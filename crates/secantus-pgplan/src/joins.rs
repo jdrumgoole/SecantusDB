@@ -1523,10 +1523,15 @@ fn lateral_leaf(
     // row re-plans it with its own. Only the shape is wanted, so no user
     // function is called and no sequence drawn: planning a FROM-less body
     // evaluates its targets, and a call here would run once more than the
-    // left side has rows.
+    // left side has rows. A correlated subquery there is a NULL of its type
+    // too (`probing`): run over the sample values it read no real row, and
+    // a prepared statement's Describe has no executor to run it, so
+    // `lateral (select (select v.a) k)` failed to prepare (RP-856).
     let mut sample_params = params.to_vec();
     sample_params.extend(types.iter().map(|t| sample_value_for_type(t)));
-    let planned = crate::correlated::without_calls(|| plan_select(&inner, lookup, &sample_params));
+    let planned = crate::correlated::probing(|| {
+        crate::correlated::without_calls(|| plan_select(&inner, lookup, &sample_params))
+    });
     let plan = match planned {
         // It names a column nothing has: PostgreSQL's 42703, where the
         // planner could only say it cannot read the reference.

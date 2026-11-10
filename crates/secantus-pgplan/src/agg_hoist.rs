@@ -65,13 +65,18 @@ fn target(name: &str, val: pg_query::protobuf::Node) -> pg_query::protobuf::Node
 
 /// `__grp`, or `__grp2`, `__grp3`, ... when the statement already has it.
 fn fresh_alias(s: &pg_query::protobuf::SelectStmt) -> String {
+    fresh_name(s, "__grp")
+}
+
+/// `base`, or `base2`, `base3`, ... when the statement already has it.
+fn fresh_name(s: &pg_query::protobuf::SelectStmt, base: &str) -> String {
     let printed = format!("{s:?}");
     let mut k = 1;
     loop {
         let name = if k == 1 {
-            "__grp".to_string()
+            base.to_string()
         } else {
-            format!("__grp{k}")
+            format!("{base}{k}")
         };
         if !printed.contains(&format!("\"{name}\"")) {
             return name;
@@ -196,6 +201,22 @@ fn from_item_cols(
                             },
                             _ => unknown = true,
                         }
+                    }
+                }
+                // `(values (1, 2)) v(a)`: the alias's names, then
+                // `column2`, ... as PostgreSQL names a VALUES list's columns.
+                Some(N::SelectStmt(b))
+                    if b.op == pg_query::protobuf::SetOperation::SetopNone as i32
+                        && b.target_list.is_empty() =>
+                {
+                    match b.values_lists.first().and_then(|r| r.node.as_ref()) {
+                        Some(N::List(row)) => found.extend((0..row.items.len()).map(|i| {
+                            renamed
+                                .get(i)
+                                .cloned()
+                                .unwrap_or_else(|| format!("column{}", i + 1))
+                        })),
+                        _ => unknown = true,
                     }
                 }
                 _ => unknown = true,
@@ -773,6 +794,140 @@ fn grouping_keys<'a>(g: &'a pg_query::protobuf::Node, out: &mut Vec<&'a pg_query
     }
 }
 
+/// One GROUP BY item with each of its keys -- itself, or what a `ROLLUP` /
+/// `CUBE` / `GROUPING SETS` is made of -- passed through `f`; `None` when
+/// `f` refuses a key.
+fn map_group_keys(
+    g: &pg_query::protobuf::Node,
+    f: &mut dyn FnMut(&pg_query::protobuf::Node) -> Option<pg_query::protobuf::Node>,
+) -> Option<pg_query::protobuf::Node> {
+    let mut out = g.clone();
+    match out.node.as_mut() {
+        Some(N::GroupingSet(set)) => {
+            for c in &mut set.content {
+                *c = map_group_keys(c, f)?;
+            }
+        }
+        Some(N::RowExpr(r)) => {
+            for c in &mut r.args {
+                *c = map_group_keys(c, f)?;
+            }
+        }
+        Some(_) => return f(g),
+        None => {}
+    }
+    Some(out)
+}
+
+/// A GROUP BY key as `findTargetlistEntrySQL92` reads it: an integer
+/// constant is the select-list item at that position, and a bare name that
+/// is no input column but names an output column is that item's
+/// expression; anything else is an expression over the input. The split
+/// gives the inner query a select list of its own, so the key must be
+/// resolved here, against the statement's. `None` -- leave the statement
+/// unsplit, for the planner's own error -- for a position outside the
+/// select list or a constant that is no integer.
+fn sql92_group_key(
+    g: &pg_query::protobuf::Node,
+    s: &pg_query::protobuf::SelectStmt,
+    level: &Level,
+) -> Option<pg_query::protobuf::Node> {
+    // A star counts as the columns it expands to; positions past one are
+    // not this select list's.
+    let star = s.target_list.iter().any(|t| match t.node.as_ref() {
+        Some(N::ResTarget(rt)) => matches!(
+            rt.val.as_deref().and_then(|v| v.node.as_ref()),
+            Some(N::ColumnRef(c)) if c.fields.iter().any(|f| matches!(f.node.as_ref(), Some(N::AStar(_))))
+        ),
+        _ => true,
+    });
+    let target = |i: usize| match s.target_list.get(i).and_then(|t| t.node.as_ref()) {
+        Some(N::ResTarget(rt)) => rt.val.as_deref().cloned(),
+        _ => None,
+    };
+    match g.node.as_ref() {
+        Some(N::AConst(c)) => match c.val.as_ref() {
+            Some(pg_query::protobuf::a_const::Val::Ival(i)) if !star => usize::try_from(i.ival)
+                .ok()?
+                .checked_sub(1)
+                .and_then(target),
+            Some(pg_query::protobuf::a_const::Val::Ival(_)) => Some(g.clone()),
+            // Any other constant is PostgreSQL's 42601 `non-integer
+            // constant in GROUP BY`: the statement is left to the planner.
+            _ => None,
+        },
+        Some(N::ColumnRef(c)) if c.fields.len() == 1 => {
+            let Some(name) = column_ref_name(c) else {
+                return Some(g.clone());
+            };
+            if level.has_col(&name) != Some(false) {
+                return Some(g.clone());
+            }
+            let named: Vec<pg_query::protobuf::Node> = s
+                .target_list
+                .iter()
+                .filter_map(|t| match t.node.as_ref() {
+                    Some(N::ResTarget(rt)) if rt.name == name => rt.val.as_deref().cloned(),
+                    _ => None,
+                })
+                .collect();
+            // Two output columns of the name with different expressions are
+            // PostgreSQL's 42702 `GROUP BY "x" is ambiguous`: left as
+            // written, which the inner query does not resolve either.
+            match named.split_first() {
+                Some((first, rest)) if rest.iter().all(|n| node_print(n) == node_print(first)) => {
+                    Some(first.clone())
+                }
+                _ => Some(g.clone()),
+            }
+        }
+        _ => Some(g.clone()),
+    }
+}
+
+/// The FROM item among `items` a qualifier `q` names, looking through an
+/// unaliased JOIN to its sides.
+fn named_item<'a>(
+    items: &'a [pg_query::protobuf::Node],
+    q: &str,
+) -> Option<&'a pg_query::protobuf::Node> {
+    items.iter().find_map(|item| match item.node.as_ref() {
+        Some(N::JoinExpr(j)) if j.alias.is_none() => {
+            let sides: Vec<&pg_query::protobuf::Node> = [j.larg.as_deref(), j.rarg.as_deref()]
+                .into_iter()
+                .flatten()
+                .collect();
+            sides
+                .into_iter()
+                .find_map(|s| named_item(std::slice::from_ref(s), q))
+        }
+        _ => {
+            let mut names = Vec::new();
+            collect_visible_names(item, &mut names);
+            names.iter().any(|n| n == q).then_some(item)
+        }
+    })
+}
+
+/// The name a scalar subquery whose one target is a star takes: its first
+/// column's (`FigureColname` sees the expanded target list), so `(select
+/// v.*)` over `v(a)` is `a`. The qualifier is looked up in the subquery's
+/// own FROM, then in the level's.
+fn star_column_name(
+    c: &pg_query::protobuf::ColumnRef,
+    body: &pg_query::protobuf::SelectStmt,
+    s: &pg_query::protobuf::SelectStmt,
+    lookup: &dyn Fn(&str) -> Option<TableDef>,
+) -> Option<String> {
+    let item = match ref_parts(c).last() {
+        Some(q) => named_item(&body.from_clause, q).or_else(|| named_item(&s.from_clause, q))?,
+        None => body.from_clause.first()?,
+    };
+    let mut cols = Some(Vec::new());
+    from_item_cols(item, lookup, &mut cols);
+    cols?.into_iter().next()
+}
+
 fn split_inner_with(
     s: &pg_query::protobuf::SelectStmt,
     force: bool,
@@ -798,9 +953,12 @@ fn split_inner_with(
     {
         return None;
     }
+    // A subquery in GROUP BY is a key like any other expression, computed
+    // once per input row (RP-700).
     let has = s.target_list.iter().any(contains_sublink)
         || s.having_clause.as_deref().is_some_and(contains_sublink)
-        || s.sort_clause.iter().any(contains_sublink);
+        || s.sort_clause.iter().any(contains_sublink)
+        || s.group_clause.iter().any(contains_sublink);
     if !has && !force {
         return None;
     }
@@ -813,11 +971,28 @@ fn split_inner_with(
         inner_targets: Vec::new(),
         ungrouped: None,
     };
+    // `GROUP BY 1` and `GROUP BY <output name>` name the select list's
+    // items, which the inner query does not have: resolve them first, so
+    // `select (select v.a) ... group by 1` groups by the subquery and its
+    // outer column is grouped through it (RP-700).
+    let mut group_clause = Vec::with_capacity(s.group_clause.len());
+    for g in &s.group_clause {
+        group_clause.push(map_group_keys(g, &mut |k| {
+            sql92_group_key(k, s, &slots.ours)
+        })?);
+    }
+    // A key holding a subquery is computed per input row by a LATERAL
+    // subquery the inner query joins, and grouped by its column: the
+    // aggregate planner keys on expressions over the row, not on
+    // subqueries. `(print of the key, the column that computes it)`.
+    let lateral_alias = fresh_name(s, "__grpk");
+    let mut lateral_targets: Vec<pg_query::protobuf::Node> = Vec::new();
+    let mut lateral_keys: Vec<(String, pg_query::protobuf::Node)> = Vec::new();
     // Under `ROLLUP` / `CUBE` / `GROUPING SETS` the keys are the
     // expressions the sets are made of; the inner query keeps the clause
     // and yields each key once, NULL in a row whose set leaves it out.
     let mut keys: Vec<&pg_query::protobuf::Node> = Vec::new();
-    for g in &s.group_clause {
+    for g in &group_clause {
         grouping_keys(g, &mut keys);
     }
     for g in keys {
@@ -830,8 +1005,17 @@ fn split_inner_with(
             Some(N::ColumnRef(c)) => column_ref_name(c),
             _ => None,
         };
+        let computed = if contains_sublink(g) {
+            let column = format!("__k{}", lateral_targets.len() + 1);
+            lateral_targets.push(target(&column, g.clone()));
+            let r = slot_ref(&lateral_alias, &column);
+            lateral_keys.push((print.clone(), r.clone()));
+            r
+        } else {
+            g.clone()
+        };
         slots.groups.push((print, col, slot.clone()));
-        slots.inner_targets.push(target(&slot, g.clone()));
+        slots.inner_targets.push(target(&slot, computed));
     }
     let mut outer_targets = Vec::new();
     for t in &s.target_list {
@@ -857,11 +1041,23 @@ fn split_inner_with(
                                         Some(N::ResTarget(r)) if !r.name.is_empty() => {
                                             r.name.clone()
                                         }
-                                        Some(N::ResTarget(r)) => r
-                                            .val
-                                            .as_deref()
-                                            .map(expression_column_name)
-                                            .unwrap_or_else(|| "?column?".into()),
+                                        Some(N::ResTarget(r)) => {
+                                            match r.val.as_deref().and_then(|v| v.node.as_ref()) {
+                                                Some(N::ColumnRef(c))
+                                                    if c.fields.iter().any(|f| {
+                                                        matches!(f.node.as_ref(), Some(N::AStar(_)))
+                                                    }) =>
+                                                {
+                                                    star_column_name(c, b, s, lookup)
+                                                        .unwrap_or_else(|| "?column?".into())
+                                                }
+                                                _ => r
+                                                    .val
+                                                    .as_deref()
+                                                    .map(expression_column_name)
+                                                    .unwrap_or_else(|| "?column?".into()),
+                                            }
+                                        }
                                         _ => "?column?".into(),
                                     }
                                 }
@@ -903,6 +1099,43 @@ fn split_inner_with(
     // An output alias in ORDER BY names the output column, which the outer
     // query still has under the same name.
     let mut inner = s.clone();
+    inner.group_clause = group_clause
+        .iter()
+        .map(|g| {
+            map_group_keys(g, &mut |k| {
+                let print = node_print(k);
+                Some(
+                    lateral_keys
+                        .iter()
+                        .find(|(p, _)| *p == print)
+                        .map_or_else(|| k.clone(), |(_, r)| r.clone()),
+                )
+            })
+        })
+        .collect::<Option<Vec<_>>>()?;
+    if !lateral_targets.is_empty() {
+        // With no FROM there is no row to be lateral to.
+        let lateral = !inner.from_clause.is_empty();
+        inner.from_clause.push(pg_query::protobuf::Node {
+            node: Some(N::RangeSubselect(Box::new(
+                pg_query::protobuf::RangeSubselect {
+                    lateral,
+                    subquery: Some(Box::new(pg_query::protobuf::Node {
+                        node: Some(N::SelectStmt(Box::new(pg_query::protobuf::SelectStmt {
+                            target_list: lateral_targets,
+                            op: pg_query::protobuf::SetOperation::SetopNone as i32,
+                            limit_option: pg_query::protobuf::LimitOption::Default as i32,
+                            ..Default::default()
+                        }))),
+                    })),
+                    alias: Some(pg_query::protobuf::Alias {
+                        aliasname: lateral_alias,
+                        colnames: Vec::new(),
+                    }),
+                },
+            ))),
+        });
+    }
     inner.target_list = slots.inner_targets.clone();
     inner.having_clause = None;
     inner.distinct_clause = Vec::new();

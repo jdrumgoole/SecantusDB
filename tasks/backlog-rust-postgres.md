@@ -3123,16 +3123,6 @@ Measured on a private PostgreSQL 15.19 cluster with `fe(a int, b text)` and
 the column written out, so none is the star's. The gap tests are in
 `tests/backlog/test_rp_found_rp517.py`.
 
-- [ ] **A GROUP BY naming a correlated subquery target is refused.**
-      `select (select v.a) from (values (1)) v(a) group by 1`, its `(select
-      v.*)` form and `group by (select v.a)` each answer `1` on PostgreSQL
-      15.19: the grouped item is the subquery, so its outer column is
-      grouped. Here the first is 42803 `subquery uses ungrouped column "v.a"
-      from outer query`, the star form 42P01 `missing FROM-clause entry for
-      table "v"`, the written-out one 42803 `column "v.a" must appear in the
-      GROUP BY clause or be used in an aggregate function`, each at 16.
-      Verify: tests/backlog/test_rp_found_rp517.py::test_group_by_a_correlated_subquery_target
-      Backlog-ID: RP-700
 - [ ] **A LATERAL subquery's outer column is named by its type, and a star
       over an outer item there is 42P01.** `select l.* from (values (3))
       v(a), lateral (select v.a) l` names its column `a` on PostgreSQL 15.19
@@ -3680,3 +3670,26 @@ statement reads only `VALUES` lists.
       grouping check unexpanded.
       Verify: tests/backlog/test_rp_found_rp699.py::test_a_star_over_a_from_subquery_in_a_grouped_query
       Backlog-ID: RP-852
+
+## Found while working RP-700 (2026-11-10)
+
+Measured on PostgreSQL 15.19 (the shared reference on port 5415): every
+statement is VALUES-only and runs there as written.
+
+- [ ] **An ungrouped column beside a subquery in a grouped select list is
+      42703, not 42803.** `select b, (select 1) from (values (1, 2)) v(a,
+      b) group by a` is 42803 `column "v.b" must appear in the GROUP BY
+      clause or be used in an aggregate function` at 8 on PostgreSQL 15.19,
+      and `select (select v.a), b ... group by 1` the same at 22. Here each
+      is 42703 `column "b" does not exist`, with a HINT that `v` has one:
+      `agg_hoist::split` reads `b` from the grouped FROM subquery it builds,
+      and calls `check_stray` only for a query with no GROUP BY.
+      Verify: tests/backlog/test_rp_found_rp700.py::test_an_ungrouped_column_beside_a_subquery_is_42803
+      Backlog-ID: RP-853
+- [ ] **A GROUP BY constant that is no integer is not 42601.** `select 1
+      from (values (1)) v(a) group by 1.5` is 42601 `non-integer constant
+      in GROUP BY` at 42 on PostgreSQL 15.19 (`findTargetlistEntrySQL92`),
+      and so is a string, NULL or boolean constant there. Here each is
+      0A000 `this target is not supported yet`, with no position.
+      Verify: tests/backlog/test_rp_found_rp700.py::test_a_non_integer_group_by_constant_is_42601
+      Backlog-ID: RP-854
