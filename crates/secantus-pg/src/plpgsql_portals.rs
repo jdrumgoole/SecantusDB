@@ -33,12 +33,15 @@ impl PlHost<'_> {
             .unwrap_or_else(|e| e.into_inner())
             .take();
         let (schema, rows) = read?;
+        // The portal's row type keeps each column's domain (RP-807).
+        let domains =
+            secantus_pgplan::select_output_domains(sql, types, &|n: &str| self.h.lookup(n));
         let current_of = updatable
             .zip(ids)
             .filter(|(_, ids)| ids.len() == rows.len())
             .map(|(table, ids)| CurrentOf { table, ids });
         self.h
-            .register_portal(name, statement, schema, rows, scroll, current_of)
+            .register_portal(name, statement, (schema, domains), rows, scroll, current_of)
             .map_err(|e| pl_error(&e))
     }
 
@@ -72,6 +75,7 @@ impl PlHost<'_> {
             })
             .collect();
         let typmods = cursor.schema.iter().map(|f| f.type_modifier()).collect();
+        let domains = cursor.domains.clone();
         let row = usize::try_from(cursor.pos - 1)
             .ok()
             .and_then(|i| i.checked_sub(cursor.base))
@@ -83,18 +87,21 @@ impl PlHost<'_> {
                 columns,
                 rows: row.into_iter().collect(),
                 typmods,
+                domains,
             },
         ))
     }
 }
 
 impl PgHandler {
-    /// Keep `rows` as the cursor `name` (or the next `<unnamed portal N>`).
+    /// Keep `rows` as the cursor `name` (or the next `<unnamed portal N>`),
+    /// of the row type `(schema, domains)`: its wire description and the
+    /// domain each column is of (RP-807).
     pub(crate) fn register_portal(
         &self,
         name: Option<&str>,
         statement: &str,
-        schema: Vec<FieldInfo>,
+        (schema, domains): (Vec<FieldInfo>, Vec<Option<String>>),
         rows: Vec<Vec<Option<Bson>>>,
         scroll: bool,
         current_of: Option<CurrentOf>,
@@ -132,6 +139,7 @@ impl PgHandler {
             CursorState {
                 born: next_cursor_born(),
                 schema,
+                domains,
                 rows: text_rows,
                 pos: 0,
                 statement: statement.to_string(),

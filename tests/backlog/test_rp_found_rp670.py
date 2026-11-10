@@ -6,8 +6,8 @@ assignment to a trigger record's domain field did not check the domain):
   assignment coercion raises 22001 (RP-687, fixed: now regression tests);
 - a record filled by `SELECT ... INTO` typed its fields by the wire's base
   type, without the column's domain or modifier, so an assignment to a
-  field checked neither (RP-688, fixed: now regression tests); a record
-  filled by `FETCH` still does (RP-807);
+  field checked neither (RP-688, fixed: now regression tests); so did a
+  record filled by `FETCH` (RP-807, fixed: now a regression test);
 - a variable declared of a table's row type (`declare r t`) has no fields
   an assignment can name (RP-689).
 
@@ -230,9 +230,12 @@ FETCH_INTO_FIELDS = {
 }
 
 
-@pytest.mark.backlog("RP-807")
+@pytest.mark.backlog_fixed("RP-807")
 @pytest.mark.parametrize("query", list(FETCH_INTO_FIELDS))
 def test_fetch_into_record_fields_keep_their_domains(query: str, dsn: str) -> None:
+    """Was: the portal kept only its wire description, which names a
+    domain column by its base type, so a fetched record's field was of the
+    base type and an assignment skipped the domain's CHECK (RP-807)."""
     assert _answer(dsn, query) == FETCH_INTO_FIELDS[query]
 
 

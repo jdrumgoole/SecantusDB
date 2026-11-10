@@ -2322,6 +2322,7 @@ impl plpgsql_fn::Host for PlHost<'_> {
             columns,
             rows,
             typmods,
+            domains: Vec::new(),
         })
     }
 
@@ -2396,6 +2397,7 @@ impl plpgsql_fn::Host for PlHost<'_> {
             columns,
             rows,
             typmods: Vec::new(),
+            domains: Vec::new(),
         })
     }
 
@@ -4688,6 +4690,11 @@ struct CursorState {
     /// `next_cursor_born()` at its DECLARE.
     born: u64,
     schema: Arc<Vec<FieldInfo>>,
+    /// The domain each column of the portal's row type is of, in order
+    /// (its tuple descriptor's type; `schema`, like RowDescription, names
+    /// a domain column by its base type). A PL/pgSQL `FETCH ... INTO` a
+    /// record types the fields by it (RP-807). Empty when not known.
+    domains: Vec<Option<String>>,
     rows: Vec<DataRow>,
     /// PostgreSQL's own cursor position: the 1-based row the cursor sits ON,
     /// with 0 meaning "before the first row" and `len + 1` meaning "after the
@@ -33654,6 +33661,11 @@ impl PgHandler {
                     CursorState {
                         born: next_cursor_born(),
                         schema,
+                        domains: secantus_pgplan::select_output_domains(
+                            &statement,
+                            &[],
+                            &|n: &str| self.lookup(n),
+                        ),
                         rows,
                         pos: 0,
                         statement,

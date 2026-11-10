@@ -1157,6 +1157,9 @@ impl PgHandler {
         Ok(Some(CursorState {
             born: next_cursor_born(),
             schema: Arc::new(self.row_schema(&def, &sel.columns, &sel.casts)),
+            domains: secantus_pgplan::select_output_domains(statement, &[], &|n: &str| {
+                self.lookup(n)
+            }),
             rows: Vec::new(),
             pos: 0,
             statement: statement.to_string(),

@@ -2519,18 +2519,6 @@ Measured on a private PostgreSQL 15.19 cluster with the `_SETUP` in
 dv687, c char(3))`, `d687` an `int` with `check (value > 0)` and `dv687` a
 `varchar(3)`.
 
-- [ ] **A record filled by `FETCH` types a domain column by its base
-      type.** After `open c` over `select * from t687` and `fetch c into
-      r`, `r.a := -5` is 23514 and `pg_typeof(r.a)` is `d687` on
-      PostgreSQL 15.19; here the assignment is stored and `pg_typeof` is
-      `integer`. The portal keeps only its wire description, which names a
-      domain column by its base type (as RowDescription does), so the
-      FETCH has no domain to give the field. Since RP-688 a `SELECT ...
-      INTO`, a FOR over a query and an `EXECUTE ... INTO` type it by the
-      domain. The cursor state a SQL `DECLARE` keeps is the same, so the
-      domains belong on it, not on the PL/pgSQL side.
-      Verify: tests/backlog/test_rp_found_rp670.py::test_fetch_into_record_fields_keep_their_domains
-      Backlog-ID: RP-807
 - [ ] **A variable of a table's row type has no assignable fields.**
       `declare r t687; begin r.a := 5;` assigns the field on PostgreSQL
       15.19 (and `r.a := -5` is the domain's 23514); here it is 42601
@@ -2553,6 +2541,21 @@ dv687, c char(3))`, `d687` an `int` with `check (value > 0)` and `dv687` a
       three phases' durations from a slow run.
       Backlog-ID: RP-690
       Verify: none -- seen once, under load; a timing that does not fail on demand
+
+## Found while working RP-807 (2026-11-10)
+
+Measured on a private PostgreSQL 15.19 cluster with the `_SETUP` in
+`tests/backlog/test_rp_found_rp807.py`.
+
+- [ ] **A bound cursor's arguments are not bound.** `declare r int; c
+      cursor (k int) for select k; begin open c(5); fetch c into r;` sets
+      `r` to 5 on PostgreSQL 15.19, and a cursor argument may stand
+      anywhere its query takes a value (`where a = k`). Here the OPEN is
+      42703 `column "k" does not exist`: the bound query is planned with
+      no variable `k` in scope, as the argument list is not read. A
+      cursor reading a block variable of the same name works.
+      Verify: tests/backlog/test_rp_found_rp807.py::test_bound_cursor_arguments_are_bound
+      Backlog-ID: RP-809
 
 ## Found while working RP-687 (2026-11-09)
 

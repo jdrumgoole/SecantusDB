@@ -531,7 +531,8 @@ pub fn select_target_domain(
 /// of is assigned with no coercion, as PostgreSQL's `exec_cast_value` skips
 /// one between equal types (RP-694). A parameter is of the domain `types`
 /// names. Empty when the columns are not known (not a SELECT, a VALUES
-/// list).
+/// list). A `DECLARE ... CURSOR FOR` gives its query's: the portal's row
+/// type keeps each column's domain, as its tuple descriptor does (RP-807).
 pub fn select_output_domains(
     sql: &str,
     types: &[String],
@@ -540,13 +541,17 @@ pub fn select_output_domains(
     let Ok(parsed) = pg_query::parse(sql) else {
         return Vec::new();
     };
-    let Some(N::SelectStmt(s)) = parsed
+    let node = parsed
         .protobuf
         .stmts
         .first()
         .and_then(|r| r.stmt.as_deref())
-        .and_then(|n| n.node.as_ref())
-    else {
+        .and_then(|n| n.node.as_ref());
+    let node = match node {
+        Some(N::DeclareCursorStmt(d)) => d.query.as_deref().and_then(|q| q.node.as_ref()),
+        other => other,
+    };
+    let Some(N::SelectStmt(s)) = node else {
         return Vec::new();
     };
     let params: Vec<Option<String>> = types
@@ -815,6 +820,28 @@ mod tests {
         ] {
             assert_eq!(of(sql).update, expected, "{sql}");
         }
+    }
+
+    /// A `DECLARE ... CURSOR FOR` gives its query's column domains, as the
+    /// portal's row type keeps them for a later `FETCH` (RP-807).
+    #[test]
+    fn a_declared_cursor_gives_its_query_domains() {
+        domains::set_user_domains(vec![domain("dnv", 90031), domain("dother", 90032)]);
+        let lookup = |name: &str| (name == "fd").then(table);
+        let dnv = Some("dnv".to_string());
+        let dother = Some("dother".to_string());
+        for sql in [
+            "SELECT a, b, i FROM fd",
+            "DECLARE s CURSOR FOR SELECT a, b, i FROM fd",
+            "DECLARE s SCROLL CURSOR WITH HOLD FOR SELECT * FROM fd",
+        ] {
+            assert_eq!(
+                select_output_domains(sql, &[], &lookup),
+                vec![dnv.clone(), dother.clone(), None],
+                "{sql}"
+            );
+        }
+        assert!(select_output_domains("CLOSE s", &[], &lookup).is_empty());
     }
 
     /// An INSERT ... SELECT source's column keeps its domain through a

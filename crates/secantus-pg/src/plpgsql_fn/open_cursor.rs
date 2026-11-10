@@ -130,11 +130,10 @@ impl Interp<'_> {
         }
         let target = self.target_datum(body)?;
         let first = out.rows.first().map(|r| r.as_slice());
-        // The portal's query is not at hand: a domain column is named by
-        // its base type, and a value of it moves in through the domain's
-        // checks, which a stored value passes. A record field is then of
-        // the base type, where PostgreSQL keeps the domain (RP-807).
-        self.assign_row(target, &out, first, &[])?;
+        // The portal's row type names each column's domain, as its tuple
+        // descriptor does: a record field is of the domain, and a value of
+        // it moves in with no coercion (RP-807).
+        self.assign_row(target, &out, first, &out.domains)?;
         self.set_found(first.is_some());
         self.row_count = u64::from(first.is_some());
         Ok(Flow::Next)
