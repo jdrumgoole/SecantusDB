@@ -1512,6 +1512,13 @@ fn count_inline(
     if let Some(c) = options.get("collation") {
         cmd.insert("collation", c.clone());
     }
+    // The window's `$sort` attaches each document's sort key (RM-408).
+    let _window_sorts = secantus_core::aggregate::window_sorts(
+        pipeline
+            .iter()
+            .filter_map(|stage| stage.get_document(shape::WINDOW_SORT).ok().cloned())
+            .collect(),
+    );
     // A prefix of a pipeline `hybrid::prepare` made runs as it did.
     let mut run = || order::uncounted(|| crate::aggregate::aggregate_inline(&cmd, ctx));
     let reply = if crate::hybrid::has_prepared_stage(pipeline) {

@@ -1100,6 +1100,7 @@ fn sort_members(
             })
             .collect::<Result<_, _>>()?;
         let sizing = secantus_core::sorter::Sizing {
+            sizes: None,
             source: secantus_core::sorter::SortSource::QueryLayer,
             fields: None,
             budget: budgets.sort,

@@ -54,7 +54,7 @@ pub(crate) const VALUE: usize = 16;
 /// string `Value` of n bytes is n + 40).
 const RC_STRING: usize = 24;
 /// `sizeof(RCVector<Value>)`.
-const RC_VECTOR: usize = 40;
+pub(crate) const RC_VECTOR: usize = 40;
 /// `sizeof(RCDecimal)`.
 const RC_DECIMAL: usize = 32;
 /// The longest string a classic `Value` keeps inline.
@@ -677,35 +677,32 @@ pub fn document_size(doc: &Document) -> usize {
     bson_len(doc) + DOCUMENT_OVERHEAD
 }
 
+/// The bytes the top-level field `name` holding `v` takes in its document's
+/// BSON (`BSONElement::size`).
+pub fn element_len(name: &str, v: &Bson) -> usize {
+    2 + name.len() + value_len(v)
+}
+
 /// mongod's size of a document the classic engine built field by field,
 /// reserving room for its fields first (`MutableDocument(n)`), as a
 /// `$group` builds each document it returns (`Document::getApproximateSize`;
 /// measured on mongod 8.2.1, 2026-11-08, from `explain`'s
 /// `totalOutputDataSizeBytes` over 1 to 14 fields of names 1 to 100 bytes
-/// long, RM-328). Its storage (104 bytes), an empty BSON object (5), the
-/// buffer it allocated and what each value holds beyond its own `Value`.
-/// The buffer reserves 32 bytes a field and 32 more, and a hash table of 4
-/// bytes a bucket, 8 buckets doubling while there are more fields than
-/// buckets. A field takes its `Value`, two 4-byte words and its name with a
-/// NUL, to the next 8 bytes; once they no longer fit the buffer grows to
-/// the next power of two, at least 128, with room for the hash table.
+/// long, RM-328): its storage over an empty BSON object, the buffer
+/// `DocumentStorage` allocated, and what each value holds beyond its own
+/// `Value` ([`crate::docstore`]).
 pub fn built_document_size(doc: &Document) -> usize {
-    let fields = doc.len();
-    let mut buckets = 8;
-    while fields > buckets {
-        buckets *= 2;
+    built_document_size_with(doc, |_, v| crate::docstore::held(v))
+}
+
+/// [`built_document_size`], `held` giving what each field's value holds
+/// beyond its `Value` -- for a value an expression built rather than read.
+pub fn built_document_size_with(doc: &Document, held: impl Fn(&str, &Bson) -> usize) -> usize {
+    let mut s = crate::docstore::Stored::reserved(doc.len());
+    for (name, v) in doc {
+        s.add_field(name, held(name, v));
     }
-    let hash = 4 * buckets;
-    let mut allocated = 32 * (fields + 1) + hash;
-    let mut used = 0;
-    for (name, _) in doc {
-        used += (VALUE + 8 + name.len() + 1).div_ceil(8) * 8;
-        if used + hash > allocated {
-            allocated = (used + hash).next_power_of_two().max(128);
-        }
-    }
-    let held: usize = doc.values().map(|v| classic_size(v) - VALUE).sum();
-    DOCUMENT_OVERHEAD + 5 + allocated + held
+    s.approximate()
 }
 
 /// mongod's size of `doc` cut down to the top-level `fields` a stage and

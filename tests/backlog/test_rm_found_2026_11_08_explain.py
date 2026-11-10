@@ -66,11 +66,13 @@ def _changed_document_sizes(client: Any) -> dict:
     }
 
 
-@pytest.mark.backlog("RM-408")
+@pytest.mark.backlog_fixed("RM-408")
 def test_changed_documents_are_sized_as_mongod_sizes_them(rust_mongo: Any, mongod: Any) -> None:
-    """mongod 8.2.1 sizes a document an `$unwind` or `$addFields` changed,
+    """mongod 8.2.1 sized a document an `$unwind` or `$addFields` changed,
     and one an expression object built, by its storage: what it allocated
-    and what its new values hold, on top of the BSON it came from."""
+    and what its new values held, on top of the BSON it came from. This
+    server sized all three as the BSON they encode until RM-408 modelled
+    that storage."""
     assert _changed_document_sizes(rust_mongo) == _changed_document_sizes(mongod)
 
 
