@@ -795,17 +795,6 @@ These are explicit non-goals. Don't add them without a reason.
       e01df2d2 (2026-11-08), each command checked against a probe of its own.
       Backlog-ID: RM-360
       Verify: tests/backlog/test_rm_355_364.py::test_every_line_counts_its_interrupt_checks
-- [ ] **On the asynchronous oplog a write's line has no
-      `totalOplogSlotDurationMicros`.** mongod 8.2.11 times each oplog slot
-      from its reservation to the commit of the write that took it (RM-361).
-      With `--oplog-async` (`SECANTUS_OPLOG_ASYNC`, a prototype; its default
-      is RM-135's decision) this server mints a write's entries only after
-      the write commits and a drainer writes them later, so no slot is open
-      inside the write and the line carries no field. Found 2026-11-07 when
-      CI's async-oplog lane failed RM-361's storage tests, which now pin the
-      synchronous oplog.
-      Backlog-ID: RM-379
-      Verify: tests/backlog/test_rm_355_364.py::test_an_async_oplog_write_says_how_long_it_held_its_oplog_slot
 - [ ] **A line on `admin`, `local` or `config` says its collection is
       `normal`.** mongod 8.2.1's `Slow query` line for an operation on one
       of its internal databases -- a `ping` (`admin.$cmd`), a `find` of

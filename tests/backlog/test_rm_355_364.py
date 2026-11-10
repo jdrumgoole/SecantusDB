@@ -1036,14 +1036,15 @@ def rust_mongo_async(tmp_path_factory: pytest.TempPathFactory) -> Iterator[Any]:
             proc.kill()
 
 
-@pytest.mark.backlog("RM-379")
+@pytest.mark.backlog_fixed("RM-379")
 def test_an_async_oplog_write_says_how_long_it_held_its_oplog_slot(
     rust_mongo_async: Any, mongod_rs: Any
 ) -> None:
     """mongod 8.2.11's line for an insert carries
     `totalOplogSlotDurationMicros` (RM-361). On the asynchronous oplog
-    (`--oplog-async`) this server mints a write's entries only after the
-    write commits, so no slot is open inside it and the line has no field."""
+    (`--oplog-async`) this server minted a write's entries only after the
+    write committed, so it timed no slot and the line had no field; it now
+    times each emit, where mongod reserves, to the write's commit."""
     got = _both(rust_mongo_async, mongod_rs, lambda d: d.c.insert_one({"_id": 100}))
     answers = {
         s: ("totalOplogSlotDurationMicros" in _line(lines, "insert"))
