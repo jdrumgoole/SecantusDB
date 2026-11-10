@@ -2123,6 +2123,11 @@ impl Drop for NestedStatement<'_> {
 }
 
 impl plpgsql_fn::Host for PlHost<'_> {
+    fn percent_type(&self, words: &[String]) -> Option<String> {
+        self.h.install_user_types();
+        secantus_pgplan::plpgsql_percent_type_outer(words, &|n| self.h.lookup(n))
+    }
+
     fn expression_type(&self, sql: &str, types: &[String]) -> Option<String> {
         // Planned as a Describe plans it, over NULL parameters of the
         // declared types, but with no subquery runner and without
@@ -13894,11 +13899,28 @@ impl PgHandler {
             return Ok(());
         }
         self.install_user_types();
+        // A `%TYPE` nothing answers falls through to `parse_datatype` of
+        // the whole text, whose grammar refuses the `%` (RP-818).
+        let percent = plpgsql_fn::percent_types(create_sql, &|w| {
+            secantus_pgplan::plpgsql_percent_type_outer(w, &|n| self.lookup(n))
+        });
         for d in &declared {
-            let Err(refused) = secantus_pgplan::plpgsql_declared_type(&d.typname) else {
-                continue;
+            let mut at_percent = None;
+            let refused = match percent.iter().find(|(datum, _)| *datum == d.datum) {
+                Some((_, Some(_))) => continue,
+                Some((_, None)) => {
+                    at_percent = d.typname.find('%');
+                    secantus_pgplan::DeclaredTypeError::AtType(secantus_pgplan::Error::Parse(
+                        "syntax error at or near \"%\"".into(),
+                    ))
+                }
+                None => match secantus_pgplan::plpgsql_declared_type(&d.typname) {
+                    Ok(()) => continue,
+                    Err(refused) => refused,
+                },
             };
-            let offset = plpgsql_fn::declared_type_offset(body, d);
+            let offset =
+                plpgsql_fn::declared_type_offset(body, d).map(|at| at + at_percent.unwrap_or(0));
             let (e, at_type) = match refused {
                 secantus_pgplan::DeclaredTypeError::AtType(e) => (e, true),
                 secantus_pgplan::DeclaredTypeError::Compile(e) => (e, false),
@@ -13906,6 +13928,10 @@ impl PgHandler {
             let mut err = Self::err(&e);
             if let PgWireError::UserError(info) = &mut err {
                 info.position = None;
+                if at_percent.is_some() {
+                    // `typeStringToTypeName`'s callback.
+                    info.where_context = Some(format!("invalid type name \"{}\"", d.typname));
+                }
                 match offset.filter(|_| at_type) {
                     Some(byte) => {
                         let at = body[..byte].chars().count() + 1;

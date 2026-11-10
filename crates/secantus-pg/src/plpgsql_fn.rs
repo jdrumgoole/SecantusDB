@@ -104,6 +104,8 @@ pub struct QueryOut {
 /// What the interpreter asks of the server.
 mod block_scope;
 mod open_cursor;
+mod percent_type;
+pub use percent_type::percent_types;
 
 pub trait Host {
     /// `OPEN cur FOR query`: make a portal over the query's rows, named
@@ -180,6 +182,13 @@ pub trait Host {
     /// an assignment's coercion from that type (`exec_cast_value`, RP-712).
     fn expression_type(&self, sql: &str, types: &[String]) -> Option<String> {
         let _ = (sql, types);
+        None
+    }
+    /// What a DECLARE's `words%TYPE` names when no variable of the
+    /// function does: a type, or a relation's column, as a declared type's
+    /// text (`secantus_pgplan::plpgsql_percent_type_outer`, RP-818).
+    fn percent_type(&self, words: &[String]) -> Option<String> {
+        let _ = words;
         None
     }
     /// The domain each column of the query `sql` (over parameters of
@@ -748,6 +757,8 @@ pub fn validate(create_sql: &str) -> Result<(), PlError> {
 /// text, `%TYPE` and `%ROWTYPE` included, and no location).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Declared {
+    /// Its datum number.
+    pub datum: usize,
     pub lineno: usize,
     pub refname: String,
     pub typname: String,
@@ -775,7 +786,8 @@ pub fn declared_types(create_sql: &str) -> Vec<Declared> {
         .and_then(Value::as_array)
         .map(|ds| {
             ds.iter()
-                .filter_map(|d| {
+                .enumerate()
+                .filter_map(|(datum, d)| {
                     let v = d.get("PLpgSQL_var")?;
                     let lineno = v.get("lineno").and_then(Value::as_u64)? as usize;
                     let typname = v
@@ -787,6 +799,7 @@ pub fn declared_types(create_sql: &str) -> Vec<Declared> {
                         return None;
                     }
                     Some(Declared {
+                        datum,
                         lineno,
                         refname: v.get("refname")?.as_str()?.to_string(),
                         typname: typname.to_string(),
@@ -1030,10 +1043,25 @@ pub fn run(create_sql: &str, inv: Invocation<'_>, host: &dyn Host) -> Result<Out
             arg += 1;
         }
     }
+    // A `%TYPE` declaration has the type it names (RP-818).
+    let mut kinds: Vec<percent_type::Kind> = datums
+        .iter()
+        .map(|d| match d {
+            Datum::Var { ty, .. } => percent_type::Kind::Var(ty.clone()),
+            _ => percent_type::Kind::Other,
+        })
+        .collect();
+    let fname = function_name(create_sql);
+    for (d, t) in percent_type::resolve(&f, fname.as_deref(), &mut kinds, &|w| host.percent_type(w))
+    {
+        if let (Some(t), Some(Datum::Var { ty, .. })) = (t, datums.get_mut(d)) {
+            *ty = t;
+        }
+    }
     let mut interp = Interp {
         datums,
         arg_slots,
-        fn_name: function_name(create_sql),
+        fn_name: fname,
         host,
         trigger: inv.trigger.clone(),
         returns_set: inv.returns_set,
@@ -3368,6 +3396,7 @@ mod rp573_declarations {
     #[test]
     fn a_declared_type_is_found_after_its_name() {
         let d = |lineno: usize, refname: &str, typname: &str| Declared {
+            datum: 0,
             lineno,
             refname: refname.into(),
             typname: typname.into(),

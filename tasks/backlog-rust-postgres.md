@@ -3517,17 +3517,21 @@ Measured on a private PostgreSQL 15.19 cluster with the `_SETUP` in
       reuse.
       Verify: tests/backlog/test_rp_found_rp809.py::test_for_over_a_bound_cursor
       Backlog-ID: RP-817
-- [ ] **A variable declared `%TYPE` cannot be assigned.** `declare k
-      t809.v%type := 'ab'` is a `character varying` holding `ab`, and `k :=
-      'abcd'` is 22001 `value too long for type character varying(3)`, on
-      PostgreSQL 15.19; `declare a int; k a%type` is an `integer`. Here
-      every assignment to such a variable, its default included, is 3F000
-      `schema "t809" does not exist` (the `t809.v%type` text read as a
-      qualified type name) or 42601 `syntax error at or near "$1"`. Since
-      RP-573 the declaration is checked at CREATE FUNCTION and before a DO
-      block runs, but the variable's type stays the text as written
-      (libpg_query stubs `plpgsql_parse_wordtype` / `cwordtype` out), so
-      the type must be resolved here, from the column or from the variable
-      in the block scopes.
-      Verify: tests/backlog/test_rp_found_rp809.py::test_a_percent_type_variable_is_assigned
-      Backlog-ID: RP-818
+
+## Found while working RP-818 (2026-11-10)
+
+- [ ] **A routine's parameter or result declared `%TYPE` is not
+      resolved.** `create function f(x t.v%type) returns text` over a
+      `varchar(3)` column makes `x` a `character varying` on PostgreSQL
+      15.19 (`LookupTypeNameExtended`: the column's type, without its
+      modifier), with the NOTICE `type reference t.v%TYPE converted to
+      character varying`, and `pg_get_function_arguments` is `x character
+      varying`; `returns t.v%type` alike. Here CREATE succeeds with no
+      NOTICE, the parameter is stored as a type named `"t.v"` (a call sees
+      a `record`), the result's `pg_typeof` is `t.v`, and a LANGUAGE sql
+      routine's `%TYPE` parameter is 3F000 `schema "t" does not exist`.
+      Found while working RP-818 (2026-11-10), which resolves `%TYPE` in a
+      DECLARE (`secantus_pgplan::plpgsql_percent_type_outer` answers the
+      column's type, which CREATE FUNCTION can reuse without the modifier).
+      Verify: tests/backlog/test_rp_found_rp818.py::test_a_routines_percent_type_parameter_is_resolved
+      Backlog-ID: RP-822

@@ -128,6 +128,8 @@ mod func_cast;
 mod funcsig;
 mod named_args;
 pub mod nodetostring;
+mod plpgsql_pct_type;
+pub use plpgsql_pct_type::{plpgsql_percent_type_outer, plpgsql_percent_type_words};
 mod query_reads;
 mod schema_functions;
 mod search_cycle;

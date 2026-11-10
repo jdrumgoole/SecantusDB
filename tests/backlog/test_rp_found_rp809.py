@@ -2,7 +2,8 @@
 cursor's arguments were not bound):
 
 - a FOR loop over a bound cursor is refused as a gap;
-- a variable declared `%TYPE` cannot be assigned.
+- a variable declared `%TYPE` could not be assigned: its type was the text
+  as written (fixed, RP-818).
 
 The expected answers were measured on a private, freshly initdb'd
 PostgreSQL 15.19 cluster with `_SETUP`.
@@ -87,7 +88,7 @@ PERCENT_TYPE = {
 }
 
 
-@pytest.mark.backlog("RP-818")
+@pytest.mark.backlog_fixed("RP-818")
 @pytest.mark.parametrize("query", list(PERCENT_TYPE))
 def test_a_percent_type_variable_is_assigned(query: str, dsn: str) -> None:
     assert _answer(dsn, query) == PERCENT_TYPE[query]
