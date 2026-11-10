@@ -480,6 +480,9 @@ pub fn bind(
     logs.log(
         LogEntry::new("I", "CONTROL", 4615611, "initandlisten", "MongoDB starting").attr(starting),
     );
+    for entry in secantus_commands::diagnostics::startup_details(config.require_auth) {
+        logs.log(entry);
+    }
     logs.log(
         LogEntry::new("I", "NETWORK", 23016, "listener", "Waiting for connections").attr(doc! {
             "port": i32::from(address.port()),

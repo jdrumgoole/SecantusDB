@@ -978,17 +978,25 @@ These are explicit non-goals. Don't add them without a reason.
       Verify: tests/backlog/test_rm_355_364.py::test_an_update_in_a_transaction_counts_no_dirty_bytes
 
 - [ ] **mongod's startup lines this server does not write.** Since RM-302
-  the log is mongod's structured log, and the lines this server writes --
-  `MongoDB starting`, `Waiting for connections`, `Connection accepted` /
-  `ended`, `client metadata`, `Received first command on ingress
-  connection`, every `Slow query` -- carry mongod's ids, threads and
-  attributes. At startup mongod 8.2.11 also writes about eighty more on
-  `initandlisten` (`Build Info` 23403, `Operating System` 51765, `Options
-  set by command line` 21951, then the network, WiredTiger and recovery
-  lines); this server writes `MongoDB starting` alone (measured
-  2026-10-24 and 2026-11-07). Found with RM-302.
+  the log is mongod's structured log, and since 2026-11-10 this server
+  starts it as mongod 8.2.11 does on `initandlisten`: `MongoDB starting`,
+  `Build Info` (23403), `Operating System` (51765) and `Options set by
+  command line` (21951, which carries RM-425's `parsed` until that is
+  fixed). mongod then writes about seventy more there -- the network
+  lines, `Opening WiredTiger` (22315) and the WiredTiger messages under
+  it, `WiredTiger opened` (4795906), the recovery, catalog, FCV, FTDC and
+  flow-control lines -- and ends with `mongod startup complete`
+  (8423403); this server writes none of them (measured 2026-10-24,
+  2026-11-07 and 2026-11-10). Found with RM-302.
   Backlog-ID: RM-305
-  Verify: tests/backlog/test_rm_001_028.py::test_startup_writes_build_os_and_options_lines
+  Verify: tests/backlog/test_rm_001_028.py::test_startup_writes_the_storage_and_startup_complete_lines
+- [ ] **`buildInfo` names the architecture as Rust does.** mongod 8.2.11 on
+  macOS arm64 gives `arm64` as `buildEnvironment.distarch` and
+  `target_arch` (and in the `Build Info` startup line); this server gives
+  Rust's `std::env::consts::ARCH`, `aarch64` (measured 2026-11-10). Found
+  while working RM-305.
+  Backlog-ID: RM-500
+  Verify: tests/backlog/test_rm_found_2026_11_10.py::test_build_info_names_the_architecture_as_mongod_does
 - [ ] **A command that fails to parse is counted as a connection's first
   command.** mongod 8.2.11 writes `Received first command on ingress
   connection` (6788700) for the first command after the handshake that it
