@@ -552,11 +552,9 @@ fn type_collation(type_oid: i64, domains: &HashMap<i64, i64>) -> i64 {
 }
 
 /// The collation `DefineDomain` gives each user domain, and the array type
-/// it makes beside it, by oid: its base type's `typcollation` (the domain
-/// over a domain its base domain's, a domain over an array its element's).
-///
-/// A COLLATE clause is not kept by `CREATE DOMAIN` here (RP-782), so the
-/// base type's collation is the one every domain takes.
+/// it makes beside it, by oid: the one its COLLATE clause named (RP-782),
+/// else its base type's `typcollation` (the domain over a domain its base
+/// domain's, a domain over an array its element's).
 fn domain_collations(domains: &[secantus_pgplan::domains::Domain]) -> HashMap<i64, i64> {
     fn of(base: &str, domains: &[secantus_pgplan::domains::Domain], depth: u8) -> i64 {
         // Bounded: a catalog cannot hold a cycle, but a bad one must not hang.
@@ -568,14 +566,28 @@ fn domain_collations(domains: &[secantus_pgplan::domains::Domain]) -> HashMap<i6
             return of(element, domains, depth + 1);
         }
         if let Some(d) = domains.iter().find(|d| d.name == base) {
-            return of(&d.base, domains, depth + 1);
+            return own(d, domains, depth + 1);
         }
         secantus_pgplan::pgtypes::oid_of_name(base)
             .map_or(0, |oid| type_collation(oid, &HashMap::new()))
     }
+    // A domain's COLLATE clause, else its base's collation.
+    fn own(
+        d: &secantus_pgplan::domains::Domain,
+        domains: &[secantus_pgplan::domains::Domain],
+        depth: u8,
+    ) -> i64 {
+        match &d.collation {
+            Some(name) => secantus_pgplan::regobj::collation_names()
+                .into_iter()
+                .find(|(n, _)| n == name)
+                .map_or(0, |(_, o)| o),
+            None => of(&d.base, domains, depth),
+        }
+    }
     let mut out = HashMap::new();
     for d in domains {
-        let coll = of(&d.base, domains, 0);
+        let coll = own(d, domains, 0);
         out.insert(d.oid, coll);
         out.insert(d.oid + secantus_pgplan::USER_TYPE_ARRAY_OID_OFFSET, coll);
     }
@@ -1709,6 +1721,7 @@ mod tests {
             checks: Vec::new(),
             not_valid: Vec::new(),
             default_sql: None,
+            collation: None,
         }
     }
 
@@ -1740,5 +1753,23 @@ mod tests {
         // A built-in keeps its own, and an unknown oid has none.
         assert_eq!(type_collation(25, &colls), DEFAULT_COLLATION);
         assert_eq!(type_collation(99999, &colls), 0);
+    }
+
+    // A COLLATE clause names the domain's collation, which a domain over it
+    // without one inherits, and the array type beside each takes (RP-782;
+    // measured on 15.19).
+    #[test]
+    fn a_domains_collate_clause_is_its_collation() {
+        let mut dc = domain("dc", 68000, "text");
+        dc.collation = Some("C".into());
+        let mut dcp = domain("dcp", 68002, "dc");
+        dcp.collation = Some("POSIX".into());
+        let domains = [dc, domain("dcd", 68001, "dc"), dcp];
+        let colls = domain_collations(&domains);
+        let array = secantus_pgplan::USER_TYPE_ARRAY_OID_OFFSET;
+        for (oid, want) in [(68000, C_COLLATION), (68001, C_COLLATION), (68002, 951)] {
+            assert_eq!(type_collation(oid, &colls), want, "domain {oid}");
+            assert_eq!(type_collation(oid + array, &colls), want, "array {oid}");
+        }
     }
 }

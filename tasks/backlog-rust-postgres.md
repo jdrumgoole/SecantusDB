@@ -3384,20 +3384,6 @@ with ICU) with the `_SETUP` in `tests/backlog/test_rp_found_rp769.py`.
 Since RP-769 a domain, and its array type, takes its base type's
 collation (`catalog_fill.rs`'s `domain_collations`).
 
-- [ ] **`CREATE DOMAIN`'s COLLATE clause is parsed and dropped.** `create
-      domain d782c as text collate "C"` gives the domain, its array type
-      and a column of it collation 950 on PostgreSQL 15.19, and a domain
-      `collate "und-x-icu"` sorts `a` before `B` and answers `collation
-      for` with `"und-x-icu"`, as `information_schema.domains` names it;
-      here every one is the base type's `default` (100, sorted bytewise,
-      `collation_name` NULL). `create domain d as int collate "C"` is
-      42804 `collations are not supported by type integer` and a collation
-      that does not exist 42704 on 15.19; here both are made.
-      `plan_create_domain` never reads `coll_clause`, and `Domain` has no
-      field to keep it: the domain's stored document, its catalog rows and
-      the collation a column of it sorts by all need it.
-      Verify: tests/backlog/test_rp_found_rp769.py::test_create_domain_keeps_its_collate_clause
-      Backlog-ID: RP-782
 - [ ] **`information_schema.columns.collation_name` shows only a declared
       COLLATE.** PostgreSQL 15.19's view joins `pg_collation` on
       `attcollation` and leaves out only `pg_catalog.default`, so a `name`
@@ -3409,6 +3395,56 @@ collation (`catalog_fill.rs`'s `domain_collations`).
       DECLARES a collation shows one").
       Verify: tests/backlog/test_rp_found_rp769.py::test_information_schema_columns_collation_is_the_columns
       Backlog-ID: RP-783
+
+## Found while working RP-782 (2026-11-10)
+
+Measured on a private PostgreSQL 15.19 cluster (locale C.UTF-8, built
+with ICU) with the `_SETUP` in `tests/backlog/test_rp_found_rp782.py`:
+`xu782f` a domain over `text` `collate "und-x-icu"`, `xc782f` one
+`collate "C"`.
+
+- [ ] **A cast to a collated domain does not take its collation.** Since
+      RP-782 a domain keeps its COLLATE, and a column of it sorts by it,
+      but an expression of the domain's type does not: `select 'a'::xu782f
+      < 'B'::xu782f` is true on PostgreSQL 15.19 and false here, `order
+      by` and `max` over a VALUES list of `xu782f` sort bytewise, and
+      `'a'::xu782f < 'B'::xc782f` is 42P22 `could not determine which
+      collation to use for string comparison` there and false here.
+      `exprCollation` of a cast to a domain is the domain's
+      `typcollation`, an IMPLICIT collation (`COLLATE_IMPLICIT`), so the
+      fix is the analyser's collation derivation, not an explicit
+      `COLLATE` wrapped round the cast (which would turn the 42P22 into a
+      42P21).
+      Verify: tests/backlog/test_rp_found_rp782.py::test_a_cast_to_a_collated_domain_takes_its_collation
+      Backlog-ID: RP-796
+- [ ] **`information_schema`'s text columns are not collated "C".**
+      `information_schema.sql` declares `character_data` and `yes_or_no`
+      `COLLATE "C"` (kept on the built-in domains since RP-782), and its
+      views' columns are of those domains and of `sql_identifier`, so
+      `collation for (data_type)` of `information_schema.columns` is
+      `"C"` on PostgreSQL 15.19; here it is `"default"`, as is
+      `is_insertable_into` of `information_schema.tables`. The views'
+      columns are typed by their base types (`varchar`), so they also sort
+      by the database's collation.
+      Verify: tests/backlog/test_rp_found_rp782.py::test_information_schema_character_data_columns_are_collated_c
+      Backlog-ID: RP-797
+- [ ] **`pg_get_viewdef` of a system view is NULL.** `select
+      pg_get_viewdef('pg_tables'::regclass)` deparses the view's rule on
+      PostgreSQL 15.19 (` SELECT n.nspname AS schemaname, ...`), as it does
+      for every `pg_catalog` and `information_schema` view; here every one
+      answers NULL, though a user view's definition is printed.
+      Verify: tests/backlog/test_rp_found_rp782.py::test_pg_get_viewdef_of_a_system_view
+      Backlog-ID: RP-798
+- [ ] **An added domain column does not reach its base type's
+      aggregates.** After `alter table t add column a xc782f`,
+      `string_agg(a, ',')` is 42883 `function string_agg(xc782f, unknown)
+      does not exist` here and aggregates on PostgreSQL 15.19. A column
+      CREATE TABLE declares of a domain is stored as the base type with a
+      `domain_type` tag (`tag_domain_column`); one ADD COLUMN adds keeps the
+      domain's name as its type (`plan_added_column`), which the
+      aggregate's overload resolution does not follow to `text`.
+      Verify: tests/backlog/test_rp_found_rp782.py::test_an_added_domain_column_reaches_its_base_types_aggregates
+      Backlog-ID: RP-799
 
 ## Found while working RP-768 (2026-11-10)
 

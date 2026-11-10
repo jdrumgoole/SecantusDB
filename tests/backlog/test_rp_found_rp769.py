@@ -1,6 +1,6 @@
 """Gap tests of the divergences found while working RP-769 (a domain takes
-its base type's collation): RP-782, `CREATE DOMAIN`'s COLLATE clause is
-parsed and dropped; RP-783, `information_schema.columns.collation_name`
+its base type's collation): RP-782, `CREATE DOMAIN`'s COLLATE clause was
+parsed and dropped (fixed); RP-783, `information_schema.columns.collation_name`
 shows only a declared COLLATE.
 
 The expected answers were measured on a private, freshly initdb'd
@@ -56,7 +56,9 @@ def _answer(c: psycopg.Connection, sql: str) -> object:
 # `DefineDomain`: a COLLATE clause names the domain's collation, which its
 # array type, its columns, a sort and `pg_collation_for` all take; a base
 # type with no collation, or a collation that does not exist, is refused.
-@pytest.mark.backlog("RP-782")
+# The clause was parsed and dropped, every domain taking its base type's
+# collation (RP-782).
+@pytest.mark.backlog_fixed("RP-782")
 def test_create_domain_keeps_its_collate_clause(dsn: str) -> None:
     with _connect(dsn) as c:
         got = [
@@ -90,6 +92,73 @@ def test_create_domain_keeps_its_collate_clause(dsn: str) -> None:
         [("d782c", "C"), ("d782u", "und-x-icu")],
         "42804 collations are not supported by type integer",
         '42704 collation "nope" for encoding "UTF8" does not exist',
+    ]
+
+
+# `GetColumnDefCollation`: a column's collation is its own COLLATE's, else
+# its type's -- through a domain over a domain, and for a column ALTER TABLE
+# ADD COLUMN adds, whose own COLLATE was dropped too (RP-782).
+@pytest.mark.backlog_fixed("RP-782")
+def test_a_column_takes_its_domains_collate_clause(dsn: str) -> None:
+    with _connect(dsn) as c:
+        got = [
+            _answer(c, sql)
+            for sql in [
+                "drop table if exists te782",
+                "drop domain if exists e782c cascade",
+                "drop domain if exists e782u cascade",
+                'create domain e782c as text collate "C"',
+                "create domain e782d as e782c",
+                'create domain e782u as e782c collate "und-x-icu"',
+                'create table te782 (c e782c, d e782d, u e782u, o e782c collate "und-x-icu")',
+                "insert into te782 values ('a', 'a', 'a', 'a'), ('B', 'B', 'B', 'B')",
+                "select attname::text, attcollation::int from pg_attribute"
+                " where attrelid = 'te782'::regclass and attnum > 0 order by attnum",
+                "select collation for (c), collation for (d), collation for (u),"
+                " collation for (o) from te782 limit 1",
+                "select string_agg(c, ',' order by c), string_agg(d, ',' order by d),"
+                " string_agg(u, ',' order by u), string_agg(o, ',' order by o) from te782",
+                "alter table te782 add column a e782u",
+                'alter table te782 add column z text collate "C"',
+                'alter table te782 add column zu e782c collate "und-x-icu"',
+                "update te782 set a = c, z = c, zu = c",
+                "select attname::text, attcollation::int from pg_attribute"
+                " where attrelid = 'te782'::regclass and attnum > 4 order by attnum",
+                # (an added domain column is read by a sort, not string_agg:
+                # RP-799)
+                "select a from te782 order by a",
+                "select z from te782 order by z",
+                "select zu from te782 order by zu",
+                'alter table te782 add column w int collate "C"',
+                'alter table te782 add column w text collate "nope"',
+                "drop table te782",
+                "drop domain e782c cascade",
+            ]
+        ]
+    assert got == [
+        "DROP TABLE",
+        "DROP DOMAIN",
+        "DROP DOMAIN",
+        "CREATE DOMAIN",
+        "CREATE DOMAIN",
+        "CREATE DOMAIN",
+        "CREATE TABLE",
+        "INSERT 0 2",
+        [("c", 950), ("d", 950), ("u", 12713), ("o", 12713)],
+        [('"C"', '"C"', '"und-x-icu"', '"und-x-icu"')],
+        [("B,a", "B,a", "a,B", "a,B")],
+        "ALTER TABLE",
+        "ALTER TABLE",
+        "ALTER TABLE",
+        "UPDATE 2",
+        [("a", 12713), ("z", 950), ("zu", 12713)],
+        [("a",), ("B",)],
+        [("B",), ("a",)],
+        [("a",), ("B",)],
+        "42804 collations are not supported by type integer",
+        '42704 collation "nope" for encoding "UTF8" does not exist',
+        "DROP TABLE",
+        "DROP DOMAIN",
     ]
 
 

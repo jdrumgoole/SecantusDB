@@ -8848,6 +8848,22 @@ fn plan_added_column(
     }
     column.typmod = cd.type_name.as_ref().map(declared_typmod).unwrap_or(-1);
     column.set_ndims(cd.type_name.as_ref().map_or(0, declared_ndims));
+    // `GetColumnDefCollation`: the COLLATE clause's collation, looked up
+    // first (42704) and refused over a type with none (42804); without one,
+    // the type's, which for a domain is the one its COLLATE named (RP-782).
+    if let Some(cc) = cd.coll_clause.as_deref() {
+        let name = collation::clause_name(cc);
+        collation::resolve(&name)?;
+        if !collation::collatable(&ty) {
+            return Err(Error::DatatypeMismatch(format!(
+                "collations are not supported by type {}",
+                display_type(&ty)
+            )));
+        }
+        column.extra.insert("collation", name);
+    } else if let Some(coll) = domains::declared_collation(&ty) {
+        column.extra.insert("collation", coll);
+    }
     for con in &cd.constraints {
         let Some(N::Constraint(k)) = con.node.as_ref() else {
             continue;
@@ -9115,6 +9131,14 @@ fn tag_domain_column(
 ) -> Result<()> {
     column.typmod = resolved.map_or(d.typmod, |(_, typmod, _)| *typmod);
     column.extra.insert("domain_type", d.name.clone());
+    // A column's collation is its own COLLATE's, else its type's
+    // (`attcollation` from `typcollation`): a domain's COLLATE reaches every
+    // column of it that declares none (RP-782).
+    if !column.extra.contains_key("collation") {
+        if let Some(coll) = domains::declared_collation(&d.name) {
+            column.extra.insert("collation", coll);
+        }
+    }
     if let Some(sql) = &d.default_sql {
         let raw = domains::parse_default_sql(sql)?;
         match default_value_or_expr(&raw, underlying, &[])? {
@@ -43718,9 +43742,13 @@ fn collation_for_type(ty: &str) -> Result<Bson> {
         return Ok(Bson::String(crate::scalar::quote_identifier(known)));
     }
     let mut base = ty.trim_end_matches("[]").to_string();
-    // A domain's collation is its base type's (`DefineDomain`), through a
-    // domain over a domain and a domain over an array; the error still
-    // names the type as `pg_typeof` gave it.
+    // A domain's collation is the one its COLLATE named (RP-782), else its
+    // base type's (`DefineDomain`), through a domain over a domain and a
+    // domain over an array; the error still names the type as `pg_typeof`
+    // gave it.
+    if let Some(coll) = domains::declared_collation(&base) {
+        return Ok(Bson::String(crate::scalar::quote_identifier(&coll)));
+    }
     if let Some((inner, _, _)) = domains::base_type_and_typmod(&base) {
         base = inner.trim_end_matches("[]").to_string();
     }
