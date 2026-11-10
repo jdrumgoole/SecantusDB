@@ -2043,6 +2043,11 @@ impl Interp<'_> {
                 "assignment to a field of an array element",
             ));
         }
+        if ty == "jsonb" {
+            return self
+                .assign_jsonb_subscripted(target, value, text, mode, current)
+                .map(Some);
+        }
         // A domain over an array is subscripted as its base type, and the
         // new array is coerced back to the domain, which checks it.
         let (array_ty, domain) = if ty.ends_with("[]") {
@@ -2057,9 +2062,6 @@ impl Interp<'_> {
                         element.to_string()
                     };
                     (format!("{element}[]"), Some((ty.clone(), base)))
-                }
-                _ if ty == "jsonb" => {
-                    return Err(PlError::unsupported("assignment to a jsonb subscript"))
                 }
                 _ => {
                     return Err(PlError::new(
@@ -2134,6 +2136,63 @@ impl Interp<'_> {
             Some((domain, base)) => self.convert_to(&domain, out, &base)?,
             None => out,
         }))
+    }
+
+    /// `x['a'][1] := v` over a `jsonb` variable (RP-772): jsonb's
+    /// subscripting handler (`jsonbsubs.c`). Each subscript is coerced to
+    /// `int4` or `text` (`jsonb_subscript_transform`), evaluated and checked
+    /// (none NULL), then the value is coerced to `jsonb` and placed by
+    /// `jsonb_set_element`, which builds a missing path; a NULL variable
+    /// starts as `[]` when the first subscript is an integer, else `{}`.
+    fn assign_jsonb_subscripted(
+        &self,
+        target: &str,
+        value: &str,
+        text: &str,
+        mode: u64,
+        current: Bson,
+    ) -> Result<Bson, PlError> {
+        use secantus_pgplan::jsonb_subs::{self, SubscriptKind};
+        let texts = subscript_texts(target)
+            .ok_or_else(|| PlError::unsupported("this assignment target"))?;
+        if texts.iter().any(|(slice, _, _)| *slice) {
+            return Err(plan_error(jsonb_subs::slice_error()));
+        }
+        let mut subs = Vec::with_capacity(texts.len());
+        for (_, _, upper) in &texts {
+            let t = upper.ok_or_else(|| plan_error(jsonb_subs::slice_error()))?;
+            let source = if untyped_literal(t) {
+                "unknown".to_string()
+            } else {
+                self.expression_type(t).unwrap_or_default()
+            };
+            subs.push((t, jsonb_subs::subscript_kind(&source).map_err(plan_error)?));
+        }
+        let mut path = Vec::with_capacity(subs.len());
+        let mut any_null = false;
+        for (t, kind) in &subs {
+            let cast = match kind {
+                SubscriptKind::Int => "int4",
+                SubscriptKind::Text => "text",
+            };
+            let v = self.eval_body(format!("({t})::{cast}"), text, mode)?;
+            match jsonb_subs::path_step(&v, *kind).map_err(plan_error)? {
+                Some(step) => path.push(step),
+                None => any_null = true,
+            }
+        }
+        let value = value.trim().to_string();
+        if any_null {
+            // As for an array: a value that folds to a constant was computed
+            // while the assignment was planned, so its error comes first.
+            if select_target(&format!("SELECT {value}")).is_some_and(|n| expression_folds(&n)) {
+                self.eval_typed_body(Some("jsonb".to_string()), value, text, mode)?;
+            }
+            return Err(plan_error(jsonb_subs::null_subscript_error()));
+        }
+        let v = self.eval_typed_body(Some("jsonb".to_string()), value, text, mode)?;
+        let expect_array = subs.first().map(|(_, k)| *k) == Some(SubscriptKind::Int);
+        jsonb_subs::assign(&current, &path, expect_array, &v).map_err(plan_error)
     }
 
     /// The value an assignment stores in a record field of type `ty`

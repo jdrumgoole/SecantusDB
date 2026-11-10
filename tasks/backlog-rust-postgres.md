@@ -2627,25 +2627,6 @@ nothing. The gap tests are in `tests/backlog/test_rp_found_rp712.py`.
       Verify: tests/backlog/test_rp_found_rp712.py::test_literal_input_error_in_an_assignment_carries_its_query
       Backlog-ID: RP-753
 
-## Found while working RP-711 (2026-11-10)
-
-Measured on PostgreSQL 15.19: the SELECT and DO statements on the shared
-reference on port 5415 (they create nothing), the UPDATEs on a private
-cluster with the `_SETUP` in `tests/backlog/test_rp_found_rp711.py`:
-`j711(k int primary key, j jsonb)` holding `(1, '{"a": [1]}')`.
-
-- [ ] **jsonb subscripting is refused.** `('{"a": [1,2]}'::jsonb)['a'][1]`
-      is `2` on PostgreSQL 15.19; `update j711 set j['b'] = '2'` makes
-      `{"a": [1], "b": 2}`, and `set j['a'][3] = '5'` pads the array to
-      `{"a": [1, null, null, 5]}` (`jsonb_set_element`, which builds the
-      missing path); in PL/pgSQL `x['a']['b'] := '1'` over a NULL `jsonb`
-      makes `{"a": {"b": 1}}`. Here the fetch and the UPDATE are 42804
-      `cannot subscript type jsonb because it does not support
-      subscripting` -- a wrong statement about jsonb, not a gap named as
-      one -- and the PL/pgSQL assignment is 0A000.
-      Verify: tests/backlog/test_rp_found_rp711.py::test_jsonb_subscripting
-      Backlog-ID: RP-772
-
 ## Found while working RP-668 (2026-11-09)
 
 Measured on a private PostgreSQL 15.19 cluster with the `_SCOPE_SETUP` in

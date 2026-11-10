@@ -191,6 +191,7 @@ pub use correlated::{
     DESCRIBE_QUERY, FETCH_CURSOR,
 };
 pub mod json;
+pub mod jsonb_subs;
 pub mod jsonfn;
 pub mod jsonops;
 pub mod jsonpath;
@@ -438,6 +439,12 @@ impl Error {
                 if m == "macaddr8 data out of range to convert to macaddr" =>
             {
                 Some("Only addresses that have FF and FE as values in the 4th and 5th bytes from the left, for example xx:xx:xx:ff:fe:xx:xx:xx, are eligible to be converted from macaddr8 to macaddr.")
+            }
+            // `jsonb_subscript_transform` (jsonbsubs.c).
+            Error::DatatypeMismatch(m)
+                if m.starts_with("subscript type ") && m.ends_with(" is not supported") =>
+            {
+                Some("jsonb subscript must be coercible to either integer or text.")
             }
             Error::DatatypeMismatch(m) if m.contains(" but expression is of type ") => {
                 Some("You will need to rewrite or cast the expression.")
@@ -3744,6 +3751,10 @@ pub struct SubscriptAssign {
     pub typmod: i32,
     pub subs: Vec<SubscriptTarget>,
     pub value: ColumnExpr,
+    /// Over a `jsonb` column, the type each subscript is coerced to
+    /// (`jsonb_subscript_transform`); the assignment is then jsonb's
+    /// `jsonb_set_element`, not an array's (RP-772).
+    pub jsonb: Option<Vec<jsonb_subs::SubscriptKind>>,
 }
 
 /// One subscript of an assignment target. A bound is an expression over the
@@ -4067,6 +4078,70 @@ fn vector_scalars(values: Vec<Bson>, element: &str) -> Vec<Bson> {
         .collect()
 }
 
+/// The subscripts of a jsonb reference, each with the type it is coerced
+/// to (`jsonb_subscript_transform`): a slice anywhere is 42804, as is a
+/// subscript of a type that coerces to neither `int4` nor `text`.
+fn jsonb_subscript_kinds(
+    indirection: &[pg_query::protobuf::Node],
+    mut type_of: impl FnMut(&pg_query::protobuf::Node) -> Result<String>,
+) -> Result<Vec<(&pg_query::protobuf::Node, jsonb_subs::SubscriptKind)>> {
+    let mut out = Vec::with_capacity(indirection.len());
+    let indices: Vec<&pg_query::protobuf::AIndices> = indirection
+        .iter()
+        .filter_map(|i| match i.node.as_ref() {
+            Some(N::AIndices(ix)) => Some(ix.as_ref()),
+            _ => None,
+        })
+        .collect();
+    // The transform refuses a slice while it reads the FIRST subscript,
+    // at that subscript's upper bound (its lower one when there is none).
+    if indices.iter().any(|ix| ix.is_slice) {
+        if let Some(loc) = indices
+            .first()
+            .and_then(|ix| ix.uidx.as_deref().or(ix.lidx.as_deref()))
+            .and_then(expr_location)
+        {
+            set_error_location(loc);
+        }
+        return Err(jsonb_subs::slice_error());
+    }
+    for ix in indices {
+        let sub = ix.uidx.as_deref().ok_or_else(jsonb_subs::slice_error)?;
+        let kind = jsonb_subs::subscript_kind(&type_of(sub)?).inspect_err(|_| {
+            if let Some(loc) = expr_location(sub) {
+                set_error_location(loc);
+            }
+        })?;
+        out.push((sub, kind));
+    }
+    Ok(out)
+}
+
+/// `j['a'][1]`: jsonb's subscripting handler's fetch (RP-772,
+/// [`jsonb_subs`]). The subscripts are typed first, so a NULL source still
+/// refuses a `numeric` one, as on PostgreSQL 15.19.
+fn jsonb_subscript_fetch(
+    value: Bson,
+    indirection: &[pg_query::protobuf::Node],
+    params: &[Bson],
+) -> Result<Bson> {
+    let subs = jsonb_subscript_kinds(indirection, |n| {
+        let v = const_value(n, params)?;
+        Ok(static_type(n, &v))
+    })?;
+    if value == Bson::Null {
+        return Ok(Bson::Null);
+    }
+    let mut path = Vec::with_capacity(subs.len());
+    for (n, kind) in subs {
+        match jsonb_subs::path_step(&const_value(n, params)?, kind)? {
+            Some(step) => path.push(step),
+            None => return Ok(Bson::Null),
+        }
+    }
+    jsonb_subs::fetch(&value, &path)
+}
+
 /// `a[i]`, `a[lo:hi]` and their multidimensional forms.
 ///
 /// Two rules decide the shape of the answer, and both are PostgreSQL's rather
@@ -4083,6 +4158,9 @@ fn array_subscript(
     params: &[Bson],
 ) -> Result<Bson> {
     let value = const_value(arg, params)?;
+    if static_type(arg, &value) == "jsonb" {
+        return jsonb_subscript_fetch(value, indirection, params);
+    }
     if value == Bson::Null {
         return Ok(Bson::Null);
     }
@@ -4155,6 +4233,10 @@ fn array_subscript(
     let lower = arrays::lower_bounds(&value);
     let value = arrays::strip(&value);
     if !matches!(value, Bson::Array(_)) {
+        // `transformContainerSubscripts` reports it at the container.
+        if let Some(loc) = expr_location(arg) {
+            set_error_location(loc);
+        }
         return Err(Error::DatatypeMismatch(format!(
             "cannot subscript type {} because it does not support subscripting",
             static_type(arg, &value)
@@ -7868,6 +7950,28 @@ fn assignment_pathway(source: &str, target: &str) -> bool {
         }
     }
     funcsig::category_of_oid(t) == Some('S')
+}
+
+/// `can_coerce_type(source, target, COERCION_IMPLICIT)` for a scalar
+/// target (`parse_coerce.c`): the same type, or a `pg_cast` row (built in or
+/// a user's) whose context is IMPLICIT. A domain is seen through to its
+/// base type (`find_coercion_pathway`'s `getBaseType`). There is no I/O
+/// fallback at the implicit level.
+pub(crate) fn implicit_pathway(source: &str, target: &str) -> bool {
+    let source = domains::domain_base(source).unwrap_or_else(|| source.to_string());
+    let (Some(s), Some(t)) = (user_casts::type_oid(&source), user_casts::type_oid(target)) else {
+        return false;
+    };
+    if s == t {
+        return true;
+    }
+    if let Some((.., context, _)) = pg_casts::BUILTIN_CASTS
+        .iter()
+        .find(|(_, cs, ct, ..)| *cs == s && *ct == t)
+    {
+        return *context == b'i';
+    }
+    user_casts::find(&source, target).is_some_and(|cast| cast.context == 'i')
 }
 
 /// Does PL/pgSQL assign a value of type `source` to a variable declared
@@ -30245,6 +30349,8 @@ fn static_type_uncached(node: &pg_query::protobuf::Node, value: &Bson) -> String
                 None if base == "oidvector" => if any_slice { "oid[]" } else { "oid" }.to_string(),
                 // `name` is an array of `"char"`.
                 None if base == "name" => QUOTED_CHAR.to_string(),
+                // jsonb's subscripting handler returns jsonb (RP-772).
+                None if base == "jsonb" => base,
                 None if base == "point" => "float8".to_string(),
                 None if matches!(base.as_str(), "lseg" | "box") => "point".to_string(),
                 None => inferred_type(value).to_string(),
@@ -43481,6 +43587,28 @@ fn plan_subscript_assign(
     params: &[Bson],
     sample: &Document,
 ) -> Result<SubscriptAssign> {
+    if column.pg_type == "jsonb" {
+        let kinds = jsonb_subscript_kinds(indirection, |n| {
+            row_column_expr(n, fields, params, sample).map(|e| column_expr_type(&e).to_string())
+        })?;
+        let mut subs = Vec::with_capacity(kinds.len());
+        let mut jsonb = Vec::with_capacity(kinds.len());
+        for (n, kind) in kinds {
+            subs.push(SubscriptTarget::Index(row_column_expr(
+                n, fields, params, sample,
+            )?));
+            jsonb.push(kind);
+        }
+        return Ok(SubscriptAssign {
+            field: field.to_string(),
+            pg_type: column.pg_type.clone(),
+            value_type: "jsonb".to_string(),
+            typmod: -1,
+            subs,
+            value: row_column_expr(val, fields, params, sample)?,
+            jsonb: Some(jsonb),
+        });
+    }
     let element = column.pg_type.strip_suffix("[]").ok_or_else(|| {
         Error::DatatypeMismatch(format!(
             "cannot subscript type {} because it does not support subscripting",
@@ -43525,6 +43653,7 @@ fn plan_subscript_assign(
         typmod: column.typmod,
         subs,
         value: row_column_expr(val, fields, params, sample)?,
+        jsonb: None,
     })
 }
 
@@ -43533,6 +43662,22 @@ fn plan_subscript_assign(
 /// ([`array_assign`]): a one-dimensional array grows to meet a subscript
 /// past either end, NULL-filling the gap; a multidimensional one does not.
 fn apply_subscript_assign(a: &SubscriptAssign, row: &Document, current: Bson) -> Result<Bson> {
+    if let Some(kinds) = &a.jsonb {
+        // `jsonb_subscript_check_subscripts`: every subscript as text, none
+        // NULL; then the value, NULL being JSON `null`.
+        let mut path = Vec::with_capacity(kinds.len());
+        for (s, kind) in a.subs.iter().zip(kinds) {
+            let SubscriptTarget::Index(e) = s else {
+                return Err(jsonb_subs::slice_error());
+            };
+            let step = jsonb_subs::path_step(&apply_row_expr(e, row)?, *kind)?
+                .ok_or_else(jsonb_subs::null_subscript_error)?;
+            path.push(step);
+        }
+        let expect_array = kinds.first() == Some(&jsonb_subs::SubscriptKind::Int);
+        let value = cast_value(apply_row_expr(&a.value, row)?, "jsonb")?;
+        return jsonb_subs::assign(&current, &path, expect_array, &value);
+    }
     // The subscripts are evaluated and checked first (none may be NULL),
     // then the value (`ExecEvalSubscriptingRef`'s order).
     let bound = |e: &Option<ColumnExpr>| e.as_ref().map(|e| apply_row_expr(e, row)).transpose();
