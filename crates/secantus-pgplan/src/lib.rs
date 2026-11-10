@@ -7849,6 +7849,146 @@ fn assignment_pathway(source: &str, target: &str) -> bool {
     funcsig::category_of_oid(t) == Some('S')
 }
 
+/// Does PL/pgSQL assign a value of type `source` to a variable declared
+/// `target` through the types' text I/O rather than by a cast? PL/pgSQL
+/// coerces with `COERCION_PLPGSQL` (`exec_cast_value` ->
+/// `get_cast_hashentry`), which lies between ASSIGNMENT and EXPLICIT: an
+/// implicit or assignment cast is used, an explicit-only one is not, and
+/// when `find_coercion_pathway` finds nothing else it falls back to
+/// `COERCEVIAIO` -- the source's output function, then the target's input.
+/// So `x int := true` reaches `int4in` as `t` and is 22P02, and
+/// `x date := 5` is 22007, not 42846 (RP-712).
+///
+/// Both sides are seen through a domain to its base (`getBaseType`).
+/// Answers `false` when an ordinary cast does the same: the same type; a
+/// type of the string category on the source side, whose explicit cast is
+/// already the I/O conversion; a type outside the built-in catalog (a
+/// user's enum or composite), a pseudo-type or `unknown`, which are left to
+/// the caller's cast.
+pub fn plpgsql_assigns_via_io(source: &str, target: &str) -> bool {
+    let (Some(s), Some(t)) = (plpgsql_base(source), plpgsql_base(target)) else {
+        return false;
+    };
+    if s == t {
+        return false;
+    }
+    let (Some(so), Some(to)) = (pgtypes::oid_of_name(&s), pgtypes::oid_of_name(&t)) else {
+        return false;
+    };
+    let category = |oid: i64, name: &str| {
+        let element = name.trim_end_matches("[]");
+        let oid = if element.len() == name.len() {
+            Some(oid)
+        } else {
+            pgtypes::oid_of_name(element)
+        };
+        oid.and_then(funcsig::category_of_oid)
+    };
+    match (category(so, &s), category(to, &t)) {
+        (Some('S' | 'P' | 'X'), _) | (_, Some('P' | 'X')) | (None, _) | (_, None) => false,
+        _ => !assignment_pathway(&s, &t),
+    }
+}
+
+/// A type named as a PL/pgSQL declaration or a described column names it,
+/// seen through a domain, in the planner's spelling.
+fn plpgsql_base(t: &str) -> Option<String> {
+    let (name, _) = declared_type_and_typmod(t)?;
+    let name = match domains::base_type_and_typmod(&name) {
+        Some((b, ..)) => declared_type_and_typmod(&b).map_or(b, |(n, _)| n),
+        None => name,
+    };
+    Some(one_array_level(&name))
+}
+
+/// Are the output function of `source` and the input function of
+/// `target` both IMMUTABLE in PostgreSQL 15's `pg_proc`, so that
+/// `eval_const_expressions` folds a `CoerceViaIO` between them over a
+/// constant at plan time? An array converts element by element
+/// (`ArrayCoerceExpr`), so its elements' functions decide. Where they
+/// fold, a PL/pgSQL assignment's conversion error is raised while its
+/// query is planned, under the `PL/pgSQL assignment` frame; where not, it
+/// is raised by the executor's simple-expression path, which has none.
+pub fn plpgsql_io_folds(source: &str, target: &str) -> bool {
+    // `typinput` / `typoutput` of provolatile `s`, measured on 15.19
+    // (`oid < 16384`); every other built-in's are `i`.
+    fn stable_io(t: &str, input: bool) -> bool {
+        let both = matches!(
+            t,
+            "date"
+                | "interval"
+                | "money"
+                | "timestamp"
+                | "timestamptz"
+                | "aclitem"
+                | "record"
+                | "int4range"
+                | "int8range"
+                | "numrange"
+                | "daterange"
+                | "tsrange"
+                | "tstzrange"
+                | "int4multirange"
+                | "int8multirange"
+                | "nummultirange"
+                | "datemultirange"
+                | "tsmultirange"
+                | "tstzmultirange"
+        ) || t.starts_with("reg");
+        both || (input && matches!(t, "time" | "timetz" | "xml"))
+    }
+    let (Some(s), Some(t)) = (plpgsql_base(source), plpgsql_base(target)) else {
+        return false;
+    };
+    let (s, t) = (s.trim_end_matches("[]"), t.trim_end_matches("[]"));
+    !stable_io(s, false) && !stable_io(t, true)
+}
+
+#[cfg(test)]
+mod plpgsql_assigns_via_io_tests {
+    use super::plpgsql_assigns_via_io as io;
+
+    #[test]
+    fn an_explicit_only_cast_or_none_converts_through_text() {
+        // bool <-> int4 are explicit-only casts (`int4(bool)`, `bool(int4)`).
+        assert!(io("bool", "int"));
+        assert!(io("int4", "boolean"));
+        // No pg_cast row at all, and neither side a string type.
+        assert!(io("int4", "date"));
+        // An array coerces element by element: bool -> int4 has no path.
+        assert!(io("bool[]", "int4[]"));
+    }
+
+    #[test]
+    fn an_implicit_or_assignment_cast_is_used() {
+        assert!(!io("int4", "int8"));
+        assert!(!io("int8", "int4"));
+        assert!(!io("numeric", "int4"));
+        // Into the string category is always an assignment coercion.
+        assert!(!io("bool", "text"));
+        assert!(!io("bool", "varchar(3)"));
+        // Out of it, the explicit cast already is the I/O conversion.
+        assert!(!io("text", "int4"));
+        assert!(!io("int4", "int4"));
+        assert!(!io("int4[]", "int8[]"));
+    }
+
+    #[test]
+    fn a_conversion_folds_only_through_immutable_io_functions() {
+        use super::plpgsql_io_folds as folds;
+        assert!(folds("bool", "int4"));
+        assert!(folds("bool[]", "int4[]"));
+        assert!(folds("int4", "inet"));
+        // `date_in`, `range_in` and `cash_out` are STABLE.
+        assert!(!folds("int4", "date"));
+        assert!(!folds("int4", "int4range"));
+        assert!(!folds("money", "float8"));
+        // `time_out` is immutable, `time_in` is not.
+        assert!(folds("time", "int4"));
+        assert!(!folds("int4", "time"));
+    }
+}
+
 /// `int4[][]` names the same type as `int4[]`: PostgreSQL records no
 /// dimension count in a type.
 fn one_array_level(name: &str) -> String {

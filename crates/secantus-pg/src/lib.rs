@@ -2121,6 +2121,31 @@ impl Drop for NestedStatement<'_> {
 }
 
 impl plpgsql_fn::Host for PlHost<'_> {
+    fn expression_type(&self, sql: &str, types: &[String]) -> Option<String> {
+        // Planned as a Describe plans it, over NULL parameters of the
+        // declared types, but with no subquery runner and without
+        // `describe_fields`' bookkeeping: an expression that fails to plan
+        // (`1/0` folds) answers no type here, and the evaluation that
+        // follows raises the error -- recording it as a failed Describe
+        // would abort the transaction first (25P02).
+        let declared: Vec<Option<String>> = types.iter().map(|t| Some(t.clone())).collect();
+        let params = vec![Bson::Null; types.len()];
+        let stmt = secantus_pgplan::plan_with_session_types_and_subqueries(
+            sql,
+            &|n| self.h.lookup(n),
+            &params,
+            &declared,
+            &self.h.session_timezone(),
+            None,
+        )
+        .ok()?;
+        let fields = self.h.describe_planned(stmt).ok()??;
+        let [field] = fields.as_slice() else {
+            return None;
+        };
+        secantus_pgplan::pgtypes::type_name_of_oid(i64::from(field.datatype().oid()))
+    }
+
     fn output_domains(&self, sql: &str, types: &[String]) -> Vec<Option<String>> {
         let lookup = |n: &str| self.h.lookup(n);
         secantus_pgplan::select_output_domains(sql, types, &lookup)

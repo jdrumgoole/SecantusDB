@@ -2558,16 +2558,6 @@ Measured on a private PostgreSQL 15.19 cluster with the `_SETUP` in
 Measured on a private PostgreSQL 15.19 cluster with the `_SETUP` in
 `tests/backlog/test_rp_found_rp694.py`: `dnn694` an `int` domain `not null`.
 
-- [ ] **An assignment with only an explicit cast uses it.** `declare x int;
-      begin x := true;` is 22P02 `invalid input syntax for type integer:
-      "t"` on PostgreSQL 15.19, as are `select true into x` and `x bool :=
-      5`: PL/pgSQL coerces with `COERCION_PLPGSQL`, which with no implicit
-      or assignment cast converts through the source's output and the
-      target's input (`get_cast_hashentry`). Here the explicit cast runs
-      and `x` is 1 (`t` for the `bool`). `eval_typed` and `coerce_moved`
-      both cast with `::`.
-      Verify: tests/backlog/test_rp_found_rp694.py::test_assignment_with_only_an_explicit_cast_converts_through_text
-      Backlog-ID: RP-712
 - [ ] **A `FOR` over a query or an `EXECUTE ... INTO` refuses scalar
       variable targets.** `for x in select '7'::text loop` over an `int`
       `x`, `for x, y in select 1, 'a'` and `execute 'select 7' into x` each
@@ -2578,6 +2568,48 @@ Measured on a private PostgreSQL 15.19 cluster with the `_SETUP` in
       goes through `target_datum`).
       Verify: tests/backlog/test_rp_found_rp694.py::test_for_and_execute_into_scalar_variables
       Backlog-ID: RP-713
+
+## Found while working RP-712 (2026-11-10)
+
+Measured on PostgreSQL 15.19 (port 5415) with statements that create
+nothing. The gap tests are in `tests/backlog/test_rp_found_rp712.py`.
+
+- [ ] **A `numeric` out of `int4`'s range quotes its value.** `select
+      1e20::numeric::int` is 22003 `integer out of range` on PostgreSQL
+      15.19 (`numeric_int4_opt_error`); here the message is `integer out of
+      range: "100000000000000000000"`, in plain SQL and in a PL/pgSQL
+      assignment or `INTO` alike.
+      Verify: tests/backlog/test_rp_found_rp712.py::test_numeric_out_of_int4_range_quotes_no_value
+      Backlog-ID: RP-749
+- [ ] **A `jsonb` input error carries no `JSON data` CONTEXT.** `select
+      't'::jsonb` is 22P02 `invalid input syntax for type json` with
+      CONTEXT `JSON data, line 1: t` on PostgreSQL 15.19 (`json_errcontext`);
+      here the CONTEXT is absent, and in a PL/pgSQL assignment (`x jsonb :=
+      true`) the line is missing from the stack.
+      Verify: tests/backlog/test_rp_found_rp712.py::test_jsonb_input_error_carries_its_json_data_context
+      Backlog-ID: RP-750
+- [ ] **A `money` variable prints its number in a RAISE.** `declare x money;
+      begin x := 5.25; raise notice '%', x;` notices `$5.25` on PostgreSQL
+      15.19 (RAISE prints a value by its type's output function, `cash_out`);
+      here it notices `5.25`, the carried numeric.
+      Verify: tests/backlog/test_rp_found_rp712.py::test_money_variable_prints_through_cash_out
+      Backlog-ID: RP-751
+- [ ] **An assignment's overlong `varchar(n)` value is 22001 with no
+      assignment frame.** `declare x varchar(3); begin x := 'abcdef'::text;`
+      carries CONTEXT `PL/pgSQL assignment "x := 'abcdef'::text"` above the
+      `at assignment` line on PostgreSQL 15.19: the length coercion is part
+      of the assignment's query and folds as it is planned. Here only the
+      `at assignment` line is sent: `fit_assigned` raises outside the
+      framed query.
+      Verify: tests/backlog/test_rp_found_rp712.py::test_overlong_varchar_assignment_is_framed_by_the_assignment
+      Backlog-ID: RP-752
+- [ ] **An assignment's literal input error carries no internal query.**
+      `declare x int; begin x := 'abc';` is 22P02 with `internal_query` `x
+      := 'abc'` on PostgreSQL 15.19 (the literal is coerced as the
+      assignment is parsed); here no internal query is sent. The same class
+      as RP-488, in a shape its test does not reach.
+      Verify: tests/backlog/test_rp_found_rp712.py::test_literal_input_error_in_an_assignment_carries_its_query
+      Backlog-ID: RP-753
 
 ## Found while working RP-695 (2026-11-09)
 
