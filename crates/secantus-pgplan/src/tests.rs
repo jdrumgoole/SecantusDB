@@ -3648,6 +3648,47 @@ fn citext_internal_functions() {
 }
 
 #[test]
+fn a_using_clause_name_error_has_no_position() {
+    // `transformFromClauseItem` matches USING names with no
+    // `parser_errposition` (PostgreSQL 15.19, RP-481).
+    for (sql, state, message) in [
+        (
+            "select * from fs join fe using (nosuch)",
+            "42703",
+            "column \"nosuch\" specified in USING clause does not exist in left table",
+        ),
+        (
+            "select * from fs join fe using (c)",
+            "42703",
+            "column \"c\" specified in USING clause does not exist in right table",
+        ),
+        (
+            "select * from (select 1 as a, 2 as a) l join fe using (a)",
+            "42702",
+            "common column name \"a\" appears more than once in left table",
+        ),
+        (
+            "select * from fs join fe using (a, a)",
+            "42701",
+            "column name \"a\" appears more than once in USING clause",
+        ),
+    ] {
+        take_error_location();
+        assert_eq!(error_position(sql, state, message), None, "for {sql}");
+    }
+    // An unknown column elsewhere in the statement is still placed.
+    take_error_location();
+    assert_eq!(
+        error_position(
+            "select nosuch from fs join fe using (a)",
+            "42703",
+            "column \"nosuch\" does not exist"
+        ),
+        Some(8)
+    );
+}
+
+#[test]
 fn an_unterminated_literal_is_positioned_where_it_opens() {
     let at = |sql: &str, message: &str| error_position(sql, "42601", message);
     assert_eq!(

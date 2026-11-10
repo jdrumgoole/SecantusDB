@@ -2141,14 +2141,15 @@ Measured on PostgreSQL 15.19 (the data-modifying WITH on a private cluster).
       Backlog-ID: RP-471
       Verify: tests/backlog/test_rp_subquery_scope.py::test_aliased_join_plan
 
-## Found while working RP-470 (2026-11-07)
+## Found while working RP-481 (2026-11-10)
 
-- [ ] **A missing USING column's 42703 carries a position.** PostgreSQL
-      15.19 reports `column "a" specified in USING clause does not exist in
-      left table` with no position; here it points into the statement (41,
-      33 in the gap test's two statements).
-      Verify: tests/backlog/test_rp_subquery_scope.py::test_using_column_missing_has_no_position
-      Backlog-ID: RP-481
+- [ ] **A USING list that names a column twice is not refused.**
+      PostgreSQL 15.19's `transformFromClauseItem` refuses `select * from
+      fs join fe using (a, a)` with 42701 `column name "a" appears more
+      than once in USING clause` (no position); here it runs and returns
+      the join's rows.
+      Verify: tests/backlog/test_rp_subquery_scope.py::test_using_clause_repeats_a_column
+      Backlog-ID: RP-857
 
 ## Found while working RP-479 (2026-11-08)
 
