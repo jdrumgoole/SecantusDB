@@ -109,6 +109,24 @@ next_item() {
     echo "$n"
 }
 
+# Whether a listed ID is still open: a `Backlog-ID:` line in its backlog
+# on the branch the fixes land on. An item another lane's fix closed in
+# passing (RM-403 closed RM-397, RM-408 closed RM-396, 2026-11-10) used to
+# get a session that found nothing to do, landed nothing, and so stopped
+# the batch. Unknown backlog or no branch: open, and the session decides.
+item_is_open() {
+    local id=$1 ref=$2 file=
+    case "$backlog" in
+        mongo* | rm) file=tasks/backlog-rust-mongodb.md ;;
+        postgres | pg | rp) file=tasks/backlog-rust-postgres.md ;;
+        *) return 0 ;;
+    esac
+    git fetch -q origin "$ref" 2>/dev/null
+    local text
+    text=$(git show "origin/$ref:$file" 2>/dev/null) || return 0
+    grep -qE "Backlog-ID: ${id}([^0-9]|\$)" <<<"$text"
+}
+
 lane() {
     local k=$1 wt=
     # Stagger the lanes so the second does not pick while the first is
@@ -165,6 +183,10 @@ lane() {
         fi
         local id=
         [[ -n $list ]] && id=$(grep -vE '^[[:space:]]*(#|$)' "$list" | sed -n "${n}p" | awk '{print $1}')
+        if [[ -n $id ]] && ! item_is_open "$id" "${into:-main}"; then
+            echo "$(date '+%F %T') item $n (lane $k) skipped: $id is already closed on ${into:-main}" >>"$out/summary.txt"
+            continue
+        fi
         scripts/fix_one.sh -p "$backlog" $id ${into:+into "$into"} ${wt:+lane "$wt"} >"$out/$n.log" 2>&1
         local rc=$?
         if [[ $rc -eq 0 && -n $into ]]; then
