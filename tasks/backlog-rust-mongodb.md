@@ -1272,14 +1272,59 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       sizes, so those stages spill and refuse later than mongod.
       Verify: tests/backlog/test_rm_found_2026_11_08_explain.py::test_changed_documents_are_sized_as_mongod_sizes_them
       Backlog-ID: RM-408
-- [ ] **A pipeline's own `$_internalSetWindowFields` ranks without a sort
-      key.** The stage runs since RM-328, as mongod runs it behind the
-      `$sort` a `$setWindowFields` is parsed into. Named by a pipeline
-      without a `$sort` in front, mongod 8.2.1's `$rank` finds no sort key
-      on the documents and ranks every one 1; this server ranks them by
-      their `sortBy` values in the order they came (1, 2, 3, 3, 5).
-      Verify: tests/backlog/test_rm_found_2026_11_08_explain.py::test_an_internal_window_ranks_by_the_sort_key_it_was_given
-      Backlog-ID: RM-410
+- [ ] **The sort key is lost at a `$replaceRoot`, a `$lookup` or a
+      `$setWindowFields`.** mongod 8.2.11 keeps a document's sort key
+      through a `$replaceRoot`, a `$lookup` and a `$setWindowFields` with no
+      `sortBy`, and a `$setWindowFields` that sorts leaves its own (the
+      partition key, then `sortBy`). This server ends the key at each
+      (`agg_meta::KEEPS_SORT_METADATA`), so a `$_internalSetWindowFields`
+      after one ranks every document 1 and `{$meta: "sortKey"}` reads `[]`.
+      Found 2026-11-10 (RM-410).
+      Verify: tests/backlog/test_rm_found_2026_11_10_rm410.py::test_the_sort_key_passes_through_stages_that_keep_it
+      Backlog-ID: RM-520
+- [ ] **A `$lookup` sub-pipeline's `$sort` sets no sort key.** In a
+      `$lookup` pipeline, mongod 8.2.11 ranks a `$_internalSetWindowFields`
+      by the key the sub-pipeline's `$sort` set; this server does not run
+      `agg_meta::rewrite_sort_metadata` over a sub-pipeline, so every
+      document ties. Found 2026-11-10 (RM-410).
+      Verify: tests/backlog/test_rm_found_2026_11_10_rm410.py::test_a_lookup_sub_pipeline_sort_sets_the_key
+      Backlog-ID: RM-521
+- [ ] **A rank with no sort key at all is answered, not refused.** After a
+      `$group` or a `$unionWith` a document carries no sort key
+      (`{$meta: "sortKey"}` is missing there, not `[]`), and mongod 8.2.11
+      refuses a `$_internalSetWindowFields` `$rank` with 9973200 "Attempt to
+      get sort key which has not been populated"; this server ties the
+      documents. A document read from the collection with no `$sort` has the
+      empty key, which ties, on both. Found 2026-11-10 (RM-410).
+      Verify: tests/backlog/test_rm_found_2026_11_10_rm410.py::test_a_rank_with_no_sort_key_is_refused
+      Backlog-ID: RM-522
+- [ ] **A `$sort` behind another stage sets the sort key where mongod's
+      keeps the earlier one.** Behind a leading `$sort` and an `$addFields`,
+      mongod 8.2.11's key after a second `$sort` is still the first's; a
+      `$sort` behind a leading `$addFields` or `$project` leaves the empty
+      key. `{$meta: "sortKey"}` and a `$_internalSetWindowFields`'s ranks
+      show it alike; this server takes the last `$sort`'s key. (Behind an
+      `$unwind` mongod does take the later `$sort`'s.) Cause in mongod not
+      traced: measured, not derived. Found 2026-11-10 (RM-410).
+      Verify: tests/backlog/test_rm_found_2026_11_10_rm410.py::test_which_sort_sets_the_key
+      Backlog-ID: RM-523
+- [ ] **A `$sort` that a later `$sort` overrides still orders the ties.**
+      mongod 8.2.11 drops the earlier `$sort` of `$sort: {k: 1}, $sort: {n:
+      1}`, also across an `$unwind`, so documents tied on `n` come in the
+      collection's order; this server runs both, and the ties keep the
+      first sort's order. A different document order. Found 2026-11-10
+      (RM-410).
+      Verify: tests/backlog/test_rm_found_2026_11_10_rm410.py::test_a_sort_before_another_sort_is_dropped
+      Backlog-ID: RM-524
+- [ ] **`{$meta: "sortKey"}` gives an empty array's key as null.**
+      mongod 8.2.11's key for an empty array is `undefined`, which pymongo
+      decodes as `None`: `$type` reads `"undefined"`, and a `$group` on the
+      key keeps the empty array's document and a null's apart. This server
+      reads the key through `$ifNull` (`agg_meta::sort_key_read`), since its
+      expressions take `undefined` for MISSING. The ranks already tell the
+      two apart (RM-410). Found 2026-11-10.
+      Verify: tests/backlog/test_rm_found_2026_11_10_rm410.py::test_an_empty_arrays_sort_key_is_undefined
+      Backlog-ID: RM-525
 - [ ] **A query-layer sort spills its documents in sorted order, not as its
       scan read them.** mongod 8.2's `SORT` takes the documents as the stage
       below hands them over (a forward `COLLSCAN` for a plain collection)

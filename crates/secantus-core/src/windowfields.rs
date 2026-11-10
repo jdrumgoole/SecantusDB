@@ -45,6 +45,10 @@ use crate::{decimal, expressions, group, order, paths};
 type R<T> = Result<T, Fallback>;
 
 const RANK_FUNCS: [&str; 3] = ["$rank", "$denseRank", "$documentNumber"];
+
+/// The field the command layer hands a document's sort-key metadata over
+/// in, as the `$sort` in reach left it (`agg_meta::rewrite_sort_metadata`).
+pub const SORT_KEY_FIELD: &str = "__secantus_meta_sortKey";
 /// Ops whose output is a per-slot vector precomputed once over the sorted
 /// partition (prefix accumulation / gap-fill), rather than a window accumulator.
 const PREFIX_OPS: [&str; 3] = ["$expMovingAvg", "$locf", "$linearFill"];
@@ -354,6 +358,15 @@ fn window_fields_each(
     }
 
     let needs_rank = compiled.iter().any(|c| RANK_FUNCS.contains(&c.op));
+    // `$_internalSetWindowFields` ranks by the sort key a `$sort` in front
+    // attached (`ExpressionInternalRawSortKey`), not by its `sortBy`: with no
+    // `$sort` in reach the key is empty and every document ties (mongod
+    // 8.2.1 and 8.2.11, 2026-11-10, RM-410). The key is taken off each
+    // document while the stage runs, so the partition cache does not count
+    // it as a field, and put back on as it leaves for the stages after.
+    let mut docs = docs;
+    let metadata: Option<Vec<Option<Bson>>> =
+        presorted.then(|| docs.iter_mut().map(|d| d.remove(SORT_KEY_FIELD)).collect());
     // Range windows, `$linearFill`, and `$derivative`/`$integral` all need the
     // single-ascending-numeric sortBy values (window bounds / interp / rate x-axis).
     let needs_range = compiled.iter().any(|c| {
@@ -417,8 +430,9 @@ fn window_fields_each(
 
     // What of each document the partition cache holds.
     let cached = cache_fields(spec, &compiled, downstream);
-    let sizer = match sort_by {
-        Some(sort_by) if needs_rank => CacheSize::SortKey {
+    let sizer = match (sort_by, &metadata) {
+        (_, Some(m)) if needs_rank => CacheSize::Metadata(m),
+        (Some(sort_by), _) if needs_rank => CacheSize::SortKey {
             partition_by,
             sort_by,
             vars,
@@ -453,7 +467,7 @@ fn window_fields_each(
                     next: ordered
                         .get(pi + 1)
                         .filter(|next| !next.is_empty())
-                        .map(|next| (sizer.of(&docs[next[0]]), key(next))),
+                        .map(|next| (sizer.of(&docs, next[0]), key(next))),
                 }
             }
             None => PartitionToken::default(),
@@ -461,7 +475,11 @@ fn window_fields_each(
         let slots = slots.clone();
         let n = slots.len();
         let ranks = if needs_rank {
-            Some(compute_ranks(&slots, &docs, sort_by))
+            let keys = match &metadata {
+                Some(m) => RankKeys::Metadata(m),
+                None => RankKeys::SortBy(sort_by),
+            };
+            Some(compute_ranks(&slots, &docs, &keys))
         } else {
             None
         };
@@ -658,6 +676,9 @@ fn window_fields_each(
                     }
                 };
                 paths::set_path(&mut out_doc, c.field, value).map_err(|_| Fallback::Defer)?;
+            }
+            if let Some(Some(key)) = metadata.as_ref().map(|m| &m[orig_i]) {
+                out_doc.insert(SORT_KEY_FIELD, key.clone());
             }
             sink(out_doc)?;
         }
@@ -962,7 +983,7 @@ impl FunctionMemory {
                 // The key the accumulator kept: the first of the documents
                 // tied with this one.
                 let first_tied = ranks.map_or(pos, |r| r.rank[pos] as usize - 1);
-                let held = match sizer.sort_key(&docs[slots[first_tied]]) {
+                let held = match sizer.sort_key(docs, slots[first_tied]) {
                     Some(key) if *keeps_key => {
                         *base + crate::memlimit::classic_size(&key) - crate::memlimit::VALUE
                     }
@@ -1144,15 +1165,23 @@ enum CacheSize<'a> {
         sort_by: &'a Document,
         vars: &'a Document,
     },
+    /// `$_internalSetWindowFields`' rank functions read the sort key the
+    /// documents came with, by their index in the stage's input: one value
+    /// for a one-field `$sort`, an array for more, and the empty array with
+    /// no `$sort` in reach (mongod 8.2.11 holds 40 bytes more for it than
+    /// for an int, 2026-11-10, RM-410).
+    Metadata(&'a [Option<Bson>]),
 }
 
 impl CacheSize<'_> {
-    fn of(&self, doc: &Document) -> usize {
+    /// What the cache counts for `docs[i]`.
+    fn of(&self, docs: &[Document], i: usize) -> usize {
+        let doc = &docs[i];
         match self {
             CacheSize::Fields(Some(f)) => crate::memlimit::fields_size(doc, f),
             CacheSize::Fields(None) => crate::memlimit::document_size(doc),
-            CacheSize::SortKey { .. } => {
-                let key = self.sort_key(doc).unwrap_or(Bson::Null);
+            CacheSize::SortKey { .. } | CacheSize::Metadata(_) => {
+                let key = self.sort_key(docs, i).unwrap_or(Bson::Null);
                 crate::memlimit::document_size(doc)
                     + crate::memlimit::SORT_KEY_METADATA
                     + crate::memlimit::classic_size(&key)
@@ -1160,8 +1189,15 @@ impl CacheSize<'_> {
         }
     }
 
-    /// The sort key `$sort` attaches to `doc`, when the cache keeps it.
-    fn sort_key(&self, doc: &Document) -> Option<Bson> {
+    /// The sort key `$sort` attaches to `docs[i]`, when the cache keeps it.
+    fn sort_key(&self, docs: &[Document], i: usize) -> Option<Bson> {
+        if let CacheSize::Metadata(keys) = self {
+            return Some(match &keys[i] {
+                Some(Bson::Array(parts)) if parts.len() == 1 => parts[0].clone(),
+                Some(key) => key.clone(),
+                None => Bson::Array(Vec::new()),
+            });
+        }
         let CacheSize::SortKey {
             partition_by,
             sort_by,
@@ -1170,6 +1206,7 @@ impl CacheSize<'_> {
         else {
             return None;
         };
+        let doc = &docs[i];
         let mut parts = Vec::with_capacity(sort_by.len() + 1);
         if let Some(by) = partition_by {
             parts.push(partition_key(doc, by, vars));
@@ -1260,7 +1297,7 @@ fn run_cache(
     }
     let last = n as i64 - 1;
     let budget = crate::memlimit::budgets().window_fields;
-    let size = |i: usize| sizer.of(&docs[slots[i]]);
+    let size = |i: usize| sizer.of(docs, slots[i]);
     let mut read_next = false;
     let mut functions = compiled
         .iter()
@@ -1438,6 +1475,16 @@ fn sorted_slots(part: &[usize], docs: &[Document], sort_by: Option<&Document>) -
     Ok(slots)
 }
 
+/// What a rank function compares to find ties.
+enum RankKeys<'a> {
+    /// `$setWindowFields`: the `sortBy` values its own `$sort` ordered by.
+    SortBy(Option<&'a Document>),
+    /// `$_internalSetWindowFields`: each document's sort-key metadata, by
+    /// its index in the stage's input; `None` (no `$sort` in reach) is the
+    /// empty key.
+    Metadata(&'a [Option<Bson>]),
+}
+
 struct Ranks {
     doc_number: Vec<i32>,
     rank: Vec<i32>,
@@ -1447,8 +1494,8 @@ struct Ranks {
 /// Per-slot rank vectors over a sorted partition. `$documentNumber` is the
 /// 1-indexed slot; `$rank` restarts at the tie-group's first slot (gaps on
 /// ties); `$denseRank` increments once per distinct sort key (no gaps). Ties are
-/// consecutive slots whose `sortBy` field values all compare `Equal`.
-fn compute_ranks(slots: &[usize], docs: &[Document], sort_by: Option<&Document>) -> Ranks {
+/// consecutive slots whose keys compare `Equal`.
+fn compute_ranks(slots: &[usize], docs: &[Document], keys: &RankKeys) -> Ranks {
     let n = slots.len();
     let mut doc_number = vec![0i32; n];
     let mut rank = vec![0i32; n];
@@ -1467,15 +1514,20 @@ fn compute_ranks(slots: &[usize], docs: &[Document], sort_by: Option<&Document>)
     let mut cur_dense = 1i32;
     for i in 1..n {
         doc_number[i] = i as i32 + 1;
-        let tied = match sort_by {
-            Some(sb) => sb.iter().all(|(f, dir)| {
+        let tied = match keys {
+            RankKeys::SortBy(Some(sb)) => sb.iter().all(|(f, dir)| {
                 let desc = matches!(dir, Bson::Int32(-1) | Bson::Int64(-1));
                 order::cmp(
                     &order::sort_repr(field_value(&docs[slots[i]], f), desc),
                     &order::sort_repr(field_value(&docs[slots[i - 1]], f), desc),
                 ) == Ordering::Equal
             }),
-            None => false,
+            RankKeys::SortBy(None) => false,
+            RankKeys::Metadata(m) => {
+                let empty = Bson::Array(Vec::new());
+                let key = |slot: usize| m[slot].as_ref().unwrap_or(&empty);
+                order::cmp(key(slots[i]), key(slots[i - 1])) == Ordering::Equal
+            }
         };
         if !tied {
             cur_rank = i as i32 + 1;
@@ -2804,6 +2856,67 @@ mod budget_tests {
             .map(|d| (d.get_i32("_id").unwrap(), d.get_i32("t").unwrap()))
             .collect();
         assert_eq!(totals, [(0, 0), (1, 1), (2, 2), (3, 7), (4, 7), (5, 5)]);
+    }
+
+    /// `$_internalSetWindowFields` ranks by the sort key each document
+    /// came with, not by its `sortBy`, and with none every document ties
+    /// (mongod 8.2.1 and 8.2.11, 2026-11-10, RM-410). The key goes back on
+    /// each document for the stages after.
+    #[test]
+    fn the_internal_stage_ranks_by_the_sort_key_it_was_given() {
+        let ranks = |keys: &[Option<Bson>]| {
+            let docs: Vec<Document> = [3, 1, 2, 2, 5]
+                .iter()
+                .zip(keys)
+                .enumerate()
+                .map(|(i, (n, key))| {
+                    let mut d = doc! {"_id": i as i32, "n": *n};
+                    if let Some(key) = key {
+                        d.insert(SORT_KEY_FIELD, key.clone());
+                    }
+                    d
+                })
+                .collect();
+            let spec = Bson::Document(doc! {
+                "sortBy": {"n": 1},
+                "output": {"r": {"$rank": {}}, "d": {"$denseRank": {}}},
+            });
+            let mut out = Vec::new();
+            internal_set_window_fields_each(&spec, docs, &Document::new(), None, None, &mut |d| {
+                out.push(d);
+                Ok(())
+            })
+            .unwrap();
+            out
+        };
+        let none = ranks(&[None, None, None, None, None]);
+        let got: Vec<(i32, i32)> = none
+            .iter()
+            .map(|d| (d.get_i32("r").unwrap(), d.get_i32("d").unwrap()))
+            .collect();
+        assert_eq!(got, [(1, 1); 5]);
+        assert!(none.iter().all(|d| !d.contains_key(SORT_KEY_FIELD)));
+
+        // A `$sort` on another field: ties follow its key, and an empty
+        // array's (`undefined`) is not a null's.
+        let keys = [
+            bson!([0]),
+            bson!([0]),
+            Bson::Array(vec![Bson::Undefined]),
+            bson!([null]),
+            bson!([null]),
+        ];
+        let sorted = ranks(&keys.clone().map(Some));
+        let got: Vec<(i32, i32)> = sorted
+            .iter()
+            .map(|d| (d.get_i32("r").unwrap(), d.get_i32("d").unwrap()))
+            .collect();
+        assert_eq!(got, [(1, 1), (1, 1), (3, 2), (4, 3), (4, 3)]);
+        let back: Vec<&Bson> = sorted
+            .iter()
+            .map(|d| d.get(SORT_KEY_FIELD).unwrap())
+            .collect();
+        assert_eq!(back, keys.iter().collect::<Vec<_>>());
     }
 
     /// What `explain` lists for the stage: each function's most and the

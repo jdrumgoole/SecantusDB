@@ -1374,10 +1374,12 @@ pub(crate) fn sort_key_values(d: &Document, fields: &[(String, bool)]) -> R<Vec<
 }
 
 /// `{$_secantusSortKey: {into, by}}`: an internal stage the command layer
-/// puts after a `$sort` whose `{$meta: "sortKey"}` a later stage reads. It
-/// writes the sort key mongod keeps as metadata, an array with one value
-/// per sort field, under `into`. A missing value and an empty array show as
-/// null, as mongod shows them (measured 8.2.11).
+/// puts after a `$sort` whose sort key a later stage reads (a `{$meta:
+/// "sortKey"}`, a `$_internalSetWindowFields`'s ranks). It writes the sort
+/// key mongod keeps as metadata, an array with one value per sort field,
+/// under `into`: a missing value is null and an empty array `undefined`,
+/// which `$rank` tells apart and pymongo decodes as `None` (`$type` shows it;
+/// measured 8.2.11, 2026-11-10).
 fn sort_key_stage(docs: Vec<Document>, spec: &Bson) -> R<Vec<Document>> {
     let spec = spec.as_document().ok_or(Fallback::Defer)?;
     let Some(Bson::String(into)) = spec.get("into") else {
@@ -1386,13 +1388,7 @@ fn sort_key_stage(docs: Vec<Document>, spec: &Bson) -> R<Vec<Document>> {
     let fields = sort_fields(spec.get("by").ok_or(Fallback::Defer)?)?;
     docs.into_iter()
         .map(|mut d| {
-            let keys = sort_key_values(&d, &fields)?
-                .into_iter()
-                .map(|k| match k {
-                    Bson::Undefined | Bson::MinKey => Bson::Null,
-                    other => other,
-                })
-                .collect();
+            let keys = sort_key_values(&d, &fields)?;
             d.insert(into.clone(), Bson::Array(keys));
             Ok(d)
         })
