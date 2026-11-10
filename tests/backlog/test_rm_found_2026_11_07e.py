@@ -19,12 +19,14 @@ from tests.backlog.conftest import mongo_answer
 pymongo = pytest.importorskip("pymongo")
 
 
-@pytest.mark.backlog("RM-393")
+@pytest.mark.backlog_fixed("RM-393")
 def test_a_line_through_the_centre_is_at_distance_zero(rust_mongo: Any) -> None:
     """A 2dsphere `$geoNear` from a LineString's own first vertex: Linux
-    mongod 8.2.12 measures 0.0. macOS 8.2.1 measures 6.4256766055857336e-12
-    and this server 6.425676607797001e-12, so in a `$near` the line comes
-    after a point and a polygon at distance 0 instead of before them."""
+    mongod 8.2.12 measures 0.0. macOS 8.2.1 measures 6.4256766055857336e-12,
+    and this server answered 6.425676607797001e-12, a floor copied from that
+    build, so in a `$near` the line came after a point and a polygon at
+    distance 0 instead of before them. Its S2 arithmetic now rounds each
+    step, as the Linux build does, and `$geoNear` measures with it."""
     db = rust_mongo["rm393"]
     db.c.drop()
     line = {"type": "LineString", "coordinates": [[0.0, 0.0], [2.0, 2.0]]}

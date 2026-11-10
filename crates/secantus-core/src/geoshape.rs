@@ -890,19 +890,14 @@ impl Near {
     /// How far a stored value is from the centre: the least over the
     /// geometries it holds. `None` when it holds none this query measures.
     pub fn distance(&self, v: &Bson) -> Option<f64> {
+        if self.spherical {
+            return crate::geoorder::near::sphere_distance(self.centre, v);
+        }
         stored(v)
             .iter()
-            .filter_map(|g| {
-                if self.spherical {
-                    Some(sphere::distance(g, self.centre) * EARTH_RADIUS_METERS)
-                } else {
-                    match g {
-                        Geom::Point(p) => {
-                            Some(crate::geoorder::near::flat_distance(*p, self.centre))
-                        }
-                        _ => None,
-                    }
-                }
+            .filter_map(|g| match g {
+                Geom::Point(p) => Some(crate::geoorder::near::flat_distance(*p, self.centre)),
+                _ => None,
             })
             .min_by(f64::total_cmp)
     }
@@ -966,10 +961,6 @@ pub(crate) mod sphere {
     use super::{Geom, P};
 
     pub type V = [f64; 3];
-
-    /// The angle mongod reports from a point to a line it lies on: not
-    /// nothing, but 6.42567661e-12 metres of it.
-    const ON_A_LINE: f64 = 1.007_459_37e-18;
 
     /// What counts as two lines touching, or a line touching a loop: about
     /// a centimetre on the ground, the width of a leaf cell. (Only a point
@@ -1577,28 +1568,6 @@ pub(crate) mod sphere {
                     _ => false,
                 })
             })
-    }
-
-    /// The angle from `centre` to the nearest point of the geometry: nothing
-    /// for a point on it or in it. A line is never at nothing, as mongod
-    /// measures it: `$maxDistance: 0` leaves out a line that starts at the
-    /// centre.
-    pub fn distance(g: &Geom, centre: P) -> f64 {
-        let mut pieces = Vec::new();
-        parts(g, &mut pieces);
-        let c = unit(centre);
-        pieces
-            .iter()
-            .map(|piece| match piece {
-                Part::Point(p) => angle(*p, c),
-                Part::Polygon(rings) if in_polygon(c, rings) => 0.0,
-                other => part_edges(other)
-                    .iter()
-                    .map(|(a, b)| to_arc(c, *a, *b))
-                    .fold(f64::INFINITY, f64::min)
-                    .max(ON_A_LINE),
-            })
-            .fold(f64::INFINITY, f64::min)
     }
 
     /// S2's `SimpleCCW`: `a`, `b`, `c` turn counter-clockwise.

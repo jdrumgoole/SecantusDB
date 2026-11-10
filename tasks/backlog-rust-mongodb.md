@@ -1155,21 +1155,6 @@ about forty such points; these are the ones measured.
       every other write.
       Backlog-ID: RM-501
       Verify: tests/backlog/test_rm_found_2026_11_10_rm391.py::test_a_batched_delete_many_tests_each_document_twice
-- [ ] **The S2 geometry computes with the macOS build's fused arithmetic,
-      not the Linux build's.** `crates/secantus-core/src/s2legacy/` was
-      written to the macOS arm64 mongod, which fuses multiply-adds: the
-      dot and cross products (`point.rs`), the face-UV transforms, the
-      interval arithmetic all use `mul_add`. mongod 8.2.12 on Linux, the
-      exemplar (Joe, 2026-10-21), rounds each step, x86-64 and arm64 alike
-      (measured in `mongo:8.2` containers, 2026-11-07). Seen: a 2dsphere
-      `$geoNear` from a LineString's own vertex is 0.0 on Linux, 6.4e-12 m
-      here (and on macOS, to within the last digits), so a `$near` returns
-      the line after the point and polygon tied with it at 0, not before.
-      The face-UV transforms decide which cell a point is in, so the
-      change can move index keys and explain bounds: measure the covering
-      and explain sweeps against a Linux mongod, not the macOS one on PATH.
-      Verify: tests/backlog/test_rm_found_2026_11_07e.py::test_a_line_through_the_centre_is_at_distance_zero
-      Backlog-ID: RM-393
 
 ### 7.086 The Rust MongoDB server, audited -- 2026-10-20
 

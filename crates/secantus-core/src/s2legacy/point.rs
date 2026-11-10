@@ -1,18 +1,14 @@
 //! `S2Point` (`Vector3<double>`), the face projections of `s2.h`, and the
 //! orientation predicates of `s2.cc`.
 //!
-//! Fused multiply-adds. clang (`-ffp-contract=on`, its default) fuses a
-//! product and a sum written in one source expression into one `fma`,
-//! and the reference mongod (8.2.11 on arm64) is built that way: a
-//! dot product `a*b + c*d + e*f` is `fma(e, f, fma(a, b, c*d))`, a cross
-//! product's `a*b - c*d` is `fma(a, b, -(c*d))`, and so on, the left-hand
-//! product fused when both sides are products. The rounding is not the
-//! same as the unfused arithmetic, and where a result should be exactly
-//! zero (a point on a line through the centre) only the fused one gives
-//! mongod's answer: mongod measures 6.42567661e-12 metres from a point to a
-//! line that starts there, the error term of one fused product. So every
-//! expression here is fused where clang fuses its C++ original, and only
-//! there.
+//! No fused multiply-adds. mongod's Linux build -- the exemplar (Joe,
+//! 2026-10-21) -- rounds every product and every sum, x86-64 and arm64
+//! alike (8.2.12, measured 2026-11-07), so each expression here is its C++
+//! original evaluated left to right, one rounding per operation. (The
+//! macOS arm64 build is compiled by clang with `-ffp-contract=on`, which
+//! fuses `a*b + c*d` into `fma(a, b, c*d)`: its rounding differs, and a
+//! point on a line through it is 6.4e-12 m from that line rather than 0.0.
+//! This module once copied that build; RM-393 moved it.)
 
 use std::ops::{Add, Mul, Neg, Sub};
 
@@ -34,20 +30,19 @@ impl Point {
         self.0[2]
     }
 
-    /// `DotProd`: `c0*v0 + c1*v1 + c2*v2`, fused as clang fuses it (see
-    /// the module notes).
+    /// `DotProd`: `c0*v0 + c1*v1 + c2*v2` (see the module notes).
     pub fn dot(self, o: Point) -> f64 {
         let (a, b) = (self.0, o.0);
-        a[2].mul_add(b[2], a[0].mul_add(b[0], a[1] * b[1]))
+        a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
     }
 
-    /// `CrossProd`: each `x*y - z*w` fused as `fma(x, y, -(z*w))`.
+    /// `CrossProd`: each component `x*y - z*w`.
     pub fn cross(self, o: Point) -> Point {
         let (a, b) = (self.0, o.0);
         Point([
-            a[1].mul_add(b[2], -(a[2] * b[1])),
-            a[2].mul_add(b[0], -(a[0] * b[2])),
-            a[0].mul_add(b[1], -(a[1] * b[0])),
+            a[1] * b[2] - a[2] * b[1],
+            a[2] * b[0] - a[0] * b[2],
+            a[0] * b[1] - a[1] * b[0],
         ])
     }
 
@@ -152,7 +147,7 @@ pub fn from_radians(lat: f64, lng: f64) -> Point {
 
 /// `S2LatLng::Latitude`.
 pub fn latitude(p: Point) -> f64 {
-    p.z().atan2(p.x().mul_add(p.x(), p.y() * p.y()).sqrt())
+    p.z().atan2((p.x() * p.x() + p.y() * p.y()).sqrt())
 }
 
 /// `S2LatLng::Longitude`.
@@ -164,17 +159,17 @@ pub fn longitude(p: Point) -> f64 {
 
 pub fn st_to_uv(s: f64) -> f64 {
     if s >= 0.5 {
-        (1.0 / 3.0) * (4.0 * s).mul_add(s, -1.0)
+        (1.0 / 3.0) * (4.0 * s * s - 1.0)
     } else {
-        (1.0 / 3.0) * (-(4.0 * (1.0 - s))).mul_add(1.0 - s, 1.0)
+        (1.0 / 3.0) * (1.0 - 4.0 * (1.0 - s) * (1.0 - s))
     }
 }
 
 pub fn uv_to_st(u: f64) -> f64 {
     if u >= 0.0 {
-        0.5 * 3.0f64.mul_add(u, 1.0).sqrt()
+        0.5 * (1.0 + 3.0 * u).sqrt()
     } else {
-        (-0.5f64).mul_add((-3.0f64).mul_add(u, 1.0).sqrt(), 1.0)
+        1.0 - 0.5 * (1.0 - 3.0 * u).sqrt()
     }
 }
 
@@ -306,14 +301,14 @@ pub fn robust_ccw(a: Point, b: Point, c: Point) -> i32 {
 
 fn planar_ccw(a: (f64, f64), b: (f64, f64)) -> i32 {
     // `Vector2_d`: `DotProd` and `Norm2` are `x*x' + y*y'`, `CrossProd`
-    // `x*y' - y*x'`, each fused like `Vector3`'s.
-    let dot2 = |p: (f64, f64), q: (f64, f64)| p.0.mul_add(q.0, p.1 * q.1);
+    // `x*y' - y*x'`.
+    let dot2 = |p: (f64, f64), q: (f64, f64)| p.0 * q.0 + p.1 * q.1;
     let sab = if dot2(a, b) > 0.0 { -1.0 } else { 1.0 };
     let vab = (a.0 + sab * b.0, a.1 + sab * b.1);
     let da = dot2(a, a);
     let db = dot2(b, b);
     let less = |p: (f64, f64), q: (f64, f64)| p.0 < q.0 || (p.0 == q.0 && p.1 < q.1);
-    let cross = |p: (f64, f64), q: (f64, f64)| p.0.mul_add(q.1, -(p.1 * q.0));
+    let cross = |p: (f64, f64), q: (f64, f64)| p.0 * q.1 - p.1 * q.0;
     let sign = if da < db || (da == db && less(a, b)) {
         cross(a, vab) * sab
     } else {

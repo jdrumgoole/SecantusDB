@@ -387,6 +387,15 @@ fn distance(near: &Near, flat: bool, value: &Bson) -> Option<f64> {
             .map(|p| flat_distance(p, centre))
             .reduce(least);
     }
+    sphere_distance(centre, value)
+}
+
+/// The sphere half of `computeGeoNearDistance`: the least
+/// `GeometryContainer::minDistance` from `centre` (longitude, latitude) to
+/// what the field holds, in metres. `$near` and `$geoNear` both measure
+/// with it.
+pub(crate) fn sphere_distance(centre: (f64, f64), value: &Bson) -> Option<f64> {
+    let least = |a: f64, b: f64| if b < a { b } else { a };
     let point = latlng_point(centre.0, centre.1);
     stored_all(value)
         .iter()

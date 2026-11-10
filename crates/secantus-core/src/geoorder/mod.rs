@@ -583,4 +583,13 @@ mod tests {
         let rest: Vec<i64> = std::iter::from_fn(|| next(&mut live)).collect();
         assert_eq!(rest, [20, 1, 2, 4, 21, 5]);
     }
+
+    #[test]
+    fn a_line_from_the_centre_is_at_distance_zero() {
+        // mongod 8.2.12 on Linux (x86-64 and arm64, 2026-11-07) rounds each
+        // step of S2's arithmetic and measures 0.0; the macOS build fuses
+        // multiply-adds and measures 6.4256766055857336e-12 (RM-393).
+        let line = bson::bson!({ "type": "LineString", "coordinates": [[0.0, 0.0], [2.0, 2.0]] });
+        assert_eq!(near::sphere_distance((0.0, 0.0), &line), Some(0.0));
+    }
 }
