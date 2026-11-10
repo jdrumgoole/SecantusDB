@@ -686,6 +686,12 @@ fn consult<'a>(
         cached_ran: Default::default(),
     };
     let _chosen = plan::plan(&query(Some(&trial)), &catalog);
+    // A contested read ran the cache's active plan, or a trial's winner.
+    let from_plan_cache = trial.cached_ran.get();
+    crate::opdebug::note_planned(crate::opdebug::Planned {
+        from_multi_planner: !from_plan_cache,
+        from_plan_cache,
+    });
     hook.read_only.set(true);
     Ok(Some(hook))
 }
@@ -1237,6 +1243,15 @@ fn tried(
     );
     if subplanned(&plan) {
         return Ok(Some((plan, None)));
+    }
+    // A read through the plan cache ran its active plan, or a trial's
+    // winner (`fromPlanCache`, `fromMultiPlanner`).
+    if hook.is_some() {
+        let from_plan_cache = trial.cached_ran.get();
+        crate::opdebug::note_planned(crate::opdebug::Planned {
+            from_multi_planner: !from_plan_cache,
+            from_plan_cache,
+        });
     }
     // The winner's trial, or none: the plan cache's plan ran in its place
     // (`CachedPlanStage`), or the winner was decided by counting, and

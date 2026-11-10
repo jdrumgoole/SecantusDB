@@ -1403,22 +1403,35 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
   every subtype-2 value. mongod 8.2.11 writes the bytes alone, which is not
   a valid subtype-2 value: pymongo refuses to decode the reply. Out of
   scope; nothing reads the old subtype as mongod emits it.
-- [ ] **`$queryStats` never records a query.** mongod 8.2.11 records
-      queries in its query stats store once `internalQueryStatsRateLimit`
-      is not 0 (-1: every query), and `$queryStats` lists each under its
-      representative shape (`key.queryShape`, `keyHash`, `queryShapeHash`)
-      with its `metrics`. Its default is 0, which records nothing: this
-      server reports that 0 and refuses to change it (20), so `$queryStats`
-      (argument, placement and privileges as mongod's since 2026-11-08) is
-      always empty. The store needs mongod's query-shape statistics, keyed by
-      the representative shape's SHA-256 (`queryShapeHash`, which this
-      server computes since 2026-11-07 for the shapes RM-358 covers);
-      `metrics` holds the counters RM-170 decided not to stand in for (the
-      delinquency counters, RM-355) beside ones a plan supplies. The plan
-      cache's shape (`planCacheShapeHash`) is a different shape and does not
-      serve it.
-      Backlog-ID: RM-215
-      Verify: tests/backlog/test_rm_found_2026_10_20b.py::test_query_stats_records_queries_when_asked
+- [ ] **`$queryStats`' remainder: cache size, explains, transformed
+      identifiers.** Since 2026-11-10 the query stats store records
+      `find`, `aggregate`, `distinct` and `count` under mongod's key, with
+      its metrics (`tests/mongod_live/test_query_stats.py`). mongod 8.2.11
+      also: reports `internalQueryStatsCacheSize` ("1%"), sizes the store
+      by it and evicts the least recent entries past it, and turns
+      `$queryStats` off (6579000) at "0MB"; samples by
+      `internalQueryStatsSampleRate`; records an `aggregate` that explains,
+      its key saying `explain: "queryPlanner"`; and lists every identifier
+      (field paths, namespaces, `let` names) as its HMAC-SHA-256 under
+      `transformIdentifiers`. This server reports neither parameter, keeps
+      every entry, records no explain, and refuses `transformIdentifiers`
+      (238) once the store has entries to print. Unmeasured: the key's
+      `writeConcern` and `$readPreference` (copied as the command gave
+      them), the order of `otherNss` past one namespace (mongod's is a hash
+      set's), and `fromMultiPlanner` for a rooted `$or` the subplanner
+      plans (counted false here). Found 2026-11-10 working RM-215.
+      Verify: tests/backlog/test_rm_found_2026_11_10_rm215.py::test_query_stats_remainder
+      Backlog-ID: RM-532
+- [ ] **A date-part operator's argument as an array of one fails.**
+      mongod 8.2.11 takes `{$year: ["$t"]}` (any of `$year` ... `$isoWeek`,
+      `$dayOfWeek`) as `{$year: "$t"}`: null for a missing field, the part
+      of a date. This server evaluates the array itself and fails with
+      16006 "can't convert from BSON type array to Date"; with
+      `[{date: "$t"}]` mongod's 16006 names an object where this server's
+      names an array. Found 2026-11-10 working RM-215, running the
+      query-shape corpus's expressions.
+      Verify: tests/backlog/test_rm_found_2026_11_10_rm215.py::test_a_date_part_takes_an_array_of_one
+      Backlog-ID: RM-533
 - [ ] **`$lookup` runs a `let` that is not a document, and a lone join field.**
       mongod 8.2.11 refuses `let: 5` with 14 "BSON field '$lookup.let' is
       the wrong type 'int', expected type 'object'", and `localField`
