@@ -169,7 +169,12 @@ fn derived_def(
                         || scalar && crate::collation::is_citext(&t)
                         // A network type: its comparisons go by
                         // `__net_sortkey`, not by the text (RP-610).
-                        || scalar && matches!(t.as_str(), "inet" | "cidr"))
+                        || scalar && matches!(t.as_str(), "inet" | "cidr")
+                        // An enum: a row casting to one types the column,
+                        // as `select_common_type` resolves the other rows'
+                        // unknown literals to it, so it sorts and compares
+                        // by declaration (RP-766).
+                        || scalar && enum_labels(&t).is_some())
                     .then_some(t)
                 }
                 _ => None,

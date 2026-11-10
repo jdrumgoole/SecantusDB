@@ -3411,16 +3411,21 @@ statement is VALUES-only and runs there as written.
       Verify: tests/backlog/test_rp_found_rp756.py::test_a_set_operation_from_subquerys_column_is_typed
       Backlog-ID: RP-765
 
-## Found while working RP-762 (2026-11-10)
+## Found while working RP-766 (2026-11-10)
 
 Measured on a private PostgreSQL 15.19 cluster with `create type e766 as
-enum ('z', 'a', 'm')`. The gap test is in `tests/backlog/test_rp_found_rp762.py`.
+enum ('z', 'a', 'm')` and `create table t766 (m e766)` holding `m`, `z`,
+`a`. The gap test is in `tests/backlog/test_rp_found_rp766.py`.
 
-- [ ] **An enum column of a VALUES list sorts by its labels' text.**
-      `select x::text as v from (values ('a'::e766), ('z'), ('m')) s(x)
-      order by x` is `z`, `a`, `m` on PostgreSQL 15.19, in declaration
-      order, as a table's enum column sorts here; here it is `a`, `m`, `z`.
-      A comparison over the column in an ORDER BY key compares the text the
-      same way. Not yet diagnosed.
-      Verify: tests/backlog/test_rp_found_rp762.py::test_a_values_enum_column_sorts_by_declaration
-      Backlog-ID: RP-766
+- [ ] **An enum column read through a subquery or a CTE sorts and compares
+      by its labels' text.** `select m::text as v from (select m from t766)
+      q order by m` is `z`, `a`, `m` on PostgreSQL 15.19, in declaration
+      order; here it is `a`, `m`, `z`. `select *` in the subquery, a CTE,
+      and a `WHERE m > 'z'` over the subquery's column (no rows here, `a`
+      and `m` on PostgreSQL) go the same way, as does an outer subquery
+      over a VALUES list's enum column. The type-order rewrite types a
+      derived relation's column only from a cast written in it
+      (`derived_def` in `secantus-pgplan/src/enum_order.rs`), not from the
+      column a target names in the derived query's own FROM.
+      Verify: tests/backlog/test_rp_found_rp766.py::test_a_derived_enum_column_sorts_by_declaration
+      Backlog-ID: RP-768
