@@ -957,17 +957,6 @@ These are explicit non-goals. Don't add them without a reason.
       says `IXSCAN { m: 1, t: 1 }`. Found while working RM-363, 2026-11-10.
       Verify: tests/backlog/test_rm_found_2026_11_10_rm363.py::test_a_read_of_the_meta_index_names_the_index_over_the_buckets
       Backlog-ID: RM-496
-- [ ] **A read of the plan cache's plan has no CACHED_PLAN stage.** mongod
-      8.2.11 runs the active plan of its plan cache under a CACHED_PLAN
-      stage, and its profile entries for the `find` and each `getMore`
-      carry it over the plan's stages, counting what it handed out (`works`
-      and `advanced` 2 on a first batch of two, 4 after the next); this
-      server's start at the plan's FETCH, whose counts are mongod's. A
-      `find` mongod plans by a fresh trial carries no MULTI_PLAN stage, and
-      neither does this server's. Measured 2026-11-09; found while working
-      RM-349.
-      Verify: tests/backlog/test_rm_355_364.py::test_a_read_of_the_cached_plan_reports_its_cached_plan_stage
-      Backlog-ID: RM-458
 - [ ] **WiredTiger 11's interruptible cache wait is not on the line.**
       mongod 8.2.11's WiredTiger splits a cache wait into the share spent
       in interruptible eviction (`timeWaitingMicros.cacheInterruptibleMicros`)

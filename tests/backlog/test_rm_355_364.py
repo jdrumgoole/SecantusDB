@@ -836,15 +836,16 @@ def test_a_rooted_or_of_tried_branches_counts_its_reads(rust_mongo: Any, mongod_
     assert answers["rust"] == answers["mongod"]
 
 
-@pytest.mark.backlog("RM-458")
+@pytest.mark.backlog_fixed("RM-458")
 def test_a_read_of_the_cached_plan_reports_its_cached_plan_stage(
     rust_mongo: Any, steady_mongod: Any
 ) -> None:
     """mongod 8.2.11's profile entries for a `find` that runs the active
     plan of its plan cache carry a CACHED_PLAN stage over the plan's, which
     counts what it handed out (`works` and `advanced` 2 on a first batch of
-    two, 4 after the next, measured 2026-11-09). This server's start at the
-    plan's FETCH."""
+    two, 4 after the next, measured 2026-11-09). This server's started at
+    the plan's FETCH; they now carry the CACHED_PLAN
+    (`test_a_cached_read_reports_its_cached_plan_as_it_ran`)."""
     query = {"a": {"$gte": 2}, "b": {"$gte": 3}}
 
     def setup(d: Any) -> None:
@@ -863,6 +864,68 @@ def test_a_read_of_the_cached_plan_reports_its_cached_plan_stage(
         for s, (_, entries) in got.items()
     }
     assert [e["stage"] for e in answers["mongod"]] == ["CACHED_PLAN"] * 8, answers["mongod"]
+    assert answers["rust"] == answers["mongod"]
+
+
+_CACHED_QUERY = {"a": {"$gte": 2}, "b": {"$gte": 3}}
+
+#: Reads of the plan cache's plan, besides `_CONTESTED`'s: a trial that
+#: ran to its end before a default first batch, a LIMIT filled after the
+#: trial in the first batch and in a `getMore`, a SKIP under a LIMIT, and a
+#: first batch that reads the plan to its end.
+_CACHED: dict[str, tuple[Any, Any]] = {
+    **_CONTESTED,
+    "ended_default_batch": (
+        _contested,
+        lambda d: list(d.c.find({"x": {"$gte": 2}, "y": 1})),
+    ),
+    "limit_past_trial": (
+        _contested_many,
+        lambda d: list(d.c.find(_CACHED_QUERY).limit(150).batch_size(200)),
+    ),
+    "limit_past_trial_batches": (
+        _contested_many,
+        lambda d: list(d.c.find(_CACHED_QUERY).limit(150).batch_size(120)),
+    ),
+    "skip_under_limit": (
+        _contested_many,
+        lambda d: list(d.c.find(_CACHED_QUERY).skip(3).limit(20).batch_size(8)),
+    ),
+    "whole_first_batch": (
+        _contested_many,
+        lambda d: list(d.c.find(_CACHED_QUERY).batch_size(500)),
+    ),
+}
+
+
+@pytest.mark.backlog_fixed("RM-458")
+@pytest.mark.parametrize("name", list(_CACHED))
+def test_a_cached_read_reports_its_cached_plan_as_it_ran(
+    rust_mongo: Any, steady_mongod: Any, name: str
+) -> None:
+    """mongod 8.2.11 runs a contested `find` whose plan cache entry is
+    active under a CACHED_PLAN stage, which hands out its trial's results
+    one per work before it works the plan again and passes on each work
+    after; it finds a plan already at its end (a trial that ran out, a
+    LIMIT filled) without working it, so the `find`'s last work is its own
+    (measured 2026-11-10). This server's entries had no CACHED_PLAN."""
+    setup, op = _CACHED[name]
+
+    def cached(d: Any) -> None:
+        setup(d)
+        for _ in range(2):
+            op(d)
+
+    got = _both(rust_mongo, steady_mongod, op, cached)
+    answers = {
+        s: [
+            (e.get("keysExamined"), e.get("docsExamined"), _timeless(e.get("execStats")))
+            for e in entries
+        ]
+        for s, (_, entries) in got.items()
+    }
+    assert answers["mongod"], name
+    assert all(a[2]["stage"] == "CACHED_PLAN" for a in answers["mongod"]), answers["mongod"]
     assert answers["rust"] == answers["mongod"]
 
 
