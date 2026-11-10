@@ -38550,7 +38550,7 @@ impl PgHandler {
                 let rows = if *on_left { &mut left } else { &mut right };
                 for row in rows.iter_mut() {
                     if let Some(Some(Bson::String(text))) = row.get(*i) {
-                        let v = secantus_pgplan::cast_text_to(text, name, &tz)
+                        let v = secantus_pgplan::cast_unknown_text_to(text, name, &tz)
                             .map_err(|e| Self::err(&e))?;
                         row[*i] = Some(v);
                     }
