@@ -43657,8 +43657,14 @@ fn collation_for_type(ty: &str) -> Result<Bson> {
     if let Some(known) = ty.strip_prefix('\u{1f}') {
         return Ok(Bson::String(crate::scalar::quote_identifier(known)));
     }
-    let base = ty.trim_end_matches("[]");
-    Ok(match base {
+    let mut base = ty.trim_end_matches("[]").to_string();
+    // A domain's collation is its base type's (`DefineDomain`), through a
+    // domain over a domain and a domain over an array; the error still
+    // names the type as `pg_typeof` gave it.
+    if let Some((inner, _, _)) = domains::base_type_and_typmod(&base) {
+        base = inner.trim_end_matches("[]").to_string();
+    }
+    Ok(match base.as_str() {
         "unknown" => Bson::Null,
         "name" => Bson::String("\"C\"".into()),
         "text" | "character varying" | "character" | "citext" | "varchar" | "bpchar" => {

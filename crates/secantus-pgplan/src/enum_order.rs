@@ -1866,11 +1866,15 @@ impl Rewriter<'_> {
                             // type is only settled when the statement runs.
                             Err(_) if crate::collation::collatable(&col.pg_type) => None,
                             // A parse-analysis error in PostgreSQL: raised
-                            // whether or not a row is read.
+                            // whether or not a row is read. It names the
+                            // column's type, a domain rather than its base.
                             Err(_) => {
                                 return Err(Error::DatatypeMismatch(format!(
                                     "collations are not supported by type {}",
-                                    crate::display_type(&col.pg_type)
+                                    col.extra.get_str("domain_type").map_or_else(
+                                        |_| crate::display_type(&col.pg_type),
+                                        |d| crate::pgtypes::user_type_catalog_name(d).to_string()
+                                    )
                                 )))
                             }
                         },
