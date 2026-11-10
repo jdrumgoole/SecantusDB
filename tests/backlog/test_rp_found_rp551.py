@@ -71,8 +71,9 @@ def test_domain_result_column_typmod(query: str, prepare: bool, dsn: str) -> Non
 
 
 # A column declared with a domain carries no modifier of its own: its
-# `atttypmod` is -1 (the domain's `typtypmod` holds the width).
-@pytest.mark.backlog("RP-558")
+# `atttypmod` is -1 (the domain's `typtypmod` holds the width). It
+# answered the domain's width, 7, until RP-661.
+@pytest.mark.backlog_fixed("RP-558")
 def test_domain_column_atttypmod(dsn: str) -> None:
     with _connect(dsn) as c:
         got = c.execute(

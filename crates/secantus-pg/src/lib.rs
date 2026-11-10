@@ -23977,7 +23977,7 @@ impl PgHandler {
                         );
                         d.insert(
                             def.field_of("atttypmod").expect("column"),
-                            Bson::Int32(catalog_typmod(c)),
+                            Bson::Int32(attribute_typmod(c)),
                         );
                         // `ALTER COLUMN ... SET STORAGE / STATISTICS`.
                         if let (Ok(storage), Some(field)) =
@@ -24125,7 +24125,7 @@ impl PgHandler {
                             let mut d = plain(ix.oid, &c.name, atttypid, i + 1);
                             d.insert(
                                 def.field_of("atttypmod").expect("column"),
-                                Bson::Int32(catalog_typmod(c)),
+                                Bson::Int32(attribute_typmod(c)),
                             );
                             // A key column's attribute is copied from the
                             // table's (`ConstructTupleDescriptor`).
@@ -40108,6 +40108,7 @@ impl PgHandler {
                 matview_sql,
                 matview_aliases,
                 access_method,
+                column_domains,
             } => {
                 // What PostgreSQL's analysis of the query refuses, before
                 // anything is made (RP-282).
@@ -40157,6 +40158,23 @@ impl PgHandler {
                             ))));
                         }
                         seen.push(name.clone());
+                        // A column of a domain makes a column of the domain,
+                        // with the domain's own modifier, as
+                        // `intorel_startup` copies the query's tuple
+                        // descriptor; the description read here has already
+                        // seen through it (RP-661).
+                        let domain = column_domains
+                            .get(i)
+                            .filter(|_| column_domains.len() == fields.len())
+                            .and_then(Option::as_deref);
+                        if let Some(column) = domain
+                            .map(|d| secantus_pgplan::domain_column(&name, d))
+                            .transpose()
+                            .map_err(|e| Self::err(&e))?
+                            .flatten()
+                        {
+                            return Ok(column);
+                        }
                         let pg_type = internal_type_name(f.datatype()).ok_or_else(|| {
                             PgWireError::UserError(Box::new(ErrorInfo::new(
                                 "ERROR".into(),
@@ -40184,6 +40202,7 @@ impl PgHandler {
                     def.extra.insert("access_method", am);
                 }
                 let targets: Vec<String> = def.columns.iter().map(|c| c.name.clone()).collect();
+                let written_width = targets.len();
                 // The rows are read BEFORE the table exists so a query that
                 // fails leaves nothing behind, as PostgreSQL's single
                 // transaction would.
@@ -40235,7 +40254,15 @@ impl PgHandler {
                             overriding_system: false,
                             overriding_user: false,
                             source_targets: Vec::new(),
-                            source_domains: Vec::new(),
+                            // `intorel_receive` coerces nothing: a value of
+                            // a domain column is copied unchecked, so a row
+                            // a `NOT VALID` CHECK would refuse is still
+                            // copied (RP-661).
+                            source_domains: if column_domains.len() == written_width {
+                                column_domains
+                            } else {
+                                Vec::new()
+                            },
                         }),
                         max_rows,
                     );
@@ -40262,23 +40289,25 @@ impl PgHandler {
                     .lookup_ref(&ins.table)
                     .ok_or_else(|| Self::err(&PlanError::UndefinedTable(ins.table.clone())))?;
                 // The domain columns whose source value is already of their
-                // domain: no coercion, so not checked (RP-664).
+                // domain: no coercion, so not checked (RP-664). An
+                // `INSERT ... SELECT`'s, and a CREATE TABLE AS fill's, whose
+                // rows were read before the table existed (RP-661).
                 let mut of_domain: Vec<String> = Vec::new();
+                for (target, src) in ins.targets.iter().zip(&ins.source_domains) {
+                    let (Some(col), Some(src)) = (def.column(target), src) else {
+                        continue;
+                    };
+                    if col
+                        .extra
+                        .get_str("domain_type")
+                        .is_ok_and(|d| secantus_pgplan::domains::same_domain(src, d))
+                    {
+                        of_domain.push(col.field());
+                    }
+                }
                 // `INSERT ... SELECT`: read the query's rows first, then write
                 // them exactly as a VALUES list would be written.
                 if let Some(source) = ins.source.take() {
-                    for (target, src) in ins.targets.iter().zip(&ins.source_domains) {
-                        let (Some(col), Some(src)) = (def.column(target), src) else {
-                            continue;
-                        };
-                        if col
-                            .extra
-                            .get_str("domain_type")
-                            .is_ok_and(|d| secantus_pgplan::domains::same_domain(src, d))
-                        {
-                            of_domain.push(col.field());
-                        }
-                    }
                     let mut source_types = self.check_insert_select_types(&def, &ins, &source)?;
                     // With user casts installed, the source's column types
                     // decide whether an assignment cast converts a value.
@@ -57226,11 +57255,24 @@ fn first_occurrences(start: Vec<String>, more: impl IntoIterator<Item = String>)
     fields
 }
 
-/// The type modifier the catalog reports for a column. A domain column's is
-/// its domain's own `typtypmod` (what `_pg_truetypmod` reads): `Column::typmod`
-/// holds the width a value is coerced to, which through a domain over a
-/// domain is the innermost domain's (`getBaseTypeAndTypmod`), while 15.19's
-/// catalog answers the outer domain's -1 (RP-551).
+/// A column's `pg_attribute.atttypmod`. A domain takes no modifier
+/// (`typenameTypeMod` refuses one), so a column of a domain is -1 however
+/// wide its base is: `a d`, `d` a domain over `char(3)`, is -1 on 15.19, in
+/// the table, an index over it and a CREATE TABLE AS copy of it (RP-661).
+/// `Column::typmod` holds the width a value is coerced to.
+fn attribute_typmod(c: &secantus_pgcatalog::Column) -> i32 {
+    if c.extra.get_str("domain_type").is_ok() {
+        -1
+    } else {
+        c.typmod
+    }
+}
+
+/// The type modifier `information_schema` reports for a column. A domain
+/// column's is its domain's own `typtypmod` (what `_pg_truetypmod` reads):
+/// `Column::typmod` holds the width a value is coerced to, which through a
+/// domain over a domain is the innermost domain's (`getBaseTypeAndTypmod`),
+/// while 15.19's catalog answers the outer domain's -1 (RP-551).
 fn catalog_typmod(c: &secantus_pgcatalog::Column) -> i32 {
     c.extra
         .get_str("domain_type")

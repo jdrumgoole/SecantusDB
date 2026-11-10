@@ -2349,24 +2349,6 @@ gap tests are in `tests/backlog/test_rp_found_rp532.py`.
       Backlog-ID: RP-537
       Verify: tests/backlog/test_rp_found_rp532.py::test_alias_hides_relation_name
 
-## Found while working RP-551 (2026-11-08)
-
-Measured on a private PostgreSQL 15.19 cluster with `create domain d551c as
-char(3)`, `d551n` over `numeric(5,2)`, `d551t` over `timestamp(0)` and
-`fd551(a d551c)`. The gap tests are in `tests/backlog/test_rp_found_rp551.py`.
-
-- [ ] **A domain column's `atttypmod` is the domain's width.** A column
-      declared with a domain carries no modifier of its own, so `fd551.a`'s
-      `atttypmod` is -1 on PostgreSQL 15.19 (the width is the domain's
-      `typtypmod`, which `information_schema` reads through
-      `_pg_truetypmod`); here it is 7. A domain over a domain already
-      answers -1 (RP-551 keeps the catalog at the column's own domain).
-      Backlog-ID: RP-558
-      Verify: tests/backlog/test_rp_found_rp551.py::test_domain_column_atttypmod
-      Since RP-557 the wire sends a domain column with its base type's
-      modifier wherever it is computed, so fixing this keeps the column's
-      RowDescription at 7.
-
 ## Found while working RP-557 (2026-11-08)
 
 Measured on a private PostgreSQL 15.19 cluster with `create domain d557 as
@@ -2391,15 +2373,6 @@ change too. The gap tests are in `tests/backlog/test_rp_found_rp557.py`.
       Two sides of one type keep 7 in both.
       Verify: tests/backlog/test_rp_found_rp557.py::test_set_op_of_a_domain_and_its_base_type
       Backlog-ID: RP-660
-- [ ] **`CREATE TABLE AS` turns a domain column into its base type.**
-      `create table c557 as select a, c from t557` makes `a` of type `d557`
-      with `atttypmod` -1 on PostgreSQL 15.19 (`intorel_startup` copies the
-      query's tuple descriptor); here `a` is `character` with 7: the
-      columns are read back from the wire description (`copy_query_fields`
-      then `internal_type_name`), which has already seen through the domain
-      and, since RP-557, carries the domain's width.
-      Verify: tests/backlog/test_rp_found_rp557.py::test_create_table_as_keeps_a_domain_column
-      Backlog-ID: RP-661
 
 ## Found while working RP-590 (2026-11-08)
 
@@ -3429,3 +3402,21 @@ enum ('z', 'a', 'm')` and `create table t766 (m e766)` holding `m`, `z`,
       column a target names in the derived query's own FROM.
       Verify: tests/backlog/test_rp_found_rp766.py::test_a_derived_enum_column_sorts_by_declaration
       Backlog-ID: RP-768
+
+## Found while working RP-661 (2026-11-10)
+
+Measured on a private PostgreSQL 15.19 cluster with `create domain d as
+text` and `create table t (a d, b text)`. The gap test is in
+`tests/backlog/test_rp_found_rp661.py`.
+
+- [ ] **A domain over a collatable type has no collation, so a view of
+      its column is refused.** `create view v as select a from t` is
+      `CREATE VIEW` on PostgreSQL 15.19, and so is a materialized view;
+      here both are 42P16 `no collation was derived for column "a" with
+      collatable type text`, raised by `check_new_relation_columns`.
+      `pg_attribute.attcollation` of the domain column is 0 here, and so
+      is the domain's `pg_type.typcollation`; both are 100 on 15.19, as
+      `b`'s is: `catalog_fill.rs`'s `type_collation` answers 0 for every
+      domain oid, where `DefineDomain` copies the base type's collation.
+      Verify: tests/backlog/test_rp_found_rp661.py::test_a_view_of_a_text_domain_column, tests/backlog/test_rp_found_rp661.py::test_a_text_domain_has_the_default_collation
+      Backlog-ID: RP-769

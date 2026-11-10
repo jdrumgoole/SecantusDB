@@ -5100,6 +5100,62 @@ fn an_unknown_beside_an_array_is_its_array_type() {
     }
 }
 
+/// RP-661: a CREATE TABLE AS records the domain each of its query's columns
+/// is of, read from the query as written: a column of a domain, through a
+/// WITH or a FROM subquery, and none for a cast to the base type or a
+/// VALUES list. `domain_column` makes a column as `CREATE TABLE (a dc)`
+/// declares one. Measured on PostgreSQL 15.19 (`intorel_startup`).
+#[test]
+fn create_table_as_records_its_columns_domains() {
+    domains::set_user_domains(vec![domains::Domain {
+        name: "dc661".to_string(),
+        oid: 90661,
+        base: "bpchar".to_string(),
+        typmod: 7,
+        not_null: false,
+        checks: Vec::new(),
+        not_valid: Vec::new(),
+        default_sql: None,
+    }]);
+    let table = || {
+        let mut a = Column::new("a", "bpchar", false);
+        a.typmod = 7;
+        a.extra.insert("domain_type", "dc661");
+        TableDef::new("fd661", vec![a, Column::new("i", "int4", false)])
+    };
+    let lookup = |name: &str| (name == "fd661").then(table);
+    let domains_of = |sql: &str| match plan(sql, &lookup) {
+        Ok(Statement::CreateTableAs { column_domains, .. }) => column_domains,
+        other => panic!("{sql}: {other:?}"),
+    };
+    let dc = Some("dc661".to_string());
+    assert_eq!(
+        domains_of("CREATE TABLE c AS SELECT a, i FROM fd661"),
+        vec![dc.clone(), None]
+    );
+    assert_eq!(
+        domains_of("CREATE TABLE c AS WITH q AS (SELECT a FROM fd661) SELECT * FROM q"),
+        vec![dc.clone()]
+    );
+    assert_eq!(
+        domains_of("CREATE TABLE c AS SELECT s.a FROM (SELECT a FROM fd661) s WITH NO DATA"),
+        vec![dc.clone()]
+    );
+    assert_eq!(domains_of("SELECT a INTO c FROM fd661"), vec![dc.clone()]);
+    assert_eq!(
+        domains_of("CREATE TABLE c AS SELECT a::bpchar FROM fd661"),
+        vec![None]
+    );
+    assert!(domains_of("CREATE TABLE c AS VALUES (1)").is_empty());
+    let column = domain_column("a", "dc661")
+        .expect("plans")
+        .expect("a domain");
+    assert_eq!((column.pg_type.as_str(), column.typmod), ("bpchar", 7));
+    assert_eq!(column.extra.get_str("domain_type").ok(), Some("dc661"));
+    assert!(domain_column("a", "int4").expect("plans").is_none());
+    domains::set_user_domains(Vec::new());
+}
+
 /// RP-551: a domain's values are coerced to its base type at the base's
 /// modifier, `getBaseTypeAndTypmod`'s, through a domain over a domain too
 /// (`dc3n` over `dc3 char(3)` is a width-3 `bpchar`, though its own
