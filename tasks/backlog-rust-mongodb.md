@@ -1018,16 +1018,6 @@ These are explicit non-goals. Don't add them without a reason.
   with RM-305.
   Backlog-ID: RM-386
   Verify: tests/backlog/test_rm_001_028.py::test_a_command_its_handler_fails_to_parse_is_not_the_first_command
-- [ ] **A `deleteMany` over pre-images is batched.** mongod 8.2.11 writes
-  a multi-document delete of a collection with
-  `changeStreamPreAndPostImages` as one `d` entry per document, each with
-  its own time and its pre-image under it (`applyOpsIndex` 0); the same
-  delete of a plain collection it batches into one `applyOps` (RM-077).
-  This server batches both, so the oplog, the change stream events' times
-  and the pre-images' `_id.ts` / `applyOpsIndex` of such a delete differ
-  from mongod's (measured 2026-11-07). Found while working RM-366.
-  Backlog-ID: RM-389
-  Verify: tests/backlog/test_rm_found_2026_11_07c.py::test_a_delete_many_over_pre_images_is_not_batched
 ### 7.091 mongod's slot-based engine (SBE) -- 2026-10-23
 
 mongod 8.2 runs the front of a pipeline in its slot-based engine when it can

@@ -130,11 +130,13 @@ fn a_pre_image_is_recorded_on_the_asynchronous_oplog() {
     );
 }
 
-/// The deletes of one batch are one `applyOps` entry in the oplog view, so
-/// their pre-images share its time and number their places in it -- and
-/// each is still found from its own stored entry.
+/// A collection that records pre-images is not deleted in batches: mongod
+/// 8.2.11 writes each document of a `deleteMany` as its own `d` entry, in
+/// its read order, each pre-image under its entry's time at
+/// `applyOpsIndex` 0 -- where a plain collection's deletes share one
+/// `applyOps` (RM-389). Each pre-image is still found from its entry.
 #[test]
-fn a_batch_s_pre_images_share_its_time() {
+fn a_delete_many_s_pre_images_are_one_per_entry() {
     with_store(StorageOptions::default(), |st| {
         recording(st);
         let docs: Vec<Vec<u8>> = (1..=3).map(|i| enc(&doc! {"_id": i, "v": i})).collect();
@@ -144,20 +146,26 @@ fn a_batch_s_pre_images_share_its_time() {
                 .unwrap();
         });
         let deletes = entries_of(st, "d");
-        assert_eq!(deletes.len(), 3);
-        let first_ts = deletes[0].1.get_timestamp("ts").unwrap();
+        let ids: Vec<Bson> = deletes
+            .iter()
+            .map(|(_, e)| e.get_document("o").unwrap().get("_id").unwrap().clone())
+            .collect();
+        assert_eq!(ids, vec![Bson::Int32(1), Bson::Int32(2), Bson::Int32(3)]);
+        assert!(
+            deletes.iter().all(|(_, e)| !e.contains_key("bg")),
+            "{deletes:?}"
+        );
         let mut found = pre_images(st);
-        found.sort_by_key(|d| {
-            d.get_document("_id")
-                .unwrap()
-                .get_i64("applyOpsIndex")
-                .unwrap()
-        });
+        found.sort_by_key(|d| d.get_document("_id").unwrap().get_timestamp("ts").unwrap());
         assert_eq!(found.len(), 3, "{found:?}");
-        for (i, (record, (seq, entry))) in found.iter().zip(&deletes).enumerate() {
+        let mut last = None;
+        for (record, (seq, entry)) in found.iter().zip(&deletes) {
             let id = record.get_document("_id").unwrap();
-            assert_eq!(id.get_timestamp("ts").unwrap(), first_ts);
-            assert_eq!(id.get_i64("applyOpsIndex").unwrap(), i as i64);
+            let ts = id.get_timestamp("ts").unwrap();
+            assert_eq!(ts, entry.get_timestamp("ts").unwrap());
+            assert!(last < Some(ts), "each delete has its own time");
+            last = Some(ts);
+            assert_eq!(id.get_i64("applyOpsIndex").unwrap(), 0);
             let deleted = entry.get_document("o").unwrap().get("_id").unwrap().clone();
             assert_eq!(
                 record.get_document("preImage").unwrap().get("_id"),
@@ -166,6 +174,48 @@ fn a_batch_s_pre_images_share_its_time() {
             let pre = decode(&st.read_preimage(*seq).unwrap().expect("found"));
             assert_eq!(pre.get("_id"), Some(&deleted));
         }
+    });
+}
+
+/// A `deleteMany` of a collection that records pre-images deletes one
+/// document at a time, so a filter that fails on the third of five leaves
+/// the two before it deleted, where a batched delete of a plain collection
+/// deletes none (measured mongod 8.2.11, 2026-11-10, RM-389).
+#[test]
+fn a_failing_delete_many_over_pre_images_keeps_what_it_deleted() {
+    with_store(StorageOptions::default(), |st| {
+        recording(st);
+        st.create_collection("app", "plain").unwrap();
+        let filter = doc! {"$expr": {"$gt": [{"$add": ["$v", 1]}, 0]}};
+        for coll in ["c", "plain"] {
+            let docs: Vec<Vec<u8>> = (0..5)
+                .map(|i| {
+                    let v = if i == 2 {
+                        Bson::String("x".into())
+                    } else {
+                        Bson::Int32(i)
+                    };
+                    enc(&doc! {"_id": i, "v": v})
+                })
+                .collect();
+            st.insert("app", coll, docs, true).unwrap();
+            secantus_storage::with_reversed_delete_batches(10, || {
+                st.delete_matching("app", coll, &filter, 0, &Document::new(), None)
+                    .expect_err("$add of a string fails");
+            });
+        }
+        let left = |coll: &str| -> Vec<Bson> {
+            let mut ids: Vec<Bson> = st
+                .scan_collection("app", coll)
+                .unwrap()
+                .iter()
+                .map(|b| decode(b).get("_id").unwrap().clone())
+                .collect();
+            ids.sort_by_key(|b| b.as_i32());
+            ids
+        };
+        assert_eq!(left("c"), (2..5).map(Bson::Int32).collect::<Vec<_>>());
+        assert_eq!(left("plain"), (0..5).map(Bson::Int32).collect::<Vec<_>>());
     });
 }
 

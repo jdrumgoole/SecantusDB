@@ -22370,7 +22370,16 @@ impl Storage {
         // 360, and an error on the third of five deleted none (RM-313,
         // RM-323). (Killed after 0.5 s it had deleted 4, which no documented
         // target explains.)
-        const BATCH_DOCS: usize = 10;
+        //
+        // A collection that records pre-images mongod does not batch: it
+        // deletes its matches one at a time, in its plan's order, each with
+        // its own `d` entry and pre-image, so a failure part-way leaves every
+        // document before it deleted (measured 8.2.11, 2026-11-10, RM-389).
+        let per_document = {
+            let session = self.op_session()?;
+            pre_post_images_enabled(&session, db, coll)?
+        };
+        let batch_docs: usize = if per_document { 1 } else { 10 };
         const BATCH_BYTES: usize = 2 * 1024 * 1024;
         // Each batch of two or more is one `applyOps` entry on mongod.
         struct ClearGroups;
@@ -22429,7 +22438,7 @@ impl Storage {
             // The plan's read, a staged batch at a time, each deleted before
             // the next is read.
             Some(mut source) => loop {
-                let pulled = source.pull(BATCH_DOCS, BATCH_BYTES);
+                let pulled = source.pull(batch_docs, BATCH_BYTES);
                 if pulled.stopped {
                     scan_error = Some(StorageError::MaxTimeExpired);
                     break;
@@ -22456,7 +22465,7 @@ impl Storage {
                         Ok(true) => {
                             staged_bytes += blob.len();
                             staged.push((recordid, blob));
-                            if staged.len() >= BATCH_DOCS || staged_bytes >= BATCH_BYTES {
+                            if staged.len() >= batch_docs || staged_bytes >= BATCH_BYTES {
                                 delete_batch(std::mem::take(&mut staged))?;
                                 staged_bytes = 0;
                             }
