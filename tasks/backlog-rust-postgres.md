@@ -410,6 +410,10 @@ one beside it.
   0.42 s late, load average about 12.6 from a `gate_rm.py` just before);
   rerun alone at once it passed 15 of 15. RM-385 changes only the MongoDB
   server's statement statistics, which the PG server does not read.
+  Again 2026-11-10 in the RM-389 lane (`[0.7]` 0.41 s late), and rerun
+  alone it failed 1 run of 3 at a load average of 3.9. RM-389 changes only
+  the shared storage crate's `deleteMany` of a collection that records
+  pre-images, which this test does not run.
   Verify: none -- intermittent under load; RP-202's regression test is the check, and it passed 14 of 14 runs on two rebuilt commits
   Backlog-ID: RP-748
 - [ ] **OPEN -- `gate_pg.sh`'s login step differs from the local reference

@@ -30,11 +30,11 @@ def _delete_many_shape(client: Any, pre_images: bool) -> list:
     return out
 
 
-@pytest.mark.backlog("RM-389")
+@pytest.mark.backlog_fixed("RM-389")
 def test_a_delete_many_over_pre_images_is_not_batched(rust_mongo: Any, mongod_rs: Any) -> None:
     """mongod 8.2.11 writes a `deleteMany` of a collection that records
     pre-images as one `d` entry per document, where it batches the same
-    delete of a plain collection into one `applyOps`. This server batches
+    delete of a plain collection into one `applyOps`. This server batched
     both."""
     assert _delete_many_shape(mongod_rs, False) == [("applyOps", 3)]  # the reference
     theirs = _delete_many_shape(mongod_rs, True)
