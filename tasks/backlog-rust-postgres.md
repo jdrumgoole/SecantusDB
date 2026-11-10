@@ -3137,15 +3137,6 @@ Measured on a private PostgreSQL 15.19 cluster with `fe(a int, b text)` and
 the column written out, so none is the star's. The gap tests are in
 `tests/backlog/test_rp_found_rp517.py`.
 
-- [ ] **A correlated set operation is 42P01.** `select (select v.a
-      intersect select 5) from (values (5), (6)) v(a)` answers `5` and NULL
-      on PostgreSQL 15.19, `(select v.a union all select 9 limit 1)` `5`,
-      and `(select v.a union select 9)` is 21000 `more than one row
-      returned by a subquery used as an expression`; here each is 42P01
-      `missing FROM-clause entry for table "v"` at 16: the arms' outer
-      reference is not found.
-      Verify: tests/backlog/test_rp_found_rp517.py::test_correlated_set_operation
-      Backlog-ID: RP-698
 - [ ] **A GROUP BY naming a correlated subquery target is refused.**
       `select (select v.a) from (values (1)) v(a) group by 1`, its `(select
       v.*)` form and `group by (select v.a)` each answer `1` on PostgreSQL
@@ -3358,3 +3349,19 @@ statement is VALUES-only and runs there as written. The gap tests are in
       also do (unmeasured for those).
       Verify: tests/backlog/test_rp_found_rp706.py::test_a_window_min_max_over_a_network_value_uses_network_order
       Backlog-ID: RP-754
+
+## Found while working RP-698 (2026-11-10)
+
+Measured on PostgreSQL 15.19 (the shared reference on port 5415).
+
+- [ ] **An outer column in a set operation's ORDER BY is 42703.** `select
+      (select a from (values (1)) t(a) union select 9 order by b limit 1)
+      from (values (5, 6)) v(a, b)` is 0A000 `invalid UNION/INTERSECT/EXCEPT
+      ORDER BY clause`, DETAIL `Only result column names can be used, not
+      expressions or functions.`, at 65 on PostgreSQL 15.19: the ORDER BY
+      sees only the output columns, so `b` resolves to the outer row and is
+      a sort expression (`transformSetOperationStmt`); `order by v.b` is the
+      same. Here each is 42703 `column "b" does not exist`. A name neither
+      level has is 42703 on both.
+      Verify: tests/backlog/test_rp_found_rp698.py::test_an_outer_column_in_a_set_operations_order_by
+      Backlog-ID: RP-747

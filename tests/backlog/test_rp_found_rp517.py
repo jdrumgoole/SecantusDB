@@ -4,7 +4,7 @@ explicitly as well as through a star, so they are not the star's:
 
 - a row compared with a correlated subquery (`(a, c) in (select fs.a,
   fs.c)`) was refused (RP-697, fixed);
-- a correlated set operation is 42P01 (RP-698);
+- a correlated set operation was 42P01 (RP-698, fixed);
 - a correlated subquery that passed an outer FROM function's column, or a
   field of an outer whole row, through unchanged answered it as text, and
   `(v).*` there was refused (RP-699, fixed);
@@ -253,8 +253,10 @@ def test_row_against_a_correlated_subquery_with_a_parameter(dsn: str) -> None:
             c.execute(_ROW_SETUP[0])
 
 
-# A set operation's arms read the outer row as any subquery does. Here each
-# is 42P01 `missing FROM-clause entry for table "v"` at 16.
+# A set operation's arms read the outer row as any subquery does. Each was
+# 42P01 `missing FROM-clause entry for table "v"` at 16, the intersect's
+# column named `?column?` once it ran, and a bare name an arm's own FROM
+# has was read from the outer row (RP-698, fixed).
 CORRELATED_SET_OPERATION = {
     "select (select v.a union select 9) from (values (5)) v(a)": (
         "21000",
@@ -266,10 +268,26 @@ CORRELATED_SET_OPERATION = {
         ["a"],
     ),
     "select (select v.a union all select 9 limit 1) from (values (5)) v(a)": ([(5,)], ["a"]),
+    "select (select a from (values (1)) t(a) union select 9 order by 1 limit 1)"
+    " from (values (5)) v(a)": ([(1,)], ["a"]),
+    "select (select a from (values (1)) t(a) intersect select v.a) from (values (1), (5)) v(a)": (
+        [(1,), (None,)],
+        ["a"],
+    ),
+    "select (select a from (values (1)) t(a) intersect select a) from (values (1), (5)) v(a)": (
+        [(1,), (None,)],
+        ["a"],
+    ),
+    "select (select z from (values (1)) t(z) where z < a union select 9 order by 1 limit 1)"
+    " from (values (5), (0)) v(a)": ([(1,), (9,)], ["z"]),
+    "select (select 9 union select v.a order by 1 limit 1) from (values (9), (3)) v(a)": (
+        [(9,), (3,)],
+        ["?column?"],
+    ),
 }
 
 
-@pytest.mark.backlog("RP-698")
+@pytest.mark.backlog_fixed("RP-698")
 @pytest.mark.parametrize("query", list(CORRELATED_SET_OPERATION))
 def test_correlated_set_operation(query: str, dsn: str) -> None:
     assert answer(dsn, query) == CORRELATED_SET_OPERATION[query]

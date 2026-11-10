@@ -16868,7 +16868,11 @@ fn expression_column_name(node: &pg_query::protobuf::Node) -> String {
             Ok(SubLinkType::ArraySublink) => "array".to_string(),
             Ok(SubLinkType::ExprSublink) => {
                 match sl.subselect.as_deref().and_then(|n| n.node.as_ref()) {
+                    // A set operation's targets are its leftmost arm's
+                    // (`transformSetOperationStmt`), which is where the
+                    // analysed query's first `resname` comes from (RP-698).
                     Some(N::SelectStmt(sel)) => {
+                        let sel = prune_outputs::leftmost_arm(sel);
                         match sel.target_list.first().and_then(|t| t.node.as_ref()) {
                             Some(N::ResTarget(rt)) if !rt.name.is_empty() => rt.name.clone(),
                             Some(N::ResTarget(rt)) => rt
@@ -23785,6 +23789,17 @@ fn row_subquery_comparison(
 /// in `s`'s own FROM -- that is, a correlation. `None` when every reference
 /// resolves inside the subquery.
 fn foreign_qualifier(s: &pg_query::protobuf::SelectStmt) -> Option<String> {
+    // A set operation's arms are query levels of their own, each reading
+    // the outer row as any subquery does (`transformSetOperationTree`
+    // analyses each leaf with the same parent state): `(select v.a
+    // intersect select 5)` is correlated through its left arm. Its own
+    // FROM, WHERE and targets are empty, so only the arms say (RP-698).
+    if s.larg.is_some() || s.rarg.is_some() {
+        return [s.larg.as_deref(), s.rarg.as_deref()]
+            .into_iter()
+            .flatten()
+            .find_map(foreign_qualifier);
+    }
     // An ALIASED relation goes by its alias only, as in PostgreSQL: in
     // `(SELECT count(*) FROM t1 AS x WHERE x.b < t1.b)`, `t1.b` is the OUTER
     // row's. Counting the hidden table name as an inner one planned the

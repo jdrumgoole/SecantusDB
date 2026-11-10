@@ -6012,6 +6012,36 @@ fn a_name_bound_inside_a_derived_table_is_not_bound_beside_it() {
     }
 }
 
+/// RP-698: a set operation's arms each read the outer row, a qualified
+/// reference in either arm correlating it, and a bare name only from an
+/// arm with no FROM of its own (an arm's own column is not the outer one).
+#[test]
+fn a_set_operations_arms_are_correlated_one_by_one() {
+    let body = subquery_body;
+    for (sql, outer) in [
+        ("select v.a intersect select 5", Some("v.a")),
+        ("select 9 union select v.a", Some("v.a")),
+        ("select 1 union (select 2 except select v.a)", Some("v.a")),
+        ("select t.a from t union select 9", None),
+    ] {
+        assert_eq!(foreign_qualifier(&body(sql)).as_deref(), outer, "{sql}");
+    }
+    let outer = vec!["a".to_string()];
+    for (sql, want) in [
+        ("select a union select 9", true),
+        ("select 9 union all select a + 1", true),
+        ("select a from t union select 9", false),
+        ("select a from t union select 9 order by a", false),
+        ("select a from t union select a", true),
+    ] {
+        assert_eq!(
+            correlated::fromless_outer_ref(&body(sql), &outer),
+            want,
+            "{sql}"
+        );
+    }
+}
+
 /// Which sides of `x op ANY (array)` drop their trailing blanks, each pair
 /// measured on PostgreSQL 15.19 (RP-684).
 #[test]
