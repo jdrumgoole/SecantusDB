@@ -3471,18 +3471,6 @@ and `create domain di811 as int`.
       table's CHECK is coerced since RP-811 (`optype::check_constraint`).
       Verify: tests/backlog/test_rp_found_rp811.py::test_a_domain_check_and_an_index_predicate_are_coerced_to_boolean
       Backlog-ID: RP-813
-- [ ] **A boolean coercion passes an array, and names a domain by its base
-      type.** `select * from c811 where a`, `... where a and true`, `select
-      a is true from c811` and `create table ... (a int[] check (a))` are
-      42804 `argument of WHERE / AND / IS TRUE / CHECK must be type boolean,
-      not type integer[]` on PostgreSQL 15.19; here the SELECTs answer no
-      rows and the table is created. A domain operand is named by the
-      domain: `where d` over a `di811` column is `... not type di811`, here
-      `not type integer`. `optype`'s `clause_is_boolean`, `bool_argument`
-      and `boolean_test_argument` pass any type `category` has no entry for,
-      and `operand_type` resolves a domain to its base.
-      Verify: tests/backlog/test_rp_found_rp811.py::test_a_boolean_coercion_refuses_an_array_and_names_a_domain
-      Backlog-ID: RP-814
 - [ ] **ALTER TABLE's expressions are not coerced to boolean when no row
       reaches them, and SET DEFAULT's error has a position.** On PostgreSQL
       15.19 `alter table c811 alter column x type bool using (x is true)`

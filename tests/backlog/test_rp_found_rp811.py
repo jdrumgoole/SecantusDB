@@ -82,7 +82,7 @@ def test_a_domain_check_and_an_index_predicate_are_coerced_to_boolean(
     assert _answer(dsn, query) == expected
 
 
-@pytest.mark.backlog("RP-814")
+@pytest.mark.backlog_fixed("RP-814")
 @pytest.mark.parametrize(
     ("query", "expected"),
     [
@@ -99,10 +99,59 @@ def test_a_boolean_coercion_refuses_an_array_and_names_a_domain(
 ) -> None:
     """`coerce_to_boolean` refuses any type with no cast to boolean -- an
     array included -- and names the operand's own type, a domain by the
-    domain's name: each is 42804 on PostgreSQL 15.19. Here an array passes
-    (the SELECTs answer no rows, the table is created) and a domain is
-    named by its base type."""
+    domain's name: each is 42804 on PostgreSQL 15.19. An array passed (the
+    SELECTs answered no rows, the table was created) and a domain was named
+    by its base type."""
     assert _answer(dsn, query) == expected
+
+
+_BOOL_SETUP = [
+    "drop table if exists p814",
+    "drop domain if exists dd814, db814, da814 cascade",
+    "create domain db814 as bool",
+    "create domain dd814 as db814",
+    "create domain da814 as int[]",
+    "create table p814 (b bool, db db814, dd dd814, a int[], ba bool[], da da814, x int)",
+    "insert into p814 values (true, true, true, '{1}', '{t}', '{2}', 1)",
+]
+
+
+@pytest.mark.backlog_fixed("RP-814")
+@pytest.mark.parametrize(
+    ("query", "expected"),
+    [
+        ("select x from p814 where db", [(1,)]),
+        ("select x from p814 where dd and true", [(1,)]),
+        ("select db is true, dd is false from p814", [(True, False)]),
+        ("select x from p814 where ba[1]", [(1,)]),
+        ("select x from p814 where not db", []),
+        ("select x from p814 p where p.db", [(1,)]),
+        ("select x from p814 where da", _not_boolean("WHERE", "da814", 26)),
+        ("select x from p814 where ba", _not_boolean("WHERE", "boolean[]", 26)),
+        (
+            "select x from p814 where a is not unknown",
+            _not_boolean("IS NOT UNKNOWN", "integer[]", 26),
+        ),
+    ],
+)
+def test_a_boolean_coercion_follows_a_domain_to_its_base(
+    dsn: str, query: str, expected: object
+) -> None:
+    """A domain over `boolean` (or over such a domain) coerces to boolean,
+    and one over an array is refused under its own name; `boolean[]` is
+    no boolean. Measured on a private PostgreSQL 15.19 cluster."""
+    with psycopg.connect(dsn, autocommit=True) as c:
+        for q in _BOOL_SETUP:
+            c.execute(q)
+        try:
+            cur = c.execute(query)
+            got: object = cur.fetchall()
+        except psycopg.Error as e:
+            got = ("error", e.sqlstate, str(e).splitlines()[0], e.diag.statement_position)
+        finally:
+            c.execute(_BOOL_SETUP[0])
+            c.execute(_BOOL_SETUP[1])
+    assert got == expected
 
 
 @pytest.mark.backlog("RP-815")
