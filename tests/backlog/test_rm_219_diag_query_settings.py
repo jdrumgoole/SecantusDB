@@ -540,35 +540,75 @@ def test_samples_are_written_to_diagnostic_data(
     assert ours == _ftdc_files(mongod_rs, dbpath) == (True, True)
 
 
-def _framework_and_debug_shape(client: Any) -> tuple:
-    client.drop_database("rm219f")
+def _set_framework(client: Any, db: str, query: dict, framework: str) -> None:
     _clear(client)
-    client.rm219f.a.insert_many([{"x": i} for i in range(5)])
-    query = {"find": "a", "filter": {"x": 1}}
     client.admin.command(
-        {
-            "setQuerySettings": dict(query, **{"$db": "rm219f"}),
-            "settings": {"queryFramework": "sbe"},
-        }
+        {"setQuerySettings": dict(query, **{"$db": db}), "settings": {"queryFramework": framework}}
     )
-    version = client.rm219f.command("explain", query)["explainVersion"]
+
+
+def _mod_by_zero(client: Any, run: Any) -> Any:
+    try:
+        return ("ok", run())
+    except pymongo.errors.OperationFailure as e:
+        return ("err", e.code)
+
+
+def _engine_choice(client: Any) -> dict:
+    client.drop_database("rm219f")
+    db = client.rm219f
+    db.a.insert_many([{"x": i, "y": i % 2} for i in range(5)])
+    out = {}
+    find = {"find": "a", "filter": {"x": 1}}
+    _set_framework(client, "rm219f", find, "sbe")
+    out["find under sbe"] = db.command("explain", find)["explainVersion"]
+    group = {"aggregate": "a", "pipeline": [{"$group": {"_id": "$y"}}], "cursor": {}}
+    _set_framework(client, "rm219f", group, "classic")
+    out["$group under classic"] = db.command("explain", group)["explainVersion"]
+    # The engines fail `$mod` by zero with their own codes: SBE 4848403,
+    # classic 16610.
+    by_zero = {"$expr": {"$eq": [{"$mod": ["$x", 0]}, 1]}}
+    _set_framework(client, "rm219f", {"find": "a", "filter": by_zero}, "sbe")
+    out["find $mod by zero"] = _mod_by_zero(client, lambda: list(db.a.find(by_zero)))
+    pipeline = [{"$group": {"_id": {"$mod": ["$x", 0]}}}]
+    _set_framework(
+        client, "rm219f", {"aggregate": "a", "pipeline": pipeline, "cursor": {}}, "classic"
+    )
+    out["$group $mod by zero"] = _mod_by_zero(client, lambda: list(db.a.aggregate(pipeline)))
+    _clear(client)
+    return out
+
+
+@pytest.mark.backlog_fixed("RM-418")
+def test_query_framework_chooses_the_engine(
+    rust_mongo: Any,
+    mongod_rs: Any,  # noqa: F811
+) -> None:
+    """Under `queryFramework: "sbe"` mongod ran a plain `find` in its
+    slot-based engine (`explainVersion` 2, SBE's errors), and under
+    `"classic"` it kept a `$group` it would push into SBE classic."""
+    assert _engine_choice(rust_mongo) == _engine_choice(mongod_rs)
+
+
+def _debug_shape(client: Any) -> list:
+    client.drop_database("rm219f")
+    client.rm219f.a.insert_many([{"x": i} for i in range(5)])
+    _set_framework(client, "rm219f", {"find": "a", "filter": {"x": 1}}, "sbe")
     debug = [
         e.get("debugQueryShape")
         for e in client.admin.aggregate([{"$querySettings": {"showDebugQueryShape": True}}])
     ]
     _clear(client)
-    return version, debug
+    return debug
 
 
 @pytest.mark.backlog("RM-418")
-def test_query_framework_chooses_the_engine_and_debug_shape_is_shown(
+def test_show_debug_query_shape(
     rust_mongo: Any,
     mongod_rs: Any,  # noqa: F811
 ) -> None:
-    """Under `queryFramework: "sbe"` mongod runs a plain `find` in its
-    slot-based engine (`explainVersion` 2), and `showDebugQueryShape` adds
-    each query's `debugQueryShape`."""
-    assert _framework_and_debug_shape(rust_mongo) == _framework_and_debug_shape(mongod_rs)
+    """`showDebugQueryShape` adds each query's `debugQueryShape`."""
+    assert _debug_shape(rust_mongo) == _debug_shape(mongod_rs)
 
 
 def _oplog_storage_stats(client: Any) -> tuple:

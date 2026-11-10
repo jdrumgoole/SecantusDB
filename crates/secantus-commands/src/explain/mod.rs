@@ -359,17 +359,68 @@ pub(crate) fn sbe_pushdown(
     hint: Option<&Bson>,
     collation: Option<&Collation>,
 ) -> Option<usize> {
-    let default = crate::util::default_collation(storage, db, coll);
-    let same_collation = match (collation, default.as_ref()) {
-        (None, None) => true,
-        (Some(a), Some(b)) => a.same(b),
-        _ => false,
-    };
-    if id_hack_read(coll, hoisted, hint, same_collation) {
+    // A query setting's `queryFramework: "classic"` keeps it all classic.
+    if crate::query_settings::framework() == Some(crate::query_settings::Framework::Classic) {
+        return None;
+    }
+    if id_hack_read(
+        coll,
+        hoisted,
+        hint,
+        same_collation(storage, db, coll, collation),
+    ) {
         return None;
     }
     let is_view = |from: &str| crate::views::is_view(storage, db, from);
     secantus_core::sbe::pushdown(hoisted, &is_view)
+}
+
+/// Whether the read uses the collection's own collation.
+fn same_collation(
+    storage: &dyn crate::storage::Storage,
+    db: &str,
+    coll: &str,
+    collation: Option<&Collation>,
+) -> bool {
+    let default = crate::util::default_collation(storage, db, coll);
+    match (collation, default.as_ref()) {
+        (None, None) => true,
+        (Some(a), Some(b)) => a.same(b),
+        _ => false,
+    }
+}
+
+/// Whether mongod runs a `find` of `db.coll` in its slot-based engine: only
+/// under a query setting's `queryFramework: "sbe"` (`trySbeEngine`; the
+/// default `trySbeRestricted` runs a plain `find` classic), when SBE
+/// compiles its filter and projection, and when it is not an `_id` point
+/// read, which mongod's express path runs classic (RM-418).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn find_runs_in_sbe(
+    storage: &dyn crate::storage::Storage,
+    db: &str,
+    coll: &str,
+    filter: &Document,
+    projection: Option<&Document>,
+    skip: i64,
+    hint: Option<&Bson>,
+    collation: Option<&Collation>,
+) -> bool {
+    if crate::query_settings::framework() != Some(crate::query_settings::Framework::Sbe)
+        || !secantus_core::sbe::find_compatible(filter, projection)
+    {
+        return false;
+    }
+    let mut read = vec![Bson::Document(doc! { "$match": filter.clone() })];
+    if skip > 0 {
+        read.push(Bson::Document(doc! { "$skip": skip }));
+    }
+    !id_hack_read(
+        coll,
+        &read,
+        hint,
+        same_collation(storage, db, coll, collation),
+    )
 }
 
 /// Whether mongod reads the front of `pipeline` as an `_id` point query
@@ -750,11 +801,27 @@ fn front_runs_in_sbe(
     collation: Option<&Collation>,
     pipeline: &[Document],
 ) -> bool {
-    !pipeline.is_empty() && {
-        let stages: Vec<Bson> = pipeline.iter().cloned().map(Bson::Document).collect();
-        let hoisted = hoist::hoist_matches(&stages);
-        sbe_pushdown(storage, db, &s.coll, &hoisted, s.hint.as_ref(), collation).is_some()
+    if pipeline.is_empty() {
+        return plain_find(s)
+            && find_runs_in_sbe(
+                storage,
+                db,
+                &s.coll,
+                &s.filter,
+                s.projection.as_ref(),
+                s.skip,
+                s.hint.as_ref(),
+                collation,
+            );
     }
+    let stages: Vec<Bson> = pipeline.iter().cloned().map(Bson::Document).collect();
+    let hoisted = hoist::hoist_matches(&stages);
+    sbe_pushdown(storage, db, &s.coll, &hoisted, s.hint.as_ref(), collation).is_some()
+}
+
+/// A `find` command of a collection, not a view's pipeline.
+fn plain_find(s: &Shape) -> bool {
+    matches!(s.kind, Kind::Find) && !s.pipeline
 }
 
 /// The plan cache key mongod builds for the query `s` plans, as a `Slow
@@ -1389,7 +1456,16 @@ fn server_info(ctx: &CommandContext) -> Document {
     }
 }
 
-fn server_parameters() -> Document {
+/// `serverParameters`. The framework control is the one a query setting
+/// chose (RM-418) where the reply is the query's own explain; one with
+/// classic `stages` after its `$cursor` reports the server's
+/// (`trySbeRestricted`) whatever the setting (`own`: false; measured
+/// 8.2.11, 2026-11-10).
+pub(crate) fn server_parameters(own: bool) -> Document {
+    let control = crate::query_settings::framework().filter(|_| own).map_or(
+        "trySbeRestricted",
+        crate::query_settings::Framework::control,
+    );
     // The memory budgets as `setParameter` left them (RM-211, RM-315).
     let b = secantus_core::memlimit::budgets();
     let int = |n: usize| i32::try_from(n).unwrap_or(i32::MAX);
@@ -1402,7 +1478,7 @@ fn server_parameters() -> Document {
         "internalQueryProhibitBlockingMergeOnMongoS": 0_i32,
         "internalQueryMaxAddToSetBytes": int(b.add_to_set),
         "internalDocumentSourceSetWindowFieldsMaxMemoryBytes": int(b.window_fields),
-        "internalQueryFrameworkControl": "trySbeRestricted",
+        "internalQueryFrameworkControl": control,
         "internalQueryPlannerIgnoreIndexWithCollationForRegex": 1_i32,
     }
 }
@@ -1783,17 +1859,8 @@ fn reply_for(r: &Request, verbosity: Verbosity, ctx: &mut CommandContext) -> Han
         let built = if t.exists {
             // The plan the trial chose is a forward collection scan: the
             // query in front of the group is that scan's filter and paging.
-            let mut scan = &plan;
-            loop {
-                scan = match scan {
-                    Node::Projection { input, .. }
-                    | Node::Skip(_, input)
-                    | Node::Limit(_, input) => input,
-                    _ => break,
-                };
-            }
             let forward_scan = matches!(
-                scan,
+                plan.without_paging(),
                 Node::CollScan {
                     backward: false,
                     ..
@@ -1828,6 +1895,55 @@ fn reply_for(r: &Request, verbosity: Verbosity, ctx: &mut CommandContext) -> Han
                 docs: &t.docs,
                 stage_counts: &stage_counts,
                 stage_spills: &stage_spills,
+            };
+            return sbe_reply(r, planner, &sbe, verbosity, ctx);
+        }
+    }
+    // A `find` mongod runs in SBE (RM-418): over a forward collection scan
+    // with no sort, projection, hint or collation, its scan, filter, skip
+    // and limit; any other is still explained in the classic shape.
+    if r.pipeline.is_empty() && front_runs_in_sbe(storage, &db, s, collation.as_ref(), &[]) {
+        let built = if !t.exists {
+            Some(sbe::eof_plan())
+        } else {
+            let scan = matches!(
+                plan.without_paging(),
+                Node::CollScan {
+                    backward: false,
+                    ..
+                }
+            );
+            let simple = s.sort.as_ref().is_none_or(Document::is_empty)
+                && s.projection.as_ref().is_none_or(Document::is_empty)
+                && s.hint.is_none()
+                && collation.is_none()
+                && s.min_max.is_none()
+                && !s.return_key
+                && !s.show_record_id;
+            let parsed = parsed::parsed_query(&s.filter);
+            let filter = sbe::Filter::parse(&parsed);
+            let on = sbe::Front {
+                parsed,
+                filter,
+                skip: s.skip,
+                limit: s.limit,
+            };
+            let filtered = s.filter.is_empty() || on.filter.is_some();
+            let uuid = crate::admin::collection_uuid_text(storage, &db, &s.coll);
+            (scan && simple && filtered)
+                .then(|| sbe::find_plan(&uuid, &on))
+                .flatten()
+        };
+        if let Some(built) = built {
+            let is_cached = cache.as_ref().is_some_and(|c| c.cached(&plan));
+            let sbe = Pushed {
+                plan: &built,
+                pushed: 0,
+                tail: &[],
+                is_cached,
+                docs: &t.docs,
+                stage_counts: &[],
+                stage_spills: &[],
             };
             return sbe_reply(r, planner, &sbe, verbosity, ctx);
         }
@@ -1873,7 +1989,7 @@ fn reply_for(r: &Request, verbosity: Verbosity, ctx: &mut CommandContext) -> Han
         }
         reply.insert("command", r.echo.clone());
         reply.insert("serverInfo", server_info(ctx));
-        reply.insert("serverParameters", server_parameters());
+        reply.insert("serverParameters", server_parameters(true));
     } else {
         let mut cursor = doc! { "queryPlanner": planner };
         if let Some(st) = &stats {
@@ -1904,7 +2020,7 @@ fn reply_for(r: &Request, verbosity: Verbosity, ctx: &mut CommandContext) -> Han
         }
         reply.insert("stages", stages);
         reply.insert("serverInfo", server_info(ctx));
-        reply.insert("serverParameters", server_parameters());
+        reply.insert("serverParameters", server_parameters(false));
         reply.insert("command", r.echo.clone());
     }
     reply.insert("ok", 1.0);
@@ -2000,7 +2116,7 @@ fn sbe_reply(
     let whole = s.rest.len() == p.pushed && p.tail.is_empty();
     let mut qp = Document::new();
     for (k, v) in planner {
-        if k == "maxIndexedOrSolutionsReached" && whole {
+        if k == "maxIndexedOrSolutionsReached" && whole && !r.pipeline.is_empty() {
             qp.insert("optimizedPipeline", true);
         }
         if k == "winningPlan" {
@@ -2015,12 +2131,17 @@ fn sbe_reply(
     if whole {
         reply.insert("queryPlanner", qp);
         if wanted {
-            let (stats, _) = p.plan.execution_stats(p.docs, sbe::Pull::Whole, all_plans);
+            let pull = if r.pipeline.is_empty() {
+                sbe::Pull::Find
+            } else {
+                sbe::Pull::Whole
+            };
+            let (stats, _) = p.plan.execution_stats(p.docs, pull, all_plans);
             reply.insert("executionStats", stats);
         }
         reply.insert("command", r.echo.clone());
         reply.insert("serverInfo", server_info(ctx));
-        reply.insert("serverParameters", server_parameters());
+        reply.insert("serverParameters", server_parameters(true));
         reply.insert("ok", 1.0);
         return Ok(reply);
     }
@@ -2072,7 +2193,7 @@ fn sbe_reply(
     }
     reply.insert("stages", stages);
     reply.insert("serverInfo", server_info(ctx));
-    reply.insert("serverParameters", server_parameters());
+    reply.insert("serverParameters", server_parameters(false));
     reply.insert("command", r.echo.clone());
     reply.insert("ok", 1.0);
     Ok(reply)
@@ -2665,7 +2786,7 @@ fn own_source_reply(
     }
     let mut reply = doc! { "explainVersion": "1", "stages": stages };
     reply.insert("serverInfo", server_info(ctx));
-    reply.insert("serverParameters", server_parameters());
+    reply.insert("serverParameters", server_parameters(false));
     reply.insert("command", echo);
     reply.insert("ok", 1.0);
     Ok(reply)

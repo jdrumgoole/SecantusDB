@@ -149,10 +149,10 @@ fn parse(group: &Document) -> Option<(Id, Vec<Acc>)> {
 }
 
 /// The slot counter (`IdGenerator`: the first id is 1).
-struct Slots(Slot);
+pub(super) struct Slots(pub(super) Slot);
 
 impl Slots {
-    fn next(&mut self) -> Slot {
+    pub(super) fn next(&mut self) -> Slot {
         self.0 += 1;
         self.0
     }
@@ -172,48 +172,41 @@ pub(crate) struct Front {
     pub limit: i64,
 }
 
-pub(super) fn build(group: &Document, uuid: &str, last: bool, front: &Front) -> Option<Plan> {
-    let (id, accs) = parse(group)?;
-    let mut args: Vec<&Arg> = match &id {
-        Id::One(a) => vec![a],
-        Id::Object(children) => children.iter().map(|(_, a)| a).collect(),
-    };
-    args.extend(accs.iter().filter_map(|a| a.arg.as_ref()));
-    let paths: Vec<&Vec<String>> = {
-        let mut seen: Vec<&Vec<String>> = Vec::new();
-        for a in &args {
-            if let Arg::Path(p) = a {
-                if !seen.contains(&p) {
-                    seen.push(p);
-                }
-            }
-        }
-        seen
-    };
-    if paths.len() > 1 {
-        return None;
+impl Front {
+    /// How many query solution nodes the query makes: the scan, then a
+    /// SKIP and a LIMIT when it has them.
+    pub(super) fn nodes(&self) -> u32 {
+        1 + u32::from(self.skip > 0) + u32::from(self.limit > 0)
     }
-    let fields: BTreeSet<String> = args
-        .iter()
-        .filter_map(|a| match a {
-            Arg::Field(f) => Some(f.clone()),
-            Arg::Path(p) => Some(p[0].clone()),
-            _ => None,
-        })
-        .collect();
-    let whole_document = args.iter().any(|a| matches!(a, Arg::Root));
-    let projected = !fields.is_empty() && !whole_document;
-    let (skip, limit) = (front.skip.max(0), front.limit.max(0));
-    if projected && (skip > 0 || limit > 0) {
-        return None;
-    }
-    // The query's nodes: the scan, then a SKIP and a LIMIT. Node 2 is the
-    // dependency projection pushdown puts under the group when it needs a
-    // finite set of fields; it builds no SBE stage.
-    let front_nodes = 1 + u32::from(skip > 0) + u32::from(limit > 0);
-    let node: u32 = if projected { 3 } else { front_nodes + 1 };
+}
 
-    let mut slots = Slots(0);
+/// The query's SBE stages, as `buildCollScan` and `buildLimitSkip` build
+/// them: what they are, the slots they took and the query solution they
+/// were built from.
+pub(super) struct Scanned {
+    pub root: Stage,
+    /// The scanned document's slot.
+    pub record: Slot,
+    /// The top-level fields the scan reads into slots.
+    pub fields: Vec<(String, Slot)>,
+    /// The skip's and the limit's constants.
+    pub env: Vec<(Slot, i64)>,
+    pub query_plan: Document,
+}
+
+/// The collection scan of the collection whose UUID is `uuid`, reading
+/// `fields` and then the filter's, with the filter, skip and limit of
+/// `front`. Slots come from `slots` in the builder's order: a skip's
+/// constant when a limit sits directly over it, the record and record id,
+/// the field slots, then the limit's or lone skip's constant.
+pub(super) fn scan(
+    front: &Front,
+    uuid: &str,
+    fields: BTreeSet<String>,
+    slots: &mut Slots,
+) -> Option<Scanned> {
+    let (skip, limit) = (front.skip.max(0), front.limit.max(0));
+    let front_nodes = front.nodes();
     let merged_skip = (skip > 0 && limit > 0).then(|| slots.next());
     let record = slots.next();
     let record_id = slots.next();
@@ -279,6 +272,63 @@ pub(super) fn build(group: &Document, uuid: &str, last: bool, front: &Front) -> 
             input: Box::new(root),
         };
     }
+    Some(Scanned {
+        root,
+        record,
+        fields: scan_fields,
+        env,
+        query_plan,
+    })
+}
+
+pub(super) fn build(group: &Document, uuid: &str, last: bool, front: &Front) -> Option<Plan> {
+    let (id, accs) = parse(group)?;
+    let mut args: Vec<&Arg> = match &id {
+        Id::One(a) => vec![a],
+        Id::Object(children) => children.iter().map(|(_, a)| a).collect(),
+    };
+    args.extend(accs.iter().filter_map(|a| a.arg.as_ref()));
+    let paths: Vec<&Vec<String>> = {
+        let mut seen: Vec<&Vec<String>> = Vec::new();
+        for a in &args {
+            if let Arg::Path(p) = a {
+                if !seen.contains(&p) {
+                    seen.push(p);
+                }
+            }
+        }
+        seen
+    };
+    if paths.len() > 1 {
+        return None;
+    }
+    let fields: BTreeSet<String> = args
+        .iter()
+        .filter_map(|a| match a {
+            Arg::Field(f) => Some(f.clone()),
+            Arg::Path(p) => Some(p[0].clone()),
+            _ => None,
+        })
+        .collect();
+    let whole_document = args.iter().any(|a| matches!(a, Arg::Root));
+    let projected = !fields.is_empty() && !whole_document;
+    if projected && (front.skip > 0 || front.limit > 0) {
+        return None;
+    }
+    // The query's nodes: the scan, then a SKIP and a LIMIT. Node 2 is the
+    // dependency projection pushdown puts under the group when it needs a
+    // finite set of fields; it builds no SBE stage.
+    let node: u32 = if projected { 3 } else { front.nodes() + 1 };
+
+    let mut slots = Slots(0);
+    let Scanned {
+        mut root,
+        record,
+        fields: scan_fields,
+        env,
+        query_plan,
+    } = scan(front, uuid, fields, &mut slots)?;
+    let field_slot = |f: &str| scan_fields.iter().find(|(n, _)| n == f).map(|(_, s)| *s);
 
     // The dotted path: `traverseP` over its top-level field, one lambda per
     // level, framed from 1 + (levels - 1) since generating it took those.

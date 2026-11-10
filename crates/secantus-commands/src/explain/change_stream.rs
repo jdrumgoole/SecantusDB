@@ -842,7 +842,7 @@ pub(super) fn reply(
         "stages": stages.into_iter().map(Bson::Document).collect::<Vec<_>>(),
     };
     reply.insert("serverInfo", server_info(ctx));
-    reply.insert("serverParameters", server_parameters());
+    reply.insert("serverParameters", server_parameters(false));
     reply.insert("command", echo);
     reply.insert("ok", 1.0);
     Ok(reply)

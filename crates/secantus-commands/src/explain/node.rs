@@ -255,6 +255,19 @@ fn child(stats: Option<&Stats>, i: usize) -> Option<&Stats> {
 }
 
 impl Node {
+    /// The plan under its projection, skip and limit.
+    pub(crate) fn without_paging(&self) -> &Node {
+        let mut node = self;
+        loop {
+            node = match node {
+                Node::Projection { input, .. } | Node::Skip(_, input) | Node::Limit(_, input) => {
+                    input
+                }
+                _ => return node,
+            };
+        }
+    }
+
     pub fn fetch(filter: Option<Document>, input: Node) -> Node {
         Node::Fetch {
             filter,

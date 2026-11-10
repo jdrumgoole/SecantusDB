@@ -191,6 +191,13 @@ pub fn expression_compatible(expr: &Bson) -> bool {
 }
 
 /// Whether a `$match` filter compiles: its `$expr`s, and no `$jsonSchema`.
+/// Whether SBE compiles a `find` with this filter and projection: under
+/// `trySbeEngine` (a `queryFramework: "sbe"` query setting) such a `find`
+/// runs in SBE, any other in the classic engine (RM-418).
+pub fn find_compatible(filter: &Document, projection: Option<&Document>) -> bool {
+    filter_compatible(filter) && projection.is_none_or(projection_compatible)
+}
+
 fn filter_compatible(filter: &Document) -> bool {
     filter.iter().all(|(k, v)| match k.as_str() {
         "$expr" => expression_compatible(v),

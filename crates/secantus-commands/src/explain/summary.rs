@@ -115,9 +115,12 @@ pub(crate) struct PlanInfo {
 /// record count included, and not for an `_id` point read (`EXPRESS`), a
 /// `distinct` from a DISTINCT_SCAN, or a collection that does not exist
 /// (measured 2026-10-27). `queryFramework` is `sbe` for an `aggregate`
-/// whose `$group` or `$lookup` its engine takes, `classic` for the other
-/// `find`s, `distinct`s and `aggregate`s; a `count` prints none.
+/// whose `$group` or `$lookup` its engine takes, and for a `find` a query
+/// setting puts in SBE (RM-418), `classic` for the other `find`s,
+/// `distinct`s and `aggregate`s; a `count` prints none.
 pub(crate) fn plan_info(request: &Document, ctx: &CommandContext) -> PlanInfo {
+    // Reported after the read ran: under its query settings again.
+    let _settings = crate::query_settings::reenter(request, ctx);
     match ctx.storage().ok() {
         Some(storage) => plan_info_in(storage, &ctx.db_name, request),
         None => PlanInfo::default(),
@@ -185,7 +188,23 @@ fn plan_info_with(
         _ => Vec::new(),
     };
     out.framework = match name {
-        "find" | "distinct" => Some("classic"),
+        "find" => {
+            let collation = crate::util::effective_collation(storage, db, &s.coll, request)
+                .ok()
+                .flatten();
+            let sbe = super::find_runs_in_sbe(
+                storage,
+                db,
+                &s.coll,
+                &s.filter,
+                s.projection.as_ref(),
+                s.skip,
+                s.hint.as_ref(),
+                collation.as_ref(),
+            );
+            Some(if sbe { "sbe" } else { "classic" })
+        }
+        "distinct" => Some("classic"),
         "aggregate" => {
             let pipeline: Vec<Bson> = stages.iter().cloned().map(Bson::Document).collect();
             let hoisted = super::hoist::hoist_matches(&pipeline);
