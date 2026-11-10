@@ -132,7 +132,7 @@ fn n_items(dims: &[i64]) -> Result<i64> {
 }
 
 /// `ArrayCheckBounds`: each dimension's upper bound must fit an `int4`.
-fn check_bounds(dims: &[i64], lbs: &[i64]) -> Result<()> {
+pub(crate) fn check_bounds(dims: &[i64], lbs: &[i64]) -> Result<()> {
     for (d, lb) in dims.iter().zip(lbs) {
         if d + lb > i64::from(i32::MAX) {
             return Err(Error::Sqlstate(

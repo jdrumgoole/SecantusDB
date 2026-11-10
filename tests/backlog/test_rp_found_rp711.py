@@ -1,8 +1,8 @@
 """Gap tests of divergences found while working RP-711 (a PL/pgSQL
 assignment to an array element was refused):
 
-- an array literal whose upper bound passes `int4` is accepted, where
-  `array_in`'s `ArrayCheckBounds` refuses it;
+- an array literal whose upper bound passes `int4` was accepted, where
+  `array_in`'s `ArrayCheckBounds` refuses it (fixed, RP-771);
 - jsonb subscripting -- a fetch, an UPDATE's `SET j['k'] = v`, a PL/pgSQL
   `x['k'] := v` -- is refused, the first two with a 42804 that says jsonb
   does not support subscripting.
@@ -62,6 +62,12 @@ ARRAY_BOUNDS = {
         "54000",
         "array lower bound is too large: 2147483646",
     ),
+    # Checked before the first element is read: `x` is never parsed.
+    "select '[2147483647:2147483647]={x}'::int[]": (
+        "error",
+        "54000",
+        "array lower bound is too large: 2147483647",
+    ),
     "select ('[2147483646:2147483646]={1}'::int[])::text": (
         "ok",
         [("[2147483646:2147483646]={1}",)],
@@ -70,7 +76,7 @@ ARRAY_BOUNDS = {
 }
 
 
-@pytest.mark.backlog("RP-771")
+@pytest.mark.backlog_fixed("RP-771")
 @pytest.mark.parametrize("query", list(ARRAY_BOUNDS))
 def test_array_input_refuses_an_upper_bound_past_int4(query: str, dsn: str) -> None:
     assert _answer(dsn, query) == ARRAY_BOUNDS[query]
