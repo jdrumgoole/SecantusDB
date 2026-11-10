@@ -776,8 +776,12 @@ fn reach(
         .or_else(|| w.get("range"))
         .and_then(Bson::as_array)
         .and_then(|b| b.get(1));
+    let current = matches!(upper, Some(Bson::String(s)) if s == "current");
     let hi = match upper {
         Some(Bson::String(s)) if s == "unbounded" => last + 1,
+        // `"current"` is the document answered: a `range` window looks no
+        // further for its end (`getEndpointsRangeBased`; RM-404).
+        _ if current => p,
         _ if range => hi + 1,
         // A document window asks for its upper bound, which `window_bounds`
         // clamps to the partition.
@@ -785,6 +789,39 @@ fn reach(
         Some(Bson::Int64(k)) => p + k,
         _ => hi,
     };
+    // A window with no lower end runs an accumulator that never lets a value
+    // go (`WindowFunctionExecNonRemovable[Range]`; `$first`, `$last` and
+    // `$derivative` run their own executors), so it holds only what it has
+    // still to read. A `documents` one reads its upper end and lets go of
+    // what lies left of it (`kDefaultSequential`): `[-4]` keeps the four
+    // documents behind the one answered. A `range` one lets go of what lies
+    // left of the right endpoint it found answering the document before
+    // (`kRightEndpoint`), nothing while its window is empty (macOS 8.2.1
+    // and Linux 8.2.12, RM-404: `["unbounded", 4]` over values two apart
+    // holds four documents, `["unbounded", -9]` seven).
+    if !window_removes(Some(w)) && !matches!(c.op, "$first" | "$last" | "$derivative") {
+        let keep = if range {
+            match pos.checked_sub(1) {
+                Some(before) if current => before,
+                Some(before) => {
+                    let (lo, hi) = range_window_bounds(before, n, w, range_vals, range_dates)?;
+                    if hi >= lo {
+                        clamp(hi).min(pos)
+                    } else {
+                        0
+                    }
+                }
+                None => 0,
+            }
+        } else {
+            match upper {
+                Some(Bson::Int32(k)) if *k < 0 => clamp(p + i64::from(*k)),
+                Some(Bson::Int64(k)) if *k < 0 => clamp(p + k),
+                _ => pos,
+            }
+        };
+        return Ok((keep, hi.max(p)));
+    }
     if range || (matches!(c.op, "$first" | "$last") && window_removes(Some(w))) {
         return Ok((clamp((lo - 1).min(p)), hi.max(p)));
     }
@@ -826,7 +863,24 @@ enum FunctionMemory {
         acc: group::Acc,
         fed: usize,
     },
+    /// `AccumulatorExpMovingAvg`: its own size alone, whatever it averages
+    /// (136, measured macOS 8.2.1 over ints, decimals and missing values;
+    /// Linux 8.2.12's least budgets agree; RM-404).
+    ExpMovingAvg,
+    /// `AccumulatorLocf`: its own size (128), and what the last value it
+    /// carries holds beyond its inline `Value` -- nothing for an int, a
+    /// string's buffer (measured macOS 8.2.1; Linux 8.2.12's least budgets
+    /// agree; RM-404).
+    Locf {
+        last: Option<usize>,
+        fed: usize,
+    },
 }
+
+/// `AccumulatorExpMovingAvg`'s size (RM-404).
+const EXP_MOVING_AVG: usize = 136;
+/// `AccumulatorLocf`'s size, before the value it carries (RM-404).
+const LOCF: usize = 128;
 
 impl FunctionMemory {
     fn of(c: &OutField) -> R<FunctionMemory> {
@@ -851,6 +905,11 @@ impl FunctionMemory {
             }
             _ => {}
         }
+        match c.op {
+            "$expMovingAvg" => return Ok(FunctionMemory::ExpMovingAvg),
+            "$locf" => return Ok(FunctionMemory::Locf { last: None, fed: 0 }),
+            _ => {}
+        }
         if matches!(c.op, "$first" | "$last")
             || PREFIX_OPS.contains(&c.op)
             || COVARIANCE_OPS.contains(&c.op)
@@ -864,6 +923,7 @@ impl FunctionMemory {
                     "$avg" => crate::memlimit::LAYOUT.removable_avg,
                     "$push" => crate::memlimit::LAYOUT.removable_push,
                     "$stdDevPop" | "$stdDevSamp" => crate::memlimit::LAYOUT.removable_std_dev,
+                    "$min" | "$max" => crate::memlimit::LAYOUT.removable_min_max,
                     _ => crate::memlimit::LAYOUT.removable,
                 },
                 sizes: Vec::new(),
@@ -924,7 +984,12 @@ impl FunctionMemory {
                         expressions::evaluate(&docs[slots[i]], c.arg, vars).unwrap_or(Bson::Null)
                     };
                     let size = crate::memlimit::classic_size(&v);
-                    let s = if size > 16 || c.op == "$push" {
+                    // `$min` / `$max` keep every value that is not nullish in
+                    // their multiset, beside the executor's queue of all
+                    // (`WindowFunctionMinMaxCommon::add`; RM-404).
+                    let min_max = matches!(c.op, "$min" | "$max")
+                        && !matches!(v, Bson::Null | Bson::Undefined);
+                    let s = if size > 16 || c.op == "$push" || min_max {
                         2 * size
                     } else {
                         size
@@ -958,6 +1023,19 @@ impl FunctionMemory {
                     *fed += 1;
                 }
                 let held = group::acc_memory_classic(acc);
+                (held, held)
+            }
+            FunctionMemory::ExpMovingAvg => (EXP_MOVING_AVG, EXP_MOVING_AVG),
+            FunctionMemory::Locf { last, fed } => {
+                while *fed <= pos && *fed < slots.len() {
+                    let v = expressions::evaluate(&docs[slots[*fed]], c.arg, vars)
+                        .unwrap_or(Bson::Null);
+                    if !matches!(v, Bson::Null | Bson::Undefined) {
+                        *last = Some(crate::memlimit::classic_size(&v) - crate::memlimit::VALUE);
+                    }
+                    *fed += 1;
+                }
+                let held = LOCF + last.unwrap_or(0);
                 (held, held)
             }
         })
@@ -2781,6 +2859,49 @@ mod budget_tests {
     /// Linux mongod 8.2.12: 1222 and 12885; macOS arm64 8.2.1, whose
     /// removable `$sum` is 8 bytes larger and `$push` 32 smaller: 1230 and
     /// 12853 (RM-403).
+    #[test]
+    fn windows_with_no_lower_end_hold_what_they_have_still_to_read() {
+        // RM-404 (macOS 8.2.1, Linux 8.2.12): each document cached is
+        // `{_id, n}` with mongod's `Document` overhead; `n` runs two apart.
+        let fields = ["_id", "n"].map(String::from).into_iter().collect();
+        let doc = memlimit::fields_size(&docs()[0], &fields);
+        let layout = memlimit::LAYOUT;
+        let sum = |w: Bson| least(window(bson!({"$sum": "$n", "window": w}), false)).0;
+        // `range`: from the right end found answering the one before, to
+        // the document past this one's.
+        assert_eq!(
+            sum(bson!({"range": ["unbounded", 4]})),
+            4 * doc + layout.sum
+        );
+        assert_eq!(
+            sum(bson!({"range": ["unbounded", 0]})),
+            3 * doc + layout.sum
+        );
+        assert_eq!(
+            sum(bson!({"range": ["unbounded", -9]})),
+            7 * doc + layout.sum
+        );
+        assert_eq!(
+            sum(bson!({"range": ["unbounded", "current"]})),
+            2 * doc + layout.sum
+        );
+        // `documents`: from its upper end.
+        assert_eq!(
+            sum(bson!({"documents": ["unbounded", -4]})),
+            5 * doc + layout.sum
+        );
+        // A function that counts itself, besides the document answered.
+        let ema = bson!({"$expMovingAvg": {"input": "$n", "N": 2}});
+        assert_eq!(least(window(ema, false)).0, doc + EXP_MOVING_AVG);
+        assert_eq!(least(window(bson!({"$locf": "$n"}), false)).0, doc + LOCF);
+        // `$min` / `$max`: each int in the queue and in the multiset.
+        let max = bson!({"$max": "$n", "window": {"documents": [-3, 3]}});
+        assert_eq!(
+            least(window(max, false)).0,
+            4 * doc + layout.removable_min_max + 7 * 2 * memlimit::VALUE
+        );
+    }
+
     #[test]
     fn removable_windows_keep_their_budgets() {
         let layout = crate::memlimit::LAYOUT;

@@ -84,6 +84,12 @@ pub(crate) struct Layout {
     pub removable_avg: usize,
     pub removable_push: usize,
     pub removable_std_dev: usize,
+    /// `WindowFunctionMinMax` (`$min` / `$max`), before the values its
+    /// multiset and its executor's queue hold (RM-404: macOS 8.2.1 112,
+    /// from `maxFunctionMemoryUsageBytes` over windows of one to eleven
+    /// documents; Linux 8.2.12 128, from the least budget of a `[-3, 3]`
+    /// window, 852).
+    pub removable_min_max: usize,
     /// `AccumulatorRank`, `AccumulatorDenseRank`,
     /// `AccumulatorDocumentNumber`.
     pub rank: usize,
@@ -99,6 +105,7 @@ pub(crate) const LIBSTDCXX: Layout = Layout {
     removable_avg: 304,
     removable_push: 160,
     removable_std_dev: 472,
+    removable_min_max: 128,
     rank: 376,
     dense_rank: 368,
     document_number: 368,
@@ -118,6 +125,7 @@ pub(crate) const LIBCXX_ARM64: Layout = Layout {
     removable_avg: 312,
     removable_push: 128,
     removable_std_dev: 488,
+    removable_min_max: 112,
     rank: 344,
     dense_rank: 336,
     document_number: 336,
