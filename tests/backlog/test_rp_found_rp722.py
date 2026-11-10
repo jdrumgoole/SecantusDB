@@ -21,15 +21,19 @@ Found while working it, and since fixed:
 - an array column compared with an untyped literal in the select list
   (`select a > '{b}' from t`) was 42883 `operator does not exist: text[] >
   text` once a row held an array whose lower bound is not 1; the literal is
-  read as the column's array type now, as PostgreSQL does (RP-734).
+  read as the column's array type now, as PostgreSQL does (RP-734);
+- `a = any (array['{x,y}'::text[]])` over a `text[]` column answered rows
+  where PostgreSQL resolves `text[] = text` and refuses it, 42883, and ANY
+  / ALL compared a scalar with a multidimensional array's sub-arrays, not
+  its elements; ANY / ALL take the array's element type and walk every
+  element now (RP-740).
 
 Found while working those (each a gap test below):
 
 - `a IS NULL` over an array column matches an array holding a NULL
   element (RP-739);
-- `a = any (array['{x,y}'::text[]])` over a `text[]` column answers rows
-  where PostgreSQL resolves `text[] = text` and refuses it, 42883
-  (RP-740).
+- a scalar compared with an array value names `int4 = int4[]` where
+  PostgreSQL names `integer = integer[]` (RP-742).
 
 The VALUES-only answers were measured on PostgreSQL 15.19 (the shared
 reference on port 5415). The ones over `x722` were measured on a private,
@@ -268,11 +272,90 @@ def test_a_null_test_over_an_array_column_reads_the_array(
     assert _answer(shapes, f"select k from x733 where {where} order by k") == [(k,) for k in keys]
 
 
-@pytest.mark.backlog("RP-740")
+@pytest.mark.backlog_fixed("RP-740")
 def test_an_array_column_against_any_of_an_array_of_arrays(shapes: str) -> None:
-    """`array['{x,y}'::text[]]` is a `text[]`, so ANY compares `text[]` with
-    `text`, which has no operator."""
+    """`array['{x,y}'::text[]]` is a `text[]`, so ANY compared `text[]` with
+    `text`, which has no operator; the filter had matched it as `a = '{x,y}'`."""
     assert _answer(shapes, "select k from x733 where a = any (array['{x,y}'::text[]])") == (
         "42883",
         "operator does not exist: text[] = text",
     )
+
+
+@pytest.mark.backlog_fixed("RP-740")
+@pytest.mark.parametrize(
+    ("query", "answer"),
+    [
+        # ANY / ALL walk every element of a multidimensional array, as
+        # `ExecEvalScalarArrayOp` does; a row holding `{{1,2},{3,4}}` was
+        # 42883 `int4 = int4[]` for `2 = any (b)`.
+        ("select k from x733 where 2 = any (b) order by k", [(3,), (4,), (5,)]),
+        ("select k from x733 where 'w' = any (a) order by k", [(1,)]),
+        (
+            "select k, 4 = any (b), 1 <> all (b) from x733 order by k",
+            [
+                (1, False, True),
+                (2, None, False),
+                (3, False, False),
+                (4, True, False),
+                (5, False, False),
+                (6, None, None),
+                (7, None, None),
+            ],
+        ),
+        ("select 1 = any ('{{2},{1}}'::int[]), 2 = all ('{{2},{2}}'::int[])", [(True, True)]),
+        # An array column meets the array's element type.
+        (
+            "select k from x733 where a = any (array[a])",
+            ("42883", "operator does not exist: text[] = text"),
+        ),
+        (
+            "select k from x733 where a <> all ('{{x,y}}'::text[])",
+            ("42883", "operator does not exist: text[] <> text"),
+        ),
+        (
+            "select k from x733 where a = any ('{x}')",
+            ("42704", "could not find array type for data type text[]"),
+        ),
+        (
+            "select '{x,y}'::text[] = any (array['{x,y}'::text[]])",
+            ("42883", "operator does not exist: text[] = text"),
+        ),
+        (
+            "select k from (values (1, '{x,y}'::text[])) v(k, a)"
+            " where a = any (array['{x,y}'::text[]])",
+            ("42883", "operator does not exist: text[] = text"),
+        ),
+        # A subquery's rows that are arrays stay whole, and a vector array's
+        # elements are vectors.
+        (
+            "select k from x733 where b = any (select b from x733 where k in (3, 4)) order by k",
+            [(3,), (4,)],
+        ),
+        (
+            "select k from x733 where b <> all (select b from x733 where k = 3) order by k",
+            [(1,), (2,), (4,), (5,), (7,)],
+        ),
+        ("select array[1] = any (select array[1])", [(True,)]),
+        ("select '1 2'::int2vector = any (array['1 2'::int2vector])", [(True,)]),
+    ],
+)
+def test_any_and_all_compare_with_the_arrays_elements(
+    query: str, answer: object, shapes: str
+) -> None:
+    """Measured on PostgreSQL 15.19 over the same rows (`x733` as a CTE)."""
+    assert _answer(shapes, query) == answer
+
+
+@pytest.mark.backlog("RP-742")
+@pytest.mark.parametrize(
+    "query",
+    [
+        "select 1 = (select array[1])",
+        "select x = y from (values (1, array[1])) v(x, y)",
+        "select 1 = any (select array[1])",
+    ],
+)
+def test_a_scalar_against_an_array_value_names_its_types(query: str, dsn: str) -> None:
+    """PostgreSQL 15.19 names `integer` and `integer[]`, not `int4`."""
+    assert _answer(dsn, query) == ("42883", "operator does not exist: integer = integer[]")
