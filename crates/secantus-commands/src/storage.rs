@@ -293,6 +293,22 @@ pub struct OperationCounts {
     pub oplog_slot_micros: i64,
 }
 
+impl OperationCounts {
+    /// These counts with the engine's statistics of `o` added.
+    pub fn plus_engine(mut self, o: &OperationCounts) -> Self {
+        self.bytes_read += o.bytes_read;
+        self.bytes_written += o.bytes_written;
+        self.read_micros += o.read_micros;
+        self.write_micros += o.write_micros;
+        self.cache_wait_micros += o.cache_wait_micros;
+        self.schema_lock_wait_micros += o.schema_lock_wait_micros;
+        self.handle_lock_wait_micros += o.handle_lock_wait_micros;
+        self.txn_bytes_dirty += o.txn_bytes_dirty;
+        self.txn_updates += o.txn_updates;
+        self
+    }
+}
+
 /// The storage operations the command handlers depend on. Bytes at the seam:
 /// documents go in/out as `bson::encode` bytes, as they come off the WT cursor.
 pub trait Storage: Send + Sync {
@@ -1334,6 +1350,16 @@ pub trait Storage: Send + Sync {
     /// What the store has counted so far for the operation running on
     /// this thread; `None` outside [`Self::begin_operation_counts`].
     fn operation_counts(&self) -> Option<OperationCounts> {
+        None
+    }
+
+    /// What the transaction running on this thread has counted in the
+    /// engine since its counts were last taken, taken from the operation's:
+    /// the share a transaction's update or delete statement reports as its
+    /// own, leaving its command none, as mongod's statement takes its
+    /// recovery unit's statistics since the last call (RM-385). `None`
+    /// outside a transaction, or when the store counts nothing.
+    fn take_transaction_counts(&self) -> Option<OperationCounts> {
         None
     }
 

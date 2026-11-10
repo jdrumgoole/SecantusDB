@@ -1487,12 +1487,14 @@ def test_a_transaction_statement_counts_its_updates(rust_mongo: Any, mongod_rs: 
     assert answers["rust"] == answers["mongod"]
 
 
-@pytest.mark.backlog("RM-385")
+@pytest.mark.backlog_fixed("RM-385")
 def test_an_update_in_a_transaction_counts_no_dirty_bytes(rust_mongo: Any, mongod_rs: Any) -> None:
-    """mongod 8.2.11's line for an `update` and a `delete` inside a
-    transaction carries no `txnBytesDirty` or `txnNumUpdates`, where an
-    insert's carries both (measured 2026-11-07); this server's counts the
-    statement's share on all three."""
+    """mongod 8.2.11's `update` and `delete` command lines inside a
+    transaction carried no `txnBytesDirty` or `txnNumUpdates`, where an
+    insert's carries both (measured 2026-11-07): the statement's own line
+    took them, as its `CurOp` takes its recovery unit's statistics since
+    the last call. This server's printed the statement's share on the
+    command line; its statement takes them now (2026-11-10)."""
 
     def op(db: Any) -> None:
         with db.client.start_session() as s, s.start_transaction():
@@ -1516,3 +1518,63 @@ def test_an_update_in_a_transaction_counts_no_dirty_bytes(rust_mongo: Any, mongo
         "delete": [],
     }
     assert answers["rust"] == answers["mongod"]
+    # Where they went: the statements' lines and the profile entries.
+    keys = ["txnBytesDirty", "txnNumUpdates"]
+    taken = {
+        s: (
+            [
+                (sorted(k for k in a.get("storage", {}).get("data", {}) if k.startswith("txn")))
+                for _, a in lines
+                if next(iter(a.get("command", {})), "") == "q"
+            ],
+            [
+                (
+                    e.get("op"),
+                    sorted(k for k in e.get("storage", {}).get("data", {}) if k.startswith("txn")),
+                )
+                for e in entries
+            ],
+        )
+        for s, (lines, entries) in got.items()
+    }
+    assert taken["mongod"] == (
+        [keys, keys],
+        [("insert", keys), ("update", keys), ("remove", keys)],
+    )
+    assert taken["rust"] == taken["mongod"]
+
+
+# ------------------------------------------------------------- RM-499 --
+
+
+@pytest.mark.backlog("RM-499")
+def test_an_insert_in_a_transaction_counts_mongods_dirty_bytes(
+    rust_mongo: Any, mongod_rs: Any
+) -> None:
+    """mongod 8.2.11's line for a transaction's insert of `{_id: 700, y: 1}`
+    into a collection indexed on `_id` and `x` counts about 305-345
+    `txnBytesDirty`; this server's about 391, 71-87 bytes more per document
+    (measured 2026-11-10), where an update and a delete of it count the same
+    on both (96 and 192). An insert's count is not exact on either server:
+    WiredTiger draws each new key's skiplist depth at random, 8 bytes a
+    level (`__wt_skip_choose_depth`, one in four goes a level deeper), so
+    the per-document mean over fifty documents is compared, within 8 bytes.
+    The draw moves that mean by about 1.3 bytes either way; the surplus is
+    ten times the tolerance."""
+    n = 50
+
+    def op(db: Any) -> None:
+        with db.client.start_session() as s, s.start_transaction():
+            db.c.insert_many([{"_id": 1000 + i, "y": i % 3} for i in range(n)], session=s)
+
+    got = _both(rust_mongo, mongod_rs, op)
+    per_doc = {
+        s: [
+            e.get("storage", {}).get("data", {}).get("txnBytesDirty", 0) / n
+            for e in entries
+            if e.get("op") == "insert"
+        ]
+        for s, (_, entries) in got.items()
+    }
+    assert len(per_doc["mongod"]) == 1 and len(per_doc["rust"]) == 1, per_doc
+    assert abs(per_doc["rust"][0] - per_doc["mongod"][0]) <= 8, per_doc

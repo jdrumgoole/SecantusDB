@@ -737,16 +737,27 @@ impl Session {
     /// outlives a statement (a transaction's) gives each statement its own
     /// share. Nothing when no operation is counting.
     pub fn collect_operation_statistics(&self) -> Result<()> {
+        if let Some(stats) = self.statistics_since_last_call()? {
+            note_operation_stats(&stats);
+        }
+        Ok(())
+    }
+
+    /// What this session counted since it last gave its counts, started
+    /// over, without adding them to the running operation's: mongod's
+    /// `computeOperationStatisticsSinceLastCall`, which a transaction's
+    /// update or delete statement takes as its own (RM-385). `None` when no
+    /// operation is counting.
+    pub fn statistics_since_last_call(&self) -> Result<Option<OperationStats>> {
         if !self.stats || !operation_stats_armed() {
-            return Ok(());
+            return Ok(None);
         }
         let mut stats = self.statistics(true)?;
         if !self.in_txn.get() {
             stats.txn_bytes_dirty = 0;
             stats.txn_updates = 0;
         }
-        note_operation_stats(&stats);
-        Ok(())
+        Ok(Some(stats))
     }
 
     /// Whether the session can be handed to another operation as it stands:

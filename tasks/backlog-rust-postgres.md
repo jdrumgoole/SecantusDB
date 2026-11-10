@@ -406,7 +406,10 @@ one beside it.
   To work it: time each rewrite pass of the `IN` list at delay 0.7 and
   record when each pass checks the cancel flag, under a load average near
   7. A copy that cannot be interrupted and takes about 0.3 s under load is
-  RP-202's own signature.
+  RP-202's own signature. Again 2026-11-10 in the RM-385 lane (`[0.7]`
+  0.42 s late, load average about 12.6 from a `gate_rm.py` just before);
+  rerun alone at once it passed 15 of 15. RM-385 changes only the MongoDB
+  server's statement statistics, which the PG server does not read.
   Verify: none -- intermittent under load; RP-202's regression test is the check, and it passed 14 of 14 runs on two rebuilt commits
   Backlog-ID: RP-748
 - [ ] **OPEN -- `gate_pg.sh`'s login step differs from the local reference
