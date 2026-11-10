@@ -84,6 +84,36 @@ def test_a_push_counts_what_it_holds(rust_mongo: Any, mongod: Any) -> None:
     same(answer(rust_mongo), answer(mongod))
 
 
+HELD = {
+    "a long string": "$s",
+    "a short string": {"$substrCP": ["$s", 0, 10]},
+    "a longer string": {"$concat": ["$s", "$s"]},
+    "a decimal": {"$toDecimal": "$n"},
+    "null": None,
+    "missing": "$nope",
+}
+
+
+def test_a_first_and_a_last_count_the_value_they_hold(rust_mongo: Any, mongod: Any) -> None:
+    """The classic `$first` and `$last` count what their value keeps beyond
+    its inline `Value`: a long string's buffer, a decimal's, nothing for an
+    int (RM-409). Compared as differences from an int, since an
+    accumulator's own size differs between mongod's builds."""
+
+    def answer(client: Any) -> dict:
+        db = _load(client)
+        out = {}
+        for op in ("$first", "$last"):
+            group = {"_id": "$k", "int": {op: "$n"}}
+            group.update({name: {op: expr} for name, expr in HELD.items()})
+            stage = _explained(db, [{"$unwind": "$s"}, {"$group": group}])["stages"][-1]
+            memory = stage["maxAccumulatorMemoryUsageBytes"]
+            out[op] = {name: memory[name] - memory["int"] for name in HELD}
+        return out
+
+    same(answer(rust_mongo), answer(mongod))
+
+
 WINDOWS = {
     "leading, sorted": [
         {"$setWindowFields": {"sortBy": {"n": 1}, "output": {"z": {"$first": "$n"}}}}

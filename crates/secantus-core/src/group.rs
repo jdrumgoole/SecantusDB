@@ -2235,9 +2235,14 @@ fn acc_memory(acc: &Acc) -> usize {
     base + match acc {
         Acc::Push(c) | Acc::AddToSet(c) | Acc::ConcatArrays(c) | Acc::SetUnion(c) => c.mem,
         Acc::Min(Some(v)) | Acc::Max(Some(v)) => memlimit::engine_size(v),
-        // The classic `$first` / `$last` count themselves only.
         Acc::First(Some(v)) | Acc::Last(Some(v)) if sbe => {
             memlimit::sbe_size(v.as_ref().unwrap_or(&Bson::Null))
+        }
+        // The classic `$first` / `$last` count what the value they hold
+        // keeps beyond its inline `Value` (`sizeof(*this) +
+        // _first.getApproximateSize() - sizeof(Value)`; RM-409).
+        Acc::First(Some(v)) | Acc::Last(Some(v)) => {
+            memlimit::classic_size(v.as_ref().unwrap_or(&Bson::Null)) - memlimit::VALUE
         }
         Acc::MergeObjects(d) if sbe && !d.is_empty() => {
             memlimit::sbe_size(&Bson::Null) + memlimit::bson_len(d)

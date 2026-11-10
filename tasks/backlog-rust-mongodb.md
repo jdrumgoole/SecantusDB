@@ -1272,15 +1272,6 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       sizes, so those stages spill and refuse later than mongod.
       Verify: tests/backlog/test_rm_found_2026_11_08_explain.py::test_changed_documents_are_sized_as_mongod_sizes_them
       Backlog-ID: RM-408
-- [ ] **A classic `$group`'s `$first` and `$last` count only themselves.**
-      mongod 8.2.1's `maxAccumulatorMemoryUsageBytes` for a `$first` of a
-      1000-byte string is 1024 bytes a group more than for a `$first` of
-      an int: it counts the value it holds. This server counts the
-      accumulator alone (`group::acc_memory`, "The classic `$first` /
-      `$last` count themselves only"), so its `$group` budget sees less
-      than mongod's.
-      Verify: tests/backlog/test_rm_found_2026_11_08_explain.py::test_a_classic_first_counts_its_value
-      Backlog-ID: RM-409
 - [ ] **A pipeline's own `$_internalSetWindowFields` ranks without a sort
       key.** The stage runs since RM-328, as mongod runs it behind the
       `$sort` a `$setWindowFields` is parsed into. Named by a pipeline
