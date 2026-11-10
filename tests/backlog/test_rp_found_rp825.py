@@ -1,6 +1,7 @@
-"""Gap tests of the divergences found while working RP-825 (a domain's
-DEFAULT is the type's, not its column's): a column `CREATE TABLE ... (LIKE
-t)` copies from a column of a domain is not one of the domain.
+"""Regression tests of the divergences found while working RP-825 (a
+domain's DEFAULT is the type's, not its column's): a column `CREATE TABLE
+... (LIKE t)` copies from a column of a domain was not one of the domain
+(RP-839, fixed).
 
 The expected answers were measured on a private, freshly initdb'd
 PostgreSQL 15.19 cluster with `_SETUP`, which each test runs after.
@@ -51,10 +52,10 @@ def _answers(dsn: str, sqls: list[str]) -> list[object]:
 # DEFAULT, the domain's CHECK refuses `-1`, and `information_schema` names
 # the domain and no `column_default` (the domain's DEFAULT is the type's,
 # which INCLUDING DEFAULTS does not copy, as it is no `pg_attrdef` row).
-# Here the copy is typed by the domain's base: no DEFAULT without INCLUDING
-# DEFAULTS, no CHECK, no `domain_name`, and with INCLUDING DEFAULTS the
-# domain's DEFAULT is copied in as the column's own.
-@pytest.mark.backlog("RP-839")
+# The copy used to be typed by the domain's base: no DEFAULT without
+# INCLUDING DEFAULTS, no CHECK, no `domain_name`, and with INCLUDING DEFAULTS
+# the domain's DEFAULT copied in as the column's own.
+@pytest.mark.backlog_fixed("RP-839")
 def test_a_like_copy_of_a_domain_column_is_one_of_the_domain(dsn: str) -> None:
     got = _answers(
         dsn,

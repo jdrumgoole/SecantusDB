@@ -3557,28 +3557,6 @@ varchar(3), w dv689, c char(3))`, `d689` an `int` with `check (value > 0)`.
       Verify: tests/backlog/test_rp_found_rp689.py::test_a_column_a_record_field_shares_is_ambiguous
       Backlog-ID: RP-838
 
-## Found while working RP-825 (2026-11-10)
-
-Measured on a private, freshly initdb'd PostgreSQL 15.19 cluster with the
-`_SETUP` in `tests/backlog/test_rp_found_rp825.py`: `d825` a domain over
-`int` with `default 42 check (value > 0)`, and `t825(k int, d d825)`.
-
-- [ ] **A column `LIKE` copies from a column of a domain is not one of the
-      domain.** `create table l (like t825)` makes `d` a column of `d825`
-      on PostgreSQL 15.19 (`transformTableLikeClause` copies `atttypid`):
-      an INSERT naming no `d` takes the domain's DEFAULT `42`, `-1` is
-      23514 under the domain's CHECK, and `information_schema.columns`
-      names `domain_name` `d825` with no `column_default`, with or without
-      INCLUDING DEFAULTS (the domain's DEFAULT is no `pg_attrdef` row, so
-      there is nothing to copy). Here the copy is rendered by the column's
-      stored base type (`int4`): no DEFAULT, no CHECK, no `domain_name`,
-      and with INCLUDING DEFAULTS the domain's `42` is copied in as the
-      column's own. The faithful fix renders a domain column by its
-      domain's name in `expand_table_like` (`crates/secantus-pgplan/src/lib.rs`),
-      and copies only a default the column set itself.
-      Verify: tests/backlog/test_rp_found_rp825.py::test_a_like_copy_of_a_domain_column_is_one_of_the_domain
-      Backlog-ID: RP-839
-
 ## Found while working RP-761 (2026-11-10)
 
 Measured on a private, freshly initdb'd PostgreSQL 15.19 cluster with the
@@ -3594,3 +3572,41 @@ Measured on a private, freshly initdb'd PostgreSQL 15.19 cluster with the
       the plan's tlist), not the field it is computed into.
       Verify: tests/backlog/test_rp_found_rp761.py::test_explain_prints_a_computed_sort_key_as_its_expression
       Backlog-ID: RP-840
+
+## Found while working RP-839 (2026-11-10)
+
+Measured on a private, freshly initdb'd PostgreSQL 15.19 cluster with the
+`_SETUP` in `tests/backlog/test_rp_found_rp839.py`: `"Mx839"` a domain over
+`int` with `not null check (value > 0)`, `t839(x text collate "C", y text,
+m "Mx839")` and `z839(o char(4) default 'ab', v varchar(3) default 'q')`.
+
+- [ ] **A column `LIKE` copies drops the column's collation.** `create
+      table l839 (like t839)` makes `x` a column collated "C" on PostgreSQL
+      15.19 (`transformTableLikeClause` copies `attcollation` with the
+      type), and `information_schema.columns.collation_name` is `C`. Here
+      the copy takes its type's default collation: `attcollation` is
+      "default" and `collation_name` NULL, so the copy sorts and compares
+      by a different collation than the column it was copied from.
+      `expand_table_like` (`crates/secantus-pgplan/src/lib.rs`) renders
+      each column by its type alone.
+      Verify: tests/backlog/test_rp_found_rp839.py::test_a_like_copy_keeps_a_columns_collation
+      Backlog-ID: RP-844
+- [ ] **A domain whose name needs quotes is named bare in its errors.** An
+      INSERT of NULL into a column of `"Mx839"` is 23502 `domain "Mx839"
+      does not allow null values` on PostgreSQL 15.19, and a value its
+      CHECK refuses is 23514 `value for domain "Mx839" violates check
+      constraint "Mx839_check"`: `domain_check_input` names the domain by
+      `format_type_be`, which quotes a name as `quote_identifier` does.
+      Here both print `Mx839` without the quotes, as does `select
+      null::"Mx839"`.
+      Verify: tests/backlog/test_rp_found_rp839.py::test_a_domain_error_quotes_a_name_that_needs_it
+      Backlog-ID: RP-845
+- [ ] **A `char(n)` column's DEFAULT prints its cast as `::character`.**
+      `information_schema.columns.column_default` and `pg_get_expr(adbin,
+      adrelid)` of `o char(4) default 'ab'` are `'ab'::bpchar` on
+      PostgreSQL 15.19 (`get_const_expr` prints the folded constant's
+      type by `format_type_with_typemod` with no modifier, `bpchar`); here
+      they are `'ab'::character`. A `varchar(3)` column's `'q'::character
+      varying` already agrees.
+      Verify: tests/backlog/test_rp_found_rp839.py::test_a_char_columns_default_casts_to_bpchar
+      Backlog-ID: RP-846

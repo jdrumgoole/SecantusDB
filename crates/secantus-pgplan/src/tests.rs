@@ -5251,6 +5251,74 @@ fn an_added_domain_column_is_tagged_like_a_declared_one() {
     domains::set_user_domains(Vec::new());
 }
 
+/// RP-839: `CREATE TABLE ... (LIKE t)` copies a column's `atttypid`, so a
+/// column of a domain stays one of it and follows the domain's DEFAULT,
+/// which INCLUDING DEFAULTS does not copy in as the column's own (it is the
+/// type's); a DEFAULT the column set itself is copied. The copy used to be
+/// typed by the domain's base, untagged, with the domain's DEFAULT made its
+/// own under INCLUDING DEFAULTS.
+#[test]
+fn a_like_copy_of_a_domain_column_is_one_of_the_domain() {
+    let domain = |name: &str, oid| domains::Domain {
+        name: name.to_string(),
+        oid,
+        base: "int4".to_string(),
+        typmod: -1,
+        not_null: false,
+        checks: Vec::new(),
+        not_valid: Vec::new(),
+        default_sql: Some("42".to_string()),
+        collation: None,
+    };
+    domains::set_user_domains(vec![domain("dd", 90041), domain("Mixed Dom", 90042)]);
+    let mut source = t();
+    for (name, dom) in [("d", "dd"), ("m", "Mixed Dom"), ("own", "dd")] {
+        let Some(column) = domain_column(name, dom).expect("a domain column") else {
+            panic!("{dom} is a domain");
+        };
+        source.columns.push(column);
+    }
+    // `own` sets a DEFAULT of its own, as SET DEFAULT leaves it.
+    let own = source.columns.iter_mut().find(|c| c.name == "own").unwrap();
+    own.default = Some(Bson::Int32(7));
+    own.extra.remove("default_from_domain");
+    let lookup = |name: &str| (name == "t").then(|| source.clone());
+    for sql in [
+        "CREATE TABLE l (LIKE t)",
+        "CREATE TABLE l (LIKE t INCLUDING DEFAULTS)",
+    ] {
+        let def = match plan(sql, &lookup).expect("should plan") {
+            Statement::CreateTable(def, _) => def,
+            other => panic!("wrong statement: {other:?}"),
+        };
+        for (name, dom) in [("d", "dd"), ("m", "Mixed Dom")] {
+            let c = def.column(name).unwrap();
+            assert_eq!(c.pg_type, "int4", "{sql}");
+            assert_eq!(c.extra.get_str("domain_type").ok(), Some(dom), "{sql}");
+            assert_eq!(c.default, Some(Bson::Int32(42)), "{sql}");
+            assert_eq!(
+                c.extra.get_bool("default_from_domain").ok(),
+                Some(true),
+                "{sql}"
+            );
+        }
+        let c = def.column("own").unwrap();
+        assert_eq!(c.extra.get_str("domain_type").ok(), Some("dd"), "{sql}");
+        if sql.contains("INCLUDING") {
+            assert_eq!(c.default, Some(Bson::Int32(7)), "{sql}");
+            assert!(c.extra.get_bool("default_from_domain").is_err(), "{sql}");
+        } else {
+            assert_eq!(c.default, Some(Bson::Int32(42)), "{sql}");
+            assert_eq!(
+                c.extra.get_bool("default_from_domain").ok(),
+                Some(true),
+                "{sql}"
+            );
+        }
+    }
+    domains::set_user_domains(Vec::new());
+}
+
 /// RP-825: a column of a domain has no default of its own until it sets
 /// one; an INSERT takes the domain's (`typdefault`). SET DEFAULT makes one
 /// the column's, which an ALTER DOMAIN no longer moves, and DROP DEFAULT

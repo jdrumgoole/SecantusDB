@@ -11852,15 +11852,32 @@ fn expand_table_like(
         let o = like.options;
         let mut parts: Vec<String> = Vec::new();
         for col in &def.columns {
-            let mut sql = format!(
-                "{} {}",
-                q(&col.name),
-                scalar::format_type_text(&col.pg_type, (col.typmod >= 0).then_some(col.typmod))
-            );
+            // `transformTableLikeClause` copies `atttypid`, so a column of a
+            // domain stays one of it -- its CHECK and NOT NULL, its DEFAULT
+            // (the type's), its `domain_name` -- rather than becoming one of
+            // the domain's base type (RP-839). The domain carries its own
+            // modifier.
+            let domain = col
+                .extra
+                .get_str("domain_type")
+                .ok()
+                .and_then(domains::user_domain);
+            let ty = match &domain {
+                Some(d) => quote_type_path(&d.name),
+                None => {
+                    scalar::format_type_text(&col.pg_type, (col.typmod >= 0).then_some(col.typmod))
+                }
+            };
+            let mut sql = format!("{} {ty}", q(&col.name));
             if !col.nullable {
                 sql.push_str(" NOT NULL");
             }
-            if o & DEFAULTS != 0 {
+            // A default the column follows from its domain is the type's
+            // (`typdefault`), no `pg_attrdef` row: INCLUDING DEFAULTS has
+            // nothing of the column's to copy, and the copy, a column of the
+            // same domain, follows it as this one does.
+            let own_default = col.extra.get_bool("default_from_domain") != Ok(true);
+            if o & DEFAULTS != 0 && own_default {
                 // The expression default's SQL, else the stored value as a
                 // literal of the column's type.
                 let literal = col.default.as_ref().filter(|v| **v != Bson::Null).map(|v| {
