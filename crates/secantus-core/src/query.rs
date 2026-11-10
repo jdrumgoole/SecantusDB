@@ -2165,6 +2165,65 @@ fn op_type(values: &[Cand], spec: &Bson, field: &str, descend: bool) -> R {
 
 // --- $size --------------------------------------------------------------
 
+/// mongod's path-accepting keywords: the operators its parser looks up under
+/// a field (`queryOperatorMap` in `expression_parser.cpp`). `$not`, the geo
+/// shape keys (`$geometry`, `$box`, ...) and the top-level operators are not
+/// among them (measured 8.2.11, 2026-11-10).
+const PATH_ACCEPTING_KEYWORDS: &[&str] = &[
+    "$_internalEqHash",
+    "$_internalExprEq",
+    "$_internalExprGt",
+    "$_internalExprGte",
+    "$_internalExprLt",
+    "$_internalExprLte",
+    "$_internalSchemaAllElemMatchFromIndex",
+    "$_internalSchemaBinDataEncryptedType",
+    "$_internalSchemaBinDataSubType",
+    "$_internalSchemaEq",
+    "$_internalSchemaFmod",
+    "$_internalSchemaMatchArrayIndex",
+    "$_internalSchemaMaxItems",
+    "$_internalSchemaMaxLength",
+    "$_internalSchemaMinItems",
+    "$_internalSchemaMinLength",
+    "$_internalSchemaObjectMatch",
+    "$_internalSchemaType",
+    "$_internalSchemaUniqueItems",
+    "$all",
+    "$bitsAllClear",
+    "$bitsAllSet",
+    "$bitsAnyClear",
+    "$bitsAnySet",
+    "$elemMatch",
+    "$eq",
+    "$exists",
+    "$geoIntersects",
+    "$geoNear",
+    "$geoWithin",
+    "$gt",
+    "$gte",
+    "$in",
+    "$lt",
+    "$lte",
+    "$mod",
+    "$ne",
+    "$near",
+    "$nearSphere",
+    "$nin",
+    "$options",
+    "$regex",
+    "$size",
+    "$type",
+    "$within",
+];
+
+/// A document whose FIRST key is a path-accepting keyword: what mongod's
+/// `$all` refuses as an element ("no $ expressions in $all").
+fn opens_with_path_keyword(value: &Bson) -> bool {
+    matches!(value, Bson::Document(d)
+        if d.keys().next().is_some_and(|k| PATH_ACCEPTING_KEYWORDS.contains(&k.as_str())))
+}
+
 /// `$all`: every listed element holds of the field -- mongod parses
 /// `{f: {$all: [x, y]}}` as `{$and: [{f: x}, {f: y}]}`, so each element is an
 /// EQUALITY with all of equality's rules: `$all: [null]` matches a missing
@@ -2188,7 +2247,8 @@ fn op_all(
     }
     // mongod decides by the FIRST element (measured 8.2.11, 2026-10-22): when
     // it is `{$elemMatch: ...}` every element must be one, with an object
-    // argument; otherwise no element may be an operator document.
+    // argument; otherwise no element may open with a path-accepting keyword.
+    // Any other `$`-prefixed document is an equality to that document (RM-421).
     let is_elemmatch = |e: &Bson| matches!(e, Bson::Document(d) if d.keys().next().is_some_and(|k| k == "$elemMatch"));
     if is_elemmatch(&required[0]) {
         for r in required {
@@ -2201,10 +2261,7 @@ fn op_all(
                 }
             }
         }
-    } else if required
-        .iter()
-        .any(|r| matches!(r, Bson::Document(d) if is_operator_dict(d)))
-    {
+    } else if required.iter().any(opens_with_path_keyword) {
         return Err(Fallback::mongo(2, "no $ expressions in $all"));
     } else if required.iter().any(|r| matches!(r, Bson::Undefined)) {
         return Err(undefined_operand());
@@ -2985,6 +3042,47 @@ mod tests {
         assert!(m(doc! {"a": 1e-300}, doc! {"a": {"$mod": [2, 0]}}));
         assert!(m(doc! {"a": -9.2e18}, doc! {"a": {"$mod": [2, 0]}}));
         assert!(m(doc! {"a": -5.5}, doc! {"a": {"$mod": [2, -1]}}));
+    }
+
+    /// `$all` refuses an element only when it opens with a path-accepting
+    /// keyword; any other `$`-prefixed document is an equality (RM-421,
+    /// measured 8.2.11).
+    #[test]
+    fn all_takes_a_dollar_object_that_is_no_keyword_as_a_value() {
+        let x = doc! {"$x": 1};
+        assert!(m(doc! {"a": x.clone()}, doc! {"a": {"$all": [x.clone()]}}));
+        assert!(m(
+            doc! {"a": [x.clone(), 2]},
+            doc! {"a": {"$all": [2, x.clone()]}}
+        ));
+        assert!(!m(doc! {"a": [1]}, doc! {"a": {"$all": [x.clone()]}}));
+        for first in [
+            "$not",
+            "$geometry",
+            "$and",
+            "$expr",
+            "$_internalExprNe",
+            "$",
+        ] {
+            assert!(
+                !m(doc! {"a": 1}, doc! {"a": {"$all": [{first: 1}]}}),
+                "{first}"
+            );
+        }
+        for first in ["$eq", "$gt", "$geoNear", "$_internalSchemaEq", "$options"] {
+            let err = matches(
+                &doc! {"a": 1},
+                &doc! {"a": {"$all": [2, {first: 1}]}},
+                &Document::new(),
+                None,
+            )
+            .unwrap_err();
+            assert_eq!(
+                err.as_mongo(),
+                Some((2, "no $ expressions in $all")),
+                "{first}"
+            );
+        }
     }
 
     fn m(doc: Document, query: Document) -> bool {

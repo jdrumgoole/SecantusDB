@@ -1633,13 +1633,17 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       drop it as a timing. Found 2026-11-10 (RM-418).
       Verify: tests/backlog/test_rm_found_2026_11_10_rm418.py::test_find_explain_gives_optimization_time
       Backlog-ID: RM-545
-- [ ] **`$all` refuses a `$`-prefixed object that is not `$elemMatch`.**
-      mongod 8.2.11 takes `find({a: {$all: [{$x: 1}]}})` as an equality to
-      that object and answers (here, no documents); this server refuses
-      it with 2 "no $ expressions in $all". Found 2026-11-08 while working
-      RM-330.
-      Backlog-ID: RM-421
-      Verify: tests/backlog/test_rm_found_2026_11_08_rm330.py::test_all_takes_a_dollar_object_as_a_value
+- [ ] **A `$near` key inside a VALUE is refused as a misplaced `$near`.**
+      `{a: {$eq: {$near: 1}}}`, `{a: {$ne: {$nearSphere: 1}}}`, `{a: {x:
+      {$near: 1}}}` and `{a: {$all: [{x: {$near: 1}}]}}` are equalities on
+      mongod 8.2.11, which answers them; this server refuses each with 2 "geo
+      $near must be top-level expr", since `near.rs` `holds_near` looks for
+      the key anywhere in the filter, values included. The same check
+      answers `{a: {$all: [{$near: 1}]}}` with that message where mongod
+      gives `$all`'s "no $ expressions in $all". Found 2026-11-10 while
+      working RM-421.
+      Verify: tests/backlog/test_rm_found_2026_11_10_rm421.py::test_a_near_key_inside_a_value_is_an_equality
+      Backlog-ID: RM-546
 - [ ] **A hinted index that no predicate bounds sorts its FETCH filter by
       path.** mongod 8.2.1 keeps the canonical order there: `{s: {$gte:
       "a", $lte: "z"}, t: 1}` hinted to `u_1` fetches with `[t $eq, s $lte,

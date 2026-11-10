@@ -35,10 +35,12 @@ def test_an_id_match_refuses_a_dollar_object_in_in(rust_mongo: Any, mongod: Any)
     assert run(rust_mongo) == run(mongod)
 
 
-@pytest.mark.backlog("RM-421")
+@pytest.mark.backlog_fixed("RM-421")
 def test_all_takes_a_dollar_object_as_a_value(rust_mongo: Any, mongod: Any) -> None:
     """mongod 8.2.11 takes `{a: {$all: [{$x: 1}]}}` as an equality to that
-    object (no documents match here); the Rust server refuses it with 2."""
+    object (no documents match here); the Rust server refused it with 2, since
+    it refused every `$`-led element rather than mongod's path-accepting
+    keywords alone."""
 
     def run(client: Any) -> tuple:
         coll = client.rm330f.c

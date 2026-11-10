@@ -26341,8 +26341,12 @@ fn implied_equality(value: &Bson) -> Option<Bson> {
         if let Some(Bson::Array(items)) = d.get(op) {
             if items.len() == 1 {
                 // `{$all: [{$elemMatch: ...}]}` is a test of the elements, not
-                // a value: it seeds nothing (measured 8.2.11, 2026-10-12).
-                if op == "$all" && is_op_doc(&items[0]) {
+                // a value: it seeds nothing (measured 8.2.11, 2026-10-12). Any
+                // other `$`-led document is a value and seeds itself (RM-421).
+                if op == "$all"
+                    && matches!(&items[0], Bson::Document(d)
+                        if d.keys().next().is_some_and(|k| k == "$elemMatch"))
+                {
                     return None;
                 }
                 return Some(items[0].clone());
