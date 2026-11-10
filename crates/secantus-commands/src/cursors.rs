@@ -200,32 +200,6 @@ struct Entry {
     stream_busy: bool,
     /// What the cursor's operations have reported of its plan (RM-400).
     counts: CursorCounts,
-    /// Run when the cursor leaves the registry, however it leaves: its
-    /// query's stats are recorded then (RM-215).
-    on_close: Option<OnClose>,
-}
-
-/// A closure run once, when the cursor holding it is closed -- exhausted,
-/// killed, timed out, or dropped with its collection.
-pub struct OnClose(Option<Box<dyn FnOnce() + Send>>);
-
-impl OnClose {
-    pub fn new(f: impl FnOnce() + Send + 'static) -> Self {
-        OnClose(Some(Box::new(f)))
-    }
-
-    /// Drop it without running it.
-    pub fn disarm(mut self) {
-        self.0 = None;
-    }
-}
-
-impl Drop for OnClose {
-    fn drop(&mut self) {
-        if let Some(f) = self.0.take() {
-            f();
-        }
-    }
 }
 
 /// What a cursor's plan has done, which mongod 8.2.11 reports on every
@@ -492,7 +466,6 @@ impl CursorRegistry {
                 streaming: false,
                 stream_busy: false,
                 counts: CursorCounts::default(),
-                on_close: None,
             },
         );
         Ok(id)
@@ -542,7 +515,6 @@ impl CursorRegistry {
                 streaming: false,
                 stream_busy: false,
                 counts: CursorCounts::default(),
-                on_close: None,
             },
         );
         Ok(id)
@@ -651,27 +623,11 @@ impl CursorRegistry {
         let Some(old) = inner.cursors.remove(&into) else {
             return false;
         };
-        let mut old = old;
-        e.owner = old.owner.take();
-        e.users = std::mem::take(&mut old.users);
+        e.owner = old.owner;
+        e.users = old.users;
         e.time_limited = old.time_limited;
-        // The client's cursor reads on: what closing it runs is not run yet.
-        e.on_close = old.on_close.take().or(e.on_close.take());
         inner.cursors.insert(into, e);
         true
-    }
-
-    /// Run `f` when cursor `cursor_id` closes; `f` handed back when there
-    /// is no such cursor.
-    pub fn on_close(&self, cursor_id: i64, f: OnClose) -> Result<(), OnClose> {
-        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        match inner.cursors.get_mut(&cursor_id) {
-            Some(e) => {
-                e.on_close = Some(f);
-                Ok(())
-            }
-            None => Err(f),
-        }
     }
 
     /// Drain up to `batch_size` documents (`<= 0` ⇒ all remaining), never more

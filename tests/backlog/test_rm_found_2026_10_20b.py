@@ -748,25 +748,14 @@ def _recorded_find(client: Any) -> Any:
     ]
 
 
-@pytest.fixture
-def recording_rust(tmp_path: Any) -> Iterator[Any]:
-    """A `secantusd-rs` of this test's own, for the reason `recording_mongod`
-    is one."""
-    from tests.backlog.conftest import rust_mongo_server
-
-    with rust_mongo_server(tmp_path / "store") as client:
-        yield client
-
-
-@pytest.mark.backlog_fixed("RM-215")
-def test_query_stats_records_queries_when_asked(recording_rust: Any, recording_mongod: Any) -> None:
+@pytest.mark.backlog("RM-215")
+def test_query_stats_records_queries_when_asked(rust_mongo: Any, recording_mongod: Any) -> None:
     """mongod 8.2.11 records a query in its query stats store once
     `internalQueryStatsRateLimit` is not 0 (-1: every query), and
-    `$queryStats` lists it under its representative shape. This server had
-    no store: it refused to change the parameter (20) and recorded nothing.
-    Since 2026-11-10 it keeps mongod's store
-    (`tests/mongod_live/test_query_stats.py` sweeps the keys)."""
-    assert mongo_answer(lambda: _recorded_find(recording_rust)) == mongo_answer(
+    `$queryStats` lists it under its representative shape. This server has
+    no store, so it refuses to change the parameter (20) and leaves the
+    module's server recording nothing."""
+    assert mongo_answer(lambda: _recorded_find(rust_mongo)) == mongo_answer(
         lambda: _recorded_find(recording_mongod)
     )
 

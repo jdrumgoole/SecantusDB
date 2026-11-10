@@ -87,7 +87,7 @@ pub mod mongod_codes;
 mod mongod_commands;
 mod near;
 mod notablescan;
-pub mod opdebug;
+mod opdebug;
 pub mod ops;
 pub mod params;
 mod privileges;
@@ -95,7 +95,6 @@ mod procstats;
 pub mod profiler;
 pub mod query_settings;
 mod query_shape;
-pub mod query_stats;
 pub mod rbac;
 mod replset_admin;
 mod request_dump;
@@ -311,9 +310,6 @@ pub struct CommandContext {
     /// The CPU time the operation's thread spent on it, where mongod
     /// measures it (Linux).
     pub cpu_nanos: Option<i64>,
-    /// How the operation's read chose its plan (`fromMultiPlanner`,
-    /// `fromPlanCache`), when it consulted the plan cache.
-    pub planned: Option<opdebug::Planned>,
     /// The raw BSON byte slices of an `insert`'s kind-1 `documents` sequence,
     /// handed in by the server **un-decoded** so the insert handler can store the
     /// client's bytes verbatim (the raw-BSON write path) instead of paying a
@@ -422,7 +418,6 @@ impl CommandContext {
             write_concern_wait: None,
             last_op_seq: 0,
             cpu_nanos: None,
-            planned: None,
             raw_insert_documents: None,
             locks: None,
             txn_locks: false,
@@ -948,7 +943,6 @@ fn dispatch_named(doc: &Document, ctx: &mut CommandContext) -> Document {
     let planning = explain::planning_scope();
     let cpu_started = opdebug::thread_cpu_nanos();
     opdebug::take_examined();
-    opdebug::take_planned();
     opdebug::take_resolved_views();
     ctx.op_counts = None;
     ctx.op_locks = None;
@@ -1083,7 +1077,6 @@ fn dispatch_named(doc: &Document, ctx: &mut CommandContext) -> Document {
         }
         ctx.exec_stats = Some(examined);
     }
-    ctx.planned = opdebug::take_planned();
     ctx.op_counts = ctx.storage.as_ref().and_then(|s| s.operation_counts());
     ctx.op_locks = Some(lock_manager::operation_locks(false));
     ctx.flow_control_tickets = lock_manager::flow_control_tickets();

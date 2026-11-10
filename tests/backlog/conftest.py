@@ -25,7 +25,6 @@ once, with the version in a comment), or ask a live reference fixture.
 
 from __future__ import annotations
 
-import contextlib
 import json
 import os
 import pathlib
@@ -175,15 +174,8 @@ def rust_mongo(tmp_path_factory: pytest.TempPathFactory) -> Iterator[Any]:
     """A pymongo client to a `secantusd-rs` of this module's own, whose
     execution control, as `mongod_rs`'s, counts no ticket as held too long:
     a line's `delinquencyInfo` is load's, not the operation's."""
-    with rust_mongo_server(tmp_path_factory.mktemp("rust-mongo")) as client:
-        yield client
-
-
-@contextlib.contextmanager
-def rust_mongo_server(store: Any) -> Iterator[Any]:
-    """A `secantusd-rs` on `store`, as `rust_mongo` starts one, for a test
-    that needs a server no other test shares."""
     assert RS_BINARY.exists(), f"{RS_BINARY} is not built (./inv rust-binary-build)"
+    store = tmp_path_factory.mktemp("rust-mongo")
     proc = subprocess.Popen(
         [
             str(RS_BINARY),
