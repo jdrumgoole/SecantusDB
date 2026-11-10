@@ -4,8 +4,8 @@ cursor's arguments were not bound) and RP-817:
 - a FOR loop over a bound cursor was refused as a gap (fixed, RP-817);
 - a variable declared `%TYPE` could not be assigned: its type was the text
   as written (fixed, RP-818);
-- a cursor FOR loop's portal is not pinned: a CLOSE of it in the loop, and
-  a COMMIT or ROLLBACK in a procedure's loop, drop it.
+- a cursor FOR loop's portal was not pinned: a CLOSE of it in the loop, and
+  a COMMIT or ROLLBACK in a procedure's loop, dropped it (fixed, RP-823).
 
 The expected answers were measured on a private, freshly initdb'd
 PostgreSQL 15.19 cluster with `_SETUP`.
@@ -225,6 +225,36 @@ PINNED_PORTAL = {
     # (`HoldPinnedPortals`), and the loop goes on.
     "call p817c()": ("error", "P0001", "12"),
     "call p817r()": ("error", "P0001", "12"),
+    # The held portal is still the loop's: pg_cursors lists it (not
+    # holdable) in each transaction, and it is gone when the loop ends.
+    "do $$ declare c cursor for select generate_series(1,3) a; r text := ''; h text; "
+    "begin for x in c loop r := r || x.a; commit; select string_agg(name||':'||is_holdable, "
+    "',') into h from pg_cursors; r := r || '[' || coalesce(h,'') || ']'; end loop; "
+    "select count(*) into h from pg_cursors; raise exception '% after=%', r, h; end $$": (
+        "error",
+        "P0001",
+        "1[c:false]2[c:false]3[c:false] after=0",
+    ),
+    # A FETCH in the body after a COMMIT moves the loop with it.
+    "do $$ declare c cursor for select generate_series(1,5) a; r text := ''; y int; "
+    "begin for x in c loop r := r || x.a; commit; fetch c into y; "
+    "r := r || '/' || coalesce(y::text,'-') || ';'; end loop; raise exception '%', r; end $$": (
+        "error",
+        "P0001",
+        "1/2;3/4;5/-;",
+    ),
+    # A cursor the loop does not walk is closed by the COMMIT as before.
+    "do $$ declare c cursor for select generate_series(1,2) a; d cursor for select 7 b; "
+    "r text := ''; h text; begin open d; for x in c loop r := r || x.a; commit; "
+    "select string_agg(name, ',' order by name) into h from pg_cursors; "
+    "r := r || '[' || coalesce(h,'') || ']'; end loop; raise exception '%', r; end $$": (
+        "error",
+        "P0001",
+        "1[c]2[c]",
+    ),
+    # Held, it is still pinned.
+    "do $$ declare c cursor for select generate_series(1,2) a; begin for x in c loop "
+    "commit; close c; end loop; end $$": ("error", "24000", 'cannot drop pinned portal "c"'),
 }
 
 _PROCEDURES = [
@@ -237,7 +267,7 @@ _PROCEDURES = [
 ]
 
 
-@pytest.mark.backlog("RP-823")
+@pytest.mark.backlog_fixed("RP-823")
 @pytest.mark.parametrize("query", list(PINNED_PORTAL))
 def test_a_cursor_loops_portal_is_pinned(query: str, dsn: str) -> None:
     with psycopg.connect(dsn, autocommit=True) as c:

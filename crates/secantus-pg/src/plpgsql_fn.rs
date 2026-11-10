@@ -244,6 +244,11 @@ pub trait Host {
         let _ = name;
         false
     }
+    /// Pin or unpin the portal `name` (`PinPortal` / `UnpinPortal`), as a
+    /// FOR loop does while it walks it.
+    fn pin_cursor(&self, name: &str, pinned: bool) {
+        let _ = (name, pinned);
+    }
 }
 
 /// A record value: its columns (name, type) and their values, or NULL.

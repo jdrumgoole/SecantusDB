@@ -157,7 +157,11 @@ impl Interp<'_> {
             vars: vec![(name, target)],
             ..Default::default()
         });
+        // `exec_for_query` pins the portal while it walks it, so the body
+        // cannot close it, and a procedure's COMMIT or ROLLBACK holds it.
+        self.host.pin_cursor(&portal, true);
         let walked = self.walk_portal(&portal, target, body, label);
+        self.host.pin_cursor(&portal, false);
         self.active.truncate(depth);
         match walked {
             Ok(flow) => {

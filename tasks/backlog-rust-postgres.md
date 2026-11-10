@@ -3500,26 +3500,6 @@ and `create domain di811 as int`.
       Verify: tests/backlog/test_rp_found_rp811.py::test_a_system_column_in_a_check_is_42p10
       Backlog-ID: RP-816
 
-## Found while working RP-809 (2026-11-10)
-
-Measured on a private PostgreSQL 15.19 cluster with the `_SETUP` in
-`tests/backlog/test_rp_found_rp809.py`: `t809(a int, v varchar(3))`.
-
-- [ ] **A cursor FOR loop's portal is not pinned.** Found while working
-      RP-817. `exec_for_query` pins the portal it walks (`PinPortal`), so on
-      PostgreSQL 15.19 a `CLOSE c` inside `for x in c loop`, by PL/pgSQL or
-      by `execute 'close c'`, and an `execute 'close all'`, are 24000
-      `cannot drop pinned portal "c"`; and a COMMIT or ROLLBACK in a
-      procedure's loop holds the pinned portal (`HoldPinnedPortals`, from
-      `_SPI_commit` / `_SPI_rollback`), so the loop goes on (`12`). Here the
-      CLOSE drops it and the transaction end closes it, and the next row's
-      fetch is 34000 `cursor "c" does not exist`. The faithful fix is a
-      pinned flag on the session's cursor (`CursorState`) that the loop
-      sets and clears, refused by CLOSE and CLOSE ALL and kept (made held)
-      at transaction end.
-      Verify: tests/backlog/test_rp_found_rp809.py::test_a_cursor_loops_portal_is_pinned
-      Backlog-ID: RP-823
-
 ## Found while working RP-818 (2026-11-10)
 
 - [ ] **A routine's parameter or result declared `%TYPE` is not
@@ -3537,3 +3517,33 @@ Measured on a private PostgreSQL 15.19 cluster with the `_SETUP` in
       column's type, which CREATE FUNCTION can reuse without the modifier).
       Verify: tests/backlog/test_rp_found_rp818.py::test_a_routines_percent_type_parameter_is_resolved
       Backlog-ID: RP-822
+
+## Found while working RP-823 (2026-11-10)
+
+Measured on PostgreSQL 15.19; none of the statements creates an object.
+
+- [ ] **A FOR loop over a query or an EXECUTE runs no portal.**
+      `exec_stmt_fors` and `exec_stmt_dynfors` open the query as an
+      unnamed portal and walk it through `exec_for_query`, which pins it:
+      on PostgreSQL 15.19 `pg_cursors` lists `<unnamed portal 1>` while
+      `for x in select 1 loop` (or `in execute 'select 1'`) runs, and an
+      `execute 'close all'` in its body is 24000 `cannot drop pinned portal
+      "<unnamed portal 1>"`. Here the loop reads the query's rows with no
+      portal, so `pg_cursors` is empty and the CLOSE ALL runs. The cursor
+      FOR loop pins its portal since RP-823 (`CursorState::pinned`, held by
+      a procedure's COMMIT or ROLLBACK); the faithful fix walks these loops
+      through a portal of their own the same way, which also brings
+      `HoldPinnedPortals`' 2D000 `cannot perform transaction commands
+      inside a cursor loop that is not read-only` for a loop over an
+      `INSERT ... RETURNING`.
+      Verify: tests/backlog/test_rp_found_rp823.py::test_a_query_loop_walks_a_pinned_portal
+      Backlog-ID: RP-828
+- [ ] **A BEGIN inside a multi-statement simple query warns 25001.**
+      `begin; select 1; commit` and `select 1; begin; select 2; commit`,
+      each sent as one simple Query, answer with no notice on PostgreSQL
+      15.19: `BeginTransactionBlock` turns the implicit block
+      (`TBLOCK_IMPLICIT_INPROGRESS`) into a real one. Here each sends the
+      WARNING 25001 `there is already a transaction in progress`, which
+      only a BEGIN inside an explicit block should.
+      Verify: tests/backlog/test_rp_found_rp823.py::test_a_begin_in_a_multi_statement_query_does_not_warn
+      Backlog-ID: RP-829
