@@ -558,6 +558,27 @@ impl<'p> Scope<'p> {
     }
 
     fn column_type_raw(&self, c: &pg_query::protobuf::ColumnRef) -> Option<String> {
+        self.column_type_by(c, &|col| col.pg_type.clone())
+    }
+
+    /// A column's type as declared: its domain's name when it was declared
+    /// over a domain (the catalog keeps the base type as `pg_type`), as
+    /// `format_type_be` names the column's `atttypid`.
+    fn column_declared_type(&self, c: &pg_query::protobuf::ColumnRef) -> Option<String> {
+        self.column_type_by(c, &|col| {
+            col.extra
+                .get_str("domain_type")
+                .map_or_else(|_| col.pg_type.clone(), str::to_string)
+        })
+        .filter(|t| !t.is_empty())
+    }
+
+    /// The column `c` resolves to, read by `ty`.
+    fn column_type_by(
+        &self,
+        c: &pg_query::protobuf::ColumnRef,
+        ty: &dyn Fn(&Column) -> String,
+    ) -> Option<String> {
         let parts: Vec<&str> = c
             .fields
             .iter()
@@ -579,30 +600,27 @@ impl<'p> Scope<'p> {
                         .iter()
                         .any(|(_, o)| o != r && o.start <= r.start && r.end <= o.end)
                 });
-                let mut found = outermost.map(|(c, _)| c.pg_type.clone()).chain(
+                let mut found = outermost.map(|(c, _)| ty(c)).chain(
                     self.tables
                         .iter()
                         .enumerate()
                         .filter(|(i, _)| !hidden(*i))
-                        .filter_map(|(_, (_, d))| d.column(col).map(|c| c.pg_type.clone())),
+                        .filter_map(|(_, (_, d))| d.column(col).map(ty)),
                 );
                 match found.next() {
                     // Named by more than one side, or possibly by a FROM item
                     // this cannot see into: not ours to judge.
                     Some(first) => (self.complete && found.next().is_none()).then_some(first),
                     // Not a column here: an outer reference.
-                    None if self.complete => self.parent?.column_type(c),
+                    None if self.complete => self.parent?.column_type_by(c, ty),
                     None => None,
                 }
             }
             [q, col] => match self.tables.iter().find(|(a, _)| a == q) {
-                Some((_, d)) => d.column(col).map(|c| c.pg_type.clone()),
+                Some((_, d)) => d.column(col).map(ty),
                 None => match self.using_aliases.iter().find(|(a, _)| a == q) {
-                    Some((_, cols)) => cols
-                        .iter()
-                        .find(|c| c.name == *col)
-                        .map(|c| c.pg_type.clone()),
-                    None if self.complete => self.parent?.column_type(c),
+                    Some((_, cols)) => cols.iter().find(|c| c.name == *col).map(ty),
+                    None if self.complete => self.parent?.column_type_by(c, ty),
                     None => None,
                 },
             },
@@ -1782,6 +1800,40 @@ fn check_aexpr(e: &pg_query::protobuf::AExpr, scope: &Scope) -> Result<()> {
                     }
                 }
             }
+            // Each untyped member is read as a type when the statement is
+            // analysed, so one that is not valid input for it fails before
+            // any row is compared, and over no rows (RP-806). More than one
+            // member with no Var is coerced to their common type with the
+            // left operand's (`transformAExprIn`); otherwise each member is
+            // an `=` of its own, where the untyped side takes the left's
+            // type. A common type this cannot tell checks nothing.
+            let row_from = crate::correlated::row_params_from();
+            let mut nonvars: Vec<&pg_query::protobuf::Node> = Vec::new();
+            for (i, item) in items.items.iter().enumerate() {
+                if i % 1024 == 1023 {
+                    crate::cancel::check()?;
+                }
+                if !crate::in_member_has_var(item, row_from) {
+                    nonvars.push(item);
+                }
+            }
+            let target = match (e.lexpr.as_deref(), nonvars.len()) {
+                (Some(lexpr), n) if n > 1 => {
+                    let mut parts = Vec::with_capacity(n + 1);
+                    parts.push(lexpr);
+                    parts.extend(nonvars.iter().copied());
+                    common_type(&parts, scope).map(crate::domain_base)
+                }
+                _ => Some(crate::domain_base(l.clone())),
+            };
+            if let Some(target) = target {
+                for (i, item) in nonvars.iter().enumerate() {
+                    if i % 1024 == 1023 {
+                        crate::cancel::check()?;
+                    }
+                    literal_fits(item, &target)?;
+                }
+            }
         }
         Some(K::AexprLike | K::AexprIlike) | Some(K::AexprOp)
             if matches!(op.as_str(), "~~" | "~~*" | "!~~" | "!~~*") =>
@@ -2762,6 +2814,38 @@ pub(crate) fn check(node: &N, lookup: &dyn Fn(&str) -> Option<TableDef>) -> Resu
     regclass::analysing(|| check_in(node, &[], lookup))
 }
 
+/// A CHECK constraint's expression over the table `name` (`def`), as
+/// `cookConstraint` judges it: `transformExpr` analyses it -- so a test's
+/// or a connective's argument is coerced to boolean under its own name --
+/// and `coerce_to_boolean(..., "CHECK")` then coerces the whole of it
+/// (RP-811). A CHECK holds no subquery, so no catalog is consulted.
+pub(crate) fn check_constraint(
+    raw: &pg_query::protobuf::Node,
+    name: &str,
+    def: &TableDef,
+) -> Result<()> {
+    let lookup: &dyn Fn(&str) -> Option<TableDef> = &|_| None;
+    let scope = Scope {
+        tables: vec![(name.to_string(), def.clone())],
+        complete: true,
+        unresolved: false,
+        parent: None,
+        lookup: Some(lookup),
+        ctes: Vec::new(),
+        merged: Vec::new(),
+        using_aliases: Vec::new(),
+        rowtypes: Vec::new(),
+    };
+    let cx = Cx {
+        lookup,
+        ctes: Vec::new(),
+    };
+    regclass::analysing(|| {
+        walk(raw, &scope, &cx)?;
+        clause_is_boolean(raw, &scope, "CHECK")
+    })
+}
+
 /// [`check`] with the CTEs of an enclosing WITH in view: a data-modifying
 /// CTE sees the ones before it, as a SELECT's does.
 fn check_in(node: &N, outer: &[Cte], lookup: &dyn Fn(&str) -> Option<TableDef>) -> Result<()> {
@@ -2790,14 +2874,19 @@ fn check_in(node: &N, outer: &[Cte], lookup: &dyn Fn(&str) -> Option<TableDef>) 
                 .collect();
             let scope = Scope::new(&items, &ctes, lookup, None);
             let cx = Cx { lookup, ctes };
-            match u.where_clause.as_deref() {
-                Some(w) => {
-                    no_aggregate_in_where(w)?;
-                    walk(w, &scope, &cx)?;
-                    clause_is_boolean(w, &scope, "WHERE")
-                }
-                None => Ok(()),
+            if let Some(w) = u.where_clause.as_deref() {
+                no_aggregate_in_where(w)?;
+                walk(w, &scope, &cx)?;
+                clause_is_boolean(w, &scope, "WHERE")?;
             }
+            // `transformUpdateStmt` transforms the WHERE, then each SET
+            // expression (`transformUpdateTargetList`), whatever the rows:
+            // `set b = (i is true) where false` over an `int` is 42804
+            // (RP-810), where judging it per row answered `UPDATE 0`.
+            for t in &u.target_list {
+                walk(t, &scope, &cx)?;
+            }
+            Ok(())
         }
         N::DeleteStmt(d) => {
             let ctes = with_ctes(d.with_clause.as_ref(), outer, lookup, None)?;
@@ -3165,20 +3254,36 @@ fn part_location(p: &pg_query::protobuf::Node) -> Option<i32> {
 fn clause_is_boolean(n: &pg_query::protobuf::Node, scope: &Scope, clause: &str) -> Result<()> {
     // An untyped literal is read by `boolin` (RP-424, `bool_clauses`).
     unknown_as_boolean(n, scope)?;
-    let Some(t) = operand_type(n, scope) else {
+    let Some(t) = not_boolean(n, scope) else {
         return Ok(());
     };
-    if matches!(t.as_str(), "bool" | "boolean") || category(&t).is_none() {
-        return Ok(());
-    }
     let loc = crate::srf_place::leftmost(n);
     if loc >= 0 {
         set_error_location(loc);
     }
     Err(Error::DatatypeMismatch(format!(
-        "argument of {clause} must be type boolean, not type {}",
-        display_type(&t)
+        "argument of {clause} must be type boolean, not type {t}"
     )))
+}
+
+/// The type `coerce_to_boolean` names when it refuses `n`, or `None` when
+/// `n` passes or is not typed here. Only `boolean` (or a domain over it)
+/// coerces to boolean -- no other type has an assignment cast to it -- so
+/// a built-in type `category` knows and any array (`int[]`, `bool[]`) are
+/// refused. A domain is judged by its innermost base type and named by its
+/// own name, as `format_type_be` prints the expression's type (RP-814):
+/// `where d` over a domain on `int` is `... not type di811`.
+fn not_boolean(n: &pg_query::protobuf::Node, scope: &Scope) -> Option<String> {
+    let declared = match n.node.as_ref()? {
+        N::ColumnRef(c) => scope.column_declared_type(c)?,
+        _ => operand_type_declared(n, scope)?,
+    };
+    let base = crate::domains::base_type_and_typmod(&declared)
+        .map_or_else(|| declared.clone(), |(base, _, _)| base);
+    if matches!(base.as_str(), "bool" | "boolean") {
+        return None;
+    }
+    (base.ends_with("[]") || category(&base).is_some()).then(|| display_type(&declared))
 }
 
 /// `coerce_to_boolean` of an untyped literal: 22P02 when `boolin` cannot
@@ -3201,12 +3306,9 @@ fn bool_argument(
 ) -> Result<()> {
     use pg_query::protobuf::BoolExprType;
     unknown_as_boolean(arg, scope)?;
-    let Some(t) = operand_type(arg, scope) else {
+    let Some(t) = not_boolean(arg, scope) else {
         return Ok(());
     };
-    if matches!(t.as_str(), "bool" | "boolean") || category(&t).is_none() {
-        return Ok(());
-    }
     if let Some(loc) = expr_location(arg) {
         set_error_location(loc);
     }
@@ -3217,7 +3319,7 @@ fn bool_argument(
             Ok(BoolExprType::OrExpr) => "OR",
             _ => "NOT",
         },
-        display_type(&t)
+        t
     )))
 }
 
@@ -3234,12 +3336,9 @@ fn boolean_test_argument(
 ) -> Result<()> {
     use pg_query::protobuf::BoolTestType as B;
     unknown_as_boolean(arg, scope)?;
-    let Some(ty) = operand_type(arg, scope) else {
+    let Some(ty) = not_boolean(arg, scope) else {
         return Ok(());
     };
-    if matches!(ty.as_str(), "bool" | "boolean") || category(&ty).is_none() {
-        return Ok(());
-    }
     let test = match B::try_from(t.booltesttype) {
         Ok(B::IsTrue) => "IS TRUE",
         Ok(B::IsNotTrue) => "IS NOT TRUE",
@@ -3256,8 +3355,7 @@ fn boolean_test_argument(
         set_error_location(loc);
     }
     Err(Error::DatatypeMismatch(format!(
-        "argument of {test} must be type boolean, not type {}",
-        display_type(&ty)
+        "argument of {test} must be type boolean, not type {ty}"
     )))
 }
 

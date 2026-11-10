@@ -51,3 +51,54 @@ def test_fix_many_exits_when_its_lanes_finish(tmp_path: Path) -> None:
     )
     assert proc.stdout.strip() == "done"
     assert time.monotonic() - t0 < 30
+
+
+def _item_is_open_fn() -> str:
+    text = (ROOT / "scripts/fix_many.sh").read_text()
+    start = text.index("item_is_open() {")
+    return text[start : text.index("\n}\n", start) + 3]
+
+
+def test_a_listed_item_already_closed_is_skipped_not_run(tmp_path: Path) -> None:
+    """fix_many skips a listed ID whose `Backlog-ID:` line is gone from the
+    branch the fixes land on: a session for it lands nothing, which stopped
+    the batch (RM-397, closed by RM-403's fix, 2026-11-10)."""
+    origin = tmp_path / "origin"
+    work = tmp_path / "work"
+    git = ["git", "-c", "user.email=t@t", "-c", "user.name=t"]
+    subprocess.run([*git, "init", "-q", "-b", "rm-batch", str(origin)], check=True)
+    (origin / "tasks").mkdir()
+    (origin / "tasks/backlog-rust-mongodb.md").write_text(
+        "- [ ] **open**\n  Backlog-ID: RM-001\n- [ ] **also open**\n  Backlog-ID: RM-0011\n"
+    )
+    subprocess.run([*git, "-C", str(origin), "add", "-A"], check=True)
+    subprocess.run([*git, "-C", str(origin), "commit", "-qm", "x"], check=True)
+    subprocess.run(["git", "clone", "-q", str(origin), str(work)], check=True)
+    script = tmp_path / "check.sh"
+    script.write_text(
+        f"backlog=mongodb\n{_item_is_open_fn()}"
+        "for id in RM-001 RM-002 RM-0011 RM-01; do\n"
+        '  item_is_open "$id" rm-batch && echo "$id open" || echo "$id closed"\n'
+        "done\n"
+    )
+    proc = subprocess.run(
+        ["bash", str(script)], cwd=work, capture_output=True, text=True, timeout=60
+    )
+    assert proc.stdout.split("\n")[:4] == [
+        "RM-001 open",
+        "RM-002 closed",
+        "RM-0011 open",
+        "RM-01 closed",
+    ], proc.stdout + proc.stderr
+
+
+def test_fix_many_skips_a_closed_item_before_its_session() -> None:
+    text = (ROOT / "scripts/fix_many.sh").read_text()
+    check = text.index('! item_is_open "$id"')
+    assert check < text.index("scripts/fix_one.sh -p", check)
+
+
+def test_fix_many_prunes_uvs_cache_before_the_disk_floor() -> None:
+    text = (ROOT / "scripts/fix_many.sh").read_text()
+    prune = text.index("uv cache prune")
+    assert prune < text.index("SECANTUS_MIN_FREE_GB", prune)

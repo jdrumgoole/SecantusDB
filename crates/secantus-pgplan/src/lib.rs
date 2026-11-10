@@ -128,6 +128,10 @@ mod func_cast;
 mod funcsig;
 mod named_args;
 pub mod nodetostring;
+mod plpgsql_pct_type;
+pub use plpgsql_pct_type::{
+    plpgsql_percent_type_outer, plpgsql_percent_type_words, plpgsql_row_type, PlpgsqlRowType,
+};
 mod query_reads;
 mod schema_functions;
 mod search_cycle;
@@ -2389,6 +2393,11 @@ pub enum AlterTableAction {
         /// A folded default's catalog rendering (`(1 + 2)`), when it was
         /// written as an expression.
         sql: Option<String>,
+        /// The default is the column's DOMAIN's (`typdefault`), which an
+        /// INSERT applies when the column has none of its own
+        /// (`build_column_default`): an ALTER DOMAIN moving it, or a DROP
+        /// DEFAULT leaving it. It is no `pg_attrdef` row (RP-825).
+        from_domain: bool,
     },
     /// `SET NOT NULL` / `DROP NOT NULL`.
     SetNotNull {
@@ -2406,6 +2415,16 @@ pub enum AlterTableAction {
         /// `USING <expr>`: the new value computed from the row, as SQL
         /// (planned by the executor over the table), instead of a cast.
         using: Option<String>,
+        /// The column's new collation (`GetColumnDefCollation`): the
+        /// statement's COLLATE clause, else the new type's; `None` is the
+        /// default. A collation the column had before does not carry over.
+        collation: Option<String>,
+        /// When the new type is a domain, the column as `CREATE TABLE`
+        /// declares one of it (`domain_column`): `pg_type` / `typmod` are
+        /// then the domain's innermost base, and the column takes the
+        /// template's domain tag, and its DEFAULT unless it has its own
+        /// (RP-834).
+        domain: Option<Box<Column>>,
     },
     AddCheck(CheckConstraint),
     /// `ADD [CONSTRAINT n] UNIQUE (...)`: checked against the rows already
@@ -4437,18 +4456,41 @@ thread_local! {
     /// The parse location (a byte offset into the statement) of the token
     /// the last planning error is about, when the site that raised it knew.
     static ERROR_LOCATION: std::cell::Cell<Option<i32>> = const { std::cell::Cell::new(None) };
+    /// The last planning error was raised where PostgreSQL's parse state
+    /// has no source text, so it carries no position at all.
+    static ERROR_UNPOSITIONED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Mark the error about to be raised as one PostgreSQL reports with no
+/// position: raised under a parse state made with no query text, as
+/// `AddRelationNewConstraints` is from ALTER TABLE (RP-811).
+pub(crate) fn set_error_unpositioned() {
+    ERROR_LOCATION.with(|l| l.set(None));
+    ERROR_UNPOSITIONED.with(|u| u.set(true));
+}
+
+/// Whether the last planning error was marked [`set_error_unpositioned`].
+/// Read, not consumed: the server asks for a position more than once
+/// (`err_in`, then `positioned`), and every ask must answer none. Cleared
+/// by [`take_error_location`] before a statement is planned, and by
+/// [`set_error_location`] for a later error that has one.
+pub(crate) fn error_unpositioned() -> bool {
+    ERROR_UNPOSITIONED.with(std::cell::Cell::get)
 }
 
 /// Record where the error about to be raised points.
 pub(crate) fn set_error_location(location: i32) {
     if location >= 0 {
+        ERROR_UNPOSITIONED.with(|u| u.set(false));
         ERROR_LOCATION.with(|l| l.set(Some(location)));
     }
 }
 
 /// The location the last planning error recorded, consumed; call before
-/// planning to clear a stale one too.
+/// planning to clear a stale one too (and a stale
+/// [`set_error_unpositioned`] with it).
 pub fn take_error_location() -> Option<i32> {
+    ERROR_UNPOSITIONED.with(|u| u.set(false));
     ERROR_LOCATION.with(std::cell::Cell::take)
 }
 
@@ -5961,7 +6003,7 @@ fn plan_node(
                 written: parts.join("."),
             })
         }
-        N::CreateFunctionStmt(f) => plan_create_function(&f),
+        N::CreateFunctionStmt(f) => plan_create_function(&f, lookup),
         N::CallStmt(c) => plan_call(&c, params),
         N::AlterFunctionStmt(a) => alter_routine::plan_alter(&a),
         N::AlterObjectSchemaStmt(a) if alter_routine::plan_set_schema(&a).is_some() => {
@@ -7094,6 +7136,48 @@ fn check_routine_types(f: &pg_query::protobuf::CreateFunctionStmt) -> Result<()>
     Ok(())
 }
 
+/// A routine's signature with each `%TYPE` resolved to the column's type
+/// (RP-822), in the order CREATE FUNCTION looks its types up: the
+/// parameters (`interpret_function_parameter_list`), then the result
+/// (`compute_return_type`). A parameter's type that does not exist is
+/// reported where it stands, so a `%TYPE` before it has already said
+/// what it converted to, and one after it is never looked up. `check`
+/// is whether the other types are checked here (a `LANGUAGE sql` or
+/// `plpgsql` routine's; see `check_routine_types`).
+fn resolve_routine_types(
+    f: &pg_query::protobuf::CreateFunctionStmt,
+    lookup: &dyn Fn(&str) -> Option<TableDef>,
+    check: bool,
+) -> Result<pg_query::protobuf::CreateFunctionStmt> {
+    let mut f = f.clone();
+    for p in &mut f.parameters {
+        if let Some(N::FunctionParameter(fp)) = p.node.as_mut() {
+            if let Some(tn) = fp.arg_type.as_mut() {
+                if tn.pct_type {
+                    *tn = plpgsql_pct_type::routine_percent_type(tn, lookup)?;
+                } else if check {
+                    if let Some(t) = routine_type_missing(tn)? {
+                        return Err(Error::UndefinedObject(format!("type {t} does not exist")));
+                    }
+                }
+            }
+        }
+    }
+    // A procedure has no result; RETURNS TABLE of one column repeats that
+    // column's type as the result, which is looked up again.
+    if !f.is_procedure {
+        if let Some(tn) = f.return_type.as_mut() {
+            if tn.pct_type {
+                *tn = plpgsql_pct_type::routine_percent_type(tn, lookup)?;
+            }
+        }
+    }
+    if check {
+        check_routine_types(&f)?;
+    }
+    Ok(f)
+}
+
 /// Why a PL/pgSQL DECLARE's type was refused: by the type lookup
 /// `parse_datatype` runs under its own error callback, which places the
 /// error at the type's text in the body (`AtType`), or by a
@@ -7207,7 +7291,10 @@ pub fn plpgsql_declared_type(text: &str) -> std::result::Result<(), DeclaredType
     }
 }
 
-fn plan_create_function(f: &pg_query::protobuf::CreateFunctionStmt) -> Result<Statement> {
+fn plan_create_function(
+    f: &pg_query::protobuf::CreateFunctionStmt,
+    lookup: &dyn Fn(&str) -> Option<TableDef>,
+) -> Result<Statement> {
     let name_parts: Vec<String> = f
         .funcname
         .iter()
@@ -7242,11 +7329,12 @@ fn plan_create_function(f: &pg_query::protobuf::CreateFunctionStmt) -> Result<St
         .next_back()
         .ok_or_else(|| Error::Parse("CREATE FUNCTION without a name".into()))?;
     // Every type the signature names is looked up before the result is
-    // reconciled with the OUT parameters (RP-566). A `LANGUAGE internal`
-    // wrapper's are checked where it is created.
-    if matches!(routine_language(f).as_deref(), Some("sql" | "plpgsql")) {
-        check_routine_types(f)?;
-    }
+    // reconciled with the OUT parameters (RP-566), a `%TYPE` resolved to
+    // its column's type (RP-822). A `LANGUAGE internal` wrapper's other
+    // types are checked where it is created.
+    let check = matches!(routine_language(f).as_deref(), Some("sql" | "plpgsql"));
+    let resolved = resolve_routine_types(f, lookup, check)?;
+    let f = &resolved;
     let mut arg_types = Vec::new();
     for p in &f.parameters {
         let Some(N::FunctionParameter(fp)) = p.node.as_ref() else {
@@ -8269,6 +8357,27 @@ fn plan_alter_action(
             if_exists: cmd.missing_ok,
         }),
         Ok(AT::AtColumnDefault) => {
+            // `DROP DEFAULT` of a column of a domain removes only the
+            // column's own default: an INSERT then takes the domain's again
+            // (`build_column_default` falls back to `typdefault`), as it
+            // stands now and as a later ALTER DOMAIN moves it (RP-825).
+            if cmd.def.is_none() {
+                let column = def
+                    .column(&cmd.name)
+                    .ok_or_else(|| Error::UndefinedColumn(cmd.name.clone()))?;
+                if let Some(d) = column
+                    .extra
+                    .get_str("domain_type")
+                    .ok()
+                    .and_then(domains::user_domain)
+                {
+                    return domains::inherited_default(
+                        &cmd.name,
+                        &column.pg_type,
+                        d.default_sql.as_deref(),
+                    );
+                }
+            }
             // `DROP DEFAULT` is the same node with no expression.
             let value = match cmd.def.as_ref() {
                 None => None,
@@ -8292,6 +8401,7 @@ fn plan_alter_action(
                 value,
                 expr,
                 sql,
+                from_domain: false,
             })
         }
         Ok(AT::AtSetNotNull) => Ok(AlterTableAction::SetNotNull {
@@ -8423,6 +8533,26 @@ fn plan_alter_action(
             let current = def
                 .column(&cmd.name)
                 .ok_or_else(|| Error::UndefinedColumn(cmd.name.clone()))?;
+            // `ATPrepAlterColumnType` takes the new `attcollation` from
+            // `GetColumnDefCollation(NULL, def, targettype)`: the clause's
+            // collation, looked up first (42704) and refused over a type with
+            // none (42804), ahead of the cast below; without one, the new
+            // type's. The collation the column had -- its own COLLATE's or
+            // its old domain's -- is gone.
+            let collation = match cd.coll_clause.as_deref() {
+                Some(cc) => {
+                    let name = collation::clause_name(cc);
+                    collation::resolve(&name)?;
+                    if !collation::collatable(&ty) {
+                        return Err(Error::DatatypeMismatch(format!(
+                            "collations are not supported by type {}",
+                            display_type(&ty)
+                        )));
+                    }
+                    Some(name)
+                }
+                None => domains::declared_collation(&ty),
+            };
             // PostgreSQL decides this from the TYPES alone, before looking at
             // a single row: the conversion is allowed only where an
             // assignment cast exists, and otherwise the statement is refused
@@ -8437,12 +8567,25 @@ fn plan_alter_action(
                     display_type(&ty)
                 )));
             }
+            // `atttypid` becomes the domain itself, so the column is one of
+            // it as CREATE TABLE declares one: stored as the domain's
+            // innermost base with that base's modifier, tagged with the
+            // domain (whose constraints every write then checks), and given
+            // its DEFAULT. Kept under the domain's name with no tag, the
+            // column had no DEFAULT and named no domain (RP-834).
+            let domain = domain_column(&cmd.name, &ty)?.map(Box::new);
+            let (pg_type, typmod) = match &domain {
+                Some(c) => (c.pg_type.clone(), c.typmod),
+                None => (ty, cd.type_name.as_ref().map(declared_typmod).unwrap_or(-1)),
+            };
             Ok(AlterTableAction::AlterType {
                 column: cmd.name.clone(),
-                pg_type: ty,
-                typmod: cd.type_name.as_ref().map(declared_typmod).unwrap_or(-1),
+                pg_type,
+                typmod,
                 ndims: cd.type_name.as_ref().map_or(0, declared_ndims),
                 using,
+                collation,
+                domain,
             })
         }
         Ok(AT::AtAddConstraint) => {
@@ -8504,8 +8647,11 @@ fn plan_alter_action(
                 .ok_or_else(|| Error::Parse("CHECK without an expression".into()))?;
             let expression = check_expression_text(raw)?;
             // Planned now, so an unknown column is 42703 at ALTER rather than
-            // on the next INSERT.
-            plan_check_expression(&expression, def)?;
+            // on the next INSERT. `ATAddCheckConstraint` hands
+            // `AddRelationNewConstraints` no query text, so an error in the
+            // expression carries no position.
+            cook_check(raw, &expression, &schemas::split_key(table).1, def)
+                .inspect_err(|_| set_error_unpositioned())?;
             let name = if k.conname.is_empty() {
                 let named = columns_referenced(raw, def);
                 let base = match named.as_slice() {
@@ -8958,11 +9104,27 @@ fn plan_added_column(
 ) -> Result<Column> {
     use pg_query::protobuf::ConstrType as CT;
     let declared = cd.type_name.as_ref().map(type_name_of).unwrap_or_default();
-    let ty = normalize_serial(&declared);
+    // A column of a domain is stored as the domain's innermost base, with
+    // that base's modifier (`getBaseTypeAndTypmod`), and tagged with the
+    // domain, as CREATE TABLE declares one: the tag is what checks the
+    // domain's constraints on a write, gives the column the domain's
+    // DEFAULT, pads a domain over `char(n)`, and lets a function or an
+    // aggregate over the base take it. Kept as the domain's name, the column
+    // had none of these (RP-799).
+    let domain = domains::user_domain(&declared);
+    let resolved = domain
+        .as_ref()
+        .and_then(|d| domains::base_type_and_typmod(&d.name));
+    let base = match (&resolved, &domain) {
+        (Some((base, _, _)), _) => base.clone(),
+        (None, Some(d)) => d.base.clone(),
+        (None, None) => declared.clone(),
+    };
+    let ty = normalize_serial(&base);
     let mut column = Column::new(&cd.colname, &ty, false);
     // A serial column draws from `<table>_<column>_seq` (the executor picks
     // a free name if that one is taken) and numbers the existing rows.
-    if ty != declared {
+    if ty != base {
         column.sequence = Some(format!("{table}_{}_seq", cd.colname));
     }
     column.typmod = cd.type_name.as_ref().map(declared_typmod).unwrap_or(-1);
@@ -8983,6 +9145,11 @@ fn plan_added_column(
     } else if let Some(coll) = domains::declared_collation(&ty) {
         column.extra.insert("collation", coll);
     }
+    if let Some(d) = &domain {
+        // The domain's DEFAULT is the column's unless the column declares
+        // its own (below, which then overwrites it).
+        tag_domain_column(&mut column, d, resolved.as_ref(), &ty)?;
+    }
     for con in &cd.constraints {
         let Some(N::Constraint(k)) = con.node.as_ref() else {
             continue;
@@ -8999,6 +9166,12 @@ fn plan_added_column(
                 // executor's rewrite -- `gen_random_uuid()` gives each row its
                 // own, as PostgreSQL does -- and per inserted row after.
                 check_default_type(&column, raw)?;
+                // The column's own DEFAULT replaces the domain's, whichever
+                // form either takes.
+                column.extra.remove("default_from_domain");
+                column.default = None;
+                column.set_default_expr(None);
+                column.set_default_sql(None);
                 match default_value_or_expr(raw, &ty, params)? {
                     DefaultSpec::Value(v) => {
                         column.default = Some(v);
@@ -9420,11 +9593,17 @@ pub fn apply_alter_to_def(def: &mut TableDef, action: &AlterTableAction) {
             value,
             expr,
             sql,
+            from_domain,
         } => {
             if let Some(c) = def.columns.iter_mut().find(|c| c.name == *column) {
                 c.default = value.clone();
                 c.set_default_expr(expr.clone());
                 c.set_default_sql(if value.is_some() { sql.clone() } else { None });
+                if *from_domain {
+                    c.extra.insert("default_from_domain", true);
+                } else {
+                    c.extra.remove("default_from_domain");
+                }
             }
         }
         AlterTableAction::SetNotNull { column, not_null } => {
@@ -9437,12 +9616,57 @@ pub fn apply_alter_to_def(def: &mut TableDef, action: &AlterTableAction) {
             pg_type,
             typmod,
             ndims,
+            collation,
+            domain,
             ..
         } => {
             if let Some(c) = def.columns.iter_mut().find(|c| c.name == *column) {
                 c.pg_type = pg_type.clone();
                 c.typmod = *typmod;
                 c.set_ndims(*ndims);
+                match collation {
+                    Some(name) => c.extra.insert("collation", name.clone()),
+                    None => c.extra.remove("collation"),
+                };
+                // `atttypid` is the new type, so a column retyped off its
+                // domain is no longer one of it: the domain's CHECK and NOT
+                // NULL are not checked on a write, `information_schema` names
+                // no domain, and DROP DOMAIN finds no column depending on it.
+                // The domain's DEFAULT was never the column's (it is the
+                // type's, `typdefault`), so it goes too; a DEFAULT the column
+                // set itself stays, coerced to the new type (RP-824).
+                let new_domain = domain
+                    .as_ref()
+                    .and_then(|t| t.extra.get_str("domain_type").ok());
+                if c.extra
+                    .get_str("domain_type")
+                    .is_ok_and(|d| Some(d) != new_domain)
+                {
+                    c.extra.remove("domain_type");
+                    if c.extra.get_bool("default_from_domain") == Ok(true) {
+                        c.extra.remove("default_from_domain");
+                        c.default = None;
+                        c.set_default_expr(None);
+                        c.set_default_sql(None);
+                    }
+                }
+                // Retyped INTO a domain, the column is one of it: tagged, and
+                // following the domain's DEFAULT (`typdefault`) unless it set
+                // one of its own, which stays, coerced to the new type
+                // (RP-834).
+                if let Some(t) = domain {
+                    if let Ok(name) = t.extra.get_str("domain_type") {
+                        c.extra.insert("domain_type", name.to_string());
+                    }
+                    let own = c.extra.get_bool("default_from_domain") != Ok(true)
+                        && (c.default.is_some() || c.default_expr().is_some());
+                    if !own {
+                        c.default = t.default.clone();
+                        c.set_default_expr(t.default_expr().map(str::to_string));
+                        c.set_default_sql(t.default_sql().map(str::to_string));
+                        c.extra.insert("default_from_domain", true);
+                    }
+                }
             }
         }
         AlterTableAction::AddCheck(check) => {
@@ -11628,15 +11852,32 @@ fn expand_table_like(
         let o = like.options;
         let mut parts: Vec<String> = Vec::new();
         for col in &def.columns {
-            let mut sql = format!(
-                "{} {}",
-                q(&col.name),
-                scalar::format_type_text(&col.pg_type, (col.typmod >= 0).then_some(col.typmod))
-            );
+            // `transformTableLikeClause` copies `atttypid`, so a column of a
+            // domain stays one of it -- its CHECK and NOT NULL, its DEFAULT
+            // (the type's), its `domain_name` -- rather than becoming one of
+            // the domain's base type (RP-839). The domain carries its own
+            // modifier.
+            let domain = col
+                .extra
+                .get_str("domain_type")
+                .ok()
+                .and_then(domains::user_domain);
+            let ty = match &domain {
+                Some(d) => quote_type_path(&d.name),
+                None => {
+                    scalar::format_type_text(&col.pg_type, (col.typmod >= 0).then_some(col.typmod))
+                }
+            };
+            let mut sql = format!("{} {ty}", q(&col.name));
             if !col.nullable {
                 sql.push_str(" NOT NULL");
             }
-            if o & DEFAULTS != 0 {
+            // A default the column follows from its domain is the type's
+            // (`typdefault`), no `pg_attrdef` row: INCLUDING DEFAULTS has
+            // nothing of the column's to copy, and the copy, a column of the
+            // same domain, follows it as this one does.
+            let own_default = col.extra.get_bool("default_from_domain") != Ok(true);
+            if o & DEFAULTS != 0 && own_default {
                 // The expression default's SQL, else the stored value as a
                 // literal of the column's type.
                 let literal = col.default.as_ref().filter(|v| **v != Bson::Null).map(|v| {
@@ -12243,7 +12484,7 @@ fn plan_create(c: &pg_query::protobuf::CreateStmt) -> Result<Statement> {
         // The predicate's SQL text is the catalog record (`(a > 0)`);
         // planning it now surfaces an unknown column at CREATE.
         let expression = check_expression_text(&raw)?;
-        plan_check_expression(&expression, &def)?;
+        cook_check(&raw, &expression, &schemas::split_key(&table).1, &def)?;
         let name = if conname.is_empty() {
             // `<table>_<col>_check` when the predicate names exactly one
             // column, `<table>_check` otherwise, with a counter to keep the
@@ -12563,6 +12804,65 @@ pub fn resolve_fk_target(fk: &mut ForeignKey, target: &TableDef) -> Result<()> {
     } else {
         Err(no_match())
     }
+}
+
+/// A CHECK constraint's expression judged as `cookConstraint` judges it,
+/// over the table `name` (`def`): an unknown column is 42703 now rather than
+/// on the next INSERT, and the expression is coerced to boolean -- `check
+/// (x)` over an `int` is 42804 `argument of CHECK ...`, `check (x is true)`
+/// its test's own 42804 (RP-811). `transformExpr` goes left to right and
+/// `coerce_to_boolean` of the whole runs after it, so a missing column
+/// written before the argument refused is the error, as it is whenever the
+/// whole expression is what is refused.
+fn cook_check(
+    raw: &pg_query::protobuf::Node,
+    expression: &str,
+    name: &str,
+    def: &TableDef,
+) -> Result<()> {
+    let Err(refused) = optype::check_constraint(raw, name, def) else {
+        return plan_check_expression(expression, def).map(drop);
+    };
+    let at = take_error_location();
+    let whole =
+        matches!(&refused, Error::DatatypeMismatch(m) if m.starts_with("argument of CHECK "));
+    let column_first =
+        first_missing_column(raw, name, def).is_some_and(|m| whole || at.is_none_or(|a| m < a));
+    if column_first {
+        plan_check_expression(expression, def)?;
+    }
+    if let Some(a) = at {
+        set_error_location(a);
+    }
+    Err(refused)
+}
+
+/// Where the first column reference in `raw` that names no column of the
+/// table `name` (`def`) is written, if one does.
+fn first_missing_column(raw: &pg_query::protobuf::Node, name: &str, def: &TableDef) -> Option<i32> {
+    let known = |c: &str| def.column(c).is_some() || def.system_columns.iter().any(|s| s.name == c);
+    let mut first: Option<i32> = None;
+    walk_column_refs(&mut raw.clone(), &mut |_, c| {
+        let parts: Vec<&str> = c
+            .fields
+            .iter()
+            .filter_map(|f| match f.node.as_ref() {
+                Some(N::String(s)) => Some(s.sval.as_str()),
+                _ => None,
+            })
+            .collect();
+        let missing = match parts.as_slice() {
+            [col] => !known(col),
+            [table, col] => *table != name || !known(col),
+            _ => false,
+        };
+        if missing && first.is_none_or(|f| c.location < f) {
+            first = Some(c.location);
+        }
+        Ok(())
+    })
+    .ok()?;
+    first
 }
 
 /// Plan a CHECK constraint's predicate text over `def`'s columns as a row
@@ -14161,13 +14461,26 @@ fn plan_window_frame(
 }
 
 /// A windowed select list: output columns, their per-column expressions, the
-/// window items themselves, and the synthetic columns their values land in.
+/// window items themselves, the synthetic columns their values land in, and
+/// how many computed window keys were named (the next one's number).
 type WindowTargets = (
     Vec<(String, String)>,
     Vec<Option<ColumnExpr>>,
     Vec<WindowItem>,
     Vec<Column>,
+    usize,
 );
+
+/// The named windows of a select's WINDOW clause, in its order.
+fn named_windows(s: &pg_query::protobuf::SelectStmt) -> Vec<pg_query::protobuf::WindowDef> {
+    s.window_clause
+        .iter()
+        .filter_map(|n| match n.node.as_ref() {
+            Some(N::WindowDef(w)) => Some((**w).clone()),
+            _ => None,
+        })
+        .collect()
+}
 
 /// Plan the select list of a query carrying window functions.
 ///
@@ -14180,14 +14493,7 @@ fn plan_window_targets(
     def: &TableDef,
     params: &[Bson],
 ) -> Result<WindowTargets> {
-    let named: Vec<pg_query::protobuf::WindowDef> = s
-        .window_clause
-        .iter()
-        .filter_map(|n| match n.node.as_ref() {
-            Some(N::WindowDef(w)) => Some((**w).clone()),
-            _ => None,
-        })
-        .collect();
+    let named = named_windows(s);
     let mut columns = Vec::new();
     let mut casts = Vec::new();
     let mut windows: Vec<WindowItem> = Vec::new();
@@ -14243,7 +14549,7 @@ fn plan_window_targets(
         columns.push((out, field));
         casts.push(None);
     }
-    Ok((columns, casts, windows, extra))
+    Ok((columns, casts, windows, extra, keys))
 }
 
 /// One window call, planned into `windows` and `extra`; answers the synthetic
@@ -14359,6 +14665,44 @@ fn plan_window_call(
     Ok(field)
 }
 
+/// Plan each window call inside `val` as its own window, and replace it in
+/// the expression by a reference to the field its value lands in.
+#[allow(clippy::too_many_arguments)]
+fn replace_window_calls(
+    val: &mut pg_query::protobuf::Node,
+    named: &[pg_query::protobuf::WindowDef],
+    def: &TableDef,
+    params: &[Bson],
+    keys: &mut usize,
+    windows: &mut Vec<WindowItem>,
+    extra: &mut Vec<Column>,
+) -> Result<()> {
+    let mut failure: Option<Error> = None;
+    walk_expr(val, &mut |n| {
+        if failure.is_some() {
+            return Ok(());
+        }
+        if let Some(N::FuncCall(f)) = n.node.as_ref() {
+            if f.over.is_some() {
+                match plan_window_call(f, named, def, params, keys, windows, extra) {
+                    Ok(field) => {
+                        n.node = Some(N::ColumnRef(pg_query::protobuf::ColumnRef {
+                            fields: vec![string_node(&field)],
+                            location: -1,
+                        }));
+                    }
+                    Err(e) => failure = Some(e),
+                }
+            }
+        }
+        Ok(())
+    })?;
+    match failure {
+        Some(e) => Err(e),
+        None => Ok(()),
+    }
+}
+
 /// A target that HOLDS window calls inside an expression -- `v::numeric /
 /// sum(v) over ()`. Each call is planned as its own window, replaced in the
 /// expression by a reference to the field it lands in, and the expression is
@@ -14383,29 +14727,7 @@ fn plan_nested_windows(
     } else {
         rt.name.clone()
     };
-    let mut failure: Option<Error> = None;
-    walk_expr(&mut val, &mut |n| {
-        if failure.is_some() {
-            return Ok(());
-        }
-        if let Some(N::FuncCall(f)) = n.node.as_ref() {
-            if f.over.is_some() {
-                match plan_window_call(f, named, def, params, keys, windows, extra) {
-                    Ok(field) => {
-                        n.node = Some(N::ColumnRef(pg_query::protobuf::ColumnRef {
-                            fields: vec![string_node(&field)],
-                            location: -1,
-                        }));
-                    }
-                    Err(e) => failure = Some(e),
-                }
-            }
-        }
-        Ok(())
-    })?;
-    if let Some(e) = failure {
-        return Err(e);
-    }
+    replace_window_calls(&mut val, named, def, params, keys, windows, extra)?;
     let mut extended = def.clone();
     extended.columns.extend(extra.iter().cloned());
     let target = pg_query::protobuf::Node {
@@ -17816,7 +18138,7 @@ fn bpchar_compared_operands(
 /// Whether an IN list's member reads a Var of its own query: a column, or
 /// a row's column standing as a `$n` past the statement's `row_from`
 /// parameters (`contain_vars_of_level(rexpr, 0)` in `transformAExprIn`).
-fn in_member_has_var(item: &pg_query::protobuf::Node, row_from: usize) -> bool {
+pub(crate) fn in_member_has_var(item: &pg_query::protobuf::Node, row_from: usize) -> bool {
     if matches!(item.node.as_ref(), Some(N::ColumnRef(_))) {
         return true;
     }
@@ -27498,14 +27820,13 @@ fn plan_select_rest(
     // Window functions project into synthetic `__winN` fields, which are
     // appended to the def so the row schema and every later lookup resolve
     // them exactly like a stored column.
-    let (columns, casts, windows, extra) = if has_window(s) {
-        let (c, k, w, e) = plan_window_targets(s, &def, params)?;
-        (c, k, w, e)
+    let (columns, casts, mut windows, extra, mut window_keys) = if has_window(s) {
+        plan_window_targets(s, &def, params)?
     } else {
         let (c, k) = plan_table_targets(&s.target_list, &def, params)?;
-        (c, k, Vec::new(), Vec::new())
+        (c, k, Vec::new(), Vec::new(), 0)
     };
-    let def = if extra.is_empty() {
+    let mut def = if extra.is_empty() {
         def
     } else {
         let mut d = def;
@@ -27564,6 +27885,56 @@ fn plan_select_rest(
                     None => def
                         .field_of(&col)
                         .ok_or_else(|| Error::UndefinedColumn(col.clone()))?,
+                }
+            }
+            // A key holding a window call. One written exactly as a target
+            // IS that target (`findTargetlistEntrySQL99` matches by
+            // `equal()`), sorted as its position would be; any other is a
+            // resjunk target of its own, whose window calls are computed
+            // beside the select list's (RP-761).
+            Some(_) if node_has_window(sb.node.as_deref()) => {
+                let node = sb.node.as_deref().expect("matched Some");
+                let plain: Vec<&pg_query::protobuf::Node> = s
+                    .target_list
+                    .iter()
+                    .filter_map(|t| match t.node.as_ref() {
+                        Some(N::ResTarget(rt)) => rt.val.as_deref(),
+                        _ => None,
+                    })
+                    .collect();
+                let matched = (plain.len() == columns.len())
+                    .then(|| plain.iter().position(|v| same_expression(v, node)))
+                    .flatten();
+                if let Some(i) = matched {
+                    columns[i].1.clone()
+                } else {
+                    let mut key = node.clone();
+                    let mut added = Vec::new();
+                    replace_window_calls(
+                        &mut key,
+                        &named_windows(s),
+                        &def,
+                        params,
+                        &mut window_keys,
+                        &mut windows,
+                        &mut added,
+                    )?;
+                    def.columns.extend(added);
+                    let fields: Vec<RowField> = def
+                        .columns
+                        .iter()
+                        .chain(def.system_columns.iter())
+                        .map(|c| {
+                            note_bpchar_width(c);
+                            (c.name.clone(), c.field(), c.pg_type.clone())
+                        })
+                        .collect();
+                    let mut sample = Document::new();
+                    for c in &def.columns {
+                        sample.insert(c.field(), sample_value_for_type(&c.pg_type));
+                    }
+                    order_exprs.push(row_column_expr(&key, &fields, params, &sample)?);
+                    format!("__order{}", order_exprs.len() - 1)
                 }
             }
             // A COMPUTED sort key (`order by n * -1`, `order by upper(a)`).
@@ -31195,7 +31566,7 @@ fn common_type(nodes: &[&pg_query::protobuf::Node]) -> String {
 }
 
 /// `getBaseType`: a domain's innermost base type, any other type as it is.
-fn domain_base(t: String) -> String {
+pub(crate) fn domain_base(t: String) -> String {
     domains::base_type_and_typmod(&t).map_or(t, |(base, _, _)| base)
 }
 
@@ -35813,6 +36184,11 @@ fn user_composite(name: &str) -> Option<(i64, CompositeFields)> {
             .get(at)
             .map(|(_, oid, fields)| (*oid, fields.clone()))
     })
+}
+
+/// A composite type's fields by name, as `user_composite` finds it.
+pub(crate) fn user_composite_fields(name: &str) -> Option<CompositeFields> {
+    user_composite(name).map(|(_, fields)| fields)
 }
 
 /// A composite type's oid by name -- the door `user_type_oid` misses because
@@ -44087,6 +44463,11 @@ fn collation_for_call(f: &pg_query::protobuf::FuncCall, params: &[Bson]) -> Opti
 /// `pg_collation_for` of a value of the type `pg_typeof` names.
 fn collation_for_type(ty: &str) -> Result<Bson> {
     if let Some(known) = ty.strip_prefix('\u{1f}') {
+        // A column of no collation (RP-803): `pg_collation_for` of
+        // `InvalidOid` is NULL.
+        if known == crate::collation::INDETERMINATE {
+            return Ok(Bson::Null);
+        }
         return Ok(Bson::String(crate::scalar::quote_identifier(known)));
     }
     let mut base = ty.trim_end_matches("[]").to_string();

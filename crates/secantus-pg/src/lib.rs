@@ -121,6 +121,7 @@ mod schema_rows;
 mod scram_binding;
 mod serializable;
 mod server;
+mod setop_order;
 mod sql_fn_params;
 mod sql_fn_validator;
 mod ssi;
@@ -2123,6 +2124,16 @@ impl Drop for NestedStatement<'_> {
 }
 
 impl plpgsql_fn::Host for PlHost<'_> {
+    fn percent_type(&self, words: &[String]) -> Option<String> {
+        self.h.install_user_types();
+        secantus_pgplan::plpgsql_percent_type_outer(words, &|n| self.h.lookup(n))
+    }
+
+    fn row_type(&self, text: &str) -> Option<secantus_pgplan::PlpgsqlRowType> {
+        self.h.install_user_types();
+        secantus_pgplan::plpgsql_row_type(text, &|n| self.h.lookup(n))
+    }
+
     fn expression_type(&self, sql: &str, types: &[String]) -> Option<String> {
         // Planned as a Describe plans it, over NULL parameters of the
         // declared types, but with no subquery runner and without
@@ -2288,6 +2299,18 @@ impl plpgsql_fn::Host for PlHost<'_> {
             .execute_statement(Statement::CloseCursor(name.to_string()), 0)
             .map(|_| ())
             .map_err(|e| pl_error(&e))
+    }
+
+    fn cursor_exists(&self, name: &str) -> bool {
+        self.h
+            .cursors
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains_key(name)
+    }
+
+    fn pin_cursor(&self, name: &str, pinned: bool) {
+        self.h.pin_cursor(name, pinned);
     }
 
     fn query(
@@ -2485,14 +2508,25 @@ impl plpgsql_fn::Host for PlHost<'_> {
                 "invalid transaction termination",
             ));
         }
+        // `_SPI_commit` / `_SPI_rollback`: a FOR loop's pinned cursor is
+        // held first, so the loop reads on in the next transaction.
+        self.h.hold_pinned_cursors();
         self.h
             .restart_transaction(commit, chain)
             .map_err(|e| pl_error(&e))
     }
 
-    fn notice(&self, severity: &str, sqlstate: &str, message: String) {
+    fn notice(
+        &self,
+        severity: &str,
+        sqlstate: &str,
+        message: String,
+        detail: Option<String>,
+        hint: Option<String>,
+    ) {
         let mut info = ErrorInfo::new(severity.into(), sqlstate.into(), message);
-        info.detail = None;
+        info.detail = detail;
+        info.hint = hint;
         self.h
             .pending_notices
             .lock()
@@ -4519,6 +4553,14 @@ pub struct PgHandler {
     /// query outside a block -- PostgreSQL's non-atomic context. A
     /// multi-statement query string is an implicit block.
     sole_implicit: AtomicBool,
+    /// PostgreSQL's `TBLOCK_IMPLICIT_INPROGRESS`: the transaction open is a
+    /// multi-statement simple query's implicit block, not one a BEGIN
+    /// opened. It counts as a transaction block for everything that asks
+    /// (`in_transaction` is set), except xact.c's block statements: a BEGIN
+    /// there makes it the block with no WARNING, a COMMIT / ROLLBACK /
+    /// PREPARE TRANSACTION warns 25P01 and ends it, and AND CHAIN and the
+    /// savepoint statements are 25P01 errors (RP-829).
+    implicit_block: AtomicBool,
     /// Set by `with_isolation_for`: the READ COMMITTED statement about to run
     /// reads only tables the block has not written, so it runs in a fresh
     /// read-only transaction ([`PgHandler::rc_reads_apart`]) instead of the
@@ -4537,6 +4579,16 @@ pub struct PgHandler {
     /// REPEATABLE READ or SERIALIZABLE block that has none yet does not
     /// take one for it.
     no_snapshot_stmt: AtomicBool,
+    /// PostgreSQL's `FirstSnapshotSet`: a statement of this transaction
+    /// has taken a snapshot (any but those `PlannedStmtRequiresSnapshot`
+    /// exempts). Set as such a statement starts, cleared as the
+    /// transaction ends (`AtEOXact_Snapshot`, here `ssi_end`, which every
+    /// end runs). Once set, the transaction's isolation, read-write and
+    /// deferrable modes are fixed (`check_transaction_guc`, RP-831).
+    first_snapshot_set: AtomicBool,
+    /// SET ... TO DEFAULT is applying the reset value, which PostgreSQL's
+    /// `set_config_option` installs without the setting's check hook.
+    setting_reset_value: AtomicBool,
     /// How many statements are running on this session (`run_typed_inner`,
     /// nested ones -- a `DO` block's, a function's -- counted too): the
     /// outermost one outside a transaction holds its table locks to its
@@ -4732,6 +4784,15 @@ struct CursorState {
     /// A WITH HOLD cursor whose transaction has ended: its rows are kept,
     /// but `WHERE CURRENT OF` refuses it.
     held: bool,
+    /// A PL/pgSQL FOR loop is walking it (`PinPortal` in `exec_for_query`):
+    /// a CLOSE of it, or a CLOSE ALL, is 24000 `cannot drop pinned portal`
+    /// (`PortalDrop`), and a COMMIT or ROLLBACK in a procedure holds it
+    /// rather than closing it (`HoldPinnedPortals`, RP-823).
+    pinned: bool,
+    /// Held by a COMMIT or ROLLBACK while pinned (`autoHeld`): it lives on
+    /// across every later transaction end until the loop closes it, as
+    /// `AtCommit_Portals` and `AtAbort_Portals` pass an auto-held portal by.
+    auto_held: bool,
 }
 
 /// What `WHERE CURRENT OF` needs of a cursor (RP-072): the one table it
@@ -5041,11 +5102,14 @@ impl PgHandler {
             wire_portals: Mutex::new(HashMap::new()),
             txn_control: AtomicBool::new(false),
             sole_implicit: AtomicBool::new(false),
+            implicit_block: AtomicBool::new(false),
             rc_apart: AtomicBool::new(false),
             ssi_registered: AtomicBool::new(false),
             bound_params: Mutex::new(None),
             ssi_unique_pending: Mutex::new(Vec::new()),
             no_snapshot_stmt: AtomicBool::new(false),
+            first_snapshot_set: AtomicBool::new(false),
+            setting_reset_value: AtomicBool::new(false),
             statement_depth: std::sync::atomic::AtomicUsize::new(0),
             rc_overlay: Mutex::new(None),
             plan_apart: Mutex::new(None),
@@ -13782,7 +13846,12 @@ impl PgHandler {
         // PostgreSQL checks the body at CREATE (`check_function_bodies`).
         match def.language.as_str() {
             "plpgsql" => {
-                let create_sql = plpgsql_create_sql(&read_back);
+                // A variable of a composite type is compiled as a record of
+                // it, which the catalog decides (RP-689).
+                let create_sql = plpgsql_fn::with_row_types(
+                    &plpgsql_create_sql(&read_back),
+                    &PlHost { h: self },
+                );
                 plpgsql_fn::validate(&create_sql).map_err(|e| {
                     PgWireError::UserError(Box::new(ErrorInfo::new(
                         "ERROR".into(),
@@ -13894,11 +13963,28 @@ impl PgHandler {
             return Ok(());
         }
         self.install_user_types();
+        // A `%TYPE` nothing answers falls through to `parse_datatype` of
+        // the whole text, whose grammar refuses the `%` (RP-818).
+        let percent = plpgsql_fn::percent_types(create_sql, &|w| {
+            secantus_pgplan::plpgsql_percent_type_outer(w, &|n| self.lookup(n))
+        });
         for d in &declared {
-            let Err(refused) = secantus_pgplan::plpgsql_declared_type(&d.typname) else {
-                continue;
+            let mut at_percent = None;
+            let refused = match percent.iter().find(|(datum, _)| *datum == d.datum) {
+                Some((_, Some(_))) => continue,
+                Some((_, None)) => {
+                    at_percent = d.typname.find('%');
+                    secantus_pgplan::DeclaredTypeError::AtType(secantus_pgplan::Error::Parse(
+                        "syntax error at or near \"%\"".into(),
+                    ))
+                }
+                None => match secantus_pgplan::plpgsql_declared_type(&d.typname) {
+                    Ok(()) => continue,
+                    Err(refused) => refused,
+                },
             };
-            let offset = plpgsql_fn::declared_type_offset(body, d);
+            let offset =
+                plpgsql_fn::declared_type_offset(body, d).map(|at| at + at_percent.unwrap_or(0));
             let (e, at_type) = match refused {
                 secantus_pgplan::DeclaredTypeError::AtType(e) => (e, true),
                 secantus_pgplan::DeclaredTypeError::Compile(e) => (e, false),
@@ -13906,6 +13992,10 @@ impl PgHandler {
             let mut err = Self::err(&e);
             if let PgWireError::UserError(info) = &mut err {
                 info.position = None;
+                if at_percent.is_some() {
+                    // `typeStringToTypeName`'s callback.
+                    info.where_context = Some(format!("invalid type name \"{}\"", d.typname));
+                }
                 match offset.filter(|_| at_type) {
                     Some(byte) => {
                         let at = body[..byte].chars().count() + 1;
@@ -19348,11 +19438,19 @@ impl PgHandler {
                 ),
             ))));
         }
+        let base_domain = self.domains()?.into_iter().find(|x| x.name == d.base);
         let known = secantus_pgplan::pgtypes::oid_of_name(&d.base).is_some()
-            || self.domains()?.iter().any(|x| x.name == d.base)
+            || base_domain.is_some()
             || self.enums()?.iter().any(|(n, _, _)| *n == d.base);
         if !known {
             return Err(Self::undefined_domain(&d.base));
+        }
+        // `DefineDomain`: a domain over a domain inherits the base
+        // domain's `typdefault` as it stands now -- a copy, which a later
+        // ALTER DOMAIN of the base does not move -- unless its own DEFAULT
+        // clause (`DEFAULT NULL` included) replaces it.
+        if d.default_sql.is_none() {
+            d.default_sql = base_domain.and_then(|b| b.default_sql);
         }
         d.oid = self.mint_composite_oid()?;
         self.insert_type_doc(
@@ -28616,14 +28714,37 @@ impl PgHandler {
     ///   transaction, and what it committed survives the later failure.
     ///
     /// Both fall out of reusing the session's own transaction slot rather than
-    /// tracking a second one: `BEGIN` inside an open transaction is already a
-    /// no-op here (as it is a warning in PostgreSQL), and `COMMIT` already
-    /// takes the handle. After a mid-batch COMMIT a fresh implicit transaction
-    /// is opened for the commands that follow, which is what PostgreSQL does.
+    /// tracking a second one: a `BEGIN` keeps the open transaction, and
+    /// `COMMIT` already takes the handle. After a mid-batch COMMIT a fresh
+    /// implicit transaction is opened for the commands that follow, which is
+    /// what PostgreSQL does. What the block statements say there -- no
+    /// WARNING for a BEGIN, one for a COMMIT -- is `implicit_block`'s.
     async fn run_batch(&self, stmts: &[String], whole: &str) -> PgWireResult<Vec<Response>> {
+        let out = self.run_batch_statements(stmts, whole).await;
+        // The implicit block ends with the query string, whichever way.
+        self.implicit_block
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        out
+    }
+
+    /// Open the batch's implicit transaction. Two statements or more make it
+    /// an implicit BLOCK (`TBLOCK_IMPLICIT_INPROGRESS`, `implicit_block`);
+    /// one alone is PostgreSQL's `TBLOCK_STARTED`.
+    fn begin_batch_implicit(&self, stmts: usize) -> PgWireResult<()> {
+        self.begin_implicit()?;
+        self.implicit_block
+            .store(stmts > 1, std::sync::atomic::Ordering::Relaxed);
+        Ok(())
+    }
+
+    async fn run_batch_statements(
+        &self,
+        stmts: &[String],
+        whole: &str,
+    ) -> PgWireResult<Vec<Response>> {
         let mut implicit = self.txn.lock().unwrap_or_else(|e| e.into_inner()).is_none();
         if implicit {
-            self.begin_implicit()?;
+            self.begin_batch_implicit(stmts.len())?;
         }
 
         let mut out = Vec::with_capacity(stmts.len());
@@ -28691,7 +28812,7 @@ impl PgHandler {
             // transaction; PostgreSQL starts another for what follows.
             if i + 1 < stmts.len() && self.txn.lock().unwrap_or_else(|e| e.into_inner()).is_none() {
                 implicit = true;
-                self.begin_implicit()?;
+                self.begin_batch_implicit(stmts.len())?;
             }
         }
 
@@ -30379,11 +30500,24 @@ impl PgHandler {
                         Ok(())
                     });
                 }
+                // `ATExecAddColumn`: a column of a domain takes its DEFAULT,
+                // or NULL, coerced into the domain for every row already
+                // there, so a NOT NULL or CHECK the value fails refuses the
+                // ALTER (23502 / 23514); an empty table checks nothing.
+                let domain = column.extra.get_str("domain_type").ok();
+                let check = |v: &Bson| -> PgWireResult<()> {
+                    match domain {
+                        Some(d) => secantus_pgplan::domains::domain_check(d, v)
+                            .map_err(|e| PgHandler::err(&e)),
+                        None => Ok(()),
+                    }
+                };
                 if let Some(expr) = column.default_expr() {
                     let sql = format!("SELECT ({expr})::{}", column.pg_type);
                     let field = column.field();
                     return self.rewrite_rows(table, |d| {
                         let value = self.eval_constant_sql(&sql)?;
+                        check(&value)?;
                         let stored = secantus_pgplan::carry_subms(d, &field, value);
                         d.insert(field.clone(), stored);
                         Ok(())
@@ -30391,6 +30525,7 @@ impl PgHandler {
                 }
                 let value = typed_default(column)?.unwrap_or(Bson::Null);
                 self.rewrite_rows(table, |d| {
+                    check(&value)?;
                     d.insert(column.field(), value.clone());
                     Ok(())
                 })
@@ -30409,6 +30544,7 @@ impl PgHandler {
                 column,
                 pg_type,
                 using: Some(sql),
+                domain,
                 ..
             } => {
                 // `USING <expr>`: the new value is the expression over the row
@@ -30420,7 +30556,10 @@ impl PgHandler {
                 // Over the row as it was: the column still has its OLD type.
                 let expr = secantus_pgplan::plan_check_expression(sql, before)
                     .map_err(|e| Self::err(&e))?;
-                let ty = pg_type.clone();
+                // Into a domain, the value is coerced to the domain, which
+                // checks its constraints (`CoerceToDomain`) and leaves the
+                // base type's value (RP-834).
+                let ty = Self::alter_type_target(pg_type, domain.as_deref());
                 let tz = self.session_timezone();
                 self.rewrite_rows_heap(table, def, move |d| {
                     let v = secantus_pgplan::apply_row_expr(&expr, d).map_err(|e| Self::err(&e))?;
@@ -30436,13 +30575,16 @@ impl PgHandler {
                 .map_err(|e| Self::unique_rebuild_error(e, def))
             }
             A::AlterType {
-                column, pg_type, ..
+                column,
+                pg_type,
+                domain,
+                ..
             } => {
                 let field = def
                     .column(column)
                     .map(|c| c.field())
                     .unwrap_or_else(|| column.clone());
-                let ty = pg_type.clone();
+                let ty = Self::alter_type_target(pg_type, domain.as_deref());
                 let tz = self.session_timezone();
                 // A change between binary-coercible types (`varchar` and
                 // `text`) is a catalog change only; any other rewrites the
@@ -30571,6 +30713,17 @@ impl PgHandler {
             }
             A::SetDefault { .. } | A::SetNotNull { .. } => Ok(()),
         }
+    }
+
+    /// The type an `ALTER COLUMN TYPE` coerces each stored value to: the
+    /// domain when the new type is one (`domain`, the template column
+    /// `domain_column` made), so its constraints are checked, else the new
+    /// type itself.
+    fn alter_type_target(pg_type: &str, domain: Option<&secantus_pgcatalog::Column>) -> String {
+        domain
+            .and_then(|c| c.extra.get_str("domain_type").ok())
+            .unwrap_or(pg_type)
+            .to_string()
     }
 
     /// Read every row of a table, transform it, and write the table back.
@@ -31344,6 +31497,13 @@ impl PgHandler {
     /// A `serial` column's default is the `nextval` call rather than the
     /// stored value, because that is what it actually is.
     fn default_expression(c: &Column) -> Bson {
+        // A default the column takes from its domain is the TYPE's
+        // (`pg_type.typdefault`), which an INSERT applies when the column has
+        // none of its own: it is no `pg_attrdef` row, so `atthasdef` is false
+        // and `column_default` NULL (RP-825).
+        if c.extra.get_bool("default_from_domain") == Ok(true) {
+            return Bson::Null;
+        }
         if let Some(seq) = c.sequence.as_deref() {
             // An IDENTITY column has no column default in PostgreSQL: the
             // value comes from the identity machinery, and `column_default`
@@ -32351,15 +32511,36 @@ impl PgHandler {
     /// holdable included. After this a `FETCH` of a closed cursor answers
     /// `34000 cursor does not exist`, which is what a client's `ServerCursor`
     /// checks for after `conn.commit()`.
+    ///
+    /// A cursor a procedure's COMMIT or ROLLBACK held while a FOR loop
+    /// walked it (`hold_pinned_cursors`) survives either end, as
+    /// `AtCommit_Portals` and `AtAbort_Portals` pass an auto-held portal by.
     fn close_cursors_on_txn_end(&self, keep_holdable: bool) {
         let mut cursors = self.cursors.lock().unwrap_or_else(|e| e.into_inner());
-        if keep_holdable {
-            cursors.retain(|_, c| c.is_holdable);
-            for c in cursors.values_mut() {
-                c.held = true;
-            }
-        } else {
-            cursors.clear();
+        cursors.retain(|_, c| c.auto_held || (keep_holdable && c.is_holdable));
+        for c in cursors.values_mut() {
+            c.held = true;
+        }
+    }
+
+    /// `HoldPinnedPortals`, run by a procedure's COMMIT or ROLLBACK
+    /// (`_SPI_commit` / `_SPI_rollback`) before the transaction ends: every
+    /// cursor a FOR loop has pinned is held, so the loop goes on reading it
+    /// in the next transaction. Its rows are already materialised (a
+    /// PL/pgSQL portal is, `register_portal`), which is what `HoldPortal`
+    /// makes of the rest of a portal's rows.
+    pub(crate) fn hold_pinned_cursors(&self) {
+        let mut cursors = self.cursors.lock().unwrap_or_else(|e| e.into_inner());
+        for c in cursors.values_mut().filter(|c| c.pinned) {
+            c.auto_held = true;
+        }
+    }
+
+    /// Pin or unpin the cursor `name` (`PinPortal` / `UnpinPortal`).
+    pub(crate) fn pin_cursor(&self, name: &str, pinned: bool) {
+        let mut cursors = self.cursors.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(c) = cursors.get_mut(name) {
+            c.pinned = pinned;
         }
     }
 
@@ -32550,6 +32731,17 @@ impl PgHandler {
             }
             _ => false,
         }
+    }
+
+    /// A top-level statement of a multi-statement query's implicit block
+    /// (`implicit_block`). A PL/pgSQL statement is never one.
+    fn in_implicit_block(&self) -> bool {
+        self.implicit_block
+            .load(std::sync::atomic::Ordering::Relaxed)
+            && self
+                .nested_statements
+                .load(std::sync::atomic::Ordering::Relaxed)
+                == 0
     }
 
     fn begin_implicit(&self) -> PgWireResult<()> {
@@ -33174,10 +33366,15 @@ impl PgHandler {
                 self.0.store(false, std::sync::atomic::Ordering::Relaxed);
             }
         }
-        self.no_snapshot_stmt.store(
-            sql_takes_no_snapshot(sql),
-            std::sync::atomic::Ordering::Relaxed,
-        );
+        let no_snapshot = sql_takes_no_snapshot(sql);
+        self.no_snapshot_stmt
+            .store(no_snapshot, std::sync::atomic::Ordering::Relaxed);
+        // The statement takes its snapshot as it starts, before anything it
+        // runs -- a `set_config` in its select list included -- can ask.
+        if !no_snapshot {
+            self.first_snapshot_set
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+        }
         let _snapshotless = Snapshotless(&self.no_snapshot_stmt);
         // The table locks an outermost statement outside a transaction
         // takes are its implicit transaction's: they end with it, on every
@@ -33390,6 +33587,20 @@ impl PgHandler {
         // COMMIT and ROLLBACK are: rolling back to a savepoint is how a client
         // RECOVERS from the error that poisoned the block.
         if let Statement::Transaction(control) = &stmt {
+            // AND CHAIN in an implicit block is `EndTransactionBlock` /
+            // `UserAbortTransactionBlock`'s 25P01, before anything ends.
+            let chain_word = match control {
+                TransactionControl::Commit { chain: true } => Some("COMMIT AND CHAIN"),
+                TransactionControl::Rollback { chain: true } => Some("ROLLBACK AND CHAIN"),
+                _ => None,
+            };
+            if let Some(word) = chain_word.filter(|_| self.in_implicit_block()) {
+                self.note_failure();
+                return Err(Self::user_error(
+                    "25P01",
+                    format!("{word} can only be used in transaction blocks"),
+                ));
+            }
             // A COMMIT does the block's temporary tables' ON COMMIT actions
             // first, inside the block, as `PreCommit_on_commit_actions` does
             // (RP-065): a commit that then fails undoes them with the rest.
@@ -33682,6 +33893,8 @@ impl PgHandler {
                         // Declared outside a block, its transaction is
                         // already over.
                         held: holdable && !in_block,
+                        pinned: false,
+                        auto_held: false,
                     },
                 );
             if holdable {
@@ -34657,6 +34870,7 @@ impl PgHandler {
                     // the client's loader).
                     self.check_set_privilege(&key)?;
                     let text = self.canonical_setting_value(&key, &text)?;
+                    self.check_transaction_guc(&key, &text)?;
                     // `is_local` outside a block lasts only for the
                     // statement's own implicit transaction: nothing stays.
                     // `is_local` outside any transaction lasts for the
@@ -36027,9 +36241,12 @@ impl PgHandler {
             TransactionControl::Release(_) => "RELEASE SAVEPOINT",
             _ => "ROLLBACK TO SAVEPOINT",
         };
+        // An implicit block refuses them too (`DefineSavepoint`,
+        // `ReleaseSavepoint`, `RollbackToSavepoint`).
         if !self
             .in_transaction
             .load(std::sync::atomic::Ordering::Relaxed)
+            || self.in_implicit_block()
         {
             return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
                 "ERROR".into(),
@@ -36424,6 +36641,91 @@ impl PgHandler {
     }
 
     /// BEGIN / START TRANSACTION / COMMIT / ROLLBACK, with `AND CHAIN`.
+    /// variable.c's check hooks for the three transaction GUCs
+    /// (`check_XactIsoLevel`, `check_transaction_read_only`,
+    /// `check_transaction_deferrable`), asked wherever a value is SET --
+    /// `SET`, `SET LOCAL`, `SET TRANSACTION`, a BEGIN's modes, `set_config`
+    /// -- in their order of checks. Once the transaction has taken a
+    /// snapshot (`first_snapshot_set`), or inside a subtransaction, its
+    /// modes are fixed: a different isolation level, a move from read-only
+    /// to read-write, or any deferrable setting is 25001 (RP-831). Another
+    /// key, or `value` not a transaction mode's, passes.
+    fn check_transaction_guc(&self, key: &str, value: &str) -> PgWireResult<()> {
+        use std::sync::atomic::Ordering::Relaxed;
+        let snapshot = self.first_snapshot_set.load(Relaxed);
+        let sub = || {
+            !self
+                .savepoints
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_empty()
+        };
+        let refuse = |msg: &str| Err(Self::user_error("25001", msg.into()));
+        match key {
+            "transaction_isolation" => {
+                // `newXactIsoLevel != XactIsoLevel && IsTransactionState()`.
+                if self.setting_is("transaction_isolation", value) {
+                    return Ok(());
+                }
+                if snapshot {
+                    return refuse(
+                        "SET TRANSACTION ISOLATION LEVEL must be called before any query",
+                    );
+                }
+                if sub() {
+                    return refuse(
+                        "SET TRANSACTION ISOLATION LEVEL must not be called in a subtransaction",
+                    );
+                }
+            }
+            "transaction_read_only" => {
+                // Only a move to read-write, from read-only.
+                let read_write = matches!(value, "off" | "false" | "no" | "0");
+                if !read_write || !self.setting_is("transaction_read_only", "on") {
+                    return Ok(());
+                }
+                if sub() {
+                    return refuse(
+                        "cannot set transaction read-write mode inside a read-only transaction",
+                    );
+                }
+                if snapshot {
+                    return refuse("transaction read-write mode must be set before any query");
+                }
+            }
+            "transaction_deferrable" => {
+                if sub() {
+                    return refuse(
+                        "SET TRANSACTION [NOT] DEFERRABLE cannot be called within a subtransaction",
+                    );
+                }
+                if snapshot {
+                    return refuse(
+                        "SET TRANSACTION [NOT] DEFERRABLE must be called before any query",
+                    );
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// [`Self::check_transaction_guc`] for each mode a `SET TRANSACTION` or
+    /// a BEGIN names, as `ExecSetVariableStmt` / `standard_ProcessUtility`
+    /// set them: isolation, then read-only, then deferrable.
+    fn check_transaction_modes(&self, modes: &TransactionModes) -> PgWireResult<()> {
+        if let Some(iso) = &modes.isolation {
+            self.check_transaction_guc("transaction_isolation", iso)?;
+        }
+        if let Some(ro) = modes.read_only {
+            self.check_transaction_guc("transaction_read_only", if ro { "on" } else { "off" })?;
+        }
+        if let Some(df) = modes.deferrable {
+            self.check_transaction_guc("transaction_deferrable", if df { "on" } else { "off" })?;
+        }
+        Ok(())
+    }
+
     /// Apply the transaction characteristics of a `BEGIN` / `START TRANSACTION`
     /// to the `transaction_*` GUCs for the life of the block.
     ///
@@ -36434,22 +36736,44 @@ impl PgHandler {
     /// for the rest. This server is single-node and does not enforce isolation;
     /// it only reflects what was requested so a client reading
     /// `current_setting('transaction_isolation')` sees its own choice.
-    fn apply_transaction_modes_on_begin(&self, modes: &TransactionModes) {
+    ///
+    /// A BEGIN `continuing` an open transaction -- a nested one, or one
+    /// in a multi-statement query's implicit block -- starts nothing: the
+    /// transaction keeps what it had (a `SET TRANSACTION` before the BEGIN
+    /// included), and only the modes the statement names are set, as
+    /// `standard_ProcessUtility` sets them after `BeginTransactionBlock`
+    /// (15.19: `set transaction read only; begin; show
+    /// transaction_read_only` is `on`, RP-829).
+    fn apply_transaction_modes_on_begin(&self, modes: &TransactionModes, continuing: bool) {
         let mut settings = self.settings.lock().unwrap_or_else(|e| e.into_inner());
-        let default_of = |settings: &HashMap<String, String>, key: &str| -> String {
-            settings.get(key).cloned().unwrap_or_default()
+        let unnamed = |settings: &HashMap<String, String>, key: &str, default: &str| -> String {
+            settings
+                .get(if continuing { key } else { default })
+                .cloned()
+                .unwrap_or_default()
         };
-        let isolation = modes
-            .isolation
-            .clone()
-            .unwrap_or_else(|| default_of(&settings, "default_transaction_isolation"));
+        let isolation = modes.isolation.clone().unwrap_or_else(|| {
+            unnamed(
+                &settings,
+                "transaction_isolation",
+                "default_transaction_isolation",
+            )
+        });
         let read_only = match modes.read_only {
             Some(v) => if v { "on" } else { "off" }.to_string(),
-            None => default_of(&settings, "default_transaction_read_only"),
+            None => unnamed(
+                &settings,
+                "transaction_read_only",
+                "default_transaction_read_only",
+            ),
         };
         let deferrable = match modes.deferrable {
             Some(v) => if v { "on" } else { "off" }.to_string(),
-            None => default_of(&settings, "default_transaction_deferrable"),
+            None => unnamed(
+                &settings,
+                "transaction_deferrable",
+                "default_transaction_deferrable",
+            ),
         };
         settings.insert_keeping_source("transaction_isolation", isolation);
         settings.insert_keeping_source("transaction_read_only", read_only);
@@ -36502,7 +36826,19 @@ impl PgHandler {
             && self
                 .in_transaction
                 .load(std::sync::atomic::Ordering::Relaxed);
-        if nested {
+        // A multi-statement query's implicit block is the exception
+        // (`TBLOCK_IMPLICIT_INPROGRESS`, RP-829): a BEGIN there makes it the
+        // block -- same transaction, no WARNING -- and a COMMIT, ROLLBACK or
+        // PREPARE TRANSACTION ends it with `EndTransactionBlock`'s WARNING
+        // (AND CHAIN was refused in `run`).
+        let implicit = self.in_implicit_block();
+        if implicit {
+            self.implicit_block
+                .store(false, std::sync::atomic::Ordering::Relaxed);
+            if !opens {
+                self.warning("25P01", "there is no transaction in progress".into());
+            }
+        } else if nested {
             self.warning("25001", "there is already a transaction in progress".into());
         }
         // What the block did to temporary tables and holdable cursors only
@@ -36573,14 +36909,22 @@ impl PgHandler {
             // error, and the existing transaction continues.
             TransactionControl::Begin(modes) => {
                 begin(&mut guard)?;
-                self.apply_transaction_modes_on_begin(&modes);
+                // The modes are SET through their GUCs' check hooks: a
+                // BEGIN continuing a transaction that has taken a snapshot
+                // cannot change them (RP-831).
+                self.check_transaction_modes(&modes)?;
+                self.apply_transaction_modes_on_begin(&modes, nested);
                 ("BEGIN", false)
             }
             // Same statement, different word: the tag is what a client reads
             // back, and `START TRANSACTION` answers with its own.
             TransactionControl::Start(modes) => {
                 begin(&mut guard)?;
-                self.apply_transaction_modes_on_begin(&modes);
+                // The modes are SET through their GUCs' check hooks: a
+                // BEGIN continuing a transaction that has taken a snapshot
+                // cannot change them (RP-831).
+                self.check_transaction_modes(&modes)?;
+                self.apply_transaction_modes_on_begin(&modes, nested);
                 ("START TRANSACTION", false)
             }
             TransactionControl::Commit { chain } => {
@@ -38660,28 +39004,93 @@ impl PgHandler {
                 out.extend(left);
                 out.extend(right);
             }
-            secantus_pgplan::SetOpKind::Intersect => {
-                let mut pool = distinct_set::IdentCounts::new();
-                for r in &right {
-                    pool.add(ident(r));
-                }
-                for row in left {
-                    let k = ident(&row);
-                    // ALL pairs each right-side row with one left-side row.
-                    if pool.take(&k, set.all) {
-                        out.push(row);
+            secantus_pgplan::SetOpKind::Intersect | secantus_pgplan::SetOpKind::Except => {
+                // A SetOp returns one row per group, as often as the group
+                // is output: the group's first row from the input the
+                // planner put first when it hashes, the first after its
+                // sort when it sorts (RP-692, `setop_order`).
+                let intersect = matches!(set.kind, secantus_pgplan::SetOpKind::Intersect);
+                let plan = self.setop_plan(set, &schema);
+                let (first, second) = if plan.right_first {
+                    (right, left)
+                } else {
+                    (left, right)
+                };
+                if plan.sorted {
+                    // `set_output_count`, per group of the sorted rows.
+                    let count = |n_left: usize, n_right: usize| match (intersect, set.all) {
+                        (true, true) => n_left.min(n_right),
+                        (true, false) => usize::from(n_left > 0 && n_right > 0),
+                        (false, true) => n_left.saturating_sub(n_right),
+                        (false, false) => usize::from(n_left > 0 && n_right == 0),
+                    };
+                    let mut tagged: Vec<(bool, Vec<Option<Bson>>)> = Vec::new();
+                    tagged.extend(first.into_iter().map(|r| (!plan.right_first, r)));
+                    tagged.extend(second.into_iter().map(|r| (plan.right_first, r)));
+                    // The group's columns ascending, NULLs last: each one's
+                    // default B-tree order.
+                    let mut cmp = |a: &(bool, Vec<Option<Bson>>), b: &(bool, Vec<Option<Bson>>)| {
+                        for i in 0..schema.len() {
+                            let l = a.1.get(i).and_then(|v| v.as_ref());
+                            let r = b.1.get(i).and_then(|v| v.as_ref());
+                            let ord = match (
+                                matches!(l, None | Some(Bson::Null)),
+                                matches!(r, None | Some(Bson::Null)),
+                            ) {
+                                (true, true) => Ordering::Equal,
+                                (true, false) => Ordering::Greater,
+                                (false, true) => Ordering::Less,
+                                (false, false) => compare_values(
+                                    &unpadded(i, l).unwrap_or(Bson::Null),
+                                    &unpadded(i, r).unwrap_or(Bson::Null),
+                                ),
+                            };
+                            if ord != Ordering::Equal {
+                                return ord;
+                            }
+                        }
+                        Ordering::Equal
+                    };
+                    let rows = tuplesort::sort(tagged, None, &mut cmp);
+                    let mut i = 0;
+                    while i < rows.len() {
+                        let k = ident(&rows[i].1);
+                        let mut j = i;
+                        let (mut n_left, mut n_right) = (0usize, 0usize);
+                        while j < rows.len() && (j == i || ident(&rows[j].1) == k) {
+                            if rows[j].0 {
+                                n_left += 1;
+                            } else {
+                                n_right += 1;
+                            }
+                            j += 1;
+                        }
+                        for _ in 0..count(n_left, n_right) {
+                            out.push(rows[i].1.clone());
+                        }
+                        i = j;
                     }
-                }
-            }
-            secantus_pgplan::SetOpKind::Except => {
-                let mut pool = distinct_set::IdentCounts::new();
-                for r in &right {
-                    pool.add(ident(r));
-                }
-                for row in left {
-                    let k = ident(&row);
-                    if !pool.take(&k, set.all) {
-                        out.push(row);
+                } else {
+                    let mut pool = distinct_set::IdentCounts::new();
+                    for r in &second {
+                        pool.add(ident(r));
+                    }
+                    let mut groups = distinct_set::IdentIndex::new();
+                    let mut firsts: Vec<Vec<Option<Bson>>> = Vec::new();
+                    for row in first {
+                        let k = ident(&row);
+                        let group = match groups.find_or_add(k.clone()) {
+                            Ok(g) => g,
+                            Err(g) => {
+                                firsts.push(row);
+                                g
+                            }
+                        };
+                        // ALL pairs each of the second input's rows with one
+                        // of the first's.
+                        if pool.take(&k, set.all) == intersect {
+                            out.push(firsts[group].clone());
+                        }
                     }
                 }
             }
@@ -45034,6 +45443,30 @@ impl PgHandler {
 
             Statement::CloseCursor(name) => {
                 let mut cursors = self.cursors.lock().unwrap_or_else(|e| e.into_inner());
+                // `PortalDrop` refuses a portal a PL/pgSQL FOR loop has
+                // pinned, and CLOSE ALL (`PortalHashTableDeleteAll`) drops
+                // each portal through it, so one pinned portal fails it.
+                // PostgreSQL walks its hash table, dropping the portals it
+                // meets before the pinned one; the error aborts the
+                // transaction, which drops them all the same.
+                let pinned = if name.is_empty() {
+                    cursors
+                        .iter()
+                        .filter(|(_, c)| c.pinned)
+                        .min_by_key(|(_, c)| c.born)
+                        .map(|(n, _)| n.clone())
+                } else {
+                    cursors
+                        .get(&name)
+                        .filter(|c| c.pinned)
+                        .map(|_| name.clone())
+                };
+                if let Some(pinned) = pinned {
+                    return Err(Self::user_error(
+                        "24000", // invalid_cursor_state
+                        format!("cannot drop pinned portal \"{pinned}\""),
+                    ));
+                }
                 if !name.is_empty() && cursors.remove(&name).is_none() {
                     return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
                         "ERROR".into(),
@@ -45549,7 +45982,15 @@ impl PgHandler {
                 } else {
                     Statement::Set { name, value }
                 };
-                let out = self.execute_statement(stmt, max_rows)?;
+                // The reset value is installed without the setting's check
+                // hook (15.19: `begin isolation level serializable; select
+                // 1; set transaction_isolation to default` is accepted).
+                self.setting_reset_value
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+                let out = self.execute_statement(stmt, max_rows);
+                self.setting_reset_value
+                    .store(false, std::sync::atomic::Ordering::Relaxed);
+                let out = out?;
                 // The value takes the reset value's source too.
                 let mut settings = self.settings.lock().unwrap_or_else(|e| e.into_inner());
                 if let Some(now) = settings.get(&key).cloned() {
@@ -45632,6 +46073,13 @@ impl PgHandler {
                         .mark_session("client_encoding");
                 } else {
                     let value = self.canonical_setting_value(&key, &value)?;
+                    // The setting's check hook; a reset value has none.
+                    if !self
+                        .setting_reset_value
+                        .load(std::sync::atomic::Ordering::Relaxed)
+                    {
+                        self.check_transaction_guc(&key, &value)?;
+                    }
                     self.note_txn_guc(&key, false, &value);
                     let mut settings = self.settings.lock().unwrap_or_else(|e| e.into_inner());
                     settings.insert(key.clone(), value.clone());
@@ -45670,6 +46118,7 @@ impl PgHandler {
                     .in_transaction
                     .load(std::sync::atomic::Ordering::Relaxed)
                 {
+                    self.check_transaction_modes(&modes)?;
                     let mut settings = self.settings.lock().unwrap_or_else(|e| e.into_inner());
                     if let Some(iso) = &modes.isolation {
                         settings.insert("transaction_isolation".into(), iso.clone());
@@ -45693,6 +46142,8 @@ impl PgHandler {
                         "25P01",
                         "SET TRANSACTION can only be used in transaction blocks".into(),
                     );
+                    // ... and the modes still go through their check hooks.
+                    self.check_transaction_modes(&modes)?;
                 }
                 Ok(vec![Response::Execution(Tag::new("SET"))])
             }
@@ -54612,6 +55063,8 @@ fn sql_takes_no_snapshot(sql: &str) -> bool {
             | b"savepoint"
             | b"release"
             | b"checkpoint"
+            | b"fetch"
+            | b"move"
     )
 }
 

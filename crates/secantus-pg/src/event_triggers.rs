@@ -368,6 +368,7 @@ impl PgHandler {
                     pg_type,
                     typmod,
                     using,
+                    domain,
                     ..
                 } => {
                     let Some(col) = def.column(column) else {
@@ -379,7 +380,18 @@ impl PgHandler {
                         ("text", "varchar") | ("varchar", "text") | ("cidr", "inet")
                     ) || (old == new
                         && (*typmod < 0 || (col.typmod >= 0 && *typmod >= col.typmod)));
-                    if using.is_some() || !coercible {
+                    // Into a domain, the base's coercion decides, and a
+                    // domain with a constraint anywhere in its chain rewrites
+                    // the table to check every row (`CoerceToDomain` under
+                    // `DomainHasConstraints`, RP-834).
+                    let checked = domain
+                        .as_ref()
+                        .and_then(|c| c.extra.get_str("domain_type").ok())
+                        .and_then(secantus_pgplan::domains::base_type_and_typmod)
+                        .is_some_and(|(_, _, chain)| {
+                            chain.iter().any(|d| d.not_null || !d.checks.is_empty())
+                        });
+                    if using.is_some() || !coercible || checked {
                         reason |= 4;
                     }
                 }

@@ -158,6 +158,16 @@ pub(crate) fn interruptible<T: Send + 'static>(
             .join()
             .map_err(|_| Error::Sqlstate("XX000", "the parser thread panicked".into()))?;
     }
+    // A cancel already pending is answered before any work starts, as
+    // PostgreSQL's next CHECK_FOR_INTERRUPTS would. A pre-pass that swallows
+    // a cut-short parse (privileges, locks) would otherwise start the whole
+    // parse again on a new thread, and on a small CI runner each abandoned
+    // thread's parse, and the freeing of its tree, took the CPU the cancel
+    // was waiting for (RP-571: 0.37 s late, two such threads in the trace).
+    if let Some(message) = reason() {
+        trace(format_args!("parse not started: a cancel is pending"));
+        return Err(Error::Sqlstate("57014", message.into()));
+    }
     let (tx, rx) = std::sync::mpsc::channel();
     trace(format_args!("parse thread spawning"));
     std::thread::Builder::new()
@@ -253,4 +263,37 @@ pub fn trace(event: std::fmt::Arguments<'_>) {
     // One write per line, so lines from several threads do not interleave.
     let mut f = file.lock().unwrap_or_else(|e| e.into_inner());
     let _ = f.write_all(line.as_bytes());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    /// A cancel already pending is answered without starting the work: a
+    /// pre-pass that swallowed a cut-short parse used to start the whole
+    /// parse again on a new thread (RP-571).
+    #[test]
+    fn a_pending_cancel_starts_no_work() {
+        let ran = Arc::new(AtomicBool::new(false));
+        let seen = Arc::clone(&ran);
+        let hook = || Some("canceling statement due to user request");
+        let got = with_cancel_hook(&hook, || {
+            interruptible(1 << 20, move || {
+                seen.store(true, Ordering::SeqCst);
+                Ok(())
+            })
+        });
+        assert!(matches!(got, Err(Error::Sqlstate("57014", _))), "{got:?}");
+        assert!(!ran.load(Ordering::SeqCst), "the work ran after the cancel");
+    }
+
+    /// Without a cancel the work runs and its answer comes back.
+    #[test]
+    fn without_a_cancel_the_work_runs() {
+        let hook = || None;
+        let got = with_cancel_hook(&hook, || interruptible(1 << 20, || Ok(7)));
+        assert!(matches!(got, Ok(7)), "{got:?}");
+    }
 }

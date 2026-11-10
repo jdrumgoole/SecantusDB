@@ -108,6 +108,14 @@ fn names_temp_schema(schema: &str) -> Option<String> {
     (schema == "pg_temp" || schema == t).then_some(t)
 }
 
+/// The session's temporary schema when it holds a relation: what an
+/// explicit `pg_temp` qualifier finds (`LookupExplicitNamespace`), which
+/// PostgreSQL creates with the session's first temporary relation. (It
+/// then outlives that relation's drop, which this does not model.)
+pub(crate) fn temp_schema_in_use() -> Option<String> {
+    temp_schema().filter(|_| session_has_temp())
+}
+
 /// Does the session have a temporary relation?
 fn session_has_temp() -> bool {
     thread_local! {

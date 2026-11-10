@@ -4,6 +4,7 @@ comparing with mongod 8.2.11 (a one-member replica set, macOS arm64).
 
 from __future__ import annotations
 
+import json
 from typing import Any
 
 import pytest
@@ -145,18 +146,23 @@ _LISTED = {
 }
 
 
-def _or_branches_unordered(value: Any) -> Any:
-    """`value` with every `$or`'s branches in one order. mongod 8.2.11 does
-    not keep one: the moved `$match` of `an_or` listed `a` before `b` in 3
-    of 5 fresh replica sets and `b` before `a` in the other 2 (2026-11-10),
-    so a comparison of the order fails on mongod's coin, not this server's."""
+def _or_unordered(value: Any) -> Any:
+    """`value` with each `$or`'s branches in one order. mongod 8.2.11 lists
+    the branches of a `$match` it moves ahead of `$documents`' stages in an
+    order that changes from call to call: `{$or: [{a: 1}, {b: 3}]}` came back
+    with `a` first in 15 of 30 explains and `b` first in the others, on one
+    server and across restarts (2026-11-10; CI snapshots #2652 and #2655 failed
+    on it). Its order is not part of the answer, so neither server's is
+    compared."""
     if isinstance(value, dict):
-        out = {k: _or_branches_unordered(v) for k, v in value.items()}
+        out = {k: _or_unordered(v) for k, v in value.items()}
         if isinstance(out.get("$or"), list):
-            out["$or"] = sorted(out["$or"], key=repr)
+            out["$or"] = sorted(
+                out["$or"], key=lambda b: json.dumps(b, sort_keys=True, default=str)
+            )
         return out
     if isinstance(value, list):
-        return [_or_branches_unordered(v) for v in value]
+        return [_or_unordered(v) for v in value]
     return value
 
 
@@ -168,9 +174,7 @@ def _collectionless_stages(client: Any, pipelines: dict, verbosity: str) -> dict
             verbosity=verbosity,
         )
         return [
-            _or_branches_unordered(
-                {k: v for k, v in s.items() if k != "executionTimeMillisEstimate"}
-            )
+            _or_unordered({k: v for k, v in s.items() if k != "executionTimeMillisEstimate"})
             for s in reply["stages"]
         ]
 

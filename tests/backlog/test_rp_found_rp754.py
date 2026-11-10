@@ -39,6 +39,19 @@ WINDOW_IN_ORDER_BY = {
     " order by max(x::text) over (order by x) desc": [("2",), ("1",)],
     "select sum(x) over (order by x) + 1 from (values (1), (2)) s(x)"
     " order by sum(x) over (order by x) desc": [(4,), (2,)],
+    # A window call written only in the ORDER BY, a named window, and a
+    # window inside a larger key.
+    "select x from (values (1), (2), (3)) s(x) order by row_number() over (order by x desc)": [
+        (3,),
+        (2,),
+        (1,),
+    ],
+    "select x, sum(x) over w from (values (1), (2), (3)) s(x) window w as (order by x)"
+    " order by sum(x) over w desc": [(3, 6), (2, 3), (1, 1)],
+    "select x, count(*) over () from (values (1), (2), (3)) s(x)"
+    " order by x * count(*) over () desc limit 2": [(3, 3), (2, 3)],
+    "select x, rank() over (order by x) from (values (3), (1), (2)) s(x)"
+    " order by -rank() over (order by x)": [(3, 3), (2, 2), (1, 1)],
     # A positional key naming a window target of a network type.
     "select max(x) over (order by x)"
     " from (values ('10.0.0.1'::inet), ('9.0.0.0'::inet)) s(x) order by 1 desc": [
@@ -48,12 +61,14 @@ WINDOW_IN_ORDER_BY = {
 }
 
 
-@pytest.mark.backlog("RP-761")
+@pytest.mark.backlog_fixed("RP-761")
 @pytest.mark.parametrize("query", list(WINDOW_IN_ORDER_BY))
 def test_a_window_call_in_an_order_by_key(query: str, rust_pg: object) -> None:
     """An ORDER BY key holding a window call sorts by the call's value on
-    PostgreSQL 15.19. Here it is 0A000 `function max(text) is not supported
-    yet` (`sum(integer)`): the key is evaluated as a scalar call."""
+    PostgreSQL 15.19. It was 0A000 `function max(text) is not supported
+    yet` (`sum(integer)`) here: the key was evaluated as a scalar call. A key
+    written as a target now sorts as that target, and any other computes its
+    window calls beside the select list's."""
     assert _rows(rust_pg, query) == WINDOW_IN_ORDER_BY[query]
 
 

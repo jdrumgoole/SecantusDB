@@ -8,8 +8,9 @@ assignment to a trigger record's domain field did not check the domain):
   type, without the column's domain or modifier, so an assignment to a
   field checked neither (RP-688, fixed: now regression tests); so did a
   record filled by `FETCH` (RP-807, fixed: now a regression test);
-- a variable declared of a table's row type (`declare r t`) has no fields
-  an assignment can name (RP-689).
+- a variable declared of a table's row type (`declare r t`) had no fields
+  an assignment could name (RP-689, fixed: now regression tests, with
+  more in `test_rp_found_rp689.py`).
 
 The expected answers were measured on a private, freshly initdb'd
 PostgreSQL 15.19 cluster with `_SETUP`.
@@ -253,7 +254,9 @@ ROW_VARIABLE = {
 }
 
 
-@pytest.mark.backlog("RP-689")
+@pytest.mark.backlog_fixed("RP-689")
 @pytest.mark.parametrize("query", list(ROW_VARIABLE))
 def test_row_variable_fields_are_assignable(query: str, dsn: str) -> None:
+    """Was: the variable was a scalar of the type's name, so `r.a := 5` was
+    42601 `"r.a" is not a known variable` (RP-689)."""
     assert _answer(dsn, query) == ROW_VARIABLE[query]

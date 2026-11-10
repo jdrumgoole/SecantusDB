@@ -823,6 +823,14 @@ fn eval(name: &str, args: &[Bson]) -> Result<Bson> {
     if crate::jsonpath::is_function(name) {
         return crate::jsonpath_call(name, args);
     }
+    // A sort by a column of no collation fails as the sort starts, before
+    // any value is compared (`varstr_sortsupport`'s `check_collation_set`):
+    // a NULL key fails too (RP-803).
+    if name == "__coll_key"
+        && matches!(args.first(), Some(Bson::String(c)) if c == crate::collation::INDETERMINATE)
+    {
+        return Err(crate::collation::indeterminate());
+    }
     if !matches!(
         name,
         "concat" | "concat_ws" | "greatest" | "least" | "format" | "quote_nullable"

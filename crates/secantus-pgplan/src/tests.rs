@@ -5203,6 +5203,319 @@ fn a_domain_over_char_n_coerces_to_its_base_width() {
     domains::set_user_domains(Vec::new());
 }
 
+/// RP-799: a column ADD COLUMN adds of a domain is typed as CREATE TABLE
+/// types one -- the innermost base at its width, tagged with the domain,
+/// with the domain's DEFAULT until the column declares its own. It was
+/// typed by the domain's name and tagged with nothing.
+#[test]
+fn an_added_domain_column_is_tagged_like_a_declared_one() {
+    let domain = |name: &str, oid, base: &str, typmod, default_sql: Option<&str>| domains::Domain {
+        name: name.to_string(),
+        oid,
+        base: base.to_string(),
+        typmod,
+        not_null: false,
+        checks: Vec::new(),
+        not_valid: Vec::new(),
+        default_sql: default_sql.map(str::to_string),
+        collation: None,
+    };
+    domains::set_user_domains(vec![
+        domain("dc3", 90011, "bpchar", 7, None),
+        domain("dc3n", 90012, "dc3", -1, None),
+        domain("dd", 90013, "int4", -1, Some("42")),
+    ]);
+    let added = |sql: &str| match plan_ok(sql) {
+        Statement::AlterTable { mut actions, .. } => match actions.remove(0) {
+            AlterTableAction::AddColumn { column, .. } => column,
+            other => panic!("wrong action: {other:?}"),
+        },
+        other => panic!("wrong statement: {other:?}"),
+    };
+    let c = added("ALTER TABLE t ADD COLUMN a dc3n");
+    assert_eq!((c.pg_type.as_str(), c.typmod), ("bpchar", 7));
+    assert_eq!(c.extra.get_str("domain_type").ok(), Some("dc3n"));
+    let c = added("ALTER TABLE t ADD COLUMN d dd");
+    assert_eq!(c.pg_type, "int4");
+    assert_eq!(c.extra.get_str("domain_type").ok(), Some("dd"));
+    assert_eq!(c.default, Some(Bson::Int32(42)));
+    assert_eq!(c.extra.get_bool("default_from_domain").ok(), Some(true));
+    // The column's own DEFAULT replaces the domain's, whichever form it has.
+    let c = added("ALTER TABLE t ADD COLUMN d dd DEFAULT (random() * 10)::int4");
+    assert_eq!(c.default, None);
+    assert!(c.default_expr().is_some());
+    assert!(c.extra.get_bool("default_from_domain").is_err());
+    let c = added("ALTER TABLE t ADD COLUMN d dd DEFAULT 1");
+    assert_eq!(c.default, Some(Bson::Int32(1)));
+    assert!(c.extra.get_bool("default_from_domain").is_err());
+    domains::set_user_domains(Vec::new());
+}
+
+/// RP-839: `CREATE TABLE ... (LIKE t)` copies a column's `atttypid`, so a
+/// column of a domain stays one of it and follows the domain's DEFAULT,
+/// which INCLUDING DEFAULTS does not copy in as the column's own (it is the
+/// type's); a DEFAULT the column set itself is copied. The copy used to be
+/// typed by the domain's base, untagged, with the domain's DEFAULT made its
+/// own under INCLUDING DEFAULTS.
+#[test]
+fn a_like_copy_of_a_domain_column_is_one_of_the_domain() {
+    let domain = |name: &str, oid| domains::Domain {
+        name: name.to_string(),
+        oid,
+        base: "int4".to_string(),
+        typmod: -1,
+        not_null: false,
+        checks: Vec::new(),
+        not_valid: Vec::new(),
+        default_sql: Some("42".to_string()),
+        collation: None,
+    };
+    domains::set_user_domains(vec![domain("dd", 90041), domain("Mixed Dom", 90042)]);
+    let mut source = t();
+    for (name, dom) in [("d", "dd"), ("m", "Mixed Dom"), ("own", "dd")] {
+        let Some(column) = domain_column(name, dom).expect("a domain column") else {
+            panic!("{dom} is a domain");
+        };
+        source.columns.push(column);
+    }
+    // `own` sets a DEFAULT of its own, as SET DEFAULT leaves it.
+    let own = source.columns.iter_mut().find(|c| c.name == "own").unwrap();
+    own.default = Some(Bson::Int32(7));
+    own.extra.remove("default_from_domain");
+    let lookup = |name: &str| (name == "t").then(|| source.clone());
+    for sql in [
+        "CREATE TABLE l (LIKE t)",
+        "CREATE TABLE l (LIKE t INCLUDING DEFAULTS)",
+    ] {
+        let def = match plan(sql, &lookup).expect("should plan") {
+            Statement::CreateTable(def, _) => def,
+            other => panic!("wrong statement: {other:?}"),
+        };
+        for (name, dom) in [("d", "dd"), ("m", "Mixed Dom")] {
+            let c = def.column(name).unwrap();
+            assert_eq!(c.pg_type, "int4", "{sql}");
+            assert_eq!(c.extra.get_str("domain_type").ok(), Some(dom), "{sql}");
+            assert_eq!(c.default, Some(Bson::Int32(42)), "{sql}");
+            assert_eq!(
+                c.extra.get_bool("default_from_domain").ok(),
+                Some(true),
+                "{sql}"
+            );
+        }
+        let c = def.column("own").unwrap();
+        assert_eq!(c.extra.get_str("domain_type").ok(), Some("dd"), "{sql}");
+        if sql.contains("INCLUDING") {
+            assert_eq!(c.default, Some(Bson::Int32(7)), "{sql}");
+            assert!(c.extra.get_bool("default_from_domain").is_err(), "{sql}");
+        } else {
+            assert_eq!(c.default, Some(Bson::Int32(42)), "{sql}");
+            assert_eq!(
+                c.extra.get_bool("default_from_domain").ok(),
+                Some(true),
+                "{sql}"
+            );
+        }
+    }
+    domains::set_user_domains(Vec::new());
+}
+
+/// RP-825: a column of a domain has no default of its own until it sets
+/// one; an INSERT takes the domain's (`typdefault`). SET DEFAULT makes one
+/// the column's, which an ALTER DOMAIN no longer moves, and DROP DEFAULT
+/// leaves the domain's again. Here SET DEFAULT kept the column following
+/// the domain, and DROP DEFAULT left it with none.
+#[test]
+fn a_columns_set_and_drop_default_leave_its_domains() {
+    domains::set_user_domains(vec![domains::Domain {
+        name: "dd".to_string(),
+        oid: 90031,
+        base: "int4".to_string(),
+        typmod: -1,
+        not_null: false,
+        checks: Vec::new(),
+        not_valid: Vec::new(),
+        default_sql: Some("42".to_string()),
+        collation: None,
+    }]);
+    let mut def = t();
+    let Some(column) = domain_column("d", "dd").expect("a domain column") else {
+        panic!("dd is a domain");
+    };
+    def.columns.push(column);
+    let alter = |def: &TableDef, sql: &str| {
+        let lookup = |name: &str| (name == "t").then(|| def.clone());
+        match plan(sql, &lookup).expect("should plan") {
+            Statement::AlterTable { mut actions, .. } => actions.remove(0),
+            other => panic!("wrong statement: {other:?}"),
+        }
+    };
+    let from_domain = |def: &TableDef| {
+        def.column("d")
+            .unwrap()
+            .extra
+            .get_bool("default_from_domain")
+            .is_ok_and(|b| b)
+    };
+    assert!(from_domain(&def));
+    let set = alter(&def, "ALTER TABLE t ALTER COLUMN d SET DEFAULT 7");
+    apply_alter_to_def(&mut def, &set);
+    assert_eq!(def.column("d").unwrap().default, Some(Bson::Int32(7)));
+    assert!(!from_domain(&def));
+    let drop = alter(&def, "ALTER TABLE t ALTER COLUMN d DROP DEFAULT");
+    apply_alter_to_def(&mut def, &drop);
+    assert_eq!(def.column("d").unwrap().default, Some(Bson::Int32(42)));
+    assert!(from_domain(&def));
+    // A column of no domain has nothing to fall back to.
+    let drop = alter(&def, "ALTER TABLE t ALTER COLUMN n DROP DEFAULT");
+    apply_alter_to_def(&mut def, &drop);
+    assert_eq!(def.column("n").unwrap().default, None);
+    domains::set_user_domains(Vec::new());
+}
+
+/// RP-824: `ALTER COLUMN TYPE` sets `atttypid` to the new type, so a column
+/// retyped off its domain is no longer one of it -- no domain tag, no
+/// domain DEFAULT, and the new type's collation (`GetColumnDefCollation`),
+/// not the one it had. The tag stayed, and every write checked the domain.
+#[test]
+fn a_column_retyped_off_its_domain_is_not_one_of_it() {
+    domains::set_user_domains(vec![domains::Domain {
+        name: "dd".to_string(),
+        oid: 90021,
+        base: "int4".to_string(),
+        typmod: -1,
+        not_null: false,
+        checks: Vec::new(),
+        not_valid: Vec::new(),
+        default_sql: Some("42".to_string()),
+        collation: None,
+    }]);
+    let alter = |sql: &str| match plan_ok(sql) {
+        Statement::AlterTable { mut actions, .. } => actions.remove(0),
+        other => panic!("wrong statement: {other:?}"),
+    };
+    let mut def = t();
+    let AlterTableAction::AddColumn { column, .. } = alter("ALTER TABLE t ADD COLUMN d dd") else {
+        panic!("not an ADD COLUMN");
+    };
+    def.columns.push(column.clone());
+    let mut own = column.clone();
+    own.name = "e".to_string();
+    own.extra.remove("default_from_domain");
+    own.default = Some(Bson::Int32(7));
+    def.columns.push(own);
+    for name in ["d", "e"] {
+        apply_alter_to_def(
+            &mut def,
+            &AlterTableAction::AlterType {
+                column: name.to_string(),
+                pg_type: "int8".to_string(),
+                typmod: -1,
+                ndims: 0,
+                using: None,
+                collation: None,
+                domain: None,
+            },
+        );
+    }
+    let d = def.column("d").unwrap();
+    assert_eq!(d.pg_type, "int8");
+    assert!(d.extra.get_str("domain_type").is_err());
+    assert!(d.extra.get_bool("default_from_domain").is_err());
+    assert_eq!(d.default, None);
+    // A DEFAULT the column set itself is the column's, and stays.
+    let e = def.column("e").unwrap();
+    assert!(e.extra.get_str("domain_type").is_err());
+    assert_eq!(e.default, Some(Bson::Int32(7)));
+    domains::set_user_domains(Vec::new());
+
+    // The clause's collation, else the new type's: none for `text`.
+    let collation_of = |sql: &str| match alter(sql) {
+        AlterTableAction::AlterType { collation, .. } => collation,
+        other => panic!("wrong action: {other:?}"),
+    };
+    assert_eq!(
+        collation_of(r#"ALTER TABLE t ALTER COLUMN name TYPE text COLLATE "C""#).as_deref(),
+        Some("C")
+    );
+    assert_eq!(
+        collation_of("ALTER TABLE t ALTER COLUMN name TYPE text"),
+        None
+    );
+    let mut def = t();
+    def.columns[1].extra.insert("collation", "C");
+    apply_alter_to_def(
+        &mut def,
+        &AlterTableAction::AlterType {
+            column: "name".to_string(),
+            pg_type: "text".to_string(),
+            typmod: -1,
+            ndims: 0,
+            using: None,
+            collation: None,
+            domain: None,
+        },
+    );
+    assert!(def
+        .column("name")
+        .unwrap()
+        .extra
+        .get_str("collation")
+        .is_err());
+}
+
+/// RP-834: a column retyped INTO a domain is one of it, as CREATE TABLE
+/// declares one -- stored as the domain's base, tagged with the domain, and
+/// following its DEFAULT unless it set one of its own. It was stored under
+/// the domain's name with no tag, and its DEFAULT was NULL.
+#[test]
+fn a_column_retyped_into_a_domain_is_one_of_it() {
+    domains::set_user_domains(vec![domains::Domain {
+        name: "dd".to_string(),
+        oid: 90022,
+        base: "int4".to_string(),
+        typmod: -1,
+        not_null: false,
+        checks: vec![("dd_check".to_string(), "VALUE > 0".to_string())],
+        not_valid: Vec::new(),
+        default_sql: Some("42".to_string()),
+        collation: None,
+    }]);
+    let alter = |sql: &str| match plan_ok(sql) {
+        Statement::AlterTable { mut actions, .. } => actions.remove(0),
+        other => panic!("wrong statement: {other:?}"),
+    };
+    let action = alter("ALTER TABLE t ALTER COLUMN n TYPE dd USING n::dd");
+    let AlterTableAction::AlterType {
+        pg_type, domain, ..
+    } = &action
+    else {
+        panic!("not an ALTER COLUMN TYPE: {action:?}");
+    };
+    assert_eq!(pg_type, "int4");
+    assert_eq!(
+        domain
+            .as_ref()
+            .and_then(|c| c.extra.get_str("domain_type").ok()),
+        Some("dd")
+    );
+    let mut def = t();
+    def.columns[0].default = Some(Bson::Int32(7));
+    apply_alter_to_def(&mut def, &action);
+    let n = def.column("n").unwrap();
+    assert_eq!(n.pg_type, "int4");
+    assert_eq!(n.extra.get_str("domain_type"), Ok("dd"));
+    assert_eq!(n.extra.get_bool("default_from_domain"), Ok(true));
+    assert_eq!(n.default, Some(Bson::Int32(42)));
+    // A DEFAULT the column set itself stays the column's.
+    let action = alter("ALTER TABLE t ALTER COLUMN id TYPE dd USING id::dd");
+    apply_alter_to_def(&mut def, &action);
+    let id = def.column("id").unwrap();
+    assert_eq!(id.extra.get_str("domain_type"), Ok("dd"));
+    assert!(id.extra.get_bool("default_from_domain").is_err());
+    assert_eq!(id.default, Some(Bson::Int32(7)));
+    domains::set_user_domains(Vec::new());
+}
+
 /// `ALTER DOMAIN ... ADD CONSTRAINT ... NOT VALID` carries the NOT VALID
 /// (`skip_validation`), which a plain ADD does not, and `VALIDATE
 /// CONSTRAINT` names the constraint (RP-555).
@@ -6392,4 +6705,141 @@ fn a_field_of_an_outer_whole_row_is_its_column() {
     assert_eq!(target_refs(&inner), ["v.a", "v.a", "v.c", "?"]);
     assert_eq!(target_refs(&own), ["?"]);
     assert_eq!(target_refs(&bound), ["?"]);
+}
+
+/// `transformAExprIn` reads an IN list's untyped members as a type when the
+/// statement is analysed (RP-806): the common type of the left operand and
+/// the members with no Var when there are more than one of them, otherwise
+/// the left operand's. A member that type's input refuses is its 22P02 at
+/// planning, before any row is compared, even one past a member that
+/// matches; each measured on PostgreSQL 15.19.
+#[test]
+fn an_in_lists_untyped_member_is_read_as_the_lists_type_at_planning() {
+    // (statement, message, 0-based location: PostgreSQL's position less one)
+    for (sql, want, at) in [
+        (
+            "select n in (1, 'x') from t",
+            "invalid input syntax for type integer: \"x\"",
+            16,
+        ),
+        (
+            "select 1 in (1, 'x')",
+            "invalid input syntax for type integer: \"x\"",
+            16,
+        ),
+        // One member with no Var: a plain `=`, read as the left operand's
+        // type.
+        (
+            "select n in (id, 'x') from t",
+            "invalid input syntax for type integer: \"x\"",
+            17,
+        ),
+        // The common type of `int4` and `numeric` is `numeric`.
+        (
+            "select n in (1.5, 'x') from t",
+            "invalid input syntax for type numeric: \"x\"",
+            18,
+        ),
+        // NOT IN coerces the same way.
+        (
+            "select n not in (2, '1.5') from t",
+            "invalid input syntax for type integer: \"1.5\"",
+            20,
+        ),
+    ] {
+        take_error_location();
+        let err = analysed(sql).expect_err("should refuse");
+        assert_eq!(err.sqlstate(), "22P02", "for {sql}: {err}");
+        assert_eq!(err.to_string(), want, "for {sql}");
+        assert_eq!(take_error_location(), Some(at), "for {sql}");
+    }
+    // A member the type reads is no error.
+    for sql in [
+        "select n in (1, '2') from t",
+        "select n in (1, ' 2 ', null) from t",
+        "select n in (1.5, '1.5') from t",
+        "select 1::int2 in (1, '70000')",
+        "select name in ('a', 'x') from t",
+    ] {
+        assert!(analysed(sql).is_ok(), "{sql}: {:?}", analysed(sql).err());
+    }
+}
+
+/// A CHECK constraint is coerced to boolean as `cookConstraint` does it
+/// (RP-811): 42804 under the test's or the clause's name at the argument's
+/// leftmost token, after any missing column written before it, and with no
+/// position at all under ALTER TABLE, whose parse state has no query text.
+/// Measured on PostgreSQL 15.19.
+#[test]
+fn a_check_constraint_is_coerced_to_boolean() {
+    for (sql, state, want, at) in [
+        (
+            "create table c (x int check (x))",
+            "42804",
+            "argument of CHECK",
+            29,
+        ),
+        (
+            "create table c (x int check (x is true))",
+            "42804",
+            "argument of IS TRUE",
+            29,
+        ),
+        (
+            "create table c (x int check (x and y))",
+            "42804",
+            "argument of AND",
+            29,
+        ),
+        (
+            "create table c (x int check (y and x))",
+            "42703",
+            "\"y\"",
+            29,
+        ),
+        ("create table c (x int check (x + y))", "42703", "\"y\"", 33),
+        (
+            "create table c (x int check ((x is true) = y))",
+            "42804",
+            "IS TRUE",
+            30,
+        ),
+    ] {
+        take_error_location();
+        let err = plan(sql, &lookup).expect_err("should refuse");
+        assert_eq!(err.sqlstate(), state, "for {sql} (got {err})");
+        assert!(err.to_string().contains(want), "for {sql}: {err}");
+        assert!(!error_unpositioned(), "for {sql}");
+        assert_eq!(
+            crate::errpos::error_position(sql, state, &err.to_string()),
+            Some(at as usize + 1),
+            "for {sql}"
+        );
+    }
+    for sql in [
+        "create table c (x int check (x > 0))",
+        "create table c (x int check ('t'))",
+        "create table c (x int check (null))",
+        "create table c (x bool check (x))",
+    ] {
+        plan(sql, &lookup).expect("should plan");
+    }
+    for sql in [
+        "alter table t add check (n)",
+        "alter table t add constraint k check (n is false)",
+    ] {
+        take_error_location();
+        let err = plan(sql, &lookup).expect_err("should refuse");
+        assert_eq!(err.sqlstate(), "42804", "for {sql} (got {err})");
+        assert_eq!(
+            crate::errpos::error_position(sql, "42804", &err.to_string()),
+            None,
+            "for {sql}"
+        );
+        // Every ask answers none (the server asks twice), until the next
+        // statement is planned.
+        assert!(error_unpositioned(), "for {sql}");
+        take_error_location();
+        assert!(!error_unpositioned(), "for {sql}");
+    }
 }

@@ -104,6 +104,9 @@ pub struct QueryOut {
 /// What the interpreter asks of the server.
 mod block_scope;
 mod open_cursor;
+mod percent_type;
+mod row_type;
+pub use percent_type::percent_types;
 
 pub trait Host {
     /// `OPEN cur FOR query`: make a portal over the query's rows, named
@@ -124,8 +127,16 @@ pub trait Host {
     fn query(&self, sql: &str, params: &[Bson], types: &[String]) -> Result<QueryOut, PlError>;
     /// Run a statement for its effect; answers the rows it affected.
     fn execute(&self, sql: &str, params: &[Bson], types: &[String]) -> Result<u64, PlError>;
-    /// A `RAISE` below ERROR: `(severity, sqlstate, message)`.
-    fn notice(&self, severity: &str, sqlstate: &str, message: String);
+    /// A `RAISE` below ERROR: its severity, SQLSTATE and message, with
+    /// the DETAIL and HINT its `USING` options gave.
+    fn notice(
+        &self,
+        severity: &str,
+        sqlstate: &str,
+        message: String,
+        detail: Option<String>,
+        hint: Option<String>,
+    );
     /// Run an INSERT / UPDATE / DELETE and answer its RETURNING rows
     /// (`... RETURNING ... INTO`).
     /// `CALL p(...)` from a body: each OUTPUT parameter as `(argument
@@ -182,6 +193,21 @@ pub trait Host {
         let _ = (sql, types);
         None
     }
+    /// What a DECLARE's `words%TYPE` names when no variable of the
+    /// function does: a type, or a relation's column, as a declared type's
+    /// text (`secantus_pgplan::plpgsql_percent_type_outer`, RP-818).
+    fn percent_type(&self, words: &[String]) -> Option<String> {
+        let _ = words;
+        None
+    }
+    /// A DECLARE's type text as a ROW type, when it names one: a table's
+    /// or a composite type's, or a relation's `%ROWTYPE` -- its name and
+    /// each field's `(name, declared type text)`
+    /// (`secantus_pgplan::plpgsql_row_type`, RP-689).
+    fn row_type(&self, text: &str) -> Option<secantus_pgplan::PlpgsqlRowType> {
+        let _ = text;
+        None
+    }
     /// The domain each column of the query `sql` (over parameters of
     /// `types`) is of, in order; empty when not known. A column of the
     /// domain its `INTO` variable is of moves into it with no coercion
@@ -229,6 +255,16 @@ pub trait Host {
     fn close_cursor(&self, name: &str) -> Result<(), PlError> {
         let _ = name;
         Err(PlError::unsupported("CLOSE"))
+    }
+    /// Whether the session has a portal named `name` (`SPI_cursor_find`).
+    fn cursor_exists(&self, name: &str) -> bool {
+        let _ = name;
+        false
+    }
+    /// Pin or unpin the portal `name` (`PinPortal` / `UnpinPortal`), as a
+    /// FOR loop does while it walks it.
+    fn pin_cursor(&self, name: &str, pinned: bool) {
+        let _ = (name, pinned);
     }
 }
 
@@ -308,6 +344,9 @@ enum Datum {
     Rec {
         name: String,
         rec: Option<Record>,
+        /// The row type a variable of a composite type is declared with
+        /// (`rectypeid`); `None` for a `record` (RP-689).
+        row_type: Option<row_type::RowType>,
     },
     Row {
         fields: Vec<usize>,
@@ -359,6 +398,9 @@ struct Interp<'a> {
     cursor_exprs: HashMap<usize, String>,
     /// A bound cursor's declared options (`SCROLL` / `NO SCROLL`), by datum.
     cursor_options: HashMap<usize, u64>,
+    /// A bound cursor's argument row (`c CURSOR (k int) FOR ...`), by datum:
+    /// the row of the variables its OPEN assigns (`cursor_explicit_argrow`).
+    cursor_argrows: HashMap<usize, usize>,
     /// How CONTEXT names this function: `f(integer)`, or
     /// `inline_code_block` for a DO block.
     label: String,
@@ -734,6 +776,13 @@ fn parenthesise_return_next(sql: &str) -> String {
     out
 }
 
+/// `create_sql` as it is parsed: a variable declared of a composite type
+/// declared `record`, as PL/pgSQL compiles it (RP-689). For the checks
+/// made at CREATE; [`run`] makes the same rewrite itself.
+pub fn with_row_types(create_sql: &str, host: &dyn Host) -> String {
+    row_type::row_typed(create_sql, &|t| host.row_type(t)).0
+}
+
 /// Check a body parses, for CREATE FUNCTION: PostgreSQL validates at CREATE.
 pub fn validate(create_sql: &str) -> Result<(), PlError> {
     parsed(create_sql).map(|_| ())
@@ -745,6 +794,8 @@ pub fn validate(create_sql: &str) -> Result<(), PlError> {
 /// text, `%TYPE` and `%ROWTYPE` included, and no location).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Declared {
+    /// Its datum number.
+    pub datum: usize,
     pub lineno: usize,
     pub refname: String,
     pub typname: String,
@@ -772,7 +823,8 @@ pub fn declared_types(create_sql: &str) -> Vec<Declared> {
         .and_then(Value::as_array)
         .map(|ds| {
             ds.iter()
-                .filter_map(|d| {
+                .enumerate()
+                .filter_map(|(datum, d)| {
                     let v = d.get("PLpgSQL_var")?;
                     let lineno = v.get("lineno").and_then(Value::as_u64)? as usize;
                     let typname = v
@@ -784,6 +836,7 @@ pub fn declared_types(create_sql: &str) -> Vec<Declared> {
                         return None;
                     }
                     Some(Declared {
+                        datum,
                         lineno,
                         refname: v.get("refname")?.as_str()?.to_string(),
                         typname: typname.to_string(),
@@ -939,7 +992,9 @@ fn condition_matches(cond: &Value, sqlstate: &str) -> bool {
 
 /// Run one call of a PL/pgSQL function.
 pub fn run(create_sql: &str, inv: Invocation<'_>, host: &dyn Host) -> Result<Outcome, PlError> {
-    let f = parsed(create_sql)?;
+    // A variable of a composite type is a record of that type (RP-689).
+    let (rewritten, row_decls) = row_type::row_typed(create_sql, &|t| host.row_type(t));
+    let f = parsed(&rewritten)?;
     let mut datums = Vec::new();
     let mut found_no = None;
     for (i, d) in f
@@ -978,7 +1033,16 @@ pub fn run(create_sql: &str, inv: Invocation<'_>, host: &dyn Host) -> Result<Out
                 .and_then(Value::as_str)
                 .unwrap_or_default()
                 .to_string();
-            datums.push(Datum::Rec { name, rec: None });
+            let lineno = r.get("lineno").and_then(Value::as_u64).unwrap_or(0) as usize;
+            let row_type = row_decls
+                .iter()
+                .find(|d| d.lineno == lineno && d.refname == name)
+                .map(|d| d.row_type.clone());
+            datums.push(Datum::Rec {
+                name,
+                rec: None,
+                row_type,
+            });
         } else if let Some(r) = d.get("PLpgSQL_row") {
             let fields = r
                 .get("fields")
@@ -1027,10 +1091,25 @@ pub fn run(create_sql: &str, inv: Invocation<'_>, host: &dyn Host) -> Result<Out
             arg += 1;
         }
     }
+    // A `%TYPE` declaration has the type it names (RP-818).
+    let mut kinds: Vec<percent_type::Kind> = datums
+        .iter()
+        .map(|d| match d {
+            Datum::Var { ty, .. } => percent_type::Kind::Var(ty.clone()),
+            _ => percent_type::Kind::Other,
+        })
+        .collect();
+    let fname = function_name(create_sql);
+    for (d, t) in percent_type::resolve(&f, fname.as_deref(), &mut kinds, &|w| host.percent_type(w))
+    {
+        if let (Some(t), Some(Datum::Var { ty, .. })) = (t, datums.get_mut(d)) {
+            *ty = t;
+        }
+    }
     let mut interp = Interp {
         datums,
         arg_slots,
-        fn_name: function_name(create_sql),
+        fn_name: fname,
         host,
         trigger: inv.trigger.clone(),
         returns_set: inv.returns_set,
@@ -1051,6 +1130,7 @@ pub fn run(create_sql: &str, inv: Invocation<'_>, host: &dyn Host) -> Result<Out
         handling: None,
         cursor_exprs: open_cursor::cursor_exprs(&f),
         cursor_options: open_cursor::cursor_options(&f),
+        cursor_argrows: open_cursor::cursor_argrows(&f),
         expression_types: std::cell::RefCell::default(),
         label: function_label(create_sql),
         dyn_text: None,
@@ -1062,8 +1142,11 @@ pub fn run(create_sql: &str, inv: Invocation<'_>, host: &dyn Host) -> Result<Out
                 ds.iter()
                     .enumerate()
                     .filter_map(|(i, d)| {
-                        let e = d.get("PLpgSQL_var")?.get("default_val")?;
-                        Some((i, e.clone()))
+                        let v = d.get("PLpgSQL_var")?;
+                        match v.get("default_val") {
+                            Some(e) => Some((i, e.clone())),
+                            None => open_cursor::cursor_name_default(v).map(|e| (i, e)),
+                        }
                     })
                     .collect()
             })
@@ -1260,6 +1343,19 @@ fn bind_frame(text: &str, mode: u64) -> Option<String> {
     })
 }
 
+/// An input error on a literal of `sql` (`'x'::int`): it carries a cursor
+/// position, which `_SPI_error_callback` turns into an internal query
+/// position instead of a `SQL ...` CONTEXT frame.
+fn literal_input_error(sql: &str, err: &PlError) -> bool {
+    err.sqlstate.starts_with("22")
+        && err
+            .message
+            .strip_suffix('"')
+            .and_then(|m| m.rsplit_once(": \""))
+            .map(|(_, v)| v)
+            .is_some_and(|lit| sql.contains(&format!("'{}'", lit.replace('\'', "''"))))
+}
+
 fn expr_frame(
     text: &str,
     mode: u64,
@@ -1275,18 +1371,8 @@ fn expr_frame(
             _ => format!("SQL statement \"{text}\""),
         })
     };
-    // An input error on a literal of the text has a position: no frame.
-    if err.sqlstate.starts_with("22") {
-        if let Some(lit) = err
-            .message
-            .strip_suffix('"')
-            .and_then(|m| m.rsplit_once(": \""))
-            .map(|(_, v)| v)
-        {
-            if sql.contains(&format!("'{}'", lit.replace('\'', "''"))) {
-                return None;
-            }
-        }
+    if literal_input_error(sql, err) {
+        return None;
     }
     let parsed = pg_query::parse(sql).ok()?;
     let simple = match parsed
@@ -1418,6 +1504,14 @@ fn expression_folds(expr: &pg_query::protobuf::node::Node) -> bool {
     })
 }
 
+/// The type a record variable's value is of: its declared row type's, or
+/// `record`.
+fn record_type_name(row_type: &Option<row_type::RowType>) -> String {
+    row_type
+        .as_ref()
+        .map_or_else(|| "record".to_string(), |rt| rt.name.clone())
+}
+
 /// A record as a whole, as a value of its row type.
 fn record_value(rec: &Record) -> Bson {
     let mut d = bson::Document::new();
@@ -1508,6 +1602,53 @@ impl Interp<'_> {
                             );
                             e.from_sql = true;
                             return Err(e);
+                        } else if let Some(d) = self
+                            .qualifying_record(&name, &field)
+                            .filter(|_| !matches!(tok(i + 3), Some(".") | Some("(")))
+                        {
+                            // `r.f` is a RECFIELD datum (`plpgsql_parse_dblword`
+                            // builds one for any field name), and
+                            // `exec_eval_datum` looks the field up in the
+                            // record's row type: a name it lacks is 42703,
+                            // never a column of a FROM item `r` (RP-837).
+                            match self.datums.get(d) {
+                                Some(Datum::Rec { rec: Some(r), .. })
+                                    if r.get(&field).is_some() =>
+                                {
+                                    let (v, ty) = r.get(&field).expect("checked");
+                                    bound = Some((v.clone(), ty.to_string(), i + 2));
+                                }
+                                Some(Datum::Rec {
+                                    rec: None,
+                                    row_type: Some(rt),
+                                    ..
+                                }) if rt.columns.iter().any(|(n, _)| *n == field) => {
+                                    let (_, ty) = rt
+                                        .columns
+                                        .iter()
+                                        .find(|(n, _)| *n == field)
+                                        .expect("checked");
+                                    bound = Some((Bson::Null, ty.clone(), i + 2));
+                                }
+                                Some(Datum::Rec {
+                                    rec: Some(_),
+                                    name: rec_name,
+                                    ..
+                                })
+                                | Some(Datum::Rec {
+                                    row_type: Some(_),
+                                    name: rec_name,
+                                    ..
+                                }) => {
+                                    let mut e = PlError::new(
+                                        "42703",
+                                        format!("record \"{rec_name}\" has no field \"{field}\""),
+                                    );
+                                    e.from_sql = true;
+                                    return Err(e);
+                                }
+                                _ => {}
+                            }
                         } else if !matches!(tok(i + 3), Some(".") | Some("(")) {
                             // `blk.x`: a variable of a block (or FOR loop)
                             // labelled `blk`, innermost first; then `fname.p`,
@@ -1542,6 +1683,22 @@ impl Interp<'_> {
                     // A named argument's name (`p(r => r)`) is not a column
                     // reference, so not a variable either.
                     if let Some((v, ty)) = self.scalar(&name) {
+                        bound = Some((v, ty, i));
+                    } else if let Some((v, ty)) = self
+                        .named(&name)
+                        .filter(|d| {
+                            matches!(
+                                self.datums.get(*d),
+                                Some(Datum::Rec {
+                                    row_type: Some(_),
+                                    ..
+                                })
+                            )
+                        })
+                        .and_then(|d| self.datum_value(d))
+                    {
+                        // A record of a declared row type is a value of that
+                        // type, NULL until assigned (RP-689).
                         bound = Some((v, ty, i));
                     } else if let Some(rec) = self.record(&name) {
                         // A record as a whole: a value of its row type.
@@ -1619,8 +1776,16 @@ impl Interp<'_> {
     fn datum_value(&self, d: usize) -> Option<(Bson, String)> {
         match self.datums.get(d)? {
             Datum::Var { ty, value, .. } => Some((value.clone(), ty.clone())),
-            Datum::Rec { rec: Some(r), .. } => Some((record_value(r), "record".into())),
-            Datum::Rec { rec: None, .. } => Some((Bson::Null, "record".into())),
+            Datum::Rec {
+                rec: Some(r),
+                row_type,
+                ..
+            } => Some((record_value(r), record_type_name(row_type))),
+            Datum::Rec {
+                rec: None,
+                row_type,
+                ..
+            } => Some((Bson::Null, record_type_name(row_type))),
             _ => None,
         }
     }
@@ -1735,11 +1900,34 @@ impl Interp<'_> {
         self.trigger.is_none()
             && matches!(
                 self.named(name).and_then(|d| self.datums.get(d)),
-                Some(Datum::Rec { rec: None, .. })
+                Some(Datum::Rec {
+                    rec: None,
+                    row_type: None,
+                    ..
+                })
             )
     }
 
+    /// The declared row type of a record variable that is still NULL (the
+    /// innermost one of that name).
+    fn null_typed_record(&self, name: &str) -> Option<&row_type::RowType> {
+        match self.named(name).and_then(|d| self.datums.get(d))? {
+            Datum::Rec {
+                rec: None,
+                row_type: Some(rt),
+                ..
+            } => Some(rt),
+            _ => None,
+        }
+    }
+
     fn record_field(&self, name: &str, field: &str) -> Option<(Bson, String)> {
+        if let Some(rt) = self.null_typed_record(name) {
+            // A field of a NULL record of a row type is NULL, of the
+            // field's type (RP-689).
+            let (_, ty) = rt.columns.iter().find(|(n, _)| n == field)?;
+            return Some((Bson::Null, ty.clone()));
+        }
         let rec = self.record(name)?;
         let (v, ty) = rec.get(field)?;
         Some((v.clone(), ty.to_string()))
@@ -1758,6 +1946,33 @@ impl Interp<'_> {
             _ => text.to_string(),
         };
         self.eval_body(body, text, mode)
+    }
+
+    /// Evaluate an expression and print it as `convert_value_to_string`
+    /// does, by its type's OUTPUT function (`None` for NULL): a RAISE's
+    /// parameters and options. A value carried in a form other than its
+    /// text needs the type -- `money`'s `cash_out` is `$5.25`, not the
+    /// carried `5.25` (RP-751) -- and a boolean is `boolout`'s `t` / `f`,
+    /// not a text cast's `true`.
+    fn eval_output(&self, e: &Value) -> Result<Option<String>, PlError> {
+        let v = self.eval(e)?;
+        if v == Bson::Null {
+            return Ok(None);
+        }
+        // A mode-0 expression is a whole statement, not a select target.
+        let ty = expr_query(e)
+            .filter(|(_, mode)| *mode != 0)
+            .and_then(|(text, mode)| {
+                let body = match mode {
+                    3 | 4 => text.split_once(":=").map_or(text, |(_, r)| r).trim(),
+                    _ => text,
+                };
+                self.expression_type(body)
+            });
+        Ok(Some(secantus_pgplan::typeout::output_text(
+            &v,
+            ty.as_deref().unwrap_or("text"),
+        )))
     }
 
     /// Evaluate `body`, a part of the expression `text` (of parse mode
@@ -2022,7 +2237,23 @@ impl Interp<'_> {
         let (ty, current) = match self.datums.get(no) {
             Some(Datum::Var { ty, value, .. }) => (ty.clone(), value.clone()),
             Some(Datum::RecField { field, parent }) => match self.datums.get(*parent) {
-                Some(Datum::Rec { rec: Some(r), name }) => match r.get(field) {
+                Some(Datum::Rec {
+                    rec: None,
+                    row_type: Some(rt),
+                    name,
+                }) => match rt.columns.iter().find(|(n, _)| n == field) {
+                    // NULL until assigned: each field reads NULL.
+                    Some((_, t)) => (t.clone(), Bson::Null),
+                    None => {
+                        return Err(PlError::new(
+                            "42703",
+                            format!("record \"{name}\" has no field \"{field}\""),
+                        ))
+                    }
+                },
+                Some(Datum::Rec {
+                    rec: Some(r), name, ..
+                }) => match r.get(field) {
                     Some((v, t)) => (t.to_string(), v.clone()),
                     None => {
                         return Err(PlError::new(
@@ -2243,10 +2474,25 @@ impl Interp<'_> {
         match self.datums.get(no) {
             Some(Datum::RecField { field, parent }) => {
                 let (field, parent) = (field.clone(), *parent);
+                // A record of a declared row type that is still NULL is
+                // first made a row of NULL fields
+                // (`instantiate_empty_record_variable`, RP-689).
+                if let Some(Datum::Rec {
+                    rec: rec @ None,
+                    row_type: Some(rt),
+                    ..
+                }) = self.datums.get_mut(parent)
+                {
+                    *rec = Some(Record {
+                        columns: rt.columns.clone(),
+                        values: vec![Bson::Null; rt.columns.len()],
+                    });
+                }
                 match self.datums.get_mut(parent) {
                     Some(Datum::Rec {
                         rec: Some(rec),
                         name,
+                        ..
                     }) => match rec.columns.iter().position(|(n, _)| *n == field) {
                         Some(i) => {
                             rec.values[i] = value;
@@ -2327,6 +2573,35 @@ impl Interp<'_> {
                 .unwrap_or_else(|| "text".to_string())
         };
         match self.datums.get(target) {
+            Some(Datum::Rec {
+                row_type: Some(rt), ..
+            }) => {
+                // A record of a declared row type keeps it: the row's
+                // values are moved into its fields by position, each
+                // converted to the field's type by the assignment rule
+                // (`exec_move_row_from_fields`); a field with no value is
+                // NULL, a value with no field ignored; no row leaves every
+                // field NULL (RP-689).
+                let columns_to = rt.columns.clone();
+                let mut values = Vec::with_capacity(columns_to.len());
+                for (i, (_, ty)) in columns_to.iter().enumerate() {
+                    let v = match row.and_then(|r| r.get(i)) {
+                        Some(v) => self
+                            .convert_to(ty, v.clone(), &source(i))
+                            .map_err(|e| e.with_sql_frame(|| None))?,
+                        None => Bson::Null,
+                    };
+                    values.push(v);
+                }
+                let rec = Some(Record {
+                    columns: columns_to,
+                    values,
+                });
+                if let Some(Datum::Rec { rec: slot, .. }) = self.datums.get_mut(target) {
+                    *slot = rec;
+                }
+                Ok(())
+            }
             Some(Datum::Rec { .. }) => {
                 // No row still gives the record the query's row type, every
                 // field NULL (`exec_move_row` over a NULL tuple). Each field
@@ -2600,6 +2875,16 @@ impl Interp<'_> {
                             Some(Datum::Rec { rec: Some(r), .. }) => {
                                 r.get(field).map(|(_, t)| t.to_string())
                             }
+                            // Still NULL: the field of its row type (RP-689).
+                            Some(Datum::Rec {
+                                rec: None,
+                                row_type: Some(rt),
+                                ..
+                            }) => rt
+                                .columns
+                                .iter()
+                                .find(|(n, _)| n == field)
+                                .map(|(_, t)| t.clone()),
                             _ => None,
                         };
                         match ty {
@@ -2905,6 +3190,7 @@ impl Interp<'_> {
             }
             "PLpgSQL_stmt_raise" => self.raise(body),
             "PLpgSQL_stmt_open" => self.open_cursor(body),
+            "PLpgSQL_stmt_forc" => self.for_cursor(body, label.as_deref()),
             "PLpgSQL_stmt_fetch" => self.fetch_cursor(body),
             "PLpgSQL_stmt_close" => self.close_cursor(body),
             "PLpgSQL_stmt_perform" => {
@@ -3153,13 +3439,8 @@ impl Interp<'_> {
             .unwrap_or_default()
             .iter()
             .map(|p| {
-                // As the type's output function writes it: `boolout`'s
-                // `t` / `f`, not a text cast's `true`.
-                self.eval(p).map(|v| match v {
-                    Bson::Null => "<NULL>".to_string(),
-                    Bson::Boolean(b) => if b { "t" } else { "f" }.to_string(),
-                    other => secantus_pgplan::value_text(&other),
-                })
+                self.eval_output(p)
+                    .map(|v| v.unwrap_or_else(|| "<NULL>".to_string()))
             })
             .collect::<Result<_, _>>()?;
         let mut text = String::new();
@@ -3208,7 +3489,9 @@ impl Interp<'_> {
                 .get("PLpgSQL_raise_option")
                 .cloned()
                 .unwrap_or(Value::Null);
-            let v = secantus_pgplan::value_text(&self.eval(o.get("expr").unwrap_or(&Value::Null))?);
+            let v = self
+                .eval_output(o.get("expr").unwrap_or(&Value::Null))?
+                .unwrap_or_default();
             match o.get("opt_type").and_then(Value::as_u64).unwrap_or(0) {
                 0 => {
                     if err_code.is_some() {
@@ -3263,7 +3546,10 @@ impl Interp<'_> {
             19 => "WARNING",
             _ => return Ok(Flow::Next),
         };
-        self.host.notice(severity, &err.sqlstate, err.message);
+        // `exec_stmt_raise` passes the DETAIL and HINT to `ereport` at
+        // every level, a notice's included.
+        self.host
+            .notice(severity, &err.sqlstate, err.message, err.detail, err.hint);
         Ok(Flow::Next)
     }
 }
@@ -3361,6 +3647,7 @@ mod rp573_declarations {
     #[test]
     fn a_declared_type_is_found_after_its_name() {
         let d = |lineno: usize, refname: &str, typname: &str| Declared {
+            datum: 0,
             lineno,
             refname: refname.into(),
             typname: typname.into(),

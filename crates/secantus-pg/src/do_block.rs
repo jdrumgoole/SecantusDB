@@ -76,7 +76,11 @@ impl PgHandler {
                 // `plpgsql_compile_inline` compiles the whole block, its
                 // declarations' types looked up, before any of it runs
                 // (RP-573).
-                self.check_plpgsql_declarations("inline_code_block", &sql, body)?;
+                self.check_plpgsql_declarations(
+                    "inline_code_block",
+                    &crate::plpgsql_fn::with_row_types(&sql, &crate::PlHost { h: self }),
+                    body,
+                )?;
                 // Alone in its query string outside a block, the body may
                 // COMMIT; anywhere else it is atomic.
                 let prev = self.txn_control.swap(
