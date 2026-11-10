@@ -3577,14 +3577,6 @@ COLUMN adds.
       `tag_domain_column` stores the domain's default in the column.
       Verify: tests/backlog/test_rp_found_rp799.py::test_a_domains_default_is_not_its_columns
       Backlog-ID: RP-825
-- [ ] **A domain over a domain does not take the inner domain's DEFAULT.**
-      A column of `dx2`, over `dx` with `default 42`, is `42` where an
-      INSERT omits it on PostgreSQL 15.19 (`getTypeDefault` reads the
-      outer domain's `typdefault`, which CREATE DOMAIN copies from its base
-      domain); here it is NULL, as only the outer domain's own DEFAULT is
-      read.
-      Verify: tests/backlog/test_rp_found_rp799.py::test_a_domain_over_a_domain_takes_its_default
-      Backlog-ID: RP-826
 - [ ] **`information_schema.columns.data_type` of a domain over a domain
       names its base.** A column of `dx2` is `USER-DEFINED` on PostgreSQL
       15.19 -- the view reads the domain's immediate base type, itself a
