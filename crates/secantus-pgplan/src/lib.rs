@@ -17237,6 +17237,53 @@ fn fit_array_elements(value: Bson, element: &str, typmod: i32) -> Result<Bson> {
 }
 
 #[cfg(test)]
+mod array_literal_bounds_tests {
+    use super::{parse_array, Error};
+
+    fn sqlstate(r: super::Result<bson::Bson>) -> (String, String) {
+        match r {
+            Err(Error::Sqlstate(code, m)) => (code.to_string(), m),
+            Err(e @ Error::InvalidText(_)) => ("22P02".into(), e.to_string()),
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn array_check_bounds_refuses_an_upper_bound_past_int4() {
+        // RP-771: `array_in`'s `ArrayCheckBounds`, measured on PG 15.19.
+        let lb = |n: i64| {
+            (
+                "54000".to_string(),
+                format!("array lower bound is too large: {n}"),
+            )
+        };
+        assert_eq!(
+            sqlstate(parse_array("[2147483647:2147483647]={1}", "int4")),
+            lb(2147483647)
+        );
+        assert_eq!(
+            sqlstate(parse_array("[2147483646:2147483647]={1,2}", "int4")),
+            lb(2147483646)
+        );
+        assert_eq!(
+            sqlstate(parse_array("[1:1][2147483647:2147483647]={{1}}", "int4")),
+            lb(2147483647)
+        );
+        // Checked before any element is read, after the shape check.
+        assert_eq!(
+            sqlstate(parse_array("[2147483647:2147483647]={x}", "int4")),
+            lb(2147483647)
+        );
+        assert_eq!(
+            sqlstate(parse_array("[2147483647:2147483647]={1,2}", "int4")).0,
+            "22P02"
+        );
+        assert!(parse_array("[2147483646:2147483646]={1}", "int4").is_ok());
+        assert!(parse_array("[-2147483648:-2147483648]={1}", "int4").is_ok());
+    }
+}
+
+#[cfg(test)]
 mod bpchar_array_tests {
     use super::{arrays, pad_bpchar, trim_bpchar_deep};
     use bson::Bson;
@@ -37606,10 +37653,15 @@ fn parse_array_with(
     // (`'{1,{2,x}}'::int[]` is `malformed array literal`, not `"x"`): the
     // same parse with text elements, which only the structure can fail.
     if !matches!(element_type, "text" | "varchar" | "bpchar" | "name") {
-        if let Err(e @ Error::InvalidText(_)) = parse_array(text, "text") {
-            if e.to_string().starts_with("malformed array literal") {
+        match parse_array(text, "text") {
+            Err(e @ Error::InvalidText(_))
+                if e.to_string().starts_with("malformed array literal") =>
+            {
                 return Err(e);
             }
+            // `ArrayCheckBounds` runs before the first element is read.
+            Err(e @ Error::Sqlstate("54000", _)) => return Err(e),
+            _ => {}
         }
     }
     let malformed = || Error::InvalidText(format!("malformed array literal: \"{text}\""));
@@ -37677,6 +37729,14 @@ fn parse_array_with(
     if !declared.is_empty() && array_dims(&items) != declared {
         return Err(malformed());
     }
+    // `ArrayCheckBounds`: once the decoration matches the contents, each
+    // dimension's lower bound plus its length must fit an `int4`
+    // (`'[2147483647:2147483647]={1}'` is 54000).
+    let dims: Vec<i64> = declared
+        .iter()
+        .map(|&d| i64::try_from(d).unwrap_or(i64::MAX))
+        .collect();
+    array_assign::check_bounds(&dims, &lower)?;
     Ok(arrays::bounded(Bson::Array(items), &lower))
 }
 
