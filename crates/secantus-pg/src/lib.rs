@@ -2128,6 +2128,11 @@ impl plpgsql_fn::Host for PlHost<'_> {
         secantus_pgplan::plpgsql_percent_type_outer(words, &|n| self.h.lookup(n))
     }
 
+    fn row_type(&self, text: &str) -> Option<secantus_pgplan::PlpgsqlRowType> {
+        self.h.install_user_types();
+        secantus_pgplan::plpgsql_row_type(text, &|n| self.h.lookup(n))
+    }
+
     fn expression_type(&self, sql: &str, types: &[String]) -> Option<String> {
         // Planned as a Describe plans it, over NULL parameters of the
         // declared types, but with no subquery runner and without
@@ -13840,7 +13845,12 @@ impl PgHandler {
         // PostgreSQL checks the body at CREATE (`check_function_bodies`).
         match def.language.as_str() {
             "plpgsql" => {
-                let create_sql = plpgsql_create_sql(&read_back);
+                // A variable of a composite type is compiled as a record of
+                // it, which the catalog decides (RP-689).
+                let create_sql = plpgsql_fn::with_row_types(
+                    &plpgsql_create_sql(&read_back),
+                    &PlHost { h: self },
+                );
                 plpgsql_fn::validate(&create_sql).map_err(|e| {
                     PgWireError::UserError(Box::new(ErrorInfo::new(
                         "ERROR".into(),

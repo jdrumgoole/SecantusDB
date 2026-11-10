@@ -105,6 +105,7 @@ pub struct QueryOut {
 mod block_scope;
 mod open_cursor;
 mod percent_type;
+mod row_type;
 pub use percent_type::percent_types;
 
 pub trait Host {
@@ -197,6 +198,14 @@ pub trait Host {
     /// text (`secantus_pgplan::plpgsql_percent_type_outer`, RP-818).
     fn percent_type(&self, words: &[String]) -> Option<String> {
         let _ = words;
+        None
+    }
+    /// A DECLARE's type text as a ROW type, when it names one: a table's
+    /// or a composite type's, or a relation's `%ROWTYPE` -- its name and
+    /// each field's `(name, declared type text)`
+    /// (`secantus_pgplan::plpgsql_row_type`, RP-689).
+    fn row_type(&self, text: &str) -> Option<secantus_pgplan::PlpgsqlRowType> {
+        let _ = text;
         None
     }
     /// The domain each column of the query `sql` (over parameters of
@@ -335,6 +344,9 @@ enum Datum {
     Rec {
         name: String,
         rec: Option<Record>,
+        /// The row type a variable of a composite type is declared with
+        /// (`rectypeid`); `None` for a `record` (RP-689).
+        row_type: Option<row_type::RowType>,
     },
     Row {
         fields: Vec<usize>,
@@ -764,6 +776,13 @@ fn parenthesise_return_next(sql: &str) -> String {
     out
 }
 
+/// `create_sql` as it is parsed: a variable declared of a composite type
+/// declared `record`, as PL/pgSQL compiles it (RP-689). For the checks
+/// made at CREATE; [`run`] makes the same rewrite itself.
+pub fn with_row_types(create_sql: &str, host: &dyn Host) -> String {
+    row_type::row_typed(create_sql, &|t| host.row_type(t)).0
+}
+
 /// Check a body parses, for CREATE FUNCTION: PostgreSQL validates at CREATE.
 pub fn validate(create_sql: &str) -> Result<(), PlError> {
     parsed(create_sql).map(|_| ())
@@ -973,7 +992,9 @@ fn condition_matches(cond: &Value, sqlstate: &str) -> bool {
 
 /// Run one call of a PL/pgSQL function.
 pub fn run(create_sql: &str, inv: Invocation<'_>, host: &dyn Host) -> Result<Outcome, PlError> {
-    let f = parsed(create_sql)?;
+    // A variable of a composite type is a record of that type (RP-689).
+    let (rewritten, row_decls) = row_type::row_typed(create_sql, &|t| host.row_type(t));
+    let f = parsed(&rewritten)?;
     let mut datums = Vec::new();
     let mut found_no = None;
     for (i, d) in f
@@ -1012,7 +1033,16 @@ pub fn run(create_sql: &str, inv: Invocation<'_>, host: &dyn Host) -> Result<Out
                 .and_then(Value::as_str)
                 .unwrap_or_default()
                 .to_string();
-            datums.push(Datum::Rec { name, rec: None });
+            let lineno = r.get("lineno").and_then(Value::as_u64).unwrap_or(0) as usize;
+            let row_type = row_decls
+                .iter()
+                .find(|d| d.lineno == lineno && d.refname == name)
+                .map(|d| d.row_type.clone());
+            datums.push(Datum::Rec {
+                name,
+                rec: None,
+                row_type,
+            });
         } else if let Some(r) = d.get("PLpgSQL_row") {
             let fields = r
                 .get("fields")
@@ -1474,6 +1504,14 @@ fn expression_folds(expr: &pg_query::protobuf::node::Node) -> bool {
     })
 }
 
+/// The type a record variable's value is of: its declared row type's, or
+/// `record`.
+fn record_type_name(row_type: &Option<row_type::RowType>) -> String {
+    row_type
+        .as_ref()
+        .map_or_else(|| "record".to_string(), |rt| rt.name.clone())
+}
+
 /// A record as a whole, as a value of its row type.
 fn record_value(rec: &Record) -> Bson {
     let mut d = bson::Document::new();
@@ -1599,6 +1637,22 @@ impl Interp<'_> {
                     // reference, so not a variable either.
                     if let Some((v, ty)) = self.scalar(&name) {
                         bound = Some((v, ty, i));
+                    } else if let Some((v, ty)) = self
+                        .named(&name)
+                        .filter(|d| {
+                            matches!(
+                                self.datums.get(*d),
+                                Some(Datum::Rec {
+                                    row_type: Some(_),
+                                    ..
+                                })
+                            )
+                        })
+                        .and_then(|d| self.datum_value(d))
+                    {
+                        // A record of a declared row type is a value of that
+                        // type, NULL until assigned (RP-689).
+                        bound = Some((v, ty, i));
                     } else if let Some(rec) = self.record(&name) {
                         // A record as a whole: a value of its row type.
                         bound = Some((record_value(rec), "record".into(), i));
@@ -1675,8 +1729,16 @@ impl Interp<'_> {
     fn datum_value(&self, d: usize) -> Option<(Bson, String)> {
         match self.datums.get(d)? {
             Datum::Var { ty, value, .. } => Some((value.clone(), ty.clone())),
-            Datum::Rec { rec: Some(r), .. } => Some((record_value(r), "record".into())),
-            Datum::Rec { rec: None, .. } => Some((Bson::Null, "record".into())),
+            Datum::Rec {
+                rec: Some(r),
+                row_type,
+                ..
+            } => Some((record_value(r), record_type_name(row_type))),
+            Datum::Rec {
+                rec: None,
+                row_type,
+                ..
+            } => Some((Bson::Null, record_type_name(row_type))),
             _ => None,
         }
     }
@@ -1791,11 +1853,34 @@ impl Interp<'_> {
         self.trigger.is_none()
             && matches!(
                 self.named(name).and_then(|d| self.datums.get(d)),
-                Some(Datum::Rec { rec: None, .. })
+                Some(Datum::Rec {
+                    rec: None,
+                    row_type: None,
+                    ..
+                })
             )
     }
 
+    /// The declared row type of a record variable that is still NULL (the
+    /// innermost one of that name).
+    fn null_typed_record(&self, name: &str) -> Option<&row_type::RowType> {
+        match self.named(name).and_then(|d| self.datums.get(d))? {
+            Datum::Rec {
+                rec: None,
+                row_type: Some(rt),
+                ..
+            } => Some(rt),
+            _ => None,
+        }
+    }
+
     fn record_field(&self, name: &str, field: &str) -> Option<(Bson, String)> {
+        if let Some(rt) = self.null_typed_record(name) {
+            // A field of a NULL record of a row type is NULL, of the
+            // field's type (RP-689).
+            let (_, ty) = rt.columns.iter().find(|(n, _)| n == field)?;
+            return Some((Bson::Null, ty.clone()));
+        }
         let rec = self.record(name)?;
         let (v, ty) = rec.get(field)?;
         Some((v.clone(), ty.to_string()))
@@ -2105,7 +2190,23 @@ impl Interp<'_> {
         let (ty, current) = match self.datums.get(no) {
             Some(Datum::Var { ty, value, .. }) => (ty.clone(), value.clone()),
             Some(Datum::RecField { field, parent }) => match self.datums.get(*parent) {
-                Some(Datum::Rec { rec: Some(r), name }) => match r.get(field) {
+                Some(Datum::Rec {
+                    rec: None,
+                    row_type: Some(rt),
+                    name,
+                }) => match rt.columns.iter().find(|(n, _)| n == field) {
+                    // NULL until assigned: each field reads NULL.
+                    Some((_, t)) => (t.clone(), Bson::Null),
+                    None => {
+                        return Err(PlError::new(
+                            "42703",
+                            format!("record \"{name}\" has no field \"{field}\""),
+                        ))
+                    }
+                },
+                Some(Datum::Rec {
+                    rec: Some(r), name, ..
+                }) => match r.get(field) {
                     Some((v, t)) => (t.to_string(), v.clone()),
                     None => {
                         return Err(PlError::new(
@@ -2326,10 +2427,25 @@ impl Interp<'_> {
         match self.datums.get(no) {
             Some(Datum::RecField { field, parent }) => {
                 let (field, parent) = (field.clone(), *parent);
+                // A record of a declared row type that is still NULL is
+                // first made a row of NULL fields
+                // (`instantiate_empty_record_variable`, RP-689).
+                if let Some(Datum::Rec {
+                    rec: rec @ None,
+                    row_type: Some(rt),
+                    ..
+                }) = self.datums.get_mut(parent)
+                {
+                    *rec = Some(Record {
+                        columns: rt.columns.clone(),
+                        values: vec![Bson::Null; rt.columns.len()],
+                    });
+                }
                 match self.datums.get_mut(parent) {
                     Some(Datum::Rec {
                         rec: Some(rec),
                         name,
+                        ..
                     }) => match rec.columns.iter().position(|(n, _)| *n == field) {
                         Some(i) => {
                             rec.values[i] = value;
@@ -2410,6 +2526,35 @@ impl Interp<'_> {
                 .unwrap_or_else(|| "text".to_string())
         };
         match self.datums.get(target) {
+            Some(Datum::Rec {
+                row_type: Some(rt), ..
+            }) => {
+                // A record of a declared row type keeps it: the row's
+                // values are moved into its fields by position, each
+                // converted to the field's type by the assignment rule
+                // (`exec_move_row_from_fields`); a field with no value is
+                // NULL, a value with no field ignored; no row leaves every
+                // field NULL (RP-689).
+                let columns_to = rt.columns.clone();
+                let mut values = Vec::with_capacity(columns_to.len());
+                for (i, (_, ty)) in columns_to.iter().enumerate() {
+                    let v = match row.and_then(|r| r.get(i)) {
+                        Some(v) => self
+                            .convert_to(ty, v.clone(), &source(i))
+                            .map_err(|e| e.with_sql_frame(|| None))?,
+                        None => Bson::Null,
+                    };
+                    values.push(v);
+                }
+                let rec = Some(Record {
+                    columns: columns_to,
+                    values,
+                });
+                if let Some(Datum::Rec { rec: slot, .. }) = self.datums.get_mut(target) {
+                    *slot = rec;
+                }
+                Ok(())
+            }
             Some(Datum::Rec { .. }) => {
                 // No row still gives the record the query's row type, every
                 // field NULL (`exec_move_row` over a NULL tuple). Each field
@@ -2683,6 +2828,16 @@ impl Interp<'_> {
                             Some(Datum::Rec { rec: Some(r), .. }) => {
                                 r.get(field).map(|(_, t)| t.to_string())
                             }
+                            // Still NULL: the field of its row type (RP-689).
+                            Some(Datum::Rec {
+                                rec: None,
+                                row_type: Some(rt),
+                                ..
+                            }) => rt
+                                .columns
+                                .iter()
+                                .find(|(n, _)| n == field)
+                                .map(|(_, t)| t.clone()),
                             _ => None,
                         };
                         match ty {
