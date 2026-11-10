@@ -3575,17 +3575,6 @@ Measured on a private, freshly initdb'd PostgreSQL 15.19 cluster with the
 `int` with `not null check (value > 0)`, `t839(x text collate "C", y text,
 m "Mx839")` and `z839(o char(4) default 'ab', v varchar(3) default 'q')`.
 
-- [ ] **A column `LIKE` copies drops the column's collation.** `create
-      table l839 (like t839)` makes `x` a column collated "C" on PostgreSQL
-      15.19 (`transformTableLikeClause` copies `attcollation` with the
-      type), and `information_schema.columns.collation_name` is `C`. Here
-      the copy takes its type's default collation: `attcollation` is
-      "default" and `collation_name` NULL, so the copy sorts and compares
-      by a different collation than the column it was copied from.
-      `expand_table_like` (`crates/secantus-pgplan/src/lib.rs`) renders
-      each column by its type alone.
-      Verify: tests/backlog/test_rp_found_rp839.py::test_a_like_copy_keeps_a_columns_collation
-      Backlog-ID: RP-844
 - [ ] **A domain whose name needs quotes is named bare in its errors.** An
       INSERT of NULL into a column of `"Mx839"` is 23502 `domain "Mx839"
       does not allow null values` on PostgreSQL 15.19, and a value its
