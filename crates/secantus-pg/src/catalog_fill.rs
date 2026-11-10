@@ -5,6 +5,8 @@
 //! filled in after the catalog's own columns, so a row the builder already
 //! set is left alone.
 
+use std::collections::HashMap;
+
 use bson::{Bson, Document};
 use secantus_pgcatalog::{Column, TableDef};
 
@@ -514,8 +516,6 @@ fn default_opclass(type_oid: i64) -> i64 {
         .map_or(0, |(o, _, _)| *o)
 }
 
-/// A type's collation: `default` for the collatable string types, `C` for
-/// `name`, none (0) for the rest.
 /// A built-in type's `(typelem, typcollation)` as PostgreSQL 15.19's
 /// `pg_type` holds them (`pg15_catalog_rows.txt`).
 fn builtin_type_facts(type_oid: i64) -> Option<(i64, i64)> {
@@ -537,15 +537,49 @@ fn builtin_type_facts(type_oid: i64) -> Option<(i64, i64)> {
     .copied()
 }
 
-fn type_collation(type_oid: i64) -> i64 {
+/// A type's collation (`typcollation`): a built-in's as 15.19 records it,
+/// a user domain's or its array type's from `domains`, none (0) for the
+/// rest.
+fn type_collation(type_oid: i64, domains: &HashMap<i64, i64>) -> i64 {
     if let Some((_, coll)) = builtin_type_facts(type_oid) {
         return coll;
     }
     match type_oid {
         25 | 1042 | 1043 => DEFAULT_COLLATION,
         19 => C_COLLATION,
-        _ => 0,
+        _ => domains.get(&type_oid).copied().unwrap_or(0),
     }
+}
+
+/// The collation `DefineDomain` gives each user domain, and the array type
+/// it makes beside it, by oid: its base type's `typcollation` (the domain
+/// over a domain its base domain's, a domain over an array its element's).
+///
+/// A COLLATE clause is not kept by `CREATE DOMAIN` here (RP-782), so the
+/// base type's collation is the one every domain takes.
+fn domain_collations(domains: &[secantus_pgplan::domains::Domain]) -> HashMap<i64, i64> {
+    fn of(base: &str, domains: &[secantus_pgplan::domains::Domain], depth: u8) -> i64 {
+        // Bounded: a catalog cannot hold a cycle, but a bad one must not hang.
+        if depth > 32 {
+            return 0;
+        }
+        // An array type's collation is its element's (`_text` 100, `_name` 950).
+        if let Some(element) = base.trim().strip_suffix("[]") {
+            return of(element, domains, depth + 1);
+        }
+        if let Some(d) = domains.iter().find(|d| d.name == base) {
+            return of(&d.base, domains, depth + 1);
+        }
+        secantus_pgplan::pgtypes::oid_of_name(base)
+            .map_or(0, |oid| type_collation(oid, &HashMap::new()))
+    }
+    let mut out = HashMap::new();
+    for d in domains {
+        let coll = of(&d.base, domains, 0);
+        out.insert(d.oid, coll);
+        out.insert(d.oid + secantus_pgplan::USER_TYPE_ARRAY_OID_OFFSET, coll);
+    }
+    out
 }
 
 impl PgHandler {
@@ -1199,6 +1233,13 @@ impl PgHandler {
         } else {
             Vec::new()
         };
+        // The collation each user domain and its array type carry.
+        let domain_colls: HashMap<i64, i64> =
+            if matches!(name, "pg_type" | "pg_attribute" | "pg_index") {
+                domain_collations(&self.domains().unwrap_or_default())
+            } else {
+                HashMap::new()
+            };
         // Enum types are passed by value (they are oids); attbyval needs it.
         let enum_oids: Vec<i64> = if name == "pg_attribute" {
             self.enums()
@@ -1330,7 +1371,7 @@ impl PgHandler {
                                         "indclass" => Bson::Int64(default_opclass(*ty)),
                                         // DESC implies NULLS FIRST: both bits.
                                         "indoption" => Bson::Int32(if *desc { 3 } else { 0 }),
-                                        _ => Bson::Int64(type_collation(*ty)),
+                                        _ => Bson::Int64(type_collation(*ty, &domain_colls)),
                                     })
                                     .collect(),
                             )
@@ -1409,9 +1450,12 @@ impl PgHandler {
                                         secantus_pgplan::regobj::collation_names()
                                             .into_iter()
                                             .find(|(n, _)| *n == name)
-                                            .map_or_else(|| type_collation(type_oid), |(_, o)| o),
+                                            .map_or_else(
+                                                || type_collation(type_oid, &domain_colls),
+                                                |(_, o)| o,
+                                            ),
                                     ),
-                                    None => Bson::Int64(type_collation(type_oid)),
+                                    None => Bson::Int64(type_collation(type_oid, &domain_colls)),
                                 }
                             }
                             // The column type's `typlen` / `typstorage`: a
@@ -1560,7 +1604,7 @@ impl PgHandler {
                             .unwrap_or(Bson::Null)
                     }
                     ("pg_type", "typcollation") => {
-                        Bson::Int64(type_collation(int(get(row, "oid"))))
+                        Bson::Int64(type_collation(int(get(row, "oid")), &domain_colls))
                     }
                     // An array type's element; 0 for any other type.
                     ("pg_type", "typelem") => Bson::Int64(
@@ -1647,5 +1691,54 @@ fn default_text(sql: String, ty: &str) -> String {
         format!("{sql}::{ty}")
     } else {
         secantus_pgplan::generation_expression(&sql).unwrap_or(sql)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use secantus_pgplan::domains::Domain;
+
+    fn domain(name: &str, oid: i64, base: &str) -> Domain {
+        Domain {
+            name: name.into(),
+            oid,
+            base: base.into(),
+            typmod: -1,
+            not_null: false,
+            checks: Vec::new(),
+            not_valid: Vec::new(),
+            default_sql: None,
+        }
+    }
+
+    // `DefineDomain` gives a domain, and the array type beside it, its base
+    // type's `typcollation` (RP-769; measured on 15.19).
+    #[test]
+    fn a_domain_takes_its_base_types_collation() {
+        let domains = [
+            domain("dt", 67000, "text"),
+            domain("dtd", 67001, "dt"),
+            domain("dn", 67002, "name"),
+            domain("dta", 67003, "text[]"),
+            domain("di", 67004, "int4"),
+            domain("dv", 67005, "varchar"),
+        ];
+        let colls = domain_collations(&domains);
+        let array = secantus_pgplan::USER_TYPE_ARRAY_OID_OFFSET;
+        for (oid, want) in [
+            (67000, DEFAULT_COLLATION),
+            (67001, DEFAULT_COLLATION),
+            (67002, C_COLLATION),
+            (67003, DEFAULT_COLLATION),
+            (67004, 0),
+            (67005, DEFAULT_COLLATION),
+        ] {
+            assert_eq!(type_collation(oid, &colls), want, "domain {oid}");
+            assert_eq!(type_collation(oid + array, &colls), want, "array {oid}");
+        }
+        // A built-in keeps its own, and an unknown oid has none.
+        assert_eq!(type_collation(25, &colls), DEFAULT_COLLATION);
+        assert_eq!(type_collation(99999, &colls), 0);
     }
 }

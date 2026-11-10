@@ -3386,23 +3386,38 @@ statement is VALUES-only and runs there as written.
       Verify: tests/backlog/test_rp_found_rp756.py::test_a_set_operation_from_subquerys_column_is_typed
       Backlog-ID: RP-765
 
-## Found while working RP-661 (2026-11-10)
+## Found while working RP-769 (2026-11-10)
 
-Measured on a private PostgreSQL 15.19 cluster with `create domain d as
-text` and `create table t (a d, b text)`. The gap test is in
-`tests/backlog/test_rp_found_rp661.py`.
+Measured on a private PostgreSQL 15.19 cluster (locale C.UTF-8, built
+with ICU) with the `_SETUP` in `tests/backlog/test_rp_found_rp769.py`.
+Since RP-769 a domain, and its array type, takes its base type's
+collation (`catalog_fill.rs`'s `domain_collations`).
 
-- [ ] **A domain over a collatable type has no collation, so a view of
-      its column is refused.** `create view v as select a from t` is
-      `CREATE VIEW` on PostgreSQL 15.19, and so is a materialized view;
-      here both are 42P16 `no collation was derived for column "a" with
-      collatable type text`, raised by `check_new_relation_columns`.
-      `pg_attribute.attcollation` of the domain column is 0 here, and so
-      is the domain's `pg_type.typcollation`; both are 100 on 15.19, as
-      `b`'s is: `catalog_fill.rs`'s `type_collation` answers 0 for every
-      domain oid, where `DefineDomain` copies the base type's collation.
-      Verify: tests/backlog/test_rp_found_rp661.py::test_a_view_of_a_text_domain_column, tests/backlog/test_rp_found_rp661.py::test_a_text_domain_has_the_default_collation
-      Backlog-ID: RP-769
+- [ ] **`CREATE DOMAIN`'s COLLATE clause is parsed and dropped.** `create
+      domain d782c as text collate "C"` gives the domain, its array type
+      and a column of it collation 950 on PostgreSQL 15.19, and a domain
+      `collate "und-x-icu"` sorts `a` before `B` and answers `collation
+      for` with `"und-x-icu"`, as `information_schema.domains` names it;
+      here every one is the base type's `default` (100, sorted bytewise,
+      `collation_name` NULL). `create domain d as int collate "C"` is
+      42804 `collations are not supported by type integer` and a collation
+      that does not exist 42704 on 15.19; here both are made.
+      `plan_create_domain` never reads `coll_clause`, and `Domain` has no
+      field to keep it: the domain's stored document, its catalog rows and
+      the collation a column of it sorts by all need it.
+      Verify: tests/backlog/test_rp_found_rp769.py::test_create_domain_keeps_its_collate_clause
+      Backlog-ID: RP-782
+- [ ] **`information_schema.columns.collation_name` shows only a declared
+      COLLATE.** PostgreSQL 15.19's view joins `pg_collation` on
+      `attcollation` and leaves out only `pg_catalog.default`, so a `name`
+      column, a `name[]` column and a column of a domain over `name` show
+      `C` (`collation_catalog` and `collation_schema` `pg_catalog`), and a
+      declared `collate "default"` shows nothing. Here the first three
+      show NULL and the last `default`: the row is built from the
+      column's declared collation alone (`lib.rs`, "Only a column that
+      DECLARES a collation shows one").
+      Verify: tests/backlog/test_rp_found_rp769.py::test_information_schema_columns_collation_is_the_columns
+      Backlog-ID: RP-783
 
 ## Found while working RP-768 (2026-11-10)
 

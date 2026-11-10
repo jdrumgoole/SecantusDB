@@ -523,6 +523,9 @@ pub fn collatable(ty: &str) -> bool {
             | "character varying"
             | "character"
     ) || ty.ends_with("[]") && collatable(ty.trim_end_matches("[]"))
+        // A domain takes its base type's collation (`DefineDomain`), so it
+        // is collatable when its innermost base is (RP-769).
+        || crate::domains::base_type_and_typmod(ty).is_some_and(|(base, _, _)| collatable(&base))
 }
 
 /// A `COLLATE` clause's collation name.
