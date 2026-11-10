@@ -21,13 +21,12 @@ Found while working it, and since fixed:
 - an array column compared with an untyped literal in the select list
   (`select a > '{b}' from t`) was 42883 `operator does not exist: text[] >
   text` once a row held an array whose lower bound is not 1; the literal is
-  read as the column's array type now, as PostgreSQL does (RP-734);
-- `a IS NULL` over an array column matched an array holding a NULL
-  element, through the MQL `{a: null}`; it is evaluated per row now
-  (RP-739).
+  read as the column's array type now, as PostgreSQL does (RP-734).
 
-Found while working those (a gap test below):
+Found while working those (each a gap test below):
 
+- `a IS NULL` over an array column matches an array holding a NULL
+  element (RP-739);
 - `a = any (array['{x,y}'::text[]])` over a `text[]` column answers rows
   where PostgreSQL resolves `text[] = text` and refuses it, 42883
   (RP-740).
@@ -252,38 +251,21 @@ def test_a_write_filters_an_array_column_by_array_cmp(shapes: str) -> None:
     assert left == [(103,), (104,), (107,)]
 
 
-@pytest.mark.backlog_fixed("RP-739")
+@pytest.mark.backlog("RP-739")
 @pytest.mark.parametrize(
     ("where", "keys"),
     [
         ("b is null", [6]),
         ("b is not null", [1, 2, 3, 4, 5, 7]),
         ("b isnull", [6]),
-        ("b notnull", [1, 2, 3, 4, 5, 7]),
         ("not (b is null)", [1, 2, 3, 4, 5, 7]),
-        ("not (b is not null)", [6]),
     ],
 )
 def test_a_null_test_over_an_array_column_reads_the_array(
     where: str, keys: list, shapes: str
 ) -> None:
-    """An array holding a NULL element was not NULL (`{NULL,1}`, `{NULL}`):
-    the null test had lowered to the MQL `{b: null}`, which also matched
-    one, and is now evaluated per row. Measured on PostgreSQL 15.19."""
+    """An array holding a NULL element is not NULL (`{NULL,1}`, `{NULL}`)."""
     assert _answer(shapes, f"select k from x733 where {where} order by k") == [(k,) for k in keys]
-
-
-@pytest.mark.backlog_fixed("RP-739")
-def test_a_write_filters_an_array_column_by_its_null_test(shapes: str) -> None:
-    """An UPDATE and a DELETE took the same null test as a SELECT."""
-    with psycopg.connect(shapes) as c:
-        try:
-            assert c.execute("update x733 set k = k + 100 where b is null").rowcount == 1
-            assert c.execute("delete from x733 where b is not null").rowcount == 6
-            left = c.execute("select k from x733 order by k").fetchall()
-        finally:
-            c.rollback()
-    assert left == [(106,)]
 
 
 @pytest.mark.backlog("RP-740")

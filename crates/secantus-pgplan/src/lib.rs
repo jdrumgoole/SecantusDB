@@ -43451,7 +43451,6 @@ fn lower_where_plain(
         Some(N::NullTest(t)) => {
             let field = column_field(t.arg.as_deref(), def)?;
             composite_null_test_is_per_row(def, &field)?;
-            array_compare_is_per_row(def, &field)?;
             // A SQL NULL is either an explicit null or an absent field here,
             // and MQL's `null` / `$ne: null` match exactly that pair.
             match NullTestType::try_from(t.nulltesttype) {
@@ -46710,7 +46709,6 @@ fn lower_negated(
         Some(N::NullTest(t)) => {
             let field = column_field(t.arg.as_deref(), def)?;
             composite_null_test_is_per_row(def, &field)?;
-            array_compare_is_per_row(def, &field)?;
             match NullTestType::try_from(t.nulltesttype) {
                 Ok(NullTestType::IsNull) => Ok(doc! { field: { "$ne": Bson::Null } }),
                 Ok(NullTestType::IsNotNull) => Ok(doc! { field: Bson::Null }),
@@ -46906,11 +46904,6 @@ fn type_is_rowtype(t: &str) -> bool {
 /// '{x,y}'` found `{{x,y},{z,w}}`, a NULL element sorted first, and an
 /// array whose lower bound is not 1 (held as a tagged document) fell in no
 /// range at all (RP-733). Evaluated per row it compares as `array_cmp`.
-///
-/// `IS [NOT] NULL` over an array column too: the MQL `{a: null}` also
-/// matches an array holding a NULL element (`{NULL,1}`), which PostgreSQL's
-/// `ExecEvalNullTest` finds NOT NULL -- only the datum itself is tested,
-/// never its elements (RP-739).
 fn array_compare_is_per_row(def: &TableDef, field: &str) -> Result<()> {
     if ARRAY_COMPARE_AS_FILTER.with(std::cell::Cell::get) {
         return Ok(());
