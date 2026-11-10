@@ -16,13 +16,20 @@ from typing import Any
 import psycopg
 import pytest
 
+from tests.backlog.conftest import cancel_trace_window
+
 _LIST = ",".join(str(i) for i in range(200_000))
 
+# A cancel that misses its budget prints the server's cancel trace: the late
+# answers come under load and from CI, not on demand (RP-748).
+CANCEL_TRACE = True
 
-def _cancel_after(conn: Any, delay: float, sql: str) -> tuple[str, float]:
-    """Send `sql` (prepared), cancel it `delay` seconds in: the answer and
-    how long after the cancel it came."""
+
+def _cancel_after(server: Any, conn: Any, delay: float, sql: str) -> tuple[str, float, str]:
+    """Send `sql` (prepared), cancel it `delay` seconds in: the answer, how
+    long after the cancel it came, and the server's cancel trace over it."""
     timer = threading.Timer(delay, conn.cancel)
+    wall = time.time()
     t0 = time.monotonic()
     timer.start()
     try:
@@ -32,7 +39,7 @@ def _cancel_after(conn: Any, delay: float, sql: str) -> tuple[str, float]:
         state = e.sqlstate or ""
     elapsed = time.monotonic() - t0
     timer.join()
-    return state, elapsed - delay
+    return state, elapsed - delay, cancel_trace_window(server, wall, time.time())
 
 
 @pytest.mark.backlog_fixed("RP-286")
@@ -43,10 +50,10 @@ def test_a_sleep_in_a_streamed_select_list_is_cancelled(rust_pg: Any) -> None:
     with rust_pg.connect() as conn:
         conn.execute("create table if not exists rp286_t (a int)")
         conn.execute("insert into rp286_t values (1)")
-        state, late = _cancel_after(conn, 0.5, "select a, pg_sleep(2) from rp286_t")
+        state, late, trace = _cancel_after(rust_pg, conn, 0.5, "select a, pg_sleep(2) from rp286_t")
         conn.execute("drop table rp286_t")
     assert state == "57014"
-    assert late < 0.5, f"cancel honoured {late:.2f} s after it was sent"
+    assert late < 0.5, f"cancel honoured {late:.2f} s after it was sent{trace}"
 
 
 @pytest.mark.backlog_fixed("RP-202")
@@ -57,10 +64,11 @@ def test_a_cancel_while_a_huge_in_list_is_planned_over_a_table(rust_pg: Any, del
     interrupted. A cancel waited for the pass it landed in."""
     with rust_pg.connect() as conn:
         conn.execute("create table if not exists rp202_t (a int, b text)")
-        state, late = _cancel_after(
+        state, late, trace = _cancel_after(
+            rust_pg,
             conn,
             delay,
             f"select a, b, pg_sleep(3) from rp202_t where a in ({_LIST}) and b <> '{delay}'",
         )
     assert state == "57014"
-    assert late < 0.3, f"cancel honoured {late:.2f} s after it was sent"
+    assert late < 0.3, f"cancel honoured {late:.2f} s after it was sent{trace}"

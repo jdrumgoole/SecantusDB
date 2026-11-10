@@ -277,12 +277,46 @@ def mongod_rs() -> Iterator[Any]:
 
 
 @pytest.fixture(scope="module")
-def rust_pg(tmp_path_factory: pytest.TempPathFactory) -> Iterator[Any]:
-    """A running `secantusd-pg` of this module's own (`.connect()`)."""
+def rust_pg(
+    request: pytest.FixtureRequest, tmp_path_factory: pytest.TempPathFactory
+) -> Iterator[Any]:
+    """A running `secantusd-pg` of this module's own (`.connect()`).
+
+    A module that sets `CANCEL_TRACE = True` gets the server's cancel trace
+    (`SECANTUS_PG_CANCEL_TRACE`) at `server.cancel_trace`, for
+    `cancel_trace_window` to print when a cancel misses its budget."""
     from tests.test_rust_pgserver_slice import _Server
 
-    with _Server(tmp_path_factory.mktemp("rust-pg")) as server:
+    env = None
+    trace = None
+    if getattr(request.module, "CANCEL_TRACE", False):
+        trace = tmp_path_factory.mktemp("cancel-trace") / "trace.log"
+        env = {"SECANTUS_PG_CANCEL_TRACE": str(trace)}
+    with _Server(tmp_path_factory.mktemp("rust-pg"), env=env) as server:
+        server.cancel_trace = trace
         yield server
+
+
+def cancel_trace_window(server: Any, start: float, end: float) -> str:
+    """The server's cancel trace between two `time.time()` readings, each
+    line timed from `start`: what ran between a cancel's request and its
+    answer (RP-571, RP-748). Empty when the module did not ask for it."""
+    path = getattr(server, "cancel_trace", None)
+    if path is None or not path.exists():
+        return ""
+    lines = []
+    for line in path.read_text(errors="replace").splitlines():
+        stamp, _, rest = line.partition(" ")
+        try:
+            at = int(stamp) / 1e6
+        except ValueError:
+            continue
+        if start - 0.05 <= at <= end + 0.05:
+            lines.append(f"  {at - start:+8.3f} {rest}")
+    # The walk checks repeat by the thousand; keep the window readable.
+    if len(lines) > 400:
+        lines = lines[:150] + [f"  ... {len(lines) - 300} lines ..."] + lines[-150:]
+    return "\ncancel trace (seconds from the statement's start):\n" + "\n".join(lines)
 
 
 @pytest.fixture

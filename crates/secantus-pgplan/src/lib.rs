@@ -148,6 +148,7 @@ pub use funcsig::{select_routine, RoutineChoice};
 mod optype;
 mod semijoin;
 mod semijoin_hash;
+mod sort_input;
 pub use errpos::{alter_finds_relation_by_name, error_position};
 pub use semijoin_hash::{with_fresh_subquery_cache, with_scan_cache, ScanCache};
 pub mod alter_routine;
@@ -1645,6 +1646,13 @@ pub struct Select {
     /// (a join, a FROM-subquery, a view): the executor locks the base-table
     /// rows behind the rows it returns (see [`lock_targets`]).
     pub lock_clauses: Vec<LockClause>,
+    /// Per output column, parallel to `columns`: computed BELOW the ORDER
+    /// BY's Sort, once a row in scan order (`true`), or postponed to the
+    /// projection above it (`false`) -- PostgreSQL's
+    /// `make_sort_input_target` (RP-732, `sort_input.rs`). Empty when
+    /// there is no ORDER BY, which leaves every computed column to the
+    /// projection as the rows are sent.
+    pub sort_input: Vec<bool>,
 }
 
 /// How a `SELECT ... FOR UPDATE` treats a row another transaction holds.
@@ -7841,6 +7849,146 @@ fn assignment_pathway(source: &str, target: &str) -> bool {
     funcsig::category_of_oid(t) == Some('S')
 }
 
+/// Does PL/pgSQL assign a value of type `source` to a variable declared
+/// `target` through the types' text I/O rather than by a cast? PL/pgSQL
+/// coerces with `COERCION_PLPGSQL` (`exec_cast_value` ->
+/// `get_cast_hashentry`), which lies between ASSIGNMENT and EXPLICIT: an
+/// implicit or assignment cast is used, an explicit-only one is not, and
+/// when `find_coercion_pathway` finds nothing else it falls back to
+/// `COERCEVIAIO` -- the source's output function, then the target's input.
+/// So `x int := true` reaches `int4in` as `t` and is 22P02, and
+/// `x date := 5` is 22007, not 42846 (RP-712).
+///
+/// Both sides are seen through a domain to its base (`getBaseType`).
+/// Answers `false` when an ordinary cast does the same: the same type; a
+/// type of the string category on the source side, whose explicit cast is
+/// already the I/O conversion; a type outside the built-in catalog (a
+/// user's enum or composite), a pseudo-type or `unknown`, which are left to
+/// the caller's cast.
+pub fn plpgsql_assigns_via_io(source: &str, target: &str) -> bool {
+    let (Some(s), Some(t)) = (plpgsql_base(source), plpgsql_base(target)) else {
+        return false;
+    };
+    if s == t {
+        return false;
+    }
+    let (Some(so), Some(to)) = (pgtypes::oid_of_name(&s), pgtypes::oid_of_name(&t)) else {
+        return false;
+    };
+    let category = |oid: i64, name: &str| {
+        let element = name.trim_end_matches("[]");
+        let oid = if element.len() == name.len() {
+            Some(oid)
+        } else {
+            pgtypes::oid_of_name(element)
+        };
+        oid.and_then(funcsig::category_of_oid)
+    };
+    match (category(so, &s), category(to, &t)) {
+        (Some('S' | 'P' | 'X'), _) | (_, Some('P' | 'X')) | (None, _) | (_, None) => false,
+        _ => !assignment_pathway(&s, &t),
+    }
+}
+
+/// A type named as a PL/pgSQL declaration or a described column names it,
+/// seen through a domain, in the planner's spelling.
+fn plpgsql_base(t: &str) -> Option<String> {
+    let (name, _) = declared_type_and_typmod(t)?;
+    let name = match domains::base_type_and_typmod(&name) {
+        Some((b, ..)) => declared_type_and_typmod(&b).map_or(b, |(n, _)| n),
+        None => name,
+    };
+    Some(one_array_level(&name))
+}
+
+/// Are the output function of `source` and the input function of
+/// `target` both IMMUTABLE in PostgreSQL 15's `pg_proc`, so that
+/// `eval_const_expressions` folds a `CoerceViaIO` between them over a
+/// constant at plan time? An array converts element by element
+/// (`ArrayCoerceExpr`), so its elements' functions decide. Where they
+/// fold, a PL/pgSQL assignment's conversion error is raised while its
+/// query is planned, under the `PL/pgSQL assignment` frame; where not, it
+/// is raised by the executor's simple-expression path, which has none.
+pub fn plpgsql_io_folds(source: &str, target: &str) -> bool {
+    // `typinput` / `typoutput` of provolatile `s`, measured on 15.19
+    // (`oid < 16384`); every other built-in's are `i`.
+    fn stable_io(t: &str, input: bool) -> bool {
+        let both = matches!(
+            t,
+            "date"
+                | "interval"
+                | "money"
+                | "timestamp"
+                | "timestamptz"
+                | "aclitem"
+                | "record"
+                | "int4range"
+                | "int8range"
+                | "numrange"
+                | "daterange"
+                | "tsrange"
+                | "tstzrange"
+                | "int4multirange"
+                | "int8multirange"
+                | "nummultirange"
+                | "datemultirange"
+                | "tsmultirange"
+                | "tstzmultirange"
+        ) || t.starts_with("reg");
+        both || (input && matches!(t, "time" | "timetz" | "xml"))
+    }
+    let (Some(s), Some(t)) = (plpgsql_base(source), plpgsql_base(target)) else {
+        return false;
+    };
+    let (s, t) = (s.trim_end_matches("[]"), t.trim_end_matches("[]"));
+    !stable_io(s, false) && !stable_io(t, true)
+}
+
+#[cfg(test)]
+mod plpgsql_assigns_via_io_tests {
+    use super::plpgsql_assigns_via_io as io;
+
+    #[test]
+    fn an_explicit_only_cast_or_none_converts_through_text() {
+        // bool <-> int4 are explicit-only casts (`int4(bool)`, `bool(int4)`).
+        assert!(io("bool", "int"));
+        assert!(io("int4", "boolean"));
+        // No pg_cast row at all, and neither side a string type.
+        assert!(io("int4", "date"));
+        // An array coerces element by element: bool -> int4 has no path.
+        assert!(io("bool[]", "int4[]"));
+    }
+
+    #[test]
+    fn an_implicit_or_assignment_cast_is_used() {
+        assert!(!io("int4", "int8"));
+        assert!(!io("int8", "int4"));
+        assert!(!io("numeric", "int4"));
+        // Into the string category is always an assignment coercion.
+        assert!(!io("bool", "text"));
+        assert!(!io("bool", "varchar(3)"));
+        // Out of it, the explicit cast already is the I/O conversion.
+        assert!(!io("text", "int4"));
+        assert!(!io("int4", "int4"));
+        assert!(!io("int4[]", "int8[]"));
+    }
+
+    #[test]
+    fn a_conversion_folds_only_through_immutable_io_functions() {
+        use super::plpgsql_io_folds as folds;
+        assert!(folds("bool", "int4"));
+        assert!(folds("bool[]", "int4[]"));
+        assert!(folds("int4", "inet"));
+        // `date_in`, `range_in` and `cash_out` are STABLE.
+        assert!(!folds("int4", "date"));
+        assert!(!folds("int4", "int4range"));
+        assert!(!folds("money", "float8"));
+        // `time_out` is immutable, `time_in` is not.
+        assert!(folds("time", "int4"));
+        assert!(!folds("int4", "time"));
+    }
+}
+
 /// `int4[][]` names the same type as `int4[]`: PostgreSQL records no
 /// dimension count in a type.
 fn one_array_level(name: &str) -> String {
@@ -13258,31 +13406,49 @@ pub fn avg_result_type(source: Option<&str>) -> &'static str {
 /// type of the overload `func_select_candidate` picks among PostgreSQL 15's
 /// 22 (`pg_aggregate`), a domain reduced to its base type first. Most types
 /// have their own, so keep their type; the others take the one an implicit
-/// cast reaches: `varchar`, `name` and `"char"` are `max(text)` (measured
-/// on 15.19, RP-681). A polymorphic answer (`anyarray`, `anyenum`) is the
-/// input type itself.
+/// cast reaches: `varchar`, `name` and `"char"` are `max(text)` (RP-681), a
+/// `reg*` is `max(oid)` and `cidr` is `max(inet)` (RP-706), all measured on
+/// 15.19. A polymorphic answer (`anyarray`, `anyenum`) is the input type
+/// itself.
 ///
-/// Only a `text` answer is taken, whose value is the input's string as it
-/// is. A `reg*` is `max(oid)` and `cidr` is `max(inet)` on 15.19 too, but
-/// there each input is COERCED before it is compared (`max(regclass)` is
-/// the largest OID, not name), which the engines computing min / max do not
-/// do yet: those keep their input type (RP-706).
+/// Where the answer is another type, each input is coerced to it before it
+/// is compared ([`min_max_input_type`]): `max(regclass)` is the largest
+/// OID, not the largest name.
 pub fn min_max_result_type(source: &str) -> String {
     let base = domains::base_type_and_typmod(source).map_or_else(|| source.to_string(), |b| b.0);
     if funcsig::has_exact("max", std::slice::from_ref(&base)) {
         return base;
     }
     match funcsig::selected_result_type("max", std::slice::from_ref(&base)) {
-        Some(t) if t == "text" => t,
-        _ if base == source => base,
-        // A domain over a type with no `max` of its own and no text
-        // answer: as before, its own type.
-        _ => source.to_string(),
+        Some(t) => t,
+        None if base == source => base,
+        // A domain over a type with no `max` of its own and none an
+        // implicit cast reaches: as before, its own type.
+        None => source.to_string(),
     }
+}
+
+/// The type a `min` / `max` over `source` coerces each input to before
+/// comparing, when its overload takes another one whose values are not
+/// the input's as they are: `oid` for a `reg*` (`max(oid)`, so the largest
+/// OID wins rather than the largest name) and `inet` for a `cidr`. `None`
+/// when the inputs compare as they are, a `text` answer included: a
+/// `varchar`, `name` or `"char"` value is its string.
+pub fn min_max_input_type(source: &str) -> Option<String> {
+    let base = domains::base_type_and_typmod(source).map_or_else(|| source.to_string(), |b| b.0);
+    let target = min_max_result_type(source);
+    (target != base && target != source && target != "text").then_some(target)
+}
+
+/// One input of a `min` / `max` coerced to [`min_max_input_type`]'s type,
+/// as PostgreSQL's implicit cast does before the aggregate sees it.
+pub fn coerce_min_max_input(value: &Bson, target: &str) -> Result<Bson> {
+    cast_value(value.clone(), target)
 }
 
 #[cfg(test)]
 mod min_max_result_type_tests {
+    use super::min_max_input_type as input;
     use super::min_max_result_type as t;
 
     #[test]
@@ -13296,13 +13462,32 @@ mod min_max_result_type_tests {
             "text", "bpchar", "int2", "int4", "numeric", "date", "inet", "oid",
         ] {
             assert_eq!(t(own), own);
+            assert_eq!(input(own), None);
         }
         // `max(anyarray)`: the array type itself.
         assert_eq!(t("varchar[]"), "varchar[]");
-        // `max(oid)` / `max(inet)` on 15.19, kept until the input is
-        // coerced (RP-706).
-        assert_eq!(t("regclass"), "regclass");
-        assert_eq!(t("cidr"), "cidr");
+        assert_eq!(input("varchar[]"), None);
+        // `max(oid)` / `max(inet)` on 15.19, each input coerced (RP-706).
+        for reg in [
+            "regclass",
+            "regtype",
+            "regproc",
+            "regprocedure",
+            "regoper",
+            "regoperator",
+            "regnamespace",
+            "regrole",
+            "regconfig",
+            "regdictionary",
+            "regcollation",
+        ] {
+            assert_eq!(t(reg), "oid", "{reg}");
+            assert_eq!(input(reg).as_deref(), Some("oid"), "{reg}");
+        }
+        assert_eq!(t("cidr"), "inet");
+        assert_eq!(input("cidr").as_deref(), Some("inet"));
+        // A text answer compares the strings as they are.
+        assert_eq!(input("varchar"), None);
     }
 }
 
@@ -16385,6 +16570,7 @@ fn plan_series_select(
             .find(|(out, _)| out == name)
             .map(|(_, f)| f.clone())
     })?;
+    let sort_input = sort_input::sort_input_columns(s, &columns);
 
     Ok(Statement::Select(Select {
         table: String::new(),
@@ -16403,6 +16589,7 @@ fn plan_series_select(
         distinct,
         lock: None,
         lock_clauses: Vec::new(),
+        sort_input,
     }))
 }
 
@@ -16681,7 +16868,11 @@ fn expression_column_name(node: &pg_query::protobuf::Node) -> String {
             Ok(SubLinkType::ArraySublink) => "array".to_string(),
             Ok(SubLinkType::ExprSublink) => {
                 match sl.subselect.as_deref().and_then(|n| n.node.as_ref()) {
+                    // A set operation's targets are its leftmost arm's
+                    // (`transformSetOperationStmt`), which is where the
+                    // analysed query's first `resname` comes from (RP-698).
                     Some(N::SelectStmt(sel)) => {
+                        let sel = prune_outputs::leftmost_arm(sel);
                         match sel.target_list.first().and_then(|t| t.node.as_ref()) {
                             Some(N::ResTarget(rt)) if !rt.name.is_empty() => rt.name.clone(),
                             Some(N::ResTarget(rt)) => rt
@@ -17327,6 +17518,41 @@ pub(crate) fn trim_bpchar(v: Bson) -> Bson {
         Bson::String(t) => Bson::String(t.trim_end_matches(' ').to_string()),
         other => other,
     }
+}
+
+/// The two operands of a comparison (`=`, `<>`, the orderings) as the
+/// operator their types resolve to compares them, where one side is a
+/// `char(n)`: against another `char(n)`, an untyped literal or a `varchar`
+/// (read as `bpchar` by the implicit cast) both sides are `bpchar`, and
+/// `bpchareq` / `bpcharcmp` ignore the trailing blanks on each; against
+/// `text` the operator is `texteq`, the `char(n)` side cast to text (its
+/// blanks dropped, as `rtrim1` does) and the text side as it is. The binary
+/// operators, a simple CASE's `test = label` and NULLIF's `a = b` all
+/// compare through it (RP-726, RP-737).
+fn bpchar_compared_operands(
+    l: Option<&pg_query::protobuf::Node>,
+    mut lhs: Bson,
+    r: Option<&pg_query::protobuf::Node>,
+    mut rhs: Bson,
+) -> (Bson, Bson) {
+    let bp = |n: Option<&pg_query::protobuf::Node>, v: &Bson| {
+        n.is_some_and(|n| is_bpchar_type(&static_type(n, v)))
+    };
+    let (lb, rb) = (bp(l, &lhs), bp(r, &rhs));
+    if !(lb || rb) {
+        return (lhs, rhs);
+    }
+    let vc = |n: Option<&pg_query::protobuf::Node>, v: &Bson| {
+        n.is_some_and(|n| is_varchar_type(&static_type(n, v)))
+    };
+    let (lu, ru) = (unknown_operand(l), unknown_operand(r));
+    if lb || (rb && (lu || vc(l, &lhs))) {
+        lhs = trim_bpchar(lhs);
+    }
+    if rb || (lb && (ru || vc(r, &rhs))) {
+        rhs = trim_bpchar(rhs);
+    }
+    (lhs, rhs)
 }
 
 /// Which sides of `x op ANY / ALL (array)` drop their trailing blanks:
@@ -18790,8 +19016,12 @@ fn plan_aggregate_item(
             }
         }
     }
-    // A FILTER no MQL filter can express -- one holding a subquery, or the
-    // per-row call a correlated one became -- is evaluated per row (below).
+    // A FILTER no MQL filter can express -- one holding a subquery, the
+    // per-row call a correlated one became, or one the lowering refuses as
+    // `Unsupported` (an array column's null test or comparison, RP-739 /
+    // RP-733) -- is evaluated per row (below), as a WHERE's residual is
+    // (`lower_where_or_residual`). An undefined column or a bad type stays
+    // the error it is.
     let mut sublink_filter = None;
     let filter = match f.agg_filter.as_deref() {
         None => None,
@@ -18806,6 +19036,10 @@ fn plan_aggregate_item(
         Some(node) => match lower_where(node, def, params) {
             Ok(d) => Some(d),
             Err(_) if correlated::has_correlated_call(node) => {
+                sublink_filter = Some(node);
+                None
+            }
+            Err(Error::Unsupported(_)) => {
                 sublink_filter = Some(node);
                 None
             }
@@ -18876,6 +19110,13 @@ fn plan_aggregate_item(
         item.filter = Some(bson::doc! { field.clone(): true });
         item.filter_field = Some(field);
         item.filter_expr = expr;
+        // `count(*)` takes no argument to resolve: the per-row FILTER is
+        // all it reads (`count(*) filter (where b is null)`, RP-739).
+        if name == "count" && f.agg_star {
+            item.func = AggFunc::CountStar;
+            item.order = plan_aggregate_order(&f.agg_order, def, params)?;
+            return Ok(item);
+        }
     }
     if f.agg_within_group {
         // `percentile_cont(0.5) WITHIN GROUP (ORDER BY v)`: the ordered
@@ -23019,8 +23260,12 @@ fn resolve_one_sublink(
     // WITH items see and hide (`under_visible_ctes`). Added AFTER the
     // subquery's own resolution: they are already resolved.
     let mut inner = under_visible_ctes(&inner)?;
-    if sl.sub_link_type == SubLinkType::ArraySublink as i32 {
-        cast_array_subquery_column(&mut inner, lookup);
+    // An ARRAY or a scalar (EXPR) subquery is of its one column's type,
+    // which over a domain column is the domain (RP-569, RP-665).
+    if sl.sub_link_type == SubLinkType::ArraySublink as i32
+        || sl.sub_link_type == SubLinkType::ExprSublink as i32
+    {
+        cast_subquery_column_to_domain(&mut inner, lookup);
     }
 
     // A QUALIFIED reference to something outside the subquery has to be
@@ -23177,6 +23422,9 @@ fn resolve_one_sublink(
                     // parameter type names one (RP-569).
                     // So is a `char(n)[]` / `varchar(n)[]` one, whose
                     // elements the cast at its modifier pads (RP-666).
+                    // A `text` column is declared too: left a bare
+                    // parameter, `pg_typeof((select max(v) ...))` over one
+                    // was 42P18 where PostgreSQL answers `text` (RP-707).
                     let cast = |t: &str| {
                         let base = t.strip_suffix("[]").unwrap_or(t);
                         sublink_value_cast(t)
@@ -23185,7 +23433,7 @@ fn resolve_one_sublink(
                     };
                     if let Some(t) = ty
                         .as_deref()
-                        .filter(|t| !cast(t) && !matches!(*t, "" | "unknown" | "record" | "text"))
+                        .filter(|t| !cast(t) && !matches!(*t, "" | "unknown" | "record"))
                     {
                         declare_sublink_param(params.len() - 1, t);
                     }
@@ -23230,6 +23478,12 @@ fn resolve_one_sublink(
                     // that returned nothing is a bare NULL.
                     if ty == "record" {
                         return Ok(null);
+                    }
+                    // A NULL of the column's domain is no coercion into it:
+                    // no row is a NULL `ExecSetParamPlan` checks nothing of,
+                    // even a NOT NULL domain's (RP-665).
+                    if domains::user_domain(ty.strip_suffix("[]").unwrap_or(&ty)).is_some() {
+                        return Ok(relabel_cast(null, &ty));
                     }
                     // A NULL of the column's type at its modifier, as an
                     // EXPR sublink is typed whatever it returns (RP-666).
@@ -23371,6 +23625,45 @@ fn resolve_one_sublink(
                     _ => None,
                 })
                 .unwrap_or_else(|| "=".to_string());
+            // Rows that are themselves arrays cannot ride in one array: an
+            // array's elements are walked whole-array, every dimension at
+            // once (RP-740), so `array[1] = any (select array[1])` would
+            // meet `1`. Each row is its own comparison instead, OR'd for
+            // ANY and AND'd for ALL, whose three-valued logic is ANY's and
+            // ALL's over a non-empty list.
+            if values
+                .iter()
+                .any(|v| matches!(v, Bson::Array(_)) || arrays::is_bounded(v))
+            {
+                let arms: Vec<pg_query::protobuf::Node> = values
+                    .into_iter()
+                    .map(|v| pg_query::protobuf::Node {
+                        node: Some(N::AExpr(Box::new(AExpr {
+                            kind: AExprKind::AexprOp as i32,
+                            name: vec![string_node(&op)],
+                            lexpr: Some(Box::new(test.clone())),
+                            rexpr: Some(Box::new(param_node(params, v))),
+                            location: sl.location,
+                        }))),
+                    })
+                    .collect();
+                if arms.len() == 1 {
+                    return Ok(arms.into_iter().next().expect("one"));
+                }
+                let boolop = if kind == SubLinkType::AnySublink {
+                    BoolExprType::OrExpr
+                } else {
+                    BoolExprType::AndExpr
+                };
+                return Ok(pg_query::protobuf::Node {
+                    node: Some(N::BoolExpr(Box::new(pg_query::protobuf::BoolExpr {
+                        boolop: boolop as i32,
+                        args: arms,
+                        location: -1,
+                        ..Default::default()
+                    }))),
+                });
+            }
             let kind = if kind == SubLinkType::AnySublink {
                 AExprKind::AexprOpAny
             } else {
@@ -23509,6 +23802,17 @@ fn row_subquery_comparison(
 /// in `s`'s own FROM -- that is, a correlation. `None` when every reference
 /// resolves inside the subquery.
 fn foreign_qualifier(s: &pg_query::protobuf::SelectStmt) -> Option<String> {
+    // A set operation's arms are query levels of their own, each reading
+    // the outer row as any subquery does (`transformSetOperationTree`
+    // analyses each leaf with the same parent state): `(select v.a
+    // intersect select 5)` is correlated through its left arm. Its own
+    // FROM, WHERE and targets are empty, so only the arms say (RP-698).
+    if s.larg.is_some() || s.rarg.is_some() {
+        return [s.larg.as_deref(), s.rarg.as_deref()]
+            .into_iter()
+            .flatten()
+            .find_map(foreign_qualifier);
+    }
     // An ALIASED relation goes by its alias only, as in PostgreSQL: in
     // `(SELECT count(*) FROM t1 AS x WHERE x.b < t1.b)`, `t1.b` is the OUTER
     // row's. Counting the hidden table name as an inner one planned the
@@ -24901,7 +25205,7 @@ fn timezone_functions_as_views(
 /// a table's, a join's, a WITH item's or a FROM subquery's
 /// (`domain_scope`, RP-657); `None` when nothing changed. An ARRAY
 /// subquery's column is cast where the subquery is resolved
-/// (`cast_array_subquery_column`).
+/// (`cast_subquery_column_to_domain`).
 fn rewrite_domain_typeof(
     s: &pg_query::protobuf::SelectStmt,
     lookup: &dyn Fn(&str) -> Option<TableDef>,
@@ -24955,12 +25259,14 @@ fn domain_columns_of(def: &TableDef) -> std::collections::HashMap<String, String
 }
 
 /// `ARRAY(select c ...)` over a domain column `c` is the domain's array,
-/// as `ARRAY[c]` is: the subquery's one column is cast to its domain before
-/// the subquery is planned (RP-569) -- reached through a join, a WITH or a
+/// as `ARRAY[c]` is, and a scalar `(select c ...)` is of the domain
+/// (`exprType` of an EXPR SubLink is its column's, RP-665): the subquery's
+/// one column is cast to its domain before the subquery is planned
+/// (RP-569) -- reached through a join, a WITH or a
 /// FROM subquery, or in every branch of a set operation whose branches are
 /// all of the domain (RP-657). More than one column is the 42601 the
 /// subquery reports. The cast is a relabel, which checks nothing (RP-655).
-fn cast_array_subquery_column(
+fn cast_subquery_column_to_domain(
     inner: &mut pg_query::protobuf::SelectStmt,
     lookup: &dyn Fn(&str) -> Option<TableDef>,
 ) {
@@ -26967,6 +27273,7 @@ fn plan_select_rest(
     } else {
         Vec::new()
     };
+    let sort_input = sort_input::sort_input_columns(s, &columns);
 
     Ok(Statement::Select(Select {
         series: None,
@@ -26985,6 +27292,7 @@ fn plan_select_rest(
         distinct,
         lock,
         lock_clauses,
+        sort_input,
     }))
 }
 
@@ -27531,6 +27839,7 @@ fn plan_join_plain_select(
         distinct,
         lock: None,
         lock_clauses: Vec::new(),
+        sort_input: Vec::new(),
     }))
 }
 
@@ -29882,13 +30191,16 @@ fn static_type_uncached(node: &pg_query::protobuf::Node, value: &Bson) -> String
                             && !matches!(r.node.as_ref(), Some(N::AConst(c)) if c.isnull
                                 || matches!(c.val, Some(pg_query::protobuf::a_const::Val::Sval(_)))) =>
                     {
-                        static_type(r, &Bson::Null)
+                        domain_base(static_type(r, &Bson::Null))
                     }
                     // Typed from the `=` PostgreSQL resolves: its LEFT input
-                    // type, which an implicit cast may widen (RP-076).
+                    // type, which an implicit cast may widen (RP-076), and a
+                    // domain's is its base's operator's (RP-665).
                     (Some(l), Some(r)) => {
-                        let lt = static_type(l, value);
-                        let rt = static_type(r, &Bson::Null);
+                        // An untyped right side reads as the left's type
+                        // (RP-741).
+                        let lt = domain_base(static_type(l, value));
+                        let rt = nullif_right_type(r, &Bson::Null, &lt);
                         funcsig::operator_left_input("=", &lt, &rt).unwrap_or(lt)
                     }
                     (Some(l), _) => static_type(l, value),
@@ -30462,7 +30774,18 @@ fn case_results(c: &pg_query::protobuf::CaseExpr) -> Vec<&pg_query::protobuf::No
             _ => None,
         })
         .collect();
-    out.extend(c.defresult.as_deref());
+    // No ELSE is an ELSE NULL (`transformCaseExpr`), an untyped input to
+    // the CASE's `select_common_type`, so `case when p then d end` over a
+    // domain `d` is of its base (RP-665).
+    static ELSE_NULL: std::sync::LazyLock<pg_query::protobuf::Node> =
+        std::sync::LazyLock::new(|| pg_query::protobuf::Node {
+            node: Some(N::AConst(pg_query::protobuf::AConst {
+                isnull: true,
+                location: -1,
+                val: None,
+            })),
+        });
+    out.push(c.defresult.as_deref().unwrap_or(&ELSE_NULL));
     out
 }
 
@@ -30477,9 +30800,18 @@ fn common_type(nodes: &[&pg_query::protobuf::Node]) -> String {
         }
         _ => false,
     };
+    // Only inputs all of exactly one type keep it, which is the one way a
+    // domain is the result; otherwise each is resolved by its domain's base
+    // (`getBaseType`), so `coalesce(d, 0)` is the base type (RP-665).
+    let typed: Vec<String> = nodes
+        .iter()
+        .filter(|n| !untyped(n))
+        .map(|n| static_type(n, &Bson::Null))
+        .collect();
+    let same = typed.len() == nodes.len() && typed.windows(2).all(|w| w[0] == w[1]);
     let mut out: Option<String> = None;
-    for n in nodes.iter().filter(|n| !untyped(n)) {
-        let t = static_type(n, &Bson::Null);
+    for t in typed {
+        let t = if same { t } else { domain_base(t) };
         out = Some(match out {
             None => t,
             Some(cur) if cur == t => cur,
@@ -30489,6 +30821,11 @@ fn common_type(nodes: &[&pg_query::protobuf::Node]) -> String {
         });
     }
     out.unwrap_or_else(|| "text".to_string())
+}
+
+/// `getBaseType`: a domain's innermost base type, any other type as it is.
+fn domain_base(t: String) -> String {
+    domains::base_type_and_typmod(&t).map_or(t, |(base, _, _)| base)
 }
 
 /// The date/time type two of them meet as: `date` widens to `timestamp`,
@@ -30964,6 +31301,7 @@ fn plan_select_srf(
         distinct: plan_distinct(s, &|_| None)?,
         lock: None,
         lock_clauses: Vec::new(),
+        sort_input: Vec::new(),
     })))
 }
 
@@ -40295,6 +40633,23 @@ fn unknown_operand(n: Option<&pg_query::protobuf::Node>) -> bool {
     }
 }
 
+/// The type NULLIF's `=` reads its right operand as, given the left one's
+/// type `lt`: an untyped literal or a bare NULL is `unknown`, which operator
+/// resolution reads as the other side's type (`oper_select_candidate`'s
+/// "unknown is the same type as the known input"). So
+/// `nullif('ab'::char(4), 'zz')` is `bpchareq`, the result the left operand
+/// as it is, `character` with its padding; `nullif('a'::varchar, 'b')` is
+/// still `texteq` and `text`, as `varchar = varchar` resolves there
+/// (RP-741).
+fn nullif_right_type(r: &pg_query::protobuf::Node, v: &Bson, lt: &str) -> String {
+    let null = matches!(r.node.as_ref(), Some(N::AConst(c)) if c.isnull);
+    if null || unknown_operand(Some(r)) {
+        lt.to_string()
+    } else {
+        static_type(r, v)
+    }
+}
+
 /// The full-text operators: `@@` / `@@@` (with `text` sides converted as
 /// PostgreSQL's `ts_match_tt` / `ts_match_tq` do), `||` / `&&` / `<->` on
 /// queries, `||` on vectors. `None`: not a full-text operation.
@@ -43416,6 +43771,7 @@ fn lower_where_plain(
         Some(N::NullTest(t)) => {
             let field = column_field(t.arg.as_deref(), def)?;
             composite_null_test_is_per_row(def, &field)?;
+            array_compare_is_per_row(def, &field)?;
             // A SQL NULL is either an explicit null or an absent field here,
             // and MQL's `null` / `$ne: null` match exactly that pair.
             match NullTestType::try_from(t.nulltesttype) {
@@ -45420,9 +45776,19 @@ fn const_value_node(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result<
                 Some(subject) => {
                     let label =
                         case_label(c.arg.as_deref(), subject, test, const_value(test, params)?)?;
-                    *subject != Bson::Null
+                    // `test = label` through the operator the two types
+                    // resolve to: a `char(n)` side against a `varchar` one
+                    // is `bpchareq`, against `text` `texteq` over its text,
+                    // so its padding does not count (RP-737).
+                    let (s, label) = bpchar_compared_operands(
+                        c.arg.as_deref(),
+                        subject.clone(),
+                        Some(test),
+                        label,
+                    );
+                    s != Bson::Null
                         && label != Bson::Null
-                        && eval_binary("=", subject.clone(), label)? == Bson::Boolean(true)
+                        && eval_binary("=", s, label)? == Bson::Boolean(true)
                 }
                 // Searched form: only TRUE takes the branch.
                 None => const_value(test, params)? == Bson::Boolean(true),
@@ -45669,9 +46035,18 @@ fn const_value_node(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result<
                 }
                 return Ok(lhs);
             }
-            if lhs != Bson::Null
-                && rhs != Bson::Null
-                && compare_constants(&lhs, &rhs) == Some(std::cmp::Ordering::Equal)
+            // `a = b` through the operator the two types resolve to: a
+            // `char(n)` side's padding does not count (RP-737). The value
+            // returned is still the left operand as it was.
+            let (lc, rc) = bpchar_compared_operands(
+                e.lexpr.as_deref(),
+                lhs.clone(),
+                e.rexpr.as_deref(),
+                rhs.clone(),
+            );
+            if lc != Bson::Null
+                && rc != Bson::Null
+                && compare_constants(&lc, &rc) == Some(std::cmp::Ordering::Equal)
             {
                 return Ok(Bson::Null);
             }
@@ -45680,7 +46055,7 @@ fn const_value_node(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result<
             if let (Some(l), Some(r)) = (e.lexpr.as_deref(), e.rexpr.as_deref()) {
                 if lhs != Bson::Null && !l_bare {
                     let lt = static_type(l, &lhs);
-                    let rt = static_type(r, &rhs);
+                    let rt = nullif_right_type(r, &rhs, &lt);
                     if let Some(input) = funcsig::operator_left_input("=", &lt, &rt) {
                         if input != lt {
                             // A `char(n)` loses its padding on the way to
@@ -45717,7 +46092,9 @@ fn const_value_node(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result<
             let rhs = const_value(rexpr, params)?;
             // A vector array's elements are compared as the vectors they are,
             // not as the text they are carried as inside it (RP-575).
-            let rhs = match vectors::vector_array_element(&static_type(rexpr, &rhs)) {
+            let vector =
+                vectors::vector_array_element(&static_type(rexpr, &rhs)).map(str::to_string);
+            let rhs = match vector.as_deref() {
                 Some(elem) => {
                     let lower = arrays::lower_bounds(&rhs);
                     arrays::bounded(vectors::scalars(arrays::strip(&rhs), elem), &lower)
@@ -45751,13 +46128,19 @@ fn const_value_node(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result<
                     Bson::String(t) => json::jsonb_value_key(t).map_or(v, Bson::String),
                     _ => v,
                 };
-                let rhs = match arrays::strip(&rhs) {
+                let rhs = match any_elements(&rhs) {
                     Bson::Array(items) => Bson::Array(items.into_iter().map(key).collect()),
                     other => other,
                 };
                 return eval_scalar_array_const(&op, key(lhs), rhs, is_any);
             }
-            return eval_scalar_array_const(&op, lhs, arrays::strip(&rhs), is_any);
+            // A vector is itself held as an array: its elements stay whole.
+            let rhs = if vector.is_some() {
+                arrays::strip(&rhs)
+            } else {
+                any_elements(&rhs)
+            };
+            return eval_scalar_array_const(&op, lhs, rhs, is_any);
         }
         // `LIKE` / `ILIKE` as a VALUE (`select a like 'a%'`), not just as a
         // WHERE predicate. Their own AExpr kind, so they never reached the
@@ -46072,23 +46455,12 @@ fn const_value_node(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result<
             };
             let (lb, rb) = (bp(e.lexpr.as_deref(), &lhs), bp(e.rexpr.as_deref(), &rhs));
             if lb || rb {
-                let (lu, ru) = (
-                    unknown_operand(e.lexpr.as_deref()),
-                    unknown_operand(e.rexpr.as_deref()),
-                );
                 if matches!(op.as_str(), "=" | "<>" | "!=" | "<" | "<=" | ">" | ">=") {
                     // A `varchar` side against a `char(n)` one is read as
                     // `bpchar` too: `'ab '::varchar = 'ab'::char(3)` is true
                     // on 15.19 (RP-726).
-                    let vc = |n: Option<&pg_query::protobuf::Node>, v: &Bson| {
-                        n.is_some_and(|n| is_varchar_type(&static_type(n, v)))
-                    };
-                    if lb || (rb && (lu || vc(e.lexpr.as_deref(), &lhs))) {
-                        lhs = trim_bpchar(lhs);
-                    }
-                    if rb || (lb && (ru || vc(e.rexpr.as_deref(), &rhs))) {
-                        rhs = trim_bpchar(rhs);
-                    }
+                    (lhs, rhs) =
+                        bpchar_compared_operands(e.lexpr.as_deref(), lhs, e.rexpr.as_deref(), rhs);
                 } else if op == "||" {
                     if lb {
                         lhs = trim_bpchar(lhs);
@@ -46666,6 +47038,7 @@ fn lower_negated(
         Some(N::NullTest(t)) => {
             let field = column_field(t.arg.as_deref(), def)?;
             composite_null_test_is_per_row(def, &field)?;
+            array_compare_is_per_row(def, &field)?;
             match NullTestType::try_from(t.nulltesttype) {
                 Ok(NullTestType::IsNull) => Ok(doc! { field: { "$ne": Bson::Null } }),
                 Ok(NullTestType::IsNotNull) => Ok(doc! { field: Bson::Null }),
@@ -46861,6 +47234,11 @@ fn type_is_rowtype(t: &str) -> bool {
 /// '{x,y}'` found `{{x,y},{z,w}}`, a NULL element sorted first, and an
 /// array whose lower bound is not 1 (held as a tagged document) fell in no
 /// range at all (RP-733). Evaluated per row it compares as `array_cmp`.
+///
+/// `IS [NOT] NULL` over an array column too: the MQL `{a: null}` also
+/// matches an array holding a NULL element (`{NULL,1}`), which PostgreSQL's
+/// `ExecEvalNullTest` finds NOT NULL -- only the datum itself is tested,
+/// never its elements (RP-739).
 fn array_compare_is_per_row(def: &TableDef, field: &str) -> Result<()> {
     if ARRAY_COMPARE_AS_FILTER.with(std::cell::Cell::get) {
         return Ok(());
@@ -47832,6 +48210,17 @@ fn op_to_mql(op: &str) -> Option<&'static str> {
     })
 }
 
+/// The elements `x op ANY / ALL (array)` compares `x` with: every element,
+/// in row-major order, whatever the array's dimensions or bounds
+/// (`ExecEvalScalarArrayOp` walks `ARR_DATA_PTR`), so `1 = any ('{{1}}')`
+/// is true (RP-740). Anything that is not an array is returned unchanged.
+fn any_elements(rhs: &Bson) -> Bson {
+    match arrays::strip(rhs) {
+        Bson::Array(_) => Bson::Array(arrays::flatten(rhs)),
+        other => other,
+    }
+}
+
 /// `scalar <op> ANY(array)` / `scalar <op> ALL(array)` as a constant.
 ///
 /// Three-valued, matching PostgreSQL: a NULL scalar is NULL; `ANY` is TRUE on
@@ -47856,11 +48245,26 @@ fn eval_scalar_array_const(op: &str, lhs: Bson, rhs: Bson, is_any: bool) -> Resu
         other => {
             return Err(Error::UndefinedFunction(format!(
                 "operator does not exist: {} {op} {}",
-                inferred_type(&lhs),
-                inferred_type(&other)
+                display_type(inferred_type(&lhs)),
+                display_type(inferred_type(&other))
             )))
         }
     };
+    // An array beside an element that is not one: no comparison operator
+    // takes them (`text[] = text`, 42883), however the array was built --
+    // `ARRAY['{x,y}'::text[]]` holds `text` elements. Typing catches this
+    // at plan time where it sees both types; here the values say (RP-740).
+    let is_array = |v: &Bson| matches!(v, Bson::Array(_)) || arrays::is_bounded(v);
+    if is_array(&lhs) && op_to_mql(op).is_some() {
+        if let Some(el) = elems.iter().find(|el| **el != Bson::Null && !is_array(el)) {
+            return Err(Error::UndefinedFunction(format!(
+                "operator does not exist: {} {} {}",
+                display_type(inferred_type(&lhs)),
+                if op == "!=" { "<>" } else { op },
+                display_type(inferred_type(el))
+            )));
+        }
+    }
     let mut any_null = false;
     for el in elems {
         if el == Bson::Null {
@@ -47926,6 +48330,15 @@ fn lower_scalar_array(
             "a varchar column against a char(n) array".into(),
         ));
     }
+    // An untyped literal is read as the array type of an array column's
+    // type, which has none (`could not find array type`, parse_oper.c).
+    if elem_type.ends_with("[]") && unknown_operand(rexpr) && matches!(rhs, Bson::String(_)) {
+        set_error_location(e.location);
+        return Err(Error::UndefinedObject(format!(
+            "could not find array type for data type {}",
+            display_type(elem_type)
+        )));
+    }
     let rhs = coerce_any_array(rhs, elem_type)?;
     let rhs = if trim_elems {
         match arrays::strip(&rhs) {
@@ -47942,6 +48355,31 @@ fn lower_scalar_array(
     } else {
         rhs
     };
+    // A vector is itself held as an array: its elements stay whole.
+    let rhs = if vectors::is_vector(elem_type) {
+        rhs
+    } else {
+        any_elements(&rhs)
+    };
+    // An array column beside a scalar element: `text[] = text` has no
+    // operator (42883), where the filter matched an array holding the
+    // element (RP-740). Typing refuses this first over a table's column;
+    // a VALUES or subquery column reaches here.
+    if elem_type.ends_with("[]") && !vectors::is_vector(elem_type) {
+        if let Bson::Array(items) = &rhs {
+            if let Some(el) = items.iter().find(|el| {
+                **el != Bson::Null && !matches!(el, Bson::Array(_)) && !arrays::is_bounded(el)
+            }) {
+                set_error_location(e.location);
+                return Err(Error::UndefinedFunction(format!(
+                    "operator does not exist: {} {} {}",
+                    display_type(elem_type),
+                    if op == "!=" { "<>" } else { op.as_str() },
+                    display_type(inferred_type(el))
+                )));
+            }
+        }
+    }
     let elems = match rhs {
         Bson::Array(v) => v,
         // A NULL array (a genuine NULL operand, or an unbound parameter at

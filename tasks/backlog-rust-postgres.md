@@ -373,8 +373,8 @@ one beside it.
   Backlog-ID: RP-606
   Verify: none -- intermittent, not reproduced; the regression test is the check
 - [ ] **NOT REPRODUCED -- left open as a watch item. A cancel during the
-  parse was honoured 0.65 s late once, RP-002's pre-fix signature
-  (2026-11-08).** `tests/backlog/test_rp_triage.py::test_cancel_during_parse_is_honoured_with_user_code_present`
+  parse was honoured late on Linux CI twice, in both of RP-002's
+  regression tests (2026-11-08, 2026-11-10).** `tests/backlog/test_rp_triage.py::test_cancel_during_parse_is_honoured_with_user_code_present`
   (RP-002's regression test) failed in CI's `pg-oracle (backlog)` lane on
   snapshot PR #2480 (`e8272d38`): `cancel honoured 0.65 s after it was
   sent`, budget 0.25 s. RP-002's own record puts the unfixed bug at about
@@ -387,35 +387,26 @@ one beside it.
   write past it). Found by the MongoDB batch; not worked from that side.
   On a recurrence, capture which passes parsed the statement and when each
   checked the cancel flag.
+  **Second recurrence (2026-11-10), in the other test:**
+  `test_cancel_during_parse_is_honoured_at_once` failed in the same lane on
+  snapshot PR #2591 (`2d70153d`, job 129547189731): `cancel honoured 0.53 s
+  after it was sent`, budget 0.5 s, the 57014 at 1.03 s where PostgreSQL
+  15.19 answers at 0.515 s. The snapshot's one change was RP-741 (NULLIF's
+  operand typing), which no parse or cancel path reaches. It was not
+  reproduced on macOS (130 runs, up to 4 at once at load ~14, all within
+  0.09 s). The same day RP-748 (RP-202's test, late under load) was traced
+  to a loop in `optype::check_aexpr` with no cancellation point, over every
+  item of the `IN` list (RP-530's row check), about 70 ms in a debug build
+  and half a second under load. This statement's `1 in (...)` goes through
+  that loop too, so it is the likely cause here as well, but neither
+  RP-002 failure was traced, so this stays a watch item. Both RP-002 tests
+  now print the server's cancel trace (`SECANTUS_PG_CANCEL_TRACE`) when
+  they miss their budget: on a recurrence, read which stretch the trace
+  shows without a check. A third the same morning: the user-code test
+  at 0.33 s against 0.25 s on RM snapshot PR #2601 (job 129641495115),
+  whose change (RM-385, MongoDB statement statistics) reaches no PG path.
   Backlog-ID: RP-571
-  Verify: none -- intermittent, not reproduced; RP-002's regression test is the check, and it passed on rerun
-- [ ] **OPEN -- a cancel while a huge `IN` list is planned is honoured up
-  to 0.52 s late, against RP-202's 0.3 s budget (2026-11-09).**
-  `tests/backlog/test_rp202_cancel.py::test_a_cancel_while_a_huge_in_list_is_planned_over_a_table`
-  (RP-202's regression test) failed in the `backlog` step of a local
-  `gate_pg.sh --storage --fast` on the RM-379 lane (commit `5cc38549` on
-  `rm-batch` `57e33821`, debug build): `[0.7]` honoured 0.32 s late.
-  Rerun on its own at once (load average about 7), it failed 3 runs of 5:
-  0.30 s, 0.52 s and 0.34 s late. After the lane was rebuilt, on
-  `rm-batch` `49012e84` without RM-379 it passed 6 of 6, and with RM-379
-  on `01a19d63` it passed 8 of 8 (load average about 3.5). RM-379 changes
-  only the shared storage crate's asynchronous-oplog path, which the PG
-  server does not select. So the late cancels follow load or the older
-  build, and the cause has not been measured. PostgreSQL 15.19 answers at
-  about 0.015 s. Found by the MongoDB batch, and not worked from that side.
-  To work it: time each rewrite pass of the `IN` list at delay 0.7 and
-  record when each pass checks the cancel flag, under a load average near
-  7. A copy that cannot be interrupted and takes about 0.3 s under load is
-  RP-202's own signature. Again 2026-11-10 in the RM-385 lane (`[0.7]`
-  0.42 s late, load average about 12.6 from a `gate_rm.py` just before);
-  rerun alone at once it passed 15 of 15. RM-385 changes only the MongoDB
-  server's statement statistics, which the PG server does not read.
-  Again 2026-11-10 in the RM-389 lane (`[0.7]` 0.41 s late), and rerun
-  alone it failed 1 run of 3 at a load average of 3.9. RM-389 changes only
-  the shared storage crate's `deleteMany` of a collection that records
-  pre-images, which this test does not run.
-  Verify: none -- intermittent under load; RP-202's regression test is the check, and it passed 14 of 14 runs on two rebuilt commits
-  Backlog-ID: RP-748
+  Verify: none -- intermittent, Linux CI only, not reproduced on macOS; RP-002's two regression tests are the check, and print the cancel trace on a miss
 - [ ] **OPEN -- `gate_pg.sh`'s login step differs from the local reference
   in 6 of 547 TLS scenarios, because that reference now links OpenSSL 4.**
   Homebrew's `postgresql@15` (15.19_1, 2026-11-07) links
@@ -1079,7 +1070,7 @@ one beside it.
 ## Found by a CI run (2026-11-07)
 
 - [ ] **OPEN — CI: `obj_description` of a commented index answered NULL
-      once; not reproduced.** Commit `f96fc90d`, job 128491514608
+      twice; not reproduced.** Commit `f96fc90d`, job 128491514608
       (`pg-oracle (differential)`),
       `tests/test_rust_pg_corpora.py::test_corpus_answers_as_postgresql_does[sqlalchemy_catalog]`.
       The setup ran `COMMENT ON INDEX sa35_s.sa35_d_ix IS 'ix comment'`, and
@@ -1107,8 +1098,25 @@ one beside it.
       transform comment helpers, and `shobj_description`'s
       `shared_comments`. They were not on this corpus's path, and their
       first failure should be made to surface the same way.
+      **It recurred on 2026-11-09, as the NULL with no error.** RM snapshot
+      #2584, run 42717349016, job 129502313793, 23:17 UTC: the same check
+      answered NULL, 1 of 52 differ, 1 failed and 1,183 passed. Every setup
+      statement succeeded, because the test now fails a setup error first,
+      and no statement raised. The rerun of the same job on the same commit
+      passed (job 129513427390). The snapshot changed no code on this path.
+      That rules out the transient storage read. What remains: the comment
+      was written under a key the later read does not find, or the planner
+      thread that ran the check held a publication of `OBJECT_COMMENTS`
+      from before the write. Locally, 600 more runs did not reproduce it
+      (macOS arm64, a binary of tree `72006e6c`): 200 serial, and 400 as
+      four concurrent loops at load 13-25. Both occurrences are Linux CI.
+      A lead not yet checked: the autovacuum launcher builds a full
+      `PgHandler` (`autovacuum::setting`, `worker`) every second for the
+      server's whole life, a second session reading the catalog beside
+      every connection, so a fix should prove the catalog caches cannot
+      take that session's view as the connection's.
       Backlog-ID: RP-499
-      Verify: none -- seen once in CI, not reproduced; a recurrence now names its cause in the job log
+      Verify: none -- seen twice in Linux CI (2026-11-07, 2026-11-09), 600 + ~2,000 local runs never reproduced it
 
 ## Found by the 2026-10-20 audit
 
@@ -2480,21 +2488,24 @@ Measured on a private PostgreSQL 15.19 cluster with the `_SETUP` in
       Verify: tests/backlog/test_rp_found_rp672.py::test_intersect_keeps_the_smaller_inputs_value
       Backlog-ID: RP-692
 
-## Found while working RP-655 (2026-11-08)
+## Found while working RP-665 (2026-11-10)
 
-Measured on a private PostgreSQL 15.19 cluster with `create domain d655 as
-int`, `t655(a d655, b int)` holding `(-1, -1)` and `(5, 5)`, then `alter
-domain d655 add constraint d655_pos check (value > 0) not valid`. The gap
-tests are in `tests/backlog/test_rp_found_rp655.py`.
+Measured on a private PostgreSQL 15.19 cluster with the `_SETUP` in
+`tests/backlog/test_rp_found_rp665.py`: `t665(a d665, c dc665, b int)`
+over `create domain d665 as int` and `create domain dc665 as char(4)`.
 
-- [ ] **A scalar subquery over a domain column is typed by the domain's
-      base.** `select pg_typeof((select a from t655 where b < 0))` is
-      `d655` on PostgreSQL 15.19 (`exprType` of the SubLink is its column's);
-      here it is `integer`. The subquery's column is typed by the stored
-      column's base type; since RP-569 only an ARRAY subquery's column is
-      cast to its domain (`cast_array_subquery_column`).
-      Verify: tests/backlog/test_rp_found_rp655.py::test_scalar_subquery_over_a_domain_column_is_of_the_domain
-      Backlog-ID: RP-665
+- [ ] **A CASE, COALESCE, GREATEST or LEAST over domain columns alone is
+      typed by the domain's base.** `select pg_typeof(coalesce(a, a)) from
+      t665` is `d665` on PostgreSQL 15.19, and so are `case when ... then a
+      else a end`, `greatest(a, a)` and `least(a, a)`; `coalesce(c, c)` is
+      `dc665` (`select_common_type` keeps a type every input shares
+      exactly, a domain included). Here each is `integer` (`character`).
+      Since RP-665 the common type keeps a domain every input is OF -- a
+      scalar subquery over one is -- but a bare domain column reaches a
+      `pg_typeof` as its domain only directly (`rewrite_domain_typeof`),
+      so inside these it is still of its stored base type.
+      Verify: tests/backlog/test_rp_found_rp665.py::test_common_type_of_domain_columns_alone_is_the_domain
+      Backlog-ID: RP-764
 
 ## Found while working RP-656 (2026-11-08)
 
@@ -2588,16 +2599,6 @@ Measured on a private PostgreSQL 15.19 cluster with the `_SETUP` in
 Measured on a private PostgreSQL 15.19 cluster with the `_SETUP` in
 `tests/backlog/test_rp_found_rp694.py`: `dnn694` an `int` domain `not null`.
 
-- [ ] **An assignment with only an explicit cast uses it.** `declare x int;
-      begin x := true;` is 22P02 `invalid input syntax for type integer:
-      "t"` on PostgreSQL 15.19, as are `select true into x` and `x bool :=
-      5`: PL/pgSQL coerces with `COERCION_PLPGSQL`, which with no implicit
-      or assignment cast converts through the source's output and the
-      target's input (`get_cast_hashentry`). Here the explicit cast runs
-      and `x` is 1 (`t` for the `bool`). `eval_typed` and `coerce_moved`
-      both cast with `::`.
-      Verify: tests/backlog/test_rp_found_rp694.py::test_assignment_with_only_an_explicit_cast_converts_through_text
-      Backlog-ID: RP-712
 - [ ] **A `FOR` over a query or an `EXECUTE ... INTO` refuses scalar
       variable targets.** `for x in select '7'::text loop` over an `int`
       `x`, `for x, y in select 1, 'a'` and `execute 'select 7' into x` each
@@ -2608,6 +2609,48 @@ Measured on a private PostgreSQL 15.19 cluster with the `_SETUP` in
       goes through `target_datum`).
       Verify: tests/backlog/test_rp_found_rp694.py::test_for_and_execute_into_scalar_variables
       Backlog-ID: RP-713
+
+## Found while working RP-712 (2026-11-10)
+
+Measured on PostgreSQL 15.19 (port 5415) with statements that create
+nothing. The gap tests are in `tests/backlog/test_rp_found_rp712.py`.
+
+- [ ] **A `numeric` out of `int4`'s range quotes its value.** `select
+      1e20::numeric::int` is 22003 `integer out of range` on PostgreSQL
+      15.19 (`numeric_int4_opt_error`); here the message is `integer out of
+      range: "100000000000000000000"`, in plain SQL and in a PL/pgSQL
+      assignment or `INTO` alike.
+      Verify: tests/backlog/test_rp_found_rp712.py::test_numeric_out_of_int4_range_quotes_no_value
+      Backlog-ID: RP-749
+- [ ] **A `jsonb` input error carries no `JSON data` CONTEXT.** `select
+      't'::jsonb` is 22P02 `invalid input syntax for type json` with
+      CONTEXT `JSON data, line 1: t` on PostgreSQL 15.19 (`json_errcontext`);
+      here the CONTEXT is absent, and in a PL/pgSQL assignment (`x jsonb :=
+      true`) the line is missing from the stack.
+      Verify: tests/backlog/test_rp_found_rp712.py::test_jsonb_input_error_carries_its_json_data_context
+      Backlog-ID: RP-750
+- [ ] **A `money` variable prints its number in a RAISE.** `declare x money;
+      begin x := 5.25; raise notice '%', x;` notices `$5.25` on PostgreSQL
+      15.19 (RAISE prints a value by its type's output function, `cash_out`);
+      here it notices `5.25`, the carried numeric.
+      Verify: tests/backlog/test_rp_found_rp712.py::test_money_variable_prints_through_cash_out
+      Backlog-ID: RP-751
+- [ ] **An assignment's overlong `varchar(n)` value is 22001 with no
+      assignment frame.** `declare x varchar(3); begin x := 'abcdef'::text;`
+      carries CONTEXT `PL/pgSQL assignment "x := 'abcdef'::text"` above the
+      `at assignment` line on PostgreSQL 15.19: the length coercion is part
+      of the assignment's query and folds as it is planned. Here only the
+      `at assignment` line is sent: `fit_assigned` raises outside the
+      framed query.
+      Verify: tests/backlog/test_rp_found_rp712.py::test_overlong_varchar_assignment_is_framed_by_the_assignment
+      Backlog-ID: RP-752
+- [ ] **An assignment's literal input error carries no internal query.**
+      `declare x int; begin x := 'abc';` is 22P02 with `internal_query` `x
+      := 'abc'` on PostgreSQL 15.19 (the literal is coerced as the
+      assignment is parsed); here no internal query is sent. The same class
+      as RP-488, in a shape its test does not reach.
+      Verify: tests/backlog/test_rp_found_rp712.py::test_literal_input_error_in_an_assignment_carries_its_query
+      Backlog-ID: RP-753
 
 ## Found while working RP-695 (2026-11-09)
 
@@ -2747,25 +2790,6 @@ Measured on PostgreSQL 15.19; none of it needs DDL. The gap tests are in
       functions of the byte-ordered types only.
       Verify: tests/backlog/test_rp_found_rp603.py::test_oidvector_comparison_functions
       Backlog-ID: RP-612
-
-## Found while working RP-611 (2026-11-08)
-
-Measured on PostgreSQL 15.19; none of it needs DDL. The gap tests are in
-`tests/backlog/test_rp_found_rp611.py`.
-
-- [ ] **An ORDER BY naming a window function over a keyed window is
-      refused.** `select v::text t, row_number() over (order by v) from
-      (values ('[1,2]'::int4range), ('[0,5]')) s(v) order by 2` (or `...
-      r ... order by r`) answers on PostgreSQL 15.19; here it is `function
-      row_number() is not supported yet`. The same query without the outer
-      ORDER BY answers, as does one whose window orders by a collation. It
-      fails when the window's ORDER BY is a range, a multirange or an
-      `oidvector`, which `sort_by` keys by `__range_sortkey`. A likely
-      cause, read from the code and not proven: `rewrite` resolves an
-      ORDER BY position or alias to its target and copies any target that
-      is not a column -- the window call too -- into the sort clause.
-      Verify: tests/backlog/test_rp_found_rp611.py::test_order_by_a_window_target_over_a_keyed_window
-      Backlog-ID: RP-652
 
 ## Found while working RP-529 (2026-11-08)
 
@@ -3135,15 +3159,6 @@ Measured on a private PostgreSQL 15.19 cluster with `fe(a int, b text)` and
 the column written out, so none is the star's. The gap tests are in
 `tests/backlog/test_rp_found_rp517.py`.
 
-- [ ] **A correlated set operation is 42P01.** `select (select v.a
-      intersect select 5) from (values (5), (6)) v(a)` answers `5` and NULL
-      on PostgreSQL 15.19, `(select v.a union all select 9 limit 1)` `5`,
-      and `(select v.a union select 9)` is 21000 `more than one row
-      returned by a subquery used as an expression`; here each is 42P01
-      `missing FROM-clause entry for table "v"` at 16: the arms' outer
-      reference is not found.
-      Verify: tests/backlog/test_rp_found_rp517.py::test_correlated_set_operation
-      Backlog-ID: RP-698
 - [ ] **A GROUP BY naming a correlated subquery target is refused.**
       `select (select v.a) from (values (1)) v(a) group by 1`, its `(select
       v.*)` form and `group by (select v.a)` each answer `1` on PostgreSQL
@@ -3238,16 +3253,6 @@ Measured on a private PostgreSQL 15.19 cluster with the `_SETUP` in
 varchar(4), t text)` holding `(1, 'y', 'y', 'y')` and `(2, 'ab', 'ab ',
 'ab ')`.
 
-- [ ] **A simple CASE and NULLIF over a `char(n)` and another string type
-      compare without the operator their types resolve to.** `case c when
-      v` and `nullif(v, c)`, `c` a `char(3)` `y` and `v` a `varchar` `y`,
-      are `eq` / NULL on PostgreSQL 15.19 (`bpchareq`); here `ne` / `y`, the
-      `char(n)` side compared with its padding. Against `text` (`texteq`,
-      the `char(n)` side cast to text) `case t when c` over `ab ` and `ab`
-      is `ne` there, `eq` here, and `nullif(t, c)` over `y` and `y` is
-      NULL there, `y` here. Two `char(n)` operands are answered.
-      Verify: tests/backlog/test_rp_found_rp726.py::test_case_and_nullif_compare_by_type
-      Backlog-ID: RP-737
 - [ ] **EXPLAIN of a JOIN ... ON a `varchar` column equal to a `char(n)`
       one prints the Hash Cond through `text` casts.** `explain (costs
       off) select x.k, y.k from ch726 x join ch726 y on x.v = y.c` prints
@@ -3257,6 +3262,9 @@ varchar(4), t text)` holding `(1, 'y', 'y', 'y')` and `(2, 'ab', 'ab ',
       Found while working RP-736 (2026-11-09).
       Verify: tests/backlog/test_rp_found_rp726.py::test_explain_join_on_varchar_against_char_n
       Backlog-ID: RP-738
+
+## Found while working RP-737 (2026-11-09)
+
 - [ ] **A cancel while a 200,000-item `IN` list is planned still waits
       up to ~0.25 s, about one time in twenty.** RP-202's
       `test_a_cancel_while_a_huge_in_list_is_planned_over_a_table[0.7]`
@@ -3273,73 +3281,151 @@ varchar(4), t text)` holding `(1, 'y', 'y', 'y')` and `(2, 'ab', 'ab ',
       branch (lane pg-batch-2, debug build) the whole file's run had the
       cancel 0.62 s and 0.72 s late in two of three runs at a load average
       of about 16, then passed ten runs at loads of 11 and 23, four of them
-      on a build of `aae69552`, before RP-733.
+      on a build of `aae69552`, before RP-733. Again on the RP-741 branch
+      (lane pg-batch-3, debug build, 2026-11-10): 0.32 s late once in the
+      gate's backlog step at a load of about 13, then the file passed five
+      runs in a row at loads of 13-16. Again on the RP-707 branch (lane
+      pg-batch-2, debug build, 2026-11-10): 0.68 s late once in the gate's
+      backlog step at a load of about 11; then 30 cancels at delay 0.7
+      each on that branch and on its base `49f2f12e` without it, medians
+      0.022 s and 0.021 s, one late cancel each at 0.250 s and 0.244 s.
       Verify: none -- a timing tail that does not fail on demand; RP-202's own test is the check
       Backlog-ID: RP-735
 
-## Found while working RP-681 (2026-11-09)
+## Found while working RP-732 (2026-11-09)
 
-Measured on a private PostgreSQL 15.19 cluster with the `_SETUP` in
-`tests/backlog/test_rp_found_rp681.py`: `t681(k int, v varchar(4), ...)`.
+Measured on PostgreSQL 15.19 (the shared reference on port 5415): every
+statement is VALUES-only and runs there as written. The gap tests are in
+`tests/backlog/test_rp_found_rp732.py`.
 
-- [ ] **`min` / `max` over a `reg*` or `cidr` value keep its type and
-      compare it as itself.** PostgreSQL 15.19 resolves `max(regclass)` to
-      `max(oid)` and `max(cidr)` to `max(inet)` (`func_select_candidate`
-      over `pg_aggregate`'s 22 overloads), coercing each input first:
-      `max(x)` over `'pg_class'::regclass` and `'pg_type'::regclass` is
-      1259, an `oid`, the larger OID. Here it is `pg_class`, a `regclass`
-      chosen by NAME (`pg_type` is larger as text), and `max(cidr)` is
-      described `cidr` (650), not `inet` (869). Since RP-681
-      `min_max_result_type` takes the overload's type only where it is
-      `text`, whose value is the input's string unchanged; these need the
-      input coerced in each engine that computes min / max.
-      Verify: tests/backlog/test_rp_found_rp681.py::test_min_max_coerce_their_input_to_the_overloads_type
-      Backlog-ID: RP-706
-- [ ] **`pg_typeof` of a `text` scalar subquery is 42P18.** `select
-      pg_typeof((select max(v) from t681))` is `text` on PostgreSQL 15.19;
-      here it is 42P18 `could not determine data type of parameter $1`, as
-      for `(select upper(v) ...)` and `(select string_agg(v, ',') ...)`,
-      while one over an `int` column or a bare `varchar` column answers.
-      Verify: tests/backlog/test_rp_found_rp681.py::test_pg_typeof_of_a_text_scalar_subquery
-      Backlog-ID: RP-707
+- [ ] **A DECLARE CURSOR computes every row's select list at the DECLARE.**
+      `declare c cursor for select 1/(k - 1) from (values (2), (1)) s(k)`
+      then `fetch 1 from c` answers `1` on PostgreSQL 15.19, whose cursor
+      runs its plan as it is fetched; here the DECLARE itself raises the
+      second row's 22012 `division by zero`, and the cursor is not
+      created.
+      Verify: tests/backlog/test_rp_found_rp732.py::test_a_cursor_computes_its_rows_as_they_are_fetched
+      Backlog-ID: RP-744
+- [ ] **A sorted cursor computes an expensive column below its Sort.** A
+      cursor is planned with `cursor_tuple_fraction` (0.1), and
+      `make_sort_input_target` postpones an expensive column (more than
+      10 x `cpu_operator_cost`, `to_tsvector`'s `procost` is 100) past the
+      Sort whenever `tuple_fraction > 0`, as for a LIMIT: `declare c
+      cursor for select k, to_tsvector(case when k = 1 then 'nope' else
+      'simple' end::regconfig, 'a')::text from (values (1), (2)) s(k) order
+      by k desc` then `fetch 1` answers `(2, 'a':1)` on PostgreSQL 15.19.
+      Since RP-732 `sort_input.rs` sees only a LIMIT, so the column is
+      computed for every row and the first row's 42704 is raised. Needs the
+      item above first: today the DECLARE computes every row anyway.
+      Verify: tests/backlog/test_rp_found_rp732.py::test_a_sorted_cursor_postpones_an_expensive_column
+      Backlog-ID: RP-745
+- [ ] **A cast over a CASE of untyped literals reports a branch's input
+      error at the literal.** `select (case when k = 1 then 'x' else '5'
+      end)::int from (values (1)) s(k)` is 22P02 `invalid input syntax for
+      type integer: "x"` with no position on PostgreSQL 15.19, which
+      resolves the CASE to `text` and casts its result as the row runs;
+      here the error carries the position of `'x'`, the cast having been
+      applied to each branch's literal.
+      Verify: tests/backlog/test_rp_found_rp732.py::test_a_cast_over_a_case_of_literals_reports_no_position
+      Backlog-ID: RP-746
 
-## Found while working RP-730 (2026-11-09)
+## Found while working RP-740 (2026-11-09)
+
+Measured on PostgreSQL 15.19 (the shared reference on port 5415).
+
+- [ ] **A scalar compared with an array value names the types by their
+      internal names.** `select 1 = (select array[1])`, `select x = y from
+      (values (1, array[1])) v(x, y)` and `select 1 = any (select
+      array[1])` are each 42883 `operator does not exist: integer =
+      integer[]` on PostgreSQL 15.19; here the message reads `int4 =
+      int4[]`: the per-row evaluation's mismatch prints `inferred_type`
+      without `display_type`.
+      Verify: tests/backlog/test_rp_found_rp722.py::test_a_scalar_against_an_array_value_names_its_types
+      Backlog-ID: RP-742
+
+## Found while working RP-698 (2026-11-10)
+
+Measured on PostgreSQL 15.19 (the shared reference on port 5415).
+
+- [ ] **An outer column in a set operation's ORDER BY is 42703.** `select
+      (select a from (values (1)) t(a) union select 9 order by b limit 1)
+      from (values (5, 6)) v(a, b)` is 0A000 `invalid UNION/INTERSECT/EXCEPT
+      ORDER BY clause`, DETAIL `Only result column names can be used, not
+      expressions or functions.`, at 65 on PostgreSQL 15.19: the ORDER BY
+      sees only the output columns, so `b` resolves to the outer row and is
+      a sort expression (`transformSetOperationStmt`); `order by v.b` is the
+      same. Here each is 42703 `column "b" does not exist`. A name neither
+      level has is 42703 on both.
+      Verify: tests/backlog/test_rp_found_rp698.py::test_an_outer_column_in_a_set_operations_order_by
+      Backlog-ID: RP-767
+
+## Found while working RP-707 (2026-11-10)
 
 Measured on PostgreSQL 15.19 (the shared reference on port 5415): every
 statement is VALUES-only and runs there as written.
 
-- [ ] **A query with ORDER BY computes its select list after the sort.**
-      PostgreSQL 15.19 projects the select list below the Sort, in scan
-      order, so `select k, case when k = 1 then 1/0 else ('x' || k)::int
-      end from (values (1), (2)) s(k) order by k desc` raises the first
-      row's 22012 `division by zero`. Here it raises the second row's 22P02
-      `invalid input syntax for type integer: "x2"`, the row that sorts
-      first: the error a client sees, and the order a volatile select-list
-      expression runs in, follow the sort rather than the scan.
-      Verify: tests/backlog/test_rp_found_rp730.py::test_select_list_is_computed_before_the_sort
-      Backlog-ID: RP-732
+- [ ] **A scalar subquery in an `IN` list is refused.** `x in ((select
+      max(y) ...), 'tt')` is an ordinary list on PostgreSQL 15.19 (each
+      element compared by `=`, ORed); here the statement is 0A000 `SubLink
+      is not supported yet`.
+      Verify: tests/backlog/test_rp_found_rp707.py::test_a_scalar_subquery_in_an_in_list
+      Backlog-ID: RP-757
 
-## Found while working RP-733 (2026-11-09)
+## Found while working RP-754 (2026-11-10)
 
-Measured on PostgreSQL 15.19 (the shared reference on port 5415) with the
-`_SHAPES` in `tests/backlog/test_rp_found_rp722.py`: `x733(k int, a text[],
-b int[])`, `b` holding `'{}'`, `'{NULL,1}'`, `'{1,2}'`, `'{{1,2},{3,4}}'`,
-`'[2:3]={1,2}'`, NULL and `'{NULL}'`.
+Measured on PostgreSQL 15.19 (the shared reference on port 5415): every
+statement is VALUES-only and runs there as written. The gap tests are in
+`tests/backlog/test_rp_found_rp754.py`. The type-order rewrite
+(`enum_order.rs`, `rewrite`) reads an ORDER BY key with `sort_by` only,
+never with `expr` as it reads the select list.
 
-- [ ] **`IS NULL` over an array column matches an array holding a NULL
-      element.** `select k from x733 where b is null` is only the row whose
-      `b` is NULL on PostgreSQL 15.19; here it is also `{NULL,1}` and
-      `{NULL}`, and `IS NOT NULL` (`NOT (b IS NULL)`, `ISNULL` the same)
-      drops them. The null test lowers to the MQL `{b: null}`, which also
-      matches an array with a NULL element; `IS NOT DISTINCT FROM NULL` is
-      right since RP-733 took it per row.
-      Verify: tests/backlog/test_rp_found_rp722.py::test_a_null_test_over_an_array_column_reads_the_array
-      Backlog-ID: RP-739
-- [ ] **`a = ANY (array of arrays)` over an array column answers rows.**
-      `select k from x733 where a = any (array['{x,y}'::text[]])` is 42883
-      `operator does not exist: text[] = text` on PostgreSQL 15.19 (the
-      ARRAY constructor over `text[]` is a two-dimensional `text[]`, so ANY
-      compares `text[]` with `text`); here it answers the rows `a = '{x,y}'`
-      would, through the MQL filter.
-      Verify: tests/backlog/test_rp_found_rp722.py::test_an_array_column_against_any_of_an_array_of_arrays
-      Backlog-ID: RP-740
+- [ ] **A window call in an ORDER BY key is 0A000.** `select max(x::text)
+      over (order by x) from (values (1), (2)) s(x) order by max(x::text)
+      over (order by x) desc` is `2`, `1` on PostgreSQL 15.19, and the same
+      with `sum(x) over (order by x) + 1` `4`, `2`; here each is 0A000
+      `function max(text) is not supported yet` (`sum(integer)`): the key is
+      evaluated per row as a scalar call. `select max(x) over (order by x)
+      from (values ('10.0.0.1'::inet), ('9.0.0.0'::inet)) s(x) order by 1
+      desc` is refused the same way, since the network rewrite copies a
+      positional key's target into the sort (since RP-754 a target whose
+      value needs no key stays positional, so `(max(x) over (...))::text
+      ... order by 1` is answered).
+      Verify: tests/backlog/test_rp_found_rp754.py::test_a_window_call_in_an_order_by_key
+      Backlog-ID: RP-761
+
+## Found while working RP-756 (2026-11-10)
+
+Measured on PostgreSQL 15.19 (the shared reference on port 5415): every
+statement is VALUES-only and runs there as written.
+
+- [ ] **A FROM subquery's set operation is not typed by the operator
+      check.** `select x = 1 from (select 'a'::text union select 'b')
+      s(x)` is 42883 `operator does not exist: text = integer` at 10 on
+      PostgreSQL 15.19 (the set operation's column is its arms' common
+      type, `text` when both are untyped literals); here it is 0A000
+      `comparing string with int32 using = is not supported yet`, raised
+      at run time with no position. `optype.rs`'s `add_derived` marks a
+      set-operation FROM item incomplete, so none of its columns is
+      typed. A scalar subquery over a set operation is typed since RP-756
+      (`first_output_type`).
+      Verify: tests/backlog/test_rp_found_rp756.py::test_a_set_operation_from_subquerys_column_is_typed
+      Backlog-ID: RP-765
+
+## Found while working RP-766 (2026-11-10)
+
+Measured on a private PostgreSQL 15.19 cluster with `create type e766 as
+enum ('z', 'a', 'm')` and `create table t766 (m e766)` holding `m`, `z`,
+`a`. The gap test is in `tests/backlog/test_rp_found_rp766.py`.
+
+- [ ] **An enum column read through a subquery or a CTE sorts and compares
+      by its labels' text.** `select m::text as v from (select m from t766)
+      q order by m` is `z`, `a`, `m` on PostgreSQL 15.19, in declaration
+      order; here it is `a`, `m`, `z`. `select *` in the subquery, a CTE,
+      and a `WHERE m > 'z'` over the subquery's column (no rows here, `a`
+      and `m` on PostgreSQL) go the same way, as does an outer subquery
+      over a VALUES list's enum column. The type-order rewrite types a
+      derived relation's column only from a cast written in it
+      (`derived_def` in `secantus-pgplan/src/enum_order.rs`), not from the
+      column a target names in the derived query's own FROM.
+      Verify: tests/backlog/test_rp_found_rp766.py::test_a_derived_enum_column_sorts_by_declaration
+      Backlog-ID: RP-768

@@ -370,6 +370,27 @@ QUERIES = [
     "SELECT a::text FROM (VALUES ('10.0.0.10'::inet), ('9.0.0.1')) s(a) WHERE a < '10.0.0.2'",
     "SELECT a::text FROM (VALUES ('10.0.0.10'::cidr), ('9.0.0.0/8')) s(a) "
     "WHERE a BETWEEN '9.0.0.0/8' AND '10.0.0.10'",
+    # A window min / max picks in `network_cmp` order as the aggregate does,
+    # its frame ordered by the same key (RP-754).
+    "SELECT (max(a) OVER ())::text, (min(a) OVER ())::text "
+    "FROM (VALUES ('10.0.0.1'::inet), ('9.0.0.0'), ('::1')) s(a)",
+    "SELECT (max(a) OVER ())::text FROM (VALUES ('10.0.0.1/32'::cidr), ('9.0.0.0/8')) s(a)",
+    "SELECT (max(a) OVER (ORDER BY a))::text "
+    "FROM (VALUES ('10.0.0.1'::inet), ('9.0.0.0')) s(a) ORDER BY 1",
+    # A comparison inside a sort key compares in `network_cmp` order, as it
+    # does in the select list (RP-762).
+    "SELECT a::text FROM (VALUES ('10.0.0.1'::inet), ('9.0.0.0')) s(a) "
+    "ORDER BY a > '9.5.0.0'::inet, a::text",
+    "SELECT string_agg(a::text, ',' ORDER BY a > '9.5.0.0'::inet, a::text) "
+    "FROM (VALUES ('10.0.0.1'::inet), ('9.0.0.0')) s(a)",
+    # Under a locale collation a window min / max picks in the collation's
+    # order, its frame ordered by the same collation (RP-763). The outer
+    # ORDER BY names "C": under the database's default it follows the
+    # reference's locale (CI's sorts `a A b B`, the local 14's `A B a b`).
+    'SELECT min(a COLLATE "en-x-icu") OVER (), max(a COLLATE "en-x-icu") OVER () '
+    "FROM (VALUES ('a'), ('B'), ('A')) s(a)",
+    'SELECT a, max(a COLLATE "en-x-icu") OVER (ORDER BY a COLLATE "en-x-icu") '
+    "FROM (VALUES ('a'), ('B'), ('b'), ('A')) s(a) ORDER BY a COLLATE \"C\"",
     "SELECT NULL::uuid",
     # Anonymous records (ROW / parenthesised list): construction, text
     # render with PG field-quoting, and three-valued comparison.

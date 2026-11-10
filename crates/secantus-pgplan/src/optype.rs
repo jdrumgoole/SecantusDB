@@ -507,7 +507,14 @@ impl<'p> Scope<'p> {
                     _ => None,
                 })
                 .unwrap_or_else(|| "?column?".to_string());
-            let ty = operand_type(val, &inner).unwrap_or_default();
+            // An untyped literal or NULL is `text` to the query around
+            // this one (`resolveTargetListUnknowns`, which a FROM
+            // subquery, a CTE and a view are analysed with).
+            let ty = if is_untyped_literal(val) {
+                "text".to_string()
+            } else {
+                operand_type(val, &inner).unwrap_or_default()
+            };
             columns.push(Column::new(&name, &ty, true));
         }
         // A name the derived table has twice is ambiguous to a reference
@@ -954,17 +961,10 @@ fn operand_type_declared(n: &pg_query::protobuf::Node, scope: &Scope) -> Option<
             else {
                 return None;
             };
-            if sub.op != pg_query::protobuf::SetOperation::SetopNone as i32
-                || sub.with_clause.is_some()
-            {
+            if sub.with_clause.is_some() {
                 return None;
             }
-            let lookup = scope.lookup?;
-            let inner = Scope::new(&sub.from_clause, &scope.ctes, lookup, Some(scope));
-            let Some(N::ResTarget(rt)) = sub.target_list.first()?.node.as_ref() else {
-                return None;
-            };
-            operand_type(rt.val.as_deref()?, &inner)
+            first_output_type(sub, scope)?.or_else(|| Some("text".into()))
         }
         // CASE / COALESCE / GREATEST / LEAST: their branches' common type,
         // untyped literals taking it.
@@ -1184,6 +1184,44 @@ fn mismatch(op: &str, l: &str, r: &str, location: i32) -> Error {
     ))
 }
 
+/// The element type of the array operand of `x op ANY / ALL (r)`, every
+/// dimension's `[]` dropped: an array type carries no dimension count, so
+/// `ARRAY[b]` over an `int[]` `b` and `'{{1}}'::int[]` both hold `int4`
+/// elements (`make_scalar_array_op` takes `get_base_element_type`). An
+/// ARRAY of untyped literals alone is a `text[]`; `None` when not typed.
+fn any_element_type(r: &pg_query::protobuf::Node, scope: &Scope) -> Option<String> {
+    use pg_query::protobuf::a_const::Val;
+    let base = |t: &str| {
+        let t = t.trim_end_matches("[]").to_string();
+        crate::domains::domain_base(&t).unwrap_or(t)
+    };
+    match r.node.as_ref()? {
+        N::AArrayExpr(a) => {
+            let mut literal = false;
+            for el in &a.elements {
+                let t = match el.node.as_ref() {
+                    Some(N::AConst(c)) if matches!(c.val, Some(Val::Sval(_))) => {
+                        literal = true;
+                        None
+                    }
+                    Some(N::TypeCast(tc)) => tc.type_name.as_ref().map(type_name_of),
+                    Some(N::AArrayExpr(_)) => any_element_type(el, scope),
+                    _ => operand_type(el, scope),
+                };
+                if let Some(t) = t {
+                    return Some(base(&t));
+                }
+            }
+            literal.then(|| "text".to_string())
+        }
+        N::TypeCast(tc) => {
+            let t = type_name_of(tc.type_name.as_ref()?);
+            t.ends_with("[]").then(|| base(&t))
+        }
+        _ => operand_type(r, scope).and_then(|t| t.ends_with("[]").then(|| base(&t))),
+    }
+}
+
 /// The operators `pg_operator` has over `(record, record)` in PostgreSQL
 /// 15: `record_eq` .. `record_ge` and their `record_image_*` forms. (`!=`
 /// is the parser's spelling of `<>`.)
@@ -1253,7 +1291,12 @@ fn check_aexpr(e: &pg_query::protobuf::AExpr, scope: &Scope) -> Result<()> {
             e.rexpr.as_deref().and_then(|n| n.node.as_ref()),
         ) {
             if let Some(ty) = operand_type(col, scope).filter(|t| crate::user_enum(t).is_some()) {
-                for item in &items.items {
+                for (i, item) in items.items.iter().enumerate() {
+                    // A cancellation point every so often, as in the typing
+                    // loop below (RP-748).
+                    if i % 1024 == 1023 {
+                        crate::cancel::check()?;
+                    }
                     if let Some(N::AConst(c)) = item.node.as_ref() {
                         if let Some(pg_query::protobuf::a_const::Val::Sval(label)) = c.val.as_ref()
                         {
@@ -1288,7 +1331,14 @@ fn check_aexpr(e: &pg_query::protobuf::AExpr, scope: &Scope) -> Result<()> {
         ) {
             // `transformAExprIn` falls back to one `=` (`<>` for NOT IN)
             // per item, in the list's order.
-            for item in &items.items {
+            for (i, item) in items.items.iter().enumerate() {
+                // A cancellation point every so often: over a 200,000-item
+                // list this loop was the longest stretch a cancel could not
+                // reach, about 70 ms in a debug build and half a second
+                // under load, past RP-202's budget (RP-748).
+                if i % 1024 == 1023 {
+                    crate::cancel::check()?;
+                }
                 row_against_non_row(&op, l, item, e.location, scope)?;
             }
         }
@@ -1588,6 +1638,37 @@ fn check_aexpr(e: &pg_query::protobuf::AExpr, scope: &Scope) -> Result<()> {
             }
         }
     }
+    // `x op ANY / ALL (array)` compares `x` with the array's ELEMENT type
+    // (`make_scalar_array_op`), and an array's element type is never an
+    // array: `ARRAY['{x,y}'::text[]]` and `'{{x,y}}'::text[]` are both a
+    // `text[]` of two dimensions. So an array `x` meets a scalar, which no
+    // comparison operator takes (`text[] = text`, 42883), where the
+    // evaluation compared it with each sub-array and answered rows (RP-740).
+    if matches!(kind, Some(K::AexprOpAny | K::AexprOpAll))
+        && matches!(op.as_str(), "=" | "<>" | "!=" | "<" | "<=" | ">" | ">=")
+        && l.strip_suffix("[]")
+            .is_some_and(|el| category(el).is_some())
+    {
+        if let Some(r) = e.rexpr.as_deref() {
+            // An untyped literal is read as `x`'s array type, and an array
+            // type has none of its own (42704, parse_oper.c).
+            if matches!(r.node.as_ref(), Some(N::AConst(c))
+                if matches!(c.val, Some(pg_query::protobuf::a_const::Val::Sval(_))))
+            {
+                set_error_location(e.location);
+                return Err(Error::UndefinedObject(format!(
+                    "could not find array type for data type {}",
+                    display_type(&l)
+                )));
+            }
+            if let Some(el) = any_element_type(r, scope) {
+                if category(&el).is_some() {
+                    let op = if op == "!=" { "<>" } else { op.as_str() };
+                    return Err(mismatch(op, &l, &el, e.location));
+                }
+            }
+        }
+    }
     let Some(lc) = category(&l) else {
         return Ok(());
     };
@@ -1619,6 +1700,17 @@ fn check_aexpr(e: &pg_query::protobuf::AExpr, scope: &Scope) -> Result<()> {
                 .and_then(|t| t.strip_suffix("[]").map(str::to_string))
                 .into_iter()
                 .collect(),
+        };
+        // A nested array's elements (`1 = any (array['{x}'::text[]])` is
+        // `integer = text`), which `operand_type` leaves untyped.
+        let elements = if elements.is_empty() {
+            e.rexpr
+                .as_deref()
+                .and_then(|r| any_element_type(r, scope))
+                .into_iter()
+                .collect()
+        } else {
+            elements
         };
         if let Some(r) = elements
             .iter()
@@ -2782,6 +2874,45 @@ fn literal_fits(n: &pg_query::protobuf::Node, ty: &str) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// A bare string literal or NULL: of type `unknown` where it is written.
+fn is_untyped_literal(n: &pg_query::protobuf::Node) -> bool {
+    matches!(n.node.as_ref(), Some(N::AConst(c))
+        if c.isnull || matches!(c.val, Some(pg_query::protobuf::a_const::Val::Sval(_))))
+}
+
+/// The type of a subquery's first output column, as a scalar subquery
+/// over it is typed: `Some(None)` when every arm gives an untyped literal
+/// or NULL there -- which the query around it reads as `text`, as
+/// `resolveTargetListUnknowns` resolves a subquery's own targets and a set
+/// operation its all-unknown columns -- and `None` when this cannot tell.
+/// Arms of different known types are `None` too: their common type is the
+/// planner's to judge.
+fn first_output_type(
+    sub: &pg_query::protobuf::SelectStmt,
+    scope: &Scope,
+) -> Option<Option<String>> {
+    if sub.op != pg_query::protobuf::SetOperation::SetopNone as i32 {
+        let left = first_output_type(sub.larg.as_deref()?, scope)?;
+        let right = first_output_type(sub.rarg.as_deref()?, scope)?;
+        return match (left, right) {
+            (None, t) | (t, None) => Some(t),
+            (Some(l), Some(r)) => (l == r).then_some(Some(l)),
+        };
+    }
+    if sub.with_clause.is_some() || !sub.values_lists.is_empty() {
+        return None;
+    }
+    let Some(N::ResTarget(rt)) = sub.target_list.first()?.node.as_ref() else {
+        return None;
+    };
+    let val = rt.val.as_deref()?;
+    if is_untyped_literal(val) {
+        return Some(None);
+    }
+    let inner = Scope::new(&sub.from_clause, &scope.ctes, scope.lookup?, Some(scope));
+    operand_type(val, &inner).map(Some)
 }
 
 /// The type several branches share: their known types agreeing (numbers
