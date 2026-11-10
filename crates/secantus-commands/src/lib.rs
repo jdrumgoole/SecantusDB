@@ -905,7 +905,6 @@ fn dispatch_named(doc: &Document, ctx: &mut CommandContext) -> Document {
         stats.count_op(doc);
     }
     let name = command_name(doc);
-    handshake::note_command(name, ctx, started);
     let _active = stats
         .as_ref()
         .map(|s| s.status.activate(status::OpKind::of(name)));
@@ -953,7 +952,7 @@ fn dispatch_named(doc: &Document, ctx: &mut CommandContext) -> Document {
     ctx.profiling = profiler::begin(name, doc, ctx);
     lastop::begin(ctx, doc);
     let last_op_before = ctx.last_op_seq;
-    let mut reply = dispatch_inner(doc, ctx);
+    let mut reply = dispatch_inner(doc, ctx, started);
     // The connection's last op, and the reads of the system's a write that
     // logged nothing makes before its write concern waits (RM-360).
     // `createIndexes` moves it to the system's whatever it did, as mongod's
@@ -1731,7 +1730,11 @@ fn parse_before_locks(name: &str, doc: &Document, db: &str) -> Result<(), Comman
     }
 }
 
-fn dispatch_inner(doc: &Document, ctx: &mut CommandContext) -> Document {
+fn dispatch_inner(
+    doc: &Document,
+    ctx: &mut CommandContext,
+    received: std::time::Instant,
+) -> Document {
     let name = command_name(doc);
 
     // Database-name length limit: mongod rejects any namespace whose database
@@ -1938,6 +1941,14 @@ fn dispatch_inner(doc: &Document, ctx: &mut CommandContext) -> Document {
                     return e.into_reply();
                 }
             }
+            // The command has parsed, been authorized and passed its
+            // concerns and `maxTimeMS`: it is about to run, which is where
+            // mongod's `IngressHandshakeMetrics::onCommandReceived` counts a
+            // connection's first command. A command refused before here is
+            // passed over; one refused inside the run -- a view, a bucket
+            // namespace, an oplog write -- counts (measured 8.2.11,
+            // 2026-11-10, RM-386).
+            handshake::note_command(name, ctx, received);
             // Refuse a direct insert/update/delete on a synthetic read-only view
             // (local.oplog.rs / admin.system.users), mirroring commands.py.
             if let Some(e) = reject_synthetic_view_write(name, doc, &ctx.db_name) {
@@ -1985,7 +1996,12 @@ fn dispatch_inner(doc: &Document, ctx: &mut CommandContext) -> Document {
             }
             reply
         }
-        None => CommandError::command_not_found(name).into_reply(),
+        None => {
+            // A command mongod has and this server does not: mongod would
+            // parse and run it, so it counts as it arrives.
+            handshake::note_command(name, ctx, received);
+            CommandError::command_not_found(name).into_reply()
+        }
     }
 }
 
