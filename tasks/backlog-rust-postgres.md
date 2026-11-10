@@ -3447,24 +3447,6 @@ with ICU) with the `_SETUP` in `tests/backlog/test_rp_found_rp782.py`
       Verify: tests/backlog/test_rp_found_rp796.py::test_a_column_of_conflicting_implicit_collations_has_none
       Backlog-ID: RP-803
 
-## Found while working RP-768 (2026-11-10)
-
-Measured on a private PostgreSQL 15.19 cluster with `create table ja768 (i
-int, x int)` and `create table jb768 (i int, y int)`, each holding `(1,
-...)` and `(2, ...)`. The gap test is in
-`tests/backlog/test_rp_found_rp768.py`.
-
-- [ ] **A column alias list over a FROM subquery's joined `*` is refused
-      unless only its first column is read.** `select t from (select *
-      from ja768 join jb768 on ja768.i = jb768.i) q(p, r, s, t)` is `100`,
-      `200` on PostgreSQL 15.19; here it is 42601 `table "q" has 1 columns
-      available but 4 columns specified`. So are `select r ...`, `order by
-      t` and `where t > 100`; `select p ...`, `select * ...` and `select t
-      ... order by p` answer. Whatever counts the subquery's columns for
-      the alias list sees one where the join's `*` gives four.
-      Verify: tests/backlog/test_rp_found_rp768.py::test_an_alias_list_over_a_joined_star
-      Backlog-ID: RP-773
-
 ## Found while working RP-757 (2026-11-10)
 
 Measured on PostgreSQL 15.19 (the shared reference on port 5415): every
