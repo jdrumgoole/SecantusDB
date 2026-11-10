@@ -9032,11 +9032,27 @@ fn plan_added_column(
 ) -> Result<Column> {
     use pg_query::protobuf::ConstrType as CT;
     let declared = cd.type_name.as_ref().map(type_name_of).unwrap_or_default();
-    let ty = normalize_serial(&declared);
+    // A column of a domain is stored as the domain's innermost base, with
+    // that base's modifier (`getBaseTypeAndTypmod`), and tagged with the
+    // domain, as CREATE TABLE declares one: the tag is what checks the
+    // domain's constraints on a write, gives the column the domain's
+    // DEFAULT, pads a domain over `char(n)`, and lets a function or an
+    // aggregate over the base take it. Kept as the domain's name, the column
+    // had none of these (RP-799).
+    let domain = domains::user_domain(&declared);
+    let resolved = domain
+        .as_ref()
+        .and_then(|d| domains::base_type_and_typmod(&d.name));
+    let base = match (&resolved, &domain) {
+        (Some((base, _, _)), _) => base.clone(),
+        (None, Some(d)) => d.base.clone(),
+        (None, None) => declared.clone(),
+    };
+    let ty = normalize_serial(&base);
     let mut column = Column::new(&cd.colname, &ty, false);
     // A serial column draws from `<table>_<column>_seq` (the executor picks
     // a free name if that one is taken) and numbers the existing rows.
-    if ty != declared {
+    if ty != base {
         column.sequence = Some(format!("{table}_{}_seq", cd.colname));
     }
     column.typmod = cd.type_name.as_ref().map(declared_typmod).unwrap_or(-1);
@@ -9057,6 +9073,11 @@ fn plan_added_column(
     } else if let Some(coll) = domains::declared_collation(&ty) {
         column.extra.insert("collation", coll);
     }
+    if let Some(d) = &domain {
+        // The domain's DEFAULT is the column's unless the column declares
+        // its own (below, which then overwrites it).
+        tag_domain_column(&mut column, d, resolved.as_ref(), &ty)?;
+    }
     for con in &cd.constraints {
         let Some(N::Constraint(k)) = con.node.as_ref() else {
             continue;
@@ -9073,6 +9094,12 @@ fn plan_added_column(
                 // executor's rewrite -- `gen_random_uuid()` gives each row its
                 // own, as PostgreSQL does -- and per inserted row after.
                 check_default_type(&column, raw)?;
+                // The column's own DEFAULT replaces the domain's, whichever
+                // form either takes.
+                column.extra.remove("default_from_domain");
+                column.default = None;
+                column.set_default_expr(None);
+                column.set_default_sql(None);
                 match default_value_or_expr(raw, &ty, params)? {
                     DefaultSpec::Value(v) => {
                         column.default = Some(v);

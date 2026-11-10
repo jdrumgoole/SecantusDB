@@ -136,8 +136,10 @@ def test_pg_get_viewdef_of_a_system_view(dsn: str) -> None:
 
 
 # `ATExecAddColumn` types an added column of a domain as it does one CREATE
-# TABLE declares: an aggregate over the base type takes it.
-@pytest.mark.backlog("RP-799")
+# TABLE declares: an aggregate over the base type takes it. Here the column
+# was typed by the domain's name, so `string_agg` was 42883; fixed by
+# RP-799.
+@pytest.mark.backlog_fixed("RP-799")
 def test_an_added_domain_column_reaches_its_base_types_aggregates(dsn: str) -> None:
     with _connect(dsn) as c:
         got = [
