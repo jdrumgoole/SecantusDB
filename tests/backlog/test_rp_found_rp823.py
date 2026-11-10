@@ -3,10 +3,13 @@ portal was not pinned):
 
 - a FOR loop over a query or an EXECUTE runs no portal: `pg_cursors` lists
   none while it runs, and a CLOSE ALL in its body is not refused;
-- a BEGIN inside a multi-statement simple query warns 25001.
+- a BEGIN inside a multi-statement simple query warned 25001 (RP-829, fixed:
+  the implicit block, `TBLOCK_IMPLICIT_INPROGRESS`, is now modelled for
+  every block statement).
 
 The expected answers were measured on PostgreSQL 15.19; none of the
-statements creates an object.
+statements creates an object (the PREPARE TRANSACTION case was measured on
+a private cluster, and its transaction is rolled back).
 """
 
 from __future__ import annotations
@@ -64,10 +67,168 @@ def test_a_query_loop_walks_a_pinned_portal(query: str, dsn: str) -> None:
     assert _answer(dsn, query) == QUERY_LOOP_PORTAL[query]
 
 
-@pytest.mark.backlog("RP-829")
+@pytest.mark.backlog_fixed("RP-829")
 @pytest.mark.parametrize("query", ["begin; select 1; commit", "select 1; begin; select 2; commit"])
 def test_a_begin_in_a_multi_statement_query_does_not_warn(query: str, dsn: str) -> None:
     # `BeginTransactionBlock` turns an implicit block (TBLOCK_IMPLICIT_
     # INPROGRESS) into a real one with no WARNING; only a BEGIN inside an
     # explicit block warns 25001.
     assert _answer(dsn, query) == ("notice", [])
+
+
+ALREADY = ("25001", "there is already a transaction in progress")
+NO_TXN = ("25P01", "there is no transaction in progress")
+
+
+def _blocks(c: psycopg.Connection, query: str) -> tuple[object, ...]:
+    """Every result of one simple Query (tag and rows), or its error, with
+    the notices it raised and the transaction status after it."""
+    notices: list[tuple[str | None, str | None]] = []
+    c.add_notice_handler(lambda d: notices.append((d.sqlstate, d.message_primary)))
+    try:
+        cur = c.execute(query)
+        results = []
+        while True:
+            results.append((cur.statusmessage, cur.fetchall() if cur.description else None))
+            if not cur.nextset():
+                break
+        outcome: object = results
+    except psycopg.Error as e:
+        outcome = ("error", e.sqlstate, e.diag.message_primary)
+    return (outcome, notices, c.info.transaction_status.name)
+
+
+IMPLICIT_BLOCK = {
+    # A BEGIN in an explicit block still warns, implicit block or not.
+    "begin; begin; select 1; commit": (
+        [("BEGIN", None), ("BEGIN", None), ("SELECT 1", [(1,)]), ("COMMIT", None)],
+        [ALREADY],
+        "IDLE",
+    ),
+    # `EndTransactionBlock` / `UserAbortTransactionBlock`: the implicit
+    # block ends with a WARNING, and the query goes on in a new one.
+    "select 1; commit": ([("SELECT 1", [(1,)]), ("COMMIT", None)], [NO_TXN], "IDLE"),
+    "select 1; rollback": ([("SELECT 1", [(1,)]), ("ROLLBACK", None)], [NO_TXN], "IDLE"),
+    "commit; select 1": ([("COMMIT", None), ("SELECT 1", [(1,)])], [NO_TXN], "IDLE"),
+    "rollback; select 1": ([("ROLLBACK", None), ("SELECT 1", [(1,)])], [NO_TXN], "IDLE"),
+    "select 1; commit; select 1/0": (("error", "22012", "division by zero"), [NO_TXN], "IDLE"),
+    # ... but AND CHAIN, and the savepoint statements, are errors there.
+    "select 1; commit and chain": (
+        ("error", "25P01", "COMMIT AND CHAIN can only be used in transaction blocks"),
+        [],
+        "IDLE",
+    ),
+    "select 1; rollback and chain": (
+        ("error", "25P01", "ROLLBACK AND CHAIN can only be used in transaction blocks"),
+        [],
+        "IDLE",
+    ),
+    "select 1; savepoint s": (
+        ("error", "25P01", "SAVEPOINT can only be used in transaction blocks"),
+        [],
+        "IDLE",
+    ),
+    "select 1; release savepoint s": (
+        ("error", "25P01", "RELEASE SAVEPOINT can only be used in transaction blocks"),
+        [],
+        "IDLE",
+    ),
+    "select 1; rollback to savepoint s": (
+        ("error", "25P01", "ROLLBACK TO SAVEPOINT can only be used in transaction blocks"),
+        [],
+        "IDLE",
+    ),
+    # After a BEGIN it is a block like any other.
+    "select 1; begin; savepoint s; release s; commit": (
+        [
+            ("SELECT 1", [(1,)]),
+            ("BEGIN", None),
+            ("SAVEPOINT", None),
+            ("RELEASE", None),
+            ("COMMIT", None),
+        ],
+        [],
+        "IDLE",
+    ),
+    "select 1; begin; select 2": (
+        [("SELECT 1", [(1,)]), ("BEGIN", None), ("SELECT 1", [(2,)])],
+        [],
+        "INTRANS",
+    ),
+    "select 1; start transaction; select 2": (
+        [("SELECT 1", [(1,)]), ("START TRANSACTION", None), ("SELECT 1", [(2,)])],
+        [],
+        "INTRANS",
+    ),
+    "select 1; begin; commit and chain; show transaction_isolation": (
+        [
+            ("SELECT 1", [(1,)]),
+            ("BEGIN", None),
+            ("COMMIT", None),
+            ("SHOW", [("read committed",)]),
+        ],
+        [],
+        "INTRANS",
+    ),
+    # A BEGIN that continues a transaction keeps its modes, and sets only
+    # the ones it names.
+    "set transaction read only; begin; show transaction_read_only; commit": (
+        [("SET", None), ("BEGIN", None), ("SHOW", [("on",)]), ("COMMIT", None)],
+        [],
+        "IDLE",
+    ),
+    "set transaction isolation level repeatable read; begin read only; "
+    "show transaction_isolation; show transaction_read_only; commit": (
+        [
+            ("SET", None),
+            ("BEGIN", None),
+            ("SHOW", [("repeatable read",)]),
+            ("SHOW", [("on",)]),
+            ("COMMIT", None),
+        ],
+        [],
+        "IDLE",
+    ),
+    "set transaction isolation level repeatable read; start transaction; "
+    "show transaction_isolation; commit": (
+        [
+            ("SET", None),
+            ("START TRANSACTION", None),
+            ("SHOW", [("repeatable read",)]),
+            ("COMMIT", None),
+        ],
+        [],
+        "IDLE",
+    ),
+    "begin isolation level serializable; begin; show transaction_isolation; commit": (
+        [("BEGIN", None), ("BEGIN", None), ("SHOW", [("serializable",)]), ("COMMIT", None)],
+        [ALREADY],
+        "IDLE",
+    ),
+}
+
+
+@pytest.mark.backlog_fixed("RP-829")
+@pytest.mark.parametrize("query", list(IMPLICIT_BLOCK))
+def test_the_implicit_blocks_transaction_statements(query: str, dsn: str) -> None:
+    with psycopg.connect(dsn, autocommit=True) as c:
+        assert _blocks(c, query) == IMPLICIT_BLOCK[query]
+
+
+@pytest.mark.backlog_fixed("RP-829")
+def test_a_prepare_transaction_in_the_implicit_block_prepares_it(dsn: str) -> None:
+    # `PrepareTransactionBlock` over `EndTransactionBlock`: the WARNING,
+    # then the implicit block's transaction is prepared.
+    with psycopg.connect(dsn, autocommit=True) as c:
+        try:
+            assert _blocks(c, "select 1; prepare transaction 'rp829'") == (
+                [("SELECT 1", [(1,)]), ("PREPARE TRANSACTION", None)],
+                [NO_TXN],
+                "IDLE",
+            )
+            assert c.execute(
+                "select gid from pg_prepared_xacts where gid = 'rp829'"
+            ).fetchall() == [("rp829",)]
+        finally:
+            if c.execute("select gid from pg_prepared_xacts where gid = 'rp829'").fetchall():
+                c.execute("rollback prepared 'rp829'")

@@ -121,6 +121,28 @@ fn word_type(word: &str) -> Option<String> {
     (builtin || user).then(|| word.to_string())
 }
 
+/// The catalog key of `relation` as `RangeVarGetRelid` finds it: on the
+/// path when unqualified, else in `schema` -- `pg_temp` only once the
+/// session has its temporary schema, a catalog by its bare name. `None`
+/// when the schema does not exist (`LookupExplicitNamespace`).
+fn relation_key_of(schema: Option<&str>, relation: &str) -> Option<String> {
+    let Some(s) = schema else {
+        return Some(schemas::resolve_unqualified(relation));
+    };
+    let resolved = if crate::is_pg_temp_schema(s) {
+        schemas::temp_schema_in_use().filter(|t| s == "pg_temp" || t == s)?
+    } else if schemas::schema_exists(s) {
+        s.to_string()
+    } else {
+        return None;
+    };
+    Some(if resolved == "pg_catalog" {
+        relation.to_string()
+    } else {
+        schemas::relation_key(&resolved, relation)
+    })
+}
+
 /// The type of `relation.column` (`schema.relation.column`), with its
 /// modifier, when the relation exists and has the column.
 fn column_type(
@@ -129,18 +151,7 @@ fn column_type(
     column: &str,
     lookup: &dyn Fn(&str) -> Option<TableDef>,
 ) -> Option<String> {
-    let key = match schema {
-        None => schemas::resolve_unqualified(relation),
-        Some(s) if crate::is_pg_temp_schema(s) => {
-            schemas::relation_key(&schemas::temp_schema()?, relation)
-        }
-        Some(s) => {
-            if !schemas::schema_exists(s) {
-                return None;
-            }
-            schemas::relation_key(s, relation)
-        }
-    };
+    let key = relation_key_of(schema.map(String::as_str), relation)?;
     let def = lookup(&key)?;
     let c = def.column(column)?;
     // A domain column is of the domain, which carries the modifier
@@ -157,9 +168,179 @@ fn column_type(
     })
 }
 
+/// `LookupTypeNameExtended`'s `%TYPE` branch, for a routine's parameter or
+/// result type (RP-822): CREATE FUNCTION / PROCEDURE look each one up with
+/// `missing_ok` false and no parse state, so every error here has no
+/// position.
+///
+/// The words are `relation.column`, `schema.relation.column` or
+/// `database.schema.relation.column` (the grammar refuses a lone word).
+/// The relation is found as `RangeVarGetRelid` finds it -- 0A000 for
+/// another database, 3F000 for a missing schema, 42P01 for a missing
+/// relation -- and the column is any of its attributes, a system column
+/// included, else 42703. The type is the column's, WITHOUT its modifier
+/// (`atttypid` only), and a NOTICE says so (`type reference t.c%TYPE
+/// converted to character varying`). The answer is a type name naming that
+/// type, the `SETOF` and position kept, which the routine then stores as
+/// if it had been written out.
+pub(crate) fn routine_percent_type(
+    tn: &pg_query::protobuf::TypeName,
+    lookup: &dyn Fn(&str) -> Option<TableDef>,
+) -> crate::Result<pg_query::protobuf::TypeName> {
+    use crate::Error;
+    use pg_query::protobuf::node::Node as N;
+    let words: Vec<String> = tn
+        .names
+        .iter()
+        .filter_map(|n| match n.node.as_ref()? {
+            N::String(s) => Some(s.sval.clone()),
+            _ => None,
+        })
+        .collect();
+    let refuse = |e: Error| {
+        crate::set_error_unpositioned();
+        Err(e)
+    };
+    // `NameListToString`: the words joined by dots, never quoted.
+    let written = words.join(".");
+    let (schema, relation, column) = match words.as_slice() {
+        [_] => {
+            return refuse(Error::Sqlstate(
+                "42601",
+                format!("improper %TYPE reference (too few dotted names): {written}"),
+            ))
+        }
+        [relation, column] => (None, relation, column),
+        [schema, relation, column] => (Some(schema.clone()), relation, column),
+        [catalog, schema, relation, column] => {
+            if *catalog != crate::session_database() {
+                return refuse(Error::Sqlstate(
+                    "0A000",
+                    format!(
+                        "cross-database references are not implemented: \"{catalog}.{schema}.{relation}\""
+                    ),
+                ));
+            }
+            (Some(schema.clone()), relation, column)
+        }
+        _ => {
+            return refuse(Error::Sqlstate(
+                "42601",
+                format!("improper %TYPE reference (too many dotted names): {written}"),
+            ))
+        }
+    };
+    let Some(key) = relation_key_of(schema.as_deref(), relation) else {
+        return refuse(Error::Sqlstate(
+            "3F000",
+            format!("schema \"{}\" does not exist", schema.unwrap_or_default()),
+        ));
+    };
+    let Some(def) = lookup(&key) else {
+        let shown = match &schema {
+            Some(s) => format!("{s}.{relation}"),
+            None => relation.clone(),
+        };
+        // Not `UndefinedTable`, which the server places at the name.
+        return refuse(Error::Sqlstate(
+            "42P01",
+            format!("relation \"{shown}\" does not exist"),
+        ));
+    };
+    let Some(c) = def.column(column) else {
+        return refuse(Error::Sqlstate(
+            "42703",
+            format!("column \"{column}\" of relation \"{relation}\" does not exist"),
+        ));
+    };
+    // A domain column is of the domain, an enum column of its enum.
+    let ty = ["domain_type", "enum_type"]
+        .iter()
+        .find_map(|k| c.extra.get_str(k).ok().map(str::to_string))
+        .unwrap_or_else(|| c.pg_type.clone());
+    // `format_type_be`: no modifier.
+    crate::fts::planner_notice(&format!(
+        "type reference {written}%TYPE converted to {}",
+        scalar::format_type_text_public(&ty, None)
+    ));
+    let (element, array) = match ty.strip_suffix("[]") {
+        Some(e) => (e, true),
+        None => (ty.as_str(), false),
+    };
+    let string = |s: &str| pg_query::protobuf::Node {
+        node: Some(N::String(pg_query::protobuf::String { sval: s.into() })),
+    };
+    // A schema-qualified type keeps its schema as its own name part.
+    let names = match element.split_once('.') {
+        Some((s, n)) if !element.starts_with('"') => vec![string(s), string(n)],
+        _ => vec![string(element)],
+    };
+    let array_bounds = if array {
+        vec![pg_query::protobuf::Node {
+            node: Some(N::Integer(pg_query::protobuf::Integer { ival: -1 })),
+        }]
+    } else {
+        Vec::new()
+    };
+    Ok(pg_query::protobuf::TypeName {
+        names,
+        type_oid: 0,
+        setof: tn.setof,
+        pct_type: false,
+        typmods: Vec::new(),
+        typemod: -1,
+        array_bounds,
+        location: tn.location,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::plpgsql_percent_type_words as words;
+
+    /// The first parameter's type name of a CREATE FUNCTION.
+    fn first_parameter_type(sql: &str) -> pg_query::protobuf::TypeName {
+        use pg_query::protobuf::node::Node as N;
+        let tree = pg_query::parse(sql).expect("parses");
+        let Some(N::CreateFunctionStmt(f)) = tree.protobuf.stmts[0]
+            .stmt
+            .as_ref()
+            .and_then(|s| s.node.clone())
+        else {
+            panic!("not a CREATE FUNCTION")
+        };
+        match f.parameters[0].node.as_ref() {
+            Some(N::FunctionParameter(p)) => p.arg_type.clone().expect("typed"),
+            _ => panic!("no parameter"),
+        }
+    }
+
+    #[test]
+    fn a_routines_percent_type_nothing_answers_is_refused() {
+        let refused = |sql: &str| {
+            let tn = first_parameter_type(sql);
+            assert!(tn.pct_type);
+            super::routine_percent_type(&tn, &|_| None)
+                .expect_err("refused")
+                .to_string()
+        };
+        let body = " returns int language sql as $$ select 1 $$";
+        assert!(
+            refused(&format!("create function f(x a.b.c.d.e%type){body}"))
+                .contains("improper %TYPE reference (too many dotted names): a.b.c.d.e")
+        );
+        assert!(refused(&format!("create function f(x nope.v%type){body}"))
+            .contains("relation \"nope\" does not exist"));
+        assert!(
+            refused(&format!("create function f(x nos.nope.v%type){body}"))
+                .contains("schema \"nos\" does not exist")
+        );
+        // No temporary table yet: `pg_temp` names no schema.
+        assert!(
+            refused(&format!("create function f(x pg_temp.t.v%type){body}"))
+                .contains("schema \"pg_temp\" does not exist")
+        );
+    }
 
     fn w(parts: &[&str]) -> Option<Vec<String>> {
         Some(parts.iter().map(|p| p.to_string()).collect())

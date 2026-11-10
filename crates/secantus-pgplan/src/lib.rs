@@ -5986,7 +5986,7 @@ fn plan_node(
                 written: parts.join("."),
             })
         }
-        N::CreateFunctionStmt(f) => plan_create_function(&f),
+        N::CreateFunctionStmt(f) => plan_create_function(&f, lookup),
         N::CallStmt(c) => plan_call(&c, params),
         N::AlterFunctionStmt(a) => alter_routine::plan_alter(&a),
         N::AlterObjectSchemaStmt(a) if alter_routine::plan_set_schema(&a).is_some() => {
@@ -7119,6 +7119,48 @@ fn check_routine_types(f: &pg_query::protobuf::CreateFunctionStmt) -> Result<()>
     Ok(())
 }
 
+/// A routine's signature with each `%TYPE` resolved to the column's type
+/// (RP-822), in the order CREATE FUNCTION looks its types up: the
+/// parameters (`interpret_function_parameter_list`), then the result
+/// (`compute_return_type`). A parameter's type that does not exist is
+/// reported where it stands, so a `%TYPE` before it has already said
+/// what it converted to, and one after it is never looked up. `check`
+/// is whether the other types are checked here (a `LANGUAGE sql` or
+/// `plpgsql` routine's; see `check_routine_types`).
+fn resolve_routine_types(
+    f: &pg_query::protobuf::CreateFunctionStmt,
+    lookup: &dyn Fn(&str) -> Option<TableDef>,
+    check: bool,
+) -> Result<pg_query::protobuf::CreateFunctionStmt> {
+    let mut f = f.clone();
+    for p in &mut f.parameters {
+        if let Some(N::FunctionParameter(fp)) = p.node.as_mut() {
+            if let Some(tn) = fp.arg_type.as_mut() {
+                if tn.pct_type {
+                    *tn = plpgsql_pct_type::routine_percent_type(tn, lookup)?;
+                } else if check {
+                    if let Some(t) = routine_type_missing(tn)? {
+                        return Err(Error::UndefinedObject(format!("type {t} does not exist")));
+                    }
+                }
+            }
+        }
+    }
+    // A procedure has no result; RETURNS TABLE of one column repeats that
+    // column's type as the result, which is looked up again.
+    if !f.is_procedure {
+        if let Some(tn) = f.return_type.as_mut() {
+            if tn.pct_type {
+                *tn = plpgsql_pct_type::routine_percent_type(tn, lookup)?;
+            }
+        }
+    }
+    if check {
+        check_routine_types(&f)?;
+    }
+    Ok(f)
+}
+
 /// Why a PL/pgSQL DECLARE's type was refused: by the type lookup
 /// `parse_datatype` runs under its own error callback, which places the
 /// error at the type's text in the body (`AtType`), or by a
@@ -7232,7 +7274,10 @@ pub fn plpgsql_declared_type(text: &str) -> std::result::Result<(), DeclaredType
     }
 }
 
-fn plan_create_function(f: &pg_query::protobuf::CreateFunctionStmt) -> Result<Statement> {
+fn plan_create_function(
+    f: &pg_query::protobuf::CreateFunctionStmt,
+    lookup: &dyn Fn(&str) -> Option<TableDef>,
+) -> Result<Statement> {
     let name_parts: Vec<String> = f
         .funcname
         .iter()
@@ -7267,11 +7312,12 @@ fn plan_create_function(f: &pg_query::protobuf::CreateFunctionStmt) -> Result<St
         .next_back()
         .ok_or_else(|| Error::Parse("CREATE FUNCTION without a name".into()))?;
     // Every type the signature names is looked up before the result is
-    // reconciled with the OUT parameters (RP-566). A `LANGUAGE internal`
-    // wrapper's are checked where it is created.
-    if matches!(routine_language(f).as_deref(), Some("sql" | "plpgsql")) {
-        check_routine_types(f)?;
-    }
+    // reconciled with the OUT parameters (RP-566), a `%TYPE` resolved to
+    // its column's type (RP-822). A `LANGUAGE internal` wrapper's other
+    // types are checked where it is created.
+    let check = matches!(routine_language(f).as_deref(), Some("sql" | "plpgsql"));
+    let resolved = resolve_routine_types(f, lookup, check)?;
+    let f = &resolved;
     let mut arg_types = Vec::new();
     for p in &f.parameters {
         let Some(N::FunctionParameter(fp)) = p.node.as_ref() else {

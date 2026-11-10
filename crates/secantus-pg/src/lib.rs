@@ -4539,6 +4539,14 @@ pub struct PgHandler {
     /// query outside a block -- PostgreSQL's non-atomic context. A
     /// multi-statement query string is an implicit block.
     sole_implicit: AtomicBool,
+    /// PostgreSQL's `TBLOCK_IMPLICIT_INPROGRESS`: the transaction open is a
+    /// multi-statement simple query's implicit block, not one a BEGIN
+    /// opened. It counts as a transaction block for everything that asks
+    /// (`in_transaction` is set), except xact.c's block statements: a BEGIN
+    /// there makes it the block with no WARNING, a COMMIT / ROLLBACK /
+    /// PREPARE TRANSACTION warns 25P01 and ends it, and AND CHAIN and the
+    /// savepoint statements are 25P01 errors (RP-829).
+    implicit_block: AtomicBool,
     /// Set by `with_isolation_for`: the READ COMMITTED statement about to run
     /// reads only tables the block has not written, so it runs in a fresh
     /// read-only transaction ([`PgHandler::rc_reads_apart`]) instead of the
@@ -5070,6 +5078,7 @@ impl PgHandler {
             wire_portals: Mutex::new(HashMap::new()),
             txn_control: AtomicBool::new(false),
             sole_implicit: AtomicBool::new(false),
+            implicit_block: AtomicBool::new(false),
             rc_apart: AtomicBool::new(false),
             ssi_registered: AtomicBool::new(false),
             bound_params: Mutex::new(None),
@@ -28666,14 +28675,37 @@ impl PgHandler {
     ///   transaction, and what it committed survives the later failure.
     ///
     /// Both fall out of reusing the session's own transaction slot rather than
-    /// tracking a second one: `BEGIN` inside an open transaction is already a
-    /// no-op here (as it is a warning in PostgreSQL), and `COMMIT` already
-    /// takes the handle. After a mid-batch COMMIT a fresh implicit transaction
-    /// is opened for the commands that follow, which is what PostgreSQL does.
+    /// tracking a second one: a `BEGIN` keeps the open transaction, and
+    /// `COMMIT` already takes the handle. After a mid-batch COMMIT a fresh
+    /// implicit transaction is opened for the commands that follow, which is
+    /// what PostgreSQL does. What the block statements say there -- no
+    /// WARNING for a BEGIN, one for a COMMIT -- is `implicit_block`'s.
     async fn run_batch(&self, stmts: &[String], whole: &str) -> PgWireResult<Vec<Response>> {
+        let out = self.run_batch_statements(stmts, whole).await;
+        // The implicit block ends with the query string, whichever way.
+        self.implicit_block
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        out
+    }
+
+    /// Open the batch's implicit transaction. Two statements or more make it
+    /// an implicit BLOCK (`TBLOCK_IMPLICIT_INPROGRESS`, `implicit_block`);
+    /// one alone is PostgreSQL's `TBLOCK_STARTED`.
+    fn begin_batch_implicit(&self, stmts: usize) -> PgWireResult<()> {
+        self.begin_implicit()?;
+        self.implicit_block
+            .store(stmts > 1, std::sync::atomic::Ordering::Relaxed);
+        Ok(())
+    }
+
+    async fn run_batch_statements(
+        &self,
+        stmts: &[String],
+        whole: &str,
+    ) -> PgWireResult<Vec<Response>> {
         let mut implicit = self.txn.lock().unwrap_or_else(|e| e.into_inner()).is_none();
         if implicit {
-            self.begin_implicit()?;
+            self.begin_batch_implicit(stmts.len())?;
         }
 
         let mut out = Vec::with_capacity(stmts.len());
@@ -28741,7 +28773,7 @@ impl PgHandler {
             // transaction; PostgreSQL starts another for what follows.
             if i + 1 < stmts.len() && self.txn.lock().unwrap_or_else(|e| e.into_inner()).is_none() {
                 implicit = true;
-                self.begin_implicit()?;
+                self.begin_batch_implicit(stmts.len())?;
             }
         }
 
@@ -32623,6 +32655,17 @@ impl PgHandler {
         }
     }
 
+    /// A top-level statement of a multi-statement query's implicit block
+    /// (`implicit_block`). A PL/pgSQL statement is never one.
+    fn in_implicit_block(&self) -> bool {
+        self.implicit_block
+            .load(std::sync::atomic::Ordering::Relaxed)
+            && self
+                .nested_statements
+                .load(std::sync::atomic::Ordering::Relaxed)
+                == 0
+    }
+
     fn begin_implicit(&self) -> PgWireResult<()> {
         let handle = self.open_transaction_handle()?;
         *self.txn.lock().unwrap_or_else(|e| e.into_inner()) = Some(handle);
@@ -33461,6 +33504,20 @@ impl PgHandler {
         // COMMIT and ROLLBACK are: rolling back to a savepoint is how a client
         // RECOVERS from the error that poisoned the block.
         if let Statement::Transaction(control) = &stmt {
+            // AND CHAIN in an implicit block is `EndTransactionBlock` /
+            // `UserAbortTransactionBlock`'s 25P01, before anything ends.
+            let chain_word = match control {
+                TransactionControl::Commit { chain: true } => Some("COMMIT AND CHAIN"),
+                TransactionControl::Rollback { chain: true } => Some("ROLLBACK AND CHAIN"),
+                _ => None,
+            };
+            if let Some(word) = chain_word.filter(|_| self.in_implicit_block()) {
+                self.note_failure();
+                return Err(Self::user_error(
+                    "25P01",
+                    format!("{word} can only be used in transaction blocks"),
+                ));
+            }
             // A COMMIT does the block's temporary tables' ON COMMIT actions
             // first, inside the block, as `PreCommit_on_commit_actions` does
             // (RP-065): a commit that then fails undoes them with the rest.
@@ -36100,9 +36157,12 @@ impl PgHandler {
             TransactionControl::Release(_) => "RELEASE SAVEPOINT",
             _ => "ROLLBACK TO SAVEPOINT",
         };
+        // An implicit block refuses them too (`DefineSavepoint`,
+        // `ReleaseSavepoint`, `RollbackToSavepoint`).
         if !self
             .in_transaction
             .load(std::sync::atomic::Ordering::Relaxed)
+            || self.in_implicit_block()
         {
             return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
                 "ERROR".into(),
@@ -36507,22 +36567,44 @@ impl PgHandler {
     /// for the rest. This server is single-node and does not enforce isolation;
     /// it only reflects what was requested so a client reading
     /// `current_setting('transaction_isolation')` sees its own choice.
-    fn apply_transaction_modes_on_begin(&self, modes: &TransactionModes) {
+    ///
+    /// A BEGIN `continuing` an open transaction -- a nested one, or one
+    /// in a multi-statement query's implicit block -- starts nothing: the
+    /// transaction keeps what it had (a `SET TRANSACTION` before the BEGIN
+    /// included), and only the modes the statement names are set, as
+    /// `standard_ProcessUtility` sets them after `BeginTransactionBlock`
+    /// (15.19: `set transaction read only; begin; show
+    /// transaction_read_only` is `on`, RP-829).
+    fn apply_transaction_modes_on_begin(&self, modes: &TransactionModes, continuing: bool) {
         let mut settings = self.settings.lock().unwrap_or_else(|e| e.into_inner());
-        let default_of = |settings: &HashMap<String, String>, key: &str| -> String {
-            settings.get(key).cloned().unwrap_or_default()
+        let unnamed = |settings: &HashMap<String, String>, key: &str, default: &str| -> String {
+            settings
+                .get(if continuing { key } else { default })
+                .cloned()
+                .unwrap_or_default()
         };
-        let isolation = modes
-            .isolation
-            .clone()
-            .unwrap_or_else(|| default_of(&settings, "default_transaction_isolation"));
+        let isolation = modes.isolation.clone().unwrap_or_else(|| {
+            unnamed(
+                &settings,
+                "transaction_isolation",
+                "default_transaction_isolation",
+            )
+        });
         let read_only = match modes.read_only {
             Some(v) => if v { "on" } else { "off" }.to_string(),
-            None => default_of(&settings, "default_transaction_read_only"),
+            None => unnamed(
+                &settings,
+                "transaction_read_only",
+                "default_transaction_read_only",
+            ),
         };
         let deferrable = match modes.deferrable {
             Some(v) => if v { "on" } else { "off" }.to_string(),
-            None => default_of(&settings, "default_transaction_deferrable"),
+            None => unnamed(
+                &settings,
+                "transaction_deferrable",
+                "default_transaction_deferrable",
+            ),
         };
         settings.insert_keeping_source("transaction_isolation", isolation);
         settings.insert_keeping_source("transaction_read_only", read_only);
@@ -36575,7 +36657,19 @@ impl PgHandler {
             && self
                 .in_transaction
                 .load(std::sync::atomic::Ordering::Relaxed);
-        if nested {
+        // A multi-statement query's implicit block is the exception
+        // (`TBLOCK_IMPLICIT_INPROGRESS`, RP-829): a BEGIN there makes it the
+        // block -- same transaction, no WARNING -- and a COMMIT, ROLLBACK or
+        // PREPARE TRANSACTION ends it with `EndTransactionBlock`'s WARNING
+        // (AND CHAIN was refused in `run`).
+        let implicit = self.in_implicit_block();
+        if implicit {
+            self.implicit_block
+                .store(false, std::sync::atomic::Ordering::Relaxed);
+            if !opens {
+                self.warning("25P01", "there is no transaction in progress".into());
+            }
+        } else if nested {
             self.warning("25001", "there is already a transaction in progress".into());
         }
         // What the block did to temporary tables and holdable cursors only
@@ -36646,14 +36740,14 @@ impl PgHandler {
             // error, and the existing transaction continues.
             TransactionControl::Begin(modes) => {
                 begin(&mut guard)?;
-                self.apply_transaction_modes_on_begin(&modes);
+                self.apply_transaction_modes_on_begin(&modes, nested);
                 ("BEGIN", false)
             }
             // Same statement, different word: the tag is what a client reads
             // back, and `START TRANSACTION` answers with its own.
             TransactionControl::Start(modes) => {
                 begin(&mut guard)?;
-                self.apply_transaction_modes_on_begin(&modes);
+                self.apply_transaction_modes_on_begin(&modes, nested);
                 ("START TRANSACTION", false)
             }
             TransactionControl::Commit { chain } => {
