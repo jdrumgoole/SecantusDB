@@ -934,19 +934,29 @@ These are explicit non-goals. Don't add them without a reason.
       neither:
       - a read two or more plans could serve, which mongod chooses by
         trial, other than a `find`'s: an `aggregate`'s, a `count`'s, a
-        write's. Its documents come from the store's router. mongod counts
-        what the winner examined in its trial, and since RM-349 a `find`
-        streams the winner after its trial's buffer and counts as mongod's
-        does; the other readers still decline a contested plan
-        (`order::stream_plan`);
-      - a time-series collection's read and a geo, `$near` or `$text` read.
-        mongod counts the buckets its cursor stage buffered (all 15 of 300
-        measurements in the first batch of 101, 0 after); counting them
-        needs `find` to read the buckets as a time-series `aggregate` does
-        since RM-348, which is RM-455.
-      Measured 2026-10-27 and 2026-11-07.
+        `distinct`'s, a write's. Its documents come from the store's
+        router. mongod counts what the winner examined in its trial, and
+        since RM-349 a `find` streams the winner after its trial's buffer
+        and counts as mongod's does; the other readers still decline a
+        contested plan (`order::stream_plan`);
+      - a read of a time-series collection made whole: under a `$sort`, a
+        `$group` (`count_documents`), an inclusion `$project` (RM-456), a
+        filter on the meta field (RM-457), a hint or a collation. mongod
+        counts the buckets its cursor stage buffered (five of five for a
+        sorted `find`). Since RM-455 a `find` is the aggregation mongod
+        converts it to, and counts where a time-series `aggregate` streams;
+      - a geo, `$near` or `$text` read (`$geoWithin` over a `2d` index:
+        mongod 5 keys and 4 documents, this server none).
+      Measured 2026-10-27, 2026-11-07 and 2026-11-10.
       Backlog-ID: RM-363
-      Verify: tests/backlog/test_rm_355_364.py::test_a_read_of_a_time_series_collection_counts_what_it_examined
+      Verify: tests/backlog/test_rm_355_364.py::test_a_contested_aggregate_counts_what_it_examined, tests/backlog/test_rm_355_364.py::test_a_time_series_read_made_whole_counts_what_it_examined
+- [ ] **A read of a time-series collection's meta index names the index
+      as `listIndexes` shows it.** mongod 8.2.11's line for a `find({m: 1})`
+      of a time-series collection says `IXSCAN { meta: 1, control.min.t: 1,
+      control.max.t: 1 }`, the index as its buckets keep it; this server's
+      says `IXSCAN { m: 1, t: 1 }`. Found while working RM-363, 2026-11-10.
+      Verify: tests/backlog/test_rm_found_2026_11_10_rm363.py::test_a_read_of_the_meta_index_names_the_index_over_the_buckets
+      Backlog-ID: RM-496
 - [ ] **A read of the plan cache's plan has no CACHED_PLAN stage.** mongod
       8.2.11 runs the active plan of its plan cache under a CACHED_PLAN
       stage, and its profile entries for the `find` and each `getMore`
@@ -2392,16 +2402,15 @@ cursor options, `getMore`, `killCursors`, the cursors of `aggregate` and the
 listing commands, tailable cursors, `count`, `distinct`). The Rust server
 differs on 5 scenarios. What is left:
 
-- [ ] **RUST MongoDB server: a `find` of a time-series collection reads
-      it whole.** mongod answers it with an aggregation over the buckets,
-      read through its cursor stage (32 buckets first, twice as many at each
-      refill) as a time-series `aggregate` is here since RM-348: over 4,000
-      measurements in 100 buckets, read one at a time and all deleted after
-      the first, mongod 8.2.11 returns 2,303 more and this server 3,999.
-      `find` reads the collection at the command (`find.rs`, `as_read`), so
-      its line also counts nothing examined (RM-363). Measured 2026-11-09.
-      Backlog-ID: RM-455
-      Verify: tests/backlog/test_rm_found_2026_11_09_rm348.py::test_a_time_series_find_goes_bucket_by_bucket
+- [ ] **RUST MongoDB server: a tailable `find` of a collection that is not
+      capped does not print its query.** mongod 8.2.11 refuses it (2) with
+      the query its planner could not plan, `error processing query:
+      ns=<db>.pTree: $and\nSort: {}\nProj: {}\n tailable cursor requested
+      on non capped collection`; this server's message is `ns=<db>.p
+      tailable cursor ...`, with no query. Found while working RM-363,
+      2026-11-10.
+      Verify: tests/backlog/test_rm_found_2026_11_10_rm363.py::test_a_tailable_find_of_a_collection_that_is_not_capped_prints_its_query
+      Backlog-ID: RM-498
 - [ ] **RUST MongoDB server: a time-series `aggregate` that needs only
       some fields reads the collection at the command.** Behind an inclusion
       `$project` (`{$project: {v: 1}}`) mongod 8.2.11 reads the buckets one

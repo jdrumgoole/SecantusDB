@@ -8,6 +8,7 @@ its item names with mongod 8.2's.
 
 from __future__ import annotations
 
+import datetime
 from collections.abc import Iterator
 from typing import Any
 
@@ -1211,13 +1212,14 @@ def test_a_contested_read_counts_what_it_examined(rust_mongo: Any, mongod_rs: An
     assert answers["rust"] == answers["mongod"]
 
 
-@pytest.mark.backlog("RM-363")
+@pytest.mark.backlog_fixed("RM-363")
 def test_a_read_of_a_time_series_collection_counts_what_it_examined(
     rust_mongo: Any, mongod_rs: Any
 ) -> None:
     """mongod 8.2.11's line for a `find` of a time-series collection counts
     the buckets it examined (`keysExamined: 0, docsExamined: 0` over none,
-    measured 2026-10-27). This server reads it whole, and counts nothing."""
+    measured 2026-10-27). This server read it whole, and counted nothing,
+    until the `find` became the aggregation mongod converts it to (RM-455)."""
 
     def setup(db: Any) -> None:
         db.create_collection("ts", timeseries={"timeField": "t"})
@@ -1225,6 +1227,59 @@ def test_a_read_of_a_time_series_collection_counts_what_it_examined(
     got = _both(rust_mongo, mongod_rs, lambda d: list(d.ts.find()), setup)
     answers = {s: _counts(_line(lines, "find")) for s, (lines, _) in got.items()}
     assert answers["mongod"].get("docsExamined") == 0
+    assert answers["rust"] == answers["mongod"]
+
+
+def _series(db: Any) -> None:
+    """300 measurements in five series: five buckets."""
+    db.create_collection("ts", timeseries={"timeField": "t", "metaField": "m"})
+    base = datetime.datetime(2024, 1, 1)
+    db.ts.insert_many(
+        [{"t": base + datetime.timedelta(seconds=i), "m": i % 5, "v": i} for i in range(300)]
+    )
+
+
+@pytest.mark.backlog_fixed("RM-363")
+def test_a_time_series_find_counts_the_buckets_its_first_batch_examined(
+    rust_mongo: Any, mongod_rs: Any
+) -> None:
+    """mongod 8.2.11's line for a `find` of five buckets counts all five
+    examined for the first batch, and none for the `getMore` after it, as
+    its line for the same `aggregate` does (measured 2026-11-10)."""
+    got = _both(rust_mongo, mongod_rs, lambda d: list(d.ts.find({"v": {"$gte": 10}})), _series)
+    answers = {s: [_counts(a) for _, a in lines] for s, (lines, _) in got.items()}
+    assert [a.get("docsExamined") for a in answers["mongod"]] == [5, 0]
+    assert answers["rust"] == answers["mongod"]
+
+
+@pytest.mark.backlog("RM-363")
+def test_a_time_series_read_made_whole_counts_what_it_examined(
+    rust_mongo: Any, mongod_rs: Any
+) -> None:
+    """mongod 8.2.11's line for a sorted `find` of five buckets counts the
+    five it examined (measured 2026-11-10). This server reads a time-series
+    collection whole under a sort, and counts nothing."""
+    got = _both(rust_mongo, mongod_rs, lambda d: list(d.ts.find().sort("v", -1).limit(3)), _series)
+    answers = {s: _counts(_line(lines, "find")) for s, (lines, _) in got.items()}
+    assert answers["mongod"].get("docsExamined") == 5
+    assert answers["rust"] == answers["mongod"]
+
+
+@pytest.mark.backlog("RM-363")
+def test_a_contested_aggregate_counts_what_it_examined(rust_mongo: Any, mongod_rs: Any) -> None:
+    """mongod 8.2.11's line for an `aggregate` two indexes could serve counts
+    what the plan it chose by trial examined (`keysExamined: 4,
+    docsExamined: 4`, measured 2026-11-10). This server reads it through its
+    store's router, and counts nothing."""
+
+    def setup(db: Any) -> None:
+        seed(db)
+        db.c.create_index("y")
+
+    pipeline = [{"$match": {"x": {"$gte": 2}, "y": 1}}]
+    got = _both(rust_mongo, mongod_rs, lambda d: list(d.c.aggregate(pipeline)), setup)
+    answers = {s: _counts(_line(lines, "aggregate")) for s, (lines, _) in got.items()}
+    assert "keysExamined" in answers["mongod"]
     assert answers["rust"] == answers["mongod"]
 
 
