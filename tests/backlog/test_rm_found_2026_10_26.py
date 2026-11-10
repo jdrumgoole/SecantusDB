@@ -112,14 +112,73 @@ def test_x86_spill_after_project_storage_size(rust_mongo: Any, mongod: Any) -> N
     assert ours == _sort_storage_sizes(mongod)["after $project"]
 
 
-def _storage_sizes(client: Any) -> dict:
+def _group_storage_sizes(client: Any) -> dict:
     db = _spill_db(client)
-    group = _profiled(
-        db,
-        [{"$unwind": "$s"}, {"$group": {"_id": "$n", "s": {"$push": "$s"}}}],
-        {"internalDocumentSourceGroupMaxMemoryBytes": 5_000},
-        "rm316group",
-    )
+    groups = {
+        # The case RM-325 was filed on: one accumulator, its state an array.
+        "$push": {"_id": "$n", "s": {"$push": "$s"}},
+        # A state that is a document: a partial sum and a count, Welford's
+        # state, the merged fields.
+        "$avg": {"_id": "$n", "a": {"$avg": "$n"}},
+        "$stdDevPop": {"_id": "$n", "d": {"$stdDevPop": "$n"}},
+        "$mergeObjects": {"_id": "$n", "o": {"$mergeObjects": {"a": "$s"}}},
+        # The missing value: mongod writes its type byte alone.
+        "$first": {"_id": "$n", "f": {"$first": "$zz"}},
+    }
+    sizes = {}
+    for name, group in groups.items():
+        entry = _profiled(
+            db,
+            [{"$unwind": "$s"}, {"$group": group}],
+            {"internalDocumentSourceGroupMaxMemoryBytes": 5_000},
+            "rm325" + name,
+        )
+        sizes[name] = (entry.get("groupSpills"), entry.get("groupSpilledDataStorageSize"))
+    return sizes
+
+
+@pytest.mark.backlog_fixed("RM-325")
+def test_group_spill_storage_size(rust_mongo: Any, mongod: Any) -> None:
+    """A classic `$group` spilled its groups as this server's own BSON
+    (320100 bytes for a `$push` of 300 1000-byte strings, where mongod 8.2
+    stores 16321); it now writes mongod's sorter file -- each group's key
+    and its accumulators' `getValue(toBeMerged)` states -- so
+    `groupSpilledDataStorageSize` is mongod's to the byte."""
+    assert _group_storage_sizes(rust_mongo) == _group_storage_sizes(mongod)
+
+
+def _group_held_value_spills(client: Any) -> dict:
+    db = _spill_db(client)
+    groups = {
+        "$first": {"_id": "$n", "f": {"$first": "$s"}},
+        "$last": {"_id": "$n", "f": {"$last": "$s"}},
+        "$firstN": {"_id": "$n", "f": {"$firstN": {"n": 2, "input": "$s"}}},
+        "$maxN": {"_id": "$n", "f": {"$maxN": {"n": 2, "input": "$s"}}},
+        "$topN": {"_id": "$n", "f": {"$topN": {"n": 2, "sortBy": {"n": -1}, "output": "$s"}}},
+        "object _id": {"_id": {"n": "$n"}, "f": {"$first": "$zz"}},
+    }
+    spills = {}
+    for name, group in groups.items():
+        entry = _profiled(
+            db,
+            [{"$unwind": "$s"}, {"$group": group}],
+            {"internalDocumentSourceGroupMaxMemoryBytes": 5_000},
+            "rm502" + name,
+        )
+        spills[name] = (entry.get("groupSpills"), entry.get("groupSpilledBytes"))
+    return spills
+
+
+@pytest.mark.backlog("RM-502")
+def test_group_held_value_spills(rust_mongo: Any, mongod: Any) -> None:
+    """mongod 8.2 counts the 1000-byte string a classic `$first` holds, and
+    spills 60 times as for a `$push` (this server: 9); it counts an object
+    `_id` as the key it groups on (9 spills; this server 15)."""
+    assert _group_held_value_spills(rust_mongo) == _group_held_value_spills(mongod)
+
+
+def _window_storage_size(client: Any) -> int:
+    db = _spill_db(client)
 
     def window_storage() -> int:
         return client.admin.command("serverStatus")["metrics"]["query"]["setWindowFields"][
@@ -133,18 +192,14 @@ def _storage_sizes(client: Any) -> dict:
         {"internalDocumentSourceSetWindowFieldsMaxMemoryBytes": 50_000},
         "rm325window",
     )
-    return {
-        "group": group.get("groupSpilledDataStorageSize"),
-        "window": window_storage() - before,
-    }
+    return window_storage() - before
 
 
 @pytest.mark.backlog("RM-325")
 def test_spill_storage_size(rust_mongo: Any, mongod: Any) -> None:
-    """mongod 8.2 spills a classic `$group` to a sorter file of its
-    accumulators' merge values (16321 bytes here) and a `$setWindowFields`
-    to a WiredTiger table (4096)."""
-    assert _storage_sizes(rust_mongo) == _storage_sizes(mongod)
+    """mongod 8.2 spills a `$setWindowFields` to a WiredTiger table (4096
+    bytes here); this server writes a file of its own (310800)."""
+    assert _window_storage_size(rust_mongo) == _window_storage_size(mongod)
 
 
 def _leading_sort_storage(client: Any) -> Any:

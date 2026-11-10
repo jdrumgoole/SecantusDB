@@ -11,10 +11,18 @@
 //! out in the hash table's order. Measured on mongod 8.2.11 (2026-10-26):
 //! the same answers either way, and the key order once spilled.
 //!
-//! A partial state is written as a small BSON document per accumulator and
-//! read back into the same state, so a merged `$sum` adds the two
-//! double-double totals and a merged `$push` concatenates in input order --
-//! what mongod's `getValue(toBeMerged)` / `process(merging)` pair does.
+//! The classic engine's spill is mongod's (`GroupProcessor::spill`, RM-325):
+//! a sorter file ([`crate::spill_file`]) of one record per group -- the group
+//! key as a `Value`, then the accumulators' `getValue(toBeMerged)` states (no
+//! value for none, the state itself for one, an array of them for more) --
+//! read back into fresh accumulators by `process(state, merging)` in run
+//! order, as `getNextSpilled` does. So the file is mongod's to the byte, and
+//! a merged `$stdDevPop`, or `$maxN` with ties, answers what mongod's merge
+//! answers.
+//!
+//! SBE spills its hash table to a WiredTiger record store of its own, which
+//! the engine crate cannot reach; its spill here is still this server's: a
+//! small BSON document per accumulator, read back into the same state.
 
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Read, Write};
@@ -25,11 +33,11 @@ use bson::{doc, Bson, Document};
 
 use crate::fallback::Fallback;
 use crate::group::{
-    const_add, finalize, gkey, update_extreme, Acc, Capped, ConstSum, NElemKind, Num, TopNKind,
-    Width,
+    const_add, finalize, gkey, merging_acc, nelem_result, topn_kept, update_extreme, Acc, Capped,
+    ConstSum, NElemKind, Num, TopNKind, Width,
 };
 use crate::summation::DoubleDoubleSum;
-use crate::{decimal, memlimit, order};
+use crate::{decimal, memlimit, order, spill_file};
 
 type R<T> = Result<T, Fallback>;
 
@@ -58,6 +66,8 @@ struct Run {
 #[derive(Default)]
 pub(crate) struct Spills {
     runs: Vec<Run>,
+    /// Spilled by SBE, in this server's own format.
+    sbe: bool,
 }
 
 impl Spills {
@@ -84,6 +94,122 @@ impl Drop for Spills {
     }
 }
 
+/// How a `$group`'s `_id` is grouped on (`GroupProcessorBase::setIdExpression`):
+/// one expression's value, or -- for an object of fields, `{a: "$a", b:
+/// "$b"}` -- each field's, the object built only when a group is output.
+pub(crate) enum IdShape {
+    Plain,
+    Fields(Vec<String>),
+}
+
+impl IdShape {
+    pub(crate) fn of(id_expr: &Bson) -> IdShape {
+        match id_expr {
+            Bson::Document(d) if d.keys().next().is_some_and(|k| !k.starts_with('$')) => {
+                IdShape::Fields(d.keys().cloned().collect())
+            }
+            _ => IdShape::Plain,
+        }
+    }
+}
+
+/// A group key as mongod holds it: a `Value`, or for two fields or more an
+/// array whose elements may be missing.
+enum Key {
+    One(Bson),
+    Parts(Vec<Option<Bson>>),
+}
+
+impl Key {
+    /// mongod's key of the group whose `_id` is `id` (`computeGroupKey`):
+    /// one field's value is its value (missing is null).
+    fn of(id: Bson, shape: &IdShape) -> Key {
+        match (shape, id) {
+            (IdShape::Fields(names), Bson::Document(mut d)) if names.len() > 1 => {
+                Key::Parts(names.iter().map(|n| d.remove(n)).collect())
+            }
+            (IdShape::Fields(names), Bson::Document(mut d)) => {
+                Key::One(d.remove(&names[0]).unwrap_or(Bson::Null))
+            }
+            (_, id) => Key::One(id),
+        }
+    }
+
+    /// The `_id` mongod outputs for this key (`expandId`).
+    fn expand(self, shape: &IdShape) -> Bson {
+        match (shape, self) {
+            (IdShape::Fields(names), Key::One(v)) => {
+                let mut d = Document::new();
+                d.insert(names[0].clone(), v);
+                Bson::Document(d)
+            }
+            (IdShape::Fields(names), Key::Parts(parts)) => Bson::Document(
+                names
+                    .iter()
+                    .zip(parts)
+                    .filter_map(|(n, p)| p.map(|v| (n.clone(), v)))
+                    .collect(),
+            ),
+            (IdShape::Plain, Key::One(v)) => v,
+            // A plain key is never written as parts.
+            (IdShape::Plain, Key::Parts(_)) => Bson::Null,
+        }
+    }
+
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), spill_file::Error> {
+        match self {
+            Key::One(v) => spill_file::write_value(v, out),
+            Key::Parts(parts) => spill_file::write_parts(parts, out),
+        }
+    }
+
+    fn read(at: &mut spill_file::Cursor, shape: &IdShape) -> Result<Key, spill_file::Error> {
+        Ok(match shape {
+            IdShape::Fields(names) if names.len() > 1 => Key::Parts(spill_file::read_parts(at)?),
+            _ => Key::One(spill_file::read_value(at)?),
+        })
+    }
+}
+
+/// mongod's `ValueComparator` over two keys: an array compares element by
+/// element, and the missing value sorts with undefined, after MinKey and
+/// before everything else.
+fn key_cmp(a: &Key, b: &Key) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    fn part(a: &Option<Bson>, b: &Option<Bson>) -> Ordering {
+        let missing_against = |v: &Bson| match v {
+            Bson::MinKey => Ordering::Greater,
+            Bson::Undefined => Ordering::Equal,
+            _ => Ordering::Less,
+        };
+        match (a, b) {
+            (None, None) => Ordering::Equal,
+            (None, Some(v)) => missing_against(v),
+            (Some(v), None) => missing_against(v).reverse(),
+            (Some(x), Some(y)) => order::cmp(x, y),
+        }
+    }
+    match (a, b) {
+        (Key::One(x), Key::One(y)) => order::cmp(x, y),
+        (Key::Parts(x), Key::Parts(y)) => x
+            .iter()
+            .zip(y)
+            .map(|(p, q)| part(p, q))
+            .find(|o| o.is_ne())
+            .unwrap_or_else(|| x.len().cmp(&y.len())),
+        (Key::One(_), Key::Parts(_)) => Ordering::Less,
+        (Key::Parts(_), Key::One(_)) => Ordering::Greater,
+    }
+}
+
+fn spill_path(dir: &std::path::Path) -> PathBuf {
+    dir.join(format!(
+        "secantus-group-{}-{}.spill",
+        std::process::id(),
+        NEXT_FILE.fetch_add(1, AtomicOrdering::Relaxed)
+    ))
+}
+
 /// Write the groups in memory to a new run, sorted by key.
 /// `held`: mongod's estimate of the groups' memory, which it reports as the
 /// spill's `spilledBytes` (the file's size is `spilledDataStorageSize`).
@@ -92,10 +218,524 @@ pub(crate) fn spill(
     states: Vec<Vec<Acc>>,
     spills: &mut Spills,
     held: usize,
+    shape: &IdShape,
 ) -> R<()> {
     if ids.is_empty() {
         return Ok(());
     }
+    if crate::sbe::active() {
+        spills.sbe = true;
+        return spill_sbe(ids, states, spills, held);
+    }
+    let dir = memlimit::spill_dir();
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        return Err(io_error("create the directory for", &dir, e));
+    }
+    let path = spill_path(&dir);
+    let fail = |e: spill_file::Error| io_error(e.what, &path, e.detail);
+    let mut groups: Vec<(Key, Vec<Acc>)> = ids
+        .into_iter()
+        .map(|id| Key::of(id, shape))
+        .zip(states)
+        .collect();
+    // `std::sort` with mongod's comparator: equal keys never meet in one
+    // run, so the sort's stability does not matter.
+    groups.sort_by(|a, b| key_cmp(&a.0, &b.0));
+    let mut out = spill_file::Writer::create(&path).map_err(fail)?;
+    // Registered before anything is written, so a failure below removes it.
+    spills.runs.push(Run {
+        path: path.clone(),
+        groups: 0,
+    });
+    let mut records = 0usize;
+    for (key, accs) in groups {
+        let buf = out.buffer();
+        key.write(buf).map_err(fail)?;
+        let mut states = Vec::with_capacity(accs.len());
+        for acc in accs {
+            states.push(merge_state(acc)?);
+        }
+        match states.len() {
+            0 => spill_file::write_value_or_missing(None, buf),
+            1 => spill_file::write_value_or_missing(states[0].as_ref(), buf),
+            _ => spill_file::write_parts(&states, buf),
+        }
+        .map_err(fail)?;
+        out.added().map_err(fail)?;
+        records += 1;
+    }
+    let written = out.done().map_err(fail)?;
+    if let Some(run) = spills.runs.last_mut() {
+        run.groups = records;
+    }
+    memlimit::record_group_spill(records as i64, held as i64, written.stored);
+    Ok(())
+}
+
+/// mongod's `partialSum` array: `[nonDecimalTotalType, sum, addend]`, and the
+/// decimal total when the total is a decimal (`serializePartialSum`).
+fn partial_sum(width: Width, total: &DoubleDoubleSum, dec: Option<&decimal::Dec>) -> R<Bson> {
+    let (sum, addend, _) = total.parts();
+    let tag = match width {
+        Width::Int => 16,
+        Width::Long => 18,
+        Width::Double => 1,
+    };
+    let mut parts = vec![Bson::Int32(tag), Bson::Double(sum), Bson::Double(addend)];
+    if let Some(d) = dec {
+        parts.push(decimal::to_bson(d).ok_or(Fallback::Defer)?);
+    }
+    Ok(Bson::Array(parts))
+}
+
+fn num_state(n: Num) -> R<Bson> {
+    match n {
+        Num::Sum {
+            width,
+            total,
+            decimal: dec,
+        } => partial_sum(width, &total, dec.as_ref()),
+        // `_constantSumToDoubleDoubleSummation`.
+        Num::Const(c) => {
+            let mut total = DoubleDoubleSum::default();
+            let width = match c {
+                ConstSum::Int(i) => {
+                    total.add_int(i);
+                    Width::Int
+                }
+                ConstSum::Long(i) => {
+                    total.add_long(i);
+                    Width::Long
+                }
+                ConstSum::Double(d) => {
+                    total.add_double(d);
+                    Width::Double
+                }
+            };
+            partial_sum(width, &total, None)
+        }
+    }
+}
+
+/// An accumulator's `getValue(toBeMerged = true)`; `None` is the missing
+/// value.
+fn merge_state(acc: Acc) -> R<Option<Bson>> {
+    Ok(Some(match acc {
+        Acc::Sum(n) => num_state(n)?,
+        // `$count` is `{$sum: 1}`: a constant int sum, a long past 2^31.
+        Acc::Count(n) => num_state(Num::Const(
+            i32::try_from(n).map_or(ConstSum::Long(n), ConstSum::Int),
+        ))?,
+        Acc::Avg(state) => {
+            let (n, count) = state.unwrap_or((Num::zero(), 0));
+            Bson::Document(doc! { "count": count, "ps": num_state(n)? })
+        }
+        Acc::Min(v) | Acc::Max(v) => v.unwrap_or(Bson::Null),
+        // A spilled group has seen a document; its value may be missing.
+        Acc::First(v) | Acc::Last(v) => return Ok(v.flatten()),
+        Acc::Push(c) | Acc::AddToSet(c) | Acc::ConcatArrays(c) | Acc::SetUnion(c) => {
+            Bson::Array(c.items)
+        }
+        Acc::MergeObjects(d) => Bson::Document(d),
+        // Welford's running state, as `AccumulatorStdDev` keeps it.
+        Acc::StdDev { values, .. } => {
+            let (count, mean, m2) = welford(&values);
+            Bson::Document(doc! { "m2": m2, "mean": mean, "count": count })
+        }
+        // mongod writes its t-digest here; this server keeps the values.
+        Acc::Percentile { values, .. } => doubles(values),
+        Acc::NElem { kind, n, vals } => Bson::Array(nelem_result(kind, n.unwrap_or(0), vals)?),
+        // `{generatedSortKey, output}` for each item kept, in sort order: the
+        // key is the one sort field's value, or an array of them.
+        Acc::TopN {
+            kind,
+            n,
+            dirs,
+            items,
+        } => {
+            let single = dirs.len() == 1;
+            let kept = topn_kept(kind, n.unwrap_or(1), &dirs, items)?;
+            Bson::Array(
+                kept.into_iter()
+                    .map(|(mut keys, output)| {
+                        let key = if single {
+                            keys.pop().unwrap_or(Bson::Null)
+                        } else {
+                            Bson::Array(keys)
+                        };
+                        Bson::Document(doc! { "generatedSortKey": key, "output": output })
+                    })
+                    .collect(),
+            )
+        }
+        // A `$group` with `$accumulator` fails on its first document.
+        Acc::Script => return Err(Fallback::Defer),
+    }))
+}
+
+/// `AccumulatorStdDev::processInternal` over `values`: (count, mean, m2).
+fn welford(values: &[f64]) -> (i64, f64, f64) {
+    let (mut count, mut mean, mut m2) = (0i64, 0.0f64, 0.0f64);
+    for &x in values {
+        count += 1;
+        let delta = x - mean;
+        if delta != 0.0 {
+            mean += delta / count as f64;
+            m2 += delta * (x - mean);
+        }
+    }
+    (count, mean, m2)
+}
+
+/// An accumulator merging spilled states.
+enum Merging {
+    Acc(Acc),
+    /// `$stdDevPop` / `$stdDevSamp`'s Welford state.
+    StdDev {
+        pop: bool,
+        count: i64,
+        mean: f64,
+        m2: f64,
+    },
+}
+
+impl Merging {
+    fn new(op: &str, arg: &Bson, vars: &Document) -> R<Merging> {
+        Ok(match op {
+            // A constant sum is turned into a double-double one to merge.
+            "$sum" | "$count" => Merging::Acc(Acc::Sum(Num::zero())),
+            "$stdDevPop" | "$stdDevSamp" => Merging::StdDev {
+                pop: op == "$stdDevPop",
+                count: 0,
+                mean: 0.0,
+                m2: 0.0,
+            },
+            _ => Merging::Acc(merging_acc(op, arg, vars)?),
+        })
+    }
+
+    /// `process(state, merging = true)`.
+    fn merge(&mut self, state: Option<Bson>) -> R<()> {
+        let bad = || Fallback::mongo(1, "$group read a spilled state it did not write");
+        let array = |s: Option<Bson>| match s {
+            Some(Bson::Array(a)) => Ok(a),
+            _ => Err(bad()),
+        };
+        match self {
+            Merging::StdDev {
+                count, mean, m2, ..
+            } => {
+                let Some(Bson::Document(d)) = state else {
+                    return Err(bad());
+                };
+                let (Ok(m2_in), Ok(mean_in), Ok(count_in)) =
+                    (d.get_f64("m2"), d.get_f64("mean"), d.get_i64("count"))
+                else {
+                    return Err(bad());
+                };
+                if count_in == 0 {
+                    return Ok(());
+                }
+                let delta = mean_in - *mean;
+                let new_count = count_in + *count;
+                if delta != 0.0 {
+                    *mean =
+                        ((*count as f64 * *mean) + (count_in as f64 * mean_in)) / new_count as f64;
+                    *m2 += delta * delta * (*count as f64 * count_in as f64 / new_count as f64);
+                }
+                *m2 += m2_in;
+                *count = new_count;
+            }
+            Merging::Acc(acc) => match acc {
+                Acc::Sum(n) => apply_partial_sum(n, &array(state)?)?,
+                Acc::Avg(avg) => {
+                    let Some(Bson::Document(d)) = state else {
+                        return Err(bad());
+                    };
+                    let (Ok(ps), Ok(c)) = (d.get_array("ps"), d.get_i64("count")) else {
+                        return Err(bad());
+                    };
+                    let (n, count) = avg.get_or_insert_with(|| (Num::zero(), 0));
+                    apply_partial_sum(n, ps)?;
+                    *count += c;
+                }
+                Acc::Min(a) => {
+                    if let Some(v) = state {
+                        update_extreme(a, v, std::cmp::Ordering::Less)?;
+                    }
+                }
+                Acc::Max(a) => {
+                    if let Some(v) = state {
+                        update_extreme(a, v, std::cmp::Ordering::Greater)?;
+                    }
+                }
+                Acc::First(a) => {
+                    if a.is_none() {
+                        *a = Some(state);
+                    }
+                }
+                Acc::Last(a) => *a = Some(state),
+                Acc::Push(c) => {
+                    for v in array(state)? {
+                        c.push(v)?;
+                    }
+                }
+                Acc::AddToSet(c) => {
+                    for v in array(state)? {
+                        c.add(v)?;
+                    }
+                }
+                Acc::ConcatArrays(c) => c.concat(array(state)?)?,
+                Acc::SetUnion(c) => c.union(array(state)?)?,
+                Acc::MergeObjects(into) => match state {
+                    Some(Bson::Document(d)) => {
+                        for (k, v) in d {
+                            into.insert(k, v);
+                        }
+                    }
+                    Some(Bson::Null | Bson::Undefined) | None => {}
+                    Some(_) => return Err(bad()),
+                },
+                Acc::Percentile { values, .. } => {
+                    for v in array(state)? {
+                        values.push(v.as_f64().ok_or_else(bad)?);
+                    }
+                }
+                Acc::NElem { vals, .. } => vals.extend(array(state)?),
+                Acc::TopN { dirs, items, .. } => {
+                    let single = dirs.len() == 1;
+                    for item in array(state)? {
+                        let Bson::Document(mut d) = item else {
+                            return Err(bad());
+                        };
+                        let (Some(key), Some(output)) =
+                            (d.remove("generatedSortKey"), d.remove("output"))
+                        else {
+                            return Err(bad());
+                        };
+                        let keys = match key {
+                            Bson::Array(keys) if !single => keys,
+                            key if single => vec![key],
+                            _ => return Err(bad()),
+                        };
+                        items.push((keys, output));
+                    }
+                }
+                Acc::Count(_) | Acc::StdDev { .. } | Acc::Script => return Err(bad()),
+            },
+        }
+        Ok(())
+    }
+
+    /// The accumulator to finalize, and a standard deviation's answer, which
+    /// replaces the placeholder's.
+    fn finish(self) -> (Acc, Option<Bson>) {
+        match self {
+            Merging::Acc(Acc::Avg(Some((_, 0)))) => (Acc::Avg(None), None),
+            Merging::Acc(acc) => (acc, None),
+            Merging::StdDev { pop, count, m2, .. } => {
+                let adjusted = if pop { count } else { count - 1 };
+                let answer = if adjusted <= 0 {
+                    Bson::Null
+                } else {
+                    Bson::Double((m2 / adjusted as f64).sqrt())
+                };
+                (
+                    Acc::StdDev {
+                        values: Vec::new(),
+                        pop,
+                    },
+                    Some(answer),
+                )
+            }
+        }
+    }
+}
+
+/// `applyPartialSum`: widen the types, add the sum and then the addend as
+/// doubles (not the addend of an infinite sum when it is NaN), and add the
+/// decimal total when there is one.
+fn apply_partial_sum(n: &mut Num, arr: &[Bson]) -> R<()> {
+    let bad = || Fallback::mongo(1, "$group read a spilled sum it did not write");
+    let (Some(Bson::Int32(tag)), Some(Bson::Double(sum)), Some(Bson::Double(addend))) =
+        (arr.first(), arr.get(1), arr.get(2))
+    else {
+        return Err(bad());
+    };
+    let w = match tag {
+        16 => Width::Int,
+        18 => Width::Long,
+        1 => Width::Double,
+        _ => return Err(bad()),
+    };
+    let (width, mut total, mut dec) = match std::mem::replace(n, Num::zero()) {
+        Num::Sum {
+            width,
+            total,
+            decimal,
+        } => (width, total, decimal),
+        Num::Const(_) => return Err(bad()),
+    };
+    total.add_double(*sum);
+    if sum.is_finite() || !addend.is_nan() {
+        total.add_double(*addend);
+    }
+    if let Some(d) = arr.get(3) {
+        let d = decimal::from_bson(d).ok_or_else(bad)?;
+        dec = Some(match dec {
+            Some(into) => decimal::add(&into, &d).ok_or(Fallback::Defer)?,
+            None => decimal::add(&decimal::parse("0").ok_or(Fallback::Defer)?, &d)
+                .ok_or(Fallback::Defer)?,
+        });
+    }
+    *n = Num::Sum {
+        width: width.max(w),
+        total,
+        decimal: dec,
+    };
+    Ok(())
+}
+
+/// A classic run being read back: its next record and how many are left.
+struct ClassicReader {
+    path: PathBuf,
+    input: spill_file::Reader,
+    left: usize,
+    head: Option<(Key, Vec<Option<Bson>>)>,
+}
+
+impl ClassicReader {
+    fn advance(&mut self, shape: &IdShape, accs: usize) -> R<()> {
+        self.head = None;
+        if self.left == 0 {
+            return Ok(());
+        }
+        self.left -= 1;
+        let record = self
+            .input
+            .record(|at| {
+                let key = Key::read(at, shape)?;
+                let states = match accs {
+                    0 => {
+                        spill_file::read_value_or_missing(at)?;
+                        Vec::new()
+                    }
+                    1 => vec![spill_file::read_value_or_missing(at)?],
+                    _ => spill_file::read_parts(at)?,
+                };
+                Ok((key, states))
+            })
+            .map_err(|e| io_error(e.what, &self.path, e.detail))?;
+        if record.1.len() != accs {
+            return Err(io_error(
+                "read",
+                &self.path,
+                "a group with the wrong number of states",
+            ));
+        }
+        self.head = Some(record);
+        Ok(())
+    }
+}
+
+/// `getNextSpilled`: the runs merged key by key, each key's states merged
+/// into fresh accumulators in run order.
+fn merge_classic(
+    mut spills: Spills,
+    accs: &[(&str, &str, &Bson)],
+    shape: &IdShape,
+    vars: &Document,
+) -> R<Vec<Document>> {
+    let mut readers = Vec::with_capacity(spills.runs.len());
+    for run in &spills.runs {
+        let input = spill_file::Reader::open(&run.path)
+            .map_err(|e| io_error(e.what, &run.path, e.detail))?;
+        let mut reader = ClassicReader {
+            path: run.path.clone(),
+            input,
+            left: run.groups,
+            head: None,
+        };
+        reader.advance(shape, accs.len())?;
+        readers.push(reader);
+    }
+    let mut out = Vec::new();
+    loop {
+        crate::deadline::check()?;
+        let mut least: Option<usize> = None;
+        for (i, r) in readers.iter().enumerate() {
+            let Some((key, _)) = &r.head else { continue };
+            if least.is_none_or(|l| {
+                let (lk, _) = readers[l].head.as_ref().expect("a head");
+                key_cmp(key, lk).is_lt()
+            }) {
+                least = Some(i);
+            }
+        }
+        let Some(first) = least else { break };
+        let mut merging = accs
+            .iter()
+            .map(|(_, op, arg)| Merging::new(op, arg, vars))
+            .collect::<R<Vec<_>>>()?;
+        let mut key: Option<Key> = None;
+        for reader in readers.iter_mut().skip(first) {
+            // The least key is the first run's head; equal keys follow it in
+            // run order.
+            let same = match (&reader.head, &key) {
+                (Some((k, _)), Some(kept)) => key_cmp(k, kept).is_eq(),
+                (Some(_), None) => true,
+                (None, _) => false,
+            };
+            if !same {
+                continue;
+            }
+            let (k, states) = reader.head.take().expect("a head");
+            key.get_or_insert(k);
+            for (m, s) in merging.iter_mut().zip(states) {
+                m.merge(s)?;
+            }
+            reader.advance(shape, accs.len())?;
+        }
+        let id = key.expect("the least head").expand(shape);
+        let mut answers = Vec::new();
+        let mut paired = Vec::with_capacity(accs.len());
+        for ((field, _, _), m) in accs.iter().zip(merging) {
+            let (acc, answer) = m.finish();
+            if let Some(a) = answer {
+                answers.push((*field, a));
+            }
+            paired.push((*field, acc));
+        }
+        let mut d = finalize(id, paired)?;
+        for (field, a) in answers {
+            d.insert(field, a);
+        }
+        out.push(d);
+    }
+    drop(readers);
+    for run in std::mem::take(&mut spills.runs) {
+        std::fs::remove_file(&run.path).map_err(|e| io_error("remove", &run.path, e))?;
+    }
+    Ok(out)
+}
+
+/// Merge the runs into the finished groups, in key order. `accs` names each
+/// accumulator's output field, operator and argument.
+pub(crate) fn merge(
+    spills: Spills,
+    accs: &[(&str, &str, &Bson)],
+    shape: &IdShape,
+    vars: &Document,
+) -> R<Vec<Document>> {
+    if spills.sbe {
+        let fields: Vec<&str> = accs.iter().map(|(f, _, _)| *f).collect();
+        return merge_sbe(spills, &fields);
+    }
+    merge_classic(spills, accs, shape, vars)
+}
+
+/// SBE: write the groups as this server's own BSON records.
+fn spill_sbe(ids: Vec<Bson>, states: Vec<Vec<Acc>>, spills: &mut Spills, held: usize) -> R<()> {
     let mut order: Vec<usize> = (0..ids.len()).collect();
     order.sort_by(|&a, &b| order::cmp(&ids[a], &ids[b]));
     let mut groups: Vec<Option<(Bson, Vec<Acc>)>> = ids.into_iter().zip(states).map(Some).collect();
@@ -103,11 +743,7 @@ pub(crate) fn spill(
     if let Err(e) = std::fs::create_dir_all(&dir) {
         return Err(io_error("create the directory for", &dir, e));
     }
-    let path = dir.join(format!(
-        "secantus-group-{}-{}.bson",
-        std::process::id(),
-        NEXT_FILE.fetch_add(1, AtomicOrdering::Relaxed)
-    ));
+    let path = spill_path(&dir);
     let file = File::create(&path).map_err(|e| io_error("create", &path, e))?;
     // Registered before anything is written, so a failure below removes it.
     spills.runs.push(Run {
@@ -202,9 +838,8 @@ impl Reader {
     }
 }
 
-/// Merge the runs into the finished groups, in key order. `fields` names
-/// each accumulator's output field.
-pub(crate) fn merge(mut spills: Spills, fields: &[&str]) -> R<Vec<Document>> {
+/// SBE: merge its runs, each key's states folded into the first's.
+fn merge_sbe(mut spills: Spills, fields: &[&str]) -> R<Vec<Document>> {
     let runs = std::mem::take(&mut spills.runs);
     let mut readers = Vec::with_capacity(runs.len());
     // Hand the paths back so the files are removed if opening one fails.
@@ -282,7 +917,6 @@ fn width_code(w: Width) -> i32 {
         Width::Int => 0,
         Width::Long => 1,
         Width::Double => 2,
-        Width::Decimal => 3,
     }
 }
 
@@ -291,7 +925,6 @@ fn width_of(code: i32) -> R<Width> {
         0 => Width::Int,
         1 => Width::Long,
         2 => Width::Double,
-        3 => Width::Decimal,
         _ => return Err(Fallback::Defer),
     })
 }
@@ -451,8 +1084,8 @@ fn acc_to_doc(acc: Acc) -> R<Document> {
         Acc::Avg(Some((n, c))) => doc! { "t": "avg", "n": num_to_doc(n)?, "c": c },
         Acc::Min(v) => optional("min", v),
         Acc::Max(v) => optional("max", v),
-        Acc::First(v) => optional("first", v),
-        Acc::Last(v) => optional("last", v),
+        Acc::First(v) => optional("first", v.map(|v| v.unwrap_or(Bson::Null))),
+        Acc::Last(v) => optional("last", v.map(|v| v.unwrap_or(Bson::Null))),
         Acc::Push(c) => capped_to_doc("push", c),
         Acc::AddToSet(c) => capped_to_doc("addToSet", c),
         Acc::ConcatArrays(c) => capped_to_doc("concatArrays", c),
@@ -506,8 +1139,8 @@ fn acc_from_doc(d: &Document) -> R<Acc> {
         },
         "min" => Acc::Min(v()),
         "max" => Acc::Max(v()),
-        "first" => Acc::First(v()),
-        "last" => Acc::Last(v()),
+        "first" => Acc::First(v().map(Some)),
+        "last" => Acc::Last(v().map(Some)),
         "push" => Acc::Push(capped_from_doc(d)?),
         "addToSet" => Acc::AddToSet(capped_from_doc(d)?),
         "concatArrays" => Acc::ConcatArrays(capped_from_doc(d)?),
@@ -725,12 +1358,87 @@ mod tests {
             let spilled = group(20_000, true, sbe).unwrap();
             let report = memlimit::report();
             assert!(report.used_disk && report.group_spills > 1, "{report:?}");
-            // Same groups, every accumulator merged to the same answer.
-            assert_eq!(by_key(whole), spilled.clone(), "sbe: {sbe}");
+            // Same groups, every accumulator merged to the same answer --
+            // but a classic `$stdDevPop`, which mongod merges by the parallel
+            // algorithm from each run's Welford state, to its last digits.
+            let mut whole = by_key(whole);
+            let mut merged = spilled.clone();
+            if !sbe {
+                for (w, m) in whole.iter_mut().zip(merged.iter_mut()) {
+                    let (a, b) = (w.get_f64("sd").unwrap(), m.get_f64("sd").unwrap());
+                    assert!((a - b).abs() <= a.abs() * 1e-13, "{a} {b}");
+                    w.insert("sd", 0.0);
+                    m.insert("sd", 0.0);
+                }
+            }
+            assert_eq!(whole, merged, "sbe: {sbe}");
             // In key order, as mongod returns a spilled group.
             let keys: Vec<i32> = spilled.iter().map(|d| d.get_i32("_id").unwrap()).collect();
             assert_eq!(keys, (0..23).collect::<Vec<_>>());
         }
+    }
+
+    /// The records of a classic spill are mongod's (RM-325): the key as a
+    /// `Value` -- a compound `_id`'s fields as an array, a missing one
+    /// missing -- then each accumulator's `getValue(toBeMerged)`: a sum's
+    /// `[nonDecimalTotalType, sum, addend]`, a `$push`'s array, a `$first`
+    /// of a missing field the missing value.
+    #[test]
+    fn a_classic_spill_writes_mongods_sorter_records_and_merges_them() {
+        use super::{merge, spill, IdShape, Spills};
+        use crate::group::{Acc, Capped, Num};
+        use crate::spill_file;
+
+        let _e = crate::sbe::enter(false);
+        let shape = IdShape::Fields(vec!["a".into(), "b".into()]);
+        let run = |n: i32, s: &str| {
+            let mut push = Capped::default();
+            push.push(Bson::String(s.into())).unwrap();
+            vec![
+                Acc::Sum(Num::zero().add(&Bson::Int32(n)).unwrap()),
+                Acc::Push(push),
+                Acc::First(Some(None)),
+            ]
+        };
+        let mut spills = Spills::default();
+        spill(
+            vec![bson!({"b": 2})],
+            vec![run(5, "x")],
+            &mut spills,
+            100,
+            &shape,
+        )
+        .unwrap();
+        spill(
+            vec![bson!({"b": 2})],
+            vec![run(3, "y")],
+            &mut spills,
+            100,
+            &shape,
+        )
+        .unwrap();
+
+        let mut input = spill_file::Reader::open(&spills.runs[0].path).unwrap();
+        let (key, states) = input
+            .record(|at| Ok((spill_file::read_parts(at)?, spill_file::read_parts(at)?)))
+            .unwrap();
+        assert_eq!(key, vec![None, Some(Bson::Int32(2))]);
+        assert_eq!(
+            states,
+            vec![Some(bson!([16, 5.0, 0.0])), Some(bson!(["x"])), None]
+        );
+
+        let (sum, push, first) = (bson!("$a"), bson!("$s"), bson!("$zz"));
+        let accs = [
+            ("t", "$sum", &sum),
+            ("p", "$push", &push),
+            ("f", "$first", &first),
+        ];
+        let out = merge(spills, &accs, &shape, &Document::new()).unwrap();
+        assert_eq!(
+            out,
+            vec![doc! {"_id": {"b": 2}, "t": 8, "p": ["x", "y"], "f": null}]
+        );
     }
 
     #[test]
