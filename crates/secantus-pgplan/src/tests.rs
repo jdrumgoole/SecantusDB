@@ -6334,6 +6334,44 @@ fn bpchar_assigned_to_a_string_type_drops_its_blanks() {
     );
 }
 
+/// An untyped literal a VALUES column or a set operation reads as `bpchar`
+/// keeps its trailing blanks: the column has no modifier, and `bpcharin` at
+/// -1 keeps the text as written (`(values ('a'::char(3)), ('b ')) s(f)` is
+/// `b `, 2 bytes, on PostgreSQL 15.19; RP-804). A `char(3)` member keeps
+/// its padding, as it did.
+#[test]
+fn an_untyped_literal_read_as_bpchar_keeps_its_blanks() {
+    let tz = TimeZoneSetting::Utc;
+    assert_eq!(
+        cast_unknown_text_to("b ", "bpchar", &tz).unwrap(),
+        Bson::String("b ".into())
+    );
+    assert_eq!(
+        cast_text_to("b ", "bpchar", &tz).unwrap(),
+        Bson::String("b".into()),
+        "a stored char(n) value is still trimmed"
+    );
+    assert_eq!(
+        cast_unknown_text_to("7", "int4", &tz).unwrap(),
+        Bson::Int32(7)
+    );
+    match plan_ok("values ('a'::char(3)), ('b '), (null)") {
+        Statement::ValuesConstant(vc) => {
+            assert_eq!(vc.types, vec!["bpchar".to_string()]);
+            assert_eq!(vc.typmods, Some(vec![-1]));
+            assert_eq!(
+                vc.rows,
+                vec![
+                    vec![Bson::String("a  ".into())],
+                    vec![Bson::String("b ".into())],
+                    vec![Bson::Null],
+                ]
+            );
+        }
+        other => panic!("wrong statement: {other:?}"),
+    }
+}
+
 #[test]
 fn a_field_of_an_outer_whole_row_is_its_column() {
     // RP-699: `(v).a` over an outer FROM item's whole row is `v.a`, and

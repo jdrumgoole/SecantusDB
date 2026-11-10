@@ -3468,25 +3468,6 @@ FROM-less and VALUES-only statements. The gap test is in
       Verify: tests/backlog/test_rp_found_rp792.py::test_an_in_lists_unreadable_member_is_an_error
       Backlog-ID: RP-806
 
-## Found while working RP-794 (2026-11-10)
-
-Measured on the shared PostgreSQL 15.19 reference (port 5415); the
-statements are VALUES-only and create nothing. The gap tests are in
-`tests/backlog/test_rp_found_rp794.py`.
-
-- [ ] **An untyped literal typed `bpchar` beside a `char(n)` loses its
-      trailing blanks.** `select 'a'::char(3) union all select 'b '` is
-      `a  `, `b ` on PostgreSQL 15.19, and so is `(values ('a'::char(3)),
-      ('b ')) s(f)`: the column is `bpchar` with no modifier (the literal
-      is `unknown`, resolved to the `char(3)` member's type, and the
-      members' modifiers differ), so `octet_length` of `'b '` is 2. Here
-      it reads back `b`, 1 byte: the literal's blanks are dropped where it
-      is coerced to `bpchar`, while a member cast to `char(2)` keeps
-      them (`('b '::char(2))` agrees). A wrong value, not only a wrong
-      length.
-      Verify: tests/backlog/test_rp_found_rp794.py::test_an_untyped_literal_resolved_to_bpchar_keeps_its_blanks
-      Backlog-ID: RP-804
-
 ## Found while working RP-774 (2026-11-10)
 
 Measured on the shared PostgreSQL 15.19 reference (port 5415); the

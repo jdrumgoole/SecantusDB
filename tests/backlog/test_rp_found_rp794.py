@@ -1,7 +1,7 @@
 """What working RP-794 (an ORDER BY over an unsized `bpchar` column) found:
 
 - an untyped literal resolved to `bpchar` by a VALUES list or a set
-  operation beside a `char(n)` loses its trailing blanks (RP-804);
+  operation beside a `char(n)` lost its trailing blanks (RP-804, fixed);
 - `string_agg` over an unsized `bpchar` column kept the blanks the cast
   to its `text` argument drops (RP-805, fixed).
 
@@ -33,7 +33,7 @@ def _answer(dsn: str, query: str) -> object:
             return ("error", e.sqlstate, str(e).splitlines()[0])
 
 
-@pytest.mark.backlog("RP-804")
+@pytest.mark.backlog_fixed("RP-804")
 @pytest.mark.parametrize(
     ("query", "expected"),
     [
@@ -46,6 +46,27 @@ def _answer(dsn: str, query: str) -> object:
             "select f, octet_length(f) from (values ('a'::char(3)), ('b ')) s(f)",
             [("a  ", 3), ("b ", 2)],
         ),
+        (
+            "select f, octet_length(f) from (values ('b '), ('a'::char(3))) s(f)",
+            [("b ", 2), ("a  ", 3)],
+        ),
+        (
+            "select f, octet_length(f) from (select 'b ' f union all select 'a'::char(3)) s",
+            [("b ", 2), ("a  ", 3)],
+        ),
+        (
+            "select f, octet_length(f) from (select x f from"
+            " (select 'a'::char(3) x from generate_series(1, 1)) t union all select 'b ') s",
+            [("a  ", 3), ("b ", 2)],
+        ),
+        (
+            "select octet_length(f) from (values ('a'::char(3)), ('c ')) s(f) where f = 'c'",
+            [(2,)],
+        ),
+        (
+            "select f, octet_length(f) from (select 'a'::char(3) f intersect select 'a ') s",
+            [("a  ", 3)],
+        ),
     ],
 )
 def test_an_untyped_literal_resolved_to_bpchar_keeps_its_blanks(
@@ -54,7 +75,9 @@ def test_an_untyped_literal_resolved_to_bpchar_keeps_its_blanks(
     """The column's type is `bpchar` with no modifier (`'b '` is `unknown`,
     resolved to the `char(3)` member's type, whose modifier the other
     member does not share), so `'b '` keeps its blank: `octet_length` is 2
-    on PostgreSQL 15.19. Here it reads back `b`, 1 byte."""
+    on PostgreSQL 15.19, on either side and under a filter that compares
+    it as `bpchar`. It read back `b`, 1 byte: the literal went through the
+    `bpchar` cast that stores a `char(n)` value trimmed."""
     assert _answer(dsn, query) == expected
 
 

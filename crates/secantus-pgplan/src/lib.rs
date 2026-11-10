@@ -31854,7 +31854,7 @@ fn plan_values_constant(s: &pg_query::protobuf::SelectStmt, params: &[Bson]) -> 
             row[i] = if v == Bson::Null || common == "text" {
                 v
             } else if untyped {
-                cast_value(v, &common)?
+                unknown_literal_as(v, &common)?
             } else {
                 to_common_type(v, &common)?
             };
@@ -36698,6 +36698,31 @@ pub fn cast_text_to(text: &str, target: &str, tz: &TimeZoneSetting) -> Result<Bs
     let out = cast_value(Bson::String(text.to_string()), target);
     PLAN_TIMEZONE.with(|t| *t.borrow_mut() = previous);
     out
+}
+
+/// An untyped literal of a set operation's side read as the other side's
+/// type `target`, under the session's zone: `unknown_literal_as`.
+pub fn cast_unknown_text_to(text: &str, target: &str, tz: &TimeZoneSetting) -> Result<Bson> {
+    let previous = PLAN_TIMEZONE.with(|t| t.replace(tz.clone()));
+    let out = unknown_literal_as(Bson::String(text.to_string()), target);
+    PLAN_TIMEZONE.with(|t| *t.borrow_mut() = previous);
+    out
+}
+
+/// An untyped literal of a VALUES column or a set operation, read as the
+/// column's common type `target` (`coerce_type` over an `unknown` Const:
+/// the type's input function). Where that type is `bpchar` the column has
+/// no modifier -- the literal carries none, so `select_common_typmod` is
+/// -1 -- and `bpcharin` at -1 keeps the text as written, trailing blanks
+/// included: `select 'a'::char(3) union all select 'b '` is `b `, 2 bytes,
+/// on 15.19. `cast_value` trims every `bpchar` value, which is how a
+/// `char(n)` column stores one; an unsized cell is not padded back on the
+/// way out, so it would lose its blanks (RP-804).
+fn unknown_literal_as(v: Bson, target: &str) -> Result<Bson> {
+    if target == "bpchar" && matches!(v, Bson::String(_)) {
+        return cast_value_inner(v, target);
+    }
+    cast_value(v, target)
 }
 
 /// Install the session's `TimeZone` for the statements that follow, so an
