@@ -8,8 +8,9 @@ what it found:
   drops trailing blanks, as `hashbpchar` does), and its EXPLAIN prints the
   Hash Cond through `text` casts;
 - a simple CASE and NULLIF over a `char(n)` and another string type
-  compare without the operator their types resolve to, so the `char(n)`
-  operand keeps its blanks.
+  compared without the operator their types resolve to, so the `char(n)`
+  operand kept its blanks (fixed by RP-737: both compare through the
+  binary operators' `char(n)` rules).
 
 An answer is the rows and the column names. Measured on a private, freshly
 initdb'd PostgreSQL 15.19 cluster with `_SETUP`.
@@ -176,8 +177,8 @@ def test_explain_join_on_varchar_against_char_n(query: str, dsn: str) -> None:
 # A simple CASE is `test = when-value` and NULLIF is `a = b`, each through
 # the operator the two types resolve to: `bpchareq` for a `varchar` against
 # a `char(n)`, `texteq` against `text` with the `char(n)` side cast to text
-# (its blanks dropped). Here the `char(n)` side is compared padded. Two
-# `char(n)` operands are answered (`case c when 'y'::char(3)`).
+# (its blanks dropped). The `char(n)` side was compared padded. Two
+# `char(n)` operands were answered (`case c when 'y'::char(3)`).
 CASE_AND_NULLIF = {
     "select k, case c when v then 'eq' else 'ne' end from ch726 order by k": (
         [(1, "eq"), (2, "eq")],
@@ -198,7 +199,7 @@ CASE_AND_NULLIF = {
 }
 
 
-@pytest.mark.backlog("RP-737")
+@pytest.mark.backlog_fixed("RP-737")
 @pytest.mark.parametrize("query", list(CASE_AND_NULLIF))
 def test_case_and_nullif_compare_by_type(query: str, dsn: str) -> None:
     assert answer(dsn, query) == CASE_AND_NULLIF[query]

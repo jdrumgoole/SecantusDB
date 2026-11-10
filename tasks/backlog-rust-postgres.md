@@ -3207,16 +3207,6 @@ Measured on a private PostgreSQL 15.19 cluster with the `_SETUP` in
 varchar(4), t text)` holding `(1, 'y', 'y', 'y')` and `(2, 'ab', 'ab ',
 'ab ')`.
 
-- [ ] **A simple CASE and NULLIF over a `char(n)` and another string type
-      compare without the operator their types resolve to.** `case c when
-      v` and `nullif(v, c)`, `c` a `char(3)` `y` and `v` a `varchar` `y`,
-      are `eq` / NULL on PostgreSQL 15.19 (`bpchareq`); here `ne` / `y`, the
-      `char(n)` side compared with its padding. Against `text` (`texteq`,
-      the `char(n)` side cast to text) `case t when c` over `ab ` and `ab`
-      is `ne` there, `eq` here, and `nullif(t, c)` over `y` and `y` is
-      NULL there, `y` here. Two `char(n)` operands are answered.
-      Verify: tests/backlog/test_rp_found_rp726.py::test_case_and_nullif_compare_by_type
-      Backlog-ID: RP-737
 - [ ] **EXPLAIN of a JOIN ... ON a `varchar` column equal to a `char(n)`
       one prints the Hash Cond through `text` casts.** `explain (costs
       off) select x.k, y.k from ch726 x join ch726 y on x.v = y.c` prints
@@ -3226,6 +3216,22 @@ varchar(4), t text)` holding `(1, 'y', 'y', 'y')` and `(2, 'ab', 'ab ',
       Found while working RP-736 (2026-11-09).
       Verify: tests/backlog/test_rp_found_rp726.py::test_explain_join_on_varchar_against_char_n
       Backlog-ID: RP-738
+
+## Found while working RP-737 (2026-11-09)
+
+Measured on PostgreSQL 15.19 (the shared reference on port 5415) with
+FROM-less statements and a VALUES list; the gap tests are in
+`tests/backlog/test_rp_found_rp737.py`.
+
+- [ ] **NULLIF of a `char(n)` against an untyped literal or NULL is typed
+      `text` and drops its padding.** `select nullif('ab'::char(4), 'zz')`
+      is `character` `ab  ` on PostgreSQL 15.19 (`bpchareq`, the literal
+      read as `bpchar`, so the result keeps the left operand's type);
+      here it is `text` `ab`, and so is `nullif('ab'::char(4), null)` and
+      `nullif(c, 'zz')` over a `char(3)` column. Against a typed
+      `char(n)`, `varchar` or `text` operand the type and value match.
+      Verify: tests/backlog/test_rp_found_rp737.py::test_nullif_char_n_against_untyped_keeps_bpchar
+      Backlog-ID: RP-741
 - [ ] **A cancel while a 200,000-item `IN` list is planned still waits
       up to ~0.25 s, about one time in twenty.** RP-202's
       `test_a_cancel_while_a_huge_in_list_is_planned_over_a_table[0.7]`
@@ -3302,6 +3308,16 @@ b int[])`, `b` holding `'{}'`, `'{NULL,1}'`, `'{1,2}'`, `'{{1,2},{3,4}}'`,
       drops them. The null test lowers to the MQL `{b: null}`, which also
       matches an array with a NULL element; `IS NOT DISTINCT FROM NULL` is
       right since RP-733 took it per row.
+      A first fix (`d4e56836`, 2026-11-09) sent the null test down RP-733's
+      per-row path and was reverted. The aggregate FILTER lowering
+      (`lower_where` for `agg_filter`, which takes the per-row path only
+      for a sublink or a correlated call) returned the refusal, so
+      `select array_agg(a) filter (where a is not null) from bc_arr where id
+      < 3` became 0A000 "an array column compared with a constant" where
+      PostgreSQL answers `{{1,2}}`. `test_rust_pg_builtin_coverage.py` failed
+      on snapshot PR #2586. The fix must evaluate a FILTER that the filter
+      cannot express per row too, which an array comparison inside a
+      FILTER probably needs since RP-733 as well (unmeasured).
       Verify: tests/backlog/test_rp_found_rp722.py::test_a_null_test_over_an_array_column_reads_the_array
       Backlog-ID: RP-739
 - [ ] **`a = ANY (array of arrays)` over an array column answers rows.**
