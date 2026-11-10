@@ -757,6 +757,7 @@ mod tests {
             checks: vec![("pos".to_string(), "VALUE > 0".to_string())],
             not_valid: vec!["pos".to_string()],
             default_sql: None,
+            collation: None,
         }
     }
 

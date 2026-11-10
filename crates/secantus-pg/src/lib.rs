@@ -19260,6 +19260,7 @@ impl PgHandler {
                 checks,
                 not_valid,
                 default_sql,
+                collation: d.get_str("collation").ok().map(str::to_string),
             });
         }
         out.sort_by(|a, b| a.name.cmp(&b.name));
@@ -19287,6 +19288,7 @@ impl PgHandler {
             "typmod": d.typmod,
             "base_oid": secantus_pgplan::pgtypes::oid_of_name(&d.base).map_or(Bson::Null, Bson::Int64),
             "oid": d.oid,
+            "collation": d.collation.clone().map_or(Bson::Null, Bson::String),
         }
     }
 

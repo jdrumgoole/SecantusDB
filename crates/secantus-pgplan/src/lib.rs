@@ -8848,6 +8848,22 @@ fn plan_added_column(
     }
     column.typmod = cd.type_name.as_ref().map(declared_typmod).unwrap_or(-1);
     column.set_ndims(cd.type_name.as_ref().map_or(0, declared_ndims));
+    // `GetColumnDefCollation`: the COLLATE clause's collation, looked up
+    // first (42704) and refused over a type with none (42804); without one,
+    // the type's, which for a domain is the one its COLLATE named (RP-782).
+    if let Some(cc) = cd.coll_clause.as_deref() {
+        let name = collation::clause_name(cc);
+        collation::resolve(&name)?;
+        if !collation::collatable(&ty) {
+            return Err(Error::DatatypeMismatch(format!(
+                "collations are not supported by type {}",
+                display_type(&ty)
+            )));
+        }
+        column.extra.insert("collation", name);
+    } else if let Some(coll) = domains::declared_collation(&ty) {
+        column.extra.insert("collation", coll);
+    }
     for con in &cd.constraints {
         let Some(N::Constraint(k)) = con.node.as_ref() else {
             continue;
@@ -9115,6 +9131,14 @@ fn tag_domain_column(
 ) -> Result<()> {
     column.typmod = resolved.map_or(d.typmod, |(_, typmod, _)| *typmod);
     column.extra.insert("domain_type", d.name.clone());
+    // A column's collation is its own COLLATE's, else its type's
+    // (`attcollation` from `typcollation`): a domain's COLLATE reaches every
+    // column of it that declares none (RP-782).
+    if !column.extra.contains_key("collation") {
+        if let Some(coll) = domains::declared_collation(&d.name) {
+            column.extra.insert("collation", coll);
+        }
+    }
     if let Some(sql) = &d.default_sql {
         let raw = domains::parse_default_sql(sql)?;
         match default_value_or_expr(&raw, underlying, &[])? {
@@ -43560,6 +43584,50 @@ fn references_literal_only_column(node: &pg_query::protobuf::Node, def: &TableDe
     })
 }
 
+/// Whether column `c` of `def` holds its `bpchar` values WITH their
+/// trailing blanks, which its comparisons must ignore.
+///
+/// A stored table's `char(n)` cell is written trimmed, and so is a
+/// materialised source's sized one (`stored_bpchar_cell`), so an MQL filter
+/// compares it with the constant's blanks dropped (`bpchar_operand`) and
+/// agrees with `bpchareq`. An UNSIZED `bpchar` column of a materialised
+/// source -- a VALUES list or a set operation whose members' modifiers
+/// differ, `(values ('uu'::char(4)), ('tt')) s(f)` -- has no width to pad
+/// the value back to, so its cell keeps the blanks as written (`'uu  '`,
+/// as PostgreSQL shows it), and an MQL comparison read them: `f = 'uu'`
+/// and `f in ('uu  ', 'tt')` found nothing (RP-775). A stored table's def
+/// carries its system columns (`TableDef::from_document`); a materialised
+/// source's does not.
+fn keeps_bpchar_blanks(def: &TableDef, c: &Column) -> bool {
+    def.system_columns.is_empty() && c.pg_type == "bpchar" && c.typmod <= 4
+}
+
+/// Whether `node` reads a column of `def` whose `bpchar` cells keep their
+/// trailing blanks (`keeps_bpchar_blanks`). Such a predicate is refused
+/// here and evaluated per row, whose operators compare as `bpchar` does
+/// (`bpchar_compared_operands`): blanks ignored against `bpchar`, the column
+/// `rtrim`med against `text`.
+fn references_blank_keeping_bpchar(node: &pg_query::protobuf::Node, def: &TableDef) -> bool {
+    if !def.columns.iter().any(|c| keeps_bpchar_blanks(def, c)) {
+        return false;
+    }
+    let Some(inner) = node.node.as_ref() else {
+        return false;
+    };
+    let keeps = |c: &pg_query::protobuf::ColumnRef| {
+        column_ref_name(c)
+            .and_then(|name| def.column(&name))
+            .is_some_and(|col| keeps_bpchar_blanks(def, col))
+    };
+    if let N::ColumnRef(c) = inner {
+        return keeps(c);
+    }
+    inner.nodes().iter().any(|(n, _, _, _)| match n {
+        pg_query::NodeRef::ColumnRef(c) => keeps(c),
+        _ => false,
+    })
+}
+
 /// Whether `node` reads a column anywhere beneath it.
 fn references_columns(node: &pg_query::protobuf::Node) -> bool {
     let mut probe = node.clone();
@@ -43718,9 +43786,13 @@ fn collation_for_type(ty: &str) -> Result<Bson> {
         return Ok(Bson::String(crate::scalar::quote_identifier(known)));
     }
     let mut base = ty.trim_end_matches("[]").to_string();
-    // A domain's collation is its base type's (`DefineDomain`), through a
-    // domain over a domain and a domain over an array; the error still
-    // names the type as `pg_typeof` gave it.
+    // A domain's collation is the one its COLLATE named (RP-782), else its
+    // base type's (`DefineDomain`), through a domain over a domain and a
+    // domain over an array; the error still names the type as `pg_typeof`
+    // gave it.
+    if let Some(coll) = domains::declared_collation(&base) {
+        return Ok(Bson::String(crate::scalar::quote_identifier(&coll)));
+    }
     if let Some((inner, _, _)) = domains::base_type_and_typmod(&base) {
         base = inner.trim_end_matches("[]").to_string();
     }
@@ -43766,6 +43838,13 @@ fn lower_where_plain(
     if references_literal_only_column(node, def) {
         return Err(Error::Unsupported(
             "a predicate over a column whose name is not a plain field".into(),
+        ));
+    }
+    // A `bpchar` cell that keeps its trailing blanks is compared per row,
+    // as `bpchar` (RP-775).
+    if references_blank_keeping_bpchar(node, def) {
+        return Err(Error::Unsupported(
+            "a predicate over a bpchar column that keeps its blanks".into(),
         ));
     }
     // A predicate over no column -- `WHERE false`, `WHERE $1` -- is decided

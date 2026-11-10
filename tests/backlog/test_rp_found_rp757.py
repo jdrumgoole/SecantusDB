@@ -2,8 +2,8 @@
 
 - a scalar subquery under `IS [NOT] TRUE` / `FALSE` / `UNKNOWN`, or under
   a `COLLATE`, is still refused;
-- a `char(n)` column of a VALUES list, compared in a WHERE, does not
-  compare as `bpchar`.
+- a `char(n)` column of a VALUES list, compared in a WHERE, did not
+  compare as `bpchar` (RP-775, fixed).
 
 Measured on PostgreSQL 15.19 (the shared reference on port 5415): every
 statement is VALUES-only and runs there as written.
@@ -55,26 +55,49 @@ def test_a_scalar_subquery_under_a_boolean_test_or_collate(
 
 
 _C = "from (values ('uu'::char(4)), ('tt'), ('vv')) s(f)"
+# A set operation whose sides' modifiers differ is unsized `bpchar` too.
+_U = "from (select 'uu'::char(4) f union all select 'tt' union all select 'vv') s"
 
 
-@pytest.mark.backlog("RP-775")
+@pytest.mark.backlog_fixed("RP-775")
 @pytest.mark.parametrize(
     ("query", "expected"),
     [
         # An IN list's members take the column's type, bpchar: blanks
         # do not count.
         (f"select f {_C} where f in ('uu  ', 'tt') order by f", [("tt",), ("uu  ",)]),
-        (f"select f {_C} where f in ('uu  '::text, 'tt') order by f", [("tt",), ("uu  ",)]),
         (f"select f {_C} where f in ((select 'uu'), 'tt') order by f", [("tt",), ("uu  ",)]),
-        # `bpchar = text` resolves to text: the column is rtrimmed and the
-        # text keeps its blanks, so nothing matches.
-        (f"select f {_C} where f = (select 'uu  ') order by f", []),
+        (f"select f {_C} where f not in ('uu  ', 'tt') order by f", [("vv",)]),
+        (f"select f {_C} where f = 'uu' order by f", [("uu  ",)]),
+        (f"select f {_C} where f <> 'uu  ' order by f", [("tt",), ("vv",)]),
+        (f"select f {_C} where f <= 'uu' order by f", [("tt",), ("uu  ",)]),
+        (f"select f {_C} where f between 'tt ' and 'uu ' order by f", [("tt",), ("uu  ",)]),
+        (f"select f {_C} where f is distinct from 'uu  ' order by f", [("tt",), ("vv",)]),
+        # Against `text` the column is `rtrim`med and the text keeps its
+        # blanks.
+        (f"select f {_C} where f = 'uu  '::text order by f", []),
+        (f"select f {_C} where f = 'uu'::text order by f", [("uu  ",)]),
+        # A one-member list is a plain `=`, here `text`'s.
+        (f"select f {_C} where f in ('uu  '::text) order by f", []),
+        (f"select f {_U} where f = 'uu' order by f", [("uu  ",)]),
+        (f"select f {_U} where f = 'uu  '::text order by f", []),
+        (
+            "with s(f) as (values ('uu'::char(4)), ('tt')) select f from s where f = 'uu'",
+            [("uu  ",)],
+        ),
+        (
+            "select s.f from (values ('uu'::char(4)), ('tt')) s(f), (values (1)) t(n)"
+            " where s.f = 'uu'",
+            [("uu  ",)],
+        ),
     ],
 )
 def test_a_values_char_column_compares_as_bpchar_in_a_where(
     dsn: str, query: str, expected: object
 ) -> None:
-    """A `char(4)` column of a VALUES list compared in a WHERE: the select
-    list's `f in (...)` already answers as PostgreSQL 15.19 does, the
-    filter does not."""
+    """An unsized `bpchar` column of a VALUES list or a set operation
+    keeps its cells' blanks (`'uu  '`, as PostgreSQL 15.19 shows them), and
+    a WHERE over it read them: `f = 'uu'` and `f in ('uu  ', 'tt')` found
+    nothing, `f = 'uu  '::text` found `'uu  '`. Such a predicate is now
+    evaluated per row, as `bpchar` compares."""
     assert _answer(dsn, query) == expected

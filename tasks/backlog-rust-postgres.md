@@ -3384,20 +3384,6 @@ with ICU) with the `_SETUP` in `tests/backlog/test_rp_found_rp769.py`.
 Since RP-769 a domain, and its array type, takes its base type's
 collation (`catalog_fill.rs`'s `domain_collations`).
 
-- [ ] **`CREATE DOMAIN`'s COLLATE clause is parsed and dropped.** `create
-      domain d782c as text collate "C"` gives the domain, its array type
-      and a column of it collation 950 on PostgreSQL 15.19, and a domain
-      `collate "und-x-icu"` sorts `a` before `B` and answers `collation
-      for` with `"und-x-icu"`, as `information_schema.domains` names it;
-      here every one is the base type's `default` (100, sorted bytewise,
-      `collation_name` NULL). `create domain d as int collate "C"` is
-      42804 `collations are not supported by type integer` and a collation
-      that does not exist 42704 on 15.19; here both are made.
-      `plan_create_domain` never reads `coll_clause`, and `Domain` has no
-      field to keep it: the domain's stored document, its catalog rows and
-      the collation a column of it sorts by all need it.
-      Verify: tests/backlog/test_rp_found_rp769.py::test_create_domain_keeps_its_collate_clause
-      Backlog-ID: RP-782
 - [ ] **`information_schema.columns.collation_name` shows only a declared
       COLLATE.** PostgreSQL 15.19's view joins `pg_collation` on
       `attcollation` and leaves out only `pg_catalog.default`, so a `name`
@@ -3409,6 +3395,56 @@ collation (`catalog_fill.rs`'s `domain_collations`).
       DECLARES a collation shows one").
       Verify: tests/backlog/test_rp_found_rp769.py::test_information_schema_columns_collation_is_the_columns
       Backlog-ID: RP-783
+
+## Found while working RP-782 (2026-11-10)
+
+Measured on a private PostgreSQL 15.19 cluster (locale C.UTF-8, built
+with ICU) with the `_SETUP` in `tests/backlog/test_rp_found_rp782.py`:
+`xu782f` a domain over `text` `collate "und-x-icu"`, `xc782f` one
+`collate "C"`.
+
+- [ ] **A cast to a collated domain does not take its collation.** Since
+      RP-782 a domain keeps its COLLATE, and a column of it sorts by it,
+      but an expression of the domain's type does not: `select 'a'::xu782f
+      < 'B'::xu782f` is true on PostgreSQL 15.19 and false here, `order
+      by` and `max` over a VALUES list of `xu782f` sort bytewise, and
+      `'a'::xu782f < 'B'::xc782f` is 42P22 `could not determine which
+      collation to use for string comparison` there and false here.
+      `exprCollation` of a cast to a domain is the domain's
+      `typcollation`, an IMPLICIT collation (`COLLATE_IMPLICIT`), so the
+      fix is the analyser's collation derivation, not an explicit
+      `COLLATE` wrapped round the cast (which would turn the 42P22 into a
+      42P21).
+      Verify: tests/backlog/test_rp_found_rp782.py::test_a_cast_to_a_collated_domain_takes_its_collation
+      Backlog-ID: RP-796
+- [ ] **`information_schema`'s text columns are not collated "C".**
+      `information_schema.sql` declares `character_data` and `yes_or_no`
+      `COLLATE "C"` (kept on the built-in domains since RP-782), and its
+      views' columns are of those domains and of `sql_identifier`, so
+      `collation for (data_type)` of `information_schema.columns` is
+      `"C"` on PostgreSQL 15.19; here it is `"default"`, as is
+      `is_insertable_into` of `information_schema.tables`. The views'
+      columns are typed by their base types (`varchar`), so they also sort
+      by the database's collation.
+      Verify: tests/backlog/test_rp_found_rp782.py::test_information_schema_character_data_columns_are_collated_c
+      Backlog-ID: RP-797
+- [ ] **`pg_get_viewdef` of a system view is NULL.** `select
+      pg_get_viewdef('pg_tables'::regclass)` deparses the view's rule on
+      PostgreSQL 15.19 (` SELECT n.nspname AS schemaname, ...`), as it does
+      for every `pg_catalog` and `information_schema` view; here every one
+      answers NULL, though a user view's definition is printed.
+      Verify: tests/backlog/test_rp_found_rp782.py::test_pg_get_viewdef_of_a_system_view
+      Backlog-ID: RP-798
+- [ ] **An added domain column does not reach its base type's
+      aggregates.** After `alter table t add column a xc782f`,
+      `string_agg(a, ',')` is 42883 `function string_agg(xc782f, unknown)
+      does not exist` here and aggregates on PostgreSQL 15.19. A column
+      CREATE TABLE declares of a domain is stored as the base type with a
+      `domain_type` tag (`tag_domain_column`); one ADD COLUMN adds keeps the
+      domain's name as its type (`plan_added_column`), which the
+      aggregate's overload resolution does not follow to `text`.
+      Verify: tests/backlog/test_rp_found_rp782.py::test_an_added_domain_column_reaches_its_base_types_aggregates
+      Backlog-ID: RP-799
 
 ## Found while working RP-768 (2026-11-10)
 
@@ -3444,27 +3480,51 @@ statement is VALUES-only and runs there as written. The gap tests are in
       unresolved.
       Verify: tests/backlog/test_rp_found_rp757.py::test_a_scalar_subquery_under_a_boolean_test_or_collate
       Backlog-ID: RP-774
-- [ ] **A `char(n)` column of a VALUES list does not compare as `bpchar` in
-      a WHERE.** Over `(values ('uu'::char(4)), ('tt'), ('vv')) s(f)`,
-      `where f in ('uu  ', 'tt')` is `tt`, `uu  ` on PostgreSQL 15.19 (the
-      list's members take the column's type, and `bpchar` ignores trailing
-      blanks); here it is `tt` alone, and the same with `'uu  '::text` or
-      `(select 'uu')` as the member. `where f = (select 'uu  ')` finds
-      nothing on 15.19 (`bpchar = text` resolves to `text`, the column
-      `rtrim`med) and `uu  ` here. The select list's `f in (...)` already
-      agrees, as does a `char(4)` table column (RP-691).
-      Verify: tests/backlog/test_rp_found_rp757.py::test_a_values_char_column_compares_as_bpchar_in_a_where
-      Backlog-ID: RP-775
 
-## Found while working RP-771 (2026-11-10)
+## Found while working RP-775 (2026-11-10)
 
-- [ ] **A binary array parameter whose upper bound passes `int4` is
-      accepted.** An `int4[]` sent in binary format with lower bound
-      2147483647 and one element is 54000 `array lower bound is too large:
-      2147483647` on PostgreSQL 15.19 (`array_recv` runs the same
-      `ArrayCheckBounds` as `array_in`, before reading an element); here
-      it binds and prints `[2147483647:2147483647]={1}`. Since RP-771 the
-      text literal is refused; `binary_array` in `secantus-pg/src/lib.rs`
-      keeps the lower bounds without the check.
-      Verify: tests/backlog/test_rp_found_rp771.py::test_binary_array_refuses_an_upper_bound_past_int4
-      Backlog-ID: RP-795
+Measured on PostgreSQL 15.19: the VALUES-only statements on the shared
+reference (port 5415), the stored-table ones on a private, freshly
+initdb'd cluster. The gap tests are in
+`tests/backlog/test_rp_found_rp775.py`.
+
+- [ ] **Per row, a `char(n)` operand against a `text` one resolves the
+      operator wrongly in two shapes.** Evaluated per row -- a select
+      list, or a WHERE over a VALUES list or a set operation (RP-775 sends
+      those to the evaluator) -- over `(values ('uu'::char(4)), ('tt'),
+      ('vv')) s(f)` on PostgreSQL 15.19: `f in ('uu  '::text, 'tt')` is
+      true for `uu  ` (more than one non-Var member, so
+      `transformAExprIn` compares as the list's common type, `bpchar`),
+      and `f = (select 'uu  ')` is false for every row (the subquery's
+      column is `text`, so `texteq` over the `rtrim`med column). Here the
+      first compares the `text` member as `text` (it expands the list to
+      one `=` per member, which is right only for one member), and the
+      second as `bpchar`: the subquery's value is a parameter whose type
+      `declare_sublink_param` records while planning, and the per-row
+      evaluation no longer sees it. The same on a stored `char(n)`
+      table's select list. The WHERE forms over a VALUES list that the
+      MQL filter answered wrongly were RP-775.
+      Verify: tests/backlog/test_rp_found_rp775.py::test_a_char_operand_against_text_per_row
+      Backlog-ID: RP-792
+- [ ] **A one-member `IN` list of `text` over a `char(n)` column compares
+      as `bpchar`.** Over a stored `char(4)` column holding `uu`, `where
+      f in ('uu  '::text)` finds nothing on PostgreSQL 15.19 (a private
+      cluster): `transformAExprIn` builds the `bpchar[]` comparison only
+      for more than one non-Var member, and one member is a plain `=`,
+      which against `text` resolves to `texteq` over the `rtrim`med
+      column. Here `lower_in` coerces every member to the column's type
+      and drops its blanks, so `uu` matches, and `not in` drops it. Its
+      comment (RP-691) states the one-member case the wrong way round.
+      Verify: tests/backlog/test_rp_found_rp775.py::test_a_one_member_text_in_list_compares_as_text
+      Backlog-ID: RP-793
+- [ ] **An ORDER BY over an unsized `bpchar` column of a VALUES list or a
+      set operation counts the trailing blanks.** `select f from (values
+      ('a  '::char(3)), (E'a\t')) s(f) order by f` is `a  `, `a<tab>` on
+      PostgreSQL 15.19: `bpcharcmp` compares `bcTruelen` lengths, so `'a  '`
+      sorts as `'a'`. The column is unsized (its members' modifiers
+      differ), so its cells keep their blanks (`stored_bpchar_cell` has no
+      width to pad back to), and the sort here reads them: a blank (0x20)
+      after a tab (0x09), so the order is reversed. The same over `(select
+      'a'::char(3) f union all select E'a\t') s`, and with DESC.
+      Verify: tests/backlog/test_rp_found_rp775.py::test_an_unsized_bpchar_column_sorts_without_its_blanks
+      Backlog-ID: RP-794

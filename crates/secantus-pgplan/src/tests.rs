@@ -5116,6 +5116,7 @@ fn create_table_as_records_its_columns_domains() {
         checks: Vec::new(),
         not_valid: Vec::new(),
         default_sql: None,
+        collation: None,
     }]);
     let table = || {
         let mut a = Column::new("a", "bpchar", false);
@@ -5172,6 +5173,7 @@ fn a_domain_over_char_n_coerces_to_its_base_width() {
         checks: Vec::new(),
         not_valid: Vec::new(),
         default_sql: None,
+        collation: None,
     };
     domains::set_user_domains(vec![
         domain("dc3", 90001, "bpchar", 7),
@@ -5249,6 +5251,7 @@ fn an_array_of_one_domain_is_the_domains_array() {
         checks: Vec::new(),
         not_valid: Vec::new(),
         default_sql: None,
+        collation: None,
     }]);
     let array_type = |sql: &str| {
         let parsed = pg_query::parse(sql).expect("parses");
@@ -5293,6 +5296,7 @@ fn a_cast_to_a_domain_array_coerces_each_element() {
         not_null,
         checks: Vec::new(),
         default_sql: None,
+        collation: None,
         not_valid: Vec::new(),
     };
     domains::set_user_domains(vec![
@@ -5596,6 +5600,7 @@ fn a_cast_to_a_domain_with_a_modifier_has_a_typmod() {
         not_null: false,
         checks: Vec::new(),
         default_sql: None,
+        collation: None,
         not_valid: Vec::new(),
     };
     domains::set_user_domains(vec![
@@ -5715,6 +5720,7 @@ fn a_domain_column_is_cast_to_its_domain_where_an_array_shows_it() {
         checks: Vec::new(),
         not_valid,
         default_sql: None,
+        collation: None,
     };
     domains::set_user_domains(vec![
         domain("dc", Vec::new()),
@@ -5801,6 +5807,7 @@ fn a_domain_column_keeps_its_domain_through_joins_withs_and_set_operations() {
         checks: Vec::new(),
         not_valid: Vec::new(),
         default_sql: None,
+        collation: None,
     }]);
     let table = |name: &str| {
         let mut a = Column::new("a", "bpchar", false);
@@ -5913,6 +5920,7 @@ fn a_cast_of_a_domain_column_to_its_own_domain_is_a_relabel() {
         checks: vec![("pos".to_string(), "VALUE > 0".to_string())],
         not_valid: vec!["pos".to_string()],
         default_sql: None,
+        collation: None,
     }]);
     let table = || {
         let mut a = Column::new("a", "int4", false);
@@ -6126,6 +6134,35 @@ fn any_array_bpchar_trims_follow_operator_resolution() {
             "{lhs} op ANY ({array})"
         );
     }
+}
+
+/// An unsized `bpchar` column of a materialised source keeps its cells'
+/// trailing blanks (`stored_bpchar_cell` has no width to pad back to), so a
+/// predicate over it is evaluated per row, as `bpchar`, not lowered to an
+/// MQL filter that reads the blanks (RP-775). A stored table's unsized
+/// `bpchar` cell is written trimmed, and its predicate still lowers.
+#[test]
+fn a_blank_keeping_bpchar_column_is_compared_per_row() {
+    let mut stored = TableDef::new("t", vec![Column::new("f", "bpchar", false)]);
+    stored.system_columns = secantus_pgcatalog::system_columns();
+    let lookup = |name: &str| (name == "t").then(|| stored.clone());
+    let planned = |sql: &str| match plan(sql, &lookup).expect("should plan") {
+        Statement::Select(s) => (s.filter.is_empty(), s.residual.is_some()),
+        other => panic!("wrong statement for {sql}: {other:?}"),
+    };
+    for sql in [
+        "SELECT f FROM (VALUES ('uu'::char(4)), ('tt')) s(f) WHERE f = 'uu'",
+        "SELECT f FROM (VALUES ('uu'::char(4)), ('tt')) s(f) WHERE f IN ('uu  ', 'tt')",
+        "SELECT f FROM (SELECT 'uu'::char(4) f UNION ALL SELECT 'tt') s WHERE f <> 'uu'",
+    ] {
+        assert_eq!(planned(sql), (true, true), "per row: {sql}");
+    }
+    // A sized column of the same source is stored trimmed: still a filter.
+    assert_eq!(
+        planned("SELECT f FROM (VALUES ('uu'::char(4)), ('tt'::char(4))) s(f) WHERE f = 'uu'"),
+        (false, false)
+    );
+    assert_eq!(planned("SELECT f FROM t WHERE f = 'uu'"), (false, false));
 }
 
 /// A constant compared with a `char(n)` column keeps its trailing blanks

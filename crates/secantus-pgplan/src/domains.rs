@@ -28,6 +28,9 @@ pub struct Domain {
     pub not_valid: Vec<String>,
     /// The DEFAULT expression's SQL.
     pub default_sql: Option<String>,
+    /// The collation a `COLLATE` clause named (`typcollation`); `None`
+    /// takes the base type's, as `DefineDomain` does without one.
+    pub collation: Option<String>,
 }
 
 thread_local! {
@@ -89,6 +92,8 @@ pub fn system_domains() -> &'static [Domain] {
                     .collect(),
                 not_valid: Vec::new(),
                 default_sql: default.map(str::to_string),
+                // `character_data` and `yes_or_no` are declared `COLLATE "C"`.
+                collation: matches!(name, "character_data" | "yes_or_no").then(|| "C".to_string()),
             }
         };
         vec![
@@ -167,6 +172,17 @@ pub fn base_type_and_typmod(name: &str) -> Option<(String, i32, Vec<Domain>)> {
     }
     let typmod = chain.last()?.typmod;
     Some((base, typmod, chain))
+}
+
+/// The collation a domain declared, its own or, without a COLLATE clause,
+/// the one of the domain it is over (`DefineDomain` copies the base type's
+/// `typcollation`); `None` when no domain in the chain declared one, and so
+/// the innermost base type's collation is the domain's.
+pub fn declared_collation(name: &str) -> Option<String> {
+    base_type_and_typmod(name)?
+        .2
+        .into_iter()
+        .find_map(|d| d.collation)
 }
 
 /// Check `value` against domain `name`: 23502 for a NULL the domain refuses,
@@ -439,6 +455,23 @@ pub(crate) fn plan_create_domain(c: &pg_query::protobuf::CreateDomainStmt) -> Re
         .as_ref()
         .ok_or_else(|| Error::Parse("CREATE DOMAIN without a type".into()))?;
     let base = type_name_of(tn);
+    // `DefineDomain`: the COLLATE clause's collation is looked up first
+    // (42704), then refused over a base type with no collation (42804,
+    // naming the base type), before any constraint is read.
+    let collation = match c.coll_clause.as_deref() {
+        Some(cc) => {
+            let coll = collation::clause_name(cc);
+            collation::resolve(&coll)?;
+            if !collation::collatable(&base) {
+                return Err(Error::DatatypeMismatch(format!(
+                    "collations are not supported by type {}",
+                    display_type(&base)
+                )));
+            }
+            Some(coll)
+        }
+        None => None,
+    };
     let (not_null, checks, default_sql) = constraints_of(&name, &c.constraints, &[])?;
     Ok(Statement::CreateDomain(Domain {
         name,
@@ -449,6 +482,7 @@ pub(crate) fn plan_create_domain(c: &pg_query::protobuf::CreateDomainStmt) -> Re
         checks,
         not_valid: Vec::new(),
         default_sql,
+        collation,
     }))
 }
 

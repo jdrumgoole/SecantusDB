@@ -1,9 +1,11 @@
 """Gap tests of divergences found while working RP-771 (an array literal
 whose upper bound passes `int4` was accepted):
 
-- an array parameter in BINARY format whose upper bound passes `int4` is
+- an array parameter in BINARY format whose upper bound passes `int4` was
   accepted, where `array_recv` runs the same `ArrayCheckBounds` as
-  `array_in` and refuses it with 54000.
+  `array_in` and refuses it with 54000 (RP-795, fixed: `binary_recv.rs`'s
+  `recv_array` now runs `ArrayGetNItems` and `ArrayCheckBounds` on the
+  dimensions before it reads an element, as `array_recv` does).
 
 The expected answers were measured on PostgreSQL 15.19 (the shared
 reference; the statement creates nothing).
@@ -59,8 +61,25 @@ BINARY_BOUNDS = {
     (2147483646, (1,)): ("ok", [("[2147483646:2147483646]={1}",)]),
 }
 
+# `ArrayGetNItems` runs first: a negative dimension, or one past
+# `MaxArraySize`, is refused before any element is read.
+SIZE = "array size exceeds the maximum allowed (134217727)"
+BINARY_DIMENSIONS = {
+    "past MaxArraySize": ((2147483647,), (1,), ("error", "54000", SIZE)),
+    "negative": ((-1,), (1,), ("error", "54000", SIZE)),
+    "empty, the bound at int4's top": ((0,), (2147483647,), ("ok", [("{}",)])),
+}
 
-@pytest.mark.backlog("RP-795")
+
+def _array(dims: tuple[int, ...], lbs: tuple[int, ...]) -> _RawArray:
+    """An `int4[]` header of `dims` and `lbs`, with no element."""
+    data = struct.pack(">iiI", len(dims), 0, 23)
+    for d, lb in zip(dims, lbs, strict=True):
+        data += struct.pack(">ii", d, lb)
+    return _RawArray(data)
+
+
+@pytest.mark.backlog_fixed("RP-795")
 @pytest.mark.parametrize("case", list(BINARY_BOUNDS), ids=str)
 def test_binary_array_refuses_an_upper_bound_past_int4(
     case: tuple[int, tuple[int, ...]], dsn: str
@@ -74,3 +93,17 @@ def test_binary_array_refuses_an_upper_bound_past_int4(
         except psycopg.Error as e:
             answer = ("error", e.sqlstate, str(e).splitlines()[0])
     assert answer == BINARY_BOUNDS[case]
+
+
+@pytest.mark.backlog_fixed("RP-795")
+@pytest.mark.parametrize("case", list(BINARY_DIMENSIONS))
+def test_binary_array_counts_its_elements_before_reading_one(case: str, dsn: str) -> None:
+    dims, lbs, want = BINARY_DIMENSIONS[case]
+    with psycopg.connect(dsn, autocommit=True) as c:
+        c.adapters.register_dumper(_RawArray, _RawArrayDumper)
+        try:
+            rows = c.execute("select %b::text", [_array(dims, lbs)]).fetchall()
+            answer: tuple[object, ...] = ("ok", rows)
+        except psycopg.Error as e:
+            answer = ("error", e.sqlstate, str(e).splitlines()[0])
+    assert answer == want
