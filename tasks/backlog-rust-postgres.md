@@ -3507,7 +3507,7 @@ Measured on the shared PostgreSQL 15.19 reference (port 5415); the
 statements are VALUES-only and create nothing. The gap tests are in
 `tests/backlog/test_rp_found_rp794.py`.
 
-- [ ] **An untyped literal resolved to `bpchar` beside a `char(n)` loses its
+- [ ] **An untyped literal typed `bpchar` beside a `char(n)` loses its
       trailing blanks.** `select 'a'::char(3) union all select 'b '` is
       `a  `, `b ` on PostgreSQL 15.19, and so is `(values ('a'::char(3)),
       ('b ')) s(f)`: the column is `bpchar` with no modifier (the literal
