@@ -176,7 +176,10 @@ pub(crate) fn interruptible<T: Send + 'static>(
         if trace_on() {
             let gap = last.elapsed();
             if gap > std::time::Duration::from_millis(50) {
-                trace(format_args!("parse wait polled after {} ms", gap.as_millis()));
+                trace(format_args!(
+                    "parse wait polled after {} ms",
+                    gap.as_millis()
+                ));
             }
             last = std::time::Instant::now();
         }

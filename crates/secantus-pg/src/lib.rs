@@ -32985,7 +32985,11 @@ impl PgHandler {
             secantus_pgplan::cancel::trace(format_args!(
                 "pid {} cycle start{}",
                 self.backend_pid.load(Relaxed),
-                if dropped { ", a pending cancel dropped" } else { "" }
+                if dropped {
+                    ", a pending cancel dropped"
+                } else {
+                    ""
+                }
             ));
             self.message_cycle.fetch_add(1, Relaxed);
             if self.backend_pid.load(Relaxed) != 0 {
