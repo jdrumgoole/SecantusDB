@@ -15,3 +15,7 @@ their sort order. The plain aggregates already picked in the right order.
 
 Fixes RP-763 (tests/backlog/test_rp_found_rp754.py::test_a_window_min_max_under_a_collation,
 tests/backlog/test_rp_found_rp754.py::test_a_window_min_max_over_an_enum).
+
+The differential check over a window `max` under `en-x-icu` orders its
+outer query by `"C"`: ordered by the database's default collation, it
+followed the reference server's locale and failed against CI's.
