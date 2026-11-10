@@ -620,18 +620,31 @@ fn output_names(
     colnames: &[String],
 ) -> Option<Vec<Option<String>>> {
     let first = first_arm(inner)?;
+    // A `*` (or `x.*`) target is as many outputs as it expands to, which the
+    // parse tree does not say: the star itself, and every target after it
+    // while an alias list could be naming it, are unknown and kept. Without
+    // that, `(select * from a join b ...) q(p, r, s, t)` read the star as the
+    // one output `p` and nulled it when only `t` was read (RP-773).
+    let mut after_star = false;
     Some(
         first
             .target_list
             .iter()
             .enumerate()
             .map(|(k, t)| {
-                if let Some(c) = colnames.get(k) {
-                    return Some(c.clone());
-                }
                 let N::ResTarget(rt) = t.node.as_ref()? else {
                     return None;
                 };
+                if is_star_target(rt) {
+                    after_star = true;
+                    return None;
+                }
+                if after_star && !colnames.is_empty() {
+                    return None;
+                }
+                if let Some(c) = colnames.get(k) {
+                    return Some(c.clone());
+                }
                 if !rt.name.is_empty() {
                     return Some(rt.name.clone());
                 }
@@ -639,6 +652,16 @@ fn output_names(
             })
             .collect(),
     )
+}
+
+/// A target that expands to a row's columns: `*`, `x.*`, `(expr).*`.
+fn is_star_target(rt: &pg_query::protobuf::ResTarget) -> bool {
+    let is_star = |n: &pg_query::protobuf::Node| matches!(n.node.as_ref(), Some(N::AStar(_)));
+    match rt.val.as_deref().and_then(|v| v.node.as_ref()) {
+        Some(N::ColumnRef(c)) => c.fields.last().is_some_and(is_star),
+        Some(N::AIndirection(ind)) => ind.indirection.last().is_some_and(is_star),
+        _ => false,
+    }
 }
 
 /// The leftmost arm of a UNION ALL tree (the select itself when it is not a

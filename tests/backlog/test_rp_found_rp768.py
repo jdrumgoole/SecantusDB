@@ -1,9 +1,10 @@
 """What working RP-768 (a derived relation's column keeps its type) found.
 
 A column alias list over a FROM subquery whose select list is a join's `*`
-is refused, unless the outer query reads only the alias list's first
-column. Measured on a private PostgreSQL 15.19 cluster, since every
-statement needs a `CREATE TABLE`.
+was refused, unless the outer query read only the alias list's first
+column (RP-773): the unread-output pruning took the `*` for one output. Measured on a
+private PostgreSQL 15.19 cluster, since every statement needs a `CREATE
+TABLE`.
 """
 
 from __future__ import annotations
@@ -20,6 +21,11 @@ ALIASED_JOIN_STAR = {
     f"select t from {_J} order by t": [(100,), (200,)],
     f"select r from {_J} order by r": [(10,), (20,)],
     f"select t from {_J} where t > 100": [(200,)],
+    # A star that is not the whole select list: the names after it.
+    "select s from (select ja768.*, jb768.y from ja768 join jb768"
+    " on ja768.i = jb768.i) q(p, r, s) order by s": [(100,), (200,)],
+    "select r from (select (ja768).*, 7 from ja768) q(p, r, s) order by r": [(10,), (20,)],
+    "select s from (select (ja768).*, 7 from ja768) q(p, r, s) order by r": [(7,), (7,)],
 }
 
 
@@ -33,12 +39,12 @@ def _tables(rust_pg: object) -> object:
     return rust_pg
 
 
-@pytest.mark.backlog("RP-773")
+@pytest.mark.backlog_fixed("RP-773")
 @pytest.mark.parametrize("query", list(ALIASED_JOIN_STAR))
 def test_an_alias_list_over_a_joined_star(query: str, _tables: object) -> None:
     """An alias list names each of a joined `*`'s columns on PostgreSQL
-    15.19, so any of them can be read. Here every one but the first is 42601
-    `table "q" has 1 columns available but 4 columns specified`."""
+    15.19, so any of them can be read. Here every one but the first was
+    42601 `table "q" has 1 columns available but 4 columns specified`."""
     with psycopg.connect(_dsn(_tables) + " dbname=postgres", autocommit=True) as c:
         try:
             got: object = [tuple(r) for r in c.execute(query).fetchall()]
