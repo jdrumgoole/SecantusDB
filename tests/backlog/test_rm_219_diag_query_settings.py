@@ -481,10 +481,21 @@ def _period_takes_effect(client: Any) -> tuple:
 
     try:
         set_period(60_000)
-        time.sleep(1.2)
+        # The collector may be part-way through a wait under the old period
+        # (1 s), and samples once more when it ends: on a loaded CI runner
+        # that sample came after a fixed 1.2 s settle, and mongod read as
+        # not holding (2026-11-10, PG snapshot #2664). So look for a quiet
+        # 1.2 s in up to three: a server still sampling every second has
+        # none, and one that took the new period has every one after the
+        # in-flight sample.
+        held = False
+        for _ in range(3):
+            before = start()
+            time.sleep(1.2)
+            if start() == before:
+                held = True
+                break
         before = start()
-        time.sleep(1.2)
-        held = start() == before
         set_period(200)
         deadline = time.monotonic() + 3
         while start() == before:
