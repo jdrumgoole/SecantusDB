@@ -24397,7 +24397,8 @@ fn resolve_one_sublink(
 /// rows of `a = x AND b = y`, `NOT IN` an AND over the rows of `a <> x OR b
 /// <> y` -- whose three-valued logic is SQL's row comparison exactly (a NULL
 /// makes a row's comparison unknown, not false). No rows: FALSE for IN,
-/// TRUE for NOT IN.
+/// TRUE for NOT IN. An ordering operator (`< ANY`, `>= ALL`, ...) compares
+/// each subquery row as a RowCompareExpr does (RP-727).
 #[allow(clippy::too_many_arguments)]
 fn row_subquery_comparison(
     sl: &pg_query::protobuf::SubLink,
@@ -24422,12 +24423,21 @@ fn row_subquery_comparison(
             _ => None,
         })
         .unwrap_or_else(|| "=".to_string());
-    if !matches!(op.as_str(), "=" | "<>") {
+    let ordered = matches!(op.as_str(), "<" | "<=" | ">" | ">=");
+    if !ordered && !matches!(op.as_str(), "=" | "<>") {
         return Err(Error::Unsupported(format!(
             "a row comparison with {op} and a subquery"
         )));
     }
     let width = row.args.len();
+    if ordered && width == 0 {
+        // `make_row_comparison_op`'s check, at the operator, ahead of any
+        // row.
+        set_error_location(sl.location);
+        return Err(Error::FeatureNotSupported(
+            "cannot compare rows of zero length".into(),
+        ));
+    }
     if let Some(r) = rows.first() {
         if r.len() != width {
             return Err(Error::Parse(if r.len() > width {
@@ -24458,33 +24468,66 @@ fn row_subquery_comparison(
     } else {
         (BoolExprType::OrExpr, BoolExprType::AndExpr)
     };
+    // One field against one subquery column under `op`. A `char(n)`
+    // subquery column's value keeps its type, so the pair takes the
+    // operator the two types resolve to: against a `varchar` field that is
+    // `bpchareq`, which ignores the trailing blanks on both sides (RP-726).
+    let pair =
+        |params: &mut Vec<Bson>, i: usize, lhs: &pg_query::protobuf::Node, v: Bson, op: &str| {
+            let value = param_node(params, v);
+            let rhs = match types.and_then(|t| t.get(i)) {
+                Some(t) if is_bpchar_type(t) => relabel_cast(value, t),
+                _ => value,
+            };
+            pg_query::protobuf::Node {
+                node: Some(N::AExpr(Box::new(AExpr {
+                    kind: AExprKind::AexprOp as i32,
+                    name: vec![string_node(op)],
+                    lexpr: Some(Box::new(lhs.clone())),
+                    rexpr: Some(Box::new(rhs)),
+                    location: -1,
+                }))),
+            }
+        };
     let mut arms = Vec::with_capacity(rows.len());
     for r in rows {
+        if ordered {
+            // Each subquery row is a RowCompareExpr with the row, which
+            // `ExecEvalRowCompare` decides at the first pair that is not
+            // equal: a NULL there or before it makes the comparison NULL,
+            // and rows equal throughout satisfy only `<=` and `>=`. As a
+            // tree that is `a1 < x1 OR (a1 = x1 AND (... an op xn))`,
+            // built from the last pair out: a decided pair settles its OR
+            // or AND whatever lies beyond it, and an unknown one leaves
+            // the whole unknown.
+            let strict = &op[..1];
+            let last = width - 1;
+            let mut values: Vec<Bson> = r;
+            let mut tree = pair(
+                params,
+                last,
+                &row.args[last],
+                std::mem::replace(&mut values[last], Bson::Null),
+                &op,
+            );
+            for i in (0..last).rev() {
+                let v = std::mem::replace(&mut values[i], Bson::Null);
+                let lt = pair(params, i, &row.args[i], v.clone(), strict);
+                let eq = pair(params, i, &row.args[i], v, "=");
+                tree = boolexpr(
+                    BoolExprType::OrExpr,
+                    vec![lt, boolexpr(BoolExprType::AndExpr, vec![eq, tree])],
+                );
+            }
+            arms.push(tree);
+            continue;
+        }
         let cmps: Vec<pg_query::protobuf::Node> = row
             .args
             .iter()
             .zip(r)
             .enumerate()
-            .map(|(i, (lhs, v))| {
-                // A `char(n)` subquery column's value keeps its type, so the
-                // pair takes the operator the two types resolve to: against
-                // a `varchar` field that is `bpchareq`, which ignores the
-                // trailing blanks on both sides (RP-726).
-                let value = param_node(params, v);
-                let rhs = match types.and_then(|t| t.get(i)) {
-                    Some(t) if is_bpchar_type(t) => relabel_cast(value, t),
-                    _ => value,
-                };
-                pg_query::protobuf::Node {
-                    node: Some(N::AExpr(Box::new(AExpr {
-                        kind: AExprKind::AexprOp as i32,
-                        name: vec![string_node(&op)],
-                        lexpr: Some(Box::new(lhs.clone())),
-                        rexpr: Some(Box::new(rhs)),
-                        location: -1,
-                    }))),
-                }
-            })
+            .map(|(i, (lhs, v))| pair(params, i, lhs, v, &op))
             .collect();
         arms.push(if cmps.len() == 1 {
             cmps.into_iter().next().expect("one")

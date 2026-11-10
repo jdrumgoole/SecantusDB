@@ -3179,15 +3179,6 @@ Measured on a private PostgreSQL 15.19 cluster with the `_SETUP` in
 `tests/backlog/test_rp_found_rp697.py`: `rn697(k int, a int, c text)` and
 `ch697(k int, c char(3), v varchar(4))`.
 
-- [ ] **An uncorrelated `row op ANY / ALL (subquery)` with an ordering
-      operator is refused.** `select k, (k, a) < any (select 2, 3) from
-      rn697` answers per row on PostgreSQL 15.19 (each subquery row a
-      `RowCompareExpr` with the row); here it is 0A000 `a row comparison
-      with < and a subquery is not supported yet`, as is `>= all`.
-      `row_subquery_comparison` builds only `=` and `<>`; the correlated
-      form is answered since RP-697.
-      Verify: tests/backlog/test_rp_found_rp697.py::test_uncorrelated_ordered_row_any
-      Backlog-ID: RP-727
 - [ ] **A row compared with a subquery whose column has no operator with
       the row's field is not 42883.** `(a, c) = (select 1, 2)`, `c` text,
       is 42883 `operator does not exist: text = integer` at 18 on
@@ -3646,3 +3637,37 @@ statement is a FROM function and runs there as written.
       `rows=1 width=4`.
       Verify: tests/backlog/test_rp_found_rp703.py::test_a_series_scan_explains_its_alias_and_filter
       Backlog-ID: RP-847
+
+## Found while working RP-727 (2026-11-10)
+
+Measured on PostgreSQL 15.19 (the shared reference on port 5415): every
+statement is VALUES-only and runs there as written. The gap tests are in
+`tests/backlog/test_rp_found_rp727.py`.
+
+- [ ] **A row comparison of zero-length rows answers.** `select row() =
+      row()`, `row() <> row()` and `row() in (select)` are 0A000 `cannot
+      compare rows of zero length` at the operator (14) on PostgreSQL 15.19
+      (`make_row_comparison_op`); here they answer `t`, `f` and `t`. Since
+      RP-727 an ordering operator against a subquery (`row() < any
+      (select)`) is refused as PostgreSQL refuses it.
+      Verify: tests/backlog/test_rp_found_rp727.py::test_zero_length_row_comparison_is_0a000
+      Backlog-ID: RP-849
+- [ ] **A row field that is an untyped literal is not coerced to its
+      pair's type.** `select (1, '2') = (1, 2)` and `(1, '2') < any
+      (select 1, 3)` are `t` on PostgreSQL 15.19: each pair's operator is
+      resolved as the statement is analysed, and the `unknown` literal
+      takes the other side's type. `(1, 'a') < (1, 2)` is then 22P02
+      `invalid input syntax for type integer: "a"` at 12. Here each is
+      0A000 `comparing string with int32 using ... is not supported yet`,
+      with no position: the literal is compared as a string.
+      Verify: tests/backlog/test_rp_found_rp727.py::test_untyped_literal_in_a_row_takes_its_pairs_type
+      Backlog-ID: RP-850
+- [ ] **A row comparison with a pattern operator is refused.** `select
+      ('a', 'b') ~<~ ('a', 'c')` and `('a', 'b') ~<~ any (select 'a', 'c')`
+      are `t` on PostgreSQL 15.19: `~<~` is a btree operator (of
+      `text_pattern_ops`), so `make_row_comparison_op` builds a
+      RowCompareExpr of it as of `<`. Here the first is 42804 `collations
+      are not supported by type record` and the second 0A000 `a row
+      comparison with ~<~ and a subquery is not supported yet`.
+      Verify: tests/backlog/test_rp_found_rp727.py::test_row_comparison_with_a_pattern_operator
+      Backlog-ID: RP-851
