@@ -210,6 +210,24 @@ pub(crate) fn take_resolved_views() -> Option<Vec<Bson>> {
     (!found.is_empty()).then(|| found.into_values().map(Bson::Document).collect())
 }
 
+/// The collection beneath the view `ns` (`<db>.<view>`), when the running
+/// read resolved it ([`note_resolved_views`]): mongod runs a read of a view
+/// on the collection beneath it, and when the read fails there its line and
+/// profile entry keep that namespace -- `<db>.c` for a view `v` on `c`,
+/// `<db>.system.buckets.ts` for a time-series collection `ts`. A read that
+/// succeeds names the view again; one that failed before it resolved the
+/// view names the view (measured 8.2.11, RM-380).
+pub(crate) fn beneath_view(ctx: &CommandContext, ns: &str) -> Option<String> {
+    let db = ns.split_once('.')?.0;
+    ctx.resolved_views
+        .as_ref()?
+        .iter()
+        .filter_map(Bson::as_document)
+        .find(|v| v.get_str("viewNamespace") == Ok(ns))
+        .and_then(|v| v.get_array("dependencyChain").ok()?.last()?.as_str())
+        .map(|base| format!("{db}.{base}"))
+}
+
 /// Every view among `own` and the namespaces `pipeline` involves, and among
 /// those the views' own pipelines involve, as mongod's `resolvedViews`
 /// lists them: `{viewNamespace, dependencyChain, resolvedPipeline}` --

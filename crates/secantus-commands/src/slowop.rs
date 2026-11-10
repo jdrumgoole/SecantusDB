@@ -222,13 +222,22 @@ pub(crate) fn failure(reply: &Document, out: &mut Document) {
     out.insert("errCode", code);
 }
 
-/// The collection a command names: its own value, or `getMore`'s
-/// `collection`.
+/// The collection a command names: its own value, `getMore`'s
+/// `collection`, or the collection of the read an `explain` explains
+/// (`find`, `aggregate`, `count`, `distinct`; mongod's line for an `explain`
+/// of a write names `<db>.$cmd`, measured 8.2.11, RM-380).
 fn target_collection<'a>(name: &str, request: &'a Document) -> Option<&'a str> {
-    let target = if name == "getMore" {
-        request.get("collection")
-    } else {
-        request.get(name)
+    let target = match name {
+        "getMore" => request.get("collection"),
+        "explain" => {
+            let inner = request.get_document("explain").ok()?;
+            let read = inner.keys().next()?;
+            if !is_read(read) {
+                return None;
+            }
+            inner.get(read)
+        }
+        _ => request.get(name),
     };
     match target {
         Some(bson::Bson::String(coll)) if !coll.is_empty() => Some(coll.as_str()),
@@ -259,6 +268,34 @@ fn line_target<'a>(
     }
 }
 
+/// Whether `name` reads a namespace that may be a view, as mongod's reads
+/// acquire one: a view, or a time-series collection, is named as such on the
+/// line of a read of it that succeeds.
+fn is_read(name: &str) -> bool {
+    matches!(name, "find" | "aggregate" | "count" | "distinct")
+}
+
+/// The kind of namespace the line names, as mongod's operation acquired it
+/// (measured 8.2.11, RM-380): `view` or `timeseries` only for a read of one
+/// that succeeded. Everything else acquires a collection, or fails, and
+/// names its namespace `normal` whatever it is -- a `getMore` of a view's
+/// cursor, a write to a view (refused) or to a time-series collection, a
+/// `drop` or `collMod` of a view, a read that failed (before it resolved a
+/// view it names the view, after it the collection beneath:
+/// `opdebug::beneath_view`).
+fn line_kind(
+    name: &str,
+    ok: bool,
+    ctx: &CommandContext,
+    db: &str,
+    coll: Option<&str>,
+) -> &'static str {
+    if !ok || !(is_read(name) || name == "explain") {
+        return "normal";
+    }
+    crate::opdebug::collection_type(ctx, db, coll.unwrap_or("$cmd"))
+}
+
 /// Whether `name` plans a query of its own, so its line has the planner's
 /// fields (`planningTimeMicros`).
 fn plans(name: &str) -> bool {
@@ -280,14 +317,15 @@ pub fn read_attributes(request: &Document, reply: &Document, ctx: &CommandContex
     let mut out = Document::new();
     out.insert("isFromUserConnection", true);
     let (db, coll) = line_target(name, request, reply, &ctx.db_name);
-    // mongod names the namespace's kind as the operation found it: what a
-    // `create` creates was not there.
-    let kind = if name == "create" {
-        "normal"
-    } else {
-        crate::opdebug::collection_type(ctx, db, coll.unwrap_or("$cmd"))
-    };
-    out.insert("collectionType", kind);
+    let ok = reply.get_f64("ok").unwrap_or(1.0) == 1.0;
+    // The namespace [`attributes`] names, moved beneath a view the read
+    // failed under.
+    if let (false, Some(coll)) = (ok, coll) {
+        if let Some(ns) = crate::opdebug::beneath_view(ctx, &format!("{db}.{coll}")) {
+            out.insert("ns", ns);
+        }
+    }
+    out.insert("collectionType", line_kind(name, ok, ctx, db, coll));
     // A query that parsed has its shape, whether or not it then ran (RM-358).
     if let Some(shape) = crate::query_shape::hash(&ctx.db_name, request) {
         out.insert("queryShapeHash", shape);
@@ -296,7 +334,6 @@ pub fn read_attributes(request: &Document, reply: &Document, ctx: &CommandContex
     if let Some(views) = &ctx.resolved_views {
         out.insert("resolvedViews", views.clone());
     }
-    let ok = reply.get_f64("ok").unwrap_or(1.0) == 1.0;
     let exec = ctx.exec_stats.as_ref().filter(|_| ok);
     if ok {
         // A cursor's `getMore` names the command that opened it, and
@@ -519,7 +556,8 @@ fn command_shown(request: &Document) -> Document {
 /// that names none, and `db.$cmd` otherwise, as mongod has it (a
 /// `renameCollection`'s: [`line_target`]); an `update`
 /// or `delete` is `db.$cmd` too, its statements' lines
-/// naming the collection. `read` is [`read_attributes`]' part. The whole
+/// naming the collection. `read` is [`read_attributes`]' part, whose `ns`,
+/// when it has one, is where a read of a view failed. The whole
 /// in mongod's order (`opdebug::LINE_ORDER`).
 pub fn attributes(
     request: &Document,
@@ -711,6 +749,46 @@ mod tests {
             Duration::ZERO,
         );
         assert_eq!(attr.get_str("ns"), Ok("a.$cmd.aggregate"));
+    }
+
+    /// An `explain` of a read names the collection it explains, and one of
+    /// a write `<db>.$cmd`, as mongod 8.2.11's line does (RM-380).
+    #[test]
+    fn an_explain_names_the_collection_of_the_read_it_explains() {
+        let ns = |explained: Document| {
+            let attr = attributes(
+                &doc! {"explain": explained, "$db": "a"},
+                &doc! {"ok": 1.0},
+                Document::new(),
+                "a",
+                Duration::ZERO,
+                Duration::ZERO,
+            );
+            attr.get_str("ns").unwrap().to_string()
+        };
+        assert_eq!(ns(doc! {"find": "v", "filter": {}}), "a.v");
+        assert_eq!(
+            ns(doc! {"aggregate": "c", "pipeline": [], "cursor": {}}),
+            "a.c"
+        );
+        assert_eq!(ns(doc! {"count": "c"}), "a.c");
+        assert_eq!(ns(doc! {"distinct": "c", "key": "x"}), "a.c");
+        assert_eq!(ns(doc! {"update": "c", "updates": []}), "a.$cmd");
+    }
+
+    /// A read of a view that failed is named where it failed, beneath the
+    /// view, when its read part says so (RM-380).
+    #[test]
+    fn a_read_part_naming_a_namespace_moves_the_line() {
+        let attr = attributes(
+            &doc! {"find": "v", "$db": "a"},
+            &doc! {"ok": 0.0, "code": 16608_i32, "errmsg": "can't divide by zero"},
+            doc! {"ns": "a.c", "collectionType": "normal"},
+            "a",
+            Duration::ZERO,
+            Duration::ZERO,
+        );
+        assert_eq!(attr.get_str("ns"), Ok("a.c"));
     }
 
     /// A `renameCollection` names the collection it renamed, and the

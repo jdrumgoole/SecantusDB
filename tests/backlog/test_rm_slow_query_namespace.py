@@ -158,8 +158,10 @@ def test_a_data_size_line_names_its_own_namespace(rust_mongo: Any, mongod_rs: An
 def test_a_command_that_fails_to_parse_writes_no_line(rust_mongo: Any, mongod_rs: Any) -> None:
     """mongod 8.2.1 writes no `Slow query` line for a command refused as it
     parses -- a mistyped or missing field (14, 40414), an unknown one
-    (40415), a collection name that is not a string (73) -- since the
-    operation never ran; this server writes one for each."""
+    (40415), a collection name that is not a string (73), an unknown
+    pipeline stage (40324, measured 8.2.11 on a collection and on a view,
+    2026-11-10) -- since the operation never ran; this server writes one for
+    each."""
 
     def run(client: Any, db: Any) -> None:
         _command(client, db, "admin", {"renameCollection": 5, "to": f"{db.name}.c9"})
@@ -167,6 +169,9 @@ def test_a_command_that_fails_to_parse_writes_no_line(rust_mongo: Any, mongod_rs
         _command(client, db, "<db>", {"find": "c", "bogus": 1})
         _command(client, db, "<db>", {"find": 5})
         _command(client, db, "<db>", {"count": 5})
+        _command(
+            client, db, "<db>", {"aggregate": "c", "pipeline": [{"$bogusStage": {}}], "cursor": {}}
+        )
 
     answers = _both(run, rust_mongo, mongod_rs)
     assert answers["mongod"][0] == []

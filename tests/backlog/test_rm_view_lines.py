@@ -32,21 +32,21 @@ def _lines(rust_mongo: Any, mongod_rs: Any, op: Any) -> dict:
     return out
 
 
-@pytest.mark.backlog("RM-380")
+@pytest.mark.backlog_fixed("RM-380")
 def test_a_get_more_of_a_view_is_of_a_normal_collection(rust_mongo: Any, mongod_rs: Any) -> None:
     """mongod 8.2.1's line for a `getMore` of a cursor over a view names the
-    view as `collectionType: "normal"`; this server's says `view`."""
+    view as `collectionType: "normal"`; this server's said `view`."""
     got = _lines(rust_mongo, mongod_rs, lambda d: list(d.v.find(batch_size=4)))
     assert [g for g in got["mongod"] if g[0] == "getMore"] == [("getMore", "v", "normal")] * 2
     assert got["rust"] == got["mongod"]
 
 
-@pytest.mark.backlog("RM-380")
+@pytest.mark.backlog_fixed("RM-380")
 def test_a_find_and_modify_of_a_view_is_of_a_normal_collection(
     rust_mongo: Any, mongod_rs: Any
 ) -> None:
     """mongod 8.2.1's line for a `findAndModify` of a view, which it
-    refuses, says `collectionType: "normal"`; this server's says `view`."""
+    refuses, says `collectionType: "normal"`; this server's said `view`."""
     got = _lines(
         rust_mongo, mongod_rs, lambda d: d.v.find_one_and_update({"x": 1}, {"$set": {"q": 1}})
     )
@@ -54,21 +54,21 @@ def test_a_find_and_modify_of_a_view_is_of_a_normal_collection(
     assert got["rust"] == got["mongod"]
 
 
-@pytest.mark.backlog("RM-380")
+@pytest.mark.backlog_fixed("RM-380")
 def test_an_explain_line_names_what_it_explains(rust_mongo: Any, mongod_rs: Any) -> None:
     """mongod 8.2.1's line for an `explain` of a `find` of a view names the
-    view (`<db>.v`, `collectionType: "view"`); this server's names
+    view (`<db>.v`, `collectionType: "view"`); this server's named
     `<db>.$cmd`, `normal`."""
     got = _lines(rust_mongo, mongod_rs, lambda d: d.command("explain", {"find": "v", "filter": {}}))
     assert got["mongod"] == [("explain", "v", "view")]
     assert got["rust"] == got["mongod"]
 
 
-@pytest.mark.backlog("RM-380")
+@pytest.mark.backlog_fixed("RM-380")
 def test_a_read_of_a_view_that_fails_names_its_collection(rust_mongo: Any, mongod_rs: Any) -> None:
     """mongod 8.2.1's line for a read of a view that fails once it runs
     names the collection beneath the view (`<db>.c`, `normal`); this
-    server's names the view."""
+    server's named the view."""
     got = _lines(
         rust_mongo,
         mongod_rs,
