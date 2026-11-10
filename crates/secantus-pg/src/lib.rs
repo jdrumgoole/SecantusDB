@@ -50469,9 +50469,18 @@ fn compute_basic_aggregate(item: &AggItem, rows: &[Document]) -> Bson {
                 }
                 return secantus_pgplan::bytea::to_binary(parts.join(sep));
             }
+            // A `bpchar` argument reaches `string_agg(text, text)` through
+            // the implicit `bpchar` -> `text` cast, `rtrim1`, which drops
+            // its trailing blanks (only blanks: a tab stays). A `char(n)`
+            // column's cells are stored trimmed already, but an unsized
+            // `bpchar` column's keep theirs (`values ('a  '::char(3)),
+            // ('b'::char(2))` is `a|b` on PostgreSQL 15.19). The cast comes
+            // before DISTINCT, so `'a  '` and `'a'` are one value.
+            let rtrim = item.source_type.as_deref() == Some("bpchar");
             let mut texts: Vec<String> = values
                 .iter()
                 .filter_map(|v| match v {
+                    Bson::String(t) if rtrim => Some(t.trim_end_matches(' ').to_string()),
                     Bson::String(t) => Some(t.clone()),
                     _ => None,
                 })

@@ -2,8 +2,8 @@
 
 - an untyped literal resolved to `bpchar` by a VALUES list or a set
   operation beside a `char(n)` loses its trailing blanks (RP-804);
-- `string_agg` over an unsized `bpchar` column keeps the blanks the cast
-  to its `text` argument drops (RP-805).
+- `string_agg` over an unsized `bpchar` column kept the blanks the cast
+  to its `text` argument drops (RP-805, fixed).
 
 Measured on the shared PostgreSQL 15.19 reference (port 5415); the
 statements create nothing.
@@ -58,7 +58,7 @@ def test_an_untyped_literal_resolved_to_bpchar_keeps_its_blanks(
     assert _answer(dsn, query) == expected
 
 
-@pytest.mark.backlog("RP-805")
+@pytest.mark.backlog_fixed("RP-805")
 @pytest.mark.parametrize(
     ("query", "expected"),
     [
@@ -71,6 +71,25 @@ def test_an_untyped_literal_resolved_to_bpchar_keeps_its_blanks(
             " (values ('a  '::char(3)), (E'a\\t'), ('a'::char(2))) s(f)",
             [("a|a|a\t",)],
         ),
+        (
+            "select string_agg(f, '|' order by f desc) from"
+            " (values ('a  '::char(3)), (E'a\\t'), ('a'::char(2))) s(f)",
+            [("a\t|a|a",)],
+        ),
+        (
+            "select string_agg(distinct f, '|') from"
+            " (values ('a  '::char(3)), ('a'::char(2)), ('b'::char(2))) s(f)",
+            [("a|b",)],
+        ),
+        (
+            "select string_agg(f, '|') over (order by f) from"
+            " (values ('a  '::char(3)), ('b'::char(2))) s(f)",
+            [("a",), ("a|b",)],
+        ),
+        (
+            "select string_agg(f, '|') from (values (' a '::char(3)), ('b'::char(2))) s(f)",
+            [(" a|b",)],
+        ),
     ],
 )
 def test_string_agg_over_an_unsized_bpchar_drops_its_blanks(
@@ -79,7 +98,8 @@ def test_string_agg_over_an_unsized_bpchar_drops_its_blanks(
     """`string_agg(text, text)` takes a `bpchar` argument through the
     implicit `bpchar` -> `text` cast, `rtrim1`, which drops the trailing
     blanks: `a|b` on PostgreSQL 15.19. Over an unsized column (its members'
-    modifiers differ) the cells keep their blanks here, and the aggregate
-    joins them as they are: `a  |b `. A `char(3)` column of both members
-    already agrees."""
+    modifiers differ) the cells kept their blanks here, and the aggregate
+    joined them as they were: `a  |b `. The cast comes before DISTINCT and
+    applies in a window too; a leading blank and a tab stay. A `char(3)`
+    column of both members already agreed."""
     assert _answer(dsn, query) == expected
