@@ -2796,6 +2796,38 @@ pub(crate) fn check(node: &N, lookup: &dyn Fn(&str) -> Option<TableDef>) -> Resu
     regclass::analysing(|| check_in(node, &[], lookup))
 }
 
+/// A CHECK constraint's expression over the table `name` (`def`), as
+/// `cookConstraint` judges it: `transformExpr` analyses it -- so a test's
+/// or a connective's argument is coerced to boolean under its own name --
+/// and `coerce_to_boolean(..., "CHECK")` then coerces the whole of it
+/// (RP-811). A CHECK holds no subquery, so no catalog is consulted.
+pub(crate) fn check_constraint(
+    raw: &pg_query::protobuf::Node,
+    name: &str,
+    def: &TableDef,
+) -> Result<()> {
+    let lookup: &dyn Fn(&str) -> Option<TableDef> = &|_| None;
+    let scope = Scope {
+        tables: vec![(name.to_string(), def.clone())],
+        complete: true,
+        unresolved: false,
+        parent: None,
+        lookup: Some(lookup),
+        ctes: Vec::new(),
+        merged: Vec::new(),
+        using_aliases: Vec::new(),
+        rowtypes: Vec::new(),
+    };
+    let cx = Cx {
+        lookup,
+        ctes: Vec::new(),
+    };
+    regclass::analysing(|| {
+        walk(raw, &scope, &cx)?;
+        clause_is_boolean(raw, &scope, "CHECK")
+    })
+}
+
 /// [`check`] with the CTEs of an enclosing WITH in view: a data-modifying
 /// CTE sees the ones before it, as a SELECT's does.
 fn check_in(node: &N, outer: &[Cte], lookup: &dyn Fn(&str) -> Option<TableDef>) -> Result<()> {

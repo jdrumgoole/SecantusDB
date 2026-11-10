@@ -6451,3 +6451,82 @@ fn an_in_lists_untyped_member_is_read_as_the_lists_type_at_planning() {
         assert!(analysed(sql).is_ok(), "{sql}: {:?}", analysed(sql).err());
     }
 }
+
+/// A CHECK constraint is coerced to boolean as `cookConstraint` does it
+/// (RP-811): 42804 under the test's or the clause's name at the argument's
+/// leftmost token, after any missing column written before it, and with no
+/// position at all under ALTER TABLE, whose parse state has no query text.
+/// Measured on PostgreSQL 15.19.
+#[test]
+fn a_check_constraint_is_coerced_to_boolean() {
+    for (sql, state, want, at) in [
+        (
+            "create table c (x int check (x))",
+            "42804",
+            "argument of CHECK",
+            29,
+        ),
+        (
+            "create table c (x int check (x is true))",
+            "42804",
+            "argument of IS TRUE",
+            29,
+        ),
+        (
+            "create table c (x int check (x and y))",
+            "42804",
+            "argument of AND",
+            29,
+        ),
+        (
+            "create table c (x int check (y and x))",
+            "42703",
+            "\"y\"",
+            29,
+        ),
+        ("create table c (x int check (x + y))", "42703", "\"y\"", 33),
+        (
+            "create table c (x int check ((x is true) = y))",
+            "42804",
+            "IS TRUE",
+            30,
+        ),
+    ] {
+        take_error_location();
+        let err = plan(sql, &lookup).expect_err("should refuse");
+        assert_eq!(err.sqlstate(), state, "for {sql} (got {err})");
+        assert!(err.to_string().contains(want), "for {sql}: {err}");
+        assert!(!error_unpositioned(), "for {sql}");
+        assert_eq!(
+            crate::errpos::error_position(sql, state, &err.to_string()),
+            Some(at as usize + 1),
+            "for {sql}"
+        );
+    }
+    for sql in [
+        "create table c (x int check (x > 0))",
+        "create table c (x int check ('t'))",
+        "create table c (x int check (null))",
+        "create table c (x bool check (x))",
+    ] {
+        plan(sql, &lookup).expect("should plan");
+    }
+    for sql in [
+        "alter table t add check (n)",
+        "alter table t add constraint k check (n is false)",
+    ] {
+        take_error_location();
+        let err = plan(sql, &lookup).expect_err("should refuse");
+        assert_eq!(err.sqlstate(), "42804", "for {sql} (got {err})");
+        assert_eq!(
+            crate::errpos::error_position(sql, "42804", &err.to_string()),
+            None,
+            "for {sql}"
+        );
+        // Every ask answers none (the server asks twice), until the next
+        // statement is planned.
+        assert!(error_unpositioned(), "for {sql}");
+        take_error_location();
+        assert!(!error_unpositioned(), "for {sql}");
+    }
+}

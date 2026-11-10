@@ -3469,15 +3469,6 @@ s text)`.
       an INSERT's VALUES are checked when the statement is analysed.
       Verify: tests/backlog/test_rp_found_rp808.py::test_an_update_set_expression_is_coerced_to_boolean
       Backlog-ID: RP-810
-- [ ] **A CHECK constraint's expression is not coerced to boolean.**
-      `create table c808 (x int check (x))` is 42804 `argument of CHECK
-      must be type boolean, not type integer` on PostgreSQL 15.19
-      (`cookConstraint`'s `coerce_to_boolean`), and `check (x is true)` /
-      `check (x and true)` are their own test's 42804, all at the `x`.
-      Here the table is created; `check (x)` then admits every row, 0
-      and NULL included, and `check (x is true)` refuses every one.
-      Verify: tests/backlog/test_rp_found_rp808.py::test_a_check_constraint_is_coerced_to_boolean
-      Backlog-ID: RP-811
 - [ ] **AND / OR / NOT report a non-boolean argument at the operator.**
       `coerce_to_boolean` reports at the argument's `exprLocation`, an
       operator expression's leftmost token: `select ('x' || 'y') and
@@ -3489,3 +3480,50 @@ s text)`.
       `expr_location`; RP-808's boolean test uses `srf_place::leftmost`.
       Verify: tests/backlog/test_rp_found_rp808.py::test_a_connectives_argument_is_reported_at_its_leftmost_token
       Backlog-ID: RP-812
+
+## Found while working RP-811 (2026-11-10)
+
+Measured on a private, freshly initdb'd PostgreSQL 15.19 cluster with the
+`_SETUP` in `tests/backlog/test_rp_found_rp811.py`: `c811(x int, a int[])`
+and `create domain di811 as int`.
+
+- [ ] **A domain's CHECK and a partial index's WHERE are not coerced to
+      boolean.** `create domain d as int check (value)` is 42804 `argument
+      of CHECK must be type boolean, not type integer` on PostgreSQL 15.19
+      (`domainAddConstraint`'s `coerce_to_boolean`), and `check (value is
+      true)` its test's own 42804, both with no position; `create index on
+      c811 (x) where x` is 42804 `argument of WHERE ...` at the `x` (32,
+      `transformIndexStmt`). Here the domain and the index are created. A
+      table's CHECK is coerced since RP-811 (`optype::check_constraint`).
+      Verify: tests/backlog/test_rp_found_rp811.py::test_a_domain_check_and_an_index_predicate_are_coerced_to_boolean
+      Backlog-ID: RP-813
+- [ ] **A boolean coercion passes an array, and names a domain by its base
+      type.** `select * from c811 where a`, `... where a and true`, `select
+      a is true from c811` and `create table ... (a int[] check (a))` are
+      42804 `argument of WHERE / AND / IS TRUE / CHECK must be type boolean,
+      not type integer[]` on PostgreSQL 15.19; here the SELECTs answer no
+      rows and the table is created. A domain operand is named by the
+      domain: `where d` over a `di811` column is `... not type di811`, here
+      `not type integer`. `optype`'s `clause_is_boolean`, `bool_argument`
+      and `boolean_test_argument` pass any type `category` has no entry for,
+      and `operand_type` resolves a domain to its base.
+      Verify: tests/backlog/test_rp_found_rp811.py::test_a_boolean_coercion_refuses_an_array_and_names_a_domain
+      Backlog-ID: RP-814
+- [ ] **ALTER TABLE's expressions are not coerced to boolean when no row
+      reaches them, and SET DEFAULT's error has a position.** On PostgreSQL
+      15.19 `alter table c811 alter column x type bool using (x is true)`
+      is 42804 `argument of IS TRUE ...` at 50 and `add column y bool
+      generated always as (x is true) stored` the same 42804 with no
+      position, both over an empty table; here each is `ALTER TABLE`, the
+      expression judged only per row. `alter column x set default (1 is
+      true)` is that 42804 with no position (`AddRelationNewConstraints`
+      gets no query text from ALTER TABLE); here it is placed at the `1`.
+      Verify: tests/backlog/test_rp_found_rp811.py::test_alter_table_expressions_are_coerced_to_boolean
+      Backlog-ID: RP-815
+- [ ] **A system column in a CHECK is 42703, not 42P10.** `create table
+      t811 (x int check (xmin))` is 42P10 `system column "xmin" reference in
+      check constraint is invalid` at 33 on PostgreSQL 15.19
+      (`cookConstraint` refuses any system column but `tableoid`); here it
+      is 42703 `column "xmin" does not exist`.
+      Verify: tests/backlog/test_rp_found_rp811.py::test_a_system_column_in_a_check_is_42p10
+      Backlog-ID: RP-816
