@@ -1236,20 +1236,6 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       file's framing. Found 2026-11-10 (RM-400).
       Verify: tests/backlog/test_rm_326_sort_counts.py::test_descending_and_tied_spill_storage_size
       Backlog-ID: RM-503
-- [ ] **macOS mongod counts window functions at its own sizes.** This
-      server counts a window function's memory at Linux mongod 8.2.12's
-      sizes (x86-64 and arm64 agree), the exemplar CI measures. macOS
-      mongod 8.2.1 (arm64) sizes many differently: a growing `$sum` /
-      `$count` 184 bytes, not 176; a removable `$sum` 8 more and a removable
-      `$push`, `$min`, `$max` and `$addToSet` 16-32 less; `$rank`,
-      `$denseRank` and `$documentNumber` 32 less (344 / 336 / 336); `$top`
-      and `$topN` 72 less, `$firstN` 32 less, `$minN` 16 less. So on this
-      Mac a `[-5, 5]` `$sum`, a partitioned whole-partition `$sum` and a
-      `[-5, 5]` `$push` run under 1230, 2312 and 12853 bytes where this
-      server needs 1222, 2304 and 12885. The `$group` face of the same
-      sizes is RM-397. Checked on this Mac only (`only_on("arm64")`).
-      Verify: tests/backlog/test_rm_found_2026_10_26.py::test_macos_window_function_sizes
-      Backlog-ID: RM-403
 - [ ] **Four window shapes still miss mongod's `$setWindowFields` budget.**
       Over 40 small documents Linux mongod 8.2.12 runs a `range` window
       with no lower end (`["unbounded", 4]`) under 676 bytes, where this
@@ -1342,15 +1328,6 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       CI. Found 2026-11-07, snapshot PR #2447.
       Backlog-ID: RM-402
       Verify: tests/backlog/test_rm_found_2026_10_26.py::test_x86_spill_after_project_storage_size
-- [ ] **A `$group` of `$sum` and `$count` counts less memory than mongod.**
-      Spilling 300 groups of `{t: {$sum: "$n"}, c: {$count: {}}}` 22 times,
-      mongod 8.2.1 reports `groupSpilledBytes: 115200` and this server
-      110400: the spills and records agree, so each group's accumulators
-      are counted 16 bytes short. That is mongod on arm64: on CI's x86_64
-      Linux mongod and this server agree (2026-11-07), so the gap test runs
-      on arm64 only.
-      Backlog-ID: RM-397
-      Verify: tests/backlog/test_rm_found_2026_10_26.py::test_group_sum_spilled_bytes
 - [ ] **A classic `$group` counts its held values' and `_id`'s memory
       unlike mongod, so it spills at other points.** Over 300 documents of a
       1000-byte string, budget 5000, mongod 8.2.11 spills a `$first` /

@@ -877,9 +877,13 @@ mod tests {
                 doc! { "$setWindowFields": { "sortBy": { "n": 1 }, "output": { "t": output } } },
             )]
         };
-        // The partition and `$sum`'s 176 bytes (the Linux build's; macOS
-        // arm64 counts 184): 5414201 below.
-        assert_eq!(least_budget(&swf(doc! { "$sum": "$n" }), &docs), 49_126);
+        // The partition and `$sum`'s own size (Linux's 176 bytes: 49126;
+        // macOS arm64 counts 184): 5414201 below.
+        let sum = crate::memlimit::LAYOUT.sum;
+        assert_eq!(
+            least_budget(&swf(doc! { "$sum": "$n" }), &docs),
+            48_950 + sum
+        );
         // The document answered and the next: 5643011 below.
         let uc = doc! { "$sum": "$n", "window": { "documents": ["unbounded", "current"] } };
         assert_eq!(least_budget(&swf(uc), &docs), 1_077);
