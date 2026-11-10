@@ -1524,20 +1524,38 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
         options are not applied.
       Backlog-ID: RM-216
       Verify: none -- the missing fields are mongod's internal accounting; the registry's own tests are backlog_fixed
-- [ ] **`applyOps`, `dbCheck` and `filemd5` refuse what mongod runs.**
-      mongod 8.2.11 (one-member replica set) applies an `applyOps` insert of
-      a document a little over 16 MB, as oplog application allows (10334
-      here), and takes `importCollection`, `createDatabaseMetadata` and
-      `modifyCollectionShardingIndexCatalog` entries (115 here); it runs
-      `dbCheck` with `validateMode: "extraIndexKeysCheck"` and answers
-      `filemd5` with `partialOk` (both 115 here: its `md5state` is mongod's
-      own MD5 implementation's state). `dbCheck` also runs before it answers
-      (mongod runs it in the background), walks a database's collections in
-      name order (mongod's is its catalog's internal order) and does not
-      apply `maxBytesPerBatch` / `maxBatchTimeMillis` / `maxCountPerSecond`.
+- [ ] **`dbCheck` refuses `extraIndexKeysCheck`, and `applyOps` some entries.**
+      mongod 8.2.11 (one-member replica set) runs `dbCheck` with
+      `validateMode: "extraIndexKeysCheck"` (115 here): it walks the named
+      index in batches of `maxDocsPerBatch` keys, a batch ending only where
+      the key changes, and writes a `batch` oplog entry per batch whose `md5`
+      is the MD5 of the batch's keys as KeyString V1 bytes, each with its
+      `kEnd` discriminator (4) and without its RecordId (checked by hand for
+      int keys, 2026-11-10), with `batchStart` / `batchEnd` /
+      `lastKeyChecked` as keys; an index that does not exist gets a
+      `dbCheckBatch` warning in `local.system.healthlog`. Building it needs a
+      KeyString encoder for every BSON type (key_string.cpp's doubles and
+      Decimal128 included) and each index kind's keys (hashed, 2dsphere,
+      wildcard, collated). mongod also takes `applyOps` `importCollection`,
+      `createDatabaseMetadata` and `modifyCollectionShardingIndexCatalog`
+      entries (115 here). `dbCheck` also runs before it answers (mongod runs
+      it in the background), walks a database's collections in name order
+      (mongod's is its catalog's internal order) and does not apply
+      `maxBytesPerBatch` / `maxBatchTimeMillis` / `maxCountPerSecond`.
       Carried over from RM-219 when its last commands landed, 2026-11-08.
-      Verify: tests/backlog/test_rm_219_diag_query_settings.py::test_admin_command_remainders
+      Verify: tests/backlog/test_rm_219_diag_query_settings.py::test_db_check_extra_index_keys
       Backlog-ID: RM-416
+- [ ] **`applyOps` applies a `u` replacement of a missing document.** A `u`
+      entry whose `o` is a whole document with `o2`'s `_id`, for a document
+      that does not exist and without `b: true`, is inserted here; mongod
+      8.2.11 does not apply it (`false` in `results`, the command 8), as this
+      server's own module comment says. A `u` upsert of a document past
+      16 MB is 10334 "object to insert too large" here, 17420 "Document to
+      upsert is larger than 16777216" on mongod, and an `i` entry replacing
+      an existing document with one past 16 MB is 10334 here, 17419 on
+      mongod. Found 2026-11-10 while working RM-416.
+      Verify: tests/backlog/test_rm_219_diag_query_settings.py::test_apply_ops_update_entries
+      Backlog-ID: RM-540
 - [ ] **FTDC is a sample in memory only.** Since 2026-11-10 the sample
       carries `transportLayerStats` and `diagnosticDataCollectionEnabled` /
       `diagnosticDataCollectionPeriodMillis` switch it and set its period.

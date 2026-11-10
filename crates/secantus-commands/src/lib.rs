@@ -110,6 +110,7 @@ pub mod status;
 pub mod stepdown;
 pub mod storage;
 mod timeseries;
+mod tomcrypt_md5;
 mod ts_bucket_ns;
 mod ts_buckets;
 pub use ts_buckets::{BUCKETS_PREFIX, BUCKETS_STAGE, VIEWS_STAGE};

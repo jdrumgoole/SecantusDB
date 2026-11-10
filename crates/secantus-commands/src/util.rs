@@ -653,6 +653,19 @@ fn code_name_for(code: i32) -> &'static str {
     }
 }
 
+/// `BSONElement::trueValue`.
+pub(crate) fn true_value(v: &Bson) -> bool {
+    match v {
+        Bson::Boolean(b) => *b,
+        Bson::Null | Bson::Undefined => false,
+        Bson::Double(d) => *d != 0.0,
+        Bson::Int32(n) => *n != 0,
+        Bson::Int64(n) => *n != 0,
+        Bson::Decimal128(d) => d.to_string().parse::<f64>() != Ok(0.0),
+        _ => true,
+    }
+}
+
 /// Whether a BSON value reads as true where mongod takes a bool or a number.
 pub(crate) fn truthy(v: &Bson) -> bool {
     match v {

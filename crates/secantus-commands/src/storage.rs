@@ -521,6 +521,19 @@ pub trait Storage: Send + Sync {
         ordered: bool,
     ) -> Result<(usize, Vec<Document>), StorageError>;
 
+    /// [`Self::insert`] as oplog application (`applyOps`) inserts: mongod
+    /// applies a document past the 16 MiB a client insert may write, up to
+    /// its internal limit of 16 MiB plus 16 KiB.
+    fn insert_from_oplog_application(
+        &self,
+        db: &str,
+        coll: &str,
+        docs: Vec<Vec<u8>>,
+        ordered: bool,
+    ) -> Result<(usize, Vec<Document>), StorageError> {
+        self.insert(db, coll, docs, ordered)
+    }
+
     /// Apply one update spec. `update` is the document-form update (operators or
     /// a replacement); pipeline-form updates are a later slice.
     fn update_matching(

@@ -12896,7 +12896,21 @@ impl Storage {
         docs: Vec<Vec<u8>>,
         ordered: bool,
     ) -> Result<(usize, Vec<Document>)> {
-        self.insert_with(db, coll, docs, None, ordered)
+        self.insert_with(db, coll, docs, None, ordered, MAX_BSON_OBJECT_SIZE)
+    }
+
+    /// [`Self::insert`] as oplog application inserts (`applyOps`): mongod
+    /// applies a document past the 16 MiB a client insert may write, up to
+    /// its internal limit of 16 MiB plus 16 KiB (measured 8.2.11,
+    /// 2026-11-10).
+    pub fn insert_from_oplog_application(
+        &self,
+        db: &str,
+        coll: &str,
+        docs: Vec<Vec<u8>>,
+        ordered: bool,
+    ) -> Result<(usize, Vec<Document>)> {
+        self.insert_with(db, coll, docs, None, ordered, MAX_BUILT_DOCUMENT_SIZE)
     }
 
     /// [`Self::insert`] of documents the caller holds decoded as well as
@@ -12911,7 +12925,14 @@ impl Storage {
         ordered: bool,
     ) -> Result<(usize, Vec<Document>)> {
         let (bytes, decoded): (Vec<Vec<u8>>, Vec<Document>) = docs.into_iter().unzip();
-        self.insert_with(db, coll, bytes, Some(decoded), ordered)
+        self.insert_with(
+            db,
+            coll,
+            bytes,
+            Some(decoded),
+            ordered,
+            MAX_BSON_OBJECT_SIZE,
+        )
     }
 
     fn insert_with(
@@ -12921,6 +12942,7 @@ impl Storage {
         docs: Vec<Vec<u8>>,
         decoded: Option<Vec<Document>>,
         ordered: bool,
+        max_doc_size: usize,
     ) -> Result<(usize, Vec<Document>)> {
         // One wire message never runs as ONE statement transaction: its dirty
         // content (doc rows + full-doc oplog entries + index entries, ~2-3x
@@ -12939,7 +12961,7 @@ impl Storage {
         let mut errors: Vec<Document> = Vec::new();
         if docs.is_empty() {
             // An empty batch still lazily creates the collection.
-            let (_, _, _) = self.insert_chunk(db, coll, &[], None, 0, ordered)?;
+            let (_, _, _) = self.insert_chunk(db, coll, &[], None, 0, ordered, max_doc_size)?;
             return Ok((0, errors));
         }
         // A user write block refuses each document as mongod's insert does,
@@ -12974,8 +12996,15 @@ impl Storage {
             let chunk_decoded = decoded
                 .as_mut()
                 .map(|d| d.by_ref().take(end - start).collect::<Vec<_>>());
-            let (chunk_inserted, chunk_errors, stopped) =
-                self.insert_chunk(db, coll, &docs[start..end], chunk_decoded, start, ordered)?;
+            let (chunk_inserted, chunk_errors, stopped) = self.insert_chunk(
+                db,
+                coll,
+                &docs[start..end],
+                chunk_decoded,
+                start,
+                ordered,
+                max_doc_size,
+            )?;
             inserted += chunk_inserted;
             errors.extend(chunk_errors);
             if stopped {
@@ -12990,6 +13019,7 @@ impl Storage {
     /// note there). `base_index` offsets per-doc error indexes back into the
     /// client's batch. Returns `(inserted, errors, stopped)` — `stopped` when
     /// an ordered batch hit an error and the remaining chunks must not run.
+    #[allow(clippy::too_many_arguments)]
     fn insert_chunk(
         &self,
         db: &str,
@@ -12998,6 +13028,7 @@ impl Storage {
         decoded: Option<Vec<Document>>,
         base_index: usize,
         ordered: bool,
+        max_doc_size: usize,
     ) -> Result<(usize, Vec<Document>, bool)> {
         // What depends only on the documents themselves -- decoding them, an
         // `_id` minted for one with none, its `_id` key and the oplog's `o2`
@@ -13138,7 +13169,7 @@ impl Storage {
                         reencoded = encode_doc(doc)?;
                         &reencoded
                     };
-                    if blob.len() > MAX_BSON_OBJECT_SIZE {
+                    if blob.len() > max_doc_size {
                         errors.push(too_large_write_error(index, blob.len()));
                         if ordered {
                             stopped = true;
