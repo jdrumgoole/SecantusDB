@@ -96,3 +96,9 @@ def test_fix_many_skips_a_closed_item_before_its_session() -> None:
     text = (ROOT / "scripts/fix_many.sh").read_text()
     check = text.index('! item_is_open "$id"')
     assert check < text.index("scripts/fix_one.sh -p", check)
+
+
+def test_fix_many_prunes_uvs_cache_before_the_disk_floor() -> None:
+    text = (ROOT / "scripts/fix_many.sh").read_text()
+    prune = text.index("uv cache prune")
+    assert prune < text.index("SECANTUS_MIN_FREE_GB", prune)

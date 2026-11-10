@@ -174,6 +174,11 @@ lane() {
                 echo "$(date '+%F %T') lane $k: ${lane_gb} GB over SECANTUS_LANE_MAX_GB (${SECANTUS_LANE_MAX_GB:-35}): cargo targets wiped" >>"$out/summary.txt"
             fi
         fi
+        # uv's cache keeps every wheel each lane's `./inv sync` builds: it
+        # grew 13-26 GB a day under a two-lane batch and twice took the disk
+        # under the floor below (2026-11-09/10). `uv cache prune` drops only
+        # entries nothing uses, under uv's own cache lock.
+        uv cache prune >/dev/null 2>&1 || true
         local free_gb
         free_gb=$(df -g "${wt:-.}" | awk 'NR == 2 { print $4 }')
         if [[ $free_gb -lt ${SECANTUS_MIN_FREE_GB:-40} ]]; then
