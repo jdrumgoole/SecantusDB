@@ -1641,13 +1641,6 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       while working RM-219.
       Verify: tests/backlog/test_rm_219_diag_query_settings.py::test_oplog_storage_stats
       Backlog-ID: RM-419
-- [ ] **An aggregate `$match` on `_id` takes an `$in` of a `$`-prefixed
-      object.** mongod 8.2.11 refuses `{$match: {_id: {$in: [{$x: 1}]}}}`
-      with 2 "cannot nest $ under $in", as it does on any other path and as
-      this server does for `find` and for `$match` on another field; here
-      the aggregate answers. Found 2026-11-08 while working RM-330.
-      Backlog-ID: RM-420
-      Verify: tests/backlog/test_rm_found_2026_11_08_rm330.py::test_an_id_match_refuses_a_dollar_object_in_in
 - [ ] **`$all` refuses a `$`-prefixed object that is not `$elemMatch`.**
       mongod 8.2.11 takes `find({a: {$all: [{$x: 1}]}})` as an equality to
       that object and answers (here, no documents); this server refuses

@@ -1739,6 +1739,11 @@ pub fn unknown_operator_in_filter(filter: &Document) -> Option<(i32, String)> {
                 }
             }
         }
+        // A `$`-prefixed document in a `$in` / `$nin`, wherever it sits: the
+        // empty document above reaches only the clauses it evaluates (RM-420).
+        if let Some(found) = secantus_core::query::nested_in_error(&clause) {
+            return Some(found);
+        }
     }
     None
 }

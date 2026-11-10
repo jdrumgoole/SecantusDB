@@ -1275,6 +1275,44 @@ fn in_elements_ok(arr: &[Bson]) -> Result<(), Fallback> {
     Ok(())
 }
 
+/// mongod's parse-time refusal of a `$in` / `$nin` element that is a
+/// `$`-prefixed document, wherever the filter holds one: under a field, a
+/// `$not`, an `$elemMatch` or a branch of `$and` / `$or` / `$nor`. mongod
+/// refuses it while it parses, so before any document is read: over a read
+/// that answers from the `_id` index, a branch an `$or` never reached and an
+/// empty collection too (RM-420, measured 8.2.11). The matcher's own check
+/// ([`in_elements_ok`]) sees only the clauses it evaluates.
+pub fn nested_in_error(filter: &Document) -> Option<(i32, String)> {
+    filter
+        .iter()
+        .find_map(|(key, value)| match (key.as_str(), value) {
+            ("$and" | "$or" | "$nor", Bson::Array(subs)) => subs
+                .iter()
+                .filter_map(Bson::as_document)
+                .find_map(nested_in_error),
+            (k, _) if k.starts_with('$') => None,
+            (_, Bson::Document(cond)) if is_operator_dict(cond) => nested_in_condition_error(cond),
+            _ => None,
+        })
+}
+
+/// [`nested_in_error`] over one field's operator document.
+fn nested_in_condition_error(cond: &Document) -> Option<(i32, String)> {
+    cond.iter().find_map(|(op, arg)| match (op.as_str(), arg) {
+        ("$in" | "$nin", Bson::Array(arr)) => in_elements_ok(arr)
+            .err()
+            .and_then(|fault| fault.as_mongo().map(|(code, msg)| (code, msg.to_string()))),
+        ("$not", Bson::Document(inner)) if is_operator_dict(inner) => {
+            nested_in_condition_error(inner)
+        }
+        ("$elemMatch", Bson::Document(inner)) if elem_match_value_form(inner) => {
+            nested_in_condition_error(inner)
+        }
+        ("$elemMatch", Bson::Document(inner)) => nested_in_error(inner),
+        _ => None,
+    })
+}
+
 fn in_candidate_matches(
     values: &[Cand],
     cand: &Bson,
@@ -2240,18 +2278,22 @@ fn op_size(values: &[Cand], size: &Bson) -> R {
 
 // --- $elemMatch ---------------------------------------------------------
 
+/// `$elemMatch`'s VALUE form: the first key is an operator that is not a
+/// top-level one. `{$and: [...]}` / `{$or: ...}` / `{$nor: ...}` take the
+/// element as a document (measured 8.2.11, 2026-10-22).
+fn elem_match_value_form(cond: &Document) -> bool {
+    is_operator_dict(cond)
+        && !cond
+            .keys()
+            .next()
+            .is_some_and(|k| KNOWN_TOP_LEVEL_OPERATORS.contains(&k.as_str()))
+}
+
 fn op_elem_match(values: &[Cand], cond: &Bson, field: &str) -> R {
     let Bson::Document(condd) = cond else {
         return Ok(false); // Python: non-mapping condition -> False
     };
-    // The VALUE form when the first key is an operator that is not a
-    // top-level one: `{$and: [...]}` / `{$or: ...}` / `{$nor: ...}` take the
-    // element as a document (measured 8.2.11, 2026-10-22).
-    let scalar_form = is_operator_dict(condd)
-        && !condd
-            .keys()
-            .next()
-            .is_some_and(|k| KNOWN_TOP_LEVEL_OPERATORS.contains(&k.as_str()));
+    let scalar_form = elem_match_value_form(condd);
     if !scalar_form {
         elem_match_object_check(condd)?;
     }
@@ -3343,6 +3385,53 @@ mod in_set_tests {
                 };
                 assert_eq!(plain, hashed, "{op} over {d:?}");
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod nested_in_tests {
+    use super::nested_in_error;
+    use bson::doc;
+
+    const NESTED: Option<(i32, &str)> = Some((2, "cannot nest $ under $in"));
+
+    fn check(filter: bson::Document) -> Option<(i32, String)> {
+        nested_in_error(&filter)
+    }
+
+    #[test]
+    fn a_dollar_object_in_in_is_refused_wherever_it_sits() {
+        for filter in [
+            doc! {"_id": {"$in": [{"$x": 1}]}},
+            doc! {"a": {"$nin": [1, {"$x": 1}]}},
+            doc! {"a": {"$gt": 5, "$in": [{"$x": 1}]}},
+            doc! {"$or": [{"_id": 1}, {"b": {"$in": [{"$x": 1}]}}]},
+            doc! {"$and": [{"$nor": [{"b": {"$in": [{"$x": 1}]}}]}]},
+            doc! {"a": {"$not": {"$in": [{"$x": 1}]}}},
+            doc! {"a": {"$elemMatch": {"c": {"$in": [{"$x": 1}]}}}},
+            doc! {"a": {"$elemMatch": {"$in": [{"$x": 1}]}}},
+        ] {
+            let got = check(filter.clone());
+            assert_eq!(
+                got.as_ref().map(|(c, m)| (*c, m.as_str())),
+                NESTED,
+                "{filter:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn values_that_are_not_operators_pass() {
+        for filter in [
+            doc! {"a": {"$in": [{"x": 1, "$y": 2}, 1, "s"]}},
+            doc! {"a": {"$in": [{"$ref": "c", "$id": 1}]}},
+            doc! {"a": {"$eq": {"$x": 1}}},
+            doc! {"a": {"$all": [{"$x": 1}]}},
+            doc! {"$expr": {"$in": [{"$literal": 1}, [1]]}},
+            doc! {"a": {"x": {"$in": [{"$x": 1}]}}},
+        ] {
+            assert_eq!(check(filter.clone()), None, "{filter:?}");
         }
     }
 }
