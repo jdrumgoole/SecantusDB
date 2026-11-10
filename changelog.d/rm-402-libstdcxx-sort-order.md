@@ -1,0 +1,11 @@
+### Documents whose sort keys tie come in the order Linux mongod's sorter leaves them
+
+mongod's external sorter sorts what it holds with C++'s `std::sort`, before each spill and once at the end when it never spills. `std::sort` is not stable, so documents whose sort keys compare equal come out in whatever order the C++ library's algorithm leaves them. The Rust MongoDB server sorted stably, keeping ties in the order they arrived. On Linux, where mongod is built against libstdc++, that put tied documents in each spilled run in another order. A `$sort` after `$project` over 300 documents with seven key values stored 122288 bytes of spill where mongod 8.2.12 stores 122253, and a `$sort` after another stage returned 40 tied documents in a different order from mongod. The sorter now sorts each run, and an unspilled sort, as libstdc++'s introsort does, on every build except macOS arm64. There mongod's libc++ sorts differently and is not yet modelled (RM-526). Linux mongod's spill sizes for three tied sorts (122253, 51231, 51232) now match to the byte. Each document's place is carried through the sort, so the storage sizes later stages count stay with the right document.
+
+#### Fixed
+
+- `secantus-core` sorter: `sort_held` models `NoLimitSorter::sort`. Off macOS arm64 it is libstdc++'s `std::sort` (`stl::sort`, over positions, so no document is copied). On macOS arm64 the order stays as the documents came. Spilled runs carry their records' input positions, and `sort_documents_placed` returns them, so a `$sort` keeps each document's storage model beside it. `stl::LIBCXX` now selects the platform for `memlimit::LAYOUT` too.
+- Fixes RM-402 (tests/backlog/test_rm_found_2026_10_26.py::test_linux_spill_after_project_storage_size; also tests/backlog/test_rm_found_2026_10_26.py::test_linux_tied_sort_order and tests/backlog/test_rm_found_2026_10_26.py::test_linux_tied_spill_storage_size)
+- RM-325's regression test compares every case on every platform again.
+- RM-503 folded into RM-526 (the same cause, libc++'s sort on macOS), and RM-526's gap tests now run on macOS only.
+- Filed RM-527: `find`, a leading `$sort` and `$setWindowFields` take tied documents in a stable order of their own (tests/backlog/test_rm_found_2026_11_10_rm402.py::test_tied_order_of_find_leading_sort_and_window).

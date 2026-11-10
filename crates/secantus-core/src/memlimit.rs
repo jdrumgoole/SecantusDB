@@ -133,7 +133,7 @@ pub(crate) const LIBCXX_ARM64: Layout = Layout {
 
 /// The layout of the mongod build this server stands in for: macOS arm64's
 /// where it is built for one, Linux's everywhere else.
-pub(crate) const LAYOUT: Layout = if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+pub(crate) const LAYOUT: Layout = if crate::stl::LIBCXX {
     LIBCXX_ARM64
 } else {
     LIBSTDCXX

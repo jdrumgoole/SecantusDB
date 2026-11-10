@@ -1216,16 +1216,6 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       same runs in 928800 (1032). Found 2026-11-10 (RM-398).
       Verify: tests/backlog/test_rm_326_sort_counts.py::test_sbe_sort_spilled_bytes
       Backlog-ID: RM-506
-- [ ] **A sort on a descending or tied key spills a file of another
-      size.** Over 300 1-KB documents under a 50000-byte budget, macOS
-      mongod 8.2.11 stores 54562 bytes for the 13 spills of `{n: -1}`,
-      51240 for `{k: 1}` (seven values, so tied keys) and 131282 for `{n:
-      -1, s: 1}`; this server 54563, 50599 and 131265. An ascending sort on
-      a unique key (`{n: 1}`, 54548; `{n: 1, s: 1}`, 131252) is mongod's to
-      the byte, so the records or their order in each run differ, not the
-      file's framing. Found 2026-11-10 (RM-400).
-      Verify: tests/backlog/test_rm_326_sort_counts.py::test_descending_and_tied_spill_storage_size
-      Backlog-ID: RM-503
 - [ ] **A `range` window's `"current"` bound takes in tied documents.**
       mongod 8.2.1 reads `"current"` in a `range` window as the document
       answered (`getEndpointsRangeBased`: offset 0), so over `n` of 1, 1,
@@ -1353,27 +1343,39 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       2026-11-10 (RM-408).
       Verify: tests/backlog/test_rm_found_rm408.py::test_a_document_a_project_built_is_sized_as_built
       Backlog-ID: RM-519
-- [ ] **A sort by a key many documents share stores its spilled runs in
-      another order than mongod.** Over 300 documents sorted by `{k: -1}`
-      (seven values of `k`), budget 50000, mongod 8.2.11 on arm64 stores
-      51260 bytes for its 13 spills and this server 51242 -- `find` and a
-      pipeline's leading `$sort` alike, with the same spills, records and
-      bytes, so documents that compare equal sit in each run in another
-      order. A sort whose keys are all different, or all the same (`{s:
-      1}` over one string), agrees (RM-395). Found 2026-11-10 while working
-      RM-395.
-      Verify: tests/backlog/test_rm_found_2026_11_10_rm395.py::test_tied_sort_spill_storage_size
+- [ ] **On macOS documents whose sort keys tie come in another order
+      than mongod's.** mongod's sorter sorts what it holds with
+      `std::sort`, which is not stable, so documents whose keys compare
+      equal come in the C++ library's order. This server sorts as
+      libstdc++, the Linux build's library, does (RM-402: Linux mongod
+      8.2.12 and this server agree on every case below), and on macOS keeps
+      them in the order they came, where mongod 8.2.11's libc++ reorders
+      them. Over 300 1-KB documents under a 50000-byte budget, a sort by
+      `{k: -1}` (seven values of `k`) stores 51260 bytes for its 13 spills
+      on mongod and 51242 here -- `find` and a pipeline's leading `$sort`
+      alike -- and `{k: 1}` 51240 and 51244 (this was RM-503); the 40
+      documents over three values of `k` a `$sort` after `$project`
+      returns come back 39, 3, 27, 9, ... from mongod and in their order
+      here. A sort whose keys are all different agrees. The fix is
+      libc++'s `std::sort`, step for step, where `stl::LIBCXX`. Checked on
+      macOS only. Found 2026-11-10 while working RM-395 and RM-400.
+      Verify: tests/backlog/test_rm_found_2026_11_10_rm395.py::test_tied_sort_spill_storage_size, tests/backlog/test_rm_326_sort_counts.py::test_descending_and_tied_spill_storage_size, tests/backlog/test_rm_found_2026_11_10_rm395.py::test_macos_tied_sort_order
       Backlog-ID: RM-526
-- [ ] **On x86_64 a sort after `$project` stores 35 bytes more spill than
-      mongod.** mongod 8.2's spill sizes differ by platform (the in-order
-      sort stores 130545 bytes on arm64 and 131252 on x86_64), and each
-      platform's mongod is the reference (Joe, 2026-11-07). On arm64 this
-      server agrees on every RM-325 case. On CI's x86_64 Linux the 29
-      spills of `[{$project: {s: 1, k: 1}}, {$sort: {k: -1, s: 1}}]` store
-      122288 bytes where mongod stores 122253. Checked on x86_64 only, by
-      CI. Found 2026-11-07, snapshot PR #2447.
-      Backlog-ID: RM-402
-      Verify: tests/backlog/test_rm_found_2026_10_26.py::test_x86_spill_after_project_storage_size
+- [ ] **`find`, a leading `$sort` and `$setWindowFields` hand back
+      documents whose sort keys tie in the order they were read.** mongod
+      runs each through the same sorter as any other sort, and its
+      `std::sort` reorders ties: 40 documents over three values of `k`
+      sorted by `{k: 1}` come back 39, 3, 27, 9, ... from all four of
+      `find`, `[{$sort}]`, `$setWindowFields` and a `$sort` after `$project`
+      on macOS mongod 8.2.11, and libstdc++'s `std::sort` (g++ 15.2), the
+      Linux build's, gives 0, 21, 18, 24, .... Since RM-402 the sorter here
+      (`sorter::sort_held`) gives the Linux order for a `$sort` after
+      another stage, but these three take a stable order of their own: the
+      storage read's sort (`secantus-storage`, `compare_sort_keys`) for
+      `find` and a leading `$sort`, and the window stage's own sort. On
+      macOS the order also needs RM-526. Found 2026-11-10 working RM-402.
+      Verify: tests/backlog/test_rm_found_2026_11_10_rm402.py::test_tied_order_of_find_leading_sort_and_window
+      Backlog-ID: RM-527
 - [ ] **A classic `$group` counts its held values' and `_id`'s memory
       unlike mongod, so it spills at other points.** Over 300 documents of a
       1000-byte string, budget 5000, mongod 8.2.11 spills a `$first` /

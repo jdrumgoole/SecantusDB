@@ -252,11 +252,16 @@ pub fn apply_pipeline(
                 .as_ref()
                 .filter(|_| pipeline_sort)
                 .map(|st| st.iter().map(docstore::Stored::for_sorter).collect());
-            // Where each document goes, to keep its storage beside it.
-            let order = match &stores {
-                Some(_) => Some(stable_order(&docs, spec)?),
-                None => None,
+            // Where each document goes, to keep its storage beside it: the
+            // sorter's own order where it sorts them, since its ties come
+            // in the C++ library's order (`sorter::sort_held`).
+            let stable = |docs: &[Document]| -> R<Option<Vec<usize>>> {
+                match &stores {
+                    Some(_) => stable_order(docs, spec).map(Some),
+                    None => Ok(None),
+                }
             };
+            let order;
             let before = memlimit::report();
             // The query layer's sort: counted over what its plan gave it, in
             // that order -- which documents a top-k sorter keeps (RM-399) and
@@ -271,8 +276,12 @@ pub fn apply_pipeline(
                 _ => None,
             };
             docs = match (source, input) {
-                (None, _) => sort_stage(docs, spec)?,
+                (None, _) => {
+                    order = stable(&docs)?;
+                    sort_stage(docs, spec)?
+                }
                 (Some(source), Some(input)) => {
+                    order = stable(&docs)?;
                     let fields = match source {
                         crate::sorter::SortSource::QueryLayer => None,
                         _ => scanned.as_ref(),
@@ -289,7 +298,17 @@ pub fn apply_pipeline(
                     let added = (source == crate::sorter::SortSource::Modified
                         && !added.is_empty())
                     .then_some(&added);
-                    budgeted_sort_stage(docs, spec, source, fields, added, sizes.as_deref(), limit)?
+                    let (sorted, placed) = budgeted_sort_stage(
+                        docs,
+                        spec,
+                        source,
+                        fields,
+                        added,
+                        sizes.as_deref(),
+                        limit,
+                    )?;
+                    order = stores.is_some().then_some(placed);
+                    sorted
                 }
             };
             if let (Some(st), Some(order)) = (stores.take(), order) {
@@ -1988,7 +2007,7 @@ fn budgeted_sort_stage(
     added: Option<&std::collections::BTreeSet<String>>,
     sizes: Option<&[usize]>,
     limit: Option<usize>,
-) -> R<Vec<Document>> {
+) -> R<(Vec<Document>, Vec<usize>)> {
     let sizing = crate::sorter::Sizing {
         sizes,
         source,
@@ -1996,7 +2015,7 @@ fn budgeted_sort_stage(
         budget: crate::memlimit::budgets().sort,
         added,
     };
-    crate::sorter::sort_documents(docs, spec, &sizing, limit)
+    crate::sorter::sort_documents_placed(docs, spec, &sizing, limit)
 }
 
 pub(crate) fn sort_stage(docs: Vec<Document>, spec: &Bson) -> R<Vec<Document>> {
