@@ -543,6 +543,17 @@ pub(crate) fn read_error_on_namespace(err: StorageError, command: &str, ns: &str
 /// commands like `count` / `find`). Read commands never carry an
 /// execution-time update error, so this drops the flag; `findAndModify`, which
 /// does, goes through [`command_error_during`].
+/// Whether `reply` answers `ok: 1`, whatever its numeric type: a view's
+/// `distinct` answers an int32 one, as mongod's does.
+pub(crate) fn reply_ok(reply: &Document) -> bool {
+    match reply.get("ok") {
+        Some(Bson::Double(n)) => *n == 1.0,
+        Some(Bson::Int32(n)) => *n == 1,
+        Some(Bson::Int64(n)) => *n == 1,
+        _ => false,
+    }
+}
+
 /// Whether `reply` refuses a command that did not parse: mongod never ran
 /// it, so it is no statement of a transaction and no run of the command.
 pub(crate) fn did_not_parse(reply: &Document) -> bool {
@@ -675,6 +686,19 @@ mod tests {
     use super::as_i64;
     use bson::Bson;
     use std::str::FromStr;
+
+    /// A reply's `ok` is 1 whatever its numeric type: a view's `distinct`
+    /// answers an int32 one (RM-380).
+    #[test]
+    fn a_reply_is_ok_whatever_the_type_of_its_ok() {
+        use bson::doc;
+        assert!(super::reply_ok(&doc! {"ok": 1.0}));
+        assert!(super::reply_ok(&doc! {"ok": 1_i32}));
+        assert!(super::reply_ok(&doc! {"ok": 1_i64}));
+        assert!(!super::reply_ok(&doc! {"ok": 0.0}));
+        assert!(!super::reply_ok(&doc! {"ok": 0_i32}));
+        assert!(!super::reply_ok(&doc! {}));
+    }
 
     /// mongod wraps an EXECUTION-time update error and leaves a parse error
     /// bare, and the wrapper names the command. Probed 8.2.11 (2026-09-06).

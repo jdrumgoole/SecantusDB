@@ -822,7 +822,9 @@ These are explicit non-goals. Don't add them without a reason.
       mongod 8.2.1 writes no line for a command its IDL parse refuses -- a
       mistyped or missing field (14, 40414: `renameCollection: 5`, no
       `to`), an unknown one (40415: `find` with `bogus`), a collection name
-      that is not a string (73: `find: 5`, `count: 5`) -- as the operation
+      that is not a string (73: `find: 5`, `count: 5`), an unknown pipeline
+      stage (40324: an `aggregate` of a collection or a view, measured
+      8.2.11 while working RM-380) -- as the operation
       never ran; this server writes one for each, since its handlers parse
       and run in one step (as RM-386 has it).
       Found while working RM-378, 2026-11-09.
@@ -835,25 +837,74 @@ These are explicit non-goals. Don't add them without a reason.
       while working RM-378, 2026-11-09.
       Verify: tests/backlog/test_rm_rename_errors.py::test_renaming_system_views_is_a_write_to_it
       Backlog-ID: RM-482
-- [ ] **A line names the wrong namespace or kind around a view.**
-      mongod 8.2.1's `Slow query` line for a `getMore` of a cursor over a
-      view, and for a `findAndModify` of a view (which it refuses), says
-      `collectionType: "normal"`, where this server's says `view`; its
-      line for an `explain` of a `find` of a view names `<db>.v`, `view`,
-      where this server's names `<db>.$cmd`, `normal`; and its line for a
-      read of a view that fails once it runs names the collection beneath
-      the view (`<db>.c`, `normal`), where this server's names the view.
-      (An `aggregate` of a view refused for an unknown stage wrote no line
-      on mongod and one here; not pinned.) Found while working RM-362,
-      2026-11-07.
-      Backlog-ID: RM-380
-      Verify: tests/backlog/test_rm_view_lines.py::test_a_get_more_of_a_view_is_of_a_normal_collection, tests/backlog/test_rm_view_lines.py::test_a_find_and_modify_of_a_view_is_of_a_normal_collection, tests/backlog/test_rm_view_lines.py::test_an_explain_line_names_what_it_explains, tests/backlog/test_rm_view_lines.py::test_a_read_of_a_view_that_fails_names_its_collection
 - [ ] **A `distinct` of a view says nothing of its planning.** mongod
       8.2.1's line for a `distinct` of a view carries `planningTimeMicros`,
       as one of a collection does; this server's has none. Found while
       working RM-362, 2026-11-07.
       Backlog-ID: RM-381
       Verify: tests/backlog/test_rm_view_lines.py::test_a_distinct_of_a_view_says_how_long_it_planned
+- [ ] **A read of a view refused before it resolves the view resolves it
+      anyway.** mongod 8.2.11 refuses a `find` of a view whose projection
+      does not parse (`{a: {$bogusop: 1}}`), and an `explain` of a `find`
+      of a view whose filter does not, before it resolves the view: its line
+      names the view (`<db>.v`, `normal`) and has no `resolvedViews`. This
+      server resolves the view first, so its line has `resolvedViews` and
+      names the collection beneath, as a read that failed after resolving
+      does (RM-380). Found while working RM-380, 2026-11-10.
+      Verify: tests/backlog/test_rm_view_namespaces.py::test_a_read_refused_before_it_resolves_names_the_view
+      Backlog-ID: RM-483
+- [ ] **A time-series collection's `collMod` and `collStats` lines name the
+      collection, not its buckets.** mongod 8.2.11's name
+      `<db>.system.buckets.ts`, `collectionType: "timeseriesBuckets"`; this
+      server's name `<db>.ts`, `normal`. Found while working RM-380,
+      2026-11-10.
+      Verify: tests/backlog/test_rm_view_namespaces.py::test_a_time_series_ddl_line_names_its_buckets
+      Backlog-ID: RM-484
+- [ ] **A refused `validate` or `dropIndexes` of a view names the view.**
+      mongod 8.2.11's line for each names `<db>.$cmd`; this server's names
+      `<db>.v`. Found while working RM-380, 2026-11-10.
+      Verify: tests/backlog/test_rm_view_namespaces.py::test_a_refused_validate_of_a_view_names_cmd
+      Backlog-ID: RM-485
+- [ ] **An `explain` of a write is profiled.** mongod 8.2.11 writes no
+      profile entry for an `explain` of an `update` (a `delete` or
+      `findAndModify` not measured); this server writes one, named for the
+      collection. Found while working RM-380, 2026-11-10.
+      Verify: tests/backlog/test_rm_view_namespaces.py::test_an_explain_of_a_write_is_not_profiled
+      Backlog-ID: RM-486
+- [ ] **An `update` or `delete` of a view writes no statement line.**
+      mongod 8.2.11 refuses the statement and writes its line (`<db>.v`,
+      `normal`, `ok: 0`, the refusal) before the command's; this server
+      writes the command's line alone. Found while working RM-380,
+      2026-11-10.
+      Verify: tests/backlog/test_rm_view_namespaces.py::test_a_write_to_a_view_has_a_statement_line
+      Backlog-ID: RM-487
+- [ ] **A refused `listIndexes` or `collStats` of a view is not profiled.**
+      mongod 8.2.11 writes an entry for each (`<db>.v`, `ok: 0`); this
+      server writes none. Found while working RM-380, 2026-11-10.
+      Verify: tests/backlog/test_rm_view_namespaces.py::test_a_refused_list_indexes_of_a_view_is_profiled
+      Backlog-ID: RM-488
+- [ ] **A `getMore` of a `find` of a view names a write concern.** mongod
+      8.2.11's line and profile entry for it carry no `writeConcern`, as
+      one of a `find` of a collection; this server's carry the one an
+      `aggregate`'s `getMore` runs under, since it runs the `find` as an
+      `aggregate`. Found while working RM-380, 2026-11-10.
+      Verify: tests/backlog/test_rm_view_namespaces.py::test_a_get_more_of_a_find_of_a_view_names_no_write_concern
+      Backlog-ID: RM-489
+- [ ] **A `distinct` of a view is counted as failed.** A view's `distinct`
+      answers `ok` as an int32, as mongod's does, and about 270 readers of
+      a reply's `ok` (`get_f64("ok")`) take it for a failure:
+      `serverStatus` counts it in `metrics.commands.distinct.failed`, where
+      mongod 8.2.11 does not, and the transaction, interrupt and
+      write-concern paths read it the same way. The profiler reads it with
+      `util::reply_ok` since RM-380. Found while working RM-380,
+      2026-11-10.
+      Verify: tests/backlog/test_rm_view_namespaces.py::test_a_distinct_of_a_view_is_not_counted_failed
+      Backlog-ID: RM-490
+- [ ] **`metrics.commands.<name>` has no `rejected`.** mongod 8.2.11 counts
+      `failed`, `rejected` and `total` for a command; this server counts
+      `failed` and `total`. Found while working RM-380, 2026-11-10.
+      Verify: tests/backlog/test_rm_view_namespaces.py::test_a_command_metric_counts_rejections
+      Backlog-ID: RM-491
 - [ ] **A `dropDatabase` line names `<db>.$cmd`.** mongod 8.2.11's `Slow
       query` line for a `dropDatabase` names the database alone (`ns:
       "<db>"`); this server's names `<db>.$cmd`, as it does for a command
