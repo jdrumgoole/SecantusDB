@@ -2393,6 +2393,11 @@ pub enum AlterTableAction {
         /// A folded default's catalog rendering (`(1 + 2)`), when it was
         /// written as an expression.
         sql: Option<String>,
+        /// The default is the column's DOMAIN's (`typdefault`), which an
+        /// INSERT applies when the column has none of its own
+        /// (`build_column_default`): an ALTER DOMAIN moving it, or a DROP
+        /// DEFAULT leaving it. It is no `pg_attrdef` row (RP-825).
+        from_domain: bool,
     },
     /// `SET NOT NULL` / `DROP NOT NULL`.
     SetNotNull {
@@ -8352,6 +8357,27 @@ fn plan_alter_action(
             if_exists: cmd.missing_ok,
         }),
         Ok(AT::AtColumnDefault) => {
+            // `DROP DEFAULT` of a column of a domain removes only the
+            // column's own default: an INSERT then takes the domain's again
+            // (`build_column_default` falls back to `typdefault`), as it
+            // stands now and as a later ALTER DOMAIN moves it (RP-825).
+            if cmd.def.is_none() {
+                let column = def
+                    .column(&cmd.name)
+                    .ok_or_else(|| Error::UndefinedColumn(cmd.name.clone()))?;
+                if let Some(d) = column
+                    .extra
+                    .get_str("domain_type")
+                    .ok()
+                    .and_then(domains::user_domain)
+                {
+                    return domains::inherited_default(
+                        &cmd.name,
+                        &column.pg_type,
+                        d.default_sql.as_deref(),
+                    );
+                }
+            }
             // `DROP DEFAULT` is the same node with no expression.
             let value = match cmd.def.as_ref() {
                 None => None,
@@ -8375,6 +8401,7 @@ fn plan_alter_action(
                 value,
                 expr,
                 sql,
+                from_domain: false,
             })
         }
         Ok(AT::AtSetNotNull) => Ok(AlterTableAction::SetNotNull {
@@ -9566,11 +9593,17 @@ pub fn apply_alter_to_def(def: &mut TableDef, action: &AlterTableAction) {
             value,
             expr,
             sql,
+            from_domain,
         } => {
             if let Some(c) = def.columns.iter_mut().find(|c| c.name == *column) {
                 c.default = value.clone();
                 c.set_default_expr(expr.clone());
                 c.set_default_sql(if value.is_some() { sql.clone() } else { None });
+                if *from_domain {
+                    c.extra.insert("default_from_domain", true);
+                } else {
+                    c.extra.remove("default_from_domain");
+                }
             }
         }
         AlterTableAction::SetNotNull { column, not_null } => {

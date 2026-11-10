@@ -31496,6 +31496,13 @@ impl PgHandler {
     /// A `serial` column's default is the `nextval` call rather than the
     /// stored value, because that is what it actually is.
     fn default_expression(c: &Column) -> Bson {
+        // A default the column takes from its domain is the TYPE's
+        // (`pg_type.typdefault`), which an INSERT applies when the column has
+        // none of its own: it is no `pg_attrdef` row, so `atthasdef` is false
+        // and `column_default` NULL (RP-825).
+        if c.extra.get_bool("default_from_domain") == Ok(true) {
+            return Bson::Null;
+        }
         if let Some(seq) = c.sequence.as_deref() {
             // An IDENTITY column has no column default in PostgreSQL: the
             // value comes from the identity machinery, and `column_default`

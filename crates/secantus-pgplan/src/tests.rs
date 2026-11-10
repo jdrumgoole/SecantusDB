@@ -5251,6 +5251,59 @@ fn an_added_domain_column_is_tagged_like_a_declared_one() {
     domains::set_user_domains(Vec::new());
 }
 
+/// RP-825: a column of a domain has no default of its own until it sets
+/// one; an INSERT takes the domain's (`typdefault`). SET DEFAULT makes one
+/// the column's, which an ALTER DOMAIN no longer moves, and DROP DEFAULT
+/// leaves the domain's again. Here SET DEFAULT kept the column following
+/// the domain, and DROP DEFAULT left it with none.
+#[test]
+fn a_columns_set_and_drop_default_leave_its_domains() {
+    domains::set_user_domains(vec![domains::Domain {
+        name: "dd".to_string(),
+        oid: 90031,
+        base: "int4".to_string(),
+        typmod: -1,
+        not_null: false,
+        checks: Vec::new(),
+        not_valid: Vec::new(),
+        default_sql: Some("42".to_string()),
+        collation: None,
+    }]);
+    let mut def = t();
+    let Some(column) = domain_column("d", "dd").expect("a domain column") else {
+        panic!("dd is a domain");
+    };
+    def.columns.push(column);
+    let alter = |def: &TableDef, sql: &str| {
+        let lookup = |name: &str| (name == "t").then(|| def.clone());
+        match plan(sql, &lookup).expect("should plan") {
+            Statement::AlterTable { mut actions, .. } => actions.remove(0),
+            other => panic!("wrong statement: {other:?}"),
+        }
+    };
+    let from_domain = |def: &TableDef| {
+        def.column("d")
+            .unwrap()
+            .extra
+            .get_bool("default_from_domain")
+            .is_ok_and(|b| b)
+    };
+    assert!(from_domain(&def));
+    let set = alter(&def, "ALTER TABLE t ALTER COLUMN d SET DEFAULT 7");
+    apply_alter_to_def(&mut def, &set);
+    assert_eq!(def.column("d").unwrap().default, Some(Bson::Int32(7)));
+    assert!(!from_domain(&def));
+    let drop = alter(&def, "ALTER TABLE t ALTER COLUMN d DROP DEFAULT");
+    apply_alter_to_def(&mut def, &drop);
+    assert_eq!(def.column("d").unwrap().default, Some(Bson::Int32(42)));
+    assert!(from_domain(&def));
+    // A column of no domain has nothing to fall back to.
+    let drop = alter(&def, "ALTER TABLE t ALTER COLUMN n DROP DEFAULT");
+    apply_alter_to_def(&mut def, &drop);
+    assert_eq!(def.column("n").unwrap().default, None);
+    domains::set_user_domains(Vec::new());
+}
+
 /// RP-824: `ALTER COLUMN TYPE` sets `atttypid` to the new type, so a column
 /// retyped off its domain is no longer one of it -- no domain tag, no
 /// domain DEFAULT, and the new type's collation (`GetColumnDefCollation`),

@@ -3526,15 +3526,6 @@ holds for a column CREATE TABLE declares and, since RP-799, for one ADD
 COLUMN adds, and since RP-834 for one ALTER COLUMN TYPE retypes into a
 domain.
 
-- [ ] **A domain's DEFAULT is listed as its column's default.** `create
-      table t (d dx)` has no `pg_attrdef` row on PostgreSQL 15.19, and
-      `information_schema.columns.column_default` is NULL: the domain's
-      DEFAULT is the type's (`pg_type.typdefault`), applied at INSERT by
-      `build_column_default`, not copied into the column. Here
-      `pg_get_expr(adbin, adrelid)` and `column_default` are `42`, as
-      `tag_domain_column` stores the domain's default in the column.
-      Verify: tests/backlog/test_rp_found_rp799.py::test_a_domains_default_is_not_its_columns
-      Backlog-ID: RP-825
 - [ ] **`information_schema.columns.data_type` of a domain over a domain
       names its base.** A column of `dx2` is `USER-DEFINED` on PostgreSQL
       15.19 -- the view reads the domain's immediate base type, itself a
@@ -3587,3 +3578,25 @@ varchar(3), w dv689, c char(3))`, `d689` an `int` with `check (value > 0)`.
       `plpgsql_fn.rs` says so), a bare column name included.
       Verify: tests/backlog/test_rp_found_rp689.py::test_a_column_a_record_field_shares_is_ambiguous
       Backlog-ID: RP-838
+
+## Found while working RP-825 (2026-11-10)
+
+Measured on a private, freshly initdb'd PostgreSQL 15.19 cluster with the
+`_SETUP` in `tests/backlog/test_rp_found_rp825.py`: `d825` a domain over
+`int` with `default 42 check (value > 0)`, and `t825(k int, d d825)`.
+
+- [ ] **A column `LIKE` copies from a column of a domain is not one of the
+      domain.** `create table l (like t825)` makes `d` a column of `d825`
+      on PostgreSQL 15.19 (`transformTableLikeClause` copies `atttypid`):
+      an INSERT naming no `d` takes the domain's DEFAULT `42`, `-1` is
+      23514 under the domain's CHECK, and `information_schema.columns`
+      names `domain_name` `d825` with no `column_default`, with or without
+      INCLUDING DEFAULTS (the domain's DEFAULT is no `pg_attrdef` row, so
+      there is nothing to copy). Here the copy is rendered by the column's
+      stored base type (`int4`): no DEFAULT, no CHECK, no `domain_name`,
+      and with INCLUDING DEFAULTS the domain's `42` is copied in as the
+      column's own. The faithful fix renders a domain column by its
+      domain's name in `expand_table_like` (`crates/secantus-pgplan/src/lib.rs`),
+      and copies only a default the column set itself.
+      Verify: tests/backlog/test_rp_found_rp825.py::test_a_like_copy_of_a_domain_column_is_one_of_the_domain
+      Backlog-ID: RP-839
