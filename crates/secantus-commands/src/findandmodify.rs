@@ -487,9 +487,14 @@ pub fn find_and_modify(doc: &Document, ctx: &mut CommandContext) -> HandlerResul
             },
         )
         .map_err(|e| crate::util::command_error_during(e, "findAndModify"))?;
+        // The row the read matched, as it matched it: the write does not
+        // test it again (RM-391). Its `_id` and the query are the write's
+        // filter, so the same bytes match that too.
+        let mut matched_row = Vec::new();
         let candidates = if let Some(sel) = selection {
             crate::opdebug::note_examined(sel.keys_examined, sel.docs_examined, Some(sel.summary));
             crate::opdebug::note_write_run(sel.run);
+            matched_row = sel.matched.into_iter().take(1).collect();
             sel.first.into_iter().collect()
         } else {
             crate::explain::order::find(
@@ -613,14 +618,16 @@ pub fn find_and_modify(doc: &Document, ctx: &mut CommandContext) -> HandlerResul
 
         // remove=true: delete the matched doc, return its (pre-image) value.
         if is_remove {
-            let deleted = match storage.delete_matching_with_let(
-                &ctx.db_name,
-                &coll,
-                &write_filter,
-                1,
-                &let_vars,
-                collation.as_ref(),
-            ) {
+            let deleted = match crate::explain::order::with_matched(storage, matched_row, || {
+                storage.delete_matching_with_let(
+                    &ctx.db_name,
+                    &coll,
+                    &write_filter,
+                    1,
+                    &let_vars,
+                    collation.as_ref(),
+                )
+            }) {
                 Ok(n) => n,
                 Err(e) => return Ok(storage_err_reply(e, validator.as_ref())),
             };
@@ -677,40 +684,42 @@ pub fn find_and_modify(doc: &Document, ctx: &mut CommandContext) -> HandlerResul
         }
 
         // update: apply it to the matched doc (pipeline-form or operator/replacement).
-        let update_result = if let Some(stages) = pipeline {
-            storage.update_matching_pipeline(
-                &ctx.db_name,
-                &coll,
-                &write_filter,
-                stages,
-                false,
-                false,
-                &let_vars,
-                collation.as_ref(),
-                validator.as_ref(),
-                validator_moderate,
-                return_new,
-            )
-        } else {
-            let upd = update
-                .and_then(Bson::as_document)
-                .cloned()
-                .unwrap_or_default();
-            storage.update_matching_array_filters(
-                &ctx.db_name,
-                &coll,
-                &write_filter,
-                &upd,
-                false,
-                false,
-                &array_filters,
-                &let_vars,
-                collation.as_ref(),
-                validator.as_ref(),
-                validator_moderate,
-                return_new,
-            )
-        };
+        let update_result = crate::explain::order::with_matched(storage, matched_row, || {
+            if let Some(stages) = pipeline {
+                storage.update_matching_pipeline(
+                    &ctx.db_name,
+                    &coll,
+                    &write_filter,
+                    stages,
+                    false,
+                    false,
+                    &let_vars,
+                    collation.as_ref(),
+                    validator.as_ref(),
+                    validator_moderate,
+                    return_new,
+                )
+            } else {
+                let upd = update
+                    .and_then(Bson::as_document)
+                    .cloned()
+                    .unwrap_or_default();
+                storage.update_matching_array_filters(
+                    &ctx.db_name,
+                    &coll,
+                    &write_filter,
+                    &upd,
+                    false,
+                    false,
+                    &array_filters,
+                    &let_vars,
+                    collation.as_ref(),
+                    validator.as_ref(),
+                    validator_moderate,
+                    return_new,
+                )
+            }
+        });
         let outcome = match update_result {
             Ok(o) => o,
             Err(e) => return Ok(storage_err_reply(e, validator.as_ref())),

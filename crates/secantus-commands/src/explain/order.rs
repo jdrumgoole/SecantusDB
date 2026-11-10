@@ -2025,21 +2025,50 @@ pub(crate) fn pinned<T>(
     pin: Pin,
     f: impl FnOnce() -> Result<T, StorageError>,
 ) -> Result<T, StorageError> {
-    let order = match pin {
-        Pin::Store => return f(),
-        Pin::Rows(order) => order,
+    let (mut order, matched) = match pin {
+        Pin::Store(matched) => (None, matched),
+        Pin::Rows(rows) => (Some(rows.iter().map(|(rid, _)| *rid).collect()), rows),
         Pin::Read(read) => return streamed(storage, *read, f),
     };
     let mut f = Some(f);
     let mut out = None;
-    storage.with_candidate_order(order, &mut || {
+    // The rows the read matched are not tested again (RM-391).
+    storage.with_matched_rows(matched, &mut || match order.take() {
+        Some(order) => storage.with_candidate_order(order, &mut || {
+            if let Some(run) = f.take() {
+                out = Some(run());
+            }
+        }),
+        None => {
+            if let Some(run) = f.take() {
+                out = Some(run());
+            }
+        }
+    });
+    match out {
+        Some(v) => v,
+        // A store that did not call back: run it unpinned.
+        None => (f.take().expect("the write ran or it did not"))(),
+    }
+}
+
+/// Run `f`, a write through `storage`, knowing that `rows` matched its
+/// filter as the bytes given: those it reads unchanged are not tested
+/// again, as mongod tests a write's filter once per document (RM-391).
+pub(crate) fn with_matched<T>(
+    storage: &dyn Storage,
+    rows: Vec<(i64, Vec<u8>)>,
+    f: impl FnOnce() -> T,
+) -> T {
+    let mut f = Some(f);
+    let mut out = None;
+    storage.with_matched_rows(rows, &mut || {
         if let Some(run) = f.take() {
             out = Some(run());
         }
     });
     match out {
         Some(v) => v,
-        // A store that did not call back: run it unpinned.
         None => (f.take().expect("the write ran or it did not"))(),
     }
 }
@@ -2139,14 +2168,12 @@ pub(crate) fn in_delete_batches<T>(storage: &dyn Storage, f: impl FnOnce() -> T)
     }
 }
 
-/// Every RecordId `ask` matches, in mongod's order, for a delete that
-/// removes them all: the order its batches are formed in. `None`: the
+/// Every row `ask` matches, in mongod's order, for a delete that removes
+/// them all: the order its batches are formed in, each row with the bytes
+/// it matched as. `None`: the
 /// store's own order is the plan's (a whole collection read in storage
 /// order, or the one index both read), or nothing matched.
-pub(crate) fn delete_order(
-    storage: &dyn Storage,
-    ask: &Ask,
-) -> Result<Option<Vec<i64>>, StorageError> {
+pub(crate) fn delete_order(storage: &dyn Storage, ask: &Ask) -> Result<Option<Rows>, StorageError> {
     if ask.filter.is_empty() && ask.hint.is_none() {
         return Ok(None);
     }
@@ -2159,9 +2186,7 @@ pub(crate) fn delete_order(
     if rows.is_empty() {
         return Ok(None);
     }
-    Ok(Some(
-        rows.into_iter().map(|(recordid, _)| recordid).collect(),
-    ))
+    Ok(Some(rows))
 }
 
 /// Whether the store, left to pick, already takes the document mongod's
@@ -2226,12 +2251,13 @@ fn store_order_is_the_plans(storage: &dyn Storage, ask: &Ask) -> Result<bool, St
 /// first that still matches when it runs.
 const WRITE_CANDIDATES: usize = 8;
 
-/// The RecordIds of the first documents `ask` matches, in mongod's order,
-/// for a write that changes one of them. `None`: let the store pick.
+/// The first rows `ask` matches, in mongod's order, each with the bytes it
+/// matched as, for a write that changes one of them. `None`: let the store
+/// pick.
 pub(crate) fn write_candidates(
     storage: &dyn Storage,
     ask: &Ask,
-) -> Result<Option<Vec<i64>>, StorageError> {
+) -> Result<Option<Rows>, StorageError> {
     // `{_id: value}` names its document: there is no order to find.
     if ask.filter.len() == 1
         && ask
@@ -2252,12 +2278,7 @@ pub(crate) fn write_candidates(
     if rows.is_empty() {
         return Ok(None);
     }
-    Ok(Some(
-        rows.into_iter()
-            .take(WRITE_CANDIDATES)
-            .map(|(recordid, _)| recordid)
-            .collect(),
-    ))
+    Ok(Some(rows.into_iter().take(WRITE_CANDIDATES).collect()))
 }
 /// What a read other than a `find`'s plans for ([`counted_plan`]).
 #[derive(Clone, Copy)]
@@ -2366,6 +2387,9 @@ pub(crate) struct Selection {
     pub rids: Vec<i64>,
     /// The first match itself, for a `findAndModify`.
     pub first: Option<Vec<u8>>,
+    /// Every row the read matched, in its order, each with the bytes it
+    /// matched as: the write does not test them again (RM-391).
+    pub matched: Vec<(i64, Vec<u8>)>,
     pub keys_examined: i64,
     pub docs_examined: i64,
     pub summary: String,
@@ -2399,28 +2423,47 @@ fn write_read(plan: &Node) -> &Node {
 
 /// The documents a write takes ([`pinned`]).
 pub(crate) enum Pin {
-    /// The store's own candidates.
-    Store,
-    /// These rows, in this order.
-    Rows(Vec<i64>),
+    /// The store's own candidates, those of them read as these bytes
+    /// matched already.
+    Store(Vec<(i64, Vec<u8>)>),
+    /// These rows, in this order, each with the bytes it matched as.
+    Rows(Vec<(i64, Vec<u8>)>),
     /// What this read returns, as the write reaches it.
     Read(Box<PendingRead>),
 }
 
 impl Pin {
     /// The rows `rows` names, or the store's candidates when there are none.
-    pub(crate) fn rows(rows: Option<Vec<i64>>) -> Self {
+    pub(crate) fn rows(rows: Option<Vec<(i64, Vec<u8>)>>) -> Self {
         match rows {
             Some(rows) if !rows.is_empty() => Pin::Rows(rows),
-            _ => Pin::Store,
+            _ => Pin::Store(Vec::new()),
         }
     }
 
-    /// A selection's documents: its pending read, else its rows.
+    /// A selection's documents: its pending read, else its rows, else the
+    /// store's candidates, knowing which of them the read matched.
     pub(crate) fn of(selection: Selection) -> Self {
         match selection.pending {
             Some(read) => Pin::Read(read),
-            None => Pin::rows(Some(selection.rids)),
+            None if selection.rids.is_empty() => Pin::Store(selection.matched),
+            None => Pin::Rows(selection.matched),
+        }
+    }
+
+    /// Only the first row, for a write whose filter now names that row's
+    /// document alone (an update under a sort): no other row can match it.
+    pub(crate) fn first_only(self) -> Self {
+        match self {
+            Pin::Store(mut rows) => {
+                rows.truncate(1);
+                Pin::Store(rows)
+            }
+            Pin::Rows(mut rows) => {
+                rows.truncate(1);
+                Pin::Rows(rows)
+            }
+            read => read,
         }
     }
 }
@@ -2476,6 +2519,7 @@ pub(crate) fn write_selection(
         return Ok(Some(Selection {
             rids: Vec::new(),
             first: found.into_iter().next(),
+            matched: Vec::new(),
             keys_examined: n,
             docs_examined: n,
             summary,
@@ -2513,6 +2557,7 @@ pub(crate) fn write_selection(
         return Ok(Some(Selection {
             rids: Vec::new(),
             first: None,
+            matched: Vec::new(),
             keys_examined: 0,
             docs_examined: 0,
             summary: summary.clone(),
@@ -2530,8 +2575,11 @@ pub(crate) fn write_selection(
     let batch = stream.next_batch(storage, 1, usize::MAX)?;
     let (keys_examined, docs_examined) = (batch.keys_examined, batch.docs_examined);
     let counted = run(&stream);
-    let first = batch.docs.into_iter().next();
-    let mut rids = batch.rids;
+    let first = batch.docs.first().cloned();
+    let mut rids = batch.rids.clone();
+    // What the read matched, so that the write does not test it again: mongod
+    // tests a write's filter once per document (RM-391).
+    let mut matched: Vec<(i64, Vec<u8>)> = batch.rids.into_iter().zip(batch.docs).collect();
     if !rids.is_empty() && store_order_is_the_plans(storage, ask)? {
         // The store, left to pick, takes the same document (RM-056): the
         // write reads as it did, and no candidates are read for it.
@@ -2541,11 +2589,13 @@ pub(crate) fn write_selection(
         // takes the next: read, and not counted, as the store's own read
         // of its candidates was.
         let more = stream.next_batch(storage, WRITE_CANDIDATES - 1, usize::MAX)?;
-        rids.extend(more.rids);
+        rids.extend(more.rids.iter().copied());
+        matched.extend(more.rids.into_iter().zip(more.docs));
     }
     Ok(Some(Selection {
         rids,
         first,
+        matched,
         keys_examined,
         docs_examined,
         summary,
