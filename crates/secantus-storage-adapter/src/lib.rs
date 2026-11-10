@@ -960,6 +960,10 @@ impl CmdStorage for StorageAdapter {
         secantus_storage::with_candidate_order(order, f)
     }
 
+    fn with_matched_rows(&self, rows: Vec<(i64, Vec<u8>)>, f: &mut dyn FnMut()) {
+        secantus_storage::with_matched_rows(rows, f)
+    }
+
     fn with_candidate_source(
         &self,
         source: &mut dyn FnMut(usize, usize) -> secantus_commands::storage::Pulled,

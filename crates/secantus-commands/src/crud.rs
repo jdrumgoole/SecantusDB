@@ -1422,7 +1422,7 @@ pub fn delete(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
             if let Err(e) = planned {
                 log::warn!("planning a delete of many documents: {e:?}");
             }
-            Pin::Store
+            Pin::Store(Vec::new())
         };
         // The statement's interrupt point before it writes: a kill between
         // statements, or one the reads above took for an answer (RM-313).
@@ -2494,6 +2494,8 @@ pub(crate) fn update_in(
         // (UPDATE over a SORT, or over a read in the sort's order) reads it
         // (RM-376), and the write is pinned to it. Nothing matched -> the
         // filter stays, so an upsert still upserts.
+        // The filter names the sorted first document alone, once found.
+        let mut named = false;
         if let (Some(sort), false) = (&sort_spec, absent) {
             let sorted = match &selection {
                 Some(sel) => Ok(sel.first.iter().cloned().collect::<Vec<_>>()),
@@ -2537,6 +2539,7 @@ pub(crate) fn update_in(
                 if let Ok(d) = secantus_core::bsondoc::from_bytes(first.as_slice()) {
                     if let Some(id) = d.get("_id") {
                         q = doc! { "_id": id.clone() };
+                        named = true;
                     }
                 }
             }
@@ -2553,7 +2556,12 @@ pub(crate) fn update_in(
         // the order mongod reads them.
         use crate::explain::order::Pin;
         let first = if let Some(sel) = selection {
-            Pin::of(sel)
+            // Under a filter that names one document, the read's other
+            // matches are not its candidates.
+            match named {
+                true => Pin::of(sel).first_only(),
+                false => Pin::of(sel),
+            }
         } else if multi || absent {
             if !absent {
                 // An update of many documents reads them in no order of its
@@ -2581,7 +2589,7 @@ pub(crate) fn update_in(
                     log::warn!("planning an update of many documents: {e:?}");
                 }
             }
-            Pin::Store
+            Pin::Store(Vec::new())
         } else {
             Pin::rows(
                 crate::explain::order::write_candidates(

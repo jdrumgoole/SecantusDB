@@ -35,6 +35,8 @@ def _writes_in_a_find_s_time(client: Any) -> list:
             "updates": [{"q": SLOW, "u": {"$inc": {"n": 1}}, "multi": True}],
         },
         "delete": {"delete": "c", "deletes": [{"q": SLOW, "limit": 1}]},
+        "findAndModify": {"findAndModify": "c", "query": SLOW, "update": {"$inc": {"n": 1}}},
+        "findAndModify remove": {"findAndModify": "c", "query": SLOW, "remove": True},
     }
     out = []
     for name, command in writes.items():
@@ -45,13 +47,15 @@ def _writes_in_a_find_s_time(client: Any) -> list:
     return out
 
 
-@pytest.mark.backlog("RM-391")
+@pytest.mark.backlog_fixed("RM-391")
 def test_a_write_tests_each_document_once(rust_mongo: Any, mongod_rs: Any) -> None:
     """mongod tests a write's filter against each document once, so an
     update or delete of one document takes as long as a `find` of it and
-    fits in a `maxTimeMS` half again as long. This server tests it once in
+    fits in a `maxTimeMS` half again as long. This server tested it once in
     the read that picks the candidates and again in the storage write, and
-    runs out of that budget (code 50)."""
+    ran out of that budget (code 50); the write now takes the rows the read
+    matched, with the bytes it matched them as, and tests only a row that
+    changed since."""
     theirs = _writes_in_a_find_s_time(mongod_rs)
-    assert theirs == [("update", None), ("updateMany", None), ("delete", None)], theirs
+    assert theirs == [(name, None) for name, _ in theirs], theirs
     assert _writes_in_a_find_s_time(rust_mongo) == theirs

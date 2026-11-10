@@ -3981,6 +3981,9 @@ thread_local! {
     /// The rows a write on this thread tests, in the order it tests them
     /// (`with_candidate_order`). `None`: the router's own candidates.
     static CANDIDATE_ORDER: RefCell<Option<Vec<i64>>> = const { RefCell::new(None) };
+    /// The rows the next write on this thread is known to match, each with
+    /// the bytes it matched as (`with_matched_rows`).
+    static MATCHED_ROWS: RefCell<HashMap<i64, Vec<u8>>> = RefCell::new(HashMap::new());
     /// The batch size a multi-document delete on this thread removes its
     /// documents in, each batch in reverse (`with_reversed_delete_batches`).
     /// 0: in the order they were read.
@@ -4230,6 +4233,46 @@ pub fn with_candidate_order<T>(order: Vec<i64>, f: impl FnOnce() -> T) -> T {
     f()
 }
 
+/// Run `f` with the next write knowing that each of `rows` matched its
+/// filter as the bytes given: the caller's read of the write's documents
+/// tested them already. mongod tests a write's filter once per document
+/// (RM-391), so a candidate the write reads as those same bytes is not
+/// tested again; one another writer changed since is. Restored on return,
+/// panic included.
+pub fn with_matched_rows<T>(rows: Vec<(i64, Vec<u8>)>, f: impl FnOnce() -> T) -> T {
+    struct Restore(HashMap<i64, Vec<u8>>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            MATCHED_ROWS.with(|m| *m.borrow_mut() = std::mem::take(&mut self.0));
+        }
+    }
+    let _r = Restore(MATCHED_ROWS.with(|m| m.replace(rows.into_iter().collect())));
+    f()
+}
+
+/// Whether the row `recordid`, read as `blob`, is one the write's caller
+/// matched as these bytes ([`with_matched_rows`]).
+fn matched_before(recordid: i64, blob: &[u8]) -> bool {
+    MATCHED_ROWS.with(|m| m.borrow().get(&recordid).is_some_and(|b| b == blob))
+}
+
+/// `filter`'s verdict on the candidate `recordid`, read as `blob`, for a
+/// write: true without a test when the write's caller matched it as these
+/// bytes ([`matched_before`]).
+fn write_matches(
+    recordid: i64,
+    blob: &[u8],
+    filter: &Document,
+    vars: &Document,
+    coll_opt: Option<&Collation>,
+) -> Result<bool> {
+    if matched_before(recordid, blob) {
+        return Ok(true);
+    }
+    let raw = bson::RawDocument::from_bytes(blob).map_err(|_| StorageError::QueryUnsupported)?;
+    secantus_core::query::matches_raw(raw, filter, vars, coll_opt).map_err(query_fault)
+}
+
 /// One pull from a write's candidate source ([`with_candidate_source`]).
 pub struct Pulled {
     /// The rows the source's read matched, in its order, each with the
@@ -4275,7 +4318,10 @@ pub fn with_candidate_source<T>(source: &mut CandidateSource<'_>, f: impl FnOnce
     // all of this call, so it outlives every use.
     let ptr: NonNull<CandidateSource<'static>> = unsafe { std::mem::transmute(ptr) };
     let _r = Restore(CANDIDATE_SOURCE.with(|s| s.replace(Some(ptr))));
-    f()
+    // A write that drains the source notes what it matched for itself
+    // (`candidate_docs`), for as long as this call runs.
+    let matched = MATCHED_ROWS.with(|m| m.borrow().clone());
+    with_matched_rows(matched.into_iter().collect(), f)
 }
 
 /// The candidate source set for this write, taken so that nothing the
@@ -4294,12 +4340,13 @@ impl TakenSource {
         unsafe { (*self.0.as_ptr())(want, max_bytes) }
     }
 
-    /// Every row the source matches, in its order: `None` when it stopped.
-    fn drain(&mut self) -> Option<Vec<i64>> {
+    /// Every row the source matches, in its order, each with the bytes it
+    /// matched as: `None` when it stopped.
+    fn drain(&mut self) -> Option<Vec<(i64, Vec<u8>)>> {
         let mut rows = Vec::new();
         loop {
             let pulled = self.pull(0, usize::MAX);
-            rows.extend(pulled.rows.into_iter().map(|(rid, _)| rid));
+            rows.extend(pulled.rows);
             if pulled.stopped {
                 return None;
             }
@@ -20221,8 +20268,11 @@ impl Storage {
         }
         // A write that does not draw a pull at a time takes the source's
         // every row first, the same way.
+        // The source tested them: the write does not again (RM-391).
         if let Some(mut source) = TakenSource::take() {
-            let order = source.drain().ok_or(StorageError::MaxTimeExpired)?;
+            let rows = source.drain().ok_or(StorageError::MaxTimeExpired)?;
+            let order = rows.iter().map(|(recordid, _)| *recordid).collect();
+            MATCHED_ROWS.with(|m| m.borrow_mut().extend(rows));
             return self.rows_by_recordids(session, db, coll, order);
         }
         // `force_scan` (a collation is active) bypasses the collation-naive
@@ -21536,13 +21586,11 @@ impl Storage {
                     for (recordid, _id_k, blob) in
                         self.candidate_docs(&session, db, coll, filter, coll_opt.is_some())?
                     {
-                        let raw = bson::RawDocument::from_bytes(&blob)
-                            .map_err(|_| StorageError::QueryUnsupported)?;
-                        match secantus_core::query::matches_raw(raw, filter, vars, coll_opt) {
+                        match write_matches(recordid, &blob, filter, vars, coll_opt) {
                             Ok(true) => rids.push((recordid, blob)),
                             Ok(false) => {}
-                            Err(fault) => {
-                                scan_error = Some(query_fault(fault));
+                            Err(e) => {
+                                scan_error = Some(e);
                                 break;
                             }
                         }
@@ -21840,11 +21888,7 @@ impl Storage {
                     // Match over raw BSON first (decodes only the filter's fields);
                     // a rejected candidate skips the full document decode. A
                     // matched candidate is then decoded for the update transform.
-                    let raw = bson::RawDocument::from_bytes(&blob)
-                        .map_err(|_| StorageError::QueryUnsupported)?;
-                    if !secantus_core::query::matches_raw(raw, filter, vars, coll_opt)
-                        .map_err(query_fault)?
-                    {
+                    if !write_matches(recordid, &blob, filter, vars, coll_opt)? {
                         continue;
                     }
                     let doc = decode_doc(&blob)?;
@@ -22408,9 +22452,7 @@ impl Storage {
                 let mut staged: Vec<(i64, Vec<u8>)> = Vec::new();
                 let mut staged_bytes = 0usize;
                 for (recordid, _id_k, blob) in candidates {
-                    let raw = bson::RawDocument::from_bytes(&blob)
-                        .map_err(|_| StorageError::QueryUnsupported)?;
-                    match secantus_core::query::matches_raw(raw, filter, let_vars, coll_opt) {
+                    match write_matches(recordid, &blob, filter, let_vars, coll_opt) {
                         Ok(true) => {
                             staged_bytes += blob.len();
                             staged.push((recordid, blob));
@@ -22420,9 +22462,9 @@ impl Storage {
                             }
                         }
                         Ok(false) => {}
-                        Err(fault) => {
+                        Err(e) => {
                             staged.clear();
-                            scan_error = Some(query_fault(fault));
+                            scan_error = Some(e);
                             break;
                         }
                     }
@@ -22591,11 +22633,7 @@ impl Storage {
                     // Match over raw BSON first (decodes only the filter's fields);
                     // a rejected candidate skips the full decode. A matched
                     // candidate is decoded for the delete's oplog `o2` / pre-image.
-                    let raw = bson::RawDocument::from_bytes(&blob)
-                        .map_err(|_| StorageError::QueryUnsupported)?;
-                    if !secantus_core::query::matches_raw(raw, filter, let_vars, coll_opt)
-                        .map_err(query_fault)?
-                    {
+                    if !write_matches(recordid, &blob, filter, let_vars, coll_opt)? {
                         continue;
                     }
                     let doc = decode_doc(&blob)?;

@@ -833,6 +833,14 @@ pub trait Storage: Send + Sync {
         f()
     }
 
+    /// Run `f` with the write it makes knowing that each of `rows` matched
+    /// its filter as the bytes given, so a candidate it reads as those
+    /// bytes is not tested again: mongod tests a write's filter once per
+    /// document (RM-391). Default: every candidate is tested.
+    fn with_matched_rows(&self, _rows: Vec<(i64, Vec<u8>)>, f: &mut dyn FnMut()) {
+        f()
+    }
+
     /// Run `f` with the write it makes drawing its candidates from
     /// `source` as it writes them ([`Pulled`]). Default: every row the
     /// source matches first, as [`Self::with_candidate_order`] takes them.
