@@ -1125,23 +1125,30 @@ Python behind the Rust server, a deferral answers 2 "aggregation pipeline
 uses a stage or operator not supported by the Rust server". The file has
 about forty such points; these are the ones measured.
 
-- [ ] **An updateMany whose plan the write cannot stream reads every
-      candidate before it writes one.** mongod updates each document as its
-      scan reaches it, whatever the plan, so one out of `maxTimeMS` part-way
-      has updated some (mongod 8.2.11, 2026-11-07: 100,000 documents in a
-      collection clustered by `_id`, `maxTimeMS: 30`). This server's write
-      takes a streamed plan's documents a pull at a time (RM-323), but a
-      plan the stream does not run -- a clustered or time-series
-      collection, a contested or geo plan -- leaves the update to the
-      store's own candidates, read whole (`candidate_docs`) before any is
-      tested, and a budget spent in that read updates nothing. Its deleteMany
-      deletes each staged batch as it tests, but on a replica set a
-      contested or geo plan is first read and tested whole to work out
-      mongod's order (`delete_order`; read from the code, not yet probed).
-      The work is to read the store's candidates a page at a time into the
-      write, and to stream the order.
+- [ ] **A write of many through an index, or on a contested plan, reads
+      every candidate before it writes one.** mongod writes each document
+      as its plan returns it, whatever the plan, so an updateMany or
+      deleteMany out of `maxTimeMS` part-way has written some (mongod
+      8.2.11, 2026-11-10, 100,000 documents, `maxTimeMS: 30`: through index
+      `a_1` of a collection clustered by `_id` 4,599 updated and 11,280
+      deleted; a contested plan over `a_1` and `b_1` 1,536 updated and
+      10,030 deleted). A plan this server's write cannot stream -- a
+      clustered or time-series collection, a contested or geo plan --
+      leaves the write to the store, which since 2026-11-10 reads its
+      candidates a page at a time and writes each page first, so a
+      collection scan out of time keeps what it wrote. Two reads still run
+      whole before the first write, and a budget spent in them writes
+      nothing: the router's RecordIds of an index (`try_index_id_keys`,
+      read whole before the first page), and the read that picks a
+      contested plan (`explain::order::through_cache` runs `ordered_rows`
+      over every match; on a replica set a deleteMany's `delete_order`
+      does the same to work out mongod's order; both read from the code,
+      the nothing-written measured). The work is to read the
+      index a page at a time into the write, and to choose the contested
+      plan by mongod's trial period rather than a whole read; a geo plan
+      is the same shape, not yet probed.
       Backlog-ID: RM-390
-      Verify: tests/backlog/test_rm_found_2026_10_27.py::test_an_update_many_of_a_clustered_collection_out_of_time_keeps_its_updates
+      Verify: tests/backlog/test_rm_found_2026_11_10_rm390.py::test_a_write_of_many_out_of_time_keeps_what_it_wrote_whatever_its_plan
 - [ ] **A batched deleteMany tests each document's filter once, where
       mongod tests it twice.** mongod's batched multi-delete
       (`batchUserMultiDeletes`, on by default) tests a document when it
