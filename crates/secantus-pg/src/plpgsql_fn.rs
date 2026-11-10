@@ -239,6 +239,11 @@ pub trait Host {
         let _ = name;
         Err(PlError::unsupported("CLOSE"))
     }
+    /// Whether the session has a portal named `name` (`SPI_cursor_find`).
+    fn cursor_exists(&self, name: &str) -> bool {
+        let _ = name;
+        false
+    }
 }
 
 /// A record value: its columns (name, type) and their values, or NULL.
@@ -1094,8 +1099,11 @@ pub fn run(create_sql: &str, inv: Invocation<'_>, host: &dyn Host) -> Result<Out
                 ds.iter()
                     .enumerate()
                     .filter_map(|(i, d)| {
-                        let e = d.get("PLpgSQL_var")?.get("default_val")?;
-                        Some((i, e.clone()))
+                        let v = d.get("PLpgSQL_var")?;
+                        match v.get("default_val") {
+                            Some(e) => Some((i, e.clone())),
+                            None => open_cursor::cursor_name_default(v).map(|e| (i, e)),
+                        }
                     })
                     .collect()
             })
@@ -2940,6 +2948,7 @@ impl Interp<'_> {
             }
             "PLpgSQL_stmt_raise" => self.raise(body),
             "PLpgSQL_stmt_open" => self.open_cursor(body),
+            "PLpgSQL_stmt_forc" => self.for_cursor(body, label.as_deref()),
             "PLpgSQL_stmt_fetch" => self.fetch_cursor(body),
             "PLpgSQL_stmt_close" => self.close_cursor(body),
             "PLpgSQL_stmt_perform" => {

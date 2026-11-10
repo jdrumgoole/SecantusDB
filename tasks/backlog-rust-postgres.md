@@ -3505,18 +3505,20 @@ and `create domain di811 as int`.
 Measured on a private PostgreSQL 15.19 cluster with the `_SETUP` in
 `tests/backlog/test_rp_found_rp809.py`: `t809(a int, v varchar(3))`.
 
-- [ ] **A FOR loop over a bound cursor is refused.** `declare t int := 0; c
-      cursor (k int) for select a from t809 where a >= k; begin for x in
-      c(1) loop t := t + x.a; end loop;` sums 3 on PostgreSQL 15.19
-      (`exec_stmt_forc`: the cursor is opened with its arguments, the loop
-      variable is a record of the cursor's row, and the portal is closed
-      when the loop ends), and `for x in c loop` over a cursor with no
-      arguments works alike. Here each is 0A000 `the statement forc in a
-      PL/pgSQL function is not supported yet`. Since RP-809 an OPEN binds
-      the arguments (`open_cursor::cursor_arguments`), which a FOR can
-      reuse.
-      Verify: tests/backlog/test_rp_found_rp809.py::test_for_over_a_bound_cursor
-      Backlog-ID: RP-817
+- [ ] **A cursor FOR loop's portal is not pinned.** Found while working
+      RP-817. `exec_for_query` pins the portal it walks (`PinPortal`), so on
+      PostgreSQL 15.19 a `CLOSE c` inside `for x in c loop`, by PL/pgSQL or
+      by `execute 'close c'`, and an `execute 'close all'`, are 24000
+      `cannot drop pinned portal "c"`; and a COMMIT or ROLLBACK in a
+      procedure's loop holds the pinned portal (`HoldPinnedPortals`, from
+      `_SPI_commit` / `_SPI_rollback`), so the loop goes on (`12`). Here the
+      CLOSE drops it and the transaction end closes it, and the next row's
+      fetch is 34000 `cursor "c" does not exist`. The faithful fix is a
+      pinned flag on the session's cursor (`CursorState`) that the loop
+      sets and clears, refused by CLOSE and CLOSE ALL and kept (made held)
+      at transaction end.
+      Verify: tests/backlog/test_rp_found_rp809.py::test_a_cursor_loops_portal_is_pinned
+      Backlog-ID: RP-823
 
 ## Found while working RP-818 (2026-11-10)
 
