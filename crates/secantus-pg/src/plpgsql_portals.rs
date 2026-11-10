@@ -154,6 +154,8 @@ impl PgHandler {
                 failed: false,
                 current_of,
                 held: false,
+                pinned: false,
+                auto_held: false,
             },
         );
         Ok(name)

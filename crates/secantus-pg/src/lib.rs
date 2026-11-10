@@ -2303,6 +2303,10 @@ impl plpgsql_fn::Host for PlHost<'_> {
             .contains_key(name)
     }
 
+    fn pin_cursor(&self, name: &str, pinned: bool) {
+        self.h.pin_cursor(name, pinned);
+    }
+
     fn query(
         &self,
         sql: &str,
@@ -2498,6 +2502,9 @@ impl plpgsql_fn::Host for PlHost<'_> {
                 "invalid transaction termination",
             ));
         }
+        // `_SPI_commit` / `_SPI_rollback`: a FOR loop's pinned cursor is
+        // held first, so the loop reads on in the next transaction.
+        self.h.hold_pinned_cursors();
         self.h
             .restart_transaction(commit, chain)
             .map_err(|e| pl_error(&e))
@@ -4745,6 +4752,15 @@ struct CursorState {
     /// A WITH HOLD cursor whose transaction has ended: its rows are kept,
     /// but `WHERE CURRENT OF` refuses it.
     held: bool,
+    /// A PL/pgSQL FOR loop is walking it (`PinPortal` in `exec_for_query`):
+    /// a CLOSE of it, or a CLOSE ALL, is 24000 `cannot drop pinned portal`
+    /// (`PortalDrop`), and a COMMIT or ROLLBACK in a procedure holds it
+    /// rather than closing it (`HoldPinnedPortals`, RP-823).
+    pinned: bool,
+    /// Held by a COMMIT or ROLLBACK while pinned (`autoHeld`): it lives on
+    /// across every later transaction end until the loop closes it, as
+    /// `AtCommit_Portals` and `AtAbort_Portals` pass an auto-held portal by.
+    auto_held: bool,
 }
 
 /// What `WHERE CURRENT OF` needs of a cursor (RP-072): the one table it
@@ -32385,15 +32401,36 @@ impl PgHandler {
     /// holdable included. After this a `FETCH` of a closed cursor answers
     /// `34000 cursor does not exist`, which is what a client's `ServerCursor`
     /// checks for after `conn.commit()`.
+    ///
+    /// A cursor a procedure's COMMIT or ROLLBACK held while a FOR loop
+    /// walked it (`hold_pinned_cursors`) survives either end, as
+    /// `AtCommit_Portals` and `AtAbort_Portals` pass an auto-held portal by.
     fn close_cursors_on_txn_end(&self, keep_holdable: bool) {
         let mut cursors = self.cursors.lock().unwrap_or_else(|e| e.into_inner());
-        if keep_holdable {
-            cursors.retain(|_, c| c.is_holdable);
-            for c in cursors.values_mut() {
-                c.held = true;
-            }
-        } else {
-            cursors.clear();
+        cursors.retain(|_, c| c.auto_held || (keep_holdable && c.is_holdable));
+        for c in cursors.values_mut() {
+            c.held = true;
+        }
+    }
+
+    /// `HoldPinnedPortals`, run by a procedure's COMMIT or ROLLBACK
+    /// (`_SPI_commit` / `_SPI_rollback`) before the transaction ends: every
+    /// cursor a FOR loop has pinned is held, so the loop goes on reading it
+    /// in the next transaction. Its rows are already materialised (a
+    /// PL/pgSQL portal is, `register_portal`), which is what `HoldPortal`
+    /// makes of the rest of a portal's rows.
+    pub(crate) fn hold_pinned_cursors(&self) {
+        let mut cursors = self.cursors.lock().unwrap_or_else(|e| e.into_inner());
+        for c in cursors.values_mut().filter(|c| c.pinned) {
+            c.auto_held = true;
+        }
+    }
+
+    /// Pin or unpin the cursor `name` (`PinPortal` / `UnpinPortal`).
+    pub(crate) fn pin_cursor(&self, name: &str, pinned: bool) {
+        let mut cursors = self.cursors.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(c) = cursors.get_mut(name) {
+            c.pinned = pinned;
         }
     }
 
@@ -33716,6 +33753,8 @@ impl PgHandler {
                         // Declared outside a block, its transaction is
                         // already over.
                         held: holdable && !in_block,
+                        pinned: false,
+                        auto_held: false,
                     },
                 );
             if holdable {
@@ -45068,6 +45107,30 @@ impl PgHandler {
 
             Statement::CloseCursor(name) => {
                 let mut cursors = self.cursors.lock().unwrap_or_else(|e| e.into_inner());
+                // `PortalDrop` refuses a portal a PL/pgSQL FOR loop has
+                // pinned, and CLOSE ALL (`PortalHashTableDeleteAll`) drops
+                // each portal through it, so one pinned portal fails it.
+                // PostgreSQL walks its hash table, dropping the portals it
+                // meets before the pinned one; the error aborts the
+                // transaction, which drops them all the same.
+                let pinned = if name.is_empty() {
+                    cursors
+                        .iter()
+                        .filter(|(_, c)| c.pinned)
+                        .min_by_key(|(_, c)| c.born)
+                        .map(|(n, _)| n.clone())
+                } else {
+                    cursors
+                        .get(&name)
+                        .filter(|c| c.pinned)
+                        .map(|_| name.clone())
+                };
+                if let Some(pinned) = pinned {
+                    return Err(Self::user_error(
+                        "24000", // invalid_cursor_state
+                        format!("cannot drop pinned portal \"{pinned}\""),
+                    ));
+                }
                 if !name.is_empty() && cursors.remove(&name).is_none() {
                     return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
                         "ERROR".into(),

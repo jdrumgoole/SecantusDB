@@ -1188,6 +1188,8 @@ impl PgHandler {
             }),
             base: 0,
             failed: false,
+            pinned: false,
+            auto_held: false,
         }))
     }
 
