@@ -74,7 +74,7 @@ pub fn set_window_fields_stage(
     vars: &Document,
 ) -> R<Vec<Document>> {
     let mut out = Vec::with_capacity(docs.len());
-    set_window_fields_each(spec, docs, vars, None, &mut |d| {
+    set_window_fields_each(spec, docs, vars, None, None, &mut |d| {
         out.push(d);
         Ok(())
     })?;
@@ -96,14 +96,19 @@ pub fn set_window_fields_stage(
 /// partition is counted -- one with an `"unbounded"` upper bound, or none --
 /// which holds the whole partition; a bounded window holds less, and is not
 /// refused here.
+///
+/// `reads`: when given, how many of `docs` mongod's partition iterator has
+/// read, in the order the stage takes them, once it has answered each
+/// output (RM-326).
 pub(crate) fn set_window_fields_each(
     spec: &Bson,
     docs: Vec<Document>,
     vars: &Document,
     downstream: Option<&std::collections::BTreeSet<String>>,
+    reads: Option<&mut Vec<usize>>,
     sink: &mut dyn FnMut(Document) -> R<()>,
 ) -> R<()> {
-    window_fields_each(spec, docs, vars, downstream, false, sink)
+    window_fields_each(spec, docs, vars, downstream, false, reads, sink)
 }
 
 /// The refusal `$setWindowFields` (or, with `presorted`,
@@ -123,6 +128,7 @@ pub fn set_window_fields_spec_refusal(spec: &Bson, presorted: bool) -> Option<Fa
         &Document::new(),
         None,
         presorted,
+        None,
         &mut |_| Ok(()),
     ) {
         Err(f) if f.is_bare() => Some(f),
@@ -141,9 +147,10 @@ pub(crate) fn internal_set_window_fields_each(
     docs: Vec<Document>,
     vars: &Document,
     downstream: Option<&std::collections::BTreeSet<String>>,
+    reads: Option<&mut Vec<usize>>,
     sink: &mut dyn FnMut(Document) -> R<()>,
 ) -> R<()> {
-    window_fields_each(spec, docs, vars, downstream, true, sink)
+    window_fields_each(spec, docs, vars, downstream, true, reads, sink)
 }
 
 fn window_fields_each(
@@ -152,6 +159,7 @@ fn window_fields_each(
     vars: &Document,
     downstream: Option<&std::collections::BTreeSet<String>>,
     presorted: bool,
+    mut reads: Option<&mut Vec<usize>>,
     sink: &mut dyn FnMut(Document) -> R<()>,
 ) -> R<()> {
     let spec = spec.as_document().ok_or(Fallback::Defer)?;
@@ -431,6 +439,9 @@ fn window_fields_each(
         functions: vec![0; compiled.len()],
         total: 0,
     };
+    // The documents of the partitions before this one, and the most the
+    // partition iterator has read so far (RM-326).
+    let (mut base, mut read) = (0usize, 0usize);
     for (pi, slots) in ordered.iter().enumerate() {
         let token = match partition_by {
             Some(by) => {
@@ -560,6 +571,23 @@ fn window_fields_each(
         // computed once, not once per document.
         let mut last_window: Vec<Option<(i64, i64, Bson)>> = vec![None; compiled.len()];
         for (pos, &orig_i) in slots.iter().enumerate() {
+            if let Some(reads) = reads.as_deref_mut() {
+                // mongod's iterator reads what each function's window asks
+                // for, the next partition's first document when one runs
+                // off the end, and, as it advances past the document it
+                // answered, the next one (measured 8.2.11, 2026-11-10: a
+                // running total read 33 for a batch of 32, a `[-1, 2]`
+                // window 33 for 31, a partition's total its partition and
+                // one more).
+                let mut asked = pos as i64 + 1;
+                for c in &compiled {
+                    let (_, hi) = reach(c, pos, n, range_vals.as_deref(), range_dates.as_deref())?;
+                    asked = asked.max(hi);
+                }
+                let asked = usize::try_from(asked).unwrap_or(0).min(n);
+                read = read.max(base + asked + 1);
+                reads.push(read);
+            }
             let mut out_doc = docs[orig_i].clone();
             for (ci, c) in compiled.iter().enumerate() {
                 let value = if RANK_FUNCS.contains(&c.op) {
@@ -633,6 +661,7 @@ fn window_fields_each(
             }
             sink(out_doc)?;
         }
+        base += n;
     }
     let wide = |n: usize| i64::try_from(n).unwrap_or(i64::MAX);
     crate::memlimit::record_window(|| crate::memlimit::WindowStats {
@@ -2577,6 +2606,7 @@ mod budget_tests {
             docs(),
             &Document::new(),
             Some(&downstream),
+            None,
             &mut |_| Ok(()),
         )
     }
@@ -2604,6 +2634,36 @@ mod budget_tests {
         Bson::Document(spec)
     }
 
+    /// What mongod 8.2.11's partition iterator has read once it answers
+    /// each output (2026-11-10, RM-326): one ahead of a rank or running
+    /// total, the window's upper end, and a partition's total its whole
+    /// partition and the next one's first document.
+    #[test]
+    fn a_window_reads_what_its_iterator_asks_for() {
+        let docs: Vec<Document> = (0..7)
+            .map(|i| doc! {"_id": i, "k": i / 3, "n": i})
+            .collect();
+        let reads = |output: Bson, partitioned: bool| {
+            let mut reads = Vec::new();
+            set_window_fields_each(
+                &window(output, partitioned),
+                docs.clone(),
+                &Document::new(),
+                None,
+                Some(&mut reads),
+                &mut |_| Ok(()),
+            )
+            .unwrap();
+            reads
+        };
+        assert_eq!(reads(bson!({"$rank": {}}), false), [2, 3, 4, 5, 6, 7, 8]);
+        let ahead = bson!({"$sum": "$n", "window": {"documents": [-1, 2]}});
+        assert_eq!(reads(ahead, false), [3, 4, 5, 6, 7, 8, 8]);
+        assert_eq!(reads(bson!({"$sum": "$n"}), false), [8; 7]);
+        assert_eq!(reads(bson!({"$sum": "$n"}), true), [4, 4, 4, 7, 7, 7, 8]);
+        assert_eq!(reads(bson!({"$rank": {}}), true), [2, 3, 4, 5, 6, 7, 8]);
+    }
+
     /// `$_internalSetWindowFields` takes its input as it comes: a partition
     /// is a run of one key (mongod 8.2.1, 2026-11-08, RM-328).
     #[test]
@@ -2619,7 +2679,7 @@ mod budget_tests {
             "output": {"t": {"$sum": "$n"}},
         });
         let mut out = Vec::new();
-        internal_set_window_fields_each(&spec, docs, &Document::new(), None, &mut |d| {
+        internal_set_window_fields_each(&spec, docs, &Document::new(), None, None, &mut |d| {
             out.push(d);
             Ok(())
         })
@@ -2638,7 +2698,7 @@ mod budget_tests {
     fn a_window_reports_its_memory_at_its_peak() {
         let spec = window(bson!({"$first": "$n"}), false);
         let (_, report) = memlimit::captured(|| {
-            set_window_fields_each(&spec, docs(), &Document::new(), None, &mut |_| Ok(()))
+            set_window_fields_each(&spec, docs(), &Document::new(), None, None, &mut |_| Ok(()))
         });
         let total: usize = docs().iter().map(memlimit::document_size).sum();
         let stats = &report.windows[0];
@@ -2650,7 +2710,7 @@ mod budget_tests {
                 window_fields: 10_000,
                 ..Default::default()
             });
-            set_window_fields_each(&spec, docs(), &Document::new(), None, &mut |_| Ok(()))
+            set_window_fields_each(&spec, docs(), &Document::new(), None, None, &mut |_| Ok(()))
         });
         let stats = &report.windows[0];
         assert!(stats.spills > 0);

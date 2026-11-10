@@ -1196,22 +1196,6 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       cannot reach today.
       Backlog-ID: RM-325
       Verify: tests/backlog/test_rm_found_2026_10_26.py::test_spill_storage_size
-- [ ] **A sort under a cursor stage is counted once behind stages whose
-      reads depend on the documents.** mongod 8.2.11's cursor stage adds
-      its executor's sort counts to its own at every buffer it loads
-      (`DocumentSourceCursor::loadBatch`), so a query-layer sort that
-      spilled is profiled once per load: this server counts the loads where
-      the stages after the cursor stage read a number of documents known
-      from the batch (one-for-one stages, `$skip`, `$limit`, a stage that
-      reads everything, a window that reaches its end). Behind an
-      `$unwind`, a `$match` that does not read to the end, a `$rank` or a
-      bounded window, or a partitioned `$setWindowFields`, what they read
-      for the first batch depends on the documents, and the sort is counted
-      once: `sortSpills: 13` where mongod says 39 (an `$unwind` of strings,
-      a `$rank`), or 42 (a partitioned window). Following those needs what
-      each stage read of its input, which the eager pipeline does not keep.
-      Backlog-ID: RM-326
-      Verify: tests/backlog/test_rm_326_sort_counts.py::test_sort_counts_per_load_through_stages_that_filter
 - [ ] **A `getMore` reports none of its cursor's sort counts, and the
       sort counters count each sort once.** mongod 8.2.11 profiles every
       `getMore` of a cursor whose plan sorted with the sort's counts so far

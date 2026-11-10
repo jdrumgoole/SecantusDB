@@ -411,10 +411,32 @@ pub struct CursorRead {
     pub at: usize,
     /// The query layer took a `$limit` after the sort.
     pub limited: bool,
+    /// For each stage from `at` on whose reads depend on its documents (a
+    /// `$match`, an `$unwind`, a `$setWindowFields`), keyed by its place
+    /// after `at`: how many documents of its input it had read when it gave
+    /// each of its outputs -- one past its input when it looked for the
+    /// end. mongod pulls a document at a time through them, so these are
+    /// what the cursor stage must load for a batch (RM-326).
+    pub reads: std::collections::BTreeMap<usize, Vec<usize>>,
 }
 
 pub(crate) fn note_cursor_read(read: CursorRead) {
     CURSOR_READ.with(|c| *c.borrow_mut() = Some(read));
+}
+
+/// Whether the stage at `index` of the pipeline running reads documents a
+/// query-layer sort that spilled hands on, so its reads are kept (RM-326).
+pub(crate) fn tracks_reads(index: usize) -> bool {
+    CURSOR_READ.with(|c| c.borrow().as_ref().is_some_and(|read| index >= read.at))
+}
+
+/// Keep what the stage at `index` read for each of its outputs.
+pub(crate) fn note_stage_reads(index: usize, reads: Vec<usize>) {
+    CURSOR_READ.with(|c| {
+        if let Some(read) = c.borrow_mut().as_mut().filter(|read| index >= read.at) {
+            read.reads.insert(index - read.at, reads);
+        }
+    });
 }
 
 /// The query-layer sort of the pipeline just run, when it spilled.
