@@ -77,9 +77,18 @@ def test_a_numeric_constant_selected_from_a_from_item_is_inserted(dsn: str) -> N
     `numeric`. Here each is 42804 `column "x" is of type numeric but
     expression is of type text`, though `insert into t692e select 1.0, 1`
     (no FROM) is inserted."""
+    inserts = [
+        "insert into t692e select 1.0, g from generate_series(1, 2) g",
+        "insert into t692e select 1.0, g from (values (3)) v(g)",
+        "insert into t692e (x) select 1.5 from t692j",
+    ]
+    errors: list[tuple[str, str | None]] = []
     with _connect(dsn) as c:
-        c.execute("insert into t692e select 1.0, g from generate_series(1, 2) g")
-        c.execute("insert into t692e select 1.0, g from (values (3)) v(g)")
-        c.execute("insert into t692e (x) select 1.5 from t692j")
+        for q in inserts:
+            try:
+                c.execute(q)
+            except psycopg.Error as e:
+                errors.append((q, e.sqlstate))
         got = _text(c, "select x, k from t692e order by k, x")
+    assert errors == []
     assert got == [("1.0", "1"), ("1.0", "2"), ("1.0", "3"), ("1.5", None)]

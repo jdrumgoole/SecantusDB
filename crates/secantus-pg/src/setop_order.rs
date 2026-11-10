@@ -409,8 +409,7 @@ fn hash_choose_num_partitions(groups: f64, entry: f64, hash_mem: f64) -> f64 {
     let wanted = HASHAGG_PARTITION_FACTOR * groups * entry;
     let dpartitions = (1.0 + wanted / hash_mem)
         .min(partition_limit)
-        .max(HASHAGG_MIN_PARTITIONS)
-        .min(HASHAGG_MAX_PARTITIONS);
+        .clamp(HASHAGG_MIN_PARTITIONS, HASHAGG_MAX_PARTITIONS);
     // `my_log2`: ceil(log2(n)) of the truncated count.
     let n = dpartitions.trunc() as u64;
     let bits = if n <= 1 {
