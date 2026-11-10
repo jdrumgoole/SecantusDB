@@ -197,8 +197,15 @@ git push origin HEAD:<branch>   # fast-forward only, never --force
   (`--fast`) only when the rebase had a conflict or the commits it brought
   in touch a file yours touches:
   `git diff --name-only <old base> origin/<branch>` against
-  `git show --name-only --format= HEAD`. Otherwise push: the batch PR's CI
-  checks the commits together. A rejected push means the same: fetch,
+  `git show --name-only --format= HEAD`. **Code in the same directory as
+  yours, though no file is shared, reruns the behaviour checks only**:
+  `scripts/gate_rm.py --only binary-build,server-build,backlog,mongod-live`
+  (about 12 min; the PG gate's equivalent steps for an RP item). Two items
+  in one module can each pass alone and break together: RM-215 (query
+  stats, `explain/order.rs`) rebased onto RM-414 (`explain/mod.rs`,
+  `hoist.rs`) shared no file, skipped the gate, and broke RM-414's
+  regression test on snapshot #2652, which cost a revert (2026-11-10).
+  Otherwise push: the batch PR's CI checks the commits together. A rejected push means the same: fetch,
   rebase, the same overlap test, push again. (A session gated three times
   for other lanes' unrelated commits, 150 min, on 2026-11-06.)
 - **Prose does not count as overlap.** Every item edits
