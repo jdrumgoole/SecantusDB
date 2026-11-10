@@ -104,6 +104,10 @@ pub(crate) fn leftmost(n: &pg_query::protobuf::Node) -> i32 {
         Some(N::BoolExpr(b)) => b.args.first().map_or(b.location, leftmost),
         Some(N::TypeCast(tc)) => tc.arg.as_deref().map_or(tc.location, leftmost),
         Some(N::FuncCall(f)) => f.location,
+        // Led by their keyword, which is where `exprLocation` puts them.
+        Some(N::CoalesceExpr(c)) => c.location,
+        Some(N::MinMaxExpr(m)) => m.location,
+        Some(N::CaseExpr(c)) => c.location,
         Some(N::ColumnRef(c)) => c.location,
         Some(N::AConst(c)) => c.location,
         _ => -1,

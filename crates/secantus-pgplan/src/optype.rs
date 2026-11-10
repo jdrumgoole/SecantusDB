@@ -1871,6 +1871,14 @@ fn walk(n: &pg_query::protobuf::Node, scope: &Scope, cx: &Cx) -> Result<()> {
                 walk(a, scope, cx)?;
             }
         }
+        // `transformBooleanTest` transforms its argument, then coerces it
+        // with `coerce_to_boolean` under the test's own name (RP-808).
+        N::BooleanTest(t) => {
+            if let Some(a) = t.arg.as_deref() {
+                walk(a, scope, cx)?;
+                boolean_test_argument(t, a, scope)?;
+            }
+        }
         // A cast to or from `"char"` with no path is refused when the
         // statement is analysed, whatever the rows (`i2::"char"` over an
         // empty table too). The call form `int2(x)` is a function call on
@@ -3210,6 +3218,46 @@ fn bool_argument(
             _ => "NOT",
         },
         display_type(&t)
+    )))
+}
+
+/// `x IS [NOT] TRUE / FALSE / UNKNOWN`: `transformBooleanTest` coerces `x`
+/// to boolean naming the test, so a typed operand of another built-in type
+/// is 42804 at the operand (`select 1 is true`). Lowered as it stood, the
+/// test was `coalesce(x, false)` over a number and answered `false`, and
+/// `IS UNKNOWN` was `IS NULL`, true for any NULL. An untyped literal is
+/// `boolin`'s input (`'a' is true` is 22P02).
+fn boolean_test_argument(
+    t: &pg_query::protobuf::BooleanTest,
+    arg: &pg_query::protobuf::Node,
+    scope: &Scope,
+) -> Result<()> {
+    use pg_query::protobuf::BoolTestType as B;
+    unknown_as_boolean(arg, scope)?;
+    let Some(ty) = operand_type(arg, scope) else {
+        return Ok(());
+    };
+    if matches!(ty.as_str(), "bool" | "boolean") || category(&ty).is_none() {
+        return Ok(());
+    }
+    let test = match B::try_from(t.booltesttype) {
+        Ok(B::IsTrue) => "IS TRUE",
+        Ok(B::IsNotTrue) => "IS NOT TRUE",
+        Ok(B::IsFalse) => "IS FALSE",
+        Ok(B::IsNotFalse) => "IS NOT FALSE",
+        Ok(B::IsUnknown) => "IS UNKNOWN",
+        Ok(B::IsNotUnknown) => "IS NOT UNKNOWN",
+        _ => return Ok(()),
+    };
+    // `coerce_to_boolean` reports at `exprLocation`: an operator
+    // expression's leftmost token (`(s || 'y') is true` at the `s`).
+    let loc = crate::srf_place::leftmost(arg);
+    if let Some(loc) = (loc >= 0).then_some(loc).or_else(|| expr_location(arg)) {
+        set_error_location(loc);
+    }
+    Err(Error::DatatypeMismatch(format!(
+        "argument of {test} must be type boolean, not type {}",
+        display_type(&ty)
     )))
 }
 
