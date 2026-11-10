@@ -39071,25 +39071,62 @@ impl PgHandler {
                         i = j;
                     }
                 } else {
-                    let mut pool = distinct_set::IdentCounts::new();
-                    for r in &second {
-                        pool.add(ident(r));
-                    }
+                    // `setop_fill_hash_table`: the first input's rows make
+                    // the groups, each keeping its first row, and count;
+                    // the second input's only count the groups they find.
                     let mut groups = distinct_set::IdentIndex::new();
                     let mut firsts: Vec<Vec<Option<Bson>>> = Vec::new();
-                    for row in first {
-                        let k = ident(&row);
-                        let group = match groups.find_or_add(k.clone()) {
-                            Ok(g) => g,
-                            Err(g) => {
+                    let mut counts: Vec<(usize, usize)> = Vec::new();
+                    let mut last_new = 0usize;
+                    let n_first = first.len();
+                    for (at, row) in first.into_iter().enumerate() {
+                        match groups.find_or_add(ident(&row)) {
+                            Ok(g) => counts[g].0 += 1,
+                            Err(_) => {
                                 firsts.push(row);
-                                g
+                                counts.push((1, 0));
+                                last_new = at;
                             }
+                        }
+                    }
+                    for row in &second {
+                        if let Some(g) = groups.find(&ident(row)) {
+                            counts[g].1 += 1;
+                        }
+                    }
+                    // `setop_retrieve_hash_table`: the groups in the hash
+                    // table's order. Every first-input row inserts
+                    // (`LookupTupleHashEntry` with `isnew`), so one after the
+                    // last group's first can grow the table.
+                    let types: Option<Vec<String>> = schema
+                        .iter()
+                        .map(|f| Self::planner_type_name(f.datatype()))
+                        .collect();
+                    let order = plan
+                        .nbuckets
+                        .zip(types)
+                        .and_then(|(nbuckets, types)| {
+                            secantus_pgplan::hashagg::hash_agg_order(
+                                &firsts,
+                                &types,
+                                nbuckets,
+                                last_new + 1 < n_first,
+                            )
+                        })
+                        .unwrap_or_else(|| (0..firsts.len()).collect());
+                    // `set_output_count`: an INTERSECT's group is output
+                    // as often as both inputs hold it (once without ALL),
+                    // an EXCEPT's as often as the first holds it more.
+                    for g in order {
+                        let (n_first, n_second) = counts[g];
+                        let n = match (intersect, set.all) {
+                            (true, true) => n_first.min(n_second),
+                            (true, false) => usize::from(n_second > 0),
+                            (false, true) => n_first.saturating_sub(n_second),
+                            (false, false) => usize::from(n_second == 0),
                         };
-                        // ALL pairs each of the second input's rows with one
-                        // of the first's.
-                        if pool.take(&k, set.all) == intersect {
-                            out.push(firsts[group].clone());
+                        for _ in 0..n {
+                            out.push(firsts[g].clone());
                         }
                     }
                 }

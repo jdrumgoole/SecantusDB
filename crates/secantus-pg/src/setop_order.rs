@@ -19,6 +19,12 @@
 //! group's row is the one PostgreSQL's quicksort leaves first among its
 //! ties (`tuplesort`), and the groups come out in that order.
 //!
+//! A HashSetOp returns its groups in its hash table's order
+//! (`setop_retrieve_hash_table`), each group's rows together: the table is
+//! the one a HashAggregate builds (`hashagg::hash_agg_order`), started at
+//! the plan's group estimate, which only the first input's rows insert
+//! into -- the second input's look a group up and add none (RP-842).
+//!
 //! The estimates are PostgreSQL's: a leaf's groups are `estimate_num_groups`
 //! over its select list on its own row estimate, and a nested set
 //! operation's are its rows. An input this server does not estimate -- a
@@ -68,6 +74,11 @@ pub(crate) struct SetOpPlan {
     /// The SetOp sorts the Append's rows on the columns and walks the
     /// groups in that order; otherwise it hashes the first input's.
     pub(crate) sorted: bool,
+    /// The buckets a HashSetOp's table starts with: the plan's `numGroups`,
+    /// truncated to a `long` (`create_setop_plan`), and no more than hash
+    /// memory holds of `TupleHashEntryData` (`BuildTupleHashTableExt`).
+    /// `None` when the inputs are not estimated.
+    pub(crate) nbuckets: Option<u64>,
 }
 
 impl PgHandler {
@@ -83,6 +94,7 @@ impl PgHandler {
         let written = SetOpPlan {
             right_first: false,
             sorted: false,
+            nbuckets: None,
         };
         let (Some(left), Some(right)) = (
             self.setop_input_estimate(&set.left),
@@ -111,9 +123,14 @@ impl PgHandler {
         let hashed = self
             .chooses_hashed_setop(schema, left.rows + right.rows, groups, output, set)
             .unwrap_or(true);
+        let hash_mem = self.hash_mem_limit(self.kb_setting("work_mem", 4096));
+        let nbuckets = (groups as u64)
+            .min((hash_mem / TUPLE_HASH_ENTRY) as u64)
+            .max(1);
         SetOpPlan {
             right_first,
             sorted: !hashed,
+            nbuckets: Some(nbuckets),
         }
     }
 
