@@ -17043,7 +17043,9 @@ fn plan_series_select(
                 } else {
                     rt.name.clone()
                 };
-                let result_type = const_col_type(&value).to_string();
+                // Typed by its node, as PostgreSQL types a literal: `1.5` is
+                // `numeric`, which its decoded value alone does not say (RP-843).
+                let result_type = static_type(val, &value);
                 columns.push((out.clone(), out));
                 casts.push(Some(ColumnExpr::Const { value, result_type }));
             }
@@ -19136,7 +19138,9 @@ fn plan_table_targets(
                 } else {
                     rt.name.clone()
                 };
-                let result_type = const_col_type(&value).to_string();
+                // Typed by its node, as PostgreSQL types a literal: `1.5` is
+                // `numeric`, which its decoded value alone does not say (RP-843).
+                let result_type = static_type(val, &value);
                 columns.push((out.clone(), out));
                 casts.push(Some(ColumnExpr::Const { value, result_type }));
             }
@@ -37070,17 +37074,6 @@ pub fn column_expr_type(expr: &ColumnExpr) -> &str {
         ColumnExpr::Coalesce { .. } => "text",
         ColumnExpr::Const { result_type, .. } => result_type,
         ColumnExpr::Row { result_type, .. } => result_type,
-    }
-}
-
-/// The PostgreSQL type name a literal select-list constant reports.
-fn const_col_type(v: &Bson) -> &'static str {
-    match v {
-        Bson::Boolean(_) => "bool",
-        Bson::Int32(_) => "int4",
-        Bson::Int64(_) => "int8",
-        Bson::Double(_) => "float8",
-        _ => "text",
     }
 }
 

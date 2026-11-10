@@ -355,6 +355,26 @@ one beside it.
 
 ## 5. Known bugs and edge cases to watch
 
+- [ ] **NOT REPRODUCED -- left open as a watch item. SERIALIZABLE
+  raised a false 40001 once in the GIN isolation spec (2026-11-10).**
+  `tests/backlog/test_rp_isolation.py::test_ssi_index_access_methods[predicate-gin]`
+  (RP-254's regression test) failed in a local `gate_pg.sh --fast` backlog
+  step, under a load average of about 14 on 12 cores. In permutation
+  `ra1 ro2 wo1 c1 wb2 c2`, `wb2` (`insert into gin_tbl values (array[2])`)
+  was 40001 `could not serialize access due to read/write dependencies
+  among transactions`, `Canceled on identification as a pivot, during
+  write`. PostgreSQL 15.19 inserts and commits there: `ra1`'s `p @>
+  array[1] limit 1` holds SIREAD locks only on key 1's GIN pages, so `wb2`
+  makes no conflict. Here `ra1`'s read overlapped `wb2`'s write, which
+  points at the read locking more GIN pages than PostgreSQL does, perhaps
+  rows read past the LIMIT. That was not measured. The batch's change at
+  the time, RP-843 (select-list literal typing), is not on any path this
+  spec runs, and the gate before the rebase passed it. On the same commit
+  it then passed 4 of 4 runs alone and 24 of 24 runs six at a time. On a
+  recurrence, record which GIN pages `ra1` locked (`pg_locks` of s1 before
+  `c1`) and how many rows its scan read.
+  Verify: none -- intermittent, not reproduced; RP-254's isolation test is the check
+  Backlog-ID: RP-848
 - [ ] **NOT REPRODUCED -- left open as a watch item. A `CREATE VIEW`
   went unanswered for 10 s once (2026-11-08).** `tests/backlog/test_rp_found_pgtest.py::test_view_columns_name_their_base_columns`
   (a regression test) failed in CI's `pg-oracle (backlog)` lane on
@@ -3608,16 +3628,6 @@ its first input gave.
       hashed.
       Verify: tests/backlog/test_rp_found_rp692.py::test_an_intersect_over_a_join_puts_the_smaller_input_first
       Backlog-ID: RP-841
-- [ ] **A numeric constant selected from a FROM item is refused by
-      INSERT.** `insert into t692e select 1.0, g from generate_series(1, 2)
-      g`, the same over `(values (3)) v(g)`, and `insert into t692e (x)
-      select 1.5 from t692j` insert their rows on PostgreSQL 15.19. Here
-      each is 42804 `column "x" is of type numeric but expression is of
-      type text`, though `insert into t692e select 1.0, 1`, with no FROM,
-      is inserted: the select list's constant over a FROM item is typed
-      `text`.
-      Verify: tests/backlog/test_rp_found_rp692.py::test_a_numeric_constant_selected_from_a_from_item_is_inserted
-      Backlog-ID: RP-843
 
 ## Found while working RP-703 (2026-11-10)
 

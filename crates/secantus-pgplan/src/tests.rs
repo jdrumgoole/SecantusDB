@@ -6898,3 +6898,35 @@ fn a_check_constraint_is_coerced_to_boolean() {
         assert!(!error_unpositioned(), "for {sql}");
     }
 }
+
+/// A literal in the select list of a query with a FROM item is typed by its
+/// node, as PostgreSQL types it: `1.5` is `numeric` and `B'101'` is `bit`,
+/// which their decoded values alone do not say. Both were `text`, so the
+/// client read a string and `insert into t (x) select 1.5 from t` was 42804
+/// (RP-843; measured on PostgreSQL 15.19, 2026-11-10).
+#[test]
+fn a_select_list_literal_over_a_from_item_is_typed_by_its_node() {
+    let const_types = |sql: &str| -> Vec<String> {
+        match plan_ok(sql) {
+            Statement::Select(s) => s
+                .casts
+                .iter()
+                .map(|c| match c {
+                    Some(ColumnExpr::Const { result_type, .. }) => result_type.clone(),
+                    other => panic!("{sql}: {other:?}"),
+                })
+                .collect(),
+            other => panic!("{sql}: {other:?}"),
+        }
+    };
+    let want = ["numeric", "numeric", "bit", "int4", "int8", "bool", "text"];
+    for from in ["t", "generate_series(1, 2) g"] {
+        assert_eq!(
+            const_types(&format!(
+                "select 1.5, 1e-3, B'101', 1, 15000000000, true, 'x' from {from}"
+            )),
+            want,
+            "from {from}"
+        );
+    }
+}

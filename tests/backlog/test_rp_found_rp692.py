@@ -93,14 +93,15 @@ def test_a_hashed_set_operation_outputs_each_group_together_in_hash_order(dsn: s
     assert [r[0] for r in grown] == ["g", "h", "a", "e", "d", "c", "b", "f"]
 
 
-@pytest.mark.backlog("RP-843")
+@pytest.mark.backlog_fixed("RP-843")
 def test_a_numeric_constant_selected_from_a_from_item_is_inserted(dsn: str) -> None:
     """`insert into t692e select 1.0, g from generate_series(1, 2) g`, the
     same over `(values (3)) v(g)`, and `insert into t692e (x) select 1.5
     from t692j` insert their rows on PostgreSQL 15.19: the constant is
-    `numeric`. Here each is 42804 `column "x" is of type numeric but
-    expression is of type text`, though `insert into t692e select 1.0, 1`
-    (no FROM) is inserted."""
+    `numeric`. Each was 42804 `column "x" is of type numeric but expression
+    is of type text` here, though `insert into t692e select 1.0, 1` (no
+    FROM) was inserted: a select-list constant over a FROM item was typed
+    by its decoded value, not its node."""
     inserts = [
         "insert into t692e select 1.0, g from generate_series(1, 2) g",
         "insert into t692e select 1.0, g from (values (3)) v(g)",
