@@ -556,7 +556,8 @@ fn command_shown(request: &Document) -> Document {
 /// that names none, and `db.$cmd` otherwise, as mongod has it (a
 /// `renameCollection`'s: [`line_target`]); an `update`
 /// or `delete` is `db.$cmd` too, its statements' lines
-/// naming the collection. `read` is [`read_attributes`]' part, whose `ns`,
+/// naming the collection, and a `dropDatabase` or `dbStats` is `db`. `read`
+/// is [`read_attributes`]' part, whose `ns`,
 /// when it has one, is where a read of a view failed. The whole
 /// in mongod's order (`opdebug::LINE_ORDER`).
 pub fn attributes(
@@ -570,6 +571,9 @@ pub fn attributes(
     let name = request.keys().next().map(String::as_str).unwrap_or("");
     let (db, coll) = line_target(name, request, reply, db);
     let ns = match coll {
+        // These run on the database itself: mongod's invocation names its
+        // namespace as the database alone (measured 8.2.11, RM-383).
+        _ if matches!(name, "dropDatabase" | "dbStats" | "dbstats") => db.to_string(),
         Some(_) if matches!(name, "update" | "delete") => format!("{db}.$cmd"),
         Some(coll) => format!("{db}.{coll}"),
         // A collectionless aggregate runs on its own namespace (measured
@@ -749,6 +753,27 @@ mod tests {
             Duration::ZERO,
         );
         assert_eq!(attr.get_str("ns"), Ok("a.$cmd.aggregate"));
+    }
+
+    /// A `dropDatabase` and a `dbStats` name the database alone, as mongod
+    /// 8.2.11's lines do (RM-383).
+    #[test]
+    fn a_database_command_names_the_database() {
+        for request in [
+            doc! {"dropDatabase": 1_i32, "$db": "a"},
+            doc! {"dbStats": 1_i32, "$db": "a"},
+            doc! {"dbstats": 1_i32, "$db": "a"},
+        ] {
+            let attr = attributes(
+                &request,
+                &doc! {"ok": 1.0},
+                Document::new(),
+                "a",
+                Duration::ZERO,
+                Duration::ZERO,
+            );
+            assert_eq!(attr.get_str("ns"), Ok("a"), "{request}");
+        }
     }
 
     /// An `explain` of a read names the collection it explains, and one of
