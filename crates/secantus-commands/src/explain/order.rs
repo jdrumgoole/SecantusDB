@@ -683,6 +683,7 @@ fn consult<'a>(
         whole: &whole,
         ranked: Default::default(),
         cache: Some(&hook),
+        cached_ran: Default::default(),
     };
     let _chosen = plan::plan(&query(Some(&trial)), &catalog);
     hook.read_only.set(true);
@@ -1079,6 +1080,9 @@ pub(crate) struct TrialBuffer {
     pub results: usize,
     /// The winner ran out in its trial: it reads nothing more.
     pub ended: bool,
+    /// The winner is the plan cache's active plan, run in place of the
+    /// trial under mongod's CACHED_PLAN stage, which hands the buffer out.
+    pub cached: bool,
 }
 
 /// [`stream_plan`] for a `find`, a contested plan included (RM-349): mongod
@@ -1222,6 +1226,7 @@ fn tried(
         whole: &whole,
         ranked: Default::default(),
         cache: hook.as_ref().map(|h| h as &dyn plan::CacheHook),
+        cached_ran: Default::default(),
     };
     let plan = plan::plan(
         &Query {
@@ -1240,10 +1245,12 @@ fn tried(
         Some(winner) => TrialBuffer {
             results: winner.stats.n_returned.max(0) as usize,
             ended: winner.stats.work.is_some_and(|w| w.eof),
+            cached: false,
         },
         None => TrialBuffer {
             results: plan::trial_need(query) as usize,
             ended: false,
+            cached: trial.cached_ran.get(),
         },
     };
     Ok(Some((plan, Some(buffer))))
@@ -1471,6 +1478,7 @@ pub(crate) fn ordered_rows(storage: &dyn Storage, ask: &Ask) -> Result<Option<Ro
             whole: &whole,
             ranked: Default::default(),
             cache: hook.as_ref().map(|h| h as &dyn plan::CacheHook),
+            cached_ran: Default::default(),
         };
         plan = plan::plan(&query(Some(&trial)), &catalog);
     }

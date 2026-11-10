@@ -223,6 +223,10 @@ pub(crate) struct Trial<'a> {
     /// writes after one (`super::plan_cache`). `explain` passes none: it
     /// neither reads nor writes the cache.
     pub cache: Option<&'a dyn CacheHook>,
+    /// The query's active cache entry ran in place of a trial and did no
+    /// worse than it allowed: mongod runs it under a CACHED_PLAN stage
+    /// (`CachedPlanStage`), which a replanned query's does not keep.
+    pub cached_ran: std::cell::Cell<bool>,
 }
 
 /// What the plan cache holds for a query, as the planner asks it.
@@ -1672,6 +1676,7 @@ fn tried(
                         != Some(false);
                 if fits {
                     trial.ranked.borrow_mut().clear();
+                    trial.cached_ran.set(!l.branch && !l.trusted);
                     cache.chose(l, sig.clone());
                     return Some(found.swap_remove(at).0);
                 }

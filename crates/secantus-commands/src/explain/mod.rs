@@ -637,6 +637,7 @@ fn plan_for(
         whole: &whole,
         ranked: Default::default(),
         cache: None,
+        cached_ran: Default::default(),
     };
     let q = Query {
         canonical,
@@ -847,6 +848,7 @@ fn distinct_group(
         whole: &whole,
         ranked: Default::default(),
         cache: None,
+        cached_ran: Default::default(),
     };
     distinct_group_with(s, collation, &t.catalog, Some(&trial), |asked| {
         plan_for(asked, canonical, collation, t, ctx, false)

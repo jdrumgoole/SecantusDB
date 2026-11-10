@@ -2025,6 +2025,28 @@ pub(crate) struct Stream {
     /// finds it at its end (measured 8.2.11: the FETCH over an IXSCAN works
     /// once more than the scan).
     ran_out: bool,
+    /// The plan is the plan cache's, run under mongod's CACHED_PLAN
+    /// ([`Stream::buffer_trial`]).
+    cached: Option<CachedRun>,
+}
+
+/// mongod's CACHED_PLAN over the plan its plan cache held (RM-458): it
+/// hands out its trial's results one per work before it works the plan
+/// again, and passes on every work after (`CachedPlanStage::doWork`).
+#[derive(Clone, Copy, Debug, Default)]
+struct CachedRun {
+    /// The trial's results past the plan's skip, and those still to hand out.
+    results: i64,
+    left: i64,
+    /// The plan's works and needTime when its trial stopped.
+    works: i64,
+    need_time: i64,
+    /// The result at the front of the stash was handed out already: the
+    /// executor holds it for the next batch, which it did not fit.
+    held: bool,
+    /// `find`'s executor worked the stage once more with the plan at its
+    /// end, which the stage answers without working the plan.
+    eof_work: bool,
 }
 
 /// The yields a run went through: a cursor's between its batches, a
@@ -2197,6 +2219,7 @@ impl Stream {
             failed: None,
             carried: (0, 0),
             ran_out: false,
+            cached: None,
         }))
     }
 
@@ -2244,6 +2267,7 @@ impl Stream {
             failed: None,
             carried: (0, 0),
             ran_out: false,
+            cached: None,
         }
     }
 
@@ -2290,6 +2314,7 @@ impl Stream {
             failed: None,
             carried: (0, 0),
             ran_out: false,
+            cached: None,
         }))
     }
 
@@ -2481,12 +2506,14 @@ impl Stream {
     /// batches that follow, which return them before they read on from
     /// where the trial stopped. A winner that `ended` in its trial read
     /// everything it returns. What the trial examined is counted by the
-    /// first batch.
+    /// first batch. `cached`: the plan, when it is the plan cache's, which
+    /// mongod runs under a CACHED_PLAN stage.
     pub(crate) fn buffer_trial(
         &mut self,
         storage: &dyn Storage,
         results: usize,
         ended: bool,
+        cached: Option<&Node>,
     ) -> Result<(), StorageError> {
         self.keys = 0;
         self.docs = 0;
@@ -2498,15 +2525,37 @@ impl Stream {
             (true, Some(limit)) => Some(limit.max(0) as usize + skip),
             (false, _) => Some(results + skip),
         };
+        let mut past = 0;
         if want != Some(0) {
             let found = self.read(storage, want.unwrap_or(0), None)?;
             // A LIMIT the trial filled is at its end from then on.
-            let past = found.len().saturating_sub(skip) as i64;
+            past = found.len().saturating_sub(skip) as i64;
             self.limit_reached |= self.limit.is_some_and(|limit| past >= limit);
             self.stashed.extend(found);
         }
         self.done |= ended;
         self.ran_out = ended && self.done;
+        if let Some(plan) = cached {
+            // The plan's SKIP ran in the trial: what it skipped is behind it.
+            let skipped = (self.skip.max(0) as usize).min(self.stashed.len());
+            self.stashed.drain(..skipped);
+            self.skip -= skipped as i64;
+            if let Some(at) = self.top(plan, Yields::default(), false, false) {
+                self.cached = Some(CachedRun {
+                    results: past,
+                    left: past,
+                    works: at.works,
+                    need_time: at.stats.work.map_or(0, |w| w.need_time),
+                    ..Default::default()
+                });
+                // The plan's trial ran to its end, or filled its LIMIT: it
+                // is never worked again (measured 8.2.11).
+                if at.eof {
+                    self.done = true;
+                    self.ran_out = true;
+                }
+            }
+        }
         self.carried = (self.keys, self.docs);
         Ok(())
     }
@@ -2591,10 +2640,16 @@ impl Stream {
                 if self.done {
                     // The work that finds the trial's winner at its end
                     // again: the topmost stage's own, which asks no input.
+                    // Under a CACHED_PLAN, the work is that stage's: it
+                    // finds the plan at its end without working it.
                     if self.first && std::mem::take(&mut self.ran_out) {
-                        let t = self.root.tally_mut();
-                        t.own += 1;
-                        t.eof_again += 1;
+                        if let Some(c) = &mut self.cached {
+                            c.eof_work = true;
+                        } else {
+                            let t = self.root.tally_mut();
+                            t.own += 1;
+                            t.eof_again += 1;
+                        }
                     }
                     break;
                 }
@@ -2617,7 +2672,17 @@ impl Stream {
                     self.skip -= 1;
                     continue;
                 }
+                // A CACHED_PLAN hands its trial's results out first.
+                if let Some(c) = &mut self.cached {
+                    if !std::mem::take(&mut c.held) {
+                        c.left = (c.left - 1).max(0);
+                    }
+                }
                 if !reaching && !out.is_empty() && bytes + found.doc.len() > max_bytes {
+                    // The executor holds it: the stage has handed it out.
+                    if let Some(c) = &mut self.cached {
+                        c.held = true;
+                    }
                     fresh.push_front(found);
                     self.stashed = fresh;
                     break 'fill;
@@ -2631,8 +2696,12 @@ impl Stream {
                         self.stashed.clear();
                         self.limit_reached = true;
                         // `find`'s executor works the LIMIT once more, which
-                        // finds it at its end; a `getMore`'s does not.
-                        self.limit_eof_work = self.first;
+                        // finds it at its end; a `getMore`'s does not. A
+                        // CACHED_PLAN over the LIMIT finds that itself.
+                        match &mut self.cached {
+                            Some(c) => c.eof_work |= self.first,
+                            None => self.limit_eof_work = self.first,
+                        }
                         break 'fill;
                     }
                 }
@@ -2652,7 +2721,11 @@ impl Stream {
     /// the one the stream was made from.
     pub(crate) fn exec_stats(&self, plan: &Node) -> Option<Document> {
         let run = self.report_with(plan, self.shown)?;
-        Some(exec_stats_doc(plan, &run.stats))
+        let stages = exec_stats_doc(plan, &run.stats);
+        Some(match &self.cached {
+            Some(c) => cached_plan_doc(c, &run, self.shown, stages),
+            None => stages,
+        })
     }
 
     /// What each stage of `plan` did, yielding `y` times.
@@ -2993,6 +3066,32 @@ pub(crate) fn exec_stats_doc(plan: &Node, stats: &Stats) -> Document {
     out.extend(plan.to_doc(Some(stats)));
     blank_projections(&mut out);
     out
+}
+
+/// The CACHED_PLAN mongod runs the plan cache's plan under, over the plan's
+/// `stages` as they ran (`run`): each result it handed out took it one
+/// work, from its trial's buffer or from the plan, and every work of the
+/// plan's after the trial is one of its own, as is the work that finds the
+/// plan at its end (measured 8.2.11). It is not `isCached`, there.
+fn cached_plan_doc(c: &CachedRun, run: &Report, y: Yields, mut stages: Document) -> Document {
+    stages.remove("isCached");
+    let need_time = run.stats.work.map_or(0, |w| w.need_time) - c.need_time;
+    let advanced = run.advanced - c.left;
+    let works = (c.results - c.left) + (run.works - c.works) + i64::from(c.eof_work);
+    doc! {
+        "isCached": false,
+        "stage": "CACHED_PLAN",
+        "nReturned": num(advanced),
+        "executionTimeMillisEstimate": num(run.millis),
+        "works": num(works),
+        "advanced": num(advanced),
+        "needTime": num(need_time),
+        "needYield": 0_i32,
+        "saveState": num(y.saved),
+        "restoreState": num(y.restored),
+        "isEOF": i32::from(c.left == 0 && run.eof),
+        "inputStage": stages,
+    }
 }
 
 /// A `count` answered from the collection's record count: mongod's

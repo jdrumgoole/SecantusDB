@@ -1573,7 +1573,12 @@ fn stream_find(
     if let Some(trial) = trial {
         let _active = secantus_core::collation::activate(asked.collation);
         stream
-            .buffer_trial(storage.as_ref(), trial.results, trial.ended)
+            .buffer_trial(
+                storage.as_ref(),
+                trial.results,
+                trial.ended,
+                trial.cached.then_some(&plan),
+            )
             .map_err(read_error)?;
     }
     let mut cursor = FindStream {
