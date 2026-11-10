@@ -69,6 +69,68 @@ pub const ACCUMULATOR_BASE: usize = 144;
 /// `sizeof(AccumulatorPush)` (and `$concatArrays`'s), measured the same way.
 pub const PUSH_BASE: usize = 120;
 
+/// The function sizes a mongod build counts that follow from how it was
+/// built -- its standard library -- rather than from what the function
+/// holds. One per mongod build, chosen by the target this server is built
+/// for: each platform's mongod is the reference (Joe, 2026-11-07).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Layout {
+    /// A classic `$sum` / `$count` accumulator (`AccumulatorSum`).
+    pub sum: usize,
+    /// A removable window function's own size, before the values in its
+    /// window: `$sum` and the functions sized as it is, `$avg`, `$push`,
+    /// `$stdDevPop` / `$stdDevSamp`.
+    pub removable: usize,
+    pub removable_avg: usize,
+    pub removable_push: usize,
+    pub removable_std_dev: usize,
+    /// `AccumulatorRank`, `AccumulatorDenseRank`,
+    /// `AccumulatorDocumentNumber`.
+    pub rank: usize,
+    pub dense_rank: usize,
+    pub document_number: usize,
+}
+
+/// libstdc++: Linux mongod 8.2.12, x86-64 and arm64 alike (2026-11-08,
+/// RM-327), the exemplar CI measures.
+pub(crate) const LIBSTDCXX: Layout = Layout {
+    sum: 176,
+    removable: 296,
+    removable_avg: 304,
+    removable_push: 160,
+    removable_std_dev: 472,
+    rank: 376,
+    dense_rank: 368,
+    document_number: 368,
+};
+
+/// libc++ on arm64: macOS mongod 8.2.1 and 8.2.11, which agree (2026-11-10,
+/// RM-403: `maxAccumulatorMemoryUsageBytes`, `maxFunctionMemoryUsageBytes`
+/// over windows of one to 21 documents with and without `partitionBy`, and
+/// the least budgets). A removable function's maximum there is its size
+/// with one value more than its window holds -- the executor adds the
+/// value entering before it removes the one leaving -- so `$sum` over
+/// `[-5, 5]` peaks at 304 + 12 x 16. The other functions' sizes are
+/// Linux's.
+pub(crate) const LIBCXX_ARM64: Layout = Layout {
+    sum: 184,
+    removable: 304,
+    removable_avg: 312,
+    removable_push: 128,
+    removable_std_dev: 488,
+    rank: 344,
+    dense_rank: 336,
+    document_number: 336,
+};
+
+/// The layout of the mongod build this server stands in for: macOS arm64's
+/// where it is built for one, Linux's everywhere else.
+pub(crate) const LAYOUT: Layout = if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+    LIBCXX_ARM64
+} else {
+    LIBSTDCXX
+};
+
 /// Each budget, in bytes: mongod's runtime-settable knobs, 100 MiB unless
 /// `setParameter` changed one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -823,7 +885,8 @@ mod tests {
     fn a_group_reports_its_accumulators_and_output() {
         // mongod 8.2.1 over 300 documents in 7 groups (2026-11-08): the
         // documents it builds take 1659 bytes; each `$sum` is counted over
-        // every group at once (here at Linux's 176 bytes a `$sum`, RM-397).
+        // every group at once, at the build's size of a `$sum` (176 bytes on
+        // Linux, 184 on macOS arm64).
         let docs: Vec<Document> = (0..300).map(|i| doc! {"_id": i, "k": i % 7}).collect();
         let spec = Bson::Document(doc! {"_id": "$k", "n": {"$sum": 1}});
         let (out, report) =
@@ -836,7 +899,7 @@ mod tests {
         assert_eq!(
             report.groups,
             [GroupStats {
-                max_accumulator_memory: vec![("n".to_string(), 7 * 176)],
+                max_accumulator_memory: vec![("n".to_string(), 7 * LAYOUT.sum as i64)],
                 total_output_data_size: 1659,
             }]
         );

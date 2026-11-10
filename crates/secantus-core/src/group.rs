@@ -2248,13 +2248,12 @@ fn acc_memory(acc: &Acc) -> usize {
 
 /// What mongod's classic accumulator object counts for itself (its
 /// `sizeof`), read from 8.2.11's `explain` (`maxAccumulatorMemoryUsageBytes`
-/// over five documents, 2026-10-26) on the Linux x86-64 build, the
-/// exemplar: the macOS arm64 build differs for some (`$sum` 184, `$topN`
-/// 568, ...). The values a `$push`, `$addToSet`, `$min` or `$max` holds are
-/// counted on top.
+/// over five documents, 2026-10-26) on the Linux x86-64 build; `$sum` is
+/// the build's own ([`memlimit::LAYOUT`]: 184 on macOS arm64). The values a
+/// `$push`, `$addToSet`, `$min` or `$max` holds are counted on top.
 fn classic_base(acc: &Acc) -> usize {
     match acc {
-        Acc::Sum(_) | Acc::Count(_) => 176,
+        Acc::Sum(_) | Acc::Count(_) => memlimit::LAYOUT.sum,
         Acc::Avg(_) => 152,
         Acc::Min(_) | Acc::Max(_) => 104,
         Acc::First(_) => 120,

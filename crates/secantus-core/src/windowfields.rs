@@ -803,8 +803,8 @@ enum FunctionMemory {
     /// `AccumulatorRank` / `AccumulatorDenseRank` /
     /// `AccumulatorDocumentNumber`: `sizeof(*this)`, and for `$rank` and
     /// `$denseRank` the last distinct sort key, beyond the `Value` held
-    /// inline (Linux 8.2.12, x86-64 and arm64: 376, 368, 368; macOS arm64
-    /// 8.2.1 counts 32 less, RM-403).
+    /// inline (the build's own, `memlimit::LAYOUT`: Linux 8.2.12 376, 368,
+    /// 368; macOS arm64 32 less).
     Rank {
         base: usize,
         keeps_key: bool,
@@ -813,10 +813,14 @@ enum FunctionMemory {
     /// once for a value a `Value` holds inline, twice for one on the heap,
     /// and `$push` every value twice (Linux x86-64 8.2.11, five ints in a
     /// `[-5, 5]` window: `$sum` 376, `$avg` 384, `$push` 320, `$stdDevPop`
-    /// 552; macOS arm64 counts 24 more for `$sum`).
+    /// 552; its own size is the build's, `memlimit::LAYOUT`: macOS arm64
+    /// counts 8 more for `$sum` and `$avg`, 16 for `$stdDevPop`, and 32
+    /// less for `$push`).
     Removable {
         base: usize,
         sizes: Vec<Option<usize>>,
+        /// The window it answered last, as `(from, upto)`.
+        last: Option<(usize, usize)>,
     },
     Growing {
         acc: group::Acc,
@@ -829,19 +833,19 @@ impl FunctionMemory {
         match c.op {
             "$rank" => {
                 return Ok(FunctionMemory::Rank {
-                    base: 376,
+                    base: crate::memlimit::LAYOUT.rank,
                     keeps_key: true,
                 })
             }
             "$denseRank" => {
                 return Ok(FunctionMemory::Rank {
-                    base: 368,
+                    base: crate::memlimit::LAYOUT.dense_rank,
                     keeps_key: true,
                 })
             }
             "$documentNumber" => {
                 return Ok(FunctionMemory::Rank {
-                    base: 368,
+                    base: crate::memlimit::LAYOUT.document_number,
                     keeps_key: false,
                 })
             }
@@ -857,12 +861,13 @@ impl FunctionMemory {
         if window_removes(c.window) {
             return Ok(FunctionMemory::Removable {
                 base: match c.op {
-                    "$avg" => 304,
-                    "$push" => 160,
-                    "$stdDevPop" | "$stdDevSamp" => 472,
-                    _ => 296,
+                    "$avg" => crate::memlimit::LAYOUT.removable_avg,
+                    "$push" => crate::memlimit::LAYOUT.removable_push,
+                    "$stdDevPop" | "$stdDevSamp" => crate::memlimit::LAYOUT.removable_std_dev,
+                    _ => crate::memlimit::LAYOUT.removable,
                 },
                 sizes: Vec::new(),
+                last: None,
             });
         }
         Ok(FunctionMemory::Growing {
@@ -872,7 +877,13 @@ impl FunctionMemory {
     }
 
     /// The bytes held once the window covers indices `from..=upto` of
-    /// `slots`, answering `pos`.
+    /// `slots`, answering `pos`, and the most held on the way there. A
+    /// removable function takes in the values entering its window before
+    /// it lets go of those leaving (`WindowFunctionExecRemovableDocument`
+    /// and `...Range::update`, r8.2.1), so for a moment it holds both
+    /// windows: mongod's tracker keeps that as its maximum, while its
+    /// budget is checked once the update is done (measured 8.2.1 and
+    /// 8.2.11: a `[-5, 5]` `$sum` of ints peaks at 12 values).
     #[allow(clippy::too_many_arguments)]
     fn held(
         &mut self,
@@ -884,55 +895,70 @@ impl FunctionMemory {
         vars: &Document,
         sizer: &CacheSize,
         ranks: Option<&Ranks>,
-    ) -> R<usize> {
+    ) -> R<(usize, usize)> {
         Ok(match self {
-            FunctionMemory::Nothing => 0,
+            FunctionMemory::Nothing => (0, 0),
             FunctionMemory::Rank { base, keeps_key } => {
                 // The key the accumulator kept: the first of the documents
                 // tied with this one.
                 let first_tied = ranks.map_or(pos, |r| r.rank[pos] as usize - 1);
-                match sizer.sort_key(&docs[slots[first_tied]]) {
+                let held = match sizer.sort_key(&docs[slots[first_tied]]) {
                     Some(key) if *keeps_key => {
                         *base + crate::memlimit::classic_size(&key) - crate::memlimit::VALUE
                     }
                     _ => *base,
-                }
+                };
+                (held, held)
             }
-            FunctionMemory::Removable { base, sizes } => {
+            FunctionMemory::Removable { base, sizes, last } => {
                 if sizes.is_empty() {
                     sizes.resize(slots.len(), None);
                 }
-                let mut held = *base;
-                for i in from..=upto.min(slots.len() - 1) {
-                    let size = match sizes[i] {
-                        Some(s) => s,
-                        None => {
-                            let v = if c.op == "$count" {
-                                Bson::Int32(1)
-                            } else {
-                                expressions::evaluate(&docs[slots[i]], c.arg, vars)
-                                    .unwrap_or(Bson::Null)
-                            };
-                            let size = crate::memlimit::classic_size(&v);
-                            let s = if size > 16 || c.op == "$push" {
-                                2 * size
-                            } else {
-                                size
-                            };
-                            sizes[i] = Some(s);
-                            s
-                        }
+                let mut value_size = |i: usize| -> usize {
+                    if let Some(s) = sizes[i] {
+                        return s;
+                    }
+                    let v = if c.op == "$count" {
+                        Bson::Int32(1)
+                    } else {
+                        expressions::evaluate(&docs[slots[i]], c.arg, vars).unwrap_or(Bson::Null)
                     };
-                    held += size;
+                    let size = crate::memlimit::classic_size(&v);
+                    let s = if size > 16 || c.op == "$push" {
+                        2 * size
+                    } else {
+                        size
+                    };
+                    sizes[i] = Some(s);
+                    s
+                };
+                let end = slots.len() - 1;
+                let mut held = *base;
+                for i in from..=upto.min(end) {
+                    held += value_size(i);
                 }
-                held
+                // The values leaving, still held while the entering ones
+                // went in: only when some entered.
+                let mut peak = held;
+                if let Some((was_from, was_upto)) = *last {
+                    if upto.min(end) > was_upto.min(end) {
+                        for i in was_from..=was_upto.min(end) {
+                            if i < from || i > upto {
+                                peak += value_size(i);
+                            }
+                        }
+                    }
+                }
+                *last = Some((from, upto));
+                (held, peak)
             }
             FunctionMemory::Growing { acc, fed } => {
                 while *fed <= upto && *fed < slots.len() {
                     group::apply_acc(acc, c.arg, &docs[slots[*fed]], vars)?;
                     *fed += 1;
                 }
-                group::acc_memory_classic(acc)
+                let held = group::acc_memory_classic(acc);
+                (held, held)
             }
         })
     }
@@ -1214,6 +1240,7 @@ fn run_cache(
         Ok(())
     };
     let mut outside_before = token.bytes(false);
+    let mut held_before = vec![0usize; compiled.len()];
     for pos in 0..n {
         let mut ahead = pos as i64;
         let mut reads = Vec::with_capacity(compiled.len());
@@ -1237,15 +1264,25 @@ fn run_cache(
             &mut stats.total,
         )?;
         read_next |= ahead > last;
+        // The functions update one after another: while one holds its
+        // peak, those before it hold their new windows and those after it
+        // their old ones.
         let mut functions_held = 0usize;
-        for (((f, c), window), max) in functions
+        let mut not_yet: usize = held_before.iter().sum();
+        for ((((f, c), window), max), before) in functions
             .iter_mut()
             .zip(compiled)
             .zip(&reads)
             .zip(stats.functions.iter_mut())
+            .zip(held_before.iter_mut())
         {
-            let held = f.held(c, pos, *window, slots, docs, vars, sizer, ranks)?;
-            *max = (*max).max(held);
+            let (held, peak) = f.held(c, pos, *window, slots, docs, vars, sizer, ranks)?;
+            *max = (*max).max(peak);
+            not_yet -= *before;
+            stats.total = stats
+                .total
+                .max(cache.used + functions_held + peak + not_yet + token.peak(read_next));
+            *before = held;
             functions_held += held;
         }
         let outside = functions_held + token.bytes(read_next);
@@ -2728,18 +2765,29 @@ mod budget_tests {
     #[test]
     fn a_partitioned_window_counts_the_next_partitions_first_document() {
         let (least, refusal) = least(window(bson!({"$sum": "$n"}), true));
-        assert_eq!(least, 2304);
-        // What is left once the cache goes: the function's 176 bytes, the
-        // partition key's 16 and the next partition's first document's 132.
-        assert!(refusal.contains("5414201") && refusal.contains("used 324 bytes"));
+        // The function's own size: Linux's 176 bytes (2304), macOS arm64's
+        // 184 (2312, RM-403).
+        let sum = crate::memlimit::LAYOUT.sum;
+        assert_eq!(least, 2128 + sum);
+        // What is left once the cache goes: the function, the partition
+        // key's 16 and the next partition's first document's 132.
+        let used = format!("used {} bytes", sum + 16 + 132);
+        assert!(
+            refusal.contains("5414201") && refusal.contains(&used),
+            "{refusal}"
+        );
     }
 
+    /// Linux mongod 8.2.12: 1222 and 12885; macOS arm64 8.2.1, whose
+    /// removable `$sum` is 8 bytes larger and `$push` 32 smaller: 1230 and
+    /// 12853 (RM-403).
     #[test]
     fn removable_windows_keep_their_budgets() {
+        let layout = crate::memlimit::LAYOUT;
         let sum = bson!({"$sum": "$n", "window": {"documents": [-5, 5]}});
-        assert_eq!(least(window(sum, false)).0, 1222);
+        assert_eq!(least(window(sum, false)).0, 926 + layout.removable);
         let push = bson!({"$push": "$s", "window": {"documents": [-5, 5]}});
-        assert_eq!(least(window(push, false)).0, 12885);
+        assert_eq!(least(window(push, false)).0, 12725 + layout.removable_push);
     }
 
     /// 8.2.1 and 8.2.12, 2026-11-08 (RM-405).

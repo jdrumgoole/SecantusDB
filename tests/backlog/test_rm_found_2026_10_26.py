@@ -266,10 +266,12 @@ def _group_sum_spilled_bytes(client: Any) -> Any:
     return (entry.get("groupSpills"), entry.get("groupSpilledBytes"))
 
 
-@pytest.mark.backlog("RM-397")
+@pytest.mark.backlog_fixed("RM-397")
 def test_group_sum_spilled_bytes(rust_mongo: Any, mongod: Any) -> None:
-    """mongod 8.2 on arm64 counts a `$group` of `$sum` and `$count` as
-    115200 bytes over its 22 spills; this server counts 110400. On x86_64
+    """macOS mongod 8.2 on arm64 counted a `$group` of `$sum` and `$count`
+    as 115200 bytes over its 22 spills, where this server counted Linux's
+    110400: its `$sum` accumulator is 184 bytes, not 176. This server now
+    counts the build it runs on (fixed 2026-11-10 with RM-403). On x86_64
     mongod and this server agree (CI, 2026-11-07)."""
     only_on("arm64", why="x86_64 mongod and this server agree")
     assert _group_sum_spilled_bytes(rust_mongo) == _group_sum_spilled_bytes(mongod)
@@ -319,7 +321,7 @@ WINDOWS = {
 }
 
 #: The cases whose least budget macOS mongod counts with its own function
-#: sizes (RM-403): this server counts Linux's, the exemplar CI measures.
+#: sizes, which differ from Linux's (RM-403).
 MACOS_SIZES = ("[-5, 5] $sum", "whole partitions", "[-5, 5] $push of strings")
 
 
@@ -359,23 +361,67 @@ def test_window_budget_residuals(rust_mongo: Any, mongod: Any) -> None:
     function's cache holds whole documents carrying `$sort`'s sort key (two
     at its peak: 1619 bytes) and the function its accumulator; a
     partitioned window counts the partition key and the next partition's
-    first document its iterator read to find the end (2304). On arm64 --
-    this Mac -- the cases macOS mongod sizes differently are RM-403's
-    gap, so only the others are compared."""
-    names = list(WINDOWS)
-    if PLATFORM == "arm64":
-        names = [n for n in names if n not in MACOS_SIZES]
-    assert _least_budgets(rust_mongo, names) == _least_budgets(mongod, names)
+    first document its iterator read to find the end (2304). Each
+    platform's figures are its own mongod's (RM-403)."""
+    assert _least_budgets(rust_mongo) == _least_budgets(mongod)
 
 
-@pytest.mark.backlog("RM-403")
+@pytest.mark.backlog_fixed("RM-403")
 def test_macos_window_function_sizes(rust_mongo: Any, mongod: Any) -> None:
-    """macOS mongod 8.2.1 counts some window functions at its own sizes --
-    a growing `$sum` 184 bytes, not Linux's 176, a removable `$push` 32
-    less -- so these windows' least budgets are 1230, 2312 and 12853 on
-    this Mac (1222, 2304 and 12885 on Linux)."""
-    only_on("arm64", why="Linux mongod's sizes are this server's (RM-327's regression test)")
+    """macOS mongod 8.2.1 counted some window functions at its own sizes --
+    a growing `$sum` 184 bytes, not Linux's 176, a removable `$sum` 8 more
+    and a removable `$push` 32 less -- so these windows' least budgets are
+    1230, 2312 and 12853 on a Mac (1222, 2304 and 12885 on Linux), where
+    this server counted Linux's. It now counts the build it runs on (fixed
+    2026-11-10)."""
+    only_on("darwin", why="Linux mongod's sizes are checked by RM-327's regression test")
     assert _least_budgets(rust_mongo, MACOS_SIZES) == _least_budgets(mongod, MACOS_SIZES)
+
+
+REMOVABLE = {
+    "[-1, 1] $sum": ({"$sum": "$n", "window": {"documents": [-1, 1]}}, False),
+    "[-5, 5] $sum": ({"$sum": "$n", "window": {"documents": [-5, 5]}}, False),
+    "[-5, 5] $push of strings": ({"$push": "$s", "window": {"documents": [-5, 5]}}, False),
+    "[0, 0] $push of strings": ({"$push": "$s", "window": {"documents": [0, 0]}}, False),
+    "range [-6, 0] $sum": ({"$sum": "$n", "window": {"range": [-6, 0]}}, False),
+    "partitioned [-20, 20] $push": ({"$push": "$n", "window": {"documents": [-20, 20]}}, True),
+}
+
+
+def _removable_peaks(client: Any) -> dict:
+    client.drop_database("rm507")
+    db = client.rm507
+    db.c.insert_many([{"_id": i, "k": i % 7, "n": i * 2, "s": "x" * (300 + i)} for i in range(100)])
+    db.c.create_index("n")
+    out = {}
+    for name, (output, partitioned) in REMOVABLE.items():
+        spec: dict = {"sortBy": {"n": 1}, "output": {"t": output}}
+        if partitioned:
+            spec["partitionBy"] = "$k"
+        ex = db.command(
+            {
+                "explain": {
+                    "aggregate": "c",
+                    "pipeline": [{"$setWindowFields": spec}, {"$project": {"_id": 1, "t": 1}}],
+                    "cursor": {},
+                },
+                "verbosity": "executionStats",
+            }
+        )
+        stage = next(s for s in ex["stages"] if "$_internalSetWindowFields" in s)
+        out[name] = (stage["maxFunctionMemoryUsageBytes"], stage["maxTotalMemoryUsageBytes"])
+    return out
+
+
+@pytest.mark.backlog_fixed("RM-507")
+def test_removable_window_peak_holds_the_leaving_value(rust_mongo: Any, mongod: Any) -> None:
+    """mongod's removable executors take in the values entering a window
+    before letting go of those leaving it (`...Removable{Document,Range}::
+    update`, r8.2.1), so `explain`'s maxima count both: 8.2.1 and 8.2.11
+    report a `[-5, 5]` `$sum` of ints at 12 values. This server counted the
+    window alone, as the budget check does (fixed 2026-11-10, found working
+    RM-403). A window over a whole partition takes nothing in at its peak."""
+    assert _removable_peaks(rust_mongo) == _removable_peaks(mongod)
 
 
 # ------------------------------------------- RM-328 explain's counters --
