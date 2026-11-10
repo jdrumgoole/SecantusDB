@@ -2412,6 +2412,12 @@ pub enum AlterTableAction {
         /// statement's COLLATE clause, else the new type's; `None` is the
         /// default. A collation the column had before does not carry over.
         collation: Option<String>,
+        /// When the new type is a domain, the column as `CREATE TABLE`
+        /// declares one of it (`domain_column`): `pg_type` / `typmod` are
+        /// then the domain's innermost base, and the column takes the
+        /// template's domain tag, and its DEFAULT unless it has its own
+        /// (RP-834).
+        domain: Option<Box<Column>>,
     },
     AddCheck(CheckConstraint),
     /// `ADD [CONSTRAINT n] UNIQUE (...)`: checked against the rows already
@@ -8532,13 +8538,25 @@ fn plan_alter_action(
                     display_type(&ty)
                 )));
             }
+            // `atttypid` becomes the domain itself, so the column is one of
+            // it as CREATE TABLE declares one: stored as the domain's
+            // innermost base with that base's modifier, tagged with the
+            // domain (whose constraints every write then checks), and given
+            // its DEFAULT. Kept under the domain's name with no tag, the
+            // column had no DEFAULT and named no domain (RP-834).
+            let domain = domain_column(&cmd.name, &ty)?.map(Box::new);
+            let (pg_type, typmod) = match &domain {
+                Some(c) => (c.pg_type.clone(), c.typmod),
+                None => (ty, cd.type_name.as_ref().map(declared_typmod).unwrap_or(-1)),
+            };
             Ok(AlterTableAction::AlterType {
                 column: cmd.name.clone(),
-                pg_type: ty,
-                typmod: cd.type_name.as_ref().map(declared_typmod).unwrap_or(-1),
+                pg_type,
+                typmod,
                 ndims: cd.type_name.as_ref().map_or(0, declared_ndims),
                 using,
                 collation,
+                domain,
             })
         }
         Ok(AT::AtAddConstraint) => {
@@ -9564,6 +9582,7 @@ pub fn apply_alter_to_def(def: &mut TableDef, action: &AlterTableAction) {
             typmod,
             ndims,
             collation,
+            domain,
             ..
         } => {
             if let Some(c) = def.columns.iter_mut().find(|c| c.name == *column) {
@@ -9581,13 +9600,36 @@ pub fn apply_alter_to_def(def: &mut TableDef, action: &AlterTableAction) {
                 // The domain's DEFAULT was never the column's (it is the
                 // type's, `typdefault`), so it goes too; a DEFAULT the column
                 // set itself stays, coerced to the new type (RP-824).
-                if c.extra.get_str("domain_type").is_ok_and(|d| d != pg_type) {
+                let new_domain = domain
+                    .as_ref()
+                    .and_then(|t| t.extra.get_str("domain_type").ok());
+                if c.extra
+                    .get_str("domain_type")
+                    .is_ok_and(|d| Some(d) != new_domain)
+                {
                     c.extra.remove("domain_type");
                     if c.extra.get_bool("default_from_domain") == Ok(true) {
                         c.extra.remove("default_from_domain");
                         c.default = None;
                         c.set_default_expr(None);
                         c.set_default_sql(None);
+                    }
+                }
+                // Retyped INTO a domain, the column is one of it: tagged, and
+                // following the domain's DEFAULT (`typdefault`) unless it set
+                // one of its own, which stays, coerced to the new type
+                // (RP-834).
+                if let Some(t) = domain {
+                    if let Ok(name) = t.extra.get_str("domain_type") {
+                        c.extra.insert("domain_type", name.to_string());
+                    }
+                    let own = c.extra.get_bool("default_from_domain") != Ok(true)
+                        && (c.default.is_some() || c.default_expr().is_some());
+                    if !own {
+                        c.default = t.default.clone();
+                        c.set_default_expr(t.default_expr().map(str::to_string));
+                        c.set_default_sql(t.default_sql().map(str::to_string));
+                        c.extra.insert("default_from_domain", true);
                     }
                 }
             }

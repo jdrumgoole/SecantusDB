@@ -5292,6 +5292,7 @@ fn a_column_retyped_off_its_domain_is_not_one_of_it() {
                 ndims: 0,
                 using: None,
                 collation: None,
+                domain: None,
             },
         );
     }
@@ -5330,6 +5331,7 @@ fn a_column_retyped_off_its_domain_is_not_one_of_it() {
             ndims: 0,
             using: None,
             collation: None,
+            domain: None,
         },
     );
     assert!(def
@@ -5338,6 +5340,59 @@ fn a_column_retyped_off_its_domain_is_not_one_of_it() {
         .extra
         .get_str("collation")
         .is_err());
+}
+
+/// RP-834: a column retyped INTO a domain is one of it, as CREATE TABLE
+/// declares one -- stored as the domain's base, tagged with the domain, and
+/// following its DEFAULT unless it set one of its own. It was stored under
+/// the domain's name with no tag, and its DEFAULT was NULL.
+#[test]
+fn a_column_retyped_into_a_domain_is_one_of_it() {
+    domains::set_user_domains(vec![domains::Domain {
+        name: "dd".to_string(),
+        oid: 90022,
+        base: "int4".to_string(),
+        typmod: -1,
+        not_null: false,
+        checks: vec![("dd_check".to_string(), "VALUE > 0".to_string())],
+        not_valid: Vec::new(),
+        default_sql: Some("42".to_string()),
+        collation: None,
+    }]);
+    let alter = |sql: &str| match plan_ok(sql) {
+        Statement::AlterTable { mut actions, .. } => actions.remove(0),
+        other => panic!("wrong statement: {other:?}"),
+    };
+    let action = alter("ALTER TABLE t ALTER COLUMN n TYPE dd USING n::dd");
+    let AlterTableAction::AlterType {
+        pg_type, domain, ..
+    } = &action
+    else {
+        panic!("not an ALTER COLUMN TYPE: {action:?}");
+    };
+    assert_eq!(pg_type, "int4");
+    assert_eq!(
+        domain
+            .as_ref()
+            .and_then(|c| c.extra.get_str("domain_type").ok()),
+        Some("dd")
+    );
+    let mut def = t();
+    def.columns[0].default = Some(Bson::Int32(7));
+    apply_alter_to_def(&mut def, &action);
+    let n = def.column("n").unwrap();
+    assert_eq!(n.pg_type, "int4");
+    assert_eq!(n.extra.get_str("domain_type"), Ok("dd"));
+    assert_eq!(n.extra.get_bool("default_from_domain"), Ok(true));
+    assert_eq!(n.default, Some(Bson::Int32(42)));
+    // A DEFAULT the column set itself stays the column's.
+    let action = alter("ALTER TABLE t ALTER COLUMN id TYPE dd USING id::dd");
+    apply_alter_to_def(&mut def, &action);
+    let id = def.column("id").unwrap();
+    assert_eq!(id.extra.get_str("domain_type"), Ok("dd"));
+    assert!(id.extra.get_bool("default_from_domain").is_err());
+    assert_eq!(id.default, Some(Bson::Int32(7)));
+    domains::set_user_domains(Vec::new());
 }
 
 /// `ALTER DOMAIN ... ADD CONSTRAINT ... NOT VALID` carries the NOT VALID
