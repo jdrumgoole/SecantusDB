@@ -2313,11 +2313,16 @@ impl plpgsql_fn::Host for PlHost<'_> {
                 (f.name().to_string(), ty)
             })
             .collect();
+        let typmods = schema.iter().map(|f| f.type_modifier()).collect();
         let rows = rows
             .into_iter()
             .map(|r| r.into_iter().map(|v| v.unwrap_or(Bson::Null)).collect())
             .collect();
-        Ok(plpgsql_fn::QueryOut { columns, rows })
+        Ok(plpgsql_fn::QueryOut {
+            columns,
+            rows,
+            typmods,
+        })
     }
 
     fn execute(
@@ -2387,7 +2392,11 @@ impl plpgsql_fn::Host for PlHost<'_> {
                     .map_err(|e| pl_error(&e))
             })
         })?;
-        Ok(plpgsql_fn::QueryOut { columns, rows })
+        Ok(plpgsql_fn::QueryOut {
+            columns,
+            rows,
+            typmods: Vec::new(),
+        })
     }
 
     fn call(

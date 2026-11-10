@@ -132,8 +132,9 @@ impl Interp<'_> {
         let first = out.rows.first().map(|r| r.as_slice());
         // The portal's query is not at hand: a domain column is named by
         // its base type, and a value of it moves in through the domain's
-        // checks, which a stored value passes.
-        self.assign_row(target, &out.columns, first, &[])?;
+        // checks, which a stored value passes. A record field is then of
+        // the base type, where PostgreSQL keeps the domain (RP-807).
+        self.assign_row(target, &out, first, &[])?;
         self.set_found(first.is_some());
         self.row_count = u64::from(first.is_some());
         Ok(Flow::Next)

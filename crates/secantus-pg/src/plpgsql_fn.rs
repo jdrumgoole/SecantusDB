@@ -93,6 +93,9 @@ impl PlError {
 pub struct QueryOut {
     pub columns: Vec<(String, String)>,
     pub rows: Vec<Vec<Bson>>,
+    /// Each column's type modifier (`exprTypmod`, -1 for none), where the
+    /// result's description carries one; empty when it is not known.
+    pub typmods: Vec<i32>,
 }
 
 /// What the interpreter asks of the server.
@@ -2200,8 +2203,19 @@ impl Interp<'_> {
     /// value cast from its own type to the field's. A field of a domain
     /// checks the domain's constraints unless the value is already of the
     /// domain, so `new.a := -5` fails on its own line, whatever the trigger
-    /// assigns after it (RP-670).
+    /// assigns after it (RP-670). A field of any other type takes the
+    /// value by the assignment rule, as a variable does: a `varchar(3)`
+    /// field refuses an overlong value with 22001 (RP-688).
     fn assign_field(&self, e: &Value, ty: &str) -> Result<Bson, PlError> {
+        if secantus_pgplan::domains::user_domain(ty).is_none() {
+            if let Some((text, mode)) = expr_query(e) {
+                let body = match mode {
+                    3 | 4 => text.split_once(":=").map_or(text, |(_, r)| r).trim(),
+                    _ => text,
+                };
+                return self.eval_typed_body(Some(ty.to_string()), body.to_string(), text, mode);
+            }
+        }
         let v = self.eval(e)?;
         let bound = expr_query(e).and_then(|(text, mode)| {
             let body = match mode {
@@ -2296,10 +2310,11 @@ impl Interp<'_> {
     fn assign_row(
         &mut self,
         target: usize,
-        columns: &[(String, String)],
+        out: &QueryOut,
         row: Option<&[Bson]>,
         domains: &[Option<String>],
     ) -> Result<(), PlError> {
+        let columns = out.columns.as_slice();
         let source = |i: usize| -> String {
             domains
                 .get(i)
@@ -2311,9 +2326,29 @@ impl Interp<'_> {
         match self.datums.get(target) {
             Some(Datum::Rec { .. }) => {
                 // No row still gives the record the query's row type, every
-                // field NULL (`exec_move_row` over a NULL tuple).
+                // field NULL (`exec_move_row` over a NULL tuple). Each field
+                // is of its column's declared type (`exprType` /
+                // `exprTypmod`): the domain a column is of, or the base
+                // type at its modifier, so an assignment to the field
+                // checks the domain or the length (RP-688).
+                let typed = columns
+                    .iter()
+                    .enumerate()
+                    .map(|(i, (name, ty))| {
+                        let declared = match domains.get(i).cloned().flatten() {
+                            Some(d) => d,
+                            None => match out.typmods.get(i) {
+                                Some(m) if *m >= 0 => {
+                                    secantus_pgplan::scalar::format_type_text_public(ty, Some(*m))
+                                }
+                                _ => ty.clone(),
+                            },
+                        };
+                        (name.clone(), declared)
+                    })
+                    .collect();
                 let rec = Some(Record {
-                    columns: columns.to_vec(),
+                    columns: typed,
                     values: row.map_or_else(|| vec![Bson::Null; columns.len()], <[Bson]>::to_vec),
                 });
                 if let Some(Datum::Rec { rec: slot, .. }) = self.datums.get_mut(target) {
@@ -2758,7 +2793,7 @@ impl Interp<'_> {
                 };
                 self.set_found(!out.rows.is_empty());
                 for row in &out.rows {
-                    self.assign_row(target, &out.columns, Some(row), &domains)?;
+                    self.assign_row(target, &out, Some(row), &domains)?;
                     match self.stmts(body.get("body").unwrap_or(&Value::Null))? {
                         Flow::Exit(l) if Self::label_matches(&l, label.as_deref()) => break,
                         Flow::Continue(l) if Self::label_matches(&l, label.as_deref()) => {}
@@ -2909,7 +2944,7 @@ impl Interp<'_> {
                     } else {
                         Vec::new()
                     };
-                    self.assign_row(target, &out.columns, first, &domains)?;
+                    self.assign_row(target, &out, first, &domains)?;
                     self.set_found(!out.rows.is_empty());
                     self.row_count = out.rows.len().min(1) as u64;
                     return Ok(Flow::Next);
@@ -2948,7 +2983,7 @@ impl Interp<'_> {
                         .ok_or_else(|| PlError::unsupported("this EXECUTE INTO target"))?;
                     let first = out.rows.first().map(|r| r.as_slice());
                     let domains = self.host.output_domains(&sql, &types);
-                    self.assign_row(target, &out.columns, first, &domains)?;
+                    self.assign_row(target, &out, first, &domains)?;
                     self.set_found(!out.rows.is_empty());
                 } else {
                     let head = sql.trim_start().to_ascii_lowercase();

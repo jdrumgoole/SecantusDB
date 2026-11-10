@@ -71,6 +71,7 @@ impl PlHost<'_> {
                 (f.name().to_string(), ty)
             })
             .collect();
+        let typmods = cursor.schema.iter().map(|f| f.type_modifier()).collect();
         let row = usize::try_from(cursor.pos - 1)
             .ok()
             .and_then(|i| i.checked_sub(cursor.base))
@@ -81,6 +82,7 @@ impl PlHost<'_> {
             plpgsql_fn::QueryOut {
                 columns,
                 rows: row.into_iter().collect(),
+                typmods,
             },
         ))
     }
