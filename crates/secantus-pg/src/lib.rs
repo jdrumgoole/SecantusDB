@@ -2295,6 +2295,14 @@ impl plpgsql_fn::Host for PlHost<'_> {
             .map_err(|e| pl_error(&e))
     }
 
+    fn cursor_exists(&self, name: &str) -> bool {
+        self.h
+            .cursors
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains_key(name)
+    }
+
     fn query(
         &self,
         sql: &str,

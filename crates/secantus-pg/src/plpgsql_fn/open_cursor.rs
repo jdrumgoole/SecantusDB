@@ -11,22 +11,74 @@
 
 use super::*;
 
+/// The cursor variable a cursor statement names (`curvar`). libpg_query
+/// leaves a zero field out, so a missing one is datum 0.
+fn cursor_var(body: &Value) -> usize {
+    body.get("curvar")
+        .and_then(Value::as_u64)
+        .map_or(0, |n| n as usize)
+}
+
 impl Interp<'_> {
+    /// The portal name a cursor variable asks for: its value, or `None`
+    /// when it is NULL (the portal is then `<unnamed portal N>`). A name a
+    /// portal already has is 42P03, before anything else runs
+    /// (`exec_stmt_open` and `exec_stmt_forc` look it up with
+    /// `SPI_cursor_find` first).
+    fn wanted_portal(&self, var: usize) -> Result<Option<String>, PlError> {
+        let wanted = match self.datums.get(var) {
+            Some(Datum::Var { value, .. }) => match value {
+                Bson::Null => None,
+                Bson::String(s) => Some(s.clone()),
+                other => Some(secantus_pgplan::value_text(other)),
+            },
+            _ => None,
+        };
+        if let Some(name) = &wanted {
+            if self.host.cursor_exists(name) {
+                return Err(PlError::new(
+                    "42P03",
+                    format!("cursor \"{name}\" already in use"),
+                ));
+            }
+        }
+        Ok(wanted)
+    }
+
+    /// Whether a cursor's declared options leave it scrollable: unless NO
+    /// SCROLL (CURSOR_OPT_NO_SCROLL) the rows are kept, so backward
+    /// fetches work, and pg_cursors says so.
+    fn scrollable(options: u64) -> bool {
+        options & 0x0004 == 0
+    }
+
+    /// A bound cursor's query, bound over its arguments' values: the
+    /// arguments are variables of a level of their own, labelled with the
+    /// cursor's name, that its query was compiled in (`decl_cursor_args`).
+    fn bind_bound_cursor(
+        &mut self,
+        var: usize,
+        body: &Value,
+        query: &str,
+    ) -> Result<(String, Vec<Bson>, Vec<String>), PlError> {
+        let depth = self.active.len();
+        if let Some(level) = self.cursor_arguments(var, body)? {
+            self.active.push(level);
+        }
+        let bound = self.bind(query);
+        self.active.truncate(depth);
+        bound
+    }
+
     pub(super) fn open_cursor(&mut self, body: &Value) -> Result<Flow, PlError> {
-        let var = body
-            .get("curvar")
-            .and_then(Value::as_u64)
-            .map(|n| n as usize)
-            .ok_or_else(|| PlError::new("XX000", "OPEN without a cursor variable"))?;
-        // Scrollable unless NO SCROLL (CURSOR_OPT_NO_SCROLL): the rows are
-        // kept, so backward fetches work, and pg_cursors says so.
-        // A bound cursor declares it (`c NO SCROLL CURSOR FOR ...`).
+        let var = cursor_var(body);
+        // A bound cursor declares its options (`c NO SCROLL CURSOR FOR ...`).
         let options = body
             .get("cursor_options")
             .and_then(Value::as_u64)
             .unwrap_or(0)
             | self.cursor_options.get(&var).copied().unwrap_or(0);
-        let scroll = options & 0x0004 == 0;
+        let wanted = self.wanted_portal(var)?;
         let (statement, (sql, params, types)) =
             if let Some(q) = body.get("query").and_then(|q| expr_query(q)) {
                 (q.0.to_string(), self.bind(q.0)?)
@@ -34,38 +86,132 @@ impl Interp<'_> {
                 let text = self.dynamic_sql(d)?;
                 (text.clone(), (text, Vec::new(), Vec::new()))
             } else if let Some(q) = self.cursor_exprs.get(&var).cloned() {
-                // A bound cursor's arguments are variables of a level of
-                // their own, labelled with the cursor's name, that its
-                // query was compiled in (`decl_cursor_args`).
-                let depth = self.active.len();
-                if let Some(level) = self.cursor_arguments(var, body)? {
-                    self.active.push(level);
-                }
-                let bound = self.bind(&q);
-                self.active.truncate(depth);
-                (q, bound?)
+                let bound = self.bind_bound_cursor(var, body, &q)?;
+                (q, bound)
             } else {
                 return Err(PlError::unsupported("this OPEN form"));
             };
-        let (current, var_name) = match self.datums.get(var) {
-            Some(Datum::Var { value, name, .. }) => (value.clone(), name.clone()),
-            _ => (Bson::Null, String::new()),
-        };
-        // A bound cursor variable starts out holding its own name.
-        let current = match current {
-            Bson::Null if self.cursor_exprs.contains_key(&var) => Bson::String(var_name),
-            other => other,
-        };
-        let wanted = match &current {
-            Bson::Null => None,
-            Bson::String(s) => Some(s.clone()),
-            other => Some(secantus_pgplan::value_text(other)),
-        };
-        let name =
-            self.host
-                .open_cursor(wanted.as_deref(), &statement, &sql, &params, &types, scroll)?;
+        let name = self.host.open_cursor(
+            wanted.as_deref(),
+            &statement,
+            &sql,
+            &params,
+            &types,
+            Self::scrollable(options),
+        )?;
         self.set_var(var, Bson::String(name))?;
         Ok(Flow::Next)
+    }
+
+    /// `FOR rec IN cur [(args)] LOOP ... END LOOP` (`exec_stmt_forc`): the
+    /// bound cursor is opened as an OPEN opens it -- its name checked, its
+    /// arguments assigned, the portal named by the variable or, when that
+    /// is NULL, `<unnamed portal N>`, which the variable holds while the
+    /// loop runs -- and the loop walks the portal (`exec_for_query`). The
+    /// portal is closed when the loop ends, by EXIT or RETURN too, and a
+    /// variable that was NULL is NULL again.
+    ///
+    /// The loop reads the portal a row at a time, so a FETCH or MOVE on the
+    /// cursor in the body moves the loop with it, as it does on PostgreSQL.
+    pub(super) fn for_cursor(
+        &mut self,
+        body: &Value,
+        label: Option<&str>,
+    ) -> Result<Flow, PlError> {
+        let var = cursor_var(body);
+        let target = body
+            .get("var")
+            .and_then(|v| v.as_object())
+            .and_then(|o| o.values().next())
+            .and_then(|v| v.get("dno"))
+            .and_then(Value::as_u64)
+            .map(|n| n as usize)
+            .ok_or_else(|| PlError::new("XX000", "a cursor FOR loop without a loop variable"))?;
+        let wanted = self.wanted_portal(var)?;
+        let query = self
+            .cursor_exprs
+            .get(&var)
+            .cloned()
+            .ok_or_else(|| PlError::new("XX000", "a cursor FOR loop over an unbound cursor"))?;
+        let (sql, params, types) = self.bind_bound_cursor(var, body, &query)?;
+        let options = self.cursor_options.get(&var).copied().unwrap_or(0);
+        let portal = self.host.open_cursor(
+            wanted.as_deref(),
+            &query,
+            &sql,
+            &params,
+            &types,
+            Self::scrollable(options),
+        )?;
+        if wanted.is_none() {
+            self.set_var(var, Bson::String(portal.clone()))?;
+        }
+        // The loop's own level: its label qualifies the loop variable.
+        let depth = self.active.len();
+        let name = match self.datums.get(target) {
+            Some(Datum::Rec { name, .. } | Datum::Var { name, .. }) => name.clone(),
+            _ => String::new(),
+        };
+        self.active.push(block_scope::Scope {
+            label: label.map(str::to_string),
+            vars: vec![(name, target)],
+            ..Default::default()
+        });
+        let walked = self.walk_portal(&portal, target, body, label);
+        self.active.truncate(depth);
+        match walked {
+            Ok(flow) => {
+                self.host.close_cursor(&portal)?;
+                if wanted.is_none() {
+                    self.set_var(var, Bson::Null)?;
+                }
+                Ok(flow)
+            }
+            // PostgreSQL leaves the portal to the abort of the (sub)
+            // transaction the error ends, which drops it; it is dropped
+            // here, and the body's error is the one reported.
+            Err(e) => {
+                if self.host.cursor_exists(&portal) {
+                    self.host.close_cursor(&portal)?;
+                }
+                Err(e)
+            }
+        }
+    }
+
+    /// `exec_for_query`: each row of the portal into the loop variable, then
+    /// the body. With no row at all the variable is set to NULL. FOUND is
+    /// set when the loop ends, by whether a row was read; the body sees
+    /// the FOUND it was entered with.
+    fn walk_portal(
+        &mut self,
+        portal: &str,
+        target: usize,
+        body: &Value,
+        label: Option<&str>,
+    ) -> Result<Flow, PlError> {
+        use secantus_pgplan::FetchDirection as Fd;
+        let stmts = body.get("body").unwrap_or(&Value::Null);
+        let mut found = false;
+        let flow = loop {
+            let (_, out) = self.host.fetch_cursor(portal, Fd::Forward, 1)?;
+            let Some(row) = out.rows.first() else {
+                if !found {
+                    self.assign_row(target, &out, None, &out.domains)?;
+                }
+                break Flow::Next;
+            };
+            found = true;
+            self.assign_row(target, &out, Some(row), &out.domains)?;
+            match self.stmts(stmts)? {
+                Flow::Exit(l) if Self::label_matches(&l, label) => break Flow::Next,
+                Flow::Continue(l) if Self::label_matches(&l, label) => {}
+                Flow::Next => {}
+                other => break other,
+            }
+        };
+        self.set_found(found);
+        Ok(flow)
     }
 
     /// Assign a bound cursor's arguments, and give back the level its query
@@ -214,6 +360,34 @@ impl Interp<'_> {
     }
 }
 
+/// A bound cursor variable's default: its own name, as a `refcursor`
+/// literal. PostgreSQL 15's grammar gives every `c CURSOR FOR ...` this
+/// `default_val` (`curname_def` in `pl_gram.y`'s `decl_statement`), so the
+/// variable reads `c` before any OPEN and its portal is named `c`; one set
+/// to NULL opens `<unnamed portal N>`. libpg_query parses with a later
+/// grammar, which dropped it, so it is made here. `None` for any other
+/// variable.
+pub(super) fn cursor_name_default(var: &Value) -> Option<Value> {
+    var.get("cursor_explicit_expr")?;
+    let name = var.get("refname")?.as_str()?;
+    // As `curname_def` writes it: quotes doubled, and a backslash doubled
+    // under E'' so standard_conforming_strings cannot change its reading.
+    let mut text = String::with_capacity(name.len() + 24);
+    if name.contains('\\') {
+        text.push('E');
+    }
+    text.push('\'');
+    for ch in name.chars() {
+        if ch == '\'' || ch == '\\' {
+            text.push(ch);
+        }
+        text.push(ch);
+    }
+    text.push_str("'::pg_catalog.refcursor");
+    // RAW_PARSE_PLPGSQL_EXPR, as `curname_def->parseMode`.
+    Some(serde_json::json!({ "PLpgSQL_expr": { "query": text, "parseMode": 2 } }))
+}
+
 /// The bound cursors' declared options, by datum number.
 pub(super) fn cursor_options(f: &Value) -> HashMap<usize, u64> {
     f.get("datums")
@@ -355,6 +529,46 @@ fn is_ident(b: u8) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A bound cursor variable's default is its own name as a `refcursor`
+    /// literal, written as PostgreSQL 15's `curname_def` writes it; a plain
+    /// `refcursor` has none (RP-817).
+    #[test]
+    fn a_bound_cursors_name_default() {
+        let f = super::super::parsed(
+            "create function f() returns int language plpgsql as $$ declare \
+             c cursor for select 1; \"o'k\" cursor for select 2; \"b\\s\" cursor for select 3; \
+             e refcursor; begin return 1; end $$",
+        )
+        .unwrap();
+        let defaults: Vec<(String, Option<String>)> = f["datums"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|d| d.get("PLpgSQL_var"))
+            .map(|v| {
+                let q = cursor_name_default(v)
+                    .and_then(|e| expr_query(&e).map(|(q, m)| (q.to_string(), m)));
+                if let Some((_, mode)) = &q {
+                    assert_eq!(*mode, 2);
+                }
+                (v["refname"].as_str().unwrap().to_string(), q.map(|q| q.0))
+            })
+            .filter(|(n, _)| n != "found")
+            .collect();
+        assert_eq!(
+            defaults,
+            [
+                ("c".into(), Some("'c'::pg_catalog.refcursor".into())),
+                ("o'k".into(), Some("'o''k'::pg_catalog.refcursor".into())),
+                (
+                    "b\\s".into(),
+                    Some("E'b\\\\s'::pg_catalog.refcursor".into())
+                ),
+                ("e".into(), None),
+            ]
+        );
+    }
 
     /// A bound cursor with arguments names its argument row, whose fields
     /// are the argument variables in declared order; a cursor with none,
