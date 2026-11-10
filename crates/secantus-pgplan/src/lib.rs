@@ -61,6 +61,7 @@ mod typmod_cast;
 mod unread_ctes;
 pub mod vectors;
 pub use expr_where::with_expr_index_hook;
+pub mod array_assign;
 pub mod arrays;
 pub mod bits;
 mod bool_clauses;
@@ -7901,6 +7902,18 @@ pub fn plpgsql_assigns_via_io(source: &str, target: &str) -> bool {
     match (category(so, &s), category(to, &t)) {
         (Some('S' | 'P' | 'X'), _) | (_, Some('P' | 'X')) | (None, _) | (_, None) => false,
         _ => !assignment_pathway(&s, &t),
+    }
+}
+
+/// Does a value of type `source` coerce to an array subscript? PostgreSQL
+/// coerces each subscript to `int4` by the ASSIGNMENT rule
+/// (`transformContainerSubscripts`), so `x[1.5::float8]` is `x[2]` and
+/// `x['1'::text]` or `x[true]` is 42804 `array subscript must have type
+/// integer`.
+pub fn subscript_coerces(source: &str) -> bool {
+    match plpgsql_base(source) {
+        Some(base) => base == "unknown" || assignment_pathway(&base, "int4"),
+        None => true,
     }
 }
 
@@ -43393,15 +43406,9 @@ fn plan_subscript_assign(
             subs.push(SubscriptTarget::Index(i));
         }
     }
-    // A slice assignment rewrites a whole range, and doing that in more than
-    // one dimension at once needs the shape rules an element assignment does
-    // not. Refused by name rather than half-applied.
-    if slices > 1 || (slices == 1 && subs.len() > 1) {
-        return Err(Error::Unsupported(
-            "UPDATE of a slice of a multidimensional array".into(),
-        ));
-    }
-    let value_type = if slices == 1 {
+    // Once any subscript is a slice the whole target is one, and the value
+    // assigned is an array (`transformContainerSubscripts`).
+    let value_type = if slices > 0 {
         column.pg_type.clone()
     } else {
         element.to_string()
@@ -43416,14 +43423,26 @@ fn plan_subscript_assign(
     })
 }
 
-/// Apply one `SET a[...] = v` to the array the row holds.
-///
-/// A subscript past the end EXTENDS the array, padding the gap with NULLs:
-/// `ia[5] = 5` over `{1,2,3}` is `{1,2,3,NULL,5}`, and assigning into a NULL
-/// column builds the array from nothing. A slice whose source is shorter than
-/// the range is PostgreSQL's own "source array too small"; a longer one has
-/// its tail ignored.
+/// Apply one `SET a[...] = v` to the array the row holds, as
+/// PostgreSQL's `array_set_element` / `array_set_slice` do
+/// ([`array_assign`]): a one-dimensional array grows to meet a subscript
+/// past either end, NULL-filling the gap; a multidimensional one does not.
 fn apply_subscript_assign(a: &SubscriptAssign, row: &Document, current: Bson) -> Result<Bson> {
+    // The subscripts are evaluated and checked first (none may be NULL),
+    // then the value (`ExecEvalSubscriptingRef`'s order).
+    let bound = |e: &Option<ColumnExpr>| e.as_ref().map(|e| apply_row_expr(e, row)).transpose();
+    let mut subs = Vec::with_capacity(a.subs.len());
+    for s in &a.subs {
+        subs.push(match s {
+            SubscriptTarget::Index(e) => {
+                array_assign::AssignSubscript::Index(apply_row_expr(e, row)?)
+            }
+            SubscriptTarget::Slice(lo, hi) => {
+                array_assign::AssignSubscript::Slice(bound(lo)?, bound(hi)?)
+            }
+        });
+    }
+    array_assign::check_subscripts(&subs)?;
     // The new element (or slice) is coerced to the element type at the
     // column's modifier by the assignment rule, as
     // `transformAssignmentSubscripts` does: an overlong `varchar(3)` element
@@ -43433,112 +43452,7 @@ fn apply_subscript_assign(a: &SubscriptAssign, row: &Document, current: Bson) ->
         &a.value_type,
         a.typmod,
     )?;
-    let index = |e: &ColumnExpr| -> Result<i64> {
-        let i = arrays::subscript_index(&apply_row_expr(e, row)?)?;
-        // A subscript past the end EXTENDS the array, so the subscript is the
-        // size being asked for -- `SET a[1000000000] = 1` is a one-line
-        // statement that would otherwise allocate a billion slots.
-        arrays::check_array_size(i.abs())?;
-        Ok(i)
-    };
-    // The array as its elements and each dimension's lower bound; a NULL
-    // column is an empty array, which takes whatever bound it is given.
-    let lower = arrays::lower_bounds(&current);
-    let items = match arrays::strip(&current) {
-        Bson::Array(items) => items,
-        _ => Vec::new(),
-    };
-    let one_dim = arrays::dim_lengths(&Bson::Array(items.clone())).len() <= 1;
-    // One dimension: the assignment may reach BELOW the lower bound as well as
-    // past the upper one, and either way the array grows to meet it, the gap
-    // NULL-filled -- `SET a[0] = 9` over `{1,2}` is `[0:2]={9,1,2}`.
-    let place_range = |lo: i64, hi: i64, source: &[Bson]| -> Result<Bson> {
-        let (mut lb, mut out) = (lower.first().copied().unwrap_or(1), items.clone());
-        if out.is_empty() {
-            lb = lo;
-        }
-        if lo < lb {
-            let grow = (lb - lo) as usize;
-            let mut front = vec![Bson::Null; grow];
-            front.extend(out);
-            out = front;
-            lb = lo;
-        }
-        let needed = (hi - lb + 1).max(0) as usize;
-        arrays::check_array_size(needed as i64)?;
-        if out.len() < needed {
-            out.resize(needed, Bson::Null);
-        }
-        for (n, slot) in (lo..=hi).enumerate() {
-            out[(slot - lb) as usize] = source[n].clone();
-        }
-        Ok(arrays::bounded(Bson::Array(out), &[lb]))
-    };
-    if let [SubscriptTarget::Slice(lo, hi)] = a.subs.as_slice() {
-        let lb = lower.first().copied().unwrap_or(1);
-        let lo = lo.as_ref().map(index).transpose()?.unwrap_or(lb);
-        let hi = match hi.as_ref().map(index).transpose()? {
-            Some(h) => h,
-            None => lb + items.len() as i64 - 1,
-        };
-        let Bson::Array(source) = arrays::strip(&value) else {
-            // A NULL source for a slice is PostgreSQL's own error rather than
-            // a no-op: there is nothing to copy into the range.
-            return Err(Error::DataException("source array too small".into()));
-        };
-        let width = (hi - lo + 1).max(0) as usize;
-        if source.len() < width {
-            return Err(Error::DataException("source array too small".into()));
-        }
-        if width == 0 {
-            return Ok(current);
-        }
-        return place_range(lo, hi, &source);
-    }
-    if let ([SubscriptTarget::Index(e)], true) = (a.subs.as_slice(), one_dim) {
-        let i = index(e)?;
-        return place_range(i, i, std::slice::from_ref(&value));
-    }
-    // Several dimensions: each subscript is relative to its dimension's lower
-    // bound, and one below it is refused by name rather than re-based.
-    let mut path = Vec::with_capacity(a.subs.len());
-    for (dim, sub) in a.subs.iter().enumerate() {
-        match sub {
-            SubscriptTarget::Index(e) => {
-                let rebased = index(e)? - lower.get(dim).copied().unwrap_or(1) + 1;
-                if rebased < 1 {
-                    return Err(Error::Unsupported(
-                        "UPDATE of a multidimensional array element below its lower bound".into(),
-                    ));
-                }
-                path.push(rebased);
-            }
-            SubscriptTarget::Slice(..) => {
-                return Err(Error::Unsupported(
-                    "UPDATE of a slice of a multidimensional array".into(),
-                ))
-            }
-        }
-    }
-    fn place(current: &Bson, path: &[i64], value: Bson) -> Bson {
-        let Some((&head, rest)) = path.split_first() else {
-            return value;
-        };
-        let mut items = match current {
-            Bson::Array(items) => items.clone(),
-            _ => Vec::new(),
-        };
-        let slot = head as usize - 1;
-        if items.len() <= slot {
-            items.resize(slot + 1, Bson::Null);
-        }
-        items[slot] = place(&items[slot].clone(), rest, value);
-        Bson::Array(items)
-    }
-    Ok(arrays::bounded(
-        place(&Bson::Array(items), &path, value),
-        &lower,
-    ))
+    array_assign::assign_subscripts(current, &subs, value)
 }
 
 /// Whether a stored field name can only be addressed LITERALLY: MQL reads a

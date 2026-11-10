@@ -2614,7 +2614,9 @@ nothing. The gap tests are in `tests/backlog/test_rp_found_rp712.py`.
       `at assignment` line on PostgreSQL 15.19: the length coercion is part
       of the assignment's query and folds as it is planned. Here only the
       `at assignment` line is sent: `fit_assigned` raises outside the
-      framed query.
+      framed query. The same holds for an element of a `varchar(3)[]`
+      (`x[1] := 'abcdef'`, framed `PL/pgSQL assignment "x[1] :=
+      'abcdef'"` on 15.19) and for a slice (`x[1:1] := array['abcd']`).
       Verify: tests/backlog/test_rp_found_rp712.py::test_overlong_varchar_assignment_is_framed_by_the_assignment
       Backlog-ID: RP-752
 - [ ] **An assignment's literal input error carries no internal query.**
@@ -2625,21 +2627,33 @@ nothing. The gap tests are in `tests/backlog/test_rp_found_rp712.py`.
       Verify: tests/backlog/test_rp_found_rp712.py::test_literal_input_error_in_an_assignment_carries_its_query
       Backlog-ID: RP-753
 
-## Found while working RP-695 (2026-11-09)
+## Found while working RP-711 (2026-11-10)
 
-Measured on a private PostgreSQL 15.19 cluster with the `_SETUP` in
-`tests/backlog/test_rp_found_rp695.py`: `t695(k int, a varchar(3)[], c
-char(3)[], b bit(3)[])`.
+Measured on PostgreSQL 15.19: the SELECT and DO statements on the shared
+reference on port 5415 (they create nothing), the UPDATEs on a private
+cluster with the `_SETUP` in `tests/backlog/test_rp_found_rp711.py`:
+`j711(k int primary key, j jsonb)` holding `(1, '{"a": [1]}')`.
 
-- [ ] **A PL/pgSQL assignment to an array element is refused.** `declare x
-      int[]; begin x[1] := 5;` makes `{5}` on PostgreSQL 15.19, and
-      `x[2] := 'ab'` over a `text[]` `{a}` makes `{a,ab}`
-      (`exec_assign_value` over a `PLpgSQL_arrayelem`, which coerces the
-      new element to the element type and `array_set_element`s it); here
-      the element's value is cast to the whole array's type: 22P02
-      `cannot cast int4 to int4[]` / `malformed array literal: "ab"`.
-      Verify: tests/backlog/test_rp_found_rp695.py::test_assignment_to_an_array_element
-      Backlog-ID: RP-711
+- [ ] **An array literal whose upper bound passes `int4` is accepted.**
+      `select '[2147483647:2147483647]={1}'::int[]` is 54000 `array lower
+      bound is too large: 2147483647` on PostgreSQL 15.19 (`array_in`'s
+      `ArrayCheckBounds`: each dimension's lower bound plus its length must
+      fit an `int4`), and `'[2147483646:2147483647]={1,2}'` names 2147483646;
+      here both are accepted. Since RP-711 an assignment that would build
+      such an array is refused as PostgreSQL refuses it; the literal is not.
+      Verify: tests/backlog/test_rp_found_rp711.py::test_array_input_refuses_an_upper_bound_past_int4
+      Backlog-ID: RP-771
+- [ ] **jsonb subscripting is refused.** `('{"a": [1,2]}'::jsonb)['a'][1]`
+      is `2` on PostgreSQL 15.19; `update j711 set j['b'] = '2'` makes
+      `{"a": [1], "b": 2}`, and `set j['a'][3] = '5'` pads the array to
+      `{"a": [1, null, null, 5]}` (`jsonb_set_element`, which builds the
+      missing path); in PL/pgSQL `x['a']['b'] := '1'` over a NULL `jsonb`
+      makes `{"a": {"b": 1}}`. Here the fetch and the UPDATE are 42804
+      `cannot subscript type jsonb because it does not support
+      subscripting` -- a wrong statement about jsonb, not a gap named as
+      one -- and the PL/pgSQL assignment is 0A000.
+      Verify: tests/backlog/test_rp_found_rp711.py::test_jsonb_subscripting
+      Backlog-ID: RP-772
 
 ## Found while working RP-668 (2026-11-09)
 
