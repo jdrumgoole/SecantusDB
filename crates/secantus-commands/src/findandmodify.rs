@@ -253,7 +253,7 @@ pub fn find_and_modify(doc: &Document, ctx: &mut CommandContext) -> HandlerResul
     // A pipeline is checked before any document is looked for, so a bad one
     // is refused when nothing matches too. It was then a silent no-op.
     if let Some(Bson::Array(stages)) = update {
-        if let Some(problem) = pipeline_update_problem(stages) {
+        if let Some(problem) = pipeline_update_problem(stages, &ctx.db_name) {
             return Ok(problem.into_reply());
         }
     }
@@ -757,7 +757,7 @@ pub fn find_and_modify(doc: &Document, ctx: &mut CommandContext) -> HandlerResul
 /// What mongod refuses about a pipeline given as the `update`, as a command
 /// error: a stage that is not a document, has no single name, or is unknown,
 /// one an update may not run, and a stage whose own argument is malformed.
-fn pipeline_update_problem(stages: &[Bson]) -> Option<CommandError> {
+fn pipeline_update_problem(stages: &[Bson], db: &str) -> Option<CommandError> {
     const ALLOWED: [&str; 6] = [
         "$set",
         "$addFields",
@@ -766,7 +766,7 @@ fn pipeline_update_problem(stages: &[Bson]) -> Option<CommandError> {
         "$replaceRoot",
         "$replaceWith",
     ];
-    if let Err(e) = crate::aggregate::validate_stage_names(stages) {
+    if let Err(e) = crate::aggregate::validate_stage_names(stages, db) {
         return Some(e);
     }
     for stage in stages {

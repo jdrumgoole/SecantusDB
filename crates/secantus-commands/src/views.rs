@@ -258,7 +258,7 @@ pub(crate) fn definition_problem(
         }
     }
     if let Some(pipeline) = pipeline {
-        if let Err(e) = crate::aggregate::validate_stage_names(pipeline) {
+        if let Err(e) = crate::aggregate::validate_stage_names(pipeline, db) {
             return Some(e);
         }
         // A view reads a collection, so a `$queryStats` anywhere in it is not

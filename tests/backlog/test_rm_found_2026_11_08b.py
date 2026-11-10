@@ -55,13 +55,13 @@ def _collectionless_lookups(client: Any) -> dict:
     }
 
 
-@pytest.mark.backlog("RM-413")
+@pytest.mark.backlog_fixed("RM-413")
 def test_a_lookup_without_from_runs_its_documents(rust_mongo: Any, mongod_rs: Any) -> None:  # noqa: F811
     """mongod 8.2.11 runs a `$lookup` with no `from` whose pipeline starts
     with `$documents`, and refuses one whose pipeline does not (9, "$lookup
     stage without explicit collection must have a pipeline with $documents
-    as first stage"). This server answers 2 "$lookup requires 'from'
-    (string)" to both."""
+    as first stage"). This server answered 2 "$lookup requires 'from'
+    (string)" to both, until RM-413 ran the pipeline's own documents."""
     assert _collectionless_lookups(rust_mongo) == _collectionless_lookups(mongod_rs)
 
 
