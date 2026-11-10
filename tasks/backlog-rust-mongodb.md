@@ -1179,21 +1179,17 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
   246 SnapshotUnavailable, by name, rather than answer as of now; without
   `atClusterTime` it reads the latest data, which is correct. `secantusd-rs`
   creates its stores the other way, mongod's (RM-210).
-- [ ] **A `$group`'s and a `$setWindowFields`'s spills take this
-      server's size on disk, not mongod's.** A sort's spill file is mongod
-      8.2's -- 64 KiB chunks of `serializeForSorter` records, each
-      snappy-compressed by mongod's own compressor -- so a sort's and a
-      `$bucketAuto`'s `spilledDataStorageSize` are mongod's to the byte
-      (`test_spill_file_storage_size`). Two spillers are not: a classic
-      `$group` writes its partial states as this server's own BSON
-      documents, where mongod writes each group's key and its accumulators'
-      `getValue(toBeMerged)` values to a sorter file (16321 bytes for a
-      `$push` of 300 1000-byte strings on 8.2.1, against 320100 here); and a
-      `$setWindowFields` spills its partition cache to a file, where mongod's
-      goes to a WiredTiger temporary table (`spilledDataStorageSize: 4096`,
-      against 310800). The first needs every accumulator's merge value in
-      mongod's form; the second a WiredTiger table, which the engine crate
-      cannot reach today.
+- [ ] **A `$setWindowFields`'s spill takes this server's size on disk,
+      not mongod's.** A sort's and a classic `$group`'s spill files are
+      mongod 8.2's sorter files to the byte (`test_spill_file_storage_size`,
+      `test_group_spill_storage_size`). mongod spills a `$setWindowFields`'s
+      partition cache to a WiredTiger temporary table
+      (`spilledDataStorageSize: 4096`), where this server writes a file of
+      its own (310800); the engine crate cannot reach a WiredTiger table
+      today. Two more spills are this server's and unmeasured: an SBE
+      `$group` (mongod: a WiredTiger record store; its budget is not
+      settable at runtime) and a `$median` / `$percentile` state (mongod
+      writes its t-digest; this server keeps, and writes, the values).
       Backlog-ID: RM-325
       Verify: tests/backlog/test_rm_found_2026_10_26.py::test_spill_storage_size
 - [ ] **A `getMore` reports none of its cursor's sort counts, and the
@@ -1341,6 +1337,22 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       on arm64 only.
       Backlog-ID: RM-397
       Verify: tests/backlog/test_rm_found_2026_10_26.py::test_group_sum_spilled_bytes
+- [ ] **A classic `$group` counts its held values' and `_id`'s memory
+      unlike mongod, so it spills at other points.** Over 300 documents of a
+      1000-byte string, budget 5000, mongod 8.2.11 spills a `$first` /
+      `$last` / `$firstN` / `$maxN` of the string 60 times, as it does a
+      `$push` (each accumulator counts the `Value` it holds), where this
+      server spills 8 to 13 times: it counts a classic `$first` / `$last`
+      as its fixed size alone, a `$firstN` / `$maxN` / `$topN` / `$bottom`
+      short of mongod's (`$topN`: 38 spills to mongod's 75), and a
+      `$median` over it (20 to 17). An object `_id` goes the other way: mongod
+      counts the key it groups on (one field's value, or an array of the
+      fields'), this server the built `_id` document (`{_id: {n: "$n"}}`:
+      15 spills to 9; two fields under a `$push`: 75 to 60). The spill
+      file is mongod's (RM-325's fix); its size follows the runs. Found
+      2026-11-10 working RM-325.
+      Backlog-ID: RM-502
+      Verify: tests/backlog/test_rm_found_2026_10_26.py::test_group_held_value_spills
 - **Scope decision — SBE's `$concatArrays` refusal names a count mongod
   never set.** Over its budget mongod 8.2.11 says "Concatentating array of
   2 elements and N bytes with array of 87684434848907256 elements and M

@@ -117,6 +117,54 @@ pub(crate) fn read_bson(at: &mut Cursor) -> R<Document> {
     crate::bsondoc::from_bytes(at.take(len)?).map_err(corrupt)
 }
 
+/// `Value::serializeForSorter` of `v`, where `None` is the missing value:
+/// its type byte (EOO) alone.
+pub(crate) fn write_value_or_missing(v: Option<&Bson>, out: &mut Vec<u8>) -> R<()> {
+    match v {
+        Some(v) => write_value(v, out),
+        None => {
+            out.push(0);
+            Ok(())
+        }
+    }
+}
+
+/// The value a [`write_value_or_missing`] wrote.
+pub(crate) fn read_value_or_missing(at: &mut Cursor) -> R<Option<Bson>> {
+    if at.peek_byte()? == 0 {
+        at.byte()?;
+        return Ok(None);
+    }
+    read_value(at).map(Some)
+}
+
+/// `Value::serializeForSorter` of an array whose elements may be missing
+/// (a `$group`'s compound key, or its accumulators' states): the type byte,
+/// the count, then each element.
+pub(crate) fn write_parts(parts: &[Option<Bson>], out: &mut Vec<u8>) -> R<()> {
+    out.push(0x04);
+    let count =
+        i32::try_from(parts.len()).map_err(|_| err("encode a record for", "an array too long"))?;
+    out.extend_from_slice(&count.to_le_bytes());
+    for p in parts {
+        write_value_or_missing(p.as_ref(), out)?;
+    }
+    Ok(())
+}
+
+/// The elements a [`write_parts`] wrote.
+pub(crate) fn read_parts(at: &mut Cursor) -> R<Vec<Option<Bson>>> {
+    if at.byte()? != 0x04 {
+        return Err(corrupt("a record whose parts are not an array"));
+    }
+    let count = at.len()?;
+    let mut parts = Vec::with_capacity(count.min(1 << 16));
+    for _ in 0..count {
+        parts.push(read_value_or_missing(at)?);
+    }
+    Ok(parts)
+}
+
 /// Bytes being read, with every read bounds-checked: a short or damaged
 /// spill fails the query, never panics.
 pub(crate) struct Cursor<'a> {
@@ -147,6 +195,13 @@ impl<'a> Cursor<'a> {
 
     fn byte(&mut self) -> R<u8> {
         Ok(self.take(1)?[0])
+    }
+
+    fn peek_byte(&self) -> R<u8> {
+        self.bytes
+            .get(self.pos)
+            .copied()
+            .ok_or_else(|| corrupt("a record that runs past its chunk"))
     }
 
     fn i32(&mut self) -> R<i32> {

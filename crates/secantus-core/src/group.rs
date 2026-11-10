@@ -213,6 +213,8 @@ pub fn gkey(v: &Bson) -> R<GKey> {
 // `windowfields` module reuses; not part of any real cross-module API.
 pub(crate) enum Num {
     Sum {
+        /// The widest non-decimal type seen (mongod's `nonDecimalTotalType`);
+        /// the total is a decimal (`totalType`) when `decimal` is set.
         width: Width,
         total: DoubleDoubleSum,
         decimal: Option<decimal::Dec>,
@@ -226,7 +228,6 @@ pub(crate) enum Width {
     Int,
     Long,
     Double,
-    Decimal,
 }
 
 #[derive(Clone, Copy)]
@@ -295,7 +296,7 @@ impl Num {
                             None => decimal::add(&decimal_zero()?, &x),
                             Some(d) => decimal::add(&d, &x),
                         };
-                        (Width::Decimal, Some(sum.ok_or(Fallback::Defer)?))
+                        (Width::Int, Some(sum.ok_or(Fallback::Defer)?))
                     }
                     _ => return Err(Fallback::Defer),
                 };
@@ -325,13 +326,11 @@ impl Num {
             Num::Const(ConstSum::Long(i)) => Ok(Bson::Int64(i)),
             Num::Const(ConstSum::Double(d)) => Ok(Bson::Double(d)),
             Num::Sum {
-                width,
                 total,
-                decimal: dec,
-            } => match width {
-                Width::Decimal => {
-                    decimal::to_bson(&Num::decimal_total(&total, dec)?).ok_or(Fallback::Defer)
-                }
+                decimal: dec @ Some(_),
+                ..
+            } => decimal::to_bson(&Num::decimal_total(&total, dec)?).ok_or(Fallback::Defer),
+            Num::Sum { width, total, .. } => match width {
                 Width::Int if total.fits_long() => {
                     let v = total.get_long();
                     Ok(i32::try_from(v).map_or(Bson::Int64(v), Bson::Int32))
@@ -346,9 +345,9 @@ impl Num {
     pub(crate) fn average(self, count: i64) -> R<Bson> {
         match self {
             Num::Sum {
-                width: Width::Decimal,
                 total,
-                decimal: dec,
+                decimal: dec @ Some(_),
+                ..
             } => {
                 let sum = Num::decimal_total(&total, dec)?;
                 decimal::to_bson(&decimal::div_int(&sum, count).ok_or(Fallback::Defer)?)
@@ -413,8 +412,10 @@ pub(crate) enum Acc {
     Avg(Option<(Num, i64)>), // None until the first numeric value (finalises to null)
     Min(Option<Bson>),       // None == "unset or null-equivalent"
     Max(Option<Bson>),
-    First(Option<Bson>), // None == not yet seen any doc
-    Last(Option<Bson>),
+    // None == not yet seen any doc; Some(None) == the value was missing,
+    // which mongod holds as the missing value and outputs as null.
+    First(Option<Option<Bson>>),
+    Last(Option<Option<Bson>>),
     Push(Capped),
     AddToSet(Capped),
     // `$mergeObjects`: merge each per-doc operand document into the accumulator
@@ -767,6 +768,47 @@ pub(crate) fn new_acc(op: &str) -> R<Acc> {
     })
 }
 
+/// A fresh accumulator to merge spilled states into: mongod's
+/// `startNewGroup`, whose initializer gives the N accumulators their `n`.
+pub(crate) fn merging_acc(op: &str, arg: &Bson, vars: &Document) -> R<Acc> {
+    let mut acc = new_acc(op)?;
+    match &mut acc {
+        Acc::NElem { n, .. } => {
+            let Bson::Document(d) = arg else {
+                return Err(Fallback::Defer);
+            };
+            *n = Some(group_n(d.get("n").ok_or(Fallback::Defer)?, vars)?);
+        }
+        Acc::TopN { kind, n, dirs, .. } => {
+            let Bson::Document(d) = arg else {
+                return Err(Fallback::Defer);
+            };
+            let Some(Bson::Document(sortby)) = d.get("sortBy") else {
+                return Err(Fallback::Defer);
+            };
+            *n = Some(match kind {
+                TopNKind::TopN | TopNKind::BottomN => {
+                    group_n(d.get("n").ok_or(Fallback::Defer)?, vars)?
+                }
+                TopNKind::Top | TopNKind::Bottom => 1,
+            });
+            *dirs = sortby
+                .values()
+                .map(|v| as_int_like(v) == Some(-1))
+                .collect();
+        }
+        Acc::Percentile {
+            is_median: false,
+            ps,
+            ..
+        } => {
+            *ps = percentile_spec(arg, "$percentile")?.1;
+        }
+        _ => {}
+    }
+    Ok(acc)
+}
+
 fn is_null(b: &Bson) -> bool {
     matches!(b, Bson::Null)
 }
@@ -849,18 +891,12 @@ pub(crate) fn apply_acc(acc: &mut Acc, arg: &Bson, doc: &Document, vars: &Docume
         Acc::Max(cur) => update_extreme(cur, eval(arg, doc, vars)?, Ordering::Greater)?,
         Acc::First(slot) => {
             if slot.is_none() {
-                // `if field not in bucket` — set once (even to null). Wrap so a
-                // null first value is distinguishable from "unset".
-                *slot = Some(missing_as_null(expressions::evaluate_or_missing(
-                    doc, arg, vars,
-                )?));
+                // `if field not in bucket` — set once (even to null or
+                // missing).
+                *slot = Some(eval_or_missing(arg, doc, vars)?.map(missing_as_null));
             }
         }
-        Acc::Last(slot) => {
-            *slot = Some(missing_as_null(expressions::evaluate_or_missing(
-                doc, arg, vars,
-            )?))
-        }
+        Acc::Last(slot) => *slot = Some(eval_or_missing(arg, doc, vars)?.map(missing_as_null)),
         Acc::Push(list) => {
             if let Some(v) = eval_or_missing(arg, doc, vars)? {
                 list.push(v)?;
@@ -1204,6 +1240,22 @@ fn pattern_cmp(a: &[Bson], b: &[Bson], dirs: &[bool]) -> Ordering {
 }
 
 fn topn_result(kind: TopNKind, n: usize, dirs: &[bool], items: Vec<(Vec<Bson>, Bson)>) -> R<Bson> {
+    let kept = topn_kept(kind, n, dirs, items)?;
+    let outputs: Vec<Bson> = kept.into_iter().map(|(_, o)| o).collect();
+    Ok(match kind {
+        TopNKind::Top | TopNKind::Bottom => outputs.into_iter().next().unwrap_or(Bson::Null),
+        TopNKind::TopN | TopNKind::BottomN => Bson::Array(outputs),
+    })
+}
+
+/// The items a `$top` / `$bottom` (N) keeps, with their sort keys, in sort
+/// order.
+pub(crate) fn topn_kept(
+    kind: TopNKind,
+    n: usize,
+    dirs: &[bool],
+    items: Vec<Keyed>,
+) -> R<Vec<Keyed>> {
     for (sv, _) in &items {
         if !sv.iter().all(crate::order::is_sortable) {
             return Err(Fallback::Defer);
@@ -1215,19 +1267,14 @@ fn topn_result(kind: TopNKind, n: usize, dirs: &[bool], items: Vec<(Vec<Bson>, B
         n
     };
     let top = matches!(kind, TopNKind::Top | TopNKind::TopN);
-    let kept = if crate::sbe::active() {
+    Ok(if crate::sbe::active() {
         sbe_top_bottom_n(items, n, top, dirs)
     } else {
         classic_top_bottom_n(items, n, top, dirs)
-    };
-    let outputs: Vec<Bson> = kept.into_iter().map(|(_, o)| o).collect();
-    Ok(match kind {
-        TopNKind::Top | TopNKind::Bottom => outputs.into_iter().next().unwrap_or(Bson::Null),
-        TopNKind::TopN | TopNKind::BottomN => Bson::Array(outputs),
     })
 }
 
-type Keyed = (Vec<Bson>, Bson);
+pub(crate) type Keyed = (Vec<Bson>, Bson);
 
 /// `$topN` / `$bottomN` as the classic engine keeps them
 /// (`AccumulatorTopBottomN`, 8.2.11): a multimap in sort order, a document
@@ -1291,7 +1338,7 @@ fn sbe_top_bottom_n(items: Vec<Keyed>, n: usize, top: bool, dirs: &[bool]) -> Ve
 /// nulls (first/last `n` in insertion order); `$maxN`/`$minN` drop nulls, then sort
 /// via the `order::cmp`/`is_sortable` contract (`$maxN` descending, `$minN`
 /// ascending) — an element outside the sortable subset defers the group to Python.
-fn nelem_result(kind: NElemKind, n: usize, vals: Vec<Bson>) -> R<Vec<Bson>> {
+pub(crate) fn nelem_result(kind: NElemKind, n: usize, vals: Vec<Bson>) -> R<Vec<Bson>> {
     match kind {
         NElemKind::First => {
             let k = n.min(vals.len());
@@ -1487,7 +1534,7 @@ pub(crate) fn finalize(id: Bson, accs: Vec<(&str, Acc)>) -> R<Document> {
                 out.insert(field.to_string(), v.unwrap_or(Bson::Null));
             }
             Acc::First(v) | Acc::Last(v) => {
-                out.insert(field.to_string(), v.unwrap_or(Bson::Null));
+                out.insert(field.to_string(), v.flatten().unwrap_or(Bson::Null));
             }
             Acc::Push(list) | Acc::AddToSet(list) => {
                 out.insert(field.to_string(), Bson::Array(list.items));
@@ -1559,7 +1606,7 @@ pub(crate) fn finalize_window_value(acc: Acc) -> R<Bson> {
             None => Bson::Null,
         },
         Acc::Min(v) | Acc::Max(v) => v.unwrap_or(Bson::Null),
-        Acc::First(v) | Acc::Last(v) => v.unwrap_or(Bson::Null),
+        Acc::First(v) | Acc::Last(v) => v.flatten().unwrap_or(Bson::Null),
         Acc::Push(list) | Acc::AddToSet(list) => Bson::Array(list.items),
         // Empty window -> {} (a fresh accumulator over zero docs), matching
         // `_empty_window_value("$mergeObjects")`.
@@ -2189,7 +2236,9 @@ fn acc_memory(acc: &Acc) -> usize {
         Acc::Push(c) | Acc::AddToSet(c) | Acc::ConcatArrays(c) | Acc::SetUnion(c) => c.mem,
         Acc::Min(Some(v)) | Acc::Max(Some(v)) => memlimit::engine_size(v),
         // The classic `$first` / `$last` count themselves only.
-        Acc::First(Some(v)) | Acc::Last(Some(v)) if sbe => memlimit::sbe_size(v),
+        Acc::First(Some(v)) | Acc::Last(Some(v)) if sbe => {
+            memlimit::sbe_size(v.as_ref().unwrap_or(&Bson::Null))
+        }
         Acc::MergeObjects(d) if sbe && !d.is_empty() => {
             memlimit::sbe_size(&Bson::Null) + memlimit::bson_len(d)
         }
@@ -2271,6 +2320,7 @@ fn run_group(
     let mut acc_mem: Vec<usize> = vec![0; compiled.len()];
     let mut acc_max: Vec<usize> = vec![0; compiled.len()];
     let mut spills = crate::group_spill::Spills::default();
+    let shape = crate::group_spill::IdShape::of(id_expr);
 
     for d in docs {
         crate::deadline::check()?;
@@ -2322,6 +2372,7 @@ fn run_group(
                 std::mem::take(&mut states),
                 &mut spills,
                 mem,
+                &shape,
             )?;
             mem = 0;
             acc_mem.iter_mut().for_each(|m| *m = 0);
@@ -2331,9 +2382,10 @@ fn run_group(
     let out = if !spills.is_empty() {
         // What is still in memory is spilled too, and every group comes out
         // of the merge, in key order.
-        crate::group_spill::spill(ids, states, &mut spills, mem)?;
-        let fields: Vec<&str> = compiled.iter().map(|c| c.field).collect();
-        crate::group_spill::merge(spills, &fields)?
+        crate::group_spill::spill(ids, states, &mut spills, mem, &shape)?;
+        let accs: Vec<(&str, &str, &Bson)> =
+            compiled.iter().map(|c| (c.field, c.op, c.arg)).collect();
+        crate::group_spill::merge(spills, &accs, &shape, vars)?
     } else {
         let mut out = Vec::with_capacity(ids.len());
         for (id, accs) in ids.into_iter().zip(states) {
