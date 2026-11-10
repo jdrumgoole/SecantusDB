@@ -17014,7 +17014,7 @@ fn plan_series_select(
     series: Series,
     params: &[Bson],
 ) -> Result<Statement> {
-    let filter = series_where(s, &series, params)?;
+    let (filter, residual) = series_where(s, &series, params)?;
     let mut columns: Vec<(String, String)> = Vec::new();
     let mut casts: Vec<Option<ColumnExpr>> = Vec::new();
     for t in &s.target_list {
@@ -17124,7 +17124,7 @@ fn plan_series_select(
         columns,
         casts,
         filter,
-        residual: None,
+        residual,
         order,
         limit,
         offset,
@@ -17137,35 +17137,48 @@ fn plan_series_select(
 }
 
 /// The WHERE clause of a select over a generated series, lowered against the
-/// one int4 column the series exposes. `where false` over a series answers
+/// one column the series exposes (`int4`, or `int8` for an `int8` series),
+/// with what does not lower as a per-row residual. `where false` over a series answers
 /// no rows and still describes the column (measured), which is what a
 /// server-side cursor opened on it relies on.
 fn series_where(
     s: &pg_query::protobuf::SelectStmt,
     series: &Series,
     params: &[Bson],
-) -> Result<Document> {
+) -> Result<(Document, Option<ColumnExpr>)> {
     match s.where_clause.as_ref() {
-        None => Ok(Document::new()),
+        None => Ok((Document::new(), None)),
         // `where false` / `where $1`: a predicate with no column in it keeps
         // every row or none.
         Some(w)
             if matches!(w.node.as_ref(), Some(N::AConst(_) | N::ParamRef(_)))
                 || !references_columns(w) =>
         {
-            Ok(if constant_where(w, params)? {
-                Document::new()
-            } else {
-                doc! { "$expr": false }
-            })
+            Ok((
+                if constant_where(w, params)? {
+                    Document::new()
+                } else {
+                    doc! { "$expr": false }
+                },
+                None,
+            ))
         }
-        // `FROM generate_series(...) g`: the series is the column.
+        // `FROM generate_series(...) g`: the series is the column. A WHERE
+        // that does not lower to a filter -- an expression over the column,
+        // a correlated subquery's per-row call -- is a residual evaluated
+        // per row, as over a table: PostgreSQL's Function Scan applies its
+        // quals to each row the function returns (RP-703). Refusing it
+        // leaked the correlated call's internal name in a 42883.
         Some(w) if !s.from_clause.is_empty() => {
             let def = TableDef::new(
                 "generate_series",
-                vec![Column::new(&series.column, "int4", false)],
+                vec![Column::new(
+                    &series.column,
+                    if series.int8 { "int8" } else { "int4" },
+                    false,
+                )],
             );
-            lower_where(w, &def, params)
+            lower_where_or_residual(w, &def, params)
         }
         // A FROM-less select has no column for its WHERE to name: an output
         // alias is not visible there (`select generate_series(1, 3) as g
@@ -28493,7 +28506,12 @@ fn plan_aggregate_direct(
         }
         // The WHERE clause was silently dropped here before: `count(*)
         // from generate_series(1, 5) i where i > 2` answered 5.
-        let filter = series_where(s, &series, params)?;
+        let (filter, residual) = series_where(s, &series, params)?;
+        if residual.is_some() {
+            return Err(Error::Unsupported(
+                "this WHERE over an aggregated generate_series".into(),
+            ));
+        }
         return Ok(Statement::Aggregate(Aggregate {
             table: String::new(),
             series: Some(series),
@@ -31998,7 +32016,9 @@ fn plan_select_srf(
     };
     // The predicate sees the series under its OUTPUT name, which is the only
     // name the row has (`select generate_series(1, 3) as bar where bar > 1`).
-    let filter = series_where(s, &series, params)?;
+    // A FROM-less select has no column for its WHERE to read, so nothing
+    // is left over to run per row.
+    let (filter, _) = series_where(s, &series, params)?;
     let mut order = Vec::new();
     for item in &s.sort_clause {
         let Some(N::SortBy(sb)) = item.node.as_ref() else {

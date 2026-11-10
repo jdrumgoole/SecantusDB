@@ -2850,6 +2850,31 @@ fn a_where_over_a_series_filters_it() {
     }
 }
 
+/// A WHERE over a series that does not lower to a filter -- an expression
+/// over the column -- is a residual run per row, as over a table, not a
+/// refusal (RP-703: `where f.x + 1 > 0` was 0A000, and a correlated
+/// subquery there a 42883 naming the internal per-row call). A conjunct
+/// that lowers stays the filter.
+#[test]
+fn a_where_over_a_series_that_does_not_lower_is_a_residual() {
+    match plan_ok("SELECT x FROM generate_series(1,5) f(x) WHERE x % 2 = 0 AND x > 2") {
+        Statement::Select(sel) => {
+            assert!(sel.series.is_some());
+            assert_eq!(sel.filter, bson::doc! { "x": { "$gt": 2 } });
+            assert!(sel.residual.is_some(), "x % 2 = 0 runs per row");
+        }
+        other => panic!("wrong statement: {other:?}"),
+    }
+    // An undefined column is still the error, not a silent residual.
+    assert!(matches!(
+        plan(
+            "SELECT x FROM generate_series(1,5) f(x) WHERE y + 1 > 0",
+            &lookup
+        ),
+        Err(Error::UndefinedColumn(_))
+    ));
+}
+
 /// A set-returning function in the SELECT LIST of a FROM-less query is not a
 /// constant: `select generate_series(1,3)` is three ROWS.
 ///

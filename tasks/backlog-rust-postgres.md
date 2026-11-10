@@ -3136,16 +3136,6 @@ the column written out, so none is the star's. The gap tests are in
       over an unaliased `generate_series(1, 2) f`.
       Verify: tests/backlog/test_rp_found_rp699.py::test_function_whole_row_under_a_column_alias
       Backlog-ID: RP-702
-- [ ] **A correlated subquery in the WHERE of a query over a FROM function
-      is 42883 and names the internal call.** `select 1 from
-      generate_series(1, 2) f(x) where (select f.x + 1) > 0` answers two
-      rows on PostgreSQL 15.19 and `where exists (select 1 where f.x > 1)`
-      one; here each is 42883 `function \x1fcorrelated(integer, unknown,
-      ...) does not exist`, the per-row call that stands in for the
-      subquery leaking into the client's error. The same subquery in the
-      select list, or over a VALUES list, is answered.
-      Verify: tests/backlog/test_rp_found_rp699.py::test_correlated_subquery_in_a_function_scan_where
-      Backlog-ID: RP-703
 - [ ] **`(v).*` in a select list is 0A000.** `select (v).* from (values
       (1)) v(a)` answers `1`, column `a`, on PostgreSQL 15.19 and over `v(a,
       b)` both columns (`transformIndirection` expands a whole row's star
@@ -3628,3 +3618,21 @@ its first input gave.
       `text`.
       Verify: tests/backlog/test_rp_found_rp692.py::test_a_numeric_constant_selected_from_a_from_item_is_inserted
       Backlog-ID: RP-843
+
+## Found while working RP-703 (2026-11-10)
+
+Measured on PostgreSQL 15.19 (the shared reference on port 5415): every
+statement is a FROM function and runs there as written.
+
+- [ ] **EXPLAIN of a `generate_series` in FROM prints no alias and no
+      Filter.** `explain (costs off) select 1 from generate_series(1, 2)
+      f(x) where x > 1` is `Function Scan on generate_series f` /
+      `Filter: (x > 1)` on PostgreSQL 15.19 (`ExplainNode` names the
+      alias, `show_scan_qual` the quals the scan applies to each row), and
+      a WHERE that runs per row (`f.x + 1 > 0`, since RP-703) is a
+      `Filter:` the same way. Here each prints the bare `Function Scan on
+      generate_series`, with or without the alias and the WHERE; with
+      costs, its estimate is `rows=0 width=0` where PostgreSQL's is
+      `rows=1 width=4`.
+      Verify: tests/backlog/test_rp_found_rp703.py::test_a_series_scan_explains_its_alias_and_filter
+      Backlog-ID: RP-847

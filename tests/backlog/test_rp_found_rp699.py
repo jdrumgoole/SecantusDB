@@ -3,8 +3,8 @@ FROM function's column or a whole row's field keeps its type) found:
 
 - a FROM function's whole row under a column alias is 42703 inside an
   expression (RP-702);
-- a correlated subquery in the WHERE of a query over a FROM function is
-  42883 and names the internal per-row call (RP-703);
+- a correlated subquery in the WHERE of a query over a FROM function was
+  42883 and named the internal per-row call (RP-703, fixed);
 - `(v).*` in a select list is 0A000 (RP-704);
 - a field of an outer item's whole row in a LATERAL subquery is 42703
   (RP-705).
@@ -59,8 +59,12 @@ def test_function_whole_row_under_a_column_alias(query: str, dsn: str) -> None:
     assert answer(dsn, query) == FUNCTION_WHOLE_ROW_ALIASED[query]
 
 
-# Here each is 42883 `function \x1fcorrelated(integer, unknown, ...) does
-# not exist`: the call standing in for the subquery reaches the client.
+# A Function Scan applies its WHERE to each row the function returns. Each
+# of the first two was 42883 `function \x1fcorrelated(integer, unknown, ...)
+# does not exist`, the call standing in for the subquery reaching the
+# client, and the third 0A000 `AExpr is not supported yet`: a WHERE over a
+# `generate_series` that did not lower to a filter was refused rather than
+# run per row.
 FUNCTION_SCAN_CORRELATED_WHERE = {
     "select 1 from generate_series(1, 2) f(x) where (select f.x + 1) > 0": (
         [(1,), (1,)],
@@ -70,10 +74,11 @@ FUNCTION_SCAN_CORRELATED_WHERE = {
         [(1,)],
         ["?column?"],
     ),
+    "select 1 from generate_series(1, 2) f(x) where f.x + 1 > 0": ([(1,), (1,)], ["?column?"]),
 }
 
 
-@pytest.mark.backlog("RP-703")
+@pytest.mark.backlog_fixed("RP-703")
 @pytest.mark.parametrize("query", list(FUNCTION_SCAN_CORRELATED_WHERE))
 def test_correlated_subquery_in_a_function_scan_where(query: str, dsn: str) -> None:
     assert answer(dsn, query) == FUNCTION_SCAN_CORRELATED_WHERE[query]
