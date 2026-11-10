@@ -87,10 +87,11 @@ def _first_holds(client: Any) -> int:
     return memory["long"] - memory["int"]
 
 
-@pytest.mark.backlog("RM-409")
+@pytest.mark.backlog_fixed("RM-409")
 def test_a_classic_first_counts_its_value(rust_mongo: Any, mongod: Any) -> None:
-    """mongod 8.2.1's classic `$first` counts the value it holds: a
-    1000-byte string's 1024 bytes beyond an int's, in each of 7 groups."""
+    """mongod 8.2.1's classic `$first` counted the value it held: a
+    1000-byte string's 1024 bytes beyond an int's, in each of 7 groups;
+    this server counted the accumulator alone until RM-409."""
     assert _first_holds(rust_mongo) == _first_holds(mongod)
 
 
