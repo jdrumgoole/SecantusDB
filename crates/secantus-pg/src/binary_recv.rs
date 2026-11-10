@@ -307,12 +307,15 @@ fn recv_array(element: &Type, buf: &mut Buf<'_>, utf8: bool) -> Result<bool, PgW
             ));
         }
     }
-    let mut items: i64 = if ndim == 0 { 0 } else { 1 };
+    let mut dims = Vec::with_capacity(ndim as usize);
+    let mut lbs = Vec::with_capacity(ndim as usize);
     for _ in 0..ndim {
-        let dim = buf.i32()?;
-        buf.i32()?; // lower bound
-        items = items.saturating_mul(i64::from(dim.max(0)));
+        dims.push(buf.i32()?);
+        lbs.push(buf.i32()?);
     }
+    // Both before an element is read, as `array_recv` calls them (RP-795).
+    let items = array_get_n_items(&dims)?;
+    array_check_bounds(&dims, &lbs)?;
     for i in 0..items {
         let len = buf.i32()?;
         if len == -1 {
@@ -333,6 +336,51 @@ fn recv_array(element: &Type, buf: &mut Buf<'_>, utf8: bool) -> Result<bool, PgW
         }
     }
     Ok(true)
+}
+
+/// `MaxArraySize`: the most elements an array may hold.
+const MAX_ARRAY_SIZE: i32 = 134_217_727;
+
+/// `ArrayGetNItems`: the element count of `dims`. A negative dimension, a
+/// running product that leaves `int4`, or a total past `MaxArraySize` is
+/// refused -- the overflow is checked at each step, the limit only on the
+/// total, so `[65536, 65536, 0]` is refused and `[200000000, 0]` is not
+/// (measured on PostgreSQL 15.19). No dimension is one element.
+fn array_get_n_items(dims: &[i32]) -> Result<i32, PgWireError> {
+    let too_big = || {
+        error(
+            "54000",
+            format!("array size exceeds the maximum allowed ({MAX_ARRAY_SIZE})"),
+        )
+    };
+    if dims.is_empty() {
+        return Ok(0);
+    }
+    let mut ret: i32 = 1;
+    for &d in dims {
+        if d < 0 {
+            return Err(too_big());
+        }
+        ret = ret.checked_mul(d).ok_or_else(too_big)?;
+    }
+    if ret > MAX_ARRAY_SIZE {
+        return Err(too_big());
+    }
+    Ok(ret)
+}
+
+/// `ArrayCheckBounds`: each dimension's lower bound plus its length must
+/// fit an `int4` (`array_in` makes the same check, RP-771).
+fn array_check_bounds(dims: &[i32], lbs: &[i32]) -> Result<(), PgWireError> {
+    for (&d, &lb) in dims.iter().zip(lbs) {
+        if d.checked_add(lb).is_none() {
+            return Err(error(
+                "54000",
+                format!("array lower bound is too large: {lb}"),
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// `format_type`'s name for a built-in type.
@@ -413,6 +461,16 @@ mod tests {
             (&Type::INT4_ARRAY, "000000010000000000000017000000010000000100000002000000", "08P01 insufficient data left in message"),
             (&Type::INT4_ARRAY, "0000000700000000000000170000000100000001", "54000 number of array dimensions (7) exceeds the maximum allowed (6)"),
             (&Type::INT4_ARRAY, "0000000100000002000000170000000100000001", "22P03 invalid array flags"),
+            // `ArrayGetNItems` then `ArrayCheckBounds`, before any element
+            // (RP-795, measured 2026-11-10).
+            (&Type::INT4_ARRAY, "000000010000000000000017000000017fffffff0000000400000001", "54000 array lower bound is too large: 2147483647"),
+            (&Type::INT4_ARRAY, "000000010000000000000017000000017ffffffe0000000400000001", "ok"),
+            (&Type::INT4_ARRAY, "0000000100000000000000177fffffff00000001", "54000 array size exceeds the maximum allowed (134217727)"),
+            (&Type::INT4_ARRAY, "000000010000000000000017ffffffff00000001", "54000 array size exceeds the maximum allowed (134217727)"),
+            (&Type::INT4_ARRAY, "000000030000000000000017000100000000000100010000000000010000000000000001", "54000 array size exceeds the maximum allowed (134217727)"),
+            (&Type::INT4_ARRAY, "0000000200000000000000170bebc200000000010000000000000001", "ok"),
+            (&Type::INT4_ARRAY, "00000002000000000000001700000000000000010bebc20077359400", "54000 array lower bound is too large: 2000000000"),
+            (&Type::INT4_ARRAY, "000000010000000000000017000000007fffffff", "ok"),
             (&Type::INTERVAL_ARRAY, "0000000100000000010101010000000100000000", "08P01 insufficient data left in message"),
             (&Type::INTERVAL_ARRAY, "000000000000000000000017", "42804 binary data has array element type 23 (integer) instead of expected 1186 (interval)"),
             (&Type::JSON_ARRAY, "000000000000000000000eda", "42804 binary data has array element type 3802 (jsonb) instead of expected 114 (json)"),

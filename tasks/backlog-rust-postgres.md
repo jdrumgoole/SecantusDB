@@ -3491,16 +3491,3 @@ statement is VALUES-only and runs there as written. The gap tests are in
       agrees, as does a `char(4)` table column (RP-691).
       Verify: tests/backlog/test_rp_found_rp757.py::test_a_values_char_column_compares_as_bpchar_in_a_where
       Backlog-ID: RP-775
-
-## Found while working RP-771 (2026-11-10)
-
-- [ ] **A binary array parameter whose upper bound passes `int4` is
-      accepted.** An `int4[]` sent in binary format with lower bound
-      2147483647 and one element is 54000 `array lower bound is too large:
-      2147483647` on PostgreSQL 15.19 (`array_recv` runs the same
-      `ArrayCheckBounds` as `array_in`, before reading an element); here
-      it binds and prints `[2147483647:2147483647]={1}`. Since RP-771 the
-      text literal is refused; `binary_array` in `secantus-pg/src/lib.rs`
-      keeps the lower bounds without the check.
-      Verify: tests/backlog/test_rp_found_rp771.py::test_binary_array_refuses_an_upper_bound_past_int4
-      Backlog-ID: RP-795
