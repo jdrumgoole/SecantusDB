@@ -387,6 +387,7 @@ impl PgHandler {
             ascending: true,
             nulls: secantus_pgplan::Nulls::Last,
             jsonb: false,
+            bpchar: false,
             expr: None,
         };
         match &sel.distinct {
@@ -868,6 +869,7 @@ fn fts_text_key(i: usize, field: &str) -> OrderKey {
         ascending: true,
         nulls: secantus_pgplan::Nulls::Last,
         jsonb: false,
+        bpchar: false,
         expr: Some(secantus_pgplan::ColumnExpr::Casts {
             source: Some(field.to_string()),
             chain: vec![FTS_TEXT.to_string()],

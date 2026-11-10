@@ -191,6 +191,7 @@ pub use correlated::{
     DESCRIBE_QUERY, FETCH_CURSOR,
 };
 pub mod json;
+pub mod jsonb_subs;
 pub mod jsonfn;
 pub mod jsonops;
 pub mod jsonpath;
@@ -438,6 +439,12 @@ impl Error {
                 if m == "macaddr8 data out of range to convert to macaddr" =>
             {
                 Some("Only addresses that have FF and FE as values in the 4th and 5th bytes from the left, for example xx:xx:xx:ff:fe:xx:xx:xx, are eligible to be converted from macaddr8 to macaddr.")
+            }
+            // `jsonb_subscript_transform` (jsonbsubs.c).
+            Error::DatatypeMismatch(m)
+                if m.starts_with("subscript type ") && m.ends_with(" is not supported") =>
+            {
+                Some("jsonb subscript must be coercible to either integer or text.")
             }
             Error::DatatypeMismatch(m) if m.contains(" but expression is of type ") => {
                 Some("You will need to rewrite or cast the expression.")
@@ -1305,7 +1312,9 @@ pub enum ConflictAction {
         /// of the column's domain (`excluded.a`, the target's own `a`).
         of_domain: Vec<String>,
         /// `WHERE` on the DO UPDATE: the update is skipped when it is false.
-        filter: Option<ColumnExpr>,
+        /// Boxed, so the variant stays within `large_enum_variant`'s bound
+        /// of the data-less `Nothing`.
+        filter: Option<Box<ColumnExpr>>,
     },
 }
 
@@ -1468,6 +1477,12 @@ pub struct OrderKey {
     /// The key is `jsonb`: it orders as PostgreSQL's jsonb btree order
     /// (`json::jsonb_compare`), not as its stored text.
     pub jsonb: bool,
+    /// The key is `bpchar`: it orders as `bpcharcmp`, which compares the two
+    /// values' `bcTruelen` lengths, so trailing blanks do not count (`'a  '`
+    /// sorts as `'a'`, before `E'a\t'`). A stored `char(n)` cell is kept
+    /// trimmed already; an unsized `bpchar` column of a VALUES list or a set
+    /// operation keeps its blanks, which a raw string comparison read (RP-794).
+    pub bpchar: bool,
     /// `ORDER BY` over a COMPUTED expression (`order by n * -1`,
     /// `order by upper(a)`). The executor evaluates it per row into `field` —
     /// a synthetic name — just before sorting, so the sort itself stays the
@@ -3237,6 +3252,13 @@ pub enum ColumnExpr {
         expr: Box<pg_query::protobuf::Node>,
         fields: Vec<RowField>,
         params: Vec<Bson>,
+        /// The type each of `params` was declared as while the expression
+        /// was planned. A scalar subquery folded into a parameter declares
+        /// its column's type then (`declare_sublink_param`), and the
+        /// declaration is gone by the time a row is evaluated: without it
+        /// `f = (select 'uu  '::text)` read the value as untyped and
+        /// compared it as `bpchar` (RP-792).
+        param_types: Vec<Option<String>>,
         result_type: String,
         /// Each field's `char(n)` width, when it has one: the value is
         /// padded to it before evaluation.
@@ -3738,6 +3760,10 @@ pub struct SubscriptAssign {
     pub typmod: i32,
     pub subs: Vec<SubscriptTarget>,
     pub value: ColumnExpr,
+    /// Over a `jsonb` column, the type each subscript is coerced to
+    /// (`jsonb_subscript_transform`); the assignment is then jsonb's
+    /// `jsonb_set_element`, not an array's (RP-772).
+    pub jsonb: Option<Vec<jsonb_subs::SubscriptKind>>,
 }
 
 /// One subscript of an assignment target. A bound is an expression over the
@@ -4061,6 +4087,70 @@ fn vector_scalars(values: Vec<Bson>, element: &str) -> Vec<Bson> {
         .collect()
 }
 
+/// The subscripts of a jsonb reference, each with the type it is coerced
+/// to (`jsonb_subscript_transform`): a slice anywhere is 42804, as is a
+/// subscript of a type that coerces to neither `int4` nor `text`.
+fn jsonb_subscript_kinds(
+    indirection: &[pg_query::protobuf::Node],
+    mut type_of: impl FnMut(&pg_query::protobuf::Node) -> Result<String>,
+) -> Result<Vec<(&pg_query::protobuf::Node, jsonb_subs::SubscriptKind)>> {
+    let mut out = Vec::with_capacity(indirection.len());
+    let indices: Vec<&pg_query::protobuf::AIndices> = indirection
+        .iter()
+        .filter_map(|i| match i.node.as_ref() {
+            Some(N::AIndices(ix)) => Some(ix.as_ref()),
+            _ => None,
+        })
+        .collect();
+    // The transform refuses a slice while it reads the FIRST subscript,
+    // at that subscript's upper bound (its lower one when there is none).
+    if indices.iter().any(|ix| ix.is_slice) {
+        if let Some(loc) = indices
+            .first()
+            .and_then(|ix| ix.uidx.as_deref().or(ix.lidx.as_deref()))
+            .and_then(expr_location)
+        {
+            set_error_location(loc);
+        }
+        return Err(jsonb_subs::slice_error());
+    }
+    for ix in indices {
+        let sub = ix.uidx.as_deref().ok_or_else(jsonb_subs::slice_error)?;
+        let kind = jsonb_subs::subscript_kind(&type_of(sub)?).inspect_err(|_| {
+            if let Some(loc) = expr_location(sub) {
+                set_error_location(loc);
+            }
+        })?;
+        out.push((sub, kind));
+    }
+    Ok(out)
+}
+
+/// `j['a'][1]`: jsonb's subscripting handler's fetch (RP-772,
+/// [`jsonb_subs`]). The subscripts are typed first, so a NULL source still
+/// refuses a `numeric` one, as on PostgreSQL 15.19.
+fn jsonb_subscript_fetch(
+    value: Bson,
+    indirection: &[pg_query::protobuf::Node],
+    params: &[Bson],
+) -> Result<Bson> {
+    let subs = jsonb_subscript_kinds(indirection, |n| {
+        let v = const_value(n, params)?;
+        Ok(static_type(n, &v))
+    })?;
+    if value == Bson::Null {
+        return Ok(Bson::Null);
+    }
+    let mut path = Vec::with_capacity(subs.len());
+    for (n, kind) in subs {
+        match jsonb_subs::path_step(&const_value(n, params)?, kind)? {
+            Some(step) => path.push(step),
+            None => return Ok(Bson::Null),
+        }
+    }
+    jsonb_subs::fetch(&value, &path)
+}
+
 /// `a[i]`, `a[lo:hi]` and their multidimensional forms.
 ///
 /// Two rules decide the shape of the answer, and both are PostgreSQL's rather
@@ -4077,6 +4167,9 @@ fn array_subscript(
     params: &[Bson],
 ) -> Result<Bson> {
     let value = const_value(arg, params)?;
+    if static_type(arg, &value) == "jsonb" {
+        return jsonb_subscript_fetch(value, indirection, params);
+    }
     if value == Bson::Null {
         return Ok(Bson::Null);
     }
@@ -4149,6 +4242,10 @@ fn array_subscript(
     let lower = arrays::lower_bounds(&value);
     let value = arrays::strip(&value);
     if !matches!(value, Bson::Array(_)) {
+        // `transformContainerSubscripts` reports it at the container.
+        if let Some(loc) = expr_location(arg) {
+            set_error_location(loc);
+        }
         return Err(Error::DatatypeMismatch(format!(
             "cannot subscript type {} because it does not support subscripting",
             static_type(arg, &value)
@@ -7862,6 +7959,28 @@ fn assignment_pathway(source: &str, target: &str) -> bool {
         }
     }
     funcsig::category_of_oid(t) == Some('S')
+}
+
+/// `can_coerce_type(source, target, COERCION_IMPLICIT)` for a scalar
+/// target (`parse_coerce.c`): the same type, or a `pg_cast` row (built in or
+/// a user's) whose context is IMPLICIT. A domain is seen through to its
+/// base type (`find_coercion_pathway`'s `getBaseType`). There is no I/O
+/// fallback at the implicit level.
+pub(crate) fn implicit_pathway(source: &str, target: &str) -> bool {
+    let source = domains::domain_base(source).unwrap_or_else(|| source.to_string());
+    let (Some(s), Some(t)) = (user_casts::type_oid(&source), user_casts::type_oid(target)) else {
+        return false;
+    };
+    if s == t {
+        return true;
+    }
+    if let Some((.., context, _)) = pg_casts::BUILTIN_CASTS
+        .iter()
+        .find(|(_, cs, ct, ..)| *cs == s && *ct == t)
+    {
+        return *context == b'i';
+    }
+    user_casts::find(&source, target).is_some_and(|cast| cast.context == 'i')
 }
 
 /// Does PL/pgSQL assign a value of type `source` to a variable declared
@@ -12765,7 +12884,7 @@ fn plan_on_conflict(
                 set_exprs,
                 // Filled from the statement as written (`domain_scope`).
                 of_domain: Vec::new(),
-                filter,
+                filter: filter.map(Box::new),
             }
         }
         _ => return Err(Error::Unsupported("this ON CONFLICT action".into())),
@@ -13825,6 +13944,14 @@ fn jsonb_field(def: &TableDef, field: &str) -> bool {
         .any(|c| c.pg_type == "jsonb" && c.field() == field)
 }
 
+/// Is `field` a `bpchar` column of `def`? Its sort key then orders as
+/// `bpcharcmp`, without the trailing blanks.
+fn bpchar_field(def: &TableDef, field: &str) -> bool {
+    def.columns
+        .iter()
+        .any(|c| is_bpchar_type(&c.pg_type) && c.field() == field)
+}
+
 /// One PARTITION BY or ORDER BY key of a window.
 ///
 /// A PARTITION BY item is a bare expression rather than a `SortBy`, so the two
@@ -13867,6 +13994,7 @@ fn window_sort_key(
                     ascending,
                     nulls,
                     jsonb: column.pg_type == "jsonb",
+                    bpchar: is_bpchar_type(&column.pg_type),
                     expr: None,
                 });
             }
@@ -13897,6 +14025,7 @@ fn window_sort_key(
         ascending,
         nulls,
         jsonb: false,
+        bpchar: false,
         expr: Some(expr),
     })
 }
@@ -16641,6 +16770,7 @@ fn plan_series_select(
             ascending,
             nulls,
             jsonb: false,
+            bpchar: false,
             expr: None,
         });
     }
@@ -17683,6 +17813,90 @@ fn bpchar_compared_operands(
     (lhs, rhs)
 }
 
+/// Whether an IN list's member reads a Var of its own query: a column, or
+/// a row's column standing as a `$n` past the statement's `row_from`
+/// parameters (`contain_vars_of_level(rexpr, 0)` in `transformAExprIn`).
+fn in_member_has_var(item: &pg_query::protobuf::Node, row_from: usize) -> bool {
+    if matches!(item.node.as_ref(), Some(N::ColumnRef(_))) {
+        return true;
+    }
+    if let Some(N::ParamRef(p)) = item.node.as_ref() {
+        return usize::try_from(p.number).is_ok_and(|n| n > row_from);
+    }
+    item.node.as_ref().is_some_and(|n| {
+        n.nodes().iter().any(|(x, _, _, _)| match x {
+            pg_query::NodeRef::ColumnRef(_) => true,
+            pg_query::NodeRef::ParamRef(p) => usize::try_from(p.number).is_ok_and(|n| n > row_from),
+            _ => false,
+        })
+    })
+}
+
+/// Whether an IN operand is an untyped literal or NULL, which
+/// `select_common_type` reads as `unknown`, taking the others' type.
+fn in_member_untyped(n: &pg_query::protobuf::Node) -> bool {
+    matches!(n.node.as_ref(), Some(N::AConst(c))
+        if c.isnull || matches!(c.val, Some(pg_query::protobuf::a_const::Val::Sval(_))))
+}
+
+/// The type `transformAExprIn` coerces an IN list's non-Var members to, when
+/// there are more than one of them: `select_common_type` over the left
+/// operand and those members, kept only where it has an array type, so not
+/// for a row, a record or an array (`get_array_type`). `None` -- every
+/// member a plain `=` -- otherwise, and wherever a type cannot be told or
+/// the inputs share no category (`select_common_type` with no context).
+fn in_list_common_type(
+    e: &AExpr,
+    items: &[pg_query::protobuf::Node],
+    row_from: usize,
+) -> Option<String> {
+    let nonvars: Vec<&pg_query::protobuf::Node> = items
+        .iter()
+        .filter(|item| !in_member_has_var(item, row_from))
+        .collect();
+    if nonvars.len() < 2 {
+        return None;
+    }
+    let lexpr = e.lexpr.as_deref()?;
+    let mut typed: Vec<String> = Vec::new();
+    let mut untyped = 0;
+    for n in std::iter::once(lexpr).chain(nonvars.iter().copied()) {
+        if in_member_untyped(n) {
+            untyped += 1;
+            continue;
+        }
+        let t = static_type(n, &Bson::Null);
+        if t.is_empty() || t == "unknown" {
+            return None;
+        }
+        typed.push(t);
+    }
+    // All of exactly one type keep it, a domain included; otherwise each is
+    // read as its base type (`getBaseType`).
+    let common = if untyped == 0 && typed.windows(2).all(|w| w[0] == w[1]) {
+        typed.first()?.clone()
+    } else {
+        let mut out: Option<String> = None;
+        for t in typed {
+            let t = domain_base(t);
+            out = Some(match out {
+                None => t,
+                Some(o) => optype::select_common(&o, &t)?,
+            });
+        }
+        out.unwrap_or_else(|| "text".to_string())
+    };
+    let base = domain_base(common.clone());
+    if base.ends_with("[]")
+        || matches!(base.as_str(), "record" | "unknown")
+        || user_composite(&base).is_some()
+        || pgtypes::oid_of_name(&base).is_none()
+    {
+        return None;
+    }
+    Some(common)
+}
+
 /// Which sides of `x op ANY / ALL (array)` drop their trailing blanks:
 /// `(x, the array's elements)`, given `x`'s type and the array's.
 ///
@@ -17746,10 +17960,17 @@ fn row_column_expr(
             })
             .collect()
     });
+    let param_types = PLAN_PARAM_TYPES.with(|t| {
+        let t = t.borrow();
+        (0..params.len())
+            .map(|i| t.get(i).cloned().flatten())
+            .collect()
+    });
     let mut out = ColumnExpr::Row {
         expr: Box::new(expr.clone()),
         fields: fields.to_vec(),
         params: params_read_by(&expr, params),
+        param_types,
         result_type: String::new(),
         widths,
         scratch: RowScratch::default(),
@@ -18244,6 +18465,7 @@ pub fn apply_row_expr(expr: &ColumnExpr, row: &Document) -> Result<Bson> {
         expr,
         fields,
         params,
+        param_types,
         widths,
         scratch,
         ..
@@ -18269,7 +18491,7 @@ pub fn apply_row_expr(expr: &ColumnExpr, row: &Document) -> Result<Bson> {
     });
     // The declared types are the expression's own, the same for every row:
     // installed from its memo rather than built again (RP-131).
-    let previous = expr_memo::declare_row_fields(&scratch.1, params.len(), fields);
+    let previous = expr_memo::declare_row_fields(&scratch.1, params.len(), param_types, fields);
     let n = params.len();
     let _memo = expr_memo::install(&scratch.1, expr);
     let run = |all: &[Bson]| correlated::with_row_params_from(n, || const_value(expr, all));
@@ -19333,6 +19555,7 @@ fn plan_aggregate_item(
             ascending,
             nulls,
             jsonb: false,
+            bpchar: false,
             expr: None,
         }];
         // The further ordering columns, an expression computed into a
@@ -19968,6 +20191,7 @@ fn plan_aggregate_order(
         };
         keys.push(OrderKey {
             jsonb: jsonb_field(def, &field),
+            bpchar: bpchar_field(def, &field),
             field,
             ascending,
             nulls,
@@ -27385,6 +27609,7 @@ fn plan_select_rest(
             .map(|i| order_exprs[i].clone());
         order.push(OrderKey {
             jsonb: jsonb_field(&def, &field),
+            bpchar: bpchar_field(&def, &field),
             field,
             ascending,
             nulls,
@@ -30225,6 +30450,8 @@ fn static_type_uncached(node: &pg_query::protobuf::Node, value: &Bson) -> String
                 None if base == "oidvector" => if any_slice { "oid[]" } else { "oid" }.to_string(),
                 // `name` is an array of `"char"`.
                 None if base == "name" => QUOTED_CHAR.to_string(),
+                // jsonb's subscripting handler returns jsonb (RP-772).
+                None if base == "jsonb" => base,
                 None if base == "point" => "float8".to_string(),
                 None if matches!(base.as_str(), "lseg" | "box") => "point".to_string(),
                 None => inferred_type(value).to_string(),
@@ -31400,6 +31627,7 @@ fn plan_select_srf(
             ascending,
             nulls,
             jsonb: false,
+            bpchar: false,
             expr: None,
         });
     }
@@ -43460,6 +43688,28 @@ fn plan_subscript_assign(
     params: &[Bson],
     sample: &Document,
 ) -> Result<SubscriptAssign> {
+    if column.pg_type == "jsonb" {
+        let kinds = jsonb_subscript_kinds(indirection, |n| {
+            row_column_expr(n, fields, params, sample).map(|e| column_expr_type(&e).to_string())
+        })?;
+        let mut subs = Vec::with_capacity(kinds.len());
+        let mut jsonb = Vec::with_capacity(kinds.len());
+        for (n, kind) in kinds {
+            subs.push(SubscriptTarget::Index(row_column_expr(
+                n, fields, params, sample,
+            )?));
+            jsonb.push(kind);
+        }
+        return Ok(SubscriptAssign {
+            field: field.to_string(),
+            pg_type: column.pg_type.clone(),
+            value_type: "jsonb".to_string(),
+            typmod: -1,
+            subs,
+            value: row_column_expr(val, fields, params, sample)?,
+            jsonb: Some(jsonb),
+        });
+    }
     let element = column.pg_type.strip_suffix("[]").ok_or_else(|| {
         Error::DatatypeMismatch(format!(
             "cannot subscript type {} because it does not support subscripting",
@@ -43504,6 +43754,7 @@ fn plan_subscript_assign(
         typmod: column.typmod,
         subs,
         value: row_column_expr(val, fields, params, sample)?,
+        jsonb: None,
     })
 }
 
@@ -43512,6 +43763,22 @@ fn plan_subscript_assign(
 /// ([`array_assign`]): a one-dimensional array grows to meet a subscript
 /// past either end, NULL-filling the gap; a multidimensional one does not.
 fn apply_subscript_assign(a: &SubscriptAssign, row: &Document, current: Bson) -> Result<Bson> {
+    if let Some(kinds) = &a.jsonb {
+        // `jsonb_subscript_check_subscripts`: every subscript as text, none
+        // NULL; then the value, NULL being JSON `null`.
+        let mut path = Vec::with_capacity(kinds.len());
+        for (s, kind) in a.subs.iter().zip(kinds) {
+            let SubscriptTarget::Index(e) = s else {
+                return Err(jsonb_subs::slice_error());
+            };
+            let step = jsonb_subs::path_step(&apply_row_expr(e, row)?, *kind)?
+                .ok_or_else(jsonb_subs::null_subscript_error)?;
+            path.push(step);
+        }
+        let expect_array = kinds.first() == Some(&jsonb_subs::SubscriptKind::Int);
+        let value = cast_value(apply_row_expr(&a.value, row)?, "jsonb")?;
+        return jsonb_subs::assign(&current, &path, expect_array, &value);
+    }
     // The subscripts are evaluated and checked first (none may be NULL),
     // then the value (`ExecEvalSubscriptingRef`'s order).
     let bound = |e: &Option<ColumnExpr>| e.as_ref().map(|e| apply_row_expr(e, row)).transpose();
@@ -46317,12 +46584,35 @@ fn const_value_node(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result<
                 rexpr: None,
                 location: e.location,
             };
+            // More than one member with no Var in it is one array comparison
+            // over the list's common type (`transformAExprIn`): those members
+            // are coerced to it first, so a `text` one against a `char(n)`
+            // operand is read as `bpchar` (RP-792). The rest, and every
+            // member of a list with one such, are a plain `=` each.
+            let row_from = correlated::row_params_from();
+            let common = expr_memo::in_list_type(e, || in_list_common_type(e, items, row_from));
             for (i, item) in items.iter().enumerate() {
                 if i % 1024 == 1023 {
                     cancel::check()?;
                 }
                 let mut eq = base.clone();
-                eq.rexpr = Some(Box::new(item.clone()));
+                eq.rexpr = Some(Box::new(match common.as_deref() {
+                    Some(t)
+                        if !in_member_has_var(item, row_from)
+                            && (in_member_untyped(item) || static_type(item, &Bson::Null) != t) =>
+                    {
+                        let mut cast = type_name_node(t);
+                        cast.location = -1;
+                        pg_query::protobuf::Node {
+                            node: Some(N::TypeCast(Box::new(pg_query::protobuf::TypeCast {
+                                arg: Some(Box::new(item.clone())),
+                                type_name: Some(cast),
+                                location: -1,
+                            }))),
+                        }
+                    }
+                    _ => item.clone(),
+                }));
                 match const_value(
                     &pg_query::protobuf::Node {
                         node: Some(N::AExpr(Box::new(eq))),
@@ -48607,14 +48897,25 @@ fn lower_in(e: &AExpr, def: &TableDef, params: &[Bson]) -> Result<Document> {
         Some(N::List(l)) => &l.items,
         _ => return Err(Error::Unsupported("this IN list".into())),
     };
+    // `transformAExprIn` builds one array comparison only from more than one
+    // non-Var member: then the members take the list's common type
+    // (`select_common_type` keeps the first, `bpchar`, as `text` and
+    // `bpchar` coerce both ways), so a `char(n)` column compares each as
+    // `bpchar`, even a `text` one: `f in ('xy  '::text, 'q')` finds `'xy'`
+    // (RP-691). One member is a plain `=` (`make_op`), resolved like any
+    // comparison: against `text` it is `texteq` over the `rtrim`med column,
+    // so `f in ('xy  '::text)` finds nothing (RP-793).
+    let text_wins = items.len() == 1;
     let mut values = Vec::new();
     let mut saw_null = false;
     for item in items {
-        // An IN list's members take the column's type (`select_common_type`
-        // keeps the first, `bpchar`, as `text` and `bpchar` coerce both
-        // ways), so a `char(n)` column compares each as `bpchar`, even a
-        // `text` one: `f in ('xy  '::text)` finds `'xy'` (RP-691).
-        let v = bpchar_operand(def, &field, Some(item), const_value(item, params)?, false);
+        let v = bpchar_operand(
+            def,
+            &field,
+            Some(item),
+            const_value(item, params)?,
+            text_wins,
+        );
         let v = coerce_to_column(def, &field, reg_oid_operand(v))?;
         if v == Bson::Null {
             saw_null = true;
@@ -48678,8 +48979,9 @@ fn lower_in(e: &AExpr, def: &TableDef, params: &[Bson]) -> Result<Document> {
 /// value PostgreSQL 15.19 casts the column to `text` (`rtrim`) and compares
 /// `text`s: `f = 'xy  '::text` finds nothing and `f < 'xy '::text` finds
 /// `'xy'` (RP-685). The stored value is the column's `rtrim` already, so
-/// that constant is compared as it is. An IN list passes `false`: its
-/// members are coerced to the column's type first (RP-691).
+/// that constant is compared as it is. An IN list of more than one member
+/// passes `false`: its members are coerced to the list's common type,
+/// `bpchar`, first (RP-691); one member is a plain `=` (RP-793).
 fn bpchar_operand(
     def: &TableDef,
     field: &str,

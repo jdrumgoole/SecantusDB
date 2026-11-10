@@ -4,8 +4,8 @@ assignment to an array element was refused):
 - an array literal whose upper bound passes `int4` was accepted, where
   `array_in`'s `ArrayCheckBounds` refuses it (fixed, RP-771);
 - jsonb subscripting -- a fetch, an UPDATE's `SET j['k'] = v`, a PL/pgSQL
-  `x['k'] := v` -- is refused, the first two with a 42804 that says jsonb
-  does not support subscripting.
+  `x['k'] := v` -- was refused, the first two with a 42804 that said jsonb
+  does not support subscripting (fixed, RP-772: `jsonbsubs.c` ported).
 
 The expected answers were measured on PostgreSQL 15.19: the SELECT and DO
 statements on the shared reference (they create nothing), the UPDATEs on a
@@ -110,7 +110,117 @@ JSONB_SUBSCRIPTS = {
 }
 
 
-@pytest.mark.backlog("RP-772")
+@pytest.mark.backlog_fixed("RP-772")
 @pytest.mark.parametrize("query", list(JSONB_SUBSCRIPTS))
 def test_jsonb_subscripting(query: str, dsn: str) -> None:
     assert _answer(dsn, query) == JSONB_SUBSCRIPTS[query]
+
+
+# The rest of `jsonbsubs.c` and `setPath`: each subscript is coerced to the
+# ONE of int4 and text it coerces to implicitly (a slice, a bigint, a
+# numeric or a boolean is 42804); an array step is `strtoint`'s (leading
+# blanks taken, trailing ones not); a NULL source is `[]` under an integer
+# first subscript, `{}` otherwise; a missing path is built and an array
+# padded with nulls; a negative index past the start, a step into a scalar
+# and a NULL subscript are refused. Measured on PostgreSQL 15.19 (the
+# UPDATEs on a private cluster with `_SETUP`).
+JSONB_SUBSCRIPT_EDGES = {
+    "select ('{\"a\": [1, 2]}'::jsonb)['a'][-1]": ("ok", [(2,)], []),
+    "select ('[1, 2]'::jsonb)[' 1']": ("ok", [(2,)], []),
+    "select ('[1, 2]'::jsonb)['1 ']": ("ok", [(None,)], []),
+    "select ('{\"1\": 5}'::jsonb)[1]": ("ok", [(5,)], []),
+    "select ('{\"a\": 1}'::jsonb)[null]": ("ok", [(None,)], []),
+    "select ('\"x\"'::jsonb)['a']": ("ok", [(None,)], []),
+    "select pg_typeof(('{\"a\": 1}'::jsonb)['a'])": ("ok", [("jsonb",)], []),
+    "select ('{\"a\": 1}'::jsonb)[1.5]": (
+        "error",
+        "42804",
+        "subscript type numeric is not supported",
+    ),
+    "select ('{\"a\": 1}'::jsonb)[1::int8]": (
+        "error",
+        "42804",
+        "subscript type bigint is not supported",
+    ),
+    "select ('{\"a\": 1}'::jsonb)['a':'b']": (
+        "error",
+        "42804",
+        "jsonb subscript does not support slices",
+    ),
+    "select (null::jsonb)[true]": ("error", "42804", "subscript type boolean is not supported"),
+    "select k, j['a'][0], j['a'][k] from j711": ("ok", [(1, 1, None)], []),
+    "do $$ declare x jsonb := '[1]'; begin x[5] := '2'; raise notice '%', x; end $$": (
+        "ok",
+        None,
+        ["[1, null, null, null, null, 2]"],
+    ),
+    "do $$ declare x jsonb; begin x[2] := '1'; raise notice '%', x; end $$": (
+        "ok",
+        None,
+        ["[null, null, 1]"],
+    ),
+    "do $$ declare x jsonb := '[]'; begin x[1]['a'][0] := '1'; raise notice '%', x; end $$": (
+        "ok",
+        None,
+        ['[null, {"a": [1]}]'],
+    ),
+    "do $$ declare x jsonb := '[1]'; begin x[-5] := '2'; end $$": (
+        "error",
+        "22023",
+        "path element at position 1 is out of range: -5",
+    ),
+    "do $$ declare x jsonb := '1'; begin x['a'] := '2'; end $$": (
+        "error",
+        "22023",
+        "cannot replace existing key",
+    ),
+    "do $$ declare x jsonb := '{}'; begin x[null] := '1'; end $$": (
+        "error",
+        "22004",
+        "jsonb subscript in assignment must not be null",
+    ),
+    "do $$ declare x jsonb := '[1]'; begin x['a'] := '1'; end $$": (
+        "error",
+        "22P02",
+        'path element at position 1 is not an integer: "a"',
+    ),
+    "do $$ declare x jsonb := '[1]'; begin x[1:2] := '5'; end $$": (
+        "error",
+        "42804",
+        "jsonb subscript does not support slices",
+    ),
+    "update j711 set j[k] = '1' where k = 1 returning j": ("ok", [({"1": 1, "a": [1]},)], []),
+    "update j711 set j['a'] = null where k = 1 returning j": ("ok", [({"a": None},)], []),
+    "update j711 set j['a'][-1] = '7' where k = 1 returning j": ("ok", [({"a": [7]},)], []),
+    "update j711 set j['b']['c'][1] = '7' where k = 1 returning j": (
+        "ok",
+        [({"a": [1], "b": {"c": [None, 7]}},)],
+        [],
+    ),
+    "update j711 set j['a'][null::int] = '1' where k = 1 returning j": (
+        "error",
+        "22004",
+        "jsonb subscript in assignment must not be null",
+    ),
+    "update j711 set j['a'][-3] = '1' where k = 1 returning j": (
+        "error",
+        "22023",
+        "path element at position 2 is out of range: -3",
+    ),
+    "update j711 set j['a']['b'] = '1' where k = 1 returning j": (
+        "error",
+        "22P02",
+        'path element at position 2 is not an integer: "b"',
+    ),
+    "update j711 set j['a'][0]['x'] = '1' where k = 1 returning j": (
+        "error",
+        "22023",
+        "cannot replace existing key",
+    ),
+}
+
+
+@pytest.mark.backlog_fixed("RP-772")
+@pytest.mark.parametrize("query", list(JSONB_SUBSCRIPT_EDGES))
+def test_jsonb_subscripting_edges(query: str, dsn: str) -> None:
+    assert _answer(dsn, query) == JSONB_SUBSCRIPT_EDGES[query]

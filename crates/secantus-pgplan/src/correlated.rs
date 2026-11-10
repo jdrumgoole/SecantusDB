@@ -2788,6 +2788,12 @@ pub(crate) fn with_call_args_kind<R>(kind: CallArgs, f: impl FnOnce() -> R) -> R
     out
 }
 
+/// The number of statement parameters the row expression now running has:
+/// a `$n` past it is one of the row's columns (`usize::MAX` outside one).
+pub(crate) fn row_params_from() -> usize {
+    ROW_PARAMS_FROM.with(|c| c.get())
+}
+
 /// Evaluate `f` with parameters numbered past `n` being a row's columns.
 pub(crate) fn with_row_params_from<R>(n: usize, f: impl FnOnce() -> R) -> R {
     let previous = ROW_PARAMS_FROM.with(|c| c.replace(n));

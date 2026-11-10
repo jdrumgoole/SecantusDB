@@ -2627,25 +2627,6 @@ nothing. The gap tests are in `tests/backlog/test_rp_found_rp712.py`.
       Verify: tests/backlog/test_rp_found_rp712.py::test_literal_input_error_in_an_assignment_carries_its_query
       Backlog-ID: RP-753
 
-## Found while working RP-711 (2026-11-10)
-
-Measured on PostgreSQL 15.19: the SELECT and DO statements on the shared
-reference on port 5415 (they create nothing), the UPDATEs on a private
-cluster with the `_SETUP` in `tests/backlog/test_rp_found_rp711.py`:
-`j711(k int primary key, j jsonb)` holding `(1, '{"a": [1]}')`.
-
-- [ ] **jsonb subscripting is refused.** `('{"a": [1,2]}'::jsonb)['a'][1]`
-      is `2` on PostgreSQL 15.19; `update j711 set j['b'] = '2'` makes
-      `{"a": [1], "b": 2}`, and `set j['a'][3] = '5'` pads the array to
-      `{"a": [1, null, null, 5]}` (`jsonb_set_element`, which builds the
-      missing path); in PL/pgSQL `x['a']['b'] := '1'` over a NULL `jsonb`
-      makes `{"a": {"b": 1}}`. Here the fetch and the UPDATE are 42804
-      `cannot subscript type jsonb because it does not support
-      subscripting` -- a wrong statement about jsonb, not a gap named as
-      one -- and the PL/pgSQL assignment is 0A000.
-      Verify: tests/backlog/test_rp_found_rp711.py::test_jsonb_subscripting
-      Backlog-ID: RP-772
-
 ## Found while working RP-668 (2026-11-09)
 
 Measured on a private PostgreSQL 15.19 cluster with the `_SCOPE_SETUP` in
@@ -3501,50 +3482,51 @@ statement is VALUES-only and runs there as written. The gap tests are in
       Verify: tests/backlog/test_rp_found_rp757.py::test_a_scalar_subquery_under_a_boolean_test_or_collate
       Backlog-ID: RP-774
 
-## Found while working RP-775 (2026-11-10)
+## Found while working RP-792 (2026-11-10)
 
-Measured on PostgreSQL 15.19: the VALUES-only statements on the shared
-reference (port 5415), the stored-table ones on a private, freshly
-initdb'd cluster. The gap tests are in
-`tests/backlog/test_rp_found_rp775.py`.
+Measured on the shared PostgreSQL 15.19 reference (port 5415) with
+FROM-less and VALUES-only statements. The gap test is in
+`tests/backlog/test_rp_found_rp792.py`.
 
-- [ ] **Per row, a `char(n)` operand against a `text` one resolves the
-      operator wrongly in two shapes.** Evaluated per row -- a select
-      list, or a WHERE over a VALUES list or a set operation (RP-775 sends
-      those to the evaluator) -- over `(values ('uu'::char(4)), ('tt'),
-      ('vv')) s(f)` on PostgreSQL 15.19: `f in ('uu  '::text, 'tt')` is
-      true for `uu  ` (more than one non-Var member, so
-      `transformAExprIn` compares as the list's common type, `bpchar`),
-      and `f = (select 'uu  ')` is false for every row (the subquery's
-      column is `text`, so `texteq` over the `rtrim`med column). Here the
-      first compares the `text` member as `text` (it expands the list to
-      one `=` per member, which is right only for one member), and the
-      second as `bpchar`: the subquery's value is a parameter whose type
-      `declare_sublink_param` records while planning, and the per-row
-      evaluation no longer sees it. The same on a stored `char(n)`
-      table's select list. The WHERE forms over a VALUES list that the
-      MQL filter answered wrongly were RP-775.
-      Verify: tests/backlog/test_rp_found_rp775.py::test_a_char_operand_against_text_per_row
-      Backlog-ID: RP-792
-- [ ] **A one-member `IN` list of `text` over a `char(n)` column compares
-      as `bpchar`.** Over a stored `char(4)` column holding `uu`, `where
-      f in ('uu  '::text)` finds nothing on PostgreSQL 15.19 (a private
-      cluster): `transformAExprIn` builds the `bpchar[]` comparison only
-      for more than one non-Var member, and one member is a plain `=`,
-      which against `text` resolves to `texteq` over the `rtrim`med
-      column. Here `lower_in` coerces every member to the column's type
-      and drops its blanks, so `uu` matches, and `not in` drops it. Its
-      comment (RP-691) states the one-member case the wrong way round.
-      Verify: tests/backlog/test_rp_found_rp775.py::test_a_one_member_text_in_list_compares_as_text
-      Backlog-ID: RP-793
-- [ ] **An ORDER BY over an unsized `bpchar` column of a VALUES list or a
-      set operation counts the trailing blanks.** `select f from (values
-      ('a  '::char(3)), (E'a\t')) s(f) order by f` is `a  `, `a<tab>` on
-      PostgreSQL 15.19: `bpcharcmp` compares `bcTruelen` lengths, so `'a  '`
-      sorts as `'a'`. The column is unsized (its members' modifiers
-      differ), so its cells keep their blanks (`stored_bpchar_cell` has no
-      width to pad back to), and the sort here reads them: a blank (0x20)
-      after a tab (0x09), so the order is reversed. The same over `(select
-      'a'::char(3) f union all select E'a\t') s`, and with DESC.
-      Verify: tests/backlog/test_rp_found_rp775.py::test_an_unsized_bpchar_column_sorts_without_its_blanks
-      Backlog-ID: RP-794
+- [ ] **An IN list's untyped member that its common type cannot read is
+      no error once an earlier member matches.** `select 1 in (1, 'x')`
+      is 22P02 `invalid input syntax for type integer: "x"` on PostgreSQL
+      15.19, and so is `select x, x in (1, 'x') from (values (1)) s(x)`,
+      even `... where false`: `transformAExprIn` coerces every non-Var
+      member to the list's common type while the statement is analysed,
+      before a row is read. Here the members are compared one at a time
+      and the first match ends the list, so both answer `true`, and with
+      no rows nothing is checked. (A WHERE that lowers to a filter, and
+      `1 = any(array[1, 'x'])`, already raise it.)
+      Verify: tests/backlog/test_rp_found_rp792.py::test_an_in_lists_unreadable_member_is_an_error
+      Backlog-ID: RP-806
+
+## Found while working RP-794 (2026-11-10)
+
+Measured on the shared PostgreSQL 15.19 reference (port 5415); the
+statements are VALUES-only and create nothing. The gap tests are in
+`tests/backlog/test_rp_found_rp794.py`.
+
+- [ ] **An untyped literal typed `bpchar` beside a `char(n)` loses its
+      trailing blanks.** `select 'a'::char(3) union all select 'b '` is
+      `a  `, `b ` on PostgreSQL 15.19, and so is `(values ('a'::char(3)),
+      ('b ')) s(f)`: the column is `bpchar` with no modifier (the literal
+      is `unknown`, resolved to the `char(3)` member's type, and the
+      members' modifiers differ), so `octet_length` of `'b '` is 2. Here
+      it reads back `b`, 1 byte: the literal's blanks are dropped where it
+      is coerced to `bpchar`, while a member cast to `char(2)` keeps
+      them (`('b '::char(2))` agrees). A wrong value, not only a wrong
+      length.
+      Verify: tests/backlog/test_rp_found_rp794.py::test_an_untyped_literal_resolved_to_bpchar_keeps_its_blanks
+      Backlog-ID: RP-804
+- [ ] **`string_agg` over an unsized `bpchar` column keeps its blanks.**
+      `select string_agg(f, '|') from (values ('a  '::char(3)),
+      ('b'::char(2))) s(f)` is `a|b` on PostgreSQL 15.19: the argument
+      reaches `string_agg(text, text)` through the implicit `bpchar` ->
+      `text` cast (`rtrim1`), which drops the trailing blanks. Here it is
+      `a  |b `: the unsized column's cells keep their blanks and the
+      aggregate joins them uncast. `f::text` and `length(f::text)` over the
+      same column already agree, and so does a `char(3)` column of both
+      members.
+      Verify: tests/backlog/test_rp_found_rp794.py::test_string_agg_over_an_unsized_bpchar_drops_its_blanks
+      Backlog-ID: RP-805

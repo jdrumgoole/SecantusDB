@@ -6165,12 +6165,58 @@ fn a_blank_keeping_bpchar_column_is_compared_per_row() {
     assert_eq!(planned("SELECT f FROM t WHERE f = 'uu'"), (false, false));
 }
 
+/// An IN list of more than one non-Var member compares those members as
+/// the list's common type (`transformAExprIn`): against a `char(n)` operand
+/// that is `bpchar`, so a `text` or `varchar` member's trailing blanks do
+/// not count. A Var member, and a list with one constant, are a plain `=`
+/// each, which against `text` is `texteq` (RP-792).
+#[test]
+fn an_in_lists_constants_take_its_common_type() {
+    let calc = |sql: &str| match plan_ok(&format!("SELECT {sql}")) {
+        Statement::SelectConstant(sc) => match &sc.columns[0].1 {
+            ConstCol::Value(v) => v.clone(),
+            other => panic!("{sql} -> {other:?}"),
+        },
+        other => panic!("wrong statement for {sql}: {other:?}"),
+    };
+    for (sql, want) in [
+        ("'uu'::char(4) in ('uu  '::text, 'tt')", true),
+        ("'uu'::char(4) in ('uu  '::text, 'tt'::varchar)", true),
+        ("'uu'::char(4) not in ('uu  '::text, 'tt')", false),
+        ("'uu'::char(4) in ('uu  '::text)", false),
+        ("'uu  '::text in ('uu'::char(4), 'tt')", false),
+        ("1 in (1.0, 2.5)", true),
+        ("2 in ('2', 2.5)", true),
+    ] {
+        assert_eq!(calc(sql), Bson::Boolean(want), "{sql}");
+    }
+    // Evaluated per row: the column is a `$n` past the statement's
+    // parameters, a Var, and the constants still meet as `bpchar`.
+    let def = TableDef::new("c", vec![Column::new("f", "bpchar", false)]);
+    let row = |f: &str| doc! {"_id": 1, "f": f};
+    let expr = plan_check_expression("(f in ('uu  '::text, 'tt'))", &def).unwrap();
+    assert_eq!(
+        apply_row_expr(&expr, &row("uu  ")).unwrap(),
+        Bson::Boolean(true)
+    );
+    assert_eq!(
+        apply_row_expr(&expr, &row("vv")).unwrap(),
+        Bson::Boolean(false)
+    );
+    let expr = plan_check_expression("('uu  '::text in (f, 'tt'))", &def).unwrap();
+    assert_eq!(
+        apply_row_expr(&expr, &row("uu")).unwrap(),
+        Bson::Boolean(false)
+    );
+}
+
 /// A constant compared with a `char(n)` column keeps its trailing blanks
 /// only when the comparison is `text`'s: against a `text` or `name` value
 /// PostgreSQL 15.19 casts the column to `text` (RP-685). An untyped, a
-/// `char(n)` or a `varchar` constant, an IN list's members (coerced to the
-/// column's type) and a BETWEEN's untyped bounds compare as `bpchar`, which
-/// drops them (RP-691).
+/// `char(n)` or a `varchar` constant, a longer IN list's members (coerced
+/// to the list's common type) and a BETWEEN's untyped bounds compare as
+/// `bpchar`, which drops them (RP-691); a one-member IN list is a plain `=`
+/// (RP-793).
 #[test]
 fn a_char_n_column_strips_a_constant_only_for_a_bpchar_comparison() {
     let def = TableDef::new(
@@ -6191,6 +6237,9 @@ fn a_char_n_column_strips_a_constant_only_for_a_bpchar_comparison() {
         "SELECT k FROM t WHERE f = 'xy  '::name",
         "SELECT k FROM t WHERE f < 'xy  '::text",
         "SELECT k FROM t WHERE f BETWEEN 'xy  '::text AND 'xz'::text",
+        // One member is a plain `=`, `text`'s (RP-793).
+        "SELECT k FROM t WHERE f IN ('xy  '::text)",
+        "SELECT k FROM t WHERE f NOT IN ('xy  '::text)",
     ] {
         assert!(
             filter(sql).contains("\"xy  \""),

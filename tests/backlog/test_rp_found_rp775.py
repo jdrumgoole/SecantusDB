@@ -2,11 +2,12 @@
 
 - evaluated per row, a `char(n)` operand against a `text` one resolves
   the operator wrongly in two shapes: a longer IN list's `text` member,
-  and a scalar subquery's `text` value (RP-792);
-- a one-member IN list of `text` over a stored `char(n)` column compares
-  as `bpchar`, where PostgreSQL makes it a plain `=`, `text`'s (RP-793);
+  and a scalar subquery's `text` value (RP-792, fixed);
+- a one-member IN list of `text` over a stored `char(n)` column compared
+  as `bpchar`, where PostgreSQL makes it a plain `=`, `text`'s (RP-793,
+  fixed);
 - an ORDER BY over an unsized `bpchar` column of a VALUES list or a set
-  operation counts the cells' trailing blanks (RP-794).
+  operation counted the cells' trailing blanks (RP-794, fixed).
 
 The stored-table answers were measured on a private, freshly initdb'd
 PostgreSQL 15.19 cluster with `_SETUP`; the VALUES-only ones on the shared
@@ -50,7 +51,7 @@ def _answer(dsn: str, query: str, setup: list[str] | None = None) -> object:
 _C = "from (values ('uu'::char(4)), ('tt'), ('vv')) s(f)"
 
 
-@pytest.mark.backlog("RP-792")
+@pytest.mark.backlog_fixed("RP-792")
 @pytest.mark.parametrize(
     ("query", "expected"),
     [
@@ -69,17 +70,41 @@ _C = "from (values ('uu'::char(4)), ('tt'), ('vv')) s(f)"
             f"select f, f = (select 'uu  '::text) {_C} order by f",
             [("tt", False), ("uu  ", False), ("vv", False)],
         ),
+        # A `varchar` member meets `bpchar` as `bpchar` too.
+        (
+            f"select f, f in ('uu  '::text, 'tt'::varchar) {_C} order by f",
+            [("tt", True), ("uu  ", True), ("vv", False)],
+        ),
+        # A Var member is a plain `=` of its own, so only one member is a
+        # constant here: `'uu  '::text` against the column is `texteq`.
+        (
+            f"select f, 'uu  '::text in (f, 'tt') {_C} order by f",
+            [("tt", False), ("uu  ", False), ("vv", False)],
+        ),
+        # The same with no row to read: a FROM-less select list.
+        (
+            "select 'uu'::char(4) in ('uu  '::text, 'tt'), 'uu'::char(4) = (select 'uu  '::text)",
+            [(True, False)],
+        ),
+        # The subquery's value keeps its type per row.
+        (
+            f"select f, pg_typeof((select 'uu  ')) {_C} order by f",
+            [("tt", "text"), ("uu  ", "text"), ("vv", "text")],
+        ),
     ],
 )
 def test_a_char_operand_against_text_per_row(dsn: str, query: str, expected: object) -> None:
     """Evaluated per row -- a select list, or a WHERE over a VALUES list --
-    a `char(n)` operand compares with a `text` member of a longer IN list
+    a `char(n)` operand compared with a `text` member of a longer IN list
     as `text`, and with a scalar subquery's `text` value as `bpchar`
-    (blanks dropped); PostgreSQL 15.19 does the opposite in each."""
+    (blanks dropped); PostgreSQL 15.19 does the opposite in each. The IN
+    list now coerces its non-Var members to their common type, as
+    `transformAExprIn` does, and a row expression keeps the type its
+    subquery's parameter was declared with while it was planned."""
     assert _answer(dsn, query) == expected
 
 
-@pytest.mark.backlog("RP-793")
+@pytest.mark.backlog_fixed("RP-793")
 @pytest.mark.parametrize(
     ("query", "expected"),
     [
@@ -94,12 +119,12 @@ def test_a_one_member_text_in_list_compares_as_text(dsn: str, query: str, expect
     """`transformAExprIn` builds a `bpchar[]` comparison only for more
     than one non-Var member; one member is `f = 'uu  '::text`, which
     resolves to `texteq` over the `rtrim`med column, so nothing matches on
-    PostgreSQL 15.19. Here the member is coerced to `bpchar` and its blanks
-    dropped, so `uu` matches (and NOT IN drops it)."""
+    PostgreSQL 15.19. The member was coerced to `bpchar` and its blanks
+    dropped, so `uu` matched (and NOT IN dropped it)."""
     assert _answer(dsn, query, _SETUP) == expected
 
 
-@pytest.mark.backlog("RP-794")
+@pytest.mark.backlog_fixed("RP-794")
 @pytest.mark.parametrize(
     ("query", "expected"),
     [
@@ -115,14 +140,20 @@ def test_a_one_member_text_in_list_compares_as_text(dsn: str, query: str, expect
             "select f from (select 'a'::char(3) f union all select E'a\\t') s order by f",
             [("a  ",), ("a\t",)],
         ),
+        (
+            "select f, row_number() over (order by f)"
+            " from (values ('a  '::char(3)), (E'a\\t')) s(f) order by 2",
+            [("a  ", 1), ("a\t", 2)],
+        ),
     ],
 )
 def test_an_unsized_bpchar_column_sorts_without_its_blanks(
     dsn: str, query: str, expected: object
 ) -> None:
     """`bpcharcmp` compares the values' `bcTruelen` lengths, so `'a  '`
-    sorts as `'a'`, before `E'a\\t'`, on PostgreSQL 15.19. The column is
-    unsized (its members' modifiers differ), so its cells keep their
-    blanks here, and the sort reads them: a blank (0x20) sorts after a tab
-    (0x09)."""
+    sorts as `'a'`, before `E'a\\t'`, on PostgreSQL 15.19, in an ORDER BY
+    and a window's alike. The column is unsized (its members' modifiers
+    differ), so its cells keep their blanks, and the sort read them: a
+    blank (0x20) sorted after a tab (0x09). A `bpchar` sort key now
+    compares without them (`OrderKey::bpchar`)."""
     assert _answer(dsn, query) == expected

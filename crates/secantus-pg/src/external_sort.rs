@@ -361,6 +361,7 @@ mod tests {
             ascending: false,
             nulls: Nulls::First,
             jsonb: false,
+            bpchar: false,
             expr: None,
         }];
         let data = rows(n);
@@ -428,6 +429,7 @@ mod tests {
             ascending: true,
             nulls: Nulls::Last,
             jsonb: false,
+            bpchar: false,
             expr: None,
         }];
         // 120,000 rows over 101 keys: spilled runs, duplicates across them.
