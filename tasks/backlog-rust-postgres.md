@@ -3403,20 +3403,6 @@ with ICU) with the `_SETUP` in `tests/backlog/test_rp_found_rp782.py`:
 `xu782f` a domain over `text` `collate "und-x-icu"`, `xc782f` one
 `collate "C"`.
 
-- [ ] **A cast to a collated domain does not take its collation.** Since
-      RP-782 a domain keeps its COLLATE, and a column of it sorts by it,
-      but an expression of the domain's type does not: `select 'a'::xu782f
-      < 'B'::xu782f` is true on PostgreSQL 15.19 and false here, `order
-      by` and `max` over a VALUES list of `xu782f` sort bytewise, and
-      `'a'::xu782f < 'B'::xc782f` is 42P22 `could not determine which
-      collation to use for string comparison` there and false here.
-      `exprCollation` of a cast to a domain is the domain's
-      `typcollation`, an IMPLICIT collation (`COLLATE_IMPLICIT`), so the
-      fix is the analyser's collation derivation, not an explicit
-      `COLLATE` wrapped round the cast (which would turn the 42P22 into a
-      42P21).
-      Verify: tests/backlog/test_rp_found_rp782.py::test_a_cast_to_a_collated_domain_takes_its_collation
-      Backlog-ID: RP-796
 - [ ] **`information_schema`'s text columns are not collated "C".**
       `information_schema.sql` declares `character_data` and `yes_or_no`
       `COLLATE "C"` (kept on the built-in domains since RP-782), and its
@@ -3445,6 +3431,40 @@ with ICU) with the `_SETUP` in `tests/backlog/test_rp_found_rp782.py`:
       aggregate's overload resolution does not follow to `text`.
       Verify: tests/backlog/test_rp_found_rp782.py::test_an_added_domain_column_reaches_its_base_types_aggregates
       Backlog-ID: RP-799
+
+## Found while working RP-796 (2026-11-10)
+
+Measured on a private PostgreSQL 15.19 cluster (locale C.UTF-8, built
+with ICU) with the `_SETUP` in `tests/backlog/test_rp_found_rp782.py`
+(`xu782f` a domain over `text` `collate "und-x-icu"`, `xc782f` one
+`collate "C"`). The gap tests are in `tests/backlog/test_rp_found_rp796.py`.
+
+- [ ] **A `COLLATE` over an expression of a collated domain is 42804.**
+      `select 'a'::xu782f collate "C" < 'B'` is false on PostgreSQL 15.19,
+      `v::xu782f collate "C" < 'C'` over a VALUES list compares bytewise,
+      and `order by v::xu782f collate "C"` sorts `B, D, a, c`; here each is
+      42804 `collations are not supported by type xu782f` (a domain over a
+      domain too). `transformCollateClause` asks `type_is_collatable` of
+      the expression's type, which a domain over `text` is. The type
+      checks that refuse it list base type names (the FROM-less constant
+      `COLLATE` in `lib.rs`, among others) rather than asking
+      `collation::collatable`, which follows a domain to its base. A
+      `COLLATE` naming a locale collation (`"und-x-icu"`) over one is
+      answered.
+      Verify: tests/backlog/test_rp_found_rp796.py::test_collate_over_a_collated_domain_expression
+      Backlog-ID: RP-802
+- [ ] **A VALUES or set-operation column whose rows carry two different
+      implicit collations sorts bytewise.** `transformValuesClause` and a
+      set operation take the column's collation by
+      `select_common_collation(..., none_ok = true)`, so `(values
+      ('a'::xu782f), ('B'::xc782f)) s(v)` has no collation on PostgreSQL
+      15.19: `collation for (v)` is NULL, and `order by v` or `max(v)` is
+      42P22 `could not determine which collation to use for string
+      comparison` (a UNION ALL of the two likewise). Here the column has
+      `"default"` and sorts bytewise (`B, a`; `max` is `a`). Comparing it
+      with a constant takes the constant's default collation and agrees.
+      Verify: tests/backlog/test_rp_found_rp796.py::test_a_column_of_conflicting_implicit_collations_has_none
+      Backlog-ID: RP-803
 
 ## Found while working RP-768 (2026-11-10)
 
