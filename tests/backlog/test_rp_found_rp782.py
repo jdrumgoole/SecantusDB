@@ -51,7 +51,10 @@ def _answer(c: psycopg.Connection, sql: str) -> object:
 
 # `exprCollation` of a cast to a domain is the domain's `typcollation`, an
 # IMPLICIT collation: two different ones meeting in a comparison are 42P22.
-@pytest.mark.backlog("RP-796")
+# A cast written over a `COLLATE` keeps the clause, EXPLICIT, as
+# `coerce_type` pushes the coercion beneath it. Here a cast to a collated
+# domain carried no collation, so it compared bytewise; fixed by RP-796.
+@pytest.mark.backlog_fixed("RP-796")
 def test_a_cast_to_a_collated_domain_takes_its_collation(dsn: str) -> None:
     with _connect(dsn) as c:
         got = [
@@ -62,6 +65,12 @@ def test_a_cast_to_a_collated_domain_takes_its_collation(dsn: str) -> None:
                 "select max(v) from (values ('a'::xu782f), ('B'::xu782f)) s(v)",
                 "select 'a'::xu782f < 'B'::text",
                 "select 'a'::xu782f < 'B'::xc782f",
+                "select ('a' collate \"C\")::xu782f < 'B',"
+                " (('a' collate \"und-x-icu\")::xc782f) < 'B'",
+                "select ('a' collate \"und-x-icu\")::text < 'B'",
+                "select v from (select 'a'::xu782f union all select 'B') s(v) order by v",
+                "select a from (values ('a'), ('B'), ('c'), ('D')) t(a)"
+                " where a::xu782f < 'C' order by a::xu782f",
             ]
         ]
     assert got == [
@@ -70,6 +79,10 @@ def test_a_cast_to_a_collated_domain_takes_its_collation(dsn: str) -> None:
         [("B",)],
         [(True,)],
         "42P22 could not determine which collation to use for string comparison",
+        [(False, True)],
+        [(True,)],
+        [("a",), ("B",)],
+        [("a",), ("B",), ("c",)],
     ]
 
 

@@ -144,6 +144,43 @@ fn scope_column<'a>(
     }
 }
 
+/// The `COLLATE` clause a cast keeps: `coerce_type` pushes a coercion
+/// beneath a `CollateExpr` and keeps the clause over the result when the
+/// target type is collatable (dropping it otherwise), so `(x COLLATE
+/// "C")::d` carries the EXPLICIT collation `"C"`, whatever `d` declares.
+fn cast_collate_clause(
+    tc: &pg_query::protobuf::TypeCast,
+) -> Option<&pg_query::protobuf::CollateClause> {
+    if !crate::collation::collatable(&type_name_of(tc.type_name.as_ref()?)) {
+        return None;
+    }
+    match tc.arg.as_deref()?.node.as_ref()? {
+        N::CollateClause(cc) => Some(cc),
+        N::TypeCast(inner) => cast_collate_clause(inner),
+        _ => None,
+    }
+}
+
+/// The collation a cast to a domain gives its value: the domain's
+/// `typcollation` when a COLLATE clause named one other than `default`, as
+/// an IMPLICIT collation that replaces whatever the argument carried
+/// (`assign_collations_walker`'s `CoerceToDomain` case). `None` for a cast
+/// to anything else, or to a domain whose collation is its base type's.
+fn domain_cast_collation(tc: &pg_query::protobuf::TypeCast) -> Option<String> {
+    let t = tc.type_name.as_ref()?;
+    if !t.array_bounds.is_empty() {
+        return None;
+    }
+    let name = type_name_of(t);
+    if name.trim_end().ends_with("[]") {
+        return None;
+    }
+    if cast_collate_clause(tc).is_some() {
+        return None;
+    }
+    crate::domains::declared_collation(&name).filter(|c| c != "default")
+}
+
 /// One output column of a derived relation's leg (or VALUES row): its
 /// expression, its name, and the FROM item's column it passes through
 /// when it is a bare reference to one.
@@ -352,10 +389,30 @@ fn derived_def(
                     col
                 })
                 .unwrap_or_else(|| Column::new(n, "text", false));
-            let collation = all.iter().find_map(|r| match expr_at(r, i)?.node.as_ref() {
-                Some(N::CollateClause(cc)) => Some(crate::collation::clause_name(cc)),
-                _ => None,
-            });
+            // An explicit `COLLATE` wins; otherwise the implicit collation
+            // the rows' casts to a collated domain agree on, and none when
+            // two differ (`select_common_collation` with `none_ok`, as
+            // `transformValuesClause` and a set operation call it) (RP-796).
+            let collation = all
+                .iter()
+                .find_map(|r| match expr_at(r, i)?.node.as_ref() {
+                    Some(N::CollateClause(cc)) => Some(crate::collation::clause_name(cc)),
+                    Some(N::TypeCast(tc)) => {
+                        cast_collate_clause(tc).map(crate::collation::clause_name)
+                    }
+                    _ => None,
+                })
+                .or_else(|| {
+                    let implicit: Vec<String> = all
+                        .iter()
+                        .filter_map(|r| match expr_at(r, i)?.node.as_ref() {
+                            Some(N::TypeCast(tc)) => domain_cast_collation(tc),
+                            _ => None,
+                        })
+                        .collect();
+                    let first = implicit.first()?;
+                    implicit.iter().all(|n| n == first).then(|| first.clone())
+                });
             if let Some(coll) = collation {
                 c.extra.insert("collation", coll);
             }
@@ -773,6 +830,14 @@ impl Rewriter<'_> {
             Some(N::TypeCast(tc)) if Self::is_citext_cast(tc) => {
                 Some((crate::collation::CITEXT.to_string(), false))
             }
+            // A cast keeps a COLLATE it was written over, explicit; a cast
+            // to a collated domain gives the domain's, implicit (RP-796).
+            Some(N::TypeCast(tc)) => match cast_collate_clause(tc) {
+                Some(cc) => locale(&crate::collation::clause_name(cc)).map(|n| (n, true)),
+                None => domain_cast_collation(tc)
+                    .and_then(|n| locale(&n))
+                    .map(|n| (n, false)),
+            },
             _ => None,
         }
     }
@@ -848,6 +913,19 @@ impl Rewriter<'_> {
                 Some(N::TypeCast(tc)) if Self::is_citext_cast(tc) => {
                     Some((crate::collation::CITEXT.to_string(), false))
                 }
+                // A cast keeps a COLLATE it was written over, explicit; a
+                // cast to a collated domain gives the domain's, implicit
+                // (RP-796).
+                Some(N::TypeCast(tc)) => match cast_collate_clause(tc) {
+                    Some(cc) => {
+                        let name = crate::collation::clause_name(cc);
+                        self.collate_locations
+                            .borrow_mut()
+                            .push((name.clone(), cc.location));
+                        Some((name, true))
+                    }
+                    None => domain_cast_collation(tc).map(|name| (name, false)),
+                },
                 _ => None,
             }
         };
@@ -2769,4 +2847,79 @@ fn takes_no_collation(ty: &str) -> bool {
             | "oid"
             | "money"
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn domain(name: &str, base: &str, collation: Option<&str>) -> domains::Domain {
+        domains::Domain {
+            name: name.to_string(),
+            oid: 90796,
+            base: base.to_string(),
+            typmod: -1,
+            not_null: false,
+            checks: Vec::new(),
+            not_valid: Vec::new(),
+            default_sql: None,
+            collation: collation.map(str::to_string),
+        }
+    }
+
+    /// The select list's first expression, which must be a cast.
+    fn cast(sql: &str) -> pg_query::protobuf::TypeCast {
+        let parsed = pg_query::parse(sql).expect("parses");
+        let stmt = parsed.protobuf.stmts[0].stmt.as_ref().expect("a statement");
+        let Some(N::SelectStmt(s)) = stmt.node.as_ref() else {
+            panic!("{sql}: not a SELECT");
+        };
+        let Some(N::ResTarget(rt)) = s.target_list[0].node.as_ref() else {
+            panic!("{sql}: no target");
+        };
+        match rt.val.as_deref().and_then(|v| v.node.as_ref()) {
+            Some(N::TypeCast(tc)) => (**tc).clone(),
+            other => panic!("{sql}: not a cast: {other:?}"),
+        }
+    }
+
+    /// RP-796: a cast to a domain whose COLLATE named a collation carries
+    /// it, implicitly (`assign_collations_walker`'s `CoerceToDomain`), and
+    /// so does a domain over it; a cast written over a `COLLATE` keeps the
+    /// clause, explicitly, as `coerce_type` pushes the coercion beneath it,
+    /// unless the target type takes no collation. Measured on PostgreSQL
+    /// 15.19.
+    #[test]
+    fn a_cast_carries_its_domains_collation_or_the_collate_beneath_it() {
+        domains::set_user_domains(vec![
+            domain("xu796", "text", Some("und-x-icu")),
+            domain("xd796", "xu796", None),
+            domain("xn796", "text", None),
+            domain("xdef796", "text", Some("default")),
+        ]);
+        let implicit = |sql: &str| domain_cast_collation(&cast(sql));
+        let explicit =
+            |sql: &str| cast_collate_clause(&cast(sql)).map(crate::collation::clause_name);
+        assert_eq!(implicit("select 'a'::xu796"), Some("und-x-icu".to_string()));
+        assert_eq!(implicit("select 'a'::xd796"), Some("und-x-icu".to_string()));
+        for sql in [
+            "select 'a'::xn796",
+            "select 'a'::xdef796",
+            "select 'a'::text",
+            "select '{a}'::xu796[]",
+            "select ('a' collate \"C\")::xu796",
+        ] {
+            assert_eq!(implicit(sql), None, "{sql}");
+        }
+        assert_eq!(
+            explicit("select ('a' collate \"C\")::xu796"),
+            Some("C".to_string())
+        );
+        assert_eq!(
+            explicit("select (('a' collate \"C\")::xu796)::text"),
+            Some("C".to_string())
+        );
+        assert_eq!(explicit("select ('1' collate \"C\")::int4"), None);
+        assert_eq!(explicit("select 'a'::xu796"), None);
+    }
 }
