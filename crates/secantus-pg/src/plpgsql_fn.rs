@@ -549,6 +549,132 @@ pub fn static_queries(create_sql: &str) -> Option<Vec<String>> {
     Some(out)
 }
 
+/// An assignment statement's text split at its `:=` (or `=`) into the
+/// target and the value, outside any bracket or parenthesis.
+fn split_assignment(text: &str) -> Option<(&str, &str)> {
+    let scan = pg_query::scan(text).ok()?;
+    let mut depth = 0i32;
+    for t in &scan.tokens {
+        let (start, end) = (t.start as usize, t.end as usize);
+        match text.get(start..end)? {
+            "[" | "(" => depth += 1,
+            "]" | ")" => depth -= 1,
+            ":=" | "=" if depth == 0 => return Some((&text[..start], &text[end..])),
+            _ => {}
+        }
+    }
+    None
+}
+
+/// The subscripts and field selections of an assignment's target
+/// (`x[1]`, `x[i][j]`, `x[2:]`), or `None` when it has none.
+fn target_indirection(target: &str) -> Option<Vec<pg_query::protobuf::Node>> {
+    use pg_query::protobuf::node::Node as N;
+    let parsed = pg_query::parse(&format!("SELECT {target}")).ok()?;
+    let stmt = parsed
+        .protobuf
+        .stmts
+        .first()?
+        .stmt
+        .as_ref()?
+        .node
+        .as_ref()?;
+    let N::SelectStmt(s) = stmt else { return None };
+    let Some(N::ResTarget(rt)) = s.target_list.first()?.node.as_ref() else {
+        return None;
+    };
+    match rt.val.as_ref()?.node.as_ref()? {
+        N::AIndirection(ind) if !ind.indirection.is_empty() => Some(ind.indirection.clone()),
+        _ => None,
+    }
+}
+
+/// One subscript's text: `(is_slice, lower, upper)`.
+type SubscriptText<'a> = (bool, Option<&'a str>, Option<&'a str>);
+
+/// The text of each subscript of an assignment's target, in order:
+/// `(is_slice, lower, upper)`, a bound left out `None` (`x[2:]`). Read off
+/// the scanner's tokens, so a `::` cast or a bracket inside a bound is no
+/// separator.
+fn subscript_texts(target: &str) -> Option<Vec<SubscriptText<'_>>> {
+    let scan = pg_query::scan(target).ok()?;
+    let mut out = Vec::new();
+    let (mut brackets, mut parens) = (0i32, 0i32);
+    // The open subscript: where it starts, and where its `:` is.
+    let mut open: Option<(usize, Option<(usize, usize)>)> = None;
+    let bound = |from: usize, to: usize| Some(target[from..to].trim()).filter(|t| !t.is_empty());
+    for t in &scan.tokens {
+        let (start, end) = (t.start as usize, t.end as usize);
+        match target.get(start..end)? {
+            "(" => parens += 1,
+            ")" => parens -= 1,
+            "[" => {
+                if brackets == 0 && parens == 0 {
+                    open = Some((end, None));
+                }
+                brackets += 1;
+            }
+            "]" => {
+                brackets -= 1;
+                if brackets == 0 && parens == 0 {
+                    let (from, colon) = open.take()?;
+                    out.push(match colon {
+                        Some((c_start, c_end)) => (true, bound(from, c_start), bound(c_end, start)),
+                        None => (false, None, bound(from, start)),
+                    });
+                }
+            }
+            ":" if brackets == 1 && parens == 0 => {
+                if let Some((_, colon @ None)) = open.as_mut() {
+                    *colon = Some((start, end));
+                }
+            }
+            _ => {}
+        }
+    }
+    Some(out)
+}
+
+/// Is `expr` a bare string or NULL constant, of type `unknown` until its
+/// context gives it one?
+fn untyped_literal(expr: &str) -> bool {
+    use pg_query::protobuf::node::Node as N;
+    let Ok(parsed) = pg_query::parse(&format!("SELECT {expr}")) else {
+        return false;
+    };
+    let target = parsed
+        .protobuf
+        .stmts
+        .first()
+        .and_then(|s| s.stmt.as_ref())
+        .and_then(|s| match s.node.as_ref() {
+            Some(N::SelectStmt(sel)) => sel.target_list.first().cloned(),
+            _ => None,
+        });
+    let Some(N::ResTarget(rt)) = target.and_then(|t| t.node) else {
+        return false;
+    };
+    matches!(
+        rt.val.as_ref().and_then(|v| v.node.as_ref()),
+        Some(N::AConst(c)) if c.isnull || matches!(c.val, Some(pg_query::protobuf::a_const::Val::Sval(_)))
+    )
+}
+
+/// A planner error as the interpreter raises it, its DETAIL split off.
+fn plan_error(e: secantus_pgplan::Error) -> PlError {
+    let message = e.to_string();
+    let mut err = match message.split_once("\nDetail: ") {
+        Some((m, d)) => {
+            let mut err = PlError::new(e.sqlstate(), m);
+            err.detail = Some(d.to_string());
+            err
+        }
+        None => PlError::new(e.sqlstate(), message.clone()),
+    };
+    err.from_sql = false;
+    err
+}
+
 /// `RETURN NEXT ident;` → `RETURN NEXT (ident);`, case-insensitively.
 fn parenthesise_return_next(sql: &str) -> String {
     let lower = sql.to_ascii_lowercase();
@@ -1625,6 +1751,12 @@ impl Interp<'_> {
                 .to_string(),
             _ => text.to_string(),
         };
+        self.eval_body(body, text, mode)
+    }
+
+    /// Evaluate `body`, a part of the expression `text` (of parse mode
+    /// `mode`, which frames an error), to its single value.
+    fn eval_body(&self, body: String, text: &str, mode: u64) -> Result<Bson, PlError> {
         let sql = if mode == 0 {
             body
         } else {
@@ -1680,6 +1812,18 @@ impl Interp<'_> {
                 .to_string(),
             _ => text.to_string(),
         };
+        self.eval_typed_body(ty, body, text, mode)
+    }
+
+    /// [`Self::eval_typed`] of `body`, a part of the expression `text`,
+    /// cast to the declared type `ty` (none: as it is).
+    fn eval_typed_body(
+        &self,
+        ty: Option<String>,
+        body: String,
+        text: &str,
+        mode: u64,
+    ) -> Result<Bson, PlError> {
         // With no implicit or assignment cast from the expression's type,
         // the value goes through its output function and the declared
         // type's input (`COERCION_PLPGSQL`'s `COERCEVIAIO`): evaluated as
@@ -1688,7 +1832,7 @@ impl Interp<'_> {
             let src = self.expression_type(&body)?;
             secantus_pgplan::plpgsql_assigns_via_io(&src, ty).then_some(src)
         }) {
-            let v = self.eval(e)?;
+            let v = self.eval_body(body.clone(), text, mode)?;
             // An assignment statement's coercion is part of its query
             // (`transformPLAssignStmt`), so an error in it is framed by
             // the assignment; a declaration's default is coerced outside
@@ -1701,7 +1845,7 @@ impl Interp<'_> {
                 && secantus_pgplan::plpgsql_io_folds(&src, ty.as_deref().unwrap_or_default())
                 && select_target(&format!("SELECT {body}")).is_some_and(|n| expression_folds(&n));
             return self
-                .convert_moved(no, v, &src)
+                .convert_to(ty.as_deref().unwrap_or_default(), v, &src)
                 .map_err(|err| err.with_sql_frame(|| planned.then(|| bind_frame(text, mode))?));
         }
         let length = ty.as_deref().and_then(|ty| {
@@ -1792,7 +1936,13 @@ impl Interp<'_> {
         let Some(Datum::Var { ty, .. }) = self.datums.get(no) else {
             return Ok(v);
         };
-        let ty = ty.clone();
+        self.convert_to(&ty.clone(), v, src)
+    }
+
+    /// The value `v`, of type `src`, converted to the declared type `ty`
+    /// by PL/pgSQL's assignment rule ([`Self::coerce_moved`]).
+    fn convert_to(&self, ty: &str, v: Bson, src: &str) -> Result<Bson, PlError> {
+        let ty = ty.to_string();
         let unmodified_same = secantus_pgplan::declared_type_and_typmod(&ty)
             .is_some_and(|(base, typmod)| typmod < 0 && base == src);
         if unmodified_same || secantus_pgplan::domains::same_domain(src, &ty) {
@@ -1805,7 +1955,7 @@ impl Interp<'_> {
                 Bson::Null => Bson::Null,
                 v => Bson::String(secantus_pgplan::typeout::output_text(v, src)),
             };
-            return self.convert_moved(no, text, "text");
+            return self.convert_to(&ty, text, "text");
         }
         let types = [src.to_string()];
         let length = self.host.assignment_length(&ty, "SELECT $1", &types);
@@ -1837,6 +1987,153 @@ impl Interp<'_> {
             }
             None => Ok(v),
         }
+    }
+
+    /// The value an assignment to an array element or slice stores in
+    /// variable `no` (`x[i] := v`, `x[i:j] := v`), or `None` when the
+    /// assignment's target has no subscript. PostgreSQL 15 compiles it
+    /// into one `SubscriptingRef` over the variable
+    /// (`transformPLAssignStmt`): the subscripts are evaluated as `int4`
+    /// and checked first, then the value, coerced by the assignment rule
+    /// to the element type (to the array type for a slice), and
+    /// `array_set_element` / `array_set_slice` place it (RP-711).
+    fn assign_subscripted(&self, no: usize, e: &Value) -> Result<Option<Bson>, PlError> {
+        use pg_query::protobuf::node::Node as N;
+        let Some((text, mode)) = expr_query(e) else {
+            return Ok(None);
+        };
+        if !matches!(mode, 3..=5) {
+            return Ok(None);
+        }
+        let Some((target, value)) = split_assignment(text) else {
+            return Ok(None);
+        };
+        let Some(indirection) = target_indirection(target) else {
+            return Ok(None);
+        };
+        // The array is a variable's value or a record's field (`r.a[2] :=
+        // 5`), which `set_var` writes back.
+        let (ty, current) = match self.datums.get(no) {
+            Some(Datum::Var { ty, value, .. }) => (ty.clone(), value.clone()),
+            Some(Datum::RecField { field, parent }) => match self.datums.get(*parent) {
+                Some(Datum::Rec { rec: Some(r), name }) => match r.get(field) {
+                    Some((v, t)) => (t.to_string(), v.clone()),
+                    None => {
+                        return Err(PlError::new(
+                            "42703",
+                            format!("record \"{name}\" has no field \"{field}\""),
+                        ))
+                    }
+                },
+                Some(Datum::Rec { name, .. }) => {
+                    return Err(PlError::new(
+                        "55000",
+                        format!("record \"{name}\" is not assigned yet"),
+                    ))
+                }
+                _ => return Err(PlError::unsupported("this assignment target")),
+            },
+            _ => return Err(PlError::unsupported("this assignment target")),
+        };
+        if !indirection
+            .iter()
+            .all(|i| matches!(i.node.as_ref(), Some(N::AIndices(_))))
+        {
+            return Err(PlError::unsupported(
+                "assignment to a field of an array element",
+            ));
+        }
+        // A domain over an array is subscripted as its base type, and the
+        // new array is coerced back to the domain, which checks it.
+        let (array_ty, domain) = if ty.ends_with("[]") {
+            (ty.clone(), None)
+        } else {
+            match secantus_pgplan::domains::base_type_and_typmod(&ty) {
+                Some((base, typmod, _)) if base.ends_with("[]") => {
+                    let element = base.trim_end_matches("[]");
+                    let element = if typmod >= 0 {
+                        secantus_pgplan::scalar::format_type_text_public(element, Some(typmod))
+                    } else {
+                        element.to_string()
+                    };
+                    (format!("{element}[]"), Some((ty.clone(), base)))
+                }
+                _ if ty == "jsonb" => {
+                    return Err(PlError::unsupported("assignment to a jsonb subscript"))
+                }
+                _ => {
+                    return Err(PlError::new(
+                        "42804",
+                        format!(
+                            "cannot subscript type {} because it does not support subscripting",
+                            secantus_pgplan::display_type(&ty)
+                        ),
+                    ))
+                }
+            }
+        };
+        let texts = subscript_texts(target)
+            .filter(|t| t.len() == indirection.len())
+            .ok_or_else(|| PlError::unsupported("this assignment target"))?;
+        // Each subscript is coerced to `int4` by the assignment rule, a
+        // parse-time check made before anything is evaluated.
+        for t in texts.iter().flat_map(|(_, lo, hi)| [lo, hi]).flatten() {
+            let typed = !untyped_literal(t);
+            if typed
+                && self
+                    .expression_type(t)
+                    .is_some_and(|src| !secantus_pgplan::subscript_coerces(&src))
+            {
+                return Err(PlError::new(
+                    "42804",
+                    "array subscript must have type integer",
+                ));
+            }
+        }
+        let subscript = |t: &Option<&str>| -> Result<Option<Bson>, PlError> {
+            match t {
+                Some(t) => self.eval_body(format!("({t})::int4"), text, mode).map(Some),
+                None => Ok(None),
+            }
+        };
+        let mut subs = Vec::with_capacity(texts.len());
+        for (is_slice, lower, upper) in &texts {
+            subs.push(if *is_slice {
+                secantus_pgplan::array_assign::AssignSubscript::Slice(
+                    subscript(lower)?,
+                    subscript(upper)?,
+                )
+            } else {
+                secantus_pgplan::array_assign::AssignSubscript::Index(
+                    subscript(upper)?.unwrap_or(Bson::Null),
+                )
+            });
+        }
+        let is_slice = texts.iter().any(|(slice, _, _)| *slice);
+        let value_ty = if is_slice {
+            array_ty.clone()
+        } else {
+            array_ty.trim_end_matches("[]").to_string()
+        };
+        let value = value.trim().to_string();
+        let v = match secantus_pgplan::array_assign::check_subscripts(&subs) {
+            Ok(()) => self.eval_typed_body(Some(value_ty), value, text, mode)?,
+            // The NULL check runs in the executor; a value that folds to a
+            // constant was computed while the assignment was planned, so
+            // its error comes first (`x[null] := 1/0` is 22012).
+            Err(null) => {
+                if select_target(&format!("SELECT {value}")).is_some_and(|n| expression_folds(&n)) {
+                    self.eval_typed_body(Some(value_ty), value, text, mode)?;
+                }
+                return Err(plan_error(null));
+            }
+        };
+        let out = secantus_pgplan::array_assign::assign_subscripts(current, &subs, v)
+            .map_err(plan_error)?;
+        Ok(Some(match domain {
+            Some((domain, base)) => self.convert_to(&domain, out, &base)?,
+            None => out,
+        }))
     }
 
     /// The value an assignment stores in a record field of type `ty`
@@ -2195,6 +2492,10 @@ impl Interp<'_> {
             "PLpgSQL_stmt_assign" => {
                 let no = body.get("varno").and_then(Value::as_u64).unwrap_or(0) as usize;
                 let expr = body.get("expr").cloned().unwrap_or(Value::Null);
+                if let Some(v) = self.assign_subscripted(no, &expr)? {
+                    self.set_var(no, v)?;
+                    return Ok(Flow::Next);
+                }
                 let v = match self.datums.get(no) {
                     Some(Datum::RecField { field, parent }) => {
                         // Cast to the field's type, as an assignment would.
