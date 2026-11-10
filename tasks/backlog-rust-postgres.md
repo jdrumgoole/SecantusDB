@@ -3332,18 +3332,6 @@ Measured on PostgreSQL 15.19 (the shared reference on port 5415).
       Verify: tests/backlog/test_rp_found_rp698.py::test_an_outer_column_in_a_set_operations_order_by
       Backlog-ID: RP-767
 
-## Found while working RP-707 (2026-11-10)
-
-Measured on PostgreSQL 15.19 (the shared reference on port 5415): every
-statement is VALUES-only and runs there as written.
-
-- [ ] **A scalar subquery in an `IN` list is refused.** `x in ((select
-      max(y) ...), 'tt')` is an ordinary list on PostgreSQL 15.19 (each
-      element compared by `=`, ORed); here the statement is 0A000 `SubLink
-      is not supported yet`.
-      Verify: tests/backlog/test_rp_found_rp707.py::test_a_scalar_subquery_in_an_in_list
-      Backlog-ID: RP-757
-
 ## Found while working RP-754 (2026-11-10)
 
 Measured on PostgreSQL 15.19 (the shared reference on port 5415): every
@@ -3384,25 +3372,6 @@ statement is VALUES-only and runs there as written.
       Verify: tests/backlog/test_rp_found_rp756.py::test_a_set_operation_from_subquerys_column_is_typed
       Backlog-ID: RP-765
 
-## Found while working RP-766 (2026-11-10)
-
-Measured on a private PostgreSQL 15.19 cluster with `create type e766 as
-enum ('z', 'a', 'm')` and `create table t766 (m e766)` holding `m`, `z`,
-`a`. The gap test is in `tests/backlog/test_rp_found_rp766.py`.
-
-- [ ] **An enum column read through a subquery or a CTE sorts and compares
-      by its labels' text.** `select m::text as v from (select m from t766)
-      q order by m` is `z`, `a`, `m` on PostgreSQL 15.19, in declaration
-      order; here it is `a`, `m`, `z`. `select *` in the subquery, a CTE,
-      and a `WHERE m > 'z'` over the subquery's column (no rows here, `a`
-      and `m` on PostgreSQL) go the same way, as does an outer subquery
-      over a VALUES list's enum column. The type-order rewrite types a
-      derived relation's column only from a cast written in it
-      (`derived_def` in `secantus-pgplan/src/enum_order.rs`), not from the
-      column a target names in the derived query's own FROM.
-      Verify: tests/backlog/test_rp_found_rp766.py::test_a_derived_enum_column_sorts_by_declaration
-      Backlog-ID: RP-768
-
 ## Found while working RP-661 (2026-11-10)
 
 Measured on a private PostgreSQL 15.19 cluster with `create domain d as
@@ -3420,3 +3389,49 @@ text` and `create table t (a d, b text)`. The gap test is in
       domain oid, where `DefineDomain` copies the base type's collation.
       Verify: tests/backlog/test_rp_found_rp661.py::test_a_view_of_a_text_domain_column, tests/backlog/test_rp_found_rp661.py::test_a_text_domain_has_the_default_collation
       Backlog-ID: RP-769
+
+## Found while working RP-768 (2026-11-10)
+
+Measured on a private PostgreSQL 15.19 cluster with `create table ja768 (i
+int, x int)` and `create table jb768 (i int, y int)`, each holding `(1,
+...)` and `(2, ...)`. The gap test is in
+`tests/backlog/test_rp_found_rp768.py`.
+
+- [ ] **A column alias list over a FROM subquery's joined `*` is refused
+      unless only its first column is read.** `select t from (select *
+      from ja768 join jb768 on ja768.i = jb768.i) q(p, r, s, t)` is `100`,
+      `200` on PostgreSQL 15.19; here it is 42601 `table "q" has 1 columns
+      available but 4 columns specified`. So are `select r ...`, `order by
+      t` and `where t > 100`; `select p ...`, `select * ...` and `select t
+      ... order by p` answer. Whatever counts the subquery's columns for
+      the alias list sees one where the join's `*` gives four.
+      Verify: tests/backlog/test_rp_found_rp768.py::test_an_alias_list_over_a_joined_star
+      Backlog-ID: RP-773
+
+## Found while working RP-757 (2026-11-10)
+
+Measured on PostgreSQL 15.19 (the shared reference on port 5415): every
+statement is VALUES-only and runs there as written. The gap tests are in
+`tests/backlog/test_rp_found_rp757.py`.
+
+- [ ] **A scalar subquery under `IS [NOT] TRUE` or `COLLATE` is refused.**
+      `select x from (values ('tt'::text), ('uu'), ('vv')) s(x) where (x =
+      (select 'uu')) is not true` is `tt`, `vv` on PostgreSQL 15.19, and
+      `where x = (select 'uu') collate "C"` is `uu`; here each is 0A000
+      `SubLink is not supported yet`. `resolve_sublinks_in_expr` in
+      `secantus-pgplan/src/lib.rs` descends no `BooleanTest` and no
+      `CollateClause`, so the subquery under one reaches planning
+      unresolved.
+      Verify: tests/backlog/test_rp_found_rp757.py::test_a_scalar_subquery_under_a_boolean_test_or_collate
+      Backlog-ID: RP-774
+- [ ] **A `char(n)` column of a VALUES list does not compare as `bpchar` in
+      a WHERE.** Over `(values ('uu'::char(4)), ('tt'), ('vv')) s(f)`,
+      `where f in ('uu  ', 'tt')` is `tt`, `uu  ` on PostgreSQL 15.19 (the
+      list's members take the column's type, and `bpchar` ignores trailing
+      blanks); here it is `tt` alone, and the same with `'uu  '::text` or
+      `(select 'uu')` as the member. `where f = (select 'uu  ')` finds
+      nothing on 15.19 (`bpchar = text` resolves to `text`, the column
+      `rtrim`med) and `uu  ` here. The select list's `f in (...)` already
+      agrees, as does a `char(4)` table column (RP-691).
+      Verify: tests/backlog/test_rp_found_rp757.py::test_a_values_char_column_compares_as_bpchar_in_a_where
+      Backlog-ID: RP-775
