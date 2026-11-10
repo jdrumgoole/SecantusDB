@@ -632,10 +632,11 @@ def _oplog_storage_stats(client: Any) -> tuple:
     return ("ok", stats.get("capped"), stats.get("count", 0) > 0, stats.get("size", 0) > 0)
 
 
-@pytest.mark.backlog("RM-419")
+@pytest.mark.backlog_fixed("RM-419")
 def test_oplog_storage_stats(rust_mongo: Any, mongod_rs: Any) -> None:  # noqa: F811
-    """`$collStats: {storageStats: {}}` on `local.oplog.rs` answers, as for
-    any collection: capped, with its entries counted and sized."""
+    """`$collStats: {storageStats: {}}` on `local.oplog.rs` was refused with
+    26 NamespaceNotFound; it now answers as for any collection: capped, with
+    its entries counted and sized."""
     assert _oplog_storage_stats(rust_mongo) == _oplog_storage_stats(mongod_rs)
 
 

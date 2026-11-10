@@ -102,7 +102,7 @@ fn stamped(start: DateTime, result: Result<Document, CommandError>) -> Document 
 fn coll_stats(ctx: &mut CommandContext, host: &Bson, db: &str, coll: &str) -> HandlerResult {
     let storage = ctx.storage()?;
     let ns = format!("{db}.{coll}");
-    if !storage.collection_exists(db, coll).unwrap_or(false) {
+    if !crate::stats_admin::has_stats(storage, db, coll) {
         return Err(CommandError::new(
             26,
             "NamespaceNotFound",

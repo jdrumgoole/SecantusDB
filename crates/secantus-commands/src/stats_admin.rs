@@ -224,6 +224,16 @@ pub fn coll_stats(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     Ok(out)
 }
 
+/// Whether `(db, coll)` is there to answer statistics for: a collection, or
+/// the oplog, which the storage serves as a capped view of its own tables
+/// with no catalog entry, and which mongod answers as any capped collection
+/// (RM-419, mongod 8.2.11).
+pub(crate) fn has_stats(storage: &dyn crate::storage::Storage, db: &str, coll: &str) -> bool {
+    storage.collection_exists(db, coll).unwrap_or(false)
+        || ((db, coll) == ("local", "oplog.rs")
+            && storage.collection_is_capped(db, coll).unwrap_or(false))
+}
+
 /// A collection's sizes and counts, divided by `scale`: what `collStats`
 /// answers after `ns`, and the `storageStats` of a `$collStats` stage. One
 /// function, so the two cannot give different numbers for one collection
@@ -235,7 +245,7 @@ pub(crate) fn storage_stats(
     scale: i64,
 ) -> Result<Document, CommandError> {
     let options = storage.get_collection_options(db, coll).unwrap_or_default();
-    let exists = storage.collection_exists(db, coll).unwrap_or(false);
+    let exists = has_stats(storage, db, coll);
     // The size storer's numbers, read without reading a document, as
     // mongod's are (RM-191).
     let kept = storage.collection_sizes(db, coll).map_err(command_error)?;

@@ -1633,14 +1633,6 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       drop it as a timing. Found 2026-11-10 (RM-418).
       Verify: tests/backlog/test_rm_found_2026_11_10_rm418.py::test_find_explain_gives_optimization_time
       Backlog-ID: RM-545
-- [ ] **`$collStats` refuses `local.oplog.rs`.** `{$collStats:
-      {storageStats: {}}}` on the oplog is 26 NamespaceNotFound here, and
-      `collStats` answers it with `size: 0` and no `capped`; mongod 8.2.11
-      answers both as for any capped collection. The FTDC sample's
-      `local.oplog.rs.stats` collector carries the same 26. Found 2026-11-08
-      while working RM-219.
-      Verify: tests/backlog/test_rm_219_diag_query_settings.py::test_oplog_storage_stats
-      Backlog-ID: RM-419
 - [ ] **`$all` refuses a `$`-prefixed object that is not `$elemMatch`.**
       mongod 8.2.11 takes `find({a: {$all: [{$x: 1}]}})` as an equality to
       that object and answers (here, no documents); this server refuses

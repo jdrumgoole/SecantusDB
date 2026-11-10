@@ -14886,13 +14886,23 @@ impl Storage {
     /// tables, and is counted by reading them.
     pub fn collection_sizes(&self, db: &str, coll: &str) -> Result<CollectionSizes> {
         if self.is_oplog_rs(db, coll) {
+            let (records, data_size) = self.oplog_rs_sizes()?;
             return Ok(CollectionSizes {
-                records: self.count_matching(db, coll, &Document::new(), None)? as i64,
-                data_size: self.collection_data_size(db, coll)?,
+                records,
+                data_size,
                 ..CollectionSizes::default()
             });
         }
         Ok(self.sizes.get(db, coll))
+    }
+
+    /// The `local.oplog.rs` view's entry count and their summed BSON bytes:
+    /// its entries live in the oplog tables, not the document tables a
+    /// collection's sizes are read from (RM-419: the oplog's size read 0).
+    fn oplog_rs_sizes(&self) -> Result<(i64, i64)> {
+        let blobs = self.find_oplog_rs(&Document::new(), None, None, &Document::new())?;
+        let size = blobs.iter().map(|b| b.len() as i64).sum();
+        Ok((blobs.len() as i64, size))
     }
 
     /// `(db, coll)`'s sizes counted by reading every document and index
@@ -14980,6 +14990,9 @@ impl Storage {
     /// `dataSize` `collStats` reports). Best-effort — excludes WT block
     /// overhead. Mirrors `storage.collection_data_size`.
     pub fn collection_data_size(&self, db: &str, coll: &str) -> Result<i64> {
+        if self.is_oplog_rs(db, coll) {
+            return Ok(self.oplog_rs_sizes()?.1);
+        }
         // Lock-free read (see the `lock` field's invariants).
         let session = self.conn.open_session()?;
         let mut total = 0i64;
