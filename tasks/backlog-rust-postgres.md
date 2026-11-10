@@ -3534,16 +3534,6 @@ Measured on a private, freshly initdb'd PostgreSQL 15.19 cluster with the
 `_SETUP` in `tests/backlog/test_rp_found_rp689.py`: `t689(a d689, v
 varchar(3), w dv689, c char(3))`, `d689` an `int` with `check (value > 0)`.
 
-- [ ] **Reading a field a record lacks is 42P01.** `do $$ declare r record;
-      begin select 1 as a into r; raise exception '%', r.nosuch; end $$` is
-      42703 `record "r" has no field "nosuch"` on PostgreSQL 15.19
-      (`exec_eval_datum` over the RECFIELD), and so is the same read of a
-      variable of a row type, assigned or not. Here the reference is left
-      in the SQL text, which reads it as a column of a FROM item `r`: 42P01
-      `missing FROM-clause entry for table "r"`. (An assignment to such a
-      field is 42703 already.)
-      Verify: tests/backlog/test_rp_found_rp689.py::test_reading_a_field_a_record_lacks_is_42703
-      Backlog-ID: RP-837
 - [ ] **A column a record variable's field shares is not ambiguous.** With
       `declare r t689`, `(select r.a from t689 r)` is 42702 `column
       reference "r.a" is ambiguous` on PostgreSQL 15.19
