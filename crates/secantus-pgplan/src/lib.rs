@@ -23418,6 +23418,9 @@ fn resolve_one_sublink(
                     // parameter type names one (RP-569).
                     // So is a `char(n)[]` / `varchar(n)[]` one, whose
                     // elements the cast at its modifier pads (RP-666).
+                    // A `text` column is declared too: left a bare
+                    // parameter, `pg_typeof((select max(v) ...))` over one
+                    // was 42P18 where PostgreSQL answers `text` (RP-707).
                     let cast = |t: &str| {
                         let base = t.strip_suffix("[]").unwrap_or(t);
                         sublink_value_cast(t)
@@ -23426,7 +23429,7 @@ fn resolve_one_sublink(
                     };
                     if let Some(t) = ty
                         .as_deref()
-                        .filter(|t| !cast(t) && !matches!(*t, "" | "unknown" | "record" | "text"))
+                        .filter(|t| !cast(t) && !matches!(*t, "" | "unknown" | "record"))
                     {
                         declare_sublink_param(params.len() - 1, t);
                     }

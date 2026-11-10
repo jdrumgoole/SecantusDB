@@ -3262,22 +3262,13 @@ varchar(4), t text)` holding `(1, 'y', 'y', 'y')` and `(2, 'ab', 'ab ',
       on a build of `aae69552`, before RP-733. Again on the RP-741 branch
       (lane pg-batch-3, debug build, 2026-11-10): 0.32 s late once in the
       gate's backlog step at a load of about 13, then the file passed five
-      runs in a row at loads of 13-16.
+      runs in a row at loads of 13-16. Again on the RP-707 branch (lane
+      pg-batch-2, debug build, 2026-11-10): 0.68 s late once in the gate's
+      backlog step at a load of about 11; then 30 cancels at delay 0.7
+      each on that branch and on its base `49f2f12e` without it, medians
+      0.022 s and 0.021 s, one late cancel each at 0.250 s and 0.244 s.
       Verify: none -- a timing tail that does not fail on demand; RP-202's own test is the check
       Backlog-ID: RP-735
-
-## Found while working RP-681 (2026-11-09)
-
-Measured on a private PostgreSQL 15.19 cluster with the `_SETUP` in
-`tests/backlog/test_rp_found_rp681.py`: `t681(k int, v varchar(4), ...)`.
-
-- [ ] **`pg_typeof` of a `text` scalar subquery is 42P18.** `select
-      pg_typeof((select max(v) from t681))` is `text` on PostgreSQL 15.19;
-      here it is 42P18 `could not determine data type of parameter $1`, as
-      for `(select upper(v) ...)` and `(select string_agg(v, ',') ...)`,
-      while one over an `int` column or a bare `varchar` column answers.
-      Verify: tests/backlog/test_rp_found_rp681.py::test_pg_typeof_of_a_text_scalar_subquery
-      Backlog-ID: RP-707
 
 ## Found while working RP-732 (2026-11-09)
 
@@ -3365,3 +3356,30 @@ Measured on PostgreSQL 15.19 (the shared reference on port 5415).
       level has is 42703 on both.
       Verify: tests/backlog/test_rp_found_rp698.py::test_an_outer_column_in_a_set_operations_order_by
       Backlog-ID: RP-747
+
+## Found while working RP-707 (2026-11-10)
+
+Measured on PostgreSQL 15.19 (the shared reference on port 5415): every
+statement is VALUES-only and runs there as written.
+
+- [ ] **A subquery over an untyped literal is `unknown` outside it.**
+      PostgreSQL 15.19 resolves an untyped literal in a subquery's target
+      list to `text` (`resolveTargetListUnknowns`), so `select 1 =
+      (select '1')` is 42883 `operator does not exist: integer = text`,
+      `(select '2020-01-01') < now()` is 42883 too, and `case when false
+      then 1 else (select 'a') end` is 42804 `CASE types text and integer
+      cannot be matched`. Here the outer expression still coerces the
+      literal to the other side's type: `1 = (select '1')` and `(select
+      'a') = 1` are 0A000 `comparing int32 with string using = is not
+      supported yet` (`1 = (select '1')` answered true before RP-707), the
+      `< now()` answers true, and the CASE is 22P02. `(select 'a'::text) = 1`
+      is already right, and `pg_typeof((select 'a'))` is `text` since
+      RP-707.
+      Verify: tests/backlog/test_rp_found_rp707.py::test_an_untyped_literal_subquery_is_text_outside_it
+      Backlog-ID: RP-756
+- [ ] **A scalar subquery in an `IN` list is refused.** `x in ((select
+      max(y) ...), 'tt')` is an ordinary list on PostgreSQL 15.19 (each
+      element compared by `=`, ORed); here the statement is 0A000 `SubLink
+      is not supported yet`.
+      Verify: tests/backlog/test_rp_found_rp707.py::test_a_scalar_subquery_in_an_in_list
+      Backlog-ID: RP-757

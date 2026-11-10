@@ -11,7 +11,7 @@ CTE column, a window call and a view's column.
 A `reg*` reaches `max(oid)` and `cidr` reaches `max(inet)` the same way,
 and there each input is coerced before it is compared: `max(regclass)` is
 the largest OID, as an `oid`. Here they kept the input type (RP-706, fixed).
-And a `text` scalar subquery inside `pg_typeof` is refused.
+And a `text` scalar subquery inside `pg_typeof` was refused (RP-707, fixed).
 
 The expected answers were measured on a private, freshly initdb'd
 PostgreSQL 15.19 cluster with `_SETUP`.
@@ -137,22 +137,54 @@ def test_min_max_coerce_their_input_to_the_overloads_type(dsn: str) -> None:
         assert cur.description[0].type_code == _INET
 
 
-@pytest.mark.backlog("RP-707")
+@pytest.mark.backlog_fixed("RP-707")
 @pytest.mark.parametrize(
     "query",
     [
         "select pg_typeof((select max(v) from t681))::text",
         "select pg_typeof((select upper(v) from t681 limit 1))::text",
         "select pg_typeof((select string_agg(v, ',') from t681))::text",
+        "select pg_typeof((select 'a'::text))::text",
+        "select pg_typeof((select 'a'))::text",
     ],
 )
 def test_pg_typeof_of_a_text_scalar_subquery(query: str, dsn: str) -> None:
     """`pg_typeof` of a scalar subquery whose column is `text` is `text` on
-    PostgreSQL 15.19; here it is 42P18 `could not determine data type of
+    PostgreSQL 15.19; here it was 42P18 `could not determine data type of
     parameter $1`, while one over an `int` or a bare `varchar` column
-    answers."""
+    answered: the resolved value's parameter was declared for every column
+    type but `text`."""
     try:
         got: object = _described(dsn, query)
     except psycopg.Error as e:
         got = ("error", e.sqlstate, str(e).splitlines()[0])
     assert got == ([_TEXT], [("text",)])
+
+
+_TEXT_SUBQUERY = "(select max(x) from (values ('uu'::text), ('tt')) s(x))"
+
+
+@pytest.mark.backlog_fixed("RP-707")
+@pytest.mark.parametrize(
+    ("query", "expected"),
+    [
+        (f"select concat({_TEXT_SUBQUERY}, 1)", ([_TEXT], [("uu1",)])),
+        (f"select format('%s!', {_TEXT_SUBQUERY})", ([_TEXT], [("uu!",)])),
+        (f"select {_TEXT_SUBQUERY} || array['q']", ([1009], [(["uu", "q"],)])),
+        (
+            "select (select '12') + 1",
+            ("error", "42883", "operator does not exist: text + integer"),
+        ),
+    ],
+)
+def test_a_text_scalar_subquery_is_typed_text(query: str, expected: object, dsn: str) -> None:
+    """The same undeclared parameter reached every caller of a `text`
+    scalar subquery: `concat` and `format` refused it with 42P18, `||`
+    read it as an array literal (22P02 `malformed array literal`), and
+    `(select '12') + 1` answered 13. Measured on PostgreSQL 15.19, each is
+    the answer of a `text` value."""
+    try:
+        got: object = _described(dsn, query)
+    except psycopg.Error as e:
+        got = ("error", e.sqlstate, str(e).splitlines()[0])
+    assert got == expected
