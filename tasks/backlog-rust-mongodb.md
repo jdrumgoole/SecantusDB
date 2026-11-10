@@ -1419,16 +1419,38 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       serve it.
       Backlog-ID: RM-215
       Verify: tests/backlog/test_rm_found_2026_10_20b.py::test_query_stats_records_queries_when_asked
-- [ ] **A `$lookup` without `from` is refused.** mongod 8.2.11 runs a
-      `$lookup` whose pipeline starts with `$documents` and names no `from`
-      (in `{aggregate: 1}` or over a collection, with `let`), and refuses
-      one whose pipeline does not with 9 "$lookup stage without explicit
-      collection must have a pipeline with $documents as first stage". This
-      server answers 2 "$lookup requires 'from' (string)" to both. (A
-      `$unionWith` without `coll` runs since RM-179.) Found 2026-11-08
-      (RM-215).
-      Verify: tests/backlog/test_rm_found_2026_11_08b.py::test_a_lookup_without_from_runs_its_documents
-      Backlog-ID: RM-413
+- [ ] **`$lookup` runs a `let` that is not a document, and a lone join field.**
+      mongod 8.2.11 refuses `let: 5` with 14 "BSON field '$lookup.let' is
+      the wrong type 'int', expected type 'object'", and `localField`
+      without `foreignField` (or the reverse) with 9 "$lookup requires both
+      or neither of 'localField' and 'foreignField' to be specified". This
+      server runs the first, runs the lone field when there is a pipeline,
+      and answers 2 without one. Found 2026-11-10 (RM-413).
+      Verify: tests/backlog/test_rm_found_2026_11_10_lookup.py::test_lookup_refuses_a_bad_let_and_a_lone_join_field
+      Backlog-ID: RM-528
+- [ ] **A `$lookup` whose `localField` is an empty array joins nothing.**
+      mongod 8.2.11 joins it as it joins null: to the foreign documents
+      whose `foreignField` is missing, null or `[null]`, in the simple form
+      and with a pipeline. This server's `lookup_match` finds no element to
+      compare and joins none. Found 2026-11-10 (RM-413).
+      Verify: tests/backlog/test_rm_found_2026_11_10_lookup.py::test_an_empty_local_array_joins_what_null_joins
+      Backlog-ID: RM-529
+- [ ] **`$documents` in a `$facet` is not refused with 40600.** mongod
+      8.2.11 refuses it with 40600 "$documents is not allowed to be used
+      within a $facet stage", and names the stage that holds it when a
+      `$unionWith` or `$lookup` in the facet does ("$documents inside of
+      $unionWith is not allowed ..."). This server answers 73 to the first
+      and runs the other two. Found 2026-11-10 (RM-413).
+      Verify: tests/backlog/test_rm_found_2026_11_10_lookup.py::test_documents_is_refused_in_a_facet
+      Backlog-ID: RM-530
+- [ ] **`$documents` of a non-array answers 2.** mongod 8.2.11 refuses
+      `$documents: 5` at run time with 5858203 "Executor error during
+      aggregate command on namespace: <db>.$cmd.aggregate :: caused by ::
+      an array is expected" (the outer collection's namespace inside a
+      `$lookup`). This server answers 2 "$documents argument must evaluate
+      to an array". Found 2026-11-10 (RM-413).
+      Verify: tests/backlog/test_rm_found_2026_11_10_lookup.py::test_documents_of_a_non_array_is_an_executor_error
+      Backlog-ID: RM-531
 - [ ] **A collectionless aggregate's explain is not mongod's.** For
       `{aggregate: 1, pipeline: [{$documents: [...]}, {$match: ...}]}` at
       `executionStats` mongod 8.2.11 gives each stage its `nReturned` and

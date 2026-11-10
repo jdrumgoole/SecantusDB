@@ -864,15 +864,29 @@ pub(crate) fn listed_stage(stage: &Document, db: &str) -> Vec<Document> {
             }
             one(doc! { "$facet": out })
         }
-        ("$lookup", Bson::Document(spec))
-            if spec.contains_key("pipeline") && !spec.contains_key("let") =>
-        {
+        // mongod's order, with the `let` a pipeline always has and the
+        // `$cmd.aggregate` a `$lookup` without `from` reads (RM-413, 8.2.11).
+        ("$lookup", Bson::Document(spec)) if spec.contains_key("pipeline") => {
             let mut out = Document::new();
-            for (k, v) in spec {
-                if k == "pipeline" {
-                    out.insert("let", Document::new());
+            let from = spec
+                .get("from")
+                .cloned()
+                .unwrap_or_else(|| crate::aggregate::COLLECTIONLESS_COLL.into());
+            out.insert("from", from);
+            for k in ["as", "localField", "foreignField"] {
+                if let Some(v) = spec.get(k) {
+                    out.insert(k, v.clone());
                 }
-                out.insert(k.clone(), v.clone());
+            }
+            let lets = spec
+                .get("let")
+                .cloned()
+                .unwrap_or_else(|| Document::new().into());
+            out.insert("let", lets);
+            for (k, v) in spec {
+                if !out.contains_key(k) {
+                    out.insert(k.clone(), v.clone());
+                }
             }
             one(doc! { "$lookup": out })
         }

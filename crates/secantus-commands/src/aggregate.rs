@@ -241,7 +241,7 @@ pub fn aggregate(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     // Validate stage names up-front (mongod parses before running): an
     // unrecognised stage is Location40324, an Atlas-only stage is
     // CommandNotSupported (115) — not the generic "unsupported" BadValue.
-    if let Err(e) = validate_stage_names(&pipeline) {
+    if let Err(e) = validate_stage_names(&pipeline, &ctx.db_name) {
         return Ok(e.into_reply());
     }
     // mongod resolves the namespaces the stages read once it knows the
@@ -1996,7 +1996,7 @@ fn validate_no_where_in_match(pipeline: &[Bson]) -> Result<(), CommandError> {
     Ok(())
 }
 
-pub(crate) fn validate_stage_names(pipeline: &[Bson]) -> Result<(), CommandError> {
+pub(crate) fn validate_stage_names(pipeline: &[Bson], db: &str) -> Result<(), CommandError> {
     for stage in pipeline {
         // Both of these used to `continue`, so a malformed element sailed past
         // validation: `pipeline: [42]` reached execution and surfaced as a bare
@@ -2044,7 +2044,91 @@ pub(crate) fn validate_stage_names(pipeline: &[Bson]) -> Result<(), CommandError
             }
             _ => {}
         }
+        lookups_lite_parse(std::slice::from_ref(stage), db)?;
         nested_query_stats_specs(stage)?;
+    }
+    Ok(())
+}
+
+/// What mongod's `$lookup` refuses as it first reads the stage, before any
+/// other stage-field check (an unknown field, a missing `as`): `from` that is
+/// not a string (9) or names no collection (73), a `pipeline` that is not an
+/// array of documents (14), and with no `from` a pipeline that does not make
+/// its own documents (9) -- such a `$lookup` reads no collection (RM-413,
+/// measured 8.2.11).
+fn lookup_lite_parse(spec: Option<&Bson>, db: &str) -> Result<(), CommandError> {
+    let Some(Bson::Document(spec)) = spec else {
+        return Ok(());
+    };
+    match spec.get("from") {
+        None | Some(Bson::String(_) | Bson::Document(_)) => {}
+        Some(other) => {
+            return Err(CommandError::new(
+                9,
+                "FailedToParse",
+                format!(
+                    "$lookup 'from' field must be a string, but found {}",
+                    secantus_core::query::bson_type_name(other)
+                ),
+            ))
+        }
+    }
+    if matches!(spec.get("from"), Some(Bson::String(s)) if s.is_empty()) {
+        return Err(CommandError::new(
+            73,
+            "InvalidNamespace",
+            format!("invalid $lookup namespace: {db}"),
+        ));
+    }
+    let pipeline = match spec.get("pipeline") {
+        None => None,
+        Some(Bson::Array(stages)) => {
+            if !stages.iter().all(|s| matches!(s, Bson::Document(_))) {
+                return Err(CommandError::new(14, "TypeMismatch", PIPELINE_ELEMENT_MSG));
+            }
+            Some(stages)
+        }
+        Some(_) => {
+            return Err(CommandError::new(
+                14,
+                "TypeMismatch",
+                "A pipeline must be an array of objects",
+            ))
+        }
+    };
+    if !spec.contains_key("from") {
+        let Some(stages) = pipeline else {
+            return Err(CommandError::new(
+                9,
+                "FailedToParse",
+                "must specify 'pipeline' when 'from' is empty",
+            ));
+        };
+        if !stages
+            .first()
+            .is_some_and(|s| stage_name(s) == "$documents")
+        {
+            return Err(CommandError::new(
+                9,
+                "FailedToParse",
+                "$lookup stage without explicit collection must have a pipeline with \
+                 $documents as first stage",
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Every `$lookup` in `pipeline` and in the pipelines its stages hold
+/// (`$facet`, `$lookup`, `$unionWith`), read as `lookup_lite_parse` reads one.
+fn lookups_lite_parse(pipeline: &[Bson], db: &str) -> Result<(), CommandError> {
+    for stage in pipeline {
+        if stage_name(stage) == "$lookup" {
+            lookup_lite_parse(stage.as_document().and_then(|d| d.get("$lookup")), db)?;
+        }
+        for (_, sub, _) in sub_pipelines(stage) {
+            lookups_lite_parse(sub, db)?;
+        }
     }
     Ok(())
 }
@@ -2941,6 +3025,11 @@ fn apply_storage_stage(
     }
 }
 
+/// The collection mongod names for what a collectionless stage reads: a
+/// `$lookup` with no `from` reads `<db>.$cmd.aggregate`, as `{aggregate: 1}`
+/// does.
+pub(crate) const COLLECTIONLESS_COLL: &str = "$cmd.aggregate";
+
 /// `$lookup` — join a foreign collection in. Mirrors `aggregate._stage_lookup`:
 /// simple `localField`/`foreignField` equality join (array-aware), or the
 /// `let` + `pipeline` form (each outer doc binds `let` vars, then runs the
@@ -2988,9 +3077,15 @@ fn apply_lookup(
             ),
         ));
     }
-    let from = spec
-        .get_str("from")
-        .map_err(|_| bad_value("$lookup requires 'from' (string)"))?;
+    // No `from`: the pipeline makes its own documents (`lookup_lite_parse`
+    // has refused any other shape), and reads no collection (RM-413).
+    let from = match spec.get("from") {
+        None => None,
+        Some(_) => Some(
+            spec.get_str("from")
+                .map_err(|_| bad_value("$lookup requires 'from' (string)"))?,
+        ),
+    };
     let as_field = spec
         .get_str("as")
         .map_err(|_| bad_value("$lookup requires 'as' (string)"))?;
@@ -2998,6 +3093,56 @@ fn apply_lookup(
     let foreign_field = spec.get_str("foreignField").ok();
     let sub_pipeline = spec.get("pipeline").and_then(Bson::as_array);
     let let_spec = spec.get("let").and_then(Bson::as_document);
+    let bind = |doc: &Document| -> Result<Document, CommandError> {
+        let mut sub_vars = vars.clone();
+        if let Some(ls) = let_spec {
+            for (k, expr) in ls.iter() {
+                let v = secantus_core::expressions::evaluate(doc, expr, vars)
+                    .map_err(|_| bad_value("$lookup let expression not supported"))?;
+                sub_vars.insert(k.clone(), v);
+            }
+        }
+        Ok(sub_vars)
+    };
+
+    let Some(from) = from else {
+        let sub = sub_pipeline.ok_or_else(|| {
+            bad_value("$lookup stage without explicit collection must have a pipeline")
+        })?;
+        // mongod puts the `localField` / `foreignField` match right after the
+        // `$documents` that make the candidates, ahead of the rest.
+        let (source, rest) = sub.split_at(sub.len().min(1));
+        let mut out = Vec::with_capacity(docs.len());
+        for doc in docs {
+            let sub_vars = bind(&doc)?;
+            let _sub = InSubPipeline::enter(SubPipeline::Lookup);
+            let run = |input: Vec<Document>, stages: &[Bson]| {
+                run_segmented(
+                    input,
+                    stages,
+                    db,
+                    None,
+                    &sub_vars,
+                    storage,
+                    collation,
+                    &Document::new(),
+                    None,
+                )
+            };
+            let mut made = run(Vec::new(), source)?;
+            if let (Some(lf), Some(ff)) = (local_field, foreign_field) {
+                let lv = secantus_core::get_path(&doc, lf).cloned();
+                made.retain(|fd| lookup_match(lv.as_ref(), secantus_core::get_path(fd, ff)));
+            }
+            let joined = run(made, rest)?;
+            lookup_budget(&joined, COLLECTIONLESS_COLL)?;
+            let mut new = doc;
+            let arr = Bson::Array(joined.into_iter().map(Bson::Document).collect());
+            set_field_path(&mut new, as_field, arr);
+            out.push(new);
+        }
+        return Ok(out);
+    };
 
     // Index-driven simple form: when there's no sub-pipeline, both fields are
     // present, and the foreign collection has a leading-field index on
@@ -3058,14 +3203,7 @@ fn apply_lookup(
             // candidate foreign docs (pre-filtered by localField/foreignField if
             // both are present, else the whole collection), then run the inner
             // pipeline over them.
-            let mut sub_vars = vars.clone();
-            if let Some(ls) = let_spec {
-                for (k, expr) in ls.iter() {
-                    let v = secantus_core::expressions::evaluate(&doc, expr, vars)
-                        .map_err(|_| bad_value("$lookup let expression not supported"))?;
-                    sub_vars.insert(k.clone(), v);
-                }
-            }
+            let sub_vars = bind(&doc)?;
             let candidates: Vec<Document> = match (local_field, foreign_field) {
                 (Some(lf), Some(ff)) => {
                     let lv = secantus_core::get_path(&doc, lf).cloned();
@@ -6067,7 +6205,7 @@ mod malformed_pipeline_tests {
             Bson::Double(3.5),
             Bson::Boolean(true),
         ] {
-            let err = validate_stage_names(std::slice::from_ref(&bad))
+            let err = validate_stage_names(std::slice::from_ref(&bad), "test")
                 .expect_err(&format!("{bad:?} should be rejected"));
             assert_eq!(err.code, 14, "{bad:?}");
             assert_eq!(err.code_name, "TypeMismatch", "{bad:?}");
@@ -6084,7 +6222,7 @@ mod malformed_pipeline_tests {
             doc! {"$match": {}, "$count": "n"},
             doc! {"$limit": 1, "$count": "n"},
         ] {
-            let err = validate_stage_names(&[Bson::Document(bad.clone())])
+            let err = validate_stage_names(&[Bson::Document(bad.clone())], "test")
                 .expect_err(&format!("{bad:?} should be rejected"));
             assert_eq!(err.code, 40323, "{bad:?}");
             assert_eq!(err.code_name, "Location40323", "{bad:?}");
@@ -6094,11 +6232,79 @@ mod malformed_pipeline_tests {
 
     #[test]
     fn well_formed_pipeline_still_validates() {
-        validate_stage_names(&[
-            Bson::Document(doc! {"$match": {"x": 1}}),
-            Bson::Document(doc! {"$count": "n"}),
-        ])
+        validate_stage_names(
+            &[
+                Bson::Document(doc! {"$match": {"x": 1}}),
+                Bson::Document(doc! {"$count": "n"}),
+            ],
+            "test",
+        )
         .expect("a valid pipeline must not be rejected");
+    }
+
+    /// `$lookup` is read before its fields are checked, in mongod 8.2.11's
+    /// order: `from`, then `pipeline`, then, with no `from`, a pipeline that
+    /// makes its own documents (RM-413).
+    #[test]
+    fn lookup_is_read_in_mongods_order() {
+        let check = |spec: Document| {
+            validate_stage_names(&[Bson::Document(doc! {"$lookup": spec})], "db")
+                .err()
+                .map(|e| (e.code, e.errmsg))
+        };
+        let docs = bson::bson!([{"$documents": [{"b": 1}]}]);
+        assert_eq!(check(doc! {"pipeline": docs.clone(), "as": "z"}), None);
+        assert_eq!(
+            check(doc! {"bogus": 1, "pipeline": 5, "from": 5, "as": "z"}),
+            Some((
+                9,
+                "$lookup 'from' field must be a string, but found int".into()
+            ))
+        );
+        assert_eq!(
+            check(doc! {"bogus": 1, "from": Bson::Null}),
+            Some((
+                9,
+                "$lookup 'from' field must be a string, but found null".into()
+            ))
+        );
+        assert_eq!(
+            check(doc! {"pipeline": 5, "from": "", "as": "z"}),
+            Some((73, "invalid $lookup namespace: db".into()))
+        );
+        assert_eq!(
+            check(doc! {"pipeline": 5}),
+            Some((14, "A pipeline must be an array of objects".into()))
+        );
+        assert_eq!(
+            check(doc! {"from": "c", "pipeline": [5], "as": "z"}),
+            Some((14, PIPELINE_ELEMENT_MSG.into()))
+        );
+        assert_eq!(
+            check(doc! {"bogus": 1}),
+            Some((9, "must specify 'pipeline' when 'from' is empty".into()))
+        );
+        let refused = Some((
+            9,
+            "$lookup stage without explicit collection must have a pipeline with $documents \
+             as first stage"
+                .to_string(),
+        ));
+        assert_eq!(check(doc! {"pipeline": [], "as": "z"}), refused);
+        assert_eq!(check(doc! {"pipeline": [{"$match": {}}]}), refused);
+        // A `$lookup` in any stage's pipeline is read the same way.
+        let inner = doc! {"$lookup": {"pipeline": [{"$match": {}}], "as": "y"}};
+        assert_eq!(
+            check(doc! {"from": "c", "as": "z", "pipeline": [inner.clone()]}),
+            refused
+        );
+        for outer in [
+            doc! {"$facet": {"f": [inner.clone()]}},
+            doc! {"$unionWith": {"coll": "c", "pipeline": [inner.clone()]}},
+        ] {
+            let err = validate_stage_names(&[Bson::Document(outer)], "db").err();
+            assert_eq!(err.map(|e| (e.code, e.errmsg)), refused);
+        }
     }
 }
 
@@ -6286,7 +6492,7 @@ mod query_stats_tests {
     }
 
     fn spec_error(spec: Bson) -> Option<(i32, String)> {
-        validate_stage_names(&[Bson::Document(doc! {"$queryStats": spec})])
+        validate_stage_names(&[Bson::Document(doc! {"$queryStats": spec})], "test")
             .err()
             .map(|e| (e.code, e.errmsg))
     }
