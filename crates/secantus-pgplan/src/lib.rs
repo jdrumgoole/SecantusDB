@@ -22824,6 +22824,10 @@ fn resolve_sublinks_in_expr(
         N::CoalesceExpr(c) => children.extend(c.args.iter_mut()),
         N::MinMaxExpr(m) => children.extend(m.args.iter_mut()),
         N::NullTest(t) => children.extend(t.arg.as_deref_mut()),
+        // `(x = (select ...)) is not true` and `(select ...) collate "C"`:
+        // the subquery is an ordinary value under either (RP-774).
+        N::BooleanTest(t) => children.extend(t.arg.as_deref_mut()),
+        N::CollateClause(c) => children.extend(c.arg.as_deref_mut()),
         // `SET (a, b) = (SELECT ...)`'s record subquery (`multi_assign`).
         N::MultiAssignRef(m) => children.extend(m.source.as_deref_mut()),
         N::AIndirection(a) => {

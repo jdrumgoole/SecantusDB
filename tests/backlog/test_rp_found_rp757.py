@@ -1,7 +1,7 @@
 """What working RP-757 (a scalar subquery in an `IN` list) found:
 
 - a scalar subquery under `IS [NOT] TRUE` / `FALSE` / `UNKNOWN`, or under
-  a `COLLATE`, is still refused;
+  a `COLLATE`, was refused (RP-774, fixed);
 - a `char(n)` column of a VALUES list, compared in a WHERE, did not
   compare as `bpchar` (RP-775, fixed).
 
@@ -36,21 +36,61 @@ def _answer(dsn: str, query: str) -> object:
 _S = "from (values ('tt'::text), ('uu'), ('vv')) s(x)"
 
 
-@pytest.mark.backlog("RP-774")
+_SN = "from (values ('tt'::text), ('uu'), ('vv'), (null)) s(x)"
+# A correlated subquery: `uu` for the row `uu`, NULL for every other.
+_COR = "(select y from (values ('uu'::text)) t(y) where y = s.x)"
+
+
+@pytest.mark.backlog_fixed("RP-774")
 @pytest.mark.parametrize(
     ("query", "expected"),
     [
         (f"select x {_S} where (x = (select 'uu')) is not true order by x", [("tt",), ("vv",)]),
         (f"select x {_S} where (x = (select 'uu')) is true order by x", [("uu",)]),
         (f"select x {_S} where x = (select 'uu') collate \"C\" order by x", [("uu",)]),
+        # Every boolean test, over a row whose comparison is NULL too.
+        (f"select x {_SN} where (x = (select 'uu')) is false order by x", [("tt",), ("vv",)]),
+        (
+            f"select x {_SN} where (x = (select 'uu')) is not false order by x",
+            [("uu",), (None,)],
+        ),
+        (f"select x {_SN} where (x = (select 'uu')) is unknown order by x", [(None,)]),
+        (
+            f"select x {_SN} where (x = (select 'uu')) is not unknown order by x",
+            [("tt",), ("uu",), ("vv",)],
+        ),
+        # In a select list, and with no FROM.
+        (
+            f"select x, (x = (select 'uu')) is not true {_S} order by x",
+            [("tt", True), ("uu", False), ("vv", True)],
+        ),
+        ("select ((select null::int) = 1) is unknown", [(True,)]),
+        # The subquery on the left of the comparison, and a COLLATE that
+        # changes the answer: under "C" every capital sorts first.
+        (f"select x {_S} where (select 'uu') collate \"C\" = x order by x", [("uu",)]),
+        (
+            "select x from (values ('a'::text), ('B'), ('c')) s(x)"
+            ' where x < (select \'b\') collate "C" order by x collate "C"',
+            [("B",), ("a",)],
+        ),
+        ("select collation for ((select 'b') collate \"C\")", [('"C"',)]),
+        # A correlated subquery under either.
+        (f"select x {_SN} where (x = {_COR}) is not true order by x", [("tt",), ("vv",), (None,)]),
+        (f'select x {_SN} where x = {_COR} collate "C" order by x', [("uu",)]),
+        # COLLATE over a subquery of a type with no collation.
+        (
+            'select x from (values (1)) s(x) where x = (select 1) collate "C"',
+            ("error", "42804", "collations are not supported by type integer"),
+        ),
     ],
 )
 def test_a_scalar_subquery_under_a_boolean_test_or_collate(
     dsn: str, query: str, expected: object
 ) -> None:
     """A scalar subquery under `IS [NOT] TRUE` or `COLLATE` is an ordinary
-    value on PostgreSQL 15.19; here each statement is 0A000 `SubLink is not
-    supported yet`."""
+    value on PostgreSQL 15.19; each statement was 0A000 `SubLink is not
+    supported yet`, as `resolve_sublinks_in_expr` descended neither
+    `BooleanTest` nor `CollateClause`."""
     assert _answer(dsn, query) == expected
 
 

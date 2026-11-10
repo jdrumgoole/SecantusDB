@@ -4,9 +4,10 @@ assignment to a trigger record's domain field did not check the domain):
 - a PL/pgSQL assignment to a `varchar(n)` / `char(n)` variable, or one of a
   domain over `varchar(n)`, truncated an overlong value where PostgreSQL's
   assignment coercion raises 22001 (RP-687, fixed: now regression tests);
-- a record filled by `SELECT ... INTO` types its fields by the wire's base
+- a record filled by `SELECT ... INTO` typed its fields by the wire's base
   type, without the column's domain or modifier, so an assignment to a
-  field checks neither (RP-688);
+  field checked neither (RP-688, fixed: now regression tests); a record
+  filled by `FETCH` still does (RP-807);
 - a variable declared of a table's row type (`declare r t`) has no fields
   an assignment can name (RP-689).
 
@@ -33,6 +34,12 @@ _SETUP = [
 ]
 _SEL = "do $$ declare r record; begin select * into r from t687; %s end $$"
 _ROW = "do $$ declare r t687; begin %s end $$"
+_FOR = "do $$ declare r record; begin for r in select * from t687 loop %s end loop; end $$"
+_DYN = "do $$ declare r record; begin execute 'select * from t687' into r; %s end $$"
+_FETCH = (
+    "do $$ declare r record; c cursor for select * from t687; "
+    "begin open c; fetch c into r; %s end $$"
+)
 _VARCHAR3 = ("error", "22001", "value too long for type character varying(3)")
 _D687 = ("error", "23514", 'value for domain d687 violates check constraint "d687_check"')
 
@@ -150,20 +157,83 @@ def test_variable_assignment_stores_a_fitting_value(query: str, dsn: str) -> Non
 
 
 # A record's fields are the query's columns, of their declared types
-# (`exprType` / `exprTypmod`): the domain, and the modifier.
+# (`exprType` / `exprTypmod`): the domain, and the modifier. An assignment
+# to a field takes its value by the assignment rule (`exec_assign_value`),
+# as one to a variable does.
 SELECT_INTO_FIELDS = {
     _SEL % "r.a := -5;": _D687,
     _SEL % "r.v := 'abcdef';": _VARCHAR3,
     _SEL % "r.w := 'abcdef';": _VARCHAR3,
     _SEL % "raise exception '%', pg_typeof(r.a);": ("error", "P0001", "d687"),
     _SEL % "raise exception '%', pg_typeof(r.w);": ("error", "P0001", "dv687"),
+    # A FOR over a query and an EXECUTE ... INTO fill the record alike.
+    _FOR % "r.a := -5;": _D687,
+    _FOR % "r.v := 'abcdef';": _VARCHAR3,
+    _FOR % "raise exception '%', pg_typeof(r.a);": ("error", "P0001", "d687"),
+    _DYN % "r.a := -5;": _D687,
+    _DYN % "raise exception '%', pg_typeof(r.w);": ("error", "P0001", "dv687"),
+    # What fits is stored as the field's type: a `char(3)` padded, a
+    # `varchar(3)`'s excess blanks dropped, a literal read by its input.
+    _SEL % "r.c := 'ab'; raise exception '[%] %', r.c, octet_length(r.c);": (
+        "error",
+        "P0001",
+        "[ab ] 3",
+    ),
+    _SEL % "r.c := 'abcd';": ("error", "22001", "value too long for type character(3)"),
+    _SEL % "r.v := 'abc   '; raise exception '[%]', r.v;": ("error", "P0001", "[abc]"),
+    _SEL % "r.v := 12; raise exception '[%] %', r.v, pg_typeof(r.v);": (
+        "error",
+        "P0001",
+        "[12] character varying",
+    ),
+    _SEL % "r.a := '8'; raise exception '%', r.a;": ("error", "P0001", "8"),
+    # A computed column keeps the modifier its expression has, and one
+    # with none takes any length.
+    "do $$ declare r record; begin select v::varchar(2) as t from t687 into r; "
+    "r.t := 'abcdefgh'; end $$": (
+        "error",
+        "22001",
+        "value too long for type character varying(2)",
+    ),
+    "do $$ declare r record; begin select 1.5::numeric(2,1) as t into r; r.t := 9.99; end $$": (
+        "error",
+        "22003",
+        "numeric field overflow",
+    ),
+    "do $$ declare r record; begin select a + 1 as s, v || 'zzzz' as t from t687 into r; "
+    "r.t := 'abcdefgh'; raise exception '% %', r.s, r.t; end $$": (
+        "error",
+        "P0001",
+        "6 abcdefgh",
+    ),
+    "do $$ declare r record; begin select 1 as t into r; r.t := 'x'; end $$": (
+        "error",
+        "22P02",
+        'invalid input syntax for type integer: "x"',
+    ),
 }
 
 
-@pytest.mark.backlog("RP-688")
+@pytest.mark.backlog_fixed("RP-688")
 @pytest.mark.parametrize("query", list(SELECT_INTO_FIELDS))
 def test_select_into_record_fields_keep_their_declared_types(query: str, dsn: str) -> None:
+    """Was: the fields were typed by the wire's base type, so an
+    assignment checked neither the domain nor the modifier (RP-688)."""
     assert _answer(dsn, query) == SELECT_INTO_FIELDS[query]
+
+
+# A FETCH fills the record from the portal's row type, which keeps each
+# column's domain as the query's does.
+FETCH_INTO_FIELDS = {
+    _FETCH % "r.a := -5;": _D687,
+    _FETCH % "raise exception '%', pg_typeof(r.a);": ("error", "P0001", "d687"),
+}
+
+
+@pytest.mark.backlog("RP-807")
+@pytest.mark.parametrize("query", list(FETCH_INTO_FIELDS))
+def test_fetch_into_record_fields_keep_their_domains(query: str, dsn: str) -> None:
+    assert _answer(dsn, query) == FETCH_INTO_FIELDS[query]
 
 
 # `declare r t687` is a row variable of the table's row type: each field is

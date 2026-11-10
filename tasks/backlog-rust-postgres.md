@@ -2519,16 +2519,18 @@ Measured on a private PostgreSQL 15.19 cluster with the `_SETUP` in
 dv687, c char(3))`, `d687` an `int` with `check (value > 0)` and `dv687` a
 `varchar(3)`.
 
-- [ ] **A `SELECT ... INTO` record's fields are typed without their
-      domain or modifier.** After `select * into r from t687`, `r.a :=
-      -5` is 23514 and `r.v := 'abcdef'` 22001 on PostgreSQL 15.19, and
-      `pg_typeof(r.a)` is `d687`; here both assignments are stored and
-      `pg_typeof` is `integer`. The record's field types come from the
-      query's RowDescription (`PlHost::query`), which names a domain
-      column by its base type and carries no modifier. Since RP-670 a
-      trigger's NEW and OLD fields are typed by the column's domain.
-      Verify: tests/backlog/test_rp_found_rp670.py::test_select_into_record_fields_keep_their_declared_types
-      Backlog-ID: RP-688
+- [ ] **A record filled by `FETCH` types a domain column by its base
+      type.** After `open c` over `select * from t687` and `fetch c into
+      r`, `r.a := -5` is 23514 and `pg_typeof(r.a)` is `d687` on
+      PostgreSQL 15.19; here the assignment is stored and `pg_typeof` is
+      `integer`. The portal keeps only its wire description, which names a
+      domain column by its base type (as RowDescription does), so the
+      FETCH has no domain to give the field. Since RP-688 a `SELECT ...
+      INTO`, a FOR over a query and an `EXECUTE ... INTO` type it by the
+      domain. The cursor state a SQL `DECLARE` keeps is the same, so the
+      domains belong on it, not on the PL/pgSQL side.
+      Verify: tests/backlog/test_rp_found_rp670.py::test_fetch_into_record_fields_keep_their_domains
+      Backlog-ID: RP-807
 - [ ] **A variable of a table's row type has no assignable fields.**
       `declare r t687; begin r.a := 5;` assigns the field on PostgreSQL
       15.19 (and `r.a := -5` is the domain's 23514); here it is 42601
@@ -3447,23 +3449,6 @@ with ICU) with the `_SETUP` in `tests/backlog/test_rp_found_rp782.py`
       Verify: tests/backlog/test_rp_found_rp796.py::test_a_column_of_conflicting_implicit_collations_has_none
       Backlog-ID: RP-803
 
-## Found while working RP-757 (2026-11-10)
-
-Measured on PostgreSQL 15.19 (the shared reference on port 5415): every
-statement is VALUES-only and runs there as written. The gap tests are in
-`tests/backlog/test_rp_found_rp757.py`.
-
-- [ ] **A scalar subquery under `IS [NOT] TRUE` or `COLLATE` is refused.**
-      `select x from (values ('tt'::text), ('uu'), ('vv')) s(x) where (x =
-      (select 'uu')) is not true` is `tt`, `vv` on PostgreSQL 15.19, and
-      `where x = (select 'uu') collate "C"` is `uu`; here each is 0A000
-      `SubLink is not supported yet`. `resolve_sublinks_in_expr` in
-      `secantus-pgplan/src/lib.rs` descends no `BooleanTest` and no
-      `CollateClause`, so the subquery under one reaches planning
-      unresolved.
-      Verify: tests/backlog/test_rp_found_rp757.py::test_a_scalar_subquery_under_a_boolean_test_or_collate
-      Backlog-ID: RP-774
-
 ## Found while working RP-792 (2026-11-10)
 
 Measured on the shared PostgreSQL 15.19 reference (port 5415) with
@@ -3501,3 +3486,22 @@ statements are VALUES-only and create nothing. The gap tests are in
       length.
       Verify: tests/backlog/test_rp_found_rp794.py::test_an_untyped_literal_resolved_to_bpchar_keeps_its_blanks
       Backlog-ID: RP-804
+
+## Found while working RP-774 (2026-11-10)
+
+Measured on the shared PostgreSQL 15.19 reference (port 5415); the
+statements are FROM-less or VALUES-only and create nothing. The gap test
+is in `tests/backlog/test_rp_found_rp774.py`.
+
+- [ ] **`IS [NOT] TRUE / FALSE / UNKNOWN` over a value that is not
+      `boolean` is no error.** `select 1 is true` is 42804 `argument of
+      IS TRUE must be type boolean, not type integer` on PostgreSQL 15.19
+      (`transformBooleanTest` coerces the argument with
+      `coerce_to_boolean`, naming the test), and so is `'x'::text is
+      unknown` or `null::int is unknown`. Here `1 is true` and `1 is not
+      false` are `false`, `null::int is unknown` is `true`, and a WHERE
+      `x is true` over an `int` column finds no rows: a wrong answer
+      where PostgreSQL refuses the query. `IS NOT TRUE` / `IS FALSE` over
+      one is 42804 already, but blames `NOT` rather than the test.
+      Verify: tests/backlog/test_rp_found_rp774.py::test_a_boolean_test_over_a_non_boolean_is_42804
+      Backlog-ID: RP-808
