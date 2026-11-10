@@ -377,6 +377,12 @@ QUERIES = [
     "SELECT (max(a) OVER ())::text FROM (VALUES ('10.0.0.1/32'::cidr), ('9.0.0.0/8')) s(a)",
     "SELECT (max(a) OVER (ORDER BY a))::text "
     "FROM (VALUES ('10.0.0.1'::inet), ('9.0.0.0')) s(a) ORDER BY 1",
+    # A comparison inside a sort key compares in `network_cmp` order, as it
+    # does in the select list (RP-762).
+    "SELECT a::text FROM (VALUES ('10.0.0.1'::inet), ('9.0.0.0')) s(a) "
+    "ORDER BY a > '9.5.0.0'::inet, a::text",
+    "SELECT string_agg(a::text, ',' ORDER BY a > '9.5.0.0'::inet, a::text) "
+    "FROM (VALUES ('10.0.0.1'::inet), ('9.0.0.0')) s(a)",
     "SELECT NULL::uuid",
     # Anonymous records (ROW / parenthesised list): construction, text
     # render with PG field-quoting, and three-valued comparison.

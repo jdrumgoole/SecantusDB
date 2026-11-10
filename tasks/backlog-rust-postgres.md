@@ -3354,15 +3354,6 @@ never with `expr` as it reads the select list.
       ... order by 1` is answered).
       Verify: tests/backlog/test_rp_found_rp754.py::test_a_window_call_in_an_order_by_key
       Backlog-ID: RP-761
-- [ ] **An ORDER BY comparison over a network value compares the text.**
-      `select x::text from (values ('10.0.0.1'::inet), ('9.0.0.0'::inet))
-      s(x) order by x > '9.5.0.0'::inet` is `9.0.0.0/32`, `10.0.0.1/32` on
-      PostgreSQL 15.19; here `10.0.0.1/32` comes first, its comparison false
-      by the text, though the same comparison in the select list answers
-      true. Enum comparisons in an ORDER BY key are left alone the same way
-      (unmeasured).
-      Verify: tests/backlog/test_rp_found_rp754.py::test_an_order_by_comparison_over_a_network_value
-      Backlog-ID: RP-762
 - [ ] **A window `min` / `max` under a collation picks by the text's
       bytes.** `select min(x collate "en-x-icu") over (), max(x collate
       "en-x-icu") over () from (values ('a'), ('B')) s(x)` is `a`, `B` on
@@ -3390,3 +3381,17 @@ statement is VALUES-only and runs there as written.
       (`first_output_type`).
       Verify: tests/backlog/test_rp_found_rp756.py::test_a_set_operation_from_subquerys_column_is_typed
       Backlog-ID: RP-765
+
+## Found while working RP-762 (2026-11-10)
+
+Measured on a private PostgreSQL 15.19 cluster with `create type e766 as
+enum ('z', 'a', 'm')`. The gap test is in `tests/backlog/test_rp_found_rp762.py`.
+
+- [ ] **An enum column of a VALUES list sorts by its labels' text.**
+      `select x::text as v from (values ('a'::e766), ('z'), ('m')) s(x)
+      order by x` is `z`, `a`, `m` on PostgreSQL 15.19, in declaration
+      order, as a table's enum column sorts here; here it is `a`, `m`, `z`.
+      A comparison over the column in an ORDER BY key compares the text the
+      same way. Not yet diagnosed.
+      Verify: tests/backlog/test_rp_found_rp762.py::test_a_values_enum_column_sorts_by_declaration
+      Backlog-ID: RP-766

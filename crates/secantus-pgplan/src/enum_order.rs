@@ -1051,7 +1051,11 @@ impl Rewriter<'_> {
         ))
     }
 
-    fn sort_by(&mut self, item: &mut pg_query::protobuf::Node) {
+    /// A sort key: one whose own type orders by something other than its
+    /// stored form is keyed; any other is an expression like the select
+    /// list's, its comparisons rewritten (`order by x > '9.5.0.0'::inet`
+    /// compares by `network_cmp`, not the text, RP-762).
+    fn sort_by(&mut self, item: &mut pg_query::protobuf::Node) -> Result<()> {
         if let Some(N::SortBy(sb)) = item.node.as_mut() {
             if let Some(key) = sb.node.as_deref() {
                 if let Some((_, labels)) = self.enum_of(key) {
@@ -1075,15 +1079,19 @@ impl Rewriter<'_> {
                 } else if let Some((collation, _)) = self.coll_of(key) {
                     sb.node = Some(Box::new(Self::coll_key(key, &collation)));
                     self.changed = true;
+                } else if let Some(key) = sb.node.as_deref_mut() {
+                    self.expr(key)?;
                 }
             }
         }
+        Ok(())
     }
 
-    fn window(&mut self, w: &mut pg_query::protobuf::WindowDef) {
+    fn window(&mut self, w: &mut pg_query::protobuf::WindowDef) -> Result<()> {
         for o in &mut w.order_clause {
-            self.sort_by(o);
+            self.sort_by(o)?;
         }
+        Ok(())
     }
 
     /// Rewrite an expression tree in place.
@@ -1802,7 +1810,7 @@ impl Rewriter<'_> {
                     let mut agg = (**f).clone();
                     agg.args = vec![Self::net_key(arg.clone())];
                     if let Some(w) = agg.over.as_deref_mut() {
-                        self.window(w);
+                        self.window(w)?;
                     }
                     let call = pg_query::protobuf::Node {
                         node: Some(N::FuncCall(Box::new(agg))),
@@ -1938,10 +1946,10 @@ impl Rewriter<'_> {
         // Window and aggregate ORDER BYs inside the expression.
         if let Some(N::FuncCall(f)) = node.node.as_mut() {
             for o in &mut f.agg_order {
-                self.sort_by(o);
+                self.sort_by(o)?;
             }
             if let Some(w) = f.over.as_deref_mut() {
-                self.window(w);
+                self.window(w)?;
             }
         }
         // Then the children.
@@ -2357,7 +2365,7 @@ pub(crate) fn rewrite(
         }
     }
     for item in &mut out.sort_clause {
-        r.sort_by(item);
+        r.sort_by(item)?;
     }
     // A JOIN's ON condition compares like a WHERE.
     fn join_quals(node: &mut pg_query::protobuf::Node, r: &mut Rewriter) -> Result<()> {
@@ -2416,7 +2424,7 @@ pub(crate) fn rewrite(
     }
     for w in &mut out.window_clause {
         if let Some(N::WindowDef(def)) = w.node.as_mut() {
-            r.window(def);
+            r.window(def)?;
         }
     }
     Ok(r.changed.then_some(out))
