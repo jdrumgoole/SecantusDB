@@ -137,8 +137,9 @@ def test_an_added_domain_column_is_one_of_the_domain(dsn: str) -> None:
 
 # `ATExecAlterColumnType` gives the column the new type outright: nothing of
 # the domain it had is left, so its CHECK no longer applies and the domain
-# can be dropped. Here the column kept its `domain_type` tag.
-@pytest.mark.backlog("RP-824")
+# can be dropped. Here the column kept its `domain_type` tag. Fixed by
+# RP-824.
+@pytest.mark.backlog_fixed("RP-824")
 def test_a_column_retyped_off_its_domain_drops_it(dsn: str) -> None:
     got = _answers(
         dsn,
@@ -159,6 +160,54 @@ def test_a_column_retyped_off_its_domain_drops_it(dsn: str) -> None:
         "INSERT 0 1",
         [(-1, "integer")],
         [("integer", None)],
+        "DROP DOMAIN",
+        "DROP TABLE",
+    ]
+
+
+# `ATExecAlterColumnType` also takes the column's new collation from
+# `GetColumnDefCollation`: the statement's COLLATE, else the new type's,
+# checked before the cast. A domain's DEFAULT was the type's, so it goes
+# with the domain; a DEFAULT the column declared stays. Here the column kept
+# the domain's DEFAULT and the collation it had, its own or its domain's,
+# and the COLLATE clause was ignored. Fixed by RP-824.
+@pytest.mark.backlog_fixed("RP-824")
+def test_a_retyped_column_takes_the_new_types_collation_and_default(dsn: str) -> None:
+    got = _answers(
+        dsn,
+        [
+            "create table t799 (k int, d dx799, n dnd799 default 7, a dt799,"
+            ' c text collate "C", e text)',
+            "alter table t799 alter column d type bigint, alter column n type int,"
+            " alter column a type text, alter column c type text,"
+            ' alter column e type text collate "C"',
+            "insert into t799 (k) values (1)",
+            "select * from t799",
+            "select column_name, data_type, domain_name, column_default,"
+            " collation_name from information_schema.columns"
+            " where table_name = 't799' order by ordinal_position",
+            'alter table t799 alter column k type text collate "C",'
+            ' alter column e type int collate "C"',
+            "drop domain dnd799",
+            "drop domain dt799",
+            "drop table t799",
+        ],
+    )
+    assert got == [
+        "CREATE TABLE",
+        "ALTER TABLE",
+        "INSERT 0 1",
+        [(1, None, 7, None, None, None)],
+        [
+            ("k", "integer", None, None, None),
+            ("d", "bigint", None, None, None),
+            ("n", "integer", None, "7", None),
+            ("a", "text", None, None, None),
+            ("c", "text", None, None, None),
+            ("e", "text", None, None, "C"),
+        ],
+        "42804 collations are not supported by type integer",
+        "DROP DOMAIN",
         "DROP DOMAIN",
         "DROP TABLE",
     ]

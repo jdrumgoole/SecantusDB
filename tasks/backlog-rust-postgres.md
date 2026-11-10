@@ -2538,7 +2538,11 @@ dv687, c char(3))`, `d687` an `int` with `check (value > 0)` and `dv687` a
       for the whole test, reopen included). Not diagnosed: whether the time
       is the shutdown watch telling the connection to finish, the drain, or
       the closing checkpoint under disk contention; the next step is the
-      three phases' durations from a slow run.
+      three phases' durations from a slow run. Seen a second time on
+      2026-11-10 (RP-831's `--fast` gate, again the run after a rebase):
+      `4.21637575s`, with the load average at 15-17 and a second lane's
+      gate running; the test alone then passed six times running at load
+      8-10.
       Backlog-ID: RP-690
       Verify: none -- seen once, under load; a timing that does not fail on demand
 
@@ -3520,29 +3524,6 @@ Measured on PostgreSQL 15.19; none of the statements creates an object.
       Verify: tests/backlog/test_rp_found_rp822.py::test_a_signatures_percent_type_is_resolved
       Backlog-ID: RP-830
 
-## Found while working RP-829 (2026-11-10)
-
-Measured on PostgreSQL 15.19; none of the statements creates an object.
-
-- [ ] **A transaction's isolation, read-write and deferrable modes can be
-      changed after it ran a query.** On PostgreSQL 15.19 `begin; select 1;
-      set transaction isolation level serializable` is 25001 `SET
-      TRANSACTION ISOLATION LEVEL must be called before any query`
-      (`check_XactIsoLevel` once `FirstSnapshotSet`, for a level other than
-      the current one), and so is the same change through `set
-      transaction_isolation = ...`, `set_config(...)`, a BEGIN's modes
-      after a query in a multi-statement query's implicit block (`select
-      1; begin isolation level serializable`) or in a block. `begin read
-      only; select 1; set transaction read write` is 25001 `transaction
-      read-write mode must be set before any query`, and `set transaction
-      [not] deferrable` after a query is 25001 `SET TRANSACTION [NOT]
-      DEFERRABLE must be called before any query`. Here each is accepted
-      and the GUC moves, though the transaction's snapshot was taken under
-      the old mode. The faithful fix keeps PostgreSQL's `FirstSnapshotSet`
-      per transaction and checks it in the three GUCs' check hooks.
-      Verify: tests/backlog/test_rp_found_rp829.py::test_a_transaction_mode_is_set_before_any_query
-      Backlog-ID: RP-831
-
 ## Found while working RP-799 (2026-11-10)
 
 Measured on a private, freshly initdb'd PostgreSQL 15.19 cluster with the
@@ -3552,16 +3533,6 @@ Measured on a private, freshly initdb'd PostgreSQL 15.19 cluster with the
 holds for a column CREATE TABLE declares and, since RP-799, for one ADD
 COLUMN adds.
 
-- [ ] **A column retyped off its domain still enforces the domain.** After
-      `create table t (a dpos)` and `alter table t alter column a type
-      int`, PostgreSQL 15.19 inserts `-1`, `information_schema.columns`
-      names no domain, and `drop domain dpos` succeeds; here the insert is
-      23514 `value for domain dpos violates check constraint "dpos_check"`,
-      `domain_name` is still `dpos`, and the DROP is 2BP01 naming the
-      column. `ALTER COLUMN TYPE` sets the stored type but leaves the
-      column's `domain_type` tag, which every write checks.
-      Verify: tests/backlog/test_rp_found_rp799.py::test_a_column_retyped_off_its_domain_drops_it
-      Backlog-ID: RP-824
 - [ ] **A domain's DEFAULT is listed as its column's default.** `create
       table t (d dx)` has no `pg_attrdef` row on PostgreSQL 15.19, and
       `information_schema.columns.column_default` is NULL: the domain's
@@ -3594,3 +3565,24 @@ Measured on PostgreSQL 15.19; none of it needs DDL. The gap tests are in
       line) as an error collects them on the way out.
       Verify: tests/backlog/test_rp_found_rp751.py::test_a_notice_carries_its_context
       Backlog-ID: RP-833
+
+## Found while working RP-824 (2026-11-10)
+
+Measured on a private, freshly initdb'd PostgreSQL 15.19 cluster with the
+`_SETUP` in `tests/backlog/test_rp_found_rp824.py`: `dx824` a domain over
+`int` with `check (value > 0) default 42`.
+
+- [ ] **A column retyped into a domain with USING is not one of the
+      domain.** After `alter table t alter column a type dx824 using
+      a::dx824` (`a int`), PostgreSQL 15.19 fills an INSERT that names no
+      `a` with the domain's DEFAULT `42`, `information_schema.columns`
+      reads `data_type` `integer` and `domain_name` `dx824`, and `drop
+      domain dx824` is 2BP01. Here the column is stored under the domain's
+      name with no `domain_type` tag (as RP-799 found for ADD COLUMN): its
+      DEFAULT is NULL and `data_type` is `USER-DEFINED`, with no
+      `domain_name`; a column retyped from `dx824` to `dx824` keeps its
+      tag but is `USER-DEFINED` too. (The CHECK is enforced, and DROP
+      DOMAIN refused.) The faithful fix types the column by the domain's
+      innermost base and tags it, as `plan_added_column` does.
+      Verify: tests/backlog/test_rp_found_rp824.py::test_a_column_retyped_into_a_domain_is_one_of_it
+      Backlog-ID: RP-834

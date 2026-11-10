@@ -4573,6 +4573,16 @@ pub struct PgHandler {
     /// REPEATABLE READ or SERIALIZABLE block that has none yet does not
     /// take one for it.
     no_snapshot_stmt: AtomicBool,
+    /// PostgreSQL's `FirstSnapshotSet`: a statement of this transaction
+    /// has taken a snapshot (any but those `PlannedStmtRequiresSnapshot`
+    /// exempts). Set as such a statement starts, cleared as the
+    /// transaction ends (`AtEOXact_Snapshot`, here `ssi_end`, which every
+    /// end runs). Once set, the transaction's isolation, read-write and
+    /// deferrable modes are fixed (`check_transaction_guc`, RP-831).
+    first_snapshot_set: AtomicBool,
+    /// SET ... TO DEFAULT is applying the reset value, which PostgreSQL's
+    /// `set_config_option` installs without the setting's check hook.
+    setting_reset_value: AtomicBool,
     /// How many statements are running on this session (`run_typed_inner`,
     /// nested ones -- a `DO` block's, a function's -- counted too): the
     /// outermost one outside a transaction holds its table locks to its
@@ -5092,6 +5102,8 @@ impl PgHandler {
             bound_params: Mutex::new(None),
             ssi_unique_pending: Mutex::new(Vec::new()),
             no_snapshot_stmt: AtomicBool::new(false),
+            first_snapshot_set: AtomicBool::new(false),
+            setting_reset_value: AtomicBool::new(false),
             statement_depth: std::sync::atomic::AtomicUsize::new(0),
             rc_overlay: Mutex::new(None),
             plan_apart: Mutex::new(None),
@@ -33318,10 +33330,15 @@ impl PgHandler {
                 self.0.store(false, std::sync::atomic::Ordering::Relaxed);
             }
         }
-        self.no_snapshot_stmt.store(
-            sql_takes_no_snapshot(sql),
-            std::sync::atomic::Ordering::Relaxed,
-        );
+        let no_snapshot = sql_takes_no_snapshot(sql);
+        self.no_snapshot_stmt
+            .store(no_snapshot, std::sync::atomic::Ordering::Relaxed);
+        // The statement takes its snapshot as it starts, before anything it
+        // runs -- a `set_config` in its select list included -- can ask.
+        if !no_snapshot {
+            self.first_snapshot_set
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+        }
         let _snapshotless = Snapshotless(&self.no_snapshot_stmt);
         // The table locks an outermost statement outside a transaction
         // takes are its implicit transaction's: they end with it, on every
@@ -34817,6 +34834,7 @@ impl PgHandler {
                     // the client's loader).
                     self.check_set_privilege(&key)?;
                     let text = self.canonical_setting_value(&key, &text)?;
+                    self.check_transaction_guc(&key, &text)?;
                     // `is_local` outside a block lasts only for the
                     // statement's own implicit transaction: nothing stays.
                     // `is_local` outside any transaction lasts for the
@@ -36587,6 +36605,91 @@ impl PgHandler {
     }
 
     /// BEGIN / START TRANSACTION / COMMIT / ROLLBACK, with `AND CHAIN`.
+    /// variable.c's check hooks for the three transaction GUCs
+    /// (`check_XactIsoLevel`, `check_transaction_read_only`,
+    /// `check_transaction_deferrable`), asked wherever a value is SET --
+    /// `SET`, `SET LOCAL`, `SET TRANSACTION`, a BEGIN's modes, `set_config`
+    /// -- in their order of checks. Once the transaction has taken a
+    /// snapshot (`first_snapshot_set`), or inside a subtransaction, its
+    /// modes are fixed: a different isolation level, a move from read-only
+    /// to read-write, or any deferrable setting is 25001 (RP-831). Another
+    /// key, or `value` not a transaction mode's, passes.
+    fn check_transaction_guc(&self, key: &str, value: &str) -> PgWireResult<()> {
+        use std::sync::atomic::Ordering::Relaxed;
+        let snapshot = self.first_snapshot_set.load(Relaxed);
+        let sub = || {
+            !self
+                .savepoints
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_empty()
+        };
+        let refuse = |msg: &str| Err(Self::user_error("25001", msg.into()));
+        match key {
+            "transaction_isolation" => {
+                // `newXactIsoLevel != XactIsoLevel && IsTransactionState()`.
+                if self.setting_is("transaction_isolation", value) {
+                    return Ok(());
+                }
+                if snapshot {
+                    return refuse(
+                        "SET TRANSACTION ISOLATION LEVEL must be called before any query",
+                    );
+                }
+                if sub() {
+                    return refuse(
+                        "SET TRANSACTION ISOLATION LEVEL must not be called in a subtransaction",
+                    );
+                }
+            }
+            "transaction_read_only" => {
+                // Only a move to read-write, from read-only.
+                let read_write = matches!(value, "off" | "false" | "no" | "0");
+                if !read_write || !self.setting_is("transaction_read_only", "on") {
+                    return Ok(());
+                }
+                if sub() {
+                    return refuse(
+                        "cannot set transaction read-write mode inside a read-only transaction",
+                    );
+                }
+                if snapshot {
+                    return refuse("transaction read-write mode must be set before any query");
+                }
+            }
+            "transaction_deferrable" => {
+                if sub() {
+                    return refuse(
+                        "SET TRANSACTION [NOT] DEFERRABLE cannot be called within a subtransaction",
+                    );
+                }
+                if snapshot {
+                    return refuse(
+                        "SET TRANSACTION [NOT] DEFERRABLE must be called before any query",
+                    );
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// [`Self::check_transaction_guc`] for each mode a `SET TRANSACTION` or
+    /// a BEGIN names, as `ExecSetVariableStmt` / `standard_ProcessUtility`
+    /// set them: isolation, then read-only, then deferrable.
+    fn check_transaction_modes(&self, modes: &TransactionModes) -> PgWireResult<()> {
+        if let Some(iso) = &modes.isolation {
+            self.check_transaction_guc("transaction_isolation", iso)?;
+        }
+        if let Some(ro) = modes.read_only {
+            self.check_transaction_guc("transaction_read_only", if ro { "on" } else { "off" })?;
+        }
+        if let Some(df) = modes.deferrable {
+            self.check_transaction_guc("transaction_deferrable", if df { "on" } else { "off" })?;
+        }
+        Ok(())
+    }
+
     /// Apply the transaction characteristics of a `BEGIN` / `START TRANSACTION`
     /// to the `transaction_*` GUCs for the life of the block.
     ///
@@ -36770,6 +36873,10 @@ impl PgHandler {
             // error, and the existing transaction continues.
             TransactionControl::Begin(modes) => {
                 begin(&mut guard)?;
+                // The modes are SET through their GUCs' check hooks: a
+                // BEGIN continuing a transaction that has taken a snapshot
+                // cannot change them (RP-831).
+                self.check_transaction_modes(&modes)?;
                 self.apply_transaction_modes_on_begin(&modes, nested);
                 ("BEGIN", false)
             }
@@ -36777,6 +36884,10 @@ impl PgHandler {
             // back, and `START TRANSACTION` answers with its own.
             TransactionControl::Start(modes) => {
                 begin(&mut guard)?;
+                // The modes are SET through their GUCs' check hooks: a
+                // BEGIN continuing a transaction that has taken a snapshot
+                // cannot change them (RP-831).
+                self.check_transaction_modes(&modes)?;
                 self.apply_transaction_modes_on_begin(&modes, nested);
                 ("START TRANSACTION", false)
             }
@@ -45770,7 +45881,15 @@ impl PgHandler {
                 } else {
                     Statement::Set { name, value }
                 };
-                let out = self.execute_statement(stmt, max_rows)?;
+                // The reset value is installed without the setting's check
+                // hook (15.19: `begin isolation level serializable; select
+                // 1; set transaction_isolation to default` is accepted).
+                self.setting_reset_value
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+                let out = self.execute_statement(stmt, max_rows);
+                self.setting_reset_value
+                    .store(false, std::sync::atomic::Ordering::Relaxed);
+                let out = out?;
                 // The value takes the reset value's source too.
                 let mut settings = self.settings.lock().unwrap_or_else(|e| e.into_inner());
                 if let Some(now) = settings.get(&key).cloned() {
@@ -45853,6 +45972,13 @@ impl PgHandler {
                         .mark_session("client_encoding");
                 } else {
                     let value = self.canonical_setting_value(&key, &value)?;
+                    // The setting's check hook; a reset value has none.
+                    if !self
+                        .setting_reset_value
+                        .load(std::sync::atomic::Ordering::Relaxed)
+                    {
+                        self.check_transaction_guc(&key, &value)?;
+                    }
                     self.note_txn_guc(&key, false, &value);
                     let mut settings = self.settings.lock().unwrap_or_else(|e| e.into_inner());
                     settings.insert(key.clone(), value.clone());
@@ -45891,6 +46017,7 @@ impl PgHandler {
                     .in_transaction
                     .load(std::sync::atomic::Ordering::Relaxed)
                 {
+                    self.check_transaction_modes(&modes)?;
                     let mut settings = self.settings.lock().unwrap_or_else(|e| e.into_inner());
                     if let Some(iso) = &modes.isolation {
                         settings.insert("transaction_isolation".into(), iso.clone());
@@ -45914,6 +46041,8 @@ impl PgHandler {
                         "25P01",
                         "SET TRANSACTION can only be used in transaction blocks".into(),
                     );
+                    // ... and the modes still go through their check hooks.
+                    self.check_transaction_modes(&modes)?;
                 }
                 Ok(vec![Response::Execution(Tag::new("SET"))])
             }
@@ -54833,6 +54962,8 @@ fn sql_takes_no_snapshot(sql: &str) -> bool {
             | b"savepoint"
             | b"release"
             | b"checkpoint"
+            | b"fetch"
+            | b"move"
     )
 }
 
