@@ -68,6 +68,132 @@ pub(crate) fn hash(db: &str, request: &Document) -> Option<String> {
     Some(digest.iter().map(|b| format!("{b:02X}")).collect())
 }
 
+/// A query as `$queryStats` keeps it: its shape twice -- with
+/// representative literals, which the entry's `keyHash` covers, and with
+/// debug type strings, which `$queryStats` prints -- and its
+/// `queryShapeHash`.
+pub(crate) struct StatsShape {
+    pub representative: Document,
+    pub debug: Document,
+    pub hash: String,
+}
+
+/// The shape a `find`, `distinct`, `count` or `aggregate` against database
+/// `db` is recorded under in the query stats store (RM-215). Unlike
+/// [`hash`] this shapes a read of an internal database or a system
+/// collection too: mongod 8.2.11 records those.
+pub(crate) fn stats_shape(db: &str, request: &Document) -> Option<StatsShape> {
+    let name = request.keys().next()?.as_str();
+    let coll = match request.get(name)? {
+        Bson::String(coll) => coll.as_str(),
+        one if name == "aggregate" && number(one) == Some(1.0) => "$cmd.aggregate",
+        _ => return None,
+    };
+    let digest = match name {
+        "find" => find(db, request)?,
+        "distinct" => distinct(db, request)?,
+        "count" => count(db, request)?,
+        "aggregate" => aggregate(db, coll, request)?,
+        _ => return None,
+    };
+    let representative = shape_doc(db, coll, name, request)?;
+    let debug = with_debug(|| shape_doc(db, coll, name, request))?;
+    Some(StatsShape {
+        representative,
+        debug,
+        hash: digest.iter().map(|b| format!("{b:02X}")).collect(),
+    })
+}
+
+/// A literal outside the shape -- a `$queryStats` key's `comment`,
+/// `maxTimeMS` or `batchSize` -- as its representative, or its debug type
+/// string when `debug`.
+pub(crate) fn literal(v: &Bson, debug_form: bool) -> Option<Bson> {
+    if debug_form {
+        with_debug(|| rep(v))
+    } else {
+        rep(v)
+    }
+}
+
+/// The query shape as a document (`Shape::toBson`): `cmdNs`, a non-empty
+/// collation, then what the command's own components append.
+fn shape_doc(db: &str, coll: &str, name: &str, request: &Document) -> Option<Document> {
+    let mut shape = doc! { "cmdNs": { "db": db, "coll": coll } };
+    if let Some(c) = optional_doc(request, "collation")?.filter(|c| !c.is_empty()) {
+        shape.insert("collation", c);
+    }
+    match name {
+        "find" => {
+            // `FindCmdShapeComponents::appendTo`.
+            if let Some(l) = optional_doc(request, "let")? {
+                shape.insert("let", let_shape(&l)?);
+            }
+            shape.insert("command", "find");
+            let filter = optional_doc(request, "filter")?.unwrap_or_default();
+            shape.insert("filter", filter_shape(&filter)?);
+            if let Some(p) = find_projection(request)? {
+                shape.insert("projection", p);
+            }
+            for key in ["max", "min"] {
+                if let Some(d) = optional_doc(request, key)?.filter(|d| !d.is_empty()) {
+                    shape.insert(key, flat_literals(&d)?);
+                }
+            }
+            if let Some(d) = optional_doc(request, "sort")?.filter(|d| !d.is_empty()) {
+                shape.insert("sort", sort_shape(&d)?);
+            }
+            for key in ["limit", "skip"] {
+                if request.contains_key(key) {
+                    shape.insert(key, rep(&Bson::Int64(1))?);
+                }
+            }
+            for key in FIND_FLAGS {
+                if let Some(v) = request.get(key) {
+                    shape.insert(key, v.as_bool()?);
+                }
+            }
+        }
+        "distinct" => {
+            shape.insert("command", "distinct");
+            shape.insert("key", request.get_str("key").ok()?);
+            let query = optional_doc(request, "query")?.unwrap_or_default();
+            let query = filter_shape(&query)?;
+            if !query.is_empty() {
+                shape.insert("query", query);
+            }
+        }
+        "count" => {
+            shape.insert("command", "count");
+            let query = optional_doc(request, "query")?.unwrap_or_default();
+            let query = filter_shape(&query)?;
+            if !query.is_empty() {
+                shape.insert("query", query);
+            }
+            for key in ["limit", "skip"] {
+                if request.contains_key(key) {
+                    shape.insert(key, rep(&Bson::Int64(1))?);
+                }
+            }
+        }
+        "aggregate" => {
+            if let Some(l) = optional_doc(request, "let")? {
+                shape.insert("let", let_shape(&l)?);
+            }
+            shape.insert("command", "aggregate");
+            shape.insert(
+                "pipeline",
+                pipeline_shape(db, request.get_array("pipeline").ok()?)?,
+            );
+            if let Some(v) = request.get("allowDiskUse") {
+                shape.insert("allowDiskUse", v.as_bool()?);
+            }
+        }
+        _ => return None,
+    }
+    Some(shape)
+}
+
 fn bytes(d: &Document) -> Option<Vec<u8>> {
     secantus_core::bsondoc::to_vec(d).ok()
 }
@@ -95,13 +221,30 @@ const FIND_FLAGS: [&str; 8] = [
     "oplogReplay",
 ];
 
+/// A `find`'s projection shape, if it has one. `showRecordId` asks it
+/// for the record id, ahead of an included `_id` (measured 8.2.11).
+fn find_projection(request: &Document) -> Option<Option<Document>> {
+    let mut shown = match optional_doc(request, "projection")?.filter(|p| !p.is_empty()) {
+        Some(p) => Some(projection(&p, Mode::Find)?),
+        None => None,
+    };
+    if request.get("showRecordId").and_then(Bson::as_bool) == Some(true) {
+        let p = shown.get_or_insert_with(Document::new);
+        let id = (p.keys().last().map(String::as_str) == Some("_id"))
+            .then(|| p.remove("_id"))
+            .flatten();
+        p.insert("$recordId", doc! { "$meta": "recordId" });
+        if let Some(id) = id {
+            p.insert("_id", id);
+        }
+    }
+    Some(shown)
+}
+
 fn find(db: &str, request: &Document) -> Option<[u8; 32]> {
     let coll = request.get_str("find").ok()?;
     let filter = filter_shape(&optional_doc(request, "filter")?.unwrap_or_default())?;
-    let projection = match optional_doc(request, "projection")? {
-        Some(p) => projection(&p, Mode::Find)?,
-        None => Document::new(),
-    };
+    let projection = find_projection(request)?.unwrap_or_default();
     let sort = match optional_doc(request, "sort")? {
         Some(s) => sort_shape(&s)?,
         None => Document::new(),
@@ -158,26 +301,104 @@ fn distinct(db: &str, request: &Document) -> Option<[u8; 32]> {
 }
 
 fn aggregate(db: &str, coll: &str, request: &Document) -> Option<[u8; 32]> {
-    let pipeline = pipeline_shape(db, request.get_array("pipeline").ok()?)?;
-    let mut shape = doc! { "cmdNs": { "db": db, "coll": coll } };
-    if let Some(c) = optional_doc(request, "collation")?.filter(|c| !c.is_empty()) {
-        shape.insert("collation", c);
-    }
-    if let Some(l) = optional_doc(request, "let")? {
-        shape.insert("let", let_shape(&l)?);
-    }
-    shape.insert("command", "aggregate");
-    shape.insert("pipeline", pipeline);
-    if let Some(v) = request.get("allowDiskUse") {
-        shape.insert("allowDiskUse", v.as_bool()?);
-    }
+    let shape = shape_doc(db, coll, "aggregate", request)?;
     Some(Sha256::digest(bytes(&shape)?).into())
+}
+
+/// `CountCmdShape::sha256Hash`: `"count"`, a 16-bit options word, the
+/// namespace, the collation, a byte of skip (bit 0) and limit (bit 1),
+/// then the representative query.
+fn count(db: &str, request: &Document) -> Option<[u8; 32]> {
+    let coll = request.get_str("count").ok()?;
+    let query = filter_shape(&optional_doc(request, "query")?.unwrap_or_default())?;
+    let collation = optional_doc(request, "collation")?.unwrap_or_default();
+    let mut buf = b"count".to_vec();
+    buf.extend_from_slice(&0_i16.to_le_bytes());
+    buf.extend_from_slice(format!("{db}.{coll}").as_bytes());
+    buf.extend_from_slice(&bytes(&collation)?);
+    buf.push(
+        u8::from(request.contains_key("skip")) | (u8::from(request.contains_key("limit")) << 1),
+    );
+    buf.extend_from_slice(&bytes(&query)?);
+    Some(Sha256::digest(&buf).into())
 }
 
 // ------------------------------------------------------------ literals --
 
-/// mongod's representative value of `v` (`defaultLiteralOfType`).
+thread_local! {
+    /// Shape literals as mongod's debug type strings (`?number`) rather
+    /// than representative values: how `$queryStats` prints a shape.
+    static DEBUG: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+fn debug() -> bool {
+    DEBUG.with(std::cell::Cell::get)
+}
+
+/// Run `f` with the shape's literals serialized as debug type strings
+/// (`kToDebugTypeString`).
+fn with_debug<R>(f: impl FnOnce() -> R) -> R {
+    let was = DEBUG.with(|d| d.replace(true));
+    let out = f();
+    DEBUG.with(|d| d.set(was));
+    out
+}
+
+/// mongod's debug type string of one value's type (`debugTypeString`),
+/// an array's by its elements: `[]` empty, `?array<T>` of one type, and
+/// `?array<>` of more than one.
+fn debug_type(v: &Bson, top: bool) -> String {
+    match v {
+        Bson::Double(_) | Bson::Int32(_) | Bson::Int64(_) | Bson::Decimal128(_) => "?number",
+        Bson::String(_) | Bson::Symbol(_) => "?string",
+        Bson::Document(_) => "?object",
+        Bson::Array(items) if top => {
+            let first = items.first().map(|f| debug_type(f, false));
+            return match first {
+                None => "[]".into(),
+                Some(t) if items.iter().all(|i| debug_type(i, false) == t) => {
+                    format!("?array<{t}>")
+                }
+                Some(_) => "?array<>".into(),
+            };
+        }
+        Bson::Array(_) => "?array",
+        Bson::Binary(_) => "?binData",
+        Bson::ObjectId(_) => "?objectId",
+        Bson::Boolean(_) => "?bool",
+        Bson::DateTime(_) => "?date",
+        Bson::Null => "?null",
+        Bson::RegularExpression(_) => "?regex",
+        Bson::JavaScriptCode(_) => "?javascript",
+        Bson::JavaScriptCodeWithScope(_) => "?javascriptWithScope",
+        Bson::Timestamp(_) => "?timestamp",
+        Bson::MinKey => "?minKey",
+        Bson::MaxKey => "?maxKey",
+        Bson::Undefined => "?undefined",
+        Bson::DbPointer(_) => "?dbPointer",
+    }
+    .into()
+}
+
+/// A literal as the shape being built serializes it: its representative,
+/// or under [`with_debug`] the debug type string of that representative --
+/// mongod prints a debug shape by re-parsing the representative one.
+fn lit(representative: Bson) -> Bson {
+    if debug() {
+        Bson::String(debug_type(&representative, true))
+    } else {
+        representative
+    }
+}
+
+/// mongod's literal of `v`: its representative value
+/// (`defaultLiteralOfType`), or its debug type string (see [`lit`]).
 fn rep(v: &Bson) -> Option<Bson> {
+    Some(lit(representative(v)?))
+}
+
+/// mongod's representative value of `v` (`defaultLiteralOfType`).
+fn representative(v: &Bson) -> Option<Bson> {
     match v {
         Bson::Array(items) => Some(Bson::Array(array_rep(items.iter())?)),
         other => scalar_rep(other),
@@ -412,18 +633,18 @@ fn pathless(op: &str, v: &Bson) -> Option<Option<Node>> {
         "$or" => Node::Or(list(v)?),
         "$nor" => Node::Nor(list(v)?),
         "$comment" => return Some(None),
-        "$alwaysTrue" | "$alwaysFalse" => Node::Raw(doc! { op: 1 }),
+        "$alwaysTrue" | "$alwaysFalse" => Node::Raw(doc! { op: lit(Bson::Int32(1)) }),
         "$expr" => Node::Raw(doc! { "$expr": expr(v, true)? }),
         "$where" => {
             if !matches!(v, Bson::String(_) | Bson::JavaScriptCode(_)) {
                 return None;
             }
-            Node::Raw(doc! { "$where": Bson::JavaScriptCode("return ?;".into()) })
+            Node::Raw(doc! { "$where": lit(Bson::JavaScriptCode("return ?;".into())) })
         }
         // mongod parses `$sampleRate` into the expression it stands for.
         "$sampleRate" => {
             number(v)?;
-            Node::Raw(doc! { "$expr": { "$lt": [{ "$rand": {} }, 1] } })
+            Node::Raw(doc! { "$expr": { "$lt": [{ "$rand": {} }, lit(Bson::Int32(1))] } })
         }
         "$text" => {
             let d = v.as_document()?;
@@ -456,7 +677,7 @@ fn geojson_coordinates(kind: &str) -> Option<Bson> {
     let p = |x: i32, y: i32| Bson::Array(vec![Bson::Int32(x), Bson::Int32(y)]);
     let line = || Bson::Array(vec![p(0, 0), p(1, 1)]);
     let polygon = || Bson::Array(vec![Bson::Array(vec![p(0, 0), p(0, 1), p(1, 1), p(0, 0)])]);
-    Some(match kind {
+    Some(lit(match kind {
         "Point" => p(1, 1),
         "LineString" => line(),
         "Polygon" => polygon(),
@@ -464,7 +685,7 @@ fn geojson_coordinates(kind: &str) -> Option<Bson> {
         "MultiLineString" => Bson::Array(vec![line(), line()]),
         "MultiPolygon" => Bson::Array(vec![polygon()]),
         _ => return None,
-    })
+    }))
 }
 
 /// A GeoJSON geometry: its type and `crs` as written, its coordinates (or
@@ -519,12 +740,12 @@ fn geo_shape(op: &str, v: &Bson) -> Option<Document> {
     let value = match (op, shape.as_str()) {
         (_, "$geometry") => Bson::Document(geojson(value.as_document()?)?),
         ("$geoIntersects", _) => return None,
-        (_, "$center" | "$centerSphere" | "$box") => ones(value)?,
-        (_, "$polygon") => Bson::Array(vec![
+        (_, "$center" | "$centerSphere" | "$box") => lit(ones(value)?),
+        (_, "$polygon") => lit(Bson::Array(vec![
             Bson::Array(vec![Bson::Int32(0), Bson::Int32(0)]),
             Bson::Array(vec![Bson::Int32(0), Bson::Int32(1)]),
             Bson::Array(vec![Bson::Int32(1), Bson::Int32(1)]),
-        ]),
+        ])),
         _ => return None,
     };
     Some(doc! { shape.clone(): value })
@@ -544,7 +765,7 @@ fn near(context: &Document) -> Option<Document> {
                             "$geometry" => Bson::Document(geojson(iv.as_document()?)?),
                             "$maxDistance" | "$minDistance" => {
                                 number(iv)?;
-                                Bson::Int32(1)
+                                lit(Bson::Int32(1))
                             }
                             _ => return None,
                         };
@@ -552,11 +773,11 @@ fn near(context: &Document) -> Option<Document> {
                     }
                     Bson::Document(inner)
                 }
-                other => legacy_point(other)?,
+                other => lit(legacy_point(other)?),
             },
             "$maxDistance" | "$minDistance" => {
                 number(v)?;
-                Bson::Int32(1)
+                lit(Bson::Int32(1))
             }
             _ => return None,
         };
@@ -583,9 +804,9 @@ fn leaf(path: &str, op: &str, value: Bson) -> Node {
 
 fn regex_leaf(path: &str, options: &str) -> Node {
     // `"\\?"` and `"i"`: a representative that parses as a regex.
-    let mut rhs = doc! { "$regex": "\\?" };
+    let mut rhs = doc! { "$regex": lit(Bson::String("\\?".into())) };
     if !options.is_empty() {
-        rhs.insert("$options", "i");
+        rhs.insert("$options", lit(Bson::String("i".into())));
     }
     Node::Leaf {
         path: path.to_string(),
@@ -615,7 +836,7 @@ fn sub_field(path: &str, op: &str, v: &Bson, context: &Document) -> Option<Optio
         "$ne" if matches!(v, Bson::RegularExpression(_)) => return None,
         "$ne" => Node::Not(Box::new(comparison(path, "$eq", v)?)),
         "$in" | "$nin" => {
-            let node = leaf(path, "$in", Bson::Array(in_rep(v.as_array()?)?));
+            let node = leaf(path, "$in", lit(Bson::Array(in_rep(v.as_array()?)?)));
             if op == "$in" {
                 node
             } else {
@@ -623,7 +844,7 @@ fn sub_field(path: &str, op: &str, v: &Bson, context: &Document) -> Option<Optio
             }
         }
         "$exists" => {
-            let node = leaf(path, "$exists", Bson::Boolean(true));
+            let node = leaf(path, "$exists", lit(Bson::Boolean(true)));
             if true_value(v) {
                 node
             } else {
@@ -635,7 +856,7 @@ fn sub_field(path: &str, op: &str, v: &Bson, context: &Document) -> Option<Optio
             if n < 0.0 || n.fract() != 0.0 {
                 return None;
             }
-            leaf(path, "$size", Bson::Int32(1))
+            leaf(path, "$size", lit(Bson::Int32(1)))
         }
         "$mod" => {
             if v.as_array().map(Vec::len) != Some(2) {
@@ -644,7 +865,7 @@ fn sub_field(path: &str, op: &str, v: &Bson, context: &Document) -> Option<Optio
             leaf(
                 path,
                 "$mod",
-                Bson::Array(vec![Bson::Int32(1), Bson::Int32(1)]),
+                Bson::Array(vec![lit(Bson::Int32(1)), lit(Bson::Int32(1))]),
             )
         }
         "$type" => leaf(path, "$type", Bson::Array(type_set(v)?)),
@@ -692,7 +913,7 @@ fn sub_field(path: &str, op: &str, v: &Bson, context: &Document) -> Option<Optio
             return Some(None)
         }
         "$bitsAllSet" | "$bitsAllClear" | "$bitsAnySet" | "$bitsAnyClear" => {
-            leaf(path, op, Bson::Array(bits_rep(v)?))
+            leaf(path, op, lit(Bson::Array(bits_rep(v)?)))
         }
         _ => return None,
     }))
@@ -722,7 +943,7 @@ fn all(path: &str, items: &[Bson]) -> Option<Node> {
         }
     }
     if kids.is_empty() {
-        return Some(Node::Raw(doc! { "$alwaysFalse": 1 }));
+        return Some(Node::Raw(doc! { "$alwaysFalse": lit(Bson::Int32(1)) }));
     }
     Some(Node::And(kids))
 }
@@ -877,7 +1098,7 @@ fn serialize(node: &Node, include_path: bool) -> Document {
         }
         Node::And(kids) if kids.is_empty() => Document::new(),
         Node::And(kids) => doc! { "$and": list(kids) },
-        Node::Or(kids) if kids.is_empty() => doc! { "$alwaysFalse": 1 },
+        Node::Or(kids) if kids.is_empty() => doc! { "$alwaysFalse": lit(Bson::Int32(1)) },
         Node::Or(kids) => doc! { "$or": list(kids) },
         Node::Nor(kids) => doc! { "$nor": list(kids) },
         Node::Raw(d) => d.clone(),
@@ -887,7 +1108,7 @@ fn serialize(node: &Node, include_path: bool) -> Document {
 
 fn not(child: &Node, include_path: bool) -> Document {
     if matches!(child, Node::And(kids) if kids.is_empty()) {
-        return doc! { "$alwaysFalse": 1 };
+        return doc! { "$alwaysFalse": lit(Bson::Int32(1)) };
     }
     if !include_path {
         let inner = match child {
@@ -1066,7 +1287,8 @@ fn constant_value(v: &Bson) -> Bson {
 /// `ExpressionConstant::serializeConstant`.
 fn constant(v: &Bson, wrap: bool) -> Option<Bson> {
     let r = rep(v)?;
-    Some(if wrap {
+    // A debug shape prints a constant bare.
+    Some(if wrap && !debug() {
         Bson::Document(doc! { "$const": r })
     } else {
         r
@@ -1112,6 +1334,12 @@ fn nary(op: &str, arg: &Bson) -> Option<Bson> {
         Bson::Array(a) => a.iter().collect(),
         other => vec![other],
     };
+    // A debug shape prints arguments that are all constants as one array
+    // literal (measured 8.2.11: `{$add: [1, 2]}` is `{$add: "?array<?number>"}`).
+    if debug() && !args.is_empty() && args.iter().all(|a| is_constant(a)) {
+        let values = args.iter().map(|a| constant_value(a)).collect();
+        return Some(Bson::Document(doc! { op: lit(Bson::Array(values)) }));
+    }
     let out = args
         .into_iter()
         .map(|a| {
@@ -1167,6 +1395,11 @@ fn kept_constant(v: &Bson) -> Bson {
         }
         other => other.clone(),
     };
+    // A debug shape prints the value bare, as written -- a string that
+    // would read as a field path aside.
+    if debug() && !matches!(&value, Bson::String(s) if s.starts_with('$')) {
+        return value;
+    }
     Bson::Document(doc! { "$const": value })
 }
 
@@ -1232,10 +1465,10 @@ fn operator_shape(op: &str, arg: &Bson) -> Option<Document> {
             Bson::String(to.into())
         };
         let format = matches!(&to, Bson::String(s) if s == "string") || to.as_document().is_some();
-        let mut out = doc! { "input": sub_expr(single(arg)?)?, "to": { "$const": to } };
+        let mut out = doc! { "input": sub_expr(single(arg)?)?, "to": kept_constant(&to) };
         if format {
             // `$toString` and `$toUUID` convert with a format, a constant.
-            out.insert("format", doc! { "$const": "?" });
+            out.insert("format", constant(&Bson::String("?".into()), true)?);
         }
         return Some(doc! { "$convert": out });
     }
@@ -1281,6 +1514,14 @@ fn operator_shape(op: &str, arg: &Bson) -> Option<Document> {
                 ) {
                     out.insert("to", kept_constant(&to));
                 }
+            }
+            // A debug shape keeps a document's representative as it
+            // re-parsed it (measured 8.2.11: `to: {"?": "?"}`).
+            if let Some(to) = d
+                .get("to")
+                .filter(|t| debug() && t.as_document().is_some() && all_constant(t))
+            {
+                out.insert("to", representative(&constant_value(to))?);
             }
             doc! { "$convert": out }
         }
@@ -1568,8 +1809,10 @@ fn emit(tree: &[(String, PNode)]) -> Option<Document> {
             let value = match v {
                 PNode::Sub(sub) => Bson::Document(emit(sub)?),
                 PNode::Bool(b) => Bson::Boolean(*b),
-                PNode::Slice(Bson::Array(_)) => Bson::Array(vec![Bson::Int32(1), Bson::Int32(1)]),
-                PNode::Slice(_) => Bson::Int32(1),
+                PNode::Slice(Bson::Array(_)) => {
+                    Bson::Array(vec![lit(Bson::Int32(1)), lit(Bson::Int32(1))])
+                }
+                PNode::Slice(_) => lit(Bson::Int32(1)),
                 PNode::ElemMatch(q) => Bson::Document(doc! { "$elemMatch": filter_shape(q)? }),
                 PNode::Expr(e) => expr(e, true)?,
             };
@@ -1643,12 +1886,15 @@ const ACCUMULATORS: &[&str] = &[
 ];
 
 fn count_of_one() -> Document {
-    doc! { "$sum": { "$const": 1 } }
+    match constant(&Bson::Int32(1), true) {
+        Some(one) => doc! { "$sum": one },
+        None => doc! { "$sum": { "$const": 1 } },
+    }
 }
 
 /// A JavaScript function's source: a bare representative string.
 fn js_source(v: &Bson) -> Option<Bson> {
-    matches!(v, Bson::String(_) | Bson::JavaScriptCode(_)).then(|| Bson::String("?".into()))
+    matches!(v, Bson::String(_) | Bson::JavaScriptCode(_)).then(|| lit(Bson::String("?".into())))
 }
 
 /// An accumulator (`{$op: <argument>}` in a `$group`, a `$bucket`'s or
@@ -1730,7 +1976,7 @@ fn window_function(op: &str, arg: &Bson) -> Option<Document> {
             let d = arg.as_document()?;
             let default = match d.get("default") {
                 Some(v) => rep(v)?,
-                None => Bson::Null,
+                None => lit(Bson::Null),
             };
             doc! { op: {
                 "by": rep(d.get("by")?)?,
@@ -1745,7 +1991,7 @@ fn window_function(op: &str, arg: &Bson) -> Option<Document> {
                 (Some(n), None) => ("N", rep(n)?),
                 (None, Some(a)) => {
                     number(a)?;
-                    ("alpha", Bson::Double(0.1))
+                    ("alpha", lit(Bson::Double(0.1)))
                 }
                 _ => return None,
             };
@@ -1785,7 +2031,7 @@ fn window(w: &Document) -> Option<Document> {
                 let bounds = v.as_array().filter(|b| b.len() == 2)?;
                 let bound = |b: &Bson, numeric: i64| match b {
                     Bson::String(_) => Some(b.clone()),
-                    other => number(other).map(|_| Bson::Int64(numeric)),
+                    other => number(other).map(|_| lit(Bson::Int64(numeric))),
                 };
                 Bson::Array(vec![bound(&bounds[0], 0)?, bound(&bounds[1], 1)?])
             }
@@ -1913,13 +2159,13 @@ fn bucket(spec: &Document) -> Option<Vec<Document>> {
     let branches = bounds
         .windows(2)
         .map(|pair| {
-            let (lo, hi) = (scalar_rep(&pair[0])?, scalar_rep(&pair[1])?);
+            let (lo, hi) = (lit(scalar_rep(&pair[0])?), lit(scalar_rep(&pair[1])?));
             Some(Bson::Document(doc! {
                 "case": { "$and": [
                     { "$gte": [group_by.clone(), lo.clone()] },
                     { "$lt": [group_by.clone(), hi] },
                 ] },
-                "then": { "$const": lo },
+                "then": if debug() { lo } else { Bson::Document(doc! { "$const": lo }) },
             }))
         })
         .collect::<Option<Vec<_>>>()?;
@@ -2010,9 +2256,11 @@ fn densify(spec: &Document) -> Option<Vec<Document>> {
     let mut shaped = doc! { "step": rep(range.get("step")?)? };
     let bounds = match range.get("bounds")? {
         Bson::String(s) if s == "full" || s == "partition" => Bson::String(s.clone()),
-        Bson::Array(a) if a.len() == 2 => {
-            Bson::Array(a.iter().map(scalar_rep).collect::<Option<_>>()?)
-        }
+        Bson::Array(a) if a.len() == 2 => Bson::Array(
+            a.iter()
+                .map(|b| scalar_rep(b).map(lit))
+                .collect::<Option<_>>()?,
+        ),
         _ => return None,
     };
     shaped.insert("bounds", bounds);
@@ -2216,13 +2464,13 @@ fn stage_shape(db: &str, stage: &Document) -> Option<Vec<Document>> {
         "$match" => vec![doc! { "$match": filter_shape(spec.as_document()?)? }],
         "$limit" | "$skip" => {
             number(spec)?;
-            vec![doc! { name: 1 }]
+            vec![doc! { name: lit(Bson::Int32(1)) }]
         }
         "$sort" => vec![doc! { "$sort": sort_shape(spec.as_document()?)? }],
         "$count" => {
             let field = spec.as_str()?;
             vec![
-                doc! { "$group": { "_id": { "$const": Bson::Null }, field: count_of_one() } },
+                doc! { "$group": { "_id": constant(&Bson::Null, true)?, field: count_of_one() } },
                 doc! { "$project": { field: true, "_id": false } },
             ]
         }
@@ -2257,7 +2505,7 @@ fn stage_shape(db: &str, stage: &Document) -> Option<Vec<Document>> {
                 Bson::Document(d) => {
                     out.insert("path", d.get_str("path").ok()?);
                     if d.get("preserveNullAndEmptyArrays").is_some_and(true_value) {
-                        out.insert("preserveNullAndEmptyArrays", true);
+                        out.insert("preserveNullAndEmptyArrays", lit(Bson::Boolean(true)));
                     }
                     if let Some(index) = d.get("includeArrayIndex") {
                         out.insert("includeArrayIndex", index.as_str()?);
@@ -2274,7 +2522,7 @@ fn stage_shape(db: &str, stage: &Document) -> Option<Vec<Document>> {
         "$replaceWith" => vec![doc! { "$replaceRoot": { "newRoot": expr(spec, true)? } }],
         "$sample" => {
             number(spec.as_document()?.get("size")?)?;
-            vec![doc! { "$sample": { "size": 1 } }]
+            vec![doc! { "$sample": { "size": lit(Bson::Int32(1)) } }]
         }
         "$sortByCount" => vec![
             doc! { "$group": { "_id": expr(spec, true)?, "count": count_of_one() } },
@@ -2367,9 +2615,10 @@ fn stage_shape(db: &str, stage: &Document) -> Option<Vec<Document>> {
         "$bucketAuto" => {
             let d = spec.as_document()?;
             number(d.get("buckets")?)?;
-            let mut out = doc! { "groupBy": sub_expr(d.get("groupBy")?)?, "buckets": 1 };
+            let mut out =
+                doc! { "groupBy": sub_expr(d.get("groupBy")?)?, "buckets": lit(Bson::Int32(1)) };
             if let Some(g) = d.get("granularity") {
-                out.insert("granularity", g.as_str()?);
+                out.insert("granularity", lit(Bson::String(g.as_str()?.into())));
             }
             let output = match d.get_document("output") {
                 Ok(o) => accumulators(o.iter())?,
@@ -2471,7 +2720,7 @@ fn stage_shape(db: &str, stage: &Document) -> Option<Vec<Document>> {
             };
             const FIELD: &str = "_tempDocumentsField";
             vec![
-                doc! { "$queue": [{ "?": "?" }] },
+                doc! { "$queue": lit(Bson::Array(vec![Bson::Document(doc! { "?": "?" })])) },
                 doc! { "$project": { "_id": true, FIELD: docs } },
                 doc! { "$unwind": { "path": format!("${FIELD}") } },
                 doc! { "$replaceRoot": { "newRoot": format!("${FIELD}") } },

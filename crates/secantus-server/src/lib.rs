@@ -1268,6 +1268,7 @@ fn run_dispatch(
     // unwind the connection thread and drop the socket with no reply — matching
     // the Python server's dispatch-level catch-all.
     let started = std::time::Instant::now();
+    secantus_commands::query_stats::before_operation(request, &ctx);
     secantus_commands::lock_manager::begin_operation();
     let reply =
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| dispatch(request, &mut ctx)))
@@ -1303,6 +1304,9 @@ fn run_dispatch(
     // whatever `slowms` says (mongod 8.2.11).
     let total = started.elapsed();
     let worked = total.saturating_sub(ctx.awaited.get());
+    // The query stats store (RM-215): what the query counted, recorded now
+    // or held until its cursor closes.
+    secantus_commands::query_stats::after_operation(request, &reply, &ctx, worked);
     let slow = match ctx.slow_log {
         Some(matched) => matched,
         None => {

@@ -781,9 +781,8 @@ fn listed(test_commands: bool) -> Vec<(&'static str, bool, Bson)> {
             true,
             Bson::Int64(104_857_600),
         ),
-        // How many queries a second mongod records for `$queryStats`: its
-        // default, 0, records none, which is what this server does -- it
-        // has no query stats store, so the value cannot be changed (RM-215).
+        // How many queries a second the query stats store records for
+        // `$queryStats` (RM-215): its default, 0, records none.
         ("internalQueryStatsRateLimit", true, Bson::Int32(0)),
         // The logical session cache (`crate::logical_sessions`): how long a
         // session record lives, and how often the cache refreshes and reaps.
