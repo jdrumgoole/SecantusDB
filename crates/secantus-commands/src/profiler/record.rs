@@ -1276,6 +1276,17 @@ impl<'a> Statements<'a> {
     fn ran(&self, open: &Open, outcome: &StatementOutcome) -> Ran {
         let since = |now: Option<i64>, then: Option<i64>| now.map(|a| a - then.unwrap_or(0));
         let now = self.storage.as_ref().and_then(|s| s.operation_counts());
+        // A transaction's statement takes what its transaction counted in
+        // the engine since the last statement did, and its command keeps
+        // none of it (RM-385).
+        let taken = self
+            .storage
+            .as_ref()
+            .and_then(|s| s.take_transaction_counts());
+        let statement = match (now, taken) {
+            (Some(n), Some(t)) => Some(n.plus_engine(&t)),
+            (n, t) => n.or(t),
+        };
         let then = open.counts;
         let exec = STATEMENT_EXEC.with(|s| s.borrow_mut().take());
         let planning = match (crate::explain::planning_spent(), open.planning) {
@@ -1319,7 +1330,7 @@ impl<'a> Statements<'a> {
                 .zip(crate::opdebug::thread_cpu_nanos())
                 .map(|(a, b)| b - a),
             storage: crate::opdebug::storage_section(
-                now.as_ref(),
+                statement.as_ref(),
                 crate::lock_manager::execution_admission().as_deref(),
             ),
             remote: crate::slowop::remote(),

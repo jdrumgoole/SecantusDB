@@ -4155,6 +4155,28 @@ pub fn operation_counts() -> Option<OperationCounts> {
     })
 }
 
+/// What the user transaction running on this thread has counted in
+/// WiredTiger since its statistics were last taken, taken from the running
+/// operation: the share a transaction's update or delete statement reports
+/// as its own, leaving its command none, as mongod's statement takes its
+/// recovery unit's statistics since the last call (RM-385). `None` outside a
+/// transaction or an operation that counts.
+pub fn take_transaction_statistics() -> Option<secantus_wt::OperationStats> {
+    let active = ACTIVE_TXN_SESSION.with(|c| c.get());
+    if active.is_null() {
+        return None;
+    }
+    // SAFETY: `with_user_transaction` installs the pointer for the strict
+    // duration of its call on this thread and clears it before returning.
+    match unsafe { &*active }.statistics_since_last_call() {
+        Ok(stats) => stats,
+        Err(e) => {
+            eprintln!("secantus-storage: reading a transaction's statistics failed: {e}");
+            None
+        }
+    }
+}
+
 /// Whether a collection with `options` is defined by a document of its
 /// database's `system.views`, as mongod keeps a view and a time-series
 /// collection (the view over its buckets): creating it inserts that

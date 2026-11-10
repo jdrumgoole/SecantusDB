@@ -969,13 +969,19 @@ These are explicit non-goals. Don't add them without a reason.
       cache). (Its other half, `txnNumUpdates`, closed 2026-11-07.)
       Backlog-ID: RM-364
       Verify: none -- no test drives mongod's eviction into an interruptible wait on demand
-- [ ] **A transaction's `update` and `delete` lines count dirty bytes.**
-      mongod 8.2.11's line for an `update` or a `delete` inside a
-      transaction carries no `txnBytesDirty` or `txnNumUpdates`, where an
-      insert's carries both; this server's counts the statement's share on
-      all three (measured 2026-11-07). Found while working RM-364.
-      Backlog-ID: RM-385
-      Verify: tests/backlog/test_rm_355_364.py::test_an_update_in_a_transaction_counts_no_dirty_bytes
+- [ ] **A transaction's insert counts more dirty bytes than mongod's.**
+      mongod 8.2.11's line for an insert of `{_id: 700, y: 1}` inside a
+      transaction, into a collection indexed on `_id` and `x`, counts
+      `txnBytesDirty` 305-345 over its 3 updates; this server's about 391.
+      Over fifty documents in one `insert` the mean is 70-71 bytes more per
+      document here, every run. An update or a delete of the same document
+      counts the same on both (96 and 192), so the surplus is in what an
+      insert links into a page: the record and its index keys, whose layout
+      here is not mongod's KeyString. (An insert's count varies by 8 bytes a
+      skiplist level on both servers: WiredTiger draws each new key's depth
+      at random.) Measured 2026-11-10. Found while working RM-385.
+      Verify: tests/backlog/test_rm_355_364.py::test_an_insert_in_a_transaction_counts_mongods_dirty_bytes
+      Backlog-ID: RM-499
 
 - [ ] **mongod's startup lines this server does not write.** Since RM-302
   the log is mongod's structured log, and since 2026-11-10 this server
