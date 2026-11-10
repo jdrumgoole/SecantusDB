@@ -11869,6 +11869,16 @@ fn expand_table_like(
                 }
             };
             let mut sql = format!("{} {ty}", q(&col.name));
+            // `transformTableLikeClause` copies `attcollation` with the type
+            // (`def->collOid`), whatever the LIKE's options, so a `text
+            // COLLATE "C"` column's copy sorts and compares as "C" too
+            // (RP-844). A column of a collated domain carries the domain's,
+            // which the COLLATE repeats.
+            if let Ok(coll) = col.extra.get_str("collation") {
+                if coll != crate::collation::INDETERMINATE {
+                    sql.push_str(&format!(" COLLATE {}", q(coll)));
+                }
+            }
             if !col.nullable {
                 sql.push_str(" NOT NULL");
             }

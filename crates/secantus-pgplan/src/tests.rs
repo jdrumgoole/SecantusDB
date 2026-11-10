@@ -5251,6 +5251,36 @@ fn an_added_domain_column_is_tagged_like_a_declared_one() {
     domains::set_user_domains(Vec::new());
 }
 
+/// RP-844: `transformTableLikeClause` copies a column's `attcollation`
+/// with its type, under any LIKE options, so a `text COLLATE "C"` column's
+/// copy is collated "C" and an uncollated one stays uncollated. The copy
+/// used to take its type's default collation.
+#[test]
+fn a_like_copy_keeps_a_columns_collation() {
+    let mut source = t();
+    source.columns[1].extra.insert("collation", "C");
+    let lookup = |name: &str| (name == "t").then(|| source.clone());
+    for sql in [
+        "CREATE TABLE l (LIKE t)",
+        "CREATE TABLE l (LIKE t INCLUDING ALL)",
+    ] {
+        let def = match plan(sql, &lookup).expect("should plan") {
+            Statement::CreateTable(def, _) => def,
+            other => panic!("wrong statement: {other:?}"),
+        };
+        let collation = |c: &str| {
+            def.column(c)
+                .unwrap()
+                .extra
+                .get_str("collation")
+                .ok()
+                .map(str::to_string)
+        };
+        assert_eq!(collation("name").as_deref(), Some("C"), "{sql}");
+        assert_eq!(collation("n"), None, "{sql}");
+    }
+}
+
 /// RP-839: `CREATE TABLE ... (LIKE t)` copies a column's `atttypid`, so a
 /// column of a domain stays one of it and follows the domain's DEFAULT,
 /// which INCLUDING DEFAULTS does not copy in as the column's own (it is the
