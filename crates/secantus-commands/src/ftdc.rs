@@ -15,10 +15,18 @@
 //! - on Linux, either one then `systemMetrics`, the machine's `/proc`
 //!   counters (`system_metrics`).
 //!
+//! Then `transportLayerStats`, the transport layer's own counters: each
+//! listener's socket backlog depth and the connections discarded because
+//! their client left.
+//!
 //! A collector that fails keeps its error in the sample (`ok: 0`, `errmsg`,
 //! `code`, `codeName`), as mongod's does before its set is initiated.
-//! mongod's `transportLayerStats` collector is not sampled, nor are the
-//! samples written to `diagnostic.data` (RM-417).
+//!
+//! `diagnosticDataCollectionEnabled` and `diagnosticDataCollectionPeriodMillis`
+//! switch the sampling and set its period, as on mongod: a new period takes
+//! effect at its next boundary, and while sampling is off `getDiagnosticData`
+//! keeps answering the last sample. The samples are not written to
+//! `diagnostic.data` (RM-417).
 
 use std::sync::Mutex;
 use std::time::Duration;
@@ -29,6 +37,21 @@ use crate::{CommandContext, CommandError, HandlerResult};
 
 /// mongod's default `diagnosticDataCollectionPeriodMillis`.
 pub const PERIOD: Duration = Duration::from_millis(1000);
+
+/// The parameter that switches sampling on and off.
+pub const ENABLED_PARAMETER: &str = "diagnosticDataCollectionEnabled";
+
+/// The parameter that sets the sampling period, in milliseconds.
+pub const PERIOD_PARAMETER: &str = "diagnosticDataCollectionPeriodMillis";
+
+/// Whether to sample, and how often, as the server's parameters say now.
+pub fn schedule(params: &crate::params::ServerParams) -> (bool, Duration) {
+    let period = params.number(PERIOD_PARAMETER, PERIOD.as_millis() as i64);
+    (
+        params.flag(ENABLED_PARAMETER, true),
+        Duration::from_millis(period.max(1) as u64),
+    )
+}
 
 /// The latest sample, shared server-wide.
 #[derive(Default)]
@@ -99,6 +122,30 @@ fn coll_stats(ctx: &mut CommandContext, host: &Bson, db: &str, coll: &str) -> Ha
     })
 }
 
+/// The transport layer's FTDC counters (mongod's `appendStatsForFTDC`):
+/// each listener's socket backlog queue depth, then the connections it
+/// discarded because their client had already disconnected. This server
+/// has one listener, its TCP socket, and neither measures the depth nor
+/// discards a connection, as mongod on macOS does not (RM-417 keeps
+/// mongod's Linux measurement and its Unix domain socket listener).
+fn transport_layer_stats(ctx: &CommandContext) -> Document {
+    let listeners: Vec<Bson> = ctx
+        .server_address
+        .iter()
+        .map(|(host, port)| {
+            let address = match host.contains(':') {
+                true => format!("[{host}]:{port}"),
+                false => format!("{host}:{port}"),
+            };
+            Bson::Document(doc! {address: 0_i32})
+        })
+        .collect();
+    doc! {
+        "listenerSocketBacklogQueueDepths": listeners,
+        "connsDiscardedDueToClientDisconnect": 0_i64,
+    }
+}
+
 /// The request mongod's FTDC sends `serverStatus` (`ftdc_server.cpp`).
 fn server_status_request() -> Document {
     doc! {
@@ -140,6 +187,11 @@ fn sample(ctx: &mut CommandContext) -> Document {
     let start = DateTime::now();
     let status = crate::admin::server_status(&server_status_request(), ctx);
     out.insert("serverStatus", stamped(start, status));
+    let start = DateTime::now();
+    out.insert(
+        "transportLayerStats",
+        stamped(start, Ok(transport_layer_stats(ctx))),
+    );
     // Linux mongod's machine counters from `/proc` (RM-424); macOS mongod
     // has no such collector.
     #[cfg(target_os = "linux")]
@@ -176,14 +228,46 @@ mod tests {
         let s = sample(&mut ctx);
         let keys: Vec<&str> = s.keys().map(String::as_str).collect();
         let expected: &[&str] = if cfg!(target_os = "linux") {
-            &["start", "serverStatus", "systemMetrics", "end"]
+            &[
+                "start",
+                "serverStatus",
+                "transportLayerStats",
+                "systemMetrics",
+                "end",
+            ]
         } else {
-            &["start", "serverStatus", "end"]
+            &["start", "serverStatus", "transportLayerStats", "end"]
         };
         assert_eq!(keys, expected);
         let status = s.get_document("serverStatus").unwrap();
         assert_eq!(status.keys().next().map(String::as_str), Some("start"));
         assert_eq!(status.keys().last().map(String::as_str), Some("end"));
+    }
+
+    #[test]
+    fn transport_layer_stats_name_each_listener() {
+        let mut ctx = CommandContext::new(0);
+        ctx.server_address = Some(("127.0.0.1".to_string(), 27017));
+        assert_eq!(
+            transport_layer_stats(&ctx),
+            doc! {
+                "listenerSocketBacklogQueueDepths": [{"127.0.0.1:27017": 0_i32}],
+                "connsDiscardedDueToClientDisconnect": 0_i64,
+            }
+        );
+        ctx.server_address = Some(("::1".to_string(), 27017));
+        let stats = transport_layer_stats(&ctx);
+        let depths = stats.get_array("listenerSocketBacklogQueueDepths").unwrap();
+        assert_eq!(depths[0], Bson::Document(doc! {"[::1]:27017": 0_i32}));
+    }
+
+    #[test]
+    fn the_parameters_switch_sampling_and_set_its_period() {
+        let params = crate::params::ServerParams::new();
+        assert_eq!(schedule(&params), (true, PERIOD));
+        params.set_startup(ENABLED_PARAMETER, Bson::Boolean(false));
+        params.set_startup(PERIOD_PARAMETER, Bson::Int32(250));
+        assert_eq!(schedule(&params), (false, Duration::from_millis(250)));
     }
 
     #[test]

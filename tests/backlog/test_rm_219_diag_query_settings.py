@@ -7,6 +7,8 @@ the Rust server answers the same, reduced to what the test is about.
 
 from __future__ import annotations
 
+import os
+import re
 import time
 from typing import Any
 
@@ -14,7 +16,7 @@ import bson
 import pymongo
 import pytest
 
-from tests.backlog.conftest import OS, only_on
+from tests.backlog.conftest import OS, only_on, rust_mongo_server
 from tests.backlog.test_rm_057_084 import mongod_rs  # noqa: F401 - fixture
 
 # --------------------------------------------------- getDiagnosticData --
@@ -35,8 +37,6 @@ def _latest_sample(client: Any) -> dict:
 
 def _sample_shape(client: Any) -> dict:
     data = _latest_sample(client)
-    # mongod's transportLayerStats collector is not sampled here (RM-417).
-    data.pop("transportLayerStats", None)
     collectors = {k: v for k, v in data.items() if isinstance(v, dict)}
     return {
         "keys": list(data),
@@ -432,15 +432,112 @@ def _ftdc_parameters(client: Any) -> tuple:
     )
 
 
-@pytest.mark.backlog("RM-417")
+@pytest.mark.backlog_fixed("RM-417")
 def test_ftdc_parameters_and_transport_collector(
     rust_mongo: Any,
     mongod_rs: Any,  # noqa: F811
 ) -> None:
     """mongod reports `diagnosticDataCollectionEnabled` (true) and
     `diagnosticDataCollectionPeriodMillis` (1000), and its sample carries a
-    `transportLayerStats` collector."""
+    `transportLayerStats` collector. This server knew neither parameter and
+    had no such collector."""
     assert _ftdc_parameters(rust_mongo) == _ftdc_parameters(mongod_rs)
+
+
+def _transport_layer_stats(client: Any) -> tuple:
+    stats = _latest_sample(client)["transportLayerStats"]
+    port = client.address[1]
+    return (
+        list(stats),
+        # mongod also listens on its Unix domain socket (RM-417).
+        [d for d in stats["listenerSocketBacklogQueueDepths"] if not next(iter(d)).startswith("/")],
+        type(stats["connsDiscardedDueToClientDisconnect"]),
+        port,
+    )
+
+
+@pytest.mark.backlog_fixed("RM-417")
+def test_transport_layer_stats_name_the_tcp_listener(
+    rust_mongo: Any,
+    mongod_rs: Any,  # noqa: F811
+) -> None:
+    """mongod 8.2.11's `transportLayerStats` is stamped `start` / `end`
+    around each listener's backlog depth, keyed `host:port` (0 on macOS,
+    where mongod does not measure it), and the connections discarded for a
+    client that left."""
+    ours, theirs = _transport_layer_stats(rust_mongo), _transport_layer_stats(mongod_rs)
+    for shape in (ours, theirs):
+        port = shape[3]
+        assert shape[1] == [{f"127.0.0.1:{port}": 0}], shape
+    assert (ours[0], ours[2]) == (theirs[0], theirs[2])
+
+
+def _period_takes_effect(client: Any) -> tuple:
+    def set_period(ms: int) -> Any:
+        return client.admin.command({"setParameter": 1, "diagnosticDataCollectionPeriodMillis": ms})
+
+    def start() -> Any:
+        return client.admin.command("getDiagnosticData")["data"].get("start")
+
+    try:
+        set_period(60_000)
+        time.sleep(1.2)
+        before = start()
+        time.sleep(1.2)
+        held = start() == before
+        set_period(200)
+        deadline = time.monotonic() + 3
+        while start() == before:
+            assert time.monotonic() < deadline, "the new period took no effect within 3 s"
+            time.sleep(0.02)
+        client.admin.command({"setParameter": 1, "diagnosticDataCollectionEnabled": False})
+        time.sleep(0.5)
+        stopped = start()
+        time.sleep(0.6)
+        off = start() == stopped and stopped is not None
+    finally:
+        set_period(1000)
+        client.admin.command({"setParameter": 1, "diagnosticDataCollectionEnabled": True})
+    return held, off
+
+
+@pytest.mark.backlog_fixed("RM-417")
+def test_the_period_and_the_switch_take_effect(
+    rust_mongo: Any,
+    mongod_rs: Any,  # noqa: F811
+) -> None:
+    """On mongod 8.2.11 a longer period holds the sample, a shorter one
+    takes effect at once, and switching sampling off keeps the last sample."""
+    assert _period_takes_effect(rust_mongo) == _period_takes_effect(mongod_rs) == (True, True)
+
+
+def _ftdc_files(client: Any, dbpath: str) -> tuple:
+    directory = os.path.join(dbpath, "diagnostic.data")
+    try:
+        reported = client.admin.command(
+            {"getParameter": 1, "diagnosticDataCollectionDirectoryPath": 1}
+        )["diagnosticDataCollectionDirectoryPath"]
+    except pymongo.errors.OperationFailure as e:
+        reported = ("err", e.code)
+    names = os.listdir(directory) if os.path.isdir(directory) else []
+    pattern = r"metrics\.\d{4}-\d\d-\d\dT\d\d-\d\d-\d\dZ-\d{5}"
+    return reported == directory, any(re.fullmatch(pattern, n) for n in names)
+
+
+@pytest.mark.backlog("RM-417")
+def test_samples_are_written_to_diagnostic_data(
+    tmp_path: Any,
+    mongod_rs: Any,  # noqa: F811
+) -> None:
+    """mongod 8.2.11 writes its samples to `<dbpath>/diagnostic.data`, a
+    `metrics.<time>-00000` file it names in
+    `diagnosticDataCollectionDirectoryPath`."""
+    dbpath = mongod_rs.admin.command("getCmdLineOpts")["parsed"]["storage"]["dbPath"]
+    store = str(tmp_path / "store")
+    with rust_mongo_server(store) as rust:
+        _latest_sample(rust)
+        ours = _ftdc_files(rust, store)
+    assert ours == _ftdc_files(mongod_rs, dbpath) == (True, True)
 
 
 def _framework_and_debug_shape(client: Any) -> tuple:

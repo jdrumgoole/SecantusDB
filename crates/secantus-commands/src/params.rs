@@ -119,6 +119,13 @@ pub enum ParamKind {
 /// `(name, kind)` for every runtime-settable parameter.
 const SETTABLE: &[(&str, ParamKind)] = &[
     ("logLevel", ParamKind::LogLevel),
+    // mongod's FTDC sampling (`crate::ftdc`), read by the collector on
+    // every wake: the switch, and the period of at least 100 ms.
+    ("diagnosticDataCollectionEnabled", ParamKind::Bool),
+    (
+        "diagnosticDataCollectionPeriodMillis",
+        ParamKind::Int32AtLeast(100),
+    ),
     // Refuse a query the planner would answer with a collection scan
     // (`crate::notablescan`); read on every query, so it is also kept in an
     // atomic beside the stored value.
@@ -1034,6 +1041,59 @@ mod tests {
         c.db_name = "admin".to_string();
         c.server_params = Some(std::sync::Arc::new(ServerParams::new()));
         c
+    }
+
+    #[test]
+    fn the_ftdc_parameters_coerce_and_refuse_as_mongod_does() {
+        // mongod 8.2.11, 2026-11-10 (RM-417).
+        let mut c = ctx();
+        let period = |c: &mut CommandContext, v: Bson| {
+            set_parameter(
+                &doc! {"setParameter": 1, "diagnosticDataCollectionPeriodMillis": v},
+                c,
+            )
+        };
+        let r = period(&mut c, Bson::Int32(500)).unwrap();
+        assert_eq!(r.get_i32("was").unwrap(), 1000);
+        let r = period(&mut c, Bson::Double(100.9)).unwrap();
+        assert_eq!(r.get_i32("was").unwrap(), 500);
+        for (value, message) in [
+            (
+                Bson::Int32(99),
+                "Invalid value for parameter diagnosticDataCollectionPeriodMillis: 99 is not \
+                 greater than or equal to 100",
+            ),
+            (
+                Bson::String("x".into()),
+                "Failed validating diagnosticDataCollectionPeriodMillis: Unable to coerce \
+                 value to integral type",
+            ),
+            (
+                Bson::Int64(3_000_000_000),
+                "Failed validating diagnosticDataCollectionPeriodMillis: Out of bounds \
+                 coercing to integral value",
+            ),
+        ] {
+            let e = period(&mut c, value).unwrap_err();
+            assert_eq!((e.code, e.errmsg.as_str()), (2, message));
+        }
+        let enabled = |c: &mut CommandContext, v: Bson| {
+            set_parameter(
+                &doc! {"setParameter": 1, "diagnosticDataCollectionEnabled": v},
+                c,
+            )
+            .unwrap()
+        };
+        assert!(enabled(&mut c, Bson::Int32(0)).get_bool("was").unwrap());
+        assert!(!enabled(&mut c, Bson::Null).get_bool("was").unwrap());
+        assert!(!enabled(&mut c, Bson::String("true".into()))
+            .get_bool("was")
+            .unwrap());
+        let params = c.server_params.as_ref().unwrap();
+        assert_eq!(
+            crate::ftdc::schedule(params),
+            (true, std::time::Duration::from_millis(100))
+        );
     }
 
     #[test]

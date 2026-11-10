@@ -46,6 +46,9 @@ use secantus_wire::{
 /// How long a connection read blocks before re-checking the shutdown flag, so
 /// idle connection threads are reaped promptly on `stop`.
 const READ_POLL: Duration = Duration::from_millis(250);
+
+/// How often the FTDC collector wakes to look at its parameters.
+const FTDC_POLL: Duration = Duration::from_millis(20);
 /// Accept-loop poll interval (the listener is non-blocking) — same purpose.
 const ACCEPT_POLL: Duration = Duration::from_millis(5);
 /// Default for [`ServerConfig::message_read_timeout`]: an in-progress message
@@ -544,19 +547,34 @@ pub fn bind(
 
 /// mongod's FTDC collector: a sample on every period boundary until the
 /// server stops, the latest kept for `getDiagnosticData`.
+///
+/// `diagnosticDataCollectionPeriodMillis` and `diagnosticDataCollectionEnabled`
+/// are read on every wake: a changed period moves the next sample to its
+/// own next boundary, and while sampling is off the boundaries pass with no
+/// sample taken (mongod's `FTDCController::doLoop`).
 fn ftdc_loop(shared: Arc<Shared>) {
-    use secantus_commands::ftdc::{next_boundary, PERIOD};
+    use secantus_commands::ftdc::{next_boundary, schedule};
     let now_ms = || bson::DateTime::now().timestamp_millis();
     let auth = Arc::new(Mutex::new(ConnectionAuth::new()));
-    let mut next = next_boundary(now_ms(), PERIOD);
+    let (_, mut period) = schedule(&shared.server_params);
+    let mut next = next_boundary(now_ms(), period);
     while !shared.stop.load(Ordering::SeqCst) {
+        let (enabled, now_period) = schedule(&shared.server_params);
+        if now_period != period {
+            period = now_period;
+            next = next_boundary(now_ms(), period);
+        }
         let now = now_ms();
         if now >= next {
-            let mut ctx = make_context(0, &shared, &auth, &None);
-            shared.ftdc.collect(&mut ctx);
-            next = next_boundary(now_ms(), PERIOD);
+            if enabled {
+                let mut ctx = make_context(0, &shared, &auth, &None);
+                shared.ftdc.collect(&mut ctx);
+            }
+            next = next_boundary(now_ms(), period);
         } else {
-            thread::sleep(Duration::from_millis((next - now) as u64).min(READ_POLL));
+            // Short enough that a new period or switch is seen well within
+            // the shortest period mongod allows (100 ms).
+            thread::sleep(Duration::from_millis((next - now) as u64).min(FTDC_POLL));
         }
     }
 }
