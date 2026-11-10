@@ -154,16 +154,30 @@ pub fn apply_pipeline(
                 .flat_map(|spec| spec.keys())
                 .map(|k| k.split('.').next().unwrap_or(k).to_string())
                 .collect();
-            let limit = pipeline
-                .get(i + 1)
-                .and_then(|st| st.as_document())
-                .and_then(|st| st.get("$limit"))
-                .and_then(as_int_like)
-                .and_then(|n| usize::try_from(n).ok());
+            let limit = limit_for_pushdown(&pipeline[i + 1..]);
             let before = memlimit::report();
-            docs = match source {
-                None => sort_stage(docs, spec)?,
-                Some(source) => {
+            // The query layer's sort with a limit: counted over what its plan
+            // gave it, in that order, while the documents it hands on are
+            // the read's, already sorted and limited (RM-399).
+            let input = match (source, limit) {
+                (
+                    Some(crate::sorter::SortSource::QueryLayer | crate::sorter::SortSource::Sbe),
+                    Some(k),
+                ) if first && k > 1 => LEADING_INPUT.with(|l| l.borrow_mut().take()),
+                _ => None,
+            };
+            docs = match (source, input) {
+                (None, _) => sort_stage(docs, spec)?,
+                (Some(source), Some(input)) => {
+                    let fields = match source {
+                        crate::sorter::SortSource::QueryLayer => None,
+                        _ => scanned.as_ref(),
+                    };
+                    budgeted_sort_stage(input, spec, source, fields, None, limit)?;
+                    docs.truncate(limit.unwrap_or(usize::MAX));
+                    docs
+                }
+                (Some(source), None) => {
                     let fields = match source {
                         crate::sorter::SortSource::QueryLayer => None,
                         _ => scanned.as_ref(),
@@ -1392,6 +1406,63 @@ fn stage_name_of(stage: &Bson) -> &str {
         .map_or("", String::as_str)
 }
 
+/// mongod's `canSwapWithSkippingOrLimitingStage`: a stage that hands on
+/// each document it is given, one for one. A `$lookup` / `$graphLookup`
+/// that takes in the `$unwind` after it does not.
+pub fn swaps_with_skip_and_limit(stage: &Bson, next: Option<&Bson>) -> bool {
+    match stage_name_of(stage) {
+        "$project"
+        | "$addFields"
+        | "$set"
+        | "$unset"
+        | "$replaceRoot"
+        | "$replaceWith"
+        | crate::sbe::ENGINE_STAGE => true,
+        name @ ("$lookup" | "$graphLookup") => {
+            let as_field = stage
+                .as_document()
+                .and_then(|d| d.get_document(name).ok())
+                .and_then(|spec| spec.get_str("as").ok());
+            let unwound = next
+                .and_then(Bson::as_document)
+                .and_then(|d| match d.get("$unwind") {
+                    Some(Bson::String(path)) => Some(path.clone()),
+                    Some(Bson::Document(spec)) => spec.get_str("path").ok().map(str::to_string),
+                    _ => None,
+                });
+            !matches!((as_field, unwound), (Some(a), Some(u)) if u == format!("${a}"))
+        }
+        _ => false,
+    }
+}
+
+/// The limit a `$sort` takes from the stages `after` it
+/// (`DocumentSource::extractLimitForPushdown`, mongod 8.2): the least
+/// `$limit`, each plus the `$skip`s before it, that only `$skip`s, other
+/// `$limit`s and stages passing each document on stand before (RM-399:
+/// `[$sort, $addFields, {$limit: 50}]` sorts as a top 50).
+pub fn limit_for_pushdown(after: &[Bson]) -> Option<usize> {
+    let count = |stage: &Bson, name: &str| {
+        stage
+            .as_document()
+            .and_then(|d| d.get(name))
+            .and_then(as_int_like)
+            .and_then(|n| usize::try_from(n).ok())
+    };
+    let (mut skip, mut limit) = (0usize, None::<usize>);
+    for (i, stage) in after.iter().enumerate() {
+        if let Some(k) = count(stage, "$skip") {
+            skip = skip.saturating_add(k);
+        } else if let Some(k) = count(stage, "$limit") {
+            let k = k.saturating_add(skip);
+            limit = Some(limit.map_or(k, |l| l.min(k)));
+        } else if !swaps_with_skip_and_limit(stage, after.get(i + 1)) {
+            break;
+        }
+    }
+    limit
+}
+
 /// Which of mongod's sorts a `$sort` after `before` is, for what each
 /// document counts (`sorter`): the stages that change a document leave it
 /// counted for its cache.
@@ -1428,12 +1499,31 @@ thread_local! {
     static LEADING_SORT: std::cell::Cell<Option<(bool, bool)>> = const { std::cell::Cell::new(None) };
 }
 
-/// Forgets an unread leading-sort verdict when dropped.
+thread_local! {
+    /// What the query layer's blocking sort took in for the pipeline the
+    /// caller runs next, in the order its plan gave it (RM-399).
+    static LEADING_INPUT: std::cell::RefCell<Option<Vec<Document>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Forgets an unread leading-sort verdict, and its input, when dropped.
 pub struct LeadingSort;
+
+impl LeadingSort {
+    /// The documents the query layer's sort took in, in its plan's order:
+    /// a sort with a limit counts what mongod's top-k sorter does over them,
+    /// which depends on that order and on the documents the limit leaves
+    /// out (RM-399).
+    pub fn with_input(self, input: Option<Vec<Document>>) -> Self {
+        LEADING_INPUT.with(|l| *l.borrow_mut() = input);
+        self
+    }
+}
 
 impl Drop for LeadingSort {
     fn drop(&mut self) {
         LEADING_SORT.with(|l| l.set(None));
+        LEADING_INPUT.with(|l| l.borrow_mut().take());
     }
 }
 
@@ -1967,6 +2057,52 @@ mod tests {
 
     fn run(docs: Vec<Document>, pipeline: Vec<Bson>) -> Vec<Document> {
         apply_pipeline(docs, &pipeline, &Document::new(), None).expect("should not fall back")
+    }
+
+    #[test]
+    fn a_sort_takes_the_limit_mongod_pushes_into_it() {
+        // `extractLimitForPushdown`: past `$skip`s, which add to it, and
+        // stages that pass each document on; the least of the limits (RM-399).
+        let stages = |v: Vec<Document>| v.into_iter().map(Bson::Document).collect::<Vec<_>>();
+        let pushed = |v: Vec<Document>| limit_for_pushdown(&stages(v));
+        assert_eq!(pushed(vec![doc! {"$limit": 50}]), Some(50));
+        assert_eq!(
+            pushed(vec![doc! {"$addFields": {"z": 1}}, doc! {"$limit": 50}]),
+            Some(50)
+        );
+        assert_eq!(
+            pushed(vec![
+                doc! {"$skip": 10},
+                doc! {"$project": {"s": 0}},
+                doc! {"$limit": 40}
+            ]),
+            Some(50)
+        );
+        assert_eq!(
+            pushed(vec![
+                doc! {"$limit": 9},
+                doc! {"$set": {"z": 1}},
+                doc! {"$limit": 3}
+            ]),
+            Some(3)
+        );
+        // A stage that can change how many documents pass stops it.
+        assert_eq!(
+            pushed(vec![doc! {"$match": {"z": 1}}, doc! {"$limit": 5}]),
+            None
+        );
+        assert_eq!(
+            pushed(vec![
+                doc! {"$lookup": {"from": "o", "localField": "a", "foreignField": "b", "as": "x"}},
+                doc! {"$unwind": "$x"},
+                doc! {"$limit": 5}
+            ]),
+            None
+        );
+        assert_eq!(
+            pushed(vec![doc! {"$group": {"_id": null}}, doc! {"$limit": 5}]),
+            None
+        );
     }
 
     #[test]

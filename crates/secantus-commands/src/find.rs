@@ -1550,6 +1550,7 @@ fn stream_find(
             crate::aggregate::budgets_of(ctx),
             doc.get_bool("allowDiskUse").unwrap_or(true),
         )),
+        keep_sort_input: false,
     };
     let mut stream = match near {
         Some(_) if wants_index_key => return Ok(None),

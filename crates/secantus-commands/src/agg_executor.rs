@@ -275,7 +275,7 @@ pub(crate) fn cursor_loads(
                 limit = Some(limit.map_or(k, |l| l.min(k)));
                 continue;
             }
-            moving = swaps_with_skip_and_limit(stage, stages.get(i + 1));
+            moving = secantus_core::aggregate::swaps_with_skip_and_limit(stage, stages.get(i + 1));
         }
         left.push((i, stage));
     }
@@ -343,36 +343,6 @@ pub(crate) fn cursor_loads(
                 break;
             }
         }
-    }
-}
-
-/// mongod's `canSwapWithSkippingOrLimitingStage`: a stage that hands on
-/// each document it is given, one for one. A `$lookup` / `$graphLookup`
-/// that takes in the `$unwind` after it does not.
-fn swaps_with_skip_and_limit(stage: &Bson, next: Option<&Bson>) -> bool {
-    match name_of(stage) {
-        "$project"
-        | "$addFields"
-        | "$set"
-        | "$unset"
-        | "$replaceRoot"
-        | "$replaceWith"
-        | secantus_core::sbe::ENGINE_STAGE => true,
-        name @ ("$lookup" | "$graphLookup") => {
-            let as_field = stage
-                .as_document()
-                .and_then(|d| d.get_document(name).ok())
-                .and_then(|spec| spec.get_str("as").ok());
-            let unwound = next
-                .and_then(Bson::as_document)
-                .and_then(|d| match d.get("$unwind") {
-                    Some(Bson::String(path)) => Some(path.clone()),
-                    Some(Bson::Document(spec)) => spec.get_str("path").ok().map(str::to_string),
-                    _ => None,
-                });
-            !matches!((as_field, unwound), (Some(a), Some(u)) if u == format!("${a}"))
-        }
-        _ => false,
     }
 }
 
