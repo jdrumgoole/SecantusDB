@@ -1256,22 +1256,6 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       traced. Found 2026-11-10 (RM-404).
       Verify: tests/backlog/test_rm_found_2026_11_10_rm404.py::test_a_partitioned_windows_total_memory
       Backlog-ID: RM-510
-- [ ] **A document a stage changed or built is sized as if it were read.**
-      mongod 8.2.1 sizes a document an `$unwind` or `$addFields` changed,
-      or an expression object built, by its storage: the buffer it
-      allocated and what its new values hold, on top of the BSON it came
-      from (`Document::getApproximateSize`; `memlimit::built_document_size`
-      has the measured model for a `$group`'s own output). This server
-      sizes all three as the BSON they encode, so `explain` shows less
-      than mongod: a whole-partition window after an `$unwind` of 300
-      1000-byte documents holds 342000 bytes here, 687600 there; the
-      `$sort` in front of a computed `partitionBy` counts 404400 against
-      543600, and the window behind it 119818 against 175671; a `$group`
-      with a compound `_id` returns 2296 bytes against 3094; a `$push` of
-      `{x: "$n"}` holds 40440 against 76740. The budgets count the same
-      sizes, so those stages spill and refuse later than mongod.
-      Verify: tests/backlog/test_rm_found_2026_11_08_explain.py::test_changed_documents_are_sized_as_mongod_sizes_them
-      Backlog-ID: RM-408
 - [ ] **The sort key is lost at a `$replaceRoot`, a `$lookup` or a
       `$setWindowFields`.** mongod 8.2.11 keeps a document's sort key
       through a `$replaceRoot`, a `$lookup` and a `$setWindowFields` with no
@@ -1325,6 +1309,50 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       two apart (RM-410). Found 2026-11-10.
       Verify: tests/backlog/test_rm_found_2026_11_10_rm410.py::test_an_empty_arrays_sort_key_is_undefined
       Backlog-ID: RM-525
+- [ ] **A sub-document a stage reads or writes into is sized as if it
+      were read.** mongod 8.2.11 gives a sub-document a cache of its own
+      when a stage reads a field inside it (`$addFields: {q: "$e.y"}`) or
+      sets one (`$set: {"e.z": 1}`), and the sort and window behind count
+      it: (349500, 369000) and (305100, 324600) bytes over 300 documents.
+      This server's storage model (`docstore`, RM-408) caches top-level
+      fields only, and sizes the sub-document as the BSON it was read from:
+      (288900, 308400) and (290700, 288300).
+      Verify: tests/backlog/test_rm_found_rm408.py::test_a_sub_document_a_stage_touched_is_sized_by_its_storage
+      Backlog-ID: RM-515
+- [ ] **`explain` counts every document a `$sort` with a `$limit` read.**
+      For `[{$addFields: {q: "$b"}}, {$sort: {n: -1}}, {$limit: 200}]`
+      over 300 documents mongod 8.2.11's `totalDataSizeSortedBytesEstimate`
+      is the 200 its top-k sort kept (131400); this server's is all 300
+      (197100), as for the same pipeline without the `$limit`. A pipeline
+      run outside `explain` takes the `$limit` (`limit_for_pushdown`), so
+      look first at the run `explain` reads the `$sort`'s counters from.
+      Found 2026-11-10 (RM-408).
+      Verify: tests/backlog/test_rm_found_rm408.py::test_explain_counts_the_documents_a_sort_with_a_limit_kept
+      Backlog-ID: RM-516
+- [ ] **`explain` lists a `$sort` that a window's own sort replaces.** For
+      `[{$unwind: "$t"}, {$sort: {t: 1}}, {$setWindowFields: {sortBy: {n:
+      1}, ...}}]` mongod 8.2.11 drops the `$sort` on `t` and moves the
+      window's `$sort` on `n` ahead of the `$unwind`, listing `$unwind` and
+      `$_internalSetWindowFields` alone. This server lists both `$sort`s
+      after the `$unwind`, and counts both. Found 2026-11-10 (RM-408).
+      Verify: tests/backlog/test_rm_found_rm408.py::test_a_sort_a_window_supersedes_is_not_listed
+      Backlog-ID: RM-517
+- [ ] **`$_internalInhibitOptimization` is refused as an unknown stage.**
+      mongod 8.2.11 runs it -- it passes its documents on and keeps the
+      stages after it out of the scan -- so a pipeline with it answers as
+      one without. This server refuses it (40324, "Unrecognized pipeline
+      stage name"). Found 2026-11-10 (RM-408).
+      Verify: tests/backlog/test_rm_found_rm408.py::test_internal_inhibit_optimization_runs
+      Backlog-ID: RM-518
+- [ ] **A document an inclusion `$project` built is sized as if it were
+      read.** Behind an `$unwind` (so not taken by the scan), mongod
+      8.2.11's `$project: {t: 1, n: 1}` builds each document it returns,
+      and the `$sort` after it counts that storage: 351300 bytes over 900
+      documents. This server counts each as the BSON it encodes, 188700:
+      the storage model (`docstore`, RM-408) stops at a `$project`. Found
+      2026-11-10 (RM-408).
+      Verify: tests/backlog/test_rm_found_rm408.py::test_a_document_a_project_built_is_sized_as_built
+      Backlog-ID: RM-519
 - [ ] **A query-layer sort spills its documents in sorted order, not as its
       scan read them.** mongod 8.2's `SORT` takes the documents as the stage
       below hands them over (a forward `COLLSCAN` for a plain collection)
@@ -1341,17 +1369,6 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       does, instead of the command sorting the sorted output again.
       Backlog-ID: RM-395
       Verify: tests/backlog/test_rm_found_2026_10_26.py::test_leading_sort_spill_storage_size
-- [ ] **A `$sort` after `$addFields` spills at slightly different record
-      boundaries.** Over documents of varying size, mongod 8.2.1's first two
-      runs of a `$sort` after `$addFields` hold about three records more
-      than this server's (its merged runs are 60909 and 55591 bytes before
-      compression, these 59997 and 56503), so the file differs (39691 bytes
-      against 39694) though the spills, records and bytes agree. The
-      memory a modified document counts (`SortSource::Modified`, measured by
-      bisection over documents of one size) is not quite mongod's for
-      these.
-      Backlog-ID: RM-396
-      Verify: tests/backlog/test_rm_found_2026_10_26.py::test_added_fields_sort_spill_storage_size
 - [ ] **On Linux the diagnostic sample has no `systemMetrics`.** mongod
       8.2 on Linux adds a `systemMetrics` collector to each FTDC sample
       (`getDiagnosticData`): the machine's CPU, memory, network and disk

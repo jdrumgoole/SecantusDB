@@ -78,7 +78,7 @@ pub fn set_window_fields_stage(
     vars: &Document,
 ) -> R<Vec<Document>> {
     let mut out = Vec::with_capacity(docs.len());
-    set_window_fields_each(spec, docs, vars, None, None, &mut |d| {
+    set_window_fields_each(spec, docs, vars, None, None, None, &mut |d| {
         out.push(d);
         Ok(())
     })?;
@@ -109,10 +109,11 @@ pub(crate) fn set_window_fields_each(
     docs: Vec<Document>,
     vars: &Document,
     downstream: Option<&std::collections::BTreeSet<String>>,
+    sizes: Option<&[usize]>,
     reads: Option<&mut Vec<usize>>,
     sink: &mut dyn FnMut(Document) -> R<()>,
 ) -> R<()> {
-    window_fields_each(spec, docs, vars, downstream, false, reads, sink)
+    window_fields_each(spec, docs, vars, downstream, sizes, false, reads, sink)
 }
 
 /// The refusal `$setWindowFields` (or, with `presorted`,
@@ -130,6 +131,7 @@ pub fn set_window_fields_spec_refusal(spec: &Bson, presorted: bool) -> Option<Fa
         spec,
         Vec::new(),
         &Document::new(),
+        None,
         None,
         presorted,
         None,
@@ -151,17 +153,22 @@ pub(crate) fn internal_set_window_fields_each(
     docs: Vec<Document>,
     vars: &Document,
     downstream: Option<&std::collections::BTreeSet<String>>,
+    sizes: Option<&[usize]>,
     reads: Option<&mut Vec<usize>>,
     sink: &mut dyn FnMut(Document) -> R<()>,
 ) -> R<()> {
-    window_fields_each(spec, docs, vars, downstream, true, reads, sink)
+    window_fields_each(spec, docs, vars, downstream, sizes, true, reads, sink)
 }
 
+/// `sizes`: when given, each of `docs`' size as mongod's partition cache
+/// counts it (`Document::getApproximateSize` of its storage, RM-408).
+#[allow(clippy::too_many_arguments)]
 fn window_fields_each(
     spec: &Bson,
     docs: Vec<Document>,
     vars: &Document,
     downstream: Option<&std::collections::BTreeSet<String>>,
+    sizes: Option<&[usize]>,
     presorted: bool,
     mut reads: Option<&mut Vec<usize>>,
     sink: &mut dyn FnMut(Document) -> R<()>,
@@ -431,6 +438,7 @@ fn window_fields_each(
     // What of each document the partition cache holds.
     let cached = cache_fields(spec, &compiled, downstream);
     let sizer = match (sort_by, &metadata) {
+        _ if sizes.is_some() => CacheSize::Sized(sizes.unwrap_or_default()),
         (_, Some(m)) if needs_rank => CacheSize::Metadata(m),
         (Some(sort_by), _) if needs_rank => CacheSize::SortKey {
             partition_by,
@@ -1171,6 +1179,9 @@ enum CacheSize<'a> {
     /// no `$sort` in reach (mongod 8.2.11 holds 40 bytes more for it than
     /// for an int, 2026-11-10, RM-410).
     Metadata(&'a [Option<Bson>]),
+    /// Each document's size, by its place in the stage's input, from the
+    /// storage the stages before it left it ([`crate::docstore`]).
+    Sized(&'a [usize]),
 }
 
 impl CacheSize<'_> {
@@ -1178,6 +1189,7 @@ impl CacheSize<'_> {
     fn of(&self, docs: &[Document], i: usize) -> usize {
         let doc = &docs[i];
         match self {
+            CacheSize::Sized(sizes) => sizes[i],
             CacheSize::Fields(Some(f)) => crate::memlimit::fields_size(doc, f),
             CacheSize::Fields(None) => crate::memlimit::document_size(doc),
             CacheSize::SortKey { .. } | CacheSize::Metadata(_) => {
@@ -1206,21 +1218,45 @@ impl CacheSize<'_> {
         else {
             return None;
         };
-        let doc = &docs[i];
-        let mut parts = Vec::with_capacity(sort_by.len() + 1);
-        if let Some(by) = partition_by {
-            parts.push(partition_key(doc, by, vars));
-        }
-        for (field, dir) in sort_by.iter() {
-            let desc = matches!(dir, Bson::Int32(-1) | Bson::Int64(-1));
-            parts.push(order::sort_repr(field_value(doc, field), desc));
-        }
-        Some(if parts.len() == 1 {
-            parts.pop().expect("one part")
-        } else {
-            Bson::Array(parts)
-        })
+        Some(sort_key(&docs[i], *partition_by, Some(sort_by), vars))
     }
+}
+
+/// The sort key the `$sort` a window runs behind attaches to `doc`: the
+/// partition key first when there is one, then the `sortBy` values, an
+/// array when there are two or more.
+pub(crate) fn sort_key(
+    doc: &Document,
+    partition_by: Option<&Bson>,
+    sort_by: Option<&Document>,
+    vars: &Document,
+) -> Bson {
+    let mut parts = Vec::new();
+    if let Some(by) = partition_by {
+        parts.push(partition_key(doc, by, vars));
+    }
+    for (field, dir) in sort_by.into_iter().flatten() {
+        let desc = matches!(dir, Bson::Int32(-1) | Bson::Int64(-1));
+        parts.push(order::sort_repr(field_value(doc, field), desc));
+    }
+    if parts.len() == 1 {
+        parts.pop().expect("one part")
+    } else {
+        Bson::Array(parts)
+    }
+}
+
+/// Whether one of the stage's functions ranks, reading the sort key the
+/// `$sort` in front of it attaches to each document.
+pub(crate) fn reads_sort_key(spec: &Bson) -> bool {
+    spec.as_document()
+        .and_then(|s| s.get_document("output").ok())
+        .is_some_and(|out| {
+            out.values().any(|f| {
+                f.as_document()
+                    .is_some_and(|f| f.keys().any(|op| RANK_FUNCS.contains(&op.as_str())))
+            })
+        })
 }
 
 /// `doc`'s partition key as `PartitionKeyComparator` holds it: missing is
@@ -2774,6 +2810,7 @@ mod budget_tests {
             &Document::new(),
             Some(&downstream),
             None,
+            None,
             &mut |_| Ok(()),
         )
     }
@@ -2817,6 +2854,7 @@ mod budget_tests {
                 docs.clone(),
                 &Document::new(),
                 None,
+                None,
                 Some(&mut reads),
                 &mut |_| Ok(()),
             )
@@ -2846,10 +2884,18 @@ mod budget_tests {
             "output": {"t": {"$sum": "$n"}},
         });
         let mut out = Vec::new();
-        internal_set_window_fields_each(&spec, docs, &Document::new(), None, None, &mut |d| {
-            out.push(d);
-            Ok(())
-        })
+        internal_set_window_fields_each(
+            &spec,
+            docs,
+            &Document::new(),
+            None,
+            None,
+            None,
+            &mut |d| {
+                out.push(d);
+                Ok(())
+            },
+        )
         .unwrap();
         let totals: Vec<(i32, i32)> = out
             .iter()
@@ -2882,10 +2928,18 @@ mod budget_tests {
                 "output": {"r": {"$rank": {}}, "d": {"$denseRank": {}}},
             });
             let mut out = Vec::new();
-            internal_set_window_fields_each(&spec, docs, &Document::new(), None, None, &mut |d| {
-                out.push(d);
-                Ok(())
-            })
+            internal_set_window_fields_each(
+                &spec,
+                docs,
+                &Document::new(),
+                None,
+                None,
+                None,
+                &mut |d| {
+                    out.push(d);
+                    Ok(())
+                },
+            )
             .unwrap();
             out
         };
@@ -2926,7 +2980,15 @@ mod budget_tests {
     fn a_window_reports_its_memory_at_its_peak() {
         let spec = window(bson!({"$first": "$n"}), false);
         let (_, report) = memlimit::captured(|| {
-            set_window_fields_each(&spec, docs(), &Document::new(), None, None, &mut |_| Ok(()))
+            set_window_fields_each(
+                &spec,
+                docs(),
+                &Document::new(),
+                None,
+                None,
+                None,
+                &mut |_| Ok(()),
+            )
         });
         let total: usize = docs().iter().map(memlimit::document_size).sum();
         let stats = &report.windows[0];
@@ -2938,7 +3000,15 @@ mod budget_tests {
                 window_fields: 10_000,
                 ..Default::default()
             });
-            set_window_fields_each(&spec, docs(), &Document::new(), None, None, &mut |_| Ok(()))
+            set_window_fields_each(
+                &spec,
+                docs(),
+                &Document::new(),
+                None,
+                None,
+                None,
+                &mut |_| Ok(()),
+            )
         });
         let stats = &report.windows[0];
         assert!(stats.spills > 0);

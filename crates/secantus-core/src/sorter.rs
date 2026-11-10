@@ -22,9 +22,13 @@
 //! | --- | --- |
 //! | the query layer's (`find`, a pipeline's leading `$sort`) | its BSON + 16 |
 //! | `$sort` over documents read from the collection | its BSON + 96 |
-//! | `$sort` after `$addFields` / `$set` / `$unset` | its BSON + 224 |
-//! | `$sort` after `$unwind` | its BSON + 240 |
+//! | `$sort` after `$addFields` / `$set` / `$unwind` | its storage ([`crate::docstore`], RM-408) |
 //! | `$bucketAuto` | its BSON + 333 |
+//!
+//! (The storage model gives the +224 and +240 once measured here for a
+//! short field an `$addFields` added and an `$unwind` of strings set: a
+//! 128-byte field cache, and what the unwound value holds beyond its
+//! BSON.)
 //!
 //! A key counts as a classic `Value`: one field's value, or an array of
 //! them for a compound sort. A pipeline's documents carry only the fields
@@ -98,6 +102,11 @@ pub struct Sizing<'a> {
     /// Fields a stage before the sort added, which mongod counts as the
     /// document read rather than as written (`$addFields`, `$set`).
     pub added: Option<&'a BTreeSet<String>>,
+    /// Each document's size by its place in the sort's input, when the
+    /// stages before it left a storage mongod sizes otherwise than as read
+    /// (`memUsageForSorter`, [`crate::docstore`]): it stands for the
+    /// document's and its overhead.
+    pub sizes: Option<&'a [usize]>,
 }
 
 /// The memory a sorter keeps aside for reading its runs back
@@ -672,7 +681,13 @@ pub fn blocking_sort(
     let budget = sizing.budget;
     let reserve = reserved(budget, sizing.source.file_iterator());
     let effective = budget.saturating_sub(reserve);
-    let size = |(k, d, _): &Held| sized_key(k, sizing.source) + doc_size(d, sizing);
+    let size = |(k, d, pos): &Held| {
+        sized_key(k, sizing.source)
+            + match sizing.sizes {
+                Some(sizes) => sizes[*pos as usize],
+                None => doc_size(d, sizing),
+            }
+    };
     let items = items
         .into_iter()
         .enumerate()
@@ -866,6 +881,7 @@ mod tests {
     fn a_spilled_sort_answers_as_one_held_in_memory() {
         let whole = {
             let sizing = Sizing {
+                sizes: None,
                 source: SortSource::QueryLayer,
                 fields: None,
                 added: None,
@@ -875,6 +891,7 @@ mod tests {
         };
         memlimit::reset_report();
         let sizing = Sizing {
+            sizes: None,
             source: SortSource::QueryLayer,
             fields: None,
             added: None,
@@ -908,6 +925,7 @@ mod tests {
             })
             .collect();
         let sizing = Sizing {
+            sizes: None,
             source: SortSource::QueryLayer,
             fields: None,
             added: None,
@@ -937,6 +955,7 @@ mod tests {
     /// spilledDataStorageSize)`.
     fn spilled(items: Vec<(Vec<Bson>, Document)>, budget: usize) -> (i64, i64, i64) {
         let sizing = Sizing {
+            sizes: None,
             source: SortSource::QueryLayer,
             fields: None,
             added: None,
@@ -997,6 +1016,7 @@ mod tests {
         };
         let counted = |budget: usize, limit: Option<usize>| {
             let sizing = Sizing {
+                sizes: None,
                 source: SortSource::Sbe,
                 fields: Some(&fields),
                 added: None,
@@ -1016,6 +1036,7 @@ mod tests {
         // mongod 8.2.11, `find({z: 0}).sort({y: 1})` over six documents:
         // `totalDataSizeSorted` 0 for a limit of 1, 134 for 2 (RM-374).
         let sizing = Sizing {
+            sizes: None,
             source: SortSource::QueryLayer,
             fields: None,
             added: None,
@@ -1046,6 +1067,7 @@ mod tests {
         // profile's `sortSpills`, `sortSpilledRecords` and
         // `sortTotalDataSizeBytes` (RM-399).
         let sizing = Sizing {
+            sizes: None,
             source: SortSource::QueryLayer,
             fields: None,
             added: None,

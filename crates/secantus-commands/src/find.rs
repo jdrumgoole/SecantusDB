@@ -871,6 +871,7 @@ fn find_body(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
             let _budgets = secantus_core::memlimit::with_budgets(crate::aggregate::budgets_of(ctx));
             let decoded = crate::util::decode_docs(docs.clone())?;
             let sizing = secantus_core::sorter::Sizing {
+                sizes: None,
                 source: secantus_core::sorter::SortSource::QueryLayer,
                 fields: None,
                 budget: secantus_core::memlimit::budgets().sort,

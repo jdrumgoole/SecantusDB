@@ -246,12 +246,15 @@ def _added_fields_sort(client: Any) -> Any:
     return (entry.get("sortSpills"), entry.get("sortSpilledDataStorageSize"))
 
 
-@pytest.mark.backlog("RM-396")
+@pytest.mark.backlog_fixed("RM-396")
 def test_added_fields_sort_spill_storage_size(rust_mongo: Any, mongod: Any) -> None:
-    """mongod 8.2 spills a `$sort` after `$addFields` at its own record
-    boundaries: its first two runs of documents of varying size hold about
+    """mongod 8.2 spilled a `$sort` after `$addFields` at its own record
+    boundaries: its first two runs of documents of varying size held about
     three records more than this server's, so the merged runs (and the
-    file, 39691 bytes) differ though the spills and bytes agree."""
+    file, 39691 bytes) differed though the spills and bytes agreed. The
+    field the `$addFields` read went into the document's cache, whose BSON
+    bytes mongod's sorter leaves out; RM-408's storage model counts them
+    so."""
     assert _added_fields_sort(rust_mongo) == _added_fields_sort(mongod)
 
 
