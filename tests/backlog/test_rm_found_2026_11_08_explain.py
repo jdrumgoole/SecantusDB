@@ -111,11 +111,12 @@ def _internal_ranks(client: Any) -> Any:
     return {name: mongo_answer(lambda p=p: list(db.c.aggregate(p))) for name, p in runs.items()}
 
 
-@pytest.mark.backlog("RM-410")
+@pytest.mark.backlog_fixed("RM-410")
 def test_an_internal_window_ranks_by_the_sort_key_it_was_given(
     rust_mongo: Any, mongod: Any
 ) -> None:
     """A pipeline that names `$_internalSetWindowFields` itself: mongod
     8.2.1's rank functions read the sort key a `$sort` attached to each
-    document, and without one every document ties."""
+    document, and without one every document ties; this server ranked by
+    `sortBy` until RM-410."""
     assert _internal_ranks(rust_mongo) == _internal_ranks(mongod)

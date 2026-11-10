@@ -22,7 +22,7 @@ pub(crate) const RECORD_ID: &str = "__secantus_meta_recordId";
 /// The field a document's index key is handed to the pipeline under.
 pub(crate) const INDEX_KEY: &str = "__secantus_meta_indexKey";
 /// The field a `$sort` (or `$geoNear`) leaves its sort key in.
-pub(crate) const SORT_KEY: &str = "__secantus_meta_sortKey";
+pub(crate) const SORT_KEY: &str = secantus_core::SORT_KEY_FIELD;
 /// The fields a `$geoNear` leaves its distance and point in.
 pub(crate) const GEO_DISTANCE: &str = "__secantus_meta_geoNearDistance";
 pub(crate) const GEO_POINT: &str = "__secantus_meta_geoNearPoint";
@@ -30,7 +30,8 @@ pub(crate) const GEO_POINT: &str = "__secantus_meta_geoNearPoint";
 /// The stages a document's sort key and `$geoNear` metadata pass through
 /// (measured 8.2.11: `$match`, `$limit`, `$skip`, `$addFields`, `$project`,
 /// `$unwind` and a later `$sort` keep them; a `$group` reads them and drops
-/// them).
+/// them; a second `$_internalSetWindowFields` ranks by the key the first
+/// passed on, 2026-11-10, RM-410).
 const KEEPS_SORT_METADATA: &[&str] = &[
     "$project",
     "$addFields",
@@ -41,6 +42,7 @@ const KEEPS_SORT_METADATA: &[&str] = &[
     "$limit",
     "$skip",
     "$unwind",
+    "$_internalSetWindowFields",
 ];
 
 /// The stages that keep a document's metadata as they pass it on.
@@ -166,6 +168,38 @@ pub(crate) fn mentions(v: &Bson, kind: &str) -> bool {
     }
 }
 
+/// A `{$meta: "sortKey"}` read of [`SORT_KEY`]. The field holds the key as
+/// a `$_internalSetWindowFields` compares it, an empty array's part
+/// `undefined`, which this engine's expressions take for MISSING; `$meta`
+/// gives that part as null, as it was before RM-410 kept the key whole.
+fn sort_key_read() -> Bson {
+    Bson::Document(bson::doc! {
+        "$map": { "input": format!("${SORT_KEY}"), "in": { "$ifNull": ["$$this", null] } }
+    })
+}
+
+/// Whether `stage` reads a document's sort-key metadata: a `{$meta:
+/// "sortKey"}`, or a `$_internalSetWindowFields` whose `$rank` or
+/// `$denseRank` compares the key a `$sort` in front attached (mongod 8.2.1
+/// and 8.2.11, RM-410; `$setWindowFields` ranks behind its own `$sort`).
+pub(crate) fn reads_sort_key(stage: &Bson) -> bool {
+    if mentions(stage, "sortKey") {
+        return true;
+    }
+    let Some(Bson::Document(spec)) = stage
+        .as_document()
+        .and_then(|d| d.get("$_internalSetWindowFields"))
+    else {
+        return false;
+    };
+    spec.get_document("output").is_ok_and(|output| {
+        output
+            .values()
+            .filter_map(Bson::as_document)
+            .any(|f| f.contains_key("$rank") || f.contains_key("$denseRank"))
+    })
+}
+
 /// Replace each `{$meta: kind}` in `v` with `with`.
 fn replace_with(v: &mut Bson, kind: &str, with: &Bson) {
     match v {
@@ -219,7 +253,7 @@ pub(crate) fn rewrite_sort_metadata(stages: &mut Vec<Bson>) {
     ];
     if !stages
         .iter()
-        .any(|s| KINDS.iter().any(|(k, _)| mentions(s, k)))
+        .any(|s| reads_sort_key(s) || KINDS.iter().any(|(k, _)| mentions(s, k)))
     {
         return;
     }
@@ -238,7 +272,7 @@ pub(crate) fn rewrite_sort_metadata(stages: &mut Vec<Bson>) {
         }
         if keeps || name == "$group" {
             if sort_live {
-                replace(&mut stage, "sortKey", SORT_KEY);
+                replace_with(&mut stage, "sortKey", &sort_key_read());
             } else if matches!(name.as_str(), "$addFields" | "$set" | "$group") {
                 replace_with(
                     &mut stage,
@@ -468,7 +502,7 @@ mod tests {
             doc! { "$project": { "k": { "$meta": "sortKey" } } },
         ]);
         rewrite_sort_metadata(&mut stages);
-        let read = format!("${SORT_KEY}");
+        let read = sort_key_read();
         assert_eq!(
             stages,
             self::stages(vec![
@@ -482,6 +516,47 @@ mod tests {
                 doc! { "$project": { "k": { "$meta": "sortKey" } } },
             ])
         );
+    }
+
+    /// A `$_internalSetWindowFields` that ranks reads the sort key the
+    /// `$sort` in front left, through stages that keep it and through
+    /// itself to a second window (RM-410); one that does not rank, and a
+    /// `$setWindowFields`, which ranks behind its own `$sort`, read none.
+    #[test]
+    fn an_internal_window_that_ranks_reads_the_sort_key() {
+        let rank = doc! { "$_internalSetWindowFields": {
+        "sortBy": { "n": 1 }, "output": { "r": { "$rank": {} } } } };
+        let number = doc! { "$_internalSetWindowFields": {
+        "sortBy": { "n": 1 }, "output": { "x": { "$documentNumber": {} } } } };
+        assert!(reads_sort_key(&Bson::Document(rank.clone())));
+        assert!(!reads_sort_key(&Bson::Document(number.clone())));
+        let public = doc! { "$setWindowFields": {
+        "sortBy": { "n": 1 }, "output": { "r": { "$rank": {} } } } };
+        assert!(!reads_sort_key(&Bson::Document(public)));
+
+        let mut piped = stages(vec![
+            doc! { "$sort": { "k": 1 } },
+            doc! { "$addFields": { "z": 1 } },
+            number.clone(),
+            rank.clone(),
+        ]);
+        rewrite_sort_metadata(&mut piped);
+        assert_eq!(
+            piped,
+            stages(vec![
+                doc! { "$sort": { "k": 1 } },
+                doc! { "$_secantusSortKey": { "into": SORT_KEY, "by": { "k": 1 } } },
+                doc! { "$addFields": { "z": 1 } },
+                number,
+                rank.clone(),
+                doc! { "$unset": [SORT_KEY] },
+            ])
+        );
+
+        // No `$sort` in reach: nothing to read, and every document ties.
+        let mut alone = stages(vec![rank.clone()]);
+        rewrite_sort_metadata(&mut alone);
+        assert_eq!(alone, stages(vec![rank]));
     }
 
     #[test]

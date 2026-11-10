@@ -73,7 +73,7 @@ mod regexutil;
 mod summation;
 mod tzdb;
 mod windowfields;
-pub use windowfields::set_window_fields_spec_refusal;
+pub use windowfields::{set_window_fields_spec_refusal, SORT_KEY_FIELD};
 
 // Re-export the read-only dotted-path helpers (only) so the Rust storage layer's
 // index-key builders can resolve `key_spec` fields against documents, mirroring
