@@ -649,6 +649,20 @@ fn find_body(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     argtypes::require_natural_hint(hint)?;
     let collation = crate::util::effective_collation(storage, &ctx.db_name, &coll, doc)?;
     let _active = secantus_core::collation::activate(collation.as_ref());
+    // The engine the read runs in: SBE under a query setting's
+    // `queryFramework: "sbe"` when SBE compiles it (RM-418), which decides
+    // how its expressions answer and fail, and its plan cache key.
+    let sbe = crate::explain::find_runs_in_sbe(
+        storage,
+        &ctx.db_name,
+        &coll,
+        &filter,
+        doc.get_document("projection").ok(),
+        skip as i64,
+        hint,
+        collation.as_ref(),
+    );
+    let _engine = secantus_core::sbe::enter(sbe);
     // Command `let` → vars visible to `$expr` in the filter.
     let let_vars = crate::util::checked_let_vars(doc.get("let"))?;
     // `batchSize` is tri-state: absent ⇒ default, 0 ⇒ empty firstBatch + cursor,
@@ -794,6 +808,7 @@ fn find_body(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
             max: max_doc,
             return_key: bool_field(doc, "returnKey", false),
             show_record_id: bool_field(doc, "showRecordId", false),
+            sbe,
         };
         if let Some(reply) = stream_find(ctx, doc, &asked)? {
             return Ok(reply);
@@ -841,7 +856,7 @@ fn find_body(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
                         .filter(|p| !p.is_empty()),
                     cached: true,
                     distinct: None,
-                    sbe: false,
+                    sbe,
                 },
             },
         )
@@ -1286,6 +1301,8 @@ struct StreamAsk<'a> {
     max: Option<&'a Document>,
     return_key: bool,
     show_record_id: bool,
+    /// The read runs in SBE (RM-418).
+    sbe: bool,
 }
 
 /// A `find` cursor that reads on as `getMore` asks: the plan's read
@@ -1306,6 +1323,8 @@ struct FindStream {
     show_record_id: bool,
     /// The plan the stream runs, whose stages a profile entry reports.
     plan: crate::explain::Node,
+    /// Each batch is read in SBE (RM-418).
+    sbe: bool,
 }
 
 /// A streamed batch made what the `find` asked for: each document's key
@@ -1418,6 +1437,7 @@ impl crate::cursors::StreamCursor for FindStream {
         max_bytes: usize,
     ) -> Result<crate::cursors::StreamedBatch, CommandError> {
         let _active = secantus_core::collation::activate(self.collation.as_ref());
+        let _engine = secantus_core::sbe::enter(self.sbe);
         let batch = self
             .stream
             .next_batch(storage, want, max_bytes)
@@ -1484,6 +1504,7 @@ fn stream_find(
             projection: projection.as_ref(),
             // A contested plan is tried through the plan cache (RM-349).
             cached: true,
+            sbe: asked.sbe,
             ..Default::default()
         },
     };
@@ -1597,6 +1618,7 @@ fn stream_find(
         return_key: asked.return_key,
         show_record_id: asked.show_record_id,
         plan,
+        sbe: asked.sbe,
     };
     // `batchSize: 0` asks for the cursor and no documents.
     let batch = if asked.batch_size == 0 {

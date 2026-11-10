@@ -107,17 +107,32 @@ fn hash_combine(seed: u64, value: u64) -> u64 {
     x
 }
 
-/// `query_settings::hash` of empty settings: no framework, no index hints
-/// (each an empty `boost::optional`, hashed as `0x12345678`), not rejected.
-fn empty_settings_hash() -> u64 {
-    let h = hash_combine(0, 0x1234_5678);
-    let h = hash_combine(h, 0x1234_5678);
-    hash_combine(h, 0)
+/// An empty `boost::optional`, as `boost::hash` hashes it.
+const NO_VALUE: u64 = 0x1234_5678;
+
+/// `query_settings::hash` of the running read's settings: its framework
+/// (`QueryFrameworkControlEnum`: `forceClassicEngine` 0, `trySbeEngine` 2),
+/// its index hints, each [`NO_VALUE`] when unset, and whether it is
+/// rejected. A setting's `comment` is not hashed (measured 8.2.11,
+/// 2026-11-10, RM-418). Not yet: index hints are hashed as unset, where
+/// mongod hashes the hints (RM-544).
+fn settings_hash() -> u64 {
+    use crate::query_settings::{framework, Framework};
+    let framework = match framework() {
+        None => NO_VALUE,
+        Some(Framework::Classic) => 0,
+        Some(Framework::Sbe) => 2,
+    };
+    let reject = crate::query_settings::active().is_some_and(|s| s.get_bool("reject") == Ok(true));
+    let h = hash_combine(0, framework);
+    let h = hash_combine(h, NO_VALUE);
+    hash_combine(h, u64::from(reject))
 }
 
-/// `PlanCacheKeyInfo::planCacheKeyHash`.
+/// `PlanCacheKeyInfo::planCacheKeyHash`, under the running read's query
+/// settings.
 pub(crate) fn key_hash(key: &str) -> u32 {
-    hash_combine(u64::from(compute_hash(key)), empty_settings_hash()) as u32
+    hash_combine(u64::from(compute_hash(key)), settings_hash()) as u32
 }
 
 /// A hash as `explain` and `$planCacheStats` print it.
@@ -856,6 +871,36 @@ mod tests {
         assert_eq!(hex(compute_hash("eqa||_id-a||fc")), "72FD18C0");
         assert_eq!(hex(compute_hash("ina_re/i/||||fc")), "B8C39B8F");
         assert_eq!(hex(compute_hash("res/im/||||fc")), "4F486929");
+    }
+
+    /// The read's query settings move the key, not the shape hash (mongod
+    /// 8.2.11, 2026-11-10: `find({x: 1})`, no index, RM-418).
+    #[test]
+    fn query_settings_move_the_key() {
+        assert_eq!(hex(key_hash("eqx||||fc")), "2455F991");
+        for (settings, shape, want) in [
+            (
+                doc! { "queryFramework": "classic" },
+                "eqx||||fc",
+                "70AF0008",
+            ),
+            (doc! { "queryFramework": "sbe" }, "eqx||||fs", "836D8349"),
+            (doc! { "reject": true }, "eqx||||fc", "38A42FC1"),
+            (
+                doc! { "reject": true, "comment": "c" },
+                "eqx||||fc",
+                "38A42FC1",
+            ),
+            (
+                doc! { "queryFramework": "sbe", "reject": true },
+                "eqx||||fs",
+                "B2ACD88E",
+            ),
+        ] {
+            let _in_place = crate::query_settings::scoped(settings.clone());
+            assert_eq!(hex(key_hash(shape)), want, "{settings}");
+        }
+        assert_eq!(hex(key_hash("eqx||||fc")), "2455F991");
     }
 
     #[test]

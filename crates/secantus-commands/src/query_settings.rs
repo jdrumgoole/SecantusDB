@@ -22,9 +22,14 @@
 //!   filter are ignored, and its `explain` says `querySettings` and
 //!   `indexFilterSet: false`.
 //!
-//! Not yet: `queryFramework` is kept and reported but does not choose the
-//! engine, and a write made to `config.clusterParameters` directly is read
-//! only by the next server start (RM-418).
+//! - runs in the engine its `queryFramework` names (`framework`): under
+//!   `"classic"` (mongod's `forceClassicEngine`) nothing is pushed into SBE,
+//!   and under `"sbe"` (`trySbeEngine`) a `find` SBE compiles runs there.
+//!
+//! Not yet: under `"sbe"` an `aggregate` and a `distinct` are pushed down
+//! as without the setting, `showDebugQueryShape` gives no
+//! `debugQueryShape`, and a write made to `config.clusterParameters`
+//! directly is read only by the next server start (RM-418).
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -800,6 +805,30 @@ pub(crate) fn enter(
     Ok(Some((Scope { previous }, rewritten)))
 }
 
+/// The settings `request`'s shape has, put in place again for what is
+/// reported of the read after its own scope ended: its `Slow query` line
+/// and profile entry, and a `getMore`'s, which report the plan of the
+/// command that opened the cursor. Reads only what the command loaded.
+pub(crate) fn reenter(request: &Document, ctx: &CommandContext) -> Option<Scope> {
+    let (read, _) = read_of(request)?;
+    let store = ctx.query_settings.as_ref()?;
+    let entries = store
+        .entries
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()?;
+    if entries.is_empty() {
+        return None;
+    }
+    let hash = crate::query_shape::hash(&ctx.db_name, read)?;
+    let entry = entries
+        .iter()
+        .find(|e| e.get_str("queryShapeHash") == Ok(hash.as_str()))?;
+    let settings = entry.get_document("settings").cloned().unwrap_or_default();
+    let previous = ACTIVE.with(|a| a.borrow_mut().replace(Rc::new(settings)));
+    Some(Scope { previous })
+}
+
 fn read_filter(read: &Document) -> Option<&Document> {
     let key = if read.contains_key("distinct") {
         "query"
@@ -877,6 +906,41 @@ fn predicate_paths(filter: &Document, out: &mut Vec<String>) {
         } else if !k.starts_with('$') {
             out.push(k.clone());
         }
+    }
+}
+
+/// `settings` in place for the rest of a test, as a read's.
+#[cfg(test)]
+pub(crate) fn scoped(settings: Document) -> Scope {
+    let previous = ACTIVE.with(|a| a.borrow_mut().replace(Rc::new(settings)));
+    Scope { previous }
+}
+
+/// The engine a query setting chooses for a read.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Framework {
+    /// `"classic"`: mongod's `forceClassicEngine`.
+    Classic,
+    /// `"sbe"`: mongod's `trySbeEngine`.
+    Sbe,
+}
+
+impl Framework {
+    /// `internalQueryFrameworkControl` as the read's `explain` reports it.
+    pub(crate) fn control(self) -> &'static str {
+        match self {
+            Framework::Classic => "forceClassicEngine",
+            Framework::Sbe => "trySbeEngine",
+        }
+    }
+}
+
+/// The `queryFramework` of the running read's settings, if they name one.
+pub(crate) fn framework() -> Option<Framework> {
+    match active()?.get_str("queryFramework").ok()? {
+        "classic" => Some(Framework::Classic),
+        "sbe" => Some(Framework::Sbe),
+        _ => None,
     }
 }
 

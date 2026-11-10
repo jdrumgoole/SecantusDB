@@ -13,11 +13,15 @@
 //! when the group reads no field; whose `_id` and accumulator arguments
 //! are field paths, `$$ROOT` or constants, and whose accumulators are
 //! `$sum`, `$count`, `$avg`, `$first`, `$last`, `$min`, `$max`, `$push` and
-//! `$addToSet`. Everything else SBE runs is still explained in the classic
-//! shape (`tasks/backlog-rust-mongodb.md`, RM-071).
+//! `$addToSet`. And a `find` a `queryFramework: "sbe"` query setting puts
+//! in SBE (RM-418, `find.rs`): the same collection scan, filter, skip and
+//! limit, with nothing over them. Everything else SBE runs is still
+//! explained in the classic shape (`tasks/backlog-rust-mongodb.md`, RM-071,
+//! RM-543).
 
 mod expr;
 mod filter;
+mod find;
 mod group;
 mod print;
 mod stage;
@@ -46,6 +50,13 @@ pub(crate) struct Plan {
 /// (`newObj`). `None` when the group is outside what is built here.
 pub(crate) fn group_plan(group: &Document, uuid: &str, last: bool, front: &Front) -> Option<Plan> {
     group::build(group, uuid, last, front)
+}
+
+/// The plan for a `find` whose query is `front`, a collection scan of the
+/// collection whose UUID is `uuid`. `None` when its filter is outside what
+/// is built here.
+pub(crate) fn find_plan(uuid: &str, front: &Front) -> Option<Plan> {
+    find::build(uuid, front)
 }
 
 /// The plan mongod builds over a collection that does not exist.
@@ -83,6 +94,9 @@ const INITIAL_BATCH: i64 = 32;
 pub(crate) enum Pull {
     /// Nothing classic follows: the plan runs once to the end.
     Whole,
+    /// A `find`'s plan: run to the end, each stage reported as it ran (a
+    /// limit stops what is under it short of EOF).
+    Find,
     /// A `$cursor` loads batches until the stages after it stop pulling:
     /// at a `$limit` right after it, or once it has handed over `handed`
     /// when that is less than the plan returns; else at the plan's end.
@@ -148,7 +162,7 @@ impl Plan {
         let (stages, produced, examined) = if self.eof {
             // Under a `$cursor`, saved and restored around its one batch.
             let (saved, restored) = match pull {
-                Pull::Whole => (0, 0),
+                Pull::Whole | Pull::Find => (0, 0),
                 Pull::Batches { .. } => {
                     let (_, loads, _) = batches(0, None);
                     (loads + 1, loads)
@@ -182,7 +196,7 @@ impl Plan {
             let (rows, counted) = self.root.run(docs, None);
             let n = rows.len() as i64;
             let (produced, saves, eof) = match pull {
-                Pull::Whole => (n, None, true),
+                Pull::Whole | Pull::Find => (n, None, true),
                 Pull::Batches { limit, handed } => {
                     let demand = limit.or((handed < n).then_some(handed));
                     let (got, loads, eof) = batches(n, demand);
@@ -198,7 +212,8 @@ impl Plan {
             }
             let examined = scan.reads;
             let pulled = Pulled { produced, eof };
-            let stages = stats_doc(&self.root, &counted, Some(&pulled), saves);
+            let pulled = (!matches!(pull, Pull::Find)).then_some(&pulled);
+            let stages = stats_doc(&self.root, &counted, pulled, saves);
             (stages, produced, examined)
         };
         let mut out = doc! {

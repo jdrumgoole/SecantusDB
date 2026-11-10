@@ -1563,19 +1563,58 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       for the first. Found 2026-11-10 (RM-417).
       Verify: tests/backlog/test_rm_found_2026_11_10_rm417.py::test_an_int_parameter_bounds_the_double_before_truncating
       Backlog-ID: RM-541
-- [ ] **Query settings keep `queryFramework` without acting on it.** Since
-      2026-11-08 `setQuerySettings` / `removeQuerySettings` / `$querySettings`
-      keep mongod's settings and a read of their shape is refused (411) or
-      planned over its `indexHints` (RM-219). Open: under `queryFramework:
-      "sbe"` mongod runs a plain `find` in its slot-based engine
-      (`explainVersion` "2"), and `"classic"` keeps a `$group` pipeline out
-      of it, where this server's engine choice is unchanged;
-      `showDebugQueryShape` gives no `debugQueryShape`; a query whose shape
-      `query_shape.rs` does not compute is refused 115; and a write made to
-      `config.clusterParameters` directly is read only at the next start
-      (mongod's op observer reloads it).
-      Verify: tests/backlog/test_rm_219_diag_query_settings.py::test_query_framework_chooses_the_engine_and_debug_shape_is_shown
+- [ ] **`$querySettings` gives no `debugQueryShape`, and query settings
+      miss two of mongod's mechanisms.** Since 2026-11-08
+      `setQuerySettings` / `removeQuerySettings` / `$querySettings` keep
+      mongod's settings, a read of their shape is refused (411) or planned
+      over its `indexHints` (RM-219), and since 2026-11-10 its
+      `queryFramework` chooses the engine (RM-418). Open:
+      `showDebugQueryShape` gives no `debugQueryShape` (mongod's shape with
+      each literal a debug type string, `{x: {$eq: "?number"}}`, which
+      RM-215's `query_shape::stats_shape` now serializes for `$queryStats`);
+      a query whose shape `query_shape.rs` does not compute
+      is refused 115; and a write made to `config.clusterParameters`
+      directly is read only at the next start (mongod's op observer
+      reloads it).
+      Verify: tests/backlog/test_rm_219_diag_query_settings.py::test_show_debug_query_shape
       Backlog-ID: RM-418
+- [ ] **Under `queryFramework: "sbe"` an `aggregate` and a `distinct` are
+      pushed into SBE as without the setting.** mongod 8.2.11's
+      `trySbeEngine` runs a `distinct`, and an `aggregate` whose stages it
+      does not push past the query (`[{$match: ...}]`, a `$project` or
+      `$addFields` after it), in SBE (`explainVersion` "2", the
+      `queryHash` of the SBE-run query); this server keeps
+      `trySbeRestricted`'s rule there, which pushes only a `$group` or
+      `$lookup`, and runs them classic. Found 2026-11-10 (RM-418).
+      Verify: tests/backlog/test_rm_found_2026_11_10_rm418.py::test_sbe_framework_pushes_an_aggregate_and_a_distinct
+      Backlog-ID: RM-542
+- [ ] **A `find` under `queryFramework: "sbe"` that is sorted, projected,
+      index-served or filtered beyond comparisons is explained in the
+      classic shape.** mongod 8.2.11 runs it in SBE and explains it so
+      (`nlj` / `ixseek` / `seek` over an index, `sort` and `project`
+      stages, `$in`'s `isMember`), as RM-071 describes for a pushed-down
+      `$group`'s front; this server runs it in SBE (its expressions answer
+      as SBE's) but builds the slot program only for a forward collection
+      scan, its comparison filter, skip and limit (`explain/sbe/find.rs`).
+      Found 2026-11-10 (RM-418).
+      Verify: tests/backlog/test_rm_found_2026_11_10_rm418.py::test_sbe_find_shapes_are_explained_as_sbe
+      Backlog-ID: RM-543
+- [ ] **A query's `planCacheKey` hashes its `indexHints` setting as unset.**
+      mongod 8.2.11 folds the read's query settings into the key
+      (`query_settings::hash`): the framework and `reject` are hashed here
+      since 2026-11-10 (RM-418), but a setting's `indexHints` is hashed as
+      an empty `boost::optional`, where mongod hashes the hints: `find({x:
+      1})` with `allowedIndexes: [{$natural: 1}]` keys as without settings
+      here and differently on mongod. Found 2026-11-10 (RM-418).
+      Verify: tests/backlog/test_rm_found_2026_11_10_rm418.py::test_plan_cache_key_hashes_index_hints
+      Backlog-ID: RM-544
+- [ ] **A `find`'s `explain` gives no `optimizationTimeMillis`.** mongod
+      8.2.11's `queryPlanner` carries it (0 on a small collection) after
+      `planCacheKey`, for a `find` with or without query settings; this
+      server's lists it only for a change stream. The live comparisons
+      drop it as a timing. Found 2026-11-10 (RM-418).
+      Verify: tests/backlog/test_rm_found_2026_11_10_rm418.py::test_find_explain_gives_optimization_time
+      Backlog-ID: RM-545
 - [ ] **`$collStats` refuses `local.oplog.rs`.** `{$collStats:
       {storageStats: {}}}` on the oplog is 26 NamespaceNotFound here, and
       `collStats` answers it with `size: 0` and no `capped`; mongod 8.2.11
