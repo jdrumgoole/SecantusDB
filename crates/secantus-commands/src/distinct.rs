@@ -150,28 +150,26 @@ pub fn distinct(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     let mut stages: Option<Document> = None;
     let mut values: Vec<Bson> = if on_view {
         crate::views::check_hint(storage, &ctx.db_name, &coll, hint, &filter)?;
-        if crate::notablescan::enabled(ctx) {
-            // The view's pipeline, then the query: what mongod plans.
-            let tail = if filter.is_empty() {
-                Vec::new()
-            } else {
-                vec![Bson::Document(bson::doc! { "$match": filter.clone() })]
-            };
-            let (base, pipeline) =
-                crate::aggregate::resolve_view(storage, &ctx.db_name, &coll, tail)?;
-            let (query, sort) = crate::explain::pipeline_query(&base, &pipeline);
-            crate::notablescan::check(
-                ctx,
-                &crate::notablescan::Read {
-                    coll: &base,
-                    filter: &query,
-                    sort: sort.as_ref(),
-                    hint: None,
-                    collation: collation.as_ref(),
-                    shown: Default::default(),
-                },
-            )?;
-        }
+        // The view's pipeline, then the query: what mongod plans, and
+        // `notablescan` judges, whether or not it is set (RM-381).
+        let tail = if filter.is_empty() {
+            Vec::new()
+        } else {
+            vec![Bson::Document(bson::doc! { "$match": filter.clone() })]
+        };
+        let (base, pipeline) = crate::aggregate::resolve_view(storage, &ctx.db_name, &coll, tail)?;
+        let (query, sort) = crate::explain::pipeline_query(&base, &pipeline);
+        crate::notablescan::plan_and_check(
+            ctx,
+            &crate::notablescan::Read {
+                coll: &base,
+                filter: &query,
+                sort: sort.as_ref(),
+                hint: None,
+                collation: collation.as_ref(),
+                shown: Default::default(),
+            },
+        )?;
         document_values(
             &crate::aggregate::collection_documents(
                 storage,

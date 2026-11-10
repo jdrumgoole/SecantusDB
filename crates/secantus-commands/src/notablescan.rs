@@ -312,6 +312,36 @@ pub(crate) fn check(ctx: &CommandContext, read: &Read) -> Result<(), CommandErro
     check_in(ctx.storage()?, &ctx.db_name, read)
 }
 
+/// Plan `read` as mongod plans it, set or not, for a caller that runs it
+/// another way -- a `distinct` of a view, which mongod runs as an
+/// aggregation over the collection beneath it -- so its line carries the
+/// `planningTimeMicros` (RM-381; measured 8.2.11, 2026-11-10); then [`check`]
+/// it on that plan. A collection that is not there is an `EOF` mongod plans
+/// all the same.
+pub(crate) fn plan_and_check(ctx: &CommandContext, read: &Read) -> Result<(), CommandError> {
+    let storage = ctx.storage()?;
+    let db = ctx.db_name.as_str();
+    if !storage.collection_exists(db, read.coll).unwrap_or(false)
+        || crate::views::is_view(storage, db, read.coll)
+    {
+        drop(crate::explain::planned_apart());
+        return Ok(());
+    }
+    let why = crate::explain::plans_table_scan(
+        storage,
+        db,
+        read.coll,
+        read.filter,
+        read.sort,
+        read.hint,
+        read.collation,
+    )?;
+    if !enabled(ctx) || exempt(db, read.coll, read.filter) {
+        return Ok(());
+    }
+    refuse_planned(storage, db, read, why)
+}
+
 /// [`check`] of a read of `db`, for a caller that has read the parameter
 /// and holds no context.
 pub(crate) fn check_in(storage: &dyn Storage, db: &str, read: &Read) -> Result<(), CommandError> {
