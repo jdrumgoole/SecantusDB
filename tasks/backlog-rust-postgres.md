@@ -2542,21 +2542,6 @@ dv687, c char(3))`, `d687` an `int` with `check (value > 0)` and `dv687` a
       Backlog-ID: RP-690
       Verify: none -- seen once, under load; a timing that does not fail on demand
 
-## Found while working RP-807 (2026-11-10)
-
-Measured on a private PostgreSQL 15.19 cluster with the `_SETUP` in
-`tests/backlog/test_rp_found_rp807.py`.
-
-- [ ] **A bound cursor's arguments are not bound.** `declare r int; c
-      cursor (k int) for select k; begin open c(5); fetch c into r;` sets
-      `r` to 5 on PostgreSQL 15.19, and a cursor argument may stand
-      anywhere its query takes a value (`where a = k`). Here the OPEN is
-      42703 `column "k" does not exist`: the bound query is planned with
-      no variable `k` in scope, as the argument list is not read. A
-      cursor reading a block variable of the same name works.
-      Verify: tests/backlog/test_rp_found_rp807.py::test_bound_cursor_arguments_are_bound
-      Backlog-ID: RP-809
-
 ## Found while working RP-687 (2026-11-09)
 
 Measured on a private PostgreSQL 15.19 cluster with the `_SETUP` in
@@ -3439,37 +3424,28 @@ with ICU) with the `_SETUP` in `tests/backlog/test_rp_found_rp782.py`
       answered.
       Verify: tests/backlog/test_rp_found_rp796.py::test_collate_over_a_collated_domain_expression
       Backlog-ID: RP-802
-- [ ] **A VALUES or set-operation column whose rows carry two different
-      implicit collations sorts bytewise.** `transformValuesClause` and a
-      set operation take the column's collation by
-      `select_common_collation(..., none_ok = true)`, so `(values
-      ('a'::xu782f), ('B'::xc782f)) s(v)` has no collation on PostgreSQL
-      15.19: `collation for (v)` is NULL, and `order by v` or `max(v)` is
-      42P22 `could not determine which collation to use for string
-      comparison` (a UNION ALL of the two likewise). Here the column has
-      `"default"` and sorts bytewise (`B, a`; `max` is `a`). Comparing it
-      with a constant takes the constant's default collation and agrees.
-      Verify: tests/backlog/test_rp_found_rp796.py::test_a_column_of_conflicting_implicit_collations_has_none
-      Backlog-ID: RP-803
 
-## Found while working RP-792 (2026-11-10)
+## Found while working RP-803 (2026-11-10)
 
-Measured on the shared PostgreSQL 15.19 reference (port 5415) with
-FROM-less and VALUES-only statements. The gap test is in
-`tests/backlog/test_rp_found_rp792.py`.
+Measured on a private PostgreSQL 15.19 cluster (locale C.UTF-8, built
+with ICU) with the `_SETUP` in `tests/backlog/test_rp_found_rp782.py`.
+Since RP-803 a VALUES or set-operation column whose rows' implicit
+collations conflict has none (`collation::INDETERMINATE`): ORDER BY and
+`max` / `min` over it are 42P22, and `collation for` it is NULL.
 
-- [ ] **An IN list's untyped member that its common type cannot read is
-      no error once an earlier member matches.** `select 1 in (1, 'x')`
-      is 22P02 `invalid input syntax for type integer: "x"` on PostgreSQL
-      15.19, and so is `select x, x in (1, 'x') from (values (1)) s(x)`,
-      even `... where false`: `transformAExprIn` coerces every non-Var
-      member to the list's common type while the statement is analysed,
-      before a row is read. Here the members are compared one at a time
-      and the first match ends the list, so both answer `true`, and with
-      no rows nothing is checked. (A WHERE that lowers to a filter, and
-      `1 = any(array[1, 'x'])`, already raise it.)
-      Verify: tests/backlog/test_rp_found_rp792.py::test_an_in_lists_unreadable_member_is_an_error
-      Backlog-ID: RP-806
+- [ ] **A column of no collation is still grouped, made distinct and
+      compared bytewise.** Over `(values ('a'::xu782f), ('B'::xc782f))
+      s(v)`, `group by v` is 42P22 `could not determine which collation to
+      use for string hashing` on PostgreSQL 15.19 (`hashtext`'s
+      `check_collation_set`), and `select distinct v`, `count(distinct
+      v)`, `select v = v` and `select v < v` are 42P22 `... for string
+      comparison` (`texteq`, `text_lt`); here each answers, bytewise. A
+      sort by it over no rows (`... where false order by v`) is 42P22 there,
+      as `varstr_sortsupport` checks as the sort starts; here it is empty,
+      since the check rides on each row's sort key. (`where v = v` answers
+      both rows on both: the planner reduces it to `v IS NOT NULL`.)
+      Verify: tests/backlog/test_rp_found_rp796.py::test_a_column_of_no_collation_is_not_hashed_or_compared
+      Backlog-ID: RP-820
 
 ## Found while working RP-808 (2026-11-10)
 
@@ -3477,26 +3453,6 @@ Measured on a private, freshly initdb'd PostgreSQL 15.19 cluster with the
 `_SETUP` in `tests/backlog/test_rp_found_rp808.py`: `t808(i int, b bool,
 s text)`.
 
-- [ ] **An UPDATE's SET expression is not coerced to boolean when no row
-      reaches it.** `update t808 set b = (i is true) where false`, `(i
-      and true)` and `(not i)` over the `int` column are 42804 `argument
-      of IS TRUE / AND / NOT must be type boolean, not type integer` on
-      PostgreSQL 15.19 (`transformUpdateTargetList` transforms each SET
-      expression, whatever the rows). Here each is `UPDATE 0`: the SET
-      expression is only judged when a row's value is computed, so the
-      statement fails or not by the data. A SELECT's, a DELETE's WHERE and
-      an INSERT's VALUES are checked when the statement is analysed.
-      Verify: tests/backlog/test_rp_found_rp808.py::test_an_update_set_expression_is_coerced_to_boolean
-      Backlog-ID: RP-810
-- [ ] **A CHECK constraint's expression is not coerced to boolean.**
-      `create table c808 (x int check (x))` is 42804 `argument of CHECK
-      must be type boolean, not type integer` on PostgreSQL 15.19
-      (`cookConstraint`'s `coerce_to_boolean`), and `check (x is true)` /
-      `check (x and true)` are their own test's 42804, all at the `x`.
-      Here the table is created; `check (x)` then admits every row, 0
-      and NULL included, and `check (x is true)` refuses every one.
-      Verify: tests/backlog/test_rp_found_rp808.py::test_a_check_constraint_is_coerced_to_boolean
-      Backlog-ID: RP-811
 - [ ] **AND / OR / NOT report a non-boolean argument at the operator.**
       `coerce_to_boolean` reports at the argument's `exprLocation`, an
       operator expression's leftmost token: `select ('x' || 'y') and
@@ -3508,3 +3464,74 @@ s text)`.
       `expr_location`; RP-808's boolean test uses `srf_place::leftmost`.
       Verify: tests/backlog/test_rp_found_rp808.py::test_a_connectives_argument_is_reported_at_its_leftmost_token
       Backlog-ID: RP-812
+
+## Found while working RP-811 (2026-11-10)
+
+Measured on a private, freshly initdb'd PostgreSQL 15.19 cluster with the
+`_SETUP` in `tests/backlog/test_rp_found_rp811.py`: `c811(x int, a int[])`
+and `create domain di811 as int`.
+
+- [ ] **A domain's CHECK and a partial index's WHERE are not coerced to
+      boolean.** `create domain d as int check (value)` is 42804 `argument
+      of CHECK must be type boolean, not type integer` on PostgreSQL 15.19
+      (`domainAddConstraint`'s `coerce_to_boolean`), and `check (value is
+      true)` its test's own 42804, both with no position; `create index on
+      c811 (x) where x` is 42804 `argument of WHERE ...` at the `x` (32,
+      `transformIndexStmt`). Here the domain and the index are created. A
+      table's CHECK is coerced since RP-811 (`optype::check_constraint`).
+      Verify: tests/backlog/test_rp_found_rp811.py::test_a_domain_check_and_an_index_predicate_are_coerced_to_boolean
+      Backlog-ID: RP-813
+- [ ] **ALTER TABLE's expressions are not coerced to boolean when no row
+      reaches them, and SET DEFAULT's error has a position.** On PostgreSQL
+      15.19 `alter table c811 alter column x type bool using (x is true)`
+      is 42804 `argument of IS TRUE ...` at 50 and `add column y bool
+      generated always as (x is true) stored` the same 42804 with no
+      position, both over an empty table; here each is `ALTER TABLE`, the
+      expression judged only per row. `alter column x set default (1 is
+      true)` is that 42804 with no position (`AddRelationNewConstraints`
+      gets no query text from ALTER TABLE); here it is placed at the `1`.
+      Verify: tests/backlog/test_rp_found_rp811.py::test_alter_table_expressions_are_coerced_to_boolean
+      Backlog-ID: RP-815
+- [ ] **A system column in a CHECK is 42703, not 42P10.** `create table
+      t811 (x int check (xmin))` is 42P10 `system column "xmin" reference in
+      check constraint is invalid` at 33 on PostgreSQL 15.19
+      (`cookConstraint` refuses any system column but `tableoid`); here it
+      is 42703 `column "xmin" does not exist`.
+      Verify: tests/backlog/test_rp_found_rp811.py::test_a_system_column_in_a_check_is_42p10
+      Backlog-ID: RP-816
+
+## Found while working RP-809 (2026-11-10)
+
+Measured on a private PostgreSQL 15.19 cluster with the `_SETUP` in
+`tests/backlog/test_rp_found_rp809.py`: `t809(a int, v varchar(3))`.
+
+- [ ] **A FOR loop over a bound cursor is refused.** `declare t int := 0; c
+      cursor (k int) for select a from t809 where a >= k; begin for x in
+      c(1) loop t := t + x.a; end loop;` sums 3 on PostgreSQL 15.19
+      (`exec_stmt_forc`: the cursor is opened with its arguments, the loop
+      variable is a record of the cursor's row, and the portal is closed
+      when the loop ends), and `for x in c loop` over a cursor with no
+      arguments works alike. Here each is 0A000 `the statement forc in a
+      PL/pgSQL function is not supported yet`. Since RP-809 an OPEN binds
+      the arguments (`open_cursor::cursor_arguments`), which a FOR can
+      reuse.
+      Verify: tests/backlog/test_rp_found_rp809.py::test_for_over_a_bound_cursor
+      Backlog-ID: RP-817
+
+## Found while working RP-818 (2026-11-10)
+
+- [ ] **A routine's parameter or result declared `%TYPE` is not
+      resolved.** `create function f(x t.v%type) returns text` over a
+      `varchar(3)` column makes `x` a `character varying` on PostgreSQL
+      15.19 (`LookupTypeNameExtended`: the column's type, without its
+      modifier), with the NOTICE `type reference t.v%TYPE converted to
+      character varying`, and `pg_get_function_arguments` is `x character
+      varying`; `returns t.v%type` alike. Here CREATE succeeds with no
+      NOTICE, the parameter is stored as a type named `"t.v"` (a call sees
+      a `record`), the result's `pg_typeof` is `t.v`, and a LANGUAGE sql
+      routine's `%TYPE` parameter is 3F000 `schema "t" does not exist`.
+      Found while working RP-818 (2026-11-10), which resolves `%TYPE` in a
+      DECLARE (`secantus_pgplan::plpgsql_percent_type_outer` answers the
+      column's type, which CREATE FUNCTION can reuse without the modifier).
+      Verify: tests/backlog/test_rp_found_rp818.py::test_a_routines_percent_type_parameter_is_resolved
+      Backlog-ID: RP-822

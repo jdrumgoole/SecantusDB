@@ -1,9 +1,9 @@
 """Regression tests of RP-807 (a PL/pgSQL `FETCH ... INTO` a record typed a
 domain column by its base type, so an assignment to the field skipped the
-domain's CHECK), over every way a portal is made, and a gap test of a
-divergence found while working it:
+domain's CHECK), over every way a portal is made, and of a divergence
+found while working it:
 
-- a bound cursor's arguments (`c cursor (k int) for ...; open c(5)`) are
+- a bound cursor's arguments (`c cursor (k int) for ...; open c(5)`) were
   not bound (RP-809).
 
 The expected answers were measured on a private, freshly initdb'd
@@ -128,10 +128,112 @@ BOUND_ARGS = {
     "begin open c(5); fetch c into r; raise exception '%', r; end $$": ("error", "P0001", "5"),
     "do $$ declare r record; c cursor (k int) for select a from t807 where a = k; "
     "begin open c(5); fetch c into r; r.a := -5; end $$": _D807,
+    # Named notation, in any order, and mixed with positional.
+    "do $$ declare r text; c cursor (k int, s text) for select s || k; "
+    "begin open c(s := 'x', k := 3); fetch c into r; raise exception '%', r; end $$": (
+        "error",
+        "P0001",
+        "x3",
+    ),
+    "do $$ declare r text; c cursor (k int, s text) for select s || k; "
+    "begin open c(3, s := 'y'); fetch c into r; raise exception '%', r; end $$": (
+        "error",
+        "P0001",
+        "y3",
+    ),
+    # Each value moves in by the assignment rule: rounded, typed, checked.
+    "do $$ declare r text; c cursor (k int) for select k; "
+    "begin open c(2.5); fetch c into r; raise exception '%', r; end $$": ("error", "P0001", "3"),
+    "do $$ declare r text; c cursor (k int) for select pg_typeof(k); "
+    "begin open c('7'); fetch c into r; raise exception '%', r; end $$": (
+        "error",
+        "P0001",
+        "integer",
+    ),
+    "do $$ declare r text; c cursor (k varchar(2)) for select k; "
+    "begin open c('abc'); fetch c into r; end $$": (
+        "error",
+        "22001",
+        "value too long for type character varying(2)",
+    ),
+    "do $$ declare r text; c cursor (k int) for select k; "
+    "begin open c('x'); fetch c into r; end $$": (
+        "error",
+        "22P02",
+        'invalid input syntax for type integer: "x"',
+    ),
+    "do $$ declare r text; c cursor (k d807) for select k; "
+    "begin open c(-1); fetch c into r; end $$": _D807,
+    "do $$ declare r text; c cursor (k d807) for select pg_typeof(k); "
+    "begin open c(4); fetch c into r; raise exception '%', r; end $$": ("error", "P0001", "d807"),
+    # The arguments' level is labelled with the cursor's name, and is the
+    # innermost: it hides a block variable of the same name.
+    "do $$ declare r int; c cursor (k int) for select c.k; "
+    "begin open c(9); fetch c into r; raise exception '%', r; end $$": ("error", "P0001", "9"),
+    "do $$ declare k int := 1; r int; c cursor (k int) for select k; "
+    "begin open c(6); fetch c into r; raise exception '%', r; end $$": ("error", "P0001", "6"),
+    "do $$ declare r int; c cursor (lo int, hi int) for "
+    "select count(*) from t807 where a between lo and hi; "
+    "begin open c(1, 6); fetch c into r; raise exception '%', r; end $$": ("error", "P0001", "1"),
+    "do $$ declare x int := 40; r int; c cursor (k int) for select k; "
+    "begin open c(x + 2); fetch c into r; raise exception '%', r; end $$": ("error", "P0001", "42"),
+    "do $$ declare r int; c cursor (k int) for select k; "
+    "begin open c((select max(a) from t807)); fetch c into r; raise exception '%', r; end $$": (
+        "error",
+        "P0001",
+        "5",
+    ),
+    "do $$ declare r int; s int; c cursor (k int) for select k; begin open c(1); "
+    "fetch c into r; close c; open c(2); fetch c into s; raise exception '% %', r, s; end $$": (
+        "error",
+        "P0001",
+        "1 2",
+    ),
+    # The arguments are a SELECT INTO: FOUND and ROW_COUNT are set by it,
+    # and a second row is not read.
+    "do $$ declare n int; c cursor (k int) for select a from t807 where a > k; "
+    "begin perform 1 where false; open c(0); get diagnostics n = row_count; "
+    "raise exception '% %', found, n; end $$": ("error", "P0001", "t 1"),
+    "do $$ declare n int; r int; c cursor (k int) for select k; "
+    "begin open c(generate_series(4, 6)); get diagnostics n = row_count; fetch c into r; "
+    "raise exception '% % %', found, n, r; end $$": ("error", "P0001", "t 1 4"),
 }
 
 
-@pytest.mark.backlog("RP-809")
+@pytest.mark.backlog_fixed("RP-809")
 @pytest.mark.parametrize("query", list(BOUND_ARGS))
 def test_bound_cursor_arguments_are_bound(query: str, dsn: str) -> None:
+    """Was: the OPEN of a bound cursor read no arguments, so its query was
+    planned with no `k` in scope (42703), or read a block variable of the
+    same name (RP-809)."""
     assert _answer(dsn, query) == BOUND_ARGS[query]
+
+
+_ARG_FRAME = "PL/pgSQL function inline_code_block line 1 at OPEN"
+# An error running the argument list carries its `SQL expression` frame,
+# but not a literal's input error, which has a position instead; an error
+# moving a value into its variable has neither.
+BOUND_ARG_CONTEXT = {
+    "do $$ declare c cursor (k int) for select k; begin open c(1/0); end $$": (
+        "22012",
+        'SQL expression "1/0"\n' + _ARG_FRAME,
+    ),
+    "do $$ declare c cursor (k int) for select k; begin open c('x'::int); end $$": (
+        "22P02",
+        _ARG_FRAME,
+    ),
+    "do $$ declare c cursor (k int) for select k; begin open c('x'); end $$": (
+        "22P02",
+        _ARG_FRAME,
+    ),
+}
+
+
+@pytest.mark.backlog_fixed("RP-809")
+@pytest.mark.parametrize("query", list(BOUND_ARG_CONTEXT))
+def test_bound_cursor_argument_errors_are_framed(query: str, dsn: str) -> None:
+    """Was: no argument was evaluated, so none of these errors was raised
+    (RP-809)."""
+    with psycopg.connect(dsn, autocommit=True) as c, pytest.raises(psycopg.Error) as e:
+        c.execute(query)
+    assert (e.value.sqlstate, e.value.diag.context) == BOUND_ARG_CONTEXT[query]

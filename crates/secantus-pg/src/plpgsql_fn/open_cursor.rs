@@ -34,8 +34,16 @@ impl Interp<'_> {
                 let text = self.dynamic_sql(d)?;
                 (text.clone(), (text, Vec::new(), Vec::new()))
             } else if let Some(q) = self.cursor_exprs.get(&var).cloned() {
-                let bound = self.bind(&q)?;
-                (q, bound)
+                // A bound cursor's arguments are variables of a level of
+                // their own, labelled with the cursor's name, that its
+                // query was compiled in (`decl_cursor_args`).
+                let depth = self.active.len();
+                if let Some(level) = self.cursor_arguments(var, body)? {
+                    self.active.push(level);
+                }
+                let bound = self.bind(&q);
+                self.active.truncate(depth);
+                (q, bound?)
             } else {
                 return Err(PlError::unsupported("this OPEN form"));
             };
@@ -58,6 +66,65 @@ impl Interp<'_> {
                 .open_cursor(wanted.as_deref(), &statement, &sql, &params, &types, scroll)?;
         self.set_var(var, Bson::String(name))?;
         Ok(Flow::Next)
+    }
+
+    /// Assign a bound cursor's arguments, and give back the level its query
+    /// reads them in; `None` for a cursor declared with none.
+    ///
+    /// `exec_stmt_open` runs the OPEN's `argquery` (the argument list
+    /// `read_cursor_args` builds, in declared order) as a `SELECT ... INTO`
+    /// the cursor's argument row, through `exec_stmt_execsql`: each value
+    /// moves into its variable by the assignment rule (a domain's CHECK, a
+    /// length), and FOUND and ROW_COUNT are set by it as by any SELECT
+    /// INTO. An error raised running it carries its `SQL expression` frame.
+    fn cursor_arguments(
+        &mut self,
+        var: usize,
+        body: &Value,
+    ) -> Result<Option<block_scope::Scope>, PlError> {
+        let Some(&row) = self.cursor_argrows.get(&var) else {
+            return Ok(None);
+        };
+        let Some(Datum::Row { fields }) = self.datums.get(row) else {
+            return Err(PlError::new(
+                "XX000",
+                "a cursor's argument row is not a row",
+            ));
+        };
+        let fields = fields.clone();
+        let (text, mode) = body
+            .get("argquery")
+            .and_then(|q| expr_query(q))
+            .ok_or_else(|| PlError::new("XX000", "an OPEN of a cursor with arguments has none"))?;
+        let frame = || bind_frame(text, mode);
+        let raw = format!("SELECT {text}");
+        let (sql, params, types) = self.bind(&raw).map_err(|e| e.with_sql_frame(frame))?;
+        let out = self.host.query(&sql, &params, &types).map_err(|e| {
+            let framed = !literal_input_error(&raw, &e);
+            e.with_sql_frame(|| if framed { frame() } else { None })
+        })?;
+        // Not STRICT: a second row is not read (`tcount` 1).
+        let domains = self.host.output_domains(&sql, &types);
+        let first = out.rows.first().map(|r| r.as_slice());
+        self.assign_row(row, &out, first, &domains)?;
+        self.set_found(first.is_some());
+        self.row_count = u64::from(first.is_some());
+        let vars = fields
+            .iter()
+            .filter_map(|&d| match self.datums.get(d) {
+                Some(Datum::Var { name, .. }) => Some((name.clone(), d)),
+                _ => None,
+            })
+            .collect();
+        let label = match self.datums.get(var) {
+            Some(Datum::Var { name, .. }) => Some(name.clone()),
+            _ => None,
+        };
+        Ok(Some(block_scope::Scope {
+            label,
+            vars,
+            ..Default::default()
+        }))
     }
 
     /// The portal a cursor variable names: its value (22004 when NULL, as
@@ -157,6 +224,25 @@ pub(super) fn cursor_options(f: &Value) -> HashMap<usize, u64> {
                 .filter_map(|(i, d)| {
                     let o = d.get("PLpgSQL_var")?.get("cursor_options")?.as_u64()?;
                     Some((i, o))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The bound cursors' argument rows (`cursor_explicit_argrow`), by datum
+/// number; a cursor with no arguments has none (-1).
+pub(super) fn cursor_argrows(f: &Value) -> HashMap<usize, usize> {
+    f.get("datums")
+        .and_then(Value::as_array)
+        .map(|ds| {
+            ds.iter()
+                .enumerate()
+                .filter_map(|(i, d)| {
+                    let v = d.get("PLpgSQL_var")?;
+                    v.get("cursor_explicit_expr")?;
+                    let row = v.get("cursor_explicit_argrow")?.as_u64()?;
+                    Some((i, usize::try_from(row).ok()?))
                 })
                 .collect()
         })
@@ -264,4 +350,47 @@ pub(super) fn cursor_param_rewrite(sql: &str, var: &str) -> Option<String> {
 
 fn is_ident(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b == b'_'
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A bound cursor with arguments names its argument row, whose fields
+    /// are the argument variables in declared order; a cursor with none,
+    /// and a plain `refcursor`, have none (RP-809).
+    #[test]
+    fn a_bound_cursors_argument_row() {
+        let f = super::super::parsed(
+            "create function f() returns int language plpgsql as $$ declare \
+             c cursor (k int, s text) for select s || k; d cursor for select 1; \
+             e refcursor; begin return 1; end $$",
+        )
+        .unwrap();
+        let rows = cursor_argrows(&f);
+        let names: Vec<Option<String>> = f["datums"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|d| {
+                d.get("PLpgSQL_var")
+                    .and_then(|v| v["refname"].as_str())
+                    .map(str::to_string)
+            })
+            .collect();
+        let at = |n: &str| names.iter().position(|x| x.as_deref() == Some(n)).unwrap();
+        assert_eq!(rows.len(), 1);
+        let row = rows[&at("c")];
+        let fields: Vec<&str> = f["datums"][row]["PLpgSQL_row"]["fields"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|x| {
+                names[x["varno"].as_u64().unwrap() as usize]
+                    .as_deref()
+                    .unwrap()
+            })
+            .collect();
+        assert_eq!(fields, ["k", "s"]);
+    }
 }

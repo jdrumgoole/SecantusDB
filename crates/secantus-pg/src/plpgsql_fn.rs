@@ -104,6 +104,8 @@ pub struct QueryOut {
 /// What the interpreter asks of the server.
 mod block_scope;
 mod open_cursor;
+mod percent_type;
+pub use percent_type::percent_types;
 
 pub trait Host {
     /// `OPEN cur FOR query`: make a portal over the query's rows, named
@@ -180,6 +182,13 @@ pub trait Host {
     /// an assignment's coercion from that type (`exec_cast_value`, RP-712).
     fn expression_type(&self, sql: &str, types: &[String]) -> Option<String> {
         let _ = (sql, types);
+        None
+    }
+    /// What a DECLARE's `words%TYPE` names when no variable of the
+    /// function does: a type, or a relation's column, as a declared type's
+    /// text (`secantus_pgplan::plpgsql_percent_type_outer`, RP-818).
+    fn percent_type(&self, words: &[String]) -> Option<String> {
+        let _ = words;
         None
     }
     /// The domain each column of the query `sql` (over parameters of
@@ -359,6 +368,9 @@ struct Interp<'a> {
     cursor_exprs: HashMap<usize, String>,
     /// A bound cursor's declared options (`SCROLL` / `NO SCROLL`), by datum.
     cursor_options: HashMap<usize, u64>,
+    /// A bound cursor's argument row (`c CURSOR (k int) FOR ...`), by datum:
+    /// the row of the variables its OPEN assigns (`cursor_explicit_argrow`).
+    cursor_argrows: HashMap<usize, usize>,
     /// How CONTEXT names this function: `f(integer)`, or
     /// `inline_code_block` for a DO block.
     label: String,
@@ -745,6 +757,8 @@ pub fn validate(create_sql: &str) -> Result<(), PlError> {
 /// text, `%TYPE` and `%ROWTYPE` included, and no location).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Declared {
+    /// Its datum number.
+    pub datum: usize,
     pub lineno: usize,
     pub refname: String,
     pub typname: String,
@@ -772,7 +786,8 @@ pub fn declared_types(create_sql: &str) -> Vec<Declared> {
         .and_then(Value::as_array)
         .map(|ds| {
             ds.iter()
-                .filter_map(|d| {
+                .enumerate()
+                .filter_map(|(datum, d)| {
                     let v = d.get("PLpgSQL_var")?;
                     let lineno = v.get("lineno").and_then(Value::as_u64)? as usize;
                     let typname = v
@@ -784,6 +799,7 @@ pub fn declared_types(create_sql: &str) -> Vec<Declared> {
                         return None;
                     }
                     Some(Declared {
+                        datum,
                         lineno,
                         refname: v.get("refname")?.as_str()?.to_string(),
                         typname: typname.to_string(),
@@ -1027,10 +1043,25 @@ pub fn run(create_sql: &str, inv: Invocation<'_>, host: &dyn Host) -> Result<Out
             arg += 1;
         }
     }
+    // A `%TYPE` declaration has the type it names (RP-818).
+    let mut kinds: Vec<percent_type::Kind> = datums
+        .iter()
+        .map(|d| match d {
+            Datum::Var { ty, .. } => percent_type::Kind::Var(ty.clone()),
+            _ => percent_type::Kind::Other,
+        })
+        .collect();
+    let fname = function_name(create_sql);
+    for (d, t) in percent_type::resolve(&f, fname.as_deref(), &mut kinds, &|w| host.percent_type(w))
+    {
+        if let (Some(t), Some(Datum::Var { ty, .. })) = (t, datums.get_mut(d)) {
+            *ty = t;
+        }
+    }
     let mut interp = Interp {
         datums,
         arg_slots,
-        fn_name: function_name(create_sql),
+        fn_name: fname,
         host,
         trigger: inv.trigger.clone(),
         returns_set: inv.returns_set,
@@ -1051,6 +1082,7 @@ pub fn run(create_sql: &str, inv: Invocation<'_>, host: &dyn Host) -> Result<Out
         handling: None,
         cursor_exprs: open_cursor::cursor_exprs(&f),
         cursor_options: open_cursor::cursor_options(&f),
+        cursor_argrows: open_cursor::cursor_argrows(&f),
         expression_types: std::cell::RefCell::default(),
         label: function_label(create_sql),
         dyn_text: None,
@@ -1260,6 +1292,19 @@ fn bind_frame(text: &str, mode: u64) -> Option<String> {
     })
 }
 
+/// An input error on a literal of `sql` (`'x'::int`): it carries a cursor
+/// position, which `_SPI_error_callback` turns into an internal query
+/// position instead of a `SQL ...` CONTEXT frame.
+fn literal_input_error(sql: &str, err: &PlError) -> bool {
+    err.sqlstate.starts_with("22")
+        && err
+            .message
+            .strip_suffix('"')
+            .and_then(|m| m.rsplit_once(": \""))
+            .map(|(_, v)| v)
+            .is_some_and(|lit| sql.contains(&format!("'{}'", lit.replace('\'', "''"))))
+}
+
 fn expr_frame(
     text: &str,
     mode: u64,
@@ -1275,18 +1320,8 @@ fn expr_frame(
             _ => format!("SQL statement \"{text}\""),
         })
     };
-    // An input error on a literal of the text has a position: no frame.
-    if err.sqlstate.starts_with("22") {
-        if let Some(lit) = err
-            .message
-            .strip_suffix('"')
-            .and_then(|m| m.rsplit_once(": \""))
-            .map(|(_, v)| v)
-        {
-            if sql.contains(&format!("'{}'", lit.replace('\'', "''"))) {
-                return None;
-            }
-        }
+    if literal_input_error(sql, err) {
+        return None;
     }
     let parsed = pg_query::parse(sql).ok()?;
     let simple = match parsed
@@ -3361,6 +3396,7 @@ mod rp573_declarations {
     #[test]
     fn a_declared_type_is_found_after_its_name() {
         let d = |lineno: usize, refname: &str, typname: &str| Declared {
+            datum: 0,
             lineno,
             refname: refname.into(),
             typname: typname.into(),

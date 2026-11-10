@@ -128,6 +128,8 @@ mod func_cast;
 mod funcsig;
 mod named_args;
 pub mod nodetostring;
+mod plpgsql_pct_type;
+pub use plpgsql_pct_type::{plpgsql_percent_type_outer, plpgsql_percent_type_words};
 mod query_reads;
 mod schema_functions;
 mod search_cycle;
@@ -4437,18 +4439,41 @@ thread_local! {
     /// The parse location (a byte offset into the statement) of the token
     /// the last planning error is about, when the site that raised it knew.
     static ERROR_LOCATION: std::cell::Cell<Option<i32>> = const { std::cell::Cell::new(None) };
+    /// The last planning error was raised where PostgreSQL's parse state
+    /// has no source text, so it carries no position at all.
+    static ERROR_UNPOSITIONED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Mark the error about to be raised as one PostgreSQL reports with no
+/// position: raised under a parse state made with no query text, as
+/// `AddRelationNewConstraints` is from ALTER TABLE (RP-811).
+pub(crate) fn set_error_unpositioned() {
+    ERROR_LOCATION.with(|l| l.set(None));
+    ERROR_UNPOSITIONED.with(|u| u.set(true));
+}
+
+/// Whether the last planning error was marked [`set_error_unpositioned`].
+/// Read, not consumed: the server asks for a position more than once
+/// (`err_in`, then `positioned`), and every ask must answer none. Cleared
+/// by [`take_error_location`] before a statement is planned, and by
+/// [`set_error_location`] for a later error that has one.
+pub(crate) fn error_unpositioned() -> bool {
+    ERROR_UNPOSITIONED.with(std::cell::Cell::get)
 }
 
 /// Record where the error about to be raised points.
 pub(crate) fn set_error_location(location: i32) {
     if location >= 0 {
+        ERROR_UNPOSITIONED.with(|u| u.set(false));
         ERROR_LOCATION.with(|l| l.set(Some(location)));
     }
 }
 
 /// The location the last planning error recorded, consumed; call before
-/// planning to clear a stale one too.
+/// planning to clear a stale one too (and a stale
+/// [`set_error_unpositioned`] with it).
 pub fn take_error_location() -> Option<i32> {
+    ERROR_UNPOSITIONED.with(|u| u.set(false));
     ERROR_LOCATION.with(std::cell::Cell::take)
 }
 
@@ -8504,8 +8529,11 @@ fn plan_alter_action(
                 .ok_or_else(|| Error::Parse("CHECK without an expression".into()))?;
             let expression = check_expression_text(raw)?;
             // Planned now, so an unknown column is 42703 at ALTER rather than
-            // on the next INSERT.
-            plan_check_expression(&expression, def)?;
+            // on the next INSERT. `ATAddCheckConstraint` hands
+            // `AddRelationNewConstraints` no query text, so an error in the
+            // expression carries no position.
+            cook_check(raw, &expression, &schemas::split_key(table).1, def)
+                .inspect_err(|_| set_error_unpositioned())?;
             let name = if k.conname.is_empty() {
                 let named = columns_referenced(raw, def);
                 let base = match named.as_slice() {
@@ -12243,7 +12271,7 @@ fn plan_create(c: &pg_query::protobuf::CreateStmt) -> Result<Statement> {
         // The predicate's SQL text is the catalog record (`(a > 0)`);
         // planning it now surfaces an unknown column at CREATE.
         let expression = check_expression_text(&raw)?;
-        plan_check_expression(&expression, &def)?;
+        cook_check(&raw, &expression, &schemas::split_key(&table).1, &def)?;
         let name = if conname.is_empty() {
             // `<table>_<col>_check` when the predicate names exactly one
             // column, `<table>_check` otherwise, with a counter to keep the
@@ -12563,6 +12591,65 @@ pub fn resolve_fk_target(fk: &mut ForeignKey, target: &TableDef) -> Result<()> {
     } else {
         Err(no_match())
     }
+}
+
+/// A CHECK constraint's expression judged as `cookConstraint` judges it,
+/// over the table `name` (`def`): an unknown column is 42703 now rather than
+/// on the next INSERT, and the expression is coerced to boolean -- `check
+/// (x)` over an `int` is 42804 `argument of CHECK ...`, `check (x is true)`
+/// its test's own 42804 (RP-811). `transformExpr` goes left to right and
+/// `coerce_to_boolean` of the whole runs after it, so a missing column
+/// written before the argument refused is the error, as it is whenever the
+/// whole expression is what is refused.
+fn cook_check(
+    raw: &pg_query::protobuf::Node,
+    expression: &str,
+    name: &str,
+    def: &TableDef,
+) -> Result<()> {
+    let Err(refused) = optype::check_constraint(raw, name, def) else {
+        return plan_check_expression(expression, def).map(drop);
+    };
+    let at = take_error_location();
+    let whole =
+        matches!(&refused, Error::DatatypeMismatch(m) if m.starts_with("argument of CHECK "));
+    let column_first =
+        first_missing_column(raw, name, def).is_some_and(|m| whole || at.is_none_or(|a| m < a));
+    if column_first {
+        plan_check_expression(expression, def)?;
+    }
+    if let Some(a) = at {
+        set_error_location(a);
+    }
+    Err(refused)
+}
+
+/// Where the first column reference in `raw` that names no column of the
+/// table `name` (`def`) is written, if one does.
+fn first_missing_column(raw: &pg_query::protobuf::Node, name: &str, def: &TableDef) -> Option<i32> {
+    let known = |c: &str| def.column(c).is_some() || def.system_columns.iter().any(|s| s.name == c);
+    let mut first: Option<i32> = None;
+    walk_column_refs(&mut raw.clone(), &mut |_, c| {
+        let parts: Vec<&str> = c
+            .fields
+            .iter()
+            .filter_map(|f| match f.node.as_ref() {
+                Some(N::String(s)) => Some(s.sval.as_str()),
+                _ => None,
+            })
+            .collect();
+        let missing = match parts.as_slice() {
+            [col] => !known(col),
+            [table, col] => *table != name || !known(col),
+            _ => false,
+        };
+        if missing && first.is_none_or(|f| c.location < f) {
+            first = Some(c.location);
+        }
+        Ok(())
+    })
+    .ok()?;
+    first
 }
 
 /// Plan a CHECK constraint's predicate text over `def`'s columns as a row
@@ -17816,7 +17903,7 @@ fn bpchar_compared_operands(
 /// Whether an IN list's member reads a Var of its own query: a column, or
 /// a row's column standing as a `$n` past the statement's `row_from`
 /// parameters (`contain_vars_of_level(rexpr, 0)` in `transformAExprIn`).
-fn in_member_has_var(item: &pg_query::protobuf::Node, row_from: usize) -> bool {
+pub(crate) fn in_member_has_var(item: &pg_query::protobuf::Node, row_from: usize) -> bool {
     if matches!(item.node.as_ref(), Some(N::ColumnRef(_))) {
         return true;
     }
@@ -31195,7 +31282,7 @@ fn common_type(nodes: &[&pg_query::protobuf::Node]) -> String {
 }
 
 /// `getBaseType`: a domain's innermost base type, any other type as it is.
-fn domain_base(t: String) -> String {
+pub(crate) fn domain_base(t: String) -> String {
     domains::base_type_and_typmod(&t).map_or(t, |(base, _, _)| base)
 }
 
@@ -44087,6 +44174,11 @@ fn collation_for_call(f: &pg_query::protobuf::FuncCall, params: &[Bson]) -> Opti
 /// `pg_collation_for` of a value of the type `pg_typeof` names.
 fn collation_for_type(ty: &str) -> Result<Bson> {
     if let Some(known) = ty.strip_prefix('\u{1f}') {
+        // A column of no collation (RP-803): `pg_collation_for` of
+        // `InvalidOid` is NULL.
+        if known == crate::collation::INDETERMINATE {
+            return Ok(Bson::Null);
+        }
         return Ok(Bson::String(crate::scalar::quote_identifier(known)));
     }
     let mut base = ty.trim_end_matches("[]").to_string();

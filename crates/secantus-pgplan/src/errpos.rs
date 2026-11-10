@@ -170,6 +170,10 @@ fn names_a_signature_type(sql: &str, message: &str) -> bool {
 /// The position in `sql` of an error with this SQLSTATE and primary
 /// message, when it can be found.
 pub fn error_position(sql: &str, sqlstate: &str, message: &str) -> Option<usize> {
+    // Raised under a parse state with no source text (RP-811).
+    if crate::error_unpositioned() {
+        return None;
+    }
     let location = take_error_location();
     // A cancelled or terminated statement has no position on PostgreSQL,
     // and looking for one in a large statement would hold the cancel's

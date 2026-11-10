@@ -1,9 +1,10 @@
 """Gap tests of the divergences found while working RP-808 (`IS TRUE` and
 its kin over a value that is not boolean):
 
-- an UPDATE's SET expression is not coerced to boolean when no row reaches
-  it (RP-810);
-- a CHECK constraint's expression is not coerced to boolean (RP-811);
+- an UPDATE's SET expression was not coerced to boolean when no row
+  reached it (RP-810, fixed);
+- a CHECK constraint's expression was not coerced to boolean (RP-811,
+  fixed);
 - AND / OR / NOT report a non-boolean argument at the operator, not at the
   argument's leftmost token (RP-812).
 
@@ -92,7 +93,7 @@ def test_a_boolean_test_over_a_non_boolean_is_42804_at_its_argument(
     assert _answer(dsn, query) == expected
 
 
-@pytest.mark.backlog("RP-810")
+@pytest.mark.backlog_fixed("RP-810")
 @pytest.mark.parametrize(
     ("query", "expected"),
     [
@@ -106,25 +107,83 @@ def test_an_update_set_expression_is_coerced_to_boolean(
 ) -> None:
     """`transformUpdateTargetList` transforms each SET expression, which
     coerces a test's or a connective's argument to boolean whether or not a
-    row is updated: each is 42804 on PostgreSQL 15.19. Here an UPDATE no
-    row reaches is `UPDATE 0`."""
+    row is updated: each is 42804 on PostgreSQL 15.19. Before RP-810 an
+    UPDATE no row reached was `UPDATE 0`, as its SET expressions were only
+    judged when a row's value was computed."""
     assert _answer(dsn, query) == expected
 
 
-@pytest.mark.backlog("RP-811")
+def _unpositioned(error: tuple[str, str, str, str]) -> tuple[str, str, str, None]:
+    return (error[0], error[1], error[2], None)
+
+
+@pytest.mark.backlog_fixed("RP-811")
 @pytest.mark.parametrize(
     ("query", "expected"),
     [
         ("create table c808 (x int check (x))", _not_boolean("CHECK", "integer", 33)),
         ("create table c808 (x int check (x is true))", _not_boolean("IS TRUE", "integer", 33)),
         ("create table c808 (x int check (x and true))", _not_boolean("AND", "integer", 33)),
+        ("create table c808 (x int, check (x + 1))", _not_boolean("CHECK", "integer", 34)),
+        ("create table c808 (x text check (x || 'a'))", _not_boolean("CHECK", "text", 34)),
+        ("create table c808 (x int check (x::text))", _not_boolean("CHECK", "text", 33)),
+        (
+            "create table c808 (x int check (case when x > 0 then 1 else 0 end))",
+            _not_boolean("CHECK", "integer", 33),
+        ),
+        ("create table c808 (x int check (coalesce(x, 1)))", _not_boolean("CHECK", "integer", 33)),
+        ("create table c808 (x int check (x > 0 and x))", _not_boolean("AND", "integer", 43)),
+        ("create table c808 (x int check (not x))", _not_boolean("NOT", "integer", 37)),
+        ("create table c808 (x int check (1))", _not_boolean("CHECK", "integer", 33)),
+        # `transformExpr` goes left to right, and the whole is coerced last.
+        ("create table c808 (x int check (x and y))", _not_boolean("AND", "integer", 33)),
+        (
+            "create table c808 (x int check ((x is true) = y))",
+            _not_boolean("IS TRUE", "integer", 34),
+        ),
+        (
+            "create table c808 (x int check (y and x))",
+            ("error", "42703", 'column "y" does not exist', "33"),
+        ),
+        (
+            "create table c808 (x int check (x + y))",
+            ("error", "42703", 'column "y" does not exist', "37"),
+        ),
+        (
+            "create table c808 (x int check ('x'))",
+            ("error", "22P02", 'invalid input syntax for type boolean: "x"', "33"),
+        ),
+        ("create table c808 (x int check ('t'))", "CREATE TABLE"),
+        ("create table c808 (x int check (null))", "CREATE TABLE"),
+        ("create table c808 (x int check (x::bool))", "CREATE TABLE"),
+        ("create table c808 (x int check (x in (1, 2)))", "CREATE TABLE"),
+        ("create table c808 (x bool check (x))", "CREATE TABLE"),
+        # ALTER TABLE hands `AddRelationNewConstraints` no query text.
+        ("alter table t808 add check (i)", _unpositioned(_not_boolean("CHECK", "integer", 0))),
+        (
+            "alter table t808 add constraint k check (i is false)",
+            _unpositioned(_not_boolean("IS FALSE", "integer", 0)),
+        ),
+        (
+            "alter table t808 add column y int check (y + 1)",
+            _unpositioned(_not_boolean("CHECK", "integer", 0)),
+        ),
+        (
+            "alter table t808 add constraint k check (q)",
+            ("error", "42703", 'column "q" does not exist', None),
+        ),
+        (
+            "alter table t808 add constraint k check ('x')",
+            ("error", "22P02", 'invalid input syntax for type boolean: "x"', None),
+        ),
     ],
 )
 def test_a_check_constraint_is_coerced_to_boolean(dsn: str, query: str, expected: object) -> None:
     """`cookConstraint` coerces a CHECK expression to boolean
     (`coerce_to_boolean(..., "CHECK")`) after transforming it: each is 42804
-    on PostgreSQL 15.19. Here the table is created, and `check (x)` then
-    admits every row, 0 included."""
+    on PostgreSQL 15.19, with no position under ALTER TABLE. Before RP-811
+    the table was created, and `check (x)` then admitted every row, 0 and
+    NULL included, while `check (x is true)` refused every one."""
     assert _answer(dsn, query) == expected
 
 
