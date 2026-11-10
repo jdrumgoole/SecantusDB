@@ -997,18 +997,21 @@ These are explicit non-goals. Don't add them without a reason.
   while working RM-305.
   Backlog-ID: RM-500
   Verify: tests/backlog/test_rm_found_2026_11_10.py::test_build_info_names_the_architecture_as_mongod_does
-- [ ] **A command that fails to parse is counted as a connection's first
-  command.** mongod 8.2.11 writes `Received first command on ingress
-  connection` (6788700) for the first command after the handshake that it
-  parses (`IngressHandshakeMetrics::onCommandReceived`, after the
-  command's IDL parse): `{find: 1}` after `hello`, refused for its
-  namespace, is passed over and the next command writes the line, timed
-  from the `hello`. This server counts every command either server knows
-  as it arrives, since its handlers parse and run in one step; the fix is
-  a parse step ahead of the run that the line can follow (measured
-  2026-11-07). Found with RM-305.
+- [ ] **A command its handler fails to parse is counted as a connection's
+  first command.** mongod 8.2.11 writes `Received first command on ingress
+  connection` (6788700) when a command is about to run: one its IDL parse,
+  its generic arguments, its concerns, `maxTimeMS` or its authorization
+  refuses is passed over, and the next command writes the line, timed from
+  the `hello`. This server writes it at the same point of its dispatcher
+  (since 2026-11-10), so the checks the dispatcher makes are passed over;
+  but its handlers parse their own fields inside the run, so a command
+  refused there -- `{find: "c", bogus: 1}` (40415), `{insert: "c",
+  documents: 1}` (14), an unknown pipeline stage (40324), `lsid: 1` (14),
+  and the like -- still counts. The fix is a parse step for each handler
+  ahead of its run, which the line can follow (measured 2026-11-10). Found
+  with RM-305.
   Backlog-ID: RM-386
-  Verify: tests/backlog/test_rm_001_028.py::test_a_command_that_fails_to_parse_is_not_the_first_command
+  Verify: tests/backlog/test_rm_001_028.py::test_a_command_its_handler_fails_to_parse_is_not_the_first_command
 - [ ] **A `deleteMany` over pre-images is batched.** mongod 8.2.11 writes
   a multi-document delete of a collection with
   `changeStreamPreAndPostImages` as one `d` entry per document, each with

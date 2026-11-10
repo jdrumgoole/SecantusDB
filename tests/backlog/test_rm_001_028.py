@@ -719,13 +719,14 @@ def _op_msg(sock: socket.socket, command: dict, request_id: int) -> dict:
     return bson.decode(sock.recv(length - 16, socket.MSG_WAITALL)[5:])
 
 
-@pytest.mark.backlog("RM-386")
+@pytest.mark.backlog_fixed("RM-386")
 def test_a_command_that_fails_to_parse_is_not_the_first_command(rust_mongo: Any) -> None:
     """mongod 8.2.11 times `Received first command on ingress connection`
     (6788700) from the first command it PARSES: after `hello`, a `{find: 1}`
     (refused for its namespace) is passed over and the line is written by
     the `ping` a second later, with `elapsedMillis` about 1000 (measured
-    2026-11-07). This server counts the `find`, at about 0."""
+    2026-11-07). This server counted the `find`, at about 0, until the line
+    moved to where the command is about to run."""
     host, port = rust_mongo.address
     with socket.create_connection((host, port)) as sock:
         local_host, local_port = sock.getsockname()[:2]
@@ -741,6 +742,49 @@ def test_a_command_that_fails_to_parse_is_not_the_first_command(rust_mongo: Any)
         e["attr"]["elapsedMillis"] for e in lines if e["id"] == 6788700 and e["ctx"] == thread
     ]
     assert len(elapsed) == 1 and elapsed[0] >= 900, elapsed
+
+
+# Commands whose handler refuses them for a field, as mongod's IDL parse does
+# (measured 8.2.11, 2026-11-10): each is passed over by mongod's 6788700.
+_REFUSED_IN_PARSE = {
+    "find-unknown-field": {"find": "c", "bogus": 1, "$db": "rm386"},
+    "insert-documents-int": {"insert": "c", "documents": 1, "$db": "rm386"},
+    "aggregate-unknown-stage": {
+        "aggregate": "c",
+        "pipeline": [{"$bogus": 1}],
+        "cursor": {},
+        "$db": "rm386",
+    },
+    "ping-lsid-int": {"ping": 1, "lsid": 1, "$db": "admin"},
+}
+
+
+@pytest.mark.backlog("RM-386")
+def test_a_command_its_handler_fails_to_parse_is_not_the_first_command(rust_mongo: Any) -> None:
+    """mongod 8.2.11 passes over, for `Received first command on ingress
+    connection` (6788700), a command its IDL parse refuses -- an unknown
+    field (40415), a field of the wrong type (14), an unknown pipeline stage
+    (40324), an `lsid` that is not a document (14) -- and the next command
+    writes the line (measured 2026-11-10). This server parses these inside
+    the command's run, after the line, so it counts each."""
+    host, port = rust_mongo.address
+    passed_over = {}
+    for name, command in _REFUSED_IN_PARSE.items():
+        with socket.create_connection((host, port)) as sock:
+            local_host, local_port = sock.getsockname()[:2]
+            local = f"{local_host}:{local_port}"
+            client = {"driver": {"name": "rm386", "version": "1"}, "os": {"type": "Darwin"}}
+            _op_msg(sock, {"hello": 1, "client": client, "$db": "admin"}, 1)
+            _op_msg(sock, command, 2)
+            time.sleep(0.3)
+            _op_msg(sock, {"ping": 1, "$db": "admin"}, 3)
+        lines = [json.loads(line) for line in rust_mongo.admin.command("getLog", "global")["log"]]
+        thread = next(e["ctx"] for e in lines if e["id"] == 51800 and e["attr"]["remote"] == local)
+        elapsed = [
+            e["attr"]["elapsedMillis"] for e in lines if e["id"] == 6788700 and e["ctx"] == thread
+        ]
+        passed_over[name] = len(elapsed) == 1 and elapsed[0] >= 250
+    assert passed_over == dict.fromkeys(_REFUSED_IN_PARSE, True)
 
 
 @pytest.mark.backlog_fixed("RM-025")
