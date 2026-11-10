@@ -24,10 +24,21 @@ def _writes_in_a_find_s_time(client: Any) -> list:
     """Each write of one slow document, given `_BUDGET` times what a `find`
     with the same filter takes on this server: its error code, or None."""
     slow = Slow(client)
-    slow.seed(1, 1.0)
-    began = time.monotonic()
-    slow.run({"find": "c", "filter": SLOW})
-    budget = max(1, int((time.monotonic() - began) * 1000 * _BUDGET))
+
+    def budget() -> int:
+        # Paired with the write it is for, and the slower of two `find`s: one
+        # `find` timed before all five writes gave a budget the later writes
+        # overran on a loaded CI runner, testing their filter once
+        # (snapshot #2608, 2026-11-10; its rerun passed). A filter tested
+        # twice still takes about twice a `find`, past the budget.
+        took = []
+        for _ in range(2):
+            slow.seed(1, 1.0)
+            began = time.monotonic()
+            slow.run({"find": "c", "filter": SLOW})
+            took.append(time.monotonic() - began)
+        return max(1, int(max(took) * 1000 * _BUDGET))
+
     writes = {
         "update": {"update": "c", "updates": [{"q": SLOW, "u": {"$inc": {"n": 1}}}]},
         "updateMany": {
@@ -40,8 +51,9 @@ def _writes_in_a_find_s_time(client: Any) -> list:
     }
     out = []
     for name, command in writes.items():
+        ms = budget()
         slow.seed(1, 1.0)
-        reply = slow.run({**command, "maxTimeMS": budget})
+        reply = slow.run({**command, "maxTimeMS": ms})
         code = reply.get("code") or next((e["code"] for e in reply.get("writeErrors", [])), None)
         out.append((name, code))
     return out
