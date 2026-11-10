@@ -275,6 +275,7 @@ pub fn aggregate(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         .unwrap_or_default();
     let caller = crate::session::user_digest(&crate::session::authenticated(ctx));
     SESSIONS.with(|sessions| *sessions.borrow_mut() = (seen, caller));
+    crate::query_stats::set_current(ctx.server_params.as_ref().map(|p| p.query_stats().clone()));
     // `$where` in a `$match` is refused with the aggregation-context code on
     // every mongod, script engine or not -- and it must be refused before the
     // leading-`$match` lift hands the filter to the query matcher.
@@ -2625,12 +2626,9 @@ pub(crate) fn run_segmented(
                 // that never configured one (RM-215).
                 Vec::new()
             } else if name == "$queryStats" {
-                // The query stats store's entries. mongod 8.2.11 records a
-                // query only while `internalQueryStatsRateLimit` is not 0,
-                // and 0 is its default, so a server left at its defaults
-                // has recorded none. This server reports that parameter as
-                // 0 and keeps it there: it has no store (RM-215).
-                Vec::new()
+                // The query stats store's entries (RM-215): none until
+                // `internalQueryStatsRateLimit` is set off its default, 0.
+                crate::query_stats::stage_rows(stage.as_document().and_then(|d| d.get(name)))?
             } else if name == "$currentOp" {
                 // The registry's operations, and its idle cursors when asked
                 // (RM-216); the synthetic row only off-server.

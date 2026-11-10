@@ -124,6 +124,9 @@ const SETTABLE: &[(&str, ParamKind)] = &[
     // atomic beside the stored value.
     ("notablescan", ParamKind::Bool),
     ("quiet", ParamKind::Bool),
+    // How many queries a second the query stats store records (RM-215):
+    // 0 none, -1 every one. Applied to the store as it changes.
+    ("internalQueryStatsRateLimit", ParamKind::Int32AtLeast(-1)),
     // The TTL monitor, which these reach in the storage layer as well as
     // being stored here: a test sets the sleep to 1 to see a document expire
     // without waiting a minute.
@@ -307,6 +310,8 @@ pub struct ServerParams {
     ingress_admission: crate::admission::ingress::IngressAdmissionController,
     /// mongod's execution admission control, once the server starts it.
     execution: std::sync::OnceLock<std::sync::Arc<crate::admission::execution::ExecutionControl>>,
+    /// mongod's query stats store, which `$queryStats` lists (RM-215).
+    query_stats: std::sync::Arc<crate::query_stats::QueryStatsStore>,
 }
 
 /// mongod's connection-establishment rate limiter (8.2.11, measured
@@ -326,6 +331,11 @@ struct IngressBucket {
 impl ServerParams {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// The server's query stats store (RM-215).
+    pub fn query_stats(&self) -> &std::sync::Arc<crate::query_stats::QueryStatsStore> {
+        &self.query_stats
     }
 
     /// A user or role changed: every connection recomputes its privileges
@@ -1002,6 +1012,11 @@ pub fn set_parameter(doc: &Document, ctx: &mut CommandContext) -> HandlerResult 
                 }
                 ("internalQueryExecYieldPeriodMS", Bson::Int32(ms)) => {
                     secantus_core::deadline::set_yield_period_ms(i64::from(*ms));
+                }
+                ("internalQueryStatsRateLimit", Bson::Int32(n)) => {
+                    if let Some(s) = store.as_ref() {
+                        s.query_stats.set_rate_limit(*n);
+                    }
                 }
                 ("notablescan", Bson::Boolean(on)) => {
                     if let Some(s) = store.as_ref() {

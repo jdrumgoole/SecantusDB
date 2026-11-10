@@ -181,6 +181,38 @@ pub(crate) fn take_examined() -> Option<crate::ExecStats> {
 }
 
 thread_local! {
+    /// How the running command's read chose its plan, as mongod's
+    /// `fromMultiPlanner` / `fromPlanCache` say it: noted by the read's
+    /// plan cache consultation (`explain::order`), the first one the
+    /// command makes.
+    static PLANNER: std::cell::Cell<Option<Planned>> = const { std::cell::Cell::new(None) };
+}
+
+/// How a read chose its plan: a trial among candidates
+/// (`from_multi_planner`), or the plan cache's active plan
+/// (`from_plan_cache`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Planned {
+    pub from_multi_planner: bool,
+    pub from_plan_cache: bool,
+}
+
+/// The running command's read chose its plan so; a later read of the same
+/// command (a `$lookup`'s) does not replace it.
+pub(crate) fn note_planned(planned: Planned) {
+    PLANNER.with(|p| {
+        if p.get().is_none() {
+            p.set(Some(planned));
+        }
+    });
+}
+
+/// What [`note_planned`] noted for the command, taken.
+pub(crate) fn take_planned() -> Option<Planned> {
+    PLANNER.with(std::cell::Cell::take)
+}
+
+thread_local! {
     /// The views the command running on this thread resolved, by name
     /// (RM-362); `dispatch` takes them.
     static RESOLVED_VIEWS: std::cell::RefCell<std::collections::BTreeMap<String, Document>> =

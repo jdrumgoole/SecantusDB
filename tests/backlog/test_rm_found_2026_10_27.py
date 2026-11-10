@@ -17,7 +17,7 @@ import pytest
 from bson import Binary
 
 from tests.backlog.conftest import mongo_answer
-from tests.mongod_live.test_interrupts import SLOW, Slow
+from tests.mongod_live.test_interrupts import DB, SLOW, Slow
 
 
 def _fails_part_way(client: Any) -> tuple:
@@ -103,6 +103,19 @@ def _delete_many_killed(client: Any, clustered: bool = False) -> tuple:
     replies: list = []
     thread = threading.Thread(target=lambda: replies.append(slow.run(command)), daemon=True)
     thread.start()
+    # 1.5 s from when the delete runs: on a loaded box the request can land
+    # after a kill timed from the thread's start, which then kills nothing
+    # and the delete runs to its end (the RM gate, 2026-11-10).
+    running = {
+        "aggregate": 1,
+        "pipeline": [{"$currentOp": {}}, {"$match": {"ns": f"{DB}.c"}}],
+        "cursor": {},
+    }
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline:
+        if slow.run(running, db="admin")["cursor"]["firstBatch"]:
+            break
+        time.sleep(0.05)
     time.sleep(1.5)
     slow.kill("killSessions", lsid, {})
     thread.join(120)
