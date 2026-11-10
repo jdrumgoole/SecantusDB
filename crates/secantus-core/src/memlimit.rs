@@ -212,6 +212,8 @@ pub struct SpillReport {
     pub sort_spilled_data_storage_size: i64,
     /// What the sorts counted, spilled or not (`sortTotalDataSizeBytes`).
     pub sort_total_data_size: i64,
+    /// The keys the sorts sorted (mongod's `keysSorted`).
+    pub keys_sorted: i64,
     /// Each `$group` that finished, in the order they did (RM-328).
     pub groups: Vec<GroupStats>,
     /// Each `$setWindowFields` that finished, in the order they did.
@@ -261,6 +263,7 @@ impl SpillReport {
             sort_spilled_data_storage_size: self.sort_spilled_data_storage_size
                 - before.sort_spilled_data_storage_size,
             sort_total_data_size: self.sort_total_data_size - before.sort_total_data_size,
+            keys_sorted: self.keys_sorted - before.keys_sorted,
             groups: self.groups[before.groups.len().min(self.groups.len())..].to_vec(),
             windows: self.windows[before.windows.len().min(self.windows.len())..].to_vec(),
         }
@@ -331,14 +334,43 @@ pub static SORT_METRICS: SortCounters = SortCounters {
 };
 
 /// A sort that ran: `keys` documents, `bytes` counted, in memory or not.
+/// `metrics.query.sort` counts them when the operation ends
+/// ([`count_sorted`]).
 pub(crate) fn record_sort(keys: i64, bytes: i64) {
     REPORT.with(|r| {
         let mut r = r.borrow_mut();
         r.has_sort_stage = true;
         r.sort_total_data_size += bytes;
+        r.keys_sorted += keys;
     });
-    SORT_METRICS.total_keys_sorted.add(keys);
-    SORT_METRICS.total_bytes_sorted.add(bytes);
+}
+
+/// The operation ended: add its `keysSorted` and `sortTotalDataSizeBytes`
+/// to `metrics.query.sort`, as mongod 8.2.11 does for each operation
+/// (`curop_metrics.cpp`) -- each `getMore` of a cursor with what its plan
+/// has sorted so far, so a sort is counted again at every one (RM-400).
+pub fn count_sorted() {
+    REPORT.with(|r| {
+        let r = r.borrow();
+        SORT_METRICS.total_keys_sorted.add(r.keys_sorted);
+        SORT_METRICS.total_bytes_sorted.add(r.sort_total_data_size);
+    });
+}
+
+/// Add what a cursor's earlier operations reported of its plan to this
+/// operation's: mongod's every operation on a cursor reports its plan's
+/// sort and group counts so far (RM-400).
+pub fn add_report(earlier: &SpillReport) {
+    REPORT.with(|r| {
+        let mut r = r.borrow_mut();
+        r.used_disk |= earlier.used_disk;
+        r.has_sort_stage |= earlier.has_sort_stage;
+        r.group_spills += earlier.group_spills;
+        r.group_spilled_records += earlier.group_spilled_records;
+        r.group_spilled_bytes += earlier.group_spilled_bytes;
+        r.group_spilled_data_storage_size += earlier.group_spilled_data_storage_size;
+    });
+    add_sort_counts(earlier, 1);
 }
 
 /// A sort wrote a run (a spill, or a merge of runs) of `records`, as
@@ -397,7 +429,7 @@ pub fn reset_report() {
     CURSOR_READ.with(|c| c.borrow_mut().take());
 }
 
-/// A query-layer sort that spilled, read by the stages after it through
+/// A query-layer sort, spilled or not, read by the stages after it through
 /// mongod's cursor stage (RM-326). mongod 8.2.11's cursor stage adds its
 /// executor's summary to its own at every buffer it loads, and never resets
 /// the sort's counts there, so the operation reports them once per load.
@@ -425,7 +457,7 @@ pub(crate) fn note_cursor_read(read: CursorRead) {
 }
 
 /// Whether the stage at `index` of the pipeline running reads documents a
-/// query-layer sort that spilled hands on, so its reads are kept (RM-326).
+/// query-layer sort hands on, so its reads are kept (RM-326).
 pub(crate) fn tracks_reads(index: usize) -> bool {
     CURSOR_READ.with(|c| c.borrow().as_ref().is_some_and(|read| index >= read.at))
 }
@@ -453,6 +485,7 @@ pub fn add_sort_counts(sort: &SpillReport, times: i64) {
         r.sort_spilled_bytes += sort.sort_spilled_bytes * times;
         r.sort_spilled_data_storage_size += sort.sort_spilled_data_storage_size * times;
         r.sort_total_data_size += sort.sort_total_data_size * times;
+        r.keys_sorted += sort.keys_sorted * times;
     });
 }
 

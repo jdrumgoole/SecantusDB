@@ -189,14 +189,90 @@ def _get_mores(client: Any) -> dict:
     return out
 
 
-@pytest.mark.backlog("RM-400")
+@pytest.mark.backlog_fixed("RM-400")
 def test_get_more_sort_counts(rust_mongo: Any, mongod: Any) -> None:
-    """mongod 8.2.11 profiles a cursor's `getMore` with its sort's counts so
-    far (`sortSpills: 52` after an aggregate that reported 52), and adds the
+    """mongod 8.2.11 profiled a cursor's `getMore` with its sort's counts so
+    far (`sortSpills: 52` after an aggregate that reported 52), and added the
     operation's `keysSorted` / `sortTotalDataSizeBytes` to `totalKeysSorted` /
     `totalBytesSorted` for each operation, the `getMore`s included (2400
-    keys for a sort of 300 read through four loads, then one `getMore`)."""
+    keys for a sort of 300 read through four loads, then one `getMore`).
+    This server's `getMore` entries carried no sort counts, and it added
+    each sort's keys and bytes once, as it sorted."""
     assert _get_mores(rust_mongo) == _get_mores(mongod)
+
+
+def _counted(client: Any) -> dict:
+    """What `metrics.query.sort` counts for each operation, no sort spilling."""
+    db = _spill_db(client)
+    out = {}
+    for name, run in {
+        "through the cursor stage": lambda: list(
+            db.c.aggregate([{"$sort": {"n": -1}}, ADD], batchSize=50)
+        ),
+        "a window": lambda: list(
+            db.c.aggregate(
+                [{"$setWindowFields": {"sortBy": {"n": 1}, "output": {"t": {"$sum": "$n"}}}}]
+            )
+        ),
+        "the query layer's alone": lambda: list(db.c.aggregate([{"$sort": {"n": -1}}])),
+        "a find in batches": lambda: list(db.c.find({}).sort("n", -1).batch_size(50)),
+        "explain": lambda: db.command(
+            "explain",
+            {"aggregate": "c", "pipeline": [{"$sort": {"n": -1}}, ADD], "cursor": {}},
+            verbosity="executionStats",
+        ),
+    }.items():
+        before = _sort_metrics(client)
+        run()
+        after = _sort_metrics(client)
+        out[name] = {k: after[k] - before[k] for k in ("totalKeysSorted", "totalBytesSorted")}
+    return out
+
+
+@pytest.mark.backlog_fixed("RM-400")
+def test_sort_counted_per_operation_without_a_spill(rust_mongo: Any, mongod: Any) -> None:
+    """mongod 8.2.11 counted a sort in `totalKeysSorted` per operation and
+    per cursor-stage load whether or not it spilled (6900 keys for a sort of
+    300 read in batches of 50 through `$addFields`, 2100 for a `find` in
+    batches of 50), and counted nothing for an `explain`. This server
+    counted each sort once, an `explain`'s included."""
+    assert _counted(rust_mongo) == _counted(mongod)
+
+
+GROUP_BUDGET = {"internalDocumentSourceGroupMaxMemoryBytes": 50_000}
+
+
+def _group_get_mores(client: Any) -> list:
+    db = _spill_db(client)
+    for k, v in GROUP_BUDGET.items():
+        client.admin.command({"setParameter": 1, k: v})
+    db.command({"profile": 2})
+    try:
+        list(
+            db.c.aggregate(
+                [{"$unwind": "$s"}, {"$group": {"_id": "$n", "s": {"$push": "$s"}}}],
+                comment="rm400-group",
+            )
+        )
+    finally:
+        db.command({"profile": 0})
+        for k in GROUP_BUDGET:
+            client.admin.command({"setParameter": 1, k: 104_857_600})
+    entries = db.system.profile.find(
+        {"$or": [{"command.comment": "rm400-group"}, {"originatingCommand.comment": "rm400-group"}]}
+    )
+    return [
+        {k: e.get(k) for k in ("op", "usedDisk", "groupSpills", "groupSpilledRecords")}
+        for e in entries
+    ]
+
+
+@pytest.mark.backlog_fixed("RM-400")
+def test_get_more_group_spills(rust_mongo: Any, mongod: Any) -> None:
+    """mongod 8.2.11 profiled a cursor's `getMore` with its `$group`'s
+    spills too (7 spills of 300 records, on the `aggregate` and again on
+    its `getMore`). This server's `getMore` carried none."""
+    assert _group_get_mores(rust_mongo) == _group_get_mores(mongod)
 
 
 # ------------------------------------- RM-398 SBE's sort bytes --
@@ -311,3 +387,29 @@ def test_sbe_limited_sort_counts_every_key(rust_mongo: Any, mongod: Any) -> None
     every key it took (300 over 300 documents) to `totalKeysSorted`, for a
     limit of 50 and of 1, and no bytes; this server adds 50 and 1."""
     assert _sbe_limited_keys(rust_mongo) == _sbe_limited_keys(mongod)
+
+
+# --------------------- RM-503 a descending or tied sort's spill file --
+
+
+def _spill_storage(client: Any) -> dict:
+    db = _spill_db(client)
+    return {
+        name: (e.get("sortSpills"), e.get("sortSpilledDataStorageSize"))
+        for name, e in (
+            (name, _profiled(db, pipeline, SORT_BUDGET, f"rm503-{name}"))
+            for name, pipeline in {
+                "descending": [{"$sort": {"n": -1}}],
+                "tied": [{"$sort": {"k": 1}}],
+                "descending, then a string": [{"$sort": {"n": -1, "s": 1}}],
+            }.items()
+        )
+    }
+
+
+@pytest.mark.backlog("RM-503")
+def test_descending_and_tied_spill_storage_size(rust_mongo: Any, mongod: Any) -> None:
+    """macOS mongod 8.2.11 stores 54562 bytes for the 13 spills of a sort on
+    `{n: -1}`, 51240 for `{k: 1}` (tied keys) and 131282 for `{n: -1, s:
+    1}`; this server stores 54563, 50599 and 131265."""
+    assert _spill_storage(rust_mongo) == _spill_storage(mongod)

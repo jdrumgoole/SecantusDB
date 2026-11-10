@@ -198,6 +198,64 @@ struct Entry {
     stream: Option<Box<dyn StreamCursor>>,
     streaming: bool,
     stream_busy: bool,
+    /// What the cursor's operations have reported of its plan (RM-400).
+    counts: CursorCounts,
+}
+
+/// What a cursor's plan has done, which mongod 8.2.11 reports on every
+/// operation that reads the cursor (RM-400): each `getMore` is profiled with
+/// its plan's sort and group counts so far, and adds its sorts' keys and
+/// bytes to `metrics.query.sort` again.
+#[derive(Debug, Clone, Default)]
+pub struct CursorCounts {
+    /// The command that opened a cursor whose documents were all read for
+    /// its first batch (a pipeline that blocks): its `getMore`s name it as
+    /// a streaming cursor's do.
+    pub origin: Option<Document>,
+    /// The plan's summary, which every `getMore` repeats.
+    pub plan_summary: Option<String>,
+    /// The plan sorts in memory (`hasSortStage`).
+    pub has_sort_stage: bool,
+    /// What the cursor's last operation reported.
+    pub reported: secantus_core::memlimit::SpillReport,
+    /// A query-layer sort read through the cursor stage, which counts it
+    /// again at each buffer it loads (RM-326).
+    pub loads: Option<CursorLoads>,
+}
+
+/// A query-layer sort read through mongod's cursor stage, and how far the
+/// stage has read it (`agg_executor::cursor_loads`).
+#[derive(Debug, Clone)]
+pub struct CursorLoads {
+    /// What the sort counted, once.
+    pub sort: secantus_core::memlimit::SpillReport,
+    /// The stages the cursor stage feeds.
+    pub downstream: Vec<Bson>,
+    pub sizes: Vec<usize>,
+    pub limited: bool,
+    pub reads: std::collections::BTreeMap<usize, Vec<usize>>,
+    /// The documents the cursor's operations have asked the stages for.
+    pub pulled: usize,
+    /// The buffers loaded for them.
+    pub loaded: usize,
+}
+
+impl CursorLoads {
+    /// Ask for `more` documents (one more when the read found its end):
+    /// what the sort is counted beyond what was already reported.
+    pub fn pull(&mut self, more: usize) -> Option<i64> {
+        self.pulled += more;
+        let loads = crate::agg_executor::cursor_loads(
+            &self.downstream,
+            &self.sizes,
+            self.limited,
+            &self.reads,
+            self.pulled,
+        )?;
+        let extra = loads.saturating_sub(self.loaded);
+        self.loaded = self.loaded.max(loads);
+        Some(extra as i64)
+    }
 }
 
 /// The session a cursor was opened in, and the transaction number when it was
@@ -407,6 +465,7 @@ impl CursorRegistry {
                 stream: None,
                 streaming: false,
                 stream_busy: false,
+                counts: CursorCounts::default(),
             },
         );
         Ok(id)
@@ -455,6 +514,7 @@ impl CursorRegistry {
                 stream: None,
                 streaming: false,
                 stream_busy: false,
+                counts: CursorCounts::default(),
             },
         );
         Ok(id)
@@ -534,6 +594,20 @@ impl CursorRegistry {
             e.stream = Some(stream);
             e.stream_busy = false;
             e.last_access = now;
+        }
+    }
+
+    /// What cursor `cursor_id`'s operations have reported (RM-400).
+    pub fn counts(&self, cursor_id: i64) -> Option<CursorCounts> {
+        let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        inner.cursors.get(&cursor_id).map(|e| e.counts.clone())
+    }
+
+    /// Change what cursor `cursor_id` keeps of its operations' counts.
+    pub fn update_counts(&self, cursor_id: i64, f: impl FnOnce(&mut CursorCounts)) {
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(e) = inner.cursors.get_mut(&cursor_id) {
+            f(&mut e.counts);
         }
     }
 
@@ -1261,11 +1335,38 @@ pub fn get_more(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         return Ok(doc! { "cursor": cursor_doc, "ok": 1.0 });
     }
 
+    let counts = cursors.counts(cursor_id);
     let (batch, exhausted) =
         match cursors.next_batch(cursor_id, batch_size.unwrap_or(0), MAX_GETMORE_BATCH_BYTES) {
             Ok(x) => x,
             Err(_) => return Ok(cursor_not_found(cursor_id)),
         };
+    if let Some(counts) = counts {
+        report_counts(
+            cursors,
+            cursor_id,
+            &counts,
+            batch.len(),
+            exhausted,
+            batch_size,
+        );
+        // A cursor whose documents were all read for its first batch: its
+        // `getMore` names the command that opened it, and examines nothing
+        // (measured 8.2.11).
+        if let Some(origin) = counts.origin {
+            ctx.exec_stats = Some(crate::ExecStats {
+                keys_examined: 0,
+                docs_examined: 0,
+                cursor_id,
+                exhausted,
+                plan_summary: counts.plan_summary,
+                originating_command: Some(origin),
+                has_sort_stage: counts.has_sort_stage,
+                exec_stages: None,
+                write_run: None,
+            });
+        }
+    }
     // The registry already holds the batch as pre-encoded blobs; hand them to
     // the server (`ctx.pending_batch`) to splice onto the wire without the
     // decode→re-encode round-trip `docs_to_bson` would cost. The reply carries
@@ -1324,6 +1425,7 @@ fn stream_get_more(
         .clone()
         .ok_or_else(|| CommandError::new(1, "InternalError", "no storage configured"))?;
     let want = batch_size.unwrap_or(0).max(0) as usize;
+    let counts = cursors.counts(cursor_id);
     let batch = match stream.next_batch(storage.as_ref(), want, MAX_GETMORE_BATCH_BYTES) {
         Ok(b) => b,
         Err(e) => {
@@ -1332,6 +1434,16 @@ fn stream_get_more(
             return Err(get_more_error(e));
         }
     };
+    if let Some(counts) = counts {
+        report_counts(
+            &cursors,
+            cursor_id,
+            &counts,
+            batch.docs.len(),
+            batch.exhausted,
+            batch_size,
+        );
+    }
     let open = !batch.exhausted;
     ctx.exec_stats = Some(crate::ExecStats {
         keys_examined: batch.keys_examined,
@@ -1361,6 +1473,39 @@ fn stream_get_more(
         },
         "ok": 1.0,
     })
+}
+
+/// What a `getMore` of a cursor reports of its plan (RM-400): mongod 8.2.11
+/// profiles it with what the cursor's operations have counted so far --
+/// its own work added to what the last one reported -- and a query-layer
+/// sort read through the cursor stage once more for each buffer the stage
+/// loaded for this batch. `returned`: the batch's documents; a batch that
+/// came up short of `batch_size` (none: as many as fit) found the end, and
+/// asked the stages for one more.
+fn report_counts(
+    cursors: &CursorRegistry,
+    cursor_id: i64,
+    counts: &CursorCounts,
+    returned: usize,
+    exhausted: bool,
+    batch_size: Option<i64>,
+) {
+    secantus_core::memlimit::add_report(&counts.reported);
+    let Some(mut loads) = counts.loads.clone() else {
+        return;
+    };
+    let found_end = exhausted && batch_size.is_none_or(|n| (returned as i64) < n);
+    if let Some(extra) = loads.pull(returned + usize::from(found_end)) {
+        secantus_core::memlimit::add_sort_counts(&loads.sort, extra);
+    }
+    cursors.update_counts(cursor_id, |c| c.loads = Some(loads));
+}
+
+/// The operation ended with cursor `cursor_id` open: keep what it reported
+/// of its plan, which the cursor's next operation reports again (RM-400).
+pub(crate) fn keep_reported(cursors: &CursorRegistry, cursor_id: i64) {
+    let reported = secantus_core::memlimit::report();
+    cursors.update_counts(cursor_id, |c| c.reported = reported);
 }
 
 /// An executor's error met by a `getMore`, which mongod names rather than

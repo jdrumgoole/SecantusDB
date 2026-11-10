@@ -1192,19 +1192,6 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       writes its t-digest; this server keeps, and writes, the values).
       Backlog-ID: RM-325
       Verify: tests/backlog/test_rm_found_2026_10_26.py::test_spill_storage_size
-- [ ] **A `getMore` reports none of its cursor's sort counts, and the
-      sort counters count each sort once.** mongod 8.2.11 profiles every
-      `getMore` of a cursor whose plan sorted with the sort's counts so far
-      (`sortSpills: 52` on the `getMore` after an aggregate that reported
-      52; 29 on a `find`'s), and adds an operation's `keysSorted` and
-      `sortTotalDataSizeBytes` to `metrics.query.sort.totalKeysSorted` /
-      `totalBytesSorted` when it ends (`curop_metrics.cpp`), each `getMore`
-      included: 2400 keys for a sort of 300 read through four loads and one
-      `getMore`, 600 for a `find` of 300 and its `getMore`. This server's
-      `getMore` entries carry no sort counts, and it adds each sort's keys
-      and bytes once, as it sorts.
-      Backlog-ID: RM-400
-      Verify: tests/backlog/test_rm_326_sort_counts.py::test_get_more_sort_counts
 - [ ] **An SBE sort keeps a field only its key reads.** mongod 8.2.11's
       slot-based sort in front of `{$group: {_id: "$k", f: {$first:
       "$s"}}}` keeps `k` and `s` beside its key `n`, a row of 1064 bytes for
@@ -1239,6 +1226,16 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       records where mongod's spill 592.
       Backlog-ID: RM-399
       Verify: tests/backlog/test_rm_326_sort_counts.py::test_top_k_sort_spills
+- [ ] **A sort on a descending or tied key spills a file of another
+      size.** Over 300 1-KB documents under a 50000-byte budget, macOS
+      mongod 8.2.11 stores 54562 bytes for the 13 spills of `{n: -1}`,
+      51240 for `{k: 1}` (seven values, so tied keys) and 131282 for `{n:
+      -1, s: 1}`; this server 54563, 50599 and 131265. An ascending sort on
+      a unique key (`{n: 1}`, 54548; `{n: 1, s: 1}`, 131252) is mongod's to
+      the byte, so the records or their order in each run differ, not the
+      file's framing. Found 2026-11-10 (RM-400).
+      Verify: tests/backlog/test_rm_326_sort_counts.py::test_descending_and_tied_spill_storage_size
+      Backlog-ID: RM-503
 - [ ] **macOS mongod counts window functions at its own sizes.** This
       server counts a window function's memory at Linux mongod 8.2.12's
       sizes (x86-64 and arm64 agree), the exemplar CI measures. macOS

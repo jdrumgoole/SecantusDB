@@ -1084,6 +1084,24 @@ fn dispatch_named(doc: &Document, ctx: &mut CommandContext) -> Document {
         .map(|(began, now)| now - began);
     drop(planning);
     drop(counting);
+    // What the operation sorted is counted as it ends, and a cursor it
+    // leaves open keeps what it reported, which the cursor's next operation
+    // reports again (RM-400). An `explain` counts nothing (measured 8.2.11).
+    if name != "explain" {
+        secantus_core::memlimit::count_sorted();
+        let open = reply
+            .get_document("cursor")
+            .ok()
+            .and_then(|c| c.get_i64("id").ok())
+            .filter(|id| *id != 0);
+        if let (true, Some(id), Some(cursors)) = (
+            matches!(name, "find" | "aggregate" | "getMore"),
+            open,
+            ctx.cursors.as_deref(),
+        ) {
+            cursors::keep_reported(cursors, id);
+        }
+    }
     profiler::finish(name, doc, inner_n, &reply, ctx);
     reply
 }
