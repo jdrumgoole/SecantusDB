@@ -3482,31 +3482,24 @@ statement is VALUES-only and runs there as written. The gap tests are in
       Verify: tests/backlog/test_rp_found_rp757.py::test_a_scalar_subquery_under_a_boolean_test_or_collate
       Backlog-ID: RP-774
 
-## Found while working RP-775 (2026-11-10)
+## Found while working RP-792 (2026-11-10)
 
-Measured on PostgreSQL 15.19: the VALUES-only statements on the shared
-reference (port 5415), the stored-table ones on a private, freshly
-initdb'd cluster. The gap tests are in
-`tests/backlog/test_rp_found_rp775.py`.
+Measured on the shared PostgreSQL 15.19 reference (port 5415) with
+FROM-less and VALUES-only statements. The gap test is in
+`tests/backlog/test_rp_found_rp792.py`.
 
-- [ ] **Per row, a `char(n)` operand against a `text` one resolves the
-      operator wrongly in two shapes.** Evaluated per row -- a select
-      list, or a WHERE over a VALUES list or a set operation (RP-775 sends
-      those to the evaluator) -- over `(values ('uu'::char(4)), ('tt'),
-      ('vv')) s(f)` on PostgreSQL 15.19: `f in ('uu  '::text, 'tt')` is
-      true for `uu  ` (more than one non-Var member, so
-      `transformAExprIn` compares as the list's common type, `bpchar`),
-      and `f = (select 'uu  ')` is false for every row (the subquery's
-      column is `text`, so `texteq` over the `rtrim`med column). Here the
-      first compares the `text` member as `text` (it expands the list to
-      one `=` per member, which is right only for one member), and the
-      second as `bpchar`: the subquery's value is a parameter whose type
-      `declare_sublink_param` records while planning, and the per-row
-      evaluation no longer sees it. The same on a stored `char(n)`
-      table's select list. The WHERE forms over a VALUES list that the
-      MQL filter answered wrongly were RP-775.
-      Verify: tests/backlog/test_rp_found_rp775.py::test_a_char_operand_against_text_per_row
-      Backlog-ID: RP-792
+- [ ] **An IN list's untyped member that its common type cannot read is
+      no error once an earlier member matches.** `select 1 in (1, 'x')`
+      is 22P02 `invalid input syntax for type integer: "x"` on PostgreSQL
+      15.19, and so is `select x, x in (1, 'x') from (values (1)) s(x)`,
+      even `... where false`: `transformAExprIn` coerces every non-Var
+      member to the list's common type while the statement is analysed,
+      before a row is read. Here the members are compared one at a time
+      and the first match ends the list, so both answer `true`, and with
+      no rows nothing is checked. (A WHERE that lowers to a filter, and
+      `1 = any(array[1, 'x'])`, already raise it.)
+      Verify: tests/backlog/test_rp_found_rp792.py::test_an_in_lists_unreadable_member_is_an_error
+      Backlog-ID: RP-806
 
 ## Found while working RP-794 (2026-11-10)
 

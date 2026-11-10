@@ -772,7 +772,7 @@ fn view_select(r: &pg_query::protobuf::RangeVar) -> Option<pg_query::protobuf::S
 /// takes over from `varchar` / `bpchar` (each casts to it, it to neither),
 /// and otherwise the first stays, as `text`, `varchar` and `bpchar` cast
 /// each way. `"char"` meets none of them; `None` across categories.
-fn select_common(o: &str, t: &str) -> Option<String> {
+pub(crate) fn select_common(o: &str, t: &str) -> Option<String> {
     if o == t {
         return Some(o.to_string());
     }

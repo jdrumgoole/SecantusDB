@@ -2,7 +2,7 @@
 
 - evaluated per row, a `char(n)` operand against a `text` one resolves
   the operator wrongly in two shapes: a longer IN list's `text` member,
-  and a scalar subquery's `text` value (RP-792);
+  and a scalar subquery's `text` value (RP-792, fixed);
 - a one-member IN list of `text` over a stored `char(n)` column compared
   as `bpchar`, where PostgreSQL makes it a plain `=`, `text`'s (RP-793,
   fixed);
@@ -51,7 +51,7 @@ def _answer(dsn: str, query: str, setup: list[str] | None = None) -> object:
 _C = "from (values ('uu'::char(4)), ('tt'), ('vv')) s(f)"
 
 
-@pytest.mark.backlog("RP-792")
+@pytest.mark.backlog_fixed("RP-792")
 @pytest.mark.parametrize(
     ("query", "expected"),
     [
@@ -70,13 +70,37 @@ _C = "from (values ('uu'::char(4)), ('tt'), ('vv')) s(f)"
             f"select f, f = (select 'uu  '::text) {_C} order by f",
             [("tt", False), ("uu  ", False), ("vv", False)],
         ),
+        # A `varchar` member meets `bpchar` as `bpchar` too.
+        (
+            f"select f, f in ('uu  '::text, 'tt'::varchar) {_C} order by f",
+            [("tt", True), ("uu  ", True), ("vv", False)],
+        ),
+        # A Var member is a plain `=` of its own, so only one member is a
+        # constant here: `'uu  '::text` against the column is `texteq`.
+        (
+            f"select f, 'uu  '::text in (f, 'tt') {_C} order by f",
+            [("tt", False), ("uu  ", False), ("vv", False)],
+        ),
+        # The same with no row to read: a FROM-less select list.
+        (
+            "select 'uu'::char(4) in ('uu  '::text, 'tt'), 'uu'::char(4) = (select 'uu  '::text)",
+            [(True, False)],
+        ),
+        # The subquery's value keeps its type per row.
+        (
+            f"select f, pg_typeof((select 'uu  ')) {_C} order by f",
+            [("tt", "text"), ("uu  ", "text"), ("vv", "text")],
+        ),
     ],
 )
 def test_a_char_operand_against_text_per_row(dsn: str, query: str, expected: object) -> None:
     """Evaluated per row -- a select list, or a WHERE over a VALUES list --
-    a `char(n)` operand compares with a `text` member of a longer IN list
+    a `char(n)` operand compared with a `text` member of a longer IN list
     as `text`, and with a scalar subquery's `text` value as `bpchar`
-    (blanks dropped); PostgreSQL 15.19 does the opposite in each."""
+    (blanks dropped); PostgreSQL 15.19 does the opposite in each. The IN
+    list now coerces its non-Var members to their common type, as
+    `transformAExprIn` does, and a row expression keeps the type its
+    subquery's parameter was declared with while it was planned."""
     assert _answer(dsn, query) == expected
 
 

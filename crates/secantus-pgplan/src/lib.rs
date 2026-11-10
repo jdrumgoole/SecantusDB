@@ -1312,7 +1312,9 @@ pub enum ConflictAction {
         /// of the column's domain (`excluded.a`, the target's own `a`).
         of_domain: Vec<String>,
         /// `WHERE` on the DO UPDATE: the update is skipped when it is false.
-        filter: Option<ColumnExpr>,
+        /// Boxed, so the variant stays within `large_enum_variant`'s bound
+        /// of the data-less `Nothing`.
+        filter: Option<Box<ColumnExpr>>,
     },
 }
 
@@ -3250,6 +3252,13 @@ pub enum ColumnExpr {
         expr: Box<pg_query::protobuf::Node>,
         fields: Vec<RowField>,
         params: Vec<Bson>,
+        /// The type each of `params` was declared as while the expression
+        /// was planned. A scalar subquery folded into a parameter declares
+        /// its column's type then (`declare_sublink_param`), and the
+        /// declaration is gone by the time a row is evaluated: without it
+        /// `f = (select 'uu  '::text)` read the value as untyped and
+        /// compared it as `bpchar` (RP-792).
+        param_types: Vec<Option<String>>,
         result_type: String,
         /// Each field's `char(n)` width, when it has one: the value is
         /// padded to it before evaluation.
@@ -12875,7 +12884,7 @@ fn plan_on_conflict(
                 set_exprs,
                 // Filled from the statement as written (`domain_scope`).
                 of_domain: Vec::new(),
-                filter,
+                filter: filter.map(Box::new),
             }
         }
         _ => return Err(Error::Unsupported("this ON CONFLICT action".into())),
@@ -17804,6 +17813,90 @@ fn bpchar_compared_operands(
     (lhs, rhs)
 }
 
+/// Whether an IN list's member reads a Var of its own query: a column, or
+/// a row's column standing as a `$n` past the statement's `row_from`
+/// parameters (`contain_vars_of_level(rexpr, 0)` in `transformAExprIn`).
+fn in_member_has_var(item: &pg_query::protobuf::Node, row_from: usize) -> bool {
+    if matches!(item.node.as_ref(), Some(N::ColumnRef(_))) {
+        return true;
+    }
+    if let Some(N::ParamRef(p)) = item.node.as_ref() {
+        return usize::try_from(p.number).is_ok_and(|n| n > row_from);
+    }
+    item.node.as_ref().is_some_and(|n| {
+        n.nodes().iter().any(|(x, _, _, _)| match x {
+            pg_query::NodeRef::ColumnRef(_) => true,
+            pg_query::NodeRef::ParamRef(p) => usize::try_from(p.number).is_ok_and(|n| n > row_from),
+            _ => false,
+        })
+    })
+}
+
+/// Whether an IN operand is an untyped literal or NULL, which
+/// `select_common_type` reads as `unknown`, taking the others' type.
+fn in_member_untyped(n: &pg_query::protobuf::Node) -> bool {
+    matches!(n.node.as_ref(), Some(N::AConst(c))
+        if c.isnull || matches!(c.val, Some(pg_query::protobuf::a_const::Val::Sval(_))))
+}
+
+/// The type `transformAExprIn` coerces an IN list's non-Var members to, when
+/// there are more than one of them: `select_common_type` over the left
+/// operand and those members, kept only where it has an array type, so not
+/// for a row, a record or an array (`get_array_type`). `None` -- every
+/// member a plain `=` -- otherwise, and wherever a type cannot be told or
+/// the inputs share no category (`select_common_type` with no context).
+fn in_list_common_type(
+    e: &AExpr,
+    items: &[pg_query::protobuf::Node],
+    row_from: usize,
+) -> Option<String> {
+    let nonvars: Vec<&pg_query::protobuf::Node> = items
+        .iter()
+        .filter(|item| !in_member_has_var(item, row_from))
+        .collect();
+    if nonvars.len() < 2 {
+        return None;
+    }
+    let lexpr = e.lexpr.as_deref()?;
+    let mut typed: Vec<String> = Vec::new();
+    let mut untyped = 0;
+    for n in std::iter::once(lexpr).chain(nonvars.iter().copied()) {
+        if in_member_untyped(n) {
+            untyped += 1;
+            continue;
+        }
+        let t = static_type(n, &Bson::Null);
+        if t.is_empty() || t == "unknown" {
+            return None;
+        }
+        typed.push(t);
+    }
+    // All of exactly one type keep it, a domain included; otherwise each is
+    // read as its base type (`getBaseType`).
+    let common = if untyped == 0 && typed.windows(2).all(|w| w[0] == w[1]) {
+        typed.first()?.clone()
+    } else {
+        let mut out: Option<String> = None;
+        for t in typed {
+            let t = domain_base(t);
+            out = Some(match out {
+                None => t,
+                Some(o) => optype::select_common(&o, &t)?,
+            });
+        }
+        out.unwrap_or_else(|| "text".to_string())
+    };
+    let base = domain_base(common.clone());
+    if base.ends_with("[]")
+        || matches!(base.as_str(), "record" | "unknown")
+        || user_composite(&base).is_some()
+        || pgtypes::oid_of_name(&base).is_none()
+    {
+        return None;
+    }
+    Some(common)
+}
+
 /// Which sides of `x op ANY / ALL (array)` drop their trailing blanks:
 /// `(x, the array's elements)`, given `x`'s type and the array's.
 ///
@@ -17867,10 +17960,17 @@ fn row_column_expr(
             })
             .collect()
     });
+    let param_types = PLAN_PARAM_TYPES.with(|t| {
+        let t = t.borrow();
+        (0..params.len())
+            .map(|i| t.get(i).cloned().flatten())
+            .collect()
+    });
     let mut out = ColumnExpr::Row {
         expr: Box::new(expr.clone()),
         fields: fields.to_vec(),
         params: params_read_by(&expr, params),
+        param_types,
         result_type: String::new(),
         widths,
         scratch: RowScratch::default(),
@@ -18365,6 +18465,7 @@ pub fn apply_row_expr(expr: &ColumnExpr, row: &Document) -> Result<Bson> {
         expr,
         fields,
         params,
+        param_types,
         widths,
         scratch,
         ..
@@ -18390,7 +18491,7 @@ pub fn apply_row_expr(expr: &ColumnExpr, row: &Document) -> Result<Bson> {
     });
     // The declared types are the expression's own, the same for every row:
     // installed from its memo rather than built again (RP-131).
-    let previous = expr_memo::declare_row_fields(&scratch.1, params.len(), fields);
+    let previous = expr_memo::declare_row_fields(&scratch.1, params.len(), param_types, fields);
     let n = params.len();
     let _memo = expr_memo::install(&scratch.1, expr);
     let run = |all: &[Bson]| correlated::with_row_params_from(n, || const_value(expr, all));
@@ -46483,12 +46584,35 @@ fn const_value_node(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result<
                 rexpr: None,
                 location: e.location,
             };
+            // More than one member with no Var in it is one array comparison
+            // over the list's common type (`transformAExprIn`): those members
+            // are coerced to it first, so a `text` one against a `char(n)`
+            // operand is read as `bpchar` (RP-792). The rest, and every
+            // member of a list with one such, are a plain `=` each.
+            let row_from = correlated::row_params_from();
+            let common = expr_memo::in_list_type(e, || in_list_common_type(e, items, row_from));
             for (i, item) in items.iter().enumerate() {
                 if i % 1024 == 1023 {
                     cancel::check()?;
                 }
                 let mut eq = base.clone();
-                eq.rexpr = Some(Box::new(item.clone()));
+                eq.rexpr = Some(Box::new(match common.as_deref() {
+                    Some(t)
+                        if !in_member_has_var(item, row_from)
+                            && (in_member_untyped(item) || static_type(item, &Bson::Null) != t) =>
+                    {
+                        let mut cast = type_name_node(t);
+                        cast.location = -1;
+                        pg_query::protobuf::Node {
+                            node: Some(N::TypeCast(Box::new(pg_query::protobuf::TypeCast {
+                                arg: Some(Box::new(item.clone())),
+                                type_name: Some(cast),
+                                location: -1,
+                            }))),
+                        }
+                    }
+                    _ => item.clone(),
+                }));
                 match const_value(
                     &pg_query::protobuf::Node {
                         node: Some(N::AExpr(Box::new(eq))),

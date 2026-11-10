@@ -547,6 +547,7 @@ fn residual_quals(residual: &secantus_pgplan::ColumnExpr) -> Option<Vec<OpQual>>
         expr,
         fields,
         params,
+        param_types,
         ..
     } = residual
     else {
@@ -607,6 +608,7 @@ fn residual_quals(residual: &secantus_pgplan::ColumnExpr) -> Option<Vec<OpQual>>
             expr: Box::new(other.clone()),
             fields: fields.clone(),
             params: params.clone(),
+            param_types: param_types.clone(),
             result_type: String::new(),
             widths: vec![None; fields.len()],
             scratch: Default::default(),

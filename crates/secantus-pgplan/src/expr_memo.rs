@@ -49,6 +49,10 @@ struct Inner {
     /// operands were found to have an operator (`array_operand_mismatch`
     /// answered nothing).
     operators: HashMap<usize, Option<u64>>,
+    /// An `IN` list, by its `AExpr`'s address: the type its non-Var
+    /// members are coerced to (`in_list_type`), for the resolution epoch it
+    /// was worked out at -- settled once, as `transformAExprIn` does.
+    in_lists: HashMap<usize, Option<(u64, Option<String>)>>,
     /// The parameter types the evaluation declares (the statement's, then
     /// the row's fields), kept to be installed again for the next row.
     declared: Vec<Option<String>>,
@@ -110,6 +114,11 @@ fn collect(node: &pg_query::protobuf::Node, inner: &mut Inner) {
             inner
                 .operators
                 .insert(std::ptr::from_ref::<AExpr>(e) as usize, None);
+            if e.kind == pg_query::protobuf::AExprKind::AexprIn as i32 {
+                inner
+                    .in_lists
+                    .insert(std::ptr::from_ref::<AExpr>(e) as usize, None);
+            }
             kids.extend(e.lexpr.as_deref());
             kids.extend(e.rexpr.as_deref());
         }
@@ -263,6 +272,38 @@ pub(crate) fn null_type(
     Some(t)
 }
 
+/// The type the `IN` list `e` of the expression being evaluated coerces its
+/// non-Var members to: `compute` (`in_list_common_type`) answers it, once
+/// per resolution epoch, so a long list is not typed again for every row
+/// (RP-202's 200,000 members).
+pub(crate) fn in_list_type(e: &AExpr, compute: impl FnOnce() -> Option<String>) -> Option<String> {
+    let addr = std::ptr::from_ref(e) as usize;
+    let epoch = schemas::resolve_epoch();
+    let known = with_current(|m| {
+        let inner =
+            m.0.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        inner.in_lists.get(&addr).cloned()
+    });
+    let Some(known) = known else {
+        return compute();
+    };
+    if let Some((at, t)) = known {
+        if at == epoch {
+            return t;
+        }
+    }
+    let t = compute();
+    with_current(|m| {
+        let mut inner =
+            m.0.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        inner.in_lists.insert(addr, Some((epoch, t.clone())));
+        Some(())
+    });
+    t
+}
+
 /// Whether the operator `e` has none for its operands' types: `check`
 /// (`array_operand_mismatch`) answers it, and an operator of the expression
 /// being evaluated that passed is not asked again at the same epoch -- the
@@ -299,10 +340,13 @@ pub(crate) fn operator_unresolved(
 /// Install `n_params` statement parameter types and `fields`' types after
 /// them as the declared parameter types, from `memo`'s copy when its
 /// statement part still matches; the previous declarations are returned
-/// for [`restore_declared`].
+/// for [`restore_declared`]. A statement parameter the session declares no
+/// type for takes the one `planned` recorded for it while the expression
+/// was planned (a scalar subquery's column type, RP-792).
 pub(crate) fn declare_row_fields(
     memo: &ExprMemo,
     n_params: usize,
+    planned: &[Option<String>],
     fields: &[RowField],
 ) -> Vec<Option<String>> {
     let mut mine = std::mem::take(
@@ -314,11 +358,17 @@ pub(crate) fn declare_row_fields(
     );
     PLAN_PARAM_TYPES.with(|t| {
         let mut current = t.borrow_mut();
+        let statement = |i: usize| {
+            current
+                .get(i)
+                .and_then(Option::as_ref)
+                .or_else(|| planned.get(i).and_then(Option::as_ref))
+        };
         let same = mine.len() == n_params + fields.len()
-            && (0..n_params).all(|i| mine[i].as_ref() == current.get(i).and_then(Option::as_ref));
+            && (0..n_params).all(|i| mine[i].as_ref() == statement(i));
         if !same {
             mine.clear();
-            mine.extend((0..n_params).map(|i| current.get(i).cloned().flatten()));
+            mine.extend((0..n_params).map(|i| statement(i).cloned()));
             mine.extend(fields.iter().map(|(_, _, ty)| Some(ty.clone())));
         }
         std::mem::replace(&mut *current, mine)
