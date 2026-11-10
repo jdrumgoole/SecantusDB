@@ -603,6 +603,7 @@ impl PgHandler {
                                 value: None,
                                 expr: None,
                                 sql: None,
+                                from_domain: false,
                             },
                         ),
                     ));

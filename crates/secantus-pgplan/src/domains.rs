@@ -559,6 +559,7 @@ pub fn inherited_default(
             value: None,
             expr: None,
             sql: None,
+            from_domain: true,
         });
     };
     let raw = parse_default_sql(sql)?;
@@ -571,6 +572,7 @@ pub fn inherited_default(
         value,
         expr,
         sql: ruleutils_default(&raw),
+        from_domain: true,
     })
 }
 

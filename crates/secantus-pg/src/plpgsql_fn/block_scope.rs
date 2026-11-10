@@ -435,6 +435,32 @@ impl Interp<'_> {
         })
     }
 
+    /// `name.field` read as a field of the record variable `name`: its
+    /// datum, when `plpgsql_ns_lookup` finds the record before a block
+    /// labelled `name` that declares `field`. Each level, innermost first,
+    /// is searched for an unqualified `name` that is not a scalar (a scalar
+    /// cannot be qualified, so it is passed over) before the level's own
+    /// label.
+    pub(super) fn qualifying_record(&self, name: &str, field: &str) -> Option<usize> {
+        let is_rec =
+            |d: usize| matches!(self.datums.get(d), Some(Datum::Rec { name: n, .. }) if n == name);
+        let (false, Some(end)) = (self.scopes.is_empty(), self.function_level) else {
+            return self
+                .datums
+                .iter()
+                .rposition(|d| matches!(d, Datum::Rec { name: n, .. } if n == name));
+        };
+        for s in self.active.iter().rev() {
+            if let Some((_, d)) = s.vars.iter().rev().find(|(n, d)| n == name && is_rec(*d)) {
+                return Some(*d);
+            }
+            if s.label.as_deref() == Some(name) && s.vars.iter().any(|(n, _)| n == field) {
+                return None;
+            }
+        }
+        (0..end).rev().find(|d| is_rec(*d))
+    }
+
     /// A bare `name`: the datum of the innermost level being run that
     /// declares it, then of the function's own level (`function_level`), as `plpgsql_ns_lookup` searches outwards
     /// with no qualifier. A variable of a block that has ended is in no

@@ -121,6 +121,7 @@ mod schema_rows;
 mod scram_binding;
 mod serializable;
 mod server;
+mod setop_order;
 mod sql_fn_params;
 mod sql_fn_validator;
 mod ssi;
@@ -31496,6 +31497,13 @@ impl PgHandler {
     /// A `serial` column's default is the `nextval` call rather than the
     /// stored value, because that is what it actually is.
     fn default_expression(c: &Column) -> Bson {
+        // A default the column takes from its domain is the TYPE's
+        // (`pg_type.typdefault`), which an INSERT applies when the column has
+        // none of its own: it is no `pg_attrdef` row, so `atthasdef` is false
+        // and `column_default` NULL (RP-825).
+        if c.extra.get_bool("default_from_domain") == Ok(true) {
+            return Bson::Null;
+        }
         if let Some(seq) = c.sequence.as_deref() {
             // An IDENTITY column has no column default in PostgreSQL: the
             // value comes from the identity machinery, and `column_default`
@@ -38996,28 +39004,93 @@ impl PgHandler {
                 out.extend(left);
                 out.extend(right);
             }
-            secantus_pgplan::SetOpKind::Intersect => {
-                let mut pool = distinct_set::IdentCounts::new();
-                for r in &right {
-                    pool.add(ident(r));
-                }
-                for row in left {
-                    let k = ident(&row);
-                    // ALL pairs each right-side row with one left-side row.
-                    if pool.take(&k, set.all) {
-                        out.push(row);
+            secantus_pgplan::SetOpKind::Intersect | secantus_pgplan::SetOpKind::Except => {
+                // A SetOp returns one row per group, as often as the group
+                // is output: the group's first row from the input the
+                // planner put first when it hashes, the first after its
+                // sort when it sorts (RP-692, `setop_order`).
+                let intersect = matches!(set.kind, secantus_pgplan::SetOpKind::Intersect);
+                let plan = self.setop_plan(set, &schema);
+                let (first, second) = if plan.right_first {
+                    (right, left)
+                } else {
+                    (left, right)
+                };
+                if plan.sorted {
+                    // `set_output_count`, per group of the sorted rows.
+                    let count = |n_left: usize, n_right: usize| match (intersect, set.all) {
+                        (true, true) => n_left.min(n_right),
+                        (true, false) => usize::from(n_left > 0 && n_right > 0),
+                        (false, true) => n_left.saturating_sub(n_right),
+                        (false, false) => usize::from(n_left > 0 && n_right == 0),
+                    };
+                    let mut tagged: Vec<(bool, Vec<Option<Bson>>)> = Vec::new();
+                    tagged.extend(first.into_iter().map(|r| (!plan.right_first, r)));
+                    tagged.extend(second.into_iter().map(|r| (plan.right_first, r)));
+                    // The group's columns ascending, NULLs last: each one's
+                    // default B-tree order.
+                    let mut cmp = |a: &(bool, Vec<Option<Bson>>), b: &(bool, Vec<Option<Bson>>)| {
+                        for i in 0..schema.len() {
+                            let l = a.1.get(i).and_then(|v| v.as_ref());
+                            let r = b.1.get(i).and_then(|v| v.as_ref());
+                            let ord = match (
+                                matches!(l, None | Some(Bson::Null)),
+                                matches!(r, None | Some(Bson::Null)),
+                            ) {
+                                (true, true) => Ordering::Equal,
+                                (true, false) => Ordering::Greater,
+                                (false, true) => Ordering::Less,
+                                (false, false) => compare_values(
+                                    &unpadded(i, l).unwrap_or(Bson::Null),
+                                    &unpadded(i, r).unwrap_or(Bson::Null),
+                                ),
+                            };
+                            if ord != Ordering::Equal {
+                                return ord;
+                            }
+                        }
+                        Ordering::Equal
+                    };
+                    let rows = tuplesort::sort(tagged, None, &mut cmp);
+                    let mut i = 0;
+                    while i < rows.len() {
+                        let k = ident(&rows[i].1);
+                        let mut j = i;
+                        let (mut n_left, mut n_right) = (0usize, 0usize);
+                        while j < rows.len() && (j == i || ident(&rows[j].1) == k) {
+                            if rows[j].0 {
+                                n_left += 1;
+                            } else {
+                                n_right += 1;
+                            }
+                            j += 1;
+                        }
+                        for _ in 0..count(n_left, n_right) {
+                            out.push(rows[i].1.clone());
+                        }
+                        i = j;
                     }
-                }
-            }
-            secantus_pgplan::SetOpKind::Except => {
-                let mut pool = distinct_set::IdentCounts::new();
-                for r in &right {
-                    pool.add(ident(r));
-                }
-                for row in left {
-                    let k = ident(&row);
-                    if !pool.take(&k, set.all) {
-                        out.push(row);
+                } else {
+                    let mut pool = distinct_set::IdentCounts::new();
+                    for r in &second {
+                        pool.add(ident(r));
+                    }
+                    let mut groups = distinct_set::IdentIndex::new();
+                    let mut firsts: Vec<Vec<Option<Bson>>> = Vec::new();
+                    for row in first {
+                        let k = ident(&row);
+                        let group = match groups.find_or_add(k.clone()) {
+                            Ok(g) => g,
+                            Err(g) => {
+                                firsts.push(row);
+                                g
+                            }
+                        };
+                        // ALL pairs each of the second input's rows with one
+                        // of the first's.
+                        if pool.take(&k, set.all) == intersect {
+                            out.push(firsts[group].clone());
+                        }
                     }
                 }
             }

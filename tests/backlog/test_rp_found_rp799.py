@@ -216,8 +216,8 @@ def test_a_retyped_column_takes_the_new_types_collation_and_default(dsn: str) ->
 # A domain's DEFAULT is the type's (`typdefault`), which
 # `build_column_default` falls back to at INSERT; the column has no
 # `pg_attrdef` row of its own. Here the domain's DEFAULT was copied into
-# the column, and listed as its default.
-@pytest.mark.backlog("RP-825")
+# the column, and listed as its default. Fixed by RP-825.
+@pytest.mark.backlog_fixed("RP-825")
 def test_a_domains_default_is_not_its_columns(dsn: str) -> None:
     got = _answers(
         dsn,
@@ -241,6 +241,56 @@ def test_a_domains_default_is_not_its_columns(dsn: str) -> None:
         [(1, 42, 5)],
         [("k", None), ("d", None), ("f", None)],
         [("k", None), ("d", None), ("f", None)],
+        "DROP TABLE",
+    ]
+
+
+# A column's own DEFAULT (`pg_attrdef`) is the one an INSERT takes, and an
+# ALTER DOMAIN does not move it; DROP DEFAULT removes only it, so the
+# domain's DEFAULT applies again, as it stands then. Here SET DEFAULT left
+# the column following the domain (`3` took 9), and DROP DEFAULT left it
+# with none (`4` was NULL). Measured on a private PostgreSQL 15.19 cluster;
+# fixed by RP-825.
+@pytest.mark.backlog_fixed("RP-825")
+def test_a_columns_drop_default_leaves_its_domains(dsn: str) -> None:
+    attrdef = (
+        "select attname, atthasdef, pg_get_expr(adbin, adrelid) from pg_attribute"
+        " left join pg_attrdef on adrelid = attrelid and adnum = attnum"
+        " where attrelid = 't799'::regclass and attnum > 0 order by attnum"
+    )
+    got = _answers(
+        dsn,
+        [
+            "create table t799 (k int, d dx799)",
+            "insert into t799 (k) values (1)",
+            "alter table t799 alter d set default 7",
+            "insert into t799 (k) values (2)",
+            attrdef,
+            "alter domain dx799 set default 9",
+            "insert into t799 (k) values (3)",
+            "alter table t799 alter d drop default",
+            "insert into t799 (k) values (4)",
+            attrdef,
+            "alter domain dx799 set default 11",
+            "insert into t799 (k) values (5)",
+            "select * from t799 order by k",
+            "drop table t799",
+        ],
+    )
+    assert got == [
+        "CREATE TABLE",
+        "INSERT 0 1",
+        "ALTER TABLE",
+        "INSERT 0 1",
+        [("k", False, None), ("d", True, "7")],
+        "ALTER DOMAIN",
+        "INSERT 0 1",
+        "ALTER TABLE",
+        "INSERT 0 1",
+        [("k", False, None), ("d", False, None)],
+        "ALTER DOMAIN",
+        "INSERT 0 1",
+        [(1, 42), (2, 7), (3, 7), (4, 9), (5, 11)],
         "DROP TABLE",
     ]
 

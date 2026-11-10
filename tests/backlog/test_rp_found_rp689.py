@@ -6,7 +6,7 @@ found while working it:
   parse and a row moved into it kept only its first column (RP-689,
   fixed: these are its regression tests beside the gap test in
   `test_rp_found_rp670.py`);
-- reading a field a record does not have is 42P01 (RP-837);
+- reading a field a record does not have was 42P01 (RP-837, fixed);
 - a qualified column reference that a record variable's field shares is
   read as the field, not refused as ambiguous (RP-838).
 
@@ -134,12 +134,42 @@ MISSING_FIELD = {
     ),
     _R % "raise exception '%', r.nosuch;": ("error", "42703", 'record "r" has no field "nosuch"'),
 }
+_NOSUCH = ("error", "42703", 'record "r" has no field "nosuch"')
+_FILLED = "do $$ declare r record; x int; begin select 1 as a into r; %s end $$"
+# The same read in every statement that evaluates an expression, and a
+# record that hides a block labelled with its name: `plpgsql_ns_lookup`
+# searches each level for the unqualified name before the level's label.
+MISSING_FIELD_EVERYWHERE = {
+    _FILLED % "x := r.nosuch;": _NOSUCH,
+    _FILLED % "if r.nosuch then end if;": _NOSUCH,
+    _FILLED % "perform r.nosuch;": _NOSUCH,
+    _FILLED % "select r.nosuch into x;": _NOSUCH,
+    _FILLED % "raise exception '%', (select r.nosuch from (select 1) r);": _NOSUCH,
+    "do $$ <<r>> declare nosuch int := 7; begin declare r record; begin "
+    "select 1 as a into r; raise exception '%', r.nosuch; end; end $$": _NOSUCH,
+    # The field it has is still read, and a label still qualifies when no
+    # record hides it.
+    _FILLED % "raise exception '%', r.a;": _raised("1"),
+    "do $$ <<r>> declare nosuch int := 7; begin raise exception '%', r.nosuch; end $$": (
+        _raised("7")
+    ),
+}
 
 
-@pytest.mark.backlog("RP-837")
+@pytest.mark.backlog_fixed("RP-837")
 @pytest.mark.parametrize("query", list(MISSING_FIELD))
 def test_reading_a_field_a_record_lacks_is_42703(query: str, dsn: str) -> None:
+    """Was: the reference was left in the SQL text, which read it as a
+    column of a FROM item `r`: 42P01 `missing FROM-clause entry for table
+    "r"` (RP-837)."""
     assert _answer(dsn, query) == MISSING_FIELD[query]
+
+
+@pytest.mark.backlog_fixed("RP-837")
+@pytest.mark.parametrize("query", list(MISSING_FIELD_EVERYWHERE))
+def test_a_missing_record_field_is_42703_in_every_statement(query: str, dsn: str) -> None:
+    """Was: 42P01 in each, `7` for the hidden label (RP-837)."""
+    assert _answer(dsn, query) == MISSING_FIELD_EVERYWHERE[query]
 
 
 @pytest.mark.backlog("RP-838")

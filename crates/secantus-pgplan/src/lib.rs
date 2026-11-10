@@ -2393,6 +2393,11 @@ pub enum AlterTableAction {
         /// A folded default's catalog rendering (`(1 + 2)`), when it was
         /// written as an expression.
         sql: Option<String>,
+        /// The default is the column's DOMAIN's (`typdefault`), which an
+        /// INSERT applies when the column has none of its own
+        /// (`build_column_default`): an ALTER DOMAIN moving it, or a DROP
+        /// DEFAULT leaving it. It is no `pg_attrdef` row (RP-825).
+        from_domain: bool,
     },
     /// `SET NOT NULL` / `DROP NOT NULL`.
     SetNotNull {
@@ -8352,6 +8357,27 @@ fn plan_alter_action(
             if_exists: cmd.missing_ok,
         }),
         Ok(AT::AtColumnDefault) => {
+            // `DROP DEFAULT` of a column of a domain removes only the
+            // column's own default: an INSERT then takes the domain's again
+            // (`build_column_default` falls back to `typdefault`), as it
+            // stands now and as a later ALTER DOMAIN moves it (RP-825).
+            if cmd.def.is_none() {
+                let column = def
+                    .column(&cmd.name)
+                    .ok_or_else(|| Error::UndefinedColumn(cmd.name.clone()))?;
+                if let Some(d) = column
+                    .extra
+                    .get_str("domain_type")
+                    .ok()
+                    .and_then(domains::user_domain)
+                {
+                    return domains::inherited_default(
+                        &cmd.name,
+                        &column.pg_type,
+                        d.default_sql.as_deref(),
+                    );
+                }
+            }
             // `DROP DEFAULT` is the same node with no expression.
             let value = match cmd.def.as_ref() {
                 None => None,
@@ -8375,6 +8401,7 @@ fn plan_alter_action(
                 value,
                 expr,
                 sql,
+                from_domain: false,
             })
         }
         Ok(AT::AtSetNotNull) => Ok(AlterTableAction::SetNotNull {
@@ -9566,11 +9593,17 @@ pub fn apply_alter_to_def(def: &mut TableDef, action: &AlterTableAction) {
             value,
             expr,
             sql,
+            from_domain,
         } => {
             if let Some(c) = def.columns.iter_mut().find(|c| c.name == *column) {
                 c.default = value.clone();
                 c.set_default_expr(expr.clone());
                 c.set_default_sql(if value.is_some() { sql.clone() } else { None });
+                if *from_domain {
+                    c.extra.insert("default_from_domain", true);
+                } else {
+                    c.extra.remove("default_from_domain");
+                }
             }
         }
         AlterTableAction::SetNotNull { column, not_null } => {
@@ -11819,15 +11852,32 @@ fn expand_table_like(
         let o = like.options;
         let mut parts: Vec<String> = Vec::new();
         for col in &def.columns {
-            let mut sql = format!(
-                "{} {}",
-                q(&col.name),
-                scalar::format_type_text(&col.pg_type, (col.typmod >= 0).then_some(col.typmod))
-            );
+            // `transformTableLikeClause` copies `atttypid`, so a column of a
+            // domain stays one of it -- its CHECK and NOT NULL, its DEFAULT
+            // (the type's), its `domain_name` -- rather than becoming one of
+            // the domain's base type (RP-839). The domain carries its own
+            // modifier.
+            let domain = col
+                .extra
+                .get_str("domain_type")
+                .ok()
+                .and_then(domains::user_domain);
+            let ty = match &domain {
+                Some(d) => quote_type_path(&d.name),
+                None => {
+                    scalar::format_type_text(&col.pg_type, (col.typmod >= 0).then_some(col.typmod))
+                }
+            };
+            let mut sql = format!("{} {ty}", q(&col.name));
             if !col.nullable {
                 sql.push_str(" NOT NULL");
             }
-            if o & DEFAULTS != 0 {
+            // A default the column follows from its domain is the type's
+            // (`typdefault`), no `pg_attrdef` row: INCLUDING DEFAULTS has
+            // nothing of the column's to copy, and the copy, a column of the
+            // same domain, follows it as this one does.
+            let own_default = col.extra.get_bool("default_from_domain") != Ok(true);
+            if o & DEFAULTS != 0 && own_default {
                 // The expression default's SQL, else the stored value as a
                 // literal of the column's type.
                 let literal = col.default.as_ref().filter(|v| **v != Bson::Null).map(|v| {
@@ -14411,13 +14461,26 @@ fn plan_window_frame(
 }
 
 /// A windowed select list: output columns, their per-column expressions, the
-/// window items themselves, and the synthetic columns their values land in.
+/// window items themselves, the synthetic columns their values land in, and
+/// how many computed window keys were named (the next one's number).
 type WindowTargets = (
     Vec<(String, String)>,
     Vec<Option<ColumnExpr>>,
     Vec<WindowItem>,
     Vec<Column>,
+    usize,
 );
+
+/// The named windows of a select's WINDOW clause, in its order.
+fn named_windows(s: &pg_query::protobuf::SelectStmt) -> Vec<pg_query::protobuf::WindowDef> {
+    s.window_clause
+        .iter()
+        .filter_map(|n| match n.node.as_ref() {
+            Some(N::WindowDef(w)) => Some((**w).clone()),
+            _ => None,
+        })
+        .collect()
+}
 
 /// Plan the select list of a query carrying window functions.
 ///
@@ -14430,14 +14493,7 @@ fn plan_window_targets(
     def: &TableDef,
     params: &[Bson],
 ) -> Result<WindowTargets> {
-    let named: Vec<pg_query::protobuf::WindowDef> = s
-        .window_clause
-        .iter()
-        .filter_map(|n| match n.node.as_ref() {
-            Some(N::WindowDef(w)) => Some((**w).clone()),
-            _ => None,
-        })
-        .collect();
+    let named = named_windows(s);
     let mut columns = Vec::new();
     let mut casts = Vec::new();
     let mut windows: Vec<WindowItem> = Vec::new();
@@ -14493,7 +14549,7 @@ fn plan_window_targets(
         columns.push((out, field));
         casts.push(None);
     }
-    Ok((columns, casts, windows, extra))
+    Ok((columns, casts, windows, extra, keys))
 }
 
 /// One window call, planned into `windows` and `extra`; answers the synthetic
@@ -14609,6 +14665,44 @@ fn plan_window_call(
     Ok(field)
 }
 
+/// Plan each window call inside `val` as its own window, and replace it in
+/// the expression by a reference to the field its value lands in.
+#[allow(clippy::too_many_arguments)]
+fn replace_window_calls(
+    val: &mut pg_query::protobuf::Node,
+    named: &[pg_query::protobuf::WindowDef],
+    def: &TableDef,
+    params: &[Bson],
+    keys: &mut usize,
+    windows: &mut Vec<WindowItem>,
+    extra: &mut Vec<Column>,
+) -> Result<()> {
+    let mut failure: Option<Error> = None;
+    walk_expr(val, &mut |n| {
+        if failure.is_some() {
+            return Ok(());
+        }
+        if let Some(N::FuncCall(f)) = n.node.as_ref() {
+            if f.over.is_some() {
+                match plan_window_call(f, named, def, params, keys, windows, extra) {
+                    Ok(field) => {
+                        n.node = Some(N::ColumnRef(pg_query::protobuf::ColumnRef {
+                            fields: vec![string_node(&field)],
+                            location: -1,
+                        }));
+                    }
+                    Err(e) => failure = Some(e),
+                }
+            }
+        }
+        Ok(())
+    })?;
+    match failure {
+        Some(e) => Err(e),
+        None => Ok(()),
+    }
+}
+
 /// A target that HOLDS window calls inside an expression -- `v::numeric /
 /// sum(v) over ()`. Each call is planned as its own window, replaced in the
 /// expression by a reference to the field it lands in, and the expression is
@@ -14633,29 +14727,7 @@ fn plan_nested_windows(
     } else {
         rt.name.clone()
     };
-    let mut failure: Option<Error> = None;
-    walk_expr(&mut val, &mut |n| {
-        if failure.is_some() {
-            return Ok(());
-        }
-        if let Some(N::FuncCall(f)) = n.node.as_ref() {
-            if f.over.is_some() {
-                match plan_window_call(f, named, def, params, keys, windows, extra) {
-                    Ok(field) => {
-                        n.node = Some(N::ColumnRef(pg_query::protobuf::ColumnRef {
-                            fields: vec![string_node(&field)],
-                            location: -1,
-                        }));
-                    }
-                    Err(e) => failure = Some(e),
-                }
-            }
-        }
-        Ok(())
-    })?;
-    if let Some(e) = failure {
-        return Err(e);
-    }
+    replace_window_calls(&mut val, named, def, params, keys, windows, extra)?;
     let mut extended = def.clone();
     extended.columns.extend(extra.iter().cloned());
     let target = pg_query::protobuf::Node {
@@ -27748,14 +27820,13 @@ fn plan_select_rest(
     // Window functions project into synthetic `__winN` fields, which are
     // appended to the def so the row schema and every later lookup resolve
     // them exactly like a stored column.
-    let (columns, casts, windows, extra) = if has_window(s) {
-        let (c, k, w, e) = plan_window_targets(s, &def, params)?;
-        (c, k, w, e)
+    let (columns, casts, mut windows, extra, mut window_keys) = if has_window(s) {
+        plan_window_targets(s, &def, params)?
     } else {
         let (c, k) = plan_table_targets(&s.target_list, &def, params)?;
-        (c, k, Vec::new(), Vec::new())
+        (c, k, Vec::new(), Vec::new(), 0)
     };
-    let def = if extra.is_empty() {
+    let mut def = if extra.is_empty() {
         def
     } else {
         let mut d = def;
@@ -27814,6 +27885,56 @@ fn plan_select_rest(
                     None => def
                         .field_of(&col)
                         .ok_or_else(|| Error::UndefinedColumn(col.clone()))?,
+                }
+            }
+            // A key holding a window call. One written exactly as a target
+            // IS that target (`findTargetlistEntrySQL99` matches by
+            // `equal()`), sorted as its position would be; any other is a
+            // resjunk target of its own, whose window calls are computed
+            // beside the select list's (RP-761).
+            Some(_) if node_has_window(sb.node.as_deref()) => {
+                let node = sb.node.as_deref().expect("matched Some");
+                let plain: Vec<&pg_query::protobuf::Node> = s
+                    .target_list
+                    .iter()
+                    .filter_map(|t| match t.node.as_ref() {
+                        Some(N::ResTarget(rt)) => rt.val.as_deref(),
+                        _ => None,
+                    })
+                    .collect();
+                let matched = (plain.len() == columns.len())
+                    .then(|| plain.iter().position(|v| same_expression(v, node)))
+                    .flatten();
+                if let Some(i) = matched {
+                    columns[i].1.clone()
+                } else {
+                    let mut key = node.clone();
+                    let mut added = Vec::new();
+                    replace_window_calls(
+                        &mut key,
+                        &named_windows(s),
+                        &def,
+                        params,
+                        &mut window_keys,
+                        &mut windows,
+                        &mut added,
+                    )?;
+                    def.columns.extend(added);
+                    let fields: Vec<RowField> = def
+                        .columns
+                        .iter()
+                        .chain(def.system_columns.iter())
+                        .map(|c| {
+                            note_bpchar_width(c);
+                            (c.name.clone(), c.field(), c.pg_type.clone())
+                        })
+                        .collect();
+                    let mut sample = Document::new();
+                    for c in &def.columns {
+                        sample.insert(c.field(), sample_value_for_type(&c.pg_type));
+                    }
+                    order_exprs.push(row_column_expr(&key, &fields, params, &sample)?);
+                    format!("__order{}", order_exprs.len() - 1)
                 }
             }
             // A COMPUTED sort key (`order by n * -1`, `order by upper(a)`).

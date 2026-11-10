@@ -1602,6 +1602,53 @@ impl Interp<'_> {
                             );
                             e.from_sql = true;
                             return Err(e);
+                        } else if let Some(d) = self
+                            .qualifying_record(&name, &field)
+                            .filter(|_| !matches!(tok(i + 3), Some(".") | Some("(")))
+                        {
+                            // `r.f` is a RECFIELD datum (`plpgsql_parse_dblword`
+                            // builds one for any field name), and
+                            // `exec_eval_datum` looks the field up in the
+                            // record's row type: a name it lacks is 42703,
+                            // never a column of a FROM item `r` (RP-837).
+                            match self.datums.get(d) {
+                                Some(Datum::Rec { rec: Some(r), .. })
+                                    if r.get(&field).is_some() =>
+                                {
+                                    let (v, ty) = r.get(&field).expect("checked");
+                                    bound = Some((v.clone(), ty.to_string(), i + 2));
+                                }
+                                Some(Datum::Rec {
+                                    rec: None,
+                                    row_type: Some(rt),
+                                    ..
+                                }) if rt.columns.iter().any(|(n, _)| *n == field) => {
+                                    let (_, ty) = rt
+                                        .columns
+                                        .iter()
+                                        .find(|(n, _)| *n == field)
+                                        .expect("checked");
+                                    bound = Some((Bson::Null, ty.clone(), i + 2));
+                                }
+                                Some(Datum::Rec {
+                                    rec: Some(_),
+                                    name: rec_name,
+                                    ..
+                                })
+                                | Some(Datum::Rec {
+                                    row_type: Some(_),
+                                    name: rec_name,
+                                    ..
+                                }) => {
+                                    let mut e = PlError::new(
+                                        "42703",
+                                        format!("record \"{rec_name}\" has no field \"{field}\""),
+                                    );
+                                    e.from_sql = true;
+                                    return Err(e);
+                                }
+                                _ => {}
+                            }
                         } else if !matches!(tok(i + 3), Some(".") | Some("(")) {
                             // `blk.x`: a variable of a block (or FOR loop)
                             // labelled `blk`, innermost first; then `fname.p`,

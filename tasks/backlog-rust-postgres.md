@@ -405,6 +405,21 @@ one beside it.
   shows without a check. A third the same morning: the user-code test
   at 0.33 s against 0.25 s on RM snapshot PR #2601 (job 129641495115),
   whose change (RM-385, MongoDB statement statistics) reaches no PG path.
+  **Fourth, traced (2026-11-10):** the user-code test at 0.37 s on PG
+  snapshot PR #2655 (`cd41d329`, job 130097550779). The trace shows no
+  stretch without a check on the statement's own thread. Instead the
+  statement's first parse ran 0.5 s (about 70 ms elsewhere) beside two
+  parse threads earlier statements had abandoned, and after the cancel
+  (+0.507) a privilege pre-pass that swallowed the cut-short parse
+  started a SECOND parse thread (+0.526, which took 100 ms to start);
+  the 57014 left at +0.866. Each abandoned thread parses to the end and
+  then frees its 200,000-item tree (113 to 144 ms here). Fixed in part:
+  `cancel::interruptible` now answers a pending cancel before starting
+  any work, as PostgreSQL's next CHECK_FOR_INTERRUPTS would, so no parse
+  starts after the cancel (unit test `cancel::tests::a_pending_cancel_starts_no_work`).
+  What remains is the CPU the parse threads abandoned BEFORE the cancel
+  take until they finish, since libpg_query cannot be stopped mid-parse.
+  Left open as a watch item until the lane stays green.
   Backlog-ID: RP-571
   Verify: none -- intermittent, Linux CI only, not reproduced on macOS; RP-002's two regression tests are the check, and print the cancel trace on a miss
 - [ ] **OPEN -- `gate_pg.sh`'s login step differs from the local reference
@@ -2450,16 +2465,6 @@ Measured on a private PostgreSQL 15.19 cluster with the `_SETUP` in
       blanks ignored), which reaches the storage keys: more than one PR.
       Verify: tests/backlog/test_rp_found_rp672.py::test_create_table_as_of_an_unsized_bpchar_keeps_its_blanks
       Backlog-ID: RP-693
-- [ ] **INTERSECT keeps the left side's value, not the smaller input's.**
-      PostgreSQL 15.19 plans an INTERSECT with the input it estimates
-      smaller first (`generate_nonunion_paths`), and a group's value is the
-      one that input gave: `select a from t672c intersect select
-      'xy'::text` is `xy`, unpadded, as the one-row constant is estimated
-      smaller than the unanalysed table (1850 rows). Here the left side's
-      row is always the one returned, `xy ` with its blank. Over equal
-      estimates (two VALUES lists) the left side comes first, as here.
-      Verify: tests/backlog/test_rp_found_rp672.py::test_intersect_keeps_the_smaller_inputs_value
-      Backlog-ID: RP-692
 
 ## Found while working RP-665 (2026-11-10)
 
@@ -3298,28 +3303,6 @@ Measured on PostgreSQL 15.19 (the shared reference on port 5415).
       Verify: tests/backlog/test_rp_found_rp698.py::test_an_outer_column_in_a_set_operations_order_by
       Backlog-ID: RP-767
 
-## Found while working RP-754 (2026-11-10)
-
-Measured on PostgreSQL 15.19 (the shared reference on port 5415): every
-statement is VALUES-only and runs there as written. The gap tests are in
-`tests/backlog/test_rp_found_rp754.py`. The type-order rewrite
-(`enum_order.rs`, `rewrite`) reads an ORDER BY key with `sort_by` only,
-never with `expr` as it reads the select list.
-
-- [ ] **A window call in an ORDER BY key is 0A000.** `select max(x::text)
-      over (order by x) from (values (1), (2)) s(x) order by max(x::text)
-      over (order by x) desc` is `2`, `1` on PostgreSQL 15.19, and the same
-      with `sum(x) over (order by x) + 1` `4`, `2`; here each is 0A000
-      `function max(text) is not supported yet` (`sum(integer)`): the key is
-      evaluated per row as a scalar call. `select max(x) over (order by x)
-      from (values ('10.0.0.1'::inet), ('9.0.0.0'::inet)) s(x) order by 1
-      desc` is refused the same way, since the network rewrite copies a
-      positional key's target into the sort (since RP-754 a target whose
-      value needs no key stays positional, so `(max(x) over (...))::text
-      ... order by 1` is answered).
-      Verify: tests/backlog/test_rp_found_rp754.py::test_a_window_call_in_an_order_by_key
-      Backlog-ID: RP-761
-
 ## Found while working RP-756 (2026-11-10)
 
 Measured on PostgreSQL 15.19 (the shared reference on port 5415): every
@@ -3526,15 +3509,6 @@ holds for a column CREATE TABLE declares and, since RP-799, for one ADD
 COLUMN adds, and since RP-834 for one ALTER COLUMN TYPE retypes into a
 domain.
 
-- [ ] **A domain's DEFAULT is listed as its column's default.** `create
-      table t (d dx)` has no `pg_attrdef` row on PostgreSQL 15.19, and
-      `information_schema.columns.column_default` is NULL: the domain's
-      DEFAULT is the type's (`pg_type.typdefault`), applied at INSERT by
-      `build_column_default`, not copied into the column. Here
-      `pg_get_expr(adbin, adrelid)` and `column_default` are `42`, as
-      `tag_domain_column` stores the domain's default in the column.
-      Verify: tests/backlog/test_rp_found_rp799.py::test_a_domains_default_is_not_its_columns
-      Backlog-ID: RP-825
 - [ ] **`information_schema.columns.data_type` of a domain over a domain
       names its base.** A column of `dx2` is `USER-DEFINED` on PostgreSQL
       15.19 -- the view reads the domain's immediate base type, itself a
@@ -3565,16 +3539,6 @@ Measured on a private, freshly initdb'd PostgreSQL 15.19 cluster with the
 `_SETUP` in `tests/backlog/test_rp_found_rp689.py`: `t689(a d689, v
 varchar(3), w dv689, c char(3))`, `d689` an `int` with `check (value > 0)`.
 
-- [ ] **Reading a field a record lacks is 42P01.** `do $$ declare r record;
-      begin select 1 as a into r; raise exception '%', r.nosuch; end $$` is
-      42703 `record "r" has no field "nosuch"` on PostgreSQL 15.19
-      (`exec_eval_datum` over the RECFIELD), and so is the same read of a
-      variable of a row type, assigned or not. Here the reference is left
-      in the SQL text, which reads it as a column of a FROM item `r`: 42P01
-      `missing FROM-clause entry for table "r"`. (An assignment to such a
-      field is 42703 already.)
-      Verify: tests/backlog/test_rp_found_rp689.py::test_reading_a_field_a_record_lacks_is_42703
-      Backlog-ID: RP-837
 - [ ] **A column a record variable's field shares is not ambiguous.** With
       `declare r t689`, `(select r.a from t689 r)` is 42702 `column
       reference "r.a" is ambiguous` on PostgreSQL 15.19
@@ -3587,3 +3551,101 @@ varchar(3), w dv689, c char(3))`, `d689` an `int` with `check (value > 0)`.
       `plpgsql_fn.rs` says so), a bare column name included.
       Verify: tests/backlog/test_rp_found_rp689.py::test_a_column_a_record_field_shares_is_ambiguous
       Backlog-ID: RP-838
+
+## Found while working RP-761 (2026-11-10)
+
+Measured on a private, freshly initdb'd PostgreSQL 15.19 cluster with the
+`_SETUP` in `tests/backlog/test_rp_found_rp761.py`: `t761(x int)`.
+
+- [ ] **EXPLAIN prints a computed sort key by its synthetic field.**
+      `explain (costs off) select x from t761 order by x + 1` prints `Sort
+      Key: ((x + 1))` on PostgreSQL 15.19, and a key that is a window
+      target `Sort Key: (sum(x) OVER (?)) DESC`; here the first is `Sort
+      Key: __order0` (the planner's field for a computed key) and the
+      second `Sort Key: sum DESC` (the target's output name). The Sort's
+      key wants deparsing as ruleutils does it (`deparse_expression` with
+      the plan's tlist), not the field it is computed into.
+      Verify: tests/backlog/test_rp_found_rp761.py::test_explain_prints_a_computed_sort_key_as_its_expression
+      Backlog-ID: RP-840
+
+## Found while working RP-839 (2026-11-10)
+
+Measured on a private, freshly initdb'd PostgreSQL 15.19 cluster with the
+`_SETUP` in `tests/backlog/test_rp_found_rp839.py`: `"Mx839"` a domain over
+`int` with `not null check (value > 0)`, `t839(x text collate "C", y text,
+m "Mx839")` and `z839(o char(4) default 'ab', v varchar(3) default 'q')`.
+
+- [ ] **A column `LIKE` copies drops the column's collation.** `create
+      table l839 (like t839)` makes `x` a column collated "C" on PostgreSQL
+      15.19 (`transformTableLikeClause` copies `attcollation` with the
+      type), and `information_schema.columns.collation_name` is `C`. Here
+      the copy takes its type's default collation: `attcollation` is
+      "default" and `collation_name` NULL, so the copy sorts and compares
+      by a different collation than the column it was copied from.
+      `expand_table_like` (`crates/secantus-pgplan/src/lib.rs`) renders
+      each column by its type alone.
+      Verify: tests/backlog/test_rp_found_rp839.py::test_a_like_copy_keeps_a_columns_collation
+      Backlog-ID: RP-844
+- [ ] **A domain whose name needs quotes is named bare in its errors.** An
+      INSERT of NULL into a column of `"Mx839"` is 23502 `domain "Mx839"
+      does not allow null values` on PostgreSQL 15.19, and a value its
+      CHECK refuses is 23514 `value for domain "Mx839" violates check
+      constraint "Mx839_check"`: `domain_check_input` names the domain by
+      `format_type_be`, which quotes a name as `quote_identifier` does.
+      Here both print `Mx839` without the quotes, as does `select
+      null::"Mx839"`.
+      Verify: tests/backlog/test_rp_found_rp839.py::test_a_domain_error_quotes_a_name_that_needs_it
+      Backlog-ID: RP-845
+- [ ] **A `char(n)` column's DEFAULT prints its cast as `::character`.**
+      `information_schema.columns.column_default` and `pg_get_expr(adbin,
+      adrelid)` of `o char(4) default 'ab'` are `'ab'::bpchar` on
+      PostgreSQL 15.19 (`get_const_expr` prints the folded constant's
+      type by `format_type_with_typemod` with no modifier, `bpchar`); here
+      they are `'ab'::character`. A `varchar(3)` column's `'q'::character
+      varying` already agrees.
+      Verify: tests/backlog/test_rp_found_rp839.py::test_a_char_columns_default_casts_to_bpchar
+      Backlog-ID: RP-846
+
+## Found while working RP-692 (2026-11-10)
+
+Measured on a private, freshly initdb'd PostgreSQL 15.19 cluster with the
+`_SETUP` in `tests/backlog/test_rp_found_rp692.py`: `t692j(x numeric, k
+int)` holding `(1.0, 1)`, and an empty `t692e(x numeric, k int)`. Since
+RP-692 an INTERSECT or EXCEPT runs the plan PostgreSQL makes for it
+(`setop_order.rs`): the input with fewer estimated groups first, hashed or
+sorted as `choose_hashed_setop` prices them, each group's row the first
+its first input gave.
+
+- [ ] **An INTERSECT over an input this server does not estimate keeps its
+      left input first.** `select a.x from t692j a join t692j b on a.k =
+      b.k intersect select 1.000` is `1.000` on PostgreSQL 15.19: the
+      join's estimated groups outnumber the constant's one, so the constant
+      is the HashSetOp's first input. Here it is `1.0`, the left input's:
+      `setop_input_estimate` estimates a constant, a VALUES list, one user
+      table's stored columns through a WHERE the selectivity model covers,
+      and a nested set operation, and leaves any other input -- a join, an
+      aggregate or GROUP BY, a DISTINCT, a computed column, a FROM
+      subquery other than VALUES, a catalog -- in the written order,
+      hashed.
+      Verify: tests/backlog/test_rp_found_rp692.py::test_an_intersect_over_a_join_puts_the_smaller_input_first
+      Backlog-ID: RP-841
+- [ ] **A hashed INTERSECT or EXCEPT returns its groups in its first
+      input's order.** PostgreSQL 15.19's HashSetOp returns them in its
+      hash table's order (`setop_retrieve_hash_table`): `select x, y from
+      (values (1.0, true), (1.00, false), (1.000, true)) v(x, y) intersect
+      select x, y from (values (1, true), (1, false)) w(x, y)` is `(1, f),
+      (1, t)` there and `(1, t), (1, f)` here. The HashAggregate's order is
+      modelled already (`hashagg::hash_agg_order`: the tuple hash and
+      simplehash's placement); a sorted SetOp's order is since RP-692.
+      Verify: tests/backlog/test_rp_found_rp692.py::test_a_hashed_set_operation_returns_its_groups_in_hash_order
+      Backlog-ID: RP-842
+- [ ] **A numeric constant selected from a FROM item is refused by
+      INSERT.** `insert into t692e select 1.0, g from generate_series(1, 2)
+      g`, the same over `(values (3)) v(g)`, and `insert into t692e (x)
+      select 1.5 from t692j` insert their rows on PostgreSQL 15.19. Here
+      each is 42804 `column "x" is of type numeric but expression is of
+      type text`, though `insert into t692e select 1.0, 1`, with no FROM,
+      is inserted: the select list's constant over a FROM item is typed
+      `text`.
+      Verify: tests/backlog/test_rp_found_rp692.py::test_a_numeric_constant_selected_from_a_from_item_is_inserted
+      Backlog-ID: RP-843
