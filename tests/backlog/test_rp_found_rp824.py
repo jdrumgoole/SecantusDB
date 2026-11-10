@@ -1,6 +1,6 @@
 """Gap test of the divergence found while working RP-824 (a column retyped
 off its domain is no longer one of it): a column retyped INTO a domain with
-USING is not one of the domain either.
+USING was not one of the domain either (RP-834, fixed).
 
 The expected answers were measured on a private, freshly initdb'd
 PostgreSQL 15.19 cluster with `_SETUP`, which the test runs after.
@@ -43,10 +43,10 @@ def _answer(c: psycopg.Connection, sql: str) -> object:
 # of it as CREATE TABLE declares one: the domain's DEFAULT fills an INSERT
 # that names no value for it, `information_schema` reads the domain's base
 # as `data_type` and names the domain, and the domain cannot be dropped.
-# Here the column is stored under the domain's name with no domain tag, so
-# its DEFAULT is NULL, `data_type` is `USER-DEFINED`, and the domain whose
-# column was retyped from int names no domain at all.
-@pytest.mark.backlog("RP-834")
+# The column was stored under the domain's name with no domain tag, so its
+# DEFAULT was NULL, `data_type` was `USER-DEFINED`, and the column retyped
+# from int named no domain at all. Fixed by RP-834.
+@pytest.mark.backlog_fixed("RP-834")
 def test_a_column_retyped_into_a_domain_is_one_of_it(dsn: str) -> None:
     with psycopg.connect(dsn, autocommit=True) as c:
         for q in _SETUP:

@@ -30533,6 +30533,7 @@ impl PgHandler {
                 column,
                 pg_type,
                 using: Some(sql),
+                domain,
                 ..
             } => {
                 // `USING <expr>`: the new value is the expression over the row
@@ -30544,7 +30545,10 @@ impl PgHandler {
                 // Over the row as it was: the column still has its OLD type.
                 let expr = secantus_pgplan::plan_check_expression(sql, before)
                     .map_err(|e| Self::err(&e))?;
-                let ty = pg_type.clone();
+                // Into a domain, the value is coerced to the domain, which
+                // checks its constraints (`CoerceToDomain`) and leaves the
+                // base type's value (RP-834).
+                let ty = Self::alter_type_target(pg_type, domain.as_deref());
                 let tz = self.session_timezone();
                 self.rewrite_rows_heap(table, def, move |d| {
                     let v = secantus_pgplan::apply_row_expr(&expr, d).map_err(|e| Self::err(&e))?;
@@ -30560,13 +30564,16 @@ impl PgHandler {
                 .map_err(|e| Self::unique_rebuild_error(e, def))
             }
             A::AlterType {
-                column, pg_type, ..
+                column,
+                pg_type,
+                domain,
+                ..
             } => {
                 let field = def
                     .column(column)
                     .map(|c| c.field())
                     .unwrap_or_else(|| column.clone());
-                let ty = pg_type.clone();
+                let ty = Self::alter_type_target(pg_type, domain.as_deref());
                 let tz = self.session_timezone();
                 // A change between binary-coercible types (`varchar` and
                 // `text`) is a catalog change only; any other rewrites the
@@ -30695,6 +30702,17 @@ impl PgHandler {
             }
             A::SetDefault { .. } | A::SetNotNull { .. } => Ok(()),
         }
+    }
+
+    /// The type an `ALTER COLUMN TYPE` coerces each stored value to: the
+    /// domain when the new type is one (`domain`, the template column
+    /// `domain_column` made), so its constraints are checked, else the new
+    /// type itself.
+    fn alter_type_target(pg_type: &str, domain: Option<&secantus_pgcatalog::Column>) -> String {
+        domain
+            .and_then(|c| c.extra.get_str("domain_type").ok())
+            .unwrap_or(pg_type)
+            .to_string()
     }
 
     /// Read every row of a table, transform it, and write the table back.
