@@ -401,12 +401,17 @@ fn merge_runs(
 
 /// `MergeableSorter::_mergeSpills`: merge the runs `parallel` at a time
 /// until no more than `target` are left, each merge written as a new run.
+/// `limit`: a top-k sorter's, which its merge iterator stops at, so each
+/// merged run holds no more than that many (mongod 8.2.11: a limit of 50
+/// over seven runs of 43 writes merged runs of 50, 50, 50, 42, then 50, 50;
+/// RM-399).
 fn merge_spills(
     runs: Vec<Run>,
     target: usize,
     parallel: usize,
     cmp: &dyn Fn(&[Bson], &[Bson]) -> Ordering,
     sizing: &Sizing,
+    limit: Option<usize>,
 ) -> R<Vec<Run>> {
     let target = target.max(1);
     let mut runs = runs;
@@ -420,6 +425,9 @@ fn merge_spills(
                 merged.push(item);
                 Ok(())
             })?;
+            if let Some(k) = limit {
+                merged.truncate(k);
+            }
             next.push(write_run(merged.into_iter(), sizing)?);
         }
         runs = next;
@@ -427,9 +435,234 @@ fn merge_spills(
     Ok(runs)
 }
 
+/// mongod 8.2's `TopKSorter` (`sorter_template_defs.h`): a sort that keeps
+/// only its first `k`, held to its budget as [`blocking_sort`]'s is, spilling
+/// what it holds as a sorted run whenever it passes it (RM-399).
+///
+/// It adds each document while it holds fewer than `k`, counting its bytes
+/// as sorted, and once it holds `k` keeps them as a heap, a better document
+/// replacing the worst (its bytes then count in memory, not as sorted). At
+/// each spill it moves a cutoff from what the runs so far hold -- the worst
+/// key it has kept once `k` were kept at or above it, or the median of a
+/// spill once `k` were kept at or below that -- and turns away any document
+/// not better than it. Its merges stop each merged run at `k`.
+///
+/// Measured against mongod 8.2.11 over 300 documents of {_id, k, s: 1000
+/// x's, n}, sorted both ways over `n` in and out of input order, limits 2 to
+/// 250, under a 50000-byte budget: every spill, record and byte matched.
+struct TopK<'a> {
+    k: usize,
+    cmp: &'a dyn Fn(&[Bson], &[Bson]) -> Ordering,
+    sizing: &'a Sizing<'a>,
+    effective: usize,
+    iterators: usize,
+    parallel: usize,
+    /// What it holds, with what each counts; a heap of the worst first once
+    /// it holds `k`.
+    data: Vec<(Held, usize)>,
+    used: usize,
+    runs: Vec<Run>,
+    cutoff: Option<Vec<Bson>>,
+    worst_seen: Option<Vec<Bson>>,
+    worst_count: usize,
+    last_median: Option<Vec<Bson>>,
+    median_count: usize,
+    /// Bytes counted as sorted: those of each document added while it held
+    /// fewer than `k`.
+    sorted: usize,
+    /// What it held at each spill while taking its input (SBE's count).
+    spilled: usize,
+}
+
+impl<'a> TopK<'a> {
+    fn new(
+        k: usize,
+        cmp: &'a dyn Fn(&[Bson], &[Bson]) -> Ordering,
+        sizing: &'a Sizing<'a>,
+        effective: usize,
+        iterators: usize,
+        parallel: usize,
+    ) -> Self {
+        TopK {
+            k,
+            cmp,
+            sizing,
+            effective,
+            iterators,
+            parallel,
+            data: Vec::new(),
+            used: 0,
+            runs: Vec::new(),
+            cutoff: None,
+            worst_seen: None,
+            worst_count: 0,
+            last_median: None,
+            median_count: 0,
+            sorted: 0,
+            spilled: 0,
+        }
+    }
+
+    /// mongod's `less` on keys alone.
+    fn less(&self, a: &[Bson], b: &[Bson]) -> bool {
+        (self.cmp)(a, b) == Ordering::Less
+    }
+
+    /// The order the heap keeps: by key, then by arrival, so equal keys
+    /// answer in the order they came, as the whole sort's do.
+    fn later(&self, a: &Held, b: &Held) -> bool {
+        (self.cmp)(&a.0, &b.0).then(a.2.cmp(&b.2)) == Ordering::Greater
+    }
+
+    fn sift_down(&mut self, mut i: usize) {
+        let n = self.data.len();
+        loop {
+            let (l, r) = (2 * i + 1, 2 * i + 2);
+            let mut m = i;
+            if l < n && self.later(&self.data[l].0, &self.data[m].0) {
+                m = l;
+            }
+            if r < n && self.later(&self.data[r].0, &self.data[m].0) {
+                m = r;
+            }
+            if m == i {
+                return;
+            }
+            self.data.swap(i, m);
+            i = m;
+        }
+    }
+
+    fn add(&mut self, item: Held, size: usize) -> R<()> {
+        if self.data.len() < self.k {
+            if self.cutoff.as_ref().is_some_and(|c| !self.less(&item.0, c)) {
+                return Ok(());
+            }
+            self.data.push((item, size));
+            self.used += size;
+            self.sorted += size;
+            if self.data.len() == self.k {
+                for i in (0..self.k / 2).rev() {
+                    self.sift_down(i);
+                }
+            }
+        } else {
+            if !self.less(&item.0, &self.data[0].0 .0) {
+                return Ok(());
+            }
+            self.used = self.used + size - self.data[0].1;
+            self.data[0] = (item, size);
+            self.sift_down(0);
+        }
+        if self.used > self.effective {
+            self.spilled += self.used;
+            self.spill()?;
+        }
+        Ok(())
+    }
+
+    fn sort(&mut self) {
+        let cmp = self.cmp;
+        self.data
+            .sort_by(|(a, _), (b, _)| cmp(&a.0, &b.0).then(a.2.cmp(&b.2)));
+    }
+
+    /// `TopKSorter::updateCutoff`, over what it holds, sorted.
+    fn update_cutoff(&mut self) {
+        let Some(((worst, _, _), _)) = self.data.last() else {
+            return;
+        };
+        if self.worst_count == 0
+            || self
+                .worst_seen
+                .as_ref()
+                .is_some_and(|w| self.less(w, worst))
+        {
+            self.worst_seen = Some(worst.clone());
+        }
+        if self.median_count == 0 {
+            self.last_median = Some(self.data[self.data.len() / 2].0 .0.clone());
+        }
+        self.worst_count += self.data.len();
+        let median = self.last_median.as_ref().expect("a median");
+        self.median_count += self
+            .data
+            .iter()
+            .take_while(|((k, _, _), _)| !self.less(median, k))
+            .count();
+        if self.worst_count >= self.k {
+            let w = self.worst_seen.as_ref().expect("a worst");
+            if self.cutoff.as_ref().is_none_or(|c| self.less(w, c)) {
+                self.cutoff = self.worst_seen.clone();
+            }
+            self.worst_count = 0;
+        }
+        if self.median_count >= self.k {
+            let m = self.last_median.as_ref().expect("a median");
+            if self.cutoff.as_ref().is_none_or(|c| self.less(m, c)) {
+                self.cutoff = self.last_median.clone();
+            }
+            self.median_count = 0;
+        }
+    }
+
+    fn spill(&mut self) -> R<()> {
+        if self.data.is_empty() {
+            return Ok(());
+        }
+        if !memlimit::disk_allowed() {
+            return Err(refused(self.sizing.budget));
+        }
+        self.sort();
+        self.update_cutoff();
+        let held = std::mem::take(&mut self.data);
+        self.runs
+            .push(write_run(held.into_iter().map(|(h, _)| h), self.sizing)?);
+        self.used = 0;
+        if self.runs.len() >= self.iterators {
+            let all = std::mem::take(&mut self.runs);
+            self.runs = merge_spills(
+                all,
+                self.iterators / 2,
+                self.parallel,
+                self.cmp,
+                self.sizing,
+                Some(self.k),
+            )?;
+        }
+        Ok(())
+    }
+
+    fn done(mut self) -> R<Vec<Held>> {
+        if self.runs.is_empty() {
+            self.sort();
+            return Ok(self.data.into_iter().map(|(h, _)| h).collect());
+        }
+        self.spill()?;
+        let runs = std::mem::take(&mut self.runs);
+        let runs = merge_spills(
+            runs,
+            self.parallel,
+            self.parallel,
+            self.cmp,
+            self.sizing,
+            Some(self.k),
+        )?;
+        let mut out = Vec::with_capacity(self.k);
+        merge_runs(&runs, self.sizing.source, self.cmp, |item| {
+            if out.len() < self.k {
+                out.push(item);
+            }
+            Ok(())
+        })?;
+        Ok(out)
+    }
+}
+
 /// Sort `items` by `cmp` (stable), held to `sizing.budget`: spilled to disk
 /// when the command allows it, refused (292) when it does not. `limit`: a
-/// `$limit` mongod folds into the sort, which then keeps only that many.
+/// `$limit` mongod folds into the sort, which then keeps only that many, as
+/// its top-k sorter ([`TopK`]) does.
 pub fn blocking_sort(
     items: Vec<(Vec<Bson>, Document)>,
     cmp: &dyn Fn(&[Bson], &[Bson]) -> Ordering,
@@ -458,24 +691,34 @@ pub fn blocking_sort(
         }
     };
 
-    if let Some(k) = limit {
-        // mongod's top-k sorter keeps only the k first; a limit of one never
-        // goes near its budget. Its sorter for a limit of one (sorter.cpp's
-        // `LimitOneSorter`) counts the keys it saw but no bytes: mongod
-        // 8.2.11 reports `totalDataSizeSorted: 0` for it (RM-374).
-        let mut items: Vec<Held> = items.collect();
-        items.sort_by(|a, b| cmp(&a.0, &b.0));
-        items.truncate(k);
-        let held: usize = items.iter().map(size).sum();
-        record(if k == 1 || sbe { 0 } else { held });
-        if k > 1 && held > effective && !memlimit::disk_allowed() {
-            return Err(refused(budget));
-        }
-        return Ok(unheld(items));
-    }
-
     let iterators = (reserve / sizing.source.file_iterator()).max(1);
     let parallel = (budget / SORTED_FILE_BUFFER).max(2);
+
+    match limit {
+        Some(k) if k <= 1 => {
+            // A limit of one never goes near its budget. Its sorter
+            // (sorter.cpp's `LimitOneSorter`) counts the keys it saw but no
+            // bytes: mongod 8.2.11 reports `totalDataSizeSorted: 0` for it
+            // (RM-374).
+            let mut items: Vec<Held> = items.collect();
+            items.sort_by(|a, b| cmp(&a.0, &b.0));
+            items.truncate(k);
+            record(0);
+            return Ok(unheld(items));
+        }
+        Some(k) => {
+            let mut top = TopK::new(k, cmp, sizing, effective, iterators, parallel);
+            for item in items {
+                crate::deadline::check()?;
+                let s = size(&item);
+                top.add(item, s)?;
+            }
+            record(if sbe { top.spilled } else { top.sorted });
+            return top.done().map(unheld);
+        }
+        None => {}
+    }
+
     let mut held: Vec<Held> = Vec::new();
     let mut runs: Vec<Run> = Vec::new();
     let mut used = 0usize;
@@ -492,7 +735,7 @@ pub fn blocking_sort(
         runs.push(write_run(std::mem::take(held).into_iter(), sizing)?);
         if runs.len() >= iterators {
             let all = std::mem::take(runs);
-            *runs = merge_spills(all, iterators / 2, parallel, cmp, sizing)?;
+            *runs = merge_spills(all, iterators / 2, parallel, cmp, sizing, None)?;
         }
         Ok(())
     };
@@ -514,7 +757,7 @@ pub fn blocking_sort(
         return Ok(unheld(held));
     }
     spill(&mut held, &mut runs)?;
-    let runs = merge_spills(runs, parallel, parallel, cmp, sizing)?;
+    let runs = merge_spills(runs, parallel, parallel, cmp, sizing, None)?;
     let mut out = Vec::with_capacity(n as usize);
     merge_runs(&runs, sizing.source, cmp, |(k, d, _)| {
         out.push((k, d));
@@ -793,6 +1036,73 @@ mod tests {
         let (two, bytes) = sorted(2);
         assert_eq!(two, vec![0, 3]);
         assert!(bytes > 0);
+    }
+
+    #[test]
+    fn a_sort_with_a_limit_spills_as_mongods_top_k_sorter_does() {
+        // mongod 8.2.11, `[{$sort: {n: way}}, {$limit: k}, {$addFields: ...}]`
+        // over 300 documents of {_id, k, s: 1000 x's, n} under a 50000-byte
+        // budget, `n` read in order (`i`) or not (`37 i mod 300`): the
+        // profile's `sortSpills`, `sortSpilledRecords` and
+        // `sortTotalDataSizeBytes` (RM-399).
+        let sizing = Sizing {
+            source: SortSource::QueryLayer,
+            fields: None,
+            added: None,
+            budget: 50_000,
+        };
+        let counted = |shuffled: bool, way: i32, k: usize| {
+            let docs = (0..300)
+                .map(|i| {
+                    let n = if shuffled { (i * 37) % 300 } else { i };
+                    let d = doc! { "_id": i, "k": i % 7, "s": "x".repeat(1000), "n": n };
+                    (vec![Bson::Int32(n)], d)
+                })
+                .collect();
+            let by = |a: &[Bson], b: &[Bson]| {
+                let c = crate::order::cmp(&a[0], &b[0]);
+                if way < 0 {
+                    c.reverse()
+                } else {
+                    c
+                }
+            };
+            let (out, report) = memlimit::captured(|| blocking_sort(docs, &by, &sizing, Some(k)));
+            let out = out.unwrap();
+            // It answers the first k, whatever it spilled.
+            let mut want: Vec<i32> = (0..300).collect();
+            if way < 0 {
+                want.reverse();
+            }
+            let got: Vec<i32> = out.iter().map(|(_, d)| d.get_i32("n").unwrap()).collect();
+            assert_eq!(got, want[..k], "{shuffled} {way} {k}");
+            (
+                report.sort_spills,
+                report.sort_spilled_records,
+                report.sort_total_data_size,
+            )
+        };
+        // Each document better than the last: no cutoff turns any away, and
+        // the merges stop each run at the limit.
+        assert_eq!(counted(false, -1, 50), (13, 592, 320_400));
+        assert_eq!(counted(false, -1, 100), (13, 800, 320_400));
+        assert_eq!(counted(false, -1, 200), (13, 900, 320_400));
+        // Each worse: the cutoff turns the rest away after two runs.
+        assert_eq!(counted(false, 1, 50), (2, 86, 91_848));
+        assert_eq!(counted(false, 1, 200), (10, 645, 229_620));
+        // Out of order, the median of a run becomes the cutoff too.
+        assert_eq!(counted(true, 1, 50), (10, 439, 225_348));
+        assert_eq!(counted(true, -1, 50), (11, 460, 232_824));
+        assert_eq!(counted(true, -1, 100), (13, 711, 278_748));
+        assert_eq!(counted(true, 1, 200), (13, 897, 319_332));
+        // Held in memory it counts the k it added first, the documents that
+        // replaced them in the heap not (mongod: 32040 for a limit of 30).
+        assert_eq!(counted(false, -1, 30), (0, 0, 32_040));
+        // Past the budget without disk use it is refused.
+        let _off = memlimit::allow_disk_use(false);
+        let docs = items(300, 1000);
+        let e = blocking_sort(docs, &cmp, &sizing, Some(50)).unwrap_err();
+        assert_eq!(e.as_mongo().map(|(code, _)| code), Some(292));
     }
 
     #[test]

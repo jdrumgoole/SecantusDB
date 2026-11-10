@@ -308,9 +308,9 @@ def _top_k(client: Any) -> dict:
     )
 
 
-@pytest.mark.backlog("RM-399")
+@pytest.mark.backlog_fixed("RM-399")
 def test_top_k_sort_spills(rust_mongo: Any, mongod: Any) -> None:
-    """mongod 8.2.11's sort with a limit over its budget spills: 13 runs,
+    """mongod 8.2.11's sort with a limit over its budget spilled: 13 runs,
     900 records for a limit of 200 over 300 documents, and 592 records for a
     limit of 50 it moved past an `$addFields`."""
     assert _top_k(rust_mongo) == _top_k(mongod)

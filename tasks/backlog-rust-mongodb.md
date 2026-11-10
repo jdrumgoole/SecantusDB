@@ -1216,16 +1216,6 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       same runs in 928800 (1032). Found 2026-11-10 (RM-398).
       Verify: tests/backlog/test_rm_326_sort_counts.py::test_sbe_sort_spilled_bytes
       Backlog-ID: RM-506
-- [ ] **A sort with a limit spills as mongod's top-k sorter does not.**
-      Over its budget mongod 8.2.11 spills a sort with a limit
-      (`TopKSorter`): `[$sort, {$limit: 200}, $addFields]` over 300 1-KB
-      documents spills 13 runs of 900 records under a 50000-byte budget,
-      where this server's limited sort spills nothing. A `$limit` mongod
-      moves into the sort past an `$addFields` (`extractLimitForPushdown`)
-      is not taken in here, so that sort spills as a whole sort would: 900
-      records where mongod's spill 592.
-      Backlog-ID: RM-399
-      Verify: tests/backlog/test_rm_326_sort_counts.py::test_top_k_sort_spills
 - [ ] **A sort on a descending or tied key spills a file of another
       size.** Over 300 1-KB documents under a 50000-byte budget, macOS
       mongod 8.2.11 stores 54562 bytes for the 13 spills of `{n: -1}`,
