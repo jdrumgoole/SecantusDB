@@ -3618,16 +3618,6 @@ its first input gave.
       hashed.
       Verify: tests/backlog/test_rp_found_rp692.py::test_an_intersect_over_a_join_puts_the_smaller_input_first
       Backlog-ID: RP-841
-- [ ] **A hashed INTERSECT or EXCEPT returns its groups in its first
-      input's order.** PostgreSQL 15.19's HashSetOp returns them in its
-      hash table's order (`setop_retrieve_hash_table`): `select x, y from
-      (values (1.0, true), (1.00, false), (1.000, true)) v(x, y) intersect
-      select x, y from (values (1, true), (1, false)) w(x, y)` is `(1, f),
-      (1, t)` there and `(1, t), (1, f)` here. The HashAggregate's order is
-      modelled already (`hashagg::hash_agg_order`: the tuple hash and
-      simplehash's placement); a sorted SetOp's order is since RP-692.
-      Verify: tests/backlog/test_rp_found_rp692.py::test_a_hashed_set_operation_returns_its_groups_in_hash_order
-      Backlog-ID: RP-842
 - [ ] **A numeric constant selected from a FROM item is refused by
       INSERT.** `insert into t692e select 1.0, g from generate_series(1, 2)
       g`, the same over `(values (3)) v(g)`, and `insert into t692e (x)
