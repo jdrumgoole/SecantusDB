@@ -3384,25 +3384,6 @@ statement is VALUES-only and runs there as written.
       Verify: tests/backlog/test_rp_found_rp756.py::test_a_set_operation_from_subquerys_column_is_typed
       Backlog-ID: RP-765
 
-## Found while working RP-766 (2026-11-10)
-
-Measured on a private PostgreSQL 15.19 cluster with `create type e766 as
-enum ('z', 'a', 'm')` and `create table t766 (m e766)` holding `m`, `z`,
-`a`. The gap test is in `tests/backlog/test_rp_found_rp766.py`.
-
-- [ ] **An enum column read through a subquery or a CTE sorts and compares
-      by its labels' text.** `select m::text as v from (select m from t766)
-      q order by m` is `z`, `a`, `m` on PostgreSQL 15.19, in declaration
-      order; here it is `a`, `m`, `z`. `select *` in the subquery, a CTE,
-      and a `WHERE m > 'z'` over the subquery's column (no rows here, `a`
-      and `m` on PostgreSQL) go the same way, as does an outer subquery
-      over a VALUES list's enum column. The type-order rewrite types a
-      derived relation's column only from a cast written in it
-      (`derived_def` in `secantus-pgplan/src/enum_order.rs`), not from the
-      column a target names in the derived query's own FROM.
-      Verify: tests/backlog/test_rp_found_rp766.py::test_a_derived_enum_column_sorts_by_declaration
-      Backlog-ID: RP-768
-
 ## Found while working RP-661 (2026-11-10)
 
 Measured on a private PostgreSQL 15.19 cluster with `create domain d as
@@ -3420,3 +3401,21 @@ text` and `create table t (a d, b text)`. The gap test is in
       domain oid, where `DefineDomain` copies the base type's collation.
       Verify: tests/backlog/test_rp_found_rp661.py::test_a_view_of_a_text_domain_column, tests/backlog/test_rp_found_rp661.py::test_a_text_domain_has_the_default_collation
       Backlog-ID: RP-769
+
+## Found while working RP-768 (2026-11-10)
+
+Measured on a private PostgreSQL 15.19 cluster with `create table ja768 (i
+int, x int)` and `create table jb768 (i int, y int)`, each holding `(1,
+...)` and `(2, ...)`. The gap test is in
+`tests/backlog/test_rp_found_rp768.py`.
+
+- [ ] **A column alias list over a FROM subquery's joined `*` is refused
+      unless only its first column is read.** `select t from (select *
+      from ja768 join jb768 on ja768.i = jb768.i) q(p, r, s, t)` is `100`,
+      `200` on PostgreSQL 15.19; here it is 42601 `table "q" has 1 columns
+      available but 4 columns specified`. So are `select r ...`, `order by
+      t` and `where t > 100`; `select p ...`, `select * ...` and `select t
+      ... order by p` answer. Whatever counts the subquery's columns for
+      the alias list sees one where the join's `*` gives four.
+      Verify: tests/backlog/test_rp_found_rp768.py::test_an_alias_list_over_a_joined_star
+      Backlog-ID: RP-773

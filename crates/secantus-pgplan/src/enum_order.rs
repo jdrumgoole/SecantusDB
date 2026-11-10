@@ -56,7 +56,7 @@ fn scope(
                 };
                 out.push((
                     alias.aliasname.clone(),
-                    derived_def(&alias.aliasname, q, &alias.colnames),
+                    derived_def(&alias.aliasname, q, &alias.colnames, lookup),
                 ));
             }
             Some(N::JoinExpr(j)) => {
@@ -72,84 +72,287 @@ fn scope(
     }
 }
 
+/// The WITH items `with` puts in scope, each a derived relation, in
+/// order: a later item sees the earlier ones, and a RECURSIVE item's own
+/// name inside it is the item itself, whose columns are not known here.
+fn with_scope(
+    with: Option<&pg_query::protobuf::WithClause>,
+    lookup: &dyn Fn(&str) -> Option<TableDef>,
+) -> Vec<(String, TableDef)> {
+    let mut out: Vec<(String, TableDef)> = Vec::new();
+    let Some(w) = with else {
+        return out;
+    };
+    for c in &w.ctes {
+        let Some(N::CommonTableExpr(cte)) = c.node.as_ref() else {
+            continue;
+        };
+        let Some(N::SelectStmt(q)) = cte.ctequery.as_deref().and_then(|n| n.node.as_ref()) else {
+            continue;
+        };
+        let def = {
+            let earlier = |n: &str| {
+                if w.recursive && n == cte.ctename {
+                    return None;
+                }
+                out.iter()
+                    .rev()
+                    .find(|(c, _)| c == n)
+                    .map(|(_, d)| d.clone())
+                    .or_else(|| lookup(n))
+            };
+            derived_def(&cte.ctename, q, &cte.aliascolnames, &earlier)
+        };
+        out.push((cte.ctename.clone(), def));
+    }
+    out
+}
+
+/// The column a reference names among `scope`'s FROM items: a qualified
+/// one in the item of that name, a bare one in the only item that has it.
+fn scope_column<'a>(
+    scope: &'a [(String, TableDef)],
+    c: &pg_query::protobuf::ColumnRef,
+) -> Option<&'a Column> {
+    let parts: Vec<&str> = c
+        .fields
+        .iter()
+        .filter_map(|f| match f.node.as_ref() {
+            Some(N::String(s)) => Some(s.sval.as_str()),
+            _ => None,
+        })
+        .collect();
+    if parts.len() != c.fields.len() {
+        return None;
+    }
+    match parts.as_slice() {
+        [q, col] | [_, q, col] => scope
+            .iter()
+            .find(|(n, _)| n == q)
+            .and_then(|(_, def)| def.column(col)),
+        [col] => {
+            let hits: Vec<&Column> = scope
+                .iter()
+                .filter_map(|(_, def)| def.column(col))
+                .collect();
+            match hits.as_slice() {
+                [one] => Some(*one),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+/// One output column of a derived relation's leg (or VALUES row): its
+/// expression, its name, and the FROM item's column it passes through
+/// when it is a bare reference to one.
+struct LegColumn {
+    expr: Option<pg_query::protobuf::Node>,
+    name: String,
+    column: Option<Column>,
+}
+
+/// Every leg's (or VALUES row's) output columns, by position, with the
+/// leg's own WITH and the enclosing ones in scope.
+fn legs(
+    q: &pg_query::protobuf::SelectStmt,
+    lookup: &dyn Fn(&str) -> Option<TableDef>,
+    out: &mut Vec<Vec<LegColumn>>,
+) {
+    let ctes = with_scope(q.with_clause.as_ref(), lookup);
+    let inner = |n: &str| {
+        ctes.iter()
+            .find(|(c, _)| c == n)
+            .map(|(_, d)| d.clone())
+            .or_else(|| lookup(n))
+    };
+    if q.op != pg_query::protobuf::SetOperation::SetopNone as i32 {
+        for side in [q.larg.as_deref(), q.rarg.as_deref()].into_iter().flatten() {
+            legs(side, &inner, out);
+        }
+        return;
+    }
+    if !q.values_lists.is_empty() {
+        for vl in &q.values_lists {
+            if let Some(N::List(l)) = vl.node.as_ref() {
+                out.push(
+                    l.items
+                        .iter()
+                        .enumerate()
+                        .map(|(i, e)| LegColumn {
+                            expr: Some(e.clone()),
+                            name: format!("column{}", i + 1),
+                            column: None,
+                        })
+                        .collect(),
+                );
+            }
+        }
+        return;
+    }
+    let mut from = Vec::new();
+    scope(&q.from_clause, &inner, &mut from);
+    // A join that merges columns (USING, NATURAL) or renames them behind an
+    // alias: a `*` over it is not the sides' columns in order.
+    fn merges(n: &pg_query::protobuf::Node) -> bool {
+        match n.node.as_ref() {
+            Some(N::JoinExpr(j)) => {
+                j.is_natural
+                    || !j.using_clause.is_empty()
+                    || j.alias.is_some()
+                    || j.larg.as_deref().is_some_and(merges)
+                    || j.rarg.as_deref().is_some_and(merges)
+            }
+            _ => false,
+        }
+    }
+    let starable = q.from_clause.iter().all(|f| {
+        !merges(f)
+            && matches!(
+                f.node.as_ref(),
+                Some(N::RangeVar(_) | N::RangeSubselect(_) | N::JoinExpr(_))
+            )
+    }) && from.len() == q.from_clause.iter().map(count_items).sum::<usize>();
+    fn count_items(n: &pg_query::protobuf::Node) -> usize {
+        match n.node.as_ref() {
+            Some(N::JoinExpr(j)) => {
+                j.larg.as_deref().map_or(0, count_items) + j.rarg.as_deref().map_or(0, count_items)
+            }
+            _ => 1,
+        }
+    }
+    let passed = |c: &Column, name: &str| {
+        let mut col = Column::new(name, &c.pg_type, false);
+        for key in ["enum_type", "collation"] {
+            if let Ok(v) = c.extra.get_str(key) {
+                col.extra.insert(key, v.to_string());
+            }
+        }
+        col
+    };
+    let mut leg = Vec::new();
+    for t in &q.target_list {
+        let Some(N::ResTarget(rt)) = t.node.as_ref() else {
+            continue;
+        };
+        let Some(val) = rt.val.as_deref() else {
+            continue;
+        };
+        if let Some(N::ColumnRef(c)) = val.node.as_ref() {
+            if matches!(
+                c.fields.last().and_then(|f| f.node.as_ref()),
+                Some(N::AStar(_))
+            ) {
+                // `*` / `q.*`: the FROM items' columns, each passed through.
+                let items: Vec<&(String, TableDef)> = match &c.fields[..c.fields.len() - 1] {
+                    [] => from.iter().collect(),
+                    [q] => match q.node.as_ref() {
+                        Some(N::String(s)) => from.iter().filter(|(n, _)| *n == s.sval).collect(),
+                        _ => Vec::new(),
+                    },
+                    _ => Vec::new(),
+                };
+                if !starable || items.is_empty() {
+                    // Columns this does not know: no leg of it is typed, as
+                    // before.
+                    out.push(
+                        q.target_list
+                            .iter()
+                            .filter_map(|t| match t.node.as_ref() {
+                                Some(N::ResTarget(rt)) => Some(LegColumn {
+                                    expr: rt.val.as_deref().cloned(),
+                                    name: if rt.name.is_empty() {
+                                        rt.val
+                                            .as_deref()
+                                            .map(expression_column_name)
+                                            .unwrap_or_default()
+                                    } else {
+                                        rt.name.clone()
+                                    },
+                                    column: None,
+                                }),
+                                _ => None,
+                            })
+                            .collect(),
+                    );
+                    return;
+                }
+                for (_, def) in items {
+                    for col in &def.columns {
+                        leg.push(LegColumn {
+                            expr: None,
+                            name: col.name.clone(),
+                            column: Some(passed(col, &col.name)),
+                        });
+                    }
+                }
+                continue;
+            }
+        }
+        let name = if rt.name.is_empty() {
+            expression_column_name(val)
+        } else {
+            rt.name.clone()
+        };
+        let column = match val.node.as_ref() {
+            Some(N::ColumnRef(c)) => scope_column(&from, c).map(|col| passed(col, &name)),
+            _ => None,
+        };
+        leg.push(LegColumn {
+            expr: Some(val.clone()),
+            name,
+            column,
+        });
+    }
+    out.push(leg);
+}
+
 /// A derived relation's columns: named by `colnames` (an alias list), else
-/// by its first leg's targets (`columnN` for VALUES). A column is `text`
-/// here -- the rewriter reads only its collation -- carrying the collation
-/// an explicit `COLLATE` in any row or leg gives it.
+/// by its first leg's targets (`columnN` for VALUES). A column a leg passes
+/// through from its own FROM keeps that column's type and collation, as
+/// PostgreSQL's Var does (`exprType`, `exprCollation`), so an enum read
+/// through a subquery or a WITH still sorts by declaration (RP-768);
+/// anything else is `text` here -- the rewriter reads only its collation
+/// -- carrying the collation an explicit `COLLATE` in any row or leg gives
+/// it.
 fn derived_def(
     name: &str,
     q: &pg_query::protobuf::SelectStmt,
     colnames: &[pg_query::protobuf::Node],
+    lookup: &dyn Fn(&str) -> Option<TableDef>,
 ) -> TableDef {
-    fn first_leg(q: &pg_query::protobuf::SelectStmt) -> &pg_query::protobuf::SelectStmt {
-        match q.larg.as_deref() {
-            Some(l) if q.op != pg_query::protobuf::SetOperation::SetopNone as i32 => first_leg(l),
-            _ => q,
-        }
-    }
-    // Every leg's (or row's) expressions, by position.
-    fn rows(q: &pg_query::protobuf::SelectStmt, out: &mut Vec<Vec<pg_query::protobuf::Node>>) {
-        if q.op != pg_query::protobuf::SetOperation::SetopNone as i32 {
-            for side in [q.larg.as_deref(), q.rarg.as_deref()].into_iter().flatten() {
-                rows(side, out);
-            }
-            return;
-        }
-        if !q.values_lists.is_empty() {
-            for vl in &q.values_lists {
-                if let Some(N::List(l)) = vl.node.as_ref() {
-                    out.push(l.items.clone());
-                }
-            }
-            return;
-        }
-        out.push(
-            q.target_list
-                .iter()
-                .filter_map(|t| match t.node.as_ref() {
-                    Some(N::ResTarget(rt)) => rt.val.as_deref().cloned(),
-                    _ => None,
-                })
-                .collect(),
-        );
-    }
-    let first = first_leg(q);
-    let mut names: Vec<String> = if !first.values_lists.is_empty() {
-        let width = match first.values_lists.first().and_then(|v| v.node.as_ref()) {
-            Some(N::List(l)) => l.items.len(),
-            _ => 0,
-        };
-        (1..=width).map(|i| format!("column{i}")).collect()
-    } else {
-        first
-            .target_list
-            .iter()
-            .filter_map(|t| match t.node.as_ref() {
-                Some(N::ResTarget(rt)) => Some(if rt.name.is_empty() {
-                    rt.val
-                        .as_deref()
-                        .map(expression_column_name)
-                        .unwrap_or_default()
-                } else {
-                    rt.name.clone()
-                }),
-                _ => None,
-            })
-            .collect()
-    };
+    let mut all = Vec::new();
+    legs(q, lookup, &mut all);
+    let mut names: Vec<String> = all
+        .first()
+        .map(|leg| leg.iter().map(|c| c.name.clone()).collect())
+        .unwrap_or_default();
     for (i, n) in colnames.iter().enumerate() {
         if let (Some(N::String(s)), Some(slot)) = (n.node.as_ref(), names.get_mut(i)) {
             *slot = s.sval.clone();
         }
     }
-    let mut all = Vec::new();
-    rows(q, &mut all);
+    fn expr_at(r: &[LegColumn], i: usize) -> Option<&pg_query::protobuf::Node> {
+        r.get(i).and_then(|c| c.expr.as_ref())
+    }
     let columns = names
         .iter()
         .enumerate()
         .map(|(i, n)| {
-            let mut c = Column::new(n, "text", false);
-            let collation = all.iter().find_map(|r| match r.get(i)?.node.as_ref() {
+            // The first leg that passes a FROM item's column through types
+            // it: `select_common_type` resolves the other legs' unknown
+            // literals to that type.
+            let mut c = all
+                .iter()
+                .find_map(|r| r.get(i)?.column.as_ref())
+                .map(|col| {
+                    let mut col = col.clone();
+                    col.name = n.clone();
+                    col
+                })
+                .unwrap_or_else(|| Column::new(n, "text", false));
+            let collation = all.iter().find_map(|r| match expr_at(r, i)?.node.as_ref() {
                 Some(N::CollateClause(cc)) => Some(crate::collation::clause_name(cc)),
                 _ => None,
             });
@@ -159,7 +362,7 @@ fn derived_def(
             // A range, multirange, `"char"` or citext column: a row casting
             // to one types it, so ORDER BY sorts it by `__range_sortkey` and
             // a citext compares as citext (RP-182).
-            let ranged = all.iter().find_map(|r| match r.get(i)?.node.as_ref() {
+            let ranged = all.iter().find_map(|r| match expr_at(r, i)?.node.as_ref() {
                 Some(N::TypeCast(tc)) => {
                     let t = type_name_of(tc.type_name.as_ref()?);
                     let scalar = tc.type_name.as_ref()?.array_bounds.is_empty();
@@ -187,7 +390,7 @@ fn derived_def(
             // `btoidvectorcmp` (RP-611).
             if let Some(t) = all
                 .iter()
-                .find_map(|r| oidvector_type(r.get(i)?, &|_| None))
+                .find_map(|r| oidvector_type(expr_at(r, i)?, &|_| None))
             {
                 c.pg_type = t.to_string();
             }
@@ -537,33 +740,7 @@ impl Rewriter<'_> {
 
     /// The column `c` names in scope, when it names exactly one.
     fn column_of(&self, c: &pg_query::protobuf::ColumnRef) -> Option<&Column> {
-        let parts: Vec<&str> = c
-            .fields
-            .iter()
-            .filter_map(|f| match f.node.as_ref() {
-                Some(N::String(s)) => Some(s.sval.as_str()),
-                _ => None,
-            })
-            .collect();
-        match parts.as_slice() {
-            [q, col] | [_, q, col] => self
-                .scope
-                .iter()
-                .find(|(n, _)| n == q)
-                .and_then(|(_, def)| def.column(col)),
-            [col] => {
-                let hits: Vec<&Column> = self
-                    .scope
-                    .iter()
-                    .filter_map(|(_, def)| def.column(col))
-                    .collect();
-                match hits.as_slice() {
-                    [one] => Some(*one),
-                    _ => None,
-                }
-            }
-            _ => None,
-        }
+        scope_column(self.scope, c)
     }
 
     /// The LOCALE collation (one that orders differently from bytes) a
@@ -2134,21 +2311,7 @@ pub(crate) fn rewrite(
     lookup: &dyn Fn(&str) -> Option<TableDef>,
 ) -> Result<Option<pg_query::protobuf::SelectStmt>> {
     // A CTE is a derived relation too, and shadows a table of its name.
-    let ctes: Vec<(String, TableDef)> = s
-        .with_clause
-        .iter()
-        .flat_map(|w| &w.ctes)
-        .filter_map(|c| match c.node.as_ref() {
-            Some(N::CommonTableExpr(cte)) => match cte.ctequery.as_deref()?.node.as_ref() {
-                Some(N::SelectStmt(q)) => Some((
-                    cte.ctename.clone(),
-                    derived_def(&cte.ctename, q, &cte.aliascolnames),
-                )),
-                _ => None,
-            },
-            _ => None,
-        })
-        .collect();
+    let ctes = with_scope(s.with_clause.as_ref(), lookup);
     let with_ctes = |name: &str| {
         ctes.iter()
             .find(|(n, _)| n == name)
