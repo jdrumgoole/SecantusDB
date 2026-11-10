@@ -837,12 +837,6 @@ These are explicit non-goals. Don't add them without a reason.
       while working RM-378, 2026-11-09.
       Verify: tests/backlog/test_rm_rename_errors.py::test_renaming_system_views_is_a_write_to_it
       Backlog-ID: RM-482
-- [ ] **A `distinct` of a view says nothing of its planning.** mongod
-      8.2.1's line for a `distinct` of a view carries `planningTimeMicros`,
-      as one of a collection does; this server's has none. Found while
-      working RM-362, 2026-11-07.
-      Backlog-ID: RM-381
-      Verify: tests/backlog/test_rm_view_lines.py::test_a_distinct_of_a_view_says_how_long_it_planned
 - [ ] **A read of a view refused before it resolves the view resolves it
       anyway.** mongod 8.2.11 refuses a `find` of a view whose projection
       does not parse (`{a: {$bogusop: 1}}`), and an `explain` of a `find`
@@ -905,6 +899,26 @@ These are explicit non-goals. Don't add them without a reason.
       `failed` and `total`. Found while working RM-380, 2026-11-10.
       Verify: tests/backlog/test_rm_view_namespaces.py::test_a_command_metric_counts_rejections
       Backlog-ID: RM-491
+- [ ] **A `distinct` of a view counts nothing it examined.** mongod 8.2.11
+      runs it as an aggregation over the collection beneath the view, and
+      its line counts what that plan examined (`keysExamined: 11,
+      docsExamined: 11, cursorExhausted: true` over an `IXSCAN { x: 1 }`),
+      as an `aggregate` of the view's does here; this server reads the
+      view's documents another way (`aggregate::collection_documents`) and
+      prints none of the three. Since RM-381 it plans that read, for the
+      `planningTimeMicros`, without running it. Found while working
+      RM-381, 2026-11-10.
+      Verify: tests/backlog/test_rm_view_lines.py::test_a_distinct_of_a_view_counts_what_it_examined
+      Backlog-ID: RM-493
+- [ ] **A `count` or `aggregate` of a view names a COLLSCAN beneath it.**
+      Over a view `{$match: {x: {$gte: 1}}}` on a collection indexed on
+      `x`, mongod 8.2.11's line for a `count_documents({})` names
+      `COUNT_SCAN { x: 1 }` (`docsExamined: 0`) and for a `$group` names
+      `IXSCAN { x: 1 }`; this server's name `COLLSCAN`, while counting 11
+      keys and 11 documents examined. Its explain of such a `count` is
+      RM-072. Found while working RM-381, 2026-11-10.
+      Verify: tests/backlog/test_rm_view_lines.py::test_a_count_and_an_aggregate_of_a_view_name_the_plan_beneath
+      Backlog-ID: RM-494
 - [ ] **A `Slow query` line takes a command's string argument for its
       collection.** mongod 8.2.11's lines for a `validate: "c"`, a
       `dataSize: "<db>.c"` and a `getLog` name `<db>.$cmd`; this server's
