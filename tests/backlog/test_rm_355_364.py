@@ -975,13 +975,18 @@ def test_an_aggregate_or_an_insert_has_no_execution_stats(rust_mongo: Any, mongo
 
 
 @pytest.mark.backlog_fixed("RM-360")
-def test_a_line_counts_its_interrupt_checks(rust_mongo: Any, mongod_rs: Any) -> None:
+def test_a_line_counts_its_interrupt_checks(rust_mongo: Any, steady_mongod: Any) -> None:
     """mongod 8.2.11's line for a command carries `numInterruptChecks`,
     how many times it checked whether it had been killed (5 for a `find`
     of ten documents through an index, measured 2026-10-27). This server's
     had none; it now checks where mongod does, and counts
-    (`tests/mongod_live/test_interrupt_checks.py`)."""
-    got = _both(rust_mongo, mongod_rs, lambda d: list(d.c.find({"x": {"$gt": 1}})))
+    (`tests/mongod_live/test_interrupt_checks.py`).
+
+    Each yield adds two checks (5, 9, 15, 27 for 0, 2, 5, 11 yields,
+    measured 2026-11-10), and load decides whether a timed one comes: an RM
+    gate saw mongod count 7. Both servers run with timed yields off."""
+    with no_timed_yields(rust_mongo):
+        got = _both(rust_mongo, steady_mongod, lambda d: list(d.c.find({"x": {"$gt": 1}})))
     answers = {s: _line(lines, "find").get("numInterruptChecks") for s, (lines, _) in got.items()}
     assert answers["mongod"] is not None
     assert answers["rust"] == answers["mongod"]
