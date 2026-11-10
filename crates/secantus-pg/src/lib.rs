@@ -2510,9 +2510,17 @@ impl plpgsql_fn::Host for PlHost<'_> {
             .map_err(|e| pl_error(&e))
     }
 
-    fn notice(&self, severity: &str, sqlstate: &str, message: String) {
+    fn notice(
+        &self,
+        severity: &str,
+        sqlstate: &str,
+        message: String,
+        detail: Option<String>,
+        hint: Option<String>,
+    ) {
         let mut info = ErrorInfo::new(severity.into(), sqlstate.into(), message);
-        info.detail = None;
+        info.detail = detail;
+        info.hint = hint;
         self.h
             .pending_notices
             .lock()
@@ -19407,11 +19415,19 @@ impl PgHandler {
                 ),
             ))));
         }
+        let base_domain = self.domains()?.into_iter().find(|x| x.name == d.base);
         let known = secantus_pgplan::pgtypes::oid_of_name(&d.base).is_some()
-            || self.domains()?.iter().any(|x| x.name == d.base)
+            || base_domain.is_some()
             || self.enums()?.iter().any(|(n, _, _)| *n == d.base);
         if !known {
             return Err(Self::undefined_domain(&d.base));
+        }
+        // `DefineDomain`: a domain over a domain inherits the base
+        // domain's `typdefault` as it stands now -- a copy, which a later
+        // ALTER DOMAIN of the base does not move -- unless its own DEFAULT
+        // clause (`DEFAULT NULL` included) replaces it.
+        if d.default_sql.is_none() {
+            d.default_sql = base_domain.and_then(|b| b.default_sql);
         }
         d.oid = self.mint_composite_oid()?;
         self.insert_type_doc(

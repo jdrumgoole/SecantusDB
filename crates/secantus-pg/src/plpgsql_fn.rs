@@ -126,8 +126,16 @@ pub trait Host {
     fn query(&self, sql: &str, params: &[Bson], types: &[String]) -> Result<QueryOut, PlError>;
     /// Run a statement for its effect; answers the rows it affected.
     fn execute(&self, sql: &str, params: &[Bson], types: &[String]) -> Result<u64, PlError>;
-    /// A `RAISE` below ERROR: `(severity, sqlstate, message)`.
-    fn notice(&self, severity: &str, sqlstate: &str, message: String);
+    /// A `RAISE` below ERROR: its severity, SQLSTATE and message, with
+    /// the DETAIL and HINT its `USING` options gave.
+    fn notice(
+        &self,
+        severity: &str,
+        sqlstate: &str,
+        message: String,
+        detail: Option<String>,
+        hint: Option<String>,
+    );
     /// Run an INSERT / UPDATE / DELETE and answer its RETURNING rows
     /// (`... RETURNING ... INTO`).
     /// `CALL p(...)` from a body: each OUTPUT parameter as `(argument
@@ -1808,6 +1816,33 @@ impl Interp<'_> {
         self.eval_body(body, text, mode)
     }
 
+    /// Evaluate an expression and print it as `convert_value_to_string`
+    /// does, by its type's OUTPUT function (`None` for NULL): a RAISE's
+    /// parameters and options. A value carried in a form other than its
+    /// text needs the type -- `money`'s `cash_out` is `$5.25`, not the
+    /// carried `5.25` (RP-751) -- and a boolean is `boolout`'s `t` / `f`,
+    /// not a text cast's `true`.
+    fn eval_output(&self, e: &Value) -> Result<Option<String>, PlError> {
+        let v = self.eval(e)?;
+        if v == Bson::Null {
+            return Ok(None);
+        }
+        // A mode-0 expression is a whole statement, not a select target.
+        let ty = expr_query(e)
+            .filter(|(_, mode)| *mode != 0)
+            .and_then(|(text, mode)| {
+                let body = match mode {
+                    3 | 4 => text.split_once(":=").map_or(text, |(_, r)| r).trim(),
+                    _ => text,
+                };
+                self.expression_type(body)
+            });
+        Ok(Some(secantus_pgplan::typeout::output_text(
+            &v,
+            ty.as_deref().unwrap_or("text"),
+        )))
+    }
+
     /// Evaluate `body`, a part of the expression `text` (of parse mode
     /// `mode`, which frames an error), to its single value.
     fn eval_body(&self, body: String, text: &str, mode: u64) -> Result<Bson, PlError> {
@@ -3202,13 +3237,8 @@ impl Interp<'_> {
             .unwrap_or_default()
             .iter()
             .map(|p| {
-                // As the type's output function writes it: `boolout`'s
-                // `t` / `f`, not a text cast's `true`.
-                self.eval(p).map(|v| match v {
-                    Bson::Null => "<NULL>".to_string(),
-                    Bson::Boolean(b) => if b { "t" } else { "f" }.to_string(),
-                    other => secantus_pgplan::value_text(&other),
-                })
+                self.eval_output(p)
+                    .map(|v| v.unwrap_or_else(|| "<NULL>".to_string()))
             })
             .collect::<Result<_, _>>()?;
         let mut text = String::new();
@@ -3257,7 +3287,9 @@ impl Interp<'_> {
                 .get("PLpgSQL_raise_option")
                 .cloned()
                 .unwrap_or(Value::Null);
-            let v = secantus_pgplan::value_text(&self.eval(o.get("expr").unwrap_or(&Value::Null))?);
+            let v = self
+                .eval_output(o.get("expr").unwrap_or(&Value::Null))?
+                .unwrap_or_default();
             match o.get("opt_type").and_then(Value::as_u64).unwrap_or(0) {
                 0 => {
                     if err_code.is_some() {
@@ -3312,7 +3344,10 @@ impl Interp<'_> {
             19 => "WARNING",
             _ => return Ok(Flow::Next),
         };
-        self.host.notice(severity, &err.sqlstate, err.message);
+        // `exec_stmt_raise` passes the DETAIL and HINT to `ereport` at
+        // every level, a notice's included.
+        self.host
+            .notice(severity, &err.sqlstate, err.message, err.detail, err.hint);
         Ok(Flow::Next)
     }
 }

@@ -198,8 +198,8 @@ def test_a_domains_default_is_not_its_columns(dsn: str) -> None:
 
 # `DefineDomain` copies the base type's `typdefaultbin` into a domain over
 # a domain that declares no DEFAULT of its own. Here only the outer
-# domain's own DEFAULT was read.
-@pytest.mark.backlog("RP-826")
+# domain's own DEFAULT was read, and the column was NULL. Fixed by RP-826.
+@pytest.mark.backlog_fixed("RP-826")
 def test_a_domain_over_a_domain_takes_its_default(dsn: str) -> None:
     got = _answers(
         dsn,
@@ -217,6 +217,51 @@ def test_a_domain_over_a_domain_takes_its_default(dsn: str) -> None:
         "ALTER TABLE",
         [(1, 42, 42)],
         "DROP TABLE",
+    ]
+
+
+# RP-826's regression test. The inherited default is a COPY taken at CREATE
+# DOMAIN: a later ALTER DOMAIN of the base does not move it, a domain over
+# that domain copies it again, and the outer domain's own DEFAULT -- even
+# `DEFAULT NULL` -- replaces it. `information_schema.domains` lists the copy
+# as the domain's default (measured on a private PostgreSQL 15.19 cluster).
+@pytest.mark.backlog_fixed("RP-826")
+def test_a_domain_over_a_domain_copies_its_default_at_create(dsn: str) -> None:
+    drops = [
+        "drop table if exists t799",
+        "drop domain if exists dx4_799",
+        "drop domain if exists dx3_799",
+        "drop domain if exists dn799",
+    ]
+    got = _answers(
+        dsn,
+        [
+            *drops,
+            "create domain dx3_799 as dx799 default 9",
+            "create domain dn799 as dx799 default null",
+            "alter domain dx799 set default 7",
+            "create domain dx4_799 as dx2_799",
+            "create table t799 (k int, a dx2_799, b dx3_799, c dn799, d dx799, e dx4_799)",
+            "insert into t799 (k) values (1)",
+            "select * from t799",
+            "select domain_name, domain_default from information_schema.domains"
+            " where domain_name in ('dx2_799', 'dx3_799', 'dx4_799') order by 1",
+            *drops,
+        ],
+    )
+    assert got[len(drops) :] == [
+        "CREATE DOMAIN",
+        "CREATE DOMAIN",
+        "ALTER DOMAIN",
+        "CREATE DOMAIN",
+        "CREATE TABLE",
+        "INSERT 0 1",
+        [(1, 42, 9, None, 7, 42)],
+        [("dx2_799", "42"), ("dx3_799", "9"), ("dx4_799", "42")],
+        "DROP TABLE",
+        "DROP DOMAIN",
+        "DROP DOMAIN",
+        "DROP DOMAIN",
     ]
 
 
