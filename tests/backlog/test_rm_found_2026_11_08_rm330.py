@@ -18,10 +18,12 @@ def _code(answer: tuple) -> tuple:
     return answer[:2]
 
 
-@pytest.mark.backlog("RM-420")
+@pytest.mark.backlog_fixed("RM-420")
 def test_an_id_match_refuses_a_dollar_object_in_in(rust_mongo: Any, mongod: Any) -> None:
     """mongod 8.2.11 refuses `{$match: {_id: {$in: [{$x: 1}]}}}` with 2
-    "cannot nest $ under $in", as on any other path; the Rust server answers."""
+    "cannot nest $ under $in", as on any other path; the Rust server answered,
+    since its matcher refused it only from a clause it evaluated and the `_id`
+    read evaluated none. The filter's structure is checked while it parses now."""
 
     def run(client: Any) -> tuple:
         coll = client.rm330f.c
