@@ -210,10 +210,11 @@ def _sbe_sorted(client: Any) -> dict:
     return {k: after[k] - before[k] for k in ("totalKeysSorted", "totalBytesSorted")}
 
 
-@pytest.mark.backlog("RM-398")
+@pytest.mark.backlog_fixed("RM-398")
 def test_sbe_sort_bytes(rust_mongo: Any, mongod: Any) -> None:
-    """mongod 8.2.11's SBE sort in front of a `$group` counts its keys (300)
-    and no bytes in `totalBytesSorted`."""
+    """mongod 8.2.11's SBE sort in front of a `$group` counted its keys (300)
+    and no bytes in `totalBytesSorted`: it adds bytes only for the runs it
+    spills while reading its input."""
     assert _sbe_sorted(rust_mongo) == _sbe_sorted(mongod)
 
 
@@ -237,3 +238,76 @@ def test_top_k_sort_spills(rust_mongo: Any, mongod: Any) -> None:
     900 records for a limit of 200 over 300 documents, and 592 records for a
     limit of 50 it moved past an `$addFields`."""
     assert _top_k(rust_mongo) == _top_k(mongod)
+
+
+# ---------------- found 2026-11-10 while closing RM-398: SBE's sort rows --
+
+
+def _sbe_sort_spilled(client: Any) -> dict:
+    db = _spill_db(client)
+    before = _sort_metrics(client)
+    entry = _profiled(
+        db,
+        [{"$sort": {"n": 1}}, {"$group": {"_id": "$k", "f": {"$first": "$s"}}}],
+        SORT_BUDGET,
+        "rm398-sbe-spilled",
+    )
+    after = _sort_metrics(client)
+    return {
+        "totalBytesSorted": after["totalBytesSorted"] - before["totalBytesSorted"],
+        "sortTotalDataSizeBytes": entry.get("sortTotalDataSizeBytes"),
+    }
+
+
+@pytest.mark.backlog("RM-504")
+def test_sbe_sort_row_leaves_out_a_field_only_the_key_reads(rust_mongo: Any, mongod: Any) -> None:
+    """mongod 8.2.11's SBE sort in front of `{$group: {_id: "$k", f:
+    {$first: "$s"}}}` keeps `k` and `s` beside its key, not `n`, which only
+    the sort reads: a row of 1064, so its six spills while reading count
+    274512, where this server's rows of 1073 count 276834."""
+    assert _sbe_sort_spilled(rust_mongo) == _sbe_sort_spilled(mongod)
+
+
+def _sbe_sort_spilled_bytes(client: Any) -> dict:
+    db = _spill_db(client)
+    entry = _profiled(
+        db,
+        [{"$sort": {"n": 1}}, {"$group": {"_id": "$k", "f": {"$first": "$s"}}}],
+        SORT_BUDGET,
+        "rm398-sbe-spilled-bytes",
+    )
+    return {k: entry.get(k) for k in ("sortSpills", "sortSpilledRecords", "sortSpilledBytes")}
+
+
+@pytest.mark.backlog("RM-506")
+def test_sbe_sort_spilled_bytes(rust_mongo: Any, mongod: Any) -> None:
+    """mongod 8.2.11's SBE sort in front of a `$group` writes 13 runs of 900
+    records, 927900 bytes (1031 a record); this server writes 928800."""
+    assert _sbe_sort_spilled_bytes(rust_mongo) == _sbe_sort_spilled_bytes(mongod)
+
+
+def _sbe_limited_keys(client: Any) -> dict:
+    db = _spill_db(client)
+    out = {}
+    for limit in (50, 1):
+        before = _sort_metrics(client)
+        list(
+            db.c.aggregate(
+                [
+                    {"$sort": {"n": 1}},
+                    {"$limit": limit},
+                    {"$group": {"_id": "$k", "f": {"$first": "$n"}}},
+                ]
+            )
+        )
+        after = _sort_metrics(client)
+        out[limit] = {k: after[k] - before[k] for k in ("totalKeysSorted", "totalBytesSorted")}
+    return out
+
+
+@pytest.mark.backlog("RM-505")
+def test_sbe_limited_sort_counts_every_key(rust_mongo: Any, mongod: Any) -> None:
+    """mongod 8.2.11's SBE sort with a `$limit` in front of a `$group` adds
+    every key it took (300 over 300 documents) to `totalKeysSorted`, for a
+    limit of 50 and of 1, and no bytes; this server adds 50 and 1."""
+    assert _sbe_limited_keys(rust_mongo) == _sbe_limited_keys(mongod)

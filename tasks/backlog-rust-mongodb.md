@@ -1205,13 +1205,30 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       and bytes once, as it sorts.
       Backlog-ID: RM-400
       Verify: tests/backlog/test_rm_326_sort_counts.py::test_get_more_sort_counts
-- [ ] **An SBE sort counts its bytes in `totalBytesSorted`.** mongod
-      8.2.11's slot-based sort in front of a `$group` (`[{$sort: {n: 1}},
-      {$group: {_id: "$k", f: {$first: "$n"}}}]` over 300 documents) adds
-      its 300 keys to `metrics.query.sort.totalKeysSorted` and nothing to
-      `totalBytesSorted`. This server adds 17700 bytes.
-      Backlog-ID: RM-398
-      Verify: tests/backlog/test_rm_326_sort_counts.py::test_sbe_sort_bytes
+- [ ] **An SBE sort keeps a field only its key reads.** mongod 8.2.11's
+      slot-based sort in front of `{$group: {_id: "$k", f: {$first:
+      "$s"}}}` keeps `k` and `s` beside its key `n`, a row of 1064 bytes for
+      documents of a 1000-byte `s`, and over 300 of them under a 50000-byte
+      budget counts 274512 in `totalBytesSorted` and
+      `sortTotalDataSizeBytes` (six spills of 43 rows while reading). This
+      server's row also keeps `n` (1073), so it counts 276834. Found
+      2026-11-10 (RM-398).
+      Verify: tests/backlog/test_rm_326_sort_counts.py::test_sbe_sort_row_leaves_out_a_field_only_the_key_reads
+      Backlog-ID: RM-504
+- [ ] **An SBE sort with a limit counts only the keys it keeps.** mongod
+      8.2.11's slot-based sort in `[{$sort: {n: 1}}, {$limit: 50}, {$group:
+      ...}]` over 300 documents adds all 300 keys it took to
+      `metrics.query.sort.totalKeysSorted`, for a limit of 50 and of 1. This
+      server adds 50 and 1. Found 2026-11-10 (RM-398).
+      Verify: tests/backlog/test_rm_326_sort_counts.py::test_sbe_limited_sort_counts_every_key
+      Backlog-ID: RM-505
+- [ ] **An SBE sort's spilled records are a byte longer than mongod's.**
+      mongod 8.2.11's slot-based sort in front of a `$group`, over 300
+      documents of a 1000-byte `s` under a 50000-byte budget, writes 13 runs
+      of 900 records in 927900 bytes (1031 a record); this server writes the
+      same runs in 928800 (1032). Found 2026-11-10 (RM-398).
+      Verify: tests/backlog/test_rm_326_sort_counts.py::test_sbe_sort_spilled_bytes
+      Backlog-ID: RM-506
 - [ ] **A sort with a limit spills as mongod's top-k sorter does not.**
       Over its budget mongod 8.2.11 spills a sort with a limit
       (`TopKSorter`): `[$sort, {$limit: 200}, $addFields]` over 300 1-KB
