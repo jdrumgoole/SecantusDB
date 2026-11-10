@@ -2609,17 +2609,23 @@ pub(crate) struct Counted {
     pub docs: Vec<Vec<u8>>,
     pub keys_examined: i64,
     pub docs_examined: i64,
+    /// What the plan's blocking sort of documents took in, in the order it
+    /// took it, when `keep_sort_input` asked and the plan has one.
+    pub sort_input: Option<Vec<Vec<u8>>>,
 }
 
 /// [`find`], run as mongod's plan for the read runs when a stream can run
 /// it (RM-023): every document, in the plan's order (a sort of whole
 /// documents included), with the keys and documents it examined. `limit`
 /// is the plan's (0: none); `projection` decides whether the plan covers
-/// the read. `None`: read as before.
+/// the read. `keep_sort_input`: also hand back what a blocking sort of
+/// documents took in, in the plan's order, for the pipeline's `$sort` to
+/// count as mongod's sorter does (RM-399). `None`: read as before.
 pub(crate) fn find_counted(
     storage: &dyn Storage,
     ask: &Ask,
     projection: Option<&Document>,
+    keep_sort_input: bool,
 ) -> Result<Option<Counted>, StorageError> {
     let flags = StreamFlags {
         sorts_documents: true,
@@ -2632,6 +2638,7 @@ pub(crate) fn find_counted(
     // budget and counts its spills, once (a second count doubled them).
     let opts = super::stream::Options {
         collation: ask.collation,
+        keep_sort_input,
         ..Default::default()
     };
     let Some(mut stream) =
@@ -2644,5 +2651,6 @@ pub(crate) fn find_counted(
         docs: all.docs,
         keys_examined: all.keys_examined,
         docs_examined: all.docs_examined,
+        sort_input: stream.take_sort_input(),
     }))
 }

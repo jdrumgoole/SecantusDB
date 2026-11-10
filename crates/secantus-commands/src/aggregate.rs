@@ -837,7 +837,15 @@ pub fn aggregate(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
                 // plan cache keys it: the projection of what the stages
                 // read, the skip and limit it takes in.
                 let front = crate::explain::pipeline_canonical(c, &read_pipeline);
-                let read = |sort: Option<&Document>, limit: i64| {
+                // A leading `$sort` counts what mongod's sorter does over
+                // what the plan hands it, in that order: which documents a
+                // top-k sorter keeps (RM-399), and which a spilled run holds
+                // (RM-395). The read keeps that for it.
+                let keep_input = lead.sort.is_some()
+                    && secantus_core::aggregate::limit_for_pushdown(rest.get(1..).unwrap_or(&[]))
+                        .is_none_or(|k| k > 1);
+                let mut sort_input: Option<Vec<Vec<u8>>> = None;
+                let mut read = |sort: Option<&Document>, limit: i64| {
                     let moved = lead.filter.as_ref().filter(|_| sort.is_some());
                     // Read as mongod's plan reads, counting what it examines
                     // (RM-023), when a stream can run the plan.
@@ -855,6 +863,7 @@ pub fn aggregate(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
                             asked: Default::default(),
                         },
                         front.projection.as_ref(),
+                        keep_input && sort.is_some(),
                     )?;
                     if let Some(counted) = counted {
                         crate::opdebug::note_examined(
@@ -862,6 +871,7 @@ pub fn aggregate(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
                             counted.docs_examined,
                             None,
                         );
+                        sort_input = counted.sort_input;
                         return Ok(counted.docs);
                     }
                     crate::explain::order::find(
@@ -927,10 +937,23 @@ pub fn aggregate(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
                 // Whether the pipeline's leading `$sort` is a blocking sort
                 // in mongod's plan, which its budget holds (RM-315).
                 if first_read.sort.is_some() {
-                    leading_guard = Some(secantus_core::aggregate::leading_sort(
-                        crate::explain::order::sorts_in_memory(storage, &first_read),
-                        sbe_read,
-                    ));
+                    let input = match sort_input.take() {
+                        Some(found) => Some(decode_docs(crate::ts_buckets::as_read(
+                            storage,
+                            &ctx.db_name,
+                            c,
+                            found,
+                            false,
+                        )?)?),
+                        None => None,
+                    };
+                    leading_guard = Some(
+                        secantus_core::aggregate::leading_sort(
+                            crate::explain::order::sorts_in_memory(storage, &first_read),
+                            sbe_read,
+                        )
+                        .with_input(input),
+                    );
                 } else if let Some(sort) = window_sort(&rest) {
                     // A leading `$setWindowFields` sorts as a leading `$sort`
                     // would: from an index if one gives the order.

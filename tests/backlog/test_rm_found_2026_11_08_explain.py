@@ -66,11 +66,13 @@ def _changed_document_sizes(client: Any) -> dict:
     }
 
 
-@pytest.mark.backlog("RM-408")
+@pytest.mark.backlog_fixed("RM-408")
 def test_changed_documents_are_sized_as_mongod_sizes_them(rust_mongo: Any, mongod: Any) -> None:
-    """mongod 8.2.1 sizes a document an `$unwind` or `$addFields` changed,
+    """mongod 8.2.1 sized a document an `$unwind` or `$addFields` changed,
     and one an expression object built, by its storage: what it allocated
-    and what its new values hold, on top of the BSON it came from."""
+    and what its new values held, on top of the BSON it came from. This
+    server sized all three as the BSON they encode until RM-408 modelled
+    that storage."""
     assert _changed_document_sizes(rust_mongo) == _changed_document_sizes(mongod)
 
 
@@ -87,10 +89,11 @@ def _first_holds(client: Any) -> int:
     return memory["long"] - memory["int"]
 
 
-@pytest.mark.backlog("RM-409")
+@pytest.mark.backlog_fixed("RM-409")
 def test_a_classic_first_counts_its_value(rust_mongo: Any, mongod: Any) -> None:
-    """mongod 8.2.1's classic `$first` counts the value it holds: a
-    1000-byte string's 1024 bytes beyond an int's, in each of 7 groups."""
+    """mongod 8.2.1's classic `$first` counted the value it held: a
+    1000-byte string's 1024 bytes beyond an int's, in each of 7 groups;
+    this server counted the accumulator alone until RM-409."""
     assert _first_holds(rust_mongo) == _first_holds(mongod)
 
 
@@ -110,11 +113,12 @@ def _internal_ranks(client: Any) -> Any:
     return {name: mongo_answer(lambda p=p: list(db.c.aggregate(p))) for name, p in runs.items()}
 
 
-@pytest.mark.backlog("RM-410")
+@pytest.mark.backlog_fixed("RM-410")
 def test_an_internal_window_ranks_by_the_sort_key_it_was_given(
     rust_mongo: Any, mongod: Any
 ) -> None:
     """A pipeline that names `$_internalSetWindowFields` itself: mongod
     8.2.1's rank functions read the sort key a `$sort` attached to each
-    document, and without one every document ties."""
+    document, and without one every document ties; this server ranked by
+    `sortBy` until RM-410."""
     assert _internal_ranks(rust_mongo) == _internal_ranks(mongod)

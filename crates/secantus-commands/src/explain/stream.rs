@@ -183,6 +183,9 @@ pub(crate) struct Options<'a> {
     /// A blocking sort's memory budget and whether it may spill to disk
     /// (`allowDiskUse`), held to as mongod's `SORT` holds to it (RM-315).
     pub sort_budget: Option<(secantus_core::memlimit::Budgets, bool)>,
+    /// Keep what a blocking sort of documents takes in, in the order the
+    /// plan gives it ([`Stream::take_sort_input`]).
+    pub keep_sort_input: bool,
 }
 
 /// What a scan knows of its index.
@@ -1001,6 +1004,9 @@ enum Stage {
         t: Tally,
         /// What its sorter counted (`totalDataSizeSorted`, the spills).
         report: Option<Box<secantus_core::memlimit::SpillReport>>,
+        /// Every document it took in, in the order it took them, when asked
+        /// for ([`Options::keep_sort_input`]).
+        kept: Option<Vec<Vec<u8>>>,
     },
     Near(Box<NearStage>),
 }
@@ -1094,6 +1100,7 @@ fn sort_members(
             })
             .collect::<Result<_, _>>()?;
         let sizing = secantus_core::sorter::Sizing {
+            sizes: None,
             source: secantus_core::sorter::SortSource::QueryLayer,
             fields: None,
             budget: budgets.sort,
@@ -1511,6 +1518,7 @@ impl Stage {
                 project,
                 t,
                 report,
+                kept,
             } => {
                 if sorted.is_none() {
                     let mut all: Vec<Member> = Vec::new();
@@ -1523,6 +1531,9 @@ impl Stage {
                             }
                         }
                         all.push(m);
+                    }
+                    if let Some(kept) = kept {
+                        *kept = all.iter().filter_map(|m| m.doc.clone()).collect();
                     }
                     let (out, counted) = sort_members(
                         cx,
@@ -2157,6 +2168,7 @@ impl Stream {
                     },
                     t: Tally::default(),
                     report: None,
+                    kept: opts.keep_sort_input.then(Vec::new),
                 };
                 below.skip = skip;
                 below.skip_given = skip;
@@ -2344,6 +2356,15 @@ impl Stream {
 
     /// Every result of the read, with each one's RecordId, and what reading
     /// them examined: a read made whole, as a write's or a `distinct`'s is.
+    /// What the plan's blocking sort of documents took in, in the order it
+    /// took it, once it has run, when [`Options::keep_sort_input`] asked.
+    pub(crate) fn take_sort_input(&mut self) -> Option<Vec<Vec<u8>>> {
+        match &mut self.root {
+            Stage::SortDocs { kept, .. } => kept.take(),
+            _ => None,
+        }
+    }
+
     pub(crate) fn read_all(&mut self, storage: &dyn Storage) -> Result<ReadAll, StorageError> {
         let mut out = ReadAll::default();
         loop {

@@ -1216,16 +1216,6 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       same runs in 928800 (1032). Found 2026-11-10 (RM-398).
       Verify: tests/backlog/test_rm_326_sort_counts.py::test_sbe_sort_spilled_bytes
       Backlog-ID: RM-506
-- [ ] **A sort with a limit spills as mongod's top-k sorter does not.**
-      Over its budget mongod 8.2.11 spills a sort with a limit
-      (`TopKSorter`): `[$sort, {$limit: 200}, $addFields]` over 300 1-KB
-      documents spills 13 runs of 900 records under a 50000-byte budget,
-      where this server's limited sort spills nothing. A `$limit` mongod
-      moves into the sort past an `$addFields` (`extractLimitForPushdown`)
-      is not taken in here, so that sort spills as a whole sort would: 900
-      records where mongod's spill 592.
-      Backlog-ID: RM-399
-      Verify: tests/backlog/test_rm_326_sort_counts.py::test_top_k_sort_spills
 - [ ] **A sort on a descending or tied key spills a file of another
       size.** Over 300 1-KB documents under a 50000-byte budget, macOS
       mongod 8.2.11 stores 54562 bytes for the 13 spills of `{n: -1}`,
@@ -1236,91 +1226,144 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       file's framing. Found 2026-11-10 (RM-400).
       Verify: tests/backlog/test_rm_326_sort_counts.py::test_descending_and_tied_spill_storage_size
       Backlog-ID: RM-503
-- [ ] **macOS mongod counts window functions at its own sizes.** This
-      server counts a window function's memory at Linux mongod 8.2.12's
-      sizes (x86-64 and arm64 agree), the exemplar CI measures. macOS
-      mongod 8.2.1 (arm64) sizes many differently: a growing `$sum` /
-      `$count` 184 bytes, not 176; a removable `$sum` 8 more and a removable
-      `$push`, `$min`, `$max` and `$addToSet` 16-32 less; `$rank`,
-      `$denseRank` and `$documentNumber` 32 less (344 / 336 / 336); `$top`
-      and `$topN` 72 less, `$firstN` 32 less, `$minN` 16 less. So on this
-      Mac a `[-5, 5]` `$sum`, a partitioned whole-partition `$sum` and a
-      `[-5, 5]` `$push` run under 1230, 2312 and 12853 bytes where this
-      server needs 1222, 2304 and 12885. The `$group` face of the same
-      sizes is RM-397. Checked on this Mac only (`only_on("arm64")`).
-      Verify: tests/backlog/test_rm_found_2026_10_26.py::test_macos_window_function_sizes
-      Backlog-ID: RM-403
-- [ ] **Four window shapes still miss mongod's `$setWindowFields` budget.**
-      Over 40 small documents Linux mongod 8.2.12 runs a `range` window
-      with no lower end (`["unbounded", 4]`) under 676 bytes, where this
-      server holds the whole partition (5176); `$expMovingAvg` under 261
-      and `$locf` under 253 (here 250: their functions count nothing); a
-      removable `[-3, 3]` `$max` under 852 (here 908). Each also misses
-      partitioned. The rest of a 48-shape matrix (document and range
-      windows, `$first` / `$last`, `$shift`, the rank functions, each with
-      and without `partitionBy`) matches to the byte.
-      Verify: tests/backlog/test_rm_found_2026_11_08.py::test_window_budget_more_shapes
-      Backlog-ID: RM-404
-- [ ] **A document a stage changed or built is sized as if it were read.**
-      mongod 8.2.1 sizes a document an `$unwind` or `$addFields` changed,
-      or an expression object built, by its storage: the buffer it
-      allocated and what its new values hold, on top of the BSON it came
-      from (`Document::getApproximateSize`; `memlimit::built_document_size`
-      has the measured model for a `$group`'s own output). This server
-      sizes all three as the BSON they encode, so `explain` shows less
-      than mongod: a whole-partition window after an `$unwind` of 300
-      1000-byte documents holds 342000 bytes here, 687600 there; the
-      `$sort` in front of a computed `partitionBy` counts 404400 against
-      543600, and the window behind it 119818 against 175671; a `$group`
-      with a compound `_id` returns 2296 bytes against 3094; a `$push` of
-      `{x: "$n"}` holds 40440 against 76740. The budgets count the same
-      sizes, so those stages spill and refuse later than mongod.
-      Verify: tests/backlog/test_rm_found_2026_11_08_explain.py::test_changed_documents_are_sized_as_mongod_sizes_them
-      Backlog-ID: RM-408
-- [ ] **A classic `$group`'s `$first` and `$last` count only themselves.**
-      mongod 8.2.1's `maxAccumulatorMemoryUsageBytes` for a `$first` of a
-      1000-byte string is 1024 bytes a group more than for a `$first` of
-      an int: it counts the value it holds. This server counts the
-      accumulator alone (`group::acc_memory`, "The classic `$first` /
-      `$last` count themselves only"), so its `$group` budget sees less
-      than mongod's.
-      Verify: tests/backlog/test_rm_found_2026_11_08_explain.py::test_a_classic_first_counts_its_value
-      Backlog-ID: RM-409
-- [ ] **A pipeline's own `$_internalSetWindowFields` ranks without a sort
-      key.** The stage runs since RM-328, as mongod runs it behind the
-      `$sort` a `$setWindowFields` is parsed into. Named by a pipeline
-      without a `$sort` in front, mongod 8.2.1's `$rank` finds no sort key
-      on the documents and ranks every one 1; this server ranks them by
-      their `sortBy` values in the order they came (1, 2, 3, 3, 5).
-      Verify: tests/backlog/test_rm_found_2026_11_08_explain.py::test_an_internal_window_ranks_by_the_sort_key_it_was_given
-      Backlog-ID: RM-410
-- [ ] **A query-layer sort spills its documents in sorted order, not as its
-      scan read them.** mongod 8.2's `SORT` takes the documents as the stage
-      below hands them over (a forward `COLLSCAN` for a plain collection)
-      and spills each run sorted. Here the read hands the sorter documents it
-      has already sorted -- `find`, the aggregate pipeline's leading `$sort`,
-      `explain`'s executor -- so a sort that reorders its input spills
-      different runs: the same spills, records and bytes, but a different
-      file (130528 bytes against mongod 8.2.1's 130545 for 300 documents
-      sorted by `{s: 1, n: -1}`; measured by copying mongod's live spill file
-      out of `_tmp`). A sort whose input is already in order, a pipeline
-      `$sort` after another stage, and the stream's `SORT` under a write
-      (`sort_members`, given a budget) spill as mongod does. The fix is for
-      the read to run the budgeted sort over its input, as `sort_members`
-      does, instead of the command sorting the sorted output again.
-      Backlog-ID: RM-395
-      Verify: tests/backlog/test_rm_found_2026_10_26.py::test_leading_sort_spill_storage_size
-- [ ] **A `$sort` after `$addFields` spills at slightly different record
-      boundaries.** Over documents of varying size, mongod 8.2.1's first two
-      runs of a `$sort` after `$addFields` hold about three records more
-      than this server's (its merged runs are 60909 and 55591 bytes before
-      compression, these 59997 and 56503), so the file differs (39691 bytes
-      against 39694) though the spills, records and bytes agree. The
-      memory a modified document counts (`SortSource::Modified`, measured by
-      bisection over documents of one size) is not quite mongod's for
-      these.
-      Backlog-ID: RM-396
-      Verify: tests/backlog/test_rm_found_2026_10_26.py::test_added_fields_sort_spill_storage_size
+- [ ] **A `range` window's `"current"` bound takes in tied documents.**
+      mongod 8.2.1 reads `"current"` in a `range` window as the document
+      answered (`getEndpointsRangeBased`: offset 0), so over `n` of 1, 1,
+      2, 2, 2, 3 a `$push` of `_id` over `["unbounded", "current"]` gives
+      `[0], [0, 1], [0, 1, 2], ...`; this server bounds the window by the
+      current sort value (`range_window_bounds`), taking in every document
+      tied with it: `[0, 1], [0, 1], [0, 1, 2, 3, 4], ...`. The same for a
+      `"current"` lower bound. A wrong answer for any sort key with ties.
+      Found 2026-11-10 (RM-404).
+      Verify: tests/backlog/test_rm_found_2026_11_10_rm404.py::test_a_range_windows_current_is_the_document
+      Backlog-ID: RM-508
+- [ ] **`$integral` and the covariances count no memory in a window.**
+      mongod 8.2.1 counts what they hold: `maxFunctionMemoryUsageBytes`
+      3888 for a `["unbounded", 4]` `range` `$integral` over 40 documents,
+      568 for a `["unbounded", -1]` `$covariancePop`. This server counts
+      nothing for either (`FunctionMemory::Nothing`), so `explain` shows 0
+      and the stage runs under budgets mongod refuses (500 against 4300,
+      375 against 818). Found 2026-11-10 (RM-404).
+      Verify: tests/backlog/test_rm_found_2026_11_10_rm404.py::test_integral_and_covariance_count_their_memory
+      Backlog-ID: RM-509
+- [ ] **A partitioned window's `maxTotalMemoryUsageBytes` is 16 bytes off.**
+      With `partitionBy` over three partitions of 40 small documents,
+      macOS mongod 8.2.1 reports 748 for a `range [-4, 4]` `$sum` (here
+      764), 2180 for a whole-partition `$sum` (2196), 480 for a running
+      `$sum` (464) and 432 for `$expMovingAvg` (416). Both directions, one
+      partition key's size; the least budgets agree, so the moment the
+      tracker sees differs, not what the budget counts. Cause not yet
+      traced. Found 2026-11-10 (RM-404).
+      Verify: tests/backlog/test_rm_found_2026_11_10_rm404.py::test_a_partitioned_windows_total_memory
+      Backlog-ID: RM-510
+- [ ] **The sort key is lost at a `$replaceRoot`, a `$lookup` or a
+      `$setWindowFields`.** mongod 8.2.11 keeps a document's sort key
+      through a `$replaceRoot`, a `$lookup` and a `$setWindowFields` with no
+      `sortBy`, and a `$setWindowFields` that sorts leaves its own (the
+      partition key, then `sortBy`). This server ends the key at each
+      (`agg_meta::KEEPS_SORT_METADATA`), so a `$_internalSetWindowFields`
+      after one ranks every document 1 and `{$meta: "sortKey"}` reads `[]`.
+      Found 2026-11-10 (RM-410).
+      Verify: tests/backlog/test_rm_found_2026_11_10_rm410.py::test_the_sort_key_passes_through_stages_that_keep_it
+      Backlog-ID: RM-520
+- [ ] **A `$lookup` sub-pipeline's `$sort` sets no sort key.** In a
+      `$lookup` pipeline, mongod 8.2.11 ranks a `$_internalSetWindowFields`
+      by the key the sub-pipeline's `$sort` set; this server does not run
+      `agg_meta::rewrite_sort_metadata` over a sub-pipeline, so every
+      document ties. Found 2026-11-10 (RM-410).
+      Verify: tests/backlog/test_rm_found_2026_11_10_rm410.py::test_a_lookup_sub_pipeline_sort_sets_the_key
+      Backlog-ID: RM-521
+- [ ] **A rank with no sort key at all is answered, not refused.** After a
+      `$group` or a `$unionWith` a document carries no sort key
+      (`{$meta: "sortKey"}` is missing there, not `[]`), and mongod 8.2.11
+      refuses a `$_internalSetWindowFields` `$rank` with 9973200 "Attempt to
+      get sort key which has not been populated"; this server ties the
+      documents. A document read from the collection with no `$sort` has the
+      empty key, which ties, on both. Found 2026-11-10 (RM-410).
+      Verify: tests/backlog/test_rm_found_2026_11_10_rm410.py::test_a_rank_with_no_sort_key_is_refused
+      Backlog-ID: RM-522
+- [ ] **A `$sort` behind another stage sets the sort key where mongod's
+      keeps the earlier one.** Behind a leading `$sort` and an `$addFields`,
+      mongod 8.2.11's key after a second `$sort` is still the first's; a
+      `$sort` behind a leading `$addFields` or `$project` leaves the empty
+      key. `{$meta: "sortKey"}` and a `$_internalSetWindowFields`'s ranks
+      show it alike; this server takes the last `$sort`'s key. (Behind an
+      `$unwind` mongod does take the later `$sort`'s.) Cause in mongod not
+      traced: measured, not derived. Found 2026-11-10 (RM-410).
+      Verify: tests/backlog/test_rm_found_2026_11_10_rm410.py::test_which_sort_sets_the_key
+      Backlog-ID: RM-523
+- [ ] **A `$sort` that a later `$sort` overrides still orders the ties.**
+      mongod 8.2.11 drops the earlier `$sort` of `$sort: {k: 1}, $sort: {n:
+      1}`, also across an `$unwind`, so documents tied on `n` come in the
+      collection's order; this server runs both, and the ties keep the
+      first sort's order. A different document order. Found 2026-11-10
+      (RM-410).
+      Verify: tests/backlog/test_rm_found_2026_11_10_rm410.py::test_a_sort_before_another_sort_is_dropped
+      Backlog-ID: RM-524
+- [ ] **`{$meta: "sortKey"}` gives an empty array's key as null.**
+      mongod 8.2.11's key for an empty array is `undefined`, which pymongo
+      decodes as `None`: `$type` reads `"undefined"`, and a `$group` on the
+      key keeps the empty array's document and a null's apart. This server
+      reads the key through `$ifNull` (`agg_meta::sort_key_read`), since its
+      expressions take `undefined` for MISSING. The ranks already tell the
+      two apart (RM-410). Found 2026-11-10.
+      Verify: tests/backlog/test_rm_found_2026_11_10_rm410.py::test_an_empty_arrays_sort_key_is_undefined
+      Backlog-ID: RM-525
+- [ ] **A sub-document a stage reads or writes into is sized as if it
+      were read.** mongod 8.2.11 gives a sub-document a cache of its own
+      when a stage reads a field inside it (`$addFields: {q: "$e.y"}`) or
+      sets one (`$set: {"e.z": 1}`), and the sort and window behind count
+      it: (349500, 369000) and (305100, 324600) bytes over 300 documents.
+      This server's storage model (`docstore`, RM-408) caches top-level
+      fields only, and sizes the sub-document as the BSON it was read from:
+      (288900, 308400) and (290700, 288300).
+      Verify: tests/backlog/test_rm_found_rm408.py::test_a_sub_document_a_stage_touched_is_sized_by_its_storage
+      Backlog-ID: RM-515
+- [ ] **`explain` counts every document a `$sort` with a `$limit` read.**
+      For `[{$addFields: {q: "$b"}}, {$sort: {n: -1}}, {$limit: 200}]`
+      over 300 documents mongod 8.2.11's `totalDataSizeSortedBytesEstimate`
+      is the 200 its top-k sort kept (131400); this server's is all 300
+      (197100), as for the same pipeline without the `$limit`. A pipeline
+      run outside `explain` takes the `$limit` (`limit_for_pushdown`), so
+      look first at the run `explain` reads the `$sort`'s counters from.
+      Found 2026-11-10 (RM-408).
+      Verify: tests/backlog/test_rm_found_rm408.py::test_explain_counts_the_documents_a_sort_with_a_limit_kept
+      Backlog-ID: RM-516
+- [ ] **`explain` lists a `$sort` that a window's own sort replaces.** For
+      `[{$unwind: "$t"}, {$sort: {t: 1}}, {$setWindowFields: {sortBy: {n:
+      1}, ...}}]` mongod 8.2.11 drops the `$sort` on `t` and moves the
+      window's `$sort` on `n` ahead of the `$unwind`, listing `$unwind` and
+      `$_internalSetWindowFields` alone. This server lists both `$sort`s
+      after the `$unwind`, and counts both. Found 2026-11-10 (RM-408).
+      Verify: tests/backlog/test_rm_found_rm408.py::test_a_sort_a_window_supersedes_is_not_listed
+      Backlog-ID: RM-517
+- [ ] **`$_internalInhibitOptimization` is refused as an unknown stage.**
+      mongod 8.2.11 runs it -- it passes its documents on and keeps the
+      stages after it out of the scan -- so a pipeline with it answers as
+      one without. This server refuses it (40324, "Unrecognized pipeline
+      stage name"). Found 2026-11-10 (RM-408).
+      Verify: tests/backlog/test_rm_found_rm408.py::test_internal_inhibit_optimization_runs
+      Backlog-ID: RM-518
+- [ ] **A document an inclusion `$project` built is sized as if it were
+      read.** Behind an `$unwind` (so not taken by the scan), mongod
+      8.2.11's `$project: {t: 1, n: 1}` builds each document it returns,
+      and the `$sort` after it counts that storage: 351300 bytes over 900
+      documents. This server counts each as the BSON it encodes, 188700:
+      the storage model (`docstore`, RM-408) stops at a `$project`. Found
+      2026-11-10 (RM-408).
+      Verify: tests/backlog/test_rm_found_rm408.py::test_a_document_a_project_built_is_sized_as_built
+      Backlog-ID: RM-519
+- [ ] **A sort by a key many documents share stores its spilled runs in
+      another order than mongod.** Over 300 documents sorted by `{k: -1}`
+      (seven values of `k`), budget 50000, mongod 8.2.11 on arm64 stores
+      51260 bytes for its 13 spills and this server 51242 -- `find` and a
+      pipeline's leading `$sort` alike, with the same spills, records and
+      bytes, so documents that compare equal sit in each run in another
+      order. A sort whose keys are all different, or all the same (`{s:
+      1}` over one string), agrees (RM-395). Found 2026-11-10 while working
+      RM-395.
+      Verify: tests/backlog/test_rm_found_2026_11_10_rm395.py::test_tied_sort_spill_storage_size
+      Backlog-ID: RM-526
 - [ ] **On Linux the diagnostic sample has no `systemMetrics`.** mongod
       8.2 on Linux adds a `systemMetrics` collector to each FTDC sample
       (`getDiagnosticData`): the machine's CPU, memory, network and disk
@@ -1342,15 +1385,6 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       CI. Found 2026-11-07, snapshot PR #2447.
       Backlog-ID: RM-402
       Verify: tests/backlog/test_rm_found_2026_10_26.py::test_x86_spill_after_project_storage_size
-- [ ] **A `$group` of `$sum` and `$count` counts less memory than mongod.**
-      Spilling 300 groups of `{t: {$sum: "$n"}, c: {$count: {}}}` 22 times,
-      mongod 8.2.1 reports `groupSpilledBytes: 115200` and this server
-      110400: the spills and records agree, so each group's accumulators
-      are counted 16 bytes short. That is mongod on arm64: on CI's x86_64
-      Linux mongod and this server agree (2026-11-07), so the gap test runs
-      on arm64 only.
-      Backlog-ID: RM-397
-      Verify: tests/backlog/test_rm_found_2026_10_26.py::test_group_sum_spilled_bytes
 - [ ] **A classic `$group` counts its held values' and `_id`'s memory
       unlike mongod, so it spills at other points.** Over 300 documents of a
       1000-byte string, budget 5000, mongod 8.2.11 spills a `$first` /

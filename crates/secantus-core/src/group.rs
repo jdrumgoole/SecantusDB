@@ -501,6 +501,14 @@ impl Capped {
     /// `$push`: `AccumulatorPush::processInternal` (classic), SBE's
     /// `addToArrayCapped`.
     pub(crate) fn push(&mut self, v: Bson) -> R<()> {
+        let size = memlimit::classic_size(&v);
+        self.push_sized(v, size)
+    }
+
+    /// [`Capped::push`] of a value the classic engine counts at `size`
+    /// (`Value::getApproximateSize`: a document an expression object built
+    /// counts its storage, [`crate::docstore::produced_size`]).
+    pub(crate) fn push_sized(&mut self, v: Bson, size: usize) -> R<()> {
         if crate::sbe::active() {
             let elem = memlimit::sbe_size(&v);
             if self.mem + elem >= memlimit::budgets().push {
@@ -520,7 +528,7 @@ impl Capped {
             self.items.push(v);
             return Ok(());
         }
-        self.mem += memlimit::classic_size(&v);
+        self.mem += size;
         self.items.push(v);
         if memlimit::PUSH_BASE + self.mem > memlimit::budgets().push {
             return Err(Fallback::mongo(
@@ -537,6 +545,12 @@ impl Capped {
     /// `$addToSet`: the value unless an equal one is there already
     /// (`AccumulatorAddToSet`, SBE's `addToSetCapped`).
     pub(crate) fn add(&mut self, v: Bson) -> R<()> {
+        let size = memlimit::classic_size(&v);
+        self.add_sized(v, size)
+    }
+
+    /// [`Capped::add`] of a value the classic engine counts at `size`.
+    pub(crate) fn add_sized(&mut self, v: Bson, size: usize) -> R<()> {
         for existing in self.items.iter() {
             if expressions::py_eq(&v, existing).map_err(|_| Fallback::Defer)? {
                 return Ok(());
@@ -561,7 +575,7 @@ impl Capped {
             self.items.push(v);
             return Ok(());
         }
-        self.mem += memlimit::classic_size(&v);
+        self.mem += size;
         self.items.push(v);
         let used = memlimit::ACCUMULATOR_BASE + self.mem;
         if used > memlimit::budgets().add_to_set {
@@ -899,14 +913,16 @@ pub(crate) fn apply_acc(acc: &mut Acc, arg: &Bson, doc: &Document, vars: &Docume
         Acc::Last(slot) => *slot = Some(eval_or_missing(arg, doc, vars)?.map(missing_as_null)),
         Acc::Push(list) => {
             if let Some(v) = eval_or_missing(arg, doc, vars)? {
-                list.push(v)?;
+                let size = crate::docstore::produced_size(arg, &v);
+                list.push_sized(v, size)?;
             }
         }
         Acc::AddToSet(list) => {
             let Some(v) = eval_or_missing(arg, doc, vars)? else {
                 return Ok(());
             };
-            list.add(v)?;
+            let size = crate::docstore::produced_size(arg, &v);
+            list.add_sized(v, size)?;
         }
         Acc::MergeObjects(merged) => {
             // Null / undefined / missing -> skip; a document merges, later
@@ -2235,9 +2251,14 @@ fn acc_memory(acc: &Acc) -> usize {
     base + match acc {
         Acc::Push(c) | Acc::AddToSet(c) | Acc::ConcatArrays(c) | Acc::SetUnion(c) => c.mem,
         Acc::Min(Some(v)) | Acc::Max(Some(v)) => memlimit::engine_size(v),
-        // The classic `$first` / `$last` count themselves only.
         Acc::First(Some(v)) | Acc::Last(Some(v)) if sbe => {
             memlimit::sbe_size(v.as_ref().unwrap_or(&Bson::Null))
+        }
+        // The classic `$first` / `$last` count what the value they hold
+        // keeps beyond its inline `Value` (`sizeof(*this) +
+        // _first.getApproximateSize() - sizeof(Value)`; RM-409).
+        Acc::First(Some(v)) | Acc::Last(Some(v)) => {
+            memlimit::classic_size(v.as_ref().unwrap_or(&Bson::Null)) - memlimit::VALUE
         }
         Acc::MergeObjects(d) if sbe && !d.is_empty() => {
             memlimit::sbe_size(&Bson::Null) + memlimit::bson_len(d)
@@ -2248,13 +2269,12 @@ fn acc_memory(acc: &Acc) -> usize {
 
 /// What mongod's classic accumulator object counts for itself (its
 /// `sizeof`), read from 8.2.11's `explain` (`maxAccumulatorMemoryUsageBytes`
-/// over five documents, 2026-10-26) on the Linux x86-64 build, the
-/// exemplar: the macOS arm64 build differs for some (`$sum` 184, `$topN`
-/// 568, ...). The values a `$push`, `$addToSet`, `$min` or `$max` holds are
-/// counted on top.
+/// over five documents, 2026-10-26) on the Linux x86-64 build; `$sum` is
+/// the build's own ([`memlimit::LAYOUT`]: 184 on macOS arm64). The values a
+/// `$push`, `$addToSet`, `$min` or `$max` holds are counted on top.
 fn classic_base(acc: &Acc) -> usize {
     match acc {
-        Acc::Sum(_) | Acc::Count(_) => 176,
+        Acc::Sum(_) | Acc::Count(_) => memlimit::LAYOUT.sum,
         Acc::Avg(_) => 152,
         Acc::Min(_) | Acc::Max(_) => 104,
         Acc::First(_) => 120,
@@ -2331,7 +2351,11 @@ fn run_group(
             None => {
                 let i = ids.len();
                 index.insert(gk, i);
-                mem += memlimit::engine_size(&key_val);
+                mem += if sbe {
+                    memlimit::sbe_size(&key_val)
+                } else {
+                    classic_key_size(id_expr, &key_val)
+                };
                 ids.push(key_val);
                 let mut accs = Vec::with_capacity(compiled.len());
                 for (j, c) in compiled.iter().enumerate() {
@@ -2403,10 +2427,117 @@ fn run_group(
             .collect(),
         total_output_data_size: out
             .iter()
-            .map(|d| wide(memlimit::built_document_size(d)))
+            .map(|d| {
+                wide(memlimit::built_document_size_with(d, |name, v| {
+                    output_held(id_expr, &compiled, name, v)
+                }))
+            })
             .sum(),
     });
     Ok(out)
+}
+
+/// The fields of an `_id` that is an expression object: mongod groups on
+/// each one's value (`_idFieldNames`, `_idExpressions`).
+fn id_fields(id_expr: &Bson) -> Option<Vec<(&str, &Bson)>> {
+    match id_expr {
+        Bson::Document(d) if d.keys().next().is_some_and(|k| !k.starts_with('$')) => {
+            Some(d.iter().map(|(k, e)| (k.as_str(), e)).collect())
+        }
+        _ => None,
+    }
+}
+
+/// What a classic `$group` counts for a new group's key
+/// (`computeGroupKey`'s `Value`): the one `_id` expression's value, or an
+/// array of each field's.
+fn classic_key_size(id_expr: &Bson, key: &Bson) -> usize {
+    match id_fields(id_expr).as_deref() {
+        None => crate::docstore::produced_size(id_expr, key),
+        Some([(name, expr)]) => match key {
+            Bson::Document(d) => d
+                .get(*name)
+                .map_or(memlimit::VALUE, |v| crate::docstore::produced_size(expr, v)),
+            _ => memlimit::classic_size(key),
+        },
+        Some(fields) => {
+            let Bson::Document(d) = key else {
+                return memlimit::classic_size(key);
+            };
+            memlimit::VALUE
+                + memlimit::RC_VECTOR
+                + fields
+                    .iter()
+                    .map(|(name, expr)| {
+                        d.get(*name)
+                            .map_or(memlimit::VALUE, |v| crate::docstore::produced_size(expr, v))
+                    })
+                    .sum::<usize>()
+        }
+    }
+}
+
+/// What a `$group` output field's value holds beyond its `Value`
+/// (`makeDocument`): the `_id` as `expandId` builds it -- a document of one
+/// field built as it comes, of more with room for them reserved -- and a
+/// `$push` / `$addToSet` array of the values it took, each as its
+/// expression built it.
+fn output_held(id_expr: &Bson, compiled: &[Compiled], name: &str, v: &Bson) -> usize {
+    use crate::docstore::{held, produced_held, produced_size, Stored};
+    if name == "_id" {
+        let Some(fields) = id_fields(id_expr) else {
+            return produced_held(id_expr, v);
+        };
+        let Bson::Document(d) = v else {
+            return held(v);
+        };
+        let mut s = if fields.len() == 1 {
+            Stored::built()
+        } else {
+            Stored::reserved(fields.len())
+        };
+        for (f, expr) in fields {
+            s.set_field(f, d.get(f).map_or(0, |fv| produced_held(expr, fv)));
+        }
+        return s.approximate();
+    }
+    match (compiled.iter().find(|c| c.field == name), v) {
+        (Some(c), Bson::Array(items)) if matches!(c.op, "$push" | "$addToSet") => {
+            memlimit::RC_VECTOR
+                + items
+                    .iter()
+                    .map(|item| produced_size(c.arg, item))
+                    .sum::<usize>()
+        }
+        _ => held(v),
+    }
+}
+
+/// The storage of each document a `$group` stage `spec` returned, as
+/// `makeDocument` builds it: room for its fields reserved, then each added
+/// ([`output_held`]).
+pub(crate) fn output_stores(spec: &Bson, out: &[Document]) -> Vec<crate::docstore::Stored> {
+    let Bson::Document(s) = spec else {
+        return Vec::new();
+    };
+    let id_expr = s.get("_id").unwrap_or(&Bson::Null);
+    let compiled: Vec<Compiled> = s
+        .iter()
+        .filter(|(k, _)| *k != "_id")
+        .filter_map(|(field, v)| {
+            let (op, arg) = v.as_document()?.iter().next()?;
+            Some(Compiled { field, op, arg })
+        })
+        .collect();
+    out.iter()
+        .map(|d| {
+            let mut st = crate::docstore::Stored::reserved(d.len());
+            for (name, v) in d {
+                st.add_field(name, output_held(id_expr, &compiled, name, v));
+            }
+            st
+        })
+        .collect()
 }
 
 /// `$group` stage entry point.
@@ -3236,6 +3367,7 @@ pub fn bucket_auto_stage(spec: &Bson, docs: &[Document], vars: &Document) -> R<V
                 .values()
                 .all(|acc| collect_fields(acc, &mut fields));
         let sizing = crate::sorter::Sizing {
+            sizes: None,
             source: crate::sorter::SortSource::BucketAuto,
             fields: bounded.then_some(&fields),
             budget: memlimit::budgets().bucket_auto,

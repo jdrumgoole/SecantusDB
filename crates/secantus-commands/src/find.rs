@@ -871,6 +871,7 @@ fn find_body(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
             let _budgets = secantus_core::memlimit::with_budgets(crate::aggregate::budgets_of(ctx));
             let decoded = crate::util::decode_docs(docs.clone())?;
             let sizing = secantus_core::sorter::Sizing {
+                sizes: None,
                 source: secantus_core::sorter::SortSource::QueryLayer,
                 fields: None,
                 budget: secantus_core::memlimit::budgets().sort,
@@ -1550,6 +1551,7 @@ fn stream_find(
             crate::aggregate::budgets_of(ctx),
             doc.get_bool("allowDiskUse").unwrap_or(true),
         )),
+        keep_sort_input: false,
     };
     let mut stream = match near {
         Some(_) if wants_index_key => return Ok(None),

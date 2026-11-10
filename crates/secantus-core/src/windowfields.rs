@@ -45,6 +45,10 @@ use crate::{decimal, expressions, group, order, paths};
 type R<T> = Result<T, Fallback>;
 
 const RANK_FUNCS: [&str; 3] = ["$rank", "$denseRank", "$documentNumber"];
+
+/// The field the command layer hands a document's sort-key metadata over
+/// in, as the `$sort` in reach left it (`agg_meta::rewrite_sort_metadata`).
+pub const SORT_KEY_FIELD: &str = "__secantus_meta_sortKey";
 /// Ops whose output is a per-slot vector precomputed once over the sorted
 /// partition (prefix accumulation / gap-fill), rather than a window accumulator.
 const PREFIX_OPS: [&str; 3] = ["$expMovingAvg", "$locf", "$linearFill"];
@@ -74,7 +78,7 @@ pub fn set_window_fields_stage(
     vars: &Document,
 ) -> R<Vec<Document>> {
     let mut out = Vec::with_capacity(docs.len());
-    set_window_fields_each(spec, docs, vars, None, None, &mut |d| {
+    set_window_fields_each(spec, docs, vars, None, None, None, &mut |d| {
         out.push(d);
         Ok(())
     })?;
@@ -105,10 +109,11 @@ pub(crate) fn set_window_fields_each(
     docs: Vec<Document>,
     vars: &Document,
     downstream: Option<&std::collections::BTreeSet<String>>,
+    sizes: Option<&[usize]>,
     reads: Option<&mut Vec<usize>>,
     sink: &mut dyn FnMut(Document) -> R<()>,
 ) -> R<()> {
-    window_fields_each(spec, docs, vars, downstream, false, reads, sink)
+    window_fields_each(spec, docs, vars, downstream, sizes, false, reads, sink)
 }
 
 /// The refusal `$setWindowFields` (or, with `presorted`,
@@ -126,6 +131,7 @@ pub fn set_window_fields_spec_refusal(spec: &Bson, presorted: bool) -> Option<Fa
         spec,
         Vec::new(),
         &Document::new(),
+        None,
         None,
         presorted,
         None,
@@ -147,17 +153,22 @@ pub(crate) fn internal_set_window_fields_each(
     docs: Vec<Document>,
     vars: &Document,
     downstream: Option<&std::collections::BTreeSet<String>>,
+    sizes: Option<&[usize]>,
     reads: Option<&mut Vec<usize>>,
     sink: &mut dyn FnMut(Document) -> R<()>,
 ) -> R<()> {
-    window_fields_each(spec, docs, vars, downstream, true, reads, sink)
+    window_fields_each(spec, docs, vars, downstream, sizes, true, reads, sink)
 }
 
+/// `sizes`: when given, each of `docs`' size as mongod's partition cache
+/// counts it (`Document::getApproximateSize` of its storage, RM-408).
+#[allow(clippy::too_many_arguments)]
 fn window_fields_each(
     spec: &Bson,
     docs: Vec<Document>,
     vars: &Document,
     downstream: Option<&std::collections::BTreeSet<String>>,
+    sizes: Option<&[usize]>,
     presorted: bool,
     mut reads: Option<&mut Vec<usize>>,
     sink: &mut dyn FnMut(Document) -> R<()>,
@@ -354,6 +365,15 @@ fn window_fields_each(
     }
 
     let needs_rank = compiled.iter().any(|c| RANK_FUNCS.contains(&c.op));
+    // `$_internalSetWindowFields` ranks by the sort key a `$sort` in front
+    // attached (`ExpressionInternalRawSortKey`), not by its `sortBy`: with no
+    // `$sort` in reach the key is empty and every document ties (mongod
+    // 8.2.1 and 8.2.11, 2026-11-10, RM-410). The key is taken off each
+    // document while the stage runs, so the partition cache does not count
+    // it as a field, and put back on as it leaves for the stages after.
+    let mut docs = docs;
+    let metadata: Option<Vec<Option<Bson>>> =
+        presorted.then(|| docs.iter_mut().map(|d| d.remove(SORT_KEY_FIELD)).collect());
     // Range windows, `$linearFill`, and `$derivative`/`$integral` all need the
     // single-ascending-numeric sortBy values (window bounds / interp / rate x-axis).
     let needs_range = compiled.iter().any(|c| {
@@ -417,8 +437,10 @@ fn window_fields_each(
 
     // What of each document the partition cache holds.
     let cached = cache_fields(spec, &compiled, downstream);
-    let sizer = match sort_by {
-        Some(sort_by) if needs_rank => CacheSize::SortKey {
+    let sizer = match (sort_by, &metadata) {
+        _ if sizes.is_some() => CacheSize::Sized(sizes.unwrap_or_default()),
+        (_, Some(m)) if needs_rank => CacheSize::Metadata(m),
+        (Some(sort_by), _) if needs_rank => CacheSize::SortKey {
             partition_by,
             sort_by,
             vars,
@@ -453,7 +475,7 @@ fn window_fields_each(
                     next: ordered
                         .get(pi + 1)
                         .filter(|next| !next.is_empty())
-                        .map(|next| (sizer.of(&docs[next[0]]), key(next))),
+                        .map(|next| (sizer.of(&docs, next[0]), key(next))),
                 }
             }
             None => PartitionToken::default(),
@@ -461,7 +483,11 @@ fn window_fields_each(
         let slots = slots.clone();
         let n = slots.len();
         let ranks = if needs_rank {
-            Some(compute_ranks(&slots, &docs, sort_by))
+            let keys = match &metadata {
+                Some(m) => RankKeys::Metadata(m),
+                None => RankKeys::SortBy(sort_by),
+            };
+            Some(compute_ranks(&slots, &docs, &keys))
         } else {
             None
         };
@@ -659,6 +685,9 @@ fn window_fields_each(
                 };
                 paths::set_path(&mut out_doc, c.field, value).map_err(|_| Fallback::Defer)?;
             }
+            if let Some(Some(key)) = metadata.as_ref().map(|m| &m[orig_i]) {
+                out_doc.insert(SORT_KEY_FIELD, key.clone());
+            }
             sink(out_doc)?;
         }
         base += n;
@@ -776,8 +805,12 @@ fn reach(
         .or_else(|| w.get("range"))
         .and_then(Bson::as_array)
         .and_then(|b| b.get(1));
+    let current = matches!(upper, Some(Bson::String(s)) if s == "current");
     let hi = match upper {
         Some(Bson::String(s)) if s == "unbounded" => last + 1,
+        // `"current"` is the document answered: a `range` window looks no
+        // further for its end (`getEndpointsRangeBased`; RM-404).
+        _ if current => p,
         _ if range => hi + 1,
         // A document window asks for its upper bound, which `window_bounds`
         // clamps to the partition.
@@ -785,6 +818,39 @@ fn reach(
         Some(Bson::Int64(k)) => p + k,
         _ => hi,
     };
+    // A window with no lower end runs an accumulator that never lets a value
+    // go (`WindowFunctionExecNonRemovable[Range]`; `$first`, `$last` and
+    // `$derivative` run their own executors), so it holds only what it has
+    // still to read. A `documents` one reads its upper end and lets go of
+    // what lies left of it (`kDefaultSequential`): `[-4]` keeps the four
+    // documents behind the one answered. A `range` one lets go of what lies
+    // left of the right endpoint it found answering the document before
+    // (`kRightEndpoint`), nothing while its window is empty (macOS 8.2.1
+    // and Linux 8.2.12, RM-404: `["unbounded", 4]` over values two apart
+    // holds four documents, `["unbounded", -9]` seven).
+    if !window_removes(Some(w)) && !matches!(c.op, "$first" | "$last" | "$derivative") {
+        let keep = if range {
+            match pos.checked_sub(1) {
+                Some(before) if current => before,
+                Some(before) => {
+                    let (lo, hi) = range_window_bounds(before, n, w, range_vals, range_dates)?;
+                    if hi >= lo {
+                        clamp(hi).min(pos)
+                    } else {
+                        0
+                    }
+                }
+                None => 0,
+            }
+        } else {
+            match upper {
+                Some(Bson::Int32(k)) if *k < 0 => clamp(p + i64::from(*k)),
+                Some(Bson::Int64(k)) if *k < 0 => clamp(p + k),
+                _ => pos,
+            }
+        };
+        return Ok((keep, hi.max(p)));
+    }
     if range || (matches!(c.op, "$first" | "$last") && window_removes(Some(w))) {
         return Ok((clamp((lo - 1).min(p)), hi.max(p)));
     }
@@ -803,8 +869,8 @@ enum FunctionMemory {
     /// `AccumulatorRank` / `AccumulatorDenseRank` /
     /// `AccumulatorDocumentNumber`: `sizeof(*this)`, and for `$rank` and
     /// `$denseRank` the last distinct sort key, beyond the `Value` held
-    /// inline (Linux 8.2.12, x86-64 and arm64: 376, 368, 368; macOS arm64
-    /// 8.2.1 counts 32 less, RM-403).
+    /// inline (the build's own, `memlimit::LAYOUT`: Linux 8.2.12 376, 368,
+    /// 368; macOS arm64 32 less).
     Rank {
         base: usize,
         keeps_key: bool,
@@ -813,38 +879,64 @@ enum FunctionMemory {
     /// once for a value a `Value` holds inline, twice for one on the heap,
     /// and `$push` every value twice (Linux x86-64 8.2.11, five ints in a
     /// `[-5, 5]` window: `$sum` 376, `$avg` 384, `$push` 320, `$stdDevPop`
-    /// 552; macOS arm64 counts 24 more for `$sum`).
+    /// 552; its own size is the build's, `memlimit::LAYOUT`: macOS arm64
+    /// counts 8 more for `$sum` and `$avg`, 16 for `$stdDevPop`, and 32
+    /// less for `$push`).
     Removable {
         base: usize,
         sizes: Vec<Option<usize>>,
+        /// The window it answered last, as `(from, upto)`.
+        last: Option<(usize, usize)>,
     },
     Growing {
         acc: group::Acc,
         fed: usize,
     },
+    /// `AccumulatorExpMovingAvg`: its own size alone, whatever it averages
+    /// (136, measured macOS 8.2.1 over ints, decimals and missing values;
+    /// Linux 8.2.12's least budgets agree; RM-404).
+    ExpMovingAvg,
+    /// `AccumulatorLocf`: its own size (128), and what the last value it
+    /// carries holds beyond its inline `Value` -- nothing for an int, a
+    /// string's buffer (measured macOS 8.2.1; Linux 8.2.12's least budgets
+    /// agree; RM-404).
+    Locf {
+        last: Option<usize>,
+        fed: usize,
+    },
 }
+
+/// `AccumulatorExpMovingAvg`'s size (RM-404).
+const EXP_MOVING_AVG: usize = 136;
+/// `AccumulatorLocf`'s size, before the value it carries (RM-404).
+const LOCF: usize = 128;
 
 impl FunctionMemory {
     fn of(c: &OutField) -> R<FunctionMemory> {
         match c.op {
             "$rank" => {
                 return Ok(FunctionMemory::Rank {
-                    base: 376,
+                    base: crate::memlimit::LAYOUT.rank,
                     keeps_key: true,
                 })
             }
             "$denseRank" => {
                 return Ok(FunctionMemory::Rank {
-                    base: 368,
+                    base: crate::memlimit::LAYOUT.dense_rank,
                     keeps_key: true,
                 })
             }
             "$documentNumber" => {
                 return Ok(FunctionMemory::Rank {
-                    base: 368,
+                    base: crate::memlimit::LAYOUT.document_number,
                     keeps_key: false,
                 })
             }
+            _ => {}
+        }
+        match c.op {
+            "$expMovingAvg" => return Ok(FunctionMemory::ExpMovingAvg),
+            "$locf" => return Ok(FunctionMemory::Locf { last: None, fed: 0 }),
             _ => {}
         }
         if matches!(c.op, "$first" | "$last")
@@ -857,12 +949,14 @@ impl FunctionMemory {
         if window_removes(c.window) {
             return Ok(FunctionMemory::Removable {
                 base: match c.op {
-                    "$avg" => 304,
-                    "$push" => 160,
-                    "$stdDevPop" | "$stdDevSamp" => 472,
-                    _ => 296,
+                    "$avg" => crate::memlimit::LAYOUT.removable_avg,
+                    "$push" => crate::memlimit::LAYOUT.removable_push,
+                    "$stdDevPop" | "$stdDevSamp" => crate::memlimit::LAYOUT.removable_std_dev,
+                    "$min" | "$max" => crate::memlimit::LAYOUT.removable_min_max,
+                    _ => crate::memlimit::LAYOUT.removable,
                 },
                 sizes: Vec::new(),
+                last: None,
             });
         }
         Ok(FunctionMemory::Growing {
@@ -872,7 +966,13 @@ impl FunctionMemory {
     }
 
     /// The bytes held once the window covers indices `from..=upto` of
-    /// `slots`, answering `pos`.
+    /// `slots`, answering `pos`, and the most held on the way there. A
+    /// removable function takes in the values entering its window before
+    /// it lets go of those leaving (`WindowFunctionExecRemovableDocument`
+    /// and `...Range::update`, r8.2.1), so for a moment it holds both
+    /// windows: mongod's tracker keeps that as its maximum, while its
+    /// budget is checked once the update is done (measured 8.2.1 and
+    /// 8.2.11: a `[-5, 5]` `$sum` of ints peaks at 12 values).
     #[allow(clippy::too_many_arguments)]
     fn held(
         &mut self,
@@ -884,55 +984,88 @@ impl FunctionMemory {
         vars: &Document,
         sizer: &CacheSize,
         ranks: Option<&Ranks>,
-    ) -> R<usize> {
+    ) -> R<(usize, usize)> {
         Ok(match self {
-            FunctionMemory::Nothing => 0,
+            FunctionMemory::Nothing => (0, 0),
             FunctionMemory::Rank { base, keeps_key } => {
                 // The key the accumulator kept: the first of the documents
                 // tied with this one.
                 let first_tied = ranks.map_or(pos, |r| r.rank[pos] as usize - 1);
-                match sizer.sort_key(&docs[slots[first_tied]]) {
+                let held = match sizer.sort_key(docs, slots[first_tied]) {
                     Some(key) if *keeps_key => {
                         *base + crate::memlimit::classic_size(&key) - crate::memlimit::VALUE
                     }
                     _ => *base,
-                }
+                };
+                (held, held)
             }
-            FunctionMemory::Removable { base, sizes } => {
+            FunctionMemory::Removable { base, sizes, last } => {
                 if sizes.is_empty() {
                     sizes.resize(slots.len(), None);
                 }
-                let mut held = *base;
-                for i in from..=upto.min(slots.len() - 1) {
-                    let size = match sizes[i] {
-                        Some(s) => s,
-                        None => {
-                            let v = if c.op == "$count" {
-                                Bson::Int32(1)
-                            } else {
-                                expressions::evaluate(&docs[slots[i]], c.arg, vars)
-                                    .unwrap_or(Bson::Null)
-                            };
-                            let size = crate::memlimit::classic_size(&v);
-                            let s = if size > 16 || c.op == "$push" {
-                                2 * size
-                            } else {
-                                size
-                            };
-                            sizes[i] = Some(s);
-                            s
-                        }
+                let mut value_size = |i: usize| -> usize {
+                    if let Some(s) = sizes[i] {
+                        return s;
+                    }
+                    let v = if c.op == "$count" {
+                        Bson::Int32(1)
+                    } else {
+                        expressions::evaluate(&docs[slots[i]], c.arg, vars).unwrap_or(Bson::Null)
                     };
-                    held += size;
+                    let size = crate::memlimit::classic_size(&v);
+                    // `$min` / `$max` keep every value that is not nullish in
+                    // their multiset, beside the executor's queue of all
+                    // (`WindowFunctionMinMaxCommon::add`; RM-404).
+                    let min_max = matches!(c.op, "$min" | "$max")
+                        && !matches!(v, Bson::Null | Bson::Undefined);
+                    let s = if size > 16 || c.op == "$push" || min_max {
+                        2 * size
+                    } else {
+                        size
+                    };
+                    sizes[i] = Some(s);
+                    s
+                };
+                let end = slots.len() - 1;
+                let mut held = *base;
+                for i in from..=upto.min(end) {
+                    held += value_size(i);
                 }
-                held
+                // The values leaving, still held while the entering ones
+                // went in: only when some entered.
+                let mut peak = held;
+                if let Some((was_from, was_upto)) = *last {
+                    if upto.min(end) > was_upto.min(end) {
+                        for i in was_from..=was_upto.min(end) {
+                            if i < from || i > upto {
+                                peak += value_size(i);
+                            }
+                        }
+                    }
+                }
+                *last = Some((from, upto));
+                (held, peak)
             }
             FunctionMemory::Growing { acc, fed } => {
                 while *fed <= upto && *fed < slots.len() {
                     group::apply_acc(acc, c.arg, &docs[slots[*fed]], vars)?;
                     *fed += 1;
                 }
-                group::acc_memory_classic(acc)
+                let held = group::acc_memory_classic(acc);
+                (held, held)
+            }
+            FunctionMemory::ExpMovingAvg => (EXP_MOVING_AVG, EXP_MOVING_AVG),
+            FunctionMemory::Locf { last, fed } => {
+                while *fed <= pos && *fed < slots.len() {
+                    let v = expressions::evaluate(&docs[slots[*fed]], c.arg, vars)
+                        .unwrap_or(Bson::Null);
+                    if !matches!(v, Bson::Null | Bson::Undefined) {
+                        *last = Some(crate::memlimit::classic_size(&v) - crate::memlimit::VALUE);
+                    }
+                    *fed += 1;
+                }
+                let held = LOCF + last.unwrap_or(0);
+                (held, held)
             }
         })
     }
@@ -1040,15 +1173,27 @@ enum CacheSize<'a> {
         sort_by: &'a Document,
         vars: &'a Document,
     },
+    /// `$_internalSetWindowFields`' rank functions read the sort key the
+    /// documents came with, by their index in the stage's input: one value
+    /// for a one-field `$sort`, an array for more, and the empty array with
+    /// no `$sort` in reach (mongod 8.2.11 holds 40 bytes more for it than
+    /// for an int, 2026-11-10, RM-410).
+    Metadata(&'a [Option<Bson>]),
+    /// Each document's size, by its place in the stage's input, from the
+    /// storage the stages before it left it ([`crate::docstore`]).
+    Sized(&'a [usize]),
 }
 
 impl CacheSize<'_> {
-    fn of(&self, doc: &Document) -> usize {
+    /// What the cache counts for `docs[i]`.
+    fn of(&self, docs: &[Document], i: usize) -> usize {
+        let doc = &docs[i];
         match self {
+            CacheSize::Sized(sizes) => sizes[i],
             CacheSize::Fields(Some(f)) => crate::memlimit::fields_size(doc, f),
             CacheSize::Fields(None) => crate::memlimit::document_size(doc),
-            CacheSize::SortKey { .. } => {
-                let key = self.sort_key(doc).unwrap_or(Bson::Null);
+            CacheSize::SortKey { .. } | CacheSize::Metadata(_) => {
+                let key = self.sort_key(docs, i).unwrap_or(Bson::Null);
                 crate::memlimit::document_size(doc)
                     + crate::memlimit::SORT_KEY_METADATA
                     + crate::memlimit::classic_size(&key)
@@ -1056,8 +1201,15 @@ impl CacheSize<'_> {
         }
     }
 
-    /// The sort key `$sort` attaches to `doc`, when the cache keeps it.
-    fn sort_key(&self, doc: &Document) -> Option<Bson> {
+    /// The sort key `$sort` attaches to `docs[i]`, when the cache keeps it.
+    fn sort_key(&self, docs: &[Document], i: usize) -> Option<Bson> {
+        if let CacheSize::Metadata(keys) = self {
+            return Some(match &keys[i] {
+                Some(Bson::Array(parts)) if parts.len() == 1 => parts[0].clone(),
+                Some(key) => key.clone(),
+                None => Bson::Array(Vec::new()),
+            });
+        }
         let CacheSize::SortKey {
             partition_by,
             sort_by,
@@ -1066,20 +1218,45 @@ impl CacheSize<'_> {
         else {
             return None;
         };
-        let mut parts = Vec::with_capacity(sort_by.len() + 1);
-        if let Some(by) = partition_by {
-            parts.push(partition_key(doc, by, vars));
-        }
-        for (field, dir) in sort_by.iter() {
-            let desc = matches!(dir, Bson::Int32(-1) | Bson::Int64(-1));
-            parts.push(order::sort_repr(field_value(doc, field), desc));
-        }
-        Some(if parts.len() == 1 {
-            parts.pop().expect("one part")
-        } else {
-            Bson::Array(parts)
-        })
+        Some(sort_key(&docs[i], *partition_by, Some(sort_by), vars))
     }
+}
+
+/// The sort key the `$sort` a window runs behind attaches to `doc`: the
+/// partition key first when there is one, then the `sortBy` values, an
+/// array when there are two or more.
+pub(crate) fn sort_key(
+    doc: &Document,
+    partition_by: Option<&Bson>,
+    sort_by: Option<&Document>,
+    vars: &Document,
+) -> Bson {
+    let mut parts = Vec::new();
+    if let Some(by) = partition_by {
+        parts.push(partition_key(doc, by, vars));
+    }
+    for (field, dir) in sort_by.into_iter().flatten() {
+        let desc = matches!(dir, Bson::Int32(-1) | Bson::Int64(-1));
+        parts.push(order::sort_repr(field_value(doc, field), desc));
+    }
+    if parts.len() == 1 {
+        parts.pop().expect("one part")
+    } else {
+        Bson::Array(parts)
+    }
+}
+
+/// Whether one of the stage's functions ranks, reading the sort key the
+/// `$sort` in front of it attaches to each document.
+pub(crate) fn reads_sort_key(spec: &Bson) -> bool {
+    spec.as_document()
+        .and_then(|s| s.get_document("output").ok())
+        .is_some_and(|out| {
+            out.values().any(|f| {
+                f.as_document()
+                    .is_some_and(|f| f.keys().any(|op| RANK_FUNCS.contains(&op.as_str())))
+            })
+        })
 }
 
 /// `doc`'s partition key as `PartitionKeyComparator` holds it: missing is
@@ -1156,7 +1333,7 @@ fn run_cache(
     }
     let last = n as i64 - 1;
     let budget = crate::memlimit::budgets().window_fields;
-    let size = |i: usize| sizer.of(&docs[slots[i]]);
+    let size = |i: usize| sizer.of(docs, slots[i]);
     let mut read_next = false;
     let mut functions = compiled
         .iter()
@@ -1214,6 +1391,7 @@ fn run_cache(
         Ok(())
     };
     let mut outside_before = token.bytes(false);
+    let mut held_before = vec![0usize; compiled.len()];
     for pos in 0..n {
         let mut ahead = pos as i64;
         let mut reads = Vec::with_capacity(compiled.len());
@@ -1237,15 +1415,25 @@ fn run_cache(
             &mut stats.total,
         )?;
         read_next |= ahead > last;
+        // The functions update one after another: while one holds its
+        // peak, those before it hold their new windows and those after it
+        // their old ones.
         let mut functions_held = 0usize;
-        for (((f, c), window), max) in functions
+        let mut not_yet: usize = held_before.iter().sum();
+        for ((((f, c), window), max), before) in functions
             .iter_mut()
             .zip(compiled)
             .zip(&reads)
             .zip(stats.functions.iter_mut())
+            .zip(held_before.iter_mut())
         {
-            let held = f.held(c, pos, *window, slots, docs, vars, sizer, ranks)?;
-            *max = (*max).max(held);
+            let (held, peak) = f.held(c, pos, *window, slots, docs, vars, sizer, ranks)?;
+            *max = (*max).max(peak);
+            not_yet -= *before;
+            stats.total = stats
+                .total
+                .max(cache.used + functions_held + peak + not_yet + token.peak(read_next));
+            *before = held;
             functions_held += held;
         }
         let outside = functions_held + token.bytes(read_next);
@@ -1323,6 +1511,16 @@ fn sorted_slots(part: &[usize], docs: &[Document], sort_by: Option<&Document>) -
     Ok(slots)
 }
 
+/// What a rank function compares to find ties.
+enum RankKeys<'a> {
+    /// `$setWindowFields`: the `sortBy` values its own `$sort` ordered by.
+    SortBy(Option<&'a Document>),
+    /// `$_internalSetWindowFields`: each document's sort-key metadata, by
+    /// its index in the stage's input; `None` (no `$sort` in reach) is the
+    /// empty key.
+    Metadata(&'a [Option<Bson>]),
+}
+
 struct Ranks {
     doc_number: Vec<i32>,
     rank: Vec<i32>,
@@ -1332,8 +1530,8 @@ struct Ranks {
 /// Per-slot rank vectors over a sorted partition. `$documentNumber` is the
 /// 1-indexed slot; `$rank` restarts at the tie-group's first slot (gaps on
 /// ties); `$denseRank` increments once per distinct sort key (no gaps). Ties are
-/// consecutive slots whose `sortBy` field values all compare `Equal`.
-fn compute_ranks(slots: &[usize], docs: &[Document], sort_by: Option<&Document>) -> Ranks {
+/// consecutive slots whose keys compare `Equal`.
+fn compute_ranks(slots: &[usize], docs: &[Document], keys: &RankKeys) -> Ranks {
     let n = slots.len();
     let mut doc_number = vec![0i32; n];
     let mut rank = vec![0i32; n];
@@ -1352,15 +1550,20 @@ fn compute_ranks(slots: &[usize], docs: &[Document], sort_by: Option<&Document>)
     let mut cur_dense = 1i32;
     for i in 1..n {
         doc_number[i] = i as i32 + 1;
-        let tied = match sort_by {
-            Some(sb) => sb.iter().all(|(f, dir)| {
+        let tied = match keys {
+            RankKeys::SortBy(Some(sb)) => sb.iter().all(|(f, dir)| {
                 let desc = matches!(dir, Bson::Int32(-1) | Bson::Int64(-1));
                 order::cmp(
                     &order::sort_repr(field_value(&docs[slots[i]], f), desc),
                     &order::sort_repr(field_value(&docs[slots[i - 1]], f), desc),
                 ) == Ordering::Equal
             }),
-            None => false,
+            RankKeys::SortBy(None) => false,
+            RankKeys::Metadata(m) => {
+                let empty = Bson::Array(Vec::new());
+                let key = |slot: usize| m[slot].as_ref().unwrap_or(&empty);
+                order::cmp(key(slots[i]), key(slots[i - 1])) == Ordering::Equal
+            }
         };
         if !tied {
             cur_rank = i as i32 + 1;
@@ -2607,6 +2810,7 @@ mod budget_tests {
             &Document::new(),
             Some(&downstream),
             None,
+            None,
             &mut |_| Ok(()),
         )
     }
@@ -2650,6 +2854,7 @@ mod budget_tests {
                 docs.clone(),
                 &Document::new(),
                 None,
+                None,
                 Some(&mut reads),
                 &mut |_| Ok(()),
             )
@@ -2679,16 +2884,93 @@ mod budget_tests {
             "output": {"t": {"$sum": "$n"}},
         });
         let mut out = Vec::new();
-        internal_set_window_fields_each(&spec, docs, &Document::new(), None, None, &mut |d| {
-            out.push(d);
-            Ok(())
-        })
+        internal_set_window_fields_each(
+            &spec,
+            docs,
+            &Document::new(),
+            None,
+            None,
+            None,
+            &mut |d| {
+                out.push(d);
+                Ok(())
+            },
+        )
         .unwrap();
         let totals: Vec<(i32, i32)> = out
             .iter()
             .map(|d| (d.get_i32("_id").unwrap(), d.get_i32("t").unwrap()))
             .collect();
         assert_eq!(totals, [(0, 0), (1, 1), (2, 2), (3, 7), (4, 7), (5, 5)]);
+    }
+
+    /// `$_internalSetWindowFields` ranks by the sort key each document
+    /// came with, not by its `sortBy`, and with none every document ties
+    /// (mongod 8.2.1 and 8.2.11, 2026-11-10, RM-410). The key goes back on
+    /// each document for the stages after.
+    #[test]
+    fn the_internal_stage_ranks_by_the_sort_key_it_was_given() {
+        let ranks = |keys: &[Option<Bson>]| {
+            let docs: Vec<Document> = [3, 1, 2, 2, 5]
+                .iter()
+                .zip(keys)
+                .enumerate()
+                .map(|(i, (n, key))| {
+                    let mut d = doc! {"_id": i as i32, "n": *n};
+                    if let Some(key) = key {
+                        d.insert(SORT_KEY_FIELD, key.clone());
+                    }
+                    d
+                })
+                .collect();
+            let spec = Bson::Document(doc! {
+                "sortBy": {"n": 1},
+                "output": {"r": {"$rank": {}}, "d": {"$denseRank": {}}},
+            });
+            let mut out = Vec::new();
+            internal_set_window_fields_each(
+                &spec,
+                docs,
+                &Document::new(),
+                None,
+                None,
+                None,
+                &mut |d| {
+                    out.push(d);
+                    Ok(())
+                },
+            )
+            .unwrap();
+            out
+        };
+        let none = ranks(&[None, None, None, None, None]);
+        let got: Vec<(i32, i32)> = none
+            .iter()
+            .map(|d| (d.get_i32("r").unwrap(), d.get_i32("d").unwrap()))
+            .collect();
+        assert_eq!(got, [(1, 1); 5]);
+        assert!(none.iter().all(|d| !d.contains_key(SORT_KEY_FIELD)));
+
+        // A `$sort` on another field: ties follow its key, and an empty
+        // array's (`undefined`) is not a null's.
+        let keys = [
+            bson!([0]),
+            bson!([0]),
+            Bson::Array(vec![Bson::Undefined]),
+            bson!([null]),
+            bson!([null]),
+        ];
+        let sorted = ranks(&keys.clone().map(Some));
+        let got: Vec<(i32, i32)> = sorted
+            .iter()
+            .map(|d| (d.get_i32("r").unwrap(), d.get_i32("d").unwrap()))
+            .collect();
+        assert_eq!(got, [(1, 1), (1, 1), (3, 2), (4, 3), (4, 3)]);
+        let back: Vec<&Bson> = sorted
+            .iter()
+            .map(|d| d.get(SORT_KEY_FIELD).unwrap())
+            .collect();
+        assert_eq!(back, keys.iter().collect::<Vec<_>>());
     }
 
     /// What `explain` lists for the stage: each function's most and the
@@ -2698,7 +2980,15 @@ mod budget_tests {
     fn a_window_reports_its_memory_at_its_peak() {
         let spec = window(bson!({"$first": "$n"}), false);
         let (_, report) = memlimit::captured(|| {
-            set_window_fields_each(&spec, docs(), &Document::new(), None, None, &mut |_| Ok(()))
+            set_window_fields_each(
+                &spec,
+                docs(),
+                &Document::new(),
+                None,
+                None,
+                None,
+                &mut |_| Ok(()),
+            )
         });
         let total: usize = docs().iter().map(memlimit::document_size).sum();
         let stats = &report.windows[0];
@@ -2710,7 +3000,15 @@ mod budget_tests {
                 window_fields: 10_000,
                 ..Default::default()
             });
-            set_window_fields_each(&spec, docs(), &Document::new(), None, None, &mut |_| Ok(()))
+            set_window_fields_each(
+                &spec,
+                docs(),
+                &Document::new(),
+                None,
+                None,
+                None,
+                &mut |_| Ok(()),
+            )
         });
         let stats = &report.windows[0];
         assert!(stats.spills > 0);
@@ -2728,18 +3026,72 @@ mod budget_tests {
     #[test]
     fn a_partitioned_window_counts_the_next_partitions_first_document() {
         let (least, refusal) = least(window(bson!({"$sum": "$n"}), true));
-        assert_eq!(least, 2304);
-        // What is left once the cache goes: the function's 176 bytes, the
-        // partition key's 16 and the next partition's first document's 132.
-        assert!(refusal.contains("5414201") && refusal.contains("used 324 bytes"));
+        // The function's own size: Linux's 176 bytes (2304), macOS arm64's
+        // 184 (2312, RM-403).
+        let sum = crate::memlimit::LAYOUT.sum;
+        assert_eq!(least, 2128 + sum);
+        // What is left once the cache goes: the function, the partition
+        // key's 16 and the next partition's first document's 132.
+        let used = format!("used {} bytes", sum + 16 + 132);
+        assert!(
+            refusal.contains("5414201") && refusal.contains(&used),
+            "{refusal}"
+        );
+    }
+
+    /// Linux mongod 8.2.12: 1222 and 12885; macOS arm64 8.2.1, whose
+    /// removable `$sum` is 8 bytes larger and `$push` 32 smaller: 1230 and
+    /// 12853 (RM-403).
+    #[test]
+    fn windows_with_no_lower_end_hold_what_they_have_still_to_read() {
+        // RM-404 (macOS 8.2.1, Linux 8.2.12): each document cached is
+        // `{_id, n}` with mongod's `Document` overhead; `n` runs two apart.
+        let fields = ["_id", "n"].map(String::from).into_iter().collect();
+        let doc = memlimit::fields_size(&docs()[0], &fields);
+        let layout = memlimit::LAYOUT;
+        let sum = |w: Bson| least(window(bson!({"$sum": "$n", "window": w}), false)).0;
+        // `range`: from the right end found answering the one before, to
+        // the document past this one's.
+        assert_eq!(
+            sum(bson!({"range": ["unbounded", 4]})),
+            4 * doc + layout.sum
+        );
+        assert_eq!(
+            sum(bson!({"range": ["unbounded", 0]})),
+            3 * doc + layout.sum
+        );
+        assert_eq!(
+            sum(bson!({"range": ["unbounded", -9]})),
+            7 * doc + layout.sum
+        );
+        assert_eq!(
+            sum(bson!({"range": ["unbounded", "current"]})),
+            2 * doc + layout.sum
+        );
+        // `documents`: from its upper end.
+        assert_eq!(
+            sum(bson!({"documents": ["unbounded", -4]})),
+            5 * doc + layout.sum
+        );
+        // A function that counts itself, besides the document answered.
+        let ema = bson!({"$expMovingAvg": {"input": "$n", "N": 2}});
+        assert_eq!(least(window(ema, false)).0, doc + EXP_MOVING_AVG);
+        assert_eq!(least(window(bson!({"$locf": "$n"}), false)).0, doc + LOCF);
+        // `$min` / `$max`: each int in the queue and in the multiset.
+        let max = bson!({"$max": "$n", "window": {"documents": [-3, 3]}});
+        assert_eq!(
+            least(window(max, false)).0,
+            4 * doc + layout.removable_min_max + 7 * 2 * memlimit::VALUE
+        );
     }
 
     #[test]
     fn removable_windows_keep_their_budgets() {
+        let layout = crate::memlimit::LAYOUT;
         let sum = bson!({"$sum": "$n", "window": {"documents": [-5, 5]}});
-        assert_eq!(least(window(sum, false)).0, 1222);
+        assert_eq!(least(window(sum, false)).0, 926 + layout.removable);
         let push = bson!({"$push": "$s", "window": {"documents": [-5, 5]}});
-        assert_eq!(least(window(push, false)).0, 12885);
+        assert_eq!(least(window(push, false)).0, 12725 + layout.removable_push);
     }
 
     /// 8.2.1 and 8.2.12, 2026-11-08 (RM-405).

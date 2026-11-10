@@ -54,7 +54,7 @@ pub(crate) const VALUE: usize = 16;
 /// string `Value` of n bytes is n + 40).
 const RC_STRING: usize = 24;
 /// `sizeof(RCVector<Value>)`.
-const RC_VECTOR: usize = 40;
+pub(crate) const RC_VECTOR: usize = 40;
 /// `sizeof(RCDecimal)`.
 const RC_DECIMAL: usize = 32;
 /// The longest string a classic `Value` keeps inline.
@@ -68,6 +68,76 @@ const SBE_SMALL_STR: usize = 7;
 pub const ACCUMULATOR_BASE: usize = 144;
 /// `sizeof(AccumulatorPush)` (and `$concatArrays`'s), measured the same way.
 pub const PUSH_BASE: usize = 120;
+
+/// The function sizes a mongod build counts that follow from how it was
+/// built -- its standard library -- rather than from what the function
+/// holds. One per mongod build, chosen by the target this server is built
+/// for: each platform's mongod is the reference (Joe, 2026-11-07).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Layout {
+    /// A classic `$sum` / `$count` accumulator (`AccumulatorSum`).
+    pub sum: usize,
+    /// A removable window function's own size, before the values in its
+    /// window: `$sum` and the functions sized as it is, `$avg`, `$push`,
+    /// `$stdDevPop` / `$stdDevSamp`.
+    pub removable: usize,
+    pub removable_avg: usize,
+    pub removable_push: usize,
+    pub removable_std_dev: usize,
+    /// `WindowFunctionMinMax` (`$min` / `$max`), before the values its
+    /// multiset and its executor's queue hold (RM-404: macOS 8.2.1 112,
+    /// from `maxFunctionMemoryUsageBytes` over windows of one to eleven
+    /// documents; Linux 8.2.12 128, from the least budget of a `[-3, 3]`
+    /// window, 852).
+    pub removable_min_max: usize,
+    /// `AccumulatorRank`, `AccumulatorDenseRank`,
+    /// `AccumulatorDocumentNumber`.
+    pub rank: usize,
+    pub dense_rank: usize,
+    pub document_number: usize,
+}
+
+/// libstdc++: Linux mongod 8.2.12, x86-64 and arm64 alike (2026-11-08,
+/// RM-327), the exemplar CI measures.
+pub(crate) const LIBSTDCXX: Layout = Layout {
+    sum: 176,
+    removable: 296,
+    removable_avg: 304,
+    removable_push: 160,
+    removable_std_dev: 472,
+    removable_min_max: 128,
+    rank: 376,
+    dense_rank: 368,
+    document_number: 368,
+};
+
+/// libc++ on arm64: macOS mongod 8.2.1 and 8.2.11, which agree (2026-11-10,
+/// RM-403: `maxAccumulatorMemoryUsageBytes`, `maxFunctionMemoryUsageBytes`
+/// over windows of one to 21 documents with and without `partitionBy`, and
+/// the least budgets). A removable function's maximum there is its size
+/// with one value more than its window holds -- the executor adds the
+/// value entering before it removes the one leaving -- so `$sum` over
+/// `[-5, 5]` peaks at 304 + 12 x 16. The other functions' sizes are
+/// Linux's.
+pub(crate) const LIBCXX_ARM64: Layout = Layout {
+    sum: 184,
+    removable: 304,
+    removable_avg: 312,
+    removable_push: 128,
+    removable_std_dev: 488,
+    removable_min_max: 112,
+    rank: 344,
+    dense_rank: 336,
+    document_number: 336,
+};
+
+/// The layout of the mongod build this server stands in for: macOS arm64's
+/// where it is built for one, Linux's everywhere else.
+pub(crate) const LAYOUT: Layout = if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+    LIBCXX_ARM64
+} else {
+    LIBSTDCXX
+};
 
 /// Each budget, in bytes: mongod's runtime-settable knobs, 100 MiB unless
 /// `setParameter` changed one.
@@ -607,35 +677,32 @@ pub fn document_size(doc: &Document) -> usize {
     bson_len(doc) + DOCUMENT_OVERHEAD
 }
 
+/// The bytes the top-level field `name` holding `v` takes in its document's
+/// BSON (`BSONElement::size`).
+pub fn element_len(name: &str, v: &Bson) -> usize {
+    2 + name.len() + value_len(v)
+}
+
 /// mongod's size of a document the classic engine built field by field,
 /// reserving room for its fields first (`MutableDocument(n)`), as a
 /// `$group` builds each document it returns (`Document::getApproximateSize`;
 /// measured on mongod 8.2.1, 2026-11-08, from `explain`'s
 /// `totalOutputDataSizeBytes` over 1 to 14 fields of names 1 to 100 bytes
-/// long, RM-328). Its storage (104 bytes), an empty BSON object (5), the
-/// buffer it allocated and what each value holds beyond its own `Value`.
-/// The buffer reserves 32 bytes a field and 32 more, and a hash table of 4
-/// bytes a bucket, 8 buckets doubling while there are more fields than
-/// buckets. A field takes its `Value`, two 4-byte words and its name with a
-/// NUL, to the next 8 bytes; once they no longer fit the buffer grows to
-/// the next power of two, at least 128, with room for the hash table.
+/// long, RM-328): its storage over an empty BSON object, the buffer
+/// `DocumentStorage` allocated, and what each value holds beyond its own
+/// `Value` ([`crate::docstore`]).
 pub fn built_document_size(doc: &Document) -> usize {
-    let fields = doc.len();
-    let mut buckets = 8;
-    while fields > buckets {
-        buckets *= 2;
+    built_document_size_with(doc, |_, v| crate::docstore::held(v))
+}
+
+/// [`built_document_size`], `held` giving what each field's value holds
+/// beyond its `Value` -- for a value an expression built rather than read.
+pub fn built_document_size_with(doc: &Document, held: impl Fn(&str, &Bson) -> usize) -> usize {
+    let mut s = crate::docstore::Stored::reserved(doc.len());
+    for (name, v) in doc {
+        s.add_field(name, held(name, v));
     }
-    let hash = 4 * buckets;
-    let mut allocated = 32 * (fields + 1) + hash;
-    let mut used = 0;
-    for (name, _) in doc {
-        used += (VALUE + 8 + name.len() + 1).div_ceil(8) * 8;
-        if used + hash > allocated {
-            allocated = (used + hash).next_power_of_two().max(128);
-        }
-    }
-    let held: usize = doc.values().map(|v| classic_size(v) - VALUE).sum();
-    DOCUMENT_OVERHEAD + 5 + allocated + held
+    s.approximate()
 }
 
 /// mongod's size of `doc` cut down to the top-level `fields` a stage and
@@ -823,7 +890,8 @@ mod tests {
     fn a_group_reports_its_accumulators_and_output() {
         // mongod 8.2.1 over 300 documents in 7 groups (2026-11-08): the
         // documents it builds take 1659 bytes; each `$sum` is counted over
-        // every group at once (here at Linux's 176 bytes a `$sum`, RM-397).
+        // every group at once, at the build's size of a `$sum` (176 bytes on
+        // Linux, 184 on macOS arm64).
         let docs: Vec<Document> = (0..300).map(|i| doc! {"_id": i, "k": i % 7}).collect();
         let spec = Bson::Document(doc! {"_id": "$k", "n": {"$sum": 1}});
         let (out, report) =
@@ -836,7 +904,7 @@ mod tests {
         assert_eq!(
             report.groups,
             [GroupStats {
-                max_accumulator_memory: vec![("n".to_string(), 7 * 176)],
+                max_accumulator_memory: vec![("n".to_string(), 7 * LAYOUT.sum as i64)],
                 total_output_data_size: 1659,
             }]
         );

@@ -246,12 +246,10 @@ fn build(
     } else {
         Default::default()
     };
-    // `{$meta: "sortKey"}`: from the `$sort` the plan reads in order, worked
-    // out for each document as a `$sort` stage leaves it (`agg_meta`).
-    if stages
-        .iter()
-        .any(|s| crate::agg_meta::mentions(s, "sortKey"))
-    {
+    // `{$meta: "sortKey"}` and a `$_internalSetWindowFields`'s ranks: from
+    // the `$sort` the plan reads in order, worked out for each document as a
+    // `$sort` stage leaves it (`agg_meta`).
+    if stages.iter().any(crate::agg_meta::reads_sort_key) {
         match &query.sort {
             Some(sort) => {
                 let mut with = vec![Bson::Document(doc! { "$sort": sort.clone() })];
