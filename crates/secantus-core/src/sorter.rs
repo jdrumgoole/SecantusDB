@@ -447,6 +447,11 @@ pub fn blocking_sort(
     let unheld = |held: Vec<Held>| held.into_iter().map(|(k, d, _)| (k, d)).collect();
     let n = items.len() as i64;
     let bucket_auto = sizing.source == SortSource::BucketAuto;
+    // mongod 8.2.11's slot-based sort adds its bytes to the counters only
+    // as it spills while taking its input: what it held at each such spill.
+    // Its last run, written when the input ends, and a sort that never
+    // spills, add none (RM-398).
+    let sbe = sizing.source == SortSource::Sbe;
     let record = |bytes: usize| {
         if !bucket_auto {
             memlimit::record_sort(n, bytes as i64);
@@ -462,7 +467,7 @@ pub fn blocking_sort(
         items.sort_by(|a, b| cmp(&a.0, &b.0));
         items.truncate(k);
         let held: usize = items.iter().map(size).sum();
-        record(if k == 1 { 0 } else { held });
+        record(if k == 1 || sbe { 0 } else { held });
         if k > 1 && held > effective && !memlimit::disk_allowed() {
             return Err(refused(budget));
         }
@@ -475,6 +480,7 @@ pub fn blocking_sort(
     let mut runs: Vec<Run> = Vec::new();
     let mut used = 0usize;
     let mut total = 0usize;
+    let mut spilled = 0usize;
     let spill = |held: &mut Vec<Held>, runs: &mut Vec<Run>| -> R<()> {
         if held.is_empty() {
             return Ok(());
@@ -498,10 +504,11 @@ pub fn blocking_sort(
         held.push(item);
         if used > effective {
             spill(&mut held, &mut runs)?;
+            spilled += used;
             used = 0;
         }
     }
-    record(total);
+    record(if sbe { spilled } else { total });
     if runs.is_empty() {
         held.sort_by(|a, b| cmp(&a.0, &b.0));
         return Ok(unheld(held));
@@ -727,6 +734,38 @@ mod tests {
         assert_eq!(counted(&twelve, 331, Some(3)), Ok(195));
         assert_eq!(counted(&twelve, 330, Some(3)), Err(Some(292)));
         assert_eq!(counted(&twelve, 1, Some(1)), Ok(0));
+    }
+
+    #[test]
+    fn an_sbe_sort_counts_only_the_bytes_it_spills_while_reading() {
+        // mongod 8.2.11, `[{$sort: {n: 1}}, {$group: {_id: "$k", f: {$first:
+        // "$s"}}}]` over 300 documents of {_id, k, s: 1000 x's, n}: a row of
+        // 1064 (the key, `k` and `s`), six spills of 43 rows while reading
+        // under 50000 bytes, 274512; its last run of 42 adds nothing, and
+        // nor does the same sort held in memory, or one with a limit (RM-398).
+        let fields: BTreeSet<String> = ["k", "s"].iter().map(|f| f.to_string()).collect();
+        let docs = || {
+            (0..300)
+                .map(|i| {
+                    let d = doc! { "_id": i, "k": i % 7, "s": "x".repeat(1000), "n": i };
+                    (vec![Bson::Int32(i)], d)
+                })
+                .collect::<Vec<_>>()
+        };
+        let counted = |budget: usize, limit: Option<usize>| {
+            let sizing = Sizing {
+                source: SortSource::Sbe,
+                fields: Some(&fields),
+                added: None,
+                budget,
+            };
+            let (out, report) = memlimit::captured(|| blocking_sort(docs(), &cmp, &sizing, limit));
+            out.unwrap();
+            (report.sort_spills > 0, report.sort_total_data_size)
+        };
+        assert_eq!(counted(50_000, None), (true, 274_512));
+        assert_eq!(counted(memlimit::MAX_BYTES, None), (false, 0));
+        assert_eq!(counted(memlimit::MAX_BYTES, Some(50)), (false, 0));
     }
 
     #[test]
