@@ -96,6 +96,9 @@ pub struct QueryOut {
     /// Each column's type modifier (`exprTypmod`, -1 for none), where the
     /// result's description carries one; empty when it is not known.
     pub typmods: Vec<i32>,
+    /// The domain each column is of, where the source keeps it (a
+    /// portal's row type, for `FETCH`); empty when it is not known.
+    pub domains: Vec<Option<String>>,
 }
 
 /// What the interpreter asks of the server.

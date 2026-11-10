@@ -1,8 +1,8 @@
 """What working RP-774 (a scalar subquery under `IS TRUE` or `COLLATE`)
 found:
 
-- `IS [NOT] TRUE / FALSE / UNKNOWN` over a value that is not `boolean` is
-  no error (RP-808).
+- `IS [NOT] TRUE / FALSE / UNKNOWN` over a value that is not `boolean` was
+  no error (RP-808, fixed).
 
 Measured on PostgreSQL 15.19 (the shared reference on port 5415): every
 statement is FROM-less or VALUES-only and creates nothing.
@@ -36,7 +36,7 @@ def _not_boolean(test: str, typ: str) -> tuple[str, str, str]:
     return ("error", "42804", f"argument of {test} must be type boolean, not type {typ}")
 
 
-@pytest.mark.backlog("RP-808")
+@pytest.mark.backlog_fixed("RP-808")
 @pytest.mark.parametrize(
     ("query", "expected"),
     [
@@ -63,8 +63,8 @@ def _not_boolean(test: str, typ: str) -> tuple[str, str, str]:
     ],
 )
 def test_a_boolean_test_over_a_non_boolean_is_42804(dsn: str, query: str, expected: object) -> None:
-    """`transformBooleanTest` coerces its argument to `boolean` and names
-    the test when it cannot: `select 1 is true` is 42804 on PostgreSQL
-    15.19. Here it is `false`, `null::int is unknown` is `true`, and `IS
-    NOT TRUE` / `IS FALSE` blame `NOT`."""
+    """`transformBooleanTest` coerced its argument to `boolean` and named
+    the test when it could not: `select 1 is true` is 42804 on PostgreSQL
+    15.19. Before RP-808 it was `false`, `null::int is unknown` was `true`,
+    and `IS NOT TRUE` / `IS FALSE` blamed `NOT`."""
     assert _answer(dsn, query) == expected

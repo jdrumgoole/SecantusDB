@@ -30859,55 +30859,63 @@ fn static_type_uncached(node: &pg_query::protobuf::Node, value: &Bson) -> String
     }
 }
 
-/// `x IS TRUE` is `coalesce(x, false)`, `x IS NOT FALSE` `coalesce(x, true)`,
-/// `x IS FALSE` `coalesce(not x, false)`, `x IS NOT TRUE` `coalesce(not x,
-/// true)`, and `IS [NOT] UNKNOWN` is `IS [NOT] NULL`.
-fn boolean_test_equivalent(
-    t: &pg_query::protobuf::BooleanTest,
-) -> Result<pg_query::protobuf::Node> {
+/// `x IS [NOT] TRUE | FALSE | UNKNOWN` as a value: never NULL, which is the
+/// whole difference from `x = true`. `transformBooleanTest` coerces `x` to
+/// boolean under the test's name, so a value of another type is 42804 at
+/// it (RP-808): the plan-time check in `optype` judges a typed operand,
+/// this one what that cannot type (`('x' || 'y') is true`). An untyped
+/// literal is read by `boolin`. The operand is evaluated once.
+fn boolean_test_value(t: &pg_query::protobuf::BooleanTest, params: &[Bson]) -> Result<Bson> {
     use pg_query::protobuf::BoolTestType as B;
     let arg = t
         .arg
         .as_deref()
-        .cloned()
         .ok_or_else(|| Error::Parse("IS TRUE with no operand".into()))?;
     let kind =
         B::try_from(t.booltesttype).map_err(|_| Error::Unsupported("this IS test".into()))?;
-    let node = |n: N| pg_query::protobuf::Node { node: Some(n) };
-    let not = |a: pg_query::protobuf::Node| {
-        node(N::BoolExpr(Box::new(pg_query::protobuf::BoolExpr {
-            boolop: BoolExprType::NotExpr as i32,
-            args: vec![a],
-            location: -1,
-            ..Default::default()
-        })))
-    };
-    let coalesce = |a: pg_query::protobuf::Node, b: bool| {
-        node(N::CoalesceExpr(Box::new(
-            pg_query::protobuf::CoalesceExpr {
-                args: vec![a, bool_const_node(b)],
-                location: -1,
-                ..Default::default()
-            },
-        )))
-    };
-    let null_test = |a: pg_query::protobuf::Node, t: NullTestType| {
-        node(N::NullTest(Box::new(pg_query::protobuf::NullTest {
-            arg: Some(Box::new(a)),
-            nulltesttype: t as i32,
-            location: -1,
-            ..Default::default()
-        })))
-    };
-    Ok(match kind {
-        B::IsTrue => coalesce(arg, false),
-        B::IsNotFalse => coalesce(arg, true),
-        B::IsFalse => coalesce(not(arg), false),
-        B::IsNotTrue => coalesce(not(arg), true),
-        B::IsUnknown => null_test(arg, NullTestType::IsNull),
-        B::IsNotUnknown => null_test(arg, NullTestType::IsNotNull),
+    let test = match kind {
+        B::IsTrue => "IS TRUE",
+        B::IsNotTrue => "IS NOT TRUE",
+        B::IsFalse => "IS FALSE",
+        B::IsNotFalse => "IS NOT FALSE",
+        B::IsUnknown => "IS UNKNOWN",
+        B::IsNotUnknown => "IS NOT UNKNOWN",
         B::Undefined => return Err(Error::Unsupported("this IS test".into())),
-    })
+    };
+    let value = const_value(arg, params)?;
+    let value = match arg.node.as_ref() {
+        Some(N::AConst(c)) if matches!(c.val, Some(a_const::Val::Sval(_))) => {
+            cast_value(value, "bool")?
+        }
+        _ => value,
+    };
+    let truth = match value {
+        Bson::Null => None,
+        Bson::Boolean(v) => Some(v),
+        other => {
+            let loc = crate::srf_place::leftmost(arg);
+            let loc = if loc >= 0 {
+                loc
+            } else {
+                expr_location(arg).unwrap_or(-1)
+            };
+            if loc >= 0 {
+                set_error_location(loc);
+            }
+            return Err(Error::DatatypeMismatch(format!(
+                "argument of {test} must be type boolean, not type {}",
+                display_type(inferred_type(&other))
+            )));
+        }
+    };
+    Ok(Bson::Boolean(match kind {
+        B::IsTrue => truth == Some(true),
+        B::IsNotTrue => truth != Some(true),
+        B::IsFalse => truth == Some(false),
+        B::IsNotFalse => truth != Some(false),
+        B::IsUnknown => truth.is_none(),
+        _ => truth.is_some(),
+    }))
 }
 
 /// A SELECT's `LIMIT` and `OFFSET`. Each is an int8 expression: a NULL
@@ -46117,10 +46125,9 @@ fn const_value_node(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result<
         }
         return Ok(Bson::Null);
     }
-    // `x IS [NOT] TRUE | FALSE | UNKNOWN`, as the expressions it is short
-    // for -- never NULL itself, which is the whole difference from `x = true`.
+    // `x IS [NOT] TRUE | FALSE | UNKNOWN`.
     if let Some(N::BooleanTest(t)) = node.node.as_ref() {
-        return const_value(&boolean_test_equivalent(t)?, params);
+        return boolean_test_value(t, params);
     }
     // `x IS [NOT] NULL` over a value. A row is null when EVERY field is
     // null and not null when NO field is -- so `row(1, null)` answers false

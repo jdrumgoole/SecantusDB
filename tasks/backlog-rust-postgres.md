@@ -2519,18 +2519,6 @@ Measured on a private PostgreSQL 15.19 cluster with the `_SETUP` in
 dv687, c char(3))`, `d687` an `int` with `check (value > 0)` and `dv687` a
 `varchar(3)`.
 
-- [ ] **A record filled by `FETCH` types a domain column by its base
-      type.** After `open c` over `select * from t687` and `fetch c into
-      r`, `r.a := -5` is 23514 and `pg_typeof(r.a)` is `d687` on
-      PostgreSQL 15.19; here the assignment is stored and `pg_typeof` is
-      `integer`. The portal keeps only its wire description, which names a
-      domain column by its base type (as RowDescription does), so the
-      FETCH has no domain to give the field. Since RP-688 a `SELECT ...
-      INTO`, a FOR over a query and an `EXECUTE ... INTO` type it by the
-      domain. The cursor state a SQL `DECLARE` keeps is the same, so the
-      domains belong on it, not on the PL/pgSQL side.
-      Verify: tests/backlog/test_rp_found_rp670.py::test_fetch_into_record_fields_keep_their_domains
-      Backlog-ID: RP-807
 - [ ] **A variable of a table's row type has no assignable fields.**
       `declare r t687; begin r.a := 5;` assigns the field on PostgreSQL
       15.19 (and `r.a := -5` is the domain's 23514); here it is 42601
@@ -2553,6 +2541,21 @@ dv687, c char(3))`, `d687` an `int` with `check (value > 0)` and `dv687` a
       three phases' durations from a slow run.
       Backlog-ID: RP-690
       Verify: none -- seen once, under load; a timing that does not fail on demand
+
+## Found while working RP-807 (2026-11-10)
+
+Measured on a private PostgreSQL 15.19 cluster with the `_SETUP` in
+`tests/backlog/test_rp_found_rp807.py`.
+
+- [ ] **A bound cursor's arguments are not bound.** `declare r int; c
+      cursor (k int) for select k; begin open c(5); fetch c into r;` sets
+      `r` to 5 on PostgreSQL 15.19, and a cursor argument may stand
+      anywhere its query takes a value (`where a = k`). Here the OPEN is
+      42703 `column "k" does not exist`: the bound query is planned with
+      no variable `k` in scope, as the argument list is not read. A
+      cursor reading a block variable of the same name works.
+      Verify: tests/backlog/test_rp_found_rp807.py::test_bound_cursor_arguments_are_bound
+      Backlog-ID: RP-809
 
 ## Found while working RP-687 (2026-11-09)
 
@@ -3468,21 +3471,40 @@ FROM-less and VALUES-only statements. The gap test is in
       Verify: tests/backlog/test_rp_found_rp792.py::test_an_in_lists_unreadable_member_is_an_error
       Backlog-ID: RP-806
 
-## Found while working RP-774 (2026-11-10)
+## Found while working RP-808 (2026-11-10)
 
-Measured on the shared PostgreSQL 15.19 reference (port 5415); the
-statements are FROM-less or VALUES-only and create nothing. The gap test
-is in `tests/backlog/test_rp_found_rp774.py`.
+Measured on a private, freshly initdb'd PostgreSQL 15.19 cluster with the
+`_SETUP` in `tests/backlog/test_rp_found_rp808.py`: `t808(i int, b bool,
+s text)`.
 
-- [ ] **`IS [NOT] TRUE / FALSE / UNKNOWN` over a value that is not
-      `boolean` is no error.** `select 1 is true` is 42804 `argument of
-      IS TRUE must be type boolean, not type integer` on PostgreSQL 15.19
-      (`transformBooleanTest` coerces the argument with
-      `coerce_to_boolean`, naming the test), and so is `'x'::text is
-      unknown` or `null::int is unknown`. Here `1 is true` and `1 is not
-      false` are `false`, `null::int is unknown` is `true`, and a WHERE
-      `x is true` over an `int` column finds no rows: a wrong answer
-      where PostgreSQL refuses the query. `IS NOT TRUE` / `IS FALSE` over
-      one is 42804 already, but blames `NOT` rather than the test.
-      Verify: tests/backlog/test_rp_found_rp774.py::test_a_boolean_test_over_a_non_boolean_is_42804
-      Backlog-ID: RP-808
+- [ ] **An UPDATE's SET expression is not coerced to boolean when no row
+      reaches it.** `update t808 set b = (i is true) where false`, `(i
+      and true)` and `(not i)` over the `int` column are 42804 `argument
+      of IS TRUE / AND / NOT must be type boolean, not type integer` on
+      PostgreSQL 15.19 (`transformUpdateTargetList` transforms each SET
+      expression, whatever the rows). Here each is `UPDATE 0`: the SET
+      expression is only judged when a row's value is computed, so the
+      statement fails or not by the data. A SELECT's, a DELETE's WHERE and
+      an INSERT's VALUES are checked when the statement is analysed.
+      Verify: tests/backlog/test_rp_found_rp808.py::test_an_update_set_expression_is_coerced_to_boolean
+      Backlog-ID: RP-810
+- [ ] **A CHECK constraint's expression is not coerced to boolean.**
+      `create table c808 (x int check (x))` is 42804 `argument of CHECK
+      must be type boolean, not type integer` on PostgreSQL 15.19
+      (`cookConstraint`'s `coerce_to_boolean`), and `check (x is true)` /
+      `check (x and true)` are their own test's 42804, all at the `x`.
+      Here the table is created; `check (x)` then admits every row, 0
+      and NULL included, and `check (x is true)` refuses every one.
+      Verify: tests/backlog/test_rp_found_rp808.py::test_a_check_constraint_is_coerced_to_boolean
+      Backlog-ID: RP-811
+- [ ] **AND / OR / NOT report a non-boolean argument at the operator.**
+      `coerce_to_boolean` reports at the argument's `exprLocation`, an
+      operator expression's leftmost token: `select ('x' || 'y') and
+      true` is 42804 at position 9 on PostgreSQL 15.19, `(s || 'y') or
+      true` at 9, `insert ... values (1 and true)` at the `1` (30). Here
+      they are reported at the `||` or the `and` (25, 11, 36), and `not
+      ('x' || 'y')` one character early (12 for 13). `optype`'s
+      `bool_argument` and `const_value`'s BoolExpr arm use
+      `expr_location`; RP-808's boolean test uses `srf_place::leftmost`.
+      Verify: tests/backlog/test_rp_found_rp808.py::test_a_connectives_argument_is_reported_at_its_leftmost_token
+      Backlog-ID: RP-812
