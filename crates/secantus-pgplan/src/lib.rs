@@ -2408,6 +2408,10 @@ pub enum AlterTableAction {
         /// `USING <expr>`: the new value computed from the row, as SQL
         /// (planned by the executor over the table), instead of a cast.
         using: Option<String>,
+        /// The column's new collation (`GetColumnDefCollation`): the
+        /// statement's COLLATE clause, else the new type's; `None` is the
+        /// default. A collation the column had before does not carry over.
+        collation: Option<String>,
     },
     AddCheck(CheckConstraint),
     /// `ADD [CONSTRAINT n] UNIQUE (...)`: checked against the rows already
@@ -8494,6 +8498,26 @@ fn plan_alter_action(
             let current = def
                 .column(&cmd.name)
                 .ok_or_else(|| Error::UndefinedColumn(cmd.name.clone()))?;
+            // `ATPrepAlterColumnType` takes the new `attcollation` from
+            // `GetColumnDefCollation(NULL, def, targettype)`: the clause's
+            // collation, looked up first (42704) and refused over a type with
+            // none (42804), ahead of the cast below; without one, the new
+            // type's. The collation the column had -- its own COLLATE's or
+            // its old domain's -- is gone.
+            let collation = match cd.coll_clause.as_deref() {
+                Some(cc) => {
+                    let name = collation::clause_name(cc);
+                    collation::resolve(&name)?;
+                    if !collation::collatable(&ty) {
+                        return Err(Error::DatatypeMismatch(format!(
+                            "collations are not supported by type {}",
+                            display_type(&ty)
+                        )));
+                    }
+                    Some(name)
+                }
+                None => domains::declared_collation(&ty),
+            };
             // PostgreSQL decides this from the TYPES alone, before looking at
             // a single row: the conversion is allowed only where an
             // assignment cast exists, and otherwise the statement is refused
@@ -8514,6 +8538,7 @@ fn plan_alter_action(
                 typmod: cd.type_name.as_ref().map(declared_typmod).unwrap_or(-1),
                 ndims: cd.type_name.as_ref().map_or(0, declared_ndims),
                 using,
+                collation,
             })
         }
         Ok(AT::AtAddConstraint) => {
@@ -9538,12 +9563,33 @@ pub fn apply_alter_to_def(def: &mut TableDef, action: &AlterTableAction) {
             pg_type,
             typmod,
             ndims,
+            collation,
             ..
         } => {
             if let Some(c) = def.columns.iter_mut().find(|c| c.name == *column) {
                 c.pg_type = pg_type.clone();
                 c.typmod = *typmod;
                 c.set_ndims(*ndims);
+                match collation {
+                    Some(name) => c.extra.insert("collation", name.clone()),
+                    None => c.extra.remove("collation"),
+                };
+                // `atttypid` is the new type, so a column retyped off its
+                // domain is no longer one of it: the domain's CHECK and NOT
+                // NULL are not checked on a write, `information_schema` names
+                // no domain, and DROP DOMAIN finds no column depending on it.
+                // The domain's DEFAULT was never the column's (it is the
+                // type's, `typdefault`), so it goes too; a DEFAULT the column
+                // set itself stays, coerced to the new type (RP-824).
+                if c.extra.get_str("domain_type").is_ok_and(|d| d != pg_type) {
+                    c.extra.remove("domain_type");
+                    if c.extra.get_bool("default_from_domain") == Ok(true) {
+                        c.extra.remove("default_from_domain");
+                        c.default = None;
+                        c.set_default_expr(None);
+                        c.set_default_sql(None);
+                    }
+                }
             }
         }
         AlterTableAction::AddCheck(check) => {

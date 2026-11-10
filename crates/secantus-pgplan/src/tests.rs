@@ -5251,6 +5251,95 @@ fn an_added_domain_column_is_tagged_like_a_declared_one() {
     domains::set_user_domains(Vec::new());
 }
 
+/// RP-824: `ALTER COLUMN TYPE` sets `atttypid` to the new type, so a column
+/// retyped off its domain is no longer one of it -- no domain tag, no
+/// domain DEFAULT, and the new type's collation (`GetColumnDefCollation`),
+/// not the one it had. The tag stayed, and every write checked the domain.
+#[test]
+fn a_column_retyped_off_its_domain_is_not_one_of_it() {
+    domains::set_user_domains(vec![domains::Domain {
+        name: "dd".to_string(),
+        oid: 90021,
+        base: "int4".to_string(),
+        typmod: -1,
+        not_null: false,
+        checks: Vec::new(),
+        not_valid: Vec::new(),
+        default_sql: Some("42".to_string()),
+        collation: None,
+    }]);
+    let alter = |sql: &str| match plan_ok(sql) {
+        Statement::AlterTable { mut actions, .. } => actions.remove(0),
+        other => panic!("wrong statement: {other:?}"),
+    };
+    let mut def = t();
+    let AlterTableAction::AddColumn { column, .. } = alter("ALTER TABLE t ADD COLUMN d dd") else {
+        panic!("not an ADD COLUMN");
+    };
+    def.columns.push(column.clone());
+    let mut own = column.clone();
+    own.name = "e".to_string();
+    own.extra.remove("default_from_domain");
+    own.default = Some(Bson::Int32(7));
+    def.columns.push(own);
+    for name in ["d", "e"] {
+        apply_alter_to_def(
+            &mut def,
+            &AlterTableAction::AlterType {
+                column: name.to_string(),
+                pg_type: "int8".to_string(),
+                typmod: -1,
+                ndims: 0,
+                using: None,
+                collation: None,
+            },
+        );
+    }
+    let d = def.column("d").unwrap();
+    assert_eq!(d.pg_type, "int8");
+    assert!(d.extra.get_str("domain_type").is_err());
+    assert!(d.extra.get_bool("default_from_domain").is_err());
+    assert_eq!(d.default, None);
+    // A DEFAULT the column set itself is the column's, and stays.
+    let e = def.column("e").unwrap();
+    assert!(e.extra.get_str("domain_type").is_err());
+    assert_eq!(e.default, Some(Bson::Int32(7)));
+    domains::set_user_domains(Vec::new());
+
+    // The clause's collation, else the new type's: none for `text`.
+    let collation_of = |sql: &str| match alter(sql) {
+        AlterTableAction::AlterType { collation, .. } => collation,
+        other => panic!("wrong action: {other:?}"),
+    };
+    assert_eq!(
+        collation_of(r#"ALTER TABLE t ALTER COLUMN name TYPE text COLLATE "C""#).as_deref(),
+        Some("C")
+    );
+    assert_eq!(
+        collation_of("ALTER TABLE t ALTER COLUMN name TYPE text"),
+        None
+    );
+    let mut def = t();
+    def.columns[1].extra.insert("collation", "C");
+    apply_alter_to_def(
+        &mut def,
+        &AlterTableAction::AlterType {
+            column: "name".to_string(),
+            pg_type: "text".to_string(),
+            typmod: -1,
+            ndims: 0,
+            using: None,
+            collation: None,
+        },
+    );
+    assert!(def
+        .column("name")
+        .unwrap()
+        .extra
+        .get_str("collation")
+        .is_err());
+}
+
 /// `ALTER DOMAIN ... ADD CONSTRAINT ... NOT VALID` carries the NOT VALID
 /// (`skip_validation`), which a plain ADD does not, and `VALIDATE
 /// CONSTRAINT` names the constraint (RP-555).

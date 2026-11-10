@@ -3552,16 +3552,6 @@ Measured on a private, freshly initdb'd PostgreSQL 15.19 cluster with the
 holds for a column CREATE TABLE declares and, since RP-799, for one ADD
 COLUMN adds.
 
-- [ ] **A column retyped off its domain still enforces the domain.** After
-      `create table t (a dpos)` and `alter table t alter column a type
-      int`, PostgreSQL 15.19 inserts `-1`, `information_schema.columns`
-      names no domain, and `drop domain dpos` succeeds; here the insert is
-      23514 `value for domain dpos violates check constraint "dpos_check"`,
-      `domain_name` is still `dpos`, and the DROP is 2BP01 naming the
-      column. `ALTER COLUMN TYPE` sets the stored type but leaves the
-      column's `domain_type` tag, which every write checks.
-      Verify: tests/backlog/test_rp_found_rp799.py::test_a_column_retyped_off_its_domain_drops_it
-      Backlog-ID: RP-824
 - [ ] **A domain's DEFAULT is listed as its column's default.** `create
       table t (d dx)` has no `pg_attrdef` row on PostgreSQL 15.19, and
       `information_schema.columns.column_default` is NULL: the domain's
@@ -3594,3 +3584,24 @@ Measured on PostgreSQL 15.19; none of it needs DDL. The gap tests are in
       line) as an error collects them on the way out.
       Verify: tests/backlog/test_rp_found_rp751.py::test_a_notice_carries_its_context
       Backlog-ID: RP-833
+
+## Found while working RP-824 (2026-11-10)
+
+Measured on a private, freshly initdb'd PostgreSQL 15.19 cluster with the
+`_SETUP` in `tests/backlog/test_rp_found_rp824.py`: `dx824` a domain over
+`int` with `check (value > 0) default 42`.
+
+- [ ] **A column retyped into a domain with USING is not one of the
+      domain.** After `alter table t alter column a type dx824 using
+      a::dx824` (`a int`), PostgreSQL 15.19 fills an INSERT that names no
+      `a` with the domain's DEFAULT `42`, `information_schema.columns`
+      reads `data_type` `integer` and `domain_name` `dx824`, and `drop
+      domain dx824` is 2BP01. Here the column is stored under the domain's
+      name with no `domain_type` tag (as RP-799 found for ADD COLUMN): its
+      DEFAULT is NULL and `data_type` is `USER-DEFINED`, with no
+      `domain_name`; a column retyped from `dx824` to `dx824` keeps its
+      tag but is `USER-DEFINED` too. (The CHECK is enforced, and DROP
+      DOMAIN refused.) The faithful fix types the column by the domain's
+      innermost base and tags it, as `plan_added_column` does.
+      Verify: tests/backlog/test_rp_found_rp824.py::test_a_column_retyped_into_a_domain_is_one_of_it
+      Backlog-ID: RP-834
