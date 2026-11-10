@@ -480,6 +480,14 @@ def _period_takes_effect(client: Any) -> tuple:
         return client.admin.command("getDiagnosticData")["data"].get("start")
 
     try:
+        # Both servers sample on the wall clock's multiples of the period
+        # (`FTDCUtil::roundTime`), so a 60 s period samples at the next whole
+        # minute: a window that crosses one sees a sample there and reads as
+        # not holding (both servers, 2 of 6 concurrent runs, 2026-11-10).
+        # Start clear of it: the window below is 2.4 s.
+        to_minute = 60 - time.time() % 60
+        if to_minute < 4:
+            time.sleep(to_minute + 0.2)
         set_period(60_000)
         time.sleep(1.2)
         before = start()
