@@ -704,6 +704,45 @@ pub const CATALOG_TABLE: &str = COLL_TABLE;
 /// [`frame_doc_value`]).
 type ScannedDoc = (i64, Vec<u8>, Vec<u8>);
 
+/// Where a write's own candidates come from ([`Storage::candidate_pages`]),
+/// read a page at a time so that a write of many writes each page before
+/// it reads the next, as mongod's update and delete stages write each
+/// document their plan returns before they pull the next (RM-390).
+enum CandidatePages {
+    /// These RecordIds, in this order, each fetched as its page is read.
+    Rows(std::vec::IntoIter<i64>),
+    /// The collection in RecordId order, resumed after the last row read;
+    /// `backward` in descending order, as `$natural: -1` reads it.
+    Scan {
+        after: Option<i64>,
+        backward: bool,
+        done: bool,
+    },
+    /// Rows a hinted index read returned, read whole.
+    Read(std::vec::IntoIter<ScannedDoc>),
+}
+
+/// One page of [`CandidatePages`]: each row's RecordId and document.
+type CandidatePage = Vec<(i64, Vec<u8>)>;
+
+impl CandidatePages {
+    fn scan(backward: bool) -> Self {
+        CandidatePages::Scan {
+            after: None,
+            backward,
+            done: false,
+        }
+    }
+}
+
+/// [`CandidatePages::Rows`] over `recordids`, each once, in the order first
+/// named.
+fn candidate_rows(recordids: Vec<i64>) -> CandidatePages {
+    let mut seen = HashSet::with_capacity(recordids.len());
+    let unique: Vec<i64> = recordids.into_iter().filter(|r| seen.insert(*r)).collect();
+    CandidatePages::Rows(unique.into_iter())
+}
+
 /// One entry to persist to the oplog, before `ts` / `wall` are stamped on.
 /// The hot CRUD paths build [`OplogEntry::Raw`] (op / ns / ui / o / o2 already
 /// serialized, the document body spliced in without re-encoding — the oplog
@@ -20261,10 +20300,24 @@ impl Storage {
         filter: &Document,
         force_scan: bool,
     ) -> Result<Vec<ScannedDoc>> {
+        let pages = self.candidate_pages(session, db, coll, filter, force_scan)?;
+        self.read_whole(session, db, coll, pages)
+    }
+
+    /// [`Self::candidate_docs`], not yet read: the RecordIds the router
+    /// names, or a collection scan ([`Self::next_candidate_page`]).
+    fn candidate_pages(
+        &self,
+        session: &Session,
+        db: &str,
+        coll: &str,
+        filter: &Document,
+        force_scan: bool,
+    ) -> Result<CandidatePages> {
         // A caller that fixed the order (`with_candidate_order`) named the
         // rows: they are read as they are now, and still tested by the write.
         if let Some(order) = CANDIDATE_ORDER.with(|o| o.borrow().clone()) {
-            return self.rows_by_recordids(session, db, coll, order);
+            return Ok(candidate_rows(order));
         }
         // A write that does not draw a pull at a time takes the source's
         // every row first, the same way.
@@ -20273,20 +20326,92 @@ impl Storage {
             let rows = source.drain().ok_or(StorageError::MaxTimeExpired)?;
             let order = rows.iter().map(|(recordid, _)| *recordid).collect();
             MATCHED_ROWS.with(|m| m.borrow_mut().extend(rows));
-            return self.rows_by_recordids(session, db, coll, order);
+            return Ok(candidate_rows(order));
         }
         // `force_scan` (a collation is active) bypasses the collation-naive
         // indexes for a full collection scan + in-memory collation matching.
         if filter.is_empty() || force_scan {
-            return self.scan_docs(session, db, coll);
+            return Ok(CandidatePages::scan(false));
         }
         let routed = match self.try_index_id_keys(session, db, coll, filter)? {
             Some(r) => Some(r),
             None => self.try_residual_index_id_keys(session, db, coll, filter)?,
         };
-        match routed {
-            Some(recordids) => self.rows_by_recordids(session, db, coll, recordids),
-            None => self.scan_docs(session, db, coll),
+        Ok(match routed {
+            Some(recordids) => candidate_rows(recordids),
+            None => CandidatePages::scan(false),
+        })
+    }
+
+    /// Every row `pages` names, read now, with its `id_key`.
+    fn read_whole(
+        &self,
+        session: &Session,
+        db: &str,
+        coll: &str,
+        pages: CandidatePages,
+    ) -> Result<Vec<ScannedDoc>> {
+        match pages {
+            CandidatePages::Rows(rids) => self.rows_by_recordids(session, db, coll, rids.collect()),
+            CandidatePages::Scan { backward, .. } => {
+                let mut docs = self.scan_docs(session, db, coll)?;
+                if backward {
+                    docs.reverse();
+                }
+                Ok(docs)
+            }
+            CandidatePages::Read(rows) => Ok(rows.collect()),
+        }
+    }
+
+    /// The next page of `pages`, up to `max` rows each with its document as
+    /// it is now, read on its own snapshot: `None` when no rows are left. A
+    /// page may be empty when every row it named has gone.
+    fn next_candidate_page(
+        &self,
+        db: &str,
+        coll: &str,
+        pages: &mut CandidatePages,
+        max: usize,
+    ) -> Result<Option<CandidatePage>> {
+        match pages {
+            CandidatePages::Rows(rids) => {
+                let page: Vec<i64> = rids.by_ref().take(max).collect();
+                if page.is_empty() {
+                    return Ok(None);
+                }
+                let docs = self.records_by_id(db, coll, &page)?;
+                Ok(Some(
+                    page.into_iter()
+                        .zip(docs)
+                        .filter_map(|(rid, doc)| doc.map(|d| (rid, d)))
+                        .collect(),
+                ))
+            }
+            CandidatePages::Scan {
+                after,
+                backward,
+                done,
+            } => {
+                if *done {
+                    return Ok(None);
+                }
+                let page = self.records_after(db, coll, *after, max, *backward)?;
+                *done = page.len() < max;
+                match page.last() {
+                    Some((rid, _)) => *after = Some(*rid),
+                    None => return Ok(None),
+                }
+                Ok(Some(page))
+            }
+            CandidatePages::Read(rows) => {
+                let page: CandidatePage = rows
+                    .by_ref()
+                    .take(max)
+                    .map(|(rid, _, blob)| (rid, blob))
+                    .collect();
+                Ok((!page.is_empty()).then_some(page))
+            }
         }
     }
 
@@ -21578,25 +21703,46 @@ impl Storage {
                         }
                     }
                 }
-                // The store's own candidates, tested as they are read, with
-                // the bytes each matched as, then written.
+                // The store's own candidates, read a page at a time and
+                // tested as they are read, each page's matches written, with
+                // the bytes each matched as, before the next is read: mongod
+                // updates each document as its scan reaches it, whatever the
+                // plan (RM-390).
                 None => {
-                    let session = self.op_session()?;
-                    let mut rids = Vec::new();
-                    for (recordid, _id_k, blob) in
-                        self.candidate_docs(&session, db, coll, filter, coll_opt.is_some())?
-                    {
-                        match write_matches(recordid, &blob, filter, vars, coll_opt) {
-                            Ok(true) => rids.push((recordid, blob)),
-                            Ok(false) => {}
+                    let mut pages = {
+                        let session = self.op_session()?;
+                        self.candidate_pages(&session, db, coll, filter, coll_opt.is_some())?
+                    };
+                    loop {
+                        let page = match self.next_candidate_page(
+                            db,
+                            coll,
+                            &mut pages,
+                            WRITE_CHUNK_MAX_DOCS,
+                        ) {
+                            Ok(Some(page)) => page,
+                            Ok(None) => break,
                             Err(e) => {
                                 scan_error = Some(e);
                                 break;
                             }
+                        };
+                        let mut rids = Vec::new();
+                        for (recordid, blob) in page {
+                            match write_matches(recordid, &blob, filter, vars, coll_opt) {
+                                Ok(true) => rids.push((recordid, blob)),
+                                Ok(false) => {}
+                                Err(e) => {
+                                    scan_error = Some(e);
+                                    break;
+                                }
+                            }
+                        }
+                        write(&rids)?;
+                        if scan_error.is_some() {
+                            break;
                         }
                     }
-                    drop(session);
-                    write(&rids)?;
                 }
             }
             (matched, modified, scan_error)
@@ -22304,27 +22450,38 @@ impl Storage {
         force_scan: bool,
         hint: Option<&Hint>,
     ) -> Result<Vec<ScannedDoc>> {
+        let pages = self.delete_candidate_pages(session, db, coll, filter, force_scan, hint)?;
+        self.read_whole(session, db, coll, pages)
+    }
+
+    /// [`Self::delete_candidates`], not yet read
+    /// ([`Self::next_candidate_page`]).
+    fn delete_candidate_pages(
+        &self,
+        session: &Session,
+        db: &str,
+        coll: &str,
+        filter: &Document,
+        force_scan: bool,
+        hint: Option<&Hint>,
+    ) -> Result<CandidatePages> {
         let Some(hint) = hint else {
-            return self.candidate_docs(session, db, coll, filter, force_scan);
+            return self.candidate_pages(session, db, coll, filter, force_scan);
         };
         if CANDIDATE_ORDER.with(|o| o.borrow().is_some())
             || CANDIDATE_SOURCE.with(|s| s.get().is_some())
         {
             // The hint has to be one the collection has, order fixed or not.
             self.resolve_hint(session, db, coll, hint)?;
-            return self.candidate_docs(session, db, coll, filter, force_scan);
+            return self.candidate_pages(session, db, coll, filter, force_scan);
         }
         if self.is_timeseries(session, db, coll)? {
-            return self.candidate_docs(session, db, coll, filter, force_scan);
+            return self.candidate_pages(session, db, coll, filter, force_scan);
         }
         let resolved = self.resolve_hint(session, db, coll, hint)?;
         match resolved {
-            ResolvedHint::Natural => self.scan_docs(session, db, coll),
-            ResolvedHint::NaturalReverse => {
-                let mut docs = self.scan_docs(session, db, coll)?;
-                docs.reverse();
-                Ok(docs)
-            }
+            ResolvedHint::Natural => Ok(CandidatePages::scan(false)),
+            ResolvedHint::NaturalReverse => Ok(CandidatePages::scan(true)),
             _ => {
                 // The hinted read returns documents; each one's row is found
                 // again through its `_id`.
@@ -22338,7 +22495,7 @@ impl Storage {
                         out.push((recordid, key, blob));
                     }
                 }
-                Ok(out)
+                Ok(CandidatePages::Read(out.into_iter()))
             }
         }
     }
@@ -22451,30 +22608,53 @@ impl Storage {
                     break;
                 }
             },
-            // The store's own candidates, tested in order, each batch
-            // deleted as it is staged.
+            // The store's own candidates, read a page at a time and tested
+            // in order, each batch deleted as it is staged (RM-390).
             None => {
-                let candidates = {
+                let mut pages = {
                     let session = self.op_session()?;
-                    self.delete_candidates(&session, db, coll, filter, coll_opt.is_some(), hint)?
+                    self.delete_candidate_pages(
+                        &session,
+                        db,
+                        coll,
+                        filter,
+                        coll_opt.is_some(),
+                        hint,
+                    )?
                 };
                 let mut staged: Vec<(i64, Vec<u8>)> = Vec::new();
                 let mut staged_bytes = 0usize;
-                for (recordid, _id_k, blob) in candidates {
-                    match write_matches(recordid, &blob, filter, let_vars, coll_opt) {
-                        Ok(true) => {
-                            staged_bytes += blob.len();
-                            staged.push((recordid, blob));
-                            if staged.len() >= batch_docs || staged_bytes >= BATCH_BYTES {
-                                delete_batch(std::mem::take(&mut staged))?;
-                                staged_bytes = 0;
-                            }
-                        }
-                        Ok(false) => {}
+                'read: loop {
+                    let page = match self.next_candidate_page(
+                        db,
+                        coll,
+                        &mut pages,
+                        WRITE_CHUNK_MAX_DOCS,
+                    ) {
+                        Ok(Some(page)) => page,
+                        Ok(None) => break,
                         Err(e) => {
                             staged.clear();
                             scan_error = Some(e);
                             break;
+                        }
+                    };
+                    for (recordid, blob) in page {
+                        match write_matches(recordid, &blob, filter, let_vars, coll_opt) {
+                            Ok(true) => {
+                                staged_bytes += blob.len();
+                                staged.push((recordid, blob));
+                                if staged.len() >= batch_docs || staged_bytes >= BATCH_BYTES {
+                                    delete_batch(std::mem::take(&mut staged))?;
+                                    staged_bytes = 0;
+                                }
+                            }
+                            Ok(false) => {}
+                            Err(e) => {
+                                staged.clear();
+                                scan_error = Some(e);
+                                break 'read;
+                            }
                         }
                     }
                 }

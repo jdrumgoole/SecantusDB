@@ -157,17 +157,18 @@ def test_an_update_many_out_of_time_keeps_the_documents_it_updated(
     assert _update_many_out_of_time(rust_mongo) == theirs
 
 
-@pytest.mark.backlog("RM-390")
+@pytest.mark.backlog_fixed("RM-390")
 def test_an_update_many_of_a_clustered_collection_out_of_time_keeps_its_updates(
     rust_mongo: Any, mongod_rs: Any
 ) -> None:
     """mongod 8.2.11 updates a clustered collection's documents as its scan
     reads them, as it does any collection's, so an updateMany whose
     `maxTimeMS` runs out part-way has updated some (measured 2026-11-07).
-    A plan this server's write cannot stream -- a clustered or time-series
-    collection, a contested or geo plan -- leaves the update to read every
-    candidate before it tests or writes one, and a budget spent in that
-    read leaves nothing updated."""
+    A plan this server's write could not stream -- a clustered or
+    time-series collection -- left the update to read every candidate
+    before it tested or wrote one, and a budget spent in that read left
+    nothing updated. The store's candidates are now read a page at a time,
+    each written before the next is read."""
     theirs = _update_many_out_of_time(mongod_rs, clustered=True)
     assert theirs == (("err", 50), True), theirs
     assert _update_many_out_of_time(rust_mongo, clustered=True) == theirs

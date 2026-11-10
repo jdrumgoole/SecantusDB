@@ -294,3 +294,76 @@ fn multi_update_interrupted_in_an_expression_writes_nothing() {
     drop(st);
     let _ = std::fs::remove_dir_all(&home);
 }
+
+/// A write of many with no source of its own reads the store's candidates a
+/// page at a time and writes each page before it reads the next (RM-390):
+/// across more than one page -- a collection scan, an index's RecordIds,
+/// a `$natural: -1` scan -- every match is written exactly once and no other.
+#[test]
+fn a_write_of_many_reads_every_page_of_its_candidates_once() {
+    let home = temp_home();
+    let st = Storage::open(home.to_str().unwrap()).unwrap();
+    let docs: Vec<Vec<u8>> = (0..2500i64)
+        .map(|i| enc(&doc! {"_id": i, "k": i % 2, "n": 0}))
+        .collect();
+    st.insert("app", "c", docs, true).unwrap();
+    st.create_index("app", "c", "k_1", &doc! {"k": 1}, &doc! {})
+        .unwrap();
+    let update = |filter: Document| {
+        st.update_matching(
+            "app",
+            "c",
+            &filter,
+            &doc! {"$inc": {"n": 1}},
+            true,
+            false,
+            &[],
+            &Document::new(),
+            None,
+            None,
+            false,
+        )
+        .unwrap()
+    };
+    // A collection scan.
+    let out = update(doc! {"n": {"$gte": 0}});
+    assert_eq!((out.matched, out.modified), (2500, 2500));
+    // The RecordIds index `k_1` names.
+    let out = update(doc! {"k": 1});
+    assert_eq!((out.matched, out.modified), (1250, 1250));
+    assert_eq!(
+        st.count_matching("app", "c", &doc! {"n": 2}, None).unwrap(),
+        1250
+    );
+    assert_eq!(
+        st.count_matching("app", "c", &doc! {"n": 1}, None).unwrap(),
+        1250
+    );
+    // A `$natural: -1` scan, staged and deleted in batches.
+    let reverse = secantus_storage::Hint::KeySpec(doc! {"$natural": -1});
+    let deleted = st
+        .delete_matching_hinted(
+            "app",
+            "c",
+            &doc! {"n": 2},
+            0,
+            &Document::new(),
+            None,
+            Some(&reverse),
+        )
+        .unwrap();
+    assert_eq!(deleted, 1250);
+    assert_eq!(
+        st.count_matching("app", "c", &doc! {"k": 0}, None).unwrap(),
+        1250
+    );
+    assert_eq!(st.count_matching("app", "c", &doc! {}, None).unwrap(), 1250);
+    // A forward scan of what is left.
+    let deleted = st
+        .delete_matching("app", "c", &doc! {"n": 1}, 0, &Document::new(), None)
+        .unwrap();
+    assert_eq!(deleted, 1250);
+    assert_eq!(st.count_matching("app", "c", &doc! {}, None).unwrap(), 0);
+    drop(st);
+    let _ = std::fs::remove_dir_all(&home);
+}
