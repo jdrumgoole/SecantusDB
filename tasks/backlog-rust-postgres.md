@@ -2450,16 +2450,6 @@ Measured on a private PostgreSQL 15.19 cluster with the `_SETUP` in
       blanks ignored), which reaches the storage keys: more than one PR.
       Verify: tests/backlog/test_rp_found_rp672.py::test_create_table_as_of_an_unsized_bpchar_keeps_its_blanks
       Backlog-ID: RP-693
-- [ ] **INTERSECT keeps the left side's value, not the smaller input's.**
-      PostgreSQL 15.19 plans an INTERSECT with the input it estimates
-      smaller first (`generate_nonunion_paths`), and a group's value is the
-      one that input gave: `select a from t672c intersect select
-      'xy'::text` is `xy`, unpadded, as the one-row constant is estimated
-      smaller than the unanalysed table (1850 rows). Here the left side's
-      row is always the one returned, `xy ` with its blank. Over equal
-      estimates (two VALUES lists) the left side comes first, as here.
-      Verify: tests/backlog/test_rp_found_rp672.py::test_intersect_keeps_the_smaller_inputs_value
-      Backlog-ID: RP-692
 
 ## Found while working RP-665 (2026-11-10)
 
@@ -3600,3 +3590,47 @@ m "Mx839")` and `z839(o char(4) default 'ab', v varchar(3) default 'q')`.
       varying` already agrees.
       Verify: tests/backlog/test_rp_found_rp839.py::test_a_char_columns_default_casts_to_bpchar
       Backlog-ID: RP-846
+
+## Found while working RP-692 (2026-11-10)
+
+Measured on a private, freshly initdb'd PostgreSQL 15.19 cluster with the
+`_SETUP` in `tests/backlog/test_rp_found_rp692.py`: `t692j(x numeric, k
+int)` holding `(1.0, 1)`, and an empty `t692e(x numeric, k int)`. Since
+RP-692 an INTERSECT or EXCEPT runs the plan PostgreSQL makes for it
+(`setop_order.rs`): the input with fewer estimated groups first, hashed or
+sorted as `choose_hashed_setop` prices them, each group's row the first
+its first input gave.
+
+- [ ] **An INTERSECT over an input this server does not estimate keeps its
+      left input first.** `select a.x from t692j a join t692j b on a.k =
+      b.k intersect select 1.000` is `1.000` on PostgreSQL 15.19: the
+      join's estimated groups outnumber the constant's one, so the constant
+      is the HashSetOp's first input. Here it is `1.0`, the left input's:
+      `setop_input_estimate` estimates a constant, a VALUES list, one user
+      table's stored columns through a WHERE the selectivity model covers,
+      and a nested set operation, and leaves any other input -- a join, an
+      aggregate or GROUP BY, a DISTINCT, a computed column, a FROM
+      subquery other than VALUES, a catalog -- in the written order,
+      hashed.
+      Verify: tests/backlog/test_rp_found_rp692.py::test_an_intersect_over_a_join_puts_the_smaller_input_first
+      Backlog-ID: RP-841
+- [ ] **A hashed INTERSECT or EXCEPT returns its groups in its first
+      input's order.** PostgreSQL 15.19's HashSetOp returns them in its
+      hash table's order (`setop_retrieve_hash_table`): `select x, y from
+      (values (1.0, true), (1.00, false), (1.000, true)) v(x, y) intersect
+      select x, y from (values (1, true), (1, false)) w(x, y)` is `(1, f),
+      (1, t)` there and `(1, t), (1, f)` here. The HashAggregate's order is
+      modelled already (`hashagg::hash_agg_order`: the tuple hash and
+      simplehash's placement); a sorted SetOp's order is since RP-692.
+      Verify: tests/backlog/test_rp_found_rp692.py::test_a_hashed_set_operation_returns_its_groups_in_hash_order
+      Backlog-ID: RP-842
+- [ ] **A numeric constant selected from a FROM item is refused by
+      INSERT.** `insert into t692e select 1.0, g from generate_series(1, 2)
+      g`, the same over `(values (3)) v(g)`, and `insert into t692e (x)
+      select 1.5 from t692j` insert their rows on PostgreSQL 15.19. Here
+      each is 42804 `column "x" is of type numeric but expression is of
+      type text`, though `insert into t692e select 1.0, 1`, with no FROM,
+      is inserted: the select list's constant over a FROM item is typed
+      `text`.
+      Verify: tests/backlog/test_rp_found_rp692.py::test_a_numeric_constant_selected_from_a_from_item_is_inserted
+      Backlog-ID: RP-843

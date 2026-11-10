@@ -23,11 +23,12 @@ import pytest
 from tests.backlog.test_rp_batch26 import _dsn
 
 _SETUP = [
-    "drop table if exists t672c, t672t, t672v, t672ctas cascade",
+    "drop table if exists t672c, t672t, t672v, t672ctas, t672n cascade",
     "create table t672c (a char(3))",
     "insert into t672c values ('xy')",
     "create table t672t (s text)",
     "create table t672v (v varchar(5), n name)",
+    "create table t672n (x numeric)",
 ]
 
 
@@ -141,17 +142,64 @@ def test_create_table_as_of_an_unsized_bpchar_keeps_its_blanks(dsn: str) -> None
     assert got == [("e", 1), ("xy ", 3), ("xy ", 3)]
 
 
-@pytest.mark.backlog("RP-692")
+@pytest.mark.backlog_fixed("RP-692")
 def test_intersect_keeps_the_smaller_inputs_value(dsn: str) -> None:
     """PostgreSQL 15.19 plans an INTERSECT with the input it estimates
     smaller first (`generate_nonunion_paths`), and a group's value is the
     one its first input gave. Over a table (estimated 1850 rows unanalysed)
     and a one-row constant, the constant comes first: `select a from t672c
     intersect select 'xy'::text` is `xy`, unpadded. Here the left side's
-    value is always kept, `xy ` with its blank."""
+    value was always kept, `xy ` with its blank."""
     with _connect(dsn) as c:
         got = _rows(
             c,
             "select a, octet_length(a) from (select a from t672c intersect select 'xy'::text) s",
         )
     assert got == [("xy", 2)]
+
+
+def _text(c: psycopg.Connection, query: str) -> list[str | None]:
+    return [None if r[0] is None else str(r[0]) for r in c.execute(query).fetchall()]
+
+
+@pytest.mark.backlog_fixed("RP-692")
+def test_a_set_operations_group_is_its_first_inputs_first_row(dsn: str) -> None:
+    """A SetOp returns each group's first row from the input listed first,
+    as often as the group is output (`nodeSetOp.c`), measured on a private
+    PostgreSQL 15.19 cluster. INTERSECT ALL and EXCEPT ALL repeated that
+    row where this server returned each matching row; a VALUES list of more
+    rows than the other side's came second; and a sorted SetOp
+    (`enable_hashagg` off) returns the groups in its quicksort's order,
+    each one's row the first among its ties."""
+    with _connect(dsn) as c:
+        c.execute("insert into t672n values (1.0), (1.00), (2.0)")
+        assert _text(c, "select x from t672n intersect select 1.000") == ["1.000"]
+        assert _text(
+            c,
+            "select x from (values (1.0), (1.00)) v(x)"
+            " intersect all select x from (values (1), (1)) w(x)",
+        ) == ["1.0", "1.0"]
+        assert _text(
+            c, "select x from (values (1.0), (1.00), (1.000)) v(x) except all select 1"
+        ) == ["1.0", "1.0"]
+        assert _text(
+            c,
+            "select x from (values (1.0), (1.00), (1.000)) v(x)"
+            " intersect select x from (values (1), (1)) w(x)",
+        ) == ["1"]
+        c.execute("set enable_hashagg = off")
+        assert _text(
+            c,
+            "select x from (values (2.0), (1.0), (1.00), (3)) v(x)"
+            " intersect all select x from (values (1), (1), (3.0), (2)) w(x)",
+        ) == ["1", "1", "2", "3.0"]
+        assert _text(
+            c,
+            "select x from (values (5), (4), (3), (2), (1), (1.0), (1.00), (2.0), (3.0)) v(x)"
+            " intersect select x from (values (1.000), (2.00), (3.00), (4.0)) w(x)",
+        ) == ["1.000", "2.0", "3.0", "4"]
+        assert _text(
+            c,
+            "select x from (values (null::numeric), (1.0)) v(x)"
+            " intersect select x from (values (null::numeric), (1)) w(x)",
+        ) == ["1.0", None]
