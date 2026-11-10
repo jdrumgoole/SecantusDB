@@ -22509,6 +22509,10 @@ fn resolve_sublinks_in_expr(
         N::BoolExpr(b) => children.extend(b.args.iter_mut()),
         N::AArrayExpr(a) => children.extend(a.elements.iter_mut()),
         N::RowExpr(r) => children.extend(r.args.iter_mut()),
+        // An `IN` list's members: `x in ((select ...), 'tt')` is an
+        // ordinary list to PostgreSQL 15.19 (`transformAExprIn`), each
+        // uncorrelated subquery one more value of it (RP-757).
+        N::List(l) => children.extend(l.items.iter_mut()),
         N::CoalesceExpr(c) => children.extend(c.args.iter_mut()),
         N::MinMaxExpr(m) => children.extend(m.args.iter_mut()),
         N::NullTest(t) => children.extend(t.arg.as_deref_mut()),

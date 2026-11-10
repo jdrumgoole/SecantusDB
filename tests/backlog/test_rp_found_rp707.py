@@ -126,13 +126,74 @@ def test_an_untyped_literal_subquery_is_text_outside_it(
     assert _answer(dsn, query) == expected
 
 
-@pytest.mark.backlog("RP-757")
+@pytest.mark.backlog_fixed("RP-757")
 def test_a_scalar_subquery_in_an_in_list(dsn: str) -> None:
     """A scalar subquery as one element of an `IN` list is an ordinary
-    expression on PostgreSQL 15.19 (`x = sub OR x = 'tt'`); here the
-    statement is 0A000 `SubLink is not supported yet`."""
+    expression on PostgreSQL 15.19 (`x = sub OR x = 'tt'`); the statement
+    was 0A000 `SubLink is not supported yet`, as the subquery resolver did
+    not descend into the list."""
     assert _answer(
         dsn,
         "select x from (values ('tt'::text), ('uu'), ('vv')) s(x)"
         " where x in ((select max(y) from (values ('uu'::text)) t(y)), 'tt') order by x",
     ) == ([25], [("tt",), ("uu",)])
+
+
+_S = "from (values ('tt'::text), ('uu'), ('vv')) s(x)"
+
+
+@pytest.mark.backlog_fixed("RP-757")
+@pytest.mark.parametrize(
+    ("query", "expected"),
+    [
+        (
+            f"select x {_S} where x not in ((select max(y) from (values ('uu'::text)) t(y)), 'tt')"
+            " order by x",
+            ([25], [("vv",)]),
+        ),
+        # A NULL member: never true in IN, makes NOT IN never true.
+        (f"select x {_S} where x in ((select null::text), 'tt') order by x", ([25], [("tt",)])),
+        (f"select x {_S} where x not in ((select null::text), 'tt') order by x", ([25], [])),
+        # No row: the member is NULL.
+        (
+            f"select x {_S} where x in"
+            " ((select y from (values ('uu'::text)) t(y) where false), 'tt') order by x",
+            ([25], [("tt",)]),
+        ),
+        (
+            f"select x {_S} where x in ((select y from (values ('uu'::text), ('vv')) t(y)), 'tt')"
+            " order by x",
+            ("error", "21000", "more than one row returned by a subquery used as an expression"),
+        ),
+        # Correlated: evaluated per outer row.
+        (
+            f"select x {_S} where x in ((select y from (values ('uu'::text), ('vv')) t(y)"
+            " where y = s.x), 'tt') order by x",
+            ([25], [("tt",), ("uu",), ("vv",)]),
+        ),
+        (
+            f"select x {_S} where x in ((select 1), 'tt') order by x",
+            ("error", "42883", "operator does not exist: text = integer"),
+        ),
+        (
+            "select x from (values (1), (2), (3)) s(x) where x in ((select 2), 3.0) order by x",
+            ([23], [(2,), (3,)]),
+        ),
+        (
+            f"select x {_S} where x in ((select 'uu'), (select 'vv')) order by x",
+            ([25], [("uu",), ("vv",)]),
+        ),
+        (
+            "select 'tt' in ((select 'tt'), 'x'), 'q' in ((select 'tt'), 'x')",
+            ([16, 16], [(True, False)]),
+        ),
+        (
+            f"select x, x in ((select 'uu'), 'tt') {_S} order by x",
+            ([25, 16], [("tt", True), ("uu", True), ("vv", False)]),
+        ),
+    ],
+)
+def test_a_scalar_subquery_in_an_in_list_shapes(dsn: str, query: str, expected: object) -> None:
+    """More `IN` lists with a scalar subquery member, each measured on
+    PostgreSQL 15.19 (the shared reference on port 5415)."""
+    assert _answer(dsn, query) == expected

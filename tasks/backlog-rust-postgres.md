@@ -3332,18 +3332,6 @@ Measured on PostgreSQL 15.19 (the shared reference on port 5415).
       Verify: tests/backlog/test_rp_found_rp698.py::test_an_outer_column_in_a_set_operations_order_by
       Backlog-ID: RP-767
 
-## Found while working RP-707 (2026-11-10)
-
-Measured on PostgreSQL 15.19 (the shared reference on port 5415): every
-statement is VALUES-only and runs there as written.
-
-- [ ] **A scalar subquery in an `IN` list is refused.** `x in ((select
-      max(y) ...), 'tt')` is an ordinary list on PostgreSQL 15.19 (each
-      element compared by `=`, ORed); here the statement is 0A000 `SubLink
-      is not supported yet`.
-      Verify: tests/backlog/test_rp_found_rp707.py::test_a_scalar_subquery_in_an_in_list
-      Backlog-ID: RP-757
-
 ## Found while working RP-754 (2026-11-10)
 
 Measured on PostgreSQL 15.19 (the shared reference on port 5415): every
@@ -3419,3 +3407,31 @@ int, x int)` and `create table jb768 (i int, y int)`, each holding `(1,
       the alias list sees one where the join's `*` gives four.
       Verify: tests/backlog/test_rp_found_rp768.py::test_an_alias_list_over_a_joined_star
       Backlog-ID: RP-773
+
+## Found while working RP-757 (2026-11-10)
+
+Measured on PostgreSQL 15.19 (the shared reference on port 5415): every
+statement is VALUES-only and runs there as written. The gap tests are in
+`tests/backlog/test_rp_found_rp757.py`.
+
+- [ ] **A scalar subquery under `IS [NOT] TRUE` or `COLLATE` is refused.**
+      `select x from (values ('tt'::text), ('uu'), ('vv')) s(x) where (x =
+      (select 'uu')) is not true` is `tt`, `vv` on PostgreSQL 15.19, and
+      `where x = (select 'uu') collate "C"` is `uu`; here each is 0A000
+      `SubLink is not supported yet`. `resolve_sublinks_in_expr` in
+      `secantus-pgplan/src/lib.rs` descends no `BooleanTest` and no
+      `CollateClause`, so the subquery under one reaches planning
+      unresolved.
+      Verify: tests/backlog/test_rp_found_rp757.py::test_a_scalar_subquery_under_a_boolean_test_or_collate
+      Backlog-ID: RP-774
+- [ ] **A `char(n)` column of a VALUES list does not compare as `bpchar` in
+      a WHERE.** Over `(values ('uu'::char(4)), ('tt'), ('vv')) s(f)`,
+      `where f in ('uu  ', 'tt')` is `tt`, `uu  ` on PostgreSQL 15.19 (the
+      list's members take the column's type, and `bpchar` ignores trailing
+      blanks); here it is `tt` alone, and the same with `'uu  '::text` or
+      `(select 'uu')` as the member. `where f = (select 'uu  ')` finds
+      nothing on 15.19 (`bpchar = text` resolves to `text`, the column
+      `rtrim`med) and `uu  ` here. The select list's `f in (...)` already
+      agrees, as does a `char(4)` table column (RP-691).
+      Verify: tests/backlog/test_rp_found_rp757.py::test_a_values_char_column_compares_as_bpchar_in_a_where
+      Backlog-ID: RP-775
