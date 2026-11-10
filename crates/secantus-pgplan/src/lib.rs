@@ -13406,31 +13406,49 @@ pub fn avg_result_type(source: Option<&str>) -> &'static str {
 /// type of the overload `func_select_candidate` picks among PostgreSQL 15's
 /// 22 (`pg_aggregate`), a domain reduced to its base type first. Most types
 /// have their own, so keep their type; the others take the one an implicit
-/// cast reaches: `varchar`, `name` and `"char"` are `max(text)` (measured
-/// on 15.19, RP-681). A polymorphic answer (`anyarray`, `anyenum`) is the
-/// input type itself.
+/// cast reaches: `varchar`, `name` and `"char"` are `max(text)` (RP-681), a
+/// `reg*` is `max(oid)` and `cidr` is `max(inet)` (RP-706), all measured on
+/// 15.19. A polymorphic answer (`anyarray`, `anyenum`) is the input type
+/// itself.
 ///
-/// Only a `text` answer is taken, whose value is the input's string as it
-/// is. A `reg*` is `max(oid)` and `cidr` is `max(inet)` on 15.19 too, but
-/// there each input is COERCED before it is compared (`max(regclass)` is
-/// the largest OID, not name), which the engines computing min / max do not
-/// do yet: those keep their input type (RP-706).
+/// Where the answer is another type, each input is coerced to it before it
+/// is compared ([`min_max_input_type`]): `max(regclass)` is the largest
+/// OID, not the largest name.
 pub fn min_max_result_type(source: &str) -> String {
     let base = domains::base_type_and_typmod(source).map_or_else(|| source.to_string(), |b| b.0);
     if funcsig::has_exact("max", std::slice::from_ref(&base)) {
         return base;
     }
     match funcsig::selected_result_type("max", std::slice::from_ref(&base)) {
-        Some(t) if t == "text" => t,
-        _ if base == source => base,
-        // A domain over a type with no `max` of its own and no text
-        // answer: as before, its own type.
-        _ => source.to_string(),
+        Some(t) => t,
+        None if base == source => base,
+        // A domain over a type with no `max` of its own and none an
+        // implicit cast reaches: as before, its own type.
+        None => source.to_string(),
     }
+}
+
+/// The type a `min` / `max` over `source` coerces each input to before
+/// comparing, when its overload takes another one whose values are not
+/// the input's as they are: `oid` for a `reg*` (`max(oid)`, so the largest
+/// OID wins rather than the largest name) and `inet` for a `cidr`. `None`
+/// when the inputs compare as they are, a `text` answer included: a
+/// `varchar`, `name` or `"char"` value is its string.
+pub fn min_max_input_type(source: &str) -> Option<String> {
+    let base = domains::base_type_and_typmod(source).map_or_else(|| source.to_string(), |b| b.0);
+    let target = min_max_result_type(source);
+    (target != base && target != source && target != "text").then_some(target)
+}
+
+/// One input of a `min` / `max` coerced to [`min_max_input_type`]'s type,
+/// as PostgreSQL's implicit cast does before the aggregate sees it.
+pub fn coerce_min_max_input(value: &Bson, target: &str) -> Result<Bson> {
+    cast_value(value.clone(), target)
 }
 
 #[cfg(test)]
 mod min_max_result_type_tests {
+    use super::min_max_input_type as input;
     use super::min_max_result_type as t;
 
     #[test]
@@ -13444,13 +13462,32 @@ mod min_max_result_type_tests {
             "text", "bpchar", "int2", "int4", "numeric", "date", "inet", "oid",
         ] {
             assert_eq!(t(own), own);
+            assert_eq!(input(own), None);
         }
         // `max(anyarray)`: the array type itself.
         assert_eq!(t("varchar[]"), "varchar[]");
-        // `max(oid)` / `max(inet)` on 15.19, kept until the input is
-        // coerced (RP-706).
-        assert_eq!(t("regclass"), "regclass");
-        assert_eq!(t("cidr"), "cidr");
+        assert_eq!(input("varchar[]"), None);
+        // `max(oid)` / `max(inet)` on 15.19, each input coerced (RP-706).
+        for reg in [
+            "regclass",
+            "regtype",
+            "regproc",
+            "regprocedure",
+            "regoper",
+            "regoperator",
+            "regnamespace",
+            "regrole",
+            "regconfig",
+            "regdictionary",
+            "regcollation",
+        ] {
+            assert_eq!(t(reg), "oid", "{reg}");
+            assert_eq!(input(reg).as_deref(), Some("oid"), "{reg}");
+        }
+        assert_eq!(t("cidr"), "inet");
+        assert_eq!(input("cidr").as_deref(), Some("inet"));
+        // A text answer compares the strings as they are.
+        assert_eq!(input("varchar"), None);
     }
 }
 

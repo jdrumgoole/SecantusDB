@@ -10,8 +10,8 @@ CTE column, a window call and a view's column.
 
 A `reg*` reaches `max(oid)` and `cidr` reaches `max(inet)` the same way,
 and there each input is coerced before it is compared: `max(regclass)` is
-the largest OID, as an `oid`. Here it is still the input type, compared by
-name. And a `text` scalar subquery inside `pg_typeof` is refused.
+the largest OID, as an `oid`. Here they kept the input type (RP-706, fixed).
+And a `text` scalar subquery inside `pg_typeof` is refused.
 
 The expected answers were measured on a private, freshly initdb'd
 PostgreSQL 15.19 cluster with `_SETUP`.
@@ -112,13 +112,12 @@ def test_a_views_min_max_column_is_text(dsn: str) -> None:
     assert got == [("m", "text"), ("e", "text")]
 
 
-@pytest.mark.backlog("RP-706")
+@pytest.mark.backlog_fixed("RP-706")
 def test_min_max_coerce_their_input_to_the_overloads_type(dsn: str) -> None:
     """`max(regclass)` is `max(oid)` on PostgreSQL 15.19: each input is
     coerced to `oid` and the largest OID is the answer, described `oid`
     (`pg_class` 1259 over `pg_type` 1247); `max(cidr)` is `max(inet)`,
-    described `inet`. Here both keep their input type, and the `regclass`
-    answer is the largest NAME, `pg_type`."""
+    described `inet`. Here both kept their input type (RP-706)."""
     assert _described(
         dsn,
         "select max(x)::oid::int8, min(x)::oid::int8, pg_typeof(max(x))::text"

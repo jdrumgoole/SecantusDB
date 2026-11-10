@@ -1822,7 +1822,10 @@ impl Rewriter<'_> {
                         let call = pg_query::protobuf::Node {
                             node: Some(N::FuncCall(Box::new(agg))),
                         };
-                        *node = Self::net_value(call, &ty);
+                        // Read back as the overload's type: `max(cidr)` is
+                        // `max(inet)`, its input coerced, so an `inet`
+                        // (15.19, RP-706).
+                        *node = Self::net_value(call, &crate::min_max_result_type(&ty));
                         self.changed = true;
                         return Ok(());
                     }

@@ -3280,19 +3280,6 @@ varchar(4), t text)` holding `(1, 'y', 'y', 'y')` and `(2, 'ab', 'ab ',
 Measured on a private PostgreSQL 15.19 cluster with the `_SETUP` in
 `tests/backlog/test_rp_found_rp681.py`: `t681(k int, v varchar(4), ...)`.
 
-- [ ] **`min` / `max` over a `reg*` or `cidr` value keep its type and
-      compare it as itself.** PostgreSQL 15.19 resolves `max(regclass)` to
-      `max(oid)` and `max(cidr)` to `max(inet)` (`func_select_candidate`
-      over `pg_aggregate`'s 22 overloads), coercing each input first:
-      `max(x)` over `'pg_class'::regclass` and `'pg_type'::regclass` is
-      1259, an `oid`, the larger OID. Here it is `pg_class`, a `regclass`
-      chosen by NAME (`pg_type` is larger as text), and `max(cidr)` is
-      described `cidr` (650), not `inet` (869). Since RP-681
-      `min_max_result_type` takes the overload's type only where it is
-      `text`, whose value is the input's string unchanged; these need the
-      input coerced in each engine that computes min / max.
-      Verify: tests/backlog/test_rp_found_rp681.py::test_min_max_coerce_their_input_to_the_overloads_type
-      Backlog-ID: RP-706
 - [ ] **`pg_typeof` of a `text` scalar subquery is 42P18.** `select
       pg_typeof((select max(v) from t681))` is `text` on PostgreSQL 15.19;
       here it is 42P18 `could not determine data type of parameter $1`, as
@@ -3351,3 +3338,23 @@ Measured on PostgreSQL 15.19 (the shared reference on port 5415).
       without `display_type`.
       Verify: tests/backlog/test_rp_found_rp722.py::test_a_scalar_against_an_array_value_names_its_types
       Backlog-ID: RP-742
+
+## Found while working RP-706 (2026-11-10)
+
+Measured on PostgreSQL 15.19 (the shared reference on port 5415): every
+statement is VALUES-only and runs there as written. The gap tests are in
+`tests/backlog/test_rp_found_rp706.py`.
+
+- [ ] **A window `min` / `max` over `inet` or `cidr` compares the values'
+      text.** `select (max(x) over ())::text, (min(x) over ())::text from
+      (values ('10.0.0.1'::inet), ('9.0.0.0'::inet), ('::1'::inet)) s(x)`
+      is `::1/128` and `9.0.0.0/32` on PostgreSQL 15.19 (`network_cmp`:
+      IPv4 first, then by address); here the minimum is `10.0.0.1/32`, the
+      smallest TEXT, and `max(cidr) over ()` picks `9.0.0.0/8` over
+      `10.0.0.1/32`. With `over (order by x)` it is 0A000 `function
+      max(inet) is not supported yet`. The plain aggregate is rewritten to
+      compare `__net_sortkey` (`enum_order.rs`, RP-610); that rewrite skips
+      a call with OVER, which the enum and collation rewrites beside it
+      also do (unmeasured for those).
+      Verify: tests/backlog/test_rp_found_rp706.py::test_a_window_min_max_over_a_network_value_uses_network_order
+      Backlog-ID: RP-754

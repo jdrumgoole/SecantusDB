@@ -50013,7 +50013,8 @@ thread_local! {
 }
 
 thread_local! {
-    /// What `array_agg` over arrays refused; read with the float overflow.
+    /// What `array_agg` over arrays refused, or a `min` / `max` input's
+    /// coercion to its overload's type; read with the float overflow.
     static ARRAY_AGG_ERROR: std::cell::RefCell<Option<PlanError>> =
         const { std::cell::RefCell::new(None) };
 }
@@ -50537,6 +50538,32 @@ fn compute_basic_aggregate(item: &AggItem, rows: &[Document]) -> Bson {
             }
         }
         AggFunc::Min | AggFunc::Max => {
+            // The overload's input type, where it is another one: a `reg*`
+            // is `max(oid)` and a `cidr` `max(inet)`, so each input is
+            // coerced first and `max(regclass)` is the largest OID, not the
+            // largest name (15.19, RP-706).
+            let coerced: Vec<Bson>;
+            let values: Vec<&Bson> = match item
+                .source_type
+                .as_deref()
+                .and_then(secantus_pgplan::min_max_input_type)
+            {
+                Some(target) => {
+                    let mut out = Vec::with_capacity(values.len());
+                    for v in values {
+                        match secantus_pgplan::coerce_min_max_input(v, &target) {
+                            Ok(c) => out.push(c),
+                            Err(e) => {
+                                ARRAY_AGG_ERROR.with(|slot| *slot.borrow_mut() = Some(e));
+                                return Bson::Null;
+                            }
+                        }
+                    }
+                    coerced = out;
+                    coerced.iter().collect()
+                }
+                None => values,
+            };
             let mut best: Option<&Bson> = None;
             for v in values {
                 best = Some(match best {
