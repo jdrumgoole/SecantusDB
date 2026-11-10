@@ -258,14 +258,16 @@ pub fn apply_pipeline(
                 None => None,
             };
             let before = memlimit::report();
-            // The query layer's sort with a limit: counted over what its plan
-            // gave it, in that order, while the documents it hands on are
-            // the read's, already sorted and limited (RM-399).
-            let input = match (source, limit) {
-                (
-                    Some(crate::sorter::SortSource::QueryLayer | crate::sorter::SortSource::Sbe),
-                    Some(k),
-                ) if first && k > 1 => LEADING_INPUT.with(|l| l.borrow_mut().take()),
+            // The query layer's sort: counted over what its plan gave it, in
+            // that order -- which documents a top-k sorter keeps (RM-399) and
+            // which a spilled run holds (RM-395) -- while the documents it
+            // hands on are the read's, already sorted and limited.
+            let input = match source {
+                Some(crate::sorter::SortSource::QueryLayer | crate::sorter::SortSource::Sbe)
+                    if first && limit.is_none_or(|k| k > 1) =>
+                {
+                    LEADING_INPUT.with(|l| l.borrow_mut().take())
+                }
                 _ => None,
             };
             docs = match (source, input) {

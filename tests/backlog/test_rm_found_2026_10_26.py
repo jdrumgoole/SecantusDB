@@ -213,11 +213,13 @@ def _leading_sort_storage(client: Any) -> Any:
     return entry.get("sortSpilledDataStorageSize")
 
 
-@pytest.mark.backlog("RM-395")
+@pytest.mark.backlog_fixed("RM-395")
 def test_leading_sort_spill_storage_size(rust_mongo: Any, mongod: Any) -> None:
     """mongod 8.2's `SORT` takes documents as its collection scan reads them,
     so a sort that reverses that order spills runs of the first documents
-    read, each sorted (130545 bytes)."""
+    read, each sorted (130545 bytes). A pipeline's leading `$sort` without a
+    limit counted the read's already-sorted output instead (130528); it now
+    counts what the plan handed its sort, in that order (fixed 2026-11-10)."""
     assert _leading_sort_storage(rust_mongo) == _leading_sort_storage(mongod)
 
 

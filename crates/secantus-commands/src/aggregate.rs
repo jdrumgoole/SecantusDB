@@ -837,12 +837,13 @@ pub fn aggregate(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
                 // plan cache keys it: the projection of what the stages
                 // read, the skip and limit it takes in.
                 let front = crate::explain::pipeline_canonical(c, &read_pipeline);
-                // A leading `$sort` mongod gives a limit counts what its
-                // top-k sorter does over what the plan hands it, in order:
-                // the read keeps that for it (RM-399).
-                let top_k = lead.sort.is_some()
+                // A leading `$sort` counts what mongod's sorter does over
+                // what the plan hands it, in that order: which documents a
+                // top-k sorter keeps (RM-399), and which a spilled run holds
+                // (RM-395). The read keeps that for it.
+                let keep_input = lead.sort.is_some()
                     && secantus_core::aggregate::limit_for_pushdown(rest.get(1..).unwrap_or(&[]))
-                        .is_some_and(|k| k > 1);
+                        .is_none_or(|k| k > 1);
                 let mut sort_input: Option<Vec<Vec<u8>>> = None;
                 let mut read = |sort: Option<&Document>, limit: i64| {
                     let moved = lead.filter.as_ref().filter(|_| sort.is_some());
@@ -862,7 +863,7 @@ pub fn aggregate(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
                             asked: Default::default(),
                         },
                         front.projection.as_ref(),
-                        top_k && sort.is_some(),
+                        keep_input && sort.is_some(),
                     )?;
                     if let Some(counted) = counted {
                         crate::opdebug::note_examined(

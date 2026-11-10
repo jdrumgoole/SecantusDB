@@ -1353,22 +1353,17 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       2026-11-10 (RM-408).
       Verify: tests/backlog/test_rm_found_rm408.py::test_a_document_a_project_built_is_sized_as_built
       Backlog-ID: RM-519
-- [ ] **A query-layer sort spills its documents in sorted order, not as its
-      scan read them.** mongod 8.2's `SORT` takes the documents as the stage
-      below hands them over (a forward `COLLSCAN` for a plain collection)
-      and spills each run sorted. Here the read hands the sorter documents it
-      has already sorted -- `find`, the aggregate pipeline's leading `$sort`,
-      `explain`'s executor -- so a sort that reorders its input spills
-      different runs: the same spills, records and bytes, but a different
-      file (130528 bytes against mongod 8.2.1's 130545 for 300 documents
-      sorted by `{s: 1, n: -1}`; measured by copying mongod's live spill file
-      out of `_tmp`). A sort whose input is already in order, a pipeline
-      `$sort` after another stage, and the stream's `SORT` under a write
-      (`sort_members`, given a budget) spill as mongod does. The fix is for
-      the read to run the budgeted sort over its input, as `sort_members`
-      does, instead of the command sorting the sorted output again.
-      Backlog-ID: RM-395
-      Verify: tests/backlog/test_rm_found_2026_10_26.py::test_leading_sort_spill_storage_size
+- [ ] **A sort by a key many documents share stores its spilled runs in
+      another order than mongod.** Over 300 documents sorted by `{k: -1}`
+      (seven values of `k`), budget 50000, mongod 8.2.11 on arm64 stores
+      51260 bytes for its 13 spills and this server 51242 -- `find` and a
+      pipeline's leading `$sort` alike, with the same spills, records and
+      bytes, so documents that compare equal sit in each run in another
+      order. A sort whose keys are all different, or all the same (`{s:
+      1}` over one string), agrees (RM-395). Found 2026-11-10 while working
+      RM-395.
+      Verify: tests/backlog/test_rm_found_2026_11_10_rm395.py::test_tied_sort_spill_storage_size
+      Backlog-ID: RM-526
 - [ ] **On Linux the diagnostic sample has no `systemMetrics`.** mongod
       8.2 on Linux adds a `systemMetrics` collector to each FTDC sample
       (`getDiagnosticData`): the machine's CPU, memory, network and disk
