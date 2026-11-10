@@ -3298,28 +3298,6 @@ Measured on PostgreSQL 15.19 (the shared reference on port 5415).
       Verify: tests/backlog/test_rp_found_rp698.py::test_an_outer_column_in_a_set_operations_order_by
       Backlog-ID: RP-767
 
-## Found while working RP-754 (2026-11-10)
-
-Measured on PostgreSQL 15.19 (the shared reference on port 5415): every
-statement is VALUES-only and runs there as written. The gap tests are in
-`tests/backlog/test_rp_found_rp754.py`. The type-order rewrite
-(`enum_order.rs`, `rewrite`) reads an ORDER BY key with `sort_by` only,
-never with `expr` as it reads the select list.
-
-- [ ] **A window call in an ORDER BY key is 0A000.** `select max(x::text)
-      over (order by x) from (values (1), (2)) s(x) order by max(x::text)
-      over (order by x) desc` is `2`, `1` on PostgreSQL 15.19, and the same
-      with `sum(x) over (order by x) + 1` `4`, `2`; here each is 0A000
-      `function max(text) is not supported yet` (`sum(integer)`): the key is
-      evaluated per row as a scalar call. `select max(x) over (order by x)
-      from (values ('10.0.0.1'::inet), ('9.0.0.0'::inet)) s(x) order by 1
-      desc` is refused the same way, since the network rewrite copies a
-      positional key's target into the sort (since RP-754 a target whose
-      value needs no key stays positional, so `(max(x) over (...))::text
-      ... order by 1` is answered).
-      Verify: tests/backlog/test_rp_found_rp754.py::test_a_window_call_in_an_order_by_key
-      Backlog-ID: RP-761
-
 ## Found while working RP-756 (2026-11-10)
 
 Measured on PostgreSQL 15.19 (the shared reference on port 5415): every
@@ -3600,3 +3578,19 @@ Measured on a private, freshly initdb'd PostgreSQL 15.19 cluster with the
       and copies only a default the column set itself.
       Verify: tests/backlog/test_rp_found_rp825.py::test_a_like_copy_of_a_domain_column_is_one_of_the_domain
       Backlog-ID: RP-839
+
+## Found while working RP-761 (2026-11-10)
+
+Measured on a private, freshly initdb'd PostgreSQL 15.19 cluster with the
+`_SETUP` in `tests/backlog/test_rp_found_rp761.py`: `t761(x int)`.
+
+- [ ] **EXPLAIN prints a computed sort key by its synthetic field.**
+      `explain (costs off) select x from t761 order by x + 1` prints `Sort
+      Key: ((x + 1))` on PostgreSQL 15.19, and a key that is a window
+      target `Sort Key: (sum(x) OVER (?)) DESC`; here the first is `Sort
+      Key: __order0` (the planner's field for a computed key) and the
+      second `Sort Key: sum DESC` (the target's output name). The Sort's
+      key wants deparsing as ruleutils does it (`deparse_expression` with
+      the plan's tlist), not the field it is computed into.
+      Verify: tests/backlog/test_rp_found_rp761.py::test_explain_prints_a_computed_sort_key_as_its_expression
+      Backlog-ID: RP-840
