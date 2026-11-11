@@ -15,6 +15,13 @@
 # With a batch-pid it keeps going until that process has exited and
 # nothing is left to land; without one it lands what is there and stops.
 #
+# SECANTUS_LAND_MIN=N (default 1): while the batch is still running, wait
+# until at least N commits (one per item) are on <branch> before freezing a
+# snapshot, so each full CI cycle checks N items together rather than
+# whatever one lane pushed last (Joe, 2026-11-10: "5 items at a time before
+# a full ci cycle"). Once the batch has exited, the remainder lands whatever
+# its size.
+#
 # Exit 0 done; 1 a check on the snapshot failed (bisect its commits; nothing
 # merged); 2 a git / gh step failed; 4 this PR's checks passed but another
 # run of the same commit failed, or a workflow run failed with jobs that
@@ -23,6 +30,8 @@
 set -uo pipefail
 branch=${1:?usage: $0 <integration-branch> [batch-pid]}
 batch_pid=${2:-}
+land_min=${SECANTUS_LAND_MIN:-1}
+[[ $land_min =~ ^[1-9][0-9]*$ ]] || { echo "SECANTUS_LAND_MIN must be a positive integer" >&2; exit 2; }
 [[ $branch == main ]] && { echo "not main" >&2; exit 2; }
 ci=$branch-ci
 # Which server's batch this is: the MongoDB backlog's integration branches
@@ -53,6 +62,9 @@ while :; do
             echo "$(date '+%T') nothing left to land"
             exit 0
         fi
+        sleep 300; continue
+    fi
+    if [[ $ahead -lt $land_min && -n $batch_pid ]] && kill -0 "$batch_pid" 2>/dev/null; then
         sleep 300; continue
     fi
     snap=$(git rev-parse origin/$branch)
