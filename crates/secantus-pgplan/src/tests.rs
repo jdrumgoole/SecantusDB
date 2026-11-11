@@ -3648,6 +3648,47 @@ fn citext_internal_functions() {
 }
 
 #[test]
+fn a_using_clause_name_error_has_no_position() {
+    // `transformFromClauseItem` matches USING names with no
+    // `parser_errposition` (PostgreSQL 15.19, RP-481).
+    for (sql, state, message) in [
+        (
+            "select * from fs join fe using (nosuch)",
+            "42703",
+            "column \"nosuch\" specified in USING clause does not exist in left table",
+        ),
+        (
+            "select * from fs join fe using (c)",
+            "42703",
+            "column \"c\" specified in USING clause does not exist in right table",
+        ),
+        (
+            "select * from (select 1 as a, 2 as a) l join fe using (a)",
+            "42702",
+            "common column name \"a\" appears more than once in left table",
+        ),
+        (
+            "select * from fs join fe using (a, a)",
+            "42701",
+            "column name \"a\" appears more than once in USING clause",
+        ),
+    ] {
+        take_error_location();
+        assert_eq!(error_position(sql, state, message), None, "for {sql}");
+    }
+    // An unknown column elsewhere in the statement is still placed.
+    take_error_location();
+    assert_eq!(
+        error_position(
+            "select nosuch from fs join fe using (a)",
+            "42703",
+            "column \"nosuch\" does not exist"
+        ),
+        Some(8)
+    );
+}
+
+#[test]
 fn an_unterminated_literal_is_positioned_where_it_opens() {
     let at = |sql: &str, message: &str| error_position(sql, "42601", message);
     assert_eq!(
@@ -6899,6 +6940,44 @@ fn a_check_constraint_is_coerced_to_boolean() {
     }
 }
 
+/// GRANT and REVOKE find their routine with `LookupFuncWithArgs`, which has
+/// no parse position: a signature no routine has is 42883 with none, as
+/// from DROP / ALTER / COMMENT (PostgreSQL 15.19, RP-520). A call's missing
+/// function still points at its name.
+#[test]
+fn grant_revoke_missing_routine_has_no_position() {
+    for (sql, message) in [
+        (
+            "grant execute on function gc(bool) to public",
+            "function gc(boolean) does not exist",
+        ),
+        (
+            "grant execute on procedure gc(bool) to public",
+            "procedure gc(boolean) does not exist",
+        ),
+        (
+            "REVOKE execute on function gc(bool) from public",
+            "function gc(boolean) does not exist",
+        ),
+        (
+            "revoke grant option for execute on function public.gc(int) from public",
+            "function public.gc(integer) does not exist",
+        ),
+    ] {
+        take_error_location();
+        assert_eq!(error_position(sql, "42883", message), None, "for {sql}");
+    }
+    take_error_location();
+    assert_eq!(
+        error_position(
+            "select gc(true)",
+            "42883",
+            "function gc(boolean) does not exist"
+        ),
+        Some(8)
+    );
+}
+
 /// A literal in the select list of a query with a FROM item is typed by its
 /// node, as PostgreSQL types it: `1.5` is `numeric` and `B'101'` is `bit`,
 /// which their decoded values alone do not say. Both were `text`, so the
@@ -6985,4 +7064,56 @@ fn a_whole_row_star_is_the_items_star() {
     );
     // A name no FROM item has is left to be reported as a missing column.
     assert_eq!(whole_row_star("select (q).* from t"), None);
+}
+
+/// `numeric_int2` / `numeric_int4_opt_error` / `numeric_int8` (RP-749,
+/// measured on PostgreSQL 15.19): out of range is 22003 naming the target
+/// type and quoting no value; NaN and +/-Infinity are 0A000.
+#[test]
+fn numeric_to_integer_errors_match_postgres() {
+    let cases = [
+        ("1e20", "int4", "22003", "integer out of range"),
+        ("-3e9", "int4", "22003", "integer out of range"),
+        ("2147483647.5", "int4", "22003", "integer out of range"),
+        ("1e20", "int2", "22003", "smallint out of range"),
+        ("40000", "int2", "22003", "smallint out of range"),
+        ("1e30", "int8", "22003", "bigint out of range"),
+        ("NaN", "int4", "0A000", "cannot convert NaN to integer"),
+        ("NaN", "int2", "0A000", "cannot convert NaN to smallint"),
+        ("NaN", "int8", "0A000", "cannot convert NaN to bigint"),
+        (
+            "Infinity",
+            "int4",
+            "0A000",
+            "cannot convert infinity to integer",
+        ),
+        (
+            "-Infinity",
+            "int2",
+            "0A000",
+            "cannot convert infinity to smallint",
+        ),
+        (
+            "Infinity",
+            "int8",
+            "0A000",
+            "cannot convert infinity to bigint",
+        ),
+    ];
+    for (text, target, state, message) in cases {
+        let err = cast_value(numeric::parse_numeric(text).unwrap(), target).unwrap_err();
+        assert_eq!(
+            (err.sqlstate(), err.to_string().as_str()),
+            (state, message),
+            "{text}::{target}"
+        );
+    }
+    assert_eq!(
+        cast_value(numeric::parse_numeric("-2147483648.4").unwrap(), "int4").unwrap(),
+        Bson::Int32(i32::MIN)
+    );
+    assert_eq!(
+        cast_value(numeric::parse_numeric("-32768.4").unwrap(), "int2").unwrap(),
+        Bson::Int32(-32768)
+    );
 }

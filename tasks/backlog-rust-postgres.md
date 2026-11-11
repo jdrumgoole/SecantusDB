@@ -1842,15 +1842,6 @@ a regression test.
       on PostgreSQL 15.19 (found while working RP-441).
       Verify: tests/backlog/test_rp_fromless_analysis.py::test_missing_column_before_operator_to_its_right
       Backlog-ID: RP-447
-- [ ] **An operator over `current_user` or `current_schema` names its
-      operand `text`, not `name`.** `select 1 + current_user` is 42883
-      `operator does not exist: integer + text` here and `integer + name`
-      on PostgreSQL 15.19 (`select current_schema + 1` likewise);
-      `pg_typeof` of each is `name` on both, so only the operator check's
-      typing of the keyword functions differs. Measured on PostgreSQL 15.19
-      (found while working RP-441).
-      Verify: tests/backlog/test_rp_fromless_analysis.py::test_keyword_function_operand_is_name
-      Backlog-ID: RP-448
 - [ ] **A cast literal's input error is reported after the operator
       around it.** PostgreSQL 15.19's `transformTypeCast` runs a constant's
       input function as the cast is transformed, before `make_op` looks the
@@ -2141,14 +2132,15 @@ Measured on PostgreSQL 15.19 (the data-modifying WITH on a private cluster).
       Backlog-ID: RP-471
       Verify: tests/backlog/test_rp_subquery_scope.py::test_aliased_join_plan
 
-## Found while working RP-470 (2026-11-07)
+## Found while working RP-481 (2026-11-10)
 
-- [ ] **A missing USING column's 42703 carries a position.** PostgreSQL
-      15.19 reports `column "a" specified in USING clause does not exist in
-      left table` with no position; here it points into the statement (41,
-      33 in the gap test's two statements).
-      Verify: tests/backlog/test_rp_subquery_scope.py::test_using_column_missing_has_no_position
-      Backlog-ID: RP-481
+- [ ] **A USING list that names a column twice is not refused.**
+      PostgreSQL 15.19's `transformFromClauseItem` refuses `select * from
+      fs join fe using (a, a)` with 42701 `column name "a" appears more
+      than once in USING clause` (no position); here it runs and returns
+      the join's rows.
+      Verify: tests/backlog/test_rp_subquery_scope.py::test_using_clause_repeats_a_column
+      Backlog-ID: RP-857
 
 ## Found while working RP-479 (2026-11-08)
 
@@ -2224,13 +2216,6 @@ Measured on a private PostgreSQL 15.19 cluster. The gap tests are in
       built-in's comment.
       Verify: tests/backlog/test_rp_found_rp514.py::test_builtin_routine_resolved_by_its_overloads
       Backlog-ID: RP-519
-- [ ] **GRANT's 42883 for a signature no routine has carries a position.**
-      PostgreSQL 15.19's `LookupFuncWithArgs` raises `function gc(boolean)
-      does not exist` (and `procedure ...` for PROCEDURE) with no position;
-      here it carries one, at the routine's name (27, 28). COMMENT's same
-      error has none.
-      Verify: tests/backlog/test_rp_found_rp514.py::test_grant_missing_signature_has_no_position
-      Backlog-ID: RP-520
 
 ## Found while working RP-516 (2026-11-08)
 
@@ -2599,13 +2584,6 @@ Measured on a private PostgreSQL 15.19 cluster with the `_SETUP` in
 Measured on PostgreSQL 15.19 (port 5415) with statements that create
 nothing. The gap tests are in `tests/backlog/test_rp_found_rp712.py`.
 
-- [ ] **A `numeric` out of `int4`'s range quotes its value.** `select
-      1e20::numeric::int` is 22003 `integer out of range` on PostgreSQL
-      15.19 (`numeric_int4_opt_error`); here the message is `integer out of
-      range: "100000000000000000000"`, in plain SQL and in a PL/pgSQL
-      assignment or `INTO` alike.
-      Verify: tests/backlog/test_rp_found_rp712.py::test_numeric_out_of_int4_range_quotes_no_value
-      Backlog-ID: RP-749
 - [ ] **A `jsonb` input error carries no `JSON data` CONTEXT.** `select
       't'::jsonb` is 22P02 `invalid input syntax for type json` with
       CONTEXT `JSON data, line 1: t` on PostgreSQL 15.19 (`json_errcontext`);
@@ -3255,20 +3233,6 @@ statement is VALUES-only and runs there as written. The gap tests are in
       applied to each branch's literal.
       Verify: tests/backlog/test_rp_found_rp732.py::test_a_cast_over_a_case_of_literals_reports_no_position
       Backlog-ID: RP-746
-
-## Found while working RP-740 (2026-11-09)
-
-Measured on PostgreSQL 15.19 (the shared reference on port 5415).
-
-- [ ] **A scalar compared with an array value names the types by their
-      internal names.** `select 1 = (select array[1])`, `select x = y from
-      (values (1, array[1])) v(x, y)` and `select 1 = any (select
-      array[1])` are each 42883 `operator does not exist: integer =
-      integer[]` on PostgreSQL 15.19; here the message reads `int4 =
-      int4[]`: the per-row evaluation's mismatch prints `inferred_type`
-      without `display_type`.
-      Verify: tests/backlog/test_rp_found_rp722.py::test_a_scalar_against_an_array_value_names_its_types
-      Backlog-ID: RP-742
 
 ## Found while working RP-698 (2026-11-10)
 

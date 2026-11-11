@@ -576,8 +576,10 @@ def test_whole_row_of_a_view_is_its_row_type(dsn: str) -> None:
     assert row is not None and (lone, joined, aliased) == (row[0], row[0], row[0])
 
 
-# Found while working RP-470. PostgreSQL 15.19 reports a missing USING
-# column's 42703 with no position; here it points into the statement.
+# Found while working RP-470. PostgreSQL 15.19 reports a missing,
+# ambiguous or repeated USING column with no position
+# (`transformFromClauseItem` matches the names with no
+# `parser_errposition`); each pointed into the statement.
 USING_COLUMN_MISSING = {
     "select * from fs as x(p) join fe using (a)": (
         "42703",
@@ -591,13 +593,38 @@ USING_COLUMN_MISSING = {
         None,
         None,
     ),
+    "select * from fs join fe using (c)": (
+        "42703",
+        'column "c" specified in USING clause does not exist in right table',
+        None,
+        None,
+    ),
+    "select * from (select 1 as a, 2 as a) l join fe using (a)": (
+        "42702",
+        'common column name "a" appears more than once in left table',
+        None,
+        None,
+    ),
 }
 
 
-@pytest.mark.backlog("RP-481")
+@pytest.mark.backlog_fixed("RP-481")
 @pytest.mark.parametrize("query", list(USING_COLUMN_MISSING))
 def test_using_column_missing_has_no_position(query: str, dsn: str) -> None:
     assert answer(dsn, query) == USING_COLUMN_MISSING[query]
+
+
+# Found while working RP-481. `transformFromClauseItem` refuses a USING
+# list that names a column twice (PostgreSQL 15.19, no position); here the
+# join ran.
+@pytest.mark.backlog("RP-857")
+def test_using_clause_repeats_a_column(dsn: str) -> None:
+    assert answer(dsn, "select * from fs join fe using (a, a)") == (
+        "42701",
+        'column name "a" appears more than once in USING clause',
+        None,
+        None,
+    )
 
 
 _JOIN_PLAN = [

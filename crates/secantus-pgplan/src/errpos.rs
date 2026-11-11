@@ -167,6 +167,38 @@ fn names_a_signature_type(sql: &str, message: &str) -> bool {
             .is_some_and(|tn| format!("\"{}\"", written(tn)) == missing)
 }
 
+/// Is this one of the errors `transformFromClauseItem` raises while it
+/// matches a JOIN's USING (or NATURAL) column names against its two sides?
+/// It works on the names alone and calls no `parser_errposition`, so a
+/// missing (42703), ambiguous (42702) or repeated (42701) column has no
+/// position (PostgreSQL 15.19, RP-481).
+fn is_using_clause_error(sqlstate: &str, message: &str) -> bool {
+    let m = message.split('\n').next().unwrap_or("");
+    let Some(rest) = m.strip_prefix(match sqlstate {
+        "42703" => "column \"",
+        "42702" => "common column name \"",
+        "42701" => "column name \"",
+        _ => return false,
+    }) else {
+        return false;
+    };
+    let tail = match sqlstate {
+        "42703" => [
+            "\" specified in USING clause does not exist in left table",
+            "\" specified in USING clause does not exist in right table",
+        ],
+        "42702" => [
+            "\" appears more than once in left table",
+            "\" appears more than once in right table",
+        ],
+        _ => [
+            "\" appears more than once in USING clause",
+            "\" appears more than once in USING clause",
+        ],
+    };
+    tail.iter().any(|t| rest.ends_with(t))
+}
+
 /// The position in `sql` of an error with this SQLSTATE and primary
 /// message, when it can be found.
 pub fn error_position(sql: &str, sqlstate: &str, message: &str) -> Option<usize> {
@@ -193,6 +225,9 @@ pub fn error_position(sql: &str, sqlstate: &str, message: &str) -> Option<usize>
         return None;
     }
     if sqlstate == "42704" && names_a_signature_type(sql, message) {
+        return None;
+    }
+    if is_using_clause_error(sqlstate, message) {
         return None;
     }
     // `ALTER TABLE | INDEX | VIEW | SEQUENCE | MATERIALIZED VIEW | FOREIGN
@@ -579,10 +614,11 @@ pub fn error_position(sql: &str, sqlstate: &str, message: &str) -> Option<usize>
                 .strip_prefix("function ")
                 .or_else(|| m.strip_prefix("procedure "))
             {
-                // A function a DROP / ALTER / COMMENT names is looked up
-                // without a parse position.
+                // A function a DROP / ALTER / COMMENT / GRANT / REVOKE names
+                // is looked up without a parse position (`LookupFuncWithArgs`;
+                // PostgreSQL 15.19, RP-520).
                 if toks.first().is_some_and(|t| {
-                    ["drop", "alter", "comment"]
+                    ["drop", "alter", "comment", "grant", "revoke"]
                         .iter()
                         .any(|k| t.text.eq_ignore_ascii_case(k))
                 }) {

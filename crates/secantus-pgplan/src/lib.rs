@@ -38758,6 +38758,29 @@ fn decimal_to_integer(v: &Bson) -> Option<i128> {
     numeric::bigint_to_i128(&numeric::numeric_text_to_integer(&numeric_text(v)?)?)
 }
 
+/// `numeric_int2` / `numeric_int4_opt_error` / `numeric_int8`: a `numeric`
+/// cast to the integer type `name` (`smallint`, `integer`, `bigint`) whose
+/// range is `range`. NaN and +/-Infinity are 0A000 `cannot convert NaN to
+/// <name>` / `cannot convert infinity to <name>`; a value that rounds out of
+/// range is 22003 `<name> out of range`, quoting no value (RP-749,
+/// measured on 15.19).
+fn numeric_to_integer(v: &Bson, name: &str, range: std::ops::RangeInclusive<i128>) -> Result<i128> {
+    let text = numeric_text(v).unwrap_or_else(|| value_text(v));
+    if text == "NaN" {
+        return Err(Error::FeatureNotSupported(format!(
+            "cannot convert NaN to {name}"
+        )));
+    }
+    if text.ends_with("Infinity") {
+        return Err(Error::FeatureNotSupported(format!(
+            "cannot convert infinity to {name}"
+        )));
+    }
+    decimal_to_integer(v)
+        .filter(|n| range.contains(n))
+        .ok_or_else(|| Error::NumericOutOfRange(format!("{name} out of range")))
+}
+
 /// A value as its PostgreSQL text, which is what `::text` would produce.
 pub fn value_text(v: &Bson) -> String {
     render_value_text(v)
@@ -39359,12 +39382,17 @@ fn cast_value_inner(value: Bson, target: &str) -> Result<Bson> {
                     ))
                 }
             }
-            v if is_numeric(v) => decimal_to_integer(v)
-                .and_then(|n| i32::try_from(n).ok())
-                .map(Bson::Int32)
-                .ok_or_else(|| {
-                    Error::NumericOutOfRange(format!("integer out of range: \"{}\"", as_text(v)))
-                }),
+            // `numeric_int2` checks smallint's range itself, so a value out
+            // of it is `smallint out of range` (or `cannot convert NaN to
+            // smallint`), never an `integer` message.
+            v if is_numeric(v) => {
+                let (name, range) = if matches!(target, "int2" | "smallint") {
+                    ("smallint", i128::from(i16::MIN)..=i128::from(i16::MAX))
+                } else {
+                    ("integer", i128::from(i32::MIN)..=i128::from(i32::MAX))
+                };
+                numeric_to_integer(v, name, range).map(|n| Bson::Int32(n as i32))
+            }
             Bson::String(s) => {
                 let small = matches!(target, "int2" | "smallint");
                 let name = if small { "smallint" } else { "integer" };
@@ -39405,12 +39433,10 @@ fn cast_value_inner(value: Bson, target: &str) -> Result<Bson> {
                     Err(Error::NumericOutOfRange("bigint out of range".to_string()))
                 }
             }
-            v if is_numeric(v) => decimal_to_integer(v)
-                .and_then(|n| i64::try_from(n).ok())
-                .map(Bson::Int64)
-                .ok_or_else(|| {
-                    Error::NumericOutOfRange(format!("bigint out of range: \"{}\"", as_text(v)))
-                }),
+            v if is_numeric(v) => {
+                numeric_to_integer(v, "bigint", i128::from(i64::MIN)..=i128::from(i64::MAX))
+                    .map(|n| Bson::Int64(n as i64))
+            }
             Bson::String(s) => {
                 let t = s.trim();
                 t.parse::<i64>().map(Bson::Int64).map_err(|_| {
@@ -42397,8 +42423,8 @@ pub(crate) fn eval_binary(op: &str, lhs: Bson, rhs: Bson) -> Result<Bson> {
         if matches!(&lhs, Bson::Array(_)) ^ matches!(&rhs, Bson::Array(_)) {
             return Err(Error::UndefinedFunction(format!(
                 "operator does not exist: {} {op} {}",
-                inferred_type(&lhs),
-                inferred_type(&rhs)
+                display_type(inferred_type(&lhs)),
+                display_type(inferred_type(&rhs))
             )));
         }
         // `time` has no comparison with `timetz` or `interval` of its own:
@@ -48943,8 +48969,8 @@ fn lower_aexpr(e: &AExpr, def: &TableDef, params: &[Bson]) -> Result<Document> {
         if !coltype.map(|t| t.ends_with("[]")).unwrap_or(false) {
             return Err(Error::UndefinedFunction(format!(
                 "operator does not exist: {} {op} {}",
-                coltype.unwrap_or("text"),
-                inferred_type(&value)
+                display_type(coltype.unwrap_or("text")),
+                display_type(inferred_type(&value))
             )));
         }
     }

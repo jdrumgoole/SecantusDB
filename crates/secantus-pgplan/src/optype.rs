@@ -934,7 +934,9 @@ fn operand_type_declared(n: &pg_query::protobuf::Node, scope: &Scope) -> Option<
             (!t.ends_with("[]")).then_some(t)
         }
         N::ColumnRef(c) => scope.column_type(c),
-        // `current_date` and friends: their fixed types.
+        // `current_date` and friends: their fixed types. The role, catalog
+        // and schema ones are `name` (`transformSQLValueFunction`'s
+        // NAMEOID), so `1 + current_user` is `integer + name`.
         N::SqlvalueFunction(f) => {
             use pg_query::protobuf::SqlValueFunctionOp as O;
             Some(
@@ -944,6 +946,12 @@ fn operand_type_declared(n: &pg_query::protobuf::Node, scope: &Scope) -> Option<
                     O::SvfopCurrentTimestamp | O::SvfopCurrentTimestampN => "timestamptz",
                     O::SvfopLocaltime | O::SvfopLocaltimeN => "time",
                     O::SvfopLocaltimestamp | O::SvfopLocaltimestampN => "timestamp",
+                    O::SvfopCurrentRole
+                    | O::SvfopCurrentUser
+                    | O::SvfopUser
+                    | O::SvfopSessionUser
+                    | O::SvfopCurrentCatalog
+                    | O::SvfopCurrentSchema => "name",
                     _ => return None,
                 }
                 .into(),
