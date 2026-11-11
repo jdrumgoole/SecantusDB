@@ -29,6 +29,11 @@ full-match restore in a `rust-storage` lane compiles 10 crates, not 652.
   WiredTiger build the `rust-storage` lanes use.
 - `storage-engine`: the smoke-test step runs with `-n auto
   --dist=loadgroup`; the R7 step stays here for the macOS cron cell only.
+- `storage-engine`'s Windows cell runs on the weekly cron and on a manual
+  dispatch only, no longer on every push to `main`, where it took 55 to 66
+  minutes against ~11 for every other MongoDB lane. A Windows-only break now
+  shows up at the next weekly run, a dispatch
+  (`gh workflow run test.yml --ref <branch>`) or a release build.
 
 #### Fixed
 

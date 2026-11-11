@@ -831,12 +831,16 @@ jobs:
         # ``Install toolchain (macOS)`` step below exists for exactly these
         # cells (it was unreachable while this matrix was Linux + Windows only).
         #
-        # Windows joins on the push to main (and the cron), not on a PR
-        # (2026-10-22). It was the whole run's critical path: 44-51 min against
-        # 25 for the next job, almost all of it the PGO + LTO wheel build on a
-        # 4-core runner. What is lost: a Windows-only break surfaces on main,
-        # after the merge, not on the PR that caused it.
-        os: ${{ fromJSON((github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && '["ubuntu-latest","windows-latest","macos-14"]' || github.event_name == 'push' && '["ubuntu-latest","windows-latest"]' || '["ubuntu-latest"]') }}
+        # Windows joins on the weekly cron (and a manual dispatch) only (Joe,
+        # 2026-11-11). It left the PR on 2026-10-22, when it was the whole
+        # run's critical path (44-51 min against 25 for the next job), and
+        # left the push to main on 2026-11-11, where it was again: 55-66 min
+        # against ~11 for every other MongoDB lane, almost all of it the PGO +
+        # LTO wheel build on a 4-core runner. What is lost: a Windows-only
+        # break surfaces at the next weekly run (or a dispatch, or a release
+        # build), not on the commit that caused it. To check a change on
+        # Windows first: `gh workflow run test.yml --ref <branch>`.
+        os: ${{ fromJSON((github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && '["ubuntu-latest","windows-latest","macos-14"]' || '["ubuntu-latest"]') }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
       - name: Free disk the job does not use
@@ -1051,10 +1055,11 @@ jobs:
         #
         # Linux runs `fast` on a PR AND on the push to main, so that main saves
         # the cache a PR restores (a PR cannot save one another PR can read).
-        # The full build is still built and tested on every push to main by the
-        # Windows cell, and on all three OSes by the weekly cron. What is lost:
-        # a fault that only the LTO / PGO build has shows up on main, not on the
-        # PR, and on Linux only weekly or at release.
+        # The full build is built and tested by the weekly cron (Windows and
+        # macOS cells; there is no push-to-main cell since 2026-11-11) and by
+        # the release builds. What is lost: a fault that only the LTO / PGO
+        # build has shows up at the next weekly run or release, not on the PR
+        # or on main.
         id: mode
         shell: bash
         run: |
