@@ -2600,13 +2600,6 @@ Measured on a private PostgreSQL 15.19 cluster with the `_SETUP` in
 Measured on PostgreSQL 15.19 (port 5415) with statements that create
 nothing. The gap tests are in `tests/backlog/test_rp_found_rp712.py`.
 
-- [ ] **A `numeric` out of `int4`'s range quotes its value.** `select
-      1e20::numeric::int` is 22003 `integer out of range` on PostgreSQL
-      15.19 (`numeric_int4_opt_error`); here the message is `integer out of
-      range: "100000000000000000000"`, in plain SQL and in a PL/pgSQL
-      assignment or `INTO` alike.
-      Verify: tests/backlog/test_rp_found_rp712.py::test_numeric_out_of_int4_range_quotes_no_value
-      Backlog-ID: RP-749
 - [ ] **A `jsonb` input error carries no `JSON data` CONTEXT.** `select
       't'::jsonb` is 22P02 `invalid input syntax for type json` with
       CONTEXT `JSON data, line 1: t` on PostgreSQL 15.19 (`json_errcontext`);

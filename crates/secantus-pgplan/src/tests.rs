@@ -7027,3 +7027,55 @@ fn a_whole_row_star_is_the_items_star() {
     // A name no FROM item has is left to be reported as a missing column.
     assert_eq!(whole_row_star("select (q).* from t"), None);
 }
+
+/// `numeric_int2` / `numeric_int4_opt_error` / `numeric_int8` (RP-749,
+/// measured on PostgreSQL 15.19): out of range is 22003 naming the target
+/// type and quoting no value; NaN and +/-Infinity are 0A000.
+#[test]
+fn numeric_to_integer_errors_match_postgres() {
+    let cases = [
+        ("1e20", "int4", "22003", "integer out of range"),
+        ("-3e9", "int4", "22003", "integer out of range"),
+        ("2147483647.5", "int4", "22003", "integer out of range"),
+        ("1e20", "int2", "22003", "smallint out of range"),
+        ("40000", "int2", "22003", "smallint out of range"),
+        ("1e30", "int8", "22003", "bigint out of range"),
+        ("NaN", "int4", "0A000", "cannot convert NaN to integer"),
+        ("NaN", "int2", "0A000", "cannot convert NaN to smallint"),
+        ("NaN", "int8", "0A000", "cannot convert NaN to bigint"),
+        (
+            "Infinity",
+            "int4",
+            "0A000",
+            "cannot convert infinity to integer",
+        ),
+        (
+            "-Infinity",
+            "int2",
+            "0A000",
+            "cannot convert infinity to smallint",
+        ),
+        (
+            "Infinity",
+            "int8",
+            "0A000",
+            "cannot convert infinity to bigint",
+        ),
+    ];
+    for (text, target, state, message) in cases {
+        let err = cast_value(numeric::parse_numeric(text).unwrap(), target).unwrap_err();
+        assert_eq!(
+            (err.sqlstate(), err.to_string().as_str()),
+            (state, message),
+            "{text}::{target}"
+        );
+    }
+    assert_eq!(
+        cast_value(numeric::parse_numeric("-2147483648.4").unwrap(), "int4").unwrap(),
+        Bson::Int32(i32::MIN)
+    );
+    assert_eq!(
+        cast_value(numeric::parse_numeric("-32768.4").unwrap(), "int2").unwrap(),
+        Bson::Int32(-32768)
+    );
+}
