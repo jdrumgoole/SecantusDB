@@ -2259,14 +2259,6 @@ tests are in `tests/backlog/test_rp_found_rp546.py`.
       `other objects depend on it`. With no routine it already matches.
       Backlog-ID: RP-562
       Verify: tests/backlog/test_rp_found_rp546.py::test_drop_type_of_a_row_type_with_a_routine
-- [ ] **DROP TYPE names a routine with a blank after each comma.**
-      `getObjectDescription` writes `format_procedure`'s
-      `function k563(integer,ty563)`; DROP TYPE's DETAIL and CASCADE notice
-      here say `k563(integer, ty563)` (`function_signature`, which DROP
-      FUNCTION's dependants share). DROP TABLE names them as PostgreSQL does
-      since RP-546 (`row_type_depends::routine_description`).
-      Backlog-ID: RP-563
-      Verify: tests/backlog/test_rp_found_rp546.py::test_drop_type_names_a_routine_as_format_procedure
 - [ ] **A DROP TABLE of several tables is refused under the first one's
       name.** PostgreSQL 15.19's `reportDependentObjects` says `cannot drop
       desired object(s) because other objects depend on them` when the DROP

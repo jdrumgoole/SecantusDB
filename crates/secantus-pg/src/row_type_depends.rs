@@ -99,9 +99,28 @@ pub(crate) fn last_reached(lines: Vec<(String, String)>) -> Vec<(String, String)
 /// off the search path, and each input argument's `format_type_be`, joined
 /// by a bare comma (`function f(integer,s.t)`).
 pub(crate) fn routine_description(d: &Document) -> String {
+    let params: Vec<&str> = d
+        .get_array("param_types")
+        .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
+        .unwrap_or_default();
+    format!(
+        "function {}",
+        format_procedure(
+            d.get_str("schema").unwrap_or("public"),
+            d.get_str("name").unwrap_or_default(),
+            &params,
+        )
+    )
+}
+
+/// `format_procedure`: the routine's name, quoted and qualified when its
+/// schema is off the search path, then each input argument's
+/// `format_type_be` joined by a bare comma -- `f(integer,s.t)`. This is the
+/// form `getObjectDescription` gives a routine in every DETAIL and CASCADE
+/// notice; `func_signature_string` (`f(integer, s.t)`, unquoted name) is
+/// the lookup errors' form, and is not this one (RP-563).
+pub(crate) fn format_procedure<S: AsRef<str>>(schema: &str, name: &str, params: &[S]) -> String {
     let q = secantus_pgplan::scalar::quote_identifier;
-    let name = d.get_str("name").unwrap_or_default();
-    let schema = d.get_str("schema").unwrap_or("public");
     let shown = if schema.starts_with("pg_temp")
         || secantus_pgplan::schemas::search_path()
             .iter()
@@ -111,20 +130,16 @@ pub(crate) fn routine_description(d: &Document) -> String {
     } else {
         format!("{}.{}", q(schema), q(name))
     };
-    let args: Vec<String> = d
-        .get_array("param_types")
-        .map(|a| {
-            a.iter()
-                .filter_map(|v| v.as_str())
-                .map(|t| {
-                    secantus_pgplan::user_casts::type_oid(t)
-                        .map(secantus_pgplan::regtype_text)
-                        .unwrap_or_else(|| t.to_string())
-                })
-                .collect()
+    let args: Vec<String> = params
+        .iter()
+        .map(|t| {
+            let t = t.as_ref();
+            secantus_pgplan::user_casts::type_oid(t)
+                .map(secantus_pgplan::regtype_text)
+                .unwrap_or_else(|| t.to_string())
         })
-        .unwrap_or_default();
-    format!("function {shown}({})", args.join(","))
+        .collect();
+    format!("{shown}({})", args.join(","))
 }
 
 /// Every type a stored routine's signature names: each parameter's (OUT,
@@ -262,5 +277,30 @@ impl PgHandler {
             self.drop_object_acl("function", key)?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::format_procedure;
+
+    // `format_procedure` joins the arguments by a bare comma, as
+    // `getObjectDescription` names a routine (RP-563), and quotes and
+    // qualifies the name as `quote_qualified_identifier` does.
+    #[test]
+    fn format_procedure_joins_by_a_bare_comma() {
+        assert_eq!(
+            format_procedure("public", "k563", &["int4", "text"]),
+            "k563(integer,text)"
+        );
+        assert_eq!(
+            format_procedure("public", "Q f", &["int4"]),
+            "\"Q f\"(integer)"
+        );
+        assert_eq!(
+            format_procedure("s563", "h", &["int4", "bool"]),
+            "s563.h(integer,boolean)"
+        );
+        assert_eq!(format_procedure::<&str>("public", "z", &[]), "z()");
     }
 }

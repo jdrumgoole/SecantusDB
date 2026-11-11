@@ -13145,9 +13145,19 @@ impl PgHandler {
         out
     }
 
-    /// A function's signature as PostgreSQL prints it in messages:
-    /// `invin(cstring)`, `invout("a-b")` -- each argument type by its display
-    /// name, a user type quoted as an identifier.
+    /// A routine as `getObjectDescription` names it without its `function`
+    /// prefix: `format_procedure`'s `f(integer,ty)`, a bare comma between
+    /// the arguments. Every 2BP01 headline, DETAIL line and CASCADE notice
+    /// naming a routine uses this form (measured on PostgreSQL 15.19,
+    /// RP-563); the lookup errors (42883, 42809) use `function_signature`.
+    pub(crate) fn routine_object_name(&self, f: &UserFunction) -> String {
+        row_type_depends::format_procedure(&f.schema, &f.name, &f.param_types)
+    }
+
+    /// A function's signature as PostgreSQL's lookup errors print it
+    /// (`func_signature_string`): `invin(cstring)`, `invout("a-b")`,
+    /// `f(integer, text)` -- each argument type by its display name, a user
+    /// type quoted as an identifier, joined by a comma and a blank.
     fn function_signature(&self, f: &UserFunction) -> String {
         let args: Vec<String> = f
             .param_types
@@ -42191,17 +42201,20 @@ impl PgHandler {
                         found => return Err(Self::routine_lookup_error(&kind, &name, found.len())),
                     },
                 };
-                let sig = self.function_signature(&target);
+                // `getObjectDescription`'s form, as every refusal and
+                // notice below names the routine (RP-563).
+                let sig = self.routine_object_name(&target);
                 // From here on, the routine's own (bare) name.
                 let name = target.name.clone();
                 // DROP FUNCTION names a function and DROP PROCEDURE a
-                // procedure (DROP ROUTINE either): 42809 across them.
+                // procedure (DROP ROUTINE either): 42809 across them, in
+                // `func_signature_string`'s form.
                 if (kind == "procedure" && !target.is_procedure)
                     || (kind == "function" && target.is_procedure)
                 {
                     return Err(Self::user_error(
                         "42809",
-                        format!("{sig} is not a {}", kind),
+                        format!("{} is not a {}", self.function_signature(&target), kind),
                     ));
                 }
                 self.drop_function_casts(&target, cascade)?;
@@ -42240,7 +42253,7 @@ impl PgHandler {
                     for f in functions.iter().filter(|f| {
                         f.name != name && (f.param_types.contains(&key) || f.return_type == key)
                     }) {
-                        cascade_descs.push(format!("function {}", self.function_signature(f)));
+                        cascade_descs.push(format!("function {}", self.routine_object_name(f)));
                         cascade_functions.push(format!("{}/{}", f.name, f.param_types.len()));
                     }
                 }
@@ -42255,7 +42268,7 @@ impl PgHandler {
                         }) {
                             lines.push(format!(
                                 "function {} depends on type {quoted}",
-                                self.function_signature(f)
+                                self.routine_object_name(f)
                             ));
                         }
                     }
@@ -42517,7 +42530,7 @@ impl PgHandler {
                                 .map(|f| {
                                     format!(
                                         "function {} depends on type {quoted}",
-                                        self.function_signature(f)
+                                        self.routine_object_name(f)
                                     )
                                 })
                                 .collect();
@@ -42538,7 +42551,7 @@ impl PgHandler {
                         if !dependents.is_empty() {
                             let descs: Vec<String> = dependents
                                 .iter()
-                                .map(|f| format!("function {}", self.function_signature(f)))
+                                .map(|f| format!("function {}", self.routine_object_name(f)))
                                 .collect();
                             self.cascade_notice(&descs);
                             for f in &dependents {

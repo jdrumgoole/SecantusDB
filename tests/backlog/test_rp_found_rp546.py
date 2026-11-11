@@ -126,9 +126,9 @@ def test_drop_type_of_a_row_type_with_a_routine(dsn: str) -> None:
 
 
 # `getObjectDescription` names a routine by `format_procedure`, its argument
-# types joined by a bare comma. DROP TYPE's DETAIL here puts a blank after
-# each comma.
-@pytest.mark.backlog("RP-563")
+# types joined by a bare comma. DROP TYPE's DETAIL here put a blank after
+# each comma, the lookup errors' `func_signature_string` form.
+@pytest.mark.backlog_fixed("RP-563")
 def test_drop_type_names_a_routine_as_format_procedure(dsn: str) -> None:
     with psycopg.connect(dsn, autocommit=True) as c:
         c.execute("drop type if exists ty563 cascade")
