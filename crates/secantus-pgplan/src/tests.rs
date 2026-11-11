@@ -4316,6 +4316,33 @@ fn an_exists_subquery_is_analysed_before_its_list_is_dropped() {
 }
 
 #[test]
+fn a_star_with_no_from_has_no_tables_to_expand() {
+    // `ExpandAllTables` with an empty range table (RP-446): 42601 at the
+    // `*`, in its place in the target list, and in an EXISTS subquery's
+    // list before the planner drops it. Each was 0A000 `this target is not
+    // supported yet`, and the EXISTS answered `true`.
+    for (sql, state, at) in [
+        ("select *", "42601", 7),
+        ("select *, nosuch", "42601", 7),
+        ("select nosuch, *", "42703", 7),
+        ("select * where nosuch", "42601", 7),
+        ("select exists (select *)", "42601", 22),
+        ("select exists (select 1, *)", "42601", 25),
+        ("select exists (select nosuch, *)", "42703", 22),
+    ] {
+        take_error_location();
+        let err = analysed(sql).expect_err("should refuse");
+        assert_eq!(err.sqlstate(), state, "for {sql} (got {err})");
+        assert_eq!(take_error_location(), Some(at), "for {sql}");
+    }
+    // A qualified star is the qualifier's check, and a FROM gives the bare
+    // one a table to expand.
+    let err = analysed("select exists (select x.*)").expect_err("should refuse");
+    assert_eq!(err.sqlstate(), "42P01", "got {err}");
+    analysed("select exists (select * from t)").expect("a table to expand");
+}
+
+#[test]
 fn a_column_reference_with_no_from_names_nothing() {
     // `transformColumnRef` over an empty range table (RP-441): 42703 for a
     // bare name, 42P01 for a qualified one, at the reference's own token,
@@ -6937,6 +6964,97 @@ fn a_check_constraint_is_coerced_to_boolean() {
         assert!(error_unpositioned(), "for {sql}");
         take_error_location();
         assert!(!error_unpositioned(), "for {sql}");
+    }
+}
+
+/// A system column other than `tableoid` in a CHECK is 42P10 where
+/// `scanNSItemForColumn` meets it (RP-816): after a missing column written
+/// before it, before an argument refused after it, and with no position
+/// under ALTER TABLE. Measured on PostgreSQL 15.19.
+#[test]
+fn a_system_column_in_a_check_constraint_is_refused() {
+    let refused =
+        |col: &str| format!("system column \"{col}\" reference in check constraint is invalid");
+    for (sql, state, want, at) in [
+        (
+            "create table c (x int check (xmin))",
+            "42P10",
+            refused("xmin"),
+            29,
+        ),
+        (
+            "create table c (x int check (xmin = '1'))",
+            "42P10",
+            refused("xmin"),
+            29,
+        ),
+        (
+            "create table c (x int, check (c.xmin = '1'))",
+            "42P10",
+            refused("xmin"),
+            30,
+        ),
+        (
+            "create table c (x int check (ctid is not null))",
+            "42P10",
+            refused("ctid"),
+            29,
+        ),
+        (
+            "create table c (x int check (cmin = cmax))",
+            "42P10",
+            refused("cmin"),
+            29,
+        ),
+        (
+            "create table c (x int check (xmin = '1' and y = 1))",
+            "42P10",
+            refused("xmin"),
+            29,
+        ),
+        (
+            "create table c (x int check ((xmin = '1') = x))",
+            "42P10",
+            refused("xmin"),
+            30,
+        ),
+        (
+            "create table c (x int check (y = 1 and xmin = '1'))",
+            "42703",
+            "column \"y\" does not exist".to_string(),
+            29,
+        ),
+        (
+            "create table c (x int check (x and xmin = '1'))",
+            "42804",
+            "argument of AND must be type boolean, not type integer".to_string(),
+            29,
+        ),
+    ] {
+        take_error_location();
+        let err = plan(sql, &lookup).expect_err("should refuse");
+        assert_eq!(err.sqlstate(), state, "for {sql} (got {err})");
+        assert_eq!(err.to_string(), want, "for {sql}");
+        assert_eq!(
+            crate::errpos::error_position(sql, state, &err.to_string()),
+            Some(at as usize + 1),
+            "for {sql}"
+        );
+    }
+    for (sql, col) in [
+        ("alter table t add check (xmin = '1')", "xmin"),
+        ("alter table t add constraint k check (xmax = '1')", "xmax"),
+    ] {
+        take_error_location();
+        let err = plan(sql, &lookup).expect_err("should refuse");
+        assert_eq!(err.sqlstate(), "42P10", "for {sql} (got {err})");
+        assert_eq!(err.to_string(), refused(col), "for {sql}");
+        assert_eq!(
+            crate::errpos::error_position(sql, "42P10", &err.to_string()),
+            None,
+            "for {sql}"
+        );
+        take_error_location();
     }
 }
 

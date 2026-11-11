@@ -1825,13 +1825,6 @@ a regression test.
       private 15.19 cluster (found while working RP-432).
       Verify: tests/backlog/test_rp_dml_from.py::test_missing_column_reported_before_ambiguous_one
       Backlog-ID: RP-436
-- [ ] **`SELECT *` with no FROM is refused as a gap.** `select *` answers
-      `0A000 this target is not supported yet`; PostgreSQL 15.19's
-      `transformTargetList` answers 42601 `SELECT * with no tables
-      specified is not valid` at the `*`. Measured on PostgreSQL 15.19
-      (found while working RP-441).
-      Verify: tests/backlog/test_rp_fromless_analysis.py::test_star_with_no_from
-      Backlog-ID: RP-446
 - [ ] **An operator's type error is reported ahead of a missing column to
       its left.** `select nosuch + (1 + true)` is 42883 `operator does not
       exist: integer + boolean` here, from `optype` checking every operator
@@ -2266,21 +2259,6 @@ tests are in `tests/backlog/test_rp_found_rp546.py`.
       `other objects depend on it`. With no routine it already matches.
       Backlog-ID: RP-562
       Verify: tests/backlog/test_rp_found_rp546.py::test_drop_type_of_a_row_type_with_a_routine
-- [ ] **DROP TYPE names a routine with a blank after each comma.**
-      `getObjectDescription` writes `format_procedure`'s
-      `function k563(integer,ty563)`; DROP TYPE's DETAIL and CASCADE notice
-      here say `k563(integer, ty563)` (`function_signature`, which DROP
-      FUNCTION's dependants share). DROP TABLE names them as PostgreSQL does
-      since RP-546 (`row_type_depends::routine_description`).
-      Backlog-ID: RP-563
-      Verify: tests/backlog/test_rp_found_rp546.py::test_drop_type_names_a_routine_as_format_procedure
-- [ ] **A DROP TABLE of several tables is refused under the first one's
-      name.** PostgreSQL 15.19's `reportDependentObjects` says `cannot drop
-      desired object(s) because other objects depend on them` when the DROP
-      names more than one object; here `drop table m564a, m564b` is `cannot
-      drop table m564a because ...`, each table being dropped on its own.
-      Backlog-ID: RP-564
-      Verify: tests/backlog/test_rp_found_rp546.py::test_multi_table_drop_refusal_headline
 - [ ] **A routine over a temporary table's row type names no type.** On
       PostgreSQL 15.19 `create function tf565(tt565)` over a temp table has
       `proargtypes` `{tt565}`, and `drop table tt565` is 2BP01 naming it.
@@ -2295,6 +2273,21 @@ tests are in `tests/backlog/test_rp_found_rp546.py`.
       `pg_describe_object` of a routine shares that text.
       Backlog-ID: RP-567
       Verify: tests/backlog/test_rp_found_rp546.py::test_regprocedure_quotes_as_format_procedure
+
+## Found while working RP-564 (2026-11-11)
+
+Measured on a private PostgreSQL 15.19 cluster. The gap test is in
+`tests/backlog/test_rp_found_rp546.py`.
+
+- [ ] **A DROP TABLE CASCADE of several tables sends one notice per
+      table.** PostgreSQL 15.19's `performMultipleDeletions` reports the
+      whole statement once: `drop table n564a, n564b cascade` is one
+      `drop cascades to 5 other objects`, the last table's dependants
+      first. Here each table is dropped on its own and sends its own
+      notice (`... 3 other objects`, then `... 2 other objects`). RESTRICT
+      already refuses the statement as one since RP-564.
+      Verify: tests/backlog/test_rp_found_rp546.py::test_multi_table_drop_cascade_notice
+      Backlog-ID: RP-858
 
 ## Found while working RP-527 (2026-11-08)
 
@@ -2746,12 +2739,6 @@ char(3)`, `create domain dc3n as dc3` and the rest of the `_SETUP` in
       23514 has no position.
       Backlog-ID: RP-552
       Verify: tests/backlog/test_rp_found_rp529.py::test_record_literal_domain_error_position
-- [ ] **A schema's domain reports its CHECK under the qualified name.**
-      `select 200::s.sd` is 23514 `value for domain s.sd violates check
-      constraint "sd_check"` on PostgreSQL 15.19; here the constraint is
-      `"s.sd_check"`, though `pg_constraint.conname` is `sd_check` in both.
-      Backlog-ID: RP-553
-      Verify: tests/backlog/test_rp_found_rp529.py::test_schema_domain_check_name
 - [ ] **`ALTER COLUMN TYPE` to a domain over the column's type is
       refused.** `alter table falt alter column a type pint`, `a int` and
       `pint` a domain over `int`, retypes the column on PostgreSQL 15.19
@@ -3402,13 +3389,46 @@ and `create domain di811 as int`.
       gets no query text from ALTER TABLE); here it is placed at the `1`.
       Verify: tests/backlog/test_rp_found_rp811.py::test_alter_table_expressions_are_coerced_to_boolean
       Backlog-ID: RP-815
-- [ ] **A system column in a CHECK is 42703, not 42P10.** `create table
-      t811 (x int check (xmin))` is 42P10 `system column "xmin" reference in
-      check constraint is invalid` at 33 on PostgreSQL 15.19
-      (`cookConstraint` refuses any system column but `tableoid`); here it
-      is 42703 `column "xmin" does not exist`.
-      Verify: tests/backlog/test_rp_found_rp811.py::test_a_system_column_in_a_check_is_42p10
-      Backlog-ID: RP-816
+
+## Found while working RP-816 (2026-11-11)
+
+Measured on a private PostgreSQL 15.19 cluster.
+
+- [ ] **`tableoid` in a CHECK names no column.** `create table t816 (x int
+      check (tableoid::int > 0))` and `alter table c816 add constraint k
+      check (tableoid::int > 0)` create the constraint on PostgreSQL 15.19
+      (`scanNSItemForColumn` allows `tableoid`, alone of the system
+      columns, under `EXPR_KIND_CHECK_CONSTRAINT`), and `check (tableoid)`
+      is 42804 `argument of CHECK must be type boolean, not type oid` at
+      33. Here each is 42703 `column "tableoid" does not exist`: a SELECT's
+      `tableoid` is rewritten in `partitions.rs`, and a CHECK's row
+      evaluation has no `tableoid` to read.
+      Verify: tests/backlog/test_rp_found_rp816.py::test_tableoid_in_a_check_is_a_column
+      Backlog-ID: RP-859
+- [ ] **A whole-row reference in a CHECK is refused as unsupported.**
+      `create table t816 (x int check ((t816.*) is not null))` creates the
+      table on PostgreSQL 15.19; here it is 0A000 `this column is not
+      supported yet`.
+      Verify: tests/backlog/test_rp_found_rp816.py::test_a_whole_row_reference_in_a_check_is_taken
+      Backlog-ID: RP-860
+- [ ] **A CHECK takes another table's qualifier, and names a qualified
+      missing column without it.** `create table t816 (x int, check
+      (other.x = 1))` creates the table here; PostgreSQL 15.19 is 42P01
+      `missing FROM-clause entry for table "other"` at 34 (the CHECK's
+      range table holds only its own table). `check (t816.nosuch = 1)` is
+      42703 `column t816.nosuch does not exist` at 34 there
+      (`errorMissingColumn` names the qualifier, at the reference's start)
+      and `column "nosuch" does not exist` at 39 here.
+      Verify: tests/backlog/test_rp_found_rp816.py::test_a_checks_qualified_column_is_resolved_against_its_table
+      Backlog-ID: RP-861
+- [ ] **A system column in a generated column's expression is accepted.**
+      `create table t816 (x int, y int generated always as
+      (xmin::text::int) stored)` is 42P10 `cannot use system column "xmin"
+      in column generation expression` at 54 on PostgreSQL 15.19
+      (`scanNSItemForColumn` under `EXPR_KIND_GENERATED_COLUMN`, `tableoid`
+      allowed); here the table is created.
+      Verify: tests/backlog/test_rp_found_rp816.py::test_a_system_column_in_a_generated_column_is_42p10
+      Backlog-ID: RP-862
 
 ## Found while working RP-823 (2026-11-10)
 
@@ -3529,7 +3549,9 @@ m "Mx839")` and `z839(o char(4) default 'ab', v varchar(3) default 'q')`.
       constraint "Mx839_check"`: `domain_check_input` names the domain by
       `format_type_be`, which quotes a name as `quote_identifier` does.
       Here both print `Mx839` without the quotes, as does `select
-      null::"Mx839"`.
+      null::"Mx839"`. A keyword is quoted too: `select 0::s."int"`, `s."int"`
+      a domain over `int` with `check (value > 0)`, is `value for domain
+      s."int" violates ...` on 15.19 and `s.int` here (found working RP-553).
       Verify: tests/backlog/test_rp_found_rp839.py::test_a_domain_error_quotes_a_name_that_needs_it
       Backlog-ID: RP-845
 - [ ] **A `char(n)` column's DEFAULT prints its cast as `::character`.**

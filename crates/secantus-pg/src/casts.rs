@@ -539,7 +539,7 @@ impl PgHandler {
                 .map(|f| {
                     format!(
                         "function {} depends on type {name}",
-                        self.function_signature(f)
+                        self.routine_object_name(f)
                     )
                 })
                 .collect();
@@ -557,7 +557,7 @@ impl PgHandler {
         }
         let mut descs: Vec<String> = functions
             .iter()
-            .map(|f| format!("function {}", self.function_signature(f)))
+            .map(|f| format!("function {}", self.routine_object_name(f)))
             .collect();
         descs.extend(casts.iter().map(|(_, c)| c.clone()));
         descs.extend(transforms.iter().map(|(_, t)| t.clone()));
@@ -584,7 +584,7 @@ impl PgHandler {
         if casts.is_empty() {
             return Ok(());
         }
-        let sig = self.function_signature(f);
+        let sig = self.routine_object_name(f);
         if !cascade {
             let lines = casts
                 .iter()

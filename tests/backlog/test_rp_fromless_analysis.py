@@ -320,15 +320,42 @@ def test_fromless_subquery_two_levels_down_reads_the_outer_row(query: str, rust_
     assert got == TWO_LEVELS_DOWN[query]
 
 
-@pytest.mark.backlog("RP-446")
-def test_star_with_no_from(rust_pg: Any) -> None:
-    """`0A000 this target is not supported yet` here."""
-    assert answer(rust_pg, "select *") == (
-        "42601",
-        "SELECT * with no tables specified is not valid",
+def _no_tables(position: str) -> Answer:
+    return ("42601", "SELECT * with no tables specified is not valid", None, position)
+
+
+# `ExpandAllTables` finding no range-table entry for a bare `*`: 42601 at
+# the `*`, met in its place in the target list, and in an EXISTS subquery
+# before the planner drops the list.
+STAR_WITH_NO_FROM = {
+    "select *": _no_tables("8"),
+    "select *, nosuch": _no_tables("8"),
+    "select nosuch, *": _missing("8"),
+    "select 'x'::int, *": (
+        "22P02",
+        'invalid input syntax for type integer: "x"',
         None,
         "8",
-    )
+    ),
+    "select * where nosuch": _no_tables("8"),
+    "select * order by nosuch": _no_tables("8"),
+    "select * union select 1": _no_tables("8"),
+    "select 1 union select *": _no_tables("23"),
+    "select (select *)": _no_tables("16"),
+    "select exists (select *)": _no_tables("23"),
+    "select 1 where exists (select *)": _no_tables("31"),
+    "select exists (select 1, *)": _no_tables("26"),
+    "select exists (select nosuch, *)": _missing("23"),
+    "select exists (select * order by nosuch)": _no_tables("23"),
+}
+
+
+@pytest.mark.backlog_fixed("RP-446")
+@pytest.mark.parametrize("query", list(STAR_WITH_NO_FROM))
+def test_star_with_no_from(query: str, rust_pg: Any) -> None:
+    """`0A000 this target is not supported yet` here, and `true` for the
+    star in an EXISTS list, which was dropped unanalysed."""
+    assert answer(rust_pg, query) == STAR_WITH_NO_FROM[query]
 
 
 @pytest.mark.backlog("RP-447")

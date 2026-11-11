@@ -403,8 +403,12 @@ fn constraints_of(
                     .as_deref()
                     .ok_or_else(|| Error::Parse("CHECK without an expression".into()))?;
                 let name = if k.conname.is_empty() {
-                    // Named after `integer`, not the key `"integer"`.
-                    let domain = crate::pgtypes::user_type_catalog_name(domain);
+                    // Named after `integer`, not the key `"integer"`, and
+                    // after `sd`, not the key `s.sd`: `domainAddConstraint`
+                    // chooses it from the domain's own name, which the
+                    // schema is not part of (`sd_check`, 15.19; RP-553).
+                    let (_, bare) = crate::schemas::split_key(domain);
+                    let domain = crate::pgtypes::user_type_catalog_name(&bare);
                     let mut candidate = format!("{domain}_check");
                     let mut i = 0;
                     while existing.contains(&candidate)

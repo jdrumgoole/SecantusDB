@@ -7,7 +7,7 @@ CHECK constraint coerced to boolean):
   (RP-814);
 - ALTER TABLE's expressions are not coerced to boolean when no row reaches
   them, and SET DEFAULT's error has a position (RP-815);
-- a system column in a CHECK is 42703, not 42P10 (RP-816).
+- a system column in a CHECK was 42703, not 42P10 (RP-816).
 
 The expected answers were measured on a private, freshly initdb'd
 PostgreSQL 15.19 cluster with `_SETUP`, which each statement runs after.
@@ -184,10 +184,10 @@ def test_alter_table_expressions_are_coerced_to_boolean(
     assert _answer(dsn, query) == expected
 
 
-@pytest.mark.backlog("RP-816")
+@pytest.mark.backlog_fixed("RP-816")
 def test_a_system_column_in_a_check_is_42p10(dsn: str) -> None:
-    """`cookConstraint` refuses a system column other than `tableoid` in a
-    CHECK: 42P10 on PostgreSQL 15.19. Here it is 42703, as though the
+    """`scanNSItemForColumn` refuses a system column other than `tableoid`
+    in a CHECK: 42P10 on PostgreSQL 15.19. It was 42703, as though the
     column did not exist."""
     assert _answer(dsn, "create table t811 (x int check (xmin))") == (
         "error",

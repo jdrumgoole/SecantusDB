@@ -220,11 +220,17 @@ fn is_string_literal(n: &Node) -> bool {
 
 /// The error `transformColumnRef` raises for a reference that an empty
 /// range table cannot resolve, recorded at the reference's own token. A
-/// bare `*` is `SELECT * with no tables specified`, answered where the
-/// target list is planned.
+/// bare `*`, which the grammar admits only as a whole target-list entry,
+/// is `ExpandAllTables` finding no range-table entry to expand (RP-446):
+/// 42601 `SELECT * with no tables specified is not valid` at the `*`, met
+/// in its place in the target list like any other entry.
 fn missing(c: &ColumnRef) -> Result<()> {
     if c.fields.len() == 1 && matches!(c.fields[0].node.as_ref(), Some(N::AStar(_))) {
-        return Ok(());
+        set_error_location(c.location);
+        return Err(Error::Sqlstate(
+            "42601",
+            "SELECT * with no tables specified is not valid".to_string(),
+        ));
     }
     Err(values_refs::reference_error(c, None, &|_| None))
 }
