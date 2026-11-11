@@ -2,7 +2,7 @@
 
 - a `varchar` compared with a `char(n)` counted the trailing blanks (fixed);
 - an uncorrelated `row op ANY / ALL (subquery)` with an ordering operator
-  is refused;
+  was refused (fixed, RP-727);
 - a row compared with a subquery whose column types have no operator
   together is refused at run time, not reported as 42883 when planned.
 
@@ -73,8 +73,13 @@ def test_varchar_against_bpchar_ignores_trailing_blanks(query: str, dsn: str) ->
 
 
 # `(k, a) < any (select 2, 3)`: each subquery row is a RowCompareExpr with
-# the row. Here it is 0A000 `a row comparison with < and a subquery is not
-# supported yet`; only `=` and `<>` are answered uncorrelated.
+# the row. It was 0A000 `a row comparison with < and a subquery is not
+# supported yet`; only `=` and `<>` were answered uncorrelated. The VALUES
+# rows check where a NULL decides (at or before the first unequal pair) and
+# where it does not (after it), over three columns.
+_V727 = (
+    "(values (1, 1, 1), (1, 1, null), (1, null, 3), (null, 1, 1), (2, 1, 1), (0, 9, 9)) v(a, b, c)"
+)
 UNCORRELATED_ORDERED_ANY = {
     "select k, (k, a) < any (select 2, 3) from rn697 order by k": (
         [(1, True), (2, None), (3, False), (4, False)],
@@ -84,10 +89,35 @@ UNCORRELATED_ORDERED_ANY = {
         [(1, False), (2, None), (3, True), (4, True)],
         ["k", "?column?"],
     ),
+    f"select (a, b, c) < any (select 1, 1, 2) from {_V727}": (
+        [(True,), (None,), (None,), (None,), (False,), (True,)],
+        ["?column?"],
+    ),
+    f"select (a, b, c) <= any (select 1, 1, 1) from {_V727}": (
+        [(True,), (None,), (None,), (None,), (False,), (True,)],
+        ["?column?"],
+    ),
+    f"select (a, b, c) > all (select 1, 1, 1 union all select 0, 5, 5) from {_V727}": (
+        [(False,), (None,), (None,), (None,), (True,), (False,)],
+        ["?column?"],
+    ),
+    f"select (a, b, c) < all (select 2, null, 1 union all select 1, 5, null) from {_V727}": (
+        [(True,), (True,), (None,), (None,), (False,), (True,)],
+        ["?column?"],
+    ),
+    f"select (a, b, c) >= all (select 1, 1, 1 where false) from {_V727}": (
+        [(True,), (True,), (True,), (True,), (True,), (True,)],
+        ["?column?"],
+    ),
+    "select row() < any (select)": (
+        "0A000",
+        "cannot compare rows of zero length",
+        "14",
+    ),
 }
 
 
-@pytest.mark.backlog("RP-727")
+@pytest.mark.backlog_fixed("RP-727")
 @pytest.mark.parametrize("query", list(UNCORRELATED_ORDERED_ANY))
 def test_uncorrelated_ordered_row_any(query: str, dsn: str) -> None:
     assert answer(dsn, query) == UNCORRELATED_ORDERED_ANY[query]

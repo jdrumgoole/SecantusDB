@@ -52,13 +52,13 @@ def test_an_intersect_over_a_join_puts_the_smaller_input_first(dsn: str) -> None
     assert got == [("1.000",)]
 
 
-@pytest.mark.backlog("RP-842")
+@pytest.mark.backlog_fixed("RP-842")
 def test_a_hashed_set_operation_returns_its_groups_in_hash_order(dsn: str) -> None:
     """A HashSetOp returns its groups in its hash table's order
     (`setop_retrieve_hash_table`): `select x, y from (values (1.0, true),
     (1.00, false), (1.000, true)) v(x, y) intersect select x, y from
     (values (1, true), (1, false)) w(x, y)` is `(1, f), (1, t)` on
-    PostgreSQL 15.19. Here the groups come out in the first input's order,
+    PostgreSQL 15.19. The groups came out in the first input's order,
     `(1, t), (1, f)`."""
     with _connect(dsn) as c:
         got = _text(
@@ -69,14 +69,39 @@ def test_a_hashed_set_operation_returns_its_groups_in_hash_order(dsn: str) -> No
     assert got == [("1", "False"), ("1", "True")]
 
 
-@pytest.mark.backlog("RP-843")
+@pytest.mark.backlog_fixed("RP-842")
+def test_a_hashed_set_operation_outputs_each_group_together_in_hash_order(dsn: str) -> None:
+    """Measured on PostgreSQL 15.19, both plans a HashSetOp: an EXCEPT ALL
+    returns each group's surviving copies together, in the hash table's
+    order, and an INTERSECT whose first input repeats a group after its
+    last new one grows the table (`SH_INSERT` checks the fill even for a
+    key already present). The server returned the first input's order,
+    each copy where its row stood."""
+    with _connect(dsn) as c:
+        except_all = _text(
+            c,
+            "select x from (values (3), (1), (4), (1), (5), (9), (2), (6), (5), (3), (5)) v(x)"
+            " except all select x from (values (5), (1), (8)) w(x)",
+        )
+        grown = _text(
+            c,
+            "select x from (values ('a'), ('b'), ('c'), ('d'), ('e'), ('f'), ('g'), ('h'),"
+            " ('a')) v(x) intersect select x from (values ('h'), ('g'), ('f'), ('e'), ('d'),"
+            " ('c'), ('b'), ('a'), ('z')) w(x)",
+        )
+    assert [r[0] for r in except_all] == ["9", "1", "5", "5", "2", "4", "6", "3", "3"]
+    assert [r[0] for r in grown] == ["g", "h", "a", "e", "d", "c", "b", "f"]
+
+
+@pytest.mark.backlog_fixed("RP-843")
 def test_a_numeric_constant_selected_from_a_from_item_is_inserted(dsn: str) -> None:
     """`insert into t692e select 1.0, g from generate_series(1, 2) g`, the
     same over `(values (3)) v(g)`, and `insert into t692e (x) select 1.5
     from t692j` insert their rows on PostgreSQL 15.19: the constant is
-    `numeric`. Here each is 42804 `column "x" is of type numeric but
-    expression is of type text`, though `insert into t692e select 1.0, 1`
-    (no FROM) is inserted."""
+    `numeric`. Each was 42804 `column "x" is of type numeric but expression
+    is of type text` here, though `insert into t692e select 1.0, 1` (no
+    FROM) was inserted: a select-list constant over a FROM item was typed
+    by its decoded value, not its node."""
     inserts = [
         "insert into t692e select 1.0, g from generate_series(1, 2) g",
         "insert into t692e select 1.0, g from (values (3)) v(g)",

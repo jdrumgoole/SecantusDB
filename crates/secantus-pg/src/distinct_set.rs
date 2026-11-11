@@ -132,53 +132,6 @@ impl<K: IdentHash> DistinctSet<K> {
     }
 }
 
-/// A multiset of identities, for INTERSECT / EXCEPT: buckets by hash, a
-/// count per member, membership by `==` (as `DistinctSet`).
-pub(crate) struct IdentCounts<K> {
-    state: std::collections::hash_map::RandomState,
-    buckets: HashMap<u64, Vec<(K, usize)>>,
-}
-
-impl<K: IdentHash> IdentCounts<K> {
-    pub(crate) fn new() -> Self {
-        Self {
-            state: Default::default(),
-            buckets: HashMap::new(),
-        }
-    }
-
-    fn hash_of(&self, k: &K) -> u64 {
-        let mut h = self.state.build_hasher();
-        k.ident_hash(&mut h);
-        h.finish()
-    }
-
-    pub(crate) fn add(&mut self, k: K) {
-        let bucket = self.buckets.entry(self.hash_of(&k)).or_default();
-        match bucket.iter_mut().find(|(m, _)| *m == k) {
-            Some((_, n)) => *n += 1,
-            None => bucket.push((k, 1)),
-        }
-    }
-
-    /// Whether `k` has a member left; `consume` takes one of it away.
-    pub(crate) fn take(&mut self, k: &K, consume: bool) -> bool {
-        let h = self.hash_of(k);
-        let Some(bucket) = self.buckets.get_mut(&h) else {
-            return false;
-        };
-        match bucket.iter_mut().find(|(m, n)| m == k && *n > 0) {
-            Some((_, n)) => {
-                if consume {
-                    *n -= 1;
-                }
-                true
-            }
-            None => false,
-        }
-    }
-}
-
 /// Identities numbered in the order first seen, for GROUP BY: buckets by
 /// hash, membership by `==` (as `DistinctSet`).
 pub(crate) struct IdentIndex<K> {
@@ -208,6 +161,17 @@ impl<K: IdentHash> IdentIndex<K> {
         self.len += 1;
         bucket.push((k, i));
         Err(i)
+    }
+
+    /// The number of `k`, if it has one.
+    pub(crate) fn find(&self, k: &K) -> Option<usize> {
+        let mut h = self.state.build_hasher();
+        k.ident_hash(&mut h);
+        self.buckets
+            .get(&h.finish())?
+            .iter()
+            .find(|(m, _)| m == k)
+            .map(|(_, i)| *i)
     }
 }
 

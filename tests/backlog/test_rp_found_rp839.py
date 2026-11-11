@@ -51,9 +51,9 @@ def _answers(dsn: str, sqls: list[str]) -> list[object]:
 
 # `transformTableLikeClause` copies each column's `attcollation` with its
 # type, so a `text COLLATE "C"` column's copy is collated "C", which
-# `information_schema.columns.collation_name` names. Here the copy takes
-# its type's default collation.
-@pytest.mark.backlog("RP-844")
+# `information_schema.columns.collation_name` names. The copy took its
+# type's default collation until RP-844.
+@pytest.mark.backlog_fixed("RP-844")
 def test_a_like_copy_keeps_a_columns_collation(dsn: str) -> None:
     got = _answers(
         dsn,

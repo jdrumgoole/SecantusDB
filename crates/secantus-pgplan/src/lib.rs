@@ -11869,6 +11869,16 @@ fn expand_table_like(
                 }
             };
             let mut sql = format!("{} {ty}", q(&col.name));
+            // `transformTableLikeClause` copies `attcollation` with the type
+            // (`def->collOid`), whatever the LIKE's options, so a `text
+            // COLLATE "C"` column's copy sorts and compares as "C" too
+            // (RP-844). A column of a collated domain carries the domain's,
+            // which the COLLATE repeats.
+            if let Ok(coll) = col.extra.get_str("collation") {
+                if coll != crate::collation::INDETERMINATE {
+                    sql.push_str(&format!(" COLLATE {}", q(coll)));
+                }
+            }
             if !col.nullable {
                 sql.push_str(" NOT NULL");
             }
@@ -17004,7 +17014,7 @@ fn plan_series_select(
     series: Series,
     params: &[Bson],
 ) -> Result<Statement> {
-    let filter = series_where(s, &series, params)?;
+    let (filter, residual) = series_where(s, &series, params)?;
     let mut columns: Vec<(String, String)> = Vec::new();
     let mut casts: Vec<Option<ColumnExpr>> = Vec::new();
     for t in &s.target_list {
@@ -17033,7 +17043,9 @@ fn plan_series_select(
                 } else {
                     rt.name.clone()
                 };
-                let result_type = const_col_type(&value).to_string();
+                // Typed by its node, as PostgreSQL types a literal: `1.5` is
+                // `numeric`, which its decoded value alone does not say (RP-843).
+                let result_type = static_type(val, &value);
                 columns.push((out.clone(), out));
                 casts.push(Some(ColumnExpr::Const { value, result_type }));
             }
@@ -17114,7 +17126,7 @@ fn plan_series_select(
         columns,
         casts,
         filter,
-        residual: None,
+        residual,
         order,
         limit,
         offset,
@@ -17127,35 +17139,48 @@ fn plan_series_select(
 }
 
 /// The WHERE clause of a select over a generated series, lowered against the
-/// one int4 column the series exposes. `where false` over a series answers
+/// one column the series exposes (`int4`, or `int8` for an `int8` series),
+/// with what does not lower as a per-row residual. `where false` over a series answers
 /// no rows and still describes the column (measured), which is what a
 /// server-side cursor opened on it relies on.
 fn series_where(
     s: &pg_query::protobuf::SelectStmt,
     series: &Series,
     params: &[Bson],
-) -> Result<Document> {
+) -> Result<(Document, Option<ColumnExpr>)> {
     match s.where_clause.as_ref() {
-        None => Ok(Document::new()),
+        None => Ok((Document::new(), None)),
         // `where false` / `where $1`: a predicate with no column in it keeps
         // every row or none.
         Some(w)
             if matches!(w.node.as_ref(), Some(N::AConst(_) | N::ParamRef(_)))
                 || !references_columns(w) =>
         {
-            Ok(if constant_where(w, params)? {
-                Document::new()
-            } else {
-                doc! { "$expr": false }
-            })
+            Ok((
+                if constant_where(w, params)? {
+                    Document::new()
+                } else {
+                    doc! { "$expr": false }
+                },
+                None,
+            ))
         }
-        // `FROM generate_series(...) g`: the series is the column.
+        // `FROM generate_series(...) g`: the series is the column. A WHERE
+        // that does not lower to a filter -- an expression over the column,
+        // a correlated subquery's per-row call -- is a residual evaluated
+        // per row, as over a table: PostgreSQL's Function Scan applies its
+        // quals to each row the function returns (RP-703). Refusing it
+        // leaked the correlated call's internal name in a 42883.
         Some(w) if !s.from_clause.is_empty() => {
             let def = TableDef::new(
                 "generate_series",
-                vec![Column::new(&series.column, "int4", false)],
+                vec![Column::new(
+                    &series.column,
+                    if series.int8 { "int8" } else { "int4" },
+                    false,
+                )],
             );
-            lower_where(w, &def, params)
+            lower_where_or_residual(w, &def, params)
         }
         // A FROM-less select has no column for its WHERE to name: an output
         // alias is not visible there (`select generate_series(1, 3) as g
@@ -19113,7 +19138,9 @@ fn plan_table_targets(
                 } else {
                     rt.name.clone()
                 };
-                let result_type = const_col_type(&value).to_string();
+                // Typed by its node, as PostgreSQL types a literal: `1.5` is
+                // `numeric`, which its decoded value alone does not say (RP-843).
+                let result_type = static_type(val, &value);
                 columns.push((out.clone(), out));
                 casts.push(Some(ColumnExpr::Const { value, result_type }));
             }
@@ -24370,7 +24397,8 @@ fn resolve_one_sublink(
 /// rows of `a = x AND b = y`, `NOT IN` an AND over the rows of `a <> x OR b
 /// <> y` -- whose three-valued logic is SQL's row comparison exactly (a NULL
 /// makes a row's comparison unknown, not false). No rows: FALSE for IN,
-/// TRUE for NOT IN.
+/// TRUE for NOT IN. An ordering operator (`< ANY`, `>= ALL`, ...) compares
+/// each subquery row as a RowCompareExpr does (RP-727).
 #[allow(clippy::too_many_arguments)]
 fn row_subquery_comparison(
     sl: &pg_query::protobuf::SubLink,
@@ -24395,12 +24423,21 @@ fn row_subquery_comparison(
             _ => None,
         })
         .unwrap_or_else(|| "=".to_string());
-    if !matches!(op.as_str(), "=" | "<>") {
+    let ordered = matches!(op.as_str(), "<" | "<=" | ">" | ">=");
+    if !ordered && !matches!(op.as_str(), "=" | "<>") {
         return Err(Error::Unsupported(format!(
             "a row comparison with {op} and a subquery"
         )));
     }
     let width = row.args.len();
+    if ordered && width == 0 {
+        // `make_row_comparison_op`'s check, at the operator, ahead of any
+        // row.
+        set_error_location(sl.location);
+        return Err(Error::FeatureNotSupported(
+            "cannot compare rows of zero length".into(),
+        ));
+    }
     if let Some(r) = rows.first() {
         if r.len() != width {
             return Err(Error::Parse(if r.len() > width {
@@ -24431,33 +24468,66 @@ fn row_subquery_comparison(
     } else {
         (BoolExprType::OrExpr, BoolExprType::AndExpr)
     };
+    // One field against one subquery column under `op`. A `char(n)`
+    // subquery column's value keeps its type, so the pair takes the
+    // operator the two types resolve to: against a `varchar` field that is
+    // `bpchareq`, which ignores the trailing blanks on both sides (RP-726).
+    let pair =
+        |params: &mut Vec<Bson>, i: usize, lhs: &pg_query::protobuf::Node, v: Bson, op: &str| {
+            let value = param_node(params, v);
+            let rhs = match types.and_then(|t| t.get(i)) {
+                Some(t) if is_bpchar_type(t) => relabel_cast(value, t),
+                _ => value,
+            };
+            pg_query::protobuf::Node {
+                node: Some(N::AExpr(Box::new(AExpr {
+                    kind: AExprKind::AexprOp as i32,
+                    name: vec![string_node(op)],
+                    lexpr: Some(Box::new(lhs.clone())),
+                    rexpr: Some(Box::new(rhs)),
+                    location: -1,
+                }))),
+            }
+        };
     let mut arms = Vec::with_capacity(rows.len());
     for r in rows {
+        if ordered {
+            // Each subquery row is a RowCompareExpr with the row, which
+            // `ExecEvalRowCompare` decides at the first pair that is not
+            // equal: a NULL there or before it makes the comparison NULL,
+            // and rows equal throughout satisfy only `<=` and `>=`. As a
+            // tree that is `a1 < x1 OR (a1 = x1 AND (... an op xn))`,
+            // built from the last pair out: a decided pair settles its OR
+            // or AND whatever lies beyond it, and an unknown one leaves
+            // the whole unknown.
+            let strict = &op[..1];
+            let last = width - 1;
+            let mut values: Vec<Bson> = r;
+            let mut tree = pair(
+                params,
+                last,
+                &row.args[last],
+                std::mem::replace(&mut values[last], Bson::Null),
+                &op,
+            );
+            for i in (0..last).rev() {
+                let v = std::mem::replace(&mut values[i], Bson::Null);
+                let lt = pair(params, i, &row.args[i], v.clone(), strict);
+                let eq = pair(params, i, &row.args[i], v, "=");
+                tree = boolexpr(
+                    BoolExprType::OrExpr,
+                    vec![lt, boolexpr(BoolExprType::AndExpr, vec![eq, tree])],
+                );
+            }
+            arms.push(tree);
+            continue;
+        }
         let cmps: Vec<pg_query::protobuf::Node> = row
             .args
             .iter()
             .zip(r)
             .enumerate()
-            .map(|(i, (lhs, v))| {
-                // A `char(n)` subquery column's value keeps its type, so the
-                // pair takes the operator the two types resolve to: against
-                // a `varchar` field that is `bpchareq`, which ignores the
-                // trailing blanks on both sides (RP-726).
-                let value = param_node(params, v);
-                let rhs = match types.and_then(|t| t.get(i)) {
-                    Some(t) if is_bpchar_type(t) => relabel_cast(value, t),
-                    _ => value,
-                };
-                pg_query::protobuf::Node {
-                    node: Some(N::AExpr(Box::new(AExpr {
-                        kind: AExprKind::AexprOp as i32,
-                        name: vec![string_node(&op)],
-                        lexpr: Some(Box::new(lhs.clone())),
-                        rexpr: Some(Box::new(rhs)),
-                        location: -1,
-                    }))),
-                }
-            })
+            .map(|(i, (lhs, v))| pair(params, i, lhs, v, &op))
             .collect();
         arms.push(if cmps.len() == 1 {
             cmps.into_iter().next().expect("one")
@@ -26752,6 +26822,102 @@ fn alias_field_rewrite(
     Ok(changed.then_some(out))
 }
 
+/// A select-list `(v).*` or `(v.*).*`, where `v` names a FROM item of this
+/// level, as the item's star `v.*` (RP-704). PostgreSQL's
+/// `transformIndirection` reads `(v)` as a column first and as the item's
+/// whole row only when no column of that name is in scope
+/// (`transformColumnRef`), and a star over a whole row expands as `v.*`
+/// does (`ExpandIndirectionStar` -> `ExpandRowReference`): the item's
+/// columns, under their own names. A column named `v` wins, so `(v).*` of
+/// an integer column stays PostgreSQL's 42809; so does a one-column
+/// function's alias, whose whole row is the function's scalar value.
+/// `None` when the select list holds none to rewrite.
+fn whole_row_star_rewrite(
+    s: &pg_query::protobuf::SelectStmt,
+    lookup: &dyn Fn(&str) -> Option<TableDef>,
+) -> Option<pg_query::protobuf::SelectStmt> {
+    let is_star = |n: &pg_query::protobuf::Node| matches!(n.node.as_ref(), Some(N::AStar(_)));
+    // The item a target `(q).*` / `(q.*).*` names, and whether it was the
+    // qualified star `q.*`, which is the row whatever the columns are.
+    let named = |t: &pg_query::protobuf::Node| -> Option<(String, bool, i32)> {
+        let Some(N::ResTarget(rt)) = t.node.as_ref() else {
+            return None;
+        };
+        let Some(N::AIndirection(ind)) = rt.val.as_deref()?.node.as_ref() else {
+            return None;
+        };
+        if !matches!(ind.indirection.as_slice(), [star] if is_star(star)) {
+            return None;
+        }
+        let Some(N::ColumnRef(c)) = ind.arg.as_deref()?.node.as_ref() else {
+            return None;
+        };
+        let (q, qualified_star) = match c.fields.as_slice() {
+            [q] => (q, false),
+            [q, star] if is_star(star) => (q, true),
+            _ => return None,
+        };
+        match q.node.as_ref() {
+            Some(N::String(q)) => Some((q.sval.clone(), qualified_star, c.location)),
+            _ => None,
+        }
+    };
+    if !s.target_list.iter().any(|t| named(t).is_some()) {
+        return None;
+    }
+    let mut ctes = VISIBLE_CTES.with(|v| v.borrow().clone());
+    ctes.extend(s.with_clause.iter().flat_map(|w| w.ctes.iter().cloned()));
+    let mut columns = Vec::new();
+    for item in &s.from_clause {
+        collect_from_columns(item, lookup, &ctes, &mut columns);
+    }
+    let whole_row = |name: &str| -> bool {
+        if columns.iter().any(|c| c == name) {
+            return false;
+        }
+        let Some(item) = s
+            .from_clause
+            .iter()
+            .find_map(|item| correlated::named_item(item, name))
+        else {
+            return false;
+        };
+        match item.node.as_ref() {
+            Some(N::RangeFunction(rf)) => {
+                correlated::without_calls(|| joins::function_columns(rf, lookup, &[]))
+                    .is_some_and(|cols| cols.len() > 1)
+            }
+            _ => true,
+        }
+    };
+    let mut out = s.clone();
+    let mut changed = false;
+    for t in &mut out.target_list {
+        let Some((q, qualified_star, location)) = named(t) else {
+            continue;
+        };
+        if !qualified_star && !whole_row(&q) {
+            continue;
+        }
+        let Some(N::ResTarget(rt)) = t.node.as_mut() else {
+            continue;
+        };
+        rt.val = Some(Box::new(pg_query::protobuf::Node {
+            node: Some(N::ColumnRef(pg_query::protobuf::ColumnRef {
+                fields: vec![
+                    string_node(&q),
+                    pg_query::protobuf::Node {
+                        node: Some(N::AStar(pg_query::protobuf::AStar {})),
+                    },
+                ],
+                location,
+            })),
+        }));
+        changed = true;
+    }
+    changed.then_some(out)
+}
+
 thread_local! {
     /// The FROM subqueries `column_alias_rewrite` made of a table with a
     /// column-alias list: `(alias, subquery, table)`.
@@ -26973,6 +27139,10 @@ fn plan_select(
     cancel::check()?;
     // `(j).value` where `j` names a FROM item: the item's column.
     if let Some(rewritten) = alias_field_rewrite(s, lookup)? {
+        return plan_select(&rewritten, lookup, params);
+    }
+    // `(v).*` where `v` names a FROM item: the item's star (RP-704).
+    if let Some(rewritten) = whole_row_star_rewrite(s, lookup) {
         return plan_select(&rewritten, lookup, params);
     }
     if s.op != pg_query::protobuf::SetOperation::SetopNone as i32 {
@@ -28483,7 +28653,12 @@ fn plan_aggregate_direct(
         }
         // The WHERE clause was silently dropped here before: `count(*)
         // from generate_series(1, 5) i where i > 2` answered 5.
-        let filter = series_where(s, &series, params)?;
+        let (filter, residual) = series_where(s, &series, params)?;
+        if residual.is_some() {
+            return Err(Error::Unsupported(
+                "this WHERE over an aggregated generate_series".into(),
+            ));
+        }
         return Ok(Statement::Aggregate(Aggregate {
             table: String::new(),
             series: Some(series),
@@ -31988,7 +32163,9 @@ fn plan_select_srf(
     };
     // The predicate sees the series under its OUTPUT name, which is the only
     // name the row has (`select generate_series(1, 3) as bar where bar > 1`).
-    let filter = series_where(s, &series, params)?;
+    // A FROM-less select has no column for its WHERE to read, so nothing
+    // is left over to run per row.
+    let (filter, _) = series_where(s, &series, params)?;
     let mut order = Vec::new();
     for item in &s.sort_clause {
         let Some(N::SortBy(sb)) = item.node.as_ref() else {
@@ -37040,17 +37217,6 @@ pub fn column_expr_type(expr: &ColumnExpr) -> &str {
         ColumnExpr::Coalesce { .. } => "text",
         ColumnExpr::Const { result_type, .. } => result_type,
         ColumnExpr::Row { result_type, .. } => result_type,
-    }
-}
-
-/// The PostgreSQL type name a literal select-list constant reports.
-fn const_col_type(v: &Bson) -> &'static str {
-    match v {
-        Bson::Boolean(_) => "bool",
-        Bson::Int32(_) => "int4",
-        Bson::Int64(_) => "int8",
-        Bson::Double(_) => "float8",
-        _ => "text",
     }
 }
 

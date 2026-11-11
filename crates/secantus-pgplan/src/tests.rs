@@ -2850,6 +2850,31 @@ fn a_where_over_a_series_filters_it() {
     }
 }
 
+/// A WHERE over a series that does not lower to a filter -- an expression
+/// over the column -- is a residual run per row, as over a table, not a
+/// refusal (RP-703: `where f.x + 1 > 0` was 0A000, and a correlated
+/// subquery there a 42883 naming the internal per-row call). A conjunct
+/// that lowers stays the filter.
+#[test]
+fn a_where_over_a_series_that_does_not_lower_is_a_residual() {
+    match plan_ok("SELECT x FROM generate_series(1,5) f(x) WHERE x % 2 = 0 AND x > 2") {
+        Statement::Select(sel) => {
+            assert!(sel.series.is_some());
+            assert_eq!(sel.filter, bson::doc! { "x": { "$gt": 2 } });
+            assert!(sel.residual.is_some(), "x % 2 = 0 runs per row");
+        }
+        other => panic!("wrong statement: {other:?}"),
+    }
+    // An undefined column is still the error, not a silent residual.
+    assert!(matches!(
+        plan(
+            "SELECT x FROM generate_series(1,5) f(x) WHERE y + 1 > 0",
+            &lookup
+        ),
+        Err(Error::UndefinedColumn(_))
+    ));
+}
+
 /// A set-returning function in the SELECT LIST of a FROM-less query is not a
 /// constant: `select generate_series(1,3)` is three ROWS.
 ///
@@ -5251,6 +5276,36 @@ fn an_added_domain_column_is_tagged_like_a_declared_one() {
     domains::set_user_domains(Vec::new());
 }
 
+/// RP-844: `transformTableLikeClause` copies a column's `attcollation`
+/// with its type, under any LIKE options, so a `text COLLATE "C"` column's
+/// copy is collated "C" and an uncollated one stays uncollated. The copy
+/// used to take its type's default collation.
+#[test]
+fn a_like_copy_keeps_a_columns_collation() {
+    let mut source = t();
+    source.columns[1].extra.insert("collation", "C");
+    let lookup = |name: &str| (name == "t").then(|| source.clone());
+    for sql in [
+        "CREATE TABLE l (LIKE t)",
+        "CREATE TABLE l (LIKE t INCLUDING ALL)",
+    ] {
+        let def = match plan(sql, &lookup).expect("should plan") {
+            Statement::CreateTable(def, _) => def,
+            other => panic!("wrong statement: {other:?}"),
+        };
+        let collation = |c: &str| {
+            def.column(c)
+                .unwrap()
+                .extra
+                .get_str("collation")
+                .ok()
+                .map(str::to_string)
+        };
+        assert_eq!(collation("name").as_deref(), Some("C"), "{sql}");
+        assert_eq!(collation("n"), None, "{sql}");
+    }
+}
+
 /// RP-839: `CREATE TABLE ... (LIKE t)` copies a column's `atttypid`, so a
 /// column of a domain stays one of it and follows the domain's DEFAULT,
 /// which INCLUDING DEFAULTS does not copy in as the column's own (it is the
@@ -6842,4 +6897,92 @@ fn a_check_constraint_is_coerced_to_boolean() {
         take_error_location();
         assert!(!error_unpositioned(), "for {sql}");
     }
+}
+
+/// A literal in the select list of a query with a FROM item is typed by its
+/// node, as PostgreSQL types it: `1.5` is `numeric` and `B'101'` is `bit`,
+/// which their decoded values alone do not say. Both were `text`, so the
+/// client read a string and `insert into t (x) select 1.5 from t` was 42804
+/// (RP-843; measured on PostgreSQL 15.19, 2026-11-10).
+#[test]
+fn a_select_list_literal_over_a_from_item_is_typed_by_its_node() {
+    let const_types = |sql: &str| -> Vec<String> {
+        match plan_ok(sql) {
+            Statement::Select(s) => s
+                .casts
+                .iter()
+                .map(|c| match c {
+                    Some(ColumnExpr::Const { result_type, .. }) => result_type.clone(),
+                    other => panic!("{sql}: {other:?}"),
+                })
+                .collect(),
+            other => panic!("{sql}: {other:?}"),
+        }
+    };
+    let want = ["numeric", "numeric", "bit", "int4", "int8", "bool", "text"];
+    for from in ["t", "generate_series(1, 2) g"] {
+        assert_eq!(
+            const_types(&format!(
+                "select 1.5, 1e-3, B'101', 1, 15000000000, true, 'x' from {from}"
+            )),
+            want,
+            "from {from}"
+        );
+    }
+}
+
+/// `sql`'s select list after `whole_row_star_rewrite`, deparsed; `None`
+/// when it rewrote nothing.
+fn whole_row_star(sql: &str) -> Option<String> {
+    let parsed = pg_query::parse(sql).unwrap();
+    let Some(N::SelectStmt(s)) = parsed.protobuf.stmts[0]
+        .stmt
+        .as_ref()
+        .and_then(|n| n.node.as_ref())
+    else {
+        panic!("not a SELECT: {sql}");
+    };
+    let out = whole_row_star_rewrite(s, &lookup)?;
+    let tree = pg_query::protobuf::ParseResult {
+        version: parsed.protobuf.version,
+        stmts: vec![pg_query::protobuf::RawStmt {
+            stmt: Some(Box::new(pg_query::protobuf::Node {
+                node: Some(N::SelectStmt(Box::new(out))),
+            })),
+            stmt_location: 0,
+            stmt_len: 0,
+        }],
+    };
+    Some(pg_query::deparse(&tree).unwrap())
+}
+
+#[test]
+fn a_whole_row_star_is_the_items_star() {
+    // PostgreSQL 15.19 (RP-704): `transformIndirection` reads `(v)` as the
+    // FROM item's whole row when no column is named `v`, and expands its
+    // star as `v.*` does.
+    assert_eq!(
+        whole_row_star("select 0 as k, (v).* from (values (1)) v(a)").as_deref(),
+        Some("SELECT 0 AS k, v.* FROM (VALUES (1)) v(a)")
+    );
+    assert_eq!(
+        whole_row_star("select (x).* from t x").as_deref(),
+        Some("SELECT x.* FROM t x")
+    );
+    // `(v.*).*` is the row whatever the item's columns are called.
+    assert_eq!(
+        whole_row_star("select (v.*).* from (values (1)) v(v)").as_deref(),
+        Some("SELECT v.* FROM (VALUES (1)) v(v)")
+    );
+    // A column of the name wins: `(v).*` of an integer is PostgreSQL's
+    // 42809, as is a one-column function's alias, whose whole row is its
+    // scalar value.
+    assert_eq!(whole_row_star("select (v).* from (values (1)) v(v)"), None);
+    assert_eq!(whole_row_star("select (name).* from t name"), None);
+    assert_eq!(
+        whole_row_star("select (f).* from generate_series(1, 2) f(x)"),
+        None
+    );
+    // A name no FROM item has is left to be reported as a missing column.
+    assert_eq!(whole_row_star("select (q).* from t"), None);
 }
