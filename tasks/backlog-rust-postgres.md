@@ -1825,13 +1825,6 @@ a regression test.
       private 15.19 cluster (found while working RP-432).
       Verify: tests/backlog/test_rp_dml_from.py::test_missing_column_reported_before_ambiguous_one
       Backlog-ID: RP-436
-- [ ] **`SELECT *` with no FROM is refused as a gap.** `select *` answers
-      `0A000 this target is not supported yet`; PostgreSQL 15.19's
-      `transformTargetList` answers 42601 `SELECT * with no tables
-      specified is not valid` at the `*`. Measured on PostgreSQL 15.19
-      (found while working RP-441).
-      Verify: tests/backlog/test_rp_fromless_analysis.py::test_star_with_no_from
-      Backlog-ID: RP-446
 - [ ] **An operator's type error is reported ahead of a missing column to
       its left.** `select nosuch + (1 + true)` is 42883 `operator does not
       exist: integer + boolean` here, from `optype` checking every operator

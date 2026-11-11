@@ -4316,6 +4316,33 @@ fn an_exists_subquery_is_analysed_before_its_list_is_dropped() {
 }
 
 #[test]
+fn a_star_with_no_from_has_no_tables_to_expand() {
+    // `ExpandAllTables` with an empty range table (RP-446): 42601 at the
+    // `*`, in its place in the target list, and in an EXISTS subquery's
+    // list before the planner drops it. Each was 0A000 `this target is not
+    // supported yet`, and the EXISTS answered `true`.
+    for (sql, state, at) in [
+        ("select *", "42601", 7),
+        ("select *, nosuch", "42601", 7),
+        ("select nosuch, *", "42703", 7),
+        ("select * where nosuch", "42601", 7),
+        ("select exists (select *)", "42601", 22),
+        ("select exists (select 1, *)", "42601", 25),
+        ("select exists (select nosuch, *)", "42703", 22),
+    ] {
+        take_error_location();
+        let err = analysed(sql).expect_err("should refuse");
+        assert_eq!(err.sqlstate(), state, "for {sql} (got {err})");
+        assert_eq!(take_error_location(), Some(at), "for {sql}");
+    }
+    // A qualified star is the qualifier's check, and a FROM gives the bare
+    // one a table to expand.
+    let err = analysed("select exists (select x.*)").expect_err("should refuse");
+    assert_eq!(err.sqlstate(), "42P01", "got {err}");
+    analysed("select exists (select * from t)").expect("a table to expand");
+}
+
+#[test]
 fn a_column_reference_with_no_from_names_nothing() {
     // `transformColumnRef` over an empty range table (RP-441): 42703 for a
     // bare name, 42P01 for a qualified one, at the reference's own token,

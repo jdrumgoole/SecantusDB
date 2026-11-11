@@ -15099,8 +15099,9 @@ pub(crate) fn simplify_exists(
 /// FROM item is a plain table, so no other could have it too (42702). Any
 /// other is kept for the planner, which resolves it as PostgreSQL would: an
 /// outer row's column (a correlation), 42702, or 42703. A subquery's own
-/// list is its own query and is not walked here; a `*` is left to the
-/// qualifier check.
+/// list is its own query and is not walked here; a qualified `*` is left
+/// to the qualifier check, and a bare one is kept only when there is no
+/// FROM for it to expand (42601).
 pub(crate) fn exists_target_refs_to_analyse(
     s: &pg_query::protobuf::SelectStmt,
     lookup: &dyn Fn(&str) -> Option<TableDef>,
@@ -15186,7 +15187,13 @@ pub(crate) fn exists_target_refs_to_analyse(
         let _ = walk_expr(&mut t.clone(), &mut |n| {
             if let Some(N::ColumnRef(c)) = n.node.as_ref() {
                 let star = c.fields.iter().any(|f| matches!(f.node, Some(N::AStar(_))));
-                if !star && !answered(c) {
+                // A bare `*` with no FROM has no range-table entry to
+                // expand (RP-446): kept, for the FROM-less check to refuse
+                // as 42601, as `ExpandAllTables` does before the list is
+                // dropped.
+                let bare_star_without_from =
+                    star && c.fields.len() == 1 && s.from_clause.is_empty();
+                if bare_star_without_from || (!star && !answered(c)) {
                     kept.push(pg_query::protobuf::Node {
                         node: Some(N::ResTarget(Box::new(pg_query::protobuf::ResTarget {
                             val: Some(Box::new(n.clone())),
