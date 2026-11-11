@@ -39816,38 +39816,15 @@ fn cast_value_inner(value: Bson, target: &str) -> Result<Bson> {
             &as_text(&value),
             xml::XmlOption::Content,
         )?)),
-        // `int2vector` / `oidvector`: an int array, read from its
-        // space-separated text or taken from an int array as it stands.
+        // `int2vector` / `oidvector`: an int array, read from its text by
+        // the types' own input functions, or taken from an int array as it
+        // stands.
         "int2vector" | "oidvector" => match value {
             Bson::Array(items) => Ok(Bson::Array(items)),
-            other => {
-                let text = as_text(&other);
-                let items: Result<Vec<Bson>> = text
-                    .split_ascii_whitespace()
-                    .map(|w| {
-                        let n: i64 = w.parse().map_err(|_| {
-                            Error::InvalidText(format!(
-                                "invalid input syntax for type {}: \"{w}\"",
-                                if target == "int2vector" {
-                                    "smallint"
-                                } else {
-                                    "oid"
-                                }
-                            ))
-                        })?;
-                        Ok(if target == "int2vector" {
-                            Bson::Int32(i32::from(i16::try_from(n).map_err(|_| {
-                                Error::NumericOutOfRange(format!(
-                                    "value \"{w}\" is out of range for type smallint"
-                                ))
-                            })?))
-                        } else {
-                            Bson::Int64(n)
-                        })
-                    })
-                    .collect();
-                Ok(Bson::Array(items?))
+            other if target == "int2vector" => {
+                Ok(Bson::Array(vectors::int2vector_in(&as_text(&other))?))
             }
+            other => Ok(Bson::Array(vectors::oidvector_in(&as_text(&other))?)),
         },
         "jsonpath" => Ok(Bson::String(jsonpath::render(&jsonpath::parse(&as_text(
             &value,

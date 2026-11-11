@@ -2705,13 +2705,6 @@ Measured on PostgreSQL 15.19; none of it needs DDL. The gap tests are in
       raw text.
       Verify: tests/backlog/test_rp_found_rp575.py::test_vector_array_parameter
       Backlog-ID: RP-604
-- [ ] **An `int2vector` input's out-of-range error quotes only its number.**
-      `int2vectorin` reports the rest of the input from the number on:
-      `'70000 1'::int2vector` and `'1 70000 1'::int2vector` are 22003
-      `value "70000 1" is out of range for type smallint` on PostgreSQL
-      15.19. Here the message quotes `"70000"`.
-      Verify: tests/backlog/test_rp_found_rp575.py::test_int2vector_range_error_quotes_the_rest
-      Backlog-ID: RP-605
 
 ## Found while working RP-603 (2026-11-08)
 
@@ -3705,3 +3698,25 @@ statement is VALUES-only and runs there as written.
       0A000 `this target is not supported yet`, with no position.
       Verify: tests/backlog/test_rp_found_rp700.py::test_a_non_integer_group_by_constant_is_42601
       Backlog-ID: RP-854
+
+## Found while working RP-605 (2026-11-11)
+
+Measured on PostgreSQL 15.19; none of it needs DDL. The gap tests are in
+`tests/backlog/test_rp_found_rp605.py`.
+
+- [ ] **A literal's out-of-range input error has no position.**
+      `select '70000'::int2` is 22003 `value "70000" is out of range for
+      type smallint` at 8 on PostgreSQL 15.19, and so is every 22003 an
+      input function raises for a constant (`'99999999999'::int4`,
+      `'70000 1'::int2vector`, an array element); here the 22003 has no
+      position. `errpos.rs` places a 22P02 at the literal it quotes but has
+      no 22003 arm.
+      Verify: tests/backlog/test_rp_found_rp605.py::test_out_of_range_literal_has_a_position
+      Backlog-ID: RP-866
+- [ ] **An escape-string literal's input error has no position when an
+      escape is in its value.** `select E'a\tb'::int4` is 22P02 at 8 on
+      PostgreSQL 15.19; here it has none, `errpos.rs` matching the quoted
+      value (with a real tab) against the literal's spelling (`\t`).
+      `E'x'::int4`, with no escape, is placed.
+      Verify: tests/backlog/test_rp_found_rp605.py::test_escaped_literal_input_error_has_a_position
+      Backlog-ID: RP-867
