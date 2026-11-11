@@ -61,6 +61,15 @@ fn element_literal(toks: &[Tok], value: &str) -> Option<usize> {
     }) {
         return Some(i);
     }
+    // An `int2vector` / `oidvector` input error quotes the input from the
+    // failing number to its end (`'1 x 2'` is 22P02 for `"x 2"`), or from
+    // just after the last number `oidvectorin` read (`'1x'` is for `"x"`).
+    let vector_tail = |e: &str| {
+        e.strip_suffix(value).is_some_and(|head| {
+            head.is_empty()
+                || head.ends_with(|c: char| c.is_ascii_digit() || " \t\n\x0b\x0c\r".contains(c))
+        })
+    };
     let holds = |t: &Tok| -> bool {
         let Some(body) = t.text.strip_prefix('\'').and_then(|r| r.strip_suffix('\'')) else {
             return false;
@@ -71,14 +80,26 @@ fn element_literal(toks: &[Tok], value: &str) -> Option<usize> {
             (Some('{'), Some('}')) | (Some('('), Some(')')) => &inner[1..inner.len() - 1],
             _ => return false,
         };
-        // An `int2vector` / `oidvector` element's input error names one of
-        // its space-separated numbers (`'{"1 x"}'::int2vector[]` is 22P02
-        // for `"x"`, at the literal).
+        // An `int2vector` / `oidvector` element's input error names the rest
+        // of the element (`'{"1 x 2"}'::int2vector[]` is 22P02 for `"x 2"`,
+        // at the literal).
         inner.split([',', '{', '}', '(', ')']).any(|e| {
             let e = e.trim().trim_matches('"');
-            e == value || e.split_ascii_whitespace().any(|w| w == value)
+            e == value || vector_tail(e)
         })
     };
+    // A literal cast to a vector type itself (`'1 x 2'::int2vector`).
+    if let Some(i) = toks.windows(3).position(|w| {
+        w[1].text == "::"
+            && crate::vectors::is_vector(&w[2].text.to_ascii_lowercase())
+            && w[0]
+                .text
+                .strip_prefix('\'')
+                .and_then(|r| r.strip_suffix('\''))
+                .is_some_and(|body| vector_tail(&body.replace("''", "'")))
+    }) {
+        return Some(i);
+    }
     let mut hits = toks.iter().enumerate().filter(|(_, t)| holds(t));
     let (i, _) = hits.next()?;
     hits.next().is_none().then_some(i)

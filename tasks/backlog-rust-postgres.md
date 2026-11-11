@@ -2498,22 +2498,44 @@ numeric(5,2), ca char(3)[])` holding `('xy', 'ab', 2.5, '{a,bc}')`.
       Verify: tests/backlog/test_rp_found_rp656.py::test_array_sublink_of_numeric_describes_its_modifier
       Backlog-ID: RP-667
 
-## Found while working RP-671 (2026-11-08)
+## Found while working RP-682 (2026-11-11)
 
-Measured on PostgreSQL 15.19 (the shared reference on port 5415): the
-VALUES-only statements as written, the rest with the `_SETUP` tables of
-`tests/backlog/test_rp_found_rp671.py` made temporary. This server keeps a
-`char(n)` value trimmed and pads it where it enters an expression; a value
-that reaches a comparison carrying its blanks is compared with them.
+Measured on PostgreSQL 15.19 (the shared reference on port 5415) with the
+VALUES-only statements of `tests/backlog/test_rp_found_rp682.py`.
 
-- [ ] **OVER on a plain function is 0A000.** `select octet_length('x')
-      over ()` is 42809 `OVER specified, but octet_length is not a window
-      function nor an aggregate function` on PostgreSQL 15.19 (`ParseFuncOrColumn`);
-      here it is 0A000 `window function octet_length() is not supported
-      yet`, for `upper` and `length` alike: a function PostgreSQL itself
-      refuses is reported as a gap in this server.
-      Verify: tests/backlog/test_rp_found_rp671.py::test_over_on_a_plain_function_is_42809
-      Backlog-ID: RP-682
+- [ ] **DISTINCT, ORDER BY or FILTER on a plain function call is accepted
+      and ignored.** `select upper(distinct 'a')`, `select upper('a' order
+      by 1)` and `select upper('a') filter (where true)` are each 42809
+      `<clause> specified, but upper is not an aggregate function` on
+      PostgreSQL 15.19 (`ParseFuncOrColumn`); here each answers `A`. Since
+      RP-682 the same clauses under OVER are refused in PostgreSQL's order;
+      without OVER the plain-call path never looks at them.
+      Verify: tests/backlog/test_rp_found_rp682.py::test_an_aggregate_clause_on_a_plain_function_is_42809
+      Backlog-ID: RP-868
+
+- [ ] **An ordered-set aggregate under OVER is not refused as
+      PostgreSQL refuses it.** `select rank(1) over ()` is 42809 `WITHIN
+      GROUP is required for ordered-set aggregate rank` on PostgreSQL 15.19
+      (with arguments `rank` resolves to the hypothetical-set aggregate);
+      here it answers 1, the window function. `percentile_cont(0.5) within
+      group (order by v) over ()` is 0A000 `OVER is not supported for
+      ordered-set aggregate percentile_cont` there and 0A000 `window
+      function percentile_cont() is not supported yet` here. Needs the
+      aggregates' `aggkind`, which the planner does not keep.
+      Verify: tests/backlog/test_rp_found_rp682.py::test_an_ordered_set_aggregate_over_a_window_is_refused
+      Backlog-ID: RP-869
+
+- [ ] **Most of PostgreSQL's aggregates do not run over a window.**
+      `stddev(v) over (order by v)` answers the running sample standard
+      deviation on PostgreSQL 15.19; here it is 0A000 `window function
+      stddev() is not supported yet`, and so is every built-in aggregate
+      but `sum`, `count`, `avg`, `min`, `max`, `string_agg`, `array_agg`,
+      `bool_and` and `bool_or`: `bit_and` / `bit_or` / `bit_xor`, `corr`,
+      `covar_*`, `every`, `json[b]_agg`, `json[b]_object_agg`,
+      `range_agg`, `range_intersect_agg`, the `regr_*` family, `stddev*`,
+      `var*` / `variance` and `xmlagg` (a user aggregate runs).
+      Verify: tests/backlog/test_rp_found_rp682.py::test_more_aggregates_run_over_a_window
+      Backlog-ID: RP-870
 
 ## Found while working RP-670 (2026-11-09)
 
@@ -2540,21 +2562,6 @@ dv687, c char(3))`, `d687` an `int` with `check (value > 0)` and `dv687` a
       8-10.
       Backlog-ID: RP-690
       Verify: none -- seen once, under load; a timing that does not fail on demand
-
-## Found while working RP-687 (2026-11-09)
-
-Measured on a private PostgreSQL 15.19 cluster with the `_SETUP` in
-`tests/backlog/test_rp_found_rp687.py`: `dcc687` a `varchar(3)` with
-`check (value <> 'no')`, `dvv687` a domain over it.
-
-- [ ] **A cast to a domain over a domain names the inner domain.** `select
-      'no'::dvv687` is 23514 `value for domain dvv687 violates check
-      constraint "dcc687_check"` on PostgreSQL 15.19 (one `CoerceToDomain`
-      names the domain it coerces to); here the message names `dcc687`,
-      for `'no'::text::dvv687` and a PL/pgSQL `x dvv687 := 'no'` alike.
-      Since RP-670 a trigger record's field of such a domain names it.
-      Verify: tests/backlog/test_rp_found_rp687.py::test_cast_to_a_domain_over_a_domain_names_the_outer_domain
-      Backlog-ID: RP-696
 
 ## Found while working RP-694 (2026-11-09)
 
@@ -2705,13 +2712,6 @@ Measured on PostgreSQL 15.19; none of it needs DDL. The gap tests are in
       raw text.
       Verify: tests/backlog/test_rp_found_rp575.py::test_vector_array_parameter
       Backlog-ID: RP-604
-- [ ] **An `int2vector` input's out-of-range error quotes only its number.**
-      `int2vectorin` reports the rest of the input from the number on:
-      `'70000 1'::int2vector` and `'1 70000 1'::int2vector` are 22003
-      `value "70000 1" is out of range for type smallint` on PostgreSQL
-      15.19. Here the message quotes `"70000"`.
-      Verify: tests/backlog/test_rp_found_rp575.py::test_int2vector_range_error_quotes_the_rest
-      Backlog-ID: RP-605
 
 ## Found while working RP-603 (2026-11-08)
 
@@ -3535,34 +3535,56 @@ Measured on a private, freshly initdb'd PostgreSQL 15.19 cluster with the
       Verify: tests/backlog/test_rp_found_rp761.py::test_explain_prints_a_computed_sort_key_as_its_expression
       Backlog-ID: RP-840
 
-## Found while working RP-839 (2026-11-10)
+## Found while working RP-846 (2026-11-11)
 
 Measured on a private, freshly initdb'd PostgreSQL 15.19 cluster with the
-`_SETUP` in `tests/backlog/test_rp_found_rp839.py`: `"Mx839"` a domain over
-`int` with `not null check (value > 0)`, `t839(x text collate "C", y text,
-m "Mx839")` and `z839(o char(4) default 'ab', v varchar(3) default 'q')`.
+`_SETUP` in `tests/backlog/test_rp_found_rp846.py`, the session's TimeZone
+`UTC`. Both answers come from `information_schema.columns.column_default`
+and `pg_get_expr(adbin, adrelid)`, which this server renders by one
+function, `default_expression`, from the folded value rather than from a
+stored expression tree.
 
-- [ ] **A domain whose name needs quotes is named bare in its errors.** An
-      INSERT of NULL into a column of `"Mx839"` is 23502 `domain "Mx839"
-      does not allow null values` on PostgreSQL 15.19, and a value its
-      CHECK refuses is 23514 `value for domain "Mx839" violates check
-      constraint "Mx839_check"`: `domain_check_input` names the domain by
-      `format_type_be`, which quotes a name as `quote_identifier` does.
-      Here both print `Mx839` without the quotes, as does `select
-      null::"Mx839"`. A keyword is quoted too: `select 0::s."int"`, `s."int"`
-      a domain over `int` with `check (value > 0)`, is `value for domain
-      s."int" violates ...` on 15.19 and `s.int` here (found working RP-553).
-      Verify: tests/backlog/test_rp_found_rp839.py::test_a_domain_error_quotes_a_name_that_needs_it
-      Backlog-ID: RP-845
-- [ ] **A `char(n)` column's DEFAULT prints its cast as `::character`.**
-      `information_schema.columns.column_default` and `pg_get_expr(adbin,
-      adrelid)` of `o char(4) default 'ab'` are `'ab'::bpchar` on
-      PostgreSQL 15.19 (`get_const_expr` prints the folded constant's
-      type by `format_type_with_typemod` with no modifier, `bpchar`); here
-      they are `'ab'::character`. A `varchar(3)` column's `'q'::character
-      varying` already agrees.
-      Verify: tests/backlog/test_rp_found_rp839.py::test_a_char_columns_default_casts_to_bpchar
-      Backlog-ID: RP-846
+- [ ] **A DEFAULT written as an explicit cast with a modifier drops the
+      modifier.** `e char(4) default 'ab'::char(4)` and `e2 varchar(5)
+      default 'ab'::varchar(5)` are `'ab'::character(4)` and
+      `'ab'::character varying(5)` on PostgreSQL 15.19: the explicit cast
+      is a length coercion marked COERCE_EXPLICIT_CAST, which ruleutils
+      prints with its modifier. Here they are `'ab'::bpchar` and
+      `'ab'::character varying`, as an implicit coercion of a bare literal
+      prints: the explicit cast's modifier is not kept with the folded
+      value.
+      Verify: tests/backlog/test_rp_found_rp846.py::test_an_explicit_cast_default_keeps_its_modifier
+      Backlog-ID: RP-863
+- [ ] **A `timestamp`, `timestamptz`, `interval` or `bytea` DEFAULT prints
+      its internal form.** `ts timestamp(2) default '2020-01-01'` is
+      `'2020-01-01 00:00:00'::timestamp without time zone` on PostgreSQL
+      15.19, `timestamptz default '2020-01-01 00:00:00+00'`
+      `'2020-01-01 00:00:00+00'::timestamp with time zone`, `interval
+      default '1 day'` `'1 day'::interval` and `bytea default '\x01'`
+      `'\x01'::bytea`. Here they are `DateTime("2020-01-01 0:00:00.0
+      +00:00:00")`, `{ "__ivl_mon": 0, "__ivl_day": 1, "__ivl_us": 0 }` and
+      `Binary(0x0, AQ==)`: `default_expression` formats a non-string
+      stored value with `Bson`'s `Display`, where `get_const_expr` uses the
+      type's output function (a timestamptz in the session's TimeZone),
+      quoted and labelled.
+      Verify: tests/backlog/test_rp_found_rp846.py::test_a_temporal_or_bytea_default_prints_as_a_literal
+      Backlog-ID: RP-864
+
+## Found while working RP-845 (2026-11-11)
+
+Measured on PostgreSQL 15.19 (the shared reference on port 5415) with the
+`_SETUP` in `tests/backlog/test_rp_found_rp839.py` and `"Over845"` a domain
+over its `"Mx839"`.
+
+- [ ] **A PL/pgSQL declaration folds a quoted type name to lower case.**
+      `do $$ declare x "Over845" := 5; begin raise notice '%', x; end $$`
+      prints `NOTICE: 5` on PostgreSQL 15.19 (`parse_datatype` reads the
+      type as the grammar does, keeping a quoted name's case), and an
+      assignment of 0 to such a variable is 23514 `value for domain
+      "Over845" violates check constraint "Mx839_check"`. Here each is
+      42704 `type "over845" does not exist`.
+      Verify: tests/backlog/test_rp_found_rp839.py::test_a_plpgsql_declaration_keeps_a_quoted_types_case
+      Backlog-ID: RP-865
 
 ## Found while working RP-692 (2026-11-10)
 
@@ -3672,10 +3694,68 @@ statement is VALUES-only and runs there as written.
       and calls `check_stray` only for a query with no GROUP BY.
       Verify: tests/backlog/test_rp_found_rp700.py::test_an_ungrouped_column_beside_a_subquery_is_42803
       Backlog-ID: RP-853
-- [ ] **A GROUP BY constant that is no integer is not 42601.** `select 1
-      from (values (1)) v(a) group by 1.5` is 42601 `non-integer constant
-      in GROUP BY` at 42 on PostgreSQL 15.19 (`findTargetlistEntrySQL92`),
-      and so is a string, NULL or boolean constant there. Here each is
-      0A000 `this target is not supported yet`, with no position.
-      Verify: tests/backlog/test_rp_found_rp700.py::test_a_non_integer_group_by_constant_is_42601
-      Backlog-ID: RP-854
+
+## Found while working RP-854 (2026-11-11)
+
+Measured on PostgreSQL 15.19 (the shared reference on port 5415): every
+statement is VALUES-only and runs there as written. The gap tests are in
+`tests/backlog/test_rp_found_rp854.py`.
+
+- [ ] **An ORDER BY constant that is no integer is not 42601.** `select 1
+      from (values (1)) v(a) order by 2.5` is 42601 `non-integer constant
+      in ORDER BY` at 42 on PostgreSQL 15.19 (`findTargetlistEntrySQL92`),
+      and `select a ... group by a order by 'x'` the same at 53. Here the
+      first is 0A000 `ORDER BY over an expression is not supported yet` and
+      the second returns its row. The GROUP BY half is `group_sql92.rs`
+      (RP-854); a statement with both is answered for its GROUP BY
+      constant until this one is fixed, where PostgreSQL names the ORDER BY.
+      Verify: tests/backlog/test_rp_found_rp854.py::test_a_non_integer_order_by_constant_is_42601
+      Backlog-ID: RP-871
+- [ ] **A DISTINCT ON constant that is no integer returns rows.** `select
+      distinct on (1.5) a from (values (1)) v(a)` is 42601 `non-integer
+      constant in DISTINCT ON` at 21 on PostgreSQL 15.19, and so is a string
+      there. Here each returns its row: the constant is a key of one value.
+      Verify: tests/backlog/test_rp_found_rp854.py::test_a_non_integer_distinct_on_constant_is_42601
+      Backlog-ID: RP-872
+- [ ] **A GROUP BY position inside a grouping set or a parenthesised list
+      is grouped as a value.** `select a from (values (1), (2)) v(a) group
+      by rollup(1)` groups by `a` on PostgreSQL 15.19 (`flatten_grouping_sets`
+      flattens sets and an implicit row, and each integer in them is a
+      select-list position), and so do `grouping sets ((1), ())` and `select
+      a, a + 1 ... group by (1, 2)`. Here each is 42803 `column "a" must
+      appear in the GROUP BY clause`: `plan_aggregate` resolves a position
+      only at the top level, and pushes a set's or a row's elements as
+      expressions. A position past the select list there (`rollup(9)`) is
+      0A000, not 42P10 `GROUP BY position 9 is not in select list` at 49.
+      Verify: tests/backlog/test_rp_found_rp854.py::test_a_group_by_position_inside_a_set_or_list_is_a_position
+      Backlog-ID: RP-873
+- [ ] **A grouped query reports a column that does not exist as 42803.**
+      `select nosuch from (values (1)) v(a) group by a` is 42703 `column
+      "nosuch" does not exist` at 8 on PostgreSQL 15.19 (`transformColumnRef`,
+      while the select list is analysed, before `parseCheckAggregates`).
+      Here it is 42803 `column "nosuch" must appear in the GROUP BY clause or
+      be used in an aggregate function`, at the same place.
+      Verify: tests/backlog/test_rp_found_rp854.py::test_an_undefined_column_in_a_grouped_query_is_42703
+      Backlog-ID: RP-874
+
+## Found while working RP-605 (2026-11-11)
+
+Measured on PostgreSQL 15.19; none of it needs DDL. The gap tests are in
+`tests/backlog/test_rp_found_rp605.py`.
+
+- [ ] **A literal's out-of-range input error has no position.**
+      `select '70000'::int2` is 22003 `value "70000" is out of range for
+      type smallint` at 8 on PostgreSQL 15.19, and so is every 22003 an
+      input function raises for a constant (`'99999999999'::int4`,
+      `'70000 1'::int2vector`, an array element); here the 22003 has no
+      position. `errpos.rs` places a 22P02 at the literal it quotes but has
+      no 22003 arm.
+      Verify: tests/backlog/test_rp_found_rp605.py::test_out_of_range_literal_has_a_position
+      Backlog-ID: RP-866
+- [ ] **An escape-string literal's input error has no position when an
+      escape is in its value.** `select E'a\tb'::int4` is 22P02 at 8 on
+      PostgreSQL 15.19; here it has none, `errpos.rs` matching the quoted
+      value (with a real tab) against the literal's spelling (`\t`).
+      `E'x'::int4`, with no escape, is placed.
+      Verify: tests/backlog/test_rp_found_rp605.py::test_escaped_literal_input_error_has_a_position
+      Backlog-ID: RP-867

@@ -15,8 +15,8 @@ value's blanks) pinned and found:
   value were read as a plain `=` / `<>`;
 - RP-681 (fixed): `min` / `max` over a `varchar` column were typed
   `varchar`, not `text`;
-- OVER on a function that is not a window function or an aggregate is
-  0A000, not 42809.
+- RP-682 (fixed): OVER on a function that is not a window function or an
+  aggregate was 0A000, not 42809.
 
 Measured on PostgreSQL 15.19 (the shared reference on port 5415): the
 VALUES-only statements as written, the rest with `_SETUP`'s tables made
@@ -216,12 +216,71 @@ OVER = {
 }
 
 
-@pytest.mark.backlog("RP-682")
+@pytest.mark.backlog_fixed("RP-682")
 @pytest.mark.parametrize("query", list(OVER))
 def test_over_on_a_plain_function_is_42809(query: str, dsn: str) -> None:
+    """Was 0A000 `window function octet_length() is not supported yet`."""
     name = OVER[query]
     assert _rows(dsn, query) == (
         "error",
         "42809",
         f"OVER specified, but {name} is not a window function nor an aggregate function",
     )
+
+
+# `ParseFuncOrColumn`'s order, measured on PostgreSQL 15.19: the arguments
+# and the function resolve first (42883), then the first aggregate-only
+# clause a plain function carries is named, the function as written.
+OVER_ORDER = {
+    "select upper(1) over ()": ("error", "42883", "function upper(integer) does not exist"),
+    "select nosuch(1) over ()": ("error", "42883", "function nosuch(integer) does not exist"),
+    "select upper(nosuch3()) over ()": ("error", "42883", "function nosuch3() does not exist"),
+    "select pg_catalog.upper('a') over ()": (
+        "error",
+        "42809",
+        "OVER specified, but pg_catalog.upper is not a window function nor an aggregate function",
+    ),
+    "select 1 + upper('a') over ()": (
+        "error",
+        "42809",
+        "OVER specified, but upper is not a window function nor an aggregate function",
+    ),
+    "select now(*) over ()": (
+        "error",
+        "42809",
+        "now(*) specified, but now is not an aggregate function",
+    ),
+    "select upper('a') filter (where true) over ()": (
+        "error",
+        "42809",
+        "FILTER specified, but upper is not an aggregate function",
+    ),
+    "select upper(distinct 'a') filter (where true) over ()": (
+        "error",
+        "42809",
+        "DISTINCT specified, but upper is not an aggregate function",
+    ),
+}
+
+
+@pytest.mark.backlog_fixed("RP-682")
+@pytest.mark.parametrize("query", list(OVER_ORDER))
+def test_over_on_a_plain_function_resolves_the_call_first(query: str, dsn: str) -> None:
+    """Each was 0A000 `window function ... is not supported yet`."""
+    assert _rows(dsn, query) == OVER_ORDER[query]
+
+
+@pytest.mark.backlog_fixed("RP-682")
+def test_over_on_a_plain_function_calls_nothing(dsn: str) -> None:
+    """The refusal is the parser's: `nextval` under OVER never ran, so the
+    sequence's first value is still 1 (PostgreSQL 15.19)."""
+    with psycopg.connect(dsn, autocommit=True) as c:
+        c.execute("drop sequence if exists s682")
+        c.execute("create sequence s682")
+        try:
+            with pytest.raises(psycopg.Error) as e:
+                c.execute("select nextval('s682') over ()")
+            assert e.value.sqlstate == "42809"
+            assert c.execute("select nextval('s682')").fetchall() == [(1,)]
+        finally:
+            c.execute("drop sequence s682")

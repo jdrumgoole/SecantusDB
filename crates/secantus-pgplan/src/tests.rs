@@ -410,6 +410,33 @@ fn order_by_a_non_grouped_column_is_refused() {
     assert_eq!(err.sqlstate(), "42803");
 }
 
+/// A GROUP BY constant that is no integer is PostgreSQL's 42601 at the
+/// constant (`findTargetlistEntrySQL92`), after what parse analysis meets
+/// first: the select list, and a GROUP BY item before it (RP-854).
+#[test]
+fn a_non_integer_group_by_constant_is_42601() {
+    for (sql, at) in [
+        ("SELECT count(*) FROM t GROUP BY 1.5", 32),
+        ("SELECT name FROM t GROUP BY name, 'x'", 34),
+        ("SELECT 1 FROM t GROUP BY -1.5", 25),
+        ("SELECT 1 FROM t GROUP BY rollup(name, NULL)", 38),
+        ("SELECT 1 GROUP BY true", 18),
+        ("SELECT name FROM t GROUP BY 1.5", 28),
+    ] {
+        take_error_location();
+        let err = plan(sql, &lookup).expect_err(sql);
+        assert_eq!(err.sqlstate(), "42601", "{sql}: {err}");
+        assert_eq!(err.to_string(), "non-integer constant in GROUP BY", "{sql}");
+        assert_eq!(take_error_location(), Some(at), "{sql}");
+    }
+    let err = plan("SELECT nosuch FROM t GROUP BY 1.5", &lookup).expect_err("must refuse");
+    assert_eq!(err.sqlstate(), "42703", "{err}");
+    let err = plan("SELECT 1 FROM t GROUP BY 9, 1.5", &lookup).expect_err("must refuse");
+    assert_eq!(err.sqlstate(), "42P10", "{err}");
+    // A constant under a cast or an operator is an expression.
+    plan("SELECT 1 FROM t GROUP BY 'x'::text", &lookup).expect("an expression key");
+}
+
 #[test]
 fn group_by_resolves_order_by_index() {
     match plan_ok("SELECT count(*) FROM t GROUP BY name ORDER BY name DESC") {
@@ -4447,6 +4474,69 @@ fn a_subquery_target_is_named_as_written() {
             other => panic!("{q}: {other:?}"),
         }
     }
+}
+
+#[test]
+fn over_on_a_plain_function_is_42809_after_the_call_resolves() {
+    // `ParseFuncOrColumn` resolves the arguments and the function, then
+    // refuses an aggregate-only clause on a plain function, first one first
+    // (RP-682): each OVER here was 0A000 `window function upper() is not
+    // supported yet`. Answers measured on PostgreSQL 15.19.
+    let over = |f: &str| {
+        format!("OVER specified, but {f} is not a window function nor an aggregate function")
+    };
+    for (q, want, at) in [
+        ("select octet_length('x') over ()", over("octet_length"), 7),
+        (
+            "select id, upper(name) over (partition by id) from t",
+            over("upper"),
+            11,
+        ),
+        (
+            "select pg_catalog.lower(name) over () from t",
+            over("pg_catalog.lower"),
+            7,
+        ),
+        ("select 1 + upper('a') over ()", over("upper"), 11),
+        (
+            "select now(*) over ()",
+            "now(*) specified, but now is not an aggregate function".to_string(),
+            7,
+        ),
+        (
+            "select upper('a' order by 1) over ()",
+            "ORDER BY specified, but upper is not an aggregate function".to_string(),
+            7,
+        ),
+        (
+            "select upper(distinct 'a') filter (where true) over ()",
+            "DISTINCT specified, but upper is not an aggregate function".to_string(),
+            7,
+        ),
+    ] {
+        let _ = take_error_location();
+        let err = analysed(q).expect_err(q);
+        assert!(
+            matches!(&err, Error::Sqlstate("42809", m) if *m == want),
+            "{q}: {err:?}"
+        );
+        assert_eq!(take_error_location(), Some(at), "{q}");
+    }
+    // A call no function takes fails first as it does without OVER (42883
+    // on the wire; the server judges a name this crate does not know).
+    for q in [
+        "select upper(1)",
+        "select nosuch(1)",
+        "select upper(nosuch())",
+    ] {
+        let plain = analysed(q).expect_err(q);
+        let windowed = analysed(&format!("{q} over ()")).expect_err(q);
+        assert_eq!(format!("{windowed:?}"), format!("{plain:?}"), "{q}");
+    }
+    // An aggregate PostgreSQL has and this planner does not run over a
+    // window is still this server's gap.
+    let err = analysed("select stddev(id) over () from t").expect_err("stddev");
+    assert!(matches!(&err, Error::Unsupported(_)), "{err:?}");
 }
 
 #[test]

@@ -34,6 +34,7 @@ mod expr_where;
 mod filter_sublink;
 mod fromless;
 mod functional_grouping;
+mod group_sql92;
 mod guc_args;
 pub mod hashagg;
 mod hashed_subplan;
@@ -14612,8 +14613,9 @@ fn plan_window_call(
         .as_deref()
         .ok_or_else(|| Error::Internal("a window call without OVER".into()))?;
     let name = func_name(f).unwrap_or_default();
-    let func = window_func_by_name(&name)
-        .ok_or_else(|| Error::Unsupported(format!("window function {name}()")))?;
+    let Some(func) = window_func_by_name(&name) else {
+        return Err(over_on_unplanned_function(f, &name, def, params));
+    };
     let func = if func == WindowFunc::Count && f.agg_star {
         WindowFunc::CountStar
     } else {
@@ -14706,6 +14708,90 @@ fn plan_window_call(
         user,
     });
     Ok(field)
+}
+
+/// Is `name` one of PostgreSQL 15.19's own aggregates or window functions,
+/// in any overload (`SELECT DISTINCT proname FROM pg_proc WHERE prokind IN
+/// ('a', 'w') AND oid < 16384`)? No name there is also a plain function's.
+fn is_builtin_aggregate_or_window(name: &str) -> bool {
+    static SET: std::sync::OnceLock<std::collections::HashSet<&'static str>> =
+        std::sync::OnceLock::new();
+    SET.get_or_init(|| {
+        include_str!("pg15_aggregate_window_functions.tsv")
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .collect()
+    })
+    .contains(name)
+}
+
+/// The error for an OVER on a call the window planner has no function for.
+///
+/// An aggregate or window function PostgreSQL has (`stddev(v) over ()`) is a
+/// gap in this server, 0A000. Anything else is `ParseFuncOrColumn`'s: the
+/// arguments and the function are resolved first, so a call no function
+/// takes is 42883, then a plain function is 42809 for the first clause only
+/// an aggregate or window function may carry, in PostgreSQL's order
+/// (`(*)`, DISTINCT, WITHIN GROUP, ORDER BY, FILTER, OVER), naming the
+/// function as written (`NameListToString`: `pg_catalog.upper`).
+fn over_on_unplanned_function(
+    f: &pg_query::protobuf::FuncCall,
+    name: &str,
+    def: &TableDef,
+    params: &[Bson],
+) -> Error {
+    if is_builtin_aggregate_or_window(name) {
+        return Error::Unsupported(format!("window function {name}()"));
+    }
+    // Resolve it as the plain call it would be without the clauses: the
+    // planner's overload resolution reports a call no function takes.
+    let plain = pg_query::protobuf::FuncCall {
+        over: None,
+        agg_star: false,
+        agg_distinct: false,
+        agg_within_group: false,
+        agg_order: Vec::new(),
+        agg_filter: None,
+        ..f.clone()
+    };
+    let target = pg_query::protobuf::Node {
+        node: Some(N::ResTarget(Box::new(pg_query::protobuf::ResTarget {
+            name: String::new(),
+            indirection: Vec::new(),
+            val: Some(Box::new(pg_query::protobuf::Node {
+                node: Some(N::FuncCall(Box::new(plain))),
+            })),
+            location: f.location,
+        }))),
+    };
+    if let Err(e) = plan_table_targets(std::slice::from_ref(&target), def, params) {
+        return e;
+    }
+    let written = f
+        .funcname
+        .iter()
+        .filter_map(|n| match n.node.as_ref()? {
+            N::String(s) => Some(s.sval.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join(".");
+    let message = if f.agg_star {
+        format!("{written}(*) specified, but {written} is not an aggregate function")
+    } else if f.agg_distinct {
+        format!("DISTINCT specified, but {written} is not an aggregate function")
+    } else if f.agg_within_group {
+        format!("WITHIN GROUP specified, but {written} is not an aggregate function")
+    } else if !f.agg_order.is_empty() {
+        format!("ORDER BY specified, but {written} is not an aggregate function")
+    } else if f.agg_filter.is_some() {
+        format!("FILTER specified, but {written} is not an aggregate function")
+    } else {
+        format!("OVER specified, but {written} is not a window function nor an aggregate function")
+    };
+    set_error_location(f.location);
+    Error::Sqlstate("42809", message)
 }
 
 /// Plan each window call inside `val` as its own window, and replace it in
@@ -17994,9 +18080,7 @@ pub(crate) fn domain_array_cast(value: &Bson, element: &str) -> Result<Option<Bs
         return Ok(None);
     }
     let check = |v: Bson| -> Result<Bson> {
-        for d in chain.iter().rev() {
-            domains::check_domain(d, &v)?;
-        }
+        domains::check_chain(&chain, &v)?;
         Ok(v)
     };
     match value {
@@ -27110,6 +27194,9 @@ fn plan_select(
 ) -> Result<Statement> {
     // A cancellation point at every pass: each rewrite below re-enters here.
     cancel::check()?;
+    // A GROUP BY constant that is no integer is 42601, after what parse
+    // analysis meets before it (RP-854).
+    group_sql92::check(s, &|cut| plan_select(cut, lookup, params))?;
     // `WITH` is shorthand for the FROM-subqueries below, so it is rewritten
     // away before any of the shape checks run -- every one of them would
     // otherwise have to know about it.
@@ -34730,9 +34817,7 @@ fn composite_value(value: Bson, target: &str, fields: &[(String, String)]) -> Re
         out.push(if ty == "bpchar" {
             let v = cast_value_inner(v, ty)?;
             // Innermost first, as a domain over a domain checks its base's.
-            for d in domains_of.iter().rev() {
-                domains::check_domain(d, &v)?;
-            }
+            domains::check_chain(&domains_of, &v)?;
             v
         } else {
             cast_value(v, ty)?
@@ -38890,10 +38975,11 @@ pub(crate) fn cast_value(value: Bson, target: &str) -> Result<Bson> {
             ))),
         };
     }
-    // A domain: the base type's cast, then the domain's constraints.
-    if let Some(d) = domains::user_domain(target) {
-        let v = cast_value(value, &d.base)?;
-        domains::check_domain(&d, &v)?;
+    // A domain: the innermost base type's cast, then the constraints of
+    // every domain of the chain, named by the one cast to.
+    if let Some((base, _, chain)) = domains::base_type_and_typmod(target) {
+        let v = cast_value(value, &base)?;
+        domains::check_chain(&chain, &v)?;
         return Ok(v);
     }
     let out = cast_value_inner(value, target)?;
@@ -39816,38 +39902,15 @@ fn cast_value_inner(value: Bson, target: &str) -> Result<Bson> {
             &as_text(&value),
             xml::XmlOption::Content,
         )?)),
-        // `int2vector` / `oidvector`: an int array, read from its
-        // space-separated text or taken from an int array as it stands.
+        // `int2vector` / `oidvector`: an int array, read from its text by
+        // the types' own input functions, or taken from an int array as it
+        // stands.
         "int2vector" | "oidvector" => match value {
             Bson::Array(items) => Ok(Bson::Array(items)),
-            other => {
-                let text = as_text(&other);
-                let items: Result<Vec<Bson>> = text
-                    .split_ascii_whitespace()
-                    .map(|w| {
-                        let n: i64 = w.parse().map_err(|_| {
-                            Error::InvalidText(format!(
-                                "invalid input syntax for type {}: \"{w}\"",
-                                if target == "int2vector" {
-                                    "smallint"
-                                } else {
-                                    "oid"
-                                }
-                            ))
-                        })?;
-                        Ok(if target == "int2vector" {
-                            Bson::Int32(i32::from(i16::try_from(n).map_err(|_| {
-                                Error::NumericOutOfRange(format!(
-                                    "value \"{w}\" is out of range for type smallint"
-                                ))
-                            })?))
-                        } else {
-                            Bson::Int64(n)
-                        })
-                    })
-                    .collect();
-                Ok(Bson::Array(items?))
+            other if target == "int2vector" => {
+                Ok(Bson::Array(vectors::int2vector_in(&as_text(&other))?))
             }
+            other => Ok(Bson::Array(vectors::oidvector_in(&as_text(&other))?)),
         },
         "jsonpath" => Ok(Bson::String(jsonpath::render(&jsonpath::parse(&as_text(
             &value,
@@ -45807,9 +45870,7 @@ fn const_value_node(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result<
             if typmod >= 0 {
                 let v = explicit_typmod(cast_value(value, &base)?, &base, typmod)?;
                 // Innermost first, as a domain over a domain checks its base's.
-                for d in chain.iter().rev() {
-                    domains::check_domain(d, &v)?;
-                }
+                domains::check_chain(&chain, &v)?;
                 return Ok(v);
             }
         }

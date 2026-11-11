@@ -3,7 +3,7 @@
 array built-ins refuse a vector), RP-602 (a two-dimensional `int2vector`
 prints as text), RP-603 (`oidvector`'s `<` compared element by element, fixed),
 RP-604 (a parameter declared `int2vector[]` has no type) and RP-605 (an
-`int2vector` input's out-of-range error quotes only its number).
+`int2vector` input's out-of-range error quoted only its number, fixed).
 
 The expected answers were measured on PostgreSQL 15.19; none needs DDL.
 """
@@ -177,12 +177,48 @@ def test_vector_array_parameter(value: bytes, fmt: int, dsn: str) -> None:
     assert got == expected
 
 
-@pytest.mark.backlog("RP-605")
+@pytest.mark.backlog_fixed("RP-605")
 @pytest.mark.parametrize("literal", ["70000 1", "1 70000 1"])
 def test_int2vector_range_error_quotes_the_rest(literal: str, dsn: str) -> None:
+    """`int2vectorin` quotes the input from the failing number to its end;
+    the message quoted only the number."""
     with psycopg.connect(dsn, autocommit=True) as c:
         assert pg_answer(c, f"select '{literal}'::int2vector") == (
             "err",
             "22003",
             'value "70000 1" is out of range for type smallint',
         )
+
+
+# `int2vectorin` / `oidvectorin` as PostgreSQL 15.19 reads each input: a
+# syntax error quotes the rest of the input, at the literal (8), and
+# `oidvectorin` takes `strtoul`'s answer for a negative number.
+VECTOR_INPUT: dict[str, tuple[object, ...]] = {
+    "select '1 x 2'::int2vector": ("22P02", 'invalid input syntax for type smallint: "x 2"', "8"),
+    "select '1x 2'::int2vector": ("22P02", 'invalid input syntax for type smallint: "1x 2"', "8"),
+    "select '1 -'::int2vector": ("22P02", 'invalid input syntax for type smallint: "-"', "8"),
+    "select '{\"1 x 2\"}'::int2vector[]": (
+        "22P02",
+        'invalid input syntax for type smallint: "x 2"',
+        "8",
+    ),
+    "select '1x'::oidvector": ("22P02", 'invalid input syntax for type oid: "x"', "8"),
+    "select 'x 1'::oidvector": ("22P02", 'invalid input syntax for type oid: "x 1"', "8"),
+    "select '1-2'::oidvector::text": ("ok", "1 4294967294"),
+    "select '-1'::oidvector::text": ("ok", "4294967295"),
+    "select '+5 -3'::int2vector::text": ("ok", "5 -3"),
+}
+
+
+@pytest.mark.backlog_fixed("RP-605")
+@pytest.mark.parametrize("sql", list(VECTOR_INPUT))
+def test_vector_input_reads_as_postgresql(sql: str, dsn: str) -> None:
+    """The vector input functions split on whitespace and parsed each word
+    whole: a syntax error quoted one word, `'-1'::oidvector` was -1 and
+    `'1-2'` was refused."""
+    with psycopg.connect(dsn, autocommit=True) as c:
+        try:
+            got: tuple[object, ...] = ("ok", c.execute(sql).fetchone()[0])
+        except psycopg.Error as e:
+            got = (e.sqlstate, str(e).splitlines()[0], e.diag.statement_position)
+    assert got == VECTOR_INPUT[sql]

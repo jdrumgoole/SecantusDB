@@ -2262,12 +2262,7 @@ impl plpgsql_fn::Host for PlHost<'_> {
             // chain, the innermost domain's first, and names the domain it
             // coerces to (`value for domain dd violates check constraint
             // "d_check"`, 15.19).
-            let outer = chain.first().map(|d| d.name.clone()).unwrap_or_default();
-            for d in chain.iter().rev() {
-                let mut d = d.clone();
-                d.name.clone_from(&outer);
-                secantus_pgplan::domains::check_domain(&d, &v).map_err(plan_error)?;
-            }
+            secantus_pgplan::domains::check_chain(&chain, &v).map_err(plan_error)?;
             Ok(v)
         })())
     }
@@ -31647,20 +31642,23 @@ impl PgHandler {
         if let (Some(sql), Some(_)) = (c.default_sql(), c.default.as_ref()) {
             return Bson::String(sql.to_string());
         }
+        // `get_const_expr` labels a literal by `format_type_with_typemod` of
+        // the Const's type with the Const's modifier, which is -1: the
+        // column's modifier sits on the implicit length coercion, which
+        // ruleutils does not print. With no modifier a `char(n)` is
+        // `bpchar` and a `bit(n)` `"bit"`, never `character` / `bit`, which
+        // would read back as `(1)` (RP-846; measured on 15.19).
+        let label = secantus_pgplan::scalar::format_type_text_public(&c.pg_type, Some(-1));
         match c.default.as_ref() {
             None | Some(Bson::Null) => Bson::Null,
             Some(Bson::String(s)) => {
                 // Single quotes double inside a SQL literal.
                 let escaped = s.replace('\'', "''");
-                Bson::String(format!(
-                    "'{escaped}'::{}",
-                    secantus_pgplan::display_type(&c.pg_type)
-                ))
+                Bson::String(format!("'{escaped}'::{label}"))
             }
             Some(Bson::Array(items)) => Bson::String(format!(
-                "'{}'::{}",
+                "'{}'::{label}",
                 secantus_pgplan::render_array(items).replace('\'', "''"),
-                secantus_pgplan::display_type(&c.pg_type)
             )),
             Some(Bson::Boolean(b)) => Bson::String(b.to_string()),
             Some(other) => {

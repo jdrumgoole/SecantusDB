@@ -8,8 +8,8 @@ value):
   fixed);
 - an assignment to a variable of `varchar(n)[]` truncated each overlong
   element where PostgreSQL raises 22001 (RP-695, fixed);
-- a cast to a domain over a domain names the INNER domain in its 23514,
-  where PostgreSQL names the one cast to (RP-696).
+- a cast to a domain over a domain named the INNER domain in its 23514,
+  where PostgreSQL names the one cast to (RP-696, fixed).
 
 The expected answers were measured on a private, freshly initdb'd
 PostgreSQL 15.19 cluster with `_SETUP`.
@@ -237,7 +237,8 @@ NESTED_DOMAIN = {
 }
 
 
-@pytest.mark.backlog("RP-696")
+@pytest.mark.backlog_fixed("RP-696")
 @pytest.mark.parametrize("query", list(NESTED_DOMAIN))
 def test_cast_to_a_domain_over_a_domain_names_the_outer_domain(query: str, dsn: str) -> None:
+    """Was: the message named the inner domain whose CHECK failed (RP-696)."""
     assert _answer(dsn, query) == NESTED_DOMAIN[query]
