@@ -3646,14 +3646,6 @@ Measured on PostgreSQL 15.19 (the shared reference on port 5415): every
 statement is VALUES-only and runs there as written. The gap tests are in
 `tests/backlog/test_rp_found_rp727.py`.
 
-- [ ] **A row comparison of zero-length rows answers.** `select row() =
-      row()`, `row() <> row()` and `row() in (select)` are 0A000 `cannot
-      compare rows of zero length` at the operator (14) on PostgreSQL 15.19
-      (`make_row_comparison_op`); here they answer `t`, `f` and `t`. Since
-      RP-727 an ordering operator against a subquery (`row() < any
-      (select)`) is refused as PostgreSQL refuses it.
-      Verify: tests/backlog/test_rp_found_rp727.py::test_zero_length_row_comparison_is_0a000
-      Backlog-ID: RP-849
 - [ ] **A row field that is an untyped literal is not coerced to its
       pair's type.** `select (1, '2') = (1, 2)` and `(1, '2') < any
       (select 1, 3)` are `t` on PostgreSQL 15.19: each pair's operator is
@@ -3670,9 +3662,30 @@ statement is VALUES-only and runs there as written. The gap tests are in
       `text_pattern_ops`), so `make_row_comparison_op` builds a
       RowCompareExpr of it as of `<`. Here the first is 42804 `collations
       are not supported by type record` and the second 0A000 `a row
-      comparison with ~<~ and a subquery is not supported yet`.
+      comparison with ~<~ and a subquery is not supported yet`. Since RP-849
+      rows of no fields are 0A000 `cannot compare rows of zero length`
+      under any operator, `row() ~<~ any (select)` included, but `row()
+      ~<~ row()` is still the 42804: the collation check runs first.
       Verify: tests/backlog/test_rp_found_rp727.py::test_row_comparison_with_a_pattern_operator
       Backlog-ID: RP-851
+
+## Found while working RP-849 (2026-11-11)
+
+Measured on PostgreSQL 15.19 (the shared reference on port 5415): every
+statement is VALUES-only and runs there as written. The gap test is in
+`tests/backlog/test_rp_found_rp849.py`.
+
+- [ ] **A row beside an operand that is not a row looks its operator up
+      before a missing column is reported.** `select (1, nosuch) = (1)
+      from (values (1)) v(a)` and `(1, nosuch) in (1, 2)` are 42703
+      `column "nosuch" does not exist` at 12 on PostgreSQL 15.19:
+      `transformAExprOp` / `transformAExprIn` transform the operands
+      before `make_op` looks for `record = integer`. Here each is 42883
+      `operator does not exist: record = integer`: `row_against_non_row`
+      runs before the operands' names are resolved. (Two row constructors
+      resolve their operands' bare names first since RP-849.)
+      Verify: tests/backlog/test_rp_found_rp849.py::test_a_row_beside_a_non_row_transforms_its_operands_first
+      Backlog-ID: RP-875
 
 ## Found while working RP-704 (2026-11-10)
 

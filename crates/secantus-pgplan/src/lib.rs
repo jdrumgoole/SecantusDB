@@ -24029,6 +24029,15 @@ pub(crate) fn check_sublink_width(
             match left.cmp(&width) {
                 std::cmp::Ordering::Less => "subquery has too many columns",
                 std::cmp::Ordering::Greater => "subquery has too few columns",
+                // Then `make_row_comparison_op`, whatever the operator: a
+                // row of no fields against a subquery of no columns is
+                // 0A000, at the operator (RP-849).
+                std::cmp::Ordering::Equal if left == 0 => {
+                    set_error_location(sl.location);
+                    return Err(Error::FeatureNotSupported(
+                        "cannot compare rows of zero length".into(),
+                    ));
+                }
                 std::cmp::Ordering::Equal => return Ok(()),
             }
         }
@@ -24547,20 +24556,21 @@ fn row_subquery_comparison(
             _ => None,
         })
         .unwrap_or_else(|| "=".to_string());
+    let width = row.args.len();
+    if width == 0 {
+        // `make_row_comparison_op`'s check, at the operator, ahead of the
+        // operator's lookup and of any row (`check_sublink_width` makes it
+        // where the subquery's width is known).
+        set_error_location(sl.location);
+        return Err(Error::FeatureNotSupported(
+            "cannot compare rows of zero length".into(),
+        ));
+    }
     let ordered = matches!(op.as_str(), "<" | "<=" | ">" | ">=");
     if !ordered && !matches!(op.as_str(), "=" | "<>") {
         return Err(Error::Unsupported(format!(
             "a row comparison with {op} and a subquery"
         )));
-    }
-    let width = row.args.len();
-    if ordered && width == 0 {
-        // `make_row_comparison_op`'s check, at the operator, ahead of any
-        // row.
-        set_error_location(sl.location);
-        return Err(Error::FeatureNotSupported(
-            "cannot compare rows of zero length".into(),
-        ));
     }
     if let Some(r) = rows.first() {
         if r.len() != width {
