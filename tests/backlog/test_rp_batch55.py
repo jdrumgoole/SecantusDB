@@ -42,6 +42,12 @@ from tests.backlog.test_rp_batch26 import _dsn, _marked
 from tests.backlog.test_rp_batch34 import run_scenario
 
 _FLUSH = "select pg_stat_force_next_flush()"
+# Waits until no other backend is connected to this database.
+_ALONE = (
+    "do $$ begin while (select count(*) from pg_stat_activity "
+    "where datname = current_database() and pid <> pg_backend_pid()) > 0 loop "
+    "perform pg_sleep(0.01); perform pg_stat_clear_snapshot(); end loop; end $$"
+)
 _TABLE = (
     "select seq_scan, seq_tup_read, idx_scan, idx_tup_fetch, n_tup_ins, n_tup_upd, n_tup_del, "
     "n_tup_hot_upd, n_live_tup, n_dead_tup, n_mod_since_analyze, n_ins_since_vacuum, "
@@ -190,6 +196,11 @@ SCENARIOS: dict[str, tuple[str, bool, list[str]]] = {
             # tuples and this server keeps elsewhere.
             "create table rp55_d (x int)",
             "create table rp55_before (c bigint, r bigint, i bigint, d bigint)",
+            # The counts are the database's: an earlier session still
+            # ending flushes its last commit when it goes (as PostgreSQL's
+            # backend does at exit), which under load can land after the
+            # baseline. Wait until this is the database's only backend.
+            _ALONE,
             _FLUSH,
             "insert into rp55_before select xact_commit, xact_rollback, tup_inserted, "
             "tup_deleted from pg_stat_database where datname = current_database()",
@@ -363,6 +374,7 @@ EXPECTED: dict[str, Any] = {
     "a database's transactions and tuples": [
         "CREATE TABLE",
         "CREATE TABLE",
+        "DO",
         [("",)],
         "INSERT 0 1",
         "INSERT 0 3",
