@@ -1801,6 +1801,773 @@ impl ColumnBuilder {
     }
 }
 
+pub use decoding::{decode, DecodeError, Value};
+
+/// The decoder, apart from the builder's own helpers.
+mod decoding {
+    use super::*;
+
+    // ---------------------------------------------------------------------------
+    // Decoding: `BSONColumn::Iterator` (`bsoncolumn.cpp`) and
+    // `Simple8b<T>::Iterator` (`simple8b.h`), mongod 8.2.11. Each decoded value
+    // is an element without its field name; `None` is a skip (a measurement
+    // without the field).
+
+    /// One decoded value: its BSON type byte and its value bytes.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct Value {
+        pub ty: u8,
+        pub value: Vec<u8>,
+    }
+
+    /// Why a column does not decode: `mongod`'s assertion code and message.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct DecodeError {
+        pub code: i32,
+        pub message: &'static str,
+    }
+
+    fn invalid(code: i32) -> DecodeError {
+        DecodeError {
+            code,
+            message: "Invalid BSON Column encoding",
+        }
+    }
+
+    const INTERLEAVED_LEGACY: u8 = 0xF0;
+    const INTERLEAVED: u8 = 0xF1;
+    const INTERLEAVED_ARRAY_ROOT: u8 = 0xF2;
+
+    fn is_literal_control(control: u8) -> bool {
+        (control & 0xE0) == 0 || control == MIN_KEY || control == MAX_KEY
+    }
+
+    fn is_interleaved_control(control: u8) -> bool {
+        matches!(
+            control,
+            INTERLEAVED_LEGACY | INTERLEAVED | INTERLEAVED_ARRAY_ROOT
+        )
+    }
+
+    fn scale_index_for_control(control: u8) -> Option<u8> {
+        match control >> 4 {
+            0b1000 => Some(5),
+            0b1001 => Some(0),
+            0b1010 => Some(1),
+            0b1011 => Some(2),
+            0b1100 => Some(3),
+            0b1101 => Some(4),
+            _ => None,
+        }
+    }
+
+    fn cstring_len(b: &[u8]) -> Option<usize> {
+        b.iter().position(|&c| c == 0).map(|n| n + 1)
+    }
+
+    fn le_i32_at(b: &[u8], at: usize) -> Option<i32> {
+        b.get(at..at + 4)
+            .map(|s| i32::from_le_bytes([s[0], s[1], s[2], s[3]]))
+    }
+
+    /// The size of a value of type `ty` at the start of `b`.
+    fn value_size(ty: u8, b: &[u8]) -> Option<usize> {
+        let n = match ty {
+            DOUBLE | DATE | TIMESTAMP | INT64 => 8,
+            STRING | CODE | 0x0E => 4 + usize::try_from(le_i32_at(b, 0)?).ok()?,
+            OBJECT | ARRAY | 0x0F => usize::try_from(le_i32_at(b, 0)?).ok()?,
+            BINARY => 5 + usize::try_from(le_i32_at(b, 0)?).ok()?,
+            UNDEFINED | NULL | MIN_KEY | MAX_KEY => 0,
+            OID => 12,
+            BOOLEAN => 1,
+            0x0B => {
+                let p = cstring_len(b)?;
+                p + cstring_len(b.get(p..)?)?
+            }
+            0x0C => 4 + usize::try_from(le_i32_at(b, 0)?).ok()? + 12,
+            INT32 => 4,
+            DECIMAL => 16,
+            _ => return None,
+        };
+        (n <= b.len()).then_some(n)
+    }
+
+    /// `Simple8b<T>::Iterator`: the values of a run of Simple-8b blocks.
+    /// `wide` is the `uint128_t` instantiation.
+    #[derive(Debug, Clone)]
+    struct S8Iter {
+        wide: bool,
+        blocks: Vec<u64>,
+        at: usize,
+        current: u64,
+        value: Option<u128>,
+        mask: u64,
+        rle_remaining: u32,
+        shift: u32,
+        bits_per_value: u32,
+        count_mask: u64,
+        count_bits: u32,
+        count_multiplier: u32,
+        selector: u8,
+        ext: u8,
+    }
+
+    const TRAILING_ZEROS_MASK: [u64; 4] = [0, 0xF, 0xF, 0x1F];
+    const TRAILING_ZEROS_MULTIPLIER: [u32; 4] = [0, 1, 4, 4];
+
+    impl S8Iter {
+        fn new(wide: bool, bytes: &[u8], previous: Option<u128>) -> Result<Self, DecodeError> {
+            let blocks = bytes
+                .as_chunks::<8>()
+                .0
+                .iter()
+                .map(|c| u64::from_le_bytes(*c))
+                .collect();
+            let mut it = S8Iter {
+                wide,
+                blocks,
+                at: 0,
+                current: 0,
+                value: previous,
+                mask: 0,
+                rle_remaining: 0,
+                shift: 0,
+                bits_per_value: 0,
+                count_mask: 0,
+                count_bits: 0,
+                count_multiplier: 0,
+                selector: 0,
+                ext: 0,
+            };
+            if !it.blocks.is_empty() {
+                it.load_block()?;
+            }
+            Ok(it)
+        }
+
+        fn more(&self) -> bool {
+            self.at != self.blocks.len()
+        }
+
+        fn load_block(&mut self) -> Result<(), DecodeError> {
+            self.current = self.blocks[self.at];
+            self.selector = (self.current & 0xF) as u8;
+            if self.selector == 0 {
+                return Err(DecodeError {
+                    code: 8787300,
+                    message: "invalid selector 0",
+                });
+            }
+            let selector_ext = ((self.current >> SELECTOR_BITS) & 0xF) as u8;
+            if u64::from(self.selector) == RLE_SELECTOR {
+                self.shift = 65;
+                self.rle_remaining = (u32::from(selector_ext) + 1) * RLE_MULTIPLIER - 1;
+                return Ok(());
+            }
+            self.ext = BASE_SELECTOR;
+            let mut extension_bits = 0;
+            if self.selector == 7 || self.selector == 8 {
+                self.ext =
+                    SELECTOR_TO_EXTENSION[(self.selector - 7) as usize][selector_ext as usize];
+                if self.ext == INVALID_SELECTOR {
+                    return Err(DecodeError {
+                        code: 8787301,
+                        message: "invalid extended selector",
+                    });
+                }
+                if self.ext != BASE_SELECTOR {
+                    self.selector = selector_ext;
+                }
+                extension_bits = 4;
+            }
+            let (e, s) = (self.ext as usize, self.selector as usize);
+            self.mask = DECODE_MASK[e][s];
+            self.count_mask = TRAILING_ZEROS_MASK[e];
+            self.count_bits = u32::from(TRAILING_ZERO_BIT_SIZE[e]);
+            self.count_multiplier = TRAILING_ZEROS_MULTIPLIER[e];
+            self.bits_per_value = u32::from(BITS_PER_INT_FOR_SELECTOR[e][s]) + self.count_bits;
+            self.shift = u32::from(SELECTOR_BITS) + extension_bits;
+            self.rle_remaining = 0;
+            self.load_value();
+            Ok(())
+        }
+
+        fn load_value(&mut self) {
+            let value = (self.current >> self.shift) & self.mask;
+            if value == self.mask {
+                self.value = None;
+                return;
+            }
+            let trailing = value & self.count_mask;
+            let mut zeros = trailing as u32 * self.count_multiplier;
+            let v = value >> self.count_bits;
+            self.value = Some(if self.wide {
+                u128::from(v).wrapping_shl(zeros)
+            } else {
+                zeros %= 64;
+                u128::from(v.wrapping_shl(zeros))
+            });
+        }
+
+        /// `operator++`.
+        fn advance(&mut self) -> Result<(), DecodeError> {
+            if !self.more() {
+                return Ok(());
+            }
+            if self.rle_remaining > 0 {
+                self.rle_remaining -= 1;
+                return Ok(());
+            }
+            self.shift += self.bits_per_value;
+            if self.shift + self.bits_per_value > 64 {
+                self.at += 1;
+                if self.at == self.blocks.len() {
+                    self.rle_remaining = 0;
+                    self.shift = 0;
+                    return Ok(());
+                }
+                return self.load_block();
+            }
+            self.load_value();
+            Ok(())
+        }
+    }
+
+    fn decode_int128(v: u128) -> i128 {
+        ((v >> 1) ^ (!(v & 1)).wrapping_add(1)) as i128
+    }
+
+    #[derive(Debug, Clone)]
+    enum Decoder {
+        D64 {
+            pos: Option<S8Iter>,
+            last_encoded: i64,
+            last_encoded_dod: i64,
+            scale_index: u8,
+            delta_of_delta: bool,
+        },
+        D128 {
+            pos: Option<S8Iter>,
+            last_encoded: i128,
+        },
+    }
+
+    impl Decoder {
+        fn d64() -> Self {
+            Decoder::D64 {
+                pos: None,
+                last_encoded: 0,
+                last_encoded_dod: 0,
+                scale_index: MEMORY_AS_INTEGER,
+                delta_of_delta: false,
+            }
+        }
+
+        /// `pos.valid() && (++pos).more()`: advance a live block reader and say
+        /// whether it still holds a value.
+        fn next_in_block(&mut self) -> Result<bool, DecodeError> {
+            let pos = match self {
+                Decoder::D64 { pos, .. } | Decoder::D128 { pos, .. } => pos,
+            };
+            match pos {
+                Some(p) => {
+                    p.advance()?;
+                    Ok(p.more())
+                }
+                None => Ok(false),
+            }
+        }
+    }
+
+    /// `DecodingState`: one stream's decoder and the last value it produced.
+    #[derive(Debug, Clone)]
+    struct DecodingState {
+        decoder: Decoder,
+        last: Option<Value>,
+    }
+
+    impl DecodingState {
+        fn new() -> Self {
+            DecodingState {
+                decoder: Decoder::d64(),
+                last: None,
+            }
+        }
+
+        /// `loadUncompressed`: a literal sets the decoder up for the deltas
+        /// that follow it.
+        fn load_uncompressed(&mut self, v: Value) {
+            let ty = v.ty;
+            if uses_128bit(ty) {
+                let last_encoded = match ty {
+                    STRING | CODE => {
+                        let s = &v.value[4..v.value.len().saturating_sub(1)];
+                        encode_string(s).unwrap_or(0)
+                    }
+                    BINARY => {
+                        let data = &v.value[5..];
+                        encode_binary(data).unwrap_or(0)
+                    }
+                    _ => {
+                        let low = read_i64(&v.value[..8]) as u64;
+                        let high = read_i64(&v.value[8..16]) as u64;
+                        ((u128::from(high) << 64) | u128::from(low)) as i128
+                    }
+                };
+                self.decoder = Decoder::D128 {
+                    pos: None,
+                    last_encoded,
+                };
+            } else {
+                let dod = uses_delta_of_delta(ty);
+                let encoded: i64 = match ty {
+                    OID => encode_object_id(&v.value),
+                    DATE | INT64 | TIMESTAMP => read_i64(&v.value),
+                    BOOLEAN => i64::from(v.value[0] != 0),
+                    INT32 => i64::from(read_i32(&v.value)),
+                    _ => 0,
+                };
+                self.decoder = Decoder::D64 {
+                    pos: None,
+                    last_encoded: if dod { 0 } else { encoded },
+                    last_encoded_dod: if dod { encoded } else { 0 },
+                    scale_index: MEMORY_AS_INTEGER,
+                    delta_of_delta: dod,
+                };
+            }
+            self.last = Some(v);
+        }
+
+        /// `loadControl`: a literal, or a run of Simple-8b blocks whose first
+        /// value is returned. Gives the value and the bytes consumed.
+        fn load_control(&mut self, buf: &[u8]) -> Result<(Option<Value>, usize), DecodeError> {
+            let control = buf[0];
+            if is_literal_control(control) {
+                if buf.len() < 2 || buf[1] != 0 {
+                    return Err(invalid(6067602));
+                }
+                let size = value_size(control, &buf[2..]).ok_or_else(|| invalid(6067602))?;
+                let v = Value {
+                    ty: control,
+                    value: buf[2..2 + size].to_vec(),
+                };
+                self.load_uncompressed(v.clone());
+                return Ok((Some(v), 2 + size));
+            }
+            let blocks = usize::from(control & 0x0F) + 1;
+            let size = 8 * blocks;
+            if size + 1 >= buf.len() {
+                return Err(invalid(6067608));
+            }
+            let bytes = &buf[1..1 + size];
+            let scale = scale_index_for_control(control);
+            let last_ty = self.last.as_ref().map(|v| v.ty);
+            match &mut self.decoder {
+                Decoder::D64 {
+                    pos,
+                    last_encoded,
+                    scale_index,
+                    ..
+                } => {
+                    let s = scale.ok_or(DecodeError {
+                        code: 6067606,
+                        message: "Invalid control byte in BSON Column",
+                    })?;
+                    *scale_index = s;
+                    if last_ty == Some(DOUBLE) {
+                        let last = read_f64(&self.last.as_ref().expect("double").value);
+                        *last_encoded = encode_double(last, s).ok_or(DecodeError {
+                            code: 6067607,
+                            message: "Invalid double encoding in BSON Column",
+                        })?;
+                    } else if s != MEMORY_AS_INTEGER {
+                        return Err(DecodeError {
+                            code: 8827800,
+                            message: "Unexpected control for type in BSONColumn",
+                        });
+                    }
+                    let previous = match pos {
+                        Some(p) => p.value,
+                        None => Some(0),
+                    };
+                    *pos = Some(S8Iter::new(false, bytes, previous)?);
+                }
+                Decoder::D128 { pos, .. } => {
+                    if scale != Some(MEMORY_AS_INTEGER) {
+                        return Err(DecodeError {
+                            code: 8838600,
+                            message: "Invalid control byte in BSON Column",
+                        });
+                    }
+                    let previous = match pos {
+                        Some(p) => p.value,
+                        None => Some(0),
+                    };
+                    *pos = Some(S8Iter::new(true, bytes, previous)?);
+                }
+            }
+            Ok((self.load_delta()?, size + 1))
+        }
+
+        /// `loadDelta`: the value at the block reader's position.
+        fn load_delta(&mut self) -> Result<Option<Value>, DecodeError> {
+            let Some(last) = self.last.clone() else {
+                return Ok(None);
+            };
+            match &mut self.decoder {
+                Decoder::D64 {
+                    pos,
+                    last_encoded,
+                    last_encoded_dod,
+                    scale_index,
+                    delta_of_delta,
+                } => {
+                    let Some(delta) = pos.as_ref().and_then(|p| p.value) else {
+                        return Ok(None);
+                    };
+                    let delta = delta as u64;
+                    if !*delta_of_delta && delta == 0 {
+                        return Ok(Some(last));
+                    }
+                    *last_encoded = last_encoded.wrapping_add(decode_int64(delta));
+                    if *delta_of_delta {
+                        *last_encoded_dod = last_encoded_dod.wrapping_add(*last_encoded);
+                    }
+                    let write = if *delta_of_delta {
+                        *last_encoded_dod
+                    } else {
+                        *last_encoded
+                    };
+                    let value = match last.ty {
+                        DOUBLE => decode_double(write, *scale_index).to_le_bytes().to_vec(),
+                        OID => {
+                            let b = write.to_le_bytes();
+                            let mut oid = last.value.clone();
+                            oid[0] = b[6];
+                            oid[1] = b[5];
+                            oid[2] = b[3];
+                            oid[3] = b[1];
+                            oid[9] = b[4];
+                            oid[10] = b[2];
+                            oid[11] = b[0];
+                            oid
+                        }
+                        DATE | INT64 | TIMESTAMP => write.to_le_bytes().to_vec(),
+                        BOOLEAN => vec![u8::from(write != 0)],
+                        INT32 => (write as i32).to_le_bytes().to_vec(),
+                        _ => {
+                            return Err(DecodeError {
+                                code: 6785500,
+                                message: "Invalid delta in BSON Column encoding",
+                            })
+                        }
+                    };
+                    let v = Value { ty: last.ty, value };
+                    self.last = Some(v.clone());
+                    Ok(Some(v))
+                }
+                Decoder::D128 { pos, last_encoded } => {
+                    let Some(delta) = pos.as_ref().and_then(|p| p.value) else {
+                        return Ok(None);
+                    };
+                    if delta == 0 {
+                        return Ok(Some(last));
+                    }
+                    *last_encoded = last_encoded.wrapping_add(decode_int128(delta));
+                    let bytes = (*last_encoded as u128).to_le_bytes();
+                    let value = match last.ty {
+                        STRING | CODE => {
+                            let end = bytes.iter().rposition(|&c| c != 0).map_or(0, |i| i + 1);
+                            let mut s: Vec<u8> = bytes[..end].to_vec();
+                            s.reverse();
+                            let mut out = ((s.len() + 1) as i32).to_le_bytes().to_vec();
+                            out.extend_from_slice(&s);
+                            out.push(0);
+                            out
+                        }
+                        BINARY => {
+                            let len = usize::try_from(read_i32(&last.value)).unwrap_or(usize::MAX);
+                            if len > 16 {
+                                return Err(DecodeError {
+                                    code: 8412601,
+                                    message:
+                                        "BinData length should not exceed 16 in a delta encoding",
+                                });
+                            }
+                            let mut out = last.value[..5].to_vec();
+                            out.extend_from_slice(&bytes[..len]);
+                            out
+                        }
+                        DECIMAL => bytes.to_vec(),
+                        _ => {
+                            return Err(DecodeError {
+                                code: 8412600,
+                                message: "Invalid delta in BSON Column encoding",
+                            })
+                        }
+                    };
+                    let v = Value { ty: last.ty, value };
+                    self.last = Some(v.clone());
+                    Ok(Some(v))
+                }
+            }
+        }
+    }
+
+    /// A node of an interleaved reference object: a scalar with its stream,
+    /// or a sub-object whose fields follow.
+    #[derive(Debug, Clone)]
+    enum RefNode {
+        Scalar {
+            name: Vec<u8>,
+            state: usize,
+        },
+        Object {
+            name: Vec<u8>,
+            ty: u8,
+            allow_empty: bool,
+            children: Vec<RefNode>,
+        },
+    }
+
+    /// The elements of a BSON document's bytes: `(type, name, value)`.
+    /// A document element: its type, its name and its value bytes.
+    type Field<'a> = (u8, &'a [u8], &'a [u8]);
+
+    fn elements(doc: &[u8]) -> Result<Vec<Field<'_>>, DecodeError> {
+        let bad = || invalid(6067610);
+        let len = usize::try_from(le_i32_at(doc, 0).ok_or_else(bad)?).map_err(|_| bad())?;
+        if len < 5 || len > doc.len() {
+            return Err(bad());
+        }
+        let mut out = Vec::new();
+        let mut at = 4;
+        while at < len - 1 {
+            let ty = doc[at];
+            let name_len = cstring_len(&doc[at + 1..len]).ok_or_else(bad)?;
+            let name = &doc[at + 1..at + name_len];
+            let vstart = at + 1 + name_len;
+            let size = value_size(ty, &doc[vstart..len]).ok_or_else(bad)?;
+            out.push((ty, name, &doc[vstart..vstart + size]));
+            at = vstart + size;
+        }
+        Ok(out)
+    }
+
+    /// `BSONObjTraversal` over the reference object: one stream per scalar,
+    /// each set up from the reference's own value (`loadUncompressed`).
+    fn reference_nodes(
+        doc: &[u8],
+        arrays: bool,
+        states: &mut Vec<DecodingState>,
+    ) -> Result<Vec<RefNode>, DecodeError> {
+        let mut out = Vec::new();
+        for (ty, name, value) in elements(doc)? {
+            if ty == OBJECT || (arrays && ty == ARRAY) {
+                out.push(RefNode::Object {
+                    name: name.to_vec(),
+                    ty,
+                    allow_empty: is_empty_doc(value),
+                    children: reference_nodes(value, arrays, states)?,
+                });
+            } else {
+                let mut s = DecodingState::new();
+                s.load_uncompressed(Value {
+                    ty,
+                    value: value.to_vec(),
+                });
+                states.push(s);
+                out.push(RefNode::Scalar {
+                    name: name.to_vec(),
+                    state: states.len() - 1,
+                });
+            }
+        }
+        Ok(out)
+    }
+
+    fn write_element(out: &mut Vec<u8>, ty: u8, name: &[u8], value: &[u8]) {
+        out.push(ty);
+        out.extend_from_slice(name);
+        out.push(0);
+        out.extend_from_slice(value);
+    }
+
+    struct Interleaved {
+        states: Vec<DecodingState>,
+        nodes: Vec<RefNode>,
+        root_ty: u8,
+    }
+
+    enum Step {
+        /// A scalar produced its next value (or a skip).
+        Value(Option<Value>),
+        /// The streams are exhausted and the next control is EOO.
+        End,
+    }
+
+    /// The iterator's interleaved increment for one scalar stream.
+    fn interleaved_scalar(
+        state: &mut DecodingState,
+        buf: &[u8],
+        control: &mut usize,
+    ) -> Result<Step, DecodeError> {
+        if state.decoder.next_in_block()? {
+            return Ok(Step::Value(state.load_delta()?));
+        }
+        let Some(&c) = buf.get(*control) else {
+            return Err(invalid(6067602));
+        };
+        if c == EOO {
+            *control += 1;
+            return Ok(Step::End);
+        }
+        let (v, size) = state.load_control(&buf[*control..])?;
+        *control += size;
+        Ok(Step::Value(v))
+    }
+
+    /// Write one interleaved object's fields under `nodes` into `out`; `None`
+    /// when the first scalar met the end of the interleaved section.
+    fn interleaved_fields(
+        nodes: &[RefNode],
+        states: &mut [DecodingState],
+        buf: &[u8],
+        control: &mut usize,
+        processed: &mut usize,
+        out: &mut Vec<u8>,
+    ) -> Result<bool, DecodeError> {
+        for node in nodes {
+            match node {
+                RefNode::Scalar { name, state } => {
+                    match interleaved_scalar(&mut states[*state], buf, control)? {
+                        Step::End => return Ok(false),
+                        Step::Value(Some(v)) => {
+                            write_element(out, v.ty, name, &v.value);
+                        }
+                        Step::Value(None) => {}
+                    }
+                    *processed += 1;
+                }
+                RefNode::Object {
+                    name,
+                    ty,
+                    allow_empty,
+                    children,
+                } => {
+                    let mut sub = Vec::new();
+                    let more =
+                        interleaved_fields(children, states, buf, control, processed, &mut sub)?;
+                    if !more {
+                        return Ok(false);
+                    }
+                    if sub.is_empty() && !allow_empty {
+                        continue;
+                    }
+                    let mut value = ((sub.len() + 5) as i32).to_le_bytes().to_vec();
+                    value.extend_from_slice(&sub);
+                    value.push(0);
+                    write_element(out, *ty, name, &value);
+                }
+            }
+        }
+        Ok(true)
+    }
+
+    /// Decode a column (the bytes of a BSON binary of subtype 7) into its
+    /// values, in order: `mongod`'s `BSONColumn` iterator.
+    pub fn decode(buf: &[u8]) -> Result<Vec<Option<Value>>, DecodeError> {
+        if buf.is_empty() {
+            return Err(invalid(6067609));
+        }
+        let mut out: Vec<Option<Value>> = Vec::new();
+        let mut control = 0usize;
+        let mut regular = DecodingState::new();
+        let mut interleaved: Option<Interleaved> = None;
+        loop {
+            if let Some(il) = &mut interleaved {
+                let mut fields = Vec::new();
+                let mut processed = 0;
+                let more = interleaved_fields(
+                    &il.nodes,
+                    &mut il.states,
+                    buf,
+                    &mut control,
+                    &mut processed,
+                    &mut fields,
+                )?;
+                if !more {
+                    if processed != 0 {
+                        return Err(invalid(6067604));
+                    }
+                    // The first stream met the end; the rest must be spent.
+                    for s in il.states.iter_mut().skip(1) {
+                        if s.decoder.next_in_block()? {
+                            return Err(invalid(8902201));
+                        }
+                    }
+                    // Back to regular mode, the last object as the previous value.
+                    regular = DecodingState::new();
+                    regular.last = out.last().cloned().flatten();
+                    interleaved = None;
+                    continue;
+                }
+                out.push(if fields.is_empty() {
+                    None
+                } else {
+                    let mut value = ((fields.len() + 5) as i32).to_le_bytes().to_vec();
+                    value.extend_from_slice(&fields);
+                    value.push(0);
+                    Some(Value {
+                        ty: il.root_ty,
+                        value,
+                    })
+                });
+                continue;
+            }
+            if regular.decoder.next_in_block()? {
+                out.push(regular.load_delta()?);
+                continue;
+            }
+            let Some(&c) = buf.get(control) else {
+                return Err(invalid(6067602));
+            };
+            if c == EOO {
+                if control + 1 != buf.len() {
+                    return Err(invalid(7482200));
+                }
+                return Ok(out);
+            }
+            if is_interleaved_control(c) {
+                let reference = &buf[control + 1..];
+                let mut states = Vec::new();
+                let nodes = reference_nodes(reference, c != INTERLEAVED_LEGACY, &mut states)?;
+                if states.is_empty() {
+                    return Err(invalid(6067610));
+                }
+                let ref_len = le_i32_at(reference, 0).unwrap_or(0) as usize;
+                control += 1 + ref_len;
+                if control >= buf.len() || buf[control] == EOO {
+                    return Err(invalid(9232700));
+                }
+                interleaved = Some(Interleaved {
+                    states,
+                    nodes,
+                    root_ty: if c == INTERLEAVED_ARRAY_ROOT {
+                        ARRAY
+                    } else {
+                        OBJECT
+                    },
+                });
+                continue;
+            }
+            let (v, size) = regular.load_control(&buf[control..])?;
+            control += size;
+            out.push(v);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1877,6 +2644,439 @@ mod tests {
         let literal = |c: &str| format!("020015000000{}00", c.repeat(20));
         let want = format!("{}{}00", literal("78"), literal("79"));
         assert_eq!(column(&[string(&x), string(&y)]), want);
+    }
+
+    fn unhex(s: &str) -> Vec<u8> {
+        (0..s.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
+            .collect()
+    }
+
+    /// A value as a column element: its type byte and value bytes.
+    fn element(v: &bson::Bson) -> (u8, Vec<u8>) {
+        let bytes = bson::to_vec(&bson::doc! {"": v.clone()}).unwrap();
+        (bytes[4], bytes[6..bytes.len() - 1].to_vec())
+    }
+
+    /// Encode `values` (`None` a skip), decode the bytes, and compare.
+    fn round_trip(label: &str, values: &[Option<bson::Bson>]) {
+        let raw: Vec<Option<(u8, Vec<u8>)>> =
+            values.iter().map(|v| v.as_ref().map(element)).collect();
+        let mut b = ColumnBuilder::new();
+        for v in &raw {
+            b.append(v.as_ref().map(|(ty, value)| Element { ty: *ty, value }));
+        }
+        let bytes = b.finalize();
+        let got = decode(&bytes).unwrap_or_else(|e| panic!("{label}: {e:?}"));
+        let want: Vec<Option<Value>> = raw
+            .into_iter()
+            .map(|v| v.map(|(ty, value)| Value { ty, value }))
+            .collect();
+        assert_eq!(got.len(), want.len(), "{label}: count");
+        for (i, (g, w)) in got.iter().zip(&want).enumerate() {
+            assert_eq!(g, w, "{label}: value {i} of {}", hex(&bytes));
+        }
+    }
+
+    fn some(values: Vec<bson::Bson>) -> Vec<Option<bson::Bson>> {
+        values.into_iter().map(Some).collect()
+    }
+
+    #[test]
+    fn mongods_bytes_decode_to_their_values() {
+        let ints = |v: &[Option<i32>]| -> Vec<Option<Value>> {
+            v.iter()
+                .map(|x| {
+                    x.map(|n| Value {
+                        ty: INT32,
+                        value: n.to_le_bytes().to_vec(),
+                    })
+                })
+                .collect()
+        };
+        assert_eq!(
+            decode(&unhex("100000000000802c0000020020000000")).unwrap(),
+            ints(&[Some(0), Some(1), Some(2), Some(3)])
+        );
+        assert_eq!(
+            decode(&unhex("10000100000080fbff2700fcffffff00")).unwrap(),
+            ints(&[Some(1), None, Some(3), None, None])
+        );
+        assert_eq!(
+            decode(&unhex("1000050000008107000000000000000e0000000000000000")).unwrap(),
+            ints(&[Some(5); 10])
+        );
+        let s = |x: &str| {
+            let (ty, value) = string(x);
+            Some(Value { ty, value })
+        };
+        assert_eq!(
+            decode(&unhex(
+                "0200020000006100812d000000000803002e20200c0000000000"
+            ))
+            .unwrap(),
+            vec![s("a"), s("b"), s("ab"), s("abc")]
+        );
+        let obj = |n: i32| {
+            let mut v = vec![12, 0, 0, 0, INT32, b'a', 0];
+            v.extend_from_slice(&n.to_le_bytes());
+            v.push(0);
+            Some(Value {
+                ty: OBJECT,
+                value: v,
+            })
+        };
+        assert_eq!(
+            decode(&unhex("f10c0000001061000100000000800d000000080000000000")).unwrap(),
+            vec![obj(1), obj(2)]
+        );
+    }
+
+    #[test]
+    fn every_kind_of_column_round_trips() {
+        use bson::{doc, oid::ObjectId, Binary, Bson, DateTime, Decimal128, Timestamp};
+        use rand::{Rng, SeedableRng};
+        let mut rng = rand::rngs::StdRng::seed_from_u64(88);
+        let mut series: Vec<(&str, Vec<Option<Bson>>)> = vec![
+            ("ints", some((0..4).map(Bson::Int32).collect())),
+            (
+                "ints_wide",
+                some(
+                    [1, 1000, -5, 7, 7, 7, i32::MAX, i32::MIN, 0]
+                        .into_iter()
+                        .map(Bson::Int32)
+                        .collect(),
+                ),
+            ),
+            ("rle", some(vec![Bson::Int32(5); 500])),
+            (
+                "rle_then_change",
+                some(
+                    std::iter::repeat_n(5, 130)
+                        .chain([6])
+                        .chain(std::iter::repeat_n(5, 250))
+                        .map(Bson::Int32)
+                        .collect(),
+                ),
+            ),
+            (
+                "count_limit",
+                some((0..1100).map(|i| Bson::Int32(i % 7)).collect()),
+            ),
+            (
+                "int64",
+                some(
+                    (0..40)
+                        .map(|_| Bson::Int64(rng.random_range(-(1i64 << 62)..(1i64 << 62))))
+                        .collect(),
+                ),
+            ),
+            (
+                "int64_extremes",
+                some(vec![
+                    Bson::Int64(i64::MAX),
+                    Bson::Int64(i64::MIN),
+                    Bson::Int64(0),
+                ]),
+            ),
+            (
+                "doubles",
+                some(
+                    [1.5, 2.5, 3.25, 1.0, 0.1, 0.2, 0.3, 1.0001, 7.0]
+                        .into_iter()
+                        .map(Bson::Double)
+                        .collect(),
+                ),
+            ),
+            (
+                "doubles_odd",
+                some(
+                    [
+                        0.0,
+                        -0.0,
+                        f64::INFINITY,
+                        f64::NEG_INFINITY,
+                        f64::NAN,
+                        1e300,
+                        5e-324,
+                        3.0,
+                    ]
+                    .into_iter()
+                    .map(Bson::Double)
+                    .collect(),
+                ),
+            ),
+            (
+                "doubles_random",
+                some(
+                    (0..80)
+                        .map(|_| Bson::Double(rng.random_range(-1e6..1e6)))
+                        .collect(),
+                ),
+            ),
+            (
+                "doubles_money",
+                some(
+                    (0..90)
+                        .map(|_| {
+                            Bson::Double((rng.random_range(0.0..500.0f64) * 100.0).round() / 100.0)
+                        })
+                        .collect(),
+                ),
+            ),
+            (
+                "strings",
+                some(
+                    [
+                        "a",
+                        "b",
+                        "ab",
+                        "abc",
+                        "",
+                        "xxxxxxxxxxxxxxxx",
+                        "yyyyyyyyyyyyyyyyy",
+                        "abcd",
+                    ]
+                    .into_iter()
+                    .map(|s| Bson::String(s.into()))
+                    .collect(),
+                ),
+            ),
+            (
+                "strings_nul",
+                some(vec![
+                    Bson::String("\u{0}a".into()),
+                    Bson::String("b".into()),
+                    Bson::String("\u{0}b".into()),
+                ]),
+            ),
+            (
+                "code",
+                some(vec![
+                    Bson::JavaScriptCode("f()".into()),
+                    Bson::JavaScriptCode("g()".into()),
+                ]),
+            ),
+            (
+                "bools_nulls",
+                some(vec![
+                    Bson::Boolean(true),
+                    Bson::Boolean(false),
+                    Bson::Boolean(true),
+                    Bson::Null,
+                    Bson::Null,
+                    Bson::Undefined,
+                    Bson::MinKey,
+                    Bson::MaxKey,
+                    Bson::MaxKey,
+                ]),
+            ),
+            (
+                "dates",
+                some(
+                    (0..30)
+                        .map(|_| {
+                            Bson::DateTime(DateTime::from_millis(
+                                1_767_225_600_000 + rng.random_range(0..10_000_000),
+                            ))
+                        })
+                        .collect(),
+                ),
+            ),
+            (
+                "oids",
+                some(
+                    (0..40u32)
+                        .map(|i| {
+                            let mut b = [0u8; 12];
+                            b[..4].copy_from_slice(&0x6500_0000u32.to_be_bytes());
+                            b[4..9].copy_from_slice(&[0xaa, 0xbb, 0xcc, 0xdd, 0xee]);
+                            b[9..].copy_from_slice(&(i * 3).to_be_bytes()[1..]);
+                            Bson::ObjectId(ObjectId::from_bytes(b))
+                        })
+                        .collect(),
+                ),
+            ),
+            (
+                "decimals",
+                some(
+                    (0..25)
+                        .map(|_| {
+                            let s = format!("{}", rng.random_range(0..1_000_000) as f64 / 100.0);
+                            Bson::Decimal128(s.parse::<Decimal128>().unwrap())
+                        })
+                        .collect(),
+                ),
+            ),
+            (
+                "binary",
+                some(
+                    (0..20u8)
+                        .map(|i| {
+                            Bson::Binary(Binary {
+                                subtype: bson::spec::BinarySubtype::Generic,
+                                bytes: vec![i, i + 1, i.wrapping_mul(3)],
+                            })
+                        })
+                        .chain([Bson::Binary(Binary {
+                            subtype: bson::spec::BinarySubtype::Generic,
+                            bytes: vec![b'x'; 20],
+                        })])
+                        .collect(),
+                ),
+            ),
+            (
+                "timestamps",
+                some(
+                    (0..30)
+                        .map(|i| {
+                            Bson::Timestamp(Timestamp {
+                                time: 1_700_000_000 + i / 3,
+                                increment: i % 3,
+                            })
+                        })
+                        .collect(),
+                ),
+            ),
+            (
+                "regex",
+                some(vec![
+                    Bson::RegularExpression(bson::Regex {
+                        pattern: "a+".into(),
+                        options: String::new(),
+                    }),
+                    Bson::RegularExpression(bson::Regex {
+                        pattern: "a+".into(),
+                        options: String::new(),
+                    }),
+                    Bson::RegularExpression(bson::Regex {
+                        pattern: "b".into(),
+                        options: "i".into(),
+                    }),
+                ]),
+            ),
+            (
+                "objects",
+                some(
+                    (0..30)
+                        .map(|i: i32| {
+                            Bson::Document(doc! {"a": i, "b": "s".repeat((i % 3) as usize)})
+                        })
+                        .collect(),
+                ),
+            ),
+            (
+                "objects_growing",
+                some(
+                    (0..6)
+                        .flat_map(|_| {
+                            [
+                                doc! {"a": 1},
+                                doc! {"a": 2, "b": 1},
+                                doc! {"b": 2},
+                                doc! {"a": 3, "c": {"d": 1}},
+                            ]
+                        })
+                        .map(Bson::Document)
+                        .collect(),
+                ),
+            ),
+            (
+                "objects_nested",
+                some(
+                    (0..25)
+                        .map(|i| {
+                            Bson::Document(
+                                doc! {"x": {"y": i, "z": [i, i + 1]}, "w": i as f64 * 0.5},
+                            )
+                        })
+                        .collect(),
+                ),
+            ),
+            (
+                "objects_empty",
+                some(vec![
+                    Bson::Document(doc! {}),
+                    Bson::Document(doc! {"a": {}}),
+                    Bson::Document(doc! {"a": 1}),
+                    Bson::Document(doc! {}),
+                ]),
+            ),
+            (
+                "objects_to_scalar",
+                some(vec![
+                    Bson::Document(doc! {"a": 1}),
+                    Bson::Document(doc! {"a": 2}),
+                    Bson::Document(doc! {"a": {"b": 1}}),
+                    Bson::Int32(3),
+                    Bson::Document(doc! {"a": 3}),
+                ]),
+            ),
+            (
+                "arrays",
+                some(
+                    (0..20)
+                        .map(|i| Bson::Array(vec![Bson::Int32(i), Bson::Int32(i + 1)]))
+                        .chain([
+                            Bson::Array(vec![Bson::Int32(1)]),
+                            Bson::Array(vec![]),
+                            Bson::Array((1..5).map(Bson::Int32).collect()),
+                        ])
+                        .collect(),
+                ),
+            ),
+        ];
+        let skips = |v: Vec<Option<Bson>>, every: usize| -> Vec<Option<Bson>> {
+            v.into_iter()
+                .enumerate()
+                .map(|(i, x)| if i % every == 1 { None } else { x })
+                .collect()
+        };
+        let mut with_skips = Vec::new();
+        for (label, values) in &series {
+            with_skips.push((*label, skips(values.clone(), 3)));
+        }
+        series.push(("sparse", {
+            let mut v = vec![Some(Bson::Int32(1)), None, Some(Bson::Int32(3)), None, None];
+            v.extend(std::iter::repeat_n(None, 70));
+            v.push(Some(Bson::Int32(9)));
+            v
+        }));
+        series.push(("skips_first", {
+            let mut v: Vec<Option<Bson>> = std::iter::repeat_n(None, 65).collect();
+            v.extend([Some(Bson::Double(2.5)), Some(Bson::Double(3.5))]);
+            v
+        }));
+        series.push((
+            "mixed_types",
+            some(vec![
+                Bson::Int32(1),
+                Bson::String("x".into()),
+                Bson::Double(2.5),
+                Bson::Document(doc! {"a": 1}),
+                Bson::Int64(4),
+                Bson::Document(doc! {"a": 2}),
+                Bson::Null,
+            ]),
+        ));
+        for (label, values) in series.iter().chain(with_skips.iter()) {
+            round_trip(label, values);
+        }
+    }
+
+    #[test]
+    fn a_damaged_column_is_refused() {
+        assert_eq!(decode(&[]).unwrap_err().code, 6067609);
+        // Values, but no closing EOO.
+        assert!(decode(&unhex("1000000000")).is_err());
+        // Bytes after the closing EOO.
+        assert_eq!(
+            decode(&unhex("10000000000000ff")).unwrap_err().code,
+            7482200
+        );
+        // A Simple-8b run that runs past the end.
+        assert!(decode(&unhex("10000000000080")).is_err());
     }
 
     #[test]
