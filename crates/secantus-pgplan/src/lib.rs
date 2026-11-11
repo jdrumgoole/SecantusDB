@@ -42423,8 +42423,8 @@ pub(crate) fn eval_binary(op: &str, lhs: Bson, rhs: Bson) -> Result<Bson> {
         if matches!(&lhs, Bson::Array(_)) ^ matches!(&rhs, Bson::Array(_)) {
             return Err(Error::UndefinedFunction(format!(
                 "operator does not exist: {} {op} {}",
-                inferred_type(&lhs),
-                inferred_type(&rhs)
+                display_type(inferred_type(&lhs)),
+                display_type(inferred_type(&rhs))
             )));
         }
         // `time` has no comparison with `timetz` or `interval` of its own:
@@ -48969,8 +48969,8 @@ fn lower_aexpr(e: &AExpr, def: &TableDef, params: &[Bson]) -> Result<Document> {
         if !coltype.map(|t| t.ends_with("[]")).unwrap_or(false) {
             return Err(Error::UndefinedFunction(format!(
                 "operator does not exist: {} {op} {}",
-                coltype.unwrap_or("text"),
-                inferred_type(&value)
+                display_type(coltype.unwrap_or("text")),
+                display_type(inferred_type(&value))
             )));
         }
     }

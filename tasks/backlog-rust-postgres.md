@@ -3243,20 +3243,6 @@ statement is VALUES-only and runs there as written. The gap tests are in
       Verify: tests/backlog/test_rp_found_rp732.py::test_a_cast_over_a_case_of_literals_reports_no_position
       Backlog-ID: RP-746
 
-## Found while working RP-740 (2026-11-09)
-
-Measured on PostgreSQL 15.19 (the shared reference on port 5415).
-
-- [ ] **A scalar compared with an array value names the types by their
-      internal names.** `select 1 = (select array[1])`, `select x = y from
-      (values (1, array[1])) v(x, y)` and `select 1 = any (select
-      array[1])` are each 42883 `operator does not exist: integer =
-      integer[]` on PostgreSQL 15.19; here the message reads `int4 =
-      int4[]`: the per-row evaluation's mismatch prints `inferred_type`
-      without `display_type`.
-      Verify: tests/backlog/test_rp_found_rp722.py::test_a_scalar_against_an_array_value_names_its_types
-      Backlog-ID: RP-742
-
 ## Found while working RP-698 (2026-11-10)
 
 Measured on PostgreSQL 15.19 (the shared reference on port 5415).

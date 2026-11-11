@@ -412,15 +412,23 @@ def test_any_and_all_compare_with_the_arrays_elements(
     assert _answer(shapes, query) == answer
 
 
-@pytest.mark.backlog("RP-742")
+@pytest.mark.backlog_fixed("RP-742")
 @pytest.mark.parametrize(
-    "query",
+    ("query", "message"),
     [
-        "select 1 = (select array[1])",
-        "select x = y from (values (1, array[1])) v(x, y)",
-        "select 1 = any (select array[1])",
+        ("select 1 = (select array[1])", "integer = integer[]"),
+        ("select x = y from (values (1, array[1])) v(x, y)", "integer = integer[]"),
+        ("select 1 = any (select array[1])", "integer = integer[]"),
+        ("select (select array[1]) = 1", "integer[] = integer"),
+        ("select 'a'::text = (select array['a'::text])", "text = text[]"),
+        ("select 1.5 < (select array[1.5])", "numeric < numeric[]"),
+        ("select 1::int8 <> (select array[1::int8])", "bigint <> bigint[]"),
+        ("select true = (select array[true])", "boolean = boolean[]"),
     ],
 )
-def test_a_scalar_against_an_array_value_names_its_types(query: str, dsn: str) -> None:
-    """PostgreSQL 15.19 names `integer` and `integer[]`, not `int4`."""
-    assert _answer(dsn, query) == ("42883", "operator does not exist: integer = integer[]")
+def test_a_scalar_against_an_array_value_names_its_types(
+    query: str, message: str, dsn: str
+) -> None:
+    """PostgreSQL 15.19 named the SQL types (`integer`, `integer[]`); the
+    per-row mismatch printed the internal `int4` until RP-742."""
+    assert _answer(dsn, query) == ("42883", f"operator does not exist: {message}")
