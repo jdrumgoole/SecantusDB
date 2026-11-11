@@ -92,10 +92,11 @@ def test_a_domain_error_quotes_a_name_that_needs_it(dsn: str) -> None:
 
 
 # `ruleutils` prints a constant's cast by `format_type_with_typemod` of the
-# Const's type, `bpchar` for a `char(n)` column's coerced DEFAULT (the
-# typmod sits on the length-coercion, which the constant was folded
-# through). Here it prints the SQL spelling `character`.
-@pytest.mark.backlog("RP-846")
+# Const's type with its modifier, -1, so `bpchar` for a `char(n)` column's
+# DEFAULT (the column's modifier sits on the implicit length coercion,
+# which ruleutils does not print). It printed the SQL spelling `character`
+# until RP-846.
+@pytest.mark.backlog_fixed("RP-846")
 def test_a_char_columns_default_casts_to_bpchar(dsn: str) -> None:
     got = _answers(
         dsn,

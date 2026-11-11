@@ -3554,15 +3554,41 @@ m "Mx839")` and `z839(o char(4) default 'ab', v varchar(3) default 'q')`.
       s."int" violates ...` on 15.19 and `s.int` here (found working RP-553).
       Verify: tests/backlog/test_rp_found_rp839.py::test_a_domain_error_quotes_a_name_that_needs_it
       Backlog-ID: RP-845
-- [ ] **A `char(n)` column's DEFAULT prints its cast as `::character`.**
-      `information_schema.columns.column_default` and `pg_get_expr(adbin,
-      adrelid)` of `o char(4) default 'ab'` are `'ab'::bpchar` on
-      PostgreSQL 15.19 (`get_const_expr` prints the folded constant's
-      type by `format_type_with_typemod` with no modifier, `bpchar`); here
-      they are `'ab'::character`. A `varchar(3)` column's `'q'::character
-      varying` already agrees.
-      Verify: tests/backlog/test_rp_found_rp839.py::test_a_char_columns_default_casts_to_bpchar
-      Backlog-ID: RP-846
+
+## Found while working RP-846 (2026-11-11)
+
+Measured on a private, freshly initdb'd PostgreSQL 15.19 cluster with the
+`_SETUP` in `tests/backlog/test_rp_found_rp846.py`, the session's TimeZone
+`UTC`. Both answers come from `information_schema.columns.column_default`
+and `pg_get_expr(adbin, adrelid)`, which this server renders by one
+function, `default_expression`, from the folded value rather than from a
+stored expression tree.
+
+- [ ] **A DEFAULT written as an explicit cast with a modifier drops the
+      modifier.** `e char(4) default 'ab'::char(4)` and `e2 varchar(5)
+      default 'ab'::varchar(5)` are `'ab'::character(4)` and
+      `'ab'::character varying(5)` on PostgreSQL 15.19: the explicit cast
+      is a length coercion marked COERCE_EXPLICIT_CAST, which ruleutils
+      prints with its modifier. Here they are `'ab'::bpchar` and
+      `'ab'::character varying`, as an implicit coercion of a bare literal
+      prints: the explicit cast's modifier is not kept with the folded
+      value.
+      Verify: tests/backlog/test_rp_found_rp846.py::test_an_explicit_cast_default_keeps_its_modifier
+      Backlog-ID: RP-863
+- [ ] **A `timestamp`, `timestamptz`, `interval` or `bytea` DEFAULT prints
+      its internal form.** `ts timestamp(2) default '2020-01-01'` is
+      `'2020-01-01 00:00:00'::timestamp without time zone` on PostgreSQL
+      15.19, `timestamptz default '2020-01-01 00:00:00+00'`
+      `'2020-01-01 00:00:00+00'::timestamp with time zone`, `interval
+      default '1 day'` `'1 day'::interval` and `bytea default '\x01'`
+      `'\x01'::bytea`. Here they are `DateTime("2020-01-01 0:00:00.0
+      +00:00:00")`, `{ "__ivl_mon": 0, "__ivl_day": 1, "__ivl_us": 0 }` and
+      `Binary(0x0, AQ==)`: `default_expression` formats a non-string
+      stored value with `Bson`'s `Display`, where `get_const_expr` uses the
+      type's output function (a timestamptz in the session's TimeZone),
+      quoted and labelled.
+      Verify: tests/backlog/test_rp_found_rp846.py::test_a_temporal_or_bytea_default_prints_as_a_literal
+      Backlog-ID: RP-864
 
 ## Found while working RP-692 (2026-11-10)
 

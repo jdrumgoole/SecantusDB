@@ -5559,6 +5559,40 @@ def test_literal_column_defaults(home: Path) -> None:
         assert cur.fetchone() == (7, "x")
 
 
+def test_a_literal_defaults_cast_names_its_type_without_a_modifier(home: Path) -> None:
+    """ruleutils labels a literal DEFAULT by `format_type_with_typemod` of the
+    constant's type, whose modifier is -1 (the column's sits on the implicit
+    length coercion it does not print): `bpchar` and `"bit"`, which would
+    read back as `character(1)` and `bit(1)` spelled the SQL way (RP-846).
+    Measured on a freshly initdb'd PostgreSQL 15.19."""
+    with _Server(home) as server, server.connect() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "create table fp_dm (o char(4) default 'ab', g char(4)[] default '{a}',"
+            " h char default 'a', b bit(3) default B'101', v varchar(3) default 'q',"
+            " c \"char\" default 'x')"
+        )
+        want = [
+            ("o", "'ab'::bpchar"),
+            ("g", "'{a}'::bpchar[]"),
+            ("h", "'a'::bpchar"),
+            ("b", "'101'::\"bit\""),
+            ("v", "'q'::character varying"),
+            ("c", "'x'::\"char\""),
+        ]
+        cur.execute(
+            "select column_name, column_default from information_schema.columns"
+            " where table_name = 'fp_dm' order by ordinal_position"
+        )
+        assert cur.fetchall() == want
+        cur.execute(
+            "select a.attname, pg_get_expr(d.adbin, d.adrelid) from pg_attrdef d"
+            " join pg_attribute a on a.attrelid = d.adrelid and a.attnum = d.adnum"
+            " where d.adrelid = 'fp_dm'::regclass order by d.adnum"
+        )
+        assert cur.fetchall() == want
+
+
 def test_constant_where_on_a_from_less_select(home: Path) -> None:
     """With no FROM, a WHERE is a constant predicate on the one row: false or
     NULL is zero rows (the predicate used to be ignored), a non-boolean is
