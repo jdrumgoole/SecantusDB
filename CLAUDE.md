@@ -220,6 +220,17 @@ engines.
 - **Ad-hoc reproducers and cross-driver smokes use `127.0.0.1:27018`** (clear of a real `mongod` on 27017; gauges use ephemeral ports).
 - Python 3.12 pinned via `.python-version`. Managed with `uv`. Always invoke Python via `uv run python -m ...` so `pyenv` doesn't intercept.
 - Build/admin tasks: `tasks.py` (`invoke`). `invoke test`, `invoke lint`, `invoke fmt`, `invoke docs`, `invoke serve`.
+- **Use the graphify code graph to save tokens, and refresh it at every
+  session start** (Joe, 2026-11-11). `graphify update .` in the main checkout
+  re-extracts changed code with no LLM, in under a minute (`start-session`
+  step 1a). Before reading files broadly to answer a structural question --
+  what calls X, how A reaches B, what a symbol does -- ask the graph first:
+  `graphify query "..." --budget 1500`, `graphify explain "<symbol>"`,
+  `graphify path "A" "B"` (from a worktree, add `--graph
+  /Users/jdrumgoole/GIT/SecantusDB/graphify-out/graph.json`). For a literal
+  string -- an error message, a SQLSTATE, a function name -- grep is cheaper
+  and exact: a query for the GROUP BY constant check returned MongoDB nodes.
+  A graph you could not refresh is not current; say so and use grep.
 - **Admin-UI screenshots are generated, never hand-captured** (`invoke
   admin-screenshots`), and regenerated on every release. Details: the
   `secantusdb-release` skill.
