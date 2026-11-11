@@ -15356,6 +15356,112 @@ impl PgHandler {
         Ok(())
     }
 
+    /// What a DROP TABLE of `table` reaches, its partitions `children`
+    /// aside, and what else the statement drops (`dropping`) aside.
+    fn table_dependants(
+        &self,
+        table: &str,
+        children: &[String],
+        dropping: &[String],
+    ) -> PgWireResult<TableDependants> {
+        let fks: Vec<(TableDef, secantus_pgcatalog::ForeignKey)> = self
+            .referencing_keys(table)?
+            .into_iter()
+            .filter(|(child, _)| child.name != table && !dropping.contains(&child.name))
+            .collect();
+        // The views and materialized views over it, and over those, depth
+        // first (RP-525).
+        let mut seen = vec![table.to_string()];
+        seen.extend(children.iter().cloned());
+        let views = self.rule_dependents("table", table, &mut seen)?;
+        // Inheritance children (and theirs) depend on it too.
+        let mut kids: Vec<(String, String)> = Vec::new();
+        let mut stack = vec![table.to_string()];
+        let defs = self.all_table_defs()?;
+        while let Some(p) = stack.pop() {
+            for d in &defs {
+                if Self::inherited_parents(d).contains(&p)
+                    && !kids.iter().any(|(k, _)| *k == d.name)
+                    && !dropping.contains(&d.name)
+                {
+                    kids.push((d.name.clone(), p.clone()));
+                    stack.push(d.name.clone());
+                }
+            }
+        }
+        // The routines and casts over its row type come first: that type is
+        // made with the table (RP-546).
+        let mut row_type = self.row_type_dependents(table)?;
+        // Each view, then what names ITS row type (RP-568).
+        let table_lines = row_type.lines.clone();
+        let view_lines = self.reader_lines(&views, &mut row_type)?;
+        let objects: Vec<(String, String)> = table_lines
+            .into_iter()
+            .chain(
+                kids.iter()
+                    .map(|(k, p)| (format!("table {k}"), format!("table {p}"))),
+            )
+            .chain(fks.iter().map(|(child, fk)| {
+                (
+                    format!("constraint {} on table {}", fk.name, child.name),
+                    format!("table {table}"),
+                )
+            }))
+            .chain(view_lines)
+            .collect();
+        Ok(TableDependants {
+            fks,
+            views,
+            kids,
+            row_type,
+            objects: row_type_depends::last_reached(objects),
+        })
+    }
+
+    /// A RESTRICT DROP TABLE naming more than one table that exists is one
+    /// `performMultipleDeletions`: `reportDependentObjects` refuses the whole
+    /// statement under `cannot drop desired object(s)`, its DETAIL reading
+    /// `targetObjects` backwards -- the last table's dependants first, and an
+    /// object two of them reach named once, under the first table that
+    /// reaches it (RP-564). One table keeps its own name in the headline,
+    /// which the drop itself reports.
+    fn refuse_multi_table_drop(&self, present: &[String], dropping: &[String]) -> PgWireResult<()> {
+        let existing: Vec<&String> = present
+            .iter()
+            .filter(|t| self.lookup(t).is_some())
+            .collect();
+        if existing.len() < 2 {
+            return Ok(());
+        }
+        let mut lines: Vec<(String, String)> = Vec::new();
+        for table in existing.into_iter().rev() {
+            let children: Vec<String> = self
+                .partitions_of(table)?
+                .into_iter()
+                .map(|c| c.name)
+                .collect();
+            lines.extend(self.table_dependants(table, &children, dropping)?.objects);
+        }
+        let lines = row_type_depends::last_reached(lines);
+        if lines.is_empty() {
+            return Ok(());
+        }
+        let mut info = ErrorInfo::new(
+            "ERROR".into(),
+            "2BP01".into(), // dependent_objects_still_exist
+            "cannot drop desired object(s) because other objects depend on them".into(),
+        );
+        info.detail = Some(
+            lines
+                .iter()
+                .map(|(o, on)| format!("{o} depends on {on}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        );
+        info.hint = Some("Use DROP ... CASCADE to drop the dependent objects too.".into());
+        Err(PgWireError::UserError(Box::new(info)))
+    }
+
     /// Every view: `(name, stored definition)`, name-sorted, with this
     /// transaction's uncommitted creates and drops applied.
     /// `pg_get_constraintdef` for every constraint, keyed by the synthetic oid
@@ -26569,6 +26675,18 @@ const HIDDEN_SETTINGS: [&str; 6] = [
     "ssl_renegotiation_limit",
     "default_with_oids",
 ];
+
+/// What a DROP TABLE of one table reaches: the other tables' foreign keys
+/// referencing it, the views over it, its inheritance children `(child,
+/// parent)`, what names its row type, and the 2BP01 DETAIL's `(object,
+/// what it depends on)` lines, in `reportDependentObjects` order.
+struct TableDependants {
+    fks: Vec<(TableDef, secantus_pgcatalog::ForeignKey)>,
+    views: Vec<RuleDependent>,
+    kids: Vec<(String, String)>,
+    row_type: row_type_depends::RowTypeDependents,
+    objects: Vec<(String, String)>,
+}
 
 /// One reader `rule_dependents` found: a view or materialized view `key`
 /// and the relation `on_key` (of `on_kind`) it depends on.
@@ -44311,6 +44429,9 @@ impl PgHandler {
                     drop_kind::RelKind::Table
                 };
                 let present = self.check_drop_kinds(&drop.tables, right, drop.if_exists)?;
+                if !drop.cascade {
+                    self.refuse_multi_table_drop(&present, &drop.tables)?;
+                }
                 for table in &present {
                     // `heap_drop_with_catalog`: as a TRUNCATE does.
                     self.ssi_table_write(table)?;
@@ -44338,54 +44459,13 @@ impl PgHandler {
                     // views), in PostgreSQL's order. RESTRICT refuses;
                     // CASCADE drops the views and the constraints.
                     if self.lookup(table).is_some() {
-                        let fks: Vec<(TableDef, secantus_pgcatalog::ForeignKey)> = self
-                            .referencing_keys(table)?
-                            .into_iter()
-                            .filter(|(child, _)| {
-                                child.name != *table && !drop.tables.contains(&child.name)
-                            })
-                            .collect();
-                        // The views and materialized views over it, and over
-                        // those, depth first (RP-525).
-                        let mut seen = vec![table.clone()];
-                        seen.extend(children.iter().cloned());
-                        let views = self.rule_dependents("table", table, &mut seen)?;
-                        // Inheritance children (and theirs) depend on it too.
-                        let mut kids: Vec<(String, String)> = Vec::new();
-                        let mut stack = vec![table.clone()];
-                        let defs = self.all_table_defs()?;
-                        while let Some(p) = stack.pop() {
-                            for d in &defs {
-                                if Self::inherited_parents(d).contains(&p)
-                                    && !kids.iter().any(|(k, _)| *k == d.name)
-                                    && !drop.tables.contains(&d.name)
-                                {
-                                    kids.push((d.name.clone(), p.clone()));
-                                    stack.push(d.name.clone());
-                                }
-                            }
-                        }
-                        // The routines and casts over its row type come
-                        // first: that type is made with the table (RP-546).
-                        let mut row_type = self.row_type_dependents(table)?;
-                        // Each view, then what names ITS row type (RP-568).
-                        let table_lines = row_type.lines.clone();
-                        let view_lines = self.reader_lines(&views, &mut row_type)?;
-                        let objects: Vec<(String, String)> = table_lines
-                            .into_iter()
-                            .chain(
-                                kids.iter()
-                                    .map(|(k, p)| (format!("table {k}"), format!("table {p}"))),
-                            )
-                            .chain(fks.iter().map(|(child, fk)| {
-                                (
-                                    format!("constraint {} on table {}", fk.name, child.name),
-                                    format!("table {table}"),
-                                )
-                            }))
-                            .chain(view_lines)
-                            .collect();
-                        let objects = row_type_depends::last_reached(objects);
+                        let TableDependants {
+                            fks,
+                            views,
+                            kids,
+                            row_type,
+                            objects,
+                        } = self.table_dependants(table, &children, &drop.tables)?;
                         if !objects.is_empty() {
                             if !drop.cascade {
                                 let mut info = ErrorInfo::new(

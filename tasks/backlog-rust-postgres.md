@@ -2259,13 +2259,6 @@ tests are in `tests/backlog/test_rp_found_rp546.py`.
       `other objects depend on it`. With no routine it already matches.
       Backlog-ID: RP-562
       Verify: tests/backlog/test_rp_found_rp546.py::test_drop_type_of_a_row_type_with_a_routine
-- [ ] **A DROP TABLE of several tables is refused under the first one's
-      name.** PostgreSQL 15.19's `reportDependentObjects` says `cannot drop
-      desired object(s) because other objects depend on them` when the DROP
-      names more than one object; here `drop table m564a, m564b` is `cannot
-      drop table m564a because ...`, each table being dropped on its own.
-      Backlog-ID: RP-564
-      Verify: tests/backlog/test_rp_found_rp546.py::test_multi_table_drop_refusal_headline
 - [ ] **A routine over a temporary table's row type names no type.** On
       PostgreSQL 15.19 `create function tf565(tt565)` over a temp table has
       `proargtypes` `{tt565}`, and `drop table tt565` is 2BP01 naming it.
@@ -2280,6 +2273,21 @@ tests are in `tests/backlog/test_rp_found_rp546.py`.
       `pg_describe_object` of a routine shares that text.
       Backlog-ID: RP-567
       Verify: tests/backlog/test_rp_found_rp546.py::test_regprocedure_quotes_as_format_procedure
+
+## Found while working RP-564 (2026-11-11)
+
+Measured on a private PostgreSQL 15.19 cluster. The gap test is in
+`tests/backlog/test_rp_found_rp546.py`.
+
+- [ ] **A DROP TABLE CASCADE of several tables sends one notice per
+      table.** PostgreSQL 15.19's `performMultipleDeletions` reports the
+      whole statement once: `drop table n564a, n564b cascade` is one
+      `drop cascades to 5 other objects`, the last table's dependants
+      first. Here each table is dropped on its own and sends its own
+      notice (`... 3 other objects`, then `... 2 other objects`). RESTRICT
+      already refuses the statement as one since RP-564.
+      Verify: tests/backlog/test_rp_found_rp546.py::test_multi_table_drop_cascade_notice
+      Backlog-ID: RP-858
 
 ## Found while working RP-527 (2026-11-08)
 

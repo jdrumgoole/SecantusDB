@@ -1,5 +1,6 @@
 """Gap tests of what was found while working RP-546 (a function over a
-table's row type depends on the table): RP-560 .. RP-568.
+table's row type depends on the table): RP-560 .. RP-568, and RP-858,
+found while working RP-564.
 
 An answer is the rows, `"ok"` for a statement with none, or `(sqlstate,
 message, detail)` for an error. The expected answers were measured on a
@@ -146,9 +147,9 @@ def test_drop_type_names_a_routine_as_format_procedure(dsn: str) -> None:
 
 
 # `reportDependentObjects` names the one object dropped, or, when the DROP
-# names several, says `desired object(s)`. Here a two-table DROP TABLE is
+# names several, says `desired object(s)`. A two-table DROP TABLE was
 # refused under the first table's name.
-@pytest.mark.backlog("RP-564")
+@pytest.mark.backlog_fixed("RP-564")
 def test_multi_table_drop_refusal_headline(dsn: str) -> None:
     with psycopg.connect(dsn, autocommit=True) as c:
         c.execute("drop table if exists m564a, m564b cascade")
@@ -163,6 +164,91 @@ def test_multi_table_drop_refusal_headline(dsn: str) -> None:
         "2BP01",
         "cannot drop desired object(s) because other objects depend on them",
         "function k564(m564b,m564a) depends on type m564a",
+    )
+
+
+# The several-table refusal's DETAIL reads `targetObjects` backwards: the
+# last table named's dependants first, and the routine over both under the
+# table named first. An IF EXISTS list with one table present keeps that
+# table's name.
+@pytest.mark.backlog_fixed("RP-564")
+def test_multi_table_drop_detail_order(dsn: str) -> None:
+    with psycopg.connect(dsn, autocommit=True) as c:
+        c.execute("drop table if exists n564a, n564b cascade")
+        c.execute("create table n564a (a int)")
+        c.execute("create table n564b (a int)")
+        c.execute("create function k564n(n564b, n564a) returns int language sql as $$ select 1 $$")
+        c.execute("create view n564va as select * from n564a")
+        c.execute("create view n564vb as select * from n564b")
+        c.execute("create function kb564(n564b) returns int language sql as $$ select 1 $$")
+        c.execute("create function ka564(n564a) returns int language sql as $$ select 1 $$")
+        try:
+            got = [
+                _run(c, "drop table n564a, n564b"),
+                _run(c, "drop table n564b, n564a"),
+                _run(c, "drop table if exists nosuch564, n564a"),
+            ]
+        finally:
+            c.execute("drop table if exists n564a, n564b cascade")
+    many = "cannot drop desired object(s) because other objects depend on them"
+    assert got == [
+        (
+            "2BP01",
+            many,
+            "function kb564(n564b) depends on type n564b\n"
+            "view n564vb depends on table n564b\n"
+            "function k564n(n564b,n564a) depends on type n564a\n"
+            "function ka564(n564a) depends on type n564a\n"
+            "view n564va depends on table n564a",
+        ),
+        (
+            "2BP01",
+            many,
+            "function ka564(n564a) depends on type n564a\n"
+            "view n564va depends on table n564a\n"
+            "function k564n(n564b,n564a) depends on type n564b\n"
+            "function kb564(n564b) depends on type n564b\n"
+            "view n564vb depends on table n564b",
+        ),
+        _refused(
+            "n564a",
+            "function k564n(n564b,n564a) depends on type n564a",
+            "function ka564(n564a) depends on type n564a",
+            "view n564va depends on table n564a",
+        ),
+    ]
+
+
+# A CASCADE DROP TABLE of several tables is one `performMultipleDeletions`
+# and so one notice, the last table's dependants first. Here each table is
+# dropped on its own, each with its own notice.
+@pytest.mark.backlog("RP-858")
+def test_multi_table_drop_cascade_notice(dsn: str) -> None:
+    notices: list[tuple[str | None, str | None]] = []
+    with psycopg.connect(dsn, autocommit=True) as c:
+        c.execute("drop table if exists p858a, p858b cascade")
+        c.execute("create table p858a (a int)")
+        c.execute("create table p858b (a int)")
+        c.execute("create function k858(p858b, p858a) returns int language sql as $$ select 1 $$")
+        c.execute("create view p858va as select * from p858a")
+        c.execute("create view p858vb as select * from p858b")
+        c.add_notice_handler(
+            lambda d: notices.append((d.message_primary, d.message_detail)),
+        )
+        try:
+            got = (_run(c, "drop table p858a, p858b cascade"), list(notices))
+        finally:
+            c.execute("drop table if exists p858a, p858b cascade")
+    assert got == (
+        "ok",
+        [
+            (
+                "drop cascades to 3 other objects",
+                "drop cascades to view p858vb\n"
+                "drop cascades to function k858(p858b,p858a)\n"
+                "drop cascades to view p858va",
+            )
+        ],
     )
 
 
