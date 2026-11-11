@@ -60,7 +60,7 @@ jobs:
         uses: ./.github/actions/cached-bun
 
       - name: Run nightly security review
-        uses: anthropics/claude-code-action@4036a180cf690f49529f5d8c79c998855287f590  # v1
+        uses: anthropics/claude-code-action@61a9c274fa7110a66dfafc1bbbced03833eb25fe  # v1
         with:
           path_to_bun_executable: ${{ steps.bun.outputs.path }}
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
