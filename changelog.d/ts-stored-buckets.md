@@ -85,6 +85,7 @@ the server now differs from mongod on two scenarios, down from five.
 - Filed RM-548: `listIndexes` of `system.buckets.<name>` shows a TTL or
   partial index as the collection keeps it, without mongod's single-field
   key, rewritten filter and `originalSpec`.
-- Filed RM-549 (decision needed): `serverStatus` has no `bucketCatalog`
-  section, and idle buckets never close under memory pressure. Both depend
-  on the bytes mongod's own structures allocate.
+- Filed RM-549: `serverStatus` has no `bucketCatalog` section, and idle
+  buckets never close under memory pressure. Both depend on the bytes
+  mongod's own structures allocate, which is to be modelled (decided
+  2026-11-11).

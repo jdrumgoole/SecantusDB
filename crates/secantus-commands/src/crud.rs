@@ -2292,6 +2292,16 @@ pub(crate) fn update_in(
         // A time-series collection's one update, of the meta field, is an
         // update of its buckets.
         if ts_fields.is_some() {
+            // The statement runs, and is profiled and logged as one.
+            statements.update(
+                db_name,
+                &coll,
+                spec,
+                n,
+                n_modified,
+                upserted.len(),
+                write_errors.len(),
+            );
             let collation = crate::util::effective_collation(storage, db_name, &coll, spec)
                 .ok()
                 .flatten();

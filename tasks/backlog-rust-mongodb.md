@@ -2666,12 +2666,12 @@ compressed column, placed by mongod's bucket catalog
       catalog's to report; `memoryUsage`, and so the expiry, is the bytes
       mongod's own C++ structures allocate through its tracking allocators,
       which this server does not make. Measured 2026-11-11.
-      **Decision needed (2026-11-11):** model `memoryUsage` (and the
-      expiry it drives) from the sizes of mongod's structures, or report
-      the section without it, or leave the section out until the
-      allocation accounting can be reproduced. The size limit's memory
-      accounting (`getCacheDerivedBucketMaxSize`, decided 2026-10-16) does
-      not depend on it and is built.
+      **Decided (Joe, 2026-11-11):** model mongod's accounting: charge each
+      bucket, its column builders, summaries, schema and the catalog's maps
+      the bytes mongod's structures allocate through its tracking
+      allocators, so `memoryUsage` and idle-bucket expiry follow mongod's.
+      The size limit's memory accounting (`getCacheDerivedBucketMaxSize`,
+      decided 2026-10-16) does not depend on it and is built.
       Verify: tests/backlog/test_rm_found_2026_11_11_rm088.py::test_server_status_reports_the_bucket_catalog
       Backlog-ID: RM-549
 - [ ] **RUST MongoDB server: a measurement holding a BSONColumn binary

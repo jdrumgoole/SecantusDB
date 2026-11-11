@@ -108,7 +108,7 @@ SCENARIOS = {
     # Every commit updates the one bucket.
     "small_batches": (
         {"timeField": "t", "metaField": "m"},
-        [[{"t": at(i / 600), "m": 1, "v": i, "w": "abcdefghijklmnopqrstuvwxyz" * 4}] for i in range(120)],
+        [[{"t": at(i / 600), "m": 1, "v": i, "w": "abcdefghij" * 10}] for i in range(120)],
     ),
     # A measurement earlier than the last one written makes the bucket
     # unsorted (control.version 3).
@@ -120,9 +120,7 @@ SCENARIOS = {
 
 
 @pytest.mark.parametrize("label", sorted(SCENARIOS))
-def test_buckets_are_stored_as_mongod_stores_them(
-    rust_mongo: Any, mongod: Any, label: str
-) -> None:
+def test_buckets_are_stored_as_mongod_stores_them(rust_mongo: Any, mongod: Any, label: str) -> None:
     ts, batches = SCENARIOS[label]
 
     def run(client: Any) -> tuple:

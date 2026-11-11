@@ -226,19 +226,27 @@ fn an_old_store_is_converted_on_open() {
             .insert(
                 "t",
                 "system.buckets.w",
-                vec![bson::to_vec(&doc! {"_id": bson::oid::ObjectId::new(), "control": {}}).unwrap()],
+                vec![
+                    bson::to_vec(&doc! {"_id": bson::oid::ObjectId::new(), "control": {}}).unwrap(),
+                ],
                 true,
             )
             .unwrap();
 
-        assert_eq!(secantus_commands::upgrade_time_series(adapter.as_ref()).unwrap(), 4);
+        assert_eq!(
+            secantus_commands::upgrade_time_series(adapter.as_ref()).unwrap(),
+            4
+        );
         assert!(adapter
             .find("t", "w", &Document::new(), None, None)
             .unwrap()
             .is_empty());
         assert_eq!(placed(&mut c), (vec![1, 3, 2, 4], vec![2, 1, 1]));
         // Done once: opening again converts nothing.
-        assert_eq!(secantus_commands::upgrade_time_series(adapter.as_ref()).unwrap(), 0);
+        assert_eq!(
+            secantus_commands::upgrade_time_series(adapter.as_ref()).unwrap(),
+            0
+        );
         assert_eq!(placed(&mut c), (vec![1, 3, 2, 4], vec![2, 1, 1]));
     });
 }
