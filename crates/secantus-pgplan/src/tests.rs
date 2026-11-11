@@ -6967,6 +6967,97 @@ fn a_check_constraint_is_coerced_to_boolean() {
     }
 }
 
+/// A system column other than `tableoid` in a CHECK is 42P10 where
+/// `scanNSItemForColumn` meets it (RP-816): after a missing column written
+/// before it, before an argument refused after it, and with no position
+/// under ALTER TABLE. Measured on PostgreSQL 15.19.
+#[test]
+fn a_system_column_in_a_check_constraint_is_refused() {
+    let refused =
+        |col: &str| format!("system column \"{col}\" reference in check constraint is invalid");
+    for (sql, state, want, at) in [
+        (
+            "create table c (x int check (xmin))",
+            "42P10",
+            refused("xmin"),
+            29,
+        ),
+        (
+            "create table c (x int check (xmin = '1'))",
+            "42P10",
+            refused("xmin"),
+            29,
+        ),
+        (
+            "create table c (x int, check (c.xmin = '1'))",
+            "42P10",
+            refused("xmin"),
+            30,
+        ),
+        (
+            "create table c (x int check (ctid is not null))",
+            "42P10",
+            refused("ctid"),
+            29,
+        ),
+        (
+            "create table c (x int check (cmin = cmax))",
+            "42P10",
+            refused("cmin"),
+            29,
+        ),
+        (
+            "create table c (x int check (xmin = '1' and y = 1))",
+            "42P10",
+            refused("xmin"),
+            29,
+        ),
+        (
+            "create table c (x int check ((xmin = '1') = x))",
+            "42P10",
+            refused("xmin"),
+            30,
+        ),
+        (
+            "create table c (x int check (y = 1 and xmin = '1'))",
+            "42703",
+            "column \"y\" does not exist".to_string(),
+            29,
+        ),
+        (
+            "create table c (x int check (x and xmin = '1'))",
+            "42804",
+            "argument of AND must be type boolean, not type integer".to_string(),
+            29,
+        ),
+    ] {
+        take_error_location();
+        let err = plan(sql, &lookup).expect_err("should refuse");
+        assert_eq!(err.sqlstate(), state, "for {sql} (got {err})");
+        assert_eq!(err.to_string(), want, "for {sql}");
+        assert_eq!(
+            crate::errpos::error_position(sql, state, &err.to_string()),
+            Some(at as usize + 1),
+            "for {sql}"
+        );
+    }
+    for (sql, col) in [
+        ("alter table t add check (xmin = '1')", "xmin"),
+        ("alter table t add constraint k check (xmax = '1')", "xmax"),
+    ] {
+        take_error_location();
+        let err = plan(sql, &lookup).expect_err("should refuse");
+        assert_eq!(err.sqlstate(), "42P10", "for {sql} (got {err})");
+        assert_eq!(err.to_string(), refused(col), "for {sql}");
+        assert_eq!(
+            crate::errpos::error_position(sql, "42P10", &err.to_string()),
+            None,
+            "for {sql}"
+        );
+        take_error_location();
+    }
+}
+
 /// GRANT and REVOKE find their routine with `LookupFuncWithArgs`, which has
 /// no parse position: a signature no routine has is 42883 with none, as
 /// from DROP / ALTER / COMMENT (PostgreSQL 15.19, RP-520). A call's missing

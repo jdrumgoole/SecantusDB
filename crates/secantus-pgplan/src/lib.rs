@@ -12823,35 +12823,61 @@ pub fn resolve_fk_target(fk: &mut ForeignKey, target: &TableDef) -> Result<()> {
 /// its test's own 42804 (RP-811). `transformExpr` goes left to right and
 /// `coerce_to_boolean` of the whole runs after it, so a missing column
 /// written before the argument refused is the error, as it is whenever the
-/// whole expression is what is refused.
+/// whole expression is what is refused. A system column other than
+/// `tableoid` is refused where `scanNSItemForColumn` meets it, under
+/// `EXPR_KIND_CHECK_CONSTRAINT`: 42P10 `system column "xmin" reference in
+/// check constraint is invalid` at the reference (RP-816).
 fn cook_check(
     raw: &pg_query::protobuf::Node,
     expression: &str,
     name: &str,
     def: &TableDef,
 ) -> Result<()> {
+    // The column reference `transformExpr` refuses first, if any: a column
+    // the table lacks (42703) or a system column (42P10).
+    let column = |refused_at: Option<i32>, whole: bool| -> Result<()> {
+        match first_bad_column(raw, name, def) {
+            Some((at, system)) if whole || refused_at.is_none_or(|a| at < a) => match system {
+                Some(col) => {
+                    set_error_location(at);
+                    Err(Error::InvalidColumnReference(format!(
+                        "system column \"{col}\" reference in check constraint is invalid"
+                    )))
+                }
+                None => plan_check_expression(expression, def).map(drop),
+            },
+            _ => Ok(()),
+        }
+    };
     let Err(refused) = optype::check_constraint(raw, name, def) else {
+        column(None, true)?;
         return plan_check_expression(expression, def).map(drop);
     };
     let at = take_error_location();
     let whole =
         matches!(&refused, Error::DatatypeMismatch(m) if m.starts_with("argument of CHECK "));
-    let column_first =
-        first_missing_column(raw, name, def).is_some_and(|m| whole || at.is_none_or(|a| m < a));
-    if column_first {
-        plan_check_expression(expression, def)?;
-    }
+    column(at, whole)?;
     if let Some(a) = at {
         set_error_location(a);
     }
     Err(refused)
 }
 
-/// Where the first column reference in `raw` that names no column of the
-/// table `name` (`def`) is written, if one does.
-fn first_missing_column(raw: &pg_query::protobuf::Node, name: &str, def: &TableDef) -> Option<i32> {
+/// Where the first column reference in `raw` that a CHECK over the table
+/// `name` (`def`) cannot take is written: one naming no column of the table
+/// (`None`), or a system column other than `tableoid` (`Some(name)`).
+fn first_bad_column(
+    raw: &pg_query::protobuf::Node,
+    name: &str,
+    def: &TableDef,
+) -> Option<(i32, Option<String>)> {
+    let system = |c: &str| {
+        secantus_pgcatalog::SYSTEM_FIELDS
+            .iter()
+            .any(|(s, _, _)| *s == c)
+    };
     let known = |c: &str| def.column(c).is_some() || def.system_columns.iter().any(|s| s.name == c);
-    let mut first: Option<i32> = None;
+    let mut first: Option<(i32, Option<String>)> = None;
     walk_column_refs(&mut raw.clone(), &mut |_, c| {
         let parts: Vec<&str> = c
             .fields
@@ -12861,13 +12887,20 @@ fn first_missing_column(raw: &pg_query::protobuf::Node, name: &str, def: &TableD
                 _ => None,
             })
             .collect();
-        let missing = match parts.as_slice() {
-            [col] => !known(col),
-            [table, col] => *table != name || !known(col),
-            _ => false,
+        let (ours, col) = match parts.as_slice() {
+            [col] => (true, *col),
+            [table, col] => (*table == name, *col),
+            _ => return Ok(()),
         };
-        if missing && first.is_none_or(|f| c.location < f) {
-            first = Some(c.location);
+        let bad = if ours && system(col) {
+            Some(Some(col.to_string()))
+        } else {
+            (!ours || !known(col)).then_some(None)
+        };
+        if let Some(bad) = bad {
+            if first.as_ref().is_none_or(|(f, _)| c.location < *f) {
+                first = Some((c.location, bad));
+            }
         }
         Ok(())
     })

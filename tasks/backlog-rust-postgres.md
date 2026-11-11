@@ -3395,13 +3395,46 @@ and `create domain di811 as int`.
       gets no query text from ALTER TABLE); here it is placed at the `1`.
       Verify: tests/backlog/test_rp_found_rp811.py::test_alter_table_expressions_are_coerced_to_boolean
       Backlog-ID: RP-815
-- [ ] **A system column in a CHECK is 42703, not 42P10.** `create table
-      t811 (x int check (xmin))` is 42P10 `system column "xmin" reference in
-      check constraint is invalid` at 33 on PostgreSQL 15.19
-      (`cookConstraint` refuses any system column but `tableoid`); here it
-      is 42703 `column "xmin" does not exist`.
-      Verify: tests/backlog/test_rp_found_rp811.py::test_a_system_column_in_a_check_is_42p10
-      Backlog-ID: RP-816
+
+## Found while working RP-816 (2026-11-11)
+
+Measured on a private PostgreSQL 15.19 cluster.
+
+- [ ] **`tableoid` in a CHECK names no column.** `create table t816 (x int
+      check (tableoid::int > 0))` and `alter table c816 add constraint k
+      check (tableoid::int > 0)` create the constraint on PostgreSQL 15.19
+      (`scanNSItemForColumn` allows `tableoid`, alone of the system
+      columns, under `EXPR_KIND_CHECK_CONSTRAINT`), and `check (tableoid)`
+      is 42804 `argument of CHECK must be type boolean, not type oid` at
+      33. Here each is 42703 `column "tableoid" does not exist`: a SELECT's
+      `tableoid` is rewritten in `partitions.rs`, and a CHECK's row
+      evaluation has no `tableoid` to read.
+      Verify: tests/backlog/test_rp_found_rp816.py::test_tableoid_in_a_check_is_a_column
+      Backlog-ID: RP-859
+- [ ] **A whole-row reference in a CHECK is refused as unsupported.**
+      `create table t816 (x int check ((t816.*) is not null))` creates the
+      table on PostgreSQL 15.19; here it is 0A000 `this column is not
+      supported yet`.
+      Verify: tests/backlog/test_rp_found_rp816.py::test_a_whole_row_reference_in_a_check_is_taken
+      Backlog-ID: RP-860
+- [ ] **A CHECK takes another table's qualifier, and names a qualified
+      missing column without it.** `create table t816 (x int, check
+      (other.x = 1))` creates the table here; PostgreSQL 15.19 is 42P01
+      `missing FROM-clause entry for table "other"` at 34 (the CHECK's
+      range table holds only its own table). `check (t816.nosuch = 1)` is
+      42703 `column t816.nosuch does not exist` at 34 there
+      (`errorMissingColumn` names the qualifier, at the reference's start)
+      and `column "nosuch" does not exist` at 39 here.
+      Verify: tests/backlog/test_rp_found_rp816.py::test_a_checks_qualified_column_is_resolved_against_its_table
+      Backlog-ID: RP-861
+- [ ] **A system column in a generated column's expression is accepted.**
+      `create table t816 (x int, y int generated always as
+      (xmin::text::int) stored)` is 42P10 `cannot use system column "xmin"
+      in column generation expression` at 54 on PostgreSQL 15.19
+      (`scanNSItemForColumn` under `EXPR_KIND_GENERATED_COLUMN`, `tableoid`
+      allowed); here the table is created.
+      Verify: tests/backlog/test_rp_found_rp816.py::test_a_system_column_in_a_generated_column_is_42p10
+      Backlog-ID: RP-862
 
 ## Found while working RP-823 (2026-11-10)
 
