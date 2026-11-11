@@ -30,6 +30,8 @@ from pathlib import Path
 
 import pytest
 
+from tests.server_pipes import drain
+
 psycopg = pytest.importorskip("psycopg")
 
 REPO = Path(__file__).resolve().parents[1]
@@ -64,6 +66,7 @@ def dsn(tmp_path: Path) -> Iterator[str]:
         line = proc.stdout.readline() if proc.stdout else ""
         match = re.search(r"listening on \S+:(\d+)", line)
         assert match, f"secantusd-pg did not start: {line!r}"
+        drain(proc)
         yield f"host=127.0.0.1 port={match.group(1)} dbname=postgres user=postgres"
     finally:
         proc.terminate()

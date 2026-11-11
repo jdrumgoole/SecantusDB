@@ -27,6 +27,8 @@ except ImportError:  # pragma: no cover - Windows
 
 import pytest
 
+from tests.server_pipes import drain
+
 # These tests are disk-I/O bound end-to-end (real durable WiredTiger in the
 # binary, snapshot + restore): ~8s solo, but the documented contention factor
 # under a full parallel suite is 15-35x (see _restore), and with TWO suites on
@@ -238,22 +240,6 @@ def _read_banner_line(proc: subprocess.Popen, timeout: float = 120.0) -> str:
     return result["line"]
 
 
-def _drain(proc: subprocess.Popen) -> None:
-    """Keep reading both of the server's pipes once its banner is read.
-
-    Nothing else reads them before the test stops the server, and a pipe
-    nobody reads fills (64 KiB on Linux and macOS, about 4 KiB on Windows):
-    every server thread that logs then blocks on the write, so commands hang
-    and so does shutdown. The same deadlock failed
-    ``test_rust_binary_smoke.py`` on Windows (2026-11-11).
-    """
-    import threading
-
-    for pipe in (proc.stdout, proc.stderr):
-        if pipe is not None:
-            threading.Thread(target=lambda p=pipe: [None for _ in p], daemon=True).start()
-
-
 def test_rust_binary_v2_archive_base_snapshot_and_restore(tmp_path: pathlib.Path) -> None:
     """End-to-end PITR v2 on the Rust server: a server started with
     --oplog-archive-dir takes a base snapshot via secantusAdmin.archiveBaseSnapshot,
@@ -282,7 +268,7 @@ def test_rust_binary_v2_archive_base_snapshot_and_restore(tmp_path: pathlib.Path
     try:
         assert proc.stdout is not None
         line = _read_banner_line(proc)
-        _drain(proc)
+        drain(proc)
         m = _BANNER.search(line)
         assert m, f"no listening banner in: {line!r}"
         host, port = m.group(1), int(m.group(2))
