@@ -3297,7 +3297,11 @@ touched:
   interleaved. It must not get a wider budget, because 1.5 is what
   separates once per document from twice. The previous PG snapshot's run
   (2026-11-10 22:20) failed the same step on RM-417's test, also a timing
-  check.
+  check. It happened again on PR #2676 (run 42963914378, 2026-11-11
+  05:31), on the same first assertion: this time mongod's `findAndModify`
+  measured 1.593 against finds of 0.687, 0.391 and 0.731 s. That is one
+  fast round again: two of that batch's four PG snapshots (#2671, #2676)
+  went red on this test alone.
   Backlog-ID: RM-547
   Verify: none -- a timing flake in the reference server's own measurement under CI load
 
