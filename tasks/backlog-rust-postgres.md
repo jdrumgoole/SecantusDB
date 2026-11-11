@@ -3694,13 +3694,49 @@ statement is VALUES-only and runs there as written.
       and calls `check_stray` only for a query with no GROUP BY.
       Verify: tests/backlog/test_rp_found_rp700.py::test_an_ungrouped_column_beside_a_subquery_is_42803
       Backlog-ID: RP-853
-- [ ] **A GROUP BY constant that is no integer is not 42601.** `select 1
-      from (values (1)) v(a) group by 1.5` is 42601 `non-integer constant
-      in GROUP BY` at 42 on PostgreSQL 15.19 (`findTargetlistEntrySQL92`),
-      and so is a string, NULL or boolean constant there. Here each is
-      0A000 `this target is not supported yet`, with no position.
-      Verify: tests/backlog/test_rp_found_rp700.py::test_a_non_integer_group_by_constant_is_42601
-      Backlog-ID: RP-854
+
+## Found while working RP-854 (2026-11-11)
+
+Measured on PostgreSQL 15.19 (the shared reference on port 5415): every
+statement is VALUES-only and runs there as written. The gap tests are in
+`tests/backlog/test_rp_found_rp854.py`.
+
+- [ ] **An ORDER BY constant that is no integer is not 42601.** `select 1
+      from (values (1)) v(a) order by 2.5` is 42601 `non-integer constant
+      in ORDER BY` at 42 on PostgreSQL 15.19 (`findTargetlistEntrySQL92`),
+      and `select a ... group by a order by 'x'` the same at 53. Here the
+      first is 0A000 `ORDER BY over an expression is not supported yet` and
+      the second returns its row. The GROUP BY half is `group_sql92.rs`
+      (RP-854); a statement with both is answered for its GROUP BY
+      constant until this one is fixed, where PostgreSQL names the ORDER BY.
+      Verify: tests/backlog/test_rp_found_rp854.py::test_a_non_integer_order_by_constant_is_42601
+      Backlog-ID: RP-871
+- [ ] **A DISTINCT ON constant that is no integer returns rows.** `select
+      distinct on (1.5) a from (values (1)) v(a)` is 42601 `non-integer
+      constant in DISTINCT ON` at 21 on PostgreSQL 15.19, and so is a string
+      there. Here each returns its row: the constant is a key of one value.
+      Verify: tests/backlog/test_rp_found_rp854.py::test_a_non_integer_distinct_on_constant_is_42601
+      Backlog-ID: RP-872
+- [ ] **A GROUP BY position inside a grouping set or a parenthesised list
+      is grouped as a value.** `select a from (values (1), (2)) v(a) group
+      by rollup(1)` groups by `a` on PostgreSQL 15.19 (`flatten_grouping_sets`
+      flattens sets and an implicit row, and each integer in them is a
+      select-list position), and so do `grouping sets ((1), ())` and `select
+      a, a + 1 ... group by (1, 2)`. Here each is 42803 `column "a" must
+      appear in the GROUP BY clause`: `plan_aggregate` resolves a position
+      only at the top level, and pushes a set's or a row's elements as
+      expressions. A position past the select list there (`rollup(9)`) is
+      0A000, not 42P10 `GROUP BY position 9 is not in select list` at 49.
+      Verify: tests/backlog/test_rp_found_rp854.py::test_a_group_by_position_inside_a_set_or_list_is_a_position
+      Backlog-ID: RP-873
+- [ ] **A grouped query reports a column that does not exist as 42803.**
+      `select nosuch from (values (1)) v(a) group by a` is 42703 `column
+      "nosuch" does not exist` at 8 on PostgreSQL 15.19 (`transformColumnRef`,
+      while the select list is analysed, before `parseCheckAggregates`).
+      Here it is 42803 `column "nosuch" must appear in the GROUP BY clause or
+      be used in an aggregate function`, at the same place.
+      Verify: tests/backlog/test_rp_found_rp854.py::test_an_undefined_column_in_a_grouped_query_is_42703
+      Backlog-ID: RP-874
 
 ## Found while working RP-605 (2026-11-11)
 

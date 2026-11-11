@@ -34,6 +34,7 @@ mod expr_where;
 mod filter_sublink;
 mod fromless;
 mod functional_grouping;
+mod group_sql92;
 mod guc_args;
 pub mod hashagg;
 mod hashed_subplan;
@@ -27193,6 +27194,9 @@ fn plan_select(
 ) -> Result<Statement> {
     // A cancellation point at every pass: each rewrite below re-enters here.
     cancel::check()?;
+    // A GROUP BY constant that is no integer is 42601, after what parse
+    // analysis meets before it (RP-854).
+    group_sql92::check(s, &|cut| plan_select(cut, lookup, params))?;
     // `WITH` is shorthand for the FROM-subqueries below, so it is rewritten
     // away before any of the shape checks run -- every one of them would
     // otherwise have to know about it.

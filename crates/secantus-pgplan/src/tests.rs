@@ -410,6 +410,33 @@ fn order_by_a_non_grouped_column_is_refused() {
     assert_eq!(err.sqlstate(), "42803");
 }
 
+/// A GROUP BY constant that is no integer is PostgreSQL's 42601 at the
+/// constant (`findTargetlistEntrySQL92`), after what parse analysis meets
+/// first: the select list, and a GROUP BY item before it (RP-854).
+#[test]
+fn a_non_integer_group_by_constant_is_42601() {
+    for (sql, at) in [
+        ("SELECT count(*) FROM t GROUP BY 1.5", 32),
+        ("SELECT name FROM t GROUP BY name, 'x'", 34),
+        ("SELECT 1 FROM t GROUP BY -1.5", 25),
+        ("SELECT 1 FROM t GROUP BY rollup(name, NULL)", 38),
+        ("SELECT 1 GROUP BY true", 18),
+        ("SELECT name FROM t GROUP BY 1.5", 28),
+    ] {
+        take_error_location();
+        let err = plan(sql, &lookup).expect_err(sql);
+        assert_eq!(err.sqlstate(), "42601", "{sql}: {err}");
+        assert_eq!(err.to_string(), "non-integer constant in GROUP BY", "{sql}");
+        assert_eq!(take_error_location(), Some(at), "{sql}");
+    }
+    let err = plan("SELECT nosuch FROM t GROUP BY 1.5", &lookup).expect_err("must refuse");
+    assert_eq!(err.sqlstate(), "42703", "{err}");
+    let err = plan("SELECT 1 FROM t GROUP BY 9, 1.5", &lookup).expect_err("must refuse");
+    assert_eq!(err.sqlstate(), "42P10", "{err}");
+    // A constant under a cast or an operator is an expression.
+    plan("SELECT 1 FROM t GROUP BY 'x'::text", &lookup).expect("an expression key");
+}
+
 #[test]
 fn group_by_resolves_order_by_index() {
     match plan_ok("SELECT count(*) FROM t GROUP BY name ORDER BY name DESC") {
