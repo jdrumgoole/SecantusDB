@@ -345,7 +345,7 @@ Each unblocks rows that otherwise stay open.
 | mapReduce refusal (RM-027) | accepted; the Java and Kotlin gauge test is an expected failure |
 | Record ids (RM-083) | per-collection counters on disk, mongod's numbers |
 | Role order (RM-029) | a side table the Rust server alone writes |
-| Time-series size closing (RM-088) | model mongod's server-wide bucket catalog |
+| Time-series size closing (RM-088) | done 2026-11-11 (#2684): mongod's server-wide bucket catalog |
 | Collation (RM-091, RM-095) | done 2026-11-09: mongo's ICU 57.1, vendored and linked in place of ICU4X |
 | SBE explain (RM-071, RM-072) | transcribe mongod's stage builders and execute the slot programs |
 | Python-server compatibility | no longer a constraint, on-disk format included (`CLAUDE.md`) |
@@ -356,7 +356,7 @@ Each unblocks rows that otherwise stay open.
 | A schema change under an open transaction (RM-084) | model mongod's collection locks; DDL waits and answers 50 at `maxTimeMS` |
 | Privileges of the `secantusAdmin` commands | keep the mapping; scope decision (formerly RM-028) |
 | `explain` | mongod's plan; where the router reads differently, bring the router to the plan (RM-094) |
-| Stored time-series buckets (RM-088) | store real BSONColumn buckets, with the catalog above |
+| Stored time-series buckets (RM-088) | done 2026-11-11 (#2684): real BSONColumn buckets, with the catalog above; what is left is RM-457, RM-548, RM-549 |
 | Profiler and `Slow query` execution statistics (RM-023, done 2026-10-27) | counted during execution, with the streaming cursors; what is left is RM-355, RM-357 to RM-364 |
 | Wire compression | already speaks snappy, zstd and zlib (2026-10-15); add the `serverStatus` counters (RM-147) |
 | Server-side JavaScript | keep refusing; scope decision (formerly RM-009); the two Go `$where` leaves are expected failures |
@@ -369,7 +369,8 @@ rows for the hint wording, RM-058, RM-147, RM-081, role order (RM-029),
 test commands off everywhere, Rust first in the README and docs, the Linux
 heap measurement (RM-049), RM-084, streaming cursors with execution counts
 (RM-023), per-collection record ids (RM-083), ICU 57.1 (RM-091, RM-095),
-stored buckets with the catalog (RM-088), SBE (RM-071, RM-072).
+stored buckets with the catalog (RM-088, done 2026-11-11), SBE (RM-071,
+RM-072).
 
 ## Out of scope or accepted
 
