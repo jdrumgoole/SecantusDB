@@ -5411,6 +5411,8 @@ pub struct Storage {
     /// livelocks the engine — the same stall class the chunked inserts
     /// closed for plain batches, which chunking cannot close here.
     txn_dirty_limit: u64,
+    /// The WiredTiger cache size the connection was opened with, in bytes.
+    cache_bytes: u64,
     /// Which oplog shard tables this process has already created (bit per shard
     /// index) — see [`ensure_oplog_shard`]. Shared with the async drainers.
     oplog_shards_created: Arc<AtomicU32>,
@@ -8214,6 +8216,7 @@ impl Storage {
             options_cache: std::sync::RwLock::new(HashMap::new()),
             list_cache: std::sync::RwLock::new(HashMap::new()),
             txn_dirty_limit: (parse_cache_bytes(config) as f64 * 0.20 * 0.75) as u64,
+            cache_bytes: parse_cache_bytes(config),
             oplog_shards_created,
             ttl: TtlMonitor::default(),
             enable_oplog: true,
@@ -11002,6 +11005,12 @@ fn prune_oplog_rows(ctx: &PruneCtx, now: Option<i64>) -> Result<usize> {
 }
 
 impl Storage {
+    /// The WiredTiger cache size this store was opened with, in bytes:
+    /// what `mongod` sizes time-series buckets by.
+    pub fn cache_bytes(&self) -> u64 {
+        self.cache_bytes
+    }
+
     /// Append one `{op: "n", ns: "", o: {msg: "periodic noop"}}` heartbeat and
     /// return its seq — keeps a quiet collection's resume token advancing with
     /// cluster time. Mirrors `storage.emit_noop_heartbeat`.

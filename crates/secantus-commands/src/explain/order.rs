@@ -2017,6 +2017,18 @@ fn used_indexes(node: &Node, out: &mut Vec<String>) {
 
 /// `Storage::find_collated`, in mongod's order.
 pub(crate) fn find(storage: &dyn Storage, ask: &Ask) -> Result<Vec<Vec<u8>>, StorageError> {
+    // A time-series collection's measurements are in its buckets.
+    if let Some(found) = crate::ts_store::find(
+        storage,
+        ask.db,
+        ask.coll,
+        ask.filter,
+        ask.sort,
+        ask.collation,
+        ask.vars,
+    )? {
+        return Ok(found);
+    }
     match ordered_rows(storage, ask)? {
         Some(rows) => Ok(rows.into_iter().map(|(_, blob)| blob).collect()),
         None => storage.find_collated(

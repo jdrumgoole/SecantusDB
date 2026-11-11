@@ -1736,7 +1736,7 @@ fn facet_stage(
 /// `(path, reverse)` pairs from a sort spec. Each direction must be `1`/`-1`
 /// (ints or bools coerced as Python's `int(d)`); anything else (textScore meta,
 /// floats, ...) defers.
-pub(crate) fn sort_fields(spec: &Bson) -> R<Vec<(String, bool)>> {
+pub fn sort_fields(spec: &Bson) -> R<Vec<(String, bool)>> {
     let Bson::Document(d) = spec else {
         return Err(Fallback::Defer);
     };
@@ -1764,7 +1764,7 @@ pub(crate) fn sort_fields(spec: &Bson) -> R<Vec<(String, bool)>> {
 }
 
 /// The values a `$sort` on `fields` compares for `d`, one per field.
-pub(crate) fn sort_key_values(d: &Document, fields: &[(String, bool)]) -> R<Vec<Bson>> {
+pub fn sort_key_values(d: &Document, fields: &[(String, bool)]) -> R<Vec<Bson>> {
     // A sort on `_id` alone compares the whole value, an array as an array
     // (after documents), where any other sort takes an array's smallest
     // element: mongod 8.2.11 sorts a `$group`'s array keys `b, z, {x: 1},

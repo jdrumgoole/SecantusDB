@@ -1134,30 +1134,45 @@ pub fn insert(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         }
     }
 
-    // A time-series batch is placed in time order: mongod 8.2.11 sorts each
-    // meta value's measurements by time before it buckets them, so a batch
-    // that runs backwards in time shares a bucket where one-at-a-time
-    // inserts would not. The buckets here are derived from the order the
-    // measurements are stored in (`ts_buckets`), so the batch is stored
-    // sorted. An ordered batch that stopped at a bad measurement is placed
-    // one measurement at a time, as written (measured).
-    if ts_fields.is_some() && !(ordered && !pre_errors.is_empty()) {
-        let mut by_time: Vec<usize> = (0..surviving.len()).collect();
-        by_time.sort_by_key(|&i| times[i]);
-        let mut docs: Vec<Option<Vec<u8>>> = surviving.into_iter().map(Some).collect();
-        surviving = by_time
-            .iter()
-            .map(|&i| docs[i].take().unwrap_or_default())
-            .collect();
-        survivor_to_orig = by_time.iter().map(|&i| survivor_to_orig[i]).collect();
-    }
-
     // An ordered batch stops AT the pre-check failure; the documents before
     // it are inserted (see `insert_raw_path`).
     if surviving.is_empty() {
         return Ok(doc! { "n": 0_i32, "ok": 1.0, "writeErrors": bson_array(pre_errors) });
     }
 
+    // A time-series collection's measurements go into its buckets, through
+    // the bucket catalog, which splits the batch by meta value and sorts
+    // each part by time (mongod 8.2.11). An ordered batch that stopped at a
+    // bad measurement is placed one measurement at a time, as written
+    // (measured): mongod retries such a batch one by one.
+    if ts_fields.is_some() {
+        let mut measurements = Vec::with_capacity(surviving.len());
+        for (index, raw) in surviving.iter().enumerate() {
+            let doc = secantus_core::bsondoc::from_bytes(&raw[..])
+                .map_err(|e| CommandError::new(8, "UnknownError", e.to_string()))?;
+            measurements.push(crate::bucket_catalog::Measurement { index, doc });
+        }
+        let batches = if ordered && !pre_errors.is_empty() {
+            measurements.into_iter().map(|m| vec![m]).collect()
+        } else {
+            vec![measurements]
+        };
+        let outcomes = crate::ts_store::insert(storage, &db, &coll, batches)?;
+        let mut inserted = 0usize;
+        let mut errors: Vec<Document> = Vec::new();
+        for index in 0..surviving.len() {
+            match outcomes.get(&index) {
+                Some(Ok(())) => inserted += 1,
+                Some(Err(e)) => errors.push(doc! {
+                    "index": index as i32,
+                    "code": e.code,
+                    "errmsg": e.errmsg.clone(),
+                }),
+                None => {}
+            }
+        }
+        return insert_reply(inserted, errors, pre_errors, &survivor_to_orig, ordered);
+    }
     // A retryable write's inserts name their statements (RM-224).
     storage.set_insert_positions(Some(survivor_to_orig.clone()));
     let inserted = storage.insert(&db, &coll, surviving, ordered);
@@ -1624,7 +1639,19 @@ pub fn count(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     // Its stages (`execStats`, RM-359), and whether it read the record count.
     let mut stages: Option<Document> = None;
     let mut fast_count = false;
-    let mut n = if view_on.is_some() {
+    // A time-series collection counts the measurements its buckets unpack to.
+    let time_series = crate::ts_store::layout_of(storage, &ctx.db_name, &coll).is_some();
+    let mut n = if time_series && view_on.is_none() {
+        crate::ts_store::measurements(
+            storage,
+            &ctx.db_name,
+            &coll,
+            &filter,
+            &Document::new(),
+            collation.as_ref(),
+        )?
+        .len() as i64
+    } else if view_on.is_some() {
         // Run on the VIEW: the aggregation resolves it, through any views
         // beneath it, and a view may hold a stage only a view may hold.
         let view_on = coll.clone();

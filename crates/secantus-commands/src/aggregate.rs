@@ -3846,11 +3846,21 @@ pub(crate) fn collection_documents(
     filter: &Document,
     collation: Option<&Collation>,
 ) -> Result<Vec<Document>, CommandError> {
+    if crate::ts_store::layout_of(storage, db, coll).is_some() {
+        return crate::ts_store::measurements(
+            storage,
+            db,
+            coll,
+            filter,
+            &Document::new(),
+            collation,
+        );
+    }
     if !crate::views::is_view(storage, db, coll) {
         let found = storage
             .find(db, coll, filter, None, None)
             .map_err(command_error)?;
-        return decode_docs(crate::ts_buckets::as_read(storage, db, coll, found, false)?);
+        return decode_docs(found);
     }
     let mut tail: Vec<Bson> = Vec::new();
     if !filter.is_empty() {
@@ -4696,10 +4706,7 @@ fn apply_coll_stats(
             .get("scale")
             .and_then(crate::util::as_i64)
             .unwrap_or(1);
-        let mut storage_stats = crate::stats_admin::storage_stats(storage, db, coll, scale)?;
-        if let Some(n) = buckets {
-            storage_stats.insert("count", crate::admin::int_bson(n));
-        }
+        let storage_stats = crate::stats_admin::storage_stats(storage, db, coll, scale)?;
         out.insert("storageStats", storage_stats);
     }
     if spec.is_some_and(|s| s.contains_key("latencyStats")) {
@@ -5028,8 +5035,16 @@ fn apply_out(
         storage
             .create_collection_with_options(&out_db, &tmp, &options)
             .map_err(command_error)?;
+        let time_series = options.contains_key("timeseries");
+        if time_series {
+            crate::ts_store::create_buckets(storage, &out_db, &tmp)?;
+        }
         if !docs.is_empty() {
-            insert_or_fail(storage, &out_db, &tmp, encode_docs(docs)?)?;
+            if time_series {
+                crate::ts_store::insert_or_fail(storage, &out_db, &tmp, docs)?;
+            } else {
+                insert_or_fail(storage, &out_db, &tmp, encode_docs(docs)?)?;
+            }
         }
         for ix in &indexes {
             let (Ok(name), Ok(key)) = (ix.get_str("name"), ix.get_document("key")) else {
@@ -5047,16 +5062,32 @@ fn apply_out(
         }
         Ok(())
     })();
+    let time_series = options.contains_key("timeseries");
     if let Err(e) = build {
+        crate::ts_store::drop_buckets(storage, &out_db, &tmp)?;
         storage
             .drop_collection(&out_db, &tmp)
             .map_err(command_error)?;
         return Err(e);
     }
+    // A time-series target's buckets go with it.
+    if time_series {
+        crate::ts_store::drop_buckets(storage, &out_db, &out_coll)?;
+        storage
+            .rename_collection(
+                &out_db,
+                &crate::ts_store::buckets_ns(&tmp),
+                &out_db,
+                &crate::ts_store::buckets_ns(&out_coll),
+                true,
+            )
+            .map_err(command_error)?;
+    }
     let (renamed, why) = storage
         .rename_collection(&out_db, &tmp, &out_db, &out_coll, true)
         .map_err(command_error)?;
     if !renamed {
+        crate::ts_store::drop_buckets(storage, &out_db, &tmp)?;
         storage
             .drop_collection(&out_db, &tmp)
             .map_err(command_error)?;

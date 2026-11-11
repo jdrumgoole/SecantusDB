@@ -212,12 +212,6 @@ pub fn coll_stats(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
             format!("Namespace {ns} is a view, not a collection"),
         ));
     }
-    let options = storage
-        .get_collection_options(&db, &coll)
-        .unwrap_or_default();
-    if options.contains_key("timeseries") {
-        return crate::admin::time_series_stats(&coll, ctx);
-    }
     let mut out = doc! { "ns": ns };
     out.extend(storage_stats(storage, &db, &coll, scale)?);
     out.insert("ok", 1.0);
@@ -246,9 +240,19 @@ pub(crate) fn storage_stats(
 ) -> Result<Document, CommandError> {
     let options = storage.get_collection_options(db, coll).unwrap_or_default();
     let exists = has_stats(storage, db, coll);
+    // A time-series collection's sizes are its buckets'.
+    let time_series = options.contains_key("timeseries");
+    let buckets_ns = crate::ts_store::buckets_ns(coll);
+    let stored = if time_series && storage.collection_exists(db, &buckets_ns).unwrap_or(false) {
+        buckets_ns.as_str()
+    } else {
+        coll
+    };
     // The size storer's numbers, read without reading a document, as
     // mongod's are (RM-191).
-    let kept = storage.collection_sizes(db, coll).map_err(command_error)?;
+    let kept = storage
+        .collection_sizes(db, stored)
+        .map_err(command_error)?;
     let count = kept.records;
     let size = kept.data_size;
     let measured = kept.index_sizes;
@@ -258,7 +262,11 @@ pub(crate) fn storage_stats(
     let mut sizes = Document::new();
     let mut builds = Vec::new();
     let building = crate::admin::building_indexes(storage, db, coll);
-    let ready = storage.list_indexes(db, coll).unwrap_or_default();
+    let mut ready = storage.list_indexes(db, coll).unwrap_or_default();
+    // A time-series collection has no `_id` index.
+    if time_series {
+        ready.retain(|ix| ix.get_str("name") != Ok("_id_"));
+    }
     for (index, is_building) in ready
         .iter()
         .map(|ix| (ix, false))
@@ -277,9 +285,19 @@ pub(crate) fn storage_stats(
         .iter()
         .map(|(k, v)| (k.clone(), int(as_i64(v).unwrap_or(0) / scale)))
         .collect();
-    let mut out = doc! { "size": int(size / scale), "count": int(count) };
-    if count > 0 {
-        out.insert("avgObjSize", int(size / count));
+    let mut out = doc! { "size": int(size / scale) };
+    if time_series {
+        // In place of the document count, the buckets and what the bucket
+        // catalog did with them (mongod 8.2.11).
+        out.insert(
+            "timeseries",
+            crate::ts_store::stats_section(storage, db, coll, count, size)?,
+        );
+    } else {
+        out.insert("count", int(count));
+        if count > 0 {
+            out.insert("avgObjSize", int(size / count));
+        }
     }
     out.insert("numOrphanDocs", 0_i32);
     out.insert("storageSize", int(size / scale));

@@ -576,6 +576,10 @@ pub fn create(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         )
         .into_reply());
     }
+    // A time-series collection keeps its measurements in buckets.
+    if ts_def.is_some() {
+        crate::ts_store::create_buckets(storage, &ctx.db_name, &coll)?;
+    }
     // A time-series collection with a meta field starts with an index on
     // the meta and time fields.
     if let Some((name, key)) = ts_def
@@ -4373,45 +4377,6 @@ pub fn rename_collection(doc: &Document, ctx: &mut CommandContext) -> HandlerRes
         }
     }
     Ok(doc! { "ok": 1.0 })
-}
-
-/// `collStats` for a time-series collection: its buckets, not its documents.
-pub(crate) fn time_series_stats(coll: &str, ctx: &CommandContext) -> HandlerResult {
-    let storage = ctx.storage()?;
-    let index_sizes = storage
-        .index_sizes(&ctx.db_name, coll)
-        .map_err(command_error)?;
-    let buckets = crate::ts_buckets::of_collection(storage, &ctx.db_name, coll)?;
-    let bucket_size: i64 = buckets
-        .iter()
-        .map(|b| {
-            crate::bsondoc::to_vec(b)
-                .map(|v| v.len() as i64)
-                .unwrap_or(0)
-        })
-        .sum();
-    let n = buckets.len() as i64;
-    let mut index_sizes = index_sizes;
-    index_sizes.remove("_id_");
-    let total_index_size: i64 = index_sizes.values().filter_map(as_i64).sum();
-    Ok(doc! {
-        "ns": format!("{}.{}", ctx.db_name, coll),
-        "size": int_bson(bucket_size),
-        "timeseries": {
-            "bucketsNs": format!(
-                "{}.{}{coll}", ctx.db_name, crate::ts_buckets::BUCKETS_PREFIX
-            ),
-            "bucketCount": int_bson(n),
-            "avgBucketSize": int_bson(if n > 0 { bucket_size / n } else { 0 }),
-        },
-        "storageSize": int_bson(bucket_size),
-        "capped": false,
-        "nindexes": index_sizes.len() as i32,
-        "totalIndexSize": int_bson(total_index_size),
-        "indexSizes": index_sizes,
-        "scaleFactor": 1_i32,
-        "ok": 1.0,
-    })
 }
 
 /// `serverStatus` — the sections this server has true numbers for, in
