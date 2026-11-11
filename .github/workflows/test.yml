@@ -448,8 +448,39 @@ jobs:
   # build script at it, and run fmt / clippy / the crate's WT-backed test suite.
   # Linux-only — cross-platform WiredTiger *linking* is already proven by the
   # `storage-engine` 3-OS wheel build below.
+  #
+  # Four lanes in parallel (2026-11-11). As one serial job this was 20-21 min,
+  # a close second to `storage-engine` on a PR's critical path: ~11 min of
+  # compiling and ~10 of test runs, five crates one after another. No lane
+  # depends on another's output, so each now gets its own runner and the job
+  # takes as long as its slowest lane. Every gate the serial job ran still
+  # runs, in exactly one lane:
+  #   storage        fmt / clippy / test of secantus-storage
+  #   storage-async  secantus-storage's tests again under the async oplog
+  #   adapter        fmt / clippy / test of secantus-storage-adapter
+  #   mdb            fmt / clippy of secantus-wt, secantus-storage-py and
+  #                  secantusdb, and the tests of secantusdb and secantus-wt
+  #   pg             fmt / clippy of secantus-server-py and secantus-pg
+  #
+  # `cache-root` is the ONE crate whose dependency graph the lane's cargo
+  # cache is cleaned against (see the cache step for why only one).
   rust-storage:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - lane: storage
+            cache-root: crates/secantus-storage
+          - lane: storage-async
+            cache-root: crates/secantus-storage
+          - lane: adapter
+            cache-root: crates/secantus-storage-adapter
+          - lane: mdb
+            cache-root: crates/secantusdb
+          - lane: pg
+            cache-root: crates/secantus-server-py
+    name: rust-storage (${{ matrix.lane }})
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
       - name: Free disk the job does not use
@@ -668,21 +699,26 @@ jobs:
       - name: Cache cargo registry + target (WT-linked crates)
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6  # v2.9.2
         with:
-          # All seven roots share the one target above, so this is a single
-          # cache, not seven. Keep this list in step with the gate steps below.
-          workspaces: |
-            crates/secantus-storage -> ../wt-target
-            crates/secantus-storage-adapter -> ../wt-target
-            crates/secantus-wt -> ../wt-target
-            crates/secantus-storage-py -> ../wt-target
-            crates/secantus-server-py -> ../wt-target
-            crates/secantusdb -> ../wt-target
-            crates/secantus-pg -> ../wt-target
+          # ONE workspace root per lane, never a list. Before saving, rust-cache
+          # cleans the target once PER listed workspace, keeping only that
+          # workspace's dependencies. With all seven WT-linked crates listed
+          # against the one shared target, each pass deleted what the others
+          # needed and only their INTERSECTION survived -- 7 packages of 583
+          # (secantus-wt alone depends on 10). Every "full match" restore
+          # therefore still compiled ~350 crates (run 42993136757: 652
+          # Compiling lines after `full match: true`). The root named here is
+          # the lane's largest graph; the lane's other crates miss at most a
+          # few dozen of its packages.
+          workspaces: ${{ matrix.cache-root }} -> ../wt-target
+          # One cache per lane: they share the job id, so without this the
+          # five lanes would write to, and restore, one key.
+          key: ${{ matrix.lane }}
           cache-on-failure: true
           # Saved from main only: see the ``rust`` job's cache step.
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Cargo fmt / clippy / test (secantus-storage)
+        if: matrix.lane == 'storage'
         working-directory: crates/secantus-storage
         run: |
           cargo fmt --check
@@ -695,10 +731,10 @@ jobs:
       # tasks/rust-async-oplog-prototype.md names this lane as the
       # precondition for the mode ever becoming a default. Mode-specific
       # tests pin their own mode via StorageOptions (the option beats the env
-      # var), so sync-only invariants stay covered by the run above while
-      # everything else exercises the async path. Same build — only the env
-      # differs, so this re-runs tests without recompiling.
+      # var), so sync-only invariants stay covered by the `storage` lane
+      # while everything else exercises the async path.
       - name: Cargo test (secantus-storage, async-oplog lane)
+        if: matrix.lane == 'storage-async'
         working-directory: crates/secantus-storage
         env:
           SECANTUS_OPLOG_ASYNC: "1"
@@ -713,27 +749,35 @@ jobs:
         # `Storage` trait's supertrait). Its `tests/command_*_wt.rs` drive the
         # command layer end-to-end through the real WT adapter — the layer that
         # catches command-behaviour regressions — so run them here.
+        if: matrix.lane == 'adapter'
         working-directory: crates/secantus-storage-adapter
         run: |
           cargo fmt --check
           cargo clippy --all-targets -- -D warnings
           cargo test
 
-      # The four WT-linked crates nothing gated until now -- not here, not in
+      # The WT-linked crates nothing else gates -- not the lanes above, not
       # the clean workspace (`cargo` does not warn about an excluded crate, so
       # `./inv rust-test` reports success having never compiled them). Two of
       # these are shipped artifacts: `secantusdb` is the standalone binary and
       # `secantus-server-py` is the embedded handle the Rust gauge drives.
       # clippy only here: `secantusdb`'s and `secantus-wt`'s own tests run in
-      # the next step, and the other three have none of their own.
+      # the `mdb` lane's test step, and the other three have none of their own.
       # `secantus-pg` (the PostgreSQL server) joined on 2026-10-07: it was built
       # and its integration tests run in another job, but never linted, and six
       # `clippy::drop_non_drop` errors sat in it unreported. The pgwire fork
       # (`secantus-pgwire`) links no WiredTiger, so the `rust` job gates it.
+      # Split across the `mdb` and `pg` lanes by dependency graph.
       - name: Cargo fmt / clippy (the remaining WT-linked crates)
+        if: matrix.lane == 'mdb' || matrix.lane == 'pg'
         run: |
           set -e
-          for crate in secantus-wt secantus-storage-py secantus-server-py secantusdb secantus-pg; do
+          if [ "${{ matrix.lane }}" = mdb ]; then
+            crates="secantus-wt secantus-storage-py secantusdb"
+          else
+            crates="secantus-server-py secantus-pg"
+          fi
+          for crate in $crates; do
             echo "::group::$crate"
             (cd "crates/$crate" \
               && cargo fmt --check \
@@ -748,6 +792,7 @@ jobs:
         # `secantus_mdb::Server` embedding API the crate is published for)
         # or `compression.rs`, and `secantus-wt`'s own tests ran only in
         # wt-sys.yml, which a path filter limits to WiredTiger changes.
+        if: matrix.lane == 'mdb'
         run: |
           set -e
           for crate in secantusdb secantus-wt; do
@@ -786,12 +831,16 @@ jobs:
         # ``Install toolchain (macOS)`` step below exists for exactly these
         # cells (it was unreachable while this matrix was Linux + Windows only).
         #
-        # Windows joins on the push to main (and the cron), not on a PR
-        # (2026-10-22). It was the whole run's critical path: 44-51 min against
-        # 25 for the next job, almost all of it the PGO + LTO wheel build on a
-        # 4-core runner. What is lost: a Windows-only break surfaces on main,
-        # after the merge, not on the PR that caused it.
-        os: ${{ fromJSON((github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && '["ubuntu-latest","windows-latest","macos-14"]' || github.event_name == 'push' && '["ubuntu-latest","windows-latest"]' || '["ubuntu-latest"]') }}
+        # Windows joins on the weekly cron (and a manual dispatch) only (Joe,
+        # 2026-11-11). It left the PR on 2026-10-22, when it was the whole
+        # run's critical path (44-51 min against 25 for the next job), and
+        # left the push to main on 2026-11-11, where it was again: 55-66 min
+        # against ~11 for every other MongoDB lane, almost all of it the PGO +
+        # LTO wheel build on a 4-core runner. What is lost: a Windows-only
+        # break surfaces at the next weekly run (or a dispatch, or a release
+        # build), not on the commit that caused it. To check a change on
+        # Windows first: `gh workflow run test.yml --ref <branch>`.
+        os: ${{ fromJSON((github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && '["ubuntu-latest","windows-latest","macos-14"]' || '["ubuntu-latest"]') }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
       - name: Free disk the job does not use
@@ -875,26 +924,11 @@ jobs:
           df -h "$(cat /tmp/tdir)" || df -h . || true
           if [ "$RUNNER_OS" = "Windows" ]; then echo "C: (toolchains)"; df -h /c || true; fi
 
-      - name: Register the MongoDB 8.2 apt repository (Linux)
-        # For `mongodb-org-server`: the reference mongod the Rust MongoDB
-        # server's backlog tests compare against (the step "Rust MongoDB
-        # server against mongod" below). 8.2 because every recorded
-        # expectation was measured on 8.2.1 / 8.2.11, and a patch bump has
-        # moved an error message before. The KEY is `server-8.0.asc` on
-        # purpose: there is no `server-8.2.asc`, and MongoDB signs both series
-        # with one key (fingerprint 4B0752C1BCA238C0B4EE14DC41DE058A4E7DCA05).
-        if: runner.os == 'Linux'
-        run: |
-          curl -fsSL --retry 3 --retry-all-errors --max-time 60 \
-            https://www.mongodb.org/static/pgp/server-8.0.asc \
-            | sudo gpg --dearmor -o /usr/share/keyrings/mongodb-server.gpg
-          echo "deb [signed-by=/usr/share/keyrings/mongodb-server.gpg] https://repo.mongodb.org/apt/ubuntu noble/mongodb-org/8.2 multiverse" | sudo tee /etc/apt/sources.list.d/mongodb-org-8.2.list
-
       - name: Install toolchain (Linux)
         if: runner.os == 'Linux'
         uses: ./.github/actions/apt-install
         with:
-          packages: swig ninja-build liblz4-dev mongodb-org-server
+          packages: swig ninja-build liblz4-dev
       - name: Point bindgen at the image's libclang
         if: runner.os == 'Linux'
         uses: ./.github/actions/image-libclang
@@ -1021,10 +1055,11 @@ jobs:
         #
         # Linux runs `fast` on a PR AND on the push to main, so that main saves
         # the cache a PR restores (a PR cannot save one another PR can read).
-        # The full build is still built and tested on every push to main by the
-        # Windows cell, and on all three OSes by the weekly cron. What is lost:
-        # a fault that only the LTO / PGO build has shows up on main, not on the
-        # PR, and on Linux only weekly or at release.
+        # The full build is built and tested by the weekly cron (Windows and
+        # macOS cells; there is no push-to-main cell since 2026-11-11) and by
+        # the release builds. What is lost: a fault that only the LTO / PGO
+        # build has shows up at the next weekly run or release, not on the PR
+        # or on main.
         id: mode
         shell: bash
         run: |
@@ -1173,12 +1208,20 @@ jobs:
         # report a pass having run none of it -- the exact failure mode this
         # step's list exists to prevent. `trustme` makes the certificates its
         # TLS tests start the server with.
+        #
+        # Under xdist since 2026-11-11: run serially this was 1262 tests in
+        # 306 s, a fifth of the job. Every file here already runs under the
+        # repo's own `-n auto --dist=loadgroup` addopts on a developer box
+        # (`-o addopts=` below drops the marker filter, which is why it is
+        # spelled out rather than inherited). The concurrency suite in the
+        # next step stays serial: it measures lock scaling, which other
+        # workers on the same cores would distort.
         shell: bash
         run: >-
-          uv run --no-project --with pymongo --with pytest
+          uv run --no-project --with pymongo --with pytest --with pytest-xdist
           --with "psycopg[binary]" --with trustme
           --with "$(ls dist-storage/*.whl)"
-          python -m pytest tests/test_rust_storage_smoke.py tests/test_rust_server_smoke.py
+          python -m pytest -n auto --dist=loadgroup tests/test_rust_storage_smoke.py tests/test_rust_server_smoke.py
           tests/test_pgserver_embedded.py
           tests/test_rust_agg_runtime_errors.py tests/test_crash_recovery.py
           tests/test_rust_arg_types_sweep.py tests/test_rust_pitr_cross_server.py
@@ -1238,14 +1281,13 @@ jobs:
           df -h "$t" || df -h . || true
           if [ "$RUNNER_OS" = "Windows" ]; then echo "C: (toolchains)"; df -h /c || true; fi
 
-      - name: Build + smoke the standalone secantusd-rs binary (R7)
-        # The bin crate links the SAME vendored WiredTiger the wheel build above
-        # produced under build/*/wt-build (scikit-build-core's build-dir), via
-        # build.rs's SECANTUS_WT_INCLUDE / SECANTUS_WT_LIB override. Windows is
-        # skipped: build.rs probes libwiredtiger.a/.so, which the MSVC build
-        # doesn't produce — the Windows artifact ships via the wheel's CMake
-        # path only (tracked in tasks/backlog.md §7).
-        if: runner.os != 'Windows'
+      - name: Build + smoke the standalone secantusd-rs binary (R7, macOS)
+        # macOS (the weekly cron) only. On Linux this moved to the
+        # `mdb-binary` job, which builds the binary without waiting for this
+        # job's wheel. Keep the test list in step with that job's "(R7)" step.
+        # The bin crate links the SAME vendored WiredTiger the wheel build
+        # above produced under build/*/wt-build.
+        if: runner.os == 'macOS'
         shell: bash
         run: |
           wt=$(ls -d "$PWD"/build/*/wt-build 2>/dev/null | head -1)
@@ -1255,18 +1297,178 @@ jobs:
           fi
           export SECANTUS_WT_INCLUDE="$wt/include" SECANTUS_WT_LIB="$wt"
           cargo build --manifest-path crates/secantusdb/Cargo.toml
-          # test_rust_binary_pitr.py (PITR restore and --preserve-oplog
-          # against this binary) ran in no job until 2026-10-21: it imports
-          # `secantus` for its seeding, so the test job's selector drops it,
-          # and the `importorskip("_secantus_server")` guard never saw it.
-          # test_rust_binary_crash_durability.py SIGKILLs the binary in the
-          # middle of concurrent `j: true` writes in its DEFAULT mode, which
-          # test_crash_recovery.py (data-nonlogged mode only) does not cover.
           uv run --no-project --with pymongo --with pytest --with pytest-timeout \
             --with "$(ls dist-storage/*.whl)" \
             python -m pytest tests/test_rust_binary_smoke.py tests/test_rust_binary_pitr.py \
             tests/test_rust_binary_crash_durability.py \
             -o addopts= -p no:cacheprovider -q -rs
+
+      - name: Disk watchdog report (RP-312)
+        # A fired watchdog fails the job: it means a runaway write happened,
+        # whatever the test steps reported.
+        if: always() && runner.os != 'Windows'
+        run: |
+          f="$RUNNER_TEMP/disk-watch.txt"
+          if [ -s "$f.lowest" ]; then
+            echo "disk watchdog: lowest free space $(( $(cat "$f.lowest") / 1048576 )) GB"
+          fi
+          if [ -s "$f" ]; then
+            cat "$f"
+            echo "::error::RP-312 disk watchdog fired: a runaway write; the report above names the writer"
+            exit 1
+          fi
+          echo "disk watchdog: free space never fell under the threshold"
+
+  mdb-binary:
+    # The standalone `secantusd-rs` (debug) against a live mongod 8.2: the
+    # backlog's RM gap and regression tests, tests/mongod_live/, and the R7
+    # binary tests. Until 2026-11-11 these were the tail of `storage-engine`,
+    # where they waited ~9 min for a wheel they do not use -- they drive the
+    # debug binary cargo builds here, and import nothing from the wheel (the
+    # R7 PITR test seeds through the `secantus` package, which `uv sync`
+    # installs). Moving them here, and splitting them in two shards, took ~10
+    # min (backlog verify 5m15, mongod_live 2m48, R7 build + tests ~2 min)
+    # off the PR's critical path.
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        # backlog: tools/backlog.py verify (the RM items' tests)
+        # live:    tests/mongod_live/ and the R7 binary tests
+        shard: [backlog, live]
+    name: mdb-binary (${{ matrix.shard }})
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      - name: Free disk the job does not use
+        uses: ./.github/actions/free-disk
+      - name: Start the disk watchdog (RP-312)
+        # See the storage-engine job's step of the same name.
+        run: |
+          scripts/ci_disk_watch_selftest.sh
+          nohup scripts/ci_disk_watch.sh "$RUNNER_TEMP/disk-watch.txt" / >/dev/null 2>&1 &
+      - name: Move the host time zone off UTC
+        uses: ./.github/actions/non-utc-host
+      - name: Checkout the WiredTiger submodule
+        shell: bash
+        run: >-
+          git submodule update --init --depth 1 vendor/wiredtiger ||
+          git submodule update --init vendor/wiredtiger
+
+      - name: Register the MongoDB 8.2 apt repository (Linux)
+        # For `mongodb-org-server`: the reference mongod the Rust MongoDB
+        # server's backlog tests compare against (the step "Rust MongoDB
+        # server against mongod" below). 8.2 because every recorded
+        # expectation was measured on 8.2.1 / 8.2.11, and a patch bump has
+        # moved an error message before. The KEY is `server-8.0.asc` on
+        # purpose: there is no `server-8.2.asc`, and MongoDB signs both series
+        # with one key (fingerprint 4B0752C1BCA238C0B4EE14DC41DE058A4E7DCA05).
+        run: |
+          curl -fsSL --retry 3 --retry-all-errors --max-time 60 \
+            https://www.mongodb.org/static/pgp/server-8.0.asc \
+            | sudo gpg --dearmor -o /usr/share/keyrings/mongodb-server.gpg
+          echo "deb [signed-by=/usr/share/keyrings/mongodb-server.gpg] https://repo.mongodb.org/apt/ubuntu noble/mongodb-org/8.2 multiverse" | sudo tee /etc/apt/sources.list.d/mongodb-org-8.2.list
+
+      - name: Install toolchain
+        uses: ./.github/actions/apt-install
+        with:
+          packages: swig ninja-build liblz4-dev mongodb-org-server
+      - name: Point bindgen at the image's libclang
+        uses: ./.github/actions/image-libclang
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30  # stable
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78  # v7.6.0
+        with:
+          # See the storage-engine job for both settings.
+          enable-cache: true
+          prune-cache: false
+          cache-suffix: py3.12
+          cache-dependency-glob: uv.lock
+      - name: Set up Python 3.12
+        uses: ./.github/actions/uv-python
+        with:
+          version: "3.12"
+
+      # The vendored WiredTiger, built by `uv sync` and restored from the
+      # SAME cache key as the rust-storage job's (see the comments there): a
+      # hit is a 2 s sync instead of a ~100 s C build.
+      - name: Pin the build interpreter so the cache can actually be reused
+        id: pybuild
+        shell: bash
+        run: |
+          p=$(uv python find)
+          echo "SKBUILD_CMAKE_DEFINE=Python3_EXECUTABLE=$p" >> "$GITHUB_ENV"
+          echo "path=$p" >> "$GITHUB_OUTPUT"
+          echo "pinned build interpreter: $p"
+      - name: Compute WiredTiger build-cache key
+        id: wtkey
+        shell: bash
+        run: |
+          echo "wt=$(git rev-parse HEAD:vendor/wiredtiger)" >> "$GITHUB_OUTPUT"
+          echo "py=$(printf %s '${{ steps.pybuild.outputs.path }}' | sha256sum | cut -c1-12)" >> "$GITHUB_OUTPUT"
+          cfg=$(cat CMakeLists.txt cmake/*.py cmake/*.cmake pyproject.toml | sha256sum | cut -c1-16)
+          echo "cfg=$cfg" >> "$GITHUB_OUTPUT"
+          echo "img=${ImageVersion:-unknown}" >> "$GITHUB_OUTPUT"
+      - name: Restore the WiredTiger build
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
+        with:
+          path: build
+          # Keep identical to the rust-storage job's key.
+          key: wtbuild-${{ runner.os }}-${{ steps.wtkey.outputs.img }}-py3.12-engineoff-wt${{ steps.wtkey.outputs.wt }}-cfg${{ steps.wtkey.outputs.cfg }}-py${{ steps.wtkey.outputs.py }}
+      - name: Sync dependencies
+        run: uv sync --extra dev
+      - name: Verify the WiredTiger build is real
+        shell: bash
+        run: |
+          uv run python -c "
+          import wiredtiger
+          v = wiredtiger.wiredtiger_version()
+          assert hasattr(wiredtiger, 'wiredtiger_open'), 'stub module, not the real extension'
+          assert 'WiredTiger' in v[0], v
+          print('WiredTiger OK:', v[0])
+          "
+      - name: Point secantus-wt at the vendored WiredTiger
+        run: |
+          wt=$(ls -d "$PWD"/build/*/wt-build 2>/dev/null | head -1)
+          if [ -z "$wt" ] || [ ! -f "$wt/include/wiredtiger.h" ] || [ ! -f "$wt/libwiredtiger.a" ]; then
+            echo "vendored WiredTiger not found under build/*/wt-build" >&2
+            exit 1
+          fi
+          echo "SECANTUS_WT_INCLUDE=$wt/include" >> "$GITHUB_ENV"
+          echo "SECANTUS_WT_LIB=$wt" >> "$GITHUB_ENV"
+
+      - name: Cache cargo registry + target (secantusdb debug)
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6  # v2.9.2
+        with:
+          workspaces: crates/secantusdb -> target
+          # Both shards build the same binary: one cache.
+          shared-key: mdb-binary
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Build the standalone secantusd-rs binary (debug)
+        # tests/backlog/conftest.py runs crates/secantusdb/target/debug/secantusd-rs.
+        if: matrix.shard == 'backlog'
+        run: cargo build --manifest-path crates/secantusdb/Cargo.toml
+
+      - name: Build + smoke the standalone secantusd-rs binary (R7)
+        # The bin crate links the vendored WiredTiger resolved above.
+        # test_rust_binary_pitr.py (PITR restore and --preserve-oplog
+        # against this binary) ran in no job until 2026-10-21: it imports
+        # `secantus` for its seeding, so the test job's selector drops it,
+        # and the `importorskip("_secantus_server")` guard never saw it.
+        # test_rust_binary_crash_durability.py SIGKILLs the binary in the
+        # middle of concurrent `j: true` writes in its DEFAULT mode, which
+        # test_crash_recovery.py (data-nonlogged mode only) does not cover.
+        # Keep the test list in step with the storage-engine job's macOS step.
+        if: matrix.shard == 'live'
+        run: |
+          cargo build --manifest-path crates/secantusdb/Cargo.toml
+          uv run python -m pytest tests/test_rust_binary_smoke.py tests/test_rust_binary_pitr.py \
+            tests/test_rust_binary_crash_durability.py \
+            -o addopts= -p no:cacheprovider -p no:randomly -q -rs
 
       - name: Rust MongoDB server against mongod (the backlog's tests)
         # Every RM item's gap test (fails while the item is open) and every
@@ -1286,38 +1488,42 @@ jobs:
         # $push / $facet / $lookup; it ran here under `--skip RM-211` while
         # the server had no memory budgets and took ~14.5 GB to do it. With
         # the budgets it refuses as mongod does, under 1 GB.
-        #
-        # tests/mongod_live/ then compares the surface no backlog item
-        # covers (window functions, change-stream images, retryable writes,
-        # an operator tail). Both run whatever the first answers, so one
-        # failure never hides the other.
-        if: runner.os == 'Linux'
-        shell: bash
+        if: matrix.shard == 'backlog'
         run: |
           mongod --version | head -1
           # invoke: a gap test about the build tooling imports rust_tasks
           # (RM-388), which imports invoke; uv.lock's version.
-          deps="--with pymongo==4.17.0 --with pytest --with pytest-xdist --with psycopg[binary]==3.3.4 --with invoke==3.0.3"
-          status=0
-          uv run --no-project $deps \
-            python tools/backlog.py verify --file backlog-rust-mongodb.md --regressions \
-            || status=1
-          uv run --no-project $deps \
+          #
+          # --isolated: this job ran `uv sync`, and `uv run --no-project`
+          # alone layers its ephemeral env over that .venv -- pytest-randomly,
+          # pytest-timeout and the `secantus` package with it. The first run
+          # of this job did exactly that and took 421 s here and 595 s for
+          # mongod_live, against 197-370 s and 118-195 s in the old job.
+          uv run --no-project --isolated --with pymongo==4.17.0 --with pytest --with pytest-xdist \
+            --with "psycopg[binary]==3.3.4" --with invoke==3.0.3 \
+            python tools/backlog.py verify --file backlog-rust-mongodb.md --regressions
+
+      - name: Rust MongoDB server against mongod (mongod_live)
+        # The surface no backlog item covers (window functions, change-stream
+        # images, retryable writes, an operator tail).
+        if: matrix.shard == 'live'
+        run: |
+          mongod --version | head -1
+          # --isolated: see the backlog step.
+          uv run --no-project --isolated --with pymongo==4.17.0 --with pytest --with pytest-xdist \
+            --with "psycopg[binary]==3.3.4" --with invoke==3.0.3 \
             python -m pytest tests/mongod_live -m mongod_live -o addopts= -n auto \
-            -p no:cacheprovider -q -rs || status=1
-          exit $status
+            -p no:cacheprovider -q -rs
 
       - name: Memory pressure, if the mongod comparison failed
         # A step SIGTERMed by the runner (exit 143) prints no test summary;
         # the kernel log says whether memory ran out, and who it killed.
-        if: failure() && runner.os == 'Linux'
+        if: failure()
         run: |
           free -m
           sudo dmesg -T | grep -iE "out of memory|oom-kill|killed process" | tail -20 || true
       - name: Disk watchdog report (RP-312)
-        # A fired watchdog fails the job: it means a runaway write happened,
-        # whatever the test steps reported.
-        if: always() && runner.os != 'Windows'
+        if: always()
         run: |
           f="$RUNNER_TEMP/disk-watch.txt"
           if [ -s "$f.lowest" ]; then
