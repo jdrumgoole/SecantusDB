@@ -33,6 +33,8 @@ from pathlib import Path
 
 import pytest
 
+from tests.server_pipes import drain
+
 psycopg = pytest.importorskip("psycopg")
 from psycopg.types.multirange import Multirange  # noqa: E402
 from psycopg.types.range import Range  # noqa: E402
@@ -125,6 +127,7 @@ class _Server:
                 rest = self.proc.stdout.read() if self.proc.stdout else ""
             raise RuntimeError(f"secantusd-pg did not start: {line!r}{rest!r}")
         self.port = int(match.group(1))
+        drain(self.proc)
         return self
 
     def _trust_args(self) -> tuple[str, ...]:
@@ -11406,6 +11409,7 @@ def _mongo_server(home: Path) -> Iterator[tuple[str, int]]:
             if m or not line:
                 break
         assert m, f"no listening banner in the first stdout lines: {line!r}"
+        drain(proc)
         yield m.group(1), int(m.group(2))
     finally:
         proc.terminate()

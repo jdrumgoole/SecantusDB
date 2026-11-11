@@ -27,6 +27,8 @@ except ImportError:  # pragma: no cover - Windows
 
 import pytest
 
+from tests.server_pipes import drain
+
 # These tests are disk-I/O bound end-to-end (real durable WiredTiger in the
 # binary, snapshot + restore): ~8s solo, but the documented contention factor
 # under a full parallel suite is 15-35x (see _restore), and with TWO suites on
@@ -266,6 +268,7 @@ def test_rust_binary_v2_archive_base_snapshot_and_restore(tmp_path: pathlib.Path
     try:
         assert proc.stdout is not None
         line = _read_banner_line(proc)
+        drain(proc)
         m = _BANNER.search(line)
         assert m, f"no listening banner in: {line!r}"
         host, port = m.group(1), int(m.group(2))

@@ -24,6 +24,8 @@ import threading
 
 import pytest
 
+from tests.server_pipes import drain
+
 psycopg = pytest.importorskip("psycopg")
 
 _REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
@@ -114,6 +116,7 @@ def _bound_address(proc: subprocess.Popen[str]) -> tuple[str, int]:
     first = line[0] if line else ""
     match = _BANNER.search(first)
     assert match, f"no listening banner in first stdout line: {first!r}"
+    drain(proc)
     return match.group(1), int(match.group(2))
 
 
