@@ -68,7 +68,8 @@ pub(crate) fn intercept(name: &str, doc: &Document, ctx: &mut CommandContext) ->
                             "CommandNotSupported",
                             format!(
                                 "an index on {ns} must be one the time-series collection can \
-                                 show: this server keeps its measurements, not its buckets"
+                                 show: this server keeps a time-series collection's indexes \
+                                 on the collection"
                             ),
                         )
                         .into_reply(),

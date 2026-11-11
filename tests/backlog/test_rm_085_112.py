@@ -431,10 +431,11 @@ def test_find_refuses_an_unknown_field(rust_mongo: Any, mongod: Any) -> None:
 # --------------------------------------------------- 7.071 time series --
 
 
-@pytest.mark.backlog("RM-088")
+@pytest.mark.backlog_fixed("RM-088")
 def test_bucket_collection_can_be_deleted_from(rust_mongo: Any, mongod: Any) -> None:
     """mongod 8.2.11: a delete on `system.buckets.<name>` succeeds and removes
-    the measurements (the Rust server answers 115)."""
+    the measurements. The Rust server answered 115 until 2026-11-11, when it
+    began to store the buckets."""
 
     def probe(client: Any) -> tuple:
         db = client[_name("rm088")]

@@ -1,21 +1,16 @@
-//! The buckets of a time-series collection.
+//! What a time-series collection's buckets are made of, and how a filter
+//! and an index key read on them.
 //!
 //! `mongod` stores a time-series collection as bucket documents in
 //! `system.buckets.<name>` and presents the collection as a view that unpacks
-//! them. This server stores the measurements as ordinary documents, in the
-//! format the Python server shares, and DERIVES the buckets when something
-//! asks for them: a read of `system.buckets.<name>`, the order a scan of the
-//! collection returns its measurements in, the counts `collStats` and
-//! `validate` report.
-//!
-//! The derivation replays the measurements in the order they were stored
-//! through `mongod`'s bucket catalog ([`place`]). `mongod` sorts an insert
-//! batch by time before placing it, and so does the insert here before
-//! storing it (`crud::insert`), which is what lets the stored order stand
-//! for the order `mongod` placed them in. A bucket never closes for size
-//! here: `mongod`'s limit depends on its cache size and on how many buckets
-//! the whole server has open. Shapes were read from `mongod` 8.2.11, and
-//! each data column holds `mongod`'s compressed bytes.
+//! them; so does this server (`ts_store`, `bucket_catalog`). This module
+//! holds the pieces both sides of that use: the collection's layout (its
+//! time and meta fields, its bucket span and rounding), the schema a bucket
+//! keeps (`Schema`), the running minimum and maximum (`fold`), the
+//! bucket-level filter's comparisons (`bucket_matches`), the streaming
+//! bucket scan (`BucketScan`), `system.views`' definitions, the bucket
+//! validator, and the translation of index keys between the collection and
+//! its buckets. Shapes were read from `mongod` 8.2.11.
 
 use std::cmp::Ordering;
 

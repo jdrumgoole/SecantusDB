@@ -1,7 +1,7 @@
 //! A time-series collection's buckets, and the four collection commands
 //! added with them (`convertToCapped`, `cloneCollectionAsCapped`, `compact`,
-//! `reIndex`). The server keeps measurements, not buckets; what it derives
-//! from them is checked here against what mongod 8.2.11 answered
+//! `reIndex`). The buckets are stored, as mongod stores them; what reads of
+//! them answer is checked here against what mongod 8.2.11 answered
 //! (`tools/probes/time_series.py`).
 
 mod common;

@@ -2580,8 +2580,12 @@ differs on 5 scenarios. What is left:
       index's order -- series by series -- and returns 1,279 more after the
       delete; this server reads such a read (and any over a collection with
       an index of its own, or under a hint or a collation) whole: 3,199.
-      Streaming it means a bucket scan in an index's order over buckets this
-      server derives. Measured 2026-11-09.
+      The buckets are stored since 2026-11-11, but the indexes are not
+      built over them: a time-series collection's index specs are kept on
+      the collection, every read scans the buckets in `_id` order, and
+      `collStats` reports its index sizes as 0. Streaming it means indexes
+      over the buckets and a bucket scan in an index's order. Measured
+      2026-11-09.
       Backlog-ID: RM-457
       Verify: tests/backlog/test_rm_found_2026_11_09_rm348.py::test_a_time_series_read_of_the_meta_index_buffers_its_buckets
 - **Not probed (RM-083's remainder, 2026-10-17)** -- `oplogReplay`,
@@ -2627,52 +2631,49 @@ masks only the write-conflict cause. What is left:
 `tools/probes/time_series.py`, mongod 8.2.11: 191 scenarios on a fresh
 database each (what `create` accepts, inserts, reads, where measurements are
 placed, the restricted writes, indexes, `collMod`, rename and the rest). The
-Rust server differs on 5, and on a sixth (`listCollections` order) in the
-runs where mongod's own order comes out the other way (2026-10-16).
-mongod keeps the rows as buckets in `system.buckets.<name>` and presents the
-collection as a view; this server keeps ordinary documents, and most of what
-is left follows from that:
+Rust server differs on 2 (2026-11-11): a `hashed` index (a scope decision)
+and `collStats`' sizes -- its storage size, as on every collection (RM-040),
+and its index sizes, 0 while the indexes are not built over the buckets
+(RM-457); a third, `listCollections` order, differs in the runs where
+mongod's own order comes out the other way.
+Since 2026-11-11 this server keeps a time-series collection as mongod does:
+bucket documents in `system.buckets.<name>`, each data field mongod's
+compressed column, placed by mongod's bucket catalog
+(`crates/secantus-commands/src/bucket_catalog.rs`). What is left:
 
-- [ ] **RUST MongoDB server: the buckets are derived, not stored**
-      (2026-10-11; 6 of 187 still differ). The server keeps measurements as
-      ordinary documents, the format the Python server shares, and works the
-      buckets out when asked (`crates/secantus-commands/src/ts_buckets.rs`):
-      reads of `system.buckets.<name>` and `system.views`, the listings, the
-      scan order, `validate`, `collStats` and `$collStats`. What that leaves:
-      - **A bucket never closes for size.** (Batches are sorted by time,
-        and a field changing type rolls a bucket over, as on mongod, since
-        2026-10-16.) mongod's size limit depends on its cache size and on
-        how many buckets the whole server has open
-        (`getCacheDerivedBucketMaxSize`), and a bucket of fewer than 10
-        measurements stays open for large ones: modelling that state is a
-        decision for Joe. The reopening query's own size filter is left out
-        for the same reason.
-      - **A bucket cannot be written.** An insert that passes the bucket
-        schema, and any update or delete on `system.buckets.<name>`, answers
-        115. `renameCollection` on it answers 166 (mongod renames it).
-        An index on it must be one the collection can show.
-      - **`collStats` has no write counters** (`numBucketInserts`,
-        `numBucketsClosedDueTo...`): a history this server does not keep.
-        Its sizes are of the derived buckets, not of compressed ones.
-      - **An unsorted read of a time-series collection reads the whole
-        collection** to place the measurements, whatever its filter.
-      - **`dbStats` counts a time-series collection's measurements**, not
-        its buckets, and does not count it as a view: mongod 8.2.11
-        answered `views: 2` for a database holding one view and one
-        time-series collection, this server `views: 1`.
-      **Decided 2026-10-16 (Joe):** model mongod's server-wide bucket
-      catalog, memory accounting across every collection included
-      (`getCacheDerivedBucketMaxSize`), so buckets close for size as on
-      mongod.
-      **Decided 2026-10-16 (Joe):** store real buckets in mongod's
-      compressed column format (BSONColumn), kept by the server-wide
-      catalog, in place of measurements kept as documents. Existing stores
-      are converted on open. This also closes the bucket writes, the
-      `collStats` counters and the whole-collection read above. (The
-      encoder exists: `secantus_core::bsoncolumn` writes mongod's column
-      bytes since 2026-11-09, and the derived buckets use it.)
-      Backlog-ID: RM-088
-      Verify: tests/backlog/test_rm_085_112.py::test_bucket_collection_can_be_deleted_from
+- [ ] **RUST MongoDB server: `listIndexes` of `system.buckets.<name>`
+      shows a TTL or partial index as the time-series collection keeps it.**
+      mongod 8.2.11 keeps a TTL index on the time field as
+      `{control.min.<time>: 1}` on the buckets, its partial filter on the
+      meta field as one on `meta` (`{meta: {$eq: "a"}}`), and the index as
+      asked in `originalSpec`; this server lists the bound pair
+      `{control.min.t: 1, control.max.t: 1}` and the filter as given, with
+      no `originalSpec`. The index specs are kept on the time-series
+      collection and translated for the listing (`ts_bucket_ns::bucket_indexes`);
+      the TTL pass already expires buckets by `control.min.<time>`.
+      Measured 2026-11-11.
+      Verify: tests/backlog/test_rm_found_2026_11_11_rm088.py::test_bucket_indexes_list_a_ttl_index_as_mongod_keeps_it
+      Backlog-ID: RM-548
+- [ ] **RUST MongoDB server: the bucket catalog keeps no account of its
+      memory.** mongod 8.2.11 reports a `bucketCatalog` section in
+      `serverStatus` once a time-series collection is written to
+      (`numBuckets`, `numOpenBuckets`, `numIdleBuckets`,
+      `numArchivedBuckets`, `memoryUsage`, the execution counters,
+      `stateManagement`), and closes or archives idle buckets when the
+      catalog's memory passes `timeseriesIdleBucketExpiryMemoryUsageThreshold`
+      (a share of the machine's memory). This server reports no section and
+      never expires an idle bucket. Everything but the memory is the
+      catalog's to report; `memoryUsage`, and so the expiry, is the bytes
+      mongod's own C++ structures allocate through its tracking allocators,
+      which this server does not make. Measured 2026-11-11.
+      **Decision needed (2026-11-11):** model `memoryUsage` (and the
+      expiry it drives) from the sizes of mongod's structures, or report
+      the section without it, or leave the section out until the
+      allocation accounting can be reproduced. The size limit's memory
+      accounting (`getCacheDerivedBucketMaxSize`, decided 2026-10-16) does
+      not depend on it and is built.
+      Verify: tests/backlog/test_rm_found_2026_11_11_rm088.py::test_server_status_reports_the_bucket_catalog
+      Backlog-ID: RM-549
 - [ ] **RUST MongoDB server: a measurement holding a BSONColumn binary
       is stored** (found 2026-11-09 while building the bucket encoder).
       mongod 8.2.11 refuses a measurement whose data field is, or holds at

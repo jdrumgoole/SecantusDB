@@ -73,8 +73,34 @@ fn totals(ctx: &CommandContext, db: &str) -> Result<Totals, CommandError> {
         index_size: 0,
     };
     for c in storage.list_collections(db).map_err(command_error)? {
-        if crate::views::is_view(storage, db, &c) {
+        // A time-series collection is a view over its buckets, as on mongod;
+        // its bucket collection is the collection, holding the buckets and
+        // the time-series collection's indexes (it has no `_id` index).
+        if crate::views::is_view(storage, db, &c)
+            || crate::ts_store::layout_of(storage, db, &c).is_some()
+        {
             t.views += 1;
+            continue;
+        }
+        if let Some((base, _)) = crate::ts_buckets::bucketed(storage, db, &c) {
+            t.collections += 1;
+            let kept = storage.collection_sizes(db, &c).map_err(command_error)?;
+            t.objects += kept.records;
+            t.data_size += kept.data_size;
+            t.indexes += storage.list_indexes(db, &base).map_or(0, |l| {
+                l.iter()
+                    .filter(|ix| ix.get_str("name") != Ok("_id_"))
+                    .count()
+            }) as i64;
+            let sizes = storage
+                .collection_sizes(db, &base)
+                .map_err(command_error)?
+                .index_sizes;
+            t.index_size += sizes
+                .iter()
+                .filter(|(name, _)| name.as_str() != "_id_")
+                .filter_map(|(_, v)| as_i64(v))
+                .sum::<i64>();
             continue;
         }
         t.collections += 1;
