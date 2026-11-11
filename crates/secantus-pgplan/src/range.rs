@@ -137,73 +137,125 @@ pub fn render_multirange_in_zone(text: &str, tz: &crate::TimeZoneSetting) -> Res
 
 /// Parse a range literal: `[1,5)`, `(,5]`, `empty`, with optional quoting
 /// around a bound that contains a comma or a quote.
+///
+/// A port of PostgreSQL's `range_parse` (`rangetypes.c`), check for check
+/// and DETAIL for DETAIL: each malformed literal is 22P02 `malformed range
+/// literal` naming the input as given, and the DETAIL says which check
+/// stopped it. A bound keeps its whitespace, as there: the element's input
+/// function decides what it means (`[ 1 , 2 )` is `[1,2)`, `[1 2,3)` is
+/// int4's `invalid input syntax`).
 fn parse_literal(text: &str) -> Result<Range> {
-    let t = text.trim();
-    if t.eq_ignore_ascii_case("empty") {
+    let bytes = text.as_bytes();
+    let mut ptr = 0;
+    let skip_space = |mut i: usize| {
+        while i < bytes.len() && is_c_space(bytes[i]) {
+            i += 1;
+        }
+        i
+    };
+    ptr = skip_space(ptr);
+    // `empty` is matched as a prefix, case-insensitively, and only
+    // whitespace may follow it.
+    const EMPTY: &[u8] = b"empty";
+    if bytes.len() - ptr >= EMPTY.len() && bytes[ptr..ptr + EMPTY.len()].eq_ignore_ascii_case(EMPTY)
+    {
+        ptr = skip_space(ptr + EMPTY.len());
+        if ptr != bytes.len() {
+            return Err(malformed_range(text, "Junk after \"empty\" key word."));
+        }
         return Ok(Range::empty());
     }
-    let bytes = t.as_bytes();
-    let (lower_inc, upper_inc) = match (bytes.first(), bytes.last()) {
-        (Some(b'['), Some(b')')) => (true, false),
-        (Some(b'['), Some(b']')) => (true, true),
-        (Some(b'('), Some(b')')) => (false, false),
-        (Some(b'('), Some(b']')) => (false, true),
-        _ => return Err(bad_range(text)),
-    };
-    let body = &t[1..t.len() - 1];
-    // Each part carries whether it was ever quoted: `["",foo)` has an EMPTY
-    // STRING lower bound, where `[,foo)` has an infinite one, and only the
-    // quotes tell them apart once the text is stripped.
-    let mut parts: Vec<(String, bool)> = Vec::new();
-    let mut cur = String::new();
-    let mut quoted = false;
-    let mut seen_quote = false;
-    let mut chars = body.chars().peekable();
-    while let Some(c) = chars.next() {
-        match c {
-            // A doubled quote inside the quotes is one literal quote, the
-            // way PostgreSQL's `range_parse_bound` reads it: `["""",#)` is
-            // the bound `"`.
-            '"' if quoted && chars.peek() == Some(&'"') => {
-                chars.next();
-                cur.push('"');
-            }
-            '"' => {
-                quoted = !quoted;
-                seen_quote = true;
-            }
-            '\\' => {
-                if let Some(n) = chars.next() {
-                    cur.push(n);
-                }
-            }
-            ',' if !quoted => {
-                parts.push((std::mem::take(&mut cur), std::mem::take(&mut seen_quote)));
-            }
-            // Whitespace outside the quotes is not part of the bound. ASCII only,
-            // as C `isspace` reads it: U+0085 and U+00A0 are bound text.
-            c if !quoted && c.is_ascii_whitespace() => {}
-            _ => cur.push(c),
-        }
-    }
-    parts.push((cur, seen_quote));
-    if parts.len() != 2 {
-        return Err(bad_range(text));
-    }
-    let bound = |(s, was_quoted): &(String, bool)| {
-        if s.is_empty() && !was_quoted {
-            None
-        } else {
-            Some(s.clone())
+    let lower_inc = match bytes.get(ptr) {
+        Some(b'[') => true,
+        Some(b'(') => false,
+        _ => {
+            return Err(malformed_range(
+                text,
+                "Missing left parenthesis or bracket.",
+            ))
         }
     };
+    ptr += 1;
+    let (lower, next) = parse_bound(text, ptr)?;
+    ptr = next;
+    if bytes.get(ptr) != Some(&b',') {
+        return Err(malformed_range(text, "Missing comma after lower bound."));
+    }
+    let (upper, next) = parse_bound(text, ptr + 1)?;
+    ptr = next;
+    let upper_inc = match bytes.get(ptr) {
+        Some(b']') => true,
+        Some(b')') => false,
+        // `parse_bound` stops only at one of the three, so this is a comma.
+        _ => return Err(malformed_range(text, "Too many commas.")),
+    };
+    ptr = skip_space(ptr + 1);
+    if ptr != bytes.len() {
+        return Err(malformed_range(
+            text,
+            "Junk after right parenthesis or bracket.",
+        ));
+    }
     Ok(Range {
         empty: false,
-        lower: bound(&parts[0]),
-        upper: bound(&parts[1]),
+        lower,
+        upper,
         lower_inc,
         upper_inc,
     })
+}
+
+/// PostgreSQL's `range_parse_bound`: the bound starting at byte `ptr`, and
+/// the byte after it. A bound with no characters at all is infinite
+/// (`None`); `""` is an empty string. Inside quotes a doubled quote is one
+/// quote; a backslash takes the next character literally, in or out of
+/// quotes. Every delimiter is ASCII, so a byte offset is a char boundary.
+fn parse_bound(text: &str, mut ptr: usize) -> Result<(Option<String>, usize)> {
+    let bytes = text.as_bytes();
+    let delimiter = |i: usize| matches!(bytes.get(i), Some(b',' | b')' | b']'));
+    if delimiter(ptr) {
+        return Ok((None, ptr));
+    }
+    let mut buf = String::new();
+    let mut inquote = false;
+    let mut chars = text[ptr..].char_indices().peekable();
+    loop {
+        let Some((offset, ch)) = chars.next() else {
+            return Err(malformed_range(text, "Unexpected end of input."));
+        };
+        let here = ptr + offset;
+        if !inquote && matches!(ch, ',' | ')' | ']') {
+            ptr = here;
+            break;
+        }
+        match ch {
+            '\\' => match chars.next() {
+                Some((_, n)) => buf.push(n),
+                None => return Err(malformed_range(text, "Unexpected end of input.")),
+            },
+            '"' if !inquote => inquote = true,
+            '"' if chars.peek().is_some_and(|&(_, n)| n == '"') => {
+                chars.next();
+                buf.push('"');
+            }
+            '"' => inquote = false,
+            c => buf.push(c),
+        }
+    }
+    Ok((Some(buf), ptr))
+}
+
+/// C `isspace` in the C locale: ASCII whitespace AND vertical tab, which
+/// `u8::is_ascii_whitespace` leaves out.
+fn is_c_space(b: u8) -> bool {
+    matches!(b, b' ' | b'\t' | b'\n' | 0x0b | 0x0c | b'\r')
+}
+
+/// `range_parse`'s 22P02: the literal as given, and the check that failed.
+fn malformed_range(text: &str, detail: &str) -> Error {
+    Error::InvalidText(format!(
+        "malformed range literal: \"{text}\"\nDetail: {detail}"
+    ))
 }
 
 fn bad_range(text: &str) -> Error {
@@ -736,4 +788,58 @@ pub fn multirange_from_typed_args(
         })
         .collect::<Result<Vec<_>>>()?;
     normalise_multirange(members, &member_type)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn detail_of(text: &str) -> String {
+        match parse_literal(text) {
+            Err(Error::InvalidText(m)) => m,
+            other => panic!("{text:?} parsed as {other:?}"),
+        }
+    }
+
+    /// Each of `range_parse`'s checks, with the DETAIL PostgreSQL 15.19
+    /// gives for it and the input as given, leading space included.
+    #[test]
+    fn malformed_literal_names_the_check() {
+        for (text, detail) in [
+            ("[1,2", "Unexpected end of input."),
+            (" [1,2", "Unexpected end of input."),
+            ("[1\\", "Unexpected end of input."),
+            ("[1,2]x", "Junk after right parenthesis or bracket."),
+            ("1,2", "Missing left parenthesis or bracket."),
+            ("", "Missing left parenthesis or bracket."),
+            ("emptyx", "Junk after \"empty\" key word."),
+            ("[1,2,3)", "Too many commas."),
+            ("[1;2)", "Missing comma after lower bound."),
+        ] {
+            assert_eq!(
+                detail_of(text),
+                format!("malformed range literal: \"{text}\"\nDetail: {detail}"),
+            );
+        }
+    }
+
+    /// A bound keeps its whitespace for the element's input function; only
+    /// a bound with no characters at all is infinite, and `""` is empty.
+    #[test]
+    fn bounds_keep_their_text() {
+        let r = parse_literal("[ 1 , 2 ) ").unwrap();
+        assert_eq!(
+            (r.lower.as_deref(), r.upper.as_deref()),
+            (Some(" 1 "), Some(" 2 "))
+        );
+        assert!(r.lower_inc && !r.upper_inc);
+        let r = parse_literal("(,\"\"]").unwrap();
+        assert_eq!((r.lower, r.upper.as_deref()), (None, Some("")));
+        let r = parse_literal("[\"a\"\"b\",c\\,d)").unwrap();
+        assert_eq!(
+            (r.lower.as_deref(), r.upper.as_deref()),
+            (Some("a\"b"), Some("c,d"))
+        );
+        assert!(parse_literal("\x0b EMPTY \x0b").unwrap().empty);
+    }
 }

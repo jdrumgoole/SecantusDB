@@ -2795,14 +2795,6 @@ Measured on a private PostgreSQL 15.19 cluster with `fe(a int, b text)`.
       the same shape (RP-511).
       Backlog-ID: RP-507
       Verify: tests/backlog/test_rp_found_rp500.py::test_operand_constant_read_at_create
-- [ ] **A malformed range literal's 22P02 has no DETAIL.** PostgreSQL
-      15.19's `range_parse` explains each one: `select '[1,2'::int4range`
-      has DETAIL `Unexpected end of input.`, `'[1,2]x'` `Junk after right
-      parenthesis or bracket.`, `'1,2'` `Missing left parenthesis or
-      bracket.`. Here the message and position match and the DETAIL is
-      empty.
-      Backlog-ID: RP-510
-      Verify: tests/backlog/test_rp_found_rp500.py::test_range_literal_detail
 - [ ] **PREPARE evaluates a constant expression, and does not read a cast
       constant it does not evaluate.** PostgreSQL 15.19's PREPARE
       parse-analyses its statement and plans nothing: `prepare s1 as select
@@ -2817,6 +2809,25 @@ Measured on a private PostgreSQL 15.19 cluster with `fe(a int, b text)`.
       evaluate.
       Backlog-ID: RP-511
       Verify: tests/backlog/test_rp_found_rp500.py::test_prepare_analyses_without_evaluating
+
+## Found while working RP-510 (2026-11-11)
+
+Measured on PostgreSQL 15.19.
+
+- [ ] **A malformed multirange literal's 22P02 has no DETAIL, and a bad
+      member is reported as a range literal.** PostgreSQL 15.19's
+      `multirange_in` walks the literal itself and explains each failure:
+      `select '{[1,2}'::int4multirange` and `'{[1,2)'` have DETAIL
+      `Unexpected end of input.`, `'[1,2)'` `Missing left brace.`, `'{[1,2)}
+      x'` `Junk after closing right brace.`, and `'{[1,2),x}'` is
+      `malformed multirange literal: "{[1,2),x}"` with `Expected range
+      start.`. Here the first four have no DETAIL, and the last is
+      `malformed range literal: "x"` with the range parser's DETAIL: the
+      literal is split into members first (`split_members`) and each member
+      parsed as a range, where PostgreSQL's state machine reads the members
+      in place.
+      Verify: tests/backlog/test_rp_found_rp510.py::test_multirange_literal_detail
+      Backlog-ID: RP-878
 
 ## Found while working RP-493 (2026-11-07)
 
