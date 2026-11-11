@@ -51,7 +51,8 @@ from pathlib import Path
 MONGOD_8211 = Path("/opt/homebrew/opt/mongodb-community@8.2.11/bin")
 RUFF = "ruff@0.15.20"
 WORKERS = "4"
-#: The ``storage-engine`` job's steps whose named test files this gate runs.
+#: The CI steps whose named test files this gate runs (the first is in the
+#: ``storage-engine`` job, the R7 one in ``mdb-binary``).
 STORAGE_ENGINE_STEPS = (
     "Storage + Rust-server smoke tests",
     "Build + smoke the standalone secantusd-rs binary (R7)",
