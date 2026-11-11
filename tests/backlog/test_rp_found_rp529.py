@@ -1,8 +1,8 @@
 """Gap tests of the divergences found while working RP-529 (a domain
 column's whole row is typed by the domain): RP-551 (a cast to a domain
 over `char(n)` was not blank-padded; fixed), RP-552 (a domain's CHECK error inside a
-record literal carries no position), RP-553 (a schema's domain names its
-CHECK after the qualified name), RP-554 (a scalar subquery's array of a row
+record literal carries no position), RP-553 (a schema's domain named its
+CHECK after the qualified name; fixed), RP-554 (a scalar subquery's array of a row
 type was described as `text[]`; fixed), RP-555 (`ALTER DOMAIN ... NOT VALID`
 validated the rows; fixed) and RP-556 (`ALTER COLUMN TYPE` to a domain over the
 column's type is refused).
@@ -136,7 +136,7 @@ def test_record_literal_domain_error_position(dsn: str) -> None:
 
 
 # An unnamed CHECK of a domain in a schema is named after the domain's own
-# name, not its qualified one.
+# name, not its qualified one. It was `s.sd_check` (RP-553).
 SCHEMA_DOMAIN = {
     "select 200::s.sd": (
         "23514",
@@ -148,10 +148,29 @@ SCHEMA_DOMAIN = {
 }
 
 
-@pytest.mark.backlog("RP-553")
+@pytest.mark.backlog_fixed("RP-553")
 @pytest.mark.parametrize("query", list(SCHEMA_DOMAIN))
 def test_schema_domain_check_name(query: str, dsn: str) -> None:
     assert answer(dsn, query) == SCHEMA_DOMAIN[query]
+
+
+# `ALTER DOMAIN ... ADD CHECK` numbers a second unnamed CHECK after the
+# bare name too, and `DROP CONSTRAINT` finds it by that name (RP-553).
+@pytest.mark.backlog_fixed("RP-553")
+def test_schema_domain_added_check_name(dsn: str) -> None:
+    with psycopg.connect(dsn, autocommit=True) as c:
+        for q in _SETUP:
+            c.execute(q)
+        names = "select conname from pg_constraint where contypid = 's.sd'::regtype order by 1"
+        c.execute("alter domain s.sd add check (value > 0)")
+        assert c.execute(names).fetchall() == [("sd_check",), ("sd_check1",)]
+        with pytest.raises(psycopg.errors.CheckViolation) as e:
+            c.execute("select (-1)::s.sd")
+        assert e.value.diag.message_primary == (
+            'value for domain s.sd violates check constraint "sd_check1"'
+        )
+        c.execute("alter domain s.sd drop constraint sd_check")
+        assert c.execute(names).fetchall() == [("sd_check1",)]
 
 
 # A scalar subquery's `array_agg` of a whole row is an array of the row

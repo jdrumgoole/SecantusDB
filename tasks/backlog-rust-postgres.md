@@ -2739,12 +2739,6 @@ char(3)`, `create domain dc3n as dc3` and the rest of the `_SETUP` in
       23514 has no position.
       Backlog-ID: RP-552
       Verify: tests/backlog/test_rp_found_rp529.py::test_record_literal_domain_error_position
-- [ ] **A schema's domain reports its CHECK under the qualified name.**
-      `select 200::s.sd` is 23514 `value for domain s.sd violates check
-      constraint "sd_check"` on PostgreSQL 15.19; here the constraint is
-      `"s.sd_check"`, though `pg_constraint.conname` is `sd_check` in both.
-      Backlog-ID: RP-553
-      Verify: tests/backlog/test_rp_found_rp529.py::test_schema_domain_check_name
 - [ ] **`ALTER COLUMN TYPE` to a domain over the column's type is
       refused.** `alter table falt alter column a type pint`, `a int` and
       `pint` a domain over `int`, retypes the column on PostgreSQL 15.19
@@ -3555,7 +3549,9 @@ m "Mx839")` and `z839(o char(4) default 'ab', v varchar(3) default 'q')`.
       constraint "Mx839_check"`: `domain_check_input` names the domain by
       `format_type_be`, which quotes a name as `quote_identifier` does.
       Here both print `Mx839` without the quotes, as does `select
-      null::"Mx839"`.
+      null::"Mx839"`. A keyword is quoted too: `select 0::s."int"`, `s."int"`
+      a domain over `int` with `check (value > 0)`, is `value for domain
+      s."int" violates ...` on 15.19 and `s.int` here (found working RP-553).
       Verify: tests/backlog/test_rp_found_rp839.py::test_a_domain_error_quotes_a_name_that_needs_it
       Backlog-ID: RP-845
 - [ ] **A `char(n)` column's DEFAULT prints its cast as `::character`.**
