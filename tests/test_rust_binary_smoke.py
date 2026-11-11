@@ -19,6 +19,7 @@ import re
 import signal
 import subprocess
 import sys
+import threading
 
 import pytest
 
@@ -122,6 +123,57 @@ _SPAWN_KWARGS: dict[str, object] = (
 )
 
 
+class _Drain:
+    """Reads a server's pipe to its end on a thread, keeping what it read.
+
+    A pipe nobody reads fills, and the server then blocks in its next log
+    write -- holding whatever it held, so every connection stalls and pymongo,
+    its heartbeats unanswered, cancels the operation in flight. A Windows
+    anonymous pipe fills at ~4 KiB, a handful of `Slow query` lines at
+    `slowms: 0` (2026-11-10 to 11-11: every push to main failed
+    test_slow_operations_are_logged_... with `_OperationCancelled`); Linux's
+    64 KiB only hid it.
+    """
+
+    def __init__(self, pipe: object) -> None:
+        self._lines: list[str] = []
+        self._thread = threading.Thread(target=self._read, args=(pipe,), daemon=True)
+        self._thread.start()
+
+    def _read(self, pipe: object) -> None:
+        for line in pipe:  # type: ignore[attr-defined]
+            self._lines.append(line)
+
+    def text(self) -> str:
+        """Everything the server wrote, once it has exited (or 10 s on)."""
+        self._thread.join(timeout=10)
+        return "".join(self._lines)
+
+
+#: Each started server's stderr, by pid.
+_STDERR: dict[int, _Drain] = {}
+
+
+def _start(args: list[str], **kwargs: object) -> subprocess.Popen[str]:
+    """The binary with ``args``, both pipes read for as long as it runs:
+    stderr from here, stdout by `_bound_address` once it has the banner."""
+    assert _BIN is not None
+    proc = subprocess.Popen(
+        [str(_BIN), *args],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        **kwargs,  # type: ignore[call-overload]
+    )
+    _STDERR[proc.pid] = _Drain(proc.stderr)
+    return proc
+
+
+def _stderr(proc: subprocess.Popen[str]) -> str:
+    """What a `_start`ed server wrote to standard error."""
+    return _STDERR[proc.pid].text()
+
+
 def _request_shutdown(proc: subprocess.Popen[str]) -> None:
     """Ask the daemon to stop the way a user would, per platform."""
     proc.send_signal(signal.CTRL_BREAK_EVENT if _WINDOWS else signal.SIGTERM)
@@ -129,14 +181,7 @@ def _request_shutdown(proc: subprocess.Popen[str]) -> None:
 
 @pytest.fixture
 def daemon(tmp_path: pathlib.Path) -> subprocess.Popen[str]:
-    assert _BIN is not None
-    proc = subprocess.Popen(
-        [str(_BIN), "--port", "0", "--storage-path", str(tmp_path / "data")],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        **_SPAWN_KWARGS,
-    )
+    proc = _start(["--port", "0", "--storage-path", str(tmp_path / "data")], **_SPAWN_KWARGS)
     try:
         yield proc
     finally:
@@ -155,6 +200,7 @@ def _bound_address(proc: subprocess.Popen[str]) -> tuple[str, int]:
         if m or not line:
             break
     assert m, f"no listening banner in the first stdout lines: {line!r}"
+    _Drain(proc.stdout)
     return m.group(1), int(m.group(2))
 
 
@@ -182,7 +228,7 @@ def test_binary_serves_pymongo_and_exits_cleanly(
         client.close()
 
     _request_shutdown(daemon)
-    assert daemon.wait(timeout=15) == 0, daemon.stderr.read() if daemon.stderr else ""
+    assert daemon.wait(timeout=15) == 0, _stderr(daemon)
 
 
 def test_slow_operations_are_logged_and_the_threshold_is_server_wide(
@@ -242,8 +288,7 @@ def test_slow_operations_are_logged_and_the_threshold_is_server_wide(
 
     _request_shutdown(daemon)
     assert daemon.wait(timeout=15) == 0
-    assert daemon.stderr is not None
-    stderr = daemon.stderr.read()
+    stderr = _stderr(daemon)
     # mongod's structured log line, on standard error as in `getLog`.
     assert (
         '"msg":"Slow query","attr":{"type":"command","isFromUserConnection":true,'
@@ -252,19 +297,8 @@ def test_slow_operations_are_logged_and_the_threshold_is_server_wide(
 
 
 def test_standalone_flag_drops_replica_set(tmp_path: pathlib.Path) -> None:
-    assert _BIN is not None
-    proc = subprocess.Popen(
-        [
-            str(_BIN),
-            "--port",
-            "0",
-            "--storage-path",
-            str(tmp_path / "data"),
-            "--standalone",
-        ],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
+    proc = _start(
+        ["--port", "0", "--storage-path", str(tmp_path / "data"), "--standalone"],
         **_SPAWN_KWARGS,
     )
     try:
@@ -355,13 +389,9 @@ def test_stops_on_sigterm_sent_at_the_banner_whatever_the_parent_left(
     a harness sends SIGTERM the moment it reads the banner. Before batch 58
     the stop handler was installed AFTER the banner, so that SIGTERM was
     ignored (blocked / SIG_IGN) or killed the process with no checkpoint."""
-    assert _BIN is not None
-    proc = subprocess.Popen(
-        [str(_BIN), "--port", "0", "--storage-path", str(tmp_path / "data")],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        preexec_fn=inherit,  # type: ignore[arg-type]
+    proc = _start(
+        ["--port", "0", "--storage-path", str(tmp_path / "data")],
+        preexec_fn=inherit,
     )
     try:
         _bound_address(proc)
