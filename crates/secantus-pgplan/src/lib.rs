@@ -14612,8 +14612,9 @@ fn plan_window_call(
         .as_deref()
         .ok_or_else(|| Error::Internal("a window call without OVER".into()))?;
     let name = func_name(f).unwrap_or_default();
-    let func = window_func_by_name(&name)
-        .ok_or_else(|| Error::Unsupported(format!("window function {name}()")))?;
+    let Some(func) = window_func_by_name(&name) else {
+        return Err(over_on_unplanned_function(f, &name, def, params));
+    };
     let func = if func == WindowFunc::Count && f.agg_star {
         WindowFunc::CountStar
     } else {
@@ -14706,6 +14707,90 @@ fn plan_window_call(
         user,
     });
     Ok(field)
+}
+
+/// Is `name` one of PostgreSQL 15.19's own aggregates or window functions,
+/// in any overload (`SELECT DISTINCT proname FROM pg_proc WHERE prokind IN
+/// ('a', 'w') AND oid < 16384`)? No name there is also a plain function's.
+fn is_builtin_aggregate_or_window(name: &str) -> bool {
+    static SET: std::sync::OnceLock<std::collections::HashSet<&'static str>> =
+        std::sync::OnceLock::new();
+    SET.get_or_init(|| {
+        include_str!("pg15_aggregate_window_functions.tsv")
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .collect()
+    })
+    .contains(name)
+}
+
+/// The error for an OVER on a call the window planner has no function for.
+///
+/// An aggregate or window function PostgreSQL has (`stddev(v) over ()`) is a
+/// gap in this server, 0A000. Anything else is `ParseFuncOrColumn`'s: the
+/// arguments and the function are resolved first, so a call no function
+/// takes is 42883, then a plain function is 42809 for the first clause only
+/// an aggregate or window function may carry, in PostgreSQL's order
+/// (`(*)`, DISTINCT, WITHIN GROUP, ORDER BY, FILTER, OVER), naming the
+/// function as written (`NameListToString`: `pg_catalog.upper`).
+fn over_on_unplanned_function(
+    f: &pg_query::protobuf::FuncCall,
+    name: &str,
+    def: &TableDef,
+    params: &[Bson],
+) -> Error {
+    if is_builtin_aggregate_or_window(name) {
+        return Error::Unsupported(format!("window function {name}()"));
+    }
+    // Resolve it as the plain call it would be without the clauses: the
+    // planner's overload resolution reports a call no function takes.
+    let plain = pg_query::protobuf::FuncCall {
+        over: None,
+        agg_star: false,
+        agg_distinct: false,
+        agg_within_group: false,
+        agg_order: Vec::new(),
+        agg_filter: None,
+        ..f.clone()
+    };
+    let target = pg_query::protobuf::Node {
+        node: Some(N::ResTarget(Box::new(pg_query::protobuf::ResTarget {
+            name: String::new(),
+            indirection: Vec::new(),
+            val: Some(Box::new(pg_query::protobuf::Node {
+                node: Some(N::FuncCall(Box::new(plain))),
+            })),
+            location: f.location,
+        }))),
+    };
+    if let Err(e) = plan_table_targets(std::slice::from_ref(&target), def, params) {
+        return e;
+    }
+    let written = f
+        .funcname
+        .iter()
+        .filter_map(|n| match n.node.as_ref()? {
+            N::String(s) => Some(s.sval.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join(".");
+    let message = if f.agg_star {
+        format!("{written}(*) specified, but {written} is not an aggregate function")
+    } else if f.agg_distinct {
+        format!("DISTINCT specified, but {written} is not an aggregate function")
+    } else if f.agg_within_group {
+        format!("WITHIN GROUP specified, but {written} is not an aggregate function")
+    } else if !f.agg_order.is_empty() {
+        format!("ORDER BY specified, but {written} is not an aggregate function")
+    } else if f.agg_filter.is_some() {
+        format!("FILTER specified, but {written} is not an aggregate function")
+    } else {
+        format!("OVER specified, but {written} is not a window function nor an aggregate function")
+    };
+    set_error_location(f.location);
+    Error::Sqlstate("42809", message)
 }
 
 /// Plan each window call inside `val` as its own window, and replace it in

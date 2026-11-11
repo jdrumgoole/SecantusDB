@@ -2498,22 +2498,44 @@ numeric(5,2), ca char(3)[])` holding `('xy', 'ab', 2.5, '{a,bc}')`.
       Verify: tests/backlog/test_rp_found_rp656.py::test_array_sublink_of_numeric_describes_its_modifier
       Backlog-ID: RP-667
 
-## Found while working RP-671 (2026-11-08)
+## Found while working RP-682 (2026-11-11)
 
-Measured on PostgreSQL 15.19 (the shared reference on port 5415): the
-VALUES-only statements as written, the rest with the `_SETUP` tables of
-`tests/backlog/test_rp_found_rp671.py` made temporary. This server keeps a
-`char(n)` value trimmed and pads it where it enters an expression; a value
-that reaches a comparison carrying its blanks is compared with them.
+Measured on PostgreSQL 15.19 (the shared reference on port 5415) with the
+VALUES-only statements of `tests/backlog/test_rp_found_rp682.py`.
 
-- [ ] **OVER on a plain function is 0A000.** `select octet_length('x')
-      over ()` is 42809 `OVER specified, but octet_length is not a window
-      function nor an aggregate function` on PostgreSQL 15.19 (`ParseFuncOrColumn`);
-      here it is 0A000 `window function octet_length() is not supported
-      yet`, for `upper` and `length` alike: a function PostgreSQL itself
-      refuses is reported as a gap in this server.
-      Verify: tests/backlog/test_rp_found_rp671.py::test_over_on_a_plain_function_is_42809
-      Backlog-ID: RP-682
+- [ ] **DISTINCT, ORDER BY or FILTER on a plain function call is accepted
+      and ignored.** `select upper(distinct 'a')`, `select upper('a' order
+      by 1)` and `select upper('a') filter (where true)` are each 42809
+      `<clause> specified, but upper is not an aggregate function` on
+      PostgreSQL 15.19 (`ParseFuncOrColumn`); here each answers `A`. Since
+      RP-682 the same clauses under OVER are refused in PostgreSQL's order;
+      without OVER the plain-call path never looks at them.
+      Verify: tests/backlog/test_rp_found_rp682.py::test_an_aggregate_clause_on_a_plain_function_is_42809
+      Backlog-ID: RP-868
+
+- [ ] **An ordered-set aggregate under OVER is not refused as
+      PostgreSQL refuses it.** `select rank(1) over ()` is 42809 `WITHIN
+      GROUP is required for ordered-set aggregate rank` on PostgreSQL 15.19
+      (with arguments `rank` resolves to the hypothetical-set aggregate);
+      here it answers 1, the window function. `percentile_cont(0.5) within
+      group (order by v) over ()` is 0A000 `OVER is not supported for
+      ordered-set aggregate percentile_cont` there and 0A000 `window
+      function percentile_cont() is not supported yet` here. Needs the
+      aggregates' `aggkind`, which the planner does not keep.
+      Verify: tests/backlog/test_rp_found_rp682.py::test_an_ordered_set_aggregate_over_a_window_is_refused
+      Backlog-ID: RP-869
+
+- [ ] **Most of PostgreSQL's aggregates do not run over a window.**
+      `stddev(v) over (order by v)` answers the running sample standard
+      deviation on PostgreSQL 15.19; here it is 0A000 `window function
+      stddev() is not supported yet`, and so is every built-in aggregate
+      but `sum`, `count`, `avg`, `min`, `max`, `string_agg`, `array_agg`,
+      `bool_and` and `bool_or`: `bit_and` / `bit_or` / `bit_xor`, `corr`,
+      `covar_*`, `every`, `json[b]_agg`, `json[b]_object_agg`,
+      `range_agg`, `range_intersect_agg`, the `regr_*` family, `stddev*`,
+      `var*` / `variance` and `xmlagg` (a user aggregate runs).
+      Verify: tests/backlog/test_rp_found_rp682.py::test_more_aggregates_run_over_a_window
+      Backlog-ID: RP-870
 
 ## Found while working RP-670 (2026-11-09)
 
