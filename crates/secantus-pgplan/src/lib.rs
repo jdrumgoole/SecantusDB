@@ -17994,9 +17994,7 @@ pub(crate) fn domain_array_cast(value: &Bson, element: &str) -> Result<Option<Bs
         return Ok(None);
     }
     let check = |v: Bson| -> Result<Bson> {
-        for d in chain.iter().rev() {
-            domains::check_domain(d, &v)?;
-        }
+        domains::check_chain(&chain, &v)?;
         Ok(v)
     };
     match value {
@@ -34730,9 +34728,7 @@ fn composite_value(value: Bson, target: &str, fields: &[(String, String)]) -> Re
         out.push(if ty == "bpchar" {
             let v = cast_value_inner(v, ty)?;
             // Innermost first, as a domain over a domain checks its base's.
-            for d in domains_of.iter().rev() {
-                domains::check_domain(d, &v)?;
-            }
+            domains::check_chain(&domains_of, &v)?;
             v
         } else {
             cast_value(v, ty)?
@@ -38890,10 +38886,11 @@ pub(crate) fn cast_value(value: Bson, target: &str) -> Result<Bson> {
             ))),
         };
     }
-    // A domain: the base type's cast, then the domain's constraints.
-    if let Some(d) = domains::user_domain(target) {
-        let v = cast_value(value, &d.base)?;
-        domains::check_domain(&d, &v)?;
+    // A domain: the innermost base type's cast, then the constraints of
+    // every domain of the chain, named by the one cast to.
+    if let Some((base, _, chain)) = domains::base_type_and_typmod(target) {
+        let v = cast_value(value, &base)?;
+        domains::check_chain(&chain, &v)?;
         return Ok(v);
     }
     let out = cast_value_inner(value, target)?;
@@ -45784,9 +45781,7 @@ fn const_value_node(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result<
             if typmod >= 0 {
                 let v = explicit_typmod(cast_value(value, &base)?, &base, typmod)?;
                 // Innermost first, as a domain over a domain checks its base's.
-                for d in chain.iter().rev() {
-                    domains::check_domain(d, &v)?;
-                }
+                domains::check_chain(&chain, &v)?;
                 return Ok(v);
             }
         }

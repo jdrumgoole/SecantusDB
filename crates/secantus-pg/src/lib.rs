@@ -2262,12 +2262,7 @@ impl plpgsql_fn::Host for PlHost<'_> {
             // chain, the innermost domain's first, and names the domain it
             // coerces to (`value for domain dd violates check constraint
             // "d_check"`, 15.19).
-            let outer = chain.first().map(|d| d.name.clone()).unwrap_or_default();
-            for d in chain.iter().rev() {
-                let mut d = d.clone();
-                d.name.clone_from(&outer);
-                secantus_pgplan::domains::check_domain(&d, &v).map_err(plan_error)?;
-            }
+            secantus_pgplan::domains::check_chain(&chain, &v).map_err(plan_error)?;
             Ok(v)
         })())
     }

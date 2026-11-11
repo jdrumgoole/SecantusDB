@@ -186,12 +186,26 @@ pub fn declared_collation(name: &str) -> Option<String> {
 }
 
 /// Check `value` against domain `name`: 23502 for a NULL the domain refuses,
-/// 23514 naming the first CHECK that is false.
+/// 23514 naming the first CHECK that is false. A domain over a domain
+/// answers to every domain of its chain (`check_chain`).
 pub fn domain_check(name: &str, value: &Bson) -> Result<()> {
-    match user_domain(name) {
-        Some(d) => check_domain(&d, value),
+    match base_type_and_typmod(name) {
+        Some((_, _, chain)) => check_chain(&chain, value),
         None => Ok(()),
     }
+}
+
+/// One `CoerceToDomain` to `chain[0]` (`base_type_and_typmod`'s chain,
+/// outermost first): every domain's constraints, the innermost domain's
+/// first, each error naming the domain coerced to (15.19, RP-845).
+pub fn check_chain(chain: &[Domain], value: &Bson) -> Result<()> {
+    let Some(outer) = chain.first() else {
+        return Ok(());
+    };
+    for d in chain.iter().rev() {
+        check_domain_as(d, value, outer)?;
+    }
+    Ok(())
 }
 
 thread_local! {
@@ -229,15 +243,28 @@ pub fn same_domain(a: &str, b: &str) -> bool {
     }
 }
 
-/// `domain_check` for a domain already looked up.
-pub fn check_domain(d: &Domain, value: &Bson) -> Result<()> {
+/// The domain as `domain_check_input`'s errors name it, `format_type_be`:
+/// qualified only when its schema is off the search path, and each part
+/// quoted as `quote_identifier` quotes it (`"Mx839"`, RP-845).
+fn format_type_be(d: &Domain) -> String {
+    crate::regtype_text(d.oid)
+}
+
+/// `d`'s own constraints, checked for a coercion to `coerced_to`, the
+/// domain the errors name (`value for domain dd violates check constraint
+/// "d_check"`, 15.19): `ExecEvalConstraintCheck` names the `CoerceToDomain`'s
+/// `resulttype` by `format_type_be`.
+fn check_domain_as(d: &Domain, value: &Bson, coerced_to: &Domain) -> Result<()> {
     if relabelling() {
         return Ok(());
     }
     if *value == Bson::Null && d.not_null {
         return Err(Error::Sqlstate(
             "23502",
-            format!("domain {} does not allow null values", d.name),
+            format!(
+                "domain {} does not allow null values",
+                format_type_be(coerced_to)
+            ),
         ));
     }
     // Every CHECK is evaluated on NULL too; `value > 0` is NULL, which
@@ -251,7 +278,7 @@ pub fn check_domain(d: &Domain, value: &Bson) -> Result<()> {
                 "23514",
                 format!(
                     "value for domain {} violates check constraint \"{cname}\"",
-                    d.name
+                    format_type_be(coerced_to)
                 ),
             ));
         }

@@ -2541,21 +2541,6 @@ dv687, c char(3))`, `d687` an `int` with `check (value > 0)` and `dv687` a
       Backlog-ID: RP-690
       Verify: none -- seen once, under load; a timing that does not fail on demand
 
-## Found while working RP-687 (2026-11-09)
-
-Measured on a private PostgreSQL 15.19 cluster with the `_SETUP` in
-`tests/backlog/test_rp_found_rp687.py`: `dcc687` a `varchar(3)` with
-`check (value <> 'no')`, `dvv687` a domain over it.
-
-- [ ] **A cast to a domain over a domain names the inner domain.** `select
-      'no'::dvv687` is 23514 `value for domain dvv687 violates check
-      constraint "dcc687_check"` on PostgreSQL 15.19 (one `CoerceToDomain`
-      names the domain it coerces to); here the message names `dcc687`,
-      for `'no'::text::dvv687` and a PL/pgSQL `x dvv687 := 'no'` alike.
-      Since RP-670 a trigger record's field of such a domain names it.
-      Verify: tests/backlog/test_rp_found_rp687.py::test_cast_to_a_domain_over_a_domain_names_the_outer_domain
-      Backlog-ID: RP-696
-
 ## Found while working RP-694 (2026-11-09)
 
 Measured on a private PostgreSQL 15.19 cluster with the `_SETUP` in
@@ -3528,26 +3513,6 @@ Measured on a private, freshly initdb'd PostgreSQL 15.19 cluster with the
       Verify: tests/backlog/test_rp_found_rp761.py::test_explain_prints_a_computed_sort_key_as_its_expression
       Backlog-ID: RP-840
 
-## Found while working RP-839 (2026-11-10)
-
-Measured on a private, freshly initdb'd PostgreSQL 15.19 cluster with the
-`_SETUP` in `tests/backlog/test_rp_found_rp839.py`: `"Mx839"` a domain over
-`int` with `not null check (value > 0)`, `t839(x text collate "C", y text,
-m "Mx839")` and `z839(o char(4) default 'ab', v varchar(3) default 'q')`.
-
-- [ ] **A domain whose name needs quotes is named bare in its errors.** An
-      INSERT of NULL into a column of `"Mx839"` is 23502 `domain "Mx839"
-      does not allow null values` on PostgreSQL 15.19, and a value its
-      CHECK refuses is 23514 `value for domain "Mx839" violates check
-      constraint "Mx839_check"`: `domain_check_input` names the domain by
-      `format_type_be`, which quotes a name as `quote_identifier` does.
-      Here both print `Mx839` without the quotes, as does `select
-      null::"Mx839"`. A keyword is quoted too: `select 0::s."int"`, `s."int"`
-      a domain over `int` with `check (value > 0)`, is `value for domain
-      s."int" violates ...` on 15.19 and `s.int` here (found working RP-553).
-      Verify: tests/backlog/test_rp_found_rp839.py::test_a_domain_error_quotes_a_name_that_needs_it
-      Backlog-ID: RP-845
-
 ## Found while working RP-846 (2026-11-11)
 
 Measured on a private, freshly initdb'd PostgreSQL 15.19 cluster with the
@@ -3582,6 +3547,22 @@ stored expression tree.
       quoted and labelled.
       Verify: tests/backlog/test_rp_found_rp846.py::test_a_temporal_or_bytea_default_prints_as_a_literal
       Backlog-ID: RP-864
+
+## Found while working RP-845 (2026-11-11)
+
+Measured on PostgreSQL 15.19 (the shared reference on port 5415) with the
+`_SETUP` in `tests/backlog/test_rp_found_rp839.py` and `"Over845"` a domain
+over its `"Mx839"`.
+
+- [ ] **A PL/pgSQL declaration folds a quoted type name to lower case.**
+      `do $$ declare x "Over845" := 5; begin raise notice '%', x; end $$`
+      prints `NOTICE: 5` on PostgreSQL 15.19 (`parse_datatype` reads the
+      type as the grammar does, keeping a quoted name's case), and an
+      assignment of 0 to such a variable is 23514 `value for domain
+      "Over845" violates check constraint "Mx839_check"`. Here each is
+      42704 `type "over845" does not exist`.
+      Verify: tests/backlog/test_rp_found_rp839.py::test_a_plpgsql_declaration_keeps_a_quoted_types_case
+      Backlog-ID: RP-865
 
 ## Found while working RP-692 (2026-11-10)
 
