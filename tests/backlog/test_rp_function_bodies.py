@@ -8,8 +8,8 @@ RP-477 (a function with one OUT parameter, called in FROM, named its
 column after the function; fixed), found while working RP-477, RP-483
 (the same function's call in a select list was named after its parameter,
 and a field of its scalar result was not refused; fixed), and found while
-working RP-483, RP-485 (a call in a schema that does not exist is a missing
-function, not a missing schema); and found while working RP-465, RP-500
+working RP-483, RP-485 (a call in a schema that does not exist was a missing
+function, not a missing schema; fixed); and found while working RP-465, RP-500
 (CREATE did not check a literal's input, the result type, a CALL, or a
 SQL-standard body with `check_function_bodies` off; fixed) and RP-502 (an
 array parameter could not be subscripted; fixed).
@@ -973,25 +973,121 @@ def test_set_returning_target_is_named_by_its_function(query: str, dsn: str) -> 
 
 # Found while working RP-483: a call qualified by a schema that does not
 # exist is 3F000 on PostgreSQL 15.19 (`LookupExplicitNamespace`), at the
-# call; `pg_temp` is such a schema until the session makes a temp object.
+# call, a built-in's name included; `pg_temp` is such a schema until the
+# session makes a temp object. An analysis error PostgreSQL meets first --
+# the FROM clause's, the call's argument's, an earlier target's -- stands.
+_NO_SCHEMA = 'schema "nosuch_schema" does not exist'
+_NO_FUNCTION_HINT = (
+    "No function matches the given name and argument types. "
+    "You might need to add explicit type casts."
+)
 MISSING_SCHEMA_CALL = {
-    "select nosuch_schema.nosuch()": (
-        "3F000",
-        'schema "nosuch_schema" does not exist',
+    "select nosuch_schema.nosuch()": ("3F000", _NO_SCHEMA, None, "8"),
+    "select 1 + nosuch_schema.f(1)": ("3F000", _NO_SCHEMA, None, "12"),
+    "select pg_temp.nosuch()": ("3F000", 'schema "pg_temp" does not exist', None, "8"),
+    "select nosuch_schema.abs(-2)": ("3F000", _NO_SCHEMA, None, "8"),
+    "select nosuch_schema.count(*)": ("3F000", _NO_SCHEMA, None, "8"),
+    "select nosuch_schema.f(), realmissing()": ("3F000", _NO_SCHEMA, None, "8"),
+    "select 1/0, nosuch_schema.f()": ("3F000", _NO_SCHEMA, None, "13"),
+    "values (1), (nosuch_schema.f())": ("3F000", _NO_SCHEMA, None, "14"),
+    "explain select nosuch_schema.f()": ("3F000", _NO_SCHEMA, None, "16"),
+    "select * from nosuch_schema.f()": ("3F000", _NO_SCHEMA, None, "15"),
+    "select nosuch_schema.f() from nosuch_table": (
+        "42P01",
+        'relation "nosuch_table" does not exist',
+        None,
+        "31",
+    ),
+    "select nosuch_schema.f(nosuch_col)": (
+        "42703",
+        'column "nosuch_col" does not exist',
+        None,
+        "24",
+    ),
+    "select nosuch_col, nosuch_schema.f()": (
+        "42703",
+        'column "nosuch_col" does not exist',
         None,
         "8",
     ),
-    "select 1 + nosuch_schema.f(1)": (
-        "3F000",
-        'schema "nosuch_schema" does not exist',
-        None,
-        "12",
+    "select realmissing(), nosuch_schema.f()": (
+        "42883",
+        "function realmissing() does not exist",
+        _NO_FUNCTION_HINT,
+        "8",
     ),
-    "select pg_temp.nosuch()": ("3F000", 'schema "pg_temp" does not exist', None, "8"),
 }
 
 
-@pytest.mark.backlog("RP-485")
+@pytest.mark.backlog_fixed("RP-485")
 @pytest.mark.parametrize("query", list(MISSING_SCHEMA_CALL))
 def test_call_in_a_missing_schema(query: str, dsn: str) -> None:
+    """A call in a missing schema was 42883, the function not found."""
     assert answer(dsn, query) == MISSING_SCHEMA_CALL[query]
+
+
+def session_answer(dsn: str, statements: tuple[str, ...]) -> Any:
+    """The last statement's answer, the statements run in order on one
+    fresh session."""
+    with psycopg.connect(dsn, autocommit=True) as c:
+        out: Any = None
+        for q in statements:
+            try:
+                cur = c.execute(q)
+                out = cur.fetchall() if cur.description else ("rowcount", cur.rowcount)
+            except psycopg.Error as e:
+                out = (
+                    e.sqlstate,
+                    e.diag.message_primary,
+                    e.diag.message_hint,
+                    e.diag.statement_position,
+                )
+        return out
+
+
+# `pg_temp` is the session's temp namespace once its first temporary
+# object is made, and stays one after the last is dropped
+# (`myTempNamespace`); one made by a rolled-back transaction leaves none
+# (`AtEOXact_Namespace`). And the call runs nothing: a subquery in its
+# arguments draws no sequence value. PostgreSQL 15.19.
+_NO_PG_TEMP_FUNCTION = (
+    "42883",
+    "function pg_temp.nosuch() does not exist",
+    _NO_FUNCTION_HINT,
+    "8",
+)
+MISSING_SCHEMA_SESSION = {
+    "temp table dropped": (
+        ("create temp table tt485(a int)", "drop table tt485", "select pg_temp.nosuch()"),
+        _NO_PG_TEMP_FUNCTION,
+    ),
+    "temp function dropped": (
+        (
+            "create function pg_temp.tf485() returns int language sql as $$ select 3 $$",
+            "drop function pg_temp.tf485()",
+            "select pg_temp.nosuch()",
+        ),
+        _NO_PG_TEMP_FUNCTION,
+    ),
+    "temp table rolled back": (
+        ("begin", "create temp table tt485(a int)", "rollback", "select pg_temp.nosuch()"),
+        ("3F000", 'schema "pg_temp" does not exist', None, "8"),
+    ),
+    "no sequence drawn": (
+        (
+            "drop sequence if exists s485",
+            "create sequence s485",
+            "select nosuch_schema.f((select nextval('s485')))",
+            "select nextval('s485')",
+        ),
+        [(1,)],
+    ),
+}
+
+
+@pytest.mark.backlog_fixed("RP-485")
+@pytest.mark.parametrize("case", list(MISSING_SCHEMA_SESSION))
+def test_missing_schema_call_in_a_session(case: str, dsn: str) -> None:
+    """`pg_temp` was always a schema here, and the call's subquery ran."""
+    statements, expected = MISSING_SCHEMA_SESSION[case]
+    assert session_answer(dsn, statements) == expected

@@ -4514,6 +4514,9 @@ pub struct PgHandler {
     wire_dealloc: Mutex<Vec<String>>,
     /// The temporary tables this session created, dropped when it ends.
     temp_tables: Mutex<Vec<String>>,
+    /// The session's temp namespace has been made (PostgreSQL's
+    /// `myTempNamespace`; see [`Self::install_temp_namespace`]).
+    temp_namespace_made: AtomicBool,
     /// The open block declared a `WITH HOLD` cursor: another thing
     /// PostgreSQL refuses to PREPARE.
     holdable_declared: AtomicBool,
@@ -5085,6 +5088,7 @@ impl PgHandler {
             statement_source: Mutex::new(None),
             wire_dealloc: Mutex::new(Vec::new()),
             temp_tables: Mutex::new(Vec::new()),
+            temp_namespace_made: AtomicBool::new(false),
             holdable_declared: AtomicBool::new(false),
             txn_gucs: Mutex::new(HashMap::new()),
             statement_gucs: Mutex::new(HashMap::new()),
@@ -5567,6 +5571,34 @@ impl PgHandler {
     }
 
     fn install_user_types(&self) {
+        self.install_session_state();
+        self.install_temp_namespace();
+    }
+
+    /// Whether the session's temp namespace exists, for an explicit
+    /// `pg_temp` (`LookupExplicitNamespace`): PostgreSQL's `myTempNamespace`,
+    /// made by the session's first temporary object and kept after its
+    /// last is dropped. Latched from the objects the planner was just
+    /// given, outside a transaction only: one a rolled-back transaction or
+    /// savepoint made leaves no namespace (`AtEOXact_Namespace`), and
+    /// inside one the planner sees the objects themselves. (An object made
+    /// and dropped inside one transaction that commits is missed.)
+    fn install_temp_namespace(&self) {
+        let made = &self.temp_namespace_made;
+        if !made.load(std::sync::atomic::Ordering::Relaxed)
+            && !self
+                .in_transaction
+                .load(std::sync::atomic::Ordering::Relaxed)
+            && secantus_pgplan::schemas::session_holds_temp()
+        {
+            made.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        secantus_pgplan::schemas::set_temp_namespace_made(
+            made.load(std::sync::atomic::Ordering::Relaxed),
+        );
+    }
+
+    fn install_session_state(&self) {
         // Whichever COPY this thread installed for no longer has the
         // thread's state: another session's statement may be installing.
         COPY_INSTALLED.with(|c| c.set(0));

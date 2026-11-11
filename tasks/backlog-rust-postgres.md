@@ -2071,21 +2071,56 @@ Measured on PostgreSQL 15.19 (the data-modifying WITH on a private cluster).
       Verify: tests/backlog/test_rp_plpgsql_labels.py::test_expression_error_carries_its_query
       Backlog-ID: RP-488
 
-## Found while working RP-483 (2026-11-07)
+## Found while working RP-485 (2026-11-11)
 
-- [ ] **A call in a schema that does not exist is reported as a missing
-      function.** On PostgreSQL 15.19 `select nosuch_schema.nosuch()` is
-      3F000 `schema "nosuch_schema" does not exist` at 8
-      (`LookupExplicitNamespace`, before any function is looked up), and
-      `select pg_temp.nosuch()` the same for `pg_temp` in a session that has
-      made no temporary object yet. Here each is 42883 `function nosuch()
-      does not exist` (the schema dropped from the name, at the parenthesis,
-      22) or `function pg_temp.nosuch() does not exist`, with the
-      no-matching-function HINT. Once the session has a temp table both
-      servers answer 42883 for `pg_temp`. Measured on a private 15.19
+- [ ] **A call to a missing function in a named schema drops the schema
+      from the message.** On PostgreSQL 15.19 `select public.nosuch(1)` is
+      42883 `function public.nosuch(integer) does not exist` at 8, the name
+      as written, schema and all (`pg_catalog.nosuch()` and a user schema's
+      alike). Here the message is `function nosuch(integer) does not exist`
+      and the position the bare name's, 15. Measured on a private 15.19
       cluster.
-      Verify: tests/backlog/test_rp_function_bodies.py::test_call_in_a_missing_schema
-      Backlog-ID: RP-485
+      Verify: tests/backlog/test_rp_qualified_calls.py::test_missing_function_keeps_its_schema
+      Backlog-ID: RP-879
+- [ ] **A three-part function name is looked up by its last part.** On
+      PostgreSQL 15.19 `select a.b.c()` is 0A000 `cross-database references
+      are not implemented: a.b.c` at 8 (`DeconstructQualifiedName`, the
+      catalog not the current database). Here it is 42883 `function c()
+      does not exist` at 12. Measured on a private 15.19 cluster.
+      Verify: tests/backlog/test_rp_qualified_calls.py::test_three_part_function_name
+      Backlog-ID: RP-880
+- [ ] **CREATE TABLE does not analyse a column's DEFAULT.** On PostgreSQL
+      15.19 `create table t (a int default nosuch_fn())` is 42883 `function
+      nosuch_fn() does not exist` at 35, and `default nosuch_schema.f()` is
+      3F000 `schema "nosuch_schema" does not exist` at 35
+      (`cookDefault` -> `transformExpr`, at CREATE). Here both succeed, and
+      the error waits for an INSERT that uses the default. Measured on a
+      private 15.19 cluster.
+      Verify: tests/backlog/test_rp_qualified_calls.py::test_create_table_default_is_analysed
+      Backlog-ID: RP-881
+- [ ] **A missing relation qualified with `pg_temp` is named by the
+      session's `pg_temp_N`.** On PostgreSQL 15.19 `select * from
+      pg_temp.nosuch` is 42P01 `relation "pg_temp.nosuch" does not exist`
+      at 15, the name as written, whether or not the session has a temp
+      table. Here it is `relation "pg_temp_N.nosuch" does not exist` at 23.
+      Measured on a private 15.19 cluster.
+      Verify: tests/backlog/test_rp_qualified_calls.py::test_pg_temp_relation_is_named_as_written
+      Backlog-ID: RP-882
+- [ ] **The session's temp namespace does not follow its transactions.**
+      PostgreSQL 15.19 makes `myTempNamespace` with the first temporary
+      object and forgets it when the transaction (or subtransaction) that
+      made it aborts (`AtEOXact_Namespace`). Here `pg_my_temp_schema()`
+      after `begin; create temp table tt(a int); rollback` is the
+      namespace's oid where PostgreSQL answers 0 (the session's list of temp
+      tables keeps the rolled-back name), and after `begin; create temp
+      table tt(a int); drop table tt; commit` the call `pg_temp.nosuch()` is
+      3F000 `schema "pg_temp" does not exist` where PostgreSQL answers 42883
+      (the namespace is latched only from a statement outside a
+      transaction, `install_temp_namespace`). Faithful: keep the namespace's
+      creating (sub)transaction, as `myTempNamespaceSubID` does. Measured on
+      a private 15.19 cluster.
+      Verify: tests/backlog/test_rp_qualified_calls.py::test_temp_namespace_follows_transactions
+      Backlog-ID: RP-883
 
 ## Found while working RP-472 (2026-11-07)
 
