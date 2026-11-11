@@ -611,6 +611,7 @@ fn stage_series(
     group: Vec<Measurement>,
     touched: &mut Vec<ObjectId>,
 ) -> Result<(), CommandError> {
+    forget_changed(inner, uuid, target, key)?;
     let mut rest = group.into_iter().peekable();
     while let Some(first) = rest.peek() {
         let (at, opened_due_to_metadata) = eligible_bucket(inner, uuid, target, env, key, first)?;
@@ -640,6 +641,53 @@ fn stage_series(
         if staged_any && !touched.contains(&bucket.id) {
             touched.push(bucket.id);
         }
+    }
+    Ok(())
+}
+
+/// Forget the series' open buckets that are no longer stored as the
+/// catalog last wrote them: deleted (a TTL pass, a delete) or written by
+/// hand. mongod clears such a bucket when the write happens
+/// (`directWriteStart`); a write here that does not pass through the
+/// commands (the TTL monitor) is found by reading the bucket back.
+fn forget_changed(
+    inner: &mut Inner,
+    uuid: &[u8],
+    target: &Target<'_>,
+    key: &[u8],
+) -> Result<(), CommandError> {
+    let buckets_ns = target.buckets_ns();
+    let Inner {
+        collections,
+        global,
+        ..
+    } = inner;
+    let Some(coll) = collections.get_mut(uuid) else {
+        return Ok(());
+    };
+    let ids: Vec<(ObjectId, u64)> = coll
+        .open
+        .iter()
+        .filter(|b| b.key == key && b.committed > 0 && b.count == b.committed)
+        .map(|b| (b.id, b.committed))
+        .collect();
+    for (id, committed) in ids {
+        let rows = target
+            .storage
+            .find(target.db, &buckets_ns, &doc! {"_id": id}, None, None)
+            .map_err(crate::util::command_error)?;
+        let stored = rows.first().and_then(|r| decode(r).ok()).and_then(|d| {
+            d.get_document("control")
+                .ok()
+                .and_then(|c| c.get("count"))
+                .and_then(crate::util::as_i64)
+        });
+        if stored == Some(committed as i64) {
+            continue;
+        }
+        coll.open.retain(|b| b.id != id);
+        coll.stats.0[Stat::ActiveBuckets as usize] -= 1;
+        global.0[Stat::ActiveBuckets as usize] -= 1;
     }
     Ok(())
 }
@@ -1471,10 +1519,25 @@ fn commit(
                     return Err(write_error(e));
                 }
             } else {
-                target
+                let outcome = target
                     .storage
-                    .update_matching(target.db, &buckets_ns, &doc! {"_id": bucket.id}, &doc, false, false)
+                    .update_matching(
+                        target.db,
+                        &buckets_ns,
+                        &doc! {"_id": bucket.id},
+                        &doc,
+                        false,
+                        false,
+                    )
                     .map_err(crate::util::command_error)?;
+                // Removed between the check above and this write.
+                if outcome.matched == 0 {
+                    return Err(CommandError::new(
+                        112,
+                        "WriteConflict",
+                        "the time-series bucket was removed while it was written",
+                    ));
+                }
             }
             Ok(())
         }),

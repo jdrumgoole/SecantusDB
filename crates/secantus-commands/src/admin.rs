@@ -1246,6 +1246,10 @@ pub fn drop(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         n_indexes
     };
     let was_view = crate::views::is_view(storage, &ctx.db_name, &coll);
+    // A time-series collection's buckets go with it.
+    if crate::ts_store::layout_of(storage, &ctx.db_name, &coll).is_some() {
+        crate::ts_store::drop_buckets(storage, &ctx.db_name, &coll)?;
+    }
     let existed = storage
         .drop_collection(&ctx.db_name, &coll)
         .map_err(command_error)?;
@@ -1498,6 +1502,12 @@ pub(crate) fn collection_entries(
     names: &[String],
 ) -> Result<Vec<Document>, CommandError> {
     let mut entries: Vec<Document> = Vec::with_capacity(names.len());
+    // A time-series collection's bucket collection is listed beside it,
+    // with the options mongod shows (below), not as it is stored.
+    let names: Vec<&String> = names
+        .iter()
+        .filter(|n| crate::ts_buckets::bucketed(storage, db, n).is_none())
+        .collect();
     for n in names {
         let mut options = storage
             .get_collection_options(db, n)
@@ -1642,8 +1652,9 @@ pub(crate) fn collection_entries(
         entries.push(entry);
     }
     // What mongod keeps views and time-series collections in: `system.views`,
-    // and a `system.buckets.<name>` per time-series collection. Neither is
-    // stored here, and both read as mongod's do (see `ts_buckets`).
+    // and a `system.buckets.<name>` per time-series collection. The view
+    // definitions are rows of the catalog here; the buckets are stored
+    // (`ts_store`) and listed with the options mongod shows for them.
     let mut derived: Vec<Document> = Vec::new();
     for entry in &entries {
         let (Ok(name), Ok("timeseries")) = (entry.get_str("name"), entry.get_str("type")) else {
@@ -1657,8 +1668,22 @@ pub(crate) fn collection_entries(
         };
         let time = definition.get_str("timeField").unwrap_or_default();
         let mut info = doc! { "readOnly": false };
-        if let Ok(uuid) = storage.collection_uuid(db, name) {
-            info.insert("uuid", crate::ts_buckets::derived_uuid(&uuid, 1));
+        let buckets = crate::ts_store::buckets_ns(name);
+        match storage.collection_uuid(db, &buckets) {
+            Ok(uuid) if uuid.len() == 16 => {
+                info.insert(
+                    "uuid",
+                    Bson::Binary(bson::Binary {
+                        subtype: bson::spec::BinarySubtype::Uuid,
+                        bytes: uuid,
+                    }),
+                );
+            }
+            _ => {
+                if let Ok(uuid) = storage.collection_uuid(db, name) {
+                    info.insert("uuid", crate::ts_buckets::derived_uuid(&uuid, 1));
+                }
+            }
         }
         derived.push(doc! {
             "name": format!("{}{name}", crate::ts_buckets::BUCKETS_PREFIX),
@@ -4228,6 +4253,16 @@ pub fn drop_database(doc: &Document, ctx: &mut CommandContext) -> HandlerResult 
             );
         }
     }
+    // The bucket catalog forgets the database's time-series buckets.
+    if let Some(catalog) = storage.bucket_catalog() {
+        for coll in storage.list_collections(&ctx.db_name).unwrap_or_default() {
+            if coll.starts_with(crate::ts_buckets::BUCKETS_PREFIX) {
+                if let Ok(uuid) = storage.collection_uuid(&ctx.db_name, &coll) {
+                    catalog.clear(&uuid);
+                }
+            }
+        }
+    }
     storage.drop_database(&ctx.db_name).map_err(command_error)?;
     // A replica-set member answers `{ok: 1}` alone (measured 8.2.11,
     // 2026-10-11, for an empty database, one with a collection and one with
@@ -5108,21 +5143,25 @@ pub fn validate(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     reply.insert("ns", ns);
     // In the background, the checkpoint's own (a collection dropped and made
     // again since has a new one, and one dropped since has none live).
-    let uuid = match (&checkpointed, options.get("uuid")) {
-        (Some(_), Some(Bson::Binary(b))) => Some(b.bytes.clone()),
-        (Some(_), _) => None,
-        (None, _) => storage.collection_uuid(&ctx.db_name, &coll).ok(),
+    // A time-series collection validates its bucket collection, and names
+    // that collection's UUID.
+    let uuid = match (&checkpointed, options.get("uuid"), &layout) {
+        (_, _, Some(_)) => storage
+            .collection_uuid(&ctx.db_name, &crate::ts_store::buckets_ns(&coll))
+            .ok(),
+        (Some(_), Some(Bson::Binary(b)), None) => Some(b.bytes.clone()),
+        (Some(_), _, None) => None,
+        (None, _, None) => storage.collection_uuid(&ctx.db_name, &coll).ok(),
     };
     if let Some(uuid) = uuid {
         if uuid.len() == 16 {
-            let uuid = match &layout {
-                Some(_) => crate::ts_buckets::derived_uuid(&uuid, 1),
-                None => Bson::Binary(bson::Binary {
+            reply.insert(
+                "uuid",
+                Bson::Binary(bson::Binary {
                     subtype: bson::spec::BinarySubtype::Uuid,
                     bytes: uuid,
                 }),
-            };
-            reply.insert("uuid", uuid);
+            );
         }
     }
     reply.extend(doc! {

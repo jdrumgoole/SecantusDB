@@ -1445,19 +1445,39 @@ pub fn delete(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
             write_errors.push(Bson::Document(e));
             break;
         }
-        let deleted = crate::explain::order::in_delete_batches(storage, || {
-            crate::explain::order::pinned(storage, first, || {
-                storage.delete_matching_hinted(
-                    &ctx.db_name,
-                    &coll,
-                    &filter,
-                    limit,
-                    &let_vars,
-                    collation.as_ref(),
-                    argtypes::given_hint(spec),
-                )
+        // A time-series collection's measurements are deleted from its
+        // buckets.
+        let deleted = if crate::ts_store::layout_of(storage, &ctx.db_name, &coll).is_some() {
+            crate::ts_store::delete(
+                storage,
+                &ctx.db_name,
+                &coll,
+                &filter,
+                limit == 1,
+                &let_vars,
+                collation.as_ref(),
+            )
+            .map(|gone| gone.len())
+            .map_err(|e| StorageError::WriteError {
+                code: e.code,
+                errmsg: e.errmsg,
+                exec: false,
             })
-        });
+        } else {
+            crate::explain::order::in_delete_batches(storage, || {
+                crate::explain::order::pinned(storage, first, || {
+                    storage.delete_matching_hinted(
+                        &ctx.db_name,
+                        &coll,
+                        &filter,
+                        limit,
+                        &let_vars,
+                        collation.as_ref(),
+                        argtypes::given_hint(spec),
+                    )
+                })
+            })
+        };
         if deleted.is_ok() {
             crate::explain::order::count_index_use(
                 storage,
@@ -2269,6 +2289,37 @@ pub(crate) fn update_in(
             continue;
         }
 
+        // A time-series collection's one update, of the meta field, is an
+        // update of its buckets.
+        if ts_fields.is_some() {
+            let collation = crate::util::effective_collation(storage, db_name, &coll, spec)
+                .ok()
+                .flatten();
+            match crate::ts_store::update_meta(
+                storage,
+                db_name,
+                &coll,
+                spec,
+                &let_vars,
+                collation.as_ref(),
+            ) {
+                Ok((matched, modified)) => {
+                    n += matched;
+                    n_modified += modified;
+                }
+                Err(e) => {
+                    write_errors.push(Bson::Document(doc! {
+                        "index": index as i32,
+                        "code": e.code,
+                        "errmsg": e.errmsg.clone(),
+                    }));
+                    if ordered {
+                        break;
+                    }
+                }
+            }
+            continue;
+        }
         // Per-statement constants (`c`): more variables, for a PIPELINE update
         // only. They were accepted and ignored, so `$$k` was an undefined
         // variable (measured 8.2.11, 2026-10-10).

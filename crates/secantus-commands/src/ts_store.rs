@@ -401,3 +401,359 @@ pub(crate) fn stats_section(
     stats.append_to(&mut out);
     Ok(out)
 }
+
+/// `path` with the meta field's name as the bucket keeps it (`meta`), when
+/// it is in the meta field.
+fn meta_path(path: &str, meta: &str) -> Option<String> {
+    let rest = path.strip_prefix(meta)?;
+    (rest.is_empty() || rest.starts_with('.')).then(|| format!("meta{rest}"))
+}
+
+/// A meta-only filter as a filter on the buckets.
+fn bucket_meta_filter(filter: &Document, meta: &str) -> Document {
+    let mut out = Document::new();
+    for (k, v) in filter {
+        match (k.as_str(), v) {
+            ("$and" | "$or" | "$nor", Bson::Array(parts)) => {
+                let parts: Vec<Bson> = parts
+                    .iter()
+                    .map(|p| match p {
+                        Bson::Document(d) => Bson::Document(bucket_meta_filter(d, meta)),
+                        other => other.clone(),
+                    })
+                    .collect();
+                out.insert(k.clone(), parts);
+            }
+            _ => match meta_path(k, meta) {
+                Some(path) => {
+                    out.insert(path, v.clone());
+                }
+                None => {
+                    out.insert(k.clone(), v.clone());
+                }
+            },
+        }
+    }
+    out
+}
+
+/// `update`'s one statement on a time-series collection, which mongod
+/// 8.2.11 takes only as a multi update of the meta field
+/// (`timeseries::update_problem` has refused the rest): an update of the
+/// buckets' `meta`. Its `n` and `nModified` count measurements, not
+/// buckets.
+pub(crate) fn update_meta(
+    storage: &dyn Storage,
+    db: &str,
+    coll: &str,
+    statement: &Document,
+    let_vars: &Document,
+    collation: Option<&Collation>,
+) -> Result<(i32, i32), CommandError> {
+    let Some(layout) = layout_of(storage, db, coll) else {
+        return Ok((0, 0));
+    };
+    let Some(meta) = layout.meta.as_deref() else {
+        return Ok((0, 0));
+    };
+    let ns = buckets_ns(coll);
+    let q = statement.get_document("q").cloned().unwrap_or_default();
+    let filter = bucket_meta_filter(&q, meta);
+    let mut update = Document::new();
+    for (op, targets) in statement.get_document("u").cloned().unwrap_or_default() {
+        let Bson::Document(targets) = targets else {
+            update.insert(op, targets);
+            continue;
+        };
+        let mut moved = Document::new();
+        for (path, value) in targets {
+            let path = meta_path(&path, meta).unwrap_or(path);
+            let value = match (op.as_str(), value) {
+                ("$rename", Bson::String(to)) => Bson::String(meta_path(&to, meta).unwrap_or(to)),
+                (_, v) => v,
+            };
+            moved.insert(path, value);
+        }
+        update.insert(op, moved);
+    }
+    let array_filters: Vec<Document> = statement
+        .get_array("arrayFilters")
+        .map(|a| a.iter().filter_map(Bson::as_document).cloned().collect())
+        .unwrap_or_default();
+    let rows = storage
+        .find_collated(db, &ns, &filter, None, None, collation, let_vars)
+        .map_err(crate::util::command_error)?;
+    let uuid = storage.collection_uuid(db, &ns).ok();
+    let (mut n, mut modified) = (0i32, 0i32);
+    for raw in rows {
+        let bucket = decode(&raw)?;
+        let Some(Bson::ObjectId(id)) = bucket.get("_id") else {
+            continue;
+        };
+        let count = bucket
+            .get_document("control")
+            .ok()
+            .and_then(|c| c.get("count"))
+            .and_then(crate::util::as_i64)
+            .unwrap_or(0) as i32;
+        if let (Some(catalog), Some(uuid)) = (storage.bucket_catalog(), &uuid) {
+            catalog.clear_bucket(uuid, id);
+        }
+        let outcome = storage
+            .update_matching_array_filters(
+                db,
+                &ns,
+                &doc! { "_id": *id },
+                &update,
+                false,
+                false,
+                &array_filters,
+                let_vars,
+                collation,
+                None,
+                false,
+                false,
+            )
+            .map_err(crate::util::command_error)?;
+        n += count * outcome.matched as i32;
+        modified += count * outcome.modified as i32;
+    }
+    Ok((n, modified))
+}
+
+/// The bucket document mongod writes for `measurements` (in time order)
+/// when it rewrites a bucket (`makeNewDocumentForWrite`, then
+/// `compressBucket`): the summaries and columns of what is left, the
+/// window's start kept as `control.min.<time>`.
+fn rewritten_bucket(
+    id: bson::oid::ObjectId,
+    meta: Option<&Bson>,
+    measurements: &[Document],
+    layout: &Layout,
+    min_time: &Bson,
+) -> Result<Document, CommandError> {
+    let mut min = Document::new();
+    let mut max = Document::new();
+    let mut fields: Vec<String> = Vec::new();
+    for m in measurements {
+        for (name, v) in m {
+            if layout.meta.as_deref() == Some(name.as_str()) {
+                continue;
+            }
+            if !fields.contains(name) {
+                fields.push(name.clone());
+            }
+            for (acc, want_max) in [(&mut min, false), (&mut max, true)] {
+                match acc.get_mut(name) {
+                    Some(slot) => {
+                        let held = std::mem::replace(slot, Bson::Null);
+                        *slot = crate::ts_buckets::fold(Some(held), v, want_max);
+                    }
+                    None => {
+                        acc.insert(name.clone(), crate::ts_buckets::fold(None, v, want_max));
+                    }
+                }
+            }
+        }
+    }
+    if let Some(slot) = min.get_mut(&layout.time) {
+        *slot = min_time.clone();
+    }
+    let mut data = Document::new();
+    for field in &fields {
+        let mut builder = secantus_core::bsoncolumn::ColumnBuilder::new();
+        for m in measurements {
+            match m.get(field) {
+                Some(v) => {
+                    let bytes = encode(&doc! {"": v.clone()})?;
+                    builder.append(Some(secantus_core::bsoncolumn::Element {
+                        ty: bytes[4],
+                        value: &bytes[6..bytes.len() - 1],
+                    }));
+                }
+                None => builder.skip(),
+            }
+        }
+        data.insert(
+            field.clone(),
+            Bson::Binary(bson::Binary {
+                subtype: BinarySubtype::Column,
+                bytes: builder.finalize(),
+            }),
+        );
+    }
+    let mut doc = doc! {
+        "_id": id,
+        "control": {
+            "version": crate::bucket_catalog::SORTED_VERSION,
+            "min": min,
+            "max": max,
+            "count": measurements.len() as i32,
+        },
+    };
+    if let Some(meta) = meta {
+        doc.insert("meta", meta.clone());
+    }
+    doc.insert("data", data);
+    Ok(doc)
+}
+
+/// Delete the measurements of `db.coll` that `filter` matches, at most one
+/// when `just_one`: each bucket that holds one is rewritten with what is
+/// left, or deleted when nothing is (mongod 8.2.11's time-series delete).
+/// The measurements deleted, in scan order.
+pub(crate) fn delete(
+    storage: &dyn Storage,
+    db: &str,
+    coll: &str,
+    filter: &Document,
+    just_one: bool,
+    vars: &Document,
+    collation: Option<&Collation>,
+) -> Result<Vec<Document>, CommandError> {
+    let Some(layout) = layout_of(storage, db, coll) else {
+        return Ok(Vec::new());
+    };
+    let ns = buckets_ns(coll);
+    let bucket_filter = crate::timeseries::bucket_filter(
+        filter,
+        &layout.time,
+        layout.meta.as_deref(),
+        layout.span_ms / 1000,
+    );
+    let uuid = storage.collection_uuid(db, &ns).ok();
+    let mut deleted = Vec::new();
+    for bucket in stored_buckets(storage, db, coll)? {
+        if just_one && !deleted.is_empty() {
+            break;
+        }
+        if !bucket_filter.is_empty() && !crate::ts_buckets::bucket_matches(&bucket, &bucket_filter)?
+        {
+            continue;
+        }
+        let Some(Bson::ObjectId(id)) = bucket.get("_id").cloned() else {
+            continue;
+        };
+        let mut kept = Vec::new();
+        let mut gone = Vec::new();
+        for m in unpack(&bucket, &layout)? {
+            let hit = (!just_one || gone.is_empty())
+                && (filter.is_empty()
+                    || secantus_core::query::matches(&m, filter, vars, collation)
+                        .map_err(match_error)?);
+            if hit {
+                gone.push(m);
+            } else {
+                kept.push(m);
+            }
+        }
+        if gone.is_empty() {
+            continue;
+        }
+        if let (Some(catalog), Some(uuid)) = (storage.bucket_catalog(), &uuid) {
+            catalog.clear_bucket(uuid, &id);
+        }
+        if kept.is_empty() {
+            storage
+                .delete_matching(db, &ns, &doc! { "_id": id }, 1)
+                .map_err(crate::util::command_error)?;
+        } else {
+            kept.sort_by_key(|m| layout.time_of(m));
+            let min_time = bucket
+                .get_document("control")
+                .ok()
+                .and_then(|c| c.get_document("min").ok())
+                .and_then(|m| m.get(&layout.time))
+                .cloned()
+                .unwrap_or(Bson::Null);
+            let doc = rewritten_bucket(id, bucket.get("meta"), &kept, &layout, &min_time)?;
+            storage
+                .update_matching(db, &ns, &doc! { "_id": id }, &doc, false, false)
+                .map_err(crate::util::command_error)?;
+        }
+        deleted.extend(gone);
+    }
+    Ok(deleted)
+}
+
+/// Bring a store written before time-series buckets were stored up to
+/// date: a time-series collection whose measurements are still documents
+/// of its own table has them placed into buckets, one at a time in the
+/// order they were stored (the order this server placed them in when it
+/// derived its buckets), then taken out of the table. Run as the store is
+/// opened, before the server answers anyone; nothing it writes is logged.
+///
+/// The buckets are written before a measurement is removed, and a
+/// collection that still holds measurements has its bucket collection
+/// rebuilt from them, so a conversion cut short is done again from the
+/// start the next time the store opens. The measurements converted.
+pub fn upgrade_time_series(storage: &dyn Storage) -> Result<usize, CommandError> {
+    let _quiet = storage.unreplicated();
+    let mut converted = 0;
+    for db in storage
+        .list_databases()
+        .map_err(crate::util::command_error)?
+    {
+        for coll in storage
+            .list_collections(&db)
+            .map_err(crate::util::command_error)?
+        {
+            if layout_of(storage, &db, &coll).is_none() {
+                continue;
+            }
+            let stored = storage
+                .find(&db, &coll, &Document::new(), None, None)
+                .map_err(crate::util::command_error)?;
+            let ns = buckets_ns(&coll);
+            let has_buckets = storage
+                .collection_exists(&db, &ns)
+                .map_err(crate::util::command_error)?;
+            if stored.is_empty() {
+                if !has_buckets {
+                    create_buckets(storage, &db, &coll)?;
+                }
+                continue;
+            }
+            if has_buckets {
+                storage
+                    .drop_collection(&db, &ns)
+                    .map_err(crate::util::command_error)?;
+            }
+            create_buckets(storage, &db, &coll)?;
+            let batches: Vec<Vec<crate::bucket_catalog::Measurement>> = stored
+                .iter()
+                .enumerate()
+                .map(|(index, raw)| {
+                    decode(raw).map(|doc| vec![crate::bucket_catalog::Measurement { index, doc }])
+                })
+                .collect::<Result<_, _>>()?;
+            let layout = layout_of(storage, &db, &coll).expect("checked above");
+            let target = crate::bucket_catalog::Target {
+                storage,
+                db: &db,
+                coll: &coll,
+                layout: &layout,
+            };
+            // A catalog of its own: the server's starts empty, as it would
+            // after a restart.
+            let catalog = crate::bucket_catalog::BucketCatalog::new();
+            let outcomes = crate::bucket_catalog::insert(&catalog, &target, batches)?;
+            if let Some((_, Err(e))) = outcomes.iter().find(|(_, o)| o.is_err()) {
+                return Err(CommandError::new(
+                    e.code,
+                    "TimeseriesUpgradeFailed",
+                    format!(
+                        "converting {db}.{coll} to stored buckets: {}; its measurements are \
+                         kept",
+                        e.errmsg
+                    ),
+                ));
+            }
+            storage
+                .delete_matching(&db, &coll, &Document::new(), 0)
+                .map_err(crate::util::command_error)?;
+            converted += stored.len();
+        }
+    }
+    Ok(converted)
+}

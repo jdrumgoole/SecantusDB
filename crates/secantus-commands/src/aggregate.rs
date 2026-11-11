@@ -3860,7 +3860,9 @@ pub(crate) fn collection_documents(
         let found = storage
             .find(db, coll, filter, None, None)
             .map_err(command_error)?;
-        return decode_docs(found);
+        return decode_docs(crate::explain::order::in_clustered_order(
+            storage, db, coll, collation, found,
+        ));
     }
     let mut tail: Vec<Bson> = Vec::new();
     if !filter.is_empty() {

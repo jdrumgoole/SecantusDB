@@ -115,6 +115,7 @@ mod ts_bucket_ns;
 mod ts_buckets;
 mod ts_store;
 pub use ts_buckets::{BUCKETS_PREFIX, BUCKETS_STAGE, VIEWS_STAGE};
+pub use ts_store::upgrade_time_series;
 pub mod bucket_catalog;
 pub use bucket_catalog::BucketCatalog;
 pub mod topstats;

@@ -2031,16 +2031,61 @@ pub(crate) fn find(storage: &dyn Storage, ask: &Ask) -> Result<Vec<Vec<u8>>, Sto
     }
     match ordered_rows(storage, ask)? {
         Some(rows) => Ok(rows.into_iter().map(|(_, blob)| blob).collect()),
-        None => storage.find_collated(
-            ask.db,
-            ask.coll,
-            ask.filter,
-            ask.sort,
-            ask.hint,
-            ask.collation,
-            ask.vars,
-        ),
+        None => {
+            let found = storage.find_collated(
+                ask.db,
+                ask.coll,
+                ask.filter,
+                ask.sort,
+                ask.hint,
+                ask.collation,
+                ask.vars,
+            )?;
+            if ask.sort.is_some_and(|s| !s.is_empty()) || ask.hint.is_some() {
+                return Ok(found);
+            }
+            Ok(in_clustered_order(
+                storage,
+                ask.db,
+                ask.coll,
+                ask.collation,
+                found,
+            ))
+        }
     }
+}
+
+/// A clustered collection's documents, read unsorted and unhinted, come in
+/// `_id` order: mongod keys a clustered collection's records by their `_id`
+/// (measured 8.2.11: `_id`s inserted 3, 1, 2 read back 1, 2, 3). The store
+/// keeps them in insertion order.
+pub(crate) fn in_clustered_order(
+    storage: &dyn Storage,
+    db: &str,
+    coll: &str,
+    collation: Option<&Collation>,
+    found: Vec<Vec<u8>>,
+) -> Vec<Vec<u8>> {
+    if found.len() < 2
+        || !storage
+            .get_collection_options(db, coll)
+            .is_ok_and(|o| o.contains_key("clusteredIndex"))
+    {
+        return found;
+    }
+    let _active = secantus_core::collation::activate(collation);
+    let mut keyed: Vec<(Bson, Vec<u8>)> = found
+        .into_iter()
+        .map(|raw| {
+            let id = secantus_core::bsondoc::from_bytes(&raw[..])
+                .ok()
+                .and_then(|d| d.get("_id").cloned())
+                .unwrap_or(Bson::Null);
+            (id, raw)
+        })
+        .collect();
+    keyed.sort_by(|a, b| secantus_core::order::cmp(&a.0, &b.0));
+    keyed.into_iter().map(|(_, raw)| raw).collect()
 }
 
 /// Run `f`, a write through `storage`, over the documents `pin` names.
