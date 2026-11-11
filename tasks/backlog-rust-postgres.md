@@ -3478,23 +3478,6 @@ Measured on PostgreSQL 15.19; none of the statements creates an object.
       Verify: tests/backlog/test_rp_found_rp822.py::test_a_signatures_percent_type_is_resolved
       Backlog-ID: RP-830
 
-## Found while working RP-799 (2026-11-10)
-
-Measured on a private, freshly initdb'd PostgreSQL 15.19 cluster with the
-`_SETUP` in `tests/backlog/test_rp_found_rp799.py`: `dx` a domain over
-`int` with `default 42`, `dx2` a domain over `dx`, `dnd` one over `int`
-`not null default 5`, and `dpos` one over `int` `check (value > 0)`. Each
-holds for a column CREATE TABLE declares and, since RP-799, for one ADD
-COLUMN adds, and since RP-834 for one ALTER COLUMN TYPE retypes into a
-domain.
-
-- [ ] **`information_schema.columns.data_type` of a domain over a domain
-      names its base.** A column of `dx2` is `USER-DEFINED` on PostgreSQL
-      15.19 -- the view reads the domain's immediate base type, itself a
-      domain -- and `integer` here.
-      Verify: tests/backlog/test_rp_found_rp799.py::test_data_type_of_a_domain_over_a_domain_is_user_defined
-      Backlog-ID: RP-827
-
 ## Found while working RP-751 (2026-11-10)
 
 Measured on PostgreSQL 15.19; none of it needs DDL. The gap tests are in

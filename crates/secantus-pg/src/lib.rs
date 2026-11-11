@@ -6293,6 +6293,15 @@ impl PgHandler {
         ("USER-DEFINED".into(), bare(pg_type))
     }
 
+    /// The immediate base of a column's domain when that base is itself a
+    /// domain (`create domain d2 as d1`), as `information_schema.columns`
+    /// reads `typbasetype`; `None` for a column of no domain, or of a domain
+    /// over a non-domain type.
+    fn domain_over_domain_base(c: &Column) -> Option<String> {
+        let domain = secantus_pgplan::domains::user_domain(c.extra.get_str("domain_type").ok()?)?;
+        secantus_pgplan::domains::user_domain(&domain.base).map(|_| domain.base)
+    }
+
     /// The name a user type resolves under: its bare name in `public` (on the
     /// default search_path), else `schema.name`. A `public` name that a
     /// `pg_catalog` type shares is `public.name` too: `pg_catalog` is searched
@@ -21984,7 +21993,13 @@ impl PgHandler {
                         // A text `YES` / `NO`, not a boolean: this is the SQL
                         // standard's view and PostgreSQL follows it.
                         d.insert(f("is_nullable"), if c.nullable { "YES" } else { "NO" });
-                        let (data_type, udt_name) = Self::information_schema_type(&c.pg_type);
+                        // A column of a domain over a domain is typed by
+                        // the domain's IMMEDIATE base (`typbasetype`), a
+                        // domain itself: USER-DEFINED, with no length or
+                        // precision (measured on 15.19).
+                        let inner = Self::domain_over_domain_base(c);
+                        let ty = inner.as_deref().unwrap_or(&c.pg_type);
+                        let (data_type, udt_name) = Self::information_schema_type(ty);
                         d.insert(f("data_type"), data_type.clone());
                         let (precision, scale, length) = Self::typmod_parts(c);
                         d.insert(f("character_maximum_length"), length);
@@ -22056,7 +22071,7 @@ impl PgHandler {
                         // A user type outside `public` is named by its own
                         // schema (`s.e` is schema `s`, name `e`).
                         let qualified = (data_type == "USER-DEFINED")
-                            .then(|| c.pg_type.split_once('.'))
+                            .then(|| ty.split_once('.'))
                             .flatten();
                         if let Some((_, bare)) = qualified {
                             d.insert(f("udt_name"), bare);
@@ -22069,8 +22084,12 @@ impl PgHandler {
                         info_columns::fill(
                             &mut d,
                             &def,
-                            &c.pg_type,
-                            catalog_typmod(c),
+                            ty,
+                            if inner.is_some() {
+                                -1
+                            } else {
+                                catalog_typmod(c)
+                            },
                             i + 1,
                             udt_schema,
                             &db,
