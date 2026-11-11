@@ -1,7 +1,7 @@
 ---
 name: start-session
 model: sonnet
-description: Get a new SecantusDB session into gear — establish what is actually true about the repo and the machine before touching anything, then set up to work. Fires at the start of a session, on "let's start", "what should I work on", "get set up", "what's the state of things", or before the first substantive change. Holds the freshness checks that stop you working from a stale picture, the leftovers a previous session may have left running, and the claim protocol that stops two sessions building the same thing.
+description: Get a new SecantusDB session into gear — establish what is actually true about the repo and the machine before touching anything, then set up to work. Fires at the start of a session, on "let's start", "what should I work on", "get set up", "what's the state of things", or before the first substantive change. Holds the freshness checks that stop you working from a stale picture (the graphify code-graph refresh among them), the leftovers a previous session may have left running, and the claim protocol that stops two sessions building the same thing.
 ---
 
 # Start by finding out what is true, not what you remember
@@ -33,6 +33,37 @@ git stash list
 - If your own last session left something uncommitted here, land or stash it
   before starting anything new: a parallel session's `git reset --hard` will
   take it.
+
+## 1a. Refresh the code graph (graphify)
+
+The main checkout holds a graphify knowledge graph of the repo
+(`graphify-out/`, git-ignored). It is only useful while it is current: a
+stale one points at code that has moved. Refresh it every session, after
+step 1, with the main checkout at `origin/main`:
+
+```bash
+cd /Users/jdrumgoole/GIT/SecantusDB
+git status --short          # clean (submodule noise aside)? then:
+git pull --ff-only -q
+graphify update .           # ~/.local/bin/graphify (uv tool graphifyy)
+```
+
+- **Code only, no LLM, no tokens.** It re-extracts the changed files' ASTs
+  and rebuilds the graph: 43 s for 515 files after three weeks' drift
+  (2026-11-11). It writes nothing but `graphify-out/`.
+- **Do not pull a dirty main checkout** to refresh it: uncommitted changes
+  there belong to a parallel session (step 1). Update the graph as it is
+  and say it may lag `origin/main`.
+- **The warning that community labels changed is not a failure.** `graphify
+  label` would rename them with the LLM; the session does not need it.
+- **Run it in the main checkout only**, never a worktree, where the graph
+  would be a second 160 MB copy. From a worktree, query the main one:
+  `graphify query "..." --graph /Users/jdrumgoole/GIT/SecantusDB/graphify-out/graph.json`.
+- **If the update fails, say so and work from grep.** Do not query a graph
+  you could not refresh as though it were current.
+
+How to use it is in CLAUDE.md ("Tooling"): structure questions go to the
+graph, literal strings to grep.
 
 ## 2. The machine may still be running the last session
 
