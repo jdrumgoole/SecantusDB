@@ -394,7 +394,7 @@ jobs:
             crates
             crates/secantus-pgwire
           cache-on-failure: true
-          save-if: ${{ github.ref == 'refs/heads/main' }}
+          save-if: ${{ github.ref == 'refs/heads/main' || github.head_ref == 'ci-mdb-speedup' }}
 
       - name: Cargo fmt / clippy / unit tests
         # Run across the whole Rust workspace (the pure-engine `secantus-core`
@@ -715,7 +715,7 @@ jobs:
           key: ${{ matrix.lane }}
           cache-on-failure: true
           # Saved from main only: see the ``rust`` job's cache step.
-          save-if: ${{ github.ref == 'refs/heads/main' }}
+          save-if: ${{ github.ref == 'refs/heads/main' || github.head_ref == 'ci-mdb-speedup' }}
 
       - name: Cargo fmt / clippy / test (secantus-storage)
         if: matrix.lane == 'storage'
@@ -1441,7 +1441,7 @@ jobs:
           workspaces: crates/secantusdb -> target
           # Both shards build the same binary: one cache.
           shared-key: mdb-binary
-          save-if: ${{ github.ref == 'refs/heads/main' }}
+          save-if: ${{ github.ref == 'refs/heads/main' || github.head_ref == 'ci-mdb-speedup' }}
 
       - name: Build the standalone secantusd-rs binary (debug)
         # tests/backlog/conftest.py runs crates/secantusdb/target/debug/secantusd-rs.
