@@ -2225,13 +2225,6 @@ Measured on a private PostgreSQL 15.19 cluster. The gap tests are in
       built-in's comment.
       Verify: tests/backlog/test_rp_found_rp514.py::test_builtin_routine_resolved_by_its_overloads
       Backlog-ID: RP-519
-- [ ] **GRANT's 42883 for a signature no routine has carries a position.**
-      PostgreSQL 15.19's `LookupFuncWithArgs` raises `function gc(boolean)
-      does not exist` (and `procedure ...` for PROCEDURE) with no position;
-      here it carries one, at the routine's name (27, 28). COMMENT's same
-      error has none.
-      Verify: tests/backlog/test_rp_found_rp514.py::test_grant_missing_signature_has_no_position
-      Backlog-ID: RP-520
 
 ## Found while working RP-516 (2026-11-08)
 

@@ -147,7 +147,8 @@ def test_builtin_routine_resolved_by_its_overloads(query: str, dsn: str) -> None
     assert answer(dsn, query) == BUILTIN_ROUTINES[query]
 
 
-# A signature no routine has is reported with no position.
+# A signature no routine has was reported with no position, as
+# `LookupFuncWithArgs` reports it.
 MISSING_SIGNATURE = {
     "grant execute on function gc(bool) to public": (
         "42883",
@@ -161,10 +162,22 @@ MISSING_SIGNATURE = {
         None,
         None,
     ),
+    "revoke execute on function gc(bool) from public": (
+        "42883",
+        "function gc(boolean) does not exist",
+        None,
+        None,
+    ),
+    "revoke execute on procedure gc(bool) from public": (
+        "42883",
+        "procedure gc(boolean) does not exist",
+        None,
+        None,
+    ),
 }
 
 
-@pytest.mark.backlog("RP-520")
+@pytest.mark.backlog_fixed("RP-520")
 @pytest.mark.parametrize("query", list(MISSING_SIGNATURE))
 def test_grant_missing_signature_has_no_position(query: str, dsn: str) -> None:
     assert answer(dsn, query) == MISSING_SIGNATURE[query]

@@ -6940,6 +6940,44 @@ fn a_check_constraint_is_coerced_to_boolean() {
     }
 }
 
+/// GRANT and REVOKE find their routine with `LookupFuncWithArgs`, which has
+/// no parse position: a signature no routine has is 42883 with none, as
+/// from DROP / ALTER / COMMENT (PostgreSQL 15.19, RP-520). A call's missing
+/// function still points at its name.
+#[test]
+fn grant_revoke_missing_routine_has_no_position() {
+    for (sql, message) in [
+        (
+            "grant execute on function gc(bool) to public",
+            "function gc(boolean) does not exist",
+        ),
+        (
+            "grant execute on procedure gc(bool) to public",
+            "procedure gc(boolean) does not exist",
+        ),
+        (
+            "REVOKE execute on function gc(bool) from public",
+            "function gc(boolean) does not exist",
+        ),
+        (
+            "revoke grant option for execute on function public.gc(int) from public",
+            "function public.gc(integer) does not exist",
+        ),
+    ] {
+        take_error_location();
+        assert_eq!(error_position(sql, "42883", message), None, "for {sql}");
+    }
+    take_error_location();
+    assert_eq!(
+        error_position(
+            "select gc(true)",
+            "42883",
+            "function gc(boolean) does not exist"
+        ),
+        Some(8)
+    );
+}
+
 /// A literal in the select list of a query with a FROM item is typed by its
 /// node, as PostgreSQL types it: `1.5` is `numeric` and `B'101'` is `bit`,
 /// which their decoded values alone do not say. Both were `text`, so the

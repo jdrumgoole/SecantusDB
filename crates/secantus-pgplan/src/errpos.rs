@@ -614,10 +614,11 @@ pub fn error_position(sql: &str, sqlstate: &str, message: &str) -> Option<usize>
                 .strip_prefix("function ")
                 .or_else(|| m.strip_prefix("procedure "))
             {
-                // A function a DROP / ALTER / COMMENT names is looked up
-                // without a parse position.
+                // A function a DROP / ALTER / COMMENT / GRANT / REVOKE names
+                // is looked up without a parse position (`LookupFuncWithArgs`;
+                // PostgreSQL 15.19, RP-520).
                 if toks.first().is_some_and(|t| {
-                    ["drop", "alter", "comment"]
+                    ["drop", "alter", "comment", "grant", "revoke"]
                         .iter()
                         .any(|k| t.text.eq_ignore_ascii_case(k))
                 }) {
