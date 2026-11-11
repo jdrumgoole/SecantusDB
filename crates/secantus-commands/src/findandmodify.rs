@@ -340,6 +340,34 @@ pub fn find_and_modify(doc: &Document, ctx: &mut CommandContext) -> HandlerResul
     let let_vars = crate::util::command_let_vars(doc.get("let"), ctx);
     let collation = crate::util::effective_collation(storage, &ctx.db_name, &coll, doc)?;
     let _active = secantus_core::collation::activate(collation.as_ref());
+    // A time-series collection's one `findAndModify`, a `remove`: the first
+    // measurement the query matches, deleted from its bucket.
+    if is_remove && crate::ts_store::layout_of(storage, &ctx.db_name, &coll).is_some() {
+        let gone = crate::ts_store::delete(
+            storage,
+            &ctx.db_name,
+            &coll,
+            &query,
+            true,
+            &let_vars,
+            collation.as_ref(),
+        )?;
+        let value = match gone.into_iter().next() {
+            Some(found) => project_value(found, fields, &query, &let_vars)?,
+            None => {
+                return Ok(doc! {
+                    "lastErrorObject": { "n": 0 },
+                    "value": Bson::Null,
+                    "ok": 1.0,
+                })
+            }
+        };
+        return Ok(doc! {
+            "lastErrorObject": { "n": 1 },
+            "value": value,
+            "ok": 1.0,
+        });
+    }
     // `arrayFilters` ($[ident] identifiers) for an operator-form update.
     let array_filters: Vec<Document> = doc
         .get("arrayFilters")

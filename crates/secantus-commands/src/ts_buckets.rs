@@ -1,28 +1,21 @@
-//! The buckets of a time-series collection.
+//! What a time-series collection's buckets are made of, and how a filter
+//! and an index key read on them.
 //!
 //! `mongod` stores a time-series collection as bucket documents in
 //! `system.buckets.<name>` and presents the collection as a view that unpacks
-//! them. This server stores the measurements as ordinary documents, in the
-//! format the Python server shares, and DERIVES the buckets when something
-//! asks for them: a read of `system.buckets.<name>`, the order a scan of the
-//! collection returns its measurements in, the counts `collStats` and
-//! `validate` report.
-//!
-//! The derivation replays the measurements in the order they were stored
-//! through `mongod`'s bucket catalog ([`place`]). `mongod` sorts an insert
-//! batch by time before placing it, and so does the insert here before
-//! storing it (`crud::insert`), which is what lets the stored order stand
-//! for the order `mongod` placed them in. A bucket never closes for size
-//! here: `mongod`'s limit depends on its cache size and on how many buckets
-//! the whole server has open. Shapes were read from `mongod` 8.2.11, and
-//! each data column holds `mongod`'s compressed bytes.
+//! them; so does this server (`ts_store`, `bucket_catalog`). This module
+//! holds the pieces both sides of that use: the collection's layout (its
+//! time and meta fields, its bucket span and rounding), the schema a bucket
+//! keeps (`Schema`), the running minimum and maximum (`fold`), the
+//! bucket-level filter's comparisons (`bucket_matches`), the streaming
+//! bucket scan (`BucketScan`), `system.views`' definitions, the bucket
+//! validator, and the translation of index keys between the collection and
+//! its buckets. Shapes were read from `mongod` 8.2.11.
 
 use std::cmp::Ordering;
-use std::collections::HashMap;
 
 use bson::spec::BinarySubtype;
 use bson::{doc, Binary, Bson, Document};
-use secantus_core::bsoncolumn::{ColumnBuilder, Element};
 
 use crate::CommandError;
 
@@ -33,16 +26,13 @@ pub const BUCKETS_PREFIX: &str = "system.buckets.";
 /// name and yields its bucket documents. Not a stage a client can name.
 pub const BUCKETS_STAGE: &str = "$_secantusBuckets";
 
-/// The most measurements `mongod` puts in one bucket.
-const MAX_COUNT: usize = 1000;
-
 /// How a collection's measurements fall into buckets.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct Layout {
     pub time: String,
     pub meta: Option<String>,
-    span_ms: i64,
-    rounding_ms: i64,
+    pub span_ms: i64,
+    pub rounding_ms: i64,
 }
 
 impl Layout {
@@ -73,14 +63,14 @@ impl Layout {
         })
     }
 
-    fn time_of(&self, doc: &Document) -> i64 {
+    pub(crate) fn time_of(&self, doc: &Document) -> i64 {
         match doc.get(&self.time) {
             Some(Bson::DateTime(t)) => t.timestamp_millis(),
             _ => 0,
         }
     }
 
-    fn meta_of(&self, doc: &Document) -> Option<Bson> {
+    pub(crate) fn meta_of(&self, doc: &Document) -> Option<Bson> {
         let field = self.meta.as_ref()?;
         doc.get(field).map(sorted_keys)
     }
@@ -88,7 +78,7 @@ impl Layout {
 
 /// `v` with the keys of every document in it sorted, as `mongod` keeps a
 /// meta value: `{b: 1, a: 2}` and `{a: 2, b: 1}` are one series.
-fn sorted_keys(v: &Bson) -> Bson {
+pub(crate) fn sorted_keys(v: &Bson) -> Bson {
     match v {
         Bson::Document(d) => {
             let mut keys: Vec<&String> = d.keys().collect();
@@ -104,19 +94,6 @@ fn sorted_keys(v: &Bson) -> Bson {
     }
 }
 
-/// One derived bucket: where its window starts, its meta value, and the
-/// measurements in it (indices into the input, in time order).
-#[derive(Debug, Clone, PartialEq)]
-pub(crate) struct Bucket {
-    start_ms: i64,
-    meta: Option<Bson>,
-    pub members: Vec<usize>,
-    /// The measurement that opened it (an index into the input).
-    first: usize,
-    /// The types its measurements' fields have had ([`Schema`]).
-    schema: Schema,
-}
-
 /// What a bucket's measurements have held at each path, as `mongod`'s
 /// bucket catalog tracks it (`timeseries::bucket_catalog::Schema`, 8.2): a
 /// scalar by its canonical type (every number is one type, so is every
@@ -127,7 +104,7 @@ pub(crate) struct Bucket {
 /// out; a path a measurement leaves out changes nothing.
 
 #[derive(Debug, Clone, PartialEq, Default)]
-enum Schema {
+pub(crate) enum Schema {
     #[default]
     Unset,
     Value(i32),
@@ -211,8 +188,20 @@ impl Schema {
         &mut fields[at].1
     }
 
+    /// Take a document in whole: `Schema::parseFromBSON` takes a bucket's
+    /// `control.min` and `control.max` this way.
+    pub(crate) fn take_all(&mut self, doc: &Document) -> bool {
+        if matches!(self, Schema::Unset) {
+            *self = Schema::Object(Vec::new());
+        }
+        let Schema::Object(fields) = self else {
+            return false;
+        };
+        doc.iter().all(|(k, v)| Self::field(fields, k).update(v))
+    }
+
     /// Take a measurement in, its meta field left out.
-    fn take(&mut self, doc: &Document, layout: &Layout) -> bool {
+    pub(crate) fn take(&mut self, doc: &Document, layout: &Layout) -> bool {
         if matches!(self, Schema::Unset) {
             *self = Schema::Object(Vec::new());
         }
@@ -225,170 +214,10 @@ impl Schema {
     }
 }
 
-/// Why a bucket cannot take a measurement (`RolloverReason`, mongod 8.2).
-#[derive(Debug, Clone, Copy, PartialEq)]
-enum Rollover {
-    /// The measurement is before the bucket's window: the bucket is
-    /// archived, and can be reopened from memory.
-    TimeBackward,
-    /// After the window, full, or of another schema: the bucket leaves
-    /// memory, and nothing may be reopened by query for this measurement.
-    Other,
-}
-
-impl Bucket {
-    fn covers(&self, t: i64, layout: &Layout) -> bool {
-        t >= self.start_ms && t - self.start_ms < layout.span_ms
-    }
-
-    /// `determineRolloverReason`, the size check aside: `None` when the
-    /// bucket takes the measurement (and its schema then holds it).
-    fn rollover(&mut self, doc: &Document, t: i64, layout: &Layout) -> Option<Rollover> {
-        if t < self.start_ms {
-            return Some(Rollover::TimeBackward);
-        }
-        if !self.covers(t, layout) || self.members.len() >= MAX_COUNT {
-            return Some(Rollover::Other);
-        }
-        // A bucket that refuses a measurement keeps the schema it had:
-        // `mongod` rebuilds a reopened bucket's schema from what it holds.
-        let held = self.schema.clone();
-        if !self.schema.take(doc, layout) {
-            self.schema = held;
-            return Some(Rollover::Other);
-        }
-        None
-    }
-}
-
-/// Per meta value, the buckets `mongod` holds in memory.
-#[derive(Default)]
-struct Series {
-    /// The bucket measurements go to.
-    open: Option<usize>,
-    /// Buckets rolled over for a measurement before their window, by start.
-    archived: Vec<usize>,
-    /// Every bucket of the series, as a query of `system.buckets` finds them.
-    all: Vec<usize>,
-}
-
-/// Place `docs` (the collection's measurements, in the order they were
-/// stored) into buckets, returned in the order `system.buckets` holds them:
-/// by the start of the window, then by which was opened first.
-///
-/// Each measurement goes through `mongod`'s bucket catalog (8.2,
-/// `findOpenBucketForMeasurement` / `potentiallyReopenBucket`): into its
-/// series' open bucket when that takes it; otherwise into an archived
-/// bucket whose window holds it (the latest to start), or -- when every
-/// bucket it was turned away from was turned away for time running
-/// backwards -- the earliest-starting stored bucket whose window holds it
-/// and has room (the reopening query); otherwise into a new bucket, whose
-/// window starts at its time rounded down. A bucket that cannot take what
-/// it is offered is rolled over: archived for time running backwards, and
-/// otherwise dropped from memory (a query can still reopen it).
-pub(crate) fn place(docs: &[Document], layout: &Layout) -> Vec<Bucket> {
-    let mut buckets: Vec<Bucket> = Vec::new();
-    let mut series: HashMap<Vec<u8>, Series> = HashMap::new();
-    for (i, doc) in docs.iter().enumerate() {
-        let t = layout.time_of(doc);
-        let meta = layout.meta_of(doc);
-        let key = match &meta {
-            Some(m) => crate::bsondoc::to_vec(&doc! {"m": m.clone()}).unwrap_or_default(),
-            None => Vec::new(),
-        };
-        let s = series.entry(key).or_default();
-        let mut query_allowed = true;
-        let mut open_rollover = None;
-        if let Some(o) = s.open {
-            match buckets[o].rollover(doc, t, layout) {
-                None => {
-                    buckets[o].members.push(i);
-                    continue;
-                }
-                Some(reason) => {
-                    query_allowed &= reason == Rollover::TimeBackward;
-                    open_rollover = Some((o, reason));
-                }
-            }
-        }
-        // The open bucket is rolled over: archived, or out of memory.
-        if let Some((o, reason)) = open_rollover {
-            s.open = None;
-            if reason == Rollover::TimeBackward {
-                s.archived.push(o);
-            }
-        }
-        let archived = s
-            .archived
-            .iter()
-            .copied()
-            .filter(|&b| buckets[b].covers(t, layout))
-            .max_by_key(|&b| buckets[b].start_ms);
-        let candidate = archived.or_else(|| {
-            query_allowed
-                .then(|| {
-                    s.all
-                        .iter()
-                        .copied()
-                        .filter(|&b| {
-                            buckets[b].covers(t, layout) && buckets[b].members.len() < MAX_COUNT
-                        })
-                        .min_by_key(|&b| buckets[b].start_ms)
-                })
-                .flatten()
-        });
-        if let Some(c) = candidate {
-            s.archived.retain(|&b| b != c);
-            if buckets[c].rollover(doc, t, layout).is_none() {
-                buckets[c].members.push(i);
-                s.open = Some(c);
-                continue;
-            }
-        }
-        let mut schema = Schema::Unset;
-        schema.take(doc, layout);
-        s.open = Some(buckets.len());
-        s.all.push(buckets.len());
-        buckets.push(Bucket {
-            start_ms: t.div_euclid(layout.rounding_ms) * layout.rounding_ms,
-            meta,
-            members: vec![i],
-            first: i,
-            schema,
-        });
-    }
-    for bucket in &mut buckets {
-        bucket.members.sort_by_key(|&i| layout.time_of(&docs[i]));
-    }
-    // A stable sort: buckets with one start keep the order they opened in.
-    buckets.sort_by_key(|b| b.start_ms.div_euclid(1000));
-    buckets
-}
-
-/// A measurement as the collection returns it: the time field, the meta
-/// field with its keys sorted, then the rest in the order it was written.
-pub(crate) fn measurement(doc: &Document, layout: &Layout) -> Document {
-    let mut out = Document::new();
-    if let Some(t) = doc.get(&layout.time) {
-        out.insert(layout.time.clone(), t.clone());
-    }
-    if let Some(field) = &layout.meta {
-        if let Some(m) = doc.get(field) {
-            out.insert(field.clone(), sorted_keys(m));
-        }
-    }
-    for (k, v) in doc {
-        if k != &layout.time && Some(k) != layout.meta.as_ref() {
-            out.insert(k.clone(), v.clone());
-        }
-    }
-    out
-}
-
 /// Fold `v` into a bucket's running minimum (or maximum) for one field.
 /// Documents fold field by field and arrays element by element, as `mongod`
 /// computes `control.min` / `control.max`; anything else is compared whole.
-fn fold(acc: Option<Bson>, v: &Bson, want_max: bool) -> Bson {
+pub(crate) fn fold(acc: Option<Bson>, v: &Bson, want_max: bool) -> Bson {
     let Some(acc) = acc else {
         return v.clone();
     };
@@ -424,126 +253,6 @@ fn fold(acc: Option<Bson>, v: &Bson, want_max: bool) -> Bson {
     }
 }
 
-/// A bucket column (BSON binary subtype 7): one field's values across the
-/// bucket's measurements, `None` where a measurement has no such field, in
-/// the bytes `mongod`'s `BSONColumnBuilder` writes
-/// (`secantus_core::bsoncolumn`).
-fn column(values: &[Option<&Bson>]) -> Result<Bson, CommandError> {
-    let mut raw: Vec<Option<Vec<u8>>> = Vec::with_capacity(values.len());
-    for v in values {
-        raw.push(match v {
-            Some(v) => {
-                let element = crate::bsondoc::to_vec(&doc! {"": (*v).clone()})
-                    .map_err(|e| CommandError::new(8, "UnknownError", e.to_string()))?;
-                // The element alone: without the document's length and its
-                // closing zero.
-                Some(element[4..element.len() - 1].to_vec())
-            }
-            None => None,
-        });
-    }
-    let mut builder = ColumnBuilder::new();
-    for element in &raw {
-        // Type byte, the empty name's terminator, then the value.
-        builder.append(element.as_ref().map(|e| Element {
-            ty: e[0],
-            value: &e[2..],
-        }));
-    }
-    Ok(Bson::Binary(Binary {
-        subtype: BinarySubtype::Column,
-        bytes: builder.finalize(),
-    }))
-}
-
-/// A bucket's `_id`: its window's start in the timestamp, as `mongod` has it,
-/// then bytes that keep buckets opened later in order after it.
-fn bucket_id(ns: &str, start_ms: i64, opened: usize) -> bson::oid::ObjectId {
-    let mut bytes = [0u8; 12];
-    bytes[..4].copy_from_slice(&(start_ms.div_euclid(1000) as u32).to_be_bytes());
-    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-    for b in ns.bytes() {
-        hash = (hash ^ u64::from(b)).wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    bytes[4..8].copy_from_slice(&(hash as u32).to_be_bytes());
-    bytes[8..].copy_from_slice(&(opened as u32).to_be_bytes());
-    bson::oid::ObjectId::from_bytes(bytes)
-}
-
-/// The bucket documents of a collection holding `docs` (in insertion order).
-pub(crate) fn documents(
-    ns: &str,
-    docs: &[Document],
-    layout: &Layout,
-) -> Result<Vec<Document>, CommandError> {
-    place(docs, layout)
-        .into_iter()
-        .enumerate()
-        .map(|(opened, bucket)| bucket_document(ns, opened, bucket, docs, layout))
-        .collect()
-}
-
-/// `bucket`'s document, the `opened`-th of `ns` in `system.buckets` order.
-fn bucket_document(
-    ns: &str,
-    opened: usize,
-    bucket: Bucket,
-    docs: &[Document],
-    layout: &Layout,
-) -> Result<Document, CommandError> {
-    // The data fields, in the order the bucket first met them.
-    let mut fields: Vec<&String> = Vec::new();
-    for &i in &bucket.members {
-        for k in docs[i].keys() {
-            if Some(k) != layout.meta.as_ref() && !fields.contains(&k) {
-                fields.push(k);
-            }
-        }
-    }
-    let mut min = Document::new();
-    let mut max = Document::new();
-    let mut data = Document::new();
-    for field in fields {
-        let values: Vec<Option<&Bson>> =
-            bucket.members.iter().map(|&i| docs[i].get(field)).collect();
-        for v in values.iter().flatten() {
-            let low = fold(min.remove(field), v, false);
-            min.insert(field.clone(), low);
-            let high = fold(max.remove(field), v, true);
-            max.insert(field.clone(), high);
-        }
-        data.insert(field.clone(), column(&values)?);
-    }
-    // The minimum time is the start of the window, not the first reading.
-    min.insert(
-        layout.time.clone(),
-        bson::DateTime::from_millis(bucket.start_ms),
-    );
-    let mut doc = doc! {
-        "_id": bucket_id(ns, bucket.start_ms, opened),
-        "control": {
-            "version": 2,
-            "min": min,
-            "max": max,
-            "count": bucket.members.len() as i32,
-        },
-    };
-    if let Some(meta) = bucket.meta {
-        doc.insert("meta", meta);
-    }
-    doc.insert("data", data);
-    Ok(doc)
-}
-
-/// The order a scan returns measurements in: bucket by bucket, each in time
-/// order. Indices into `docs`.
-pub(crate) fn scan_order(docs: &[Document], layout: &Layout) -> Vec<usize> {
-    place(docs, layout)
-        .into_iter()
-        .flat_map(|b| b.members)
-        .collect()
-}
-
 /// The collection `coll` names when it is the bucket namespace of a
 /// time-series collection: `(name, options)`.
 pub(crate) fn bucketed(
@@ -558,113 +267,44 @@ pub(crate) fn bucketed(
         .then(|| (name.to_string(), options))
 }
 
-/// Every measurement of `db.coll`, in insertion order.
-fn stored(
-    storage: &dyn crate::storage::Storage,
-    db: &str,
-    coll: &str,
-) -> Result<Vec<Vec<u8>>, CommandError> {
-    storage
-        .find(db, coll, &Document::new(), None, None)
-        .map_err(crate::util::command_error)
-}
-
-fn decoded(raw: &[Vec<u8>]) -> Result<Vec<Document>, CommandError> {
-    raw.iter()
-        .map(|b| {
-            secantus_core::bsondoc::from_bytes(&b[..])
-                .map_err(|e| CommandError::new(8, "UnknownError", e.to_string()))
-        })
-        .collect()
-}
-
-/// The bucket documents of the time-series collection `db.coll`.
+/// The bucket documents of the time-series collection `db.coll`, as they
+/// are stored, in `_id` order.
 pub(crate) fn of_collection(
     storage: &dyn crate::storage::Storage,
     db: &str,
     coll: &str,
 ) -> Result<Vec<Document>, CommandError> {
-    let options = storage
-        .get_collection_options(db, coll)
-        .map_err(crate::util::command_error)?;
-    let Some(layout) = Layout::of(&options) else {
-        return Ok(Vec::new());
-    };
-    let docs = decoded(&stored(storage, db, coll)?)?;
-    documents(&format!("{db}.{coll}"), &docs, &layout)
+    crate::ts_store::stored_buckets(storage, db, coll)
 }
 
-/// What a read of `db.coll` returns when it is a time-series collection:
-/// `found` (the matching measurements, in insertion order unless `sorted`)
-/// in `mongod`'s scan order and each in `mongod`'s field order. Any other
-/// collection's documents pass through untouched.
+/// What a read of `db.coll` returns: `found` as read. A time-series
+/// collection's reads (`ts_store::find`) already give its measurements in
+/// `mongod`'s scan order, each in `mongod`'s field order.
 pub(crate) fn as_read(
-    storage: &dyn crate::storage::Storage,
-    db: &str,
-    coll: &str,
+    _storage: &dyn crate::storage::Storage,
+    _db: &str,
+    _coll: &str,
     found: Vec<Vec<u8>>,
-    sorted: bool,
+    _sorted: bool,
 ) -> Result<Vec<Vec<u8>>, CommandError> {
-    if found.is_empty() {
-        return Ok(found);
-    }
-    let Some(layout) = storage
-        .get_collection_options(db, coll)
-        .ok()
-        .as_ref()
-        .and_then(Layout::of)
-    else {
-        return Ok(found);
-    };
-    let shaped = |raw: &Vec<u8>| -> Result<Vec<u8>, CommandError> {
-        let doc = secantus_core::bsondoc::from_bytes(&raw[..])
-            .map_err(|e| CommandError::new(8, "UnknownError", e.to_string()))?;
-        crate::bsondoc::to_vec(&measurement(&doc, &layout))
-            .map_err(|e| CommandError::new(8, "UnknownError", e.to_string()))
-    };
-    if sorted {
-        return found.iter().map(shaped).collect();
-    }
-    // Where each stored measurement falls in the scan order. Two identical
-    // documents are interchangeable, so matching by bytes is enough.
-    let all = stored(storage, db, coll)?;
-    let order = scan_order(&decoded(&all)?, &layout);
-    let mut rank: HashMap<&[u8], Vec<usize>> = HashMap::new();
-    for (position, &i) in order.iter().enumerate().rev() {
-        rank.entry(all[i].as_slice()).or_default().push(position);
-    }
-    let mut placed: Vec<(usize, &Vec<u8>)> = found
-        .iter()
-        .map(|raw| {
-            let position = rank
-                .get_mut(raw.as_slice())
-                .and_then(Vec::pop)
-                .unwrap_or(usize::MAX);
-            (position, raw)
-        })
-        .collect();
-    placed.sort_by_key(|(position, _)| *position);
-    placed.into_iter().map(|(_, raw)| shaped(raw)).collect()
+    Ok(found)
 }
 
 /// A read of a time-series collection bucket by bucket, as `mongod`'s
 /// cursor stage reads `system.buckets.<name>` under `$_internalUnpackBucket`
 /// (measured 8.2.11, 2026-11-09): it buffers bucket documents, those the
 /// bucket-level filter passes, and the stage after it unpacks each into its
-/// measurements as the cursor reaches it. A refill derives the buckets from
-/// the collection as it is then and goes on after the last bucket buffered:
-/// one whose window starts later, or starts with it and was opened by a
-/// later measurement, which is the order `system.buckets` holds them in.
+/// measurements as the cursor reaches it. A refill reads the buckets as
+/// they are then and goes on after the last bucket buffered, in `_id`
+/// order, which is the order `system.buckets` holds them in.
 pub(crate) struct BucketScan {
     db: String,
     coll: String,
-    ns: String,
     layout: Layout,
     /// The bucket-level filter (`timeseries::bucket_filter`).
     filter: Document,
-    /// The last bucket buffered: its window's start, in seconds as its
-    /// `_id` holds it, and the RecordId of the measurement that opened it.
-    after: Option<(i64, i64)>,
+    /// The `_id` of the last bucket buffered.
+    after: Option<[u8; 12]>,
 }
 
 /// What one refill of a [`BucketScan`] buffered.
@@ -678,13 +318,13 @@ pub(crate) struct Buffered {
 }
 
 impl BucketScan {
-    /// A scan of `db.coll`, when it is a time-series collection this store
-    /// can read by RecordId; `filter` is the measurement-level query.
+    /// A scan of `db.coll`, when it is a time-series collection; `filter`
+    /// is the measurement-level query.
     pub(crate) fn of(
         storage: &dyn crate::storage::Storage,
         db: &str,
         coll: &str,
-        ns: &str,
+        _ns: &str,
         filter: &Document,
     ) -> Result<Option<BucketScan>, CommandError> {
         let Some(layout) = storage
@@ -695,13 +335,6 @@ impl BucketScan {
         else {
             return Ok(None);
         };
-        let readable = storage
-            .records_after(db, coll, None, 0, false)
-            .map_err(crate::util::command_error)?
-            .is_some();
-        if !readable {
-            return Ok(None);
-        }
         let filter = crate::timeseries::bucket_filter(
             filter,
             &layout.time,
@@ -711,7 +344,6 @@ impl BucketScan {
         Ok(Some(BucketScan {
             db: db.to_string(),
             coll: coll.to_string(),
-            ns: ns.to_string(),
             layout,
             filter,
             after: None,
@@ -744,20 +376,20 @@ impl BucketScan {
         want: usize,
         max_bytes: usize,
     ) -> Result<Buffered, CommandError> {
-        let rows = storage
-            .records_after(&self.db, &self.coll, None, usize::MAX, false)
-            .map_err(crate::util::command_error)?
-            .unwrap_or_default();
-        let (rids, raw): (Vec<i64>, Vec<Vec<u8>>) = rows.into_iter().unzip();
-        let docs = decoded(&raw)?;
+        let rows = crate::ts_store::stored_bucket_bytes(storage, &self.db, &self.coll)?;
         let mut out = Buffered {
             docs: Vec::new(),
             exhausted: true,
             examined: 0,
         };
         let (mut count, mut bytes) = (0usize, 0usize);
-        for (opened, bucket) in place(&docs, &self.layout).into_iter().enumerate() {
-            let key = (bucket.start_ms.div_euclid(1000), rids[bucket.first]);
+        for raw in rows {
+            let document = secantus_core::bsondoc::from_bytes(&raw[..])
+                .map_err(|e| CommandError::new(8, "UnknownError", e.to_string()))?;
+            let Some(Bson::ObjectId(id)) = document.get("_id") else {
+                continue;
+            };
+            let key = id.bytes();
             if self.after.is_some_and(|after| key <= after) {
                 continue;
             }
@@ -767,18 +399,14 @@ impl BucketScan {
             }
             out.examined += 1;
             self.after = Some(key);
-            let members = bucket.members.clone();
-            let document = bucket_document(&self.ns, opened, bucket, &docs, &self.layout)?;
             if !self.filter.is_empty() && !bucket_matches(&document, &self.filter)? {
                 continue;
             }
-            bytes += crate::bsondoc::to_vec(&document)
-                .map_err(|e| CommandError::new(8, "UnknownError", e.to_string()))?
-                .len();
+            bytes += raw.len();
             count += 1;
-            for i in members {
+            for m in crate::ts_store::unpack(&document, &self.layout)? {
                 out.docs.push(
-                    crate::bsondoc::to_vec(&measurement(&docs[i], &self.layout))
+                    crate::bsondoc::to_vec(&m)
                         .map_err(|e| CommandError::new(8, "UnknownError", e.to_string()))?,
                 );
             }
@@ -792,7 +420,7 @@ impl BucketScan {
 /// missing field below everything, and an array met on the path always
 /// matching (`InternalExprComparisonMatchExpression`); the rest is an
 /// ordinary query.
-fn bucket_matches(bucket: &Document, filter: &Document) -> Result<bool, CommandError> {
+pub(crate) fn bucket_matches(bucket: &Document, filter: &Document) -> Result<bool, CommandError> {
     for (key, value) in filter {
         let ok = match (key.as_str(), value) {
             ("$and", Bson::Array(items)) => {
@@ -1081,105 +709,6 @@ mod tests {
             {"control.max.v": {"$_internalExprGte": 0}},
             {"meta": 5},
         ]}));
-    }
-
-    fn at(minutes: i64) -> Bson {
-        // 2026-01-01T00:00:00Z
-        Bson::DateTime(bson::DateTime::from_millis(
-            1_767_225_600_000 + minutes * 60_000,
-        ))
-    }
-
-    /// What `mongod` 8.2.11 made of the same six measurements, one at a time.
-    #[test]
-    fn measurements_fall_into_mongods_buckets() {
-        let docs = vec![
-            doc! {"_id": 1, "t": at(0), "m": {"b": 1, "a": 2}, "v": 1, "s": "x"},
-            doc! {"_id": 2, "t": at(1), "m": "b", "v": 2},
-            doc! {"_id": 3, "t": at(2), "m": {"a": 2, "b": 1}, "v": 3.5},
-            doc! {"_id": 4, "t": at(3), "v": 4},
-            doc! {"_id": 5, "t": at(120), "m": "b", "v": 5},
-            doc! {"_id": 6, "t": at(30), "m": "b", "v": 6},
-        ];
-        let buckets = place(&docs, &layout());
-        let members: Vec<Vec<usize>> = buckets.iter().map(|b| b.members.clone()).collect();
-        // {a, b} at 00:00, "b" at 00:01 (reopened for 00:30), none at 00:03,
-        // "b" again at 02:00.
-        assert_eq!(members, vec![vec![0, 2], vec![1, 5], vec![3], vec![4]]);
-        assert_eq!(scan_order(&docs, &layout()), vec![0, 2, 1, 5, 3, 4]);
-    }
-
-    /// mongod 8.2.11, one measurement at a time: a field that changes kind
-    /// rolls the bucket over, and a number of another type does not. The
-    /// last measurement runs backwards in time, so the reopening query may
-    /// run, and it reopens the EARLIEST bucket whose window holds it -- the
-    /// one the string turned away -- not the latest.
-    #[test]
-    fn a_schema_change_rolls_the_bucket_over() {
-        let docs = vec![
-            doc! {"_id": 0, "t": at(30), "m": "a", "v": 1},
-            doc! {"_id": 1, "t": at(31), "m": "a", "v": "s"},
-            doc! {"_id": 2, "t": at(32), "m": "a", "v": 3},
-            doc! {"_id": 3, "t": at(33), "m": "a", "v": 4.5},
-            doc! {"_id": 4, "t": at(34), "m": "a", "v": 5_i64, "w": {"x": 1}},
-            doc! {"_id": 5, "t": at(35), "m": "a", "w": {"x": 2, "y": [1]}},
-            doc! {"_id": 6, "t": at(36), "m": "a", "w": {"x": "no"}},
-            doc! {"_id": 7, "t": Bson::DateTime(bson::DateTime::from_millis(
-                1_767_225_600_000 + 31 * 60_000 + 30_000,
-            )), "m": "a"},
-        ];
-        let members: Vec<Vec<usize>> = place(&docs, &layout())
-            .iter()
-            .map(|b| b.members.clone())
-            .collect();
-        assert_eq!(
-            members,
-            vec![vec![0, 7], vec![1], vec![2, 3, 4, 5], vec![6]]
-        );
-        assert_eq!(scan_order(&docs, &layout()), vec![0, 7, 1, 2, 3, 4, 5, 6]);
-    }
-
-    #[test]
-    fn a_bucket_document_has_mongods_shape() {
-        let docs = vec![
-            doc! {"_id": 1, "t": at(0), "m": {"b": 1, "a": 2}, "v": 1, "s": "x"},
-            doc! {"_id": 3, "t": at(2), "m": {"a": 2, "b": 1}, "v": 3.5, "o": {"k": [1, 2]}},
-        ];
-        let buckets = documents("d.c", &docs, &layout()).unwrap();
-        assert_eq!(buckets.len(), 1);
-        let b = &buckets[0];
-        let keys: Vec<&str> = b.keys().map(String::as_str).collect();
-        assert_eq!(keys, vec!["_id", "control", "meta", "data"]);
-        assert_eq!(b.get_document("meta").unwrap(), &doc! {"a": 2, "b": 1});
-        let control = b.get_document("control").unwrap();
-        assert_eq!(control.get_i32("count").ok(), Some(2));
-        assert_eq!(
-            control.get_document("min").unwrap(),
-            &doc! {"_id": 1, "t": at(0), "v": 1, "s": "x", "o": {"k": [1, 2]}}
-        );
-        assert_eq!(
-            control.get_document("max").unwrap(),
-            &doc! {"_id": 3, "t": at(2), "v": 3.5, "s": "x", "o": {"k": [1, 2]}}
-        );
-        // `s` is a literal string, then one skipped slot (a Simple-8b block
-        // holding one all-ones 60-bit slot), then the end.
-        let Some(Bson::Binary(s)) = b.get_document("data").unwrap().get("s") else {
-            panic!("no column");
-        };
-        assert_eq!(s.subtype, BinarySubtype::Column);
-        let mut expected = vec![0x02, 0x00, 0x02, 0x00, 0x00, 0x00, b'x', 0x00, 0x80];
-        expected.extend_from_slice(&0xFFFF_FFFF_FFFF_FFFEu64.to_le_bytes());
-        expected.push(0);
-        assert_eq!(s.bytes, expected);
-    }
-
-    #[test]
-    fn a_measurement_leads_with_time_and_meta() {
-        let doc = doc! {"_id": 1, "v": 2, "m": {"b": 1, "a": {"z": 1, "y": 2}}, "t": at(0)};
-        assert_eq!(
-            measurement(&doc, &layout()),
-            doc! {"t": at(0), "m": {"a": {"y": 2, "z": 1}, "b": 1}, "_id": 1, "v": 2}
-        );
     }
 
     #[test]

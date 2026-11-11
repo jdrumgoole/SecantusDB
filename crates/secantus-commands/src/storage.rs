@@ -1313,6 +1313,20 @@ pub trait Storage: Send + Sync {
         Ok(Vec::new())
     }
 
+    /// The server's time-series bucket catalog: one per server, kept in
+    /// memory (`mongod`'s `GlobalBucketCatalog`). `None` (the default) gives
+    /// each insert a catalog of its own, which reopens every bucket from
+    /// what is stored.
+    fn bucket_catalog(&self) -> Option<&crate::bucket_catalog::BucketCatalog> {
+        None
+    }
+
+    /// The storage engine's configured cache size, in bytes: what
+    /// `mongod` derives the time-series bucket size limit from.
+    fn storage_cache_bytes(&self) -> u64 {
+        4 * 1024 * 1024 * 1024
+    }
+
     /// Documents whose `id_key` sorts strictly after `after` (all of them when
     /// `after` is `None`), as `(id_key, bson)` pairs — the tailable-find producer
     /// polls this for docs inserted since it last returned.

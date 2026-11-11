@@ -5411,6 +5411,8 @@ pub struct Storage {
     /// livelocks the engine — the same stall class the chunked inserts
     /// closed for plain batches, which chunking cannot close here.
     txn_dirty_limit: u64,
+    /// The WiredTiger cache size the connection was opened with, in bytes.
+    cache_bytes: u64,
     /// Which oplog shard tables this process has already created (bit per shard
     /// index) — see [`ensure_oplog_shard`]. Shared with the async drainers.
     oplog_shards_created: Arc<AtomicU32>,
@@ -8214,6 +8216,7 @@ impl Storage {
             options_cache: std::sync::RwLock::new(HashMap::new()),
             list_cache: std::sync::RwLock::new(HashMap::new()),
             txn_dirty_limit: (parse_cache_bytes(config) as f64 * 0.20 * 0.75) as u64,
+            cache_bytes: parse_cache_bytes(config),
             oplog_shards_created,
             ttl: TtlMonitor::default(),
             enable_oplog: true,
@@ -11002,6 +11005,12 @@ fn prune_oplog_rows(ctx: &PruneCtx, now: Option<i64>) -> Result<usize> {
 }
 
 impl Storage {
+    /// The WiredTiger cache size this store was opened with, in bytes:
+    /// what `mongod` sizes time-series buckets by.
+    pub fn cache_bytes(&self) -> u64 {
+        self.cache_bytes
+    }
+
     /// Append one `{op: "n", ns: "", o: {msg: "periodic noop"}}` heartbeat and
     /// return its seq — keeps a quiet collection's resume token advancing with
     /// cluster time. Mirrors `storage.emit_noop_heartbeat`.
@@ -13672,6 +13681,11 @@ impl Storage {
                     .saturating_sub((secs.trunc() * 1000.0) as i64),
             )
         };
+        // A time-series collection's measurements are in its buckets, which
+        // expire whole.
+        if let Some(pruned) = self.prune_ttl_time_series(db, coll, now)? {
+            return Ok(pruned);
+        }
         {
             let session = self.conn.open_session()?;
             // A clustered collection's own `expireAfterSeconds` expires a
@@ -13740,6 +13754,89 @@ impl Storage {
             pruned += self.delete_matching(db, coll, &filter, 0, &Document::new(), None)?;
         }
         Ok(pruned)
+    }
+
+    /// TTL for a time-series collection, `None` for any other. mongod
+    /// expires its buckets whole, and only once the last measurement a
+    /// bucket could hold is out of range: the cutoff is `expireAfterSeconds`
+    /// and then `bucketMaxSpanSeconds` before now (`safeExpirationDate`,
+    /// 8.2.11). The collection's own `expireAfterSeconds` deletes the
+    /// buckets whose `_id` time (the window's start) is at or before it; a
+    /// TTL index on the time field is `{control.min.<time>: 1}` on the
+    /// buckets, its partial filter on the meta field read as one on `meta`
+    /// (measured 8.2.11, 2026-11-11).
+    fn prune_ttl_time_series(
+        &self,
+        db: &str,
+        coll: &str,
+        now: bson::DateTime,
+    ) -> Result<Option<usize>> {
+        let session = self.conn.open_session()?;
+        let Some(opts) = coll_options(&session, db, coll)? else {
+            return Ok(None);
+        };
+        let Ok(ts) = opts.get_document("timeseries") else {
+            return Ok(None);
+        };
+        let seconds = |v: Option<&Bson>| match v {
+            Some(Bson::Int32(i)) => Some(f64::from(*i)),
+            Some(Bson::Int64(i)) => Some(*i as f64),
+            Some(Bson::Double(d)) => Some(*d),
+            _ => None,
+        };
+        let span = seconds(ts.get("bucketMaxSpanSeconds")).unwrap_or(3600.0);
+        let time = ts.get_str("timeField").unwrap_or_default().to_string();
+        let meta = ts.get_str("metaField").ok().map(str::to_string);
+        let cutoff = |expire: f64| {
+            now.timestamp_millis()
+                .saturating_sub(((expire.trunc() + span.trunc()) * 1000.0) as i64)
+        };
+        let buckets = format!("system.buckets.{coll}");
+        let mut filters: Vec<Document> = Vec::new();
+        if let Some(expire) =
+            seconds(opts.get("expireAfterSeconds")).filter(|s| !s.is_nan() && *s >= 0.0)
+        {
+            // `OID::init(date, max)`: the date's seconds, then all ones.
+            let secs = cutoff(expire).div_euclid(1000);
+            if secs >= 0 {
+                let mut high = [0xffu8; 12];
+                high[..4].copy_from_slice(&(secs.min(u32::MAX as i64) as u32).to_be_bytes());
+                filters.push(bson::doc! {"_id": {
+                    "$gte": bson::oid::ObjectId::from_bytes([0u8; 12]),
+                    "$lte": bson::oid::ObjectId::from_bytes(high),
+                }});
+            }
+        }
+        for (_name, key_spec, index_opts) in self.iter_indexes(&session, db, coll)? {
+            let Some(expire) = seconds(index_opts.get("expireAfterSeconds")) else {
+                continue;
+            };
+            if expire.is_nan() || expire < 0.0 || key_spec.len() != 1 {
+                continue;
+            }
+            if key_spec.keys().next().map(String::as_str) != Some(time.as_str()) {
+                continue;
+            }
+            let mut filter = bson::doc! {
+                format!("control.min.{time}"): {
+                    "$lte": bson::DateTime::from_millis(cutoff(expire)),
+                }
+            };
+            if let Ok(partial) = index_opts.get_document("partialFilterExpression") {
+                let on_buckets = match &meta {
+                    Some(meta) => meta_filter_on_buckets(partial, meta),
+                    None => partial.clone(),
+                };
+                filter = bson::doc! {"$and": [filter, on_buckets]};
+            }
+            filters.push(filter);
+        }
+        drop(session);
+        let mut pruned = 0usize;
+        for filter in filters {
+            pruned += self.delete_matching(db, &buckets, &filter, 0, &Document::new(), None)?;
+        }
+        Ok(Some(pruned))
     }
 
     /// Run `prune_ttl` against every collection in every database, returning the
@@ -25118,6 +25215,33 @@ fn default_collation(session: &Session, db: &str, coll: &str) -> Result<Option<(
         .ok()
         .and_then(secantus_core::collation::parse)
         .map(|c| (c, opts.contains_key("clusteredIndex"))))
+}
+
+/// A filter on a time-series collection's meta field as one on its
+/// buckets, where the meta value is `meta`.
+fn meta_filter_on_buckets(filter: &Document, meta: &str) -> Document {
+    let mut out = Document::new();
+    for (k, v) in filter {
+        let renamed = match (k.as_str(), v) {
+            ("$and" | "$or" | "$nor", Bson::Array(parts)) => {
+                let parts: Vec<Bson> = parts
+                    .iter()
+                    .map(|p| match p {
+                        Bson::Document(d) => Bson::Document(meta_filter_on_buckets(d, meta)),
+                        other => other.clone(),
+                    })
+                    .collect();
+                out.insert(k.clone(), parts);
+                continue;
+            }
+            _ => match k.strip_prefix(meta) {
+                Some(rest) if rest.is_empty() || rest.starts_with('.') => format!("meta{rest}"),
+                _ => k.clone(),
+            },
+        };
+        out.insert(renamed, v.clone());
+    }
+    out
 }
 
 /// Whether the collection is clustered. Asked only when a duplicate `_id` is

@@ -1134,30 +1134,45 @@ pub fn insert(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         }
     }
 
-    // A time-series batch is placed in time order: mongod 8.2.11 sorts each
-    // meta value's measurements by time before it buckets them, so a batch
-    // that runs backwards in time shares a bucket where one-at-a-time
-    // inserts would not. The buckets here are derived from the order the
-    // measurements are stored in (`ts_buckets`), so the batch is stored
-    // sorted. An ordered batch that stopped at a bad measurement is placed
-    // one measurement at a time, as written (measured).
-    if ts_fields.is_some() && !(ordered && !pre_errors.is_empty()) {
-        let mut by_time: Vec<usize> = (0..surviving.len()).collect();
-        by_time.sort_by_key(|&i| times[i]);
-        let mut docs: Vec<Option<Vec<u8>>> = surviving.into_iter().map(Some).collect();
-        surviving = by_time
-            .iter()
-            .map(|&i| docs[i].take().unwrap_or_default())
-            .collect();
-        survivor_to_orig = by_time.iter().map(|&i| survivor_to_orig[i]).collect();
-    }
-
     // An ordered batch stops AT the pre-check failure; the documents before
     // it are inserted (see `insert_raw_path`).
     if surviving.is_empty() {
         return Ok(doc! { "n": 0_i32, "ok": 1.0, "writeErrors": bson_array(pre_errors) });
     }
 
+    // A time-series collection's measurements go into its buckets, through
+    // the bucket catalog, which splits the batch by meta value and sorts
+    // each part by time (mongod 8.2.11). An ordered batch that stopped at a
+    // bad measurement is placed one measurement at a time, as written
+    // (measured): mongod retries such a batch one by one.
+    if ts_fields.is_some() {
+        let mut measurements = Vec::with_capacity(surviving.len());
+        for (index, raw) in surviving.iter().enumerate() {
+            let doc = secantus_core::bsondoc::from_bytes(&raw[..])
+                .map_err(|e| CommandError::new(8, "UnknownError", e.to_string()))?;
+            measurements.push(crate::bucket_catalog::Measurement { index, doc });
+        }
+        let batches = if ordered && !pre_errors.is_empty() {
+            measurements.into_iter().map(|m| vec![m]).collect()
+        } else {
+            vec![measurements]
+        };
+        let outcomes = crate::ts_store::insert(storage, &db, &coll, batches)?;
+        let mut inserted = 0usize;
+        let mut errors: Vec<Document> = Vec::new();
+        for index in 0..surviving.len() {
+            match outcomes.get(&index) {
+                Some(Ok(())) => inserted += 1,
+                Some(Err(e)) => errors.push(doc! {
+                    "index": index as i32,
+                    "code": e.code,
+                    "errmsg": e.errmsg.clone(),
+                }),
+                None => {}
+            }
+        }
+        return insert_reply(inserted, errors, pre_errors, &survivor_to_orig, ordered);
+    }
     // A retryable write's inserts name their statements (RM-224).
     storage.set_insert_positions(Some(survivor_to_orig.clone()));
     let inserted = storage.insert(&db, &coll, surviving, ordered);
@@ -1430,19 +1445,39 @@ pub fn delete(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
             write_errors.push(Bson::Document(e));
             break;
         }
-        let deleted = crate::explain::order::in_delete_batches(storage, || {
-            crate::explain::order::pinned(storage, first, || {
-                storage.delete_matching_hinted(
-                    &ctx.db_name,
-                    &coll,
-                    &filter,
-                    limit,
-                    &let_vars,
-                    collation.as_ref(),
-                    argtypes::given_hint(spec),
-                )
+        // A time-series collection's measurements are deleted from its
+        // buckets.
+        let deleted = if crate::ts_store::layout_of(storage, &ctx.db_name, &coll).is_some() {
+            crate::ts_store::delete(
+                storage,
+                &ctx.db_name,
+                &coll,
+                &filter,
+                limit == 1,
+                &let_vars,
+                collation.as_ref(),
+            )
+            .map(|gone| gone.len())
+            .map_err(|e| StorageError::WriteError {
+                code: e.code,
+                errmsg: e.errmsg,
+                exec: false,
             })
-        });
+        } else {
+            crate::explain::order::in_delete_batches(storage, || {
+                crate::explain::order::pinned(storage, first, || {
+                    storage.delete_matching_hinted(
+                        &ctx.db_name,
+                        &coll,
+                        &filter,
+                        limit,
+                        &let_vars,
+                        collation.as_ref(),
+                        argtypes::given_hint(spec),
+                    )
+                })
+            })
+        };
         if deleted.is_ok() {
             crate::explain::order::count_index_use(
                 storage,
@@ -1624,7 +1659,19 @@ pub fn count(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     // Its stages (`execStats`, RM-359), and whether it read the record count.
     let mut stages: Option<Document> = None;
     let mut fast_count = false;
-    let mut n = if view_on.is_some() {
+    // A time-series collection counts the measurements its buckets unpack to.
+    let time_series = crate::ts_store::layout_of(storage, &ctx.db_name, &coll).is_some();
+    let mut n = if time_series && view_on.is_none() {
+        crate::ts_store::measurements(
+            storage,
+            &ctx.db_name,
+            &coll,
+            &filter,
+            &Document::new(),
+            collation.as_ref(),
+        )?
+        .len() as i64
+    } else if view_on.is_some() {
         // Run on the VIEW: the aggregation resolves it, through any views
         // beneath it, and a view may hold a stage only a view may hold.
         let view_on = coll.clone();
@@ -2242,6 +2289,47 @@ pub(crate) fn update_in(
             continue;
         }
 
+        // A time-series collection's one update, of the meta field, is an
+        // update of its buckets.
+        if ts_fields.is_some() {
+            // The statement runs, and is profiled and logged as one.
+            statements.update(
+                db_name,
+                &coll,
+                spec,
+                n,
+                n_modified,
+                upserted.len(),
+                write_errors.len(),
+            );
+            let collation = crate::util::effective_collation(storage, db_name, &coll, spec)
+                .ok()
+                .flatten();
+            match crate::ts_store::update_meta(
+                storage,
+                db_name,
+                &coll,
+                spec,
+                &let_vars,
+                collation.as_ref(),
+            ) {
+                Ok((matched, modified)) => {
+                    n += matched;
+                    n_modified += modified;
+                }
+                Err(e) => {
+                    write_errors.push(Bson::Document(doc! {
+                        "index": index as i32,
+                        "code": e.code,
+                        "errmsg": e.errmsg.clone(),
+                    }));
+                    if ordered {
+                        break;
+                    }
+                }
+            }
+            continue;
+        }
         // Per-statement constants (`c`): more variables, for a PIPELINE update
         // only. They were accepted and ignored, so `$$k` was an undefined
         // variable (measured 8.2.11, 2026-10-10).

@@ -226,6 +226,10 @@ fn run(cli: CliArgs) -> Result<(), String> {
     // the adapter) every connection all share the one WiredTiger connection.
     let storage = Arc::new(storage);
     let adapter: Arc<dyn CmdStorage> = Arc::new(StorageAdapter::new(storage.clone()));
+    // A store whose time-series measurements predate stored buckets is
+    // converted before anyone is answered.
+    secantus_commands::upgrade_time_series(adapter.as_ref())
+        .map_err(|e| format!("converting the store's time-series collections: {e:?}"))?;
     let cursors = Arc::new(CursorRegistry::new());
     let addr = cli.bind_addr();
     let mut running = bind(&addr, cli.server_config(), adapter, cursors)

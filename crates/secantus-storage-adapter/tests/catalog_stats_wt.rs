@@ -142,7 +142,7 @@ fn list_catalog_lists_collections_then_views() {
             Ok(secantus_storage::collection_table("t", "c").as_str())
         );
 
-        // The time-series collection's buckets are kept in its own table.
+        // The time-series collection's buckets are a collection of their own.
         let buckets = entry("system.buckets.ts");
         let md = buckets.get_document("md").unwrap();
         assert_eq!(
@@ -171,7 +171,7 @@ fn list_catalog_lists_collections_then_views() {
         );
         assert_eq!(
             buckets.get_str("ident"),
-            Ok(secantus_storage::collection_table("t", "ts").as_str())
+            Ok(secantus_storage::collection_table("t", "system.buckets.ts").as_str())
         );
         // View definitions are rows of the collection registry.
         assert_eq!(

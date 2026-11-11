@@ -1,11 +1,11 @@
 //! Commands that name `system.buckets.<name>` directly.
 //!
-//! Reads of the bucket namespace go through the view machinery (the storage
-//! adapter presents it as a view whose one stage derives the buckets, see
-//! [`crate::ts_buckets`]). The commands here are the ones a view would
-//! refuse and `mongod` does not: listing and building indexes, dropping the
-//! buckets, and writing a bucket by hand. Shapes were read from `mongod`
-//! 8.2.11.
+//! The bucket namespace is a real collection (`ts_store`); most commands
+//! read and write it as any other. The ones handled here are those whose
+//! answer involves the time-series collection: its indexes, which are kept
+//! on the collection and listed here in bucket form, dropping the buckets
+//! (which drops the collection), and writing a bucket by hand, which the
+//! bucket catalog has to hear about. Shapes were read from `mongod` 8.2.11.
 
 use bson::{doc, Bson, Document};
 
@@ -38,8 +38,14 @@ pub(crate) fn intercept(name: &str, doc: &Document, ctx: &mut CommandContext) ->
     let layout = Layout::of(&options)?;
     let ns = format!("{db}.{buckets}");
     match name {
-        "insert" => Some(insert(doc, ctx, &layout)),
-        "update" | "delete" | "findAndModify" | "findandmodify" => Some(no_bucket_writes(&ns)),
+        "insert" => insert(doc, ctx, &layout, &buckets),
+        // A write to a bucket by hand: the catalog forgets the buckets it
+        // may change (mongod's `directWriteStart` clears them), and the
+        // write runs on the buckets as on any collection.
+        "update" | "delete" | "findAndModify" | "findandmodify" => {
+            forget_written(storage.as_ref(), &db, &buckets, name, doc);
+            None
+        }
         "listIndexes" => {
             let listed: Vec<Bson> = match bucket_indexes(storage.as_ref(), &db, &base, &layout) {
                 Ok(indexes) => indexes.into_iter().map(Bson::Document).collect(),
@@ -62,7 +68,8 @@ pub(crate) fn intercept(name: &str, doc: &Document, ctx: &mut CommandContext) ->
                             "CommandNotSupported",
                             format!(
                                 "an index on {ns} must be one the time-series collection can \
-                                 show: this server keeps its measurements, not its buckets"
+                                 show: this server keeps a time-series collection's indexes \
+                                 on the collection"
                             ),
                         )
                         .into_reply(),
@@ -130,25 +137,64 @@ pub(crate) fn bucket_indexes(
         .collect())
 }
 
-/// `mongod` takes an update or delete of a bucket document. This server has
-/// no bucket to change.
-fn no_bucket_writes(ns: &str) -> Document {
-    CommandError::new(
-        115,
-        "CommandNotSupported",
-        format!(
-            "{ns} cannot be written directly: this server keeps a time-series collection's \
-             measurements, not its buckets"
-        ),
-    )
-    .into_reply()
+/// Forget, in the bucket catalog, every bucket a write's filters match.
+fn forget_written(
+    storage: &dyn crate::storage::Storage,
+    db: &str,
+    buckets: &str,
+    name: &str,
+    doc: &Document,
+) {
+    let Some(catalog) = storage.bucket_catalog() else {
+        return;
+    };
+    let Ok(uuid) = storage.collection_uuid(db, buckets) else {
+        return;
+    };
+    let filters: Vec<Document> = match name {
+        "update" | "delete" => {
+            let field = if name == "update" {
+                "updates"
+            } else {
+                "deletes"
+            };
+            doc.get_array(field)
+                .map(|a| {
+                    a.iter()
+                        .filter_map(Bson::as_document)
+                        .map(|s| s.get_document("q").cloned().unwrap_or_default())
+                        .collect()
+                })
+                .unwrap_or_default()
+        }
+        _ => vec![doc.get_document("query").cloned().unwrap_or_default()],
+    };
+    for filter in filters {
+        match storage.find(db, buckets, &filter, None, None) {
+            Ok(rows) => {
+                for raw in rows {
+                    if let Ok(d) = secantus_core::bsondoc::from_bytes(&raw[..]) {
+                        if let Some(Bson::ObjectId(id)) = d.get("_id") {
+                            catalog.clear_bucket(&uuid, id);
+                        }
+                    }
+                }
+            }
+            // A filter the store cannot read: forget them all.
+            Err(_) => catalog.clear(&uuid),
+        }
+    }
 }
 
 /// An insert of bucket documents by hand. Each is checked against the
-/// validator `mongod` gives the bucket namespace, which is where a document
-/// that is not a bucket is refused; one that passes it is refused too, since
-/// there is nowhere to keep it.
-fn insert(doc: &Document, ctx: &CommandContext, layout: &Layout) -> Document {
+/// validator `mongod` gives the bucket namespace; when every one passes,
+/// the insert runs on the buckets as on any collection (`None`).
+fn insert(
+    doc: &Document,
+    ctx: &CommandContext,
+    layout: &Layout,
+    buckets: &str,
+) -> Option<Document> {
     let documents: Vec<Document> = match &ctx.raw_insert_documents {
         Some(raw) => raw
             .iter()
@@ -161,30 +207,53 @@ fn insert(doc: &Document, ctx: &CommandContext, layout: &Layout) -> Document {
     };
     let ordered = !matches!(doc.get("ordered"), Some(Bson::Boolean(false)));
     let validator = ts_buckets::validator(&layout.time);
-    let mut errors: Vec<Document> = Vec::new();
     // A validator no interrupt reaches (RM-313).
     let _opaque = secantus_core::deadline::opaque();
+    let passes: Vec<bool> = documents
+        .iter()
+        .map(|d| {
+            secantus_core::query::matches(d, &validator, &Document::new(), None).unwrap_or(true)
+        })
+        .collect();
+    if passes.iter().all(|p| *p) {
+        return None;
+    }
+    let storage = ctx.storage.clone()?;
+    let mut errors: Vec<Document> = Vec::new();
+    let mut kept: Vec<Vec<u8>> = Vec::new();
+    let mut kept_index: Vec<usize> = Vec::new();
     for (index, d) in documents.iter().enumerate() {
-        let is_bucket =
-            secantus_core::query::matches(d, &validator, &Document::new(), None).unwrap_or(true);
-        errors.push(if is_bucket {
-            doc! {
-                "index": index as i32,
-                "code": 115_i32,
-                "errmsg": "a bucket cannot be inserted directly: this server keeps a \
-                           time-series collection's measurements, not its buckets",
-            }
-        } else {
-            doc! {
-                "index": index as i32,
-                "code": 121_i32,
-                "errmsg": "Document failed validation",
-                "errInfo": crate::crud::validation_error_info(&validator, d),
-            }
+        if passes[index] {
+            kept.push(crate::bsondoc::to_vec(d).ok()?);
+            kept_index.push(index);
+            continue;
+        }
+        errors.push(doc! {
+            "index": index as i32,
+            "code": 121_i32,
+            "errmsg": "Document failed validation",
+            "errInfo": crate::crud::validation_error_info(&validator, d),
         });
         if ordered {
             break;
         }
     }
-    doc! { "n": 0_i32, "writeErrors": errors, "ok": 1.0 }
+    let mut n = 0_i32;
+    if !kept.is_empty() {
+        match storage.insert(&ctx.db_name, buckets, kept, ordered) {
+            Ok((inserted, failed)) => {
+                n = inserted as i32;
+                for mut e in failed {
+                    if let Some(local) = e.get("index").and_then(crate::util::as_i64) {
+                        let orig = kept_index.get(local as usize).copied().unwrap_or(0);
+                        e.insert("index", orig as i32);
+                    }
+                    errors.push(e);
+                }
+            }
+            Err(e) => return Some(crate::util::command_error(e).into_reply()),
+        }
+    }
+    errors.sort_by_key(|e| e.get_i32("index").unwrap_or(0));
+    Some(doc! { "n": n, "writeErrors": errors, "ok": 1.0 })
 }

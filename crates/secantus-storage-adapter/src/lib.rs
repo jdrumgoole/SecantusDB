@@ -38,6 +38,9 @@ pub struct StorageAdapter {
     /// since when (`None`: since this process began). In memory, as mongod
     /// keeps its own, so a restart starts every count again.
     index_use: Mutex<HashMap<(String, String, String), IndexUse>>,
+    /// The server's time-series bucket catalog, in memory as `mongod`
+    /// keeps it: a restart starts it empty.
+    bucket_catalog: secantus_commands::BucketCatalog,
 }
 
 /// The fields the PostgreSQL server stamps on a SQL table's row for its
@@ -150,6 +153,7 @@ impl StorageAdapter {
         StorageAdapter {
             inner,
             index_use: Mutex::new(HashMap::new()),
+            bucket_catalog: secantus_commands::BucketCatalog::new(),
         }
     }
 
@@ -204,6 +208,14 @@ impl StorageAdapter {
 }
 
 impl CmdStorage for StorageAdapter {
+    fn bucket_catalog(&self) -> Option<&secantus_commands::BucketCatalog> {
+        Some(&self.bucket_catalog)
+    }
+
+    fn storage_cache_bytes(&self) -> u64 {
+        self.inner.cache_bytes()
+    }
+
     fn in_memory(&self) -> bool {
         self.inner.in_memory()
     }
