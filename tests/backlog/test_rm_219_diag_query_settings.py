@@ -480,14 +480,20 @@ def _period_takes_effect(client: Any) -> tuple:
         return client.admin.command("getDiagnosticData")["data"].get("start")
 
     try:
+        # Both servers sample on the wall clock's multiples of the period
+        # (`FTDCUtil::roundTime`), so a 60 s period samples at the next whole
+        # minute: a window that crosses one sees a sample there and reads as
+        # not holding (both servers, 2 of 6 concurrent runs, 2026-11-10).
+        # Start clear of it: the windows below take up to 3.6 s.
+        to_minute = 60 - time.time() % 60
+        if to_minute < 5:
+            time.sleep(to_minute + 0.2)
         set_period(60_000)
-        # The collector may be part-way through a wait under the old period
-        # (1 s), and samples once more when it ends: on a loaded CI runner
-        # that sample came after a fixed 1.2 s settle, and mongod read as
-        # not holding (2026-11-10, PG snapshot #2664). So look for a quiet
+        # The collector is part-way through a wait for its next 1 s tick and
+        # samples once more when that ends, which on a loaded CI runner came
+        # after a fixed 1.2 s settle (PG snapshot #2664). So look for a quiet
         # 1.2 s in up to three: a server still sampling every second has
-        # none, and one that took the new period has every one after the
-        # in-flight sample.
+        # none, one that took the new period has every one after that tick.
         held = False
         for _ in range(3):
             before = start()

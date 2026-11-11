@@ -367,10 +367,24 @@ fn positional_leaves(filter: &Document, out: &mut Vec<PositionalLeaf>) {
                             for item in items {
                                 let inner = matches!(item, Bson::Document(d)
                                     if d.keys().next().is_some_and(|k| k == "$elemMatch"));
+                                // Any other `$`-led document is an equality to
+                                // it (RM-421): `$eq` keeps it from reading as
+                                // an operator.
+                                let clause = match item {
+                                    Bson::Document(d)
+                                        if !inner
+                                            && d.keys()
+                                                .next()
+                                                .is_some_and(|k| k.starts_with('$')) =>
+                                    {
+                                        doc! { key.clone(): { "$eq": item.clone() } }
+                                    }
+                                    _ => doc! { key.clone(): item.clone() },
+                                };
                                 out.push(PositionalLeaf {
                                     rank: if inner { 2 } else { 5 },
                                     path: key.clone(),
-                                    clause: doc! { key.clone(): item.clone() },
+                                    clause,
                                     array_equality: matches!(item, Bson::Array(_)),
                                 });
                             }
