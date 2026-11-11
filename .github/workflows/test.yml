@@ -840,7 +840,14 @@ jobs:
         # break surfaces at the next weekly run (or a dispatch, or a release
         # build), not on the commit that caused it. To check a change on
         # Windows first: `gh workflow run test.yml --ref <branch>`.
-        os: ${{ fromJSON((github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && '["ubuntu-latest","windows-latest","macos-14"]' || '["ubuntu-latest"]') }}
+        #
+        # macos-15, not macos-14: GitHub retired the macos-14 image, which
+        # stopped starting by 2026-11-11 ("The configuration
+        # 'macos-14-arm64-us-default' is not supported"; dispatch run
+        # 43069794449). The release binaries already build on macos-15
+        # (release-binaries.yml), so this cell now tests the macOS they ship
+        # on. Pinned rather than macos-latest so an image move is a commit.
+        os: ${{ fromJSON((github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && '["ubuntu-latest","windows-latest","macos-15"]' || '["ubuntu-latest"]') }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
       - name: Free disk the job does not use

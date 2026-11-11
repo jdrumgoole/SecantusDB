@@ -16,6 +16,7 @@ from __future__ import annotations
 import os
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -55,6 +56,36 @@ with open(ack_file, "a", buffering=1) as acks:
 """
 
 
+class _StderrTail:
+    """Read a writer's stderr for its whole life and keep the tail.
+
+    The embedded server writes its errors and warnings to stderr (a failed
+    oplog prune, a TTL sweep, background compaction), and nothing else read
+    the pipe until the writer was dead. A pipe nobody reads fills (64 KiB on
+    Linux and macOS, about 4 KiB on Windows); a burst of those lines would
+    then block every server thread that writes one, so inserts stop being
+    acknowledged and the test measures a hang instead of the error that
+    caused it. The same deadlock failed ``test_rust_binary_smoke.py`` on
+    Windows (2026-11-11).
+    """
+
+    def __init__(self, proc: subprocess.Popen[bytes]) -> None:
+        assert proc.stderr is not None
+        self._lines: list[bytes] = []
+        self._thread = threading.Thread(target=self._read, args=(proc.stderr,), daemon=True)
+        self._thread.start()
+
+    def _read(self, pipe: object) -> None:
+        for line in pipe:  # type: ignore[attr-defined]
+            self._lines.append(line)
+            del self._lines[:-200]
+
+    def text(self) -> str:
+        """The last 2000 characters; call it once the writer has exited."""
+        self._thread.join(timeout=10)
+        return b"".join(self._lines).decode(errors="replace")[-2000:]
+
+
 def _run_killed_load(tmp_path: Path, *, run_seconds: float, checkpoint_seconds: str) -> list[range]:
     """Drive the writer subprocess, hard-kill it mid-load, return acked ranges."""
     store = tmp_path / "wt"
@@ -71,13 +102,12 @@ def _run_killed_load(tmp_path: Path, *, run_seconds: float, checkpoint_seconds: 
         stdout=subprocess.DEVNULL,
         stderr=subprocess.PIPE,
     )
+    stderr = _StderrTail(proc)
     try:
         deadline = time.monotonic() + 30
         while not port_file.exists() and time.monotonic() < deadline:
             if proc.poll() is not None:
-                raise AssertionError(
-                    f"writer died during startup: {proc.stderr.read().decode()[-2000:]}"
-                )
+                raise AssertionError(f"writer died during startup: {stderr.text()}")
             time.sleep(0.1)
         assert port_file.exists(), "server never came up"
         time.sleep(run_seconds)  # let acked load accumulate (and checkpoints fire)
@@ -93,7 +123,7 @@ def _run_killed_load(tmp_path: Path, *, run_seconds: float, checkpoint_seconds: 
             if ack_file.exists() and ack_file.read_text().count("\n") >= 5:
                 break
             if proc.poll() is not None:
-                raise AssertionError(f"writer died mid-load: {proc.stderr.read().decode()[-2000:]}")
+                raise AssertionError(f"writer died mid-load: {stderr.text()}")
             time.sleep(0.1)
     finally:
         # `Popen.kill()` rather than `send_signal(signal.SIGKILL)`: the constant
@@ -112,7 +142,7 @@ def _run_killed_load(tmp_path: Path, *, run_seconds: float, checkpoint_seconds: 
             ranges.append(range(int(lo), int(hi)))
     assert ranges, (
         "no acknowledged batches before the kill — writer starved past the "
-        f"60s load floor; stderr: {proc.stderr.read().decode()[-2000:]}"
+        f"60s load floor; stderr: {stderr.text()}"
     )
     return ranges
 
@@ -308,13 +338,14 @@ def test_hard_kill_mid_transactions_keeps_every_acked_commit_and_its_history(tmp
         stdout=subprocess.DEVNULL,
         stderr=subprocess.PIPE,
     )
+    stderr = _StderrTail(proc)
     try:
         deadline = time.monotonic() + 60
         while time.monotonic() < deadline:
             if ack_file.exists() and ack_file.read_text().count("\n") >= 40:
                 break
             if proc.poll() is not None:
-                raise AssertionError(f"writer died: {proc.stderr.read().decode()[-2000:]}")
+                raise AssertionError(f"writer died: {stderr.text()}")
             time.sleep(0.1)
     finally:
         proc.kill()
@@ -323,7 +354,7 @@ def test_hard_kill_mid_transactions_keeps_every_acked_commit_and_its_history(tmp
     for line in ack_file.read_text().splitlines():
         lo, hi, secs, inc = (int(x) for x in line.split(":"))
         acks.append((lo, hi, Timestamp(secs, inc)))
-    assert len(acks) >= 5, f"too few commits acked: {proc.stderr.read().decode()[-2000:]}"
+    assert len(acks) >= 5, f"too few commits acked: {stderr.text()}"
     ended = int(time.time())
     outside = [t for _, _, t in acks if not started - 1 <= t.time <= ended + 1]
     assert not outside, (
