@@ -2141,19 +2141,31 @@ Measured on a private PostgreSQL 15.19 cluster with `fs(a int, c text)`
 holding `(1, 'y')`.
 
 
-## Found while working RP-508 (2026-11-08)
+## Found while working RP-515 (2026-11-11)
 
 Measured on a private PostgreSQL 15.19 cluster. The gap tests are in
-`tests/backlog/test_rp_found_rp508.py`.
+`tests/backlog/test_rp_found_rp515.py`.
 
-- [ ] **`pg_get_function_arguments` and `pg_get_function_identity_arguments`
-      of a procedure print no argument modes.** PostgreSQL 15.19's
-      `print_function_arguments` prints every mode of a procedure's
-      arguments, IN included: `create procedure gk(a int, inout b text)`
-      prints `IN a integer, INOUT b text` in both; here `a integer, b text`.
-      (A function's IN is left out on both servers.)
-      Verify: tests/backlog/test_rp_found_rp508.py::test_procedure_arguments_print_their_modes
-      Backlog-ID: RP-515
+- [ ] **`pg_get_function_arguments` and `pg_get_function_result` print
+      names unquoted.** PostgreSQL 15.19's `print_function_arguments` and
+      `print_function_rettype` pass each parameter's and TABLE column's
+      name through `quote_identifier`: `create function "F 4"("A b" int,
+      "select" int)` prints `"A b" integer, "select" integer`, and
+      `returns table(x int, "Y z" text)` prints `TABLE(x integer, "Y z"
+      text)`. Here `A b integer, select integer` and `TABLE(x integer, Y z
+      text)`.
+      Verify: tests/backlog/test_rp_found_rp515.py::test_argument_and_column_names_are_quoted
+      Backlog-ID: RP-876
+
+- [ ] **A procedure's `pg_get_function_result` and `pg_get_functiondef`
+      read as a function's.** PostgreSQL 15.19's `pg_get_function_result`
+      is NULL for a procedure, and `pg_get_functiondef` prints `CREATE OR
+      REPLACE PROCEDURE public.gk(IN a integer, INOUT b text)`, no RETURNS
+      line, the body quoted `$procedure$`. Here the result is `record` and
+      the definition `CREATE OR REPLACE FUNCTION ... RETURNS record ...
+      $function$`.
+      Verify: tests/backlog/test_rp_found_rp515.py::test_procedure_result_and_definition
+      Backlog-ID: RP-877
 
 ## Found while working RP-467 (2026-11-08)
 

@@ -2,8 +2,8 @@
 of a routine named without arguments look among the statement's kind
 only): RP-514 (GRANT and COMMENT ON a routine named without arguments
 looked among every kind, fixed) and RP-515 (`pg_get_function_arguments` and
-`pg_get_function_identity_arguments` of a procedure print no argument
-modes).
+`pg_get_function_identity_arguments` of a procedure printed no argument
+modes, fixed).
 
 An answer is `("ok", notices)`, or `(sqlstate, message, detail, hint,
 position, notices)` for an error. The expected answers were measured on a
@@ -178,8 +178,9 @@ def test_comment_lands_on_the_named_overload(dsn: str) -> None:
 
 
 # RP-515: `print_function_arguments` prints a procedure's every argument
-# with its mode, IN included (a function's IN is left out).
-@pytest.mark.backlog("RP-515")
+# with its mode, IN included (a function's IN is left out). Before the fix
+# no mode was printed, and an OUT parameter not at all.
+@pytest.mark.backlog_fixed("RP-515")
 def test_procedure_arguments_print_their_modes(dsn: str) -> None:
     query = (
         "select pg_get_function_identity_arguments('gk'::regproc), "
@@ -190,3 +191,42 @@ def test_procedure_arguments_print_their_modes(dsn: str) -> None:
         [("IN a integer, INOUT b text", "IN a integer, INOUT b text")],
         [],
     )
+
+
+# RP-515's regression beside it: a FUNCTION's OUT and INOUT parameters print
+# with their mode, between the inputs, and a default stays on its input; a
+# procedure's OUT one is printed too, before a VARIADIC. The text was
+# `a integer, c text DEFAULT 'q'::text` and `integer, VARIADIC c integer[]`.
+_MODES_SETUP = [
+    "drop routine if exists gf(int, text)",
+    "drop routine if exists gp(int, int[])",
+    "create function gf(a int, out b int, inout c text default 'q') "
+    "language sql as $$ select 1, 'x'::text $$",
+    "create procedure gp(int, out text, variadic c int[]) language sql as $$ select 'x' $$",
+]
+
+
+@pytest.mark.backlog_fixed("RP-515")
+def test_out_and_inout_arguments_print_their_modes(dsn: str) -> None:
+    with psycopg.connect(dsn, autocommit=True) as c:
+        for q in _MODES_SETUP:
+            c.execute(q)
+        try:
+            got = c.execute(
+                "select pg_get_function_arguments(p), "
+                "pg_get_function_identity_arguments(p) from "
+                "(values ('gf'::regproc), ('gp'::regproc)) v(p)"
+            ).fetchall()
+        finally:
+            c.execute("drop routine gf(int, text)")
+            c.execute("drop routine gp(int, int[])")
+    assert got == [
+        (
+            "a integer, OUT b integer, INOUT c text DEFAULT 'q'::text",
+            "a integer, OUT b integer, INOUT c text",
+        ),
+        (
+            "IN integer, OUT text, VARIADIC c integer[]",
+            "IN integer, OUT text, VARIADIC c integer[]",
+        ),
+    ]
