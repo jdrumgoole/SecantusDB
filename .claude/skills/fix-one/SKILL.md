@@ -118,8 +118,42 @@ and take a minute or two; still run both, as the branch moved.
 
 ## 4. Fix it
 
+- **Find the code through the graphify graph before reading files
+  broadly** (CLAUDE.md "Tooling"). The main checkout's graph covers
+  `origin/main` as of the session that last refreshed it; query it from
+  your worktree or lane:
+
+  ```bash
+  g=/Users/jdrumgoole/GIT/SecantusDB/graphify-out/graph.json
+  graphify query "where is <behaviour> decided" --budget 1500 --graph $g
+  graphify explain "<symbol>" --graph $g
+  graphify path "<caller>" "<callee>" --graph $g
+  ```
+
+  Grep is better for a literal string: the item's error message, a
+  SQLSTATE, a function name. Do not run `graphify update` from a session:
+  `start-session` refreshes the one graph in the main checkout, and a lane
+  would write a second 160 MB copy. Code your branch changed is not in the
+  graph yet, so read that code itself.
 - Build the most faithful version of the real product's behaviour
   (CLAUDE.md design constraints).
+- **A fix that changes an answer the server gives (an error code, a
+  message, a position, a row) can break an older test that pinned the
+  wrong answer.** Grep `tests/` for the old answer and the statement that
+  produced it, and run every test that matches:
+
+  ```bash
+  grep -rln '<old SQLSTATE or message>\|<the statement>' tests/
+  .venv/bin/python -m pytest -o addopts= -n0 <file>::<test> ...
+  ```
+
+  In integration mode this is the only local check of those tests:
+  `--fast` skips `pg-suites`, where most of them live. On 2026-11-11
+  RP-485's 3F000 fix passed its fast gate and turned snapshot PR #2676
+  red, because a slice test still expected "undefined function". When a
+  matching test asserts the old answer, probe the real product. If the
+  fix is right, change that test to the product's answer in the same
+  commit and say so in the report. Never loosen it to accept both answers.
 - Shared storage crates are allowed. Say in the PR that the other server
   links the change, and verify that server's backlog too (step 6).
 - Add a regression test beside the code where one fits (a crate test, a
@@ -153,7 +187,9 @@ longer runs. Read every `.rc` that is not 0, and the log beside it.
   (20-27 of the gate's ~40 min), which CI's pg-oracle job runs on the
   integration branch's PR before anything reaches `main`. Default mode
   keeps the full gate: that PR's CI runs the same list, but a full local
-  run saves a wasted CI round.
+  run saves a wasted CI round. The step 4 test for a changed answer covers
+  the part of `pg-suites` a fix is most likely to break, so run it before
+  the fast gate.
 - The cheap checks (fmt, lint, ruff) run first and stop the gate when one
   fails, in seconds. Fix and rerun.
 - **After a failure, rerun only what the fix can reach.** A format or lint
