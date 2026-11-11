@@ -2207,6 +2207,21 @@ pub(crate) fn user_function_named(name: &str) -> bool {
     })
 }
 
+/// Does the session have a temporary function or procedure (one in
+/// `pg_temp`)? Its first one makes the session's temp namespace, as a
+/// temporary relation does.
+pub(crate) fn temp_routine_exists() -> bool {
+    USER_FUNCTIONS.with(|f| {
+        f.borrow()
+            .iter()
+            .any(|u| u.name.starts_with("pg_temp.") || crate::is_pg_temp_schema(&u.schema))
+    }) || USER_PROCEDURES.with(|p| {
+        p.borrow()
+            .iter()
+            .any(|(s, _, _)| crate::is_pg_temp_schema(s))
+    })
+}
+
 /// Is there a user-defined function or procedure of this bare name in any
 /// schema, or one that answers to this qualified name?
 pub(crate) fn user_function_bare_named(name: &str) -> bool {

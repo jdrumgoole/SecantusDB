@@ -4514,6 +4514,9 @@ pub struct PgHandler {
     wire_dealloc: Mutex<Vec<String>>,
     /// The temporary tables this session created, dropped when it ends.
     temp_tables: Mutex<Vec<String>>,
+    /// The session's temp namespace has been made (PostgreSQL's
+    /// `myTempNamespace`; see [`Self::install_temp_namespace`]).
+    temp_namespace_made: AtomicBool,
     /// The open block declared a `WITH HOLD` cursor: another thing
     /// PostgreSQL refuses to PREPARE.
     holdable_declared: AtomicBool,
@@ -5085,6 +5088,7 @@ impl PgHandler {
             statement_source: Mutex::new(None),
             wire_dealloc: Mutex::new(Vec::new()),
             temp_tables: Mutex::new(Vec::new()),
+            temp_namespace_made: AtomicBool::new(false),
             holdable_declared: AtomicBool::new(false),
             txn_gucs: Mutex::new(HashMap::new()),
             statement_gucs: Mutex::new(HashMap::new()),
@@ -5567,6 +5571,34 @@ impl PgHandler {
     }
 
     fn install_user_types(&self) {
+        self.install_session_state();
+        self.install_temp_namespace();
+    }
+
+    /// Whether the session's temp namespace exists, for an explicit
+    /// `pg_temp` (`LookupExplicitNamespace`): PostgreSQL's `myTempNamespace`,
+    /// made by the session's first temporary object and kept after its
+    /// last is dropped. Latched from the objects the planner was just
+    /// given, outside a transaction only: one a rolled-back transaction or
+    /// savepoint made leaves no namespace (`AtEOXact_Namespace`), and
+    /// inside one the planner sees the objects themselves. (An object made
+    /// and dropped inside one transaction that commits is missed.)
+    fn install_temp_namespace(&self) {
+        let made = &self.temp_namespace_made;
+        if !made.load(std::sync::atomic::Ordering::Relaxed)
+            && !self
+                .in_transaction
+                .load(std::sync::atomic::Ordering::Relaxed)
+            && secantus_pgplan::schemas::session_holds_temp()
+        {
+            made.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        secantus_pgplan::schemas::set_temp_namespace_made(
+            made.load(std::sync::atomic::Ordering::Relaxed),
+        );
+    }
+
+    fn install_session_state(&self) {
         // Whichever COPY this thread installed for no longer has the
         // thread's state: another session's statement may be installing.
         COPY_INSTALLED.with(|c| c.set(0));
@@ -6291,6 +6323,15 @@ impl PgHandler {
             return (secantus_pgplan::display_type(pg_type), pg_type.to_string());
         }
         ("USER-DEFINED".into(), bare(pg_type))
+    }
+
+    /// The immediate base of a column's domain when that base is itself a
+    /// domain (`create domain d2 as d1`), as `information_schema.columns`
+    /// reads `typbasetype`; `None` for a column of no domain, or of a domain
+    /// over a non-domain type.
+    fn domain_over_domain_base(c: &Column) -> Option<String> {
+        let domain = secantus_pgplan::domains::user_domain(c.extra.get_str("domain_type").ok()?)?;
+        secantus_pgplan::domains::user_domain(&domain.base).map(|_| domain.base)
     }
 
     /// The name a user type resolves under: its bare name in `public` (on the
@@ -21984,7 +22025,13 @@ impl PgHandler {
                         // A text `YES` / `NO`, not a boolean: this is the SQL
                         // standard's view and PostgreSQL follows it.
                         d.insert(f("is_nullable"), if c.nullable { "YES" } else { "NO" });
-                        let (data_type, udt_name) = Self::information_schema_type(&c.pg_type);
+                        // A column of a domain over a domain is typed by
+                        // the domain's IMMEDIATE base (`typbasetype`), a
+                        // domain itself: USER-DEFINED, with no length or
+                        // precision (measured on 15.19).
+                        let inner = Self::domain_over_domain_base(c);
+                        let ty = inner.as_deref().unwrap_or(&c.pg_type);
+                        let (data_type, udt_name) = Self::information_schema_type(ty);
                         d.insert(f("data_type"), data_type.clone());
                         let (precision, scale, length) = Self::typmod_parts(c);
                         d.insert(f("character_maximum_length"), length);
@@ -22056,7 +22103,7 @@ impl PgHandler {
                         // A user type outside `public` is named by its own
                         // schema (`s.e` is schema `s`, name `e`).
                         let qualified = (data_type == "USER-DEFINED")
-                            .then(|| c.pg_type.split_once('.'))
+                            .then(|| ty.split_once('.'))
                             .flatten();
                         if let Some((_, bare)) = qualified {
                             d.insert(f("udt_name"), bare);
@@ -22069,8 +22116,12 @@ impl PgHandler {
                         info_columns::fill(
                             &mut d,
                             &def,
-                            &c.pg_type,
-                            catalog_typmod(c),
+                            ty,
+                            if inner.is_some() {
+                                -1
+                            } else {
+                                catalog_typmod(c)
+                            },
                             i + 1,
                             udt_schema,
                             &db,

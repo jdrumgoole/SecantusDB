@@ -4,7 +4,7 @@ an operator over a column or a parameter, an INSERT or UPDATE target or a
 COALESCE gives its type is not read at CREATE), RP-508 (DROP FUNCTION /
 PROCEDURE without arguments over the other kind, and DROP ROUTINE's
 notice), RP-509 (a CALL that leaves a defaulted parameter out, names its
-arguments, or passes a column), RP-510 (a malformed range literal's DETAIL)
+arguments, or passes a column), RP-510 (a malformed range literal had no DETAIL, fixed)
 and RP-511 (PREPARE evaluates a constant expression and does not read a
 cast constant it does not evaluate).
 
@@ -215,7 +215,8 @@ def test_call_arguments(query: str, dsn: str) -> None:
     assert answer(dsn, query) == CALL_ARGUMENTS[query]
 
 
-# RP-510: `range_parse`'s DETAIL for a malformed range literal.
+# RP-510: a malformed range literal had no DETAIL; it carries
+# `range_parse`'s now.
 RANGE_LITERAL_DETAIL = {
     "select '[1,2'::int4range": ("[1,2", "Unexpected end of input."),
     "select '[1,2]x'::int4range": ("[1,2]x", "Junk after right parenthesis or bracket."),
@@ -223,7 +224,7 @@ RANGE_LITERAL_DETAIL = {
 }
 
 
-@pytest.mark.backlog("RP-510")
+@pytest.mark.backlog_fixed("RP-510")
 @pytest.mark.parametrize("query", list(RANGE_LITERAL_DETAIL))
 def test_range_literal_detail(query: str, dsn: str) -> None:
     value, detail = RANGE_LITERAL_DETAIL[query]

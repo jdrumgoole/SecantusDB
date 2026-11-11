@@ -805,20 +805,62 @@ impl PgHandler {
                     .unwrap_or_default();
                 let variadic = d.get_bool("variadic").unwrap_or(false);
                 let n = types.len();
+                // Every declared parameter with its mode, when the document
+                // records them: ruleutils' `print_function_arguments` walks
+                // `proargmodes`, printing OUT and INOUT ones with their mode
+                // and, for a PROCEDURE, an IN one as `IN ` too (so the text
+                // cannot be read as DROP PROCEDURE's argument list, where a
+                // bare parameter could be OUT). TABLE ones belong to the
+                // result, not here. Without modes every parameter is an input.
+                let all_names = strings("all_params");
+                let all_types = strings("all_param_types");
+                let modes = strings("param_modes");
+                let is_procedure = d.get_bool("is_procedure").unwrap_or(false);
+                let declared: Vec<(String, String, &str)> =
+                    if !modes.is_empty() && modes.len() == all_types.len() {
+                        modes
+                            .iter()
+                            .enumerate()
+                            .map(|(i, m)| {
+                                let name = all_names.get(i).cloned().unwrap_or_default();
+                                (name, all_types[i].clone(), m.as_str())
+                            })
+                            .collect()
+                    } else {
+                        types
+                            .iter()
+                            .enumerate()
+                            .map(|(i, t)| {
+                                let name = names.get(i).cloned().unwrap_or_default();
+                                let mode = if variadic && i + 1 == n { "v" } else { "i" };
+                                (name, t.clone(), mode)
+                            })
+                            .collect()
+                    };
                 // `(with DEFAULTs, without)`: `pg_get_function_arguments`
                 // prints a parameter's default as ruleutils does -- a string
                 // literal typed, `'x'::text` -- and the identity form omits it.
-                let pairs: Vec<(String, String)> = types
+                // Defaults are by INPUT parameter, as `proargdefaults` is.
+                let mut input = 0usize;
+                let pairs: Vec<(String, String)> = declared
                     .iter()
-                    .enumerate()
-                    .map(|(i, t)| {
-                        let ty = self.display_type_name(t);
-                        let name = names.get(i).map(String::as_str).unwrap_or("");
-                        let prefix = if variadic && i + 1 == n {
-                            "VARIADIC "
-                        } else {
-                            ""
+                    .filter_map(|(name, t, mode)| {
+                        let (prefix, is_input) = match *mode {
+                            "o" => ("OUT ", false),
+                            "b" => ("INOUT ", true),
+                            "v" => ("VARIADIC ", true),
+                            "t" => return None,
+                            _ if is_procedure => ("IN ", true),
+                            _ => ("", true),
                         };
+                        let i = input;
+                        if is_input {
+                            input += 1;
+                        }
+                        Some((i, is_input, name.as_str(), t, prefix))
+                    })
+                    .map(|(i, is_input, name, t, prefix)| {
+                        let ty = self.display_type_name(t);
                         let bare = if name.is_empty() {
                             format!("{prefix}{ty}")
                         } else {
@@ -826,6 +868,7 @@ impl PgHandler {
                         };
                         let default = defaults
                             .get(i)
+                            .filter(|_| is_input)
                             .cloned()
                             .flatten()
                             .map_or_else(String::new, |sql| {

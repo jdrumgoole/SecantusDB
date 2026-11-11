@@ -1346,6 +1346,10 @@ fn check_aexpr(e: &pg_query::protobuf::AExpr, scope: &Scope) -> Result<()> {
                 && matches!(l.node.as_ref(), Some(N::RowExpr(_)))
                 && matches!(r.node.as_ref(), Some(N::SubLink(_)));
             if !row_compare {
+                if kind != Some(K::AexprNullif) {
+                    let distinct = kind != Some(K::AexprOp);
+                    row_pair_arity(l, r, distinct, e.location, &[l, r], scope)?;
+                }
                 row_against_non_row(&op, l, r, e.location, scope)?;
             }
         }
@@ -1364,6 +1368,17 @@ fn check_aexpr(e: &pg_query::protobuf::AExpr, scope: &Scope) -> Result<()> {
                 // under load, past RP-202's budget (RP-748).
                 if i % 1024 == 1023 {
                     crate::cancel::check()?;
+                }
+                if let Err(refused) = row_pair_arity(l, item, false, e.location, &[], scope) {
+                    // Every item is transformed before any is compared.
+                    let location = take_error_location();
+                    for n in std::iter::once(l).chain(&items.items) {
+                        having_names_resolve(n, scope)?;
+                    }
+                    if let Some(at) = location {
+                        set_error_location(at);
+                    }
+                    return Err(refused);
                 }
                 row_against_non_row(&op, l, item, e.location, scope)?;
             }
@@ -3184,6 +3199,42 @@ fn row_operand_type(n: &pg_query::protobuf::Node, scope: &Scope) -> Option<Strin
 /// document with the scalar at run time (0A000 `comparing document with
 /// int32`) or, over no row or a NULL, answered; `fs || 1` concatenated.
 /// An untyped literal is left alone: it is read as the row's type.
+/// Two row constructors compared field by field are held to each other's
+/// length before any operator is looked up, at the operator: rows of
+/// different lengths are 42601 `unequal number of entries in row
+/// expressions`, and two rows of none 0A000 `cannot compare rows of zero
+/// length` (`make_row_comparison_op`, which `row() = row()` and each item
+/// of a row IN list reach, whatever the operator). `IS [NOT] DISTINCT
+/// FROM` (`distinct`) is `make_row_distinct_op`, which has the first check
+/// only: `row() is distinct from row()` answers (RP-849).
+///
+/// The operands are transformed first, so a bare column among `operands`
+/// that nothing in reach has is its 42703 instead (`row() = row(nosuch)`).
+fn row_pair_arity(
+    l: &pg_query::protobuf::Node,
+    r: &pg_query::protobuf::Node,
+    distinct: bool,
+    location: i32,
+    operands: &[&pg_query::protobuf::Node],
+    scope: &Scope,
+) -> Result<()> {
+    let (Some(N::RowExpr(l)), Some(N::RowExpr(r))) = (l.node.as_ref(), r.node.as_ref()) else {
+        return Ok(());
+    };
+    let error = if l.args.len() != r.args.len() {
+        Error::Parse("unequal number of entries in row expressions".into())
+    } else if l.args.is_empty() && !distinct {
+        Error::FeatureNotSupported("cannot compare rows of zero length".into())
+    } else {
+        return Ok(());
+    };
+    for n in operands {
+        having_names_resolve(n, scope)?;
+    }
+    set_error_location(location);
+    Err(error)
+}
+
 fn row_against_non_row(
     op: &str,
     l: &pg_query::protobuf::Node,

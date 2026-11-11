@@ -7325,3 +7325,131 @@ fn numeric_to_integer_errors_match_postgres() {
         Bson::Int32(-32768)
     );
 }
+
+/// `make_row_comparison_op` holds two row constructors to each other's
+/// length before any operator is looked up, at the operator (RP-849):
+/// 42601 for rows of different lengths, then 0A000 for rows of none --
+/// for `=`, `<>` and an ordering operator alike, each item of a row IN
+/// list, and a subquery of no columns. `IS DISTINCT FROM` is
+/// `make_row_distinct_op`, which has the first check only. Locations are
+/// PostgreSQL 15.19's, less one (it counts from 1).
+#[test]
+fn a_row_comparison_is_held_to_its_rows_lengths() {
+    for (sql, state, want, at) in [
+        (
+            "select row() = row()",
+            "0A000",
+            "cannot compare rows of zero length",
+            13,
+        ),
+        (
+            "select row() <> row()",
+            "0A000",
+            "cannot compare rows of zero length",
+            13,
+        ),
+        (
+            "select row() < row()",
+            "0A000",
+            "cannot compare rows of zero length",
+            13,
+        ),
+        (
+            "select row()  in  (row())",
+            "0A000",
+            "cannot compare rows of zero length",
+            14,
+        ),
+        (
+            "select row() in (select)",
+            "0A000",
+            "cannot compare rows of zero length",
+            13,
+        ),
+        (
+            "select row() <> all (select)",
+            "0A000",
+            "cannot compare rows of zero length",
+            13,
+        ),
+        (
+            "select row() = (select)",
+            "0A000",
+            "cannot compare rows of zero length",
+            13,
+        ),
+        (
+            "select row(1) < row(1, 2)",
+            "42601",
+            "unequal number of entries in row expressions",
+            14,
+        ),
+        (
+            "select row(1, 2) in (row(1, 2), row(1))",
+            "42601",
+            "unequal number of entries in row expressions",
+            17,
+        ),
+        (
+            "select row(1) is distinct from row(1, 2)",
+            "42601",
+            "unequal number of entries in row expressions",
+            14,
+        ),
+    ] {
+        take_error_location();
+        let err = analysed(sql).expect_err("should refuse");
+        assert_eq!(err.sqlstate(), state, "for {sql} (got {err})");
+        assert!(err.to_string().contains(want), "for {sql}: {err}");
+        assert_eq!(take_error_location(), Some(at), "for {sql}");
+    }
+    // The operands are transformed first: a column nothing has is its
+    // 42703, and two rows of no fields are not distinct.
+    take_error_location();
+    let err = analysed("select row() = row(nosuch)").expect_err("should refuse");
+    assert_eq!(err.sqlstate(), "42703", "got {err}");
+    analysed("select row() is distinct from row()").expect("analysed clean");
+}
+
+/// A call qualified with a schema that does not exist is that schema's
+/// 3F000 at the call, a built-in's name included (RP-485); an analysis
+/// error PostgreSQL meets first -- the FROM clause's, the call's own
+/// argument's -- comes first, and the call found nowhere does not.
+/// Measured on PostgreSQL 15.19.
+#[test]
+fn a_call_in_a_missing_schema_is_3f000() {
+    let missing = r#"schema "nosuch_schema" does not exist"#;
+    for sql in [
+        "select nosuch_schema.f()",
+        "select 1 + nosuch_schema.f(1)",
+        "select nosuch_schema.abs(-2)",
+        "select nosuch_schema.count(*)",
+        "select nosuch_schema.f(), realmissing()",
+        "select * from t where nosuch_schema.f(n)",
+        "values (1), (nosuch_schema.f())",
+    ] {
+        take_error_location();
+        let err = plan(sql, &lookup).unwrap_err();
+        assert_eq!(
+            (err.sqlstate(), err.to_string().as_str()),
+            ("3F000", missing),
+            "{sql}"
+        );
+    }
+    take_error_location();
+    plan("select 1 + nosuch_schema.f(1)", &lookup).unwrap_err();
+    assert_eq!(take_error_location(), Some(11));
+    for (sql, sqlstate) in [
+        ("select nosuch_schema.f() from nosuch_table", "42P01"),
+        ("select nosuch_schema.f(nosuch_col) from t", "42703"),
+    ] {
+        assert_eq!(
+            plan(sql, &lookup).unwrap_err().sqlstate(),
+            sqlstate,
+            "{sql}"
+        );
+    }
+    // Schemas that exist are left to the lookup.
+    let err = plan("select pg_catalog.abs(-2), public.f()", &lookup).unwrap_err();
+    assert_ne!(err.sqlstate(), "3F000");
+}

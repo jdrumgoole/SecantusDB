@@ -108,12 +108,30 @@ fn names_temp_schema(schema: &str) -> Option<String> {
     (schema == "pg_temp" || schema == t).then_some(t)
 }
 
-/// The session's temporary schema when it holds a relation: what an
-/// explicit `pg_temp` qualifier finds (`LookupExplicitNamespace`), which
-/// PostgreSQL creates with the session's first temporary relation. (It
-/// then outlives that relation's drop, which this does not model.)
+thread_local! {
+    /// The session's temp namespace has been made (`myTempNamespace`),
+    /// installed per statement by the executor, which keeps it.
+    static TEMP_NAMESPACE_MADE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Install whether the session's temp namespace has been made.
+pub fn set_temp_namespace_made(made: bool) {
+    TEMP_NAMESPACE_MADE.with(|m| m.set(made));
+}
+
+/// The session's temporary schema once it exists: what an explicit
+/// `pg_temp` qualifier finds (`LookupExplicitNamespace`). PostgreSQL makes
+/// it with the session's first temporary object (a relation, a function)
+/// and keeps it after the last one is dropped; before that `pg_temp` is
+/// no schema (3F000).
 pub(crate) fn temp_schema_in_use() -> Option<String> {
-    temp_schema().filter(|_| session_has_temp())
+    temp_schema().filter(|_| TEMP_NAMESPACE_MADE.with(std::cell::Cell::get) || session_holds_temp())
+}
+
+/// Does the session hold a temporary object -- a relation, a function or
+/// a procedure -- among those installed for this statement?
+pub fn session_holds_temp() -> bool {
+    session_has_temp() || crate::correlated::temp_routine_exists()
 }
 
 /// Does the session have a temporary relation?

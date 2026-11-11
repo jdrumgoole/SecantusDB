@@ -17473,7 +17473,9 @@ def test_a_pg_temp_function_left_by_a_killed_server_is_gone_at_restart(
     """A `pg_temp` function is dropped at a clean disconnect; one a KILLED
     server left used to reappear for the next session handed the same
     serial. The server now drops every temp function when it opens a store,
-    before any session exists."""
+    before any session exists. The new session has no temp schema, so
+    `pg_temp.f()` is 3F000 `schema "pg_temp" does not exist`, as on
+    PostgreSQL 15.19 (`get_namespace_oid`), not an undefined function."""
     # A killed server keeps only what reached the journal.
     monkeypatch.setenv("SECANTUS_FORCE_DURABLE", "1")
     with _Server(home) as server, server.connect() as a:
@@ -17488,7 +17490,9 @@ def test_a_pg_temp_function_left_by_a_killed_server_is_gone_at_restart(
     with _Server(home) as server, server.connect() as c:
         assert c.execute("select b41_keep()").fetchone() == (2,)
         assert c.execute("select count(*) from pg_proc where proname = 'f'").fetchone() == (0,)
-        with pytest.raises(psycopg.errors.UndefinedFunction):
+        with pytest.raises(
+            psycopg.errors.InvalidSchemaName, match='schema "pg_temp" does not exist'
+        ):
             c.execute("select pg_temp.f()")
 
 

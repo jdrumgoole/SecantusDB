@@ -2071,21 +2071,56 @@ Measured on PostgreSQL 15.19 (the data-modifying WITH on a private cluster).
       Verify: tests/backlog/test_rp_plpgsql_labels.py::test_expression_error_carries_its_query
       Backlog-ID: RP-488
 
-## Found while working RP-483 (2026-11-07)
+## Found while working RP-485 (2026-11-11)
 
-- [ ] **A call in a schema that does not exist is reported as a missing
-      function.** On PostgreSQL 15.19 `select nosuch_schema.nosuch()` is
-      3F000 `schema "nosuch_schema" does not exist` at 8
-      (`LookupExplicitNamespace`, before any function is looked up), and
-      `select pg_temp.nosuch()` the same for `pg_temp` in a session that has
-      made no temporary object yet. Here each is 42883 `function nosuch()
-      does not exist` (the schema dropped from the name, at the parenthesis,
-      22) or `function pg_temp.nosuch() does not exist`, with the
-      no-matching-function HINT. Once the session has a temp table both
-      servers answer 42883 for `pg_temp`. Measured on a private 15.19
+- [ ] **A call to a missing function in a named schema drops the schema
+      from the message.** On PostgreSQL 15.19 `select public.nosuch(1)` is
+      42883 `function public.nosuch(integer) does not exist` at 8, the name
+      as written, schema and all (`pg_catalog.nosuch()` and a user schema's
+      alike). Here the message is `function nosuch(integer) does not exist`
+      and the position the bare name's, 15. Measured on a private 15.19
       cluster.
-      Verify: tests/backlog/test_rp_function_bodies.py::test_call_in_a_missing_schema
-      Backlog-ID: RP-485
+      Verify: tests/backlog/test_rp_qualified_calls.py::test_missing_function_keeps_its_schema
+      Backlog-ID: RP-879
+- [ ] **A three-part function name is looked up by its last part.** On
+      PostgreSQL 15.19 `select a.b.c()` is 0A000 `cross-database references
+      are not implemented: a.b.c` at 8 (`DeconstructQualifiedName`, the
+      catalog not the current database). Here it is 42883 `function c()
+      does not exist` at 12. Measured on a private 15.19 cluster.
+      Verify: tests/backlog/test_rp_qualified_calls.py::test_three_part_function_name
+      Backlog-ID: RP-880
+- [ ] **CREATE TABLE does not analyse a column's DEFAULT.** On PostgreSQL
+      15.19 `create table t (a int default nosuch_fn())` is 42883 `function
+      nosuch_fn() does not exist` at 35, and `default nosuch_schema.f()` is
+      3F000 `schema "nosuch_schema" does not exist` at 35
+      (`cookDefault` -> `transformExpr`, at CREATE). Here both succeed, and
+      the error waits for an INSERT that uses the default. Measured on a
+      private 15.19 cluster.
+      Verify: tests/backlog/test_rp_qualified_calls.py::test_create_table_default_is_analysed
+      Backlog-ID: RP-881
+- [ ] **A missing relation qualified with `pg_temp` is named by the
+      session's `pg_temp_N`.** On PostgreSQL 15.19 `select * from
+      pg_temp.nosuch` is 42P01 `relation "pg_temp.nosuch" does not exist`
+      at 15, the name as written, whether or not the session has a temp
+      table. Here it is `relation "pg_temp_N.nosuch" does not exist` at 23.
+      Measured on a private 15.19 cluster.
+      Verify: tests/backlog/test_rp_qualified_calls.py::test_pg_temp_relation_is_named_as_written
+      Backlog-ID: RP-882
+- [ ] **The session's temp namespace does not follow its transactions.**
+      PostgreSQL 15.19 makes `myTempNamespace` with the first temporary
+      object and forgets it when the transaction (or subtransaction) that
+      made it aborts (`AtEOXact_Namespace`). Here `pg_my_temp_schema()`
+      after `begin; create temp table tt(a int); rollback` is the
+      namespace's oid where PostgreSQL answers 0 (the session's list of temp
+      tables keeps the rolled-back name), and after `begin; create temp
+      table tt(a int); drop table tt; commit` the call `pg_temp.nosuch()` is
+      3F000 `schema "pg_temp" does not exist` where PostgreSQL answers 42883
+      (the namespace is latched only from a statement outside a
+      transaction, `install_temp_namespace`). Faithful: keep the namespace's
+      creating (sub)transaction, as `myTempNamespaceSubID` does. Measured on
+      a private 15.19 cluster.
+      Verify: tests/backlog/test_rp_qualified_calls.py::test_temp_namespace_follows_transactions
+      Backlog-ID: RP-883
 
 ## Found while working RP-472 (2026-11-07)
 
@@ -2141,19 +2176,31 @@ Measured on a private PostgreSQL 15.19 cluster with `fs(a int, c text)`
 holding `(1, 'y')`.
 
 
-## Found while working RP-508 (2026-11-08)
+## Found while working RP-515 (2026-11-11)
 
 Measured on a private PostgreSQL 15.19 cluster. The gap tests are in
-`tests/backlog/test_rp_found_rp508.py`.
+`tests/backlog/test_rp_found_rp515.py`.
 
-- [ ] **`pg_get_function_arguments` and `pg_get_function_identity_arguments`
-      of a procedure print no argument modes.** PostgreSQL 15.19's
-      `print_function_arguments` prints every mode of a procedure's
-      arguments, IN included: `create procedure gk(a int, inout b text)`
-      prints `IN a integer, INOUT b text` in both; here `a integer, b text`.
-      (A function's IN is left out on both servers.)
-      Verify: tests/backlog/test_rp_found_rp508.py::test_procedure_arguments_print_their_modes
-      Backlog-ID: RP-515
+- [ ] **`pg_get_function_arguments` and `pg_get_function_result` print
+      names unquoted.** PostgreSQL 15.19's `print_function_arguments` and
+      `print_function_rettype` pass each parameter's and TABLE column's
+      name through `quote_identifier`: `create function "F 4"("A b" int,
+      "select" int)` prints `"A b" integer, "select" integer`, and
+      `returns table(x int, "Y z" text)` prints `TABLE(x integer, "Y z"
+      text)`. Here `A b integer, select integer` and `TABLE(x integer, Y z
+      text)`.
+      Verify: tests/backlog/test_rp_found_rp515.py::test_argument_and_column_names_are_quoted
+      Backlog-ID: RP-876
+
+- [ ] **A procedure's `pg_get_function_result` and `pg_get_functiondef`
+      read as a function's.** PostgreSQL 15.19's `pg_get_function_result`
+      is NULL for a procedure, and `pg_get_functiondef` prints `CREATE OR
+      REPLACE PROCEDURE public.gk(IN a integer, INOUT b text)`, no RETURNS
+      line, the body quoted `$procedure$`. Here the result is `record` and
+      the definition `CREATE OR REPLACE FUNCTION ... RETURNS record ...
+      $function$`.
+      Verify: tests/backlog/test_rp_found_rp515.py::test_procedure_result_and_definition
+      Backlog-ID: RP-877
 
 ## Found while working RP-467 (2026-11-08)
 
@@ -2783,14 +2830,6 @@ Measured on a private PostgreSQL 15.19 cluster with `fe(a int, b text)`.
       the same shape (RP-511).
       Backlog-ID: RP-507
       Verify: tests/backlog/test_rp_found_rp500.py::test_operand_constant_read_at_create
-- [ ] **A malformed range literal's 22P02 has no DETAIL.** PostgreSQL
-      15.19's `range_parse` explains each one: `select '[1,2'::int4range`
-      has DETAIL `Unexpected end of input.`, `'[1,2]x'` `Junk after right
-      parenthesis or bracket.`, `'1,2'` `Missing left parenthesis or
-      bracket.`. Here the message and position match and the DETAIL is
-      empty.
-      Backlog-ID: RP-510
-      Verify: tests/backlog/test_rp_found_rp500.py::test_range_literal_detail
 - [ ] **PREPARE evaluates a constant expression, and does not read a cast
       constant it does not evaluate.** PostgreSQL 15.19's PREPARE
       parse-analyses its statement and plans nothing: `prepare s1 as select
@@ -2805,6 +2844,25 @@ Measured on a private PostgreSQL 15.19 cluster with `fe(a int, b text)`.
       evaluate.
       Backlog-ID: RP-511
       Verify: tests/backlog/test_rp_found_rp500.py::test_prepare_analyses_without_evaluating
+
+## Found while working RP-510 (2026-11-11)
+
+Measured on PostgreSQL 15.19.
+
+- [ ] **A malformed multirange literal's 22P02 has no DETAIL, and a bad
+      member is reported as a range literal.** PostgreSQL 15.19's
+      `multirange_in` walks the literal itself and explains each failure:
+      `select '{[1,2}'::int4multirange` and `'{[1,2)'` have DETAIL
+      `Unexpected end of input.`, `'[1,2)'` `Missing left brace.`, `'{[1,2)}
+      x'` `Junk after closing right brace.`, and `'{[1,2),x}'` is
+      `malformed multirange literal: "{[1,2),x}"` with `Expected range
+      start.`. Here the first four have no DETAIL, and the last is
+      `malformed range literal: "x"` with the range parser's DETAIL: the
+      literal is split into members first (`split_members`) and each member
+      parsed as a range, where PostgreSQL's state machine reads the members
+      in place.
+      Verify: tests/backlog/test_rp_found_rp510.py::test_multirange_literal_detail
+      Backlog-ID: RP-878
 
 ## Found while working RP-493 (2026-11-07)
 
@@ -3466,23 +3524,6 @@ Measured on PostgreSQL 15.19; none of the statements creates an object.
       Verify: tests/backlog/test_rp_found_rp822.py::test_a_signatures_percent_type_is_resolved
       Backlog-ID: RP-830
 
-## Found while working RP-799 (2026-11-10)
-
-Measured on a private, freshly initdb'd PostgreSQL 15.19 cluster with the
-`_SETUP` in `tests/backlog/test_rp_found_rp799.py`: `dx` a domain over
-`int` with `default 42`, `dx2` a domain over `dx`, `dnd` one over `int`
-`not null default 5`, and `dpos` one over `int` `check (value > 0)`. Each
-holds for a column CREATE TABLE declares and, since RP-799, for one ADD
-COLUMN adds, and since RP-834 for one ALTER COLUMN TYPE retypes into a
-domain.
-
-- [ ] **`information_schema.columns.data_type` of a domain over a domain
-      names its base.** A column of `dx2` is `USER-DEFINED` on PostgreSQL
-      15.19 -- the view reads the domain's immediate base type, itself a
-      domain -- and `integer` here.
-      Verify: tests/backlog/test_rp_found_rp799.py::test_data_type_of_a_domain_over_a_domain_is_user_defined
-      Backlog-ID: RP-827
-
 ## Found while working RP-751 (2026-11-10)
 
 Measured on PostgreSQL 15.19; none of it needs DDL. The gap tests are in
@@ -3634,14 +3675,6 @@ Measured on PostgreSQL 15.19 (the shared reference on port 5415): every
 statement is VALUES-only and runs there as written. The gap tests are in
 `tests/backlog/test_rp_found_rp727.py`.
 
-- [ ] **A row comparison of zero-length rows answers.** `select row() =
-      row()`, `row() <> row()` and `row() in (select)` are 0A000 `cannot
-      compare rows of zero length` at the operator (14) on PostgreSQL 15.19
-      (`make_row_comparison_op`); here they answer `t`, `f` and `t`. Since
-      RP-727 an ordering operator against a subquery (`row() < any
-      (select)`) is refused as PostgreSQL refuses it.
-      Verify: tests/backlog/test_rp_found_rp727.py::test_zero_length_row_comparison_is_0a000
-      Backlog-ID: RP-849
 - [ ] **A row field that is an untyped literal is not coerced to its
       pair's type.** `select (1, '2') = (1, 2)` and `(1, '2') < any
       (select 1, 3)` are `t` on PostgreSQL 15.19: each pair's operator is
@@ -3658,9 +3691,30 @@ statement is VALUES-only and runs there as written. The gap tests are in
       `text_pattern_ops`), so `make_row_comparison_op` builds a
       RowCompareExpr of it as of `<`. Here the first is 42804 `collations
       are not supported by type record` and the second 0A000 `a row
-      comparison with ~<~ and a subquery is not supported yet`.
+      comparison with ~<~ and a subquery is not supported yet`. Since RP-849
+      rows of no fields are 0A000 `cannot compare rows of zero length`
+      under any operator, `row() ~<~ any (select)` included, but `row()
+      ~<~ row()` is still the 42804: the collation check runs first.
       Verify: tests/backlog/test_rp_found_rp727.py::test_row_comparison_with_a_pattern_operator
       Backlog-ID: RP-851
+
+## Found while working RP-849 (2026-11-11)
+
+Measured on PostgreSQL 15.19 (the shared reference on port 5415): every
+statement is VALUES-only and runs there as written. The gap test is in
+`tests/backlog/test_rp_found_rp849.py`.
+
+- [ ] **A row beside an operand that is not a row looks its operator up
+      before a missing column is reported.** `select (1, nosuch) = (1)
+      from (values (1)) v(a)` and `(1, nosuch) in (1, 2)` are 42703
+      `column "nosuch" does not exist` at 12 on PostgreSQL 15.19:
+      `transformAExprOp` / `transformAExprIn` transform the operands
+      before `make_op` looks for `record = integer`. Here each is 42883
+      `operator does not exist: record = integer`: `row_against_non_row`
+      runs before the operands' names are resolved. (Two row constructors
+      resolve their operands' bare names first since RP-849.)
+      Verify: tests/backlog/test_rp_found_rp849.py::test_a_row_beside_a_non_row_transforms_its_operands_first
+      Backlog-ID: RP-875
 
 ## Found while working RP-704 (2026-11-10)
 

@@ -1,6 +1,7 @@
 """What working RP-727 (an ordered row comparison with a subquery) found:
 
-- a row comparison of zero-length rows answers instead of 0A000;
+- a row comparison of zero-length rows answered instead of 0A000 (fixed:
+  RP-849);
 - a row field that is an untyped literal is compared as a string, not
   coerced to its pair's type;
 - a row comparison with a pattern operator (`~<~`) is refused.
@@ -35,7 +36,7 @@ def answer(dsn: str, query: str) -> Any:
 
 
 # `make_row_comparison_op` refuses a row of no fields, at the operator,
-# for every operator. Here `=`, `<>` and IN answer.
+# for every operator. Here `=`, `<>` and IN answered until RP-849.
 ZERO_LENGTH = {
     "select row() = row()": ("0A000", "cannot compare rows of zero length", "14"),
     "select row() <> row()": ("0A000", "cannot compare rows of zero length", "14"),
@@ -43,7 +44,7 @@ ZERO_LENGTH = {
 }
 
 
-@pytest.mark.backlog("RP-849")
+@pytest.mark.backlog_fixed("RP-849")
 @pytest.mark.parametrize("query", list(ZERO_LENGTH))
 def test_zero_length_row_comparison_is_0a000(query: str, dsn: str) -> None:
     assert answer(dsn, query) == ZERO_LENGTH[query]

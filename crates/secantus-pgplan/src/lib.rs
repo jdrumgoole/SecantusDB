@@ -4487,6 +4487,11 @@ pub(crate) fn set_error_location(location: i32) {
     }
 }
 
+/// The location the last planning error recorded, left in place.
+fn peek_error_location() -> Option<i32> {
+    ERROR_LOCATION.with(std::cell::Cell::get)
+}
+
 /// The location the last planning error recorded, consumed; call before
 /// planning to clear a stale one too (and a stale
 /// [`set_error_unpositioned`] with it).
@@ -4864,12 +4869,15 @@ fn parse_one(sql: &str) -> Result<N> {
     Ok(node)
 }
 
-/// A qualified type name's schema must exist: `1::nosuch.t` is 3F000 at the
-/// type name, before anything looks for the type (15.19).
 /// The type names a statement writes: a cast's, a column's, and any the
-/// walk reaches on its own (it does not descend into the first two).
-fn statement_type_names(node: &N) -> Vec<pg_query::protobuf::TypeName> {
+/// walk reaches on its own (it does not descend into the first two). And,
+/// from the same walk, the first call (by position) qualified with a
+/// schema that does not exist.
+fn statement_type_names(
+    node: &N,
+) -> (Vec<pg_query::protobuf::TypeName>, Option<MissingCallSchema>) {
     let mut out = Vec::new();
+    let mut call: Option<MissingCallSchema> = None;
     let columns = |elts: &[pg_query::protobuf::Node],
                    out: &mut Vec<pg_query::protobuf::TypeName>| {
         for e in elts {
@@ -4891,19 +4899,98 @@ fn statement_type_names(node: &N) -> Vec<pg_query::protobuf::TypeName> {
         }
         _ => {}
     }
-    for (n, _, _, _) in node.nodes() {
-        match n {
-            pg_query::NodeRef::TypeName(tn) => out.push(tn.clone()),
-            pg_query::NodeRef::TypeCast(tc) => out.extend(tc.type_name.clone()),
-            pg_query::NodeRef::ColumnDef(cd) => out.extend(cd.type_name.clone()),
-            _ => {}
+    // pg_query's walk does not descend into a VALUES list's rows: each
+    // row's expressions are walked as roots of their own.
+    let mut roots = vec![node];
+    while let Some(root) = roots.pop() {
+        for (n, _, _, _) in root.nodes() {
+            match n {
+                pg_query::NodeRef::TypeName(tn) => out.push(tn.clone()),
+                pg_query::NodeRef::TypeCast(tc) => out.extend(tc.type_name.clone()),
+                pg_query::NodeRef::ColumnDef(cd) => out.extend(cd.type_name.clone()),
+                pg_query::NodeRef::FuncCall(f) => {
+                    if let Some(missing) = missing_call_schema(f) {
+                        if call.as_ref().is_none_or(|c| f.location < c.location) {
+                            call = Some(missing);
+                        }
+                    }
+                }
+                pg_query::NodeRef::SelectStmt(sel) => {
+                    for row in &sel.values_lists {
+                        match row.node.as_ref() {
+                            Some(N::List(l)) => {
+                                roots.extend(l.items.iter().filter_map(|i| i.node.as_ref()));
+                            }
+                            Some(other) => roots.push(other),
+                            None => {}
+                        }
+                    }
+                }
+                _ => {}
+            }
         }
     }
-    out
+    (out, call)
 }
 
+/// The schema a `schema.function(...)` call names, when it does not exist.
+/// PostgreSQL looks the schema up before any function
+/// (`FuncnameGetCandidates` -> `LookupExplicitNamespace`), so a missing one
+/// is 3F000, not 42883 -- and a built-in is not found through it either.
+/// `pg_temp` exists once the session has made a temporary object. A
+/// three-part name is left to the lookup.
+fn missing_call_schema(f: &pg_query::protobuf::FuncCall) -> Option<MissingCallSchema> {
+    let [schema, name] = f.funcname.as_slice() else {
+        return None;
+    };
+    let (Some(N::String(s)), Some(N::String(name))) = (schema.node.as_ref(), name.node.as_ref())
+    else {
+        return None;
+    };
+    let schema = s.sval.as_str();
+    let exists = if schema == "pg_temp" {
+        schemas::temp_schema_in_use().is_some()
+    } else {
+        // A session's `pg_temp_N` is left to the lookup, as before.
+        schema.starts_with("pg_temp_") || schemas::schema_exists(schema)
+    };
+    (!exists).then(|| MissingCallSchema {
+        location: f.location,
+        schema: schema.to_string(),
+        function: name.sval.clone(),
+    })
+}
+
+/// A call qualified with a schema that does not exist.
+struct MissingCallSchema {
+    location: i32,
+    schema: String,
+    /// The function's own name, as written.
+    function: String,
+}
+
+thread_local! {
+    /// The first call of the statement a client sent whose schema does not
+    /// exist, for [`answer_missing_call_schema`]:
+    /// cleared before that statement is parsed, and kept against the
+    /// snippets its rewrites parse after it.
+    static MISSING_CALL_SCHEMA: std::cell::RefCell<Option<MissingCallSchema>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// A qualified type name's schema must exist: `1::nosuch.t` is 3F000 at the
+/// type name, before anything looks for the type (15.19). A call's missing
+/// schema is recorded, not raised: PostgreSQL reaches it only when it
+/// analyses the call, after the FROM clause, the call's arguments and the
+/// target entries before it.
 fn check_type_schemas(node: &N) -> Result<()> {
-    for tn in statement_type_names(node) {
+    let (types, call) = statement_type_names(node);
+    if let Some(call) = call {
+        MISSING_CALL_SCHEMA.with(|m| {
+            m.borrow_mut().get_or_insert(call);
+        });
+    }
+    for tn in types {
         {
             let parts: Vec<&str> = tn
                 .names
@@ -4927,6 +5014,92 @@ fn check_type_schemas(node: &N) -> Result<()> {
     Ok(())
 }
 
+/// The missing-schema call [`check_type_schemas`] found in the statement
+/// just parsed, taken.
+fn take_missing_call_schema() -> Option<MissingCallSchema> {
+    MISSING_CALL_SCHEMA.with(|m| m.borrow_mut().take())
+}
+
+/// Plan a statement holding a call in a schema that does not exist, and
+/// answer as PostgreSQL does: an analysis error it meets first (a missing
+/// column or relation, a type mismatch, in the FROM clause, the call's
+/// arguments or an earlier target) stands, and so does another function
+/// found nowhere, written before the call. This call found nowhere, a
+/// refusal (0A000), a data error from folding a constant -- all of which
+/// PostgreSQL meets after analysis, or never -- or the plan succeeding is
+/// the schema's 3F000 at the call. Anything else (a cancel, a resource
+/// limit) stands. Nothing runs while it plans: the statement never reaches
+/// the executor.
+fn answer_missing_call_schema(
+    sql: &str,
+    missing: Option<MissingCallSchema>,
+    plan: impl FnOnce() -> Result<Statement>,
+) -> Result<Statement> {
+    let Some(missing) = missing else {
+        return plan();
+    };
+    match planning_without_running(plan) {
+        Err(e) => match missing_function_name(&e) {
+            None if !["0A", "21", "22"].contains(&&e.sqlstate()[..2]) => Err(e),
+            // The planner's own refusal carries no location: the function's
+            // first call in the statement is where it points.
+            Some(other)
+                if other != missing.function
+                    && peek_error_location()
+                        .or_else(|| first_call_location(sql, other))
+                        .is_some_and(|at| at < missing.location) =>
+            {
+                Err(e)
+            }
+            _ => Err(missing.error()),
+        },
+        Ok(_) => Err(missing.error()),
+    }
+}
+
+impl MissingCallSchema {
+    fn error(&self) -> Error {
+        set_error_location(self.location);
+        Error::Sqlstate(
+            "3F000",
+            format!("schema \"{}\" does not exist", self.schema),
+        )
+    }
+}
+
+/// Where the statement first calls a function of this bare name.
+fn first_call_location(sql: &str, name: &str) -> Option<i32> {
+    let tree = parse_tree(sql).ok()?;
+    tree.nodes()
+        .into_iter()
+        .filter_map(|(n, _, _, _)| match n {
+            pg_query::NodeRef::FuncCall(f) => f
+                .funcname
+                .last()
+                .and_then(|n| match n.node.as_ref()? {
+                    N::String(s) => Some(s.sval == name),
+                    _ => None,
+                })
+                .unwrap_or(false)
+                .then_some(f.location),
+            _ => None,
+        })
+        .min()
+}
+
+/// The bare name of the function a "found nowhere" error names
+/// (`function f(integer) does not exist`, or the planner's `function f()`
+/// it is turned into), if that is what it is.
+fn missing_function_name(e: &Error) -> Option<&str> {
+    let m = match e {
+        Error::UndefinedFunction(m) => m.strip_suffix(" does not exist")?,
+        Error::Unsupported(m) => m.as_str(),
+        _ => return None,
+    };
+    let (name, _) = m.strip_prefix("function ")?.split_once('(')?;
+    Some(name.rsplit('.').next().unwrap_or(name))
+}
+
 /// A missing type is named as the statement wrote it, schema and all
 /// (`type "public.nosuch" does not exist`): the planner's own message
 /// carries the bare name its lowering kept.
@@ -4944,7 +5117,7 @@ fn qualify_type_error(e: Error, node: &pg_query::protobuf::Node) -> Error {
     let Some(inner) = node.node.as_ref() else {
         return e;
     };
-    for tn in statement_type_names(inner) {
+    for tn in statement_type_names(inner).0 {
         {
             let parts: Vec<String> = tn
                 .names
@@ -5078,6 +5251,7 @@ fn pattern_ops(node: &mut N) {
 /// search path does not reach is not found. (A stored definition -- a
 /// view's body -- keeps reading what it was created over.)
 fn parse_one_as_sent(sql: &str) -> Result<N> {
+    MISSING_CALL_SCHEMA.with(|m| *m.borrow_mut() = None);
     let previous = schemas::AS_SENT.with(|f| f.replace(true));
     let out = parse_one(sql);
     schemas::AS_SENT.with(|f| f.set(previous));
@@ -5102,9 +5276,22 @@ pub fn plan_with_params(
     params: &[Bson],
 ) -> Result<Statement> {
     joins::clear_planned_joins();
-    let mut node = pg_query::protobuf::Node {
-        node: Some(parse_one_as_sent(sql)?),
-    };
+    // A rewrite the parse runs may refuse the call already.
+    let parsed = parse_one_as_sent(sql);
+    answer_missing_call_schema(sql, take_missing_call_schema(), || {
+        let node = pg_query::protobuf::Node {
+            node: Some(parsed?),
+        };
+        plan_with_params_parsed(sql, node, lookup, params)
+    })
+}
+
+fn plan_with_params_parsed(
+    sql: &str,
+    mut node: pg_query::protobuf::Node,
+    lookup: &dyn Fn(&str) -> Option<TableDef>,
+    params: &[Bson],
+) -> Result<Statement> {
     pullup::rewrite(&mut node);
     prune_outputs::rewrite(&mut node, lookup, params);
     event_triggers::rewrite_sources(sql, &mut node)?;
@@ -5141,16 +5328,21 @@ pub fn plan_with_subqueries(
     params: &[Bson],
     run: SubqueryRunner<'_>,
 ) -> Result<Statement> {
-    let node = pg_query::protobuf::Node {
-        node: Some(parse_one_as_sent(sql)?),
-    };
-    cancel::check()?;
-    cancel::check()?;
+    let parsed = parse_one_as_sent(sql);
+    let missing = take_missing_call_schema();
     // The statement as written, for a type error's qualified name: from the
     // memo again when one is raised, not cloned for every plan (a clone of a
     // 200,000-item IN list is a fifth of a second in which no cancel is
     // seen).
-    plan_with_subqueries_parsed(sql, node, lookup, params, run).map_err(|e| {
+    answer_missing_call_schema(sql, missing, || {
+        let node = pg_query::protobuf::Node {
+            node: Some(parsed?),
+        };
+        cancel::check()?;
+        cancel::check()?;
+        plan_with_subqueries_parsed(sql, node, lookup, params, run)
+    })
+    .map_err(|e| {
         if !matches!(&e, Error::UndefinedObject(m) if m.starts_with("type \"")) {
             return e;
         }
@@ -24029,6 +24221,15 @@ pub(crate) fn check_sublink_width(
             match left.cmp(&width) {
                 std::cmp::Ordering::Less => "subquery has too many columns",
                 std::cmp::Ordering::Greater => "subquery has too few columns",
+                // Then `make_row_comparison_op`, whatever the operator: a
+                // row of no fields against a subquery of no columns is
+                // 0A000, at the operator (RP-849).
+                std::cmp::Ordering::Equal if left == 0 => {
+                    set_error_location(sl.location);
+                    return Err(Error::FeatureNotSupported(
+                        "cannot compare rows of zero length".into(),
+                    ));
+                }
                 std::cmp::Ordering::Equal => return Ok(()),
             }
         }
@@ -24547,20 +24748,21 @@ fn row_subquery_comparison(
             _ => None,
         })
         .unwrap_or_else(|| "=".to_string());
+    let width = row.args.len();
+    if width == 0 {
+        // `make_row_comparison_op`'s check, at the operator, ahead of the
+        // operator's lookup and of any row (`check_sublink_width` makes it
+        // where the subquery's width is known).
+        set_error_location(sl.location);
+        return Err(Error::FeatureNotSupported(
+            "cannot compare rows of zero length".into(),
+        ));
+    }
     let ordered = matches!(op.as_str(), "<" | "<=" | ">" | ">=");
     if !ordered && !matches!(op.as_str(), "=" | "<>") {
         return Err(Error::Unsupported(format!(
             "a row comparison with {op} and a subquery"
         )));
-    }
-    let width = row.args.len();
-    if ordered && width == 0 {
-        // `make_row_comparison_op`'s check, at the operator, ahead of any
-        // row.
-        set_error_location(sl.location);
-        return Err(Error::FeatureNotSupported(
-            "cannot compare rows of zero length".into(),
-        ));
     }
     if let Some(r) = rows.first() {
         if r.len() != width {

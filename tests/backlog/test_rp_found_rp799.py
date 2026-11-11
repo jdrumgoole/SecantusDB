@@ -366,8 +366,9 @@ def test_a_domain_over_a_domain_copies_its_default_at_create(dsn: str) -> None:
 
 # `information_schema.columns.data_type` of a domain column is its
 # domain's IMMEDIATE base type's, which for a domain over a domain is a
-# domain itself: `USER-DEFINED`.
-@pytest.mark.backlog("RP-827")
+# domain itself: `USER-DEFINED`. Here it named the ultimate base,
+# `integer`. Fixed by RP-827.
+@pytest.mark.backlog_fixed("RP-827")
 def test_data_type_of_a_domain_over_a_domain_is_user_defined(dsn: str) -> None:
     got = _answers(
         dsn,
@@ -382,4 +383,58 @@ def test_data_type_of_a_domain_over_a_domain_is_user_defined(dsn: str) -> None:
         "CREATE TABLE",
         [("USER-DEFINED", "dx2_799")],
         "DROP TABLE",
+    ]
+
+
+# RP-827's regression test. Every type-derived column of
+# `information_schema.columns` reads the domain's immediate base
+# (`typbasetype`): for a domain over a domain, `udt_name` is the inner
+# domain and the lengths and precisions are NULL, whatever the inner
+# domain is over; a domain over a built-in keeps its base's. Measured on a
+# private PostgreSQL 15.19 cluster.
+@pytest.mark.backlog_fixed("RP-827")
+def test_a_domain_over_a_domain_column_is_typed_by_the_inner_domain(dsn: str) -> None:
+    domains = [
+        ("dch827", "char(3)"),
+        ("dch2_827", "dch827"),
+        ("dn827", "numeric(5,2)"),
+        ("dn2_827", "dn827"),
+        ("darr827", "int[]"),
+        ("darr2_827", "darr827"),
+        ("dts827", "timestamp(3)"),
+        ("dts2_827", "dts827"),
+        ("dt827", 'text collate "C"'),
+        ("dt2_827", "dt827"),
+    ]
+    drops = [
+        "drop table if exists t799",
+        *(f"drop domain if exists {n}" for n, _ in reversed(domains)),
+    ]
+    got = _answers(
+        dsn,
+        [
+            *drops,
+            *(f"create domain {n} as {b}" for n, b in domains),
+            "create table t799 (a dx2_799, b dch2_827, c dn2_827, d darr2_827,"
+            " f dts2_827, h dt2_827, i dx799, j dch827)",
+            "alter table t799 add column k dx2_799",
+            "select column_name, data_type, udt_schema, udt_name,"
+            " character_maximum_length, character_octet_length, numeric_precision,"
+            " numeric_precision_radix, numeric_scale, datetime_precision,"
+            " collation_name, domain_name from information_schema.columns"
+            " where table_name = 't799' order by ordinal_position",
+            *drops,
+        ],
+    )
+    n = len(drops) + len(domains) + 2
+    assert got[n] == [
+        ("a", "USER-DEFINED", "public", "dx799", *[None] * 7, "dx2_799"),
+        ("b", "USER-DEFINED", "public", "dch827", *[None] * 7, "dch2_827"),
+        ("c", "USER-DEFINED", "public", "dn827", *[None] * 7, "dn2_827"),
+        ("d", "USER-DEFINED", "public", "darr827", *[None] * 7, "darr2_827"),
+        ("f", "USER-DEFINED", "public", "dts827", *[None] * 7, "dts2_827"),
+        ("h", "USER-DEFINED", "public", "dt827", *[None] * 6, "C", "dt2_827"),
+        ("i", "integer", "pg_catalog", "int4", None, None, 32, 2, 0, None, None, "dx799"),
+        ("j", "character", "pg_catalog", "bpchar", 3, 12, *[None] * 5, "dch827"),
+        ("k", "USER-DEFINED", "public", "dx799", *[None] * 7, "dx2_799"),
     ]
