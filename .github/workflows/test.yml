@@ -1488,7 +1488,13 @@ jobs:
           mongod --version | head -1
           # invoke: a gap test about the build tooling imports rust_tasks
           # (RM-388), which imports invoke; uv.lock's version.
-          uv run --no-project --with pymongo==4.17.0 --with pytest --with pytest-xdist \
+          #
+          # --isolated: this job ran `uv sync`, and `uv run --no-project`
+          # alone layers its ephemeral env over that .venv -- pytest-randomly,
+          # pytest-timeout and the `secantus` package with it. The first run
+          # of this job did exactly that and took 421 s here and 595 s for
+          # mongod_live, against 197-370 s and 118-195 s in the old job.
+          uv run --no-project --isolated --with pymongo==4.17.0 --with pytest --with pytest-xdist \
             --with "psycopg[binary]==3.3.4" --with invoke==3.0.3 \
             python tools/backlog.py verify --file backlog-rust-mongodb.md --regressions
 
@@ -1498,7 +1504,8 @@ jobs:
         if: matrix.shard == 'live'
         run: |
           mongod --version | head -1
-          uv run --no-project --with pymongo==4.17.0 --with pytest --with pytest-xdist \
+          # --isolated: see the backlog step.
+          uv run --no-project --isolated --with pymongo==4.17.0 --with pytest --with pytest-xdist \
             --with "psycopg[binary]==3.3.4" --with invoke==3.0.3 \
             python -m pytest tests/mongod_live -m mongod_live -o addopts= -n auto \
             -p no:cacheprovider -q -rs
