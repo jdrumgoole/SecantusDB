@@ -1842,15 +1842,6 @@ a regression test.
       on PostgreSQL 15.19 (found while working RP-441).
       Verify: tests/backlog/test_rp_fromless_analysis.py::test_missing_column_before_operator_to_its_right
       Backlog-ID: RP-447
-- [ ] **An operator over `current_user` or `current_schema` names its
-      operand `text`, not `name`.** `select 1 + current_user` is 42883
-      `operator does not exist: integer + text` here and `integer + name`
-      on PostgreSQL 15.19 (`select current_schema + 1` likewise);
-      `pg_typeof` of each is `name` on both, so only the operator check's
-      typing of the keyword functions differs. Measured on PostgreSQL 15.19
-      (found while working RP-441).
-      Verify: tests/backlog/test_rp_fromless_analysis.py::test_keyword_function_operand_is_name
-      Backlog-ID: RP-448
 - [ ] **A cast literal's input error is reported after the operator
       around it.** PostgreSQL 15.19's `transformTypeCast` runs a constant's
       input function as the cast is transformed, before `make_op` looks the

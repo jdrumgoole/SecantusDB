@@ -347,16 +347,49 @@ def _no_operator(message: str, position: str) -> Answer:
     )
 
 
+# The role, catalog and schema keyword functions are `name`
+# (`transformSQLValueFunction`), so an operator beside one is judged as
+# beside a `name` column; one `name` has is still found (`||` over its
+# implicit cast to text, `=` against text). Measured on PostgreSQL 15.19.
 KEYWORD_OPERANDS = {
     "select 1 + current_user": _no_operator("operator does not exist: integer + name", "10"),
     "select current_schema + 1": _no_operator("operator does not exist: name + integer", "23"),
+    "select current_role + 1": _no_operator("operator does not exist: name + integer", "21"),
+    "select user + 1": _no_operator("operator does not exist: name + integer", "13"),
+    "select session_user + 1": _no_operator("operator does not exist: name + integer", "21"),
+    "select current_catalog + 1": _no_operator("operator does not exist: name + integer", "24"),
+    "select current_user + current_user": _no_operator(
+        "operator does not exist: name + name", "21"
+    ),
+    # A prefix operator's HINT is in the singular (`op_error`).
+    "select -current_user": (
+        "42883",
+        "operator does not exist: - name",
+        "No operator matches the given name and argument type. "
+        "You might need to add an explicit type cast.",
+        "8",
+    ),
+    "select current_user = 1": _no_operator("operator does not exist: name = integer", "21"),
+    "select current_user = true": _no_operator("operator does not exist: name = boolean", "21"),
+    "select current_user = '{}'::jsonb": _no_operator(
+        "operator does not exist: name = jsonb", "21"
+    ),
+    "select current_user = date '2020-01-01'": _no_operator(
+        "operator does not exist: name = date", "21"
+    ),
+    "select current_user in (1, 2)": _no_operator("operator does not exist: name = integer", "21"),
+    "select current_user || 1": None,
+    "select current_user = 'x'::text": None,
+    "select current_schema = 'public'": None,
 }
 
 
-@pytest.mark.backlog("RP-448")
+@pytest.mark.backlog_fixed("RP-448")
 @pytest.mark.parametrize("query", list(KEYWORD_OPERANDS))
 def test_keyword_function_operand_is_name(query: str, rust_pg: Any) -> None:
-    """The operand is named `text` in the message here."""
+    """The operand was named `text` in the message here (`integer + text`),
+    and a comparison with a number, a boolean or a date was 0A000 or
+    answered: `optype` did not type the keyword functions."""
     assert answer(rust_pg, query) == KEYWORD_OPERANDS[query]
 
 
