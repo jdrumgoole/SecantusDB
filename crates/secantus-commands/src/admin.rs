@@ -5012,8 +5012,8 @@ pub fn validate(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     };
     let layout = crate::ts_buckets::Layout::of(&options);
     let nrecords = match (&layout, &checkpointed) {
-        // The buckets are derived from the live documents, background or
-        // not (`tasks/backlog-rust-mongodb.md`, RM-033).
+        // The stored buckets, read live, background or not
+        // (`tasks/backlog-rust-mongodb.md`, RM-033).
         (Some(_), _) => {
             crate::ts_buckets::of_collection(storage, &ctx.db_name, &coll)?.len() as i64
         }

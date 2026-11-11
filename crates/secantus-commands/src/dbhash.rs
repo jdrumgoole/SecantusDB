@@ -15,8 +15,8 @@
 //!   mongod does not replicate it does not hash); `system.views` is hashed
 //!   like any collection (here, from the definitions it is derived from);
 //! - a time-series collection is hashed as `system.buckets.<name>`, from
-//!   its bucket documents (here, the ones this server derives; their bytes
-//!   equal mongod's only where the buckets do, RM-088);
+//!   its stored bucket documents (their `data` columns follow mongod's
+//!   per-process hash order there, so two mongods disagree too);
 //! - `collections` names the ones to hash: a name that is not a collection
 //!   is ignored, a non-array `collections` is ignored, and an element that
 //!   is not a string is `BadValue`. Any other field is ignored.
