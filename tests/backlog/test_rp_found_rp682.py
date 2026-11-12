@@ -1,8 +1,8 @@
 """What working RP-682 (OVER on a plain function is 42809) found:
 
-- RP-868: an aggregate-only clause -- DISTINCT, ORDER BY, FILTER -- on a plain
-  function call without OVER is accepted and ignored, where PostgreSQL
-  refuses it 42809;
+- RP-868 (fixed): an aggregate-only clause -- DISTINCT, ORDER BY, FILTER -- on
+  a plain function call without OVER was accepted and ignored, where
+  PostgreSQL refuses it 42809;
 - RP-869: an ordered-set aggregate's OVER and WITHIN GROUP checks: `rank(1) over
   ()` answers 1, and `percentile_cont(...) within group (...) over ()` is
   this server's gap message, not PostgreSQL's;
@@ -44,7 +44,7 @@ PLAIN_CLAUSES = {
 }
 
 
-@pytest.mark.backlog("RP-868")
+@pytest.mark.backlog_fixed("RP-868")
 @pytest.mark.parametrize("query", list(PLAIN_CLAUSES))
 def test_an_aggregate_clause_on_a_plain_function_is_42809(query: str, dsn: str) -> None:
     clause = PLAIN_CLAUSES[query]

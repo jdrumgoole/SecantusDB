@@ -2520,12 +2520,35 @@ impl Interp<'_> {
         }
     }
 
-    /// Assign one result row to an INTO / FOR target (a record or a row).
-    /// The datum an `INTO` fills: a record or row variable by number, or an
-    /// anonymous row of the variables listed.
-    pub(super) fn target_datum(&mut self, body: &Value) -> Result<usize, PlError> {
+    /// Assign `row` to the datum the statement's `key` field names
+    /// (`target` of an INTO, a FETCH or an `EXECUTE ... INTO`, `var` of a
+    /// FOR over a query), as [`Self::assign_row`] does. The grammar makes a
+    /// list of scalar variables -- one included -- an anonymous row
+    /// (`read_into_scalar_list`), which the dump gives no number: one is
+    /// made of the variables listed for the assignment, which
+    /// `exec_move_row` fills column by column (RP-713), and dropped after
+    /// it, so a statement run in a loop does not grow the datums.
+    pub(super) fn assign_into(
+        &mut self,
+        body: &Value,
+        key: &str,
+        out: &QueryOut,
+        row: Option<&[Bson]>,
+        domains: &[Option<String>],
+    ) -> Result<(), PlError> {
+        let base = self.datums.len();
+        let target = self.variable_datum(body, key);
+        let result = target.and_then(|t| self.assign_row(t, out, row, domains));
+        self.datums.truncate(base);
+        result
+    }
+
+    /// The datum the statement's `key` field names: a record or row
+    /// variable by number, or an anonymous row of the variables listed,
+    /// pushed onto the datums.
+    fn variable_datum(&mut self, body: &Value, key: &str) -> Result<usize, PlError> {
         let target = body
-            .get("target")
+            .get(key)
             .and_then(|t| t.as_object())
             .and_then(|o| o.values().next())
             .and_then(|v| v.get("dno").and_then(Value::as_u64))
@@ -2535,7 +2558,7 @@ impl Interp<'_> {
             None => {
                 // An anonymous row of variables.
                 let fields: Vec<usize> = body
-                    .get("target")
+                    .get(key)
                     .and_then(|t| t.get("PLpgSQL_row"))
                     .and_then(|r| r.get("fields"))
                     .and_then(Value::as_array)
@@ -2552,6 +2575,7 @@ impl Interp<'_> {
         })
     }
 
+    /// Assign one result row to an INTO / FOR target (a record or a row).
     /// `domains` names the domain each column is of, where known
     /// ([`Host::output_domains`]). A record takes the row as it is; a
     /// variable, or each variable of a row, is assigned its column's value
@@ -3060,14 +3084,6 @@ impl Interp<'_> {
                 result
             }
             "PLpgSQL_stmt_fors" | "PLpgSQL_stmt_dynfors" => {
-                let target = body
-                    .get("var")
-                    .and_then(|v| v.as_object())
-                    .and_then(|o| o.values().next())
-                    .and_then(|v| v.get("dno"))
-                    .and_then(Value::as_u64)
-                    .map(|n| n as usize)
-                    .ok_or_else(|| PlError::unsupported("this FOR target"))?;
                 let (out, domains) = if kind == "PLpgSQL_stmt_dynfors" {
                     let sql = self.dynamic_sql(body.get("query").unwrap_or(&Value::Null))?;
                     let out = self.host.query(&sql, &[], &[])?;
@@ -3080,8 +3096,13 @@ impl Interp<'_> {
                     (out, self.host.output_domains(&sql, &types))
                 };
                 self.set_found(!out.rows.is_empty());
+                if out.rows.is_empty() {
+                    // No row sets the target NULL (`exec_for_query`'s
+                    // `exec_move_row` over a NULL tuple).
+                    self.assign_into(body, "var", &out, None, &domains)?;
+                }
                 for row in &out.rows {
-                    self.assign_row(target, &out, Some(row), &domains)?;
+                    self.assign_into(body, "var", &out, Some(row), &domains)?;
                     match self.stmts(body.get("body").unwrap_or(&Value::Null))? {
                         Flow::Exit(l) if Self::label_matches(&l, label.as_deref()) => break,
                         Flow::Continue(l) if Self::label_matches(&l, label.as_deref()) => {}
@@ -3226,14 +3247,13 @@ impl Interp<'_> {
                     if strict && out.rows.len() > 1 {
                         return Err(PlError::new("P0003", "query returned more than one row"));
                     }
-                    let target = self.target_datum(body)?;
                     let first = out.rows.first().map(|r| r.as_slice());
                     let domains = if is_query {
                         self.host.output_domains(&sql, &types)
                     } else {
                         Vec::new()
                     };
-                    self.assign_row(target, &out, first, &domains)?;
+                    self.assign_into(body, "target", &out, first, &domains)?;
                     self.set_found(!out.rows.is_empty());
                     self.row_count = out.rows.len().min(1) as u64;
                     return Ok(Flow::Next);
@@ -3263,16 +3283,9 @@ impl Interp<'_> {
                 let types: Vec<String> = Vec::new();
                 if body.get("into").and_then(Value::as_bool).unwrap_or(false) {
                     let out = self.host.query(&sql, &using, &types)?;
-                    let target = body
-                        .get("target")
-                        .and_then(|t| t.as_object())
-                        .and_then(|o| o.values().next())
-                        .and_then(|v| v.get("dno").and_then(Value::as_u64))
-                        .map(|n| n as usize)
-                        .ok_or_else(|| PlError::unsupported("this EXECUTE INTO target"))?;
                     let first = out.rows.first().map(|r| r.as_slice());
                     let domains = self.host.output_domains(&sql, &types);
-                    self.assign_row(target, &out, first, &domains)?;
+                    self.assign_into(body, "target", &out, first, &domains)?;
                     self.set_found(!out.rows.is_empty());
                 } else {
                     let head = sql.trim_start().to_ascii_lowercase();

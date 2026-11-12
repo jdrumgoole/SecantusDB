@@ -437,6 +437,92 @@ fn a_non_integer_group_by_constant_is_42601() {
     plan("SELECT 1 FROM t GROUP BY 'x'::text", &lookup).expect("an expression key");
 }
 
+/// A DISTINCT ON constant that is no integer is PostgreSQL's 42601 at the
+/// constant, after the GROUP BY and an earlier DISTINCT ON item, and before
+/// the ORDER BY match and the ungrouped-column check (RP-872).
+#[test]
+fn a_non_integer_distinct_on_constant_is_42601() {
+    for (sql, at) in [
+        ("SELECT DISTINCT ON (1.5) name FROM t", 20),
+        ("SELECT DISTINCT ON (name, 'x') name FROM t", 26),
+        (
+            "SELECT DISTINCT ON (id, NULL) name, id FROM t ORDER BY name",
+            24,
+        ),
+        ("SELECT DISTINCT ON (1.5) name, id FROM t GROUP BY name", 20),
+    ] {
+        take_error_location();
+        let err = plan(sql, &lookup).expect_err(sql);
+        assert_eq!(err.sqlstate(), "42601", "{sql}: {err}");
+        assert_eq!(
+            err.to_string(),
+            "non-integer constant in DISTINCT ON",
+            "{sql}"
+        );
+        assert_eq!(take_error_location(), Some(at), "{sql}");
+    }
+    let err =
+        plan("SELECT DISTINCT ON (nosuch, 1.5) name FROM t", &lookup).expect_err("must refuse");
+    assert_eq!(err.sqlstate(), "42703", "{err}");
+    let err = plan("SELECT DISTINCT ON (1.5) name FROM t GROUP BY 2.5", &lookup)
+        .expect_err("must refuse");
+    assert_eq!(err.to_string(), "non-integer constant in GROUP BY", "{err}");
+    plan("SELECT DISTINCT ON ('x'::text) name FROM t", &lookup).expect("an expression key");
+}
+
+/// A DISTINCT ON position outside the select list as `*` expands it is
+/// PostgreSQL's 42P10 at the constant, in item order with a non-integer
+/// constant's 42601 and after an ORDER BY error; one inside a star names
+/// the column the star stands for, and is held to the ORDER BY match
+/// (RP-884).
+#[test]
+fn a_distinct_on_position_is_checked_against_the_select_list() {
+    for (sql, pos, at) in [
+        ("SELECT DISTINCT ON (9) name FROM t", 9, 20),
+        ("SELECT DISTINCT ON (0) name FROM t", 0, 20),
+        ("SELECT DISTINCT ON (-1) name FROM t", -1, 20),
+        ("SELECT DISTINCT ON (9, 1.5) name FROM t", 9, 20),
+        ("SELECT DISTINCT ON (name, 4) * FROM t", 4, 26),
+        (
+            "SELECT DISTINCT ON (3) name, count(*) FROM t GROUP BY name",
+            3,
+            20,
+        ),
+    ] {
+        take_error_location();
+        let err = plan(sql, &lookup).expect_err(sql);
+        assert_eq!(err.sqlstate(), "42P10", "{sql}: {err}");
+        assert_eq!(
+            err.to_string(),
+            format!("DISTINCT ON position {pos} is not in select list"),
+            "{sql}"
+        );
+        assert_eq!(take_error_location(), Some(at), "{sql}");
+    }
+    let err = plan(
+        "SELECT DISTINCT ON (1, 9) name FROM t ORDER BY nosuch",
+        &lookup,
+    )
+    .expect_err("must refuse");
+    assert_eq!(err.sqlstate(), "42703", "{err}");
+    let err = plan("SELECT DISTINCT ON (2) * FROM t ORDER BY 1", &lookup).expect_err("must refuse");
+    assert!(
+        err.to_string()
+            .starts_with("SELECT DISTINCT ON expressions must match initial ORDER BY"),
+        "{err}"
+    );
+    for sql in [
+        "SELECT DISTINCT ON (2) * FROM t",
+        "SELECT DISTINCT ON (3) t.* FROM t ORDER BY n, id",
+        "SELECT DISTINCT ON (2) * FROM (VALUES (1, 2)) v(a, b)",
+    ] {
+        match plan(sql, &lookup).expect(sql) {
+            Statement::Select(s) => assert!(matches!(s.distinct, Distinct::On(_)), "{sql}"),
+            other => panic!("{sql}: {other:?}"),
+        }
+    }
+}
+
 #[test]
 fn group_by_resolves_order_by_index() {
     match plan_ok("SELECT count(*) FROM t GROUP BY name ORDER BY name DESC") {
@@ -4477,6 +4563,111 @@ fn a_subquery_target_is_named_as_written() {
 }
 
 #[test]
+fn an_aggregate_clause_on_a_plain_function_is_42809() {
+    // Without OVER, `ParseFuncOrColumn` refuses the same clauses on a plain
+    // function (RP-868); each of these answered the plain call. Answers
+    // measured on PostgreSQL 15.19.
+    let not_agg =
+        |clause: &str, f: &str| format!("{clause} specified, but {f} is not an aggregate function");
+    for (q, want, at) in [
+        (
+            "select upper(distinct 'a')",
+            not_agg("DISTINCT", "upper"),
+            7,
+        ),
+        (
+            "select upper('a' order by 1)",
+            not_agg("ORDER BY", "upper"),
+            7,
+        ),
+        (
+            "select upper('a') filter (where true)",
+            not_agg("FILTER", "upper"),
+            7,
+        ),
+        (
+            "select upper(distinct 'a') filter (where true)",
+            not_agg("DISTINCT", "upper"),
+            7,
+        ),
+        (
+            "select pg_catalog.upper(distinct 'a')",
+            not_agg("DISTINCT", "pg_catalog.upper"),
+            7,
+        ),
+        (
+            "select now(*)",
+            "now(*) specified, but now is not an aggregate function".to_string(),
+            7,
+        ),
+        ("select abs(distinct -1)", not_agg("DISTINCT", "abs"), 7),
+        (
+            "select id, lower(name order by name) from t",
+            not_agg("ORDER BY", "lower"),
+            11,
+        ),
+        (
+            "select 1 where upper('a') filter (where true) = 'A'",
+            not_agg("FILTER", "upper"),
+            15,
+        ),
+        (
+            "select (select lower('a' order by 1))",
+            not_agg("ORDER BY", "lower"),
+            15,
+        ),
+        (
+            "select 1 order by upper('a') filter (where true)",
+            not_agg("FILTER", "upper"),
+            18,
+        ),
+    ] {
+        let _ = take_error_location();
+        let err = analysed(q).expect_err(q);
+        assert!(
+            matches!(&err, Error::Sqlstate("42809", m) if *m == want),
+            "{q}: {err:?}"
+        );
+        assert_eq!(take_error_location(), Some(at), "{q}");
+    }
+    // WITHIN GROUP's items count as the call's arguments: `left` takes
+    // `(unknown, integer)`, `upper` does not (42883, which the planner
+    // would answer over `upper('a')` alone).
+    let err = analysed("select left('a') within group (order by 1)").expect_err("left");
+    assert!(
+        matches!(&err, Error::Sqlstate("42809", m)
+            if m == "WITHIN GROUP specified, but left is not an aggregate function"),
+        "{err:?}"
+    );
+    let _ = take_error_location();
+    let err = analysed("select upper('a') within group (order by 1)").expect_err("upper");
+    assert!(
+        matches!(&err, Error::UndefinedFunction(m)
+            if m == "function upper(unknown, integer) does not exist"),
+        "{err:?}"
+    );
+    assert_eq!(take_error_location(), Some(7));
+    // A call no function takes is the planner's 42883 first, as without
+    // the clause.
+    for q in [
+        "select upper(distinct 1)",
+        "select nosuch(distinct 1)",
+        "select upper(*)",
+    ] {
+        let err = analysed(q).expect_err(q);
+        assert!(!matches!(&err, Error::Sqlstate("42809", _)), "{q}: {err:?}");
+    }
+    // The aggregates themselves are untouched.
+    for q in [
+        "select count(distinct id) from t",
+        "select string_agg(name, ',' order by name) from t",
+        "select count(*) filter (where id > 1) from t",
+    ] {
+        analysed(q).expect(q);
+    }
+}
+
+#[test]
 fn over_on_a_plain_function_is_42809_after_the_call_resolves() {
     // `ParseFuncOrColumn` resolves the arguments and the function, then
     // refuses an aggregate-only clause on a plain function, first one first
@@ -5330,7 +5521,9 @@ fn create_table_as_records_its_columns_domains() {
         domains_of("CREATE TABLE c AS SELECT a::bpchar FROM fd661"),
         vec![None]
     );
-    assert!(domains_of("CREATE TABLE c AS VALUES (1)").is_empty());
+    // A VALUES list's column is of no domain unless every row's value is
+    // of one (RP-884 made its columns known).
+    assert_eq!(domains_of("CREATE TABLE c AS VALUES (1)"), vec![None]);
     let column = domain_column("a", "dc661")
         .expect("plans")
         .expect("a domain");
@@ -7452,4 +7645,74 @@ fn a_call_in_a_missing_schema_is_3f000() {
     // Schemas that exist are left to the lookup.
     let err = plan("select pg_catalog.abs(-2), public.f()", &lookup).unwrap_err();
     assert_ne!(err.sqlstate(), "3F000");
+}
+
+/// A DEFAULT is analysed when CREATE TABLE declares it, as `cookDefault`
+/// analyses it, at the first token that fails (RP-881; locations measured
+/// on PostgreSQL 15.19, which reports them one-based).
+#[test]
+fn create_table_analyses_each_default() {
+    for (sql, sqlstate, message, at) in [
+        (
+            "create table t881c (a int, b int default a)",
+            "0A000",
+            "cannot use column reference in DEFAULT expression",
+            41,
+        ),
+        (
+            "create table t881c (a int default (select 1))",
+            "0A000",
+            "cannot use subquery in DEFAULT expression",
+            34,
+        ),
+        (
+            "create table t881c (a int default sum(1))",
+            "42803",
+            "aggregate functions are not allowed in DEFAULT expressions",
+            34,
+        ),
+        (
+            "create table t881c (a int default row_number() over ())",
+            "42P20",
+            "window functions are not allowed in DEFAULT expressions",
+            34,
+        ),
+        (
+            "create table t881c (a int default generate_series(1, 2))",
+            "0A000",
+            "set-returning functions are not allowed in DEFAULT expressions",
+            34,
+        ),
+        (
+            "create table t881c (a int default abs(1) over ())",
+            "42809",
+            "OVER specified, but abs is not a window function nor an aggregate function",
+            34,
+        ),
+        (
+            "create table t881c (a int default nosuch_fn(b))",
+            "0A000",
+            "cannot use column reference in DEFAULT expression",
+            44,
+        ),
+        (
+            "create table t881c (a int default abs(nosuch_fn()))",
+            "0A000",
+            "function nosuch_fn()",
+            38,
+        ),
+    ] {
+        take_error_location();
+        let err = plan(sql, &lookup).expect_err(sql);
+        assert_eq!(err.sqlstate(), sqlstate, "{sql}: {err}");
+        assert!(err.to_string().starts_with(message), "{sql}: {err}");
+        assert_eq!(take_error_location(), Some(at), "{sql}");
+    }
+    let Statement::CreateTable(def, _) = plan_ok(
+        "create table t881c (a int default abs(-1) + length('xy'), b timestamptz default now())",
+    ) else {
+        panic!("not a CREATE TABLE");
+    };
+    assert_eq!(def.columns[0].default, Some(Bson::Int32(3)));
+    assert!(def.columns[1].default_expr().is_some());
 }

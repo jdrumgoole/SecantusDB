@@ -2089,15 +2089,6 @@ Measured on PostgreSQL 15.19 (the data-modifying WITH on a private cluster).
       does not exist` at 12. Measured on a private 15.19 cluster.
       Verify: tests/backlog/test_rp_qualified_calls.py::test_three_part_function_name
       Backlog-ID: RP-880
-- [ ] **CREATE TABLE does not analyse a column's DEFAULT.** On PostgreSQL
-      15.19 `create table t (a int default nosuch_fn())` is 42883 `function
-      nosuch_fn() does not exist` at 35, and `default nosuch_schema.f()` is
-      3F000 `schema "nosuch_schema" does not exist` at 35
-      (`cookDefault` -> `transformExpr`, at CREATE). Here both succeed, and
-      the error waits for an INSERT that uses the default. Measured on a
-      private 15.19 cluster.
-      Verify: tests/backlog/test_rp_qualified_calls.py::test_create_table_default_is_analysed
-      Backlog-ID: RP-881
 - [ ] **A missing relation qualified with `pg_temp` is named by the
       session's `pg_temp_N`.** On PostgreSQL 15.19 `select * from
       pg_temp.nosuch` is 42P01 `relation "pg_temp.nosuch" does not exist`
@@ -2122,6 +2113,42 @@ Measured on PostgreSQL 15.19 (the data-modifying WITH on a private cluster).
       Verify: tests/backlog/test_rp_qualified_calls.py::test_temp_namespace_follows_transactions
       Backlog-ID: RP-883
 
+
+## Found while working RP-881 (2026-11-12)
+
+Measured on a private PostgreSQL 15.19 cluster. The gap tests are in
+`tests/backlog/test_rp_found_rp881.py`.
+
+- [ ] **A constant DEFAULT is evaluated at CREATE TABLE.** `create table t
+      (a int default 1/0)` succeeds on PostgreSQL 15.19 (`cookDefault`
+      analyses the expression, it does not run it), and the 22012 `division
+      by zero` comes from the first INSERT that uses the default; so does
+      `default 2147483647 + 1`. Here the CREATE is refused with 22012
+      (`default_value_or_expr` folds a constant default into a stored
+      value and raises what folding raises). Folding is safe for a default
+      that folds; one that errors is to be kept as its expression.
+      Verify: tests/backlog/test_rp_found_rp881.py::test_a_constant_default_is_not_run_at_create
+      Backlog-ID: RP-886
+- [ ] **CREATE TABLE IF NOT EXISTS over a table that exists checks its
+      columns.** PostgreSQL 15.19's `transformCreateStmt` finds the
+      relation first and answers with a NOTICE (`relation "t" already
+      exists, skipping`), looking at nothing else: `create table if not
+      exists t (a nosuchtype)`, `(a int, a int)` and `(a int default 'x')`
+      all succeed. Here they are 42704, 42701 and 22P02: the column types,
+      names and literal defaults are checked while planning, before the
+      executor looks for the table. (Since RP-881 the defaults' analysis
+      is skipped for such a statement, as PostgreSQL skips it.)
+      Verify: tests/backlog/test_rp_found_rp881.py::test_if_not_exists_over_a_table_checks_nothing
+      Backlog-ID: RP-887
+- [ ] **A DEFAULT's `nextval('nosuch_seq')` passes CREATE TABLE.**
+      `create table t (a int default nextval('nosuch_seq'))`
+      is 42P01 `relation "nosuch_seq" does not exist` at 42 on PostgreSQL
+      15.19: the literal is coerced to `nextval`'s `regclass` parameter
+      while the default is analysed, which runs `regclassin`. Here the
+      CREATE succeeds and the first INSERT fails. (An explicit
+      `'nosuch'::regclass` is already 42P01 at CREATE.)
+      Verify: tests/backlog/test_rp_found_rp881.py::test_a_regclass_literal_in_a_default_is_resolved
+      Backlog-ID: RP-888
 ## Found while working RP-472 (2026-11-07)
 
 - [ ] **EXPLAIN of a user function in FROM prints no Function Scan.**
@@ -2550,16 +2577,6 @@ numeric(5,2), ca char(3)[])` holding `('xy', 'ab', 2.5, '{a,bc}')`.
 Measured on PostgreSQL 15.19 (the shared reference on port 5415) with the
 VALUES-only statements of `tests/backlog/test_rp_found_rp682.py`.
 
-- [ ] **DISTINCT, ORDER BY or FILTER on a plain function call is accepted
-      and ignored.** `select upper(distinct 'a')`, `select upper('a' order
-      by 1)` and `select upper('a') filter (where true)` are each 42809
-      `<clause> specified, but upper is not an aggregate function` on
-      PostgreSQL 15.19 (`ParseFuncOrColumn`); here each answers `A`. Since
-      RP-682 the same clauses under OVER are refused in PostgreSQL's order;
-      without OVER the plain-call path never looks at them.
-      Verify: tests/backlog/test_rp_found_rp682.py::test_an_aggregate_clause_on_a_plain_function_is_42809
-      Backlog-ID: RP-868
-
 - [ ] **An ordered-set aggregate under OVER is not refused as
       PostgreSQL refuses it.** `select rank(1) over ()` is 42809 `WITHIN
       GROUP is required for ordered-set aggregate rank` on PostgreSQL 15.19
@@ -2609,22 +2626,6 @@ dv687, c char(3))`, `d687` an `int` with `check (value > 0)` and `dv687` a
       8-10.
       Backlog-ID: RP-690
       Verify: none -- seen once, under load; a timing that does not fail on demand
-
-## Found while working RP-694 (2026-11-09)
-
-Measured on a private PostgreSQL 15.19 cluster with the `_SETUP` in
-`tests/backlog/test_rp_found_rp694.py`: `dnn694` an `int` domain `not null`.
-
-- [ ] **A `FOR` over a query or an `EXECUTE ... INTO` refuses scalar
-      variable targets.** `for x in select '7'::text loop` over an `int`
-      `x`, `for x, y in select 1, 'a'` and `execute 'select 7' into x` each
-      assign on PostgreSQL 15.19 (the grammar makes the list a row target
-      that `exec_move_row` fills); here each is 0A000 `this FOR target` /
-      `this EXECUTE INTO target ... is not supported yet`. Both read only
-      the target's `dno`, which a scalar list has none of (a plain `INTO`
-      goes through `target_datum`).
-      Verify: tests/backlog/test_rp_found_rp694.py::test_for_and_execute_into_scalar_variables
-      Backlog-ID: RP-713
 
 ## Found while working RP-712 (2026-11-10)
 
@@ -3765,12 +3766,18 @@ statement is VALUES-only and runs there as written. The gap tests are in
       constant until this one is fixed, where PostgreSQL names the ORDER BY.
       Verify: tests/backlog/test_rp_found_rp854.py::test_a_non_integer_order_by_constant_is_42601
       Backlog-ID: RP-871
-- [ ] **A DISTINCT ON constant that is no integer returns rows.** `select
-      distinct on (1.5) a from (values (1)) v(a)` is 42601 `non-integer
-      constant in DISTINCT ON` at 21 on PostgreSQL 15.19, and so is a string
-      there. Here each returns its row: the constant is a key of one value.
-      Verify: tests/backlog/test_rp_found_rp854.py::test_a_non_integer_distinct_on_constant_is_42601
-      Backlog-ID: RP-872
+- [ ] **A window definition's error comes ahead of a GROUP BY or DISTINCT ON
+      constant's.** `select count(*) over w from (values (1)) v(a) group by
+      2.5 window w as (order by nosuch)` is 42601 `non-integer constant in
+      GROUP BY` at 56 on PostgreSQL 15.19, and with `distinct on (1.5)` in
+      place of the GROUP BY it is `non-integer constant in DISTINCT ON` at
+      21: `transformWindowDefinitions` runs after both clauses in
+      `transformSelectStmt`. Here each is the window's 42703 `column
+      "nosuch" does not exist`: `group_sql92`'s cut statement keeps the
+      WINDOW clause, and dropping it would leave `over w` naming no window.
+      Found while working RP-872 (2026-11-12).
+      Verify: tests/backlog/test_rp_found_rp872.py::test_a_window_definition_is_analysed_after_the_constant
+      Backlog-ID: RP-885
 - [ ] **A GROUP BY position inside a grouping set or a parenthesised list
       is grouped as a value.** `select a from (values (1), (2)) v(a) group
       by rollup(1)` groups by `a` on PostgreSQL 15.19 (`flatten_grouping_sets`

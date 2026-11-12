@@ -455,6 +455,8 @@ fn constraints_of(
                     .raw_expr
                     .as_deref()
                     .ok_or_else(|| Error::Parse("DEFAULT without an expression".into()))?;
+                // `DefineDomain` cooks it as a column's (RP-881).
+                crate::default_expr::analyse_unpositioned(raw)?;
                 default = Some(deparse_expr(raw)?);
             }
             _ => return Err(Error::Unsupported("this domain constraint".into())),
@@ -542,7 +544,15 @@ pub(crate) fn plan_alter_domain(a: &pg_query::protobuf::AlterDomainStmt) -> Resu
     let name = domain_name(&a.type_name);
     let change = match a.subtype.as_str() {
         "T" => DomainChange::SetDefault(match a.def.as_deref() {
-            Some(expr) => Some(deparse_expr(expr)?),
+            Some(expr) => {
+                // `AlterDomainDefault` finds the domain, then cooks the
+                // default as a column's (RP-881); a missing domain is the
+                // executor's 42704.
+                if user_domain(&name).is_some() {
+                    crate::default_expr::analyse_unpositioned(expr)?;
+                }
+                Some(deparse_expr(expr)?)
+            }
             None => None,
         }),
         "N" => DomainChange::NotNull(false),

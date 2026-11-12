@@ -7,7 +7,9 @@ scalar variable stored the column's value uncoerced):
   I/O and refuses `t` as an integer (RP-712, fixed: such an assignment now
   goes through the source's output function and the target's input);
 - a `FOR` over a query, or an `EXECUTE ... INTO`, whose target is a scalar
-  variable or a list of them is refused 0A000 (RP-713);
+  variable or a list of them was refused 0A000 (RP-713, fixed: the
+  anonymous row the grammar makes of the list is filled column by column,
+  as a plain `INTO`'s is, and a `FOR` over no rows sets its target NULL);
 - a variable of a NOT NULL domain with no default was created NULL, where
   PostgreSQL refuses the NULL at the block's entry (RP-714, fixed: the
   block's entry now assigns the NULL through the domain coercion).
@@ -197,10 +199,48 @@ SCALAR_TARGETS = {
 }
 
 
-@pytest.mark.backlog("RP-713")
+@pytest.mark.backlog_fixed("RP-713")
 @pytest.mark.parametrize("query", list(SCALAR_TARGETS))
 def test_for_and_execute_into_scalar_variables(query: str, dsn: str) -> None:
     assert _answer(dsn, query) == SCALAR_TARGETS[query]
+
+
+# `exec_for_query` moves a NULL tuple into the target when the query returns
+# no rows; `exec_stmt_dynexecute` and `exec_stmt_fetch` do the same for an
+# INTO with no row. A scalar list takes one column per variable, the extra
+# columns ignored, and is filled afresh on every row and every execution.
+SCALAR_TARGETS_MOVED = {
+    "do $$ declare x int := 5; y text := 'k'; begin for x, y in select 1 where false loop"
+    " end loop; raise notice '% % %', x is null, y is null, found; end $$": ["t t f"],
+    "do $$ declare x int := 5; begin for x in execute 'select 1 where false' loop end loop;"
+    " raise notice '%', x is null; end $$": ["t"],
+    "do $$ declare r record; begin select 1 a into r; for r in select 2 a where false loop"
+    " end loop; raise notice '%', r; end $$": ["()"],
+    "do $$ declare x int; y text; begin for x, y in select g, g::text || 'z'"
+    " from generate_series(1, 3) g loop raise notice '% %', x, y; end loop; end $$": [
+        "1 1z",
+        "2 2z",
+        "3 3z",
+    ],
+    "do $$ declare x int; y text; begin for x, y in select 1 loop"
+    " raise notice '% %', x, y is null; end loop; end $$": ["1 t"],
+    "do $$ declare x int; begin for x in select 1, 2 loop raise notice '%', x; end loop; end $$": [
+        "1"
+    ],
+    "do $$ declare s int := 0; x int; begin for i in 1..3 loop for x in select i * 10 loop"
+    " s := s + x; end loop; end loop; raise notice '%', s; end $$": ["60"],
+    "do $$ declare x int := 5; begin execute 'select 1 where false' into x;"
+    " raise notice '% %', x is null, found; end $$": ["t f"],
+    "do $$ declare x int; y text; c cursor for select 4, 'q'; begin open c;"
+    " fetch c into x, y; raise notice '% %', x, y; fetch c into x, y;"
+    " raise notice '% % %', x is null, y is null, found; end $$": ["4 q", "t t f"],
+}
+
+
+@pytest.mark.backlog_fixed("RP-713")
+@pytest.mark.parametrize("query", list(SCALAR_TARGETS_MOVED))
+def test_scalar_targets_are_moved_as_postgresql_moves_them(query: str, dsn: str) -> None:
+    assert _answer(dsn, query) == ("ok", SCALAR_TARGETS_MOVED[query])
 
 
 _NOT_NULL = ("error", "23502", "domain dnn694 does not allow null values")

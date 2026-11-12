@@ -285,10 +285,10 @@ fn output_columns_with(
                 .collect(),
         );
     }
-    if !s.values_lists.is_empty() {
-        return None;
-    }
     let ctes = with_ctes(s, lookup, ctes);
+    if !s.values_lists.is_empty() {
+        return values_columns(s, lookup, &ctes, params);
+    }
     let mut scope = Scope::of_from(&s.from_clause, lookup, &ctes);
     scope.params = params.to_vec();
     let mut out = Columns::new();
@@ -319,11 +319,97 @@ fn output_columns_with(
     Some(out)
 }
 
+/// A VALUES list's columns (`transformValuesClause`): `column1`,
+/// `column2`, ..., each of the domain every row's value there is of
+/// (`select_common_type`). `None` when the rows are not all one length.
+fn values_columns(
+    s: &SelectStmt,
+    lookup: &dyn Fn(&str) -> Option<TableDef>,
+    ctes: &Ctes,
+    params: &[Option<String>],
+) -> Option<Columns> {
+    let rows: Vec<&[Node]> = s
+        .values_lists
+        .iter()
+        .map(|row| match row.node.as_ref() {
+            Some(N::List(l)) => Some(l.items.as_slice()),
+            _ => None,
+        })
+        .collect::<Option<_>>()?;
+    let width = rows.first()?.len();
+    if rows.iter().any(|r| r.len() != width) {
+        return None;
+    }
+    // A VALUES list sees no FROM item of its own.
+    let mut scope = Scope::of_from(&[], lookup, ctes);
+    scope.params = params.to_vec();
+    Some(
+        (0..width)
+            .map(|i| {
+                let domain = common_domain(
+                    rows.iter()
+                        .map(|r| expr_domain(&r[i], &scope, lookup, ctes)),
+                );
+                (format!("column{}", i + 1), domain)
+            })
+            .collect(),
+    )
+}
+
+/// What each column of `s`'s select list as `*` expands it
+/// (`ExpandColumnRefStar`) is: `None` for a target as written, or the
+/// reference name of the FROM item and the column a star stands for there.
+/// `None` when the columns a star stands for are not known.
+pub(crate) fn expanded_targets(
+    s: &SelectStmt,
+    lookup: &dyn Fn(&str) -> Option<TableDef>,
+) -> Option<Vec<Option<(String, String)>>> {
+    let scope = Scope::of_select(s, lookup, &Ctes::new());
+    let mut out = Vec::new();
+    for target in &s.target_list {
+        let Some(N::ResTarget(rt)) = target.node.as_ref() else {
+            return None;
+        };
+        if let Some(N::ColumnRef(c)) = rt.val.as_deref().and_then(|v| v.node.as_ref()) {
+            if matches!(
+                c.fields.last().and_then(|f| f.node.as_ref()),
+                Some(N::AStar(_))
+            ) {
+                let sources = star_sources(&scope, &c.fields)?;
+                out.extend(
+                    sources
+                        .into_iter()
+                        .map(|(item, (column, _))| Some((item.to_string(), column.clone()))),
+                );
+                continue;
+            }
+        }
+        out.push(None);
+    }
+    Some(out)
+}
+
+/// A reference to `column` of the FROM item `item`, as `item.column`:
+/// what an [`expanded_targets`] column a star stands for is written as.
+pub(crate) fn star_column_ref(item: &str, column: &str, location: i32) -> Node {
+    let part = |sval: &str| Node {
+        node: Some(N::String(pg_query::protobuf::String {
+            sval: sval.to_string(),
+        })),
+    };
+    Node {
+        node: Some(N::ColumnRef(pg_query::protobuf::ColumnRef {
+            fields: vec![part(item), part(column)],
+            location,
+        })),
+    }
+}
+
 /// The domain each column of `query`, a CREATE TABLE AS's query as
 /// written, is of, in order (RP-661): `intorel_startup` copies the query's
 /// tuple descriptor, so a column of a domain makes a column of the domain.
-/// Empty when the columns are not known (a VALUES list, a star over an
-/// item whose columns are not known).
+/// Empty when the columns are not known (a star over an item whose
+/// columns are not known).
 pub(crate) fn query_output_domains(
     query: &Node,
     lookup: &dyn Fn(&str) -> Option<TableDef>,
@@ -338,19 +424,31 @@ pub(crate) fn query_output_domains(
 
 /// The columns `*` or `q.*` stands for.
 fn star_columns(scope: &Scope, fields: &[Node]) -> Option<Columns> {
+    Some(
+        star_sources(scope, fields)?
+            .into_iter()
+            .map(|(_, column)| column.clone())
+            .collect(),
+    )
+}
+
+/// A column a star stands for, with the reference name of the FROM item
+/// it is a column of.
+type StarColumn<'a> = (&'a str, &'a (String, Option<String>));
+
+/// The columns `*` or `q.*` stands for, each with the reference name of
+/// the FROM item it is a column of.
+fn star_sources<'a>(scope: &'a Scope, fields: &[Node]) -> Option<Vec<StarColumn<'a>>> {
+    let of_item = |(n, c): &'a (String, Option<Columns>)| {
+        c.iter().flatten().map(move |column| (n.as_str(), column))
+    };
     match fields {
-        [_] if !scope.opaque => Some(
-            scope
-                .items
-                .iter()
-                .flat_map(|(_, c)| c.iter().flatten().cloned())
-                .collect(),
-        ),
+        [_] if !scope.opaque => Some(scope.items.iter().flat_map(of_item).collect()),
         [q, _] => {
             let q = string_value(q)?;
             let mut named = scope.items.iter().filter(|(n, _)| *n == q);
             match (named.next(), named.next()) {
-                (Some((_, Some(columns))), None) => Some(columns.clone()),
+                (Some(item @ (_, Some(_))), None) => Some(of_item(item).collect()),
                 _ => None,
             }
         }
