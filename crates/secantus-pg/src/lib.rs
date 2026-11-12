@@ -4773,6 +4773,11 @@ struct CursorState {
     /// row `base + 1`.
     tail: Option<portal_stream::CursorTail>,
     base: usize,
+    /// The rows of the DECLARE's query not computed yet
+    /// (`portal_stream::PendingRows`): a FETCH computes only the rows it
+    /// reaches, as PostgreSQL's executor runs a portal's plan as it is
+    /// fetched (RP-744). `rows` then holds every row computed so far.
+    pending: Option<portal_stream::PendingRows>,
     /// An error was raised while the cursor ran (PostgreSQL's
     /// `PORTAL_FAILED`): every later read of it is refused.
     failed: bool,
@@ -29066,10 +29071,12 @@ impl PgHandler {
         if let Err(message) = cursor.check_runnable(name) {
             return Err(Self::user_error("55000", message));
         }
-        // A streamed cursor reads what this FETCH reaches first.
+        // A streamed cursor reads what this FETCH reaches first, and a
+        // cursor computes the rows it reaches (RP-744).
         if cursor.tail.is_some() {
             self.fill_cursor(cursor, direction, count)?;
         }
+        self.fill_pending(cursor, direction, count)?;
         let base = cursor.base;
         let len = (base + cursor.rows.len()) as i64;
         let pos = cursor.pos;
@@ -34047,6 +34054,65 @@ impl PgHandler {
                 ))));
             };
             let schema = q.row_schema.clone();
+            // PortalStart runs nothing: the select list is computed for the
+            // rows a FETCH reaches, so a row no FETCH reaches never raises
+            // its error (RP-744). Kept whole here: a WITH HOLD cursor
+            // declared outside a block, whose transaction ends now
+            // (PostgreSQL materialises it at that commit), and a simply
+            // updatable one, whose rows' ids are captured with them.
+            let unpolled = self
+                .cursor_capture
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .as_ref()
+                .is_none_or(Vec::is_empty);
+            if in_block && updatable.is_none() && unpolled {
+                take_ids();
+                self.cursor_capture
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .take();
+                self.cursors
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(
+                        name,
+                        CursorState {
+                            born: next_cursor_born(),
+                            schema,
+                            domains: secantus_pgplan::select_output_domains(
+                                &statement,
+                                &[],
+                                &|n: &str| self.lookup(n),
+                            ),
+                            rows: Vec::new(),
+                            pos: 0,
+                            statement,
+                            is_holdable: holdable,
+                            is_binary: is_binary_cursor,
+                            is_scrollable: scrollable,
+                            creation_time: bson::DateTime::now(),
+                            typed_rows: Some(Vec::new()),
+                            tz,
+                            tail: None,
+                            base: 0,
+                            pending: Some(portal_stream::PendingRows::new(
+                                q.data_rows,
+                                capture_typed,
+                            )),
+                            failed: false,
+                            current_of: None,
+                            held: false,
+                            pinned: false,
+                            auto_held: false,
+                        },
+                    );
+                if holdable {
+                    self.holdable_declared
+                        .store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+                return Ok(vec![Response::Execution(Tag::new("DECLARE CURSOR"))]);
+            }
             let rows = q.data_rows.try_collect::<Vec<_>>().await;
             let ids = take_ids();
             let rows = rows?;
@@ -34088,6 +34154,7 @@ impl PgHandler {
                         tz,
                         tail: None,
                         base: 0,
+                        pending: None,
                         failed: false,
                         current_of,
                         // Declared outside a block, its transaction is
@@ -37137,7 +37204,17 @@ impl PgHandler {
                 self.implicit_extended
                     .store(false, std::sync::atomic::Ordering::Relaxed);
                 // A COMMIT closes every non-holdable cursor; `WITH HOLD`
-                // survives with its rows already materialised.
+                // survives with its rows already materialised. The ones
+                // this block declared go with it if the COMMIT fails, as
+                // `AtAbort_Portals` drops a portal its transaction made.
+                let declared_here: Vec<String> = self
+                    .cursors
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .iter()
+                    .filter(|(_, c)| c.is_holdable && !c.held && !c.auto_held)
+                    .map(|(name, _)| name.clone())
+                    .collect();
                 self.close_cursors_on_txn_end(true);
                 if let Some(mut handle) = guard.take() {
                     self.in_transaction
@@ -37152,8 +37229,16 @@ impl PgHandler {
                         .with_user_transaction(&mut handle, || self.run_deferred_checks())
                         .map_err(|e| Self::storage_err("transaction failed", e))
                         .and_then(|r| r)
+                        .and_then(|()| self.persist_holdable_cursors())
                         .and_then(|()| self.ssi_pre_commit());
                     if let Err(e) = checked {
+                        {
+                            let mut cursors =
+                                self.cursors.lock().unwrap_or_else(|e| e.into_inner());
+                            for name in &declared_here {
+                                cursors.remove(name);
+                            }
+                        }
                         self.storage
                             .rollback_user_transaction(&mut handle)
                             .map_err(|e| Self::storage_err("could not roll back", e))?;
@@ -40062,6 +40147,13 @@ impl PgHandler {
             self.fill_cursor(cursor, direction, wanted)
                 .map_err(Self::plan_error_of)?;
         }
+        let direction = if backward {
+            secantus_pgplan::FetchDirection::Backward
+        } else {
+            secantus_pgplan::FetchDirection::Forward
+        };
+        self.fill_pending(cursor, direction, wanted)
+            .map_err(Self::plan_error_of)?;
         let base = cursor.base;
         let len = (base + cursor.rows.len()) as i64;
         let positions: Vec<i64> = if backward {

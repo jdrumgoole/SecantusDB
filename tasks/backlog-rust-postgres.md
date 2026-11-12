@@ -106,7 +106,10 @@ one beside it.
   it; here each answers zero rows. PostgreSQL's manual (4.2.14) calls this a
   quirk applications must not rely on, and folding anything PostgreSQL does
   not would raise errors it does not -- worse than zero rows. No answer a
-  query returns differs.
+  query returns differs. A cursor shows it too: since RP-744 its select
+  list is computed as it is fetched, so `declare c cursor for select 1/0
+  from (values (1)) s(k)` raises at the first FETCH where PostgreSQL 15.19
+  raises at the DECLARE.
 - **Known residual — PL/pgSQL `SQL expression` CONTEXT frame**
   (`tools/probes/plpgsql_expr_context.py`, 58 of 60 shapes match PostgreSQL
   15.19): `(array[1,2])[1]/0` (libpg_query deparses the subexpression without
@@ -3244,14 +3247,6 @@ Measured on PostgreSQL 15.19 (the shared reference on port 5415): every
 statement is VALUES-only and runs there as written. The gap tests are in
 `tests/backlog/test_rp_found_rp732.py`.
 
-- [ ] **A DECLARE CURSOR computes every row's select list at the DECLARE.**
-      `declare c cursor for select 1/(k - 1) from (values (2), (1)) s(k)`
-      then `fetch 1 from c` answers `1` on PostgreSQL 15.19, whose cursor
-      runs its plan as it is fetched; here the DECLARE itself raises the
-      second row's 22012 `division by zero`, and the cursor is not
-      created.
-      Verify: tests/backlog/test_rp_found_rp732.py::test_a_cursor_computes_its_rows_as_they_are_fetched
-      Backlog-ID: RP-744
 - [ ] **A sorted cursor computes an expensive column below its Sort.** A
       cursor is planned with `cursor_tuple_fraction` (0.1), and
       `make_sort_input_target` postpones an expensive column (more than
@@ -3262,7 +3257,8 @@ statement is VALUES-only and runs there as written. The gap tests are in
       by k desc` then `fetch 1` answers `(2, 'a':1)` on PostgreSQL 15.19.
       Since RP-732 `sort_input.rs` sees only a LIMIT, so the column is
       computed for every row and the first row's 42704 is raised. Needs the
-      item above first: today the DECLARE computes every row anyway.
+      Sort to run at the first FETCH too (found while working RP-744): a
+      column computed below the Sort is computed at the DECLARE.
       Verify: tests/backlog/test_rp_found_rp732.py::test_a_sorted_cursor_postpones_an_expensive_column
       Backlog-ID: RP-745
 - [ ] **A cast over a CASE of untyped literals reports a branch's input
@@ -3274,6 +3270,69 @@ statement is VALUES-only and runs there as written. The gap tests are in
       applied to each branch's literal.
       Verify: tests/backlog/test_rp_found_rp732.py::test_a_cast_over_a_case_of_literals_reports_no_position
       Backlog-ID: RP-746
+
+## Found while working RP-744 (2026-11-12)
+
+Measured on PostgreSQL 15.19: the VALUES-only statements on the shared
+reference on port 5415, the ones that create a function or a sequence on a
+private cluster. The gap tests are in `tests/backlog/test_rp_found_rp744.py`.
+Since RP-744 a cursor computes a plain select list as it is fetched
+(`portal_stream::PendingRows`); these are the shapes that still run whole
+at the DECLARE, and the cursor answers that differ either way.
+
+- [ ] **A cursor computes a function call, a `nextval` or a scalar
+      subquery in its select list at the DECLARE.** The executor computes
+      these before the row stream (they need the statement's hooks), so
+      `declare c cursor for select f(k) from (values (2), (1)) s(k)`, with
+      `f` raising for `k = 1`, raises at the DECLARE where PostgreSQL 15.19
+      answers `fetch 1` with the first row; `select nextval('s') from
+      generate_series(1, 3)` draws three values for a `fetch 1` (`currval`
+      is 3, PostgreSQL's 1); `select (select 1/(k - 1)) ...` raises too.
+      Verify: tests/backlog/test_rp_found_rp744.py::test_a_cursor_computes_a_function_call_as_it_is_fetched
+      Backlog-ID: RP-895
+- [ ] **A cursor over a set operation computes its rows at the DECLARE.**
+      `declare c cursor for select 1/(k - 1) from (values (2), (1)) s(k)
+      union all select 5` raises 22012 at the DECLARE; PostgreSQL 15.19's
+      Append is run as it is fetched, and `fetch 1` answers `1`.
+      Verify: tests/backlog/test_rp_found_rp744.py::test_a_cursor_over_a_union_computes_its_rows_as_they_are_fetched
+      Backlog-ID: RP-896
+- [ ] **A cursor's WHERE and Sort run at the DECLARE, not at the first
+      FETCH.** PostgreSQL 15.19's DECLARE only plans: `declare c cursor for
+      select k from (values (2), (0)) s(k) where 1/k > 0` succeeds and its
+      `fetch 1` raises 22012, as does a Sort over a select list that raises
+      (`... order by k desc`). Here the DECLARE runs the query and raises,
+      and no cursor is made. Deferring the run must keep the DECLARE's
+      snapshot: a row the block writes after the DECLARE is not the
+      cursor's.
+      Verify: tests/backlog/test_rp_found_rp744.py::test_a_cursor_runs_its_query_at_the_first_fetch
+      Backlog-ID: RP-897
+- [ ] **A zero-count FETCH answers no row.** On PostgreSQL 15.19 `FETCH
+      FORWARD 0`, `FETCH 0` and `FETCH BACKWARD 0` re-fetch the row the
+      cursor sits on, and `MOVE FORWARD 0` reports `MOVE 1`; here the three
+      answer no row and the MOVE reports `MOVE 0` (`FETCH RELATIVE 0`
+      already matches).
+      Verify: tests/backlog/test_rp_found_rp744.py::test_a_zero_count_fetch_refetches_the_current_row
+      Backlog-ID: RP-898
+- [ ] **A DECLARE refused for a duplicate cursor name leaves the block
+      usable.** PostgreSQL 15.19 answers 42P03 `cursor "c" already exists`
+      and aborts the block, so the next statement is 25P02; here the block
+      runs on.
+      Verify: tests/backlog/test_rp_found_rp744.py::test_a_duplicate_cursor_name_aborts_the_block
+      Backlog-ID: RP-899
+- [ ] **`pg_cursors.statement` is a deparse of the query.** PostgreSQL
+      15.19 reports the DECLARE as submitted, verbatim (`declare  c   cursor
+      for select 1 -- x`); here it is `SELECT 1`.
+      Verify: tests/backlog/test_rp_found_rp744.py::test_pg_cursors_statement_is_the_declare_text
+      Backlog-ID: RP-900
+- [ ] **A PL/pgSQL FETCH from a `refcursor` parameter is refused at CREATE
+      FUNCTION.** `create function f(c refcursor) returns int language
+      plpgsql as $$ declare r int; begin fetch c into r; return r; end $$`
+      is 42601 `variable "c" must be of type cursor or refcursor`:
+      libpg_query types a parameter as `unknown`, and only an OPEN of one
+      is rerouted (`open_cursor::cursor_param_rewrite`). PostgreSQL 15.19
+      creates it, and the call reads the caller's cursor.
+      Verify: tests/backlog/test_rp_found_rp744.py::test_a_refcursor_parameter_can_be_fetched
+      Backlog-ID: RP-901
 
 ## Found while working RP-698 (2026-11-10)
 

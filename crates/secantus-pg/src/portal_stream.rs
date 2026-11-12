@@ -1123,7 +1123,160 @@ pub(crate) fn trim_cursor(cursor: &mut CursorState) {
     }
 }
 
+/// The rows of a `DECLARE CURSOR`'s query not computed yet (RP-744).
+///
+/// PostgreSQL runs a portal's plan as it is fetched, so a FETCH computes
+/// the select list of the rows it reaches and no others: a row no FETCH
+/// reaches never raises its error. The DECLARE runs its query in its own
+/// snapshot, as before, and keeps the result's row stream unpolled; each
+/// row's select list is computed when the stream is pulled
+/// (`project_stream_into`). The rows computed so far stay in the cursor,
+/// so moving back reads them again rather than recomputing them.
+pub(crate) struct PendingRows {
+    rows: futures::stream::BoxStream<'static, PgWireResult<DataRow>>,
+    /// The DECLARE armed the typed capture (`cursor_capture`) for its
+    /// rows: each pull arms it again, around the rows it computes.
+    capture_typed: bool,
+}
+
+impl PendingRows {
+    pub(crate) fn new(
+        rows: futures::stream::BoxStream<'static, PgWireResult<DataRow>>,
+        capture_typed: bool,
+    ) -> Self {
+        Self {
+            rows,
+            capture_typed,
+        }
+    }
+}
+
+/// The (lowest, highest) 1-based row a FETCH / MOVE of `direction` `count`
+/// from position `pos` may touch; `None` for the highest is "to the end".
+fn fetch_reach(
+    pos: i64,
+    direction: secantus_pgplan::FetchDirection,
+    count: i64,
+) -> (i64, Option<i64>) {
+    use secantus_pgplan::FetchDirection as Fd;
+    match direction {
+        Fd::Forward if count >= 0 => (
+            pos.saturating_add(1),
+            (count != i64::MAX).then(|| pos.saturating_add(count)),
+        ),
+        Fd::Forward => (pos.saturating_add(count), Some(pos - 1)),
+        Fd::Backward if count >= 0 => (pos.saturating_sub(count), Some(pos - 1)),
+        Fd::Backward => (
+            pos.saturating_add(1),
+            (count != i64::MIN).then(|| pos.saturating_sub(count)),
+        ),
+        Fd::Relative => {
+            let t = pos.saturating_add(count);
+            (t, Some(t))
+        }
+        Fd::Absolute if count >= 0 => (count, Some(count)),
+        Fd::Absolute => (1, None),
+    }
+}
+
 impl PgHandler {
+    /// Compute a cursor's pending rows (`PendingRows`) through what a
+    /// FETCH / MOVE of `direction` `count` reaches: up to the furthest row
+    /// it moves to, and to the end when it counts from the end.
+    pub(crate) fn fill_pending(
+        &self,
+        cursor: &mut CursorState,
+        direction: secantus_pgplan::FetchDirection,
+        count: i64,
+    ) -> PgWireResult<()> {
+        let (_, hi) = fetch_reach(cursor.pos, direction, count);
+        self.pull_pending(cursor, hi)
+    }
+
+    /// Compute a cursor's pending rows up to row `upto` (1-based), or all
+    /// of them. An error ends the stream; the caller marks the cursor
+    /// failed, as PostgreSQL's `PortalRunFetch` does.
+    pub(crate) fn pull_pending(
+        &self,
+        cursor: &mut CursorState,
+        upto: Option<i64>,
+    ) -> PgWireResult<()> {
+        let Some(pending) = cursor.pending.as_mut() else {
+            return Ok(());
+        };
+        let have = cursor.base + cursor.rows.len();
+        let wanted = match upto {
+            Some(h) => usize::try_from(h).unwrap_or(0).saturating_sub(have),
+            None => usize::MAX,
+        };
+        if wanted == 0 {
+            return Ok(());
+        }
+        // The rows' values are captured as the stream computes them, into
+        // the buffer the DECLARE armed; put back whatever it held.
+        let previous = pending.capture_typed.then(|| {
+            self.cursor_capture
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .replace(Vec::new())
+        });
+        let mut rows = Vec::new();
+        let mut ended = false;
+        let mut failure = None;
+        while rows.len() < wanted {
+            if let Err(e) = self.check_cancel() {
+                failure = Some(e);
+                break;
+            }
+            match futures::executor::block_on(pending.rows.next()) {
+                Some(Ok(row)) => rows.push(row),
+                Some(Err(e)) => {
+                    failure = Some(e);
+                    break;
+                }
+                None => {
+                    ended = true;
+                    break;
+                }
+            }
+        }
+        let captured = previous.and_then(|previous| {
+            std::mem::replace(
+                &mut *self
+                    .cursor_capture
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner()),
+                previous,
+            )
+        });
+        let typed = captured.or_else(|| typed_from_text(&cursor.schema, &rows, &cursor.tz));
+        match (cursor.typed_rows.as_mut(), typed) {
+            (Some(all), Some(typed)) if typed.len() == rows.len() => all.extend(typed),
+            _ => cursor.typed_rows = None,
+        }
+        cursor.rows.extend(rows);
+        if ended || failure.is_some() {
+            cursor.pending = None;
+        }
+        failure.map_or(Ok(()), Err)
+    }
+
+    /// `PreCommit_Portals`: a `WITH HOLD` cursor declared in the block
+    /// computes the rest of its rows before the block commits, so an error
+    /// there is the COMMIT's (RP-744).
+    pub(crate) fn persist_holdable_cursors(&self) -> PgWireResult<()> {
+        let mut cursors = self.cursors.lock().unwrap_or_else(|e| e.into_inner());
+        for cursor in cursors.values_mut() {
+            if cursor.is_holdable && cursor.pending.is_some() {
+                if let Err(e) = self.pull_pending(cursor, None) {
+                    cursor.failed = true;
+                    return Err(e);
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// A streamed cursor's state for `DECLARE ... FOR sel`, or `None` when
     /// `sel` is not a plain read of one table (it is then materialised).
     pub(crate) fn declare_streamed(
@@ -1187,6 +1340,7 @@ impl PgHandler {
                 env,
             }),
             base: 0,
+            pending: None,
             failed: false,
             pinned: false,
             auto_held: false,
@@ -1262,28 +1416,7 @@ impl PgHandler {
         direction: secantus_pgplan::FetchDirection,
         count: i64,
     ) -> PgWireResult<()> {
-        use secantus_pgplan::FetchDirection as Fd;
-        let pos = cursor.pos;
-        // (lowest, highest) 1-based row the statement may touch; `None` for
-        // the highest means "to the end".
-        let (lo, hi): (i64, Option<i64>) = match direction {
-            Fd::Forward if count >= 0 => (
-                pos.saturating_add(1),
-                (count != i64::MAX).then(|| pos.saturating_add(count)),
-            ),
-            Fd::Forward => (pos.saturating_add(count), Some(pos - 1)),
-            Fd::Backward if count >= 0 => (pos.saturating_sub(count), Some(pos - 1)),
-            Fd::Backward => (
-                pos.saturating_add(1),
-                (count != i64::MIN).then(|| pos.saturating_sub(count)),
-            ),
-            Fd::Relative => {
-                let t = pos.saturating_add(count);
-                (t, Some(t))
-            }
-            Fd::Absolute if count >= 0 => (count, Some(count)),
-            Fd::Absolute => (1, None),
-        };
+        let (lo, hi) = fetch_reach(cursor.pos, direction, count);
         // Back past the window: read again from the start.
         if lo >= 1 && usize::try_from(lo - 1).unwrap_or(0) < cursor.base {
             if let Some(tail) = cursor.tail.as_mut() {

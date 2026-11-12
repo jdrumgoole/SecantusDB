@@ -151,6 +151,7 @@ impl PgHandler {
                 tz,
                 tail: None,
                 base: 0,
+                pending: None,
                 failed: false,
                 current_of,
                 held: false,
