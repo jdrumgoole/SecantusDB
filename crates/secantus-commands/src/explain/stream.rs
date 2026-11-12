@@ -191,6 +191,8 @@ pub(crate) struct Options<'a> {
 /// What a scan knows of its index.
 struct IndexMeta {
     name: String,
+    /// The key pattern, as the index was created.
+    key: Document,
     fields: Vec<String>,
     dirs: Vec<i32>,
     collation: Option<Collation>,
@@ -1023,13 +1025,20 @@ fn sort_fault(f: secantus_core::fallback::Fallback) -> StorageError {
     }
 }
 
-/// What mongod's sort of index keys counts of `m` (`sorter::member_size`):
-/// the values of the index key it was found at, read from `blob`, its
-/// document -- of a multikey field, the element the entry keys -- and of
-/// those, the sort pattern's.
-fn member_size(pattern: &[(String, bool)], m: &Member, blob: &[u8]) -> Result<usize, StorageError> {
+/// A member's sort key values and the values of its index key.
+type MemberValues = (Vec<Bson>, Vec<Bson>);
+
+/// What mongod's sort of index keys holds of `m`: its sort key's values,
+/// and the values of the index key it was found at, read from `blob`, its
+/// document -- of a multikey field, the element the entry keys. `None`:
+/// `m` was found at no index entry.
+fn member_values(
+    pattern: &[(String, bool)],
+    m: &Member,
+    blob: &[u8],
+) -> Result<Option<MemberValues>, StorageError> {
     let Some(entry) = &m.entry else {
-        return Ok(0);
+        return Ok(None);
     };
     let doc = secantus_core::bsondoc::from_bytes(blob).map_err(undecodable)?;
     let meta = &entry.meta;
@@ -1057,7 +1066,7 @@ fn member_size(pattern: &[(String, bool)], m: &Member, blob: &[u8]) -> Result<us
                 .map_or(Bson::Null, |at| values[at].clone())
         })
         .collect();
-    Ok(secantus_core::sorter::member_size(&sort_key, &values))
+    Ok(Some((sort_key, values)))
 }
 
 /// Sort `all` by `pattern` as mongod's `SORT` does, holding it to its
@@ -1475,7 +1484,7 @@ impl Stage {
                 report,
             } => {
                 if sorted.is_none() {
-                    let mut all: Vec<(Vec<Vec<u8>>, Member, usize)> = Vec::new();
+                    let mut all: Vec<(Vec<Vec<u8>>, Member, Option<MemberValues>)> = Vec::new();
                     while let Some(m) = input.next(cx)? {
                         // The values the keys hold, to compare under the
                         // collation and to count as the sorter does: read
@@ -1491,13 +1500,61 @@ impl Stage {
                             (Some(c), Some(b)) => collated_key(pattern, b, c)?,
                             _ => pattern_key(pattern, &m),
                         };
-                        let size = match (budget.is_some(), blob.as_deref()) {
-                            (true, Some(b)) => member_size(pattern, &m, b)?,
-                            _ => 0,
+                        let values = match (budget.is_some(), blob.as_deref()) {
+                            (true, Some(b)) => member_values(pattern, &m, b)?,
+                            _ => None,
                         };
-                        all.push((key, m, size));
+                        all.push((key, m, values));
                     }
                     let top = limit.filter(|n| *n > 0).map(|n| n as usize);
+                    if let Some((budgets, disk)) = budget {
+                        // mongod's sorter takes the members in the order
+                        // they came, each serialized as its working set
+                        // member when it spills (RM-475).
+                        let before = secantus_core::memlimit::report();
+                        let _disk = secantus_core::memlimit::allow_disk_use(*disk);
+                        let none = Document::new();
+                        // Each index's id: its place among those the
+                        // plan's scans registered, which an OR's children
+                        // do in the order they are read.
+                        let mut registered: Vec<&str> = Vec::new();
+                        let members = all
+                            .iter()
+                            .map(|(_, m, values)| {
+                                let (sort_key, index_key) = values.clone().unwrap_or_default();
+                                let (key_pattern, index_id) = match &m.entry {
+                                    Some(e) => {
+                                        let name = e.meta.name.as_str();
+                                        let at = registered
+                                            .iter()
+                                            .position(|n| *n == name)
+                                            .unwrap_or_else(|| {
+                                                registered.push(name);
+                                                registered.len() - 1
+                                            });
+                                        (&e.meta.key, at as u32)
+                                    }
+                                    None => (&none, 0),
+                                };
+                                secantus_core::sorter::IndexKeyMember {
+                                    sort_key,
+                                    key_pattern,
+                                    index_key,
+                                    index_id,
+                                    rid: m.rid,
+                                }
+                            })
+                            .collect();
+                        let descending: Vec<bool> = pattern.iter().map(|(_, d)| *d).collect();
+                        secantus_core::sorter::sort_index_keys(
+                            members,
+                            &descending,
+                            budgets.sort,
+                            top,
+                        )
+                        .map_err(sort_fault)?;
+                        *report = Some(Box::new(secantus_core::memlimit::report().less(&before)));
+                    }
                     if top.is_some() {
                         all.sort_by(|a, b| a.0.cmp(&b.0));
                     } else {
@@ -1512,14 +1569,6 @@ impl Stage {
                             .into_iter()
                             .filter_map(|at| slots[at].take())
                             .collect();
-                    }
-                    if let Some((budgets, disk)) = budget {
-                        let before = secantus_core::memlimit::report();
-                        let _disk = secantus_core::memlimit::allow_disk_use(*disk);
-                        let sizes: Vec<usize> = all.iter().map(|a| a.2).collect();
-                        secantus_core::sorter::count_members(&sizes, budgets.sort, top)
-                            .map_err(sort_fault)?;
-                        *report = Some(Box::new(secantus_core::memlimit::report().less(&before)));
                     }
                     if let Some(n) = top {
                         all.truncate(n);
@@ -1654,6 +1703,7 @@ fn index_scan(ix: &IxScan, opts: &Options) -> Result<Option<IndexScan>, StorageE
     let collation = ix.index.collation.clone();
     let meta = Arc::new(IndexMeta {
         name: ix.index.name.clone(),
+        key: ix.index.key.clone(),
         fields: fields.iter().map(|(f, _)| f.to_string()).collect(),
         dirs: dirs.clone(),
         collation: collation.clone(),

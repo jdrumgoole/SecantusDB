@@ -689,17 +689,6 @@ These are explicit non-goals. Don't add them without a reason.
       which the run could share. Found 2026-11-12 (RM-466).
       Verify: tests/backlog/test_rm_found_rm466.py::test_a_later_match_replaces_the_one_plan_cache_stats_absorbed
       Backlog-ID: RM-554
-- [ ] **A SORT of index keys past its budget does not spill.** mongod
-      8.2.11's SORT below a FETCH (`type: "default"`) spills past its
-      budget with `allowDiskUse`: 2000 65-byte members under a
-      100000-byte budget spill twice (`spilledRecords: 2000`,
-      `spilledBytes: 130000`), and the profile entry says `usedDisk` and
-      `sortSpills: 2`. This server's counts its members and refuses one
-      past the budget without disk use as mongod does (RM-375), but with
-      disk use sorts in memory and reports no spill
-      (`secantus_core::sorter::count_members`). Found 2026-11-09 (RM-375).
-      Verify: tests/backlog/test_rm_found_rm375.py::test_a_sort_of_index_keys_past_its_budget_spills
-      Backlog-ID: RM-475
 - [ ] **An `$or` of one index sorts documents, not index keys.** mongod
       8.2.11 answers `find({$or: [{y: 0}, {y: {$gt: 1}}]}).sort({x: 1})`
       over `{y: 1, x: 1}` with one two-interval IXSCAN whose keys it sorts
@@ -720,6 +709,44 @@ These are explicit non-goals. Don't add them without a reason.
       b: -1}` and `{a: -1, b: 1}`). Found 2026-11-12 (RM-477).
       Verify: tests/backlog/test_rm_found_rm477.py::test_a_sort_merge_beside_a_null_scan_breaks_ties_as_mongod
       Backlog-ID: RM-559
+- [ ] **`test_a_write_while_an_index_builds` reads mongod's answer off a
+      5 ms lock wait.** `tests/mongod_live/test_txn_catalog_changes.py`
+      asserts mongod 8.2.11 refuses a transaction's insert while an index
+      build is paused (`hangAfterStartingIndexBuild`) with WriteConflict
+      (112). In the RM gate at load 16-29 (2026-11-12, RM-475's run) mongod
+      answered LockTimeout (24, "Unable to acquire IX lock ... within
+      5ms") instead, before the Rust server was asked; a rerun at load 6
+      passed. Which answer mongod gives depends on whether the lock request
+      outlasts `maxTransactionLockRequestTimeoutMillis`, so the test's
+      reference answer is a race under load. Found 2026-11-12 (RM-475).
+      Verify: none -- an intermittent failure under load, 1 in 2 gate runs
+      Backlog-ID: RM-558
+- [ ] **A spilled SORT of index keys under a collation writes the
+      strings, not their collation keys.** mongod 8.2.11's SORT below a
+      FETCH computes each member's sort key under the command's collation
+      and spills that key: 2000 `"s{i}"` strings over `{y: 1, x: 1}` with
+      `{locale: "fr"}` under a 100000-byte budget spill 157780 bytes. This
+      server writes the string values (`stream.rs`'s `member_values`):
+      149780. What it counts in memory already agrees (140890). Found
+      2026-11-12 (RM-475).
+      Verify: tests/backlog/test_rm_found_rm475.py::test_a_spilled_sort_of_index_keys_writes_collation_keys
+      Backlog-ID: RM-555
+- [ ] **A spilled SORT of index keys compresses to a different size.**
+      Each member mongod 8.2.11 spills carries the id of the storage
+      snapshot it was read in, drawn from a process-wide counter every
+      storage transaction advances; this server writes 0
+      (`sorter::SNAPSHOT_ID`), and its `explain` writes each document's
+      place in the collection as its RecordId (`exec.rs`'s `key_members`). The uncompressed bytes agree, but
+      `spilledDataStorageSize` does not: 29061 against 31229 for 2000 int
+      members over `{y: 1, x: 1}` under a 100000-byte budget, and mongod's
+      own answer moves between runs of the same data (31229, 31231, 31240
+      measured 2026-11-12). **Decision needed (2026-11-12):** model the
+      counter (every WiredTiger snapshot this server opens since start,
+      which still could not reproduce mongod's background threads'), or
+      keep 0 and accept the storage size as approximate. Found 2026-11-12
+      (RM-475).
+      Verify: none -- mongod's own answer varies between runs; no test can pin it
+      Backlog-ID: RM-556
 - [ ] **`returnKey` is not at the top of a sorted plan.** mongod 8.2.11
       puts RETURN_KEY above a blocking sort and drops the projection:
       `RETURN_KEY <- SORT <- COLLSCAN`, and `RETURN_KEY <- SORT <- FETCH <-

@@ -1150,34 +1150,38 @@ pub(crate) fn key_members<'s>(
                         .unwrap_or(Bson::Null)
                 })
                 .collect();
-            let sort: Vec<(Bson, bool)> = pattern
+            let sort_key: Vec<Bson> = pattern
                 .iter()
-                .map(|(field, dir)| {
-                    let value = fields
+                .map(|(field, _)| {
+                    fields
                         .iter()
                         .position(|(f, _)| f == field)
-                        .map_or(Bson::Null, |at| values[at].clone());
-                    (value, crate::util::as_i64(dir).unwrap_or(1) < 0)
+                        .map_or(Bson::Null, |at| values[at].clone())
                 })
                 .collect();
-            let order = sort
-                .iter()
-                .map(|(v, descending)| directed(v, *descending, collation))
-                .collect();
-            let sort_key: Vec<Bson> = sort.into_iter().map(|(v, _)| v).collect();
             Some(KeyMember {
-                order,
-                size: secantus_core::sorter::member_size(&sort_key, &values),
+                sort_key,
+                index_key: values,
+                key_pattern: ix.index.key.clone(),
+                index: ix.index.name.clone(),
+                // The rows are the collection's documents in the order
+                // they are stored: each one's place stands for its
+                // RecordId, which moves only what a spilled run
+                // compresses to (RM-556).
+                rid: row as i64 + 1,
             })
         })
         .collect()
 }
 
-/// One member of a SORT of index keys: where it sorts, and what the
-/// sorter counts of it.
+/// One member of a SORT of index keys, as its sorter holds it: its sort
+/// key's values, and the index entry it was found at.
 pub(crate) struct KeyMember {
-    order: Vec<Vec<u8>>,
-    size: usize,
+    sort_key: Vec<Bson>,
+    index_key: Vec<Bson>,
+    key_pattern: Document,
+    index: String,
+    rid: i64,
 }
 
 /// A `SORT`'s memory and spill counters (RM-315): the rows it sorts, run
@@ -1197,14 +1201,42 @@ pub(crate) fn sort_stats(
         return;
     }
     let top = limit.and_then(|n| usize::try_from(n).ok());
-    if let Some(mut members) = keys {
-        // The sizes in sorted order: a limit keeps the first.
-        members.sort_by(|a, b| a.order.cmp(&b.order));
-        let sizes: Vec<usize> = members.iter().map(|m| m.size).collect();
+    if let Some(members) = keys {
+        // In the order they came, each index's id its place among those
+        // registered, as execution's sort takes them (RM-475).
+        let mut registered: Vec<&str> = Vec::new();
+        let members: Vec<_> = members
+            .iter()
+            .map(|m| {
+                let index_id = registered
+                    .iter()
+                    .position(|n| *n == m.index)
+                    .unwrap_or_else(|| {
+                        registered.push(&m.index);
+                        registered.len() - 1
+                    });
+                secantus_core::sorter::IndexKeyMember {
+                    sort_key: m.sort_key.clone(),
+                    key_pattern: &m.key_pattern,
+                    index_key: m.index_key.clone(),
+                    index_id: index_id as u32,
+                    rid: m.rid,
+                }
+            })
+            .collect();
+        let descending: Vec<bool> = pattern
+            .values()
+            .map(|dir| crate::util::as_i64(dir).unwrap_or(1) < 0)
+            .collect();
         let budget = secantus_core::memlimit::budgets().sort;
         let (ran, report) = secantus_core::memlimit::captured(|| {
             let _disk = secantus_core::memlimit::allow_disk_use(true);
-            secantus_core::sorter::count_members(&sizes, budget, top.filter(|&k| k > 0))
+            secantus_core::sorter::sort_index_keys(
+                members,
+                &descending,
+                budget,
+                top.filter(|&k| k > 0),
+            )
         });
         if ran.is_ok() {
             sort_extra(extra, &report);
