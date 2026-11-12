@@ -34,6 +34,13 @@
 //! analysed after it (LIMIT, OFFSET, the locking clause); the ORDER BY
 //! match and what `parseCheckAggregates` raises are not the answer. Its
 //! items are not flattened: a row or a cast of a constant is an expression.
+//!
+//! An integer there is a position in the select list as `*` expands it,
+//! and one outside it is 42P10 `DISTINCT ON position N is not in select
+//! list` at the constant, found in the same pass and the same order
+//! (RP-884): `distinct on (9, 1.5)` is the position's error. A position
+//! inside a star names the column the star stands for there, and is
+//! written as that column ([`distinct_on_star_positions`]).
 
 use super::*;
 
@@ -71,17 +78,43 @@ fn cut_at_constant(items: &[Node]) -> Option<(i32, Vec<Node>)> {
     None
 }
 
-/// The location of the first DISTINCT ON item that is a non-integer
-/// constant, and how many items come before it.
-fn distinct_on_constant(items: &[Node]) -> Option<(i32, usize)> {
+/// How many columns `s`'s select list has as `*` expands it, when that
+/// is known.
+fn select_list_width(s: &SelectStmt, lookup: &dyn Fn(&str) -> Option<TableDef>) -> Option<usize> {
+    if let Some(targets) = domain_scope::expanded_targets(s, lookup) {
+        return Some(targets.len());
+    }
+    let star = s.target_list.iter().any(|t| {
+        matches!(t.node.as_ref(), Some(N::ResTarget(rt))
+            if matches!(rt.val.as_deref().and_then(|v| v.node.as_ref()),
+                Some(N::ColumnRef(c)) if c.fields.last().is_some_and(|f| matches!(f.node, Some(N::AStar(_))))))
+    });
+    (!star).then_some(s.target_list.len())
+}
+
+/// The first DISTINCT ON item `findTargetlistEntrySQL92` refuses: a
+/// non-integer constant, or a position outside the `width` columns of the
+/// select list (one not checked when `width` is not known). Its location,
+/// how many items come before it, and the position when it is one.
+fn distinct_on_refused(items: &[Node], width: Option<usize>) -> Option<(i32, usize, Option<i32>)> {
     // `DISTINCT` alone is one item with no node.
     items
         .iter()
         .enumerate()
         .find_map(|(i, item)| match item.node.as_ref() {
-            Some(N::AConst(c)) if !matches!(c.val, Some(a_const::Val::Ival(_))) => {
-                Some((c.location, i))
-            }
+            Some(N::AConst(c)) => match c.val.as_ref() {
+                Some(a_const::Val::Ival(v)) => {
+                    let outside = match width {
+                        Some(width) => {
+                            !usize::try_from(v.ival).is_ok_and(|pos| (1..=width).contains(&pos))
+                        }
+                        // Not known: only a position no list holds.
+                        None => v.ival < 1,
+                    };
+                    outside.then_some((c.location, i, Some(v.ival)))
+                }
+                _ => Some((c.location, i, None)),
+            },
             _ => None,
         })
 }
@@ -129,32 +162,87 @@ pub(crate) fn check(s: &SelectStmt, plan: &dyn Fn(&SelectStmt) -> Result<Stateme
     ))
 }
 
-/// PostgreSQL's 42601 for a DISTINCT ON constant that is no integer,
-/// unless the statement fails earlier (module docs). Runs after [`check`],
-/// whose GROUP BY error comes first.
+/// PostgreSQL's 42601 for a DISTINCT ON constant that is no integer, and
+/// its 42P10 for a position outside the select list, unless the statement
+/// fails earlier (module docs). Runs after [`check`], whose GROUP BY error
+/// comes first.
 pub(crate) fn check_distinct_on(
     s: &SelectStmt,
+    lookup: &dyn Fn(&str) -> Option<TableDef>,
     plan: &dyn Fn(&SelectStmt) -> Result<Statement>,
 ) -> Result<()> {
-    let Some((at, before)) = distinct_on_constant(&s.distinct_clause) else {
+    if s.distinct_clause.iter().all(|n| n.node.is_none()) {
+        return Ok(());
+    }
+    let width = select_list_width(s, lookup);
+    let Some((at, before, position)) = distinct_on_refused(&s.distinct_clause, width) else {
         return Ok(());
     };
     let mut cut = s.clone();
-    cut.distinct_clause.truncate(before);
     cut.limit_count = None;
     cut.limit_offset = None;
     cut.locking_clause.clear();
-    if let Err(e) = plan(&cut) {
-        let unmatched = e
-            .to_string()
-            .starts_with("SELECT DISTINCT ON expressions must match initial ORDER BY expressions");
-        if !unmatched && raised_before_group_by(&e) {
-            return Err(e);
+    // The clauses analysed before DISTINCT ON, then its items before this
+    // one. Planned with them, a statement can fail the ORDER BY match,
+    // which is checked only after every item, ahead of an ORDER BY error
+    // of its own.
+    cut.distinct_clause.clear();
+    let mut cuts = vec![cut.clone()];
+    if before > 0 {
+        cut.distinct_clause = s.distinct_clause[..before].to_vec();
+        cuts.push(cut);
+    }
+    for cut in &cuts {
+        if let Err(e) = plan(cut) {
+            let unmatched = e.to_string().starts_with(
+                "SELECT DISTINCT ON expressions must match initial ORDER BY expressions",
+            );
+            if !unmatched && raised_before_group_by(&e) {
+                return Err(e);
+            }
         }
     }
     set_error_location(at);
-    Err(Error::Sqlstate(
-        "42601",
-        "non-integer constant in DISTINCT ON".into(),
-    ))
+    Err(match position {
+        Some(pos) => Error::InvalidColumnReference(format!(
+            "DISTINCT ON position {pos} is not in select list"
+        )),
+        None => Error::Sqlstate("42601", "non-integer constant in DISTINCT ON".into()),
+    })
+}
+
+/// `s` with each DISTINCT ON position that falls inside a `*` written as
+/// the column the star stands for there, qualified by its FROM item:
+/// `distinct on (2) * from t` sorts and compares by `t`'s second column
+/// (`findTargetlistEntrySQL92` returns the star's expanded target).
+/// `None` when there is none.
+pub(crate) fn distinct_on_star_positions(
+    s: &SelectStmt,
+    lookup: &dyn Fn(&str) -> Option<TableDef>,
+) -> Option<SelectStmt> {
+    let position = |n: &Node| match n.node.as_ref() {
+        Some(N::AConst(c)) => match c.val.as_ref() {
+            Some(a_const::Val::Ival(v)) => Some((usize::try_from(v.ival).ok()?, c.location)),
+            _ => None,
+        },
+        _ => None,
+    };
+    if !s.distinct_clause.iter().any(|n| position(n).is_some()) {
+        return None;
+    }
+    let targets = domain_scope::expanded_targets(s, lookup)?;
+    let mut out = s.clone();
+    let mut changed = false;
+    for item in &mut out.distinct_clause {
+        let Some((pos, location)) = position(item) else {
+            continue;
+        };
+        let Some(Some((from_item, column))) = pos.checked_sub(1).and_then(|k| targets.get(k))
+        else {
+            continue;
+        };
+        *item = domain_scope::star_column_ref(from_item, column, location);
+        changed = true;
+    }
+    changed.then_some(out)
 }

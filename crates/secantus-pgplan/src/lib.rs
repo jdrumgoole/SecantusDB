@@ -21425,17 +21425,22 @@ fn check_distinct_order(s: &pg_query::protobuf::SelectStmt) -> Result<()> {
 /// must be DISTINCT ON expressions until every one of those is matched, else
 /// 42P10 at the first DISTINCT ON expression. A position or an output name
 /// on either side stands for its select-list expression; a column reference
-/// is compared by its column name. Anything this cannot compare with
-/// confidence (a qualified reference inside a larger expression) is let
-/// through, as before.
-fn check_distinct_on_order(s: &pg_query::protobuf::SelectStmt) -> Result<()> {
+/// is compared by its column name, and a `*` stands for the columns it
+/// expands to (RP-884). Anything this cannot compare with confidence (a
+/// qualified reference inside a larger expression, a star over columns it
+/// does not know) is let through, as before.
+fn check_distinct_on_order(
+    s: &pg_query::protobuf::SelectStmt,
+    lookup: &dyn Fn(&str) -> Option<TableDef>,
+) -> Result<()> {
     if s.distinct_clause.is_empty()
         || s.distinct_clause.iter().any(|n| n.node.is_none())
         || s.sort_clause.is_empty()
     {
         return Ok(());
     }
-    let mut targets: Vec<(String, pg_query::protobuf::Node)> = Vec::new();
+    let mut written: Vec<(String, pg_query::protobuf::Node)> = Vec::new();
+    let mut star = false;
     for t in &s.target_list {
         let Some(N::ResTarget(rt)) = t.node.as_ref() else {
             return Ok(());
@@ -21448,11 +21453,31 @@ fn check_distinct_on_order(s: &pg_query::protobuf::SelectStmt) -> Result<()> {
                 .last()
                 .is_some_and(|f| matches!(f.node, Some(N::AStar(_))))
             {
-                return Ok(());
+                star = true;
+                continue;
             }
         }
-        targets.push((rt.name.clone(), val.clone()));
+        written.push((rt.name.clone(), val.clone()));
     }
+    let targets: Vec<(String, pg_query::protobuf::Node)> = if star {
+        let Some(expanded) = domain_scope::expanded_targets(s, lookup) else {
+            return Ok(());
+        };
+        let mut written = written.into_iter();
+        let mut out = Vec::with_capacity(expanded.len());
+        for target in expanded {
+            match target {
+                None => out.extend(written.next()),
+                Some((item, column)) => out.push((
+                    String::new(),
+                    domain_scope::star_column_ref(&item, &column, -1),
+                )),
+            }
+        }
+        out
+    } else {
+        written
+    };
     // The comparable form of an item, or None when it cannot be compared.
     let key = |n: &pg_query::protobuf::Node| -> Option<String> {
         let n = match n.node.as_ref() {
@@ -27419,8 +27444,13 @@ fn plan_select(
     // A GROUP BY constant that is no integer is 42601, after what parse
     // analysis meets before it (RP-854).
     group_sql92::check(s, &|cut| plan_select(cut, lookup, params))?;
-    // So is a DISTINCT ON constant, analysed after GROUP BY (RP-872).
-    group_sql92::check_distinct_on(s, &|cut| plan_select(cut, lookup, params))?;
+    // So is a DISTINCT ON constant, analysed after GROUP BY (RP-872). A
+    // DISTINCT ON position outside the select list is 42P10, and one
+    // inside a `*` names the column the star stands for (RP-884).
+    group_sql92::check_distinct_on(s, lookup, &|cut| plan_select(cut, lookup, params))?;
+    if let Some(rewritten) = group_sql92::distinct_on_star_positions(s, lookup) {
+        return plan_select(&rewritten, lookup, params);
+    }
     // `WITH` is shorthand for the FROM-subqueries below, so it is rewritten
     // away before any of the shape checks run -- every one of them would
     // otherwise have to know about it.
@@ -27525,7 +27555,7 @@ fn plan_select(
     cancel::check()?;
     enum_order::check_collate_operands(s, lookup)?;
     check_distinct_order(s)?;
-    check_distinct_on_order(s)?;
+    check_distinct_on_order(s, lookup)?;
     cancel::check()?;
     // A set-returning function in the select list (or ORDER BY / GROUP BY)
     // is a LATERAL source (see `srf_tlist`).

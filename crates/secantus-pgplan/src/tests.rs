@@ -470,6 +470,59 @@ fn a_non_integer_distinct_on_constant_is_42601() {
     plan("SELECT DISTINCT ON ('x'::text) name FROM t", &lookup).expect("an expression key");
 }
 
+/// A DISTINCT ON position outside the select list as `*` expands it is
+/// PostgreSQL's 42P10 at the constant, in item order with a non-integer
+/// constant's 42601 and after an ORDER BY error; one inside a star names
+/// the column the star stands for, and is held to the ORDER BY match
+/// (RP-884).
+#[test]
+fn a_distinct_on_position_is_checked_against_the_select_list() {
+    for (sql, pos, at) in [
+        ("SELECT DISTINCT ON (9) name FROM t", 9, 20),
+        ("SELECT DISTINCT ON (0) name FROM t", 0, 20),
+        ("SELECT DISTINCT ON (-1) name FROM t", -1, 20),
+        ("SELECT DISTINCT ON (9, 1.5) name FROM t", 9, 20),
+        ("SELECT DISTINCT ON (name, 4) * FROM t", 4, 26),
+        (
+            "SELECT DISTINCT ON (3) name, count(*) FROM t GROUP BY name",
+            3,
+            20,
+        ),
+    ] {
+        take_error_location();
+        let err = plan(sql, &lookup).expect_err(sql);
+        assert_eq!(err.sqlstate(), "42P10", "{sql}: {err}");
+        assert_eq!(
+            err.to_string(),
+            format!("DISTINCT ON position {pos} is not in select list"),
+            "{sql}"
+        );
+        assert_eq!(take_error_location(), Some(at), "{sql}");
+    }
+    let err = plan(
+        "SELECT DISTINCT ON (1, 9) name FROM t ORDER BY nosuch",
+        &lookup,
+    )
+    .expect_err("must refuse");
+    assert_eq!(err.sqlstate(), "42703", "{err}");
+    let err = plan("SELECT DISTINCT ON (2) * FROM t ORDER BY 1", &lookup).expect_err("must refuse");
+    assert!(
+        err.to_string()
+            .starts_with("SELECT DISTINCT ON expressions must match initial ORDER BY"),
+        "{err}"
+    );
+    for sql in [
+        "SELECT DISTINCT ON (2) * FROM t",
+        "SELECT DISTINCT ON (3) t.* FROM t ORDER BY n, id",
+        "SELECT DISTINCT ON (2) * FROM (VALUES (1, 2)) v(a, b)",
+    ] {
+        match plan(sql, &lookup).expect(sql) {
+            Statement::Select(s) => assert!(matches!(s.distinct, Distinct::On(_)), "{sql}"),
+            other => panic!("{sql}: {other:?}"),
+        }
+    }
+}
+
 #[test]
 fn group_by_resolves_order_by_index() {
     match plan_ok("SELECT count(*) FROM t GROUP BY name ORDER BY name DESC") {
@@ -5468,7 +5521,9 @@ fn create_table_as_records_its_columns_domains() {
         domains_of("CREATE TABLE c AS SELECT a::bpchar FROM fd661"),
         vec![None]
     );
-    assert!(domains_of("CREATE TABLE c AS VALUES (1)").is_empty());
+    // A VALUES list's column is of no domain unless every row's value is
+    // of one (RP-884 made its columns known).
+    assert_eq!(domains_of("CREATE TABLE c AS VALUES (1)"), vec![None]);
     let column = domain_column("a", "dc661")
         .expect("plans")
         .expect("a domain");

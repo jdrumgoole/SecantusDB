@@ -413,14 +413,16 @@ pub fn error_position(sql: &str, sqlstate: &str, message: &str) -> Option<usize>
         "42P10" if m.ends_with(" is not in select list") => {
             let (clause, rest) = m.split_once(" position ")?;
             let n = rest.split(' ').next()?;
-            let i = toks.windows(3).position(|w| {
-                w[0].text
-                    .eq_ignore_ascii_case(clause.rsplit(' ').next().unwrap_or(""))
-                    && w[1].text.eq_ignore_ascii_case("by")
+            // `ORDER BY`, `GROUP BY`, `DISTINCT ON`.
+            let words: Vec<&str> = clause.split(' ').collect();
+            let i = toks.windows(words.len()).position(|w| {
+                w.iter()
+                    .zip(&words)
+                    .all(|(t, k)| t.text.eq_ignore_ascii_case(k))
             });
             // The number among the clause's items: the first token equal to it
             // after the clause keyword.
-            let from = i.map_or(0, |i| i + 2);
+            let from = i.map_or(0, |i| i + words.len());
             pos(toks.iter().skip(from).find(|t| t.text == n)?.start)
         }
         // `invalid reference to FROM-clause entry for table "t"`: at `t.`.
