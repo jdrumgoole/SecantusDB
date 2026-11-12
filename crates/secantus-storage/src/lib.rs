@@ -21290,15 +21290,6 @@ impl Storage {
         })
     }
 
-    /// Apply `update` to documents matching `filter`. `multi` updates every
-    /// match (else just the first); `upsert` inserts a seeded document when
-    /// nothing matches. Operator-style updates emit a `$v:2` diff oplog entry,
-    /// replacement-style updates emit the full new doc; index entries, multikey
-    /// flags, unique enforcement and pre-images are all maintained. Mirrors
-    /// `storage.update_matching` (base form — `array_filters` / positional
-    /// operators / `let` / `collation` / `validator` / capped collections route
-    /// to Python at the engine-selection layer).
-    #[allow(clippy::too_many_arguments)]
     /// Update at the default `strict` validation level.
     ///
     /// Thin wrapper over [`Storage::update_matching_leveled`]; see it for the
@@ -21421,6 +21412,14 @@ impl Storage {
         Ok(rows.len())
     }
 
+    /// Apply `update` to documents matching `filter`. `multi` updates every
+    /// match (else just the first); `upsert` inserts a seeded document when
+    /// nothing matches. Operator-style updates emit a `$v:2` diff oplog entry,
+    /// replacement-style updates emit the full new doc; index entries, multikey
+    /// flags, unique enforcement and pre-images are all maintained. Mirrors
+    /// `storage.update_matching` (base form — `array_filters` / positional
+    /// operators / `let` / `collation` / `validator` / capped collections route
+    /// to Python at the engine-selection layer).
     #[allow(clippy::too_many_arguments)]
     pub fn update_matching_leveled(
         &self,

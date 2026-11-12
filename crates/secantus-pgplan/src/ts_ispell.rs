@@ -1205,10 +1205,13 @@ impl IspellDict {
         let getc = |i: usize| getwchar(&self.affixes[i].repl, level, typ);
         let mut nchar = 0;
         let mut last = 0u8;
-        for i in low..high {
-            if self.affixes[i].repl.len() > level && last != getc(i) {
-                nchar += 1;
-                last = getc(i);
+        for aff in &self.affixes[low..high] {
+            if aff.repl.len() > level {
+                let c = getwchar(&aff.repl, level, typ);
+                if last != c {
+                    nchar += 1;
+                    last = c;
+                }
             }
         }
         if nchar == 0 {
