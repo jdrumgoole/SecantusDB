@@ -306,21 +306,36 @@ fn read_record(
 /// libc++ sort is not modelled (RM-526); there the documents keep the order
 /// they came in.
 fn sort_held(held: &mut Vec<Held>, cmp: &dyn Fn(&[Bson], &[Bson]) -> Ordering) {
-    if crate::stl::LIBCXX {
-        held.sort_by(|a, b| cmp(&a.0, &b.0));
-        return;
-    }
-    // The algorithm moves positions, so sorting them moves no document.
-    let mut order: Vec<usize> = (0..held.len()).collect();
-    crate::stl::sort(&mut order, &|a: &usize, b: &usize| {
-        cmp(&held[*a].0, &held[*b].0) == Ordering::Less
-    });
+    let order = std_sort_order(held.len(), &|a, b| cmp(&held[a].0, &held[b].0));
     let mut taken: Vec<Option<Held>> = std::mem::take(held).into_iter().map(Some).collect();
     held.extend(
         order
             .into_iter()
             .map(|i| taken[i].take().expect("each position once")),
     );
+}
+
+/// The order mongod's `std::sort` leaves `n` items in, given as positions
+/// in the order they came: `cmp(a, b)` compares the items at positions `a`
+/// and `b` by their sort keys alone. Items whose keys compare equal come
+/// where the build's C++ library puts them: libstdc++'s introsort
+/// ([`crate::stl::sort`]) on the Linux build, mongod's exemplar. The macOS
+/// build's libc++ sort is not modelled (RM-526); there they keep the order
+/// they came in.
+///
+/// Every sort mongod runs through its sorter without a limit -- a
+/// `$sort`, and a `find`'s `SORT` stage (RM-312) -- leaves ties this way.
+pub fn std_sort_order(n: usize, cmp: &dyn Fn(usize, usize) -> Ordering) -> Vec<usize> {
+    let mut order: Vec<usize> = (0..n).collect();
+    if crate::stl::LIBCXX {
+        order.sort_by(|a, b| cmp(*a, *b));
+    } else {
+        // The algorithm moves positions, so sorting them moves no item.
+        crate::stl::sort(&mut order, &|a: &usize, b: &usize| {
+            cmp(*a, *b) == Ordering::Less
+        });
+    }
+    order
 }
 
 /// Write sorted `items` as a run, counted as one spill.
@@ -1012,6 +1027,33 @@ mod tests {
             ]
         };
         assert_eq!(ids(&out), expected);
+    }
+
+    /// RM-312: a `find`'s `SORT` of 200 documents in runs of 20 equal keys
+    /// leaves the equal ones as the build's `std::sort` does. The first run
+    /// under libstdc++ is the gap test's (`tests/backlog/
+    /// test_rm_found_2026_10_25.py`), which Linux mongod answers live.
+    #[test]
+    fn std_sort_order_is_the_builds_std_sort() {
+        let key = |i: usize| format!("{}{}", if i.is_multiple_of(2) { "a" } else { "A" }, i % 5);
+        let ids: Vec<usize> = (1..=200).collect();
+        let order = std_sort_order(ids.len(), &|a, b| key(ids[a]).cmp(&key(ids[b])));
+        let first: Vec<usize> = order[..20].iter().map(|&at| ids[at]).collect();
+        let expected: Vec<usize> = if crate::stl::LIBCXX {
+            // Not modelled (RM-526): the order they came in.
+            (0..20).map(|n| 5 + 10 * n).collect()
+        } else {
+            vec![
+                165, 25, 155, 55, 65, 145, 185, 75, 135, 15, 45, 85, 175, 125, 95, 195, 5, 115,
+                105, 35,
+            ]
+        };
+        assert_eq!(first, expected);
+        // Every position once, sorted by key.
+        let mut seen = order.clone();
+        seen.sort_unstable();
+        assert_eq!(seen, (0..200).collect::<Vec<_>>());
+        assert!(order.windows(2).all(|w| key(ids[w[0]]) <= key(ids[w[1]])));
     }
 
     #[test]

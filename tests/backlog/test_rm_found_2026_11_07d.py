@@ -9,6 +9,7 @@ the Rust server is `secantusd-rs` (`rust_mongo`).
 from __future__ import annotations
 
 import json
+import statistics
 import time
 from typing import Any
 
@@ -20,8 +21,9 @@ from tests.mongod_live.test_interrupts import DB, SLOW, Slow
 #: Between one filter test and two: mongod's write takes as long as the
 #: `find` (1.0 s for both, measured), this server's took twice as long.
 _BUDGET = 1.5
-#: Paired rounds of a `find` and the write; the fastest of each are compared.
-_ROUNDS = 3
+#: Paired rounds of a `find` and the write; the median of the rounds'
+#: write-over-find ratios is compared.
+_ROUNDS = 5
 
 _WRITES = {
     "update": {"update": "c", "updates": [{"q": SLOW, "u": {"$inc": {"n": 1}}}]},
@@ -68,8 +70,17 @@ def _timed(client: Any, is_mongod: bool, slow: Slow, command: dict) -> tuple[flo
 
 def _write_to_find_ratios(client: Any, is_mongod: bool) -> dict[str, tuple]:
     """For each write of one slow document: its cost over a `find` with the
-    same filter, from each side's fastest of alternating rounds, with the
-    basis and the rounds' times.
+    same filter, the median of each round's write over the `find` run just
+    before it, with the basis and the rounds' times.
+
+    The ratio is taken within a round, never fastest write over fastest
+    `find`: each round's two operations run back to back and see the same
+    load, while the fastest `find` of all rounds can come from a moment the
+    writes never had. That form failed on CI three times on mongod's own
+    side (RM-547: 1.602, 1.593, then on PR #2703 2026-11-12, `cpu` rounds of
+    one `find` ranging 0.37 to 0.6 s). The median of five lets two rounds go
+    wrong either way; the budget stays 1.5, which separates a filter tested
+    once from one tested twice.
 
     The cost is CPU time where the servers report it (`cpuNanos`, Linux), so
     a loaded runner cannot move it, and wall time elsewhere, the fastest round
@@ -93,7 +104,8 @@ def _write_to_find_ratios(client: Any, is_mongod: bool) -> dict[str, tuple]:
             basis = 0 if cpu else 1
             f = [round(t[basis], 3) for t in finds]
             w = [round(t[basis], 3) for t in writes]
-            out[name] = (round(min(w) / min(f), 3), "cpu" if cpu else "wall", f, w)
+            ratio = statistics.median(b / a for a, b in zip(f, w, strict=True))
+            out[name] = (round(ratio, 3), "cpu" if cpu else "wall", f, w)
     return out
 
 

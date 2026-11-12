@@ -20,6 +20,7 @@
 
 // Public API: the engines the PyO3 bindings (and a future standalone server)
 // call directly.
+pub mod absl_hash;
 pub mod aggregate;
 pub mod bsoncolumn;
 pub mod bsondoc;

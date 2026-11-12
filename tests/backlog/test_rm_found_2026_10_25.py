@@ -15,7 +15,7 @@ from typing import Any
 
 import pytest
 
-from tests.backlog.conftest import mongo_answer
+from tests.backlog.conftest import mongo_answer, only_on
 from tests.backlog.opdebug import no_timed_yields
 
 
@@ -608,23 +608,46 @@ def test_a_cursor_returns_what_it_buffered_when_its_collection_is_dropped(
 
 
 def _sorted_ties(client: Any) -> dict:
-    """The order of documents a blocking sort leaves equal."""
+    """The order of documents a blocking sort leaves equal: the first 20 of
+    200 that arrive in `_id` order, in 10 runs of 20 equal keys (5 runs of
+    40 under the collation, which folds case)."""
     c = _coll(client)
     c.insert_many([{"_id": i, "s": ("A" if i % 2 else "a") + str(i % 5)} for i in range(1, 201)])
+    leading = [{"$sort": {"s": 1}}]
     return {
         "simple": [d["_id"] for d in c.find({}, sort=[("s", 1)])][:20],
         "collated": [d["_id"] for d in c.find({}, sort=[("s", 1)], collation=_STRENGTH_2)][:20],
+        "$sort": [d["_id"] for d in c.aggregate(leading)][:20],
+        "$sort collated": [d["_id"] for d in c.aggregate(leading, collation=_STRENGTH_2)][:20],
     }
 
 
-@pytest.mark.backlog("RM-312")
+#: libstdc++'s `std::sort` over the 200 documents in `_id` order, by key
+#: alone: what Linux mongod's sorter leaves (its order for the 40 documents
+#: of RM-402 is g++ 15.2's, and so is this model's).
+_LIBSTDCXX_SIMPLE = [165, 25, 155, 55, 65, 145, 185, 75, 135, 15]
+_LIBSTDCXX_SIMPLE += [45, 85, 175, 125, 95, 195, 5, 115, 105, 35]
+_LIBSTDCXX_COLLATED = [105, 150, 145, 30, 140, 35, 130, 125, 40, 120]
+_LIBSTDCXX_COLLATED += [115, 45, 110, 135, 50, 100, 95, 55, 90, 85]
+
+
+@pytest.mark.backlog_fixed("RM-312")
 def test_a_blocking_sort_leaves_ties_as_mongods_sort_does(rust_mongo: Any, mongod: Any) -> None:
-    """mongod 8.2.11 sorts a blocking sort's documents with an unstable sort:
-    of 200 documents in 10 runs of 20 equal keys, the first is not the first
-    inserted, and two mongod processes agree. This server keeps equal
-    documents in the order it reads them."""
-    want = _sorted_ties(mongod)
-    assert want["simple"][:2] != [5, 15]
+    """mongod sorts a blocking sort's documents with its sorter's
+    `std::sort`, which is not stable: of 200 documents in runs of equal
+    keys, a `find` and a leading `$sort`, with a collation or without, put
+    the equal ones where the C++ library's introsort leaves them. This
+    server kept them in the order it read them. The exemplar is Linux
+    mongod, which links libstdc++ (Joe, 2026-11-12); macOS mongod's libc++
+    orders them its own way (`25, 105, 95, 115, 5, ...`, RM-526)."""
+    only_on("linux", why="the sort is libstdc++'s, the Linux build's")
+    want = {
+        "simple": _LIBSTDCXX_SIMPLE,
+        "collated": _LIBSTDCXX_COLLATED,
+        "$sort": _LIBSTDCXX_SIMPLE,
+        "$sort collated": _LIBSTDCXX_COLLATED,
+    }
+    assert _sorted_ties(mongod) == want  # the reference, live
     assert _sorted_ties(rust_mongo) == want
 
 

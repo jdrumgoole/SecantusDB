@@ -1061,9 +1061,10 @@ fn member_size(pattern: &[(String, bool)], m: &Member, blob: &[u8]) -> Result<us
 }
 
 /// Sort `all` by `pattern` as mongod's `SORT` does, holding it to its
-/// memory budget (a sort past it without `allowDiskUse` is refused, 292)
-/// and keeping documents that compare equal in the order they came; with
-/// what its sorter counted, when it ran one.
+/// memory budget (a sort past it without `allowDiskUse` is refused, 292),
+/// documents that compare equal where `std::sort` leaves them without a
+/// limit and in the order they came under one; with what its sorter
+/// counted, when it ran one.
 fn sort_members(
     cx: &Cx,
     all: Vec<Member>,
@@ -1119,7 +1120,12 @@ fn sort_members(
         .iter()
         .map(|m| m.doc.as_deref().unwrap_or(&[]))
         .collect();
-    let (order, _) = cx.storage.sort_permutation(&blobs, pattern, collation)?;
+    let (mut order, tied) = cx.storage.sort_permutation(&blobs, pattern, collation)?;
+    if top.is_none() && tied.iter().any(|t| *t) {
+        // No limit: mongod's sorter's `std::sort` (RM-312).
+        let arrival: Vec<usize> = (0..all.len()).collect();
+        order = super::order::std_sorted(&arrival, &order, &tied);
+    }
     let mut slots: Vec<Option<Member>> = all.into_iter().map(Some).collect();
     let mut out: VecDeque<Member> = order
         .into_iter()
@@ -1491,8 +1497,22 @@ impl Stage {
                         };
                         all.push((key, m, size));
                     }
-                    all.sort_by(|a, b| a.0.cmp(&b.0));
                     let top = limit.filter(|n| *n > 0).map(|n| n as usize);
+                    if top.is_some() {
+                        all.sort_by(|a, b| a.0.cmp(&b.0));
+                    } else {
+                        // No limit: mongod's sorter's `std::sort`, which
+                        // leaves keys that compare equal where it puts them
+                        // (RM-312).
+                        let order = secantus_core::sorter::std_sort_order(all.len(), &|a, b| {
+                            all[a].0.cmp(&all[b].0)
+                        });
+                        let mut slots: Vec<Option<_>> = all.into_iter().map(Some).collect();
+                        all = order
+                            .into_iter()
+                            .filter_map(|at| slots[at].take())
+                            .collect();
+                    }
                     if let Some((budgets, disk)) = budget {
                         let before = secantus_core::memlimit::report();
                         let _disk = secantus_core::memlimit::allow_disk_use(*disk);

@@ -30,9 +30,12 @@
 //! an `ExpressionNary`'s is bare), geo predicates (representatives that are
 //! valid shapes), and the stages mongod desugars into others (`$bucket`,
 //! `$setWindowFields`, `$fill`, `$densify`, `$documents`, `$score`).
+//! `$rankFusion` and `$scoreFusion` are the pipelines mongod desugars them
+//! into (`document_source_rank_fusion.cpp`,
+//! `document_source_score_fusion.cpp`).
 //!
 //! Where a query uses something this module does not shape (`$jsonSchema`,
-//! `$rankFusion`, `$scoreFusion`, an option no one has measured), [`hash`]
+//! a hybrid search over `$search`, an option no one has measured), [`hash`]
 //! answers `None` and no hash is printed: a wrong hash would be worse than
 //! none (`tasks/backlog-rust-mongodb.md` names what is left).
 
@@ -183,7 +186,7 @@ fn shape_doc(db: &str, coll: &str, name: &str, request: &Document) -> Option<Doc
             shape.insert("command", "aggregate");
             shape.insert(
                 "pipeline",
-                pipeline_shape(db, request.get_array("pipeline").ok()?)?,
+                pipeline_shape(db, coll, request.get_array("pipeline").ok()?)?,
             );
             if let Some(v) = request.get("allowDiskUse") {
                 shape.insert("allowDiskUse", v.as_bool()?);
@@ -1949,19 +1952,6 @@ fn accumulators<'a>(fields: impl Iterator<Item = (&'a String, &'a Bson)>) -> Opt
         .collect()
 }
 
-/// A sub-pipeline: each stage as the stages it parses into.
-fn pipeline_shape(db: &str, stages: &[Bson]) -> Option<Vec<Bson>> {
-    let mut out = Vec::new();
-    for stage in stages {
-        out.extend(
-            stage_shape(db, stage.as_document()?)?
-                .into_iter()
-                .map(Bson::Document),
-        );
-    }
-    Some(out)
-}
-
 /// The window functions whose argument is not an accumulator's.
 fn window_function(op: &str, arg: &Bson) -> Option<Document> {
     Some(match op {
@@ -2283,7 +2273,7 @@ fn densify(spec: &Document) -> Option<Vec<Document>> {
 }
 
 /// `$merge`, with mongod's defaults filled in.
-fn merge(db: &str, spec: &Bson) -> Option<Document> {
+fn merge(db: &str, coll: &str, spec: &Bson) -> Option<Document> {
     let spec = match spec {
         Bson::String(coll) => doc! { "into": coll.clone() },
         Bson::Document(d) => d.clone(),
@@ -2308,7 +2298,7 @@ fn merge(db: &str, spec: &Bson) -> Option<Document> {
             };
             vars.insert("new", "$$ROOT");
             out.insert("let", vars);
-            out.insert("whenMatched", pipeline_shape(db, pipeline)?);
+            out.insert("whenMatched", pipeline_shape(db, coll, pipeline)?);
         }
         Some(Bson::String(mode)) if !spec.contains_key("let") => {
             out.insert("whenMatched", mode.clone());
@@ -2431,7 +2421,10 @@ fn geo_near(spec: &Document) -> Option<Document> {
         out.insert("key", key.as_str()?);
     }
     out.insert("near", constant(spec.get("near")?, true)?);
-    out.insert("distanceField", spec.get_str("distanceField").ok()?);
+    // Optional since 8.0: mongod 8.2.11 shapes `{near: [0, 0]}` with none.
+    if let Some(f) = spec.get("distanceField") {
+        out.insert("distanceField", f.as_str()?);
+    }
     for k in ["maxDistance", "minDistance"] {
         if let Some(v) = spec.get(k) {
             out.insert(k, rep(v)?);
@@ -2452,9 +2445,541 @@ fn geo_near(spec: &Document) -> Option<Document> {
     Some(out)
 }
 
+/// A pipeline run against collection `coll` -- an `aggregate`'s own, a
+/// `$facet`'s, or a `$unionWith`'s or `$lookup`'s -- each stage as the
+/// stages it parses into, a leading `$rankFusion` or `$scoreFusion`
+/// desugared. Those two take the collection for the
+/// `$unionWith` each input pipeline after the first becomes, and must be
+/// the pipeline's first stage (mongod 8.2.11 refuses one after it).
+fn pipeline_shape(db: &str, coll: &str, stages: &[Bson]) -> Option<Vec<Bson>> {
+    let mut out = Vec::new();
+    for (at, stage) in stages.iter().enumerate() {
+        let stage = stage.as_document()?;
+        let shaped = match (stage.len(), stage.iter().next()) {
+            (1, Some((name, _))) if at > 0 && (name == "$rankFusion" || name == "$scoreFusion") => {
+                return None;
+            }
+            (1, Some((name, Bson::Document(spec)))) if name == "$rankFusion" => {
+                rank_fusion(db, coll, spec)?
+            }
+            (1, Some((name, Bson::Document(spec)))) if name == "$scoreFusion" => {
+                score_fusion(db, coll, spec)?
+            }
+            _ => stage_shape(db, coll, stage)?,
+        };
+        out.extend(shaped.into_iter().map(Bson::Document));
+    }
+    Some(out)
+}
+
+/// The shape of a stage this module builds as a user would write it.
+fn built(db: &str, coll: &str, stage: Document) -> Option<Vec<Document>> {
+    stage_shape(db, coll, &stage)
+}
+
+/// `FieldPath::validateFieldName`, which a `$rankFusion` or `$scoreFusion`
+/// input pipeline's name must pass.
+fn valid_field_name(name: &str) -> bool {
+    !name.is_empty() && !name.starts_with('$') && !name.contains('.') && !name.contains('\0')
+}
+
+/// A hybrid search's input pipelines, by name in `std::map` order (the
+/// order mongod desugars them in), each checked as
+/// `hybrid_scoring_util::isSelectionPipeline` checks it. A pipeline
+/// mongod would refuse, or one using a stage this server cannot run
+/// (`$search`, `$vectorSearch`), has no shape.
+fn fusion_inputs(input: &Document) -> Option<std::collections::BTreeMap<&str, &Vec<Bson>>> {
+    let mut out = std::collections::BTreeMap::new();
+    let pipelines = input.get_document("pipelines").ok()?;
+    // "A hybrid scoring stage should be run with at least one pipeline."
+    if pipelines.is_empty() {
+        return None;
+    }
+    for (name, pipeline) in pipelines {
+        let stages = pipeline.as_array()?;
+        if !valid_field_name(name) || stages.is_empty() {
+            return None;
+        }
+        for stage in stages {
+            let stage = stage.as_document()?;
+            let (op, spec) = stage.iter().next()?;
+            let selection = match op.as_str() {
+                "$_internalInhibitOptimization"
+                | "$limit"
+                | "$match"
+                | "$sample"
+                | "$score"
+                | "$skip"
+                | "$sort" => true,
+                "$geoNear" => {
+                    let spec = spec.as_document()?;
+                    !spec.contains_key("distanceField") && !spec.contains_key("includeLocs")
+                }
+                // A nested hybrid search is refused (10473002, 10473003);
+                // the search stages need mongot.
+                _ => false,
+            };
+            if !selection {
+                return None;
+            }
+        }
+        out.insert(name.as_str(), stages);
+    }
+    Some(out)
+}
+
+/// The first stage's name.
+fn first_stage(stages: &[Bson]) -> Option<&str> {
+    stages
+        .first()?
+        .as_document()?
+        .keys()
+        .next()
+        .map(String::as_str)
+}
+
+/// Whether any stage is `name`.
+fn has_stage(stages: &[Bson], name: &str) -> bool {
+    stages
+        .iter()
+        .any(|s| s.as_document().is_some_and(|d| d.contains_key(name)))
+}
+
+/// Whether a `$match` filter holds a `$text` predicate
+/// (`DocumentSourceMatch::containsTextOperator`).
+fn has_text(filter: &Document) -> bool {
+    filter.iter().any(|(k, v)| {
+        k == "$text"
+            || matches!(k.as_str(), "$and" | "$or" | "$nor")
+                && v.as_array()
+                    .is_some_and(|a| a.iter().any(|c| c.as_document().is_some_and(has_text)))
+    })
+}
+
+/// Whether a pipeline's `$match` with `$text` makes it produce a `score`
+/// (`Pipeline::generatesMetadataType(kScore)` over the selection stages
+/// [`fusion_inputs`] admits).
+fn generates_score(stages: &[Bson]) -> bool {
+    stages.iter().any(|s| {
+        s.as_document()
+            .and_then(|d| d.get_document("$match").ok())
+            .is_some_and(has_text)
+    })
+}
+
+/// `hybrid_scoring_util::validateWeights`: each weight a non-negative
+/// number naming an input pipeline.
+fn fusion_weights(weights: &Document, names: &[&str]) -> Option<()> {
+    for (name, w) in weights {
+        if !names.contains(&name.as_str()) || number(w)? < 0.0 {
+            return None;
+        }
+    }
+    Some(())
+}
+
+/// `scoreDetails`, a bool defaulting to false.
+fn score_details_flag(spec: &Document) -> Option<bool> {
+    match spec.get("scoreDetails") {
+        None => Some(false),
+        Some(Bson::Boolean(b)) => Some(*b),
+        Some(_) => None,
+    }
+}
+
+/// `$rankFusion`, as the pipeline `DocumentSourceRankFusion::createFromBson`
+/// desugars it into (mongod 8.2.11, `document_source_rank_fusion.cpp`):
+/// each input pipeline, the first inline and the rest in a `$unionWith`,
+/// followed by its documents' rank and reciprocal-rank score, then the
+/// `$group` that fuses them, the final score and the sort on it.
+fn rank_fusion(db: &str, coll: &str, spec: &Document) -> Option<Vec<Document>> {
+    if spec
+        .keys()
+        .any(|k| !["input", "combination", "scoreDetails"].contains(&k.as_str()))
+    {
+        return None;
+    }
+    let input = spec.get_document("input").ok()?;
+    if input.keys().any(|k| k != "pipelines") {
+        return None;
+    }
+    let inputs = fusion_inputs(input)?;
+    let names: Vec<&str> = inputs.keys().copied().collect();
+    if let Some(c) = spec.get("combination") {
+        let c = c.as_document()?;
+        if c.keys().any(|k| k != "weights") {
+            return None;
+        }
+        fusion_weights(c.get_document("weights").ok()?, &names)?;
+    }
+    let details = score_details_flag(spec)?;
+    let mut out = Vec::new();
+    for (at, (name, stages)) in inputs.iter().enumerate() {
+        // `rankFusionBsonPipelineValidator`: no `$score`, and ranked -- an
+        // implicitly ranked first stage or a `$sort`.
+        if has_stage(stages, "$score")
+            || !(first_stage(stages) == Some("$geoNear") || has_stage(stages, "$sort"))
+        {
+            return None;
+        }
+        let mut shaped: Vec<Document> = pipeline_shape(db, coll, stages)?
+            .into_iter()
+            .map(|b| b.as_document().cloned())
+            .collect::<Option<_>>()?;
+        let rank = format!("{name}_rank");
+        let score = format!("{name}_score");
+        shaped.extend(built(
+            db,
+            coll,
+            doc! { "$replaceWith": { "docs": "$$ROOT" } },
+        )?);
+        shaped.push(doc! { "$_internalSetWindowFields": {
+            "sortBy": { "order": 1 },
+            "output": { &rank: { "$rank": {} } },
+        } });
+        shaped.extend(built(
+            db,
+            coll,
+            doc! { "$addFields": { &score: { "$multiply": [
+                { "$divide": [1, { "$add": [format!("${rank}"), 60] }] },
+                1.0,
+            ] } } },
+        )?);
+        if details {
+            let value = if generates_score(stages) {
+                doc! { "value": { "$meta": "score" }, "details": [] }
+            } else {
+                doc! { "details": [] }
+            };
+            shaped.extend(built(
+                db,
+                coll,
+                doc! { "$addFields": { format!("{name}_scoreDetails"): value } },
+            )?);
+        }
+        if at == 0 {
+            out.extend(shaped);
+        } else {
+            let pipeline: Vec<Bson> = shaped.into_iter().map(Bson::Document).collect();
+            out.push(doc! { "$unionWith": { "coll": coll, "pipeline": pipeline } });
+        }
+    }
+    let path = |name: &str, suffix: &str| format!("${name}_{suffix}");
+    let mut group = doc! { "_id": "$docs._id", "docs": { "$first": "$docs" } };
+    for name in &names {
+        group.insert(
+            format!("{name}_score"),
+            doc! { "$max": { "$ifNull": [path(name, "score"), 0] } },
+        );
+        if details {
+            group.insert(
+                format!("{name}_rank"),
+                doc! { "$max": { "$ifNull": [path(name, "rank"), 0] } },
+            );
+            group.insert(
+                format!("{name}_scoreDetails"),
+                doc! { "$mergeObjects": path(name, "scoreDetails") },
+            );
+        }
+    }
+    let scores: Vec<Bson> = names
+        .iter()
+        .map(|n| Bson::String(path(n, "score")))
+        .collect();
+    out.extend(built(db, coll, doc! { "$group": group })?);
+    out.extend(built(
+        db,
+        coll,
+        doc! { "$addFields": { "score": { "$add": scores.clone() } } },
+    )?);
+    let ranks: Document = names
+        .iter()
+        .map(|n| {
+            let rank = path(n, "rank");
+            let cond = doc! { "$cond": [
+                { "$eq": [&rank, 0] },
+                { "$literal": "NA" },
+                &rank,
+            ] };
+            (format!("{n}_rank"), Bson::Document(cond))
+        })
+        .collect();
+    out.extend(built(db, coll, doc! { "$addFields": ranks })?);
+    if details {
+        let calculated: Vec<Bson> = names
+            .iter()
+            .map(|n| {
+                let rank = path(n, "rank");
+                Bson::Document(doc! { "$mergeObjects": [
+                    {
+                        "inputPipelineName": *n,
+                        "rank": &rank,
+                        "weight": { "$cond": [{ "$eq": [&rank, "NA"] }, "$$REMOVE", 1.0] },
+                    },
+                    path(n, "scoreDetails"),
+                ] })
+            })
+            .collect();
+        out.extend(built(
+            db,
+            coll,
+            doc! { "$addFields": { "calculatedScoreDetails": calculated } },
+        )?);
+        let value = doc! {
+            "value": "$score",
+            "description": "value output by reciprocal rank fusion algorithm",
+            "details": "$calculatedScoreDetails",
+        };
+        out.push(doc! { "$setMetadata": { "scoreDetails": sub_expr(&Bson::Document(value))? } });
+    } else {
+        let score = sub_expr(&Bson::Document(doc! { "$add": scores }))?;
+        out.push(doc! { "$setMetadata": { "score": score } });
+    }
+    out.extend(built(
+        db,
+        coll,
+        doc! { "$sort": { "score": -1, "_id": 1 } },
+    )?);
+    out.extend(built(
+        db,
+        coll,
+        doc! { "$replaceRoot": { "newRoot": "$docs" } },
+    )?);
+    Some(out)
+}
+
+/// `$scoreFusion`, as the pipeline
+/// `DocumentSourceScoreFusion::createFromBson` desugars it into (mongod
+/// 8.2.11, `document_source_score_fusion.cpp`): each input pipeline, the
+/// first inline and the rest in a `$unionWith`, nesting its documents and
+/// keeping its weighted, normalized score, then the `$group` and `$reduce`
+/// that fuse them, the combined score and the sort on it.
+fn score_fusion(db: &str, coll: &str, spec: &Document) -> Option<Vec<Document>> {
+    const DOCS: &str = "_internal_scoreFusion_docs";
+    const FIELDS: &str = "_internal_scoreFusion_internal_fields";
+    if spec
+        .keys()
+        .any(|k| !["input", "combination", "scoreDetails"].contains(&k.as_str()))
+    {
+        return None;
+    }
+    let input = spec.get_document("input").ok()?;
+    if input
+        .keys()
+        .any(|k| k != "pipelines" && k != "normalization")
+    {
+        return None;
+    }
+    let normalization = input.get_str("normalization").ok()?;
+    if !["none", "sigmoid", "minMaxScaler"].contains(&normalization) {
+        return None;
+    }
+    let inputs = fusion_inputs(input)?;
+    let names: Vec<&str> = inputs.keys().copied().collect();
+    // `ScoreFusionScoringOptions`: `avg` unless `method` says otherwise;
+    // an `expression` only with `method: "expression"`, and never with
+    // `weights`.
+    let mut expression = None;
+    if let Some(c) = spec.get("combination") {
+        let c = c.as_document()?;
+        if c.keys()
+            .any(|k| !["weights", "method", "expression"].contains(&k.as_str()))
+        {
+            return None;
+        }
+        if let Some(w) = c.get("weights") {
+            fusion_weights(w.as_document()?, &names)?;
+        }
+        match c.get("method") {
+            None => {}
+            Some(Bson::String(m)) if m == "avg" => {
+                if c.contains_key("expression") {
+                    return None;
+                }
+            }
+            Some(Bson::String(m)) if m == "expression" => {
+                if c.contains_key("weights") {
+                    return None;
+                }
+                expression = Some(c.get("expression")?);
+            }
+            Some(_) => return None,
+        }
+    }
+    let details = score_details_flag(spec)?;
+    let field = |name: &str, suffix: &str| format!("{FIELDS}.{name}_{suffix}");
+    let mut out = Vec::new();
+    for (at, (name, stages)) in inputs.iter().enumerate() {
+        // `scoreFusionBsonPipelineValidator`: scored -- a first `$match`
+        // with `$text`, or a `$score`.
+        let text_first = stages
+            .first()
+            .and_then(Bson::as_document)
+            .and_then(|d| d.get_document("$match").ok())
+            .is_some_and(has_text);
+        if !text_first && !has_stage(stages, "$score") {
+            return None;
+        }
+        let mut shaped: Vec<Document> = pipeline_shape(db, coll, stages)?
+            .into_iter()
+            .map(|b| b.as_document().cloned())
+            .collect::<Option<_>>()?;
+        let meta = Bson::Document(doc! { "$meta": "score" });
+        let normalized = if normalization == "sigmoid" {
+            Bson::Document(doc! { "$sigmoid": meta.clone() })
+        } else {
+            meta.clone()
+        };
+        shaped.extend(built(
+            db,
+            coll,
+            doc! { "$replaceWith": { DOCS: "$$ROOT" } },
+        )?);
+        shaped.extend(built(
+            db,
+            coll,
+            doc! { "$addFields": { field(name, "score"): { "$multiply": [normalized, 1.0] } } },
+        )?);
+        if details {
+            shaped.extend(built(
+                db,
+                coll,
+                doc! { "$addFields": { field(name, "rawScore"): meta } },
+            )?);
+            shaped.extend(built(
+                db,
+                coll,
+                doc! { "$addFields": { field(name, "scoreDetails"): { "details": [] } } },
+            )?);
+        }
+        if normalization == "minMaxScaler" {
+            let score = field(name, "score");
+            shaped.push(doc! { "$_internalSetWindowFields": {
+                "sortBy": { &score: -1 },
+                "output": { &score: {
+                    "$minMaxScaler": { "input": format!("${score}"), "min": 0, "max": 1 },
+                    "window": { "documents": ["unbounded", "unbounded"] },
+                } },
+            } });
+        }
+        if at == 0 {
+            out.extend(shaped);
+        } else {
+            let pipeline: Vec<Bson> = shaped.into_iter().map(Bson::Document).collect();
+            out.push(doc! { "$unionWith": { "coll": coll, "pipeline": pipeline } });
+        }
+    }
+    let mut push = Document::new();
+    let mut initial = Document::new();
+    let mut reduce_in = Document::new();
+    for name in &names {
+        let mut kept = vec![("score", true)];
+        if details {
+            kept.extend([("rawScore", true), ("scoreDetails", false)]);
+        }
+        for (suffix, number) in kept {
+            let key = format!("{name}_{suffix}");
+            let path = format!("${}", field(name, suffix));
+            if number {
+                push.insert(&key, doc! { "$ifNull": [path, 0] });
+                initial.insert(&key, 0);
+                reduce_in.insert(
+                    &key,
+                    doc! { "$max": [format!("$$value.{key}"), format!("$$this.{key}")] },
+                );
+            } else {
+                push.insert(&key, path);
+                initial.insert(&key, Document::new());
+                reduce_in.insert(
+                    &key,
+                    doc! { "$mergeObjects": [format!("$$value.{key}"), format!("$$this.{key}")] },
+                );
+            }
+        }
+    }
+    out.extend(built(
+        db,
+        coll,
+        doc! { "$group": {
+            "_id": format!("${DOCS}._id"),
+            DOCS: { "$first": format!("${DOCS}") },
+            FIELDS: { "$push": push },
+        } },
+    )?);
+    out.extend(built(
+        db,
+        coll,
+        doc! { "$project": {
+            DOCS: 1,
+            FIELDS: { "$reduce": {
+                "input": format!("${FIELDS}"),
+                "initialValue": initial,
+                "in": reduce_in,
+            } },
+        } },
+    )?);
+    out.extend(built(
+        db,
+        coll,
+        doc! { "$replaceRoot": { "newRoot": { "$mergeObjects": [format!("${DOCS}"), "$$ROOT"] } } },
+    )?);
+    out.extend(built(db, coll, doc! { "$project": { DOCS: 0 } })?);
+    let scores = names.iter().map(|n| format!("${}", field(n, "score")));
+    let combined = match expression {
+        Some(e) => {
+            let vars: Document = names
+                .iter()
+                .zip(scores)
+                .map(|(n, s)| (n.to_string(), Bson::String(s)))
+                .collect();
+            doc! { "$let": { "vars": vars, "in": e.clone() } }
+        }
+        None => doc! { "$avg": scores.map(Bson::String).collect::<Vec<_>>() },
+    };
+    out.push(doc! { "$setMetadata": { "score": sub_expr(&Bson::Document(combined))? } });
+    if details {
+        let calculated: Vec<Bson> = names
+            .iter()
+            .map(|n| {
+                Bson::Document(doc! { "$mergeObjects": [
+                    {
+                        "inputPipelineName": *n,
+                        "inputPipelineRawScore": format!("${}", field(n, "rawScore")),
+                        "weight": 1.0,
+                        "value": format!("${}", field(n, "score")),
+                    },
+                    format!("${}", field(n, "scoreDetails")),
+                ] })
+            })
+            .collect();
+        out.extend(built(
+            db,
+            coll,
+            doc! { "$addFields": { FIELDS: { "calculatedScoreDetails": calculated } } },
+        )?);
+        // Every string and the `combination` object are constants, whose
+        // representatives do not depend on their values.
+        let value = doc! {
+            "value": { "$meta": "score" },
+            "description": "the value calculated by combining the scores",
+            "normalization": normalization,
+            "combination": { "method": "average" },
+            "details": format!("${FIELDS}.calculatedScoreDetails"),
+        };
+        out.push(doc! { "$setMetadata": { "scoreDetails": sub_expr(&Bson::Document(value))? } });
+    }
+    out.extend(built(
+        db,
+        coll,
+        doc! { "$sort": { "score": { "$meta": "score" }, "_id": 1 } },
+    )?);
+    out.extend(built(db, coll, doc! { "$project": { FIELDS: 0 } })?);
+    Some(out)
+}
+
 /// A stage's representative shape, as the stages mongod parses it into
 /// (`$count` is a `$group` and a `$project`).
-fn stage_shape(db: &str, stage: &Document) -> Option<Vec<Document>> {
+fn stage_shape(db: &str, coll: &str, stage: &Document) -> Option<Vec<Document>> {
     if stage.len() != 1 {
         return None;
     }
@@ -2559,7 +3084,17 @@ fn stage_shape(db: &str, stage: &Document) -> Option<Vec<Document>> {
                         None => Document::new(),
                     };
                     out.insert("let", vars);
-                    out.insert("pipeline", pipeline_shape(db, p.as_array()?)?);
+                    let from = d.get_str("from").ok()?;
+                    let p = p.as_array()?;
+                    out.insert("pipeline", pipeline_shape(db, from, p)?);
+                    // `DocumentSourceLookUp::serializeToArray` flags a
+                    // hybrid search's join (`isHybridSearchPipeline`): the
+                    // hash covers it, and mongod 8.2.11's `$queryStats`
+                    // key, the debug shape, does not print it (measured
+                    // 2026-11-12).
+                    if !debug() && (has_stage(p, "$rankFusion") || has_stage(p, "$scoreFusion")) {
+                        out.insert("$_internalIsHybridSearch", true);
+                    }
                 }
                 None if d.contains_key("let") || !out.contains_key("localField") => return None,
                 None => {}
@@ -2570,7 +3105,12 @@ fn stage_shape(db: &str, stage: &Document) -> Option<Vec<Document>> {
             let facets = spec
                 .as_document()?
                 .iter()
-                .map(|(k, p)| Some((k.clone(), Bson::Array(pipeline_shape(db, p.as_array()?)?))))
+                .map(|(k, p)| {
+                    Some((
+                        k.clone(),
+                        Bson::Array(pipeline_shape(db, coll, p.as_array()?)?),
+                    ))
+                })
                 .collect::<Option<Document>>()?;
             vec![doc! { "$facet": facets }]
         }
@@ -2581,11 +3121,12 @@ fn stage_shape(db: &str, stage: &Document) -> Option<Vec<Document>> {
                     if d.keys().any(|k| k != "coll" && k != "pipeline") {
                         return None;
                     }
+                    let coll = d.get_str("coll").ok()?;
                     let pipeline = match d.get("pipeline") {
-                        Some(p) => pipeline_shape(db, p.as_array()?)?,
+                        Some(p) => pipeline_shape(db, coll, p.as_array()?)?,
                         None => Vec::new(),
                     };
-                    (d.get_str("coll").ok()?, pipeline)
+                    (coll, pipeline)
                 }
                 _ => return None,
             };
@@ -2654,7 +3195,7 @@ fn stage_shape(db: &str, stage: &Document) -> Option<Vec<Document>> {
             };
             vec![doc! { "$out": { "coll": coll, "db": out_db } }]
         }
-        "$merge" => vec![doc! { "$merge": merge(db, spec)? }],
+        "$merge" => vec![doc! { "$merge": merge(db, coll, spec)? }],
         "$geoNear" => vec![doc! { "$geoNear": geo_near(spec.as_document()?)? }],
         "$collStats" => vec![doc! { "$collStats": coll_stats(spec.as_document()?)? }],
         "$changeStream" => vec![doc! { "$changeStream": change_stream(spec.as_document()?)? }],
@@ -2891,12 +3432,120 @@ mod tests {
         );
     }
 
+    /// `$rankFusion` and `$scoreFusion` hash as the pipelines mongod
+    /// desugars them into: the hashes mongod 8.2.11 printed for these in
+    /// database `q358b` (`explain`, 2026-11-12) -- input pipelines out of
+    /// name order, weights, score details, each normalization, a custom
+    /// combination and a `$text` input.
+    #[test]
+    fn hybrid_search_hashes_match_mongods() {
+        let rf = Bson::Document(doc! { "$rankFusion": { "input": { "pipelines": {
+            "a": [{ "$sort": { "x": 1 } }],
+            "b": [{ "$sort": { "x": -1 } }],
+        } } } });
+        let cases = [
+            // rf_sd
+            (
+                doc! { "aggregate": "c", "pipeline": [{ "$rankFusion": { "input": { "pipelines": { "a": [{ "$sort": { "x": 1 } }], "b": [{ "$sort": { "x": -1 } }] } }, "scoreDetails": true } }], "cursor": {  } },
+                "0DB57D02ECD7B44779F4CA02AE53EFD8D5066264B8F87FA4C11610820F3D6BE4",
+            ),
+            // rf_w
+            (
+                doc! { "aggregate": "c", "pipeline": [{ "$rankFusion": { "input": { "pipelines": { "a": [{ "$sort": { "x": 1 } }], "b": [{ "$sort": { "x": -1 } }] } }, "combination": { "weights": { "a": 2 } } } }], "cursor": {  } },
+                "7291ED522A85B81F6F38DD08A3A6DCE7AAB55E3C4BA357D7AA1AE3E8251AC326",
+            ),
+            // rf_3
+            (
+                doc! { "aggregate": "c", "pipeline": [{ "$rankFusion": { "input": { "pipelines": { "b": [{ "$match": { "x": { "$gt": 0 } } }, { "$sort": { "x": 1 } }, { "$limit": 5 }], "a": [{ "$sort": { "x": -1 } }, { "$skip": 1 }], "Z": [{ "$geoNear": { "near": [0, 0] } }] } } } }], "cursor": {  } },
+                "4E91FE069C566F27612689C724B8A1D0F2AC1100D09A4F14747DD556AFEA0754",
+            ),
+            // rf_one
+            (
+                doc! { "aggregate": "c", "pipeline": [{ "$rankFusion": { "input": { "pipelines": { "only": [{ "$sort": { "x": 1, "y": -1 } }] } } } }], "cursor": {  } },
+                "205CDCE99EBDAFC76F41A860E804737D9D5A1D08D338E110E915280DAD487715",
+            ),
+            // rf_text_sd
+            (
+                doc! { "aggregate": "c", "pipeline": [{ "$rankFusion": { "input": { "pipelines": { "a": [{ "$match": { "$text": { "$search": "hello" } } }, { "$sort": { "s": { "$meta": "textScore" } } }], "b": [{ "$sort": { "x": 1 } }] } }, "scoreDetails": true } }], "cursor": {  } },
+                "89B59427C80532D4A1A3081D5B7D23DFB0D456870685BB3FBC309E2764F219FA",
+            ),
+            // sf_sig
+            (
+                doc! { "aggregate": "c", "pipeline": [{ "$scoreFusion": { "input": { "pipelines": { "a": [{ "$score": { "score": "$x" } }], "b": [{ "$score": { "score": { "$add": ["$x", 1] } } }] }, "normalization": "sigmoid" } } }], "cursor": {  } },
+                "78EA92F5DDA56783B9494981CE53BE7A6E0C7247C686BC74CD808D080C80E398",
+            ),
+            // sf_mm
+            (
+                doc! { "aggregate": "c", "pipeline": [{ "$scoreFusion": { "input": { "pipelines": { "a": [{ "$score": { "score": "$x" } }] }, "normalization": "minMaxScaler" } } }], "cursor": {  } },
+                "6A56C3B2A47726C95DDE639C5DB341C641749457A8E1FCD9F9D70568D16E2A51",
+            ),
+            // sf_expr
+            (
+                doc! { "aggregate": "c", "pipeline": [{ "$scoreFusion": { "input": { "pipelines": { "a": [{ "$score": { "score": "$x" } }], "b": [{ "$score": { "score": "$x" } }] }, "normalization": "none" }, "combination": { "method": "expression", "expression": { "$add": ["$$a", { "$multiply": ["$$b", 2] }] } } } }], "cursor": {  } },
+                "D61769AF3672C0DD39E42A105804F93B11F2D7386A06D366D6F5091AD7649426",
+            ),
+            // sf_w
+            (
+                doc! { "aggregate": "c", "pipeline": [{ "$scoreFusion": { "input": { "pipelines": { "a": [{ "$score": { "score": "$x" } }], "b": [{ "$score": { "score": "$x" } }] }, "normalization": "none" }, "combination": { "weights": { "b": 0.5 }, "method": "avg" } } }], "cursor": {  } },
+                "AC682F5060B25B9D2D3D65E47DBB660C6C347B604061B4548D5EFE422877C881",
+            ),
+            // sf_sd
+            (
+                doc! { "aggregate": "c", "pipeline": [{ "$scoreFusion": { "input": { "pipelines": { "a": [{ "$score": { "score": "$x" } }], "b": [{ "$match": { "x": 1 } }, { "$score": { "score": "$x", "normalization": "sigmoid", "weight": 0.5 } }] }, "normalization": "none" }, "scoreDetails": true } }], "cursor": {  } },
+                "012F43083D247EF5FC73EC29F38767D7E1E9C9289801742E8935A36F5D048263",
+            ),
+            // sf_sd_expr
+            (
+                doc! { "aggregate": "c", "pipeline": [{ "$scoreFusion": { "input": { "pipelines": { "a": [{ "$score": { "score": "$x" } }] }, "normalization": "none" }, "scoreDetails": true, "combination": { "method": "expression", "expression": { "$add": ["$$a", 1] } } } }], "cursor": {  } },
+                "0A70C8DE1BB3614C02BEF148919813B68BBF842DAB25ADE8C58E198E718FBEEF",
+            ),
+            // sf_text
+            (
+                doc! { "aggregate": "c", "pipeline": [{ "$scoreFusion": { "input": { "pipelines": { "a": [{ "$match": { "$text": { "$search": "hello" } } }] }, "normalization": "none" } } }], "cursor": {  } },
+                "C885CC9CAF3B56E803995684CCE44B4873A3C5FD706AA9F475A0E77FC68B050D",
+            ),
+            // sf_text_sd
+            (
+                doc! { "aggregate": "c", "pipeline": [{ "$scoreFusion": { "input": { "pipelines": { "a": [{ "$match": { "$text": { "$search": "hello" } } }, { "$limit": 3 }] }, "normalization": "none" }, "scoreDetails": true } }], "cursor": {  } },
+                "4436A83F3574B01407F25D1D0C0B3B4A465B0628F15E9786DC8C203196D77E98",
+            ),
+            // `$geoNear`'s `distanceField` is optional.
+            (
+                doc! { "aggregate": "c", "pipeline": [{ "$geoNear": { "near": [0, 0] } }], "cursor": {} },
+                "63CC52833F6A590FE83AA9D389F1BFD5E530AB2C5E870774A85BD5B1D58F0C67",
+            ),
+            // Nested, a hybrid search runs against the collection of the
+            // stage that holds it.
+            (
+                doc! { "aggregate": "c", "pipeline": [{ "$unionWith": { "coll": "o", "pipeline": [rf.clone()] } }], "cursor": {} },
+                "83ED2D2FA9B9E84CB31C3D28BEA296F51B5ADD9D95F73A901571468480917BBB",
+            ),
+            (
+                doc! { "aggregate": "c", "pipeline": [{ "$lookup": { "from": "o", "as": "j", "pipeline": [rf.clone()] } }], "cursor": {} },
+                "9D31F3C70DE4DF920AF6AE099BD1EA37408E280FB7713572902A80E707CC22BF",
+            ),
+            (
+                doc! { "aggregate": "c", "pipeline": [{ "$facet": { "f": [rf.clone()] } }], "cursor": {} },
+                "47D1504A5E226EEFC2CC5895CECB27DC9C1E1FB0682B929C3830CBACB6908C28",
+            ),
+        ];
+        for (command, expected) in cases {
+            assert_eq!(
+                hash("q358b", &command).as_deref(),
+                Some(expected),
+                "{command}"
+            );
+        }
+    }
+
     #[test]
     fn what_it_cannot_shape_has_no_hash() {
         assert_eq!(
             hash("d", &doc! { "find": "c", "filter": { "$jsonSchema": {} } }),
             None
         );
+        // mongod refuses a hybrid search with no input pipeline, and one
+        // that is not the pipeline's first stage.
         let rank_fusion = doc! { "$rankFusion": { "input": { "pipelines": {} } } };
         assert_eq!(
             hash(
@@ -2905,6 +3554,15 @@ mod tests {
             ),
             None
         );
+        let rank_fusion = doc! { "$rankFusion": { "input": { "pipelines": { "a": [{ "$sort": { "x": 1 } }] } } } };
+        let second = doc! {
+            "aggregate": "c",
+            "pipeline": [{ "$match": { "x": 1 } }, rank_fusion.clone()],
+            "cursor": {},
+        };
+        assert_eq!(hash("d", &second), None);
+        let first = doc! { "aggregate": "c", "pipeline": [rank_fusion], "cursor": {} };
+        assert!(hash("d", &first).is_some());
         assert_eq!(hash("d", &doc! { "count": "c" }), None);
         let find = doc! { "find": "c", "filter": { "x": 1 } };
         assert_eq!(hash("admin", &find), None);

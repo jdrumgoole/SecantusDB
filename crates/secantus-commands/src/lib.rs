@@ -983,6 +983,8 @@ fn dispatch_named(doc: &Document, ctx: &mut CommandContext) -> Document {
         let logged = lastop::fold(ctx);
         if name == "createIndexes" && ctx.replica_set_name.is_some() {
             lastop::move_to_system(ctx);
+        } else if lastop::entry_point_fixes(name, doc, ctx, last_op_before) {
+            lastop::set_last_op_to_system(ctx);
         }
         logged
     };

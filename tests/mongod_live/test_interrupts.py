@@ -95,12 +95,19 @@ class Slow:
         outer = 1_000
         while True:
             self.seed(1, outer=outer)
-            began = time.monotonic()
-            self.run({"find": "c", "filter": SLOW})
-            took = time.monotonic() - began
+            took = min(self._timed_find() for _ in range(3))
             if took > 0.2:
                 return int(outer * 2.0 / took)
             outer *= 10
+
+    def _timed_find(self) -> float:
+        """One `find` of the seeded document, in seconds. The size is taken
+        from the fastest of three: a moment of load can only make a document
+        look slower, and sizing from it would make the documents too small
+        for a kill 0.3 s in to find them running."""
+        began = time.monotonic()
+        self.run({"find": "c", "filter": SLOW})
+        return time.monotonic() - began
 
     def seed(self, n: int, per_doc: float = 2.0, *, outer: int | None = None) -> None:
         """`n` documents, each taking about `per_doc` seconds to test."""
@@ -173,6 +180,13 @@ class Slow:
             while not until():
                 assert time.monotonic() < deadline, "the command made no progress in 60 s"
                 time.sleep(0.02)
+        # A command that already answered was never interrupted, whatever
+        # the server: its reply says nothing about a kill. Say so rather than
+        # compare it as though it were a killed command's.
+        assert thread.is_alive(), (
+            f"the command answered before the kill was sent (documents sized "
+            f"too small for this load?): {command}, reply {replies}"
+        )
         kill = self.kill(how, lsid, match)
         thread.join(120)
         assert replies, "the operation never answered"
@@ -242,7 +256,7 @@ def test_each_command_answers_its_interruption(rust_mongo: Any, mongod_rs: Any) 
     is written."""
     for name, command in _COMMANDS.items():
         theirs = _killed_command(mongod_rs, command)
-        assert theirs[0]["code"] == 11601 and theirs[1] == (1, 0), (name, theirs)
+        assert theirs[0].get("code") == 11601 and theirs[1] == (1, 0), (name, theirs)
         same(_killed_command(rust_mongo, command), theirs)
 
 

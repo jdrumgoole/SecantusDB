@@ -251,6 +251,24 @@ mod tests {
         assert_eq!(v[0], 9);
     }
 
+    /// Past the insertion-sort threshold, introsort moves equal elements:
+    /// 200 positions over ten keys (RM-312's gap test) put the twenty of
+    /// the least key in libstdc++'s order. The model reproduces g++ 15.2's
+    /// order for the 40 documents of RM-402 (`sorter`'s test).
+    #[test]
+    fn introsort_leaves_equal_elements_where_libstdcxx_does() {
+        let key = |i: usize| (i.is_multiple_of(2), i % 5);
+        let mut v: Vec<usize> = (1..=200).collect();
+        sort(&mut v, &|a, b| key(*a) < key(*b));
+        assert_eq!(
+            v[..20],
+            [
+                165, 25, 155, 55, 65, 145, 185, 75, 135, 15, 45, 85, 175, 125, 95, 195, 5, 115,
+                105, 35
+            ]
+        );
+    }
+
     /// Equal keys, told apart by a tag: libstdc++'s insertion sort keeps
     /// equal elements in place.
     #[test]

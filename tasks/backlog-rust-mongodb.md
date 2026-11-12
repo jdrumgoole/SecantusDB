@@ -581,14 +581,12 @@ These are explicit non-goals. Don't add them without a reason.
       counts mongod's flow control tickets (one per global IX taken apart)
       and a retryable write's session checkout and session row, and a
       journal wait (`j`, `w: "majority"`) its transition lock and global
-      IS, so an insert, `drop` or `create` reads as mongod 8.2.11's. Still
-      different, measured against a one-member replica set:
-      - a command other than `insert`, `update` and `delete` that writes
-        nothing (`create` of a collection there): mongod reads the latest
-        optime for the client's last op under the global IS with the
-        transition lock (`setLastOpToSystemLastOpTime`), once; those three
-        do it as mongod does since RM-360 (`lastop.rs`), and
-        `createIndexes`'s read is among the rounds its line already counts;
+      IS, so an insert, `drop` or `create` reads as mongod 8.2.11's; since
+      2026-11-12 a command that took the global lock in IX and logged
+      nothing (`create` of a collection there, `drop` or `dropIndexes` of
+      one not there) reads the latest optime for its last op as mongod's
+      entry point does (`lastop::entry_point_fixes`). Still different,
+      measured against a one-member replica set:
       - an `insert` of several documents one of which fails: mongod inserts
         them again a document at a time, each under a transition, global,
         database and collection lock of its own
@@ -606,7 +604,9 @@ These are explicit non-goals. Don't add them without a reason.
         more transition, global and collection IX), and one that removes
         takes a single round;
       - `collMod` and `$out` take more transition locks than this server's
-        rounds (`$out`'s were measured on a standalone, RM-185);
+        rounds (`$out`'s were measured on a standalone, RM-185), and an
+        `$out`'s line here has one global IS more than mongod's (7 to 6,
+        measured 8.2.11 2026-11-12);
       - each global lock taken apart takes an execution ticket, so where
         these locks differ the line's `queues.execution` admissions differ
         too (RM-355; `collMod`'s line has 3 here, 4 on mongod);
@@ -618,6 +618,18 @@ These are explicit non-goals. Don't add them without a reason.
         (four in its entry, four execution admissions) and once here.
       Backlog-ID: RM-357
       Verify: tests/backlog/test_rm_355_364.py::test_more_writes_report_mongods_locks
+- [ ] **A standalone's write concern is a replica set's.** `secantusd-rs
+      --standalone` keeps the member's write-concern machinery: a write sent
+      with no write concern takes the implicit `w: "majority"` and waits for
+      the journal (one more transition IX and global IS in its `locks`), and
+      `setDefaultRWConcern` and `getDefaultRWConcern` answer. mongod 8.2.11
+      as a standalone implies `w: 1` (no journal wait) and refuses both with
+      51300 (measured 2026-11-12). RM-185's lock comparison, which runs this
+      server as a standalone, sets a stored `w: 1` default until this is
+      fixed (`tests/backlog/test_rm_185_locks.py`, `rust_mongo`): the fix
+      drops that call.
+      Backlog-ID: RM-551
+      Verify: tests/backlog/test_rm_standalone_write_concern.py::test_a_standalone_implies_w_1
 - [ ] **Some queries have no `queryShapeHash`.** Since 2026-11-07 a
       `find`'s, `distinct`'s and `aggregate`'s line, profile entry and
       `explain` carry mongod's `queryShapeHash` (`secantus-commands`
@@ -626,14 +638,16 @@ These are explicit non-goals. Don't add them without a reason.
       accumulators with arguments of their own, the stages mongod desugars,
       change streams, `aggregate: 1` and DBPointer literals
       (`tests/mongod_live/test_query_shape_hash.py`, against mongod
-      8.2.11). A query using one of these prints none, where mongod prints
-      one:
+      8.2.11); since 2026-11-12 `$rankFusion` and `$scoreFusion`, as the
+      pipelines mongod desugars them into, and a `$geoNear` with no
+      `distanceField`. A query using one of these prints none, where mongod
+      prints one:
       - `$jsonSchema`, which mongod shapes as the `$_internalSchema*`
         predicates its JSON Schema parser translates the schema into
-        (`json_schema_parser.cpp`, each keyword's translation);
-      - `$rankFusion` and `$scoreFusion`, which it shapes as the 10-15
-        stage pipelines it desugars them into (window ranks, `$unionWith`
-        per input pipeline, `$group`, `$setMetadata`);
+        (`json_schema_parser.cpp`, about 1,950 lines in 8.2.11, and the
+        serializer of each of the ~18 internal predicates it builds);
+      - a `$rankFusion` or `$scoreFusion` input of `$search` or
+        `$vectorSearch`, which need mongot;
       - options measured nowhere yet: a `$lookup` `from` naming another
         database, `$out` to a time-series collection, change stream
         options beyond `fullDocument`, `fullDocumentBeforeChange`,
@@ -642,14 +656,39 @@ These are explicit non-goals. Don't add them without a reason.
       the shaped ones were.
       Backlog-ID: RM-358
       Verify: tests/backlog/test_rm_355_364.py::test_a_query_of_every_kind_names_its_query_shape
-- [ ] **An `explain` of `$planCacheStats` fails.** mongod 8.2.11 explains
-      `aggregate` of `[{$planCacheStats: {}}]`: `stages` holds
-      `{$planCacheStats: {allHosts: false}}`, then `queryShapeHash`. This
-      server's `explain` runs the pipeline against a namespace of its own
-      (`explain.dry.run`, `explain/mod.rs`) and fails with 50933 (`collection
-      '<db>.explain.dry.run' does not exist`). Found 2026-11-09 (RM-358).
-      Verify: tests/backlog/test_rm_found_rm358.py::test_an_explain_of_plan_cache_stats_names_its_stage
-      Backlog-ID: RM-466
+- [ ] **An `explain` of `$geoNear` fails.** mongod 8.2.11 explains
+      `aggregate` of `[{$geoNear: {near: [0, 0]}}]` over a collection with
+      a `2d` index, with or without `distanceField`, and prints its
+      `queryShapeHash`. This server runs the stage itself, but its
+      `explain` runs the pipeline against a namespace of its own
+      (`explain.dry.run`, `explain/mod.rs`) and fails with 26 (`$geoNear
+      requires a geo index to run, but <db>.explain.dry.run does not
+      exist`), as RM-466 did for `$planCacheStats`. A `$rankFusion` with a
+      `$geoNear` input fails the same way. Found 2026-11-12 (RM-358).
+      Verify: tests/backlog/test_rm_found_rm358.py::test_an_explain_of_geo_near_runs
+      Backlog-ID: RM-552
+- [ ] **`$scoreFusion` combines by `"average"`, not `"avg"`.** mongod
+      8.2.11's `combination.method` is `"avg"` or `"expression"` (its IDL
+      enum, `kAvg: "avg"`) and refuses `"average"` with 2 (`Enumeration
+      value 'average' for field '$scoreFusion.combination.method' is not a
+      valid value.`); `"average"` is only the method's name in
+      `scoreDetails`. This server takes `"average"` and refuses `"avg"`
+      (`hybrid.rs`). Found 2026-11-12 (RM-358).
+      Verify: tests/backlog/test_rm_found_rm358.py::test_score_fusion_combines_by_avg
+      Backlog-ID: RM-553
+- [ ] **A later `$match` does not replace the one `$planCacheStats` absorbed.**
+      mongod 8.2.11's `$planCacheStats` absorbs the `$match` right after
+      it, and absorbs again, in place of the first, each `$match` a later
+      stage swaps ahead of itself (`doOptimizeAt` overwrites
+      `_absorbedMatch`): `[{$planCacheStats: {}}, {$match: {isActive:
+      false}}, {$project: {isActive: 1, works: 1}}, {$match: {works: {$gte:
+      0}}}]` returns every entry, the first filter lost. This server's stage
+      (`aggregate.rs`) keeps the first `$match` and runs the second after
+      the `$project`, returning none of three active entries. `explain`
+      already lists it as mongod does (`plan_cache::absorb_matches`, RM-466),
+      which the run could share. Found 2026-11-12 (RM-466).
+      Verify: tests/backlog/test_rm_found_rm466.py::test_a_later_match_replaces_the_one_plan_cache_stats_absorbed
+      Backlog-ID: RM-554
 - [ ] **An aggregate's top-k sort counts only the keys it kept.** mongod
       8.2.11 adds every document its sort read to
       `metrics.query.sort.totalKeysSorted` for a leading `$sort` and
@@ -1368,10 +1407,10 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       on macOS mongod 8.2.11, and libstdc++'s `std::sort` (g++ 15.2), the
       Linux build's, gives 0, 21, 18, 24, .... Since RM-402 the sorter here
       (`sorter::sort_held`) gives the Linux order for a `$sort` after
-      another stage, but these three take a stable order of their own: the
-      storage read's sort (`secantus-storage`, `compare_sort_keys`) for
-      `find` and a leading `$sort`, and the window stage's own sort. On
-      macOS the order also needs RM-526. Found 2026-11-10 working RM-402.
+      another stage, and since RM-312 so do `find` and a leading `$sort`
+      (the read's `SORT`, `explain/order.rs` and `explain/stream.rs`); the
+      window stage's own sort is still stable. On macOS the order also
+      needs RM-526. Found 2026-11-10 working RM-402.
       Verify: tests/backlog/test_rm_found_2026_11_10_rm402.py::test_tied_order_of_find_leading_sort_and_window
       Backlog-ID: RM-527
 - [ ] **A classic `$group` counts its held values' and `_id`'s memory
@@ -2295,28 +2334,6 @@ differs on 17 of 1,295. Pinned by
 
 What is left, on the RUST MongoDB server:
 
-- [ ] **The field order of a document upserted from two or more
-      equalities.** mongod: `{a: 1, b: 2, c: 3, d: 4}` gives `c, a, b, d`;
-      `{d: 1, c: 2, b: 3, a: 4}` gives `d, b, a, c`; an explicit `$and`
-      keeps the order written. This server sorts them.
-      mongod collects the equalities in an `EqualityMatches`, a
-      `StringDataMap` (an `absl::flat_hash_map`), and builds the document in
-      its iteration order (`update_driver.cpp` / `path_support.cpp`, 8.2);
-      absl seeds its hash per process. Measured on three mongod 8.2.11
-      processes at once: `{a, b, c, d}` gave `c, a, b, d` / `c, a, b, d` /
-      `b, a, c, d`, and one process ordered `{a, b, c, d}` and
-      `{d, c, b, a}` differently.
-      **Decided (Joe, 2026-11-12): model the hash.** Port the mechanism --
-      absl `flat_hash_map`'s hashing and iteration order over the
-      equalities' field names, with a per-process seed as absl takes it --
-      and build the upserted document in that order; an explicit `$and`
-      keeps the order written. No fixed order can equal a given mongod's,
-      so restate the gap test to assert what mongod guarantees and the
-      model reproduces: the order is a property of the process (stable
-      within one, not the sorted order across the measured inputs), and
-      `$and` keeps the written order.
-      Backlog-ID: RM-059
-      Verify: tests/backlog/test_rm_057_084.py::test_upsert_field_order_from_several_equalities
 - **`$where` in an update's query** is refused as a `--noscripting`
   mongod refuses it (the no-server-side-JavaScript scope decision, formerly
   RM-060): the statement's `writeErrors` entry, 6108304. Pinned by
@@ -2441,27 +2458,6 @@ What is left, all on the RUST MongoDB server:
       Found 2026-11-09 working RM-311.
       Verify: tests/backlog/test_rm_found_2026_11_09.py::test_explain_lists_a_match_after_the_cursor_in_written_order
       Backlog-ID: RM-444
-- [ ] **A blocking sort keeps equal documents in the order it read them;
-      mongod's sort does not.** Over 200 documents in runs of equal keys,
-      mongod 8.2.11's `find().sort({s: 1})` and `$sort` (with a collation
-      or without) return the equal documents in an order two mongod
-      processes agree on and that is not their arrival order (`25, 105, 95,
-      115, 5, ...` where they arrive `5, 15, 25, ...`): an unstable sort,
-      by its shape the C++ library's `std::sort` (not confirmed in the
-      source). This server's sort (`Storage::sort_permutation`) is stable.
-      `tools/probes/find_order.py`'s collections are small and show no
-      difference. A sort with a limit is the scope decision on its heap
-      (section 7.075).
-      **Decided (Joe, 2026-11-12): sort as libstdc++'s `std::sort` does.**
-      The exemplar is Linux mongod, which links libstdc++; reuse
-      `secantus-core/src/stl.rs`'s model (already used for SBE's heaps) for
-      the blocking sort, so equal keys come out in Linux mongod's order.
-      The macOS mongod measured here links libc++ and orders ties
-      differently; where the two differ, Linux is right. Pin the gap test
-      to the libstdc++ order (measure it on a Linux mongod 8.2, e.g. in
-      CI's mongod_live lane, rather than on this box).
-      Backlog-ID: RM-312
-      Verify: tests/backlog/test_rm_found_2026_10_25.py::test_a_blocking_sort_leaves_ties_as_mongods_sort_does
 - [ ] **`explain` of a `$unionWith` lists its sub-pipeline as written.**
       mongod 8.2.11 explains the sub-pipeline as it does the outer one: a
       `$cursor` of its own (its `queryPlanner`, and `executionStats` above
@@ -3285,29 +3281,6 @@ touched:
   or accept `storage` where mongod would give it, never drop the check.
   Backlog-ID: RM-448
   Verify: none -- an intermittent failure, 1 in 31 runs, whose counter is unknown
-- [ ] **RM-391's regression test fails on mongod's own timing under CI
-  load.** `tests/backlog/test_rm_found_2026_11_07d.py::test_a_write_tests_each_document_once`
-  first checks that mongod's write-to-`find` CPU ratio is under the 1.5
-  budget, then holds this server to it. In the `storage-engine
-  (ubuntu-latest)` job of PR #2671 (run 42938366642, 2026-11-11) the
-  FIRST assertion failed: mongod 8.2's `updateMany` measured 1.602, while
-  its `update` (1.057) and `findAndModify` (1.046) stayed well under, and
-  this server's side never ran. That snapshot's diff touched only
-  `secantus-pgplan` and PG tests, which the MongoDB server does not link,
-  so its binary was `main`'s. A ratio of minimum times over three rounds
-  is at the mercy of one fast `find` round: the finds were 0.57, 0.98 and
-  1.x s. The test needs a measurement that load on the runner cannot move
-  by a third, such as more rounds, a median, or the write and its `find`
-  interleaved. It must not get a wider budget, because 1.5 is what
-  separates once per document from twice. The previous PG snapshot's run
-  (2026-11-10 22:20) failed the same step on RM-417's test, also a timing
-  check. It happened again on PR #2676 (run 42963914378, 2026-11-11
-  05:31), on the same first assertion: this time mongod's `findAndModify`
-  measured 1.593 against finds of 0.687, 0.391 and 0.731 s. That is one
-  fast round again: two of that batch's four PG snapshots (#2671, #2676)
-  went red on this test alone.
-  Backlog-ID: RM-547
-  Verify: none -- a timing flake in the reference server's own measurement under CI load
 
 ## The macOS `test` lane wedges for its whole 30-minute cap, rarely (2026-09-18)
 

@@ -73,7 +73,7 @@ fn as_sort(stage: &Bson) -> Option<&Document> {
         .ok()
 }
 
-fn as_match(stage: &Bson) -> Option<&Document> {
+pub(crate) fn as_match(stage: &Bson) -> Option<&Document> {
     let d = stage.as_document().filter(|d| d.len() == 1)?;
     d.get_document("$match")
         .or_else(|_| d.get_document(PUSHED_MATCH))
