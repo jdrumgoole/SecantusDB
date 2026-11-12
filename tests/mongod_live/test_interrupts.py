@@ -27,6 +27,7 @@ import struct
 import threading
 import time
 import uuid
+from collections.abc import Callable
 from typing import Any
 
 import bson
@@ -143,8 +144,13 @@ class Slow:
         lsid: dict | None = None,
         match: dict | None = None,
         db: str = DB,
+        until: Callable[[], bool] | None = None,
     ) -> tuple:
-        """Run `command`, `how` it 0.3 s in, and return both replies."""
+        """Run `command`, `how` it 0.3 s in, and return both replies.
+
+        With `until`, the kill also waits for `until()` to hold, for a test
+        whose answer depends on how far the command got (see
+        `_killed_bulk_write`)."""
         replies: list = []
         thread = threading.Thread(
             target=lambda: replies.append(self.run(command, db=db)), daemon=True
@@ -162,6 +168,11 @@ class Slow:
             time.sleep(0.3)
             if self.run(running, db="admin")["cursor"]["firstBatch"]:
                 break
+        if until is not None:
+            deadline = time.monotonic() + 60
+            while not until():
+                assert time.monotonic() < deadline, "the command made no progress in 60 s"
+                time.sleep(0.02)
         kill = self.kill(how, lsid, match)
         thread.join(120)
         assert replies, "the operation never answered"
@@ -301,7 +312,21 @@ def _killed_bulk_write(client: Any, ordered: bool) -> tuple:
     # mongod lists a running bulkWrite under the op it runs (RM-324), this
     # server under the command.
     running = {"$or": [{"op": "bulkWrite"}, {"command.bulkWrite": 1}]}
-    reply, _ = slow.killed(command, "killSessions", lsid=lsid, match=running, db="admin")
+    # Kill it once its first update has committed. A kill at a fixed 0.3 s
+    # assumed the first update was done by then, which holds only while the
+    # box runs as fast as it did when `Slow` sized the documents: on a loaded
+    # CI runner (2026-11-11, main run 43115796507) mongod applied none of the
+    # fifty, and the `0 < applied` below failed on the reference server's
+    # own answer. Reproduced with each document ten times slower: applied 0
+    # in 16 of 16 runs, against 1-49 in 30 of 30 at the sized cost.
+    reply, _ = slow.killed(
+        command,
+        "killSessions",
+        lsid=lsid,
+        match=running,
+        db="admin",
+        until=lambda: slow.state()[1] > 0,
+    )
     _, applied = slow.state()
     # As for `update` (above), where the kill lands decides the wrapper.
     wrapper = "Plan executor error during update :: caused by :: "
