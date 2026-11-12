@@ -7763,3 +7763,32 @@ fn create_table_analyses_each_default() {
     assert_eq!(def.columns[0].default, Some(Bson::Int32(3)));
     assert!(def.columns[1].default_expr().is_some());
 }
+
+/// A constant DEFAULT whose folding raises a data error is kept as its
+/// expression, for the INSERT that runs it to raise, while a string
+/// literal's input error is CREATE's (RP-886, measured on PostgreSQL 15.19).
+#[test]
+fn a_default_that_does_not_fold_is_kept_as_its_expression() {
+    for sql in [
+        "create table t886 (a int default 1/0)",
+        "create table t886 (a int default 2147483647 + 1)",
+        "create table t886 (a int default 'x'::text::int)",
+        "create table t886 (a int2 default 100000)",
+    ] {
+        take_error_location();
+        let Statement::CreateTable(def, _) = plan_ok(sql) else {
+            panic!("not a CREATE TABLE: {sql}");
+        };
+        assert_eq!(def.columns[0].default, None, "{sql}");
+        assert!(def.columns[0].default_expr().is_some(), "{sql}");
+        assert_eq!(take_error_location(), None, "{sql}");
+    }
+    for sql in [
+        "create table t886 (a int default 'x')",
+        "create table t886 (a int default 'x' + 1)",
+        "create table t886 (a int default 1/0 + 'x'::int)",
+    ] {
+        let err = plan(sql, &lookup).expect_err(sql);
+        assert_eq!(err.sqlstate(), "22P02", "{sql}: {err}");
+    }
+}

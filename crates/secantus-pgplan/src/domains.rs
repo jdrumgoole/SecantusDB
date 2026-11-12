@@ -604,7 +604,7 @@ pub fn inherited_default(
         });
     };
     let raw = parse_default_sql(sql)?;
-    let (value, expr) = match default_value_or_expr(&raw, pg_type, &[])? {
+    let (value, expr) = match cooked_default_value_or_expr(&raw, pg_type, &[])? {
         DefaultSpec::Value(v) => (Some(v), None),
         DefaultSpec::Expr(e) => (None, Some(e)),
     };

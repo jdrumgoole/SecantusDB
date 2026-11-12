@@ -192,3 +192,65 @@ fn resolve(f: &FuncCall) -> Result<()> {
     }
     Err(e)
 }
+
+/// What `cookDefault` leaves of a DEFAULT whose folding raised `e` (RP-886):
+/// the analysis coerces each string literal to the type it meets, which runs
+/// that type's input function, and evaluates nothing else. So a literal's
+/// input error stands, at the declaration; any other error a constant
+/// raises (`1/0`, an overflow, a domain's CHECK) is the error of the first
+/// INSERT that uses the default, and `Ok` says to keep it as its
+/// expression. An error of the analysis itself (any class but data and
+/// integrity) stands as well.
+pub(crate) fn folding_error_stands(raw: &Node, pg_type: &str, e: Error) -> Result<()> {
+    if !["22", "23"].contains(&&e.sqlstate()[..2]) {
+        return Err(e);
+    }
+    // The whole default a literal: coerced to the column's type.
+    if let Some(s) = string_literal(raw) {
+        input(s, pg_type)?;
+        take_error_location();
+        return Ok(());
+    }
+    // A literal cast to a type is read by that type's input function
+    // (`'x'::int`); one an operator or a call types is coerced by the same
+    // function, to a type found only by resolving the operator, so it is
+    // known by the value the error quotes (`'x' + 1` is 22P02 for "x").
+    let message = e.to_string();
+    let mut quoted_literal = false;
+    walk_expr(&mut raw.clone(), &mut |n| {
+        if let Some(N::TypeCast(tc)) = n.node.as_mut() {
+            if let (Some(s), Some(tn)) = (tc.arg.as_deref().and_then(string_literal), &tc.type_name)
+            {
+                input(s, &type_name_of(tn))?;
+                tc.arg = None;
+            }
+        } else if let Some(s) = string_literal(n) {
+            quoted_literal |= message.contains(&format!("\"{s}\""));
+        }
+        Ok(())
+    })?;
+    if quoted_literal {
+        return Err(e);
+    }
+    take_error_location();
+    Ok(())
+}
+
+/// The value of a string constant (an `A_Const` of type unknown).
+fn string_literal(n: &Node) -> Option<&str> {
+    match n.node.as_ref()? {
+        N::AConst(c) => match c.val.as_ref()? {
+            pg_query::protobuf::a_const::Val::Sval(s) => Some(&s.sval),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// A string literal through the input function of `ty` (`stringTypeDatum`):
+/// a domain's base type's, since its CHECK is `CoerceToDomain`'s, which runs
+/// with the INSERT.
+fn input(s: &str, ty: &str) -> Result<Bson> {
+    let base = domains::base_type_and_typmod(ty).map_or_else(|| ty.to_string(), |(b, _, _)| b);
+    cast_value(Bson::String(s.to_string()), &base)
+}

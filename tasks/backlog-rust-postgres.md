@@ -2119,16 +2119,6 @@ Measured on PostgreSQL 15.19 (the data-modifying WITH on a private cluster).
 Measured on a private PostgreSQL 15.19 cluster. The gap tests are in
 `tests/backlog/test_rp_found_rp881.py`.
 
-- [ ] **A constant DEFAULT is evaluated at CREATE TABLE.** `create table t
-      (a int default 1/0)` succeeds on PostgreSQL 15.19 (`cookDefault`
-      analyses the expression, it does not run it), and the 22012 `division
-      by zero` comes from the first INSERT that uses the default; so does
-      `default 2147483647 + 1`. Here the CREATE is refused with 22012
-      (`default_value_or_expr` folds a constant default into a stored
-      value and raises what folding raises). Folding is safe for a default
-      that folds; one that errors is to be kept as its expression.
-      Verify: tests/backlog/test_rp_found_rp881.py::test_a_constant_default_is_not_run_at_create
-      Backlog-ID: RP-886
 - [ ] **CREATE TABLE IF NOT EXISTS over a table that exists checks its
       columns.** PostgreSQL 15.19's `transformCreateStmt` finds the
       relation first and answers with a NOTICE (`relation "t" already
@@ -2149,6 +2139,23 @@ Measured on a private PostgreSQL 15.19 cluster. The gap tests are in
       `'nosuch'::regclass` is already 42P01 at CREATE.)
       Verify: tests/backlog/test_rp_found_rp881.py::test_a_regclass_literal_in_a_default_is_resolved
       Backlog-ID: RP-888
+
+## Found while working RP-886 (2026-11-12)
+
+Measured on a private, freshly initdb'd PostgreSQL 15.19 cluster.
+
+- [ ] **A folded DEFAULT skips its column's length check.** `create table
+      t (a varchar(2) default 'abc', i int)` then `insert into t (i) values
+      (1)` is 22001 `value too long for type character varying(2)` on
+      PostgreSQL 15.19, and a `char(2)` column's `default 'xyz'` is 22001
+      `... character(2)`: the default is coerced to the column's type and
+      modifier when the INSERT runs it. Here both INSERTs succeed and store
+      the overlong value (`octet_length` 3): a constant default is folded
+      to a stored value at CREATE, and the value goes into the row without
+      the length coercion a written value gets. A `numeric(3,1)` default is
+      rounded, so the modifier reaches that type.
+      Verify: tests/backlog/test_rp_found_rp886.py::test_a_folded_default_is_coerced_to_its_column
+      Backlog-ID: RP-892
 ## Found while working RP-472 (2026-11-07)
 
 - [ ] **EXPLAIN of a user function in FROM prints no Function Scan.**
