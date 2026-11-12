@@ -219,7 +219,11 @@ pub fn aggregate(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
             "BSON field 'aggregate.pipeline' is missing but a required field",
         ));
     }
-    // `aggregate: <coll>` (string) or `aggregate: 1` (collectionless).
+    // `aggregate: <coll>` (string) or `aggregate: 1` (collectionless). A
+    // number is the collectionless form only when it EQUALS 1 (`1.0` and
+    // Decimal128 `1.0` do, `1.5` does not), and any other number is BadValue;
+    // a value that is neither a string nor a number is InvalidNamespace,
+    // naming its type (RM-464, measured 8.2.11 across every BSON type).
     let coll = match doc.get("aggregate") {
         Some(Bson::String(s)) if s.is_empty() => {
             return Err(CommandError::new(
@@ -229,7 +233,27 @@ pub fn aggregate(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
             ))
         }
         Some(Bson::String(s)) => Some(s.clone()),
-        Some(v) if as_i64(v) == Some(1) && !matches!(v, Bson::Boolean(_)) => None,
+        // Compared by value, not truncated: `as_i64` read `1.5` as 1.
+        Some(v @ (Bson::Int32(_) | Bson::Int64(_) | Bson::Double(_) | Bson::Decimal128(_)))
+            if secantus_core::order::cmp(v, &Bson::Int32(1)) == std::cmp::Ordering::Equal =>
+        {
+            None
+        }
+        Some(other)
+            if !matches!(
+                other,
+                Bson::Int32(_) | Bson::Int64(_) | Bson::Double(_) | Bson::Decimal128(_)
+            ) =>
+        {
+            return Err(CommandError::new(
+                73,
+                "InvalidNamespace",
+                format!(
+                    "Collection name has invalid type {}",
+                    secantus_core::query::bson_type_name(other)
+                ),
+            ))
+        }
         _ => {
             return Err(CommandError::new(
                 2,

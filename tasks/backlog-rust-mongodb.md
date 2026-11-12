@@ -357,15 +357,6 @@ These are explicit non-goals. Don't add them without a reason.
     `TestCausalConsistency_Supported` (29/29 passed). Re-include them.
   - Rust's `diagnostics::ok_transaction` ("no-op commit/abort") is dead code
     that nothing dispatches to.
-- [ ] **A non-string, non-number `aggregate` namespace is BadValue, not
-      InvalidNamespace.** mongod 8.2.11 answers `{aggregate: true, pipeline:
-      [], cursor: {}}` (and `null`, `{}`) with 73 "Collection name has invalid
-      type bool" (`null`, `object`); this server answers 2 "Invalid command
-      format: the 'aggregate' field must specify a collection name or 1",
-      which mongod keeps for a number other than 1. Found 2026-11-09 working
-      RM-431.
-      Verify: tests/backlog/test_rm_aggregate_parse.py::test_aggregate_names_a_mistyped_namespace
-      Backlog-ID: RM-464
 - [ ] **A wrong-type error lists the expected types in another order than
       mongod's.** mongod 8.2.11's order is per field: `cursor.batchSize`
       "[double, decimal, long, int]", `aggregate.maxTimeMS` "[double, int,
