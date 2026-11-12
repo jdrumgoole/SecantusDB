@@ -1011,6 +1011,7 @@ fn finish_join_source(
                         kind,
                         ops,
                         compare: comparison(c),
+                        restrict: None,
                     })
                 })
                 .collect()
@@ -2816,6 +2817,7 @@ fn build_join(
                         kind: filter_kind(c),
                         ops: operator_count(c),
                         compare: comparison(c),
+                        restrict: restriction_filter(c, [&left, &right], lookup, params),
                     });
                 }
             }
@@ -3010,6 +3012,68 @@ pub struct JoinFilter {
     /// take as a parameterized index qual (`match_clause_to_indexcol`,
     /// RP-354). `None` for anything else.
     pub compare: Option<(String, String, String)>,
+    /// A conjunct over one stored table's columns alone, lowered as that
+    /// table's WHERE over its stored fields: the clause
+    /// `clause_selectivity` estimates as a restriction, from the table's
+    /// statistics (an ON conjunct over a LEFT join's preserved side stays
+    /// the join's filter, RP-354). `None` for anything else.
+    pub restrict: Option<Document>,
+}
+
+/// `c`, a conjunct over joined keys, as the WHERE of the one stored
+/// table among `sides`' leaves whose keys it reads: each key renamed to
+/// the table's column, then lowered over the table's stored fields
+/// ([`JoinFilter::restrict`]). `None` when it reads more than one leaf, a
+/// leaf that is not a plain scan of a stored table, costs other than
+/// its operators ([`priced_by_operator_count`]), or does not lower to a
+/// filter.
+fn restriction_filter(
+    c: &pg_query::protobuf::Node,
+    sides: [&JoinNode; 2],
+    lookup: &dyn Fn(&str) -> Option<TableDef>,
+    params: &[Bson],
+) -> Option<Document> {
+    let [alias] = key_aliases(c).try_into().ok()?;
+    let (plan, def, columns) = sides.into_iter().find_map(|n| match n {
+        JoinNode::Leaf { plan, def, columns } if def.name == alias => Some((plan, def, columns)),
+        _ => None,
+    })?;
+    let Statement::Select(leaf) = plan.as_ref() else {
+        return None;
+    };
+    if leaf.sub.is_some() || leaf.series.is_some() || leaf.join.is_some() {
+        return None;
+    }
+    let table = lookup(&leaf.table)?;
+    if crate::correlated::has_volatile_call(c) || !priced_by_operator_count(c) {
+        return None;
+    }
+    let mut node = c.clone();
+    let mut renamed = true;
+    let _ = walk_expr(&mut node, &mut |x| {
+        if let Some(N::ColumnRef(r)) = x.node.as_mut() {
+            // The leaf's def keeps the table's column names (a rename is
+            // the scope's), each under the field the leaf's rows carry.
+            let name = column_ref_name(r)
+                .and_then(|k| columns.iter().find(|(key, _)| *key == k).cloned())
+                .and_then(|(_, f)| def.columns.iter().find(|c| c.field() == f))
+                .filter(|c| table.columns.iter().any(|t| t.name == c.name))
+                .map(|c| c.name.clone());
+            match name {
+                Some(name) => {
+                    r.fields = vec![pg_query::protobuf::Node {
+                        node: Some(N::String(pg_query::protobuf::String { sval: name })),
+                    }];
+                }
+                None => renamed = false,
+            }
+        }
+        Ok(())
+    });
+    if !renamed {
+        return None;
+    }
+    crate::lower_where(&node, &table, params).ok()
 }
 
 /// What a join filter's selectivity is estimated as with no statistics.
@@ -3032,21 +3096,58 @@ pub enum FilterKind {
     Other,
 }
 
-/// The operators `n` evaluates: each operator and IS DISTINCT FROM.
+/// The operators `n` evaluates: each operator and IS DISTINCT FROM, and a
+/// BETWEEN's two comparisons (four when SYMMETRIC), as
+/// `transformAExprBetween` expands it.
 fn operator_count(n: &pg_query::protobuf::Node) -> usize {
+    use pg_query::protobuf::AExprKind;
     let mut count = 0;
     let mut node = n.clone();
     let _ = walk_expr(&mut node, &mut |x| {
         if let Some(N::AExpr(e)) = x.node.as_ref() {
-            if e.kind == pg_query::protobuf::AExprKind::AexprOp as i32
-                || e.kind == pg_query::protobuf::AExprKind::AexprDistinct as i32
-            {
-                count += 1;
-            }
+            count += match AExprKind::try_from(e.kind) {
+                Ok(AExprKind::AexprOp | AExprKind::AexprDistinct) => 1,
+                Ok(AExprKind::AexprBetween | AExprKind::AexprNotBetween) => 2,
+                Ok(AExprKind::AexprBetweenSym | AExprKind::AexprNotBetweenSym) => 4,
+                _ => 0,
+            };
         }
         Ok(())
     });
     count
+}
+
+/// `n` is built only of what [`operator_count`] prices as
+/// `cost_qual_eval` does: comparisons, BETWEEN, AND / OR / NOT, columns
+/// and constants. An IN list, a pattern, a null test, a call or a cast of
+/// a column costs otherwise.
+fn priced_by_operator_count(n: &pg_query::protobuf::Node) -> bool {
+    use pg_query::protobuf::AExprKind;
+    match n.node.as_ref() {
+        Some(N::ColumnRef(_) | N::AConst(_)) => true,
+        Some(N::TypeCast(t)) => matches!(
+            t.arg.as_deref().and_then(|a| a.node.as_ref()),
+            Some(N::AConst(_))
+        ),
+        Some(N::BoolExpr(b)) => b.args.iter().all(priced_by_operator_count),
+        Some(N::AExpr(e)) => {
+            matches!(
+                AExprKind::try_from(e.kind),
+                Ok(AExprKind::AexprOp
+                    | AExprKind::AexprDistinct
+                    | AExprKind::AexprBetween
+                    | AExprKind::AexprNotBetween
+                    | AExprKind::AexprBetweenSym
+                    | AExprKind::AexprNotBetweenSym)
+            ) && [e.lexpr.as_deref(), e.rexpr.as_deref()]
+                .into_iter()
+                .flatten()
+                .all(priced_by_operator_count)
+        }
+        // A BETWEEN's bounds.
+        Some(N::List(l)) => l.items.iter().all(priced_by_operator_count),
+        _ => false,
+    }
 }
 
 /// `n` as a `<`, `<=`, `>` or `>=` of two joined keys: `(left key,
@@ -4590,6 +4691,43 @@ fn pushed_filter(alias: &str) -> Option<pg_query::protobuf::Node> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `sql`'s WHERE.
+    fn where_of(sql: &str) -> pg_query::protobuf::Node {
+        let parsed = pg_query::parse(sql).unwrap();
+        let Some(N::SelectStmt(s)) = parsed.protobuf.stmts[0]
+            .stmt
+            .as_ref()
+            .and_then(|n| n.node.as_ref())
+        else {
+            panic!("a SELECT");
+        };
+        *s.where_clause.clone().unwrap()
+    }
+
+    #[test]
+    fn a_between_is_its_comparisons() {
+        // `transformAExprBetween`: two comparisons, four when SYMMETRIC
+        // (RP-354).
+        let ops = |w: &str| operator_count(&where_of(&format!("select 1 from t where {w}")));
+        assert_eq!(ops("a between 1 and 2"), 2);
+        assert_eq!(ops("a not between 1 and 2"), 2);
+        assert_eq!(ops("a between symmetric 1 and 2"), 4);
+        assert_eq!(ops("a <> b and a between 1 and 2"), 3);
+    }
+
+    #[test]
+    fn only_operators_price_a_restriction() {
+        let priced =
+            |w: &str| priced_by_operator_count(&where_of(&format!("select 1 from t where {w}")));
+        assert!(priced("a > 990"));
+        assert!(priced("a between 1 and 2 or b = 'x'::text"));
+        assert!(!priced("a in (1, 2, 3)"));
+        assert!(!priced("b like 'x%'"));
+        assert!(!priced("a::numeric > 1"));
+        assert!(!priced("a is null"));
+        assert!(!priced("abs(a) > 1"));
+    }
 
     /// The WHERE `hoist_inner_on_conjuncts` leaves `sql` with, deparsed.
     fn hoisted_where(sql: &str) -> Option<String> {

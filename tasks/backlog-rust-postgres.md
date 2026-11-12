@@ -1556,13 +1556,44 @@ a regression test.
       zeros: two bounds on the index column (`e.a < k.a and e.a >
       k.a`, one `Index Cond` of both), a clause over an expression of the
       inner side (`e.a < k.a + 1`, the scan's Filter), a key on a later
-      index column; an ON conjunct over one side only (`e left join e e2
-      on e.a <> e2.a and
-      e.a > 990` is `rows=9990`, its `e.a > 990` a LEFT join's join filter
-      estimated from `e.a`'s statistics); a LEFT join with a WHERE; and a
-      join of three or more relations (found while working RP-329).
+      index column; a LEFT join with a WHERE (`e left join e e2 on e.a <>
+      e2.a where e.a > 990`, the WHERE `e`'s scan Filter, `rows=10`); and
+      a join of three or more relations (found while working RP-329).
+      Since 2026-11-12 an ON conjunct over a LEFT join's preserved side
+      alone is estimated, as PostgreSQL keeps it: a join filter
+      `clause_selectivity` estimates from that table's statistics (`e.a >
+      990` of `e left join e e2 on e.a <> e2.a and e.a > 990` is
+      `rows=9990`), a single bound deferred among the range clauses. Not
+      when the inner is also read through its index parameterized by the
+      outer row (`e left join k on e.a < k.a and e.a > 990` is `Index Scan
+      using k_pkey on k` with `Index Cond: (a > e.a)`, the restriction
+      the join's only filter, `rows=3333`), or when the conjunct costs
+      other than its operators (an IN list, a pattern, a cast of a column).
       Backlog-ID: RP-354
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[nested loop left join with a one-sided ON conjunct]
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[nested loop left join with a where], tests/backlog/test_rp_explain_costs.py::test_plan[nested loop left join with a one-sided ON conjunct into an index]
+
+- [ ] **A LEFT join reduced to an inner one keeps its ON's one-sided
+      conjunct in its Join Filter.** A WHERE that rejects the nullable
+      side's NULLs makes the LEFT join inner (`reduce_outer_joins`), and
+      PostgreSQL 15.19 then pushes an ON conjunct over one side to that
+      side's scan: `select * from e left join e e2 on e.a <> e2.a and e.a
+      > 990 where e2.b = 'v1'` is a Nested Loop with `Join Filter: (e.a <>
+      e2.a)` over `Seq Scan on e e2` (`Filter: (b = 'v1'::text)`) and a
+      Materialize of `Seq Scan on e` with `Filter: (a > 990)`. Here the
+      Join Filter keeps `(e.a > 990)` and `e`'s scan reads every row. An
+      inner join written as such already pushes it. Its rows are right.
+      Measured on a private 15.19 cluster (found while working RP-354).
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a left join reduced to inner pushes its one-sided on conjunct]
+      Backlog-ID: RP-902
+- [ ] **A BETWEEN among a join's ON conjuncts prints as one nested AND.**
+      PostgreSQL 15.19 expands `a BETWEEN x AND y` into two comparisons
+      and flattens them into the join's qual list: `select * from e left
+      join e e2 on e.a <> e2.a and e.a between 10 and 20` is `Join Filter:
+      ((e.a <> e2.a) AND (e.a >= 10) AND (e.a <= 20))`; here `((e.a <>
+      e2.a) AND ((e.a >= 10) AND (e.a <= 20)))`. The estimate is right.
+      Measured on a private 15.19 cluster (found while working RP-354).
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a between among a join's on conjuncts is flattened]
+      Backlog-ID: RP-903
 
 - [ ] **EXPLAIN ANALYZE's scan counters PostgreSQL prints that are still
       left out.** Since RP-383 a user table's heap pages carry the
