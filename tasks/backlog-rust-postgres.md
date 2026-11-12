@@ -2618,17 +2618,20 @@ VALUES-only statements of `tests/backlog/test_rp_found_rp682.py`.
       Verify: tests/backlog/test_rp_found_rp682.py::test_an_ordered_set_aggregate_over_a_window_is_refused
       Backlog-ID: RP-869
 
-- [ ] **Most of PostgreSQL's aggregates do not run over a window.**
-      `stddev(v) over (order by v)` answers the running sample standard
-      deviation on PostgreSQL 15.19; here it is 0A000 `window function
-      stddev() is not supported yet`, and so is every built-in aggregate
-      but `sum`, `count`, `avg`, `min`, `max`, `string_agg`, `array_agg`,
-      `bool_and` and `bool_or`: `bit_and` / `bit_or` / `bit_xor`, `corr`,
-      `covar_*`, `every`, `json[b]_agg`, `json[b]_object_agg`,
-      `range_agg`, `range_intersect_agg`, the `regr_*` family, `stddev*`,
-      `var*` / `variance` and `xmlagg` (a user aggregate runs).
-      Verify: tests/backlog/test_rp_found_rp682.py::test_more_aggregates_run_over_a_window
-      Backlog-ID: RP-870
+## Found while working RP-870 (2026-11-12)
+
+Measured on PostgreSQL 15.19 (the shared reference on port 5415) with the
+VALUES-only statements of `tests/backlog/test_rp_found_rp870.py`.
+
+- [ ] **An aggregate called with the wrong number of arguments is a gap,
+      not a missing function.** `select stddev(v, v) from (values (1))
+      s(v)` is 42883 `function stddev(integer, integer) does not exist` on
+      PostgreSQL 15.19, and `corr(v)` is `function corr(integer) does not
+      exist`; here both are 0A000 `an aggregate with this many arguments is
+      not supported yet`, with or without OVER (`plan_aggregate_item`'s
+      argument-count check).
+      Verify: tests/backlog/test_rp_found_rp870.py::test_an_aggregate_with_the_wrong_arity_is_42883
+      Backlog-ID: RP-904
 
 ## Found while working RP-670 (2026-11-09)
 

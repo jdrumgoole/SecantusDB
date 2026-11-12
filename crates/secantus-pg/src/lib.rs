@@ -51489,6 +51489,14 @@ fn materialise_windows(
                     .collect::<Result<_, _>>()?,
                 None => vec![Bson::Null; docs.len()],
             };
+            // A two-argument aggregate's second argument; empty otherwise.
+            let values2: Vec<Bson> = match w.arg2.as_ref() {
+                Some(expr) => docs
+                    .iter()
+                    .map(|d| secantus_pgplan::apply_row_expr(expr, d))
+                    .collect::<Result<_, _>>()?,
+                None => Vec::new(),
+            };
             // `FILTER (WHERE ...)` removes a row from the AGGREGATION, not from
             // the output: the row still gets a value, computed over the rows that
             // did pass.
@@ -51507,7 +51515,7 @@ fn materialise_windows(
                 // In the sorted order, so rows that tie on the window's ORDER
                 // BY are taken in the order PostgreSQL's sort left them.
                 partition.sort_by_key(|r| rank[*r]);
-                window_partition_values(docs, &partition, w, &values, &included)?;
+                window_partition_values(docs, &partition, w, &values, &values2, &included)?;
             }
         }
     }
@@ -51575,6 +51583,7 @@ fn window_partition_values(
     partition: &[usize],
     w: &secantus_pgplan::WindowItem,
     values: &[Bson],
+    values2: &[Bson],
     included: &[bool],
 ) -> Result<(), PlanError> {
     // The partition in WINDOW order. Stable, so rows that tie on every key
@@ -51633,7 +51642,16 @@ fn window_partition_values(
 
     for pos in 0..n {
         let row = ordered[pos];
-        let value = window_value(w, &ordered, pos, &peers, &order_values, values, included)?;
+        let value = window_value(
+            w,
+            &ordered,
+            pos,
+            &peers,
+            &order_values,
+            values,
+            values2,
+            included,
+        )?;
         docs[row].insert(w.field.clone(), value);
     }
     Ok(())
@@ -51653,6 +51671,7 @@ struct Peers {
 }
 
 /// One row's window value.
+#[allow(clippy::too_many_arguments)]
 fn window_value(
     w: &secantus_pgplan::WindowItem,
     ordered: &[usize],
@@ -51660,6 +51679,7 @@ fn window_value(
     peers: &Peers,
     order_values: &[Option<Bson>],
     values: &[Bson],
+    values2: &[Bson],
     included: &[bool],
 ) -> Result<Bson, PlanError> {
     let peer_start = &peers.start;
@@ -51747,8 +51767,11 @@ fn window_value(
     // Everything else reads the FRAME.
     let Some((lo, hi)) = window_frame_bounds(w, pos, n, peers, order_values)? else {
         // An empty frame: the aggregates answer NULL, and `count` answers 0.
+        // Any other aggregate answers what it does over no rows
+        // (`regr_count` is 0), its final function over its initial state.
         return Ok(match w.func {
             F::Count | F::CountStar => Bson::Int64(0),
+            F::Aggregate => checked_window_aggregate(w, &[], &[])?,
             _ => Bson::Null,
         });
     };
@@ -51762,10 +51785,18 @@ fn window_value(
         X::Group => p >= peer_start[pos] && p < peer_end[pos],
         X::Ties => p != pos && p >= peer_start[pos] && p < peer_end[pos],
     };
-    let frame: Vec<Bson> = (lo..=hi)
+    let rows: Vec<usize> = (lo..=hi)
         .filter(|p| !excluded(*p) && included[ordered[*p]])
-        .map(at)
         .collect();
+    let frame: Vec<Bson> = rows.iter().map(|p| at(*p)).collect();
+    if w.func == F::Aggregate {
+        let frame2: Vec<Bson> = if values2.is_empty() {
+            Vec::new()
+        } else {
+            rows.iter().map(|p| values2[ordered[*p]].clone()).collect()
+        };
+        return checked_window_aggregate(w, &frame, &frame2);
+    }
     if frame.is_empty() {
         return Ok(match w.func {
             F::Count | F::CountStar => Bson::Int64(0),
@@ -51793,15 +51824,61 @@ fn window_value(
             Some(u) => secantus_pgplan::user_agg::compute(u, &frame, w.source_type.as_deref())?,
             None => Bson::Null,
         },
-        _ => {
-            take_aggregate_error();
-            let v = window_aggregate(w, &frame);
-            if let Some(e) = take_aggregate_error() {
-                return Err(e);
-            }
-            v
-        }
+        _ => checked_window_aggregate(w, &frame, &[])?,
     })
+}
+
+/// [`window_aggregate`], with the error an aggregate raised while computing.
+fn checked_window_aggregate(
+    w: &secantus_pgplan::WindowItem,
+    frame: &[Bson],
+    frame2: &[Bson],
+) -> Result<Bson, PlanError> {
+    if let (secantus_pgplan::WindowFunc::Aggregate, Some(agg)) = (w.func, w.agg.as_deref()) {
+        return window_plain_aggregate(agg, frame, frame2);
+    }
+    take_aggregate_error();
+    let v = window_aggregate(w, frame);
+    match take_aggregate_error() {
+        Some(e) => Err(e),
+        None => Ok(v),
+    }
+}
+
+/// `WindowFunc::Aggregate`: the call's own aggregate item over the frame, by
+/// the same computation the call without OVER runs over a group. The item
+/// reads the frame's values from one-row documents rather than the slots
+/// and columns it was planned over.
+fn window_plain_aggregate(
+    agg: &AggItem,
+    frame: &[Bson],
+    frame2: &[Bson],
+) -> Result<Bson, PlanError> {
+    let item = AggItem {
+        field: Some("v".to_string()),
+        expr: None,
+        field2: agg.field2.as_ref().map(|_| "v2".to_string()),
+        expr2: None,
+        filter: None,
+        filter_field: None,
+        filter_expr: None,
+        order: Vec::new(),
+        distinct: false,
+        ..agg.clone()
+    };
+    let rows: Vec<Document> = frame
+        .iter()
+        .enumerate()
+        .map(|(i, v)| {
+            let mut d = Document::new();
+            d.insert("v", v.clone());
+            if let Some(v2) = frame2.get(i) {
+                d.insert("v2", v2.clone());
+            }
+            d
+        })
+        .collect();
+    compute_aggregate(&item, &rows).map_err(PgHandler::to_plan_error)
 }
 
 /// The aggregate window functions, computed by the ORDINARY aggregate.
@@ -58101,7 +58178,7 @@ fn priced_window_func(w: &secantus_pgplan::WindowItem) -> Option<(u32, Vec<Strin
             fields.extend(read);
         }
     }
-    if let Some(e) = &w.filter {
+    for e in w.arg2.iter().chain(w.filter.iter()) {
         let (o, read) = scan_estimate::column_expr_cost(e)?;
         ops += o;
         fields.extend(read);
