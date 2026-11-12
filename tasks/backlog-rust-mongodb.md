@@ -689,27 +689,6 @@ These are explicit non-goals. Don't add them without a reason.
       which the run could share. Found 2026-11-12 (RM-466).
       Verify: tests/backlog/test_rm_found_rm466.py::test_a_later_match_replaces_the_one_plan_cache_stats_absorbed
       Backlog-ID: RM-554
-- [ ] **An aggregate's top-k sort counts only the keys it kept.** mongod
-      8.2.11 adds every document its sort read to
-      `metrics.query.sort.totalKeysSorted` for a leading `$sort` and
-      `$limit` (6 for `[{$match: {z: 0}}, {$sort: {y: 1}}, {$limit: 1}]`
-      over six matching documents, 12 for `[{$sort: {y: 1}}, {$limit: 2}]`
-      over twelve), as a `find` with the same sort and limit does. This
-      server's read sorts and limits without counting
-      (`aggregate.rs`'s `lead.limit` read), and the pipeline's `$sort` then
-      counts the k documents it is handed: 1 and 2. Found 2026-11-09
-      (RM-374).
-      Verify: tests/backlog/test_rm_found_rm374.py::test_an_aggregate_sort_with_a_limit_counts_every_key_it_sorted
-      Backlog-ID: RM-468
-- [ ] **A write's LIMIT of one counts a second work.** mongod 8.2.11's
-      LIMIT of one over an index read in a write's sort order is EOF after
-      the work that returned its document: a profile entry's UPDATE and
-      LIMIT each report `works: 1` (`needTime: 0`) for
-      `{q: {x: {$gte: 2}}, sort: {x: 1}}` over an index on `x`, an update
-      with a `sort` and a findAndModify alike. This server's report
-      `works: 2` and the UPDATE `needTime: 1`. Found 2026-11-09 (RM-376).
-      Verify: tests/backlog/test_rm_found_rm376.py::test_a_writes_limit_of_one_is_done_after_one_work
-      Backlog-ID: RM-474
 - [ ] **A SORT of index keys past its budget does not spill.** mongod
       8.2.11's SORT below a FETCH (`type: "default"`) spills past its
       budget with `allowDiskUse`: 2000 65-byte members under a
@@ -721,24 +700,26 @@ These are explicit non-goals. Don't add them without a reason.
       (`secantus_core::sorter::count_members`). Found 2026-11-09 (RM-375).
       Verify: tests/backlog/test_rm_found_rm375.py::test_a_sort_of_index_keys_past_its_budget_spills
       Backlog-ID: RM-475
-- [ ] **`explain` sizes a SORT of index keys as documents.** mongod
-      8.2.11's `executionStats` of a SORT below a FETCH counts each member
-      as its execution does (its sort key, its index key and 32 bytes: 780
-      for twelve `{y, x}` keys, whatever the documents hold). This
-      server's `explain` (`exec.rs` / `trial.rs`'s `sort_stats`) sizes the
-      documents behind the keys, as a sort of documents counts: 1440 over
-      documents with a 50-byte pad. A profile entry's `execStats` count as
-      mongod's (RM-375). Found 2026-11-09 (RM-375).
-      Verify: tests/backlog/test_rm_found_rm375.py::test_an_explained_sort_of_index_keys_counts_its_members
-      Backlog-ID: RM-476
-- [ ] **A sort beside a multikey field sorts documents, not index keys.**
-      mongod 8.2.11 plans `find({y: {$gte: 0}}).sort({x: 1})` over `{y: 1,
-      x: 1}`, `y` multikey and `x` not, as a SORT of index keys below the
-      FETCH (`type: "default"`, 780 counted for twelve members). This
-      server sorts the fetched documents above the FETCH (`simple`, 900).
-      Found 2026-11-09 (RM-375).
-      Verify: tests/backlog/test_rm_found_rm375.py::test_a_sort_beside_a_multikey_field_sorts_index_keys
-      Backlog-ID: RM-477
+- [ ] **An `$or` of one index sorts documents, not index keys.** mongod
+      8.2.11 answers `find({$or: [{y: 0}, {y: {$gt: 1}}]}).sort({x: 1})`
+      over `{y: 1, x: 1}` with one two-interval IXSCAN whose keys it sorts
+      below the FETCH (`SUBPLAN <- FETCH <- SORT <- IXSCAN`, `type:
+      "default"`, 520 counted for eight members). This server sorts the
+      fetched documents above the FETCH (`simple`, 480). Found 2026-11-12
+      (RM-476).
+      Verify: tests/backlog/test_rm_found_rm476.py::test_an_or_of_one_index_sorts_its_keys
+      Backlog-ID: RM-557
+- [ ] **A SORT_MERGE beside a null scan breaks a tie another way than
+      mongod.** mongod 8.2.11 answers `find({a: {$in: [7, "b", 5,
+      null]}}).sort({b: 1})` over `{a: 1, b: 1}` with `FETCH <- SORT_MERGE`
+      of four scans, and returns `_id` 14 (no `a`, from the null scan)
+      before 13 (`a: 7`), which tie on `b`: `[3, 14, 13, 17]`. This server
+      plans the same merge and returns `[3, 13, 14, 17]`. Without the null
+      in the `$in` the two agree. These are the three `order` replies of
+      `tools/probes/find_order.py` (step 100 over `{a: 1, b: 1}`, `{a: 1,
+      b: -1}` and `{a: -1, b: 1}`). Found 2026-11-12 (RM-477).
+      Verify: tests/backlog/test_rm_found_rm477.py::test_a_sort_merge_beside_a_null_scan_breaks_ties_as_mongod
+      Backlog-ID: RM-559
 - [ ] **`returnKey` is not at the top of a sorted plan.** mongod 8.2.11
       puts RETURN_KEY above a blocking sort and drops the projection:
       `RETURN_KEY <- SORT <- COLLSCAN`, and `RETURN_KEY <- SORT <- FETCH <-
@@ -767,10 +748,9 @@ These are explicit non-goals. Don't add them without a reason.
       "default"`) counts 1584 bytes sorted for the twelve `{x}` members of
       `find({y: {$gte: 0}}, {_id: 0, x: 1}).sort({x: 1})`, in `explain`
       and in a profile entry's `execStats`: its working-set members, not
-      the projected documents. This server counts 528 in `explain` (the
-      projected documents) and 780 in the profile entry (members of their
-      index keys, as its sort of keys below a FETCH counts them since
-      RM-375). Found 2026-11-09 (RM-373).
+      the projected documents. This server counts 780 in both (members of
+      their index keys, as its sort of keys below a FETCH counts them since
+      RM-375, and its `explain` since RM-476). Found 2026-11-09 (RM-373).
       Verify: tests/backlog/test_rm_found_2026_11_09_rm373.py::test_a_sort_over_a_covered_projection_counts_what_it_sorted
       Backlog-ID: RM-473
 - [ ] **Some lines have no `numInterruptChecks`.** Since 2026-11-08 this
@@ -1239,13 +1219,6 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       2026-11-10 (RM-398).
       Verify: tests/backlog/test_rm_326_sort_counts.py::test_sbe_sort_row_leaves_out_a_field_only_the_key_reads
       Backlog-ID: RM-504
-- [ ] **An SBE sort with a limit counts only the keys it keeps.** mongod
-      8.2.11's slot-based sort in `[{$sort: {n: 1}}, {$limit: 50}, {$group:
-      ...}]` over 300 documents adds all 300 keys it took to
-      `metrics.query.sort.totalKeysSorted`, for a limit of 50 and of 1. This
-      server adds 50 and 1. Found 2026-11-10 (RM-398).
-      Verify: tests/backlog/test_rm_326_sort_counts.py::test_sbe_limited_sort_counts_every_key
-      Backlog-ID: RM-505
 - [ ] **An SBE sort's spilled records are a byte longer than mongod's.**
       mongod 8.2.11's slot-based sort in front of a `$group`, over 300
       documents of a 1000-byte `s` under a 50000-byte budget, writes 13 runs

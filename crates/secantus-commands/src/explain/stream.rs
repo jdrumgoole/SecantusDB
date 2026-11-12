@@ -2042,6 +2042,9 @@ pub(crate) struct Stream {
     /// LIMIT once more after the last result, where a `getMore`'s asks
     /// whether the plan is at its end first (measured 8.2.11).
     first: bool,
+    /// The read below a write's UPDATE or DELETE ([`Stream::for_write`]),
+    /// which is never `find`'s first batch.
+    write: bool,
     yields: Yields,
     /// The yields the last batch's profile entry reports.
     shown: Yields,
@@ -2246,6 +2249,7 @@ impl Stream {
             limit_reached: false,
             limit_eof_work: false,
             first: true,
+            write: false,
             yields: Yields::default(),
             shown: Yields::default(),
             failed: None,
@@ -2294,6 +2298,7 @@ impl Stream {
             limit_reached: false,
             limit_eof_work: false,
             first: true,
+            write: false,
             yields: Yields::default(),
             shown: Yields::default(),
             failed: None,
@@ -2341,6 +2346,7 @@ impl Stream {
             limit_reached: false,
             limit_eof_work: false,
             first: true,
+            write: false,
             yields: Yields::default(),
             shown: Yields::default(),
             failed: None,
@@ -2511,6 +2517,14 @@ impl Stream {
         }
         self.first = false;
         out
+    }
+
+    /// Mark the stream as the read below a write's UPDATE or DELETE stage:
+    /// a write of one is at its end after the work that returned its
+    /// document, so its LIMIT is never worked again to find its end
+    /// (measured 8.2.11: UPDATE and LIMIT each `works: 1`, RM-474).
+    pub(crate) fn for_write(&mut self) {
+        self.write = true;
     }
 
     /// The next of a write's documents, read as mongod's write stage pulls
@@ -2737,11 +2751,14 @@ impl Stream {
                         self.stashed.clear();
                         self.limit_reached = true;
                         // `find`'s executor works the LIMIT once more, which
-                        // finds it at its end; a `getMore`'s does not. A
+                        // finds it at its end; a `getMore`'s does not, nor
+                        // does a write's, whose stage is done after the
+                        // work that returned its document (RM-474). A
                         // CACHED_PLAN over the LIMIT finds that itself.
+                        let eof_work = self.first && !self.write;
                         match &mut self.cached {
-                            Some(c) => c.eof_work |= self.first,
-                            None => self.limit_eof_work = self.first,
+                            Some(c) => c.eof_work |= eof_work,
+                            None => self.limit_eof_work = eof_work,
                         }
                         break 'fill;
                     }

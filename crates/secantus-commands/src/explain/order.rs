@@ -2666,6 +2666,7 @@ pub(crate) fn write_selection(
     else {
         return Ok(None);
     };
+    stream.for_write();
     let summary = leaves_of.join(", ");
     // Only a profile entry reports the stages (`execStats`).
     let profiled = crate::profiler::profiled();

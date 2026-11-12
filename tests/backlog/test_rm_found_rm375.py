@@ -183,27 +183,112 @@ def _explained(client: Any) -> Any:
     return stage.get("type"), stage.get("totalDataSizeSorted")
 
 
-@pytest.mark.backlog("RM-476")
+def _sorts(stats: Any) -> list:
+    """The `type` and `totalDataSizeSorted` of each SORT in a plan's stats."""
+    out = []
+    while isinstance(stats, dict):
+        if stats.get("stage") == "SORT":
+            out.append((stats.get("type"), stats.get("totalDataSizeSorted")))
+        stats = stats.get("inputStage")
+    return out
+
+
+def _explained_shapes(client: Any) -> dict:
+    """Each of `_SHAPES`' SORTs as `explain` counts it: in `executionStats`,
+    and in `allPlansExecution` beside a competing `{x: 1}` index, whose
+    trial runs the SORT plan too."""
+    db = client["rm_found_rm375_shapes"]
+    out = {}
+    try:
+        for name, (docs, keys, command, _) in _SHAPES.items():
+            db.drop_collection("c")
+            db.c.insert_many(docs)
+            db.c.create_index(keys)
+            explain = {"find": "c", **command}
+            e = db.command("explain", explain, verbosity="executionStats")
+            out[name] = _sorts(e["executionStats"]["executionStages"])
+            db.c.create_index([("x", 1)])
+            e = db.command("explain", explain, verbosity="allPlansExecution")
+            out[f"{name}, trial"] = [
+                s
+                for plan in e["executionStats"]["allPlansExecution"]
+                for s in _sorts(plan.get("executionStages"))
+            ]
+    finally:
+        client.drop_database("rm_found_rm375_shapes")
+    return out
+
+
+@pytest.mark.backlog_fixed("RM-476")
 def test_an_explained_sort_of_index_keys_counts_its_members(rust_mongo: Any, mongod: Any) -> None:
     """mongod 8.2.11's `explain` of a SORT of index keys counts its members
     as its execution does: 780 for twelve `{y, x}` keys, whatever the
-    documents hold. This server's `explain` sizes the documents behind the
-    keys, as a sort of documents counts (1440 with a 50-byte pad)."""
+    documents hold, and each of `_SHAPES` as its profile entry counts it,
+    in `executionStats` and in an `allPlansExecution` trial. This server's
+    `explain` sized the documents behind the keys, as a sort of documents
+    counts (1440 with a 50-byte pad), until RM-476."""
     answers = {"mongod": _explained(mongod), "rust": _explained(rust_mongo)}
     assert answers["mongod"] == ("default", 780)
     assert answers["rust"] == answers["mongod"]
+    shapes = {"mongod": _explained_shapes(mongod), "rust": _explained_shapes(rust_mongo)}
+    # The trial counts a limit's SORT before it has sorted: none.
+    assert shapes["mongod"]["limit 3"] == [("default", 195)]
+    assert shapes["mongod"]["limit 3, trial"] == [("default", 0)]
+    assert shapes["mongod"]["string"] == [("default", 1588)]
+    assert shapes["rust"] == shapes["mongod"]
 
 
-@pytest.mark.backlog("RM-477")
+#: Sorts over an index with one multikey path, with mongod 8.2.11's SORT:
+#: a sort on fields whose own paths hold no array sorts the keys below the
+#: FETCH; one that names a multikey path sorts the fetched documents.
+_MULTIKEY: dict[str, tuple[list, list, dict, tuple[str, int]]] = {
+    "beside multikey y": (
+        [{"_id": i, "x": i, "y": [i % 3, 5]} for i in range(12)],
+        _KEYS,
+        _ON_KEYS,
+        ("default", 780),
+    ),
+    "dotted beside multikey y": (
+        [{"_id": i, "a": {"b": i}, "y": [i % 3, 7]} for i in range(12)],
+        [("y", 1), ("a.b", 1)],
+        {**_ON_KEYS, "sort": {"a.b": 1}},
+        ("default", 780),
+    ),
+    "on multikey x": (
+        [{"_id": i, "x": [i, 50], "y": i % 3} for i in range(12)],
+        _KEYS,
+        _ON_KEYS,
+        ("simple", 900),
+    ),
+    "compound naming multikey y": (
+        [{"_id": i, "x": i, "y": [i % 3, 5]} for i in range(12)],
+        _KEYS,
+        {**_ON_KEYS, "sort": {"x": 1, "y": 1}},
+        ("simple", 1764),
+    ),
+    "dotted under an array": (
+        [{"_id": i, "a": [{"b": i}], "y": i % 3} for i in range(12)],
+        [("y", 1), ("a.b", 1)],
+        {**_ON_KEYS, "sort": {"a.b": 1}},
+        ("simple", 912),
+    ),
+}
+
+
+@pytest.mark.backlog_fixed("RM-477")
 def test_a_sort_beside_a_multikey_field_sorts_index_keys(rust_mongo: Any, mongod: Any) -> None:
     """mongod 8.2.11 sorts index keys (`type: "default"`, below the FETCH)
     for `find({y: {$gte: 0}}).sort({x: 1})` over `{y: 1, x: 1}` when `y`
-    is multikey and `x` is not: 780 for twelve members. This server sorts
-    the fetched documents above the FETCH (`simple`, 900)."""
-    docs = [{"_id": i, "x": i, "y": [i % 3, 5]} for i in range(12)]
+    is multikey and `x` is not: 780 for twelve members. It asks each sort
+    path, not the index: a sort that names a multikey path sorts the
+    fetched documents. This server sorted the fetched documents above the
+    FETCH (`simple`, 900) whenever the index was multikey, until RM-477."""
     answers = {
-        side: _profiled_sort(client, is_mongod, docs, _KEYS, _ON_KEYS)
+        side: {
+            name: _profiled_sort(client, is_mongod, docs, keys, command)
+            for name, (docs, keys, command, _) in _MULTIKEY.items()
+        }
         for side, client, is_mongod in (("mongod", mongod, True), ("rust", rust_mongo, False))
     }
-    assert answers["mongod"] == ("default", 780)
+    assert answers["mongod"] == {name: want for name, (*_, want) in _MULTIKEY.items()}
     assert answers["rust"] == answers["mongod"]

@@ -21,7 +21,7 @@
 
 use super::bounds::Interval;
 use super::exec::{entries, fixed_extra, merge_head, Entry, Env, Head, Scan, Work};
-use super::node::{num, Node, Stats, WorkCounts};
+use super::node::{num, IxScan, Node, Stats, WorkCounts};
 use bson::Document;
 use secantus_core::heap::Heap;
 use std::collections::HashMap;
@@ -91,12 +91,16 @@ impl<'a> Stage<'a> {
                 extra.insert(format!("failedAnd_{i}"), 0_i32);
             }
         }
+        let mut inputs: Vec<Stage> = inputs
+            .into_iter()
+            .map(|n| Stage::new(n, env, cache))
+            .collect::<Option<_>>()?;
+        if let Node::Sort { on_keys: true, .. } = node {
+            inputs[0].keep_found();
+        }
         Some(Stage {
             node,
-            inputs: inputs
-                .into_iter()
-                .map(|n| Stage::new(n, env, cache))
-                .collect::<Option<_>>()?,
+            inputs,
             scan,
             pos: 0,
             seen: BTreeSet::new(),
@@ -114,6 +118,32 @@ impl<'a> Stage<'a> {
             works: 0,
             need_time: 0,
         })
+    }
+
+    /// Below a SORT of index keys: each scan keeps the key it found each
+    /// document at.
+    fn keep_found(&mut self) {
+        match self.node {
+            Node::IxScan(_) => {
+                if let Some(scan) = self.scan.as_mut() {
+                    scan.keep_found();
+                }
+            }
+            Node::Projection { .. } | Node::Or(_) => {
+                self.inputs.iter_mut().for_each(Stage::keep_found);
+            }
+            _ => {}
+        }
+    }
+
+    /// The scan that returned `row` and the key it found it at: an `$or`'s
+    /// first child to return it, the one whose copy it kept.
+    fn found(&self, row: usize) -> Option<(&IxScan, &[Vec<u8>])> {
+        match self.node {
+            Node::IxScan(ix) => Some((ix, self.scan.as_ref()?.found_at(row)?)),
+            Node::Projection { .. } | Node::Or(_) => self.inputs.iter().find_map(|i| i.found(row)),
+            _ => None,
+        }
     }
 
     fn work(&mut self, env: &Env) -> Work {
@@ -232,12 +262,16 @@ impl<'a> Stage<'a> {
                             let mut all = std::mem::take(&mut self.pending);
                             // What the sort held, counted when it sorts: a
                             // sort the trial does not finish reports none.
+                            let keys = super::exec::key_members(pattern, &all, env, |r| {
+                                self.inputs[0].found(r)
+                            });
                             super::exec::sort_stats(
                                 &mut self.extra,
                                 pattern,
                                 *limit,
                                 input,
                                 &all,
+                                keys,
                                 env,
                             );
                             if let Some(n) = limit {

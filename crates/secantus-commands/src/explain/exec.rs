@@ -13,7 +13,7 @@ use super::node::{num, IndexInfo, IxScan, Node, Stats};
 use bson::{Bson, Document};
 use secantus_core::collation::Collation;
 use secantus_core::heap::Heap;
-use std::collections::{BTreeSet, VecDeque};
+use std::collections::{BTreeSet, HashMap, VecDeque};
 
 /// What the stages read: the documents, in storage order.
 pub(crate) struct Env<'a> {
@@ -388,6 +388,9 @@ pub(crate) struct Scan {
     /// A multikey scan's checks for a document it already returned.
     dups_tested: i64,
     dups_dropped: i64,
+    /// Under a SORT of index keys: the entry each returned document was
+    /// found at, the key its working-set member carries (RM-476).
+    found: Option<HashMap<usize, usize>>,
 }
 
 impl Scan {
@@ -451,6 +454,28 @@ impl Scan {
             seek_pending: false,
             dups_tested: 0,
             dups_dropped: 0,
+            found: None,
+        }
+    }
+
+    /// Keep the key each returned document was found at (see
+    /// [`Scan::found_at`]).
+    pub(crate) fn keep_found(&mut self) {
+        self.found = Some(HashMap::new());
+    }
+
+    /// The key the scan found `row` at when it returned it, once
+    /// [`Scan::keep_found`] asked for it.
+    pub(crate) fn found_at(&self, row: usize) -> Option<&[Vec<u8>]> {
+        let at = *self.found.as_ref()?.get(&row)?;
+        Some(&self.entries[at].0)
+    }
+
+    /// `row` was returned, found at the entry before `pos`.
+    fn returning(&mut self, row: usize) {
+        self.returned += 1;
+        if let Some(found) = self.found.as_mut() {
+            found.insert(row, self.pos - 1);
         }
     }
 
@@ -624,7 +649,7 @@ impl Scan {
                 if repeat || !env.matches(row, &self.filter) {
                     Work::NeedTime
                 } else {
-                    self.returned += 1;
+                    self.returning(row);
                     Work::Advanced(row)
                 }
             }
@@ -640,7 +665,7 @@ impl Scan {
             if !env.matches(row, &self.filter) {
                 continue;
             }
-            self.returned += 1;
+            self.returning(row);
             return Some(row);
         }
     }
@@ -720,9 +745,13 @@ impl<'a> Run<'a> {
                 extra.insert(format!("failedAnd_{i}"), 0_i32);
             }
         }
+        let mut inputs: Vec<Run> = inputs.into_iter().map(|n| Run::new(n, env)).collect();
+        if let Node::Sort { on_keys: true, .. } = node {
+            inputs[0].keep_found();
+        }
         Run {
             node,
-            inputs: inputs.into_iter().map(|n| Run::new(n, env)).collect(),
+            inputs,
             scan,
             pos: 0,
             done: false,
@@ -735,6 +764,32 @@ impl<'a> Run<'a> {
             keys: 0,
             docs: 0,
             extra,
+        }
+    }
+
+    /// Below a SORT of index keys: each scan keeps the key it found each
+    /// document at.
+    fn keep_found(&mut self) {
+        match self.node {
+            Node::IxScan(_) => {
+                if let Some(scan) = self.scan.as_mut() {
+                    scan.keep_found();
+                }
+            }
+            Node::Projection { .. } | Node::Or(_) => {
+                self.inputs.iter_mut().for_each(Run::keep_found);
+            }
+            _ => {}
+        }
+    }
+
+    /// The scan that returned `row` and the key it found it at: an `$or`'s
+    /// first child to return it, the one whose copy it kept.
+    fn found(&self, row: usize) -> Option<(&IxScan, &[Vec<u8>])> {
+        match self.node {
+            Node::IxScan(ix) => Some((ix, self.scan.as_ref()?.found_at(row)?)),
+            Node::Projection { .. } | Node::Or(_) => self.inputs.iter().find_map(|i| i.found(row)),
+            _ => None,
         }
     }
 
@@ -881,7 +936,8 @@ impl<'a> Run<'a> {
                     while let Some(row) = self.inputs[0].pull(env) {
                         all.push(row);
                     }
-                    sort_stats(&mut self.extra, pattern, *limit, input, &all, env);
+                    let keys = key_members(pattern, &all, env, |r| self.inputs[0].found(r));
+                    sort_stats(&mut self.extra, pattern, *limit, input, &all, keys, env);
                     if let Some(n) = limit {
                         all.truncate(*n as usize);
                     }
@@ -1062,17 +1118,97 @@ pub(crate) fn fetched(node: &Node, returned: i64, extra: &mut Document) -> Optio
     }
 }
 
+/// What a SORT of index keys (`type: "default"`, below the FETCH) holds
+/// of each document it sorts, as mongod's working-set member does: its
+/// sort key's values, under `pattern`, and the values of the index key it
+/// was found at. `found`: the scan below that returned a row, and that
+/// key. `None`: some row has no such key, a sort of documents.
+pub(crate) fn key_members<'s>(
+    pattern: &Document,
+    rows: &[usize],
+    env: &Env,
+    found: impl Fn(usize) -> Option<(&'s IxScan, &'s [Vec<u8>])>,
+) -> Option<Vec<KeyMember>> {
+    rows.iter()
+        .map(|&row| {
+            let (ix, key) = found(row)?;
+            let fields = ix.index.fields();
+            let collation = ix.index.collation.as_ref();
+            // The value each key part was built from: of an array's
+            // elements, the one the entry holds.
+            let values: Vec<Bson> = fields
+                .iter()
+                .zip(key)
+                .map(|((field, dir), part)| {
+                    let (values, _) = values_at(&env.docs[row], field);
+                    let reversed = (*dir < 0) != ix.backward;
+                    values
+                        .iter()
+                        .find(|v| directed(v, reversed, collation) == *part)
+                        .or(values.first())
+                        .cloned()
+                        .unwrap_or(Bson::Null)
+                })
+                .collect();
+            let sort: Vec<(Bson, bool)> = pattern
+                .iter()
+                .map(|(field, dir)| {
+                    let value = fields
+                        .iter()
+                        .position(|(f, _)| f == field)
+                        .map_or(Bson::Null, |at| values[at].clone());
+                    (value, crate::util::as_i64(dir).unwrap_or(1) < 0)
+                })
+                .collect();
+            let order = sort
+                .iter()
+                .map(|(v, descending)| directed(v, *descending, collation))
+                .collect();
+            let sort_key: Vec<Bson> = sort.into_iter().map(|(v, _)| v).collect();
+            Some(KeyMember {
+                order,
+                size: secantus_core::sorter::member_size(&sort_key, &values),
+            })
+        })
+        .collect()
+}
+
+/// One member of a SORT of index keys: where it sorts, and what the
+/// sorter counts of it.
+pub(crate) struct KeyMember {
+    order: Vec<Vec<u8>>,
+    size: usize,
+}
+
 /// A `SORT`'s memory and spill counters (RM-315): the rows it sorts, run
-/// through the sorter its budget holds, as mongod's executes it.
+/// through the sorter its budget holds, as mongod's executes it. `keys`:
+/// a SORT of index keys' members, counted as its sorter counts them
+/// (RM-476), not the documents behind them.
 pub(crate) fn sort_stats(
     extra: &mut Document,
     pattern: &Document,
     limit: Option<i64>,
     input: &Node,
     rows: &[usize],
+    keys: Option<Vec<KeyMember>>,
     env: &Env,
 ) {
     if !crate::explain::order::plain_sort(pattern) {
+        return;
+    }
+    let top = limit.and_then(|n| usize::try_from(n).ok());
+    if let Some(mut members) = keys {
+        // The sizes in sorted order: a limit keeps the first.
+        members.sort_by(|a, b| a.order.cmp(&b.order));
+        let sizes: Vec<usize> = members.iter().map(|m| m.size).collect();
+        let budget = secantus_core::memlimit::budgets().sort;
+        let (ran, report) = secantus_core::memlimit::captured(|| {
+            let _disk = secantus_core::memlimit::allow_disk_use(true);
+            secantus_core::sorter::count_members(&sizes, budget, top.filter(|&k| k > 0))
+        });
+        if ran.is_ok() {
+            sort_extra(extra, &report);
+        }
         return;
     }
     // A projection below the sort: it sorts the projected documents.
@@ -1095,7 +1231,6 @@ pub(crate) fn sort_stats(
         budget: secantus_core::memlimit::budgets().sort,
         added: None,
     };
-    let top = limit.and_then(|n| usize::try_from(n).ok());
     let (ran, report) = secantus_core::memlimit::captured(|| {
         let _disk = secantus_core::memlimit::allow_disk_use(true);
         secantus_core::sorter::sort_documents(docs, &Bson::Document(pattern.clone()), &sizing, top)
