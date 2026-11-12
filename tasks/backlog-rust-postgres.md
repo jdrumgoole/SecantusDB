@@ -2600,22 +2600,6 @@ dv687, c char(3))`, `d687` an `int` with `check (value > 0)` and `dv687` a
       Backlog-ID: RP-690
       Verify: none -- seen once, under load; a timing that does not fail on demand
 
-## Found while working RP-694 (2026-11-09)
-
-Measured on a private PostgreSQL 15.19 cluster with the `_SETUP` in
-`tests/backlog/test_rp_found_rp694.py`: `dnn694` an `int` domain `not null`.
-
-- [ ] **A `FOR` over a query or an `EXECUTE ... INTO` refuses scalar
-      variable targets.** `for x in select '7'::text loop` over an `int`
-      `x`, `for x, y in select 1, 'a'` and `execute 'select 7' into x` each
-      assign on PostgreSQL 15.19 (the grammar makes the list a row target
-      that `exec_move_row` fills); here each is 0A000 `this FOR target` /
-      `this EXECUTE INTO target ... is not supported yet`. Both read only
-      the target's `dno`, which a scalar list has none of (a plain `INTO`
-      goes through `target_datum`).
-      Verify: tests/backlog/test_rp_found_rp694.py::test_for_and_execute_into_scalar_variables
-      Backlog-ID: RP-713
-
 ## Found while working RP-712 (2026-11-10)
 
 Measured on PostgreSQL 15.19 (port 5415) with statements that create

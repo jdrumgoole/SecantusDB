@@ -345,12 +345,11 @@ impl Interp<'_> {
             self.row_count = moved;
             return Ok(Flow::Next);
         }
-        let target = self.target_datum(body)?;
         let first = out.rows.first().map(|r| r.as_slice());
         // The portal's row type names each column's domain, as its tuple
         // descriptor does: a record field is of the domain, and a value of
         // it moves in with no coercion (RP-807).
-        self.assign_row(target, &out, first, &out.domains)?;
+        self.assign_into(body, "target", &out, first, &out.domains)?;
         self.set_found(first.is_some());
         self.row_count = u64::from(first.is_some());
         Ok(Flow::Next)
