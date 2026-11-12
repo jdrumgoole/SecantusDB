@@ -448,15 +448,86 @@ pub fn type_key(parts: &[String]) -> String {
     match parts {
         [bare] => {
             let key = crate::pgtypes::user_type_key(bare);
-            search_path()
-                .iter()
-                .filter(|s| *s != "pg_catalog")
-                .map(|s| relation_key(s, &key))
-                .find(|k| crate::column_type_exists(k))
-                .unwrap_or(key)
+            match type_schema_of(&key) {
+                Some(schema) => relation_key(&schema, &key),
+                None => key,
+            }
         }
         [schema, bare] if schema == "public" => crate::pgtypes::user_type_key(bare),
+        [schema, bare] if schema == "pg_temp" => match temp_schema() {
+            Some(t) => relation_key(&t, bare),
+            None => parts.join("."),
+        },
         _ => parts.join("."),
+    }
+}
+
+/// The schemas an unqualified user type name is looked up in, in
+/// `activeSearchPath`'s order (`recomputeNamespacePath`): the session's
+/// temporary schema first, once it exists, unless the path names
+/// `pg_temp` itself, which puts it there; then the path's other schemas.
+/// `pg_catalog` is left out: a built-in is resolved before a user type is
+/// looked for. Relations and types are found in the temporary schema;
+/// functions and operators never are (`FuncnameGetCandidates`).
+fn type_search_order() -> Vec<String> {
+    let temp = temp_schema_in_use();
+    let path = search_path();
+    let explicit = path.iter().any(|s| s == "pg_temp");
+    let mut out: Vec<String> = Vec::with_capacity(path.len() + 1);
+    if !explicit {
+        out.extend(temp.clone());
+    }
+    for s in path {
+        match s.as_str() {
+            "pg_catalog" => {}
+            "pg_temp" => out.extend(temp.clone()),
+            _ => out.push(s),
+        }
+    }
+    out
+}
+
+/// The schema holding the user type an unqualified `name` (a catalog key's
+/// last part) names, as `TypenameGetTypid` finds it: the first in
+/// [`type_search_order`] that has one.
+pub fn type_schema_of(name: &str) -> Option<String> {
+    type_search_order()
+        .into_iter()
+        .find(|s| crate::column_type_exists(&relation_key(s, name)))
+}
+
+/// A stored user type's name (`name` for `public`'s, `schema.name`
+/// otherwise) as `format_type_be` prints it: bare when `TypeIsVisible`,
+/// that is when looking the bare name up finds this very type
+/// ([`type_schema_of`]: the session's temporary schema first, then the
+/// path), qualified otherwise. So a temporary table's row type prints
+/// bare, and a `public` type a temporary one of its name hides prints
+/// `public.t`.
+pub fn type_visible_name(stored: &str) -> String {
+    let (schema, bare) = match stored.split_once('.') {
+        Some((s, b)) => (s, b),
+        None => ("public", stored),
+    };
+    if type_schema_of(bare).as_deref() == Some(schema) {
+        bare.to_string()
+    } else {
+        format!("{schema}.{bare}")
+    }
+}
+
+/// A relation's catalog key as `getRelationDescription` prints it: bare
+/// when `RelationIsVisible`, that is when [`resolve_unqualified`] of the
+/// bare name finds this relation (a temporary one included), qualified
+/// otherwise.
+pub fn relation_visible_name(key: &str) -> String {
+    let (schema, bare) = match key.split_once('.') {
+        Some((s, b)) => (s, b),
+        None => ("public", key),
+    };
+    if resolve_unqualified(bare) == key {
+        bare.to_string()
+    } else {
+        format!("{schema}.{bare}")
     }
 }
 
@@ -468,11 +539,28 @@ pub fn type_key(parts: &[String]) -> String {
 pub fn resolve_type_names(node: &mut N) -> Result<()> {
     let path = search_path();
     let public_on_path = path.iter().any(|s| s == "public");
-    if public_on_path && path.iter().all(|s| !is_user_schema(s)) {
+    let temp = temp_schema_in_use();
+    if public_on_path && temp.is_none() && path.iter().all(|s| !is_user_schema(s)) {
         return Ok(());
     }
+    let schema_node = |schema: &str| pg_query::protobuf::Node {
+        node: Some(N::String(pg_query::protobuf::String {
+            sval: schema.to_string(),
+        })),
+    };
     let resolve = |tn: &mut pg_query::protobuf::TypeName| -> Result<()> {
-        if tn.names.len() != 1 || tn.pct_type {
+        if tn.pct_type {
+            return Ok(());
+        }
+        // `pg_temp.t` is the session's temporary schema's `t`
+        // (`LookupExplicitNamespace`), keyed under the schema's own name.
+        if let (Some(t), [first, _]) = (temp.as_deref(), tn.names.as_slice()) {
+            if matches!(first.node.as_ref(), Some(N::String(s)) if s.sval == "pg_temp") {
+                tn.names[0] = schema_node(t);
+            }
+            return Ok(());
+        }
+        if tn.names.len() != 1 {
             return Ok(());
         }
         let Some(N::String(name)) = tn.names[0].node.as_ref() else {
@@ -482,23 +570,11 @@ pub fn resolve_type_names(node: &mut N) -> Result<()> {
         if crate::pgtypes::is_builtin_type(&name) {
             return Ok(());
         }
-        for schema in &path {
-            if schema == "pg_catalog" || schema.starts_with("pg_temp") {
-                continue;
+        if let Some(schema) = type_schema_of(&name) {
+            if schema != "public" {
+                tn.names.insert(0, schema_node(&schema));
             }
-            if crate::column_type_exists(&relation_key(schema, &name)) {
-                if schema != "public" {
-                    tn.names.insert(
-                        0,
-                        pg_query::protobuf::Node {
-                            node: Some(N::String(pg_query::protobuf::String {
-                                sval: schema.clone(),
-                            })),
-                        },
-                    );
-                }
-                return Ok(());
-            }
+            return Ok(());
         }
         if !public_on_path && AS_SENT.with(std::cell::Cell::get) && crate::column_type_exists(&name)
         {
@@ -522,6 +598,21 @@ pub fn resolve_type_names(node: &mut N) -> Result<()> {
     };
     match node {
         N::CreateStmt(c) => columns(&mut c.table_elts)?,
+        // Nor a routine's signature: each parameter's type (a RETURNS TABLE
+        // column's too) and the result's, which `ProcedureCreate` records
+        // by oid, so as the path finds them when the routine is made.
+        N::CreateFunctionStmt(f) => {
+            for p in &mut f.parameters {
+                if let Some(N::FunctionParameter(fp)) = p.node.as_mut() {
+                    if let Some(tn) = fp.arg_type.as_mut() {
+                        resolve(tn)?;
+                    }
+                }
+            }
+            if let Some(tn) = f.return_type.as_mut() {
+                resolve(tn)?;
+            }
+        }
         N::AlterTableStmt(a) => {
             for cmd in &mut a.cmds {
                 if let Some(N::AlterTableCmd(c)) = cmd.node.as_mut() {
@@ -547,6 +638,20 @@ pub fn resolve_type_names(node: &mut N) -> Result<()> {
                 pg_query::NodeMut::ColumnDef(cd) => {
                     if let Some(tn) = (*cd).type_name.as_mut() {
                         resolve(tn)?;
+                    }
+                }
+                // The walk does not descend into an indirection's argument
+                // either: `(row(1)::t).a`.
+                pg_query::NodeMut::AIndirection(a) => {
+                    if let Some(arg) = (*a).arg.as_deref_mut() {
+                        crate::walk_expr(arg, &mut |n| {
+                            if let Some(N::TypeCast(tc)) = n.node.as_mut() {
+                                if let Some(tn) = tc.type_name.as_mut() {
+                                    resolve(tn)?;
+                                }
+                            }
+                            Ok(())
+                        })?;
                     }
                 }
                 _ => {}

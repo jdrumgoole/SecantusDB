@@ -574,31 +574,78 @@ impl PgHandler {
         Ok(())
     }
 
-    /// `DROP FUNCTION`: the casts it implements depend on it.
+    /// The user operators implemented by function `name(args)`:
+    /// `DefineOperator` records a dependency on the operator's function
+    /// (RP-893). `(catalog key, description)`, in creation order.
+    pub(crate) fn operators_on_function(
+        &self,
+        name: &str,
+        args: &[String],
+    ) -> Vec<(String, String)> {
+        let same = |a: &str, b: &str| match (type_oid(a), type_oid(b)) {
+            (Some(x), Some(y)) => x == y,
+            _ => a.eq_ignore_ascii_case(b),
+        };
+        let mut found: Vec<(i64, String, String)> = self
+            .catalog_docs(crate::catalog_objects::OPERATOR_COLLECTION)
+            .iter()
+            .filter(|d| d.get_str("function") == Ok(name))
+            .filter(|d| {
+                let operands: Vec<&str> = d
+                    .get_str("left")
+                    .ok()
+                    .into_iter()
+                    .chain(d.get_str("right").ok())
+                    .collect();
+                operands.len() == args.len() && operands.iter().zip(args).all(|(x, y)| same(x, y))
+            })
+            .filter_map(|d| {
+                let key = d.get_str("_id").ok()?.to_string();
+                // One made before operators drew oids sorts last.
+                let oid = d.get("oid").and_then(crate::bson_i64).unwrap_or(i64::MAX);
+                Some((oid, key, crate::row_type_depends::operator_description(d)))
+            })
+            .collect();
+        found.sort();
+        found.into_iter().map(|(_, k, desc)| (k, desc)).collect()
+    }
+
+    /// `DROP FUNCTION`: the casts and operators it implements depend on it.
+    /// A cast's oid is derived from its types rather than drawn, so the
+    /// casts are listed ahead of the operators rather than among them in
+    /// creation order.
     pub(crate) fn drop_function_casts(
         &self,
         f: &crate::UserFunction,
         cascade: bool,
     ) -> PgWireResult<()> {
         let casts = self.casts_on_function(&f.name, &f.param_types);
-        if casts.is_empty() {
+        let operators = self.operators_on_function(&f.name, &f.param_types);
+        if casts.is_empty() && operators.is_empty() {
             return Ok(());
         }
         let sig = self.routine_object_name(f);
+        let descs: Vec<String> = casts
+            .iter()
+            .chain(&operators)
+            .map(|(_, c)| c.clone())
+            .collect();
         if !cascade {
-            let lines = casts
+            let lines = descs
                 .iter()
-                .map(|(_, c)| format!("{c} depends on function {sig}"))
+                .map(|c| format!("{c} depends on function {sig}"))
                 .collect();
             return Err(Self::dependents_error_lines(
                 &format!("function {sig}"),
                 lines,
             ));
         }
-        let descs: Vec<String> = casts.iter().map(|(_, c)| c.clone()).collect();
         self.cascade_notice(&descs);
         for (key, _) in &casts {
             self.drop_cast_key(key)?;
+        }
+        for (key, _) in &operators {
+            self.delete_type_doc(crate::catalog_objects::OPERATOR_COLLECTION, key)?;
         }
         Ok(())
     }

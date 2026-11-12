@@ -2119,16 +2119,6 @@ Measured on PostgreSQL 15.19 (the data-modifying WITH on a private cluster).
 Measured on a private PostgreSQL 15.19 cluster. The gap tests are in
 `tests/backlog/test_rp_found_rp881.py`.
 
-- [ ] **A constant DEFAULT is evaluated at CREATE TABLE.** `create table t
-      (a int default 1/0)` succeeds on PostgreSQL 15.19 (`cookDefault`
-      analyses the expression, it does not run it), and the 22012 `division
-      by zero` comes from the first INSERT that uses the default; so does
-      `default 2147483647 + 1`. Here the CREATE is refused with 22012
-      (`default_value_or_expr` folds a constant default into a stored
-      value and raises what folding raises). Folding is safe for a default
-      that folds; one that errors is to be kept as its expression.
-      Verify: tests/backlog/test_rp_found_rp881.py::test_a_constant_default_is_not_run_at_create
-      Backlog-ID: RP-886
 - [ ] **CREATE TABLE IF NOT EXISTS over a table that exists checks its
       columns.** PostgreSQL 15.19's `transformCreateStmt` finds the
       relation first and answers with a NOTICE (`relation "t" already
@@ -2149,6 +2139,23 @@ Measured on a private PostgreSQL 15.19 cluster. The gap tests are in
       `'nosuch'::regclass` is already 42P01 at CREATE.)
       Verify: tests/backlog/test_rp_found_rp881.py::test_a_regclass_literal_in_a_default_is_resolved
       Backlog-ID: RP-888
+
+## Found while working RP-886 (2026-11-12)
+
+Measured on a private, freshly initdb'd PostgreSQL 15.19 cluster.
+
+- [ ] **A folded DEFAULT skips its column's length check.** `create table
+      t (a varchar(2) default 'abc', i int)` then `insert into t (i) values
+      (1)` is 22001 `value too long for type character varying(2)` on
+      PostgreSQL 15.19, and a `char(2)` column's `default 'xyz'` is 22001
+      `... character(2)`: the default is coerced to the column's type and
+      modifier when the INSERT runs it. Here both INSERTs succeed and store
+      the overlong value (`octet_length` 3): a constant default is folded
+      to a stored value at CREATE, and the value goes into the row without
+      the length coercion a written value gets. A `numeric(3,1)` default is
+      rounded, so the modifier reaches that type.
+      Verify: tests/backlog/test_rp_found_rp886.py::test_a_folded_default_is_coerced_to_its_column
+      Backlog-ID: RP-892
 ## Found while working RP-472 (2026-11-07)
 
 - [ ] **EXPLAIN of a user function in FROM prints no Function Scan.**
@@ -2318,14 +2325,6 @@ tests are in `tests/backlog/test_rp_found_rp546.py`.
       member's row type in the same order as here, not PostgreSQL's.
       Backlog-ID: RP-560
       Verify: tests/backlog/test_rp_found_rp546.py::test_drop_table_dependants_in_creation_order
-- [ ] **An operator over a table's row type does not depend on it.**
-      `create operator ==== (leftarg = p561, rightarg = p561, ...)` records
-      a dependency on its argument types, so `drop table p561` names
-      `operator ====(p561,p561) depends on type p561` and CASCADE drops it.
-      Here the DETAIL names only the function, and the operator outlives the
-      table in `pg_operator`.
-      Backlog-ID: RP-561
-      Verify: tests/backlog/test_rp_found_rp546.py::test_operator_over_row_type_depends_on_its_table
 - [ ] **DROP TYPE of a table's row type with a routine over it names the
       routines.** PostgreSQL 15.19 answers `drop type r562` with 2BP01
       `cannot drop type r562 because table r562 requires it` whatever else
@@ -2333,13 +2332,6 @@ tests are in `tests/backlog/test_rp_found_rp546.py`.
       `other objects depend on it`. With no routine it already matches.
       Backlog-ID: RP-562
       Verify: tests/backlog/test_rp_found_rp546.py::test_drop_type_of_a_row_type_with_a_routine
-- [ ] **A routine over a temporary table's row type names no type.** On
-      PostgreSQL 15.19 `create function tf565(tt565)` over a temp table has
-      `proargtypes` `{tt565}`, and `drop table tt565` is 2BP01 naming it.
-      Here the argument is stored by its bare name, which resolves to no
-      type (`-`), the DROP succeeds, and the routine is left behind.
-      Backlog-ID: RP-565
-      Verify: tests/backlog/test_rp_found_rp546.py::test_routine_over_a_temp_table_row_type
 - [ ] **A `regprocedure` prints its name unquoted and a schema's type
       quoted whole.** `regprocedureout` is `format_procedure`: `"Q
       f567"(s567.t)` and `s567.h(s567.t)` on PostgreSQL 15.19. Here they are
@@ -3597,20 +3589,6 @@ stored expression tree.
       value.
       Verify: tests/backlog/test_rp_found_rp846.py::test_an_explicit_cast_default_keeps_its_modifier
       Backlog-ID: RP-863
-- [ ] **A `timestamp`, `timestamptz`, `interval` or `bytea` DEFAULT prints
-      its internal form.** `ts timestamp(2) default '2020-01-01'` is
-      `'2020-01-01 00:00:00'::timestamp without time zone` on PostgreSQL
-      15.19, `timestamptz default '2020-01-01 00:00:00+00'`
-      `'2020-01-01 00:00:00+00'::timestamp with time zone`, `interval
-      default '1 day'` `'1 day'::interval` and `bytea default '\x01'`
-      `'\x01'::bytea`. Here they are `DateTime("2020-01-01 0:00:00.0
-      +00:00:00")`, `{ "__ivl_mon": 0, "__ivl_day": 1, "__ivl_us": 0 }` and
-      `Binary(0x0, AQ==)`: `default_expression` formats a non-string
-      stored value with `Bson`'s `Display`, where `get_const_expr` uses the
-      type's output function (a timestamptz in the session's TimeZone),
-      quoted and labelled.
-      Verify: tests/backlog/test_rp_found_rp846.py::test_a_temporal_or_bytea_default_prints_as_a_literal
-      Backlog-ID: RP-864
 
 ## Found while working RP-845 (2026-11-11)
 
@@ -3820,3 +3798,47 @@ Measured on PostgreSQL 15.19; none of it needs DDL. The gap tests are in
       `E'x'::int4`, with no escape, is placed.
       Verify: tests/backlog/test_rp_found_rp605.py::test_escaped_literal_input_error_has_a_position
       Backlog-ID: RP-867
+
+## Found while working RP-565 (2026-11-12)
+
+Measured on a private, freshly initdb'd PostgreSQL 15.19 cluster. The gap
+tests are in `tests/backlog/test_rp_found_rp565.py`.
+
+- [ ] **A DROP's DETAIL names a foreign key by its schema-qualified key.**
+      `drop table s.p` with `s.child (b int references s.p)` is 2BP01 with
+      DETAIL `constraint child_b_fkey on table s.child depends on table
+      s.p` on PostgreSQL 15.19 (`getObjectDescription` prints `conname`),
+      and a temporary table's the same, `tc_b_fkey`. Here the constraint
+      is `s.child_b_fkey` and `pg_temp_N.tc_b_fkey`: the DETAIL takes the
+      stored key, though `pg_constraint.conname` is already right.
+      Verify: tests/backlog/test_rp_found_rp565.py::test_a_foreign_key_in_a_drop_detail_is_named_by_its_own_name
+      Backlog-ID: RP-890
+- [ ] **A temporary row type does not hide a built-in type of its name.**
+      PostgreSQL searches the temporary schema for a type ahead of
+      `pg_catalog` when the path does not name `pg_temp`: after `create
+      temp table text (a int)`, `'x'::text` is 22P02 `malformed record
+      literal: "x"` and `('(1)'::text).a` is 1 on 15.19. Here a built-in
+      name is resolved before any user type is looked for
+      (`is_builtin_type` ahead of `type_schema_of`), so the first answers
+      `x` and the second is 42809.
+      Verify: tests/backlog/test_rp_found_rp565.py::test_a_temporary_row_type_hides_a_built_in_type
+      Backlog-ID: RP-891
+
+## Found while working RP-864 (2026-11-12)
+
+Measured on PostgreSQL 15.19; none of it needs DDL.
+
+- [ ] **A `date` or `timestamp` made text inside an expression ignores the
+      DateStyle.** Under `set datestyle to 'German'`, `concat('2020-01-02'::date,
+      '|', '2020-01-01 12:00'::timestamp)` is `02.01.2020|01.01.2020 12:00:00`
+      on PostgreSQL 15.19, `format('%s', '2020-01-02'::date)` `02.01.2020`
+      and `row('2020-01-02'::date, '2020-01-01 12:00'::timestamp)::text`
+      `(02.01.2020,"01.01.2020 12:00:00")`: each calls `date_out` /
+      `timestamp_out`, which write in the session DateStyle. Here each is
+      ISO: `typeout::output_text` writes ISO, as JSON and XML (which stay
+      ISO under every DateStyle) need, and `needs_type` leaves `date` out,
+      so these paths print the stored text. `typeout::session_output_text`
+      (RP-864's DEFAULT printer) is the styled form; the fix is choosing it
+      at the output-function sites and not at JSON's and XML's.
+      Verify: tests/backlog/test_rp_found_rp864.py::test_a_date_as_text_in_an_expression_follows_the_datestyle
+      Backlog-ID: RP-894

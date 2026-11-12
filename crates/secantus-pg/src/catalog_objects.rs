@@ -111,8 +111,11 @@ impl PgHandler {
                 format!("operator {} already exists", op.name),
             ));
         }
+        // Its oid, drawn from the counter as `OperatorCreate` draws it, so
+        // what names a type lists it in creation order (RP-561).
         let mut doc = bson::doc! {
             "_id": &key,
+            "oid": self.mint_global_oids(1)?,
             "name": &op.name,
             "right": &op.right,
             "function": &op.function,
@@ -703,7 +706,15 @@ impl PgHandler {
                         };
                         let left = d.get_str("left").ok();
                         let mut r = Document::new();
-                        r.insert(f("oid"), oid("opr", d.get_str("_id").unwrap_or_default()));
+                        // The oid its CREATE drew (RP-561), else -- one made
+                        // before oids were drawn -- the one its key hashes to.
+                        r.insert(
+                            f("oid"),
+                            d.get("oid").and_then(crate::bson_i64).map_or_else(
+                                || oid("opr", d.get_str("_id").unwrap_or_default()),
+                                Bson::Int64,
+                            ),
+                        );
                         r.insert(f("oprname"), d.get_str("name").unwrap_or_default());
                         r.insert(f("oprnamespace"), Bson::Int64(Self::PUBLIC_NAMESPACE_OID));
                         r.insert(

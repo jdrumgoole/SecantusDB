@@ -17,7 +17,7 @@
 //! `quote_literal($1::text)`). They differ only for a boolean, which
 //! outputs as `t` and casts to `true`.
 
-use crate::{session_timezone, Bson};
+use crate::{session_datestyle, session_timezone, Bson};
 
 /// Is `ty` a type whose value is carried in a form other than its text,
 /// so that printing it needs the type? A string, an integer or a numeric
@@ -68,6 +68,26 @@ pub fn needs_type(ty: &str) -> bool {
 /// `ty`'s output function over a non-NULL `v`.
 pub fn output_text(v: &Bson, ty: &str) -> String {
     render(v, ty.trim(), false)
+}
+
+/// `ty`'s output function over a non-NULL `v` in the session's `DateStyle`
+/// as well: a `date`, `timestamp` or `timestamptz` is `02.01.2020` under
+/// German, where `output_text` writes ISO (which JSON and XML want). Used
+/// for a catalog DEFAULT's text, which `get_const_expr` prints through the
+/// output function in the reading session's settings (RP-864).
+pub fn session_output_text(v: &Bson, ty: &str) -> String {
+    let ds = session_datestyle();
+    match (ty.trim(), v) {
+        ("date", Bson::String(t)) => crate::render_date_styled(t, &ds),
+        ("timestamp" | "timestamp without time zone", _) => {
+            crate::timestamp_value_text_styled(v, &ds).unwrap_or_else(|| output_text(v, ty))
+        }
+        ("timestamptz" | "timestamp with time zone", _) => {
+            crate::timestamptz_value_text_styled(v, &session_timezone(), &ds)
+                .unwrap_or_else(|| output_text(v, ty))
+        }
+        _ => output_text(v, ty),
+    }
 }
 
 /// `v::text` for a non-NULL `v` of type `ty`.
@@ -139,4 +159,41 @@ fn element_texts(items: &[Bson], elem: &str) -> Vec<Bson> {
             other => Bson::String(render(other, elem, false)),
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{set_session_datestyle, DateStyle};
+
+    // A catalog DEFAULT's `date` / `timestamp` is written in the session
+    // DateStyle, as PostgreSQL 15.19's `get_const_expr` writes it
+    // (`'02.01.2020'::date` under German); `output_text` stays ISO (RP-864).
+    #[test]
+    fn a_date_and_a_timestamp_output_in_the_session_datestyle() {
+        let ts = Bson::DateTime(bson::DateTime::from_millis(1_577_882_096_789));
+        let date = Bson::String("2020-01-02".into());
+        set_session_datestyle(DateStyle::parse("German"));
+        let german = (
+            session_output_text(&date, "date"),
+            session_output_text(&ts, "timestamp"),
+            output_text(&date, "date"),
+            output_text(&ts, "timestamp"),
+        );
+        set_session_datestyle(DateStyle::default());
+        let iso = (
+            session_output_text(&date, "date"),
+            session_output_text(&ts, "timestamp"),
+        );
+        assert_eq!(
+            german,
+            (
+                "02.01.2020".into(),
+                "01.01.2020 12:34:56.789".into(),
+                "2020-01-02".into(),
+                "2020-01-01 12:34:56.789".into()
+            )
+        );
+        assert_eq!(iso, ("2020-01-02".into(), "2020-01-01 12:34:56.789".into()));
+    }
 }

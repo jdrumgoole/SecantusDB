@@ -3447,6 +3447,53 @@ fn to_regtype_resolves_user_type_arrays() {
     set_user_composites(Vec::new());
 }
 
+/// A bare type name is looked up as `TypenameGetTypid` walks the path: the
+/// session's temporary schema first, so a temporary table's row type is
+/// found by its bare name, its `_t` array spelling and `pg_temp.t`, and a
+/// routine over it records the temporary schema's type; and a type prints
+/// bare only when its bare name finds it, so the `public` type a temporary
+/// one hides prints qualified. Measured on PostgreSQL 15.19 (RP-565,
+/// RP-889).
+#[test]
+fn a_bare_type_name_searches_the_temporary_schema_first() {
+    schemas::set_temp_schema(Some("pg_temp_7".into()));
+    schemas::set_temp_namespace_made(true);
+    let field = || vec![("a".to_string(), "int4".to_string())];
+    set_user_composites(vec![
+        ("pg_temp_7.tt".into(), 67_101, field()),
+        ("hid".into(), 67_102, field()),
+        ("pg_temp_7.hid".into(), 67_103, field()),
+    ]);
+    let regtype = |sql: &str| match plan_ok(sql) {
+        Statement::SelectConstant(sc) => match &sc.columns[0].1 {
+            ConstCol::Value(Bson::Null) => None,
+            ConstCol::Value(v) => Some(regtype_text(regtype_oid(v).expect("a regtype"))),
+            other => panic!("not a value for {sql}: {other:?}"),
+        },
+        other => panic!("wrong statement for {sql}: {other:?}"),
+    };
+    for (sql, want) in [
+        ("SELECT to_regtype('tt')", Some("tt")),
+        ("SELECT to_regtype('_tt')", Some("tt[]")),
+        ("SELECT to_regtype('tt[]')", Some("tt[]")),
+        ("SELECT to_regtype('pg_temp.tt')", Some("tt")),
+        ("SELECT to_regtype('hid')", Some("hid")),
+        ("SELECT to_regtype('public.hid')", Some("public.hid")),
+    ] {
+        assert_eq!(regtype(sql).as_deref(), want, "for {sql}");
+    }
+    match plan_ok("CREATE FUNCTION f(tt, pg_temp.tt) RETURNS int LANGUAGE sql AS 'select 1'") {
+        Statement::CreateUserFunction(def) => {
+            let types: Vec<&str> = def.params.iter().map(|(_, t)| t.as_str()).collect();
+            assert_eq!(types, ["pg_temp_7.tt", "pg_temp_7.tt"]);
+        }
+        other => panic!("wrong statement: {other:?}"),
+    }
+    set_user_composites(Vec::new());
+    schemas::set_temp_namespace_made(false);
+    schemas::set_temp_schema(None);
+}
+
 /// `CREATE TABLE ... AS query` carries the planned query and the table's
 /// persistence, name list and `WITH [NO] DATA` -- the columns come from the
 /// query's description at execution. Measured on PostgreSQL 16 (2026-09-09).
@@ -7715,4 +7762,33 @@ fn create_table_analyses_each_default() {
     };
     assert_eq!(def.columns[0].default, Some(Bson::Int32(3)));
     assert!(def.columns[1].default_expr().is_some());
+}
+
+/// A constant DEFAULT whose folding raises a data error is kept as its
+/// expression, for the INSERT that runs it to raise, while a string
+/// literal's input error is CREATE's (RP-886, measured on PostgreSQL 15.19).
+#[test]
+fn a_default_that_does_not_fold_is_kept_as_its_expression() {
+    for sql in [
+        "create table t886 (a int default 1/0)",
+        "create table t886 (a int default 2147483647 + 1)",
+        "create table t886 (a int default 'x'::text::int)",
+        "create table t886 (a int2 default 100000)",
+    ] {
+        take_error_location();
+        let Statement::CreateTable(def, _) = plan_ok(sql) else {
+            panic!("not a CREATE TABLE: {sql}");
+        };
+        assert_eq!(def.columns[0].default, None, "{sql}");
+        assert!(def.columns[0].default_expr().is_some(), "{sql}");
+        assert_eq!(take_error_location(), None, "{sql}");
+    }
+    for sql in [
+        "create table t886 (a int default 'x')",
+        "create table t886 (a int default 'x' + 1)",
+        "create table t886 (a int default 1/0 + 'x'::int)",
+    ] {
+        let err = plan(sql, &lookup).expect_err(sql);
+        assert_eq!(err.sqlstate(), "22P02", "{sql}: {err}");
+    }
 }

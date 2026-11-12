@@ -8589,7 +8589,7 @@ fn plan_alter_action(
                     // needs nothing evaluated now; it is analysed all the
                     // same (RP-881).
                     default_expr::analyse_unpositioned(raw)?;
-                    Some(default_value_or_expr(raw, &column.pg_type, params)?)
+                    Some(cooked_default_value_or_expr(raw, &column.pg_type, params)?)
                 }
             };
             let (value, expr) = match value {
@@ -9406,6 +9406,15 @@ fn plan_added_column(
             _ => {}
         }
     }
+    // ADD COLUMN evaluates the default it keeps when it is not volatile
+    // (`ATExecAddColumn`'s missing value), the domain's too, however many
+    // rows the table holds: `add column b d` over a domain whose default is
+    // `1/0` is 22012 (RP-886).
+    if column.extra.contains_key("default_from_domain") {
+        if let Some(sql) = domain.as_ref().and_then(|d| d.default_sql.as_deref()) {
+            default_value_or_expr(&domains::parse_default_sql(sql)?, &ty, &[])?;
+        }
+    }
     Ok(column)
 }
 
@@ -9636,7 +9645,7 @@ fn tag_domain_column(
     }
     if let Some(sql) = &d.default_sql {
         let raw = domains::parse_default_sql(sql)?;
-        match default_value_or_expr(&raw, underlying, &[])? {
+        match cooked_default_value_or_expr(&raw, underlying, &[])? {
             DefaultSpec::Value(v) => {
                 column.default = Some(v);
                 column.set_default_sql(ruleutils_default(&raw));
@@ -9683,6 +9692,27 @@ fn default_value_or_expr(
         Ok(v) => Ok(DefaultSpec::Value(cast_value(v, pg_type)?)),
         Err(Error::Unsupported(_)) => as_expr(),
         Err(e) => Err(e),
+    }
+}
+
+/// A DEFAULT as it is declared -- CREATE TABLE, ALTER TABLE ... SET DEFAULT,
+/// a domain's default reaching a column -- where `cookDefault` analyses it
+/// and runs nothing: [`default_value_or_expr`], except that a constant
+/// whose folding raises an error no analysis raises (`1/0`) is kept as its
+/// expression, for the INSERT that uses it to raise (RP-886). ALTER TABLE
+/// ... ADD COLUMN evaluates its default at once, and calls
+/// [`default_value_or_expr`] itself.
+fn cooked_default_value_or_expr(
+    raw: &pg_query::protobuf::Node,
+    pg_type: &str,
+    params: &[Bson],
+) -> Result<DefaultSpec> {
+    match default_value_or_expr(raw, pg_type, params) {
+        Err(e) => {
+            default_expr::folding_error_stands(raw, pg_type, e)?;
+            Ok(DefaultSpec::Expr(deparse_expr(raw)?))
+        }
+        ok => ok,
     }
 }
 
@@ -12672,7 +12702,7 @@ fn plan_create(c: &pg_query::protobuf::CreateStmt, analyse_defaults: bool) -> Re
         let column = &mut def.columns[i];
         check_default_type(column, &raw)?;
         column.extra.remove("default_from_domain");
-        match default_value_or_expr(&raw, &underlying, &[])? {
+        match cooked_default_value_or_expr(&raw, &underlying, &[])? {
             DefaultSpec::Value(v) => {
                 column.default = Some(v);
                 column.set_default_sql(ruleutils_default(&raw));
@@ -35137,7 +35167,7 @@ pub fn regtype_text(oid: i64) -> String {
             .or_else(|| user_composite_name(oid))
             .map(|n| match n.strip_prefix("public.") {
                 Some(bare) if pgtypes::shadowed_by_catalog(bare) => n,
-                _ => schemas::visible_name(&n),
+                _ => schemas::type_visible_name(&n),
             })
     };
     if let Some(name) = user_name(oid) {
@@ -37099,19 +37129,46 @@ fn text_type_oid(name: &str) -> Option<i64> {
     if let Some(oid) = pgtypes::catalog_composite_oid(&parts, array) {
         return Some(oid);
     }
-    // A bare name finds a `public` type only while `public` is on the search
-    // path (`TypenameGetTypid`): pg_dump sets it empty, and `'mood'::regtype`
-    // is then 42704, `to_regtype('mood')` NULL.
-    if parts.len() == 1 && !schemas::search_path().iter().any(|s| s == "public") {
-        return None;
-    }
+    // A bare name is looked up as `TypenameGetTypid` walks the search path:
+    // the session's temporary schema first, then each schema on the path.
+    // So a `public` type is found only while `public` is on it: pg_dump
+    // sets it empty, and `'mood'::regtype` is then 42704, `to_regtype('mood')`
+    // NULL.
+    let found_in = match parts.as_slice() {
+        [one] => {
+            let schema = schemas::type_schema_of(&pgtypes::user_type_key(one));
+            // `_t`, the internal spelling of `t[]`, is found where `t` is.
+            if schema.is_none() {
+                if let Some(element) = one.strip_prefix('_').filter(|e| !e.is_empty()) {
+                    let key = pgtypes::user_type_key(element);
+                    if let Some(s) = schemas::type_schema_of(&key) {
+                        return user_type_or_array_oid(&format!(
+                            "{}[]",
+                            schemas::relation_key(&s, &key)
+                        ));
+                    }
+                }
+            }
+            if schema.is_none() && !schemas::search_path().iter().any(|s| s == "public") {
+                return None;
+            }
+            schema
+        }
+        _ => None,
+    };
     let base = match parts
         .iter()
         .map(String::as_str)
         .collect::<Vec<_>>()
         .as_slice()
     {
-        [one] | ["public", one] => pgtypes::user_type_key(one),
+        [one] => match found_in.as_deref() {
+            Some(schema) => schemas::relation_key(schema, &pgtypes::user_type_key(one)),
+            None => pgtypes::user_type_key(one),
+        },
+        ["public", one] => pgtypes::user_type_key(one),
+        // `pg_temp` is the session's temporary schema (`LookupExplicitNamespace`).
+        ["pg_temp", one] => schemas::relation_key(&schemas::temp_schema_in_use()?, one),
         _ => parts.join("."),
     };
     let key = if array { format!("{base}[]") } else { base };
