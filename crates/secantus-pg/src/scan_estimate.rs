@@ -486,23 +486,33 @@ impl PgHandler {
             .filter(|_| on.is_some())
             .chain(j.where_filters.iter())
             .collect();
-        // An ON conjunct reading one side only is that side's restriction
-        // (an inner join's is pushed to its scan; a LEFT join's stays a
-        // join filter, `clause_selectivity` over its statistics), which is
-        // not modelled here.
+        // An ON conjunct reading a LEFT join's preserved side only stays
+        // the join's filter, a restriction clause `clause_selectivity`
+        // estimates from that table's statistics (RP-354). One over an
+        // inner join's side is pushed to its scan, which is not modelled
+        // here; a LEFT join's nullable side's was pushed already.
+        let preserved = match left.as_ref() {
+            JoinNode::Leaf { def, .. } if left_join => Some(def.name.as_str()),
+            _ => None,
+        };
+        let restriction = |f: &secantus_pgplan::joins::JoinFilter| {
+            f.restrict.is_some() && f.aliases.len() == 1 && Some(f.aliases[0].as_str()) == preserved
+        };
         if filters.iter().any(|f| {
-            !matches!(f.kind, FilterKind::Inequality | FilterKind::NotEqual(..))
-                || f.aliases.len() < 2
+            !restriction(f)
+                && (!matches!(f.kind, FilterKind::Inequality | FilterKind::NotEqual(..))
+                    || f.aliases.len() < 2)
         }) {
             return None;
         }
+        let restricted = filters.iter().any(|f| restriction(f));
         // A `<`, `<=`, `>` or `>=` between the sides can be an indexed
         // side's parameterized Index Cond (RP-354), priced below where it
         // compares two plain keys; a `<>` never is one (no B-tree
         // strategy).
-        let opaque_inequality = filters
-            .iter()
-            .any(|f| matches!(f.kind, FilterKind::Inequality) && f.compare.is_none());
+        let opaque_inequality = filters.iter().any(|f| {
+            !restriction(f) && matches!(f.kind, FilterKind::Inequality) && f.compare.is_none()
+        });
         let indexes = self.index_relations();
         let project = j.project.as_deref();
         // Each joined key's table and field, for `neqjoinsel`.
@@ -578,9 +588,21 @@ impl PgHandler {
         // `clauselist_selectivity`: the conjuncts' product, in order. A
         // `<>` (or IS DISTINCT FROM) is `neqjoinsel`, one minus
         // `eqjoinsel` over the two columns' statistics; one never
-        // analysed is not modelled here.
+        // analysed is not modelled here. A restriction is its table's
+        // `clause_selectivity`, except that one bound of a column against
+        // a constant joins the range clauses (`addRangeClause`), which are
+        // multiplied in last, a column's two bounds as one range.
         let mut sel_factor = 1.0_f64;
+        let mut ranges: Vec<Document> = Vec::new();
         for f in &filters {
+            if let (true, Some(r)) = (restriction(f), &f.restrict) {
+                if single_bound(r) {
+                    ranges.push(r.clone());
+                } else {
+                    sel_factor *= self.restriction_selectivity(&leaves.first()?.table, r)?;
+                }
+                continue;
+            }
             sel_factor *= match &f.kind {
                 FilterKind::Inequality => 1.0 / 3.0,
                 FilterKind::NotEqual(l, r) => {
@@ -606,6 +628,13 @@ impl PgHandler {
                 _ => return None,
             };
         }
+        if !ranges.is_empty() {
+            let filter = match ranges.len() {
+                1 => ranges.remove(0),
+                _ => bson::doc! { "$and": ranges },
+            };
+            sel_factor *= self.restriction_selectivity(&leaves.first()?.table, &filter)?;
+        }
         // Each side as the inner of a nested loop through its index,
         // parameterized by the other side's row: `param[0]` is `b` inner
         // (a LEFT join's nullable side), `param[1]` is `a`.
@@ -629,6 +658,10 @@ impl PgHandler {
             );
             match found {
                 ParamFound::None => {}
+                // A restriction on the outer side is not movable into
+                // the inner's scan (`join_clause_is_movable_into`), so
+                // the scan's rows are not `param_rows`: not modelled.
+                ParamFound::Scan(..) if restricted => return None,
                 ParamFound::Unmodelled => return None,
                 ParamFound::Scan(p, scan) => {
                     param[slot] = Some(p);
@@ -3062,34 +3095,7 @@ impl PgHandler {
             })
         };
         let pt = self.planner_table_lazy(table, &count)?;
-        let (sel, quals) = if filter.is_empty() {
-            (1.0, Vec::new())
-        } else if let Some(stats) = &pt.analyzed {
-            let indexes = self.cost_indexes(table, &pt.def, count()? as u64);
-            let w = self.analyzed_where(
-                table, &pt.def, &pt.unique, stats, pt.tuples, filter, &indexes,
-            )?;
-            (w.selectivity, w.quals)
-        } else {
-            let nd = |f: &str| {
-                if pt.unique.iter().any(|u| u == f) {
-                    pt.tuples
-                } else if pt
-                    .def
-                    .columns
-                    .iter()
-                    .any(|c| c.field() == f && c.pg_type == "bool")
-                {
-                    2.0
-                } else {
-                    pt.tuples.min(200.0)
-                }
-            };
-            (
-                hashagg::filter_selectivity(filter, &nd)?,
-                costsize::conjuncts(filter)?,
-            )
-        };
+        let (sel, quals) = self.where_selectivity(table, &pt, filter, &count)?;
         let mut quals = with_in_lengths(quals);
         let mut sel = sel;
         for q in array_quals {
@@ -3120,6 +3126,62 @@ impl PgHandler {
             costsize::clamp_row_est(pt.tuples * sel),
             width,
         ))
+    }
+
+    /// `clauselist_selectivity` of `filter` over user table `table`
+    /// (`pt`), from its columns' statistics where it was analysed and
+    /// PostgreSQL's defaults where not, and its quals as the cost model
+    /// sees them; `count` counts the table's rows.
+    fn where_selectivity(
+        &self,
+        table: &str,
+        pt: &crate::PlannerTable,
+        filter: &Document,
+        count: &dyn Fn() -> Option<usize>,
+    ) -> Option<(f64, Vec<(String, costsize::Qual)>)> {
+        if filter.is_empty() {
+            return Some((1.0, Vec::new()));
+        }
+        if let Some(stats) = &pt.analyzed {
+            let indexes = self.cost_indexes(table, &pt.def, count()? as u64);
+            let w = self.analyzed_where(
+                table, &pt.def, &pt.unique, stats, pt.tuples, filter, &indexes,
+            )?;
+            return Some((w.selectivity, w.quals));
+        }
+        let nd = |f: &str| {
+            if pt.unique.iter().any(|u| u == f) {
+                pt.tuples
+            } else if pt
+                .def
+                .columns
+                .iter()
+                .any(|c| c.field() == f && c.pg_type == "bool")
+            {
+                2.0
+            } else {
+                pt.tuples.min(200.0)
+            }
+        };
+        Some((
+            hashagg::filter_selectivity(filter, &nd)?,
+            costsize::conjuncts(filter)?,
+        ))
+    }
+
+    /// `clause_selectivity` of a restriction clause over user table
+    /// `table`, lowered to `filter` ([`Self::where_selectivity`]).
+    fn restriction_selectivity(&self, table: &str, filter: &Document) -> Option<f64> {
+        let counted: std::cell::OnceCell<Option<usize>> = std::cell::OnceCell::new();
+        let count = || {
+            *counted.get_or_init(|| {
+                self.storage
+                    .count_matching(self.db(), table, &Document::new(), None)
+                    .ok()
+            })
+        };
+        let pt = self.planner_table_lazy(table, &count)?;
+        Some(self.where_selectivity(table, &pt, filter, &count)?.0)
     }
 
     /// A built-in catalog of `pg_catalog`, sized and measured as `initdb`
@@ -5037,6 +5099,17 @@ pub(crate) type LeftImplied = (Vec<(String, String)>, (String, String));
 /// restriction of its scan (`distribute_restrictinfo_to_rels`) and leaves
 /// the column's join clause in place, as an equality would not: that one
 /// joins the key's equivalence class (RP-363).
+/// `filter` is one bound of one column against a constant -- `{a: {$gt:
+/// 990}}` -- the shape `clauselist_selectivity` defers as a range clause.
+fn single_bound(filter: &Document) -> bool {
+    match filter.iter().collect::<Vec<_>>().as_slice() {
+        [(k, bson::Bson::Document(d))] if !k.starts_with('$') && d.len() == 1 => {
+            bounds_only(filter, k)
+        }
+        _ => false,
+    }
+}
+
 fn bounds_only(filter: &Document, field: &str) -> bool {
     filter.iter().all(|(k, v)| match (k.as_str(), v) {
         ("$and", bson::Bson::Array(items)) => items.iter().all(|x| match x {

@@ -2490,6 +2490,12 @@ pub struct WindowItem {
     /// Extra LITERAL arguments: `lag`/`lead`'s offset and default,
     /// `nth_value`'s N, `ntile`'s bucket count.
     pub args: Vec<Bson>,
+    /// A two-argument aggregate's second argument (`corr(y, x)`'s `x`,
+    /// `json_object_agg(k, v)`'s `v`), evaluated per row like `arg`.
+    pub arg2: Option<ColumnExpr>,
+    /// `WindowFunc::Aggregate`'s aggregate, planned as the same call without
+    /// OVER is: its argument types checked and resolved the same way.
+    pub agg: Option<Box<AggItem>>,
     /// `PARTITION BY`: rows are grouped by these before anything else. Reuses
     /// `OrderKey` so one comparator serves partitioning and ordering both;
     /// the direction and null placement are unused here.
@@ -2543,6 +2549,11 @@ pub enum WindowFunc {
     ArrayAgg,
     BoolAnd,
     BoolOr,
+    /// Any other built-in plain aggregate (`stddev`, `corr`, `jsonb_agg`,
+    /// `bit_and`, ...), computed over the frame by the ordinary aggregate
+    /// `WindowItem::agg` holds, as PostgreSQL runs any aggregate as a window
+    /// function.
+    Aggregate,
     /// A `CREATE AGGREGATE` aggregate over the frame.
     User,
 }
@@ -14425,6 +14436,10 @@ fn window_func_by_name(name: &str) -> Option<WindowFunc> {
         "array_agg" => WindowFunc::ArrayAgg,
         "bool_and" => WindowFunc::BoolAnd,
         "bool_or" => WindowFunc::BoolOr,
+        // A plain (not ordered-set) built-in aggregate of PostgreSQL's.
+        n if matches!(aggregate_func(n, false), Some((f, _)) if f != AggFunc::User) => {
+            WindowFunc::Aggregate
+        }
         n if user_agg::is_user_aggregate(n) => WindowFunc::User,
         _ => return None,
     })
@@ -14449,7 +14464,7 @@ fn window_result_type(func: WindowFunc, source: Option<&str>) -> String {
         WindowFunc::BoolAnd | WindowFunc::BoolOr => "bool".to_string(),
         WindowFunc::ArrayAgg => format!("{}[]", source.unwrap_or("text")),
         // Replaced by the aggregate's own result type once it is resolved.
-        WindowFunc::User => source.unwrap_or("text").to_string(),
+        WindowFunc::User | WindowFunc::Aggregate => source.unwrap_or("text").to_string(),
         // The value-returning ones keep their argument's type.
         WindowFunc::Lag
         | WindowFunc::Lead
@@ -14856,6 +14871,28 @@ fn plan_window_call(
     } else {
         func
     };
+    // An aggregate is checked, and its argument types resolved, exactly as
+    // the same call without OVER is (`ParseFuncOrColumn` does both before it
+    // looks at OVER): `bit_and(text)` is 42883 either way.
+    let agg = if func == WindowFunc::Aggregate {
+        // The window's own clauses are refused or applied below.
+        let plain = pg_query::protobuf::FuncCall {
+            over: None,
+            agg_filter: None,
+            agg_distinct: false,
+            agg_order: Vec::new(),
+            ..f.clone()
+        };
+        Some(Box::new(plan_aggregate_item(
+            &plain,
+            def,
+            windows.len(),
+            params,
+            String::new(),
+        )?))
+    } else {
+        None
+    };
     if f.agg_distinct {
         // PostgreSQL refuses this itself (`DISTINCT is not implemented for
         // window functions`), so it is its answer rather than a gap here.
@@ -14863,19 +14900,35 @@ fn plan_window_call(
             "DISTINCT is not implemented for window functions".into(),
         ));
     }
+    if !f.agg_order.is_empty() {
+        // `ParseFuncOrColumn`: no window function takes an ORDER BY of its
+        // own, the aggregates included.
+        set_error_location(f.location);
+        return Err(Error::FeatureNotSupported(
+            "aggregate ORDER BY is not implemented for window functions".into(),
+        ));
+    }
     let (partition_by, order_by, frame) = plan_window_def(over, named, def, params, keys)?;
     // The first argument is the one evaluated per row; the rest are
-    // constants (`lag(v, 1, -1)`, `nth_value(v, 2)`, `ntile(3)`).
-    let (arg, source_type, args) = plan_window_args(func, f, def, params)?;
+    // constants (`lag(v, 1, -1)`, `nth_value(v, 2)`, `ntile(3)`), but for a
+    // two-argument aggregate, whose second is per row too.
+    let (arg, source_type, args, arg2) = plan_window_args(func, f, def, params)?;
     let field = format!("__win{}", windows.len());
     let user = if func == WindowFunc::User {
         Some(user_agg::resolve(&name, source_type.as_deref())?)
     } else {
         None
     };
-    let result_type = match &user {
-        Some(u) => user_agg::result_type(u, source_type.as_deref()),
-        None => window_result_type(func, source_type.as_deref()),
+    let result_type = match (&user, &agg) {
+        (Some(u), _) => user_agg::result_type(u, source_type.as_deref()),
+        (_, Some(a)) => aggregate_item_type(a),
+        _ => window_result_type(func, source_type.as_deref()),
+    };
+    // The aggregate's view of its argument type (`stddev(NULL)` reads as
+    // float8), which its computation follows.
+    let source_type = match &agg {
+        Some(a) => a.source_type.clone(),
+        None => source_type,
     };
     let filter = match f.agg_filter.as_deref() {
         None => None,
@@ -14933,6 +14986,8 @@ fn plan_window_call(
         arg,
         arg_field,
         args,
+        arg2,
+        agg,
         partition_by,
         partition_types,
         order_by,
@@ -15124,14 +15179,14 @@ fn plan_window_args(
     f: &pg_query::protobuf::FuncCall,
     def: &TableDef,
     params: &[Bson],
-) -> Result<(Option<ColumnExpr>, Option<String>, Vec<Bson>)> {
+) -> Result<WindowArgs> {
     if func == WindowFunc::CountStar {
-        return Ok((None, None, Vec::new()));
+        return Ok((None, None, Vec::new(), None));
     }
     // `row_number()` / `rank()` / `dense_rank()` / `percent_rank()` /
     // `cume_dist()` take none.
     if f.args.is_empty() {
-        return Ok((None, None, Vec::new()));
+        return Ok((None, None, Vec::new(), None));
     }
     let fields: Vec<RowField> = def
         .columns
@@ -15150,7 +15205,7 @@ fn plan_window_args(
     // `ntile(3)` takes its bucket count as the ONLY argument, and it is a
     // constant rather than a per-row value.
     if func == WindowFunc::Ntile {
-        return Ok((None, None, vec![const_value(&f.args[0], params)?]));
+        return Ok((None, None, vec![const_value(&f.args[0], params)?], None));
     }
     let source_type = match f.args[0].node.as_ref() {
         Some(N::ColumnRef(c)) => {
@@ -15163,12 +15218,30 @@ fn plan_window_args(
         ColumnExpr::Row { result_type, .. } if !result_type.is_empty() => Some(result_type.clone()),
         _ => None,
     });
+    if func == WindowFunc::Aggregate {
+        // Two arguments only when the aggregate takes two, which planning
+        // it as an aggregate has checked.
+        let arg2 = match f.args.get(1) {
+            Some(node) => Some(row_column_expr(node, &fields, params, &sample)?),
+            None => None,
+        };
+        return Ok((Some(expr), source_type, Vec::new(), arg2));
+    }
     let mut args = Vec::new();
     for extra in f.args.iter().skip(1) {
         args.push(const_value(extra, params)?);
     }
-    Ok((Some(expr), source_type, args))
+    Ok((Some(expr), source_type, args, None))
 }
+
+/// A window call's arguments: the per-row one, its type, the literal extras
+/// and a two-argument aggregate's per-row second.
+type WindowArgs = (
+    Option<ColumnExpr>,
+    Option<String>,
+    Vec<Bson>,
+    Option<ColumnExpr>,
+);
 
 /// A HAVING with no GROUP BY and no aggregate in the select list: the whole
 /// input is ONE group, so the query yields one row or none -- never a row per
@@ -26223,7 +26296,8 @@ fn rewrite_tablesample(
 /// `xmlagg(x [ORDER BY ...])` as `string_agg(x::text, '' [ORDER BY ...])::xml`
 /// -- the concatenation of the non-NULL values in order, NULL over no rows,
 /// which is `xmlagg`'s definition -- so it rides the aggregate planner's
-/// ordering, FILTER and grouping as they are. `None` when there is none.
+/// ordering, FILTER, grouping and windows as they are. `None` when there is
+/// none.
 fn rewrite_xmlagg(
     s: &pg_query::protobuf::SelectStmt,
 ) -> Result<Option<pg_query::protobuf::SelectStmt>> {
@@ -26245,7 +26319,9 @@ fn rewrite_xmlagg(
         let Some(N::FuncCall(f)) = n.node.as_ref() else {
             return Ok(());
         };
-        if func_name(f).as_deref() != Some("xmlagg") || f.over.is_some() {
+        // Under OVER too: `string_agg` runs over a window frame as it does
+        // over a group.
+        if func_name(f).as_deref() != Some("xmlagg") {
             return Ok(());
         }
         let [arg] = f.args.as_slice() else {

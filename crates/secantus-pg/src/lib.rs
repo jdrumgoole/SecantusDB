@@ -4773,6 +4773,11 @@ struct CursorState {
     /// row `base + 1`.
     tail: Option<portal_stream::CursorTail>,
     base: usize,
+    /// The rows of the DECLARE's query not computed yet
+    /// (`portal_stream::PendingRows`): a FETCH computes only the rows it
+    /// reaches, as PostgreSQL's executor runs a portal's plan as it is
+    /// fetched (RP-744). `rows` then holds every row computed so far.
+    pending: Option<portal_stream::PendingRows>,
     /// An error was raised while the cursor ran (PostgreSQL's
     /// `PORTAL_FAILED`): every later read of it is refused.
     failed: bool,
@@ -21929,7 +21934,7 @@ impl PgHandler {
                 // Rows a read failed in are not kept: the next reader builds
                 // them again (and the failure stays noted for this one's).
                 let outer = CATALOG_FILL_ERROR.with(|e| e.borrow_mut().take());
-                let rows = self.virtual_rows_uncached(name, &Document::new());
+                let rows = self.catalog_rows(name);
                 let failed = CATALOG_FILL_ERROR.with(|e| {
                     let mut e = e.borrow_mut();
                     if e.is_none() {
@@ -21949,21 +21954,36 @@ impl PgHandler {
                 rows
             }
         };
-        if filter.is_empty() {
-            return Some(rows.as_ref().clone());
-        }
-        let empty = Document::new();
-        let in_sets = secantus_core::query::InSets::prepare(filter);
-        let _in_sets = secantus_core::query::InSetsGuard::install(&in_sets);
-        Some(
-            rows.iter()
-                .filter(|d| secantus_core::query::matches(d, filter, &empty, None).unwrap_or(false))
-                .cloned()
-                .collect(),
-        )
+        Some(rows.filtered(filter))
+    }
+
+    /// `pg_attribute`'s rows for PostgreSQL's own relations, filled, built
+    /// once per process (RP-715).
+    ///
+    /// They are 3,054 of the rows a fresh database lists, and no statement
+    /// changes them: every value comes from what 15.19's `initdb` leaves
+    /// (`pg_attribute_system.tsv`, the built-in types' facts, `pg_init_privs`),
+    /// none from a user's table, type, domain or grant. Rebuilt with the rest
+    /// of the catalog after every DDL statement, they were nearly all of the
+    /// first catalog query's cost after one (a debug build: 0.12 s against
+    /// 0.008 s warm), where PostgreSQL invalidates only the cache entries of
+    /// the rows a statement changed (`inval.c`) and so never re-reads them.
+    fn system_relation_attributes(&self, def: &TableDef) -> Arc<Vec<Document>> {
+        static ROWS: OnceLock<Arc<Vec<Document>>> = OnceLock::new();
+        Arc::clone(ROWS.get_or_init(|| {
+            let mut rows = catalog_meta::attribute_rows(def);
+            self.fill_catalog_columns("pg_attribute", def, &mut rows);
+            Arc::new(rows)
+        }))
     }
 
     fn virtual_rows_uncached(&self, name: &str, filter: &Document) -> Option<Vec<Document>> {
+        Some(self.catalog_rows(name)?.filtered(filter))
+    }
+
+    /// Every row of one virtual table, unfiltered: those built for this
+    /// read, and those no statement changes (`CatalogRows::fixed`).
+    pub(crate) fn catalog_rows(&self, name: &str) -> Option<CatalogRows> {
         let def = Self::virtual_table(name)?;
         let mut rows: Vec<Document> = match name {
             "pg_collation" => {
@@ -24480,8 +24500,8 @@ impl PgHandler {
                         rows.push(d);
                     }
                 }
-                // PostgreSQL's own relations' columns.
-                rows.extend(catalog_meta::attribute_rows(&def));
+                // PostgreSQL's own relations' columns are added once filled
+                // (`system_relation_attributes`): no statement changes them.
                 rows
             }
             // One row per label, in declared order; sortorder starts at 1.
@@ -25236,15 +25256,12 @@ impl PgHandler {
                     .filter(|d| oid_of(d).is_none_or(|o| !have.contains(&o))),
             );
         }
-        let empty = Document::new();
-        // Large scalar `$in` / `$nin` lists hashed once for these rows.
-        let in_sets = secantus_core::query::InSets::prepare(filter);
-        let _in_sets = secantus_core::query::InSetsGuard::install(&in_sets);
-        Some(
-            rows.into_iter()
-                .filter(|d| secantus_core::query::matches(d, filter, &empty, None).unwrap_or(false))
-                .collect(),
-        )
+        let fixed = if name == "pg_attribute" {
+            self.system_relation_attributes(&def)
+        } else {
+            Arc::default()
+        };
+        Some(CatalogRows { built: rows, fixed })
     }
 
     /// Read one table's catalog entry: this transaction's pending creates and
@@ -29054,10 +29071,12 @@ impl PgHandler {
         if let Err(message) = cursor.check_runnable(name) {
             return Err(Self::user_error("55000", message));
         }
-        // A streamed cursor reads what this FETCH reaches first.
+        // A streamed cursor reads what this FETCH reaches first, and a
+        // cursor computes the rows it reaches (RP-744).
         if cursor.tail.is_some() {
             self.fill_cursor(cursor, direction, count)?;
         }
+        self.fill_pending(cursor, direction, count)?;
         let base = cursor.base;
         let len = (base + cursor.rows.len()) as i64;
         let pos = cursor.pos;
@@ -34035,6 +34054,65 @@ impl PgHandler {
                 ))));
             };
             let schema = q.row_schema.clone();
+            // PortalStart runs nothing: the select list is computed for the
+            // rows a FETCH reaches, so a row no FETCH reaches never raises
+            // its error (RP-744). Kept whole here: a WITH HOLD cursor
+            // declared outside a block, whose transaction ends now
+            // (PostgreSQL materialises it at that commit), and a simply
+            // updatable one, whose rows' ids are captured with them.
+            let unpolled = self
+                .cursor_capture
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .as_ref()
+                .is_none_or(Vec::is_empty);
+            if in_block && updatable.is_none() && unpolled {
+                take_ids();
+                self.cursor_capture
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .take();
+                self.cursors
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(
+                        name,
+                        CursorState {
+                            born: next_cursor_born(),
+                            schema,
+                            domains: secantus_pgplan::select_output_domains(
+                                &statement,
+                                &[],
+                                &|n: &str| self.lookup(n),
+                            ),
+                            rows: Vec::new(),
+                            pos: 0,
+                            statement,
+                            is_holdable: holdable,
+                            is_binary: is_binary_cursor,
+                            is_scrollable: scrollable,
+                            creation_time: bson::DateTime::now(),
+                            typed_rows: Some(Vec::new()),
+                            tz,
+                            tail: None,
+                            base: 0,
+                            pending: Some(portal_stream::PendingRows::new(
+                                q.data_rows,
+                                capture_typed,
+                            )),
+                            failed: false,
+                            current_of: None,
+                            held: false,
+                            pinned: false,
+                            auto_held: false,
+                        },
+                    );
+                if holdable {
+                    self.holdable_declared
+                        .store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+                return Ok(vec![Response::Execution(Tag::new("DECLARE CURSOR"))]);
+            }
             let rows = q.data_rows.try_collect::<Vec<_>>().await;
             let ids = take_ids();
             let rows = rows?;
@@ -34076,6 +34154,7 @@ impl PgHandler {
                         tz,
                         tail: None,
                         base: 0,
+                        pending: None,
                         failed: false,
                         current_of,
                         // Declared outside a block, its transaction is
@@ -37125,7 +37204,17 @@ impl PgHandler {
                 self.implicit_extended
                     .store(false, std::sync::atomic::Ordering::Relaxed);
                 // A COMMIT closes every non-holdable cursor; `WITH HOLD`
-                // survives with its rows already materialised.
+                // survives with its rows already materialised. The ones
+                // this block declared go with it if the COMMIT fails, as
+                // `AtAbort_Portals` drops a portal its transaction made.
+                let declared_here: Vec<String> = self
+                    .cursors
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .iter()
+                    .filter(|(_, c)| c.is_holdable && !c.held && !c.auto_held)
+                    .map(|(name, _)| name.clone())
+                    .collect();
                 self.close_cursors_on_txn_end(true);
                 if let Some(mut handle) = guard.take() {
                     self.in_transaction
@@ -37140,8 +37229,16 @@ impl PgHandler {
                         .with_user_transaction(&mut handle, || self.run_deferred_checks())
                         .map_err(|e| Self::storage_err("transaction failed", e))
                         .and_then(|r| r)
+                        .and_then(|()| self.persist_holdable_cursors())
                         .and_then(|()| self.ssi_pre_commit());
                     if let Err(e) = checked {
+                        {
+                            let mut cursors =
+                                self.cursors.lock().unwrap_or_else(|e| e.into_inner());
+                            for name in &declared_here {
+                                cursors.remove(name);
+                            }
+                        }
                         self.storage
                             .rollback_user_transaction(&mut handle)
                             .map_err(|e| Self::storage_err("could not roll back", e))?;
@@ -40050,6 +40147,13 @@ impl PgHandler {
             self.fill_cursor(cursor, direction, wanted)
                 .map_err(Self::plan_error_of)?;
         }
+        let direction = if backward {
+            secantus_pgplan::FetchDirection::Backward
+        } else {
+            secantus_pgplan::FetchDirection::Forward
+        };
+        self.fill_pending(cursor, direction, wanted)
+            .map_err(Self::plan_error_of)?;
         let base = cursor.base;
         let len = (base + cursor.rows.len()) as i64;
         let positions: Vec<i64> = if backward {
@@ -51385,6 +51489,14 @@ fn materialise_windows(
                     .collect::<Result<_, _>>()?,
                 None => vec![Bson::Null; docs.len()],
             };
+            // A two-argument aggregate's second argument; empty otherwise.
+            let values2: Vec<Bson> = match w.arg2.as_ref() {
+                Some(expr) => docs
+                    .iter()
+                    .map(|d| secantus_pgplan::apply_row_expr(expr, d))
+                    .collect::<Result<_, _>>()?,
+                None => Vec::new(),
+            };
             // `FILTER (WHERE ...)` removes a row from the AGGREGATION, not from
             // the output: the row still gets a value, computed over the rows that
             // did pass.
@@ -51403,7 +51515,7 @@ fn materialise_windows(
                 // In the sorted order, so rows that tie on the window's ORDER
                 // BY are taken in the order PostgreSQL's sort left them.
                 partition.sort_by_key(|r| rank[*r]);
-                window_partition_values(docs, &partition, w, &values, &included)?;
+                window_partition_values(docs, &partition, w, &values, &values2, &included)?;
             }
         }
     }
@@ -51471,6 +51583,7 @@ fn window_partition_values(
     partition: &[usize],
     w: &secantus_pgplan::WindowItem,
     values: &[Bson],
+    values2: &[Bson],
     included: &[bool],
 ) -> Result<(), PlanError> {
     // The partition in WINDOW order. Stable, so rows that tie on every key
@@ -51529,7 +51642,16 @@ fn window_partition_values(
 
     for pos in 0..n {
         let row = ordered[pos];
-        let value = window_value(w, &ordered, pos, &peers, &order_values, values, included)?;
+        let value = window_value(
+            w,
+            &ordered,
+            pos,
+            &peers,
+            &order_values,
+            values,
+            values2,
+            included,
+        )?;
         docs[row].insert(w.field.clone(), value);
     }
     Ok(())
@@ -51549,6 +51671,7 @@ struct Peers {
 }
 
 /// One row's window value.
+#[allow(clippy::too_many_arguments)]
 fn window_value(
     w: &secantus_pgplan::WindowItem,
     ordered: &[usize],
@@ -51556,6 +51679,7 @@ fn window_value(
     peers: &Peers,
     order_values: &[Option<Bson>],
     values: &[Bson],
+    values2: &[Bson],
     included: &[bool],
 ) -> Result<Bson, PlanError> {
     let peer_start = &peers.start;
@@ -51643,8 +51767,11 @@ fn window_value(
     // Everything else reads the FRAME.
     let Some((lo, hi)) = window_frame_bounds(w, pos, n, peers, order_values)? else {
         // An empty frame: the aggregates answer NULL, and `count` answers 0.
+        // Any other aggregate answers what it does over no rows
+        // (`regr_count` is 0), its final function over its initial state.
         return Ok(match w.func {
             F::Count | F::CountStar => Bson::Int64(0),
+            F::Aggregate => checked_window_aggregate(w, &[], &[])?,
             _ => Bson::Null,
         });
     };
@@ -51658,10 +51785,18 @@ fn window_value(
         X::Group => p >= peer_start[pos] && p < peer_end[pos],
         X::Ties => p != pos && p >= peer_start[pos] && p < peer_end[pos],
     };
-    let frame: Vec<Bson> = (lo..=hi)
+    let rows: Vec<usize> = (lo..=hi)
         .filter(|p| !excluded(*p) && included[ordered[*p]])
-        .map(at)
         .collect();
+    let frame: Vec<Bson> = rows.iter().map(|p| at(*p)).collect();
+    if w.func == F::Aggregate {
+        let frame2: Vec<Bson> = if values2.is_empty() {
+            Vec::new()
+        } else {
+            rows.iter().map(|p| values2[ordered[*p]].clone()).collect()
+        };
+        return checked_window_aggregate(w, &frame, &frame2);
+    }
     if frame.is_empty() {
         return Ok(match w.func {
             F::Count | F::CountStar => Bson::Int64(0),
@@ -51689,15 +51824,61 @@ fn window_value(
             Some(u) => secantus_pgplan::user_agg::compute(u, &frame, w.source_type.as_deref())?,
             None => Bson::Null,
         },
-        _ => {
-            take_aggregate_error();
-            let v = window_aggregate(w, &frame);
-            if let Some(e) = take_aggregate_error() {
-                return Err(e);
-            }
-            v
-        }
+        _ => checked_window_aggregate(w, &frame, &[])?,
     })
+}
+
+/// [`window_aggregate`], with the error an aggregate raised while computing.
+fn checked_window_aggregate(
+    w: &secantus_pgplan::WindowItem,
+    frame: &[Bson],
+    frame2: &[Bson],
+) -> Result<Bson, PlanError> {
+    if let (secantus_pgplan::WindowFunc::Aggregate, Some(agg)) = (w.func, w.agg.as_deref()) {
+        return window_plain_aggregate(agg, frame, frame2);
+    }
+    take_aggregate_error();
+    let v = window_aggregate(w, frame);
+    match take_aggregate_error() {
+        Some(e) => Err(e),
+        None => Ok(v),
+    }
+}
+
+/// `WindowFunc::Aggregate`: the call's own aggregate item over the frame, by
+/// the same computation the call without OVER runs over a group. The item
+/// reads the frame's values from one-row documents rather than the slots
+/// and columns it was planned over.
+fn window_plain_aggregate(
+    agg: &AggItem,
+    frame: &[Bson],
+    frame2: &[Bson],
+) -> Result<Bson, PlanError> {
+    let item = AggItem {
+        field: Some("v".to_string()),
+        expr: None,
+        field2: agg.field2.as_ref().map(|_| "v2".to_string()),
+        expr2: None,
+        filter: None,
+        filter_field: None,
+        filter_expr: None,
+        order: Vec::new(),
+        distinct: false,
+        ..agg.clone()
+    };
+    let rows: Vec<Document> = frame
+        .iter()
+        .enumerate()
+        .map(|(i, v)| {
+            let mut d = Document::new();
+            d.insert("v", v.clone());
+            if let Some(v2) = frame2.get(i) {
+                d.insert("v2", v2.clone());
+            }
+            d
+        })
+        .collect();
+    compute_aggregate(&item, &rows).map_err(PgHandler::to_plan_error)
 }
 
 /// The aggregate window functions, computed by the ORDINARY aggregate.
@@ -55401,7 +55582,42 @@ fn copy_field(
 
 /// `virtual_rows`' cache entry: the message cycle, catalog version and
 /// settings generation it was computed under, and the rows.
-type CachedRows = (u64, u64, u64, Arc<Vec<Document>>);
+type CachedRows = (u64, u64, u64, Arc<CatalogRows>);
+
+/// A virtual table's rows ([`PgHandler::catalog_rows`]): those built for
+/// one read, then those that are the same for every read (`pg_attribute`'s
+/// rows for PostgreSQL's own relations, RP-715), shared rather than copied
+/// into each read's rows.
+#[derive(Debug, Default)]
+pub(crate) struct CatalogRows {
+    built: Vec<Document>,
+    fixed: Arc<Vec<Document>>,
+}
+
+impl CatalogRows {
+    pub(crate) fn len(&self) -> usize {
+        self.built.len() + self.fixed.len()
+    }
+
+    pub(crate) fn iter(&self) -> impl Iterator<Item = &Document> {
+        self.built.iter().chain(self.fixed.iter())
+    }
+
+    /// Copies of the rows `filter` matches, in order.
+    fn filtered(&self, filter: &Document) -> Vec<Document> {
+        if filter.is_empty() {
+            return self.iter().cloned().collect();
+        }
+        let empty = Document::new();
+        // Large scalar `$in` / `$nin` lists hashed once for these rows.
+        let in_sets = secantus_core::query::InSets::prepare(filter);
+        let _in_sets = secantus_core::query::InSetsGuard::install(&in_sets);
+        self.iter()
+            .filter(|d| secantus_core::query::matches(d, filter, &empty, None).unwrap_or(false))
+            .cloned()
+            .collect()
+    }
+}
 
 #[async_trait]
 impl CopyHandler for PgHandler {
@@ -57962,7 +58178,7 @@ fn priced_window_func(w: &secantus_pgplan::WindowItem) -> Option<(u32, Vec<Strin
             fields.extend(read);
         }
     }
-    if let Some(e) = &w.filter {
+    for e in w.arg2.iter().chain(w.filter.iter()) {
         let (o, read) = scan_estimate::column_expr_cost(e)?;
         ops += o;
         fields.extend(read);

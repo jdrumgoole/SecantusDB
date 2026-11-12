@@ -1141,15 +1141,115 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "        ->  Seq Scan on e e2  (cost=0.00..15.00 rows=1000 width=7)",
         ],
     ),
-    # A LEFT join's ON conjunct over its outer side alone stays a join
-    # filter, estimated from that column's statistics.
+    # Split from RP-354 and fixed: a LEFT join's ON conjunct over its
+    # outer side alone stays a join filter, estimated from that column's
+    # statistics, a single bound among the range clauses.
     "nested loop left join with a one-sided ON conjunct": (
-        "RP-354",
+        "RP-329",
         _ANALYSED,
         "explain select * from e left join e e2 on e.a <> e2.a and e.a > 990",
         [
             "Nested Loop Left Join  (cost=0.00..17532.50 rows=9990 width=14)",
             "  Join Filter: ((e.a <> e2.a) AND (e.a > 990))",
+            "  ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
+            "  ->  Materialize  (cost=0.00..20.00 rows=1000 width=7)",
+            "        ->  Seq Scan on e e2  (cost=0.00..15.00 rows=1000 width=7)",
+        ],
+    ),
+    # Its two bounds on one column are one range (`addRangeClause`).
+    "nested loop left join with two one-sided bounds": (
+        "RP-329",
+        _ANALYSED,
+        "explain select * from e left join e e2 on e.a <> e2.a and e.a > 990 and e.a < 995",
+        [
+            "Nested Loop Left Join  (cost=0.00..20032.50 rows=3996 width=14)",
+            "  Join Filter: ((e.a <> e2.a) AND (e.a > 990) AND (e.a < 995))",
+            "  ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
+            "  ->  Materialize  (cost=0.00..20.00 rows=1000 width=7)",
+            "        ->  Seq Scan on e e2  (cost=0.00..15.00 rows=1000 width=7)",
+        ],
+    ),
+    # An equality with a constant, from the column's MCV list.
+    "nested loop left join with a one-sided equality": (
+        "RP-329",
+        _ANALYSED,
+        "explain select * from e left join e e2 on e.a <> e2.a and e.b = 'v3'",
+        [
+            "Nested Loop Left Join  (cost=0.00..17532.50 rows=99900 width=14)",
+            "  Join Filter: ((e.a <> e2.a) AND (e.b = 'v3'::text))",
+            "  ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
+            "  ->  Materialize  (cost=0.00..20.00 rows=1000 width=7)",
+            "        ->  Seq Scan on e e2  (cost=0.00..15.00 rows=1000 width=7)",
+        ],
+    ),
+    # The outer side a primary key's table, its column stored as `_id`.
+    "nested loop left join with a one-sided ON conjunct on a primary key": (
+        "RP-329",
+        _ANALYSED,
+        "explain select * from k left join e on k.a <> e.a and k.a > 990",
+        [
+            "Nested Loop Left Join  (cost=0.00..17532.50 rows=9990 width=14)",
+            "  Join Filter: ((k.a <> e.a) AND (k.a > 990))",
+            "  ->  Seq Scan on k  (cost=0.00..15.00 rows=1000 width=7)",
+            "  ->  Materialize  (cost=0.00..20.00 rows=1000 width=7)",
+            "        ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
+        ],
+    ),
+    # Still open: the inner read through its index parameterized by the
+    # outer row, the outer restriction the join's only filter.
+    "nested loop left join with a one-sided ON conjunct into an index": (
+        "RP-354",
+        _ANALYSED,
+        "explain select * from e left join k on e.a < k.a and e.a > 990",
+        [
+            "Nested Loop Left Join  (cost=0.28..10320.00 rows=3333 width=14)",
+            "  Join Filter: (e.a > 990)",
+            "  ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
+            "  ->  Index Scan using k_pkey on k  (cost=0.28..6.14 rows=333 width=7)",
+            "        Index Cond: (a > e.a)",
+        ],
+    ),
+    # Still open: a LEFT join with a WHERE, the WHERE its outer scan's.
+    "nested loop left join with a where": (
+        "RP-354",
+        _ANALYSED,
+        "explain select * from e left join e e2 on e.a <> e2.a where e.a > 990",
+        [
+            "Nested Loop Left Join  (cost=0.00..185.00 rows=9990 width=14)",
+            "  Join Filter: (e.a <> e2.a)",
+            "  ->  Seq Scan on e  (cost=0.00..17.50 rows=10 width=7)",
+            "        Filter: (a > 990)",
+            "  ->  Materialize  (cost=0.00..20.00 rows=1000 width=7)",
+            "        ->  Seq Scan on e e2  (cost=0.00..15.00 rows=1000 width=7)",
+        ],
+    ),
+    # ------------- RP-902 a reduced LEFT join's one-sided ON conjunct
+    # A WHERE rejecting the nullable side's NULLs makes the join inner,
+    # and the ON's conjunct over one side is pushed to its scan.
+    "a left join reduced to inner pushes its one-sided on conjunct": (
+        "RP-902",
+        _ANALYSED,
+        "explain (costs off) select * from e left join e e2"
+        " on e.a <> e2.a and e.a > 990 where e2.b = 'v1'",
+        [
+            "Nested Loop",
+            "  Join Filter: (e.a <> e2.a)",
+            "  ->  Seq Scan on e e2",
+            "        Filter: (b = 'v1'::text)",
+            "  ->  Materialize",
+            "        ->  Seq Scan on e",
+            "              Filter: (a > 990)",
+        ],
+    ),
+    # ------------- RP-903 a BETWEEN among a join's ON conjuncts
+    # Expanded to its two comparisons and flattened into the qual list.
+    "a between among a join's on conjuncts is flattened": (
+        "RP-903",
+        _ANALYSED,
+        "explain select * from e left join e e2 on e.a <> e2.a and e.a between 10 and 20",
+        [
+            "Nested Loop Left Join  (cost=0.00..20032.50 rows=10989 width=14)",
+            "  Join Filter: ((e.a <> e2.a) AND (e.a >= 10) AND (e.a <= 20))",
             "  ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
             "  ->  Materialize  (cost=0.00..20.00 rows=1000 width=7)",
             "        ->  Seq Scan on e e2  (cost=0.00..15.00 rows=1000 width=7)",

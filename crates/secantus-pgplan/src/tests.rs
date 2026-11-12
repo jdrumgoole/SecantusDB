@@ -4771,9 +4771,17 @@ fn over_on_a_plain_function_is_42809_after_the_call_resolves() {
         let windowed = analysed(&format!("{q} over ()")).expect_err(q);
         assert_eq!(format!("{windowed:?}"), format!("{plain:?}"), "{q}");
     }
-    // An aggregate PostgreSQL has and this planner does not run over a
-    // window is still this server's gap.
-    let err = analysed("select stddev(id) over () from t").expect_err("stddev");
+    // Every plain aggregate runs over a window (RP-870), checked as it is
+    // without OVER; an ordered-set one under OVER is still this server's
+    // gap (RP-869).
+    analysed("select stddev(id) over () from t").expect("stddev");
+    analysed("select corr(id, id) over () from t").expect("corr");
+    let err = analysed("select bit_and(name) over () from t").expect_err("bit_and(text)");
+    assert!(
+        matches!(&err, Error::UndefinedFunction(m) if m == "function bit_and(text) does not exist"),
+        "{err:?}"
+    );
+    let err = analysed("select percentile_cont(0.5) over () from t").expect_err("percentile_cont");
     assert!(matches!(&err, Error::Unsupported(_)), "{err:?}");
 }
 

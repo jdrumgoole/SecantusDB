@@ -14,6 +14,9 @@ impl PlHost<'_> {
         types: &[String],
         scroll: bool,
     ) -> Result<String, plpgsql_fn::PlError> {
+        // A statement of its own, as `query` runs one: it sees what the
+        // body wrote before it (a FOR loop's query reads here, RP-828).
+        let level = statement_views::StatementLevel::enter(self.h);
         let stmt = self.plan(sql, params, types)?;
         // A simply updatable scan keeps each row's id, for `WHERE CURRENT
         // OF` (`current_of.rs`).
@@ -26,6 +29,7 @@ impl PlHost<'_> {
         }
         let read = self
             .joined(|| self.atomic(|| self.h.rows_with_schema(&stmt).map_err(|e| pl_error(&e))));
+        drop(level);
         let ids = self
             .h
             .cursor_ids
@@ -151,6 +155,7 @@ impl PgHandler {
                 tz,
                 tail: None,
                 base: 0,
+                pending: None,
                 failed: false,
                 current_of,
                 held: false,

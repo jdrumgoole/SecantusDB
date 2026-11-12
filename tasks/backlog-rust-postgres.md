@@ -106,7 +106,10 @@ one beside it.
   it; here each answers zero rows. PostgreSQL's manual (4.2.14) calls this a
   quirk applications must not rely on, and folding anything PostgreSQL does
   not would raise errors it does not -- worse than zero rows. No answer a
-  query returns differs.
+  query returns differs. A cursor shows it too: since RP-744 its select
+  list is computed as it is fetched, so `declare c cursor for select 1/0
+  from (values (1)) s(k)` raises at the first FETCH where PostgreSQL 15.19
+  raises at the DECLARE.
 - **Known residual — PL/pgSQL `SQL expression` CONTEXT frame**
   (`tools/probes/plpgsql_expr_context.py`, 58 of 60 shapes match PostgreSQL
   15.19): `(array[1,2])[1]/0` (libpg_query deparses the subexpression without
@@ -1079,28 +1082,31 @@ one beside it.
 
 ## Found by a CI run (2026-11-09)
 
-- [ ] **OPEN — any DDL statement makes the next catalog query re-decode
-      every catalog collection.** `bump_catalog_version` (`lib.rs`, the
-      `CatalogCache` comment) moves one version after every statement that
-      may change the catalog, and the next read of any catalog then decodes
-      all of them again. PostgreSQL invalidates only the cache entries for
-      the rows that changed (`inval.c`, `CatCacheInvalidate`, a relation's
-      relcache entry), so its first query after DDL costs about what the
-      next one does. Measured 2026-11-09 with psql's `\d` collation
-      subquery (`tests/backlog/test_rp_catalog_latency.py`) after a
-      `CREATE TABLE`:
-      - PostgreSQL 15.19 (private cluster): 0.9 ms first, 0.2 ms after.
-      - Debug `secantusd-pg`: 0.58 s first, 0.016 s after; and the first
-        query grows with the schema: 0.68 s with 50 more tables, 0.97 s
-        with 150, 1.79 s with 400 (0.044 s after).
-      A slow CI runner took the first query to 2.2 s and failed RP-077's
-      latency test on PR #2552 (job 129166397146), which until then timed
-      that cold read instead of the subquery it was written for.
-      The faithful fix keys the decoded rows per catalog row, or per
-      relation, and invalidates what a statement changed, as `inval.c` does;
-      `catcache.rs` already models which lookups miss.
+- [ ] **OPEN — after any DDL statement, the next catalog query rebuilds
+      every user relation's catalog rows, so it grows with the schema.**
+      The version `bump_catalog_version` moves after every statement that
+      may change the catalog drops every computed catalog relation, and the
+      next read of `pg_attribute`, `pg_type` or `pg_class` builds the rows of
+      every user table, view, index and sequence again (`catalog_rows`, the
+      `virtual_cache`). PostgreSQL invalidates only the cache entries of the
+      rows a statement changed (`inval.c`, `CatCacheInvalidate`, a
+      relation's relcache entry), so the rest of the schema costs it
+      nothing. Measured 2026-11-12 with psql's `\d` collation subquery
+      (`tests/backlog/test_rp_catalog_latency.py`) after a `CREATE TABLE`:
+      - PostgreSQL 15.19 (private cluster): 0.33 ms first and 0.26 ms after
+        with 200 other tables; 0.20 ms and 0.11 ms with 400.
+      - Debug `secantusd-pg`: 0.020 s first and 0.006 s after with none;
+        0.11 s and 0.008 s with 200; 0.21 s and 0.010 s with 400.
+      PostgreSQL's own relations' 3,054 `pg_attribute` rows, which were
+      most of the cost, are built once per process since 2026-11-12. The
+      faithful fix keys the rest per relation and invalidates what a
+      statement changed, as `inval.c` does; `catcache.rs` already models
+      which lookups miss. A user relation's rows depend on more than its
+      own catalog entry (its column grants, its inheritance parents, the
+      user types, domains and collations its columns name), so the key has
+      to carry each of them, or a stale row is a wrong answer.
       Backlog-ID: RP-715
-      Verify: tests/backlog/test_rp_catalog_latency.py::test_the_first_catalog_query_after_ddl_costs_what_the_next_does
+      Verify: tests/backlog/test_rp_catalog_latency.py::test_the_first_catalog_query_after_ddl_does_not_grow_with_the_schema
 
 ## Found by a CI run (2026-11-07)
 
@@ -1550,13 +1556,44 @@ a regression test.
       zeros: two bounds on the index column (`e.a < k.a and e.a >
       k.a`, one `Index Cond` of both), a clause over an expression of the
       inner side (`e.a < k.a + 1`, the scan's Filter), a key on a later
-      index column; an ON conjunct over one side only (`e left join e e2
-      on e.a <> e2.a and
-      e.a > 990` is `rows=9990`, its `e.a > 990` a LEFT join's join filter
-      estimated from `e.a`'s statistics); a LEFT join with a WHERE; and a
-      join of three or more relations (found while working RP-329).
+      index column; a LEFT join with a WHERE (`e left join e e2 on e.a <>
+      e2.a where e.a > 990`, the WHERE `e`'s scan Filter, `rows=10`); and
+      a join of three or more relations (found while working RP-329).
+      Since 2026-11-12 an ON conjunct over a LEFT join's preserved side
+      alone is estimated, as PostgreSQL keeps it: a join filter
+      `clause_selectivity` estimates from that table's statistics (`e.a >
+      990` of `e left join e e2 on e.a <> e2.a and e.a > 990` is
+      `rows=9990`), a single bound deferred among the range clauses. Not
+      when the inner is also read through its index parameterized by the
+      outer row (`e left join k on e.a < k.a and e.a > 990` is `Index Scan
+      using k_pkey on k` with `Index Cond: (a > e.a)`, the restriction
+      the join's only filter, `rows=3333`), or when the conjunct costs
+      other than its operators (an IN list, a pattern, a cast of a column).
       Backlog-ID: RP-354
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[nested loop left join with a one-sided ON conjunct]
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[nested loop left join with a where], tests/backlog/test_rp_explain_costs.py::test_plan[nested loop left join with a one-sided ON conjunct into an index]
+
+- [ ] **A LEFT join reduced to an inner one keeps its ON's one-sided
+      conjunct in its Join Filter.** A WHERE that rejects the nullable
+      side's NULLs makes the LEFT join inner (`reduce_outer_joins`), and
+      PostgreSQL 15.19 then pushes an ON conjunct over one side to that
+      side's scan: `select * from e left join e e2 on e.a <> e2.a and e.a
+      > 990 where e2.b = 'v1'` is a Nested Loop with `Join Filter: (e.a <>
+      e2.a)` over `Seq Scan on e e2` (`Filter: (b = 'v1'::text)`) and a
+      Materialize of `Seq Scan on e` with `Filter: (a > 990)`. Here the
+      Join Filter keeps `(e.a > 990)` and `e`'s scan reads every row. An
+      inner join written as such already pushes it. Its rows are right.
+      Measured on a private 15.19 cluster (found while working RP-354).
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a left join reduced to inner pushes its one-sided on conjunct]
+      Backlog-ID: RP-902
+- [ ] **A BETWEEN among a join's ON conjuncts prints as one nested AND.**
+      PostgreSQL 15.19 expands `a BETWEEN x AND y` into two comparisons
+      and flattens them into the join's qual list: `select * from e left
+      join e e2 on e.a <> e2.a and e.a between 10 and 20` is `Join Filter:
+      ((e.a <> e2.a) AND (e.a >= 10) AND (e.a <= 20))`; here `((e.a <>
+      e2.a) AND ((e.a >= 10) AND (e.a <= 20)))`. The estimate is right.
+      Measured on a private 15.19 cluster (found while working RP-354).
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a between among a join's on conjuncts is flattened]
+      Backlog-ID: RP-903
 
 - [ ] **EXPLAIN ANALYZE's scan counters PostgreSQL prints that are still
       left out.** Since RP-383 a user table's heap pages carry the
@@ -2581,17 +2618,20 @@ VALUES-only statements of `tests/backlog/test_rp_found_rp682.py`.
       Verify: tests/backlog/test_rp_found_rp682.py::test_an_ordered_set_aggregate_over_a_window_is_refused
       Backlog-ID: RP-869
 
-- [ ] **Most of PostgreSQL's aggregates do not run over a window.**
-      `stddev(v) over (order by v)` answers the running sample standard
-      deviation on PostgreSQL 15.19; here it is 0A000 `window function
-      stddev() is not supported yet`, and so is every built-in aggregate
-      but `sum`, `count`, `avg`, `min`, `max`, `string_agg`, `array_agg`,
-      `bool_and` and `bool_or`: `bit_and` / `bit_or` / `bit_xor`, `corr`,
-      `covar_*`, `every`, `json[b]_agg`, `json[b]_object_agg`,
-      `range_agg`, `range_intersect_agg`, the `regr_*` family, `stddev*`,
-      `var*` / `variance` and `xmlagg` (a user aggregate runs).
-      Verify: tests/backlog/test_rp_found_rp682.py::test_more_aggregates_run_over_a_window
-      Backlog-ID: RP-870
+## Found while working RP-870 (2026-11-12)
+
+Measured on PostgreSQL 15.19 (the shared reference on port 5415) with the
+VALUES-only statements of `tests/backlog/test_rp_found_rp870.py`.
+
+- [ ] **An aggregate called with the wrong number of arguments is a gap,
+      not a missing function.** `select stddev(v, v) from (values (1))
+      s(v)` is 42883 `function stddev(integer, integer) does not exist` on
+      PostgreSQL 15.19, and `corr(v)` is `function corr(integer) does not
+      exist`; here both are 0A000 `an aggregate with this many arguments is
+      not supported yet`, with or without OVER (`plan_aggregate_item`'s
+      argument-count check).
+      Verify: tests/backlog/test_rp_found_rp870.py::test_an_aggregate_with_the_wrong_arity_is_42883
+      Backlog-ID: RP-904
 
 ## Found while working RP-670 (2026-11-09)
 
@@ -3241,14 +3281,6 @@ Measured on PostgreSQL 15.19 (the shared reference on port 5415): every
 statement is VALUES-only and runs there as written. The gap tests are in
 `tests/backlog/test_rp_found_rp732.py`.
 
-- [ ] **A DECLARE CURSOR computes every row's select list at the DECLARE.**
-      `declare c cursor for select 1/(k - 1) from (values (2), (1)) s(k)`
-      then `fetch 1 from c` answers `1` on PostgreSQL 15.19, whose cursor
-      runs its plan as it is fetched; here the DECLARE itself raises the
-      second row's 22012 `division by zero`, and the cursor is not
-      created.
-      Verify: tests/backlog/test_rp_found_rp732.py::test_a_cursor_computes_its_rows_as_they_are_fetched
-      Backlog-ID: RP-744
 - [ ] **A sorted cursor computes an expensive column below its Sort.** A
       cursor is planned with `cursor_tuple_fraction` (0.1), and
       `make_sort_input_target` postpones an expensive column (more than
@@ -3259,7 +3291,8 @@ statement is VALUES-only and runs there as written. The gap tests are in
       by k desc` then `fetch 1` answers `(2, 'a':1)` on PostgreSQL 15.19.
       Since RP-732 `sort_input.rs` sees only a LIMIT, so the column is
       computed for every row and the first row's 42704 is raised. Needs the
-      item above first: today the DECLARE computes every row anyway.
+      Sort to run at the first FETCH too (found while working RP-744): a
+      column computed below the Sort is computed at the DECLARE.
       Verify: tests/backlog/test_rp_found_rp732.py::test_a_sorted_cursor_postpones_an_expensive_column
       Backlog-ID: RP-745
 - [ ] **A cast over a CASE of untyped literals reports a branch's input
@@ -3271,6 +3304,69 @@ statement is VALUES-only and runs there as written. The gap tests are in
       applied to each branch's literal.
       Verify: tests/backlog/test_rp_found_rp732.py::test_a_cast_over_a_case_of_literals_reports_no_position
       Backlog-ID: RP-746
+
+## Found while working RP-744 (2026-11-12)
+
+Measured on PostgreSQL 15.19: the VALUES-only statements on the shared
+reference on port 5415, the ones that create a function or a sequence on a
+private cluster. The gap tests are in `tests/backlog/test_rp_found_rp744.py`.
+Since RP-744 a cursor computes a plain select list as it is fetched
+(`portal_stream::PendingRows`); these are the shapes that still run whole
+at the DECLARE, and the cursor answers that differ either way.
+
+- [ ] **A cursor computes a function call, a `nextval` or a scalar
+      subquery in its select list at the DECLARE.** The executor computes
+      these before the row stream (they need the statement's hooks), so
+      `declare c cursor for select f(k) from (values (2), (1)) s(k)`, with
+      `f` raising for `k = 1`, raises at the DECLARE where PostgreSQL 15.19
+      answers `fetch 1` with the first row; `select nextval('s') from
+      generate_series(1, 3)` draws three values for a `fetch 1` (`currval`
+      is 3, PostgreSQL's 1); `select (select 1/(k - 1)) ...` raises too.
+      Verify: tests/backlog/test_rp_found_rp744.py::test_a_cursor_computes_a_function_call_as_it_is_fetched
+      Backlog-ID: RP-895
+- [ ] **A cursor over a set operation computes its rows at the DECLARE.**
+      `declare c cursor for select 1/(k - 1) from (values (2), (1)) s(k)
+      union all select 5` raises 22012 at the DECLARE; PostgreSQL 15.19's
+      Append is run as it is fetched, and `fetch 1` answers `1`.
+      Verify: tests/backlog/test_rp_found_rp744.py::test_a_cursor_over_a_union_computes_its_rows_as_they_are_fetched
+      Backlog-ID: RP-896
+- [ ] **A cursor's WHERE and Sort run at the DECLARE, not at the first
+      FETCH.** PostgreSQL 15.19's DECLARE only plans: `declare c cursor for
+      select k from (values (2), (0)) s(k) where 1/k > 0` succeeds and its
+      `fetch 1` raises 22012, as does a Sort over a select list that raises
+      (`... order by k desc`). Here the DECLARE runs the query and raises,
+      and no cursor is made. Deferring the run must keep the DECLARE's
+      snapshot: a row the block writes after the DECLARE is not the
+      cursor's.
+      Verify: tests/backlog/test_rp_found_rp744.py::test_a_cursor_runs_its_query_at_the_first_fetch
+      Backlog-ID: RP-897
+- [ ] **A zero-count FETCH answers no row.** On PostgreSQL 15.19 `FETCH
+      FORWARD 0`, `FETCH 0` and `FETCH BACKWARD 0` re-fetch the row the
+      cursor sits on, and `MOVE FORWARD 0` reports `MOVE 1`; here the three
+      answer no row and the MOVE reports `MOVE 0` (`FETCH RELATIVE 0`
+      already matches).
+      Verify: tests/backlog/test_rp_found_rp744.py::test_a_zero_count_fetch_refetches_the_current_row
+      Backlog-ID: RP-898
+- [ ] **A DECLARE refused for a duplicate cursor name leaves the block
+      usable.** PostgreSQL 15.19 answers 42P03 `cursor "c" already exists`
+      and aborts the block, so the next statement is 25P02; here the block
+      runs on.
+      Verify: tests/backlog/test_rp_found_rp744.py::test_a_duplicate_cursor_name_aborts_the_block
+      Backlog-ID: RP-899
+- [ ] **`pg_cursors.statement` is a deparse of the query.** PostgreSQL
+      15.19 reports the DECLARE as submitted, verbatim (`declare  c   cursor
+      for select 1 -- x`); here it is `SELECT 1`.
+      Verify: tests/backlog/test_rp_found_rp744.py::test_pg_cursors_statement_is_the_declare_text
+      Backlog-ID: RP-900
+- [ ] **A PL/pgSQL FETCH from a `refcursor` parameter is refused at CREATE
+      FUNCTION.** `create function f(c refcursor) returns int language
+      plpgsql as $$ declare r int; begin fetch c into r; return r; end $$`
+      is 42601 `variable "c" must be of type cursor or refcursor`:
+      libpg_query types a parameter as `unknown`, and only an OPEN of one
+      is rerouted (`open_cursor::cursor_param_rewrite`). PostgreSQL 15.19
+      creates it, and the call reads the caller's cursor.
+      Verify: tests/backlog/test_rp_found_rp744.py::test_a_refcursor_parameter_can_be_fetched
+      Backlog-ID: RP-901
 
 ## Found while working RP-698 (2026-11-10)
 
@@ -3481,26 +3577,47 @@ Measured on a private PostgreSQL 15.19 cluster.
       Verify: tests/backlog/test_rp_found_rp816.py::test_a_system_column_in_a_generated_column_is_42p10
       Backlog-ID: RP-862
 
-## Found while working RP-823 (2026-11-10)
+## Found while working RP-828 (2026-11-12)
 
-Measured on PostgreSQL 15.19; none of the statements creates an object.
+Measured on a private, freshly initdb'd PostgreSQL 15.19 cluster.
 
-- [ ] **A FOR loop over a query or an EXECUTE runs no portal.**
-      `exec_stmt_fors` and `exec_stmt_dynfors` open the query as an
-      unnamed portal and walk it through `exec_for_query`, which pins it:
-      on PostgreSQL 15.19 `pg_cursors` lists `<unnamed portal 1>` while
-      `for x in select 1 loop` (or `in execute 'select 1'`) runs, and an
-      `execute 'close all'` in its body is 24000 `cannot drop pinned portal
-      "<unnamed portal 1>"`. Here the loop reads the query's rows with no
-      portal, so `pg_cursors` is empty and the CLOSE ALL runs. The cursor
-      FOR loop pins its portal since RP-823 (`CursorState::pinned`, held by
-      a procedure's COMMIT or ROLLBACK); the faithful fix walks these loops
-      through a portal of their own the same way, which also brings
-      `HoldPinnedPortals`' 2D000 `cannot perform transaction commands
-      inside a cursor loop that is not read-only` for a loop over an
-      `INSERT ... RETURNING`.
-      Verify: tests/backlog/test_rp_found_rp823.py::test_a_query_loop_walks_a_pinned_portal
-      Backlog-ID: RP-828
+- [ ] **A FOR loop or an OPEN over an INSERT, UPDATE or DELETE is 0A000.**
+      `SPI_cursor_open` takes any statement that returns rows, so on
+      PostgreSQL 15.19 `for x in update t set a = a + 1 returning a loop`
+      (or `in execute '...'`) walks the RETURNING rows, and `open c for
+      insert into t values (5) returning a` fetches 5. Without RETURNING it
+      is 42P11 `cannot open UPDATE query as cursor`. A procedure's COMMIT
+      inside a loop over a DML portal is 55000 `cannot perform transaction
+      commands inside a cursor loop that is not read-only`
+      (`HoldPinnedPortals` holds only a PORTAL_ONE_SELECT portal). Here
+      every one of them is 0A000 `this query is not supported on one side
+      of a set operation`: `open_portal` reads the rows through
+      `rows_with_schema`, which has no DML arm (the PL/pgSQL `returning`
+      host call runs one through `dml_returning_values`). The portal needs
+      to record that it is not read-only, for the 55000.
+      Verify: tests/backlog/test_rp_found_rp828.py::test_a_dml_statement_opens_as_a_portal
+      Backlog-ID: RP-905
+
+- [ ] **A FOR loop or an OPEN over `EXECUTE ... USING` ignores USING.**
+      `for x in execute 'select $1 as v, $2 as w' using 5, 'q'::text loop`
+      reads `5 q` on PostgreSQL 15.19 (`exec_dynquery_with_params`), and
+      `open c for execute 'select $1 as v' using 7` fetches 7. Here both
+      are 42P02 `there is no parameter $1`: the dynamic query is run with
+      no parameters (`for_query`, `open_cursor`'s dynamic arm).
+      Verify: tests/backlog/test_rp_found_rp828.py::test_a_dynamic_portal_binds_its_using_values
+      Backlog-ID: RP-906
+
+- [ ] **A portal whose query fails as it runs takes no number.**
+      `SPI_cursor_open_internal` names an unnamed portal
+      (`CreateNewPortal`) before it runs the query, so on PostgreSQL 15.19
+      a FOR loop or an OPEN over `select a/0 from (values (1)) v(a)` that
+      fails, caught, leaves the next portal `<unnamed portal 2>`. Here the
+      rows are read before `register_portal` names the portal, so the next
+      one is `<unnamed portal 1>`. (A constant `1/0` fails in PostgreSQL's
+      planner, before the portal is named, and takes no number there
+      either.)
+      Verify: tests/backlog/test_rp_found_rp828.py::test_a_portal_that_fails_running_takes_its_number
+      Backlog-ID: RP-907
 
 ## Found while working RP-822 (2026-11-10)
 
