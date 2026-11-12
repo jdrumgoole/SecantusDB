@@ -1375,9 +1375,12 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "        Index Cond: ((a > e.a) AND (a < e.a))",
         ],
     ),
-    # An inequality over an expression of the inner side.
+    # Split from RP-354 and fixed: an inequality whose operands are no
+    # bare key of the indexed side matches no column index, so it stays
+    # the Join Filter over that side's plain scan; before, any inequality
+    # not between two bare keys left an indexed join at zeros.
     "nested loop left join on an expression of the inner side": (
-        "RP-354",
+        "RP-329",
         _ANALYSED,
         "explain select * from e left join k on e.a < k.a + 1",
         [
@@ -1386,6 +1389,70 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "  ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
             "  ->  Materialize  (cost=0.00..20.00 rows=1000 width=7)",
             "        ->  Seq Scan on k  (cost=0.00..15.00 rows=1000 width=7)",
+        ],
+    ),
+    "nested loop left join on expressions of both sides": (
+        "RP-329",
+        _ANALYSED,
+        "explain select * from e left join k on e.a + 1 < k.a + 1",
+        [
+            "Nested Loop Left Join  (cost=0.00..20032.50 rows=333333 width=14)",
+            "  Join Filter: ((e.a + 1) < (k.a + 1))",
+            "  ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
+            "  ->  Materialize  (cost=0.00..20.00 rows=1000 width=7)",
+            "        ->  Seq Scan on k  (cost=0.00..15.00 rows=1000 width=7)",
+        ],
+    ),
+    # The indexed table preserved: an outer side is never parameterized.
+    "nested loop left join from an indexed side on an expression": (
+        "RP-329",
+        _ANALYSED,
+        "explain select * from k left join k k2 on k.a < k2.a + 1",
+        [
+            "Nested Loop Left Join  (cost=0.00..17532.50 rows=333333 width=14)",
+            "  Join Filter: (k.a < (k2.a + 1))",
+            "  ->  Seq Scan on k  (cost=0.00..15.00 rows=1000 width=7)",
+            "  ->  Materialize  (cost=0.00..20.00 rows=1000 width=7)",
+            "        ->  Seq Scan on k k2  (cost=0.00..15.00 rows=1000 width=7)",
+        ],
+    ),
+    "comma join on an expression of an indexed side": (
+        "RP-329",
+        _ANALYSED,
+        "explain select * from e, k where e.a < k.a + 1",
+        [
+            "Nested Loop  (cost=0.00..17532.50 rows=333333 width=14)",
+            "  Join Filter: (e.a < (k.a + 1))",
+            "  ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
+            "  ->  Materialize  (cost=0.00..20.00 rows=1000 width=7)",
+            "        ->  Seq Scan on k  (cost=0.00..15.00 rows=1000 width=7)",
+        ],
+    ),
+    # Beside a key-to-key bound, the expression clause moves into the
+    # parameterized scan as its Filter.
+    "nested loop left join into an index with an expression filter": (
+        "RP-329",
+        _ANALYSED,
+        "explain select * from e left join k on e.a < k.a and e.a > k.a - 5",
+        [
+            "Nested Loop Left Join  (cost=0.28..8932.50 rows=111111 width=14)",
+            "  ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
+            "  ->  Index Scan using k_pkey on k  (cost=0.28..7.81 rows=111 width=7)",
+            "        Index Cond: (a > e.a)",
+            "        Filter: (e.a > (a - 5))",
+        ],
+    ),
+    # Still open: an expression of the outer side against the inner's
+    # bare key is the inner index's parameterized Index Cond.
+    "nested loop left join into an index on an expression of the outer side": (
+        "RP-354",
+        _ANALYSED,
+        "explain select * from e left join k on e.a + 1 < k.a",
+        [
+            "Nested Loop Left Join  (cost=0.28..9490.00 rows=333333 width=14)",
+            "  ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
+            "  ->  Index Scan using k_pkey on k  (cost=0.28..6.14 rows=333 width=7)",
+            "        Index Cond: (a > (e.a + 1))",
         ],
     ),
     # A `<>` whose operands differ in type after a cast (`int48ne`).

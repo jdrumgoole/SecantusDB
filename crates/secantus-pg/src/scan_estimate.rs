@@ -522,7 +522,19 @@ impl PgHandler {
         // A `<`, `<=`, `>` or `>=` between the sides can be an indexed
         // side's parameterized Index Cond (RP-354), priced below where it
         // compares two plain keys; a `<>` never is one (no B-tree
-        // strategy).
+        // strategy). Any other inequality could be one only where an
+        // operand is that side's key (or the index is over an
+        // expression), which is not priced: an expression of the side's
+        // keys (`e.a < k.a + 1`) matches no column index, so it stays the
+        // join's filter over that side's plain scan. A LEFT join's
+        // preserved side is never parameterized, so never one.
+        let opaque_keys: Vec<&str> = filters
+            .iter()
+            .filter(|f| {
+                !restriction(f) && matches!(f.kind, FilterKind::Inequality) && f.compare.is_none()
+            })
+            .flat_map(|f| f.inequality_keys.iter().map(String::as_str))
+            .collect();
         let opaque_inequality = filters.iter().any(|f| {
             !restriction(f) && matches!(f.kind, FilterKind::Inequality) && f.compare.is_none()
         });
@@ -557,7 +569,13 @@ impl PgHandler {
                 // An indexed table's own filter may be an index scan's,
                 // priced below only on a LEFT join's preserved side.
                 || (indexes.iter().any(|ix| ix.table.name == leaf.table)
-                    && (opaque_inequality || (!leaf.filter.is_empty() && !preserved_side)))
+                    && ((!preserved_side
+                        && opaque_inequality
+                        && (columns.iter().any(|(k, _)| opaque_keys.contains(&k.as_str()))
+                            || indexes
+                                .iter()
+                                .any(|ix| ix.table.name == leaf.table && ix.keys.contains(&0))))
+                        || (!leaf.filter.is_empty() && !preserved_side)))
             {
                 return None;
             }

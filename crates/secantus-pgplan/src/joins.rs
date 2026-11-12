@@ -1010,6 +1010,7 @@ fn finish_join_source(
                         kind,
                         ops,
                         compare: comparison(c),
+                        inequality_keys: inequality_keys(c),
                         restrict: None,
                     })
                 })
@@ -2817,6 +2818,7 @@ fn build_join(
                         kind,
                         ops,
                         compare: comparison(c),
+                        inequality_keys: inequality_keys(c),
                         restrict: restriction_filter(c, [&left, &right], lookup, params),
                     });
                 }
@@ -3012,6 +3014,12 @@ pub struct JoinFilter {
     /// take as a parameterized index qual (`match_clause_to_indexcol`,
     /// RP-354). `None` for anything else.
     pub compare: Option<(String, String, String)>,
+    /// A `<`, `<=`, `>` or `>=`'s operands that are a joined key, bare or
+    /// cast: the keys an index on their column could take the clause for
+    /// (`match_clause_to_indexcol` matches an operand to the index key,
+    /// the other side's operand any expression of the outer row, RP-354).
+    /// Empty for anything else, and where neither operand is one.
+    pub inequality_keys: Vec<String>,
     /// A conjunct over one stored table's columns alone, lowered as that
     /// table's WHERE over its stored fields: the clause
     /// `clause_selectivity` estimates as a restriction, from the table's
@@ -3289,6 +3297,34 @@ fn comparison(n: &pg_query::protobuf::Node) -> Option<(String, String, String)> 
         op.to_string(),
         key(e.rexpr.as_deref())?,
     ))
+}
+
+/// [`JoinFilter::inequality_keys`] of `n`.
+fn inequality_keys(n: &pg_query::protobuf::Node) -> Vec<String> {
+    use pg_query::protobuf::AExprKind;
+    let Some(N::AExpr(e)) = n.node.as_ref() else {
+        return Vec::new();
+    };
+    if e.kind != AExprKind::AexprOp as i32
+        || !matches!(operator_name(e), Ok("<" | "<=" | ">" | ">="))
+    {
+        return Vec::new();
+    }
+    // A cast of a key counts as the key: a binary-coercible one is a
+    // `RelabelType` the index still matches.
+    fn key(mut x: Option<&pg_query::protobuf::Node>) -> Option<String> {
+        while let Some(N::TypeCast(tc)) = x?.node.as_ref() {
+            x = tc.arg.as_deref();
+        }
+        match x?.node.as_ref()? {
+            N::ColumnRef(c) if c.fields.len() == 1 => column_ref_name(c),
+            _ => None,
+        }
+    }
+    [e.lexpr.as_deref(), e.rexpr.as_deref()]
+        .into_iter()
+        .filter_map(key)
+        .collect()
 }
 
 /// How `n`, a WHERE conjunct over joined keys, is estimated.
