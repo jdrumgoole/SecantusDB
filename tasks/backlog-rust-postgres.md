@@ -1577,18 +1577,35 @@ a regression test.
       k.a where k.a > 990`), and an ON conjunct over the preserved side
       alone is estimated as PostgreSQL keeps it, the join's filter, also
       when the inner is read through its index parameterized by the outer
-      row (`e left join k on e.a < k.a and e.a > 990`). Still zeros: such
-      a conjunct that costs other than its operators (an IN list, a
-      pattern, a cast of a column), and an inner join clause over a cast
-      of the inner's column, which PostgreSQL makes the parameterized
-      scan's Filter (`e left join k on e.a < k.a and e.a <> k.b::int` is
-      `cost=0.28..11975.00 rows=333000`, `Index Scan using k_pkey on k`
-      `cost=0.28..8.64 rows=332` with `Filter: (e.a <> (b)::integer)`).
-      And a cent: `k left join k k2 on k.a < k2.a and k.a > 990 where k.a
-      > 900` totals 1076.52 here, 1076.53 on PostgreSQL 15.19 -- the sum
+      row (`e left join k on e.a < k.a and e.a > 990`). Since 2026-11-12
+      a join clause `<>` over a cast of either side's column is priced
+      with its cast (a `pg_cast` function one call, an I/O conversion
+      two) and estimated as an expression with no statistics, the
+      parameterized scan's Filter where the inner is indexed (`e left
+      join k on e.a < k.a and e.a <> k.b::int`). Still zeros: such a
+      preserved-side conjunct that costs other than its operators (an IN
+      list, a pattern, a cast of a column), a cast between types no
+      `pg_cast` function or I/O conversion joins (a binary-coercible
+      `e.b::varchar <> k.b`), and a `<>` whose operands then differ in
+      type (`e.a <> k.a::bigint`, PostgreSQL's `int48ne`,
+      `cost=0.28..11142.50 rows=333000` over `Index Scan using k_pkey on
+      k` `cost=0.28..7.81 rows=332`). And a cent: `k left join k k2 on
+      k.a < k2.a and k.a > 990 where k.a > 900` totals 1076.52 here,
+      1076.53 on PostgreSQL 15.19 -- the sum
       is a .525 tie this server's index-scan costs land one ULP below.
       Backlog-ID: RP-354
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[nested loop left join with a cast clause into an index], tests/backlog/test_rp_explain_costs.py::test_plan[nested loop left join of two index scans with a one-sided ON conjunct]
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[nested loop left join of two index scans with a one-sided ON conjunct]
+- [ ] **A function call in a nested loop's join filter is priced as
+      nothing.** `cost_qual_eval` charges a call its `procost` for every
+      pair the Join Filter checks: PostgreSQL 15.19 prints `select * from e
+      left join e e2 on e.a < abs(e2.a)` (`e`, `k` analysed, 1000 rows) as
+      `Nested Loop Left Join (cost=0.00..17532.50 rows=333333 width=14)`;
+      here `cost=0.00..15032.50`, the comparison alone. A cast in the same
+      place is priced (RP-354); a call needs its overload resolved by its
+      arguments' types to read its `procost`. Its rows are right. Measured
+      on a private 15.19 cluster (found while working RP-354).
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[nested loop left join with a function call in its join filter]
+      Backlog-ID: RP-910
 
 - [ ] **EXPLAIN of a LEFT join whose WHERE keeps only the unmatched rows
       prints a Left Join, not an Anti Join.** `reduce_outer_joins` turns a
