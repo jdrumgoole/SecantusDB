@@ -1719,6 +1719,45 @@ def test_a_read_pinned_to_one_relation_answers_as_the_full_listing(
         conn.execute("ROLLBACK")
 
 
+#: Reads of one relation's `pg_attribute` rows through
+#: `pg_attribute_relid_attnum_index`, alone and with other quals beside the
+#: equality (psql's `\d` column query has the last shape).
+_ONE_RELATIONS_ATTRIBUTES = (
+    "SELECT attname FROM pg_catalog.pg_attribute WHERE attrelid = 2615",
+    "SELECT attname FROM pg_catalog.pg_attribute WHERE attrelid = 2615 AND attnum > 0",
+    "SELECT attname FROM pg_catalog.pg_attribute WHERE attrelid = 2615 AND NOT attisdropped",
+    "SELECT attname FROM pg_catalog.pg_attribute a WHERE a.attrelid = "
+    "'pg_namespace'::pg_catalog.regclass AND a.attnum > 0 AND NOT a.attisdropped",
+)
+
+
+def test_an_equality_with_other_quals_is_one_index_scan(home: Path) -> None:
+    """PostgreSQL 15.19 (the shared cluster, read only, 2026-11-12) counts
+    each `_ONE_RELATIONS_ATTRIBUTES` read as one `idx_scan` of
+    `pg_attribute` and no `seq_scan`, the other quals a filter on the index
+    scan. The catalog-read walk visited an AND's arms as select-list
+    expressions, so the equality beside them was no restriction and the read
+    was modelled as a sequential scan, which built every `pg_attribute` row
+    to count them (RP-909, RP-715). Measured in a warm backend, as the
+    change over a second run: a fresh backend's first read counts more
+    (RP-909)."""
+    scans = (
+        "SELECT seq_scan, idx_scan FROM pg_catalog.pg_stat_xact_sys_tables "
+        "WHERE relname = 'pg_attribute'"
+    )
+    with _Server(home) as server, server.connect() as conn:
+        conn.autocommit = False
+        conn.execute(_ONE_RELATIONS_ATTRIBUTES[0]).fetchall()
+        conn.execute(scans).fetchone()
+        for query in _ONE_RELATIONS_ATTRIBUTES:
+            conn.execute(query).fetchall()
+            before = conn.execute(scans).fetchone()
+            conn.execute(query).fetchall()
+            after = conn.execute(scans).fetchone()
+            assert (query, after[0] - before[0], after[1] - before[1]) == (query, 0, 1)
+        conn.rollback()
+
+
 def test_regclass_names_a_relation(home: Path) -> None:
     """`'t'::regclass` is the relation's oid, printed as its name.
 

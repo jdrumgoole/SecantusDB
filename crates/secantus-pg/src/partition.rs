@@ -221,7 +221,7 @@ impl PgHandler {
 
     /// Every partition as the planner reads it: a view over its parent.
     pub(crate) fn partition_views(&self) -> Vec<(String, String)> {
-        let Ok(defs) = self.all_table_defs() else {
+        let Ok(defs) = self.shared_table_defs() else {
             return Vec::new();
         };
         defs.iter()
@@ -243,7 +243,7 @@ impl PgHandler {
     /// parent's), which an INSERT written directly into the partition --
     /// served as a view -- gives a column it omits.
     pub(crate) fn partition_defaults(&self) -> Vec<(String, Vec<(String, String)>)> {
-        let Ok(defs) = self.all_table_defs() else {
+        let Ok(defs) = self.shared_table_defs() else {
             return Vec::new();
         };
         defs.iter()
@@ -274,10 +274,11 @@ impl PgHandler {
     /// Every table's `tableoid`: its own oid, or -- for a partitioned one --
     /// the oid of the leaf partition each row falls in.
     pub(crate) fn tableoid_expressions(&self) -> Vec<(String, String)> {
-        let Ok(defs) = self.all_table_defs() else {
+        let Ok(defs) = self.shared_table_defs() else {
             return Vec::new();
         };
-        let oid = |n: &str| self.relation_oid(n).unwrap_or(0);
+        let oids = self.relation_oids().unwrap_or_default();
+        let oid = |n: &str| Self::oid_in(&oids, n).unwrap_or(0);
         let leaves = |root: &TableDef| -> Vec<(String, String)> {
             // (leaf, its condition over `root`'s rows)
             let mut out = Vec::new();

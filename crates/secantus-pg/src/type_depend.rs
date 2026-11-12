@@ -234,7 +234,7 @@ impl PgHandler {
         }
         let mut tables = Vec::new();
         let mut typed_tables = Vec::new();
-        for def in self.all_table_defs()? {
+        for def in self.shared_table_defs()?.iter() {
             let oid = self.relation_oid(&def.name).unwrap_or(0);
             if let Ok(of) = def
                 .extra

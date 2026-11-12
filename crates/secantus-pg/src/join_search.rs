@@ -146,7 +146,8 @@ pub(crate) fn filter_selectivity(
             }
             s
         }
-        FilterKind::Other => return None,
+        // A cast key's statistics are not read here.
+        FilterKind::NotEqualCast(..) | FilterKind::Other => return None,
     })
 }
 

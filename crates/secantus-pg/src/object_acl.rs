@@ -1064,7 +1064,7 @@ impl PgHandler {
     pub(crate) fn table_grant_rows(&self, include_public: bool) -> Vec<[String; 7]> {
         let me = self.current_role_name();
         let mut out = Vec::new();
-        let Ok(defs) = self.all_table_defs() else {
+        let Ok(defs) = self.shared_table_defs() else {
             return out;
         };
         for def in defs.iter().filter(|d| !d.temp) {

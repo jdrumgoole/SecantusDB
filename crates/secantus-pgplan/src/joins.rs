@@ -1002,8 +1002,7 @@ fn finish_join_source(
                     if aliases.len() < 2 {
                         return None;
                     }
-                    let kind = filter_kind(c);
-                    let ops = operator_count(c);
+                    let (kind, ops) = filter_kind_and_ops(c, &scope);
                     let expr = on_expr(c, &scope, params).ok()?;
                     Some(JoinFilter {
                         aliases,
@@ -2811,11 +2810,12 @@ fn build_join(
                     {
                         continue;
                     }
+                    let (kind, ops) = filter_kind_and_ops(c, &side_scope);
                     on_filters.push(JoinFilter {
                         aliases: key_aliases(c),
                         expr: on_expr(c, &side_scope, params)?,
-                        kind: filter_kind(c),
-                        ops: operator_count(c),
+                        kind,
+                        ops,
                         compare: comparison(c),
                         restrict: restriction_filter(c, [&left, &right], lookup, params),
                     });
@@ -3086,6 +3086,10 @@ pub enum FilterKind {
     /// `neqjoinsel`, one minus `eqjoinsel`'s `1 / max(nd1, nd2)`
     /// (`clause_selectivity` takes a DistinctExpr as its `=`, negated).
     NotEqual(String, String),
+    /// `<>` between two joined keys of which one or both is cast
+    /// ([`CastKey`]): `neqjoinsel` as for [`FilterKind::NotEqual`], a cast
+    /// key an expression with no statistics (`examine_variable`).
+    NotEqualCast(CastKey, CastKey),
     /// A column equal to a constant: `var_eq_const` with no statistics,
     /// `1 / nd`.
     EqualsConst(String),
@@ -3094,6 +3098,118 @@ pub enum FilterKind {
     Or(Vec<FilterKind>),
     /// Anything else, which is not estimated here.
     Other,
+}
+
+/// An operand of [`FilterKind::NotEqualCast`]: a joined key, cast to the
+/// built-in type `cast` (its oid) where it is cast.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CastKey {
+    pub key: String,
+    pub cast: Option<i64>,
+}
+
+/// `cost_qual_eval`'s charge, in `cpu_operator_cost` units, for the casts
+/// in `n`, a conjunct over joined keys: a cast of a constant nothing
+/// (`eval_const_expressions` has folded it), a cast of a key what
+/// [`crate::pg_casts::explicit_cast_cost`] charges from its column's type
+/// in `scope`. `None` where a cast is of anything else, carries a type
+/// modifier or an array bound, or is one that function does not price.
+fn cast_cost(n: &pg_query::protobuf::Node, scope: &Scope) -> Option<usize> {
+    fn has_column(n: &pg_query::protobuf::Node) -> bool {
+        let mut found = false;
+        let mut node = n.clone();
+        let _ = walk_expr(&mut node, &mut |x| {
+            found |= matches!(x.node.as_ref(), Some(N::ColumnRef(_)));
+            Ok(())
+        });
+        found
+    }
+    let mut total = Some(0usize);
+    let mut node = n.clone();
+    let _ = walk_expr(&mut node, &mut |x| {
+        let Some(N::TypeCast(tc)) = x.node.as_ref() else {
+            return Ok(());
+        };
+        let Some(arg) = tc.arg.as_deref() else {
+            total = None;
+            return Ok(());
+        };
+        if !has_column(arg) {
+            return Ok(());
+        }
+        let cost = cast_key_target(tc, scope)
+            .and_then(|(source, target)| crate::pg_casts::explicit_cast_cost(source, target));
+        total = match (total, cost) {
+            (Some(t), Some(c)) => Some(t + c),
+            _ => None,
+        };
+        Ok(())
+    });
+    total
+}
+
+/// A cast of a bare joined key: its column's type and the cast's target
+/// type, both built-in oids. `None` for a cast of anything else, or one
+/// with a type modifier, an array bound or SETOF.
+fn cast_key_target(tc: &pg_query::protobuf::TypeCast, scope: &Scope) -> Option<(i64, i64)> {
+    let key = bare_key(tc.arg.as_deref()?)?;
+    let tn = tc.type_name.as_ref()?;
+    if !tn.typmods.is_empty() || !tn.array_bounds.is_empty() || tn.setof || tn.pct_type {
+        return None;
+    }
+    let name = match tn.names.last()?.node.as_ref()? {
+        N::String(s) => s.sval.clone(),
+        _ => return None,
+    };
+    let col = scope.cols.iter().find(|c| c.key == key)?;
+    Some((
+        crate::pgtypes::oid_of_name(&col.pg_type)?,
+        crate::pgtypes::oid_of_name(&name)?,
+    ))
+}
+
+/// `c`'s estimate and its `cost_qual_eval` charge in operator costs: a
+/// conjunct whose casts [`cast_cost`] cannot price is not estimated
+/// ([`FilterKind::Other`]); a `<>` over a cast key is
+/// [`FilterKind::NotEqualCast`].
+fn filter_kind_and_ops(c: &pg_query::protobuf::Node, scope: &Scope) -> (FilterKind, usize) {
+    let ops = operator_count(c);
+    let Some(casts) = cast_cost(c, scope) else {
+        return (FilterKind::Other, ops);
+    };
+    let kind = match not_equal_cast(c, scope) {
+        Some((l, r)) => FilterKind::NotEqualCast(l, r),
+        None => filter_kind(c),
+    };
+    (kind, ops + casts)
+}
+
+/// `c` as a `<>` (or IS DISTINCT FROM) between two operands that are each
+/// a joined key or a cast of one, at least one cast.
+fn not_equal_cast(c: &pg_query::protobuf::Node, scope: &Scope) -> Option<(CastKey, CastKey)> {
+    use pg_query::protobuf::AExprKind;
+    let Some(N::AExpr(e)) = c.node.as_ref() else {
+        return None;
+    };
+    let distinct = e.kind == AExprKind::AexprDistinct as i32;
+    if !distinct && !(e.kind == AExprKind::AexprOp as i32 && operator_name(e) == Ok("<>")) {
+        return None;
+    }
+    let operand = |n: Option<&pg_query::protobuf::Node>| -> Option<CastKey> {
+        let n = n?;
+        match n.node.as_ref()? {
+            N::TypeCast(tc) => Some(CastKey {
+                key: bare_key(tc.arg.as_deref()?)?,
+                cast: Some(cast_key_target(tc, scope)?.1),
+            }),
+            _ => Some(CastKey {
+                key: bare_key(n)?,
+                cast: None,
+            }),
+        }
+    };
+    let (l, r) = (operand(e.lexpr.as_deref())?, operand(e.rexpr.as_deref())?);
+    (l.cast.is_some() || r.cast.is_some()).then_some((l, r))
 }
 
 /// The operators `n` evaluates: each operator and IS DISTINCT FROM, and a

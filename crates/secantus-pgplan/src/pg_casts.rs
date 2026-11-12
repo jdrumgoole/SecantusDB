@@ -245,6 +245,48 @@ pub fn exists(source: i64, target: i64) -> bool {
         .any(|(_, s, t, ..)| *s == source && *t == target)
 }
 
+/// `cost_qual_eval`'s charge, in `cpu_operator_cost` units, for an explicit
+/// cast of a value of built-in type `source` to built-in type `target`, as
+/// `find_coercion_pathway` builds it under COERCION_EXPLICIT: a `pg_cast`
+/// row's function is a FuncExpr, its `procost` (1 for every built-in cast
+/// function); a row with method `i`, or no row with either type of the
+/// string category, is a CoerceViaIO, the source type's output function
+/// and the target's input function (1 each). `None` for anything else --
+/// the same type or a binary-coercible pair (a RelabelType, which
+/// `examine_variable` strips and EXPLAIN does not print), user and
+/// extension types, arrays, a user cast -- which a caller does not price.
+pub fn explicit_cast_cost(source: i64, target: i64) -> Option<usize> {
+    if source == target || source >= 16384 || target >= 16384 {
+        return None;
+    }
+    let (sc, tc) = (
+        crate::funcsig::category_of_oid(source)?,
+        crate::funcsig::category_of_oid(target)?,
+    );
+    if matches!(sc, 'A' | 'P' | 'X') || matches!(tc, 'A' | 'P' | 'X') {
+        return None;
+    }
+    let (Some(s), Some(t)) = (
+        crate::pgtypes::name_of_oid(source),
+        crate::pgtypes::name_of_oid(target),
+    ) else {
+        return None;
+    };
+    if crate::user_casts::find(s, t).is_some() {
+        return None;
+    }
+    match BUILTIN_CASTS
+        .iter()
+        .find(|(_, s, t, ..)| *s == source && *t == target)
+    {
+        Some((_, _, _, func, _, b'f')) if *func != 0 => Some(1),
+        Some((_, _, _, _, _, b'i')) => Some(2),
+        Some(_) => None,
+        None if sc == 'S' || tc == 'S' => Some(2),
+        None => None,
+    }
+}
+
 /// Does PostgreSQL refuse `x::target` for an `x` of type `source`, both
 /// spelled as the planner spells them? It does when both are built-in scalar
 /// types, they differ, there is no `pg_cast` row between them, and neither
@@ -278,4 +320,27 @@ pub fn refused(source: &str, target: &str) -> bool {
         return false;
     }
     !exists(s, t)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::explicit_cast_cost;
+
+    /// `cost_qual_eval` of a cast, as PostgreSQL 15.19 prices a join
+    /// filter holding one (RP-354): a cast function one call, an I/O
+    /// conversion two, a binary-coercible or same-type cast not priced.
+    #[test]
+    fn explicit_cast_costs() {
+        // text to int4: no pg_cast row, text is a string type.
+        assert_eq!(explicit_cast_cost(25, 23), Some(2));
+        // int4 to text: the same, the other way.
+        assert_eq!(explicit_cast_cost(23, 25), Some(2));
+        // int4 to int8: `int8(int4)`.
+        assert_eq!(explicit_cast_cost(23, 20), Some(1));
+        // varchar to text: binary coercible.
+        assert_eq!(explicit_cast_cost(1043, 25), None);
+        assert_eq!(explicit_cast_cost(23, 23), None);
+        // int4 to date: no cast at all.
+        assert_eq!(explicit_cast_cost(23, 1082), None);
+    }
 }

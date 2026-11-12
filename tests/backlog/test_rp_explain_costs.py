@@ -1250,10 +1250,12 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "        Index Cond: (a > e.a)",
         ],
     ),
-    # Still open: an inner clause over a cast of the inner's column is
-    # the parameterized scan's Filter, costed with the cast.
+    # Split from RP-354 and fixed: an inner clause over a cast of the
+    # inner's column is the parameterized scan's Filter, costed with the
+    # cast (text to int is a CoerceViaIO, two calls), the cast an
+    # expression with no statistics (`var_eq_non_const`'s 1/200).
     "nested loop left join with a cast clause into an index": (
-        "RP-354",
+        "RP-329",
         _ANALYSED,
         "explain select * from e left join k on e.a < k.a and e.a <> k.b::int",
         [
@@ -1264,10 +1266,91 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "        Filter: (e.a <> (b)::integer)",
         ],
     ),
-    # Still open: PostgreSQL's total is a hair above the .525 this
-    # server's lands a hair below (one ULP), so it prints a cent more.
+    # The same over an inner join.
+    "nested loop with a cast clause into an index": (
+        "RP-329",
+        _ANALYSED,
+        "explain select * from e join k on e.a < k.a and e.a <> k.b::int",
+        [
+            "Nested Loop  (cost=0.28..11975.00 rows=333000 width=14)",
+            "  ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
+            "  ->  Index Scan using k_pkey on k  (cost=0.28..8.64 rows=332 width=7)",
+            "        Index Cond: (a > e.a)",
+            "        Filter: (e.a <> (b)::integer)",
+        ],
+    ),
+    # The outer's column cast: the inner's own column keeps its
+    # statistics (`var_eq_non_const` over k.b), the join's `eqjoinsel`
+    # takes the cast's default 200 distinct values.
+    "nested loop left join with a cast of the outer's column into an index": (
+        "RP-329",
+        _ANALYSED,
+        "explain select * from e left join k on e.a < k.a and e.a::text <> k.b",
+        [
+            "Nested Loop Left Join  (cost=0.28..11655.00 rows=331667 width=14)",
+            "  ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
+            "  ->  Index Scan using k_pkey on k  (cost=0.28..8.64 rows=300 width=7)",
+            "        Index Cond: (a > e.a)",
+            "        Filter: ((e.a)::text <> b)",
+        ],
+    ),
+    # A cast in a Join Filter over two sequential scans costs its calls
+    # on every pair; before, a cast was priced as nothing.
+    "nested loop left join with a cast in its join filter": (
+        "RP-329",
+        _ANALYSED,
+        "explain select * from e left join e e2 on e.a <> e2.b::int",
+        [
+            "Nested Loop Left Join  (cost=0.00..20032.50 rows=999000 width=14)",
+            "  Join Filter: (e.a <> (e2.b)::integer)",
+            "  ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
+            "  ->  Materialize  (cost=0.00..20.00 rows=1000 width=7)",
+            "        ->  Seq Scan on e e2  (cost=0.00..15.00 rows=1000 width=7)",
+        ],
+    ),
+    "nested loop left join with a cast in an inequality": (
+        "RP-329",
+        _ANALYSED,
+        "explain select * from e left join e e2 on e.a < e2.b::int",
+        [
+            "Nested Loop Left Join  (cost=0.00..20032.50 rows=333333 width=14)",
+            "  Join Filter: (e.a < (e2.b)::integer)",
+            "  ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
+            "  ->  Materialize  (cost=0.00..20.00 rows=1000 width=7)",
+            "        ->  Seq Scan on e e2  (cost=0.00..15.00 rows=1000 width=7)",
+        ],
+    ),
+    "comma join with a cast in an inequality": (
+        "RP-329",
+        _ANALYSED,
+        "explain select * from e, e e2 where e.a < e2.b::int",
+        [
+            "Nested Loop  (cost=0.00..20032.50 rows=333333 width=14)",
+            "  Join Filter: (e.a < (e2.b)::integer)",
+            "  ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
+            "  ->  Materialize  (cost=0.00..20.00 rows=1000 width=7)",
+            "        ->  Seq Scan on e e2  (cost=0.00..15.00 rows=1000 width=7)",
+        ],
+    ),
+    # Still open: a function call in a join filter costs its `procost` a
+    # pair; here it is priced as nothing.
+    "nested loop left join with a function call in its join filter": (
+        "RP-910",
+        _ANALYSED,
+        "explain select * from e left join e e2 on e.a < abs(e2.a)",
+        [
+            "Nested Loop Left Join  (cost=0.00..17532.50 rows=333333 width=14)",
+            "  Join Filter: (e.a < abs(e2.a))",
+            "  ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
+            "  ->  Materialize  (cost=0.00..20.00 rows=1000 width=7)",
+            "        ->  Seq Scan on e e2  (cost=0.00..15.00 rows=1000 width=7)",
+        ],
+    ),
+    # Split from RP-354 and fixed: PostgreSQL's arm64 build fuses each
+    # `cost += a * b` into one multiply-add, which puts the .525 total a
+    # ULP above the tie; summed unfused it printed a cent under.
     "nested loop left join of two index scans with a one-sided ON conjunct": (
-        "RP-354",
+        "RP-329",
         _ANALYSED,
         "explain select * from k left join k k2 on k.a < k2.a and k.a > 990 where k.a > 900",
         [
@@ -1277,6 +1360,114 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "        Index Cond: (a > 900)",
             "  ->  Index Scan using k_pkey on k k2  (cost=0.28..6.50 rows=333 width=7)",
             "        Index Cond: (a > k.a)",
+        ],
+    ),
+    # Still open: the nested loops RP-354 leaves at zeros. Two bounds on
+    # the index column are one Index Cond of both.
+    "nested loop left join into an index bounded on both sides": (
+        "RP-354",
+        _ANALYSED,
+        "explain select * from e left join k on e.a < k.a and e.a > k.a",
+        [
+            "Nested Loop Left Join  (cost=0.28..3660.00 rows=111111 width=14)",
+            "  ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
+            "  ->  Index Scan using k_pkey on k  (cost=0.28..2.53 rows=111 width=7)",
+            "        Index Cond: ((a > e.a) AND (a < e.a))",
+        ],
+    ),
+    # An inequality over an expression of the inner side.
+    "nested loop left join on an expression of the inner side": (
+        "RP-354",
+        _ANALYSED,
+        "explain select * from e left join k on e.a < k.a + 1",
+        [
+            "Nested Loop Left Join  (cost=0.00..17532.50 rows=333333 width=14)",
+            "  Join Filter: (e.a < (k.a + 1))",
+            "  ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
+            "  ->  Materialize  (cost=0.00..20.00 rows=1000 width=7)",
+            "        ->  Seq Scan on k  (cost=0.00..15.00 rows=1000 width=7)",
+        ],
+    ),
+    # A `<>` whose operands differ in type after a cast (`int48ne`).
+    "nested loop left join with a cross-type inequality into an index": (
+        "RP-354",
+        _ANALYSED,
+        "explain select * from e left join k on e.a < k.a and e.a <> k.a::bigint",
+        [
+            "Nested Loop Left Join  (cost=0.28..11142.50 rows=333000 width=14)",
+            "  ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
+            "  ->  Index Scan using k_pkey on k  (cost=0.28..7.81 rows=332 width=7)",
+            "        Index Cond: (a > e.a)",
+            "        Filter: (e.a <> (a)::bigint)",
+        ],
+    ),
+    # An ON conjunct over the preserved side that is a pattern match.
+    "nested loop left join with a pattern over its preserved side": (
+        "RP-354",
+        _ANALYSED,
+        "explain select * from e left join e e2 on e.a <> e2.a and e.b like 'v1%'",
+        [
+            "Nested Loop Left Join  (cost=0.00..17532.50 rows=99900 width=14)",
+            "  Join Filter: ((e.a <> e2.a) AND (e.b ~~ 'v1%'::text))",
+            "  ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
+            "  ->  Materialize  (cost=0.00..20.00 rows=1000 width=7)",
+            "        ->  Seq Scan on e e2  (cost=0.00..15.00 rows=1000 width=7)",
+        ],
+    ),
+    # A join of three relations.
+    "nested loop of three relations": (
+        "RP-354",
+        _ANALYSED,
+        "explain select * from e join e e2 on e.a < e2.a join e e3 on e2.a < e3.a",
+        [
+            "Nested Loop  (cost=0.00..5015045.00 rows=111111000 width=21)",
+            "  Join Filter: (e2.a < e3.a)",
+            "  ->  Nested Loop  (cost=0.00..15032.50 rows=333333 width=14)",
+            "        Join Filter: (e.a < e2.a)",
+            "        ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
+            "        ->  Materialize  (cost=0.00..20.00 rows=1000 width=7)",
+            "              ->  Seq Scan on e e2  (cost=0.00..15.00 rows=1000 width=7)",
+            "  ->  Materialize  (cost=0.00..20.00 rows=1000 width=7)",
+            "        ->  Seq Scan on e e3  (cost=0.00..15.00 rows=1000 width=7)",
+        ],
+    ),
+    # Still open: a binary-coercible cast (text to varchar, back to text
+    # for the operator) is a RelabelType PostgreSQL strips, so the column
+    # keeps its statistics and prints bare; here the scan is not priced.
+    "a seq scan filter over a binary-coercible cast": (
+        "RP-912",
+        _ANALYSED,
+        "explain select * from e where b::varchar <> 'x'",
+        [
+            "Seq Scan on e  (cost=0.00..17.50 rows=1000 width=7)",
+            "  Filter: (b <> 'x'::text)",
+        ],
+    ),
+    "a join filter over a binary-coercible cast": (
+        "RP-912",
+        _ANALYSED,
+        "explain select * from e, k where e.b::varchar <> k.b",
+        [
+            "Nested Loop  (cost=0.00..15032.50 rows=900000 width=14)",
+            "  Join Filter: (e.b <> k.b)",
+            "  ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
+            "  ->  Materialize  (cost=0.00..20.00 rows=1000 width=7)",
+            "        ->  Seq Scan on k  (cost=0.00..15.00 rows=1000 width=7)",
+        ],
+    ),
+    # Still open: an IN list of constants is one array constant, printed
+    # as its literal under a join as it is on a lone scan.
+    "an in list in a scan filter under a join is an array constant": (
+        "RP-913",
+        _ANALYSED,
+        "explain select * from e, k where e.a <> k.a and e.a in (1, 2, 3)",
+        [
+            "Nested Loop  (cost=0.00..78.76 rows=2997 width=14)",
+            "  Join Filter: (e.a <> k.a)",
+            "  ->  Seq Scan on k  (cost=0.00..15.00 rows=1000 width=7)",
+            "  ->  Materialize  (cost=0.00..18.77 rows=3 width=7)",
+            "        ->  Seq Scan on e  (cost=0.00..18.75 rows=3 width=7)",
+            "              Filter: (a = ANY ('{1,2,3}'::integer[]))",
         ],
     ),
     # Split from RP-354 and fixed: a LEFT join with a WHERE over its

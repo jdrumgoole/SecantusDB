@@ -1082,38 +1082,27 @@ one beside it.
 
 ## Found by a CI run (2026-11-09)
 
-- [ ] **OPEN — the first catalog query after a DDL statement still grows
-      with the schema.** Every statement that may change the catalog moves
-      the version `bump_catalog_version` keeps, which drops every computed
-      catalog relation; PostgreSQL invalidates only the cache entries of
-      the rows a statement changed (`inval.c`), and its scans read one
-      relation's rows by index. Since 2026-11-12 a read whose filter pins
-      one relation (`pg_attribute.attrelid`, `pg_class.oid`, `pg_type.oid`)
-      builds and fills that relation's rows alone (`catalog_key`), and the
-      walk's sequential-scan count builds without filling. What still grows,
-      measured with psql's `\d` collation subquery
-      (`tests/backlog/test_rp_catalog_latency.py`) on a debug build after a
-      `CREATE TABLE`: 0.010 s with no other table, 0.049 s with 400, 0.092 s
-      with 800 (PostgreSQL 15.19: 0.33 ms with 200, 0.20 ms with 400). At
-      800 tables:
-      - `pg_type` pinned to one oid still builds every type's row before
-        keeping one (11 ms): the arm lists enums, composites, ranges and
-        base types whole.
-      - `pg_attribute` pinned to one relation still walks every table,
-        sequence, view, index and composite to find it (5 ms), and the
-        catalog version drops `relation_oid`'s memo and the decoded table
-        definitions, which are read again whole.
-      - The catalog-read walk counts every `pg_attribute` row (12 ms) for a
-        sequential scan PostgreSQL does not make (RP-909).
-      The faithful end state keys the rest per relation and invalidates
-      what a statement changed, as `inval.c` does; `catcache.rs` already
-      models which lookups miss. A user relation's rows depend on more than
-      its own catalog entry (its column grants, its inheritance parents and
-      children, the foreign keys naming it, the user types, domains and
-      collations its columns name), so a cache key has to carry each of
-      them, or a stale row is a wrong answer.
-      Backlog-ID: RP-715
-      Verify: tests/backlog/test_rp_catalog_latency.py::test_the_first_catalog_query_after_ddl_does_not_grow_with_the_schema
+- [ ] **OPEN — the first statement after DDL still rebuilds per-version
+      session state from every table.** Every statement that may change the
+      catalog moves the version `bump_catalog_version` keeps, and the next
+      statement on each connection republishes what the planner reads
+      (`install_session_state`, `publish_user_types`): the tableoid
+      expressions, the relations, the constraint and index definitions and
+      the comments, each listed from every table. PostgreSQL invalidates
+      only the cache entries of the rows a statement changed (`inval.c`).
+      psql's `\d` collation subquery straight after a `CREATE TABLE`, debug
+      build, 2026-11-12: 0.011 s with no other table, 0.023 s with 400 and
+      0.036 s with 800 (PostgreSQL 15.19: 0.33 ms with 200, 0.20 ms with
+      400). The rest of RP-715 was fixed on 2026-11-12 (keyed `pg_type`
+      reads, unchanged table definitions reused across versions, no copies
+      of them, one oid map per listing). The faithful end state keys the
+      published state per relation and invalidates what a statement
+      changed; a user relation's entries depend on more than its own
+      catalog row (its grants, its inheritance parents and children, the
+      foreign keys naming it, the types its columns name), so each key has
+      to carry them, or a stale entry is a wrong answer.
+      Backlog-ID: RP-911
+      Verify: tests/backlog/test_rp_catalog_latency.py::test_the_first_catalog_query_after_ddl_costs_the_same_at_800_tables
 
 ## Found by a CI run (2026-11-07)
 
@@ -1468,15 +1457,22 @@ a regression test.
       differ; a `pg_stat_*` view 53 match, 61 differ.
       Backlog-ID: RP-290
       Verify: tests/backlog/test_rp_catalog_reads.py::test_gap[a statistics view], tests/backlog/test_rp_catalog_reads.py::test_gap[psql's describe query]
-- [ ] **An index scan with a filter is counted as a sequential scan.**
-      `SELECT attname FROM pg_attribute WHERE attrelid = 2615 AND attnum >
-      0` (or `AND NOT attisdropped`) counts a `seq_scan` of `pg_attribute`
-      in `pg_stat_xact_sys_tables`; PostgreSQL 15.19 counts one `idx_scan`
-      and no `seq_scan`, the other qual a filter on the index scan. A
-      bare `attrelid = 2615` is counted right. Found while working RP-715:
-      the walk's sequential scan builds every `pg_attribute` row to count
-      them, a cost that grows with the schema. psql's `\d` column query
-      has this shape.
+- [ ] **A fresh backend's first catalog read counts an extra index scan
+      the second time it runs.** On a new connection, run `SELECT attname
+      FROM pg_attribute WHERE attrelid = 2615` (or with `AND attnum > 0`),
+      read `pg_stat_xact_sys_tables`, run it again and read again:
+      PostgreSQL 15.19 counts one `pg_attribute` `idx_scan` between the
+      reads, and this server counts two. Between the same reads
+      PostgreSQL counts one `pg_class` sequential scan and nothing else of
+      `pg_amop`, `pg_class`, `pg_operator` or `pg_type`; this server counts
+      six `pg_amop`, three `pg_class`, two `pg_operator` and one `pg_type`
+      index scans and no `pg_class` sequential scan (2026-11-12). Measured
+      again on a backend that has run the statement and the read once,
+      the counts match. An equality with other quals beside it was also
+      counted as a sequential scan, because the catalog-read walk visited
+      an AND's arms as select-list expressions; that part was fixed on
+      2026-11-12 (regression test
+      `tests/test_rust_pgserver_slice.py::test_an_equality_with_other_quals_is_one_index_scan`).
       Backlog-ID: RP-909
       Verify: tests/backlog/test_rp_catalog_reads.py::test_an_index_scan_with_a_filter_counts_one_index_scan
 - [ ] **A catalog row added after `initdb` counts no heap block** in
@@ -1581,18 +1577,56 @@ a regression test.
       k.a where k.a > 990`), and an ON conjunct over the preserved side
       alone is estimated as PostgreSQL keeps it, the join's filter, also
       when the inner is read through its index parameterized by the outer
-      row (`e left join k on e.a < k.a and e.a > 990`). Still zeros: such
-      a conjunct that costs other than its operators (an IN list, a
-      pattern, a cast of a column), and an inner join clause over a cast
-      of the inner's column, which PostgreSQL makes the parameterized
-      scan's Filter (`e left join k on e.a < k.a and e.a <> k.b::int` is
-      `cost=0.28..11975.00 rows=333000`, `Index Scan using k_pkey on k`
-      `cost=0.28..8.64 rows=332` with `Filter: (e.a <> (b)::integer)`).
-      And a cent: `k left join k k2 on k.a < k2.a and k.a > 990 where k.a
-      > 900` totals 1076.52 here, 1076.53 on PostgreSQL 15.19 -- the sum
-      is a .525 tie this server's index-scan costs land one ULP below.
+      row (`e left join k on e.a < k.a and e.a > 990`). Since 2026-11-12
+      a join clause `<>` over a cast of either side's column is priced
+      with its cast (a `pg_cast` function one call, an I/O conversion
+      two) and estimated as an expression with no statistics, the
+      parameterized scan's Filter where the inner is indexed (`e left
+      join k on e.a < k.a and e.a <> k.b::int`). Still zeros: such a
+      preserved-side conjunct that costs other than its operators (an IN
+      list, a pattern, a cast of a column), and a `<>` whose operands
+      then differ in type (`e.a <> k.a::bigint`, PostgreSQL's `int48ne`,
+      `cost=0.28..11142.50 rows=333000` over `Index Scan using k_pkey on
+      k` `cost=0.28..7.81 rows=332`). (A binary-coercible cast is its
+      own item.)
       Backlog-ID: RP-354
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[nested loop left join with a cast clause into an index], tests/backlog/test_rp_explain_costs.py::test_plan[nested loop left join of two index scans with a one-sided ON conjunct]
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[nested loop left join into an index bounded on both sides], tests/backlog/test_rp_explain_costs.py::test_plan[nested loop left join on an expression of the inner side], tests/backlog/test_rp_explain_costs.py::test_plan[nested loop left join with a cross-type inequality into an index], tests/backlog/test_rp_explain_costs.py::test_plan[nested loop left join with a pattern over its preserved side], tests/backlog/test_rp_explain_costs.py::test_plan[nested loop of three relations]
+- [ ] **A binary-coercible cast is kept in a plan, and its scan is not
+      priced.** A cast between binary-compatible types (`text` to
+      `varchar` and back to `text` for the operator) is a `RelabelType`
+      `eval_const_expressions` strips, so the column keeps its statistics
+      and prints bare: PostgreSQL 15.19 prints `explain select * from e
+      where b::varchar <> 'x'` (`e` analysed, 1000 rows) as `Seq Scan on e
+      (cost=0.00..17.50 rows=1000 width=7)` with `Filter: (b <>
+      'x'::text)`; here `Filter: (((b)::character varying)::text <>
+      'x'::text)` and zero costs. The same in a nested loop's Join Filter
+      (`e, k where e.b::varchar <> k.b`, PostgreSQL's `cost=0.00..15032.50
+      rows=900000`). Its rows are right. Measured on a private 15.19
+      cluster (found while working RP-354).
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a seq scan filter over a binary-coercible cast], tests/backlog/test_rp_explain_costs.py::test_plan[a join filter over a binary-coercible cast]
+      Backlog-ID: RP-912
+- [ ] **An IN list under a join prints as an ARRAY constructor.**
+      PostgreSQL folds `a in (1, 2, 3)` into one array constant and
+      prints it as its literal wherever the scan sits: PostgreSQL 15.19
+      prints `explain select * from e, k where e.a <> k.a and e.a in (1,
+      2, 3)` with the Materialized `Seq Scan on e`'s `Filter: (a = ANY
+      ('{1,2,3}'::integer[]))`; here `Filter: (a = ANY (ARRAY[1, 2, 3]))`.
+      A lone scan already prints the literal, and the costs and rows are
+      right. Measured on a private 15.19 cluster (found while working
+      RP-354).
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[an in list in a scan filter under a join is an array constant]
+      Backlog-ID: RP-913
+- [ ] **A function call in a nested loop's join filter is priced as
+      nothing.** `cost_qual_eval` charges a call its `procost` for every
+      pair the Join Filter checks: PostgreSQL 15.19 prints `select * from e
+      left join e e2 on e.a < abs(e2.a)` (`e`, `k` analysed, 1000 rows) as
+      `Nested Loop Left Join (cost=0.00..17532.50 rows=333333 width=14)`;
+      here `cost=0.00..15032.50`, the comparison alone. A cast in the same
+      place is priced (RP-354); a call needs its overload resolved by its
+      arguments' types to read its `procost`. Its rows are right. Measured
+      on a private 15.19 cluster (found while working RP-354).
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[nested loop left join with a function call in its join filter]
+      Backlog-ID: RP-910
 
 - [ ] **EXPLAIN of a LEFT join whose WHERE keeps only the unmatched rows
       prints a Left Join, not an Anti Join.** `reduce_outer_joins` turns a

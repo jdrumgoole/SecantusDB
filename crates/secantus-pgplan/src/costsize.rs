@@ -386,7 +386,7 @@ fn index_cost_loops(
         index_pages * RANDOM_PAGE_COST
     };
     let qual_op = CPU_OPERATOR_COST * iq.len() as f64;
-    total += nit * num_sa * (CPU_INDEX_TUPLE_COST + qual_op);
+    total = (nit * num_sa).mul_add(CPU_INDEX_TUPLE_COST + qual_op, total);
     let mut startup = 0.0;
     if index.hash {
         return Some((startup, total, sel));
@@ -394,11 +394,11 @@ fn index_cost_loops(
     if itup > 1.0 {
         let descent = itup.log2().ceil() * CPU_OPERATOR_COST;
         startup += descent;
-        total += descent * num_sa;
+        total = num_sa.mul_add(descent, total);
     }
     let descent = f64::from(index.height + 1) * PAGE_CPU_MULTIPLIER * CPU_OPERATOR_COST;
     startup += descent;
-    total += descent * num_sa;
+    total = num_sa.mul_add(descent, total);
     Some((startup, total, sel))
 }
 
@@ -513,14 +513,16 @@ fn index_scan_loops(
         let max_pages = visible(index_pages_fetched(tuples_fetched, rel.pages));
         let min_pages = visible((sel * rel.pages).ceil());
         let min_io = if min_pages > 0.0 {
-            RANDOM_PAGE_COST + (min_pages - 1.0).max(0.0) * SEQ_PAGE_COST
+            (min_pages - 1.0)
+                .max(0.0)
+                .mul_add(SEQ_PAGE_COST, RANDOM_PAGE_COST)
         } else {
             0.0
         };
         (max_pages * RANDOM_PAGE_COST, min_io)
     };
     let csquared = index.correlation * index.correlation;
-    let io = max_io + csquared * (min_io - max_io);
+    let io = csquared.mul_add(min_io - max_io, max_io);
     let others = || {
         quals
             .iter()
@@ -530,7 +532,10 @@ fn index_scan_loops(
     // Summed in `cost_index`'s order: the index's run cost, then the heap
     // I/O, then the per-tuple CPU, onto the startup -- floating point, so
     // the order moves the last digit EXPLAIN prints (RP-371: `8.345` is
-    // `8.35` this way and `8.34` adding onto the index's total).
+    // `8.35` this way and `8.34` adding onto the index's total). Each
+    // `x += a * b` is one fused multiply-add, as clang contracts it in
+    // PostgreSQL's arm64 build (RP-354: a nested loop over two index scans
+    // totalled `.525` a ULP low and printed a cent under PostgreSQL's).
     let startup_cost = startup + qual_startup(others());
     let mut run_cost = index_total - startup;
     run_cost += io;
@@ -1760,5 +1765,36 @@ mod tests {
         let (s, t) = param_index_scan(&rel, &pkey(), &[], 2040.0, 2040.0).unwrap();
         assert!((s - 0.1525).abs() < 1e-9, "{s}");
         assert!((t - 0.19).abs() < 0.005, "{t}");
+    }
+
+    /// `explain select * from k left join k k2 on k.a < k2.a and k.a > 990
+    /// where k.a > 900` over 1,000 analysed rows of `(a int primary key, b
+    /// text)` (5 heap pages, `k_pkey` 5 pages of height 1, correlation 1)
+    /// on PostgreSQL 15.19: the inner `Index Scan using k_pkey on k k2`,
+    /// `Index Cond: (a > k.a)` 100 times, is 6.5025 exactly as its arm64
+    /// build fuses `indexTotalCost += numIndexTuples * ...` into one
+    /// multiply-add; summed unfused it is a ULP over, and the nested loop
+    /// above it totalled 1076.52 where PostgreSQL prints 1076.53 (RP-354).
+    #[test]
+    fn a_parameterized_index_scan_fuses_its_multiply_adds() {
+        let rel = Rel {
+            pages: 5.0,
+            tuples: 1000.0,
+        };
+        let ix = Index {
+            field: "a".into(),
+            unique: true,
+            pages: 5.0,
+            height: 1,
+            columns: vec!["a".into()],
+            correlation: 1.0,
+            visible: 0.0,
+            tuples: None,
+            predicate: None,
+            hash: false,
+            later: Vec::new(),
+        };
+        let (startup, total) = param_range_index_scan(&rel, &ix, &[], true, 100.0).unwrap();
+        assert_eq!((startup, total), (0.275, 6.5025));
     }
 }

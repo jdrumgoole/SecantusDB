@@ -749,7 +749,7 @@ impl PgHandler {
                     .unwrap_or_else(|| row.iter().map(|(k, v)| (f(k), v.clone())).collect())
             })
             .collect();
-        for t in self.all_table_defs().unwrap_or_default() {
+        for t in self.shared_table_defs().unwrap_or_default().iter() {
             let Some(rel) = self.relation_oid(&t.name) else {
                 continue;
             };

@@ -124,7 +124,7 @@ impl PgHandler {
             }
         }
         let mut tables = Vec::new();
-        for t in self.all_table_defs()? {
+        for t in self.shared_table_defs()?.iter() {
             if t.extra.get_str("foreign_server") == Ok(name) {
                 lines.push(format!("foreign table {} depends on server {name}", t.name));
                 tables.push(t.name.clone());

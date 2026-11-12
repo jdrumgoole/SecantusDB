@@ -264,8 +264,8 @@ impl PgHandler {
     /// collides (written by a server that does not enforce the index) keeps
     /// no field and is reported, since the data already violates it.
     pub(crate) fn refresh_all_expression_indexes(&self) -> PgWireResult<()> {
-        for def in self.all_table_defs()? {
-            let indexes = self.expr_indexes(&def)?;
+        for def in self.shared_table_defs()?.iter() {
+            let indexes = self.expr_indexes(def)?;
             if indexes.is_empty() {
                 continue;
             }

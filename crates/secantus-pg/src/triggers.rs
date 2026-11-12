@@ -907,7 +907,7 @@ impl PgHandler {
         }
         // Every named constraint must exist and be deferrable.
         let mut known: Vec<(String, bool)> = Vec::new();
-        for def in self.all_table_defs()? {
+        for def in self.shared_table_defs()?.iter() {
             for fk in &def.foreign_keys {
                 known.push((fk.name.clone(), fk.deferrable));
             }

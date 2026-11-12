@@ -5734,7 +5734,7 @@ impl PgHandler {
             secantus_pgplan::ts_catalog::set_user_dicts(self.user_ts_dicts());
             secantus_pgplan::misc_alter::set_user_opclasses(self.user_opclasses());
             secantus_pgplan::ts_catalog::set_dropped_builtins(self.dropped_builtin_ts_configs());
-            secantus_pgplan::collation::set_declared_collations(self.all_table_defs().map_or(
+            secantus_pgplan::collation::set_declared_collations(self.shared_table_defs().map_or(
                 true,
                 |defs| {
                     defs.iter().any(|t| {
@@ -12291,6 +12291,18 @@ impl PgHandler {
     /// it is what `'t'::regclass::oid` and the RowDescription's `ftable`
     /// report. A table created before row types were recorded has none.
     fn relation_oid(&self, name: &str) -> Option<i64> {
+        Self::oid_in(self.relation_oids()?.as_ref(), name)
+    }
+
+    /// A relation's oid in [`Self::relation_oids`]' map.
+    fn oid_in(map: &HashMap<String, i64>, name: &str) -> Option<i64> {
+        map.get(name).copied().filter(|oid| *oid != i64::MIN)
+    }
+
+    /// Every relation's oid by name, as [`Self::relation_oid`] answers it,
+    /// for a caller asking for many: the catalog documents are fetched once
+    /// rather than per relation (RP-715). `i64::MIN` marks a name with none.
+    fn relation_oids(&self) -> Option<Arc<HashMap<String, i64>>> {
         type Memo = (
             Arc<Vec<Document>>,
             Arc<Vec<Document>>,
@@ -12354,7 +12366,7 @@ impl PgHandler {
                 map
             }
         };
-        map.get(name).copied().filter(|oid| *oid != i64::MIN)
+        Some(map)
     }
 
     /// Every table with a relation oid, as `(stored name, oid, temp)`, for
@@ -12721,16 +12733,17 @@ impl PgHandler {
     /// never an empty list.
     fn try_index_relations(&self) -> PgWireResult<Vec<IndexRelation>> {
         let mut out = Vec::new();
-        let defs = self.all_table_defs()?;
-        let defs_all = defs.clone();
-        let defs_partitions = |all: &[TableDef], parent: &str| -> Vec<TableDef> {
-            all.iter()
+        // Read in place: copying every definition, per call, was most of
+        // this list's cost on a large schema (RP-715).
+        let defs = self.shared_table_defs()?;
+        let defs_partitions = |parent: &str| -> Vec<&TableDef> {
+            defs.iter()
                 .filter(|d| partition::parent_of(d) == Some(parent))
-                .cloned()
                 .collect()
         };
-        for t in defs {
-            let table_oid = self.relation_oid(&t.name).filter(|o| *o > 0);
+        let oids = self.relation_oids().unwrap_or_default();
+        for t in defs.iter() {
+            let table_oid = Self::oid_in(&oids, &t.name).filter(|o| *o > 0);
             let derived = |slot: i64, name: &str| match table_oid {
                 Some(o) if slot < 16 => Self::INDEX_OID_BAND + o * 16 + slot,
                 _ => Self::index_oid(name),
@@ -12741,13 +12754,13 @@ impl PgHandler {
                     .position(|c| t.field_of(&c.name).as_deref() == Some(field))
                     .map_or(0, |i| i32::from(t.attnum(i)))
             };
-            let pk: Vec<i32> = secantus_pgplan::ordered_pk_columns(&t)
+            let pk: Vec<i32> = secantus_pgplan::ordered_pk_columns(t)
                 .iter()
                 .filter_map(|p| t.attnum_of(&p.name))
                 .map(i32::from)
                 .collect();
             if !pk.is_empty() {
-                let name = pk_constraint_name(&t);
+                let name = pk_constraint_name(t);
                 // `ADD PRIMARY KEY USING INDEX` over an index with INCLUDE
                 // columns keeps them (by column name).
                 let include: Vec<i32> = t
@@ -12882,7 +12895,7 @@ impl PgHandler {
             })
             .collect();
         while let Some(ix) = stack.pop() {
-            for child in defs_partitions(&defs_all, &ix.table.name) {
+            for child in defs_partitions(&ix.table.name) {
                 let name = match ix.name.strip_prefix(&format!("{}_", ix.table.name)) {
                     Some(rest) => format!("{}_{rest}", child.name),
                     None => {
@@ -12905,7 +12918,7 @@ impl PgHandler {
                     primary: ix.primary,
                     exclusion: ix.exclusion,
                 };
-                if partition::is_partitioned(&child) {
+                if partition::is_partitioned(child) {
                     stack.push(IndexRelation {
                         name: rel.name.clone(),
                         oid: rel.oid,
@@ -13165,7 +13178,7 @@ impl PgHandler {
         // Another session's temp namespace, while it holds a table: its
         // tables are in `pg_class` for everyone, as PostgreSQL lists them
         // (only resolving them by name is the owning session's).
-        if let Ok(defs) = self.all_table_defs() {
+        if let Ok(defs) = self.shared_table_defs() {
             for d in defs.iter().filter(|d| d.temp) {
                 if let Some((schema, _)) = d.name.split_once('.') {
                     if schema.starts_with("pg_temp_") && !out.iter().any(|(n, _)| n == schema) {
@@ -15418,9 +15431,9 @@ impl PgHandler {
         // Inheritance children (and theirs) depend on it too.
         let mut kids: Vec<(String, String)> = Vec::new();
         let mut stack = vec![table.to_string()];
-        let defs = self.all_table_defs()?;
+        let defs = self.shared_table_defs()?;
         while let Some(p) = stack.pop() {
-            for d in &defs {
+            for d in defs.iter() {
                 if Self::inherited_parents(d).contains(&p)
                     && !kids.iter().any(|(k, _)| *k == d.name)
                     && !dropping.contains(&d.name)
@@ -15519,7 +15532,7 @@ impl PgHandler {
         );
         let q = secantus_pgplan::scalar::quote_identifier;
         let qlist = |cols: &[String]| cols.iter().map(|c| q(c)).collect::<Vec<_>>().join(", ");
-        for t in self.all_table_defs()? {
+        for t in self.shared_table_defs()?.iter() {
             let Some(rel) = self.relation_oid(&t.name) else {
                 continue;
             };
@@ -15535,7 +15548,7 @@ impl PgHandler {
                     _ => String::new(),
                 }
             };
-            let pk: Vec<String> = secantus_pgplan::ordered_pk_columns(&t)
+            let pk: Vec<String> = secantus_pgplan::ordered_pk_columns(t)
                 .iter()
                 .map(|c| q(&c.name))
                 .collect();
@@ -15576,7 +15589,7 @@ impl PgHandler {
                 }
             }
             for ck in &t.check_constraints {
-                push(secantus_pgplan::check_constraint_text(&ck.expression, &t));
+                push(secantus_pgplan::check_constraint_text(&ck.expression, t));
             }
             for fk in &t.foreign_keys {
                 // `REFERENCES t` with no list names t's primary key.
@@ -16154,10 +16167,10 @@ impl PgHandler {
     }
 
     fn read_inheritance(&self) -> InheritanceTree {
-        let defs = self.all_table_defs().unwrap_or_default();
+        let defs = self.shared_table_defs().unwrap_or_default();
         let mut pairs = Vec::new();
         let mut columns: Vec<(String, Vec<String>)> = Vec::new();
-        for t in &defs {
+        for t in defs.iter() {
             for p in Self::inherited_parents(t) {
                 if !columns.iter().any(|(n, _)| *n == p) {
                     if let Some(pd) = defs.iter().find(|d| d.name == p) {
@@ -16319,6 +16332,17 @@ impl PgHandler {
     /// Every index's `(oid, pg_get_indexdef text)`: `pg_indexes.indexdef`,
     /// keyed by the index oid `pg_index` / `pg_class` carry.
     fn index_defs(&self) -> Vec<(i64, String)> {
+        let system = || {
+            catalog_meta::system_indexes()
+                .iter()
+                .map(|ix| (ix.oid, ix.def.clone()))
+        };
+        // With no index of a user's, `pg_indexes` (one index-list read per
+        // table) has nothing to add to the system's (RP-715).
+        let relations = self.index_relations();
+        if relations.is_empty() {
+            return system().collect();
+        }
         let Some(rows) = self.virtual_rows("pg_indexes", &Document::new()) else {
             return Vec::new();
         };
@@ -16337,18 +16361,14 @@ impl PgHandler {
                 by_name.entry(n).or_insert(d);
             }
         }
-        self.index_relations()
+        relations
             .into_iter()
             .filter_map(|ix| {
                 by_name
                     .get(ix.name.as_str())
                     .map(|d| (ix.oid, d.to_string()))
             })
-            .chain(
-                catalog_meta::system_indexes()
-                    .iter()
-                    .map(|ix| (ix.oid, ix.def.clone())),
-            )
+            .chain(system())
             .collect()
     }
 
@@ -16474,7 +16494,7 @@ impl PgHandler {
     /// is reported as `<t>_pkey` from the catalog instead.
     fn all_indexes(&self) -> PgWireResult<Vec<(TableDef, Document)>> {
         let mut out = Vec::new();
-        for def in self.all_table_defs()? {
+        for def in self.shared_table_defs()?.iter() {
             let indexes = self
                 .storage
                 .list_indexes(self.db(), &def.name)
@@ -19393,7 +19413,7 @@ impl PgHandler {
                     return Err(exists(&new));
                 }
                 labels[i] = new.clone();
-                for def in self.all_table_defs()? {
+                for def in self.shared_table_defs()?.iter() {
                     let is_enum = |t: &str| t == bare || t == name;
                     let fields: Vec<(String, bool)> = def
                         .columns
@@ -19560,7 +19580,7 @@ impl PgHandler {
     /// Every (table, column) whose type is domain `name`.
     fn domain_columns(&self, name: &str) -> PgWireResult<Vec<(TableDef, String)>> {
         let mut out = Vec::new();
-        for def in self.all_table_defs()? {
+        for def in self.shared_table_defs()?.iter() {
             for c in &def.columns {
                 if c.extra.get_str("domain_type") == Ok(name) {
                     out.push((def.clone(), c.name.clone()));
@@ -19963,7 +19983,7 @@ impl PgHandler {
         if Self::virtual_table(table).is_none() {
             return Ok(false);
         }
-        Ok(!self.all_table_defs()?.iter().any(|t| t.name == table))
+        Ok(!self.shared_table_defs()?.iter().any(|t| t.name == table))
     }
 
     /// Changing a system catalog is refused (a scope decision: the catalogs
@@ -20568,7 +20588,7 @@ impl PgHandler {
         };
         if name == "pg_database_size" {
             let mut total = 7 * 1024 * 1024;
-            for def in self.all_table_defs()? {
+            for def in self.shared_table_defs()?.iter() {
                 total += pages(table_bytes(&def.name)?);
             }
             return Ok(Bson::Int64(total));
@@ -20744,7 +20764,7 @@ impl PgHandler {
     /// (primary key, unique / exclusion, check, foreign key).
     pub(crate) fn constraint_comments(&self) -> Vec<(i64, String)> {
         let mut out = Vec::new();
-        for t in self.all_table_defs().unwrap_or_default() {
+        for t in self.shared_table_defs().unwrap_or_default().iter() {
             let Some(rel) = self.relation_oid(&t.name) else {
                 continue;
             };
@@ -20784,7 +20804,7 @@ impl PgHandler {
                 out.push((crate::extension_oid(i), 0, c.to_string()));
             }
         }
-        for def in self.all_table_defs()? {
+        for def in self.shared_table_defs()?.iter() {
             let Some(oid) = self.relation_oid(&def.name) else {
                 continue;
             };
@@ -21005,6 +21025,19 @@ impl PgHandler {
     }
 
     /// Every enum type: `(name, oid, labels)`, name-sorted for stable output.
+    /// [`Self::enums`] when `wanted`, else none.
+    fn enums_if(&self, wanted: bool) -> Option<Vec<(String, i64, Vec<String>)>> {
+        if wanted {
+            self.enums().ok()
+        } else {
+            Some(Vec::new())
+        }
+    }
+
+    /// Where every type a user makes draws its oid from: `initdb`'s
+    /// `FirstNormalObjectId`. A built-in type's oid is below it.
+    const FIRST_USER_TYPE_OID: i64 = 16384;
+
     fn enums(&self) -> PgWireResult<Vec<(String, i64, Vec<String>)>> {
         let mut out = Vec::new();
         for d in self.type_catalog_docs(Self::ENUM_COLLECTION)?.iter() {
@@ -22103,11 +22136,11 @@ impl PgHandler {
                 let f = |name: &str| def.field_of(name).expect("column");
                 let db = self.db().to_string();
                 let mut rows = Vec::new();
-                for t in self.all_table_defs().ok()? {
+                for t in self.shared_table_defs().ok()?.iter() {
                     for (i, c) in t.columns.iter().enumerate() {
                         let mut d = Document::new();
                         d.insert(f("table_catalog"), db.as_str());
-                        d.insert(f("table_schema"), Self::schema_of(&t));
+                        d.insert(f("table_schema"), Self::schema_of(t));
                         d.insert(f("table_name"), t.name.as_str());
                         d.insert(f("column_name"), c.name.as_str());
                         d.insert(f("ordinal_position"), Bson::Int32(i32::from(t.attnum(i))));
@@ -22185,7 +22218,7 @@ impl PgHandler {
                             f("generation_expression"),
                             generated
                                 .and_then(|g| {
-                                    secantus_pgplan::ruleutils::expr_def(g, &t)
+                                    secantus_pgplan::ruleutils::expr_def(g, t)
                                         .or_else(|| secantus_pgplan::generation_expression(g))
                                 })
                                 .map_or(Bson::Null, Bson::String),
@@ -22424,8 +22457,8 @@ impl PgHandler {
                 let mut rows = Vec::new();
                 let own_temp = self.temp_schema_name();
                 let namespaces = self.namespaces();
-                for t in self.all_table_defs().ok()? {
-                    let schema = Self::schema_of(&t);
+                for t in self.shared_table_defs().ok()?.iter() {
+                    let schema = Self::schema_of(t);
                     // Another session's temp schema is not listed
                     // (`pg_is_other_temp_schema`).
                     if t.temp && schema != own_temp {
@@ -22458,7 +22491,7 @@ impl PgHandler {
                     };
                     if t.columns.iter().any(|c| c.pk) {
                         push(
-                            &pk_constraint_name(&t),
+                            &pk_constraint_name(t),
                             "PRIMARY KEY",
                             false,
                             false,
@@ -22538,8 +22571,8 @@ impl PgHandler {
                 let db = self.db().to_string();
                 let mut rows = Vec::new();
                 let own_temp = self.temp_schema_name();
-                for t in self.all_table_defs().ok()? {
-                    let schema = Self::schema_of(&t);
+                for t in self.shared_table_defs().ok()?.iter() {
+                    let schema = Self::schema_of(t);
                     if t.temp && schema != own_temp {
                         continue;
                     }
@@ -22567,8 +22600,8 @@ impl PgHandler {
                     // key column, which is why a count over this view is one
                     // for a single-column primary key rather than one per
                     // constraint of any kind.
-                    let pkey = pk_constraint_name(&t);
-                    for (i, c) in secantus_pgplan::ordered_pk_columns(&t).iter().enumerate() {
+                    let pkey = pk_constraint_name(t);
+                    for (i, c) in secantus_pgplan::ordered_pk_columns(t).iter().enumerate() {
                         push(&pkey, &c.name, (i + 1) as i32, None, &mut rows);
                     }
                     for u in t.unique_constraints.iter().filter(|u| !u.exclusion) {
@@ -22693,7 +22726,7 @@ impl PgHandler {
                     .map(|(n, _, _)| n)
                     .collect();
                 let sizes = self.recorded_sizes();
-                for t in self.all_table_defs().ok()? {
+                for t in self.shared_table_defs().ok()?.iter() {
                     let mut d = Document::new();
                     d.insert(
                         f("oid"),
@@ -22710,18 +22743,18 @@ impl PgHandler {
                         f("relkind"),
                         if matviews.contains(&t.name) {
                             "m"
-                        } else if secantus_pgplan::fdw::is_foreign(&t) {
+                        } else if secantus_pgplan::fdw::is_foreign(t) {
                             "f"
-                        } else if partition::is_partitioned(&t) {
+                        } else if partition::is_partitioned(t) {
                             "p"
                         } else {
                             "r"
                         },
                     );
-                    d.insert(f("relispartition"), partition::parent_of(&t).is_some());
+                    d.insert(f("relispartition"), partition::parent_of(t).is_some());
                     d.insert(
                         f("relpartbound"),
-                        self.partition_bound_text(&t)
+                        self.partition_bound_text(t)
                             .map_or(Bson::Null, Bson::String),
                     );
                     d.insert(f("relnatts"), Bson::Int32(i32::from(t.natts())));
@@ -23182,9 +23215,9 @@ impl PgHandler {
                     d.insert(f("indexdef"), ix.def.as_str());
                     rows.push(d);
                 }
-                for t in self.all_table_defs().ok()? {
-                    let schema = Self::schema_of(&t);
-                    let pk: Vec<&str> = secantus_pgplan::ordered_pk_columns(&t)
+                for t in self.shared_table_defs().ok()?.iter() {
+                    let schema = Self::schema_of(t);
+                    let pk: Vec<&str> = secantus_pgplan::ordered_pk_columns(t)
                         .iter()
                         .map(|c| c.name.as_str())
                         .collect();
@@ -23192,7 +23225,7 @@ impl PgHandler {
                         let mut d = Document::new();
                         d.insert(f("schemaname"), schema.as_str());
                         d.insert(f("tablename"), t.name.as_str());
-                        d.insert(f("indexname"), pk_constraint_name(&t));
+                        d.insert(f("indexname"), pk_constraint_name(t));
                         d.insert(f("tablespace"), Bson::Null);
                         d.insert(f("indexdef"), {
                             let include: Vec<&str> = t
@@ -23202,14 +23235,14 @@ impl PgHandler {
                                 .unwrap_or_default();
                             let mut def = format!(
                                 "CREATE UNIQUE INDEX {} ON {schema}.{} USING btree ({})",
-                                pk_constraint_name(&t),
+                                pk_constraint_name(t),
                                 t.name,
                                 pk.join(", ")
                             );
                             if !include.is_empty() {
                                 def.push_str(&format!(" INCLUDE ({})", include.join(", ")));
                             }
-                            if let Some(with) = Self::constraint_index_reloptions(&t, "", true)
+                            if let Some(with) = Self::constraint_index_reloptions(t, "", true)
                                 .and_then(|o| Self::with_clause(&o))
                             {
                                 def.push_str(&with);
@@ -23219,7 +23252,7 @@ impl PgHandler {
                         rows.push(d);
                     }
                     for ix in self.storage.list_indexes(self.db(), &t.name).ok()? {
-                        let Some(indexdef) = Self::created_index_def(&t, &schema, &ix) else {
+                        let Some(indexdef) = Self::created_index_def(t, &schema, &ix) else {
                             continue;
                         };
                         let mut d = Document::new();
@@ -23259,11 +23292,11 @@ impl PgHandler {
             "pg_attrdef" => {
                 let f = |name: &str| def.field_of(name).expect("column");
                 let mut rows = Vec::new();
-                for t in self.all_table_defs().ok()? {
+                for t in self.shared_table_defs().ok()?.iter() {
                     let oid = self.relation_oid(&t.name).unwrap_or(0);
                     for (i, c) in t.columns.iter().enumerate() {
                         let expr = match c.extra.get_str("generated") {
-                            Ok(g) => secantus_pgplan::ruleutils::expr_def(g, &t)
+                            Ok(g) => secantus_pgplan::ruleutils::expr_def(g, t)
                                 .or_else(|| secantus_pgplan::generation_expression(g))
                                 .map_or(Bson::Null, Bson::String),
                             Err(_) => Self::default_expression(c),
@@ -23290,6 +23323,11 @@ impl PgHandler {
                 rows
             }
             "pg_type" => {
+                // A read pinned to a built-in type's oid (`t.oid =
+                // a.atttypid` for a `text` column) holds no type a user made:
+                // every user type's oid, and its array's, is drawn from 16384
+                // up. Only the built-in rows are built for it (RP-715).
+                let user_types = key.is_none_or(|(_, k)| *k >= Self::FIRST_USER_TYPE_OID);
                 let mut rows: Vec<Document> = secantus_pgplan::pgtypes::BUILTIN_TYPES
                     .iter()
                     .map(|(typname, oid, typarray)| {
@@ -23326,7 +23364,7 @@ impl PgHandler {
                 }
                 // User enums ride along, their typarray DERIVED as
                 // oid + 100_000 -- the shared-store rule, never stored.
-                for (name, oid, _) in self.enums().ok()? {
+                for (name, oid, _) in self.enums_if(user_types)? {
                     let mut d = Document::new();
                     d.insert(def.field_of("typname").expect("column"), name);
                     d.insert(def.field_of("oid").expect("column"), Bson::Int64(oid));
@@ -23341,15 +23379,21 @@ impl PgHandler {
                 // Composites likewise. `typrelid` is the composite's OWN oid
                 // here -- pg_attribute keys its fields on it, and this query
                 // needs no separate pg_class row.
-                let relids: HashMap<i64, i64> = self
-                    .type_catalog_docs(Self::COMPOSITE_COLLECTION)
-                    .ok()?
+                let composite_docs = match user_types {
+                    true => self.type_catalog_docs(Self::COMPOSITE_COLLECTION).ok()?,
+                    false => Arc::new(Vec::new()),
+                };
+                let relids: HashMap<i64, i64> = composite_docs
                     .iter()
                     .filter_map(|d| {
                         Some((d.get("oid").and_then(bson_i64)?, Self::composite_relid(d)?))
                     })
                     .collect();
-                for (name, oid, _) in self.composites().ok()? {
+                let composites = match user_types {
+                    true => self.composites().ok()?,
+                    false => Vec::new(),
+                };
+                for (name, oid, _) in composites.iter().cloned() {
                     let mut d = Document::new();
                     d.insert(def.field_of("typname").expect("column"), name);
                     d.insert(def.field_of("oid").expect("column"), Bson::Int64(oid));
@@ -23369,7 +23413,11 @@ impl PgHandler {
                 // oid is range_oid + offset, its typarray derived from that.
                 // psycopg's MultirangeInfo.fetch reads this row after resolving
                 // `to_regtype('<mrname>')` and joining pg_range.rngmultitypid.
-                for (name, oid, _) in self.ranges().ok()? {
+                let ranges = match user_types {
+                    true => self.ranges().ok()?,
+                    false => Vec::new(),
+                };
+                for (name, oid, _) in ranges.iter().cloned() {
                     let mut d = Document::new();
                     d.insert(def.field_of("typname").expect("column"), name.clone());
                     d.insert(def.field_of("oid").expect("column"), Bson::Int64(oid));
@@ -23403,7 +23451,11 @@ impl PgHandler {
                     .type_catalog_docs(Self::BASE_TYPE_COLLECTION)
                     .map(|d| d.to_vec())
                     .unwrap_or_default();
-                for b in self.base_types().ok()? {
+                let base_types = match user_types {
+                    true => self.base_types().ok()?,
+                    false => Vec::new(),
+                };
+                for b in base_types {
                     let mut d = Document::new();
                     let raw = base_docs.iter().find(|x| {
                         x.get_i64("oid")
@@ -23501,7 +23553,10 @@ impl PgHandler {
                     rows.push(d);
                 }
                 // Domains: their own oid, over the base type's.
-                let domains = self.domains().unwrap_or_default();
+                let domains = match user_types {
+                    true => self.domains().unwrap_or_default(),
+                    false => Vec::new(),
+                };
                 for dm in &domains {
                     let mut d = Document::new();
                     d.insert(def.field_of("typname").expect("column"), dm.name.clone());
@@ -23552,18 +23607,29 @@ impl PgHandler {
                 // type's kind from where it came from, and its namespace.
                 let oids =
                     |v: Vec<i64>| -> std::collections::HashSet<i64> { v.into_iter().collect() };
-                let enum_oids = oids(self.enums().ok()?.iter().map(|(_, o, _)| *o).collect());
-                let comp_oids = oids(self.composites().ok()?.iter().map(|(_, o, _)| *o).collect());
-                let range_oids = oids(self.ranges().ok()?.iter().map(|(_, o, _)| *o).collect());
+                let enum_oids = oids(
+                    self.enums_if(user_types)?
+                        .iter()
+                        .map(|(_, o, _)| *o)
+                        .collect(),
+                );
+                let comp_oids = oids(composites.iter().map(|(_, o, _)| *o).collect());
+                let range_oids = oids(ranges.iter().map(|(_, o, _)| *o).collect());
                 // A type created in a schema (`create type s.t as (...)`) is
                 // in that schema's namespace, as its catalog doc records.
-                let namespaces = self.namespaces();
+                let namespaces = match user_types {
+                    true => self.namespaces(),
+                    false => Vec::new(),
+                };
                 let mut type_namespace: HashMap<i64, i64> = HashMap::new();
                 for collection in [
                     Self::COMPOSITE_COLLECTION,
                     Self::ENUM_COLLECTION,
                     Self::BASE_TYPE_COLLECTION,
                 ] {
+                    if !user_types {
+                        break;
+                    }
                     for doc in self.type_catalog_docs(collection).ok()?.iter() {
                         let (Ok(schema), Some(oid)) =
                             (doc.get_str("schema"), doc.get("oid").and_then(bson_i64))
@@ -23639,7 +23705,11 @@ impl PgHandler {
                     d.insert(f("typdelim"), ",");
                 };
                 // A view's row type: every relation has one.
-                for (view, _) in self.views().unwrap_or_default() {
+                let views = match user_types {
+                    true => self.views().unwrap_or_default(),
+                    false => Vec::new(),
+                };
+                for (view, _) in views {
                     let oid = self.view_type_relid(&view);
                     let mut d = Document::new();
                     d.insert(f("typname"), view.as_str());
@@ -24050,7 +24120,7 @@ impl PgHandler {
             "pg_inherits" => {
                 let f = |name: &str| def.field_of(name).expect("column");
                 let oid = |n: &str| Bson::Int64(self.relation_oid(n).unwrap_or(0));
-                let defs = self.all_table_defs().ok()?;
+                let defs = self.shared_table_defs().ok()?;
                 let mut rows: Vec<Document> = defs
                     .iter()
                     .filter_map(|t| {
@@ -24064,7 +24134,7 @@ impl PgHandler {
                     })
                     .collect();
                 // `INHERITS (p, ...)`: one row per parent, numbered.
-                for t in &defs {
+                for t in defs.iter() {
                     for (i, p) in Self::inherited_parents(t).iter().enumerate() {
                         let mut d = Document::new();
                         d.insert(f("inhrelid"), oid(&t.name));
@@ -24078,7 +24148,7 @@ impl PgHandler {
             }
             "pg_partitioned_table" => {
                 let f = |name: &str| def.field_of(name).expect("column");
-                let defs = self.all_table_defs().ok()?;
+                let defs = self.shared_table_defs().ok()?;
                 defs.iter()
                     .filter_map(|t| {
                         let (strat, attrs) = Self::partition_strategy(t)?;
@@ -24311,8 +24381,9 @@ impl PgHandler {
                 // fields were listed here, so `attrelid = 't'::regclass`
                 // found nothing for a table.
                 let defs = self.shared_table_defs().ok()?;
+                let oids = self.relation_oids().unwrap_or_default();
                 for t in defs.iter() {
-                    let relid = self.relation_oid(&t.name).unwrap_or(0);
+                    let relid = Self::oid_in(&oids, &t.name).unwrap_or(0);
                     if !wanted(relid) {
                         continue;
                     }
@@ -25013,7 +25084,7 @@ impl PgHandler {
             }
             "pg_constraint" => {
                 let field = |c: &str| def.field_of(c).expect("column");
-                let defs = self.all_table_defs().ok()?;
+                let defs = self.shared_table_defs().ok()?;
                 // A key / unique / exclude constraint's index, by name.
                 let index_rels = self.index_relations();
                 let index_oids: Vec<(String, String, i64)> = index_rels
@@ -25077,7 +25148,7 @@ impl PgHandler {
                     d.insert(field("conbin"), text);
                     rows.push(d);
                 }
-                for t in &defs {
+                for t in defs.iter() {
                     // A table created before row types were recorded has no
                     // relation oid, so nothing could join to its rows.
                     // Skipping beats emitting rows keyed on oid 0, which
@@ -31331,8 +31402,8 @@ impl PgHandler {
             return Ok(Vec::new());
         };
         let mut out = Vec::new();
-        for t in self.all_table_defs()? {
-            let t = if t.name == table { def.clone() } else { t };
+        for t in self.shared_table_defs()?.iter() {
+            let t = if t.name == table { def } else { t };
             for fk in &t.foreign_keys {
                 if fk.ref_table == table && secantus_pgplan::same_columns(&fk.ref_columns, &cols) {
                     out.push((fk.name.clone(), t.name.clone()));
@@ -45519,7 +45590,7 @@ impl PgHandler {
                         _ => None,
                     } {
                         let mut dependent: Vec<(String, String)> = Vec::new();
-                        for def in self.all_table_defs()? {
+                        for def in self.shared_table_defs()?.iter() {
                             for ix in self
                                 .storage
                                 .list_indexes(self.db(), &def.name)
@@ -45588,7 +45659,7 @@ impl PgHandler {
                         .collect();
                     let mut dependents = Vec::new();
                     let mut columns: Vec<(String, String)> = Vec::new();
-                    for def in self.all_table_defs()? {
+                    for def in self.shared_table_defs()?.iter() {
                         for col in &def.columns {
                             let element = col.pg_type.strip_suffix("[]").unwrap_or(&col.pg_type);
                             if owned
@@ -47454,12 +47525,12 @@ impl PgHandler {
     /// PostgreSQL refuses it -- a static check on the constraint, whether
     /// or not any row currently references.
     fn truncate_set(&self, named: &[String], cascade: bool) -> PgWireResult<Vec<String>> {
-        let defs = self.all_table_defs()?;
+        let defs = self.shared_table_defs()?;
         let mut set: Vec<String> = named.to_vec();
         let mut i = 0;
         while i < set.len() {
             let parent = set[i].clone();
-            for def in &defs {
+            for def in defs.iter() {
                 if set.contains(&def.name) {
                     continue;
                 }
@@ -48453,7 +48524,7 @@ impl PgHandler {
         if let Some(defs) = self.committed_table_defs() {
             return Ok(defs.iter().flat_map(pick).collect());
         }
-        let defs = self.all_table_defs()?;
+        let defs = self.shared_table_defs()?;
         Ok(defs.iter().flat_map(pick).collect())
     }
 
@@ -48472,7 +48543,13 @@ impl PgHandler {
     /// (on a session of its own) and shared; `None` while this session's
     /// transaction has catalog changes of its own (`catalog_untouched`).
     fn committed_table_defs(&self) -> Option<Arc<Vec<TableDef>>> {
-        type Cache = Mutex<HashMap<(usize, String), (u64, Arc<Vec<TableDef>>)>>;
+        /// One catalog version's definitions, and each one's stored bytes.
+        struct Entry {
+            version: u64,
+            defs: Arc<Vec<TableDef>>,
+            raw: Arc<Vec<Vec<u8>>>,
+        }
+        type Cache = Mutex<HashMap<(usize, String), Entry>>;
         static CACHE: std::sync::OnceLock<Cache> = std::sync::OnceLock::new();
         if !self.catalog_untouched() {
             return None;
@@ -48484,9 +48561,9 @@ impl PgHandler {
         let version = catalog_cache()
             .version
             .load(std::sync::atomic::Ordering::SeqCst);
-        if let Some((v, defs)) = cache.lock().unwrap_or_else(|e| e.into_inner()).get(&key) {
-            if *v == version {
-                return Some(Arc::clone(defs));
+        if let Some(e) = cache.lock().unwrap_or_else(|e| e.into_inner()).get(&key) {
+            if e.version == version {
+                return Some(Arc::clone(&e.defs));
             }
         }
         let raw = self
@@ -48496,16 +48573,48 @@ impl PgHandler {
                     .find_matching(self.db(), CATALOG_COLLECTION, &Document::new())
             })
             .ok()?;
-        let defs: Arc<Vec<TableDef>> = Arc::new(
-            raw.iter()
-                .filter_map(|b| decode_doc(b).ok())
-                .filter_map(|d| TableDef::from_document(&d))
-                .collect(),
-        );
-        cache
+        // A definition whose stored bytes are those the previous version
+        // decoded is that definition again: only what a statement changed is
+        // decoded anew, as PostgreSQL rebuilds only the relcache entries an
+        // invalidation names (RP-715). Both reads come in the catalog's key
+        // order, so the previous version's entry for a document is at the
+        // cursor, or just past an entry the statement dropped or changed.
+        let (old_raw, old_defs) = cache
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .insert(key, (version, Arc::clone(&defs)));
+            .get(&key)
+            .map(|e| (Arc::clone(&e.raw), Arc::clone(&e.defs)))
+            .unwrap_or_default();
+        let mut cursor = 0;
+        let mut defs = Vec::with_capacity(raw.len());
+        let mut kept = Vec::with_capacity(raw.len());
+        for b in raw {
+            let same = (cursor..old_raw.len().min(cursor + 3)).find(|&i| old_raw[i] == b);
+            let def = match same {
+                Some(i) => {
+                    cursor = i + 1;
+                    old_defs[i].clone()
+                }
+                None => match decode_doc(&b)
+                    .ok()
+                    .and_then(|d| TableDef::from_document(&d))
+                {
+                    Some(def) => def,
+                    None => continue,
+                },
+            };
+            defs.push(def);
+            kept.push(b);
+        }
+        let defs = Arc::new(defs);
+        cache.lock().unwrap_or_else(|e| e.into_inner()).insert(
+            key,
+            Entry {
+                version,
+                defs: Arc::clone(&defs),
+                raw: Arc::new(kept),
+            },
+        );
         Some(defs)
     }
 

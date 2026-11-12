@@ -773,9 +773,9 @@ fn nest_loop_with(outer: &JoinSide, inner: &JoinSide, materialized: bool, qual: 
     let mut run = outer.scan.1 - outer.scan.0;
     run += inner_total - inner_startup;
     if outer.rows > 1.0 {
-        run += (outer.rows - 1.0) * rescan;
+        run = (outer.rows - 1.0).mul_add(rescan, run);
     }
-    run += (CPU_TUPLE_COST + qual) * outer.rows * inner.rows;
+    run = (CPU_TUPLE_COST + qual).mul_add(outer.rows * inner.rows, run);
     (startup, startup + run)
 }
 
@@ -1964,7 +1964,8 @@ fn memoize(inner: &InPath, key: &MemoKey, calls: f64, width: i64) -> InPath {
 /// first match, an unmatched outer row costing an indexed inner scan its
 /// first tuple's share and any other inner scan all of it -- and
 /// `cpu_tuple_cost` plus the join quals still to check (`qual`) on each
-/// pair it reads.
+/// pair it reads. Each `run_cost += a * b` is a fused multiply-add, as
+/// clang contracts PostgreSQL's (RP-354).
 fn nestloop_cost(
     outer: &InPath,
     inner: &InPath,
@@ -1976,7 +1977,7 @@ fn nestloop_cost(
     let startup = outer.startup + inner.startup;
     let mut run = outer.total - outer.startup;
     if outer.rows > 1.0 {
-        run += (outer.rows - 1.0) * rescan_start;
+        run = (outer.rows - 1.0).mul_add(rescan_start, run);
     }
     let inner_run = inner.total - inner.startup;
     let inner_rescan_run = rescan_total - rescan_start;
@@ -1986,7 +1987,7 @@ fn nestloop_cost(
         None => {
             run += inner_run;
             if outer.rows > 1.0 {
-                run += (outer.rows - 1.0) * inner_rescan_run;
+                run = (outer.rows - 1.0).mul_add(inner_rescan_run, run);
             }
             outer_rows * inner_rows
         }
@@ -1996,13 +1997,13 @@ fn nestloop_cost(
             let scan_frac = 2.0 / (match_count + 1.0);
             let mut ntuples = matched * inner_rows * scan_frac;
             if indexed {
-                run += inner_run * scan_frac;
+                run = inner_run.mul_add(scan_frac, run);
                 if matched > 1.0 {
-                    run += (matched - 1.0) * inner_rescan_run * scan_frac;
+                    run = ((matched - 1.0) * inner_rescan_run).mul_add(scan_frac, run);
                 }
                 run += unmatched * inner_rescan_run / inner_rows;
             } else {
-                ntuples += unmatched * inner_rows;
+                ntuples = unmatched.mul_add(inner_rows, ntuples);
                 run += inner_run;
                 if unmatched >= 1.0 {
                     unmatched -= 1.0;
@@ -2010,16 +2011,16 @@ fn nestloop_cost(
                     matched -= 1.0;
                 }
                 if matched > 0.0 {
-                    run += matched * inner_rescan_run * scan_frac;
+                    run = (matched * inner_rescan_run).mul_add(scan_frac, run);
                 }
                 if unmatched > 0.0 {
-                    run += unmatched * inner_rescan_run;
+                    run = unmatched.mul_add(inner_rescan_run, run);
                 }
             }
             ntuples
         }
     };
-    run += (CPU_TUPLE_COST + qual) * ntuples;
+    run = (CPU_TUPLE_COST + qual).mul_add(ntuples, run);
     (startup, startup + run)
 }
 

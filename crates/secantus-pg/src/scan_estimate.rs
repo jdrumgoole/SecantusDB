@@ -357,7 +357,7 @@ impl PgHandler {
         {
             return None;
         }
-        let defs = self.all_table_defs().ok()?;
+        let defs = self.shared_table_defs().ok()?;
         let mut children = Vec::new();
         let mut types: Vec<Vec<String>> = Vec::new();
         for side in [&set.left, &set.right] {
@@ -510,8 +510,12 @@ impl PgHandler {
         };
         if filters.iter().any(|f| {
             !restriction(f)
-                && (!matches!(f.kind, FilterKind::Inequality | FilterKind::NotEqual(..))
-                    || f.aliases.len() < 2)
+                && (!matches!(
+                    f.kind,
+                    FilterKind::Inequality
+                        | FilterKind::NotEqual(..)
+                        | FilterKind::NotEqualCast(..)
+                ) || f.aliases.len() < 2)
         }) {
             return None;
         }
@@ -608,9 +612,6 @@ impl PgHandler {
         // a constant joins the range clauses (`addRangeClause`), which are
         // multiplied in last, a column's two bounds as one range.
         let mut sel_factor = 1.0_f64;
-        // The join clauses' alone: those a parameterized inner moves into
-        // its scan, its rows `get_parameterized_baserel_size`'s.
-        let mut join_sel = 1.0_f64;
         let mut ranges: Vec<Document> = Vec::new();
         for f in &filters {
             if let (true, Some(r)) = (restriction(f), &f.restrict) {
@@ -643,10 +644,23 @@ impl PgHandler {
                     let eq = secantus_pgplan::joincost::eqjoinsel_inner(&key(&x), &key(&y));
                     1.0 - eq.clamp(0.0, 1.0)
                 }
+                // A cast key is an expression with no statistics: its
+                // distinct count `get_variable_numdistinct`'s default, no
+                // NULLs and no MCV list.
+                FilterKind::NotEqualCast(l, r) => {
+                    let (x, y) = (
+                        ne_operand(self, &key_columns, l)?,
+                        ne_operand(self, &key_columns, r)?,
+                    );
+                    if x.type_oid != y.type_oid {
+                        return None;
+                    }
+                    let eq = secantus_pgplan::joincost::eqjoinsel_inner(&x.stats(), &y.stats());
+                    1.0 - eq.clamp(0.0, 1.0)
+                }
                 _ => return None,
             };
             sel_factor *= s;
-            join_sel *= s;
         }
         if !ranges.is_empty() {
             let filter = match ranges.len() {
@@ -682,11 +696,14 @@ impl PgHandler {
             if left_join && slot == 1 {
                 break;
             }
+            // `get_parameterized_baserel_size`: the join clauses moved
+            // into the scan, estimated as restrictions of the inner.
+            let param_sel = param_selectivity(self, inner_leaf, &movable, &key_columns)?;
             let found = self.param_index_inner(
                 inner_leaf,
                 &movable,
                 outer_rows,
-                inner_rows * join_sel,
+                inner_rows * param_sel,
                 inner_rows,
             );
             match found {
@@ -1007,7 +1024,7 @@ impl PgHandler {
                     .find(|(_, al)| al == alias)
                     .map(|(t, _)| t.clone())
             };
-            let defs = self.all_table_defs().ok()?;
+            let defs = self.shared_table_defs().ok()?;
             let def_of = |alias: &str| {
                 let t = table(alias)?;
                 defs.iter().find(|d| d.name == t).cloned()
@@ -2264,7 +2281,7 @@ impl PgHandler {
     /// with an index, where PostgreSQL may choose an index path.
     pub(crate) fn modify_table_estimate(&self, stmt: &Statement) -> Option<(Estimate, Estimate)> {
         const CTID_WIDTH: i64 = 6;
-        let defs = self.all_table_defs().ok()?;
+        let defs = self.shared_table_defs().ok()?;
         let def_of = |table: &str| defs.iter().find(|d| d.name == table);
         let scan = |table: &str, filter: &Document, width: i64| -> Option<Estimate> {
             if !filter.is_empty()
@@ -2349,7 +2366,12 @@ impl PgHandler {
         fields: &[String],
         reads: &[String],
     ) -> Option<ScanEstimate> {
-        if self.all_table_defs().ok()?.iter().any(|d| d.name == table) {
+        if self
+            .shared_table_defs()
+            .ok()?
+            .iter()
+            .any(|d| d.name == table)
+        {
             if let Some(chosen) = self.user_index_path(table, filter, fields, reads) {
                 return Some(chosen);
             }
@@ -2423,7 +2445,13 @@ impl PgHandler {
         fields: &[String],
         key: &[String],
     ) -> Option<Estimate> {
-        if filter.is_empty() || !self.all_table_defs().ok()?.iter().any(|d| d.name == table) {
+        if filter.is_empty()
+            || !self
+                .shared_table_defs()
+                .ok()?
+                .iter()
+                .any(|d| d.name == table)
+        {
             return None;
         }
         let counted: std::cell::OnceCell<Option<usize>> = std::cell::OnceCell::new();
@@ -2544,7 +2572,12 @@ impl PgHandler {
         fields: &[String],
         reads: &[String],
     ) -> Option<ScanEstimate> {
-        if !self.all_table_defs().ok()?.iter().any(|d| d.name == table) {
+        if !self
+            .shared_table_defs()
+            .ok()?
+            .iter()
+            .any(|d| d.name == table)
+        {
             return None;
         }
         self.user_index_path(table, filter, fields, reads)
@@ -2573,7 +2606,12 @@ impl PgHandler {
         fields: &[String],
         want: &PathWant,
     ) -> Option<UserPath> {
-        if !self.all_table_defs().ok()?.iter().any(|d| d.name == table) {
+        if !self
+            .shared_table_defs()
+            .ok()?
+            .iter()
+            .any(|d| d.name == table)
+        {
             return None;
         }
         let mut path = self.user_paths(table, filter, fields, &[], want)?;
@@ -3003,7 +3041,13 @@ impl PgHandler {
         fields: &[String],
         reads: &[String],
     ) -> Option<Estimate> {
-        if exprs.is_empty() || !self.all_table_defs().ok()?.iter().any(|d| d.name == table) {
+        if exprs.is_empty()
+            || !self
+                .shared_table_defs()
+                .ok()?
+                .iter()
+                .any(|d| d.name == table)
+        {
             return None;
         }
         let relations = self.index_relations();
@@ -3041,7 +3085,13 @@ impl PgHandler {
         quals: &[secantus_pgplan::ArrayQual],
         fields: &[String],
     ) -> Option<Estimate> {
-        if quals.is_empty() || !self.all_table_defs().ok()?.iter().any(|d| d.name == table) {
+        if quals.is_empty()
+            || !self
+                .shared_table_defs()
+                .ok()?
+                .iter()
+                .any(|d| d.name == table)
+        {
             return None;
         }
         self.user_seq_scan_with(table, &Document::new(), fields, quals, &[])
@@ -3663,7 +3713,12 @@ impl PgHandler {
         filter: &Document,
         fields: &[String],
     ) -> Option<f64> {
-        if !self.all_table_defs().ok()?.iter().any(|d| d.name == table) {
+        if !self
+            .shared_table_defs()
+            .ok()?
+            .iter()
+            .any(|d| d.name == table)
+        {
             return None;
         }
         let counted: std::cell::OnceCell<Option<usize>> = std::cell::OnceCell::new();
@@ -4622,6 +4677,141 @@ struct SideLeaf {
     table: String,
     keys: Vec<(String, String, String)>,
     read: Vec<String>,
+}
+
+/// An operand of a `<>` between joined keys, for `eqjoinsel` and
+/// `var_eq_non_const`: its column's statistics, whether it is a cast of
+/// the column -- an expression `examine_variable` finds no statistics for
+/// -- and the type it compares as.
+struct NeOperand {
+    key: AnalysedKey,
+    cast: bool,
+    type_oid: i64,
+}
+
+impl NeOperand {
+    /// `get_variable_numdistinct` of a cast key: no statistics, so the
+    /// table's rows where fewer than `DEFAULT_NUM_DISTINCT`, else that
+    /// default.
+    fn expression_ndistinct(&self) -> (f64, bool) {
+        let tuples = self.key.tuples;
+        if tuples <= 0.0 || tuples >= 200.0 {
+            (200.0, true)
+        } else {
+            (costsize::clamp_row_est(tuples), false)
+        }
+    }
+
+    fn stats(&self) -> secantus_pgplan::joincost::KeyStats<'_> {
+        if self.cast {
+            let (ndistinct, default_ndistinct) = self.expression_ndistinct();
+            secantus_pgplan::joincost::KeyStats {
+                ndistinct,
+                default_ndistinct,
+                null_frac: 0.0,
+                mcv: &[],
+            }
+        } else {
+            secantus_pgplan::joincost::KeyStats {
+                ndistinct: self.key.ndistinct,
+                default_ndistinct: false,
+                null_frac: self.key.null_frac,
+                mcv: &self.key.mcv,
+            }
+        }
+    }
+
+    /// `var_eq_non_const` negated: the fraction of this side's rows
+    /// unequal to a value of the other side's, a pseudo-constant here.
+    fn not_equal_non_const(&self) -> f64 {
+        let (selec, null_frac) = if self.cast {
+            (1.0 / self.expression_ndistinct().0, 0.0)
+        } else {
+            let k = &self.key;
+            let selec = if k.unique && k.tuples >= 1.0 {
+                1.0 / k.tuples
+            } else {
+                let mut selec = 1.0 - k.null_frac;
+                if k.ndistinct > 1.0 {
+                    selec /= k.ndistinct;
+                }
+                // Never more than the most common value's frequency.
+                if let Some((_, first)) = k.mcv.first() {
+                    selec = selec.min(f64::from(*first));
+                }
+                selec
+            };
+            (selec, k.null_frac)
+        };
+        (1.0 - selec - null_frac).clamp(0.0, 1.0)
+    }
+}
+
+/// `o`'s table, statistics and compared type. `None` where its column was
+/// never analysed or its type is not a built-in one.
+fn ne_operand(
+    h: &PgHandler,
+    key_columns: &[(String, String, String)],
+    o: &secantus_pgplan::joins::CastKey,
+) -> Option<NeOperand> {
+    let (_, table, field) = key_columns.iter().find(|(c, _, _)| *c == o.key)?;
+    let key = h.analysed_key(table, field)?;
+    let type_oid = match o.cast {
+        Some(t) => t,
+        None => secantus_pgplan::pgtypes::oid_of_name(&key.column.pg_type)?,
+    };
+    Some(NeOperand {
+        key,
+        cast: o.cast.is_some(),
+        type_oid,
+    })
+}
+
+/// `clauselist_selectivity` of the join clauses `filters` with `varRelid`
+/// `leaf`'s relation, as `get_parameterized_baserel_size` estimates the
+/// rows of a scan of it parameterized by the other side (RP-354): each
+/// clause a restriction of `leaf`, the other side's value a
+/// pseudo-constant. An inequality is `DEFAULT_INEQ_SEL` (`scalarineqsel`
+/// with no constant to compare against); a `<>` is `var_eq_non_const`
+/// negated over `leaf`'s operand. `None` for any other clause.
+fn param_selectivity(
+    h: &PgHandler,
+    leaf: &SideLeaf,
+    filters: &[&secantus_pgplan::joins::JoinFilter],
+    key_columns: &[(String, String, String)],
+) -> Option<f64> {
+    use secantus_pgplan::joins::{CastKey, FilterKind};
+    let mine = |o: &CastKey| leaf.keys.iter().any(|(k, _, _)| *k == o.key);
+    let mut sel = 1.0_f64;
+    for f in filters {
+        sel *= match &f.kind {
+            FilterKind::Inequality => 1.0 / 3.0,
+            FilterKind::NotEqual(..) | FilterKind::NotEqualCast(..) => {
+                let (l, r) = match &f.kind {
+                    FilterKind::NotEqual(l, r) => (
+                        CastKey {
+                            key: l.clone(),
+                            cast: None,
+                        },
+                        CastKey {
+                            key: r.clone(),
+                            cast: None,
+                        },
+                    ),
+                    FilterKind::NotEqualCast(l, r) => (l.clone(), r.clone()),
+                    _ => unreachable!("matched above"),
+                };
+                let own = match (mine(&l), mine(&r)) {
+                    (true, false) => l,
+                    (false, true) => r,
+                    _ => return None,
+                };
+                ne_operand(h, key_columns, &own)?.not_equal_non_const()
+            }
+            _ => return None,
+        };
+    }
+    Some(sel)
 }
 
 /// A nested loop's inner index scan parameterized by the outer row
