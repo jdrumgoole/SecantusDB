@@ -9,6 +9,7 @@ its item names with mongod 8.2's.
 from __future__ import annotations
 
 import datetime
+import json
 from collections.abc import Iterator
 from typing import Any
 
@@ -252,7 +253,7 @@ def test_a_line_says_what_execution_control_admitted(rust_mongo: Any, mongod_rs:
     assert answers["rust"] == answers["mongod"]
 
 
-@pytest.mark.backlog("RM-355")
+@pytest.mark.backlog_fixed("RM-355")
 def test_admission_control_is_reported_where_mongod_reports_it(
     rust_mongo: Any, mongod_rs: Any
 ) -> None:
@@ -260,7 +261,9 @@ def test_admission_control_is_reported_where_mongod_reports_it(
     `ingressSessionEstablishment` beside `execution` and `ingress`, and a
     `$currentOp` row has the operation's `queues` (each pool's
     `admissions`, `totalTimeQueuedMicros`, `isHoldingTicket`) and its
-    `currentQueue` (measured 2026-11-09). This server's have neither."""
+    `currentQueue` (measured 2026-11-09). This server's had neither until
+    2026-11-12; the values are compared in
+    `tests/mongod_live/test_ingress_admission.py`."""
     answers = {}
     for server, client in (("rust", rust_mongo), ("mongod", mongod_rs)):
         status = client.admin.command("serverStatus")["queues"]
@@ -279,6 +282,69 @@ def test_admission_control_is_reported_where_mongod_reports_it(
         {"ingress": pool, "execution": pool},
         True,
     )
+    assert answers["rust"] == answers["mongod"]
+
+
+def _transaction_lines(client: Any, is_mongod: bool) -> dict:
+    """The `queues` of the `Slow query` lines of a transaction committed and
+    of one aborted, each of one insert."""
+    db = client[fresh("txn")]
+    db.create_collection("c")
+    last = client.admin.command("getLog", "global")["log"][-1]
+    client.admin.command("profile", 0, slowms=-1 if is_mongod else 0)
+    try:
+        for verb in ("commit", "abort"):
+            with client.start_session() as s:
+                s.start_transaction()
+                db.c.insert_one({"v": verb}, session=s)
+                getattr(s, f"{verb}_transaction")()
+    finally:
+        client.admin.command("profile", 0, slowms=100)
+    log = client.admin.command("getLog", "global")["log"]
+    log = log[log.index(last) + 1 :]
+    client.drop_database(db.name)
+    lines = {}
+    for raw in log:
+        entry = json.loads(raw)
+        command = next(iter(entry.get("attr", {}).get("command", {})), "")
+        if entry.get("msg") == "Slow query" and command.endswith("Transaction"):
+            lines[command] = entry["attr"].get("queues")
+    return lines
+
+
+@pytest.mark.backlog("RM-355")
+def test_ending_a_transaction_takes_mongods_execution_tickets(
+    rust_mongo: Any, mongod_rs: Any
+) -> None:
+    """mongod 8.2.11 unstashes a transaction's resources to end it, and its
+    `abortTransaction` line counts three execution admissions, as its
+    `commitTransaction` line does; this server's abort counts two (measured
+    2026-11-12)."""
+    got = {
+        "rust": _transaction_lines(rust_mongo, False),
+        "mongod": _transaction_lines(mongod_rs, True),
+    }
+    assert got["mongod"]["abortTransaction"]["execution"] == {"admissions": 3}
+    assert got["rust"] == got["mongod"]
+
+
+@pytest.mark.backlog("RM-550")
+def test_the_connection_rate_limiter_has_its_bypass_list(rust_mongo: Any, mongod_rs: Any) -> None:
+    """mongod 8.2.11 exempts the clients in
+    `ingressConnectionEstablishmentRateLimiterBypass`, a CIDR range list
+    (`{ranges: []}` by default), from its connection establishment rate
+    limiter, and counts them as `exemptedAdmissions`. This server does not
+    register the parameter (measured 2026-11-12)."""
+    answers = {}
+    for server, client in (("rust", rust_mongo), ("mongod", mongod_rs)):
+        try:
+            reply = client.admin.command(
+                "getParameter", 1, ingressConnectionEstablishmentRateLimiterBypass=1
+            )
+            answers[server] = reply["ingressConnectionEstablishmentRateLimiterBypass"]
+        except pymongo.errors.OperationFailure as e:
+            answers[server] = e.code
+    assert answers["mongod"] == {"ranges": []}
     assert answers["rust"] == answers["mongod"]
 
 

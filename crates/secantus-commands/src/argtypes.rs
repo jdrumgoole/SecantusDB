@@ -30,10 +30,14 @@ use secantus_core::query::bson_type_name;
 
 use crate::CommandError;
 
-/// mongod's numeric-slot type list, probed on 8.2.1. The ORDER is mongod's own
-/// and differs per field, so this is copied rather than derived. (6.0.16 also
-/// put the closing quote inside the bracket here; 8.x quotes it properly.)
-/// Mirrors `commands._NUMERIC_TYPES_MSG`.
+/// mongod's numeric-slot type list, probed on 8.2.1. The SET is mongod's; its
+/// ORDER is not one mongod keeps: it differs per IDL file in one build
+/// (8.2.11: `FindCommandRequest.*` and `getMore.*` "[decimal, double, long,
+/// int]", `create.*` "[int, double, decimal, long]", `cursor.batchSize`
+/// "[double, decimal, long, int]") and moves between patch builds (8.2.1,
+/// 8.2.11, 8.2.12), so it is compared as a set (`tests/mongod_reference.py`,
+/// the scope decision that was RM-465). (6.0.16 also put the closing quote
+/// inside the bracket here; 8.x quotes it properly.)
 const NUMERIC_TYPES: &str = "'[decimal, int, double, long]'";
 
 /// `findAndModify.upsert` accepts a bool OR any number, unlike the strict-bool
@@ -233,6 +237,19 @@ pub fn require_bool_field(doc: &Document, field: &str, path: &str) -> Result<(),
 /// `upsert: 1.5` are valid, while the neighbouring `update.updates.multi`
 /// rejects `multi: 1`. Two adjacent boolean-looking slots, two rules.
 pub fn require_bool_or_number(doc: &Document, field: &str, path: &str) -> Result<(), CommandError> {
+    require_bool_or_number_listing(doc, field, path, BOOL_OR_NUMBER_TYPES)
+}
+
+/// [`require_bool_or_number`] for a field whose wrong-type message lists the
+/// types in an order of its own: mongod's order is per field, not one rule
+/// (`aggregate.bypassDocumentValidation` is `'[decimal, bool, double, long,
+/// int]'`, measured 8.2.11, 2026-11-12). `types` is quoted as mongod quotes it.
+pub fn require_bool_or_number_listing(
+    doc: &Document,
+    field: &str,
+    path: &str,
+    types: &str,
+) -> Result<(), CommandError> {
     match doc.get(field) {
         None
         | Some(Bson::Null)
@@ -242,7 +259,7 @@ pub fn require_bool_or_number(doc: &Document, field: &str, path: &str) -> Result
         | Some(Bson::Double(_))
         | Some(Bson::Decimal128(_)) => Ok(()),
         Some(v) => Err(type_mismatch(format!(
-            "BSON field '{path}' is the wrong type '{}', expected types {BOOL_OR_NUMBER_TYPES}",
+            "BSON field '{path}' is the wrong type '{}', expected types {types}",
             bson_type_name(v)
         ))),
     }

@@ -357,35 +357,17 @@ These are explicit non-goals. Don't add them without a reason.
     `TestCausalConsistency_Supported` (29/29 passed). Re-include them.
   - Rust's `diagnostics::ok_transaction` ("no-op commit/abort") is dead code
     that nothing dispatches to.
-- [ ] **`aggregate` ignores a mistyped `writeConcern` or
-      `bypassDocumentValidation`.** mongod 8.2.11 type-checks both in its
-      parse of the command: `writeConcern: 5` is 14 "BSON field
-      'aggregate.writeConcern' is the wrong type 'int', expected type
-      'object'", `bypassDocumentValidation: "a"` is 14 with the type list
-      "[decimal, bool, double, long, int]". This server answers ok to both.
-      Both belong in `aggregate()`'s document-order field pass, as RM-431
-      left it. Found 2026-11-09 working RM-431.
-      Verify: tests/backlog/test_rm_aggregate_parse.py::test_aggregate_type_checks_write_concern_and_bypass
-      Backlog-ID: RM-463
-- [ ] **A non-string, non-number `aggregate` namespace is BadValue, not
-      InvalidNamespace.** mongod 8.2.11 answers `{aggregate: true, pipeline:
-      [], cursor: {}}` (and `null`, `{}`) with 73 "Collection name has invalid
-      type bool" (`null`, `object`); this server answers 2 "Invalid command
-      format: the 'aggregate' field must specify a collection name or 1",
-      which mongod keeps for a number other than 1. Found 2026-11-09 working
-      RM-431.
-      Verify: tests/backlog/test_rm_aggregate_parse.py::test_aggregate_names_a_mistyped_namespace
-      Backlog-ID: RM-464
-- [ ] **A wrong-type error lists the expected types in another order than
-      mongod's.** mongod 8.2.11's order is per field: `cursor.batchSize`
-      "[double, decimal, long, int]", `aggregate.maxTimeMS` "[double, int,
-      long, decimal]", `FindCommandRequest.batchSize` "[decimal, double, long,
-      int]". This server answers "[decimal, int, double, long]" for all
-      three. Other fields already carry their own list (`generic.rs`,
-      `cluster_params.rs`), so the order is per field, not one rule. Found
-      2026-11-09 working RM-431.
-      Verify: tests/backlog/test_rm_aggregate_parse.py::test_wrong_type_lists_the_types_in_mongods_order
-      Backlog-ID: RM-465
+- **Scope decision — the order of a wrong-type error's expected types**
+  (this was RM-465, 2026-11-12). mongod's order is not one it keeps: in one
+  8.2.11 build it differs per IDL file (`FindCommandRequest.*` and
+  `getMore.*` "[decimal, double, long, int]", `create.*` "[int, double,
+  decimal, long]", `count.*` "[int, decimal, double, long]",
+  `cursor.batchSize` "[double, decimal, long, int]", `aggregate.maxTimeMS`
+  "[double, int, long, decimal]"), and it moves between patch builds
+  (8.2.1, 8.2.11 and 8.2.12 all differ; CI installs the latest 8.2). The
+  SET matched mongod on every numeric slot probed, so the list is compared
+  as a set (`tests/mongod_reference.py::sort_type_lists`), as
+  `test_wrong_type_lists_mongods_set_of_types` now does.
 
 ### 2026-09-01: two PLANNER differences, measured and dispositioned
 
@@ -556,29 +538,45 @@ These are explicit non-goals. Don't add them without a reason.
       and profile entry `storage.timeWaitingMicros.storageExecutionMicros`
       (the global IS the line reads its statistics under takes the
       admission mongod's does; compared operation by operation in
-      `tests/mongod_live/test_slow_query_lines.py`). Open:
+      `tests/mongod_live/test_slow_query_lines.py`). Since 2026-11-12
+      `serverStatus.queues.ingressSessionEstablishment` and `connections`'
+      `queuedForEstablishment` and `establishmentRateLimit` report the
+      connection establishment rate limiter (`admission/rate_limiter.rs`, a
+      port of mongod's `RateLimiter`), and a `$currentOp` row its
+      operation's `queues` and `currentQueue`
+      (`tests/mongod_live/test_ingress_admission.py`). Open:
       - where this server's ticket points differ from mongod's: a yield here
         keeps its locks, so it keeps its ticket and takes no second
         admission (mongod returns both and takes them again, RM-360); an
         `awaitData` getMore returns its ticket for each 100 ms of its wait,
-        where mongod's yields once per wait; `commitTransaction` and
-        `abortTransaction` take no ticket (mongod's unstash takes one);
+        where mongod's yields once per wait; `abortTransaction`'s line
+        counts two execution admissions, where mongod's unstash makes it
+        three (`commitTransaction`'s three match, measured 2026-11-12);
         and an `update` or `delete` statement's line counts one admission
         fewer, its command's line one fewer per statement, because the
         statement's line is written with the command's locks still held
         (RM-357's statement rounds), where mongod's statement has let its
         own go and takes a fresh ticket to read its statistics;
-      - a `currentOp` row has no `queues` (each pool's `admissions`,
-        `totalTimeQueuedMicros`, `isHoldingTicket`) or, while it waits,
-        `currentQueue`; `serverStatus.queues` has no
-        `ingressSessionEstablishment` (the connection limiter's counts); the
-        line of a command that never got its ingress ticket names
+      - the line of a command that never got its ingress ticket names
         `<db>.$cmd` on mongod, its collection here; and mongod's first
         retryable write after startup takes a second, exempt, ingress
-        admission (not traced), all measured 8.2.11 2026-11-08.
+        admission (not traced), both measured 8.2.11 2026-11-08; an index
+        build's `$currentOp` row has no `queues` here (mongod's not yet
+        measured).
       **Decided (Joe, 2026-11-08): build mongod's execution admission control in full, the faithful option: the ingress controller, then the read and write ticket pools with `throughputProbing` (replacing `admission.rs`'s opt-in write tickets), then the per-command admission counts, so the concurrency cap is on by default as on mongod. Several PRs, in that order.** The ingress controller landed 2026-11-08, the ticket pools 2026-11-09, and the per-command admission counts on the line 2026-11-09; what is left is above.
       Backlog-ID: RM-355
-      Verify: tests/backlog/test_rm_355_364.py::test_admission_control_is_reported_where_mongod_reports_it
+      Verify: tests/backlog/test_rm_355_364.py::test_ending_a_transaction_takes_mongods_execution_tickets
+- [ ] **The connection establishment rate limiter has no bypass list.**
+      mongod 8.2.11's `ingressConnectionEstablishmentRateLimiterBypass` (a
+      CIDR range list, `{ranges: []}` by default, set at startup or at
+      runtime) exempts the clients it names from the connection
+      establishment rate limiter, which counts them in
+      `queues.ingressSessionEstablishment.exemptedAdmissions` and
+      `connections.establishmentRateLimit.exempted`. This server does not
+      register the parameter (`getParameter` answers 72), so every client
+      is limited and both counts stay 0. Found working RM-355, 2026-11-12.
+      Backlog-ID: RM-550
+      Verify: tests/backlog/test_rm_355_364.py::test_the_connection_rate_limiter_has_its_bypass_list
 - [ ] **Some writes' `locks` are not mongod's.** Since 2026-11-07 a write
       counts mongod's flow control tickets (one per global IX taken apart)
       and a retryable write's session checkout and session row, and a
@@ -2301,17 +2299,22 @@ What is left, on the RUST MongoDB server:
       equalities.** mongod: `{a: 1, b: 2, c: 3, d: 4}` gives `c, a, b, d`;
       `{d: 1, c: 2, b: 3, a: 4}` gives `d, b, a, c`; an explicit `$and`
       keeps the order written. This server sorts them.
-      **Decision needed (2026-10-17):** there is no rule to find. mongod
-      collects the equalities in an `EqualityMatches`, a `StringDataMap`
-      (an `absl::flat_hash_map`), and builds the document in its iteration
-      order (`update_driver.cpp` / `path_support.cpp`, 8.2), and absl seeds
-      its hash per process. Measured on three mongod 8.2.11 processes at
-      once: `{a, b, c, d}` gave `c, a, b, d` / `c, a, b, d` / `b, a, c, d`,
-      and one process ordered `{a, b, c, d}` and `{d, c, b, a}` differently.
-      Options: (1) a hash order of this server's own, seeded per process --
-      the mechanism, but never the same order as a given mongod; (2) keep
-      the sorted order and record the difference as a scope decision, since
-      no fixed order can match a server that has none.
+      mongod collects the equalities in an `EqualityMatches`, a
+      `StringDataMap` (an `absl::flat_hash_map`), and builds the document in
+      its iteration order (`update_driver.cpp` / `path_support.cpp`, 8.2);
+      absl seeds its hash per process. Measured on three mongod 8.2.11
+      processes at once: `{a, b, c, d}` gave `c, a, b, d` / `c, a, b, d` /
+      `b, a, c, d`, and one process ordered `{a, b, c, d}` and
+      `{d, c, b, a}` differently.
+      **Decided (Joe, 2026-11-12): model the hash.** Port the mechanism --
+      absl `flat_hash_map`'s hashing and iteration order over the
+      equalities' field names, with a per-process seed as absl takes it --
+      and build the upserted document in that order; an explicit `$and`
+      keeps the order written. No fixed order can equal a given mongod's,
+      so restate the gap test to assert what mongod guarantees and the
+      model reproduces: the order is a property of the process (stable
+      within one, not the sorted order across the measured inputs), and
+      `$and` keeps the written order.
       Backlog-ID: RM-059
       Verify: tests/backlog/test_rm_057_084.py::test_upsert_field_order_from_several_equalities
 - **`$where` in an update's query** is refused as a `--noscripting`
@@ -2449,14 +2452,14 @@ What is left, all on the RUST MongoDB server:
       `tools/probes/find_order.py`'s collections are small and show no
       difference. A sort with a limit is the scope decision on its heap
       (section 7.075).
-      **Decision needed (2026-10-25):** the order is the C++ library's, and
-      the exemplar (Linux) links libstdc++ while the macOS mongod measured
-      here links libc++. `secantus-core/src/stl.rs` already models
-      libstdc++'s `std::sort` for SBE's heaps; following it here would
-      match a Linux mongod (unmeasured on this box) and not the macOS one.
-      Options: (1) sort as libstdc++'s `std::sort` does, as for SBE's heaps;
-      (2) keep the stable order and record the difference as a scope
-      decision, as for the sort with a limit.
+      **Decided (Joe, 2026-11-12): sort as libstdc++'s `std::sort` does.**
+      The exemplar is Linux mongod, which links libstdc++; reuse
+      `secantus-core/src/stl.rs`'s model (already used for SBE's heaps) for
+      the blocking sort, so equal keys come out in Linux mongod's order.
+      The macOS mongod measured here links libc++ and orders ties
+      differently; where the two differ, Linux is right. Pin the gap test
+      to the libstdc++ order (measure it on a Linux mongod 8.2, e.g. in
+      CI's mongod_live lane, rather than on this box).
       Backlog-ID: RM-312
       Verify: tests/backlog/test_rm_found_2026_10_25.py::test_a_blocking_sort_leaves_ties_as_mongods_sort_does
 - [ ] **`explain` of a `$unionWith` lists its sub-pipeline as written.**

@@ -270,3 +270,134 @@ def test_a_queued_commands_line_says_how_long_it_waited(servers: dict) -> None:
         got[name] = lines
     same(got["rust"], got["mongod"])
     assert got["mongod"]["waited"] == (1, True, None)
+
+
+def test_a_current_op_row_says_what_admission_control_admitted(servers: dict) -> None:
+    """mongod 8.2.11's `$currentOp` row carries the operation's `queues`,
+    each pool's admissions, time queued (a wait under way included) and
+    whether it holds a ticket, and `currentQueue`, the pool it waits in now
+    and for how long, or null: a `find` queued for an ingress ticket, and
+    the `$currentOp` itself (RM-355)."""
+    got = {}
+    for name, client in servers.items():
+        client.ingress.c.insert_one({"x": 1})
+        client.admin.command("setParameter", 1, **{_POOL: 0})
+        results: dict = {}
+        thread = _queued(client, "row", results)
+        try:
+            _wait_queued(client, 1)
+            time.sleep(0.05)
+            rows = list(
+                client.admin.aggregate(
+                    [
+                        {"$currentOp": {}},
+                        {"$match": {"$or": [{"command.comment": "row"}, {"command.aggregate": 1}]}},
+                    ]
+                )
+            )
+        finally:
+            client.admin.command("setParameter", 1, **{_POOL: 1_000_000})
+            thread.join(30)
+        out = {}
+        for row in rows:
+            queued = row["command"].get("comment") == "row"
+            current = row["currentQueue"]
+            out["queued" if queued else "itself"] = (
+                _kinds(row["queues"]),
+                {
+                    pool: (q["admissions"], q["isHoldingTicket"])
+                    for pool, q in row["queues"].items()
+                },
+                row["queues"]["ingress"]["totalTimeQueuedMicros"] >= 40_000 if queued else None,
+                None
+                if current is None
+                else (current["name"], current["timeQueuedMicros"] >= 40_000, _kinds(current)),
+            )
+        # Keyed by role, not by the order the rows came back: mongod 8.2.11
+        # returns these two rows in either order from one process (18
+        # queued-first, 12 itself-first in 30 runs, 2026-11-12), and CI's
+        # Linux mongod answered itself-first where the macOS gate had seen
+        # queued-first. Every row's contents are still compared exactly.
+        got[name] = {role: out[role] for role in sorted(out)}
+    same(got["rust"], got["mongod"])
+    assert got["mongod"]["queued"][3][0] == "ingress"
+    assert got["mongod"]["itself"][3] is None
+
+
+_RATE_LIMITER = (
+    ("ingressConnectionEstablishmentRatePerSec", 1, 2147483647),
+    ("ingressConnectionEstablishmentBurstCapacitySecs", 1.0, 1.7976931348623157e308),
+    ("ingressConnectionEstablishmentMaxQueueDepth", 0, 0),
+)
+
+
+def _hello_on_a_new_connection(address: tuple[str, int]) -> bool:
+    """Open a connection and send it `hello`: whether it was answered."""
+    import socket
+    import struct
+
+    import bson
+
+    body = bson.encode({"hello": 1, "$db": "admin"})
+    with socket.create_connection(address, timeout=10) as s:
+        s.sendall(
+            struct.pack("<iiii", 21 + len(body), 1, 0, 2013) + struct.pack("<I", 0) + b"\x00" + body
+        )
+        try:
+            return len(s.recv(16)) == 16
+        except OSError:
+            return False
+
+
+def test_the_connection_rate_limiter_is_reported(servers: dict) -> None:
+    """mongod 8.2.11 reports its connection establishment rate limiter as
+    `serverStatus.queues.ingressSessionEstablishment` and, in `connections`,
+    `queuedForEstablishment` and `establishmentRateLimit`, with these
+    fields and types; at one connection a second with no queue, three
+    connections opened together are one admitted and two rejected, and
+    the counts say so (RM-355)."""
+    got = {}
+    for name, client in servers.items():
+
+        def status(c: Any = client) -> tuple[dict, dict]:
+            s = c.admin.command("serverStatus")
+            return s["queues"]["ingressSessionEstablishment"], s["connections"]
+
+        before, _ = status()
+        client.admin.command("setParameter", 1, **{p: v for p, v, _ in _RATE_LIMITER})
+        client.admin.command(
+            "setParameter", 1, ingressConnectionEstablishmentRateLimiterEnabled=True
+        )
+        try:
+            threads, answered = [], []
+            for _ in range(3):
+                t = threading.Thread(
+                    target=lambda out=answered, at=client.address: out.append(
+                        _hello_on_a_new_connection(at)
+                    )
+                )
+                threads.append(t)
+                t.start()
+            for t in threads:
+                t.join(30)
+            after, connections = status()
+        finally:
+            client.admin.command(
+                "setParameter", 1, ingressConnectionEstablishmentRateLimiterEnabled=False
+            )
+            client.admin.command("setParameter", 1, **{p: v for p, _, v in _RATE_LIMITER})
+        got[name] = (
+            _kinds(after),
+            _kinds(
+                {k: connections[k] for k in ("queuedForEstablishment", "establishmentRateLimit")}
+            ),
+            sorted(answered),
+            {
+                k: after[k] - before[k]
+                for k in ("attemptedAdmissions", "successfulAdmissions", "rejectedAdmissions")
+            },
+            connections["establishmentRateLimit"]["rejected"] - before["rejectedAdmissions"],
+            after["totalAvailableTokens"] < 1,
+        )
+    same(got["rust"], got["mongod"])
+    assert got["mongod"][2] == [False, False, True]

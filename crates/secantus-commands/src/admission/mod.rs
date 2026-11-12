@@ -10,16 +10,18 @@
 //! the time it queued, which its `Slow query` line prints.
 //!
 //! The pools built on it: [`ingress`], mongod's ingress admission control,
-//! and [`execution`], its execution control's read and write pools.
+//! and [`execution`], its execution control's read and write pools; beside
+//! them, [`rate_limiter`], the connection establishment rate limiter.
 
 pub mod execution;
 pub mod ingress;
+pub mod rate_limiter;
 
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicU8, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
-use bson::{doc, Document};
+use bson::{doc, Bson, Document};
 
 use crate::CommandError;
 
@@ -189,6 +191,36 @@ pub fn line_queues(
         out
     };
     doc! { "ingress": pool(ingress), "execution": pool(execution) }
+}
+
+/// What a `$currentOp` row says of an operation's admissions (mongod's
+/// `populateCurrentOpQueueStats`): `queues`, each pool's admissions, time
+/// queued -- a wait under way included -- and whether it holds a ticket
+/// now, every field printed at zero too; and `currentQueue`, the pool it
+/// waits in now and for how long, or null.
+pub fn current_op_queues(
+    ingress: &AdmissionContext,
+    execution: &AdmissionContext,
+) -> (Document, Bson) {
+    let mut queues = Document::new();
+    let mut current = Bson::Null;
+    for (name, ctx) in [("ingress", ingress), ("execution", execution)] {
+        let mut queued = ctx.total_time_queued_micros();
+        if let Some(since) = ctx.start_queueing_time() {
+            let waiting = i64::try_from(since.elapsed().as_micros()).unwrap_or(i64::MAX);
+            queued = queued.saturating_add(waiting);
+            current = Bson::Document(doc! { "name": name, "timeQueuedMicros": waiting });
+        }
+        queues.insert(
+            name,
+            doc! {
+                "admissions": ctx.admissions(),
+                "totalTimeQueuedMicros": queued,
+                "isHoldingTicket": ctx.is_holding_ticket(),
+            },
+        );
+    }
+    (queues, current)
 }
 
 /// The `delinquencyInfo` of an operation's `Slow query` line: the

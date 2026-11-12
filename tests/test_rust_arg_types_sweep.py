@@ -79,6 +79,10 @@ def _err(db, cmd):
         ({"collMod": "c", "validator": 5}, "collMod.validator"),
         ({"insert": "c", "documents": [{}], "writeConcern": 5}, "insert.writeConcern"),
         (
+            {"aggregate": "c", "pipeline": [], "cursor": {}, "writeConcern": 5},
+            "aggregate.writeConcern",
+        ),
+        (
             {"findAndModify": "c", "query": {}, "update": {"$set": {"a": 1}}, "fields": 5},
             "findAndModify.fields",
         ),
@@ -96,6 +100,68 @@ def test_an_object_slot_accepts_an_explicit_null(db) -> None:
     """The BSON-field family's null-means-absent rule, which `hint` does NOT share."""
     db.command({"count": "c", "query": None})
     db.command({"insert": "c", "documents": [{"z": 1}], "writeConcern": None})
+
+
+_AGG = [("aggregate", "c"), ("pipeline", []), ("cursor", {})]
+
+
+@pytest.mark.parametrize(
+    ("extra", "code", "errmsg"),
+    [
+        (
+            [("bypassDocumentValidation", "a")],
+            14,
+            "BSON field 'aggregate.bypassDocumentValidation' is the wrong type 'string', "
+            "expected types '[decimal, bool, double, long, int]'",
+        ),
+        (
+            [("writeConcern", {"zz": 1})],
+            40415,
+            "BSON field 'WriteConcernOptions.zz' is an unknown field.",
+        ),
+        (
+            [("writeConcern", {"w": True})],
+            9,
+            "w has to be a number, string, or object; found: bool",
+        ),
+        # Document order decides between two bad fields.
+        (
+            [("bypassDocumentValidation", {}), ("writeConcern", 5)],
+            14,
+            "BSON field 'aggregate.bypassDocumentValidation' is the wrong type 'object', "
+            "expected types '[decimal, bool, double, long, int]'",
+        ),
+        (
+            [("writeConcern", 5), ("explain", "a")],
+            14,
+            "BSON field 'aggregate.writeConcern' is the wrong type 'int', expected type 'object'",
+        ),
+    ],
+)
+def test_aggregate_parses_write_concern_and_bypass(db, extra, code, errmsg) -> None:
+    """RM-463: `aggregate` parses `writeConcern` (as a whole
+    `WriteConcernOptions`) and `bypassDocumentValidation` in its field pass,
+    as mongod 8.2.11 does, whatever the pipeline writes; both used to be
+    ignored and a mistyped one answered ok."""
+    from bson import SON
+
+    with pytest.raises(pymongo.errors.OperationFailure) as exc:
+        db.command(SON([*_AGG, *extra]))
+    assert (exc.value.code, exc.value.details["errmsg"]) == (code, errmsg)
+
+
+def test_aggregate_accepts_a_null_or_numeric_bypass_and_null_write_concern(db) -> None:
+    from bson import SON, Decimal128
+
+    for extra in (
+        [("bypassDocumentValidation", None)],
+        [("bypassDocumentValidation", 1.5)],
+        [("bypassDocumentValidation", Decimal128("1"))],
+        [("writeConcern", None)],
+        [("writeConcern", {})],
+        [("writeConcern", {"w": 1})],
+    ):
+        assert db.command(SON([*_AGG, *extra]))["ok"] == 1.0
 
 
 # --- hint: one message, six commands, and null is NOT accepted -------------
