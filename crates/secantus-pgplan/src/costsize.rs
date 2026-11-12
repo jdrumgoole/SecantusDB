@@ -291,12 +291,14 @@ fn index_cost(
     colsel: ColSel,
     full: bool,
 ) -> Option<(f64, f64, f64)> {
-    index_cost_loops(rel, index, quals, colsel, full, 1.0)
+    index_cost_loops(rel, index, quals, colsel, full, 1.0, 0.0)
 }
 
 /// `index_cost` for a scan repeated `loop_count` times, once per outer row
 /// of a nested loop (`genericcostestimate`'s `num_outer_scans`): the index
 /// pages all the scans fetch, by Mackert and Lohman, pro-rated per scan.
+/// `arg_cost` is `genericcostestimate`'s `qual_arg_cost`: evaluating the
+/// index quals' operands other than the index column, once a scan.
 fn index_cost_loops(
     rel: &Rel,
     index: &Index,
@@ -304,6 +306,7 @@ fn index_cost_loops(
     colsel: ColSel,
     full: bool,
     loop_count: f64,
+    arg_cost: f64,
 ) -> Option<(f64, f64, f64)> {
     let iq: Vec<&Qual> = quals
         .iter()
@@ -386,8 +389,9 @@ fn index_cost_loops(
         index_pages * RANDOM_PAGE_COST
     };
     let qual_op = CPU_OPERATOR_COST * iq.len() as f64;
+    let mut startup = arg_cost;
+    total += arg_cost;
     total = (nit * num_sa).mul_add(CPU_INDEX_TUPLE_COST + qual_op, total);
-    let mut startup = 0.0;
     if index.hash {
         return Some((startup, total, sel));
     }
@@ -476,7 +480,7 @@ fn index_scan(
     colsel: ColSel,
     full: bool,
 ) -> Option<(f64, f64)> {
-    index_scan_loops(rel, index, quals, colsel, full, 1.0)
+    index_scan_loops(rel, index, quals, colsel, full, 1.0, 0.0)
 }
 
 /// `index_scan` repeated `loop_count` times (`cost_index`'s `loop_count >
@@ -490,9 +494,10 @@ fn index_scan_loops(
     colsel: ColSel,
     full: bool,
     loop_count: f64,
+    arg_cost: f64,
 ) -> Option<(f64, f64)> {
     let (startup, index_total, sel) =
-        index_cost_loops(rel, index, quals, colsel, full, loop_count)?;
+        index_cost_loops(rel, index, quals, colsel, full, loop_count, arg_cost)?;
     let tuples_fetched = clamp_row_est(sel * rel.tuples);
     let visible = |pages: f64| {
         if index.visible > 0.0 {
@@ -565,6 +570,7 @@ pub fn param_index_scan(
         ColSel::Ndistinct(ndistinct),
         false,
         loop_count,
+        0.0,
     )
 }
 
@@ -574,13 +580,16 @@ pub fn param_index_scan(
 /// to compare against, `scalarineqsel` is `DEFAULT_INEQ_SEL`, a third of
 /// the rows, and a join clause never pairs into a range
 /// (`clauselist_selectivity` pairs only clauses over one relation), so
-/// two bounds (`a > e.a and a < e.a`) select a ninth. Repeated
-/// `loop_count` times as [`param_index_scan`] is. `(startup, total)`.
+/// two bounds (`a > e.a and a < e.a`) select a ninth. `arg_ops` are the
+/// operators of the bounds' outer-side operands (`a > e.a + 1`), each
+/// evaluated once a scan: `genericcostestimate`'s `qual_arg_cost`. Repeated `loop_count` times as
+/// [`param_index_scan`] is. `(startup, total)`.
 pub fn param_range_index_scan(
     rel: &Rel,
     index: &Index,
     quals: &[(String, Qual)],
     bounds: &[bool],
+    arg_ops: f64,
     loop_count: f64,
 ) -> Option<(f64, f64)> {
     if index.hash || bounds.is_empty() || quals.iter().any(|(f, _)| f == &index.field) {
@@ -592,7 +601,15 @@ pub fn param_range_index_scan(
         quals.push((index.field.clone(), Qual::Range(*lower)));
         sel *= 1.0 / 3.0;
     }
-    index_scan_loops(rel, index, &quals, ColSel::Given(sel), false, loop_count)
+    index_scan_loops(
+        rel,
+        index,
+        &quals,
+        ColSel::Given(sel),
+        false,
+        loop_count,
+        arg_ops * CPU_OPERATOR_COST,
+    )
 }
 
 /// A bitmap heap scan over `index` parameterized as [`param_index_scan`]
@@ -623,6 +640,7 @@ pub fn param_bitmap_heap_scan(
         ColSel::Ndistinct(ndistinct),
         false,
         loop_count,
+        0.0,
     )?;
     let startup = index_total + 0.1 * CPU_OPERATOR_COST * rows;
     let startup = startup + qual_startup(all.iter().map(|(_, q)| q));
@@ -1794,17 +1812,29 @@ mod tests {
             hash: false,
             later: Vec::new(),
         };
-        let (startup, total) = param_range_index_scan(&rel, &ix, &[], &[true], 100.0).unwrap();
+        let (startup, total) = param_range_index_scan(&rel, &ix, &[], &[true], 0.0, 100.0).unwrap();
         assert_eq!((startup, total), (0.275, 6.5025));
         // `explain select * from e left join k on e.a < k.a and e.a > k.a`
         // over the same `k` and 1,000 rows of `e`: `Index Cond: ((a >
         // e.a) AND (a < e.a))`, a ninth of the rows a scan, prints
         // `cost=0.28..2.53` on PostgreSQL 15.19 (RP-354).
         let (startup, total) =
-            param_range_index_scan(&rel, &ix, &[], &[true, false], 1000.0).unwrap();
+            param_range_index_scan(&rel, &ix, &[], &[true, false], 0.0, 1000.0).unwrap();
         assert_eq!(
             (format!("{startup:.2}"), format!("{total:.2}")),
             ("0.28".to_string(), "2.53".to_string())
+        );
+        // `explain select * from e left join k on e.a + 1 < k.a`: `Index
+        // Cond: (a > (e.a + 1))` evaluates its `+` once a scan
+        // (`qual_arg_cost`), added before the index tuples' cost, so the
+        // scan is 6.145 a hair under and prints `cost=0.28..6.14` on
+        // PostgreSQL 15.19, the loop's 1,000 rescans 2.50 more than `e.a <
+        // k.a`'s (RP-354).
+        let (startup, total) =
+            param_range_index_scan(&rel, &ix, &[], &[true], 1.0, 1000.0).unwrap();
+        assert_eq!(
+            (format!("{startup:.2}"), format!("{total:.2}")),
+            ("0.28".to_string(), "6.14".to_string())
         );
     }
 }

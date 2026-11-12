@@ -520,24 +520,31 @@ impl PgHandler {
             return None;
         }
         // A `<`, `<=`, `>` or `>=` between the sides can be an indexed
-        // side's parameterized Index Cond (RP-354), priced below where it
-        // compares two plain keys; a `<>` never is one (no B-tree
-        // strategy). Any other inequality could be one only where an
-        // operand is that side's key (or the index is over an
+        // side's parameterized Index Cond (RP-354), priced below where an
+        // operand is that side's plain key and the other reads only the
+        // other side (`e.a < k.a`, `e.a + 1 < k.a`); a `<>` never is one
+        // (no B-tree strategy). Any other could be one only where an
+        // operand is a cast of that side's key (or the index is over an
         // expression), which is not priced: an expression of the side's
         // keys (`e.a < k.a + 1`) matches no column index, so it stays the
         // join's filter over that side's plain scan. A LEFT join's
         // preserved side is never parameterized, so never one.
-        let opaque_keys: Vec<&str> = filters
-            .iter()
-            .filter(|f| {
-                !restriction(f) && matches!(f.kind, FilterKind::Inequality) && f.compare.is_none()
+        let inequalities = || {
+            filters
+                .iter()
+                .filter(|f| !restriction(f) && matches!(f.kind, FilterKind::Inequality))
+        };
+        let opaque_keys: Vec<&str> = inequalities()
+            .flat_map(|f| {
+                f.inequality_keys
+                    .iter()
+                    .filter(|k| !f.bounds.iter().any(|b| b.key == **k))
+                    .map(String::as_str)
             })
-            .flat_map(|f| f.inequality_keys.iter().map(String::as_str))
             .collect();
-        let opaque_inequality = filters.iter().any(|f| {
-            !restriction(f) && matches!(f.kind, FilterKind::Inequality) && f.compare.is_none()
-        });
+        // An operand that is not a bare key, which an index over an
+        // expression could match.
+        let opaque_inequality = inequalities().any(|f| f.bounds.len() < 2);
         let indexes = self.index_relations();
         let project = j.project.as_deref();
         // Each joined key's table and field, for `neqjoinsel`.
@@ -569,13 +576,13 @@ impl PgHandler {
                 // An indexed table's own filter may be an index scan's,
                 // priced below only on a LEFT join's preserved side.
                 || (indexes.iter().any(|ix| ix.table.name == leaf.table)
-                    && ((!preserved_side
-                        && opaque_inequality
-                        && (columns.iter().any(|(k, _)| opaque_keys.contains(&k.as_str()))
-                            || indexes
+                    && !preserved_side
+                    && (columns.iter().any(|(k, _)| opaque_keys.contains(&k.as_str()))
+                        || (opaque_inequality
+                            && indexes
                                 .iter()
-                                .any(|ix| ix.table.name == leaf.table && ix.keys.contains(&0))))
-                        || (!leaf.filter.is_empty() && !preserved_side)))
+                                .any(|ix| ix.table.name == leaf.table && ix.keys.contains(&0)))
+                        || !leaf.filter.is_empty()))
             {
                 return None;
             }
@@ -767,7 +774,8 @@ impl PgHandler {
 
     /// `leaf` as the inner side of a nested loop through one of its
     /// table's B-trees, its index qual one of `filters`' inequalities
-    /// between its leading column and the outer side's key (RP-354):
+    /// between its leading column and an expression of the outer side
+    /// (RP-354):
     /// `create_index_paths`' join clauses, `get_loop_count` the outer
     /// side's `outer_rows`. Every other join clause moves into the scan
     /// too (`join_clause_is_movable_into`), checked on each row it fetches,
@@ -802,29 +810,23 @@ impl PgHandler {
                 })
                 .collect()
         };
-        // The comparisons naming one of this side's keys, as `(this side's
-        // stored field, SQL column, its operator written this side first,
-        // the filter's cost)`.
+        // The comparisons bounding one of this side's keys, as `(this
+        // side's stored field, SQL column, its operator written this side
+        // first, the filter's cost, its other operand's)`.
         let mut clauses = Vec::new();
         for f in filters {
-            let Some((l, op, r)) = &f.compare else {
-                continue;
-            };
-            let mine = |k: &str| leaf.keys.iter().find(|(key, _, _)| key == k);
-            let (own, op) = match (mine(l), mine(r)) {
-                (Some(_), Some(_)) => return ParamFound::Unmodelled,
-                (Some(k), None) => (k, op.clone()),
-                (None, Some(k)) => (k, commuted(op).to_string()),
-                (None, None) => continue,
-            };
-            clauses.push((own.1.clone(), own.2.clone(), op, f.ops));
+            for b in &f.bounds {
+                if let Some(own) = leaf.keys.iter().find(|(key, _, _)| *key == b.key) {
+                    clauses.push((own.1.clone(), own.2.clone(), b.op.clone(), f.ops, b.arg_ops));
+                }
+            }
         }
         let mut serving = Vec::new();
         for ix in &table_indexes {
             let Some(fields) = key_fields(ix) else {
                 return ParamFound::Unmodelled;
             };
-            for (field, _, _, _) in &clauses {
+            for (field, ..) in &clauses {
                 match fields.iter().position(|f| f == field) {
                     Some(0) => serving.push((*ix, field.clone())),
                     Some(_) => return ParamFound::Unmodelled,
@@ -859,13 +861,14 @@ impl PgHandler {
         if index_only {
             ki.index.visible = ki.allvisfrac;
         }
-        let own: Vec<_> = clauses.iter().filter(|(f, _, _, _)| *f == field).collect();
+        let own: Vec<_> = clauses.iter().filter(|(f, ..)| *f == field).collect();
         let column = &own[0].1;
         let bounds: Vec<bool> = own
             .iter()
-            .map(|(_, _, op, _)| op.starts_with('>'))
+            .map(|(_, _, op, ..)| op.starts_with('>'))
             .collect();
-        let ops: usize = own.iter().map(|(_, _, _, ops)| ops).sum();
+        let ops: usize = own.iter().map(|(_, _, _, ops, _)| ops).sum();
+        let arg_ops: usize = own.iter().map(|(.., arg_ops)| arg_ops).sum();
         // The other join clauses, a filter on each row the scan fetches.
         let rest_ops = (filters.iter().map(|f| f.ops).sum::<usize>() - ops) as f64;
         let rest: Vec<(String, costsize::Qual)> = if rest_ops > 0.0 {
@@ -873,9 +876,14 @@ impl PgHandler {
         } else {
             Vec::new()
         };
-        let Some((startup, total)) =
-            costsize::param_range_index_scan(&ki.rel, &ki.index, &rest, &bounds, outer_rows)
-        else {
+        let Some((startup, total)) = costsize::param_range_index_scan(
+            &ki.rel,
+            &ki.index,
+            &rest,
+            &bounds,
+            arg_ops as f64,
+            outer_rows,
+        ) else {
             return ParamFound::Unmodelled;
         };
         let Some(name) = serving
@@ -4850,17 +4858,6 @@ enum ParamFound {
     None,
     Unmodelled,
     Scan(secantus_pgplan::joincost::ParamInner, ParamScan),
-}
-
-/// A comparison operator with its operands swapped.
-fn commuted(op: &str) -> &str {
-    match op {
-        "<" => ">",
-        "<=" => ">=",
-        ">" => "<",
-        ">=" => "<=",
-        other => other,
-    }
 }
 
 /// One analysed column's statistics (`PgHandler::analysed_key`).

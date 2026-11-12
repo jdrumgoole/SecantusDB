@@ -1593,9 +1593,28 @@ a regression test.
       that side's plain scan, or the parameterized scan's Filter beside a
       key-to-key bound. Since 2026-11-12 two bounds on the index column
       (`e.a < k.a and e.a > k.a`) are one `Index Cond` of both, a ninth of
-      the rows a scan.
+      the rows a scan. Since 2026-11-12 an expression of the outer side
+      against the inner's bare key is its Index Cond, its operators
+      evaluated once a scan (`e.a + 1 < k.a`: `Index Cond: (a > (e.a +
+      1))`), and an operand reading the key's own table no index qual
+      (`e.a + k.a < k.a`, the Join Filter); one holding a call is still
+      zeros (`length(e.b) < k.a`, PostgreSQL's Memoize over the Index
+      Scan).
       Backlog-ID: RP-354
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[nested loop left join into an index on an expression of the outer side], tests/backlog/test_rp_explain_costs.py::test_plan[nested loop left join with a cross-type inequality into an index], tests/backlog/test_rp_explain_costs.py::test_plan[nested loop left join with a pattern over its preserved side], tests/backlog/test_rp_explain_costs.py::test_plan[nested loop of three relations]
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[nested loop left join with a cross-type inequality into an index], tests/backlog/test_rp_explain_costs.py::test_plan[nested loop left join with a pattern over its preserved side], tests/backlog/test_rp_explain_costs.py::test_plan[nested loop of three relations]
+- [ ] **EXPLAIN ANALYZE of a nested loop into an index on an expression
+      of the outer row prints no actual rows.** Its estimate is right, but
+      the actual-row count of a parameterized inner scan is only worked
+      out where its Index Cond compares the outer row's bare column:
+      PostgreSQL 15.19 prints `explain (analyze, timing off, summary off)
+      select * from e left join k on e.a + 1 < k.a` (`e`, `k` 1,000
+      analysed rows, `k.a` the primary key) with `(actual rows=1000
+      loops=1)` on `Seq Scan on e` and `(actual rows=499 loops=1000)` on
+      `Index Scan using k_pkey on k`; here both scans print no actual
+      block at all. The join's own count is right. Measured on a private
+      15.19 cluster (found while working RP-354).
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[analyze of a nested loop into an index on an expression of the outer side]
+      Backlog-ID: RP-914
 - [ ] **A binary-coercible cast is kept in a plan, and its scan is not
       priced.** A cast between binary-compatible types (`text` to
       `varchar` and back to `text` for the operator) is a `RelabelType`

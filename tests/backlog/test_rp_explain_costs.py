@@ -1468,16 +1468,69 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "        Filter: (e.a > (a - 5))",
         ],
     ),
-    # Still open: an expression of the outer side against the inner's
-    # bare key is the inner index's parameterized Index Cond.
+    # Split from RP-354 and fixed: an expression of the outer side against
+    # the inner's bare key is the inner index's parameterized Index Cond,
+    # its operators evaluated once a scan (`qual_arg_cost`); before, the
+    # join printed zeros.
     "nested loop left join into an index on an expression of the outer side": (
-        "RP-354",
+        "RP-329",
         _ANALYSED,
         "explain select * from e left join k on e.a + 1 < k.a",
         [
             "Nested Loop Left Join  (cost=0.28..9490.00 rows=333333 width=14)",
             "  ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
             "  ->  Index Scan using k_pkey on k  (cost=0.28..6.14 rows=333 width=7)",
+            "        Index Cond: (a > (e.a + 1))",
+        ],
+    ),
+    "comma join into an index on an expression of two operators": (
+        "RP-329",
+        _ANALYSED,
+        "explain select * from e, k where k.a <= e.a * 2 - 1",
+        [
+            "Nested Loop  (cost=0.28..9492.50 rows=333333 width=14)",
+            "  ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
+            "  ->  Index Scan using k_pkey on k  (cost=0.28..6.15 rows=333 width=7)",
+            "        Index Cond: (a <= ((e.a * 2) - 1))",
+        ],
+    ),
+    "nested loop left join into an index bounded by expressions on both sides": (
+        "RP-329",
+        _ANALYSED,
+        "explain select * from e left join k on e.a + 1 < k.a and e.a - 1 > k.a",
+        [
+            "Nested Loop Left Join  (cost=0.28..3665.00 rows=111111 width=14)",
+            "  ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
+            "  ->  Index Scan using k_pkey on k  (cost=0.28..2.54 rows=111 width=7)",
+            "        Index Cond: ((a > (e.a + 1)) AND (a < (e.a - 1)))",
+        ],
+    ),
+    # An operand reading the key's own table is no index qual
+    # (`match_clause_to_indexcol`): the join's filter over a plain scan.
+    "nested loop left join on a key against an expression of its own table": (
+        "RP-329",
+        _ANALYSED,
+        "explain select * from e left join k on e.a + k.a < k.a",
+        [
+            "Nested Loop Left Join  (cost=0.00..17532.50 rows=333333 width=14)",
+            "  Join Filter: ((e.a + k.a) < k.a)",
+            "  ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
+            "  ->  Materialize  (cost=0.00..20.00 rows=1000 width=7)",
+            "        ->  Seq Scan on k  (cost=0.00..15.00 rows=1000 width=7)",
+        ],
+    ),
+    # Still open: EXPLAIN ANALYZE counts a parameterized scan's rows only
+    # where its Index Cond compares the outer row's bare column.
+    "analyze of a nested loop into an index on an expression of the outer side": (
+        "RP-914",
+        _ANALYSED,
+        "explain (analyze, timing off, summary off) select * from e left join k on e.a + 1 < k.a",
+        [
+            "Nested Loop Left Join  (cost=0.28..9490.00 rows=333333 width=14)"
+            " (actual rows=498503 loops=1)",
+            "  ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7) (actual rows=1000 loops=1)",
+            "  ->  Index Scan using k_pkey on k  (cost=0.28..6.14 rows=333 width=7)"
+            " (actual rows=499 loops=1000)",
             "        Index Cond: (a > (e.a + 1))",
         ],
     ),

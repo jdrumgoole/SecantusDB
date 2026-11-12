@@ -1009,7 +1009,7 @@ fn finish_join_source(
                         expr,
                         kind,
                         ops,
-                        compare: comparison(c),
+                        bounds: key_bounds(c),
                         inequality_keys: inequality_keys(c),
                         restrict: None,
                     })
@@ -2817,7 +2817,7 @@ fn build_join(
                         expr: on_expr(c, &side_scope, params)?,
                         kind,
                         ops,
-                        compare: comparison(c),
+                        bounds: key_bounds(c),
                         inequality_keys: inequality_keys(c),
                         restrict: restriction_filter(c, [&left, &right], lookup, params),
                     });
@@ -3009,13 +3009,15 @@ pub struct JoinFilter {
     pub kind: FilterKind,
     /// The operators it evaluates a row (`cost_qual_eval`).
     pub ops: usize,
-    /// A `<`, `<=`, `>` or `>=` between two joined keys: `(left key,
-    /// operator, right key)`, which a B-tree on either side's column can
-    /// take as a parameterized index qual (`match_clause_to_indexcol`,
-    /// RP-354). `None` for anything else.
-    pub compare: Option<(String, String, String)>,
+    /// A `<`, `<=`, `>` or `>=`'s operands that a B-tree on their column
+    /// can take as a parameterized index qual (`match_clause_to_indexcol`,
+    /// RP-354): a bare joined key whose other operand reads only other
+    /// tables (`e.a < k.a` bounds both keys, `e.a + 1 < k.a` only `k.a`).
+    /// Empty for anything else.
+    pub bounds: Vec<KeyBound>,
     /// A `<`, `<=`, `>` or `>=`'s operands that are a joined key, bare or
-    /// cast: the keys an index on their column could take the clause for
+    /// cast, whose other operand reads no column of the key's table: the
+    /// keys an index on their column could take the clause for
     /// (`match_clause_to_indexcol` matches an operand to the index key,
     /// the other side's operand any expression of the outer row, RP-354).
     /// Empty for anything else, and where neither operand is one.
@@ -3274,29 +3276,67 @@ fn priced_by_operator_count(n: &pg_query::protobuf::Node) -> bool {
     }
 }
 
-/// `n` as a `<`, `<=`, `>` or `>=` of two joined keys: `(left key,
-/// operator, right key)`.
-fn comparison(n: &pg_query::protobuf::Node) -> Option<(String, String, String)> {
+/// One operand of a join inequality an index on its column can serve
+/// ([`JoinFilter::bounds`]).
+#[derive(Debug, Clone, PartialEq)]
+pub struct KeyBound {
+    /// The joined key, the operand as written.
+    pub key: String,
+    /// The operator, written with the key first (`e.a + 1 < k.a` bounds
+    /// `k.a` by `>`).
+    pub op: String,
+    /// The operators the other operand evaluates once per scan:
+    /// `index_other_operands_eval_cost`, which `genericcostestimate`
+    /// charges as the scan's startup.
+    pub arg_ops: usize,
+}
+
+/// [`JoinFilter::bounds`] of `n`. The other operand must read no column
+/// of the key's table (`match_clause_to_indexcol` refuses one that does)
+/// and be built only of what [`operator_count`] prices: a call could be
+/// volatile, which is never an index qual, and costs otherwise.
+fn key_bounds(n: &pg_query::protobuf::Node) -> Vec<KeyBound> {
     use pg_query::protobuf::AExprKind;
-    let key = |x: Option<&pg_query::protobuf::Node>| match x?.node.as_ref()? {
+    let Some(N::AExpr(e)) = n.node.as_ref() else {
+        return Vec::new();
+    };
+    if e.kind != AExprKind::AexprOp as i32 {
+        return Vec::new();
+    }
+    let Ok(op @ ("<" | "<=" | ">" | ">=")) = operator_name(e) else {
+        return Vec::new();
+    };
+    let commuted = match op {
+        "<" => ">",
+        "<=" => ">=",
+        ">" => "<",
+        _ => "<=",
+    };
+    let (Some(l), Some(r)) = (e.lexpr.as_deref(), e.rexpr.as_deref()) else {
+        return Vec::new();
+    };
+    let bare = |x: &pg_query::protobuf::Node| match x.node.as_ref()? {
         N::ColumnRef(c) if c.fields.len() == 1 => column_ref_name(c),
         _ => None,
     };
-    let Some(N::AExpr(e)) = n.node.as_ref() else {
-        return None;
-    };
-    if e.kind != AExprKind::AexprOp as i32 {
-        return None;
+    let mut out = Vec::new();
+    for (own, other, op) in [(l, r, op), (r, l, commuted)] {
+        let Some(key) = bare(own) else {
+            continue;
+        };
+        let Some((alias, _)) = key.split_once(SEP) else {
+            continue;
+        };
+        if !priced_by_operator_count(other) || key_aliases(other).iter().any(|a| a == alias) {
+            continue;
+        }
+        out.push(KeyBound {
+            key,
+            op: op.to_string(),
+            arg_ops: operator_count(other),
+        });
     }
-    let op = operator_name(e).ok()?;
-    if !matches!(op, "<" | "<=" | ">" | ">=") {
-        return None;
-    }
-    Some((
-        key(e.lexpr.as_deref())?,
-        op.to_string(),
-        key(e.rexpr.as_deref())?,
-    ))
+    out
 }
 
 /// [`JoinFilter::inequality_keys`] of `n`.
@@ -3321,9 +3361,19 @@ fn inequality_keys(n: &pg_query::protobuf::Node) -> Vec<String> {
             _ => None,
         }
     }
-    [e.lexpr.as_deref(), e.rexpr.as_deref()]
+    // Nor one whose other operand reads its own table, which no index on
+    // it can take (`match_clause_to_indexcol`): `e.a + k.a < k.a` is the
+    // join's filter whatever indexes `k` has.
+    let (Some(l), Some(r)) = (e.lexpr.as_deref(), e.rexpr.as_deref()) else {
+        return Vec::new();
+    };
+    [(l, r), (r, l)]
         .into_iter()
-        .filter_map(key)
+        .filter_map(|(own, other)| {
+            let k = key(Some(own))?;
+            let (alias, _) = k.split_once(SEP)?;
+            (!key_aliases(other).iter().any(|a| a == alias)).then_some(k)
+        })
         .collect()
 }
 
