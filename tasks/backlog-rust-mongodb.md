@@ -943,24 +943,6 @@ These are explicit non-goals. Don't add them without a reason.
       "<db>.nope"`). Found while working RM-378, 2026-11-09.
       Verify: tests/backlog/test_rm_slow_query_namespace.py::test_a_failed_rename_is_not_profiled
       Backlog-ID: RM-479
-- [ ] **A `dataSize` line names `<db>.<db>.c`.** mongod 8.2.1's `Slow
-      query` line for a `dataSize`, whose argument is a full namespace,
-      names `<db>.$cmd`; this server's joins the command's database to the
-      argument. Found while working RM-378, 2026-11-09.
-      Verify: tests/backlog/test_rm_slow_query_namespace.py::test_a_data_size_line_names_its_own_namespace
-      Backlog-ID: RM-480
-- [ ] **A command refused as it parses writes a `Slow query` line.**
-      mongod 8.2.1 writes no line for a command its IDL parse refuses -- a
-      mistyped or missing field (14, 40414: `renameCollection: 5`, no
-      `to`), an unknown one (40415: `find` with `bogus`), a collection name
-      that is not a string (73: `find: 5`, `count: 5`), an unknown pipeline
-      stage (40324: an `aggregate` of a collection or a view, measured
-      8.2.11 while working RM-380) -- as the operation
-      never ran; this server writes one for each, since its handlers parse
-      and run in one step (as RM-386 has it).
-      Found while working RM-378, 2026-11-09.
-      Verify: tests/backlog/test_rm_slow_query_namespace.py::test_a_command_that_fails_to_parse_writes_no_line
-      Backlog-ID: RM-481
 - [ ] **Renaming `<db>.system.views` is refused as a view.** mongod 8.2.1
       refuses it as a write to the namespace (20 IllegalOperation, "error
       with source namespace: cannot write to <db>.system.views"); this
@@ -1056,7 +1038,11 @@ These are explicit non-goals. Don't add them without a reason.
       name `<db>.c`, `<db>.<db>.c` and `<db>.startupWarnings`
       (`slowop::target_collection` reads any command's string value as
       one). Found while working RM-383, 2026-11-10.
-      Verify: tests/backlog/test_rm_drop_reports.py::test_a_command_s_string_argument_is_not_its_collection
+      (This was RM-480: A `dataSize` line names `<db>.<db>.c`.) mongod 8.2.1's
+      `Slow query` line for a `dataSize`, whose argument is a full namespace,
+      names `<db>.$cmd`; this server's joins the command's database to the
+      argument. Found while working RM-378, 2026-11-09.
+      Verify: tests/backlog/test_rm_drop_reports.py::test_a_command_s_string_argument_is_not_its_collection, tests/backlog/test_rm_slow_query_namespace.py::test_a_data_size_line_names_its_own_namespace
       Backlog-ID: RM-495
 - [ ] **Operations this server runs another way than mongod's plan say
       less.** Since RM-023 a read or a write's read that a stream runs as
@@ -1147,8 +1133,17 @@ These are explicit non-goals. Don't add them without a reason.
   and the like -- still counts. The fix is a parse step for each handler
   ahead of its run, which the line can follow (measured 2026-11-10). Found
   with RM-305.
+  (This was RM-481: A command refused as it parses writes a `Slow query`
+  line.) mongod 8.2.1 writes no line for a command its IDL parse refuses -- a
+  mistyped or missing field (14, 40414: `renameCollection: 5`, no `to`), an
+  unknown one (40415: `find` with `bogus`), a collection name that is not a
+  string (73: `find: 5`, `count: 5`), an unknown pipeline stage (40324: an
+  `aggregate` of a collection or a view, measured 8.2.11 while working RM-380)
+  -- as the operation never ran; this server writes one for each, since its
+  handlers parse and run in one step (as RM-386 has it). Found while working
+  RM-378, 2026-11-09.
   Backlog-ID: RM-386
-  Verify: tests/backlog/test_rm_001_028.py::test_a_command_its_handler_fails_to_parse_is_not_the_first_command
+  Verify: tests/backlog/test_rm_001_028.py::test_a_command_its_handler_fails_to_parse_is_not_the_first_command, tests/backlog/test_rm_slow_query_namespace.py::test_a_command_that_fails_to_parse_writes_no_line
 ### 7.091 mongod's slot-based engine (SBE) -- 2026-10-23
 
 mongod 8.2 runs the front of a pipeline in its slot-based engine when it can
@@ -1610,7 +1605,17 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       `parsedQuery` is sorted. This server lists each with
       `parsed::parsed_query`, which sorts (`canonical_match` and `tidy` sort
       too). Found 2026-11-10 (RM-414).
-      Verify: tests/backlog/test_rm_found_2026_11_10_explain_rewrites.py::test_a_pipeline_match_lists_its_clauses_as_written
+      (This was RM-444: `explain` lists a `$match` after the cursor with its
+      clauses sorted.) mongod 8.2.11 lists a `$match` stage it does not move
+      into the query (behind a `$group` or a `$limit`) with its clauses in the
+      order they were written, and an `$expr`'s `$_internalExprEq` ahead of
+      the `$expr`: `[{$limit: 3}, {$match: {x: {$exists: true}, y: 1}}]` lists
+      `$and: [{x: {$exists: true}}, {y: {$eq: 1}}]`. This server lists the
+      clauses in the order mongod gives only the query's `parsedQuery`
+      (`MatchExpression::sortTree`): `y` first, and the `$expr` before its
+      `$_internalExprEq`. The documents are the same. Found 2026-11-09 working
+      RM-311.
+      Verify: tests/backlog/test_rm_found_2026_11_10_explain_rewrites.py::test_a_pipeline_match_lists_its_clauses_as_written, tests/backlog/test_rm_found_2026_11_09.py::test_explain_lists_a_match_after_the_cursor_in_written_order
       Backlog-ID: RM-537
 - [ ] **Explain lists stages mongod's optimizer rewrites as written.**
       mongod 8.2.11 drops a `$replaceWith: "$$ROOT"`, folds a `$limit` into
@@ -1619,7 +1624,13 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       (`{b: "$a"}`) ahead of it onto `a`, and lists `$sampleRate: 0.5` as
       `$expr: {$lt: [{$rand: {}}, {$const: 0.5}]}`. This server lists
       each stage as written. Found 2026-11-10 (RM-414).
-      Verify: tests/backlog/test_rm_found_2026_11_10_explain_rewrites.py::test_the_pipeline_rewrites_mongod_lists
+      (This was RM-427: `explain` lists a `$sort` and the `$limit` after it as
+      two stages where the cursor does not absorb them.) mongod 8.2.11 lists
+      one `$sort: {sortKey, limit}` after a `$replaceRoot`, in a `$facet`
+      sub-pipeline, and after a `$rankFusion` (its own `$sort` takes the
+      `limit`), and the stages before it then count every document, not the
+      `limit` the `$limit` pulled. Found 2026-11-08 working RM-200.
+      Verify: tests/backlog/test_rm_found_2026_11_10_explain_rewrites.py::test_the_pipeline_rewrites_mongod_lists, tests/backlog/test_rm_found_2026_11_08_explain_listing.py::test_sort_and_limit_after_the_cursor_are_one_stage
       Backlog-ID: RM-538
 - [ ] **Explain's stages lack some of mongod's statistics.** At
       `executionStats` mongod 8.2.11 gives the stages inside a `$facet` and
@@ -1639,7 +1650,8 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       ends the operation it names with 11601 wherever it next checks: a
       waiting getMore, or any scan's deadline poll. Open:
       - a row has no `currentOpTime`, `lsid`, `planSummary`,
-        `queryFramework`, `numYields`, `locks`, `queues` or `waitingForLock`;
+        `queryFramework`, `numYields`, `locks` or `waitingForLock` (`queues`
+        and `currentQueue` since RM-355, 2026-11-12);
         a getMore's `cursor` block has only its id; an idle cursor's has no
         `createdDate`, `lastAccessDate`, `nDocsReturned`, `nBatchesReturned`
         or `originatingCommand` (the cursor registry does not keep them; its
@@ -2241,7 +2253,15 @@ Still different, all 77:
       counts (`allPlansExecution` and `$planCacheStats` do carry the
       accounting the trial counted). `tools/probes/explain_commands.py`
       leaves these fields out of its comparison. Found 2026-11-08 (RM-342).
-      Verify: tests/backlog/test_rm_found_2026_11_08_rm342.py::test_explain_gives_each_stage_its_work_accounting
+      (This was RM-446: A DISTINCT_SCAN plan's `executionStats` gives no work
+      counters.) mongod 8.2.11's `executionStages` for a DISTINCT_SCAN plan --
+      of `distinct`, and of a `$group` it answers from one -- gives every
+      stage's `works`, `advanced`, `needTime`, `needYield`, `saveState`,
+      `restoreState` and `isEOF` (`distinct("x", {x: {$gt: 0}})` over `x_1`:
+      `works: 4`). This server's gives `nReturned` and the scan's own fields,
+      none of them. The trial's counters, in `allPlansExecution`, are given.
+      Found 2026-11-08 (RM-310).
+      Verify: tests/backlog/test_rm_found_2026_11_08_rm342.py::test_explain_gives_each_stage_its_work_accounting, tests/backlog/test_rm_found_2026_11_08_rm310.py::test_a_distinct_scan_run_reports_its_work_counters
       Backlog-ID: RM-434
 - [ ] **A `$sort` after a `$group` mongod pushes into SBE counts its
       documents smaller than mongod's.** `[{$group: {_id: "$a"}}, {$sort:
@@ -2474,7 +2494,7 @@ What is left, all on the RUST MongoDB server:
       classic `$cursor` / `stages` shape: any other filter (`{a: null}`'s
       `typeMatch`, `$in`'s `isMember`, `$ne`'s `!`, `$or`, ...), a sorted,
       projected or index-served front (`COUNT_SCAN`, `IXSCAN` /
-      `FETCH`), a skip or limit with a group that reads a field (mongod
+      `FETCH`; for `count` on a view, RM-072), a skip or limit with a group that reads a field (mongod
       puts its dependency projection among them), `$lookup`,
       `$sortByCount` / `$bucket` (not desugared before
       `secantus_core::sbe::pushdown`, which the executor shares), any other
@@ -2510,16 +2530,6 @@ What is left, all on the RUST MongoDB server:
       **Decided 2026-10-16 (Joe):** as RM-071, transcribe and execute.
       Backlog-ID: RM-072
       Verify: tests/backlog/test_rm_057_084.py::test_explain_of_count_on_a_view_over_an_index
-- [ ] **A DISTINCT_SCAN plan's `executionStats` gives no work counters.**
-      mongod 8.2.11's `executionStages` for a DISTINCT_SCAN plan -- of
-      `distinct`, and of a `$group` it answers from one -- gives every
-      stage's `works`, `advanced`, `needTime`, `needYield`, `saveState`,
-      `restoreState` and `isEOF` (`distinct("x", {x: {$gt: 0}})` over
-      `x_1`: `works: 4`). This server's gives `nReturned` and the scan's
-      own fields, none of them. The trial's counters, in
-      `allPlansExecution`, are given. Found 2026-11-08 (RM-310).
-      Backlog-ID: RM-446
-      Verify: tests/backlog/test_rm_found_2026_11_08_rm310.py::test_a_distinct_scan_run_reports_its_work_counters
 - [ ] **A DISTINCT_SCAN bounded on a trailing field examines fewer keys
       than mongod's.** mongod 8.2.11's DISTINCT_SCAN of `x_1_y_1` for
       `distinct("x", {x: {$gt: 0}, y: {$gt: 3}})` over `x = i % 4, y = i`
@@ -2533,18 +2543,6 @@ What is left, all on the RUST MongoDB server:
       2026-11-08 (RM-310).
       Backlog-ID: RM-447
       Verify: tests/backlog/test_rm_found_2026_11_08_rm310.py::test_a_distinct_scan_bounded_on_a_trailing_field_examines_mongods_keys
-- [ ] **`explain` lists a `$match` after the cursor with its clauses
-      sorted.** mongod 8.2.11 lists a `$match` stage it does not move into
-      the query (behind a `$group` or a `$limit`) with its clauses in the
-      order they were written, and an `$expr`'s `$_internalExprEq` ahead of
-      the `$expr`: `[{$limit: 3}, {$match: {x: {$exists: true}, y: 1}}]`
-      lists `$and: [{x: {$exists: true}}, {y: {$eq: 1}}]`. This server
-      lists the clauses in the order mongod gives only the query's
-      `parsedQuery` (`MatchExpression::sortTree`): `y` first, and the
-      `$expr` before its `$_internalExprEq`. The documents are the same.
-      Found 2026-11-09 working RM-311.
-      Verify: tests/backlog/test_rm_found_2026_11_09.py::test_explain_lists_a_match_after_the_cursor_in_written_order
-      Backlog-ID: RM-444
 - [ ] **`explain` of a `$unionWith` lists its sub-pipeline as written.**
       mongod 8.2.11 explains the sub-pipeline as it does the outer one: a
       `$cursor` of its own (its `queryPlanner`, and `executionStats` above
@@ -2557,14 +2555,6 @@ What is left, all on the RUST MongoDB server:
       2026-11-08 working RM-200.
       Backlog-ID: RM-426
       Verify: tests/backlog/test_rm_found_2026_11_08_explain_listing.py::test_union_with_sub_pipeline_is_explained
-- [ ] **`explain` lists a `$sort` and the `$limit` after it as two stages
-      where the cursor does not absorb them.** mongod 8.2.11 lists one
-      `$sort: {sortKey, limit}` after a `$replaceRoot`, in a `$facet`
-      sub-pipeline, and after a `$rankFusion` (its own `$sort` takes the
-      `limit`), and the stages before it then count every document, not
-      the `limit` the `$limit` pulled. Found 2026-11-08 working RM-200.
-      Backlog-ID: RM-427
-      Verify: tests/backlog/test_rm_found_2026_11_08_explain_listing.py::test_sort_and_limit_after_the_cursor_are_one_stage
 - [ ] **A `$facet` whose sub-pipeline keeps a sort key plans no
       `SORT_KEY_GENERATOR`.** mongod 8.2.11's `$cursor` under a `$facet`
       holding a `$sort` with `outputSortKeyMetadata` (a `$setWindowFields`
@@ -2786,6 +2776,17 @@ bytes are ICU's. What is left, there and beside it:
       **Decided 2026-10-16 (Joe):** `explain` reports mongod's plan, as it
       does; where the router reads differently, as here, the router is
       brought to the plan. Each such place is a performance bug.
+      (This was RM-119, from the removed "Collation server-wide" record.) Any
+      command `collation` forces a COLLSCAN plus an in-memory collation-aware
+      match / sort: `crates/secantus-storage/src/lib.rs` `find_matching_with`
+      sets `force_collscan = coll_opt.is_some()` ("Per-index-collation IXSCAN
+      is a later optimisation"), even when an index was built with the same
+      collation. Results are correct; the cost is a full scan. The Python
+      server already uses a collated index whose collation matches exactly
+      (`docs/indexes.md` "Per-index collation"; `numericOrdering` still
+      COLLSCANs there). Reproduce: create `{name: 1}` with `collation:
+      {locale: "en", strength: 2}`, then `find({name: "x"}).collation({locale:
+      "en", strength: 2})` and look at how the storage router reads it.
       Backlog-ID: RM-094
       Verify: none -- explain already reports IXSCAN (derived from mongod's rules); the gap is the router scanning, a cost no reply shows
 
@@ -3021,20 +3022,6 @@ race on demand, which is worth having if this area changes again.
   Diagnose before trusting week-over-week go comparisons.
   Backlog-ID: RM-118
   Verify: none -- Go gauge CI test-count discrepancy
-- [ ] **Per-index-collation IXSCAN on the Rust server** (from the removed
-  "Collation server-wide" record). Any command `collation` forces a COLLSCAN
-  plus an in-memory collation-aware match / sort:
-  `crates/secantus-storage/src/lib.rs` `find_matching_with` sets
-  `force_collscan = coll_opt.is_some()` ("Per-index-collation IXSCAN is a later
-  optimisation"), even when an index was built with the same collation. Results
-  are correct; the cost is a full scan. The Python server already uses a
-  collated index whose collation matches exactly (`docs/indexes.md` "Per-index
-  collation"; `numericOrdering` still COLLSCANs there). Reproduce: create
-  `{name: 1}` with `collation: {locale: "en", strength: 2}`, then
-  `find({name: "x"}).collation({locale: "en", strength: 2})` and look at how
-  the storage router reads it.
-  Backlog-ID: RM-119
-  Verify: none -- performance (router COLLSCAN); results correct and explain reports mongod's plan
 - [ ] **One-time: configure a PyPI Trusted Publisher for `secantus-core`.**
   On PyPI, add a Trusted Publisher for the (new) `secantus-core` project pointing
   at `.github/workflows/rust-wheels.yml` (environment `pypi`), mirroring the
@@ -3155,6 +3142,9 @@ unexplained.
   the SecantusDB side; the same counter on mongod's collection and oplog tables
   would give a like-for-like write-volume comparison. That is the measurement
   the 42x claim should have been built on.
+  (This was RM-134.) Also measure write amplification: bytes on disk per
+  insert, SecantusDB versus mongod at a fixed document size. The leading
+  hypothesis, and untested.
   Backlog-ID: RM-130
   Verify: none -- write-volume measurement campaign
 
@@ -3247,10 +3237,6 @@ above was of a fixed limit; the tail under probing is not yet measured.
 
 ### Where to go next
 
-- [ ] **Measure write amplification** — bytes on disk per insert, SecantusDB
-  versus mongod at a fixed document size. The leading hypothesis, and untested.
-  Backlog-ID: RM-134
-  Verify: none -- write-amplification measurement
 - [ ] **`--oplog-async` as a default** — worth 24% of the tail and 42% of the
   stalls on its own, independently of the cache story. Every write currently
   passes through one process-wide `Arc<Mutex<OplogState>>`.

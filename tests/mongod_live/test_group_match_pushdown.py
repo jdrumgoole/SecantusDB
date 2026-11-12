@@ -13,7 +13,7 @@ query, the stages after the read and the documents. A `$group` listed
 after the read is left out: mongod runs it in its slot-based engine for
 more shapes than this server explains that way (RM-071). The winning plan
 is left out too: its projection's name is RM-445. The clauses of a
-`$match` left behind are compared in a fixed order, as RM-444 owns the
+`$match` left behind are compared in a fixed order, as RM-537 owns the
 order mongod lists them in. Measured on 8.2.11, 2026-11-09.
 """
 
