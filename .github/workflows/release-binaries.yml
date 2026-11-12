@@ -215,8 +215,19 @@ jobs:
         # scikit-build-core forwards SKBUILD_CMAKE_DEFINE as a -D define, flipping
         # the storage-engine CMake option ON for this build only. Side effect we
         # want: libwiredtiger.a + include/wiredtiger.h under build/*/wt-build.
+        #
+        # The wheel itself is thrown away, so it is built in test.yml's `fast`
+        # mode: no PGO, no LTO, 16 codegen units. The full mode spent ~50 min
+        # of the Windows job linking an extension nobody used (one codegen
+        # unit under LTO + PGO, measured on test.yml's Windows cell,
+        # 2026-11-12: 66 -> 16 min). The mode does not reach WiredTiger, a
+        # CMake build with its own flags, nor the binary below: these are
+        # step-level variables, and that step sets its own profile.
         env:
           SKBUILD_CMAKE_DEFINE: SECANTUS_BUILD_STORAGE_ENGINE=ON
+          SECANTUS_PGO_DISABLE: "1"
+          CARGO_PROFILE_RELEASE_LTO: "off"
+          CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"
         run: uv build --wheel --out-dir dist-storage
 
       - name: Link the compressors statically (Linux)
