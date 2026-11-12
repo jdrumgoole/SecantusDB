@@ -3837,19 +3837,3 @@ tests are in `tests/backlog/test_rp_found_rp565.py`.
       `x` and the second is 42809.
       Verify: tests/backlog/test_rp_found_rp565.py::test_a_temporary_row_type_hides_a_built_in_type
       Backlog-ID: RP-891
-
-## Found while working RP-561 (2026-11-12)
-
-Measured on a private PostgreSQL 15.19 cluster.
-
-- [ ] **DROP FUNCTION of an operator's function leaves the operator.**
-      `CREATE OPERATOR` records a dependency on the function that implements
-      it, so on PostgreSQL 15.19 `drop function f561eq(f561, int)` under
-      `create operator |=| (leftarg = f561, rightarg = int, function =
-      f561eq)` is 2BP01 `cannot drop function f561eq(f561,integer) because
-      other objects depend on it`, DETAIL `operator |=|(f561,integer)
-      depends on function f561eq(f561,integer)`, and CASCADE drops the
-      operator. Here the function is dropped and the operator stays in
-      `pg_operator`, naming a function that no longer exists.
-      Verify: tests/backlog/test_rp_found_rp546.py::test_drop_function_of_an_operator_is_refused
-      Backlog-ID: RP-893

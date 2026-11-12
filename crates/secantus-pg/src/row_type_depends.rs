@@ -153,7 +153,7 @@ pub(crate) fn format_procedure<S: AsRef<str>>(schema: &str, name: &str, params: 
 /// `getObjectDescription` of an operator: `operator`, then
 /// `format_operator`'s name and its two argument types' `format_type_be`,
 /// `NONE` for a prefix operator's missing left (`operator !!(NONE,t)`).
-fn operator_description(d: &Document) -> String {
+pub(crate) fn operator_description(d: &Document) -> String {
     let left = d.get_str("left").ok();
     let right = d.get_str("right").unwrap_or_default();
     let shown = |t: &str| {
