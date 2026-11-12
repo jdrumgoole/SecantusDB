@@ -183,7 +183,7 @@ pub(crate) fn apply_column_options(
             oncommit: pg_query::protobuf::OnCommitAction::OncommitNoop as i32,
             ..Default::default()
         };
-        let Statement::CreateTable(one, _) = plan_create(&stmt)? else {
+        let Statement::CreateTable(one, _) = plan_create(&stmt, true)? else {
             return Err(Error::Internal("a partition column's options".into()));
         };
         let Some(planned) = one.columns.first() else {

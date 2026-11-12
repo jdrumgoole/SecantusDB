@@ -2089,15 +2089,6 @@ Measured on PostgreSQL 15.19 (the data-modifying WITH on a private cluster).
       does not exist` at 12. Measured on a private 15.19 cluster.
       Verify: tests/backlog/test_rp_qualified_calls.py::test_three_part_function_name
       Backlog-ID: RP-880
-- [ ] **CREATE TABLE does not analyse a column's DEFAULT.** On PostgreSQL
-      15.19 `create table t (a int default nosuch_fn())` is 42883 `function
-      nosuch_fn() does not exist` at 35, and `default nosuch_schema.f()` is
-      3F000 `schema "nosuch_schema" does not exist` at 35
-      (`cookDefault` -> `transformExpr`, at CREATE). Here both succeed, and
-      the error waits for an INSERT that uses the default. Measured on a
-      private 15.19 cluster.
-      Verify: tests/backlog/test_rp_qualified_calls.py::test_create_table_default_is_analysed
-      Backlog-ID: RP-881
 - [ ] **A missing relation qualified with `pg_temp` is named by the
       session's `pg_temp_N`.** On PostgreSQL 15.19 `select * from
       pg_temp.nosuch` is 42P01 `relation "pg_temp.nosuch" does not exist`
@@ -2122,6 +2113,42 @@ Measured on PostgreSQL 15.19 (the data-modifying WITH on a private cluster).
       Verify: tests/backlog/test_rp_qualified_calls.py::test_temp_namespace_follows_transactions
       Backlog-ID: RP-883
 
+
+## Found while working RP-881 (2026-11-12)
+
+Measured on a private PostgreSQL 15.19 cluster. The gap tests are in
+`tests/backlog/test_rp_found_rp881.py`.
+
+- [ ] **A constant DEFAULT is evaluated at CREATE TABLE.** `create table t
+      (a int default 1/0)` succeeds on PostgreSQL 15.19 (`cookDefault`
+      analyses the expression, it does not run it), and the 22012 `division
+      by zero` comes from the first INSERT that uses the default; so does
+      `default 2147483647 + 1`. Here the CREATE is refused with 22012
+      (`default_value_or_expr` folds a constant default into a stored
+      value and raises what folding raises). Folding is safe for a default
+      that folds; one that errors is to be kept as its expression.
+      Verify: tests/backlog/test_rp_found_rp881.py::test_a_constant_default_is_not_run_at_create
+      Backlog-ID: RP-886
+- [ ] **CREATE TABLE IF NOT EXISTS over a table that exists checks its
+      columns.** PostgreSQL 15.19's `transformCreateStmt` finds the
+      relation first and answers with a NOTICE (`relation "t" already
+      exists, skipping`), looking at nothing else: `create table if not
+      exists t (a nosuchtype)`, `(a int, a int)` and `(a int default 'x')`
+      all succeed. Here they are 42704, 42701 and 22P02: the column types,
+      names and literal defaults are checked while planning, before the
+      executor looks for the table. (Since RP-881 the defaults' analysis
+      is skipped for such a statement, as PostgreSQL skips it.)
+      Verify: tests/backlog/test_rp_found_rp881.py::test_if_not_exists_over_a_table_checks_nothing
+      Backlog-ID: RP-887
+- [ ] **A DEFAULT's `nextval('nosuch_seq')` passes CREATE TABLE.**
+      `create table t (a int default nextval('nosuch_seq'))`
+      is 42P01 `relation "nosuch_seq" does not exist` at 42 on PostgreSQL
+      15.19: the literal is coerced to `nextval`'s `regclass` parameter
+      while the default is analysed, which runs `regclassin`. Here the
+      CREATE succeeds and the first INSERT fails. (An explicit
+      `'nosuch'::regclass` is already 42P01 at CREATE.)
+      Verify: tests/backlog/test_rp_found_rp881.py::test_a_regclass_literal_in_a_default_is_resolved
+      Backlog-ID: RP-888
 ## Found while working RP-472 (2026-11-07)
 
 - [ ] **EXPLAIN of a user function in FROM prints no Function Scan.**

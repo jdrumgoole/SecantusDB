@@ -22,6 +22,7 @@ mod targetlist_size;
 pub use targetlist_size::MAX_HEAP_ATTRIBUTE_NUMBER;
 mod cmpfn;
 mod colhint;
+mod default_expr;
 mod schema_refs;
 mod values_refs;
 pub use colhint::missing_column_hint;
@@ -5638,7 +5639,13 @@ fn plan_node(
             };
             let (c, extra, column_options) = partitions::lower_create(&c, lookup)?;
             let like_columns = like_column_names(&c, lookup);
-            let mut st = plan_create(&expand_table_like(&c, lookup)?)?;
+            // `IF NOT EXISTS` over a relation that exists is a NOTICE before
+            // anything is analysed (`transformCreateStmt`).
+            let skipped = c.if_not_exists
+                && c.relation
+                    .as_ref()
+                    .is_some_and(|r| lookup(&relation_name(r)).is_some());
+            let mut st = plan_create(&expand_table_like(&c, lookup)?, !skipped)?;
             if let Statement::CreateTable(def, _) = &mut st {
                 // A column PostgreSQL defines from a type OID -- one LIKE
                 // (a partition's too) or `OF type` brings -- has no array
@@ -8579,7 +8586,9 @@ fn plan_alter_action(
                         .column(&cmd.name)
                         .ok_or_else(|| Error::UndefinedColumn(cmd.name.clone()))?;
                     // SET DEFAULT rewrites no rows, so an expression default
-                    // needs nothing evaluated now.
+                    // needs nothing evaluated now; it is analysed all the
+                    // same (RP-881).
+                    default_expr::analyse_unpositioned(raw)?;
                     Some(default_value_or_expr(raw, &column.pg_type, params)?)
                 }
             };
@@ -9358,6 +9367,7 @@ fn plan_added_column(
                 // An expression default is evaluated per EXISTING row by the
                 // executor's rewrite -- `gen_random_uuid()` gives each row its
                 // own, as PostgreSQL does -- and per inserted row after.
+                default_expr::analyse_unpositioned(raw)?;
                 check_default_type(&column, raw)?;
                 // The column's own DEFAULT replaces the domain's, whichever
                 // form either takes.
@@ -12159,7 +12169,9 @@ fn expand_table_like(
     Ok(out)
 }
 
-fn plan_create(c: &pg_query::protobuf::CreateStmt) -> Result<Statement> {
+/// Plan a CREATE TABLE; `analyse_defaults` is false for an `IF NOT EXISTS`
+/// over a relation that exists, whose DEFAULTs PostgreSQL never cooks.
+fn plan_create(c: &pg_query::protobuf::CreateStmt, analyse_defaults: bool) -> Result<Statement> {
     use pg_query::protobuf::ConstrType as CT;
     let relation = c
         .relation
@@ -12188,6 +12200,9 @@ fn plan_create(c: &pg_query::protobuf::CreateStmt) -> Result<Statement> {
     // resolved to CheckConstraints once every column is known, because a
     // column-level CHECK may read a column declared after it.
     let mut checks: Vec<(String, pg_query::protobuf::Node)> = Vec::new();
+    // (the column's index, its DEFAULT, its stored type), cooked after the
+    // columns, as `AddRelationNewConstraints` cooks them.
+    let mut defaults: Vec<(usize, pg_query::protobuf::Node, String)> = Vec::new();
     let mut fks: Vec<ForeignKey> = Vec::new();
     let mut uniques: Vec<UniqueConstraint> = Vec::new();
     // DEFERRABLE / INITIALLY DEFERRED arrive as separate attribute constraints
@@ -12280,35 +12295,12 @@ fn plan_create(c: &pg_query::protobuf::CreateStmt) -> Result<Statement> {
                         }
                         Ok(CT::ConstrNotnull) => column.nullable = false,
                         Ok(CT::ConstrNull) => column.nullable = !pk,
-                        // A literal DEFAULT is cast to the column's type now
-                        // (a bad literal is an error at CREATE, as on
-                        // PostgreSQL) and stored in the catalog. An
-                        // expression default -- `now()`, arithmetic -- is
-                        // refused rather than dropped: before this, every
-                        // DEFAULT was silently ignored and the omitted column
-                        // read NULL.
+                        // Cooked once every column is known (below).
                         Ok(CT::ConstrDefault) => {
                             let Some(raw) = k.raw_expr.as_ref() else {
                                 continue;
                             };
-                            // A DEFAULT is evaluated ONCE here and stored as a
-                            // value, so a volatile function -- `now()` -- would
-                            // be frozen at CREATE time and every later row
-                            // would carry the table's creation instant where
-                            // PostgreSQL stamps each INSERT. Refuse it rather
-                            // than store the wrong value silently.
-                            // So a volatile one -- or one the constant
-                            // evaluator cannot fold -- is kept as its SQL and
-                            // evaluated per INSERTed row by the executor.
-                            check_default_type(&column, raw)?;
-                            column.extra.remove("default_from_domain");
-                            match default_value_or_expr(raw, &underlying, &[])? {
-                                DefaultSpec::Value(v) => {
-                                    column.default = Some(v);
-                                    column.set_default_sql(ruleutils_default(raw));
-                                }
-                                DefaultSpec::Expr(e) => column.set_default_expr(Some(e)),
-                            }
+                            defaults.push((columns.len(), (**raw).clone(), underlying.clone()));
                         }
                         Ok(CT::ConstrCheck) => {
                             let Some(raw) = k.raw_expr.as_ref() else {
@@ -12665,6 +12657,27 @@ fn plan_create(c: &pg_query::protobuf::CreateStmt) -> Result<Statement> {
                 "column \"{}\" specified more than once",
                 col.name
             )));
+        }
+    }
+    // Each column's DEFAULT, in column order, before any CHECK
+    // (`AddRelationNewConstraints`): analysed as `cookDefault` analyses it
+    // (RP-881), then cast to the column's type and stored in the catalog
+    // when it is a constant. A volatile one -- `now()` -- or one the
+    // constant evaluator cannot fold is kept as its SQL and evaluated per
+    // INSERTed row by the executor, never frozen at CREATE time.
+    for (i, raw, underlying) in defaults {
+        if analyse_defaults {
+            default_expr::analyse(&raw)?;
+        }
+        let column = &mut def.columns[i];
+        check_default_type(column, &raw)?;
+        column.extra.remove("default_from_domain");
+        match default_value_or_expr(&raw, &underlying, &[])? {
+            DefaultSpec::Value(v) => {
+                column.default = Some(v);
+                column.set_default_sql(ruleutils_default(&raw));
+            }
+            DefaultSpec::Expr(e) => column.set_default_expr(Some(e)),
         }
     }
     // Two unnamed foreign keys over the same columns are told apart the

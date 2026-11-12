@@ -7591,3 +7591,73 @@ fn a_call_in_a_missing_schema_is_3f000() {
     let err = plan("select pg_catalog.abs(-2), public.f()", &lookup).unwrap_err();
     assert_ne!(err.sqlstate(), "3F000");
 }
+
+/// A DEFAULT is analysed when CREATE TABLE declares it, as `cookDefault`
+/// analyses it, at the first token that fails (RP-881; locations measured
+/// on PostgreSQL 15.19, which reports them one-based).
+#[test]
+fn create_table_analyses_each_default() {
+    for (sql, sqlstate, message, at) in [
+        (
+            "create table t881c (a int, b int default a)",
+            "0A000",
+            "cannot use column reference in DEFAULT expression",
+            41,
+        ),
+        (
+            "create table t881c (a int default (select 1))",
+            "0A000",
+            "cannot use subquery in DEFAULT expression",
+            34,
+        ),
+        (
+            "create table t881c (a int default sum(1))",
+            "42803",
+            "aggregate functions are not allowed in DEFAULT expressions",
+            34,
+        ),
+        (
+            "create table t881c (a int default row_number() over ())",
+            "42P20",
+            "window functions are not allowed in DEFAULT expressions",
+            34,
+        ),
+        (
+            "create table t881c (a int default generate_series(1, 2))",
+            "0A000",
+            "set-returning functions are not allowed in DEFAULT expressions",
+            34,
+        ),
+        (
+            "create table t881c (a int default abs(1) over ())",
+            "42809",
+            "OVER specified, but abs is not a window function nor an aggregate function",
+            34,
+        ),
+        (
+            "create table t881c (a int default nosuch_fn(b))",
+            "0A000",
+            "cannot use column reference in DEFAULT expression",
+            44,
+        ),
+        (
+            "create table t881c (a int default abs(nosuch_fn()))",
+            "0A000",
+            "function nosuch_fn()",
+            38,
+        ),
+    ] {
+        take_error_location();
+        let err = plan(sql, &lookup).expect_err(sql);
+        assert_eq!(err.sqlstate(), sqlstate, "{sql}: {err}");
+        assert!(err.to_string().starts_with(message), "{sql}: {err}");
+        assert_eq!(take_error_location(), Some(at), "{sql}");
+    }
+    let Statement::CreateTable(def, _) = plan_ok(
+        "create table t881c (a int default abs(-1) + length('xy'), b timestamptz default now())",
+    ) else {
+        panic!("not a CREATE TABLE");
+    };
+    assert_eq!(def.columns[0].default, Some(Bson::Int32(3)));
+    assert!(def.columns[1].default_expr().is_some());
+}

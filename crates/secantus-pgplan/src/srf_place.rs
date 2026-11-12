@@ -14,7 +14,7 @@ use super::*;
 
 /// A call that returns a set: a built-in every overload of which does, or a
 /// user function declared `RETURNS SETOF` / `TABLE`.
-fn is_srf(f: &pg_query::protobuf::FuncCall) -> bool {
+pub(crate) fn is_srf(f: &pg_query::protobuf::FuncCall) -> bool {
     let Some(name) = func_name(f) else {
         return false;
     };
