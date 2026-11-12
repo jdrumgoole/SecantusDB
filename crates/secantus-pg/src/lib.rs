@@ -15431,16 +15431,18 @@ impl PgHandler {
         // Each view, then what names ITS row type (RP-568).
         let table_lines = row_type.lines.clone();
         let view_lines = self.reader_lines(&views, &mut row_type)?;
+        // `getRelationDescription`: qualified only when not visible.
+        let shown = secantus_pgplan::schemas::relation_visible_name;
         let objects: Vec<(String, String)> = table_lines
             .into_iter()
             .chain(
                 kids.iter()
-                    .map(|(k, p)| (format!("table {k}"), format!("table {p}"))),
+                    .map(|(k, p)| (format!("table {}", shown(k)), format!("table {}", shown(p)))),
             )
             .chain(fks.iter().map(|(child, fk)| {
                 (
-                    format!("constraint {} on table {}", fk.name, child.name),
-                    format!("table {table}"),
+                    format!("constraint {} on table {}", fk.name, shown(&child.name)),
+                    format!("table {}", shown(table)),
                 )
             }))
             .chain(view_lines)
@@ -44521,7 +44523,8 @@ impl PgHandler {
                                     "ERROR".into(),
                                     "2BP01".into(),
                                     format!(
-                                        "cannot drop table {table} because other objects depend on it"
+                                        "cannot drop table {} because other objects depend on it",
+                                        secantus_pgplan::schemas::relation_visible_name(table)
                                     ),
                                 );
                                 info.detail = Some(

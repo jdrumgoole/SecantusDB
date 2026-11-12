@@ -35137,7 +35137,7 @@ pub fn regtype_text(oid: i64) -> String {
             .or_else(|| user_composite_name(oid))
             .map(|n| match n.strip_prefix("public.") {
                 Some(bare) if pgtypes::shadowed_by_catalog(bare) => n,
-                _ => schemas::visible_name(&n),
+                _ => schemas::type_visible_name(&n),
             })
     };
     if let Some(name) = user_name(oid) {
@@ -37099,19 +37099,46 @@ fn text_type_oid(name: &str) -> Option<i64> {
     if let Some(oid) = pgtypes::catalog_composite_oid(&parts, array) {
         return Some(oid);
     }
-    // A bare name finds a `public` type only while `public` is on the search
-    // path (`TypenameGetTypid`): pg_dump sets it empty, and `'mood'::regtype`
-    // is then 42704, `to_regtype('mood')` NULL.
-    if parts.len() == 1 && !schemas::search_path().iter().any(|s| s == "public") {
-        return None;
-    }
+    // A bare name is looked up as `TypenameGetTypid` walks the search path:
+    // the session's temporary schema first, then each schema on the path.
+    // So a `public` type is found only while `public` is on it: pg_dump
+    // sets it empty, and `'mood'::regtype` is then 42704, `to_regtype('mood')`
+    // NULL.
+    let found_in = match parts.as_slice() {
+        [one] => {
+            let schema = schemas::type_schema_of(&pgtypes::user_type_key(one));
+            // `_t`, the internal spelling of `t[]`, is found where `t` is.
+            if schema.is_none() {
+                if let Some(element) = one.strip_prefix('_').filter(|e| !e.is_empty()) {
+                    let key = pgtypes::user_type_key(element);
+                    if let Some(s) = schemas::type_schema_of(&key) {
+                        return user_type_or_array_oid(&format!(
+                            "{}[]",
+                            schemas::relation_key(&s, &key)
+                        ));
+                    }
+                }
+            }
+            if schema.is_none() && !schemas::search_path().iter().any(|s| s == "public") {
+                return None;
+            }
+            schema
+        }
+        _ => None,
+    };
     let base = match parts
         .iter()
         .map(String::as_str)
         .collect::<Vec<_>>()
         .as_slice()
     {
-        [one] | ["public", one] => pgtypes::user_type_key(one),
+        [one] => match found_in.as_deref() {
+            Some(schema) => schemas::relation_key(schema, &pgtypes::user_type_key(one)),
+            None => pgtypes::user_type_key(one),
+        },
+        ["public", one] => pgtypes::user_type_key(one),
+        // `pg_temp` is the session's temporary schema (`LookupExplicitNamespace`).
+        ["pg_temp", one] => schemas::relation_key(&schemas::temp_schema_in_use()?, one),
         _ => parts.join("."),
     };
     let key = if array { format!("{base}[]") } else { base };

@@ -254,9 +254,10 @@ def test_multi_table_drop_cascade_notice(dsn: str) -> None:
 
 # A routine over a temporary table's row type names that type: its
 # `proargtypes` is `{tt565}` and the table cannot be dropped without it.
-# Here the argument resolves to no type (`-`), the DROP succeeds, and the
-# routine is left naming nothing.
-@pytest.mark.backlog("RP-565")
+# The argument used to resolve to no type (`-`), the DROP succeeded, and
+# the routine was left naming nothing: a bare type name never searched the
+# session's temporary schema.
+@pytest.mark.backlog_fixed("RP-565")
 def test_routine_over_a_temp_table_row_type(dsn: str) -> None:
     with psycopg.connect(dsn, autocommit=True) as c:
         c.execute("create temp table tt565 (a int)")

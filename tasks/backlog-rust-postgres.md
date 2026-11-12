@@ -2333,13 +2333,6 @@ tests are in `tests/backlog/test_rp_found_rp546.py`.
       `other objects depend on it`. With no routine it already matches.
       Backlog-ID: RP-562
       Verify: tests/backlog/test_rp_found_rp546.py::test_drop_type_of_a_row_type_with_a_routine
-- [ ] **A routine over a temporary table's row type names no type.** On
-      PostgreSQL 15.19 `create function tf565(tt565)` over a temp table has
-      `proargtypes` `{tt565}`, and `drop table tt565` is 2BP01 naming it.
-      Here the argument is stored by its bare name, which resolves to no
-      type (`-`), the DROP succeeds, and the routine is left behind.
-      Backlog-ID: RP-565
-      Verify: tests/backlog/test_rp_found_rp546.py::test_routine_over_a_temp_table_row_type
 - [ ] **A `regprocedure` prints its name unquoted and a schema's type
       quoted whole.** `regprocedureout` is `format_procedure`: `"Q
       f567"(s567.t)` and `s567.h(s567.t)` on PostgreSQL 15.19. Here they are
@@ -3820,3 +3813,28 @@ Measured on PostgreSQL 15.19; none of it needs DDL. The gap tests are in
       `E'x'::int4`, with no escape, is placed.
       Verify: tests/backlog/test_rp_found_rp605.py::test_escaped_literal_input_error_has_a_position
       Backlog-ID: RP-867
+
+## Found while working RP-565 (2026-11-12)
+
+Measured on a private, freshly initdb'd PostgreSQL 15.19 cluster. The gap
+tests are in `tests/backlog/test_rp_found_rp565.py`.
+
+- [ ] **A DROP's DETAIL names a foreign key by its schema-qualified key.**
+      `drop table s.p` with `s.child (b int references s.p)` is 2BP01 with
+      DETAIL `constraint child_b_fkey on table s.child depends on table
+      s.p` on PostgreSQL 15.19 (`getObjectDescription` prints `conname`),
+      and a temporary table's the same, `tc_b_fkey`. Here the constraint
+      is `s.child_b_fkey` and `pg_temp_N.tc_b_fkey`: the DETAIL takes the
+      stored key, though `pg_constraint.conname` is already right.
+      Verify: tests/backlog/test_rp_found_rp565.py::test_a_foreign_key_in_a_drop_detail_is_named_by_its_own_name
+      Backlog-ID: RP-890
+- [ ] **A temporary row type does not hide a built-in type of its name.**
+      PostgreSQL searches the temporary schema for a type ahead of
+      `pg_catalog` when the path does not name `pg_temp`: after `create
+      temp table text (a int)`, `'x'::text` is 22P02 `malformed record
+      literal: "x"` and `('(1)'::text).a` is 1 on 15.19. Here a built-in
+      name is resolved before any user type is looked for
+      (`is_builtin_type` ahead of `type_schema_of`), so the first answers
+      `x` and the second is 42809.
+      Verify: tests/backlog/test_rp_found_rp565.py::test_a_temporary_row_type_hides_a_built_in_type
+      Backlog-ID: RP-891
