@@ -15,8 +15,10 @@
 //! another.
 //!
 //! A sort is the store's own comparison, as it was. The plan says only how
-//! documents that compare EQUAL are left, which is the order they reached
-//! the sort in. So a sort with no two documents equal needs no plan.
+//! documents that compare EQUAL are left: under a limit, the order they
+//! reached the sort in; without one, where mongod's sorter's `std::sort`
+//! leaves them, which depends on the order every document reached it in
+//! (RM-312). So a sort with no two documents equal needs no plan.
 //!
 //! The plan orders and never selects: a document the store matched and the
 //! plan does not reach is still returned, after the rest.
@@ -93,6 +95,40 @@ fn has_sort(node: &Node) -> bool {
         Node::Fetch { input, .. } => has_sort(input),
         _ => false,
     }
+}
+
+/// Whether the plan's `SORT` holds every document it is handed: one with
+/// no limit, which mongod's sorter sorts with `std::sort`. A sort with a
+/// limit keeps a heap of its best (section 7.075).
+fn sorts_without_limit(node: &Node) -> bool {
+    match access(node) {
+        Node::Sort { limit, .. } => limit.is_none(),
+        Node::Fetch { input, .. } => sorts_without_limit(input),
+        _ => false,
+    }
+}
+
+/// `arrival` (rows, in the order the plan hands them to its `SORT`) as
+/// mongod's sorter leaves them. `std::sort` is not stable, so where two
+/// documents that compare equal end up depends on the order every document
+/// came in, not only theirs (RM-312). `order` and `tied` are the store's
+/// sort of the same rows ([`Storage::sort_permutation`]): which runs of
+/// equal documents there are, and in what order the runs go.
+pub(super) fn std_sorted(arrival: &[usize], order: &[usize], tied: &[bool]) -> Vec<usize> {
+    let mut run = vec![0usize; order.len()];
+    let mut at_run = 0;
+    for (at, &row) in order.iter().enumerate() {
+        if at > 0 && !tied[at] {
+            at_run += 1;
+        }
+        run[row] = at_run;
+    }
+    secantus_core::sorter::std_sort_order(arrival.len(), &|a, b| {
+        run[arrival[a]].cmp(&run[arrival[b]])
+    })
+    .into_iter()
+    .map(|at| arrival[at])
+    .collect()
 }
 
 /// Whether the plan has an `$or` of scans. Its branches' filters say which
@@ -997,14 +1033,20 @@ fn placed(rows: Rows, order: Vec<usize>) -> Rows {
         .collect()
 }
 
-/// `rows` as a blocking sort leaves them: sorted by `ask.sort` when there
-/// is one, documents that compare equal in the order they came.
+/// `rows`, in the order they reach it, as a blocking sort leaves them:
+/// sorted by `ask.sort` when there is one. Documents that compare equal are
+/// where `std::sort` puts them when the sort has no limit, and in the order
+/// they came under a limit.
 fn sorted_over(storage: &dyn Storage, rows: Rows, ask: &Ask) -> Result<Rows, StorageError> {
     let Some(sort) = ask.sort else {
         return Ok(rows);
     };
     let blobs: Vec<&[u8]> = rows.iter().map(|(_, b)| b.as_slice()).collect();
-    let (order, _) = storage.sort_permutation(&blobs, sort, ask.collation)?;
+    let (mut order, tied) = storage.sort_permutation(&blobs, sort, ask.collation)?;
+    if ask.limit == 0 && tied.iter().any(|t| *t) {
+        let arrival: Vec<usize> = (0..rows.len()).collect();
+        order = std_sorted(&arrival, &order, &tied);
+    }
     Ok(placed(rows, order))
 }
 
@@ -1529,10 +1571,13 @@ pub(crate) fn ordered_rows(storage: &dyn Storage, ask: &Ask) -> Result<Option<Ro
         _ => rows.len(),
     };
     let merged = has_merge(&plan);
-    let cut = if merged { rows.len() } else { cut };
+    // A sort with no limit is `std::sort`'s: where equal documents end up
+    // depends on every document it holds, so all of them are placed.
+    let unstable = sorted.is_some() && sorts_without_limit(&plan);
+    let cut = if merged || unstable { rows.len() } else { cut };
     let placing: Vec<usize> = match &sorted {
         None => (0..rows.len()).collect(),
-        Some(_) if merged => (0..rows.len()).collect(),
+        Some(_) if merged || unstable => (0..rows.len()).collect(),
         Some((order, tied)) => {
             let mut some: Vec<usize> = (0..cut)
                 .filter(|&at| tied[at] || tied.get(at + 1).copied().unwrap_or(false))
@@ -1618,6 +1663,13 @@ pub(crate) fn ordered_rows(storage: &dyn Storage, ask: &Ask) -> Result<Option<Ro
             let mut order = placing;
             order.sort_unstable_by_key(|&row| rank[row]);
             order
+        }
+        Some((order, tied)) if unstable => {
+            // The rows in the order the plan hands them to its `SORT`, then
+            // sorted as its sorter sorts them.
+            let mut arrival = placing;
+            arrival.sort_unstable_by_key(|&row| rank[row]);
+            std_sorted(&arrival, &order, &tied)
         }
         Some((mut order, tied)) => {
             // Each run of equal documents, in the order the plan left them.

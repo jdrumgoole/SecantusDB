@@ -1380,10 +1380,10 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       on macOS mongod 8.2.11, and libstdc++'s `std::sort` (g++ 15.2), the
       Linux build's, gives 0, 21, 18, 24, .... Since RM-402 the sorter here
       (`sorter::sort_held`) gives the Linux order for a `$sort` after
-      another stage, but these three take a stable order of their own: the
-      storage read's sort (`secantus-storage`, `compare_sort_keys`) for
-      `find` and a leading `$sort`, and the window stage's own sort. On
-      macOS the order also needs RM-526. Found 2026-11-10 working RM-402.
+      another stage, and since RM-312 so do `find` and a leading `$sort`
+      (the read's `SORT`, `explain/order.rs` and `explain/stream.rs`); the
+      window stage's own sort is still stable. On macOS the order also
+      needs RM-526. Found 2026-11-10 working RM-402.
       Verify: tests/backlog/test_rm_found_2026_11_10_rm402.py::test_tied_order_of_find_leading_sort_and_window
       Backlog-ID: RM-527
 - [ ] **A classic `$group` counts its held values' and `_id`'s memory
@@ -2431,27 +2431,6 @@ What is left, all on the RUST MongoDB server:
       Found 2026-11-09 working RM-311.
       Verify: tests/backlog/test_rm_found_2026_11_09.py::test_explain_lists_a_match_after_the_cursor_in_written_order
       Backlog-ID: RM-444
-- [ ] **A blocking sort keeps equal documents in the order it read them;
-      mongod's sort does not.** Over 200 documents in runs of equal keys,
-      mongod 8.2.11's `find().sort({s: 1})` and `$sort` (with a collation
-      or without) return the equal documents in an order two mongod
-      processes agree on and that is not their arrival order (`25, 105, 95,
-      115, 5, ...` where they arrive `5, 15, 25, ...`): an unstable sort,
-      by its shape the C++ library's `std::sort` (not confirmed in the
-      source). This server's sort (`Storage::sort_permutation`) is stable.
-      `tools/probes/find_order.py`'s collections are small and show no
-      difference. A sort with a limit is the scope decision on its heap
-      (section 7.075).
-      **Decided (Joe, 2026-11-12): sort as libstdc++'s `std::sort` does.**
-      The exemplar is Linux mongod, which links libstdc++; reuse
-      `secantus-core/src/stl.rs`'s model (already used for SBE's heaps) for
-      the blocking sort, so equal keys come out in Linux mongod's order.
-      The macOS mongod measured here links libc++ and orders ties
-      differently; where the two differ, Linux is right. Pin the gap test
-      to the libstdc++ order (measure it on a Linux mongod 8.2, e.g. in
-      CI's mongod_live lane, rather than on this box).
-      Backlog-ID: RM-312
-      Verify: tests/backlog/test_rm_found_2026_10_25.py::test_a_blocking_sort_leaves_ties_as_mongods_sort_does
 - [ ] **`explain` of a `$unionWith` lists its sub-pipeline as written.**
       mongod 8.2.11 explains the sub-pipeline as it does the outer one: a
       `$cursor` of its own (its `queryPlanner`, and `executionStats` above
