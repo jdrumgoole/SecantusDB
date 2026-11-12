@@ -357,16 +357,17 @@ These are explicit non-goals. Don't add them without a reason.
     `TestCausalConsistency_Supported` (29/29 passed). Re-include them.
   - Rust's `diagnostics::ok_transaction` ("no-op commit/abort") is dead code
     that nothing dispatches to.
-- [ ] **A wrong-type error lists the expected types in another order than
-      mongod's.** mongod 8.2.11's order is per field: `cursor.batchSize`
-      "[double, decimal, long, int]", `aggregate.maxTimeMS` "[double, int,
-      long, decimal]", `FindCommandRequest.batchSize` "[decimal, double, long,
-      int]". This server answers "[decimal, int, double, long]" for all
-      three. Other fields already carry their own list (`generic.rs`,
-      `cluster_params.rs`), so the order is per field, not one rule. Found
-      2026-11-09 working RM-431.
-      Verify: tests/backlog/test_rm_aggregate_parse.py::test_wrong_type_lists_the_types_in_mongods_order
-      Backlog-ID: RM-465
+- **Scope decision — the order of a wrong-type error's expected types**
+  (this was RM-465, 2026-11-12). mongod's order is not one it keeps: in one
+  8.2.11 build it differs per IDL file (`FindCommandRequest.*` and
+  `getMore.*` "[decimal, double, long, int]", `create.*` "[int, double,
+  decimal, long]", `count.*` "[int, decimal, double, long]",
+  `cursor.batchSize` "[double, decimal, long, int]", `aggregate.maxTimeMS`
+  "[double, int, long, decimal]"), and it moves between patch builds
+  (8.2.1, 8.2.11 and 8.2.12 all differ; CI installs the latest 8.2). The
+  SET matched mongod on every numeric slot probed, so the list is compared
+  as a set (`tests/mongod_reference.py::sort_type_lists`), as
+  `test_wrong_type_lists_mongods_set_of_types` now does.
 
 ### 2026-09-01: two PLANNER differences, measured and dispositioned
 

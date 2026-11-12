@@ -30,10 +30,14 @@ use secantus_core::query::bson_type_name;
 
 use crate::CommandError;
 
-/// mongod's numeric-slot type list, probed on 8.2.1. The ORDER is mongod's own
-/// and differs per field, so this is copied rather than derived. (6.0.16 also
-/// put the closing quote inside the bracket here; 8.x quotes it properly.)
-/// Mirrors `commands._NUMERIC_TYPES_MSG`.
+/// mongod's numeric-slot type list, probed on 8.2.1. The SET is mongod's; its
+/// ORDER is not one mongod keeps: it differs per IDL file in one build
+/// (8.2.11: `FindCommandRequest.*` and `getMore.*` "[decimal, double, long,
+/// int]", `create.*` "[int, double, decimal, long]", `cursor.batchSize`
+/// "[double, decimal, long, int]") and moves between patch builds (8.2.1,
+/// 8.2.11, 8.2.12), so it is compared as a set (`tests/mongod_reference.py`,
+/// the scope decision that was RM-465). (6.0.16 also put the closing quote
+/// inside the bracket here; 8.x quotes it properly.)
 const NUMERIC_TYPES: &str = "'[decimal, int, double, long]'";
 
 /// `findAndModify.upsert` accepts a bool OR any number, unlike the strict-bool
