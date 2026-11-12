@@ -656,14 +656,6 @@ These are explicit non-goals. Don't add them without a reason.
       the shaped ones were.
       Backlog-ID: RM-358
       Verify: tests/backlog/test_rm_355_364.py::test_a_query_of_every_kind_names_its_query_shape
-- [ ] **An `explain` of `$planCacheStats` fails.** mongod 8.2.11 explains
-      `aggregate` of `[{$planCacheStats: {}}]`: `stages` holds
-      `{$planCacheStats: {allHosts: false}}`, then `queryShapeHash`. This
-      server's `explain` runs the pipeline against a namespace of its own
-      (`explain.dry.run`, `explain/mod.rs`) and fails with 50933 (`collection
-      '<db>.explain.dry.run' does not exist`). Found 2026-11-09 (RM-358).
-      Verify: tests/backlog/test_rm_found_rm358.py::test_an_explain_of_plan_cache_stats_names_its_stage
-      Backlog-ID: RM-466
 - [ ] **An `explain` of `$geoNear` fails.** mongod 8.2.11 explains
       `aggregate` of `[{$geoNear: {near: [0, 0]}}]` over a collection with
       a `2d` index, with or without `distanceField`, and prints its
@@ -671,7 +663,7 @@ These are explicit non-goals. Don't add them without a reason.
       `explain` runs the pipeline against a namespace of its own
       (`explain.dry.run`, `explain/mod.rs`) and fails with 26 (`$geoNear
       requires a geo index to run, but <db>.explain.dry.run does not
-      exist`), as RM-466 does for `$planCacheStats`. A `$rankFusion` with a
+      exist`), as RM-466 did for `$planCacheStats`. A `$rankFusion` with a
       `$geoNear` input fails the same way. Found 2026-11-12 (RM-358).
       Verify: tests/backlog/test_rm_found_rm358.py::test_an_explain_of_geo_near_runs
       Backlog-ID: RM-552
@@ -684,6 +676,19 @@ These are explicit non-goals. Don't add them without a reason.
       (`hybrid.rs`). Found 2026-11-12 (RM-358).
       Verify: tests/backlog/test_rm_found_rm358.py::test_score_fusion_combines_by_avg
       Backlog-ID: RM-553
+- [ ] **A later `$match` does not replace the one `$planCacheStats` absorbed.**
+      mongod 8.2.11's `$planCacheStats` absorbs the `$match` right after
+      it, and absorbs again, in place of the first, each `$match` a later
+      stage swaps ahead of itself (`doOptimizeAt` overwrites
+      `_absorbedMatch`): `[{$planCacheStats: {}}, {$match: {isActive:
+      false}}, {$project: {isActive: 1, works: 1}}, {$match: {works: {$gte:
+      0}}}]` returns every entry, the first filter lost. This server's stage
+      (`aggregate.rs`) keeps the first `$match` and runs the second after
+      the `$project`, returning none of three active entries. `explain`
+      already lists it as mongod does (`plan_cache::absorb_matches`, RM-466),
+      which the run could share. Found 2026-11-12 (RM-466).
+      Verify: tests/backlog/test_rm_found_rm466.py::test_a_later_match_replaces_the_one_plan_cache_stats_absorbed
+      Backlog-ID: RM-554
 - [ ] **An aggregate's top-k sort counts only the keys it kept.** mongod
       8.2.11 adds every document its sort read to
       `metrics.query.sort.totalKeysSorted` for a leading `$sort` and

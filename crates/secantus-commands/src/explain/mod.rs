@@ -2605,10 +2605,16 @@ fn aggregate(
     if target_coll.is_some() {
         checked.insert("aggregate", DRY);
     }
+    let plan_cache_stats = pipeline
+        .first()
+        .is_some_and(|s| s.contains_key("$planCacheStats"));
     match validate(crate::aggregate::aggregate, &checked, ctx) {
         // The dry run's namespace is not there, which is all a `$collStats`
         // stage is saying when it cannot read its count or its sizes.
         Err(e) if e.code == 26 && e.errmsg.contains("in $collStats stage") => {}
+        // Nor a plan cache for `$planCacheStats` to read, which `explain`
+        // lists without reading it (RM-466).
+        Err(e) if e.code == 50933 && plan_cache_stats => {}
         other => other?,
     }
     let db = ctx.db_name.clone();
@@ -2623,7 +2629,9 @@ fn aggregate(
     {
         return change_stream::reply(inner, &pipeline, echo, verbosity, ctx);
     }
-    let own_source = pipeline.first().is_some_and(shape::own_source);
+    // `$planCacheStats` reads the collection's plan cache, not its
+    // documents, through no view (measured 8.2.11).
+    let own_source = plan_cache_stats || pipeline.first().is_some_and(shape::own_source);
     let Some(coll) = target_coll.filter(|_| !own_source) else {
         let target = inner.get("aggregate").cloned().unwrap_or(Bson::Int32(1));
         return own_source_reply(&target, &pipeline, echo, verbosity, ctx);
@@ -2683,13 +2691,34 @@ fn own_source_reply(
 ) -> HandlerResult {
     let db = ctx.db_name.clone();
     let wanted = verbosity != Verbosity::QueryPlanner;
+    let plan_cache_stats = pipeline
+        .first()
+        .is_some_and(|s| s.contains_key("$planCacheStats"));
+    // Run, `$planCacheStats` needs its collection; listed, it does not
+    // (measured 8.2.11: `executionStats` of a missing one fails, with no
+    // executor's prefix on the message).
+    if let (true, true, Bson::String(coll)) = (wanted, plan_cache_stats, target) {
+        let storage = ctx.storage()?;
+        if plan_cache::place_of(storage, &db, coll)
+            .map_err(crate::util::command_error)?
+            .is_none()
+        {
+            return Err(err(
+                50933,
+                "Location50933",
+                format!("collection '{db}.{coll}' does not exist"),
+            ));
+        }
+    }
+    // The `$match` that `$planCacheStats` absorbed runs as the stage's own.
+    let mut absorbed = false;
     let (head, run_head, after) = match pipeline.split_first() {
         None => (Vec::new(), Vec::new(), Vec::new()),
         Some((source, rest)) => {
             let staged: Vec<Bson> = rest.iter().cloned().map(Bson::Document).collect();
             let mut after = shape::desugared(&staged);
             let mut head = shape::listed_stage(source, &db);
-            let run_head = match source.get("$documents") {
+            let mut run_head = match source.get("$documents") {
                 Some(docs) => {
                     // The `$replaceRoot` is one of the stages after it.
                     head.truncate(3);
@@ -2707,6 +2736,15 @@ fn own_source_reply(
                 }
                 None => vec![source.clone()],
             };
+            if plan_cache_stats {
+                let taken = plan_cache::absorb_matches(after);
+                head = vec![taken.listed];
+                if let Some(m) = taken.run {
+                    run_head.push(m);
+                    absorbed = true;
+                }
+                after = taken.rest;
+            }
             if source.contains_key("$listLocalSessions") {
                 let caller = crate::session::authenticated(ctx);
                 for stage in &mut head {
@@ -2764,6 +2802,7 @@ fn own_source_reply(
             // `$documents`' `$project` and `$unwind` are runs of their own.
             let n = match (documents, i) {
                 (true, 1 | 2) => counts.get(i - 1).copied(),
+                _ if absorbed => counts.first().copied(),
                 _ => first,
             };
             if let Some(n) = n {

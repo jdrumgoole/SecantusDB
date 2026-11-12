@@ -376,6 +376,69 @@ pub(crate) fn check_spec(spec: &Bson) -> Result<(), crate::CommandError> {
     Ok(())
 }
 
+/// What `explain` makes of `$planCacheStats` and the stages after it, as
+/// mongod's optimizer leaves them (8.2.11,
+/// `DocumentSourcePlanCacheStats::doOptimizeAt`): the stage absorbs a
+/// `$match` right after it, and absorbs again -- replacing the one it held
+/// -- each `$match` a later stage swaps ahead of itself, which sends the
+/// optimizer back to the stage. A `$match` that is right after it once it
+/// has absorbed one stays where it is: the optimizer moves on from the
+/// stage to that `$match`, which only merges with what follows.
+pub(crate) struct Absorbed {
+    /// The stage as `explain` lists it: the filter it holds as it was
+    /// written when the `$match` reached it unchanged, parsed when the
+    /// optimizer rewrote it on the way (a rename through `$project`, a
+    /// split through `$addFields`); then `allHosts`.
+    pub listed: Document,
+    /// The `$match` that runs right after the stage, when it absorbed one.
+    pub run: Option<Document>,
+    /// The stages after it, not yet reordered.
+    pub rest: Vec<Bson>,
+}
+
+/// [`Absorbed`], from the stages after `$planCacheStats` (desugared).
+pub(crate) fn absorb_matches(mut rest: Vec<Bson>) -> Absorbed {
+    use super::hoist::{as_match, hoist_after_source, PUSHED_MATCH};
+    let mut held: Option<(Document, Document)> = None;
+    // The stage's own first look: a `$match` right after it.
+    if let Some(filter) = rest.first().and_then(as_match).cloned() {
+        rest.remove(0);
+        held = Some((filter.clone(), filter));
+    }
+    // Then each `$match` another stage swaps ahead of itself, in turn.
+    while let Some(at) = rest.iter().position(|s| as_match(s).is_some()) {
+        if at == 0 {
+            break;
+        }
+        let moved = hoist_after_source(&rest[..=at]);
+        let Some(front) = moved.first().and_then(as_match).cloned() else {
+            break;
+        };
+        let pushed = moved[0]
+            .as_document()
+            .is_some_and(|d| d.contains_key(PUSHED_MATCH));
+        let listed = if pushed || Some(&front) == as_match(&rest[at]) {
+            front.clone()
+        } else {
+            super::parsed::parsed_query(&front)
+        };
+        held = Some((listed, front));
+        let mut next: Vec<Bson> = moved[1..].to_vec();
+        next.extend(rest[at + 1..].iter().cloned());
+        rest = next;
+    }
+    let mut spec = Document::new();
+    if let Some((listed, _)) = &held {
+        spec.insert("match", listed.clone());
+    }
+    spec.insert("allHosts", false);
+    Absorbed {
+        listed: doc! { "$planCacheStats": spec },
+        run: held.map(|(_, filter)| doc! { "$match": filter }),
+        rest,
+    }
+}
+
 /// `$planCacheStats`: the collection's cache entries, the latest used first,
 /// those `matched` keeps (a `$match` right after the stage is absorbed into
 /// it and sees the entry before `host` is added), each with this server's
@@ -484,5 +547,45 @@ mod tests {
             ..place()
         };
         assert!(get(&moved, &key).is_none());
+    }
+
+    fn stages(docs: Vec<Document>) -> Vec<Bson> {
+        docs.into_iter().map(Bson::Document).collect()
+    }
+
+    /// RM-466, measured against mongod 8.2.11: the first `$match` is
+    /// absorbed as written, one swapped ahead later replaces it, and one
+    /// right after an absorbed `$match` stays.
+    #[test]
+    fn absorbs_matches_as_mongods_optimizer_does() {
+        let a = absorb_matches(stages(vec![doc! { "$match": { "a": 1 } }]));
+        assert_eq!(
+            a.listed,
+            doc! { "$planCacheStats": { "match": { "a": 1 }, "allHosts": false } }
+        );
+        assert_eq!(a.run, Some(doc! { "$match": { "a": 1 } }));
+        assert!(a.rest.is_empty());
+
+        let a = absorb_matches(stages(vec![
+            doc! { "$match": { "a": 1 } },
+            doc! { "$sort": { "a": 1 } },
+            doc! { "$match": { "b": 1 } },
+        ]));
+        assert_eq!(
+            a.listed,
+            doc! { "$planCacheStats": { "match": { "b": 1 }, "allHosts": false } }
+        );
+        assert_eq!(a.rest, stages(vec![doc! { "$sort": { "a": 1 } }]));
+
+        let a = absorb_matches(stages(vec![
+            doc! { "$match": { "a": 1 } },
+            doc! { "$match": { "b": 2 } },
+        ]));
+        assert_eq!(a.run, Some(doc! { "$match": { "a": 1 } }));
+        assert_eq!(a.rest, stages(vec![doc! { "$match": { "b": 2 } }]));
+
+        let a = absorb_matches(stages(vec![doc! { "$limit": 3 }]));
+        assert_eq!(a.listed, doc! { "$planCacheStats": { "allHosts": false } });
+        assert_eq!(a.run, None);
     }
 }

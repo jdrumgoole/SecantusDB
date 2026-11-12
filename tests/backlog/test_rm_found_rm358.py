@@ -22,11 +22,11 @@ def _explain(client: Any, command: SON) -> dict:
     return {k: reply.get(k) for k in ("stages", "queryShapeHash")}
 
 
-@pytest.mark.backlog("RM-466")
+@pytest.mark.backlog_fixed("RM-466")
 def test_an_explain_of_plan_cache_stats_names_its_stage(rust_mongo: Any, mongod: Any) -> None:
     """mongod 8.2.11 explains `aggregate` of `[{$planCacheStats: {}}]`: its
     `stages` hold the stage with its default (`allHosts: false`), then its
-    `queryShapeHash`. This server's explain fails: it runs the pipeline
+    `queryShapeHash`. This server's explain failed: it ran the pipeline
     against a namespace of its own (`explain.dry.run`), which does not
     exist."""
     command = SON([("aggregate", "c"), ("pipeline", [{"$planCacheStats": {}}]), ("cursor", {})])
@@ -100,4 +100,65 @@ def test_score_fusion_combines_by_avg(rust_mongo: Any, mongod: Any) -> None:
         for s, c in (("mongod", mongod), ("rust", rust_mongo))
     }
     assert answers["mongod"] == {"avg": [2, 1, 0], "average": {"error": 2}}
+    assert answers["rust"] == answers["mongod"]
+
+
+_P = {"$planCacheStats": {}}
+
+
+def _stages(client: Any, coll: str, pipeline: list, verbosity: str) -> Any:
+    db = client["rm_found_rm466_explain"]
+    db.c.insert_one({"x": 1})
+    try:
+        command = SON([("aggregate", coll), ("pipeline", pipeline), ("cursor", {})])
+        reply = db.command("explain", command, verbosity=verbosity)
+    except OperationFailure as e:
+        return {"error": e.code, "errmsg": e.details.get("errmsg")}
+    finally:
+        client.drop_database("rm_found_rm466_explain")
+    return reply.get("stages")
+
+
+@pytest.mark.backlog_fixed("RM-466")
+@pytest.mark.parametrize(
+    ("coll", "pipeline", "verbosity"),
+    [
+        # A `$match` right after the stage is absorbed into it, as written.
+        ("c", [_P, {"$match": {"a": {"$in": [1]}}}], "queryPlanner"),
+        # ... and one that reaches it past a `$project` or a `$sort`.
+        ("c", [_P, {"$project": {"a": 1}}, {"$match": {"a": 1}}], "queryPlanner"),
+        # One rewritten on the way is absorbed parsed.
+        ("c", [_P, {"$project": {"c": "$a"}}, {"$match": {"c": 1}}], "queryPlanner"),
+        ("c", [_P, {"$addFields": {"c": 1}}, {"$match": {"a": 1, "c": 1}}], "queryPlanner"),
+        # A second `$match` right after the first stays where it is.
+        ("c", [_P, {"$match": {"a": 1}}, {"$match": {"b": 2}}], "queryPlanner"),
+        # One that a later stage swaps ahead replaces the one absorbed.
+        (
+            "c",
+            [_P, {"$match": {"a": 1}}, {"$sort": {"a": 1}}, {"$match": {"b": 1}}],
+            "queryPlanner",
+        ),
+        (
+            "c",
+            [_P, {"$sort": {"a": 1}}, {"$match": {"a": 1}}, {"$match": {"b": 1}}],
+            "queryPlanner",
+        ),
+        ("c", [_P, {"$match": {"a": 1}}, {"$limit": 1}, {"$match": {"b": 1}}], "queryPlanner"),
+        # Listed, a missing collection is no matter; run, it is.
+        ("missing", [_P, {"$match": {"a": 1}}], "queryPlanner"),
+        ("missing", [_P], "executionStats"),
+        ("c", [_P, {"$match": {"a": 1}}, {"$limit": 2}], "executionStats"),
+    ],
+)
+def test_an_explain_of_plan_cache_stats_absorbs_matches_as_mongod_does(
+    rust_mongo: Any, mongod: Any, coll: str, pipeline: list, verbosity: str
+) -> None:
+    """mongod 8.2.11's optimizer folds a `$match` into `$planCacheStats`
+    (`match`, ahead of `allHosts`) and replaces it with each later one a
+    stage swaps ahead; `executionStats` of a missing collection fails with
+    50933 and no executor's prefix. The fix for RM-466 lists them so."""
+    answers = {
+        "mongod": _stages(mongod, coll, pipeline, verbosity),
+        "rust": _stages(rust_mongo, coll, pipeline, verbosity),
+    }
     assert answers["rust"] == answers["mongod"]
