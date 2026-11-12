@@ -1589,11 +1589,15 @@ a regression test.
       <> e2.a and e.b like 'v1%'`). Still zeros: such a preserved-side
       conjunct that costs other than its operators (an IN list, a cast of
       a column, a regex match, whose selectivity is RP-423's), and a `<>`
-      whose operands
-      then differ in type (`e.a <> k.a::bigint`, PostgreSQL's `int48ne`,
-      `cost=0.28..11142.50 rows=333000` over `Index Scan using k_pkey on
-      k` `cost=0.28..7.81 rows=332`). (A binary-coercible cast is its
-      own item.) Since 2026-11-12 an inequality with no operand that is
+      no operator takes as its operands' types, which PostgreSQL resolves
+      by coercing one (`e.a <> k.a::numeric` is `(e.a)::numeric <>
+      (a)::numeric`, `cost=0.28..11975.00 rows=331667` over `Index Scan
+      using k_pkey on k` `cost=0.28..8.64 rows=332`). Since 2026-11-12 a
+      `<>` whose operands differ in type through a cross-type operator
+      (`e.a <> k.a::bigint`, `int48ne`), and one between integer columns
+      of two types (`e.a <> h.a`, `h.a` bigint, their common values
+      matched by value), is estimated as one of a single type. (A
+      binary-coercible cast is its own item.) Since 2026-11-12 an inequality with no operand that is
       the indexed side's key (`e.a < k.a + 1`) is the Join Filter over
       that side's plain scan, or the parameterized scan's Filter beside a
       key-to-key bound. Since 2026-11-12 two bounds on the index column
@@ -1606,7 +1610,33 @@ a regression test.
       zeros (`length(e.b) < k.a`, PostgreSQL's Memoize over the Index
       Scan).
       Backlog-ID: RP-354
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[nested loop left join with a cross-type inequality into an index], tests/backlog/test_rp_explain_costs.py::test_plan[nested loop of three relations]
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[nested loop left join with a coerced inequality into an index], tests/backlog/test_rp_explain_costs.py::test_plan[nested loop of three relations]
+- [ ] **EXPLAIN never caches a parameterized inner scan with a
+      Memoize.** A nested loop into an index scan parameterized by an
+      outer side of few distinct values is printed without the Memoize
+      PostgreSQL puts over it, so its cost is the uncached one: PostgreSQL
+      15.19 plans `explain select * from r left join k on r.a < k.a` (`r`
+      1,000 analysed rows of ten values, `k.a` the primary key) as
+      `Nested Loop Left Join (cost=0.29..4256.67 rows=333333 width=11)`
+      over `Memoize (cost=0.29..6.15 rows=333 width=7)` with `Cache Key:
+      r.a` and `Cache Mode: binary` above `Index Scan using k_pkey on k`;
+      here the Index Scan sits directly under the join at
+      `cost=0.28..9487.50`. The LIMIT search builds Memoize paths; the
+      nested-loop estimate (RP-354's) does not. Measured on a private
+      15.19 cluster (found while working RP-354).
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[nested loop into an index under an outer side of few values]
+      Backlog-ID: RP-916
+- [ ] **A comparison of real and double precision prints a cast
+      PostgreSQL does not make.** `real <> double precision` is the
+      cross-type operator `float48ne` (and `<`, `=`, ... likewise), which
+      takes both operands as they are; the plan here coerces the real
+      side first: PostgreSQL 15.19 prints `explain (costs off) select *
+      from fr where r <> f` (`r real`, `f float8`) with `Filter: (r <>
+      f)`, here `Filter: ((r)::double precision <> f)`. The values
+      compared are the same. Measured on a private 15.19 cluster (found
+      while working RP-354).
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[comparison of real and double precision]
+      Backlog-ID: RP-917
 - [ ] **EXPLAIN ANALYZE of a nested loop into an index on an expression
       of the outer row prints no actual rows.** Its estimate is right, but
       the actual-row count of a parameterized inner scan is only worked

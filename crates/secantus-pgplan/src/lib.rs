@@ -149,6 +149,7 @@ pub mod wparser;
 mod xml_catalog;
 mod xml_export;
 mod xml_schema;
+pub use funcsig::binary_operator_result;
 pub use funcsig::category_preferred_of_oid;
 pub use funcsig::is_builtin_function_name as is_known_function;
 pub use funcsig::{select_routine, RoutineChoice};

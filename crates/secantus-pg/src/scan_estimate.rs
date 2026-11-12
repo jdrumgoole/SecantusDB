@@ -657,8 +657,20 @@ impl PgHandler {
                         self.analysed_key(table, field)
                     };
                     let (x, y) = (stats(l)?, stats(r)?);
+                    // Two integer types compare through their cross-type
+                    // operator (`int48ne`): `eqjoinsel` matches their MCVs
+                    // by value, which their shared `int_key` encoding
+                    // does byte for byte. Any other pair of types is not
+                    // estimated.
                     if x.column.pg_type != y.column.pg_type {
-                        return None;
+                        let oid = |k: &AnalysedKey| {
+                            secantus_pgplan::pgtypes::oid_of_name(&k.column.pg_type)
+                        };
+                        let (lt, rt) = (oid(&x)?, oid(&y)?);
+                        let integer = |t: i64| matches!(t, 20 | 21 | 23);
+                        if !(integer(lt) && integer(rt) && ne_operator_exists(lt, rt)) {
+                            return None;
+                        }
                     }
                     fn key(s: &AnalysedKey) -> secantus_pgplan::joincost::KeyStats<'_> {
                         secantus_pgplan::joincost::KeyStats {
@@ -679,7 +691,12 @@ impl PgHandler {
                         ne_operand(self, &key_columns, l)?,
                         ne_operand(self, &key_columns, r)?,
                     );
-                    if x.type_oid != y.type_oid {
+                    // Operands of two types compare through PostgreSQL's
+                    // cross-type operator (`int48ne`) where one takes them
+                    // as they are; one that coerces an operand first
+                    // (`int4 <> numeric`) is not estimated. A cast key has
+                    // no MCV list, so `eqjoinsel` never compares values.
+                    if x.type_oid != y.type_oid && !ne_operator_exists(x.type_oid, y.type_oid) {
                         return None;
                     }
                     let eq = secantus_pgplan::joincost::eqjoinsel_inner(&x.stats(), &y.stats());
@@ -3786,6 +3803,22 @@ impl PgHandler {
 }
 
 #[cfg(test)]
+mod ne_operator_tests {
+    use super::ne_operator_exists;
+
+    /// `pg_operator` has `<>` over two integer types and over real and
+    /// double precision as they are; `int4 <> numeric` coerces first.
+    #[test]
+    fn cross_type_not_equal_operators() {
+        assert!(ne_operator_exists(23, 20)); // int48ne
+        assert!(ne_operator_exists(20, 21)); // int82ne
+        assert!(ne_operator_exists(700, 701)); // float48ne
+        assert!(!ne_operator_exists(23, 1700));
+        assert!(!ne_operator_exists(23, 25));
+    }
+}
+
+#[cfg(test)]
 mod unique_tests {
     use super::{hashed_distinct_estimate, sort_estimate, unique_estimate};
 
@@ -4796,6 +4829,19 @@ impl NeOperand {
             (selec, k.null_frac)
         };
         (1.0 - selec - null_frac).clamp(0.0, 1.0)
+    }
+}
+
+/// Does a built-in `<>` take a left operand of type `l` and a right one of
+/// type `r` exactly, both built-in oids -- a cross-type operator such as
+/// `int48ne` that `oper_select_candidate` picks with no coercion?
+fn ne_operator_exists(l: i64, r: i64) -> bool {
+    use secantus_pgplan::pgtypes::name_of_oid;
+    match (name_of_oid(l), name_of_oid(r)) {
+        (Some(l), Some(r)) => {
+            secantus_pgplan::binary_operator_result("<>", l, r).is_some_and(|t| t == "bool")
+        }
+        _ => false,
     }
 }
 

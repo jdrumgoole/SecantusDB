@@ -61,6 +61,20 @@ _ANALYSED_STRINGS = _ANALYSED + [
     "analyze m",
 ]
 
+# Those, and integer columns of other types: unique bigint and smallint,
+# and a few repeated values of int and bigint (RP-354).
+_ANALYSED_INTS = _ANALYSED + [
+    "create table h (a bigint, s smallint)",
+    "insert into h select g, g from generate_series(1, 1000) g",
+    "create table r (a int)",
+    "insert into r select g % 10 from generate_series(1, 1000) g",
+    "create table r8 (a bigint, s smallint)",
+    "insert into r8 select g % 7, g % 13 from generate_series(1, 1000) g",
+    "analyze h",
+    "analyze r",
+    "analyze r8",
+]
+
 # Those, a ten-row table analysed and one never analysed (RP-329).
 _ANALYSED_SMALL = _ANALYSED + [
     "create table zs (a int, b text)",
@@ -1534,9 +1548,12 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "        Index Cond: (a > (e.a + 1))",
         ],
     ),
-    # A `<>` whose operands differ in type after a cast (`int48ne`).
+    # Split from RP-354 and fixed: a `<>` whose operands differ in type
+    # after a cast compares through PostgreSQL's cross-type operator
+    # (`int48ne`), its cast operand an expression with no statistics;
+    # before, the nested loop printed zeros.
     "nested loop left join with a cross-type inequality into an index": (
-        "RP-354",
+        "RP-329",
         _ANALYSED,
         "explain select * from e left join k on e.a < k.a and e.a <> k.a::bigint",
         [
@@ -1545,6 +1562,123 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "  ->  Index Scan using k_pkey on k  (cost=0.28..7.81 rows=332 width=7)",
             "        Index Cond: (a > e.a)",
             "        Filter: (e.a <> (a)::bigint)",
+        ],
+    ),
+    "nested loop left join with a narrowing cast's inequality into an index": (
+        "RP-329",
+        _ANALYSED,
+        "explain select * from e left join k on e.a < k.a and e.a::smallint <> k.a",
+        [
+            "Nested Loop Left Join  (cost=0.28..11152.50 rows=333000 width=14)",
+            "  ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
+            "  ->  Index Scan using k_pkey on k  (cost=0.28..7.81 rows=333 width=7)",
+            "        Index Cond: (a > e.a)",
+            "        Filter: ((e.a)::smallint <> a)",
+        ],
+    ),
+    "nested loop with a cross-type inequality": (
+        "RP-329",
+        _ANALYSED,
+        "explain select * from e, e e2 where e.a <> e2.a::bigint",
+        [
+            "Nested Loop  (cost=0.00..17532.50 rows=999000 width=14)",
+            "  Join Filter: (e.a <> (e2.a)::bigint)",
+            "  ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
+            "  ->  Materialize  (cost=0.00..20.00 rows=1000 width=7)",
+            "        ->  Seq Scan on e e2  (cost=0.00..15.00 rows=1000 width=7)",
+        ],
+    ),
+    # Split from RP-354 and fixed: two integer columns of different types
+    # compare through the cross-type operator, `eqjoinsel` over both
+    # columns' statistics, their common values matched by value.
+    "nested loop over integer columns of two types": (
+        "RP-329",
+        _ANALYSED_INTS,
+        "explain select * from e, h where e.a <> h.a",
+        [
+            "Nested Loop  (cost=0.00..15033.50 rows=999000 width=17)",
+            "  Join Filter: (e.a <> h.a)",
+            "  ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
+            "  ->  Materialize  (cost=0.00..21.00 rows=1000 width=10)",
+            "        ->  Seq Scan on h  (cost=0.00..16.00 rows=1000 width=10)",
+        ],
+    ),
+    "nested loop left join over integer columns of two types": (
+        "RP-329",
+        _ANALYSED_INTS,
+        "explain select * from e left join h on e.a <> h.s",
+        [
+            "Nested Loop Left Join  (cost=0.00..15033.50 rows=999000 width=17)",
+            "  Join Filter: (e.a <> h.s)",
+            "  ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
+            "  ->  Materialize  (cost=0.00..21.00 rows=1000 width=10)",
+            "        ->  Seq Scan on h  (cost=0.00..16.00 rows=1000 width=10)",
+        ],
+    ),
+    "nested loop over common values of two integer types": (
+        "RP-329",
+        _ANALYSED_INTS,
+        "explain select * from r, r8 where r.a <> r8.a",
+        [
+            "Nested Loop  (cost=0.00..15033.50 rows=900000 width=14)",
+            "  Join Filter: (r.a <> r8.a)",
+            "  ->  Seq Scan on r  (cost=0.00..15.00 rows=1000 width=4)",
+            "  ->  Materialize  (cost=0.00..21.00 rows=1000 width=10)",
+            "        ->  Seq Scan on r8  (cost=0.00..16.00 rows=1000 width=10)",
+        ],
+    ),
+    "nested loop left join over integer columns of two types into an index": (
+        "RP-329",
+        _ANALYSED_INTS,
+        "explain select * from h left join k on h.a < k.a and h.s <> k.a",
+        [
+            "Nested Loop Left Join  (cost=0.28..10321.00 rows=333000 width=17)",
+            "  ->  Seq Scan on h  (cost=0.00..16.00 rows=1000 width=10)",
+            "  ->  Index Scan using k_pkey on k  (cost=0.28..6.98 rows=333 width=7)",
+            "        Index Cond: (a > h.a)",
+            "        Filter: (h.s <> a)",
+        ],
+    ),
+    # Still open: a `<>` no operator takes as its operands' types is
+    # resolved by coercing one (`int4 <> numeric` is `numeric <> numeric`),
+    # the coerced column an expression with its cast priced.
+    "nested loop left join with a coerced inequality into an index": (
+        "RP-354",
+        _ANALYSED,
+        "explain select * from e left join k on e.a < k.a and e.a <> k.a::numeric",
+        [
+            "Nested Loop Left Join  (cost=0.28..11975.00 rows=331667 width=14)",
+            "  ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
+            "  ->  Index Scan using k_pkey on k  (cost=0.28..8.64 rows=332 width=7)",
+            "        Index Cond: (a > e.a)",
+            "        Filter: ((e.a)::numeric <> (a)::numeric)",
+        ],
+    ),
+    # Still open: a parameterized index scan under an outer side with few
+    # distinct values is cached by a Memoize.
+    "nested loop into an index under an outer side of few values": (
+        "RP-916",
+        _ANALYSED_INTS,
+        "explain select * from r left join k on r.a < k.a",
+        [
+            "Nested Loop Left Join  (cost=0.29..4256.67 rows=333333 width=11)",
+            "  ->  Seq Scan on r  (cost=0.00..15.00 rows=1000 width=4)",
+            "  ->  Memoize  (cost=0.29..6.15 rows=333 width=7)",
+            "        Cache Key: r.a",
+            "        Cache Mode: binary",
+            "        ->  Index Scan using k_pkey on k  (cost=0.28..6.14 rows=333 width=7)",
+            "              Index Cond: (a > r.a)",
+        ],
+    ),
+    # Still open: a comparison of real and double precision is the
+    # cross-type operator (`float48ne`), printed with no cast.
+    "comparison of real and double precision": (
+        "RP-917",
+        ["create table fr (r real, f float8)"],
+        "explain (costs off) select * from fr where r <> f",
+        [
+            "Seq Scan on fr",
+            "  Filter: (r <> f)",
         ],
     ),
     # Split from RP-354 and fixed: an ON conjunct over the preserved side
