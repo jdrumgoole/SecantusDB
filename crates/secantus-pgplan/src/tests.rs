@@ -4477,6 +4477,111 @@ fn a_subquery_target_is_named_as_written() {
 }
 
 #[test]
+fn an_aggregate_clause_on_a_plain_function_is_42809() {
+    // Without OVER, `ParseFuncOrColumn` refuses the same clauses on a plain
+    // function (RP-868); each of these answered the plain call. Answers
+    // measured on PostgreSQL 15.19.
+    let not_agg =
+        |clause: &str, f: &str| format!("{clause} specified, but {f} is not an aggregate function");
+    for (q, want, at) in [
+        (
+            "select upper(distinct 'a')",
+            not_agg("DISTINCT", "upper"),
+            7,
+        ),
+        (
+            "select upper('a' order by 1)",
+            not_agg("ORDER BY", "upper"),
+            7,
+        ),
+        (
+            "select upper('a') filter (where true)",
+            not_agg("FILTER", "upper"),
+            7,
+        ),
+        (
+            "select upper(distinct 'a') filter (where true)",
+            not_agg("DISTINCT", "upper"),
+            7,
+        ),
+        (
+            "select pg_catalog.upper(distinct 'a')",
+            not_agg("DISTINCT", "pg_catalog.upper"),
+            7,
+        ),
+        (
+            "select now(*)",
+            "now(*) specified, but now is not an aggregate function".to_string(),
+            7,
+        ),
+        ("select abs(distinct -1)", not_agg("DISTINCT", "abs"), 7),
+        (
+            "select id, lower(name order by name) from t",
+            not_agg("ORDER BY", "lower"),
+            11,
+        ),
+        (
+            "select 1 where upper('a') filter (where true) = 'A'",
+            not_agg("FILTER", "upper"),
+            15,
+        ),
+        (
+            "select (select lower('a' order by 1))",
+            not_agg("ORDER BY", "lower"),
+            15,
+        ),
+        (
+            "select 1 order by upper('a') filter (where true)",
+            not_agg("FILTER", "upper"),
+            18,
+        ),
+    ] {
+        let _ = take_error_location();
+        let err = analysed(q).expect_err(q);
+        assert!(
+            matches!(&err, Error::Sqlstate("42809", m) if *m == want),
+            "{q}: {err:?}"
+        );
+        assert_eq!(take_error_location(), Some(at), "{q}");
+    }
+    // WITHIN GROUP's items count as the call's arguments: `left` takes
+    // `(unknown, integer)`, `upper` does not (42883, which the planner
+    // would answer over `upper('a')` alone).
+    let err = analysed("select left('a') within group (order by 1)").expect_err("left");
+    assert!(
+        matches!(&err, Error::Sqlstate("42809", m)
+            if m == "WITHIN GROUP specified, but left is not an aggregate function"),
+        "{err:?}"
+    );
+    let _ = take_error_location();
+    let err = analysed("select upper('a') within group (order by 1)").expect_err("upper");
+    assert!(
+        matches!(&err, Error::UndefinedFunction(m)
+            if m == "function upper(unknown, integer) does not exist"),
+        "{err:?}"
+    );
+    assert_eq!(take_error_location(), Some(7));
+    // A call no function takes is the planner's 42883 first, as without
+    // the clause.
+    for q in [
+        "select upper(distinct 1)",
+        "select nosuch(distinct 1)",
+        "select upper(*)",
+    ] {
+        let err = analysed(q).expect_err(q);
+        assert!(!matches!(&err, Error::Sqlstate("42809", _)), "{q}: {err:?}");
+    }
+    // The aggregates themselves are untouched.
+    for q in [
+        "select count(distinct id) from t",
+        "select string_agg(name, ',' order by name) from t",
+        "select count(*) filter (where id > 1) from t",
+    ] {
+        analysed(q).expect(q);
+    }
+}
+
+#[test]
 fn over_on_a_plain_function_is_42809_after_the_call_resolves() {
     // `ParseFuncOrColumn` resolves the arguments and the function, then
     // refuses an aggregate-only clause on a plain function, first one first

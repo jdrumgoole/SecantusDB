@@ -14905,7 +14905,7 @@ fn plan_window_call(
 /// Is `name` one of PostgreSQL 15.19's own aggregates or window functions,
 /// in any overload (`SELECT DISTINCT proname FROM pg_proc WHERE prokind IN
 /// ('a', 'w') AND oid < 16384`)? No name there is also a plain function's.
-fn is_builtin_aggregate_or_window(name: &str) -> bool {
+pub(crate) fn is_builtin_aggregate_or_window(name: &str) -> bool {
     static SET: std::sync::OnceLock<std::collections::HashSet<&'static str>> =
         std::sync::OnceLock::new();
     SET.get_or_init(|| {
@@ -14923,10 +14923,8 @@ fn is_builtin_aggregate_or_window(name: &str) -> bool {
 /// An aggregate or window function PostgreSQL has (`stddev(v) over ()`) is a
 /// gap in this server, 0A000. Anything else is `ParseFuncOrColumn`'s: the
 /// arguments and the function are resolved first, so a call no function
-/// takes is 42883, then a plain function is 42809 for the first clause only
-/// an aggregate or window function may carry, in PostgreSQL's order
-/// (`(*)`, DISTINCT, WITHIN GROUP, ORDER BY, FILTER, OVER), naming the
-/// function as written (`NameListToString`: `pg_catalog.upper`).
+/// takes is 42883, then a plain function is 42809
+/// ([`not_an_aggregate_function`]).
 fn over_on_unplanned_function(
     f: &pg_query::protobuf::FuncCall,
     name: &str,
@@ -14960,6 +14958,15 @@ fn over_on_unplanned_function(
     if let Err(e) = plan_table_targets(std::slice::from_ref(&target), def, params) {
         return e;
     }
+    not_an_aggregate_function(f)
+}
+
+/// `ParseFuncOrColumn`'s 42809 for a call that resolved to a plain
+/// function: the first clause only an aggregate or window function may
+/// carry, in PostgreSQL's order (`(*)`, DISTINCT, WITHIN GROUP, ORDER BY,
+/// FILTER, OVER), naming the function as written (`NameListToString`:
+/// `pg_catalog.upper`), at the call.
+pub(crate) fn not_an_aggregate_function(f: &pg_query::protobuf::FuncCall) -> Error {
     let written = f
         .funcname
         .iter()

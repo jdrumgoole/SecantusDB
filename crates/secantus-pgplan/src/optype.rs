@@ -2259,6 +2259,7 @@ fn walk(n: &pg_query::protobuf::Node, scope: &Scope, cx: &Cx) -> Result<()> {
                 walk(a, scope, cx)?;
             }
             regclass::arguments(f, scope)?;
+            aggregate_clause_on_plain_function(f, scope)?;
         }
         // A FROM subquery sees the outer query only when it is LATERAL.
         N::RangeSubselect(rs) => {
@@ -2277,6 +2278,88 @@ fn walk(n: &pg_query::protobuf::Node, scope: &Scope, cx: &Cx) -> Result<()> {
         _ => regclass::scan(n, scope)?,
     }
     Ok(())
+}
+
+/// `ParseFuncOrColumn` refuses an aggregate-only clause -- `(*)`, DISTINCT,
+/// WITHIN GROUP, ORDER BY, FILTER -- on a call that resolves to a plain
+/// function, 42809 (RP-868); the planner read past them and answered the
+/// plain call (`select upper(distinct 'a')` was `A`). The function is
+/// resolved first, so a call no function takes stays the planner's 42883:
+/// a name that is neither a built-in nor a user function, a built-in whose
+/// overloads none take the argument types (WITHIN GROUP's ORDER BY items
+/// counting as arguments), or a schema-qualified name outside `pg_catalog`
+/// that no user function answers. A WITHIN GROUP call no built-in takes is
+/// that 42883 here, since the planner would drop the items and answer
+/// over the direct arguments (`upper('a') within group (order by 1)` is
+/// `function upper(unknown, integer) does not exist`). OVER is the window
+/// planner's (RP-682).
+fn aggregate_clause_on_plain_function(
+    f: &pg_query::protobuf::FuncCall,
+    scope: &Scope,
+) -> Result<()> {
+    if f.over.is_some()
+        || !(f.agg_star
+            || f.agg_distinct
+            || f.agg_within_group
+            || !f.agg_order.is_empty()
+            || f.agg_filter.is_some())
+    {
+        return Ok(());
+    }
+    let Some(name) = func_name(f) else {
+        return Ok(());
+    };
+    if crate::is_builtin_aggregate_or_window(&name) || crate::user_agg::is_user_aggregate(&name) {
+        return Ok(());
+    }
+    if !correlated::user_function_named(&name) {
+        let schema = match f.funcname.as_slice() {
+            [_] => None,
+            [s, _] => match s.node.as_ref() {
+                Some(N::String(s)) => Some(s.sval.as_str()),
+                _ => return Ok(()),
+            },
+            _ => return Ok(()),
+        };
+        if schema.is_some_and(|s| s != "pg_catalog")
+            || !crate::funcsig::is_builtin_function_name(&name)
+        {
+            return Ok(());
+        }
+        let mut call = f.clone();
+        if f.agg_within_group {
+            call.args
+                .extend(f.agg_order.iter().filter_map(|o| match o.node.as_ref() {
+                    Some(N::SortBy(b)) => b.node.as_deref().cloned(),
+                    _ => None,
+                }));
+        }
+        if let Some(types) = call_arg_types(&call, scope) {
+            if crate::funcsig::resolves(&name, &types) == Some(false) {
+                if !f.agg_within_group {
+                    return Ok(());
+                }
+                // The planner would drop the WITHIN GROUP items and answer
+                // the call over its direct arguments alone.
+                set_error_location(f.location);
+                return Err(Error::UndefinedFunction(format!(
+                    "function {name}({}) does not exist",
+                    types
+                        .iter()
+                        .map(|t| {
+                            if t.is_empty() {
+                                "unknown".to_string()
+                            } else {
+                                crate::display_type(t)
+                            }
+                        })
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )));
+            }
+        }
+    }
+    Err(crate::not_an_aggregate_function(f))
 }
 
 /// `(expr).field` or `(expr).*` over a value of a base type is refused when

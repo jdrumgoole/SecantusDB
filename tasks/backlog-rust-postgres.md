@@ -2550,16 +2550,6 @@ numeric(5,2), ca char(3)[])` holding `('xy', 'ab', 2.5, '{a,bc}')`.
 Measured on PostgreSQL 15.19 (the shared reference on port 5415) with the
 VALUES-only statements of `tests/backlog/test_rp_found_rp682.py`.
 
-- [ ] **DISTINCT, ORDER BY or FILTER on a plain function call is accepted
-      and ignored.** `select upper(distinct 'a')`, `select upper('a' order
-      by 1)` and `select upper('a') filter (where true)` are each 42809
-      `<clause> specified, but upper is not an aggregate function` on
-      PostgreSQL 15.19 (`ParseFuncOrColumn`); here each answers `A`. Since
-      RP-682 the same clauses under OVER are refused in PostgreSQL's order;
-      without OVER the plain-call path never looks at them.
-      Verify: tests/backlog/test_rp_found_rp682.py::test_an_aggregate_clause_on_a_plain_function_is_42809
-      Backlog-ID: RP-868
-
 - [ ] **An ordered-set aggregate under OVER is not refused as
       PostgreSQL refuses it.** `select rank(1) over ()` is 42809 `WITHIN
       GROUP is required for ordered-set aggregate rank` on PostgreSQL 15.19
