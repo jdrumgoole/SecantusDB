@@ -700,16 +700,15 @@ These are explicit non-goals. Don't add them without a reason.
       (`secantus_core::sorter::count_members`). Found 2026-11-09 (RM-375).
       Verify: tests/backlog/test_rm_found_rm375.py::test_a_sort_of_index_keys_past_its_budget_spills
       Backlog-ID: RM-475
-- [ ] **`explain` sizes a SORT of index keys as documents.** mongod
-      8.2.11's `executionStats` of a SORT below a FETCH counts each member
-      as its execution does (its sort key, its index key and 32 bytes: 780
-      for twelve `{y, x}` keys, whatever the documents hold). This
-      server's `explain` (`exec.rs` / `trial.rs`'s `sort_stats`) sizes the
-      documents behind the keys, as a sort of documents counts: 1440 over
-      documents with a 50-byte pad. A profile entry's `execStats` count as
-      mongod's (RM-375). Found 2026-11-09 (RM-375).
-      Verify: tests/backlog/test_rm_found_rm375.py::test_an_explained_sort_of_index_keys_counts_its_members
-      Backlog-ID: RM-476
+- [ ] **An `$or` of one index sorts documents, not index keys.** mongod
+      8.2.11 answers `find({$or: [{y: 0}, {y: {$gt: 1}}]}).sort({x: 1})`
+      over `{y: 1, x: 1}` with one two-interval IXSCAN whose keys it sorts
+      below the FETCH (`SUBPLAN <- FETCH <- SORT <- IXSCAN`, `type:
+      "default"`, 520 counted for eight members). This server sorts the
+      fetched documents above the FETCH (`simple`, 480). Found 2026-11-12
+      (RM-476).
+      Verify: tests/backlog/test_rm_found_rm476.py::test_an_or_of_one_index_sorts_its_keys
+      Backlog-ID: RM-557
 - [ ] **A sort beside a multikey field sorts documents, not index keys.**
       mongod 8.2.11 plans `find({y: {$gte: 0}}).sort({x: 1})` over `{y: 1,
       x: 1}`, `y` multikey and `x` not, as a SORT of index keys below the
@@ -746,10 +745,9 @@ These are explicit non-goals. Don't add them without a reason.
       "default"`) counts 1584 bytes sorted for the twelve `{x}` members of
       `find({y: {$gte: 0}}, {_id: 0, x: 1}).sort({x: 1})`, in `explain`
       and in a profile entry's `execStats`: its working-set members, not
-      the projected documents. This server counts 528 in `explain` (the
-      projected documents) and 780 in the profile entry (members of their
-      index keys, as its sort of keys below a FETCH counts them since
-      RM-375). Found 2026-11-09 (RM-373).
+      the projected documents. This server counts 780 in both (members of
+      their index keys, as its sort of keys below a FETCH counts them since
+      RM-375, and its `explain` since RM-476). Found 2026-11-09 (RM-373).
       Verify: tests/backlog/test_rm_found_2026_11_09_rm373.py::test_a_sort_over_a_covered_projection_counts_what_it_sorted
       Backlog-ID: RM-473
 - [ ] **Some lines have no `numInterruptChecks`.** Since 2026-11-08 this

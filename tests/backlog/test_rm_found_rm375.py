@@ -183,15 +183,59 @@ def _explained(client: Any) -> Any:
     return stage.get("type"), stage.get("totalDataSizeSorted")
 
 
-@pytest.mark.backlog("RM-476")
+def _sorts(stats: Any) -> list:
+    """The `type` and `totalDataSizeSorted` of each SORT in a plan's stats."""
+    out = []
+    while isinstance(stats, dict):
+        if stats.get("stage") == "SORT":
+            out.append((stats.get("type"), stats.get("totalDataSizeSorted")))
+        stats = stats.get("inputStage")
+    return out
+
+
+def _explained_shapes(client: Any) -> dict:
+    """Each of `_SHAPES`' SORTs as `explain` counts it: in `executionStats`,
+    and in `allPlansExecution` beside a competing `{x: 1}` index, whose
+    trial runs the SORT plan too."""
+    db = client["rm_found_rm375_shapes"]
+    out = {}
+    try:
+        for name, (docs, keys, command, _) in _SHAPES.items():
+            db.drop_collection("c")
+            db.c.insert_many(docs)
+            db.c.create_index(keys)
+            explain = {"find": "c", **command}
+            e = db.command("explain", explain, verbosity="executionStats")
+            out[name] = _sorts(e["executionStats"]["executionStages"])
+            db.c.create_index([("x", 1)])
+            e = db.command("explain", explain, verbosity="allPlansExecution")
+            out[f"{name}, trial"] = [
+                s
+                for plan in e["executionStats"]["allPlansExecution"]
+                for s in _sorts(plan.get("executionStages"))
+            ]
+    finally:
+        client.drop_database("rm_found_rm375_shapes")
+    return out
+
+
+@pytest.mark.backlog_fixed("RM-476")
 def test_an_explained_sort_of_index_keys_counts_its_members(rust_mongo: Any, mongod: Any) -> None:
     """mongod 8.2.11's `explain` of a SORT of index keys counts its members
     as its execution does: 780 for twelve `{y, x}` keys, whatever the
-    documents hold. This server's `explain` sizes the documents behind the
-    keys, as a sort of documents counts (1440 with a 50-byte pad)."""
+    documents hold, and each of `_SHAPES` as its profile entry counts it,
+    in `executionStats` and in an `allPlansExecution` trial. This server's
+    `explain` sized the documents behind the keys, as a sort of documents
+    counts (1440 with a 50-byte pad), until RM-476."""
     answers = {"mongod": _explained(mongod), "rust": _explained(rust_mongo)}
     assert answers["mongod"] == ("default", 780)
     assert answers["rust"] == answers["mongod"]
+    shapes = {"mongod": _explained_shapes(mongod), "rust": _explained_shapes(rust_mongo)}
+    # The trial counts a limit's SORT before it has sorted: none.
+    assert shapes["mongod"]["limit 3"] == [("default", 195)]
+    assert shapes["mongod"]["limit 3, trial"] == [("default", 0)]
+    assert shapes["mongod"]["string"] == [("default", 1588)]
+    assert shapes["rust"] == shapes["mongod"]
 
 
 @pytest.mark.backlog("RM-477")
