@@ -1526,7 +1526,7 @@ fn is_write_concern_command(name: &str) -> bool {
 /// `[0, 50]` → `FailedToParse` (9). `None` when absent or well-formed. (`w > 1`
 /// and an unknown tag still succeed with a `writeConcernError` attached — see
 /// `attach_write_concern_error`.)
-fn validate_write_concern(doc: &Document, command: &str) -> Option<CommandError> {
+pub(crate) fn validate_write_concern(doc: &Document, command: &str) -> Option<CommandError> {
     let wc = match doc.get("writeConcern") {
         // An explicit `writeConcern: null` is ACCEPTED — the BSON-field family's
         // null-means-absent rule. This used to reject it.

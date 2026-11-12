@@ -357,16 +357,6 @@ These are explicit non-goals. Don't add them without a reason.
     `TestCausalConsistency_Supported` (29/29 passed). Re-include them.
   - Rust's `diagnostics::ok_transaction` ("no-op commit/abort") is dead code
     that nothing dispatches to.
-- [ ] **`aggregate` ignores a mistyped `writeConcern` or
-      `bypassDocumentValidation`.** mongod 8.2.11 type-checks both in its
-      parse of the command: `writeConcern: 5` is 14 "BSON field
-      'aggregate.writeConcern' is the wrong type 'int', expected type
-      'object'", `bypassDocumentValidation: "a"` is 14 with the type list
-      "[decimal, bool, double, long, int]". This server answers ok to both.
-      Both belong in `aggregate()`'s document-order field pass, as RM-431
-      left it. Found 2026-11-09 working RM-431.
-      Verify: tests/backlog/test_rm_aggregate_parse.py::test_aggregate_type_checks_write_concern_and_bypass
-      Backlog-ID: RM-463
 - [ ] **A non-string, non-number `aggregate` namespace is BadValue, not
       InvalidNamespace.** mongod 8.2.11 answers `{aggregate: true, pipeline:
       [], cursor: {}}` (and `null`, `{}`) with 73 "Collection name has invalid

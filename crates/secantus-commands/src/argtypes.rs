@@ -233,6 +233,19 @@ pub fn require_bool_field(doc: &Document, field: &str, path: &str) -> Result<(),
 /// `upsert: 1.5` are valid, while the neighbouring `update.updates.multi`
 /// rejects `multi: 1`. Two adjacent boolean-looking slots, two rules.
 pub fn require_bool_or_number(doc: &Document, field: &str, path: &str) -> Result<(), CommandError> {
+    require_bool_or_number_listing(doc, field, path, BOOL_OR_NUMBER_TYPES)
+}
+
+/// [`require_bool_or_number`] for a field whose wrong-type message lists the
+/// types in an order of its own: mongod's order is per field, not one rule
+/// (`aggregate.bypassDocumentValidation` is `'[decimal, bool, double, long,
+/// int]'`, measured 8.2.11, 2026-11-12). `types` is quoted as mongod quotes it.
+pub fn require_bool_or_number_listing(
+    doc: &Document,
+    field: &str,
+    path: &str,
+    types: &str,
+) -> Result<(), CommandError> {
     match doc.get(field) {
         None
         | Some(Bson::Null)
@@ -242,7 +255,7 @@ pub fn require_bool_or_number(doc: &Document, field: &str, path: &str) -> Result
         | Some(Bson::Double(_))
         | Some(Bson::Decimal128(_)) => Ok(()),
         Some(v) => Err(type_mismatch(format!(
-            "BSON field '{path}' is the wrong type '{}', expected types {BOOL_OR_NUMBER_TYPES}",
+            "BSON field '{path}' is the wrong type '{}', expected types {types}",
             bson_type_name(v)
         ))),
     }

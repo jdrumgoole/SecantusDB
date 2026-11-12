@@ -156,6 +156,22 @@ pub fn aggregate(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
             "let" => argtypes::require_object(doc, "let", "aggregate.let")?,
             "collation" => argtypes::require_object(doc, "collation", "aggregate.collation")?,
             "readConcern" => argtypes::require_object(doc, "readConcern", "aggregate.readConcern")?,
+            // Both are part of the field pass on mongod, whatever the pipeline
+            // writes (RM-463): `writeConcern` is parsed as a whole
+            // `WriteConcernOptions` here, its inner fields included, and
+            // `bypassDocumentValidation` takes a bool or any number. Both
+            // used to be ignored, and a mistyped one answered ok.
+            "writeConcern" => {
+                if let Some(e) = crate::validate_write_concern(doc, "aggregate") {
+                    return Err(e);
+                }
+            }
+            "bypassDocumentValidation" => argtypes::require_bool_or_number_listing(
+                doc,
+                "bypassDocumentValidation",
+                "aggregate.bypassDocumentValidation",
+                "'[decimal, bool, double, long, int]'",
+            )?,
             "hint" => argtypes::require_hint(doc, "hint")?,
             // The `Field '<name>' should be a boolean value` family, which
             // rejects an explicit null -- not the BSON-field family above.

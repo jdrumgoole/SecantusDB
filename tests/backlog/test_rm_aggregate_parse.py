@@ -26,14 +26,14 @@ _MISTYPED = [
 ]
 
 
-@pytest.mark.backlog("RM-463")
+@pytest.mark.backlog_fixed("RM-463")
 @pytest.mark.parametrize("command", _MISTYPED, ids=[repr(c) for c in _MISTYPED])
 def test_aggregate_type_checks_write_concern_and_bypass(
     rust_mongo: Any, mongod: Any, command: list
 ) -> None:
     """mongod refuses a non-object `writeConcern` and a non-bool-or-number
-    `bypassDocumentValidation` on `aggregate` (14); this server ignores both
-    and answers ok."""
+    `bypassDocumentValidation` on `aggregate` (14); this server ignored both
+    and answered ok, until RM-463 parsed them in the field pass."""
     assert _answer(rust_mongo, command) == _answer(mongod, command)
 
 
