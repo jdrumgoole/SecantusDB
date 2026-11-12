@@ -75,6 +75,14 @@ _ANALYSED_INTS = _ANALYSED + [
     "analyze r8",
 ]
 
+# Those, and 500 rows of a double precision column beside an integer one
+# (RP-354).
+_ANALYSED_FLOAT = _ANALYSED + [
+    "create table f (x float8, y int)",
+    "insert into f select g, g from generate_series(1, 500) g",
+    "analyze f",
+]
+
 # Those, a ten-row table analysed and one never analysed (RP-329).
 _ANALYSED_SMALL = _ANALYSED + [
     "create table zs (a int, b text)",
@@ -1639,11 +1647,13 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "        Filter: (h.s <> a)",
         ],
     ),
-    # Still open: a `<>` no operator takes as its operands' types is
-    # resolved by coercing one (`int4 <> numeric` is `numeric <> numeric`),
-    # the coerced column an expression with its cast priced.
+    # Split from RP-354 and fixed: a `<>` no operator takes as its
+    # operands' types is resolved by coercing one (`int4 <> numeric` is
+    # `numeric <> numeric`), the coerced column an expression with no
+    # statistics and its cast's function one call a row; before, the
+    # nested loop printed zeros.
     "nested loop left join with a coerced inequality into an index": (
-        "RP-354",
+        "RP-329",
         _ANALYSED,
         "explain select * from e left join k on e.a < k.a and e.a <> k.a::numeric",
         [
@@ -1652,6 +1662,86 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "  ->  Index Scan using k_pkey on k  (cost=0.28..8.64 rows=332 width=7)",
             "        Index Cond: (a > e.a)",
             "        Filter: ((e.a)::numeric <> (a)::numeric)",
+        ],
+    ),
+    # IS DISTINCT FROM resolves its `=` the same way (`make_distinct_op`).
+    "nested loop left join with a coerced is distinct from into an index": (
+        "RP-329",
+        _ANALYSED,
+        "explain select * from e left join k on e.a < k.a and e.a is distinct from k.a::numeric",
+        [
+            "Nested Loop Left Join  (cost=0.28..11975.00 rows=331667 width=14)",
+            "  ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
+            "  ->  Index Scan using k_pkey on k  (cost=0.28..8.64 rows=332 width=7)",
+            "        Index Cond: (a > e.a)",
+            "        Filter: ((e.a)::numeric IS DISTINCT FROM (a)::numeric)",
+        ],
+    ),
+    # A cast operand coerced again: two calls a row on that side.
+    "nested loop left join with a cast operand coerced again": (
+        "RP-329",
+        _ANALYSED,
+        "explain select * from e left join k on e.a < k.a and e.a::bigint <> k.a::numeric",
+        [
+            "Nested Loop Left Join  (cost=0.28..12807.50 rows=331667 width=14)",
+            "  ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
+            "  ->  Index Scan using k_pkey on k  (cost=0.28..9.47 rows=332 width=7)",
+            "        Index Cond: (a > e.a)",
+            "        Filter: (((e.a)::bigint)::numeric <> (a)::numeric)",
+        ],
+    ),
+    "nested loop with a coerced inequality": (
+        "RP-329",
+        _ANALYSED,
+        "explain select * from e, k where e.a <> k.a::numeric",
+        [
+            "Nested Loop  (cost=0.00..20032.50 rows=995000 width=14)",
+            "  Join Filter: ((e.a)::numeric <> (k.a)::numeric)",
+            "  ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
+            "  ->  Materialize  (cost=0.00..20.00 rows=1000 width=7)",
+            "        ->  Seq Scan on k  (cost=0.00..15.00 rows=1000 width=7)",
+        ],
+    ),
+    # Two bare columns with no operator between their types: the integer
+    # one is coerced (`float8ne`), the double precision one keeps its
+    # statistics.
+    "nested loop over an integer and a double precision column": (
+        "RP-329",
+        _ANALYSED_FLOAT,
+        "explain select * from e, f where e.a <> f.x",
+        [
+            "Nested Loop  (cost=0.00..8774.25 rows=499000 width=19)",
+            "  Join Filter: ((e.a)::double precision <> f.x)",
+            "  ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
+            "  ->  Materialize  (cost=0.00..10.50 rows=500 width=12)",
+            "        ->  Seq Scan on f  (cost=0.00..8.00 rows=500 width=12)",
+        ],
+    ),
+    "nested loop left join coercing the indexed side's key": (
+        "RP-329",
+        _ANALYSED_FLOAT,
+        "explain select * from f left join k on f.y < k.a and f.x <> k.a",
+        [
+            "Nested Loop Left Join  (cost=0.28..5591.75 rows=166333 width=19)",
+            "  ->  Seq Scan on f  (cost=0.00..8.00 rows=500 width=12)",
+            "  ->  Index Scan using k_pkey on k  (cost=0.28..7.85 rows=332 width=7)",
+            "        Index Cond: (a > f.y)",
+            "        Filter: (f.x <> (a)::double precision)",
+        ],
+    ),
+    # Still open: a LEFT join's ON conjunct over its nullable side alone
+    # beside an inequality into that side's index is the parameterized
+    # scan's Filter.
+    "nested loop left join with an on restriction of its nullable side": (
+        "RP-918",
+        _ANALYSED,
+        "explain select * from e left join k on e.a < k.a and k.a <> 2",
+        [
+            "Nested Loop Left Join  (cost=0.28..10320.00 rows=333000 width=14)",
+            "  ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
+            "  ->  Index Scan using k_pkey on k  (cost=0.28..6.98 rows=333 width=7)",
+            "        Index Cond: (a > e.a)",
+            "        Filter: (a <> 2)",
         ],
     ),
     # Still open: a parameterized index scan under an outer side with few

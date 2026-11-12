@@ -1588,11 +1588,13 @@ a regression test.
       `patternsel` over the column's statistics (`e left join e e2 on e.a
       <> e2.a and e.b like 'v1%'`). Still zeros: such a preserved-side
       conjunct that costs other than its operators (an IN list, a cast of
-      a column, a regex match, whose selectivity is RP-423's), and a `<>`
-      no operator takes as its operands' types, which PostgreSQL resolves
-      by coercing one (`e.a <> k.a::numeric` is `(e.a)::numeric <>
-      (a)::numeric`, `cost=0.28..11975.00 rows=331667` over `Index Scan
-      using k_pkey on k` `cost=0.28..8.64 rows=332`). Since 2026-11-12 a
+      a column, a regex match, whose selectivity is RP-423's). Since
+      2026-11-12 a `<>` (or IS DISTINCT FROM) no operator takes as its
+      operands' types is resolved by coercing one, as
+      `oper_select_candidate` does (`e.a <> k.a::numeric` is
+      `(e.a)::numeric <> (a)::numeric`), the coerced operand an expression
+      with no statistics and its cast's function one call a row; a
+      binary-coercible coercion is still zeros. Since 2026-11-12 a
       `<>` whose operands differ in type through a cross-type operator
       (`e.a <> k.a::bigint`, `int48ne`), and one between integer columns
       of two types (`e.a <> h.a`, `h.a` bigint, their common values
@@ -1610,7 +1612,22 @@ a regression test.
       zeros (`length(e.b) < k.a`, PostgreSQL's Memoize over the Index
       Scan).
       Backlog-ID: RP-354
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[nested loop left join with a coerced inequality into an index], tests/backlog/test_rp_explain_costs.py::test_plan[nested loop of three relations]
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[nested loop of three relations]
+- [ ] **EXPLAIN prints no estimate for a LEFT join whose ON restricts
+      its nullable side beside an inequality into its index.** PostgreSQL
+      15.19 plans `explain select * from e left join k on e.a < k.a and
+      k.a <> 2` (both tables 1,000 analysed rows, `k.a` the primary key)
+      as `Nested Loop Left Join (cost=0.28..10320.00 rows=333000
+      width=14)` over `Index Scan using k_pkey on k (cost=0.28..6.98
+      rows=333 width=7)` with `Index Cond: (a > e.a)` and `Filter: (a <>
+      2)`; here the join prints zeros over two plain Seq Scans, `k`'s
+      Filter `(a <> 2)` and the join's `Join Filter: (e.a < k.a)`. An ON
+      conjunct over the preserved side is estimated (RP-354); one over
+      the nullable side alone is a restriction of the inner, which the
+      nested-loop estimate does not take. Measured on a private 15.19
+      cluster (found while working RP-354).
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[nested loop left join with an on restriction of its nullable side]
+      Backlog-ID: RP-918
 - [ ] **EXPLAIN never caches a parameterized inner scan with a
       Memoize.** A nested loop into an index scan parameterized by an
       outer side of few distinct values is printed without the Memoize

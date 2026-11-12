@@ -3193,23 +3193,31 @@ fn cast_key_target(tc: &pg_query::protobuf::TypeCast, scope: &Scope) -> Option<(
 
 /// `c`'s estimate and its `cost_qual_eval` charge in operator costs: a
 /// conjunct whose casts [`cast_cost`] cannot price is not estimated
-/// ([`FilterKind::Other`]); a `<>` over a cast key is
-/// [`FilterKind::NotEqualCast`].
+/// ([`FilterKind::Other`]); a `<>` over a cast key, or one whose operator
+/// coerces an operand, is [`FilterKind::NotEqualCast`].
 fn filter_kind_and_ops(c: &pg_query::protobuf::Node, scope: &Scope) -> (FilterKind, usize) {
     let ops = operator_count(c);
     let Some(casts) = cast_cost(c, scope) else {
         return (FilterKind::Other, ops);
     };
-    let kind = match not_equal_cast(c, scope) {
-        Some((l, r)) => FilterKind::NotEqualCast(l, r),
-        None => filter_kind(c),
-    };
-    (kind, ops + casts)
+    match not_equal_cast(c, scope) {
+        Some((kind, coercions)) => (kind, ops + casts + coercions),
+        None => (filter_kind(c), ops + casts),
+    }
 }
 
 /// `c` as a `<>` (or IS DISTINCT FROM) between two operands that are each
-/// a joined key or a cast of one, at least one cast.
-fn not_equal_cast(c: &pg_query::protobuf::Node, scope: &Scope) -> Option<(CastKey, CastKey)> {
+/// a joined key or a cast of one, at least one cast or coerced: its
+/// [`FilterKind::NotEqualCast`] and the operator costs of the coercions
+/// its operator adds. `oper_select_candidate` picks the operator over the
+/// operands' types (`=` for IS DISTINCT FROM, `make_distinct_op`), and an
+/// operand of another type than its input is coerced to it by the implicit
+/// cast's function, one call a row (`e.a <> k.a::numeric` is `(e.a)::numeric
+/// <> (a)::numeric`), which leaves it an expression with no statistics.
+/// [`FilterKind::Other`] where that coercion is not priced (a
+/// binary-coercible one is a `RelabelType`, not modelled here) or no one
+/// operator resolves. `None` for any other conjunct.
+fn not_equal_cast(c: &pg_query::protobuf::Node, scope: &Scope) -> Option<(FilterKind, usize)> {
     use pg_query::protobuf::AExprKind;
     let Some(N::AExpr(e)) = c.node.as_ref() else {
         return None;
@@ -3231,8 +3239,44 @@ fn not_equal_cast(c: &pg_query::protobuf::Node, scope: &Scope) -> Option<(CastKe
             }),
         }
     };
-    let (l, r) = (operand(e.lexpr.as_deref())?, operand(e.rexpr.as_deref())?);
-    (l.cast.is_some() || r.cast.is_some()).then_some((l, r))
+    let (mut l, mut r) = (operand(e.lexpr.as_deref())?, operand(e.rexpr.as_deref())?);
+    let cast = l.cast.is_some() || r.cast.is_some();
+    let type_of = |o: &CastKey| {
+        o.cast.or_else(|| {
+            let col = scope.cols.iter().find(|c| c.key == o.key)?;
+            crate::pgtypes::oid_of_name(&col.pg_type)
+        })
+    };
+    let names = type_of(&l).zip(type_of(&r)).and_then(|(lt, rt)| {
+        Some((
+            lt,
+            rt,
+            crate::pgtypes::name_of_oid(lt)?,
+            crate::pgtypes::name_of_oid(rt)?,
+        ))
+    });
+    let Some((lt, rt, ln, rn)) = names else {
+        return cast.then_some((FilterKind::NotEqualCast(l, r), 0));
+    };
+    let op = if distinct { "=" } else { "<>" };
+    let Some((li, ri)) = crate::funcsig::operator_inputs(op, ln, rn) else {
+        return cast.then_some((FilterKind::Other, 0));
+    };
+    let mut coercions = 0;
+    for (o, from, to) in [(&mut l, lt, li), (&mut r, rt, ri)] {
+        let Some(to) = crate::pgtypes::oid_of_name(&to) else {
+            return Some((FilterKind::Other, 0));
+        };
+        if to == from {
+            continue;
+        }
+        let Some(cost) = crate::pg_casts::explicit_cast_cost(from, to) else {
+            return Some((FilterKind::Other, 0));
+        };
+        coercions += cost;
+        o.cast = Some(to);
+    }
+    (cast || coercions > 0).then_some((FilterKind::NotEqualCast(l, r), coercions))
 }
 
 /// The operators `n` evaluates: each operator and IS DISTINCT FROM, a
