@@ -1,7 +1,7 @@
 """What working RP-854 (a GROUP BY constant that is no integer) found:
 
 - an ORDER BY constant that is no integer is not 42601;
-- a DISTINCT ON constant that is no integer is not 42601;
+- a DISTINCT ON constant that is no integer was not 42601 (fixed: RP-872);
 - a GROUP BY position inside a grouping set or a parenthesised list is
   not read as a position;
 - a grouped query reports a column that does not exist as 42803, not
@@ -58,24 +58,81 @@ def test_a_non_integer_order_by_constant_is_42601(query: str, position: str, dsn
     )
 
 
-@pytest.mark.backlog("RP-872")
+@pytest.mark.backlog_fixed("RP-872")
 @pytest.mark.parametrize(
-    "query",
+    ("query", "position"),
     [
-        "select distinct on (1.5) a from (values (1)) v(a)",
-        "select distinct on ('x') a from (values (1)) v(a)",
+        ("select distinct on (1.5) a from (values (1)) v(a)", "21"),
+        ("select distinct on ('x') a from (values (1)) v(a)", "21"),
+        ("select distinct on (-1.5) a from (values (1)) v(a)", "21"),
+        ("select distinct on (null) a from (values (1)) v(a)", "21"),
+        ("select distinct on (true) a from (values (1)) v(a)", "21"),
+        ("select distinct on (b'1') a from (values (1)) v(a)", "21"),
+        ("select distinct on ((1.5)) a from (values (1)) v(a)", "22"),
+        ("select distinct on (1.5, 9) a from (values (1)) v(a)", "21"),
+        ("select distinct on (b, 1.5) a, b from (values (1, 2)) v(a, b) order by a", "24"),
+        ("select distinct on (1.5) a from (values (1)) v(a) order by a", "21"),
+        ("select distinct on (1.5) a, b from (values (1, 2)) v(a, b) group by a", "21"),
+        ("select distinct on (1.5) a from (values (1)) v(a) for update", "21"),
+        ("select distinct on (1.5) a from (values (1)) v(a) limit 'x'", "21"),
+        ("select distinct on (1.5) a from (values (1)) v(a) limit a", "21"),
+        ("select distinct on (1.5) a from (values (1)) v(a) offset a", "21"),
+        ("select distinct on (1.5) sum(a) from (values (1)) v(a)", "21"),
+        ("select * from (select distinct on (1.5) a from (values (1)) v(a)) s", "36"),
+        ("with q as (select distinct on (1.5) a from (values (1)) v(a)) select * from q", "32"),
+        ("select (select distinct on (1.5) a from (values (1)) v(a))", "29"),
+        ("select distinct on (1.5) a from (values (1)) v(a) union select 1", "21"),
     ],
 )
-def test_a_non_integer_distinct_on_constant_is_42601(query: str, dsn: str) -> None:
+def test_a_non_integer_distinct_on_constant_is_42601(query: str, position: str, dsn: str) -> None:
     """`findTargetlistEntrySQL92` refuses a DISTINCT ON constant that is no
     integer as 42601 `non-integer constant in DISTINCT ON` at the constant
-    on PostgreSQL 15.19. Here each returns its row."""
+    on PostgreSQL 15.19, ahead of the ORDER BY match, the ungrouped-column
+    check, LIMIT, OFFSET and the locking clause. Each returned its row, or
+    a later clause's error."""
     assert _answer(dsn, query) == (
         "error",
         "42601",
         "non-integer constant in DISTINCT ON",
-        "21",
+        position,
     )
+
+
+@pytest.mark.backlog_fixed("RP-872")
+@pytest.mark.parametrize(
+    ("query", "answer"),
+    [
+        (
+            "select distinct on (nosuch, 1.5) a from (values (1)) v(a)",
+            ("error", "42703", 'column "nosuch" does not exist', "21"),
+        ),
+        (
+            "select distinct on (1.5) a from (values (1)) v(a) group by 2.5",
+            ("error", "42601", "non-integer constant in GROUP BY", "60"),
+        ),
+        (
+            "select distinct on (a) a from (values (1)) v(a) group by 1.5",
+            ("error", "42601", "non-integer constant in GROUP BY", "58"),
+        ),
+        (
+            "select distinct on (1.5) a from (values (1)) v(a) order by nosuch",
+            ("error", "42703", 'column "nosuch" does not exist', "60"),
+        ),
+        (
+            "select distinct on (1.5) a from (values (1)) v(a) where nosuch",
+            ("error", "42703", 'column "nosuch" does not exist', "57"),
+        ),
+        ("select distinct on ('x'::text) a from (values (1)) v(a)", [(1,)]),
+        ("select distinct on (1 + 0.5) a from (values (1)) v(a)", [(1,)]),
+        ("select distinct on (1) a from (values (1)) v(a)", [(1,)]),
+    ],
+)
+def test_what_comes_before_a_distinct_on_constant(query: str, answer: object, dsn: str) -> None:
+    """On PostgreSQL 15.19 an earlier DISTINCT ON item, the GROUP BY, the
+    ORDER BY, WHERE and the select list are analysed before a DISTINCT ON
+    constant, so their errors come first; a constant under a cast or an
+    operator is an expression and a key, and an integer is a position."""
+    assert _answer(dsn, query) == answer
 
 
 @pytest.mark.backlog("RP-873")

@@ -437,6 +437,39 @@ fn a_non_integer_group_by_constant_is_42601() {
     plan("SELECT 1 FROM t GROUP BY 'x'::text", &lookup).expect("an expression key");
 }
 
+/// A DISTINCT ON constant that is no integer is PostgreSQL's 42601 at the
+/// constant, after the GROUP BY and an earlier DISTINCT ON item, and before
+/// the ORDER BY match and the ungrouped-column check (RP-872).
+#[test]
+fn a_non_integer_distinct_on_constant_is_42601() {
+    for (sql, at) in [
+        ("SELECT DISTINCT ON (1.5) name FROM t", 20),
+        ("SELECT DISTINCT ON (name, 'x') name FROM t", 26),
+        (
+            "SELECT DISTINCT ON (id, NULL) name, id FROM t ORDER BY name",
+            24,
+        ),
+        ("SELECT DISTINCT ON (1.5) name, id FROM t GROUP BY name", 20),
+    ] {
+        take_error_location();
+        let err = plan(sql, &lookup).expect_err(sql);
+        assert_eq!(err.sqlstate(), "42601", "{sql}: {err}");
+        assert_eq!(
+            err.to_string(),
+            "non-integer constant in DISTINCT ON",
+            "{sql}"
+        );
+        assert_eq!(take_error_location(), Some(at), "{sql}");
+    }
+    let err =
+        plan("SELECT DISTINCT ON (nosuch, 1.5) name FROM t", &lookup).expect_err("must refuse");
+    assert_eq!(err.sqlstate(), "42703", "{err}");
+    let err = plan("SELECT DISTINCT ON (1.5) name FROM t GROUP BY 2.5", &lookup)
+        .expect_err("must refuse");
+    assert_eq!(err.to_string(), "non-integer constant in GROUP BY", "{err}");
+    plan("SELECT DISTINCT ON ('x'::text) name FROM t", &lookup).expect("an expression key");
+}
+
 #[test]
 fn group_by_resolves_order_by_index() {
     match plan_ok("SELECT count(*) FROM t GROUP BY name ORDER BY name DESC") {

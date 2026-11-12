@@ -23,7 +23,17 @@
 //! is therefore planned first with its GROUP BY cut short before the
 //! constant, and an error from that plan that PostgreSQL raises in the
 //! clauses analysed earlier is the answer; anything else, or no error, is
-//! the constant's 42601.
+//! the constant's 42601. DISTINCT and DISTINCT ON are analysed after GROUP
+//! BY, so the cut drops them too.
+//!
+//! A DISTINCT ON constant goes through the same `findTargetlistEntrySQL92`
+//! (RP-872): 42601 `non-integer constant in DISTINCT ON` at the constant.
+//! `transformDistinctOnClause` analyses its items in order after GROUP BY,
+//! and only then checks them against the ORDER BY, so the statement is
+//! planned with the DISTINCT ON cut before the constant, and with nothing
+//! analysed after it (LIMIT, OFFSET, the locking clause); the ORDER BY
+//! match and what `parseCheckAggregates` raises are not the answer. Its
+//! items are not flattened: a row or a cast of a constant is an expression.
 
 use super::*;
 
@@ -61,6 +71,21 @@ fn cut_at_constant(items: &[Node]) -> Option<(i32, Vec<Node>)> {
     None
 }
 
+/// The location of the first DISTINCT ON item that is a non-integer
+/// constant, and how many items come before it.
+fn distinct_on_constant(items: &[Node]) -> Option<(i32, usize)> {
+    // `DISTINCT` alone is one item with no node.
+    items
+        .iter()
+        .enumerate()
+        .find_map(|(i, item)| match item.node.as_ref() {
+            Some(N::AConst(c)) if !matches!(c.val, Some(a_const::Val::Ival(_))) => {
+                Some((c.location, i))
+            }
+            _ => None,
+        })
+}
+
 /// Does PostgreSQL raise `e` while analysing the clauses before GROUP BY,
 /// so that it comes before the constant's error? Not this server's own
 /// gaps, not the checks that follow the grouping clause, and not what only
@@ -91,6 +116,7 @@ pub(crate) fn check(s: &SelectStmt, plan: &dyn Fn(&SelectStmt) -> Result<Stateme
     };
     let mut cut = s.clone();
     cut.group_clause = kept;
+    cut.distinct_clause.clear();
     if let Err(e) = plan(&cut) {
         if raised_before_group_by(&e) {
             return Err(e);
@@ -100,5 +126,35 @@ pub(crate) fn check(s: &SelectStmt, plan: &dyn Fn(&SelectStmt) -> Result<Stateme
     Err(Error::Sqlstate(
         "42601",
         "non-integer constant in GROUP BY".into(),
+    ))
+}
+
+/// PostgreSQL's 42601 for a DISTINCT ON constant that is no integer,
+/// unless the statement fails earlier (module docs). Runs after [`check`],
+/// whose GROUP BY error comes first.
+pub(crate) fn check_distinct_on(
+    s: &SelectStmt,
+    plan: &dyn Fn(&SelectStmt) -> Result<Statement>,
+) -> Result<()> {
+    let Some((at, before)) = distinct_on_constant(&s.distinct_clause) else {
+        return Ok(());
+    };
+    let mut cut = s.clone();
+    cut.distinct_clause.truncate(before);
+    cut.limit_count = None;
+    cut.limit_offset = None;
+    cut.locking_clause.clear();
+    if let Err(e) = plan(&cut) {
+        let unmatched = e
+            .to_string()
+            .starts_with("SELECT DISTINCT ON expressions must match initial ORDER BY expressions");
+        if !unmatched && raised_before_group_by(&e) {
+            return Err(e);
+        }
+    }
+    set_error_location(at);
+    Err(Error::Sqlstate(
+        "42601",
+        "non-integer constant in DISTINCT ON".into(),
     ))
 }

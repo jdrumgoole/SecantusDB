@@ -3739,12 +3739,29 @@ statement is VALUES-only and runs there as written. The gap tests are in
       constant until this one is fixed, where PostgreSQL names the ORDER BY.
       Verify: tests/backlog/test_rp_found_rp854.py::test_a_non_integer_order_by_constant_is_42601
       Backlog-ID: RP-871
-- [ ] **A DISTINCT ON constant that is no integer returns rows.** `select
-      distinct on (1.5) a from (values (1)) v(a)` is 42601 `non-integer
-      constant in DISTINCT ON` at 21 on PostgreSQL 15.19, and so is a string
-      there. Here each returns its row: the constant is a key of one value.
-      Verify: tests/backlog/test_rp_found_rp854.py::test_a_non_integer_distinct_on_constant_is_42601
-      Backlog-ID: RP-872
+- [ ] **A DISTINCT ON position past the select list returns rows.**
+      `select distinct on (9) a from (values (1)) v(a)` is 42P10 `DISTINCT
+      ON position 9 is not in select list` at 21 on PostgreSQL 15.19
+      (`findTargetlistEntrySQL92`), and so is `distinct on (9, 1.5)`, ahead
+      of the later constant's 42601. Here the first returns its row and the
+      second is that 42601. A position over a star is refused: `select
+      distinct on (2) * from (values (1, 2)) v(a, b)` returns `(1, 2)` there
+      and is 0A000 `DISTINCT ON over an expression` here, and `distinct on
+      (3) *` is 42P10 there. Found while working RP-872 (2026-11-12).
+      Verify: tests/backlog/test_rp_found_rp872.py::test_a_distinct_on_position_is_checked_against_the_select_list
+      Backlog-ID: RP-884
+- [ ] **A window definition's error comes ahead of a GROUP BY or DISTINCT ON
+      constant's.** `select count(*) over w from (values (1)) v(a) group by
+      2.5 window w as (order by nosuch)` is 42601 `non-integer constant in
+      GROUP BY` at 56 on PostgreSQL 15.19, and with `distinct on (1.5)` in
+      place of the GROUP BY it is `non-integer constant in DISTINCT ON` at
+      21: `transformWindowDefinitions` runs after both clauses in
+      `transformSelectStmt`. Here each is the window's 42703 `column
+      "nosuch" does not exist`: `group_sql92`'s cut statement keeps the
+      WINDOW clause, and dropping it would leave `over w` naming no window.
+      Found while working RP-872 (2026-11-12).
+      Verify: tests/backlog/test_rp_found_rp872.py::test_a_window_definition_is_analysed_after_the_constant
+      Backlog-ID: RP-885
 - [ ] **A GROUP BY position inside a grouping set or a parenthesised list
       is grouped as a value.** `select a from (values (1), (2)) v(a) group
       by rollup(1)` groups by `a` on PostgreSQL 15.19 (`flatten_grouping_sets`

@@ -27406,6 +27406,8 @@ fn plan_select(
     // A GROUP BY constant that is no integer is 42601, after what parse
     // analysis meets before it (RP-854).
     group_sql92::check(s, &|cut| plan_select(cut, lookup, params))?;
+    // So is a DISTINCT ON constant, analysed after GROUP BY (RP-872).
+    group_sql92::check_distinct_on(s, &|cut| plan_select(cut, lookup, params))?;
     // `WITH` is shorthand for the FROM-subqueries below, so it is rewritten
     // away before any of the shape checks run -- every one of them would
     // otherwise have to know about it.
