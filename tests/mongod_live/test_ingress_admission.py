@@ -313,7 +313,12 @@ def test_a_current_op_row_says_what_admission_control_admitted(servers: dict) ->
                 if current is None
                 else (current["name"], current["timeQueuedMicros"] >= 40_000, _kinds(current)),
             )
-        got[name] = out
+        # Keyed by role, not by the order the rows came back: mongod 8.2.11
+        # returns these two rows in either order from one process (18
+        # queued-first, 12 itself-first in 30 runs, 2026-11-12), and CI's
+        # Linux mongod answered itself-first where the macOS gate had seen
+        # queued-first. Every row's contents are still compared exactly.
+        got[name] = {role: out[role] for role in sorted(out)}
     same(got["rust"], got["mongod"])
     assert got["mongod"]["queued"][3][0] == "ingress"
     assert got["mongod"]["itself"][3] is None
