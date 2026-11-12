@@ -43723,13 +43723,23 @@ impl PgHandler {
                         .all(|c| c.children.is_empty() && c.name.starts_with("Seq Scan on "))
                 {
                     if let Statement::Select(sel) = inner.as_ref() {
-                        if let Some((plan, a, b, join, param)) =
+                        if let Some((plan, a, b, join, param, outer_index)) =
                             self.nest_loop_estimate(sel).or_else(|| {
                                 self.join_select_nest_loop_estimate(sel)
-                                    .map(|(plan, a, b, join)| (plan, a, b, join, None))
+                                    .map(|(plan, a, b, join)| (plan, a, b, join, None, None))
                             })
                         {
                             explain::price_nest_loop(&mut tree, &plan, a, b, join);
+                            // A LEFT join's preserved side read through its
+                            // index, its WHERE the Index Cond (RP-354).
+                            if let Some(index) = outer_index {
+                                let outer = &mut tree.children[0];
+                                if let Some(table) =
+                                    outer.name.strip_prefix("Seq Scan on ").map(str::to_string)
+                                {
+                                    explain::index_path_node(outer, index, &table);
+                                }
+                            }
                             // The inner read through its index, the join
                             // clause its Index Cond (RP-354).
                             if let Some(p) = param {

@@ -416,19 +416,16 @@ impl PgHandler {
     /// [`joincost::cheapest_nest_loop_param`]'s: over an analysed table
     /// whose B-tree leads with a column an inequality compares to the other
     /// side's, that side's index scan parameterized by the outer row is
-    /// weighed as the inner (RP-354), and the last element names it when
-    /// it wins. `None` -- zeros -- where an index the model does not price
-    /// could serve, or anything else sits in the plan.
+    /// weighed as the inner (RP-354), and the fifth element names it when
+    /// it wins. A LEFT join's preserved side, filtered by its WHERE, is
+    /// that relation's cheapest path (`set_cheapest`), an index path where
+    /// that wins, which the last element names (RP-354). `None` -- zeros
+    /// -- where an index the model does not price could serve, or anything
+    /// else sits in the plan.
     pub(crate) fn nest_loop_estimate(
         &self,
         sel: &secantus_pgplan::Select,
-    ) -> Option<(
-        secantus_pgplan::joincost::NestLoopPlan,
-        Estimate,
-        Estimate,
-        Estimate,
-        Option<ParamScan>,
-    )> {
+    ) -> Option<NestLoopEstimate> {
         use secantus_pgplan::joins::{FilterKind, JoinKind, JoinNode, JoinRows};
         use secantus_pgplan::Statement;
         let sub = sel.sub.as_ref()?;
@@ -518,7 +515,6 @@ impl PgHandler {
         }) {
             return None;
         }
-        let restricted = filters.iter().any(|f| restriction(f));
         // A `<`, `<=`, `>` or `>=` between the sides can be an indexed
         // side's parameterized Index Cond (RP-354), priced below where it
         // compares two plain keys; a `<>` never is one (no B-tree
@@ -533,7 +529,11 @@ impl PgHandler {
         // Each side's table, its keys' stored fields and SQL names, and
         // the fields it reads.
         let mut leaves: Vec<SideLeaf> = Vec::new();
-        let mut side = |node: &JoinNode| -> Option<(Estimate, i64)> {
+        // `preserved_side`: a LEFT join's outer relation, always the
+        // loop's outer, its own cheapest path whatever it is.
+        let mut side = |node: &JoinNode,
+                        preserved_side: bool|
+         -> Option<(Estimate, i64, Option<ScanIndex>)> {
             let JoinNode::Leaf { plan, def, columns } = node else {
                 return None;
             };
@@ -550,9 +550,10 @@ impl PgHandler {
                 || leaf.offset != 0
                 || !matches!(leaf.distinct, secantus_pgplan::Distinct::None)
                 || leaf.casts.iter().any(Option::is_some)
-                // An indexed table's own filter may be an index scan's.
+                // An indexed table's own filter may be an index scan's,
+                // priced below only on a LEFT join's preserved side.
                 || (indexes.iter().any(|ix| ix.table.name == leaf.table)
-                    && (opaque_inequality || !leaf.filter.is_empty()))
+                    && (opaque_inequality || (!leaf.filter.is_empty() && !preserved_side)))
             {
                 return None;
             }
@@ -573,9 +574,10 @@ impl PgHandler {
                 .filter(|(key, _)| j.needed.contains(key) || project.is_none())
                 .map(|(_, f)| stored(f))
                 .collect::<Option<_>>()?;
-            let (scan, None) = self.scan_estimate(&leaf.table, &leaf.filter, &read)? else {
+            let (scan, index) = self.scan_estimate(&leaf.table, &leaf.filter, &read)?;
+            if index.is_some() && !preserved_side {
                 return None;
-            };
+            }
             let (width, None) = self.scan_estimate(&leaf.table, &Document::new(), &above)? else {
                 return None;
             };
@@ -590,10 +592,10 @@ impl PgHandler {
                 keys,
                 read,
             });
-            Some((scan, width.3))
+            Some((scan, width.3, index))
         };
-        let (a, a_above) = side(left)?;
-        let (b, b_above) = side(right)?;
+        let (a, a_above, a_index) = side(left, left_join)?;
+        let (b, b_above, _) = side(right, false)?;
         let qual: f64 = filters
             .iter()
             .map(|f| f.ops as f64 * costsize::CPU_OPERATOR_COST)
@@ -606,6 +608,9 @@ impl PgHandler {
         // a constant joins the range clauses (`addRangeClause`), which are
         // multiplied in last, a column's two bounds as one range.
         let mut sel_factor = 1.0_f64;
+        // The join clauses' alone: those a parameterized inner moves into
+        // its scan, its rows `get_parameterized_baserel_size`'s.
+        let mut join_sel = 1.0_f64;
         let mut ranges: Vec<Document> = Vec::new();
         for f in &filters {
             if let (true, Some(r)) = (restriction(f), &f.restrict) {
@@ -616,7 +621,7 @@ impl PgHandler {
                 }
                 continue;
             }
-            sel_factor *= match &f.kind {
+            let s = match &f.kind {
                 FilterKind::Inequality => 1.0 / 3.0,
                 FilterKind::NotEqual(l, r) => {
                     let stats = |k: &str| {
@@ -640,6 +645,8 @@ impl PgHandler {
                 }
                 _ => return None,
             };
+            sel_factor *= s;
+            join_sel *= s;
         }
         if !ranges.is_empty() {
             let filter = match ranges.len() {
@@ -656,6 +663,19 @@ impl PgHandler {
         let [la, lb] = leaves.as_slice() else {
             return None;
         };
+        // A restriction on the outer side is not movable into the inner's
+        // scan (`join_clause_is_movable_into`): it stays the join's
+        // filter, checked on each pair the scan returns.
+        let movable: Vec<&secantus_pgplan::joins::JoinFilter> = filters
+            .iter()
+            .copied()
+            .filter(|f| !restriction(f))
+            .collect();
+        let kept: f64 = filters
+            .iter()
+            .filter(|f| restriction(f))
+            .map(|f| f.ops as f64 * costsize::CPU_OPERATOR_COST)
+            .sum();
         for (slot, (inner_leaf, outer_rows, inner_rows)) in
             [(lb, a.2, b.2), (la, b.2, a.2)].into_iter().enumerate()
         {
@@ -664,19 +684,16 @@ impl PgHandler {
             }
             let found = self.param_index_inner(
                 inner_leaf,
-                &filters,
+                &movable,
                 outer_rows,
-                inner_rows * sel_factor,
+                inner_rows * join_sel,
                 inner_rows,
             );
             match found {
                 ParamFound::None => {}
-                // A restriction on the outer side is not movable into
-                // the inner's scan (`join_clause_is_movable_into`), so
-                // the scan's rows are not `param_rows`: not modelled.
-                ParamFound::Scan(..) if restricted => return None,
                 ParamFound::Unmodelled => return None,
-                ParamFound::Scan(p, scan) => {
+                ParamFound::Scan(mut p, scan) => {
+                    p.qual = kept;
                     param[slot] = Some(p);
                     param_scans[slot] = Some(scan);
                 }
@@ -706,7 +723,11 @@ impl PgHandler {
         } else {
             (a, b, None)
         };
-        Some((plan, a, b, join, scan))
+        // The preserved side is the loop's outer, never moved.
+        if a_index.is_some() && plan.b_outer {
+            return None;
+        }
+        Some((plan, a, b, join, scan, a_index))
     }
 
     /// `leaf` as the inner side of a nested loop through one of its
@@ -4581,6 +4602,18 @@ impl HashSide {
             .map(|(stats, _)| i64::from(stats.width))
     }
 }
+
+/// [`PgHandler::nest_loop_estimate`]'s answer: the plan, the two scans'
+/// and the join's estimates, the inner's parameterized index scan and the
+/// preserved side's index path, where either is chosen.
+pub(crate) type NestLoopEstimate = (
+    secantus_pgplan::joincost::NestLoopPlan,
+    Estimate,
+    Estimate,
+    Estimate,
+    Option<ParamScan>,
+    Option<ScanIndex>,
+);
 
 /// A nested loop's side as [`PgHandler::nest_loop_estimate`] reads it: its
 /// table, each key with its stored field and SQL column, and the stored

@@ -1576,24 +1576,23 @@ a regression test.
       inner side (`e.a < k.a + 1`, the scan's Filter), a key on a later
       index column; and a join of three or more relations (found while
       working RP-329). Since 2026-11-12 a LEFT join's WHERE over its
-      preserved side alone is estimated as that side's scan Filter (`e
-      left join e e2 on e.a <> e2.a where e.a > 990`, `rows=10`), but not
-      where that side is indexed and the WHERE could be its Index Cond (`k
-      left join e on e.a <> k.a where k.a > 990` is `Index Scan using
-      k_pkey on k` with `Index Cond: (a > 990)`, `rows=10`, the join
-      `cost=0.28..175.95 rows=9990`).
-      Since 2026-11-12 an ON conjunct over a LEFT join's preserved side
-      alone is estimated, as PostgreSQL keeps it: a join filter
-      `clause_selectivity` estimates from that table's statistics (`e.a >
-      990` of `e left join e e2 on e.a <> e2.a and e.a > 990` is
-      `rows=9990`), a single bound deferred among the range clauses. Not
-      when the inner is also read through its index parameterized by the
-      outer row (`e left join k on e.a < k.a and e.a > 990` is `Index Scan
-      using k_pkey on k` with `Index Cond: (a > e.a)`, the restriction
-      the join's only filter, `rows=3333`), or when the conjunct costs
-      other than its operators (an IN list, a pattern, a cast of a column).
+      preserved side alone is that side's cheapest path, its scan Filter
+      or, where the index wins, its Index Cond (`k left join e on e.a <>
+      k.a where k.a > 990`), and an ON conjunct over the preserved side
+      alone is estimated as PostgreSQL keeps it, the join's filter, also
+      when the inner is read through its index parameterized by the outer
+      row (`e left join k on e.a < k.a and e.a > 990`). Still zeros: such
+      a conjunct that costs other than its operators (an IN list, a
+      pattern, a cast of a column), and an inner join clause over a cast
+      of the inner's column, which PostgreSQL makes the parameterized
+      scan's Filter (`e left join k on e.a < k.a and e.a <> k.b::int` is
+      `cost=0.28..11975.00 rows=333000`, `Index Scan using k_pkey on k`
+      `cost=0.28..8.64 rows=332` with `Filter: (e.a <> (b)::integer)`).
+      And a cent: `k left join k k2 on k.a < k2.a and k.a > 990 where k.a
+      > 900` totals 1076.52 here, 1076.53 on PostgreSQL 15.19 -- the sum
+      is a .525 tie this server's index-scan costs land one ULP below.
       Backlog-ID: RP-354
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[nested loop left join with a where on an indexed outer], tests/backlog/test_rp_explain_costs.py::test_plan[nested loop left join with a one-sided ON conjunct into an index]
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[nested loop left join with a cast clause into an index], tests/backlog/test_rp_explain_costs.py::test_plan[nested loop left join of two index scans with a one-sided ON conjunct]
 
 - [ ] **EXPLAIN of a LEFT join whose WHERE keeps only the unmatched rows
       prints a Left Join, not an Anti Join.** `reduce_outer_joins` turns a
