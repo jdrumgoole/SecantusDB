@@ -1556,9 +1556,14 @@ a regression test.
       zeros: two bounds on the index column (`e.a < k.a and e.a >
       k.a`, one `Index Cond` of both), a clause over an expression of the
       inner side (`e.a < k.a + 1`, the scan's Filter), a key on a later
-      index column; a LEFT join with a WHERE (`e left join e e2 on e.a <>
-      e2.a where e.a > 990`, the WHERE `e`'s scan Filter, `rows=10`); and
-      a join of three or more relations (found while working RP-329).
+      index column; and a join of three or more relations (found while
+      working RP-329). Since 2026-11-12 a LEFT join's WHERE over its
+      preserved side alone is estimated as that side's scan Filter (`e
+      left join e e2 on e.a <> e2.a where e.a > 990`, `rows=10`), but not
+      where that side is indexed and the WHERE could be its Index Cond (`k
+      left join e on e.a <> k.a where k.a > 990` is `Index Scan using
+      k_pkey on k` with `Index Cond: (a > 990)`, `rows=10`, the join
+      `cost=0.28..175.95 rows=9990`).
       Since 2026-11-12 an ON conjunct over a LEFT join's preserved side
       alone is estimated, as PostgreSQL keeps it: a join filter
       `clause_selectivity` estimates from that table's statistics (`e.a >
@@ -1570,8 +1575,21 @@ a regression test.
       the join's only filter, `rows=3333`), or when the conjunct costs
       other than its operators (an IN list, a pattern, a cast of a column).
       Backlog-ID: RP-354
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[nested loop left join with a where], tests/backlog/test_rp_explain_costs.py::test_plan[nested loop left join with a one-sided ON conjunct into an index]
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[nested loop left join with a where on an indexed outer], tests/backlog/test_rp_explain_costs.py::test_plan[nested loop left join with a one-sided ON conjunct into an index]
 
+- [ ] **EXPLAIN of a LEFT join whose WHERE keeps only the unmatched rows
+      prints a Left Join, not an Anti Join.** `reduce_outer_joins` turns a
+      LEFT join whose WHERE tests a column of the nullable side that the
+      ON makes strict `IS NULL` into `JOIN_ANTI`: PostgreSQL 15.19 prints
+      `select * from e left join e e2 on e.a <> e2.a where e2.a is null` as
+      `Nested Loop Anti Join (cost=0.00..65.00 rows=1 width=14)` with no
+      Filter, the inner side Materialized, and the same over `e.a = e2.a`
+      as `Hash Anti Join (cost=27.50..46.25 rows=1 width=14)`. Here each is
+      a Left Join with `Filter: (e2.a IS NULL)` above it and zero costs.
+      Its rows are right. Measured on a private 15.19 cluster (found while
+      working RP-354).
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a left join where the nullable side is null is an anti join], tests/backlog/test_rp_explain_costs.py::test_plan[a left join on an equality where the nullable side is null is an anti join]
+      Backlog-ID: RP-908
 - [ ] **A LEFT join reduced to an inner one keeps its ON's one-sided
       conjunct in its Join Filter.** A WHERE that rejects the nullable
       side's NULLs makes the LEFT join inner (`reduce_outer_joins`), and

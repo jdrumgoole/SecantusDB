@@ -467,12 +467,25 @@ impl PgHandler {
         if !equi.is_empty() || !merged.is_empty() || !expr_keys.is_empty() {
             return None;
         }
-        // An outer join's ON is its join clause and its WHERE filters the
-        // joined rows; only a LEFT join with no WHERE is modelled (RP-354).
+        // An outer join's ON is its join clause. A WHERE conjunct over its
+        // nullable side that rejects NULLs has made the join inner already
+        // (`reduce_outer_joins`); one over its preserved side alone is
+        // pushed to that side's scan (`distribute_qual_to_rels`), its
+        // Filter, and is modelled there (RP-354). Any other WHERE runs
+        // above the join, which is not.
         let left_join = match kind {
             JoinKind::Inner => false,
             JoinKind::Left => {
-                if !j.where_filters.is_empty() || !sel.filter.is_empty() || sel.residual.is_some() {
+                let JoinNode::Leaf { def, .. } = left.as_ref() else {
+                    return None;
+                };
+                let prefix = format!("{}{}", def.name, secantus_pgplan::joins::SEP);
+                let mut fields = Vec::new();
+                filter_fields(&sel.filter, &mut fields)?;
+                if !j.where_filters.is_empty()
+                    || sel.residual.is_some()
+                    || fields.iter().any(|f| !f.starts_with(&prefix))
+                {
                     return None;
                 }
                 true

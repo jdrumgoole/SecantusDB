@@ -1209,9 +1209,10 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "        Index Cond: (a > e.a)",
         ],
     ),
-    # Still open: a LEFT join with a WHERE, the WHERE its outer scan's.
+    # Split from RP-354 and fixed: a LEFT join with a WHERE over its
+    # preserved side alone, the WHERE that side's scan Filter.
     "nested loop left join with a where": (
-        "RP-354",
+        "RP-329",
         _ANALYSED,
         "explain select * from e left join e e2 on e.a <> e2.a where e.a > 990",
         [
@@ -1220,6 +1221,118 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "  ->  Seq Scan on e  (cost=0.00..17.50 rows=10 width=7)",
             "        Filter: (a > 990)",
             "  ->  Materialize  (cost=0.00..20.00 rows=1000 width=7)",
+            "        ->  Seq Scan on e e2  (cost=0.00..15.00 rows=1000 width=7)",
+        ],
+    ),
+    # Two conjuncts of the WHERE, one scan Filter estimated from both.
+    "nested loop left join with a where of two conjuncts": (
+        "RP-329",
+        _ANALYSED,
+        "explain select * from e left join e e2 on e.a <> e2.a where e.a > 990 and e.b = 'v1'",
+        [
+            "Nested Loop Left Join  (cost=0.00..47.50 rows=999 width=14)",
+            "  Join Filter: (e.a <> e2.a)",
+            "  ->  Seq Scan on e  (cost=0.00..20.00 rows=1 width=7)",
+            "        Filter: ((a > 990) AND (b = 'v1'::text))",
+            "  ->  Seq Scan on e e2  (cost=0.00..15.00 rows=1000 width=7)",
+        ],
+    ),
+    # An OR of the preserved side's columns is pushed whole.
+    "nested loop left join with a where of an or": (
+        "RP-329",
+        _ANALYSED,
+        "explain select * from e left join e e2 on e.a <> e2.a where e.a > 990 or e.b = 'v1'",
+        [
+            "Nested Loop Left Join  (cost=0.00..1672.50 rows=108891 width=14)",
+            "  Join Filter: (e.a <> e2.a)",
+            "  ->  Seq Scan on e  (cost=0.00..20.00 rows=109 width=7)",
+            "        Filter: ((a > 990) OR (b = 'v1'::text))",
+            "  ->  Materialize  (cost=0.00..20.00 rows=1000 width=7)",
+            "        ->  Seq Scan on e e2  (cost=0.00..15.00 rows=1000 width=7)",
+        ],
+    ),
+    # The WHERE on the outer side, an ON conjunct on the nullable one.
+    "nested loop left join with a where and a nullable-side ON conjunct": (
+        "RP-329",
+        _ANALYSED,
+        "explain select * from e left join e e2 on e.a <> e2.a and e2.b = 'v1' where e.a > 990",
+        [
+            "Nested Loop Left Join  (cost=0.00..50.25 rows=999 width=14)",
+            "  Join Filter: (e.a <> e2.a)",
+            "  ->  Seq Scan on e  (cost=0.00..17.50 rows=10 width=7)",
+            "        Filter: (a > 990)",
+            "  ->  Materialize  (cost=0.00..18.00 rows=100 width=7)",
+            "        ->  Seq Scan on e e2  (cost=0.00..17.50 rows=100 width=7)",
+            "              Filter: (b = 'v1'::text)",
+        ],
+    ),
+    # An inequality join, one column selected.
+    "nested loop left join with a where, an inequality join": (
+        "RP-329",
+        _ANALYSED,
+        "explain select e.a from e left join e e2 on e.a < e2.a where e.a > 990",
+        [
+            "Nested Loop Left Join  (cost=0.00..185.00 rows=3333 width=4)",
+            "  Join Filter: (e.a < e2.a)",
+            "  ->  Seq Scan on e  (cost=0.00..17.50 rows=10 width=4)",
+            "        Filter: (a > 990)",
+            "  ->  Materialize  (cost=0.00..20.00 rows=1000 width=4)",
+            "        ->  Seq Scan on e e2  (cost=0.00..15.00 rows=1000 width=4)",
+        ],
+    ),
+    # The nullable side indexed, which a `<>` cannot use.
+    "nested loop left join with a where into an indexed table": (
+        "RP-329",
+        _ANALYSED,
+        "explain select * from e left join k on e.a <> k.a where e.a > 990",
+        [
+            "Nested Loop Left Join  (cost=0.00..185.00 rows=9990 width=14)",
+            "  Join Filter: (e.a <> k.a)",
+            "  ->  Seq Scan on e  (cost=0.00..17.50 rows=10 width=7)",
+            "        Filter: (a > 990)",
+            "  ->  Materialize  (cost=0.00..20.00 rows=1000 width=7)",
+            "        ->  Seq Scan on k  (cost=0.00..15.00 rows=1000 width=7)",
+        ],
+    ),
+    # Still open: the preserved side's WHERE its index scan's Index Cond.
+    "nested loop left join with a where on an indexed outer": (
+        "RP-354",
+        _ANALYSED,
+        "explain select * from k left join e on e.a <> k.a where k.a > 990",
+        [
+            "Nested Loop Left Join  (cost=0.28..175.95 rows=9990 width=14)",
+            "  Join Filter: (e.a <> k.a)",
+            "  ->  Index Scan using k_pkey on k  (cost=0.28..8.45 rows=10 width=7)",
+            "        Index Cond: (a > 990)",
+            "  ->  Materialize  (cost=0.00..20.00 rows=1000 width=7)",
+            "        ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
+        ],
+    ),
+    # ------------- RP-908 a LEFT join whose WHERE keeps only unmatched rows
+    # `reduce_outer_joins` makes a LEFT join whose WHERE tests the nullable
+    # side's join-strict column IS NULL an anti join.
+    "a left join where the nullable side is null is an anti join": (
+        "RP-908",
+        _ANALYSED,
+        "explain select * from e left join e e2 on e.a <> e2.a where e2.a is null",
+        [
+            "Nested Loop Anti Join  (cost=0.00..65.00 rows=1 width=14)",
+            "  Join Filter: (e.a <> e2.a)",
+            "  ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
+            "  ->  Materialize  (cost=0.00..20.00 rows=1000 width=7)",
+            "        ->  Seq Scan on e e2  (cost=0.00..15.00 rows=1000 width=7)",
+        ],
+    ),
+    # The same over an equality: a Hash Anti Join.
+    "a left join on an equality where the nullable side is null is an anti join": (
+        "RP-908",
+        _ANALYSED,
+        "explain select * from e left join e e2 on e.a = e2.a where e2.a is null",
+        [
+            "Hash Anti Join  (cost=27.50..46.25 rows=1 width=14)",
+            "  Hash Cond: (e.a = e2.a)",
+            "  ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
+            "  ->  Hash  (cost=15.00..15.00 rows=1000 width=7)",
             "        ->  Seq Scan on e e2  (cost=0.00..15.00 rows=1000 width=7)",
         ],
     ),
