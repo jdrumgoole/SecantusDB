@@ -1062,16 +1062,30 @@ jobs:
         #
         # Linux runs `fast` on a PR AND on the push to main, so that main saves
         # the cache a PR restores (a PR cannot save one another PR can read).
-        # The full build is built and tested by the weekly cron (Windows and
-        # macOS cells; there is no push-to-main cell since 2026-11-11) and by
-        # the release builds. What is lost: a fault that only the LTO / PGO
-        # build has shows up at the next weekly run or release, not on the PR
-        # or on main.
+        #
+        # Windows runs `fast` always (Joe, 2026-11-12). Its full build had
+        # grown to 61 min of a 90-min job (run 43094814179): 48m48s for
+        # `_secantus_server` alone, of which ~41 min is that crate's one
+        # codegen unit under thin LTO + PGO (12 min on 2026-10-22; the PG
+        # crates linked into it grew ~65% in functions since), ~4x the same
+        # step on Linux. The three cargo builds also run one after another
+        # there (the Visual Studio generator; Ninja runs them together on
+        # Linux and macOS), and the weekly cell's cache is evicted between
+        # runs. Nothing ships the full Windows extension: PyPI is retired
+        # (2026-10-20) and the Windows release binary is built without PGO.
+        #
+        # The full build is built and tested by the weekly cron's macOS cell
+        # and by the release builds. What is lost: a fault that only the
+        # LTO / PGO build has shows up at the next weekly run or release, not
+        # on the PR or on main -- and on Windows, only at a release.
         id: mode
         shell: bash
         run: |
           mode=full
           if [ "$RUNNER_OS" = "Linux" ] && { [ "$GITHUB_EVENT_NAME" = "pull_request" ] || [ "$GITHUB_EVENT_NAME" = "push" ]; }; then
+            mode=fast
+          fi
+          if [ "$RUNNER_OS" = "Windows" ]; then
             mode=fast
           fi
           if [ "$mode" = "fast" ]; then
