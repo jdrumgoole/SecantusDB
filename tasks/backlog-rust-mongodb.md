@@ -638,14 +638,16 @@ These are explicit non-goals. Don't add them without a reason.
       accumulators with arguments of their own, the stages mongod desugars,
       change streams, `aggregate: 1` and DBPointer literals
       (`tests/mongod_live/test_query_shape_hash.py`, against mongod
-      8.2.11). A query using one of these prints none, where mongod prints
-      one:
+      8.2.11); since 2026-11-12 `$rankFusion` and `$scoreFusion`, as the
+      pipelines mongod desugars them into, and a `$geoNear` with no
+      `distanceField`. A query using one of these prints none, where mongod
+      prints one:
       - `$jsonSchema`, which mongod shapes as the `$_internalSchema*`
         predicates its JSON Schema parser translates the schema into
-        (`json_schema_parser.cpp`, each keyword's translation);
-      - `$rankFusion` and `$scoreFusion`, which it shapes as the 10-15
-        stage pipelines it desugars them into (window ranks, `$unionWith`
-        per input pipeline, `$group`, `$setMetadata`);
+        (`json_schema_parser.cpp`, about 1,950 lines in 8.2.11, and the
+        serializer of each of the ~18 internal predicates it builds);
+      - a `$rankFusion` or `$scoreFusion` input of `$search` or
+        `$vectorSearch`, which need mongot;
       - options measured nowhere yet: a `$lookup` `from` naming another
         database, `$out` to a time-series collection, change stream
         options beyond `fullDocument`, `fullDocumentBeforeChange`,
@@ -662,6 +664,26 @@ These are explicit non-goals. Don't add them without a reason.
       '<db>.explain.dry.run' does not exist`). Found 2026-11-09 (RM-358).
       Verify: tests/backlog/test_rm_found_rm358.py::test_an_explain_of_plan_cache_stats_names_its_stage
       Backlog-ID: RM-466
+- [ ] **An `explain` of `$geoNear` fails.** mongod 8.2.11 explains
+      `aggregate` of `[{$geoNear: {near: [0, 0]}}]` over a collection with
+      a `2d` index, with or without `distanceField`, and prints its
+      `queryShapeHash`. This server runs the stage itself, but its
+      `explain` runs the pipeline against a namespace of its own
+      (`explain.dry.run`, `explain/mod.rs`) and fails with 26 (`$geoNear
+      requires a geo index to run, but <db>.explain.dry.run does not
+      exist`), as RM-466 does for `$planCacheStats`. A `$rankFusion` with a
+      `$geoNear` input fails the same way. Found 2026-11-12 (RM-358).
+      Verify: tests/backlog/test_rm_found_rm358.py::test_an_explain_of_geo_near_runs
+      Backlog-ID: RM-552
+- [ ] **`$scoreFusion` combines by `"average"`, not `"avg"`.** mongod
+      8.2.11's `combination.method` is `"avg"` or `"expression"` (its IDL
+      enum, `kAvg: "avg"`) and refuses `"average"` with 2 (`Enumeration
+      value 'average' for field '$scoreFusion.combination.method' is not a
+      valid value.`); `"average"` is only the method's name in
+      `scoreDetails`. This server takes `"average"` and refuses `"avg"`
+      (`hybrid.rs`). Found 2026-11-12 (RM-358).
+      Verify: tests/backlog/test_rm_found_rm358.py::test_score_fusion_combines_by_avg
+      Backlog-ID: RM-553
 - [ ] **An aggregate's top-k sort counts only the keys it kept.** mongod
       8.2.11 adds every document its sort read to
       `metrics.query.sort.totalKeysSorted` for a leading `$sort` and

@@ -11,7 +11,8 @@ command is parsed into. Geo predicates, `$text`, the aggregation operators
 and accumulators with arguments of their own, and the stages mongod
 desugars (`$bucket`, `$setWindowFields`, `$fill`, `$densify`, `$documents`,
 `$score`, ...) each have their own serializer, measured against mongod
-8.2.11 on 2026-11-09.
+8.2.11 on 2026-11-09; `$rankFusion` and `$scoreFusion` are the pipelines
+mongod desugars them into (measured 2026-11-12).
 """
 
 from __future__ import annotations
@@ -455,6 +456,85 @@ def _dbpointer(field: str) -> RawBSONDocument:
     return RawBSONDocument(struct.pack("<i", len(element) + 5) + element + b"\x00")
 
 
+def _rank_fusion(pipelines: dict, **options: Any) -> dict:
+    return {"$rankFusion": {"input": {"pipelines": pipelines}, **options}}
+
+
+def _score_fusion(pipelines: dict, normalization: str, **options: Any) -> dict:
+    spec = {"input": {"pipelines": pipelines, "normalization": normalization}, **options}
+    return {"$scoreFusion": spec}
+
+
+_RANKED = {"a": [{"$sort": {"x": 1}}], "b": [{"$sort": {"x": -1}}]}
+_SCORED = {"a": [{"$score": {"score": "$x"}}], "b": [{"$score": {"score": {"$add": ["$x", 1]}}}]}
+
+#: `$rankFusion` and `$scoreFusion`, which mongod shapes as the pipelines it
+#: desugars them into (`document_source_rank_fusion.cpp`,
+#: `document_source_score_fusion.cpp`), each with the collection it runs
+#: against. Pinned instead against mongod's hashes in `secantus-commands`'
+#: `query_shape.rs`, as this server cannot explain them yet: an input of
+#: `$text` (no text index), of `$geoNear` (RM-552) and a
+#: `combination.method` of `"avg"` (RM-553).
+HYBRID: list[tuple[str, list]] = [
+    ("c", [_rank_fusion(_RANKED)]),
+    ("c", [_rank_fusion(_RANKED, scoreDetails=True)]),
+    ("c", [_rank_fusion(_RANKED, combination={"weights": {"b": 2}})]),
+    (
+        "c",
+        [
+            _rank_fusion(
+                SON(
+                    [
+                        ("b", [{"$match": {"x": {"$gt": 0}}}, {"$sort": {"x": 1}}, {"$limit": 5}]),
+                        ("a", [{"$sort": {"x": -1}}, {"$skip": 1}]),
+                        ("Z", [{"$sort": {"y": 1, "x": -1}}]),
+                    ]
+                )
+            )
+        ],
+    ),
+    ("c", [_score_fusion(_SCORED, "none")]),
+    ("c", [_score_fusion(_SCORED, "sigmoid")]),
+    ("c", [_score_fusion({"a": [{"$score": {"score": "$x"}}]}, "minMaxScaler")]),
+    ("c", [_score_fusion(_SCORED, "none", combination={"weights": {"b": 0.5}})]),
+    (
+        "c",
+        [
+            _score_fusion(
+                _SCORED,
+                "none",
+                combination={
+                    "method": "expression",
+                    "expression": {"$add": ["$$a", {"$multiply": ["$$b", 2]}]},
+                },
+            )
+        ],
+    ),
+    (
+        "c",
+        [
+            _score_fusion(
+                {
+                    "a": [{"$score": {"score": "$x"}}],
+                    "b": [
+                        {"$match": {"x": 1}},
+                        {"$score": {"score": "$x", "normalization": "sigmoid", "weight": 0.5}},
+                    ],
+                },
+                "minMaxScaler",
+                scoreDetails=True,
+            )
+        ],
+    ),
+    # Nested, a hybrid search runs against the collection of the stage
+    # holding it; a `$lookup` of one carries a flag the hash covers.
+    ("c", [{"$unionWith": {"coll": "o", "pipeline": [_rank_fusion(_RANKED)]}}]),
+    ("c", [{"$lookup": {"from": "o", "as": "j", "pipeline": [_rank_fusion(_RANKED)]}}]),
+    ("c", [{"$lookup": {"from": "o", "as": "j", "pipeline": [_score_fusion(_SCORED, "none")]}}]),
+    ("c", [{"$facet": {"f": [_rank_fusion(_RANKED)]}}]),
+]
+
+
 DISTINCTS: list[tuple[str, Any]] = [
     ("x", None),
     ("x", {"x": {"$gt": 5}}),
@@ -535,6 +615,11 @@ def test_an_expression(servers: Any, expression: Any) -> None:
 @pytest.mark.parametrize("pipeline", STAGES, ids=[str(p) for p in STAGES])
 def test_a_stage(servers: Any, pipeline: list) -> None:
     _check(servers, SON([("aggregate", "c"), ("pipeline", pipeline), ("cursor", {})]))
+
+
+@pytest.mark.parametrize("coll,pipeline", HYBRID, ids=[str(h) for h in HYBRID])
+def test_a_hybrid_search(servers: Any, coll: str, pipeline: list) -> None:
+    _check(servers, SON([("aggregate", coll), ("pipeline", pipeline), ("cursor", {})]))
 
 
 @pytest.mark.parametrize("filt", GEO_FILTERS, ids=[str(f) for f in GEO_FILTERS])

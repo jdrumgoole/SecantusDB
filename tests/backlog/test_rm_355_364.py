@@ -588,33 +588,6 @@ _UNSHAPED = {
         "find": "c",
         "filter": {"$jsonSchema": {"required": ["x"], "properties": {"x": {"bsonType": "int"}}}},
     },
-    "$rankFusion": {
-        "aggregate": "c",
-        "pipeline": [
-            {
-                "$rankFusion": {
-                    "input": {
-                        "pipelines": {"a": [{"$sort": {"x": 1}}], "b": [{"$sort": {"x": -1}}]}
-                    }
-                }
-            }
-        ],
-        "cursor": {},
-    },
-    "$scoreFusion": {
-        "aggregate": "c",
-        "pipeline": [
-            {
-                "$scoreFusion": {
-                    "input": {
-                        "pipelines": {"a": [{"$score": {"score": "$x"}}]},
-                        "normalization": "none",
-                    }
-                }
-            }
-        ],
-        "cursor": {},
-    },
 }
 
 
@@ -624,11 +597,10 @@ def test_a_query_of_every_kind_names_its_query_shape(rust_mongo: Any, mongod_rs:
     `queryShapeHash` for every `find`, `distinct` and `aggregate` it parses
     (measured 2026-11-07, and on 8.2.11 2026-11-09). This server shapes the
     predicates, operators, accumulators and stages in
-    `tests/mongod_live/test_query_shape_hash.py` and prints none for the
-    rest: `$jsonSchema`, which mongod shapes as the internal schema
-    predicates it translates the schema into, and `$rankFusion` and
-    `$scoreFusion`, which it shapes as the pipelines it desugars them
-    into."""
+    `tests/mongod_live/test_query_shape_hash.py`, `$rankFusion` and
+    `$scoreFusion` among them since 2026-11-12, and prints none for
+    `$jsonSchema`, which mongod shapes as the internal schema predicates it
+    translates the schema into."""
     name = fresh("qshape")
     answers = {}
     for server, client in (("rust", rust_mongo), ("mongod", mongod_rs)):
