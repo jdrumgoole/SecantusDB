@@ -382,11 +382,12 @@ def _sbe_limited_keys(client: Any) -> dict:
     return out
 
 
-@pytest.mark.backlog("RM-505")
+@pytest.mark.backlog_fixed("RM-505")
 def test_sbe_limited_sort_counts_every_key(rust_mongo: Any, mongod: Any) -> None:
     """mongod 8.2.11's SBE sort with a `$limit` in front of a `$group` adds
     every key it took (300 over 300 documents) to `totalKeysSorted`, for a
-    limit of 50 and of 1, and no bytes; this server adds 50 and 1."""
+    limit of 50 and of 1, and no bytes; this server added 50 and 1, then 1
+    for a limit of 1 alone, until the read kept its input for it (RM-468)."""
     assert _sbe_limited_keys(rust_mongo) == _sbe_limited_keys(mongod)
 
 

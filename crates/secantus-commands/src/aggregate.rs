@@ -880,11 +880,10 @@ pub fn aggregate(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
                 let front = crate::explain::pipeline_canonical(c, &read_pipeline);
                 // A leading `$sort` counts what mongod's sorter does over
                 // what the plan hands it, in that order: which documents a
-                // top-k sorter keeps (RM-399), and which a spilled run holds
-                // (RM-395). The read keeps that for it.
-                let keep_input = lead.sort.is_some()
-                    && secantus_core::aggregate::limit_for_pushdown(rest.get(1..).unwrap_or(&[]))
-                        .is_none_or(|k| k > 1);
+                // top-k sorter keeps (RM-399), which a spilled run holds
+                // (RM-395), and every key a sorter of one saw (RM-468). The
+                // read keeps that for it.
+                let keep_input = lead.sort.is_some();
                 let mut sort_input: Option<Vec<Vec<u8>>> = None;
                 let mut read = |sort: Option<&Document>, limit: i64| {
                     let moved = lead.filter.as_ref().filter(|_| sort.is_some());

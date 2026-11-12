@@ -689,18 +689,6 @@ These are explicit non-goals. Don't add them without a reason.
       which the run could share. Found 2026-11-12 (RM-466).
       Verify: tests/backlog/test_rm_found_rm466.py::test_a_later_match_replaces_the_one_plan_cache_stats_absorbed
       Backlog-ID: RM-554
-- [ ] **An aggregate's top-k sort counts only the keys it kept.** mongod
-      8.2.11 adds every document its sort read to
-      `metrics.query.sort.totalKeysSorted` for a leading `$sort` and
-      `$limit` (6 for `[{$match: {z: 0}}, {$sort: {y: 1}}, {$limit: 1}]`
-      over six matching documents, 12 for `[{$sort: {y: 1}}, {$limit: 2}]`
-      over twelve), as a `find` with the same sort and limit does. This
-      server's read sorts and limits without counting
-      (`aggregate.rs`'s `lead.limit` read), and the pipeline's `$sort` then
-      counts the k documents it is handed: 1 and 2. Found 2026-11-09
-      (RM-374).
-      Verify: tests/backlog/test_rm_found_rm374.py::test_an_aggregate_sort_with_a_limit_counts_every_key_it_sorted
-      Backlog-ID: RM-468
 - [ ] **A SORT of index keys past its budget does not spill.** mongod
       8.2.11's SORT below a FETCH (`type: "default"`) spills past its
       budget with `allowDiskUse`: 2000 65-byte members under a
@@ -1230,13 +1218,6 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       2026-11-10 (RM-398).
       Verify: tests/backlog/test_rm_326_sort_counts.py::test_sbe_sort_row_leaves_out_a_field_only_the_key_reads
       Backlog-ID: RM-504
-- [ ] **An SBE sort with a limit counts only the keys it keeps.** mongod
-      8.2.11's slot-based sort in `[{$sort: {n: 1}}, {$limit: 50}, {$group:
-      ...}]` over 300 documents adds all 300 keys it took to
-      `metrics.query.sort.totalKeysSorted`, for a limit of 50 and of 1. This
-      server adds 50 and 1. Found 2026-11-10 (RM-398).
-      Verify: tests/backlog/test_rm_326_sort_counts.py::test_sbe_limited_sort_counts_every_key
-      Backlog-ID: RM-505
 - [ ] **An SBE sort's spilled records are a byte longer than mongod's.**
       mongod 8.2.11's slot-based sort in front of a `$group`, over 300
       documents of a 1000-byte `s` under a 50000-byte budget, writes 13 runs

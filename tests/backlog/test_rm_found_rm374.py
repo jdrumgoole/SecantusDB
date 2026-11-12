@@ -23,7 +23,7 @@ def _keys_sorted(client: Any, pipeline: list) -> int:
     return after - before
 
 
-@pytest.mark.backlog("RM-468")
+@pytest.mark.backlog_fixed("RM-468")
 def test_an_aggregate_sort_with_a_limit_counts_every_key_it_sorted(
     rust_mongo: Any, mongod: Any
 ) -> None:
@@ -31,8 +31,8 @@ def test_an_aggregate_sort_with_a_limit_counts_every_key_it_sorted(
     `$limit` adds every document it read to
     `metrics.query.sort.totalKeysSorted` (6 for the six `{z: 0}` documents,
     12 with no `$match`), as a `find` with the same sort and limit does.
-    This server's read sorts and limits without counting, and the
-    pipeline's `$sort` then counts the k documents it is handed."""
+    This server's pipeline `$sort` counted only the k documents its read
+    handed it for a limit of one, which never kept the read's input."""
     pipelines = {
         "match-limit-1": [{"$match": {"z": 0}}, {"$sort": {"y": 1}}, {"$limit": 1}],
         "match-limit-2": [{"$match": {"z": 0}}, {"$sort": {"y": 1}}, {"$limit": 2}],

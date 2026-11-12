@@ -264,17 +264,17 @@ pub fn apply_pipeline(
             let order;
             let before = memlimit::report();
             // The query layer's sort: counted over what its plan gave it, in
-            // that order -- which documents a top-k sorter keeps (RM-399) and
-            // which a spilled run holds (RM-395) -- while the documents it
-            // hands on are the read's, already sorted and limited.
-            let input = match source {
-                Some(crate::sorter::SortSource::QueryLayer | crate::sorter::SortSource::Sbe)
-                    if first && limit.is_none_or(|k| k > 1) =>
-                {
-                    LEADING_INPUT.with(|l| l.borrow_mut().take())
-                }
-                _ => None,
-            };
+            // that order -- which documents a top-k sorter keeps (RM-399),
+            // which a spilled run holds (RM-395), and every key a sorter of
+            // one saw (RM-468) -- while the documents it hands on are the
+            // read's, already sorted and limited.
+            let input =
+                match source {
+                    Some(
+                        crate::sorter::SortSource::QueryLayer | crate::sorter::SortSource::Sbe,
+                    ) if first => LEADING_INPUT.with(|l| l.borrow_mut().take()),
+                    _ => None,
+                };
             docs = match (source, input) {
                 (None, _) => {
                     order = stable(&docs)?;
@@ -2525,6 +2525,29 @@ mod tests {
 
     fn run(docs: Vec<Document>, pipeline: Vec<Bson>) -> Vec<Document> {
         apply_pipeline(docs, &pipeline, &Document::new(), None).expect("should not fall back")
+    }
+
+    #[test]
+    fn a_leading_sort_of_one_counts_every_key_its_read_sorted() {
+        // mongod 8.2.11, `[{$match: {z: 0}}, {$sort: {y: 1}}, {$limit: k}]`
+        // over six matching documents: `totalKeysSorted` 6 for k of 1 and 2
+        // alike, the query layer's sorter seeing each document its plan
+        // read, though the pipeline is handed only the k it kept (RM-468).
+        let input: Vec<Document> = (0..6).map(|n| doc! {"_id": n, "y": n % 3}).collect();
+        for k in [1_i64, 2] {
+            let kept: Vec<Document> = input[..k as usize].to_vec();
+            let _guard = leading_sort(true, false).with_input(Some(input.clone()));
+            let (_, report) = memlimit::captured(|| {
+                run(
+                    kept,
+                    vec![
+                        Bson::Document(doc! {"$sort": {"y": 1}}),
+                        Bson::Document(doc! {"$limit": k}),
+                    ],
+                )
+            });
+            assert_eq!(report.keys_sorted, 6, "limit {k}");
+        }
     }
 
     #[test]
