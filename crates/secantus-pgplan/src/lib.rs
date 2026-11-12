@@ -50650,6 +50650,12 @@ fn explain_scan_patterns(
 ) -> Option<Vec<ScanPattern>> {
     let (table, where_clause) = explain_scan_where(query)?;
     let def = lookup(&table)?;
+    Some(where_patterns(where_clause, &def))
+}
+
+/// The [`ScanPattern`]s of `where_clause`, a WHERE over table `def`'s
+/// columns ([`explain_scan_patterns`]).
+fn where_patterns(where_clause: &pg_query::protobuf::Node, def: &TableDef) -> Vec<ScanPattern> {
     fn walk(n: &pg_query::protobuf::Node, def: &TableDef, out: &mut Vec<ScanPattern>) {
         match n.node.as_ref() {
             Some(N::BoolExpr(b)) => b.args.iter().for_each(|a| walk(a, def, out)),
@@ -50662,8 +50668,8 @@ fn explain_scan_patterns(
         }
     }
     let mut out = Vec::new();
-    walk(where_clause, &def, &mut out);
-    Some(out)
+    walk(where_clause, def, &mut out);
+    out
 }
 
 fn scan_pattern(e: &AExpr, def: &TableDef) -> Option<ScanPattern> {

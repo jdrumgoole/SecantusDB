@@ -640,10 +640,12 @@ impl PgHandler {
         let mut ranges: Vec<Document> = Vec::new();
         for f in &filters {
             if let (true, Some(r)) = (restriction(f), &f.restrict) {
-                if single_bound(r) {
-                    ranges.push(r.clone());
+                if single_bound(&r.filter) {
+                    ranges.push(r.filter.clone());
                 } else {
-                    sel_factor *= self.restriction_selectivity(&leaves.first()?.table, r)?;
+                    let _patterns = with_explain_patterns(&r.patterns);
+                    sel_factor *=
+                        self.restriction_selectivity(&leaves.first()?.table, &r.filter)?;
                 }
                 continue;
             }
@@ -4414,6 +4416,28 @@ impl Drop for PatternsGuard {
 pub(crate) fn explain_patterns(patterns: &[secantus_pgplan::ScanPattern]) -> PatternsGuard {
     EXPLAIN_PATTERNS.with(|c| *c.borrow_mut() = patterns.to_vec());
     PatternsGuard(())
+}
+
+/// Holds a join restriction's LIKE patterns beside the EXPLAIN's own
+/// until it is dropped.
+pub(crate) struct ExtraPatternsGuard(usize);
+
+impl Drop for ExtraPatternsGuard {
+    fn drop(&mut self) {
+        EXPLAIN_PATTERNS.with(|c| c.borrow_mut().truncate(self.0));
+    }
+}
+
+/// Add `patterns` (a join restriction's, [`secantus_pgplan::joins::Restriction`])
+/// to what this EXPLAIN's scans read a `$regex` clause as, until the guard
+/// is dropped.
+fn with_explain_patterns(patterns: &[secantus_pgplan::ScanPattern]) -> ExtraPatternsGuard {
+    EXPLAIN_PATTERNS.with(|c| {
+        let mut c = c.borrow_mut();
+        let len = c.len();
+        c.extend_from_slice(patterns);
+        ExtraPatternsGuard(len)
+    })
 }
 
 /// The LIKE / ILIKE pattern behind a lowered `$regex` clause on `field`:

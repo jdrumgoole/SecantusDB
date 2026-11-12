@@ -1547,14 +1547,53 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "        Filter: (e.a <> (a)::bigint)",
         ],
     ),
-    # An ON conjunct over the preserved side that is a pattern match.
+    # Split from RP-354 and fixed: an ON conjunct over the preserved side
+    # that is a pattern match is one operator of the Join Filter, its
+    # selectivity `patternsel` over the column's statistics; before, the
+    # join printed zeros.
     "nested loop left join with a pattern over its preserved side": (
-        "RP-354",
+        "RP-329",
         _ANALYSED,
         "explain select * from e left join e e2 on e.a <> e2.a and e.b like 'v1%'",
         [
             "Nested Loop Left Join  (cost=0.00..17532.50 rows=99900 width=14)",
             "  Join Filter: ((e.a <> e2.a) AND (e.b ~~ 'v1%'::text))",
+            "  ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
+            "  ->  Materialize  (cost=0.00..20.00 rows=1000 width=7)",
+            "        ->  Seq Scan on e e2  (cost=0.00..15.00 rows=1000 width=7)",
+        ],
+    ),
+    "nested loop left join with a negated ilike over its preserved side": (
+        "RP-329",
+        _ANALYSED,
+        "explain select * from e left join e e2 on e.a <> e2.a and e.b not ilike 'V1%'",
+        [
+            "Nested Loop Left Join  (cost=0.00..17532.50 rows=899100 width=14)",
+            "  Join Filter: ((e.a <> e2.a) AND (e.b !~~* 'V1%'::text))",
+            "  ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
+            "  ->  Materialize  (cost=0.00..20.00 rows=1000 width=7)",
+            "        ->  Seq Scan on e e2  (cost=0.00..15.00 rows=1000 width=7)",
+        ],
+    ),
+    "nested loop left join into an index with a pattern over its preserved side": (
+        "RP-329",
+        _ANALYSED,
+        "explain select * from e left join k on e.a < k.a and e.b like 'v1%'",
+        [
+            "Nested Loop Left Join  (cost=0.28..10320.00 rows=33333 width=14)",
+            "  Join Filter: (e.b ~~ 'v1%'::text)",
+            "  ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
+            "  ->  Index Scan using k_pkey on k  (cost=0.28..6.14 rows=333 width=7)",
+            "        Index Cond: (a > e.a)",
+        ],
+    ),
+    "nested loop left join with a pattern in an or over its preserved side": (
+        "RP-329",
+        _ANALYSED,
+        "explain select * from e left join e e2 on e.a <> e2.a and (e.b like 'v1%' or e.a > 5)",
+        [
+            "Nested Loop Left Join  (cost=0.00..20032.50 rows=994505 width=14)",
+            "  Join Filter: ((e.a <> e2.a) AND ((e.b ~~ 'v1%'::text) OR (e.a > 5)))",
             "  ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
             "  ->  Materialize  (cost=0.00..20.00 rows=1000 width=7)",
             "        ->  Seq Scan on e e2  (cost=0.00..15.00 rows=1000 width=7)",
@@ -3571,6 +3610,17 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "  ->  Hash  (cost=1.38..1.38 rows=29 width=20)",
             "        ->  Seq Scan on s  (cost=0.00..1.38 rows=29 width=20)",
             "              Filter: (c ~~ 'xxx%'::text)",
+        ],
+    ),
+    # Still open: a LIKE's ESCAPE is a `like_escape` call PostgreSQL folds
+    # into the pattern constant, which `patternsel` then estimates.
+    "a like with an escape clause is a folded pattern": (
+        "RP-915",
+        _ANALYSED,
+        "explain select * from e where b like 'v1!%' escape '!'",
+        [
+            "Seq Scan on e  (cost=0.00..17.50 rows=1 width=7)",
+            "  Filter: (b ~~ 'v1\\%'::text)",
         ],
     ),
     "estimate of an anchored regex match": (

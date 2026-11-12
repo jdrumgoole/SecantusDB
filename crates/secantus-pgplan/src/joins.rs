@@ -3022,12 +3022,22 @@ pub struct JoinFilter {
     /// the other side's operand any expression of the outer row, RP-354).
     /// Empty for anything else, and where neither operand is one.
     pub inequality_keys: Vec<String>,
-    /// A conjunct over one stored table's columns alone, lowered as that
-    /// table's WHERE over its stored fields: the clause
+    /// A conjunct over one stored table's columns alone, as the clause
     /// `clause_selectivity` estimates as a restriction, from the table's
     /// statistics (an ON conjunct over a LEFT join's preserved side stays
     /// the join's filter, RP-354). `None` for anything else.
-    pub restrict: Option<Document>,
+    pub restrict: Option<Restriction>,
+}
+
+/// [`JoinFilter::restrict`]: the conjunct lowered as its table's WHERE
+/// over its stored fields, and the LIKE / ILIKE conjuncts behind that
+/// WHERE's `$regex` clauses, which `patternsel` estimates from the
+/// pattern, not the regex (as a single relation's scan reads them,
+/// `ExplainOptions::scan_patterns`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Restriction {
+    pub filter: Document,
+    pub patterns: Vec<ScanPattern>,
 }
 
 /// `c`, a conjunct over joined keys, as the WHERE of the one stored
@@ -3042,7 +3052,7 @@ fn restriction_filter(
     sides: [&JoinNode; 2],
     lookup: &dyn Fn(&str) -> Option<TableDef>,
     params: &[Bson],
-) -> Option<Document> {
+) -> Option<Restriction> {
     let [alias] = key_aliases(c).try_into().ok()?;
     let (plan, def, columns) = sides.into_iter().find_map(|n| match n {
         JoinNode::Leaf { plan, def, columns } if def.name == alias => Some((plan, def, columns)),
@@ -3083,7 +3093,10 @@ fn restriction_filter(
     if !renamed {
         return None;
     }
-    crate::lower_where(&node, &table, params).ok()
+    Some(Restriction {
+        filter: crate::lower_where(&node, &table, params).ok()?,
+        patterns: crate::where_patterns(&node, &table),
+    })
 }
 
 /// What a join filter's selectivity is estimated as with no statistics.
@@ -3222,9 +3235,10 @@ fn not_equal_cast(c: &pg_query::protobuf::Node, scope: &Scope) -> Option<(CastKe
     (l.cast.is_some() || r.cast.is_some()).then_some((l, r))
 }
 
-/// The operators `n` evaluates: each operator and IS DISTINCT FROM, and a
-/// BETWEEN's two comparisons (four when SYMMETRIC), as
-/// `transformAExprBetween` expands it.
+/// The operators `n` evaluates: each operator and IS DISTINCT FROM, a
+/// pattern match (`~~`, `!~~`, `~~*`, `!~~*`, each one `OpExpr` whose
+/// function's `procost` is 1), and a BETWEEN's two comparisons (four when
+/// SYMMETRIC), as `transformAExprBetween` expands it.
 fn operator_count(n: &pg_query::protobuf::Node) -> usize {
     use pg_query::protobuf::AExprKind;
     let mut count = 0;
@@ -3232,7 +3246,12 @@ fn operator_count(n: &pg_query::protobuf::Node) -> usize {
     let _ = walk_expr(&mut node, &mut |x| {
         if let Some(N::AExpr(e)) = x.node.as_ref() {
             count += match AExprKind::try_from(e.kind) {
-                Ok(AExprKind::AexprOp | AExprKind::AexprDistinct) => 1,
+                Ok(
+                    AExprKind::AexprOp
+                    | AExprKind::AexprDistinct
+                    | AExprKind::AexprLike
+                    | AExprKind::AexprIlike,
+                ) => 1,
                 Ok(AExprKind::AexprBetween | AExprKind::AexprNotBetween) => 2,
                 Ok(AExprKind::AexprBetweenSym | AExprKind::AexprNotBetweenSym) => 4,
                 _ => 0,
@@ -3244,9 +3263,9 @@ fn operator_count(n: &pg_query::protobuf::Node) -> usize {
 }
 
 /// `n` is built only of what [`operator_count`] prices as
-/// `cost_qual_eval` does: comparisons, BETWEEN, AND / OR / NOT, columns
-/// and constants. An IN list, a pattern, a null test, a call or a cast of
-/// a column costs otherwise.
+/// `cost_qual_eval` does: comparisons, LIKE and ILIKE, BETWEEN, AND / OR /
+/// NOT, columns and constants. An IN list, a null test, a call (a LIKE's
+/// ESCAPE is `like_escape`) or a cast of a column costs otherwise.
 fn priced_by_operator_count(n: &pg_query::protobuf::Node) -> bool {
     use pg_query::protobuf::AExprKind;
     match n.node.as_ref() {
@@ -3261,6 +3280,8 @@ fn priced_by_operator_count(n: &pg_query::protobuf::Node) -> bool {
                 AExprKind::try_from(e.kind),
                 Ok(AExprKind::AexprOp
                     | AExprKind::AexprDistinct
+                    | AExprKind::AexprLike
+                    | AExprKind::AexprIlike
                     | AExprKind::AexprBetween
                     | AExprKind::AexprNotBetween
                     | AExprKind::AexprBetweenSym
@@ -4919,13 +4940,23 @@ mod tests {
     }
 
     #[test]
+    fn a_pattern_match_is_one_operator() {
+        // `~~`, `!~~`, `~~*` and `!~~*` are each one `OpExpr` (RP-354).
+        let ops = |w: &str| operator_count(&where_of(&format!("select 1 from t where {w}")));
+        assert_eq!(ops("b like 'x%'"), 1);
+        assert_eq!(ops("a <> b and b not ilike 'x%'"), 2);
+    }
+
+    #[test]
     fn only_operators_price_a_restriction() {
         let priced =
             |w: &str| priced_by_operator_count(&where_of(&format!("select 1 from t where {w}")));
         assert!(priced("a > 990"));
         assert!(priced("a between 1 and 2 or b = 'x'::text"));
         assert!(!priced("a in (1, 2, 3)"));
-        assert!(!priced("b like 'x%'"));
+        assert!(priced("b like 'x%'"));
+        assert!(priced("b not ilike 'X%'::text"));
+        assert!(!priced("b like 'x!%' escape '!'"));
         assert!(!priced("a::numeric > 1"));
         assert!(!priced("a is null"));
         assert!(!priced("abs(a) > 1"));

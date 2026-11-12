@@ -1582,9 +1582,14 @@ a regression test.
       with its cast (a `pg_cast` function one call, an I/O conversion
       two) and estimated as an expression with no statistics, the
       parameterized scan's Filter where the inner is indexed (`e left
-      join k on e.a < k.a and e.a <> k.b::int`). Still zeros: such a
-      preserved-side conjunct that costs other than its operators (an IN
-      list, a pattern, a cast of a column), and a `<>` whose operands
+      join k on e.a < k.a and e.a <> k.b::int`). Since 2026-11-12 a LIKE
+      or ILIKE (or its negation) of a string column against a constant
+      pattern is one such conjunct, one operator a pair, estimated by
+      `patternsel` over the column's statistics (`e left join e e2 on e.a
+      <> e2.a and e.b like 'v1%'`). Still zeros: such a preserved-side
+      conjunct that costs other than its operators (an IN list, a cast of
+      a column, a regex match, whose selectivity is RP-423's), and a `<>`
+      whose operands
       then differ in type (`e.a <> k.a::bigint`, PostgreSQL's `int48ne`,
       `cost=0.28..11142.50 rows=333000` over `Index Scan using k_pkey on
       k` `cost=0.28..7.81 rows=332`). (A binary-coercible cast is its
@@ -1601,7 +1606,7 @@ a regression test.
       zeros (`length(e.b) < k.a`, PostgreSQL's Memoize over the Index
       Scan).
       Backlog-ID: RP-354
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[nested loop left join with a cross-type inequality into an index], tests/backlog/test_rp_explain_costs.py::test_plan[nested loop left join with a pattern over its preserved side], tests/backlog/test_rp_explain_costs.py::test_plan[nested loop of three relations]
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[nested loop left join with a cross-type inequality into an index], tests/backlog/test_rp_explain_costs.py::test_plan[nested loop of three relations]
 - [ ] **EXPLAIN ANALYZE of a nested loop into an index on an expression
       of the outer row prints no actual rows.** Its estimate is right, but
       the actual-row count of a parameterized inner scan is only worked
@@ -1819,6 +1824,19 @@ a regression test.
       RP-404).
       Verify: tests/backlog/test_rp_explain_costs.py::test_plan[estimate of a function call compared with a constant], tests/backlog/test_rp_explain_costs.py::test_plan[estimate of a join over a scan filtered by a LIKE], tests/backlog/test_rp_explain_costs.py::test_plan[estimate of a LIKE over an expression], tests/backlog/test_rp_explain_costs.py::test_plan[estimate of a LIKE over a table never analysed], tests/backlog/test_rp_explain_costs.py::test_plan[estimate of an anchored regex match], tests/backlog/test_rp_explain_costs.py::test_plan[estimate of an unanchored regex match]
       Backlog-ID: RP-423
+- [ ] **A LIKE with an ESCAPE clause prints a `like_escape` call and is
+      not estimated.** PostgreSQL folds `like_escape(pattern, escape)` of
+      two constants into the pattern rewritten with the default escape
+      (`eval_const_expressions`), which `patternsel` then estimates:
+      PostgreSQL 15.19 prints `explain select * from e where b like 'v1!%'
+      escape '!'` (`e` analysed, 1000 rows) as `Seq Scan on e
+      (cost=0.00..17.50 rows=1 width=7)` with `Filter: (b ~~
+      'v1\%'::text)`; here `Filter: (b ~~ like_escape('v1!%'::text,
+      '!'::text))` and zero costs. The same in a nested loop's Join Filter.
+      Its rows are right. Measured on a private 15.19 cluster (found while
+      working RP-354).
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a like with an escape clause is a folded pattern]
+      Backlog-ID: RP-915
 - [ ] **A lone scan's Filter does not put an expression's conjunct
       after a cheaper one.** PostgreSQL 15.19 orders a qual list cheapest
       first (`order_qual_clauses`, by `cost_qual_eval`): `select * from e
