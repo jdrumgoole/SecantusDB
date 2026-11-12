@@ -30,9 +30,9 @@ COLLATION_QUERY = (
 #: for one column as for three. The query is timed WARM, on its second run:
 #: the first query after any DDL rebuilt the whole of `pg_attribute` (RP-715),
 #: which cost a debug build 0.6 s on a fast laptop and took a slow CI runner
-#: past this budget on 2026-11-09 (PR #2552); it still rebuilds every user
-#: relation's rows. Warm, a debug build answers in about 0.007 s, so the
-#: budget is far from both answers.
+#: past this budget on 2026-11-09 (PR #2552); it still grows with the
+#: schema. Warm, a debug build answers in about 0.007 s, so the budget is
+#: far from both answers.
 BUDGET_SECONDS = 2.0
 
 
@@ -103,28 +103,32 @@ def pg_alone(tmp_path: Path) -> Iterator[Any]:
         yield conn
 
 
-#: User tables made before measuring.
-SCHEMA_TABLES = 200
+#: User tables added between the two measurements.
+GROWTH_TABLES = 400
 
 
 @pytest.mark.backlog("RP-715")
 def test_the_first_catalog_query_after_ddl_does_not_grow_with_the_schema(
     pg_alone: Any,
 ) -> None:
-    """PostgreSQL 15.19 (private cluster, 2026-11-12) answers the collation
-    query in 0.33 ms straight after a `CREATE TABLE` with 200 other tables
-    in the database, and 0.26 ms after that; with 400, 0.20 ms and 0.11 ms.
-    DDL invalidates the changed relation's entries only (`inval.c`), so the
-    rest of the schema costs nothing. A debug `secantusd-pg` rebuilds every
-    user relation's `pg_attribute`, `pg_type` and `pg_class` rows after any
-    DDL: about 0.11 s first and 0.008 s warm with 200 tables, 0.21 s and
-    0.010 s with 400 (2026-11-12).
+    """PostgreSQL 15.19 answers the first collation query after a `CREATE
+    TABLE` in the same time however many other tables there are (0.33 ms
+    with 200, 0.20 ms with 400, private cluster, 2026-11-12): its scans read
+    the one relation's rows by index, and DDL invalidates only the cache
+    entries it changed (`inval.c`). A debug `secantusd-pg` took about
+    0.010 s with no other table, 0.049 s with 400 and 0.092 s with 800
+    (2026-11-12): a read of one type's `pg_type` row still builds every
+    type's row, a read of one relation's `pg_attribute` rows still walks
+    every relation, and the catalog-read walk counts every `pg_attribute`
+    row for the sequential scan it models (RP-909).
 
-    The same ratio as the test above, with the schema enlarged first."""
-    for i in range(SCHEMA_TABLES):
-        pg_alone.execute(f"CREATE TABLE rp715_extra_{i} (a int, b text)")
-    first, warm = _first_and_warm(pg_alone, "rp715s")
-    assert first < 3 * warm + 0.02, (
-        f"first query after DDL with {SCHEMA_TABLES} tables {first * 1000:.0f} ms, "
-        f"warm {warm * 1000:.0f} ms"
+    The fastest first-after-DDL run with 400 more tables against the
+    fastest with none, in one server."""
+    small, _ = _first_and_warm(pg_alone, "rp715a")
+    for i in range(GROWTH_TABLES):
+        pg_alone.execute(f"CREATE TABLE rp715_grow_{i} (a int, b text)")
+    large, _ = _first_and_warm(pg_alone, "rp715b")
+    assert large < 2 * small + 0.01, (
+        f"first query after DDL {small * 1000:.0f} ms with no other table, "
+        f"{large * 1000:.0f} ms with {GROWTH_TABLES}"
     )

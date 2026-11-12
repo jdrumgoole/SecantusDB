@@ -6,6 +6,7 @@
 //! set is left alone.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use bson::{Bson, Document};
 use secantus_pgcatalog::{Column, TableDef};
@@ -1138,10 +1139,44 @@ impl PgHandler {
         .collect()
     }
 
+    /// Each index's access method, by its oid (`pg_class.relam`, RP-285);
+    /// empty for any catalog but `pg_class`.
+    fn index_methods(&self, name: &str) -> HashMap<i64, i64> {
+        if name != "pg_class" {
+            return HashMap::new();
+        }
+        // Each table's indexes listed once, not once per index.
+        let mut listed: HashMap<String, Vec<Document>> = HashMap::new();
+        self.index_relations()
+            .into_iter()
+            .filter_map(|ix| {
+                let stored = listed
+                    .entry(ix.table.name.clone())
+                    .or_insert_with(|| {
+                        self.storage
+                            .list_indexes(self.db(), &ix.table.name)
+                            .unwrap_or_default()
+                    })
+                    .iter()
+                    .find(|d| d.get_str("name") == Ok(ix.name.as_str()))?;
+                let method = stored.get_str("sqlMethod").ok().or_else(|| {
+                    stored
+                        .get_document("options")
+                        .ok()
+                        .and_then(|o| o.get_str("sqlMethod").ok())
+                });
+                Some((
+                    ix.oid,
+                    secantus_pgplan::misc_alter::method_oid(method.unwrap_or("btree"))?,
+                ))
+            })
+            .collect()
+    }
+
     /// Fill the extra columns of `name`'s rows with PostgreSQL's values.
     pub(crate) fn fill_catalog_columns(&self, name: &str, def: &TableDef, rows: &mut [Document]) {
         let extra = extra_columns(name);
-        if extra.is_empty() {
+        if extra.is_empty() || rows.is_empty() {
             return;
         }
         let field = |c: &str| def.field_of(c);
@@ -1156,21 +1191,20 @@ impl PgHandler {
             _ => String::new(),
         };
         // Per table: (oid, def), for the columns that depend on it.
-        let tables: Vec<(i64, TableDef)> = match name {
-            "pg_class" | "pg_attribute" => self
-                .all_table_defs()
-                .unwrap_or_default()
-                .into_iter()
-                .filter_map(|t| Some((self.relation_oid(&t.name)?, t)))
-                .collect(),
-            _ => Vec::new(),
+        let defs = match name {
+            "pg_class" | "pg_attribute" => self.shared_table_defs().unwrap_or_default(),
+            _ => Arc::default(),
         };
+        let tables: Vec<(i64, &TableDef)> = defs
+            .iter()
+            .filter_map(|t| Some((self.relation_oid(&t.name)?, t)))
+            .collect();
         // By oid, the first of each: every row asks for its relation's
         // several times, and a scan of the list per ask made the fill
         // quadratic in the number of tables (RP-715).
         let mut by_oid: HashMap<i64, &TableDef> = HashMap::with_capacity(tables.len());
         for (oid, t) in &tables {
-            by_oid.entry(*oid).or_insert(t);
+            by_oid.entry(*oid).or_insert(*t);
         }
         let table_by_oid = |oid: i64| by_oid.get(&oid).copied();
         // Every collation by name, listed once for the rows that need it.
@@ -1189,42 +1223,23 @@ impl PgHandler {
             Vec::new()
         };
         // Every user relation's `(oid, name, owner)`, for the row types'.
-        let rel_owners: Vec<(i64, String, i64)> = if name == "pg_type" {
-            self.relation_owners()
-        } else {
-            Vec::new()
+        // Listed when a row first needs it: it is all of `pg_class`, which
+        // a read of one built-in type's row never needs (RP-715).
+        let rel_owners_once = std::cell::OnceCell::new();
+        let rel_owners = || -> &Vec<(i64, String, i64)> {
+            rel_owners_once.get_or_init(|| {
+                if name == "pg_type" {
+                    self.relation_owners()
+                } else {
+                    Vec::new()
+                }
+            })
         };
-        // Each index's access method, by its oid: `relam` (RP-285).
-        let index_methods: std::collections::HashMap<i64, i64> = if name == "pg_class" {
-            // Each table's indexes listed once, not once per index.
-            let mut listed: std::collections::HashMap<String, Vec<Document>> =
-                std::collections::HashMap::new();
-            self.index_relations()
-                .into_iter()
-                .filter_map(|ix| {
-                    let stored = listed
-                        .entry(ix.table.name.clone())
-                        .or_insert_with(|| {
-                            self.storage
-                                .list_indexes(self.db(), &ix.table.name)
-                                .unwrap_or_default()
-                        })
-                        .iter()
-                        .find(|d| d.get_str("name") == Ok(ix.name.as_str()))?;
-                    let method = stored.get_str("sqlMethod").ok().or_else(|| {
-                        stored
-                            .get_document("options")
-                            .ok()
-                            .and_then(|o| o.get_str("sqlMethod").ok())
-                    });
-                    Some((
-                        ix.oid,
-                        secantus_pgplan::misc_alter::method_oid(method.unwrap_or("btree"))?,
-                    ))
-                })
-                .collect()
-        } else {
-            std::collections::HashMap::new()
+        // Each index's access method, by its oid: `relam` (RP-285). Read,
+        // from every table's index list, when an index's row first needs it.
+        let index_methods_once = std::cell::OnceCell::new();
+        let index_methods = || -> &std::collections::HashMap<i64, i64> {
+            index_methods_once.get_or_init(|| self.index_methods(name))
         };
         // Per index: each key's type oid and whether it sorts DESC.
         // Per index, each key's `(type, descending, explicit class)`.
@@ -1361,7 +1376,7 @@ impl PgHandler {
                             "relam" => Bson::Int64(match kind.as_str() {
                                 "r" | "m" => self.table_relam(table),
                                 "t" => 2,
-                                "i" | "I" => index_methods.get(&oid).copied().unwrap_or(403),
+                                "i" | "I" => index_methods().get(&oid).copied().unwrap_or(403),
                                 _ => 0,
                             }),
                             "relfilenode" => Bson::Int64(match kind.as_str() {
@@ -1640,7 +1655,7 @@ impl PgHandler {
                         if int(get(row, "typelem")) != 0 {
                             if let Some(element) = name.strip_prefix('_') {
                                 name = element.to_string();
-                                relid = rel_owners
+                                relid = rel_owners()
                                     .iter()
                                     .find(|(_, n, _)| *n == name)
                                     .map_or(0, |(o, _, _)| *o);
@@ -1652,9 +1667,12 @@ impl PgHandler {
                                 .find(|(n, _)| *n == name)
                                 .map(|(_, o)| *o)
                                 .or_else(|| {
-                                    rel_owners
+                                    if relid == 0 {
+                                        return None;
+                                    }
+                                    rel_owners()
                                         .iter()
-                                        .find(|(o, _, _)| relid != 0 && *o == relid)
+                                        .find(|(o, _, _)| *o == relid)
                                         .map(|(_, _, owner)| *owner)
                                 })
                                 .unwrap_or(10),

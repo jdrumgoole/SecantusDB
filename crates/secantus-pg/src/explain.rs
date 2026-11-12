@@ -800,8 +800,18 @@ pub(crate) fn move_param_conds(root: &mut PlanNode) {
     };
     // The other join clauses move into the scan too
     // (`join_clause_is_movable_into`): its `Filter`, its own columns
-    // unqualified.
-    root.details.remove(at);
+    // unqualified. One that reads no inner column -- a LEFT join's ON
+    // restriction of its outer side -- cannot move, and stays the join's
+    // `Join Filter`.
+    let (rest, kept): (Vec<String>, Vec<String>) =
+        rest.into_iter().partition(|c| mentions_alias(c, &alias));
+    match kept.as_slice() {
+        [] => {
+            root.details.remove(at);
+        }
+        [one] => root.details[at].1 = one.clone(),
+        many => root.details[at].1 = format!("({})", many.join(" AND ")),
+    }
     let inner_cond = cond.clone();
     let inner = &mut root.children[1];
     inner.details.insert(0, ("Index Cond".into(), cond));
@@ -836,6 +846,26 @@ pub(crate) fn move_param_conds(root: &mut PlanNode) {
             .details
             .insert(1, ("Filter".into(), format!("({})", many.join(" AND ")))),
     }
+}
+
+/// Whether `text` names a column qualified by `alias` outside its string
+/// literals.
+fn mentions_alias(text: &str, alias: &str) -> bool {
+    let prefix = format!("{alias}.");
+    let mut quoted = false;
+    let mut prev: Option<char> = None;
+    for (i, c) in text.char_indices() {
+        if c == '\'' {
+            quoted = !quoted;
+        } else if !quoted
+            && text[i..].starts_with(&prefix)
+            && prev.is_none_or(|p| !(p.is_alphanumeric() || p == '_' || p == '.' || p == '"'))
+        {
+            return true;
+        }
+        prev = Some(c);
+    }
+    false
 }
 
 /// `text` with each `alias.` qualifier dropped, as a scan prints its own
@@ -2412,6 +2442,64 @@ mod join_type_tests {
             },
         );
         assert_eq!(root.children[1].name, "Index Only Scan using k_pkey on k");
+    }
+
+    /// A LEFT join's ON restriction of its outer side reads no inner
+    /// column, so no inner scan can take it (`join_clause_is_movable_into`):
+    /// it stays the join's `Join Filter`, a literal naming the inner's
+    /// column included (RP-354).
+    #[test]
+    fn an_outer_restriction_stays_the_join_filter() {
+        assert!(mentions_alias("(e.a <> k.b)", "k"));
+        assert!(!mentions_alias("(e.a > 990)", "k"));
+        assert!(!mentions_alias("(e.b <> 'k.a'::text)", "k"));
+        assert!(!mentions_alias("(kk.a > 990)", "k"));
+        let rel = |name: &str| {
+            let mut n = PlanNode::new(format!("Seq Scan on {name}"));
+            n.props.push(("Relation Name".into(), name.to_string()));
+            n
+        };
+        let joined = |filter: &str| {
+            let mut root = PlanNode::new("Nested Loop Left Join");
+            root.children.push(rel("e"));
+            root.children.push(rel("k"));
+            param_index_inner(
+                &mut root,
+                &crate::scan_estimate::ParamScan {
+                    index: "k_pkey".into(),
+                    alias: "k".into(),
+                    column: "a".into(),
+                    index_only: false,
+                },
+            );
+            root.details.push(("Join Filter".into(), filter.into()));
+            move_param_conds(&mut root);
+            root
+        };
+        let root = joined("((e.a < k.a) AND (e.a > 990))");
+        assert_eq!(
+            root.details,
+            vec![("Join Filter".to_string(), "(e.a > 990)".to_string())]
+        );
+        assert_eq!(
+            root.children[1].details,
+            vec![("Index Cond".to_string(), "(a > e.a)".to_string())]
+        );
+        let root = joined("((e.a < k.a) AND (e.a > 990) AND (e.b <> k.b) AND (e.b = 'v1'::text))");
+        assert_eq!(
+            root.details,
+            vec![(
+                "Join Filter".to_string(),
+                "((e.a > 990) AND (e.b = 'v1'::text))".to_string()
+            )]
+        );
+        assert_eq!(
+            root.children[1].details,
+            vec![
+                ("Index Cond".to_string(), "(a > e.a)".to_string()),
+                ("Filter".to_string(), "(e.b <> b)".to_string()),
+            ]
+        );
     }
 
     #[test]

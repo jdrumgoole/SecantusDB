@@ -21921,20 +21921,45 @@ impl PgHandler {
                 .unwrap_or_else(|e| e.into_inner())
                 .generation(),
         );
-        let hit = self
-            .virtual_cache
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .get(name)
-            .filter(|(c, v, g, _)| (*c, *v, *g) == key)
-            .map(|(_, _, _, rows)| Arc::clone(rows));
+        // A read whose filter pins the relation (`attrelid = $1`, `oid =
+        // $1`) builds that relation's rows alone, as PostgreSQL answers it
+        // with an index scan of the catalog's oid index and reads no other
+        // relation's rows (RP-715). One such build per catalog per cycle: a
+        // second relation asked for in the same cycle -- a correlated
+        // subquery's per-row lookups -- builds every row once, so a cycle
+        // never pays one build per outer row.
+        let pinned = catalog_key(name, filter);
+        let keyed_name = pinned.as_ref().map(|(_, k)| format!("{name}\u{1f}{k}"));
+        let (hit, build_key) = {
+            let cache = self.virtual_cache.lock().unwrap_or_else(|e| e.into_inner());
+            let current = |n: &str| {
+                cache
+                    .get(n)
+                    .filter(|(c, v, g, _)| (*c, *v, *g) == key)
+                    .map(|(_, _, _, rows)| Arc::clone(rows))
+            };
+            match (current(name), &keyed_name) {
+                (Some(rows), _) => (Some(rows), None),
+                (None, Some(k)) => match current(k) {
+                    Some(rows) => (Some(rows), None),
+                    None => {
+                        let prefix = format!("{name}\u{1f}");
+                        let another = cache
+                            .iter()
+                            .any(|(n, (c, v, g, _))| n.starts_with(&prefix) && (*c, *v, *g) == key);
+                        (None, if another { None } else { pinned.clone() })
+                    }
+                },
+                (None, None) => (None, None),
+            }
+        };
         let rows = match hit {
             Some(rows) => rows,
             None => {
                 // Rows a read failed in are not kept: the next reader builds
                 // them again (and the failure stays noted for this one's).
                 let outer = CATALOG_FILL_ERROR.with(|e| e.borrow_mut().take());
-                let rows = self.catalog_rows(name);
+                let rows = self.catalog_rows_keyed(name, build_key.as_ref());
                 let failed = CATALOG_FILL_ERROR.with(|e| {
                     let mut e = e.borrow_mut();
                     if e.is_none() {
@@ -21946,10 +21971,15 @@ impl PgHandler {
                 });
                 let rows = Arc::new(rows?);
                 if !failed {
-                    self.virtual_cache
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .insert(name.to_string(), (key.0, key.1, key.2, Arc::clone(&rows)));
+                    let entry = match (&build_key, keyed_name) {
+                        (Some(_), Some(k)) => k,
+                        _ => name.to_string(),
+                    };
+                    let mut cache = self.virtual_cache.lock().unwrap_or_else(|e| e.into_inner());
+                    // Every entry another tuple keys is stale for good: the
+                    // cycle, the version and the generation only move on.
+                    cache.retain(|_, (c, v, g, _)| (*c, *v, *g) == key);
+                    cache.insert(entry, (key.0, key.1, key.2, Arc::clone(&rows)));
                 }
                 rows
             }
@@ -21984,7 +22014,45 @@ impl PgHandler {
     /// Every row of one virtual table, unfiltered: those built for this
     /// read, and those no statement changes (`CatalogRows::fixed`).
     pub(crate) fn catalog_rows(&self, name: &str) -> Option<CatalogRows> {
+        self.catalog_rows_keyed(name, None)
+    }
+
+    /// [`Self::catalog_rows`], or with `key` (a field and an oid,
+    /// [`catalog_key`]) only the rows whose field holds that oid, and any
+    /// row without the field: those of one relation, as an index scan of
+    /// the catalog's oid index returns them. Every row is built as the full
+    /// listing builds it, so the rows are those the full listing filtered
+    /// by the key would hold; only the rows the key leaves out are not
+    /// built (`pg_attribute`) or filled (RP-715).
+    pub(crate) fn catalog_rows_keyed(
+        &self,
+        name: &str,
+        key: Option<&(String, i64)>,
+    ) -> Option<CatalogRows> {
+        self.build_catalog_rows(name, key, true)
+    }
+
+    /// How many rows one virtual table holds: its rows built and not
+    /// filled, since filling sets columns of the rows it is given and never
+    /// adds or drops one (RP-715).
+    pub(crate) fn catalog_row_count(&self, name: &str) -> Option<usize> {
+        Some(self.build_catalog_rows(name, None, false)?.len())
+    }
+
+    fn build_catalog_rows(
+        &self,
+        name: &str,
+        key: Option<&(String, i64)>,
+        fill: bool,
+    ) -> Option<CatalogRows> {
         let def = Self::virtual_table(name)?;
+        // `pg_attribute`'s rows of the relation `key` names, or every one.
+        let wanted = |relid: i64| key.is_none_or(|(_, k)| *k == relid);
+        // A row the key keeps: one whose field holds the key's oid, or that
+        // has no oid there to compare.
+        let keeps = |d: &Document| {
+            key.is_none_or(|(field, k)| d.get(field).and_then(bson_i64).is_none_or(|v| v == *k))
+        };
         let mut rows: Vec<Document> = match name {
             "pg_collation" => {
                 let mut rows = self.pg_collation_rows(&def);
@@ -24242,8 +24310,12 @@ impl PgHandler {
                 // `pg_attribute` almost always wants -- only a composite's
                 // fields were listed here, so `attrelid = 't'::regclass`
                 // found nothing for a table.
-                for t in self.all_table_defs().ok()? {
+                let defs = self.shared_table_defs().ok()?;
+                for t in defs.iter() {
                     let relid = self.relation_oid(&t.name).unwrap_or(0);
+                    if !wanted(relid) {
+                        continue;
+                    }
                     for (i, c) in t.columns.iter().enumerate() {
                         // A domain column's type is the DOMAIN.
                         let declared = c.extra.get_str("domain_type").unwrap_or(&c.pg_type);
@@ -24322,6 +24394,9 @@ impl PgHandler {
                 // same documents `pg_class` lists its relkind 'S' rows from.
                 for s in self.all_sequence_docs().ok()? {
                     let relid = self.sequence_relid(s.get_str("_id").unwrap_or_default());
+                    if !wanted(relid) {
+                        continue;
+                    }
                     const SEQUENCE_COLUMNS: [(&str, i64, i32); 3] = [
                         ("last_value", 20, 1),
                         ("log_cnt", 20, 2),
@@ -24383,7 +24458,8 @@ impl PgHandler {
                     .views()
                     .unwrap_or_default()
                     .into_iter()
-                    .map(|(n, _)| (self.view_relid(&n), n));
+                    .map(|(n, _)| (self.view_relid(&n), n))
+                    .filter(|(relid, _)| wanted(*relid));
                 for (relid, name) in views {
                     // The output columns' types AND modifiers: a view over
                     // `x::numeric(5,2)` reports `numeric(5,2)`. They are the
@@ -24411,7 +24487,11 @@ impl PgHandler {
                         }
                     }
                 }
-                for ix in self.index_relations() {
+                for ix in self
+                    .index_relations()
+                    .into_iter()
+                    .filter(|ix| wanted(ix.oid))
+                {
                     for (i, key) in ix.keys.iter().enumerate() {
                         let Some(c) = usize::try_from(*key)
                             .ok()
@@ -24440,12 +24520,7 @@ impl PgHandler {
                 // the same relation oid, so listing both put every table
                 // column in twice -- once from the table and once from its
                 // row type, with different `attnotnull`.
-                let table_names: Vec<String> = self
-                    .all_table_defs()
-                    .ok()?
-                    .into_iter()
-                    .map(|t| t.name)
-                    .collect();
+                let table_names: HashSet<&str> = defs.iter().map(|t| t.name.as_str()).collect();
                 // Each composite's attnums and dropped slots (ALTER TYPE ...
                 // DROP ATTRIBUTE keeps the slot), by oid.
                 let slots: HashMap<i64, (Vec<i32>, Vec<i32>)> = self
@@ -24463,7 +24538,7 @@ impl PgHandler {
                     })
                     .collect();
                 for (cname, oid, fields) in self.composites().ok()? {
-                    if table_names.contains(&cname) {
+                    if table_names.contains(cname.as_str()) || !wanted(oid) {
                         continue;
                     }
                     let (attnums, dropped) = slots.get(&oid).cloned().unwrap_or_default();
@@ -25222,11 +25297,14 @@ impl PgHandler {
             }
             _ => self.catalog_object_rows(name, &def).unwrap_or_default(),
         };
-        self.fill_catalog_columns(name, &def, &mut rows);
-        if name == "pg_type" {
-            crate::pg_type_facts::apply_identity(&def, &mut rows);
+        rows.retain(keeps);
+        if fill {
+            self.fill_catalog_columns(name, &def, &mut rows);
+            if name == "pg_type" {
+                crate::pg_type_facts::apply_identity(&def, &mut rows);
+            }
+            self.schema_qualify_rows(&def, &mut rows);
         }
-        self.schema_qualify_rows(&def, &mut rows);
         // PostgreSQL's own functions, types and catalog constraints, as a
         // fresh 15.19 database lists them, ahead of what this server's users
         // made (RP-102); a built-in row the server already computes stays.
@@ -25238,7 +25316,7 @@ impl PgHandler {
             let mut all: Vec<Document> = self
                 .builtin_catalog_rows(name, &def)
                 .iter()
-                .filter(|d| oid_of(d).is_some_and(|o| !have.contains(&o)))
+                .filter(|d| keeps(d) && oid_of(d).is_some_and(|o| !have.contains(&o)))
                 .cloned()
                 .collect();
             all.append(&mut rows);
@@ -25253,7 +25331,7 @@ impl PgHandler {
             rows.extend(
                 self.extension_member_rows(name, &def)
                     .into_iter()
-                    .filter(|d| oid_of(d).is_none_or(|o| !have.contains(&o))),
+                    .filter(|d| keeps(d) && oid_of(d).is_none_or(|o| !have.contains(&o))),
             );
         }
         let fixed = if name == "pg_attribute" {
@@ -43645,13 +43723,23 @@ impl PgHandler {
                         .all(|c| c.children.is_empty() && c.name.starts_with("Seq Scan on "))
                 {
                     if let Statement::Select(sel) = inner.as_ref() {
-                        if let Some((plan, a, b, join, param)) =
+                        if let Some((plan, a, b, join, param, outer_index)) =
                             self.nest_loop_estimate(sel).or_else(|| {
                                 self.join_select_nest_loop_estimate(sel)
-                                    .map(|(plan, a, b, join)| (plan, a, b, join, None))
+                                    .map(|(plan, a, b, join)| (plan, a, b, join, None, None))
                             })
                         {
                             explain::price_nest_loop(&mut tree, &plan, a, b, join);
+                            // A LEFT join's preserved side read through its
+                            // index, its WHERE the Index Cond (RP-354).
+                            if let Some(index) = outer_index {
+                                let outer = &mut tree.children[0];
+                                if let Some(table) =
+                                    outer.name.strip_prefix("Seq Scan on ").map(str::to_string)
+                                {
+                                    explain::index_path_node(outer, index, &table);
+                                }
+                            }
                             // The inner read through its index, the join
                             // clause its Index Cond (RP-354).
                             if let Some(p) = param {
@@ -48305,6 +48393,13 @@ impl PgHandler {
     /// Every user table this session can see: the committed catalog with
     /// what this transaction created or dropped overlaid on it.
     fn all_table_defs(&self) -> PgWireResult<Vec<TableDef>> {
+        self.shared_table_defs().map(Arc::unwrap_or_clone)
+    }
+
+    /// [`Self::all_table_defs`], shared: the committed catalog's decoded
+    /// definitions themselves when that is what this session sees, so a
+    /// reader that only looks need not copy every one (RP-715).
+    fn shared_table_defs(&self) -> PgWireResult<Arc<Vec<TableDef>>> {
         // Outside a transaction block, with no catalog change of this
         // session's pending, the read below sees the latest committed
         // catalog, which `committed_table_defs` keeps decoded once per
@@ -48322,7 +48417,7 @@ impl PgHandler {
                 == 0
         {
             if let Some(defs) = self.committed_table_defs() {
-                return Ok(defs.as_ref().clone());
+                return Ok(defs);
             }
         }
         let raw = self
@@ -48339,7 +48434,7 @@ impl PgHandler {
             defs.retain(|d| !pending.contains_key(&d.name));
             defs.extend(pending.values().filter_map(|d| d.clone()));
         }
-        Ok(defs)
+        Ok(Arc::new(defs))
     }
 
     fn referencing_keys(
@@ -55577,6 +55672,45 @@ fn copy_field(
         // COPY'd row matched only itself), and a macaddr / tsvector / jsonpath
         // kept its input spelling.
         _ => secantus_pgplan::cast_text_to(&text, pg_type, tz).map_err(|e| PgHandler::err(&e))?,
+    })
+}
+
+/// The relation a read of `name` pins, as `(field, oid)`: an equality on
+/// `pg_attribute.attrelid`, or on `pg_class.oid` / `pg_type.oid`, at the top
+/// of the filter or in its top-level `$and` -- the key of the catalog's oid
+/// index PostgreSQL's scan would take. `None` for any other read.
+pub(crate) fn catalog_key(name: &str, filter: &Document) -> Option<(String, i64)> {
+    static FIELDS: OnceLock<[(&str, Option<String>); 3]> = OnceLock::new();
+    let fields = FIELDS.get_or_init(|| {
+        let field = |name: &str, column: &str| {
+            PgHandler::virtual_table(name).and_then(|d| d.field_of(column))
+        };
+        [
+            ("pg_attribute", field("pg_attribute", "attrelid")),
+            ("pg_class", field("pg_class", "oid")),
+            ("pg_type", field("pg_type", "oid")),
+        ]
+    });
+    let field = fields.iter().find(|(n, _)| *n == name)?.1.as_ref()?;
+    let value = pinned_oid(filter, field)?;
+    Some((field.clone(), value))
+}
+
+/// The integer `filter` requires `field` to equal, if it requires one.
+fn pinned_oid(filter: &Document, field: &str) -> Option<i64> {
+    let int = |v: &Bson| match v {
+        Bson::Int32(_) | Bson::Int64(_) => bson_i64(v),
+        _ => None,
+    };
+    let direct = filter.get(field).and_then(|v| match v {
+        Bson::Document(d) if d.len() == 1 => d.get("$eq").and_then(int),
+        v => int(v),
+    });
+    direct.or_else(|| {
+        filter.get_array("$and").ok()?.iter().find_map(|c| match c {
+            Bson::Document(d) => pinned_oid(d, field),
+            _ => None,
+        })
     })
 }
 
