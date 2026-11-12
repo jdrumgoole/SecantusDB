@@ -3084,33 +3084,7 @@ impl Interp<'_> {
                 result
             }
             "PLpgSQL_stmt_fors" | "PLpgSQL_stmt_dynfors" => {
-                let (out, domains) = if kind == "PLpgSQL_stmt_dynfors" {
-                    let sql = self.dynamic_sql(body.get("query").unwrap_or(&Value::Null))?;
-                    let out = self.host.query(&sql, &[], &[])?;
-                    (out, self.host.output_domains(&sql, &[]))
-                } else {
-                    let (text, _) = expr_query(body.get("query").unwrap_or(&Value::Null))
-                        .ok_or_else(|| PlError::new("XX000", "a FOR without a query"))?;
-                    let (sql, params, types) = self.bind(text)?;
-                    let out = self.host.query(&sql, &params, &types)?;
-                    (out, self.host.output_domains(&sql, &types))
-                };
-                self.set_found(!out.rows.is_empty());
-                if out.rows.is_empty() {
-                    // No row sets the target NULL (`exec_for_query`'s
-                    // `exec_move_row` over a NULL tuple).
-                    self.assign_into(body, "var", &out, None, &domains)?;
-                }
-                for row in &out.rows {
-                    self.assign_into(body, "var", &out, Some(row), &domains)?;
-                    match self.stmts(body.get("body").unwrap_or(&Value::Null))? {
-                        Flow::Exit(l) if Self::label_matches(&l, label.as_deref()) => break,
-                        Flow::Continue(l) if Self::label_matches(&l, label.as_deref()) => {}
-                        Flow::Next => {}
-                        other => return Ok(other),
-                    }
-                }
-                Ok(Flow::Next)
+                self.for_query(body, kind == "PLpgSQL_stmt_dynfors", label.as_deref())
             }
             "PLpgSQL_stmt_foreach_a" => {
                 let no = body.get("varno").and_then(Value::as_u64).unwrap_or(0) as usize;

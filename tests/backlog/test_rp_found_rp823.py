@@ -1,8 +1,10 @@
 """Gap tests of divergences found while working RP-823 (a cursor FOR loop's
 portal was not pinned):
 
-- a FOR loop over a query or an EXECUTE runs no portal: `pg_cursors` lists
-  none while it runs, and a CLOSE ALL in its body is not refused;
+- a FOR loop over a query or an EXECUTE ran no portal (RP-828, fixed: it
+  walks a pinned `<unnamed portal N>`, as a cursor FOR loop does), so
+  `pg_cursors` listed none while it ran, a CLOSE ALL in its body was not
+  refused, and FOUND was set before the body rather than after the loop;
 - a BEGIN inside a multi-statement simple query warned 25001 (RP-829, fixed:
   the implicit block, `TBLOCK_IMPLICIT_INPROGRESS`, is now modelled for
   every block statement).
@@ -58,10 +60,37 @@ QUERY_LOOP_PORTAL = {
         "24000",
         'cannot drop pinned portal "<unnamed portal 1>"',
     ),
+    # Each loop opens its own portal, numbered in the order they open.
+    "do $$ declare x record; y record; h text; begin for x in select 1 loop "
+    "for y in execute 'select 2' loop "
+    "select string_agg(name, ',' order by name) into h from pg_cursors; end loop; end loop; "
+    "raise notice '[%]', h; end $$": ("notice", ["[<unnamed portal 1>,<unnamed portal 2>]"]),
+    # The portal's statement is the query's text.
+    "do $$ declare x record; h text; begin for x in execute 'select ' || '1' loop "
+    "select statement into h from pg_cursors; end loop; raise notice '[%]', h; end $$": (
+        "notice",
+        ["[select 1]"],
+    ),
+    # An EXIT closes it.
+    "do $$ declare x record; h text; begin for x in select 1 loop exit; end loop; "
+    "select string_agg(name, ',') into h from pg_cursors; raise notice '[%]', h; end $$": (
+        "notice",
+        ["[<NULL>]"],
+    ),
+    # `exec_for_query` sets FOUND when the loop ends: the body sees the
+    # FOUND it was entered with.
+    "do $$ declare x record; begin perform 1 where false; for x in select 1 loop "
+    "raise notice 'in %', found; end loop; raise notice 'after %', found; end $$": (
+        "notice",
+        ["in f", "after t"],
+    ),
+    # A list of scalar targets takes each row too.
+    "do $$ declare a int; b text; begin for a, b in select 1, 'q' loop "
+    "raise notice '% %', a, b; end loop; end $$": ("notice", ["1 q"]),
 }
 
 
-@pytest.mark.backlog("RP-828")
+@pytest.mark.backlog_fixed("RP-828")
 @pytest.mark.parametrize("query", list(QUERY_LOOP_PORTAL))
 def test_a_query_loop_walks_a_pinned_portal(query: str, dsn: str) -> None:
     assert _answer(dsn, query) == QUERY_LOOP_PORTAL[query]

@@ -3577,26 +3577,47 @@ Measured on a private PostgreSQL 15.19 cluster.
       Verify: tests/backlog/test_rp_found_rp816.py::test_a_system_column_in_a_generated_column_is_42p10
       Backlog-ID: RP-862
 
-## Found while working RP-823 (2026-11-10)
+## Found while working RP-828 (2026-11-12)
 
-Measured on PostgreSQL 15.19; none of the statements creates an object.
+Measured on a private, freshly initdb'd PostgreSQL 15.19 cluster.
 
-- [ ] **A FOR loop over a query or an EXECUTE runs no portal.**
-      `exec_stmt_fors` and `exec_stmt_dynfors` open the query as an
-      unnamed portal and walk it through `exec_for_query`, which pins it:
-      on PostgreSQL 15.19 `pg_cursors` lists `<unnamed portal 1>` while
-      `for x in select 1 loop` (or `in execute 'select 1'`) runs, and an
-      `execute 'close all'` in its body is 24000 `cannot drop pinned portal
-      "<unnamed portal 1>"`. Here the loop reads the query's rows with no
-      portal, so `pg_cursors` is empty and the CLOSE ALL runs. The cursor
-      FOR loop pins its portal since RP-823 (`CursorState::pinned`, held by
-      a procedure's COMMIT or ROLLBACK); the faithful fix walks these loops
-      through a portal of their own the same way, which also brings
-      `HoldPinnedPortals`' 2D000 `cannot perform transaction commands
-      inside a cursor loop that is not read-only` for a loop over an
-      `INSERT ... RETURNING`.
-      Verify: tests/backlog/test_rp_found_rp823.py::test_a_query_loop_walks_a_pinned_portal
-      Backlog-ID: RP-828
+- [ ] **A FOR loop or an OPEN over an INSERT, UPDATE or DELETE is 0A000.**
+      `SPI_cursor_open` takes any statement that returns rows, so on
+      PostgreSQL 15.19 `for x in update t set a = a + 1 returning a loop`
+      (or `in execute '...'`) walks the RETURNING rows, and `open c for
+      insert into t values (5) returning a` fetches 5. Without RETURNING it
+      is 42P11 `cannot open UPDATE query as cursor`. A procedure's COMMIT
+      inside a loop over a DML portal is 55000 `cannot perform transaction
+      commands inside a cursor loop that is not read-only`
+      (`HoldPinnedPortals` holds only a PORTAL_ONE_SELECT portal). Here
+      every one of them is 0A000 `this query is not supported on one side
+      of a set operation`: `open_portal` reads the rows through
+      `rows_with_schema`, which has no DML arm (the PL/pgSQL `returning`
+      host call runs one through `dml_returning_values`). The portal needs
+      to record that it is not read-only, for the 55000.
+      Verify: tests/backlog/test_rp_found_rp828.py::test_a_dml_statement_opens_as_a_portal
+      Backlog-ID: RP-905
+
+- [ ] **A FOR loop or an OPEN over `EXECUTE ... USING` ignores USING.**
+      `for x in execute 'select $1 as v, $2 as w' using 5, 'q'::text loop`
+      reads `5 q` on PostgreSQL 15.19 (`exec_dynquery_with_params`), and
+      `open c for execute 'select $1 as v' using 7` fetches 7. Here both
+      are 42P02 `there is no parameter $1`: the dynamic query is run with
+      no parameters (`for_query`, `open_cursor`'s dynamic arm).
+      Verify: tests/backlog/test_rp_found_rp828.py::test_a_dynamic_portal_binds_its_using_values
+      Backlog-ID: RP-906
+
+- [ ] **A portal whose query fails as it runs takes no number.**
+      `SPI_cursor_open_internal` names an unnamed portal
+      (`CreateNewPortal`) before it runs the query, so on PostgreSQL 15.19
+      a FOR loop or an OPEN over `select a/0 from (values (1)) v(a)` that
+      fails, caught, leaves the next portal `<unnamed portal 2>`. Here the
+      rows are read before `register_portal` names the portal, so the next
+      one is `<unnamed portal 1>`. (A constant `1/0` fails in PostgreSQL's
+      planner, before the portal is named, and takes no number there
+      either.)
+      Verify: tests/backlog/test_rp_found_rp828.py::test_a_portal_that_fails_running_takes_its_number
+      Backlog-ID: RP-907
 
 ## Found while working RP-822 (2026-11-10)
 

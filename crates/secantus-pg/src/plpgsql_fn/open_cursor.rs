@@ -157,26 +157,73 @@ impl Interp<'_> {
             vars: vec![(name, target)],
             ..Default::default()
         });
-        // `exec_for_query` pins the portal while it walks it, so the body
-        // cannot close it, and a procedure's COMMIT or ROLLBACK holds it.
-        self.host.pin_cursor(&portal, true);
-        let walked = self.walk_portal(&portal, target, body, label);
-        self.host.pin_cursor(&portal, false);
+        let walked = self.walk_pinned(&portal, target, body, label);
         self.active.truncate(depth);
+        let flow = walked?;
+        if wanted.is_none() {
+            self.set_var(var, Bson::Null)?;
+        }
+        Ok(flow)
+    }
+
+    /// `FOR target IN query LOOP` / `FOR target IN EXECUTE text LOOP`
+    /// (`exec_stmt_fors` / `exec_stmt_dynfors`): the query is opened as an
+    /// unnamed portal (`exec_run_select` / `SPI_cursor_parse_open`), so
+    /// `pg_cursors` lists `<unnamed portal N>` while the loop runs, and
+    /// `exec_for_query` walks it pinned, as it walks a cursor FOR loop's
+    /// (RP-828). The portal is closed when the loop ends.
+    pub(super) fn for_query(
+        &mut self,
+        body: &Value,
+        dynamic: bool,
+        label: Option<&str>,
+    ) -> Result<Flow, PlError> {
+        let query = body.get("query").unwrap_or(&Value::Null);
+        let (statement, sql, params, types) = if dynamic {
+            let sql = self.dynamic_sql(query)?;
+            (sql.clone(), sql, Vec::new(), Vec::new())
+        } else {
+            let (text, _) =
+                expr_query(query).ok_or_else(|| PlError::new("XX000", "a FOR without a query"))?;
+            let (sql, params, types) = self.bind(text)?;
+            (text.to_string(), sql, params, types)
+        };
+        let portal = self
+            .host
+            .open_cursor(None, &statement, &sql, &params, &types, false)?;
+        // A list of scalar targets is an anonymous row, pushed for the loop.
+        let base = self.datums.len();
+        let walked = self
+            .variable_datum(body, "var")
+            .and_then(|target| self.walk_pinned(&portal, target, body, label));
+        self.datums.truncate(base);
+        walked
+    }
+
+    /// `exec_for_query` over an open portal: pinned while it is walked, so
+    /// the body cannot close it and a procedure's COMMIT or ROLLBACK holds
+    /// it, then closed.
+    fn walk_pinned(
+        &mut self,
+        portal: &str,
+        target: usize,
+        body: &Value,
+        label: Option<&str>,
+    ) -> Result<Flow, PlError> {
+        self.host.pin_cursor(portal, true);
+        let walked = self.walk_portal(portal, target, body, label);
+        self.host.pin_cursor(portal, false);
         match walked {
             Ok(flow) => {
-                self.host.close_cursor(&portal)?;
-                if wanted.is_none() {
-                    self.set_var(var, Bson::Null)?;
-                }
+                self.host.close_cursor(portal)?;
                 Ok(flow)
             }
             // PostgreSQL leaves the portal to the abort of the (sub)
             // transaction the error ends, which drops it; it is dropped
             // here, and the body's error is the one reported.
             Err(e) => {
-                if self.host.cursor_exists(&portal) {
-                    self.host.close_cursor(&portal)?;
+                if self.host.cursor_exists(portal) {
+                    self.host.close_cursor(portal)?;
                 }
                 Err(e)
             }
