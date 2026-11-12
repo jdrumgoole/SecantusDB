@@ -116,7 +116,16 @@ def _stages(client: Any, coll: str, pipeline: list, verbosity: str) -> Any:
         return {"error": e.code, "errmsg": e.details.get("errmsg")}
     finally:
         client.drop_database("rm_found_rm466_explain")
-    return reply.get("stages")
+    # `executionTimeMillisEstimate` is wall-clock time: compared by type, as
+    # the other explain tests do. mongod's stage took 1 ms under CI load and
+    # this server's 0 (PG snapshot PR #2705, job 131476250250, 2026-11-12).
+    stages = reply.get("stages")
+    if stages is None:
+        return None
+    return [
+        {k: type(v).__name__ if k == "executionTimeMillisEstimate" else v for k, v in s.items()}
+        for s in stages
+    ]
 
 
 @pytest.mark.backlog_fixed("RM-466")
