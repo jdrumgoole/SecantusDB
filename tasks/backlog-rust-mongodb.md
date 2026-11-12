@@ -2307,28 +2307,6 @@ differs on 17 of 1,295. Pinned by
 
 What is left, on the RUST MongoDB server:
 
-- [ ] **The field order of a document upserted from two or more
-      equalities.** mongod: `{a: 1, b: 2, c: 3, d: 4}` gives `c, a, b, d`;
-      `{d: 1, c: 2, b: 3, a: 4}` gives `d, b, a, c`; an explicit `$and`
-      keeps the order written. This server sorts them.
-      mongod collects the equalities in an `EqualityMatches`, a
-      `StringDataMap` (an `absl::flat_hash_map`), and builds the document in
-      its iteration order (`update_driver.cpp` / `path_support.cpp`, 8.2);
-      absl seeds its hash per process. Measured on three mongod 8.2.11
-      processes at once: `{a, b, c, d}` gave `c, a, b, d` / `c, a, b, d` /
-      `b, a, c, d`, and one process ordered `{a, b, c, d}` and
-      `{d, c, b, a}` differently.
-      **Decided (Joe, 2026-11-12): model the hash.** Port the mechanism --
-      absl `flat_hash_map`'s hashing and iteration order over the
-      equalities' field names, with a per-process seed as absl takes it --
-      and build the upserted document in that order; an explicit `$and`
-      keeps the order written. No fixed order can equal a given mongod's,
-      so restate the gap test to assert what mongod guarantees and the
-      model reproduces: the order is a property of the process (stable
-      within one, not the sorted order across the measured inputs), and
-      `$and` keeps the written order.
-      Backlog-ID: RM-059
-      Verify: tests/backlog/test_rm_057_084.py::test_upsert_field_order_from_several_equalities
 - **`$where` in an update's query** is refused as a `--noscripting`
   mongod refuses it (the no-server-side-JavaScript scope decision, formerly
   RM-060): the statement's `writeErrors` entry, 6108304. Pinned by

@@ -154,21 +154,47 @@ def _upsert_order(client: Any, query: dict) -> list:
     return list(c.find_one({}, {"_id": 0}).keys())
 
 
-@pytest.mark.backlog("RM-059")
+# The four orders absl's `flat_hash_map` can give four fields inserted a, b,
+# c, d (mongod inserts the equalities in the canonical query's order, sorted
+# by path): the table grows 1 -> 3 -> 7 slots, each growth moves every field
+# up a slot and puts the new one first or last on one bit of its hash.
+_ABSL_FOUR = {
+    ("b", "a", "c", "d", "x"),
+    ("d", "b", "a", "c", "x"),
+    ("c", "a", "b", "d", "x"),
+    ("d", "c", "a", "b", "x"),
+}
+# Whether b and d each go first is one hash bit xor the table seed's low
+# bit; the xor of the two hash bits is fixed for a process, so one process
+# only ever gives one of these pairs.
+_ABSL_PAIRS = (
+    {("b", "a", "c", "d", "x"), ("d", "c", "a", "b", "x")},
+    {("c", "a", "b", "d", "x"), ("d", "b", "a", "c", "x")},
+)
+
+
+@pytest.mark.backlog_fixed("RM-059")
 def test_upsert_field_order_from_several_equalities(rust_mongo: Any, mongod: Any) -> None:
-    """mongod 8.2.11 does not seed the fields of an upsert from four equalities
-    in a fixed order: measured 2026-10-14, one mongod process gave `b, a, c,
-    d` on some runs and `d, c, a, b` on others, another `c, a, b, d` and `d,
-    b, a, c`, whatever order the query (or an explicit `$and`) wrote them in,
-    and never the sorted order this server stores. So this asks that this
-    server's order be one the reference produced over eight runs."""
+    """mongod 8.2.11 seeds an upsert's fields in the order its
+    `EqualityMatches`, an absl `flat_hash_map`, iterates the query's
+    equalities, and absl seeds that order per process and per table
+    (measured 2026-11-12 on three processes: each gave both orders of one
+    pair below, and an explicit `$and` written d, c, b, a gave the same
+    orders as `{a, b, c, d}`). No fixed order can equal a given mongod's, so
+    this asks what mongod guarantees: every order is one of the four absl
+    can give, one process gives one pair of them, and the order is not
+    fixed. This server sorted the fields; it now models absl's hash and
+    table (`secantus_core::absl_hash`)."""
     for q in (
         {"a": 1, "b": 2, "c": 3, "d": 4},
         {"d": 1, "c": 2, "b": 3, "a": 4},
         {"$and": [{"d": 1}, {"c": 2}, {"b": 3}, {"a": 4}]},
     ):
-        seen = {tuple(_upsert_order(mongod, q)) for _ in range(8)}
-        assert tuple(_upsert_order(rust_mongo, q)) in seen, (q, seen)
+        for client in (mongod, rust_mongo):
+            seen = {tuple(_upsert_order(client, q)) for _ in range(12)}
+            assert seen <= _ABSL_FOUR, (client, q, seen)
+            assert any(seen <= pair for pair in _ABSL_PAIRS), (client, q, seen)
+            assert len(seen) == 2, (client, q, seen)
 
 
 @pytest.mark.backlog_fixed("RM-060")

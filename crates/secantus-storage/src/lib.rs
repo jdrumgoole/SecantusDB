@@ -22341,7 +22341,18 @@ impl Storage {
                             });
                         }
                     }
+                    // mongod sets the equalities in the order its
+                    // `EqualityMatches` (an absl `flat_hash_map`) iterates
+                    // them, having inserted them in the canonical query's
+                    // order -- sorted by path, an explicit `$and` flattened
+                    // and sorted with the rest. absl seeds that order per
+                    // process and per table, so it is modelled, not fixed
+                    // (RM-059; `secantus_core::absl_hash`).
                     implied.sort_by(|a, b| a.0.cmp(&b.0));
+                    let paths: Vec<&str> = implied.iter().map(|(p, _)| p.as_str()).collect();
+                    let order = secantus_core::absl_hash::string_data_map_order(&paths);
+                    let implied: Vec<(String, Bson)> =
+                        order.into_iter().map(|i| implied[i].clone()).collect();
                     for (k, v) in &implied {
                         {
                             // A DOTTED equality names a nested path, and mongod
@@ -26428,21 +26439,6 @@ fn doc_was_modified(new: &Document, old: &Document, update_spec: Option<&Documen
     })
 }
 
-/// mongod's field order for an UPSERTED document: `_id` first, then the fields
-/// seeded from the query's equalities, then whatever the update added, sorted by
-/// name. `seeded` is the query-derived top-level key list. Port of
-/// `secantus.storage._order_upserted_doc`, which the Rust upsert path never had
-/// — it inserted in seed-then-update order, so `{$set: {z: 1, a: 2}}` came out
-/// `[_id, .., z, a]` where mongod gives `[_id, .., a, z]`. BSON field order is on
-/// the wire and drivers compare raw bytes (mongo-php-library's codec tests do).
-///
-/// **Only the update-added half is reproducible.** mongod's order for the
-/// query-seeded fields is an internal hash order: it is not source order, not
-/// alphabetical, and it VARIES BETWEEN RUNS for identical input (measured
-/// 8.2.11, 2026-09-06 — the same query gave `[z, c, m]` on one run and
-/// `[m, c, z]` on the next three). Sorting them is the approximation the Python
-/// server already makes, and matching it is what keeps the two servers
-/// byte-identical to each other.
 /// The single equality a field clause implies, or `None`.
 ///
 /// mongod seeds an upserted document from the query and reads more than bare
@@ -26643,20 +26639,25 @@ fn supplied_upsert_doc(seed: &Document, supplied: &Document) -> Result<Document>
     Ok(new)
 }
 
+/// mongod's field order for an UPSERTED document: `_id` first, then the fields
+/// seeded from the query's equalities in the order the seed holds them, then
+/// whatever the update added, sorted by name. `seeded` is the seed's top-level
+/// keys, in its order. BSON field order is on the wire and drivers compare raw
+/// bytes (mongo-php-library's codec tests do).
+///
+/// The seed's order is mongod's `EqualityMatches` iteration order, an absl
+/// hash order seeded per process and per table, which the seed already
+/// models (RM-059, `secantus_core::absl_hash`). It used to be sorted here,
+/// which mongod gives only by chance (never, for four fields).
 fn order_upserted_doc(new: Document, seeded: &[String]) -> Document {
-    let mut from_query: Vec<&String> = Vec::new();
-    let mut from_update: Vec<&String> = Vec::new();
-    for k in new.keys() {
-        if k == "_id" {
-            continue;
-        }
-        if seeded.iter().any(|s| s == k) {
-            from_query.push(k);
-        } else {
-            from_update.push(k);
-        }
-    }
-    from_query.sort();
+    let from_query: Vec<&String> = seeded
+        .iter()
+        .filter(|k| *k != "_id" && new.contains_key(k.as_str()))
+        .collect();
+    let mut from_update: Vec<&String> = new
+        .keys()
+        .filter(|k| *k != "_id" && !seeded.iter().any(|s| s == *k))
+        .collect();
     from_update.sort();
     let mut ordered = Document::new();
     if let Some(id) = new.get("_id") {
@@ -28528,14 +28529,14 @@ mod tests {
     }
 
     #[test]
-    fn order_upserted_doc_sorts_each_half_independently() {
+    fn order_upserted_doc_keeps_the_seed_order_and_sorts_the_update_half() {
         let new = doc! {"z": 1i32, "m": 2i32, "b": 3i32, "_id": 9i32, "y": 4i32};
         let seeded = vec!["z".to_string(), "m".to_string()];
         assert_eq!(
             super::order_upserted_doc(new, &seeded)
                 .keys()
                 .collect::<Vec<_>>(),
-            vec!["_id", "m", "z", "b", "y"]
+            vec!["_id", "z", "m", "b", "y"]
         );
     }
 
