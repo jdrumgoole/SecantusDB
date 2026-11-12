@@ -6036,20 +6036,24 @@ impl PgHandler {
         // An extension's functions (RP-229).
         defs.extend(self.extension_function_defs());
         secantus_pgplan::set_function_defs(defs);
+        // Read in place, every oid from one map: a copy of every definition
+        // and a map fetch per relation, for each listing below, made the
+        // statement after any DDL grow with the schema (RP-911).
+        let table_defs = self.shared_table_defs().unwrap_or_default();
+        let oids = self.relation_oids().unwrap_or_default();
+        let oid = |name: &str| Self::oid_in(&oids, name);
         secantus_pgplan::set_partkey_defs(
-            self.all_table_defs()
-                .unwrap_or_default()
+            table_defs
                 .iter()
-                .filter_map(|t| Some((self.relation_oid(&t.name)?, partition::partkey_text(t)?)))
+                .filter_map(|t| Some((oid(&t.name)?, partition::partkey_text(t)?)))
                 .collect(),
         );
         secantus_pgplan::set_partition_parents(
-            self.all_table_defs()
-                .unwrap_or_default()
+            table_defs
                 .iter()
                 .filter_map(|t| {
                     let parent = partition::parent_of(t)?;
-                    Some((self.relation_oid(&t.name)?, self.relation_oid(parent)?))
+                    Some((oid(&t.name)?, oid(parent)?))
                 })
                 .collect(),
         );
@@ -6282,8 +6286,7 @@ impl PgHandler {
                 .map(|(n, _, _)| n)
                 .collect();
             secantus_pgplan::set_publishable_relations(
-                self.all_table_defs()
-                    .unwrap_or_default()
+                table_defs
                     .iter()
                     .filter(|t| {
                         !t.temp
@@ -6291,15 +6294,14 @@ impl PgHandler {
                             && !matviews.contains(&t.name)
                             && !secantus_pgplan::fdw::is_foreign(t)
                     })
-                    .filter_map(|t| self.relation_oid(&t.name))
+                    .filter_map(|t| oid(&t.name))
                     .collect(),
             );
         }
         secantus_pgplan::schemas::set_relation_keys(
-            self.all_table_defs()
-                .unwrap_or_default()
-                .into_iter()
-                .map(|t| t.name)
+            table_defs
+                .iter()
+                .map(|t| t.name.clone())
                 .chain(self.views().unwrap_or_default().into_iter().map(|(n, _)| n))
                 .collect(),
         );
@@ -12377,11 +12379,11 @@ impl PgHandler {
             Err(_) => return Vec::new(),
         };
         let temps: std::collections::HashSet<String> = self
-            .all_table_defs()
+            .shared_table_defs()
             .unwrap_or_default()
-            .into_iter()
+            .iter()
             .filter(|d| d.temp)
-            .map(|d| d.name)
+            .map(|d| d.name.clone())
             .collect();
         // A standalone composite (`CREATE TYPE t AS (...)`) is a relation
         // too, relkind `c`, under its own oid (`typrelid`).

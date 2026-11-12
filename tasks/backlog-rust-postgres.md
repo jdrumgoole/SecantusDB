@@ -1091,11 +1091,21 @@ one beside it.
       the comments, each listed from every table. PostgreSQL invalidates
       only the cache entries of the rows a statement changed (`inval.c`).
       psql's `\d` collation subquery straight after a `CREATE TABLE`, debug
-      build, 2026-11-12: 0.011 s with no other table, 0.023 s with 400 and
-      0.036 s with 800 (PostgreSQL 15.19: 0.33 ms with 200, 0.20 ms with
-      400). The rest of RP-715 was fixed on 2026-11-12 (keyed `pg_type`
-      reads, unchanged table definitions reused across versions, no copies
-      of them, one oid map per listing). The faithful end state keys the
+      build, 2026-11-12: 0.010 s with no other table and 0.027 s with 800
+      (PostgreSQL 15.19: 0.33 ms with 200, 0.20 ms with 400). Fixed so far:
+      keyed `pg_type` reads, unchanged table definitions reused across
+      versions (RP-715); the republication reads the definitions in place
+      with one oid map, and the storage keeps each collection's index list
+      until a change of that collection (2026-11-12, from 0.036 s at 800).
+      What is left, measured at 800 tables: each listing still derives every
+      relation's entry again per version, about 1 ms apiece in a debug
+      build (the tableoid expressions, the comments, the relations, the
+      index and constraint definitions, the composites and their widths),
+      and the version's composite documents are decoded again (about
+      2.5 ms, paid by `relation_oids`). Reusing an unchanged document by
+      its bytes, as `committed_table_defs` does, saved nothing: cloning a
+      `Document` costs as much as decoding it, so the reused entries have
+      to be shared (`Arc`), not copied. The faithful end state keys the
       published state per relation and invalidates what a statement
       changed; a user relation's entries depend on more than its own
       catalog row (its grants, its inheritance parents and children, the

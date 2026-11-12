@@ -143,9 +143,12 @@ def test_the_first_catalog_query_after_ddl_costs_the_same_at_800_tables(
     """PostgreSQL 15.19 answers the first collation query after a `CREATE
     TABLE` in the same time however many other tables there are (0.33 ms
     with 200, 0.20 ms with 400, private cluster, 2026-11-12). A debug
-    `secantusd-pg` takes about 0.011 s with no other table and 0.036 s with
-    800 (2026-11-12): the statement after any DDL republishes the session's
-    per-version catalog state (`install_session_state`) from every table.
+    `secantusd-pg` took about 0.011 s with no other table and 0.036 s with
+    800, and since the republication stopped copying the definitions and
+    re-reading every table's index list, about 0.010 s and 0.027 s
+    (2026-11-12): the statement after any DDL still republishes the
+    session's per-version catalog state (`install_session_state`) from
+    every table.
 
     The fastest first-after-DDL run with 800 more tables against the
     fastest with none, in one server, within half again plus 5 ms."""
