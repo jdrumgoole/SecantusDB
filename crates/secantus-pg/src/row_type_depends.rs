@@ -18,8 +18,13 @@
 //! children, the foreign keys referencing it, its views), each made after
 //! the table (measured on PostgreSQL 15.19).
 //!
+//! `DefineOperator` records one from an operator to each argument type and
+//! its result's, so an operator over the row type is named and dropped the
+//! same way (RP-561).
+//!
 //! A routine's creation order is its oid, drawn from the oid counter as
-//! `ProcedureCreate` draws it. A cast's oid is derived from its types, not
+//! `ProcedureCreate` draws it, and an operator's, as `OperatorCreate` draws
+//! it: the two interleave by it. A cast's oid is derived from its types, not
 //! drawn, so the casts follow the routines rather than falling between
 //! them where PostgreSQL's creation order puts them.
 
@@ -42,7 +47,7 @@ pub(crate) fn keeping_row_type<T>(f: impl FnOnce() -> T) -> T {
     out
 }
 
-/// The routines, casts and transforms over a table's row type or its
+/// The routines, operators, casts and transforms over a table's row type or its
 /// array, as DROP TABLE reports and drops them.
 #[derive(Default)]
 pub(crate) struct RowTypeDependents {
@@ -50,6 +55,8 @@ pub(crate) struct RowTypeDependents {
     pub(crate) lines: Vec<(String, String)>,
     /// The routines' catalog keys.
     functions: Vec<String>,
+    /// The operators' catalog keys.
+    operators: Vec<String>,
     /// The casts' catalog keys.
     casts: Vec<String>,
     /// The transforms' catalog keys.
@@ -64,6 +71,7 @@ impl RowTypeDependents {
     pub(crate) fn absorb(&mut self, more: RowTypeDependents) -> Vec<(String, String)> {
         for (mine, theirs) in [
             (&mut self.functions, more.functions),
+            (&mut self.operators, more.operators),
             (&mut self.casts, more.casts),
             (&mut self.transforms, more.transforms),
         ] {
@@ -142,6 +150,33 @@ pub(crate) fn format_procedure<S: AsRef<str>>(schema: &str, name: &str, params: 
     format!("{shown}({})", args.join(","))
 }
 
+/// `getObjectDescription` of an operator: `operator`, then
+/// `format_operator`'s name and its two argument types' `format_type_be`,
+/// `NONE` for a prefix operator's missing left (`operator !!(NONE,t)`).
+fn operator_description(d: &Document) -> String {
+    let left = d.get_str("left").ok();
+    let right = d.get_str("right").unwrap_or_default();
+    let shown = |t: &str| {
+        secantus_pgplan::user_casts::type_oid(t)
+            .map(secantus_pgplan::regtype_text)
+            .unwrap_or_else(|| t.to_string())
+    };
+    format!(
+        "operator {}({},{})",
+        d.get_str("name").unwrap_or_default(),
+        left.map_or_else(|| "NONE".to_string(), shown),
+        shown(right)
+    )
+}
+
+/// Every type an operator names: its arguments' and its result's.
+fn operator_types(d: &Document) -> Vec<String> {
+    ["left", "right", "result"]
+        .iter()
+        .filter_map(|k| d.get_str(k).ok().map(str::to_string))
+        .collect()
+}
+
 /// Every type a stored routine's signature names: each parameter's (OUT,
 /// INOUT and TABLE ones included, as `proallargtypes` holds them), each
 /// RETURNS TABLE column's, and the result's.
@@ -192,9 +227,9 @@ impl PgHandler {
         };
         let (row_text, array_text) = (type_text(table, row_oid), type_text(&array, array_oid));
 
-        // `(oid, key, description, signature types)` of every routine, in
-        // creation order.
-        let mut routines: Vec<(i64, String, String, Vec<String>)> = self
+        // `(oid, is an operator, key, description, types named)` of every
+        // routine and operator, in creation order.
+        let mut routines: Vec<(i64, bool, String, String, Vec<String>)> = self
             .type_catalog_docs(Self::FUNCTION_COLLECTION)?
             .iter()
             .filter_map(|d| {
@@ -203,9 +238,19 @@ impl PgHandler {
                     .get("oid")
                     .and_then(bson_i64)
                     .unwrap_or_else(|| self.function_oid(&key));
-                Some((oid, key, routine_description(d), signature_types(d)))
+                Some((oid, false, key, routine_description(d), signature_types(d)))
             })
             .collect();
+        routines.extend(
+            self.catalog_docs(crate::catalog_objects::OPERATOR_COLLECTION)
+                .iter()
+                .filter_map(|d| {
+                    let key = d.get_str("_id").ok()?.to_string();
+                    // One made before operators drew oids sorts last.
+                    let oid = d.get("oid").and_then(bson_i64).unwrap_or(i64::MAX);
+                    Some((oid, true, key, operator_description(d), operator_types(d)))
+                }),
+        );
         routines.sort();
         // A signature type names `on` by its catalog key, or by its oid when
         // it was written another way (`public.t`).
@@ -221,12 +266,20 @@ impl PgHandler {
             (table, row_oid, &row_text),
         ];
         for (on, on_oid, on_text) in groups {
-            for (_, key, desc, types) in &routines {
-                if out.functions.contains(key) || !types.iter().any(|t| names(t, on, on_oid)) {
+            for (_, is_operator, key, desc, types) in &routines {
+                let seen = if *is_operator {
+                    &mut out.operators
+                } else {
+                    &mut out.functions
+                };
+                if seen.contains(key) || !types.iter().any(|t| names(t, on, on_oid)) {
                     continue;
                 }
+                seen.push(key.clone());
                 out.lines.push((desc.clone(), on_text.clone()));
-                out.functions.push(key.clone());
+                if *is_operator {
+                    continue;
+                }
                 if let Some(f) = functions.iter().find(|f| f.key == *key) {
                     for (cast, cast_desc) in self.casts_on_function(&f.name, &f.param_types) {
                         implementing.push((cast, cast_desc, desc.clone()));
@@ -262,13 +315,17 @@ impl PgHandler {
     }
 
     /// DROP TABLE ... CASCADE: drop what [`Self::row_type_dependents`]
-    /// found, each cast and transform before the routine it may call.
+    /// found, each cast, transform and operator before the routine it may
+    /// call.
     pub(crate) fn drop_row_type_dependents(&self, deps: &RowTypeDependents) -> PgWireResult<()> {
         for key in &deps.transforms {
             self.drop_transform_key(key)?;
         }
         for key in &deps.casts {
             self.drop_cast_key(key)?;
+        }
+        for key in &deps.operators {
+            self.delete_type_doc(crate::catalog_objects::OPERATOR_COLLECTION, key)?;
         }
         for key in &deps.functions {
             self.delete_type_doc(Self::FUNCTION_COLLECTION, key)?;

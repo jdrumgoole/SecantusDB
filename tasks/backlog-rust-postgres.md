@@ -2318,14 +2318,6 @@ tests are in `tests/backlog/test_rp_found_rp546.py`.
       member's row type in the same order as here, not PostgreSQL's.
       Backlog-ID: RP-560
       Verify: tests/backlog/test_rp_found_rp546.py::test_drop_table_dependants_in_creation_order
-- [ ] **An operator over a table's row type does not depend on it.**
-      `create operator ==== (leftarg = p561, rightarg = p561, ...)` records
-      a dependency on its argument types, so `drop table p561` names
-      `operator ====(p561,p561) depends on type p561` and CASCADE drops it.
-      Here the DETAIL names only the function, and the operator outlives the
-      table in `pg_operator`.
-      Backlog-ID: RP-561
-      Verify: tests/backlog/test_rp_found_rp546.py::test_operator_over_row_type_depends_on_its_table
 - [ ] **DROP TYPE of a table's row type with a routine over it names the
       routines.** PostgreSQL 15.19 answers `drop type r562` with 2BP01
       `cannot drop type r562 because table r562 requires it` whatever else
@@ -3838,3 +3830,19 @@ tests are in `tests/backlog/test_rp_found_rp565.py`.
       `x` and the second is 42809.
       Verify: tests/backlog/test_rp_found_rp565.py::test_a_temporary_row_type_hides_a_built_in_type
       Backlog-ID: RP-891
+
+## Found while working RP-561 (2026-11-12)
+
+Measured on a private PostgreSQL 15.19 cluster.
+
+- [ ] **DROP FUNCTION of an operator's function leaves the operator.**
+      `CREATE OPERATOR` records a dependency on the function that implements
+      it, so on PostgreSQL 15.19 `drop function f561eq(f561, int)` under
+      `create operator |=| (leftarg = f561, rightarg = int, function =
+      f561eq)` is 2BP01 `cannot drop function f561eq(f561,integer) because
+      other objects depend on it`, DETAIL `operator |=|(f561,integer)
+      depends on function f561eq(f561,integer)`, and CASCADE drops the
+      operator. Here the function is dropped and the operator stays in
+      `pg_operator`, naming a function that no longer exists.
+      Verify: tests/backlog/test_rp_found_rp546.py::test_drop_function_of_an_operator_is_refused
+      Backlog-ID: RP-893

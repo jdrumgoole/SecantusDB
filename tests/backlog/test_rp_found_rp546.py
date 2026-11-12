@@ -1,6 +1,6 @@
 """Gap tests of what was found while working RP-546 (a function over a
 table's row type depends on the table): RP-560 .. RP-568, and RP-858,
-found while working RP-564.
+found while working RP-564, and RP-893, found while working RP-561.
 
 An answer is the rows, `"ok"` for a statement with none, or `(sqlstate,
 message, detail)` for an error. The expected answers were measured on a
@@ -79,9 +79,9 @@ def test_drop_table_dependants_in_creation_order(dsn: str) -> None:
 
 # `CREATE OPERATOR` records a dependency on its argument types, so an
 # operator over a table's row type is named by a plain DROP TABLE and
-# dropped by DROP TABLE ... CASCADE. Here it is neither, and outlives the
+# dropped by DROP TABLE ... CASCADE. It was neither, and outlived the
 # table in `pg_operator`.
-@pytest.mark.backlog("RP-561")
+@pytest.mark.backlog_fixed("RP-561")
 def test_operator_over_row_type_depends_on_its_table(dsn: str) -> None:
     with psycopg.connect(dsn, autocommit=True) as c:
         c.execute("drop table if exists p561 cascade")
@@ -103,6 +103,84 @@ def test_operator_over_row_type_depends_on_its_table(dsn: str) -> None:
             "p561",
             "function p561eq(p561,p561) depends on type p561",
             "operator ====(p561,p561) depends on type p561",
+        ),
+        "ok",
+        [(0,)],
+    ]
+
+
+# The operators interleave with the routines in creation order, what names
+# the array type ahead of what names the row type, and a prefix operator's
+# missing left argument is `NONE` (`format_operator`), in the DETAIL and in
+# the CASCADE notice alike.
+@pytest.mark.backlog_fixed("RP-561")
+def test_operators_over_a_row_type_in_creation_order(dsn: str) -> None:
+    notices: list[str | None] = []
+    with psycopg.connect(dsn, autocommit=True) as c:
+        c.add_notice_handler(lambda n: notices.append(n.message_detail))
+        c.execute("drop table if exists q561 cascade")
+        for q in [
+            "create table q561 (a int)",
+            "create function q561eq(q561, q561) returns bool language sql as $$ select true $$",
+            "create operator ==== (leftarg = q561, rightarg = q561, function = q561eq)",
+            "create function q561neg(q561) returns bool language sql as $$ select true $$",
+            "create operator !!! (rightarg = q561, function = q561neg)",
+            "create function q561arr(q561[], int) returns bool language sql as $$ select true $$",
+            "create operator <<< (leftarg = q561[], rightarg = int, function = q561arr)",
+        ]:
+            c.execute(q)
+        try:
+            got = [
+                _run(c, "drop table q561"),
+                _run(c, "drop table q561 cascade"),
+                _run(c, "select count(*) from pg_operator where oprname in ('====', '!!!', '<<<')"),
+            ]
+        finally:
+            c.execute("drop table if exists q561 cascade")
+    lines = [
+        ("function q561arr(q561[],integer)", "type q561[]"),
+        ("operator <<<(q561[],integer)", "type q561[]"),
+        ("function q561eq(q561,q561)", "type q561"),
+        ("operator ====(q561,q561)", "type q561"),
+        ("function q561neg(q561)", "type q561"),
+        ("operator !!!(NONE,q561)", "type q561"),
+    ]
+    assert got == [
+        _refused("q561", *(f"{o} depends on {on}" for o, on in lines)),
+        "ok",
+        [(0,)],
+    ]
+    assert [n for n in notices if n and n.startswith("drop cascades")] == [
+        "\n".join(f"drop cascades to {o}" for o, _ in lines)
+    ]
+
+
+# An operator depends on the function that implements it, so DROP FUNCTION
+# of that function is refused while the operator exists, and CASCADE drops
+# the operator. Here the function is dropped and the operator is left in
+# `pg_operator` naming it.
+@pytest.mark.backlog("RP-893")
+def test_drop_function_of_an_operator_is_refused(dsn: str) -> None:
+    with psycopg.connect(dsn, autocommit=True) as c:
+        c.execute("drop table if exists f561 cascade")
+        c.execute("create table f561 (a int)")
+        c.execute(
+            "create function f561eq(f561, int) returns bool language sql as $$ select true $$"
+        )
+        c.execute("create operator |=| (leftarg = f561, rightarg = int, function = f561eq)")
+        try:
+            got = [
+                _run(c, "drop function f561eq(f561, int)"),
+                _run(c, "drop function f561eq(f561, int) cascade"),
+                _run(c, "select count(*) from pg_operator where oprname = '|=|'"),
+            ]
+        finally:
+            c.execute("drop table if exists f561 cascade")
+    assert got == [
+        (
+            "2BP01",
+            "cannot drop function f561eq(f561,integer) because other objects depend on it",
+            "operator |=|(f561,integer) depends on function f561eq(f561,integer)",
         ),
         "ok",
         [(0,)],
