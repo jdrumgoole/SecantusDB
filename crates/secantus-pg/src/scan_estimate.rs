@@ -357,7 +357,7 @@ impl PgHandler {
         {
             return None;
         }
-        let defs = self.all_table_defs().ok()?;
+        let defs = self.shared_table_defs().ok()?;
         let mut children = Vec::new();
         let mut types: Vec<Vec<String>> = Vec::new();
         for side in [&set.left, &set.right] {
@@ -1007,7 +1007,7 @@ impl PgHandler {
                     .find(|(_, al)| al == alias)
                     .map(|(t, _)| t.clone())
             };
-            let defs = self.all_table_defs().ok()?;
+            let defs = self.shared_table_defs().ok()?;
             let def_of = |alias: &str| {
                 let t = table(alias)?;
                 defs.iter().find(|d| d.name == t).cloned()
@@ -2264,7 +2264,7 @@ impl PgHandler {
     /// with an index, where PostgreSQL may choose an index path.
     pub(crate) fn modify_table_estimate(&self, stmt: &Statement) -> Option<(Estimate, Estimate)> {
         const CTID_WIDTH: i64 = 6;
-        let defs = self.all_table_defs().ok()?;
+        let defs = self.shared_table_defs().ok()?;
         let def_of = |table: &str| defs.iter().find(|d| d.name == table);
         let scan = |table: &str, filter: &Document, width: i64| -> Option<Estimate> {
             if !filter.is_empty()
@@ -2349,7 +2349,12 @@ impl PgHandler {
         fields: &[String],
         reads: &[String],
     ) -> Option<ScanEstimate> {
-        if self.all_table_defs().ok()?.iter().any(|d| d.name == table) {
+        if self
+            .shared_table_defs()
+            .ok()?
+            .iter()
+            .any(|d| d.name == table)
+        {
             if let Some(chosen) = self.user_index_path(table, filter, fields, reads) {
                 return Some(chosen);
             }
@@ -2423,7 +2428,13 @@ impl PgHandler {
         fields: &[String],
         key: &[String],
     ) -> Option<Estimate> {
-        if filter.is_empty() || !self.all_table_defs().ok()?.iter().any(|d| d.name == table) {
+        if filter.is_empty()
+            || !self
+                .shared_table_defs()
+                .ok()?
+                .iter()
+                .any(|d| d.name == table)
+        {
             return None;
         }
         let counted: std::cell::OnceCell<Option<usize>> = std::cell::OnceCell::new();
@@ -2544,7 +2555,12 @@ impl PgHandler {
         fields: &[String],
         reads: &[String],
     ) -> Option<ScanEstimate> {
-        if !self.all_table_defs().ok()?.iter().any(|d| d.name == table) {
+        if !self
+            .shared_table_defs()
+            .ok()?
+            .iter()
+            .any(|d| d.name == table)
+        {
             return None;
         }
         self.user_index_path(table, filter, fields, reads)
@@ -2573,7 +2589,12 @@ impl PgHandler {
         fields: &[String],
         want: &PathWant,
     ) -> Option<UserPath> {
-        if !self.all_table_defs().ok()?.iter().any(|d| d.name == table) {
+        if !self
+            .shared_table_defs()
+            .ok()?
+            .iter()
+            .any(|d| d.name == table)
+        {
             return None;
         }
         let mut path = self.user_paths(table, filter, fields, &[], want)?;
@@ -3003,7 +3024,13 @@ impl PgHandler {
         fields: &[String],
         reads: &[String],
     ) -> Option<Estimate> {
-        if exprs.is_empty() || !self.all_table_defs().ok()?.iter().any(|d| d.name == table) {
+        if exprs.is_empty()
+            || !self
+                .shared_table_defs()
+                .ok()?
+                .iter()
+                .any(|d| d.name == table)
+        {
             return None;
         }
         let relations = self.index_relations();
@@ -3041,7 +3068,13 @@ impl PgHandler {
         quals: &[secantus_pgplan::ArrayQual],
         fields: &[String],
     ) -> Option<Estimate> {
-        if quals.is_empty() || !self.all_table_defs().ok()?.iter().any(|d| d.name == table) {
+        if quals.is_empty()
+            || !self
+                .shared_table_defs()
+                .ok()?
+                .iter()
+                .any(|d| d.name == table)
+        {
             return None;
         }
         self.user_seq_scan_with(table, &Document::new(), fields, quals, &[])
@@ -3663,7 +3696,12 @@ impl PgHandler {
         filter: &Document,
         fields: &[String],
     ) -> Option<f64> {
-        if !self.all_table_defs().ok()?.iter().any(|d| d.name == table) {
+        if !self
+            .shared_table_defs()
+            .ok()?
+            .iter()
+            .any(|d| d.name == table)
+        {
             return None;
         }
         let counted: std::cell::OnceCell<Option<usize>> = std::cell::OnceCell::new();

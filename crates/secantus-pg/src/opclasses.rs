@@ -1103,7 +1103,7 @@ impl PgHandler {
     /// The indexes over a key with each class: `(index, table, class)`.
     pub(crate) fn indexes_by_class(&self) -> Vec<(String, String, i64)> {
         let mut out = Vec::new();
-        for def in self.all_table_defs().unwrap_or_default() {
+        for def in self.shared_table_defs().unwrap_or_default().iter() {
             for ix in self
                 .storage
                 .list_indexes(self.db(), &def.name)

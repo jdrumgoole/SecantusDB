@@ -2457,8 +2457,8 @@ elif __name__ == "__main__":
 #: An equality on `pg_attribute_relid_attnum_index`'s leading column with
 #: another qual beside it. PostgreSQL 15.19 (the shared cluster, read only,
 #: 2026-11-12) scans the index once for each, the other qual a filter on
-#: that scan: `pg_attribute` `seq_scan` 0, `idx_scan` 1. A bare equality
-#: (`attrelid = 2615`) is counted as PostgreSQL counts it.
+#: that scan: `pg_attribute` `seq_scan` 0, `idx_scan` 1, on a fresh
+#: backend as on a warm one.
 INDEX_SCAN_WITH_A_FILTER = (
     "SELECT attname FROM pg_catalog.pg_attribute WHERE attrelid = 2615 AND attnum > 0",
     "SELECT attname FROM pg_catalog.pg_attribute WHERE attrelid = 2615 AND NOT attisdropped",
@@ -2475,9 +2475,12 @@ _SCANS = (
 def test_an_index_scan_with_a_filter_counts_one_index_scan(rust_pg: Any, query: str) -> None:
     """PostgreSQL 15.19 counts one index scan of `pg_attribute` for each
     query (measured as the change over a second run, in one transaction, so
-    the first run's cache misses are out of it). `secantusd-pg` counts a
-    sequential scan: the walk in `catalog_reads.rs` models no index path
-    for an equality with another qual beside it (2026-11-12)."""
+    the first run's cache misses are out of it). `secantusd-pg` counted a
+    sequential scan, because the walk in `catalog_reads.rs` visited an AND's
+    arms as select-list expressions; since 2026-11-12 it counts the index
+    scan, and on a fresh backend one more, as it does for a bare `attrelid =
+    2615` (warm, the counts match:
+    `tests/test_rust_pgserver_slice.py::test_an_equality_with_other_quals_is_one_index_scan`)."""
     with rust_pg.connect(autocommit=False) as conn:
         conn.execute(query).fetchall()
         before = conn.execute(_SCANS).fetchone()

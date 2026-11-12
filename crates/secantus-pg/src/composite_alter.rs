@@ -343,7 +343,7 @@ impl PgHandler {
     /// Apply `edit` to every stored value of composite `target`.
     fn rewrite_type_values(&self, target: &str, edit: &Edit) -> PgWireResult<()> {
         let composites = self.composite_field_map()?;
-        for t in self.all_table_defs()? {
+        for t in self.shared_table_defs()?.iter() {
             let columns: Vec<(String, String)> = t
                 .columns
                 .iter()

@@ -282,7 +282,7 @@ impl PgHandler {
             d.insert(f("deptype"), deptype);
             d
         };
-        let defs = self.all_table_defs().unwrap_or_default();
+        let defs = self.shared_table_defs().unwrap_or_default();
         let mut out = Vec::new();
         // Sequences owned by a column.
         for s in self.all_sequence_docs().unwrap_or_default() {
@@ -311,7 +311,7 @@ impl PgHandler {
         // Column defaults: each on its column (`a`; a generated column's
         // expression `i`, and on the columns it reads, `n`); a `nextval`
         // default on its sequence and a cast to a user type on the type, `n`.
-        for t in &defs {
+        for t in defs.iter() {
             let Some(rel) = self.relation_oid(&t.name) else {
                 continue;
             };
@@ -379,7 +379,7 @@ impl PgHandler {
             }
         }
         // Partitions and inheritance children.
-        for t in &defs {
+        for t in defs.iter() {
             let Some(child) = self.relation_oid(&t.name) else {
                 continue;
             };

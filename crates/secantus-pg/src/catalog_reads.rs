@@ -1771,8 +1771,16 @@ impl<'a> Model<'a> {
             }
             N::AExpr(a) => self.a_expr(a, scope, in_target),
             N::BoolExpr(b) => {
+                // An AND's arms are each a restriction of their own, as the
+                // planner flattens them into the restriction list: `attrelid
+                // = $1 AND attnum > 0` is an index scan on `attrelid`
+                // (RP-909). An OR's or a NOT's arms are not.
+                let arms_in_target = in_target || b.boolop != pb::BoolExprType::AndExpr as i32;
                 for arg in &b.args {
-                    let t = self.expr_n(arg, scope);
+                    let t = arg
+                        .node
+                        .as_ref()
+                        .map_or(UNKNOWN, |n| self.expr(n, scope, arms_in_target));
                     if t == UNKNOWN {
                         self.ptype(BOOL);
                     }
@@ -1996,6 +2004,25 @@ impl<'a> Model<'a> {
                 },
                 _ => None,
             }
+        };
+        // `'t'::regclass` is the relation's oid, as `regclassin` makes it
+        // before the planner sees the constant: the index scan's key.
+        let mut konst = |e: &Option<Box<pb::Node>>| -> Option<Bson> {
+            if let Some(N::TypeCast(tc)) = node(e) {
+                let to = tc.type_name.as_ref().map(|t| names_of(&t.names));
+                if to
+                    .as_ref()
+                    .and_then(|n| n.last())
+                    .is_some_and(|n| n == "regclass")
+                {
+                    if let Some(N::AConst(c)) = node(&tc.arg) {
+                        if let Some(pb::a_const::Val::Sval(s)) = &c.val {
+                            return self.regclass_const(&s.sval).map(Bson::Int64);
+                        }
+                    }
+                }
+            }
+            konst(e)
         };
         let (side, value) = match (col(&a.lexpr), col(&a.rexpr)) {
             (Some(c), None) => (Some(c), konst(&a.rexpr)),
@@ -2304,6 +2331,28 @@ impl<'a> Model<'a> {
             );
         }
         all
+    }
+
+    /// The oid `regclassin` makes of `text`, looked up silently: the cast
+    /// itself counted its lookups (`reg_input`).
+    fn regclass_const(&mut self, text: &str) -> Option<i64> {
+        let text = text.trim();
+        if !text.is_empty() && text.bytes().all(|b| b.is_ascii_digit()) {
+            return text.parse().ok();
+        }
+        let names = qualified_names(text)?;
+        self.silent += 1;
+        let spaces = match names.as_slice() {
+            [_] => self.active_path(),
+            [s, _] => self.h.cr_namespace_oid(s).into_iter().collect(),
+            _ => Vec::new(),
+        };
+        let name = names.last()?;
+        let oid = spaces
+            .into_iter()
+            .find_map(|nsp| self.rel_in(nsp, name).map(|r| r.oid));
+        self.silent -= 1;
+        oid
     }
 
     /// The name lookups of a reg* type's input function on `text`
@@ -2898,7 +2947,7 @@ impl PgHandler {
         if let Some(view) = self.cr_view(&key, name, nsp) {
             return Some(view);
         }
-        let defs = self.all_table_defs().ok()?;
+        let defs = self.shared_table_defs().ok()?;
         if let Some(def) = defs.iter().find(|d| d.name == key) {
             let oid = self.relation_oid(&key)?;
             let mut columns = Vec::new();

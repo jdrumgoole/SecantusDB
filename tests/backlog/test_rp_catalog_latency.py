@@ -107,7 +107,7 @@ def pg_alone(tmp_path: Path) -> Iterator[Any]:
 GROWTH_TABLES = 400
 
 
-@pytest.mark.backlog("RP-715")
+@pytest.mark.backlog_fixed("RP-715")
 def test_the_first_catalog_query_after_ddl_does_not_grow_with_the_schema(
     pg_alone: Any,
 ) -> None:
@@ -117,10 +117,12 @@ def test_the_first_catalog_query_after_ddl_does_not_grow_with_the_schema(
     the one relation's rows by index, and DDL invalidates only the cache
     entries it changed (`inval.c`). A debug `secantusd-pg` took about
     0.010 s with no other table, 0.049 s with 400 and 0.092 s with 800
-    (2026-11-12): a read of one type's `pg_type` row still builds every
-    type's row, a read of one relation's `pg_attribute` rows still walks
-    every relation, and the catalog-read walk counts every `pg_attribute`
-    row for the sequential scan it models (RP-909).
+    (2026-11-12): a read of one type's `pg_type` row built every type's row,
+    the catalog-read walk counted every `pg_attribute` row for a sequential
+    scan PostgreSQL does not make (RP-909), and each catalog version
+    re-decoded every table definition, read each table's index list and
+    copied the definitions several times over. Since then a debug build
+    takes about 0.011 s with none and 0.023 s with 400.
 
     The fastest first-after-DDL run with 400 more tables against the
     fastest with none, in one server."""
@@ -131,4 +133,27 @@ def test_the_first_catalog_query_after_ddl_does_not_grow_with_the_schema(
     assert large < 2 * small + 0.01, (
         f"first query after DDL {small * 1000:.0f} ms with no other table, "
         f"{large * 1000:.0f} ms with {GROWTH_TABLES}"
+    )
+
+
+@pytest.mark.backlog("RP-911")
+def test_the_first_catalog_query_after_ddl_costs_the_same_at_800_tables(
+    pg_alone: Any,
+) -> None:
+    """PostgreSQL 15.19 answers the first collation query after a `CREATE
+    TABLE` in the same time however many other tables there are (0.33 ms
+    with 200, 0.20 ms with 400, private cluster, 2026-11-12). A debug
+    `secantusd-pg` takes about 0.011 s with no other table and 0.036 s with
+    800 (2026-11-12): the statement after any DDL republishes the session's
+    per-version catalog state (`install_session_state`) from every table.
+
+    The fastest first-after-DDL run with 800 more tables against the
+    fastest with none, in one server, within half again plus 5 ms."""
+    small, _ = _first_and_warm(pg_alone, "rp911a")
+    for i in range(2 * GROWTH_TABLES):
+        pg_alone.execute(f"CREATE TABLE rp911_grow_{i} (a int, b text)")
+    large, _ = _first_and_warm(pg_alone, "rp911b")
+    assert large < 1.5 * small + 0.005, (
+        f"first query after DDL {small * 1000:.0f} ms with no other table, "
+        f"{large * 1000:.0f} ms with {2 * GROWTH_TABLES}"
     )
