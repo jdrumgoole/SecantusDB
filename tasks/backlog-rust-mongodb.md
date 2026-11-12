@@ -566,6 +566,19 @@ These are explicit non-goals. Don't add them without a reason.
       **Decided (Joe, 2026-11-08): build mongod's execution admission control in full, the faithful option: the ingress controller, then the read and write ticket pools with `throughputProbing` (replacing `admission.rs`'s opt-in write tickets), then the per-command admission counts, so the concurrency cap is on by default as on mongod. Several PRs, in that order.** The ingress controller landed 2026-11-08, the ticket pools 2026-11-09, and the per-command admission counts on the line 2026-11-09; what is left is above.
       Backlog-ID: RM-355
       Verify: tests/backlog/test_rm_355_364.py::test_ending_a_transaction_takes_mongods_execution_tickets
+- [ ] **An aggregate through its cursor stage counts too few execution
+      admissions.** mongod 8.2.11 lets an aggregate's locks go once its
+      pipeline is built, so each buffer its cursor stage fills takes the
+      global IS and an execution ticket of its own: an `$addFields` over
+      300 documents read 50 at a time is `Global: {r: 3}` and 4 execution
+      admissions on the `aggregate` line (the build, two buffers, the
+      storage statistics). Since RM-360 this server takes the global IS for
+      each buffer too, and its line has mongod's `locks`, but it holds the
+      statement's own locks to the end of the command, so the buffers' IS
+      ride its ticket and the line says 2. Its `getMore`s, which take no
+      lock of their own, count mongod's. Found 2026-11-12 (RM-360).
+      Verify: tests/backlog/test_rm_found_2026_11_12_rm360.py::test_each_cursor_stage_buffer_takes_an_execution_ticket
+      Backlog-ID: RM-579
 - [ ] **The connection establishment rate limiter has no bypass list.**
       mongod 8.2.11's `ingressConnectionEstablishmentRateLimiterBypass` (a
       CIDR range list, `{ranges: []}` by default, set at startup or at
@@ -880,13 +893,23 @@ These are explicit non-goals. Don't add them without a reason.
       retryable write's session check-out, the reads of the system's
       latest optime for the client's last op that a write which logged
       nothing makes (`lastop.rs`), and its write concern's waits (the
-      oplog's holes, the journal flush, the commit point). The line of a
-      `find`, `count` or `distinct` of a collection with one candidate
-      plan, a `getMore` of a `find`, `listIndexes`, `listCollections`,
-      `collStats`, `ping`, `buildInfo`, and an `insert`, `update` or
-      `delete` on a member of a replica set prints mongod's count (52
-      shapes in `tests/mongod_live/test_interrupt_checks.py`). Every other
-      line prints none, where mongod prints one:
+      oplog's holes, the journal flush, the commit point). Since
+      2026-11-12 an `aggregate` mongod's query layer runs whole checks as
+      a `find` does, and one through its cursor stage checks for each
+      buffer the stage fills (the global IS it takes for it, so a `getMore`
+      of such a cursor takes no lock of its own) and ticks the pipeline's
+      interrupt checker once per stage `getNext`, the checker going on
+      with the cursor from batch to batch. The line of a `find`, `count`
+      or `distinct` of a collection with one candidate plan, a `getMore` of
+      a `find`, an `aggregate` of a collection mongod's query layer runs
+      whole, or whose stages after its cursor stage are `$project`,
+      `$unset`, `$addFields`, `$set`, `$replaceRoot`, `$replaceWith`,
+      `$unwind` and `$skip`, and the `getMore`s of its cursor,
+      `listIndexes`, `listCollections`, `collStats`, `ping`, `buildInfo`,
+      and an `insert`, `update` or `delete` on a member of a replica set
+      prints mongod's count (74 shapes in
+      `tests/mongod_live/test_interrupt_checks.py`). Every other line
+      prints none, where mongod prints one:
       - a read with more than one candidate plan, a plan from the plan
         cache, or a subplanned `$or`: mongod checks once per index scan of
         every plan its `PlanEnumerator` builds (with indexes on `x` and
@@ -894,10 +917,17 @@ These are explicit non-goals. Don't add them without a reason.
         its index intersections' included; three indexes 13) and not at
         all for a cached plan, and this planner's candidates are not its
         enumeration;
-      - an `aggregate` and a `getMore` of its cursor: every pipeline stage's
-        `getNext` ticks mongod's `ExpressionContext` interrupt checker,
-        which checks every 128th tick (an `$unwind` of 900 documents counted
-        17), and its stages are not this server's;
+      - the other aggregates: one with a `$match` or `$redact` left after
+        its read (mongod's optimizer moves some where this server's does
+        not: RM-538, RM-580), a `$limit` there (it stops its source short
+        of the documents this server runs in one go), a `$lookup`,
+        `$unionWith`, `$facet`, `$geoNear` or `$out` / `$merge`, a stage
+        read whole that SBE does not take whole (a `$sort` after a
+        `$group`, `$count`, `$bucket`: 5 on mongod), a pipeline whose
+        expressions run `$map`, `$filter` or `$reduce` (this server ticks
+        the checker once an element, mongod 8.2.11 not at all), one over a
+        view or a time-series collection, and one asked for a first batch
+        of none;
       - `findAndModify`: counted as the other writes are, it matches mongod
         8.2.11 but where its locks do not (RM-357: a retryable one's image,
         19 to this server's 16; one that removes, 7 to 10), and an IDHACK
@@ -1629,6 +1659,15 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       `limit` the `$limit` pulled. Found 2026-11-08 working RM-200.
       Verify: tests/backlog/test_rm_found_2026_11_10_explain_rewrites.py::test_the_pipeline_rewrites_mongod_lists, tests/backlog/test_rm_found_2026_11_08_explain_listing.py::test_sort_and_limit_after_the_cursor_are_one_stage
       Backlog-ID: RM-538
+- [ ] **Explain leaves a `$match` after a `$redact` where it was
+      written.** mongod 8.2.11 copies a `$match` that follows a `$redact`
+      ahead of it and into the query (`[{$redact: "$$KEEP"}, {$match: {z:
+      0}}]` explains as a `$cursor` reading `{z: {$eq: 0}}`, then the
+      `$match`, the `$redact` and the `$match` again); this server lists
+      the two stages as written over a whole-collection `$cursor`, and reads
+      the collection so. Found 2026-11-12 (RM-360).
+      Verify: tests/backlog/test_rm_found_2026_11_12_rm360.py::test_a_match_after_a_redact_is_copied_ahead_of_it
+      Backlog-ID: RM-580
 - [ ] **Explain's stages lack some of mongod's statistics.** At
       `executionStats` mongod 8.2.11 gives the stages inside a `$facet` and
       a `$unionWith` their own `nReturned` (and lists the `$unionWith`'s

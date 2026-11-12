@@ -47,6 +47,34 @@ const STREAMING_STAGES: &[&str] = &[
     "$unionWith",
 ];
 
+/// The stages after a cursor stage whose `getNext` calls -- each one tick
+/// of mongod's `ExpressionContext` interrupt checker -- are counted here
+/// (RM-360): each passes on one document per call, or (`$skip`) drops some,
+/// or (`$unwind`) makes several of one. A pipeline with any other prints no
+/// count: a `$limit` there stops its source short of the documents this
+/// cursor runs in one go, a `$lookup` or `$unionWith` reads through
+/// pipelines of its own, and a `$match` or `$redact` left after the read
+/// is not always where mongod's optimizer leaves it (RM-538: a `$match` on
+/// a field an `$addFields` renames moves ahead of it onto the field).
+const COUNTED_STAGES: &[&str] = &[
+    "$project",
+    "$unset",
+    "$addFields",
+    "$set",
+    "$replaceRoot",
+    "$replaceWith",
+    "$unwind",
+    "$skip",
+];
+
+/// Whether a stage reads metadata this cursor rewrites into stages of its
+/// own (`agg_meta`), which mongod's pipeline does not have.
+fn metas_or_sort_keys(stages: &[Bson]) -> bool {
+    stages
+        .iter()
+        .any(|s| mentions_meta(s) || crate::agg_meta::reads_sort_key(s))
+}
+
 /// What an `aggregate` over a collection asks to read.
 pub(crate) struct Ask<'a> {
     pub db: &'a str,
@@ -235,7 +263,17 @@ fn build(
         return Ok(None);
     };
     // The projection the planner took is a stage of the pipeline: run as
-    // written, not as `explain` prints it.
+    // written, not as `explain` prints it. mongod's plan runs it, so it is
+    // not one of the stages after its `$cursor` stage.
+    let in_plan = usize::from(query.projection_stage.is_some());
+    // The stages after mongod's `$cursor` stage, as its `explain` lists
+    // them, are the ones this cursor runs.
+    let modelled = !buffered
+        && !metas_or_sort_keys(&query.rest)
+        && query
+            .rest
+            .iter()
+            .all(|s| COUNTED_STAGES.contains(&stage_name(s)));
     let mut stages: Vec<Bson> = query.projection_stage.into_iter().collect();
     stages.extend(query.rest);
     // `{$meta: "recordId"}` / `{$meta: "indexKey"}` where mongod answers
@@ -290,6 +328,12 @@ fn build(
     );
     cursor.sbe = sbe;
     cursor.metas = (metas.record_id, metas.index_key);
+    // A read the query layer runs whole checks as a `find` does; one
+    // through the cursor stage counts the stages after it too, when they
+    // are stages whose calls are counted here and run in the classic engine.
+    cursor.modelled = modelled && (per_batch || !sbe);
+    cursor.counted = cursor.modelled;
+    cursor.in_plan = in_plan;
     Ok(Some((cursor, indexes)))
 }
 
@@ -601,6 +645,24 @@ struct AggStream {
     /// The read is a leading `$geoNear`'s, which gives each document what
     /// the stage adds to it.
     geo_near: Option<crate::aggregate::GeoNearRead>,
+    /// Its stages are mongod's after its cursor stage, and run in the
+    /// classic engine: each cursor-stage refill takes the global lock, as
+    /// mongod's does, and a `getMore` takes none of its own (RM-360).
+    modelled: bool,
+    /// Its interrupt checks are made where mongod's are (RM-360): each
+    /// cursor-stage refill, and each `getNext` of a stage after it.
+    counted: bool,
+    /// How many of the leading stages mongod's plan runs (the projection
+    /// it took), which tick no interrupt checker.
+    in_plan: usize,
+    /// The pipeline interrupt checker's ticks to its next check, kept
+    /// between batches as mongod's `ExpressionContext` is.
+    ticks: u32,
+    /// The `getNext` calls behind each document of `out`, counted when a
+    /// batch returns it (see [`run_counted`](Self::run_counted)).
+    out_calls: VecDeque<u64>,
+    /// The calls each stage owes the next document it passes on.
+    owed: Vec<u64>,
 }
 
 fn stage_name(s: &Bson) -> &str {
@@ -611,6 +673,7 @@ fn stage_name(s: &Bson) -> &str {
 
 impl AggStream {
     fn new(feed: Feed, buffer: Option<usize>, stages: Vec<Bson>, ask: &Ask) -> AggStream {
+        let stages_len = stages.len();
         let counts = stages
             .iter()
             .map(|s| match stage_name(s) {
@@ -648,7 +711,28 @@ impl AggStream {
             notablescan: None,
             metas: (false, false),
             geo_near: None,
+            modelled: false,
+            counted: false,
+            in_plan: 0,
+            ticks: secantus_core::deadline::FRESH_TICKS,
+            out_calls: VecDeque::new(),
+            owed: vec![0; stages_len],
         }
+    }
+
+    /// Whether this cursor reads through a cursor stage whose stages after
+    /// it are counted (see [`COUNTED_STAGES`]).
+    fn ticking(&self) -> bool {
+        self.counted && self.buffer.is_some()
+    }
+
+    /// mongod's stages' `getNext` calls, `n` of them, each a tick of the
+    /// pipeline's interrupt checker.
+    fn tick(&self, n: usize) -> Result<(), CommandError> {
+        if self.ticking() {
+            secantus_core::deadline::tick_stages(n as u64)?;
+        }
+        Ok(())
     }
 
     /// Still reading the collection the cursor was opened on.
@@ -754,6 +838,13 @@ impl AggStream {
                 let engine = secantus_core::sbe::enter(self.sbe);
                 let read = match self.buffer {
                     Some(n) => {
+                        // mongod's cursor stage takes the collection again
+                        // for each refill (`DocumentSourceCursor::loadBatch`):
+                        // the global IS, its ticket, and the check the
+                        // lock's grant makes (RM-360).
+                        if self.modelled {
+                            crate::lock_manager::global_read()?;
+                        }
                         self.buffer = Some(n * 2);
                         source.next_buffer(storage, n, BUFFER_BYTES)
                     }
@@ -844,6 +935,69 @@ impl AggStream {
         self.run_stages(storage, docs, &mut run)
     }
 
+    /// [`run`](Self::run), one stage at a time, with the `getNext` calls
+    /// that pulled each document out: mongod's pipeline pulls a document
+    /// through a `getNext` of every stage it passes, the cursor stage's
+    /// first, each a tick of its interrupt checker (RM-360). A document's
+    /// calls are counted when a batch returns it, as mongod makes them when
+    /// its cursor asks for it; a stage that takes in a document and passes
+    /// none on (`$skip`, an `$unwind` of an empty array) owes its calls to
+    /// the next document it passes on, or to the end of the pipeline.
+    fn run_counted(
+        &mut self,
+        storage: &dyn Storage,
+        docs: Vec<Document>,
+    ) -> Result<Vec<(Document, u64)>, CommandError> {
+        let mut items: Vec<(Document, u64)> = docs.into_iter().map(|d| (d, 1)).collect();
+        for i in self.start..self.stages.len() {
+            let own = u64::from(i >= self.in_plan);
+            let mut owed = std::mem::take(&mut self.owed[i]);
+            let mut passed: Vec<(Document, u64)> = Vec::with_capacity(items.len());
+            match self.counts[i] {
+                // `$skip` (a `$limit` is not counted: `COUNTED_STAGES`).
+                Some(left) => {
+                    let n = (left.max(0) as usize).min(items.len());
+                    owed += items.drain(..n).map(|(_, t)| t).sum::<u64>();
+                    self.counts[i] = Some(left - n as i64);
+                    passed = items;
+                }
+                None if stage_name(&self.stages[i]) == "$unwind" => {
+                    for (doc, t) in items {
+                        let mut one = vec![self.stages[i].clone()];
+                        let made = self.run_stages(storage, vec![doc], &mut one)?;
+                        owed += t;
+                        for d in made {
+                            passed.push((d, std::mem::take(&mut owed)));
+                        }
+                    }
+                }
+                None => {
+                    let ticks: Vec<u64> = items.iter().map(|(_, t)| *t).collect();
+                    let docs = items.into_iter().map(|(d, _)| d).collect();
+                    let mut one = vec![self.stages[i].clone()];
+                    let made = self.run_stages(storage, docs, &mut one)?;
+                    // The counted stages pass each document on.
+                    if made.len() != ticks.len() {
+                        self.counted = false;
+                    }
+                    passed = made.into_iter().zip(ticks).collect();
+                }
+            }
+            for (_, t) in passed.iter_mut() {
+                *t += own + std::mem::take(&mut owed);
+            }
+            self.owed[i] = owed;
+            items = passed;
+        }
+        Ok(items)
+    }
+
+    /// The `getNext` calls that find the pipeline over: one of each stage,
+    /// down to the cursor stage, and those the stages still owe.
+    fn calls_at_eof(&self) -> u64 {
+        1 + self.stages.len().saturating_sub(self.in_plan) as u64 + self.owed.iter().sum::<u64>()
+    }
+
     fn run_stages(
         &self,
         storage: &dyn Storage,
@@ -884,6 +1038,12 @@ impl StreamCursor for AggStream {
     ) -> Result<StreamedBatch, CommandError> {
         let _active = secantus_core::collation::activate(self.collation.as_ref());
         let _notablescan = crate::notablescan::aggregate_on(self.notablescan.clone());
+        // The pipeline's interrupt checker goes on from where the last
+        // batch left it.
+        if self.counted {
+            secantus_core::deadline::resume_ticks(self.ticks);
+        }
+        secantus_core::deadline::take_expression_ticked();
         let (mut keys, mut examined) = (0, 0);
         let mut out: Vec<Vec<u8>> = Vec::new();
         let mut bytes = 0usize;
@@ -892,8 +1052,14 @@ impl StreamCursor for AggStream {
         let mut eof = false;
         'batch: loop {
             while let Some(blob) = self.out.pop_front() {
+                // The calls that pulled it out are this batch's, even when
+                // it is held for the next: mongod's cursor got it and keeps
+                // it for the next batch.
+                let calls = self.out_calls.pop_front().unwrap_or(0);
+                self.tick(calls as usize)?;
                 if !out.is_empty() && bytes + blob.len() > max_bytes {
                     self.out.push_front(blob);
+                    self.out_calls.push_front(0);
                     break 'batch;
                 }
                 bytes += blob.len();
@@ -940,6 +1106,7 @@ impl StreamCursor for AggStream {
                 }
                 let all = crate::util::decode_docs(self.read.drain(..).collect())?;
                 let ran = self.run_stages(storage, all, &mut self.stages.clone())?;
+                self.out_calls.extend(std::iter::repeat_n(0, ran.len()));
                 self.out.extend(crate::util::encode_docs(ran)?);
                 continue;
             }
@@ -953,8 +1120,30 @@ impl StreamCursor for AggStream {
             };
             let chunk: Vec<Vec<u8>> = self.read.drain(..take).collect();
             let docs = crate::util::decode_docs(chunk)?;
-            let ran = self.run(storage, docs)?;
-            self.out.extend(crate::util::encode_docs(ran)?);
+            if self.ticking() {
+                let ran = self.run_counted(storage, docs)?;
+                self.out_calls.extend(ran.iter().map(|(_, calls)| *calls));
+                self.out.extend(crate::util::encode_docs(
+                    ran.into_iter().map(|(d, _)| d).collect(),
+                )?);
+            } else {
+                let ran = self.run(storage, docs)?;
+                self.out_calls.extend(std::iter::repeat_n(0, ran.len()));
+                self.out.extend(crate::util::encode_docs(ran)?);
+            }
+        }
+        if eof {
+            self.tick(self.calls_at_eof() as usize)?;
+        }
+        // An expression that ticked the pipeline's interrupt checker
+        // (`$map`, `$filter`, `$reduce`: one tick an element here, none on
+        // mongod 8.2.11) leaves the count this cursor's from here on.
+        if secantus_core::deadline::take_expression_ticked() {
+            self.counted = false;
+        }
+        if self.counted {
+            secantus_core::deadline::pipeline_counted();
+            self.ticks = secantus_core::deadline::ticks_to_check();
         }
         // Through a cursor stage, mongod knows the pipeline is over only once
         // it asks for a document and gets none: a batch that fills exactly
@@ -988,6 +1177,10 @@ impl StreamCursor for AggStream {
         }
         self.gone = Some(reason.to_string());
         true
+    }
+
+    fn locks_internally(&self) -> bool {
+        self.modelled && self.buffer.is_some()
     }
 }
 

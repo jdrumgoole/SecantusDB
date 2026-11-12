@@ -55,10 +55,14 @@ def logged(
     op: Callable[[Any], Any],
     prefix: str = "opdebug",
     name: str | None = None,
+    keep: frozenset[str] = frozenset(),
 ) -> tuple[list[tuple[str, dict]], list[dict]]:
     """`op`'s `Slow query` lines, as `(component, attr)`, and its database's
     profile entries. `name` names the database, for a comparison of what
-    depends on it (a query shape's hash covers its namespace)."""
+    depends on it (a query shape's hash covers its namespace). `keep`: the
+    commands otherwise left out as not the operation's that `op` runs (a
+    `createIndexes` whose line is compared), whose setup must not run them."""
+    dropped = _NOT_THE_OPERATION - keep
     db = client[name or fresh(prefix)]
     setup(db)
     log = client.admin.command("getLog", "global")["log"]
@@ -84,7 +88,7 @@ def logged(
         attr = entry["attr"]
         if not str(attr.get("ns", "")).startswith(db.name + "."):
             continue
-        if _first(attr.get("command", {})) in _NOT_THE_OPERATION:
+        if _first(attr.get("command", {})) in dropped:
             continue
         lines.append((entry["c"], attr))
     entries = [

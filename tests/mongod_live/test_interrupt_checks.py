@@ -20,10 +20,22 @@ system's), and its write concern's waits -- the oplog's holes, the journal
 flush for `j`, the commit point for `majority`, each a check before it
 waits and one when it wakes.
 
+A walk of a whole index -- the scan a sort is read in, or a hinted index
+with no predicate on its leading field -- is built outside mongod's access
+planner (`QueryPlannerAccess::scanWholeIndex`) and makes no check.
+
+An `aggregate` that mongod's query layer runs whole checks as a `find` does.
+One that reads through its cursor stage checks once for each buffer that
+stage fills -- the global IS it takes for it -- and its stages tick the
+pipeline's interrupt checker once per `getNext`, checking every 128th
+tick; the checker lives with the cursor, so a `getMore` goes on counting
+where the batch before stopped. Such a `getMore` takes no lock of its own,
+and so reads no storage statistics unless it filled a buffer.
+
 What this server does not count yet prints no field, and is RM-360's
-remainder: plans with several candidates, pipelines, `findAndModify`, DDL,
-and the write concerns whose waits are not modelled (`fsync`, a numbered
-`w` above 1, a tag, `majority` with `j: false`).
+remainder: plans with several candidates, the pipelines it does not model,
+`findAndModify`, DDL, and the write concerns whose waits are not modelled
+(`fsync`, a numbered `w` above 1, a tag, `majority` with `j: false`).
 """
 
 from __future__ import annotations
@@ -45,6 +57,28 @@ def _seed_many(db: Any) -> None:
 def _compound(db: Any) -> None:
     db.c.insert_many([{"_id": n, "x": n, "y": n % 3} for n in range(12)])
     db.c.create_index([("x", 1), ("y", 1)])
+
+
+def _documents(n: int) -> Callable[[Any], Any]:
+    """`n` documents, each with an array of none to three elements, over an
+    index on `x`: enough to fill several cursor-stage buffers (32, then
+    twice as many each time) and to cross the pipeline checker's 128 ticks
+    inside and between batches."""
+
+    def setup(db: Any) -> None:
+        db.c.insert_many(
+            [{"_id": n, "x": n, "y": n % 3, "z": n % 2, "a": list(range(n % 4))} for n in range(n)]
+        )
+        db.c.create_index("x")
+
+    return setup
+
+
+def _pipeline(pipeline: list, **kwargs: Any) -> Callable[[Any], Any]:
+    return lambda d: list(d.c.aggregate(pipeline, **kwargs))
+
+
+_ADD = {"$addFields": {"q": 1}}
 
 
 #: label -> (setup, operation, the commands whose lines are compared).
@@ -119,6 +153,88 @@ SCENARIOS: dict[str, tuple[Callable[[Any], Any], Callable[[Any], Any], tuple[str
     "listIndexes": (seed, lambda d: list(d.c.list_indexes()), ("listIndexes",)),
     "listCollections": (seed, lambda d: d.list_collection_names(), ("listCollections",)),
     "collStats": (seed, lambda d: d.command("collStats", "c"), ("collStats",)),
+    "find sorted by a walk of a whole index": (
+        seed,
+        lambda d: list(d.c.find({}).sort("x", -1)),
+        ("find",),
+    ),
+    "find filtered, sorted by a walk of a whole index": (
+        seed,
+        lambda d: list(d.c.find({"y": 1}).sort("x", 1)),
+        ("find",),
+    ),
+    "find through a hinted index it does not bound": (
+        seed,
+        lambda d: list(d.c.find({"y": 1}).hint([("x", 1)])),
+        ("find",),
+    ),
+    "count through a hinted index": (
+        seed,
+        lambda d: d.command("count", "c", query={}, hint={"x": 1}),
+        ("count",),
+    ),
+}
+
+
+_PIPELINE = ("aggregate", "getMore")
+
+#: Aggregates of a collection: the ones mongod's query layer runs whole, and
+#: the ones through its cursor stage whose stages are counted here.
+PIPELINES: dict[str, tuple[Callable[[Any], Any], Callable[[Any], Any], tuple[str, ...]]] = {
+    "aggregate of nothing but a $match": (
+        seed,
+        _pipeline([{"$match": {"x": {"$gte": 4}}}]),
+        _PIPELINE,
+    ),
+    "aggregate of no stages": (seed, _pipeline([]), _PIPELINE),
+    "aggregate of a $project": (seed, _pipeline([{"$project": {"x": 1}}]), _PIPELINE),
+    "aggregate sorted": (seed, _pipeline([{"$sort": {"y": 1}}]), _PIPELINE),
+    "aggregate sorted by an index": (_documents(300), _pipeline([{"$sort": {"x": 1}}]), _PIPELINE),
+    "aggregate of a $limit": (seed, _pipeline([{"$limit": 4}]), _PIPELINE),
+    "aggregate of a $group": (
+        seed,
+        _pipeline([{"$match": {"x": {"$gt": 2}}}, {"$group": {"_id": "$y", "n": {"$sum": 1}}}]),
+        _PIPELINE,
+    ),
+    "aggregate of a collection not there": (
+        seed,
+        lambda d: list(d.nope.aggregate([{"$match": {"x": 1}}])),
+        _PIPELINE,
+    ),
+    "aggregate through its cursor stage": (seed, _pipeline([_ADD]), _PIPELINE),
+    "aggregate of one buffer, full": (_documents(32), _pipeline([_ADD]), _PIPELINE),
+    "aggregate of a first batch, full": (_documents(101), _pipeline([_ADD]), _PIPELINE),
+    "aggregate and its getMores": (_documents(1000), _pipeline([_ADD]), _PIPELINE),
+    "aggregate in small batches": (_documents(300), _pipeline([_ADD], batchSize=50), _PIPELINE),
+    "aggregate of several stages": (
+        _documents(300),
+        _pipeline(
+            [
+                {"$match": {"x": {"$gte": 3}}},
+                {"$project": {"x": 1, "a": 1}},
+                {"$set": {"w": {"$add": ["$x", 1]}}},
+                {"$unset": "a"},
+                {"$replaceRoot": {"newRoot": {"v": "$w"}}},
+            ]
+        ),
+        _PIPELINE,
+    ),
+    "aggregate with an $unwind": (_documents(400), _pipeline([{"$unwind": "$a"}]), _PIPELINE),
+    "aggregate with an $unwind, batches ending inside a document": (
+        _documents(400),
+        _pipeline([{"$unwind": "$a"}, {"$set": {"b": 1}}], batchSize=33),
+        _PIPELINE,
+    ),
+    "aggregate with a $skip": (
+        _documents(400),
+        _pipeline([_ADD, {"$skip": 150}], batchSize=40),
+        _PIPELINE,
+    ),
+    "aggregate with a $skip between two $unwinds": (
+        _documents(400),
+        _pipeline([{"$unwind": "$a"}, {"$skip": 5}, {"$unwind": "$a"}], batchSize=60),
+        _PIPELINE,
+    ),
 }
 
 
@@ -241,6 +357,35 @@ def _counts(
         if name in commands:
             out.append((name, attr.get("numInterruptChecks"), attr.get("numYields")))
     return out
+
+
+@pytest.mark.parametrize("label", list(PIPELINES))
+def test_a_pipeline_line_counts_mongods_interrupt_checks(
+    rust_mongo: Any, mongod_rs: Any, label: str
+) -> None:
+    """Every line of the aggregate and its getMores, and their `locks`: a
+    cursor stage's buffer takes the global IS each time it fills, and a
+    getMore that fills none takes no lock (measured 8.2.11, 2026-11-12)."""
+    scenario = PIPELINES[label]
+    setup, op, commands = scenario
+    answers = {}
+    for name, client, is_mongod in (("mongod", mongod_rs, True), ("rust", rust_mongo, False)):
+        with no_timed_yields(client):
+            lines, _ = logged(client, is_mongod, setup, op)
+        answers[name] = [
+            (
+                next(iter(attr["command"])),
+                attr.get("numInterruptChecks"),
+                attr.get("numYields"),
+                attr.get("locks", {}).get("Global"),
+            )
+            for _, attr in lines
+            if next(iter(attr.get("command", {})), "") in commands
+        ]
+    theirs, ours = answers["mongod"], answers["rust"]
+    assert theirs, f"{label}: mongod wrote no line"
+    assert all(n is not None for _, n, _, _ in theirs), theirs
+    assert ours == theirs, f"{label}: ours {ours}, mongod {theirs}"
 
 
 @pytest.mark.parametrize("label", list(SCENARIOS))

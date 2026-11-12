@@ -86,6 +86,13 @@ pub trait StreamCursor: Send {
     fn source_gone(&mut self, _reason: &str) -> bool {
         false
     }
+    /// The cursor takes its locks as it reads, not for each `getMore`:
+    /// mongod's pipeline cursor (`PlanExecutor::LockPolicy::kLocksInternally`),
+    /// whose cursor stage takes the global lock for each buffer it fills,
+    /// so a `getMore` that reads from its buffer takes none (RM-360).
+    fn locks_internally(&self) -> bool {
+        false
+    }
 }
 
 /// One streamed batch, and what reading it examined.
@@ -197,6 +204,9 @@ struct Entry {
     /// (`stream_busy`), put back after.
     stream: Option<Box<dyn StreamCursor>>,
     streaming: bool,
+    /// The stream's [`StreamCursor::locks_internally`], fixed when it was
+    /// registered.
+    locks_internally: bool,
     stream_busy: bool,
     /// What the cursor's operations have reported of its plan (RM-400).
     counts: CursorCounts,
@@ -490,6 +500,7 @@ impl CursorRegistry {
                 users: current_users(),
                 stream: None,
                 streaming: false,
+                locks_internally: false,
                 stream_busy: false,
                 counts: CursorCounts::default(),
                 on_close: None,
@@ -540,6 +551,7 @@ impl CursorRegistry {
                 users: current_users(),
                 stream: None,
                 streaming: false,
+                locks_internally: false,
                 stream_busy: false,
                 counts: CursorCounts::default(),
                 on_close: None,
@@ -579,10 +591,21 @@ impl CursorRegistry {
         let id = self.register_bounded(namespace, Vec::new(), false)?;
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(e) = inner.cursors.get_mut(&id) {
+            e.locks_internally = stream.locks_internally();
             e.stream = Some(stream);
             e.streaming = true;
         }
         Ok(id)
+    }
+
+    /// Whether a `getMore` of `cursor_id` takes no lock of its own, its
+    /// cursor taking them as it reads ([`StreamCursor::locks_internally`]).
+    pub fn locks_internally(&self, cursor_id: i64) -> bool {
+        let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        inner
+            .cursors
+            .get(&cursor_id)
+            .is_some_and(|e| e.locks_internally)
     }
 
     /// Take a streaming cursor's read out for a `getMore` to run outside the

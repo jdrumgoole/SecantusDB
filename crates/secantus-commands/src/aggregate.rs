@@ -835,6 +835,12 @@ pub fn aggregate(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
                     .first()
                     .and_then(Bson::as_document)
                     .is_some_and(|d| d.contains_key("$geoNear"));
+                // A collection that is not there is read by mongod's EOF
+                // plan, which it builds without its planner's checks
+                // (RM-360), as a `find`'s.
+                if !storage.collection_exists(&ctx.db_name, c).unwrap_or(false) {
+                    crate::explain::plans_nothing();
+                }
                 if geonear_candidate_none || leads_geo_near {
                     let ask = crate::agg_stream::Ask {
                         db: &ctx.db_name,
@@ -952,6 +958,20 @@ pub fn aggregate(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
                     )
                 })?;
                 drop(engine);
+                // A pipeline mongod's query layer runs whole checks as its
+                // `find` does, which this read has counted (RM-360).
+                if !secantus_core::deadline::take_expression_ticked()
+                    && crate::explain::query_layer_takes_whole(
+                        storage,
+                        &ctx.db_name,
+                        c,
+                        &read_pipeline,
+                        hint,
+                        collation.as_ref(),
+                    )
+                {
+                    secantus_core::deadline::pipeline_counted();
+                }
                 // The plan the pipeline's first read runs uses its indexes
                 // once (a `$lookup`'s reads count none: measured 8.2.11).
                 let first_read = crate::explain::order::Ask {

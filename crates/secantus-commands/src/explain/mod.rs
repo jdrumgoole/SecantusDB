@@ -441,6 +441,33 @@ fn id_hack_read(coll: &str, pipeline: &[Bson], hint: Option<&Bson>, same_collati
     q.skip == 0 && matches!(plan::point_lookup(&canonical), Some(("_id", _)))
 }
 
+/// Whether mongod's query layer runs all of `pipeline` over `db.coll`, so
+/// the aggregate has no cursor stage and its checks are a `find`'s
+/// (RM-360): its planner takes every stage, or its slot-based engine takes
+/// a pipeline of `$match` and `$group` stages. Other stages SBE takes can
+/// leave one of theirs to the pipeline (measured 8.2.11, 2026-11-12: a
+/// `$count`'s `$project`, a `$bucket`'s `$sort`, a `$sort` after a
+/// `$group`), whose count is not modelled yet.
+pub(crate) fn query_layer_takes_whole(
+    storage: &dyn crate::storage::Storage,
+    db: &str,
+    coll: &str,
+    pipeline: &[Bson],
+    hint: Option<&Bson>,
+    collation: Option<&Collation>,
+) -> bool {
+    if pipeline_canonical(coll, pipeline).rest.is_empty() {
+        return true;
+    }
+    let hoisted = hoist::hoist_matches(pipeline);
+    let grouped = hoisted.iter().all(|s| {
+        s.as_document()
+            .and_then(|d| d.keys().next())
+            .is_some_and(|k| k == "$match" || k == "$group")
+    });
+    grouped && sbe_pushdown(storage, db, coll, &hoisted, hint, collation) == Some(hoisted.len())
+}
+
 pub(crate) fn pipeline_canonical(coll: &str, pipeline: &[Bson]) -> PipelineQuery {
     let stages: Vec<Document> = pipeline
         .iter()

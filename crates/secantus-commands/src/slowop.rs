@@ -602,6 +602,14 @@ pub fn attributes(
 /// replica set, outside a transaction. Others print none until theirs are:
 /// a pipeline's stages, `findAndModify` and DDL check where mongod's do
 /// not yet.
+/// The operation's pipeline counted its checks as mongod's does, and no
+/// expression ticked its interrupt checker where mongod's does not
+/// (`deadline::take_expression_ticked`).
+fn pipeline_counted() -> bool {
+    secantus_core::deadline::is_pipeline_counted()
+        && !secantus_core::deadline::take_expression_ticked()
+}
+
 pub fn with_interrupt_checks(
     request: &Document,
     ctx: &CommandContext,
@@ -614,12 +622,19 @@ pub fn with_interrupt_checks(
     let counted = !request.contains_key("autocommit")
         && match name {
             "find" | "count" | "distinct" => of_collection(target_collection(name, request)),
-            "getMore" => ctx
+            // A pipeline over a collection, when it counted its checks.
+            "aggregate" => pipeline_counted() && of_collection(target_collection(name, request)),
+            "getMore" => match ctx
                 .exec_stats
                 .as_ref()
                 .and_then(|e| e.originating_command.as_ref())
-                .and_then(|o| o.get_str("find").ok())
-                .is_some_and(|coll| of_collection(Some(coll))),
+            {
+                Some(o) if o.contains_key("find") => of_collection(o.get_str("find").ok()),
+                Some(o) if o.contains_key("aggregate") => {
+                    pipeline_counted() && of_collection(o.get_str("aggregate").ok())
+                }
+                _ => false,
+            },
             "listIndexes" | "listCollections" | "collStats" | "ping" | "buildInfo" => true,
             // Writes, on a member of a replica set: their last op and
             // write-concern waits are counted (`lastop`).

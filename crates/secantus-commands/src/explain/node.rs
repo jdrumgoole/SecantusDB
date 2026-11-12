@@ -87,6 +87,11 @@ pub(crate) struct IxScan {
     pub filter: Option<Document>,
     /// `min` / `max` were given: mongod prints no bounds.
     pub no_bounds: bool,
+    /// A walk of the whole index that mongod builds outside its access
+    /// planner (`QueryPlannerAccess::scanWholeIndex`): the scan a sort is
+    /// read in, or a hinted index with no predicate on its leading field.
+    /// Its planning makes no interrupt check for it (RM-360).
+    pub whole: bool,
 }
 
 impl IxScan {
@@ -98,6 +103,7 @@ impl IxScan {
             backward: false,
             filter: None,
             no_bounds: false,
+            whole: false,
         }
     }
 
