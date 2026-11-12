@@ -1584,17 +1584,38 @@ a regression test.
       parameterized scan's Filter where the inner is indexed (`e left
       join k on e.a < k.a and e.a <> k.b::int`). Still zeros: such a
       preserved-side conjunct that costs other than its operators (an IN
-      list, a pattern, a cast of a column), a cast between types no
-      `pg_cast` function or I/O conversion joins (a binary-coercible
-      `e.b::varchar <> k.b`), and a `<>` whose operands then differ in
-      type (`e.a <> k.a::bigint`, PostgreSQL's `int48ne`,
+      list, a pattern, a cast of a column), and a `<>` whose operands
+      then differ in type (`e.a <> k.a::bigint`, PostgreSQL's `int48ne`,
       `cost=0.28..11142.50 rows=333000` over `Index Scan using k_pkey on
-      k` `cost=0.28..7.81 rows=332`). And a cent: `k left join k k2 on
-      k.a < k2.a and k.a > 990 where k.a > 900` totals 1076.52 here,
-      1076.53 on PostgreSQL 15.19 -- the sum
-      is a .525 tie this server's index-scan costs land one ULP below.
+      k` `cost=0.28..7.81 rows=332`). (A binary-coercible cast is its
+      own item.)
       Backlog-ID: RP-354
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[nested loop left join of two index scans with a one-sided ON conjunct]
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[nested loop left join into an index bounded on both sides], tests/backlog/test_rp_explain_costs.py::test_plan[nested loop left join on an expression of the inner side], tests/backlog/test_rp_explain_costs.py::test_plan[nested loop left join with a cross-type inequality into an index], tests/backlog/test_rp_explain_costs.py::test_plan[nested loop left join with a pattern over its preserved side], tests/backlog/test_rp_explain_costs.py::test_plan[nested loop of three relations]
+- [ ] **A binary-coercible cast is kept in a plan, and its scan is not
+      priced.** A cast between binary-compatible types (`text` to
+      `varchar` and back to `text` for the operator) is a `RelabelType`
+      `eval_const_expressions` strips, so the column keeps its statistics
+      and prints bare: PostgreSQL 15.19 prints `explain select * from e
+      where b::varchar <> 'x'` (`e` analysed, 1000 rows) as `Seq Scan on e
+      (cost=0.00..17.50 rows=1000 width=7)` with `Filter: (b <>
+      'x'::text)`; here `Filter: (((b)::character varying)::text <>
+      'x'::text)` and zero costs. The same in a nested loop's Join Filter
+      (`e, k where e.b::varchar <> k.b`, PostgreSQL's `cost=0.00..15032.50
+      rows=900000`). Its rows are right. Measured on a private 15.19
+      cluster (found while working RP-354).
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a seq scan filter over a binary-coercible cast], tests/backlog/test_rp_explain_costs.py::test_plan[a join filter over a binary-coercible cast]
+      Backlog-ID: RP-912
+- [ ] **An IN list under a join prints as an ARRAY constructor.**
+      PostgreSQL folds `a in (1, 2, 3)` into one array constant and
+      prints it as its literal wherever the scan sits: PostgreSQL 15.19
+      prints `explain select * from e, k where e.a <> k.a and e.a in (1,
+      2, 3)` with the Materialized `Seq Scan on e`'s `Filter: (a = ANY
+      ('{1,2,3}'::integer[]))`; here `Filter: (a = ANY (ARRAY[1, 2, 3]))`.
+      A lone scan already prints the literal, and the costs and rows are
+      right. Measured on a private 15.19 cluster (found while working
+      RP-354).
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[an in list in a scan filter under a join is an array constant]
+      Backlog-ID: RP-913
 - [ ] **A function call in a nested loop's join filter is priced as
       nothing.** `cost_qual_eval` charges a call its `procost` for every
       pair the Join Filter checks: PostgreSQL 15.19 prints `select * from e
