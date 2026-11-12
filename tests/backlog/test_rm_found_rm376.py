@@ -103,13 +103,14 @@ def test_an_update_reads_under_its_sort(rust_mongo: Any, mongod: Any) -> None:
     assert answers["rust"] == answers["mongod"]
 
 
-@pytest.mark.backlog("RM-474")
+@pytest.mark.backlog_fixed("RM-474")
 def test_a_writes_limit_of_one_is_done_after_one_work(rust_mongo: Any, mongod: Any) -> None:
     """mongod 8.2.11's LIMIT of one, over an index read in a write's sort
     order, is EOF after the one work that returned its document: the
     profile entry's UPDATE and LIMIT each report `works: 1`, for an update
-    with a `sort` and a findAndModify alike. This server's report two, and
-    the UPDATE a `needTime` of 1."""
+    with a `sort` and a findAndModify alike. This server's reported two,
+    and the UPDATE a `needTime` of 1, counting the extra work `find`'s
+    executor spends finding its LIMIT at its end."""
     ops = {
         "update": (
             seed,

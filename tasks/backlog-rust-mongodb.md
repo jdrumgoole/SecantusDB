@@ -701,15 +701,6 @@ These are explicit non-goals. Don't add them without a reason.
       (RM-374).
       Verify: tests/backlog/test_rm_found_rm374.py::test_an_aggregate_sort_with_a_limit_counts_every_key_it_sorted
       Backlog-ID: RM-468
-- [ ] **A write's LIMIT of one counts a second work.** mongod 8.2.11's
-      LIMIT of one over an index read in a write's sort order is EOF after
-      the work that returned its document: a profile entry's UPDATE and
-      LIMIT each report `works: 1` (`needTime: 0`) for
-      `{q: {x: {$gte: 2}}, sort: {x: 1}}` over an index on `x`, an update
-      with a `sort` and a findAndModify alike. This server's report
-      `works: 2` and the UPDATE `needTime: 1`. Found 2026-11-09 (RM-376).
-      Verify: tests/backlog/test_rm_found_rm376.py::test_a_writes_limit_of_one_is_done_after_one_work
-      Backlog-ID: RM-474
 - [ ] **A SORT of index keys past its budget does not spill.** mongod
       8.2.11's SORT below a FETCH (`type: "default"`) spills past its
       budget with `allowDiskUse`: 2000 65-byte members under a
