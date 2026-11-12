@@ -568,31 +568,31 @@ pub fn param_index_scan(
     )
 }
 
-/// A scan of `index` inside a nested loop whose index qual bounds its
-/// leading column by the outer row's value (`a > e.a`, RP-354): with no
-/// constant to compare against, `scalarineqsel` is `DEFAULT_INEQ_SEL`, a
-/// third of the rows, and `lower` says which bound it is. Repeated
+/// A scan of `index` inside a nested loop whose index quals bound its
+/// leading column by the outer row's values (`a > e.a`, RP-354), each
+/// `bounds` entry one of them, `true` for a lower bound: with no constant
+/// to compare against, `scalarineqsel` is `DEFAULT_INEQ_SEL`, a third of
+/// the rows, and a join clause never pairs into a range
+/// (`clauselist_selectivity` pairs only clauses over one relation), so
+/// two bounds (`a > e.a and a < e.a`) select a ninth. Repeated
 /// `loop_count` times as [`param_index_scan`] is. `(startup, total)`.
 pub fn param_range_index_scan(
     rel: &Rel,
     index: &Index,
     quals: &[(String, Qual)],
-    lower: bool,
+    bounds: &[bool],
     loop_count: f64,
 ) -> Option<(f64, f64)> {
-    if index.hash || quals.iter().any(|(f, _)| f == &index.field) {
+    if index.hash || bounds.is_empty() || quals.iter().any(|(f, _)| f == &index.field) {
         return None;
     }
     let mut quals = quals.to_vec();
-    quals.push((index.field.clone(), Qual::Range(lower)));
-    index_scan_loops(
-        rel,
-        index,
-        &quals,
-        ColSel::Given(1.0 / 3.0),
-        false,
-        loop_count,
-    )
+    let mut sel = 1.0;
+    for lower in bounds {
+        quals.push((index.field.clone(), Qual::Range(*lower)));
+        sel *= 1.0 / 3.0;
+    }
+    index_scan_loops(rel, index, &quals, ColSel::Given(sel), false, loop_count)
 }
 
 /// A bitmap heap scan over `index` parameterized as [`param_index_scan`]
@@ -1794,7 +1794,17 @@ mod tests {
             hash: false,
             later: Vec::new(),
         };
-        let (startup, total) = param_range_index_scan(&rel, &ix, &[], true, 100.0).unwrap();
+        let (startup, total) = param_range_index_scan(&rel, &ix, &[], &[true], 100.0).unwrap();
         assert_eq!((startup, total), (0.275, 6.5025));
+        // `explain select * from e left join k on e.a < k.a and e.a > k.a`
+        // over the same `k` and 1,000 rows of `e`: `Index Cond: ((a >
+        // e.a) AND (a < e.a))`, a ninth of the rows a scan, prints
+        // `cost=0.28..2.53` on PostgreSQL 15.19 (RP-354).
+        let (startup, total) =
+            param_range_index_scan(&rel, &ix, &[], &[true, false], 1000.0).unwrap();
+        assert_eq!(
+            (format!("{startup:.2}"), format!("{total:.2}")),
+            ("0.28".to_string(), "2.53".to_string())
+        );
     }
 }

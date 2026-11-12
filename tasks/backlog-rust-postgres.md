@@ -1567,8 +1567,7 @@ a regression test.
       clauses its Filter (`e.a < k.a`: `Index Scan using k_pkey on k` with
       `Index Cond: (a > e.a)`), or Index Only Scan where the index holds
       every column the side reads. Every other nested loop still prints
-      zeros: two bounds on the index column (`e.a < k.a and e.a >
-      k.a`, one `Index Cond` of both), an inequality between the inner's
+      zeros: an inequality between the inner's
       key and an expression of the outer side (`e.a + 1 < k.a`,
       PostgreSQL's `Index Cond: (a > (e.a + 1))`), a key on a later
       index column; and a join of three or more relations (found while
@@ -1592,9 +1591,11 @@ a regression test.
       own item.) Since 2026-11-12 an inequality with no operand that is
       the indexed side's key (`e.a < k.a + 1`) is the Join Filter over
       that side's plain scan, or the parameterized scan's Filter beside a
-      key-to-key bound.
+      key-to-key bound. Since 2026-11-12 two bounds on the index column
+      (`e.a < k.a and e.a > k.a`) are one `Index Cond` of both, a ninth of
+      the rows a scan.
       Backlog-ID: RP-354
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[nested loop left join into an index bounded on both sides], tests/backlog/test_rp_explain_costs.py::test_plan[nested loop left join into an index on an expression of the outer side], tests/backlog/test_rp_explain_costs.py::test_plan[nested loop left join with a cross-type inequality into an index], tests/backlog/test_rp_explain_costs.py::test_plan[nested loop left join with a pattern over its preserved side], tests/backlog/test_rp_explain_costs.py::test_plan[nested loop of three relations]
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[nested loop left join into an index on an expression of the outer side], tests/backlog/test_rp_explain_costs.py::test_plan[nested loop left join with a cross-type inequality into an index], tests/backlog/test_rp_explain_costs.py::test_plan[nested loop left join with a pattern over its preserved side], tests/backlog/test_rp_explain_costs.py::test_plan[nested loop of three relations]
 - [ ] **A binary-coercible cast is kept in a plan, and its scan is not
       priced.** A cast between binary-compatible types (`text` to
       `varchar` and back to `text` for the operator) is a `RelabelType`

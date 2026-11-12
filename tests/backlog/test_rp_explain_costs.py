@@ -1362,10 +1362,11 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "        Index Cond: (a > k.a)",
         ],
     ),
-    # Still open: the nested loops RP-354 leaves at zeros. Two bounds on
-    # the index column are one Index Cond of both.
+    # Split from RP-354 and fixed: two bounds on the index column are one
+    # Index Cond of both, each `DEFAULT_INEQ_SEL` (a join clause never
+    # pairs into a range); before, the nested loop printed zeros.
     "nested loop left join into an index bounded on both sides": (
-        "RP-354",
+        "RP-329",
         _ANALYSED,
         "explain select * from e left join k on e.a < k.a and e.a > k.a",
         [
@@ -1373,6 +1374,31 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "  ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
             "  ->  Index Scan using k_pkey on k  (cost=0.28..2.53 rows=111 width=7)",
             "        Index Cond: ((a > e.a) AND (a < e.a))",
+        ],
+    ),
+    "nested loop into an index bounded on both sides, analysed": (
+        "RP-329",
+        _ANALYSED,
+        "explain (analyze, timing off, summary off)"
+        " select * from e join k on e.a <= k.a and e.a >= k.a",
+        [
+            "Nested Loop  (cost=0.28..3660.00 rows=111111 width=14) (actual rows=1000 loops=1)",
+            "  ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7) (actual rows=1000 loops=1)",
+            "  ->  Index Scan using k_pkey on k  (cost=0.28..2.53 rows=111 width=7)"
+            " (actual rows=1 loops=1000)",
+            "        Index Cond: ((a >= e.a) AND (a <= e.a))",
+        ],
+    ),
+    "nested loop left join into an index bounded on both sides with a filter": (
+        "RP-329",
+        _ANALYSED,
+        "explain select * from e left join k on e.a < k.a and e.a > k.a and e.b <> k.b",
+        [
+            "Nested Loop Left Join  (cost=0.28..3827.50 rows=100000 width=14)",
+            "  ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
+            "  ->  Index Scan using k_pkey on k  (cost=0.28..2.81 rows=100 width=7)",
+            "        Index Cond: ((a > e.a) AND (a < e.a))",
+            "        Filter: (e.b <> b)",
         ],
     ),
     # Split from RP-354 and fixed: an inequality whose operands are no

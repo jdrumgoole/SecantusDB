@@ -775,8 +775,8 @@ impl PgHandler {
     /// inner rows times every join clause's selectivity, as
     /// `get_parameterized_baserel_size` multiplies them; `inner_rows` is
     /// the plain scan's. [`ParamFound::Unmodelled`] where an index could serve
-    /// in a way not priced here: a later key column, two bounds or a
-    /// table never analysed.
+    /// in a way not priced here: a later key column, clauses on two
+    /// columns or a table never analysed.
     fn param_index_inner(
         &self,
         leaf: &SideLeaf,
@@ -835,12 +835,12 @@ impl PgHandler {
         if serving.is_empty() {
             return ParamFound::None;
         }
-        // One clause over one index (the primary key is listed as both
-        // the SQL key and the storage's `_id` index: one relation).
+        // One column over one index (the primary key is listed as both
+        // the SQL key and the storage's `_id` index: one relation), its
+        // every clause an index qual (`match_join_clauses_to_index`): two
+        // bounds (`e.a < k.a and e.a > k.a`) are one `Index Cond` of both.
         let field = serving[0].1.clone();
-        if serving.iter().any(|(_, f)| *f != field)
-            || clauses.iter().filter(|(f, _, _, _)| *f == field).count() != 1
-        {
+        if serving.iter().any(|(_, f)| *f != field) {
             return ParamFound::Unmodelled;
         }
         let Some(key) = self.analysed_key(&leaf.table, &field) else {
@@ -859,20 +859,22 @@ impl PgHandler {
         if index_only {
             ki.index.visible = ki.allvisfrac;
         }
-        let (_, column, op, ops) = clauses
+        let own: Vec<_> = clauses.iter().filter(|(f, _, _, _)| *f == field).collect();
+        let column = &own[0].1;
+        let bounds: Vec<bool> = own
             .iter()
-            .find(|(f, _, _, _)| *f == field)
-            .expect("counted above");
-        let lower = op.starts_with('>');
+            .map(|(_, _, op, _)| op.starts_with('>'))
+            .collect();
+        let ops: usize = own.iter().map(|(_, _, _, ops)| ops).sum();
         // The other join clauses, a filter on each row the scan fetches.
-        let rest_ops = (filters.iter().map(|f| f.ops).sum::<usize>() - *ops) as f64;
+        let rest_ops = (filters.iter().map(|f| f.ops).sum::<usize>() - ops) as f64;
         let rest: Vec<(String, costsize::Qual)> = if rest_ops > 0.0 {
             vec![(String::new(), costsize::Qual::Filter(rest_ops))]
         } else {
             Vec::new()
         };
         let Some((startup, total)) =
-            costsize::param_range_index_scan(&ki.rel, &ki.index, &rest, lower, outer_rows)
+            costsize::param_range_index_scan(&ki.rel, &ki.index, &rest, &bounds, outer_rows)
         else {
             return ParamFound::Unmodelled;
         };
