@@ -747,15 +747,31 @@ These are explicit non-goals. Don't add them without a reason.
       (RM-475).
       Verify: none -- mongod's own answer varies between runs; no test can pin it
       Backlog-ID: RM-556
-- [ ] **`returnKey` is not at the top of a sorted plan.** mongod 8.2.11
-      puts RETURN_KEY above a blocking sort and drops the projection:
-      `RETURN_KEY <- SORT <- COLLSCAN`, and `RETURN_KEY <- SORT <- FETCH <-
-      IXSCAN` where the index does not hold the sort. This server ignores
-      `returnKey` over a COLLSCAN (`PROJECTION_SIMPLE <- SORT <- COLLSCAN`)
-      and puts RETURN_KEY below the sort with no FETCH (`SORT <- RETURN_KEY
-      <- IXSCAN`). Found 2026-11-09 (RM-373).
-      Verify: tests/backlog/test_rm_found_2026_11_09_rm373.py::test_return_key_is_the_top_of_a_sorted_plan
-      Backlog-ID: RM-470
+- [ ] **A sort under `returnKey` is a `simple` sort, and a limited one
+      leaves ties in another order.** mongod 8.2.11's SORT under a
+      RETURN_KEY is `type: "default"` (it keeps each member's index key),
+      and `find({y: {$gte: 0}}).sort({z: 1}).limit(2).returnKey()` over
+      `{y: 1, x: 1}` returns `{y: 0, x: 6}` before `{y: 0, x: 0}`, which
+      tie on `z`. This server's SORT is `simple` (`Node::Sort`'s `on_keys`
+      says both "sorts keys below the FETCH" and the `default` type, as for
+      RM-472), and it returns `x` 0 before 6. Found 2026-11-12 (RM-470).
+      Verify: tests/backlog/test_rm_found_rm470.py::test_a_sort_under_return_key_is_a_default_sort
+      Backlog-ID: RM-566
+- [ ] **A `returnKey` point lookup on `_id` is not IDHACK.** mongod 8.2.11
+      answers `find({_id: 3}).returnKey()` by `RETURN_KEY <- IDHACK`; this
+      server plans `RETURN_KEY <- IXSCAN` (`find_plan` leaves the point
+      lookups to reads without `returnKey`). Found 2026-11-12 (RM-470).
+      Verify: tests/backlog/test_rm_found_rm470.py::test_return_key_of_an_id_point_lookup_is_idhack
+      Backlog-ID: RM-567
+- [ ] **`returnKey` drops a projection's `{$meta: "sortKey"}` field.**
+      mongod 8.2.11 keeps a projection's `sortKey` fields under `returnKey`
+      (`extractSortKeyMetaFieldsFromProjection`): `find({z: 0}, {k:
+      {$meta: "sortKey"}}).sort({z: 1}).returnKey()` returns `{k: [0]}`
+      for each document. This server returns the sort's field instead,
+      `{z: 0}`, and over an index `{y, x, z}` where mongod gives `{y, x,
+      k}`. Found 2026-11-12 (RM-470).
+      Verify: tests/backlog/test_rm_found_rm470.py::test_return_key_keeps_a_sort_key_meta_field
+      Backlog-ID: RM-568
 - [ ] **An `$or` of index scans does not answer a covered projection.**
       mongod 8.2.11 answers `{_id: 0, x: 1}` over an `$or` of two scans of
       `{y: 1, x: 1}` from their keys (`SUBPLAN <- PROJECTION_DEFAULT <- OR

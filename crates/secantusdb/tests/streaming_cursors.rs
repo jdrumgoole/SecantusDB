@@ -393,6 +393,32 @@ fn return_key_and_show_record_id_read_on() {
         .all(|d| matches!(d.get("$recordId"), Some(Bson::Int64(_)))));
 }
 
+/// `returnKey` over a sort the index does not hold reads each document in a
+/// FETCH below the sort, whose filter keeps only the matches (mongod
+/// 8.2.11: `RETURN_KEY <- SORT <- FETCH <- IXSCAN`, six keys of twelve;
+/// RM-470 returned all twelve).
+#[test]
+fn return_key_over_a_document_sort_keeps_the_filter() {
+    let server = Server::start().expect("start");
+    let c = coll(&server, "rk_sort");
+    c.insert_many((0..12).map(|n| doc! {"_id": n, "x": n, "y": n % 3, "z": n % 2}))
+        .run()
+        .unwrap();
+    index(&c, doc! {"y": 1, "x": 1}, None);
+    let cur = c
+        .find(doc! {"y": {"$gte": 0}, "z": 1})
+        .sort(doc! {"z": 1})
+        .return_key(true)
+        .batch_size(2)
+        .run()
+        .unwrap();
+    let want: Vec<Document> = [(0, 3), (0, 9), (1, 1), (1, 7), (2, 5), (2, 11)]
+        .into_iter()
+        .map(|(y, x)| doc! {"y": y, "x": x})
+        .collect();
+    assert_eq!(rest(cur), want);
+}
+
 /// A sort of index keys below the FETCH reads every key for the first
 /// batch and fetches each document as a batch reaches it: one deleted since
 /// is gone, one whose key moved is dropped, one changed otherwise is read as

@@ -2223,6 +2223,9 @@ fn runs_below_sort(projection: &Document, sort: &Document) -> bool {
 /// Sort, paging and projection around the scan, in mongod's nesting.
 fn wrap(a: Access, q: &Query) -> Node {
     let sort = sort_of(q);
+    // `returnKey` ignores the projection: mongod plans a RETURN_KEY in its
+    // place (`QueryPlannerAnalysis::analyzeDataAccess`).
+    let q_projection = q.projection.filter(|_| !q.return_key);
     let blocking = sort.filter(|_| !a.sorted);
     // A field the index holds provides its sort unless its own path is
     // multikey: `IndexScanNode::computeProperties` asks each path, not the
@@ -2236,7 +2239,7 @@ fn wrap(a: Access, q: &Query) -> Node {
     };
     let covered = a.indexed
         && a.fetch_filter.is_none()
-        && match (&a.index, q.projection) {
+        && match (&a.index, q_projection) {
             (Some(ix), Some(p)) => covers(ix, p) && blocking.is_none_or(|s| in_key(s, ix)),
             _ => false,
         };
@@ -2278,8 +2281,7 @@ fn wrap(a: Access, q: &Query) -> Node {
         absorbed.is_none()
             && !q.return_key
             && !q.show_record_id
-            && q.projection
-                .is_some_and(|p| !p.is_empty() && runs_below_sort(p, s))
+            && q_projection.is_some_and(|p| !p.is_empty() && runs_below_sort(p, s))
     });
     let keys_projected = covered && sort_on_keys && below;
     // Only one index scan's keys answer a covered projection: over a
@@ -2318,15 +2320,21 @@ fn wrap(a: Access, q: &Query) -> Node {
             node = Node::Skip(q.skip, Box::new(node));
             skipped = true;
         }
+        // Under `returnKey` the keys are returned without a FETCH unless a
+        // residual filter or a sort the keys do not hold reads the
+        // documents (measured 8.2.11: `RETURN_KEY <- SORT <- FETCH <-
+        // IXSCAN`, RM-470).
         if q.return_key {
-            node = Node::ReturnKey(Box::new(node));
+            if a.fetch_filter.is_some() || !sorted {
+                node = Node::fetch(a.fetch_filter, node);
+            }
         } else if !covered {
             node = Node::fetch(a.fetch_filter, node);
         }
     }
     let mut projected = false;
     if below && !sorted {
-        if let Some(p) = q.projection {
+        if let Some(p) = q_projection {
             node = projection(p, node);
             projected = true;
         }
@@ -2337,14 +2345,20 @@ fn wrap(a: Access, q: &Query) -> Node {
     if !skipped {
         node = Node::Skip(q.skip, Box::new(node));
     }
-    if let Some(p) = q.projection.filter(|p| !projected && !p.is_empty()) {
+    if let Some(p) = q_projection.filter(|p| !projected && !p.is_empty()) {
         node = projection(p, node);
-    } else if q.show_record_id && !projected {
+    } else if q.show_record_id && !projected && !q.return_key {
         node = Node::Projection {
             name: "PROJECTION_DEFAULT",
             spec: doc! { "$recordId": { "$meta": "recordId" } },
             input: Box::new(node),
         };
+    }
+    // RETURN_KEY is the top of the plan, above its sort and skip, below a
+    // limit no sort absorbed (`analyzeDataAccess`; measured 8.2.11: `RETURN_KEY
+    // <- SORT <- COLLSCAN`, RM-470).
+    if q.return_key {
+        node = Node::ReturnKey(Box::new(node));
     }
     if q.limit > 0 && (blocking.is_none() || absorbed.is_none()) {
         node = Node::Limit(q.limit, Box::new(node));

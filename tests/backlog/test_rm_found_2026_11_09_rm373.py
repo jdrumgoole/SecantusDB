@@ -41,13 +41,13 @@ def _sort_stage(stats: Any) -> dict:
     raise AssertionError("no SORT stage")
 
 
-@pytest.mark.backlog("RM-470")
+@pytest.mark.backlog_fixed("RM-470")
 def test_return_key_is_the_top_of_a_sorted_plan(rust_mongo: Any, mongod: Any) -> None:
     """mongod 8.2.11 puts RETURN_KEY above a blocking sort: `RETURN_KEY <-
     SORT <- COLLSCAN` for a read no index serves (its projection dropped),
     `RETURN_KEY <- SORT <- FETCH <- IXSCAN` for one whose index does not
-    hold the sort. This server ignores `returnKey` over a COLLSCAN
-    (`PROJECTION_SIMPLE <- SORT <- COLLSCAN`) and puts RETURN_KEY below the
+    hold the sort. This server ignored `returnKey` over a COLLSCAN
+    (`PROJECTION_SIMPLE <- SORT <- COLLSCAN`) and put RETURN_KEY below the
     sort, with no FETCH (`SORT <- RETURN_KEY <- IXSCAN`)."""
     commands = {
         "collscan": {
