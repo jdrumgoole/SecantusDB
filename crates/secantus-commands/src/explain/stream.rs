@@ -1985,6 +1985,7 @@ fn stage_of(
             limit,
             on_keys: true,
             input,
+            ..
         } => {
             let pattern: Vec<(String, bool)> = pattern
                 .iter()
@@ -2213,6 +2214,7 @@ impl Stream {
             limit: sort_limit,
             on_keys,
             input,
+            ..
         } = node
         {
             if *on_keys && of_keys(input) {

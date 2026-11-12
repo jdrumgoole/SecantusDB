@@ -166,6 +166,11 @@ pub(crate) enum Node {
         limit: Option<i64>,
         /// Sorting index keys below the fetch: mongod calls the type `default`.
         on_keys: bool,
+        /// The sort keeps each member's metadata beside its document (its
+        /// RecordId, a `$meta` value the projection reads): mongod's
+        /// `canUseSimpleSort` refuses its `simple` sort, which discards them,
+        /// and the type is `default` (RM-472).
+        keeps_metadata: bool,
         input: Box<Node>,
     },
     Skip(i64, Box<Node>),
@@ -379,6 +384,7 @@ impl Node {
                 pattern,
                 limit,
                 on_keys,
+                keeps_metadata,
                 input,
             } => {
                 out.insert("stage", "SORT");
@@ -390,7 +396,14 @@ impl Node {
                 if let Some(n) = limit {
                     out.insert("limitAmount", num(*n));
                 }
-                out.insert("type", if *on_keys { "default" } else { "simple" });
+                out.insert(
+                    "type",
+                    if *on_keys || *keeps_metadata {
+                        "default"
+                    } else {
+                        "simple"
+                    },
+                );
                 extra(&mut out);
                 input_of(&mut out, input);
             }

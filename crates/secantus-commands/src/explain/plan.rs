@@ -288,8 +288,17 @@ pub(crate) fn solution(node: &Node) -> String {
     fn walk(node: &Node, out: &mut String) {
         let doc = node.to_doc(None);
         out.push_str(doc.get_str("stage").unwrap_or("?"));
-        if let Node::Sort { on_keys, .. } = node {
-            out.push_str(if *on_keys { ":default" } else { ":simple" });
+        if let Node::Sort {
+            on_keys,
+            keeps_metadata,
+            ..
+        } = node
+        {
+            out.push_str(if *on_keys || *keeps_metadata {
+                ":default"
+            } else {
+                ":simple"
+            });
         }
         if let Ok(name) = doc.get_str("indexName") {
             out.push(':');
@@ -2110,12 +2119,14 @@ fn write_plan(
             Node::Sort {
                 pattern,
                 limit,
+                keeps_metadata,
                 input,
                 ..
             } => Node::Sort {
                 pattern,
                 limit,
                 on_keys: true,
+                keeps_metadata,
                 input,
             },
             other => other,
@@ -2184,6 +2195,29 @@ fn find_plan(q: &Query, catalog: &[Arc<IndexInfo>]) -> Node {
 /// literal, an expression, `$slice`, `$elemMatch` or `$meta` keeps it above
 /// -- and that hands on whole every path the sort orders by (`{a: 1}` hands
 /// on `a.b`, `{"a.b": 1}` does not hand on `a`, `{"a.c": 0}` hands on `a.b`).
+/// Whether a read's blocking sort keeps each member's metadata beside its
+/// document. mongod's `canUseSimpleSort` (`planner_analysis.cpp`) takes the
+/// `simple` sort, which discards all of it but the sort key, only when the
+/// query depends on no metadata but `sortKey` and does not keep the
+/// RecordId; otherwise the sort is `default` (measured 8.2.11, RM-472:
+/// `showRecordId`, and a projection reading `{$meta: "recordId"}`,
+/// `"indexKey"`, `"randVal"`, `"searchScore"` or `"geoNearDistance"`, sort
+/// `default`; one reading only `{$meta: "sortKey"}` sorts `simple`).
+/// `projection` is the one the plan runs (none under `returnKey`).
+fn keeps_metadata(q: &Query, projection: Option<&Document>) -> bool {
+    fn reads_metadata(v: &Bson) -> bool {
+        match v {
+            Bson::Document(d) => match d.get("$meta") {
+                Some(Bson::String(kind)) if d.len() == 1 => kind != "sortKey",
+                _ => d.values().any(reads_metadata),
+            },
+            Bson::Array(items) => items.iter().any(reads_metadata),
+            _ => false,
+        }
+    }
+    q.show_record_id || projection.is_some_and(|p| p.values().any(reads_metadata))
+}
+
 fn runs_below_sort(projection: &Document, sort: &Document) -> bool {
     fn leaves(spec: &Document, prefix: &str, out: &mut Vec<(String, bool)>) -> bool {
         spec.iter().all(|(k, v)| {
@@ -2266,10 +2300,12 @@ fn wrap(a: Access, q: &Query) -> Node {
             }
     });
     let absorbed = (q.limit > 0).then_some(q.limit + q.skip);
+    let keeps_metadata = keeps_metadata(q, q_projection);
     let sort_node = |input: Node, on_keys: bool| Node::Sort {
         pattern: blocking.cloned().unwrap_or_default(),
         limit: absorbed,
         on_keys,
+        keeps_metadata,
         input: Box::new(input),
     };
 

@@ -779,13 +779,27 @@ These are explicit non-goals. Don't add them without a reason.
       (`PROJECTION_SIMPLE <- FETCH <- OR`). Found 2026-11-09 (RM-373).
       Verify: tests/backlog/test_rm_found_2026_11_09_rm373.py::test_an_or_of_scans_answers_a_covered_projection
       Backlog-ID: RM-471
-- [ ] **A sort beside `showRecordId` is a `simple` sort.** mongod 8.2.11's
-      SORT under a `showRecordId` read's projection is `type: "default"`
-      (it keeps each document's RecordId); without `showRecordId` the same
-      read sorts `simple`. This server's is `simple` both ways. Found
-      2026-11-09 (RM-373).
-      Verify: tests/backlog/test_rm_found_2026_11_09_rm373.py::test_a_sort_beside_show_record_id_is_a_default_sort
-      Backlog-ID: RM-472
+- [ ] **A `default` sort of documents counts the documents, not its
+      working-set members.** mongod 8.2.11's SORT of a read that keeps
+      each member's metadata (`showRecordId`, a projection's `{$meta:
+      "recordId"}`; `type: "default"` since RM-472) counts each member it
+      sorts: 1122 bytes `totalDataSizeSorted` for the six documents of
+      `find({z: 0}).sort({z: 1}).showRecordId()` (374 for two under a
+      `limit` of 2, 2244 for twelve over a FETCH), where the same read
+      without `showRecordId` sorts `simple` and counts 402. This server
+      counts 402 both ways: it sorts the documents as its `simple` sort
+      does. RM-473 is the same model over a covered projection. Found
+      2026-11-12 (RM-472).
+      Verify: tests/backlog/test_rm_found_rm472.py::test_a_default_sort_of_documents_counts_its_members
+      Backlog-ID: RM-577
+- [ ] **A `$near` read over a `2d` index explains as a COLLSCAN.** mongod
+      8.2.11 plans `find({loc: {$near: [0, 0]}})` over a `{loc: "2d"}`
+      index as `GEO_NEAR_2D` (`SORT <- GEO_NEAR_2D` under a `sort`); this
+      server's `explain` names a `COLLSCAN` for the same read. The
+      documents come back in mongod's order either way. Found 2026-11-12
+      (RM-472).
+      Verify: tests/backlog/test_rm_found_rm472.py::test_a_near_read_explains_as_geo_near_2d
+      Backlog-ID: RM-578
 - [ ] **A SORT over a covered projection does not count what it sorted.**
       mongod 8.2.11's `SORT <- PROJECTION_COVERED <- IXSCAN` (`type:
       "default"`) counts 1584 bytes sorted for the twelve `{x}` members of

@@ -91,12 +91,12 @@ def test_an_or_of_scans_answers_a_covered_projection(rust_mongo: Any, mongod: An
     assert answers["rust"] == answers["mongod"]
 
 
-@pytest.mark.backlog("RM-472")
+@pytest.mark.backlog_fixed("RM-472")
 def test_a_sort_beside_show_record_id_is_a_default_sort(rust_mongo: Any, mongod: Any) -> None:
     """mongod 8.2.11's SORT under a `showRecordId` read's projection is
     `type: "default"` -- it keeps each document's RecordId -- where the same
-    read without `showRecordId` sorts `simple`. This server's is
-    `simple`."""
+    read without `showRecordId` sorts `simple`. This server's was `simple`
+    both ways."""
     command = {
         "find": "c",
         "filter": {"z": 0},
@@ -113,6 +113,48 @@ def test_a_sort_beside_show_record_id_is_a_default_sort(rust_mongo: Any, mongod:
         ("SORT", "default"),
         ("COLLSCAN", None),
     ]
+    assert answers["rust"] == answers["mongod"]
+
+
+@pytest.mark.backlog_fixed("RM-472")
+def test_a_sort_beside_a_metadata_projection_is_a_default_sort(
+    rust_mongo: Any, mongod: Any
+) -> None:
+    """mongod 8.2.11's SORT is `simple` only when the read depends on no
+    metadata but `sortKey` (`canUseSimpleSort`): a projection reading
+    `{$meta: "recordId"}`, `"indexKey"` or `"randVal"` sorts `default`, over
+    a COLLSCAN and over a FETCH, and one reading only `"sortKey"` sorts
+    `simple`. This server's was `simple` for all of them."""
+    metas = {"recordId": {"z": 0}, "indexKey": {"y": 1}, "randVal": {"z": 0}, "sortKey": {"z": 0}}
+    answers = {
+        server: {
+            meta: [
+                stage
+                for stage in _chain(
+                    _plan(
+                        client,
+                        {
+                            "find": "c",
+                            "filter": flt,
+                            "projection": {"z": 1, "m": {"$meta": meta}},
+                            "sort": {"z": 1},
+                        },
+                    )["queryPlanner"]["winningPlan"],
+                    "stage",
+                    "type",
+                )
+                if stage[0] == "SORT"
+            ]
+            for meta, flt in metas.items()
+        }
+        for server, client in (("mongod", mongod), ("rust", rust_mongo))
+    }
+    assert answers["mongod"] == {
+        "recordId": [("SORT", "default")],
+        "indexKey": [("SORT", "default")],
+        "randVal": [("SORT", "default")],
+        "sortKey": [("SORT", "simple")],
+    }
     assert answers["rust"] == answers["mongod"]
 
 
