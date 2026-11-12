@@ -1619,6 +1619,44 @@ def test_regtype_names_a_type(home: Path) -> None:
             assert cur.fetchone()[0] == want
 
 
+#: What a user can create that a `pg_attribute` row could be filled from:
+#: a domain with a collation, an enum, a composite, a collated column, an
+#: inheritance child, a column grant, a view, an index and a sequence.
+_USER_SCHEMA = (
+    'CREATE DOMAIN rp715_d AS text COLLATE "C"',
+    "CREATE TYPE rp715_mood AS ENUM ('a', 'b')",
+    "CREATE TYPE rp715_pair AS (x int, y text)",
+    'CREATE TABLE rp715_p (id int PRIMARY KEY, t rp715_d, m rp715_mood, v text COLLATE "C")',
+    "CREATE TABLE rp715_c (extra text) INHERITS (rp715_p)",
+    "GRANT SELECT (t) ON rp715_p TO PUBLIC",
+    "CREATE VIEW rp715_v AS SELECT id, t FROM rp715_p",
+    "CREATE INDEX ON rp715_p (v)",
+    "CREATE SEQUENCE rp715_s",
+)
+
+
+def test_system_relations_attributes_ignore_the_user_schema(tmp_path: Path) -> None:
+    """PostgreSQL's own relations' `pg_attribute` rows are built once per
+    process and shared (RP-715): nothing a user creates may change them.
+
+    One server reads them first in a fresh database, the other only after
+    creating everything in `_USER_SCHEMA`, so each server's one build saw a
+    different schema. Every column of every row must agree; a fill that came
+    to read user state for these rows would make them differ."""
+    query = "SELECT * FROM pg_attribute WHERE attrelid < 16384 ORDER BY attrelid, attnum"
+    answers = []
+    for i, setup in enumerate(((), _USER_SCHEMA)):
+        home = tmp_path / f"store{i}"
+        home.mkdir()
+        with _Server(home) as server, server.connect() as conn:
+            for statement in setup:
+                conn.execute(statement)
+            answers.append(conn.execute(query).fetchall())
+    fresh, after_ddl = answers
+    assert len(fresh) == 3054
+    assert after_ddl == fresh
+
+
 def test_regclass_names_a_relation(home: Path) -> None:
     """`'t'::regclass` is the relation's oid, printed as its name.
 

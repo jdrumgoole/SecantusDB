@@ -1165,7 +1165,23 @@ impl PgHandler {
                 .collect(),
             _ => Vec::new(),
         };
-        let table_by_oid = |oid: i64| tables.iter().find(|(o, _)| *o == oid).map(|(_, t)| t);
+        // By oid, the first of each: every row asks for its relation's
+        // several times, and a scan of the list per ask made the fill
+        // quadratic in the number of tables (RP-715).
+        let mut by_oid: HashMap<i64, &TableDef> = HashMap::with_capacity(tables.len());
+        for (oid, t) in &tables {
+            by_oid.entry(*oid).or_insert(t);
+        }
+        let table_by_oid = |oid: i64| by_oid.get(&oid).copied();
+        // Every collation by name, listed once for the rows that need it.
+        let collations = std::cell::OnceCell::new();
+        let collation_oid = |name: &str| {
+            collations
+                .get_or_init(secantus_pgplan::regobj::collation_names)
+                .iter()
+                .find(|(n, _): &&(String, i64)| *n == name)
+                .map(|(_, o)| *o)
+        };
         // `ALTER TYPE ... OWNER TO`'s owners, by type name.
         let type_owners: Vec<(String, i64)> = if name == "pg_type" {
             self.type_owner_oids()
@@ -1501,15 +1517,11 @@ impl PgHandler {
                                         col.extra.get_str("collation").ok().map(str::to_string)
                                     });
                                 match declared {
-                                    Some(name) => Bson::Int64(
-                                        secantus_pgplan::regobj::collation_names()
-                                            .into_iter()
-                                            .find(|(n, _)| *n == name)
-                                            .map_or_else(
-                                                || type_collation(type_oid, &domain_colls),
-                                                |(_, o)| o,
-                                            ),
-                                    ),
+                                    Some(name) => {
+                                        Bson::Int64(collation_oid(&name).unwrap_or_else(|| {
+                                            type_collation(type_oid, &domain_colls)
+                                        }))
+                                    }
                                     None => Bson::Int64(type_collation(type_oid, &domain_colls)),
                                 }
                             }

@@ -1079,28 +1079,31 @@ one beside it.
 
 ## Found by a CI run (2026-11-09)
 
-- [ ] **OPEN — any DDL statement makes the next catalog query re-decode
-      every catalog collection.** `bump_catalog_version` (`lib.rs`, the
-      `CatalogCache` comment) moves one version after every statement that
-      may change the catalog, and the next read of any catalog then decodes
-      all of them again. PostgreSQL invalidates only the cache entries for
-      the rows that changed (`inval.c`, `CatCacheInvalidate`, a relation's
-      relcache entry), so its first query after DDL costs about what the
-      next one does. Measured 2026-11-09 with psql's `\d` collation
-      subquery (`tests/backlog/test_rp_catalog_latency.py`) after a
-      `CREATE TABLE`:
-      - PostgreSQL 15.19 (private cluster): 0.9 ms first, 0.2 ms after.
-      - Debug `secantusd-pg`: 0.58 s first, 0.016 s after; and the first
-        query grows with the schema: 0.68 s with 50 more tables, 0.97 s
-        with 150, 1.79 s with 400 (0.044 s after).
-      A slow CI runner took the first query to 2.2 s and failed RP-077's
-      latency test on PR #2552 (job 129166397146), which until then timed
-      that cold read instead of the subquery it was written for.
-      The faithful fix keys the decoded rows per catalog row, or per
-      relation, and invalidates what a statement changed, as `inval.c` does;
-      `catcache.rs` already models which lookups miss.
+- [ ] **OPEN — after any DDL statement, the next catalog query rebuilds
+      every user relation's catalog rows, so it grows with the schema.**
+      The version `bump_catalog_version` moves after every statement that
+      may change the catalog drops every computed catalog relation, and the
+      next read of `pg_attribute`, `pg_type` or `pg_class` builds the rows of
+      every user table, view, index and sequence again (`catalog_rows`, the
+      `virtual_cache`). PostgreSQL invalidates only the cache entries of the
+      rows a statement changed (`inval.c`, `CatCacheInvalidate`, a
+      relation's relcache entry), so the rest of the schema costs it
+      nothing. Measured 2026-11-12 with psql's `\d` collation subquery
+      (`tests/backlog/test_rp_catalog_latency.py`) after a `CREATE TABLE`:
+      - PostgreSQL 15.19 (private cluster): 0.33 ms first and 0.26 ms after
+        with 200 other tables; 0.20 ms and 0.11 ms with 400.
+      - Debug `secantusd-pg`: 0.020 s first and 0.006 s after with none;
+        0.11 s and 0.008 s with 200; 0.21 s and 0.010 s with 400.
+      PostgreSQL's own relations' 3,054 `pg_attribute` rows, which were
+      most of the cost, are built once per process since 2026-11-12. The
+      faithful fix keys the rest per relation and invalidates what a
+      statement changed, as `inval.c` does; `catcache.rs` already models
+      which lookups miss. A user relation's rows depend on more than its
+      own catalog entry (its column grants, its inheritance parents, the
+      user types, domains and collations its columns name), so the key has
+      to carry each of them, or a stale row is a wrong answer.
       Backlog-ID: RP-715
-      Verify: tests/backlog/test_rp_catalog_latency.py::test_the_first_catalog_query_after_ddl_costs_what_the_next_does
+      Verify: tests/backlog/test_rp_catalog_latency.py::test_the_first_catalog_query_after_ddl_does_not_grow_with_the_schema
 
 ## Found by a CI run (2026-11-07)
 

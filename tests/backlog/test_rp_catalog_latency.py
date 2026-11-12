@@ -9,6 +9,8 @@ query psql sends for `\\d <table>`.
 from __future__ import annotations
 
 import time
+from collections.abc import Iterator
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -26,10 +28,11 @@ COLLATION_QUERY = (
 
 #: PostgreSQL 15.19 answered in 3.5 ms. A debug `secantusd-pg` took 64 s,
 #: for one column as for three. The query is timed WARM, on its second run:
-#: the first query after any DDL re-decodes the whole catalog (RP-715), which
-#: costs a debug build 0.6 s on a fast laptop and took a slow CI runner past
-#: this budget on 2026-11-09 (PR #2552). Warm, a debug build answers in about
-#: 0.016 s, so the budget is far from both answers again.
+#: the first query after any DDL rebuilt the whole of `pg_attribute` (RP-715),
+#: which cost a debug build 0.6 s on a fast laptop and took a slow CI runner
+#: past this budget on 2026-11-09 (PR #2552); it still rebuilds every user
+#: relation's rows. Warm, a debug build answers in about 0.007 s, so the
+#: budget is far from both answers.
 BUDGET_SECONDS = 2.0
 
 
@@ -42,7 +45,7 @@ def test_psql_describe_collation_subquery(pg: Any) -> None:
     a minute later.
 
     The first run after the `CREATE TABLE` is not timed: it pays for
-    re-reading the catalog after DDL (RP-715). Only decoded catalog rows and
+    rebuilding the catalog after DDL (RP-715). Only decoded catalog rows and
     plans are cached, never a result, so the second run still evaluates the
     subquery for every column."""
     pg.execute('CREATE TABLE rp_cx (v text COLLATE "C")')
@@ -54,20 +57,13 @@ def test_psql_describe_collation_subquery(pg: Any) -> None:
     assert elapsed < BUDGET_SECONDS, f"{elapsed:.1f} s for one column"
 
 
-@pytest.mark.backlog("RP-715")
-def test_the_first_catalog_query_after_ddl_costs_what_the_next_does(pg: Any) -> None:
-    """PostgreSQL 15.19 (private cluster, 2026-11-09) answers the collation
-    query in 0.9 ms straight after a `CREATE TABLE` and 0.2 ms after that:
-    DDL invalidates only the cache entries it changed (`inval.c`). A debug
-    `secantusd-pg` took 0.58 s and then 0.016 s, because any DDL makes the
-    next catalog read decode every catalog collection again.
-
-    A ratio, not a budget, so the verdict holds on any runner and any build:
-    the fastest first-after-DDL run of three against the fastest warm run."""
+def _first_and_warm(pg: Any, prefix: str) -> tuple[float, float]:
+    """The fastest of three first runs of the collation query, each straight
+    after a `CREATE TABLE`, and the fastest of the warm runs after them."""
     firsts, warms = [], []
     for i in range(3):
-        pg.execute(f'CREATE TABLE rp715_{i} (v text COLLATE "C")')
-        query = COLLATION_QUERY.replace("'rp_cx'", f"'rp715_{i}'")
+        pg.execute(f'CREATE TABLE {prefix}_{i} (v text COLLATE "C")')
+        query = COLLATION_QUERY.replace("'rp_cx'", f"'{prefix}_{i}'")
         start = time.monotonic()
         assert pg.execute(query).fetchall() == [("v", "C")]
         firsts.append(time.monotonic() - start)
@@ -75,7 +71,60 @@ def test_the_first_catalog_query_after_ddl_costs_what_the_next_does(pg: Any) -> 
             start = time.monotonic()
             pg.execute(query).fetchall()
             warms.append(time.monotonic() - start)
-    first, warm = min(firsts), min(warms)
+    return min(firsts), min(warms)
+
+
+@pytest.mark.backlog_fixed("RP-715")
+def test_the_first_catalog_query_after_ddl_costs_what_the_next_does(pg: Any) -> None:
+    """PostgreSQL 15.19 (private cluster, 2026-11-09) answers the collation
+    query in 0.9 ms straight after a `CREATE TABLE` and 0.2 ms after that:
+    DDL invalidates only the cache entries it changed (`inval.c`). A debug
+    `secantusd-pg` took 0.58 s and then 0.016 s, because any DDL rebuilt
+    `pg_attribute` whole, PostgreSQL's own 3,054 rows with it, and built it
+    twice (the query, and the walk that counts its catalog reads). Since
+    those rows are built once per process, a debug build takes about 0.02 s
+    and then 0.007 s (2026-11-12).
+
+    A ratio, not a budget, so the verdict holds on any runner and any build:
+    the fastest first-after-DDL run of three against the fastest warm run."""
+    first, warm = _first_and_warm(pg, "rp715")
     assert first < 3 * warm + 0.02, (
         f"first query after DDL {first * 1000:.0f} ms, warm {warm * 1000:.0f} ms"
+    )
+
+
+@pytest.fixture
+def pg_alone(tmp_path: Path) -> Iterator[Any]:
+    """A connection to a `secantusd-pg` of the test's own, whose schema no
+    other test's tables enlarge."""
+    from tests.test_rust_pgserver_slice import _Server
+
+    with _Server(tmp_path) as server, server.connect() as conn:
+        yield conn
+
+
+#: User tables made before measuring.
+SCHEMA_TABLES = 200
+
+
+@pytest.mark.backlog("RP-715")
+def test_the_first_catalog_query_after_ddl_does_not_grow_with_the_schema(
+    pg_alone: Any,
+) -> None:
+    """PostgreSQL 15.19 (private cluster, 2026-11-12) answers the collation
+    query in 0.33 ms straight after a `CREATE TABLE` with 200 other tables
+    in the database, and 0.26 ms after that; with 400, 0.20 ms and 0.11 ms.
+    DDL invalidates the changed relation's entries only (`inval.c`), so the
+    rest of the schema costs nothing. A debug `secantusd-pg` rebuilds every
+    user relation's `pg_attribute`, `pg_type` and `pg_class` rows after any
+    DDL: about 0.11 s first and 0.008 s warm with 200 tables, 0.21 s and
+    0.010 s with 400 (2026-11-12).
+
+    The same ratio as the test above, with the schema enlarged first."""
+    for i in range(SCHEMA_TABLES):
+        pg_alone.execute(f"CREATE TABLE rp715_extra_{i} (a int, b text)")
+    first, warm = _first_and_warm(pg_alone, "rp715s")
+    assert first < 3 * warm + 0.02, (
+        f"first query after DDL with {SCHEMA_TABLES} tables {first * 1000:.0f} ms, "
+        f"warm {warm * 1000:.0f} ms"
     )

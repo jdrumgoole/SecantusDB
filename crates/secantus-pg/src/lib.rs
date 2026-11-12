@@ -21929,7 +21929,7 @@ impl PgHandler {
                 // Rows a read failed in are not kept: the next reader builds
                 // them again (and the failure stays noted for this one's).
                 let outer = CATALOG_FILL_ERROR.with(|e| e.borrow_mut().take());
-                let rows = self.virtual_rows_uncached(name, &Document::new());
+                let rows = self.catalog_rows(name);
                 let failed = CATALOG_FILL_ERROR.with(|e| {
                     let mut e = e.borrow_mut();
                     if e.is_none() {
@@ -21949,21 +21949,36 @@ impl PgHandler {
                 rows
             }
         };
-        if filter.is_empty() {
-            return Some(rows.as_ref().clone());
-        }
-        let empty = Document::new();
-        let in_sets = secantus_core::query::InSets::prepare(filter);
-        let _in_sets = secantus_core::query::InSetsGuard::install(&in_sets);
-        Some(
-            rows.iter()
-                .filter(|d| secantus_core::query::matches(d, filter, &empty, None).unwrap_or(false))
-                .cloned()
-                .collect(),
-        )
+        Some(rows.filtered(filter))
+    }
+
+    /// `pg_attribute`'s rows for PostgreSQL's own relations, filled, built
+    /// once per process (RP-715).
+    ///
+    /// They are 3,054 of the rows a fresh database lists, and no statement
+    /// changes them: every value comes from what 15.19's `initdb` leaves
+    /// (`pg_attribute_system.tsv`, the built-in types' facts, `pg_init_privs`),
+    /// none from a user's table, type, domain or grant. Rebuilt with the rest
+    /// of the catalog after every DDL statement, they were nearly all of the
+    /// first catalog query's cost after one (a debug build: 0.12 s against
+    /// 0.008 s warm), where PostgreSQL invalidates only the cache entries of
+    /// the rows a statement changed (`inval.c`) and so never re-reads them.
+    fn system_relation_attributes(&self, def: &TableDef) -> Arc<Vec<Document>> {
+        static ROWS: OnceLock<Arc<Vec<Document>>> = OnceLock::new();
+        Arc::clone(ROWS.get_or_init(|| {
+            let mut rows = catalog_meta::attribute_rows(def);
+            self.fill_catalog_columns("pg_attribute", def, &mut rows);
+            Arc::new(rows)
+        }))
     }
 
     fn virtual_rows_uncached(&self, name: &str, filter: &Document) -> Option<Vec<Document>> {
+        Some(self.catalog_rows(name)?.filtered(filter))
+    }
+
+    /// Every row of one virtual table, unfiltered: those built for this
+    /// read, and those no statement changes (`CatalogRows::fixed`).
+    pub(crate) fn catalog_rows(&self, name: &str) -> Option<CatalogRows> {
         let def = Self::virtual_table(name)?;
         let mut rows: Vec<Document> = match name {
             "pg_collation" => {
@@ -24480,8 +24495,8 @@ impl PgHandler {
                         rows.push(d);
                     }
                 }
-                // PostgreSQL's own relations' columns.
-                rows.extend(catalog_meta::attribute_rows(&def));
+                // PostgreSQL's own relations' columns are added once filled
+                // (`system_relation_attributes`): no statement changes them.
                 rows
             }
             // One row per label, in declared order; sortorder starts at 1.
@@ -25236,15 +25251,12 @@ impl PgHandler {
                     .filter(|d| oid_of(d).is_none_or(|o| !have.contains(&o))),
             );
         }
-        let empty = Document::new();
-        // Large scalar `$in` / `$nin` lists hashed once for these rows.
-        let in_sets = secantus_core::query::InSets::prepare(filter);
-        let _in_sets = secantus_core::query::InSetsGuard::install(&in_sets);
-        Some(
-            rows.into_iter()
-                .filter(|d| secantus_core::query::matches(d, filter, &empty, None).unwrap_or(false))
-                .collect(),
-        )
+        let fixed = if name == "pg_attribute" {
+            self.system_relation_attributes(&def)
+        } else {
+            Arc::default()
+        };
+        Some(CatalogRows { built: rows, fixed })
     }
 
     /// Read one table's catalog entry: this transaction's pending creates and
@@ -55401,7 +55413,42 @@ fn copy_field(
 
 /// `virtual_rows`' cache entry: the message cycle, catalog version and
 /// settings generation it was computed under, and the rows.
-type CachedRows = (u64, u64, u64, Arc<Vec<Document>>);
+type CachedRows = (u64, u64, u64, Arc<CatalogRows>);
+
+/// A virtual table's rows ([`PgHandler::catalog_rows`]): those built for
+/// one read, then those that are the same for every read (`pg_attribute`'s
+/// rows for PostgreSQL's own relations, RP-715), shared rather than copied
+/// into each read's rows.
+#[derive(Debug, Default)]
+pub(crate) struct CatalogRows {
+    built: Vec<Document>,
+    fixed: Arc<Vec<Document>>,
+}
+
+impl CatalogRows {
+    pub(crate) fn len(&self) -> usize {
+        self.built.len() + self.fixed.len()
+    }
+
+    pub(crate) fn iter(&self) -> impl Iterator<Item = &Document> {
+        self.built.iter().chain(self.fixed.iter())
+    }
+
+    /// Copies of the rows `filter` matches, in order.
+    fn filtered(&self, filter: &Document) -> Vec<Document> {
+        if filter.is_empty() {
+            return self.iter().cloned().collect();
+        }
+        let empty = Document::new();
+        // Large scalar `$in` / `$nin` lists hashed once for these rows.
+        let in_sets = secantus_core::query::InSets::prepare(filter);
+        let _in_sets = secantus_core::query::InSetsGuard::install(&in_sets);
+        self.iter()
+            .filter(|d| secantus_core::query::matches(d, filter, &empty, None).unwrap_or(false))
+            .cloned()
+            .collect()
+    }
+}
 
 #[async_trait]
 impl CopyHandler for PgHandler {

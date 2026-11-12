@@ -2769,10 +2769,10 @@ impl PgHandler {
         self.session_user_name()
     }
 
-    fn virtual_rows_for(&self, name: &str) -> Option<Vec<bson::Document>> {
+    fn virtual_rows_for(&self, name: &str) -> Option<crate::CatalogRows> {
         // Uncached: the statement's own read of the catalog, in its
         // transaction, must not find rows read before it began.
-        self.virtual_rows_uncached(name, &bson::Document::new())
+        self.catalog_rows(name)
     }
 
     fn catalog_def(&self, name: &str) -> Option<secantus_pgcatalog::TableDef> {
