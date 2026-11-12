@@ -31704,16 +31704,25 @@ impl PgHandler {
         let label = secantus_pgplan::scalar::format_type_text_public(&c.pg_type, Some(-1));
         match c.default.as_ref() {
             None | Some(Bson::Null) => Bson::Null,
-            Some(Bson::String(s)) => {
-                // Single quotes double inside a SQL literal.
-                let escaped = s.replace('\'', "''");
-                Bson::String(format!("'{escaped}'::{label}"))
-            }
             Some(Bson::Array(items)) => Bson::String(format!(
                 "'{}'::{label}",
                 secantus_pgplan::render_array(items).replace('\'', "''"),
             )),
             Some(Bson::Boolean(b)) => Bson::String(b.to_string()),
+            // Anything but a number: `get_const_expr` prints the type's OUTPUT
+            // function, quoted and labelled -- a timestamp's instant, a `date`'s
+            // ISO text in the session DateStyle and zone, an interval's parts
+            // as `'1 day'::interval`, a bytea's bytes as `'\x01'::bytea`
+            // (RP-864). Single quotes double inside a SQL literal.
+            Some(v)
+                if !matches!(
+                    v,
+                    Bson::Int32(_) | Bson::Int64(_) | Bson::Double(_) | Bson::Decimal128(_)
+                ) && !secantus_pgplan::numeric::is_wide_numeric(v) =>
+            {
+                let text = secantus_pgplan::typeout::session_output_text(v, &c.pg_type);
+                Bson::String(format!("'{}'::{label}", text.replace('\'', "''")))
+            }
             Some(other) => {
                 let text = secantus_pgplan::numeric::numeric_text(other)
                     .unwrap_or_else(|| format!("{other}"));

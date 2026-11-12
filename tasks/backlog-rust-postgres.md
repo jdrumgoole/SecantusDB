@@ -3589,20 +3589,6 @@ stored expression tree.
       value.
       Verify: tests/backlog/test_rp_found_rp846.py::test_an_explicit_cast_default_keeps_its_modifier
       Backlog-ID: RP-863
-- [ ] **A `timestamp`, `timestamptz`, `interval` or `bytea` DEFAULT prints
-      its internal form.** `ts timestamp(2) default '2020-01-01'` is
-      `'2020-01-01 00:00:00'::timestamp without time zone` on PostgreSQL
-      15.19, `timestamptz default '2020-01-01 00:00:00+00'`
-      `'2020-01-01 00:00:00+00'::timestamp with time zone`, `interval
-      default '1 day'` `'1 day'::interval` and `bytea default '\x01'`
-      `'\x01'::bytea`. Here they are `DateTime("2020-01-01 0:00:00.0
-      +00:00:00")`, `{ "__ivl_mon": 0, "__ivl_day": 1, "__ivl_us": 0 }` and
-      `Binary(0x0, AQ==)`: `default_expression` formats a non-string
-      stored value with `Bson`'s `Display`, where `get_const_expr` uses the
-      type's output function (a timestamptz in the session's TimeZone),
-      quoted and labelled.
-      Verify: tests/backlog/test_rp_found_rp846.py::test_a_temporal_or_bytea_default_prints_as_a_literal
-      Backlog-ID: RP-864
 
 ## Found while working RP-845 (2026-11-11)
 
@@ -3837,3 +3823,22 @@ tests are in `tests/backlog/test_rp_found_rp565.py`.
       `x` and the second is 42809.
       Verify: tests/backlog/test_rp_found_rp565.py::test_a_temporary_row_type_hides_a_built_in_type
       Backlog-ID: RP-891
+
+## Found while working RP-864 (2026-11-12)
+
+Measured on PostgreSQL 15.19; none of it needs DDL.
+
+- [ ] **A `date` or `timestamp` made text inside an expression ignores the
+      DateStyle.** Under `set datestyle to 'German'`, `concat('2020-01-02'::date,
+      '|', '2020-01-01 12:00'::timestamp)` is `02.01.2020|01.01.2020 12:00:00`
+      on PostgreSQL 15.19, `format('%s', '2020-01-02'::date)` `02.01.2020`
+      and `row('2020-01-02'::date, '2020-01-01 12:00'::timestamp)::text`
+      `(02.01.2020,"01.01.2020 12:00:00")`: each calls `date_out` /
+      `timestamp_out`, which write in the session DateStyle. Here each is
+      ISO: `typeout::output_text` writes ISO, as JSON and XML (which stay
+      ISO under every DateStyle) need, and `needs_type` leaves `date` out,
+      so these paths print the stored text. `typeout::session_output_text`
+      (RP-864's DEFAULT printer) is the styled form; the fix is choosing it
+      at the output-function sites and not at JSON's and XML's.
+      Verify: tests/backlog/test_rp_found_rp864.py::test_a_date_as_text_in_an_expression_follows_the_datestyle
+      Backlog-ID: RP-894
