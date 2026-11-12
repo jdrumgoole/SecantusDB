@@ -222,3 +222,87 @@ def test_a_sort_over_a_projection_counts_the_projected_documents(
         [explained(rust_mongo), profiled(rust_mongo, False)],
         [explained(mongod), profiled(mongod, True)],
     )
+
+
+#: Covered reads whose SORT sorts what `PROJECTION_COVERED` built of the
+#: keys (`SORT <- PROJECTION_COVERED <- IXSCAN`, `type: "default"`): each
+#: an OWNED_OBJ working-set member, counted as its sort key and its
+#: document's `getApproximateSize` (RM-473).
+COVERED: dict[str, dict] = {
+    "x": {"projection": {"_id": 0, "x": 1}, "sort": {"x": 1}},
+    "x_descending": {"projection": {"_id": 0, "x": 1}, "sort": {"x": -1}},
+    "x_and_y": {"projection": {"_id": 0, "x": 1, "y": 1}, "sort": {"x": 1}},
+    "compound_sort": {"projection": {"_id": 0, "x": True, "y": 1.0}, "sort": {"x": 1, "y": -1}},
+    "skip": {"projection": {"_id": 0, "x": 1}, "sort": {"x": 1}, "skip": 3},
+}
+
+
+@pytest.mark.parametrize("name", list(COVERED))
+def test_a_sort_over_a_covered_projection_counts_its_documents(
+    rust_mongo: Any, mongod: Any, name: str
+) -> None:
+    spec = COVERED[name]
+    command = {"find": "c", "filter": _COVERING, **spec}
+
+    def explained(client: Any) -> Any:
+        stats = _explained(client, command, "executionStats")["executionStats"]
+        stage = _sort_stage(stats["executionStages"])
+        return [stage["type"], stage["totalDataSizeSorted"]]
+
+    def profiled(client: Any, is_mongod: bool) -> list:
+        def op(d: Any) -> Any:
+            cursor = d.c.find(_COVERING, spec["projection"]).sort(list(spec["sort"].items()))
+            return list(cursor.skip(spec.get("skip", 0)))
+
+        entries = logged(client, is_mongod, _seed, op)[1]
+        return [
+            _sort_stage(e["execStats"])["totalDataSizeSorted"] for e in entries if "execStats" in e
+        ]
+
+    same(
+        [explained(rust_mongo), profiled(rust_mongo, False)],
+        [explained(mongod), profiled(mongod, True)],
+    )
+
+
+@pytest.mark.parametrize("projection", [{"_id": 0, "x": 1}, {"_id": 0, "x": 1, "y": 1}])
+def test_a_sort_over_a_covered_projection_spills_its_documents(
+    rust_mongo: Any, mongod: Any, projection: dict
+) -> None:
+    """2000 documents under a 100000-byte budget with `allowDiskUse`: the
+    members spill as OWNED_OBJ working-set members (mongod 8.2.11: 108000
+    bytes for `{x}`, in 5 spills of 4000 records). What the runs compress
+    to (`spilledDataStorageSize`) is left out: mongod's members carry
+    snapshot ids from a process-wide counter (RM-556)."""
+
+    def spilled(client: Any, is_mongod: bool) -> dict:
+        client.admin.command("setParameter", 1, internalQueryMaxBlockingSortMemoryUsageBytes=100000)
+        try:
+
+            def setup(d: Any) -> None:
+                d.c.insert_many([{"_id": i, "x": i, "y": i % 3} for i in range(2000)])
+                d.c.create_index([("y", 1), ("x", 1)])
+
+            def op(d: Any) -> None:
+                d.command(
+                    "find",
+                    "c",
+                    filter=_COVERING,
+                    projection=projection,
+                    sort={"x": 1},
+                    allowDiskUse=True,
+                    batchSize=3000,
+                )
+
+            entry = logged(client, is_mongod, setup, op)[1][0]
+        finally:
+            client.admin.command(
+                "setParameter", 1, internalQueryMaxBlockingSortMemoryUsageBytes=104857600
+            )
+        stage = _sort_stage(entry.get("execStats"))
+        keys = ("type", "totalDataSizeSorted", "spills", "spilledRecords", "spilledBytes")
+        return {k: stage.get(k) for k in keys}
+
+    answers = {"mongod": spilled(mongod, True), "rust": spilled(rust_mongo, False)}
+    assert answers["mongod"]["spills"] > 0, answers
+    same(answers["rust"], answers["mongod"])

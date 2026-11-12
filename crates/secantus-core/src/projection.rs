@@ -621,6 +621,47 @@ fn with_computed(
     Ok(())
 }
 
+/// The document mongod 8.2's `PROJECTION_COVERED` builds from an index key
+/// (`ProjectionStageCovered::transform`): each field of `key_pattern` the
+/// simple inclusion `spec` includes -- `_id` unless it is excluded --
+/// appended in the index's order, under the field's name as the index
+/// spells it (a dotted one flat), holding the key's value. `index_key`:
+/// the key's values, in the index's order.
+pub fn covered_document(key_pattern: &Document, index_key: &[Bson], spec: &Document) -> Document {
+    let included = |field: &str| match spec.get(field) {
+        Some(v) => spec_truthy(v).unwrap_or(false),
+        None => field == "_id",
+    };
+    let mut out = Document::new();
+    for (field, value) in key_pattern.keys().zip(index_key) {
+        if included(field) {
+            out.insert(field.clone(), value.clone());
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod covered_tests {
+    use super::*;
+    use bson::doc;
+
+    #[test]
+    fn a_covered_document_holds_the_included_key_fields_in_the_index_order() {
+        let pattern = doc! { "y": 1, "a.b": -1, "_id": 1 };
+        let key = [Bson::Int32(1), Bson::String("s".into()), Bson::Int32(9)];
+        // `_id` is included unless excluded; a dotted field stays flat.
+        assert_eq!(
+            covered_document(&pattern, &key, &doc! {"a.b": 1, "y": true}),
+            doc! { "y": 1, "a.b": "s", "_id": 9 }
+        );
+        assert_eq!(
+            covered_document(&pattern, &key, &doc! {"_id": 0, "y": 1.0}),
+            doc! { "y": 1 }
+        );
+    }
+}
+
 /// Apply a projection spec to a document. `Err(Fallback::Defer)` => defer to the
 /// pure-Python `apply_projection` (which also raises the mixed-mode error).
 pub fn apply_projection(doc: &Document, spec: &Document, query: Option<&Document>) -> R<Document> {

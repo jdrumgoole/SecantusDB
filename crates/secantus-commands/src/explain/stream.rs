@@ -985,6 +985,10 @@ enum Stage {
         /// mongod's sort compares them whatever the index's collation.
         collation: Option<Collation>,
         budget: Option<(secantus_core::memlimit::Budgets, bool)>,
+        /// The spec of a covered projection below it: its sorter holds the
+        /// documents that projection builds of the keys, not the keys
+        /// (`SORT <- PROJECTION_COVERED <- IXSCAN`, RM-473).
+        covered: Option<Document>,
         t: Tally,
         /// What its sorter counted (`totalDataSizeSorted`).
         report: Option<Box<secantus_core::memlimit::SpillReport>>,
@@ -1480,6 +1484,7 @@ impl Stage {
                 sorted,
                 collation,
                 budget,
+                covered,
                 t,
                 report,
             } => {
@@ -1514,45 +1519,73 @@ impl Stage {
                         let before = secantus_core::memlimit::report();
                         let _disk = secantus_core::memlimit::allow_disk_use(*disk);
                         let none = Document::new();
-                        // Each index's id: its place among those the
-                        // plan's scans registered, which an OR's children
-                        // do in the order they are read.
-                        let mut registered: Vec<&str> = Vec::new();
-                        let members = all
-                            .iter()
-                            .map(|(_, m, values)| {
-                                let (sort_key, index_key) = values.clone().unwrap_or_default();
-                                let (key_pattern, index_id) = match &m.entry {
-                                    Some(e) => {
-                                        let name = e.meta.name.as_str();
-                                        let at = registered
-                                            .iter()
-                                            .position(|n| *n == name)
-                                            .unwrap_or_else(|| {
-                                                registered.push(name);
-                                                registered.len() - 1
-                                            });
-                                        (&e.meta.key, at as u32)
-                                    }
-                                    None => (&none, 0),
-                                };
-                                secantus_core::sorter::IndexKeyMember {
-                                    sort_key,
-                                    key_pattern,
-                                    index_key,
-                                    index_id,
-                                    rid: m.rid,
-                                }
-                            })
-                            .collect();
                         let descending: Vec<bool> = pattern.iter().map(|(_, d)| *d).collect();
-                        secantus_core::sorter::sort_index_keys(
-                            members,
-                            &descending,
-                            budgets.sort,
-                            top,
-                        )
-                        .map_err(sort_fault)?;
+                        if let Some(spec) = covered.as_ref() {
+                            // The documents the covered projection builds
+                            // of the keys, OWNED_OBJ members (RM-473).
+                            let members = all
+                                .iter()
+                                .map(|(_, m, values)| {
+                                    let (sort_key, index_key) = values.clone().unwrap_or_default();
+                                    let key_pattern =
+                                        m.entry.as_ref().map_or(&none, |e| &e.meta.key);
+                                    secantus_core::sorter::OwnedObjMember {
+                                        sort_key,
+                                        doc: secantus_core::projection::covered_document(
+                                            key_pattern,
+                                            &index_key,
+                                            spec,
+                                        ),
+                                    }
+                                })
+                                .collect();
+                            secantus_core::sorter::sort_owned_objs(
+                                members,
+                                &descending,
+                                budgets.sort,
+                                top,
+                            )
+                            .map_err(sort_fault)?;
+                        } else {
+                            // Each index's id: its place among those the
+                            // plan's scans registered, which an OR's children
+                            // do in the order they are read.
+                            let mut registered: Vec<&str> = Vec::new();
+                            let members = all
+                                .iter()
+                                .map(|(_, m, values)| {
+                                    let (sort_key, index_key) = values.clone().unwrap_or_default();
+                                    let (key_pattern, index_id) = match &m.entry {
+                                        Some(e) => {
+                                            let name = e.meta.name.as_str();
+                                            let at = registered
+                                                .iter()
+                                                .position(|n| *n == name)
+                                                .unwrap_or_else(|| {
+                                                    registered.push(name);
+                                                    registered.len() - 1
+                                                });
+                                            (&e.meta.key, at as u32)
+                                        }
+                                        None => (&none, 0),
+                                    };
+                                    secantus_core::sorter::IndexKeyMember {
+                                        sort_key,
+                                        key_pattern,
+                                        index_key,
+                                        index_id,
+                                        rid: m.rid,
+                                    }
+                                })
+                                .collect();
+                            secantus_core::sorter::sort_index_keys(
+                                members,
+                                &descending,
+                                budgets.sort,
+                                top,
+                            )
+                            .map_err(sort_fault)?;
+                        }
                         *report = Some(Box::new(secantus_core::memlimit::report().less(&before)));
                     }
                     if top.is_some() {
@@ -2001,7 +2034,16 @@ fn stage_of(
             }
             // A covered projection below the sort: the keys it projects sort.
             let mut input = input.as_ref();
-            while let Node::Projection { input: below, .. } = input {
+            let mut covered = None;
+            while let Node::Projection {
+                name,
+                spec,
+                input: below,
+            } = input
+            {
+                if *name == "PROJECTION_COVERED" {
+                    covered = Some(spec.clone());
+                }
                 input = below;
             }
             if !holds(input, &pattern) {
@@ -2017,6 +2059,7 @@ fn stage_of(
                 sorted: None,
                 collation: opts.collation.cloned(),
                 budget: opts.sort_budget,
+                covered,
                 t: Tally::default(),
                 report: None,
             })

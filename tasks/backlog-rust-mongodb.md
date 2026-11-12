@@ -740,7 +740,10 @@ These are explicit non-goals. Don't add them without a reason.
       `spilledDataStorageSize` does not: 29061 against 31229 for 2000 int
       members over `{y: 1, x: 1}` under a 100000-byte budget, and mongod's
       own answer moves between runs of the same data (31229, 31231, 31240
-      measured 2026-11-12). **Decision needed (2026-11-12):** model the
+      measured 2026-11-12). A SORT over a covered projection's OWNED_OBJ
+      members is the same: 34936 against mongod's 36220 for 2000 `{x}`
+      documents (42497 for `{x, y}`; RM-473). **Decision needed
+      (2026-11-12):** model the
       counter (every WiredTiger snapshot this server opens since start,
       which still could not reproduce mongod's background threads'), or
       keep 0 and accept the storage size as approximate. Found 2026-11-12
@@ -781,8 +784,9 @@ These are explicit non-goals. Don't add them without a reason.
       `limit` of 2, 2244 for twelve over a FETCH), where the same read
       without `showRecordId` sorts `simple` and counts 402. This server
       counts 402 both ways: it sorts the documents as its `simple` sort
-      does. RM-473 is the same model over a covered projection. Found
-      2026-11-12 (RM-472).
+      does. A SORT over a covered projection counts its members since
+      RM-473 (`sorter::sort_owned_objs`), the model this needs for a
+      member that holds a fetched document. Found 2026-11-12 (RM-472).
       Verify: tests/backlog/test_rm_found_rm472.py::test_a_default_sort_of_documents_counts_its_members
       Backlog-ID: RM-577
 - [ ] **A `$near` read over a `2d` index explains as a COLLSCAN.** mongod
@@ -857,16 +861,6 @@ These are explicit non-goals. Don't add them without a reason.
       }, IXSCAN { a: 1 }`. Found 2026-11-12 (RM-471).
       Verify: tests/backlog/test_rm_found_rm471.py::test_a_rooted_ors_plan_summary_names_each_branchs_index
       Backlog-ID: RM-576
-- [ ] **A SORT over a covered projection does not count what it sorted.**
-      mongod 8.2.11's `SORT <- PROJECTION_COVERED <- IXSCAN` (`type:
-      "default"`) counts 1584 bytes sorted for the twelve `{x}` members of
-      `find({y: {$gte: 0}}, {_id: 0, x: 1}).sort({x: 1})`, in `explain`
-      and in a profile entry's `execStats`: its working-set members, not
-      the projected documents. This server counts 780 in both (members of
-      their index keys, as its sort of keys below a FETCH counts them since
-      RM-375, and its `explain` since RM-476). Found 2026-11-09 (RM-373).
-      Verify: tests/backlog/test_rm_found_2026_11_09_rm373.py::test_a_sort_over_a_covered_projection_counts_what_it_sorted
-      Backlog-ID: RM-473
 - [ ] **Some lines have no `numInterruptChecks`.** Since 2026-11-08 this
       server checks for interrupt where mongod 8.2 does, and counts it
       (`secantus_core::deadline::check_for_interrupt`): at dispatch, at
