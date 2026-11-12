@@ -1922,8 +1922,8 @@ fn eval(f: &pg_query::protobuf::FuncCall, params: &[Bson]) -> Result<Bson> {
     let n_params = usize::try_from(int(5)?).unwrap_or(0);
     let mut inner_params = Vec::new();
     // Argument 6 is the result's modifier, read only for its type.
-    for i in 7..f.args.len() {
-        inner_params.push(const_value(&f.args[i], params)?);
+    for arg in f.args.iter().skip(7) {
+        inner_params.push(const_value(arg, params)?);
     }
     debug_assert!(inner_params.len() >= n_params);
     // The inner SQL numbers its parameters `$1..`, the statement's own and

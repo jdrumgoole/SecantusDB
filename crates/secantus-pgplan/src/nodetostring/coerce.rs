@@ -207,10 +207,7 @@ impl<'a> Analyzer<'a> {
             }
             return false;
         }
-        if have_generics && !self.check_generic_type_consistency(input, target) {
-            return false;
-        }
-        true
+        !have_generics || self.check_generic_type_consistency(input, target)
     }
 
     /// `coerce_to_target_type`.

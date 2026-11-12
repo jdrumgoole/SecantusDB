@@ -255,13 +255,8 @@ impl PgHandler {
         if let Some(f) = builtin().types.get(&t) {
             return f.typtype == 'c';
         }
-        if self
-            .composites()
+        self.composites()
             .is_ok_and(|cs| cs.iter().any(|(_, o, _)| *o == t))
-        {
-            return true;
-        }
-        false
     }
 
     /// `can_coerce_type` of one type at `COERCION_ASSIGNMENT`, as
