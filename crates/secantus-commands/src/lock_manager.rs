@@ -358,7 +358,7 @@ impl LockManager {
                     note_flow_control_ticket();
                 }
                 self.count(resource, mode, None);
-                note_taken(resource);
+                note_taken(resource, mode);
                 // mongod's `Locker::_lockBegin`: a lock granted at once is
                 // not granted to an operation that was killed or ran out of
                 // time, and the check counts (RM-360) -- a re-take by the
@@ -406,7 +406,7 @@ impl LockManager {
                 // Those queued behind may now be grantable beside it.
                 self.changed.notify_all();
                 self.count(resource, mode, Some(began.elapsed()));
-                note_taken(resource);
+                note_taken(resource, mode);
                 return Ok(());
             }
             // A kill ends the wait as a spent budget does: mongod 8.2.11
@@ -1374,11 +1374,17 @@ thread_local! {
     /// Whether the operation this thread runs has been granted the global
     /// lock, in any mode: mongod's `Locker::wasGlobalLockTaken`.
     static TOOK_GLOBAL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Whether it has been granted the global lock in IX or X: mongod's
+    /// `GlobalLockAcquisitionTracker::getGlobalWriteLocked` (RM-357).
+    static GLOBAL_WRITE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
-fn note_taken(resource: &Resource) {
+fn note_taken(resource: &Resource, mode: Mode) {
     if matches!(resource, Resource::Global) {
         TOOK_GLOBAL.with(|t| t.set(true));
+        if matches!(mode, Mode::Ix | Mode::X) {
+            GLOBAL_WRITE.with(|t| t.set(true));
+        }
     }
 }
 
@@ -1504,6 +1510,7 @@ pub fn begin_operation() {
     secantus_core::deadline::begin_operation();
     crate::explain::begin_operation();
     TOOK_GLOBAL.with(|t| t.set(false));
+    GLOBAL_WRITE.with(|t| t.set(false));
     TICKETED.with(|t| t.borrow_mut().clear());
     TICKET_ERROR.with(|t| *t.borrow_mut() = None);
     OP_LOCKS.with(|l| l.borrow_mut().clear());
@@ -1513,6 +1520,14 @@ pub fn begin_operation() {
 /// Whether the operation this thread runs has taken the global lock.
 pub fn took_global() -> bool {
     TOOK_GLOBAL.with(std::cell::Cell::get)
+}
+
+/// Whether the operation this thread runs has taken the global lock in a
+/// write mode (IX or X), which is what makes mongod's entry point move a
+/// write's unchanged last op to the system's before its write concern
+/// waits (RM-357).
+pub fn global_write_locked() -> bool {
+    GLOBAL_WRITE.with(std::cell::Cell::get)
 }
 
 /// The global lock in IS that mongod takes to read an operation's storage
@@ -1765,7 +1780,7 @@ impl LockManager {
     fn count_retake(&self, chain: &[(Resource, Mode)]) -> Result<(), MaxTimeMsExpired> {
         for (resource, mode) in chain {
             self.count(resource, *mode, None);
-            note_taken(resource);
+            note_taken(resource, *mode);
             secantus_core::deadline::check_for_interrupt()?;
         }
         Ok(())

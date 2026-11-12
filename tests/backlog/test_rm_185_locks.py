@@ -44,27 +44,39 @@ def mongod() -> Iterator[Any]:
 
 
 #: The reference is a standalone, which runs no retryable write and waits
-#: for no journal under its default `w: 1`. This server is a replica set's
-#: primary, where a retryable write also checks out its session and keeps
-#: its row, and the default `w: "majority"` waits for the journal: locks
-#: RM-357 compares with a replica set's (`tests/backlog/test_rm_355_364.py`).
-#: Both clients send neither, and this server's default is set to the
-#: standalone's, so the counts here are the rounds a command itself takes,
-#: on either.
+#: for no journal under its default `w: 1`, so this server runs as one too
+#: (`--standalone`). A replica set's primary takes more: a retryable write
+#: checks out its session and keeps its row, the default `w: "majority"`
+#: waits for the journal, and a write that logged nothing reads the
+#: system's latest optime (`setLastOpToSystemLastOpTime`, RM-357), which a
+#: standalone never does -- locks RM-357 compares with a replica set's
+#: (`tests/backlog/test_rm_355_364.py`), whose background threads make
+#: `serverStatus` deltas too noisy to compare. Both clients send neither a
+#: retryable write nor a write concern of their own, so the counts here are
+#: the rounds a command itself takes, on either.
 _BASE_ROUNDS = {"retryWrites": False, "w": 1}
 
 
 @pytest.fixture(scope="module")
-def rust_mongo(rust_mongo: Any) -> Iterator[Any]:
-    """The module's `secantusd-rs`, through a client like the reference's."""
-    host, port = rust_mongo.address
-    client = pymongo.MongoClient(host, port, serverSelectionTimeoutMS=10_000, **_BASE_ROUNDS)
-    # A command sent without a write concern takes the standalone's default.
-    client.admin.command("setDefaultRWConcern", defaultWriteConcern={"w": 1})
-    try:
-        yield client
-    finally:
-        client.close()
+def rust_mongo(tmp_path_factory: pytest.TempPathFactory) -> Iterator[Any]:
+    """A standalone `secantusd-rs` of the module's own, through a client
+    like the reference's."""
+    from tests.backlog.conftest import rust_mongo_server
+
+    with rust_mongo_server(tmp_path_factory.mktemp("rm185"), "--standalone") as server:
+        host, port = server.address
+        client = pymongo.MongoClient(host, port, serverSelectionTimeoutMS=10_000, **_BASE_ROUNDS)
+        # A command sent without a write concern takes the standalone's
+        # `w: 1`, which this server's standalone does not imply yet: it
+        # waits for the journal as a replica set's `w: "majority"` does, and
+        # accepts `setDefaultRWConcern`, which mongod's standalone refuses
+        # (RM-551). Its stored default stands in until that is fixed, and
+        # this call fails loudly when it is.
+        client.admin.command("setDefaultRWConcern", defaultWriteConcern={"w": 1})
+        try:
+            yield client
+        finally:
+            client.close()
 
 
 #: A `slowms` no operation reaches.

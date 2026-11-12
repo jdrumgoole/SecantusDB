@@ -101,6 +101,29 @@ pub(crate) fn set_last_op_to_system(ctx: &mut CommandContext) {
     drop(locks);
 }
 
+/// Whether the entry point moves the connection's last op to the system's
+/// for a command other than `insert`, `update`, `delete` and
+/// `findAndModify` (which [`finish_write`] fixes): mongod's
+/// `waitForWriteConcern` does so for a command that waits for a write
+/// concern, outside a transaction, when the command left the last op where
+/// it found it and took the global lock in a write mode
+/// (`GlobalLockAcquisitionTracker::getGlobalWriteLocked`) -- a write that
+/// logged nothing, as a `create` of a collection there does (measured
+/// 8.2.11: one more transition IX and global IS on its line; RM-357).
+pub(crate) fn entry_point_fixes(
+    name: &str,
+    doc: &Document,
+    ctx: &CommandContext,
+    before: i64,
+) -> bool {
+    ctx.replica_set_name.is_some()
+        && !doc.contains_key("autocommit")
+        && ctx.db_name != "local"
+        && crate::takes_default_write_concern(name, doc)
+        && ctx.last_op_seq == before
+        && crate::lock_manager::global_write_locked()
+}
+
 /// The connection's last op moved to the oplog's latest, its read's locks
 /// left to the caller: `createIndexes`, whose read of it (after its build)
 /// is among the global IS rounds its line already counts as mongod's

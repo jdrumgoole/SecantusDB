@@ -180,9 +180,11 @@ def rust_mongo(tmp_path_factory: pytest.TempPathFactory) -> Iterator[Any]:
 
 
 @contextlib.contextmanager
-def rust_mongo_server(store: Any) -> Iterator[Any]:
+def rust_mongo_server(store: Any, *extra_args: str) -> Iterator[Any]:
     """A `secantusd-rs` on `store`, as `rust_mongo` starts one, for a test
-    that needs a server no other test shares."""
+    that needs a server no other test shares; `extra_args` follow the
+    defaults on its command line (`--standalone`, for a comparison with a
+    standalone mongod)."""
     assert RS_BINARY.exists(), f"{RS_BINARY} is not built (./inv rust-binary-build)"
     proc = subprocess.Popen(
         [
@@ -193,6 +195,7 @@ def rust_mongo_server(store: Any) -> Iterator[Any]:
             str(store),
             "--setParameter",
             f"delinquentAcquisitionIntervalMillis={NO_DELINQUENCY_MILLIS}",
+            *extra_args,
         ],
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,

@@ -581,14 +581,12 @@ These are explicit non-goals. Don't add them without a reason.
       counts mongod's flow control tickets (one per global IX taken apart)
       and a retryable write's session checkout and session row, and a
       journal wait (`j`, `w: "majority"`) its transition lock and global
-      IS, so an insert, `drop` or `create` reads as mongod 8.2.11's. Still
-      different, measured against a one-member replica set:
-      - a command other than `insert`, `update` and `delete` that writes
-        nothing (`create` of a collection there): mongod reads the latest
-        optime for the client's last op under the global IS with the
-        transition lock (`setLastOpToSystemLastOpTime`), once; those three
-        do it as mongod does since RM-360 (`lastop.rs`), and
-        `createIndexes`'s read is among the rounds its line already counts;
+      IS, so an insert, `drop` or `create` reads as mongod 8.2.11's; since
+      2026-11-12 a command that took the global lock in IX and logged
+      nothing (`create` of a collection there, `drop` or `dropIndexes` of
+      one not there) reads the latest optime for its last op as mongod's
+      entry point does (`lastop::entry_point_fixes`). Still different,
+      measured against a one-member replica set:
       - an `insert` of several documents one of which fails: mongod inserts
         them again a document at a time, each under a transition, global,
         database and collection lock of its own
@@ -606,7 +604,9 @@ These are explicit non-goals. Don't add them without a reason.
         more transition, global and collection IX), and one that removes
         takes a single round;
       - `collMod` and `$out` take more transition locks than this server's
-        rounds (`$out`'s were measured on a standalone, RM-185);
+        rounds (`$out`'s were measured on a standalone, RM-185), and an
+        `$out`'s line here has one global IS more than mongod's (7 to 6,
+        measured 8.2.11 2026-11-12);
       - each global lock taken apart takes an execution ticket, so where
         these locks differ the line's `queues.execution` admissions differ
         too (RM-355; `collMod`'s line has 3 here, 4 on mongod);
@@ -618,6 +618,18 @@ These are explicit non-goals. Don't add them without a reason.
         (four in its entry, four execution admissions) and once here.
       Backlog-ID: RM-357
       Verify: tests/backlog/test_rm_355_364.py::test_more_writes_report_mongods_locks
+- [ ] **A standalone's write concern is a replica set's.** `secantusd-rs
+      --standalone` keeps the member's write-concern machinery: a write sent
+      with no write concern takes the implicit `w: "majority"` and waits for
+      the journal (one more transition IX and global IS in its `locks`), and
+      `setDefaultRWConcern` and `getDefaultRWConcern` answer. mongod 8.2.11
+      as a standalone implies `w: 1` (no journal wait) and refuses both with
+      51300 (measured 2026-11-12). RM-185's lock comparison, which runs this
+      server as a standalone, sets a stored `w: 1` default until this is
+      fixed (`tests/backlog/test_rm_185_locks.py`, `rust_mongo`): the fix
+      drops that call.
+      Backlog-ID: RM-551
+      Verify: tests/backlog/test_rm_standalone_write_concern.py::test_a_standalone_implies_w_1
 - [ ] **Some queries have no `queryShapeHash`.** Since 2026-11-07 a
       `find`'s, `distinct`'s and `aggregate`'s line, profile entry and
       `explain` carry mongod's `queryShapeHash` (`secantus-commands`

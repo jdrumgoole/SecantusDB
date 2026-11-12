@@ -428,6 +428,15 @@ _MATCHING_WRITES = {
     ),
     "drop": lambda d: d.command("drop", "c", writeConcern={"w": 1}),
     "create": lambda d: d.command("create", "n", writeConcern={"w": 1}),
+    # A write that logged nothing reads the latest optime for the client's
+    # last op under the global IS: twice for an insert, update or delete
+    # (the write path and the command), once for another command.
+    "insert of a duplicate key": lambda d: _w1(d).insert_one({"_id": 1}),
+    "create of a collection there": lambda d: d.command("create", "c", writeConcern={"w": 1}),
+    "drop of one not there": lambda d: d.command("drop", "k9", writeConcern={"w": 1}),
+    "dropIndexes of one not there": lambda d: d.command(
+        "dropIndexes", "c", index="nope_1", writeConcern={"w": 1}
+    ),
 }
 
 
@@ -443,7 +452,12 @@ def test_a_write_reports_mongods_locks_and_flow_control(
     1}`: the session's checkout, its row in `config.transactions` written
     under the insert's locks, and the wait for the journal (measured
     2026-10-27 and 2026-11-07). This server took one round of each and had
-    no flow control."""
+    no flow control. A command other than `insert`, `update` and `delete`
+    that took the global lock in IX and logged nothing (a `create` of a
+    collection there, a `drop` or `dropIndexes` of one not there) reads the
+    latest optime for the client's last op under the global IS, with the
+    transition lock (`setLastOpToSystemLastOpTime`, measured 2026-11-12);
+    this server did not."""
     answers = _write_locks(rust_mongo, mongod_rs, _MATCHING_WRITES[name])
     assert answers["mongod"]
     assert answers["rust"] == answers["mongod"]
@@ -451,12 +465,9 @@ def test_a_write_reports_mongods_locks_and_flow_control(
 
 #: Writes whose locks are not mongod's yet (RM-357's remainder).
 _DIVERGING_WRITES = {
-    # A write that writes nothing reads the latest optime for the client's
-    # last op under the global IS: twice for an insert, update or delete
-    # (the write path and the command), once for another command.
-    "insert of a duplicate key": lambda d: _w1(d).insert_one({"_id": 1}),
+    # A delete that writes nothing reads the latest optime twice (the write
+    # path and the command), and keeps its session row under its own locks.
     "delete matching nothing": lambda d: _w1(d).delete_one({"_id": 999}),
-    "create of a collection there": lambda d: d.command("create", "c", writeConcern={"w": 1}),
     # Each statement keeps its session row under its own locks, and takes
     # its round as it runs: this server takes every statement's first.
     "update": lambda d: _w1(d).update_one({"_id": 1}, {"$set": {"q": 1}}),
