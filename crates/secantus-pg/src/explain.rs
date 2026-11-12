@@ -783,20 +783,21 @@ pub(crate) fn move_param_conds(root: &mut PlanNode) {
     };
     let text = root.details[at].1.clone();
     let conjuncts = split_conjuncts(&text);
+    // Every clause bounding the column is an index qual, in the join's
+    // order: two bounds print as one `Index Cond` of both.
     let own = format!("{alias}.{column}");
-    let mut cond = None;
+    let mut conds = Vec::new();
     let mut rest = Vec::new();
     for c in conjuncts {
-        if cond.is_none() {
-            if let Some(moved) = index_cond_text(&c, &own, &column) {
-                cond = Some(moved);
-                continue;
-            }
+        match index_cond_text(&c, &own, &column) {
+            Some(moved) => conds.push(moved),
+            None => rest.push(c),
         }
-        rest.push(c);
     }
-    let Some(cond) = cond else {
-        return;
+    let cond = match conds.as_slice() {
+        [] => return,
+        [one] => one.clone(),
+        many => format!("({})", many.join(" AND ")),
     };
     // The other join clauses move into the scan too
     // (`join_clause_is_movable_into`): its `Filter`, its own columns
@@ -812,10 +813,9 @@ pub(crate) fn move_param_conds(root: &mut PlanNode) {
         [one] => root.details[at].1 = one.clone(),
         many => root.details[at].1 = format!("({})", many.join(" AND ")),
     }
-    let inner_cond = cond.clone();
     let inner = &mut root.children[1];
     inner.details.insert(0, ("Index Cond".into(), cond));
-    // A clause the index qual implies is not checked again
+    // A clause an index qual implies is not checked again
     // (`create_indexscan_plan`'s `predicate_implied_by`), though it was
     // costed: a strict `<` or `>` implies `<>` of the same two operands.
     let implied = |c: &str| -> bool {
@@ -826,10 +826,12 @@ pub(crate) fn move_param_conds(root: &mut PlanNode) {
                 Some((l.to_string(), r.to_string()))
             })
         };
-        let Some((cl, cr)) = operands(&inner_cond, &["<", ">"]) else {
+        let Some((l, r)) = operands(c, &["<>"]) else {
             return false;
         };
-        matches!(operands(c, &["<>"]), Some((l, r)) if (l == cl && r == cr) || (l == cr && r == cl))
+        conds.iter().any(|q| {
+            matches!(operands(q, &["<", ">"]), Some((cl, cr)) if (l == cl && r == cr) || (l == cr && r == cl))
+        })
     };
     let rest: Vec<String> = rest
         .iter()
@@ -891,7 +893,7 @@ fn unqualify(text: &str, alias: &str) -> String {
 
 /// A `Join Filter`'s conjuncts: `((x) AND (y))` is `(x)` and `(y)`; one
 /// conjunct is itself.
-fn split_conjuncts(text: &str) -> Vec<String> {
+pub(crate) fn split_conjuncts(text: &str) -> Vec<String> {
     let Some(body) = text.strip_prefix('(').and_then(|t| t.strip_suffix(')')) else {
         return vec![text.to_string()];
     };
@@ -2427,6 +2429,33 @@ mod join_type_tests {
                 ("Index Cond".to_string(), "(a < e.a)".to_string()),
                 ("Filter".to_string(), "(e.b <> b)".to_string()),
             ]
+        );
+        // Two bounds on the column are one Index Cond of both, in the
+        // join's order.
+        let mut root = PlanNode::new("Nested Loop Left Join");
+        root.children.push(rel("e"));
+        root.children.push(rel("k"));
+        param_index_inner(
+            &mut root,
+            &crate::scan_estimate::ParamScan {
+                index: "k_pkey".into(),
+                alias: "k".into(),
+                column: "a".into(),
+                index_only: false,
+            },
+        );
+        root.details.push((
+            "Join Filter".into(),
+            "((e.a < k.a) AND (e.a > k.a) AND (e.a <> k.a))".into(),
+        ));
+        move_param_conds(&mut root);
+        assert!(root.details.is_empty());
+        assert_eq!(
+            root.children[1].details,
+            vec![(
+                "Index Cond".to_string(),
+                "((a > e.a) AND (a < e.a))".to_string()
+            )]
         );
         // An inner whose index holds every column read is index-only.
         let mut root = PlanNode::new("Nested Loop");

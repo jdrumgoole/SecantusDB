@@ -337,23 +337,38 @@ impl PgHandler {
         if label != "Index Cond" {
             return;
         }
-        // `(column op alias.column)`, as `move_param_conds` writes it.
-        let Some(body) = cond.strip_prefix('(').and_then(|c| c.strip_suffix(')')) else {
-            return;
-        };
-        let mut parts = body.split(' ');
-        let (Some(col), Some(op), Some(other), None) =
-            (parts.next(), parts.next(), parts.next(), parts.next())
-        else {
-            return;
-        };
-        let Some((alias, outer_col)) = other.split_once('.') else {
-            return;
-        };
-        if alias != outer_alias {
-            return;
+        // Each conjunct `(column op alias.column)`, as `move_param_conds`
+        // writes it, all over the one index column: two bounds are one
+        // Index Cond of both.
+        let mut quals: Vec<(&str, &str)> = Vec::new();
+        let mut col = None;
+        let conjuncts = crate::explain::split_conjuncts(cond);
+        for c in &conjuncts {
+            let Some(body) = c.strip_prefix('(').and_then(|c| c.strip_suffix(')')) else {
+                return;
+            };
+            let mut parts = body.split(' ');
+            let (Some(own), Some(op), Some(other), None) =
+                (parts.next(), parts.next(), parts.next(), parts.next())
+            else {
+                return;
+            };
+            let Some((alias, outer_col)) = other.split_once('.') else {
+                return;
+            };
+            if alias != outer_alias
+                || !["=", "<", "<=", ">", ">="].contains(&op)
+                || col.is_some_and(|c| c != own)
+            {
+                return;
+            }
+            col = Some(own);
+            quals.push((op, outer_col));
         }
-        let holds = |inner: f64, outer: f64| match op {
+        let Some(col) = col else {
+            return;
+        };
+        let holds = |op: &str, inner: f64, outer: f64| match op {
             "=" => inner == outer,
             "<" => inner < outer,
             "<=" => inner <= outer,
@@ -361,17 +376,19 @@ impl PgHandler {
             ">=" => inner >= outer,
             _ => false,
         };
-        if !["=", "<", "<=", ">", ">="].contains(&op) {
-            return;
-        }
         let (Some(outer_def), Some(inner_def)) = (
             self.defined_table(&outer_table),
             self.defined_table(&inner_table),
         ) else {
             return;
         };
-        let (Some(outer_field), Some(inner_field)) =
-            (outer_def.field_of(outer_col), inner_def.field_of(col))
+        let Some(inner_field) = inner_def.field_of(col) else {
+            return;
+        };
+        let Some(outer_fields) = quals
+            .iter()
+            .map(|(op, c)| Some((*op, outer_def.field_of(c)?)))
+            .collect::<Option<Vec<_>>>()
         else {
             return;
         };
@@ -416,21 +433,24 @@ impl PgHandler {
         let mut total = 0usize;
         let mut fetches = 0usize;
         let mut joined = 0usize;
-        for d in &outer_docs {
-            let v = match d.get(&outer_field) {
-                // A NULL parameter makes the index scan return nothing.
-                None | Some(Bson::Null) => {
-                    joined += usize::from(left);
-                    continue;
+        'outer: for d in &outer_docs {
+            let mut params = Vec::with_capacity(outer_fields.len());
+            for (op, f) in &outer_fields {
+                match d.get(f) {
+                    // A NULL parameter makes the index scan return nothing.
+                    None | Some(Bson::Null) => {
+                        joined += usize::from(left);
+                        continue 'outer;
+                    }
+                    v => match number(v) {
+                        Some(n) => params.push((*op, n)),
+                        None => return,
+                    },
                 }
-                v => match number(v) {
-                    Some(n) => n,
-                    None => return,
-                },
-            };
+            }
             let mut here = 0usize;
             for ((k, _), vis) in keyed.iter().zip(&visible) {
-                if holds(*k, v) {
+                if params.iter().all(|(op, v)| holds(op, *k, *v)) {
                     here += 1;
                     fetches += usize::from(!vis);
                 }
