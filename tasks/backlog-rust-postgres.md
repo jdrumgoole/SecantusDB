@@ -1082,29 +1082,36 @@ one beside it.
 
 ## Found by a CI run (2026-11-09)
 
-- [ ] **OPEN — after any DDL statement, the next catalog query rebuilds
-      every user relation's catalog rows, so it grows with the schema.**
-      The version `bump_catalog_version` moves after every statement that
-      may change the catalog drops every computed catalog relation, and the
-      next read of `pg_attribute`, `pg_type` or `pg_class` builds the rows of
-      every user table, view, index and sequence again (`catalog_rows`, the
-      `virtual_cache`). PostgreSQL invalidates only the cache entries of the
-      rows a statement changed (`inval.c`, `CatCacheInvalidate`, a
-      relation's relcache entry), so the rest of the schema costs it
-      nothing. Measured 2026-11-12 with psql's `\d` collation subquery
-      (`tests/backlog/test_rp_catalog_latency.py`) after a `CREATE TABLE`:
-      - PostgreSQL 15.19 (private cluster): 0.33 ms first and 0.26 ms after
-        with 200 other tables; 0.20 ms and 0.11 ms with 400.
-      - Debug `secantusd-pg`: 0.020 s first and 0.006 s after with none;
-        0.11 s and 0.008 s with 200; 0.21 s and 0.010 s with 400.
-      PostgreSQL's own relations' 3,054 `pg_attribute` rows, which were
-      most of the cost, are built once per process since 2026-11-12. The
-      faithful fix keys the rest per relation and invalidates what a
-      statement changed, as `inval.c` does; `catcache.rs` already models
-      which lookups miss. A user relation's rows depend on more than its
-      own catalog entry (its column grants, its inheritance parents, the
-      user types, domains and collations its columns name), so the key has
-      to carry each of them, or a stale row is a wrong answer.
+- [ ] **OPEN — the first catalog query after a DDL statement still grows
+      with the schema.** Every statement that may change the catalog moves
+      the version `bump_catalog_version` keeps, which drops every computed
+      catalog relation; PostgreSQL invalidates only the cache entries of
+      the rows a statement changed (`inval.c`), and its scans read one
+      relation's rows by index. Since 2026-11-12 a read whose filter pins
+      one relation (`pg_attribute.attrelid`, `pg_class.oid`, `pg_type.oid`)
+      builds and fills that relation's rows alone (`catalog_key`), and the
+      walk's sequential-scan count builds without filling. What still grows,
+      measured with psql's `\d` collation subquery
+      (`tests/backlog/test_rp_catalog_latency.py`) on a debug build after a
+      `CREATE TABLE`: 0.010 s with no other table, 0.049 s with 400, 0.092 s
+      with 800 (PostgreSQL 15.19: 0.33 ms with 200, 0.20 ms with 400). At
+      800 tables:
+      - `pg_type` pinned to one oid still builds every type's row before
+        keeping one (11 ms): the arm lists enums, composites, ranges and
+        base types whole.
+      - `pg_attribute` pinned to one relation still walks every table,
+        sequence, view, index and composite to find it (5 ms), and the
+        catalog version drops `relation_oid`'s memo and the decoded table
+        definitions, which are read again whole.
+      - The catalog-read walk counts every `pg_attribute` row (12 ms) for a
+        sequential scan PostgreSQL does not make (RP-909).
+      The faithful end state keys the rest per relation and invalidates
+      what a statement changed, as `inval.c` does; `catcache.rs` already
+      models which lookups miss. A user relation's rows depend on more than
+      its own catalog entry (its column grants, its inheritance parents and
+      children, the foreign keys naming it, the user types, domains and
+      collations its columns name), so a cache key has to carry each of
+      them, or a stale row is a wrong answer.
       Backlog-ID: RP-715
       Verify: tests/backlog/test_rp_catalog_latency.py::test_the_first_catalog_query_after_ddl_does_not_grow_with_the_schema
 
@@ -1461,6 +1468,17 @@ a regression test.
       differ; a `pg_stat_*` view 53 match, 61 differ.
       Backlog-ID: RP-290
       Verify: tests/backlog/test_rp_catalog_reads.py::test_gap[a statistics view], tests/backlog/test_rp_catalog_reads.py::test_gap[psql's describe query]
+- [ ] **An index scan with a filter is counted as a sequential scan.**
+      `SELECT attname FROM pg_attribute WHERE attrelid = 2615 AND attnum >
+      0` (or `AND NOT attisdropped`) counts a `seq_scan` of `pg_attribute`
+      in `pg_stat_xact_sys_tables`; PostgreSQL 15.19 counts one `idx_scan`
+      and no `seq_scan`, the other qual a filter on the index scan. A
+      bare `attrelid = 2615` is counted right. Found while working RP-715:
+      the walk's sequential scan builds every `pg_attribute` row to count
+      them, a cost that grows with the schema. psql's `\d` column query
+      has this shape.
+      Backlog-ID: RP-909
+      Verify: tests/backlog/test_rp_catalog_reads.py::test_an_index_scan_with_a_filter_counts_one_index_scan
 - [ ] **A catalog row added after `initdb` counts no heap block** in
       `pg_statio_sys_tables`. A catalog scan counts its index pages
       (`catalog_btree.rs`, from `pg15_catalog_indexes.txt`) and, since

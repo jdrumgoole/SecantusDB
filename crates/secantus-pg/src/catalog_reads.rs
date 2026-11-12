@@ -3206,16 +3206,13 @@ impl PgHandler {
 
     /// How many rows a catalog holds: what a sequential scan returns.
     pub(crate) fn cr_catalog_rows(&self, rel: &Rel) -> i64 {
-        self.virtual_rows_for(&rel.name)
-            .map_or(0, |rows| rows.len() as i64)
+        // Counted, not filled: a count needs no column's value (RP-715).
+        self.catalog_row_count(&rel.name).map_or(0, |n| n as i64)
     }
 
     /// How many of a catalog's rows an index scan's equality on the index's
     /// leading columns returns.
     pub(crate) fn cr_catalog_matches(&self, rel: &Rel, ix: &Index, eq: &[(i64, Bson)]) -> i64 {
-        let Some(rows) = self.virtual_rows_for(&rel.name) else {
-            return 0;
-        };
         let def = self.catalog_def(&rel.name);
         let mut conds = Vec::new();
         for k in &ix.keys {
@@ -3231,6 +3228,14 @@ impl PgHandler {
                 None => break,
             }
         }
+        // An equality on the relation's oid builds that relation's rows
+        // alone (RP-715), as the scan reads no others.
+        let pins: bson::Document = conds.iter().cloned().collect();
+        let key = crate::catalog_key(&rel.name, &pins);
+        // Uncached, as `virtual_rows_for`.
+        let Some(rows) = self.catalog_rows_keyed(&rel.name, key.as_ref()) else {
+            return 0;
+        };
         rows.iter()
             .filter(|r| {
                 conds.iter().all(|(f, v)| match (r.get(f), v) {

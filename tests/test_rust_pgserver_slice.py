@@ -1657,6 +1657,68 @@ def test_system_relations_attributes_ignore_the_user_schema(tmp_path: Path) -> N
     assert after_ddl == fresh
 
 
+#: Each catalog a read can pin to one relation (RP-715), its key column,
+#: and the order its rows are compared in.
+_KEYED_CATALOGS = (
+    ("pg_attribute", "attrelid", "attnum"),
+    ("pg_class", "oid", "oid"),
+    ("pg_type", "oid", "oid"),
+)
+
+
+def _keyed_reads_match_the_full_listing(conn: psycopg.Connection) -> int:
+    """Read each `_KEYED_CATALOGS` catalog whole, then once per key with
+    the key pinned straight after a statement that moves the catalog
+    version, so the pinned read builds its relation's rows alone; return
+    how many reads were compared."""
+    compared = 0
+    for catalog, column, order in _KEYED_CATALOGS:
+        full = conn.execute(f"SELECT {column}, * FROM pg_catalog.{catalog}").fetchall()
+        by_key: dict[int, list[tuple[object, ...]]] = {}
+        for row in full:
+            by_key.setdefault(row[0], []).append(row[1:])
+        keys = sorted(k for k in by_key if k >= 16384)
+        keys += [1259, 1249, 25, 1009]
+        for key in keys:
+            conn.execute("COMMENT ON TABLE rp715_p IS 'moves the catalog version'")
+            got = conn.execute(
+                f"SELECT * FROM pg_catalog.{catalog} WHERE {column} = {key} ORDER BY {order}"
+            ).fetchall()
+            assert sorted(got, key=repr) == sorted(by_key.get(key, []), key=repr), (
+                f"{catalog} {column} = {key}"
+            )
+            compared += 1
+    return compared
+
+
+def test_a_read_pinned_to_one_relation_answers_as_the_full_listing(
+    tmp_path: Path,
+) -> None:
+    """A catalog read whose filter pins one relation (`attrelid = $1`,
+    `oid = $1`) builds that relation's rows alone, as PostgreSQL answers it
+    with an index scan (RP-715). Its rows must be exactly the rows the full
+    listing holds for that key, every column of them, for every kind of
+    relation and type a user can make -- in the committed catalog, and in a
+    transaction whose own DDL is not committed yet."""
+    extra = (
+        "ALTER TABLE rp715_p ADD COLUMN gone int",
+        "ALTER TABLE rp715_p DROP COLUMN gone",
+        "CREATE TABLE rp715_f (pid int REFERENCES rp715_p (id), n numeric(5, 2))",
+        "CREATE MATERIALIZED VIEW rp715_mv AS SELECT id FROM rp715_p",
+        "CREATE TABLE rp715_w (a int, b text)",
+        "COMMENT ON TABLE rp715_p IS 'moves the catalog version'",
+    )
+    with _Server(tmp_path) as server, server.connect() as conn:
+        for statement in _USER_SCHEMA + extra:
+            conn.execute(statement)
+        assert _keyed_reads_match_the_full_listing(conn) > 20
+        conn.execute("BEGIN")
+        conn.execute("CREATE TABLE rp715_t (x int, y rp715_pair)")
+        conn.execute("DROP TABLE rp715_w")
+        assert _keyed_reads_match_the_full_listing(conn) > 20
+        conn.execute("ROLLBACK")
+
+
 def test_regclass_names_a_relation(home: Path) -> None:
     """`'t'::regclass` is the relation's oid, printed as its name.
 
