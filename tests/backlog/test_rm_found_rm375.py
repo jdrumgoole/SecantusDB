@@ -238,16 +238,57 @@ def test_an_explained_sort_of_index_keys_counts_its_members(rust_mongo: Any, mon
     assert shapes["rust"] == shapes["mongod"]
 
 
-@pytest.mark.backlog("RM-477")
+#: Sorts over an index with one multikey path, with mongod 8.2.11's SORT:
+#: a sort on fields whose own paths hold no array sorts the keys below the
+#: FETCH; one that names a multikey path sorts the fetched documents.
+_MULTIKEY: dict[str, tuple[list, list, dict, tuple[str, int]]] = {
+    "beside multikey y": (
+        [{"_id": i, "x": i, "y": [i % 3, 5]} for i in range(12)],
+        _KEYS,
+        _ON_KEYS,
+        ("default", 780),
+    ),
+    "dotted beside multikey y": (
+        [{"_id": i, "a": {"b": i}, "y": [i % 3, 7]} for i in range(12)],
+        [("y", 1), ("a.b", 1)],
+        {**_ON_KEYS, "sort": {"a.b": 1}},
+        ("default", 780),
+    ),
+    "on multikey x": (
+        [{"_id": i, "x": [i, 50], "y": i % 3} for i in range(12)],
+        _KEYS,
+        _ON_KEYS,
+        ("simple", 900),
+    ),
+    "compound naming multikey y": (
+        [{"_id": i, "x": i, "y": [i % 3, 5]} for i in range(12)],
+        _KEYS,
+        {**_ON_KEYS, "sort": {"x": 1, "y": 1}},
+        ("simple", 1764),
+    ),
+    "dotted under an array": (
+        [{"_id": i, "a": [{"b": i}], "y": i % 3} for i in range(12)],
+        [("y", 1), ("a.b", 1)],
+        {**_ON_KEYS, "sort": {"a.b": 1}},
+        ("simple", 912),
+    ),
+}
+
+
+@pytest.mark.backlog_fixed("RM-477")
 def test_a_sort_beside_a_multikey_field_sorts_index_keys(rust_mongo: Any, mongod: Any) -> None:
     """mongod 8.2.11 sorts index keys (`type: "default"`, below the FETCH)
     for `find({y: {$gte: 0}}).sort({x: 1})` over `{y: 1, x: 1}` when `y`
-    is multikey and `x` is not: 780 for twelve members. This server sorts
-    the fetched documents above the FETCH (`simple`, 900)."""
-    docs = [{"_id": i, "x": i, "y": [i % 3, 5]} for i in range(12)]
+    is multikey and `x` is not: 780 for twelve members. It asks each sort
+    path, not the index: a sort that names a multikey path sorts the
+    fetched documents. This server sorted the fetched documents above the
+    FETCH (`simple`, 900) whenever the index was multikey, until RM-477."""
     answers = {
-        side: _profiled_sort(client, is_mongod, docs, _KEYS, _ON_KEYS)
+        side: {
+            name: _profiled_sort(client, is_mongod, docs, keys, command)
+            for name, (docs, keys, command, _) in _MULTIKEY.items()
+        }
         for side, client, is_mongod in (("mongod", mongod, True), ("rust", rust_mongo, False))
     }
-    assert answers["mongod"] == ("default", 780)
+    assert answers["mongod"] == {name: want for name, (*_, want) in _MULTIKEY.items()}
     assert answers["rust"] == answers["mongod"]

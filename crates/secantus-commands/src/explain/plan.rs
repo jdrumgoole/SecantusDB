@@ -2224,8 +2224,15 @@ fn runs_below_sort(projection: &Document, sort: &Document) -> bool {
 fn wrap(a: Access, q: &Query) -> Node {
     let sort = sort_of(q);
     let blocking = sort.filter(|_| !a.sorted);
+    // A field the index holds provides its sort unless its own path is
+    // multikey: `IndexScanNode::computeProperties` asks each path, not the
+    // index (measured 8.2.11, RM-477: `{y: 1, x: 1}`, `y` multikey, sorts
+    // `{x: 1}` on the keys below the FETCH).
     let in_key = |s: &Document, ix: &IndexInfo| {
-        !ix.is_multikey() && s.keys().all(|f| ix.position(f).is_some())
+        s.keys().all(|f| {
+            ix.position(f)
+                .is_some_and(|at| ix.multikey_paths.get(at).is_none_or(Vec::is_empty))
+        })
     };
     let covered = a.indexed
         && a.fetch_filter.is_none()

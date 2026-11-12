@@ -709,14 +709,17 @@ These are explicit non-goals. Don't add them without a reason.
       (RM-476).
       Verify: tests/backlog/test_rm_found_rm476.py::test_an_or_of_one_index_sorts_its_keys
       Backlog-ID: RM-557
-- [ ] **A sort beside a multikey field sorts documents, not index keys.**
-      mongod 8.2.11 plans `find({y: {$gte: 0}}).sort({x: 1})` over `{y: 1,
-      x: 1}`, `y` multikey and `x` not, as a SORT of index keys below the
-      FETCH (`type: "default"`, 780 counted for twelve members). This
-      server sorts the fetched documents above the FETCH (`simple`, 900).
-      Found 2026-11-09 (RM-375).
-      Verify: tests/backlog/test_rm_found_rm375.py::test_a_sort_beside_a_multikey_field_sorts_index_keys
-      Backlog-ID: RM-477
+- [ ] **A SORT_MERGE beside a null scan breaks a tie another way than
+      mongod.** mongod 8.2.11 answers `find({a: {$in: [7, "b", 5,
+      null]}}).sort({b: 1})` over `{a: 1, b: 1}` with `FETCH <- SORT_MERGE`
+      of four scans, and returns `_id` 14 (no `a`, from the null scan)
+      before 13 (`a: 7`), which tie on `b`: `[3, 14, 13, 17]`. This server
+      plans the same merge and returns `[3, 13, 14, 17]`. Without the null
+      in the `$in` the two agree. These are the three `order` replies of
+      `tools/probes/find_order.py` (step 100 over `{a: 1, b: 1}`, `{a: 1,
+      b: -1}` and `{a: -1, b: 1}`). Found 2026-11-12 (RM-477).
+      Verify: tests/backlog/test_rm_found_rm477.py::test_a_sort_merge_beside_a_null_scan_breaks_ties_as_mongod
+      Backlog-ID: RM-559
 - [ ] **`returnKey` is not at the top of a sorted plan.** mongod 8.2.11
       puts RETURN_KEY above a blocking sort and drops the projection:
       `RETURN_KEY <- SORT <- COLLSCAN`, and `RETURN_KEY <- SORT <- FETCH <-
