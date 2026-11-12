@@ -16,14 +16,15 @@
 //! | a settable parameter, wrong type | 2 `BadValue` "Invalid value for X: ..." |
 //! | any of the above outside `admin` | 13 `Unauthorized` "setParameter may only be run against the admin database." |
 //!
-//! **We deliberately do NOT register a parameter we do not honour.** The
-//! `ingressConnectionEstablishment*` family that mongo-go-driver's
-//! `TestConnectionPoolBackpressure` sets is real on mongod and tunes a
-//! connection rate limiter SecantusDB has no equivalent of. Accepting those
-//! names would let a client ask for rate limiting and silently get none, which
-//! is the "half-implemented feature that silently diverges" this project
-//! prefers an honest refusal to. A server that does not register them answers
-//! 72, and so do we.
+//! **We deliberately do NOT register a parameter we do not honour**: a
+//! name accepted and then ignored lets a client ask for a behaviour and
+//! silently get none, which is the "half-implemented feature that silently
+//! diverges" this project prefers an honest refusal to. A server that does
+//! not register a name answers 72, and so do we. The
+//! `ingressConnectionEstablishment*` family mongo-go-driver's
+//! `TestConnectionPoolBackpressure` sets is registered because it is
+//! honoured: it drives mongod's connection establishment rate limiter
+//! (`admission::rate_limiter`).
 
 use std::collections::BTreeMap;
 use std::sync::Mutex;
@@ -310,8 +311,9 @@ pub struct ServerParams {
     /// The feature compatibility version, once read from
     /// `admin.system.version` (`cluster_admin::current_fcv`) or set.
     fcv: Mutex<Option<String>>,
-    /// The connection-establishment token bucket (`admit_connection`).
-    ingress: Mutex<IngressBucket>,
+    /// mongod's connection establishment rate limiter
+    /// (`admit_connection`, RM-355).
+    establishment: crate::admission::rate_limiter::SessionEstablishmentRateLimiter,
     /// mongod's ingress admission control, which every command passes
     /// through (RM-355).
     ingress_admission: crate::admission::ingress::IngressAdmissionController,
@@ -319,20 +321,6 @@ pub struct ServerParams {
     execution: std::sync::OnceLock<std::sync::Arc<crate::admission::execution::ExecutionControl>>,
     /// mongod's query stats store, which `$queryStats` lists (RM-215).
     query_stats: std::sync::Arc<crate::query_stats::QueryStatsStore>,
-}
-
-/// mongod's connection-establishment rate limiter (8.2.11, measured
-/// 2026-10-20): a bucket of `ratePerSec x burstCapacitySecs` tokens, filled
-/// at `ratePerSec`. A connection takes a token; with none it waits its turn,
-/// a token's time each, while no more than `maxQueueDepth` connections are
-/// waiting, and past that it is closed with no reply.
-#[derive(Default)]
-struct IngressBucket {
-    /// Tokens in the bucket, negative while connections are reserved
-    /// against tokens still to come.
-    tokens: f64,
-    filled: Option<std::time::Instant>,
-    waiting: usize,
 }
 
 impl ServerParams {
@@ -440,53 +428,24 @@ impl ServerParams {
     }
 
     /// Whether a connection being established may go ahead, as mongod's
-    /// ingress rate limiter decides: at once, after waiting its turn, or
-    /// not at all (`false`: close it unanswered).
-    pub fn admit_connection(&self) -> bool {
-        let truthy = |name: &str| matches!(self.get(name), Some(Bson::Boolean(true)));
-        if !truthy("ingressConnectionEstablishmentRateLimiterEnabled") {
+    /// connection establishment rate limiter decides while
+    /// `ingressConnectionEstablishmentRateLimiterEnabled` is on: at once,
+    /// after waiting its turn, or not at all (`false`: close it unanswered,
+    /// as mongod ends a session whose `throttleIfNeeded` failed).
+    /// `disconnected` says whether the client has gone while it waits.
+    pub fn admit_connection(&self, disconnected: &mut dyn FnMut() -> bool) -> bool {
+        use crate::admission::rate_limiter::ENABLED;
+        if !matches!(self.get(ENABLED), Some(Bson::Boolean(true))) {
             return true;
         }
-        let number = |name: &str, default: f64| match self.get(name) {
-            Some(Bson::Int32(n)) => f64::from(n),
-            Some(Bson::Double(d)) => d,
-            _ => default,
-        };
-        let rate = number(
-            "ingressConnectionEstablishmentRatePerSec",
-            f64::from(i32::MAX),
-        );
-        let burst = number("ingressConnectionEstablishmentBurstCapacitySecs", f64::MAX);
-        let queue = number("ingressConnectionEstablishmentMaxQueueDepth", 0.0) as usize;
-        let capacity = (rate * burst).min(f64::from(i32::MAX)).max(1.0);
-        let wait = {
-            let Ok(mut bucket) = self.ingress.lock() else {
-                return true;
-            };
-            let now = std::time::Instant::now();
-            bucket.tokens = match bucket.filled {
-                None => capacity,
-                Some(then) => {
-                    (bucket.tokens + now.duration_since(then).as_secs_f64() * rate).min(capacity)
-                }
-            };
-            bucket.filled = Some(now);
-            if bucket.tokens >= 1.0 {
-                bucket.tokens -= 1.0;
-                return true;
-            }
-            if bucket.waiting >= queue {
-                return false;
-            }
-            bucket.tokens -= 1.0;
-            bucket.waiting += 1;
-            std::time::Duration::from_secs_f64((-bucket.tokens) / rate)
-        };
-        std::thread::sleep(wait);
-        if let Ok(mut bucket) = self.ingress.lock() {
-            bucket.waiting -= 1;
-        }
-        true
+        self.establishment.throttle_if_needed(disconnected).is_ok()
+    }
+
+    /// mongod's connection establishment rate limiter (RM-355).
+    pub fn establishment_limiter(
+        &self,
+    ) -> &crate::admission::rate_limiter::SessionEstablishmentRateLimiter {
+        &self.establishment
     }
 
     /// mongod's ingress admission control (RM-355).
@@ -588,6 +547,7 @@ impl ServerParams {
     /// value for `was`.
     fn set(&self, name: &str, value: Bson) {
         self.ingress_admission.apply(name, &value);
+        self.establishment.apply(name, &value);
         if let Ok(mut guard) = self.values.lock() {
             if let Some(alias) = crate::admission::execution::alias(name) {
                 guard.insert(alias.to_string(), value.clone());
@@ -1260,7 +1220,7 @@ mod tests {
     #[test]
     fn the_bucket_admits_a_token_at_a_time() {
         let params = ServerParams::new();
-        assert!(params.admit_connection());
+        assert!(params.admit_connection(&mut || false));
         params.set(
             "ingressConnectionEstablishmentRateLimiterEnabled",
             Bson::Boolean(true),
@@ -1270,8 +1230,8 @@ mod tests {
             "ingressConnectionEstablishmentBurstCapacitySecs",
             Bson::Double(1.0),
         );
-        assert!(params.admit_connection());
-        assert!(!params.admit_connection());
+        assert!(params.admit_connection(&mut || false));
+        assert!(!params.admit_connection(&mut || false));
     }
 
     /// The TTL monitor's two parameters (mongod 8.2.11, 2026-10-10). Both

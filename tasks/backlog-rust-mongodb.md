@@ -538,29 +538,45 @@ These are explicit non-goals. Don't add them without a reason.
       and profile entry `storage.timeWaitingMicros.storageExecutionMicros`
       (the global IS the line reads its statistics under takes the
       admission mongod's does; compared operation by operation in
-      `tests/mongod_live/test_slow_query_lines.py`). Open:
+      `tests/mongod_live/test_slow_query_lines.py`). Since 2026-11-12
+      `serverStatus.queues.ingressSessionEstablishment` and `connections`'
+      `queuedForEstablishment` and `establishmentRateLimit` report the
+      connection establishment rate limiter (`admission/rate_limiter.rs`, a
+      port of mongod's `RateLimiter`), and a `$currentOp` row its
+      operation's `queues` and `currentQueue`
+      (`tests/mongod_live/test_ingress_admission.py`). Open:
       - where this server's ticket points differ from mongod's: a yield here
         keeps its locks, so it keeps its ticket and takes no second
         admission (mongod returns both and takes them again, RM-360); an
         `awaitData` getMore returns its ticket for each 100 ms of its wait,
-        where mongod's yields once per wait; `commitTransaction` and
-        `abortTransaction` take no ticket (mongod's unstash takes one);
+        where mongod's yields once per wait; `abortTransaction`'s line
+        counts two execution admissions, where mongod's unstash makes it
+        three (`commitTransaction`'s three match, measured 2026-11-12);
         and an `update` or `delete` statement's line counts one admission
         fewer, its command's line one fewer per statement, because the
         statement's line is written with the command's locks still held
         (RM-357's statement rounds), where mongod's statement has let its
         own go and takes a fresh ticket to read its statistics;
-      - a `currentOp` row has no `queues` (each pool's `admissions`,
-        `totalTimeQueuedMicros`, `isHoldingTicket`) or, while it waits,
-        `currentQueue`; `serverStatus.queues` has no
-        `ingressSessionEstablishment` (the connection limiter's counts); the
-        line of a command that never got its ingress ticket names
+      - the line of a command that never got its ingress ticket names
         `<db>.$cmd` on mongod, its collection here; and mongod's first
         retryable write after startup takes a second, exempt, ingress
-        admission (not traced), all measured 8.2.11 2026-11-08.
+        admission (not traced), both measured 8.2.11 2026-11-08; an index
+        build's `$currentOp` row has no `queues` here (mongod's not yet
+        measured).
       **Decided (Joe, 2026-11-08): build mongod's execution admission control in full, the faithful option: the ingress controller, then the read and write ticket pools with `throughputProbing` (replacing `admission.rs`'s opt-in write tickets), then the per-command admission counts, so the concurrency cap is on by default as on mongod. Several PRs, in that order.** The ingress controller landed 2026-11-08, the ticket pools 2026-11-09, and the per-command admission counts on the line 2026-11-09; what is left is above.
       Backlog-ID: RM-355
-      Verify: tests/backlog/test_rm_355_364.py::test_admission_control_is_reported_where_mongod_reports_it
+      Verify: tests/backlog/test_rm_355_364.py::test_ending_a_transaction_takes_mongods_execution_tickets
+- [ ] **The connection establishment rate limiter has no bypass list.**
+      mongod 8.2.11's `ingressConnectionEstablishmentRateLimiterBypass` (a
+      CIDR range list, `{ranges: []}` by default, set at startup or at
+      runtime) exempts the clients it names from the connection
+      establishment rate limiter, which counts them in
+      `queues.ingressSessionEstablishment.exemptedAdmissions` and
+      `connections.establishmentRateLimit.exempted`. This server does not
+      register the parameter (`getParameter` answers 72), so every client
+      is limited and both counts stay 0. Found working RM-355, 2026-11-12.
+      Backlog-ID: RM-550
+      Verify: tests/backlog/test_rm_355_364.py::test_the_connection_rate_limiter_has_its_bypass_list
 - [ ] **Some writes' `locks` are not mongod's.** Since 2026-11-07 a write
       counts mongod's flow control tickets (one per global IX taken apart)
       and a retryable write's session checkout and session row, and a

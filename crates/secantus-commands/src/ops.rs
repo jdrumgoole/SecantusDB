@@ -38,7 +38,16 @@ pub struct RunningOp {
     /// `IndexBuildsCoordinatorMongod-N`): its `desc`, and what `killOp`
     /// does to it -- asks the build to abort (RM-187).
     build: Option<BuildOp>,
+    /// The command's ingress and execution admissions, which its row
+    /// reports as `queues` (RM-355).
+    admission: Option<Admissions>,
 }
+
+/// An operation's admission contexts: ingress's, then execution's.
+type Admissions = (
+    Arc<crate::admission::AdmissionContext>,
+    Arc<crate::admission::AdmissionContext>,
+);
 
 /// How `currentOp` lists an operation: mongod's `op` (`command`, `query`,
 /// `getmore`, `insert`, `update`, `remove` or `bulkWrite`), its namespace,
@@ -152,6 +161,11 @@ impl RunningOp {
                 doc! {"cursorId": Bson::Int64(id), "operationUsingCursorId": Bson::Int64(self.opid)},
             );
         }
+        if let Some((ingress, execution)) = &self.admission {
+            let (queues, current) = crate::admission::current_op_queues(ingress, execution);
+            out.insert("queues", queues);
+            out.insert("currentQueue", current);
+        }
         if self.killed() {
             out.insert("killPending", true);
         }
@@ -252,6 +266,8 @@ impl OpRegistry {
             // command's session interrupts the command, which aborts the
             // build with it (as `killOp` of the command does).
             session: None,
+            // The build's thread keeps no admissions of its own here.
+            admission: None,
             build: Some(BuildOp {
                 desc: format!(
                     "IndexBuildsCoordinatorMongod-{}",
@@ -400,6 +416,10 @@ pub fn begin(registry: &Arc<OpRegistry>, doc: &Document, ctx: &crate::CommandCon
         killed: Arc::new(AtomicBool::new(false)),
         session,
         build: None,
+        admission: Some((
+            ctx.ingress_admission.clone(),
+            ctx.execution_admission.clone(),
+        )),
     });
     let killed = running.killed.clone();
     registry

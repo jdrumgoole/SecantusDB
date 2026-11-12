@@ -4510,14 +4510,18 @@ pub fn server_status(doc: &Document, ctx: &mut CommandContext) -> HandlerResult 
     // which type-checks rather than coercing ("'connections.totalCreated'
     // is not a int32"). The Python server emits plain ints, which encode
     // as Int32, so it never hit this.
-    reply.insert(
-        "connections",
-        doc! {
-            "current": conns.current as i32,
-            "available": 0i32,
-            "totalCreated": conns.total_created as i32,
-        },
-    );
+    let mut connections = doc! {
+        "current": conns.current as i32,
+        "available": 0i32,
+        "totalCreated": conns.total_created as i32,
+    };
+    // The connection establishment rate limiter's counts (RM-355).
+    if let Some(params) = ctx.server_params.as_ref() {
+        params
+            .establishment_limiter()
+            .append_stats_connections(&mut connections);
+    }
+    reply.insert("connections", connections);
     if let Some(extra) = crate::procstats::extra_info() {
         reply.insert("extra_info", extra);
     }
@@ -4685,21 +4689,25 @@ fn section_wanted(doc: &Document, section: &str) -> bool {
 }
 
 /// `queues`: the admission control pools' tickets and queues, as mongod's
-/// `AdmissionServerStatusSection` reports them -- `ingress` while ingress
-/// admission control is on (RM-355). Execution control's `execution` and
-/// the connection limiter's `ingressSessionEstablishment` are not reported.
+/// `AdmissionServerStatusSection` reports them -- execution control's
+/// `execution`, `ingress` while ingress admission control is on, and the
+/// connection establishment rate limiter's `ingressSessionEstablishment`,
+/// which mongod reports whether or not the limiter is on (RM-355).
 fn queues_section(ctx: &CommandContext) -> Document {
     let mut out = Document::new();
-    // mongod's order: execution control's pools, then ingress's (RM-355).
+    // mongod's order: execution control's pools, then ingress's, then the
+    // rate limiter's.
     if let Some(execution) = ctx.locks.as_ref().and_then(|l| l.execution()) {
         out.insert("execution", execution.server_status());
     }
-    if let Some(ingress) = ctx
-        .server_params
-        .as_ref()
-        .and_then(|p| p.ingress_admission().server_status())
-    {
-        out.insert("ingress", ingress);
+    if let Some(params) = ctx.server_params.as_ref() {
+        if let Some(ingress) = params.ingress_admission().server_status() {
+            out.insert("ingress", ingress);
+        }
+        out.insert(
+            "ingressSessionEstablishment",
+            params.establishment_limiter().stats_queues(),
+        );
     }
     out
 }

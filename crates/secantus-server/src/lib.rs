@@ -633,8 +633,12 @@ fn accept_loop(listener: TcpListener, shared: Arc<Shared>) {
                     let guard = ConnGuard::new(active);
                     // mongod's connection-establishment rate limiter: a
                     // connection over the rate waits its turn or is closed
-                    // unanswered (`ServerParams::admit_connection`).
-                    if !conn_shared.server_params.admit_connection() {
+                    // unanswered (`ServerParams::admit_connection`); one
+                    // whose client goes while it waits is let go.
+                    if !conn_shared
+                        .server_params
+                        .admit_connection(&mut || client_disconnected(&stream))
+                    {
                         refuse_unanswered(stream);
                         drop(conn_shared);
                         drop(guard);
@@ -653,6 +657,25 @@ fn accept_loop(listener: TcpListener, shared: Arc<Shared>) {
             Err(_) => break,
         }
     }
+}
+
+/// Whether the client of a connection that has not yet been served has
+/// gone, as mongod's `isConnected` asks of a session: a socket that reads
+/// end-of-file, or fails, has; one with nothing to read, or with bytes
+/// waiting, has not. Nothing is consumed.
+fn client_disconnected(stream: &TcpStream) -> bool {
+    if stream.set_nonblocking(true).is_err() {
+        return true;
+    }
+    let mut probe = [0u8; 1];
+    let gone = match stream.peek(&mut probe) {
+        Ok(0) => true,
+        Ok(_) => false,
+        Err(e) => e.kind() != io::ErrorKind::WouldBlock,
+    };
+    // The listener's sockets start non-blocking; `refuse_unanswered` and
+    // `handle_connection` set the mode they need themselves.
+    gone
 }
 
 /// Close a connection the rate limiter refused, as mongod does: with no
