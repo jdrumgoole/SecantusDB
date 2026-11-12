@@ -1570,7 +1570,9 @@ a regression test.
       zeros: an inequality between the inner's
       key and an expression of the outer side (`e.a + 1 < k.a`,
       PostgreSQL's `Index Cond: (a > (e.a + 1))`), a key on a later
-      index column; and a join of three or more relations (found while
+      index column (`e, c2 where e.a < c2.y` over an index on `(x, y)`:
+      PostgreSQL's `Index Only Scan using c2_xy` with `Index Cond: (y >
+      e.a)`); and a join of three or more relations (found while
       working RP-329). Since 2026-11-12 a LEFT join's WHERE over its
       preserved side alone is that side's cheapest path, its scan Filter
       or, where the index wins, its Index Cond (`k left join e on e.a <>
@@ -1610,9 +1612,43 @@ a regression test.
       1))`), and an operand reading the key's own table no index qual
       (`e.a + k.a < k.a`, the Join Filter); one holding a call is still
       zeros (`length(e.b) < k.a`, PostgreSQL's Memoize over the Index
-      Scan).
+      Scan). Since 2026-11-12 a join of three tables written `a JOIN b ON
+      .. JOIN c ON ..`, each clause an inequality between two of them
+      over tables with no index, is priced by PostgreSQL's search over the
+      three where it keeps that order (two Nested Loops, each inner
+      Materialized where cheaper); a join of four or more, one with a
+      `<>`, a cast or an indexed table, and one PostgreSQL orders
+      otherwise (its own item) are still zeros.
       Backlog-ID: RP-354
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[nested loop of three relations]
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[nested loop into a later column of an index]
+- [ ] **A join of three tables by inequalities runs in its written
+      order, and a WHERE's join clauses all run at the top join.**
+      PostgreSQL's `standard_join_search` picks the order of an inner join
+      of three tables linked only by `<`, `<=`, `>`, `>=` or `<>` as it
+      does for equalities (`join_search.rs` searches only those): PostgreSQL
+      15.19 runs `select * from e join e e3 on e.a < e3.a join zs on e3.a >
+      zs.a` (`e` 1,000 analysed rows, `zs` ten) as `(e3 x zs) x e`, so its
+      rows come out in that loop's order (`limit 5` of `e.a` gives 1, 1, 2,
+      1, 2, here 1, 1, 1, 1, 1) and EXPLAIN prints that plan; here the tables
+      join as written and the plan is unpriced. A comma join's WHERE clause
+      over two tables is the Join Filter of the first join holding both
+      (`from e, e e2, e e3 where e.a < e2.a and e2.a < e3.a`: `(e.a < e2.a)`
+      on the lower Nested Loop); here both are the top join's, the lower
+      one a cross join. Measured on a private 15.19 cluster (found while
+      working RP-354).
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[nested loop of three relations joined in another order], tests/backlog/test_rp_explain_costs.py::test_plan[nested loop of three relations by a where]
+      Backlog-ID: RP-919
+- [ ] **The upper join of three tables prints its clauses in the ON's
+      order, not PostgreSQL's.** `build_joinrel_restrictlist` lists a
+      join's clauses from the lower join's tables' join lists, the first
+      table's clauses before the second's: PostgreSQL 15.19 prints `select
+      * from e join e e2 on e.a < e2.a join e e3 on e2.a < e3.a and e.a <
+      e3.a` with the top Nested Loop's `Join Filter: ((e.a < e3.a) AND
+      (e2.a < e3.a))`; here `((e2.a < e3.a) AND (e.a < e3.a))`. The costs and
+      rows match. Measured on a private 15.19 cluster (found while working
+      RP-354).
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[nested loop of three relations with two clauses above]
+      Backlog-ID: RP-920
 - [ ] **EXPLAIN prints no estimate for a LEFT join whose ON restricts
       its nullable side beside an inequality into its index.** PostgreSQL
       15.19 plans `explain select * from e left join k on e.a < k.a and

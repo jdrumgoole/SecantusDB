@@ -43819,6 +43819,30 @@ impl PgHandler {
                         }
                     }
                 }
+                // A Nested Loop of a Nested Loop of two tables'
+                // sequential scans and a third's (RP-354): PostgreSQL's
+                // search over the three, where it keeps this order.
+                let bare_scan = |c: &explain::PlanNode| {
+                    c.children.is_empty() && c.name.starts_with("Seq Scan on ")
+                };
+                if tree.name == "Nested Loop"
+                    && tree.details.is_empty()
+                    && tree.children.len() == 2
+                    && tree.children[0].name == "Nested Loop"
+                    && tree.children[0].details.is_empty()
+                    && tree.children[0].children.len() == 2
+                    && tree.children[0].children.iter().all(bare_scan)
+                    && bare_scan(&tree.children[1])
+                {
+                    if let Statement::Select(sel) = inner.as_ref() {
+                        if let Some(est) = self.nest_loop3_estimate(sel) {
+                            let (plan, a, b, join) = est.lower;
+                            explain::price_nest_loop(&mut tree.children[0], &plan, a, b, join);
+                            let (plan, a, b, join) = est.top;
+                            explain::price_nest_loop(&mut tree, &plan, a, b, join);
+                        }
+                    }
+                }
                 // A Limit straight over one relation's sequential scan
                 // (RP-319): the scan's estimate, then
                 // `adjust_limit_rows_costs`. Only where the Seq Scan is the

@@ -83,6 +83,14 @@ _ANALYSED_FLOAT = _ANALYSED + [
     "analyze f",
 ]
 
+# Those, and a two-column B-tree whose second column is unique (RP-354).
+_ANALYSED_COMPOSITE = _ANALYSED + [
+    "create table c2 (x int, y int)",
+    "insert into c2 select g % 10, g from generate_series(1, 1000) g",
+    "create index c2_xy on c2 (x, y)",
+    "analyze c2",
+]
+
 # Those, a ten-row table analysed and one never analysed (RP-329).
 _ANALYSED_SMALL = _ANALYSED + [
     "create table zs (a int, b text)",
@@ -1823,9 +1831,11 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "        ->  Seq Scan on e e2  (cost=0.00..15.00 rows=1000 width=7)",
         ],
     ),
-    # A join of three relations.
+    # Split from RP-354 and fixed: a join of three tables by inequalities,
+    # in the order PostgreSQL's search over the three keeps, is two
+    # priced Nested Loops; before, both printed zeros.
     "nested loop of three relations": (
-        "RP-354",
+        "RP-329",
         _ANALYSED,
         "explain select * from e join e e2 on e.a < e2.a join e e3 on e2.a < e3.a",
         [
@@ -1838,6 +1848,131 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "              ->  Seq Scan on e e2  (cost=0.00..15.00 rows=1000 width=7)",
             "  ->  Materialize  (cost=0.00..20.00 rows=1000 width=7)",
             "        ->  Seq Scan on e e3  (cost=0.00..15.00 rows=1000 width=7)",
+        ],
+    ),
+    # Split from RP-354 and fixed: each join's width is the columns read
+    # above it -- the select list's, and a clause's to the table above.
+    "nested loop of three relations reading one column": (
+        "RP-329",
+        _ANALYSED,
+        "explain select e.a from e join e e2 on e.a < e2.a join e e3 on e2.a < e3.a",
+        [
+            "Nested Loop  (cost=0.00..5015045.00 rows=111111000 width=4)",
+            "  Join Filter: (e2.a < e3.a)",
+            "  ->  Nested Loop  (cost=0.00..15032.50 rows=333333 width=8)",
+            "        Join Filter: (e.a < e2.a)",
+            "        ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=4)",
+            "        ->  Materialize  (cost=0.00..20.00 rows=1000 width=4)",
+            "              ->  Seq Scan on e e2  (cost=0.00..15.00 rows=1000 width=4)",
+            "  ->  Materialize  (cost=0.00..20.00 rows=1000 width=4)",
+            "        ->  Seq Scan on e e3  (cost=0.00..15.00 rows=1000 width=4)",
+        ],
+    ),
+    # Split from RP-354 and fixed: the lower join reads its second table
+    # outer where that is cheaper, and the two-table joins are weighed in
+    # FROM order (`zs` with `e3` is built second and costs the same).
+    "nested loop of three relations with the lower join reordered": (
+        "RP-329",
+        _ANALYSED_SMALL,
+        "explain select * from zs join e on e.a < zs.a join e e3 on e.a < e3.a",
+        [
+            "Nested Loop  (cost=0.00..50178.62 rows=1111000 width=20)",
+            "  Join Filter: (e.a < e3.a)",
+            "  ->  Nested Loop  (cost=0.00..166.12 rows=3333 width=13)",
+            "        Join Filter: (e.a < zs.a)",
+            "        ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
+            "        ->  Materialize  (cost=0.00..1.15 rows=10 width=6)",
+            "              ->  Seq Scan on zs  (cost=0.00..1.10 rows=10 width=6)",
+            "  ->  Materialize  (cost=0.00..20.00 rows=1000 width=7)",
+            "        ->  Seq Scan on e e3  (cost=0.00..15.00 rows=1000 width=7)",
+        ],
+    ),
+    # Split from RP-354 and fixed: a WHERE over one table is its scan's
+    # Filter, which shrinks it to the inner of the join below.
+    "nested loop of three relations with a where on one": (
+        "RP-329",
+        _ANALYSED,
+        "explain select * from e join e e2 on e.a < e2.a join e e3 on e2.a < e3.a where e.a > 5",
+        [
+            "Nested Loop  (cost=0.00..4989982.49 rows=110555667 width=21)",
+            "  Join Filter: (e2.a < e3.a)",
+            "  ->  Nested Loop  (cost=0.00..14959.99 rows=331667 width=14)",
+            "        Join Filter: (e.a < e2.a)",
+            "        ->  Seq Scan on e e2  (cost=0.00..15.00 rows=1000 width=7)",
+            "        ->  Materialize  (cost=0.00..22.48 rows=995 width=7)",
+            "              ->  Seq Scan on e  (cost=0.00..17.50 rows=995 width=7)",
+            "                    Filter: (a > 5)",
+            "  ->  Materialize  (cost=0.00..20.00 rows=1000 width=7)",
+            "        ->  Seq Scan on e e3  (cost=0.00..15.00 rows=1000 width=7)",
+        ],
+    ),
+    # Still open: PostgreSQL joins the two tables the cheaper clause links
+    # first and puts the third on top; here the tables join as written.
+    "nested loop of three relations joined in another order": (
+        "RP-919",
+        _ANALYSED_SMALL,
+        "explain select * from e join e e3 on e.a < e3.a join zs on e3.a > zs.a",
+        [
+            "Nested Loop  (cost=0.00..50178.62 rows=1111110 width=20)",
+            "  Join Filter: (e.a < e3.a)",
+            "  ->  Nested Loop  (cost=0.00..166.12 rows=3333 width=13)",
+            "        Join Filter: (e3.a > zs.a)",
+            "        ->  Seq Scan on e e3  (cost=0.00..15.00 rows=1000 width=7)",
+            "        ->  Materialize  (cost=0.00..1.15 rows=10 width=6)",
+            "              ->  Seq Scan on zs  (cost=0.00..1.10 rows=10 width=6)",
+            "  ->  Materialize  (cost=0.00..20.00 rows=1000 width=7)",
+            "        ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
+        ],
+    ),
+    # Still open: a comma join's WHERE clause over two tables is the Join
+    # Filter of the join that first holds both; here every one is the top
+    # join's.
+    "nested loop of three relations by a where": (
+        "RP-919",
+        _ANALYSED,
+        "explain select * from e, e e2, e e3 where e.a < e2.a and e2.a < e3.a",
+        [
+            "Nested Loop  (cost=0.00..5015045.00 rows=111111000 width=21)",
+            "  Join Filter: (e2.a < e3.a)",
+            "  ->  Nested Loop  (cost=0.00..15032.50 rows=333333 width=14)",
+            "        Join Filter: (e.a < e2.a)",
+            "        ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
+            "        ->  Materialize  (cost=0.00..20.00 rows=1000 width=7)",
+            "              ->  Seq Scan on e e2  (cost=0.00..15.00 rows=1000 width=7)",
+            "  ->  Materialize  (cost=0.00..20.00 rows=1000 width=7)",
+            "        ->  Seq Scan on e e3  (cost=0.00..15.00 rows=1000 width=7)",
+        ],
+    ),
+    # Still open: the upper join's clauses print in the order of the
+    # lower join's tables' join lists (`build_joinrel_restrictlist`), the
+    # clause to `e` before the one to `e2`; here as the ON wrote them.
+    "nested loop of three relations with two clauses above": (
+        "RP-920",
+        _ANALYSED,
+        "explain select * from e join e e2 on e.a < e2.a join e e3 on e2.a < e3.a and e.a < e3.a",
+        [
+            "Nested Loop  (cost=0.00..5848377.50 rows=37037000 width=21)",
+            "  Join Filter: ((e.a < e3.a) AND (e2.a < e3.a))",
+            "  ->  Nested Loop  (cost=0.00..15032.50 rows=333333 width=14)",
+            "        Join Filter: (e.a < e2.a)",
+            "        ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
+            "        ->  Materialize  (cost=0.00..20.00 rows=1000 width=7)",
+            "              ->  Seq Scan on e e2  (cost=0.00..15.00 rows=1000 width=7)",
+            "  ->  Materialize  (cost=0.00..20.00 rows=1000 width=7)",
+            "        ->  Seq Scan on e e3  (cost=0.00..15.00 rows=1000 width=7)",
+        ],
+    ),
+    # Still open (RP-354): an inequality on an index's second column is
+    # its Index Cond, the whole index read each loop.
+    "nested loop into a later column of an index": (
+        "RP-354",
+        _ANALYSED_COMPOSITE,
+        "explain select * from e, c2 where e.a < c2.y",
+        [
+            "Nested Loop  (cost=0.28..14490.00 rows=333333 width=15)",
+            "  ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
+            "  ->  Index Only Scan using c2_xy on c2  (cost=0.28..11.14 rows=333 width=8)",
+            "        Index Cond: (y > e.a)",
         ],
     ),
     # Still open: a binary-coercible cast (text to varchar, back to text
