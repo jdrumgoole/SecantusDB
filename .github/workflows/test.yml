@@ -1074,10 +1074,13 @@ jobs:
         # runs. Nothing ships the full Windows extension: PyPI is retired
         # (2026-10-20) and the Windows release binary is built without PGO.
         #
-        # The full build is built and tested by the weekly cron's macOS cell
-        # and by the release builds. What is lost: a fault that only the
-        # LTO / PGO build has shows up at the next weekly run or release, not
-        # on the PR or on main -- and on Windows, only at a release.
+        # The full build is built and tested by the weekly cron's Linux and
+        # macOS cells (the release builds use fast mode too since 2026-11-12:
+        # they keep only WiredTiger from that build). What is lost: a fault
+        # that only the LTO / PGO extension has shows up at the next weekly
+        # run, not on the PR or on main -- and on Windows, nowhere. That
+        # extension ships to no one; the release binaries are built in their
+        # own step with their own profile settings.
         id: mode
         shell: bash
         run: |
