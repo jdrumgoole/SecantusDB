@@ -772,13 +772,6 @@ These are explicit non-goals. Don't add them without a reason.
       k}`. Found 2026-11-12 (RM-470).
       Verify: tests/backlog/test_rm_found_rm470.py::test_return_key_keeps_a_sort_key_meta_field
       Backlog-ID: RM-568
-- [ ] **An `$or` of index scans does not answer a covered projection.**
-      mongod 8.2.11 answers `{_id: 0, x: 1}` over an `$or` of two scans of
-      `{y: 1, x: 1}` from their keys (`SUBPLAN <- PROJECTION_DEFAULT <- OR
-      <- IXSCAN`, no FETCH). This server fetches each document
-      (`PROJECTION_SIMPLE <- FETCH <- OR`). Found 2026-11-09 (RM-373).
-      Verify: tests/backlog/test_rm_found_2026_11_09_rm373.py::test_an_or_of_scans_answers_a_covered_projection
-      Backlog-ID: RM-471
 - [ ] **A `default` sort of documents counts the documents, not its
       working-set members.** mongod 8.2.11's SORT of a read that keeps
       each member's metadata (`showRecordId`, a projection's `{$meta:
@@ -800,6 +793,70 @@ These are explicit non-goals. Don't add them without a reason.
       (RM-472).
       Verify: tests/backlog/test_rm_found_rm472.py::test_a_near_read_explains_as_geo_near_2d
       Backlog-ID: RM-578
+- [ ] **Covered fields come back in the projection's order, not the key's.**
+      mongod 8.2.11 builds a covered row from the index key, so `{_id: 0,
+      x: 1, y: 1}` over `{y: 1, x: 1}` returns `{y: .., x: ..}`, from one
+      scan (`PROJECTION_COVERED`) or an `$or` of them (`PROJECTION_DEFAULT`
+      over the OR; a fetched branch's rows keep the document's order). This
+      server returns every row in the document's order, `{x: .., y: ..}`:
+      a field order a client sees. Found 2026-11-12 (RM-471).
+      Verify: tests/backlog/test_rm_found_rm471.py::test_covered_fields_come_back_in_the_key_patterns_order
+      Backlog-ID: RM-569
+- [ ] **A computed projection over index keys fetches.** mongod 8.2.11
+      answers `{_id: 0, x: 1, k: {$add: ["$x", 1]}}` from the keys of
+      `{y: 1, x: 1}` (`PROJECTION_DEFAULT <- IXSCAN`; over an `$or`, no
+      FETCH either): every field it reads is in the index. This server
+      fetches (`PROJECTION_DEFAULT <- FETCH <- IXSCAN`); `covers` refuses a
+      projection with an expression. Found 2026-11-12 (RM-471).
+      Verify: tests/backlog/test_rm_found_rm471.py::test_a_computed_projection_reads_index_keys
+      Backlog-ID: RM-570
+- [ ] **An `$or` over two indexes returns its branches out of order.**
+      mongod 8.2.11 reads `{$or: [{y: 0}, {x: {$gt: 8}}]}` over `{y: 1,
+      x: 1}` and `{x: 1}` branch by branch as its plan lists them,
+      `y_1_x_1` first: `_id` 0, 3, 6, 9, then 10, 11. This server's explain
+      lists the same order, but it returns the `x_1` branch first (9, 10,
+      11, 0, 3, 6). Sorted on `y` with `limit: 2` it then returns different
+      rows (`x` 9 and 0, where mongod returns 0 and 3), since the sort's
+      ties keep the read order. Found 2026-11-12 (RM-471).
+      Verify: tests/backlog/test_rm_found_rm471.py::test_an_or_of_two_indexes_returns_its_branches_in_order
+      Backlog-ID: RM-572
+- [ ] **An `{_id: 1}` projection is not covered.** mongod 8.2.11 answers
+      `find({y: 0}, {_id: 1})` from `{y: 1, _id: 1}`
+      (`PROJECTION_COVERED <- IXSCAN`), and from an `$or` over `_id_` and
+      that index (`PROJECTION_DEFAULT <- OR`). This server fetches each
+      document: `covers` refuses a projection of `_id` alone. Found
+      2026-11-12 (RM-471).
+      Verify: tests/backlog/test_rm_found_rm471.py::test_an_id_projection_is_covered
+      Backlog-ID: RM-573
+- [ ] **A clause beside an `$or` is rechecked in a FETCH.** mongod 8.2.11
+      pushes `x: {$lt: 10}` beside `{$or: [{y: 0}, {y: 1, x: {$gt:
+      3}}]}` into each branch's bounds over `{y: 1, x: 1}` and rechecks
+      nothing, so `{_id: 0, x: 1}` is answered from the keys
+      (`PROJECTION_DEFAULT <- OR <- IXSCAN`). This server's bounds are the
+      same, but it rechecks the clause in a FETCH over the OR (`FETCH`
+      filter `{x: {$lt: 10}}`), so it also fetches for a covered
+      projection. Found 2026-11-12 (RM-471).
+      Verify: tests/backlog/test_rm_found_rm471.py::test_a_clause_beside_an_or_is_answered_by_its_bounds
+      Backlog-ID: RM-574
+- [ ] **A sort over an `$or` with a fetched branch sorts documents.**
+      mongod 8.2.11's OR of `FETCH <- IXSCAN w_1` and `IXSCAN y_1_x_1` is
+      not fetched, and every branch carries `x` (a fetched one carries every
+      field), so `.sort({x: 1})` sorts the OR's members below a FETCH:
+      `SUBPLAN <- FETCH <- SORT (default) <- OR`; with `{_id: 0, x: 1}`,
+      `SORT <- PROJECTION_DEFAULT <- OR`, no FETCH. This server sorts
+      fetched documents above it (`SORT (simple) <- FETCH <- OR`): its
+      `keys_hold` takes only index-scan branches. Found 2026-11-12
+      (RM-471).
+      Verify: tests/backlog/test_rm_found_rm471.py::test_a_sort_over_an_or_with_a_fetched_branch_sorts_below_the_fetch
+      Backlog-ID: RM-575
+- [ ] **A rooted `$or`'s profile `planSummary` names one index twice.**
+      mongod 8.2.11's profile entry for `{$or: [{a: {$gte: 2}, b: {$gte:
+      3}}, {a: 0, b: 0}]}` over `a_1` and `b_1` says `IXSCAN { a: 1 },
+      IXSCAN { b: 1 }`, the index each branch won with. This server's
+      explain names the same two, but its profile entry says `IXSCAN { a: 1
+      }, IXSCAN { a: 1 }`. Found 2026-11-12 (RM-471).
+      Verify: tests/backlog/test_rm_found_rm471.py::test_a_rooted_ors_plan_summary_names_each_branchs_index
+      Backlog-ID: RM-576
 - [ ] **A SORT over a covered projection does not count what it sorted.**
       mongod 8.2.11's `SORT <- PROJECTION_COVERED <- IXSCAN` (`type:
       "default"`) counts 1584 bytes sorted for the twelve `{x}` members of
@@ -2527,17 +2584,6 @@ What is left, all on the RUST MongoDB server:
       RM-185.
       Backlog-ID: RM-432
       Verify: tests/backlog/test_rm_431_432.py::test_explain_parses_the_write_it_explains
-- [ ] **A rooted `$or` whose branches are tried has a FETCH over its OR.**
-      mongod 8.2.11 plans `{$or: [{a: {$gte: 2}, b: {$gte: 3}}, {a: 0, b:
-      0}]}` over `a_1` and `b_1` branch by branch, each branch's two plans
-      by trial, and its winning plan is SUBPLAN, OR, then each branch's
-      FETCH over its IXSCAN; this server's, in `explain` and in the profile
-      entry of the `find`, puts a FETCH between the SUBPLAN and the OR.
-      With one plan per branch (`find_or` in `test_rm_355_364.py`) there is
-      none. The counts are mongod's. Measured 2026-11-09; found while
-      working RM-349.
-      Verify: tests/backlog/test_rm_found_2026_11_09_rm349.py::test_a_rooted_or_of_tried_branches_has_no_fetch_over_its_or
-      Backlog-ID: RM-459
 
 ### 7.074 Change streams, command by command -- 2026-10-11
 

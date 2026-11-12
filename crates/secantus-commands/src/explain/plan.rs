@@ -1842,7 +1842,44 @@ fn truthy(v: &Bson) -> bool {
 
 /// Whether the index holds every field an inclusion projection returns.
 fn covers(index: &IndexInfo, projection: &Document) -> bool {
-    if index.is_multikey() || projection.is_empty() {
+    !index.is_multikey() && covers_with(projection, &|field| index.position(field).is_some())
+}
+
+/// mongod's `QuerySolutionNode::fetched` for the scan an access reads: a
+/// FETCH is, and an OR or a SORT_MERGE when every branch is (mongod
+/// 8.2.11: `OR <- [FETCH <- IXSCAN, FETCH <- IXSCAN]` takes no FETCH above
+/// it).
+fn fetched(node: &Node) -> bool {
+    match node {
+        Node::Fetch { .. } => true,
+        Node::Or(inputs) | Node::SortMerge { inputs, .. } => {
+            !inputs.is_empty() && inputs.iter().all(fetched)
+        }
+        _ => false,
+    }
+}
+
+/// mongod's `QuerySolutionNode::hasField`: whether everything `node`
+/// returns carries `field`. A fetched branch carries every field, an index
+/// scan the fields its index holds, and an OR or a SORT_MERGE a field each
+/// of its branches carries (mongod 8.2.11 answers `{_id: 0, x: 1}` from an
+/// `OR` of `FETCH <- IXSCAN w_1` and `IXSCAN y_1_x_1` with no FETCH above
+/// it).
+fn has_field(node: &Node, field: &str) -> bool {
+    match node {
+        Node::IxScan(ix) => !ix.index.is_multikey() && ix.index.position(field).is_some(),
+        Node::Fetch { .. } => true,
+        Node::Or(inputs) | Node::SortMerge { inputs, .. } => {
+            !inputs.is_empty() && inputs.iter().all(|i| has_field(i, field))
+        }
+        _ => false,
+    }
+}
+
+/// Whether what a scan returns carries every field an inclusion projection
+/// returns, `holds` saying which fields it carries.
+fn covers_with(projection: &Document, holds: &dyn Fn(&str) -> bool) -> bool {
+    if projection.is_empty() {
         return false;
     }
     let mut id_out = false;
@@ -1857,11 +1894,11 @@ fn covers(index: &IndexInfo, projection: &Document) -> bool {
             id_out = true;
             continue;
         }
-        if !truthy(value) || index.position(field).is_none() {
+        if !truthy(value) || !holds(field) {
             return false;
         }
     }
-    id_out || index.position("_id").is_some()
+    id_out || holds("_id")
 }
 
 /// mongod's name for a projection: `PROJECTION_DEFAULT` for one that
@@ -2271,12 +2308,6 @@ fn wrap(a: Access, q: &Query) -> Node {
                 .is_some_and(|at| ix.multikey_paths.get(at).is_none_or(Vec::is_empty))
         })
     };
-    let covered = a.indexed
-        && a.fetch_filter.is_none()
-        && match (&a.index, q_projection) {
-            (Some(ix), Some(p)) => covers(ix, p) && blocking.is_none_or(|s| in_key(s, ix)),
-            _ => false,
-        };
     // A sort on fields the index holds runs on the keys, below the fetch;
     // over an `$or` of scans, when every scan's index holds them (mongod
     // 8.2.11: `FETCH <- SORT <- OR <- IXSCAN...`).
@@ -2299,6 +2330,21 @@ fn wrap(a: Access, q: &Query) -> Node {
                 _ => false,
             }
     });
+    // A projection the scan's keys answer needs no FETCH: one index's, or
+    // an `$or`'s whose every branch carries what it returns, a fetched
+    // branch carrying everything (mongod 8.2.11's `analyzeProjection`:
+    // `SUBPLAN <- PROJECTION_DEFAULT <- OR <- IXSCAN...`, no FETCH).
+    let covered = a.indexed
+        && a.fetch_filter.is_none()
+        && match (&a.index, q_projection) {
+            (Some(ix), Some(p)) => covers(ix, p) && blocking.is_none_or(|s| in_key(s, ix)),
+            (None, Some(p)) => {
+                !fetched(&a.scan)
+                    && covers_with(p, &|f| has_field(&a.scan, f))
+                    && (blocking.is_none() || sort_on_keys)
+            }
+            _ => false,
+        };
     let absorbed = (q.limit > 0).then_some(q.limit + q.skip);
     let keeps_metadata = keeps_metadata(q, q_projection);
     let sort_node = |input: Node, on_keys: bool| Node::Sort {
@@ -2320,9 +2366,10 @@ fn wrap(a: Access, q: &Query) -> Node {
             && q_projection.is_some_and(|p| !p.is_empty() && runs_below_sort(p, s))
     });
     let keys_projected = covered && sort_on_keys && below;
-    // Only one index scan's keys answer a covered projection: over a
-    // SORT_MERGE of scans it is mongod's general one.
-    let merged = covered && matches!(a.scan, Node::SortMerge { .. });
+    // Only one index scan's keys answer a covered projection: over an OR
+    // or a SORT_MERGE of scans it is mongod's general one
+    // (`produceCoveredKeyObj` wants a single leaf).
+    let merged = covered && matches!(a.scan, Node::Or(_) | Node::SortMerge { .. });
     let projection = |p: &Document, input: Node| {
         if q.show_record_id {
             let mut spec = p.clone();
@@ -2364,7 +2411,9 @@ fn wrap(a: Access, q: &Query) -> Node {
             if a.fetch_filter.is_some() || !sorted {
                 node = Node::fetch(a.fetch_filter, node);
             }
-        } else if !covered {
+        } else if !covered && !(a.fetch_filter.is_none() && fetched(&node)) {
+            // An OR whose every branch fetched returns documents already
+            // (mongod 8.2.11: `SUBPLAN <- OR <- [FETCH <- IXSCAN...]`).
             node = Node::fetch(a.fetch_filter, node);
         }
     }

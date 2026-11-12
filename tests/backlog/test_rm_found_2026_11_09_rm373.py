@@ -72,12 +72,12 @@ def test_return_key_is_the_top_of_a_sorted_plan(rust_mongo: Any, mongod: Any) ->
     assert answers["rust"] == answers["mongod"]
 
 
-@pytest.mark.backlog("RM-471")
+@pytest.mark.backlog_fixed("RM-471")
 def test_an_or_of_scans_answers_a_covered_projection(rust_mongo: Any, mongod: Any) -> None:
     """mongod 8.2.11 answers `{_id: 0, x: 1}` over an `$or` of two scans of
     `{y: 1, x: 1}` from their keys: `SUBPLAN <- PROJECTION_DEFAULT <- OR <-
-    IXSCAN`, no FETCH. This server fetches each document
-    (`PROJECTION_SIMPLE <- FETCH <- OR`)."""
+    IXSCAN`, no FETCH. This server fetched each document
+    (`PROJECTION_SIMPLE <- FETCH <- OR`) until 2026-11-12."""
     command = {
         "find": "c",
         "filter": {"$or": [{"y": 0}, {"y": 1, "x": {"$gt": 3}}]},

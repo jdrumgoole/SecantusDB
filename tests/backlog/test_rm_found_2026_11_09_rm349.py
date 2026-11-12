@@ -20,14 +20,16 @@ def _stages(stage: Any) -> list:
     return out
 
 
-@pytest.mark.backlog("RM-459")
+@pytest.mark.backlog_fixed("RM-459")
 def test_a_rooted_or_of_tried_branches_has_no_fetch_over_its_or(
     rust_mongo: Any, mongod: Any
 ) -> None:
     """mongod 8.2.11 plans `{$or: [{a: {$gte: 2}, b: {$gte: 3}}, {a: 0, b:
     0}]}` over `a_1` and `b_1` branch by branch, each by trial, and its
     winning plan is SUBPLAN, OR, then each branch's FETCH over its IXSCAN.
-    This server's puts a FETCH between the SUBPLAN and the OR."""
+    This server's put a FETCH between the SUBPLAN and the OR until
+    2026-11-12 (fixed with RM-471: an OR whose every branch is fetched
+    takes no FETCH above it)."""
 
     def run(client: Any) -> tuple:
         coll = client.rm349f.c

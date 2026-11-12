@@ -297,6 +297,33 @@ fn sort_paging_and_projection_wrap_the_scan() {
                     "]"
                 ),
             ),
+            // Every branch's keys hold what the projection returns: no FETCH,
+            // and mongod's general projection over the OR (RM-471).
+            (
+                doc! {
+                    "filter": { "$or": [{ "c": 0 }, { "c": 1, "d": { "$gt": 3 } }] },
+                    "projection": { "_id": 0, "d": 1 },
+                },
+                concat!(
+                    "SUBPLAN <- PROJECTION_DEFAULT <- OR <- [",
+                    r#"IXSCAN c_1_d_1 forward { "c": ["[1, 1]"], "d": ["(3, inf]"] }"#,
+                    " | ",
+                    r#"IXSCAN c_1_d_1 forward { "c": ["[0, 0]"], "d": ["[MinKey, MaxKey]"] }"#,
+                    "]"
+                ),
+            ),
+            // An OR whose every branch fetched takes no FETCH above it
+            // (RM-459).
+            (
+                doc! { "filter": { "$or": [{ "a": 1, "x": 2 }, { "b": 2, "x": 3 }] } },
+                concat!(
+                    "SUBPLAN <- OR <- [",
+                    r#"FETCH filtered <- IXSCAN a_1 forward { "a": ["[1, 1]"] }"#,
+                    " | ",
+                    r#"FETCH filtered <- IXSCAN b_-1 forward { "b": ["[2, 2]"] }"#,
+                    "]"
+                ),
+            ),
             (
                 doc! { "filter": { "$or": [{ "a": 1 }, { "x": 2 }] } },
                 "SUBPLAN <- COLLSCAN filtered",
