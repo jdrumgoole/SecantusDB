@@ -2283,17 +2283,22 @@ What is left, on the RUST MongoDB server:
       equalities.** mongod: `{a: 1, b: 2, c: 3, d: 4}` gives `c, a, b, d`;
       `{d: 1, c: 2, b: 3, a: 4}` gives `d, b, a, c`; an explicit `$and`
       keeps the order written. This server sorts them.
-      **Decision needed (2026-10-17):** there is no rule to find. mongod
-      collects the equalities in an `EqualityMatches`, a `StringDataMap`
-      (an `absl::flat_hash_map`), and builds the document in its iteration
-      order (`update_driver.cpp` / `path_support.cpp`, 8.2), and absl seeds
-      its hash per process. Measured on three mongod 8.2.11 processes at
-      once: `{a, b, c, d}` gave `c, a, b, d` / `c, a, b, d` / `b, a, c, d`,
-      and one process ordered `{a, b, c, d}` and `{d, c, b, a}` differently.
-      Options: (1) a hash order of this server's own, seeded per process --
-      the mechanism, but never the same order as a given mongod; (2) keep
-      the sorted order and record the difference as a scope decision, since
-      no fixed order can match a server that has none.
+      mongod collects the equalities in an `EqualityMatches`, a
+      `StringDataMap` (an `absl::flat_hash_map`), and builds the document in
+      its iteration order (`update_driver.cpp` / `path_support.cpp`, 8.2);
+      absl seeds its hash per process. Measured on three mongod 8.2.11
+      processes at once: `{a, b, c, d}` gave `c, a, b, d` / `c, a, b, d` /
+      `b, a, c, d`, and one process ordered `{a, b, c, d}` and
+      `{d, c, b, a}` differently.
+      **Decided (Joe, 2026-11-12): model the hash.** Port the mechanism --
+      absl `flat_hash_map`'s hashing and iteration order over the
+      equalities' field names, with a per-process seed as absl takes it --
+      and build the upserted document in that order; an explicit `$and`
+      keeps the order written. No fixed order can equal a given mongod's,
+      so restate the gap test to assert what mongod guarantees and the
+      model reproduces: the order is a property of the process (stable
+      within one, not the sorted order across the measured inputs), and
+      `$and` keeps the written order.
       Backlog-ID: RM-059
       Verify: tests/backlog/test_rm_057_084.py::test_upsert_field_order_from_several_equalities
 - **`$where` in an update's query** is refused as a `--noscripting`
@@ -2431,14 +2436,14 @@ What is left, all on the RUST MongoDB server:
       `tools/probes/find_order.py`'s collections are small and show no
       difference. A sort with a limit is the scope decision on its heap
       (section 7.075).
-      **Decision needed (2026-10-25):** the order is the C++ library's, and
-      the exemplar (Linux) links libstdc++ while the macOS mongod measured
-      here links libc++. `secantus-core/src/stl.rs` already models
-      libstdc++'s `std::sort` for SBE's heaps; following it here would
-      match a Linux mongod (unmeasured on this box) and not the macOS one.
-      Options: (1) sort as libstdc++'s `std::sort` does, as for SBE's heaps;
-      (2) keep the stable order and record the difference as a scope
-      decision, as for the sort with a limit.
+      **Decided (Joe, 2026-11-12): sort as libstdc++'s `std::sort` does.**
+      The exemplar is Linux mongod, which links libstdc++; reuse
+      `secantus-core/src/stl.rs`'s model (already used for SBE's heaps) for
+      the blocking sort, so equal keys come out in Linux mongod's order.
+      The macOS mongod measured here links libc++ and orders ties
+      differently; where the two differ, Linux is right. Pin the gap test
+      to the libstdc++ order (measure it on a Linux mongod 8.2, e.g. in
+      CI's mongod_live lane, rather than on this box).
       Backlog-ID: RM-312
       Verify: tests/backlog/test_rm_found_2026_10_25.py::test_a_blocking_sort_leaves_ties_as_mongods_sort_does
 - [ ] **`explain` of a `$unionWith` lists its sub-pipeline as written.**
