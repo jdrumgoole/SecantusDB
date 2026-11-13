@@ -742,12 +742,15 @@ These are explicit non-goals. Don't add them without a reason.
       own answer moves between runs of the same data (31229, 31231, 31240
       measured 2026-11-12). A SORT over a covered projection's OWNED_OBJ
       members is the same: 34936 against mongod's 36220 for 2000 `{x}`
-      documents (42497 for `{x, y}`; RM-473). **Decision needed
-      (2026-11-12):** model the
-      counter (every WiredTiger snapshot this server opens since start,
-      which still could not reproduce mongod's background threads'), or
-      keep 0 and accept the storage size as approximate. Found 2026-11-12
-      (RM-475).
+      documents (42497 for `{x, y}`; RM-473). Found 2026-11-12 (RM-475).
+      **Decided (Joe, 2026-11-13): model the counter.** Keep mongod's
+      process-wide snapshot id, advanced by every WiredTiger snapshot this
+      server opens since start, and write each spilled member's own
+      snapshot's id where `sorter::SNAPSHOT_ID` writes 0. It cannot equal
+      a given mongod's, whose background threads advance it too, so the
+      gap test asserts what the mechanism gives: members spilled after more
+      snapshots carry larger, non-zero ids, and `spilledDataStorageSize`
+      falls within mongod's own run-to-run spread of its answer.
       Verify: none -- mongod's own answer varies between runs; no test can pin it
       Backlog-ID: RM-556
 - [ ] **A sort under `returnKey` is a `simple` sort, and a limited one
