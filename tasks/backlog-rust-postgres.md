@@ -1608,13 +1608,17 @@ a regression test.
       2026-11-13 so is a left-deep join of three to eight tables' scans by
       `<`, `<=`, `>`, `>=` or `<>` over tables with no index
       (`standard_join_search`'s levels and bushy pairs, each relation's
-      path list). Still zeros (PostgreSQL 15.19 on a private cluster,
-      `e` and `k` 1,000 analysed rows, `k.a` the primary key):
-      - a join of three tables whose third is indexed (`e join e e2 on
-        e.a < e2.a join k on e2.a < k.a`: a Memoize keyed by `e2.a` over
-        the parameterized Index Scan);
-      - a LEFT join's ON conjunct over its preserved side that is a regex
-        match (`e.b ~ 'v1'`, whose selectivity is RP-423's).
+      path list), and since 2026-11-13 one where a table with an index and
+      no filter of its own is linked to one other table, its index scan
+      parameterized by that table's rows the inner (`e join e e2 on e.a <
+      e2.a join k on e2.a < k.a`: a Memoize keyed by `e2.a` over the
+      Index Scan). Still zeros (PostgreSQL 15.19 on a private cluster,
+      `e` 1,000 analysed rows): a LEFT join's ON conjunct over its
+      preserved side that is a regex match (`e.b ~ 'v1'`, whose
+      selectivity is RP-423's). An indexed table linked to two or more
+      tables (paths parameterized by each, and joins parameterized by the
+      rest) is zeros too; PostgreSQL orders each such join measured so
+      far otherwise, which is RP-919.
       Since 2026-11-13 an IN list of constants there is priced (its
       operator over half the list, or from nine constants PostgreSQL's
       hashed list: one hash and one comparison a row, the table's build at
@@ -1629,7 +1633,28 @@ a regression test.
       call's `procost` its startup, under the Memoize PostgreSQL keys by
       the call.
       Backlog-ID: RP-354
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[nested loop of three relations into an index], tests/backlog/test_rp_explain_costs.py::test_plan[a left join's on conjunct over the preserved side is a regex match]
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a left join's on conjunct over the preserved side is a regex match]
+- [ ] **An index over a weakly correlated column is mispriced as a nested
+      loop's inner, and read for a range PostgreSQL scans the heap for.**
+      `k2 (x int, y int)` holds `g % 100` in `y` for 1,000 rows, indexed
+      and analysed (both servers report the same `pg_stats` correlation,
+      `relpages` and `reltuples`). PostgreSQL 15.19 prices `explain select
+      * from e join k2 on e.a < k2.y` (`e` 1,000 rows) `cost=0.28..9483.50`;
+      here `0.28..9487.50`, the inner Index Scan the same to two places.
+      Over twenty outer rows (`z join k2 on z.a < k2.y`) the scan itself
+      differs: `cost=0.28..7.90` there, `0.28..8.10` here (the join
+      `225.85` against `229.85`), so `cost_index`'s cost across
+      `loop_count` scans (`index_pages_fetched`, the correlation's share
+      between its best and worst I/O) is the suspect. A range of the
+      column wide enough (`select * from k2 where y > 70`, 290 rows) is
+      PostgreSQL's `Seq Scan on k2 (cost=0.00..17.50 rows=290 width=8)`,
+      `Filter: (y > 70)`; here, once the table is committed, `Index Scan
+      using k2_y_idx`, priced zeros (inside the transaction that made it,
+      PostgreSQL's plan). A narrower one (`y > 90`) matches. One cause
+      for both is not established. Measured on a private 15.19 cluster (found while
+      working RP-354).
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[nested loop into a weakly correlated index], tests/backlog/test_rp_explain_costs.py::test_plan[nested loop of few rows into a weakly correlated index], tests/backlog/test_rp_explain_costs.py::test_a_wide_range_over_a_weakly_correlated_index
+      Backlog-ID: RP-926
 - [ ] **A nested loop's Join Filter keeps the ON's written order.**
       PostgreSQL 15.19 orders a join's qual list cheapest first
       (`order_qual_clauses`, by `cost_qual_eval`, stable among equal
@@ -1823,10 +1848,17 @@ a regression test.
       (actual rows=30 loops=1)`), a LEFT join with a WHERE (unpriced too,
       RP-379), a parameterized inner index scan with its own Filter, a
       Merge Join (its Sorts' `Sort Method`), a hash table past `hash_mem`
-      (several batches) and a join with an inner-unique inner side.
-      Measured on a private 15.19 cluster (found while working RP-386).
+      (several batches), a join with an inner-unique inner side, and the
+      joins below the top one of a chain of three or more tables (`z join
+      z z2 on z.a < z2.a join z z3 on z2.a < z3.a`, `z` twenty rows: only
+      the top Nested Loop prints `actual rows` and `Rows Removed by Join
+      Filter`; PostgreSQL's lower Nested Loop is `(actual rows=190
+      loops=1)`, its Materialize `(actual rows=20 loops=20)`, and a
+      Memoize over an index scan its `Hits: 171  Misses: 19` line).
+      Measured on a private 15.19 cluster (found while working RP-386,
+      the chain while working RP-354).
       Backlog-ID: RP-390
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[analyze of a left nested loop over a char(n) join filter]
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[analyze of a left nested loop over a char(n) join filter], tests/backlog/test_rp_explain_costs.py::test_plan[analyze of a nested loop of three relations], tests/backlog/test_rp_explain_costs.py::test_plan[analyze of a nested loop of three relations into a memoized index]
 - [ ] **An inner join nested in an outer join keeps its one-table ON
       conjuncts in its Join Filter.** Since RP-391 / RP-392 an inner
       join's ON conjunct over one table is that table's scan Filter, but

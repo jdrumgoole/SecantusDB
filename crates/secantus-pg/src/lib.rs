@@ -44103,12 +44103,17 @@ impl PgHandler {
                             if levels.len() == depth {
                                 // Lowest first, so each join above is
                                 // still the tree's when it is reached.
-                                for (i, (plan, a, b, join)) in levels.iter().enumerate() {
+                                for (i, (plan, a, b, join, param)) in levels.iter().enumerate() {
                                     let mut node = &mut tree;
                                     for _ in 0..depth - 1 - i {
                                         node = &mut node.children[0];
                                     }
                                     explain::price_nest_loop(node, plan, *a, *b, *join);
+                                    // The inner read through its index
+                                    // (RP-354).
+                                    if let Some(p) = param {
+                                        explain::param_index_inner(node, p);
+                                    }
                                 }
                             }
                         }

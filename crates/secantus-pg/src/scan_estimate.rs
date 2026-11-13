@@ -786,15 +786,18 @@ impl PgHandler {
     /// A left-deep chain of Nested Loops over three to eight tables'
     /// sequential scans, written `a JOIN b ON .. JOIN c ON ..`, every
     /// clause a `<`, `<=`, `>` or `>=` (`DEFAULT_INEQ_SEL`) or a `<>`
-    /// between two analysed columns (`neqjoinsel`) linking two of them,
-    /// over tables with no index (RP-354). `standard_join_search` as
+    /// between two analysed columns (`neqjoinsel`) linking two of them
+    /// (RP-354). A table with an index has no filter of its own and its
+    /// clauses link it to one other table, whose rows parameterize its
+    /// index scan as an inner (with its Memoize, as the two-table
+    /// estimate prices them). `standard_join_search` as
     /// PostgreSQL runs it: `join_search_one_level` builds each level's
     /// join relations, in order, from each relation of the level below
     /// with each table a clause links it to (a level-two pair once, in
     /// FROM order) and then, from level four, from bushy pairs of two
     /// lower levels' relations a clause links. `make_join_rel` weighs each
     /// pair both ways into the one relation's path list
-    /// ([`joincost::cheapest_nest_loop_of`]); its rows are set once, by the
+    /// ([`joincost::cheapest_nest_loop_of_param`]); its rows are set once, by the
     /// first pair built (`build_join_rel`, `calc_joinrel_size_estimate`).
     /// A relation's width is the columns read above it
     /// (`build_joinrel_tlist`): the query's, and a clause's to a table
@@ -877,7 +880,10 @@ impl PgHandler {
             table: &'n str,
             filter: &'n Document,
             keys: Vec<(&'n str, String)>,
+            /// Each key's SQL column, in `keys`' order.
+            names: Vec<String>,
             read: Vec<String>,
+            indexed: bool,
         }
         let mut leaves: Vec<Leaf> = Vec::new();
         for node in nodes.iter().copied() {
@@ -897,17 +903,23 @@ impl PgHandler {
                 || leaf.offset != 0
                 || !matches!(leaf.distinct, secantus_pgplan::Distinct::None)
                 || leaf.casts.iter().any(Option::is_some)
-                // An index could be a scan's path, or an inner's
-                // parameterized by the rows of the others.
-                || indexes.iter().any(|ix| ix.table.name == leaf.table)
             {
+                return None;
+            }
+            // An indexed table's own filter could be an index scan's path;
+            // without one its index serves only as an inner's
+            // parameterized by the rows of the others, priced below.
+            let indexed = indexes.iter().any(|ix| ix.table.name == leaf.table);
+            if indexed && !leaf.filter.is_empty() {
                 return None;
             }
             let table = self.lookup(&leaf.table)?;
             let mut keys = Vec::new();
+            let mut names = Vec::new();
             for (key, f) in columns {
                 let c = def.columns.iter().find(|c| c.field() == *f)?;
                 keys.push((key.as_str(), table.field_of(&c.name)?));
+                names.push(c.name.clone());
             }
             let read = keys
                 .iter()
@@ -919,7 +931,9 @@ impl PgHandler {
                 table: leaf.table.as_str(),
                 filter: &leaf.filter,
                 keys,
+                names,
                 read,
+                indexed,
             });
         }
         // Each clause: its cost a row, the tables it links (a bit each,
@@ -929,6 +943,7 @@ impl PgHandler {
             set: u32,
             keys: Vec<&'k str>,
             sel: f64,
+            filter: &'k JoinFilter,
         }
         let stats = |k: &str| {
             let leaf = leaves
@@ -971,6 +986,7 @@ impl PgHandler {
                 set,
                 keys: fields.iter().map(|(_, k, _)| k.as_str()).collect(),
                 sel,
+                filter: f,
             });
         }
         // The clauses must link every table: a relation with none to the
@@ -997,6 +1013,81 @@ impl PgHandler {
                 _ => None,
             })
             .collect::<Option<_>>()?;
+        // Each indexed table's scan parameterized by the one table its
+        // clauses link it to (`create_index_paths`' join clauses), as the
+        // two-table estimate prices it: `get_loop_count` is that table's
+        // own rows whichever relation holding it is the loop's outer, and
+        // every clause moves into the scan, so the join checks none. A
+        // table linked to two or more would have paths parameterized by
+        // each and by both, and joins of it parameterized by the rest,
+        // which are not modelled.
+        let side_leaf = |l: &Leaf| SideLeaf {
+            table: l.table.to_string(),
+            keys: l
+                .keys
+                .iter()
+                .zip(&l.names)
+                .map(|((k, f), name)| (k.to_string(), f.clone(), name.clone()))
+                .collect(),
+            read: l.read.clone(),
+        };
+        let mut params: Vec<Option<(u32, secantus_pgplan::joincost::ParamInner, ParamScan)>> =
+            vec![None; n];
+        for (i, l) in leaves.iter().enumerate() {
+            if !l.indexed {
+                continue;
+            }
+            let own: Vec<&Clause> = clauses.iter().filter(|c| c.set & (1 << i) != 0).collect();
+            let other = own.first()?.set & !(1 << i);
+            if own.iter().any(|c| c.set & !(1 << i) != other) {
+                return None;
+            }
+            let movable: Vec<&JoinFilter> = own.iter().map(|c| c.filter).collect();
+            // An operand that is not this table's bare key could match an
+            // index over an expression, or a cast of the key: not priced.
+            let inequalities = || {
+                movable
+                    .iter()
+                    .filter(|f| matches!(f.kind, FilterKind::Inequality))
+            };
+            let opaque_key = inequalities().any(|f| {
+                f.inequality_keys.iter().any(|k| {
+                    !f.bounds.iter().any(|b| b.key == *k) && l.keys.iter().any(|(key, _)| key == k)
+                })
+            });
+            let expression_index = indexes
+                .iter()
+                .any(|ix| ix.table.name == l.table && ix.keys.contains(&0));
+            if opaque_key || (expression_index && inequalities().any(|f| f.bounds.len() < 2)) {
+                return None;
+            }
+            let t = other.trailing_zeros() as usize;
+            let (inner, outer) = (side_leaf(l), side_leaf(&leaves[t]));
+            let param_sel = param_selectivity(self, &inner, &movable, &key_columns)?;
+            let outer_rows = scans[t].2;
+            match self.param_index_inner(
+                &inner,
+                &movable,
+                outer_rows,
+                scans[i].2 * param_sel,
+                scans[i].2,
+            ) {
+                ParamFound::None => {}
+                ParamFound::Unmodelled => return None,
+                ParamFound::Scan(mut p, scan) => {
+                    p.memo = self.memo_key(&outer, &inner, &movable, outer_rows)?;
+                    params[i] = Some((other, p, scan));
+                }
+            }
+        }
+        // `b`'s scan parameterized by a relation of `a`, as `b`'s inner.
+        let param_of = |a: u32, b: u32| {
+            if b.count_ones() != 1 {
+                return None;
+            }
+            let (by, p, _) = params[b.trailing_zeros() as usize].as_ref()?;
+            (a & by != 0).then_some(*p)
+        };
         // The width of the columns of the tables in `set` read above it.
         let width = |set: u32| -> Option<i64> {
             let mut total = 0;
@@ -1085,10 +1176,15 @@ impl PgHandler {
                     .iter()
                     .map(|&(a, b)| (rels[&a].0, rels[&b].0, restrict(a, b).0))
                     .collect();
+                let pair_params: Vec<[Option<secantus_pgplan::joincost::ParamInner>; 2]> = built
+                    .iter()
+                    .map(|&(a, b)| [param_of(a, b), param_of(b, a)])
+                    .collect();
                 let (a, b) = built[0];
                 let rows =
                     costsize::clamp_row_est(rels[&a].0 .2 * rels[&b].0 .2 * restrict(a, b).1);
-                let (pick, plan) = secantus_pgplan::joincost::cheapest_nest_loop_of(&pairs)?;
+                let (pick, plan) =
+                    secantus_pgplan::joincost::cheapest_nest_loop_of_param(&pairs, &pair_params)?;
                 let est = (plan.startup, plan.total, rows, width(set)?);
                 rels.insert(set, (est, Some((plan, built[pick]))));
             }
@@ -1107,7 +1203,24 @@ impl PgHandler {
             } else if pair != (lower, leaf) {
                 return None;
             }
-            out.push((plan, rels[&lower].0, scans[i], *est));
+            let (mut a, mut b) = (rels[&lower].0, scans[i]);
+            // The parameterized inner: its scan's estimate, read through
+            // its index, under its Memoize where that is kept.
+            let mut scan = None;
+            if plan.param {
+                let inner = if plan.b_outer { lower } else { leaf };
+                let (_, p, s) = params[inner.trailing_zeros() as usize].as_ref()?;
+                let est = |e: Estimate| (p.startup, p.total, p.rows, e.3);
+                if plan.b_outer {
+                    a = est(a);
+                } else {
+                    b = est(b);
+                }
+                let mut s = s.clone();
+                s.memoize = plan.memoize;
+                scan = Some(s);
+            }
+            out.push((plan, a, b, *est, scan));
             set = lower;
         }
         out.reverse();
@@ -5309,6 +5422,7 @@ pub(crate) type NestLoopLevel = (
     Estimate,
     Estimate,
     Estimate,
+    Option<ParamScan>,
 );
 
 /// A nested loop's side as [`PgHandler::nest_loop_estimate`] reads it: its
