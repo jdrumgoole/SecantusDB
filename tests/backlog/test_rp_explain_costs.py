@@ -91,6 +91,16 @@ _ANALYSED_COMPOSITE = _ANALYSED + [
     "analyze c2",
 ]
 
+# Those, and a column one B-tree leads with and another holds second
+# (RP-354).
+_ANALYSED_TWO_INDEXES = _ANALYSED + [
+    "create table c4 (x int, y int)",
+    "insert into c4 select g, (g * 37) % 1000 from generate_series(1, 1000) g",
+    "create index c4_xy on c4 (x, y)",
+    "create index c4_y on c4 (y)",
+    "analyze c4",
+]
+
 # Those, a ten-row table analysed and one never analysed (RP-329).
 _ANALYSED_SMALL = _ANALYSED + [
     "create table zs (a int, b text)",
@@ -1962,16 +1972,31 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "        ->  Seq Scan on e e3  (cost=0.00..15.00 rows=1000 width=7)",
         ],
     ),
-    # Still open (RP-354): an inequality on an index's second column is
-    # its Index Cond, the whole index read each loop.
+    # Split from RP-354 and fixed: an inequality on an index's second
+    # column is its Index Cond, the whole index read each loop; before,
+    # the join printed zeros.
     "nested loop into a later column of an index": (
-        "RP-354",
+        "RP-329",
         _ANALYSED_COMPOSITE,
         "explain select * from e, c2 where e.a < c2.y",
         [
             "Nested Loop  (cost=0.28..14490.00 rows=333333 width=15)",
             "  ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
             "  ->  Index Only Scan using c2_xy on c2  (cost=0.28..11.14 rows=333 width=8)",
+            "        Index Cond: (y > e.a)",
+        ],
+    ),
+    # Still open (RP-354): a key one index leads with and another holds
+    # second is two parameterized paths, PostgreSQL keeping the cheaper
+    # (the one leading with it, which bounds its scan).
+    "nested loop into a column two indexes hold": (
+        "RP-354",
+        _ANALYSED_TWO_INDEXES,
+        "explain select * from e, c4 where e.a < c4.y",
+        [
+            "Nested Loop  (cost=0.28..9487.50 rows=333333 width=15)",
+            "  ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
+            "  ->  Index Scan using c4_y on c4  (cost=0.28..6.14 rows=333 width=8)",
             "        Index Cond: (y > e.a)",
         ],
     ),

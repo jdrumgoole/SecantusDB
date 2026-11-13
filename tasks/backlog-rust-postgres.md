@@ -1569,12 +1569,9 @@ a regression test.
       every column the side reads. Every other nested loop still prints
       zeros: an inequality between the inner's
       key and an expression of the outer side (`e.a + 1 < k.a`,
-      PostgreSQL's `Index Cond: (a > (e.a + 1))`), a key on a later
-      index column (`e, c2 where e.a < c2.y` over an index on `(x, y)`:
-      PostgreSQL's `Index Only Scan using c2_xy` with `Index Cond: (y >
-      e.a)`); and a join of three or more relations (found while
-      working RP-329). Since 2026-11-12 a LEFT join's WHERE over its
-      preserved side alone is that side's cheapest path, its scan Filter
+      PostgreSQL's `Index Cond: (a > (e.a + 1))`); and a join of three
+      or more relations (found while working RP-329). Since 2026-11-12 a
+      LEFT join's WHERE over its preserved side alone is that side's cheapest path, its scan Filter
       or, where the index wins, its Index Cond (`k left join e on e.a <>
       k.a where k.a > 990`), and an ON conjunct over the preserved side
       alone is estimated as PostgreSQL keeps it, the join's filter, also
@@ -1618,9 +1615,15 @@ a regression test.
       three where it keeps that order (two Nested Loops, each inner
       Materialized where cheaper); a join of four or more, one with a
       `<>`, a cast or an indexed table, and one PostgreSQL orders
-      otherwise (its own item) are still zeros.
+      otherwise (its own item) are still zeros. Since 2026-11-13 a key on
+      a later index column is its Index Cond, every scan reading the
+      whole index (`e, c2 where e.a < c2.y` over an index on `(x, y)`:
+      `Index Only Scan using c2_xy` with `Index Cond: (y > e.a)`); a key
+      one index leads with and another holds later is still zeros (`e, c4
+      where e.a < c4.y` over indexes on `(x, y)` and `(y)`: PostgreSQL
+      keeps the cheaper path, `Index Scan using c4_y`).
       Backlog-ID: RP-354
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[nested loop into a later column of an index]
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[nested loop into a column two indexes hold]
 - [ ] **A join of three tables by inequalities runs in its written
       order, and a WHERE's join clauses all run at the top join.**
       PostgreSQL's `standard_join_search` picks the order of an inner join

@@ -1035,7 +1035,7 @@ impl PgHandler {
 
     /// `leaf` as the inner side of a nested loop through one of its
     /// table's B-trees, its index qual one of `filters`' inequalities
-    /// between its leading column and an expression of the outer side
+    /// between one of its key columns and an expression of the outer side
     /// (RP-354):
     /// `create_index_paths`' join clauses, `get_loop_count` the outer
     /// side's `outer_rows`. Every other join clause moves into the scan
@@ -1044,8 +1044,8 @@ impl PgHandler {
     /// inner rows times every join clause's selectivity, as
     /// `get_parameterized_baserel_size` multiplies them; `inner_rows` is
     /// the plain scan's. [`ParamFound::Unmodelled`] where an index could serve
-    /// in a way not priced here: a later key column, clauses on two
-    /// columns or a table never analysed.
+    /// in a way not priced here: clauses on two columns, a column two
+    /// indexes hold at different positions or a table never analysed.
     fn param_index_inner(
         &self,
         leaf: &SideLeaf,
@@ -1088,10 +1088,8 @@ impl PgHandler {
                 return ParamFound::Unmodelled;
             };
             for (field, ..) in &clauses {
-                match fields.iter().position(|f| f == field) {
-                    Some(0) => serving.push((*ix, field.clone())),
-                    Some(_) => return ParamFound::Unmodelled,
-                    None => {}
+                if let Some(at) = fields.iter().position(|f| f == field) {
+                    serving.push((*ix, field.clone(), at > 0));
                 }
             }
         }
@@ -1102,15 +1100,24 @@ impl PgHandler {
         // the SQL key and the storage's `_id` index: one relation), its
         // every clause an index qual (`match_join_clauses_to_index`): two
         // bounds (`e.a < k.a and e.a > k.a`) are one `Index Cond` of both.
-        let field = serving[0].1.clone();
-        if serving.iter().any(|(_, f)| *f != field) {
+        // The column may be a later one of the index (`match_clause_to_index`
+        // matches every key column): `e.a < c2.y` over an index on `(x,
+        // y)` is `Index Cond: (y > e.a)`.
+        let (field, later) = (serving[0].1.clone(), serving[0].2);
+        if serving.iter().any(|(_, f, l)| *f != field || *l != later) {
             return ParamFound::Unmodelled;
         }
         let Some(key) = self.analysed_key(&leaf.table, &field) else {
             return ParamFound::Unmodelled;
         };
-        let Some(mut ki) = self.key_index(&leaf.table, &Document::new(), &field, &key, inner_rows)
-        else {
+        let Some(mut ki) = self.key_index_at(
+            &leaf.table,
+            &Document::new(),
+            &field,
+            &key,
+            inner_rows,
+            later,
+        ) else {
             return ParamFound::Unmodelled;
         };
         // An index holding every column the side reads is scanned
@@ -1140,6 +1147,7 @@ impl PgHandler {
         let Some((startup, total)) = costsize::param_range_index_scan(
             &ki.rel,
             &ki.index,
+            &field,
             &rest,
             &bounds,
             arg_ops as f64,
@@ -1149,9 +1157,9 @@ impl PgHandler {
         };
         let Some(name) = serving
             .iter()
-            .map(|(ix, _)| ix.name.clone())
+            .map(|(ix, ..)| ix.name.clone())
             .find(|n| !n.starts_with('_'))
-            .or_else(|| serving.first().map(|(ix, _)| ix.name.clone()))
+            .or_else(|| serving.first().map(|(ix, ..)| ix.name.clone()))
         else {
             return ParamFound::Unmodelled;
         };
@@ -2324,6 +2332,22 @@ impl PgHandler {
         key: &AnalysedKey,
         rows: f64,
     ) -> Option<KeyIndex> {
+        self.key_index_at(table, filter, field, key, rows, false)
+    }
+
+    /// [`Self::key_index`], or with `later` the one plain B-tree holding
+    /// `field` past its first column (RP-354), correlated by its leading
+    /// column as `btcostestimate` is. `None` where another index holds
+    /// `field` at the other position.
+    fn key_index_at(
+        &self,
+        table: &str,
+        filter: &Document,
+        field: &str,
+        key: &AnalysedKey,
+        rows: f64,
+        later: bool,
+    ) -> Option<KeyIndex> {
         let count = self
             .storage
             .count_matching(self.db(), table, &Document::new(), None)
@@ -2335,12 +2359,21 @@ impl PgHandler {
         let correlations = Self::stats_correlations(&pt.def, stats);
         let mut found: Option<costsize::Index> = None;
         for ix in &mut indexes {
-            if quals.iter().any(|(f, _)| ix.columns.contains(f))
-                || ix.columns[1..].iter().any(|c| c == field)
-            {
+            let (leading, past) = (
+                ix.field == field,
+                ix.columns[1..].iter().any(|c| c == field),
+            );
+            // An index holding it at the other position is a path not
+            // priced here.
+            let (here, there) = if later {
+                (past, leading)
+            } else {
+                (leading, past)
+            };
+            if quals.iter().any(|(f, _)| ix.columns.contains(f)) || there {
                 return None;
             }
-            if ix.field != field {
+            if !here {
                 continue;
             }
             if ix.hash || ix.predicate.is_some() || ix.tuples.is_some() {
@@ -2354,7 +2387,7 @@ impl PgHandler {
                 }
                 return None;
             }
-            let c = correlations.get(field).copied().flatten()?;
+            let c = correlations.get(&ix.field).copied().flatten()?;
             ix.correlation = if ix.columns.len() > 1 { c * 0.75 } else { c };
             if !ix.unique {
                 if let Some(Some((pages, height))) = self.dedup_index_size(table, ix) {

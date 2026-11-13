@@ -583,30 +583,55 @@ pub fn param_index_scan(
 /// two bounds (`a > e.a and a < e.a`) select a ninth. `arg_ops` are the
 /// operators of the bounds' outer-side operands (`a > e.a + 1`), each
 /// evaluated once a scan: `genericcostestimate`'s `qual_arg_cost`. Repeated `loop_count` times as
-/// [`param_index_scan`] is. `(startup, total)`.
+/// [`param_index_scan`] is. `column` is the key column bounded: the
+/// leading one, or a later one (`y > e.a` over an index on `(x, y)`),
+/// which `match_clause_to_index` matches too but which bounds nothing
+/// (`btcostestimate`'s `indexBoundQuals` stop at the leading column
+/// without a qual), so every scan reads the whole index and checks each
+/// entry against the quals. `(startup, total)`.
 pub fn param_range_index_scan(
     rel: &Rel,
     index: &Index,
+    column: &str,
     quals: &[(String, Qual)],
     bounds: &[bool],
     arg_ops: f64,
     loop_count: f64,
 ) -> Option<(f64, f64)> {
-    if index.hash || bounds.is_empty() || quals.iter().any(|(f, _)| f == &index.field) {
+    if index.hash
+        || bounds.is_empty()
+        || !index.columns.iter().any(|c| c == column)
+        || quals.iter().any(|(f, _)| index.columns.contains(f))
+    {
         return None;
     }
     let mut quals = quals.to_vec();
     let mut sel = 1.0;
     for lower in bounds {
-        quals.push((index.field.clone(), Qual::Range(*lower)));
+        quals.push((column.to_string(), Qual::Range(*lower)));
         sel *= 1.0 / 3.0;
     }
+    if column == index.field {
+        return index_scan_loops(
+            rel,
+            index,
+            &quals,
+            ColSel::Given(sel),
+            false,
+            loop_count,
+            arg_ops * CPU_OPERATOR_COST,
+        );
+    }
+    let index = Index {
+        later: vec![(column.to_string(), sel)],
+        ..index.clone()
+    };
     index_scan_loops(
         rel,
-        index,
+        &index,
         &quals,
-        ColSel::Given(sel),
-        false,
+        ColSel::Given(1.0),
+        true,
         loop_count,
         arg_ops * CPU_OPERATOR_COST,
     )
@@ -1812,14 +1837,15 @@ mod tests {
             hash: false,
             later: Vec::new(),
         };
-        let (startup, total) = param_range_index_scan(&rel, &ix, &[], &[true], 0.0, 100.0).unwrap();
+        let (startup, total) =
+            param_range_index_scan(&rel, &ix, "a", &[], &[true], 0.0, 100.0).unwrap();
         assert_eq!((startup, total), (0.275, 6.5025));
         // `explain select * from e left join k on e.a < k.a and e.a > k.a`
         // over the same `k` and 1,000 rows of `e`: `Index Cond: ((a >
         // e.a) AND (a < e.a))`, a ninth of the rows a scan, prints
         // `cost=0.28..2.53` on PostgreSQL 15.19 (RP-354).
         let (startup, total) =
-            param_range_index_scan(&rel, &ix, &[], &[true, false], 0.0, 1000.0).unwrap();
+            param_range_index_scan(&rel, &ix, "a", &[], &[true, false], 0.0, 1000.0).unwrap();
         assert_eq!(
             (format!("{startup:.2}"), format!("{total:.2}")),
             ("0.28".to_string(), "2.53".to_string())
@@ -1831,10 +1857,46 @@ mod tests {
         // PostgreSQL 15.19, the loop's 1,000 rescans 2.50 more than `e.a <
         // k.a`'s (RP-354).
         let (startup, total) =
-            param_range_index_scan(&rel, &ix, &[], &[true], 1.0, 1000.0).unwrap();
+            param_range_index_scan(&rel, &ix, "a", &[], &[true], 1.0, 1000.0).unwrap();
         assert_eq!(
             (format!("{startup:.2}"), format!("{total:.2}")),
             ("0.28".to_string(), "6.14".to_string())
         );
+    }
+
+    /// `explain select * from e, c2 where e.a < c2.y` over `c2 (x int, y
+    /// int)` of 1,000 analysed rows (5 heap pages) indexed on `(x, y)`
+    /// (`c2_xy`, 5 pages of height 1, `x`'s correlation 0.1044901): the
+    /// inner `Index Only Scan using c2_xy`, `Index Cond: (y > e.a)` 1,000
+    /// times, bounds nothing -- no qual on `x` -- so each scan reads every
+    /// index entry, and prints `cost=0.28..11.14 rows=333` on PostgreSQL
+    /// 15.19 (RP-354).
+    #[test]
+    fn a_parameterized_scan_on_a_later_index_column_reads_the_whole_index() {
+        let rel = Rel {
+            pages: 5.0,
+            tuples: 1000.0,
+        };
+        let ix = Index {
+            field: "x".into(),
+            unique: false,
+            pages: 5.0,
+            height: 1,
+            columns: vec!["x".into(), "y".into()],
+            correlation: 0.1044901 * 0.75,
+            visible: 0.0,
+            tuples: None,
+            predicate: None,
+            hash: false,
+            later: Vec::new(),
+        };
+        let (startup, total) =
+            param_range_index_scan(&rel, &ix, "y", &[], &[true], 0.0, 1000.0).unwrap();
+        assert_eq!(
+            (format!("{startup:.2}"), format!("{total:.2}")),
+            ("0.28".to_string(), "11.14".to_string())
+        );
+        // A column the index does not hold is no index qual.
+        assert!(param_range_index_scan(&rel, &ix, "z", &[], &[true], 0.0, 1000.0).is_none());
     }
 }
