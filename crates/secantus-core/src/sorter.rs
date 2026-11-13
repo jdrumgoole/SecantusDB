@@ -71,8 +71,9 @@ pub enum SortSource {
     /// down behind): rows of SBE values, the key's and the fields kept.
     Sbe,
     /// The query layer's `SORT` of index keys (`type: "default"`, below
-    /// the FETCH): working-set members, each held as [`member_doc`] and
-    /// sized by its caller ([`sort_index_keys`]).
+    /// the FETCH), or over a covered projection: working-set members, each
+    /// held as [`member_doc`] and sized by its caller ([`sort_index_keys`],
+    /// [`sort_owned_objs`]).
     Member,
 }
 
@@ -307,7 +308,7 @@ fn read_record(
         SortSource::Stored | SortSource::Modified | SortSource::Unwound => {
             (spill_file::read_document(at)?, 0)
         }
-        SortSource::Member => (member_doc(spill_file::read_index_key_member(at)?), 0),
+        SortSource::Member => (member_doc(spill_file::read_member(at)?), 0),
     };
     Ok((keys, d, pos))
 }
@@ -945,6 +946,66 @@ pub fn sort_index_keys(
         .map_err(|e| Fallback::mongo(1, format!("the sort could not {}: {}", e.what, e.detail)))?;
         items.push((m.sort_key, member_doc(bytes)));
     }
+    sort_members(items, &sizes, descending, budget, limit)
+}
+
+/// A document `PROJECTION_COVERED` made of an index scan's member, as the
+/// `SORT` above it holds it: an `OWNED_OBJ` working-set member, its keys
+/// and RecordId dropped (`ProjectionStageCovered::transform`).
+pub struct OwnedObjMember {
+    pub sort_key: Vec<Bson>,
+    /// The document, its fields in the index's order (see
+    /// [`crate::projection::covered_document`]).
+    pub doc: Document,
+}
+
+/// The snapshot id of a document a stage built rather than read
+/// (`WorkingSetMember::resetDocument` with a default `SnapshotId`).
+const NO_SNAPSHOT: u64 = 0;
+
+/// What one [`OwnedObjMember`] counts beside its sort key
+/// (`WorkingSetMember::getMemUsage`): its document's
+/// `Document::getApproximateSize` and nothing else, having no RecordId and
+/// no index key. mongod 8.2.11 counts 132 for an int sort key over
+/// `{x: <int>}` (RM-473).
+pub fn owned_obj_size(doc: &Document) -> usize {
+    memlimit::bson_len(doc) + memlimit::DOCUMENT_OVERHEAD
+}
+
+/// mongod 8.2's `SORT` over a covered projection (`SORT <-
+/// PROJECTION_COVERED <- IXSCAN`, `type: "default"`), run for what it
+/// counts: each member its sort key and [`owned_obj_size`], held to
+/// `budget` and spilled, past it with disk use, as
+/// `WorkingSetMember::serialize` writes an `OWNED_OBJ` member. As
+/// [`sort_index_keys`], the caller orders the members itself.
+pub fn sort_owned_objs(
+    members: Vec<OwnedObjMember>,
+    descending: &[bool],
+    budget: usize,
+    limit: Option<usize>,
+) -> R<()> {
+    let mut sizes = Vec::with_capacity(members.len());
+    let mut items = Vec::with_capacity(members.len());
+    for m in members {
+        sizes.push(owned_obj_size(&m.doc));
+        let mut bytes = Vec::new();
+        spill_file::write_owned_obj_member(&m.doc, NO_SNAPSHOT, &mut bytes).map_err(|e| {
+            Fallback::mongo(1, format!("the sort could not {}: {}", e.what, e.detail))
+        })?;
+        items.push((m.sort_key, member_doc(bytes)));
+    }
+    sort_members(items, &sizes, descending, budget, limit)
+}
+
+/// Run working-set members, each held as [`member_doc`] and counting its
+/// size in `sizes` beside its key, through a query-layer sorter.
+fn sort_members(
+    items: Vec<(Vec<Bson>, Document)>,
+    sizes: &[usize],
+    descending: &[bool],
+    budget: usize,
+    limit: Option<usize>,
+) -> R<()> {
     let cmp = |a: &[Bson], b: &[Bson]| {
         for (i, (x, y)) in a.iter().zip(b).enumerate() {
             let c = crate::order::cmp(x, y);
@@ -964,7 +1025,7 @@ pub fn sort_index_keys(
         fields: None,
         budget,
         added: None,
-        sizes: Some(&sizes),
+        sizes: Some(sizes),
     };
     sort_items(items, &cmp, &sizing, limit)?;
     Ok(())
@@ -1260,6 +1321,89 @@ mod tests {
         assert_eq!(counted(12, 331, Some(3)), Ok(195));
         assert_eq!(counted(12, 330, Some(3)), Err(Some(292)));
         assert_eq!(counted(12, 1, Some(1)), Ok(0));
+    }
+
+    /// `n` documents `{_id: i, x: i, y: i % 3}` as a scan of `{y: 1, x: 1}`
+    /// returns them, projected by `PROJECTION_COVERED` under `spec`, each
+    /// keyed by `sort` (fields of the key, ascending).
+    fn covered(n: i32, spec: &Document, sort: &[&str]) -> Vec<OwnedObjMember> {
+        let pattern = doc! { "y": 1, "x": 1 };
+        (0..3)
+            .flat_map(|y| (0..n).filter(move |x| x % 3 == y).map(move |x| (y, x)))
+            .map(|(y, x)| {
+                let key = doc! { "y": y, "x": x };
+                OwnedObjMember {
+                    sort_key: sort.iter().map(|f| key.get(*f).unwrap().clone()).collect(),
+                    doc: crate::projection::covered_document(
+                        &pattern,
+                        &[Bson::Int32(y), Bson::Int32(x)],
+                        spec,
+                    ),
+                }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_sort_over_a_covered_projection_counts_its_documents() {
+        // mongod 8.2.11, `find({y: {$gte: 0}}, <spec>).sort(<sort>)` over
+        // `{y: 1, x: 1}` and twelve documents (`SORT <- PROJECTION_COVERED
+        // <- IXSCAN`): each member its sort key and its document's
+        // `getApproximateSize` -- 16 + 104 + 12 for `{x}` (RM-473).
+        let counted = |spec: Document, sort: &[&str], descending: &[bool]| {
+            let (ran, report) = memlimit::captured(|| {
+                sort_owned_objs(covered(12, &spec, sort), descending, 1 << 20, None)
+            });
+            ran.unwrap();
+            report.sort_total_data_size
+        };
+        assert_eq!(counted(doc! {"_id": 0, "x": 1}, &["x"], &[false]), 1584);
+        assert_eq!(
+            counted(doc! {"_id": 0, "x": 1, "y": 1}, &["x"], &[false]),
+            1668
+        );
+        assert_eq!(
+            counted(doc! {"_id": 0, "x": 1, "y": 1}, &["x", "y"], &[false, true]),
+            2532
+        );
+    }
+
+    #[test]
+    fn a_sort_over_a_covered_projection_past_its_budget_spills_its_documents() {
+        // mongod 8.2.11, the same sort over 2000 documents with
+        // `allowDiskUse` under a 100000-byte budget: each member spilled as
+        // an OWNED_OBJ working-set member, 27 bytes with its key for `{x}`,
+        // 34 for `{x, y}` (RM-473). What the runs compress to is this
+        // server's: mongod's members carry the snapshot ids it draws from a
+        // process-wide counter (36220 and 42497 there, RM-556).
+        let spilled = |spec: Document| {
+            let _on = memlimit::allow_disk_use(true);
+            let (ran, report) = memlimit::captured(|| {
+                sort_owned_objs(covered(2000, &spec, &["x"]), &[false], 100_000, None)
+            });
+            ran.unwrap();
+            (
+                report.sort_total_data_size,
+                report.sort_spills,
+                report.sort_spilled_records,
+                report.sort_spilled_bytes,
+                report.sort_spilled_data_storage_size,
+            )
+        };
+        assert_eq!(
+            spilled(doc! {"_id": 0, "x": 1}),
+            (264_000, 5, 4000, 108_000, 34_936)
+        );
+        let (total, spills, records, bytes, _) = spilled(doc! {"_id": 0, "x": 1, "y": 1});
+        assert_eq!((total, spills, records, bytes), (278_000, 6, 4000, 136_000));
+    }
+
+    #[test]
+    fn an_owned_obj_member_reads_back_as_it_was_written() {
+        let mut out = Vec::new();
+        spill_file::write_owned_obj_member(&doc! {"x": 7, "s": "ab"}, 0, &mut out).unwrap();
+        let mut at = spill_file::Cursor::new(&out);
+        assert_eq!(spill_file::read_member(&mut at).unwrap(), out);
     }
 
     #[test]

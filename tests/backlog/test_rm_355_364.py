@@ -1047,41 +1047,66 @@ def _two_indexes(db: Any) -> None:
 
 
 _UNCOUNTED = {
-    "find": (_two_indexes, lambda d: list(d.c.find({"x": {"$gt": 1}, "y": 1}))),
-    "aggregate": (seed, lambda d: list(d.c.aggregate([{"$match": {"x": {"$gte": 4}}}]))),
+    "find": ("find", _two_indexes, lambda d: list(d.c.find({"x": {"$gt": 1}, "y": 1}))),
+    "aggregate with a $map": (
+        "aggregate",
+        seed,
+        lambda d: list(
+            d.c.aggregate([{"$addFields": {"m": {"$map": {"input": [1, 2], "in": "$$this"}}}}])
+        ),
+    ),
+    "aggregate sorting its groups": (
+        "aggregate",
+        seed,
+        lambda d: list(d.c.aggregate([{"$group": {"_id": "$y"}}, {"$sort": {"_id": 1}}])),
+    ),
     "insert": (
+        "insert",
         seed,
         lambda d: d.c.insert_many([{"_id": 1}, {"_id": 100}], ordered=False),
     ),
-    "findAndModify": (seed, lambda d: d.c.find_one_and_update({"_id": 1}, {"$set": {"q": 1}})),
-    "createIndexes": (seed, lambda d: d.c.create_index("z")),
+    "findAndModify": (
+        "findAndModify",
+        seed,
+        lambda d: d.c.find_one_and_update({"_id": 1}, {"$set": {"q": 1}}),
+    ),
+    # Over a collection with no index of its own to build, so that the
+    # setup's build cannot log a `createIndexes` line of its own.
+    "createIndexes": (
+        "createIndexes",
+        lambda d: d.c.insert_many([{"_id": n, "x": n} for n in range(12)]),
+        lambda d: d.c.create_index("z"),
+    ),
 }
 
 
 @pytest.mark.backlog("RM-360")
 def test_every_line_counts_its_interrupt_checks(rust_mongo: Any, mongod_rs: Any) -> None:
     """mongod 8.2.11's line for every command carries `numInterruptChecks`
-    (measured 2026-11-09, time-based yields off: a `find` with two
-    candidate plans 8, an `aggregate` 5, an unordered `insert` of two
-    documents, one a duplicate key, 27, a retryable `findAndModify` 26, a
-    `createIndexes` 73). This server counts its reads with one candidate
-    plan and its `insert`, `update` and `delete`, and prints none here:
-    mongod's planner checks once per index scan of every plan it
-    enumerates, its pipeline stages every 128th document, a failed batch
-    of inserts is inserted again a document at a time under locks of its
-    own, a `findAndModify` takes rounds this server does not (RM-357), and
-    DDL checks at points this server does not check yet."""
-    for name, (setup, op) in _UNCOUNTED.items():
+    (measured 2026-11-09 and 2026-11-12, time-based yields off: a `find`
+    with two candidate plans 8, an `aggregate` with a `$map` 5 and one
+    sorting its groups 5, an unordered `insert` of two documents, one a
+    duplicate key, 27, a retryable `findAndModify` 26, a `createIndexes`
+    of twelve documents 73). This server counts its reads with one candidate plan, its
+    `insert`, `update` and `delete`, and the aggregates it models, and
+    prints none here: mongod's planner checks once per index scan of every
+    plan it enumerates, its `$map` makes no tick of the pipeline's
+    interrupt checker where this server's makes one per element, its
+    slot-based engine leaves a `$sort` after a `$group` to the pipeline, a
+    failed batch of inserts is inserted again a document at a time under
+    locks of its own, a `findAndModify` takes rounds this server does not
+    (RM-357), and DDL checks at points this server does not check yet."""
+    for label, (name, setup, op) in _UNCOUNTED.items():
         answers = {}
         for server, client, is_mongod in (
             ("rust", rust_mongo, False),
             ("mongod", mongod_rs, True),
         ):
             with no_timed_yields(client):
-                lines, _ = logged(client, is_mongod, setup, op)
+                lines, _ = logged(client, is_mongod, setup, op, keep=frozenset({name}))
             answers[server] = _line(lines, name).get("numInterruptChecks")
-        assert answers["mongod"] is not None, name
-        assert answers["rust"] == answers["mongod"], name
+        assert answers["mongod"] is not None, label
+        assert answers["rust"] == answers["mongod"], label
 
 
 # ------------------------------------------------------------- RM-361 --

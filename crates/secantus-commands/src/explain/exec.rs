@@ -1201,6 +1201,42 @@ pub(crate) fn sort_stats(
         return;
     }
     let top = limit.and_then(|n| usize::try_from(n).ok());
+    if let (
+        Some(members),
+        Node::Projection {
+            name: "PROJECTION_COVERED",
+            spec,
+            ..
+        },
+    ) = (&keys, input)
+    {
+        // A covered projection below the sort: it sorts the documents the
+        // projection built of the keys, OWNED_OBJ members (RM-473).
+        let members: Vec<_> = members
+            .iter()
+            .map(|m| secantus_core::sorter::OwnedObjMember {
+                sort_key: m.sort_key.clone(),
+                doc: secantus_core::projection::covered_document(
+                    &m.key_pattern,
+                    &m.index_key,
+                    spec,
+                ),
+            })
+            .collect();
+        let (ran, report) = secantus_core::memlimit::captured(|| {
+            let _disk = secantus_core::memlimit::allow_disk_use(true);
+            secantus_core::sorter::sort_owned_objs(
+                members,
+                &descending(pattern),
+                secantus_core::memlimit::budgets().sort,
+                top.filter(|&k| k > 0),
+            )
+        });
+        if ran.is_ok() {
+            sort_extra(extra, &report);
+        }
+        return;
+    }
     if let Some(members) = keys {
         // In the order they came, each index's id its place among those
         // registered, as execution's sort takes them (RM-475).
@@ -1224,10 +1260,7 @@ pub(crate) fn sort_stats(
                 }
             })
             .collect();
-        let descending: Vec<bool> = pattern
-            .values()
-            .map(|dir| crate::util::as_i64(dir).unwrap_or(1) < 0)
-            .collect();
+        let descending = descending(pattern);
         let budget = secantus_core::memlimit::budgets().sort;
         let (ran, report) = secantus_core::memlimit::captured(|| {
             let _disk = secantus_core::memlimit::allow_disk_use(true);
@@ -1271,6 +1304,14 @@ pub(crate) fn sort_stats(
         return;
     }
     sort_extra(extra, &report);
+}
+
+/// Each sort field's direction: descending or not.
+fn descending(pattern: &Document) -> Vec<bool> {
+    pattern
+        .values()
+        .map(|dir| crate::util::as_i64(dir).unwrap_or(1) < 0)
+        .collect()
 }
 
 /// A `SORT`'s memory and spill counters from what its sorter reported.

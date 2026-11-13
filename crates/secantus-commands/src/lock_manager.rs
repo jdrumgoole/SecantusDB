@@ -1583,6 +1583,21 @@ pub fn global_reads(n: usize) {
     }
 }
 
+/// One global IS from the running statement's lock manager, taken and let
+/// go: what mongod's aggregation cursor stage takes for each buffer it
+/// fills (`DocumentSourceCursor::loadBatch`, RM-360). Refused -- killed,
+/// out of time, or no ticket -- the read fails as mongod's does.
+pub fn global_read() -> Result<(), crate::CommandError> {
+    let Some(lm) = CURRENT.with(|c| c.borrow().clone()) else {
+        return Ok(());
+    };
+    let owner = lm.statement_owner();
+    lm.acquire(owner, &Resource::Global, Mode::Is)
+        .map_err(|e| take_ticket_error().unwrap_or_else(|| e.into()))?;
+    lm.release(owner);
+    Ok(())
+}
+
 /// The running statement's lock manager, if one is wired.
 pub fn current() -> Option<std::sync::Arc<LockManager>> {
     CURRENT.with(|c| c.borrow().clone())
@@ -1773,6 +1788,20 @@ impl Guard {
             move || lm.count_retake(&chain),
         )))
     }
+}
+
+/// The yields of a statement that takes no lock of its own and reads under
+/// the global IS it takes for each read ([`global_read`]): a `getMore` of
+/// mongod's pipeline cursor, whose plan yields that lock and takes it again
+/// (RM-360).
+pub fn read_yields(
+    lm: Option<&std::sync::Arc<LockManager>>,
+) -> Option<secantus_core::deadline::YieldGuard> {
+    let lm = lm?.clone();
+    let chain = vec![(Resource::Global, Mode::Is)];
+    Some(secantus_core::deadline::yield_with(std::rc::Rc::new(
+        move || lm.count_retake(&chain),
+    )))
 }
 
 impl LockManager {

@@ -42,7 +42,7 @@ pub(crate) fn begin_operation() {
 /// the outermost call into the planner (RM-360): one per index scan the
 /// access planner builds (`QueryPlannerAccess::makeLeafNode`) and one when
 /// it is done (`PrepareExecutionHelper::prepare`), or the express
-/// executor's one; none for a `RECORD_STORE_FAST_COUNT`, a `DISTINCT_SCAN`
+/// executor's one; none for a walk of a whole index (`IxScan::whole`); none for a `RECORD_STORE_FAST_COUNT`, a `DISTINCT_SCAN`
 /// without a query, or an IDHACK, which mongod builds without its planner
 /// (an upsert's or a `count`'s `_id` lookup; measured 8.2.11, 2026-11-08
 /// and 2026-11-09). A write's are its write plan's ([`write`]). A failed check trips the
@@ -56,7 +56,8 @@ fn planning_checks(node: &Node, distinct_without_query: bool) {
     fn leaves(node: &Node) -> Option<usize> {
         match node {
             Node::CollScan { .. } => Some(0),
-            Node::IxScan(_) | Node::CountScan(_) => Some(1),
+            // A walk of the whole index is built without a check.
+            Node::IxScan(scan) | Node::CountScan(scan) => Some(usize::from(!scan.whole)),
             Node::Fetch { input, .. }
             | Node::Sort { input, .. }
             | Node::Skip(_, input)
@@ -841,6 +842,7 @@ fn scan_of(u: &IndexUse, parts: &[Document], backward: bool) -> IxScan {
         backward,
         filter: assemble(u.on_key.iter().map(|i| parts[*i].clone()).collect()),
         no_bounds: false,
+        whole: !u.leads,
     }
 }
 
@@ -1357,6 +1359,7 @@ fn sort_walks(
             Some(Access {
                 scan: Node::IxScan(IxScan {
                     backward,
+                    whole: true,
                     ..IxScan::full(ix.clone())
                 }),
                 fetch_filter: filter.clone(),

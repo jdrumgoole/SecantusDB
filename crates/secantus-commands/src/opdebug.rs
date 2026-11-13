@@ -594,6 +594,49 @@ pub(crate) fn collection_type(ctx: &CommandContext, db: &str, coll: &str) -> &'s
     }
 }
 
+/// The kind a line names a namespace by for its name alone, whatever is
+/// behind it and whatever the operation did (measured 8.2.11, RM-478): a
+/// `system.` collection is `system` in any database (`admin.system.version`
+/// included), and any other namespace on an internal database is named for
+/// it -- `admin`, `local`, `config` (`admin.$cmd`, a missing `admin.c`, a
+/// failed `find` of one, an `insert` into one). A view or time-series
+/// collection on one is still named as such by a read of it that succeeds.
+pub(crate) fn namespace_kind(db: &str, coll: &str) -> Option<&'static str> {
+    if coll.starts_with("system.") {
+        return Some("system");
+    }
+    match db {
+        "admin" => Some("admin"),
+        "local" => Some("local"),
+        "config" => Some("config"),
+        _ => None,
+    }
+}
+
+/// The kind a line names `db.coll` by: `system` for a `system.`
+/// collection; then, when the operation `looked_up` what is behind the
+/// name, its [`collection_type`] if that is a `view` or `timeseries` (an
+/// `admin.v` view read is `view`); then [`namespace_kind`]; else `normal`.
+/// Measured 8.2.11, RM-478.
+pub(crate) fn line_collection_type(
+    ctx: &CommandContext,
+    db: &str,
+    coll: &str,
+    looked_up: bool,
+) -> &'static str {
+    let by_name = namespace_kind(db, coll);
+    if by_name == Some("system") {
+        return "system";
+    }
+    if looked_up {
+        let kind = collection_type(ctx, db, coll);
+        if kind != "normal" {
+            return kind;
+        }
+    }
+    by_name.unwrap_or("normal")
+}
+
 /// [`collection_type`], asked of `storage`.
 pub(crate) fn collection_type_in(
     storage: &dyn crate::storage::Storage,
@@ -682,6 +725,21 @@ mod tests {
                 "timeWaitingMicros": { "cacheMicros": 5_i64, "storageExecutionMicros": 13_i64 },
             })
         );
+    }
+
+    #[test]
+    fn a_namespace_on_an_internal_database_or_a_system_one_is_named_for_it() {
+        assert_eq!(namespace_kind("admin", "$cmd"), Some("admin"));
+        assert_eq!(namespace_kind("admin", "c"), Some("admin"));
+        assert_eq!(namespace_kind("local", "oplog.rs"), Some("local"));
+        assert_eq!(namespace_kind("config", "c"), Some("config"));
+        assert_eq!(namespace_kind("admin", "system.version"), Some("system"));
+        assert_eq!(namespace_kind("config", "system.sessions"), Some("system"));
+        assert_eq!(namespace_kind("d", "system.js"), Some("system"));
+        assert_eq!(namespace_kind("d", "system"), None);
+        assert_eq!(namespace_kind("d", "x.system.y"), None);
+        assert_eq!(namespace_kind("d", "$cmd"), None);
+        assert_eq!(namespace_kind("Admin", "c"), None);
     }
 
     #[test]

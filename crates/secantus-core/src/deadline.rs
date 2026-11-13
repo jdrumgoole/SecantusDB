@@ -89,9 +89,14 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
     /// Calls to [`check_expression`] until it next checks.
     static EXPRESSION_TICK: Cell<u32> = const { Cell::new(EXPRESSION_CHECK_PERIOD) };
+    /// Whether [`check_expression`] ticked since [`take_expression_ticked`].
+    static EXPRESSION_TICKED: Cell<bool> = const { Cell::new(false) };
     /// Whether a check of the running operation was made somewhere mongod
     /// makes none, or one mongod makes is not made here (see [`unmatched`]).
     static UNMATCHED: Cell<bool> = const { Cell::new(false) };
+    /// Whether the running operation's pipeline counted its checks as
+    /// mongod's does (see [`pipeline_counted`]).
+    static PIPELINE_COUNTED: Cell<bool> = const { Cell::new(false) };
 }
 
 /// What a statement does at a yield besides its check (see [`yield_with`]).
@@ -125,6 +130,7 @@ pub fn begin_operation() {
     INTERRUPT_TICKS.with(|t| t.set(0));
     EXPRESSION_TICK.with(|t| t.set(EXPRESSION_CHECK_PERIOD));
     UNMATCHED.with(|u| u.set(false));
+    PIPELINE_COUNTED.with(|u| u.set(false));
 }
 
 /// mongod's `OperationContext::checkForInterruptNoAssert`: counts one
@@ -177,6 +183,63 @@ pub fn unmatched() {
 pub fn is_unmatched() -> bool {
     UNMATCHED.with(Cell::get)
 }
+
+/// The running operation read an aggregation pipeline whose checks are
+/// made where mongod's are: one its query layer runs whole, or one whose
+/// stages after its `$cursor` stage are each counted (RM-360). An
+/// `aggregate`, or a `getMore` of its cursor, prints its count only then.
+pub fn pipeline_counted() {
+    PIPELINE_COUNTED.with(|u| u.set(true));
+}
+
+/// Whether [`pipeline_counted`] was called since the operation began.
+pub fn is_pipeline_counted() -> bool {
+    PIPELINE_COUNTED.with(Cell::get)
+}
+
+/// mongod's `exec::agg::Stage::getNext`, `n` times over: each call ticks
+/// the pipeline's `ExpressionContext` interrupt checker, which checks the
+/// operation every 128th tick (`InterruptChecker`, 8.2). It is the checker
+/// [`check_expression`] ticks too, as a pipeline's `$map` ticks its
+/// stages' (RM-360).
+pub fn tick_stages(n: u64) -> Result<(), MaxTimeMsExpired> {
+    let mut left = n;
+    while left > 0 {
+        let tick = EXPRESSION_TICK.with(Cell::get) as u64;
+        if left < tick {
+            EXPRESSION_TICK.with(|t| t.set((tick - left) as u32));
+            return Ok(());
+        }
+        left -= tick;
+        EXPRESSION_TICK.with(|t| t.set(EXPRESSION_CHECK_PERIOD));
+        check_for_interrupt()?;
+    }
+    Ok(())
+}
+
+/// The pipeline interrupt checker's ticks to its next check, which a cursor
+/// keeps between its batches, as mongod's `ExpressionContext` lives with
+/// the cursor's pipeline (see [`resume_ticks`]).
+pub fn ticks_to_check() -> u32 {
+    EXPRESSION_TICK.with(Cell::get)
+}
+
+/// Resume a cursor's pipeline interrupt checker where its last batch left
+/// it ([`ticks_to_check`]).
+pub fn resume_ticks(ticks: u32) {
+    EXPRESSION_TICK.with(|t| t.set(ticks.clamp(1, EXPRESSION_CHECK_PERIOD)));
+}
+
+/// Whether an expression ticked the interrupt checker ([`check_expression`])
+/// since the last call, which resets it: mongod 8.2.11 evaluates `$map`,
+/// `$filter` and `$reduce` without a tick, so a pipeline count that took one
+/// is not mongod's (RM-360).
+pub fn take_expression_ticked() -> bool {
+    EXPRESSION_TICKED.with(|t| t.replace(false))
+}
+
+/// A fresh pipeline's interrupt checker: its first check is 128 ticks away.
+pub const FRESH_TICKS: u32 = EXPRESSION_CHECK_PERIOD;
 
 /// Restores the previous yield behaviour when dropped.
 #[must_use = "the statement stops yielding when this guard drops"]
@@ -251,6 +314,7 @@ pub fn check_expression() -> Result<(), MaxTimeMsExpired> {
     if OPAQUE.with(Cell::get) > 0 {
         return Ok(());
     }
+    EXPRESSION_TICKED.with(|t| t.set(true));
     let due = EXPRESSION_TICK.with(|t| {
         let n = t.get() - 1;
         if n == 0 {
@@ -647,5 +711,46 @@ mod tests {
         assert_eq!(check_now(), Ok(()));
         flag.store(true, std::sync::atomic::Ordering::Release);
         assert_eq!(check_now(), Err(MaxTimeMsExpired));
+    }
+
+    /// A pipeline's stage calls check the operation every 128th call, on
+    /// the checker an expression ticks too, and a cursor takes the
+    /// checker's place with it from batch to batch (RM-360).
+    #[test]
+    fn stage_calls_check_every_128th_and_carry_over() {
+        begin_operation();
+        tick_stages(127).unwrap();
+        assert_eq!(interrupt_checks(), 0);
+        tick_stages(1).unwrap();
+        assert_eq!(interrupt_checks(), 1);
+        tick_stages(2 * 128 + 5).unwrap();
+        assert_eq!(interrupt_checks(), 3);
+        let kept = ticks_to_check();
+        assert_eq!(kept, 128 - 5);
+        // The next batch is another operation: its checker resumes.
+        begin_operation();
+        assert_eq!(ticks_to_check(), FRESH_TICKS);
+        resume_ticks(kept);
+        tick_stages(u64::from(kept) - 1).unwrap();
+        assert_eq!(interrupt_checks(), 0);
+        check_expression().unwrap();
+        assert_eq!(
+            interrupt_checks(),
+            1,
+            "an expression ticks the same checker"
+        );
+        assert!(take_expression_ticked());
+        assert!(!take_expression_ticked(), "taking it resets it");
+    }
+
+    /// The flag a counted pipeline sets lasts for its operation only.
+    #[test]
+    fn a_counted_pipeline_is_the_operations_alone() {
+        begin_operation();
+        assert!(!is_pipeline_counted());
+        pipeline_counted();
+        assert!(is_pipeline_counted());
+        begin_operation();
+        assert!(!is_pipeline_counted());
     }
 }

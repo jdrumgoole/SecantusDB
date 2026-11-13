@@ -2655,7 +2655,7 @@ pub fn create_indexes(doc: &Document, ctx: &mut CommandContext) -> HandlerResult
             "type": "none",
             "isFromUserConnection": false,
             "ns": format!("{}.{coll}", ctx.db_name),
-            "collectionType": crate::opdebug::collection_type(ctx, &ctx.db_name, &coll),
+            "collectionType": crate::opdebug::line_collection_type(ctx, &ctx.db_name, &coll, true),
             "command": doc.clone(),
             "numYields": 0_i64,
         };

@@ -234,6 +234,14 @@ fn refused_unprofiled(name: &str, reply: &Document) -> bool {
         // index count, and is profiled as a collection's (RM-384).
         return name == "drop" && !reply.contains_key("nIndexesWas") && !reply.contains_key("ns");
     }
+    // A `renameCollection` that failed -- a source that does not exist, a
+    // target that does, a rename to itself, a bad target name -- has the
+    // command's own `admin.$cmd` for its namespace, as its log line does
+    // (RM-378), and `admin` profiles no command: mongod 8.2.1 profiles it
+    // nowhere (RM-479).
+    if name == "renameCollection" {
+        return true;
+    }
     let code = reply.get_i32("code").unwrap_or(0);
     let msg = reply.get_str("errmsg").unwrap_or("");
     msg.starts_with("BSON field '")
@@ -1500,6 +1508,21 @@ mod tests {
             None
         );
         assert_eq!(target("ping", &doc! {"ping": 1}, "a"), None);
+    }
+
+    /// A `renameCollection` that renamed is profiled under its source; one
+    /// that failed is profiled nowhere, as mongod 8.2.1 has it (RM-479).
+    #[test]
+    fn a_failed_rename_is_not_profiled() {
+        assert!(!refused_unprofiled("renameCollection", &doc! {"ok": 1.0}));
+        for (code, msg) in [
+            (26_i32, "Source collection b.nope does not exist"),
+            (48, "target namespace exists"),
+            (20, "Can't rename a collection to itself"),
+        ] {
+            let reply = doc! {"ok": 0.0, "code": code, "errmsg": msg};
+            assert!(refused_unprofiled("renameCollection", &reply), "{msg}");
+        }
     }
 
     /// Rendered as mongod 8.2.11 rendered it (2026-10-15).

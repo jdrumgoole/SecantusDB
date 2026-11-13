@@ -2431,7 +2431,15 @@ fn run_handler(handler: Handler, doc: &Document, ctx: &mut CommandContext) -> Do
             return reply;
         }
     }
-    let _locks = if ctx.txn_locks {
+    // A `getMore` of a pipeline whose cursor stage takes its own locks as
+    // it fills its buffer takes none of its own (RM-360).
+    let locks_internally = !ctx.txn_locks
+        && command_name(doc) == "getMore"
+        && doc
+            .get("getMore")
+            .and_then(util::as_i64)
+            .is_some_and(|id| ctx.cursors().is_ok_and(|c| c.locks_internally(id)));
+    let _locks = if ctx.txn_locks || locks_internally {
         None
     } else {
         let facts = lock_manager::StorageFacts {
@@ -2448,6 +2456,7 @@ fn run_handler(handler: Handler, doc: &Document, ctx: &mut CommandContext) -> Do
     // one in a transaction only checks for interrupt there (RM-360).
     let _yields = match &_locks {
         Some(guard) => guard.yields(),
+        None if locks_internally => lock_manager::read_yields(ctx.locks.as_ref()),
         None => Some(deadline::no_yields()),
     };
     let _current = lock_manager::enter(ctx.locks.as_ref());

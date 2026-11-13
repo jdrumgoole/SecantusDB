@@ -123,6 +123,40 @@ pub(crate) fn write_index_key_member(
     Ok(())
 }
 
+/// `WorkingSetMember::OWNED_OBJ`.
+const OWNED_OBJ: u8 = 3;
+
+/// `WorkingSetMember::serialize` (mongod 8.2) of a member holding only a
+/// document of its own (`OWNED_OBJ`: what `PROJECTION_COVERED` makes of an
+/// index scan's member, its keys and RecordId dropped): its state, the
+/// snapshot its document was read in, the document as
+/// `Document::serializeForSorter` writes it, and a zero byte for no
+/// metadata. With no RecordId it writes none (measured 8.2.11: 22 bytes
+/// for `{x: <int>}`, RM-473).
+pub(crate) fn write_owned_obj_member(doc: &Document, snapshot_id: u64, out: &mut Vec<u8>) -> R<()> {
+    out.push(OWNED_OBJ);
+    out.extend_from_slice(&snapshot_id.to_le_bytes());
+    write_document(doc, out)?;
+    out.push(0);
+    Ok(())
+}
+
+/// The bytes a [`write_index_key_member`] or [`write_owned_obj_member`]
+/// wrote, read as `WorkingSetMember::deserialize` reads them.
+pub(crate) fn read_member(at: &mut Cursor) -> R<Vec<u8>> {
+    if at.peek_byte()? != OWNED_OBJ {
+        return read_index_key_member(at);
+    }
+    let start = at.pos;
+    at.take(1 + 8)?;
+    let mut bson = Vec::new();
+    document_to_bson(at, &mut bson)?;
+    if at.byte()? != 0 {
+        return Err(corrupt("a working-set member with metadata"));
+    }
+    Ok(at.bytes[start..at.pos].to_vec())
+}
+
 /// The bytes a [`write_index_key_member`] wrote, read as
 /// `WorkingSetMember::deserialize` reads them.
 pub(crate) fn read_index_key_member(at: &mut Cursor) -> R<Vec<u8>> {

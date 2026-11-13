@@ -158,17 +158,17 @@ def test_a_sort_beside_a_metadata_projection_is_a_default_sort(
     assert answers["rust"] == answers["mongod"]
 
 
-@pytest.mark.backlog("RM-473")
+@pytest.mark.backlog_fixed("RM-473")
 def test_a_sort_over_a_covered_projection_counts_what_it_sorted(
     rust_mongo: Any, mongod: Any
 ) -> None:
     """mongod 8.2.11's `SORT <- PROJECTION_COVERED <- IXSCAN` for
     `find({y: {$gte: 0}}, {_id: 0, x: 1}).sort({x: 1})` (`type:
     "default"`) counts 1584 bytes sorted for its twelve members, in
-    `explain` and in a profile entry's `execStats`. This server counts 528
-    in `explain` (the projected documents) and 780 in the profile entry
-    (members of their index keys, as its sort of keys below a FETCH counts
-    them since RM-375)."""
+    `explain` and in a profile entry's `execStats`: each an OWNED_OBJ
+    working-set member, its sort key and its document's approximate size.
+    This server counted 780 in both, the members of their index keys, as
+    its sort of keys below a FETCH counts them."""
 
     def op(d: Any) -> Any:
         return list(d.c.find({"y": {"$gte": 0}}, {"_id": 0, "x": 1}).sort("x", 1))
