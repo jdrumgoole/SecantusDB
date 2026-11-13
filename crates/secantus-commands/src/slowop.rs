@@ -467,14 +467,15 @@ pub fn read_attributes(request: &Document, reply: &Document, ctx: &CommandContex
     if replicated {
         out.insert("readConcern", crate::opdebug::read_concern(request));
     }
-    // A `getMore` runs under the write concern of the `aggregate` that
-    // opened its cursor.
-    let concerned = match ctx
-        .exec_stats
-        .as_ref()
-        .and_then(|e| e.originating_command.as_ref())
-    {
-        Some(origin) if name == "getMore" => Some(origin),
+    // A `getMore` runs under the write concern its cursor was opened
+    // under: the opening `aggregate`'s, and none for a `find`'s, even one
+    // run as an `aggregate` (RM-489).
+    let concerned = match ctx.exec_stats.as_ref().and_then(|e| {
+        e.originating_command
+            .as_ref()
+            .map(|origin| (origin, e.write_concern))
+    }) {
+        Some((origin, opened_under)) if name == "getMore" => opened_under.then_some(origin),
         _ => crate::opdebug::takes_write_concern(name).then_some(request),
     };
     if let Some(origin) = concerned.filter(|o| replicated && crate::opdebug::has_write_concern(o)) {

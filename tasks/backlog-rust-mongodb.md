@@ -1036,13 +1036,6 @@ These are explicit non-goals. Don't add them without a reason.
       server writes none. Found while working RM-380, 2026-11-10.
       Verify: tests/backlog/test_rm_view_namespaces.py::test_a_refused_list_indexes_of_a_view_is_profiled
       Backlog-ID: RM-488
-- [ ] **A `getMore` of a `find` of a view names a write concern.** mongod
-      8.2.11's line and profile entry for it carry no `writeConcern`, as
-      one of a `find` of a collection; this server's carry the one an
-      `aggregate`'s `getMore` runs under, since it runs the `find` as an
-      `aggregate`. Found while working RM-380, 2026-11-10.
-      Verify: tests/backlog/test_rm_view_namespaces.py::test_a_get_more_of_a_find_of_a_view_names_no_write_concern
-      Backlog-ID: RM-489
 - [ ] **A `distinct` of a view is counted as failed.** A view's `distinct`
       answers `ok` as an int32, as mongod's does, and about 270 readers of
       a reply's `ok` (`get_f64("ok")`) take it for a failure:

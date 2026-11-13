@@ -727,12 +727,15 @@ fn execution(name: &str, doc: &Document, ok: bool, ctx: &CommandContext, entry: 
     if replicated {
         entry.insert("readConcern", crate::opdebug::read_concern(doc));
     }
-    let concerned = match ctx
-        .exec_stats
-        .as_ref()
-        .and_then(|e| e.originating_command.as_ref())
-    {
-        Some(origin) if name == "getMore" => Some(origin),
+    // A `getMore` runs under the write concern its cursor was opened
+    // under: the opening `aggregate`'s, and none for a `find`'s, even one
+    // run as an `aggregate` (RM-489).
+    let concerned = match ctx.exec_stats.as_ref().and_then(|e| {
+        e.originating_command
+            .as_ref()
+            .map(|origin| (origin, e.write_concern))
+    }) {
+        Some((origin, opened_under)) if name == "getMore" => opened_under.then_some(origin),
         _ => crate::opdebug::takes_write_concern(name).then_some(doc),
     };
     if let Some(origin) = concerned.filter(|o| replicated && crate::opdebug::has_write_concern(o)) {

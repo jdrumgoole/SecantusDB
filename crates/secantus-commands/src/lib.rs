@@ -363,6 +363,9 @@ pub struct ExecStats {
     /// A `getMore`'s plan summary and the command that opened its cursor.
     pub plan_summary: Option<String>,
     pub originating_command: Option<Document>,
+    /// A `getMore`'s cursor was opened under a write concern, which the
+    /// `getMore` runs under (`CursorInfo::write_concern`, RM-489).
+    pub write_concern: bool,
     /// The plan sorts in memory (`hasSortStage`), which every batch of its
     /// cursor reports.
     pub has_sort_stage: bool,

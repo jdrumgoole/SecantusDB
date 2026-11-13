@@ -1681,6 +1681,7 @@ fn stream_find(
         exhausted: batch.exhausted,
         plan_summary: None,
         originating_command: None,
+        write_concern: false,
         has_sort_stage,
         exec_stages,
         write_run: None,

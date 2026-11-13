@@ -264,8 +264,12 @@ pub(crate) fn run(
     if let Some(s) = ctx.storage.as_ref() {
         s.set_oplog_session(txn_session);
     }
-    let reply =
-        crate::cursors::with_opener(owner, users, || run_checked(name, handler, doc, ctx, &env));
+    // A cursor the command opens keeps whether it runs under a write
+    // concern, as mongod's keeps its opener's (RM-489).
+    let write_concern = crate::opdebug::has_write_concern(doc);
+    let reply = crate::cursors::with_opener(owner, users, write_concern, || {
+        run_checked(name, handler, doc, ctx, &env)
+    });
     if let Some(s) = ctx.storage.as_ref() {
         s.set_oplog_session(None);
     }

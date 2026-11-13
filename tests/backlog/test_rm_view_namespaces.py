@@ -251,13 +251,14 @@ def test_a_refused_list_indexes_of_a_view_is_profiled(rust_mongo: Any, mongod_rs
     assert got["rust"] == got["mongod"]
 
 
-@pytest.mark.backlog("RM-489")
+@pytest.mark.backlog_fixed("RM-489")
 def test_a_get_more_of_a_find_of_a_view_names_no_write_concern(
     rust_mongo: Any, mongod_rs: Any
 ) -> None:
     """mongod 8.2.11's line and profile entry for a `getMore` of a `find` of
     a view carry no `writeConcern`, as one of a `find` of a collection; this
-    server's carry the one an `aggregate`'s `getMore` runs under."""
+    server's carried the one an `aggregate`'s `getMore` runs under, since it
+    runs the `find` as an `aggregate`."""
     got = {}
     for server, (lines, entries) in _both(
         rust_mongo, mongod_rs, lambda d: list(d.v.find(batch_size=4))
@@ -266,6 +267,32 @@ def test_a_get_more_of_a_find_of_a_view_names_no_write_concern(
             "writeConcern" in a for a in [a for _, a in lines] + entries if _first(a) == "getMore"
         ]
     assert got["mongod"] == [False] * 4
+    assert got["rust"] == got["mongod"]
+
+
+@pytest.mark.backlog_fixed("RM-489")
+def test_a_get_more_names_the_write_concern_its_cursor_was_opened_under(
+    rust_mongo: Any, mongod_rs: Any
+) -> None:
+    """mongod 8.2.11's `getMore` runs under the write concern of the command
+    that opened its cursor: an `aggregate`'s (of a collection or a view, a
+    deferred first batch included), and none for a `find`'s, a time-series
+    collection's too, which runs as an `aggregate` over the buckets."""
+
+    def op(db: Any) -> None:
+        list(db.ts.find(batch_size=4))
+        list(db.c.find(batch_size=2))
+        list(db.c.aggregate([], batchSize=2))
+        list(db.v.aggregate([], batchSize=2))
+        list(db.c.aggregate([], batchSize=0))
+
+    got = {}
+    for server, (lines, entries) in _both(rust_mongo, mongod_rs, op).items():
+        got[server] = [
+            [(_ns(a), "writeConcern" in a) for _, a in lines if _first(a) == "getMore"],
+            [(_ns(e), "writeConcern" in e) for e in entries if _first(e) == "getMore"],
+        ]
+    assert ("ts", False) in got["mongod"][0] and ("c", True) in got["mongod"][0]
     assert got["rust"] == got["mongod"]
 
 
