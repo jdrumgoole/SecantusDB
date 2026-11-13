@@ -2470,16 +2470,20 @@ _SCANS = (
 )
 
 
-@pytest.mark.backlog("RP-909")
+@pytest.mark.backlog_fixed("RP-909")
 @pytest.mark.parametrize("query", INDEX_SCAN_WITH_A_FILTER)
 def test_an_index_scan_with_a_filter_counts_one_index_scan(rust_pg: Any, query: str) -> None:
     """PostgreSQL 15.19 counts one index scan of `pg_attribute` for each
     query (measured as the change over a second run, in one transaction, so
     the first run's cache misses are out of it). `secantusd-pg` counted a
     sequential scan, because the walk in `catalog_reads.rs` visited an AND's
-    arms as select-list expressions; since 2026-11-12 it counts the index
-    scan, and on a fresh backend one more, as it does for a bare `attrelid =
-    2615` (warm, the counts match:
+    arms as select-list expressions (fixed 2026-11-12), and on a fresh
+    backend one more index scan, with `pg_amop`, `pg_class`, `pg_operator`
+    and `pg_type` ones: the first read of the statistics view walked its
+    own parse and plan reads after it had answered, so they showed in the
+    next read. Since 2026-11-13 a statement that reads the counters is
+    walked before it runs, as PostgreSQL parses and plans before executing
+    (warm, the counts already matched:
     `tests/test_rust_pgserver_slice.py::test_an_equality_with_other_quals_is_one_index_scan`)."""
     with rust_pg.connect(autocommit=False) as conn:
         conn.execute(query).fetchall()

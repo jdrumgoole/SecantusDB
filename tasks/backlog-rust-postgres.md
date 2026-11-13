@@ -1577,24 +1577,6 @@ a regression test.
       differ; a `pg_stat_*` view 53 match, 61 differ.
       Backlog-ID: RP-290
       Verify: tests/backlog/test_rp_catalog_reads.py::test_gap[a statistics view], tests/backlog/test_rp_catalog_reads.py::test_gap[psql's describe query]
-- [ ] **A fresh backend's first catalog read counts an extra index scan
-      the second time it runs.** On a new connection, run `SELECT attname
-      FROM pg_attribute WHERE attrelid = 2615` (or with `AND attnum > 0`),
-      read `pg_stat_xact_sys_tables`, run it again and read again:
-      PostgreSQL 15.19 counts one `pg_attribute` `idx_scan` between the
-      reads, and this server counts two. Between the same reads
-      PostgreSQL counts one `pg_class` sequential scan and nothing else of
-      `pg_amop`, `pg_class`, `pg_operator` or `pg_type`; this server counts
-      six `pg_amop`, three `pg_class`, two `pg_operator` and one `pg_type`
-      index scans and no `pg_class` sequential scan (2026-11-12). Measured
-      again on a backend that has run the statement and the read once,
-      the counts match. An equality with other quals beside it was also
-      counted as a sequential scan, because the catalog-read walk visited
-      an AND's arms as select-list expressions; that part was fixed on
-      2026-11-12 (regression test
-      `tests/test_rust_pgserver_slice.py::test_an_equality_with_other_quals_is_one_index_scan`).
-      Backlog-ID: RP-909
-      Verify: tests/backlog/test_rp_catalog_reads.py::test_an_index_scan_with_a_filter_counts_one_index_scan
 - [ ] **A catalog row added after `initdb` counts no heap block** in
       `pg_statio_sys_tables`. A catalog scan counts its index pages
       (`catalog_btree.rs`, from `pg15_catalog_indexes.txt`) and, since

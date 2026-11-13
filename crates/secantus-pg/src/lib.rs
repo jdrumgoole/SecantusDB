@@ -34089,6 +34089,15 @@ impl PgHandler {
         // The catalog reads PostgreSQL makes for the statement, and what a
         // catalog change it makes invalidates (RP-225).
         let effects = self.catalog_effects(query);
+        // A statement that reads the scan counters sees its own parse and
+        // plan reads, so it is walked first; a failed block analyses
+        // nothing (RP-909).
+        let walked_first = catalog_reads::reads_counters(query)
+            && !catalog_reads::changes_catalogs(query)
+            && !self.txn_failed.load(std::sync::atomic::Ordering::Relaxed);
+        if walked_first {
+            self.catalog_reads(query, &effects.pre);
+        }
         let result = self
             .run_typed_inner(query, params, param_types, max_rows)
             .await;
@@ -34099,7 +34108,7 @@ impl PgHandler {
             Err(PgWireError::UserError(info))
                 if matches!(info.code.as_str(), "57014" | "57P01" | "25P02")
         );
-        if analysed {
+        if analysed && !walked_first {
             self.catalog_reads(query, &effects.pre);
         }
         self.catalog_reads_done(effects, result.is_ok());
