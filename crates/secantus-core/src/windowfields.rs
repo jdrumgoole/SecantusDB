@@ -49,6 +49,11 @@ const RANK_FUNCS: [&str; 3] = ["$rank", "$denseRank", "$documentNumber"];
 /// The field the command layer hands a document's sort-key metadata over
 /// in, as the `$sort` in reach left it (`agg_meta::rewrite_sort_metadata`).
 pub const SORT_KEY_FIELD: &str = "__secantus_meta_sortKey";
+/// The field the command layer marks a document with when it carries no
+/// sort key at all -- not the empty key a read with no `$sort` gives, but
+/// none: a `$group` made it, or a `$unionWith` added it (RM-522). A rank
+/// that reaches it is refused (`agg_meta::rewrite_sort_metadata`).
+pub const NO_SORT_KEY_FIELD: &str = "__secantus_meta_noSortKey";
 /// Ops whose output is a per-slot vector precomputed once over the sorted
 /// partition (prefix accumulation / gap-fill), rather than a window accumulator.
 const PREFIX_OPS: [&str; 3] = ["$expMovingAvg", "$locf", "$linearFill"];
@@ -371,6 +376,10 @@ fn window_fields_each(
     // 8.2.1 and 8.2.11, 2026-11-10, RM-410). The key is taken off each
     // document while the stage runs, so the partition cache does not count
     // it as a field, and put back on as it leaves for the stages after.
+    // A document with no sort key at all has nothing to rank by: mongod
+    // refuses as the rank reads it, `$documentNumber` too, so the documents
+    // before it are emitted first (8.2.11, 2026-11-13, RM-522).
+    let keyless = presorted && needs_rank;
     let mut docs = docs;
     let metadata: Option<Vec<Option<Bson>>> =
         presorted.then(|| docs.iter_mut().map(|d| d.remove(SORT_KEY_FIELD)).collect());
@@ -693,6 +702,13 @@ fn window_fields_each(
                     }
                 };
                 paths::set_path(&mut out_doc, c.field, value).map_err(|_| Fallback::Defer)?;
+            }
+            if keyless && docs[orig_i].contains_key(NO_SORT_KEY_FIELD) {
+                return Err(Fallback::mongo(
+                    9973200,
+                    "Attempt to get sort key which has not been populated",
+                )
+                .exec());
             }
             if let Some(Some(key)) = metadata.as_ref().or(carried.as_ref()).map(|m| &m[orig_i]) {
                 out_doc.insert(SORT_KEY_FIELD, key.clone());
@@ -3166,6 +3182,53 @@ mod budget_tests {
             .map(|d| d.get(SORT_KEY_FIELD).unwrap())
             .collect();
         assert_eq!(back, keys.iter().collect::<Vec<_>>());
+    }
+
+    /// A document with no sort key at all is refused as the rank reaches
+    /// it, `$documentNumber` too, after the documents before it are out
+    /// (mongod 8.2.11, 2026-11-13, RM-522); a stage that numbers nothing
+    /// passes it on.
+    #[test]
+    fn a_rank_refuses_a_document_with_no_sort_key() {
+        let run = |output: Document| {
+            let docs = vec![
+                doc! {"_id": 0},
+                doc! {"_id": 1, NO_SORT_KEY_FIELD: true},
+                doc! {"_id": 2},
+            ];
+            let spec = Bson::Document(doc! { "sortBy": {"_id": 1}, "output": output });
+            let mut out = Vec::new();
+            let r = internal_set_window_fields_each(
+                &spec,
+                docs,
+                &Document::new(),
+                None,
+                None,
+                None,
+                &mut |d| {
+                    out.push(d);
+                    Ok(())
+                },
+            );
+            (r, out)
+        };
+        for f in ["$rank", "$denseRank", "$documentNumber"] {
+            let (r, out) = run(doc! { "r": { f: {} } });
+            match r {
+                Err(Fallback::Mongo { code, message, .. }) => {
+                    assert_eq!(code, 9973200);
+                    assert_eq!(
+                        message,
+                        "Attempt to get sort key which has not been populated"
+                    );
+                }
+                other => panic!("{f}: {other:?}"),
+            }
+            assert_eq!(out.len(), 1, "{f}");
+        }
+        let (r, out) = run(doc! { "s": { "$sum": 1 } });
+        assert!(r.is_ok());
+        assert_eq!(out.len(), 3);
     }
 
     /// mongod's iterator replaces its token by assigning a new one over the

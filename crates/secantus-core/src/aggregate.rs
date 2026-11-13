@@ -953,6 +953,17 @@ const PER_DOCUMENT: &[&str] = &[
     "$match",
 ];
 
+/// The count of a `{$limit: n}` stage, for a positive whole `n`.
+fn limit_of(stage: &Bson) -> Option<usize> {
+    let n = match stage.as_document()?.get("$limit")? {
+        Bson::Int32(n) => i64::from(*n),
+        Bson::Int64(n) => *n,
+        Bson::Double(d) if d.fract() == 0.0 && *d >= 1.0 && *d < 9.0e15 => *d as i64,
+        _ => return None,
+    };
+    usize::try_from(n).ok().filter(|n| *n > 0)
+}
+
 thread_local! {
     /// The stages a caller runs after the pipeline `apply_pipeline` is
     /// given (the command layer splits a pipeline at its storage stages).
@@ -1016,7 +1027,16 @@ fn window_fields_streamed(
     let tracks = memlimit::tracks_reads(at);
     let mut window_reads = Vec::new();
     let mut fused_reads: Vec<(usize, Vec<usize>)> = vec![(0, Vec::new()); fused];
-    each(
+    // A rank refuses a document with no sort key as it reaches it (RM-522);
+    // mongod's `$limit` behind it stops pulling first when it has its
+    // documents, so the refusal is never reached.
+    let wanted = docs
+        .iter()
+        .any(|d| d.contains_key(windowfields::NO_SORT_KEY_FIELD))
+        .then(|| rest.get(fused).and_then(limit_of))
+        .flatten();
+    let mut enough = false;
+    let ran = each(
         spec,
         docs,
         vars,
@@ -1043,9 +1063,18 @@ fn window_fields_streamed(
                 }
             }
             out.extend(one);
+            if wanted.is_some_and(|n| out.len() >= n) {
+                enough = true;
+                // Stops the stage; not an error (below).
+                return Err(Fallback::Defer);
+            }
             Ok(())
         },
-    )?;
+    );
+    match ran {
+        Err(_) if enough => {}
+        other => other?,
+    }
     if tracks {
         memlimit::note_stage_reads(at, window_reads);
         for (f, (_, reads)) in fused_reads.into_iter().enumerate() {

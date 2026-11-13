@@ -174,12 +174,13 @@ def test_a_lookup_sub_pipeline_sort_sets_the_key(rust_mongo: Any, mongod: Any) -
     assert _answers(rust_mongo, pipelines) == _answers(mongod, pipelines)
 
 
-@pytest.mark.backlog("RM-522")
+@pytest.mark.backlog_fixed("RM-522")
 def test_a_rank_with_no_sort_key_is_refused(rust_mongo: Any, mongod: Any) -> None:
     """After a `$group` or a `$unionWith` a document has no sort key at all
     (`{$meta: "sortKey"}` is missing, not `[]`), and mongod 8.2.11 refuses
     the rank: 9973200 "Attempt to get sort key which has not been
-    populated". This server ties them."""
+    populated". This server tied them, until RM-522 marked such documents
+    and refused the rank that reaches one."""
     pipelines = {
         "$group": [{"$group": {"_id": "$k"}}, RANK_ID],
         "$group then $sort": [

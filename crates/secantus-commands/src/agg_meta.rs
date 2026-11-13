@@ -23,6 +23,8 @@ pub(crate) const RECORD_ID: &str = "__secantus_meta_recordId";
 pub(crate) const INDEX_KEY: &str = "__secantus_meta_indexKey";
 /// The field a `$sort` (or `$geoNear`) leaves its sort key in.
 pub(crate) const SORT_KEY: &str = secantus_core::SORT_KEY_FIELD;
+/// The field that marks a document with no sort key at all (RM-522).
+pub(crate) const NO_SORT_KEY: &str = secantus_core::NO_SORT_KEY_FIELD;
 /// The fields a `$geoNear` leaves its distance and point in.
 pub(crate) const GEO_DISTANCE: &str = "__secantus_meta_geoNearDistance";
 pub(crate) const GEO_POINT: &str = "__secantus_meta_geoNearPoint";
@@ -98,6 +100,21 @@ fn window_sort_key(spec: &Bson) -> Option<Bson> {
     }
     Some(Bson::Document(bson::doc! { "$_secantusSortKey": stage }))
 }
+
+/// The stages whose documents carry no sort key at all, not even the empty
+/// one: each makes new documents, and a `$sort` behind it gives them none
+/// either (measured 8.2.11, 2026-11-13, RM-522: `$_internalSetWindowFields`
+/// refuses a `$rank`, `$denseRank` or `$documentNumber` behind each, and
+/// `{$meta: "sortKey"}` is missing).
+const DROPS_SORT_KEY: &[&str] = &[
+    "$group",
+    "$bucket",
+    "$bucketAuto",
+    "$sortByCount",
+    "$count",
+    "$facet",
+    "$redact",
+];
 
 /// The stages that keep a document's metadata as they pass it on.
 const KEEPS_METADATA: &[&str] = &[
@@ -254,6 +271,96 @@ pub(crate) fn reads_sort_key(stage: &Bson) -> bool {
     })
 }
 
+/// Whether `stage` is a `$_internalSetWindowFields` whose output reads each
+/// document's sort key to number it: `$rank`, `$denseRank`, and
+/// `$documentNumber`, which mongod refuses as they do with no key at all
+/// (8.2.11, RM-522), though it ranks nothing by it.
+fn ranks_by_sort_key(stage: &Bson) -> bool {
+    let Some(Bson::Document(spec)) = stage
+        .as_document()
+        .and_then(|d| d.get("$_internalSetWindowFields"))
+    else {
+        return false;
+    };
+    spec.get_document("output").is_ok_and(|output| {
+        output.values().filter_map(Bson::as_document).any(|f| {
+            f.contains_key("$rank")
+                || f.contains_key("$denseRank")
+                || f.contains_key("$documentNumber")
+        })
+    })
+}
+
+/// Whether a stage in `stages` ranks documents that may carry no sort key:
+/// it comes behind a stage in [`DROPS_SORT_KEY`] or a `$unionWith`.
+pub(crate) fn ranks_with_no_sort_key(stages: &[Bson]) -> bool {
+    stages.iter().enumerate().any(|(i, s)| {
+        ranks_by_sort_key(s)
+            && stages[..i]
+                .iter()
+                .any(|b| DROPS_SORT_KEY.contains(&name(b)) || name(b) == "$unionWith")
+    })
+}
+
+/// Whether the rewrite has anything to do in `stages`.
+pub(crate) fn needs_sort_metadata(stages: &[Bson]) -> bool {
+    stages.iter().any(|s| {
+        reads_sort_key(s)
+            || ["sortKey", "geoNearDistance", "geoNearPoint"]
+                .iter()
+                .any(|k| mentions(s, k))
+    }) || ranks_with_no_sort_key(stages)
+}
+
+/// Whether the documents `$unionWith` at `stages[at]` adds reach a rank
+/// with no sort key. mongod's sub-pipeline gives them the empty key only
+/// when a `{$meta: "sortKey"}` reads them before the rank does, and never
+/// when it ends behind a stage in [`DROPS_SORT_KEY`] (8.2.11, 2026-11-13,
+/// RM-522: `$unionWith`, then a rank, is refused; with an `$addFields` of
+/// the key in between, it ties).
+fn union_adds_no_sort_key(stages: &[Bson], at: usize) -> bool {
+    let rest = &stages[at + 1..];
+    let Some(rank) = rest.iter().position(ranks_by_sort_key) else {
+        return false;
+    };
+    let between = &rest[..rank];
+    if between.iter().any(|s| DROPS_SORT_KEY.contains(&name(s))) {
+        // New documents: those are refused whatever this stage added.
+        return false;
+    }
+    let sub_drops = stages[at]
+        .as_document()
+        .and_then(|d| d.get_document("$unionWith").ok())
+        .and_then(|spec| spec.get_array("pipeline").ok())
+        .is_some_and(|sub| sub.iter().any(|s| DROPS_SORT_KEY.contains(&name(s))));
+    sub_drops || !between.iter().any(|s| mentions(s, "sortKey"))
+}
+
+/// Mark the documents `$unionWith` adds as carrying no sort key: a stage
+/// at the end of its sub-pipeline, which the stage gets when it has none.
+fn mark_union_documents(stage: &mut Bson) {
+    let mark = Bson::Document(bson::doc! { "$set": { NO_SORT_KEY: true } });
+    let Some(outer) = stage.as_document_mut() else {
+        return;
+    };
+    match outer.get_mut("$unionWith") {
+        Some(Bson::String(coll)) => {
+            let coll = coll.clone();
+            outer.insert(
+                "$unionWith",
+                bson::doc! { "coll": coll, "pipeline": [mark] },
+            );
+        }
+        Some(Bson::Document(spec)) => match spec.get_mut("pipeline") {
+            Some(Bson::Array(sub)) => sub.push(mark),
+            _ => {
+                spec.insert("pipeline", vec![mark]);
+            }
+        },
+        _ => {}
+    }
+}
+
 /// Replace each `{$meta: kind}` in `v` with `with`.
 fn replace_with(v: &mut Bson, kind: &str, with: &Bson) {
     match v {
@@ -299,26 +406,59 @@ fn is_inclusion(spec: &Document) -> bool {
 /// and `$group` give `[]` (mongod 8.2.11) and the other stages are left to
 /// refuse it; in `$match` and `$redact` the sort key is always missing (a
 /// leading `$match` becomes the query, whose `$expr` sees it missing too).
+///
+/// A document with no sort key at all -- behind a stage in
+/// [`DROPS_SORT_KEY`], or added by a `$unionWith` -- gives `{$meta:
+/// "sortKey"}` as missing and has a rank refused (RM-522).
 pub(crate) fn rewrite_sort_metadata(stages: &mut Vec<Bson>) {
-    const KINDS: [(&str, &str); 3] = [
-        ("sortKey", SORT_KEY),
-        ("geoNearDistance", GEO_DISTANCE),
-        ("geoNearPoint", GEO_POINT),
-    ];
-    if !stages
-        .iter()
-        .any(|s| reads_sort_key(s) || KINDS.iter().any(|(k, _)| mentions(s, k)))
-    {
+    if !needs_sort_metadata(stages) {
         return;
     }
     let mut out: Vec<Bson> = Vec::with_capacity(stages.len() + 4);
     // The hidden fields in place, and so the metadata in reach.
     let (mut sort_live, mut geo_live) = (false, false);
+    // No document has a sort key at all (behind a stage in
+    // `DROPS_SORT_KEY`), and the ones a `$unionWith` added carry
+    // `NO_SORT_KEY` (RM-522).
+    let (mut keyless, mut marked) = (false, false);
     let n = stages.len();
-    for (i, stage) in std::mem::take(stages).into_iter().enumerate() {
+    let all = std::mem::take(stages);
+    let unions: Vec<bool> = (0..all.len())
+        .map(|i| name(&all[i]) == "$unionWith" && union_adds_no_sort_key(&all, i))
+        .collect();
+    for (i, stage) in all.into_iter().enumerate() {
         let mut stage = stage;
         let name = name(&stage).to_string();
         let keeps = KEEPS_SORT_METADATA.contains(&name.as_str());
+        // With no key at all, `{$meta: "sortKey"}` is missing in every stage
+        // (a `$group`'s `_id` null, a `$push` of it nothing), behind a later
+        // `$sort` too; and a rank is refused, for which the documents are
+        // marked as they reach it (mongod 8.2.11, RM-522).
+        if keyless {
+            // Not into a `$lookup`'s sub-pipeline, which reads its own
+            // documents' key, nor a `$setWindowFields`, which holds it off.
+            let own = !matches!(name.as_str(), "$lookup" | "$setWindowFields");
+            if (keeps && own) || name == "$group" {
+                replace_with(&mut stage, "sortKey", &Bson::String("$$REMOVE".into()));
+            }
+            if ranks_by_sort_key(&stage) {
+                out.push(Bson::Document(bson::doc! { "$set": { NO_SORT_KEY: true } }));
+            }
+        }
+        if unions[i] && !keyless {
+            mark_union_documents(&mut stage);
+            marked = true;
+        }
+        if marked && name == "$project" {
+            // An inclusion projection would drop the mark.
+            if let Some(Bson::Document(spec)) =
+                stage.as_document_mut().and_then(|d| d.get_mut("$project"))
+            {
+                if is_inclusion(spec) {
+                    spec.insert(NO_SORT_KEY, 1);
+                }
+            }
+        }
         // `$match` and `$redact` never see a sort key: there it is MISSING,
         // after a `$sort` too (mongod 8.2.11, 2026-10-22; RM-252).
         if matches!(name.as_str(), "$match" | "$redact") {
@@ -431,18 +571,26 @@ pub(crate) fn rewrite_sort_metadata(stages: &mut Vec<Bson>) {
             }
             // A stage that makes a new document from each: the metadata
             // goes with it, as mongod copies it over.
-            "$replaceRoot" | "$replaceWith" if !live.is_empty() => {
+            // The mark a `$unionWith` left goes with it too (RM-522).
+            "$replaceRoot" | "$replaceWith" if !live.is_empty() || marked => {
+                let mut fields = live.clone();
+                if marked {
+                    fields.push(NO_SORT_KEY);
+                }
                 stage = Bson::Document(bson::doc! {
-                    "$_secantusCarry": { "stage": stage, "fields": live.clone() }
+                    "$_secantusCarry": { "stage": stage, "fields": fields }
                 });
             }
-            "$_secantusCarry" if !live.is_empty() => {
+            "$_secantusCarry" if !live.is_empty() || marked => {
                 if let Some(Bson::Document(spec)) = stage
                     .as_document_mut()
                     .and_then(|d| d.get_mut("$_secantusCarry"))
                 {
                     let mut fields = spec.get_array("fields").cloned().unwrap_or_default();
                     fields.extend(live.iter().map(|f| Bson::String((*f).to_string())));
+                    if marked {
+                        fields.push(Bson::String(NO_SORT_KEY.to_string()));
+                    }
                     spec.insert("fields", fields);
                 }
             }
@@ -458,7 +606,16 @@ pub(crate) fn rewrite_sort_metadata(stages: &mut Vec<Bson>) {
             }
             _ => {}
         }
+        let ranks = ranks_by_sort_key(&stage);
         out.push(stage);
+        if DROPS_SORT_KEY.contains(&name.as_str()) {
+            keyless = true;
+            marked = false;
+        } else if ranks {
+            // Every document that passed carried a key: one with none was
+            // refused there.
+            marked = false;
+        }
         if i + 1 == n && (sort_live || geo_live) {
             let live: Vec<&str> = [
                 (sort_live, SORT_KEY),
@@ -600,8 +757,9 @@ mod tests {
                 doc! { "$project": { "a": 1, SORT_KEY: 1 } },
                 doc! { "$project": { "k": read.clone(), SORT_KEY: 1 } },
                 doc! { "$group": { "_id": read } },
-                // Past the `$group` there is no sort key.
-                doc! { "$project": { "k": { "$meta": "sortKey" } } },
+                // Past the `$group` there is no sort key: it is missing
+                // (mongod 8.2.11, RM-522).
+                doc! { "$project": { "k": "$$REMOVE" } },
             ])
         );
     }
@@ -728,6 +886,72 @@ mod tests {
                 window,
                 doc! { "$addFields": { "m": sort_key_read() } },
                 doc! { "$unset": [SORT_KEY] },
+            ])
+        );
+    }
+
+    /// Behind a `$group` no document has a sort key, a later `$sort`
+    /// gives it none, `{$meta: "sortKey"}` is missing and a rank is
+    /// refused: the documents are marked as they reach it (RM-522).
+    #[test]
+    fn behind_a_group_there_is_no_sort_key() {
+        let rank = doc! { "$_internalSetWindowFields": {
+        "sortBy": { "_id": 1 }, "output": { "r": { "$documentNumber": {} } } } };
+        let mut piped = stages(vec![
+            doc! { "$group": { "_id": "$k", "m": { "$push": { "$meta": "sortKey" } } } },
+            doc! { "$sort": { "_id": 1 } },
+            doc! { "$project": { "m": { "$meta": "sortKey" } } },
+            rank.clone(),
+        ]);
+        assert!(needs_sort_metadata(&piped));
+        rewrite_sort_metadata(&mut piped);
+        assert_eq!(
+            piped,
+            stages(vec![
+                // Read from the collection with no `$sort`: the empty key.
+                doc! { "$group": { "_id": "$k", "m": { "$push": { "$literal": [] } } } },
+                doc! { "$sort": { "_id": 1 } },
+                doc! { "$_secantusSortKey": { "into": SORT_KEY, "by": { "_id": 1 } } },
+                doc! { "$project": { "m": "$$REMOVE", SORT_KEY: 1 } },
+                doc! { "$set": { NO_SORT_KEY: true } },
+                rank,
+                doc! { "$unset": [SORT_KEY] },
+            ])
+        );
+    }
+
+    /// The documents a `$unionWith` adds have no sort key when a rank
+    /// reads them first, and the empty one when a `{$meta: "sortKey"}`
+    /// does (RM-522).
+    #[test]
+    fn a_union_adds_documents_with_no_sort_key() {
+        let rank = doc! { "$_internalSetWindowFields": {
+        "sortBy": { "_id": 1 }, "output": { "r": { "$rank": {} } } } };
+        let mut piped = stages(vec![
+            doc! { "$unionWith": "c" },
+            doc! { "$project": { "n": 1 } },
+            rank.clone(),
+        ]);
+        rewrite_sort_metadata(&mut piped);
+        assert_eq!(
+            piped,
+            stages(vec![
+                doc! { "$unionWith": { "coll": "c",
+                "pipeline": [{ "$set": { NO_SORT_KEY: true } }] } },
+                doc! { "$project": { "n": 1, NO_SORT_KEY: 1 } },
+                rank.clone(),
+            ])
+        );
+
+        let meta = doc! { "$addFields": { "m": { "$meta": "sortKey" } } };
+        let mut read = stages(vec![doc! { "$unionWith": "c" }, meta, rank.clone()]);
+        rewrite_sort_metadata(&mut read);
+        assert_eq!(
+            read,
+            stages(vec![
+                doc! { "$unionWith": "c" },
+                doc! { "$addFields": { "m": { "$literal": [] } } },
+                rank,
             ])
         );
     }

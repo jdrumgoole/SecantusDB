@@ -311,7 +311,9 @@ fn build(
     // `{$meta: "sortKey"}` and a `$_internalSetWindowFields`'s ranks: from
     // the `$sort` the plan reads in order, worked out for each document as a
     // `$sort` stage leaves it (`agg_meta`).
-    if stages.iter().any(crate::agg_meta::reads_sort_key) {
+    if stages.iter().any(crate::agg_meta::reads_sort_key)
+        || crate::agg_meta::ranks_with_no_sort_key(&stages)
+    {
         match &query.sort {
             Some(sort) => {
                 let mut with = vec![Bson::Document(doc! { "$sort": sort.clone() })];
