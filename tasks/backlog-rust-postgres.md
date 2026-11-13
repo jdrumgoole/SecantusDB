@@ -1610,10 +1610,6 @@ a regression test.
       (`standard_join_search`'s levels and bushy pairs, each relation's
       path list). Still zeros (PostgreSQL 15.19 on a private cluster,
       `e` and `k` 1,000 analysed rows, `k.a` the primary key):
-      - an inequality between the inner's key and a call over the outer
-        row (`e, k where length(e.b) < k.a`: a Memoize keyed by
-        `length(e.b)` over `Index Scan using k_pkey` with `Index Cond: (a
-        > length(e.b))`);
       - a join of three tables whose third is indexed (`e join e e2 on
         e.a < e2.a join k on e2.a < k.a`: a Memoize keyed by `e2.a` over
         the parameterized Index Scan);
@@ -1628,9 +1624,12 @@ a regression test.
       and on a lone scan, and a `<>` of three or more tables' join whose
       operands are cast or coerced (`e2.a::numeric <> e3.a::numeric`). A
       binary-coercible cast is RP-912; a join PostgreSQL orders otherwise,
-      RP-919.
+      RP-919. Since 2026-11-13 an inequality between the inner's key and a
+      call of a built-in over the outer row is the inner's Index Cond, the
+      call's `procost` its startup, under the Memoize PostgreSQL keys by
+      the call.
       Backlog-ID: RP-354
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[nested loop into an index bounded by a call of the outer side], tests/backlog/test_rp_explain_costs.py::test_plan[nested loop of three relations into an index], tests/backlog/test_rp_explain_costs.py::test_plan[a left join's on conjunct over the preserved side is a regex match]
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[nested loop of three relations into an index], tests/backlog/test_rp_explain_costs.py::test_plan[a left join's on conjunct over the preserved side is a regex match]
 - [ ] **A nested loop's Join Filter keeps the ON's written order.**
       PostgreSQL 15.19 orders a join's qual list cheapest first
       (`order_qual_clauses`, by `cost_qual_eval`, stable among equal
@@ -1688,21 +1687,6 @@ a regression test.
       cluster (found while working RP-354).
       Verify: tests/backlog/test_rp_explain_costs.py::test_plan[nested loop left join with an on restriction of its nullable side]
       Backlog-ID: RP-918
-- [ ] **EXPLAIN never caches a parameterized inner scan with a
-      Memoize.** A nested loop into an index scan parameterized by an
-      outer side of few distinct values is printed without the Memoize
-      PostgreSQL puts over it, so its cost is the uncached one: PostgreSQL
-      15.19 plans `explain select * from r left join k on r.a < k.a` (`r`
-      1,000 analysed rows of ten values, `k.a` the primary key) as
-      `Nested Loop Left Join (cost=0.29..4256.67 rows=333333 width=11)`
-      over `Memoize (cost=0.29..6.15 rows=333 width=7)` with `Cache Key:
-      r.a` and `Cache Mode: binary` above `Index Scan using k_pkey on k`;
-      here the Index Scan sits directly under the join at
-      `cost=0.28..9487.50`. The LIMIT search builds Memoize paths; the
-      nested-loop estimate (RP-354's) does not. Measured on a private
-      15.19 cluster (found while working RP-354).
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[nested loop into an index under an outer side of few values]
-      Backlog-ID: RP-916
 - [ ] **A comparison of real and double precision prints a cast
       PostgreSQL does not make.** `real <> double precision` is the
       cross-type operator `float48ne` (and `<`, `=`, ... likewise), which
@@ -1723,10 +1707,27 @@ a regression test.
       analysed rows, `k.a` the primary key) with `(actual rows=1000
       loops=1)` on `Seq Scan on e` and `(actual rows=499 loops=1000)` on
       `Index Scan using k_pkey on k`; here both scans print no actual
-      block at all. The join's own count is right. Measured on a private
-      15.19 cluster (found while working RP-354).
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[analyze of a nested loop into an index on an expression of the outer side]
+      block at all. The join's own count is right. The same where the
+      expression has few values and PostgreSQL caches the scan in a
+      Memoize (`select * from r, k where r.a + 1 < k.a`, `r.a` ten values:
+      `Hits: 990  Misses: 10  Evictions: 0  Overflows: 0  Memory Usage:
+      380kB`, the Index Scan's `loops=10`); here the Memoize prints no
+      actual block and no cache line. Measured on a private 15.19 cluster
+      (found while working RP-354, the Memoize while working RP-916).
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[analyze of a nested loop into an index on an expression of the outer side], tests/backlog/test_rp_explain_costs.py::test_plan[analyze of a memoize keyed by an expression of the outer side]
       Backlog-ID: RP-914
+- [ ] **EXPLAIN VERBOSE prints no `Output` lists and no schema-qualified
+      names.** VERBOSE is accepted and then ignored: PostgreSQL 15.19 prints
+      `explain verbose select * from k where a > 5` (`k` 1,000 analysed
+      rows) as `Seq Scan on public.k` with `Output: a, b` and `Filter: (k.a
+      > 5)`; here `Seq Scan on k` and `Filter: (a > 5)`, as without
+      VERBOSE. A join's nodes each print their `Output` too (`Output: e.a,
+      e.b, e2.a, e2.b` on a Nested Loop, its Materialize's and Memoize's
+      likewise), and an inner index scan's `Index Cond` is qualified
+      (`(k.a > r.a)`). Measured on a private 15.19 cluster (found while
+      working RP-916).
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[explain verbose prints a scan's output list]
+      Backlog-ID: RP-925
 - [ ] **A binary-coercible cast is kept in a plan, and its scan is not
       priced.** A cast between binary-compatible types (`text` to
       `varchar` and back to `text` for the operator) is a `RelabelType`

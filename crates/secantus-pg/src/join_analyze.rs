@@ -166,7 +166,10 @@ impl PgHandler {
         if tree.name.starts_with("Hash") && tree.name.ends_with(" Join") {
             self.analyze_hash_join(tree, sel, actual);
         } else if tree.name.starts_with("Nested Loop") {
-            if tree.children[1].param_cond.is_some() {
+            if crate::explain::param_scan(&tree.children[1])
+                .param_cond
+                .is_some()
+            {
                 self.analyze_param_nest_loop(tree, sel, actual);
             } else {
                 self.analyze_plain_nest_loop(tree, sel, actual);
@@ -323,7 +326,8 @@ impl PgHandler {
         let Some((outer_table, outer_alias)) = filtered_seq_scan(&tree.children[0]) else {
             return;
         };
-        let inner = &tree.children[1];
+        let memoized = tree.children[1].name == "Memoize";
+        let inner = crate::explain::param_scan(&tree.children[1]);
         let index_only = inner.name.starts_with("Index Only Scan using ");
         if !(index_only || inner.name.starts_with("Index Scan using ")) {
             return;
@@ -413,11 +417,15 @@ impl PgHandler {
         }
         // Each inner row's key and whether its heap page is all-visible.
         let mut keyed: Vec<(f64, i64)> = Vec::new();
+        let mut keyed_docs: Vec<&Document> = Vec::new();
         for d in &inner_docs {
             match d.get(&inner_field) {
                 None | Some(Bson::Null) => continue,
                 v => match (number(v), heap::ctid_of(d)) {
-                    (Some(n), Some(c)) => keyed.push((n, c)),
+                    (Some(n), Some(c)) => {
+                        keyed.push((n, c));
+                        keyed_docs.push(d);
+                    }
                     _ => return,
                 },
             }
@@ -430,35 +438,115 @@ impl PgHandler {
         }) else {
             return;
         };
+        // A Memoize's cache (RP-916): each distinct parameter set the
+        // outer rows bring, in their order, is one miss -- the scan run
+        // once for it -- and every repeat a hit, while the cache holds every
+        // entry (`cache_lookup`). Its memory is each entry's
+        // `EMPTY_ENTRY_MEMORY_BYTES` -- a MemoizeEntry and a MemoizeKey (24
+        // bytes each) and the parameters' minimal tuple -- and each row's
+        // `CACHE_TUPLE_BYTES`, a MemoizeTuple (16) and its minimal tuple.
+        let memo_read = memoized
+            .then(|| tree.children[1].memo.as_ref().map(|m| m.read.clone()))
+            .flatten();
+        if memoized && memo_read.is_none() {
+            return;
+        }
+        // Its key must be the Index Cond's outer columns, one each: a
+        // clause the scan dropped as implied still keys it (`r.a < k.a and
+        // r.a <> k.a` is keyed `r.a, r.a`), which is not counted here.
+        if memoized {
+            let written: Vec<String> = quals
+                .iter()
+                .map(|(_, c)| format!("{outer_alias}.{c}"))
+                .collect();
+            let key = tree.children[1]
+                .details
+                .iter()
+                .find(|(k, _)| k == "Cache Key")
+                .map(|(_, v)| v.clone());
+            if key.as_deref() != Some(written.join(", ").as_str()) {
+                return;
+            }
+        }
+        let param_fields: Vec<String> = outer_fields.iter().map(|(_, f)| f.clone()).collect();
+        let row_lens: Vec<usize> = match &memo_read {
+            Some(read) => {
+                let Some(lens) = keyed_docs
+                    .iter()
+                    .map(|d| heap::minimal_tuple_len(&inner_def, d, read))
+                    .collect::<Option<Vec<usize>>>()
+                else {
+                    return;
+                };
+                lens
+            }
+            None => Vec::new(),
+        };
+        let mut seen: std::collections::HashSet<Vec<Option<Key>>> =
+            std::collections::HashSet::new();
+        let (mut misses, mut miss_rows, mut memory) = (0usize, 0usize, 0usize);
         let mut total = 0usize;
         let mut fetches = 0usize;
         let mut joined = 0usize;
-        'outer: for d in &outer_docs {
+        for d in &outer_docs {
+            // The cache key's values; a NULL one is a key like any other.
+            let mut cache_key = Vec::with_capacity(outer_fields.len());
             let mut params = Vec::with_capacity(outer_fields.len());
+            let mut null = false;
             for (op, f) in &outer_fields {
+                let Some(k) = key_of(d.get(f)) else {
+                    return;
+                };
+                cache_key.push(k);
                 match d.get(f) {
                     // A NULL parameter makes the index scan return nothing.
-                    None | Some(Bson::Null) => {
-                        joined += usize::from(left);
-                        continue 'outer;
-                    }
+                    None | Some(Bson::Null) => null = true,
                     v => match number(v) {
                         Some(n) => params.push((*op, n)),
                         None => return,
                     },
                 }
             }
+            let miss = !memoized || seen.insert(cache_key);
             let mut here = 0usize;
-            for ((k, _), vis) in keyed.iter().zip(&visible) {
-                if params.iter().all(|(op, v)| holds(op, *k, *v)) {
-                    here += 1;
-                    fetches += usize::from(!vis);
+            if !null {
+                for (i, ((k, _), vis)) in keyed.iter().zip(&visible).enumerate() {
+                    if params.iter().all(|(op, v)| holds(op, *k, *v)) {
+                        here += 1;
+                        if miss {
+                            fetches += usize::from(!vis);
+                            if memoized {
+                                memory += 16 + row_lens[i];
+                            }
+                        }
+                    }
                 }
+            }
+            if memoized && miss {
+                let Some(key_len) = heap::minimal_tuple_len(&outer_def, d, &param_fields) else {
+                    return;
+                };
+                memory += 24 + 24 + key_len;
+                misses += 1;
+                miss_rows += here;
             }
             total += here;
             joined += if left { here.max(1) } else { here };
         }
         if joined != actual {
+            return;
+        }
+        // A cache past `hash_mem` evicts (`cache_reduce_memory`), which is
+        // not modelled.
+        let multiplier = self
+            .settings
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get("hash_mem_multiplier")
+            .and_then(|v| v.trim().parse::<f64>().ok())
+            .unwrap_or(2.0);
+        let hash_mem = self.kb_setting("work_mem", 4096) as f64 * 1024.0 * multiplier;
+        if memoized && memory as f64 > hash_mem {
             return;
         }
         let loops = outer_docs.len();
@@ -470,8 +558,29 @@ impl PgHandler {
         let inner = &mut tree.children[1];
         inner.actual_rows = Some(per_loop(total, loops));
         inner.actual_loops = Some(loops);
+        let inner = if memoized {
+            if let Some(m) = inner.memo.as_mut() {
+                m.stats = Some(crate::explain::MemoStats {
+                    hits: loops - misses,
+                    misses,
+                    evictions: 0,
+                    overflows: 0,
+                    peak_bytes: memory,
+                });
+            }
+            let scan = &mut inner.children[0];
+            scan.actual_rows = Some(per_loop(miss_rows, misses));
+            scan.actual_loops = Some(misses);
+            scan
+        } else {
+            inner
+        };
+        // Its Index Cond is its only qual: nothing rechecked or filtered,
+        // which the structured formats print as a zero.
         if index_only {
             inner.heap_fetches = Some(fetches);
+        } else {
+            inner.removed_by_filter = Some(0);
         }
     }
 

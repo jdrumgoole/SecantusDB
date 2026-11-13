@@ -714,8 +714,10 @@ impl PgHandler {
             .filter(|f| restriction(f))
             .map(|f| f.ops * costsize::CPU_OPERATOR_COST)
             .sum();
-        for (slot, (inner_leaf, outer_rows, inner_rows)) in
-            [(lb, a.2, b.2), (la, b.2, a.2)].into_iter().enumerate()
+        for (slot, (inner_leaf, outer_leaf, outer_rows, inner_rows)) in
+            [(lb, la, a.2, b.2), (la, lb, b.2, a.2)]
+                .into_iter()
+                .enumerate()
         {
             if left_join && slot == 1 {
                 break;
@@ -735,6 +737,7 @@ impl PgHandler {
                 ParamFound::Unmodelled => return None,
                 ParamFound::Scan(mut p, scan) => {
                     p.qual = kept;
+                    p.memo = self.memo_key(outer_leaf, inner_leaf, &movable, outer_rows)?;
                     param[slot] = Some(p);
                     param_scans[slot] = Some(scan);
                 }
@@ -761,7 +764,10 @@ impl PgHandler {
             let slot = usize::from(plan.b_outer);
             let p = param[slot]?;
             let est = |e: Estimate| (p.startup, p.total, p.rows, e.3);
-            let scan = param_scans[slot].take();
+            let mut scan = param_scans[slot].take();
+            if let Some(s) = scan.as_mut() {
+                s.memoize = plan.memoize;
+            }
             if plan.b_outer {
                 (est(a), b, scan)
             } else {
@@ -1108,6 +1114,85 @@ impl PgHandler {
         Some(out)
     }
 
+    /// `get_memoize_path` over a scan of `inner` parameterized by the row
+    /// of `outer` (`outer_rows` rows), the join clauses `moved` into it
+    /// (RP-916): its cache key (`paraminfo_get_equal_hashops`), each
+    /// clause's operand over `outer`, and that key's distinct count as
+    /// `estimate_num_groups` reads it -- the Vars the operands read, each
+    /// once, a column never analysed a default. `Some(None)` where
+    /// PostgreSQL makes no Memoize: `enable_memoize` off, a clause that is
+    /// not a two-operand operator with one operand over each side, or an
+    /// operand whose type has no hash support. `None` where this cannot
+    /// tell: an operand of a type whose hash support it does not know, or
+    /// an expression an expression index on `outer` could hold statistics
+    /// for.
+    fn memo_key(
+        &self,
+        outer: &SideLeaf,
+        inner: &SideLeaf,
+        moved: &[&secantus_pgplan::joins::JoinFilter],
+        outer_rows: f64,
+    ) -> Option<Option<secantus_pgplan::joincost::MemoKey>> {
+        if self.setting_is("enable_memoize", "off") || moved.is_empty() {
+            return Some(None);
+        }
+        let reads = |keys: &[String], leaf: &SideLeaf| {
+            !keys.is_empty()
+                && keys
+                    .iter()
+                    .all(|k| leaf.keys.iter().any(|(lk, ..)| lk == k))
+        };
+        let expression_index = self
+            .index_relations()
+            .iter()
+            .any(|ix| ix.table.name == outer.table && ix.keys.contains(&0));
+        let mut vars: Vec<String> = Vec::new();
+        for f in moved {
+            let Some([l, r]) = &f.operands else {
+                return Some(None);
+            };
+            let o = if reads(&l.keys, outer) && reads(&r.keys, inner) {
+                l
+            } else if reads(&r.keys, outer) && reads(&l.keys, inner) {
+                r
+            } else {
+                return Some(None);
+            };
+            if !hash_support(o.type_oid?)? {
+                return Some(None);
+            }
+            if !o.bare && expression_index {
+                return None;
+            }
+            for k in &o.keys {
+                if !vars.contains(k) {
+                    vars.push(k.clone());
+                }
+            }
+        }
+        let mut key = secantus_pgplan::joincost::MemoKey {
+            ndistinct: 1.0,
+            max_ndistinct: 1.0,
+            vars: 0,
+            default: false,
+            tuples: 0.0,
+            rel_rows: outer_rows,
+        };
+        for v in &vars {
+            let (_, field, _) = outer.keys.iter().find(|(k, ..)| k == v)?;
+            match self.analysed_key(&outer.table, field) {
+                Some(stats) => {
+                    key.ndistinct *= stats.ndistinct;
+                    key.max_ndistinct = key.max_ndistinct.max(stats.ndistinct);
+                    key.tuples = stats.tuples;
+                }
+                None => key.default = true,
+            }
+            key.vars += 1;
+        }
+        Some(Some(key))
+    }
+
     /// `leaf` as the inner side of a nested loop through one of its
     /// table's B-trees, its index qual one of `filters`' inequalities
     /// between one of its key columns and an expression of the outer side
@@ -1267,12 +1352,15 @@ impl PgHandler {
                 total,
                 rows: costsize::clamp_row_est(param_rows),
                 qual: 0.0,
+                memo: None,
             },
             ParamScan {
                 index: name,
                 alias,
                 column: column.clone(),
                 index_only,
+                read: leaf.read.clone(),
+                memoize: None,
             },
         )
     }
@@ -5150,15 +5238,6 @@ struct KeyIndex {
     allvisfrac: f64,
 }
 
-impl HashSide {
-    /// Its key column's average width, for a Memoize keyed on it.
-    fn key_index_width(&self) -> Option<i64> {
-        self.column
-            .as_ref()
-            .map(|(stats, _)| i64::from(stats.width))
-    }
-}
-
 /// [`PgHandler::nest_loop_estimate`]'s answer: the plan, the two scans'
 /// and the join's estimates, the inner's parameterized index scan and the
 /// preserved side's index path, where either is chosen.
@@ -5399,12 +5478,32 @@ pub(crate) struct ParamScan {
     pub column: String,
     /// Read index-only: the index holds every column the side reads.
     pub index_only: bool,
+    /// The stored fields the scan returns (its relation's `reltarget`),
+    /// which a Memoize over it stores a row of each.
+    pub read: Vec<String>,
+    /// Under a Memoize (RP-916): the Memoize's `(startup, total)`.
+    pub memoize: Option<(f64, f64)>,
 }
 
 enum ParamFound {
     None,
     Unmodelled,
     Scan(secantus_pgplan::joincost::ParamInner, ParamScan),
+}
+
+/// Whether the built-in type `oid` has hash support (`lookup_type_cache`'s
+/// `TYPECACHE_HASH_PROC`: a default hash operator class, its own or a
+/// binary-coercible type's). `None` for a type this does not know the
+/// answer for: a user's type, or one a polymorphic class (`array_ops`,
+/// `enum_ops`, ...) could serve.
+fn hash_support(oid: i64) -> Option<bool> {
+    /// `HASH_AM_OID`.
+    const HASH_AM: i64 = 405;
+    if crate::catalog_reads::default_opclass(oid, HASH_AM) != 0 {
+        return Some(true);
+    }
+    // json, xml and the geometric types: no hash operator class at all.
+    matches!(oid, 114 | 142 | 600 | 601 | 602 | 603 | 604 | 628 | 718).then_some(false)
 }
 
 /// One analysed column's statistics (`PgHandler::analysed_key`).
@@ -5752,7 +5851,8 @@ fn unique_key_other_paths(
             return Some(out);
         }
         let k = s.key_index.as_ref()?;
-        let other_key = other.key_index_width()?;
+        // The Memoize over it is keyed on the other side's analysed column.
+        other.column.as_ref()?;
         let (st, tt) = costsize::ordered_index_scan_with(
             &k.rel,
             &k.index,
@@ -5764,13 +5864,7 @@ fn unique_key_other_paths(
         // clause's (`var_eq_non_const`), at most the rows.
         let ppi_rows = costsize::clamp_row_est(k.rel.tuples * k.where_sel / k.ndistinct.max(1.0))
             .min(s.scan.2);
-        let memo_key = MemoKey {
-            ndistinct: other.stats.0,
-            default: false,
-            tuples: other.tuples,
-            rel_rows: other.scan.2,
-            width: other_key,
-        };
+        let memo_key = MemoKey::column(other.stats.0, false, other.tuples, other.scan.2);
         let param = |(startup, total): (f64, f64)| InPath {
             startup,
             total,

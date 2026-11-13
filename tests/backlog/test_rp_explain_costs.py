@@ -1574,6 +1574,35 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "        Index Cond: (a > (e.a + 1))",
         ],
     ),
+    # Still open (RP-914): the same under the Memoize an expression of few
+    # values gets, its cache's counts and its scan's.
+    "analyze of a memoize keyed by an expression of the outer side": (
+        "RP-914",
+        _ANALYSED_INTS,
+        "explain (analyze, costs off, timing off, summary off)"
+        " select * from r, k where r.a + 1 < k.a",
+        [
+            "Nested Loop (actual rows=994500 loops=1)",
+            "  ->  Seq Scan on r (actual rows=1000 loops=1)",
+            "  ->  Memoize (actual rows=994 loops=1000)",
+            "        Cache Key: (r.a + 1)",
+            "        Cache Mode: binary",
+            "        Hits: 990  Misses: 10  Evictions: 0  Overflows: 0  Memory Usage: 380kB",
+            "        ->  Index Scan using k_pkey on k (actual rows=994 loops=10)",
+            "              Index Cond: (a > (r.a + 1))",
+        ],
+    ),
+    # Still open (RP-925): VERBOSE's output lists and qualified names.
+    "explain verbose prints a scan's output list": (
+        "RP-925",
+        _ANALYSED,
+        "explain verbose select * from k where a > 5",
+        [
+            "Seq Scan on public.k  (cost=0.00..17.50 rows=995 width=7)",
+            "  Output: a, b",
+            "  Filter: (k.a > 5)",
+        ],
+    ),
     # Split from RP-354 and fixed: a `<>` whose operands differ in type
     # after a cast compares through PostgreSQL's cross-type operator
     # (`int48ne`), its cast operand an expression with no statistics;
@@ -1762,8 +1791,10 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "        Filter: (a <> 2)",
         ],
     ),
-    # Still open: a parameterized index scan under an outer side with few
-    # distinct values is cached by a Memoize.
+    # Fixed (RP-916): a parameterized index scan under an outer side with
+    # few distinct values is cached by a Memoize (`get_memoize_path`,
+    # `cost_memoize_rescan`); before, the Index Scan sat under the join
+    # uncached at `cost=0.28..9487.50`.
     "nested loop into an index under an outer side of few values": (
         "RP-916",
         _ANALYSED_INTS,
@@ -1776,6 +1807,214 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "        Cache Mode: binary",
             "        ->  Index Scan using k_pkey on k  (cost=0.28..6.14 rows=333 width=7)",
             "              Index Cond: (a > r.a)",
+        ],
+    ),
+    # A Memoize is planned under COSTS OFF as with costs.
+    "a memoize over a nested loop's index scan, costs off": (
+        "RP-916",
+        _ANALYSED_INTS,
+        "explain (costs off) select * from r left join k on r.a < k.a",
+        [
+            "Nested Loop Left Join",
+            "  ->  Seq Scan on r",
+            "  ->  Memoize",
+            "        Cache Key: r.a",
+            "        Cache Mode: binary",
+            "        ->  Index Scan using k_pkey on k",
+            "              Index Cond: (a > r.a)",
+        ],
+    ),
+    # Its cache under ANALYZE: a miss for each of r.a's ten values, the
+    # scan run once for each, and its memory every entry's and row's
+    # (`EMPTY_ENTRY_MEMORY_BYTES`, `CACHE_TUPLE_BYTES`).
+    "analyze of a memoize over a nested loop's index scan": (
+        "RP-916",
+        _ANALYSED_INTS,
+        "explain (analyze, costs off, timing off, summary off)"
+        " select * from r left join k on r.a < k.a",
+        [
+            "Nested Loop Left Join (actual rows=995500 loops=1)",
+            "  ->  Seq Scan on r (actual rows=1000 loops=1)",
+            "  ->  Memoize (actual rows=996 loops=1000)",
+            "        Cache Key: r.a",
+            "        Cache Mode: binary",
+            "        Hits: 990  Misses: 10  Evictions: 0  Overflows: 0  Memory Usage: 380kB",
+            "        ->  Index Scan using k_pkey on k (actual rows=996 loops=10)",
+            "              Index Cond: (a > r.a)",
+        ],
+    ),
+    # Over an index-only scan, the heap fetched on a miss only.
+    "analyze of a memoize over an index only scan": (
+        "RP-916",
+        _ANALYSED_INTS,
+        "explain (analyze, costs off, timing off, summary off)"
+        " select r.a from r, k where r.a < k.a",
+        [
+            "Nested Loop (actual rows=995500 loops=1)",
+            "  ->  Seq Scan on r (actual rows=1000 loops=1)",
+            "  ->  Memoize (actual rows=996 loops=1000)",
+            "        Cache Key: r.a",
+            "        Cache Mode: binary",
+            "        Hits: 990  Misses: 10  Evictions: 0  Overflows: 0  Memory Usage: 351kB",
+            "        ->  Index Only Scan using k_pkey on k (actual rows=996 loops=10)",
+            "              Index Cond: (a > r.a)",
+            "              Heap Fetches: 9955",
+        ],
+    ),
+    # Structured: the key one text, the counts as fields.
+    "analyze of a memoize over a nested loop's index scan, json": (
+        "RP-916",
+        _ANALYSED_INTS,
+        "explain (analyze, costs off, timing off, summary off, format json)"
+        " select * from r left join k on r.a < k.a",
+        [
+            '[\n  {\n    "Plan": {\n      "Node Type": "Nested Loop",\n'
+            '      "Parallel Aware": false,\n      "Async Capable": false,\n'
+            '      "Join Type": "Left",\n      "Actual Rows": 995500,\n'
+            '      "Actual Loops": 1,\n      "Inner Unique": false,\n'
+            '      "Plans": [\n        {\n          "Node Type": "Seq Scan",\n'
+            '          "Parent Relationship": "Outer",\n'
+            '          "Parallel Aware": false,\n'
+            '          "Async Capable": false,\n          "Relation Name": "r",\n'
+            '          "Alias": "r",\n          "Actual Rows": 1000,\n'
+            '          "Actual Loops": 1\n        },\n        {\n'
+            '          "Node Type": "Memoize",\n'
+            '          "Parent Relationship": "Inner",\n'
+            '          "Parallel Aware": false,\n'
+            '          "Async Capable": false,\n          "Actual Rows": 996,\n'
+            '          "Actual Loops": 1000,\n          "Cache Key": "r.a",\n'
+            '          "Cache Mode": "binary",\n          "Cache Hits": 990,\n'
+            '          "Cache Misses": 10,\n          "Cache Evictions": 0,\n'
+            '          "Cache Overflows": 0,\n          "Peak Memory Usage": 380,\n'
+            '          "Plans": [\n            {\n'
+            '              "Node Type": "Index Scan",\n'
+            '              "Parent Relationship": "Outer",\n'
+            '              "Parallel Aware": false,\n'
+            '              "Async Capable": false,\n'
+            '              "Scan Direction": "Forward",\n'
+            '              "Index Name": "k_pkey",\n'
+            '              "Relation Name": "k",\n              "Alias": "k",\n'
+            '              "Actual Rows": 996,\n              "Actual Loops": 10,\n'
+            '              "Index Cond": "(a > r.a)",\n'
+            '              "Rows Removed by Index Recheck": 0\n            }\n'
+            '          ]\n        }\n      ]\n    },\n    "Triggers": [\n    ]\n'
+            "  }\n]",
+        ],
+    ),
+    # Found while working RP-916: a parameterized index scan's structured
+    # ANALYZE prints its zero recheck count.
+    "analyze of a nested loop's parameterized index scan, json": (
+        "RP-916",
+        _ANALYSED + ["set enable_memoize = off"],
+        "explain (analyze, costs off, timing off, summary off, format json)"
+        " select * from e left join k on e.a < k.a",
+        [
+            '[\n  {\n    "Plan": {\n      "Node Type": "Nested Loop",\n'
+            '      "Parallel Aware": false,\n      "Async Capable": false,\n'
+            '      "Join Type": "Left",\n      "Actual Rows": 499501,\n'
+            '      "Actual Loops": 1,\n      "Inner Unique": false,\n'
+            '      "Plans": [\n        {\n          "Node Type": "Seq Scan",\n'
+            '          "Parent Relationship": "Outer",\n'
+            '          "Parallel Aware": false,\n'
+            '          "Async Capable": false,\n          "Relation Name": "e",\n'
+            '          "Alias": "e",\n          "Actual Rows": 1000,\n'
+            '          "Actual Loops": 1\n        },\n        {\n'
+            '          "Node Type": "Index Scan",\n'
+            '          "Parent Relationship": "Inner",\n'
+            '          "Parallel Aware": false,\n'
+            '          "Async Capable": false,\n'
+            '          "Scan Direction": "Forward",\n'
+            '          "Index Name": "k_pkey",\n          "Relation Name": "k",\n'
+            '          "Alias": "k",\n          "Actual Rows": 500,\n'
+            '          "Actual Loops": 1000,\n'
+            '          "Index Cond": "(a > e.a)",\n'
+            '          "Rows Removed by Index Recheck": 0\n        }\n      ]\n'
+            '    },\n    "Triggers": [\n    ]\n  }\n]',
+        ],
+    ),
+    # Each moved clause's outer operand is a key, of its own type; two
+    # Vars of one table are at most a tenth of its rows (`estimate_num_groups`).
+    "a memoize keyed by two columns of other types": (
+        "RP-916",
+        _ANALYSED_INTS,
+        "explain select * from r8 left join k on r8.a < k.a and r8.s > k.a",
+        [
+            "Nested Loop Left Join  (cost=0.29..1648.71 rows=111111 width=17)",
+            "  ->  Seq Scan on r8  (cost=0.00..16.00 rows=1000 width=10)",
+            "  ->  Memoize  (cost=0.29..2.54 rows=111 width=7)",
+            "        Cache Key: r8.a, r8.s",
+            "        Cache Mode: binary",
+            "        ->  Index Scan using k_pkey on k  (cost=0.28..2.53 rows=111 width=7)",
+            "              Index Cond: ((a > r8.a) AND (a < r8.s))",
+        ],
+    ),
+    # A clause the index qual implies still keys the cache.
+    "a memoize keyed twice by one column": (
+        "RP-916",
+        _ANALYSED_INTS,
+        "explain select * from r left join k on r.a < k.a and r.a <> k.a",
+        [
+            "Nested Loop Left Join  (cost=0.29..4265.82 rows=333000 width=11)",
+            "  ->  Seq Scan on r  (cost=0.00..15.00 rows=1000 width=4)",
+            "  ->  Memoize  (cost=0.29..6.99 rows=333 width=7)",
+            "        Cache Key: r.a, r.a",
+            "        Cache Mode: binary",
+            "        ->  Index Scan using k_pkey on k  (cost=0.28..6.98 rows=333 width=7)",
+            "              Index Cond: (a > r.a)",
+        ],
+    ),
+    # An expression's distinct count is its Vars'.
+    "a memoize keyed by an expression of the outer side": (
+        "RP-916",
+        _ANALYSED_INTS,
+        "explain select * from r, k where r.a + 1 < k.a",
+        [
+            "Nested Loop  (cost=0.29..4256.70 rows=333333 width=11)",
+            "  ->  Seq Scan on r  (cost=0.00..15.00 rows=1000 width=4)",
+            "  ->  Memoize  (cost=0.29..6.15 rows=333 width=7)",
+            "        Cache Key: (r.a + 1)",
+            "        Cache Mode: binary",
+            "        ->  Index Scan using k_pkey on k  (cost=0.28..6.14 rows=333 width=7)",
+            "              Index Cond: (a > (r.a + 1))",
+        ],
+    ),
+    # A call inside the key, its `procost` the index scan's startup.
+    "a memoize keyed by arithmetic over a call": (
+        "RP-916",
+        _ANALYSED,
+        "explain select * from e, k where length(e.b) + 1 < k.a",
+        [
+            "Nested Loop  (cost=0.29..4256.73 rows=333333 width=14)",
+            "  ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
+            "  ->  Memoize  (cost=0.29..6.16 rows=333 width=7)",
+            "        Cache Key: (length(e.b) + 1)",
+            "        Cache Mode: binary",
+            "        ->  Index Scan using k_pkey on k  (cost=0.28..6.15 rows=333 width=7)",
+            "              Index Cond: (a > (length(e.b) + 1))",
+        ],
+    ),
+    # A key of as many values as calls is cheaper uncached.
+    "no memoize over an outer side of distinct calls": (
+        "RP-916",
+        _ANALYSED,
+        "explain select * from e, k where abs(e.a) < k.a",
+        [
+            "Nested Loop  (cost=0.28..9490.00 rows=333333 width=14)",
+            "  ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
+            "  ->  Index Scan using k_pkey on k  (cost=0.28..6.14 rows=333 width=7)",
+            "        Index Cond: (a > abs(e.a))",
+        ],
+    ),
+    # `enable_memoize` off: none.
+    "no memoize with enable_memoize off": (
+        "RP-916",
+        _ANALYSED_INTS + ["set enable_memoize = off"],
+        "explain select * from r, k where r.a < k.a",
+        [
+            "Nested Loop  (cost=0.28..9487.50 rows=333333 width=11)",
+            "  ->  Seq Scan on r  (cost=0.00..15.00 rows=1000 width=4)",
+            "  ->  Index Scan using k_pkey on k  (cost=0.28..6.14 rows=333 width=7)",
+            "        Index Cond: (a > r.a)",
         ],
     ),
     # Still open: a comparison of real and double precision is the
@@ -2140,11 +2379,13 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "              Index Cond: (a > e2.a)",
         ],
     ),
-    # Still open (RP-354): an inequality between the inner's key and a
-    # call over the outer row is its Index Cond, under a Memoize keyed by
-    # the call.
+    # Split from RP-354 and fixed: an inequality between the inner's key
+    # and a call over the outer row is its Index Cond, the call's
+    # `procost` its startup (`index_other_operands_eval_cost`), under a
+    # Memoize keyed by the call, whose distinct count is its Var's; before,
+    # the nested loop printed zeros.
     "nested loop into an index bounded by a call of the outer side": (
-        "RP-354",
+        "RP-329",
         _ANALYSED,
         "explain select * from e, k where length(e.b) < k.a",
         [
@@ -4991,6 +5232,7 @@ def _marked(name: str, item: str) -> Any:
         "RP-405",
         "RP-409",
         "RP-913",
+        "RP-916",
     )
     mark = pytest.mark.backlog_fixed if fixed else pytest.mark.backlog
     return pytest.param(name, marks=mark(item), id=name)
