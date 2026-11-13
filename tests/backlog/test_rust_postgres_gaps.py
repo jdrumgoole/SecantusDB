@@ -2741,13 +2741,14 @@ def test_a_left_join_descending_nulls_last_over_an_index_reads_it_backward(pg: A
     )
 
 
-@pytest.mark.backlog("RP-028")
+@pytest.mark.backlog_fixed("RP-028")
 def test_a_two_column_order_by_over_a_join_keeps_its_ties(pg: Any) -> None:
     """PostgreSQL 15.19, two 3,000-row tables never analysed: `t0 JOIN t1 ON
     t0.b = t1.a ORDER BY t1.a, t0.c LIMIT 5` leaves its ties (every row
-    t1.a = 1, t0.c = 0) as t0's rows 1310, 1695, 2815, 1660, 190. The join
-    search declines an ORDER BY of several columns, so this joins whole and
-    sorts: 190, 1310, 1695, 2815, 1660."""
+    t1.a = 1, t0.c = 0) as t0's rows 1310, 1695, 2815, 1660, 190: an
+    Incremental Sort (presorted key t1.a) over the Merge Join. The join
+    search declined an ORDER BY of several columns, so this joined whole
+    and sorted: 190, 1310, 1695, 2815, 1660."""
     pg.execute("begin")
     try:
         _rp028_tables(pg, "rp028_m", 2, 3000)
@@ -2763,6 +2764,79 @@ def test_a_two_column_order_by_over_a_join_keeps_its_ties(pg: Any) -> None:
         "ok",
         [(1310, 1), (1695, 1), (2815, 1), (1660, 1), (190, 1)],
     )
+
+
+@pytest.mark.backlog_fixed("RP-028")
+def test_a_left_join_order_by_two_columns_sorts_incrementally(pg: Any) -> None:
+    """PostgreSQL 15.19, two 3,000-row tables never analysed, an index on
+    t1.a: `t0 LEFT JOIN t1 ON t0.a = t1.b ORDER BY t0.a, t0.c LIMIT 5` is
+    an Incremental Sort (presorted key t0.a) over a Merge Left Join, which
+    leaves t0.a = 1's ties as t1's rows 11, 16, 21, 1876, 6. An ORDER BY of
+    several columns went to the streamed join (a merge join of another
+    plan's), which left them in another order."""
+    pg.execute("begin")
+    try:
+        _rp028_tables(pg, "rp028_l", 2, 3000)
+        pg.execute("create index on rp028_l1 (a)")
+        got = pg_answer(
+            pg,
+            "select rp028_l0.a, rp028_l1.a from rp028_l0"
+            " left join rp028_l1 on rp028_l0.a = rp028_l1.b"
+            " order by rp028_l0.a, rp028_l0.c limit 5",
+        )
+    finally:
+        pg.execute("rollback")
+    assert got == ("ok", [(1, 11), (1, 16), (1, 21), (1, 1876), (1, 6)])
+
+
+@pytest.mark.backlog_fixed("RP-028")
+def test_an_order_by_key_in_the_first_keys_class_is_redundant(pg: Any) -> None:
+    """PostgreSQL 15.19, three 20-row tables never analysed: in `t0 JOIN t1
+    ON t0.b = t1.a JOIN t2 ON t0.c = t2.a ORDER BY t2.a, t0.c LIMIT 5`,
+    t0.c is in t2.a's equivalence class, so the second key is a redundant
+    pathkey (`pathkey_is_redundant`) and a path in t2.a's order needs no
+    sort: (11, 4, 1), (6, 6, 1), (1, 1, 1), (16, 2, 1), (2, 2, 2). An ORDER
+    BY of several columns was joined whole and sorted."""
+    pg.execute("begin")
+    try:
+        _rp028_tables(pg, "rp028_r", 3, 20)
+        got = pg_answer(
+            pg,
+            "select rp028_r0.a, rp028_r1.a, rp028_r2.a from rp028_r0"
+            " join rp028_r1 on rp028_r0.b = rp028_r1.a"
+            " join rp028_r2 on rp028_r0.c = rp028_r2.a"
+            " order by rp028_r2.a, rp028_r0.c limit 5",
+        )
+    finally:
+        pg.execute("rollback")
+    assert got == ("ok", [(11, 4, 1), (6, 6, 1), (1, 1, 1), (16, 2, 1), (2, 2, 2)])
+
+
+@pytest.mark.backlog("RP-028")
+def test_a_descending_first_key_with_another_reads_an_index_backward(pg: Any) -> None:
+    """PostgreSQL 15.19, two 300-row tables never analysed, an index on
+    t1.a: `t0 JOIN t1 ON t0.b = t1.a ORDER BY t1.a DESC, t0.c LIMIT 5` is
+    an Incremental Sort (presorted key t1.a) over a Nested Loop whose outer
+    side is that index's backward scan, which leaves t1.a = 6's ties as
+    t0's rows 125, 20, 55, 90, 160. With a key after it, a descending
+    first key is no merge join's order (`select_outer_pathkeys_for_merge`
+    takes the query's pathkeys only when every key is a merge clause's
+    class, so the merges sort ascending), which the search's descending
+    order assumes it is; it declines the shape, and the join planned for
+    every row and sorted leaves them 90, 125, 55, 20, 160."""
+    pg.execute("begin")
+    try:
+        _rp028_tables(pg, "rp028_d", 2, 300)
+        pg.execute("create index on rp028_d1 (a)")
+        got = pg_answer(
+            pg,
+            "select rp028_d0.a, rp028_d1.a from rp028_d0"
+            " join rp028_d1 on rp028_d0.b = rp028_d1.a"
+            " order by rp028_d1.a desc, rp028_d0.c limit 5",
+        )
+    finally:
+        pg.execute("rollback")
+    assert got == ("ok", [(125, 6), (20, 6), (55, 6), (90, 6), (160, 6)])
 
 
 @pytest.mark.backlog_fixed("RP-028")

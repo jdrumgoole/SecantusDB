@@ -10946,18 +10946,19 @@ fn plan_create_index(
 
 thread_local! {
     /// `(constraint oid, pg_get_constraintdef text)`, published by the wire
-    /// layer with the rest of the catalog.
-    static CONSTRAINT_DEFS: std::cell::RefCell<Vec<(i64, String)>> =
-        const { std::cell::RefCell::new(Vec::new()) };
+    /// layer with the rest of the catalog, and derived at the first lookup
+    /// (RP-911).
+    static CONSTRAINT_DEFS: deferred::Slot<Vec<(i64, String)>> = deferred::Slot::default();
 }
 
 thread_local! {
     /// `COMMENT ON` text: `(object oid, sub-id, comment)`, the sub-id a
     /// column's number or 0 for the object itself -- pg_description's key.
     /// The error instead when the server could not read them: a lookup then
-    /// raises it, never answers NULL for a comment it did not read.
-    static OBJECT_COMMENTS: std::cell::RefCell<Result<Vec<(i64, i32, String)>>> =
-        const { std::cell::RefCell::new(Ok(Vec::new())) };
+    /// raises it, never answers NULL for a comment it did not read. Derived
+    /// at the first lookup (RP-911).
+    static OBJECT_COMMENTS: deferred::Slot<Result<Vec<(i64, i32, String)>>> =
+        deferred::Slot::new(Ok(Vec::new()));
 }
 
 /// Install the comments `obj_description` / `col_description` answer from.
@@ -10993,13 +10994,19 @@ pub(crate) fn shared_comment(oid: i64, catalog: &str) -> Option<String> {
 /// or the error the server's read of them failed with -- which every lookup
 /// then raises.
 pub fn set_object_comments(comments: Result<Vec<(i64, i32, String)>>) {
-    OBJECT_COMMENTS.with(|c| *c.borrow_mut() = comments);
+    OBJECT_COMMENTS.with(|c| c.set(comments));
+}
+
+/// [`set_object_comments`], listed when a statement first asks for a
+/// comment: `build` reads only what it captured (RP-911).
+pub fn defer_object_comments(build: impl FnOnce() -> Vec<(i64, i32, String)> + 'static) {
+    OBJECT_COMMENTS.with(|c| c.defer(move || Ok(build())));
 }
 
 /// The comment on object `oid` (column `subid`, or 0 for the object); the
 /// read's error when the comments could not be read.
 pub(crate) fn object_comment(oid: i64, subid: i32) -> Result<Option<String>> {
-    OBJECT_COMMENTS.with(|c| match &*c.borrow() {
+    deferred::read(&OBJECT_COMMENTS, |c| match c {
         Ok(comments) => Ok(comments
             .iter()
             .find(|(o, s, _)| *o == oid && *s == subid)
@@ -11201,7 +11208,14 @@ fn balanced(text: &str) -> bool {
 
 /// Install the constraint definitions `pg_get_constraintdef` answers from.
 pub fn set_constraint_defs(defs: Vec<(i64, String)>) {
-    CONSTRAINT_DEFS.with(|d| *d.borrow_mut() = defs);
+    CONSTRAINT_DEFS.with(|d| d.set(defs));
+}
+
+/// [`set_constraint_defs`], rendered when a statement first asks for one:
+/// `build` reads only what it captured, and renders under the planner
+/// state published with it (RP-911).
+pub fn defer_constraint_defs(build: impl FnOnce() -> Vec<(i64, String)> + 'static) {
+    CONSTRAINT_DEFS.with(|d| d.defer(build));
 }
 
 /// A CHECK constraint's expression as `pg_get_constraintdef` prints it:
@@ -46656,9 +46670,8 @@ fn const_value_node(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result<
                 f.args.get(1).map(|a| const_value(a, params)).transpose()?,
                 Some(Bson::Boolean(true))
             );
-            return Ok(CONSTRAINT_DEFS.with(|d| {
-                d.borrow()
-                    .iter()
+            return Ok(deferred::read(&CONSTRAINT_DEFS, |d| {
+                d.iter()
                     .find(|(o, _)| *o == oid)
                     .map_or(Bson::Null, |(_, t)| {
                         let text = match t.strip_prefix("CHECK ((").and_then(|r| {

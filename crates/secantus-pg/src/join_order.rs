@@ -82,6 +82,9 @@ struct Edge {
     v: usize,
     v_key: String,
     on: usize,
+    /// The clause is written `v_key = u_key`: its left column, the first
+    /// member of the class it makes (`process_equivalence`), is `v_key`.
+    rev: bool,
 }
 
 /// `cpu_operator_cost`.
@@ -778,14 +781,16 @@ impl PgHandler {
             {
                 return None;
             }
+            let rev = equi_reversed.first().copied().unwrap_or(false);
             edges.push(Edge {
                 u,
                 u_key: lk.clone(),
                 v,
                 v_key: rk.clone(),
                 on: i,
+                rev,
             });
-            reversed.push(equi_reversed.first().copied().unwrap_or(false));
+            reversed.push(rev);
             kinds.push(*kind);
         }
         // `reduce_outer_joins`, top down: an inner join's strict clause
@@ -902,6 +907,7 @@ impl PgHandler {
                 v,
                 v_key: rk.clone(),
                 on: ON_WHERE,
+                rev: false,
             });
             reversed.push(false);
         }
@@ -1825,10 +1831,27 @@ impl PgHandler {
         Ok(Some(joined))
     }
 
-    /// Whether the search plans `node` for an ORDER BY of one column under
-    /// a LIMIT (`four_table_join` with both).
-    pub(crate) fn ordered_limit_searched(&self, node: &JoinNode) -> bool {
-        self.four_table_chain(node, true, true).is_some()
+    /// Whether the search plans `node` for an ORDER BY under a LIMIT
+    /// (`four_table_join` with both): its first column's joined-row key
+    /// (`ascending`: with its NULLs last), and `later` its later columns',
+    /// which it plans for when [`PgHandler::later_order_keys_modelled`]
+    /// does, and with any that is a pathkey of its own only after an
+    /// ascending first key.
+    pub(crate) fn ordered_limit_searched(
+        &self,
+        node: &JoinNode,
+        first: &str,
+        ascending: bool,
+        later: &[String],
+    ) -> bool {
+        let Some((chain, search)) = self.four_table_chain(node, true, true) else {
+            return false;
+        };
+        later.is_empty()
+            || Self::order_class(&search, &chain, first).is_some_and(|class| {
+                self.later_order_keys_modelled(&search, first, class, later)
+                    .is_some_and(|n| n == 0 || ascending)
+            })
     }
 
     /// Whether `node` is a chain of four to eight tables whose join order is
@@ -1853,29 +1876,32 @@ impl PgHandler {
     /// cheapest (`limit_choice`): typically a nested loop that returns its
     /// first rows at once, in its outer side's order.
     ///
-    /// With an ORDER BY of one column (`order`, its joined-row key) the
-    /// LIMIT's plan is `create_ordered_paths`' pick: a path already in its
-    /// order, or the cheapest under a bounded Sort, which the select then
-    /// runs (`GENERAL_JOIN_PRESORTED` says it need not).
+    /// With an ORDER BY (`order`, its first column's joined-row key, and
+    /// `later` the keys of the columns after it) the LIMIT's plan is
+    /// `create_ordered_paths`' pick: a path already in its order, one in
+    /// its first key's order under an Incremental Sort, or the cheapest
+    /// under a bounded Sort, which the select then runs
+    /// (`GENERAL_JOIN_PRESORTED` says how many keys it need not sort by).
     pub(crate) fn four_table_join(
         &self,
         node: &JoinNode,
         limit: Option<(usize, usize)>,
         order: Option<(&str, bool, bool)>,
+        later: &[String],
     ) -> PgWireResult<Option<Vec<Document>>> {
         if order.is_some() && limit.is_none() {
             return Ok(None);
         }
         if limit.is_some() {
-            return self.searched_rows(node, limit, order, true);
+            return self.searched_rows(node, limit, order, later, true);
         }
         // With no LIMIT the search keeps whole pathlists too, so that a
         // nested loop over a parameterized scan is weighed; where that
         // search declines, the one over cheapest paths runs.
-        if let Some(rows) = self.searched_rows(node, None, None, true)? {
+        if let Some(rows) = self.searched_rows(node, None, None, &[], true)? {
             return Ok(Some(rows));
         }
-        self.searched_rows(node, None, None, false)
+        self.searched_rows(node, None, None, &[], false)
     }
 
     /// [`PgHandler::four_table_join`]'s search, over whole pathlists when
@@ -1885,6 +1911,7 @@ impl PgHandler {
         node: &JoinNode,
         limit: Option<(usize, usize)>,
         order: Option<(&str, bool, bool)>,
+        later: &[String],
         general: bool,
     ) -> PgWireResult<Option<Vec<Document>>> {
         let spanning_modelled = if limit.is_some() {
@@ -1900,6 +1927,8 @@ impl PgHandler {
         else {
             return Ok(None);
         };
+        // The ORDER BY's keys after its first that are pathkeys of their own.
+        let mut order_keys = 0;
         if general {
             search.general = true;
             if limit.is_some() {
@@ -1915,6 +1944,20 @@ impl PgHandler {
                 search.order = Some((key.to_string(), class));
                 search.order_desc = desc;
                 search.order_nulls_first = nulls_first;
+                if !later.is_empty() {
+                    let Some(n) = self.later_order_keys_modelled(&search, key, class, later) else {
+                        return Ok(None);
+                    };
+                    // A merge join takes the query's pathkeys only when every
+                    // ORDER BY key is one of its clauses' classes
+                    // (`select_outer_pathkeys_for_merge`); with another key
+                    // it sorts ascending, NULLs last, which this search's
+                    // descending or NULLS FIRST class order does not model.
+                    if n > 0 && (desc || nulls_first) {
+                        return Ok(None);
+                    }
+                    order_keys = n;
+                }
             }
             let Some((mut base_lists, mut param_keys)) = self.build_base_lists(&search, &chain)
             else {
@@ -2013,9 +2056,20 @@ impl PgHandler {
             Some((count, offset)) => {
                 let r = &search.rels[top];
                 let chosen = match &search.order {
-                    Some((_, class)) => {
+                    Some((key, class)) => {
                         let Some(width) = search.width(r.set) else {
                             return Ok(None);
+                        };
+                        // Keys after the first: an Incremental Sort is
+                        // weighed, over the first key's groups.
+                        let groups = if order_keys == 0 {
+                            None
+                        } else {
+                            let Some(g) = self.order_key_groups(&search, key, *class, r.rows)
+                            else {
+                                return Ok(None);
+                            };
+                            Some(g)
                         };
                         secantus_pgplan::joincost::ordered_limit_choice(
                             &r.list,
@@ -2023,10 +2077,17 @@ impl PgHandler {
                             r.rows,
                             width,
                             *class,
+                            groups,
                             count,
                             offset,
                         )
-                        .map(|(i, presorted)| {
+                        .map(|(i, how)| {
+                            use secantus_pgplan::joincost::OrderedBy;
+                            let presorted = match how {
+                                OrderedBy::Presorted => usize::MAX,
+                                OrderedBy::Incremental => 1,
+                                OrderedBy::Sort => 0,
+                            };
                             crate::GENERAL_JOIN_PRESORTED.with(|c| c.set(presorted));
                             i
                         })
@@ -2088,6 +2149,90 @@ impl PgHandler {
             return Some(ORDER_CLASS);
         }
         Some(search.key_ec(t, key).unwrap_or(ORDER_CLASS))
+    }
+
+    /// How many of an ORDER BY's keys after its first (`later`, joined-row
+    /// keys) are pathkeys of their own, when none leaves a path in the
+    /// order of more than the first key, so that
+    /// `pathkeys_count_contained_in` finds one key presorted on a path in
+    /// `class`'s order and none on any other. A key that is the first one
+    /// again, or a member of its class, is redundant
+    /// (`pathkey_is_redundant`) and counts for none. `None` (the search
+    /// declines) for a key outside the search's tables, one a WHERE may fix
+    /// to a constant (`ec_has_const`, also redundant), and any table with
+    /// an index of several columns, whose scan is in the order of more
+    /// than one.
+    fn later_order_keys_modelled(
+        &self,
+        search: &Search,
+        key: &str,
+        class: usize,
+        later: &[String],
+    ) -> Option<usize> {
+        let mut kept = 0;
+        for k in later {
+            let t = search.aliases.iter().position(|a| a == alias_of(k))?;
+            let (table, filter) = &search.tables[t];
+            let field = self.lookup(table)?.field_of(column_of(k)?)?;
+            if filter_fixes(filter, &field) {
+                return None;
+            }
+            if k == key {
+                continue;
+            }
+            // A class of three or more members, or an inner join's clause's,
+            // is one equivalence class. An outer join's clause makes each
+            // side a class of its own (`distribute_qual_to_rels` delays
+            // it), so its other key is a pathkey of its own.
+            let outer_edge = class
+                .checked_sub(2)
+                .is_some_and(|i| search.edge_outer.get(i).is_some_and(Option::is_some));
+            match search.key_ec(t, k) {
+                Some(c) if c == class && !outer_edge => {}
+                _ => kept += 1,
+            }
+        }
+        let single = search.tables.iter().all(|(table, _)| {
+            self.storage
+                .list_indexes(self.db(), table)
+                .unwrap_or_default()
+                .iter()
+                .all(|ix| ix.get_document("key").is_ok_and(|k| k.len() == 1))
+        });
+        single.then_some(kept)
+    }
+
+    /// `estimate_num_groups` over the first member of the ORDER BY's first
+    /// key's class (`cost_incremental_sort` reads `linitial(ec_members)`):
+    /// a class's first, the written left column of an edge's clause, or
+    /// the key itself for its own class; its distinct count over its
+    /// table's rows, at most the `rows` the join returns.
+    fn order_key_groups(&self, search: &Search, key: &str, class: usize, rows: f64) -> Option<f64> {
+        let (t, member) = if let Some(k) = class_index(class) {
+            search.classes.get(k)?.first()?.clone()
+        } else if class == ORDER_CLASS {
+            (
+                search.aliases.iter().position(|a| a == alias_of(key))?,
+                key.to_string(),
+            )
+        } else {
+            let e = search.edges.get(class.checked_sub(2)?)?;
+            if e.rev {
+                (e.v, e.v_key.clone())
+            } else {
+                (e.u, e.u_key.clone())
+            }
+        };
+        let (table, filter) = &search.tables[t];
+        let side = self.join_side(table, JoinKey::Column(column_of(&member)?), filter, 0)?;
+        let stat = if side.unique {
+            secantus_pgplan::hashagg::KeyStat::Unique
+        } else {
+            secantus_pgplan::hashagg::KeyStat::Unknown
+        };
+        let groups =
+            secantus_pgplan::hashagg::estimate_groups(&[stat], side.tuples, side.rows) as f64;
+        Some(groups.min(rows.round().max(1.0)))
     }
 
     /// The WHERE's join filters over the search's tables (`Search::filters`);

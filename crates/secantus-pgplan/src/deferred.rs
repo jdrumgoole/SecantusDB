@@ -62,6 +62,11 @@ impl<T: Default + 'static> Default for Slot<T> {
 }
 
 impl<T: 'static> Slot<T> {
+    /// A slot holding `value`, for a table with no `Default`.
+    pub fn new(value: T) -> Self {
+        Self(RefCell::new(Rc::new(Deferred::ready(value))))
+    }
+
     /// Publish a value already made.
     pub fn set(&self, value: T) {
         *self.0.borrow_mut() = Rc::new(Deferred::ready(value));

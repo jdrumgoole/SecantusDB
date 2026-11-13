@@ -331,6 +331,17 @@ impl PgHandler {
         if table.starts_with("__") {
             return Vec::new();
         }
+        // While a statement changes the catalog, only this table's
+        // (RP-921): nothing is memoised then, and every table's list
+        // re-reads the whole catalog.
+        if self.in_catalog_statement() {
+            return self
+                .table_index_relations_of(table)
+                .iter()
+                .filter_map(|ix| self.btree_shape(ix))
+                .map(Arc::new)
+                .collect();
+        }
         self.btree_shapes_all()
             .get(table)
             .cloned()

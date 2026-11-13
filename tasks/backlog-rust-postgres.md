@@ -777,13 +777,32 @@ one beside it.
     nullable key merges on that index's backward scan, whose DESC NULLS
     FIRST is of use for merging (`right_merge_direction` weighs the
     direction only) but not for the ORDER BY (`BACK_KEYS`): 240 of 240.
-    Declined still: an ORDER BY of several columns (joined whole and sorted, so its
-    ties come out in another order: `t0 JOIN t1 ON t0.b = t1.a ORDER BY
-    t1.a, t0.c LIMIT 5` over two 3,000-row tables), and a two-table join
-    with a subquery side.
+    Since 2026-11-13 an ORDER BY of several plain columns under a LIMIT is
+    searched too, its first column's class order the presorted key: each
+    path in that order goes under an Incremental Sort beside the
+    cheapest-total path's bounded Sort (`create_ordered_paths`), priced by
+    `cost_incremental_sort` over the groups of the class's first member,
+    and run as `nodeIncrementalSort.c` runs (`tuplesort::incremental_sort`:
+    batches of 32 sorted by every key, a group past 64 rows moved to a sort
+    by the later keys, each bounded by what the LIMIT still needs); a later
+    key in the first key's class is a redundant pathkey. On the matrix with
+    a second key (`--then m0.c`, `--then "m1.c desc"`, `--then m0.a`):
+    810 of 810 shapes each (692, 676 and 778 before); with two more
+    (`--then "m0.c, m1.b desc"`), 809 of 810 (711); the one left, not
+    diagnosed, is two rows tying on all three keys in another order
+    (`multi5/20/idx1/two_hubs2/lastleft/ordlastlim5`). Declined still (the
+    join planned for every row and sorted, as before): an ORDER BY of
+    several columns whose first is descending or NULLS FIRST, which with a
+    key after it no merge join takes (`select_outer_pathkeys_for_merge`
+    adopts the query's pathkeys only when every key is a merge clause's
+    class) and an index's backward scan gives (`--desc --then m0.c`: 789
+    of 810, 771 before; `--nulls-first --then m1.c` 800, 785 before;
+    `--desc-nulls-last --then "m0.c desc"` 776, 758 before); a later key a
+    WHERE may fix to a constant; a table with an index of several columns;
+    and a two-table join with a subquery side.
   - Sorts that spill to disk runs are not PostgreSQL's merge.
   Backlog-ID: RP-028
-  Verify: tests/backlog/test_rust_postgres_gaps.py::test_a_two_column_order_by_over_a_join_keeps_its_ties
+  Verify: tests/backlog/test_rust_postgres_gaps.py::test_a_descending_first_key_with_another_reads_an_index_backward
 
 - [ ] **OPEN — RUST pgserver on LINUX: psycopg's timing tests fail in CI
       and pass on macOS (first measured 2026-10-12).** No Linux lane ran
@@ -1096,16 +1115,23 @@ one beside it.
       the planner and in the RowDescription's wire types), a keyed
       `pg_attribute` read decoding its own relation's composite alone, and
       each table's index list read in place (2026-11-13, to 0.014 s at
-      800). What is left, profiled at 800 tables (debug build, per catalog
-      version, about 3.5 ms): the composite catalog's documents read and
-      compared afresh (0.5 ms), the oid map (`relation_oids`, 0.3 ms), the
-      constraint definitions (0.25 ms; they render through planner state,
-      `visible_name` and `check_constraint_text`, so cannot be derived
-      later from captured inputs), the index relations
-      (`derive_index_relations`, 0.5 ms, a cache lookup per table), the
-      comments (0.25 ms), the relations for `regclass` (0.2 ms) and a
-      keyed `pg_attribute` read's walk of every definition (twice, with
-      the catalog-read count). A per-table memo of the index relations by
+      800); the constraint texts rendered and every table's comments
+      listed at a statement's first lookup of one (the texts render under
+      the session state of that lookup, as `pg_get_constraintdef` does in
+      PostgreSQL; a changed search path is part of the publication's key),
+      a table with no key, unique constraint or index of its own skipped
+      before any oid lookup in the index relations, and the oid map built
+      only when a table has one (2026-11-13: the republication per catalog
+      version at about 800 tables, sampled, from 3.4 ms to 2.6 ms). What is
+      left, measured at 800 tables (debug build, 2026-11-13): the
+      republication (a `SELECT 1` straight after DDL) costs about 2.0 ms
+      more than with none -- the composite catalog read afresh and compared
+      (`committed_type_catalog_docs`, first read by `publish_tableoids`,
+      about 0.6 ms), the table catalog read and compared
+      (`committed_table_defs`, 0.3 ms), each table's index list
+      (`list_indexes_shared`, 0.2 ms), the relations for `regclass`
+      (`relations`, 0.4 ms) and the inheritance (0.1 ms); and the query's
+      own catalog reads after it, about 1.2 ms more. A per-table memo of the index relations by
       the identity of their inputs was measured slower than deriving them
       (its map work per version cost more than tables with no index). The
       faithful end state keys the published state per relation and
@@ -1119,21 +1145,73 @@ one beside it.
 
 ## Found by a profile (2026-11-13)
 
-- [ ] **OPEN — `CREATE TABLE` grows with the number of tables.** A debug
-      `secantusd-pg` takes about 1.4 ms with no other table and 42 ms with
-      800 (2026-11-13); PostgreSQL 15.19 takes 0.41 ms and 0.37 ms (private
-      cluster). After the table is made, `btree_built` looks for its new
-      indexes' page models through `hash_shapes`, `am_shapes` and
-      `btree_shapes_all`, and each lists every table's index relations
-      (`index_relations`). While the statement runs, `shared_table_defs`
-      cannot use the per-version definitions (the catalog it wrote is not
-      yet a version), so each list reads and decodes the whole catalog
-      again: three full decodes per `CREATE TABLE`, most of its time at
-      800 tables. PostgreSQL builds the new relation's indexes from that
-      relation alone (`index_build` over the one heap). The fix asks the
-      new table's own index list, not every table's.
-      Backlog-ID: RP-921
-      Verify: tests/backlog/test_rp_catalog_latency.py::test_create_table_costs_the_same_at_400_tables
+- [ ] **OPEN — `CREATE TABLE` still grows with the number of tables.**
+      A debug `secantusd-pg` takes about 1.2 ms with no other table and
+      5.9 ms with 800 (2026-11-13, after RP-921); PostgreSQL 15.19 takes
+      0.41 ms and 0.37 ms (private cluster), finding a clashing relation
+      by name through `pg_class`'s name index (`get_relname_relid`). The
+      statement's checks that the name is free list every composite type
+      (`composites()`) and every table's stored indexes
+      (`all_index_docs`, every table name read from the raw catalog while
+      the statement runs), so each grows with the schema. The faithful fix
+      is a lookup by name in a relation-name index, as `pg_class` keeps
+      one.
+      Verify: tests/backlog/test_rp_catalog_latency.py::test_create_table_costs_the_same_at_800_tables_within_a_tenth
+      Backlog-ID: RP-928
+
+## Found while working RP-921 (2026-11-13)
+
+- [ ] **OPEN — a partition's copy of a user-named index keeps the
+      parent's name.** `CREATE INDEX p_ab ON p (a, b)` on a partitioned
+      `p`, then `CREATE TABLE p_1 PARTITION OF p ...`: PostgreSQL 15.19
+      names the copy `p_1_a_b_idx` (`DefineIndex` picks a fresh name over
+      the key columns, `ChooseRelationName`); `secantusd-pg` answers
+      `p_1_ab`, the parent index's name with the parent table's prefix
+      swapped for the partition's (`partition_index`). The swap happens to
+      agree for the default names (`p_pkey`, `p_b_key`, `p_c_idx`).
+      Verify: tests/backlog/test_rp_found_rp921.py::test_a_partitions_copy_of_a_named_index_is_named_by_its_columns
+      Backlog-ID: RP-930
+
+- [ ] **OPEN — a partitioned table's indexes show a page.** PostgreSQL
+      15.19 shows every index of a partitioned table (the parent's, and a
+      partitioned partition's) at `relpages` 0, `reltuples` 0: a
+      partitioned index has no storage. `secantusd-pg` answers 1 page for
+      each primary key and for the parent's own indexes.
+      Verify: tests/backlog/test_rp_found_rp921.py::test_a_partitioned_tables_indexes_have_no_pages
+      Backlog-ID: RP-931
+
+- [ ] **OPEN — a leaf partition's inherited indexes are shown as never
+      built.** A leaf partition created under a partitioned table with a
+      user index: PostgreSQL 15.19 builds each copy over the new heap and
+      records 1 page and 0 tuples (`index_update_stats`); `secantusd-pg`
+      answers 0 pages and -1 tuples for the copies of the user's indexes
+      (its primary key's copy is right).
+      Verify: tests/backlog/test_rp_found_rp921.py::test_a_leaf_partitions_inherited_indexes_are_built
+      Backlog-ID: RP-932
+
+- [ ] **OPEN — a hash index built on an empty table is shown as never
+      built.** `CREATE INDEX ... USING hash (a)` on an empty table:
+      PostgreSQL 15.19 records 6 pages (metapage, bitmap page, initial
+      buckets) and 0 tuples; `secantusd-pg` answers 0 pages and -1
+      tuples. `hash_built` builds the page model but records no size.
+      Verify: tests/backlog/test_rp_found_rp921.py::test_a_hash_index_on_an_empty_table_is_recorded_as_built
+      Backlog-ID: RP-929
+
+- [ ] **OPEN — psql's `\d` column query straight after DDL builds all of
+      `pg_type` for a table of two column types.** The collation subquery
+      (`tests/backlog/test_rp_catalog_latency.py`'s `COLLATION_QUERY`) over
+      a table `(a int, b text)`, first after its `CREATE TABLE`: PostgreSQL
+      15.19 takes 0.35 ms with no other table and 0.33 ms with 800 (private
+      cluster, 2026-11-13); a debug `secantusd-pg` about 0.016 s with none
+      and 0.10 s with 800. `virtual_rows` builds one keyed read per catalog
+      per message cycle, and a second key in the cycle (the second column's
+      type) builds every row: every table's row type, each with its owner
+      from all of `pg_class` (`relation_owners`). PostgreSQL reads one
+      `pg_type` row per column through the oid index (`SearchSysCache`),
+      for as many keys as a statement asks. A table whose columns share one
+      type (the RP-911 test's) never reaches the second build.
+      Backlog-ID: RP-927
+      Verify: tests/backlog/test_rp_catalog_latency.py::test_the_first_catalog_query_after_ddl_over_two_column_types_costs_the_same_at_400_tables
 
 - [ ] **OPEN — a renamed index loses its comment.** `COMMENT ON INDEX ix
       IS 'c'` then `ALTER INDEX ix RENAME TO ix2`: PostgreSQL 15.19 answers

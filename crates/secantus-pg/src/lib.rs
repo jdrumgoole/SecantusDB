@@ -365,15 +365,18 @@ thread_local! {
     /// which only the join order search places (`four_table_join`).
     static GENERAL_JOIN_LIMIT: std::cell::Cell<Option<(usize, usize, bool)>> =
         const { std::cell::Cell::new(None) };
-    /// With `GENERAL_JOIN_LIMIT`, the joined-row key of the ORDER BY over
-    /// the join (one plain column, ascending with its NULLs last or
-    /// descending with them first, `true`), which only the join order
-    /// search plans for (`four_table_join`); and, once it has, whether the
-    /// plan it picked returns its rows in that order already, so that the
-    /// select runs no Sort of its own (`create_ordered_paths`).
-    static GENERAL_JOIN_ORDER: std::cell::RefCell<Option<(String, bool, bool)>> =
+    /// With `GENERAL_JOIN_LIMIT`, the joined-row key of the ORDER BY's
+    /// first column over the join (a plain column; descending, and NULLs
+    /// against the direction's default), and the joined-row keys of its
+    /// plain columns after it, which only the join order search plans for
+    /// (`four_table_join`); and, once it has, how many of the ORDER BY's
+    /// keys the plan it picked returns its rows in the order of already
+    /// (`usize::MAX` for all), so that the select runs no Sort of its own,
+    /// or an Incremental Sort (`create_ordered_paths`).
+    #[allow(clippy::type_complexity)]
+    static GENERAL_JOIN_ORDER: std::cell::RefCell<Option<(String, bool, bool, Vec<String>)>> =
         const { std::cell::RefCell::new(None) };
-    static GENERAL_JOIN_PRESORTED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static GENERAL_JOIN_PRESORTED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// Run `f` with FROM-subquery rows carrying their base row ids.
@@ -859,6 +862,10 @@ impl pgwire::api::cancel::CancelHandler for CancelBackend {
 /// shared, so a catalog version reuses the previous version's decoding of a
 /// document whose stored bytes did not change (RP-911).
 type CatalogDocs = Arc<Vec<Arc<Document>>>;
+
+/// The listing of every comment, as `(object oid, sub-id, text)`, run when
+/// a statement first asks for one (RP-911).
+type CommentsDerivation = Box<dyn FnOnce() -> Vec<(i64, i32, String)>>;
 
 /// Every table's definition. Each one is shared, so a catalog version
 /// reuses the previous version's unchanged definitions rather than copying
@@ -5862,6 +5869,15 @@ impl PgHandler {
         }
     }
 
+    /// Is a catalog-changing statement running? Its writes are in the
+    /// catalog but the catalog version has not moved, so no per-version
+    /// memo or shared definition may answer.
+    fn in_catalog_statement(&self) -> bool {
+        self.catalog_statements
+            .load(std::sync::atomic::Ordering::Relaxed)
+            > 0
+    }
+
     fn block_wrote_catalog(&self) -> bool {
         self.in_transaction
             .load(std::sync::atomic::Ordering::Relaxed)
@@ -5996,16 +6012,38 @@ impl PgHandler {
                 })
                 .collect(),
         );
-        let mut constraint_defs = self.constraint_defs().unwrap_or_default();
         // The built-ins' never change: computed once per process.
         static BUILTIN_CONSTRAINT_DEFS: OnceLock<Vec<(i64, String)>> = OnceLock::new();
-        constraint_defs.extend(
-            BUILTIN_CONSTRAINT_DEFS
-                .get_or_init(|| self.builtin_constraint_defs())
-                .iter()
-                .cloned(),
-        );
-        secantus_pgplan::set_constraint_defs(constraint_defs);
+        let builtin_constraint_defs: &'static [(i64, String)] =
+            BUILTIN_CONSTRAINT_DEFS.get_or_init(|| self.builtin_constraint_defs());
+        // The tables' constraint texts are rendered when a statement first
+        // asks for one (RP-911), from the definitions and catalog documents
+        // read now.
+        match (
+            self.shared_table_defs(),
+            self.type_catalog_docs(Self::COMPOSITE_COLLECTION),
+            self.type_catalog_docs(Self::VIEW_COLLECTION),
+        ) {
+            (Ok(defs), Ok(comps), Ok(views)) => {
+                let domains: Vec<(i64, String)> = self
+                    .domain_constraints()
+                    .into_iter()
+                    .map(|(oid, _, _, _, text)| (oid, text))
+                    .collect();
+                secantus_pgplan::defer_constraint_defs(move || {
+                    let oids = Self::relation_oids_of(comps, views);
+                    let mut out = domains;
+                    out.extend(Self::table_constraint_defs(&defs, &oids));
+                    out.extend(builtin_constraint_defs.iter().cloned());
+                    out
+                });
+            }
+            _ => {
+                let mut constraint_defs = self.constraint_defs().unwrap_or_default();
+                constraint_defs.extend(builtin_constraint_defs.iter().cloned());
+                secantus_pgplan::set_constraint_defs(constraint_defs);
+            }
+        }
         secantus_pgplan::set_view_defs(self.view_defs());
         secantus_pgplan::set_view_defs_pretty(self.view_defs_as(1));
         secantus_pgplan::set_view_defs_marked(self.view_defs_as(2));
@@ -6081,9 +6119,15 @@ impl PgHandler {
                 })
                 .collect(),
         );
-        let comments = self.object_comments();
-        complete &= comments.is_ok();
-        secantus_pgplan::set_object_comments(comments.map_err(Self::plan_error_of));
+        // Every table's comments are listed when a statement first asks
+        // for one (RP-911); the reads they need are made now.
+        match self.object_comments_builder() {
+            Ok(build) => secantus_pgplan::defer_object_comments(build),
+            Err(e) => {
+                complete = false;
+                secantus_pgplan::set_object_comments(Err(Self::plan_error_of(e)));
+            }
+        }
         secantus_pgplan::set_shared_comments(self.read_in_block(|| self.shared_comments()));
         secantus_pgplan::domains::set_user_domains(self.domains().unwrap_or_default());
         secantus_pgplan::user_agg::set_user_aggregates(self.user_aggregates().unwrap_or_default());
@@ -10586,9 +10630,25 @@ impl PgHandler {
                 if let Some(rows) = self.four_table_join(
                     node,
                     limit_offset,
-                    order.as_ref().map(|(k, desc, nf)| (k.as_str(), *desc, *nf)),
+                    order
+                        .as_ref()
+                        .map(|(k, desc, nf, _)| (k.as_str(), *desc, *nf)),
+                    order
+                        .as_ref()
+                        .map_or(&[][..], |(.., later)| later.as_slice()),
                 )? {
                     return Ok(rows);
+                }
+                // An ORDER BY of several columns the search declined: the
+                // join planned for every row, as with no LIMIT, and sorted
+                // after.
+                if order.as_ref().is_some_and(|(.., later)| !later.is_empty()) {
+                    if let Some(rows) = self.three_table_join(node, None)? {
+                        return Ok(rows);
+                    }
+                    if let Some(rows) = self.four_table_join(node, None, None, &[])? {
+                        return Ok(rows);
+                    }
                 }
                 let lrows = self.join_rows(left)?;
                 if let JoinNode::Lateral {
@@ -12972,7 +13032,7 @@ impl PgHandler {
             usize,
             String,
             TableDefs,
-            Arc<HashMap<String, i64>>,
+            (CatalogDocs, CatalogDocs),
             u64,
             Arc<Vec<IndexRelation>>,
         );
@@ -12992,7 +13052,14 @@ impl PgHandler {
         // Read in place: copying every definition, per call, was most of
         // this list's cost on a large schema (RP-715).
         let defs = self.shared_table_defs()?;
-        let oids = self.relation_oids().unwrap_or_default();
+        // The oids are a function of these documents, and are listed only
+        // when a table has an index relation (RP-911).
+        let oid_docs = (
+            self.type_catalog_docs(Self::COMPOSITE_COLLECTION)
+                .unwrap_or_default(),
+            self.type_catalog_docs(Self::VIEW_COLLECTION)
+                .unwrap_or_default(),
+        );
         let storage_ptr = Arc::as_ptr(&self.storage) as usize;
         // Inside a user transaction the index lists are read on its own
         // session, which may hold its own index DDL: not shared.
@@ -13007,7 +13074,8 @@ impl PgHandler {
                     (*s == storage_ptr
                         && *g == generation
                         && Arc::ptr_eq(d, &defs)
-                        && Arc::ptr_eq(o, &oids)
+                        && Arc::ptr_eq(&o.0, &oid_docs.0)
+                        && Arc::ptr_eq(&o.1, &oid_docs.1)
                         && db == self.db())
                     .then(|| Arc::clone(list))
                 })
@@ -13016,7 +13084,14 @@ impl PgHandler {
                 return Ok(list.as_ref().clone());
             }
         }
-        let out = self.derive_index_relations(&defs, &oids)?;
+        let oids = std::cell::OnceCell::new();
+        let oids_of = || {
+            oids.get_or_init(|| {
+                Self::relation_oids_of(Arc::clone(&oid_docs.0), Arc::clone(&oid_docs.1))
+            })
+            .as_ref()
+        };
+        let out = self.derive_index_relations(&defs, &oids_of)?;
         // Kept only when no index catalog write landed during the reads.
         if let Some(generation) =
             generation.filter(|g| secantus_storage::planner_generation() == Some(*g))
@@ -13027,7 +13102,7 @@ impl PgHandler {
                     storage_ptr,
                     self.db().to_string(),
                     defs,
-                    oids,
+                    oid_docs,
                     generation,
                     list,
                 ));
@@ -13176,10 +13251,10 @@ impl PgHandler {
 
     /// [`Self::try_index_relations`], derived from `defs` and their `oids`
     /// and each table's stored index list.
-    fn derive_index_relations(
+    fn derive_index_relations<'a>(
         &self,
         defs: &[Arc<TableDef>],
-        oids: &HashMap<String, i64>,
+        oids: &dyn Fn() -> &'a HashMap<String, i64>,
     ) -> PgWireResult<Vec<IndexRelation>> {
         let mut out = Vec::new();
         let defs_partitions = |parent: &str| -> Vec<&Arc<TableDef>> {
@@ -13188,13 +13263,21 @@ impl PgHandler {
                 .collect()
         };
         for t in defs.iter() {
-            let table_oid = Self::oid_in(oids, &t.name).filter(|o| *o > 0);
             // Read in place: a copy of every table's list, for each catalog
             // version, grew the statement after DDL with the schema (RP-911).
             let stored = self
                 .storage
                 .list_indexes_shared(self.db(), &t.name)
                 .map_err(|e| Self::storage_err("could not read the index list", e))?;
+            // A table with no key, no unique constraint and no index of its
+            // own has no index relation: no oid lookup, no derivation.
+            if !t.columns.iter().any(|c| c.pk)
+                && t.unique_constraints.is_empty()
+                && stored.iter().all(|ix| ix.get_str("name") == Ok("_id_"))
+            {
+                continue;
+            }
+            let table_oid = Self::oid_in(oids(), &t.name).filter(|o| *o > 0);
             out.extend(Self::table_index_relations(t, table_oid, &stored));
         }
         // A partitioned table's index has one on every partition too, named
@@ -13218,28 +13301,7 @@ impl PgHandler {
             .collect();
         while let Some(ix) = stack.pop() {
             for child in defs_partitions(&ix.table.name) {
-                let name = match ix.name.strip_prefix(&format!("{}_", ix.table.name)) {
-                    Some(rest) => format!("{}_{rest}", child.name),
-                    None => {
-                        let cols: Vec<&str> = ix
-                            .keys
-                            .iter()
-                            .filter_map(|k| child.columns.get((*k as usize).wrapping_sub(1)))
-                            .map(|c| c.name.as_str())
-                            .collect();
-                        format!("{}_{}_idx", child.name, cols.join("_"))
-                    }
-                };
-                let rel = IndexRelation {
-                    oid: Self::index_oid(&name),
-                    name,
-                    table: child.clone(),
-                    keys: ix.keys.clone(),
-                    include: ix.include.clone(),
-                    unique: ix.unique,
-                    primary: ix.primary,
-                    exclusion: ix.exclusion,
-                };
+                let rel = Self::partition_index(&ix, child);
                 if partition::is_partitioned(child) {
                     stack.push(IndexRelation {
                         name: rel.name.clone(),
@@ -13259,6 +13321,92 @@ impl PgHandler {
         // pg_index's physical order is creation order, which the oids follow.
         out.sort_by_key(|ix| ix.oid);
         Ok(out)
+    }
+
+    /// The index a partitioned table's index `ix` has on its partition
+    /// `child`, named as PostgreSQL names it: the parent's suffix on the
+    /// partition's name (`m_lo_pkey`), or `<partition>_<columns>_idx` for an
+    /// index the user named.
+    fn partition_index(ix: &IndexRelation, child: &Arc<TableDef>) -> IndexRelation {
+        let name = match ix.name.strip_prefix(&format!("{}_", ix.table.name)) {
+            Some(rest) => format!("{}_{rest}", child.name),
+            None => {
+                let cols: Vec<&str> = ix
+                    .keys
+                    .iter()
+                    .filter_map(|k| child.columns.get((*k as usize).wrapping_sub(1)))
+                    .map(|c| c.name.as_str())
+                    .collect();
+                format!("{}_{}_idx", child.name, cols.join("_"))
+            }
+        };
+        IndexRelation {
+            oid: Self::index_oid(&name),
+            name,
+            table: child.clone(),
+            keys: ix.keys.clone(),
+            include: ix.include.clone(),
+            unique: ix.unique,
+            primary: ix.primary,
+            exclusion: ix.exclusion,
+        }
+    }
+
+    /// [`Self::try_table_index_relations`], a failed read answered as no
+    /// indexes, as [`Self::index_relations`] answers it.
+    pub(crate) fn table_index_relations_of(&self, table: &str) -> Vec<IndexRelation> {
+        self.try_table_index_relations(table).unwrap_or_default()
+    }
+
+    /// `table`'s own entries of [`Self::try_index_relations`], in the same
+    /// order, from its catalog row, its index list and its ancestors'
+    /// alone: while a statement changes the catalog the full list reads and
+    /// decodes every table's row, which made a `CREATE TABLE` building its
+    /// constraints' indexes grow with the schema (RP-921). PostgreSQL
+    /// builds a relation's indexes from that relation (`index_build`).
+    fn try_table_index_relations(&self, table: &str) -> PgWireResult<Vec<IndexRelation>> {
+        let Some(t) = self.fresh_table_def(table)? else {
+            return Ok(Vec::new());
+        };
+        let table_oid = self.relation_oid(table).filter(|o| *o > 0);
+        let stored = self
+            .storage
+            .list_indexes_shared(self.db(), table)
+            .map_err(|e| Self::storage_err("could not read the index list", e))?;
+        let mut out = Self::table_index_relations(&t, table_oid, &stored);
+        // A partition carries its partitioned ancestors' indexes.
+        if let Some(parent) = partition::parent_of(&t) {
+            if self
+                .fresh_table_def(parent)?
+                .is_some_and(|p| partition::is_partitioned(&p))
+            {
+                for ix in self.try_table_index_relations(parent)? {
+                    out.push(Self::partition_index(&ix, &t));
+                }
+            }
+        }
+        out.sort_by_key(|ix| ix.oid);
+        Ok(out)
+    }
+
+    /// One table's entry of [`Self::shared_table_defs`], read as its
+    /// uncached path reads them: this transaction's pending create or drop,
+    /// else the catalog row in storage. Never the per-version cache, which a
+    /// catalog-changing statement has not yet moved.
+    fn fresh_table_def(&self, name: &str) -> PgWireResult<Option<Arc<TableDef>>> {
+        if let Some(pending) = self.pending.tables().get(name) {
+            return Ok(pending.clone().map(Arc::new));
+        }
+        let raw = self
+            .storage
+            .find_matching(self.db(), CATALOG_COLLECTION, &bson::doc! { "_id": name })
+            .map_err(|e| Self::storage_err("could not read the catalog", e))?;
+        Ok(raw
+            .iter()
+            .filter_map(|b| decode_doc(b).ok())
+            .filter_map(|d| TableDef::from_document(&d))
+            .find(|d| d.name == name)
+            .map(Arc::new))
     }
 
     /// Stamp each column of `def` with where it is read from, for the
@@ -15869,19 +16017,55 @@ impl PgHandler {
     /// `pg_constraint` gives it -- walked in the SAME order as those rows
     /// (primary key, unique, check, foreign key), since the oid is positional.
     fn constraint_defs(&self) -> PgWireResult<Vec<(i64, String)>> {
-        let mut out = Vec::new();
-        out.extend(
-            self.domain_constraints()
-                .into_iter()
-                .map(|(oid, _, _, _, text)| (oid, text)),
-        );
-        let q = secantus_pgplan::scalar::quote_identifier;
-        let qlist = |cols: &[String]| cols.iter().map(|c| q(c)).collect::<Vec<_>>().join(", ");
+        let mut out: Vec<(i64, String)> = self
+            .domain_constraints()
+            .into_iter()
+            .map(|(oid, _, _, _, text)| (oid, text))
+            .collect();
         // Every oid from one map: a lookup per table re-fetched the catalog
         // documents for each (RP-911).
         let oids = self.relation_oids().unwrap_or_default();
-        for t in self.shared_table_defs()?.iter() {
-            let Some(rel) = Self::oid_in(&oids, &t.name) else {
+        out.extend(Self::table_constraint_defs(
+            &self.shared_table_defs()?,
+            &oids,
+        ));
+        Ok(out)
+    }
+
+    /// The tables' part of [`Self::constraint_defs`]: a function of the
+    /// definitions `defs` and their `oids` alone (and of the planner state
+    /// the texts are rendered under), so the planner may render them when
+    /// a statement first asks for one (RP-911). A table with no constraint
+    /// costs no oid lookup.
+    fn table_constraint_defs(
+        defs: &[Arc<TableDef>],
+        oids: &HashMap<String, i64>,
+    ) -> Vec<(i64, String)> {
+        let mut out = Vec::new();
+        let q = secantus_pgplan::scalar::quote_identifier;
+        let qlist = |cols: &[String]| cols.iter().map(|c| q(c)).collect::<Vec<_>>().join(", ");
+        // `REFERENCES t` with no column list: t's definition, by name, as
+        // `lookup` finds it in the definitions this session sees.
+        let by_name = std::cell::OnceCell::new();
+        let definition = |name: &str| -> Option<&Arc<TableDef>> {
+            by_name
+                .get_or_init(|| {
+                    defs.iter()
+                        .map(|d| (d.name.as_str(), d))
+                        .collect::<HashMap<&str, &Arc<TableDef>>>()
+                })
+                .get(name)
+                .copied()
+        };
+        for t in defs.iter() {
+            if !t.columns.iter().any(|c| c.pk)
+                && t.unique_constraints.is_empty()
+                && t.check_constraints.is_empty()
+                && t.foreign_keys.is_empty()
+            {
+                continue;
+            }
+            let Some(rel) = Self::oid_in(oids, &t.name) else {
                 continue;
             };
             let mut ordinal = 0i64;
@@ -15942,7 +16126,7 @@ impl PgHandler {
             for fk in &t.foreign_keys {
                 // `REFERENCES t` with no list names t's primary key.
                 let ref_columns: Vec<String> = if fk.ref_columns.is_empty() {
-                    self.lookup(&fk.ref_table)
+                    definition(&fk.ref_table)
                         .map(|p| {
                             p.columns
                                 .iter()
@@ -15977,7 +16161,7 @@ impl PgHandler {
                 push(text);
             }
         }
-        Ok(out)
+        out
     }
 
     /// The views created `WITH CHECK OPTION`, which a write through the view
@@ -16840,6 +17024,63 @@ impl PgHandler {
     /// Every index a `CREATE INDEX` or a UNIQUE constraint built, with the
     /// table it is on -- storage's own `_id_` excluded, since the primary key
     /// is reported as `<t>_pkey` from the catalog instead.
+    /// The names of the tables [`Self::shared_table_defs`] lists, in its
+    /// order. While a statement changes the catalog, or inside a user
+    /// transaction, that list reads and decodes every table's catalog row;
+    /// a caller after names alone (is an index called this?) reads them
+    /// from the raw rows instead, as PostgreSQL finds a relation by name
+    /// without building every relation's descriptor (RP-921).
+    fn table_names(&self) -> PgWireResult<Vec<String>> {
+        if !self.storage.in_user_txn() && !self.in_catalog_statement() {
+            return Ok(self
+                .shared_table_defs()?
+                .iter()
+                .map(|d| d.name.clone())
+                .collect());
+        }
+        let raw = self
+            .storage
+            .find_matching(self.db(), CATALOG_COLLECTION, &Document::new())
+            .map_err(|e| Self::storage_err("could not read the catalog", e))?;
+        // A table's row as `TableDef::from_document` accepts one: a `table`
+        // name and a `columns` array.
+        let mut names: Vec<String> = raw
+            .iter()
+            .filter_map(|b| {
+                let d = bson::RawDocument::from_bytes(b).ok()?;
+                d.get_array("columns").ok()?;
+                Some(d.get_str("table").ok()?.to_string())
+            })
+            .collect();
+        let pending = self.pending.tables();
+        names.retain(|n| !pending.contains_key(n));
+        names.extend(
+            pending
+                .values()
+                .filter_map(|d| d.as_ref().map(|d| d.name.clone())),
+        );
+        Ok(names)
+    }
+
+    /// [`Self::all_indexes`] by table name: every stored index but `_id_`,
+    /// with no table's definition decoded.
+    fn all_index_docs(&self) -> PgWireResult<Vec<(String, Document)>> {
+        let mut out = Vec::new();
+        for table in self.table_names()? {
+            let indexes = self
+                .storage
+                .list_indexes_shared(self.db(), &table)
+                .map_err(|e| Self::storage_err("could not list the indexes", e))?;
+            for ix in indexes.iter() {
+                if ix.get_str("name") == Ok("_id_") {
+                    continue;
+                }
+                out.push((table.clone(), ix.clone()));
+            }
+        }
+        Ok(out)
+    }
+
     fn all_indexes(&self) -> PgWireResult<Vec<(TableDef, Document)>> {
         let mut out = Vec::new();
         for def in self.shared_table_defs()?.iter() {
@@ -16869,9 +17110,8 @@ impl PgHandler {
         if self.composites()?.iter().any(|(n, _, _)| *n == key) {
             return Ok(true);
         }
-        Ok(self.all_indexes()?.iter().any(|(t, ix)| {
-            ix.get_str("name") == Ok(name)
-                && secantus_pgplan::schemas::split_key(&t.name).0 == schema
+        Ok(self.all_index_docs()?.iter().any(|(t, ix)| {
+            ix.get_str("name") == Ok(name) && secantus_pgplan::schemas::split_key(t).0 == schema
         }))
     }
 
@@ -16914,7 +17154,7 @@ impl PgHandler {
             return Ok(true);
         }
         Ok(self
-            .all_indexes()?
+            .all_index_docs()?
             .iter()
             .any(|(_, ix)| ix.get_str("name") == Ok(name)))
     }
@@ -21115,10 +21355,26 @@ impl PgHandler {
     /// row carries -- numbered in the order `constraint_defs` walks them
     /// (primary key, unique / exclusion, check, foreign key).
     pub(crate) fn constraint_comments(&self) -> Vec<(i64, String)> {
-        let mut out = Vec::new();
         let oids = self.relation_oids().unwrap_or_default();
-        for t in self.shared_table_defs().unwrap_or_default().iter() {
-            let Some(rel) = Self::oid_in(&oids, &t.name) else {
+        Self::table_constraint_comments(&self.shared_table_defs().unwrap_or_default(), &oids)
+    }
+
+    /// [`Self::constraint_comments`] over the definitions `defs` and their
+    /// `oids` alone. A table with no constraint costs no oid lookup.
+    fn table_constraint_comments(
+        defs: &[Arc<TableDef>],
+        oids: &HashMap<String, i64>,
+    ) -> Vec<(i64, String)> {
+        let mut out = Vec::new();
+        for t in defs.iter() {
+            if !t.columns.iter().any(|c| c.pk)
+                && t.unique_constraints.is_empty()
+                && t.check_constraints.is_empty()
+                && t.foreign_keys.is_empty()
+            {
+                continue;
+            }
+            let Some(rel) = Self::oid_in(oids, &t.name) else {
                 continue;
             };
             let mut ordinal = 0i64;
@@ -21150,32 +21406,30 @@ impl PgHandler {
     /// stores the comments live in is the error: answered as "no comment" it
     /// was a silent NULL from `obj_description` (CI, 2026-11-07).
     pub(crate) fn object_comments(&self) -> PgWireResult<Vec<(i64, i32, String)>> {
-        let mut out = Vec::new();
+        Ok(self.object_comments_builder()?())
+    }
+
+    /// [`Self::object_comments`], as the reads it needs, made now (a
+    /// failed one is the error), and the listing of every table's
+    /// comments, which the returned derivation runs over the definitions
+    /// and catalog documents read now: the planner lists them when a
+    /// statement first asks for a comment (RP-911).
+    fn object_comments_builder(&self) -> PgWireResult<CommentsDerivation> {
+        let mut head = Vec::new();
         // An extension's description is its control file's `comment`.
         for (i, (name, _, _)) in self.extensions()?.into_iter().enumerate() {
             if let Some(c) = catalog_fill::extension_description(&name) {
-                out.push((crate::extension_oid(i), 0, c.to_string()));
+                head.push((crate::extension_oid(i), 0, c.to_string()));
             }
         }
-        let oids = self.relation_oids().unwrap_or_default();
-        for def in self.shared_table_defs()?.iter() {
-            let Some(oid) = Self::oid_in(&oids, &def.name) else {
-                continue;
-            };
-            if let Some(c) = def.comment() {
-                out.push((oid, 0, c.to_string()));
-            }
-            for (i, col) in def.columns.iter().enumerate() {
-                if let Ok(c) = col.extra.get_str("comment") {
-                    out.push((oid, i32::from(def.attnum(i)), c.to_string()));
-                }
-            }
-        }
-        out.extend(
-            self.constraint_comments()
-                .into_iter()
-                .map(|(oid, c)| (oid, 0, c)),
-        );
+        let defs = self.shared_table_defs()?;
+        let comps = self
+            .type_catalog_docs(Self::COMPOSITE_COLLECTION)
+            .unwrap_or_default();
+        let views = self
+            .type_catalog_docs(Self::VIEW_COLLECTION)
+            .unwrap_or_default();
+        let mut tail = Vec::new();
         let index_comments: Vec<Document> = self
             .storage
             .find_matching(self.db(), Self::INDEX_COMMENT_COLLECTION, &Document::new())
@@ -21190,36 +21444,36 @@ impl PgHandler {
                     .find(|d| d.get_str("_id") == Ok(Self::index_comment_key(&ix).as_str()))
                     .and_then(|d| d.get_str("comment").ok())
                 {
-                    out.push((ix.oid, 0, c.to_string()));
+                    tail.push((ix.oid, 0, c.to_string()));
                 }
             }
         }
         for d in self.type_catalog_docs(Self::DOMAIN_COLLECTION)?.iter() {
             if let (Ok(c), Some(oid)) = (d.get_str("comment"), d.get("oid").and_then(bson_i64)) {
-                out.push((oid, 0, c.to_string()));
+                tail.push((oid, 0, c.to_string()));
             }
         }
-        out.extend(
+        tail.extend(
             self.ts_config_comments()
                 .into_iter()
                 .map(|(oid, c)| (oid, 0, c)),
         );
-        out.extend(
+        tail.extend(
             self.ts_dict_comments()
                 .into_iter()
                 .map(|(oid, c)| (oid, 0, c)),
         );
-        out.extend(
+        tail.extend(
             self.conversion_comments()
                 .into_iter()
                 .map(|(oid, c)| (oid, 0, c)),
         );
-        out.extend(
+        tail.extend(
             self.opclass_comments()
                 .into_iter()
                 .map(|(_, oid, c)| (oid, 0, c)),
         );
-        out.extend(
+        tail.extend(
             self.subscription_comments()
                 .into_iter()
                 .chain(self.transform_comments())
@@ -21230,24 +21484,60 @@ impl PgHandler {
         for d in self.user_function_docs()? {
             if let Ok(c) = d.get_str("comment") {
                 let key = d.get_str("_id").unwrap_or_default();
-                out.push((self.function_oid(key), 0, c.to_string()));
+                tail.push((self.function_oid(key), 0, c.to_string()));
             }
         }
-        for d in self
+        // The rest, by relation name: resolved with the tables' oids.
+        let named: Vec<(String, String)> = self
             .storage
             .find_matching(self.db(), Self::COMMENT_COLLECTION, &Document::new())
             .map_err(|e| Self::storage_err("could not read the comments", e))?
             .iter()
             .filter_map(|b| decode_doc(b).ok())
-        {
-            let (Ok(name), Ok(c)) = (d.get_str("name"), d.get_str("comment")) else {
-                continue;
-            };
-            if let Some(oid) = Self::oid_in(&oids, name) {
-                out.push((oid, 0, c.to_string()));
+            .filter_map(|d| {
+                Some((
+                    d.get_str("name").ok()?.to_string(),
+                    d.get_str("comment").ok()?.to_string(),
+                ))
+            })
+            .collect();
+        Ok(Box::new(move || {
+            let oids = Self::relation_oids_of(comps, views);
+            let mut out = head;
+            for def in defs.iter() {
+                fn column_comment(c: &Column) -> Option<&str> {
+                    c.extra.get_str("comment").ok()
+                }
+                if def.comment().is_none()
+                    && !def.columns.iter().any(|c| column_comment(c).is_some())
+                {
+                    continue;
+                }
+                let Some(oid) = Self::oid_in(&oids, &def.name) else {
+                    continue;
+                };
+                if let Some(c) = def.comment() {
+                    out.push((oid, 0, c.to_string()));
+                }
+                for (i, col) in def.columns.iter().enumerate() {
+                    if let Some(c) = column_comment(col) {
+                        out.push((oid, i32::from(def.attnum(i)), c.to_string()));
+                    }
+                }
             }
-        }
-        Ok(out)
+            out.extend(
+                Self::table_constraint_comments(&defs, &oids)
+                    .into_iter()
+                    .map(|(oid, c)| (oid, 0, c)),
+            );
+            out.extend(tail);
+            for (name, c) in named {
+                if let Some(oid) = Self::oid_in(&oids, &name) {
+                    out.push((oid, 0, c));
+                }
+            }
+            out
+        }))
     }
 
     /// Mint an enum / composite oid the way PostgreSQL mints an OID: from a
@@ -38562,7 +38852,7 @@ impl PgHandler {
         // why the series is a SOURCE rather than its own statement.
         // The join source's plan already returns its rows in the ORDER BY's
         // order (RP-028): no Sort over it.
-        let mut presorted = false;
+        let mut presorted = 0usize;
         let (mut docs, mut def): (Vec<Document>, TableDef) = match (&sel.series, &sel.join) {
             // `LIMIT 0`: PostgreSQL's Limit node returns before it asks its
             // subplan for a row (`ExecLimit`, a count of zero), so nothing
@@ -38580,23 +38870,31 @@ impl PgHandler {
                 // reads more rows than it returns: no WHERE, or one whose
                 // every conjunct the join's scans and joins evaluate, so
                 // that the join's rows are the ones the LIMIT counts.
-                // With an ORDER BY of one plain column, ascending with its
-                // NULLs last or descending with them first (each the other's
-                // exact reverse), or with its NULLs against the direction's
-                // default (ascending NULLS FIRST, descending NULLS LAST),
-                // the search plans the join for the LIMIT and says whether
-                // its plan needs the Sort.
+                // With an ORDER BY of plain columns, the first ascending
+                // with its NULLs last or descending with them first (each
+                // the other's exact reverse), or with its NULLs against the
+                // direction's default (ascending NULLS FIRST, descending
+                // NULLS LAST), the search plans the join for the LIMIT and
+                // says how many of its keys its plan needs no Sort for.
+                let plain = |k: &secantus_pgplan::OrderKey| k.expr.is_none() && !k.jsonb;
                 let join_order = match sel.order.as_slice() {
-                    [k] if k.expr.is_none()
-                        && !k.jsonb
-                        && sel.distinct == secantus_pgplan::Distinct::None
-                        && !sel.with_ties
-                        && sel.lock_clauses.is_empty() =>
+                    [k, later @ ..]
+                        if plain(k)
+                            && later.iter().all(plain)
+                            && sel.distinct == secantus_pgplan::Distinct::None
+                            && !sel.with_ties
+                            && sel.lock_clauses.is_empty() =>
                     {
                         // NULLs against the default: first in the ascending
                         // comparator a descending order reverses.
                         let nulls_first = matches!(k.nulls, secantus_pgplan::Nulls::First);
-                        Some((k.field.clone(), !k.ascending, k.ascending == nulls_first))
+                        let later = later.iter().map(|k| k.field.clone()).collect();
+                        Some((
+                            k.field.clone(),
+                            !k.ascending,
+                            k.ascending == nulls_first,
+                            later,
+                        ))
                     }
                     _ => None,
                 };
@@ -38622,7 +38920,7 @@ impl PgHandler {
                 GENERAL_JOIN_LIMIT.with(|c| c.set(join_limit));
                 GENERAL_JOIN_ORDER
                     .with(|c| *c.borrow_mut() = join_order.filter(|_| join_limit.is_some()));
-                GENERAL_JOIN_PRESORTED.with(|c| c.set(false));
+                GENERAL_JOIN_PRESORTED.with(|c| c.set(0));
                 let docs = if !sel.lock_clauses.is_empty() && self.storage.in_user_txn() {
                     with_lock_row_ids(|| self.sub_source_docs(sub, &sel.filter))
                 } else {
@@ -38630,7 +38928,7 @@ impl PgHandler {
                 };
                 GENERAL_JOIN_LIMIT.with(|c| c.set(None));
                 GENERAL_JOIN_ORDER.with(|c| *c.borrow_mut() = None);
-                presorted = GENERAL_JOIN_PRESORTED.with(|c| c.replace(false));
+                presorted = GENERAL_JOIN_PRESORTED.with(|c| c.replace(0));
                 (docs?, sub.def.clone())
             }
             // A top-level JOIN source: materialise it, treat its
@@ -38909,7 +39207,7 @@ impl PgHandler {
         }
 
         if !sel.order.is_empty()
-            && !presorted
+            && presorted < sel.order.len()
             && !(!sel.windows.is_empty() && window_order::presorted(&sel.order, &window_sorted))
         {
             self.materialise_sort_input(&mut docs, sel, &def)?;
@@ -38924,6 +39222,18 @@ impl PgHandler {
                 // The two cannot be told apart here, so a real DISTINCT ON
                 // keeps the stable order too (RP-028 leaves it).
                 docs.sort_by(|a, b| compare_rows(a, b, &sel.order));
+            } else if presorted > 0 {
+                // An Incremental Sort over rows the join returns in order
+                // by the first `presorted` keys (RP-028).
+                let bound = sort_bound(sel).filter(|_| row_lock.is_none());
+                let (prefix, rest) = sel.order.split_at(presorted);
+                docs = tuplesort::incremental_sort(
+                    docs,
+                    bound,
+                    &mut |a, b| compare_rows(a, b, prefix) == Ordering::Equal,
+                    &mut |a, b| compare_rows(a, b, &sel.order),
+                    &mut |a, b| compare_rows(a, b, rest),
+                );
             } else {
                 let bound = sort_bound(sel).filter(|_| row_lock.is_none());
                 docs = tuplesort::sort(docs, bound, &mut |a, b| compare_rows(a, b, &sel.order));
@@ -41136,7 +41446,7 @@ impl PgHandler {
                 if self.lookup(&def.name).is_some()
                     || self.views()?.iter().any(|(n, _)| *n == def.name)
                     || self
-                        .all_indexes()?
+                        .all_index_docs()?
                         .iter()
                         .any(|(_, ix)| ix.get_str("name") == Ok(def.name.as_str()))
                 {
