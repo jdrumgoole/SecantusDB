@@ -1009,6 +1009,7 @@ fn finish_join_source(
                         expr,
                         kind,
                         ops,
+                        startup_ops: qual_startup_operators(c),
                         bounds: key_bounds(c),
                         inequality_keys: inequality_keys(c),
                         restrict: None,
@@ -2817,6 +2818,7 @@ fn build_join(
                         expr: on_expr(c, &side_scope, params)?,
                         kind,
                         ops,
+                        startup_ops: qual_startup_operators(c),
                         bounds: key_bounds(c),
                         inequality_keys: inequality_keys(c),
                         restrict: restriction_filter(c, [&left, &right], lookup, params),
@@ -3010,6 +3012,9 @@ pub struct JoinFilter {
     /// The operator costs it evaluates a row (`cost_qual_eval`), an IN
     /// list's operator over half its elements ([`qual_operators`]).
     pub ops: f64,
+    /// The operator costs it evaluates once, at startup: a hashed IN
+    /// list's table ([`qual_startup_operators`]).
+    pub startup_ops: f64,
     /// A `<`, `<=`, `>` or `>=`'s operands that a B-tree on their column
     /// can take as a parameterized index qual (`match_clause_to_indexcol`,
     /// RP-354): a bare joined key whose other operand reads only other
@@ -3307,11 +3312,17 @@ fn operator_count(n: &pg_query::protobuf::Node) -> usize {
     count
 }
 
+/// From this many elements an IN list of constants is a hashed
+/// ScalarArrayOpExpr (`MIN_ARRAY_SIZE_FOR_HASHED_SAOP`,
+/// `convert_saop_to_hashed_saop`).
+const HASHED_SAOP: usize = 9;
+
 /// [`operator_count`], and each IN list of constants ([`in_list_of_constants`])
-/// as `cost_qual_eval` charges its ScalarArrayOpExpr: the operator, of
-/// `procost` 1, over half the array's elements, as it expects the answer
-/// settled halfway (`estimate_array_length`). A list of one element is the
-/// plain operator (`transformAExprIn`).
+/// as `cost_qual_eval` charges its ScalarArrayOpExpr a row: the operator,
+/// of `procost` 1, over half the array's elements, as it expects the
+/// answer settled halfway (`estimate_array_length`), or, for a hashed list,
+/// one hash and one comparison. A list of one element is the plain
+/// operator (`transformAExprIn`).
 fn qual_operators(n: &pg_query::protobuf::Node) -> f64 {
     let mut halves = 0.0;
     let mut node = n.clone();
@@ -3319,6 +3330,7 @@ fn qual_operators(n: &pg_query::protobuf::Node) -> f64 {
         if let Some(N::AExpr(e)) = x.node.as_ref() {
             match in_list_of_constants(e) {
                 Some(1) => halves += 1.0,
+                Some(items) if items >= HASHED_SAOP => halves += 2.0,
                 Some(items) => halves += items as f64 * 0.5,
                 None => {}
             }
@@ -3328,10 +3340,25 @@ fn qual_operators(n: &pg_query::protobuf::Node) -> f64 {
     operator_count(n) as f64 + halves
 }
 
-/// `e`'s elements when it is `x IN (...)` or `x NOT IN (...)` over fewer
-/// than nine constants. PostgreSQL folds the list to one array constant,
-/// and hashes one of nine or more (`MIN_ARRAY_SIZE_FOR_HASHED_SAOP`),
-/// which charges a hash table's build at startup: not modelled here.
+/// The operators `cost_qual_eval` charges `n` once, at startup: a hashed
+/// IN list's table, one hash an element, NULLs included
+/// (`estimate_array_length`).
+fn qual_startup_operators(n: &pg_query::protobuf::Node) -> f64 {
+    let mut ops = 0.0;
+    let mut node = n.clone();
+    let _ = walk_expr(&mut node, &mut |x| {
+        if let Some(N::AExpr(e)) = x.node.as_ref() {
+            if let Some(items) = in_list_of_constants(e).filter(|i| *i >= HASHED_SAOP) {
+                ops += items as f64;
+            }
+        }
+        Ok(())
+    });
+    ops
+}
+
+/// `e`'s elements when it is `x IN (...)` or `x NOT IN (...)` over
+/// constants, which PostgreSQL folds to one array constant.
 fn in_list_of_constants(e: &pg_query::protobuf::AExpr) -> Option<usize> {
     if e.kind != pg_query::protobuf::AExprKind::AexprIn as i32 {
         return None;
@@ -3347,15 +3374,14 @@ fn in_list_of_constants(e: &pg_query::protobuf::AExpr) -> Option<usize> {
         ),
         _ => false,
     };
-    (!l.items.is_empty() && l.items.len() < 9 && l.items.iter().all(constant))
-        .then_some(l.items.len())
+    (!l.items.is_empty() && l.items.iter().all(constant)).then_some(l.items.len())
 }
 
 /// `n` is built only of what [`qual_operators`] prices as
 /// `cost_qual_eval` does: comparisons, LIKE and ILIKE, BETWEEN, an IN
-/// list of fewer than nine constants, AND / OR / NOT, columns and
-/// constants. A longer IN list, a null test, a call (a LIKE's ESCAPE is
-/// `like_escape`) or a cast of a column costs otherwise.
+/// list of constants ([`qual_startup_operators`] its hash table's build),
+/// AND / OR / NOT, columns and constants. A null test, a call (a LIKE's
+/// ESCAPE is `like_escape`) or a cast of a column costs otherwise.
 fn priced_by_operator_count(n: &pg_query::protobuf::Node) -> bool {
     use pg_query::protobuf::AExprKind;
     match n.node.as_ref() {
@@ -5049,6 +5075,16 @@ mod tests {
         assert_eq!(ops("a <> b and a not in (1, 2)"), 2.0);
         assert_eq!(ops("a in (7)"), 1.0);
         assert_eq!(ops("a in (1, 2) or a < 3"), 2.0);
+        // Nine or more are hashed: one hash and one comparison a row, and
+        // the table's build, a hash an element (NULLs too), at startup.
+        let nine = "a in (1, 2, 3, 4, 5, 6, 7, 8, 9)";
+        assert_eq!(ops(nine), 2.0);
+        assert_eq!(ops(&format!("a <> b and {nine}")), 3.0);
+        let startup =
+            |w: &str| qual_startup_operators(&where_of(&format!("select 1 from t where {w}")));
+        assert_eq!(startup(nine), 9.0);
+        assert_eq!(startup("a not in (1, 2, 3, 4, 5, 6, 7, 8, 9, null)"), 10.0);
+        assert_eq!(startup("a in (1, 2, 3, 4, 5, 6, 7, 8)"), 0.0);
     }
 
     #[test]
@@ -5059,9 +5095,9 @@ mod tests {
         assert!(priced("a between 1 and 2 or b = 'x'::text"));
         assert!(priced("a in (1, 2, 3)"));
         assert!(priced("a not in (1, null, 3::int)"));
-        // Nine or more constants are hashed, a list of columns is no
-        // constant array: neither is priced here.
-        assert!(!priced("a in (1, 2, 3, 4, 5, 6, 7, 8, 9)"));
+        // Nine or more constants are hashed, priced with the table's
+        // build; a list of columns is no constant array.
+        assert!(priced("a in (1, 2, 3, 4, 5, 6, 7, 8, 9)"));
         assert!(!priced("a in (1, b)"));
         assert!(priced("b like 'x%'"));
         assert!(priced("b not ilike 'X%'::text"));

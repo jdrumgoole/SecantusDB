@@ -629,6 +629,20 @@ impl PgHandler {
             .iter()
             .map(|f| f.ops * costsize::CPU_OPERATOR_COST)
             .sum();
+        // A hashed IN list's table, built once at the join's startup. Only
+        // a restriction kept on the join may hold one, so it is the same
+        // on every path, the parameterized one included; one in a clause
+        // movable into the inner's scan would be that scan's startup.
+        if filters
+            .iter()
+            .any(|f| !restriction(f) && f.startup_ops > 0.0)
+        {
+            return None;
+        }
+        let qual_startup: f64 = filters
+            .iter()
+            .map(|f| f.startup_ops * costsize::CPU_OPERATOR_COST)
+            .sum();
         // `clauselist_selectivity`: the conjuncts' product, in order. A
         // `<>` (or IS DISTINCT FROM) is `neqjoinsel`, one minus
         // `eqjoinsel` over the two columns' statistics; one never
@@ -735,8 +749,14 @@ impl PgHandler {
                 }
             }
         }
-        let plan =
-            secantus_pgplan::joincost::cheapest_nest_loop_param(a, b, qual, param, left_join);
+        let plan = secantus_pgplan::joincost::cheapest_nest_loop_param(
+            a,
+            b,
+            qual,
+            qual_startup,
+            param,
+            left_join,
+        );
         let rows = if left_join {
             // `calc_joinrel_size_estimate`'s JOIN_LEFT: never fewer rows
             // than the outer side.

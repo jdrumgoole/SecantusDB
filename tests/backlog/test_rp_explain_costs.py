@@ -2171,11 +2171,13 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "        ->  Seq Scan on e e2  (cost=0.00..15.00 rows=1000 width=7)",
         ],
     ),
-    # Still open (RP-354): an IN list of nine or more constants is hashed
-    # (`MIN_ARRAY_SIZE_FOR_HASHED_SAOP`): one hash and one comparison a
-    # row, and the table's build, an element's hash each, at startup.
+    # Split from RP-354 and fixed: an IN list of nine or more constants is
+    # hashed (`MIN_ARRAY_SIZE_FOR_HASHED_SAOP`): one hash and one
+    # comparison a row, and the table's build, an element's hash each, at
+    # the join's startup (`final_cost_nestloop`); before, the nested loop
+    # printed zeros.
     "a left join's on conjunct over the preserved side is a hashed in list": (
-        "RP-354",
+        "RP-329",
         _ANALYSED,
         "explain select * from e left join e e2 on e.a <> e2.a"
         " and e.a in (1, 2, 3, 4, 5, 6, 7, 8, 9)",
@@ -2185,6 +2187,63 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "  ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
             "  ->  Materialize  (cost=0.00..20.00 rows=1000 width=7)",
             "        ->  Seq Scan on e e2  (cost=0.00..15.00 rows=1000 width=7)",
+        ],
+    ),
+    "a left join's on conjunct over the preserved side is a hashed not in list": (
+        "RP-329",
+        _ANALYSED,
+        "explain select * from e left join e e2 on e.a <> e2.a"
+        " and e.a not in (1, 2, 3, 4, 5, 6, 7, 8, 9)",
+        [
+            "Nested Loop Left Join  (cost=0.02..20032.52 rows=990009 width=14)",
+            "  Join Filter: ((e.a <> e2.a) AND (e.a <> ALL ('{1,2,3,4,5,6,7,8,9}'::integer[])))",
+            "  ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
+            "  ->  Materialize  (cost=0.00..20.00 rows=1000 width=7)",
+            "        ->  Seq Scan on e e2  (cost=0.00..15.00 rows=1000 width=7)",
+        ],
+    ),
+    # A NULL element is hashed into the table too (`estimate_array_length`
+    # counts it): ten hashes at startup.
+    "a left join's on conjunct over the preserved side is a hashed in list with a null": (
+        "RP-329",
+        _ANALYSED,
+        "explain select * from e left join e e2 on e.a <> e2.a"
+        " and e.a in (1, 2, 3, 4, 5, 6, 7, 8, 9, null)",
+        [
+            "Nested Loop Left Join  (cost=0.03..20032.53 rows=8991 width=14)",
+            "  Join Filter: ((e.a <> e2.a) AND"
+            " (e.a = ANY ('{1,2,3,4,5,6,7,8,9,NULL}'::integer[])))",
+            "  ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
+            "  ->  Materialize  (cost=0.00..20.00 rows=1000 width=7)",
+            "        ->  Seq Scan on e e2  (cost=0.00..15.00 rows=1000 width=7)",
+        ],
+    ),
+    "a left join's on conjunct over the preserved side is a hashed text list": (
+        "RP-329",
+        _ANALYSED,
+        "explain select * from e left join e e2 on e.a <> e2.a"
+        " and e.b in ('v1', 'v2', 'v3', 'v4', 'v5', 'v6', 'v7', 'v8', 'v9')",
+        [
+            "Nested Loop Left Join  (cost=0.02..20032.52 rows=899100 width=14)",
+            "  Join Filter: ((e.a <> e2.a) AND"
+            " (e.b = ANY ('{v1,v2,v3,v4,v5,v6,v7,v8,v9}'::text[])))",
+            "  ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
+            "  ->  Materialize  (cost=0.00..20.00 rows=1000 width=7)",
+            "        ->  Seq Scan on e e2  (cost=0.00..15.00 rows=1000 width=7)",
+        ],
+    ),
+    # The hashed list stays the join's filter over a parameterized index
+    # scan of the nullable side, its table built once at the join's startup.
+    "a left join into an index with a hashed in list over the preserved side": (
+        "RP-329",
+        _ANALYSED,
+        "explain select * from e left join k on e.a < k.a and e.a in (1, 2, 3, 4, 5, 6, 7, 8, 9)",
+        [
+            "Nested Loop Left Join  (cost=0.30..11152.52 rows=3000 width=14)",
+            "  Join Filter: (e.a = ANY ('{1,2,3,4,5,6,7,8,9}'::integer[]))",
+            "  ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
+            "  ->  Index Scan using k_pkey on k  (cost=0.28..6.14 rows=333 width=7)",
+            "        Index Cond: (a > e.a)",
         ],
     ),
     # Still open (RP-354): a LEFT join's ON conjunct over its preserved

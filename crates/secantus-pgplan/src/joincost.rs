@@ -824,15 +824,20 @@ pub fn cheapest_nest_loop(
 /// inner (`param[0]` for `b` inner, `param[1]` for `a`): each is weighed
 /// after the plain inner and before the Material of it, as
 /// `match_unsorted_outer` tries `cheapest_parameterized_paths` (RP-354).
+///
+/// `qual_startup` is the join quals' `cost_qual_eval` startup (a hashed IN
+/// list's table), which `final_cost_nestloop` adds to every path's startup
+/// and total.
 pub fn cheapest_nest_loop_param(
     a: (f64, f64, f64, i64),
     b: (f64, f64, f64, i64),
     qual: f64,
+    qual_startup: f64,
     param: [Option<ParamInner>; 2],
     left: bool,
 ) -> NestLoopPlan {
     let orders: &[bool] = if left { &[false] } else { &[false, true] };
-    nest_loop_paths_with(a, b, qual, [None, None], orders, param)
+    nest_loop_paths_over(&[(a, b, qual)], [None, None], orders, param, qual_startup).1
 }
 
 /// [`cheapest_nest_loop`] where `a` or `b` may be `inner_unique` as the
@@ -876,7 +881,7 @@ fn nest_loop_paths_with(
     orders: &[bool],
     param: [Option<ParamInner>; 2],
 ) -> NestLoopPlan {
-    nest_loop_paths_over(&[(a, b, qual)], unique, orders, param).1
+    nest_loop_paths_over(&[(a, b, qual)], unique, orders, param, 0.0).1
 }
 
 /// Two input relations of a join, each `(startup, total, rows, width)`,
@@ -899,6 +904,7 @@ pub fn cheapest_nest_loop_of(pairs: &[NestLoopPair]) -> Option<(usize, NestLoopP
         [None, None],
         &[false, true],
         [None, None],
+        0.0,
     ))
 }
 
@@ -907,6 +913,7 @@ fn nest_loop_paths_over(
     unique: [Option<(f64, f64)>; 2],
     orders: &[bool],
     param: [Option<ParamInner>; 2],
+    qual_startup: f64,
 ) -> (usize, NestLoopPlan) {
     let mut paths: Vec<JoinPath> = Vec::new();
     // Each pair's Material of its inner, by outer side.
@@ -931,6 +938,7 @@ fn nest_loop_paths_over(
             for (kind, inner, qual) in inners {
                 let semi = unique[usize::from(!b_outer)];
                 let (startup, total) = nestloop_cost(&outer, inner, semi, false, qual);
+                let (startup, total) = (startup + qual_startup, total + qual_startup);
                 add_path(
                     &mut paths,
                     JoinPath {

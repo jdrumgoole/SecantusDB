@@ -1619,17 +1619,16 @@ a regression test.
         the parameterized Index Scan), or whose upper `<>` coerces its
         operands (`e2.a::numeric <> e3.a::numeric`);
       - a LEFT join's ON conjunct over its preserved side that costs other
-        than its operators: an IN list of nine or more constants, which
-        PostgreSQL hashes (`e.a in (1, ..., 9)`: `cost=0.02..20032.52`,
-        one hash and one comparison a row and the table's build at
-        startup), a regex match (`e.b ~ 'v1'`, whose selectivity is
-        RP-423's) and a cast of a column (`e.a::text <> '5'`).
-      Since 2026-11-13 an IN list of fewer than nine constants there is
-      priced (its operator over half the list) and estimated. A
-      binary-coercible cast is RP-912; a join PostgreSQL orders otherwise,
-      RP-919.
+        than its operators: a regex match (`e.b ~ 'v1'`, whose selectivity
+        is RP-423's) and a cast of a column (`e.a::text <> '5'`).
+      Since 2026-11-13 an IN list of constants there is priced (its
+      operator over half the list, or from nine constants PostgreSQL's
+      hashed list: one hash and one comparison a row, the table's build at
+      the join's startup) and estimated; one inside an `OR` is not, as a
+      lone scan's is not (RP-028). A binary-coercible cast is RP-912; a
+      join PostgreSQL orders otherwise, RP-919.
       Backlog-ID: RP-354
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[nested loop into an index bounded by a call of the outer side], tests/backlog/test_rp_explain_costs.py::test_plan[nested loop of three relations into an index], tests/backlog/test_rp_explain_costs.py::test_plan[nested loop of three relations with a coerced <> above], tests/backlog/test_rp_explain_costs.py::test_plan[a left join's on conjunct over the preserved side is a hashed in list], tests/backlog/test_rp_explain_costs.py::test_plan[a left join's on conjunct over the preserved side is a regex match], tests/backlog/test_rp_explain_costs.py::test_plan[a left join's on conjunct over the preserved side casts a column]
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[nested loop into an index bounded by a call of the outer side], tests/backlog/test_rp_explain_costs.py::test_plan[nested loop of three relations into an index], tests/backlog/test_rp_explain_costs.py::test_plan[nested loop of three relations with a coerced <> above], tests/backlog/test_rp_explain_costs.py::test_plan[a left join's on conjunct over the preserved side is a regex match], tests/backlog/test_rp_explain_costs.py::test_plan[a left join's on conjunct over the preserved side casts a column]
 - [ ] **A join of three tables by inequalities runs in its written
       order, and a WHERE's join clauses all run at the top join.**
       PostgreSQL's `standard_join_search` picks the order of an inner join
