@@ -1,0 +1,11 @@
+### An aggregate that mongod plans by trial reads on from where its trial stopped
+
+When two indexes could answer an `aggregate`'s `$match`, mongod runs both against the collection until one has handed over 101 documents (or the pipeline's limit) or runs out, caches the winner, returns what the winner's trial buffered and then reads on from where it stopped. The Rust MongoDB server used to read such a pipeline whole through its store when the command ran, so its `Slow query` line and profile entry counted no keys or documents examined, and a cursor over it ignored writes made while it was open: over 3,000 documents read two at a time and all deleted after the first batch, mongod returns 101 and this server returned every document that matched when the command ran.
+
+It now runs the same trial for an unsorted pipeline of stages that stream, through the plan cache as a `find` has since RM-349, buffers what the winner returned and streams the winner from there. The first batch counts what the trial examined, each `getMore` what it read after, and the plan cache's entry matches mongod's, under a skip, a limit, a projection and a plan the cache already holds.
+
+#### Fixed
+
+- `secantus-commands` (`agg_stream.rs`, `explain/order.rs`): an `aggregate` whose `$match` is contested, with no `$sort` and only stages that stream, is planned by `order::stream_tried` and its stream buffers the trial's winner (`Stream::buffer_trial`), as a `find`'s does. Pipelines in SBE and a `$unionWith`'s read still plan without a trial. Fixes the unsorted-`aggregate` part of RM-363 (tests/backlog/test_rm_355_364.py::test_a_contested_aggregate_counts_what_it_examined). RM-363 stays open for a contested `aggregate` that sorts or groups, `count`, `distinct`, writes, time-series reads made whole and geo reads.
+- Regression tests: `tests/backlog/test_rm_355_364.py::test_a_contested_aggregate_reads_on_from_its_trial` (five shapes, each line's counts and the plan cache entry compared with mongod's), `::test_a_contested_aggregate_runs_its_cached_plan` and `::test_a_contested_aggregate_sees_what_is_deleted_after_its_first_batch`.
+- Filed RM-598 (a contested read's line names the plan its trial lost, `find` included) and RM-599 (a line carries no `fromMultiPlanner` / `fromPlanCache`), each with a gap test.

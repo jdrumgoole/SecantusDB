@@ -1111,10 +1111,13 @@ These are explicit non-goals. Don't add them without a reason.
       RM-359 its profile entry carries its stages (`execStats`); these do
       neither:
       - a read two or more plans could serve, which mongod chooses by
-        trial, other than a `find`'s: an `aggregate`'s, a `count`'s, a
-        `distinct`'s, a write's. Its documents come from the store's
+        trial, other than a `find`'s or an `aggregate`'s that streams: an
+        `aggregate` that sorts or groups what its `$match` reads (mongod:
+        133 keys and documents over 400, this server none), a `count`'s,
+        a `distinct`'s, a write's. Its documents come from the store's
         router. mongod counts what the winner examined in its trial, and
-        since RM-349 a `find` streams the winner after its trial's buffer
+        since RM-349 a `find` (since 2026-11-13 an unsorted `aggregate` of
+        stages that stream) streams the winner after its trial's buffer
         and counts as mongod's does; the other readers still decline a
         contested plan (`order::stream_plan`);
       - a read of a time-series collection made whole: under a `$sort`, a
@@ -1125,9 +1128,28 @@ These are explicit non-goals. Don't add them without a reason.
         converts it to, and counts where a time-series `aggregate` streams;
       - a geo, `$near` or `$text` read (`$geoWithin` over a `2d` index:
         mongod 5 keys and 4 documents, this server none).
-      Measured 2026-10-27, 2026-11-07 and 2026-11-10.
+      Measured 2026-10-27, 2026-11-07, 2026-11-10 and 2026-11-13.
       Backlog-ID: RM-363
-      Verify: tests/backlog/test_rm_355_364.py::test_a_contested_aggregate_counts_what_it_examined, tests/backlog/test_rm_355_364.py::test_a_time_series_read_made_whole_counts_what_it_examined
+      Verify: tests/backlog/test_rm_355_364.py::test_a_contested_aggregate_that_does_not_stream_counts_what_it_examined, tests/backlog/test_rm_355_364.py::test_a_time_series_read_made_whole_counts_what_it_examined
+- [ ] **A contested read's line names the plan its trial lost.** For a
+      `find` or `aggregate` of `{x: {$lt: 30}, y: 1}` over indexes on `x`
+      and `y`, mongod 8.2.11's trial runs the index on `x`, its plan cache
+      entry and its line both say `IXSCAN { x: 1 }`; this server runs and
+      caches the same plan, but its line names `IXSCAN { y: 1 }`, the plan
+      its fixed preference puts first: `explain/summary.rs` plans the line's
+      summary from the catalog with no trial. The summary should be the
+      plan the read ran (the cached plan, or the trial's winner). Found
+      while working RM-363, 2026-11-13.
+      Verify: tests/backlog/test_rm_found_rm363.py::test_a_contested_read_names_the_plan_its_trial_chose
+      Backlog-ID: RM-598
+- [ ] **A line says nothing of how its plan was chosen.** mongod 8.2.11's
+      `Slow query` line for a read whose plan its trial chose says
+      `fromMultiPlanner: true` (and `fromPlanCache: true` for one that ran
+      the cache's active plan); this server's line carries neither, though
+      `explain/order.rs` notes both for `$queryStats`
+      (`opdebug::note_planned`). Found while working RM-363, 2026-11-13.
+      Verify: tests/backlog/test_rm_found_rm363.py::test_a_contested_read_says_it_was_multi_planned
+      Backlog-ID: RM-599
 - [ ] **A read of a time-series collection's meta index names the index
       as `listIndexes` shows it.** mongod 8.2.11's line for a `find({m: 1})`
       of a time-series collection says `IXSCAN { meta: 1, control.min.t: 1,

@@ -238,6 +238,11 @@ fn build(
     }
     let per_batch = !buffered && (query.rest.is_empty() || sbe);
     let limit = query.limit;
+    // A plan two or more indexes contest is chosen by mongod's trial, run
+    // through its plan cache when the command runs (RM-363, as a `find`'s
+    // since RM-349): the pipeline's own read in the classic engine. The
+    // query is the one mongod's plan cache keys the pipeline's front by.
+    let tries = !buffered && !sbe;
     let order = crate::explain::order::Ask {
         db: ask.db,
         coll: ask.coll,
@@ -247,19 +252,38 @@ fn build(
         collation: ask.collation,
         vars: ask.vars,
         limit: if limit > 0 { query.skip + limit } else { 0 },
-        asked: Default::default(),
+        asked: crate::near::Asked {
+            skip: query.skip,
+            limit,
+            sort: query.sort.as_ref(),
+            projection: query.projection.as_ref(),
+            cached: tries,
+            ..Default::default()
+        },
     };
-    let Some(plan) = crate::explain::order::stream_plan(
-        storage,
-        &order,
-        query.skip,
-        limit,
-        query.projection.as_ref(),
-        false,
-        Default::default(),
-    )
-    .map_err(read_error)?
-    else {
+    let planned = if tries {
+        crate::explain::order::stream_tried(
+            storage,
+            &order,
+            query.skip,
+            limit,
+            query.projection.as_ref(),
+            false,
+            Default::default(),
+        )
+    } else {
+        crate::explain::order::stream_plan(
+            storage,
+            &order,
+            query.skip,
+            limit,
+            query.projection.as_ref(),
+            false,
+            Default::default(),
+        )
+        .map(|plan| plan.map(|plan| (plan, None)))
+    };
+    let Some((plan, trial)) = planned.map_err(read_error)? else {
         return Ok(None);
     };
     // The projection the planner took is a stage of the pipeline: run as
@@ -305,12 +329,26 @@ fn build(
         collation: ask.collation,
         ..Default::default()
     };
-    let Some(source) =
+    let Some(mut source) =
         Stream::of_plan_with(&plan, ask.db, ask.coll, &query.filter, ask.vars, &opts)
             .map_err(read_error)?
     else {
         return Ok(None);
     };
+    // What the trial's winner returned in it is buffered when the command
+    // runs, and the read goes on from there; the first buffer counts what
+    // the trial examined.
+    if let Some(trial) = trial {
+        let _active = secantus_core::collation::activate(ask.collation);
+        source
+            .buffer_trial(
+                storage,
+                trial.results,
+                trial.ended,
+                trial.cached.then_some(&plan),
+            )
+            .map_err(read_error)?;
+    }
     // A `$unionWith`'s read counts none, as when the pipeline is read whole.
     if !buffered {
         crate::explain::order::count_index_use(storage, &order, crate::explain::order::Uses::Find);
