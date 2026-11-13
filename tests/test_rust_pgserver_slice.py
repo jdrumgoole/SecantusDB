@@ -2766,6 +2766,24 @@ def test_pg_cursors_statement_is_the_source_text(home: Path) -> None:
         conn.execute("close h")
 
 
+def test_a_duplicate_cursor_name_aborts_the_block(home: Path) -> None:
+    """A DECLARE of a name already open is 42P03 and aborts the block, so the
+    next statement is 25P02 until the ROLLBACK (RP-899). Measured on
+    PostgreSQL 15.19; this server let the block run on."""
+    with _Server(home) as server, server.connect() as conn:
+        conn.autocommit = True
+        conn.execute("begin")
+        conn.execute("declare c cursor for select 1")
+        with pytest.raises(psycopg.Error) as dup:
+            conn.execute("declare c cursor for select 2")
+        assert dup.value.sqlstate == "42P03"
+        with pytest.raises(psycopg.Error) as aborted:
+            conn.execute("select 1")
+        assert aborted.value.sqlstate == "25P02"
+        conn.execute("rollback")
+        assert conn.execute("select 1").fetchall() == [(1,)]
+
+
 def test_constant_select_list_column(home: Path) -> None:
     """`SELECT 1 FROM <source>` — a literal column, one per row.
 

@@ -3638,12 +3638,6 @@ at the DECLARE, and the cursor answers that differ either way.
       already matches).
       Verify: tests/backlog/test_rp_found_rp744.py::test_a_zero_count_fetch_refetches_the_current_row
       Backlog-ID: RP-898
-- [ ] **A DECLARE refused for a duplicate cursor name leaves the block
-      usable.** PostgreSQL 15.19 answers 42P03 `cursor "c" already exists`
-      and aborts the block, so the next statement is 25P02; here the block
-      runs on.
-      Verify: tests/backlog/test_rp_found_rp744.py::test_a_duplicate_cursor_name_aborts_the_block
-      Backlog-ID: RP-899
 - [ ] **A PL/pgSQL FETCH from a `refcursor` parameter is refused at CREATE
       FUNCTION.** `create function f(c refcursor) returns int language
       plpgsql as $$ declare r int; begin fetch c into r; return r; end $$`

@@ -34838,6 +34838,8 @@ impl PgHandler {
                 .unwrap_or_else(|e| e.into_inner())
                 .contains_key(&name)
             {
+                // An error in a block aborts it (RP-899).
+                self.note_failure();
                 return Err(Self::user_error(
                     "42P03",
                     format!("cursor \"{name}\" already exists"),
@@ -34945,6 +34947,7 @@ impl PgHandler {
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
                     .take();
+                self.note_failure();
                 return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
                     "ERROR".into(),
                     "0A000".into(),

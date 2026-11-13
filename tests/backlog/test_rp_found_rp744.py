@@ -8,7 +8,6 @@ computed every row's select list at the DECLARE):
   them at the first FETCH;
 - `FETCH FORWARD 0` / `FETCH 0` / `FETCH BACKWARD 0` answer no row, and
   `MOVE FORWARD 0` moves over none;
-- a DECLARE refused for a duplicate name leaves its block usable;
 - `pg_cursors.statement` is a deparse of the query, not the DECLARE text;
 - a PL/pgSQL `FETCH` from a `refcursor` parameter is refused at CREATE
   FUNCTION.
@@ -176,10 +175,11 @@ def test_a_zero_count_fetch_refetches_the_current_row(dsn: str) -> None:
     ]
 
 
-@pytest.mark.backlog("RP-899")
+@pytest.mark.backlog_fixed("RP-899")
 def test_a_duplicate_cursor_name_aborts_the_block(dsn: str) -> None:
     """PostgreSQL 15.19 refuses a DECLARE of a name already open with
-    42P03, and the block is then aborted (25P02). Here the block runs on."""
+    42P03, and the block is then aborted (25P02). This server let the block
+    run on."""
     assert _steps(
         dsn,
         [
