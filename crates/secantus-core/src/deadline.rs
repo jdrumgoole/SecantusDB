@@ -480,9 +480,19 @@ pub fn check() -> Result<(), MaxTimeMsExpired> {
     if !tick.is_multiple_of(POLL_EVERY) {
         return Ok(());
     }
+    yield_point().map(|_| ())
+}
+
+/// [`check`] at one of a plan executor's own work boundaries, where mongod
+/// asks `shouldYieldOrInterrupt` before every `work()` call: the clock is
+/// read on every call, not every [`POLL_EVERY`]th. True when the statement
+/// yielded -- released and retook its locks, so that what it reads next is
+/// read at a new snapshot -- and false when it did not, or could not (no
+/// statement locks: [`no_yields`]).
+pub fn yield_point() -> Result<bool, MaxTimeMsExpired> {
     let period = yield_period_ms();
     if period < 0 {
-        return Ok(());
+        return Ok(false);
     }
     let now = Instant::now();
     let due = YIELD_MARK.with(|m| match m.get() {
@@ -497,15 +507,16 @@ pub fn check() -> Result<(), MaxTimeMsExpired> {
         }
     });
     if !due {
-        return Ok(());
+        return Ok(false);
     }
     check_for_interrupt()?;
     let relock = YIELD_HOOK.with(|h| h.borrow().clone());
     if let Some(relock) = relock {
         YIELDS.with(|y| y.set(y.get() + 1));
         relock()?;
+        return Ok(true);
     }
-    Ok(())
+    Ok(false)
 }
 
 /// [`check`] without the poll interval — for coarse call sites.
@@ -613,6 +624,26 @@ mod tests {
             check().unwrap();
         }
         assert_eq!((yields(), relocks.get(), interrupt_checks()), (1, 1, 2));
+    }
+
+    /// A work boundary reads the clock on every call, not every
+    /// `POLL_EVERY`th, and says whether it yielded: a batched delete reads
+    /// what it staged before a yield again (RM-501).
+    #[test]
+    fn a_work_boundary_yields_on_its_first_call_past_the_period() {
+        begin_operation();
+        let period = Duration::from_millis(yield_period_ms() as u64);
+        let _y = yield_with(std::rc::Rc::new(check_for_interrupt));
+        YIELD_MARK.with(|m| m.set(Some(Instant::now() + Duration::from_secs(3600))));
+        assert_eq!(yield_point(), Ok(false), "no yield before the period");
+        YIELD_MARK.with(|m| m.set(Some(Instant::now() - period - Duration::from_millis(2))));
+        assert_eq!(yield_point(), Ok(true), "the first call past it yields");
+        assert_eq!(yields(), 1);
+        // Without statement locks to release there is no yield to report.
+        let _none = no_yields();
+        YIELD_MARK.with(|m| m.set(Some(Instant::now() - period - Duration::from_millis(2))));
+        assert_eq!(yield_point(), Ok(false));
+        assert_eq!(yields(), 1);
     }
 
     /// A nested command must not be able to widen the budget it runs under,

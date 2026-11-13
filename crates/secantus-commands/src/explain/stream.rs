@@ -154,6 +154,9 @@ pub(crate) struct Batch {
     pub docs: Vec<Vec<u8>>,
     pub rids: Vec<i64>,
     pub keys: Vec<Option<Document>>,
+    /// The statement's yields (`deadline::yields`) when each document was
+    /// read: a write that holds it past a later yield reads it again.
+    pub yields: Vec<i64>,
     pub exhausted: bool,
     pub keys_examined: i64,
     pub docs_examined: i64,
@@ -225,6 +228,8 @@ struct Found {
     doc: Vec<u8>,
     rid: i64,
     entry: Option<EntryKey>,
+    /// The statement's yields when the plan returned it.
+    yields: i64,
 }
 
 /// The plan's state between batches.
@@ -2139,6 +2144,10 @@ pub(crate) struct Stream {
     /// The read below a write's UPDATE or DELETE ([`Stream::for_write`]),
     /// which is never `find`'s first batch.
     write: bool,
+    /// The read stages a batched delete's documents (RM-501): its executor
+    /// may yield before each `work()` call that returns one, as mongod's
+    /// does ([`Stream::pull_for_write`]).
+    boundaries: bool,
     yields: Yields,
     /// The yields the last batch's profile entry reports.
     shown: Yields,
@@ -2345,6 +2354,7 @@ impl Stream {
             limit_eof_work: false,
             first: true,
             write: false,
+            boundaries: false,
             yields: Yields::default(),
             shown: Yields::default(),
             failed: None,
@@ -2394,6 +2404,7 @@ impl Stream {
             limit_eof_work: false,
             first: true,
             write: false,
+            boundaries: false,
             yields: Yields::default(),
             shown: Yields::default(),
             failed: None,
@@ -2442,6 +2453,7 @@ impl Stream {
             limit_eof_work: false,
             first: true,
             write: false,
+            boundaries: false,
             yields: Yields::default(),
             shown: Yields::default(),
             failed: None,
@@ -2552,6 +2564,18 @@ impl Stream {
                     break;
                 }
                 cx.want = if want > 0 { want - out.len() } else { 0 };
+                // The executor's yield point before the work that finds the
+                // next document, or the end.
+                if self.boundaries {
+                    secantus_core::deadline::yield_point().map_err(|_| {
+                        use secantus_core::deadline::MaxTimeMsExpired as E;
+                        StorageError::WriteError {
+                            code: E::CODE,
+                            errmsg: E::MESSAGE.to_string(),
+                            exec: false,
+                        }
+                    })?;
+                }
                 let Some(m) = self.root.next(&mut cx)? else {
                     self.done = true;
                     break;
@@ -2567,6 +2591,7 @@ impl Stream {
                     doc,
                     rid: m.rid,
                     entry: m.entry,
+                    yields: secantus_core::deadline::yields(),
                 });
             }
             Ok(())
@@ -2627,14 +2652,22 @@ impl Stream {
     /// none past the one that brings them to `max_bytes`, with what reading
     /// them examined. A read that fails part-way returns the documents it
     /// matched before the failure, with the failure, and ends there.
+    ///
+    /// `boundaries`: the documents are a batched delete's, which stages
+    /// each in a `work()` call of its own and may yield before the next:
+    /// the read yields where mongod's executor would, and each document
+    /// carries the statement's yields when it was read (RM-501).
     pub(crate) fn pull_for_write(
         &mut self,
         storage: &dyn Storage,
         want: usize,
         max_bytes: usize,
+        boundaries: bool,
     ) -> (Result<Batch, StorageError>, Option<StorageError>) {
         self.failed = Some(None);
+        self.boundaries = boundaries;
         let batch = self.batch(storage, want, max_bytes, true);
+        self.boundaries = false;
         (batch, self.failed.take().flatten())
     }
 
@@ -2742,6 +2775,7 @@ impl Stream {
             docs: Vec::with_capacity(out.len()),
             rids: Vec::with_capacity(out.len()),
             keys: Vec::with_capacity(out.len()),
+            yields: Vec::with_capacity(out.len()),
             exhausted,
             keys_examined: self.keys,
             docs_examined: self.docs,
@@ -2754,6 +2788,7 @@ impl Stream {
             batch.docs.push(found.doc);
             batch.rids.push(found.rid);
             batch.keys.push(key);
+            batch.yields.push(found.yields);
         }
         Ok(batch)
     }

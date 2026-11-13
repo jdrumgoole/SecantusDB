@@ -1460,19 +1460,20 @@ about forty such points; these are the ones measured.
       working RM-390, 2026-11-13.
       Verify: tests/backlog/test_rm_found_rm390.py::test_a_profile_entry_counts_what_it_examined_as_int32
       Backlog-ID: RM-601
-- [ ] **A batched deleteMany tests each document's filter once, where
-      mongod tests it twice.** mongod's batched multi-delete
-      (`batchUserMultiDeletes`, on by default) tests a document when it
-      stages it and again when it deletes the batch, the snapshot having
-      moved (`ensureStillMatches`): a deleteMany of one document whose
-      filter takes 1.0 s to test takes 1.95 s, three take 5.9 s, and with
-      the parameter off they take 0.98 s and 2.95 s (mongod 8.2.11,
-      2026-11-10, a one-member replica set). This server tests it once,
-      so a deleteMany fits in a `maxTimeMS` mongod runs out of (code 50).
-      Found while closing RM-391, whose once-per-document rule holds for
-      every other write.
-      Backlog-ID: RM-501
-      Verify: tests/backlog/test_rm_found_2026_11_10_rm391.py::test_a_batched_delete_many_tests_each_document_twice
+- [ ] **A write's profile entry counts no yields, where mongod counts
+      each.** mongod 8.2.11's executor yields once its yield period (10 ms)
+      has passed, before a `work()` call, and its `system.profile` entry
+      says how often: a deleteMany of three documents that take half a
+      second each to test has `numYield: 5` (before staging the second and
+      third, before the call that finds the end, and twice inside the
+      batch, which it splits once deleting it has run
+      `batchedDeletesTargetBatchTimeMS`, 5 ms; measured 2026-11-13). This
+      server's entry for it says `numYield: 0`, although since RM-501 a
+      batched delete yields at those boundaries; the profiler writes a
+      literal 0 for several commands (`profiler/record.rs`), not probed
+      one by one. Found while working RM-501.
+      Verify: tests/backlog/test_rm_found_rm501.py::test_a_delete_many_profile_entry_counts_its_yields
+      Backlog-ID: RM-609
 
 ### 7.086 The Rust MongoDB server, audited -- 2026-10-20
 

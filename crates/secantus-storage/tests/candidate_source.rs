@@ -36,12 +36,13 @@ fn source(
     rows: Vec<(i64, Vec<u8>)>,
     pulls: usize,
     asked: &RefCell<Vec<usize>>,
-) -> impl FnMut(usize, usize) -> Pulled + '_ {
+) -> impl FnMut(usize, usize, bool) -> Pulled + '_ {
     let mut rest = rows.into_iter();
-    move |want, _max_bytes| {
+    move |want, _max_bytes, _boundaries| {
         asked.borrow_mut().push(want);
         if asked.borrow().len() > pulls {
             return Pulled {
+                yields: Vec::new(),
                 rows: Vec::new(),
                 exhausted: false,
                 stopped: true,
@@ -51,6 +52,7 @@ fn source(
         let n = if want == 0 { usize::MAX } else { want };
         let rows: Vec<_> = rest.by_ref().take(n).collect();
         Pulled {
+            yields: Vec::new(),
             exhausted: rows.len() < n,
             rows,
             stopped: false,
@@ -98,9 +100,10 @@ fn an_update_many_writes_a_row_met_twice_once() {
     // write moved them ahead of it) meets them all again.
     let twice: Vec<_> = rows.iter().chain(rows.iter()).cloned().collect();
     let mut pulled = 0;
-    let mut src = |_want: usize, _max: usize| {
+    let mut src = |_want: usize, _max: usize, _boundaries: bool| {
         pulled += 1;
         Pulled {
+            yields: Vec::new(),
             rows: if pulled <= 2 {
                 twice[(pulled - 1) * 5..pulled * 5].to_vec()
             } else {

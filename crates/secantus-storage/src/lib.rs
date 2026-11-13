@@ -4346,6 +4346,9 @@ pub struct Pulled {
     /// The rows the source's read matched, in its order, each with the
     /// bytes it matched it as.
     pub rows: Vec<(i64, Vec<u8>)>,
+    /// The statement's yields (`deadline::yields`) when each row was read,
+    /// beside `rows`; a row without one counts as read at the pull's end.
+    pub yields: Vec<i64>,
     /// The read is at its end: no rows follow these.
     pub exhausted: bool,
     /// The read stopped part-way (an interrupt, a filter that failed on a
@@ -4355,8 +4358,10 @@ pub struct Pulled {
 }
 
 /// A write's candidate source: up to `want` matches, and none past the
-/// one that brings them to `max_bytes`, read on from the last pull.
-pub type CandidateSource<'a> = dyn FnMut(usize, usize) -> Pulled + 'a;
+/// one that brings them to `max_bytes`, read on from the last pull; the
+/// third argument asks the read to yield at each of its executor's work
+/// boundaries, as a batched delete's does (RM-501).
+pub type CandidateSource<'a> = dyn FnMut(usize, usize, bool) -> Pulled + 'a;
 
 thread_local! {
     /// The candidate source the next write on this thread draws from
@@ -4402,10 +4407,10 @@ impl TakenSource {
         CANDIDATE_SOURCE.with(|s| s.take()).map(TakenSource)
     }
 
-    fn pull(&mut self, want: usize, max_bytes: usize) -> Pulled {
+    fn pull(&mut self, want: usize, max_bytes: usize, boundaries: bool) -> Pulled {
         // SAFETY: see `with_candidate_source`; a `TakenSource` lives only
         // inside the write that call runs, and is used by one thread.
-        unsafe { (*self.0.as_ptr())(want, max_bytes) }
+        unsafe { (*self.0.as_ptr())(want, max_bytes, boundaries) }
     }
 
     /// Every row the source matches, in its order, each with the bytes it
@@ -4413,7 +4418,7 @@ impl TakenSource {
     fn drain(&mut self) -> Option<Vec<(i64, Vec<u8>)>> {
         let mut rows = Vec::new();
         loop {
-            let pulled = self.pull(0, usize::MAX);
+            let pulled = self.pull(0, usize::MAX, false);
             rows.extend(pulled.rows);
             if pulled.stopped {
                 return None;
@@ -21896,7 +21901,7 @@ impl Storage {
                 Some(mut source) => {
                     let mut written: HashSet<i64> = HashSet::new();
                     loop {
-                        let pulled = source.pull(WRITE_CHUNK_MAX_DOCS, usize::MAX);
+                        let pulled = source.pull(WRITE_CHUNK_MAX_DOCS, usize::MAX, false);
                         let ended = pulled.exhausted || pulled.rows.is_empty();
                         let rows: Vec<(i64, Vec<u8>)> = pulled
                             .rows
@@ -22758,6 +22763,17 @@ impl Storage {
             pre_post_images_enabled(&session, db, coll)?
         };
         let batch_docs: usize = if per_document { 1 } else { 10 };
+        // mongod's batched delete stages a document in one `work()` call and
+        // deletes the batch in a later one, unless the document fills it.
+        // Its executor may yield before each call, which abandons the
+        // snapshot, and a document staged before a yield is read and tested
+        // again when the batch is deleted (`BatchedDeleteStage::_deleteBatch`,
+        // `ensureStillMatches`): a deleteMany of one slow document takes
+        // twice a `find` of it, of 20,000 documents a fifth of a millisecond
+        // each 6% longer (measured 8.2.11, 2026-11-13, RM-501). A collection that
+        // records pre-images deletes each document in the call that staged
+        // it, and tests it once.
+        let batched = !per_document;
         const BATCH_BYTES: usize = 2 * 1024 * 1024;
         // Each batch of two or more is one `applyOps` entry on mongod.
         struct ClearGroups;
@@ -22771,15 +22787,22 @@ impl Storage {
         let mut deleted = 0usize;
         // Delete one staged batch, in bounded chunks: last-read first when
         // the caller asked for mongod's order. A chunk commits what it did
-        // before a failure; the failure is then the statement's.
-        let mut delete_batch = |mut batch: Vec<(i64, Vec<u8>)>| -> Result<()> {
+        // before a failure; the failure is then the statement's. Each row
+        // carries the statement's yields when it was staged: one staged
+        // before a later yield is tested again (RM-501).
+        let mut delete_batch = |staged: Vec<(i64, Vec<u8>, i64)>| -> Result<()> {
+            let now = deadline::yields();
+            let mut batch: Vec<(i64, Vec<u8>, bool)> = staged
+                .into_iter()
+                .map(|(rid, blob, at)| (rid, blob, batched && at != now))
+                .collect();
             if reversed {
                 batch.reverse();
                 if batch.len() > 1 {
                     let id = self.insert_groups.fetch_add(1, Ordering::Relaxed);
                     DELETE_GROUPS.with(|g| {
                         let mut g = g.borrow_mut();
-                        for (rid, _) in &batch {
+                        for (rid, _, _) in &batch {
                             g.insert(*rid, id);
                         }
                     });
@@ -22816,14 +22839,23 @@ impl Storage {
             // The plan's read, a staged batch at a time, each deleted before
             // the next is read.
             Some(mut source) => loop {
-                let pulled = source.pull(batch_docs, BATCH_BYTES);
+                let pulled = source.pull(batch_docs, BATCH_BYTES, batched);
                 if pulled.stopped {
                     scan_error = Some(StorageError::MaxTimeExpired);
                     break;
                 }
                 let ended = pulled.exhausted || pulled.rows.is_empty();
                 if !pulled.rows.is_empty() {
-                    delete_batch(pulled.rows)?;
+                    // The read yielded at its executor's work boundaries,
+                    // the one that found its end included.
+                    let unknown = deadline::yields();
+                    let mut yields = pulled.yields.into_iter();
+                    let rows = pulled
+                        .rows
+                        .into_iter()
+                        .map(|(rid, blob)| (rid, blob, yields.next().unwrap_or(unknown)))
+                        .collect();
+                    delete_batch(rows)?;
                 }
                 if ended {
                     break;
@@ -22843,8 +22875,17 @@ impl Storage {
                         hint,
                     )?
                 };
-                let mut staged: Vec<(i64, Vec<u8>)> = Vec::new();
+                let mut staged: Vec<(i64, Vec<u8>, i64)> = Vec::new();
                 let mut staged_bytes = 0usize;
+                // A work boundary of a batched delete: its executor may yield
+                // there. An interrupt there ends the delete before it
+                // deletes what it staged.
+                let boundary = || -> Result<()> {
+                    if batched {
+                        deadline::yield_point().map_err(|_| StorageError::MaxTimeExpired)?;
+                    }
+                    Ok(())
+                };
                 'read: loop {
                     let page = match self.next_candidate_page(
                         db,
@@ -22861,10 +22902,16 @@ impl Storage {
                         }
                     };
                     for (recordid, blob) in page {
+                        // Each candidate is its own `work()` call.
+                        if let Err(e) = boundary() {
+                            staged.clear();
+                            scan_error = Some(e);
+                            break 'read;
+                        }
                         match write_matches(recordid, &blob, filter, let_vars, coll_opt) {
                             Ok(true) => {
                                 staged_bytes += blob.len();
-                                staged.push((recordid, blob));
+                                staged.push((recordid, blob, deadline::yields()));
                                 if staged.len() >= batch_docs || staged_bytes >= BATCH_BYTES {
                                     delete_batch(std::mem::take(&mut staged))?;
                                     staged_bytes = 0;
@@ -22879,8 +22926,13 @@ impl Storage {
                         }
                     }
                 }
-                if !staged.is_empty() {
-                    delete_batch(staged)?;
+                if !staged.is_empty() && scan_error.is_none() {
+                    // The call that finds the read at its end deletes the
+                    // last batch.
+                    match boundary() {
+                        Ok(()) => delete_batch(staged)?,
+                        Err(e) => scan_error = Some(e),
+                    }
                 }
             }
         }
@@ -22892,7 +22944,8 @@ impl Storage {
     }
 
     /// One bounded chunk of the deleteMany, over RecordIds with the bytes
-    /// the scan matched them as. Returns `(consumed, deleted, stopped)`:
+    /// the scan matched them as, and whether the statement yielded since it
+    /// staged each (it is tested again). Returns `(consumed, deleted, stopped)`:
     /// `stopped` is the error a document another writer changed met when
     /// it was tested again, which ends the delete after this chunk commits.
     #[allow(clippy::too_many_arguments)]
@@ -22901,7 +22954,7 @@ impl Storage {
         session: &Session,
         db: &str,
         coll: &str,
-        rids: &[(i64, Vec<u8>)],
+        rids: &[(i64, Vec<u8>, bool)],
         filter: &Document,
         let_vars: &Document,
         coll_opt: Option<&Collation>,
@@ -22929,7 +22982,7 @@ impl Storage {
         let mut pre_images: Vec<Option<Vec<u8>>> = Vec::new();
         let mut stopped = None;
         let cur = session.open_cursor(&doc_table_for(db, coll), None)?;
-        for (recordid, scanned) in rids {
+        for (recordid, scanned, yielded) in rids {
             let recordid = *recordid;
             if deleted >= WRITE_CHUNK_MAX_DOCS || chunk_bytes >= WRITE_CHUNK_MAX_BYTES {
                 break;
@@ -22947,8 +23000,10 @@ impl Storage {
                 Err(e) => return Err(e.into()),
             };
             // A document unchanged since the scan matched it still matches
-            // (see `update_chunk_txn`).
-            if blob != *scanned {
+            // (see `update_chunk_txn`), unless the statement yielded since
+            // it was staged: mongod tests it again at the new snapshot
+            // whatever it reads there (RM-501).
+            if *yielded || blob != *scanned {
                 let raw = bson::RawDocument::from_bytes(&blob)
                     .map_err(|_| StorageError::QueryUnsupported)?;
                 match secantus_core::query::matches_raw(raw, filter, let_vars, coll_opt) {

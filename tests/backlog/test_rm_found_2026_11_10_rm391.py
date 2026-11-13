@@ -33,13 +33,14 @@ def _delete_many_in_a_find_s_time(client: Any) -> Any:
     return reply.get("code") or next((e["code"] for e in reply.get("writeErrors", [])), None)
 
 
-@pytest.mark.backlog("RM-501")
+@pytest.mark.backlog_fixed("RM-501")
 def test_a_batched_delete_many_tests_each_document_twice(rust_mongo: Any, mongod_rs: Any) -> None:
     """mongod's batched multi-delete (`batchUserMultiDeletes`, on by
     default) tests a document's filter when it stages it and again when it
-    deletes the batch, so a deleteMany of one slow document takes twice a
-    `find` of it and runs out of a `maxTimeMS` half again as long (code
-    50). This server tests it once, and the delete fits."""
+    deletes the batch, the statement having yielded in between, so a
+    deleteMany of one slow document takes twice a `find` of it and runs out
+    of a `maxTimeMS` half again as long (code 50). This server tested it
+    once, and the delete fitted."""
     theirs = _delete_many_in_a_find_s_time(mongod_rs)
     assert theirs == 50, theirs
     assert _delete_many_in_a_find_s_time(rust_mongo) == theirs

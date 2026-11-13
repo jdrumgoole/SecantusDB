@@ -1005,13 +1005,14 @@ impl CmdStorage for StorageAdapter {
 
     fn with_candidate_source(
         &self,
-        source: &mut dyn FnMut(usize, usize) -> secantus_commands::storage::Pulled,
+        source: &mut dyn FnMut(usize, usize, bool) -> secantus_commands::storage::Pulled,
         f: &mut dyn FnMut(),
     ) {
-        let mut source = |want: usize, max_bytes: usize| {
-            let pulled = source(want, max_bytes);
+        let mut source = |want: usize, max_bytes: usize, boundaries: bool| {
+            let pulled = source(want, max_bytes, boundaries);
             secantus_storage::Pulled {
                 rows: pulled.rows,
+                yields: pulled.yields,
                 exhausted: pulled.exhausted,
                 stopped: pulled.stopped,
             }
