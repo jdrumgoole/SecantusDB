@@ -1182,7 +1182,7 @@ These are explicit non-goals. Don't add them without a reason.
       here is not mongod's KeyString. (An insert's count varies by 8 bytes a
       skiplist level on both servers: WiredTiger draws each new key's depth
       at random.) Measured 2026-11-10. Found while working RM-385.
-      **Decision needed (2026-11-13):** the surplus is this store's shared
+      The surplus is this store's shared
       tables. Every key an insert writes carries the namespace as strings,
       because collections share sixteen document shards
       (`key_format=SSq`), every `_id` index is a row in
@@ -1198,29 +1198,20 @@ These are explicit non-goals. Don't add them without a reason.
       times 40) and nothing on mongod. Of the 51 bytes left at 9
       characters, about 40 are the prefixes (`db\0c\0` three times, plus
       `x_1\0`). The remaining ~11 are the encodings: the `_id` sort key
-      against KeyString, and the index entry's value. Options, the most
-      faithful first:
-      (a) **mongod's layout, recommended:** a table per collection keyed
-      by RecordId and a table per index keyed by KeyString, with the
-      catalog mapping namespace to ident. This closes this item and the
-      per-table half of RM-040 (`collStats.wiredTiger` / `indexDetails`,
-      real `storageSize` / `indexSize`, `$listCatalog` idents), and makes
-      the RM-192 `compact` scope decision unnecessary. It changes the
-      on-disk format both Rust servers share (a store migration, or a
-      format bump that refuses an old store), replaces `DOC_SHARDS` (a
-      table per collection gives the same per-collection file
-      independence), and the KeyString keys change the on-disk sort-key
-      rank (`sortkey.rs`, `entryFormat`). Several PRs; sequence storage
-      first, then KeyString.
-      (b) **Keep the shared tables, prefix each key with a short numeric
-      collection id or index id** in place of the names (1-2 bytes as a
-      packed `q`). This is still an on-disk format change, and a stand-in
-      for mongod's mechanism. It removes the name-length dependence and
-      about 34 of the 51 bytes; the gap test stays red at about 17 bytes
-      until the encodings also move to KeyString.
-      (c) **Scope decision:** `txnBytesDirty` counts this store's layout,
-      not mongod's. Retire the gap test with that reason, and keep the
-      update and delete counts, which already match.
+      against KeyString, and the index entry's value.
+      **Decided (Joe, 2026-11-13): mongod's layout.** A WiredTiger table
+      per collection keyed by RecordId (`key_format=q`) and a table per
+      index keyed by KeyString, with the catalog mapping each namespace to
+      its ident, as mongod does. It closes this item and the per-table half
+      of RM-040 (`collStats.wiredTiger` / `indexDetails`, real
+      `storageSize` / `indexSize`, `$listCatalog` idents), and makes the
+      RM-192 `compact` scope decision unnecessary. It changes the on-disk
+      format both Rust servers share: a format bump that refuses an old
+      store or a migration, replacing `DOC_SHARDS`, and the KeyString keys
+      change the on-disk sort-key rank (`sortkey.rs`, `entryFormat`).
+      Several PRs, storage first, then KeyString; each says in its PR that
+      the Rust PG server links it, and the PG session is told before the
+      format changes.
       Verify: tests/backlog/test_rm_355_364.py::test_an_insert_in_a_transaction_counts_mongods_dirty_bytes
       Backlog-ID: RM-499
 
