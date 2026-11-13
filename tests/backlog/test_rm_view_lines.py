@@ -134,12 +134,13 @@ def test_a_distinct_of_a_view_of_no_collection_says_how_long_it_planned(
     assert got["rust"] == got["mongod"]
 
 
-@pytest.mark.backlog("RM-493")
+@pytest.mark.backlog_fixed("RM-493")
 def test_a_distinct_of_a_view_counts_what_it_examined(rust_mongo: Any, mongod_rs: Any) -> None:
     """mongod 8.2.11's line for a `distinct` of a view counts the keys and
     documents its plan beneath the view examined, and says its cursor is
-    exhausted, as an `aggregate` of the view does; this server's says
-    neither (measured 2026-11-10, found while working RM-381)."""
+    exhausted, as an `aggregate` of the view does; this server's said
+    neither (measured 2026-11-10, found while working RM-381): it read the
+    view another way, where mongod runs the aggregation it prints."""
     got = {}
     for server, client, is_mongod in (("rust", rust_mongo, False), ("mongod", mongod_rs, True)):
         lines, _ = logged(client, is_mongod, _setup, lambda d: d.v.distinct("y"))

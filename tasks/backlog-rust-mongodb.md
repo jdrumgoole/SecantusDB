@@ -1058,17 +1058,6 @@ These are explicit non-goals. Don't add them without a reason.
       2026-11-13.
       Verify: tests/backlog/test_rm_view_namespaces.py::test_a_change_stream_of_a_view_writes_no_line
       Backlog-ID: RM-593
-- [ ] **A `distinct` of a view counts nothing it examined.** mongod 8.2.11
-      runs it as an aggregation over the collection beneath the view, and
-      its line counts what that plan examined (`keysExamined: 11,
-      docsExamined: 11, cursorExhausted: true` over an `IXSCAN { x: 1 }`),
-      as an `aggregate` of the view's does here; this server reads the
-      view's documents another way (`aggregate::collection_documents`) and
-      prints none of the three. Since RM-381 it plans that read, for the
-      `planningTimeMicros`, without running it. Found while working
-      RM-381, 2026-11-10.
-      Verify: tests/backlog/test_rm_view_lines.py::test_a_distinct_of_a_view_counts_what_it_examined
-      Backlog-ID: RM-493
 - [ ] **A `count_documents` names an `IXSCAN` where mongod runs a
       `COUNT_SCAN`.** A `count_documents` is a `$match` and a `$group` that
       reads no field. Where its filter bounds the index on `x` -- of a
@@ -1084,6 +1073,16 @@ These are explicit non-goals. Don't add them without a reason.
       2026-11-13. Found while working RM-381, 2026-11-10.
       Verify: tests/backlog/test_rm_view_lines.py::test_a_count_documents_runs_a_count_scan
       Backlog-ID: RM-494
+- [ ] **A bare `"$"` is read as a missing field, not refused.** mongod
+      8.2.11 refuses `"$"` wherever an expression parses an operand (16872
+      "'$' by itself is not a valid FieldPath"): `{$project: {f: "$"}}`,
+      `{$toUpper: "$"}`, `{$concat: ["$", "x"]}`. This server answers each
+      as if it named a missing field (`{}`, `""`, `null`), and
+      `{$_internalFindAllValuesAtPath: "$"}` with that operator's 5511201.
+      The check belongs with the operand parse (`expr_parse::operand`),
+      before any operator's own. Found while working RM-493, 2026-11-13.
+      Verify: tests/backlog/test_rm_found_rm493.py::test_a_bare_dollar_is_no_field_path
+      Backlog-ID: RM-594
 - [ ] **A `Slow query` line takes a command's string argument for its
       collection.** mongod 8.2.11's lines for a `dataSize: "<db>.c"`, a
       `getLog` and a `compact: "c"` name `<db>.$cmd`; this server's name
