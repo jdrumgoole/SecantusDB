@@ -69,6 +69,8 @@ pub(crate) struct OperFact {
     pub right: i64,
     pub result: i64,
     pub code: i64,
+    /// `oprnegate`.
+    pub negate: i64,
 }
 
 /// One `pg_amop` row.
@@ -362,6 +364,7 @@ fn load() -> Builtin {
             right: int(&r, "oprright"),
             result: int(&r, "oprresult"),
             code: int(&r, "oprcode"),
+            negate: int(&r, "oprnegate"),
         };
         b.opers_by_name.entry(o.name.clone()).or_default().push(oid);
         b.opers.insert(oid, o);

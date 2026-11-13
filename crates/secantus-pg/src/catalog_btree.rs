@@ -28,7 +28,7 @@ use bson::Bson;
 
 use crate::btree_model::{BTree, LayoutPage, Shape};
 use crate::catalog_facts::builtin;
-use crate::catalog_heap::initdb_heaps;
+use crate::catalog_heap::{initdb_heaps, InitdbHeap};
 use crate::catcache::{Backend, PageScan, K};
 use crate::PgHandler;
 
@@ -352,34 +352,78 @@ struct Tree {
     btree: BTree,
 }
 
+/// The visibility map's page 0, as a block of the table's buffers: a fork
+/// of its own, so never one of the heap's blocks.
+const VM_PAGE: i64 = -1;
+
+/// A row returned beyond `initdb`'s tuples, as a block of the table's
+/// buffers: where DDL put it is not modelled yet (RP-291), so each is a
+/// block of its own, apart from the heap's.
+fn unplaced_block(n: usize) -> i64 {
+    -2 - n as i64
+}
+
+/// What an index-only scan reads of catalog `heap` for the index tuples
+/// `tids` (in index order) and `rows` rows returned (`IndexOnlyNext`):
+/// for each tuple `visibilitymap_get_status` reads the visibility map's
+/// page -- once, keeping it pinned, and never when the heap has no map
+/// fork -- and a tuple whose block it does not mark all-visible is
+/// fetched from the heap, its block read when the block fetched before
+/// it was another (`heapam_index_fetch_tuple` keeps its buffer). A row
+/// returned beyond `tids` was written later, onto a page whose bit the
+/// write cleared (`heap_insert`'s `visibilitymap_clear`), so it is fetched
+/// too. The table's blocks read, in order, and the tuples fetched.
+fn index_only_reads(heap: &InitdbHeap, tids: &[i64], rows: usize) -> (Vec<i64>, usize) {
+    let later = rows.saturating_sub(tids.len());
+    let mut pages = Vec::new();
+    if heap.vm_fork && (!tids.is_empty() || later > 0) {
+        pages.push(VM_PAGE);
+    }
+    let mut last = None;
+    let mut fetched = 0;
+    for tid in tids {
+        let block = tid / 65536;
+        if heap.block_all_visible(block) {
+            continue;
+        }
+        fetched += 1;
+        if last != Some(block) {
+            pages.push(block);
+            last = Some(block);
+        }
+    }
+    pages.extend((0..later).map(unplaced_block));
+    (pages, fetched + later)
+}
+
+/// The index tuples of catalog index `t` whose leading key columns are
+/// `key`, in index order.
+fn key_tids(t: &Tree, key: &[K]) -> (Vec<u32>, Vec<i64>) {
+    if t.btree.root.is_none() {
+        return (Vec::new(), Vec::new());
+    }
+    let prefix: Vec<Bson> = key
+        .iter()
+        .zip(&t.shape.types)
+        .map(|(k, typ)| from_k(k, *typ))
+        .collect();
+    t.btree.prefix_scan(&t.shape, &prefix)
+}
+
 /// `Heap Fetches` of an index-only scan of catalog index `index` for the
 /// rows whose leading key columns are `key`, returning `rows` rows
 /// (`IndexOnlyNext`): a tuple whose heap block the visibility map does not
 /// mark all-visible is fetched from the heap, and counted, before its
 /// visibility is checked. The tuples are `initdb`'s, on the blocks and
 /// visibility map it left (`catalog_heap.rs`); a row returned beyond them
-/// was written later, onto a page whose bit the write cleared
-/// (`heap_insert`'s `visibilitymap_clear`), so it is fetched too. `None`
-/// for an index this server does not model.
+/// was written later, onto a page whose bit the write cleared, so it is
+/// fetched too ([`index_only_reads`]). `None` for an index this server
+/// does not model.
 pub(crate) fn index_only_heap_fetches(index: i64, key: &[K], rows: usize) -> Option<usize> {
     let t = tree(index)?;
     let table = builtin().indexes.get(&index)?.table;
     let heap = initdb_heaps().get(&table)?;
-    let tids = if t.btree.root.is_none() {
-        Vec::new()
-    } else {
-        let prefix: Vec<Bson> = key
-            .iter()
-            .zip(&t.shape.types)
-            .map(|(k, typ)| from_k(k, *typ))
-            .collect();
-        t.btree.prefix_scan(&t.shape, &prefix).1
-    };
-    let invisible = tids
-        .iter()
-        .filter(|tid| !heap.block_all_visible(*tid / 65536))
-        .count();
-    Some(invisible + rows.saturating_sub(tids.len()))
+    Some(index_only_reads(heap, &key_tids(t, key).1, rows).1)
 }
 
 impl PgHandler {
@@ -396,6 +440,9 @@ impl PgHandler {
     /// `_bt_getrootheight` (no key) reads the metapage alone, and caches
     /// it as they do. A sequential scan reads every block of the heap.
     ///
+    /// An index-only scan reads the visibility map and fetches only what it
+    /// does not mark all-visible ([`index_only_reads`]).
+    ///
     /// The heap is `initdb`'s (`catalog_heap.rs`): a row added after it is
     /// not yet placed (RP-291).
     pub(crate) fn catalog_index_pages(&self, be: &mut Backend, scans: Vec<PageScan>) {
@@ -406,14 +453,15 @@ impl PgHandler {
         let capacity = self.buffer_pages();
         let heaps = initdb_heaps();
         for scan in scans {
-            let (index, key) = match scan {
+            let (index, key, only) = match scan {
                 PageScan::Seq(table) => {
                     if let Some(h) = heaps.get(&table) {
                         stats.pages(table, 0..i64::from(h.blocks), capacity);
                     }
                     continue;
                 }
-                PageScan::Index(index, key) => (index, key),
+                PageScan::Index(index, key) => (index, key, None),
+                PageScan::IndexOnly(index, key, rows) => (index, Some(key), Some(rows)),
             };
             let Some(t) = tree(index) else {
                 continue;
@@ -430,20 +478,23 @@ impl PgHandler {
                 if be.read_metapage(index) {
                     blocks.push(0);
                 }
-                if let Some(key) = key {
-                    let prefix: Vec<Bson> = key
-                        .iter()
-                        .zip(&t.shape.types)
-                        .map(|(k, typ)| from_k(k, *typ))
-                        .collect();
-                    let (pages, tids) = t.btree.prefix_scan(&t.shape, &prefix);
+                if let Some(key) = &key {
+                    let (pages, tids) = key_tids(t, key);
                     blocks.extend(pages.into_iter().map(i64::from));
-                    for tid in tids {
-                        let block = tid / 65536;
-                        if heap.last() != Some(&block) {
-                            heap.push(block);
+                    if only.is_none() {
+                        for tid in tids {
+                            let block = tid / 65536;
+                            if heap.last() != Some(&block) {
+                                heap.push(block);
+                            }
                         }
                     }
+                }
+            }
+            if let (Some(rows), Some(key)) = (only, &key) {
+                let table = builtin().indexes.get(&index).map(|i| i.table);
+                if let Some(h) = table.and_then(|t| heaps.get(&t)) {
+                    heap = index_only_reads(h, &key_tids(t, key).1, rows).0;
                 }
             }
             stats.pages(index, blocks, capacity);
@@ -508,6 +559,35 @@ mod tests {
         }
         assert!(heaps[&1249].block_all_visible(0));
         assert!(!heaps[&1249].block_all_visible(i64::from(heaps[&1249].blocks)));
+    }
+
+    #[test]
+    fn an_index_only_scan_reads_the_visibility_map_once_then_what_it_does_not_cover() {
+        let heaps = initdb_heaps();
+        let reads = |index: i64, key: &[K], rows: usize| {
+            let t = tree(index).expect("a catalog index");
+            let table = builtin().indexes[&index].table;
+            index_only_reads(&heaps[&table], &key_tids(t, key).1, rows)
+        };
+        // pg_class_relname_nsp_index for `pg_type`: initdb left its block
+        // all-visible, so only the map's page is read.
+        let pg_type = [K::N("pg_type".into())];
+        assert_eq!(reads(2663, &pg_type, 1), (vec![VM_PAGE], 0));
+        // A name initdb never wrote: one row written later is fetched.
+        let later = [K::N("rpc_t".into())];
+        assert_eq!(
+            reads(2663, &later, 1),
+            (vec![VM_PAGE, unplaced_block(0)], 1)
+        );
+        // Nothing returned reads nothing, not even the map.
+        assert_eq!(reads(2663, &later, 0), (vec![], 0));
+        // pg_database has a map with no bit set: its block is fetched.
+        let template1 = [K::N("template1".into())];
+        assert_eq!(reads(2671, &template1, 1), (vec![VM_PAGE, 0], 1));
+        // pg_attrdef has no block and no map fork: a later row is fetched
+        // with no map page read (`vm_readbuf` finds no fork).
+        assert_eq!(heaps[&2604].blocks, 0);
+        assert_eq!(reads(2656, &[K::O(16384)], 1), (vec![unplaced_block(0)], 1));
     }
 
     #[test]

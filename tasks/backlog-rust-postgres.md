@@ -1570,13 +1570,40 @@ a regression test.
       subcommand, a new TOAST table and the role caches a non-superuser's
       permission checks read stop its walk, and a view that depends on a
       dropped column is not seen: its pg_depend rows count as none), the rule
-      queries of system views (`pg_stat_*`), psql's `\d` pattern query
-      (regex prefix as an index condition, `pg_table_is_visible` per row,
-      `get_actual_variable_range`), subqueries, CTEs, windows, PL/pgSQL
-      bodies, and texts over 64 KiB. Measured: `\d` 91 counters match, 29
-      differ; a `pg_stat_*` view 53 match, 61 differ.
+      queries of system views (`pg_stat_*`), the join in psql's `\d`
+      pattern query (`mergejoinscansel`'s operators and its
+      `get_actual_variable_range` probes of a histogram's ends; the nested
+      loop's whole-row scans, whose columns' types the executor looks up,
+      and its inner-unique scan stopping at the first match -- both follow
+      from PostgreSQL's choice of join method, which the walk does not
+      cost), a pattern whose fixed prefix is not all of it (`^(rpc.*)$`,
+      `LIKE 'rpc_t'`: the range conditions and their estimates), ILIKE and
+      `~*`, subqueries, CTEs, windows, PL/pgSQL bodies, and texts over 64
+      KiB. A pattern whose fixed prefix is all of it becoming the index's
+      equality, `COLLATE`'s lookups and `pg_table_is_visible` on the rows a
+      scan returns are walked since 2026-11-13 (regression tests
+      `tests/backlog/test_rp_catalog_reads.py::test_gap[a pattern's exact
+      match is an index condition]` and `::test_gap[psql's pattern on one
+      relation]`). Measured 2026-11-13: `\d rpc_t`'s first query 34
+      counters match, 5 differ (10 of its statement's 24 differed before);
+      a `pg_stat_*` view 16 match, 22 differ.
       Backlog-ID: RP-290
       Verify: tests/backlog/test_rp_catalog_reads.py::test_gap[a statistics view], tests/backlog/test_rp_catalog_reads.py::test_gap[psql's describe query]
+- [ ] **An ORDER BY an index scan already returns in order is counted as
+      sorted, and the index's pathkeys are not read.** With query pathkeys
+      (an ORDER BY, a GROUP BY, a join), PostgreSQL 15.19 makes each
+      B-tree's leading key a pathkey (`build_index_pathkeys`: the key's
+      family's equality operator, an AMOPSTRATEGY search, and that
+      operator's merge-join families), going on to the next key when an
+      equality fixes the column; and when the index scan it chooses returns
+      the rows in the ORDER BY's order it puts no Sort over it, so the
+      executor never looks up the sort support function. On `SELECT c.oid
+      FROM pg_class c WHERE c.relname = 'rpc_t' ORDER BY c.relname` this
+      server counts the Sort's `pg_amproc` lookup; ordered by
+      `relnamespace` it also misses `oid_ops`' equality (2026-11-13, found
+      while working RP-290).
+      Verify: tests/backlog/test_rp_catalog_reads.py::test_gap[an ORDER BY an index gives]
+      Backlog-ID: RP-934
 - [ ] **A catalog row added after `initdb` counts no heap block** in
       `pg_statio_sys_tables`. A catalog scan counts its index pages
       (`catalog_btree.rs`, from `pg15_catalog_indexes.txt`) and, since
@@ -1610,9 +1637,17 @@ a regression test.
       Fetches` (RP-360) reads `initdb`'s visibility map: until later rows
       are placed, a row DDL adds counts as fetched but the `initdb` rows
       on the page it cleared do not, and a row DDL deleted or updated
-      still reads as all-visible.
+      still reads as all-visible. Since 2026-11-13 a catalog read directly
+      through an index holding every column it reads is an index-only
+      scan here too (`IndexOnlyNext`: the visibility map's page once, the
+      heap only off an all-visible block; regression test
+      `test_an_index_only_catalog_scan_reads_the_visibility_map`), with the
+      same two gaps: each row DDL added is fetched as a block of its own,
+      and an `initdb` row on a page DDL wrote to is not fetched (`select
+      relname from pg_class where relname = 'pg_type'` after this module's
+      DDL: PostgreSQL 15.19 reads 7 `pg_class` blocks, this server 6).
       Backlog-ID: RP-291
-      Verify: tests/backlog/test_rp_catalog_reads.py::test_catalog_blocks
+      Verify: tests/backlog/test_rp_catalog_reads.py::test_catalog_blocks, tests/backlog/test_rp_catalog_reads.py::test_a_page_ddl_wrote_to_is_not_all_visible
 - [ ] **The first backend after a start is counted as a warm one.**
       PostgreSQL serves it without the relcache init files (about 245
       `pg_attribute` index scans, `pg_class` heap scans, ...); the model
@@ -1623,6 +1658,20 @@ a regression test.
       worktree's `.scratch/`, never the shared reference servers.
       Backlog-ID: RP-292
       Verify: tests/backlog/test_rp_catalog_reads.py::test_the_first_backend_after_a_start
+- [ ] **A catalog read directly is scanned by its leading equalities
+      alone.** The executor's catalog scan (`catalog_reads.rs`) takes the
+      first index whose leading column an equality matches, keyed by the
+      equalities on its leading columns. PostgreSQL 15.19 builds its index
+      paths from every clause (`match_clause_to_indexcol`): `select attnum
+      from pg_attribute where attrelid = 1259 and attnum = 1` scans
+      `pg_attribute_relid_attnum_index` for both keys (`[5, 5, 4]` over the
+      statement), where this server scans `pg_attribute_relid_attnam_index`
+      for `attrelid` alone (39 entries); and `select relname from pg_class
+      where relname >= 'pg_s' and relname < 'pg_t'` returns 74 entries of
+      `pg_class_relname_nsp_index`, where this server walks all 415. Their
+      heap and index blocks follow (found while working RP-291).
+      Verify: tests/backlog/test_rp_catalog_reads.py::test_a_catalog_scans_index_path[two equalities], tests/backlog/test_rp_catalog_reads.py::test_a_catalog_scans_index_path[a range]
+      Backlog-ID: RP-935
 - [ ] **A database-wide ANALYZE measures only some catalog columns.** Since
       RP-311 each database holds `initdb`'s `pg_statistic` rows for the
       built-in catalogs. A plain `ANALYZE` (or `VACUUM ANALYZE`)
