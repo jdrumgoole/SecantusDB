@@ -744,10 +744,11 @@ _RP287_MULTI = {
 }
 
 
-@pytest.mark.backlog("RP-287")
+@pytest.mark.backlog_fixed("RP-287")
 def test_an_expression_gin_index_has_its_pages(pg: Any) -> None:
-    """An expression GIN index is not modelled page by page: PostgreSQL
-    15.19 sizes this one at 20 pages; here `pg_relation_size` reads 0."""
+    """An expression GIN index was not modelled page by page:
+    `pg_relation_size` read 0 where PostgreSQL 15.19 sizes this one at 20
+    pages."""
     got = _in_block(
         pg,
         [
@@ -758,6 +759,122 @@ def test_an_expression_gin_index_has_its_pages(pg: Any) -> None:
         "select pg_relation_size('rp287_eg') / 8192",
     )
     assert got == ("ok", [(20,)])
+
+
+# Expression GIN indexes (`FormIndexDatum` evaluating each key), each with
+# PostgreSQL 15.19's size: filled after the build through the pending list
+# or straight into the entry tree, a text[] and a tsvector expression, the
+# two jsonb opclasses, an expression beside a plain column, NULL results,
+# and a partial one.
+_RP287_EXPR = {
+    "after-build": (
+        [
+            "create table rp287_ex (a int[])",
+            "create index rp287_exg on rp287_ex using gin ((a || array[0]))",
+            "insert into rp287_ex select array[g % 100, g % 7] from generate_series(1, 20000) g",
+        ],
+        142,
+    ),
+    "fastupdate-off": (
+        [
+            "create table rp287_ex (a int[])",
+            "create index rp287_exg on rp287_ex using gin ((a || array[0])) with (fastupdate=off)",
+            "insert into rp287_ex select array[g % 100, g % 7] from generate_series(1, 20000) g",
+        ],
+        21,
+    ),
+    "text-array": (
+        [
+            "create table rp287_ex (s text)",
+            "insert into rp287_ex select 'w' || (g % 300) || ' x' || (g % 11)"
+            " from generate_series(1, 5000) g",
+            "create index rp287_exg on rp287_ex using gin (string_to_array(s, ' '))",
+        ],
+        7,
+    ),
+    "tsvector": (
+        [
+            "create table rp287_ex (s text)",
+            "insert into rp287_ex select 'word' || (g % 300) || ' other' || (g % 11)"
+            " from generate_series(1, 5000) g",
+            "create index rp287_exg on rp287_ex using gin (to_tsvector('simple', s))",
+        ],
+        7,
+    ),
+    "jsonb-ops": (
+        [
+            "create table rp287_ex (j jsonb)",
+            "insert into rp287_ex select jsonb_build_object('k', g % 100)"
+            " from generate_series(1, 3000) g",
+            "create index rp287_exg on rp287_ex using gin ((j || '{\"z\": 1}'))",
+        ],
+        7,
+    ),
+    "jsonb-path-ops": (
+        [
+            "create table rp287_ex (j jsonb)",
+            "insert into rp287_ex select jsonb_build_object('k', g % 100)"
+            " from generate_series(1, 3000) g",
+            "create index rp287_exg on rp287_ex using gin ((j -> 'k') jsonb_path_ops)",
+        ],
+        4,
+    ),
+    "beside-a-column": (
+        [
+            "create table rp287_ex (a int[], b int[])",
+            "insert into rp287_ex select array[g % 100], array[g % 13, g % 5]"
+            " from generate_series(1, 20000) g",
+            "create index rp287_exg on rp287_ex using gin (a, (b || a))",
+        ],
+        27,
+    ),
+    "null-results": (
+        [
+            "create table rp287_ex (a int[])",
+            "insert into rp287_ex select case when g % 3 = 0 then null else array[g % 50] end"
+            " from generate_series(1, 20000) g",
+            "create index rp287_exg on rp287_ex using gin ((a || array[1]))",
+        ],
+        10,
+    ),
+    "partial": (
+        [
+            "create table rp287_ex (a int[])",
+            "insert into rp287_ex select array[g % 100, g % 7] from generate_series(1, 20000) g",
+            "create index rp287_exg on rp287_ex using gin ((a || array[0])) where a[1] < 30",
+        ],
+        6,
+    ),
+}
+
+
+@pytest.mark.backlog_fixed("RP-287")
+@pytest.mark.parametrize("case", list(_RP287_EXPR), ids=list(_RP287_EXPR))
+def test_expression_gin_index_shapes_have_their_pages(pg: Any, case: str) -> None:
+    """Expression GIN indexes over arrays, text, tsvector and jsonb, beside
+    a column, partial, or filled after the build, size as PostgreSQL
+    15.19's do."""
+    statements, pages = _RP287_EXPR[case]
+    got = _in_block(pg, statements, "select pg_relation_size('rp287_exg') / 8192")
+    assert got == ("ok", [(pages,)])
+
+
+@pytest.mark.backlog("RP-287")
+def test_a_btree_gin_index_has_its_pages(pg: Any) -> None:
+    """A btree_gin index (a scalar column under `int4_ops`) is not modelled
+    page by page: PostgreSQL 15.19 sizes this one at 9 pages; here
+    `pg_relation_size` reads 0."""
+    got = _in_block(
+        pg,
+        [
+            "create extension if not exists btree_gin",
+            "create table rp287_bg (a int)",
+            "insert into rp287_bg select g % 100 from generate_series(1, 20000) g",
+            "create index rp287_bgi on rp287_bg using gin (a)",
+        ],
+        "select pg_relation_size('rp287_bgi') / 8192",
+    )
+    assert got == ("ok", [(9,)])
 
 
 @pytest.mark.backlog_fixed("RP-287")

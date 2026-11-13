@@ -95,6 +95,10 @@ pub(crate) struct GinShape {
     /// has entries (`index_build`'s and `ExecInsertIndexTuples`'
     /// `ExecQual` on the predicate).
     pub(crate) predicate: Option<secantus_pgplan::ColumnExpr>,
+    /// An expression index's keys, one planned expression per column
+    /// (`FormIndexDatum` evaluates them; a plain column key is its name).
+    /// Its pages are modelled, its scans are not.
+    pub(crate) exprs: Option<Vec<secantus_pgplan::ColumnExpr>>,
 }
 
 /// A GiST index this models: one `point` or `box` column under its
@@ -248,17 +252,25 @@ impl GinOps {
     /// `ginExtractEntries` for each column of `row` in turn, each key
     /// marked with its column when there are several.
     fn row_keys(&self, s: &GinShape, row: &Document) -> Vec<GinKey> {
+        // An expression the write path fails on is raised there; the
+        // model only mirrors the write.
+        let evaluated: Option<Vec<Option<Bson>>> = s.exprs.as_ref().map(|exprs| {
+            exprs
+                .iter()
+                .map(|e| secantus_pgplan::apply_row_expr(e, row).ok())
+                .collect()
+        });
+        let value = |i: usize| match &evaluated {
+            Some(values) => values[i].as_ref(),
+            None => row.get(&s.cols[i].0),
+        };
         if self.cols.len() == 1 {
-            return gin_keys(&self.cols[0], row.get(&s.field));
+            return gin_keys(&self.cols[0], value(0));
         }
         let mut out = Vec::new();
-        for (i, (ops, (field, _))) in self.cols.iter().zip(&s.cols).enumerate() {
+        for (i, ops) in self.cols.iter().enumerate() {
             let att = u16::try_from(i + 1).unwrap_or(u16::MAX);
-            out.extend(
-                gin_keys(ops, row.get(field))
-                    .into_iter()
-                    .map(|k| k.of_att(att)),
-            );
+            out.extend(gin_keys(ops, value(i)).into_iter().map(|k| k.of_att(att)));
         }
         out
     }
@@ -809,7 +821,7 @@ impl crate::PgHandler {
             self.index_relations()
         };
         for ix in relations {
-            if ix.primary || ix.exclusion || ix.keys.is_empty() || ix.keys.iter().any(|k| *k <= 0) {
+            if ix.primary || ix.exclusion || ix.keys.is_empty() || ix.keys.iter().any(|k| *k < 0) {
                 continue;
             }
             let def = &ix.table;
@@ -878,24 +890,75 @@ impl crate::PgHandler {
             if path_ops.len() != ix.keys.len() {
                 continue;
             }
-            if opt("sqlExpressions").is_some() {
-                continue;
-            }
-            let fields: Vec<String> = d
-                .get_document("key")
-                .map(|k| k.keys().cloned().collect())
-                .unwrap_or_default();
-            if fields.len() != ix.keys.len() {
-                continue;
-            }
-            let Some(cols) = fields
-                .iter()
-                .map(|f| def.columns.iter().find(|c| c.field() == *f))
-                .collect::<Option<Vec<_>>>()
-            else {
-                continue;
+            // An expression GIN index is modelled, each key evaluated from
+            // its planned expression and typed as the expression is; an
+            // expression GiST one is not.
+            let exprs: Option<Vec<secantus_pgplan::ColumnExpr>> = match opt("sqlExpressions") {
+                None if ix.keys.contains(&0) => continue,
+                None => None,
+                Some(_) if method == "gist" => continue,
+                Some(Bson::Array(a)) => {
+                    let planned = a
+                        .iter()
+                        .map(|e| {
+                            e.as_str().and_then(|sql| {
+                                secantus_pgplan::plan_check_expression(sql, def).ok()
+                            })
+                        })
+                        .collect::<Option<Vec<_>>>();
+                    match planned {
+                        Some(p) if p.len() == ix.keys.len() => Some(p),
+                        _ => continue,
+                    }
+                }
+                Some(_) => continue,
             };
-            let col = cols[0];
+            // Each key's field (none for an expression), type, and whether
+            // it carries a collation of its own.
+            let keys: Vec<(String, String, bool)> = match &exprs {
+                Some(exprs) => {
+                    // An expression's collation comes from its inputs.
+                    let collated = def
+                        .columns
+                        .iter()
+                        .any(|c| c.extra.contains_key("collation"));
+                    exprs
+                        .iter()
+                        .map(|e| {
+                            (
+                                String::new(),
+                                secantus_pgplan::column_expr_type(e).to_string(),
+                                collated,
+                            )
+                        })
+                        .collect()
+                }
+                None => {
+                    let fields: Vec<String> = d
+                        .get_document("key")
+                        .map(|k| k.keys().cloned().collect())
+                        .unwrap_or_default();
+                    if fields.len() != ix.keys.len() {
+                        continue;
+                    }
+                    let Some(cols) = fields
+                        .iter()
+                        .map(|f| def.columns.iter().find(|c| c.field() == *f))
+                        .collect::<Option<Vec<_>>>()
+                    else {
+                        continue;
+                    };
+                    cols.iter()
+                        .map(|c| {
+                            (
+                                c.field(),
+                                c.pg_type.clone(),
+                                c.extra.contains_key("collation"),
+                            )
+                        })
+                        .collect()
+                }
+            };
             let reloptions: Vec<String> = match opt("sqlReloptions") {
                 Some(Bson::Array(a)) => a
                     .iter()
@@ -911,27 +974,31 @@ impl crate::PgHandler {
                 })
             };
             let shape = if method == "gin" {
-                let mut gin_cols = Vec::with_capacity(cols.len());
-                for (col, path_ops) in cols.iter().zip(&path_ops) {
+                let mut gin_cols = Vec::with_capacity(keys.len());
+                for ((field, pg_type, collated), path_ops) in keys.iter().zip(&path_ops) {
                     let elem = if *path_ops {
-                        if col.pg_type != "jsonb" {
+                        if pg_type != "jsonb" {
                             break;
                         }
                         "jsonb_path"
-                    } else if matches!(col.pg_type.as_str(), "jsonb" | "tsvector") {
-                        col.pg_type.as_str()
+                    } else if matches!(pg_type.as_str(), "jsonb" | "tsvector") {
+                        pg_type.as_str()
                     } else {
-                        let Some(elem) = col.pg_type.strip_suffix("[]") else {
+                        let Some(elem) = pg_type.strip_suffix("[]") else {
                             break;
                         };
                         elem
                     };
-                    if !ElemOps::supported(elem) || col.extra.contains_key("collation") {
+                    let textual = ElemOps {
+                        elem: elem.to_string(),
+                    }
+                    .textual();
+                    if !ElemOps::supported(elem) || (*collated && textual) {
                         break;
                     }
-                    gin_cols.push((col.field(), elem.to_string()));
+                    gin_cols.push((field.clone(), elem.to_string()));
                 }
-                if gin_cols.len() != cols.len() {
+                if gin_cols.len() != keys.len() {
                     continue;
                 }
                 AmShape::Gin(Box::new(GinShape {
@@ -947,9 +1014,10 @@ impl crate::PgHandler {
                     pending_limit_kb: reloption("gin_pending_list_limit")
                         .and_then(|v| v.parse().ok()),
                     predicate,
+                    exprs,
                 }))
             } else {
-                let opclass = match col.pg_type.as_str() {
+                let opclass = match keys[0].1.as_str() {
                     "point" => Opclass::Point,
                     "box" => Opclass::Box,
                     _ => continue,
@@ -957,7 +1025,7 @@ impl crate::PgHandler {
                 AmShape::Gist(GistShape {
                     oid: ix.oid,
                     name: ix.name.clone(),
-                    field: col.field(),
+                    field: keys[0].0.clone(),
                     opclass,
                     fillfactor: reloption("fillfactor")
                         .and_then(|v| v.parse().ok())
@@ -1236,7 +1304,9 @@ impl crate::PgHandler {
                 // its predicate (`predicate_implied_by`), which is not
                 // modelled; nor is a multi-column index's scan: such a
                 // scan keeps the relation lock.
-                AmShape::Gin(s) if s.predicate.is_some() || s.cols.len() > 1 => {
+                AmShape::Gin(s)
+                    if s.predicate.is_some() || s.exprs.is_some() || s.cols.len() > 1 =>
+                {
                     (&s.field, Vec::new())
                 }
                 AmShape::Gin(s) => (
