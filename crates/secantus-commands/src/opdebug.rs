@@ -601,7 +601,14 @@ pub(crate) fn collection_type(ctx: &CommandContext, db: &str, coll: &str) -> &'s
 /// it -- `admin`, `local`, `config` (`admin.$cmd`, a missing `admin.c`, a
 /// failed `find` of one, an `insert` into one). A view or time-series
 /// collection on one is still named as such by a read of it that succeeds.
+/// A `system.buckets.` collection is `timeseriesBuckets`, whether or not a
+/// time-series collection is behind it (a `collStats` of a missing
+/// `system.buckets.nope`, an `insert` into `system.buckets.ts`; measured
+/// 8.2.11, RM-484).
 pub(crate) fn namespace_kind(db: &str, coll: &str) -> Option<&'static str> {
+    if coll.starts_with(crate::ts_buckets::BUCKETS_PREFIX) {
+        return Some("timeseriesBuckets");
+    }
     if coll.starts_with("system.") {
         return Some("system");
     }
@@ -628,10 +635,11 @@ pub(crate) fn refused_before_acquiring(name: &str, reply: &Document) -> bool {
 }
 
 /// The kind a line names `db.coll` by: `system` for a `system.`
-/// collection; then, when the operation `looked_up` what is behind the
-/// name, its [`collection_type`] if that is a `view` or `timeseries` (an
-/// `admin.v` view read is `view`); then [`namespace_kind`]; else `normal`.
-/// Measured 8.2.11, RM-478.
+/// collection (`timeseriesBuckets` for a `system.buckets.` one, RM-484);
+/// then, when the operation `looked_up` what is behind the name, its
+/// [`collection_type`] if that is a `view` or `timeseries` (an `admin.v`
+/// view read is `view`); then [`namespace_kind`]; else `normal`. Measured
+/// 8.2.11, RM-478.
 pub(crate) fn line_collection_type(
     ctx: &CommandContext,
     db: &str,
@@ -639,8 +647,8 @@ pub(crate) fn line_collection_type(
     looked_up: bool,
 ) -> &'static str {
     let by_name = namespace_kind(db, coll);
-    if by_name == Some("system") {
-        return "system";
+    if let Some(kind @ ("system" | "timeseriesBuckets")) = by_name {
+        return kind;
     }
     if looked_up {
         let kind = collection_type(ctx, db, coll);
@@ -649,6 +657,25 @@ pub(crate) fn line_collection_type(
         }
     }
     by_name.unwrap_or("normal")
+}
+
+/// The buckets collection a command on the time-series collection
+/// `db.coll` runs on, as mongod's `collMod`, `collStats`, `createIndexes`
+/// and `dropIndexes` translate a time-series namespace to its buckets
+/// before they run: their line and profile entry (and an index build's
+/// line) name `<db>.system.buckets.<coll>`, whether the command then
+/// succeeds or fails (an index `collMod` cannot find, a
+/// negative `expireAfterSeconds`, a `dropIndexes` of a missing index). Any
+/// other command names the time-series collection itself -- a read, a
+/// write, `listIndexes`, `drop`, a `$collStats` stage (measured 8.2.11,
+/// RM-484).
+pub(crate) fn buckets_of(ctx: &CommandContext, name: &str, db: &str, coll: &str) -> Option<String> {
+    let translates = matches!(
+        name,
+        "collMod" | "collStats" | "collstats" | "createIndexes" | "dropIndexes" | "deleteIndexes"
+    );
+    (translates && collection_type(ctx, db, coll) == "timeseries")
+        .then(|| format!("{}{coll}", crate::ts_buckets::BUCKETS_PREFIX))
 }
 
 /// [`collection_type`], asked of `storage`.
@@ -754,6 +781,11 @@ mod tests {
         assert_eq!(namespace_kind("d", "x.system.y"), None);
         assert_eq!(namespace_kind("d", "$cmd"), None);
         assert_eq!(namespace_kind("Admin", "c"), None);
+        assert_eq!(
+            namespace_kind("d", "system.buckets.ts"),
+            Some("timeseriesBuckets")
+        );
+        assert_eq!(namespace_kind("d", "system.bucketsx"), Some("system"));
     }
 
     #[test]

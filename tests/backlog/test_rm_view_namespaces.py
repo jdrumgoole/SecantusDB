@@ -85,11 +85,11 @@ def test_a_read_refused_before_it_resolves_names_the_view(rust_mongo: Any, mongo
     assert got["rust"] == got["mongod"]
 
 
-@pytest.mark.backlog("RM-484")
+@pytest.mark.backlog_fixed("RM-484")
 def test_a_time_series_ddl_line_names_its_buckets(rust_mongo: Any, mongod_rs: Any) -> None:
     """mongod 8.2.11's line for a `collMod` or a `collStats` of a time-series
     collection names its buckets, `<db>.system.buckets.ts`,
-    `timeseriesBuckets`; this server's names `<db>.ts`."""
+    `timeseriesBuckets`; this server's named `<db>.ts`, `normal`."""
 
     def op(db: Any) -> None:
         db.command("collMod", "ts", expireAfterSeconds=100)

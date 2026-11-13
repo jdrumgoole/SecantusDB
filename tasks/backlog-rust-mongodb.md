@@ -961,13 +961,6 @@ These are explicit non-goals. Don't add them without a reason.
       Found while working RM-478, 2026-11-13.
       Verify: tests/backlog/test_rm_statement_line_comment.py::test_a_statement_line_carries_its_commands_comment
       Backlog-ID: RM-581
-- [ ] **A time-series collection's `collMod` and `collStats` lines name the
-      collection, not its buckets.** mongod 8.2.11's name
-      `<db>.system.buckets.ts`, `collectionType: "timeseriesBuckets"`; this
-      server's name `<db>.ts`, `normal`. Found while working RM-380,
-      2026-11-10.
-      Verify: tests/backlog/test_rm_view_namespaces.py::test_a_time_series_ddl_line_names_its_buckets
-      Backlog-ID: RM-484
 - [ ] **A `dataSize` of a view answers.** mongod 8.2.11 refuses
       `{dataSize: "<db>.v"}` of a view (166, CommandNotSupportedOnView);
       this server answers `ok: 1`, sizing nothing. Found while working
@@ -981,6 +974,46 @@ These are explicit non-goals. Don't add them without a reason.
       working RM-485, 2026-11-13.
       Verify: tests/backlog/test_rm_view_ddl_refusals.py::test_a_drop_indexes_of_system_views_answers
       Backlog-ID: RM-588
+- [ ] **A `createIndexes` that builds nothing names its collection.**
+      mongod 8.2.11's line for a `createIndexes` of an index that is there
+      already (`{x: 1}` on a collection, a time-series collection's own
+      `{m: 1, t: 1}`) names `<db>.$cmd`; this server's names the collection
+      (the time-series one's buckets since RM-484). Found while working
+      RM-484, 2026-11-13.
+      Verify: tests/backlog/test_rm_ts_ddl_lines.py::test_a_create_indexes_that_builds_nothing_names_cmd
+      Backlog-ID: RM-582
+- [ ] **An index build of a time-series collection writes no build line.**
+      mongod 8.2.11 writes two lines for a `createIndexes` that builds an
+      index of a time-series collection, the command's and its build
+      thread's, each naming `<db>.system.buckets.ts`; this server writes
+      the command's alone. Its time-series documents live in its column
+      store (`ts_store.rs`), so `create_indexes` finds the collection's
+      document table empty and takes the build for one of an empty
+      collection, which logs no line of its own. Found while working
+      RM-484, 2026-11-13.
+      Verify: tests/backlog/test_rm_ts_ddl_lines.py::test_a_time_series_index_build_has_its_line
+      Backlog-ID: RM-583
+- [ ] **A `collMod` of a missing collection names it, and is profiled.**
+      mongod 8.2.11's line for one (26, `NamespaceNotFound`) names
+      `<db>.$cmd`, and it writes no profile entry; this server's line names
+      the collection, and it writes an entry with `ok: 0`. Found while
+      working RM-484, 2026-11-13.
+      Verify: tests/backlog/test_rm_ts_ddl_lines.py::test_a_coll_mod_of_a_missing_collection_names_cmd
+      Backlog-ID: RM-584
+- [ ] **An `insert` into a time-series collection's buckets is not
+      profiled.** mongod 8.2.11 writes a profile entry for an `insert` into
+      `<db>.system.buckets.ts`; this server writes the line and no entry.
+      Found while working RM-484, 2026-11-13.
+      Verify: tests/backlog/test_rm_ts_ddl_lines.py::test_an_insert_into_buckets_is_profiled
+      Backlog-ID: RM-585
+- [ ] **A `find` of a time-series collection's buckets does not say what
+      it examined.** mongod 8.2.11's line for a `find` of
+      `<db>.system.buckets.ts` has `keysExamined`, `docsExamined` and
+      `nBatches`, as one of a collection's does; this server's has its
+      `planSummary` and `nreturned` and none of those. Found while working
+      RM-484, 2026-11-13.
+      Verify: tests/backlog/test_rm_ts_ddl_lines.py::test_a_find_of_buckets_says_what_it_examined
+      Backlog-ID: RM-586
 - [ ] **An `explain` of a write is profiled.** mongod 8.2.11 writes no
       profile entry for an `explain` of an `update` (a `delete` or
       `findAndModify` not measured); this server writes one, named for the

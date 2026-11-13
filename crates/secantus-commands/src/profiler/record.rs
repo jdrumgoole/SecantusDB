@@ -287,6 +287,12 @@ pub(crate) fn finish(
             pending.ns = ns;
         }
     }
+    // A time-series collection's DDL is filed under its buckets (RM-484).
+    if let Some((db, coll)) = pending.ns.split_once('.') {
+        if let Some(buckets) = crate::opdebug::buckets_of(ctx, name, db, coll) {
+            pending.ns = format!("{db}.{buckets}");
+        }
+    }
     let millis = pending.start.elapsed().as_millis() as i64;
     let who = Who::of(ctx);
     let mut logged = false;

@@ -334,6 +334,12 @@ pub fn read_attributes(request: &Document, reply: &Document, ctx: &CommandContex
             out.insert("ns", ns);
         }
     }
+    // Or to the buckets a time-series collection's DDL runs on (RM-484).
+    let buckets = coll.and_then(|coll| crate::opdebug::buckets_of(ctx, name, db, coll));
+    if let Some(buckets) = &buckets {
+        out.insert("ns", format!("{db}.{buckets}"));
+    }
+    let coll = buckets.as_deref().or(coll);
     out.insert("collectionType", line_kind(name, ok, ctx, db, coll));
     // A query that parsed has its shape, whether or not it then ran (RM-358).
     if let Some(shape) = crate::query_shape::hash(&ctx.db_name, request) {

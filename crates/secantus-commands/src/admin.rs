@@ -2651,11 +2651,14 @@ pub fn create_indexes(doc: &Document, ctx: &mut CommandContext) -> HandlerResult
     let build_storage = crate::opdebug::storage_section(storage.operation_counts().as_ref(), None);
     std::mem::drop(build_counts);
     if any_created && scans {
+        // A time-series collection's index is built on its buckets (RM-484).
+        let built_on = crate::opdebug::buckets_of(ctx, "createIndexes", &ctx.db_name, &coll)
+            .unwrap_or_else(|| coll.clone());
         let mut attr = doc! {
             "type": "none",
             "isFromUserConnection": false,
-            "ns": format!("{}.{coll}", ctx.db_name),
-            "collectionType": crate::opdebug::line_collection_type(ctx, &ctx.db_name, &coll, true),
+            "ns": format!("{}.{built_on}", ctx.db_name),
+            "collectionType": crate::opdebug::line_collection_type(ctx, &ctx.db_name, &built_on, true),
             "command": doc.clone(),
             "numYields": 0_i64,
         };
