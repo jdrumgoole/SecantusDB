@@ -380,14 +380,32 @@ pub fn bind(
     storage: Arc<dyn Storage>,
     cursors: Arc<CursorRegistry>,
 ) -> io::Result<RunningServer> {
+    let bind_started = Instant::now();
     let listener = TcpListener::bind(addr)?;
     let address = listener.local_addr()?;
     listener.set_nonblocking(true)?;
+    // How long each step of the start took, for `mongod startup complete`.
+    let opening = storage.opening();
+    let mut times = secantus_commands::diagnostics::StartupTimes {
+        clean: !matches!(&opening, Some(o) if matches!(o.lock_file, Some((_, true, _)))),
+        new_store: opening.as_ref().is_some_and(|o| o.new_store),
+        replica_set: config.replica_set_name.is_some(),
+        set_up_transport_layer: bind_started.elapsed(),
+        create_lock_file: opening
+            .as_ref()
+            .and_then(|o| o.lock_file.as_ref())
+            .map_or(Duration::ZERO, |(_, _, took)| *took),
+        create_storage_engine: opening.as_ref().map_or(Duration::ZERO, |o| o.open),
+        ..Default::default()
+    };
+    let start_of_start = opening.as_ref().map_or(bind_started, |o| o.started);
 
     // mongod writes the feature compatibility version when it starts on a
     // new store, so `admin` is always there.
+    let step = Instant::now();
     secantus_commands::cluster_admin::record_initial_fcv(storage.as_ref())
         .map_err(|e| io::Error::other(format!("recording the FCV: {e:?}")))?;
+    times.initialize_fcv = step.elapsed();
     let server_params = Arc::new(secantus_commands::params::ServerParams::new());
     for (name, value) in &config.startup_parameters {
         server_params.set_startup(name, value.clone());
@@ -407,19 +425,26 @@ pub fn bind(
     }
     // A replica-set primary keeps its sessions' state in `config.transactions`
     // and `config.image_collection`, which mongod creates as it steps up.
+    let step = Instant::now();
     if config.replica_set_name.is_some() {
         secantus_commands::cluster_admin::record_session_state_collections(storage.as_ref())
             .map_err(|e| io::Error::other(format!("creating the session collections: {e:?}")))?;
     }
+    times.start_up_repl_coord = step.elapsed();
     // How long pre-images are kept, as `changeStreamOptions` last set it.
+    let step = Instant::now();
     secantus_commands::cluster_params::apply_change_stream_options(storage.as_ref())
         .map_err(|e| io::Error::other(format!("reading changeStreamOptions: {e:?}")))?;
+    times.standalone_cluster_params = step.elapsed();
     // Users stored before they carried a `userId` get one (RM-031).
+    let step = Instant::now();
     secantus_commands::auth::backfill_user_ids(storage.as_ref())
         .map_err(|e| io::Error::other(format!("minting user ids: {e:?}")))?;
+    times.user_and_roles_graph = step.elapsed();
     // A set member keeps its configuration in `local.system.replset`, as
     // mongod does, so its `replicaSetId` outlives the process.
     if let Some(set_name) = &config.replica_set_name {
+        let step = Instant::now();
         secantus_commands::serverinfo::record_replset_config(
             storage.as_ref(),
             set_name,
@@ -427,11 +452,14 @@ pub fn bind(
             address.port(),
         )
         .map_err(|e| io::Error::other(format!("recording the replica-set configuration: {e:?}")))?;
+        times.start_up_repl_coord += step.elapsed();
     }
 
     // ... and records each start in `local.startup_log`.
+    let step = Instant::now();
     secantus_commands::serverinfo::record_startup(storage.as_ref(), config.require_auth)
         .map_err(|e| io::Error::other(format!("recording the start: {e:?}")))?;
+    times.log_startup_options = step.elapsed();
 
     // Build the rustls config up front so a bad cert / key fails `bind`, not the
     // first connection.
@@ -486,6 +514,12 @@ pub fn bind(
     for entry in secantus_commands::diagnostics::startup_details(config.require_auth) {
         logs.log(entry);
     }
+    // ... then how the store opened.
+    if let Some(opening) = &opening {
+        for entry in secantus_commands::diagnostics::storage_opening_lines(opening) {
+            logs.log(entry);
+        }
+    }
     logs.log(
         LogEntry::new("I", "NETWORK", 23016, "listener", "Waiting for connections").attr(doc! {
             "port": i32::from(address.port()),
@@ -536,8 +570,15 @@ pub fn bind(
         drop(ftdc_guard);
     });
 
+    let step = Instant::now();
     let accept_shared = shared.clone();
     let accept = thread::spawn(move || accept_loop(listener, accept_shared));
+    times.start_up_transport_layer = step.elapsed();
+    // mongod ends its start with a summary of each step's time (RM-305).
+    times.total = start_of_start.elapsed();
+    shared
+        .logs
+        .log(secantus_commands::diagnostics::startup_complete(&times));
 
     Ok(RunningServer {
         shared,

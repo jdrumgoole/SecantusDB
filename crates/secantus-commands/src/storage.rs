@@ -309,6 +309,27 @@ impl OperationCounts {
     }
 }
 
+/// What opening the store did, for the lines mongod writes on
+/// `initandlisten` as it starts: the lock file (`Detected unclean shutdown`),
+/// `Opening WiredTiger` with its configuration, `WiredTiger opened` with how
+/// long that took, and the timings `mongod startup complete` sums up.
+#[derive(Debug, Clone)]
+pub struct StoreOpening {
+    /// When the open began.
+    pub started: std::time::Instant,
+    /// The lock file's path, whether it said the last shutdown was unclean,
+    /// and how long taking it took; `None` when no lock file was taken.
+    pub lock_file: Option<(String, bool, std::time::Duration)>,
+    /// The home held no store before (mongod writes new metadata).
+    pub new_store: bool,
+    /// The configuration `wiredtiger_open` was given.
+    pub wt_config: String,
+    /// How long `wiredtiger_open` took.
+    pub wt_open: std::time::Duration,
+    /// How long the whole open took after the lock file.
+    pub open: std::time::Duration,
+}
+
 /// The storage operations the command handlers depend on. Bytes at the seam:
 /// documents go in/out as `bson::encode` bytes, as they come off the WT cursor.
 pub trait Storage: Send + Sync {
@@ -320,6 +341,13 @@ pub trait Storage: Send + Sync {
     /// WiredTiger-backed adapter forwards to the real flag.
     fn in_memory(&self) -> bool {
         false
+    }
+
+    /// What opening the store did, for the startup lines. Default `None`
+    /// (test fakes open nothing); the WiredTiger-backed adapter forwards
+    /// the record the store kept.
+    fn opening(&self) -> Option<StoreOpening> {
+        None
     }
 
     /// The directory the store lives in (mongod's `dbpath`), whose

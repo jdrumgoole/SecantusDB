@@ -1216,18 +1216,21 @@ These are explicit non-goals. Don't add them without a reason.
       Backlog-ID: RM-499
 
 - [ ] **mongod's startup lines this server does not write.** Since RM-302
-  the log is mongod's structured log, and since 2026-11-10 this server
+  the log is mongod's structured log, and since 2026-11-13 this server
   starts it as mongod 8.2.11 does on `initandlisten`: `MongoDB starting`,
-  `Build Info` (23403), `Operating System` (51765) and `Options set by
-  command line` (21951, which carries RM-425's `parsed` until that is
-  fixed). mongod then writes about seventy more there -- the network
-  lines, `Opening WiredTiger` (22315) and the WiredTiger messages under
-  it, `WiredTiger opened` (4795906), the recovery, catalog, FCV, FTDC and
-  flow-control lines -- and ends with `mongod startup complete`
-  (8423403); this server writes none of them (measured 2026-10-24,
-  2026-11-07 and 2026-11-10). Found with RM-302.
+  `Build Info` (23403), `Operating System` (51765), `Options set by command
+  line` (21951, which carries RM-425's `parsed` until that is fixed), the
+  lock file's `Detected unclean shutdown` (22271), `Opening WiredTiger`
+  (22315), `WiredTiger opened` (4795906) and, last, `mongod startup
+  complete` (8423403). mongod writes about sixty more there that this
+  server does not: WiredTiger's own messages under `Opening WiredTiger`
+  (22430, from its `verbose=[recovery_progress:1,...]` and
+  `json_output=(error,message)` configuration), the network lines, the
+  storage-engine detection and recovery lines, the spill WiredTiger, the
+  durable catalog, FCV, FTDC and flow-control lines (measured 2026-10-24,
+  2026-11-07, 2026-11-10 and 2026-11-13). Found with RM-302.
   Backlog-ID: RM-305
-  Verify: tests/backlog/test_rm_001_028.py::test_startup_writes_the_storage_and_startup_complete_lines
+  Verify: tests/backlog/test_rm_001_028.py::test_startup_writes_wiredtigers_own_messages
 - [ ] **A command its handler fails to parse is counted as a connection's
   first command.** mongod 8.2.11 writes `Received first command on ingress
   connection` (6788700) when a command is about to run: one its IDL parse,
