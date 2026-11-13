@@ -1506,6 +1506,66 @@ fn hint(spec: &Document, out: &mut Document) {
     }
 }
 
+/// An `update` or `delete` statement `spec` of `db.coll` refused with
+/// `error` because the namespace is a view (RM-487). mongod acquires the
+/// namespace for the write, finds a view, refuses the statement and writes
+/// its `Slow query` line (`<db>.v`, `normal`, `ok: 0`, the refusal) before
+/// the command's, one line per statement it tried: the first alone of an
+/// ordered batch, each of an unordered one. Its acquisition is a write
+/// round (`round`), which a transaction's statement does not take here:
+/// its locks are the transaction's. The statement has no plan, so the line
+/// has no plan, hashes or counts, and no profile entry (measured 8.2.11).
+pub(crate) fn refused_statement(
+    db: &str,
+    coll: &str,
+    op: &'static str,
+    spec: &Document,
+    error: &Document,
+    request: &Document,
+    round: bool,
+) {
+    if !crate::slowop::armed() {
+        return;
+    }
+    let start = Instant::now();
+    let cpu = crate::opdebug::thread_cpu_nanos();
+    drop(round.then(|| crate::lock_manager::write_rounds(db, coll, 1)));
+    let worked = start.elapsed();
+    if !crate::slowop::will_log(worked) {
+        return;
+    }
+    let command = if op == "update" {
+        update_statement(spec)
+    } else {
+        delete_statement(spec)
+    };
+    let statement = Statement {
+        ns: format!("{db}.{coll}"),
+        db: db.to_string(),
+        op,
+        command,
+        outcome: StatementOutcome::Failed(error.clone()),
+        millis: worked.as_millis() as i64,
+        ran: Ran {
+            locks: crate::lock_manager::operation_locks(false),
+            flow_control: crate::lock_manager::flow_control_tickets(),
+            took_global: crate::lock_manager::took_global(),
+            read_concern: crate::slowop::replicated()
+                .then(|| crate::opdebug::read_concern(request)),
+            cpu_nanos: cpu
+                .zip(crate::opdebug::thread_cpu_nanos())
+                .map(|(a, b)| b - a),
+            storage: crate::opdebug::storage_section(
+                None,
+                crate::lock_manager::execution_admission().as_deref(),
+            ),
+            remote: crate::slowop::remote(),
+            ..Ran::default()
+        },
+    };
+    crate::slowop::statement_line("WRITE", statement.log_attributes(), worked);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

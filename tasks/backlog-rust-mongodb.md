@@ -1014,13 +1014,23 @@ These are explicit non-goals. Don't add them without a reason.
       RM-484, 2026-11-13.
       Verify: tests/backlog/test_rm_ts_ddl_lines.py::test_a_find_of_buckets_says_what_it_examined
       Backlog-ID: RM-586
-- [ ] **An `update` or `delete` of a view writes no statement line.**
-      mongod 8.2.11 refuses the statement and writes its line (`<db>.v`,
-      `normal`, `ok: 0`, the refusal) before the command's; this server
-      writes the command's line alone. Found while working RM-380,
-      2026-11-10.
-      Verify: tests/backlog/test_rm_view_namespaces.py::test_a_write_to_a_view_has_a_statement_line
-      Backlog-ID: RM-487
+- [ ] **A refused write of a view counts fewer locks than mongod's.**
+      mongod 8.2.11 refuses a write of a view once it holds the namespace
+      for the write; this server refuses it earlier, in `views::refusal`,
+      before `session::run`, and its lines count fewer locks: a retryable
+      `update` / `delete` is refused before its session is checked out, so
+      its statement and command lines are one `ReplicationStateTransition`
+      w short (the transition lock `retryable_write_transition_lock`
+      takes); an `insert`'s line has none of its two write rounds (no
+      `Database` / `Collection`, no `flowControl`); a statement of a
+      transaction has `locks: {}` where mongod's has the transaction's
+      (`MultiDocumentTransactionsBarrier`, the rounds). The faithful fix
+      refuses the write where mongod does, after the session checkout and
+      the write's acquisition; whether a refused retryable write then uses
+      up its `txnNumber`, as on mongod, wants probing first. Found while
+      working RM-487, 2026-11-13.
+      Verify: tests/backlog/test_rm_view_namespaces.py::test_a_refused_write_of_a_view_takes_mongods_locks
+      Backlog-ID: RM-589
 - [ ] **A refused `listIndexes` or `collStats` of a view is not profiled.**
       mongod 8.2.11 writes an entry for each (`<db>.v`, `ok: 0`); this
       server writes none. Found while working RM-380, 2026-11-10.

@@ -168,11 +168,11 @@ def test_an_explain_of_a_write_is_not_profiled(rust_mongo: Any, mongod_rs: Any) 
     assert got["rust"] == got["mongod"]
 
 
-@pytest.mark.backlog("RM-487")
+@pytest.mark.backlog_fixed("RM-487")
 def test_a_write_to_a_view_has_a_statement_line(rust_mongo: Any, mongod_rs: Any) -> None:
     """mongod 8.2.11's `update` and `delete` of a view, each refused, write
     a line for the statement (`<db>.v`, `normal`, `ok: 0`) before the
-    command's; this server writes the command's alone."""
+    command's; this server wrote the command's alone."""
 
     def op(db: Any) -> None:
         _refused(lambda d: d.v.update_one({}, {"$set": {"a": 1}}))(db)
@@ -185,6 +185,55 @@ def test_a_write_to_a_view_has_a_statement_line(rust_mongo: Any, mongod_rs: Any)
         ("q", "v", "normal", 0),
         ("delete", "$cmd", "normal", 1),
     ]
+    assert got["rust"] == got["mongod"]
+
+
+@pytest.mark.backlog_fixed("RM-487")
+def test_an_unordered_write_to_a_view_has_a_line_per_statement(
+    rust_mongo: Any, mongod_rs: Any
+) -> None:
+    """mongod 8.2.11 tries each statement of an unordered `update` or
+    `delete` of a view, and writes a line for each it refuses before the
+    command's, with the statement as its `command` (`multi` and `upsert`
+    filled in) and the attributes of a write statement's line, in its
+    order. This server wrote the command's line alone."""
+
+    def op(db: Any) -> None:
+        updates = [{"q": {}, "u": {"$set": {"a": 1}}}, {"q": {"b": 1}, "u": {"$set": {"a": 2}}}]
+        deletes = [{"q": {}, "limit": 0}, {"q": {"b": 1}, "limit": 1}]
+        _refused(lambda d: d.command("update", "v", updates=updates, ordered=False))(db)
+        _refused(lambda d: d.command("delete", "v", deletes=deletes, ordered=False))(db)
+
+    def statement(a: dict) -> tuple:
+        if a["type"] == "command":
+            return (_first(a), _ns(a))
+        return (
+            a["type"],
+            _ns(a),
+            a["command"],
+            a["errCode"],
+            a["locks"],
+            [k for k in a if k != "cpuNanos"],
+        )
+
+    got = {
+        server: [statement(a) for _, a in lines]
+        for server, (lines, _) in _both(rust_mongo, mongod_rs, op).items()
+    }
+    assert [g[:2] for g in got["mongod"]] == [
+        ("update", "v"),
+        ("update", "v"),
+        ("update", "$cmd"),
+        ("remove", "v"),
+        ("remove", "v"),
+        ("delete", "$cmd"),
+    ]
+    assert got["mongod"][1][2] == {
+        "q": {"b": 1},
+        "u": {"$set": {"a": 2}},
+        "multi": False,
+        "upsert": False,
+    }
     assert got["rust"] == got["mongod"]
 
 
@@ -247,4 +296,34 @@ def test_a_command_metric_counts_rejections(rust_mongo: Any, mongod_rs: Any) -> 
     and `total`; this server's has no `rejected`."""
     got = {s: sorted(_distinct_metric(c)) for s, c in (("rust", rust_mongo), ("mongod", mongod_rs))}
     assert got["mongod"] == ["failed", "rejected", "total"]
+    assert got["rust"] == got["mongod"]
+
+
+@pytest.mark.backlog("RM-589")
+def test_a_refused_write_of_a_view_takes_mongods_locks(rust_mongo: Any, mongod_rs: Any) -> None:
+    """mongod 8.2.11 refuses a write of a view once it holds the namespace
+    for the write: a retryable `update` after checking its session out (one
+    more transition lock), an `insert` after its write rounds, and a
+    statement of a transaction under the transaction's locks. This server
+    refuses each before those, and its lines count fewer locks: the
+    retryable statement and command one transition lock short, the insert
+    no write round, the transaction's statement none at all."""
+
+    def op(db: Any) -> None:
+        _refused(lambda d: d.v.update_one({}, {"$set": {"a": 1}}))(db)
+        _refused(lambda d: d.v.insert_one({"a": 1}))(db)
+
+        def txn(d: Any) -> None:
+            with d.client.start_session() as s, s.start_transaction():
+                d.v.update_one({}, {"$set": {"a": 1}}, session=s)
+
+        _refused(txn)(db)
+
+    got = {
+        server: [(_first(a), _ns(a), a.get("locks"), a.get("flowControl")) for _, a in lines]
+        for server, (lines, _) in _both(rust_mongo, mongod_rs, op).items()
+    }
+    statement = got["mongod"][0]
+    assert statement[:2] == ("q", "v")
+    assert statement[2]["ReplicationStateTransition"] == {"acquireCount": {"w": 2}}
     assert got["rust"] == got["mongod"]
