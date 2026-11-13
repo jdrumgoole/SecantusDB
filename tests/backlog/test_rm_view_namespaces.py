@@ -347,12 +347,63 @@ def test_a_distinct_of_a_view_is_not_counted_failed(rust_mongo: Any, mongod_rs: 
     assert (got["rust"]["total"], got["rust"]["failed"]) == (1, 0)
 
 
-@pytest.mark.backlog("RM-491")
+@pytest.mark.backlog_fixed("RM-491")
 def test_a_command_metric_counts_rejections(rust_mongo: Any, mongod_rs: Any) -> None:
     """mongod 8.2.11's `metrics.commands.<name>` counts `failed`, `rejected`
-    and `total`; this server's has no `rejected`."""
+    and `total`; this server's had no `rejected`."""
     got = {s: sorted(_distinct_metric(c)) for s, c in (("rust", rust_mongo), ("mongod", mongod_rs))}
     assert got["mongod"] == ["failed", "rejected", "total"]
+    assert got["rust"] == got["mongod"]
+
+
+def _rejected_metrics(client: Any) -> dict:
+    db = client[fresh("rejected")]
+    db.c.insert_many([{"x": n} for n in range(3)])
+    shapes = [
+        {"find": "c", "filter": {"x": 1}, "$db": db.name},
+        {"distinct": "c", "key": "x", "query": {}, "$db": db.name},
+        {"aggregate": "c", "pipeline": [{"$match": {"x": 1}}], "$db": db.name},
+    ]
+    for shape in shapes:
+        client.admin.command({"setQuerySettings": shape, "settings": {"reject": True}})
+    names = ("find", "distinct", "aggregate", "explain")
+
+    def metrics() -> dict:
+        return {n: client.admin.command("serverStatus")["metrics"]["commands"][n] for n in names}
+
+    before = metrics()
+    codes = []
+    for op in (
+        lambda: list(db.c.find({"x": 2})),
+        lambda: db.c.distinct("x"),
+        lambda: list(db.c.aggregate([{"$match": {"x": 2}}])),
+        lambda: db.c.find({"x": 2}).explain(),
+        lambda: db.command("find", "c", filter={"$bad": 1}),
+    ):
+        try:
+            op()
+            codes.append(None)
+        except PyMongoError as e:
+            codes.append(getattr(e, "code", None))
+    after = metrics()
+    for shape in shapes:
+        client.admin.command({"removeQuerySettings": shape})
+    client.drop_database(db.name)
+    deltas = {n: {k: after[n][k] - before[n].get(k, 0) for k in after[n]} for n in names}
+    return {"codes": codes, "metrics": deltas}
+
+
+@pytest.mark.backlog_fixed("RM-491")
+def test_a_query_settings_refusal_counts_rejected_not_failed(
+    rust_mongo: Any, mongod_rs: Any
+) -> None:
+    """mongod 8.2.11 counts a read a query setting refuses (411
+    `QueryRejectedBySettings`) in its command's `rejected` and `total`,
+    never in `failed`; its `explain` is not refused and counts nothing
+    rejected, and any other error still counts `failed`."""
+    got = {s: _rejected_metrics(c) for s, c in (("rust", rust_mongo), ("mongod", mongod_rs))}
+    assert got["mongod"]["codes"] == [411, 411, 411, None, 2]
+    assert got["mongod"]["metrics"]["find"] == {"failed": 1, "rejected": 1, "total": 2}
     assert got["rust"] == got["mongod"]
 
 

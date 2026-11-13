@@ -1068,11 +1068,6 @@ These are explicit non-goals. Don't add them without a reason.
       2026-11-10.
       Verify: tests/backlog/test_rm_view_namespaces.py::test_a_distinct_of_a_view_is_not_counted_failed
       Backlog-ID: RM-490
-- [ ] **`metrics.commands.<name>` has no `rejected`.** mongod 8.2.11 counts
-      `failed`, `rejected` and `total` for a command; this server counts
-      `failed` and `total`. Found while working RM-380, 2026-11-10.
-      Verify: tests/backlog/test_rm_view_namespaces.py::test_a_command_metric_counts_rejections
-      Backlog-ID: RM-491
 - [ ] **A `distinct` of a view counts nothing it examined.** mongod 8.2.11
       runs it as an aggregation over the collection beneath the view, and
       its line counts what that plan examined (`keysExamined: 11,
