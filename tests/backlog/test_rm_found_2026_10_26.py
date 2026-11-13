@@ -140,7 +140,7 @@ def test_linux_tied_spill_storage_size(rust_mongo: Any, mongod: Any) -> None:
     """Sorts by a key many documents share store Linux mongod 8.2.12's bytes
     once each run is sorted as libstdc++ sorts it: `{k: 1}` 51231 (this
     server stored 51244) and `find`'s `{k: -1}` 51232 (51242), CI
-    2026-11-10. macOS is RM-526."""
+    2026-11-10. macOS agrees since RM-526 (libc++'s `std::sort`)."""
     from tests.backlog.test_rm_326_sort_counts import _spill_storage
     from tests.backlog.test_rm_found_2026_11_10_rm395 import _tied_sort_storage
 

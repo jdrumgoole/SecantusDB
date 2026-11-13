@@ -10,13 +10,16 @@
 //!
 //! mongod's external sorter sorts what it holds with `std::sort` too
 //! (`NoLimitSorter::sort`), so the order of documents whose sort keys
-//! compare equal is the library's there as well (RM-402).
+//! compare equal is the library's there as well (RM-402). The macOS build
+//! links libc++, whose `std::sort` is [`libcxx::sort`] (RM-526).
 //!
 //! `less(a, b)` is the comparator the C++ code passes: a strict weak order.
 //!
 //! The heap steps move elements with swaps where libstdc++ moves them into
 //! a hole: the hole always holds the value being placed, and every
 //! comparison reads it from there, so the two orders are the same.
+
+pub(crate) mod libcxx;
 
 /// `std::__push_heap`: the value at `hole` rises past each parent less
 /// than it, no higher than `top`.

@@ -27,5 +27,7 @@ def test_tied_order_of_find_leading_sort_and_window(rust_mongo: Any, mongod: Any
     """mongod sorts all three with its sorter's `std::sort`, so the 40
     documents over three values of `k` come back reordered -- macOS mongod
     8.2.11: 39, 3, 27, 9, ...; libstdc++'s order on Linux: 0, 21, 18, 24,
-    ... (g++ 15.2) -- where this server returns them in the order read."""
+    ... (g++ 15.2) -- where this server's `$setWindowFields` returns them in
+    the order read. `find` and a leading `$sort` agree since RM-312 (Linux)
+    and RM-526 (macOS)."""
     assert _tied_order(rust_mongo) == _tied_order(mongod)

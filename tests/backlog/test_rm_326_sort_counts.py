@@ -475,12 +475,13 @@ def _spill_storage(client: Any) -> dict:
     }
 
 
-@pytest.mark.backlog("RM-526")
+@pytest.mark.backlog_fixed("RM-526")
 def test_descending_and_tied_spill_storage_size(rust_mongo: Any, mongod: Any) -> None:
     """macOS mongod 8.2.11 stores 54562 bytes for the 13 spills of a sort on
     `{n: -1}`, 51240 for `{k: 1}` (tied keys) and 131282 for `{n: -1, s:
-    1}`; this server stores 54562, 51244 and 131282: the tied keys' runs
-    hold them in another order (this was RM-503). On Linux the two agree
+    1}`; this server stored 54562, 51244 and 131282, the tied keys' runs
+    holding them in another order (this was RM-503), until it sorted them
+    with libc++'s `std::sort` on macOS. On Linux the two agree
     since RM-402 (libstdc++'s `std::sort`)."""
     only_on("darwin", why="Linux mongod and this server agree since RM-402")
     assert _spill_storage(rust_mongo) == _spill_storage(mongod)

@@ -1725,24 +1725,6 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       2026-11-10 (RM-408).
       Verify: tests/backlog/test_rm_found_rm408.py::test_a_document_a_project_built_is_sized_as_built
       Backlog-ID: RM-519
-- [ ] **On macOS documents whose sort keys tie come in another order
-      than mongod's.** mongod's sorter sorts what it holds with
-      `std::sort`, which is not stable, so documents whose keys compare
-      equal come in the C++ library's order. This server sorts as
-      libstdc++, the Linux build's library, does (RM-402: Linux mongod
-      8.2.12 and this server agree on every case below), and on macOS keeps
-      them in the order they came, where mongod 8.2.11's libc++ reorders
-      them. Over 300 1-KB documents under a 50000-byte budget, a sort by
-      `{k: -1}` (seven values of `k`) stores 51260 bytes for its 13 spills
-      on mongod and 51242 here -- `find` and a pipeline's leading `$sort`
-      alike -- and `{k: 1}` 51240 and 51244 (this was RM-503); the 40
-      documents over three values of `k` a `$sort` after `$project`
-      returns come back 39, 3, 27, 9, ... from mongod and in their order
-      here. A sort whose keys are all different agrees. The fix is
-      libc++'s `std::sort`, step for step, where `stl::LIBCXX`. Checked on
-      macOS only. Found 2026-11-10 while working RM-395 and RM-400.
-      Verify: tests/backlog/test_rm_found_2026_11_10_rm395.py::test_tied_sort_spill_storage_size, tests/backlog/test_rm_326_sort_counts.py::test_descending_and_tied_spill_storage_size, tests/backlog/test_rm_found_2026_11_10_rm395.py::test_macos_tied_sort_order
-      Backlog-ID: RM-526
 - [ ] **`find`, a leading `$sort` and `$setWindowFields` hand back
       documents whose sort keys tie in the order they were read.** mongod
       runs each through the same sorter as any other sort, and its
@@ -1753,9 +1735,9 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       Linux build's, gives 0, 21, 18, 24, .... Since RM-402 the sorter here
       (`sorter::sort_held`) gives the Linux order for a `$sort` after
       another stage, and since RM-312 so do `find` and a leading `$sort`
-      (the read's `SORT`, `explain/order.rs` and `explain/stream.rs`); the
-      window stage's own sort is still stable. On macOS the order also
-      needs RM-526. Found 2026-11-10 working RM-402.
+      (the read's `SORT`, `explain/order.rs` and `explain/stream.rs`), on
+      macOS libc++'s since RM-526; the window stage's own sort is still
+      stable. Found 2026-11-10 working RM-402.
       Verify: tests/backlog/test_rm_found_2026_11_10_rm402.py::test_tied_order_of_find_leading_sort_and_window
       Backlog-ID: RM-527
 - [ ] **A classic `$group` counts its held values' and `_id`'s memory
