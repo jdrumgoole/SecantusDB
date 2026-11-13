@@ -39,6 +39,7 @@ const CHANGE_STREAM_PIPELINE_STAGES: &[&str] = &[
     "$redact",
     "$unset",
     "$changeStreamSplitLargeEvent",
+    secantus_core::aggregate::INHIBIT_OPTIMIZATION,
 ];
 
 /// Stages mongod knows that are outside API version 1.

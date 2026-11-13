@@ -325,3 +325,30 @@ def test_internal_set_window_fields_runs_over_its_input_as_it_comes(
         return {name: mongo_answer(lambda p=p: list(db.c.aggregate(p))) for name, p in runs.items()}
 
     same(answer(rust_mongo), answer(mongod))
+
+
+SORTS_WITH_A_LIMIT = {
+    "a limit": [{"$sort": {"n": -1}}, {"$limit": 200}],
+    "a skip and a limit": [{"$sort": {"n": -1}}, {"$skip": 10}, {"$limit": 200}],
+    "a limit behind a stage": [{"$sort": {"n": -1}}, {"$addFields": {"r": 1}}, {"$limit": 50}],
+    "two limits": [{"$sort": {"n": -1}}, {"$limit": 200}, {"$limit": 20}],
+    "a limit behind a match": [{"$sort": {"n": -1}}, {"$match": {"n": {"$gt": 5}}}, {"$limit": 20}],
+}
+
+
+def test_a_sort_counts_the_documents_its_limit_keeps(rust_mongo: Any, mongod: Any) -> None:
+    """A `$sort` takes the `$limit` behind it (`extractLimitForPushdown`)
+    and keeps that many: `explain` counts those, not every document
+    (RM-516). The `$sort`'s counters alone: mongod lists the `$limit`
+    inside it, which this server does not yet (RM-538)."""
+
+    def answer(client: Any) -> dict:
+        db = _load(client)
+        out = {}
+        for name, tail in SORTS_WITH_A_LIMIT.items():
+            ex = _explained(db, [{"$addFields": {"q": "$s"}}, *tail])
+            sort = next(st for st in ex["stages"] if "$sort" in st)
+            out[name] = {k: v for k, v in sort.items() if k != "$sort"}
+        return out
+
+    same(answer(rust_mongo), answer(mongod))

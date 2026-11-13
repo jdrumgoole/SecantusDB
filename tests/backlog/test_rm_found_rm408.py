@@ -73,13 +73,15 @@ def _sorted_with_limit(client: Any) -> int:
     return stages[1]["totalDataSizeSortedBytesEstimate"]
 
 
-@pytest.mark.backlog("RM-516")
+@pytest.mark.backlog_fixed("RM-516")
 def test_explain_counts_the_documents_a_sort_with_a_limit_kept(
     rust_mongo: Any, mongod: Any
 ) -> None:
     """A pipeline `$sort` that takes the `$limit` behind it keeps only that
     many documents, and mongod 8.2.11's `explain` counts those: 200 of
-    657 bytes each, 131400."""
+    657 bytes each, 131400. This server's `explain` ran the `$sort` without
+    the `$limit` and counted all 300 (197100), until RM-516 gave that run
+    the limit the whole pipeline pushes down."""
     assert _sorted_with_limit(rust_mongo) == _sorted_with_limit(mongod)
 
 
@@ -89,11 +91,13 @@ def _listed(client: Any) -> list:
     return [next(k for k in s if k.startswith("$")) for s in stages]
 
 
-@pytest.mark.backlog("RM-517")
+@pytest.mark.backlog_fixed("RM-517")
 def test_a_sort_a_window_supersedes_is_not_listed(rust_mongo: Any, mongod: Any) -> None:
     """mongod 8.2.11 drops a `$sort` that the `$sort` a `$setWindowFields`
     is parsed into follows, and moves that one ahead of the `$unwind`:
-    `explain` lists `$unwind` and `$_internalSetWindowFields` alone."""
+    `explain` lists `$unwind` and `$_internalSetWindowFields` alone. This
+    server listed and counted both `$sort`s, until RM-524 dropped the
+    overridden one as mongod's optimizer does."""
     assert _listed(rust_mongo) == _listed(mongod)
 
 
@@ -103,11 +107,12 @@ def _inhibited(client: Any) -> Any:
     return mongo_answer(lambda: [d["_id"] for d in db.c.aggregate(pipeline)])
 
 
-@pytest.mark.backlog("RM-518")
+@pytest.mark.backlog_fixed("RM-518")
 def test_internal_inhibit_optimization_runs(rust_mongo: Any, mongod: Any) -> None:
     """mongod 8.2.11 runs `$_internalInhibitOptimization`, a stage that
     passes its documents on and keeps the stages after it out of the scan:
-    the answer is that of the pipeline without it."""
+    the answer is that of the pipeline without it. This server refused it
+    as an unknown stage (40324) until RM-518 ran it."""
     assert _inhibited(rust_mongo) == _inhibited(mongod)
 
 

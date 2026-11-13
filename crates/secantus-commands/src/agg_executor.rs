@@ -307,6 +307,7 @@ pub(crate) fn cursor_loads(
                 | "$lookup" | "$graphLookup" | "$unionWith",
                 r,
             ) => r,
+            (secantus_core::aggregate::INHIBIT_OPTIMIZATION, r) => r,
             ("$setWindowFields" | "$_internalSetWindowFields", Reads::Some(_))
                 if whole_input_window(spec) =>
             {

@@ -48,10 +48,10 @@ def test_a_facet_sort_key_is_empty(rust_mongo: Any, mongod: Any) -> None:
 def test_a_sort_behind_documents_sets_no_key(rust_mongo: Any, mongod: Any) -> None:
     """mongod 8.2.11 refuses a rank behind `$documents` and a `$sort` with
     9973200 "Attempt to get sort key which has not been populated", in a
-    collectionless aggregate and in a `$lookup` pipeline alike (cause in
-    mongod not traced; RM-523 is the nearest measured shape, a `$sort`
-    behind another stage); this server answers both, tied in the first and
-    ranked by the `$sort` in the second."""
+    collectionless aggregate and in a `$lookup` pipeline alike: a `$sort` the
+    pipeline runs writes no key (RM-523), and with no read of a collection in
+    front the documents have none, which this server's marking of keyless
+    documents (RM-522) does not cover. This server answers both, tied."""
     docs = {"$documents": [{"n": 2, "k": 1}, {"n": 1, "k": 0}, {"n": 3, "k": 1}]}
     sub = [docs, {"$sort": {"k": 1}}, RANK]
 

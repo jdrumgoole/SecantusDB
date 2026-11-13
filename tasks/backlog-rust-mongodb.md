@@ -1604,9 +1604,11 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       refused.** mongod 8.2.11 refuses a `$_internalSetWindowFields`
       `$rank` there with 9973200 "Attempt to get sort key which has not been
       populated", collectionless and in a `$lookup` pipeline alike; this
-      server ties the first and ranks the second by the `$sort`. Cause in
-      mongod not traced (RM-522 and RM-523 are the nearest shapes). Found
-      2026-11-13 (RM-521).
+      server ties both. A `$sort` the pipeline runs itself writes no key
+      (only the query layer's does, RM-523), and with no read of a
+      collection in front the documents have no key at all; the marking of
+      keyless documents RM-522 added (`agg_meta::DROPS_SORT_KEY`) does not
+      cover `$documents`. Found 2026-11-13 (RM-521).
       Verify: tests/backlog/test_rm_found_2026_11_13_rm521.py::test_a_sort_behind_documents_sets_no_key
       Backlog-ID: RM-626
 - [ ] **A `$unionWith` ends the sort key.** mongod 8.2.11 keeps the outer
@@ -1631,34 +1633,48 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       document. Found 2026-11-13 (RM-522).
       Verify: tests/backlog/test_rm_found_2026_11_13_rm522.py::test_a_graph_lookup_and_a_fill_keep_the_sort_key
       Backlog-ID: RM-632
-- [ ] **A `$sort` behind another stage sets the sort key where mongod's
-      keeps the earlier one.** Behind a leading `$sort` and an `$addFields`,
-      mongod 8.2.11's key after a second `$sort` is still the first's; a
-      `$sort` behind a leading `$addFields` or `$project` leaves the empty
-      key. `{$meta: "sortKey"}` and a `$_internalSetWindowFields`'s ranks
-      show it alike; this server takes the last `$sort`'s key. (Behind an
-      `$unwind` mongod does take the later `$sort`'s.) Cause in mongod not
-      traced: measured, not derived. Found 2026-11-10 (RM-410).
-      Verify: tests/backlog/test_rm_found_2026_11_10_rm410.py::test_which_sort_sets_the_key
-      Backlog-ID: RM-523
-- [ ] **A `$sort` that a later `$sort` overrides still orders the ties.**
-      mongod 8.2.11 drops the earlier `$sort` of `$sort: {k: 1}, $sort: {n:
-      1}`, also across an `$unwind`, so documents tied on `n` come in the
-      collection's order; this server runs both, and the ties keep the
-      first sort's order. A different document order. The `$sort` a
-      sorting `$setWindowFields` runs behind drops an earlier `$sort` too
-      (measured 2026-11-13, RM-520). Found 2026-11-10 (RM-410).
-      Verify: tests/backlog/test_rm_found_2026_11_10_rm410.py::test_a_sort_before_another_sort_is_dropped
-      Backlog-ID: RM-524
 - [ ] **`{$meta: "sortKey"}` gives an empty array's key as null.**
       mongod 8.2.11's key for an empty array is `undefined`, which pymongo
       decodes as `None`: `$type` reads `"undefined"`, and a `$group` on the
       key keeps the empty array's document and a null's apart. This server
       reads the key through `$ifNull` (`agg_meta::sort_key_read`), since its
       expressions take `undefined` for MISSING. The ranks already tell the
-      two apart (RM-410). Found 2026-11-10.
+      two apart (RM-410). Found 2026-11-10. **Blocked on RM-635**
+      (measured 2026-11-13): handing `$meta` the real `undefined` still
+      reads "missing" in `$type` of `$$this` and folds into null's
+      `$group`, so this closes with that one, not before.
       Verify: tests/backlog/test_rm_found_2026_11_10_rm410.py::test_an_empty_arrays_sort_key_is_undefined
       Backlog-ID: RM-525
+- [ ] **A stored `undefined` reads as MISSING in aggregation
+      expressions.** The expression engine spells MISSING `Bson::Undefined`
+      (`secantus-core` `expressions.rs`, `sbe_ops.rs`; ~145 sites in 22
+      files), so a real `undefined` -- a field, an array element, a `$let`
+      variable -- gives `$type` "missing" where mongod 8.2.11 gives
+      "undefined"; an `$addFields` copy of it is dropped; a `$group` on it
+      joins null's group, and one on `[undefined]` is refused (code 2, "not
+      supported by the Rust server"). The fix gives MISSING a representation
+      of its own, apart from every BSON value. Found 2026-11-13 (RM-525).
+      Verify: tests/backlog/test_rm_found_2026_11_13_rm525.py::test_a_stored_undefined_is_not_missing, tests/backlog/test_rm_found_2026_11_13_rm525.py::test_a_group_keeps_undefined_apart_from_null
+      Backlog-ID: RM-635
+- [ ] **A `$match` that reads a missing sort key names it `undefined`.**
+      With no `$sort` ahead of it, `{$match: {$expr: {$gt: [{$size:
+      {$meta: "sortKey"}}, 0]}}}` is mongod 8.2.11's 17124 "Executor error
+      during aggregate command on namespace: ... :: caused by :: The
+      argument to $size must be an array, but was of type: missing"; this
+      server's has no envelope and says `undefined`. (`$addFields` reads
+      the key as `[]` on both.) The `undefined` is RM-635's MISSING; the
+      envelope is this item's own. Found 2026-11-13 (RM-524).
+      Verify: tests/backlog/test_rm_found_2026_11_13_rm524.py::test_a_match_reads_a_missing_sort_key
+      Backlog-ID: RM-633
+- [ ] **A `$project` of `{$meta: "sortKey"}` with no `$sort` is refused as
+      unsupported.** mongod 8.2.11 refuses `{$project: {t: {$type: {$meta:
+      "sortKey"}}}}` with code 2 "Failed to determine whether query system
+      can provide a DISTINCT_SCAN grouping :: caused by :: cannot use
+      sortKey $meta projection without a sort"; this server's code 2 says
+      "aggregation pipeline uses a stage or operator not supported by the
+      Rust server". Found 2026-11-13 (RM-524).
+      Verify: tests/backlog/test_rm_found_2026_11_13_rm524.py::test_a_sort_key_projection_without_a_sort
+      Backlog-ID: RM-634
 - [ ] **`$$ROOT` shows a document's hidden sort key.** Behind a `$sort`
       whose key a later stage reads, `{$addFields: {r: "$$ROOT"}}` and a
       `$lookup` `let: {r: "$$ROOT"}` give the document with a
@@ -1699,31 +1715,6 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       (288900, 308400) and (290700, 288300).
       Verify: tests/backlog/test_rm_found_rm408.py::test_a_sub_document_a_stage_touched_is_sized_by_its_storage
       Backlog-ID: RM-515
-- [ ] **`explain` counts every document a `$sort` with a `$limit` read.**
-      For `[{$addFields: {q: "$b"}}, {$sort: {n: -1}}, {$limit: 200}]`
-      over 300 documents mongod 8.2.11's `totalDataSizeSortedBytesEstimate`
-      is the 200 its top-k sort kept (131400); this server's is all 300
-      (197100), as for the same pipeline without the `$limit`. A pipeline
-      run outside `explain` takes the `$limit` (`limit_for_pushdown`), so
-      look first at the run `explain` reads the `$sort`'s counters from.
-      Found 2026-11-10 (RM-408).
-      Verify: tests/backlog/test_rm_found_rm408.py::test_explain_counts_the_documents_a_sort_with_a_limit_kept
-      Backlog-ID: RM-516
-- [ ] **`explain` lists a `$sort` that a window's own sort replaces.** For
-      `[{$unwind: "$t"}, {$sort: {t: 1}}, {$setWindowFields: {sortBy: {n:
-      1}, ...}}]` mongod 8.2.11 drops the `$sort` on `t` and moves the
-      window's `$sort` on `n` ahead of the `$unwind`, listing `$unwind` and
-      `$_internalSetWindowFields` alone. This server lists both `$sort`s
-      after the `$unwind`, and counts both. Found 2026-11-10 (RM-408).
-      Verify: tests/backlog/test_rm_found_rm408.py::test_a_sort_a_window_supersedes_is_not_listed
-      Backlog-ID: RM-517
-- [ ] **`$_internalInhibitOptimization` is refused as an unknown stage.**
-      mongod 8.2.11 runs it -- it passes its documents on and keeps the
-      stages after it out of the scan -- so a pipeline with it answers as
-      one without. This server refuses it (40324, "Unrecognized pipeline
-      stage name"). Found 2026-11-10 (RM-408).
-      Verify: tests/backlog/test_rm_found_rm408.py::test_internal_inhibit_optimization_runs
-      Backlog-ID: RM-518
 - [ ] **A document an inclusion `$project` built is sized as if it were
       read.** Behind an `$unwind` (so not taken by the scan), mongod
       8.2.11's `$project: {t: 1, n: 1}` builds each document it returns,

@@ -55,6 +55,8 @@ const KEEPS_SORT_METADATA: &[&str] = &[
     "$_secantusCarry",
     // Where the stages move between mongod's engines: no stage of its own.
     secantus_core::sbe::ENGINE_STAGE,
+    // Passes each document on as it is.
+    secantus_core::aggregate::INHIBIT_OPTIMIZATION,
 ];
 
 /// The `$_secantusSortKey` that writes the key of the `$sort` mongod runs a
@@ -126,6 +128,7 @@ const KEEPS_METADATA: &[&str] = &[
     "$sort",
     "$limit",
     "$skip",
+    secantus_core::aggregate::INHIBIT_OPTIMIZATION,
 ];
 
 /// What [`rewrite`] did.
@@ -336,6 +339,27 @@ fn union_adds_no_sort_key(stages: &[Bson], at: usize) -> bool {
     sub_drops || !between.iter().any(|s| mentions(s, "sortKey"))
 }
 
+/// Whether no stage writes a sort key because mongod's dependency analysis
+/// never asked for one. It walks the stages front to back and stops at the
+/// first `$_internalInhibitOptimization`, which says nothing of what it
+/// needs; a sort key read only behind that stage is not asked for, so the
+/// read and every `$sort` leave the documents with none at all (mongod
+/// 8.2.11, RM-518: `{$meta: "sortKey"}` there is missing and a rank is
+/// refused). A reader ahead of it asks, a `$lookup` or `$unionWith`
+/// sub-pipeline's for its own documents only, and a `$geoNear` sets the key
+/// whatever is asked.
+fn sort_key_unrequested(stages: &[Bson]) -> bool {
+    let Some(at) = stages
+        .iter()
+        .position(|s| name(s) == secantus_core::aggregate::INHIBIT_OPTIMIZATION)
+    else {
+        return false;
+    };
+    !stages[..at].iter().any(|s| {
+        name(s) == "$geoNear" || (!matches!(name(s), "$lookup" | "$unionWith") && reads_sort_key(s))
+    })
+}
+
 /// Mark the documents `$unionWith` adds as carrying no sort key: a stage
 /// at the end of its sub-pipeline, which the stage gets when it has none.
 fn mark_union_documents(stage: &mut Bson) {
@@ -410,10 +434,26 @@ fn is_inclusion(spec: &Document) -> bool {
 /// A document with no sort key at all -- behind a stage in
 /// [`DROPS_SORT_KEY`], or added by a `$unionWith` -- gives `{$meta:
 /// "sortKey"}` as missing and has a rank refused (RM-522).
-pub(crate) fn rewrite_sort_metadata(stages: &mut Vec<Bson>) {
+///
+/// Only the `$sort` mongod's query layer runs sets the key: `query_sort`
+/// gives its pattern, mongod's pipeline front as `explain` models it
+/// (`explain::pipeline_canonical`, which moves a `$sort` ahead of an
+/// `$unwind` that leaves its fields alone), and the first `$sort` of
+/// `stages` with that pattern is the one. A `$sort` the pipeline runs itself
+/// sorts and leaves the key it was handed: the query layer's sort's, `[]`, or
+/// a `$geoNear`'s distance (mongod 8.2.11, 2026-11-13, RM-523: its
+/// `DocumentSourceSort` writes the key only when built to, as the one a
+/// `$setWindowFields` runs behind is). `query_sort` is asked only when a
+/// stage reads the metadata.
+pub(crate) fn rewrite_sort_metadata(
+    stages: &mut Vec<Bson>,
+    query_sort: impl FnOnce() -> Option<Document>,
+) {
     if !needs_sort_metadata(stages) {
         return;
     }
+    // The query layer's sort, until the `$sort` that is it has run.
+    let mut query_sort = query_sort();
     let mut out: Vec<Bson> = Vec::with_capacity(stages.len() + 4);
     // The hidden fields in place, and so the metadata in reach.
     let (mut sort_live, mut geo_live) = (false, false);
@@ -423,6 +463,9 @@ pub(crate) fn rewrite_sort_metadata(stages: &mut Vec<Bson>) {
     let (mut keyless, mut marked) = (false, false);
     let n = stages.len();
     let all = std::mem::take(stages);
+    if sort_key_unrequested(&all) {
+        keyless = true;
+    }
     let unions: Vec<bool> = (0..all.len())
         .map(|i| name(&all[i]) == "$unionWith" && union_adds_no_sort_key(&all, i))
         .collect();
@@ -517,9 +560,14 @@ pub(crate) fn rewrite_sort_metadata(stages: &mut Vec<Bson>) {
         }
         match name.as_str() {
             "$sort" => {
-                let by = stage.as_document().and_then(|d| d.get("$sort")).cloned();
+                let by = stage
+                    .as_document()
+                    .and_then(|d| d.get_document("$sort").ok())
+                    .filter(|by| query_sort.as_ref() == Some(*by))
+                    .cloned();
                 out.push(stage);
                 if let Some(by) = by {
+                    query_sort = None;
                     out.push(Bson::Document(
                         bson::doc! { "$_secantusSortKey": { "into": SORT_KEY, "by": by } },
                     ));
@@ -746,7 +794,7 @@ mod tests {
             doc! { "$group": { "_id": { "$meta": "sortKey" } } },
             doc! { "$project": { "k": { "$meta": "sortKey" } } },
         ]);
-        rewrite_sort_metadata(&mut stages);
+        rewrite_sort_metadata(&mut stages, || Some(doc! { "a": 1 }));
         let read = sort_key_read();
         assert_eq!(
             stages,
@@ -786,7 +834,7 @@ mod tests {
             number.clone(),
             rank.clone(),
         ]);
-        rewrite_sort_metadata(&mut piped);
+        rewrite_sort_metadata(&mut piped, || Some(doc! { "k": 1 }));
         assert_eq!(
             piped,
             stages(vec![
@@ -801,7 +849,7 @@ mod tests {
 
         // No `$sort` in reach: nothing to read, and every document ties.
         let mut alone = stages(vec![rank.clone()]);
-        rewrite_sort_metadata(&mut alone);
+        rewrite_sort_metadata(&mut alone, || None);
         assert_eq!(alone, stages(vec![rank]));
     }
 
@@ -823,7 +871,7 @@ mod tests {
             window.clone(),
             meta,
         ]);
-        rewrite_sort_metadata(&mut piped);
+        rewrite_sort_metadata(&mut piped, || Some(doc! { "k": 1 }));
         assert_eq!(
             piped,
             stages(vec![
@@ -876,7 +924,7 @@ mod tests {
             window.clone(),
             doc! { "$addFields": { "m": { "$meta": "sortKey" } } },
         ]);
-        rewrite_sort_metadata(&mut piped);
+        rewrite_sort_metadata(&mut piped, || None);
         assert_eq!(
             piped,
             stages(vec![
@@ -891,8 +939,9 @@ mod tests {
     }
 
     /// Behind a `$group` no document has a sort key, a later `$sort`
-    /// gives it none, `{$meta: "sortKey"}` is missing and a rank is
-    /// refused: the documents are marked as they reach it (RM-522).
+    /// gives it none (only the query layer's sets one, RM-523), `{$meta:
+    /// "sortKey"}` is missing and a rank is refused: the documents are
+    /// marked as they reach it (RM-522).
     #[test]
     fn behind_a_group_there_is_no_sort_key() {
         let rank = doc! { "$_internalSetWindowFields": {
@@ -904,18 +953,16 @@ mod tests {
             rank.clone(),
         ]);
         assert!(needs_sort_metadata(&piped));
-        rewrite_sort_metadata(&mut piped);
+        rewrite_sort_metadata(&mut piped, || None);
         assert_eq!(
             piped,
             stages(vec![
                 // Read from the collection with no `$sort`: the empty key.
                 doc! { "$group": { "_id": "$k", "m": { "$push": { "$literal": [] } } } },
                 doc! { "$sort": { "_id": 1 } },
-                doc! { "$_secantusSortKey": { "into": SORT_KEY, "by": { "_id": 1 } } },
-                doc! { "$project": { "m": "$$REMOVE", SORT_KEY: 1 } },
+                doc! { "$project": { "m": "$$REMOVE" } },
                 doc! { "$set": { NO_SORT_KEY: true } },
                 rank,
-                doc! { "$unset": [SORT_KEY] },
             ])
         );
     }
@@ -932,7 +979,7 @@ mod tests {
             doc! { "$project": { "n": 1 } },
             rank.clone(),
         ]);
-        rewrite_sort_metadata(&mut piped);
+        rewrite_sort_metadata(&mut piped, || None);
         assert_eq!(
             piped,
             stages(vec![
@@ -945,7 +992,7 @@ mod tests {
 
         let meta = doc! { "$addFields": { "m": { "$meta": "sortKey" } } };
         let mut read = stages(vec![doc! { "$unionWith": "c" }, meta, rank.clone()]);
-        rewrite_sort_metadata(&mut read);
+        rewrite_sort_metadata(&mut read, || None);
         assert_eq!(
             read,
             stages(vec![
@@ -956,13 +1003,105 @@ mod tests {
         );
     }
 
+    /// Only the `$sort` mongod's query layer runs sets the key: one the
+    /// pipeline runs behind another stage sorts and leaves the key it was
+    /// handed, the query layer's or none (mongod 8.2.11, RM-523).
+    #[test]
+    fn only_the_query_layers_sort_sets_the_key() {
+        let meta = doc! { "$addFields": { "m": { "$meta": "sortKey" } } };
+        let mut piped = stages(vec![
+            doc! { "$sort": { "k": 1 } },
+            doc! { "$addFields": { "q": 1 } },
+            doc! { "$sort": { "n": 1 } },
+            meta.clone(),
+        ]);
+        rewrite_sort_metadata(&mut piped, || Some(doc! { "k": 1 }));
+        assert_eq!(
+            piped,
+            stages(vec![
+                doc! { "$sort": { "k": 1 } },
+                doc! { "$_secantusSortKey": { "into": SORT_KEY, "by": { "k": 1 } } },
+                doc! { "$addFields": { "q": 1 } },
+                doc! { "$sort": { "n": 1 } },
+                doc! { "$addFields": { "m": sort_key_read() } },
+                doc! { "$unset": [SORT_KEY] },
+            ])
+        );
+
+        // The query layer took a later `$sort` (one an `$unwind` let ahead).
+        let mut piped = stages(vec![
+            doc! { "$sort": { "k": 1 } },
+            doc! { "$unwind": "$a" },
+            doc! { "$sort": { "n": 1 } },
+            meta.clone(),
+        ]);
+        rewrite_sort_metadata(&mut piped, || Some(doc! { "n": 1 }));
+        assert_eq!(
+            piped[3],
+            Bson::Document(doc! { "$_secantusSortKey": { "into": SORT_KEY, "by": { "n": 1 } } })
+        );
+
+        // No sort in the query layer: the documents keep the empty key.
+        let mut piped = stages(vec![
+            doc! { "$addFields": { "q": 1 } },
+            doc! { "$sort": { "n": 1 } },
+            meta,
+        ]);
+        rewrite_sort_metadata(&mut piped, || None);
+        assert_eq!(
+            piped,
+            stages(vec![
+                doc! { "$addFields": { "q": 1 } },
+                doc! { "$sort": { "n": 1 } },
+                doc! { "$addFields": { "m": { "$literal": [] } } },
+            ])
+        );
+    }
+
     #[test]
     fn add_fields_with_no_sort_key_in_reach_gives_an_empty_array() {
         let mut stages = stages(vec![doc! { "$addFields": { "k": { "$meta": "sortKey" } } }]);
-        rewrite_sort_metadata(&mut stages);
+        rewrite_sort_metadata(&mut stages, || None);
         assert_eq!(
             stages,
             self::stages(vec![doc! { "$addFields": { "k": { "$literal": [] } } }])
         );
+    }
+
+    #[test]
+    fn a_sort_key_read_only_behind_an_inhibit_is_never_asked_for() {
+        let inhibit = doc! { "$_internalInhibitOptimization": {} };
+        let meta = doc! { "$addFields": { "m": { "$meta": "sortKey" } } };
+        let sort = doc! { "$sort": { "n": 1 } };
+        let unrequested = |v: Vec<Document>| sort_key_unrequested(&stages(v));
+        assert!(unrequested(vec![
+            sort.clone(),
+            inhibit.clone(),
+            meta.clone()
+        ]));
+        assert!(unrequested(vec![
+            inhibit.clone(),
+            sort.clone(),
+            meta.clone()
+        ]));
+        assert!(!unrequested(vec![
+            sort.clone(),
+            meta.clone(),
+            inhibit.clone(),
+            meta.clone()
+        ]));
+        assert!(!unrequested(vec![sort.clone(), meta.clone()]));
+        // A `$lookup`'s reader asks for its own documents' key only.
+        let lookup = doc! { "$lookup": { "from": "c", "pipeline": [meta.clone()], "as": "j" } };
+        assert!(unrequested(vec![lookup, inhibit.clone(), meta.clone()]));
+        // A `$geoNear` sets the key whatever is asked.
+        let geo = doc! { "$geoNear": { "near": [0, 0], "distanceField": "d" } };
+        assert!(!unrequested(vec![geo, inhibit.clone(), meta.clone()]));
+
+        // The documents carry no key at all: the read is missing.
+        let mut piped = stages(vec![sort.clone(), inhibit.clone(), meta]);
+        rewrite_sort_metadata(&mut piped, || Some(doc! { "n": 1 }));
+        assert!(!piped.iter().any(|s| mentions(s, "sortKey")));
+        assert!(piped.contains(&Bson::Document(doc! { "$addFields": { "m": "$$REMOVE" } })));
     }
 }

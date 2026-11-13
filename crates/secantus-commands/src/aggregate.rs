@@ -404,6 +404,9 @@ pub fn aggregate(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     }
     let mut pipeline = pipeline;
     argtypes::normalise_pipeline_sorts(&mut pipeline);
+    // Every `$sort` has parsed: one a later `$sort` overrides goes, as
+    // mongod's optimizer erases it (RM-524).
+    crate::explain::hoist::drop_overridden_sorts_everywhere(&mut pipeline);
     // The command's `let`, which mongod substitutes before it folds.
     let fold_vars = crate::util::command_let_vars(doc.get("let"), ctx);
     // An operator the query language does not have is a parse error, whether
@@ -682,11 +685,14 @@ pub fn aggregate(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
                 && (c == "system.views"
                     || crate::ts_buckets::bucketed(storage, &ctx.db_name, c).is_some());
             let asked: &str = c;
-            let (base_coll, pipeline) = if derived {
+            let (base_coll, mut pipeline) = if derived {
                 (c.clone(), pipeline)
             } else {
                 resolve_view(storage, &ctx.db_name, c, pipeline)?
             };
+            // A view's last `$sort` is overridden by the caller's first, as
+            // any other (RM-524).
+            crate::explain::hoist::drop_overridden_sorts_everywhere(&mut pipeline);
             let c = base_coll.as_str();
             // A view's own stages go in front of the caller's, so a
             // `$indexStats` through a view with a pipeline is no longer the
@@ -1076,8 +1082,11 @@ pub fn aggregate(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
                 let mut remaining = remaining;
                 let metas = crate::agg_meta::rewrite(&read_pipeline, &mut remaining);
                 // `{$meta: "sortKey"}` and the `$geoNear` metadata, from the
-                // stage that sets them.
-                crate::agg_meta::rewrite_sort_metadata(&mut remaining);
+                // stage that sets them: the sort key from the `$sort` mongod's
+                // query layer runs (RM-523).
+                crate::agg_meta::rewrite_sort_metadata(&mut remaining, || {
+                    crate::explain::pipeline_canonical(c, &read_pipeline).sort
+                });
                 let record_ids = if metas.record_id {
                     let refs: Vec<&[u8]> = reduced.iter().map(Vec::as_slice).collect();
                     storage
@@ -1744,6 +1753,7 @@ pub(crate) fn recognized_stage(name: &str) -> bool {
             | "$set"
             | "$setWindowFields"
             | "$_internalSetWindowFields"
+            | INHIBIT_OPTIMIZATION
             | "$skip"
             | "$sort"
             | "$sortByCount"
@@ -2154,6 +2164,7 @@ pub(crate) fn validate_stage_names(pipeline: &[Bson], db: &str) -> Result<(), Co
             "$densify" => validate_densify(d.get(name))?,
             "$fill" => validate_fill(d.get(name))?,
             "$queryStats" => validate_query_stats(d.get(name))?,
+            INHIBIT_OPTIMIZATION => validate_inhibit_optimization(d.get(name))?,
             "$querySettings" => {
                 crate::query_settings::validate_stage(d.get(name))?;
             }
@@ -2504,6 +2515,34 @@ fn validate_sample(spec: Option<&Bson>) -> Result<(), CommandError> {
         ));
     }
     Ok(())
+}
+
+pub(crate) use secantus_core::aggregate::INHIBIT_OPTIMIZATION;
+
+/// `$_internalInhibitOptimization` takes an empty object: anything but an
+/// object is a `TypeMismatch` (14), an object with a field a
+/// `FailedToParse` (9) (`createFromBson`, measured 8.2.11).
+fn validate_inhibit_optimization(spec: Option<&Bson>) -> Result<(), CommandError> {
+    match spec {
+        Some(Bson::Document(d)) if d.is_empty() => Ok(()),
+        Some(Bson::Document(d)) => Err(CommandError::new(
+            9,
+            "FailedToParse",
+            format!(
+                "{INHIBIT_OPTIMIZATION} must take an empty object but found: {}",
+                secantus_core::update::render_shell(&Bson::Document(d.clone()))
+            ),
+        )),
+        other => Err(CommandError::new(
+            14,
+            "TypeMismatch",
+            format!(
+                "{INHIBIT_OPTIMIZATION} must take a nested object but found: \
+                 {INHIBIT_OPTIMIZATION}: {}",
+                secantus_core::update::render_shell(other.unwrap_or(&Bson::Null))
+            ),
+        )),
+    }
 }
 
 /// `$unwind`'s string form must be a field PATH, i.e. `$`-prefixed.
@@ -3206,11 +3245,15 @@ fn apply_lookup(
     let written_pipeline = spec.get("pipeline").and_then(Bson::as_array);
     // A `$sort` in the sub-pipeline sets the sort key its own
     // `{$meta: "sortKey"}` and `$_internalSetWindowFields` ranks read, as the
-    // top-level pipeline's does (mongod 8.2.11, RM-521): rewritten once, run
+    // top-level pipeline's does (mongod 8.2.11, RM-521): the one the read of
+    // `from` takes, a view's stages in front (RM-523). Rewritten once, run
     // for every outer document.
     let rewritten = written_pipeline.map(|sub| {
         let mut stages = sub.clone();
-        crate::agg_meta::rewrite_sort_metadata(&mut stages);
+        crate::agg_meta::rewrite_sort_metadata(&mut stages, || {
+            let (base, whole) = resolve_view(storage, db, from?, sub.clone()).ok()?;
+            crate::explain::pipeline_canonical(&base, &whole).sort
+        });
         stages
     });
     let sub_pipeline = rewritten.as_ref();
