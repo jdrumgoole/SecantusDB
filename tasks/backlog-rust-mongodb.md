@@ -1715,16 +1715,6 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       (288900, 308400) and (290700, 288300).
       Verify: tests/backlog/test_rm_found_rm408.py::test_a_sub_document_a_stage_touched_is_sized_by_its_storage
       Backlog-ID: RM-515
-- [ ] **`explain` counts every document a `$sort` with a `$limit` read.**
-      For `[{$addFields: {q: "$b"}}, {$sort: {n: -1}}, {$limit: 200}]`
-      over 300 documents mongod 8.2.11's `totalDataSizeSortedBytesEstimate`
-      is the 200 its top-k sort kept (131400); this server's is all 300
-      (197100), as for the same pipeline without the `$limit`. A pipeline
-      run outside `explain` takes the `$limit` (`limit_for_pushdown`), so
-      look first at the run `explain` reads the `$sort`'s counters from.
-      Found 2026-11-10 (RM-408).
-      Verify: tests/backlog/test_rm_found_rm408.py::test_explain_counts_the_documents_a_sort_with_a_limit_kept
-      Backlog-ID: RM-516
 - [ ] **`$_internalInhibitOptimization` is refused as an unknown stage.**
       mongod 8.2.11 runs it -- it passes its documents on and keeps the
       stages after it out of the scan -- so a pipeline with it answers as

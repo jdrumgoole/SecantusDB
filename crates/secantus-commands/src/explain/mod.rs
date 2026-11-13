@@ -1774,6 +1774,16 @@ fn reply_for(r: &Request, verbosity: Verbosity, ctx: &mut CommandContext) -> Han
                     .cloned()
                     .map(Bson::Document)
                     .collect();
+                // A `$sort` takes the `$limit` behind it in the whole run
+                // (`extractLimitForPushdown`) and keeps only that many: so
+                // does its run here, or its counters are those of a sort of
+                // everything (measured 8.2.11, RM-516: 131400 bytes for the
+                // top 200 of 300 documents, not 197100).
+                if r.pipeline[taken + i].contains_key("$sort") {
+                    if let Some(k) = secantus_core::aggregate::limit_for_pushdown(&after) {
+                        prefix.push(doc! { "$limit": i64::try_from(k).unwrap_or(i64::MAX) });
+                    }
+                }
                 if let (false, Some(fields)) =
                     (after.is_empty(), secantus_core::downstream_fields(&after))
                 {

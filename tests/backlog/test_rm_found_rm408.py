@@ -73,13 +73,15 @@ def _sorted_with_limit(client: Any) -> int:
     return stages[1]["totalDataSizeSortedBytesEstimate"]
 
 
-@pytest.mark.backlog("RM-516")
+@pytest.mark.backlog_fixed("RM-516")
 def test_explain_counts_the_documents_a_sort_with_a_limit_kept(
     rust_mongo: Any, mongod: Any
 ) -> None:
     """A pipeline `$sort` that takes the `$limit` behind it keeps only that
     many documents, and mongod 8.2.11's `explain` counts those: 200 of
-    657 bytes each, 131400."""
+    657 bytes each, 131400. This server's `explain` ran the `$sort` without
+    the `$limit` and counted all 300 (197100), until RM-516 gave that run
+    the limit the whole pipeline pushes down."""
     assert _sorted_with_limit(rust_mongo) == _sorted_with_limit(mongod)
 
 
