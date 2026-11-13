@@ -609,8 +609,128 @@ pub(crate) fn hoist_after_source(pipeline: &[Bson]) -> Vec<Bson> {
     hoist(pipeline, true)
 }
 
+/// `pipeline` without each `$sort` a later one overrides, as mongod's
+/// optimizer erases it (measured 8.2.11, RM-524): a `$sort` directly ahead
+/// of another goes, and so does one the later `$sort` reaches over stages
+/// mongod moves out from between them -- a `$match`, which goes ahead of a
+/// `$sort`, and ahead of an `$unwind` when it reads nothing the `$unwind`
+/// writes; a `$skip` of 0, which it erases; an `$unwind` the later `$sort`
+/// reads nothing of, which that `$sort` goes ahead of. A `$setWindowFields`
+/// is a `$sort` on its partition and `sortBy` first
+/// ([`super::shape::desugared_window`]), so it overrides as one, unless a
+/// computed partition puts an `$addFields` ahead of that `$sort`. Any other
+/// stage between keeps both: `[{$sort: {k: 1}}, {$limit: 10}, {$sort: {n:
+/// 1}}]` sorts twice. The ties of the later `$sort` then come in the order
+/// the documents had before the earlier one, not in its order.
+pub(crate) fn drop_overridden_sorts(pipeline: &[Bson]) -> Vec<Bson> {
+    pipeline
+        .iter()
+        .enumerate()
+        .filter(|(i, stage)| {
+            let sort = stage
+                .as_document()
+                .filter(|d| d.len() == 1)
+                .is_some_and(|d| matches!(d.get("$sort"), Some(Bson::Document(_))));
+            !(sort && overridden(&pipeline[i + 1..]))
+        })
+        .map(|(_, stage)| stage.clone())
+        .collect()
+}
+
+/// [`drop_overridden_sorts`] on `pipeline` and on every `$facet`, `$lookup`
+/// and `$unionWith` sub-pipeline in it, which mongod optimizes alike
+/// (measured 8.2.11, RM-524).
+pub(crate) fn drop_overridden_sorts_everywhere(pipeline: &mut Vec<Bson>) {
+    *pipeline = drop_overridden_sorts(pipeline);
+    for stage in pipeline.iter_mut() {
+        let Bson::Document(stage) = stage else {
+            continue;
+        };
+        let Some((name, spec)) = stage.iter_mut().next() else {
+            continue;
+        };
+        match (name.as_str(), spec) {
+            ("$facet", Bson::Document(facets)) => {
+                for (_, sub) in facets.iter_mut() {
+                    if let Bson::Array(sub) = sub {
+                        drop_overridden_sorts_everywhere(sub);
+                    }
+                }
+            }
+            ("$lookup" | "$unionWith", Bson::Document(d)) => {
+                if let Some(Bson::Array(sub)) = d.get_mut("pipeline") {
+                    drop_overridden_sorts_everywhere(sub);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Whether a later stage of `after` -- the stages behind a `$sort` --
+/// overrides that `$sort` ([`drop_overridden_sorts`]).
+fn overridden(after: &[Bson]) -> bool {
+    // The fields the `$unwind`s passed so far write.
+    let mut unwound: Vec<String> = Vec::new();
+    let reads_none = |keys: &Document, unwound: &[String]| {
+        keys.keys()
+            .all(|k| !unwound.iter().any(|w| paths_overlap(k, w)))
+    };
+    for stage in after {
+        let Some((name, spec)) = stage
+            .as_document()
+            .filter(|d| d.len() == 1)
+            .and_then(|d| d.iter().next())
+        else {
+            return false;
+        };
+        match name.as_str() {
+            "$sort" | super::shape::WINDOW_SORT => {
+                return spec
+                    .as_document()
+                    .is_some_and(|keys| reads_none(keys, &unwound));
+            }
+            "$setWindowFields" => {
+                let Some(spec) = spec.as_document() else {
+                    return false;
+                };
+                let first = super::shape::desugared_window(spec).into_iter().next();
+                return first
+                    .as_ref()
+                    .and_then(|s| s.get_document(super::shape::WINDOW_SORT).ok())
+                    .is_some_and(|keys| reads_none(keys, &unwound));
+            }
+            // Even one that reads the sort key goes ahead of the `$sort`,
+            // and reads none there (measured 8.2.11).
+            "$match" | PUSHED_MATCH => {
+                if !unwound.is_empty() {
+                    let mut read = Vec::new();
+                    let free = spec
+                        .as_document()
+                        .and_then(|m| filter_paths(m, &mut read))
+                        .is_some()
+                        && read
+                            .iter()
+                            .all(|r| !unwound.iter().any(|w| paths_overlap(r, w)));
+                    if !free {
+                        return false;
+                    }
+                }
+            }
+            "$skip" if matches!(spec, Bson::Int32(0) | Bson::Int64(0)) => {}
+            "$skip" if spec.as_f64() == Some(0.0) => {}
+            "$unwind" => match unwind_paths(spec) {
+                Some(paths) => unwound.extend(paths),
+                None => return false,
+            },
+            _ => return false,
+        }
+    }
+    false
+}
+
 fn hoist(pipeline: &[Bson], after_source: bool) -> Vec<Bson> {
-    let mut out = pipeline.to_vec();
+    let mut out = drop_overridden_sorts(pipeline);
     // A `$skip` / `$limit` is a wall a `$match` never crosses, but mongod
     // still moves one behind it ahead of the stages after it (8.2.11:
     // `[{$limit: 3}, {$project: {x: 1}}, {$match: {x: 1}}]` lists `$match`
@@ -772,8 +892,97 @@ pub(crate) fn unwind_paths(unwind: &Bson) -> Option<Vec<String>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{hoist_after_source, hoist_matches, PUSHED_MATCH};
+    use super::{
+        drop_overridden_sorts, drop_overridden_sorts_everywhere, hoist_after_source, hoist_matches,
+        PUSHED_MATCH,
+    };
     use bson::{doc, Bson};
+
+    fn stages(docs: Vec<bson::Document>) -> Vec<Bson> {
+        docs.into_iter().map(Bson::Document).collect()
+    }
+
+    /// A `$sort` goes when a later one overrides it, over the stages mongod
+    /// moves out from between them, and stays behind any other (RM-524).
+    #[test]
+    fn a_sort_a_later_sort_overrides_goes() {
+        let k = doc! { "$sort": { "k": 1 } };
+        let n = doc! { "$sort": { "n": 1 } };
+        let unwind = doc! { "$unwind": { "path": "$a", "includeArrayIndex": "i" } };
+        let dropped = |between: Vec<bson::Document>, last: bson::Document| {
+            let mut p = vec![k.clone()];
+            p.extend(between.clone());
+            p.push(last.clone());
+            let mut want = between;
+            want.push(last);
+            assert_eq!(drop_overridden_sorts(&stages(p)), stages(want));
+        };
+        dropped(vec![], n.clone());
+        dropped(vec![doc! { "$match": { "x": 1 } }], n.clone());
+        dropped(vec![doc! { "$skip": 0 }], n.clone());
+        dropped(
+            vec![unwind.clone(), doc! { "$match": { "n": 1 } }],
+            n.clone(),
+        );
+        dropped(
+            vec![],
+            doc! { "$setWindowFields": { "partitionBy": "$p", "output": {} } },
+        );
+        dropped(
+            vec![],
+            doc! { "$setWindowFields": { "sortBy": { "n": 1 }, "output": {} } },
+        );
+        let kept = |between: Vec<bson::Document>, last: bson::Document| {
+            let mut p = vec![k.clone()];
+            p.extend(between);
+            p.push(last);
+            assert_eq!(drop_overridden_sorts(&stages(p.clone())), stages(p));
+        };
+        kept(vec![doc! { "$limit": 3 }], n.clone());
+        kept(vec![doc! { "$skip": 1 }], n.clone());
+        kept(vec![doc! { "$addFields": { "q": 1 } }], n.clone());
+        kept(
+            vec![unwind.clone(), doc! { "$match": { "a": 1 } }],
+            n.clone(),
+        );
+        kept(vec![unwind.clone()], doc! { "$sort": { "i": 1 } });
+        kept(vec![unwind], doc! { "$sort": { "a.b": 1 } });
+        kept(
+            vec![],
+            doc! { "$setWindowFields": { "partitionBy": { "$mod": ["$n", 2] }, "sortBy": { "n": 1 }, "output": {} } },
+        );
+        kept(vec![], doc! { "$setWindowFields": { "output": {} } });
+        kept(
+            vec![],
+            doc! { "$_internalSetWindowFields": { "sortBy": { "n": 1 }, "output": {} } },
+        );
+    }
+
+    /// Sub-pipelines are optimized alike (RM-524).
+    #[test]
+    fn a_sub_pipelines_overridden_sort_goes() {
+        let sub = || {
+            vec![
+                Bson::Document(doc! { "$sort": { "k": 1 } }),
+                Bson::Document(doc! { "$sort": { "n": 1 } }),
+            ]
+        };
+        let mut p = stages(vec![
+            doc! { "$facet": { "f": sub() } },
+            doc! { "$lookup": { "from": "c", "pipeline": sub(), "as": "j" } },
+            doc! { "$unionWith": { "coll": "c", "pipeline": sub() } },
+        ]);
+        drop_overridden_sorts_everywhere(&mut p);
+        let one = vec![Bson::Document(doc! { "$sort": { "n": 1 } })];
+        assert_eq!(
+            p,
+            stages(vec![
+                doc! { "$facet": { "f": one.clone() } },
+                doc! { "$lookup": { "from": "c", "pipeline": one.clone(), "as": "j" } },
+                doc! { "$unionWith": { "coll": "c", "pipeline": one } },
+            ])
+        );
+    }
 
     fn root() -> Bson {
         doc! { "$replaceRoot": { "newRoot": "$_tempDocumentsField" } }.into()

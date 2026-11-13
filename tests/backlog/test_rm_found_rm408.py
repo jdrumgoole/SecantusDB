@@ -89,11 +89,13 @@ def _listed(client: Any) -> list:
     return [next(k for k in s if k.startswith("$")) for s in stages]
 
 
-@pytest.mark.backlog("RM-517")
+@pytest.mark.backlog_fixed("RM-517")
 def test_a_sort_a_window_supersedes_is_not_listed(rust_mongo: Any, mongod: Any) -> None:
     """mongod 8.2.11 drops a `$sort` that the `$sort` a `$setWindowFields`
     is parsed into follows, and moves that one ahead of the `$unwind`:
-    `explain` lists `$unwind` and `$_internalSetWindowFields` alone."""
+    `explain` lists `$unwind` and `$_internalSetWindowFields` alone. This
+    server listed and counted both `$sort`s, until RM-524 dropped the
+    overridden one as mongod's optimizer does."""
     assert _listed(rust_mongo) == _listed(mongod)
 
 

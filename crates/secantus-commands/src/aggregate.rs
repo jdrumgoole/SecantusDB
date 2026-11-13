@@ -404,6 +404,9 @@ pub fn aggregate(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     }
     let mut pipeline = pipeline;
     argtypes::normalise_pipeline_sorts(&mut pipeline);
+    // Every `$sort` has parsed: one a later `$sort` overrides goes, as
+    // mongod's optimizer erases it (RM-524).
+    crate::explain::hoist::drop_overridden_sorts_everywhere(&mut pipeline);
     // The command's `let`, which mongod substitutes before it folds.
     let fold_vars = crate::util::command_let_vars(doc.get("let"), ctx);
     // An operator the query language does not have is a parse error, whether
@@ -682,11 +685,14 @@ pub fn aggregate(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
                 && (c == "system.views"
                     || crate::ts_buckets::bucketed(storage, &ctx.db_name, c).is_some());
             let asked: &str = c;
-            let (base_coll, pipeline) = if derived {
+            let (base_coll, mut pipeline) = if derived {
                 (c.clone(), pipeline)
             } else {
                 resolve_view(storage, &ctx.db_name, c, pipeline)?
             };
+            // A view's last `$sort` is overridden by the caller's first, as
+            // any other (RM-524).
+            crate::explain::hoist::drop_overridden_sorts_everywhere(&mut pipeline);
             let c = base_coll.as_str();
             // A view's own stages go in front of the caller's, so a
             // `$indexStats` through a view with a pipeline is no longer the

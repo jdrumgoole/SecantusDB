@@ -1633,15 +1633,6 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       document. Found 2026-11-13 (RM-522).
       Verify: tests/backlog/test_rm_found_2026_11_13_rm522.py::test_a_graph_lookup_and_a_fill_keep_the_sort_key
       Backlog-ID: RM-632
-- [ ] **A `$sort` that a later `$sort` overrides still orders the ties.**
-      mongod 8.2.11 drops the earlier `$sort` of `$sort: {k: 1}, $sort: {n:
-      1}`, also across an `$unwind`, so documents tied on `n` come in the
-      collection's order; this server runs both, and the ties keep the
-      first sort's order. A different document order. The `$sort` a
-      sorting `$setWindowFields` runs behind drops an earlier `$sort` too
-      (measured 2026-11-13, RM-520). Found 2026-11-10 (RM-410).
-      Verify: tests/backlog/test_rm_found_2026_11_10_rm410.py::test_a_sort_before_another_sort_is_dropped
-      Backlog-ID: RM-524
 - [ ] **`{$meta: "sortKey"}` gives an empty array's key as null.**
       mongod 8.2.11's key for an empty array is `undefined`, which pymongo
       decodes as `None`: `$type` reads `"undefined"`, and a `$group` on the
@@ -1665,6 +1656,25 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       of its own, apart from every BSON value. Found 2026-11-13 (RM-525).
       Verify: tests/backlog/test_rm_found_2026_11_13_rm525.py::test_a_stored_undefined_is_not_missing, tests/backlog/test_rm_found_2026_11_13_rm525.py::test_a_group_keeps_undefined_apart_from_null
       Backlog-ID: RM-635
+- [ ] **A `$match` that reads a missing sort key names it `undefined`.**
+      With no `$sort` ahead of it, `{$match: {$expr: {$gt: [{$size:
+      {$meta: "sortKey"}}, 0]}}}` is mongod 8.2.11's 17124 "Executor error
+      during aggregate command on namespace: ... :: caused by :: The
+      argument to $size must be an array, but was of type: missing"; this
+      server's has no envelope and says `undefined`. (`$addFields` reads
+      the key as `[]` on both.) The `undefined` is RM-635's MISSING; the
+      envelope is this item's own. Found 2026-11-13 (RM-524).
+      Verify: tests/backlog/test_rm_found_2026_11_13_rm524.py::test_a_match_reads_a_missing_sort_key
+      Backlog-ID: RM-633
+- [ ] **A `$project` of `{$meta: "sortKey"}` with no `$sort` is refused as
+      unsupported.** mongod 8.2.11 refuses `{$project: {t: {$type: {$meta:
+      "sortKey"}}}}` with code 2 "Failed to determine whether query system
+      can provide a DISTINCT_SCAN grouping :: caused by :: cannot use
+      sortKey $meta projection without a sort"; this server's code 2 says
+      "aggregation pipeline uses a stage or operator not supported by the
+      Rust server". Found 2026-11-13 (RM-524).
+      Verify: tests/backlog/test_rm_found_2026_11_13_rm524.py::test_a_sort_key_projection_without_a_sort
+      Backlog-ID: RM-634
 - [ ] **`$$ROOT` shows a document's hidden sort key.** Behind a `$sort`
       whose key a later stage reads, `{$addFields: {r: "$$ROOT"}}` and a
       `$lookup` `let: {r: "$$ROOT"}` give the document with a
@@ -1715,14 +1725,6 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       Found 2026-11-10 (RM-408).
       Verify: tests/backlog/test_rm_found_rm408.py::test_explain_counts_the_documents_a_sort_with_a_limit_kept
       Backlog-ID: RM-516
-- [ ] **`explain` lists a `$sort` that a window's own sort replaces.** For
-      `[{$unwind: "$t"}, {$sort: {t: 1}}, {$setWindowFields: {sortBy: {n:
-      1}, ...}}]` mongod 8.2.11 drops the `$sort` on `t` and moves the
-      window's `$sort` on `n` ahead of the `$unwind`, listing `$unwind` and
-      `$_internalSetWindowFields` alone. This server lists both `$sort`s
-      after the `$unwind`, and counts both. Found 2026-11-10 (RM-408).
-      Verify: tests/backlog/test_rm_found_rm408.py::test_a_sort_a_window_supersedes_is_not_listed
-      Backlog-ID: RM-517
 - [ ] **`$_internalInhibitOptimization` is refused as an unknown stage.**
       mongod 8.2.11 runs it -- it passes its documents on and keeps the
       stages after it out of the scan -- so a pipeline with it answers as

@@ -255,13 +255,8 @@ def test_a_sort_the_pipeline_runs_keeps_the_key_it_was_handed(rust_mongo: Any, m
     }
 
     def answers(client: Any) -> dict:
+        # Ties too come in mongod's order, since RM-524.
         out = _answers(client, pipelines)
-        # Ties come in an order RM-524 owns: compare each answer's keys by
-        # document.
-        out = {
-            name: ("ok", sorted(repr(d) for d in a[1])) if a[0] == "ok" else a
-            for name, a in out.items()
-        }
         db = client.rmfound1110sk
         db.g.insert_many([{"_id": i, "loc": [i, 0], "n": 5 - i} for i in range(4)])
         db.g.create_index([("loc", "2d")])
@@ -280,12 +275,14 @@ def test_a_sort_the_pipeline_runs_keeps_the_key_it_was_handed(rust_mongo: Any, m
     assert answers(rust_mongo) == answers(mongod)
 
 
-@pytest.mark.backlog("RM-524")
+@pytest.mark.backlog_fixed("RM-524")
 def test_a_sort_before_another_sort_is_dropped(rust_mongo: Any, mongod: Any) -> None:
     """mongod 8.2.11 drops a `$sort` that a later `$sort` overrides, also
     across an `$unwind`, and the one a sorting `$setWindowFields` runs
     behind: ties under the second come in the collection's order (`_id` 2
-    before 3), not the first sort's (3 before 2)."""
+    before 3), not the first sort's (3 before 2). This server ran both, and
+    the ties kept the first sort's order, until RM-524 dropped the earlier
+    `$sort` as mongod's optimizer does."""
     pipelines = {
         "$sort, $sort": [{"$sort": {"k": 1}}, {"$sort": {"n": 1}}, {"$project": {"_id": 1}}],
         "$sort, $setWindowFields": [
@@ -301,6 +298,102 @@ def test_a_sort_before_another_sort_is_dropped(rust_mongo: Any, mongod: Any) -> 
         ],
     }
     assert _answers(rust_mongo, pipelines) == _answers(mongod, pipelines)
+
+
+@pytest.mark.backlog_fixed("RM-524")
+def test_what_lies_between_two_sorts(rust_mongo: Any, mongod: Any) -> None:
+    """mongod 8.2.11 drops the earlier `$sort` across the stages its
+    optimizer moves out from between the two -- a `$match` (ahead of an
+    `$unwind` too, when it reads nothing the `$unwind` writes), a `$skip`
+    of 0, an `$unwind` the later `$sort` does not read -- and behind a
+    `$setWindowFields` partitioned by a field; in `$facet` and `$lookup`
+    sub-pipelines alike. A `$limit` or an `$addFields` between keeps both,
+    as does a `$match` on the unwound field, an `$unwind` the later `$sort`
+    reads, and a computed partition, which mongod sets with an `$addFields`
+    ahead of the window's `$sort` (measured 2026-11-13, RM-524)."""
+    ids = {"$project": {"_id": 1}}
+    pipelines = {
+        "$match": [{"$sort": {"k": 1}}, {"$match": {"n": {"$gt": 0}}}, {"$sort": {"n": 1}}, ids],
+        "$skip 0": [{"$sort": {"k": 1}}, {"$skip": 0}, {"$sort": {"n": 1}}, ids],
+        "three $sorts": [{"$sort": {"k": -1}}, {"$sort": {"k": 1}}, {"$sort": {"n": 1}}, ids],
+        "$unwind, $match": [
+            {"$sort": {"k": 1}},
+            {"$unwind": {"path": "$a", "includeArrayIndex": "i"}},
+            {"$match": {"n": {"$gt": 0}}},
+            {"$sort": {"n": 1}},
+            ids,
+        ],
+        "partition by a field": [
+            {"$sort": {"k": 1}},
+            {"$setWindowFields": {"partitionBy": "$n", "output": {"x": {"$sum": 1}}}},
+            ids,
+        ],
+        "$facet": [{"$facet": {"f": [{"$sort": {"k": 1}}, {"$sort": {"n": 1}}, ids]}}],
+        "$lookup": [
+            {"$limit": 1},
+            {
+                "$lookup": {
+                    "from": "c",
+                    "pipeline": [{"$sort": {"k": 1}}, {"$sort": {"n": 1}}, ids],
+                    "as": "j",
+                }
+            },
+            {"$project": {"j": 1}},
+        ],
+        "$limit keeps both": [{"$sort": {"k": 1}}, {"$limit": 9}, {"$sort": {"n": 1}}, ids],
+        "$addFields keeps both": [
+            {"$sort": {"k": 1}},
+            {"$addFields": {"q": 1}},
+            {"$sort": {"k": -1}},
+            {"$sort": {"n": 1}},
+            ids,
+        ],
+        "$match on the unwound field keeps both": [
+            {"$sort": {"k": 1}},
+            {"$unwind": "$a"},
+            {"$match": {"a": {"$gt": 0}}},
+            {"$sort": {"n": 1}},
+            ids,
+        ],
+        "sort on the unwound index keeps both": [
+            {"$sort": {"k": -1}},
+            {"$unwind": {"path": "$a", "includeArrayIndex": "i"}},
+            {"$sort": {"i": 1}},
+            {"$project": {"_id": 1, "i": 1}},
+        ],
+        "computed partition keeps both": [
+            {"$sort": {"k": 1}},
+            {
+                "$setWindowFields": {
+                    "partitionBy": {"$mod": ["$n", 2]},
+                    "sortBy": {"n": 1},
+                    "output": {"x": {"$sum": 1}},
+                }
+            },
+            ids,
+        ],
+    }
+    assert _answers(rust_mongo, pipelines) == _answers(mongod, pipelines)
+
+
+@pytest.mark.backlog_fixed("RM-524")
+def test_a_views_sort_is_overridden(rust_mongo: Any, mongod: Any) -> None:
+    """A `$sort` that ends a view's pipeline is dropped behind the caller's
+    `$sort` (and its `$match`), as in one pipeline, by mongod 8.2.11; one a
+    `$limit` follows is kept (measured 2026-11-13, RM-524)."""
+
+    def answers(client: Any) -> dict:
+        _answers(client, {})
+        db = client.rmfound1110sk
+        db.command("create", "v", viewOn="c", pipeline=[{"$sort": {"k": 1}}])
+        db.command("create", "w", viewOn="c", pipeline=[{"$sort": {"k": 1}}, {"$limit": 9}])
+        tail = [{"$match": {"n": {"$gt": 0}}}, {"$sort": {"n": 1}}, {"$project": {"_id": 1}}]
+        return {
+            name: mongo_answer(lambda name=name: list(db[name].aggregate(tail)))
+            for name in ("v", "w")
+        }
+
+    assert answers(rust_mongo) == answers(mongod)
 
 
 @pytest.mark.backlog("RM-525")
