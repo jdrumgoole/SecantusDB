@@ -1083,6 +1083,51 @@ mod tests {
         assert_eq!(first(&logs), 1);
     }
 
+    /// A command its handler's parse refuses -- an unknown field, a field of
+    /// the wrong type, an unknown pipeline stage, an `lsid` that is not a
+    /// document -- is refused before it runs: it has not parsed (so it gets
+    /// no `Slow query` line), and the next command writes 6788700 (mongod
+    /// 8.2.11, RM-386). These need no storage: the parse refuses them first.
+    #[test]
+    fn a_command_its_handler_refuses_as_it_parses_never_runs() {
+        for (refused, code) in [
+            (doc! {"find": "c", "bogus": 1, "$db": "d"}, 40415),
+            (doc! {"insert": "c", "documents": 1, "$db": "d"}, 14),
+            (
+                doc! {"aggregate": "c", "pipeline": [{"$bogus": 1}], "cursor": {}, "$db": "d"},
+                40324,
+            ),
+            (doc! {"count": "c", "bogus": 1, "$db": "d"}, 40415),
+            (doc! {"getMore": 5_i64, "collection": "", "$db": "d"}, 73),
+            (doc! {"ping": 1, "lsid": 1, "$db": "admin"}, 14),
+            (
+                doc! {"explain": {"find": "c", "limit": "x"}, "$db": "d"},
+                14,
+            ),
+            (
+                doc! {"renameCollection": 5, "to": "d.x", "$db": "admin"},
+                14,
+            ),
+        ] {
+            let (mut ctx, logs) = logging_ctx();
+            ctx.db_name = refused.get_str("$db").unwrap().to_string();
+            let reply = crate::dispatch(&refused, &mut ctx);
+            assert_eq!(reply.get_i32("code"), Ok(code), "{refused:?}: {reply:?}");
+            assert!(!ctx.parsed, "{refused:?} parsed");
+            let first = |logs: &crate::logbuf::LogBuffer| {
+                ids(logs)
+                    .into_iter()
+                    .filter(|(id, _)| *id == 6788700)
+                    .count()
+            };
+            assert_eq!(first(&logs), 0, "{refused:?} counted");
+            ctx.db_name = "admin".to_string();
+            crate::dispatch(&doc! {"ping": 1, "$db": "admin"}, &mut ctx);
+            assert!(ctx.parsed);
+            assert_eq!(first(&logs), 1, "{refused:?}");
+        }
+    }
+
     /// The topologyVersion processId must be identical across calls — a changing
     /// value makes drivers read a server "restart" and clear the connection pool.
     #[test]

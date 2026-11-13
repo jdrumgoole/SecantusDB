@@ -40,7 +40,12 @@ fn truthy(value: Option<&Bson>) -> bool {
     }
 }
 
-pub fn find_and_modify(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
+/// `findAndModify` as mongod's IDL parses it, before the command runs: its
+/// fields and their types, the collection's name and `query`'s type. A
+/// command refused here never ran -- no `Slow query` line, no profile entry,
+/// not a connection's first command (RM-386, measured 8.2.11). An undefined
+/// `$$variable` and a namespace mongod does not write are refused as it runs.
+pub(crate) fn parse(doc: &Document) -> Result<(), CommandError> {
     const FIELDS: &[&str] = &[
         "findAndModify",
         "findandmodify",
@@ -92,6 +97,46 @@ pub fn find_and_modify(doc: &Document, ctx: &mut CommandContext) -> HandlerResul
     }
     argtypes::require_array_of_objects(doc, "arrayFilters", "findAndModify.arrayFilters")?;
     argtypes::require_hint(doc, "hint")?;
+    // `new` and `remove` follow `upsert` above into the bool-OR-number family,
+    // not the strict bool that `update.updates.multi` uses.
+    argtypes::require_bool_or_number(doc, "new", "findAndModify.new")?;
+    argtypes::require_bool_or_number(doc, "remove", "findAndModify.remove")?;
+    match doc
+        .get("findAndModify")
+        .or_else(|| doc.get("findandmodify"))
+    {
+        Some(Bson::String(_)) => {}
+        _ => {
+            return Err(CommandError::new(
+                2,
+                "BadValue",
+                "findAndModify requires a string collection name",
+            ))
+        }
+    }
+    // `query` must be a document. mongod rejects a bare value (e.g. an ObjectId
+    // passed as a findOneAnd* filter) with TypeMismatch (14) rather than treating
+    // it as an empty filter — mongo-node-driver's "object ids as a query
+    // predicate" tests assert the error.
+    // A null `query` is no query, as for the other optional fields.
+    if let Some(q) = doc.get("query").filter(|q| !matches!(q, Bson::Null)) {
+        if !matches!(q, Bson::Document(_)) {
+            let ty = secantus_core::query::bson_type_name(q);
+            return Err(CommandError::new(
+                14,
+                "TypeMismatch",
+                format!(
+                    "BSON field 'findAndModify.query' is the wrong type '{ty}', \
+                     expected type 'object'"
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+pub fn find_and_modify(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
+    parse(doc)?;
     // An undefined `$$variable` is a PARSE error (17276). The `update` may be a
     // PIPELINE, whose stages carry mongod's `Invalid $<stage> :: caused by ::`
     // wrapper; the query filter never does.
@@ -121,10 +166,6 @@ pub fn find_and_modify(doc: &Document, ctx: &mut CommandContext) -> HandlerResul
             }
         }
     }
-    // `new` and `remove` follow `upsert` above into the bool-OR-number family,
-    // not the strict bool that `update.updates.multi` uses.
-    argtypes::require_bool_or_number(doc, "new", "findAndModify.new")?;
-    argtypes::require_bool_or_number(doc, "remove", "findAndModify.remove")?;
     let coll = match doc
         .get("findAndModify")
         .or_else(|| doc.get("findandmodify"))
@@ -140,25 +181,6 @@ pub fn find_and_modify(doc: &Document, ctx: &mut CommandContext) -> HandlerResul
     };
     if let Some(e) = crate::admin::invalid_write_namespace(&ctx.db_name, &coll) {
         return Ok(e.into_reply());
-    }
-    // `query` must be a document. mongod rejects a bare value (e.g. an ObjectId
-    // passed as a findOneAnd* filter) with TypeMismatch (14) rather than treating
-    // it as an empty filter — mongo-node-driver's "object ids as a query
-    // predicate" tests assert the error.
-    // A null `query` is no query, as for the other optional fields.
-    if let Some(q) = doc.get("query").filter(|q| !matches!(q, Bson::Null)) {
-        if !matches!(q, Bson::Document(_)) {
-            let ty = secantus_core::query::bson_type_name(q);
-            return Ok(CommandError::new(
-                14,
-                "TypeMismatch",
-                format!(
-                    "BSON field 'findAndModify.query' is the wrong type '{ty}', \
-                     expected type 'object'"
-                ),
-            )
-            .into_reply());
-        }
     }
     let query = doc_field(doc, "query");
     // `sort: {$natural: ±1}` picks the first or last document in storage

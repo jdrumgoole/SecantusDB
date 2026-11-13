@@ -1175,9 +1175,11 @@ fn mint_id(cursors: &HashMap<i64, Entry>, tailable: bool) -> Result<i64, CursorE
 
 // --- command handlers ----------------------------------------------------
 
-/// `getMore` — pull the next batch from a cursor. Non-tailable path; the
-/// tailable change-stream path is deferred (see the module docs).
-pub fn get_more(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
+/// `getMore` as mongod's IDL parses it, before the command runs: the
+/// cursor id, `collection`, their types and the fields it takes. A command
+/// refused here never ran -- no `Slow query` line, no profile entry, not a
+/// connection's first command (RM-386, measured 8.2.11). The cursor's id.
+pub(crate) fn get_more_parse(doc: &Document) -> Result<i64, CommandError> {
     // mongod PARSES before it looks the cursor up, so a wrong-typed argument is
     // its own error rather than CursorNotFound about a cursor that exists.
     let cursor_id = match doc.get("getMore") {
@@ -1233,6 +1235,14 @@ pub fn get_more(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
             "Collection names cannot be empty",
         ));
     }
+    Ok(cursor_id)
+}
+
+/// `getMore` — pull the next batch from a cursor. Non-tailable path; the
+/// tailable change-stream path is deferred (see the module docs).
+pub fn get_more(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
+    let cursor_id = get_more_parse(doc)?;
+    let coll = doc.get("collection").and_then(Bson::as_str).unwrap_or("");
     // Tri-state like `find`'s, but the absent-default differs: mongod's 101
     // applies only to the FIRST batch — an unspecified getMore batchSize means
     // "fill up to 16MB". Only the tailable path keeps the small default (its
@@ -1692,8 +1702,11 @@ fn deferred_get_more(
     Ok(doc! { "cursor": { "nextBatch": batch, "id": id, "ns": ns }, "ok": 1.0 })
 }
 
-/// `killCursors` — explicitly close cursors.
-pub fn kill_cursors(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
+/// `killCursors` as mongod's IDL parses it, before the command runs: its
+/// fields, and each cursor id's type. A command refused here never ran --
+/// no `Slow query` line, no profile entry, not a connection's first command
+/// (RM-386, measured 8.2.11). The ids it names.
+pub(crate) fn kill_cursors_parse(doc: &Document) -> Result<Vec<i64>, CommandError> {
     // A non-array `cursors` used to fall through to an empty list and report
     // ok:1 — the caller was told cursors it named were killed when none were.
     argtypes::require_required_array(doc, "cursors", "killCursors.cursors")?;
@@ -1725,6 +1738,12 @@ pub fn kill_cursors(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
             }
         }
     }
+    Ok(cursor_ids)
+}
+
+/// `killCursors` — explicitly close cursors.
+pub fn kill_cursors(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
+    let cursor_ids = kill_cursors_parse(doc)?;
     // A blocked tailable getMore waits on the STORAGE oplog condvar, not the
     // registry, so wake it via the storage's notify (best-effort: a cursorless
     // or storageless context just skips it).

@@ -130,8 +130,19 @@ pub(crate) const AGGREGATE_FIELDS: &[&str] = &[
     "mirrored",
 ];
 
-/// `aggregate` — run a pipeline and return a cursor over the results.
-pub fn aggregate(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
+/// `aggregate` as mongod parses it before it runs: the command's fields in
+/// one pass, the required `pipeline`, the namespace, `cursor`, and the
+/// pipeline as `LiteParsedPipeline` reads it (`lite_parse_pipeline`). A
+/// command refused here never ran -- no `Slow query` line, no profile entry,
+/// not a connection's first command, and a transaction it was a statement
+/// of goes on (RM-386, measured 8.2.11). The collection it names, `None`
+/// for `aggregate: 1`. An `explain` of the aggregate (`explained`) takes no
+/// `cursor`.
+pub(crate) fn parse(
+    doc: &Document,
+    db: &str,
+    explained: bool,
+) -> Result<Option<String>, CommandError> {
     // mongod parses the command as its IDL does: ONE pass over the fields in
     // document order, each checked as it is met and an unknown one refused
     // there, so the first bad field wins. Only after the pass does it find a
@@ -184,17 +195,15 @@ pub fn aggregate(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
             "pipeline" => match doc.get("pipeline") {
                 Some(Bson::Array(stages)) => {
                     if !stages.iter().all(|s| matches!(s, Bson::Document(_))) {
-                        return Ok(CommandError::new(14, "TypeMismatch", PIPELINE_ELEMENT_MSG)
-                            .into_reply());
+                        return Err(CommandError::new(14, "TypeMismatch", PIPELINE_ELEMENT_MSG));
                     }
                 }
                 _ => {
-                    return Ok(CommandError::new(
+                    return Err(CommandError::new(
                         14,
                         "TypeMismatch",
                         "A pipeline must be an array of objects",
-                    )
-                    .into_reply())
+                    ))
                 }
             },
             k if !k.starts_with('$')
@@ -230,7 +239,7 @@ pub fn aggregate(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
             return Err(CommandError::new(
                 73,
                 "InvalidNamespace",
-                format!("Invalid namespace specified: {}", ctx.db_name),
+                format!("Invalid namespace specified: {db}"),
             ))
         }
         Some(Bson::String(s)) => Some(s.clone()),
@@ -267,13 +276,23 @@ pub fn aggregate(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     // `cursor` is required unless the command is an inline explain (measured
     // 8.2.11, 2026-10-01); an aggregate without one used to run and return a
     // cursor anyway.
-    if !doc.contains_key("cursor") && doc.get("explain") != Some(&Bson::Boolean(true)) {
+    if !explained && !doc.contains_key("cursor") && doc.get("explain") != Some(&Bson::Boolean(true))
+    {
         return Err(CommandError::new(
             9,
             "FailedToParse",
             "The 'cursor' option is required, except for aggregate with the explain argument",
         ));
     }
+    if let Some(Bson::Array(pipeline)) = doc.get("pipeline") {
+        lite_parse_pipeline(pipeline, db)?;
+    }
+    Ok(coll)
+}
+
+/// `aggregate` — run a pipeline and return a cursor over the results.
+pub fn aggregate(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
+    let coll = parse(doc, &ctx.db_name, false)?;
     let pipeline: Vec<Bson> = match doc.get("pipeline") {
         Some(Bson::Array(a)) => a.clone(),
         _ => Vec::new(),
@@ -2053,6 +2072,40 @@ fn validate_no_where_in_match(pipeline: &[Bson]) -> Result<(), CommandError> {
                 ));
             }
         }
+    }
+    Ok(())
+}
+/// The pipeline as mongod's `LiteParsedPipeline` reads it, as the command
+/// parses: each stage a one-field document whose name is a stage, `$lookup`'s
+/// first read of its spec, and `$queryStats`'s spec. The rest of each
+/// stage's spec is parsed as the command runs (`validate_stage_names` and
+/// after; measured 8.2.11 with `$sample`, `$unwind`, `$bucket`,
+/// `$setWindowFields`, `$densify`, `$fill`, `$querySettings` and the Atlas
+/// stages, RM-386).
+fn lite_parse_pipeline(pipeline: &[Bson], db: &str) -> Result<(), CommandError> {
+    for stage in pipeline {
+        let Some(d) = stage.as_document() else {
+            return Err(CommandError::new(14, "TypeMismatch", PIPELINE_ELEMENT_MSG));
+        };
+        if d.len() != 1 {
+            return Err(CommandError::new(40323, "Location40323", STAGE_ARITY_MSG));
+        }
+        let name = stage_name(stage);
+        // mongod knows the Atlas stages; it refuses them as they run.
+        if ATLAS_STAGES.contains(&name) {
+            continue;
+        }
+        if !recognized_stage(name) && !crate::hybrid::is_prepared_stage(name) {
+            return Err(CommandError::new(
+                40324,
+                "Location40324",
+                format!("Unrecognized pipeline stage name: '{name}'"),
+            ));
+        }
+        if name == "$queryStats" {
+            validate_query_stats(d.get(name))?;
+        }
+        lookups_lite_parse(std::slice::from_ref(stage), db)?;
     }
     Ok(())
 }

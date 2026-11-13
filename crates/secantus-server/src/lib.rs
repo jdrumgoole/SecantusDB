@@ -1371,13 +1371,16 @@ fn run_dispatch(
     // The query stats store (RM-215): what the query counted, recorded now
     // or held until its cursor closes.
     secantus_commands::query_stats::after_operation(request, &reply, &ctx, worked);
-    let slow = match ctx.slow_log {
-        Some(matched) => matched,
-        None => {
-            worked.as_millis() >= shared.slow_ops.slow_ms().max(0) as u128
-                && shared.slow_ops.should_log(worked, rand::random::<f64>())
-        }
-    };
+    // A command refused as it parses never ran, and mongod writes no line
+    // for it (RM-386, measured 8.2.11).
+    let slow = ctx.parsed
+        && match ctx.slow_log {
+            Some(matched) => matched,
+            None => {
+                worked.as_millis() >= shared.slow_ops.slow_ms().max(0) as u128
+                    && shared.slow_ops.should_log(worked, rand::random::<f64>())
+            }
+        };
     if slow {
         // mongod reads the operation's storage statistics for the line
         // under the global lock in IS, when the operation took the global

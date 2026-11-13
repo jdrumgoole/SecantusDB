@@ -832,14 +832,15 @@ _REFUSED_IN_PARSE = {
 }
 
 
-@pytest.mark.backlog("RM-386")
+@pytest.mark.backlog_fixed("RM-386")
 def test_a_command_its_handler_fails_to_parse_is_not_the_first_command(rust_mongo: Any) -> None:
     """mongod 8.2.11 passes over, for `Received first command on ingress
     connection` (6788700), a command its IDL parse refuses -- an unknown
     field (40415), a field of the wrong type (14), an unknown pipeline stage
     (40324), an `lsid` that is not a document (14) -- and the next command
-    writes the line (measured 2026-11-10). This server parses these inside
-    the command's run, after the line, so it counts each."""
+    writes the line (measured 2026-11-10). This server parsed these inside
+    the command's run, after the line, so it counted each, until the
+    handlers' parse ran ahead of the command."""
     host, port = rust_mongo.address
     passed_over = {}
     for name, command in _REFUSED_IN_PARSE.items():

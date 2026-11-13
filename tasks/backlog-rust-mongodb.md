@@ -1105,6 +1105,83 @@ These are explicit non-goals. Don't add them without a reason.
       tables already list it. Found while working RM-495, 2026-11-13.
       Verify: tests/backlog/test_rm_found_2026_11_13_rm495.py::test_delete_indexes_is_drop_indexes
       Backlog-ID: RM-597
+- [ ] **A `create` or `dbStats` refused for a field runs before it is
+      refused.** mongod 8.2.11 refuses a `create` with an unknown or
+      mistyped field (`bogus`, `storageEngine: 1`, `viewOn: 1`,
+      `autoIndexId`) or a `size` out of range, and a `dbStats` with an
+      unknown field or a `scale` that is not a number, as the command
+      parses: not a connection's first command (6788700), no `Slow query`
+      line. This server parses them in the handler's run, so it counts and
+      logs each. RM-386 moved the parse of `find`, the writes, `aggregate`,
+      `count`, `findAndModify`, `getMore`, `killCursors`, `drop`,
+      `listCollections`, `listIndexes`, `createIndexes`,
+      `renameCollection` and `explain` ahead of the run
+      (`parse_before_locks`); `create`'s checks interleave parse and run
+      (its capped 72s and `viewOn`/`pipeline` types), so its split needs a
+      probe of each check. A `listDatabases` on a database other than
+      `admin` (13) also counts, where mongod's does not. Found while
+      working RM-386, 2026-11-13.
+      Verify: tests/backlog/test_rm_found_rm386.py::test_create_and_db_stats_refused_as_they_parse_never_run
+      Backlog-ID: RM-602
+- [ ] **A nested pipeline's unknown stage is "not supported", and a
+      `$unionWith` `pipeline: 1` runs.** mongod 8.2.11 parses the pipeline
+      of a `$facet`, a `$lookup` and a `$unionWith` with the command's own
+      (`LiteParsedPipeline`): an unknown stage in one is 40324, and a
+      `$unionWith` `pipeline` that is not an array is 14 ("A pipeline must
+      be an array of objects"). This server answers the first with
+      BadValue (2, "not supported by the Rust server") and runs the
+      second, answering ok with the collection twice. Found while working
+      RM-386, 2026-11-13.
+      Verify: tests/backlog/test_rm_found_rm386.py::test_a_nested_pipeline_is_parsed_with_the_command
+      Backlog-ID: RM-603
+- [ ] **A `$setWindowFields`, `$densify` or `$fill` field of the wrong
+      type is "not supported".** mongod 8.2.11 refuses `output: 1`,
+      `field: 1` with 14, "BSON field '$densify.field' is the wrong type
+      'int', expected type 'string'"; this server answers BadValue (2),
+      "aggregation pipeline uses a stage or operator not supported by the
+      Rust server". Found while working RM-386, 2026-11-13.
+      Verify: tests/backlog/test_rm_found_rm386.py::test_a_stage_field_of_the_wrong_type_is_a_type_mismatch
+      Backlog-ID: RM-604
+- [ ] **`$search`, `$vectorSearch` and `$listSearchIndexes` are refused
+      with an older mongod's code and message.** mongod 8.2.11 without
+      `mongot` refuses each as it runs with 31082 (SearchNotEnabled):
+      "Using $search and $vectorSearch aggregation stages requires
+      additional configuration. ..." for the first two, its own wording for
+      `$listSearchIndexes`. This server answers all three with 115
+      (CommandNotSupported) and `SEARCH_INDEX_ATLAS_MSG` ("... an
+      Atlas-compatible deployment to use this feature."). Found while
+      working RM-386, 2026-11-13.
+      Verify: tests/backlog/test_rm_found_rm386.py::test_an_atlas_stage_is_refused_as_mongod_refuses_it
+      Backlog-ID: RM-605
+- [ ] **A `getMore` with an int cursor id is refused for its type.**
+      mongod 8.2.11 reads `{getMore: 5, collection: "c"}` as cursor 5
+      (CursorNotFound, 43), and `{getMore: 1}` is refused for the missing
+      `collection`; this server refuses the int with 14, "BSON field
+      'getMore.getMore' is the wrong type 'int', expected type 'long'".
+      Found while working RM-386, 2026-11-13.
+      Verify: tests/backlog/test_rm_found_rm386.py::test_a_get_more_takes_an_int_cursor_id
+      Backlog-ID: RM-606
+- [ ] **A command refused as it runs is profiled where mongod's is not,
+      and the other way.** mongod 8.2.11 profiles a `distinct` refused for
+      its fields; it profiles no `findAndModify` with neither `update` nor
+      `remove` or with an undefined `$$variable`, no `createIndexes`
+      refused for a spec, no `create` refused for its capped options, no
+      write to a `system.` namespace it does not take, no `explain` of an
+      `insert`, no `dbStats` of `scale: 0`; and it profiles a
+      `$querySettings` stage refused for a field. This server does each the
+      other way (`profiler::refused_unprofiled` reads the reply's message
+      for some of these). Each is run, and logged, on both. Found while
+      working RM-386, 2026-11-13.
+      Verify: tests/backlog/test_rm_found_rm386.py::test_a_command_refused_as_it_runs_is_profiled_as_mongod_profiles_it
+      Backlog-ID: RM-607
+- [ ] **An `update` whose statement fails writes one `Slow query` line,
+      not two.** mongod 8.2.11 writes the statement's line (`<db>.c`) and
+      the command's (`<db>.$cmd`) for an `update` whose one statement is
+      refused as it parses its update (`u: {$bogus: {a: 1}}`, a write
+      error in an `ok: 1` reply); this server writes the command's alone.
+      Found while working RM-386, 2026-11-13.
+      Verify: tests/backlog/test_rm_found_rm386.py::test_an_update_with_a_failed_statement_writes_two_lines
+      Backlog-ID: RM-608
 - [ ] **Operations this server runs another way than mongod's plan say
       less.** Since RM-023 a read or a write's read that a stream runs as
       mongod's plan counts its keys and documents examined, and since
@@ -1231,30 +1308,6 @@ These are explicit non-goals. Don't add them without a reason.
   2026-11-07, 2026-11-10 and 2026-11-13). Found with RM-302.
   Backlog-ID: RM-305
   Verify: tests/backlog/test_rm_001_028.py::test_startup_writes_wiredtigers_own_messages
-- [ ] **A command its handler fails to parse is counted as a connection's
-  first command.** mongod 8.2.11 writes `Received first command on ingress
-  connection` (6788700) when a command is about to run: one its IDL parse,
-  its generic arguments, its concerns, `maxTimeMS` or its authorization
-  refuses is passed over, and the next command writes the line, timed from
-  the `hello`. This server writes it at the same point of its dispatcher
-  (since 2026-11-10), so the checks the dispatcher makes are passed over;
-  but its handlers parse their own fields inside the run, so a command
-  refused there -- `{find: "c", bogus: 1}` (40415), `{insert: "c",
-  documents: 1}` (14), an unknown pipeline stage (40324), `lsid: 1` (14),
-  and the like -- still counts. The fix is a parse step for each handler
-  ahead of its run, which the line can follow (measured 2026-11-10). Found
-  with RM-305.
-  (This was RM-481: A command refused as it parses writes a `Slow query`
-  line.) mongod 8.2.1 writes no line for a command its IDL parse refuses -- a
-  mistyped or missing field (14, 40414: `renameCollection: 5`, no `to`), an
-  unknown one (40415: `find` with `bogus`), a collection name that is not a
-  string (73: `find: 5`, `count: 5`), an unknown pipeline stage (40324: an
-  `aggregate` of a collection or a view, measured 8.2.11 while working RM-380)
-  -- as the operation never ran; this server writes one for each, since its
-  handlers parse and run in one step (as RM-386 has it). Found while working
-  RM-378, 2026-11-09.
-  Backlog-ID: RM-386
-  Verify: tests/backlog/test_rm_001_028.py::test_a_command_its_handler_fails_to_parse_is_not_the_first_command, tests/backlog/test_rm_slow_query_namespace.py::test_a_command_that_fails_to_parse_writes_no_line
 ### 7.091 mongod's slot-based engine (SBE) -- 2026-10-23
 
 mongod 8.2 runs the front of a pipeline in its slot-based engine when it can

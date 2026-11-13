@@ -919,18 +919,35 @@ fn count_skip(value: Option<&Bson>) -> i64 {
     }
 }
 
+/// A write command as mongod's IDL parses it, before it runs: its fields,
+/// their types, its statements' shape and the batch's size. A command
+/// refused here never ran -- no `Slow query` line, no profile entry, not a
+/// connection's first command (RM-386, measured 8.2.11). `sequence` is an
+/// insert's documents as the wire sent them, when it sent them apart.
+pub(crate) fn write_parse(
+    command: &str,
+    doc: &Document,
+    sequence: Option<&[Vec<u8>]>,
+) -> Result<(), CommandError> {
+    if command == "insert" {
+        coll_arg(doc, "insert")?;
+        argtypes::require_object(doc, "writeConcern", "insert.writeConcern")?;
+    }
+    match write_parse_problem(command, doc, sequence) {
+        Some(problem) => Err(problem),
+        None => Ok(()),
+    }
+}
+
 pub fn insert(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
+    write_parse("insert", doc, ctx.raw_insert_documents.as_deref())?;
     let coll = coll_arg(doc, "insert")?;
     if let Some(e) = crate::admin::invalid_write_namespace(&ctx.db_name, &coll) {
         return Ok(e.into_reply());
     }
-    argtypes::require_object(doc, "writeConcern", "insert.writeConcern")?;
     // Take the raw-BSON write side-channel first, releasing the `&mut` borrow
     // before the immutable `storage()` / `db_name` borrows below.
     let raw_docs = ctx.raw_insert_documents.take();
-    if let Some(problem) = write_parse_problem("insert", doc, raw_docs.as_deref()) {
-        return Err(problem);
-    }
     let db = ctx.db_name.clone();
     let storage = ctx.storage()?;
     let ordered = bool_field(doc, "ordered", true);
@@ -1183,12 +1200,10 @@ pub fn insert(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
 
 /// `delete` — batch delete, one entry per `{q, limit}` spec.
 pub fn delete(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
+    write_parse("delete", doc, None)?;
     let coll = coll_arg(doc, "delete")?;
     if let Some(e) = crate::admin::invalid_write_namespace(&ctx.db_name, &coll) {
         return Ok(e.into_reply());
-    }
-    if let Some(problem) = write_parse_problem("delete", doc, None) {
-        return Err(problem);
     }
     let deletes = write_statements(doc, "deletes");
     let storage = ctx.storage()?;
@@ -1542,9 +1557,11 @@ pub fn delete(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     Ok(reply)
 }
 
-/// `count` — count matching documents, honouring `skip` / `limit` clamping the
-/// way mongod's `count` command (and the legacy `cursor.count()`) does.
-pub fn count(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
+/// `count` as mongod's IDL parses it, before the command runs: its fields,
+/// their types, `limit` and `skip`, and a namespace mongod refuses as it
+/// parses. A command refused here never ran (RM-386, measured 8.2.11); the
+/// hint and the query are read as it runs.
+pub(crate) fn count_parse(doc: &Document) -> Result<(), CommandError> {
     let coll = coll_arg(doc, "count")?;
     argtypes::require_object(doc, "query", "count.query")?;
     argtypes::require_object(doc, "collation", "count.collation")?;
@@ -1585,7 +1602,7 @@ pub fn count(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
             format!("Collection names cannot start with '.': {coll}"),
         ));
     }
-    let limit = count_limit(doc.get("limit"))?;
+    count_limit(doc.get("limit"))?;
     let skip = count_skip(doc.get("skip"));
     if skip < 0 {
         return Err(CommandError::new(
@@ -1594,6 +1611,16 @@ pub fn count(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
             format!("BSON field 'skip' value must be >= 0, actual value '{skip}'"),
         ));
     }
+    Ok(())
+}
+
+/// `count` — count matching documents, honouring `skip` / `limit` clamping the
+/// way mongod's `count` command (and the legacy `cursor.count()`) does.
+pub fn count(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
+    count_parse(doc)?;
+    let coll = coll_arg(doc, "count")?;
+    let limit = count_limit(doc.get("limit"))?;
+    let skip = count_skip(doc.get("skip"));
     argtypes::require_natural_hint(argtypes::given_hint(doc))?;
     // An undefined `$$variable` is a PARSE error (17276), not the storage
     // layer's generic "unsupported construct" BadValue.
