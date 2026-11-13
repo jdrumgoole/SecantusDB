@@ -2228,27 +2228,29 @@ fn streamed<T>(
     let mut out = None;
     {
         let stream = &mut read.stream;
-        let mut source = |want: usize, max_bytes: usize| {
+        let mut source = |want: usize, max_bytes: usize, boundaries: bool| {
             if failed.is_some() {
                 return Pulled {
                     rows: Vec::new(),
+                    yields: Vec::new(),
                     exhausted: true,
                     stopped: true,
                 };
             }
-            let (batch, error) = stream.pull_for_write(storage, want, max_bytes);
-            let (rows, exhausted) = match batch {
+            let (batch, error) = stream.pull_for_write(storage, want, max_bytes, boundaries);
+            let (rows, yields, exhausted) = match batch {
                 Ok(batch) => {
                     keys_examined += batch.keys_examined;
                     docs_examined += batch.docs_examined;
                     (
                         batch.rids.into_iter().zip(batch.docs).collect(),
+                        batch.yields,
                         batch.exhausted,
                     )
                 }
                 Err(e) => {
                     failed = Some(e);
-                    (Vec::new(), true)
+                    (Vec::new(), Vec::new(), true)
                 }
             };
             if error.is_some() {
@@ -2256,6 +2258,7 @@ fn streamed<T>(
             }
             Pulled {
                 rows,
+                yields,
                 exhausted,
                 stopped: failed.is_some(),
             }

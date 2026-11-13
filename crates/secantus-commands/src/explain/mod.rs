@@ -2505,6 +2505,8 @@ fn unexplainable(name: &str) -> CommandError {
 
 fn explain_reply(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     let _budgets = secantus_core::memlimit::with_budgets(crate::aggregate::budgets_of(ctx));
+    let _spill =
+        secantus_core::spill_table::with_tables(ctx.storage().ok().and_then(|s| s.spill_tables()));
     let Parsed {
         inner,
         verbosity,

@@ -13,6 +13,7 @@
 //! `delete_matching` / `count_matching`).
 
 use bson::{Bson, Document};
+pub use secantus_core::spill_table::SpillTables;
 // Re-exported so trait implementors (the WT adapter) can name the collation type
 // without a direct `secantus-core` dependency.
 pub use secantus_core::collation::Collation;
@@ -30,6 +31,9 @@ pub struct Pulled {
     /// The rows the read matched, in its order, each with the bytes it
     /// matched it as.
     pub rows: Vec<(i64, Vec<u8>)>,
+    /// The statement's yields (`secantus_core::deadline::yields`) when each
+    /// row was read, beside `rows`.
+    pub yields: Vec<i64>,
     /// The read is at its end: no rows follow these.
     pub exhausted: bool,
     /// The read stopped part-way (an interrupt, a filter that failed on a
@@ -333,6 +337,13 @@ pub struct StoreOpening {
 /// The storage operations the command handlers depend on. Bytes at the seam:
 /// documents go in/out as `bson::encode` bytes, as they come off the WT cursor.
 pub trait Storage: Send + Sync {
+    /// The spill engine aggregation stages spill to, as mongod 8.2's
+    /// (`<dbpath>/_tmp/spilldb`, RM-325). `None` (the default, for test
+    /// fakes): a stage keeps its own file.
+    fn spill_tables(&self) -> Option<std::sync::Arc<dyn SpillTables>> {
+        None
+    }
+
     /// True when the store is non-persistent (WiredTiger `in_memory=true`).
     ///
     /// Read by `serverStatus.storageEngine.persistent`. Defaults to `false`
@@ -883,16 +894,19 @@ pub trait Storage: Send + Sync {
     }
 
     /// Run `f` with the write it makes drawing its candidates from
-    /// `source` as it writes them ([`Pulled`]). Default: every row the
-    /// source matches first, as [`Self::with_candidate_order`] takes them.
+    /// `source` as it writes them ([`Pulled`]): `source(want, max_bytes,
+    /// boundaries)`, `boundaries` asking the read to yield where mongod's
+    /// executor does between a batched delete's documents. Default: every
+    /// row the source matches first, as [`Self::with_candidate_order`]
+    /// takes them.
     fn with_candidate_source(
         &self,
-        source: &mut dyn FnMut(usize, usize) -> Pulled,
+        source: &mut dyn FnMut(usize, usize, bool) -> Pulled,
         f: &mut dyn FnMut(),
     ) {
         let mut order = Vec::new();
         loop {
-            let pulled = source(0, usize::MAX);
+            let pulled = source(0, usize::MAX, false);
             // A read that stopped writes nothing here: the caller answers
             // its error.
             if pulled.stopped {

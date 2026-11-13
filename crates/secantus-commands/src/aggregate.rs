@@ -611,6 +611,7 @@ pub fn aggregate(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     let _disk_use =
         secantus_core::memlimit::allow_disk_use(doc.get_bool("allowDiskUse").unwrap_or(true));
     let _budgets = secantus_core::memlimit::with_budgets(budgets_of(ctx));
+    let _spill = secantus_core::spill_table::with_tables(storage.spill_tables());
     // A standalone has no cluster time for `$$CLUSTER_TIME` to read.
     if let Some(e) =
         crate::util::cluster_time_unavailable(ctx.replica_set_name.is_none(), &pipeline)

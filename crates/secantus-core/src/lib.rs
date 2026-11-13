@@ -51,6 +51,7 @@ mod snappy;
 pub mod sorter;
 pub mod sortkey;
 mod spill_file;
+pub mod spill_table;
 mod stl;
 pub(crate) mod timelib;
 pub mod update;

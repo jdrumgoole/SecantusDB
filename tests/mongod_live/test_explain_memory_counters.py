@@ -172,8 +172,6 @@ def test_a_window_over_its_budget_peaks_before_it_spills(rust_mongo: Any, mongod
             stage = _explained(db, WINDOWS["leading, sorted"])["stages"][0]
         finally:
             client.admin.command({"setParameter": 1, knob: 104_857_600})
-        # The spill file's size is RM-325's.
-        stage.pop("spilledDataStorageSize")
         return stage
 
     same(answer(rust_mongo), answer(mongod))

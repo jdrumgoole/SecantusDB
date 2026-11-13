@@ -75,6 +75,7 @@ pub mod findandmodify;
 pub mod ftdc;
 pub mod handshake;
 mod hostinfo;
+pub use hostinfo::mem_size_mb;
 mod interrupt;
 mod lastop;
 mod list_catalog;

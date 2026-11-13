@@ -1460,19 +1460,20 @@ about forty such points; these are the ones measured.
       working RM-390, 2026-11-13.
       Verify: tests/backlog/test_rm_found_rm390.py::test_a_profile_entry_counts_what_it_examined_as_int32
       Backlog-ID: RM-601
-- [ ] **A batched deleteMany tests each document's filter once, where
-      mongod tests it twice.** mongod's batched multi-delete
-      (`batchUserMultiDeletes`, on by default) tests a document when it
-      stages it and again when it deletes the batch, the snapshot having
-      moved (`ensureStillMatches`): a deleteMany of one document whose
-      filter takes 1.0 s to test takes 1.95 s, three take 5.9 s, and with
-      the parameter off they take 0.98 s and 2.95 s (mongod 8.2.11,
-      2026-11-10, a one-member replica set). This server tests it once,
-      so a deleteMany fits in a `maxTimeMS` mongod runs out of (code 50).
-      Found while closing RM-391, whose once-per-document rule holds for
-      every other write.
-      Backlog-ID: RM-501
-      Verify: tests/backlog/test_rm_found_2026_11_10_rm391.py::test_a_batched_delete_many_tests_each_document_twice
+- [ ] **A write's profile entry counts no yields, where mongod counts
+      each.** mongod 8.2.11's executor yields once its yield period (10 ms)
+      has passed, before a `work()` call, and its `system.profile` entry
+      says how often: a deleteMany of three documents that take half a
+      second each to test has `numYield: 5` (before staging the second and
+      third, before the call that finds the end, and twice inside the
+      batch, which it splits once deleting it has run
+      `batchedDeletesTargetBatchTimeMS`, 5 ms; measured 2026-11-13). This
+      server's entry for it says `numYield: 0`, although since RM-501 a
+      batched delete yields at those boundaries; the profiler writes a
+      literal 0 for several commands (`profiler/record.rs`), not probed
+      one by one. Found while working RM-501.
+      Verify: tests/backlog/test_rm_found_rm501.py::test_a_delete_many_profile_entry_counts_its_yields
+      Backlog-ID: RM-609
 
 ### 7.086 The Rust MongoDB server, audited -- 2026-10-20
 
@@ -1490,47 +1491,71 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
   246 SnapshotUnavailable, by name, rather than answer as of now; without
   `atClusterTime` it reads the latest data, which is correct. `secantusd-rs`
   creates its stores the other way, mongod's (RM-210).
-- [ ] **A `$setWindowFields`'s spill takes this server's size on disk,
-      not mongod's.** A sort's and a classic `$group`'s spill files are
-      mongod 8.2's sorter files to the byte (`test_spill_file_storage_size`,
-      `test_group_spill_storage_size`). mongod spills a `$setWindowFields`'s
-      partition cache to a WiredTiger temporary table
-      (`spilledDataStorageSize: 4096`), where this server writes a file of
-      its own (310800); the engine crate cannot reach a WiredTiger table
-      today. Two more spills are this server's and unmeasured: an SBE
-      `$group` (mongod: a WiredTiger record store; its budget is not
-      settable at runtime) and a `$median` / `$percentile` state (mongod
-      writes its t-digest; this server keeps, and writes, the values).
-      Backlog-ID: RM-325
-      Verify: tests/backlog/test_rm_found_2026_10_26.py::test_spill_storage_size
-- [ ] **An SBE sort keeps a field only its key reads.** mongod 8.2.11's
-      slot-based sort in front of `{$group: {_id: "$k", f: {$first:
-      "$s"}}}` keeps `k` and `s` beside its key `n`, a row of 1064 bytes for
-      documents of a 1000-byte `s`, and over 300 of them under a 50000-byte
-      budget counts 274512 in `totalBytesSorted` and
-      `sortTotalDataSizeBytes` (six spills of 43 rows while reading). This
-      server's row also keeps `n` (1073), so it counts 276834. Found
-      2026-11-10 (RM-398).
-      Verify: tests/backlog/test_rm_326_sort_counts.py::test_sbe_sort_row_leaves_out_a_field_only_the_key_reads
-      Backlog-ID: RM-504
-- [ ] **An SBE sort's spilled records are a byte longer than mongod's.**
-      mongod 8.2.11's slot-based sort in front of a `$group`, over 300
-      documents of a 1000-byte `s` under a 50000-byte budget, writes 13 runs
-      of 900 records in 927900 bytes (1031 a record); this server writes the
-      same runs in 928800 (1032). Found 2026-11-10 (RM-398).
-      Verify: tests/backlog/test_rm_326_sort_counts.py::test_sbe_sort_spilled_bytes
-      Backlog-ID: RM-506
-- [ ] **A `range` window's `"current"` bound takes in tied documents.**
-      mongod 8.2.1 reads `"current"` in a `range` window as the document
-      answered (`getEndpointsRangeBased`: offset 0), so over `n` of 1, 1,
-      2, 2, 2, 3 a `$push` of `_id` over `["unbounded", "current"]` gives
-      `[0], [0, 1], [0, 1, 2], ...`; this server bounds the window by the
-      current sort value (`range_window_bounds`), taking in every document
-      tied with it: `[0, 1], [0, 1], [0, 1, 2, 3, 4], ...`. The same for a
-      `"current"` lower bound. A wrong answer for any sort key with ties.
-      Found 2026-11-10 (RM-404).
-      Verify: tests/backlog/test_rm_found_2026_11_10_rm404.py::test_a_range_windows_current_is_the_document
-      Backlog-ID: RM-508
+- [ ] **A spill the spill engine writes out takes this server's size on
+      disk, not mongod's.** A `$setWindowFields` spills to a table of a
+      second WiredTiger instance at `<dbpath>/_tmp/spilldb`, as mongod 8.2's
+      does (RM-325's fix), and while the table stays in that engine's cache
+      both report the 4096 bytes WiredTiger creates its file with. Past
+      about 14 MB mongod writes pages out, the same every run: 73728 bytes
+      for 28 MB, 204800 for 60 MB (mongod 8.2.11, 2026-11-13). Its tables
+      are zstd-compressed at level -7 (`spillWiredTigerBlockCompressor`),
+      which the vendored WiredTiger is not built with, and it is WiredTiger
+      12.0; this server's uncompressed table leaves its file at 4096 or
+      writes megabytes (2420736 at 60 MB), as its eviction threads happen
+      to run. Found 2026-11-13 working RM-325.
+      Verify: tests/backlog/test_rm_found_2026_11_13_rm325.py::test_a_window_spill_the_engine_writes_out_is_mongods_size
+      Backlog-ID: RM-611
+- [ ] **An SBE `$group`'s budget cannot be set at startup, and its spill
+      is this server's.** mongod 8.2.11 takes
+      `internalQuerySlotBasedExecutionHashAggApproxMemoryUseInBytesBeforeSpill`
+      on its command line (not at runtime), and at 50000 spills a slot-based
+      `$group` `$push` of 300 1000-byte strings 7 times, 312300 bytes, into
+      a table of its spill engine (`groupSpilledDataStorageSize` 4096).
+      `secantusd-rs` refuses the parameter ("Unknown --setParameter"), so
+      the SBE `$group`'s budget is always 100 MiB and what it spills is
+      unmeasured. Found 2026-11-13 working RM-325 (its remainder).
+      Verify: tests/backlog/test_rm_found_2026_11_13_rm325.py::test_an_sbe_group_spills_as_mongods
+      Backlog-ID: RM-612
+- [ ] **A `$median` / `$percentile` spills the values, where mongod spills
+      its t-digest.** A classic `$group` of `{$median: {input: "$n", method:
+      "approximate"}}` over 300 groups of one value each, under a 5000-byte
+      budget, spills 84000 bytes on mongod 8.2.11 (`groupSpilledBytes`,
+      its accumulator's t-digest) and 100800 here, which keeps and writes the
+      values. The spill count is RM-502's. Found 2026-11-13 working RM-325
+      (its remainder).
+      Verify: tests/backlog/test_rm_found_2026_11_13_rm325.py::test_a_median_spills_mongods_state
+      Backlog-ID: RM-613
+- [ ] **`serverStatus` has no `spillWiredTiger` section.** mongod 8.2.11
+      reports its spill engine's statistics there from startup (`uri`
+      `"statistics:"`, `storageSize` 0 while nothing is spilled, `version`,
+      and the block-manager and cache counters;
+      `spillWiredTigerServerStatusVerbosity` 1). This server opens its spill
+      engine at the first spill and reports none of it. Found 2026-11-13
+      working RM-325.
+      Verify: tests/backlog/test_rm_found_2026_11_13_rm325.py::test_server_status_reports_the_spill_engine
+      Backlog-ID: RM-614
+- [ ] **An SBE sort's whole-document row leaves out the fields read beside it.**
+      mongod 8.2.11's slot-based sort in front of `{$group: {_id: "$k", f:
+      {$first: "$$ROOT"}}}`, over 300 documents of a 1000-byte `s` under a
+      50000-byte budget, spills rows of the whole document AND `k` (the
+      result slot and the named slot the `$group` reads): 956700 bytes over
+      900 records. This server's row holds the document alone (952200, 5
+      bytes a record fewer): `group::downstream_fields` answers `None` for
+      "whole documents" and drops the fields read by name. Found 2026-11-13
+      (RM-506).
+      Verify: tests/backlog/test_rm_found_2026_11_13_rm506.py::test_a_whole_document_row_keeps_the_fields_read_beside_it
+      Backlog-ID: RM-615
+- [ ] **An SBE sort counts no memory for a field a document lacks.**
+      mongod 8.2.11 counts every slot of an SBE sort's row in the memory it
+      holds, a missing field's `Nothing` included (`getApproximateSize`:
+      its tag and value, 9 bytes); this server counts only the fields a
+      document has (`sorter::doc_size`). With `t` on half of 300 documents
+      of a 1000-byte `s`, `[{$sort: {n: 1}}, {$group: {_id: "$k", f:
+      {$first: "$t"}, g: {$first: "$s"}}}]` under 50000 bytes reports
+      `sortTotalDataSizeBytes` 276834 on mongod and 275673 here (129 slots of
+      9). Found 2026-11-13 (RM-506).
+      Verify: tests/backlog/test_rm_found_2026_11_13_rm506.py::test_a_missing_field_counts_its_slot
+      Backlog-ID: RM-616
 - [ ] **`$integral` and the covariances count no memory in a window.**
       mongod 8.2.1 counts what they hold: `maxFunctionMemoryUsageBytes`
       3888 for a `["unbounded", 4]` `range` `$integral` over 40 documents,

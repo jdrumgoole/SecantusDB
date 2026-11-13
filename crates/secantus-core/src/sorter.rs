@@ -208,6 +208,12 @@ struct Run {
     /// in the file, which holds what mongod's does, but kept so a caller
     /// can carry what it keeps beside each document through the sort.
     positions: Vec<i64>,
+    /// An SBE sort's row slots ([`sbe_slots`]), and each record's kept
+    /// fields as places in them, in the order its document held them: the
+    /// row holds the values in its slots' order, and the document comes
+    /// back as it went in.
+    slots: Option<Vec<String>>,
+    orders: Vec<Vec<usize>>,
 }
 
 impl Drop for Run {
@@ -238,23 +244,45 @@ fn kept(doc: &Document, sizing: &Sizing) -> Document {
         .collect()
 }
 
+/// The slots of an SBE sort's row of kept values, by name
+/// (`PlanStageSlots::getRequiredNamesInOrder` sorts them, and the scan
+/// makes their slots in that order), or `None` when the stages after it
+/// read the whole document, which the row then holds as its one value.
+fn sbe_slots(sizing: &Sizing) -> Option<Vec<String>> {
+    let fields = sizing.fields?;
+    let mut names: BTreeSet<&String> = fields.iter().collect();
+    names.extend(sizing.added.into_iter().flatten());
+    Some(names.into_iter().cloned().collect())
+}
+
 /// One record as this sorter's mongod counterpart serializes it: the key
 /// as a `Value` (an array of them for a compound sort), then the document
-/// as that sorter keeps it -- the query layer's (and SBE's) as BSON, a
-/// pipeline `$sort`'s as a `Document`, `$bucketAuto`'s inside the
-/// `{output, generatedSortKey}` document it sorts.
+/// as that sorter keeps it -- the query layer's as BSON, a pipeline
+/// `$sort`'s as a `Document`, `$bucketAuto`'s inside the `{output,
+/// generatedSortKey}` document it sorts. SBE's sorter sorts rows: the key's
+/// values, then the kept fields' in `slots` (RM-506).
 fn write_record(
     (keys, d, pos): &Held,
     sizing: &Sizing,
+    slots: Option<&[String]>,
     out: &mut Vec<u8>,
 ) -> Result<(), spill_file::Error> {
+    if sizing.source == SortSource::Sbe {
+        spill_file::write_sbe_row(&keys.iter().map(Some).collect::<Vec<_>>(), out)?;
+        return match slots {
+            Some(names) => {
+                spill_file::write_sbe_row(&names.iter().map(|n| d.get(n)).collect::<Vec<_>>(), out)
+            }
+            None => spill_file::write_sbe_row(&[Some(&Bson::Document(d.clone()))], out),
+        };
+    }
     match keys.as_slice() {
         [one] => spill_file::write_value(one, out)?,
         many => spill_file::write_value(&Bson::Array(many.to_vec()), out)?,
     }
     match sizing.source {
         SortSource::QueryLayer => spill_file::write_bson(d, out),
-        SortSource::Sbe => spill_file::write_bson(&kept(d, sizing), out),
+        SortSource::Sbe => unreachable!("an SBE row is written above"),
         SortSource::BucketAuto => spill_file::write_document(
             &doc! { "output": kept(d, sizing), "generatedSortKey": *pos },
             out,
@@ -279,7 +307,11 @@ fn read_record(
     at: &mut spill_file::Cursor,
     arity: usize,
     source: SortSource,
+    sbe: Option<(&[String], &[usize])>,
 ) -> Result<Held, spill_file::Error> {
+    if source == SortSource::Sbe {
+        return read_sbe_record(at, arity, sbe);
+    }
     let key = spill_file::read_value(at)?;
     let keys = match (arity, key) {
         (1, k) => vec![k],
@@ -292,7 +324,8 @@ fn read_record(
         }
     };
     let (d, pos) = match source {
-        SortSource::QueryLayer | SortSource::Sbe => (spill_file::read_bson(at)?, 0),
+        SortSource::QueryLayer => (spill_file::read_bson(at)?, 0),
+        SortSource::Sbe => unreachable!("an SBE row is read above"),
         SortSource::BucketAuto => {
             let mut w = spill_file::read_document(at)?;
             match (w.remove("output"), w.remove("generatedSortKey")) {
@@ -311,6 +344,44 @@ fn read_record(
         SortSource::Member => (member_doc(spill_file::read_member(at)?), 0),
     };
     Ok((keys, d, pos))
+}
+
+/// The record a [`write_record`] wrote for an SBE sort: `sbe` holds the
+/// row's slots and this record's fields as places in them, in its order.
+fn read_sbe_record(
+    at: &mut spill_file::Cursor,
+    arity: usize,
+    sbe: Option<(&[String], &[usize])>,
+) -> Result<Held, spill_file::Error> {
+    let bad = |detail: &str| spill_file::Error {
+        what: "read",
+        detail: detail.into(),
+    };
+    let keys = spill_file::read_sbe_row(at)?
+        .into_iter()
+        .collect::<Option<Vec<Bson>>>()
+        .filter(|k| k.len() == arity)
+        .ok_or_else(|| bad("a record whose key is not the sort's"))?;
+    let mut values = spill_file::read_sbe_row(at)?;
+    let d = match sbe {
+        Some((names, order)) => {
+            if values.len() != names.len() {
+                return Err(bad("a row that is not the sort's"));
+            }
+            let mut d = Document::new();
+            for &i in order {
+                if let Some(v) = values.get_mut(i).and_then(Option::take) {
+                    d.insert(names[i].clone(), v);
+                }
+            }
+            d
+        }
+        None => match (values.pop(), values.is_empty()) {
+            (Some(Some(Bson::Document(d))), true) => d,
+            _ => return Err(bad("a row without its document")),
+        },
+    };
+    Ok((keys, d, 0))
 }
 
 /// `NoLimitSorter::sort`: what the sorter holds, in the order it came,
@@ -381,11 +452,24 @@ fn write_run(items: impl Iterator<Item = Held>, sizing: &Sizing) -> R<Run> {
         records: 0,
         arity: 1,
         positions: Vec::new(),
+        slots: (sizing.source == SortSource::Sbe)
+            .then(|| sbe_slots(sizing))
+            .flatten(),
+        orders: Vec::new(),
     };
     for item in items {
         run.arity = item.0.len();
         run.positions.push(item.2);
-        write_record(&item, sizing, out.buffer()).map_err(|e| io_error(&path, e))?;
+        if let Some(names) = &run.slots {
+            run.orders.push(
+                item.1
+                    .keys()
+                    .filter_map(|k| names.binary_search(k).ok())
+                    .collect(),
+            );
+        }
+        write_record(&item, sizing, run.slots.as_deref(), out.buffer())
+            .map_err(|e| io_error(&path, e))?;
         out.added().map_err(|e| io_error(&path, e))?;
         run.records += 1;
     }
@@ -413,6 +497,8 @@ struct Reader<'a> {
     input: spill_file::Reader,
     path: PathBuf,
     positions: std::slice::Iter<'a, i64>,
+    slots: Option<&'a [String]>,
+    orders: std::slice::Iter<'a, Vec<usize>>,
     arity: usize,
     source: SortSource,
 }
@@ -423,6 +509,8 @@ impl<'a> Reader<'a> {
             input: spill_file::Reader::open(&run.path).map_err(|e| io_error(&run.path, e))?,
             path: run.path.clone(),
             positions: run.positions.iter(),
+            slots: run.slots.as_deref(),
+            orders: run.orders.iter(),
             arity: run.arity,
             source,
         })
@@ -433,9 +521,24 @@ impl<'a> Reader<'a> {
             return Ok(None);
         };
         let (arity, source) = (self.arity, self.source);
+        let sbe = match self.slots {
+            Some(names) => {
+                let order = self.orders.next().ok_or_else(|| {
+                    io_error(
+                        &self.path,
+                        spill_file::Error {
+                            what: "read",
+                            detail: "a record without its fields' order".into(),
+                        },
+                    )
+                })?;
+                Some((names, order.as_slice()))
+            }
+            None => None,
+        };
         let (keys, d, _) = self
             .input
-            .record(|at| read_record(at, arity, source))
+            .record(|at| read_record(at, arity, source, sbe))
             .map_err(|e| io_error(&self.path, e))?;
         Ok(Some((keys, d, pos)))
     }
@@ -1485,6 +1588,45 @@ mod tests {
         assert_eq!(counted(50_000, None), (true, 274_512));
         assert_eq!(counted(memlimit::MAX_BYTES, None), (false, 0));
         assert_eq!(counted(memlimit::MAX_BYTES, Some(50)), (false, 0));
+    }
+
+    #[test]
+    fn an_sbe_sort_spills_rows_of_values() {
+        // mongod 8.2.11, `[{$sort: {n: 1}}, {$group: {_id: "$k", f: {$first:
+        // "$s"}}}]` over 300 documents of {_id, k, s: 1000 x's, n} under
+        // 50000 bytes: 13 runs, 900 records, 927900 bytes -- 1031 a record:
+        // the key's row (8 + 1 + 4) and `k`'s and `s`'s (8 + 1 + 4 + 1 + 4 +
+        // 1000) (RM-506). The row holds them by name; each document comes
+        // back with its fields in its own order (`s` before `k` here).
+        let fields: BTreeSet<String> = ["k", "s"].iter().map(|f| f.to_string()).collect();
+        let docs = (0..300)
+            .map(|i| {
+                let d = doc! { "_id": i, "s": "x".repeat(1000), "k": i % 7, "n": i };
+                (vec![Bson::Int32(i)], d)
+            })
+            .collect::<Vec<_>>();
+        let sizing = Sizing {
+            sizes: None,
+            source: SortSource::Sbe,
+            fields: Some(&fields),
+            added: None,
+            budget: 50_000,
+        };
+        let (out, report) = memlimit::captured(|| blocking_sort(docs, &cmp, &sizing, None));
+        let out = out.unwrap();
+        assert_eq!(
+            (
+                report.sort_spills,
+                report.sort_spilled_records,
+                report.sort_spilled_bytes
+            ),
+            (13, 900, 927_900)
+        );
+        for (i, (k, d)) in out.iter().enumerate() {
+            assert_eq!(k, &vec![Bson::Int32(i as i32)]);
+            assert_eq!(d, &doc! { "s": "x".repeat(1000), "k": i as i32 % 7 });
+            assert_eq!(d.keys().collect::<Vec<_>>(), ["s", "k"]);
+        }
     }
 
     #[test]

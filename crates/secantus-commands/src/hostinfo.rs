@@ -235,3 +235,9 @@ impl Host {
         platform::read()
     }
 }
+
+/// The machine's memory in megabytes (`hostInfo`'s `system.memSizeMB`),
+/// `None` where it cannot be read.
+pub fn mem_size_mb() -> Option<i64> {
+    Host::read().mem_size_mb
+}
