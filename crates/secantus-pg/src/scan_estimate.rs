@@ -5090,15 +5090,15 @@ fn with_explain_patterns(patterns: &[secantus_pgplan::ScanPattern]) -> ExtraPatt
     })
 }
 
-/// The LIKE / ILIKE pattern behind a lowered `$regex` clause on `field`:
-/// `(pattern, insensitive)`, or `None` where this EXPLAIN holds none that
-/// lowers to it (a regex operator's, say).
+/// The LIKE / ILIKE or regex-match pattern behind a lowered `$regex`
+/// clause on `field`: `(pattern, insensitive, is_regex)`, or `None` where
+/// this EXPLAIN holds none that lowers to it.
 pub(crate) fn explain_pattern(
     field: &str,
     regex: &str,
     insensitive: bool,
     negated: bool,
-) -> Option<(String, bool)> {
+) -> Option<(String, bool, bool)> {
     EXPLAIN_PATTERNS.with(|c| {
         c.borrow()
             .iter()
@@ -5108,7 +5108,7 @@ pub(crate) fn explain_pattern(
                     && p.insensitive == insensitive
                     && p.negated == negated
             })
-            .map(|p| (p.pattern.clone(), p.insensitive))
+            .map(|p| (p.pattern.clone(), p.insensitive, p.is_regex))
     })
 }
 

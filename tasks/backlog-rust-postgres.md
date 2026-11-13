@@ -1602,38 +1602,6 @@ a regression test.
       frequencies match (found while working RP-313).
       Verify: tests/backlog/test_rp_catalog_reads.py::test_a_catalog_columns_correlation_follows_the_heap
       Backlog-ID: RP-358
-- [ ] **EXPLAIN prints no estimate for some Nested Loops.** The nested
-      loops of two tables' scans joined by inequalities, `<>` and the
-      conjuncts below are priced as PostgreSQL 15.19 plans them, and since
-      2026-11-13 so is a left-deep join of three to eight tables' scans by
-      `<`, `<=`, `>`, `>=` or `<>` over tables with no index
-      (`standard_join_search`'s levels and bushy pairs, each relation's
-      path list), and since 2026-11-13 one where a table with an index and
-      no filter of its own is linked to one other table, its index scan
-      parameterized by that table's rows the inner (`e join e e2 on e.a <
-      e2.a join k on e2.a < k.a`: a Memoize keyed by `e2.a` over the
-      Index Scan). Still zeros (PostgreSQL 15.19 on a private cluster,
-      `e` 1,000 analysed rows): a LEFT join's ON conjunct over its
-      preserved side that is a regex match (`e.b ~ 'v1'`, whose
-      selectivity is RP-423's). An indexed table linked to two or more
-      tables (paths parameterized by each, and joins parameterized by the
-      rest) is zeros too; PostgreSQL orders each such join measured so
-      far otherwise, which is RP-919.
-      Since 2026-11-13 an IN list of constants there is priced (its
-      operator over half the list, or from nine constants PostgreSQL's
-      hashed list: one hash and one comparison a row, the table's build at
-      the join's startup) and estimated; one inside an `OR` is not, as a
-      lone scan's is not (RP-028). So is a cast of a column to an integer
-      or string type compared with a constant (`e.a::text <> '5'`), there
-      and on a lone scan, and a `<>` of three or more tables' join whose
-      operands are cast or coerced (`e2.a::numeric <> e3.a::numeric`). A
-      binary-coercible cast is RP-912; a join PostgreSQL orders otherwise,
-      RP-919. Since 2026-11-13 an inequality between the inner's key and a
-      call of a built-in over the outer row is the inner's Index Cond, the
-      call's `procost` its startup, under the Memoize PostgreSQL keys by
-      the call.
-      Backlog-ID: RP-354
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a left join's on conjunct over the preserved side is a regex match]
 - [ ] **An index over a weakly correlated column is mispriced as a nested
       loop's inner, and read for a range PostgreSQL scans the heap for.**
       `k2 (x int, y int)` holds `g % 100` in `y` for 1,000 rows, indexed
@@ -1933,25 +1901,28 @@ a regression test.
       Backlog-ID: RP-402
       Verify: tests/backlog/test_rp_explain_costs.py::test_plan[comma join with a repeated join equality], tests/backlog/test_rp_explain_costs.py::test_plan[comma join with a repeated constant equality]
 - [ ] **EXPLAIN prints no estimate for a scan filtered by a function
-      call, a pattern over an expression, a LIKE over a table never
-      analysed, or a regex.** Since RP-404 a comparison of integer or text
+      call, a pattern over an expression, or a pattern over a table never
+      analysed.** Since RP-404 a comparison of integer or text
       arithmetic with a constant, and a LIKE / ILIKE of an analysed string
       column, are estimated as PostgreSQL 15.19 estimates them. Still
       zeros: `select * from e where abs(a) > 5` (PostgreSQL `rows=333`,
       `cost=0.00..20.00`: `abs` is one function of `procost` 1, which is
       not modelled for any function), `lower(b) like 'v%'` (`rows=5`,
-      `patternsel` with no statistics), `select * from zu where c like
-      'x%'` over a table never analysed (`rows=6`, `cost=0.00..25.88`), and
-      the regex operators: `c ~ '^xx'` over thirty analysed strings is
-      `rows=30`, whose fixed prefix `regex_fixed_prefix` reads from the
-      compiled regex, and `c ~ 'w01'` over a thousand is `rows=101`. Only
-      a single relation's scan is estimated so: a join over such a scan
+      `patternsel` with no statistics), and over a table never analysed
+      `select * from zu where c like 'x%'` (`rows=6`, `cost=0.00..25.88`)
+      or `c ~ 'ab'` (`rows=254`). Since 2026-11-13 a regex match over an
+      analysed column is estimated (RP-354), from the fixed prefix
+      `regex_fixed_prefix` reads; one whose prefix walk is not modelled
+      (a group repeated other than at most once, an anchor inside a group,
+      a back reference, embedded options) still prints zeros. Only a
+      single relation's scan is estimated so: a join over such a scan
       prints zeros throughout (`e join s on s.a = e.a where s.c like
       'xxx%'` is PostgreSQL's `Hash Join (cost=1.74..20.78 rows=29
       width=27)`; `where e.a + 1 > 996` instead, `cost=1.68..23.02
-      rows=10`). Measured on a private 15.19 cluster (found while working
-      RP-404).
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[estimate of a function call compared with a constant], tests/backlog/test_rp_explain_costs.py::test_plan[estimate of a join over a scan filtered by a LIKE], tests/backlog/test_rp_explain_costs.py::test_plan[estimate of a LIKE over an expression], tests/backlog/test_rp_explain_costs.py::test_plan[estimate of a LIKE over a table never analysed], tests/backlog/test_rp_explain_costs.py::test_plan[estimate of an anchored regex match], tests/backlog/test_rp_explain_costs.py::test_plan[estimate of an unanchored regex match]
+      rows=10`; `e join w on e.a = w.a where w.c ~ '^w00'`,
+      `cost=19.64..39.30 rows=91`). Measured on a private 15.19 cluster
+      (found while working RP-404 and RP-354).
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[estimate of a function call compared with a constant], tests/backlog/test_rp_explain_costs.py::test_plan[estimate of a join over a scan filtered by a LIKE], tests/backlog/test_rp_explain_costs.py::test_plan[estimate of a LIKE over an expression], tests/backlog/test_rp_explain_costs.py::test_plan[estimate of a LIKE over a table never analysed], tests/backlog/test_rp_explain_costs.py::test_plan[estimate of a regex match over a table never analysed], tests/backlog/test_rp_explain_costs.py::test_plan[estimate of a join over a scan filtered by a regex match]
       Backlog-ID: RP-423
 - [ ] **A LIKE with an ESCAPE clause prints a `like_escape` call and is
       not estimated.** PostgreSQL folds `like_escape(pattern, escape)` of

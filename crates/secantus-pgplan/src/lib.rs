@@ -50630,8 +50630,9 @@ fn explain_scan_array_quals(
 }
 
 /// A LIKE or ILIKE (or its negation) of a single relation's string column
-/// against a constant pattern (`ExplainOptions::scan_patterns`), with the
-/// regex its lowering matches with, which identifies it in the filter.
+/// against a constant pattern (`ExplainOptions::scan_patterns`), or with
+/// `is_regex` a regex match (`~`, `~*`, `!~`, `!~*`), with the regex its
+/// lowering matches with, which identifies it in the filter.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ScanPattern {
     pub field: String,
@@ -50639,12 +50640,14 @@ pub struct ScanPattern {
     pub pattern: String,
     pub insensitive: bool,
     pub negated: bool,
+    pub is_regex: bool,
 }
 
-/// A single-relation statement's LIKE / ILIKE conjuncts, at any depth of
-/// its WHERE's ANDs and ORs: a `text`, `varchar` or `name` column on the
-/// left, a string constant (bare or cast to `text`) with the default escape
-/// on the right, lowered as `lower_pattern_match` lowers it.
+/// A single-relation statement's LIKE / ILIKE and regex-match conjuncts,
+/// at any depth of its WHERE's ANDs and ORs: a `text`, `varchar` or `name`
+/// column on the left, a string constant (bare or cast to `text`) -- a
+/// LIKE's with the default escape -- on the right, lowered as
+/// `lower_pattern_match` lowers it.
 fn explain_scan_patterns(
     query: &N,
     lookup: &dyn Fn(&str) -> Option<TableDef>,
@@ -50681,9 +50684,6 @@ fn scan_pattern(e: &AExpr, def: &TableDef) -> Option<ScanPattern> {
         return None;
     }
     let (negated, insensitive, is_like) = pattern_operator(operator_name(e).ok()?)?;
-    if !is_like {
-        return None;
-    }
     let field = column_field(e.lexpr.as_deref(), def).ok()?;
     let column = def.columns.iter().find(|c| c.field() == field)?;
     if !matches!(
@@ -50710,6 +50710,16 @@ fn scan_pattern(e: &AExpr, def: &TableDef) -> Option<ScanPattern> {
         return None;
     };
     let pattern = s.sval.clone();
+    if !is_like {
+        return Some(ScanPattern {
+            regex: scalar::pg_regex_source(&pattern),
+            field,
+            pattern,
+            insensitive,
+            negated,
+            is_regex: true,
+        });
+    }
     if like_match::ends_in_escape(&pattern, Some('\\')) {
         return None;
     }
@@ -50719,6 +50729,7 @@ fn scan_pattern(e: &AExpr, def: &TableDef) -> Option<ScanPattern> {
         pattern,
         insensitive,
         negated,
+        is_regex: false,
     })
 }
 

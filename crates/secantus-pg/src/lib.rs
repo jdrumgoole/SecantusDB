@@ -938,9 +938,10 @@ enum WhereClause {
     /// `col NOT IN (...)` of these constants.
     NotIn(String, Vec<Bson>),
     /// `col LIKE pattern` (`ILIKE` when the first flag is set; `NOT` when
-    /// the second is), its pattern read from the EXPLAIN's own
+    /// the second is; a regex match, `~` and its kin, when the third is),
+    /// its pattern read from the EXPLAIN's own
     /// (`scan_estimate::explain_pattern`).
-    Pattern(String, String, bool, bool),
+    Pattern(String, String, bool, bool, bool),
     /// An `OR` of conjunctions.
     Or(Vec<Vec<WhereClause>>),
 }
@@ -1112,7 +1113,7 @@ fn lowered_clauses(filter: &Document) -> Option<Vec<WhereClause>> {
                     c,
                     WhereClause::Cmp(g, Op::Ne, _)
                     | WhereClause::NotIn(g, _)
-                    | WhereClause::Pattern(g, _, _, true)
+                    | WhereClause::Pattern(g, _, _, true, _)
                     if g == f
                 )
             })
@@ -1126,8 +1127,8 @@ fn lowered_clauses(filter: &Document) -> Option<Vec<WhereClause>> {
     Some(out)
 }
 
-/// A lowered pattern match (`{$regex, $options}`) on `field` as the LIKE or
-/// ILIKE its EXPLAIN holds; `None` for any other regex.
+/// A lowered pattern match (`{$regex, $options}`) on `field` as the LIKE,
+/// ILIKE or regex match its EXPLAIN holds; `None` for any other regex.
 fn pattern_clause(field: &str, spec: &Document, negated: bool) -> Option<WhereClause> {
     let regex = spec.get_str("$regex").ok()?;
     let insensitive = match spec.get("$options") {
@@ -1138,13 +1139,14 @@ fn pattern_clause(field: &str, spec: &Document, negated: bool) -> Option<WhereCl
     if spec.keys().any(|k| k != "$regex" && k != "$options") {
         return None;
     }
-    let (pattern, insensitive) =
+    let (pattern, insensitive, is_regex) =
         scan_estimate::explain_pattern(field, regex, insensitive, negated)?;
     Some(WhereClause::Pattern(
         field.to_string(),
         pattern,
         insensitive,
         negated,
+        is_regex,
     ))
 }
 
@@ -9214,11 +9216,12 @@ impl PgHandler {
                     WhereClause::Null(f, is_null) => {
                         others.push(columns[at(f)?].null_sel(*is_null));
                     }
-                    WhereClause::Pattern(f, pattern, insensitive, negated) => {
+                    WhereClause::Pattern(f, pattern, insensitive, negated, is_regex) => {
                         others.push(columns[at(f)?].pattern_sel(
                             pattern,
                             *insensitive,
                             *negated,
+                            *is_regex,
                         )?);
                     }
                     WhereClause::Or(arms) => {
@@ -9327,7 +9330,7 @@ impl PgHandler {
                     WhereClause::In(_, v) | WhereClause::NotIn(_, v) if v.len() >= 9 => None,
                     WhereClause::In(_, v) | WhereClause::NotIn(_, v) => Some(v.len() as f64 * 0.5),
                     WhereClause::Null(..) => Some(0.0),
-                    // `textlike` and its kin, `procost` 1.
+                    // `textlike`, `textregexeq` and their kin, `procost` 1.
                     WhereClause::Pattern(..) => Some(1.0),
                     WhereClause::Or(arms) => arms.iter().map(|a| ops(a)).sum(),
                 })

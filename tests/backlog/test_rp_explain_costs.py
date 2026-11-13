@@ -2624,8 +2624,10 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "        Index Cond: (a > e.a)",
         ],
     ),
-    # Still open (RP-354): a LEFT join's ON conjunct over its preserved
-    # side that is a regex match.
+    # Fixed (RP-354): a LEFT join's ON conjunct over its preserved side
+    # that is a regex match printed zeros; `patternsel` now estimates a
+    # regex from its fixed prefix (`regex_fixed_prefix`) and the MCVs and
+    # histogram entries it matches.
     "a left join's on conjunct over the preserved side is a regex match": (
         "RP-354",
         _ANALYSED,
@@ -4799,6 +4801,30 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "              Filter: (c ~~ 'xxx%'::text)",
         ],
     ),
+    # The same two shapes with a regex match, whose estimate RP-354 built:
+    # still zeros (found while working RP-354).
+    "estimate of a regex match over a table never analysed": (
+        "RP-423",
+        _ANALYSED_STRINGS,
+        "explain select * from zu where c ~ 'ab'",
+        [
+            "Seq Scan on zu  (cost=0.00..25.88 rows=254 width=36)",
+            "  Filter: (c ~ 'ab'::text)",
+        ],
+    ),
+    "estimate of a join over a scan filtered by a regex match": (
+        "RP-423",
+        _ANALYSED_STRINGS,
+        "explain select * from e join w on e.a = w.a where w.c ~ '^w00'",
+        [
+            "Hash Join  (cost=19.64..39.30 rows=91 width=17)",
+            "  Hash Cond: (e.a = w.a)",
+            "  ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
+            "  ->  Hash  (cost=18.50..18.50 rows=91 width=10)",
+            "        ->  Seq Scan on w  (cost=0.00..18.50 rows=91 width=10)",
+            "              Filter: (c ~ '^w00'::text)",
+        ],
+    ),
     # Still open: a LIKE's ESCAPE is a `like_escape` call PostgreSQL folds
     # into the pattern constant, which `patternsel` then estimates.
     "a like with an escape clause is a folded pattern": (
@@ -4810,8 +4836,10 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "  Filter: (b ~~ 'v1\\%'::text)",
         ],
     ),
+    # Split from RP-423 and fixed with RP-354: a regex match's scan
+    # printed zeros.
     "estimate of an anchored regex match": (
-        "RP-423",
+        "RP-354",
         _ANALYSED_THIRTY,
         "explain select * from s where c ~ '^xx'",
         [
@@ -4820,7 +4848,7 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
         ],
     ),
     "estimate of an unanchored regex match": (
-        "RP-423",
+        "RP-354",
         _ANALYSED_STRINGS,
         "explain select * from w where c ~ 'w01'",
         [
@@ -5359,6 +5387,7 @@ def _marked(name: str, item: str) -> Any:
         "RP-350",
         "RP-351",
         "RP-352",
+        "RP-354",
         "RP-355",
         "RP-359",
         "RP-360",
