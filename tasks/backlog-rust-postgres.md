@@ -1115,16 +1115,23 @@ one beside it.
       the planner and in the RowDescription's wire types), a keyed
       `pg_attribute` read decoding its own relation's composite alone, and
       each table's index list read in place (2026-11-13, to 0.014 s at
-      800). What is left, profiled at 800 tables (debug build, per catalog
-      version, about 3.5 ms): the composite catalog's documents read and
-      compared afresh (0.5 ms), the oid map (`relation_oids`, 0.3 ms), the
-      constraint definitions (0.25 ms; they render through planner state,
-      `visible_name` and `check_constraint_text`, so cannot be derived
-      later from captured inputs), the index relations
-      (`derive_index_relations`, 0.5 ms, a cache lookup per table), the
-      comments (0.25 ms), the relations for `regclass` (0.2 ms) and a
-      keyed `pg_attribute` read's walk of every definition (twice, with
-      the catalog-read count). A per-table memo of the index relations by
+      800); the constraint texts rendered and every table's comments
+      listed at a statement's first lookup of one (the texts render under
+      the session state of that lookup, as `pg_get_constraintdef` does in
+      PostgreSQL; a changed search path is part of the publication's key),
+      a table with no key, unique constraint or index of its own skipped
+      before any oid lookup in the index relations, and the oid map built
+      only when a table has one (2026-11-13: the republication per catalog
+      version at about 800 tables, sampled, from 3.4 ms to 2.6 ms). What is
+      left, measured at 800 tables (debug build, 2026-11-13): the
+      republication (a `SELECT 1` straight after DDL) costs about 2.0 ms
+      more than with none -- the composite catalog read afresh and compared
+      (`committed_type_catalog_docs`, first read by `publish_tableoids`,
+      about 0.6 ms), the table catalog read and compared
+      (`committed_table_defs`, 0.3 ms), each table's index list
+      (`list_indexes_shared`, 0.2 ms), the relations for `regclass`
+      (`relations`, 0.4 ms) and the inheritance (0.1 ms); and the query's
+      own catalog reads after it, about 1.2 ms more. A per-table memo of the index relations by
       the identity of their inputs was measured slower than deriving them
       (its map work per version cost more than tables with no index). The
       faithful end state keys the published state per relation and
@@ -1153,6 +1160,22 @@ one beside it.
       new table's own index list, not every table's.
       Backlog-ID: RP-921
       Verify: tests/backlog/test_rp_catalog_latency.py::test_create_table_costs_the_same_at_400_tables
+
+- [ ] **OPEN — psql's `\d` column query straight after DDL builds all of
+      `pg_type` for a table of two column types.** The collation subquery
+      (`tests/backlog/test_rp_catalog_latency.py`'s `COLLATION_QUERY`) over
+      a table `(a int, b text)`, first after its `CREATE TABLE`: PostgreSQL
+      15.19 takes 0.35 ms with no other table and 0.33 ms with 800 (private
+      cluster, 2026-11-13); a debug `secantusd-pg` about 0.016 s with none
+      and 0.10 s with 800. `virtual_rows` builds one keyed read per catalog
+      per message cycle, and a second key in the cycle (the second column's
+      type) builds every row: every table's row type, each with its owner
+      from all of `pg_class` (`relation_owners`). PostgreSQL reads one
+      `pg_type` row per column through the oid index (`SearchSysCache`),
+      for as many keys as a statement asks. A table whose columns share one
+      type (the RP-911 test's) never reaches the second build.
+      Backlog-ID: RP-927
+      Verify: tests/backlog/test_rp_catalog_latency.py::test_the_first_catalog_query_after_ddl_over_two_column_types_costs_the_same_at_400_tables
 
 - [ ] **OPEN — a renamed index loses its comment.** `COMMENT ON INDEX ix
       IS 'c'` then `ALTER INDEX ix RENAME TO ix2`: PostgreSQL 15.19 answers

@@ -3453,6 +3453,52 @@ fn a_catalog_type_lookup_derives_no_deferred_composite_table() {
     set_user_composites(Vec::new());
 }
 
+/// The constraint texts and the comments are published as derivations the
+/// planner runs at the first lookup (RP-911): a statement that asks for
+/// neither derives neither, a lookup derives each once, and an error
+/// published in place of the comments is still what a lookup raises.
+#[test]
+fn constraint_texts_and_comments_are_derived_at_the_first_lookup() {
+    let texts = std::rc::Rc::new(std::cell::Cell::new(0));
+    let counter = std::rc::Rc::clone(&texts);
+    defer_constraint_defs(move || {
+        counter.set(counter.get() + 1);
+        vec![(90_001, "PRIMARY KEY (a)".into())]
+    });
+    let comments = std::rc::Rc::new(std::cell::Cell::new(0));
+    let counter = std::rc::Rc::clone(&comments);
+    defer_object_comments(move || {
+        counter.set(counter.get() + 1);
+        vec![(16_384, 0, "t".into()), (16_384, 1, "a".into())]
+    });
+    assert_eq!(
+        (texts.get(), comments.get()),
+        (0, 0),
+        "publishing derives nothing"
+    );
+    let text = |oid: i64| {
+        deferred::read(&CONSTRAINT_DEFS, |d| {
+            d.iter().find(|(o, _)| *o == oid).map(|(_, t)| t.clone())
+        })
+    };
+    assert_eq!(text(90_001).as_deref(), Some("PRIMARY KEY (a)"));
+    assert_eq!(text(90_002), None);
+    assert_eq!(texts.get(), 1, "derived once");
+    assert_eq!(
+        object_comment(16_384, 1).ok().flatten().as_deref(),
+        Some("a")
+    );
+    assert_eq!(object_comment(16_384, 2).ok().flatten(), None);
+    assert_eq!(comments.get(), 1, "derived once");
+    set_object_comments(Err(Error::Unsupported("the comments".into())));
+    assert!(
+        object_comment(16_384, 0).is_err(),
+        "the read's error is raised"
+    );
+    set_object_comments(Ok(Vec::new()));
+    set_constraint_defs(Vec::new());
+}
+
 /// `to_regtype` resolves a user type's ARRAY -- `mood[]`, `rt1[]` for a
 /// table's row type, or PostgreSQL's internal `_rt1` spelling -- to the
 /// element's oid plus the array offset, and renders it back as `name[]`.

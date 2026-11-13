@@ -219,11 +219,12 @@ def test_the_first_catalog_query_after_ddl_costs_the_same_at_800_tables_within_a
     TABLE` in the same time however many other tables there are (0.33 ms
     with 200, 0.20 ms with 400, private cluster, 2026-11-12): DDL
     invalidates only the cache entries of the rows it changed (`inval.c`).
-    A debug `secantusd-pg` takes about 0.010 s with no other table and
-    0.014 s with 800 (2026-11-13): the statement after any DDL still lists
-    the constraint definitions, the comments, the index relations and the
-    relation oids from every table, and reads every row type's catalog
-    document, for each catalog version.
+    A debug `secantusd-pg` takes about 0.011 s with no other table and
+    0.015 s with 800 (2026-11-13, with the constraint texts and comments
+    derived at their first lookup): the statement after any DDL still
+    reads every table's and every row type's catalog document, each
+    table's index list and the relations for `regclass`, for each catalog
+    version, and its own catalog reads cost about 1 ms more.
 
     The fastest of five first-after-DDL runs on a server with 800 more
     tables against the fastest on one with none, taking turns, within a
@@ -268,5 +269,45 @@ def test_create_table_costs_the_same_at_400_tables(pg_alone: Any) -> None:
     large = _fastest_create(pg_alone, "rp_ct_b")
     assert large < 1.5 * small + 0.005, (
         f"CREATE TABLE {small * 1000:.1f} ms with no other table, "
+        f"{large * 1000:.1f} ms with {GROWTH_TABLES}"
+    )
+
+
+def _fastest_first_over_two_types(pg: Any, prefix: str) -> float:
+    """The fastest of five first runs of the collation query straight after
+    a `CREATE TABLE` of an `int` and a `text` column."""
+    times = []
+    for i in range(5):
+        table = f"{prefix}_{i}"
+        pg.execute(f"CREATE TABLE {table} (a int, b text)")
+        query = COLLATION_QUERY.replace("'rp_cx'", f"'{table}'")
+        start = time.monotonic()
+        assert pg.execute(query).fetchall() == [("a", None), ("b", None)]
+        times.append(time.monotonic() - start)
+    return min(times)
+
+
+@pytest.mark.backlog("RP-927")
+def test_the_first_catalog_query_after_ddl_over_two_column_types_costs_the_same_at_400_tables(
+    pg_alone: Any,
+) -> None:
+    """PostgreSQL 15.19 answers the collation query for a table of an `int`
+    and a `text` column, straight after its `CREATE TABLE`, in the same time
+    however many other tables there are (0.35 ms with none, 0.33 ms with
+    800, private cluster, 2026-11-13): the subquery reads one `pg_type` row
+    per column through the type oid's index. A debug `secantusd-pg` took
+    about 0.016 s with none and 0.10 s with 800 (2026-11-13): one keyed
+    build per catalog per message cycle, so the second column's type, a
+    second key in the cycle, builds every `pg_type` row, each table's row
+    type with its owner from all of `pg_class`.
+
+    The fastest of five with 400 more tables against the fastest with none,
+    in one server, within half again plus 5 ms."""
+    small = _fastest_first_over_two_types(pg_alone, "rp_tt_a")
+    for i in range(GROWTH_TABLES):
+        pg_alone.execute(f"CREATE TABLE rp_tt_grow_{i} (a int, b text)")
+    large = _fastest_first_over_two_types(pg_alone, "rp_tt_b")
+    assert large < 1.5 * small + 0.005, (
+        f"first query after DDL {small * 1000:.1f} ms with no other table, "
         f"{large * 1000:.1f} ms with {GROWTH_TABLES}"
     )

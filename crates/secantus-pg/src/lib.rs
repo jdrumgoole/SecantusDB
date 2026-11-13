@@ -863,6 +863,10 @@ impl pgwire::api::cancel::CancelHandler for CancelBackend {
 /// document whose stored bytes did not change (RP-911).
 type CatalogDocs = Arc<Vec<Arc<Document>>>;
 
+/// The listing of every comment, as `(object oid, sub-id, text)`, run when
+/// a statement first asks for one (RP-911).
+type CommentsDerivation = Box<dyn FnOnce() -> Vec<(i64, i32, String)>>;
+
 /// Every table's definition. Each one is shared, so a catalog version
 /// reuses the previous version's unchanged definitions rather than copying
 /// them (RP-911).
@@ -5999,16 +6003,38 @@ impl PgHandler {
                 })
                 .collect(),
         );
-        let mut constraint_defs = self.constraint_defs().unwrap_or_default();
         // The built-ins' never change: computed once per process.
         static BUILTIN_CONSTRAINT_DEFS: OnceLock<Vec<(i64, String)>> = OnceLock::new();
-        constraint_defs.extend(
-            BUILTIN_CONSTRAINT_DEFS
-                .get_or_init(|| self.builtin_constraint_defs())
-                .iter()
-                .cloned(),
-        );
-        secantus_pgplan::set_constraint_defs(constraint_defs);
+        let builtin_constraint_defs: &'static [(i64, String)] =
+            BUILTIN_CONSTRAINT_DEFS.get_or_init(|| self.builtin_constraint_defs());
+        // The tables' constraint texts are rendered when a statement first
+        // asks for one (RP-911), from the definitions and catalog documents
+        // read now.
+        match (
+            self.shared_table_defs(),
+            self.type_catalog_docs(Self::COMPOSITE_COLLECTION),
+            self.type_catalog_docs(Self::VIEW_COLLECTION),
+        ) {
+            (Ok(defs), Ok(comps), Ok(views)) => {
+                let domains: Vec<(i64, String)> = self
+                    .domain_constraints()
+                    .into_iter()
+                    .map(|(oid, _, _, _, text)| (oid, text))
+                    .collect();
+                secantus_pgplan::defer_constraint_defs(move || {
+                    let oids = Self::relation_oids_of(comps, views);
+                    let mut out = domains;
+                    out.extend(Self::table_constraint_defs(&defs, &oids));
+                    out.extend(builtin_constraint_defs.iter().cloned());
+                    out
+                });
+            }
+            _ => {
+                let mut constraint_defs = self.constraint_defs().unwrap_or_default();
+                constraint_defs.extend(builtin_constraint_defs.iter().cloned());
+                secantus_pgplan::set_constraint_defs(constraint_defs);
+            }
+        }
         secantus_pgplan::set_view_defs(self.view_defs());
         secantus_pgplan::set_view_defs_pretty(self.view_defs_as(1));
         secantus_pgplan::set_view_defs_marked(self.view_defs_as(2));
@@ -6084,9 +6110,15 @@ impl PgHandler {
                 })
                 .collect(),
         );
-        let comments = self.object_comments();
-        complete &= comments.is_ok();
-        secantus_pgplan::set_object_comments(comments.map_err(Self::plan_error_of));
+        // Every table's comments are listed when a statement first asks
+        // for one (RP-911); the reads they need are made now.
+        match self.object_comments_builder() {
+            Ok(build) => secantus_pgplan::defer_object_comments(build),
+            Err(e) => {
+                complete = false;
+                secantus_pgplan::set_object_comments(Err(Self::plan_error_of(e)));
+            }
+        }
         secantus_pgplan::set_shared_comments(self.read_in_block(|| self.shared_comments()));
         secantus_pgplan::domains::set_user_domains(self.domains().unwrap_or_default());
         secantus_pgplan::user_agg::set_user_aggregates(self.user_aggregates().unwrap_or_default());
@@ -12991,7 +13023,7 @@ impl PgHandler {
             usize,
             String,
             TableDefs,
-            Arc<HashMap<String, i64>>,
+            (CatalogDocs, CatalogDocs),
             u64,
             Arc<Vec<IndexRelation>>,
         );
@@ -13011,7 +13043,14 @@ impl PgHandler {
         // Read in place: copying every definition, per call, was most of
         // this list's cost on a large schema (RP-715).
         let defs = self.shared_table_defs()?;
-        let oids = self.relation_oids().unwrap_or_default();
+        // The oids are a function of these documents, and are listed only
+        // when a table has an index relation (RP-911).
+        let oid_docs = (
+            self.type_catalog_docs(Self::COMPOSITE_COLLECTION)
+                .unwrap_or_default(),
+            self.type_catalog_docs(Self::VIEW_COLLECTION)
+                .unwrap_or_default(),
+        );
         let storage_ptr = Arc::as_ptr(&self.storage) as usize;
         // Inside a user transaction the index lists are read on its own
         // session, which may hold its own index DDL: not shared.
@@ -13026,7 +13065,8 @@ impl PgHandler {
                     (*s == storage_ptr
                         && *g == generation
                         && Arc::ptr_eq(d, &defs)
-                        && Arc::ptr_eq(o, &oids)
+                        && Arc::ptr_eq(&o.0, &oid_docs.0)
+                        && Arc::ptr_eq(&o.1, &oid_docs.1)
                         && db == self.db())
                     .then(|| Arc::clone(list))
                 })
@@ -13035,7 +13075,14 @@ impl PgHandler {
                 return Ok(list.as_ref().clone());
             }
         }
-        let out = self.derive_index_relations(&defs, &oids)?;
+        let oids = std::cell::OnceCell::new();
+        let oids_of = || {
+            oids.get_or_init(|| {
+                Self::relation_oids_of(Arc::clone(&oid_docs.0), Arc::clone(&oid_docs.1))
+            })
+            .as_ref()
+        };
+        let out = self.derive_index_relations(&defs, &oids_of)?;
         // Kept only when no index catalog write landed during the reads.
         if let Some(generation) =
             generation.filter(|g| secantus_storage::planner_generation() == Some(*g))
@@ -13046,7 +13093,7 @@ impl PgHandler {
                     storage_ptr,
                     self.db().to_string(),
                     defs,
-                    oids,
+                    oid_docs,
                     generation,
                     list,
                 ));
@@ -13195,10 +13242,10 @@ impl PgHandler {
 
     /// [`Self::try_index_relations`], derived from `defs` and their `oids`
     /// and each table's stored index list.
-    fn derive_index_relations(
+    fn derive_index_relations<'a>(
         &self,
         defs: &[Arc<TableDef>],
-        oids: &HashMap<String, i64>,
+        oids: &dyn Fn() -> &'a HashMap<String, i64>,
     ) -> PgWireResult<Vec<IndexRelation>> {
         let mut out = Vec::new();
         let defs_partitions = |parent: &str| -> Vec<&Arc<TableDef>> {
@@ -13207,13 +13254,21 @@ impl PgHandler {
                 .collect()
         };
         for t in defs.iter() {
-            let table_oid = Self::oid_in(oids, &t.name).filter(|o| *o > 0);
             // Read in place: a copy of every table's list, for each catalog
             // version, grew the statement after DDL with the schema (RP-911).
             let stored = self
                 .storage
                 .list_indexes_shared(self.db(), &t.name)
                 .map_err(|e| Self::storage_err("could not read the index list", e))?;
+            // A table with no key, no unique constraint and no index of its
+            // own has no index relation: no oid lookup, no derivation.
+            if !t.columns.iter().any(|c| c.pk)
+                && t.unique_constraints.is_empty()
+                && stored.iter().all(|ix| ix.get_str("name") == Ok("_id_"))
+            {
+                continue;
+            }
+            let table_oid = Self::oid_in(oids(), &t.name).filter(|o| *o > 0);
             out.extend(Self::table_index_relations(t, table_oid, &stored));
         }
         // A partitioned table's index has one on every partition too, named
@@ -15888,19 +15943,55 @@ impl PgHandler {
     /// `pg_constraint` gives it -- walked in the SAME order as those rows
     /// (primary key, unique, check, foreign key), since the oid is positional.
     fn constraint_defs(&self) -> PgWireResult<Vec<(i64, String)>> {
-        let mut out = Vec::new();
-        out.extend(
-            self.domain_constraints()
-                .into_iter()
-                .map(|(oid, _, _, _, text)| (oid, text)),
-        );
-        let q = secantus_pgplan::scalar::quote_identifier;
-        let qlist = |cols: &[String]| cols.iter().map(|c| q(c)).collect::<Vec<_>>().join(", ");
+        let mut out: Vec<(i64, String)> = self
+            .domain_constraints()
+            .into_iter()
+            .map(|(oid, _, _, _, text)| (oid, text))
+            .collect();
         // Every oid from one map: a lookup per table re-fetched the catalog
         // documents for each (RP-911).
         let oids = self.relation_oids().unwrap_or_default();
-        for t in self.shared_table_defs()?.iter() {
-            let Some(rel) = Self::oid_in(&oids, &t.name) else {
+        out.extend(Self::table_constraint_defs(
+            &self.shared_table_defs()?,
+            &oids,
+        ));
+        Ok(out)
+    }
+
+    /// The tables' part of [`Self::constraint_defs`]: a function of the
+    /// definitions `defs` and their `oids` alone (and of the planner state
+    /// the texts are rendered under), so the planner may render them when
+    /// a statement first asks for one (RP-911). A table with no constraint
+    /// costs no oid lookup.
+    fn table_constraint_defs(
+        defs: &[Arc<TableDef>],
+        oids: &HashMap<String, i64>,
+    ) -> Vec<(i64, String)> {
+        let mut out = Vec::new();
+        let q = secantus_pgplan::scalar::quote_identifier;
+        let qlist = |cols: &[String]| cols.iter().map(|c| q(c)).collect::<Vec<_>>().join(", ");
+        // `REFERENCES t` with no column list: t's definition, by name, as
+        // `lookup` finds it in the definitions this session sees.
+        let by_name = std::cell::OnceCell::new();
+        let definition = |name: &str| -> Option<&Arc<TableDef>> {
+            by_name
+                .get_or_init(|| {
+                    defs.iter()
+                        .map(|d| (d.name.as_str(), d))
+                        .collect::<HashMap<&str, &Arc<TableDef>>>()
+                })
+                .get(name)
+                .copied()
+        };
+        for t in defs.iter() {
+            if !t.columns.iter().any(|c| c.pk)
+                && t.unique_constraints.is_empty()
+                && t.check_constraints.is_empty()
+                && t.foreign_keys.is_empty()
+            {
+                continue;
+            }
+            let Some(rel) = Self::oid_in(oids, &t.name) else {
                 continue;
             };
             let mut ordinal = 0i64;
@@ -15961,7 +16052,7 @@ impl PgHandler {
             for fk in &t.foreign_keys {
                 // `REFERENCES t` with no list names t's primary key.
                 let ref_columns: Vec<String> = if fk.ref_columns.is_empty() {
-                    self.lookup(&fk.ref_table)
+                    definition(&fk.ref_table)
                         .map(|p| {
                             p.columns
                                 .iter()
@@ -15996,7 +16087,7 @@ impl PgHandler {
                 push(text);
             }
         }
-        Ok(out)
+        out
     }
 
     /// The views created `WITH CHECK OPTION`, which a write through the view
@@ -21134,10 +21225,26 @@ impl PgHandler {
     /// row carries -- numbered in the order `constraint_defs` walks them
     /// (primary key, unique / exclusion, check, foreign key).
     pub(crate) fn constraint_comments(&self) -> Vec<(i64, String)> {
-        let mut out = Vec::new();
         let oids = self.relation_oids().unwrap_or_default();
-        for t in self.shared_table_defs().unwrap_or_default().iter() {
-            let Some(rel) = Self::oid_in(&oids, &t.name) else {
+        Self::table_constraint_comments(&self.shared_table_defs().unwrap_or_default(), &oids)
+    }
+
+    /// [`Self::constraint_comments`] over the definitions `defs` and their
+    /// `oids` alone. A table with no constraint costs no oid lookup.
+    fn table_constraint_comments(
+        defs: &[Arc<TableDef>],
+        oids: &HashMap<String, i64>,
+    ) -> Vec<(i64, String)> {
+        let mut out = Vec::new();
+        for t in defs.iter() {
+            if !t.columns.iter().any(|c| c.pk)
+                && t.unique_constraints.is_empty()
+                && t.check_constraints.is_empty()
+                && t.foreign_keys.is_empty()
+            {
+                continue;
+            }
+            let Some(rel) = Self::oid_in(oids, &t.name) else {
                 continue;
             };
             let mut ordinal = 0i64;
@@ -21169,32 +21276,30 @@ impl PgHandler {
     /// stores the comments live in is the error: answered as "no comment" it
     /// was a silent NULL from `obj_description` (CI, 2026-11-07).
     pub(crate) fn object_comments(&self) -> PgWireResult<Vec<(i64, i32, String)>> {
-        let mut out = Vec::new();
+        Ok(self.object_comments_builder()?())
+    }
+
+    /// [`Self::object_comments`], as the reads it needs, made now (a
+    /// failed one is the error), and the listing of every table's
+    /// comments, which the returned derivation runs over the definitions
+    /// and catalog documents read now: the planner lists them when a
+    /// statement first asks for a comment (RP-911).
+    fn object_comments_builder(&self) -> PgWireResult<CommentsDerivation> {
+        let mut head = Vec::new();
         // An extension's description is its control file's `comment`.
         for (i, (name, _, _)) in self.extensions()?.into_iter().enumerate() {
             if let Some(c) = catalog_fill::extension_description(&name) {
-                out.push((crate::extension_oid(i), 0, c.to_string()));
+                head.push((crate::extension_oid(i), 0, c.to_string()));
             }
         }
-        let oids = self.relation_oids().unwrap_or_default();
-        for def in self.shared_table_defs()?.iter() {
-            let Some(oid) = Self::oid_in(&oids, &def.name) else {
-                continue;
-            };
-            if let Some(c) = def.comment() {
-                out.push((oid, 0, c.to_string()));
-            }
-            for (i, col) in def.columns.iter().enumerate() {
-                if let Ok(c) = col.extra.get_str("comment") {
-                    out.push((oid, i32::from(def.attnum(i)), c.to_string()));
-                }
-            }
-        }
-        out.extend(
-            self.constraint_comments()
-                .into_iter()
-                .map(|(oid, c)| (oid, 0, c)),
-        );
+        let defs = self.shared_table_defs()?;
+        let comps = self
+            .type_catalog_docs(Self::COMPOSITE_COLLECTION)
+            .unwrap_or_default();
+        let views = self
+            .type_catalog_docs(Self::VIEW_COLLECTION)
+            .unwrap_or_default();
+        let mut tail = Vec::new();
         let index_comments: Vec<Document> = self
             .storage
             .find_matching(self.db(), Self::INDEX_COMMENT_COLLECTION, &Document::new())
@@ -21209,36 +21314,36 @@ impl PgHandler {
                     .find(|d| d.get_str("_id") == Ok(Self::index_comment_key(&ix).as_str()))
                     .and_then(|d| d.get_str("comment").ok())
                 {
-                    out.push((ix.oid, 0, c.to_string()));
+                    tail.push((ix.oid, 0, c.to_string()));
                 }
             }
         }
         for d in self.type_catalog_docs(Self::DOMAIN_COLLECTION)?.iter() {
             if let (Ok(c), Some(oid)) = (d.get_str("comment"), d.get("oid").and_then(bson_i64)) {
-                out.push((oid, 0, c.to_string()));
+                tail.push((oid, 0, c.to_string()));
             }
         }
-        out.extend(
+        tail.extend(
             self.ts_config_comments()
                 .into_iter()
                 .map(|(oid, c)| (oid, 0, c)),
         );
-        out.extend(
+        tail.extend(
             self.ts_dict_comments()
                 .into_iter()
                 .map(|(oid, c)| (oid, 0, c)),
         );
-        out.extend(
+        tail.extend(
             self.conversion_comments()
                 .into_iter()
                 .map(|(oid, c)| (oid, 0, c)),
         );
-        out.extend(
+        tail.extend(
             self.opclass_comments()
                 .into_iter()
                 .map(|(_, oid, c)| (oid, 0, c)),
         );
-        out.extend(
+        tail.extend(
             self.subscription_comments()
                 .into_iter()
                 .chain(self.transform_comments())
@@ -21249,24 +21354,60 @@ impl PgHandler {
         for d in self.user_function_docs()? {
             if let Ok(c) = d.get_str("comment") {
                 let key = d.get_str("_id").unwrap_or_default();
-                out.push((self.function_oid(key), 0, c.to_string()));
+                tail.push((self.function_oid(key), 0, c.to_string()));
             }
         }
-        for d in self
+        // The rest, by relation name: resolved with the tables' oids.
+        let named: Vec<(String, String)> = self
             .storage
             .find_matching(self.db(), Self::COMMENT_COLLECTION, &Document::new())
             .map_err(|e| Self::storage_err("could not read the comments", e))?
             .iter()
             .filter_map(|b| decode_doc(b).ok())
-        {
-            let (Ok(name), Ok(c)) = (d.get_str("name"), d.get_str("comment")) else {
-                continue;
-            };
-            if let Some(oid) = Self::oid_in(&oids, name) {
-                out.push((oid, 0, c.to_string()));
+            .filter_map(|d| {
+                Some((
+                    d.get_str("name").ok()?.to_string(),
+                    d.get_str("comment").ok()?.to_string(),
+                ))
+            })
+            .collect();
+        Ok(Box::new(move || {
+            let oids = Self::relation_oids_of(comps, views);
+            let mut out = head;
+            for def in defs.iter() {
+                fn column_comment(c: &Column) -> Option<&str> {
+                    c.extra.get_str("comment").ok()
+                }
+                if def.comment().is_none()
+                    && !def.columns.iter().any(|c| column_comment(c).is_some())
+                {
+                    continue;
+                }
+                let Some(oid) = Self::oid_in(&oids, &def.name) else {
+                    continue;
+                };
+                if let Some(c) = def.comment() {
+                    out.push((oid, 0, c.to_string()));
+                }
+                for (i, col) in def.columns.iter().enumerate() {
+                    if let Some(c) = column_comment(col) {
+                        out.push((oid, i32::from(def.attnum(i)), c.to_string()));
+                    }
+                }
             }
-        }
-        Ok(out)
+            out.extend(
+                Self::table_constraint_comments(&defs, &oids)
+                    .into_iter()
+                    .map(|(oid, c)| (oid, 0, c)),
+            );
+            out.extend(tail);
+            for (name, c) in named {
+                if let Some(oid) = Self::oid_in(&oids, &name) {
+                    out.push((oid, 0, c));
+                }
+            }
+            out
+        }))
     }
 
     /// Mint an enum / composite oid the way PostgreSQL mints an OID: from a
