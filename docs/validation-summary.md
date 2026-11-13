@@ -1,6 +1,6 @@
 # Cross-Driver Conformance Summary
 
-Generated 2026-10-15 — SecantusDB 0.7.0b3. Each per-driver gauge runs the driver vendor's own integration test suite (unmodified) against a SecantusDB daemon and emits its raw output to `.validation/`. This summary normalises on **test count** so the 13 gauges compare like for like — every row counts one assertion outcome, whether it landed as a JUnit `<testcase>`, a Mocha test, an RSpec example, a `go test` event, or a pytest collected item.
+Generated 2026-10-26 — the Rust MongoDB server 0.5.3-beta.196. Each per-driver gauge runs the driver vendor's own integration test suite (unmodified) against a SecantusDB daemon and emits its raw output to `.validation/`. This summary normalises on **test count** so the 13 gauges compare like for like — every row counts one assertion outcome, whether it landed as a JUnit `<testcase>`, a Mocha test, an RSpec example, a `go test` event, or a pytest collected item.
 
 **Failures split into two columns**: *Failed* counts tests that actually need a fix on SecantusDB; *Expected* counts tests with a documented reason for failing (driver-side cascade, out-of-scope feature, single-node-topology assumption, known intermittent flake). The expected list lives in `validation_summary/expected_failures.py` and each entry carries a rationale. Adjusted pass rate = passes ÷ (passes + actual failures).
 
@@ -10,18 +10,18 @@ Generated 2026-10-15 — SecantusDB 0.7.0b3. Each per-driver gauge runs the driv
 |---|---|---|---:|---:|---:|---:|---:|---:|---:|
 | `pymongo` | Python | `f2103a95870a` | 1501 | 1206 | 0 | 5 | 290 | 99.5% | 100.0% |
 | `pymongo (async)` | Python | `f2103a95870a` | 1423 | 1111 | 0 | 6 | 306 | 99.4% | 100.0% |
-| `mongo-java-driver` | Java | `cb45be6bb147` | 900 | 496 | 0 | 0 | 404 | 100.0% | 100.0% |
+| `mongo-java-driver` | Java | `cb45be6bb147` | 900 | 495 | 0 | 1 | 404 | 99.7% | 100.0% |
 | `mongo-kotlin-driver` | Kotlin | `cb45be6bb147` | 538 | 340 | 0 | 0 | 198 | 100.0% | 100.0% |
-| `mongo-go-driver` | Go | `fd85a834c40e` | 659 | 598 | 12 | 0 | 49 | 98.0% | 98.0% |
+| `mongo-go-driver` | Go | `fd85a834c40e` | 659 | 599 | 9 | 2 | 49 | 98.1% | 98.5% |
 | `mongo-node-driver` | Node.js | `7e53685952f2` | 364 | 357 | 0 | 1 | 6 | 99.7% | 100.0% |
 | `mongo-ruby-driver` | Ruby | `f68d676643c1` | 283 | 258 | 0 | 1 | 24 | 99.6% | 100.0% |
-| `mongo-rust-driver` | Rust | `12dd49bf18bb` | 105 | 104 | 1 | 0 | 0 | 99.0% | 99.0% |
+| `mongo-rust-driver` | Rust | `12dd49bf18bb` | 105 | 105 | 0 | 0 | 0 | 100.0% | 100.0% |
 | `mongo-php-library` | PHP | `12e56461166d` | 2221 | 2197 | 1 | 0 | 23 | 99.9% | 99.9% |
 | `mongo-php-driver` | PHP | `06be1f01bb4c` | 271 | 254 | 0 | 0 | 17 | 100.0% | 100.0% |
-| `mongo-c-driver` | C | `57dba9c04991` | 841 | 790 | 1 | 2 | 48 | 99.6% | 99.8% |
+| `mongo-c-driver` | C | `57dba9c04991` | 841 | 791 | 0 | 2 | 48 | 99.7% | 100.0% |
 | `mongo-cxx-driver` | C++ | `24852b68a3d1` | 901 | 892 | 0 | 0 | 9 | 100.0% | 100.0% |
 | `mongo-csharp-driver` | C# | `8297e62d7f2b` | 228 | 228 | 0 | 0 | 0 | 100.0% | 100.0% |
-| **All drivers** | — | — | **10235** | **8831** | **15** | **15** | **1374** | **99.6%** | **99.8%** |
+| **All drivers** | — | — | **10235** | **8833** | **10** | **18** | **1374** | **99.6%** | **99.8%** |
 
 ## Per-driver scope
 
@@ -60,6 +60,15 @@ These tests fail for documented reasons that have no SecantusDB-side fix (driver
 - **vendor/pymongo-tests/test/asynchronous/test_cursor.py::TestCursor::test_where** — `$where` runs server-side JavaScript and SecantusDB ships no JS runtime, so it is rejected with `BadValue` (2) 'unsupported top-level operator: $where'. Out of scope per tasks/backlog.md §4 — supporting it would mean embedding a JS engine as mongod does.
 - **vendor/pymongo-tests/test/asynchronous/test_read_preferences.py::TestMongosAndReadPreference::test_read_preference_hedge_deprecated** — Async-only, and never reaches the wire: the test constructs `PrimaryPreferred(hedge={'enabled': True})` and asserts a `DeprecationWarning` is raised by the driver's own constructor. Purely client-side pymongo behaviour, dependent on the ambient warning filters — no server can influence the outcome.
 
+### `mongo-java-driver` (1)
+
+- **default-write-concern-3.4: MapReduce omits default write concern** — read-write-concern spec default-write-concern-3.4: its map/reduce is JavaScript, and the Rust server has no JavaScript engine. It refuses as `mongod --noscripting` 8.2.11 does (31264); before 2026-10-16 it answered ok:1 with no results, a silent wrong answer that let this test pass. Accepted by Joe 2026-10-16 (RM-027).
+
+### `mongo-go-driver` (2)
+
+- **TestSDAMErrorHandling/after_handshake_completes/network_errors/pool_not_cleared_on_timeout_network_error** — Holds a connection with `$where: sleep(...)`, which needs server-side JavaScript. The Rust server refuses `$where` as `mongod --noscripting` 8.2.11 does (6108304); no JavaScript engine is planned, MongoDB deprecated `$where` in 8.0. Scope decision by Joe 2026-10-16.
+- **TestSDAMErrorHandling/after_handshake_completes/network_errors/pool_not_cleared_on_context_cancellation** — Holds a connection with `$where: sleep(...)`, which needs server-side JavaScript. The Rust server refuses `$where` as `mongod --noscripting` 8.2.11 does (6108304); no JavaScript engine is planned, MongoDB deprecated `$where` in 8.0. Scope decision by Joe 2026-10-16.
+
 ### `mongo-node-driver` (1)
 
 - **Find should correctly sort using text search in find** — Text indexes (`$text`, `$meta: textScore`, text-index creation) are intentionally out of scope per CLAUDE.md — would require a full-text index implementation. Documented in tasks/backlog.md §4.
@@ -77,17 +86,17 @@ These tests fail for documented reasons that have no SecantusDB-side fix (driver
 
 Each gauge ships its own detailed report — per-category breakdown, named failures for triage, and the gauge's own setup notes. Open the one whose pass / fail counts you want to dig into:
 
-- [pymongo](./validation-report.md)
-- [mongo-java-driver](./validation-report-java.md)
-- [mongo-go-driver](./validation-report-go.md)
-- [mongo-node-driver](./validation-report-node.md)
-- [mongo-ruby-driver](./validation-report-ruby.md)
-- [mongo-rust-driver](./validation-report-rust.md)
-- [mongo-php-library](./validation-report-php-lib.md)
-- [mongo-php-driver](./validation-report-php-ext.md)
-- [mongo-c-driver](./validation-report-c.md)
-- [mongo-cxx-driver](./validation-report-cxx.md)
-- [mongo-csharp-driver](./validation-report-dotnet.md)
+- [pymongo](./validation-report-rust-server.md)
+- [mongo-java-driver](./validation-report-java-rust-server.md)
+- [mongo-go-driver](./validation-report-go-rust-server.md)
+- [mongo-node-driver](./validation-report-node-rust-server.md)
+- [mongo-ruby-driver](./validation-report-ruby-rust-server.md)
+- [mongo-rust-driver](./validation-report-rust-rust-server.md)
+- [mongo-php-library](./validation-report-php-lib-rust-server.md)
+- [mongo-php-driver](./validation-report-php-ext-rust-server.md)
+- [mongo-c-driver](./validation-report-c-rust-server.md)
+- [mongo-cxx-driver](./validation-report-cxx-rust-server.md)
+- [mongo-csharp-driver](./validation-report-dotnet-rust-server.md)
 
 ## Refreshing
 
