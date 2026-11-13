@@ -420,11 +420,12 @@ def _sbe_sort_spilled_bytes(client: Any) -> dict:
     return {k: entry.get(k) for k in ("sortSpills", "sortSpilledRecords", "sortSpilledBytes")}
 
 
-@pytest.mark.backlog("RM-506")
+@pytest.mark.backlog_fixed("RM-506")
 def test_sbe_sort_spilled_bytes(rust_mongo: Any, mongod: Any) -> None:
     """mongod 8.2.11's SBE sort in front of a `$group` writes 13 runs of 900
-    records, 927900 bytes (1031 a record); this server writes 922500, its
-    rows as BSON documents."""
+    records, 927900 bytes (1031 a record: a row of the key's values, then a
+    row of the kept fields'); this server wrote 922500, its key as a
+    classic `Value` and its fields as a BSON document."""
     assert _sbe_sort_spilled_bytes(rust_mongo) == _sbe_sort_spilled_bytes(mongod)
 
 

@@ -269,6 +269,306 @@ pub(crate) fn read_parts(at: &mut Cursor) -> R<Vec<Option<Bson>>> {
     Ok(parts)
 }
 
+// ------------------------------------------------------------ SBE rows --
+
+/// SBE's `TypeTags` (`sbe/values/value.h`, mongod 8.2.1), those a row an
+/// SBE sort takes from a document holds.
+mod tag {
+    pub const NOTHING: u8 = 0;
+    pub const INT32: u8 = 1;
+    pub const INT64: u8 = 2;
+    pub const DOUBLE: u8 = 3;
+    pub const DATE: u8 = 4;
+    pub const TIMESTAMP: u8 = 5;
+    pub const BOOLEAN: u8 = 6;
+    pub const NULL: u8 = 7;
+    pub const MIN_KEY: u8 = 8;
+    pub const MAX_KEY: u8 = 9;
+    pub const STRING_SMALL: u8 = 12;
+    pub const DECIMAL: u8 = 13;
+    pub const STRING_BIG: u8 = 14;
+    pub const BSON_OBJECT: u8 = 22;
+    pub const BSON_ARRAY: u8 = 23;
+    pub const BSON_SYMBOL: u8 = 25;
+    pub const BSON_OBJECT_ID: u8 = 26;
+    pub const BSON_BIN_DATA: u8 = 27;
+    pub const BSON_UNDEFINED: u8 = 28;
+    pub const BSON_REGEX: u8 = 29;
+    pub const BSON_JAVASCRIPT: u8 = 30;
+    pub const BSON_DB_POINTER: u8 = 31;
+    pub const BSON_CODE_W_SCOPE: u8 = 32;
+}
+
+/// `kSmallStringMaxLength`: a string this short, with no NUL in it, is a
+/// `StringSmall`.
+const SMALL_STRING: usize = 7;
+
+/// `MaterializedRow::serializeForSorter` (`sbe/values/row.cpp`, mongod
+/// 8.2.1) of a row of `values`, `None` the missing value (`Nothing`): the
+/// count as a `size_t`, then each value as `serializeValue` writes it.
+///
+/// The row holds what the sort stage copied out of its input slots
+/// (`copyValue`): a document's own BSON values, except that a string is
+/// made anew, a `StringSmall` (written as a C string) when it fits seven
+/// bytes and holds no NUL, a `StringBig` (its `uint32` length and bytes)
+/// otherwise.
+pub(crate) fn write_sbe_row(values: &[Option<&Bson>], out: &mut Vec<u8>) -> R<()> {
+    out.extend_from_slice(&(values.len() as u64).to_le_bytes());
+    for v in values {
+        match v {
+            None => out.push(tag::NOTHING),
+            Some(v) => {
+                let bson = element_bson(v)?;
+                let mut at = Cursor::new(&bson[6..]);
+                sbe_value_from_bson(bson[4], &mut at, out)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The row a [`write_sbe_row`] wrote.
+pub(crate) fn read_sbe_row(at: &mut Cursor) -> R<Vec<Option<Bson>>> {
+    let n = u64::from_le_bytes(
+        at.take(8)?
+            .try_into()
+            .map_err(|_| corrupt("a row without its count"))?,
+    );
+    let n = usize::try_from(n).map_err(|_| corrupt("a row with a bad count"))?;
+    let mut values = Vec::with_capacity(n.min(1 << 16));
+    for _ in 0..n {
+        let t = at.byte()?;
+        if t == tag::NOTHING {
+            values.push(None);
+            continue;
+        }
+        // Length, type, the empty name's NUL, then the value.
+        let mut bson = vec![0, 0, 0, 0, 0, 0];
+        let bson_type = sbe_value_to_bson(t, at, &mut bson)?;
+        bson[4] = bson_type;
+        bson.push(0);
+        finish_doc(&mut bson, 0)?;
+        let mut d = crate::bsondoc::from_bytes(&bson).map_err(corrupt)?;
+        values.push(Some(
+            d.remove("")
+                .ok_or_else(|| corrupt("a value that is not one"))?,
+        ));
+    }
+    Ok(values)
+}
+
+/// A string's bytes in a BSON value at `at` (its length counts its NUL),
+/// without the NUL.
+fn bson_string<'a>(at: &mut Cursor<'a>) -> R<&'a [u8]> {
+    let n = at.len()?;
+    let s = at.take(n)?;
+    Ok(s.get(..n.saturating_sub(1)).unwrap_or_default())
+}
+
+/// `value::serializeValue` of the BSON value of type `t` at `at`: its
+/// `TypeTags` byte, then the value.
+fn sbe_value_from_bson(t: u8, at: &mut Cursor, out: &mut Vec<u8>) -> R<()> {
+    let raw = |tag: u8, n: usize, at: &mut Cursor, out: &mut Vec<u8>| -> R<()> {
+        out.push(tag);
+        out.extend_from_slice(at.take(n)?);
+        Ok(())
+    };
+    let counted = |tag: u8, text: &[u8], out: &mut Vec<u8>| {
+        out.push(tag);
+        out.extend_from_slice(&(text.len() as u32).to_le_bytes());
+        out.extend_from_slice(text);
+    };
+    match t {
+        0x01 => raw(tag::DOUBLE, 8, at, out)?,
+        0x02 => {
+            let text = bson_string(at)?;
+            if text.len() <= SMALL_STRING && !text.contains(&0) {
+                out.push(tag::STRING_SMALL);
+                out.extend_from_slice(text);
+                out.push(0);
+            } else {
+                counted(tag::STRING_BIG, text, out);
+            }
+        }
+        // A document or an array: its BSON.
+        0x03 | 0x04 => {
+            let n = usize::try_from(at.peek_i32()?)
+                .map_err(|_| corrupt("a document with a bad length"))?;
+            raw(
+                if t == 0x03 {
+                    tag::BSON_OBJECT
+                } else {
+                    tag::BSON_ARRAY
+                },
+                n,
+                at,
+                out,
+            )?;
+        }
+        // Binary data: the length, the subtype and the bytes, as BSON has them.
+        0x05 => {
+            let n = usize::try_from(at.peek_i32()?)
+                .map_err(|_| corrupt("binary data with a bad length"))?;
+            raw(tag::BSON_BIN_DATA, 4 + 1 + n, at, out)?;
+        }
+        0x06 => out.push(tag::BSON_UNDEFINED),
+        0x07 => raw(tag::BSON_OBJECT_ID, 12, at, out)?,
+        0x08 => raw(tag::BOOLEAN, 1, at, out)?,
+        0x09 => raw(tag::DATE, 8, at, out)?,
+        0x0A => out.push(tag::NULL),
+        // Regular expression: the pattern and the flags, as C strings.
+        0x0B => {
+            out.push(tag::BSON_REGEX);
+            out.extend_from_slice(at.cstr()?);
+            out.extend_from_slice(at.cstr()?);
+        }
+        // DBPointer: the namespace's length and bytes, then the ObjectId.
+        0x0C => {
+            let ns = bson_string(at)?;
+            counted(tag::BSON_DB_POINTER, ns, out);
+            out.extend_from_slice(at.take(12)?);
+        }
+        0x0D => counted(tag::BSON_JAVASCRIPT, bson_string(at)?, out),
+        0x0E => counted(tag::BSON_SYMBOL, bson_string(at)?, out),
+        // JavaScript with a scope: the code's length and bytes, then the
+        // scope's BSON.
+        0x0F => {
+            let _total = at.len()?;
+            counted(tag::BSON_CODE_W_SCOPE, bson_string(at)?, out);
+            let scope = usize::try_from(at.peek_i32()?)
+                .map_err(|_| corrupt("a scope with a bad length"))?;
+            out.extend_from_slice(at.take(scope)?);
+        }
+        0x10 => raw(tag::INT32, 4, at, out)?,
+        0x11 => raw(tag::TIMESTAMP, 8, at, out)?,
+        0x12 => raw(tag::INT64, 8, at, out)?,
+        0x13 => raw(tag::DECIMAL, 16, at, out)?,
+        0xFF => out.push(tag::MIN_KEY),
+        0x7F => out.push(tag::MAX_KEY),
+        _ => {
+            return Err(err(
+                "encode a record for",
+                format!("a value of type {t:#04x}"),
+            ))
+        }
+    }
+    Ok(())
+}
+
+/// One SBE value of tag `t` (already read) at `at`, written as a BSON
+/// value; returns its BSON type.
+fn sbe_value_to_bson(t: u8, at: &mut Cursor, out: &mut Vec<u8>) -> R<u8> {
+    let string = |at: &mut Cursor, out: &mut Vec<u8>| -> R<()> {
+        let n = u32::from_le_bytes(
+            at.take(4)?
+                .try_into()
+                .map_err(|_| corrupt("a string without its length"))?,
+        ) as usize;
+        out.extend_from_slice(
+            &i32::try_from(n + 1)
+                .map_err(|_| corrupt("a string too long"))?
+                .to_le_bytes(),
+        );
+        out.extend_from_slice(at.take(n)?);
+        out.push(0);
+        Ok(())
+    };
+    let bson_type = match t {
+        tag::DOUBLE => {
+            out.extend_from_slice(at.take(8)?);
+            0x01
+        }
+        tag::STRING_SMALL => {
+            let s = at.cstr()?;
+            out.extend_from_slice(&(s.len() as i32).to_le_bytes());
+            out.extend_from_slice(s);
+            0x02
+        }
+        tag::STRING_BIG => {
+            string(at, out)?;
+            0x02
+        }
+        tag::BSON_OBJECT | tag::BSON_ARRAY => {
+            let n = usize::try_from(at.peek_i32()?)
+                .map_err(|_| corrupt("a document with a bad length"))?;
+            out.extend_from_slice(at.take(n)?);
+            if t == tag::BSON_OBJECT {
+                0x03
+            } else {
+                0x04
+            }
+        }
+        tag::BSON_BIN_DATA => {
+            let n = usize::try_from(at.peek_i32()?)
+                .map_err(|_| corrupt("binary data with a bad length"))?;
+            out.extend_from_slice(at.take(4 + 1 + n)?);
+            0x05
+        }
+        tag::BSON_UNDEFINED => 0x06,
+        tag::BSON_OBJECT_ID => {
+            out.extend_from_slice(at.take(12)?);
+            0x07
+        }
+        tag::BOOLEAN => {
+            out.extend_from_slice(at.take(1)?);
+            0x08
+        }
+        tag::DATE => {
+            out.extend_from_slice(at.take(8)?);
+            0x09
+        }
+        tag::NULL => 0x0A,
+        tag::BSON_REGEX => {
+            out.extend_from_slice(at.cstr()?);
+            out.extend_from_slice(at.cstr()?);
+            0x0B
+        }
+        tag::BSON_DB_POINTER => {
+            string(at, out)?;
+            out.extend_from_slice(at.take(12)?);
+            0x0C
+        }
+        tag::BSON_JAVASCRIPT => {
+            string(at, out)?;
+            0x0D
+        }
+        tag::BSON_SYMBOL => {
+            string(at, out)?;
+            0x0E
+        }
+        tag::BSON_CODE_W_SCOPE => {
+            let start = out.len();
+            out.extend_from_slice(&[0; 4]);
+            string(at, out)?;
+            let scope = usize::try_from(at.peek_i32()?)
+                .map_err(|_| corrupt("a scope with a bad length"))?;
+            out.extend_from_slice(at.take(scope)?);
+            finish_doc(out, start)?;
+            0x0F
+        }
+        tag::INT32 => {
+            out.extend_from_slice(at.take(4)?);
+            0x10
+        }
+        tag::TIMESTAMP => {
+            out.extend_from_slice(at.take(8)?);
+            0x11
+        }
+        tag::INT64 => {
+            out.extend_from_slice(at.take(8)?);
+            0x12
+        }
+        tag::DECIMAL => {
+            out.extend_from_slice(at.take(16)?);
+            0x13
+        }
+        tag::MIN_KEY => 0xFF,
+        tag::MAX_KEY => 0x7F,
+        _ => return Err(corrupt(format!("an SBE value of tag {t}"))),
+    };
+    Ok(bson_type)
+}
+
 /// Bytes being read, with every read bounds-checked: a short or damaged
 /// spill fails the query, never panics.
 pub(crate) struct Cursor<'a> {
@@ -759,6 +1059,56 @@ mod tests {
         )
         .unwrap();
         assert_eq!(b, [5, 0, 1, 0, 0, 0, 9]);
+    }
+
+    #[test]
+    fn sbe_rows_round_trip() {
+        let d = every_type();
+        let mut values: Vec<Option<&Bson>> = d.values().map(Some).collect();
+        values.push(None);
+        let short = Bson::String("seven!!".into());
+        let nul = Bson::String("a\0b".into());
+        values.extend([Some(&short), Some(&nul)]);
+        let mut buf = Vec::new();
+        write_sbe_row(&values, &mut buf).unwrap();
+        let mut at = Cursor::new(&buf);
+        let back = read_sbe_row(&mut at).unwrap();
+        assert!(at.at_end());
+        assert_eq!(
+            back,
+            values.into_iter().map(|v| v.cloned()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn sbe_rows_are_mongods() {
+        // `MaterializedRow::serializeForSorter` (mongod 8.2.1): the count as
+        // a `size_t`, then each value's `TypeTags` byte and value. An int32.
+        let mut r = Vec::new();
+        write_sbe_row(&[Some(&Bson::Int32(5))], &mut r).unwrap();
+        assert_eq!(r, [1, 0, 0, 0, 0, 0, 0, 0, 1, 5, 0, 0, 0]);
+        // A string of up to seven bytes is a `StringSmall`, a C string; a
+        // longer one (or one holding a NUL) a `StringBig`, its `uint32`
+        // length and bytes. A missing value is `Nothing`, its tag alone.
+        let mut r = Vec::new();
+        let (small, big) = (Bson::String("ab".into()), Bson::String("abcdefgh".into()));
+        write_sbe_row(&[Some(&small), Some(&big), None], &mut r).unwrap();
+        let mut want = vec![3, 0, 0, 0, 0, 0, 0, 0, 12, b'a', b'b', 0, 14, 8, 0, 0, 0];
+        want.extend_from_slice(b"abcdefgh");
+        want.push(0);
+        assert_eq!(r, want);
+        // A document is `bsonObject`, its BSON.
+        let mut r = Vec::new();
+        write_sbe_row(&[Some(&Bson::Document(doc! { "a": 1 }))], &mut r).unwrap();
+        assert_eq!(
+            r,
+            [1, 0, 0, 0, 0, 0, 0, 0, 22, 12, 0, 0, 0, 0x10, b'a', 0, 1, 0, 0, 0, 0]
+        );
+        // The row RM-506 measured: `k` and a 1000-byte `s`, 1018 bytes.
+        let mut r = Vec::new();
+        let s = Bson::String("x".repeat(1000));
+        write_sbe_row(&[Some(&Bson::Int32(3)), Some(&s)], &mut r).unwrap();
+        assert_eq!(r.len(), 1018);
     }
 
     #[test]

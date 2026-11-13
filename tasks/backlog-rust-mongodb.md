@@ -1534,15 +1534,28 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       working RM-325.
       Verify: tests/backlog/test_rm_found_2026_11_13_rm325.py::test_server_status_reports_the_spill_engine
       Backlog-ID: RM-614
-- [ ] **An SBE sort's spilled records are not the size of mongod's.**
-      mongod 8.2.11's slot-based sort in front of a `$group`, over 300
-      documents of a 1000-byte `s` under a 50000-byte budget, writes 13 runs
-      of 900 records in 927900 bytes (1031 a record); this server writes the
-      same runs in 922500 (1025): it writes each row, `k` and `s` since
-      RM-504, as a BSON document rather than as SBE's row of values. Found
-      2026-11-10 (RM-398).
-      Verify: tests/backlog/test_rm_326_sort_counts.py::test_sbe_sort_spilled_bytes
-      Backlog-ID: RM-506
+- [ ] **An SBE sort's whole-document row leaves out the fields read beside it.**
+      mongod 8.2.11's slot-based sort in front of `{$group: {_id: "$k", f:
+      {$first: "$$ROOT"}}}`, over 300 documents of a 1000-byte `s` under a
+      50000-byte budget, spills rows of the whole document AND `k` (the
+      result slot and the named slot the `$group` reads): 956700 bytes over
+      900 records. This server's row holds the document alone (952200, 5
+      bytes a record fewer): `group::downstream_fields` answers `None` for
+      "whole documents" and drops the fields read by name. Found 2026-11-13
+      (RM-506).
+      Verify: tests/backlog/test_rm_found_2026_11_13_rm506.py::test_a_whole_document_row_keeps_the_fields_read_beside_it
+      Backlog-ID: RM-615
+- [ ] **An SBE sort counts no memory for a field a document lacks.**
+      mongod 8.2.11 counts every slot of an SBE sort's row in the memory it
+      holds, a missing field's `Nothing` included (`getApproximateSize`:
+      its tag and value, 9 bytes); this server counts only the fields a
+      document has (`sorter::doc_size`). With `t` on half of 300 documents
+      of a 1000-byte `s`, `[{$sort: {n: 1}}, {$group: {_id: "$k", f:
+      {$first: "$t"}, g: {$first: "$s"}}}]` under 50000 bytes reports
+      `sortTotalDataSizeBytes` 276834 on mongod and 275673 here (129 slots of
+      9). Found 2026-11-13 (RM-506).
+      Verify: tests/backlog/test_rm_found_2026_11_13_rm506.py::test_a_missing_field_counts_its_slot
+      Backlog-ID: RM-616
 - [ ] **A `range` window's `"current"` bound takes in tied documents.**
       mongod 8.2.1 reads `"current"` in a `range` window as the document
       answered (`getEndpointsRangeBased`: offset 0), so over `n` of 1, 1,
