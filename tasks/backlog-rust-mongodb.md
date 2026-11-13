@@ -1058,16 +1058,6 @@ These are explicit non-goals. Don't add them without a reason.
       2026-11-13.
       Verify: tests/backlog/test_rm_view_namespaces.py::test_a_change_stream_of_a_view_writes_no_line
       Backlog-ID: RM-593
-- [ ] **A `distinct` of a view is counted as failed.** A view's `distinct`
-      answers `ok` as an int32, as mongod's does, and about 270 readers of
-      a reply's `ok` (`get_f64("ok")`) take it for a failure:
-      `serverStatus` counts it in `metrics.commands.distinct.failed`, where
-      mongod 8.2.11 does not, and the transaction, interrupt and
-      write-concern paths read it the same way. The profiler reads it with
-      `util::reply_ok` since RM-380. Found while working RM-380,
-      2026-11-10.
-      Verify: tests/backlog/test_rm_view_namespaces.py::test_a_distinct_of_a_view_is_not_counted_failed
-      Backlog-ID: RM-490
 - [ ] **A `distinct` of a view counts nothing it examined.** mongod 8.2.11
       runs it as an aggregation over the collection beneath the view, and
       its line counts what that plan examined (`keysExamined: 11,

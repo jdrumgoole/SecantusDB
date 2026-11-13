@@ -16,6 +16,7 @@
 //! `Storage` trait yet). Cursor *creation* (`find` / `aggregate` / `watch`) also
 //! lands later; until then cursors are registered programmatically.
 
+use crate::util::ReplyOk;
 use std::collections::{HashMap, VecDeque};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -1641,7 +1642,7 @@ fn deferred_get_more(
     cursor.insert("batchSize", Bson::Int64(size));
     run.insert("cursor", cursor);
     let reply = match crate::aggregate::aggregate(&run, ctx) {
-        Ok(reply) if reply.get_f64("ok") != Ok(0.0) => reply,
+        Ok(reply) if reply.ok_number() != Ok(0.0) => reply,
         Ok(reply) => {
             cursors.return_stream(cursor_id, stream, true);
             return Ok(reply);

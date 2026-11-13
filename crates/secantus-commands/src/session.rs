@@ -15,6 +15,7 @@
 //!   (`retriedStmtIds`) and runs the rest.
 //! * A cursor belongs to the session, and the transaction, that opened it.
 
+use crate::util::ReplyOk;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
@@ -961,7 +962,7 @@ fn statement(
     }
     crate::finish_txn_statement(registry, txn, &mut result);
     if let Some(ns) = target {
-        if result.get_f64("ok").unwrap_or(0.0) == 1.0 && !result.contains_key("writeErrors") {
+        if result.ok_number().unwrap_or(0.0) == 1.0 && !result.contains_key("writeErrors") {
             let wrote = match name {
                 "insert" => crate::util::as_i64_field(&result, "n") > 0,
                 "update" => result.contains_key("upserted"),
@@ -1047,7 +1048,7 @@ fn txn_write_targets(name: &str, doc: &Document, db_name: &str) -> Vec<(String, 
 // ------------------------------------------------------------ retryable writes
 
 fn ok(reply: &Document) -> bool {
-    reply.get_f64("ok").unwrap_or(0.0) == 1.0
+    reply.ok_number().unwrap_or(0.0) == 1.0
 }
 
 /// The statement id of each of a write command's `count` statements:

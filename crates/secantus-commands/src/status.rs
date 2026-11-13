@@ -43,6 +43,7 @@
 //! zero standing in for something not counted is a lie. (`locks` joined the
 //! reported sections when the lock manager landed — RM-034, 2026-10-17.)
 
+use crate::util::ReplyOk;
 use std::sync::atomic::{AtomicI64, Ordering::Relaxed};
 use std::time::Duration;
 
@@ -211,7 +212,7 @@ impl StatusCounters {
             return;
         };
         let name = name.as_str();
-        let ok = reply.get_f64("ok").unwrap_or(0.0) == 1.0;
+        let ok = reply.ok_number().unwrap_or(0.0) == 1.0;
         let code = reply.get_i32("code").unwrap_or(0);
         let micros = elapsed.as_micros().min(i64::MAX as u128) as i64;
         // A command that did not parse never ran: mongod times it as a

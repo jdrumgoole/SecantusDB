@@ -18,6 +18,7 @@
 //! has an entry of its own (`op: "update"` / `"remove"`, the statement as its
 //! `command`), and the command itself has none.
 
+use crate::util::ReplyOk;
 use std::cell::{Cell, RefCell};
 use std::time::Instant;
 
@@ -245,7 +246,7 @@ fn ends_in_out(doc: &Document) -> bool {
 /// words a wrong-typed field its own way (`Expected field filterto be of
 /// type object`, mongod's spelling).
 fn refused_unprofiled(name: &str, reply: &Document) -> bool {
-    if reply.get_f64("ok").unwrap_or(1.0) == 1.0 {
+    if reply.ok_number().unwrap_or(1.0) == 1.0 {
         // `drop` of a collection that does not exist answers ok, profiled
         // nowhere (measured). A view's drop answers `{ns, ok}`, with no
         // index count, and is profiled as a collection's (RM-384).

@@ -337,11 +337,11 @@ def _distinct_metric(client: Any) -> dict:
     return {k: after[k] - before.get(k, 0) for k in after}
 
 
-@pytest.mark.backlog("RM-490")
+@pytest.mark.backlog_fixed("RM-490")
 def test_a_distinct_of_a_view_is_not_counted_failed(rust_mongo: Any, mongod_rs: Any) -> None:
     """mongod 8.2.11 counts a `distinct` of a view in
     `metrics.commands.distinct.total` and not in `failed`; this server
-    counts it failed, as it reads the reply's int32 `ok` as a double."""
+    counted it failed, as it read the reply's int32 `ok` as a double."""
     got = {s: _distinct_metric(c) for s, c in (("rust", rust_mongo), ("mongod", mongod_rs))}
     assert (got["mongod"]["total"], got["mongod"]["failed"]) == (1, 0)
     assert (got["rust"]["total"], got["rust"]["failed"]) == (1, 0)

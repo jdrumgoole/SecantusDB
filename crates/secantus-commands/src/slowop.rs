@@ -6,6 +6,7 @@
 //! any database and every database reads them back (probed on 8.2.11) -- and
 //! are not persisted across a restart.
 
+use crate::util::ReplyOk;
 use bson::Document;
 
 use crate::CommandContext;
@@ -187,7 +188,7 @@ pub(crate) fn statement_line(component: &'static str, mut attr: Document, worked
 /// `delete` reports its counts on each statement's line
 /// (`profiler::record`), not the command's.
 fn outcome(name: &str, reply: &Document, out: &mut Document) {
-    if reply.get_f64("ok").unwrap_or(1.0) != 1.0 {
+    if reply.ok_number().unwrap_or(1.0) != 1.0 {
         failure(reply, out);
         return;
     }
@@ -268,7 +269,7 @@ fn line_target<'a>(
     if name != "renameCollection" {
         return (db, target_collection(name, request));
     }
-    let renamed = reply.get_f64("ok").unwrap_or(1.0) == 1.0;
+    let renamed = reply.ok_number().unwrap_or(1.0) == 1.0;
     match request.get_str(name).ok().and_then(|ns| ns.split_once('.')) {
         Some((source_db, coll)) if renamed && !source_db.is_empty() && !coll.is_empty() => {
             (source_db, Some(coll))
@@ -326,7 +327,7 @@ pub fn read_attributes(request: &Document, reply: &Document, ctx: &CommandContex
     let mut out = Document::new();
     out.insert("isFromUserConnection", true);
     let (db, coll) = line_target(name, request, reply, &ctx.db_name);
-    let ok = reply.get_f64("ok").unwrap_or(1.0) == 1.0;
+    let ok = reply.ok_number().unwrap_or(1.0) == 1.0;
     // The namespace [`attributes`] names, moved beneath a view the read
     // failed under.
     if let (false, Some(coll)) = (ok, coll) {

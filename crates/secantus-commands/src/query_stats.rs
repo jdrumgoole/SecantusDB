@@ -19,6 +19,7 @@
 //! each of its operations. A command that fails is not recorded; a cursor
 //! a `getMore` fails on is, as it closes.
 
+use crate::util::ReplyOk;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicI32, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -564,7 +565,7 @@ pub fn after_operation(
         }
         return;
     }
-    let ok = reply.get_f64("ok").unwrap_or(0.0) == 1.0;
+    let ok = reply.ok_number().unwrap_or(0.0) == 1.0;
     // An `aggregate` that explains is recorded with its verbosity, which
     // this store does not shape (RM-215's remainder).
     if !ok || request.contains_key("explain") || store.rate_limit.load(Ordering::Relaxed) == 0 {
