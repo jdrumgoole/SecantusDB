@@ -200,7 +200,7 @@ impl PgHandler {
     /// The database's user casts, for the planner.
     pub(crate) fn user_casts(&self) -> Vec<UserCast> {
         self.type_catalog_docs(CAST_COLLECTION)
-            .map(|docs| docs.iter().map(cast_of).collect())
+            .map(|docs| docs.iter().map(|d| cast_of(d)).collect())
             .unwrap_or_default()
     }
 

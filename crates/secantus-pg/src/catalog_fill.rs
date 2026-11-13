@@ -1204,7 +1204,7 @@ impl PgHandler {
         };
         let tables: Vec<(i64, &TableDef)> = defs
             .iter()
-            .filter_map(|t| Some((Self::oid_in(&oids, &t.name)?, t)))
+            .filter_map(|t| Some((Self::oid_in(&oids, &t.name)?, &**t)))
             .collect();
         // By oid, the first of each: every row asks for its relation's
         // several times, and a scan of the list per ask made the fill

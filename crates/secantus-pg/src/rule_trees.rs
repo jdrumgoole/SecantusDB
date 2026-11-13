@@ -699,7 +699,11 @@ impl PgHandler {
         ] {
             for d in self
                 .type_catalog_docs(coll)
-                .map(|d| d.to_vec())
+                .map(|d| {
+                    d.iter()
+                        .map(|d| Document::clone(d))
+                        .collect::<Vec<Document>>()
+                })
                 .unwrap_or_default()
             {
                 if d.get_str("ev_action").is_ok_and(lists) {

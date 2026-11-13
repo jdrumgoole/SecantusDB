@@ -52,7 +52,11 @@ fn transform_key(type_oid: i64, lang: i64) -> String {
 impl PgHandler {
     fn transform_docs(&self) -> Vec<Document> {
         self.type_catalog_docs(TRANSFORM_COLLECTION)
-            .map(|d| d.to_vec())
+            .map(|d| {
+                d.iter()
+                    .map(|d| Document::clone(d))
+                    .collect::<Vec<Document>>()
+            })
             .unwrap_or_default()
     }
 

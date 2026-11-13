@@ -148,9 +148,11 @@ def test_the_first_catalog_query_after_ddl_costs_the_same_at_800_tables(
     800, and since the republication stopped copying the definitions and
     re-reading every table's index list, about 0.010 s and 0.027 s
     (2026-11-12), and since the index relations are derived once per
-    catalog version, about 0.010 s and 0.022 s (2026-11-13): the statement
-    after any DDL still republishes the session's per-version catalog
-    state (`install_session_state`) from every table.
+    catalog version, about 0.010 s and 0.022 s, and since unchanged catalog
+    documents and table definitions are shared across versions, about
+    0.010 s and 0.018 s (2026-11-13): the statement after any DDL still
+    derives the session's per-version catalog listings
+    (`install_session_state`) from every table.
 
     The fastest of five first-after-DDL runs with 800 more tables against
     the fastest with none, in one server, within a quarter again plus 2 ms.

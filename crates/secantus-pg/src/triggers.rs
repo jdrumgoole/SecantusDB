@@ -66,7 +66,11 @@ fn strings(doc: &Document, key: &str) -> Vec<String> {
 impl PgHandler {
     /// Every stored trigger.
     pub(crate) fn trigger_docs(&self) -> PgWireResult<Vec<Document>> {
-        Ok(self.type_catalog_docs(TRIGGER_COLLECTION)?.to_vec())
+        Ok(self
+            .type_catalog_docs(TRIGGER_COLLECTION)?
+            .iter()
+            .map(|d| Document::clone(d))
+            .collect())
     }
 
     /// The triggers on `table` for one timing / event / level, in name order.

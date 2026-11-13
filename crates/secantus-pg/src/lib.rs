@@ -282,7 +282,7 @@ type ColumnTypes = Vec<(String, String)>;
 struct IndexRelation {
     name: String,
     oid: i64,
-    table: TableDef,
+    table: Arc<TableDef>,
     /// 1-based column numbers; 0 for an expression key.
     keys: Vec<i32>,
     /// The `INCLUDE` columns' numbers, which `indkey` lists after the keys.
@@ -424,7 +424,7 @@ struct CatalogCache {
     version: std::sync::atomic::AtomicU64,
     /// `(storage, db, collection)` -> the decoded rows of one type-catalog
     /// collection, `_id`-sorted.
-    entries: VersionedMap<&'static str, Arc<Vec<Document>>>,
+    entries: VersionedMap<&'static str, CatalogDocs>,
     /// `(storage, db, table)` -> its decoded catalog entry; `None` records
     /// that the table does not exist.
     tables: VersionedMap<String, Arc<Option<TableDef>>>,
@@ -747,7 +747,7 @@ thread_local! {
     /// cache: `(storage, db, collection, catalog version, rows)`, only ever
     /// filled with what the shared cache holds as current.
     #[allow(clippy::type_complexity)]
-    static CATALOG_FRONT: std::cell::RefCell<Vec<(usize, String, &'static str, u64, Arc<Vec<Document>>)>> =
+    static CATALOG_FRONT: std::cell::RefCell<Vec<(usize, String, &'static str, u64, CatalogDocs)>> =
         const { std::cell::RefCell::new(Vec::new()) };
     /// `committed_cached`'s per-thread copy of its shared map:
     /// `(storage, db, slot, catalog version, value)`.
@@ -855,8 +855,20 @@ impl pgwire::api::cancel::CancelHandler for CancelBackend {
     }
 }
 
+/// One type-catalog collection's documents, `_id`-sorted. Each document is
+/// shared, so a catalog version reuses the previous version's decoding of a
+/// document whose stored bytes did not change (RP-911).
+type CatalogDocs = Arc<Vec<Arc<Document>>>;
+
+/// Every table's definition. Each one is shared, so a catalog version
+/// reuses the previous version's unchanged definitions rather than copying
+/// them (RP-911).
+type TableDefs = Arc<Vec<Arc<TableDef>>>;
+
 /// A composite type's fields: `(field name, field type name)`, in order.
 type CompositeFields = Vec<(String, String)>;
+/// One composite as `(schema, bare_name, oid, fields)`.
+type CompositeWithSchema = (String, String, i64, CompositeFields);
 /// One enum as `(schema, bare_name, oid, labels)`.
 type EnumWithSchema = (String, String, i64, Vec<String>);
 
@@ -6143,13 +6155,14 @@ impl PgHandler {
             })
             .collect();
         secantus_pgplan::set_user_composite_widths(widths);
-        for (schema, name, oid, fields) in self.composites_with_schema().unwrap_or_default() {
-            let resolution = Self::type_resolution(&schema, &name);
-            types.push((resolution.clone(), oid, Vec::new()));
+        for (schema, name, oid, fields) in self.composites_with_schema().unwrap_or_default().iter()
+        {
+            let resolution = Self::type_resolution(schema, name);
+            types.push((resolution.clone(), *oid, Vec::new()));
             // The field metadata rides its own channel so a composite VALUE cast
             // (`'(1,x)'::testcomp`) resolves each field's type; the empty label
             // list above keeps it OUT of the enum arm.
-            composites.push((resolution, oid, fields));
+            composites.push((resolution, *oid, fields.clone()));
         }
         // A view's row type is a composite of its output columns, as a
         // table's is, under the oid `pg_type` lists it with.
@@ -7197,7 +7210,7 @@ impl PgHandler {
         let oid_i = i64::from(oid);
         let composites = self.composites_with_schema()?;
         let Some((schema, name, _, fields)) =
-            composites.into_iter().find(|(_, _, o, _)| *o == oid_i)
+            composites.iter().find(|(_, _, o, _)| *o == oid_i).cloned()
         else {
             return Ok(None);
         };
@@ -11925,12 +11938,12 @@ impl PgHandler {
     /// clones nothing. The per-statement cost used to grow with every table
     /// the session had ever created -- each one leaves a row type here --
     /// until a plain `select 1` ran twice as slowly on a used store.
-    fn type_catalog_docs(&self, collection: &'static str) -> PgWireResult<Arc<Vec<Document>>> {
+    fn type_catalog_docs(&self, collection: &'static str) -> PgWireResult<CatalogDocs> {
         let docs = self.type_catalog_docs_raw(collection)?;
         if collection != Self::FUNCTION_COLLECTION {
             return Ok(docs);
         }
-        type Memo = (Arc<Vec<Document>>, String, Arc<Vec<Document>>);
+        type Memo = (CatalogDocs, String, CatalogDocs);
         thread_local! {
             /// The function catalog as this session reads it, for the raw
             /// documents it was made from: filtering and normalising every
@@ -11954,7 +11967,7 @@ impl PgHandler {
     }
 
     /// The function catalog `docs` as this session reads it.
-    fn function_docs_for_session(&self, mut docs: Arc<Vec<Document>>) -> Arc<Vec<Document>> {
+    fn function_docs_for_session(&self, mut docs: CatalogDocs) -> CatalogDocs {
         // Another session's `pg_temp` function is invisible here.
         if docs.iter().any(|d| Self::foreign_temp_function(d, self)) {
             docs = Arc::new(
@@ -11968,7 +11981,11 @@ impl PgHandler {
         // parameter positionally, with `param_modes` -- and read here as
         // inputs (`params` / `param_types`) plus OUT columns.
         if docs.iter().any(|d| d.contains_key("param_modes")) {
-            return Arc::new(docs.iter().map(normalize_function_doc).collect());
+            return Arc::new(
+                docs.iter()
+                    .map(|d| Arc::new(normalize_function_doc(d)))
+                    .collect(),
+            );
         }
         docs
     }
@@ -11985,7 +12002,7 @@ impl PgHandler {
         thread_local! {
             /// The answer, for the documents it was read from: every
             /// statement asks (RP-014).
-            static MEMO: std::cell::RefCell<Option<(Arc<Vec<Document>>, bool)>> =
+            static MEMO: std::cell::RefCell<Option<(CatalogDocs, bool)>> =
                 const { std::cell::RefCell::new(None) };
         }
         let Ok(docs) = self.type_catalog_docs_raw(Self::FUNCTION_COLLECTION) else {
@@ -12037,15 +12054,20 @@ impl PgHandler {
         Ok(())
     }
 
-    fn type_catalog_docs_raw(&self, collection: &'static str) -> PgWireResult<Arc<Vec<Document>>> {
+    fn type_catalog_docs_raw(&self, collection: &'static str) -> PgWireResult<CatalogDocs> {
         let committed = self.committed_type_catalog_docs(collection)?;
         let overlay = self.pending.types();
         if overlay.is_empty() {
             return Ok(committed);
         }
-        let mut by_id: std::collections::BTreeMap<String, Document> = committed
+        let mut by_id: std::collections::BTreeMap<String, Arc<Document>> = committed
             .iter()
-            .map(|d| (d.get_str("_id").unwrap_or_default().to_string(), d.clone()))
+            .map(|d| {
+                (
+                    d.get_str("_id").unwrap_or_default().to_string(),
+                    Arc::clone(d),
+                )
+            })
             .collect();
         for ((coll, id), doc) in overlay.iter() {
             if *coll != collection {
@@ -12053,7 +12075,7 @@ impl PgHandler {
             }
             match doc {
                 Some(d) => {
-                    by_id.insert(id.clone(), d.clone());
+                    by_id.insert(id.clone(), Arc::new(d.clone()));
                 }
                 None => {
                     by_id.remove(id);
@@ -12066,16 +12088,13 @@ impl PgHandler {
     /// The COMMITTED rows of one type-catalog collection, `_id`-sorted, from
     /// the process-wide cache when its version is current and from storage
     /// (decoding once for everyone) when it is not. See `CatalogCache`.
-    fn committed_type_catalog_docs(
-        &self,
-        collection: &'static str,
-    ) -> PgWireResult<Arc<Vec<Document>>> {
+    fn committed_type_catalog_docs(&self, collection: &'static str) -> PgWireResult<CatalogDocs> {
         let cache = catalog_cache();
         let version = cache.version.load(std::sync::atomic::Ordering::SeqCst);
         let storage_id = Arc::as_ptr(&self.storage) as usize;
         // This thread's copy of what the shared cache held: no lock and no
         // hashing of the key for the several lookups of every statement.
-        let front = |docs: &Arc<Vec<Document>>| {
+        let front = |docs: &CatalogDocs| {
             CATALOG_FRONT.with(|f| {
                 let mut f = f.borrow_mut();
                 f.retain(|(s, d, c, v, _)| {
@@ -12125,15 +12144,7 @@ impl PgHandler {
             .storage
             .find_matching(self.db(), collection, &Document::new())
             .map_err(|e| Self::storage_err("could not read the type catalog", e))?;
-        let mut by_id: std::collections::BTreeMap<String, Document> =
-            std::collections::BTreeMap::new();
-        for bytes in raw {
-            let d: Document =
-                decode_doc(&bytes).map_err(|e| Self::storage_err("could not decode a type", e))?;
-            let id = d.get_str("_id").unwrap_or_default().to_string();
-            by_id.insert(id, d);
-        }
-        let docs: Arc<Vec<Document>> = Arc::new(by_id.into_values().collect());
+        let docs = Self::decode_type_catalog(key.clone(), raw)?;
         // A read that was in flight while the version moved must not be
         // recorded as current: store it under the version it was read AT,
         // so a bump during the read still forces the next reader to storage.
@@ -12145,6 +12156,104 @@ impl PgHandler {
                 .insert(key, (version, Arc::clone(&docs)));
             front(&docs);
         }
+        Ok(docs)
+    }
+
+    /// One type-catalog collection's stored documents decoded, `_id`-sorted.
+    /// A document whose stored bytes are those this collection's previous
+    /// read decoded is that document again, shared rather than decoded
+    /// anew: every table leaves its row type in the composite catalog, and
+    /// decoding all of them for each catalog version grew the first
+    /// statement after any DDL with the schema (RP-911), where PostgreSQL
+    /// rebuilds only the syscache entries an invalidation names. Equal
+    /// bytes are an equal document, so the reuse holds for a read of any
+    /// snapshot. Both reads come in the collection's key order, so the
+    /// previous read's entry for a document is at the cursor, or just past
+    /// one a statement dropped or changed.
+    fn decode_type_catalog(
+        key: (usize, String, &'static str),
+        raw: Vec<Vec<u8>>,
+    ) -> PgWireResult<CatalogDocs> {
+        /// One read: its stored bytes and their documents in storage
+        /// order, and the same documents `_id`-sorted.
+        #[derive(Clone, Default)]
+        struct Previous {
+            raw: Arc<Vec<Vec<u8>>>,
+            in_order: Arc<Vec<Arc<Document>>>,
+            sorted: CatalogDocs,
+        }
+        type Key = (usize, String, &'static str);
+        static PREVIOUS: OnceLock<Mutex<HashMap<Key, Previous>>> = OnceLock::new();
+        let previous = PREVIOUS.get_or_init(|| Mutex::new(HashMap::new()));
+        let old = previous
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&key)
+            .cloned()
+            .unwrap_or_default();
+        let mut cursor = 0;
+        let mut in_order = Vec::with_capacity(raw.len());
+        let mut kept = std::collections::HashSet::with_capacity(raw.len());
+        let mut fresh = Vec::new();
+        for bytes in &raw {
+            let same = (cursor..old.raw.len().min(cursor + 3)).find(|&i| old.raw[i] == *bytes);
+            let doc = match same {
+                Some(i) => {
+                    cursor = i + 1;
+                    kept.insert(Arc::as_ptr(&old.in_order[i]));
+                    Arc::clone(&old.in_order[i])
+                }
+                None => {
+                    let doc = Arc::new(
+                        decode_doc(bytes)
+                            .map_err(|e| Self::storage_err("could not decode a type", e))?,
+                    );
+                    fresh.push(Arc::clone(&doc));
+                    doc
+                }
+            };
+            in_order.push(doc);
+        }
+        let id = |d: &Document| d.get_str("_id").unwrap_or_default().to_string();
+        // The previous read's order holds for the documents it shares with
+        // this one; only those decoded anew need placing.
+        let placed = (!old.sorted.is_empty() && fresh.len() <= 16)
+            .then(|| {
+                let mut sorted: Vec<Arc<Document>> = old
+                    .sorted
+                    .iter()
+                    .filter(|d| kept.contains(&Arc::as_ptr(d)))
+                    .cloned()
+                    .collect();
+                for d in fresh {
+                    let k = id(&d);
+                    let at = sorted.partition_point(|x| id(x) < k);
+                    if sorted.get(at).is_some_and(|x| id(x) == k) {
+                        return None;
+                    }
+                    sorted.insert(at, d);
+                }
+                Some(sorted)
+            })
+            .flatten();
+        let sorted = placed.unwrap_or_else(|| {
+            // A repeated `_id` keeps its last document.
+            let mut by_id: std::collections::BTreeMap<String, Arc<Document>> =
+                std::collections::BTreeMap::new();
+            for d in &in_order {
+                by_id.insert(id(d), Arc::clone(d));
+            }
+            by_id.into_values().collect()
+        });
+        let docs: CatalogDocs = Arc::new(sorted);
+        previous.lock().unwrap_or_else(|e| e.into_inner()).insert(
+            key,
+            Previous {
+                raw: Arc::new(raw),
+                in_order: Arc::new(in_order),
+                sorted: Arc::clone(&docs),
+            },
+        );
         Ok(docs)
     }
 
@@ -12215,9 +12324,24 @@ impl PgHandler {
     /// The Python server's `__sql_composites__` shape: a doc `{composite, oid,
     /// fields: [[name, tag, sub], ...]}`, where `tag` is the field's SQL type
     /// name and `sub` is a nested composite's fields (unused here).
-    fn composites(&self) -> PgWireResult<Vec<(String, i64, CompositeFields)>> {
+    fn composites(&self) -> PgWireResult<Arc<Vec<(String, i64, CompositeFields)>>> {
+        type Memo = (CatalogDocs, Arc<Vec<(String, i64, CompositeFields)>>);
+        thread_local! {
+            /// For the documents it was built from: a statement asks several
+            /// times, and each listing of every table's row type grew the
+            /// first statement after DDL with the schema (RP-911).
+            static MEMO: std::cell::RefCell<Option<Memo>> = const { std::cell::RefCell::new(None) };
+        }
+        let docs = self.type_catalog_docs(Self::COMPOSITE_COLLECTION)?;
+        if let Some(hit) = MEMO.with(|m| {
+            m.borrow()
+                .as_ref()
+                .and_then(|(d, out)| Arc::ptr_eq(d, &docs).then(|| Arc::clone(out)))
+        }) {
+            return Ok(hit);
+        }
         let mut out = Vec::new();
-        for d in self.type_catalog_docs(Self::COMPOSITE_COLLECTION)?.iter() {
+        for d in docs.iter() {
             let name = d.get_str("composite").unwrap_or_default().to_string();
             let oid = d
                 .get_i64("oid")
@@ -12227,6 +12351,8 @@ impl PgHandler {
             out.push((name, oid, fields));
         }
         out.sort();
+        let out = Arc::new(out);
+        MEMO.with(|m| *m.borrow_mut() = Some((docs, Arc::clone(&out))));
         Ok(out)
     }
 
@@ -12257,7 +12383,7 @@ impl PgHandler {
         &self,
         resolution: &str,
     ) -> PgWireResult<Option<(String, String, i64, CompositeFields)>> {
-        type Memo = (Arc<Vec<Document>>, Arc<HashMap<String, usize>>);
+        type Memo = (CatalogDocs, Arc<HashMap<String, usize>>);
         thread_local! {
             /// Each resolution name's first document, for the documents it
             /// was built from: a result asks for every column whose type
@@ -12332,11 +12458,7 @@ impl PgHandler {
     /// for a caller asking for many: the catalog documents are fetched once
     /// rather than per relation (RP-715). `i64::MIN` marks a name with none.
     fn relation_oids(&self) -> Option<Arc<HashMap<String, i64>>> {
-        type Memo = (
-            Arc<Vec<Document>>,
-            Arc<Vec<Document>>,
-            Arc<HashMap<String, i64>>,
-        );
+        type Memo = (CatalogDocs, CatalogDocs, Arc<HashMap<String, i64>>);
         thread_local! {
             /// Every relation's oid, by name, for the catalog documents it
             /// was built from: callers ask once per relation, and a scan
@@ -12764,7 +12886,7 @@ impl PgHandler {
         type Memo = (
             usize,
             String,
-            Arc<Vec<TableDef>>,
+            TableDefs,
             Arc<HashMap<String, i64>>,
             u64,
             Arc<Vec<IndexRelation>>,
@@ -12833,11 +12955,11 @@ impl PgHandler {
     /// and each table's stored index list.
     fn derive_index_relations(
         &self,
-        defs: &[TableDef],
+        defs: &[Arc<TableDef>],
         oids: &HashMap<String, i64>,
     ) -> PgWireResult<Vec<IndexRelation>> {
         let mut out = Vec::new();
-        let defs_partitions = |parent: &str| -> Vec<&TableDef> {
+        let defs_partitions = |parent: &str| -> Vec<&Arc<TableDef>> {
             defs.iter()
                 .filter(|d| partition::parent_of(d) == Some(parent))
                 .collect()
@@ -13057,9 +13179,22 @@ impl PgHandler {
     /// `schema` field), so the bare-name resolution is unchanged for those.
     /// `pg_type.typname` and `pg_attribute` still use the BARE name; only
     /// duplicate-checking and `to_regtype` resolution consult the schema.
-    fn composites_with_schema(&self) -> PgWireResult<Vec<(String, String, i64, CompositeFields)>> {
+    fn composites_with_schema(&self) -> PgWireResult<Arc<Vec<CompositeWithSchema>>> {
+        type Memo = (CatalogDocs, Arc<Vec<CompositeWithSchema>>);
+        thread_local! {
+            /// For the documents it was built from, as `composites` keeps.
+            static MEMO: std::cell::RefCell<Option<Memo>> = const { std::cell::RefCell::new(None) };
+        }
+        let docs = self.type_catalog_docs(Self::COMPOSITE_COLLECTION)?;
+        if let Some(hit) = MEMO.with(|m| {
+            m.borrow()
+                .as_ref()
+                .and_then(|(d, out)| Arc::ptr_eq(d, &docs).then(|| Arc::clone(out)))
+        }) {
+            return Ok(hit);
+        }
         let mut out = Vec::new();
-        for d in self.type_catalog_docs(Self::COMPOSITE_COLLECTION)?.iter() {
+        for d in docs.iter() {
             let name = d.get_str("composite").unwrap_or_default().to_string();
             let schema = d.get_str("schema").unwrap_or("public").to_string();
             let oid = d
@@ -13070,6 +13205,8 @@ impl PgHandler {
             out.push((schema, name, oid, fields));
         }
         out.sort();
+        let out = Arc::new(out);
+        MEMO.with(|m| *m.borrow_mut() = Some((docs, Arc::clone(&out))));
         Ok(out)
     }
 
@@ -13906,7 +14043,7 @@ impl PgHandler {
                 matches!(d.get_str("language"), Ok("sql" | "plpgsql"))
                     || d.get_str("call_sql").is_ok()
             })
-            .cloned()
+            .map(|d| Document::clone(d))
             .collect())
     }
 
@@ -14064,7 +14201,7 @@ impl PgHandler {
             self.type_catalog_docs_raw(Self::FUNCTION_COLLECTION)?
                 .iter()
                 .find(|d| d.get_str("_id") == Ok(key.as_str()))
-                .cloned()
+                .map(|d| Document::clone(d))
         } else {
             None
         };
@@ -14620,7 +14757,7 @@ impl PgHandler {
         self.rename_relation_in_views(view, to)?;
         // What is keyed by the view's name follows it: its triggers and its
         // grants.
-        for mut t in self.trigger_docs()?.iter().cloned() {
+        for mut t in self.trigger_docs()? {
             if t.get_str("table") == Ok(view) {
                 let id = t.get_str("_id").unwrap_or_default().to_string();
                 t.insert("table", to);
@@ -14670,7 +14807,7 @@ impl PgHandler {
                 secantus_pgplan::view_deps::rename_column(def, relation, old, new, &columns_of)
                     .map_err(|e| Self::err(&e))?;
             if rewritten != def {
-                let mut d = d.clone();
+                let mut d = Document::clone(d);
                 d.insert("definition", rewritten);
                 rewrites.push((id, d));
             }
@@ -14693,7 +14830,7 @@ impl PgHandler {
                 .map_err(|e| Self::err(&e))?;
             if rewritten != def {
                 let id = d.get_str("_id").unwrap_or_default().to_string();
-                let mut d = d.clone();
+                let mut d = Document::clone(d);
                 d.insert("definition", rewritten);
                 self.replace_view_doc(&id, d)?;
             }
@@ -15085,7 +15222,7 @@ impl PgHandler {
                 } else if let Some((_, _, fields)) = self
                     .composites()
                     .ok()
-                    .and_then(|c| c.into_iter().find(|(n, _, _)| n == ret))
+                    .and_then(|c| c.iter().find(|(n, _, _)| n == ret).cloned())
                 {
                     FnColumns::Named(fields.into_iter().map(|(n, _)| n).collect())
                 } else {
@@ -16248,7 +16385,7 @@ impl PgHandler {
             .ok()?
             .iter()
             .find(|d| d.get_str("view").or_else(|_| d.get_str("_id")) == Ok(name))
-            .cloned()
+            .map(|d| Document::clone(d))
     }
 
     /// The tables `def` inherits from (`INHERITS (p, ...)`).
@@ -16545,7 +16682,7 @@ impl PgHandler {
     /// view's definition each time grew each statement's cost with the
     /// number of views (RP-014).
     fn views_shared(&self) -> PgWireResult<Arc<Vec<(String, String)>>> {
-        type Memo = (Arc<Vec<Document>>, Arc<Vec<(String, String)>>);
+        type Memo = (CatalogDocs, Arc<Vec<(String, String)>>);
         thread_local! {
             static MEMO: std::cell::RefCell<Option<Memo>> = const { std::cell::RefCell::new(None) };
         }
@@ -16606,7 +16743,7 @@ impl PgHandler {
                 if ix.get_str("name") == Ok("_id_") {
                     continue;
                 }
-                out.push((def.clone(), ix));
+                out.push((TableDef::clone(def), ix));
             }
         }
         Ok(out)
@@ -17729,7 +17866,11 @@ impl PgHandler {
         trees: Option<(String, String)>,
     ) -> PgWireResult<()> {
         let docs = self.type_catalog_docs(Self::VIEW_COLLECTION)?;
-        let Some(mut doc) = docs.iter().find(|d| d.get_str("_id") == Ok(name)).cloned() else {
+        let Some(mut doc) = docs
+            .iter()
+            .find(|d| d.get_str("_id") == Ok(name))
+            .map(|d| Document::clone(d))
+        else {
             return Ok(());
         };
         doc.insert("oid", relid);
@@ -18636,7 +18777,7 @@ impl PgHandler {
                     .type_catalog_docs_raw(Self::FUNCTION_COLLECTION)?
                     .iter()
                     .find(|d| d.get_str("_id") == Ok(key.as_str()))
-                    .cloned()
+                    .map(|d| Document::clone(d))
                 else {
                     // A built-in routine has no catalog document to hold it.
                     return Err(Self::user_error(
@@ -19686,7 +19827,7 @@ impl PgHandler {
         for def in self.shared_table_defs()?.iter() {
             for c in &def.columns {
                 if c.extra.get_str("domain_type") == Ok(name) {
-                    out.push((def.clone(), c.name.clone()));
+                    out.push((TableDef::clone(def), c.name.clone()));
                 }
             }
         }
@@ -19918,7 +20059,7 @@ impl PgHandler {
             .type_catalog_docs(Self::DOMAIN_COLLECTION)?
             .iter()
             .find(|d| d.get_str("domain") == Ok(name))
-            .cloned())
+            .map(|d| Document::clone(d)))
     }
 
     /// `COMMENT ON DOMAIN`: kept on the domain's document as `comment`, the
@@ -19964,7 +20105,7 @@ impl PgHandler {
             .ok()?
             .iter()
             .find(|d| d.get_str("matview") == Ok(name))
-            .and_then(Self::written_aliases_of)
+            .and_then(|d| Self::written_aliases_of(d))
     }
 
     fn matviews(&self) -> PgWireResult<Vec<(String, String, bool)>> {
@@ -22818,7 +22959,11 @@ impl PgHandler {
                 };
                 let view_docs = self
                     .type_catalog_docs(Self::VIEW_COLLECTION)
-                    .map(|d| d.to_vec())
+                    .map(|d| {
+                        d.iter()
+                            .map(|d| Document::clone(d))
+                            .collect::<Vec<Document>>()
+                    })
                     .unwrap_or_default();
                 let row_types = self.composites().unwrap_or_default();
                 let type_owners = self.type_owner_oids();
@@ -23070,11 +23215,12 @@ impl PgHandler {
                     .iter()
                     .filter_map(|d| d.get(f("oid")).and_then(bson_i64))
                     .collect();
-                for (name, oid, fields) in self.composites().unwrap_or_default() {
-                    if listed.contains(&oid) || self.lookup(&name).is_some() {
+                for (name, oid, fields) in self.composites().unwrap_or_default().iter() {
+                    let oid = *oid;
+                    if listed.contains(&oid) || self.lookup(name).is_some() {
                         continue;
                     }
-                    let (schema, bare) = secantus_pgplan::schemas::split_key(&name);
+                    let (schema, bare) = secantus_pgplan::schemas::split_key(name);
                     let schema = composite_schema.get(&oid).cloned().unwrap_or(schema);
                     let nsp = namespaces
                         .iter()
@@ -23097,7 +23243,7 @@ impl PgHandler {
                         Bson::Int64(
                             type_owners
                                 .iter()
-                                .find(|(n, _)| *n == bare || *n == name)
+                                .find(|(n, _)| *n == bare || n == name)
                                 .map_or(10, |(_, o)| *o),
                         ),
                     );
@@ -23496,7 +23642,7 @@ impl PgHandler {
                     .collect();
                 let composites = match user_types {
                     true => self.composites().ok()?,
-                    false => Vec::new(),
+                    false => Arc::default(),
                 };
                 for (name, oid, _) in composites.iter().cloned() {
                     let mut d = Document::new();
@@ -23554,7 +23700,11 @@ impl PgHandler {
                 // TYPE completes it (measured on 16) -- and derived after.
                 let base_docs = self
                     .type_catalog_docs(Self::BASE_TYPE_COLLECTION)
-                    .map(|d| d.to_vec())
+                    .map(|d| {
+                        d.iter()
+                            .map(|d| Document::clone(d))
+                            .collect::<Vec<Document>>()
+                    })
                     .unwrap_or_default();
                 let base_types = match user_types {
                     true => self.base_types().ok()?,
@@ -24713,7 +24863,8 @@ impl PgHandler {
                         Some((oid, (ints("attnums"), ints("dropped"))))
                     })
                     .collect();
-                for (cname, oid, fields) in self.composites().ok()? {
+                for (cname, oid, fields) in self.composites().ok()?.iter() {
+                    let oid = *oid;
                     if table_names.contains(cname.as_str()) || !wanted(oid) {
                         continue;
                     }
@@ -30104,7 +30255,7 @@ impl PgHandler {
             self.index_relations()
                 .into_iter()
                 .find(|ix| ix.name == bare)
-                .map(|ix| ix.table.name)
+                .map(|ix| ix.table.name.clone())
         };
         match stmt {
             Statement::Sequence(_, stmts) => stmts
@@ -31750,7 +31901,7 @@ impl PgHandler {
             .find(|d| {
                 d.get_str("_id") == Ok(def.name.as_str()) && d.get_bool("relation").unwrap_or(false)
             })
-            .cloned()
+            .map(|d| Document::clone(d))
         else {
             return Ok(());
         };
@@ -31785,7 +31936,7 @@ impl PgHandler {
             .type_catalog_docs(Self::COMPOSITE_COLLECTION)?
             .iter()
             .find(|d| d.get_str("_id") == Ok(old) && d.get_bool("relation").unwrap_or(false))
-            .cloned()
+            .map(|d| Document::clone(d))
         else {
             return Ok(());
         };
@@ -36280,7 +36431,7 @@ impl PgHandler {
         fn ident_byte(b: u8) -> bool {
             b.is_ascii_alphanumeric() || b == b'_' || b >= 0x80
         }
-        type Memo = (Arc<Vec<Document>>, Arc<Names>);
+        type Memo = (CatalogDocs, Arc<Names>);
         thread_local! {
             /// For the catalog documents they were read from: every
             /// statement asks, and reading, lowercasing and searching for
@@ -41803,7 +41954,7 @@ impl PgHandler {
                     descs.extend(routines.iter().map(|f| {
                         docs.iter()
                             .find(|d| d.get_str("_id") == Ok(f.key.as_str()))
-                            .map(row_type_depends::routine_description)
+                            .map(|d| row_type_depends::routine_description(d))
                             .unwrap_or_else(|| format!("function {name}.{}()", f.name))
                     }));
                     // The relations it holds, stored as `schema.name`.
@@ -46206,7 +46357,7 @@ impl PgHandler {
                             .index_relations()
                             .into_iter()
                             .find(|ix| names_index(ix, index))
-                            .map(|ix| (ix.table.name, ix.name));
+                            .map(|ix| (ix.table.name.clone(), ix.name));
                         if let Some((t, name)) = owner {
                             self.btree_reindex_one(&t, &name)?;
                         }
@@ -46798,7 +46949,7 @@ impl PgHandler {
                     .type_catalog_docs(Self::SCHEMA_COLLECTION)?
                     .iter()
                     .find(|d| d.get_str("_id") == Ok(name.as_str()))
-                    .cloned()
+                    .map(|d| Document::clone(d))
                     .unwrap_or_else(|| bson::doc! {"_id": &name, "schema": &name});
                 doc.insert("owner", owner);
                 self.delete_type_doc(Self::SCHEMA_COLLECTION, &name)?;
@@ -48608,13 +48759,14 @@ impl PgHandler {
     /// Every user table this session can see: the committed catalog with
     /// what this transaction created or dropped overlaid on it.
     fn all_table_defs(&self) -> PgWireResult<Vec<TableDef>> {
-        self.shared_table_defs().map(Arc::unwrap_or_clone)
+        self.shared_table_defs()
+            .map(|defs| defs.iter().map(|d| TableDef::clone(d)).collect())
     }
 
     /// [`Self::all_table_defs`], shared: the committed catalog's decoded
     /// definitions themselves when that is what this session sees, so a
     /// reader that only looks need not copy every one (RP-715).
-    fn shared_table_defs(&self) -> PgWireResult<Arc<Vec<TableDef>>> {
+    fn shared_table_defs(&self) -> PgWireResult<TableDefs> {
         // Outside a transaction block, with no catalog change of this
         // session's pending, the read below sees the latest committed
         // catalog, which `committed_table_defs` keeps decoded once per
@@ -48639,15 +48791,16 @@ impl PgHandler {
             .storage
             .find_matching(self.db(), CATALOG_COLLECTION, &Document::new())
             .map_err(|e| Self::storage_err("could not read the catalog", e))?;
-        let mut defs: Vec<TableDef> = raw
+        let mut defs: Vec<Arc<TableDef>> = raw
             .iter()
             .filter_map(|b| decode_doc(b).ok())
             .filter_map(|d| TableDef::from_document(&d))
+            .map(Arc::new)
             .collect();
         {
             let pending = self.pending.tables();
             defs.retain(|d| !pending.contains_key(&d.name));
-            defs.extend(pending.values().filter_map(|d| d.clone()));
+            defs.extend(pending.values().filter_map(|d| d.clone().map(Arc::new)));
         }
         Ok(Arc::new(defs))
     }
@@ -48666,10 +48819,10 @@ impl PgHandler {
         // Every UPDATE and DELETE asks; reading and decoding the whole
         // catalog for it was half an autocommit UPDATE's server time.
         if let Some(defs) = self.committed_table_defs() {
-            return Ok(defs.iter().flat_map(pick).collect());
+            return Ok(defs.iter().flat_map(|d| pick(d)).collect());
         }
         let defs = self.shared_table_defs()?;
-        Ok(defs.iter().flat_map(pick).collect())
+        Ok(defs.iter().flat_map(|d| pick(d)).collect())
     }
 
     /// Has this session's open transaction left the catalog as committed:
@@ -48686,11 +48839,11 @@ impl PgHandler {
     /// Every table definition as committed, read once per catalog version
     /// (on a session of its own) and shared; `None` while this session's
     /// transaction has catalog changes of its own (`catalog_untouched`).
-    fn committed_table_defs(&self) -> Option<Arc<Vec<TableDef>>> {
+    fn committed_table_defs(&self) -> Option<TableDefs> {
         /// One catalog version's definitions, and each one's stored bytes.
         struct Entry {
             version: u64,
-            defs: Arc<Vec<TableDef>>,
+            defs: TableDefs,
             raw: Arc<Vec<Vec<u8>>>,
         }
         type Cache = Mutex<HashMap<(usize, String), Entry>>;
@@ -48737,13 +48890,13 @@ impl PgHandler {
             let def = match same {
                 Some(i) => {
                     cursor = i + 1;
-                    old_defs[i].clone()
+                    Arc::clone(&old_defs[i])
                 }
                 None => match decode_doc(&b)
                     .ok()
                     .and_then(|d| TableDef::from_document(&d))
                 {
-                    Some(def) => def,
+                    Some(def) => Arc::new(def),
                     None => continue,
                 },
             };
@@ -58610,4 +58763,55 @@ fn catalog_typmod(c: &secantus_pgcatalog::Column) -> i32 {
         .ok()
         .and_then(secantus_pgplan::domains::user_domain)
         .map_or(c.typmod, |d| d.typmod)
+}
+
+#[cfg(test)]
+mod type_catalog_reuse_tests {
+    use super::*;
+
+    fn raw(ids: &[(&str, i32)]) -> Vec<Vec<u8>> {
+        ids.iter()
+            .map(|(id, v)| encode_doc(&bson::doc! {"_id": *id, "v": *v}).unwrap())
+            .collect()
+    }
+
+    fn ids(docs: &CatalogDocs) -> Vec<(String, i32)> {
+        docs.iter()
+            .map(|d| {
+                (
+                    d.get_str("_id").unwrap().to_string(),
+                    d.get_i32("v").unwrap(),
+                )
+            })
+            .collect()
+    }
+
+    /// A read after a change keeps the `_id` order a fresh sort gives, and
+    /// shares each document whose stored bytes did not change (RP-911).
+    #[test]
+    fn a_changed_read_is_sorted_and_shares_what_did_not_change() {
+        let key = (usize::MAX - 7, "reuse_test".to_string(), "__reuse_test__");
+        let first = PgHandler::decode_type_catalog(
+            key.clone(),
+            raw(&[("m", 1), ("c", 1), ("x", 1), ("a", 1)]),
+        )
+        .unwrap();
+        assert_eq!(
+            ids(&first),
+            [("a", 1), ("c", 1), ("m", 1), ("x", 1)].map(|(k, v)| (k.to_string(), v))
+        );
+        // `c` changed, `x` went, `b` and `z` came; storage order unsorted.
+        let second = PgHandler::decode_type_catalog(
+            key.clone(),
+            raw(&[("m", 1), ("z", 2), ("c", 2), ("b", 2), ("a", 1)]),
+        )
+        .unwrap();
+        assert_eq!(
+            ids(&second),
+            [("a", 1), ("b", 2), ("c", 2), ("m", 1), ("z", 2)].map(|(k, v)| (k.to_string(), v))
+        );
+        assert!(Arc::ptr_eq(&first[0], &second[0]), "a is shared");
+        assert!(Arc::ptr_eq(&first[2], &second[3]), "m is shared");
+        assert!(!Arc::ptr_eq(&first[1], &second[2]), "c was decoded anew");
+    }
 }

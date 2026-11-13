@@ -94,7 +94,7 @@ impl PgHandler {
             .type_catalog_docs(COLLATION_COLLECTION)?
             .iter()
             .find(|d| d.get_str("_id") == Ok(name))
-            .cloned()
+            .map(|d| Document::clone(d))
         else {
             return Err(Self::no_such_collation(name));
         };

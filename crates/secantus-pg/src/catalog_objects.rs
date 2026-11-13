@@ -64,7 +64,11 @@ fn pub_tables_bson(tables: &[PubTable]) -> Vec<Bson> {
 impl PgHandler {
     pub(crate) fn catalog_docs(&self, collection: &'static str) -> Vec<Document> {
         self.type_catalog_docs(collection)
-            .map(|d| d.to_vec())
+            .map(|d| {
+                d.iter()
+                    .map(|d| Document::clone(d))
+                    .collect::<Vec<Document>>()
+            })
             .unwrap_or_default()
     }
 
