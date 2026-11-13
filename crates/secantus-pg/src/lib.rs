@@ -5869,6 +5869,15 @@ impl PgHandler {
         }
     }
 
+    /// Is a catalog-changing statement running? Its writes are in the
+    /// catalog but the catalog version has not moved, so no per-version
+    /// memo or shared definition may answer.
+    fn in_catalog_statement(&self) -> bool {
+        self.catalog_statements
+            .load(std::sync::atomic::Ordering::Relaxed)
+            > 0
+    }
+
     fn block_wrote_catalog(&self) -> bool {
         self.in_transaction
             .load(std::sync::atomic::Ordering::Relaxed)
@@ -13292,28 +13301,7 @@ impl PgHandler {
             .collect();
         while let Some(ix) = stack.pop() {
             for child in defs_partitions(&ix.table.name) {
-                let name = match ix.name.strip_prefix(&format!("{}_", ix.table.name)) {
-                    Some(rest) => format!("{}_{rest}", child.name),
-                    None => {
-                        let cols: Vec<&str> = ix
-                            .keys
-                            .iter()
-                            .filter_map(|k| child.columns.get((*k as usize).wrapping_sub(1)))
-                            .map(|c| c.name.as_str())
-                            .collect();
-                        format!("{}_{}_idx", child.name, cols.join("_"))
-                    }
-                };
-                let rel = IndexRelation {
-                    oid: Self::index_oid(&name),
-                    name,
-                    table: child.clone(),
-                    keys: ix.keys.clone(),
-                    include: ix.include.clone(),
-                    unique: ix.unique,
-                    primary: ix.primary,
-                    exclusion: ix.exclusion,
-                };
+                let rel = Self::partition_index(&ix, child);
                 if partition::is_partitioned(child) {
                     stack.push(IndexRelation {
                         name: rel.name.clone(),
@@ -13333,6 +13321,92 @@ impl PgHandler {
         // pg_index's physical order is creation order, which the oids follow.
         out.sort_by_key(|ix| ix.oid);
         Ok(out)
+    }
+
+    /// The index a partitioned table's index `ix` has on its partition
+    /// `child`, named as PostgreSQL names it: the parent's suffix on the
+    /// partition's name (`m_lo_pkey`), or `<partition>_<columns>_idx` for an
+    /// index the user named.
+    fn partition_index(ix: &IndexRelation, child: &Arc<TableDef>) -> IndexRelation {
+        let name = match ix.name.strip_prefix(&format!("{}_", ix.table.name)) {
+            Some(rest) => format!("{}_{rest}", child.name),
+            None => {
+                let cols: Vec<&str> = ix
+                    .keys
+                    .iter()
+                    .filter_map(|k| child.columns.get((*k as usize).wrapping_sub(1)))
+                    .map(|c| c.name.as_str())
+                    .collect();
+                format!("{}_{}_idx", child.name, cols.join("_"))
+            }
+        };
+        IndexRelation {
+            oid: Self::index_oid(&name),
+            name,
+            table: child.clone(),
+            keys: ix.keys.clone(),
+            include: ix.include.clone(),
+            unique: ix.unique,
+            primary: ix.primary,
+            exclusion: ix.exclusion,
+        }
+    }
+
+    /// [`Self::try_table_index_relations`], a failed read answered as no
+    /// indexes, as [`Self::index_relations`] answers it.
+    pub(crate) fn table_index_relations_of(&self, table: &str) -> Vec<IndexRelation> {
+        self.try_table_index_relations(table).unwrap_or_default()
+    }
+
+    /// `table`'s own entries of [`Self::try_index_relations`], in the same
+    /// order, from its catalog row, its index list and its ancestors'
+    /// alone: while a statement changes the catalog the full list reads and
+    /// decodes every table's row, which made a `CREATE TABLE` building its
+    /// constraints' indexes grow with the schema (RP-921). PostgreSQL
+    /// builds a relation's indexes from that relation (`index_build`).
+    fn try_table_index_relations(&self, table: &str) -> PgWireResult<Vec<IndexRelation>> {
+        let Some(t) = self.fresh_table_def(table)? else {
+            return Ok(Vec::new());
+        };
+        let table_oid = self.relation_oid(table).filter(|o| *o > 0);
+        let stored = self
+            .storage
+            .list_indexes_shared(self.db(), table)
+            .map_err(|e| Self::storage_err("could not read the index list", e))?;
+        let mut out = Self::table_index_relations(&t, table_oid, &stored);
+        // A partition carries its partitioned ancestors' indexes.
+        if let Some(parent) = partition::parent_of(&t) {
+            if self
+                .fresh_table_def(parent)?
+                .is_some_and(|p| partition::is_partitioned(&p))
+            {
+                for ix in self.try_table_index_relations(parent)? {
+                    out.push(Self::partition_index(&ix, &t));
+                }
+            }
+        }
+        out.sort_by_key(|ix| ix.oid);
+        Ok(out)
+    }
+
+    /// One table's entry of [`Self::shared_table_defs`], read as its
+    /// uncached path reads them: this transaction's pending create or drop,
+    /// else the catalog row in storage. Never the per-version cache, which a
+    /// catalog-changing statement has not yet moved.
+    fn fresh_table_def(&self, name: &str) -> PgWireResult<Option<Arc<TableDef>>> {
+        if let Some(pending) = self.pending.tables().get(name) {
+            return Ok(pending.clone().map(Arc::new));
+        }
+        let raw = self
+            .storage
+            .find_matching(self.db(), CATALOG_COLLECTION, &bson::doc! { "_id": name })
+            .map_err(|e| Self::storage_err("could not read the catalog", e))?;
+        Ok(raw
+            .iter()
+            .filter_map(|b| decode_doc(b).ok())
+            .filter_map(|d| TableDef::from_document(&d))
+            .find(|d| d.name == name)
+            .map(Arc::new))
     }
 
     /// Stamp each column of `def` with where it is read from, for the
@@ -16950,6 +17024,63 @@ impl PgHandler {
     /// Every index a `CREATE INDEX` or a UNIQUE constraint built, with the
     /// table it is on -- storage's own `_id_` excluded, since the primary key
     /// is reported as `<t>_pkey` from the catalog instead.
+    /// The names of the tables [`Self::shared_table_defs`] lists, in its
+    /// order. While a statement changes the catalog, or inside a user
+    /// transaction, that list reads and decodes every table's catalog row;
+    /// a caller after names alone (is an index called this?) reads them
+    /// from the raw rows instead, as PostgreSQL finds a relation by name
+    /// without building every relation's descriptor (RP-921).
+    fn table_names(&self) -> PgWireResult<Vec<String>> {
+        if !self.storage.in_user_txn() && !self.in_catalog_statement() {
+            return Ok(self
+                .shared_table_defs()?
+                .iter()
+                .map(|d| d.name.clone())
+                .collect());
+        }
+        let raw = self
+            .storage
+            .find_matching(self.db(), CATALOG_COLLECTION, &Document::new())
+            .map_err(|e| Self::storage_err("could not read the catalog", e))?;
+        // A table's row as `TableDef::from_document` accepts one: a `table`
+        // name and a `columns` array.
+        let mut names: Vec<String> = raw
+            .iter()
+            .filter_map(|b| {
+                let d = bson::RawDocument::from_bytes(b).ok()?;
+                d.get_array("columns").ok()?;
+                Some(d.get_str("table").ok()?.to_string())
+            })
+            .collect();
+        let pending = self.pending.tables();
+        names.retain(|n| !pending.contains_key(n));
+        names.extend(
+            pending
+                .values()
+                .filter_map(|d| d.as_ref().map(|d| d.name.clone())),
+        );
+        Ok(names)
+    }
+
+    /// [`Self::all_indexes`] by table name: every stored index but `_id_`,
+    /// with no table's definition decoded.
+    fn all_index_docs(&self) -> PgWireResult<Vec<(String, Document)>> {
+        let mut out = Vec::new();
+        for table in self.table_names()? {
+            let indexes = self
+                .storage
+                .list_indexes_shared(self.db(), &table)
+                .map_err(|e| Self::storage_err("could not list the indexes", e))?;
+            for ix in indexes.iter() {
+                if ix.get_str("name") == Ok("_id_") {
+                    continue;
+                }
+                out.push((table.clone(), ix.clone()));
+            }
+        }
+        Ok(out)
+    }
+
     fn all_indexes(&self) -> PgWireResult<Vec<(TableDef, Document)>> {
         let mut out = Vec::new();
         for def in self.shared_table_defs()?.iter() {
@@ -16979,9 +17110,8 @@ impl PgHandler {
         if self.composites()?.iter().any(|(n, _, _)| *n == key) {
             return Ok(true);
         }
-        Ok(self.all_indexes()?.iter().any(|(t, ix)| {
-            ix.get_str("name") == Ok(name)
-                && secantus_pgplan::schemas::split_key(&t.name).0 == schema
+        Ok(self.all_index_docs()?.iter().any(|(t, ix)| {
+            ix.get_str("name") == Ok(name) && secantus_pgplan::schemas::split_key(t).0 == schema
         }))
     }
 
@@ -17024,7 +17154,7 @@ impl PgHandler {
             return Ok(true);
         }
         Ok(self
-            .all_indexes()?
+            .all_index_docs()?
             .iter()
             .any(|(_, ix)| ix.get_str("name") == Ok(name)))
     }
@@ -41316,7 +41446,7 @@ impl PgHandler {
                 if self.lookup(&def.name).is_some()
                     || self.views()?.iter().any(|(n, _)| *n == def.name)
                     || self
-                        .all_indexes()?
+                        .all_index_docs()?
                         .iter()
                         .any(|(_, ix)| ix.get_str("name") == Ok(def.name.as_str()))
                 {

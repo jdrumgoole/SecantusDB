@@ -21790,3 +21790,31 @@ def test_call_resolves_defaults_named_arguments_and_overloads(home: Path) -> Non
                     (q, (e.sqlstate, d.message_primary, d.message_hint, d.statement_position))
                 )
         assert got == _CALL_CASES
+
+
+def test_create_table_records_its_constraint_indexes_as_built(home: Path) -> None:
+    """A `CREATE TABLE` builds its constraints' indexes over the empty heap
+    and records each at 1 page and 0 tuples (`index_update_stats`), as
+    PostgreSQL 15.19 shows them (private cluster, 2026-11-13): a primary
+    key and a UNIQUE column, and a leaf partition's primary key under a
+    partitioned partition. Since RP-921 the statement looks for those
+    indexes in the new table's own list (and its ancestors'), not in every
+    table's."""
+    with _Server(home) as server, server.connect() as c:
+        for q in (
+            "create table rp921_f (a int primary key, b int unique)",
+            "create table rp921_p (a int primary key, b int) partition by range (a)",
+            "create table rp921_p1 partition of rp921_p for values from (0) to (100)"
+            " partition by range (a)",
+            "create table rp921_p1a partition of rp921_p1 for values from (0) to (50)",
+        ):
+            c.execute(q)
+        rows = c.execute(
+            "select relname, relpages, reltuples from pg_class where relname in "
+            "('rp921_f_pkey', 'rp921_f_b_key', 'rp921_p1a_pkey') order by 1"
+        ).fetchall()
+        assert rows == [
+            ("rp921_f_b_key", 1, 0.0),
+            ("rp921_f_pkey", 1, 0.0),
+            ("rp921_p1a_pkey", 1, 0.0),
+        ]

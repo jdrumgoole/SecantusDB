@@ -1145,21 +1145,57 @@ one beside it.
 
 ## Found by a profile (2026-11-13)
 
-- [ ] **OPEN — `CREATE TABLE` grows with the number of tables.** A debug
-      `secantusd-pg` takes about 1.4 ms with no other table and 42 ms with
-      800 (2026-11-13); PostgreSQL 15.19 takes 0.41 ms and 0.37 ms (private
-      cluster). After the table is made, `btree_built` looks for its new
-      indexes' page models through `hash_shapes`, `am_shapes` and
-      `btree_shapes_all`, and each lists every table's index relations
-      (`index_relations`). While the statement runs, `shared_table_defs`
-      cannot use the per-version definitions (the catalog it wrote is not
-      yet a version), so each list reads and decodes the whole catalog
-      again: three full decodes per `CREATE TABLE`, most of its time at
-      800 tables. PostgreSQL builds the new relation's indexes from that
-      relation alone (`index_build` over the one heap). The fix asks the
-      new table's own index list, not every table's.
-      Backlog-ID: RP-921
-      Verify: tests/backlog/test_rp_catalog_latency.py::test_create_table_costs_the_same_at_400_tables
+- [ ] **OPEN — `CREATE TABLE` still grows with the number of tables.**
+      A debug `secantusd-pg` takes about 1.2 ms with no other table and
+      5.9 ms with 800 (2026-11-13, after RP-921); PostgreSQL 15.19 takes
+      0.41 ms and 0.37 ms (private cluster), finding a clashing relation
+      by name through `pg_class`'s name index (`get_relname_relid`). The
+      statement's checks that the name is free list every composite type
+      (`composites()`) and every table's stored indexes
+      (`all_index_docs`, every table name read from the raw catalog while
+      the statement runs), so each grows with the schema. The faithful fix
+      is a lookup by name in a relation-name index, as `pg_class` keeps
+      one.
+      Verify: tests/backlog/test_rp_catalog_latency.py::test_create_table_costs_the_same_at_800_tables_within_a_tenth
+      Backlog-ID: RP-928
+
+## Found while working RP-921 (2026-11-13)
+
+- [ ] **OPEN — a partition's copy of a user-named index keeps the
+      parent's name.** `CREATE INDEX p_ab ON p (a, b)` on a partitioned
+      `p`, then `CREATE TABLE p_1 PARTITION OF p ...`: PostgreSQL 15.19
+      names the copy `p_1_a_b_idx` (`DefineIndex` picks a fresh name over
+      the key columns, `ChooseRelationName`); `secantusd-pg` answers
+      `p_1_ab`, the parent index's name with the parent table's prefix
+      swapped for the partition's (`partition_index`). The swap happens to
+      agree for the default names (`p_pkey`, `p_b_key`, `p_c_idx`).
+      Verify: tests/backlog/test_rp_found_rp921.py::test_a_partitions_copy_of_a_named_index_is_named_by_its_columns
+      Backlog-ID: RP-930
+
+- [ ] **OPEN — a partitioned table's indexes show a page.** PostgreSQL
+      15.19 shows every index of a partitioned table (the parent's, and a
+      partitioned partition's) at `relpages` 0, `reltuples` 0: a
+      partitioned index has no storage. `secantusd-pg` answers 1 page for
+      each primary key and for the parent's own indexes.
+      Verify: tests/backlog/test_rp_found_rp921.py::test_a_partitioned_tables_indexes_have_no_pages
+      Backlog-ID: RP-931
+
+- [ ] **OPEN — a leaf partition's inherited indexes are shown as never
+      built.** A leaf partition created under a partitioned table with a
+      user index: PostgreSQL 15.19 builds each copy over the new heap and
+      records 1 page and 0 tuples (`index_update_stats`); `secantusd-pg`
+      answers 0 pages and -1 tuples for the copies of the user's indexes
+      (its primary key's copy is right).
+      Verify: tests/backlog/test_rp_found_rp921.py::test_a_leaf_partitions_inherited_indexes_are_built
+      Backlog-ID: RP-932
+
+- [ ] **OPEN — a hash index built on an empty table is shown as never
+      built.** `CREATE INDEX ... USING hash (a)` on an empty table:
+      PostgreSQL 15.19 records 6 pages (metapage, bitmap page, initial
+      buckets) and 0 tuples; `secantusd-pg` answers 0 pages and -1
+      tuples. `hash_built` builds the page model but records no size.
+      Verify: tests/backlog/test_rp_found_rp921.py::test_a_hash_index_on_an_empty_table_is_recorded_as_built
+      Backlog-ID: RP-929
 
 - [ ] **OPEN — psql's `\d` column query straight after DDL builds all of
       `pg_type` for a table of two column types.** The collation subquery

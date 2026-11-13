@@ -250,16 +250,18 @@ def _fastest_create(pg: Any, prefix: str) -> float:
     return min(times)
 
 
-@pytest.mark.backlog("RP-921")
+@pytest.mark.backlog_fixed("RP-921")
 def test_create_table_costs_the_same_at_400_tables(pg_alone: Any) -> None:
     """PostgreSQL 15.19 runs a `CREATE TABLE` in the same time however many
     other tables there are (0.41 ms with none, 0.37 ms with 800, private
     cluster, 2026-11-13). A debug `secantusd-pg` took about 1.4 ms with
-    none and 42 ms with 800 (2026-11-13): after the table is made, its new
-    indexes' page models are looked for (`btree_built`: the hash, other
-    access-method and B-tree shapes), and each look lists every table's
+    none and 42 ms with 800 (2026-11-13): after the table was made, its new
+    indexes' page models were looked for (`btree_built`: the hash, other
+    access-method and B-tree shapes), and each look listed every table's
     index relations from the whole catalog, read and decoded afresh while
-    the statement runs.
+    the statement ran; its check that no index already had the name
+    decoded the whole catalog too. With both reading only what they need,
+    1.2 ms and 5.9 ms (RP-928 holds the rest).
 
     The fastest of five with 400 more tables against the fastest with none,
     in one server, within half again plus 5 ms."""
@@ -310,4 +312,27 @@ def test_the_first_catalog_query_after_ddl_over_two_column_types_costs_the_same_
     assert large < 1.5 * small + 0.005, (
         f"first query after DDL {small * 1000:.1f} ms with no other table, "
         f"{large * 1000:.1f} ms with {GROWTH_TABLES}"
+    )
+
+
+@pytest.mark.backlog("RP-928")
+def test_create_table_costs_the_same_at_800_tables_within_a_tenth(pg_alone: Any) -> None:
+    """PostgreSQL 15.19 runs a `CREATE TABLE` in the same time however many
+    other tables there are (0.41 ms with none, 0.37 ms with 800, private
+    cluster, 2026-11-13): it finds a clashing relation by name through
+    `pg_class`'s name index (`get_relname_relid`). Once its index builds
+    stopped reading every table (RP-921), a debug `secantusd-pg` took about
+    1.2 ms with none and 5.9 ms with 800 (2026-11-13): its checks that the
+    name is free list every composite type and every table's indexes.
+
+    The fastest of five with 800 more tables against the fastest with none,
+    in one server, within a tenth again plus 1 ms: the growth the previous
+    test's bound still allows fails it."""
+    small = _fastest_create(pg_alone, "rp_ct8_a")
+    for i in range(2 * GROWTH_TABLES):
+        pg_alone.execute(f"CREATE TABLE rp_ct8_grow_{i} (a int, b text)")
+    large = _fastest_create(pg_alone, "rp_ct8_b")
+    assert large < 1.1 * small + 0.001, (
+        f"CREATE TABLE {small * 1000:.1f} ms with no other table, "
+        f"{large * 1000:.1f} ms with {2 * GROWTH_TABLES}"
     )

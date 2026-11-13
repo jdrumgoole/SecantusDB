@@ -223,7 +223,15 @@ impl crate::PgHandler {
         }
         let mut by_table: HashMap<String, Vec<HashShape>> = HashMap::new();
         let mut stored_of: HashMap<String, Vec<Document>> = HashMap::new();
-        for ix in self.index_relations() {
+        // While a statement changes the catalog, only this table's (RP-921):
+        // nothing is memoised then, and every table's list re-reads the
+        // whole catalog.
+        let relations = if self.in_catalog_statement() {
+            self.table_index_relations_of(table)
+        } else {
+            self.index_relations()
+        };
+        for ix in relations {
             if ix.primary || ix.exclusion || ix.keys.len() != 1 || ix.keys[0] <= 0 {
                 continue;
             }
