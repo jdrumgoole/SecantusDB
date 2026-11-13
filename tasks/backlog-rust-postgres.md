@@ -378,23 +378,6 @@ one beside it.
   `c1`) and how many rows its scan read.
   Verify: none -- intermittent, not reproduced; RP-254's isolation test is the check
   Backlog-ID: RP-848
-- [ ] **NOT REPRODUCED -- left open as a watch item. A `CREATE VIEW`
-  went unanswered for 10 s once (2026-11-08).** `tests/backlog/test_rp_found_pgtest.py::test_view_columns_name_their_base_columns`
-  (a regression test) failed in CI's `pg-oracle (backlog)` lane on
-  snapshot PR #2497 (`b8976e15`): `TimeoutError: timed out` in
-  `pgwire_raw.py`'s `_until_ready`, waiting for ReadyForQuery after the
-  test's `CREATE VIEW rp_v ... FROM rp_tab1 JOIN rp_tab2` (traceback line
-  328). The raw client's socket timeout is 10 s, so the server sent
-  nothing for 10 s after a DDL statement. The `rust_pg` server is shared
-  by the module's tests under `-n 4`, so one explanation is DDL waiting on
-  a lock another test held, but that was not measured. The snapshot's only
-  change was RM-342, in `secantus-commands`, which the PG server does not
-  link. It did not fail in the 24 previous runs of that lane; a rerun was
-  started. Found by the MongoDB batch; not worked from that side. On a
-  recurrence, capture `pg_locks` / the server's lock waits at the moment
-  of the stall and which other test was running.
-  Backlog-ID: RP-606
-  Verify: none -- intermittent, not reproduced; the regression test is the check
 - [ ] **NOT REPRODUCED -- left open as a watch item. A cancel during the
   parse was honoured late on Linux CI twice, in both of RP-002's
   regression tests (2026-11-08, 2026-11-10).** `tests/backlog/test_rp_triage.py::test_cancel_during_parse_is_honoured_with_user_code_present`
@@ -1274,8 +1257,6 @@ tests regression tests:
   SELECT (`select a, pg_sleep(2) from t`) did not look for a cancel and
   slept to its end; a row streamed after the statement's hooks are gone
   is evaluated under a cancel hook now (`tests/backlog/test_rp202_cancel.py`).
-
-      Verify: none -- reproducing it exhausts memory; a bounded gap test is still to be written
 
 ## Found by batch 78 (2026-10-25)
 
@@ -3151,7 +3132,10 @@ Measured on a private PostgreSQL 15.19 cluster.
       runner, `test_rp_found_pgtest.py::test_view_columns_name_their_base_columns`
       went past its client's 10 s socket timeout twice on PR #2265, and
       again on PR #2332's `pg-oracle (server)` job (2026-11-04; that PR
-      changes EXPLAIN only, and locally the test took 3.5 s).
+      changes EXPLAIN only, and locally the test took 3.5 s), and on
+      snapshot PR #2497's `pg-oracle (backlog)` job (`b8976e15`,
+      2026-11-08), waiting for ReadyForQuery after the test's `CREATE
+      VIEW`. (This was RP-606.)
       Since 2026-11-05 PostgreSQL's own rows (oid below 16384) are read
       once per process and only the user's on each call: 0.5 s in a debug
       build (1.3 s before). What is left is the user rows' reads, each
@@ -3467,35 +3451,6 @@ varchar(4), t text)` holding `(1, 'y', 'y', 'y')` and `(2, 'ab', 'ab ',
       Found while working RP-736 (2026-11-09).
       Verify: tests/backlog/test_rp_found_rp726.py::test_explain_join_on_varchar_against_char_n
       Backlog-ID: RP-738
-
-## Found while working RP-737 (2026-11-09)
-
-- [ ] **A cancel while a 200,000-item `IN` list is planned still waits
-      up to ~0.25 s, about one time in twenty.** RP-202's
-      `test_a_cancel_while_a_huge_in_list_is_planned_over_a_table[0.7]`
-      measured 0.33 s and then 0.31 s (its bound is 0.3 s) in the backlog
-      step of `gate_pg.sh --fast` on 2026-11-09, at load 10-25 on 12
-      cores. With that test's own `_cancel_after` at delay 0.7 against a
-      debug `secantusd-pg`: at `b484522c`, 24 runs, 23 at 0.013-0.023 s
-      and one at 0.238 s; at the `pg-batch` tip `adb234a2`, without RP-726
-      and with it, 30 runs each, twice, medians 0.021-0.022 s and one late
-      cancel per 30 at 0.256-0.276 s on both. So some planning pass still
-      runs a stretch that does not look for a cancel, as the rewrite
-      passes did before RP-202; find which one by sampling the server when
-      a cancel is late. The tail reaches further under load: on the RP-733
-      branch (lane pg-batch-2, debug build) the whole file's run had the
-      cancel 0.62 s and 0.72 s late in two of three runs at a load average
-      of about 16, then passed ten runs at loads of 11 and 23, four of them
-      on a build of `aae69552`, before RP-733. Again on the RP-741 branch
-      (lane pg-batch-3, debug build, 2026-11-10): 0.32 s late once in the
-      gate's backlog step at a load of about 13, then the file passed five
-      runs in a row at loads of 13-16. Again on the RP-707 branch (lane
-      pg-batch-2, debug build, 2026-11-10): 0.68 s late once in the gate's
-      backlog step at a load of about 11; then 30 cancels at delay 0.7
-      each on that branch and on its base `49f2f12e` without it, medians
-      0.022 s and 0.021 s, one late cancel each at 0.250 s and 0.244 s.
-      Verify: none -- a timing tail that does not fail on demand; RP-202's own test is the check
-      Backlog-ID: RP-735
 
 ## Found while working RP-732 (2026-11-09)
 
