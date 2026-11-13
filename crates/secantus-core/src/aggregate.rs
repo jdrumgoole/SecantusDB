@@ -699,9 +699,9 @@ fn window_storage(
     for (s, d) in st.iter_mut().zip(docs) {
         if let (true, Some(by)) = (computed, by) {
             let mut read = Vec::new();
-            docstore::fields_read(by, &mut read);
+            docstore::paths_read(by, &mut read);
             for f in &read {
-                s.read_field(d, f);
+                s.read_path(d, f);
             }
             let key = match expressions::evaluate(d, by, vars) {
                 Ok(Bson::Undefined) | Err(_) => None,
@@ -881,7 +881,11 @@ fn unwound_storage(
 /// (`AddFieldsProjectionExecutor`): the first field's expression reads
 /// from the input's storage, which the output still shares, then each
 /// field is set on the output's own copy -- the expressions after the first
-/// read from the input's, which the output no longer sees.
+/// read from the input's, which the output no longer sees but for the
+/// sub-documents the two still share (a field cached before the copy, and
+/// not written since: reading inside it caches into the one storage). A
+/// dotted field writes into a copy of the sub-document it names
+/// ([`docstore::Stored::set_path`], RM-515).
 fn added_storage(
     spec: &Bson,
     input: &Document,
@@ -891,21 +895,41 @@ fn added_storage(
     let Some(spec) = spec.as_document() else {
         return s;
     };
-    if let Some(first) = spec.values().next() {
+    let mut written: Vec<&str> = Vec::new();
+    for (n, (k, expr)) in spec.iter().enumerate() {
         let mut read = Vec::new();
-        docstore::fields_read(first, &mut read);
-        for f in &read {
-            s.read_field(input, f);
+        docstore::paths_read(expr, &mut read);
+        for path in &read {
+            if n == 0 {
+                s.read_path(input, path);
+            } else if let Some((top, rest)) = path.split_once('.') {
+                if s.has_cached(top) && !written.contains(&top) {
+                    s.read_nested(input, top, rest);
+                }
+            }
         }
-    }
-    for (k, expr) in spec {
         let top = k.split('.').next().unwrap_or_default();
-        let held = match out.get(top) {
-            None => 0,
-            Some(v) if top == k => docstore::produced_held(expr, v),
-            Some(v) => docstore::held(v),
+        // A field set to a path the output's cache holds a sub-document at
+        // shares that storage (a read of the input's own leaves none).
+        let shares = |s: &mut docstore::Stored| match expr {
+            Bson::String(p) if p.starts_with('$') && !p.starts_with("$$") => {
+                let path = &p[1..];
+                let from = path.split('.').next().unwrap_or_default();
+                let seen = n == 0 || !written.contains(&from);
+                seen && s.set_shared(k, path)
+            }
+            _ => false,
         };
-        s.set_field(top, held);
+        if top == k {
+            if !shares(&mut s) {
+                let held = out.get(k).map_or(0, |v| docstore::produced_held(expr, v));
+                s.set_field(k, held);
+            }
+        } else {
+            let leaf = paths::get_path(out, k).map_or(0, |v| docstore::produced_held(expr, v));
+            s.set_path(Some(input), out, k, leaf);
+        }
+        written.push(top);
     }
     s
 }

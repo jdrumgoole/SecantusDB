@@ -1705,16 +1705,17 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       both do with no reader of the key after. Found 2026-11-13 (RM-520).
       Verify: tests/backlog/test_rm_found_2026_11_13_rm520.py::test_a_new_root_error_behind_a_sort_names_the_document
       Backlog-ID: RM-623
-- [ ] **A sub-document a stage reads or writes into is sized as if it
-      were read.** mongod 8.2.11 gives a sub-document a cache of its own
-      when a stage reads a field inside it (`$addFields: {q: "$e.y"}`) or
-      sets one (`$set: {"e.z": 1}`), and the sort and window behind count
-      it: (349500, 369000) and (305100, 324600) bytes over 300 documents.
-      This server's storage model (`docstore`, RM-408) caches top-level
-      fields only, and sizes the sub-document as the BSON it was read from:
-      (288900, 308400) and (290700, 288300).
-      Verify: tests/backlog/test_rm_found_rm408.py::test_a_sub_document_a_stage_touched_is_sized_by_its_storage
-      Backlog-ID: RM-515
+- [ ] **A document inside an array a stage reads or writes into is sized
+      as if it were read.** mongod 8.2.11 gives each document in an array a
+      cache of its own when a stage reads a field through the array
+      (`$addFields: {q: "$t.y"}`) or sets one (`$set: {"t.w": 1}`), and the
+      sort and window behind count it: (236000, 259600) and (279200, 302800)
+      bytes over 200 documents of `t: [1, <30 bytes>, {q: 1, y: <50 bytes>}]`.
+      This server's storage model (`docstore`) follows a sub-document's
+      storage since RM-515, but not an array's elements: (195600, 219200)
+      and (206600, 230200). Found 2026-11-13 (RM-515).
+      Verify: tests/backlog/test_rm_found_rm515.py::test_an_arrays_documents_a_stage_touched_are_sized_by_their_storage
+      Backlog-ID: RM-636
 - [ ] **A document an inclusion `$project` built is sized as if it were
       read.** Behind an `$unwind` (so not taken by the scan), mongod
       8.2.11's `$project: {t: 1, n: 1}` builds each document it returns,
@@ -3596,7 +3597,9 @@ touched:
   RM gate of 2026-11-13 (load average up to 18) the same queue-2 case
   differed in a wait instead: this server answered its third connection
   after a wait that rounded to 3 seconds, mongod after 2; four runs on
-  their own passed, at load 18. The test depends on six connects landing within one
+  their own passed, at load 18. A later RM gate that day (RM-515) saw
+  mongod answer two with no queue, as on 2026-11-08; three runs on their
+  own passed. The test depends on six connects landing within one
   second, so it is flaky by construction: it needs a measurement that
   load cannot change (connect all six behind a barrier and record how
   long they took to land, or compare with the answer mongod gives when
