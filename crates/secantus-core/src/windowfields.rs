@@ -374,6 +374,14 @@ fn window_fields_each(
     let mut docs = docs;
     let metadata: Option<Vec<Option<Bson>>> =
         presorted.then(|| docs.iter_mut().map(|d| d.remove(SORT_KEY_FIELD)).collect());
+    // A `$setWindowFields` passes on the key it was handed, or (sorting)
+    // the key of the `$sort` it runs behind, which the command layer writes
+    // in front (RM-520). It ranks by its own `sortBy`, so the key is only
+    // carried: off each document while the stage runs, where `$$ROOT` and
+    // the partition cache would see it as a field, and back on as it leaves.
+    let carried: Option<Vec<Option<Bson>>> = (!presorted
+        && docs.iter().any(|d| d.contains_key(SORT_KEY_FIELD)))
+    .then(|| docs.iter_mut().map(|d| d.remove(SORT_KEY_FIELD)).collect());
     // Range windows, `$linearFill`, and `$derivative`/`$integral` all need the
     // single-ascending-numeric sortBy values (window bounds / interp / rate x-axis).
     let needs_range = compiled.iter().any(|c| {
@@ -686,7 +694,7 @@ fn window_fields_each(
                 };
                 paths::set_path(&mut out_doc, c.field, value).map_err(|_| Fallback::Defer)?;
             }
-            if let Some(Some(key)) = metadata.as_ref().map(|m| &m[orig_i]) {
+            if let Some(Some(key)) = metadata.as_ref().or(carried.as_ref()).map(|m| &m[orig_i]) {
                 out_doc.insert(SORT_KEY_FIELD, key.clone());
             }
             sink(out_doc)?;
@@ -3192,6 +3200,41 @@ mod budget_tests {
         assert_eq!(two, (3 * size + 2 * memlimit::VALUE) as i64);
         let (one, size) = total(1);
         assert_eq!(one, (2 * size + 2 * memlimit::VALUE) as i64);
+    }
+
+    /// A `$setWindowFields` passes the sort key each document came with
+    /// on to the stages after, in its own output order, and holds it off
+    /// the document while it runs, so `$$ROOT` does not show it (mongod
+    /// 8.2.11, 2026-11-13, RM-520).
+    #[test]
+    fn a_window_carries_the_sort_key_it_was_given() {
+        let docs: Vec<Document> = [3, 1, 2]
+            .iter()
+            .enumerate()
+            .map(|(i, n)| doc! {"_id": i as i32, "n": *n, SORT_KEY_FIELD: [i as i32 * 10]})
+            .collect();
+        let spec = Bson::Document(doc! {
+            "sortBy": {"n": 1},
+            "output": {"all": {"$push": "$$ROOT"}},
+        });
+        let mut out = Vec::new();
+        set_window_fields_each(&spec, docs, &Document::new(), None, None, None, &mut |d| {
+            out.push(d);
+            Ok(())
+        })
+        .unwrap();
+        let keys: Vec<(i32, &Bson)> = out
+            .iter()
+            .map(|d| (d.get_i32("_id").unwrap(), d.get(SORT_KEY_FIELD).unwrap()))
+            .collect();
+        assert_eq!(
+            keys,
+            [(1, &bson!([10])), (2, &bson!([20])), (0, &bson!([0]))]
+        );
+        let roots = out[0].get_array("all").unwrap();
+        assert!(roots
+            .iter()
+            .all(|r| !r.as_document().unwrap().contains_key(SORT_KEY_FIELD)));
     }
 
     /// What `explain` lists for the stage: each function's most and the

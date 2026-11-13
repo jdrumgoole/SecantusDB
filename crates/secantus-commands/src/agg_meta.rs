@@ -31,7 +31,10 @@ pub(crate) const GEO_POINT: &str = "__secantus_meta_geoNearPoint";
 /// (measured 8.2.11: `$match`, `$limit`, `$skip`, `$addFields`, `$project`,
 /// `$unwind` and a later `$sort` keep them; a `$group` reads them and drops
 /// them; a second `$_internalSetWindowFields` ranks by the key the first
-/// passed on, 2026-11-10, RM-410).
+/// passed on, 2026-11-10, RM-410). A `$replaceRoot` / `$replaceWith`, a
+/// `$lookup` (in either engine) and a `$setWindowFields` keep them too, a
+/// `$setWindowFields` that sorts with the key of its own `$sort`
+/// (2026-11-13, RM-520).
 const KEEPS_SORT_METADATA: &[&str] = &[
     "$project",
     "$addFields",
@@ -43,7 +46,58 @@ const KEEPS_SORT_METADATA: &[&str] = &[
     "$skip",
     "$unwind",
     "$_internalSetWindowFields",
+    "$replaceRoot",
+    "$replaceWith",
+    "$lookup",
+    "$setWindowFields",
+    "$_secantusCarry",
+    // Where the stages move between mongod's engines: no stage of its own.
+    secantus_core::sbe::ENGINE_STAGE,
 ];
+
+/// The `$_secantusSortKey` that writes the key of the `$sort` mongod runs a
+/// `$setWindowFields` behind, on its partition and then its `sortBy` (a
+/// computed partition is a field mongod sets for it first, and a constant one
+/// is none); `None` when the stage sorts on neither and passes on the key it
+/// is handed (measured 8.2.11, 2026-11-13, RM-520).
+fn window_sort_key(spec: &Bson) -> Option<Bson> {
+    let spec = spec.as_document()?;
+    let sort_by = match spec.get("sortBy") {
+        None => None,
+        // A `sortBy` the stage refuses is left for it to refuse.
+        Some(by) => {
+            secantus_core::aggregate::sort_fields(by).ok()?;
+            Some(by.as_document()?)
+        }
+    };
+    // A constant partition is no partition: mongod sorts on none.
+    let partition = spec
+        .get("partitionBy")
+        .filter(|by| !secantus_core::aggregate::is_constant_expression(by, &[]));
+    if sort_by.is_none() && partition.is_none() {
+        return None;
+    }
+    let mut by = Document::new();
+    let mut computed = None;
+    match partition {
+        Some(Bson::String(p)) if p.starts_with('$') && !p.starts_with("$$") => {
+            by.insert(&p[1..], 1);
+        }
+        Some(expr) => computed = Some(expr.clone()),
+        None => {}
+    }
+    for (k, v) in sort_by.into_iter().flatten() {
+        by.insert(k.clone(), v.clone());
+    }
+    let mut stage = bson::doc! { "into": SORT_KEY };
+    if !by.is_empty() {
+        stage.insert("by", by);
+    }
+    if let Some(expr) = computed {
+        stage.insert("partitionBy", expr);
+    }
+    Some(Bson::Document(bson::doc! { "$_secantusSortKey": stage }))
+}
 
 /// The stages that keep a document's metadata as they pass it on.
 const KEEPS_METADATA: &[&str] = &[
@@ -270,8 +324,15 @@ pub(crate) fn rewrite_sort_metadata(stages: &mut Vec<Bson>) {
         if matches!(name.as_str(), "$match" | "$redact") {
             replace_with(&mut stage, "sortKey", &Bson::String("$$REMOVE".into()));
         }
-        if keeps || name == "$group" {
-            if sort_live {
+        // A `$lookup`'s sub-pipeline reads its own documents' metadata
+        // (RM-521); a `$setWindowFields` holds the sort key off its
+        // documents while it runs, so a `$meta` in it is left to refuse.
+        let reads_here = name != "$lookup";
+        let reads_sort_here = name != "$setWindowFields";
+        if (keeps && reads_here) || name == "$group" {
+            if !reads_sort_here {
+                // Left as it is.
+            } else if sort_live {
                 replace_with(&mut stage, "sortKey", &sort_key_read());
             } else if matches!(name.as_str(), "$addFields" | "$set" | "$group") {
                 replace_with(
@@ -367,6 +428,33 @@ pub(crate) fn rewrite_sort_metadata(stages: &mut Vec<Bson>) {
                     sort_live = true;
                 }
                 continue;
+            }
+            // A stage that makes a new document from each: the metadata
+            // goes with it, as mongod copies it over.
+            "$replaceRoot" | "$replaceWith" if !live.is_empty() => {
+                stage = Bson::Document(bson::doc! {
+                    "$_secantusCarry": { "stage": stage, "fields": live.clone() }
+                });
+            }
+            "$_secantusCarry" if !live.is_empty() => {
+                if let Some(Bson::Document(spec)) = stage
+                    .as_document_mut()
+                    .and_then(|d| d.get_mut("$_secantusCarry"))
+                {
+                    let mut fields = spec.get_array("fields").cloned().unwrap_or_default();
+                    fields.extend(live.iter().map(|f| Bson::String((*f).to_string())));
+                    spec.insert("fields", fields);
+                }
+            }
+            "$setWindowFields" => {
+                if let Some(key) = stage
+                    .as_document()
+                    .and_then(|d| d.get("$setWindowFields"))
+                    .and_then(window_sort_key)
+                {
+                    out.push(key);
+                    sort_live = true;
+                }
             }
             _ => {}
         }
@@ -557,6 +645,91 @@ mod tests {
         let mut alone = stages(vec![rank.clone()]);
         rewrite_sort_metadata(&mut alone);
         assert_eq!(alone, stages(vec![rank]));
+    }
+
+    /// A `$replaceRoot` / `$replaceWith`, a `$lookup` and a
+    /// `$setWindowFields` that does not sort pass the key on; a
+    /// `$replaceRoot` runs carried so its new documents keep it, and a
+    /// `$lookup`'s sub-pipeline is not rewritten (RM-520).
+    #[test]
+    fn the_sort_key_passes_through_stages_that_keep_it() {
+        let meta = doc! { "$addFields": { "m": { "$meta": "sortKey" } } };
+        let lookup = doc! { "$lookup": { "from": "c", "pipeline": [
+        { "$addFields": { "m": { "$meta": "sortKey" } } }], "as": "j" } };
+        let window = doc! { "$setWindowFields": { "output": { "x": { "$sum": 1 } } } };
+        let mut piped = stages(vec![
+            doc! { "$sort": { "k": 1 } },
+            doc! { "$replaceWith": "$$ROOT" },
+            lookup.clone(),
+            secantus_core_engine(),
+            window.clone(),
+            meta,
+        ]);
+        rewrite_sort_metadata(&mut piped);
+        assert_eq!(
+            piped,
+            stages(vec![
+                doc! { "$sort": { "k": 1 } },
+                doc! { "$_secantusSortKey": { "into": SORT_KEY, "by": { "k": 1 } } },
+                doc! { "$_secantusCarry": {
+                "stage": { "$replaceWith": "$$ROOT" }, "fields": [SORT_KEY] } },
+                lookup,
+                secantus_core_engine(),
+                window,
+                doc! { "$addFields": { "m": sort_key_read() } },
+                doc! { "$unset": [SORT_KEY] },
+            ])
+        );
+    }
+
+    fn secantus_core_engine() -> Document {
+        doc! { secantus_core::sbe::ENGINE_STAGE: true }
+    }
+
+    /// A `$setWindowFields` on a partition or a `sortBy` sets the key of the
+    /// `$sort` mongod runs it behind; a constant partition is none (mongod
+    /// 8.2.11, 2026-11-13, RM-520).
+    #[test]
+    fn a_window_that_sorts_sets_its_own_key() {
+        let key = |spec: Document| window_sort_key(&Bson::Document(spec));
+        assert_eq!(
+            key(doc! { "partitionBy": "$p", "sortBy": { "n": -1 }, "output": {} }),
+            Some(Bson::Document(doc! { "$_secantusSortKey": {
+            "into": SORT_KEY, "by": { "p": 1, "n": -1 } } }))
+        );
+        assert_eq!(
+            key(doc! { "partitionBy": { "$mod": ["$n", 2] }, "output": {} }),
+            Some(Bson::Document(doc! { "$_secantusSortKey": {
+            "into": SORT_KEY, "partitionBy": { "$mod": ["$n", 2] } } }))
+        );
+        assert_eq!(
+            key(doc! { "partitionBy": { "$literal": "x" }, "sortBy": { "n": 1 }, "output": {} }),
+            Some(Bson::Document(doc! { "$_secantusSortKey": {
+            "into": SORT_KEY, "by": { "n": 1 } } }))
+        );
+        assert_eq!(key(doc! { "partitionBy": "x", "output": {} }), None);
+        assert_eq!(key(doc! { "output": {} }), None);
+        // A `sortBy` the stage refuses is its to refuse.
+        assert_eq!(key(doc! { "sortBy": { "n": 2 }, "output": {} }), None);
+
+        let window = doc! { "$setWindowFields": {
+        "sortBy": { "n": 1 }, "output": { "x": { "$push": { "$meta": "sortKey" } } } } };
+        let mut piped = stages(vec![
+            window.clone(),
+            doc! { "$addFields": { "m": { "$meta": "sortKey" } } },
+        ]);
+        rewrite_sort_metadata(&mut piped);
+        assert_eq!(
+            piped,
+            stages(vec![
+                doc! { "$_secantusSortKey": { "into": SORT_KEY, "by": { "n": 1 } } },
+                // The key is off the documents while the stage runs: its
+                // own `$meta` is left as it was.
+                window,
+                doc! { "$addFields": { "m": sort_key_read() } },
+                doc! { "$unset": [SORT_KEY] },
+            ])
+        );
     }
 
     #[test]

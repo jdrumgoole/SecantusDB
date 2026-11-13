@@ -1585,18 +1585,6 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       Found 2026-11-13 (RM-509).
       Verify: tests/backlog/test_rm_found_2026_11_13_rm509.py::test_an_empty_window_counts_no_function
       Backlog-ID: RM-619
-- [ ] **The sort key is lost at a `$replaceRoot`, a `$lookup` or a
-      `$setWindowFields`.** mongod 8.2.11 keeps a document's sort key
-      through a `$replaceRoot`, a `$lookup` and a `$setWindowFields` with no
-      `sortBy`, and a `$setWindowFields` that sorts leaves its own (the
-      partition key, then `sortBy`). This server ends the key at each
-      (`agg_meta::KEEPS_SORT_METADATA`), so a `$_internalSetWindowFields`
-      after one ranks every document 1 and `{$meta: "sortKey"}` reads `[]`.
-      Found 2026-11-10 (RM-410). When `$lookup` keeps the key, the outer
-      rewrite's `replace_with` must not reach into its `pipeline`: that
-      sub-pipeline's `{$meta: "sortKey"}` reads its own key (RM-521).
-      Verify: tests/backlog/test_rm_found_2026_11_10_rm410.py::test_the_sort_key_passes_through_stages_that_keep_it
-      Backlog-ID: RM-520
 - [ ] **A `$unionWith` sub-pipeline's `$sort` sets no sort key.** In a
       `$unionWith` pipeline, mongod 8.2.11 ranks a
       `$_internalSetWindowFields` by the key the sub-pipeline's `$sort` set
@@ -1644,8 +1632,9 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       mongod 8.2.11 drops the earlier `$sort` of `$sort: {k: 1}, $sort: {n:
       1}`, also across an `$unwind`, so documents tied on `n` come in the
       collection's order; this server runs both, and the ties keep the
-      first sort's order. A different document order. Found 2026-11-10
-      (RM-410).
+      first sort's order. A different document order. The `$sort` a
+      sorting `$setWindowFields` runs behind drops an earlier `$sort` too
+      (measured 2026-11-13, RM-520). Found 2026-11-10 (RM-410).
       Verify: tests/backlog/test_rm_found_2026_11_10_rm410.py::test_a_sort_before_another_sort_is_dropped
       Backlog-ID: RM-524
 - [ ] **`{$meta: "sortKey"}` gives an empty array's key as null.**
@@ -1657,6 +1646,36 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       two apart (RM-410). Found 2026-11-10.
       Verify: tests/backlog/test_rm_found_2026_11_10_rm410.py::test_an_empty_arrays_sort_key_is_undefined
       Backlog-ID: RM-525
+- [ ] **`$$ROOT` shows a document's hidden sort key.** Behind a `$sort`
+      whose key a later stage reads, `{$addFields: {r: "$$ROOT"}}` and a
+      `$lookup` `let: {r: "$$ROOT"}` give the document with a
+      `__secantus_meta_sortKey` field, which mongod 8.2.11 keeps as
+      metadata and never shows. The key is a field of the document here
+      (`agg_meta`); the `$geoNear` fields are alike. Found 2026-11-13
+      (RM-520).
+      Verify: tests/backlog/test_rm_found_2026_11_13_rm520.py::test_root_does_not_show_the_sort_key
+      Backlog-ID: RM-620
+- [ ] **A `{$meta: "sortKey"}` in a window's output reads no key.** Behind
+      a `$sort`, mongod 8.2.11 gives each document's key to a `$push: {$meta:
+      "sortKey"}` in a `$setWindowFields` or `$_internalSetWindowFields`;
+      this server refuses it in `$setWindowFields` (code 2) and gives null in
+      `$_internalSetWindowFields`, which hold the key off the documents while
+      they run. Found 2026-11-13 (RM-520).
+      Verify: tests/backlog/test_rm_found_2026_11_13_rm520.py::test_a_windows_output_reads_the_sort_key
+      Backlog-ID: RM-621
+- [ ] **A missing `newRoot` is named null, not MISSING.** mongod 8.2.11's
+      40228 for `$replaceRoot: {newRoot: "$nope"}` (and `$replaceWith`) reads
+      "resulting value was: MISSING. Type of resulting value: 'missing'";
+      this server's reads "null" and 'null'. Found 2026-11-13 (RM-520).
+      Verify: tests/backlog/test_rm_found_2026_11_13_rm520.py::test_a_missing_new_root_is_missing
+      Backlog-ID: RM-622
+- [ ] **A `newRoot` error names a pruned document when a later stage
+      reads the sort key.** In `$sort, $replaceRoot: {newRoot: "$n"}, $addFields:
+      {m: {$meta: "sortKey"}}`, mongod 8.2.11's 40228 names the whole input
+      document; this server names only the fields the `newRoot` reads, as
+      both do with no reader of the key after. Found 2026-11-13 (RM-520).
+      Verify: tests/backlog/test_rm_found_2026_11_13_rm520.py::test_a_new_root_error_behind_a_sort_names_the_document
+      Backlog-ID: RM-623
 - [ ] **A sub-document a stage reads or writes into is sized as if it
       were read.** mongod 8.2.11 gives a sub-document a cache of its own
       when a stage reads a field inside it (`$addFields: {q: "$e.y"}`) or

@@ -106,9 +106,14 @@ pub fn apply_pipeline(
             // mongod runs the stage behind a `$sort` on its partition and
             // `sortBy`, which its budget holds like any other (RM-315).
             let before = &pipeline[..i];
-            let first = before
-                .iter()
-                .all(|st| matches!(stage_name_of(st), "$match" | crate::sbe::ENGINE_STAGE));
+            // The sort key the command layer writes in front (RM-520) is
+            // that `$sort`'s, no stage of mongod's.
+            let first = before.iter().all(|st| {
+                matches!(
+                    stage_name_of(st),
+                    "$match" | "$_secantusSortKey" | crate::sbe::ENGINE_STAGE
+                )
+            });
             // A computed partition is an `$addFields` in front of the sort,
             // which the sort cannot go ahead of.
             let by = spec.as_document().and_then(|s| s.get("partitionBy"));
@@ -506,19 +511,39 @@ fn apply_stage(
             replace_root_one(&d, spec, vars, "'replacement document'")
         }),
         "$sort" => sort_stage(docs, spec),
-        "$_secantusSortKey" => sort_key_stage(docs, spec),
+        "$_secantusSortKey" => sort_key_stage(docs, spec, vars),
         "$_secantusScore" => crate::hybrid::score_stage(docs, spec, vars),
         // A one-for-one stage that makes new documents (`$replaceRoot`),
-        // run so the score metadata stays with each document.
+        // run so the score metadata, and the hidden `fields` the command
+        // layer names (a sort key, the `$geoNear` metadata), stay with each
+        // document, as mongod's metadata does (RM-520).
         "$_secantusCarry" => {
-            let inner = spec
-                .as_document()
-                .and_then(|d| d.get_document("stage").ok())
-                .ok_or(Fallback::Defer)?;
+            let carry = spec.as_document().ok_or(Fallback::Defer)?;
+            let inner = carry.get_document("stage").map_err(|_| Fallback::Defer)?;
             let (inner_name, inner_spec) = inner.iter().next().ok_or(Fallback::Defer)?;
+            let fields: Vec<String> = match carry.get("fields") {
+                None => Vec::new(),
+                Some(Bson::Array(fields)) => fields
+                    .iter()
+                    .map(|f| f.as_str().map(str::to_string).ok_or(Fallback::Defer))
+                    .collect::<R<_>>()?,
+                Some(_) => return Err(Fallback::Defer),
+            };
             let kept = crate::hybrid::take_metadata(&docs);
+            let carried: Vec<Vec<Option<Bson>>> = docs
+                .iter()
+                .map(|d| fields.iter().map(|f| d.get(f).cloned()).collect())
+                .collect();
             let out = apply_stage(inner_name, inner_spec, docs, vars, coll)?;
-            crate::hybrid::restore_metadata(out, kept)
+            let mut out = crate::hybrid::restore_metadata(out, kept)?;
+            for (d, values) in out.iter_mut().zip(carried) {
+                for (f, v) in fields.iter().zip(values) {
+                    if let Some(v) = v {
+                        d.insert(f.clone(), v);
+                    }
+                }
+            }
+            Ok(out)
         }
         // Where the caller's pushdown rule moves between mongod's engines.
         crate::sbe::ENGINE_STAGE => {
@@ -924,6 +949,7 @@ const PER_DOCUMENT: &[&str] = &[
     "$unset",
     "$replaceRoot",
     "$replaceWith",
+    "$_secantusCarry",
     "$match",
 ];
 
@@ -1846,23 +1872,47 @@ pub fn sort_key_values(d: &Document, fields: &[(String, bool)]) -> R<Vec<Bson>> 
     Ok(keys)
 }
 
-/// `{$_secantusSortKey: {into, by}}`: an internal stage the command layer
-/// puts after a `$sort` whose sort key a later stage reads (a `{$meta:
-/// "sortKey"}`, a `$_internalSetWindowFields`'s ranks). It writes the sort
-/// key mongod keeps as metadata, an array with one value per sort field,
-/// under `into`: a missing value is null and an empty array `undefined`,
-/// which `$rank` tells apart and pymongo decodes as `None` (`$type` shows it;
-/// measured 8.2.11, 2026-11-10).
-fn sort_key_stage(docs: Vec<Document>, spec: &Bson) -> R<Vec<Document>> {
+/// `{$_secantusSortKey: {into, by, partitionBy?}}`: an internal stage the
+/// command layer puts after a `$sort` whose sort key a later stage reads (a
+/// `{$meta: "sortKey"}`, a `$_internalSetWindowFields`'s ranks). It writes
+/// the sort key mongod keeps as metadata, an array with one value per sort
+/// field, under `into`: a missing value is null and an empty array
+/// `undefined`, which `$rank` tells apart and pymongo decodes as `None`
+/// (`$type` shows it; measured 8.2.11, 2026-11-10).
+///
+/// In front of a `$setWindowFields` it writes the key of the `$sort` mongod
+/// runs that stage behind: a computed `partitionBy`, which mongod sorts on
+/// as a field it sets first, and then `by`, the partition's path and the
+/// `sortBy` (RM-520).
+fn sort_key_stage(docs: Vec<Document>, spec: &Bson, vars: &Document) -> R<Vec<Document>> {
+    /// Where a computed partition is held while its key is taken.
+    const PARTITION: &str = "__secantus_meta_partitionKey";
     let spec = spec.as_document().ok_or(Fallback::Defer)?;
     let Some(Bson::String(into)) = spec.get("into") else {
         return Err(Fallback::Defer);
     };
-    let fields = sort_fields(spec.get("by").ok_or(Fallback::Defer)?)?;
+    let partition = spec.get("partitionBy");
+    let mut fields = match spec.get("by") {
+        Some(by) => sort_fields(by)?,
+        None if partition.is_some() => Vec::new(),
+        None => return Err(Fallback::Defer),
+    };
+    if partition.is_some() {
+        fields.insert(0, (PARTITION.to_string(), false));
+    }
     docs.into_iter()
         .map(|mut d| {
-            let keys = sort_key_values(&d, &fields)?;
-            d.insert(into.clone(), Bson::Array(keys));
+            if let Some(by) = partition {
+                match evaluate(by, &d, vars)? {
+                    Bson::Undefined => None,
+                    v => d.insert(PARTITION, v),
+                };
+            }
+            let keys = sort_key_values(&d, &fields);
+            if partition.is_some() {
+                d.remove(PARTITION);
+            }
+            d.insert(into.clone(), Bson::Array(keys?));
             Ok(d)
         })
         .collect()
@@ -1952,6 +2002,7 @@ fn sort_source(before: &[Bson]) -> crate::sorter::SortSource {
                 | "$addFields"
                 | "$set"
                 | "$unset"
+                | "$_secantusSortKey"
                 | crate::sbe::ENGINE_STAGE,
                 s,
             ) => s,
@@ -2534,6 +2585,53 @@ mod tests {
 
     fn run(docs: Vec<Document>, pipeline: Vec<Bson>) -> Vec<Document> {
         apply_pipeline(docs, &pipeline, &Document::new(), None).expect("should not fall back")
+    }
+
+    /// The key of the `$sort` mongod runs a `$setWindowFields` behind: a
+    /// computed partition first, a missing one null, then the `sortBy`
+    /// (RM-520).
+    #[test]
+    fn a_sort_key_takes_a_computed_partition_first() {
+        let docs = vec![doc! {"_id": 1, "n": 3}, doc! {"_id": 2}];
+        let out = run(
+            docs,
+            vec![bson::bson!({"$_secantusSortKey": {
+                "into": "k",
+                "by": {"_id": 1},
+                "partitionBy": {"$add": ["$n", 1]},
+            }})],
+        );
+        assert_eq!(
+            out[0].get_array("k").unwrap(),
+            &vec![Bson::Int32(4), Bson::Int32(1)]
+        );
+        assert_eq!(
+            out[1].get_array("k").unwrap(),
+            &vec![Bson::Null, Bson::Int32(2)]
+        );
+        // The partition's field comes off again.
+        assert!(out
+            .iter()
+            .all(|d| !d.keys().any(|k| k.starts_with("__secantus"))));
+    }
+
+    /// A stage `$_secantusCarry` runs makes new documents and the fields it
+    /// names go on each one from the document it was made from, as mongod's
+    /// metadata does through a `$replaceRoot` (RM-520).
+    #[test]
+    fn a_carried_replace_root_keeps_the_named_fields() {
+        let docs = vec![
+            doc! {"_id": 1, "a": {"x": 1}, "h": [7]},
+            doc! {"_id": 2, "a": {"x": 2}},
+        ];
+        let out = run(
+            docs,
+            vec![bson::bson!({"$_secantusCarry": {
+                "stage": {"$replaceRoot": {"newRoot": "$a"}},
+                "fields": ["h"],
+            }})],
+        );
+        assert_eq!(out, vec![doc! {"x": 1, "h": [7]}, doc! {"x": 2}]);
     }
 
     #[test]
