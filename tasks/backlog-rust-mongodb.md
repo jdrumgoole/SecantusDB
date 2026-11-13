@@ -1648,9 +1648,23 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       key keeps the empty array's document and a null's apart. This server
       reads the key through `$ifNull` (`agg_meta::sort_key_read`), since its
       expressions take `undefined` for MISSING. The ranks already tell the
-      two apart (RM-410). Found 2026-11-10.
+      two apart (RM-410). Found 2026-11-10. **Blocked on RM-635**
+      (measured 2026-11-13): handing `$meta` the real `undefined` still
+      reads "missing" in `$type` of `$$this` and folds into null's
+      `$group`, so this closes with that one, not before.
       Verify: tests/backlog/test_rm_found_2026_11_10_rm410.py::test_an_empty_arrays_sort_key_is_undefined
       Backlog-ID: RM-525
+- [ ] **A stored `undefined` reads as MISSING in aggregation
+      expressions.** The expression engine spells MISSING `Bson::Undefined`
+      (`secantus-core` `expressions.rs`, `sbe_ops.rs`; ~145 sites in 22
+      files), so a real `undefined` -- a field, an array element, a `$let`
+      variable -- gives `$type` "missing" where mongod 8.2.11 gives
+      "undefined"; an `$addFields` copy of it is dropped; a `$group` on it
+      joins null's group, and one on `[undefined]` is refused (code 2, "not
+      supported by the Rust server"). The fix gives MISSING a representation
+      of its own, apart from every BSON value. Found 2026-11-13 (RM-525).
+      Verify: tests/backlog/test_rm_found_2026_11_13_rm525.py::test_a_stored_undefined_is_not_missing, tests/backlog/test_rm_found_2026_11_13_rm525.py::test_a_group_keeps_undefined_apart_from_null
+      Backlog-ID: RM-635
 - [ ] **`$$ROOT` shows a document's hidden sort key.** Behind a `$sort`
       whose key a later stage reads, `{$addFields: {r: "$$ROOT"}}` and a
       `$lookup` `let: {r: "$$ROOT"}` give the document with a
