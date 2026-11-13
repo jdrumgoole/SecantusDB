@@ -961,16 +961,6 @@ These are explicit non-goals. Don't add them without a reason.
       Found while working RM-478, 2026-11-13.
       Verify: tests/backlog/test_rm_statement_line_comment.py::test_a_statement_line_carries_its_commands_comment
       Backlog-ID: RM-581
-- [ ] **A read of a view refused before it resolves the view resolves it
-      anyway.** mongod 8.2.11 refuses a `find` of a view whose projection
-      does not parse (`{a: {$bogusop: 1}}`), and an `explain` of a `find`
-      of a view whose filter does not, before it resolves the view: its line
-      names the view (`<db>.v`, `normal`) and has no `resolvedViews`. This
-      server resolves the view first, so its line has `resolvedViews` and
-      names the collection beneath, as a read that failed after resolving
-      does (RM-380). Found while working RM-380, 2026-11-10.
-      Verify: tests/backlog/test_rm_view_namespaces.py::test_a_read_refused_before_it_resolves_names_the_view
-      Backlog-ID: RM-483
 - [ ] **A time-series collection's `collMod` and `collStats` lines name the
       collection, not its buckets.** mongod 8.2.11's name
       `<db>.system.buckets.ts`, `collectionType: "timeseriesBuckets"`; this

@@ -68,6 +68,27 @@ _OPS: dict[str, Callable[[Any], Any]] = {
         lambda d: list(d.ts.find({"$expr": {"$divide": [1, {"$subtract": ["$m", "$m"]}]}}))
     ),
     "find of a view that does not parse": _refused(lambda d: list(d.v.find({"x": {"$bogus": 1}}))),
+    # A find is parsed, its projection too, before a view or a time-series
+    # collection is resolved; an explained find or distinct is as well
+    # (RM-483).
+    "find of a view whose projection does not parse": _refused(
+        lambda d: list(d.v.find({}, projection={"a": 1, "b": 0}))
+    ),
+    "find of a time-series collection whose projection does not parse": _refused(
+        lambda d: list(d.ts.find({}, projection={"a": {"$bogusop": 1}}))
+    ),
+    "explain of a find of a view whose projection does not parse": _refused(
+        lambda d: d.command("explain", {"find": "v", "projection": {"a": {"$bogusop": 1}}})
+    ),
+    "explain of a find of a time-series collection that does not parse": _refused(
+        lambda d: d.command("explain", {"find": "ts", "filter": {"x": {"$bogus": 1}}})
+    ),
+    "explain of a distinct of a view that does not parse": _refused(
+        lambda d: d.command("explain", {"distinct": "v", "key": "x", "query": {"x": {"$bogus": 1}}})
+    ),
+    "explain of a count of a view that does not parse": _refused(
+        lambda d: d.command("explain", {"count": "v", "query": {"x": {"$bogus": 1}}})
+    ),
     "getMore of an aggregate of a view": lambda d: list(d.v.aggregate([], batchSize=4)),
     "insert into a view": _refused(lambda d: d.v.insert_one({"a": 1})),
     "insert into a time-series collection": lambda d: d.ts.insert_one(

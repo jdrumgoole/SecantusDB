@@ -64,12 +64,12 @@ def _entries(rust_mongo: Any, mongod_rs: Any, op: Callable[[Any], Any]) -> dict:
     }
 
 
-@pytest.mark.backlog("RM-483")
+@pytest.mark.backlog_fixed("RM-483")
 def test_a_read_refused_before_it_resolves_names_the_view(rust_mongo: Any, mongod_rs: Any) -> None:
     """mongod 8.2.11 refuses a `find` of a view whose projection does not
     parse, and an `explain` of a `find` of a view whose filter does not,
     before it resolves the view: its line names the view, `normal`, with no
-    `resolvedViews`. This server resolves the view first."""
+    `resolvedViews`. This server resolved the view first."""
 
     def op(db: Any) -> None:
         _refused(lambda d: list(d.v.find({}, projection={"a": {"$bogusop": 1}})))(db)

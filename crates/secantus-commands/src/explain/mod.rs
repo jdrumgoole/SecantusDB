@@ -2490,15 +2490,21 @@ fn explain_reply(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     let db = ctx.db_name.clone();
     let echo = shape::echo(&inner, &db);
     // The views the explained read resolves are on the explain's line
-    // (RM-362, measured 8.2.1).
-    if let (Ok(storage), Some(Bson::String(coll))) = (ctx.storage(), inner.get(&name)) {
-        if matches!(name.as_str(), "find" | "count" | "distinct" | "aggregate") {
+    // (RM-362, measured 8.2.1). mongod resolves them for a `count` or an
+    // `aggregate` before it parses the command, and for a `find` or a
+    // `distinct` after: one of those that does not parse is refused naming
+    // the view, with no `resolvedViews` (measured 8.2.11, RM-483).
+    let note_views = |ctx: &CommandContext| {
+        if let (Ok(storage), Some(Bson::String(coll))) = (ctx.storage(), inner.get(&name)) {
             let pipeline = inner
                 .get_array("pipeline")
                 .map(Vec::as_slice)
                 .unwrap_or(&[]);
             crate::opdebug::note_resolved_views(storage, &db, Some(coll), pipeline);
         }
+    };
+    if matches!(name.as_str(), "count" | "aggregate") {
+        note_views(ctx);
     }
 
     let lowered = name.to_ascii_lowercase();
@@ -2506,7 +2512,9 @@ fn explain_reply(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         "find" => {
             let coll = collection(&inner, "find", &db)?;
             validate(crate::find::find, &dry(&inner, "find"), ctx)?;
-            shape::find(&coll, &inner)?
+            let s = shape::find(&coll, &inner)?;
+            note_views(ctx);
+            s
         }
         "count" => {
             let coll = collection(&inner, "count", &db)?;
@@ -2517,6 +2525,7 @@ fn explain_reply(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
             let coll = collection(&inner, "distinct", &db)?;
             let s = shape::distinct(&coll, &inner)?;
             validate(crate::distinct::distinct, &dry(&inner, "distinct"), ctx)?;
+            note_views(ctx);
             s
         }
         "aggregate" => return aggregate(&inner, echo, inline, verbosity, ctx),
