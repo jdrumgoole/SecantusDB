@@ -606,9 +606,8 @@ impl PgHandler {
         let mut rels = Vec::new();
         let filters_sel = |list: &[(usize, f64)]| list.iter().map(|(_, s)| s).product::<f64>();
         // Their operators, each costed on every row the join makes.
-        let filters_ops = |list: &[(usize, f64)]| -> f64 {
-            list.iter().map(|(i, _)| filters[*i].ops as f64).sum()
-        };
+        let filters_ops =
+            |list: &[(usize, f64)]| -> f64 { list.iter().map(|(i, _)| filters[*i].ops).sum() };
         for (pi, p) in pairs.iter().enumerate() {
             let (a, b) = (side(p.a, &p.a_key)?, side(p.b, &p.b_key)?);
             let mut rel = JoinRel::new(false);

@@ -1009,7 +1009,8 @@ fn finish_join_source(
                         expr,
                         kind,
                         ops,
-                        compare: comparison(c),
+                        startup_ops: qual_startup_operators(c),
+                        bounds: key_bounds(c),
                         inequality_keys: inequality_keys(c),
                         restrict: None,
                     })
@@ -2817,7 +2818,8 @@ fn build_join(
                         expr: on_expr(c, &side_scope, params)?,
                         kind,
                         ops,
-                        compare: comparison(c),
+                        startup_ops: qual_startup_operators(c),
+                        bounds: key_bounds(c),
                         inequality_keys: inequality_keys(c),
                         restrict: restriction_filter(c, [&left, &right], lookup, params),
                     });
@@ -3007,40 +3009,61 @@ pub struct JoinFilter {
     /// It, over the joined keys.
     pub expr: ColumnExpr,
     pub kind: FilterKind,
-    /// The operators it evaluates a row (`cost_qual_eval`).
-    pub ops: usize,
-    /// A `<`, `<=`, `>` or `>=` between two joined keys: `(left key,
-    /// operator, right key)`, which a B-tree on either side's column can
-    /// take as a parameterized index qual (`match_clause_to_indexcol`,
-    /// RP-354). `None` for anything else.
-    pub compare: Option<(String, String, String)>,
+    /// The operator costs it evaluates a row (`cost_qual_eval`), an IN
+    /// list's operator over half its elements ([`qual_operators`]).
+    pub ops: f64,
+    /// The operator costs it evaluates once, at startup: a hashed IN
+    /// list's table ([`qual_startup_operators`]).
+    pub startup_ops: f64,
+    /// A `<`, `<=`, `>` or `>=`'s operands that a B-tree on their column
+    /// can take as a parameterized index qual (`match_clause_to_indexcol`,
+    /// RP-354): a bare joined key whose other operand reads only other
+    /// tables (`e.a < k.a` bounds both keys, `e.a + 1 < k.a` only `k.a`).
+    /// Empty for anything else.
+    pub bounds: Vec<KeyBound>,
     /// A `<`, `<=`, `>` or `>=`'s operands that are a joined key, bare or
-    /// cast: the keys an index on their column could take the clause for
+    /// cast, whose other operand reads no column of the key's table: the
+    /// keys an index on their column could take the clause for
     /// (`match_clause_to_indexcol` matches an operand to the index key,
     /// the other side's operand any expression of the outer row, RP-354).
     /// Empty for anything else, and where neither operand is one.
     pub inequality_keys: Vec<String>,
-    /// A conjunct over one stored table's columns alone, lowered as that
-    /// table's WHERE over its stored fields: the clause
+    /// A conjunct over one stored table's columns alone, as the clause
     /// `clause_selectivity` estimates as a restriction, from the table's
     /// statistics (an ON conjunct over a LEFT join's preserved side stays
     /// the join's filter, RP-354). `None` for anything else.
-    pub restrict: Option<Document>,
+    pub restrict: Option<Restriction>,
+}
+
+/// [`JoinFilter::restrict`]: the conjunct lowered as its table's WHERE
+/// over its stored fields, and the LIKE / ILIKE conjuncts behind that
+/// WHERE's `$regex` clauses, which `patternsel` estimates from the
+/// pattern, not the regex (as a single relation's scan reads them,
+/// `ExplainOptions::scan_patterns`). A comparison of an expression with
+/// a constant (a cast of a column, `e.a::text <> '5'`) is instead its
+/// [`crate::ExprQual`], estimated as an expression with no statistics,
+/// its `filter` empty (RP-354).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Restriction {
+    pub filter: Document,
+    pub patterns: Vec<ScanPattern>,
+    pub exprs: Vec<crate::ExprQual>,
 }
 
 /// `c`, a conjunct over joined keys, as the WHERE of the one stored
 /// table among `sides`' leaves whose keys it reads: each key renamed to
 /// the table's column, then lowered over the table's stored fields
 /// ([`JoinFilter::restrict`]). `None` when it reads more than one leaf, a
-/// leaf that is not a plain scan of a stored table, costs other than
-/// its operators ([`priced_by_operator_count`]), or does not lower to a
-/// filter.
+/// leaf that is not a plain scan of a stored table, or is neither priced
+/// by its operators ([`priced_by_operator_count`]) and lowered to a
+/// filter, nor a comparison of an expression with a constant
+/// ([`crate::expr_qual`]).
 fn restriction_filter(
     c: &pg_query::protobuf::Node,
     sides: [&JoinNode; 2],
     lookup: &dyn Fn(&str) -> Option<TableDef>,
     params: &[Bson],
-) -> Option<Document> {
+) -> Option<Restriction> {
     let [alias] = key_aliases(c).try_into().ok()?;
     let (plan, def, columns) = sides.into_iter().find_map(|n| match n {
         JoinNode::Leaf { plan, def, columns } if def.name == alias => Some((plan, def, columns)),
@@ -3053,7 +3076,7 @@ fn restriction_filter(
         return None;
     }
     let table = lookup(&leaf.table)?;
-    if crate::correlated::has_volatile_call(c) || !priced_by_operator_count(c) {
+    if crate::correlated::has_volatile_call(c) {
         return None;
     }
     let mut node = c.clone();
@@ -3081,7 +3104,18 @@ fn restriction_filter(
     if !renamed {
         return None;
     }
-    crate::lower_where(&node, &table, params).ok()
+    if !priced_by_operator_count(c) {
+        return Some(Restriction {
+            filter: Document::new(),
+            patterns: Vec::new(),
+            exprs: vec![crate::expr_qual(&node, &table)?],
+        });
+    }
+    Some(Restriction {
+        filter: crate::lower_where(&node, &table, params).ok()?,
+        patterns: crate::where_patterns(&node, &table),
+        exprs: Vec::new(),
+    })
 }
 
 /// What a join filter's selectivity is estimated as with no statistics.
@@ -3178,23 +3212,31 @@ fn cast_key_target(tc: &pg_query::protobuf::TypeCast, scope: &Scope) -> Option<(
 
 /// `c`'s estimate and its `cost_qual_eval` charge in operator costs: a
 /// conjunct whose casts [`cast_cost`] cannot price is not estimated
-/// ([`FilterKind::Other`]); a `<>` over a cast key is
-/// [`FilterKind::NotEqualCast`].
-fn filter_kind_and_ops(c: &pg_query::protobuf::Node, scope: &Scope) -> (FilterKind, usize) {
-    let ops = operator_count(c);
+/// ([`FilterKind::Other`]); a `<>` over a cast key, or one whose operator
+/// coerces an operand, is [`FilterKind::NotEqualCast`].
+fn filter_kind_and_ops(c: &pg_query::protobuf::Node, scope: &Scope) -> (FilterKind, f64) {
+    let ops = qual_operators(c);
     let Some(casts) = cast_cost(c, scope) else {
         return (FilterKind::Other, ops);
     };
-    let kind = match not_equal_cast(c, scope) {
-        Some((l, r)) => FilterKind::NotEqualCast(l, r),
-        None => filter_kind(c),
-    };
-    (kind, ops + casts)
+    match not_equal_cast(c, scope) {
+        Some((kind, coercions)) => (kind, ops + (casts + coercions) as f64),
+        None => (filter_kind(c), ops + casts as f64),
+    }
 }
 
 /// `c` as a `<>` (or IS DISTINCT FROM) between two operands that are each
-/// a joined key or a cast of one, at least one cast.
-fn not_equal_cast(c: &pg_query::protobuf::Node, scope: &Scope) -> Option<(CastKey, CastKey)> {
+/// a joined key or a cast of one, at least one cast or coerced: its
+/// [`FilterKind::NotEqualCast`] and the operator costs of the coercions
+/// its operator adds. `oper_select_candidate` picks the operator over the
+/// operands' types (`=` for IS DISTINCT FROM, `make_distinct_op`), and an
+/// operand of another type than its input is coerced to it by the implicit
+/// cast's function, one call a row (`e.a <> k.a::numeric` is `(e.a)::numeric
+/// <> (a)::numeric`), which leaves it an expression with no statistics.
+/// [`FilterKind::Other`] where that coercion is not priced (a
+/// binary-coercible one is a `RelabelType`, not modelled here) or no one
+/// operator resolves. `None` for any other conjunct.
+fn not_equal_cast(c: &pg_query::protobuf::Node, scope: &Scope) -> Option<(FilterKind, usize)> {
     use pg_query::protobuf::AExprKind;
     let Some(N::AExpr(e)) = c.node.as_ref() else {
         return None;
@@ -3216,13 +3258,50 @@ fn not_equal_cast(c: &pg_query::protobuf::Node, scope: &Scope) -> Option<(CastKe
             }),
         }
     };
-    let (l, r) = (operand(e.lexpr.as_deref())?, operand(e.rexpr.as_deref())?);
-    (l.cast.is_some() || r.cast.is_some()).then_some((l, r))
+    let (mut l, mut r) = (operand(e.lexpr.as_deref())?, operand(e.rexpr.as_deref())?);
+    let cast = l.cast.is_some() || r.cast.is_some();
+    let type_of = |o: &CastKey| {
+        o.cast.or_else(|| {
+            let col = scope.cols.iter().find(|c| c.key == o.key)?;
+            crate::pgtypes::oid_of_name(&col.pg_type)
+        })
+    };
+    let names = type_of(&l).zip(type_of(&r)).and_then(|(lt, rt)| {
+        Some((
+            lt,
+            rt,
+            crate::pgtypes::name_of_oid(lt)?,
+            crate::pgtypes::name_of_oid(rt)?,
+        ))
+    });
+    let Some((lt, rt, ln, rn)) = names else {
+        return cast.then_some((FilterKind::NotEqualCast(l, r), 0));
+    };
+    let op = if distinct { "=" } else { "<>" };
+    let Some((li, ri)) = crate::funcsig::operator_inputs(op, ln, rn) else {
+        return cast.then_some((FilterKind::Other, 0));
+    };
+    let mut coercions = 0;
+    for (o, from, to) in [(&mut l, lt, li), (&mut r, rt, ri)] {
+        let Some(to) = crate::pgtypes::oid_of_name(&to) else {
+            return Some((FilterKind::Other, 0));
+        };
+        if to == from {
+            continue;
+        }
+        let Some(cost) = crate::pg_casts::explicit_cast_cost(from, to) else {
+            return Some((FilterKind::Other, 0));
+        };
+        coercions += cost;
+        o.cast = Some(to);
+    }
+    (cast || coercions > 0).then_some((FilterKind::NotEqualCast(l, r), coercions))
 }
 
-/// The operators `n` evaluates: each operator and IS DISTINCT FROM, and a
-/// BETWEEN's two comparisons (four when SYMMETRIC), as
-/// `transformAExprBetween` expands it.
+/// The operators `n` evaluates: each operator and IS DISTINCT FROM, a
+/// pattern match (`~~`, `!~~`, `~~*`, `!~~*`, each one `OpExpr` whose
+/// function's `procost` is 1), and a BETWEEN's two comparisons (four when
+/// SYMMETRIC), as `transformAExprBetween` expands it.
 fn operator_count(n: &pg_query::protobuf::Node) -> usize {
     use pg_query::protobuf::AExprKind;
     let mut count = 0;
@@ -3230,7 +3309,12 @@ fn operator_count(n: &pg_query::protobuf::Node) -> usize {
     let _ = walk_expr(&mut node, &mut |x| {
         if let Some(N::AExpr(e)) = x.node.as_ref() {
             count += match AExprKind::try_from(e.kind) {
-                Ok(AExprKind::AexprOp | AExprKind::AexprDistinct) => 1,
+                Ok(
+                    AExprKind::AexprOp
+                    | AExprKind::AexprDistinct
+                    | AExprKind::AexprLike
+                    | AExprKind::AexprIlike,
+                ) => 1,
                 Ok(AExprKind::AexprBetween | AExprKind::AexprNotBetween) => 2,
                 Ok(AExprKind::AexprBetweenSym | AExprKind::AexprNotBetweenSym) => 4,
                 _ => 0,
@@ -3241,10 +3325,76 @@ fn operator_count(n: &pg_query::protobuf::Node) -> usize {
     count
 }
 
-/// `n` is built only of what [`operator_count`] prices as
-/// `cost_qual_eval` does: comparisons, BETWEEN, AND / OR / NOT, columns
-/// and constants. An IN list, a pattern, a null test, a call or a cast of
-/// a column costs otherwise.
+/// From this many elements an IN list of constants is a hashed
+/// ScalarArrayOpExpr (`MIN_ARRAY_SIZE_FOR_HASHED_SAOP`,
+/// `convert_saop_to_hashed_saop`).
+const HASHED_SAOP: usize = 9;
+
+/// [`operator_count`], and each IN list of constants ([`in_list_of_constants`])
+/// as `cost_qual_eval` charges its ScalarArrayOpExpr a row: the operator,
+/// of `procost` 1, over half the array's elements, as it expects the
+/// answer settled halfway (`estimate_array_length`), or, for a hashed list,
+/// one hash and one comparison. A list of one element is the plain
+/// operator (`transformAExprIn`).
+fn qual_operators(n: &pg_query::protobuf::Node) -> f64 {
+    let mut halves = 0.0;
+    let mut node = n.clone();
+    let _ = walk_expr(&mut node, &mut |x| {
+        if let Some(N::AExpr(e)) = x.node.as_ref() {
+            match in_list_of_constants(e) {
+                Some(1) => halves += 1.0,
+                Some(items) if items >= HASHED_SAOP => halves += 2.0,
+                Some(items) => halves += items as f64 * 0.5,
+                None => {}
+            }
+        }
+        Ok(())
+    });
+    operator_count(n) as f64 + halves
+}
+
+/// The operators `cost_qual_eval` charges `n` once, at startup: a hashed
+/// IN list's table, one hash an element, NULLs included
+/// (`estimate_array_length`).
+fn qual_startup_operators(n: &pg_query::protobuf::Node) -> f64 {
+    let mut ops = 0.0;
+    let mut node = n.clone();
+    let _ = walk_expr(&mut node, &mut |x| {
+        if let Some(N::AExpr(e)) = x.node.as_ref() {
+            if let Some(items) = in_list_of_constants(e).filter(|i| *i >= HASHED_SAOP) {
+                ops += items as f64;
+            }
+        }
+        Ok(())
+    });
+    ops
+}
+
+/// `e`'s elements when it is `x IN (...)` or `x NOT IN (...)` over
+/// constants, which PostgreSQL folds to one array constant.
+fn in_list_of_constants(e: &pg_query::protobuf::AExpr) -> Option<usize> {
+    if e.kind != pg_query::protobuf::AExprKind::AexprIn as i32 {
+        return None;
+    }
+    let Some(N::List(l)) = e.rexpr.as_deref().and_then(|r| r.node.as_ref()) else {
+        return None;
+    };
+    let constant = |x: &pg_query::protobuf::Node| match x.node.as_ref() {
+        Some(N::AConst(_)) => true,
+        Some(N::TypeCast(t)) => matches!(
+            t.arg.as_deref().and_then(|a| a.node.as_ref()),
+            Some(N::AConst(_))
+        ),
+        _ => false,
+    };
+    (!l.items.is_empty() && l.items.iter().all(constant)).then_some(l.items.len())
+}
+
+/// `n` is built only of what [`qual_operators`] prices as
+/// `cost_qual_eval` does: comparisons, LIKE and ILIKE, BETWEEN, an IN
+/// list of constants ([`qual_startup_operators`] its hash table's build),
+/// AND / OR / NOT, columns and constants. A null test, a call (a LIKE's
+/// ESCAPE is `like_escape`) or a cast of a column costs otherwise.
 fn priced_by_operator_count(n: &pg_query::protobuf::Node) -> bool {
     use pg_query::protobuf::AExprKind;
     match n.node.as_ref() {
@@ -3254,11 +3404,16 @@ fn priced_by_operator_count(n: &pg_query::protobuf::Node) -> bool {
             Some(N::AConst(_))
         ),
         Some(N::BoolExpr(b)) => b.args.iter().all(priced_by_operator_count),
+        Some(N::AExpr(e)) if in_list_of_constants(e).is_some() => {
+            e.lexpr.as_deref().is_some_and(priced_by_operator_count)
+        }
         Some(N::AExpr(e)) => {
             matches!(
                 AExprKind::try_from(e.kind),
                 Ok(AExprKind::AexprOp
                     | AExprKind::AexprDistinct
+                    | AExprKind::AexprLike
+                    | AExprKind::AexprIlike
                     | AExprKind::AexprBetween
                     | AExprKind::AexprNotBetween
                     | AExprKind::AexprBetweenSym
@@ -3274,29 +3429,67 @@ fn priced_by_operator_count(n: &pg_query::protobuf::Node) -> bool {
     }
 }
 
-/// `n` as a `<`, `<=`, `>` or `>=` of two joined keys: `(left key,
-/// operator, right key)`.
-fn comparison(n: &pg_query::protobuf::Node) -> Option<(String, String, String)> {
+/// One operand of a join inequality an index on its column can serve
+/// ([`JoinFilter::bounds`]).
+#[derive(Debug, Clone, PartialEq)]
+pub struct KeyBound {
+    /// The joined key, the operand as written.
+    pub key: String,
+    /// The operator, written with the key first (`e.a + 1 < k.a` bounds
+    /// `k.a` by `>`).
+    pub op: String,
+    /// The operators the other operand evaluates once per scan:
+    /// `index_other_operands_eval_cost`, which `genericcostestimate`
+    /// charges as the scan's startup.
+    pub arg_ops: f64,
+}
+
+/// [`JoinFilter::bounds`] of `n`. The other operand must read no column
+/// of the key's table (`match_clause_to_indexcol` refuses one that does)
+/// and be built only of what [`qual_operators`] prices: a call could be
+/// volatile, which is never an index qual, and costs otherwise.
+fn key_bounds(n: &pg_query::protobuf::Node) -> Vec<KeyBound> {
     use pg_query::protobuf::AExprKind;
-    let key = |x: Option<&pg_query::protobuf::Node>| match x?.node.as_ref()? {
+    let Some(N::AExpr(e)) = n.node.as_ref() else {
+        return Vec::new();
+    };
+    if e.kind != AExprKind::AexprOp as i32 {
+        return Vec::new();
+    }
+    let Ok(op @ ("<" | "<=" | ">" | ">=")) = operator_name(e) else {
+        return Vec::new();
+    };
+    let commuted = match op {
+        "<" => ">",
+        "<=" => ">=",
+        ">" => "<",
+        _ => "<=",
+    };
+    let (Some(l), Some(r)) = (e.lexpr.as_deref(), e.rexpr.as_deref()) else {
+        return Vec::new();
+    };
+    let bare = |x: &pg_query::protobuf::Node| match x.node.as_ref()? {
         N::ColumnRef(c) if c.fields.len() == 1 => column_ref_name(c),
         _ => None,
     };
-    let Some(N::AExpr(e)) = n.node.as_ref() else {
-        return None;
-    };
-    if e.kind != AExprKind::AexprOp as i32 {
-        return None;
+    let mut out = Vec::new();
+    for (own, other, op) in [(l, r, op), (r, l, commuted)] {
+        let Some(key) = bare(own) else {
+            continue;
+        };
+        let Some((alias, _)) = key.split_once(SEP) else {
+            continue;
+        };
+        if !priced_by_operator_count(other) || key_aliases(other).iter().any(|a| a == alias) {
+            continue;
+        }
+        out.push(KeyBound {
+            key,
+            op: op.to_string(),
+            arg_ops: qual_operators(other),
+        });
     }
-    let op = operator_name(e).ok()?;
-    if !matches!(op, "<" | "<=" | ">" | ">=") {
-        return None;
-    }
-    Some((
-        key(e.lexpr.as_deref())?,
-        op.to_string(),
-        key(e.rexpr.as_deref())?,
-    ))
+    out
 }
 
 /// [`JoinFilter::inequality_keys`] of `n`.
@@ -3321,9 +3514,19 @@ fn inequality_keys(n: &pg_query::protobuf::Node) -> Vec<String> {
             _ => None,
         }
     }
-    [e.lexpr.as_deref(), e.rexpr.as_deref()]
+    // Nor one whose other operand reads its own table, which no index on
+    // it can take (`match_clause_to_indexcol`): `e.a + k.a < k.a` is the
+    // join's filter whatever indexes `k` has.
+    let (Some(l), Some(r)) = (e.lexpr.as_deref(), e.rexpr.as_deref()) else {
+        return Vec::new();
+    };
+    [(l, r), (r, l)]
         .into_iter()
-        .filter_map(key)
+        .filter_map(|(own, other)| {
+            let k = key(Some(own))?;
+            let (alias, _) = k.split_once(SEP)?;
+            (!key_aliases(other).iter().any(|a| a == alias)).then_some(k)
+        })
         .collect()
 }
 
@@ -4869,13 +5072,49 @@ mod tests {
     }
 
     #[test]
+    fn a_pattern_match_is_one_operator() {
+        // `~~`, `!~~`, `~~*` and `!~~*` are each one `OpExpr` (RP-354).
+        let ops = |w: &str| operator_count(&where_of(&format!("select 1 from t where {w}")));
+        assert_eq!(ops("b like 'x%'"), 1);
+        assert_eq!(ops("a <> b and b not ilike 'x%'"), 2);
+    }
+
+    #[test]
+    fn an_in_list_is_its_operator_over_half_the_array() {
+        // `cost_qual_eval` of a ScalarArrayOpExpr (RP-354); one element is
+        // the plain operator.
+        let ops = |w: &str| qual_operators(&where_of(&format!("select 1 from t where {w}")));
+        assert_eq!(ops("a in (1, 2, 3)"), 1.5);
+        assert_eq!(ops("a <> b and a not in (1, 2)"), 2.0);
+        assert_eq!(ops("a in (7)"), 1.0);
+        assert_eq!(ops("a in (1, 2) or a < 3"), 2.0);
+        // Nine or more are hashed: one hash and one comparison a row, and
+        // the table's build, a hash an element (NULLs too), at startup.
+        let nine = "a in (1, 2, 3, 4, 5, 6, 7, 8, 9)";
+        assert_eq!(ops(nine), 2.0);
+        assert_eq!(ops(&format!("a <> b and {nine}")), 3.0);
+        let startup =
+            |w: &str| qual_startup_operators(&where_of(&format!("select 1 from t where {w}")));
+        assert_eq!(startup(nine), 9.0);
+        assert_eq!(startup("a not in (1, 2, 3, 4, 5, 6, 7, 8, 9, null)"), 10.0);
+        assert_eq!(startup("a in (1, 2, 3, 4, 5, 6, 7, 8)"), 0.0);
+    }
+
+    #[test]
     fn only_operators_price_a_restriction() {
         let priced =
             |w: &str| priced_by_operator_count(&where_of(&format!("select 1 from t where {w}")));
         assert!(priced("a > 990"));
         assert!(priced("a between 1 and 2 or b = 'x'::text"));
-        assert!(!priced("a in (1, 2, 3)"));
-        assert!(!priced("b like 'x%'"));
+        assert!(priced("a in (1, 2, 3)"));
+        assert!(priced("a not in (1, null, 3::int)"));
+        // Nine or more constants are hashed, priced with the table's
+        // build; a list of columns is no constant array.
+        assert!(priced("a in (1, 2, 3, 4, 5, 6, 7, 8, 9)"));
+        assert!(!priced("a in (1, b)"));
+        assert!(priced("b like 'x%'"));
+        assert!(priced("b not ilike 'X%'::text"));
+        assert!(!priced("b like 'x!%' escape '!'"));
         assert!(!priced("a::numeric > 1"));
         assert!(!priced("a is null"));
         assert!(!priced("abs(a) > 1"));

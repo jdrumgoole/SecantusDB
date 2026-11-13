@@ -273,14 +273,21 @@ pub(crate) fn operator_ambiguous(op: &str, l: &str, r: &str) -> bool {
 }
 
 /// The LEFT input type of the binary operator `op` that PostgreSQL resolves
-/// for `l op r` (`oper_select_candidate`): `l` itself when an operator takes
-/// `(l, r)` exactly, otherwise the one candidate left after keeping the most
-/// exact matches, then the most exact-or-preferred ones. `None` when the
-/// types are not both known built-ins or no single candidate remains. NULLIF
-/// takes this type (RP-076): `int4 = numeric` resolves to `numeric =
-/// numeric`, so `nullif(53, 80::numeric)` is numeric, while `int2 = int8`
-/// is the cross-type `int28eq` and keeps `int2`.
+/// for `l op r` ([`operator_inputs`]). NULLIF takes this type (RP-076):
+/// `int4 = numeric` resolves to `numeric = numeric`, so `nullif(53,
+/// 80::numeric)` is numeric, while `int2 = int8` is the cross-type
+/// `int28eq` and keeps `int2`.
 pub(crate) fn operator_left_input(op: &str, l: &str, r: &str) -> Option<String> {
+    operator_inputs(op, l, r).map(|(l, _)| l)
+}
+
+/// The input types of the binary operator `op` that PostgreSQL resolves
+/// for `l op r` (`oper_select_candidate`): `(l, r)` themselves when an
+/// operator takes them exactly, otherwise the one candidate left after
+/// keeping the most exact matches, then the most exact-or-preferred ones;
+/// an operand of another type is coerced to its input. `None` when the
+/// types are not both known built-ins or no single candidate remains.
+pub(crate) fn operator_inputs(op: &str, l: &str, r: &str) -> Option<(String, String)> {
     let cats = categories();
     if l == "unknown"
         || r == "unknown"
@@ -293,7 +300,7 @@ pub(crate) fn operator_left_input(op: &str, l: &str, r: &str) -> Option<String> 
     }
     let all = binary_operators().get(op)?;
     if all.iter().any(|(a, b)| a == l && b == r) {
-        return Some(l.to_string());
+        return Some((l.to_string(), r.to_string()));
     }
     let mut cands: Vec<&(String, String)> = all
         .iter()
@@ -327,7 +334,7 @@ pub(crate) fn operator_left_input(op: &str, l: &str, r: &str) -> Option<String> 
             )
     });
     match cands.as_slice() {
-        [one] => Some(one.0.clone()),
+        [one] => Some((*one).clone()),
         _ => None,
     }
 }
@@ -1055,6 +1062,31 @@ mod tests {
 
     fn v(types: &[&str]) -> Vec<String> {
         types.iter().map(|t| t.to_string()).collect()
+    }
+
+    /// `oper_select_candidate`'s inputs, as PostgreSQL 15.19 resolves
+    /// them (RP-354): an exact operator keeps both types, a cross-type one
+    /// too (`int48ne`); otherwise the operand that no operator takes is
+    /// coerced (`int4 <> numeric` is `numeric <> numeric`, `int4 <>
+    /// float8` the preferred `float8ne`).
+    #[test]
+    fn operator_inputs_follow_oper_select_candidate() {
+        let pair = |l: &str, r: &str| Some((l.to_string(), r.to_string()));
+        assert_eq!(operator_inputs("<>", "int4", "int4"), pair("int4", "int4"));
+        assert_eq!(operator_inputs("<>", "int4", "int8"), pair("int4", "int8"));
+        assert_eq!(
+            operator_inputs("<>", "int4", "numeric"),
+            pair("numeric", "numeric")
+        );
+        assert_eq!(
+            operator_inputs("<>", "float8", "int4"),
+            pair("float8", "float8")
+        );
+        assert_eq!(
+            operator_inputs("=", "int8", "numeric"),
+            pair("numeric", "numeric")
+        );
+        assert_eq!(operator_inputs("<>", "int4", "text"), None);
     }
 
     /// `func_get_detail` over a user routine's candidates, as PostgreSQL

@@ -291,12 +291,14 @@ fn index_cost(
     colsel: ColSel,
     full: bool,
 ) -> Option<(f64, f64, f64)> {
-    index_cost_loops(rel, index, quals, colsel, full, 1.0)
+    index_cost_loops(rel, index, quals, colsel, full, 1.0, 0.0)
 }
 
 /// `index_cost` for a scan repeated `loop_count` times, once per outer row
 /// of a nested loop (`genericcostestimate`'s `num_outer_scans`): the index
 /// pages all the scans fetch, by Mackert and Lohman, pro-rated per scan.
+/// `arg_cost` is `genericcostestimate`'s `qual_arg_cost`: evaluating the
+/// index quals' operands other than the index column, once a scan.
 fn index_cost_loops(
     rel: &Rel,
     index: &Index,
@@ -304,6 +306,7 @@ fn index_cost_loops(
     colsel: ColSel,
     full: bool,
     loop_count: f64,
+    arg_cost: f64,
 ) -> Option<(f64, f64, f64)> {
     let iq: Vec<&Qual> = quals
         .iter()
@@ -386,8 +389,9 @@ fn index_cost_loops(
         index_pages * RANDOM_PAGE_COST
     };
     let qual_op = CPU_OPERATOR_COST * iq.len() as f64;
+    let mut startup = arg_cost;
+    total += arg_cost;
     total = (nit * num_sa).mul_add(CPU_INDEX_TUPLE_COST + qual_op, total);
-    let mut startup = 0.0;
     if index.hash {
         return Some((startup, total, sel));
     }
@@ -476,7 +480,7 @@ fn index_scan(
     colsel: ColSel,
     full: bool,
 ) -> Option<(f64, f64)> {
-    index_scan_loops(rel, index, quals, colsel, full, 1.0)
+    index_scan_loops(rel, index, quals, colsel, full, 1.0, 0.0)
 }
 
 /// `index_scan` repeated `loop_count` times (`cost_index`'s `loop_count >
@@ -490,9 +494,10 @@ fn index_scan_loops(
     colsel: ColSel,
     full: bool,
     loop_count: f64,
+    arg_cost: f64,
 ) -> Option<(f64, f64)> {
     let (startup, index_total, sel) =
-        index_cost_loops(rel, index, quals, colsel, full, loop_count)?;
+        index_cost_loops(rel, index, quals, colsel, full, loop_count, arg_cost)?;
     let tuples_fetched = clamp_row_est(sel * rel.tuples);
     let visible = |pages: f64| {
         if index.visible > 0.0 {
@@ -565,7 +570,31 @@ pub fn param_index_scan(
         ColSel::Ndistinct(ndistinct),
         false,
         loop_count,
+        0.0,
     )
+}
+
+/// `add_path` between two paths of one relation with the same
+/// parameterization, rows and pathkeys (RP-354): whether `new` `(startup,
+/// total)` replaces `old` -- cheaper in total beyond the 1.01 fuzz, or
+/// fuzzily equal there and cheaper to start beyond it; fuzzily equal in
+/// both, only when cheaper beyond 1.0000000001
+/// (`compare_path_costs_fuzzily`).
+pub fn fuzzily_cheaper(new: (f64, f64), old: (f64, f64)) -> bool {
+    let cmp = |fuzz: f64| -> Option<bool> {
+        if new.1 > old.1 * fuzz {
+            Some(false)
+        } else if old.1 > new.1 * fuzz {
+            Some(true)
+        } else if new.0 > old.0 * fuzz {
+            Some(false)
+        } else if old.0 > new.0 * fuzz {
+            Some(true)
+        } else {
+            None
+        }
+    };
+    cmp(1.01).or_else(|| cmp(1.000_000_000_1)).unwrap_or(false)
 }
 
 /// A scan of `index` inside a nested loop whose index quals bound its
@@ -574,25 +603,61 @@ pub fn param_index_scan(
 /// to compare against, `scalarineqsel` is `DEFAULT_INEQ_SEL`, a third of
 /// the rows, and a join clause never pairs into a range
 /// (`clauselist_selectivity` pairs only clauses over one relation), so
-/// two bounds (`a > e.a and a < e.a`) select a ninth. Repeated
-/// `loop_count` times as [`param_index_scan`] is. `(startup, total)`.
+/// two bounds (`a > e.a and a < e.a`) select a ninth. `arg_ops` are the
+/// operators of the bounds' outer-side operands (`a > e.a + 1`), each
+/// evaluated once a scan: `genericcostestimate`'s `qual_arg_cost`. Repeated `loop_count` times as
+/// [`param_index_scan`] is. `column` is the key column bounded: the
+/// leading one, or a later one (`y > e.a` over an index on `(x, y)`),
+/// which `match_clause_to_index` matches too but which bounds nothing
+/// (`btcostestimate`'s `indexBoundQuals` stop at the leading column
+/// without a qual), so every scan reads the whole index and checks each
+/// entry against the quals. `(startup, total)`.
 pub fn param_range_index_scan(
     rel: &Rel,
     index: &Index,
+    column: &str,
     quals: &[(String, Qual)],
     bounds: &[bool],
+    arg_ops: f64,
     loop_count: f64,
 ) -> Option<(f64, f64)> {
-    if index.hash || bounds.is_empty() || quals.iter().any(|(f, _)| f == &index.field) {
+    if index.hash
+        || bounds.is_empty()
+        || !index.columns.iter().any(|c| c == column)
+        || quals.iter().any(|(f, _)| index.columns.contains(f))
+    {
         return None;
     }
     let mut quals = quals.to_vec();
     let mut sel = 1.0;
     for lower in bounds {
-        quals.push((index.field.clone(), Qual::Range(*lower)));
+        quals.push((column.to_string(), Qual::Range(*lower)));
         sel *= 1.0 / 3.0;
     }
-    index_scan_loops(rel, index, &quals, ColSel::Given(sel), false, loop_count)
+    if column == index.field {
+        return index_scan_loops(
+            rel,
+            index,
+            &quals,
+            ColSel::Given(sel),
+            false,
+            loop_count,
+            arg_ops * CPU_OPERATOR_COST,
+        );
+    }
+    let index = Index {
+        later: vec![(column.to_string(), sel)],
+        ..index.clone()
+    };
+    index_scan_loops(
+        rel,
+        &index,
+        &quals,
+        ColSel::Given(1.0),
+        true,
+        loop_count,
+        arg_ops * CPU_OPERATOR_COST,
+    )
 }
 
 /// A bitmap heap scan over `index` parameterized as [`param_index_scan`]
@@ -623,6 +688,7 @@ pub fn param_bitmap_heap_scan(
         ColSel::Ndistinct(ndistinct),
         false,
         loop_count,
+        0.0,
     )?;
     let startup = index_total + 0.1 * CPU_OPERATOR_COST * rows;
     let startup = startup + qual_startup(all.iter().map(|(_, q)| q));
@@ -1794,17 +1860,82 @@ mod tests {
             hash: false,
             later: Vec::new(),
         };
-        let (startup, total) = param_range_index_scan(&rel, &ix, &[], &[true], 100.0).unwrap();
+        let (startup, total) =
+            param_range_index_scan(&rel, &ix, "a", &[], &[true], 0.0, 100.0).unwrap();
         assert_eq!((startup, total), (0.275, 6.5025));
         // `explain select * from e left join k on e.a < k.a and e.a > k.a`
         // over the same `k` and 1,000 rows of `e`: `Index Cond: ((a >
         // e.a) AND (a < e.a))`, a ninth of the rows a scan, prints
         // `cost=0.28..2.53` on PostgreSQL 15.19 (RP-354).
         let (startup, total) =
-            param_range_index_scan(&rel, &ix, &[], &[true, false], 1000.0).unwrap();
+            param_range_index_scan(&rel, &ix, "a", &[], &[true, false], 0.0, 1000.0).unwrap();
         assert_eq!(
             (format!("{startup:.2}"), format!("{total:.2}")),
             ("0.28".to_string(), "2.53".to_string())
         );
+        // `explain select * from e left join k on e.a + 1 < k.a`: `Index
+        // Cond: (a > (e.a + 1))` evaluates its `+` once a scan
+        // (`qual_arg_cost`), added before the index tuples' cost, so the
+        // scan is 6.145 a hair under and prints `cost=0.28..6.14` on
+        // PostgreSQL 15.19, the loop's 1,000 rescans 2.50 more than `e.a <
+        // k.a`'s (RP-354).
+        let (startup, total) =
+            param_range_index_scan(&rel, &ix, "a", &[], &[true], 1.0, 1000.0).unwrap();
+        assert_eq!(
+            (format!("{startup:.2}"), format!("{total:.2}")),
+            ("0.28".to_string(), "6.14".to_string())
+        );
+    }
+
+    /// `add_path`'s choice between two parameterized index paths: the
+    /// cheaper total beyond 1%, then the cheaper startup, and between
+    /// fuzzily equal ones the old path stays (RP-354).
+    #[test]
+    fn the_fuzzily_cheaper_path_replaces_the_old() {
+        // `e.a < c4.y`: `c4_y`'s 6.14 against `c4_xy`'s 11.14.
+        assert!(fuzzily_cheaper((0.28, 6.14), (0.28, 11.14)));
+        assert!(!fuzzily_cheaper((0.28, 11.14), (0.28, 6.14)));
+        // Within 1% the startup decides.
+        assert!(fuzzily_cheaper((0.1, 100.5), (0.3, 100.0)));
+        assert!(!fuzzily_cheaper((0.3, 100.0), (0.1, 100.5)));
+        // Equal: the old stays; a hair cheaper beyond the tiny fuzz wins.
+        assert!(!fuzzily_cheaper((0.28, 6.14), (0.28, 6.14)));
+        assert!(fuzzily_cheaper((0.28, 6.1399), (0.28, 6.14)));
+    }
+
+    /// `explain select * from e, c2 where e.a < c2.y` over `c2 (x int, y
+    /// int)` of 1,000 analysed rows (5 heap pages) indexed on `(x, y)`
+    /// (`c2_xy`, 5 pages of height 1, `x`'s correlation 0.1044901): the
+    /// inner `Index Only Scan using c2_xy`, `Index Cond: (y > e.a)` 1,000
+    /// times, bounds nothing -- no qual on `x` -- so each scan reads every
+    /// index entry, and prints `cost=0.28..11.14 rows=333` on PostgreSQL
+    /// 15.19 (RP-354).
+    #[test]
+    fn a_parameterized_scan_on_a_later_index_column_reads_the_whole_index() {
+        let rel = Rel {
+            pages: 5.0,
+            tuples: 1000.0,
+        };
+        let ix = Index {
+            field: "x".into(),
+            unique: false,
+            pages: 5.0,
+            height: 1,
+            columns: vec!["x".into(), "y".into()],
+            correlation: 0.1044901 * 0.75,
+            visible: 0.0,
+            tuples: None,
+            predicate: None,
+            hash: false,
+            later: Vec::new(),
+        };
+        let (startup, total) =
+            param_range_index_scan(&rel, &ix, "y", &[], &[true], 0.0, 1000.0).unwrap();
+        assert_eq!(
+            (format!("{startup:.2}"), format!("{total:.2}")),
+            ("0.28".to_string(), "11.14".to_string())
+        );
+        // A column the index does not hold is no index qual.
+        assert!(param_range_index_scan(&rel, &ix, "z", &[], &[true], 0.0, 1000.0).is_none());
     }
 }

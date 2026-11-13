@@ -1195,9 +1195,16 @@ impl PgHandler {
             "pg_class" | "pg_attribute" => self.shared_table_defs().unwrap_or_default(),
             _ => Arc::default(),
         };
+        // Every oid from one map: a lookup per table re-fetched the catalog
+        // documents for each (RP-911).
+        let oids = if defs.is_empty() {
+            Arc::default()
+        } else {
+            self.relation_oids().unwrap_or_default()
+        };
         let tables: Vec<(i64, &TableDef)> = defs
             .iter()
-            .filter_map(|t| Some((self.relation_oid(&t.name)?, t)))
+            .filter_map(|t| Some((Self::oid_in(&oids, &t.name)?, t)))
             .collect();
         // By oid, the first of each: every row asks for its relation's
         // several times, and a scan of the list per ask made the fill

@@ -824,15 +824,20 @@ pub fn cheapest_nest_loop(
 /// inner (`param[0]` for `b` inner, `param[1]` for `a`): each is weighed
 /// after the plain inner and before the Material of it, as
 /// `match_unsorted_outer` tries `cheapest_parameterized_paths` (RP-354).
+///
+/// `qual_startup` is the join quals' `cost_qual_eval` startup (a hashed IN
+/// list's table), which `final_cost_nestloop` adds to every path's startup
+/// and total.
 pub fn cheapest_nest_loop_param(
     a: (f64, f64, f64, i64),
     b: (f64, f64, f64, i64),
     qual: f64,
+    qual_startup: f64,
     param: [Option<ParamInner>; 2],
     left: bool,
 ) -> NestLoopPlan {
     let orders: &[bool] = if left { &[false] } else { &[false, true] };
-    nest_loop_paths_with(a, b, qual, [None, None], orders, param)
+    nest_loop_paths_over(&[(a, b, qual)], [None, None], orders, param, qual_startup).1
 }
 
 /// [`cheapest_nest_loop`] where `a` or `b` may be `inner_unique` as the
@@ -876,61 +881,102 @@ fn nest_loop_paths_with(
     orders: &[bool],
     param: [Option<ParamInner>; 2],
 ) -> NestLoopPlan {
+    nest_loop_paths_over(&[(a, b, qual)], unique, orders, param, 0.0).1
+}
+
+/// Two input relations of a join, each `(startup, total, rows, width)`,
+/// and the cost a row of the join clauses between them.
+pub type NestLoopPair = ((f64, f64, f64, i64), (f64, f64, f64, i64), f64);
+
+/// [`cheapest_nest_loop`] over every pair of input relations that makes
+/// one join relation (RP-354): `make_join_rel` calls
+/// `add_paths_to_joinrel` for each pair `join_search_one_level` finds, in
+/// its order, each `(a, b, qual)` weighed `a` outer then `b`, and every
+/// path goes into the one relation's list, so the cheapest of them all is
+/// kept (an earlier pair's path where two cost the same). Returns the
+/// winning pair's index and its plan; `None` for no pairs.
+pub fn cheapest_nest_loop_of(pairs: &[NestLoopPair]) -> Option<(usize, NestLoopPlan)> {
+    if pairs.is_empty() {
+        return None;
+    }
+    Some(nest_loop_paths_over(
+        pairs,
+        [None, None],
+        &[false, true],
+        [None, None],
+        0.0,
+    ))
+}
+
+fn nest_loop_paths_over(
+    pairs: &[NestLoopPair],
+    unique: [Option<(f64, f64)>; 2],
+    orders: &[bool],
+    param: [Option<ParamInner>; 2],
+    qual_startup: f64,
+) -> (usize, NestLoopPlan) {
     let mut paths: Vec<JoinPath> = Vec::new();
-    let mut materials = [(0.0, 0.0); 2];
-    for &b_outer in orders {
-        let (o, i) = if b_outer { (b, a) } else { (a, b) };
-        let outer = InPath::scan(o.0, o.1, o.2, None);
-        let inner = InPath::scan(i.0, i.1, i.2, None);
-        let mat = material(&inner, i.3);
-        materials[usize::from(b_outer)] = (mat.startup, mat.total);
-        let param_inner = param[usize::from(b_outer)].map(|p| {
-            let mut path = InPath::scan(p.startup, p.total, p.rows, None);
-            path.indexed = true;
-            (path, p.qual)
-        });
-        let mut inners: Vec<(usize, &InPath, f64)> = vec![(0, &inner, qual)];
-        if let Some((path, q)) = &param_inner {
-            inners.push((2, path, *q));
-        }
-        inners.push((1, &mat, qual));
-        for (kind, inner, qual) in inners {
-            let semi = unique[usize::from(!b_outer)];
-            let (startup, total) = nestloop_cost(&outer, inner, semi, false, qual);
-            add_path(
-                &mut paths,
-                JoinPath {
-                    startup,
-                    total,
-                    keyed: false,
-                    class: 0,
-                    method: JoinMethod::Other,
-                    // The pair it was built from: which side is outer, and
-                    // whether its inner is materialised.
-                    // and its inner: plain (0), materialised (1) or the
-                    // parameterized index scan (2).
-                    combo: usize::from(b_outer) * 3 + kind,
-                    a_path: DEFAULT_INPUT,
-                    b_path: DEFAULT_INPUT,
-                    rows: 0.0,
-                    req_outer: 0,
-                    rescan: (startup, total),
-                },
-                false,
-            );
+    // Each pair's Material of its inner, by outer side.
+    let mut materials = vec![[(0.0, 0.0); 2]; pairs.len()];
+    for (pair, &(a, b, qual)) in pairs.iter().enumerate() {
+        for &b_outer in orders {
+            let (o, i) = if b_outer { (b, a) } else { (a, b) };
+            let outer = InPath::scan(o.0, o.1, o.2, None);
+            let inner = InPath::scan(i.0, i.1, i.2, None);
+            let mat = material(&inner, i.3);
+            materials[pair][usize::from(b_outer)] = (mat.startup, mat.total);
+            let param_inner = param[usize::from(b_outer)].map(|p| {
+                let mut path = InPath::scan(p.startup, p.total, p.rows, None);
+                path.indexed = true;
+                (path, p.qual)
+            });
+            let mut inners: Vec<(usize, &InPath, f64)> = vec![(0, &inner, qual)];
+            if let Some((path, q)) = &param_inner {
+                inners.push((2, path, *q));
+            }
+            inners.push((1, &mat, qual));
+            for (kind, inner, qual) in inners {
+                let semi = unique[usize::from(!b_outer)];
+                let (startup, total) = nestloop_cost(&outer, inner, semi, false, qual);
+                let (startup, total) = (startup + qual_startup, total + qual_startup);
+                add_path(
+                    &mut paths,
+                    JoinPath {
+                        startup,
+                        total,
+                        keyed: false,
+                        class: 0,
+                        method: JoinMethod::Other,
+                        // The pair it was built from, which side is outer,
+                        // and its inner: plain (0), materialised (1) or the
+                        // parameterized index scan (2).
+                        combo: pair * 6 + usize::from(b_outer) * 3 + kind,
+                        a_path: DEFAULT_INPUT,
+                        b_path: DEFAULT_INPUT,
+                        rows: 0.0,
+                        req_outer: 0,
+                        rescan: (startup, total),
+                    },
+                    false,
+                );
+            }
         }
     }
     let best = paths[0];
-    let b_outer = best.combo >= 3;
+    let pair = best.combo / 6;
+    let b_outer = best.combo % 6 >= 3;
     let materialized = best.combo % 3 == 1;
-    NestLoopPlan {
-        b_outer,
-        materialized,
-        startup: best.startup,
-        total: best.total,
-        material: materialized.then_some(materials[usize::from(b_outer)]),
-        param: best.combo % 3 == 2,
-    }
+    (
+        pair,
+        NestLoopPlan {
+            b_outer,
+            materialized,
+            startup: best.startup,
+            total: best.total,
+            material: materialized.then_some(materials[pair][usize::from(b_outer)]),
+            param: best.combo % 3 == 2,
+        },
+    )
 }
 
 /// A merge join, each side read in key order -- by its `ordered` index scan
@@ -2906,6 +2952,33 @@ mod tests {
         // Materialize of jq (0.00..76684.85).
         let (s, t) = nest_loop(&plain(), &plain(), true);
         assert!(close(s, 0.0) && close(t, 76684.85), "{s} {t}");
+    }
+
+    #[test]
+    fn a_join_of_three_relations_keeps_its_cheapest_pair() {
+        // `e join e e2 on e.a < e2.a join e e3 on e2.a < e3.a`, 1,000
+        // analysed rows each (PostgreSQL 15.19): {e, e2} is a Nested Loop
+        // over a Materialize of e2 (0.00..15032.50, 333,333 rows), and the
+        // three a Nested Loop of that over a Materialize of e3
+        // (0.00..5015045.00). {e2, e3} with e costs the same, so the
+        // earlier pair is kept.
+        let scan = (0.0, 15.0, 1000.0, 7);
+        let lower = cheapest_nest_loop(scan, scan, CPU_OPERATOR_COST);
+        assert!(close(lower.total, 15032.50), "{lower:?}");
+        assert!(!lower.b_outer && lower.material == Some((0.0, 20.0)));
+        let pair = (
+            (lower.startup, lower.total, 333_333.0, 14),
+            scan,
+            CPU_OPERATOR_COST,
+        );
+        let (pick, top) = cheapest_nest_loop_of(&[pair, pair]).expect("two pairs");
+        assert_eq!(pick, 0);
+        assert!(close(top.total, 5_015_045.0) && !top.b_outer, "{top:?}");
+        assert_eq!(top.material, Some((0.0, 20.0)));
+        // A dearer first pair loses to the second.
+        let dear = ((0.0, 30_000.0, 333_333.0, 14), scan, CPU_OPERATOR_COST);
+        assert_eq!(cheapest_nest_loop_of(&[dear, pair]).map(|p| p.0), Some(1));
+        assert!(cheapest_nest_loop_of(&[]).is_none());
     }
 
     #[test]

@@ -7800,3 +7800,43 @@ fn a_default_that_does_not_fold_is_kept_as_its_expression() {
         assert_eq!(err.sqlstate(), "22P02", "{sql}: {err}");
     }
 }
+
+/// `explain_scan_expr_quals` of a single-table SELECT over `t`.
+fn scan_expr_quals(sql: &str) -> Option<Vec<ExprQual>> {
+    let parsed = pg_query::parse(sql).expect("parses");
+    let node = parsed.protobuf.stmts[0]
+        .stmt
+        .as_ref()
+        .and_then(|n| n.node.clone())
+        .expect("a statement");
+    explain_scan_expr_quals(&node, &lookup)
+}
+
+#[test]
+fn a_cast_of_a_column_is_an_expression_with_its_functions_cost() {
+    // RP-354, measured on PostgreSQL 15.19: an I/O conversion is its
+    // output and input functions (`n::text <> '5'` is `cost=0.00..22.50`
+    // over 1,000 rows of five pages, three operators a row); a cast with
+    // a function is that one call (`n::int8 > 5`, two operators).
+    let q = scan_expr_quals("select * from t where n::text <> '5'").expect("priced");
+    assert_eq!(q.len(), 1);
+    assert_eq!((q[0].op, q[0].operators), (colstats::Op::Ne, 3));
+    let q = scan_expr_quals("select * from t where n::int8 > 5").expect("priced");
+    assert_eq!((q[0].op, q[0].operators), (colstats::Op::Gt, 2));
+    let q = scan_expr_quals("select * from t where name::int < 3").expect("priced");
+    assert_eq!((q[0].op, q[0].operators), (colstats::Op::Lt, 3));
+    // A folded constant cast on the other side costs nothing.
+    let q = scan_expr_quals("select * from t where n::int2 = 5::int2").expect("priced");
+    assert_eq!((q[0].op, q[0].operators), (colstats::Op::Eq, 2));
+    // Not priced: a binary-coercible cast (a RelabelType, RP-912), a
+    // cast with a type modifier, a cast to a type outside the integer and
+    // string families, and a cast of an expression.
+    for sql in [
+        "select * from t where name::varchar <> 'x'",
+        "select * from t where n::varchar(3) <> '5'",
+        "select * from t where n::numeric > 5",
+        "select * from t where (n + 1)::text <> '5'",
+    ] {
+        assert_eq!(scan_expr_quals(sql), None, "{sql}");
+    }
+}
