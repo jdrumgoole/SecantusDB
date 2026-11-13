@@ -1150,13 +1150,15 @@ These are explicit non-goals. Don't add them without a reason.
       (`opdebug::note_planned`). Found while working RM-363, 2026-11-13.
       Verify: tests/backlog/test_rm_found_rm363.py::test_a_contested_read_says_it_was_multi_planned
       Backlog-ID: RM-599
-- [ ] **A read of a time-series collection's meta index names the index
-      as `listIndexes` shows it.** mongod 8.2.11's line for a `find({m: 1})`
-      of a time-series collection says `IXSCAN { meta: 1, control.min.t: 1,
-      control.max.t: 1 }`, the index as its buckets keep it; this server's
-      says `IXSCAN { m: 1, t: 1 }`. Found while working RM-363, 2026-11-10.
-      Verify: tests/backlog/test_rm_found_2026_11_10_rm363.py::test_a_read_of_the_meta_index_names_the_index_over_the_buckets
-      Backlog-ID: RM-496
+- [ ] **A time-series read bounded on its time field is not a clustered
+      scan of its buckets.** mongod 8.2.11's line for a `find({t: {$gt:
+      <date>}})` of a time-series collection, with no index serving the
+      bound, says `CLUSTERED_IXSCAN`: the buckets are clustered by `_id`,
+      whose timestamp is each bucket's start, so the bound on
+      `control.min.t` bounds the `_id`s read. This server's says
+      `COLLSCAN`. Found while working RM-496, 2026-11-13.
+      Backlog-ID: RM-600
+      Verify: tests/backlog/test_rm_found_2026_11_10_rm363.py::test_a_time_series_read_bounded_on_its_time_field_scans_the_clustered_buckets
 - [ ] **WiredTiger 11's interruptible cache wait is not on the line.**
       mongod 8.2.11's WiredTiger splits a cache wait into the share spent
       in interruptible eviction (`timeWaitingMicros.cacheInterruptibleMicros`)
