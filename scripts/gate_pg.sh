@@ -36,7 +36,9 @@
 # --only reruns named steps after a fix that only they check (a format or
 # lint slip). After any other code change, rerun the whole gate. Each step
 # writes the commit it ran on to .scratch/gate/<step>.sha, and the summary
-# table flags a result from an older commit.
+# table flags a result from an older commit. The gate passes only when
+# every step on record is 0, not just the ones rerun: a step that failed
+# earlier still fails it.
 set -uo pipefail
 
 storage=0 fast=0 list=0 only=
@@ -104,6 +106,7 @@ summary() {
             n=$(basename "$f" .rc)
             sha=$(cat "$out/$n.sha" 2>/dev/null)
             echo "      $n=$(cat "$f") at ${sha:-?}$([[ $sha != "$head" ]] && echo "  (older commit than HEAD $head)")"
+            [[ $(cat "$f") == 0 ]] || failed=1
         done
     fi
     echo "gate=$failed"
