@@ -1556,15 +1556,6 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       9). Found 2026-11-13 (RM-506).
       Verify: tests/backlog/test_rm_found_2026_11_13_rm506.py::test_a_missing_field_counts_its_slot
       Backlog-ID: RM-616
-- [ ] **`$integral` and the covariances count no memory in a window.**
-      mongod 8.2.1 counts what they hold: `maxFunctionMemoryUsageBytes`
-      3888 for a `["unbounded", 4]` `range` `$integral` over 40 documents,
-      568 for a `["unbounded", -1]` `$covariancePop`. This server counts
-      nothing for either (`FunctionMemory::Nothing`), so `explain` shows 0
-      and the stage runs under budgets mongod refuses (500 against 4300,
-      375 against 818). Found 2026-11-10 (RM-404).
-      Verify: tests/backlog/test_rm_found_2026_11_10_rm404.py::test_integral_and_covariance_count_their_memory
-      Backlog-ID: RM-509
 - [ ] **A partitioned window's `maxTotalMemoryUsageBytes` is 16 bytes off.**
       With `partitionBy` over three partitions of 40 small documents,
       macOS mongod 8.2.1 reports 748 for a `range [-4, 4]` `$sum` (here
@@ -1572,9 +1563,42 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       `$sum` (464) and 432 for `$expMovingAvg` (416). Both directions, one
       partition key's size; the least budgets agree, so the moment the
       tracker sees differs, not what the budget counts. Cause not yet
-      traced. Found 2026-11-10 (RM-404).
+      traced. A window with no lower end over a function that keeps its
+      values is off by one value more: macOS mongod 8.2.11 reports 756 for
+      a partitioned `["unbounded", -1]` `$push` (here 724: 16 and one int's
+      16) and 1940 for `$integral` (here 1836: 16 and one point's 88;
+      RM-509). Found 2026-11-10 (RM-404).
       Verify: tests/backlog/test_rm_found_2026_11_10_rm404.py::test_a_partitioned_windows_total_memory
       Backlog-ID: RM-510
+- [ ] **`explain` with `executionStats` answers where a `$setWindowFields`
+      fails.** mongod 8.2.11 runs the pipeline for `executionStats` and
+      returns the executor's error: a `$sum` of `{$divide: [1, "$z"]}` over
+      a `z` of 0 (code 2), an `$integral` of a null input (5423900), a
+      `$derivative` of one (5624903). This server returns an `explain`
+      document for each, `maxFunctionMemoryUsageBytes` and all, while its
+      `aggregate` of the same pipeline refuses. Found 2026-11-13 (RM-509).
+      Verify: tests/backlog/test_rm_found_2026_11_13_rm509.py::test_explain_reports_a_window_functions_error
+      Backlog-ID: RM-617
+- [ ] **`$derivative`'s partition cache holds too little.** mongod 8.2.11's
+      `maxTotalMemoryUsageBytes` for a `$derivative` over ten documents of
+      125 bytes is 1250 for any window with no lower end (the whole
+      partition), 1000 for `[-3, 3]` and `[-5, 0]`, 500 for `[-1, 1]`, 375
+      for `[0, 0]`; this server's `reach` keeps two to four documents (250,
+      500). The function itself holds nothing on either. Found 2026-11-13
+      (RM-509).
+      Verify: tests/backlog/test_rm_found_2026_11_13_rm509.py::test_a_derivatives_cache_holds_what_mongods_does
+      Backlog-ID: RM-618
+- [ ] **A window with no lower end counts its function before it holds a
+      value.** mongod 8.2.11 reports `maxFunctionMemoryUsageBytes` 0 for a
+      `$sum`, `$push` or `$avg` over `["unbounded", -2]` in a partition of
+      two documents (one: `["unbounded", -1]` too), whose window never
+      holds a document; this server counts the accumulator's size (184,
+      136, 152), and for `$push` the first document's value, which its
+      `FunctionMemory::Growing` reads although the window is empty.
+      `$integral` and the covariances already count 0 there (RM-509).
+      Found 2026-11-13 (RM-509).
+      Verify: tests/backlog/test_rm_found_2026_11_13_rm509.py::test_an_empty_window_counts_no_function
+      Backlog-ID: RM-619
 - [ ] **The sort key is lost at a `$replaceRoot`, a `$lookup` or a
       `$setWindowFields`.** mongod 8.2.11 keeps a document's sort key
       through a `$replaceRoot`, a `$lookup` and a `$setWindowFields` with no

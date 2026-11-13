@@ -540,10 +540,15 @@ fn window_fields_each(
         }
         // mongod's partition cache over this partition: held to its budget,
         // spilled or refused (RM-211).
+        let sort_field = sort_by
+            .filter(|sb| sb.len() == 1)
+            .and_then(|sb| sb.keys().next())
+            .map(String::as_str);
         run_cache(
             &compiled,
             &slots,
             &docs,
+            sort_field,
             &sizer,
             ranks.as_ref(),
             token,
@@ -555,10 +560,6 @@ fn window_fields_each(
         )?;
         // $expMovingAvg / $locf / $linearFill each produce a per-slot vector —
         // precompute once per partition per output field (parallel to `compiled`).
-        let sort_field = sort_by
-            .filter(|sb| sb.len() == 1)
-            .and_then(|sb| sb.keys().next())
-            .map(String::as_str);
         let mut prefix_vecs: Vec<Option<Vec<Bson>>> = Vec::with_capacity(compiled.len());
         for c in &compiled {
             prefix_vecs.push(if PREFIX_OPS.contains(&c.op) {
@@ -904,12 +905,56 @@ enum FunctionMemory {
         last: Option<usize>,
         fed: usize,
     },
+    /// `$integral` or a covariance with no lower end: `AccumulatorIntegral`
+    /// / `AccumulatorCovariance` run by the non-removable executor. The
+    /// covariance holds its own size; `$integral` adds every point it is
+    /// given, as its `WindowFunctionIntegral` never lets one go (its
+    /// `isNonremovable` member is never set from the constructor's
+    /// argument, r8.2.11). Nothing at all until a value is given: mongod
+    /// counts a function whose window has stayed empty as 0 (RM-509,
+    /// measured macOS 8.2.11).
+    Accumulated {
+        base: usize,
+        keeps_points: bool,
+        fed: usize,
+        points: usize,
+    },
 }
 
 /// `AccumulatorExpMovingAvg`'s size (RM-404).
 const EXP_MOVING_AVG: usize = 136;
 /// `AccumulatorLocf`'s size, before the value it carries (RM-404).
 const LOCF: usize = 128;
+/// `sizeof(WindowFunctionCovariance)`: the state, a count and three
+/// running sums (two `WindowFunctionAvg`s and a `WindowFunctionSum`), none
+/// of it from the standard library, so every build's (RM-509: 472, macOS
+/// 8.2.11, which r8.2.11's members reproduce).
+const REMOVABLE_COVARIANCE: usize = 472;
+/// `sizeof(AccumulatorCovariance)`: the accumulator's 96 bytes around the
+/// window function (RM-509: 568, macOS 8.2.11).
+const COVARIANCE: usize = 568;
+
+/// The value a window function is given for the document at `doc`, as
+/// mongod's executors build it: `$integral`'s point is `[sortBy value,
+/// input]`, the others' their argument evaluated (a covariance's is the
+/// `[x, y]` array). An error is sized as `null`: the answer pass reports it.
+fn function_input(c: &OutField, doc: &Document, sort_field: Option<&str>, vars: &Document) -> Bson {
+    if c.op == "$integral" {
+        let input = c
+            .arg
+            .as_document()
+            .and_then(|d| d.get("input"))
+            .map_or(Bson::Null, |e| {
+                expressions::evaluate(doc, e, vars).unwrap_or(Bson::Null)
+            });
+        let x = sort_field.map_or(Bson::Null, |f| field_value(doc, f));
+        return Bson::Array(vec![x, input]);
+    }
+    if c.op == "$count" {
+        return Bson::Int32(1);
+    }
+    expressions::evaluate(doc, c.arg, vars).unwrap_or(Bson::Null)
+}
 
 impl FunctionMemory {
     fn of(c: &OutField) -> R<FunctionMemory> {
@@ -939,16 +984,30 @@ impl FunctionMemory {
             "$locf" => return Ok(FunctionMemory::Locf { last: None, fed: 0 }),
             _ => {}
         }
+        let integral = c.op == "$integral";
+        if (integral || COVARIANCE_OPS.contains(&c.op)) && !window_removes(c.window) {
+            return Ok(FunctionMemory::Accumulated {
+                base: if integral {
+                    crate::memlimit::LAYOUT.integral
+                } else {
+                    COVARIANCE
+                },
+                keeps_points: integral,
+                fed: 0,
+                points: 0,
+            });
+        }
         if matches!(c.op, "$first" | "$last")
             || PREFIX_OPS.contains(&c.op)
-            || COVARIANCE_OPS.contains(&c.op)
-            || matches!(c.op, "$shift" | "$derivative" | "$integral")
+            || matches!(c.op, "$shift" | "$derivative")
         {
             return Ok(FunctionMemory::Nothing);
         }
         if window_removes(c.window) {
             return Ok(FunctionMemory::Removable {
                 base: match c.op {
+                    "$integral" => crate::memlimit::LAYOUT.removable_integral,
+                    "$covariancePop" | "$covarianceSamp" => REMOVABLE_COVARIANCE,
                     "$avg" => crate::memlimit::LAYOUT.removable_avg,
                     "$push" => crate::memlimit::LAYOUT.removable_push,
                     "$stdDevPop" | "$stdDevSamp" => crate::memlimit::LAYOUT.removable_std_dev,
@@ -979,8 +1038,10 @@ impl FunctionMemory {
         c: &OutField,
         pos: usize,
         (from, upto): (usize, usize),
+        empty: bool,
         slots: &[usize],
         docs: &[Document],
+        sort_field: Option<&str>,
         vars: &Document,
         sizer: &CacheSize,
         ranks: Option<&Ranks>,
@@ -1007,18 +1068,19 @@ impl FunctionMemory {
                     if let Some(s) = sizes[i] {
                         return s;
                     }
-                    let v = if c.op == "$count" {
-                        Bson::Int32(1)
-                    } else {
-                        expressions::evaluate(&docs[slots[i]], c.arg, vars).unwrap_or(Bson::Null)
-                    };
+                    let v = function_input(c, &docs[slots[i]], sort_field, vars);
                     let size = crate::memlimit::classic_size(&v);
                     // `$min` / `$max` keep every value that is not nullish in
                     // their multiset, beside the executor's queue of all
                     // (`WindowFunctionMinMaxCommon::add`; RM-404).
                     let min_max = matches!(c.op, "$min" | "$max")
                         && !matches!(v, Bson::Null | Bson::Undefined);
-                    let s = if size > 16 || c.op == "$push" || min_max {
+                    // `$integral` keeps each point in its own deque beside the
+                    // executor's queue; a covariance keeps none, only the
+                    // queue does (RM-509, measured macOS 8.2.11).
+                    let s = if COVARIANCE_OPS.contains(&c.op) {
+                        size
+                    } else if size > 16 || c.op == "$push" || c.op == "$integral" || min_max {
                         2 * size
                     } else {
                         size
@@ -1065,6 +1127,24 @@ impl FunctionMemory {
                     *fed += 1;
                 }
                 let held = LOCF + last.unwrap_or(0);
+                (held, held)
+            }
+            FunctionMemory::Accumulated {
+                base,
+                keeps_points,
+                fed,
+                points,
+            } => {
+                if !empty {
+                    while *fed <= upto && *fed < slots.len() {
+                        if *keeps_points {
+                            let v = function_input(c, &docs[slots[*fed]], sort_field, vars);
+                            *points += crate::memlimit::classic_size(&v);
+                        }
+                        *fed += 1;
+                    }
+                }
+                let held = if *fed == 0 { 0 } else { *base + *points };
                 (held, held)
             }
         })
@@ -1352,6 +1432,7 @@ fn run_cache(
     compiled: &[OutField],
     slots: &[usize],
     docs: &[Document],
+    sort_field: Option<&str>,
     sizer: &CacheSize,
     ranks: Option<&Ranks>,
     token: PartitionToken,
@@ -1429,6 +1510,7 @@ fn run_cache(
     for pos in 0..n {
         let mut ahead = pos as i64;
         let mut reads = Vec::with_capacity(compiled.len());
+        let mut empties = Vec::with_capacity(compiled.len());
         for c in compiled {
             ahead = ahead.max(reach(c, pos, n, range_vals, range_dates)?.1);
             // A function reads its window, not the iterator's look-ahead.
@@ -1440,6 +1522,7 @@ fn run_cache(
                 Some(w) => window_bounds(pos, n, Some(w))?,
             };
             reads.push((from.max(0) as usize, upto.max(0) as usize));
+            empties.push(upto < from);
         }
         read_to(
             &mut cache,
@@ -1454,14 +1537,17 @@ fn run_cache(
         // their old ones.
         let mut functions_held = 0usize;
         let mut not_yet: usize = held_before.iter().sum();
-        for ((((f, c), window), max), before) in functions
+        for (((((f, c), window), max), before), empty) in functions
             .iter_mut()
             .zip(compiled)
             .zip(&reads)
             .zip(stats.functions.iter_mut())
             .zip(held_before.iter_mut())
+            .zip(&empties)
         {
-            let (held, peak) = f.held(c, pos, *window, slots, docs, vars, sizer, ranks)?;
+            let (held, peak) = f.held(
+                c, pos, *window, *empty, slots, docs, sort_field, vars, sizer, ranks,
+            )?;
             *max = (*max).max(peak);
             not_yet -= *before;
             stats.total = stats
@@ -3200,6 +3286,62 @@ mod budget_tests {
         assert_eq!(least(window(sum, false)).0, 926 + layout.removable);
         let push = bson!({"$push": "$s", "window": {"documents": [-5, 5]}});
         assert_eq!(least(window(push, false)).0, 12725 + layout.removable_push);
+    }
+
+    /// RM-509 (macOS mongod 8.2.11, `maxFunctionMemoryUsageBytes`): a
+    /// removable `$integral` holds its size and each point in its window
+    /// twice (its own deque and the executor's queue), one more while its
+    /// window slides; a covariance only the queue's. With no lower end the
+    /// accumulator holds every point `$integral` was given, the covariance
+    /// its size alone, and either nothing while its window is still empty.
+    #[test]
+    fn integral_and_covariance_count_what_they_hold() {
+        let layout = crate::memlimit::LAYOUT;
+        let held = |output: Bson, n: i32| {
+            let docs: Vec<Document> = (0..n).map(|i| doc! {"_id": i, "n": i * 2}).collect();
+            let (_, report) = memlimit::captured(|| {
+                set_window_fields_each(
+                    &window(output, false),
+                    docs,
+                    &Document::new(),
+                    None,
+                    None,
+                    None,
+                    &mut |_| Ok(()),
+                )
+            });
+            report.windows[0].max_function_memory[0].1 as usize
+        };
+        // `[sortBy value, input]` and `[x, y]` of ints: 88 bytes each.
+        let point = memlimit::classic_size(&bson!([0, 0]));
+        assert_eq!(point, 88);
+        let integral = |w: Bson| bson!({"$integral": {"input": "$n"}, "window": w});
+        let covariance = |w: Bson| bson!({"$covariancePop": ["$n", "$n"], "window": w});
+        let removing = bson!({"documents": [-3, 3]});
+        assert_eq!(
+            held(integral(removing.clone()), 40),
+            layout.removable_integral + 8 * 2 * point
+        );
+        assert_eq!(
+            held(covariance(removing), 40),
+            REMOVABLE_COVARIANCE + 8 * point
+        );
+        // A window that is always empty still holds the function.
+        let ahead = bson!({"documents": [1, 3]});
+        assert_eq!(held(integral(ahead), 1), layout.removable_integral);
+        let growing = bson!({"range": ["unbounded", 4]});
+        assert_eq!(
+            held(integral(growing.clone()), 40),
+            layout.integral + 40 * point
+        );
+        assert_eq!(held(covariance(growing), 40), COVARIANCE);
+        let behind = bson!({"documents": ["unbounded", -1]});
+        assert_eq!(
+            held(integral(behind.clone()), 40),
+            layout.integral + 39 * point
+        );
+        assert_eq!(held(integral(behind.clone()), 1), 0);
+        assert_eq!(held(covariance(behind), 1), 0);
     }
 
     /// 8.2.1 and 8.2.12, 2026-11-08 (RM-405).

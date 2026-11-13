@@ -65,13 +65,13 @@ COUNTED_SHAPES = {
 }
 
 
-@pytest.mark.backlog("RM-509")
+@pytest.mark.backlog_fixed("RM-509")
 def test_integral_and_covariance_count_their_memory(rust_mongo: Any, mongod: Any) -> None:
     """mongod counts what `$integral` and the covariances hold (macOS
     8.2.1: `maxFunctionMemoryUsageBytes` 3888 for a `["unbounded", 4]`
     `range` `$integral` over 40 documents, 568 for a `["unbounded", -1]`
-    `$covariancePop`); this server counts nothing for them, so their
-    least budgets are lower (500 against 4300, 375 against 818)."""
+    `$covariancePop`); this server counted nothing for them, so their
+    least budgets were lower (500 against 4300, 375 against 818)."""
     assert _shape_budgets(rust_mongo, COUNTED_SHAPES) == _shape_budgets(mongod, COUNTED_SHAPES)
 
 
