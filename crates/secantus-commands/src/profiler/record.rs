@@ -242,6 +242,12 @@ fn refused_unprofiled(name: &str, reply: &Document) -> bool {
     if name == "renameCollection" {
         return true;
     }
+    // A `dropIndexes` refused before it acquired its collection (a view, a
+    // collection that does not exist) has no namespace to be profiled
+    // under: mongod 8.2.11 profiles it nowhere (RM-485).
+    if crate::opdebug::refused_before_acquiring(name, reply) {
+        return true;
+    }
     let code = reply.get_i32("code").unwrap_or(0);
     let msg = reply.get_str("errmsg").unwrap_or("");
     msg.starts_with("BSON field '")

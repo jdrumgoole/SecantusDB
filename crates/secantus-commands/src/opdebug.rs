@@ -613,6 +613,20 @@ pub(crate) fn namespace_kind(db: &str, coll: &str) -> Option<&'static str> {
     }
 }
 
+/// Whether `name` was refused before it acquired the collection it names,
+/// so mongod's operation never took that collection's namespace: its line
+/// names `<db>.$cmd` and no profile entry is written, as for a command that
+/// never acquires a collection. A `dropIndexes` of a view
+/// (CommandNotSupportedOnView) or of a collection that does not exist
+/// (NamespaceNotFound) is refused so; one refused once it holds the
+/// collection -- an index that does not exist, the `_id` index -- names
+/// the collection and is profiled (measured 8.2.11, 2026-11-13, RM-485).
+pub(crate) fn refused_before_acquiring(name: &str, reply: &Document) -> bool {
+    matches!(name, "dropIndexes" | "deleteIndexes")
+        && !crate::util::reply_ok(reply)
+        && matches!(reply.get_i32("code"), Ok(26 | 166))
+}
+
 /// The kind a line names `db.coll` by: `system` for a `system.`
 /// collection; then, when the operation `looked_up` what is behind the
 /// name, its [`collection_type`] if that is a `view` or `timeseries` (an

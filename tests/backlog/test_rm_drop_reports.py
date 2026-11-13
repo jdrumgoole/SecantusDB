@@ -25,7 +25,8 @@ def _line_namespaces(client: Any, is_mongod: bool, commands: list[dict]) -> dict
                 k: v.replace("<db>", db.name) if isinstance(v, str) else v
                 for k, v in command.items()
             }
-            # `getLog` is refused off `admin`; its line is still written.
+            # `getLog` is refused off `admin`, `compact` on a primary; the
+            # line of each is still written.
             with contextlib.suppress(OperationFailure):
                 db.command(shown)
     finally:
@@ -60,14 +61,16 @@ def test_a_drop_database_line_names_the_database(rust_mongo: Any, mongod_rs: Any
 
 @pytest.mark.backlog("RM-495")
 def test_a_command_s_string_argument_is_not_its_collection(rust_mongo: Any, mongod_rs: Any) -> None:
-    """mongod 8.2.11's lines for a `validate`, a `dataSize` and a `getLog`
+    """mongod 8.2.11's lines for a `validate`, a `dataSize`, a `getLog` and
+    a `compact` (refused on a replica-set primary, its line still written)
     name `<db>.$cmd`; this server's name the command's string argument as
-    though it were a collection (`<db>.c`, `<db>.<db>.c`,
-    `<db>.startupWarnings`)."""
+    though it were a collection (`<db>.<db>.c`, `<db>.startupWarnings`,
+    `<db>.c`; a `validate`'s names `<db>.$cmd` since RM-485)."""
     commands = [
         {"validate": "c"},
         {"dataSize": "<db>.c"},
         {"getLog": "startupWarnings"},
+        {"compact": "c"},
     ]
     answers = {
         "rust": _line_namespaces(rust_mongo, False, commands),
@@ -77,6 +80,7 @@ def test_a_command_s_string_argument_is_not_its_collection(rust_mongo: Any, mong
         "validate": "<db>.$cmd",
         "dataSize": "<db>.$cmd",
         "getLog": "<db>.$cmd",
+        "compact": "<db>.$cmd",
     }
     assert answers["rust"] == answers["mongod"]
 

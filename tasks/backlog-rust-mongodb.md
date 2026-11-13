@@ -968,11 +968,19 @@ These are explicit non-goals. Don't add them without a reason.
       2026-11-10.
       Verify: tests/backlog/test_rm_view_namespaces.py::test_a_time_series_ddl_line_names_its_buckets
       Backlog-ID: RM-484
-- [ ] **A refused `validate` or `dropIndexes` of a view names the view.**
-      mongod 8.2.11's line for each names `<db>.$cmd`; this server's names
-      `<db>.v`. Found while working RM-380, 2026-11-10.
-      Verify: tests/backlog/test_rm_view_namespaces.py::test_a_refused_validate_of_a_view_names_cmd
-      Backlog-ID: RM-485
+- [ ] **A `dataSize` of a view answers.** mongod 8.2.11 refuses
+      `{dataSize: "<db>.v"}` of a view (166, CommandNotSupportedOnView);
+      this server answers `ok: 1`, sizing nothing. Found while working
+      RM-485, 2026-11-13.
+      Verify: tests/backlog/test_rm_view_ddl_refusals.py::test_a_data_size_of_a_view_is_refused
+      Backlog-ID: RM-587
+- [ ] **A `dropIndexes` of `system.views` is refused.** mongod 8.2.11 drops
+      `<db>.system.views`' indexes (`ok: 1`, its line and profile entry
+      naming `<db>.system.views`, `system`); this server refuses it with
+      NamespaceNotFound (26), though `system.views` exists. Found while
+      working RM-485, 2026-11-13.
+      Verify: tests/backlog/test_rm_view_ddl_refusals.py::test_a_drop_indexes_of_system_views_answers
+      Backlog-ID: RM-588
 - [ ] **An `explain` of a write is profiled.** mongod 8.2.11 writes no
       profile entry for an `explain` of an `update` (a `delete` or
       `findAndModify` not measured); this server writes one, named for the
@@ -1034,11 +1042,13 @@ These are explicit non-goals. Don't add them without a reason.
       Verify: tests/backlog/test_rm_view_lines.py::test_a_count_and_an_aggregate_of_a_view_name_the_plan_beneath
       Backlog-ID: RM-494
 - [ ] **A `Slow query` line takes a command's string argument for its
-      collection.** mongod 8.2.11's lines for a `validate: "c"`, a
-      `dataSize: "<db>.c"` and a `getLog` name `<db>.$cmd`; this server's
-      name `<db>.c`, `<db>.<db>.c` and `<db>.startupWarnings`
+      collection.** mongod 8.2.11's lines for a `dataSize: "<db>.c"`, a
+      `getLog` and a `compact: "c"` name `<db>.$cmd`; this server's name
+      `<db>.<db>.c`, `<db>.startupWarnings` and `<db>.c`
       (`slowop::target_collection` reads any command's string value as
-      one). Found while working RM-383, 2026-11-10.
+      one; a `validate`'s names `<db>.$cmd` since RM-485). Found while
+      working RM-383, 2026-11-10; `compact` measured while working RM-485,
+      2026-11-13.
       (This was RM-480: A `dataSize` line names `<db>.<db>.c`.) mongod 8.2.1's
       `Slow query` line for a `dataSize`, whose argument is a full namespace,
       names `<db>.$cmd`; this server's joins the command's database to the

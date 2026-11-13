@@ -225,9 +225,13 @@ pub(crate) fn failure(reply: &Document, out: &mut Document) {
 /// The collection a command names: its own value, `getMore`'s
 /// `collection`, or the collection of the read an `explain` explains
 /// (`find`, `aggregate`, `count`, `distinct`; mongod's line for an `explain`
-/// of a write names `<db>.$cmd`, measured 8.2.11, RM-380).
+/// of a write names `<db>.$cmd`, measured 8.2.11, RM-380). A `validate`
+/// names none: mongod's validates its collection without taking its
+/// namespace for the operation, so its line names `<db>.$cmd` whether it
+/// validated a collection or refused a view (measured 8.2.11, RM-485).
 fn target_collection<'a>(name: &str, request: &'a Document) -> Option<&'a str> {
     let target = match name {
+        "validate" => return None,
         "getMore" => request.get("collection"),
         "explain" => {
             let inner = request.get_document("explain").ok()?;
@@ -249,13 +253,18 @@ fn target_collection<'a>(name: &str, request: &'a Document) -> Option<&'a str> {
 /// against `admin` and names a full namespace: mongod's line names the
 /// collection it renamed once it has, and the command's own `admin.$cmd`
 /// when it failed -- a source that does not exist, a target that does, a
-/// view, a bad name (measured 8.2.1, 2026-11-09).
+/// view, a bad name (measured 8.2.1, 2026-11-09). A command refused before
+/// it acquired its collection names none
+/// (`opdebug::refused_before_acquiring`, RM-485).
 fn line_target<'a>(
     name: &str,
     request: &'a Document,
     reply: &Document,
     db: &'a str,
 ) -> (&'a str, Option<&'a str>) {
+    if crate::opdebug::refused_before_acquiring(name, reply) {
+        return (db, None);
+    }
     if name != "renameCollection" {
         return (db, target_collection(name, request));
     }
@@ -814,6 +823,32 @@ mod tests {
         assert_eq!(ns(doc! {"count": "c"}), "a.c");
         assert_eq!(ns(doc! {"distinct": "c", "key": "x"}), "a.c");
         assert_eq!(ns(doc! {"update": "c", "updates": []}), "a.$cmd");
+    }
+
+    /// A `validate` names `<db>.$cmd`, and so does a `dropIndexes` refused
+    /// before it acquired its collection; one refused after it names the
+    /// collection, as mongod 8.2.11's lines do (RM-485).
+    #[test]
+    fn a_validate_and_an_unacquired_drop_indexes_name_cmd() {
+        let ns = |request: Document, reply: Document| {
+            let attr = attributes(
+                &request,
+                &reply,
+                Document::new(),
+                "a",
+                Duration::ZERO,
+                Duration::ZERO,
+            );
+            attr.get_str("ns").unwrap().to_string()
+        };
+        let refused = |code: i32| doc! {"ok": 0.0, "code": code, "errmsg": "x"};
+        let drop = || doc! {"dropIndexes": "v", "index": "*", "$db": "a"};
+        assert_eq!(ns(doc! {"validate": "c"}, doc! {"ok": 1.0}), "a.$cmd");
+        assert_eq!(ns(doc! {"validate": "v"}, refused(166)), "a.$cmd");
+        assert_eq!(ns(drop(), refused(166)), "a.$cmd");
+        assert_eq!(ns(drop(), refused(26)), "a.$cmd");
+        assert_eq!(ns(drop(), refused(27)), "a.v");
+        assert_eq!(ns(drop(), doc! {"ok": 1.0}), "a.v");
     }
 
     /// A read of a view that failed is named where it failed, beneath the

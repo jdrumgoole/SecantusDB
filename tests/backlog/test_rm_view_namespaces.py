@@ -103,10 +103,10 @@ def test_a_time_series_ddl_line_names_its_buckets(rust_mongo: Any, mongod_rs: An
     assert got["rust"] == got["mongod"]
 
 
-@pytest.mark.backlog("RM-485")
+@pytest.mark.backlog_fixed("RM-485")
 def test_a_refused_validate_of_a_view_names_cmd(rust_mongo: Any, mongod_rs: Any) -> None:
     """mongod 8.2.11's line for a `validate` or a `dropIndexes` of a view,
-    each refused, names `<db>.$cmd`; this server's names the view."""
+    each refused, names `<db>.$cmd`; this server's named the view."""
 
     def op(db: Any) -> None:
         _refused(lambda d: d.command("validate", "v"))(db)
@@ -117,6 +117,34 @@ def test_a_refused_validate_of_a_view_names_cmd(rust_mongo: Any, mongod_rs: Any)
         ("validate", "$cmd", "normal", 0),
         ("dropIndexes", "$cmd", "normal", 0),
     ]
+    assert got["rust"] == got["mongod"]
+
+
+@pytest.mark.backlog_fixed("RM-485")
+def test_an_unacquired_drop_indexes_names_cmd_and_is_not_profiled(
+    rust_mongo: Any, mongod_rs: Any
+) -> None:
+    """mongod 8.2.11's `dropIndexes` of a collection that does not exist is
+    refused before it acquires one: its line names `<db>.$cmd` and it is
+    profiled nowhere. One refused once it holds its collection (an index
+    that does not exist) names the collection and is profiled. This server
+    named the missing collection and profiled it."""
+
+    def op(db: Any) -> None:
+        _refused(lambda d: d.command("dropIndexes", "nope", index="*"))(db)
+        _refused(lambda d: d.command("dropIndexes", "c", index="nope_1"))(db)
+
+    got = {
+        server: (
+            [(_first(a), _ns(a), a.get("ok", 1), a.get("errCode")) for _, a in lines],
+            [(_first(e), _ns(e)) for e in entries],
+        )
+        for server, (lines, entries) in _both(rust_mongo, mongod_rs, op).items()
+    }
+    assert got["mongod"] == (
+        [("dropIndexes", "$cmd", 0, 26), ("dropIndexes", "c", 0, 27)],
+        [("dropIndexes", "c")],
+    )
     assert got["rust"] == got["mongod"]
 
 
