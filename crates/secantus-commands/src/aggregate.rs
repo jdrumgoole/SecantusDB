@@ -3203,7 +3203,17 @@ fn apply_lookup(
         .map_err(|_| bad_value("$lookup requires 'as' (string)"))?;
     let local_field = spec.get_str("localField").ok();
     let foreign_field = spec.get_str("foreignField").ok();
-    let sub_pipeline = spec.get("pipeline").and_then(Bson::as_array);
+    let written_pipeline = spec.get("pipeline").and_then(Bson::as_array);
+    // A `$sort` in the sub-pipeline sets the sort key its own
+    // `{$meta: "sortKey"}` and `$_internalSetWindowFields` ranks read, as the
+    // top-level pipeline's does (mongod 8.2.11, RM-521): rewritten once, run
+    // for every outer document.
+    let rewritten = written_pipeline.map(|sub| {
+        let mut stages = sub.clone();
+        crate::agg_meta::rewrite_sort_metadata(&mut stages);
+        stages
+    });
+    let sub_pipeline = rewritten.as_ref();
     let let_spec = spec.get("let").and_then(Bson::as_document);
     let bind = |doc: &Document| -> Result<Document, CommandError> {
         let mut sub_vars = vars.clone();
@@ -3287,9 +3297,12 @@ fn apply_lookup(
     // The pipeline form runs its pipeline's query on the foreign collection
     // for each outer document (the simple form's join is not checked:
     // whether mongod plans it depends on which engine runs it).
-    if let (Some(sub), None, None, false) =
-        (sub_pipeline, local_field, foreign_field, docs.is_empty())
-    {
+    if let (Some(sub), None, None, false) = (
+        written_pipeline,
+        local_field,
+        foreign_field,
+        docs.is_empty(),
+    ) {
         let (filter, sort) = crate::explain::pipeline_query(from, sub);
         crate::notablescan::check_foreign(
             storage,

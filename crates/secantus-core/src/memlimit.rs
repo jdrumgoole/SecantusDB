@@ -90,6 +90,14 @@ pub(crate) struct Layout {
     /// documents; Linux 8.2.12 128, from the least budget of a `[-3, 3]`
     /// window, 852).
     pub removable_min_max: usize,
+    /// `WindowFunctionIntegral` (a removable `$integral`), before the points
+    /// in its window, and `AccumulatorIntegral` (one with no lower end),
+    /// which holds one: they differ by platform only in the `std::deque`
+    /// of points the function keeps (libc++ 48 bytes, libstdc++ 80). RM-509:
+    /// macOS 8.2.11's `maxFunctionMemoryUsageBytes` 272 and 368, which
+    /// `sizeof` over r8.2.11's members reproduces with libc++'s deque.
+    pub removable_integral: usize,
+    pub integral: usize,
     /// `AccumulatorRank`, `AccumulatorDenseRank`,
     /// `AccumulatorDocumentNumber`.
     pub rank: usize,
@@ -106,6 +114,8 @@ pub(crate) const LIBSTDCXX: Layout = Layout {
     removable_push: 160,
     removable_std_dev: 472,
     removable_min_max: 128,
+    removable_integral: 304,
+    integral: 400,
     rank: 376,
     dense_rank: 368,
     document_number: 368,
@@ -126,6 +136,8 @@ pub(crate) const LIBCXX_ARM64: Layout = Layout {
     removable_push: 128,
     removable_std_dev: 488,
     removable_min_max: 112,
+    removable_integral: 272,
+    integral: 368,
     rank: 344,
     dense_rank: 336,
     document_number: 336,

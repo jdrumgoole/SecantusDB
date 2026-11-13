@@ -49,6 +49,11 @@ const RANK_FUNCS: [&str; 3] = ["$rank", "$denseRank", "$documentNumber"];
 /// The field the command layer hands a document's sort-key metadata over
 /// in, as the `$sort` in reach left it (`agg_meta::rewrite_sort_metadata`).
 pub const SORT_KEY_FIELD: &str = "__secantus_meta_sortKey";
+/// The field the command layer marks a document with when it carries no
+/// sort key at all -- not the empty key a read with no `$sort` gives, but
+/// none: a `$group` made it, or a `$unionWith` added it (RM-522). A rank
+/// that reaches it is refused (`agg_meta::rewrite_sort_metadata`).
+pub const NO_SORT_KEY_FIELD: &str = "__secantus_meta_noSortKey";
 /// Ops whose output is a per-slot vector precomputed once over the sorted
 /// partition (prefix accumulation / gap-fill), rather than a window accumulator.
 const PREFIX_OPS: [&str; 3] = ["$expMovingAvg", "$locf", "$linearFill"];
@@ -371,9 +376,21 @@ fn window_fields_each(
     // 8.2.1 and 8.2.11, 2026-11-10, RM-410). The key is taken off each
     // document while the stage runs, so the partition cache does not count
     // it as a field, and put back on as it leaves for the stages after.
+    // A document with no sort key at all has nothing to rank by: mongod
+    // refuses as the rank reads it, `$documentNumber` too, so the documents
+    // before it are emitted first (8.2.11, 2026-11-13, RM-522).
+    let keyless = presorted && needs_rank;
     let mut docs = docs;
     let metadata: Option<Vec<Option<Bson>>> =
         presorted.then(|| docs.iter_mut().map(|d| d.remove(SORT_KEY_FIELD)).collect());
+    // A `$setWindowFields` passes on the key it was handed, or (sorting)
+    // the key of the `$sort` it runs behind, which the command layer writes
+    // in front (RM-520). It ranks by its own `sortBy`, so the key is only
+    // carried: off each document while the stage runs, where `$$ROOT` and
+    // the partition cache would see it as a field, and back on as it leaves.
+    let carried: Option<Vec<Option<Bson>>> = (!presorted
+        && docs.iter().any(|d| d.contains_key(SORT_KEY_FIELD)))
+    .then(|| docs.iter_mut().map(|d| d.remove(SORT_KEY_FIELD)).collect());
     // Range windows, `$linearFill`, and `$derivative`/`$integral` all need the
     // single-ascending-numeric sortBy values (window bounds / interp / rate x-axis).
     let needs_range = compiled.iter().any(|c| {
@@ -540,10 +557,15 @@ fn window_fields_each(
         }
         // mongod's partition cache over this partition: held to its budget,
         // spilled or refused (RM-211).
+        let sort_field = sort_by
+            .filter(|sb| sb.len() == 1)
+            .and_then(|sb| sb.keys().next())
+            .map(String::as_str);
         run_cache(
             &compiled,
             &slots,
             &docs,
+            sort_field,
             &sizer,
             ranks.as_ref(),
             token,
@@ -555,10 +577,6 @@ fn window_fields_each(
         )?;
         // $expMovingAvg / $locf / $linearFill each produce a per-slot vector —
         // precompute once per partition per output field (parallel to `compiled`).
-        let sort_field = sort_by
-            .filter(|sb| sb.len() == 1)
-            .and_then(|sb| sb.keys().next())
-            .map(String::as_str);
         let mut prefix_vecs: Vec<Option<Vec<Bson>>> = Vec::with_capacity(compiled.len());
         for c in &compiled {
             prefix_vecs.push(if PREFIX_OPS.contains(&c.op) {
@@ -685,7 +703,14 @@ fn window_fields_each(
                 };
                 paths::set_path(&mut out_doc, c.field, value).map_err(|_| Fallback::Defer)?;
             }
-            if let Some(Some(key)) = metadata.as_ref().map(|m| &m[orig_i]) {
+            if keyless && docs[orig_i].contains_key(NO_SORT_KEY_FIELD) {
+                return Err(Fallback::mongo(
+                    9973200,
+                    "Attempt to get sort key which has not been populated",
+                )
+                .exec());
+            }
+            if let Some(Some(key)) = metadata.as_ref().or(carried.as_ref()).map(|m| &m[orig_i]) {
                 out_doc.insert(SORT_KEY_FIELD, key.clone());
             }
             sink(out_doc)?;
@@ -904,12 +929,56 @@ enum FunctionMemory {
         last: Option<usize>,
         fed: usize,
     },
+    /// `$integral` or a covariance with no lower end: `AccumulatorIntegral`
+    /// / `AccumulatorCovariance` run by the non-removable executor. The
+    /// covariance holds its own size; `$integral` adds every point it is
+    /// given, as its `WindowFunctionIntegral` never lets one go (its
+    /// `isNonremovable` member is never set from the constructor's
+    /// argument, r8.2.11). Nothing at all until a value is given: mongod
+    /// counts a function whose window has stayed empty as 0 (RM-509,
+    /// measured macOS 8.2.11).
+    Accumulated {
+        base: usize,
+        keeps_points: bool,
+        fed: usize,
+        points: usize,
+    },
 }
 
 /// `AccumulatorExpMovingAvg`'s size (RM-404).
 const EXP_MOVING_AVG: usize = 136;
 /// `AccumulatorLocf`'s size, before the value it carries (RM-404).
 const LOCF: usize = 128;
+/// `sizeof(WindowFunctionCovariance)`: the state, a count and three
+/// running sums (two `WindowFunctionAvg`s and a `WindowFunctionSum`), none
+/// of it from the standard library, so every build's (RM-509: 472, macOS
+/// 8.2.11, which r8.2.11's members reproduce).
+const REMOVABLE_COVARIANCE: usize = 472;
+/// `sizeof(AccumulatorCovariance)`: the accumulator's 96 bytes around the
+/// window function (RM-509: 568, macOS 8.2.11).
+const COVARIANCE: usize = 568;
+
+/// The value a window function is given for the document at `doc`, as
+/// mongod's executors build it: `$integral`'s point is `[sortBy value,
+/// input]`, the others' their argument evaluated (a covariance's is the
+/// `[x, y]` array). An error is sized as `null`: the answer pass reports it.
+fn function_input(c: &OutField, doc: &Document, sort_field: Option<&str>, vars: &Document) -> Bson {
+    if c.op == "$integral" {
+        let input = c
+            .arg
+            .as_document()
+            .and_then(|d| d.get("input"))
+            .map_or(Bson::Null, |e| {
+                expressions::evaluate(doc, e, vars).unwrap_or(Bson::Null)
+            });
+        let x = sort_field.map_or(Bson::Null, |f| field_value(doc, f));
+        return Bson::Array(vec![x, input]);
+    }
+    if c.op == "$count" {
+        return Bson::Int32(1);
+    }
+    expressions::evaluate(doc, c.arg, vars).unwrap_or(Bson::Null)
+}
 
 impl FunctionMemory {
     fn of(c: &OutField) -> R<FunctionMemory> {
@@ -939,16 +1008,30 @@ impl FunctionMemory {
             "$locf" => return Ok(FunctionMemory::Locf { last: None, fed: 0 }),
             _ => {}
         }
+        let integral = c.op == "$integral";
+        if (integral || COVARIANCE_OPS.contains(&c.op)) && !window_removes(c.window) {
+            return Ok(FunctionMemory::Accumulated {
+                base: if integral {
+                    crate::memlimit::LAYOUT.integral
+                } else {
+                    COVARIANCE
+                },
+                keeps_points: integral,
+                fed: 0,
+                points: 0,
+            });
+        }
         if matches!(c.op, "$first" | "$last")
             || PREFIX_OPS.contains(&c.op)
-            || COVARIANCE_OPS.contains(&c.op)
-            || matches!(c.op, "$shift" | "$derivative" | "$integral")
+            || matches!(c.op, "$shift" | "$derivative")
         {
             return Ok(FunctionMemory::Nothing);
         }
         if window_removes(c.window) {
             return Ok(FunctionMemory::Removable {
                 base: match c.op {
+                    "$integral" => crate::memlimit::LAYOUT.removable_integral,
+                    "$covariancePop" | "$covarianceSamp" => REMOVABLE_COVARIANCE,
                     "$avg" => crate::memlimit::LAYOUT.removable_avg,
                     "$push" => crate::memlimit::LAYOUT.removable_push,
                     "$stdDevPop" | "$stdDevSamp" => crate::memlimit::LAYOUT.removable_std_dev,
@@ -965,6 +1048,14 @@ impl FunctionMemory {
         })
     }
 
+    /// What the function holds before its first answer in a partition.
+    fn at_start(&self) -> usize {
+        match self {
+            FunctionMemory::Removable { base, .. } => *base,
+            _ => 0,
+        }
+    }
+
     /// The bytes held once the window covers indices `from..=upto` of
     /// `slots`, answering `pos`, and the most held on the way there. A
     /// removable function takes in the values entering its window before
@@ -979,8 +1070,10 @@ impl FunctionMemory {
         c: &OutField,
         pos: usize,
         (from, upto): (usize, usize),
+        empty: bool,
         slots: &[usize],
         docs: &[Document],
+        sort_field: Option<&str>,
         vars: &Document,
         sizer: &CacheSize,
         ranks: Option<&Ranks>,
@@ -1007,18 +1100,19 @@ impl FunctionMemory {
                     if let Some(s) = sizes[i] {
                         return s;
                     }
-                    let v = if c.op == "$count" {
-                        Bson::Int32(1)
-                    } else {
-                        expressions::evaluate(&docs[slots[i]], c.arg, vars).unwrap_or(Bson::Null)
-                    };
+                    let v = function_input(c, &docs[slots[i]], sort_field, vars);
                     let size = crate::memlimit::classic_size(&v);
                     // `$min` / `$max` keep every value that is not nullish in
                     // their multiset, beside the executor's queue of all
                     // (`WindowFunctionMinMaxCommon::add`; RM-404).
                     let min_max = matches!(c.op, "$min" | "$max")
                         && !matches!(v, Bson::Null | Bson::Undefined);
-                    let s = if size > 16 || c.op == "$push" || min_max {
+                    // `$integral` keeps each point in its own deque beside the
+                    // executor's queue; a covariance keeps none, only the
+                    // queue does (RM-509, measured macOS 8.2.11).
+                    let s = if COVARIANCE_OPS.contains(&c.op) {
+                        size
+                    } else if size > 16 || c.op == "$push" || c.op == "$integral" || min_max {
                         2 * size
                     } else {
                         size
@@ -1065,6 +1159,24 @@ impl FunctionMemory {
                     *fed += 1;
                 }
                 let held = LOCF + last.unwrap_or(0);
+                (held, held)
+            }
+            FunctionMemory::Accumulated {
+                base,
+                keeps_points,
+                fed,
+                points,
+            } => {
+                if !empty {
+                    while *fed <= upto && *fed < slots.len() {
+                        if *keeps_points {
+                            let v = function_input(c, &docs[slots[*fed]], sort_field, vars);
+                            *points += crate::memlimit::classic_size(&v);
+                        }
+                        *fed += 1;
+                    }
+                }
+                let held = if *fed == 0 { 0 } else { *base + *points };
                 (held, held)
             }
         })
@@ -1322,17 +1434,40 @@ impl PartitionToken {
             _ => self.key,
         }
     }
+}
 
-    /// The most it holds at once: reading the next partition's first
-    /// document, the comparator holds that partition's key before it lets
-    /// this one's go (`maxTotalMemoryUsageBytes`, measured 8.2.1,
-    /// 2026-11-08: a partition of whole-partition `$first` peaks at its
-    /// documents, the next one's first and both keys).
-    fn peak(&self, read_next: bool) -> usize {
-        match self.next {
-            Some(_) if read_next => self.bytes(true) + self.key,
-            _ => self.key,
-        }
+// mongod's iterator counts its state through one `MemoryUsageToken`, and
+// `updateNextPartitionStateSize` replaces it by assigning a new token over
+// the old: the new one is added to the tracker before the old one is let
+// go, so for that moment the tracker holds both, and its largest total sees
+// them (`partition_iterator.cpp`, r8.2.1). It does so at two moments:
+//
+// - reading the next partition's first document (`getNextDocument`): the
+//   old token (this partition's key) and the new (that document and its
+//   key, which the comparator already holds), while the cache holds what
+//   it read and the functions what they held when the read happened;
+// - starting that partition (`advanceToNextPartition`): the cache is
+//   cleared and given that document, the old token still counts it and its
+//   key, the new one counts the key again, and the functions still hold the
+//   last partition's state (`doGetNext` resets them after `advance`).
+//
+// The first partition's start replaces an empty token, so it counts its key
+// once. Measured 8.2.11 (2026-11-13, RM-510): partitions of 1-20 documents
+// with keys of 16, 152 and 440 bytes, over range, document, running and
+// whole-partition windows.
+
+/// What a function held when the partition iterator read past the
+/// partition's end for it. A range window finds its endpoints before it
+/// adds a value (`getEndpoints`, then `addValue`), and so does a document
+/// window after its first answer (`update` reads its upper bound first);
+/// a document window's first answer (`initialize`) adds each document it
+/// reads before reading the next, so it holds the whole window by then.
+fn held_at_read(c: &OutField, pos: usize, before: usize, after: usize) -> usize {
+    let range = c.window.is_some_and(|w| w.contains_key("range"));
+    if pos == 0 && !range && c.op != "$derivative" {
+        after
+    } else {
+        before
     }
 }
 
@@ -1352,6 +1487,7 @@ fn run_cache(
     compiled: &[OutField],
     slots: &[usize],
     docs: &[Document],
+    sort_field: Option<&str>,
     sizer: &CacheSize,
     ranks: Option<&Ranks>,
     token: PartitionToken,
@@ -1424,13 +1560,20 @@ fn run_cache(
         }
         Ok(())
     };
-    let mut outside_before = token.bytes(false);
-    let mut held_before = vec![0usize; compiled.len()];
+    // What each function holds before its first answer: a removable one its
+    // own size (`WindowFunctionExecRemovable` sets it on construction and on
+    // `reset`), the others nothing (r8.2.1; measured 8.2.11, RM-510).
+    let mut held_before: Vec<usize> = functions.iter().map(FunctionMemory::at_start).collect();
+    let mut outside_before = token.bytes(false) + held_before.iter().sum::<usize>();
     for pos in 0..n {
         let mut ahead = pos as i64;
         let mut reads = Vec::with_capacity(compiled.len());
+        let mut empties = Vec::with_capacity(compiled.len());
+        let mut reaches = Vec::with_capacity(compiled.len());
         for c in compiled {
-            ahead = ahead.max(reach(c, pos, n, range_vals, range_dates)?.1);
+            let hi = reach(c, pos, n, range_vals, range_dates)?.1;
+            reaches.push(hi);
+            ahead = ahead.max(hi);
             // A function reads its window, not the iterator's look-ahead.
             let (from, upto) = match c.window {
                 None => (0, n as i64 - 1),
@@ -1440,6 +1583,7 @@ fn run_cache(
                 Some(w) => window_bounds(pos, n, Some(w))?,
             };
             reads.push((from.max(0) as usize, upto.max(0) as usize));
+            empties.push(upto < from);
         }
         read_to(
             &mut cache,
@@ -1448,32 +1592,45 @@ fn run_cache(
             outside_before,
             &mut stats.total,
         )?;
-        read_next |= ahead > last;
         // The functions update one after another: while one holds its
         // peak, those before it hold their new windows and those after it
-        // their old ones.
+        // their old ones. The first to ask past the partition's end makes
+        // the iterator read the next partition's first document.
         let mut functions_held = 0usize;
         let mut not_yet: usize = held_before.iter().sum();
-        for ((((f, c), window), max), before) in functions
+        for ((((((f, c), window), max), before), empty), hi) in functions
             .iter_mut()
             .zip(compiled)
             .zip(&reads)
             .zip(stats.functions.iter_mut())
             .zip(held_before.iter_mut())
+            .zip(&empties)
+            .zip(&reaches)
         {
-            let (held, peak) = f.held(c, pos, *window, slots, docs, vars, sizer, ranks)?;
+            let (held, peak) = f.held(
+                c, pos, *window, *empty, slots, docs, sort_field, vars, sizer, ranks,
+            )?;
             *max = (*max).max(peak);
             not_yet -= *before;
+            if *hi > last && !read_next {
+                if let Some((doc, key)) = token.next {
+                    let at_read = held_at_read(c, pos, *before, held);
+                    stats.total = stats.total.max(
+                        cache.used + functions_held + at_read + not_yet + token.key + doc + key,
+                    );
+                }
+                read_next = true;
+            }
             stats.total = stats
                 .total
-                .max(cache.used + functions_held + peak + not_yet + token.peak(read_next));
+                .max(cache.used + functions_held + peak + not_yet + token.bytes(read_next));
             *before = held;
             functions_held += held;
         }
         let outside = functions_held + token.bytes(read_next);
         stats.total = stats
             .total
-            .max(cache.used + functions_held + token.peak(read_next));
+            .max(cache.used + functions_held + token.bytes(read_next));
         outside_before = outside;
         if cache.used + outside > budget {
             if crate::memlimit::disk_allowed() {
@@ -1503,6 +1660,15 @@ fn run_cache(
                 let (_, s) = cache.held.pop_front().expect("a front");
                 cache.used -= s;
             }
+        } else if let Some((doc, key)) = token.next {
+            // Advancing past the last document reads the next partition's
+            // first, if no window did, and then starts that partition.
+            if !read_next {
+                stats.total = stats
+                    .total
+                    .max(cache.used + functions_held + token.key + doc + key);
+            }
+            stats.total = stats.total.max(2 * (doc + key) + functions_held);
         }
     }
     Ok(())
@@ -3018,6 +3184,122 @@ mod budget_tests {
         assert_eq!(back, keys.iter().collect::<Vec<_>>());
     }
 
+    /// A document with no sort key at all is refused as the rank reaches
+    /// it, `$documentNumber` too, after the documents before it are out
+    /// (mongod 8.2.11, 2026-11-13, RM-522); a stage that numbers nothing
+    /// passes it on.
+    #[test]
+    fn a_rank_refuses_a_document_with_no_sort_key() {
+        let run = |output: Document| {
+            let docs = vec![
+                doc! {"_id": 0},
+                doc! {"_id": 1, NO_SORT_KEY_FIELD: true},
+                doc! {"_id": 2},
+            ];
+            let spec = Bson::Document(doc! { "sortBy": {"_id": 1}, "output": output });
+            let mut out = Vec::new();
+            let r = internal_set_window_fields_each(
+                &spec,
+                docs,
+                &Document::new(),
+                None,
+                None,
+                None,
+                &mut |d| {
+                    out.push(d);
+                    Ok(())
+                },
+            );
+            (r, out)
+        };
+        for f in ["$rank", "$denseRank", "$documentNumber"] {
+            let (r, out) = run(doc! { "r": { f: {} } });
+            match r {
+                Err(Fallback::Mongo { code, message, .. }) => {
+                    assert_eq!(code, 9973200);
+                    assert_eq!(
+                        message,
+                        "Attempt to get sort key which has not been populated"
+                    );
+                }
+                other => panic!("{f}: {other:?}"),
+            }
+            assert_eq!(out.len(), 1, "{f}");
+        }
+        let (r, out) = run(doc! { "s": { "$sum": 1 } });
+        assert!(r.is_ok());
+        assert_eq!(out.len(), 3);
+    }
+
+    /// mongod's iterator replaces its token by assigning a new one over the
+    /// old, so it counts both for a moment (RM-510). Reading the next
+    /// partition's first document counts this partition's key and that
+    /// document with its key; starting that partition counts the document
+    /// in the cache and in the old token, and the key twice. A `[0, 0]`
+    /// `$first` keeps the document leaving its window, so with two
+    /// documents a partition the read peaks at three documents and two
+    /// keys, and with one the start at two of each (mongod 8.2.11:
+    /// 428 and 296 for documents of 132 bytes, 2026-11-13).
+    #[test]
+    fn replacing_the_partition_token_counts_both() {
+        let total = |per: i32| {
+            let docs: Vec<Document> = (0..2 * per)
+                .map(|i| doc! {"_id": i, "k": i / per, "n": i})
+                .collect();
+            let size = memlimit::document_size(&docs[0]);
+            assert!(docs.iter().all(|d| memlimit::document_size(d) == size));
+            let spec = window(
+                bson!({"$first": "$n", "window": {"documents": [0, 0]}}),
+                true,
+            );
+            let (_, report) = memlimit::captured(|| {
+                set_window_fields_each(&spec, docs, &Document::new(), None, None, None, &mut |_| {
+                    Ok(())
+                })
+            });
+            (report.windows[0].max_total_memory, size)
+        };
+        let (two, size) = total(2);
+        assert_eq!(two, (3 * size + 2 * memlimit::VALUE) as i64);
+        let (one, size) = total(1);
+        assert_eq!(one, (2 * size + 2 * memlimit::VALUE) as i64);
+    }
+
+    /// A `$setWindowFields` passes the sort key each document came with
+    /// on to the stages after, in its own output order, and holds it off
+    /// the document while it runs, so `$$ROOT` does not show it (mongod
+    /// 8.2.11, 2026-11-13, RM-520).
+    #[test]
+    fn a_window_carries_the_sort_key_it_was_given() {
+        let docs: Vec<Document> = [3, 1, 2]
+            .iter()
+            .enumerate()
+            .map(|(i, n)| doc! {"_id": i as i32, "n": *n, SORT_KEY_FIELD: [i as i32 * 10]})
+            .collect();
+        let spec = Bson::Document(doc! {
+            "sortBy": {"n": 1},
+            "output": {"all": {"$push": "$$ROOT"}},
+        });
+        let mut out = Vec::new();
+        set_window_fields_each(&spec, docs, &Document::new(), None, None, None, &mut |d| {
+            out.push(d);
+            Ok(())
+        })
+        .unwrap();
+        let keys: Vec<(i32, &Bson)> = out
+            .iter()
+            .map(|d| (d.get_i32("_id").unwrap(), d.get(SORT_KEY_FIELD).unwrap()))
+            .collect();
+        assert_eq!(
+            keys,
+            [(1, &bson!([10])), (2, &bson!([20])), (0, &bson!([0]))]
+        );
+        let roots = out[0].get_array("all").unwrap();
+        assert!(roots
+            .iter()
+            .all(|r| !r.as_document().unwrap().contains_key(SORT_KEY_FIELD)));
+    }
+
     /// What `explain` lists for the stage: each function's most and the
     /// stage's, with the moment the cache passes its budget before it
     /// spills (mongod 8.2.1, 2026-11-08, RM-328).
@@ -3200,6 +3482,62 @@ mod budget_tests {
         assert_eq!(least(window(sum, false)).0, 926 + layout.removable);
         let push = bson!({"$push": "$s", "window": {"documents": [-5, 5]}});
         assert_eq!(least(window(push, false)).0, 12725 + layout.removable_push);
+    }
+
+    /// RM-509 (macOS mongod 8.2.11, `maxFunctionMemoryUsageBytes`): a
+    /// removable `$integral` holds its size and each point in its window
+    /// twice (its own deque and the executor's queue), one more while its
+    /// window slides; a covariance only the queue's. With no lower end the
+    /// accumulator holds every point `$integral` was given, the covariance
+    /// its size alone, and either nothing while its window is still empty.
+    #[test]
+    fn integral_and_covariance_count_what_they_hold() {
+        let layout = crate::memlimit::LAYOUT;
+        let held = |output: Bson, n: i32| {
+            let docs: Vec<Document> = (0..n).map(|i| doc! {"_id": i, "n": i * 2}).collect();
+            let (_, report) = memlimit::captured(|| {
+                set_window_fields_each(
+                    &window(output, false),
+                    docs,
+                    &Document::new(),
+                    None,
+                    None,
+                    None,
+                    &mut |_| Ok(()),
+                )
+            });
+            report.windows[0].max_function_memory[0].1 as usize
+        };
+        // `[sortBy value, input]` and `[x, y]` of ints: 88 bytes each.
+        let point = memlimit::classic_size(&bson!([0, 0]));
+        assert_eq!(point, 88);
+        let integral = |w: Bson| bson!({"$integral": {"input": "$n"}, "window": w});
+        let covariance = |w: Bson| bson!({"$covariancePop": ["$n", "$n"], "window": w});
+        let removing = bson!({"documents": [-3, 3]});
+        assert_eq!(
+            held(integral(removing.clone()), 40),
+            layout.removable_integral + 8 * 2 * point
+        );
+        assert_eq!(
+            held(covariance(removing), 40),
+            REMOVABLE_COVARIANCE + 8 * point
+        );
+        // A window that is always empty still holds the function.
+        let ahead = bson!({"documents": [1, 3]});
+        assert_eq!(held(integral(ahead), 1), layout.removable_integral);
+        let growing = bson!({"range": ["unbounded", 4]});
+        assert_eq!(
+            held(integral(growing.clone()), 40),
+            layout.integral + 40 * point
+        );
+        assert_eq!(held(covariance(growing), 40), COVARIANCE);
+        let behind = bson!({"documents": ["unbounded", -1]});
+        assert_eq!(
+            held(integral(behind.clone()), 40),
+            layout.integral + 39 * point
+        );
+        assert_eq!(held(integral(behind.clone()), 1), 0);
+        assert_eq!(held(covariance(behind), 1), 0);
     }
 
     /// 8.2.1 and 8.2.12, 2026-11-08 (RM-405).

@@ -1556,51 +1556,81 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       9). Found 2026-11-13 (RM-506).
       Verify: tests/backlog/test_rm_found_2026_11_13_rm506.py::test_a_missing_field_counts_its_slot
       Backlog-ID: RM-616
-- [ ] **`$integral` and the covariances count no memory in a window.**
-      mongod 8.2.1 counts what they hold: `maxFunctionMemoryUsageBytes`
-      3888 for a `["unbounded", 4]` `range` `$integral` over 40 documents,
-      568 for a `["unbounded", -1]` `$covariancePop`. This server counts
-      nothing for either (`FunctionMemory::Nothing`), so `explain` shows 0
-      and the stage runs under budgets mongod refuses (500 against 4300,
-      375 against 818). Found 2026-11-10 (RM-404).
-      Verify: tests/backlog/test_rm_found_2026_11_10_rm404.py::test_integral_and_covariance_count_their_memory
-      Backlog-ID: RM-509
-- [ ] **A partitioned window's `maxTotalMemoryUsageBytes` is 16 bytes off.**
-      With `partitionBy` over three partitions of 40 small documents,
-      macOS mongod 8.2.1 reports 748 for a `range [-4, 4]` `$sum` (here
-      764), 2180 for a whole-partition `$sum` (2196), 480 for a running
-      `$sum` (464) and 432 for `$expMovingAvg` (416). Both directions, one
-      partition key's size; the least budgets agree, so the moment the
-      tracker sees differs, not what the budget counts. Cause not yet
-      traced. Found 2026-11-10 (RM-404).
-      Verify: tests/backlog/test_rm_found_2026_11_10_rm404.py::test_a_partitioned_windows_total_memory
-      Backlog-ID: RM-510
-- [ ] **The sort key is lost at a `$replaceRoot`, a `$lookup` or a
-      `$setWindowFields`.** mongod 8.2.11 keeps a document's sort key
-      through a `$replaceRoot`, a `$lookup` and a `$setWindowFields` with no
-      `sortBy`, and a `$setWindowFields` that sorts leaves its own (the
-      partition key, then `sortBy`). This server ends the key at each
-      (`agg_meta::KEEPS_SORT_METADATA`), so a `$_internalSetWindowFields`
-      after one ranks every document 1 and `{$meta: "sortKey"}` reads `[]`.
-      Found 2026-11-10 (RM-410).
-      Verify: tests/backlog/test_rm_found_2026_11_10_rm410.py::test_the_sort_key_passes_through_stages_that_keep_it
-      Backlog-ID: RM-520
-- [ ] **A `$lookup` sub-pipeline's `$sort` sets no sort key.** In a
-      `$lookup` pipeline, mongod 8.2.11 ranks a `$_internalSetWindowFields`
-      by the key the sub-pipeline's `$sort` set; this server does not run
-      `agg_meta::rewrite_sort_metadata` over a sub-pipeline, so every
-      document ties. Found 2026-11-10 (RM-410).
-      Verify: tests/backlog/test_rm_found_2026_11_10_rm410.py::test_a_lookup_sub_pipeline_sort_sets_the_key
-      Backlog-ID: RM-521
-- [ ] **A rank with no sort key at all is answered, not refused.** After a
-      `$group` or a `$unionWith` a document carries no sort key
-      (`{$meta: "sortKey"}` is missing there, not `[]`), and mongod 8.2.11
-      refuses a `$_internalSetWindowFields` `$rank` with 9973200 "Attempt to
-      get sort key which has not been populated"; this server ties the
-      documents. A document read from the collection with no `$sort` has the
-      empty key, which ties, on both. Found 2026-11-10 (RM-410).
-      Verify: tests/backlog/test_rm_found_2026_11_10_rm410.py::test_a_rank_with_no_sort_key_is_refused
-      Backlog-ID: RM-522
+- [ ] **`explain` with `executionStats` answers where a `$setWindowFields`
+      fails.** mongod 8.2.11 runs the pipeline for `executionStats` and
+      returns the executor's error: a `$sum` of `{$divide: [1, "$z"]}` over
+      a `z` of 0 (code 2), an `$integral` of a null input (5423900), a
+      `$derivative` of one (5624903). This server returns an `explain`
+      document for each, `maxFunctionMemoryUsageBytes` and all, while its
+      `aggregate` of the same pipeline refuses. Found 2026-11-13 (RM-509).
+      Verify: tests/backlog/test_rm_found_2026_11_13_rm509.py::test_explain_reports_a_window_functions_error
+      Backlog-ID: RM-617
+- [ ] **`$derivative`'s partition cache holds too little.** mongod 8.2.11's
+      `maxTotalMemoryUsageBytes` for a `$derivative` over ten documents of
+      125 bytes is 1250 for any window with no lower end (the whole
+      partition), 1000 for `[-3, 3]` and `[-5, 0]`, 500 for `[-1, 1]`, 375
+      for `[0, 0]`; this server's `reach` keeps two to four documents (250,
+      500). The function itself holds nothing on either. Found 2026-11-13
+      (RM-509).
+      Verify: tests/backlog/test_rm_found_2026_11_13_rm509.py::test_a_derivatives_cache_holds_what_mongods_does
+      Backlog-ID: RM-618
+- [ ] **A window with no lower end counts its function before it holds a
+      value.** mongod 8.2.11 reports `maxFunctionMemoryUsageBytes` 0 for a
+      `$sum`, `$push` or `$avg` over `["unbounded", -2]` in a partition of
+      two documents (one: `["unbounded", -1]` too), whose window never
+      holds a document; this server counts the accumulator's size (184,
+      136, 152), and for `$push` the first document's value, which its
+      `FunctionMemory::Growing` reads although the window is empty.
+      `$integral` and the covariances already count 0 there (RM-509).
+      Found 2026-11-13 (RM-509).
+      Verify: tests/backlog/test_rm_found_2026_11_13_rm509.py::test_an_empty_window_counts_no_function
+      Backlog-ID: RM-619
+- [ ] **A `$unionWith` sub-pipeline's `$sort` sets no sort key.** In a
+      `$unionWith` pipeline, mongod 8.2.11 ranks a
+      `$_internalSetWindowFields` by the key the sub-pipeline's `$sort` set
+      and gives it as `{$meta: "sortKey"}`; this server ties every document
+      and refuses the `$meta` (code 2). The same gap RM-521 closed for
+      `$lookup` (`apply_union_with` does not run
+      `agg_meta::rewrite_sort_metadata`). Found 2026-11-13 (RM-521).
+      Verify: tests/backlog/test_rm_found_2026_11_13_rm521.py::test_a_union_with_sub_pipeline_sort_sets_the_key
+      Backlog-ID: RM-624
+- [ ] **`{$meta: "sortKey"}` in a `$facet` is refused, not `[]`.** mongod
+      8.2.11 gives `[]` in a `$facet` pipeline, behind the facet's own
+      `$sort` too (its ranks tie there, which this server matches); this
+      server refuses the `$meta` with code 2. Found 2026-11-13 (RM-521).
+      Verify: tests/backlog/test_rm_found_2026_11_13_rm521.py::test_a_facet_sort_key_is_empty
+      Backlog-ID: RM-625
+- [ ] **A rank behind `$documents` and a `$sort` is answered, not
+      refused.** mongod 8.2.11 refuses a `$_internalSetWindowFields`
+      `$rank` there with 9973200 "Attempt to get sort key which has not been
+      populated", collectionless and in a `$lookup` pipeline alike; this
+      server ties the first and ranks the second by the `$sort`. Cause in
+      mongod not traced (RM-522 and RM-523 are the nearest shapes). Found
+      2026-11-13 (RM-521).
+      Verify: tests/backlog/test_rm_found_2026_11_13_rm521.py::test_a_sort_behind_documents_sets_no_key
+      Backlog-ID: RM-626
+- [ ] **A `$unionWith` ends the sort key.** mongod 8.2.11 keeps the outer
+      documents' key through a `$unionWith`, so a rank behind it ranks them
+      by the `$sort` in front, and the documents it adds carry their
+      sub-pipeline's key (the empty one with no `$sort`) to a later
+      `{$meta: "sortKey"}` -- but not to a rank, which refuses them (RM-522).
+      This server ends the key at the `$unionWith` (it is not in
+      `agg_meta::KEEPS_SORT_METADATA`): every `$meta` reads `[]` and every
+      rank ties. Found 2026-11-13 (RM-522).
+      Verify: tests/backlog/test_rm_found_2026_11_13_rm522.py::test_a_union_passes_the_sort_key_on
+      Backlog-ID: RM-630
+- [ ] **A `$densify` sets no sort key.** mongod 8.2.11 leaves each
+      document the key of the field `$densify` sorted by: `{$meta:
+      "sortKey"}` reads `[n]` and a rank behind it ranks by it. This server
+      gives `[]` and ties every document. Found 2026-11-13 (RM-522).
+      Verify: tests/backlog/test_rm_found_2026_11_13_rm522.py::test_a_densify_sets_the_sort_key
+      Backlog-ID: RM-631
+- [ ] **The sort key is lost at a `$graphLookup` or a `$fill`.** mongod
+      8.2.11 keeps it through both, as it does through the stages RM-520
+      names; this server ends it at each, so a rank behind ties every
+      document. Found 2026-11-13 (RM-522).
+      Verify: tests/backlog/test_rm_found_2026_11_13_rm522.py::test_a_graph_lookup_and_a_fill_keep_the_sort_key
+      Backlog-ID: RM-632
 - [ ] **A `$sort` behind another stage sets the sort key where mongod's
       keeps the earlier one.** Behind a leading `$sort` and an `$addFields`,
       mongod 8.2.11's key after a second `$sort` is still the first's; a
@@ -1615,8 +1645,9 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       mongod 8.2.11 drops the earlier `$sort` of `$sort: {k: 1}, $sort: {n:
       1}`, also across an `$unwind`, so documents tied on `n` come in the
       collection's order; this server runs both, and the ties keep the
-      first sort's order. A different document order. Found 2026-11-10
-      (RM-410).
+      first sort's order. A different document order. The `$sort` a
+      sorting `$setWindowFields` runs behind drops an earlier `$sort` too
+      (measured 2026-11-13, RM-520). Found 2026-11-10 (RM-410).
       Verify: tests/backlog/test_rm_found_2026_11_10_rm410.py::test_a_sort_before_another_sort_is_dropped
       Backlog-ID: RM-524
 - [ ] **`{$meta: "sortKey"}` gives an empty array's key as null.**
@@ -1628,6 +1659,36 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       two apart (RM-410). Found 2026-11-10.
       Verify: tests/backlog/test_rm_found_2026_11_10_rm410.py::test_an_empty_arrays_sort_key_is_undefined
       Backlog-ID: RM-525
+- [ ] **`$$ROOT` shows a document's hidden sort key.** Behind a `$sort`
+      whose key a later stage reads, `{$addFields: {r: "$$ROOT"}}` and a
+      `$lookup` `let: {r: "$$ROOT"}` give the document with a
+      `__secantus_meta_sortKey` field, which mongod 8.2.11 keeps as
+      metadata and never shows. The key is a field of the document here
+      (`agg_meta`); the `$geoNear` fields are alike. Found 2026-11-13
+      (RM-520).
+      Verify: tests/backlog/test_rm_found_2026_11_13_rm520.py::test_root_does_not_show_the_sort_key
+      Backlog-ID: RM-620
+- [ ] **A `{$meta: "sortKey"}` in a window's output reads no key.** Behind
+      a `$sort`, mongod 8.2.11 gives each document's key to a `$push: {$meta:
+      "sortKey"}` in a `$setWindowFields` or `$_internalSetWindowFields`;
+      this server refuses it in `$setWindowFields` (code 2) and gives null in
+      `$_internalSetWindowFields`, which hold the key off the documents while
+      they run. Found 2026-11-13 (RM-520).
+      Verify: tests/backlog/test_rm_found_2026_11_13_rm520.py::test_a_windows_output_reads_the_sort_key
+      Backlog-ID: RM-621
+- [ ] **A missing `newRoot` is named null, not MISSING.** mongod 8.2.11's
+      40228 for `$replaceRoot: {newRoot: "$nope"}` (and `$replaceWith`) reads
+      "resulting value was: MISSING. Type of resulting value: 'missing'";
+      this server's reads "null" and 'null'. Found 2026-11-13 (RM-520).
+      Verify: tests/backlog/test_rm_found_2026_11_13_rm520.py::test_a_missing_new_root_is_missing
+      Backlog-ID: RM-622
+- [ ] **A `newRoot` error names a pruned document when a later stage
+      reads the sort key.** In `$sort, $replaceRoot: {newRoot: "$n"}, $addFields:
+      {m: {$meta: "sortKey"}}`, mongod 8.2.11's 40228 names the whole input
+      document; this server names only the fields the `newRoot` reads, as
+      both do with no reader of the key after. Found 2026-11-13 (RM-520).
+      Verify: tests/backlog/test_rm_found_2026_11_13_rm520.py::test_a_new_root_error_behind_a_sort_names_the_document
+      Backlog-ID: RM-623
 - [ ] **A sub-document a stage reads or writes into is sized as if it
       were read.** mongod 8.2.11 gives a sub-document a cache of its own
       when a stage reads a field inside it (`$addFields: {q: "$e.y"}`) or
