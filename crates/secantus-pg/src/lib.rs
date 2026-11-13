@@ -34789,13 +34789,22 @@ impl PgHandler {
         if let Statement::DeclareCursor {
             name,
             query,
-            statement,
             scrollable,
             join_scroll,
             holdable,
             binary: is_binary_cursor,
         } = stmt
         {
+            // `pg_cursors.statement` is the portal's source text: the whole
+            // query string the DECLARE arrived in, verbatim, as
+            // PerformCursorOpen copies `p_sourcetext` (15.19).
+            let statement = self
+                .statement_source
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .as_ref()
+                .map(|(source, _)| source.clone())
+                .unwrap_or_default();
             // Over a join, the join method PostgreSQL picks decides it --
             // read in the open transaction, which may have made its tables.
             let scrollable = join_scroll

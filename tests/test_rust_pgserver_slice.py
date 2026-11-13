@@ -2740,6 +2740,32 @@ def test_pg_cursors_lists_open_cursors(home: Path) -> None:
         assert conn.execute("select * from pg_cursors where name = 'mycur'").fetchone() is None
 
 
+def test_pg_cursors_statement_is_the_source_text(home: Path) -> None:
+    """`pg_cursors.statement` is the query string the DECLARE arrived in,
+    verbatim (RP-900): the whole of a several-command Query, the Parse text
+    with its `$1`, psycopg's own DECLARE for a server cursor. Measured on
+    PostgreSQL 15.19; this server reported a deparse of the inner query."""
+    with _Server(home) as server, server.connect() as conn:
+        conn.autocommit = True
+        # Named, as the extended protocol's unnamed portal is listed too (RP-936).
+        statement = "select statement from pg_cursors where name in ('c', 'd', 'foo', 'h')"
+        several = "begin; declare  c   cursor for select 1 -- x\n; select 2"
+        psycopg.ClientCursor(conn).execute(several)
+        assert conn.execute(statement).fetchall() == [(several,)]
+        conn.execute("rollback")
+        with conn.transaction():
+            conn.execute("declare d cursor for select %s::int  +  1", (5,))
+            assert conn.execute(statement).fetchall() == [
+                ("declare d cursor for select $1::int  +  1",)
+            ]
+        with conn.transaction(), conn.cursor(name="foo") as cur:
+            cur.execute("select  1")
+            assert conn.execute(statement).fetchall() == [('DECLARE "foo" CURSOR FOR select  1',)]
+        conn.execute("declare h cursor with hold for select 3")
+        assert conn.execute(statement).fetchall() == [("declare h cursor with hold for select 3",)]
+        conn.execute("close h")
+
+
 def test_constant_select_list_column(home: Path) -> None:
     """`SELECT 1 FROM <source>` — a literal column, one per row.
 

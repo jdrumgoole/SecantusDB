@@ -201,11 +201,11 @@ def test_a_duplicate_cursor_name_aborts_the_block(dsn: str) -> None:
     ]
 
 
-@pytest.mark.backlog("RP-900")
+@pytest.mark.backlog_fixed("RP-900")
 def test_pg_cursors_statement_is_the_declare_text(dsn: str) -> None:
     """PostgreSQL 15.19's `pg_cursors.statement` is the query string the
-    DECLARE was submitted as, verbatim. Here it is a deparse of the inner
-    query."""
+    DECLARE was submitted as, verbatim. This server reported a deparse of
+    the inner query."""
     assert _steps(
         dsn,
         [

@@ -3641,11 +3641,6 @@ at the DECLARE, and the cursor answers that differ either way.
       runs on.
       Verify: tests/backlog/test_rp_found_rp744.py::test_a_duplicate_cursor_name_aborts_the_block
       Backlog-ID: RP-899
-- [ ] **`pg_cursors.statement` is a deparse of the query.** PostgreSQL
-      15.19 reports the DECLARE as submitted, verbatim (`declare  c   cursor
-      for select 1 -- x`); here it is `SELECT 1`.
-      Verify: tests/backlog/test_rp_found_rp744.py::test_pg_cursors_statement_is_the_declare_text
-      Backlog-ID: RP-900
 - [ ] **A PL/pgSQL FETCH from a `refcursor` parameter is refused at CREATE
       FUNCTION.** `create function f(c refcursor) returns int language
       plpgsql as $$ declare r int; begin fetch c into r; return r; end $$`
@@ -3655,6 +3650,22 @@ at the DECLARE, and the cursor answers that differ either way.
       creates it, and the call reads the caller's cursor.
       Verify: tests/backlog/test_rp_found_rp744.py::test_a_refcursor_parameter_can_be_fetched
       Backlog-ID: RP-901
+
+## Found while working RP-900 (2026-11-13)
+
+Measured on PostgreSQL 15.19 (the shared reference on port 5415). The gap
+test is in `tests/backlog/test_rp_found_rp900.py`.
+
+- [ ] **The extended protocol's unnamed portal is listed in `pg_cursors`.**
+      In a block, a parameterised statement (`select $1::int`, as psycopg
+      sends `select %s::int`) leaves a `pg_cursors` row named
+      `POSTGRESQL_DEFAULT_NAME`, pgwire's placeholder for the unnamed
+      portal, until the block ends; PostgreSQL 15.19 creates that portal
+      invisible (`exec_bind_message`) and lists none.
+      `wire_portals::note_wire_portal` skips only an empty name, and the
+      Bind hands it `DEFAULT_NAME`.
+      Verify: tests/backlog/test_rp_found_rp900.py::test_the_unnamed_portal_is_not_in_pg_cursors
+      Backlog-ID: RP-936
 
 ## Found while working RP-698 (2026-11-10)
 
