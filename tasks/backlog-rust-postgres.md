@@ -1102,19 +1102,19 @@ one beside it.
       constraint definitions and `pg_attribute` fill instead of a catalog
       fetch per table, and a composite found by name through a map rather
       than a scan of every row type per described column (2026-11-13, from
-      0.027 s at 800). What is left, profiled at 800 tables (debug build,
-      per statement): decoding the version's composite documents (about
-      1.7 ms, paid by `relation_oids`), copying the unchanged table
-      definitions into the version's list (about 1 ms in
-      `committed_table_defs`), and each listing deriving every relation's
-      entry again (the tableoid expressions, the comments, the relations,
-      the constraint and index definitions, the composites and their
-      fields, `pg_type`'s row types, each 0.2 to 1 ms). Reusing an
-      unchanged document by its bytes saves nothing while the version's
-      list holds values: cloning a `Document` or a `TableDef` costs as much
-      as decoding it, so the entries have to be shared (`Arc`) across
-      versions, which changes the type `shared_table_defs` and
-      `type_catalog_docs` hand to some 200 callers. The faithful end state
+      0.027 s at 800); the type catalog's documents and the table
+      definitions shared (`Arc`) across versions, an unchanged one reused
+      by its stored bytes and its sorted place carried forward, and the
+      composite listings built once per version (2026-11-13, from 0.021 s
+      to 0.018 s at 800, 0.010 s with none). What is left, profiled at 800
+      tables (debug build, per catalog version): each listing deriving
+      every relation's entry again into owned values -- the oid map
+      (`relation_oids`), the row types' fields (`composite_fields`, under
+      `composites` and `composites_with_schema`), the index definitions
+      (`index_defs` over `derive_index_relations`), the tableoid texts, the
+      comments, the constraint definitions, `pg_type`'s and
+      `pg_attribute`'s rows, each 0.2 to 0.8 ms -- and the planner's
+      `set_*` tables rebuilt from those lists. The faithful end state
       keys the published state per relation and invalidates what a
       statement changed; a user relation's entries depend on more than its
       own catalog row (its grants, its inheritance parents and children,

@@ -63,7 +63,11 @@ fn rule_of(d: &Document) -> (Rule, bool, i64) {
 impl PgHandler {
     pub(crate) fn rule_docs(&self) -> Vec<Document> {
         self.type_catalog_docs(RULE_COLLECTION)
-            .map(|d| d.to_vec())
+            .map(|d| {
+                d.iter()
+                    .map(|d| Document::clone(d))
+                    .collect::<Vec<Document>>()
+            })
             .unwrap_or_default()
     }
 
@@ -461,7 +465,11 @@ impl PgHandler {
         let rule_docs = self.rule_docs();
         let view_docs = self
             .type_catalog_docs(Self::VIEW_COLLECTION)
-            .map(|d| d.to_vec())
+            .map(|d| {
+                d.iter()
+                    .map(|d| Document::clone(d))
+                    .collect::<Vec<Document>>()
+            })
             .unwrap_or_default();
         let user: Vec<Document> =
             rule_docs

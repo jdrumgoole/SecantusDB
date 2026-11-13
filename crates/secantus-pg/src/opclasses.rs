@@ -217,13 +217,21 @@ fn invalid(m: impl Into<String>) -> PgWireError {
 impl PgHandler {
     fn opfamily_docs(&self) -> Vec<Document> {
         self.type_catalog_docs(OPFAMILY_COLLECTION)
-            .map(|d| d.to_vec())
+            .map(|d| {
+                d.iter()
+                    .map(|d| Document::clone(d))
+                    .collect::<Vec<Document>>()
+            })
             .unwrap_or_default()
     }
 
     fn opclass_docs(&self) -> Vec<Document> {
         self.type_catalog_docs(OPCLASS_COLLECTION)
-            .map(|d| d.to_vec())
+            .map(|d| {
+                d.iter()
+                    .map(|d| Document::clone(d))
+                    .collect::<Vec<Document>>()
+            })
             .unwrap_or_default()
     }
 
@@ -234,7 +242,7 @@ impl PgHandler {
         } else {
             AMOP_COLLECTION
         })
-        .map(|d| d.iter().map(Member::of).collect())
+        .map(|d| d.iter().map(|m| Member::of(m)).collect())
         .unwrap_or_default()
     }
 

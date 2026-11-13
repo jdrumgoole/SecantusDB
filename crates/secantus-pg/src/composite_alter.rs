@@ -37,7 +37,7 @@ impl PgHandler {
             .type_catalog_docs(Self::COMPOSITE_COLLECTION)?
             .iter()
             .find(|d| d.get_str("_id") == Ok(name) && !d.get_bool("relation").unwrap_or(false))
-            .cloned()
+            .map(|d| Document::clone(d))
         else {
             // A table's row type is not altered here (PostgreSQL's
             // ATSimplePermissions); anything else is not a relation.

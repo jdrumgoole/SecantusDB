@@ -159,7 +159,11 @@ impl Dropped {
 impl PgHandler {
     fn event_trigger_docs(&self) -> Vec<Document> {
         self.type_catalog_docs(EVENT_TRIGGER_COLLECTION)
-            .map(|d| d.to_vec())
+            .map(|d| {
+                d.iter()
+                    .map(|d| Document::clone(d))
+                    .collect::<Vec<Document>>()
+            })
             .unwrap_or_default()
     }
 

@@ -392,7 +392,7 @@ impl PgHandler {
         let fields: Option<Vec<String>> = self
             .composites()
             .ok()
-            .and_then(|cs| cs.into_iter().find(|(_, o, _)| *o == oid))
+            .and_then(|cs| cs.iter().find(|(_, o, _)| *o == oid).cloned())
             .map(|(_, _, fields)| fields.into_iter().map(|(_, t)| t).collect())
             .or_else(|| {
                 self.lookup(tag)

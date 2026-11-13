@@ -21,7 +21,11 @@ const CONVERSION_ARGS: &str = "integer, integer, cstring, internal, integer, boo
 impl PgHandler {
     fn conversion_docs(&self) -> Vec<Document> {
         self.type_catalog_docs(CONVERSION_COLLECTION)
-            .map(|d| d.to_vec())
+            .map(|d| {
+                d.iter()
+                    .map(|d| Document::clone(d))
+                    .collect::<Vec<Document>>()
+            })
             .unwrap_or_default()
     }
 

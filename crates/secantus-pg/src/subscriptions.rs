@@ -513,7 +513,11 @@ impl PgHandler {
             return Vec::new();
         }
         self.type_catalog_docs(SUBSCRIPTION_COLLECTION)
-            .map(|d| d.to_vec())
+            .map(|d| {
+                d.iter()
+                    .map(|d| Document::clone(d))
+                    .collect::<Vec<Document>>()
+            })
             .unwrap_or_default()
     }
 
