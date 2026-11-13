@@ -310,7 +310,8 @@ fn build(
     };
     // `{$meta: "sortKey"}` and a `$_internalSetWindowFields`'s ranks: from
     // the `$sort` the plan reads in order, worked out for each document as a
-    // `$sort` stage leaves it (`agg_meta`).
+    // `$sort` stage leaves it; a `$sort` among the stages after it sets none
+    // (`agg_meta`, RM-523).
     if stages.iter().any(crate::agg_meta::reads_sort_key)
         || crate::agg_meta::ranks_with_no_sort_key(&stages)
     {
@@ -318,12 +319,12 @@ fn build(
             Some(sort) => {
                 let mut with = vec![Bson::Document(doc! { "$sort": sort.clone() })];
                 with.append(&mut stages);
-                crate::agg_meta::rewrite_sort_metadata(&mut with);
+                crate::agg_meta::rewrite_sort_metadata(&mut with, || Some(sort.clone()));
                 // The plan sorted: what follows the `$sort` stays.
                 with.remove(0);
                 stages = with;
             }
-            None => crate::agg_meta::rewrite_sort_metadata(&mut stages),
+            None => crate::agg_meta::rewrite_sort_metadata(&mut stages, || None),
         }
     }
     let opts = crate::explain::stream::Options {

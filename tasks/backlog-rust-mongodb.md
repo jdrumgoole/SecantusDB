@@ -1604,9 +1604,11 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       refused.** mongod 8.2.11 refuses a `$_internalSetWindowFields`
       `$rank` there with 9973200 "Attempt to get sort key which has not been
       populated", collectionless and in a `$lookup` pipeline alike; this
-      server ties the first and ranks the second by the `$sort`. Cause in
-      mongod not traced (RM-522 and RM-523 are the nearest shapes). Found
-      2026-11-13 (RM-521).
+      server ties both. A `$sort` the pipeline runs itself writes no key
+      (only the query layer's does, RM-523), and with no read of a
+      collection in front the documents have no key at all; the marking of
+      keyless documents RM-522 added (`agg_meta::DROPS_SORT_KEY`) does not
+      cover `$documents`. Found 2026-11-13 (RM-521).
       Verify: tests/backlog/test_rm_found_2026_11_13_rm521.py::test_a_sort_behind_documents_sets_no_key
       Backlog-ID: RM-626
 - [ ] **A `$unionWith` ends the sort key.** mongod 8.2.11 keeps the outer
@@ -1631,16 +1633,6 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       document. Found 2026-11-13 (RM-522).
       Verify: tests/backlog/test_rm_found_2026_11_13_rm522.py::test_a_graph_lookup_and_a_fill_keep_the_sort_key
       Backlog-ID: RM-632
-- [ ] **A `$sort` behind another stage sets the sort key where mongod's
-      keeps the earlier one.** Behind a leading `$sort` and an `$addFields`,
-      mongod 8.2.11's key after a second `$sort` is still the first's; a
-      `$sort` behind a leading `$addFields` or `$project` leaves the empty
-      key. `{$meta: "sortKey"}` and a `$_internalSetWindowFields`'s ranks
-      show it alike; this server takes the last `$sort`'s key. (Behind an
-      `$unwind` mongod does take the later `$sort`'s.) Cause in mongod not
-      traced: measured, not derived. Found 2026-11-10 (RM-410).
-      Verify: tests/backlog/test_rm_found_2026_11_10_rm410.py::test_which_sort_sets_the_key
-      Backlog-ID: RM-523
 - [ ] **A `$sort` that a later `$sort` overrides still orders the ties.**
       mongod 8.2.11 drops the earlier `$sort` of `$sort: {k: 1}, $sort: {n:
       1}`, also across an `$unwind`, so documents tied on `n` come in the

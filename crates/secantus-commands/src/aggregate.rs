@@ -1076,8 +1076,11 @@ pub fn aggregate(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
                 let mut remaining = remaining;
                 let metas = crate::agg_meta::rewrite(&read_pipeline, &mut remaining);
                 // `{$meta: "sortKey"}` and the `$geoNear` metadata, from the
-                // stage that sets them.
-                crate::agg_meta::rewrite_sort_metadata(&mut remaining);
+                // stage that sets them: the sort key from the `$sort` mongod's
+                // query layer runs (RM-523).
+                crate::agg_meta::rewrite_sort_metadata(&mut remaining, || {
+                    crate::explain::pipeline_canonical(c, &read_pipeline).sort
+                });
                 let record_ids = if metas.record_id {
                     let refs: Vec<&[u8]> = reduced.iter().map(Vec::as_slice).collect();
                     storage
@@ -3206,11 +3209,15 @@ fn apply_lookup(
     let written_pipeline = spec.get("pipeline").and_then(Bson::as_array);
     // A `$sort` in the sub-pipeline sets the sort key its own
     // `{$meta: "sortKey"}` and `$_internalSetWindowFields` ranks read, as the
-    // top-level pipeline's does (mongod 8.2.11, RM-521): rewritten once, run
+    // top-level pipeline's does (mongod 8.2.11, RM-521): the one the read of
+    // `from` takes, a view's stages in front (RM-523). Rewritten once, run
     // for every outer document.
     let rewritten = written_pipeline.map(|sub| {
         let mut stages = sub.clone();
-        crate::agg_meta::rewrite_sort_metadata(&mut stages);
+        crate::agg_meta::rewrite_sort_metadata(&mut stages, || {
+            let (base, whole) = resolve_view(storage, db, from?, sub.clone()).ok()?;
+            crate::explain::pipeline_canonical(&base, &whole).sort
+        });
         stages
     });
     let sub_pipeline = rewritten.as_ref();

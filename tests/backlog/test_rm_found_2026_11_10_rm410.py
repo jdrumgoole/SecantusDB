@@ -199,13 +199,14 @@ def test_a_rank_with_no_sort_key_is_refused(rust_mongo: Any, mongod: Any) -> Non
     assert {k: v[:2] for k, v in ours.items()} == {k: v[:2] for k, v in theirs.items()}
 
 
-@pytest.mark.backlog("RM-523")
+@pytest.mark.backlog_fixed("RM-523")
 def test_which_sort_sets_the_key(rust_mongo: Any, mongod: Any) -> None:
-    """mongod 8.2.11 does not take a `$sort` that runs behind another stage
-    as the documents' key: behind a leading `$sort` and an `$addFields` the
-    key stays the first sort's, and a `$sort` behind a leading `$addFields`
-    or `$project` leaves the empty key -- for `{$meta: "sortKey"}` and the
-    ranks alike. This server takes the last `$sort`'s."""
+    """mongod 8.2.11 takes only the `$sort` its query layer runs as the
+    documents' key: behind a leading `$sort` and an `$addFields` the key
+    stays the first sort's, and a `$sort` behind a leading `$addFields` or
+    `$project` leaves the empty key -- for `{$meta: "sortKey"}` and the
+    ranks alike. A `$sort` the pipeline runs sorts and sets no key. This
+    server took the last `$sort`'s."""
     meta = {"$addFields": {"m": {"$meta": "sortKey"}}}
     pipelines = {
         "$sort, $addFields, $sort": [
@@ -219,6 +220,64 @@ def test_which_sort_sets_the_key(rust_mongo: Any, mongod: Any) -> None:
         "$project, $sort": [{"$project": {"n": 1, "k": 1}}, {"$sort": {"k": 1}}, meta, RANK],
     }
     assert _answers(rust_mongo, pipelines) == _answers(mongod, pipelines)
+
+
+@pytest.mark.backlog_fixed("RM-523")
+def test_a_sort_the_pipeline_runs_keeps_the_key_it_was_handed(rust_mongo: Any, mongod: Any) -> None:
+    """mongod 8.2.11 (measured 2026-11-13): a `$sort` behind an `$unwind`
+    that leaves its fields alone moves ahead of it into the query layer and
+    sets the key, one on the unwound path or behind an `$addFields` does
+    not; a `$sort` behind a `$geoNear` keeps the distance as the key; a
+    `$lookup` pipeline's `$sort` follows the same rule, a view's stages in
+    front of it; a `$setWindowFields` behind another stage still sets its
+    own."""
+    meta = {"$addFields": {"m": {"$meta": "sortKey"}}}
+    unwind = {"$unwind": "$a"}
+    window = {"$setWindowFields": {"sortBy": {"n": 1}, "output": {"x": {"$sum": 1}}}}
+
+    def sub(pipeline: list) -> list:
+        return [
+            {"$limit": 1},
+            {"$lookup": {"from": "c", "pipeline": [*pipeline, meta], "as": "j"}},
+            {"$project": {"j.m": 1}},
+        ]
+
+    pipelines = {
+        "$unwind, $sort": [unwind, {"$sort": {"n": 1}}, meta, RANK],
+        "$sort, $unwind, $sort": [{"$sort": {"k": 1}}, unwind, {"$sort": {"n": 1}}, meta],
+        "$unwind, $sort on the path": [unwind, {"$sort": {"a": 1}}, meta],
+        "$addFields, $unwind, $sort": [{"$addFields": {"q": 1}}, unwind, {"$sort": {"n": 1}}, meta],
+        "$addFields, $setWindowFields": [{"$addFields": {"q": 1}}, window, meta],
+        "$lookup: $addFields, $sort": sub([{"$addFields": {"q": 1}}, {"$sort": {"n": 1}}]),
+        "$lookup: $sort, $addFields, $sort": sub(
+            [{"$sort": {"k": 1}}, {"$addFields": {"q": 1}}, {"$sort": {"n": 1}}]
+        ),
+    }
+
+    def answers(client: Any) -> dict:
+        out = _answers(client, pipelines)
+        # Ties come in an order RM-524 owns: compare each answer's keys by
+        # document.
+        out = {
+            name: ("ok", sorted(repr(d) for d in a[1])) if a[0] == "ok" else a
+            for name, a in out.items()
+        }
+        db = client.rmfound1110sk
+        db.g.insert_many([{"_id": i, "loc": [i, 0], "n": 5 - i} for i in range(4)])
+        db.g.create_index([("loc", "2d")])
+        near = {"$geoNear": {"near": [0, 0], "distanceField": "d"}}
+        out["$geoNear, $sort"] = mongo_answer(
+            lambda: list(
+                db.g.aggregate([near, {"$addFields": {"q": 1}}, {"$sort": {"n": 1}}, meta])
+            )
+        )
+        db.command("create", "v", viewOn="c", pipeline=[{"$addFields": {"q": 1}}])
+        through_view = sub([{"$sort": {"n": 1}}])
+        through_view[1]["$lookup"]["from"] = "v"
+        out["$lookup of a view: $sort"] = mongo_answer(lambda: list(db.c.aggregate(through_view)))
+        return out
+
+    assert answers(rust_mongo) == answers(mongod)
 
 
 @pytest.mark.backlog("RM-524")
