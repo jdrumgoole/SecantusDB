@@ -28,6 +28,11 @@ them. Use a PRIVATE PostgreSQL 15 cluster (the probe creates tables), e.g.
     python tools/probes/pg_join_order_matrix.py [--filter SUBSTR] [--out DIR] \
         [--desc | --nulls-first | --desc-nulls-last]
 
+`--then KEYS` adds KEYS after every ORDER BY's column (`--then m0.c`,
+`--then "m1.c desc"`) and leaves out the shapes with no ORDER BY: an
+ORDER BY of several columns, which PostgreSQL sorts incrementally over a
+path in its first column's order. Give it its own `--out` too.
+
 `--desc` makes every ORDER BY descending (`DESC`, its NULLs first), and
 `--nulls-first` ascending with its NULLs first (`NULLS FIRST`, against the
 direction's default), and `--desc-nulls-last` descending with its NULLs last
@@ -56,6 +61,7 @@ import psycopg
 DESC = False
 NULLS_FIRST = False
 DESC_NULLS_LAST = False
+THEN: str | None = None
 
 MODS = [(7, 5), (5, 3), (3, 4), (4, 6), (6, 5)]
 
@@ -168,6 +174,12 @@ def run(dsn: str, flt: str | None) -> dict:
             keyed = [
                 (k, re.sub(r"order by (\S+)", r"order by \1 nulls first", q)) for k, q in keyed
             ]
+        if THEN is not None:
+            keyed = [
+                (k, re.sub(r"( limit \d+)", f", {THEN}\\1", q, count=1))
+                for k, q in keyed
+                if "order by" in q
+            ]
         conn.execute("begin")
         for s in setup(n, size, index):
             conn.execute(s)
@@ -180,8 +192,9 @@ def run(dsn: str, flt: str | None) -> dict:
 
 
 def main() -> None:
-    global DESC, NULLS_FIRST, DESC_NULLS_LAST
+    global DESC, NULLS_FIRST, DESC_NULLS_LAST, THEN
     args = sys.argv[1:]
+    THEN = args[args.index("--then") + 1] if "--then" in args else None
     DESC = "--desc" in args
     NULLS_FIRST = "--nulls-first" in args
     DESC_NULLS_LAST = "--desc-nulls-last" in args

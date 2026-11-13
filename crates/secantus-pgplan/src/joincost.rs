@@ -2634,14 +2634,59 @@ pub fn base_pathlist(cands: &[InPath], startup_counts: bool) -> Option<(Vec<usiz
     Some((rel.paths.iter().map(|p| p.combo).collect(), t, s))
 }
 
-/// The path PostgreSQL runs for an ORDER BY of one key and a LIMIT over a
-/// join relation of `rows` rows `width` bytes wide whose pathlist is
-/// `paths`: `create_ordered_paths` puts in the ordered relation each path
-/// already in the key's class order (`class`) as it is, and the
-/// cheapest-total one (`cheapest_total`) under a Sort the LIMIT bounds
-/// (`cost_sort` with `limit_tuples`), by `add_path`; then
-/// [`limit_choice`] over those. The index in `paths` of the path it runs,
-/// and whether it is in the key's order already (no Sort).
+/// `cost_incremental_sort` over an input of `tuples` rows `width` bytes
+/// wide costing `(startup, total)`, in order by a prefix of the sort keys
+/// whose groups `estimate_num_groups` puts at `groups`, of which a LIMIT
+/// reads `limit`: each group sorted on its own (at half as many rows again,
+/// `cost_tuplesort` bounded by the LIMIT), the first one before any row
+/// comes out, and a tuple's copy and comparison and two tuples a group of
+/// overhead. `(startup, total)`.
+pub fn cost_incremental_sort(
+    input: (f64, f64),
+    tuples: f64,
+    groups: f64,
+    width: i64,
+    limit: Option<f64>,
+) -> (f64, f64) {
+    let tuples = tuples.max(2.0);
+    let groups = groups.clamp(1.0, tuples);
+    let group_tuples = tuples / groups;
+    let group_input_run = (input.1 - input.0) / groups;
+    // `cost_tuplesort` (no input cost): its startup, then an operator a row.
+    let (group_startup, group_total) = cost_sort(0.0, 1.5 * group_tuples, width, limit);
+    let group_run = group_total - group_startup;
+    let startup = group_startup + input.0 + group_input_run;
+    // `create_incremental_sort_path` passes no comparison cost of its own.
+    let run = group_run
+        + (group_run + group_startup) * (groups - 1.0)
+        + group_input_run * (groups - 1.0)
+        + CPU_TUPLE_COST * tuples
+        + 2.0 * CPU_TUPLE_COST * groups;
+    (startup, startup + run)
+}
+
+/// How the ORDER BY's plan puts its rows in order.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum OrderedBy {
+    /// The path is in the ORDER BY's order already: no Sort.
+    Presorted,
+    /// An Incremental Sort over a path in its first key's order.
+    Incremental,
+    /// A Sort of every row.
+    Sort,
+}
+
+/// The path PostgreSQL runs for an ORDER BY and a LIMIT over a join
+/// relation of `rows` rows `width` bytes wide whose pathlist is `paths`,
+/// the ORDER BY's first key in the order of class `class`.
+/// `create_ordered_paths` puts in the ordered relation, by `add_path`:
+/// with one key (`groups` `None`), each path already in that order as it
+/// is; with more, each such path under an Incremental Sort (its first key
+/// presorted, `groups` of it), and the cheapest-total path
+/// (`cheapest_total`) under a Sort the LIMIT bounds (`cost_sort` with
+/// `limit_tuples`), first when it is both. Then [`limit_choice`] over
+/// those. The index in `paths` of the path it runs, and how its rows are
+/// put in order.
 #[allow(clippy::too_many_arguments)]
 pub fn ordered_limit_choice(
     paths: &[JoinChoice],
@@ -2649,39 +2694,52 @@ pub fn ordered_limit_choice(
     rows: f64,
     width: i64,
     class: usize,
+    groups: Option<f64>,
     count: f64,
     offset: f64,
-) -> Option<(usize, bool)> {
+) -> Option<(usize, OrderedBy)> {
     let mut ordered = JoinRel::new(true);
+    let mut kinds = Vec::new();
+    let limit = Some(count + offset);
     for (i, p) in paths.iter().enumerate() {
-        let (startup, total) = if p.class == Some(class) {
-            (p.startup, p.total)
-        } else if i == cheapest_total {
-            cost_sort(p.total, rows, width, Some(count + offset))
-        } else {
-            continue;
+        let in_order = p.class == Some(class);
+        let mut add = |(startup, total): (f64, f64), how: OrderedBy| {
+            kinds.push((i, how));
+            add_path(
+                &mut ordered.paths,
+                JoinPath {
+                    startup,
+                    total,
+                    keyed: true,
+                    class,
+                    method: p.method,
+                    combo: kinds.len() - 1,
+                    a_path: DEFAULT_INPUT,
+                    b_path: DEFAULT_INPUT,
+                    rows,
+                    req_outer: 0,
+                    rescan: (startup, total),
+                },
+                true,
+            );
         };
-        add_path(
-            &mut ordered.paths,
-            JoinPath {
-                startup,
-                total,
-                keyed: true,
-                class,
-                method: p.method,
-                combo: i,
-                a_path: DEFAULT_INPUT,
-                b_path: DEFAULT_INPUT,
-                rows,
-                req_outer: 0,
-                rescan: (startup, total),
-            },
-            true,
-        );
+        match groups {
+            None if in_order => add((p.startup, p.total), OrderedBy::Presorted),
+            _ => {
+                if i == cheapest_total {
+                    add(cost_sort(p.total, rows, width, limit), OrderedBy::Sort);
+                }
+                if let Some(groups) = groups.filter(|_| in_order) {
+                    let cost =
+                        cost_incremental_sort((p.startup, p.total), rows, groups, width, limit);
+                    add(cost, OrderedBy::Incremental);
+                }
+            }
+        }
     }
     let list = ordered.pathlist();
     let pick = list.get(limit_choice(&list, rows, count, offset)?)?.combo;
-    Some((pick, paths[pick].class == Some(class)))
+    kinds.get(pick).copied()
 }
 
 /// The path PostgreSQL runs under a LIMIT of `count` rows after `offset`
@@ -2733,6 +2791,25 @@ pub fn limit_choice(paths: &[JoinChoice], rows: f64, count: f64, offset: f64) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// PostgreSQL 15.19's EXPLAIN of two Incremental Sorts under a LIMIT 5
+    /// over merge joins of two 3,000-row tables never analysed (RP-028):
+    /// `t0 JOIN t1 ON t0.b = t1.a ORDER BY t1.a, t0.c` over a Merge Join
+    /// (511.19..1430.56, 60135 rows, width 12) is 523.28..3759.65, and
+    /// `m0 LEFT JOIN m1 ON m0.a = m1.b ORDER BY m0.a, m0.c` over a Merge
+    /// Left Join (475.86..1273.50, 52020 rows) 486.33..3288.82; 200 groups
+    /// each (`DEFAULT_NUM_DISTINCT`).
+    #[test]
+    fn incremental_sort_costs_as_postgres_15() {
+        for (input, rows, want) in [
+            ((511.19, 1430.56), 60135.0, (523.28, 3759.65)),
+            ((475.86, 1273.50), 52020.0, (486.33, 3288.82)),
+        ] {
+            let (startup, total) = cost_incremental_sort(input, rows, 200.0, 12, Some(5.0));
+            assert!((startup - want.0).abs() < 0.02, "{startup} {want:?}");
+            assert!((total - want.1).abs() < 0.05, "{total} {want:?}");
+        }
+    }
 
     /// `cost_hashjoin` on two clauses (RP-374): each clause is paid per
     /// built and per probed row, and the bucket is the smaller clause's.

@@ -777,13 +777,32 @@ one beside it.
     nullable key merges on that index's backward scan, whose DESC NULLS
     FIRST is of use for merging (`right_merge_direction` weighs the
     direction only) but not for the ORDER BY (`BACK_KEYS`): 240 of 240.
-    Declined still: an ORDER BY of several columns (joined whole and sorted, so its
-    ties come out in another order: `t0 JOIN t1 ON t0.b = t1.a ORDER BY
-    t1.a, t0.c LIMIT 5` over two 3,000-row tables), and a two-table join
-    with a subquery side.
+    Since 2026-11-13 an ORDER BY of several plain columns under a LIMIT is
+    searched too, its first column's class order the presorted key: each
+    path in that order goes under an Incremental Sort beside the
+    cheapest-total path's bounded Sort (`create_ordered_paths`), priced by
+    `cost_incremental_sort` over the groups of the class's first member,
+    and run as `nodeIncrementalSort.c` runs (`tuplesort::incremental_sort`:
+    batches of 32 sorted by every key, a group past 64 rows moved to a sort
+    by the later keys, each bounded by what the LIMIT still needs); a later
+    key in the first key's class is a redundant pathkey. On the matrix with
+    a second key (`--then m0.c`, `--then "m1.c desc"`, `--then m0.a`):
+    810 of 810 shapes each (692, 676 and 778 before); with two more
+    (`--then "m0.c, m1.b desc"`), 809 of 810 (711); the one left, not
+    diagnosed, is two rows tying on all three keys in another order
+    (`multi5/20/idx1/two_hubs2/lastleft/ordlastlim5`). Declined still (the
+    join planned for every row and sorted, as before): an ORDER BY of
+    several columns whose first is descending or NULLS FIRST, which with a
+    key after it no merge join takes (`select_outer_pathkeys_for_merge`
+    adopts the query's pathkeys only when every key is a merge clause's
+    class) and an index's backward scan gives (`--desc --then m0.c`: 789
+    of 810, 771 before; `--nulls-first --then m1.c` 800, 785 before;
+    `--desc-nulls-last --then "m0.c desc"` 776, 758 before); a later key a
+    WHERE may fix to a constant; a table with an index of several columns;
+    and a two-table join with a subquery side.
   - Sorts that spill to disk runs are not PostgreSQL's merge.
   Backlog-ID: RP-028
-  Verify: tests/backlog/test_rust_postgres_gaps.py::test_a_two_column_order_by_over_a_join_keeps_its_ties
+  Verify: tests/backlog/test_rust_postgres_gaps.py::test_a_descending_first_key_with_another_reads_an_index_backward
 
 - [ ] **OPEN — RUST pgserver on LINUX: psycopg's timing tests fail in CI
       and pass on macOS (first measured 2026-10-12).** No Linux lane ran

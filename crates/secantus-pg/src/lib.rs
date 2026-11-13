@@ -365,15 +365,18 @@ thread_local! {
     /// which only the join order search places (`four_table_join`).
     static GENERAL_JOIN_LIMIT: std::cell::Cell<Option<(usize, usize, bool)>> =
         const { std::cell::Cell::new(None) };
-    /// With `GENERAL_JOIN_LIMIT`, the joined-row key of the ORDER BY over
-    /// the join (one plain column, ascending with its NULLs last or
-    /// descending with them first, `true`), which only the join order
-    /// search plans for (`four_table_join`); and, once it has, whether the
-    /// plan it picked returns its rows in that order already, so that the
-    /// select runs no Sort of its own (`create_ordered_paths`).
-    static GENERAL_JOIN_ORDER: std::cell::RefCell<Option<(String, bool, bool)>> =
+    /// With `GENERAL_JOIN_LIMIT`, the joined-row key of the ORDER BY's
+    /// first column over the join (a plain column; descending, and NULLs
+    /// against the direction's default), and the joined-row keys of its
+    /// plain columns after it, which only the join order search plans for
+    /// (`four_table_join`); and, once it has, how many of the ORDER BY's
+    /// keys the plan it picked returns its rows in the order of already
+    /// (`usize::MAX` for all), so that the select runs no Sort of its own,
+    /// or an Incremental Sort (`create_ordered_paths`).
+    #[allow(clippy::type_complexity)]
+    static GENERAL_JOIN_ORDER: std::cell::RefCell<Option<(String, bool, bool, Vec<String>)>> =
         const { std::cell::RefCell::new(None) };
-    static GENERAL_JOIN_PRESORTED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static GENERAL_JOIN_PRESORTED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// Run `f` with FROM-subquery rows carrying their base row ids.
@@ -10586,9 +10589,25 @@ impl PgHandler {
                 if let Some(rows) = self.four_table_join(
                     node,
                     limit_offset,
-                    order.as_ref().map(|(k, desc, nf)| (k.as_str(), *desc, *nf)),
+                    order
+                        .as_ref()
+                        .map(|(k, desc, nf, _)| (k.as_str(), *desc, *nf)),
+                    order
+                        .as_ref()
+                        .map_or(&[][..], |(.., later)| later.as_slice()),
                 )? {
                     return Ok(rows);
+                }
+                // An ORDER BY of several columns the search declined: the
+                // join planned for every row, as with no LIMIT, and sorted
+                // after.
+                if order.as_ref().is_some_and(|(.., later)| !later.is_empty()) {
+                    if let Some(rows) = self.three_table_join(node, None)? {
+                        return Ok(rows);
+                    }
+                    if let Some(rows) = self.four_table_join(node, None, None, &[])? {
+                        return Ok(rows);
+                    }
                 }
                 let lrows = self.join_rows(left)?;
                 if let JoinNode::Lateral {
@@ -38562,7 +38581,7 @@ impl PgHandler {
         // why the series is a SOURCE rather than its own statement.
         // The join source's plan already returns its rows in the ORDER BY's
         // order (RP-028): no Sort over it.
-        let mut presorted = false;
+        let mut presorted = 0usize;
         let (mut docs, mut def): (Vec<Document>, TableDef) = match (&sel.series, &sel.join) {
             // `LIMIT 0`: PostgreSQL's Limit node returns before it asks its
             // subplan for a row (`ExecLimit`, a count of zero), so nothing
@@ -38580,23 +38599,31 @@ impl PgHandler {
                 // reads more rows than it returns: no WHERE, or one whose
                 // every conjunct the join's scans and joins evaluate, so
                 // that the join's rows are the ones the LIMIT counts.
-                // With an ORDER BY of one plain column, ascending with its
-                // NULLs last or descending with them first (each the other's
-                // exact reverse), or with its NULLs against the direction's
-                // default (ascending NULLS FIRST, descending NULLS LAST),
-                // the search plans the join for the LIMIT and says whether
-                // its plan needs the Sort.
+                // With an ORDER BY of plain columns, the first ascending
+                // with its NULLs last or descending with them first (each
+                // the other's exact reverse), or with its NULLs against the
+                // direction's default (ascending NULLS FIRST, descending
+                // NULLS LAST), the search plans the join for the LIMIT and
+                // says how many of its keys its plan needs no Sort for.
+                let plain = |k: &secantus_pgplan::OrderKey| k.expr.is_none() && !k.jsonb;
                 let join_order = match sel.order.as_slice() {
-                    [k] if k.expr.is_none()
-                        && !k.jsonb
-                        && sel.distinct == secantus_pgplan::Distinct::None
-                        && !sel.with_ties
-                        && sel.lock_clauses.is_empty() =>
+                    [k, later @ ..]
+                        if plain(k)
+                            && later.iter().all(plain)
+                            && sel.distinct == secantus_pgplan::Distinct::None
+                            && !sel.with_ties
+                            && sel.lock_clauses.is_empty() =>
                     {
                         // NULLs against the default: first in the ascending
                         // comparator a descending order reverses.
                         let nulls_first = matches!(k.nulls, secantus_pgplan::Nulls::First);
-                        Some((k.field.clone(), !k.ascending, k.ascending == nulls_first))
+                        let later = later.iter().map(|k| k.field.clone()).collect();
+                        Some((
+                            k.field.clone(),
+                            !k.ascending,
+                            k.ascending == nulls_first,
+                            later,
+                        ))
                     }
                     _ => None,
                 };
@@ -38622,7 +38649,7 @@ impl PgHandler {
                 GENERAL_JOIN_LIMIT.with(|c| c.set(join_limit));
                 GENERAL_JOIN_ORDER
                     .with(|c| *c.borrow_mut() = join_order.filter(|_| join_limit.is_some()));
-                GENERAL_JOIN_PRESORTED.with(|c| c.set(false));
+                GENERAL_JOIN_PRESORTED.with(|c| c.set(0));
                 let docs = if !sel.lock_clauses.is_empty() && self.storage.in_user_txn() {
                     with_lock_row_ids(|| self.sub_source_docs(sub, &sel.filter))
                 } else {
@@ -38630,7 +38657,7 @@ impl PgHandler {
                 };
                 GENERAL_JOIN_LIMIT.with(|c| c.set(None));
                 GENERAL_JOIN_ORDER.with(|c| *c.borrow_mut() = None);
-                presorted = GENERAL_JOIN_PRESORTED.with(|c| c.replace(false));
+                presorted = GENERAL_JOIN_PRESORTED.with(|c| c.replace(0));
                 (docs?, sub.def.clone())
             }
             // A top-level JOIN source: materialise it, treat its
@@ -38909,7 +38936,7 @@ impl PgHandler {
         }
 
         if !sel.order.is_empty()
-            && !presorted
+            && presorted < sel.order.len()
             && !(!sel.windows.is_empty() && window_order::presorted(&sel.order, &window_sorted))
         {
             self.materialise_sort_input(&mut docs, sel, &def)?;
@@ -38924,6 +38951,18 @@ impl PgHandler {
                 // The two cannot be told apart here, so a real DISTINCT ON
                 // keeps the stable order too (RP-028 leaves it).
                 docs.sort_by(|a, b| compare_rows(a, b, &sel.order));
+            } else if presorted > 0 {
+                // An Incremental Sort over rows the join returns in order
+                // by the first `presorted` keys (RP-028).
+                let bound = sort_bound(sel).filter(|_| row_lock.is_none());
+                let (prefix, rest) = sel.order.split_at(presorted);
+                docs = tuplesort::incremental_sort(
+                    docs,
+                    bound,
+                    &mut |a, b| compare_rows(a, b, prefix) == Ordering::Equal,
+                    &mut |a, b| compare_rows(a, b, &sel.order),
+                    &mut |a, b| compare_rows(a, b, rest),
+                );
             } else {
                 let bound = sort_bound(sel).filter(|_| row_lock.is_none());
                 docs = tuplesort::sort(docs, bound, &mut |a, b| compare_rows(a, b, &sel.order));
