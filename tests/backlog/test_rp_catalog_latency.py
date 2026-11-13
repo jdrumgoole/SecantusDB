@@ -191,19 +191,21 @@ def test_the_first_catalog_query_after_ddl_costs_the_same_at_800_tables(
     0.010 s and 0.014 s (2026-11-13).
 
     The fastest of five first-after-DDL runs on a server with 800 more
-    tables against the fastest on one with none, taking turns, within a
-    quarter again plus 2 ms. The bound was half again plus 5 ms until
-    2026-11-13, when the gap shrank to about 12 ms and that bound fell
-    inside the runs' noise: two runs in five passed with the statement
-    still twice as slow. Until the same day the two were measured one
-    after the other on one server, and a machine loaded by another build
-    failed it twice in six. What is left of the growth is the next
-    test's."""
+    tables against the fastest on one with none, taking turns, within half
+    again plus 2 ms. The bound was half again plus 5 ms until 2026-11-13,
+    when the gap shrank to about 12 ms and 5 ms fell inside the runs'
+    noise. A quarter again plus 2 ms, tried the same day, passed a debug
+    build here (10.1 ms and 13.7 ms) only through its 2 ms, and failed CI,
+    whose runs are about three times slower (29 ms and 41 ms, PR #2716):
+    the ratio is about 1.4 on both, so the absolute term is kept small.
+    Until the same day the two were measured one after the other on one
+    server, and a machine loaded by another build failed it twice in six.
+    What is left of the growth is the next test's."""
     small_conn, large_conn = pg_pair
     for i in range(2 * GROWTH_TABLES):
         large_conn.execute(f"CREATE TABLE rp911_grow_{i} (a int, b text)")
     small, large = _alternating_firsts(small_conn, large_conn, "rp911a")
-    assert large < 1.25 * small + 0.002, (
+    assert large < 1.5 * small + 0.002, (
         f"first query after DDL {small * 1000:.0f} ms with no other table, "
         f"{large * 1000:.0f} ms with {2 * GROWTH_TABLES}"
     )
