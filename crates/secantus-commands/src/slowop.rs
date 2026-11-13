@@ -278,11 +278,13 @@ fn is_read(name: &str) -> bool {
 /// The kind of namespace the line names, as mongod's operation acquired it
 /// (measured 8.2.11, RM-380): `view` or `timeseries` only for a read of one
 /// that succeeded. Everything else acquires a collection, or fails, and
-/// names its namespace `normal` whatever it is -- a `getMore` of a view's
-/// cursor, a write to a view (refused) or to a time-series collection, a
-/// `drop` or `collMod` of a view, a read that failed (before it resolved a
-/// view it names the view, after it the collection beneath:
-/// `opdebug::beneath_view`).
+/// names its namespace by its name alone (`opdebug::namespace_kind`:
+/// `system`, `admin`, `local`, `config`, RM-478), or `normal` whatever it
+/// is -- a `getMore` of a view's cursor, a write to a view (refused) or to a
+/// time-series collection, a `drop` or `collMod` of a view, a read that
+/// failed (before it resolved a view it names the view, after it the
+/// collection beneath: `opdebug::beneath_view`). A `system.` collection is
+/// `system` even to a read (`<db>.system.views` is no view to mongod).
 fn line_kind(
     name: &str,
     ok: bool,
@@ -290,10 +292,8 @@ fn line_kind(
     db: &str,
     coll: Option<&str>,
 ) -> &'static str {
-    if !ok || !(is_read(name) || name == "explain") {
-        return "normal";
-    }
-    crate::opdebug::collection_type(ctx, db, coll.unwrap_or("$cmd"))
+    let looked_up = ok && (is_read(name) || name == "explain");
+    crate::opdebug::line_collection_type(ctx, db, coll.unwrap_or("$cmd"), looked_up)
 }
 
 /// Whether `name` plans a query of its own, so its line has the planner's

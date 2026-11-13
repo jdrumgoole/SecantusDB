@@ -953,15 +953,14 @@ These are explicit non-goals. Don't add them without a reason.
       e01df2d2 (2026-11-08), each command checked against a probe of its own.
       Backlog-ID: RM-360
       Verify: tests/backlog/test_rm_355_364.py::test_every_line_counts_its_interrupt_checks
-- [ ] **A line on `admin`, `local` or `config` says its collection is
-      `normal`.** mongod 8.2.1's `Slow query` line for an operation on one
-      of its internal databases -- a `ping` (`admin.$cmd`), a `find` of
-      `admin.c` -- says `collectionType: "admin"` (`"local"`, `"config"`);
-      this server's says `"normal"`. A failed `renameCollection`, whose
-      line names `admin.$cmd` since RM-378, says `"normal"` for the same
-      reason. Found while working RM-378, 2026-11-09.
-      Verify: tests/backlog/test_rm_slow_query_namespace.py::test_a_line_on_an_internal_database_names_its_kind
-      Backlog-ID: RM-478
+- [ ] **An `update` or `delete` statement's line leaves out the command's
+      `comment`.** mongod 8.2.11's `Slow query` line for each statement
+      shows it with its command's `comment` (`{q, limit, comment}`,
+      `{q, u, multi, upsert, comment}`); this server's shows the statement
+      alone, so a log search for the comment misses the statement's line.
+      Found while working RM-478, 2026-11-13.
+      Verify: tests/backlog/test_rm_statement_line_comment.py::test_a_statement_line_carries_its_commands_comment
+      Backlog-ID: RM-581
 - [ ] **Renaming `<db>.system.views` is refused as a view.** mongod 8.2.1
       refuses it as a write to the namespace (20 IllegalOperation, "error
       with source namespace: cannot write to <db>.system.views"); this

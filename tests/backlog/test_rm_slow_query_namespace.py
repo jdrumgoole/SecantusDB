@@ -106,11 +106,11 @@ def test_a_failed_rename_line_names_its_own_namespace(rust_mongo: Any, mongod_rs
     assert [ns for ns, _ in answers["rust"][0]] == [ns for ns, _ in answers["mongod"][0]]
 
 
-@pytest.mark.backlog("RM-478")
+@pytest.mark.backlog_fixed("RM-478")
 def test_a_line_on_an_internal_database_names_its_kind(rust_mongo: Any, mongod_rs: Any) -> None:
     """mongod 8.2.1's line for an operation on `admin`, `local` or `config`
     -- a `ping`, a `find` -- says `collectionType: "admin"` (`"local"`,
-    `"config"`); this server's says `"normal"`."""
+    `"config"`); this server's said `"normal"`."""
 
     def run(client: Any, db: Any) -> None:
         for on in ("admin", "local", "config"):
@@ -125,6 +125,47 @@ def test_a_line_on_an_internal_database_names_its_kind(rust_mongo: Any, mongod_r
         "local",
         "config",
         "config",
+    ]
+    assert answers["rust"][0] == answers["mongod"][0]
+
+
+@pytest.mark.backlog_fixed("RM-478")
+def test_a_line_names_its_kind_whatever_the_operation_did(rust_mongo: Any, mongod_rs: Any) -> None:
+    """mongod 8.2.11 names a line's namespace by its name before anything
+    else: a `system.` collection is `"system"` in any database
+    (`admin.system.version` too), and anything else on an internal database
+    is that database's name, for a write, a failed `find` and a failed
+    `renameCollection` (`admin.$cmd`) as for a read. A view or time-series
+    collection read on one is still `"view"` / `"timeseries"`. This server's
+    said `"normal"` for each but the last."""
+
+    def run(client: Any, db: Any) -> None:
+        client.admin.command("create", f"{db.name}_v", viewOn="c", pipeline=[])
+        try:
+            _command(client, db, "admin", {"insert": "c", "documents": [{"_id": 1}]})
+            _command(client, db, "admin", {"find": "c", "filter": {"$bogus": 1}})
+            _command(client, db, "admin", {"find": "system.version"})
+            _command(client, db, "admin", {"find": f"{db.name}_v"})
+            _command(client, db, "config", {"find": "system.sessions"})
+            _command(client, db, "<db>", {"find": "system.js"})
+            _command(client, db, "<db>", {"insert": "system.js", "documents": [{"_id": "f"}]})
+            _command(client, db, "<db>", {"find": "c"})
+            _failed_renames(client, db)
+        finally:
+            client.admin.drop_collection(f"{db.name}_v")
+            client.admin.drop_collection("c")
+
+    answers = _both(run, rust_mongo, mongod_rs)
+    assert [kind for _, kind in answers["mongod"][0]] == [
+        "admin",
+        "admin",
+        "system",
+        "view",
+        "system",
+        "system",
+        "system",
+        "normal",
+        *["admin"] * 4,
     ]
     assert answers["rust"][0] == answers["mongod"][0]
 
