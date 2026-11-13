@@ -4,10 +4,10 @@ of `maxTimeMS` before it has written anything.
 
 The store's own candidates are now read a page at a time and each page
 written before the next is read, so a collection scan out of time keeps
-what it wrote. The reads below still happen whole before the first write:
-the router's RecordIds of an index, and the read that picks a contested
-plan (`explain::order::through_cache`, which runs `ordered_rows` over
-every match).
+what it wrote. A contested plan is now tried over what its candidates
+reach, and the winner streamed into the write (2026-11-13). The router's
+RecordIds of an index, read for a clustered collection, still come whole
+before the first write.
 
 The reference is mongod 8.2.11, asked live (`mongod_rs`, a one-member
 replica set); the Rust server is `secantusd-rs` (`rust_mongo`).
@@ -59,25 +59,33 @@ def _write_out_of_time(client: Any, plan: str, op: str) -> tuple:
 
 
 @pytest.mark.backlog("RM-390")
-@pytest.mark.parametrize(
-    "plan,op",
-    [
-        ("clustered-index", "update"),
-        ("clustered-index", "delete"),
-        ("contested", "update"),
-        ("contested", "delete"),
-    ],
-)
+@pytest.mark.parametrize("op", ["update", "delete"])
 def test_a_write_of_many_out_of_time_keeps_what_it_wrote_whatever_its_plan(
-    rust_mongo: Any, mongod_rs: Any, plan: str, op: str
+    rust_mongo: Any, mongod_rs: Any, op: str
 ) -> None:
     """mongod 8.2.11 writes each document as its plan returns it, so an
     updateMany or deleteMany out of `maxTimeMS` part-way has written some,
     whatever the plan (measured 2026-11-10: through index `a_1` of a
-    clustered collection 4,599 updated and 11,280 deleted of 100,000; a
-    contested plan 1,536 updated and 10,030 deleted). This server reads the
-    index's every RecordId, or every match of a contested plan to choose
-    it, before it writes one, and a budget spent there writes nothing."""
-    theirs = _write_out_of_time(mongod_rs, plan, op)
+    clustered collection 4,599 updated and 11,280 deleted of 100,000). This
+    server reads the index's every RecordId before it writes one, and a
+    budget spent there writes nothing."""
+    theirs = _write_out_of_time(mongod_rs, "clustered-index", op)
     assert theirs == (("err", 50), True), theirs
-    assert _write_out_of_time(rust_mongo, plan, op) == theirs
+    assert _write_out_of_time(rust_mongo, "clustered-index", op) == theirs
+
+
+@pytest.mark.backlog_fixed("RM-390")
+@pytest.mark.parametrize("op", ["update", "delete"])
+def test_a_contested_write_of_many_out_of_time_keeps_what_it_wrote(
+    rust_mongo: Any, mongod_rs: Any, op: str
+) -> None:
+    """mongod 8.2.11 tries a contested plan over what its candidates reach
+    and then writes each document the winner returns, so an updateMany or
+    deleteMany out of `maxTimeMS` part-way has written some (measured
+    2026-11-10: 1,536 updated and 10,030 deleted of 100,000). This server
+    read every match to choose the plan before it wrote one, and a budget
+    spent there wrote nothing; it now tries the plan as mongod does and
+    streams the winner into the write."""
+    theirs = _write_out_of_time(mongod_rs, "contested", op)
+    assert theirs == (("err", 50), True), theirs
+    assert _write_out_of_time(rust_mongo, "contested", op) == theirs
