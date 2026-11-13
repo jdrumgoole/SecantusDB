@@ -1435,6 +1435,22 @@ about forty such points; these are the ones measured.
       2026-11-13.)
       Backlog-ID: RM-390
       Verify: tests/backlog/test_rm_found_2026_11_10_rm390.py::test_a_write_of_many_out_of_time_keeps_what_it_wrote_whatever_its_plan
+- [ ] **A read whose plan two indexes contest reads every match.**
+      Over `{a: {$gte: 0}, b: {$gte: 0}}` with indexes `a_1` and `b_1`,
+      mongod 8.2.11 tries both plans for about 101 results and then runs
+      the winner only as far as the read needs, so a `find(...).limit(101)`
+      takes 0.3 ms, an `updateOne` 4-5 ms and an `explain` at
+      `queryPlanner` 0.3 ms whether the collection holds 10,000 documents
+      or 100,000. This server's time for each grows with the collection,
+      ten times over for ten times the documents (debug build, 2026-11-13:
+      80, 135 and 127 ms at 10,000; 710, 1,221 and 1,282 ms at 100,000), so
+      it reads every match before the limit, the single write or the plan
+      choice stops it. The answers are the same; the cost is the whole
+      read. A write of many has streamed a contested plan since
+      2026-11-13 (RM-390); a read, a write of one and `explain` do not.
+      Found while fixing RM-390's CI test, 2026-11-13.
+      Verify: tests/backlog/test_rm_found_2026_11_13_contested_reads.py::test_a_contested_read_costs_what_it_returns
+      Backlog-ID: RM-610
 - [ ] **A profile entry counts what it examined as int64, where mongod
       writes int32.** mongod 8.2.11's `system.profile` entry for an
       updateMany or a find holds `keysExamined` and `docsExamined` as
