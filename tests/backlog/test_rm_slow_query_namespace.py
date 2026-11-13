@@ -181,10 +181,10 @@ def test_a_failed_rename_is_not_profiled(rust_mongo: Any, mongod_rs: Any) -> Non
     assert answers["rust"][1] == answers["mongod"][1]
 
 
-@pytest.mark.backlog("RM-495")
+@pytest.mark.backlog_fixed("RM-495")
 def test_a_data_size_line_names_its_own_namespace(rust_mongo: Any, mongod_rs: Any) -> None:
     """mongod 8.2.1's line for a `dataSize`, whose argument is a full
-    namespace, names `<db>.$cmd`; this server's names `<db>.<db>.c`, the
+    namespace, names `<db>.$cmd`; this server's named `<db>.<db>.c`, the
     command's database joined to its argument."""
 
     def run(client: Any, db: Any) -> None:

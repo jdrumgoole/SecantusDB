@@ -59,13 +59,13 @@ def test_a_drop_database_line_names_the_database(rust_mongo: Any, mongod_rs: Any
     assert answers["rust"] == answers["mongod"]
 
 
-@pytest.mark.backlog("RM-495")
+@pytest.mark.backlog_fixed("RM-495")
 def test_a_command_s_string_argument_is_not_its_collection(rust_mongo: Any, mongod_rs: Any) -> None:
     """mongod 8.2.11's lines for a `validate`, a `dataSize`, a `getLog` and
     a `compact` (refused on a replica-set primary, its line still written)
-    name `<db>.$cmd`; this server's name the command's string argument as
+    name `<db>.$cmd`; this server's named the command's string argument as
     though it were a collection (`<db>.<db>.c`, `<db>.startupWarnings`,
-    `<db>.c`; a `validate`'s names `<db>.$cmd` since RM-485)."""
+    `<db>.c`; a `validate`'s named `<db>.$cmd` since RM-485)."""
     commands = [
         {"validate": "c"},
         {"dataSize": "<db>.c"},

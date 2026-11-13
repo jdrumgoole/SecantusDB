@@ -1083,20 +1083,28 @@ These are explicit non-goals. Don't add them without a reason.
       before any operator's own. Found while working RM-493, 2026-11-13.
       Verify: tests/backlog/test_rm_found_rm493.py::test_a_bare_dollar_is_no_field_path
       Backlog-ID: RM-594
-- [ ] **A `Slow query` line takes a command's string argument for its
-      collection.** mongod 8.2.11's lines for a `dataSize: "<db>.c"`, a
-      `getLog` and a `compact: "c"` name `<db>.$cmd`; this server's name
-      `<db>.<db>.c`, `<db>.startupWarnings` and `<db>.c`
-      (`slowop::target_collection` reads any command's string value as
-      one; a `validate`'s names `<db>.$cmd` since RM-485). Found while
-      working RM-383, 2026-11-10; `compact` measured while working RM-485,
+- [ ] **A `Slow query` line names a collection a command refused before
+      it acquired one.** mongod 8.2.11's line for a `create` of a
+      collection that exists (which succeeds) and for a `findAndModify`
+      with neither `update` nor `remove` (FailedToParse) names `<db>.$cmd`;
+      this server's names `<db>.c`. Found while working RM-495, 2026-11-13.
+      Verify: tests/backlog/test_rm_found_2026_11_13_rm495.py::test_a_command_refused_before_it_acquires_its_collection_names_cmd
+      Backlog-ID: RM-595
+- [ ] **A `Slow query` line names a command's value, not the collection it
+      works through.** mongod 8.2.11's line for a `filemd5` names its
+      root's chunks (`<db>.fs.chunks`), for a `convertToCapped` the
+      temporary collection it builds (`<db>.tmpXXXXX.convertToCapped.c`),
+      for a `rolesInfo` of a role `admin.system.roles`; this server's name
+      `<db>.$cmd`, `<db>.c` and `<db>.$cmd`. Found while working RM-495,
       2026-11-13.
-      (This was RM-480: A `dataSize` line names `<db>.<db>.c`.) mongod 8.2.1's
-      `Slow query` line for a `dataSize`, whose argument is a full namespace,
-      names `<db>.$cmd`; this server's joins the command's database to the
-      argument. Found while working RM-378, 2026-11-09.
-      Verify: tests/backlog/test_rm_drop_reports.py::test_a_command_s_string_argument_is_not_its_collection, tests/backlog/test_rm_slow_query_namespace.py::test_a_data_size_line_names_its_own_namespace
-      Backlog-ID: RM-495
+      Verify: tests/backlog/test_rm_found_2026_11_13_rm495.py::test_a_line_names_the_collection_a_command_works_through
+      Backlog-ID: RM-596
+- [ ] **`deleteIndexes` is refused as a command this server does not
+      know.** mongod 8.2.11 runs it as `dropIndexes`'s alias; this server
+      answers CommandNotFound (59), though its lock, view and time-series
+      tables already list it. Found while working RM-495, 2026-11-13.
+      Verify: tests/backlog/test_rm_found_2026_11_13_rm495.py::test_delete_indexes_is_drop_indexes
+      Backlog-ID: RM-597
 - [ ] **Operations this server runs another way than mongod's plan say
       less.** Since RM-023 a read or a write's read that a stream runs as
       mongod's plan counts its keys and documents examined, and since
