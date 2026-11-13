@@ -12869,7 +12869,9 @@ impl PgHandler {
     /// / EXCLUDE constraint's in order, as PostgreSQL builds them after the
     /// table (RP-137). A new constraint draws one even if it carries an oid:
     /// one copied from another table (LIKE, a partition's) carries that
-    /// table's. Whether any was drawn.
+    /// table's. A renamed one is not new: it carries its own oid, which
+    /// `old` holds, and keeps it as PostgreSQL's index does. Whether any
+    /// was drawn.
     fn assign_index_oids(&self, def: &mut TableDef, old: Option<&TableDef>) -> PgWireResult<bool> {
         let mut drew = false;
         let had_pk = old.is_some_and(|o| !secantus_pgplan::ordered_pk_columns(o).is_empty());
@@ -12881,7 +12883,12 @@ impl PgHandler {
         }
         for i in 0..def.unique_constraints.len() {
             let name = def.unique_constraints[i].name.clone();
-            let known = old.is_some_and(|o| o.unique_constraints.iter().any(|u| u.name == name));
+            let oid = def.unique_constraints[i].oid;
+            let known = old.is_some_and(|o| {
+                o.unique_constraints
+                    .iter()
+                    .any(|u| u.name == name || (oid.is_some() && u.oid == oid))
+            });
             if !known {
                 def.unique_constraints[i].oid = Some(self.mint_index_oid()?);
                 drew = true;
@@ -18378,14 +18385,59 @@ impl PgHandler {
         Ok(())
     }
 
-    /// An index comment's key: the bare index name (the Python server's
-    /// layout) for an index in `public`, `schema.name` elsewhere -- two
-    /// schemas may each have an index of one name.
+    /// An index comment's key: the index's oid, as PostgreSQL keys
+    /// `pg_description` by `objoid`, so a rename keeps the comment (RP-923).
+    /// No identifier holds a NUL, so it cannot meet a name key.
     fn index_comment_key(ix: &IndexRelation) -> String {
+        format!("oid\0{}", ix.oid)
+    }
+
+    /// The key a comment was recorded under before comments were keyed by
+    /// oid: the bare index name in `public`, `schema.name` elsewhere. Read
+    /// when the index has no oid key, and moved to one by a rename.
+    fn legacy_index_comment_key(ix: &IndexRelation) -> String {
         match secantus_pgplan::schemas::split_key(&ix.table.name) {
             (s, _) if s != "public" => format!("{s}.{}", ix.name),
             _ => ix.name.clone(),
         }
+    }
+
+    /// The comment `docs` hold for `ix`: its oid key's, else its name key's.
+    fn index_comment_in<'a>(docs: &'a [Document], ix: &IndexRelation) -> Option<&'a str> {
+        let find = |key: String| {
+            docs.iter()
+                .find(|d| d.get_str("_id") == Ok(key.as_str()))
+                .and_then(|d| d.get_str("comment").ok())
+        };
+        find(Self::index_comment_key(ix)).or_else(|| find(Self::legacy_index_comment_key(ix)))
+    }
+
+    /// Move a comment recorded under `ix`'s name to its oid key, before a
+    /// rename takes the name away.
+    fn rekey_legacy_index_comment(&self, ix: &IndexRelation) -> PgWireResult<()> {
+        let legacy = Self::legacy_index_comment_key(ix);
+        let docs: Vec<Document> = self
+            .storage
+            .find_matching(
+                self.db(),
+                Self::INDEX_COMMENT_COLLECTION,
+                &bson::doc! {"_id": {"$in": [&legacy, Self::index_comment_key(ix)]}},
+            )
+            .map_err(|e| Self::storage_err("could not read the index comments", e))?
+            .iter()
+            .filter_map(|b| decode_doc(b).ok())
+            .collect();
+        if !docs.iter().any(|d| d.get_str("_id") == Ok(legacy.as_str())) {
+            return Ok(());
+        }
+        let comment = Self::index_comment_in(&docs, ix).map(str::to_string);
+        self.put_comment_doc(Self::INDEX_COMMENT_COLLECTION, &legacy, None)?;
+        let key = Self::index_comment_key(ix);
+        self.put_comment_doc(
+            Self::INDEX_COMMENT_COLLECTION,
+            &key,
+            comment.map(|c| bson::doc! {"_id": &key, "comment": c}),
+        )
     }
 
     /// A relation name from a `COMMENT ON` object's name parts: `public` is
@@ -19106,6 +19158,12 @@ impl PgHandler {
                 let Some(ix) = found else {
                     return Err(missing_relation(&Self::comment_relation(names)));
                 };
+                // A comment recorded under the name goes: this one replaces it.
+                self.put_comment_doc(
+                    Self::INDEX_COMMENT_COLLECTION,
+                    &Self::legacy_index_comment_key(ix),
+                    None,
+                )?;
                 let key = Self::index_comment_key(ix);
                 self.put_comment_doc(
                     Self::INDEX_COMMENT_COLLECTION,
@@ -21439,11 +21497,7 @@ impl PgHandler {
             .collect();
         if !index_comments.is_empty() {
             for ix in self.try_index_relations()? {
-                if let Some(c) = index_comments
-                    .iter()
-                    .find(|d| d.get_str("_id") == Ok(Self::index_comment_key(&ix).as_str()))
-                    .and_then(|d| d.get_str("comment").ok())
-                {
+                if let Some(c) = Self::index_comment_in(&index_comments, &ix) {
                     tail.push((ix.oid, 0, c.to_string()));
                 }
             }
@@ -34035,6 +34089,15 @@ impl PgHandler {
         // The catalog reads PostgreSQL makes for the statement, and what a
         // catalog change it makes invalidates (RP-225).
         let effects = self.catalog_effects(query);
+        // A statement that reads the scan counters sees its own parse and
+        // plan reads, so it is walked first; a failed block analyses
+        // nothing (RP-909).
+        let walked_first = catalog_reads::reads_counters(query)
+            && !catalog_reads::changes_catalogs(query)
+            && !self.txn_failed.load(std::sync::atomic::Ordering::Relaxed);
+        if walked_first {
+            self.catalog_reads(query, &effects.pre);
+        }
         let result = self
             .run_typed_inner(query, params, param_types, max_rows)
             .await;
@@ -34045,7 +34108,7 @@ impl PgHandler {
             Err(PgWireError::UserError(info))
                 if matches!(info.code.as_str(), "57014" | "57P01" | "25P02")
         );
-        if analysed {
+        if analysed && !walked_first {
             self.catalog_reads(query, &effects.pre);
         }
         self.catalog_reads_done(effects, result.is_ok());

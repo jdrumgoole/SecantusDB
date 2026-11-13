@@ -3337,6 +3337,17 @@ pub(crate) fn changes_catalogs(sql: &str) -> bool {
     .any(|word| first.eq_ignore_ascii_case(word))
 }
 
+/// Whether a statement may read the scan counters (`pg_stat_*` and
+/// `pg_statio_*` views, `pg_stat_get_*` functions). PostgreSQL makes a
+/// statement's parse and plan catalog reads before it executes, and its
+/// counters are read live, so such a statement's answer includes its own
+/// catalog reads (RP-909): it is walked before it runs, not after.
+pub(crate) fn reads_counters(sql: &str) -> bool {
+    sql.as_bytes()
+        .windows(7)
+        .any(|w| w.eq_ignore_ascii_case(b"pg_stat"))
+}
+
 impl PgHandler {
     fn catcache_counter(&self) -> Counter {
         Counter::new(
@@ -3411,6 +3422,8 @@ impl PgHandler {
     /// catalog facts are read in the session's state as the statement left
     /// it, never ahead of what the statement itself sets up (a catalog read
     /// before the statement ran once cached rows it then answered from).
+    /// A statement that reads the counters is walked before it runs
+    /// ([`reads_counters`]).
     pub(crate) fn catalog_reads(&self, sql: &str, pre: &[Rel]) {
         let (store, pid) = self.catcache_ids();
         // A statement this long is not parsed a second time to be walked:
@@ -3820,6 +3833,19 @@ mod tests {
         assert_eq!(literal_shape("select E'x'"), None);
         // A reg* literal is a name the input function looks up.
         assert_eq!(literal_shape("select 'pg_class'::regclass::oid"), None);
+    }
+
+    #[test]
+    fn a_statement_naming_a_statistics_view_reads_the_counters() {
+        assert!(reads_counters(
+            "SELECT idx_scan FROM pg_catalog.PG_STAT_xact_sys_tables"
+        ));
+        assert!(reads_counters("select pg_stat_get_numscans(1259)"));
+        assert!(reads_counters(
+            "select heap_blks_read from pg_statio_sys_tables"
+        ));
+        assert!(!reads_counters("SELECT attname FROM pg_attribute"));
+        assert!(!reads_counters("pg_sta"));
     }
 
     #[test]

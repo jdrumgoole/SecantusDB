@@ -951,3 +951,61 @@ fn a_failed_comment_read_is_an_error_not_a_null() {
     });
     server.stop();
 }
+
+/// A comment recorded under an index's NAME, as the server kept index
+/// comments before it keyed them by oid (RP-923), is still read, and a
+/// rename moves it to the oid key rather than leaving it behind.
+#[test]
+fn an_index_comment_recorded_under_its_name_survives_a_rename() {
+    let dir = TempDir::new().expect("tempdir");
+    let rt = Runtime::new().expect("runtime");
+    let mut server = start(dir.path());
+    run(
+        &rt,
+        &server,
+        &[
+            "CREATE TABLE lg (id int PRIMARY KEY, v int)",
+            "CREATE INDEX lg_v ON lg (v)",
+        ],
+    );
+    server.stop();
+    drop(server);
+    {
+        let storage =
+            Storage::open(dir.path().to_str().expect("utf-8 home")).expect("open storage");
+        let legacy = bson::doc! {"_id": "lg_v", "comment": "by name"};
+        storage
+            .insert_one(
+                "postgres",
+                "__sql_index_comments__",
+                &bson::to_vec(&legacy).expect("encode"),
+            )
+            .expect("record the comment under the name");
+        storage.close().expect("close storage");
+    }
+    let mut server = start(dir.path());
+    let comment_of = |name: &'static str| {
+        let dsn = server.dsn();
+        rt.block_on(async move {
+            let (client, connection) = tokio_postgres::connect(&dsn, tokio_postgres::NoTls)
+                .await
+                .expect("connect");
+            let handle = tokio::spawn(async move {
+                let _ = connection.await;
+            });
+            let sql = format!("SELECT obj_description('{name}'::regclass, 'pg_class')");
+            let row = client.query_one(sql.as_str(), &[]).await.expect("comment");
+            let comment: Option<String> = row.get(0);
+            drop(client);
+            let _ = handle.await;
+            comment
+        })
+    };
+    assert_eq!(comment_of("lg_v").as_deref(), Some("by name"));
+    run(&rt, &server, &["ALTER INDEX lg_v RENAME TO lg_v2"]);
+    assert_eq!(comment_of("lg_v2").as_deref(), Some("by name"));
+    // The name key is gone: a new index of the old name has no comment.
+    run(&rt, &server, &["CREATE INDEX lg_v ON lg (id)"]);
+    assert_eq!(comment_of("lg_v"), None);
+    server.stop();
+}

@@ -1738,17 +1738,16 @@ def test_an_equality_with_other_quals_is_one_index_scan(home: Path) -> None:
     scan. The catalog-read walk visited an AND's arms as select-list
     expressions, so the equality beside them was no restriction and the read
     was modelled as a sequential scan, which built every `pg_attribute` row
-    to count them (RP-909, RP-715). Measured in a warm backend, as the
-    change over a second run: a fresh backend's first read counts more
-    (RP-909)."""
+    to count them (RP-909, RP-715). Measured on a fresh backend, as the
+    change over a second run; the first read of the statistics view walked
+    its own parse and plan reads after it answered, so they showed in the
+    next read as more index scans (RP-909)."""
     scans = (
         "SELECT seq_scan, idx_scan FROM pg_catalog.pg_stat_xact_sys_tables "
         "WHERE relname = 'pg_attribute'"
     )
     with _Server(home) as server, server.connect() as conn:
         conn.autocommit = False
-        conn.execute(_ONE_RELATIONS_ATTRIBUTES[0]).fetchall()
-        conn.execute(scans).fetchone()
         for query in _ONE_RELATIONS_ATTRIBUTES:
             conn.execute(query).fetchall()
             before = conn.execute(scans).fetchone()
@@ -16178,8 +16177,8 @@ def test_the_index_relations_follow_every_index_change(home: Path) -> None:
         b.execute("COMMENT ON INDEX mx_v IS 'by v'")
         assert _fetch(a, indexes) == [("mx_pkey", "mx_pkey", None), ("mx_v", "mx_v", "by v")]
         b.execute("ALTER INDEX mx_v RENAME TO mx_v2")
-        # The comment does not follow the rename yet (RP-923).
-        assert [r[:2] for r in _fetch(a, indexes)] == [("mx_pkey", "mx_pkey"), ("mx_v2", "mx_v2")]
+        # The comment follows the rename, keyed by the index's oid (RP-923).
+        assert _fetch(a, indexes) == [("mx_pkey", "mx_pkey", None), ("mx_v2", "mx_v2", "by v")]
         assert _fetch(a, "SELECT to_regclass('mx_v')::text") == [(None,)]
         a.execute("BEGIN")
         a.execute("CREATE INDEX mx_w ON mx (w)")
