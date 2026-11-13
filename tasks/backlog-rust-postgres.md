@@ -1570,13 +1570,40 @@ a regression test.
       subcommand, a new TOAST table and the role caches a non-superuser's
       permission checks read stop its walk, and a view that depends on a
       dropped column is not seen: its pg_depend rows count as none), the rule
-      queries of system views (`pg_stat_*`), psql's `\d` pattern query
-      (regex prefix as an index condition, `pg_table_is_visible` per row,
-      `get_actual_variable_range`), subqueries, CTEs, windows, PL/pgSQL
-      bodies, and texts over 64 KiB. Measured: `\d` 91 counters match, 29
-      differ; a `pg_stat_*` view 53 match, 61 differ.
+      queries of system views (`pg_stat_*`), the join in psql's `\d`
+      pattern query (`mergejoinscansel`'s operators and its
+      `get_actual_variable_range` probes of a histogram's ends; the nested
+      loop's whole-row scans, whose columns' types the executor looks up,
+      and its inner-unique scan stopping at the first match -- both follow
+      from PostgreSQL's choice of join method, which the walk does not
+      cost), a pattern whose fixed prefix is not all of it (`^(rpc.*)$`,
+      `LIKE 'rpc_t'`: the range conditions and their estimates), ILIKE and
+      `~*`, subqueries, CTEs, windows, PL/pgSQL bodies, and texts over 64
+      KiB. A pattern whose fixed prefix is all of it becoming the index's
+      equality, `COLLATE`'s lookups and `pg_table_is_visible` on the rows a
+      scan returns are walked since 2026-11-13 (regression tests
+      `tests/backlog/test_rp_catalog_reads.py::test_gap[a pattern's exact
+      match is an index condition]` and `::test_gap[psql's pattern on one
+      relation]`). Measured 2026-11-13: `\d rpc_t`'s first query 34
+      counters match, 5 differ (10 of its statement's 24 differed before);
+      a `pg_stat_*` view 16 match, 22 differ.
       Backlog-ID: RP-290
       Verify: tests/backlog/test_rp_catalog_reads.py::test_gap[a statistics view], tests/backlog/test_rp_catalog_reads.py::test_gap[psql's describe query]
+- [ ] **An ORDER BY an index scan already returns in order is counted as
+      sorted, and the index's pathkeys are not read.** With query pathkeys
+      (an ORDER BY, a GROUP BY, a join), PostgreSQL 15.19 makes each
+      B-tree's leading key a pathkey (`build_index_pathkeys`: the key's
+      family's equality operator, an AMOPSTRATEGY search, and that
+      operator's merge-join families), going on to the next key when an
+      equality fixes the column; and when the index scan it chooses returns
+      the rows in the ORDER BY's order it puts no Sort over it, so the
+      executor never looks up the sort support function. On `SELECT c.oid
+      FROM pg_class c WHERE c.relname = 'rpc_t' ORDER BY c.relname` this
+      server counts the Sort's `pg_amproc` lookup; ordered by
+      `relnamespace` it also misses `oid_ops`' equality (2026-11-13, found
+      while working RP-290).
+      Verify: tests/backlog/test_rp_catalog_reads.py::test_gap[an ORDER BY an index gives]
+      Backlog-ID: RP-934
 - [ ] **A catalog row added after `initdb` counts no heap block** in
       `pg_statio_sys_tables`. A catalog scan counts its index pages
       (`catalog_btree.rs`, from `pg15_catalog_indexes.txt`) and, since

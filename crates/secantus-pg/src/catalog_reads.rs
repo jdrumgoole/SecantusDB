@@ -86,7 +86,14 @@ pub(crate) struct Index {
     pub classes: Vec<i64>,
     pub am: i64,
     pub in_init_file: bool,
+    /// `indisunique`.
+    pub unique: bool,
 }
+
+/// An index condition: its operator, its input collation, and the
+/// operator of the restriction it came from (a pattern's, for the equality
+/// its fixed prefix becomes).
+type IndexCond = (i64, i64, i64);
 
 /// `typcache.c`'s `TCFLAGS_CHECKED_*` flags, and what a caller asks for.
 const TC_BTREE: u32 = 1;
@@ -116,6 +123,8 @@ const DEFAULT_TABLESPACE: i64 = 1663;
 const EVENT_TRIGGER: i64 = 3466;
 const EVENT_TRIGGER_NAME_INDEX: i64 = 3467;
 const RELATION_RELATION: i64 = 1259;
+/// `pg_table_is_visible`.
+const TABLE_IS_VISIBLE: i64 = 2079;
 const ATTRIBUTE_RELATION: i64 = 1249;
 const DEPEND_RELATION: i64 = 2608;
 const DEPEND_DEPENDER_INDEX: i64 = 2673;
@@ -161,6 +170,13 @@ struct Needs {
     saops: Vec<(i64, i64)>,
     /// Columns in join clauses.
     joins: Vec<i64>,
+    /// A restriction's explicit collation (`COLLATE`): `(attnum, operator,
+    /// collation)`. Without one, the column's own.
+    colls: Vec<(i64, i64, i64)>,
+    /// A pattern-match restriction's pattern: `(attnum, operator, text)`.
+    patterns: Vec<(i64, i64, String)>,
+    /// `pg_table_is_visible(oid)` of this relation's rows is a restriction.
+    visible: bool,
 }
 
 /// [`Model::facts`]' memo: `(session, catalog version, invalidation
@@ -224,6 +240,14 @@ const COERCION_EXPLICIT: u8 = 2;
 
 fn node(n: &Option<Box<pb::Node>>) -> Option<&N> {
     n.as_ref().and_then(|b| b.node.as_ref())
+}
+
+/// The expression under a `COLLATE`.
+fn uncollate(n: &Option<Box<pb::Node>>) -> &Option<Box<pb::Node>> {
+    match node(n) {
+        Some(N::CollateClause(c)) => &c.arg,
+        _ => n,
+    }
 }
 
 impl<'a> Model<'a> {
@@ -456,6 +480,56 @@ impl<'a> Model<'a> {
         oid
     }
 
+    /// `get_collation_oid`: in the named schema or along the path, each
+    /// schema's `lookup_collation` -- the database encoding's row, then the
+    /// row for any encoding.
+    fn lookup_collation(&mut self, names: &[String]) -> Option<i64> {
+        let (spaces, name) = match names {
+            [n] => (self.active_path(), n.clone()),
+            [s, n] => (vec![self.explicit_namespace(s)?], n.clone()),
+            _ => return None,
+        };
+        for nsp in spaces {
+            for enc in [DATABASE_ENCODING, -1] {
+                let found = self.h.cr_collation(&name, enc, nsp);
+                let key = vec![K::N(name.clone()), K::O(enc), K::O(nsp)];
+                self.search(Cache::CollNameEncNsp, key, |_| found.is_some());
+                if found.is_some() {
+                    return found;
+                }
+            }
+        }
+        None
+    }
+
+    /// The collation a `COLLATE` names, read without counting: the walk of
+    /// the clause counted its lookups.
+    fn collation_oid(&self, names: &[String]) -> Option<i64> {
+        let (spaces, name) = match names {
+            [n] => {
+                let mut v = Vec::new();
+                let elems = self.path_elements();
+                if !elems.iter().any(|e| e == "pg_catalog") {
+                    v.push(PG_CATALOG);
+                }
+                for e in elems {
+                    let n = if e == "$user" { self.user.clone() } else { e };
+                    if let Some(o) = self.h.cr_namespace_oid(&n) {
+                        v.push(o);
+                    }
+                }
+                (v, n)
+            }
+            [s, n] => (vec![self.h.cr_namespace_oid(s)?], n),
+            _ => return None,
+        };
+        spaces.into_iter().find_map(|nsp| {
+            self.h
+                .cr_collation(name, DATABASE_ENCODING, nsp)
+                .or_else(|| self.h.cr_collation(name, -1, nsp))
+        })
+    }
+
     /// `RangeVarGetRelidExtended`: the relation along the path (or in its
     /// schema), then its descriptor.
     fn range_var(&mut self, rv: &pb::RangeVar) -> Option<Rel> {
@@ -628,7 +702,7 @@ impl<'a> Model<'a> {
             }
         }
         self.statext_list(rel);
-        let needs = self.needs.get(&rel.oid).cloned().unwrap_or_default();
+        let mut needs = self.needs.get(&rel.oid).cloned().unwrap_or_default();
         if matches!(rel.kind, 'r' | 'm' | 't') {
             // `table_block_relation_estimate_size`: a table never measured
             // has its density from every column's width.
@@ -647,11 +721,40 @@ impl<'a> Model<'a> {
                 self.search(Cache::TableSpaceOid, vec![K::O(spc)], |_| true);
             }
         }
+        // A pattern whose fixed prefix is the whole of it (`^(name)$`, a
+        // LIKE without wildcards) matches as its equality operator does:
+        // `(attnum, operator, the string, the equality)`.
+        let mut exact: Vec<(i64, i64, String, i64)> = Vec::new();
+        for (att, opr, text) in needs.patterns.clone() {
+            let Some(op) = pattern_operator(opr) else {
+                continue;
+            };
+            let left = self.h.cr_operator(opr).map_or(0, |o| o.left);
+            if let (Prefix::Exact(p), Some(eq)) = (fixed_prefix(op, &text), pattern_equality(left))
+            {
+                if eq != 1955 {
+                    needs.eq_consts.push((att, Bson::String(p.clone())));
+                }
+                exact.push((att, opr, p, eq));
+            }
+        }
         // The restrictions: `clause_selectivity` reads each column's
         // statistics; an equality is checked for merge joins.
         for (att, opr, _) in &needs.quals {
             self.statistic(rel, *att);
             self.mergejoinable(*opr);
+        }
+        // `patternsel_common` estimates an exact match as `var_eq_const`
+        // with the equality, whose function it looks up when the column has
+        // statistics and no unique index of its own.
+        for (att, _, _, eq) in &exact {
+            let unique = rel
+                .indexes
+                .iter()
+                .any(|ix| ix.unique && ix.keys.as_slice() == [*att]);
+            if rel.stats.contains(att) && !unique {
+                self.oper_oid(*eq);
+            }
         }
         for (att, elem) in &needs.saops {
             // `scalararraysel`: is it the type's equality?
@@ -670,29 +773,70 @@ impl<'a> Model<'a> {
         // Index paths: an index whose leading column a restriction matches
         // is costed (`btcostestimate` reads the correlation through the
         // ordering operator when the column has statistics); an index
-        // holding every column read gives an index-only scan.
-        let mut used: Option<(Index, bool)> = None;
+        // holding every column read gives an index-only scan. `used` holds
+        // the scan's index and the operators of its conditions.
+        let mut used: Option<(Index, bool, Vec<IndexCond>)> = None;
         for ix in &rel.indexes {
             let Some(lead) = ix.keys.first().copied() else {
                 continue;
             };
-            // `match_clause_to_indexcol`: `op_in_opfamily`, an AMOPOPID
-            // search for the operator's membership in the column's family.
             let class = ix.classes.first().copied().unwrap_or(0);
             let family = self.h.cr_opclass(class).map_or(0, |o| o.family);
-            let mut matches = false;
-            for (a, opr, _) in needs.quals.clone() {
+            let lead_type = rel.columns.iter().find(|c| c.0 == lead).map_or(0, |c| c.2);
+            let index_coll = type_collation(self.h.cr_base_type(lead_type));
+            let mut ops = Vec::new();
+            for (a, opr, konst) in needs.quals.clone() {
                 if a != lead {
                     continue;
                 }
-                let member = self.op_in_family(opr, class);
-                self.search(
-                    Cache::AmopOpid,
-                    vec![K::O(opr), K::N("s".to_string()), K::O(family)],
-                    |_| member,
-                );
-                matches |= member;
+                let expr_coll = needs
+                    .colls
+                    .iter()
+                    .find(|(x, o, _)| *x == a && *o == opr)
+                    .map_or(index_coll, |c| c.2);
+                // `match_opclause_to_indexcol`: with the index's collation
+                // (`IndexCollMatchesExprColl`), `op_in_opfamily`, an
+                // AMOPOPID search for the operator's membership in the
+                // column's family.
+                if index_coll == 0 || index_coll == expr_coll {
+                    let member = self.op_in_family(opr, class);
+                    self.search(
+                        Cache::AmopOpid,
+                        vec![K::O(opr), K::N("s".to_string()), K::O(family)],
+                        |_| member,
+                    );
+                    if member {
+                        ops.push((opr, expr_coll, opr));
+                        continue;
+                    }
+                }
+                // Otherwise `get_index_clause_from_support`: a pattern
+                // operator's `match_pattern_prefix` asks whether the
+                // collation is deterministic, then makes an exact match
+                // the family's equality.
+                if !konst || pattern_operator(opr).is_none() {
+                    continue;
+                }
+                if expr_coll != 0 {
+                    self.search(Cache::CollOid, vec![K::O(expr_coll)], |_| true);
+                }
+                if let Some(eq) = exact.iter().find(|e| e.0 == a && e.1 == opr).map(|e| e.3) {
+                    let member = self.op_in_family(eq, class);
+                    self.search(
+                        Cache::AmopOpid,
+                        vec![K::O(eq), K::N("s".to_string()), K::O(family)],
+                        |_| member,
+                    );
+                    if member {
+                        // `btcostestimate`'s selectivity of the derived
+                        // condition: its estimator (`get_oprrest`). The
+                        // condition takes the index's collation.
+                        self.oper_oid(eq);
+                        ops.push((eq, index_coll, opr));
+                    }
+                }
             }
+            let matches = !ops.is_empty();
             // `build_index_paths` also costs a B-tree no clause matches when
             // it can return every column the query reads
             // (`check_index_only`): a `count(*)` reads none.
@@ -718,12 +862,88 @@ impl<'a> Model<'a> {
                 continue;
             }
             if used.is_none() {
-                used = Some((ix.clone(), covering));
+                used = Some((ix.clone(), covering, ops));
+            }
+        }
+        // `_bt_first`: a scan key whose operator compares the column with
+        // another type finds the family's cross-type comparison proc
+        // (AMPROCNUM); the same type's is in the index's descriptor.
+        if let Some((ix, _, ops)) = &used {
+            if ix.am == BTREE_AM {
+                if let Some(o) = ix.classes.first().and_then(|c| self.h.cr_opclass(*c)) {
+                    for (opr, _, _) in ops.clone() {
+                        let right = self.h.cr_operator(opr).map_or(o.intype, |f| f.right);
+                        if right != o.intype {
+                            self.opfamily_proc(o.family, o.intype, right, 1);
+                        }
+                    }
+                }
+            }
+        }
+        // `create_indexscan_plan`: a restriction the index conditions do
+        // not enforce exactly (a pattern's condition is lossy) stays a
+        // filter unless `predicate_implied_by` proves it from them;
+        // `operator_predicate_proof`, for the same column against a
+        // constant on each side under one collation, asks
+        // `lookup_proof_cache` for the operators' B-tree meanings.
+        if let Some((ix, _, ops)) = used.clone() {
+            let lead = ix.keys.first().copied().unwrap_or(0);
+            for (a, opr, konst) in needs.quals.clone() {
+                if a != lead || !konst || ops.iter().any(|(o, _, src)| *o == opr && *src == opr) {
+                    continue;
+                }
+                let typ = rel.columns.iter().find(|c| c.0 == a).map_or(0, |c| c.2);
+                let coll = needs
+                    .colls
+                    .iter()
+                    .find(|(x, o, _)| *x == a && *o == opr)
+                    .map_or_else(|| type_collation(self.h.cr_base_type(typ)), |c| c.2);
+                for (clause_op, clause_coll, _) in &ops {
+                    if *clause_coll == coll && self.op_btree_interpretation(*clause_op) {
+                        self.op_btree_interpretation(opr);
+                    }
+                }
+            }
+        }
+        // `pg_table_is_visible` on each row the scan's other quals pass
+        // (`order_qual_clauses` puts the function, cost 10, after them):
+        // the row by oid, then `RelationIsVisible`'s search for its name
+        // in each schema before its own on the path. Walked only when
+        // every other qual is an equality the rows can be matched to.
+        if needs.visible && rel.oid == RELATION_RELATION && needs.saops.is_empty() {
+            let evaluable = needs.quals.iter().all(|(a, o, _)| {
+                needs.eq_consts.iter().any(|(x, _)| x == a)
+                    && (self.h.cr_operator(*o).is_some_and(|f| f.name == "=")
+                        || exact.iter().any(|e| e.0 == *a && e.1 == *o))
+            });
+            if evaluable {
+                let ix = used.as_ref().map(|u| u.0.clone());
+                let rows = self.h.cr_class_rows(rel, ix.as_ref(), &needs.eq_consts);
+                let path = self.active_path();
+                let by_name = catalog_index(2663);
+                for (oid, name, nsp) in rows {
+                    self.search(Cache::RelOid, vec![K::O(oid)], |_| true);
+                    if nsp != PG_CATALOG && !path.contains(&nsp) {
+                        continue;
+                    }
+                    for p in &path {
+                        if *p == nsp {
+                            break;
+                        }
+                        let eq = [(2, Bson::String(name.clone())), (3, Bson::Int64(*p))];
+                        let other = !self.h.cr_class_rows(rel, by_name.as_ref(), &eq).is_empty();
+                        let key = vec![K::N(name.clone()), K::O(*p)];
+                        self.search(Cache::RelNameNsp, key, |_| other);
+                        if other {
+                            break;
+                        }
+                    }
+                }
             }
         }
         // The executor's index-only scan builds its tuple from the index's
         // columns' types.
-        if let Some((ix, true)) = &used {
+        if let Some((ix, true, _)) = &used {
             for k in ix.keys.clone() {
                 if let Some((_, _, t)) = rel.columns.iter().find(|c| c.0 == k).cloned() {
                     self.type_oid(t);
@@ -734,7 +954,7 @@ impl<'a> Model<'a> {
         if rel.catalog && matches!(rel.kind, 'r') {
             let scan =
                 match &used {
-                    Some((ix, _)) => {
+                    Some((ix, _, _)) => {
                         let n = self.h.cr_catalog_matches(rel, ix, &needs.eq_consts);
                         // The equalities on the index's leading columns are the
                         // scan's key.
@@ -806,6 +1026,29 @@ impl<'a> Model<'a> {
             .unwrap_or_default();
         self.be
             .search_list(&self.ct, Cache::AmopOpid, vec![K::O(opr)], || members);
+    }
+
+    /// `get_op_btree_interpretation`: the operator's B-tree families from
+    /// its AMOPOPID list, or, with none, its negator's (`get_negator`)
+    /// where that is a B-tree equality. Whether it found any.
+    fn op_btree_interpretation(&mut self, opr: i64) -> bool {
+        let btree = |o: i64, eq_only: bool| {
+            builtin().amop_rows.get(&o).is_some_and(|v| {
+                v.iter()
+                    .any(|r| r.method == BTREE_AM && (!eq_only || r.strategy == 3))
+            })
+        };
+        self.amop_list(opr);
+        if btree(opr, false) {
+            return true;
+        }
+        self.oper_oid(opr);
+        let neg = self.h.cr_operator(opr).map_or(0, |o| o.negate);
+        if neg == 0 {
+            return false;
+        }
+        self.amop_list(neg);
+        btree(neg, true)
     }
 
     /// `get_opfamily_member`: AMOPSTRATEGY.
@@ -1796,7 +2039,16 @@ impl<'a> Model<'a> {
                 BOOL
             }
             N::FuncCall(f) => self.func_call(f, scope, in_target),
-            N::CollateClause(c) => node(&c.arg).map_or(UNKNOWN, |a| self.expr(a, scope, in_target)),
+            N::CollateClause(c) => {
+                let t = node(&c.arg).map_or(UNKNOWN, |a| self.expr(a, scope, in_target));
+                // `transformCollateClause`: `type_is_collatable` reads the
+                // argument's type (an unknown literal's too), then
+                // `LookupCollation` the collation's name.
+                self.ptype(t);
+                let names = names_of(&c.collname);
+                self.parser(|m| m.lookup_collation(&names));
+                t
+            }
             _ => UNKNOWN,
         }
     }
@@ -1971,8 +2223,17 @@ impl<'a> Model<'a> {
     }
 
     fn note_restriction(&mut self, a: &pb::AExpr, scope: &Scope, opr: i64) {
+        // A side's explicit collation (`COLLATE`), which the operator's
+        // input collation takes (`assign_collations_walker`).
+        let coll = [&a.lexpr, &a.rexpr]
+            .into_iter()
+            .find_map(|e| match node(e) {
+                Some(N::CollateClause(c)) => Some(names_of(&c.collname)),
+                _ => None,
+            })
+            .and_then(|names| self.collation_oid(&names));
         let col = |e: &Option<Box<pb::Node>>| -> Option<(i64, i64)> {
-            let N::ColumnRef(c) = node(e)? else {
+            let N::ColumnRef(c) = node(uncollate(e))? else {
                 return None;
             };
             let names = names_of(&c.fields);
@@ -1988,7 +2249,7 @@ impl<'a> Model<'a> {
             })
         };
         let konst = |e: &Option<Box<pb::Node>>| -> Option<Bson> {
-            match node(e)? {
+            match node(uncollate(e))? {
                 N::AConst(c) => match &c.val {
                     Some(pb::a_const::Val::Ival(i)) => Some(Bson::Int64(i64::from(i.ival))),
                     Some(pb::a_const::Val::Sval(s)) => Some(Bson::String(s.sval.clone())),
@@ -2037,6 +2298,12 @@ impl<'a> Model<'a> {
             let n = self.needs.entry(rel).or_default();
             n.quals.push((att, opr, value.is_some()));
             n.all.insert(att);
+            if let Some(c) = coll {
+                n.colls.push((att, opr, c));
+            }
+            if let (Some(_), Some(Bson::String(p))) = (pattern_operator(opr), &value) {
+                n.patterns.push((att, opr, p.clone()));
+            }
             let is_eq = self.h.cr_operator(opr).is_some_and(|o| o.name == "=");
             if let (true, Some(v)) = (is_eq, value) {
                 n.eq_consts.push((att, v));
@@ -2221,6 +2488,24 @@ impl<'a> Model<'a> {
             self.coerce(*a, *d, COERCION_IMPLICIT);
         }
         self.ptype(p.ret);
+        // `pg_table_is_visible(c.oid)` restricting a scan of `pg_class`:
+        // the executor calls it on each row the scan's other quals pass.
+        if !in_target && p.oid == TABLE_IS_VISIBLE {
+            if let [arg] = f.args.as_slice() {
+                if let Some(N::ColumnRef(c)) = arg.node.as_ref() {
+                    let names = names_of(&c.fields);
+                    let rel = scope
+                        .rels
+                        .iter()
+                        .find(|(alias, _)| names.len() < 2 || names[names.len() - 2] == *alias);
+                    if let (Some("oid"), Some((_, rel))) = (names.last().map(String::as_str), rel) {
+                        if rel.oid == RELATION_RELATION {
+                            self.needs.entry(rel.oid).or_default().visible = true;
+                        }
+                    }
+                }
+            }
+        }
         // A SQL function's body is parsed when the planner inlines it, or
         // when the executor first calls it.
         let body = if self.active_fns.contains(&p.oid) || self.active_fns.len() > 16 {
@@ -2797,6 +3082,165 @@ fn self_coercible(input: &[i64], target: &[i64]) -> bool {
         .all(|(i, t)| i == t || cf::is_polymorphic(*t) || *t == cf::ANY)
 }
 
+/// `C_COLLATION_OID` and `DEFAULT_COLLATION_OID`.
+const C_COLLATION: i64 = 950;
+const DEFAULT_COLLATION: i64 = 100;
+/// The database encoding (`GetDatabaseEncoding`): UTF8.
+const DATABASE_ENCODING: i64 = 6;
+
+/// `typcollation` of a base type: `name` sorts by "C", the string types by
+/// the database's default, every other type has none.
+fn type_collation(base: i64) -> i64 {
+    match base {
+        19 => C_COLLATION,
+        25 | 1042 | 1043 => DEFAULT_COLLATION,
+        _ => 0,
+    }
+}
+
+/// A pattern-match operator whose function has `like_regex_support`
+/// (`like_support.c`): the case-sensitive LIKE and regular-expression
+/// operators, whose fixed prefix the model reads, and the others.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PatternOp {
+    Like,
+    Regex,
+    /// ILIKE, `~*` and `^@`: their prefixes are not walked.
+    Other,
+}
+
+fn pattern_operator(opr: i64) -> Option<PatternOp> {
+    match opr {
+        1207 | 1209 | 1211 | 2016 => Some(PatternOp::Like),
+        639 | 641 | 1055 => Some(PatternOp::Regex),
+        1226 | 1228 | 1234 | 1625 | 1627 | 1629 | 3877 => Some(PatternOp::Other),
+        _ => None,
+    }
+}
+
+/// `Pattern_Prefix_Status`, with the exact match's string.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Prefix {
+    None,
+    Partial,
+    Exact(String),
+}
+
+/// `pattern_fixed_prefix`: `like_fixed_prefix` for LIKE, and for a regular
+/// expression what `pg_regprefix` finds in the anchored literal patterns
+/// clients write (`^(name)$`, `^name`); a pattern of any other shape is
+/// taken to have no fixed prefix.
+fn fixed_prefix(op: PatternOp, patt: &str) -> Prefix {
+    match op {
+        PatternOp::Like => {
+            let b = patt.as_bytes();
+            let mut out = Vec::new();
+            let mut pos = 0;
+            while pos < b.len() {
+                if b[pos] == b'%' || b[pos] == b'_' {
+                    break;
+                }
+                if b[pos] == b'\\' {
+                    pos += 1;
+                    if pos >= b.len() {
+                        break;
+                    }
+                }
+                out.push(b[pos]);
+                pos += 1;
+            }
+            if pos == b.len() {
+                Prefix::Exact(String::from_utf8_lossy(&out).into_owned())
+            } else if !out.is_empty() {
+                Prefix::Partial
+            } else {
+                Prefix::None
+            }
+        }
+        PatternOp::Regex => regex_prefix(patt),
+        PatternOp::Other => Prefix::None,
+    }
+}
+
+fn regex_prefix(patt: &str) -> Prefix {
+    let Some(mut body) = patt.strip_prefix('^') else {
+        return Prefix::None;
+    };
+    let anchored = body.ends_with('$') && !body.ends_with("\\$");
+    if anchored {
+        body = &body[..body.len() - 1];
+    }
+    // A group around the whole of it.
+    while body.starts_with('(') && !body.starts_with("(?") && body.ends_with(')') {
+        let inner = &body[1..body.len() - 1];
+        let mut depth = 0i32;
+        let balanced = inner.chars().all(|c| {
+            match c {
+                '(' => depth += 1,
+                ')' => depth -= 1,
+                _ => {}
+            }
+            depth >= 0
+        }) && depth == 0;
+        if !balanced {
+            break;
+        }
+        body = inner;
+    }
+    // An alternation at the top: no prefix all branches share is taken.
+    let mut depth = 0i32;
+    let mut escaped = false;
+    for c in body.chars() {
+        match (escaped, c) {
+            (true, _) => escaped = false,
+            (false, '\\') => escaped = true,
+            (false, '(') => depth += 1,
+            (false, ')') => depth -= 1,
+            (false, '|') if depth == 0 => return Prefix::None,
+            _ => {}
+        }
+    }
+    let mut out = String::new();
+    let mut chars = body.chars().peekable();
+    let mut whole = true;
+    while let Some(c) = chars.next() {
+        let lit = match c {
+            '\\' => match chars.peek() {
+                Some(n) if !n.is_ascii_alphanumeric() => chars.next(),
+                _ => None,
+            },
+            '^' | '$' | '.' | '[' | ']' | '(' | ')' | '|' | '*' | '+' | '?' | '{' | '}' => None,
+            c => Some(c),
+        };
+        match lit {
+            Some(l) => out.push(l),
+            None => {
+                whole = false;
+                break;
+            }
+        }
+    }
+    if whole && anchored && !out.is_empty() {
+        Prefix::Exact(out)
+    } else if !out.is_empty() {
+        Prefix::Partial
+    } else {
+        Prefix::None
+    }
+}
+
+/// `match_pattern_prefix` / `patternsel_common`: the equality operator an
+/// exact match becomes, by the pattern's left type.
+fn pattern_equality(left: i64) -> Option<i64> {
+    match left {
+        19 => Some(254),
+        25 => Some(98),
+        1042 => Some(1054),
+        17 => Some(1955),
+        _ => None,
+    }
+}
+
 /// A catalog index as the model reads it.
 fn catalog_index(oid: i64) -> Option<Index> {
     let ix = builtin().indexes.get(&oid)?;
@@ -2808,6 +3252,7 @@ fn catalog_index(oid: i64) -> Option<Index> {
         classes: ix.classes.clone(),
         am: rel.relam,
         in_init_file: rel.in_init_file,
+        unique: ix.unique,
     })
 }
 
@@ -3006,6 +3451,7 @@ impl PgHandler {
                         classes,
                         am: BTREE_AM,
                         in_init_file: false,
+                        unique: ix.unique,
                     }
                 })
                 .collect();
@@ -3251,6 +3697,82 @@ impl PgHandler {
         rows.iter()
             .filter(|r| r.get(&f).and_then(crate::bson_i64) == Some(rel))
             .count() as i64
+    }
+
+    /// The `pg_collation` row of a name, encoding and schema: its oid.
+    pub(crate) fn cr_collation(&self, name: &str, encoding: i64, nsp: i64) -> Option<i64> {
+        let def = Self::virtual_table("pg_collation")?;
+        let rows = self.virtual_rows_for("pg_collation")?;
+        let f = |c: &str| def.field_of(c).unwrap_or_default();
+        let (fname, fenc, fnsp, foid) = (
+            f("collname"),
+            f("collencoding"),
+            f("collnamespace"),
+            f("oid"),
+        );
+        let found = rows.iter().find_map(|r| {
+            let hit = r.get_str(&fname).ok() == Some(name)
+                && r.get(&fenc).and_then(crate::bson_i64) == Some(encoding)
+                && r.get(&fnsp).and_then(crate::bson_i64) == Some(nsp);
+            hit.then(|| r.get(&foid).and_then(crate::bson_i64))
+                .flatten()
+        });
+        found
+    }
+
+    /// The rows of `pg_class` an index scan's equalities on the index's
+    /// leading columns return (every row without an index): `(oid, relname,
+    /// relnamespace)`.
+    pub(crate) fn cr_class_rows(
+        &self,
+        rel: &Rel,
+        ix: Option<&Index>,
+        eq: &[(i64, Bson)],
+    ) -> Vec<(i64, String, i64)> {
+        let Some(def) = self.catalog_def(&rel.name) else {
+            return Vec::new();
+        };
+        let f = |c: &str| def.field_of(c).unwrap_or_default();
+        let conds: Vec<(String, Bson)> = eq
+            .iter()
+            .filter_map(|(a, v)| {
+                let col = rel.columns.iter().find(|c| c.0 == *a)?;
+                Some((f(&col.1), v.clone()))
+            })
+            .collect();
+        let pins: bson::Document = match ix {
+            Some(ix) => ix
+                .keys
+                .iter()
+                .map_while(|k| {
+                    let col = rel.columns.iter().find(|c| c.0 == *k)?;
+                    let (_, v) = eq.iter().find(|(a, _)| a == k)?;
+                    Some((f(&col.1), v.clone()))
+                })
+                .collect(),
+            None => bson::Document::new(),
+        };
+        let key = crate::catalog_key(&rel.name, &pins);
+        let Some(rows) = self.catalog_rows_keyed(&rel.name, key.as_ref()) else {
+            return Vec::new();
+        };
+        let (foid, fname, fnsp) = (f("oid"), f("relname"), f("relnamespace"));
+        rows.iter()
+            .filter(|r| {
+                conds.iter().all(|(f, v)| match (r.get(f), v) {
+                    (Some(Bson::String(a)), Bson::String(b)) => a == b,
+                    (Some(a), Bson::Int64(b)) => crate::bson_i64(a) == Some(*b),
+                    _ => false,
+                })
+            })
+            .filter_map(|r| {
+                Some((
+                    r.get(&foid).and_then(crate::bson_i64)?,
+                    r.get_str(&fname).ok()?.to_string(),
+                    r.get(&fnsp).and_then(crate::bson_i64)?,
+                ))
+            })
+            .collect()
     }
 
     /// How many rows a catalog holds: what a sequential scan returns.
@@ -3552,6 +4074,15 @@ fn literal_shape(sql: &str) -> Option<String> {
     if REG_TYPES.iter().any(|t| lower.contains(t)) {
         return None;
     }
+    // A pattern's literal decides whether its fixed prefix becomes an index
+    // condition (`match_pattern_prefix`), and so what the planner reads.
+    if sql.contains('~')
+        || sql.contains("^@")
+        || lower.contains("like")
+        || lower.contains("similar")
+    {
+        return None;
+    }
     if lower.contains("order by")
         || lower.contains("group by")
         || sql.contains('$')
@@ -3846,6 +4377,35 @@ mod tests {
         ));
         assert!(!reads_counters("SELECT attname FROM pg_attribute"));
         assert!(!reads_counters("pg_sta"));
+    }
+
+    #[test]
+    fn a_pattern_s_literal_has_no_shape() {
+        assert_eq!(literal_shape("select a from t where a ~ '^(x)$'"), None);
+        assert_eq!(literal_shape("select a from t where a like 'x'"), None);
+    }
+
+    #[test]
+    fn a_pattern_s_fixed_prefix_is_found_as_postgresql_finds_it() {
+        let exact = |s: &str| Prefix::Exact(s.to_string());
+        // `like_fixed_prefix`: `%` and `_` are wildcards, a backslash
+        // escapes, and a pattern without a wildcard is an exact match.
+        assert_eq!(fixed_prefix(PatternOp::Like, "pg\\_am"), exact("pg_am"));
+        assert_eq!(fixed_prefix(PatternOp::Like, "abc"), exact("abc"));
+        assert_eq!(fixed_prefix(PatternOp::Like, "rpc_t"), Prefix::Partial);
+        assert_eq!(fixed_prefix(PatternOp::Like, "%t"), Prefix::None);
+        // `pg_regprefix` on an anchored literal: whole, or a prefix.
+        assert_eq!(fixed_prefix(PatternOp::Regex, "^(rpc_t)$"), exact("rpc_t"));
+        assert_eq!(fixed_prefix(PatternOp::Regex, "^rpc_t$"), exact("rpc_t"));
+        assert_eq!(fixed_prefix(PatternOp::Regex, "^a\\.b$"), exact("a.b"));
+        assert_eq!(fixed_prefix(PatternOp::Regex, "^(rpc.*)$"), Prefix::Partial);
+        assert_eq!(fixed_prefix(PatternOp::Regex, "^rpc_t"), Prefix::Partial);
+        assert_eq!(fixed_prefix(PatternOp::Regex, "rpc_t"), Prefix::None);
+        assert_eq!(fixed_prefix(PatternOp::Regex, "^(a|b)$"), Prefix::None);
+        assert_eq!(fixed_prefix(PatternOp::Regex, "^((abc))$"), exact("abc"));
+        assert_eq!(fixed_prefix(PatternOp::Regex, "^ab+c$"), Prefix::Partial);
+        assert_eq!(fixed_prefix(PatternOp::Regex, "^ab\\$"), Prefix::Partial);
+        assert_eq!(fixed_prefix(PatternOp::Other, "^(x)$"), Prefix::None);
     }
 
     #[test]
