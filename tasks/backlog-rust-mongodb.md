@@ -962,14 +962,6 @@ These are explicit non-goals. Don't add them without a reason.
       reason. Found while working RM-378, 2026-11-09.
       Verify: tests/backlog/test_rm_slow_query_namespace.py::test_a_line_on_an_internal_database_names_its_kind
       Backlog-ID: RM-478
-- [ ] **A failed `renameCollection` is profiled.** mongod 8.2.1 profiles a
-      `renameCollection` that renamed in its source's database (`ns:
-      "<db>.c"`) and one that failed nowhere: its namespace is the
-      command's own `admin.$cmd`, and `admin` profiles no command. This
-      server profiles a failed one in the source's database as well (`ns:
-      "<db>.nope"`). Found while working RM-378, 2026-11-09.
-      Verify: tests/backlog/test_rm_slow_query_namespace.py::test_a_failed_rename_is_not_profiled
-      Backlog-ID: RM-479
 - [ ] **Renaming `<db>.system.views` is refused as a view.** mongod 8.2.1
       refuses it as a write to the namespace (20 IllegalOperation, "error
       with source namespace: cannot write to <db>.system.views"); this

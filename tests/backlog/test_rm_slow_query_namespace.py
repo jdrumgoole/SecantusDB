@@ -129,11 +129,11 @@ def test_a_line_on_an_internal_database_names_its_kind(rust_mongo: Any, mongod_r
     assert answers["rust"][0] == answers["mongod"][0]
 
 
-@pytest.mark.backlog("RM-479")
+@pytest.mark.backlog_fixed("RM-479")
 def test_a_failed_rename_is_not_profiled(rust_mongo: Any, mongod_rs: Any) -> None:
     """mongod 8.2.1 profiles a `renameCollection` that renamed in its
     source's database, and one that failed nowhere (its namespace is
-    `admin.$cmd`, and `admin` profiles no command); this server profiles a
+    `admin.$cmd`, and `admin` profiles no command); this server profiled a
     failed one in the source's database too."""
     answers = _both(_failed_renames, rust_mongo, mongod_rs, profiled=("admin",))
     assert answers["mongod"][1] == {"<db>": [], "admin": []}
