@@ -57,11 +57,12 @@ def test_psql_describe_collation_subquery(pg: Any) -> None:
     assert elapsed < BUDGET_SECONDS, f"{elapsed:.1f} s for one column"
 
 
-def _first_and_warm(pg: Any, prefix: str) -> tuple[float, float]:
-    """The fastest of three first runs of the collation query, each straight
-    after a `CREATE TABLE`, and the fastest of the warm runs after them."""
+def _first_and_warm(pg: Any, prefix: str, rounds: int = 3) -> tuple[float, float]:
+    """The fastest of `rounds` first runs of the collation query, each
+    straight after a `CREATE TABLE`, and the fastest of the warm runs after
+    them."""
     firsts, warms = [], []
-    for i in range(3):
+    for i in range(rounds):
         pg.execute(f'CREATE TABLE {prefix}_{i} (v text COLLATE "C")')
         query = COLLATION_QUERY.replace("'rp_cx'", f"'{prefix}_{i}'")
         start = time.monotonic()
@@ -146,17 +147,54 @@ def test_the_first_catalog_query_after_ddl_costs_the_same_at_800_tables(
     `secantusd-pg` took about 0.011 s with no other table and 0.036 s with
     800, and since the republication stopped copying the definitions and
     re-reading every table's index list, about 0.010 s and 0.027 s
-    (2026-11-12): the statement after any DDL still republishes the
-    session's per-version catalog state (`install_session_state`) from
-    every table.
+    (2026-11-12), and since the index relations are derived once per
+    catalog version, about 0.010 s and 0.022 s (2026-11-13): the statement
+    after any DDL still republishes the session's per-version catalog
+    state (`install_session_state`) from every table.
 
-    The fastest first-after-DDL run with 800 more tables against the
-    fastest with none, in one server, within half again plus 5 ms."""
-    small, _ = _first_and_warm(pg_alone, "rp911a")
+    The fastest of five first-after-DDL runs with 800 more tables against
+    the fastest with none, in one server, within a quarter again plus 2 ms.
+    The bound was half again plus 5 ms until 2026-11-13, when the gap
+    shrank to about 12 ms and that bound fell inside the runs' noise: two
+    runs in five passed with the statement still twice as slow."""
+    small, _ = _first_and_warm(pg_alone, "rp911a", rounds=5)
     for i in range(2 * GROWTH_TABLES):
         pg_alone.execute(f"CREATE TABLE rp911_grow_{i} (a int, b text)")
-    large, _ = _first_and_warm(pg_alone, "rp911b")
-    assert large < 1.5 * small + 0.005, (
+    large, _ = _first_and_warm(pg_alone, "rp911b", rounds=5)
+    assert large < 1.25 * small + 0.002, (
         f"first query after DDL {small * 1000:.0f} ms with no other table, "
         f"{large * 1000:.0f} ms with {2 * GROWTH_TABLES}"
+    )
+
+
+def _fastest_create(pg: Any, prefix: str) -> float:
+    """The fastest of five `CREATE TABLE`s."""
+    times = []
+    for i in range(5):
+        start = time.monotonic()
+        pg.execute(f'CREATE TABLE {prefix}_{i} (v text COLLATE "C")')
+        times.append(time.monotonic() - start)
+    return min(times)
+
+
+@pytest.mark.backlog("RP-921")
+def test_create_table_costs_the_same_at_400_tables(pg_alone: Any) -> None:
+    """PostgreSQL 15.19 runs a `CREATE TABLE` in the same time however many
+    other tables there are (0.41 ms with none, 0.37 ms with 800, private
+    cluster, 2026-11-13). A debug `secantusd-pg` took about 1.4 ms with
+    none and 42 ms with 800 (2026-11-13): after the table is made, its new
+    indexes' page models are looked for (`btree_built`: the hash, other
+    access-method and B-tree shapes), and each look lists every table's
+    index relations from the whole catalog, read and decoded afresh while
+    the statement runs.
+
+    The fastest of five with 400 more tables against the fastest with none,
+    in one server, within half again plus 5 ms."""
+    small = _fastest_create(pg_alone, "rp_ct_a")
+    for i in range(GROWTH_TABLES):
+        pg_alone.execute(f"CREATE TABLE rp_ct_grow_{i} (a int, b text)")
+    large = _fastest_create(pg_alone, "rp_ct_b")
+    assert large < 1.5 * small + 0.005, (
+        f"CREATE TABLE {small * 1000:.1f} ms with no other table, "
+        f"{large * 1000:.1f} ms with {GROWTH_TABLES}"
     )

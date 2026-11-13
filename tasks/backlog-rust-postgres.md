@@ -1091,28 +1091,66 @@ one beside it.
       the comments, each listed from every table. PostgreSQL invalidates
       only the cache entries of the rows a statement changed (`inval.c`).
       psql's `\d` collation subquery straight after a `CREATE TABLE`, debug
-      build, 2026-11-12: 0.010 s with no other table and 0.027 s with 800
-      (PostgreSQL 15.19: 0.33 ms with 200, 0.20 ms with 400). Fixed so far:
-      keyed `pg_type` reads, unchanged table definitions reused across
+      build, 2026-11-13: about 0.010 s with no other table and 0.022 s with
+      800 (PostgreSQL 15.19: 0.33 ms with 200, 0.20 ms with 400). Fixed so
+      far: keyed `pg_type` reads, unchanged table definitions reused across
       versions (RP-715); the republication reads the definitions in place
       with one oid map, and the storage keeps each collection's index list
-      until a change of that collection (2026-11-12, from 0.036 s at 800).
-      What is left, measured at 800 tables: each listing still derives every
-      relation's entry again per version, about 1 ms apiece in a debug
-      build (the tableoid expressions, the comments, the relations, the
-      index and constraint definitions, the composites and their widths),
-      and the version's composite documents are decoded again (about
-      2.5 ms, paid by `relation_oids`). Reusing an unchanged document by
-      its bytes, as `committed_table_defs` does, saved nothing: cloning a
-      `Document` costs as much as decoding it, so the reused entries have
-      to be shared (`Arc`), not copied. The faithful end state keys the
-      published state per relation and invalidates what a statement
-      changed; a user relation's entries depend on more than its own
-      catalog row (its grants, its inheritance parents and children, the
-      foreign keys naming it, the types its columns name), so each key has
-      to carry them, or a stale entry is a wrong answer.
+      until a change of that collection (2026-11-12, from 0.036 s at 800);
+      the index relations derived once per catalog version and planner
+      generation rather than per ask, one oid map for the comments,
+      constraint definitions and `pg_attribute` fill instead of a catalog
+      fetch per table, and a composite found by name through a map rather
+      than a scan of every row type per described column (2026-11-13, from
+      0.027 s at 800). What is left, profiled at 800 tables (debug build,
+      per statement): decoding the version's composite documents (about
+      1.7 ms, paid by `relation_oids`), copying the unchanged table
+      definitions into the version's list (about 1 ms in
+      `committed_table_defs`), and each listing deriving every relation's
+      entry again (the tableoid expressions, the comments, the relations,
+      the constraint and index definitions, the composites and their
+      fields, `pg_type`'s row types, each 0.2 to 1 ms). Reusing an
+      unchanged document by its bytes saves nothing while the version's
+      list holds values: cloning a `Document` or a `TableDef` costs as much
+      as decoding it, so the entries have to be shared (`Arc`) across
+      versions, which changes the type `shared_table_defs` and
+      `type_catalog_docs` hand to some 200 callers. The faithful end state
+      keys the published state per relation and invalidates what a
+      statement changed; a user relation's entries depend on more than its
+      own catalog row (its grants, its inheritance parents and children,
+      the foreign keys naming it, the types its columns name), so each key
+      has to carry them, or a stale entry is a wrong answer.
       Backlog-ID: RP-911
       Verify: tests/backlog/test_rp_catalog_latency.py::test_the_first_catalog_query_after_ddl_costs_the_same_at_800_tables
+
+## Found by a profile (2026-11-13)
+
+- [ ] **OPEN — `CREATE TABLE` grows with the number of tables.** A debug
+      `secantusd-pg` takes about 1.4 ms with no other table and 42 ms with
+      800 (2026-11-13); PostgreSQL 15.19 takes 0.41 ms and 0.37 ms (private
+      cluster). After the table is made, `btree_built` looks for its new
+      indexes' page models through `hash_shapes`, `am_shapes` and
+      `btree_shapes_all`, and each lists every table's index relations
+      (`index_relations`). While the statement runs, `shared_table_defs`
+      cannot use the per-version definitions (the catalog it wrote is not
+      yet a version), so each list reads and decodes the whole catalog
+      again: three full decodes per `CREATE TABLE`, most of its time at
+      800 tables. PostgreSQL builds the new relation's indexes from that
+      relation alone (`index_build` over the one heap). The fix asks the
+      new table's own index list, not every table's.
+      Backlog-ID: RP-921
+      Verify: tests/backlog/test_rp_catalog_latency.py::test_create_table_costs_the_same_at_400_tables
+
+- [ ] **OPEN — a renamed index loses its comment.** `COMMENT ON INDEX ix
+      IS 'c'` then `ALTER INDEX ix RENAME TO ix2`: PostgreSQL 15.19 answers
+      `obj_description('ix2'::regclass, 'pg_class')` with `c`, since a
+      comment is keyed by the object's oid (`pg_description.objoid`) and a
+      rename keeps the oid; `secantusd-pg` answers NULL, for a `CREATE
+      INDEX` and for a primary key's index alike (2026-11-13). The index
+      comments are stored under a key built from the index's name
+      (`index_comment_key`), which the rename does not move.
+      Backlog-ID: RP-923
+      Verify: tests/backlog/test_rp_found_rp911.py::test_an_index_comment_survives_a_rename
 
 ## Found by a CI run (2026-11-07)
 

@@ -278,6 +278,7 @@ type TransitionRows = (Vec<Document>, Vec<Document>);
 type ColumnTypes = Vec<(String, String)>;
 
 /// One index relation as `pg_index` / `pg_class` report it.
+#[derive(Clone)]
 struct IndexRelation {
     name: String,
     oid: i64,
@@ -12256,12 +12257,38 @@ impl PgHandler {
         &self,
         resolution: &str,
     ) -> PgWireResult<Option<(String, String, i64, CompositeFields)>> {
-        for d in self.type_catalog_docs(Self::COMPOSITE_COLLECTION)?.iter() {
+        type Memo = (Arc<Vec<Document>>, Arc<HashMap<String, usize>>);
+        thread_local! {
+            /// Each resolution name's first document, for the documents it
+            /// was built from: a result asks for every column whose type
+            /// is not a common built-in, and a scan of every table's row
+            /// type per ask grew with the schema (RP-911). Holding the
+            /// documents keeps their address unique while the memo stands.
+            static MEMO: std::cell::RefCell<Option<Memo>> = const { std::cell::RefCell::new(None) };
+        }
+        let docs = self.type_catalog_docs(Self::COMPOSITE_COLLECTION)?;
+        let cached = MEMO.with(|m| {
+            m.borrow()
+                .as_ref()
+                .and_then(|(d, map)| Arc::ptr_eq(d, &docs).then(|| Arc::clone(map)))
+        });
+        let by_name = match cached {
+            Some(map) => map,
+            None => {
+                let mut map = HashMap::with_capacity(docs.len());
+                for (i, d) in docs.iter().enumerate() {
+                    let name = d.get_str("composite").unwrap_or_default();
+                    let schema = d.get_str("schema").unwrap_or("public");
+                    map.entry(Self::type_resolution(schema, name)).or_insert(i);
+                }
+                let map = Arc::new(map);
+                MEMO.with(|m| *m.borrow_mut() = Some((Arc::clone(&docs), Arc::clone(&map))));
+                map
+            }
+        };
+        if let Some(d) = by_name.get(resolution).map(|&i| &docs[i]) {
             let name = d.get_str("composite").unwrap_or_default();
             let schema = d.get_str("schema").unwrap_or("public");
-            if Self::type_resolution(schema, name) != resolution {
-                continue;
-            }
             let oid = d
                 .get_i64("oid")
                 .or_else(|_| d.get_i32("oid").map(i64::from))
@@ -12734,18 +12761,89 @@ impl PgHandler {
     /// failed read of the catalog or of a table's index list is the error,
     /// never an empty list.
     fn try_index_relations(&self) -> PgWireResult<Vec<IndexRelation>> {
-        let mut out = Vec::new();
+        type Memo = (
+            usize,
+            String,
+            Arc<Vec<TableDef>>,
+            Arc<HashMap<String, i64>>,
+            u64,
+            Arc<Vec<IndexRelation>>,
+        );
+        thread_local! {
+            /// The list, for the definitions and oids it was derived from
+            /// and the storage's planner generation it read the index
+            /// lists under: a statement asks several times (the relations,
+            /// the index definitions, `pg_class`, a `regclass` input), and
+            /// each derivation walked every table (RP-911). Every write of
+            /// an index catalog or the collection registry moves the
+            /// generation, and a new catalog version shares new
+            /// definitions, so a hit is the list a derivation would build.
+            /// Holding the inputs keeps their addresses unique while the
+            /// memo stands.
+            static MEMO: std::cell::RefCell<Option<Memo>> = const { std::cell::RefCell::new(None) };
+        }
         // Read in place: copying every definition, per call, was most of
         // this list's cost on a large schema (RP-715).
         let defs = self.shared_table_defs()?;
+        let oids = self.relation_oids().unwrap_or_default();
+        let storage_ptr = Arc::as_ptr(&self.storage) as usize;
+        // Inside a user transaction the index lists are read on its own
+        // session, which may hold its own index DDL: not shared.
+        let generation = if self.storage.in_user_txn() {
+            None
+        } else {
+            secantus_storage::planner_generation()
+        };
+        if let Some(generation) = generation {
+            let hit = MEMO.with(|m| {
+                m.borrow().as_ref().and_then(|(s, db, d, o, g, list)| {
+                    (*s == storage_ptr
+                        && *g == generation
+                        && Arc::ptr_eq(d, &defs)
+                        && Arc::ptr_eq(o, &oids)
+                        && db == self.db())
+                    .then(|| Arc::clone(list))
+                })
+            });
+            if let Some(list) = hit {
+                return Ok(list.as_ref().clone());
+            }
+        }
+        let out = self.derive_index_relations(&defs, &oids)?;
+        // Kept only when no index catalog write landed during the reads.
+        if let Some(generation) =
+            generation.filter(|g| secantus_storage::planner_generation() == Some(*g))
+        {
+            let list = Arc::new(out.clone());
+            MEMO.with(|m| {
+                *m.borrow_mut() = Some((
+                    storage_ptr,
+                    self.db().to_string(),
+                    defs,
+                    oids,
+                    generation,
+                    list,
+                ));
+            });
+        }
+        Ok(out)
+    }
+
+    /// [`Self::try_index_relations`], derived from `defs` and their `oids`
+    /// and each table's stored index list.
+    fn derive_index_relations(
+        &self,
+        defs: &[TableDef],
+        oids: &HashMap<String, i64>,
+    ) -> PgWireResult<Vec<IndexRelation>> {
+        let mut out = Vec::new();
         let defs_partitions = |parent: &str| -> Vec<&TableDef> {
             defs.iter()
                 .filter(|d| partition::parent_of(d) == Some(parent))
                 .collect()
         };
-        let oids = self.relation_oids().unwrap_or_default();
         for t in defs.iter() {
-            let table_oid = Self::oid_in(&oids, &t.name).filter(|o| *o > 0);
+            let table_oid = Self::oid_in(oids, &t.name).filter(|o| *o > 0);
             let derived = |slot: i64, name: &str| match table_oid {
                 Some(o) if slot < 16 => Self::INDEX_OID_BAND + o * 16 + slot,
                 _ => Self::index_oid(name),
@@ -15534,8 +15632,11 @@ impl PgHandler {
         );
         let q = secantus_pgplan::scalar::quote_identifier;
         let qlist = |cols: &[String]| cols.iter().map(|c| q(c)).collect::<Vec<_>>().join(", ");
+        // Every oid from one map: a lookup per table re-fetched the catalog
+        // documents for each (RP-911).
+        let oids = self.relation_oids().unwrap_or_default();
         for t in self.shared_table_defs()?.iter() {
-            let Some(rel) = self.relation_oid(&t.name) else {
+            let Some(rel) = Self::oid_in(&oids, &t.name) else {
                 continue;
             };
             let mut ordinal = 0i64;
@@ -20766,8 +20867,9 @@ impl PgHandler {
     /// (primary key, unique / exclusion, check, foreign key).
     pub(crate) fn constraint_comments(&self) -> Vec<(i64, String)> {
         let mut out = Vec::new();
+        let oids = self.relation_oids().unwrap_or_default();
         for t in self.shared_table_defs().unwrap_or_default().iter() {
-            let Some(rel) = self.relation_oid(&t.name) else {
+            let Some(rel) = Self::oid_in(&oids, &t.name) else {
                 continue;
             };
             let mut ordinal = 0i64;
@@ -20806,8 +20908,9 @@ impl PgHandler {
                 out.push((crate::extension_oid(i), 0, c.to_string()));
             }
         }
+        let oids = self.relation_oids().unwrap_or_default();
         for def in self.shared_table_defs()?.iter() {
-            let Some(oid) = self.relation_oid(&def.name) else {
+            let Some(oid) = Self::oid_in(&oids, &def.name) else {
                 continue;
             };
             if let Some(c) = def.comment() {
@@ -20891,7 +20994,7 @@ impl PgHandler {
             let (Ok(name), Ok(c)) = (d.get_str("name"), d.get_str("comment")) else {
                 continue;
             };
-            if let Some(oid) = self.relation_oid(name) {
+            if let Some(oid) = Self::oid_in(&oids, name) {
                 out.push((oid, 0, c.to_string()));
             }
         }
