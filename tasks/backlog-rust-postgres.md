@@ -1581,14 +1581,17 @@ a regression test.
         the parameterized Index Scan), or whose upper `<>` coerces its
         operands (`e2.a::numeric <> e3.a::numeric`);
       - a LEFT join's ON conjunct over its preserved side that costs other
-        than its operators: an IN list (`e.a in (1, 2, 3)`, printed `e.a =
-        ANY ('{1,2,3}'::integer[])`), a regex match (`e.b ~ 'v1'`, whose
-        selectivity is RP-423's) and a cast of a column (`e.a::text <>
-        '5'`).
-      A binary-coercible cast is RP-912; a join PostgreSQL orders
-      otherwise, RP-919.
+        than its operators: an IN list of nine or more constants, which
+        PostgreSQL hashes (`e.a in (1, ..., 9)`: `cost=0.02..20032.52`,
+        one hash and one comparison a row and the table's build at
+        startup), a regex match (`e.b ~ 'v1'`, whose selectivity is
+        RP-423's) and a cast of a column (`e.a::text <> '5'`).
+      Since 2026-11-13 an IN list of fewer than nine constants there is
+      priced (its operator over half the list) and estimated. A
+      binary-coercible cast is RP-912; a join PostgreSQL orders otherwise,
+      RP-919.
       Backlog-ID: RP-354
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[nested loop into an index bounded by a call of the outer side], tests/backlog/test_rp_explain_costs.py::test_plan[nested loop of three relations into an index], tests/backlog/test_rp_explain_costs.py::test_plan[nested loop of three relations with a coerced <> above], tests/backlog/test_rp_explain_costs.py::test_plan[a left join's on conjunct over the preserved side is an in list], tests/backlog/test_rp_explain_costs.py::test_plan[a left join's on conjunct over the preserved side is a regex match], tests/backlog/test_rp_explain_costs.py::test_plan[a left join's on conjunct over the preserved side casts a column]
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[nested loop into an index bounded by a call of the outer side], tests/backlog/test_rp_explain_costs.py::test_plan[nested loop of three relations into an index], tests/backlog/test_rp_explain_costs.py::test_plan[nested loop of three relations with a coerced <> above], tests/backlog/test_rp_explain_costs.py::test_plan[a left join's on conjunct over the preserved side is a hashed in list], tests/backlog/test_rp_explain_costs.py::test_plan[a left join's on conjunct over the preserved side is a regex match], tests/backlog/test_rp_explain_costs.py::test_plan[a left join's on conjunct over the preserved side casts a column]
 - [ ] **A join of three tables by inequalities runs in its written
       order, and a WHERE's join clauses all run at the top join.**
       PostgreSQL's `standard_join_search` picks the order of an inner join
@@ -1685,17 +1688,6 @@ a regression test.
       cluster (found while working RP-354).
       Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a seq scan filter over a binary-coercible cast], tests/backlog/test_rp_explain_costs.py::test_plan[a join filter over a binary-coercible cast]
       Backlog-ID: RP-912
-- [ ] **An IN list under a join prints as an ARRAY constructor.**
-      PostgreSQL folds `a in (1, 2, 3)` into one array constant and
-      prints it as its literal wherever the scan sits: PostgreSQL 15.19
-      prints `explain select * from e, k where e.a <> k.a and e.a in (1,
-      2, 3)` with the Materialized `Seq Scan on e`'s `Filter: (a = ANY
-      ('{1,2,3}'::integer[]))`; here `Filter: (a = ANY (ARRAY[1, 2, 3]))`.
-      A lone scan already prints the literal, and the costs and rows are
-      right. Measured on a private 15.19 cluster (found while working
-      RP-354).
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[an in list in a scan filter under a join is an array constant]
-      Backlog-ID: RP-913
 - [ ] **A function call in a nested loop's join filter is priced as
       nothing.** `cost_qual_eval` charges a call its `procost` for every
       pair the Join Filter checks: PostgreSQL 15.19 prints `select * from e

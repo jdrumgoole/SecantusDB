@@ -2118,11 +2118,13 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "              Index Cond: (a > length(e.b))",
         ],
     ),
-    # Still open (RP-354): a LEFT join's ON conjunct over its preserved
-    # side that costs other than its operators: an IN list (an array
-    # constant, `scalararraysel`), a regex match and a cast of a column.
+    # Split from RP-354 and fixed: a LEFT join's ON conjunct over its
+    # preserved side that is an IN list of constants, one array constant
+    # (`scalararraysel`) whose operator `cost_qual_eval` charges over half
+    # its elements; before, the nested loop printed zeros. One element is
+    # the plain operator.
     "a left join's on conjunct over the preserved side is an in list": (
-        "RP-354",
+        "RP-329",
         _ANALYSED,
         "explain select * from e left join e e2 on e.a <> e2.a and e.a in (1, 2, 3)",
         [
@@ -2133,6 +2135,61 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "        ->  Seq Scan on e e2  (cost=0.00..15.00 rows=1000 width=7)",
         ],
     ),
+    "a left join's on conjunct over the preserved side is a not in list": (
+        "RP-329",
+        _ANALYSED,
+        "explain select * from e left join e e2 on e.a <> e2.a and e.a not in (1, 2, 3)",
+        [
+            "Nested Loop Left Join  (cost=0.00..18782.50 rows=996003 width=14)",
+            "  Join Filter: ((e.a <> e2.a) AND (e.a <> ALL ('{1,2,3}'::integer[])))",
+            "  ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
+            "  ->  Materialize  (cost=0.00..20.00 rows=1000 width=7)",
+            "        ->  Seq Scan on e e2  (cost=0.00..15.00 rows=1000 width=7)",
+        ],
+    ),
+    "a left join's on conjunct over the preserved side is an in list of one": (
+        "RP-329",
+        _ANALYSED,
+        "explain select * from e left join e e2 on e.a <> e2.a and e.a in (7)",
+        [
+            "Nested Loop Left Join  (cost=0.00..17532.50 rows=1000 width=14)",
+            "  Join Filter: ((e.a <> e2.a) AND (e.a = 7))",
+            "  ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
+            "  ->  Materialize  (cost=0.00..20.00 rows=1000 width=7)",
+            "        ->  Seq Scan on e e2  (cost=0.00..15.00 rows=1000 width=7)",
+        ],
+    ),
+    "a left join's on conjunct over the preserved side ors an in list": (
+        "RP-329",
+        _ANALYSED,
+        "explain select * from e left join e e2 on e.a <> e2.a and (e.a in (1, 2) or e.a < 3)",
+        [
+            "Nested Loop Left Join  (cost=0.00..20032.50 rows=3992 width=14)",
+            "  Join Filter: ((e.a <> e2.a) AND ((e.a = ANY ('{1,2}'::integer[])) OR (e.a < 3)))",
+            "  ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
+            "  ->  Materialize  (cost=0.00..20.00 rows=1000 width=7)",
+            "        ->  Seq Scan on e e2  (cost=0.00..15.00 rows=1000 width=7)",
+        ],
+    ),
+    # Still open (RP-354): an IN list of nine or more constants is hashed
+    # (`MIN_ARRAY_SIZE_FOR_HASHED_SAOP`): one hash and one comparison a
+    # row, and the table's build, an element's hash each, at startup.
+    "a left join's on conjunct over the preserved side is a hashed in list": (
+        "RP-354",
+        _ANALYSED,
+        "explain select * from e left join e e2 on e.a <> e2.a"
+        " and e.a in (1, 2, 3, 4, 5, 6, 7, 8, 9)",
+        [
+            "Nested Loop Left Join  (cost=0.02..20032.52 rows=8991 width=14)",
+            "  Join Filter: ((e.a <> e2.a) AND (e.a = ANY ('{1,2,3,4,5,6,7,8,9}'::integer[])))",
+            "  ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
+            "  ->  Materialize  (cost=0.00..20.00 rows=1000 width=7)",
+            "        ->  Seq Scan on e e2  (cost=0.00..15.00 rows=1000 width=7)",
+        ],
+    ),
+    # Still open (RP-354): a LEFT join's ON conjunct over its preserved
+    # side that costs other than its operators: a regex match and a cast
+    # of a column.
     "a left join's on conjunct over the preserved side is a regex match": (
         "RP-354",
         _ANALYSED,
@@ -2181,8 +2238,9 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "        ->  Seq Scan on k  (cost=0.00..15.00 rows=1000 width=7)",
         ],
     ),
-    # Still open: an IN list of constants is one array constant, printed
-    # as its literal under a join as it is on a lone scan.
+    # Fixed: an IN list of constants is one array constant, printed as
+    # its literal under a join as it is on a lone scan; before, it printed
+    # as an ARRAY constructor.
     "an in list in a scan filter under a join is an array constant": (
         "RP-913",
         _ANALYSED,
@@ -4750,6 +4808,7 @@ def _marked(name: str, item: str) -> Any:
         "RP-404",
         "RP-405",
         "RP-409",
+        "RP-913",
     )
     mark = pytest.mark.backlog_fixed if fixed else pytest.mark.backlog
     return pytest.param(name, marks=mark(item), id=name)

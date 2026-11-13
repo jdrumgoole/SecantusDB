@@ -2116,7 +2116,7 @@ impl PgHandler {
                 tables |= 1 << table_of(a)?;
             }
             let sel = crate::join_search::filter_selectivity(&f.kind, &nd_of)?;
-            out.push((tables, sel, f.ops as f64, i));
+            out.push((tables, sel, f.ops, i));
         }
         Some(out)
     }

@@ -627,7 +627,7 @@ impl PgHandler {
         let (b, b_above, _) = side(right, false)?;
         let qual: f64 = filters
             .iter()
-            .map(|f| f.ops as f64 * costsize::CPU_OPERATOR_COST)
+            .map(|f| f.ops * costsize::CPU_OPERATOR_COST)
             .sum();
         // `clauselist_selectivity`: the conjuncts' product, in order. A
         // `<>` (or IS DISTINCT FROM) is `neqjoinsel`, one minus
@@ -707,7 +707,7 @@ impl PgHandler {
         let kept: f64 = filters
             .iter()
             .filter(|f| restriction(f))
-            .map(|f| f.ops as f64 * costsize::CPU_OPERATOR_COST)
+            .map(|f| f.ops * costsize::CPU_OPERATOR_COST)
             .sum();
         for (slot, (inner_leaf, outer_rows, inner_rows)) in
             [(lb, a.2, b.2), (la, b.2, a.2)].into_iter().enumerate()
@@ -941,7 +941,7 @@ impl PgHandler {
                 return None;
             }
             clauses.push(Clause {
-                qual: f.ops as f64 * costsize::CPU_OPERATOR_COST,
+                qual: f.ops * costsize::CPU_OPERATOR_COST,
                 set,
                 keys: fields.iter().map(|(_, k, _)| k.as_str()).collect(),
                 sel,
@@ -1171,10 +1171,10 @@ impl PgHandler {
             .iter()
             .map(|(_, _, op, ..)| op.starts_with('>'))
             .collect();
-        let ops: usize = own.iter().map(|(_, _, _, ops, _)| ops).sum();
-        let arg_ops: usize = own.iter().map(|(.., arg_ops)| arg_ops).sum();
+        let ops: f64 = own.iter().map(|(_, _, _, ops, _)| ops).sum();
+        let arg_ops: f64 = own.iter().map(|(.., arg_ops)| arg_ops).sum();
         // The other join clauses, a filter on each row the scan fetches.
-        let rest_ops = (filters.iter().map(|f| f.ops).sum::<usize>() - ops) as f64;
+        let rest_ops = filters.iter().map(|f| f.ops).sum::<f64>() - ops;
         let rest: Vec<(String, costsize::Qual)> = if rest_ops > 0.0 {
             vec![(String::new(), costsize::Qual::Filter(rest_ops))]
         } else {
@@ -1211,13 +1211,7 @@ impl PgHandler {
                 ki.index.visible = ki.allvisfrac;
             }
             let Some((startup, total)) = costsize::param_range_index_scan(
-                &ki.rel,
-                &ki.index,
-                &field,
-                &rest,
-                &bounds,
-                arg_ops as f64,
-                outer_rows,
+                &ki.rel, &ki.index, &field, &rest, &bounds, arg_ops, outer_rows,
             ) else {
                 return ParamFound::Unmodelled;
             };
@@ -5468,7 +5462,7 @@ fn hash_join_of(
     // `qp_qual_cost` on each tuple the hash clauses pass -- for a unique
     // inner side the outer rows that match, the filter's selectivity
     // among the semi-join factors (RP-381).
-    let qp = filter.ops as f64 * costsize::CPU_OPERATOR_COST;
+    let qp = filter.ops * costsize::CPU_OPERATOR_COST;
     let (startup, total) = joincost::hash_join_stats_filtered(
         &outer,
         &inner,
@@ -5643,7 +5637,7 @@ fn hash_join_of(
     let nest = joincost::cheapest_nest_loop_semi(
         a.scan,
         b.scan,
-        costsize::CPU_OPERATOR_COST * (1.0 + more.len() as f64 + filter.ops as f64),
+        costsize::CPU_OPERATOR_COST * (1.0 + more.len() as f64 + filter.ops),
         [semi(&a, unique_a), semi(&b, unique_b)],
     );
     if nest.total <= t0 * 1.01 {
@@ -5769,7 +5763,7 @@ fn unique_key_other_paths(
     let mut rel = JoinRel::without_hash(false);
     // The join filter, evaluated on each pair a path's clause passes (a
     // nested loop's every pair), RP-381.
-    rel.set_filter_cost(filter.ops as f64 * costsize::CPU_OPERATOR_COST);
+    rel.set_filter_cost(filter.ops * costsize::CPU_OPERATOR_COST);
     rel.add_paths_general(
         0,
         Some(CLASS),
@@ -5799,7 +5793,7 @@ fn unique_key_other_paths(
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct JoinFilterCost {
     pub(crate) count: usize,
-    pub(crate) ops: usize,
+    pub(crate) ops: f64,
     pub(crate) selectivity: f64,
 }
 
@@ -5807,7 +5801,7 @@ impl Default for JoinFilterCost {
     fn default() -> Self {
         Self {
             count: 0,
-            ops: 0,
+            ops: 0.0,
             selectivity: 1.0,
         }
     }
