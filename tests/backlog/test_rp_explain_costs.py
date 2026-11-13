@@ -1986,11 +1986,12 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "        Index Cond: (y > e.a)",
         ],
     ),
-    # Still open (RP-354): a key one index leads with and another holds
-    # second is two parameterized paths, PostgreSQL keeping the cheaper
-    # (the one leading with it, which bounds its scan).
+    # Split from RP-354 and fixed: a key one index leads with and another
+    # holds second is two parameterized paths, PostgreSQL keeping the
+    # cheaper (the one leading with it, which bounds its scan); before, the
+    # join printed zeros.
     "nested loop into a column two indexes hold": (
-        "RP-354",
+        "RP-329",
         _ANALYSED_TWO_INDEXES,
         "explain select * from e, c4 where e.a < c4.y",
         [
@@ -1998,6 +1999,46 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "  ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
             "  ->  Index Scan using c4_y on c4  (cost=0.28..6.14 rows=333 width=8)",
             "        Index Cond: (y > e.a)",
+        ],
+    ),
+    # Still open (RP-354): a join of three tables whose upper clause is a
+    # `<>` is priced as one of `<`: its selectivity `neqjoinsel`'s.
+    "nested loop of three relations with a <> above": (
+        "RP-354",
+        _ANALYSED,
+        "explain select * from e join e e2 on e.a < e2.a join e e3 on e2.a <> e3.a",
+        [
+            "Nested Loop  (cost=0.00..5015045.00 rows=332999667 width=21)",
+            "  Join Filter: (e2.a <> e3.a)",
+            "  ->  Nested Loop  (cost=0.00..15032.50 rows=333333 width=14)",
+            "        Join Filter: (e.a < e2.a)",
+            "        ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
+            "        ->  Materialize  (cost=0.00..20.00 rows=1000 width=7)",
+            "              ->  Seq Scan on e e2  (cost=0.00..15.00 rows=1000 width=7)",
+            "  ->  Materialize  (cost=0.00..20.00 rows=1000 width=7)",
+            "        ->  Seq Scan on e e3  (cost=0.00..15.00 rows=1000 width=7)",
+        ],
+    ),
+    # Still open (RP-354): a join of four tables, three Nested Loops.
+    "nested loop of four relations": (
+        "RP-354",
+        _ANALYSED,
+        "explain select * from e join e e2 on e.a < e2.a join e e3 on e2.a < e3.a"
+        " join e e4 on e3.a < e4.a",
+        [
+            "Nested Loop  (cost=0.00..1671680062.50 rows=37037000000 width=28)",
+            "  Join Filter: (e3.a < e4.a)",
+            "  ->  Nested Loop  (cost=0.00..5015045.00 rows=111111000 width=21)",
+            "        Join Filter: (e2.a < e3.a)",
+            "        ->  Nested Loop  (cost=0.00..15032.50 rows=333333 width=14)",
+            "              Join Filter: (e.a < e2.a)",
+            "              ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
+            "              ->  Materialize  (cost=0.00..20.00 rows=1000 width=7)",
+            "                    ->  Seq Scan on e e2  (cost=0.00..15.00 rows=1000 width=7)",
+            "        ->  Materialize  (cost=0.00..20.00 rows=1000 width=7)",
+            "              ->  Seq Scan on e e3  (cost=0.00..15.00 rows=1000 width=7)",
+            "  ->  Materialize  (cost=0.00..20.00 rows=1000 width=7)",
+            "        ->  Seq Scan on e e4  (cost=0.00..15.00 rows=1000 width=7)",
         ],
     ),
     # Still open: a binary-coercible cast (text to varchar, back to text

@@ -1628,12 +1628,14 @@ a regression test.
       otherwise (its own item) are still zeros. Since 2026-11-13 a key on
       a later index column is its Index Cond, every scan reading the
       whole index (`e, c2 where e.a < c2.y` over an index on `(x, y)`:
-      `Index Only Scan using c2_xy` with `Index Cond: (y > e.a)`); a key
-      one index leads with and another holds later is still zeros (`e, c4
-      where e.a < c4.y` over indexes on `(x, y)` and `(y)`: PostgreSQL
-      keeps the cheaper path, `Index Scan using c4_y`).
+      `Index Only Scan using c2_xy` with `Index Cond: (y > e.a)`), and
+      since 2026-11-13 a key several indexes hold is a path through each,
+      `add_path` keeping the cheapest (`e, c4 where e.a < c4.y` over
+      indexes on `(x, y)` and `(y)`: `Index Scan using c4_y`). Still zeros:
+      a join of three tables whose upper clause is a `<>` (`e join e e2 on
+      e.a < e2.a join e e3 on e2.a <> e3.a`) and one of four tables.
       Backlog-ID: RP-354
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[nested loop into a column two indexes hold]
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[nested loop of three relations with a <> above], tests/backlog/test_rp_explain_costs.py::test_plan[nested loop of four relations]
 - [ ] **A join of three tables by inequalities runs in its written
       order, and a WHERE's join clauses all run at the top join.**
       PostgreSQL's `standard_join_search` picks the order of an inner join

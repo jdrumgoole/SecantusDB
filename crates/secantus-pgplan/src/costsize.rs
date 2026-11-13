@@ -574,6 +574,29 @@ pub fn param_index_scan(
     )
 }
 
+/// `add_path` between two paths of one relation with the same
+/// parameterization, rows and pathkeys (RP-354): whether `new` `(startup,
+/// total)` replaces `old` -- cheaper in total beyond the 1.01 fuzz, or
+/// fuzzily equal there and cheaper to start beyond it; fuzzily equal in
+/// both, only when cheaper beyond 1.0000000001
+/// (`compare_path_costs_fuzzily`).
+pub fn fuzzily_cheaper(new: (f64, f64), old: (f64, f64)) -> bool {
+    let cmp = |fuzz: f64| -> Option<bool> {
+        if new.1 > old.1 * fuzz {
+            Some(false)
+        } else if old.1 > new.1 * fuzz {
+            Some(true)
+        } else if new.0 > old.0 * fuzz {
+            Some(false)
+        } else if old.0 > new.0 * fuzz {
+            Some(true)
+        } else {
+            None
+        }
+    };
+    cmp(1.01).or_else(|| cmp(1.000_000_000_1)).unwrap_or(false)
+}
+
 /// A scan of `index` inside a nested loop whose index quals bound its
 /// leading column by the outer row's values (`a > e.a`, RP-354), each
 /// `bounds` entry one of them, `true` for a lower bound: with no constant
@@ -1862,6 +1885,22 @@ mod tests {
             (format!("{startup:.2}"), format!("{total:.2}")),
             ("0.28".to_string(), "6.14".to_string())
         );
+    }
+
+    /// `add_path`'s choice between two parameterized index paths: the
+    /// cheaper total beyond 1%, then the cheaper startup, and between
+    /// fuzzily equal ones the old path stays (RP-354).
+    #[test]
+    fn the_fuzzily_cheaper_path_replaces_the_old() {
+        // `e.a < c4.y`: `c4_y`'s 6.14 against `c4_xy`'s 11.14.
+        assert!(fuzzily_cheaper((0.28, 6.14), (0.28, 11.14)));
+        assert!(!fuzzily_cheaper((0.28, 11.14), (0.28, 6.14)));
+        // Within 1% the startup decides.
+        assert!(fuzzily_cheaper((0.1, 100.5), (0.3, 100.0)));
+        assert!(!fuzzily_cheaper((0.3, 100.0), (0.1, 100.5)));
+        // Equal: the old stays; a hair cheaper beyond the tiny fuzz wins.
+        assert!(!fuzzily_cheaper((0.28, 6.14), (0.28, 6.14)));
+        assert!(fuzzily_cheaper((0.28, 6.1399), (0.28, 6.14)));
     }
 
     /// `explain select * from e, c2 where e.a < c2.y` over `c2 (x int, y

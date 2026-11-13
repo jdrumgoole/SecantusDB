@@ -1044,8 +1044,8 @@ impl PgHandler {
     /// inner rows times every join clause's selectivity, as
     /// `get_parameterized_baserel_size` multiplies them; `inner_rows` is
     /// the plain scan's. [`ParamFound::Unmodelled`] where an index could serve
-    /// in a way not priced here: clauses on two columns, a column two
-    /// indexes hold at different positions or a table never analysed.
+    /// in a way not priced here: clauses on two columns, a hash or partial
+    /// index or a table never analysed.
     fn param_index_inner(
         &self,
         leaf: &SideLeaf,
@@ -1096,39 +1096,20 @@ impl PgHandler {
         if serving.is_empty() {
             return ParamFound::None;
         }
-        // One column over one index (the primary key is listed as both
-        // the SQL key and the storage's `_id` index: one relation), its
-        // every clause an index qual (`match_join_clauses_to_index`): two
-        // bounds (`e.a < k.a and e.a > k.a`) are one `Index Cond` of both.
-        // The column may be a later one of the index (`match_clause_to_index`
-        // matches every key column): `e.a < c2.y` over an index on `(x,
-        // y)` is `Index Cond: (y > e.a)`.
-        let (field, later) = (serving[0].1.clone(), serving[0].2);
-        if serving.iter().any(|(_, f, l)| *f != field || *l != later) {
+        // One column (the primary key is listed as both the SQL key and
+        // the storage's `_id` index: one relation), its every clause an
+        // index qual (`match_join_clauses_to_index`): two bounds (`e.a <
+        // k.a and e.a > k.a`) are one `Index Cond` of both. The column may
+        // be a later one of the index (`match_clause_to_index` matches
+        // every key column): `e.a < c2.y` over an index on `(x, y)` is
+        // `Index Cond: (y > e.a)`.
+        let field = serving[0].1.clone();
+        if serving.iter().any(|(_, f, _)| *f != field) {
             return ParamFound::Unmodelled;
         }
         let Some(key) = self.analysed_key(&leaf.table, &field) else {
             return ParamFound::Unmodelled;
         };
-        let Some(mut ki) = self.key_index_at(
-            &leaf.table,
-            &Document::new(),
-            &field,
-            &key,
-            inner_rows,
-            later,
-        ) else {
-            return ParamFound::Unmodelled;
-        };
-        // An index holding every column the side reads is scanned
-        // index-only (`check_index_only`), its heap fetches cut by the
-        // visibility map's all-visible fraction (`cost_index`); with
-        // `enable_indexonlyscan` off it is a plain index scan.
-        let index_only = !self.setting_is("enable_indexonlyscan", "off")
-            && leaf.read.iter().all(|f| ki.index.columns.contains(f));
-        if index_only {
-            ki.index.visible = ki.allvisfrac;
-        }
         let own: Vec<_> = clauses.iter().filter(|(f, ..)| *f == field).collect();
         let column = &own[0].1;
         let bounds: Vec<bool> = own
@@ -1144,23 +1125,65 @@ impl PgHandler {
         } else {
             Vec::new()
         };
-        let Some((startup, total)) = costsize::param_range_index_scan(
-            &ki.rel,
-            &ki.index,
-            &field,
-            &rest,
-            &bounds,
-            arg_ops as f64,
-            outer_rows,
-        ) else {
-            return ParamFound::Unmodelled;
-        };
-        let Some(name) = serving
-            .iter()
-            .map(|(ix, ..)| ix.name.clone())
-            .find(|n| !n.starts_with('_'))
-            .or_else(|| serving.first().map(|(ix, ..)| ix.name.clone()))
-        else {
+        // Each index holding the column is a parameterized path of its
+        // own (`build_index_paths`, in the index list's oid order), and
+        // `add_path` keeps the cheapest: with the same parameterization,
+        // rows and no useful pathkeys, a path's total decides beyond the
+        // 1.01 fuzz, its startup between fuzzily equal totals, and between
+        // fuzzily equal paths the new one replaces the old only when
+        // cheaper beyond a 1.0000000001 fuzz (`e.a < c4.y` over indexes on
+        // `(x, y)` and `(y)`: `Index Scan using c4_y`).
+        let mut best: Option<(f64, f64, String, bool)> = None;
+        let mut seen: Vec<Vec<String>> = Vec::new();
+        for (ix, ..) in &serving {
+            let Some(columns) = key_fields(ix) else {
+                return ParamFound::Unmodelled;
+            };
+            if seen.contains(&columns) {
+                continue;
+            }
+            let Some(mut ki) = self.key_index_of(&leaf.table, &columns, &key, inner_rows) else {
+                return ParamFound::Unmodelled;
+            };
+            seen.push(columns.clone());
+            // An index holding every column the side reads is scanned
+            // index-only (`check_index_only`), its heap fetches cut by the
+            // visibility map's all-visible fraction (`cost_index`); with
+            // `enable_indexonlyscan` off it is a plain index scan.
+            let index_only = !self.setting_is("enable_indexonlyscan", "off")
+                && leaf.read.iter().all(|f| ki.index.columns.contains(f));
+            if index_only {
+                ki.index.visible = ki.allvisfrac;
+            }
+            let Some((startup, total)) = costsize::param_range_index_scan(
+                &ki.rel,
+                &ki.index,
+                &field,
+                &rest,
+                &bounds,
+                arg_ops as f64,
+                outer_rows,
+            ) else {
+                return ParamFound::Unmodelled;
+            };
+            // The SQL name of the relation, not the storage's `_id` one.
+            let Some(name) = serving
+                .iter()
+                .filter(|(other, ..)| key_fields(other).as_ref() == Some(&columns))
+                .map(|(other, ..)| other.name.clone())
+                .find(|n| !n.starts_with('_'))
+                .or_else(|| Some(ix.name.clone()))
+            else {
+                return ParamFound::Unmodelled;
+            };
+            let replaces = best
+                .as_ref()
+                .is_none_or(|(s, t, ..)| costsize::fuzzily_cheaper((startup, total), (*s, *t)));
+            if replaces {
+                best = Some((startup, total, name, index_only));
+            }
+        }
+        let Some((startup, total, name, index_only)) = best else {
             return ParamFound::Unmodelled;
         };
         let alias = leaf
@@ -2348,6 +2371,44 @@ impl PgHandler {
         rows: f64,
         later: bool,
     ) -> Option<KeyIndex> {
+        self.key_index_by(table, filter, key, rows, |ix| {
+            let (leading, past) = (
+                ix.field == field,
+                ix.columns[1..].iter().any(|c| c == field),
+            );
+            if later {
+                (past, leading)
+            } else {
+                (leading, past)
+            }
+        })
+    }
+
+    /// The plain B-tree of `table` whose key columns are `columns`, sized
+    /// and correlated as [`Self::key_index`] does (RP-354): one of the
+    /// indexes a parameterized scan may read.
+    fn key_index_of(
+        &self,
+        table: &str,
+        columns: &[String],
+        key: &AnalysedKey,
+        rows: f64,
+    ) -> Option<KeyIndex> {
+        self.key_index_by(table, &Document::new(), key, rows, |ix| {
+            (ix.columns == columns, false)
+        })
+    }
+
+    /// The one plain B-tree `pick` says `(is the one, rules the estimate
+    /// out)` of, scanned with `filter`.
+    fn key_index_by(
+        &self,
+        table: &str,
+        filter: &Document,
+        key: &AnalysedKey,
+        rows: f64,
+        pick: impl Fn(&costsize::Index) -> (bool, bool),
+    ) -> Option<KeyIndex> {
         let count = self
             .storage
             .count_matching(self.db(), table, &Document::new(), None)
@@ -2359,17 +2420,9 @@ impl PgHandler {
         let correlations = Self::stats_correlations(&pt.def, stats);
         let mut found: Option<costsize::Index> = None;
         for ix in &mut indexes {
-            let (leading, past) = (
-                ix.field == field,
-                ix.columns[1..].iter().any(|c| c == field),
-            );
             // An index holding it at the other position is a path not
             // priced here.
-            let (here, there) = if later {
-                (past, leading)
-            } else {
-                (leading, past)
-            };
+            let (here, there) = pick(ix);
             if quals.iter().any(|(f, _)| ix.columns.contains(f)) || there {
                 return None;
             }
