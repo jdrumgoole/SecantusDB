@@ -41,6 +41,8 @@ pub struct StorageAdapter {
     /// The server's time-series bucket catalog, in memory as `mongod`
     /// keeps it: a restart starts it empty.
     bucket_catalog: secantus_commands::BucketCatalog,
+    /// The spill engine, opened by the first stage that spills (RM-325).
+    spill: Arc<secantus_storage::spill::SpillEngine>,
 }
 
 /// The fields the PostgreSQL server stamps on a SQL table's row for its
@@ -150,10 +152,17 @@ impl StorageAdapter {
     }
 
     pub fn new(inner: Arc<WtStorage>) -> Self {
+        let cache_mb = secantus_storage::spill::cache_mb(secantus_commands::mem_size_mb());
+        let spill = Arc::new(if inner.in_memory() || inner.home().is_empty() {
+            secantus_storage::spill::SpillEngine::temporary(cache_mb)
+        } else {
+            secantus_storage::spill::SpillEngine::new(std::path::Path::new(inner.home()), cache_mb)
+        });
         StorageAdapter {
             inner,
             index_use: Mutex::new(HashMap::new()),
             bucket_catalog: secantus_commands::BucketCatalog::new(),
+            spill,
         }
     }
 
@@ -208,6 +217,10 @@ impl StorageAdapter {
 }
 
 impl CmdStorage for StorageAdapter {
+    fn spill_tables(&self) -> Option<Arc<dyn secantus_commands::storage::SpillTables>> {
+        Some(self.spill.clone())
+    }
+
     fn bucket_catalog(&self) -> Option<&secantus_commands::BucketCatalog> {
         Some(&self.bucket_catalog)
     }

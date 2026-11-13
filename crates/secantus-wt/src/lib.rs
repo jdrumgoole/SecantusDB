@@ -457,6 +457,12 @@ impl Session {
         self.on_object(unsafe { (*self.ptr).compact }, uri, config)
     }
 
+    /// `WT_SESSION::drop`: remove a table and (by default) its file. Needs
+    /// the table to have no open cursor (`EBUSY` otherwise).
+    pub fn drop_table(&self, uri: &str, config: Option<&str>) -> Result<()> {
+        self.on_object(unsafe { (*self.ptr).drop }, uri, config)
+    }
+
     /// `WT_SESSION::salvage`: rebuild a damaged table's file from whatever
     /// of it can still be read, discarding what cannot. Needs the table to
     /// have no open handle (`EBUSY` otherwise).

@@ -13,6 +13,7 @@
 //! `delete_matching` / `count_matching`).
 
 use bson::{Bson, Document};
+pub use secantus_core::spill_table::SpillTables;
 // Re-exported so trait implementors (the WT adapter) can name the collation type
 // without a direct `secantus-core` dependency.
 pub use secantus_core::collation::Collation;
@@ -336,6 +337,13 @@ pub struct StoreOpening {
 /// The storage operations the command handlers depend on. Bytes at the seam:
 /// documents go in/out as `bson::encode` bytes, as they come off the WT cursor.
 pub trait Storage: Send + Sync {
+    /// The spill engine aggregation stages spill to, as mongod 8.2's
+    /// (`<dbpath>/_tmp/spilldb`, RM-325). `None` (the default, for test
+    /// fakes): a stage keeps its own file.
+    fn spill_tables(&self) -> Option<std::sync::Arc<dyn SpillTables>> {
+        None
+    }
+
     /// True when the store is non-persistent (WiredTiger `in_memory=true`).
     ///
     /// Read by `serverStatus.storageEngine.persistent`. Defaults to `false`

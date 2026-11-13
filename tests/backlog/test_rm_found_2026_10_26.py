@@ -232,10 +232,12 @@ def _window_storage_size(client: Any) -> int:
     return window_storage() - before
 
 
-@pytest.mark.backlog("RM-325")
+@pytest.mark.backlog_fixed("RM-325")
 def test_spill_storage_size(rust_mongo: Any, mongod: Any) -> None:
-    """mongod 8.2 spills a `$setWindowFields` to a WiredTiger table (4096
-    bytes here); this server writes a file of its own (310800)."""
+    """mongod 8.2 spilled a `$setWindowFields` to a table of its spill
+    WiredTiger (`_tmp/spilldb`), 4096 bytes on disk while the engine held it
+    in cache; this server wrote a file of its own (310800). It now spills to
+    a spill engine of its own, opened as mongod's (fixed 2026-11-13)."""
     assert _window_storage_size(rust_mongo) == _window_storage_size(mongod)
 
 

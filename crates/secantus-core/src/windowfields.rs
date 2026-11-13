@@ -1074,7 +1074,7 @@ impl FunctionMemory {
 /// What spilling the partition cache wrote, across the stage's partitions.
 #[derive(Default)]
 struct CacheSpill {
-    file: Option<(std::path::PathBuf, std::io::BufWriter<std::fs::File>)>,
+    to: Option<SpillTo>,
     /// The spill table's size so far.
     stored: i64,
     /// How many times the cache spilled, and what it wrote.
@@ -1083,44 +1083,69 @@ struct CacheSpill {
     bytes: i64,
 }
 
+/// Where the cache spills: a table of the server's spill engine, as
+/// mongod 8.2's `SpillableDeque` writes to its spill WiredTiger
+/// (`spill_table`), or, for the engine run with no server, a file.
+enum SpillTo {
+    Table(Box<dyn crate::spill_table::SpillTable>),
+    File(std::path::PathBuf, std::io::BufWriter<std::fs::File>),
+}
+
 impl CacheSpill {
-    /// Write `docs` (each with the 32 bytes of metadata mongod's
+    /// Write `docs` (each counted with the 32 bytes of metadata mongod's
     /// `toBsonWithMetaData` adds for a sorted document; measured 8.2.11) to
-    /// the stage's spill table, a file here.
+    /// the stage's spill table, as records keyed by their record id.
     fn write(&mut self, docs: &[&Document]) -> R<()> {
         use std::io::Write;
         let io = |what: &str, e: &dyn std::fmt::Display| {
             Fallback::mongo(
                 1,
-                format!("$setWindowFields could not {what} its spill file: {e}"),
+                format!("$setWindowFields could not {what} its spill table: {e}"),
             )
         };
-        if self.file.is_none() {
-            let dir = crate::memlimit::spill_dir();
-            std::fs::create_dir_all(&dir).map_err(|e| io("create the directory for", &e))?;
-            static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-            let path = dir.join(format!(
-                "secantus-window-{}-{}.bson",
-                std::process::id(),
-                NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-            ));
-            let file = std::fs::File::create(&path).map_err(|e| io("create", &e))?;
-            self.file = Some((path, std::io::BufWriter::new(file)));
+        if self.to.is_none() {
+            self.to = Some(match crate::spill_table::create() {
+                Some(table) => SpillTo::Table(table.map_err(|e| io("create", &e))?),
+                None => {
+                    let dir = crate::memlimit::spill_dir();
+                    std::fs::create_dir_all(&dir)
+                        .map_err(|e| io("create the directory for", &e))?;
+                    static NEXT: std::sync::atomic::AtomicU64 =
+                        std::sync::atomic::AtomicU64::new(0);
+                    let path = dir.join(format!(
+                        "secantus-window-{}-{}.bson",
+                        std::process::id(),
+                        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                    ));
+                    let file = std::fs::File::create(&path).map_err(|e| io("create", &e))?;
+                    SpillTo::File(path, std::io::BufWriter::new(file))
+                }
+            });
         }
-        let (_, out) = self.file.as_mut().expect("opened above");
         let mut bytes = 0i64;
-        for d in docs {
+        let mut records = Vec::with_capacity(docs.len());
+        for (i, d) in docs.iter().enumerate() {
             let mut buf = Vec::new();
             crate::bsondoc::write(d, &mut buf).map_err(|e| io("encode a document for", &e))?;
-            out.write_all(&buf).map_err(|e| io("write", &e))?;
             bytes += buf.len() as i64 + 32;
+            records.push((self.records + i as i64 + 1, buf));
         }
-        out.flush().map_err(|e| io("write", &e))?;
-        let stored = out
-            .get_ref()
-            .metadata()
-            .map_err(|e| io("measure", &e))?
-            .len() as i64;
+        let stored = match self.to.as_mut().expect("opened above") {
+            SpillTo::Table(table) => {
+                table.insert(&records).map_err(|e| io("write", &e))?;
+                table.storage_size().map_err(|e| io("measure", &e))?
+            }
+            SpillTo::File(_, out) => {
+                for (_, buf) in &records {
+                    out.write_all(buf).map_err(|e| io("write", &e))?;
+                }
+                out.flush().map_err(|e| io("write", &e))?;
+                out.get_ref()
+                    .metadata()
+                    .map_err(|e| io("measure", &e))?
+                    .len() as i64
+            }
+        };
         crate::memlimit::record_window_spill(docs.len() as i64, bytes, stored - self.stored);
         self.stored = stored;
         self.spills += 1;
@@ -1131,28 +1156,37 @@ impl CacheSpill {
 
     /// Drop the spill table.
     fn finish(mut self) -> R<()> {
-        if let Some((path, out)) = self.file.take() {
-            drop(out);
-            std::fs::remove_file(&path).map_err(|e| {
-                Fallback::mongo(
-                    1,
-                    format!("$setWindowFields could not remove its spill file: {e}"),
-                )
-            })?;
+        let gone = |e: &dyn std::fmt::Display| {
+            Fallback::mongo(
+                1,
+                format!("$setWindowFields could not drop its spill table: {e}"),
+            )
+        };
+        match self.to.take() {
+            Some(SpillTo::Table(table)) => table.drop_table().map_err(|e| gone(&e)),
+            Some(SpillTo::File(path, out)) => {
+                drop(out);
+                std::fs::remove_file(&path).map_err(|e| gone(&e))
+            }
+            None => Ok(()),
         }
-        Ok(())
     }
 }
 
 impl Drop for CacheSpill {
     fn drop(&mut self) {
-        if let Some((path, _)) = self.file.take() {
-            if let Err(e) = std::fs::remove_file(&path) {
-                eprintln!(
-                    "secantus: could not remove $setWindowFields spill file {}: {e}",
-                    path.display()
-                );
+        let failed = match self.to.take() {
+            Some(SpillTo::Table(table)) => table.drop_table().err(),
+            Some(SpillTo::File(path, out)) => {
+                drop(out);
+                std::fs::remove_file(&path)
+                    .err()
+                    .map(|e| format!("{}: {e}", path.display()))
             }
+            None => None,
+        };
+        if let Some(e) = failed {
+            eprintln!("secantus: could not drop a $setWindowFields spill table: {e}");
         }
     }
 }
@@ -3013,6 +3047,69 @@ mod budget_tests {
         let stats = &report.windows[0];
         assert!(stats.spills > 0);
         assert!(stats.max_total_memory > 10_000, "{stats:?}");
+    }
+
+    /// With a spill engine handed in, the cache spills to one of its tables
+    /// -- every document once, keyed by record id from 1 -- reports the
+    /// table's size as the stage's `spilledDataStorageSize`, and drops the
+    /// table at the end (RM-325).
+    #[test]
+    fn a_window_spills_to_the_spill_engine_handed_in() {
+        use crate::spill_table::{SpillTable, SpillTables};
+        use std::sync::{Arc, Mutex};
+        #[derive(Default)]
+        struct Seen {
+            ids: Vec<i64>,
+            tables: usize,
+            dropped: usize,
+        }
+        struct Engine(Arc<Mutex<Seen>>);
+        struct Table(Arc<Mutex<Seen>>);
+        impl SpillTables for Engine {
+            fn create(&self) -> Result<Box<dyn SpillTable>, String> {
+                self.0.lock().unwrap().tables += 1;
+                Ok(Box::new(Table(self.0.clone())))
+            }
+        }
+        impl SpillTable for Table {
+            fn insert(&mut self, records: &[(i64, Vec<u8>)]) -> Result<(), String> {
+                let mut seen = self.0.lock().unwrap();
+                seen.ids.extend(records.iter().map(|(id, _)| *id));
+                Ok(())
+            }
+            fn storage_size(&self) -> Result<i64, String> {
+                Ok(4096)
+            }
+            fn drop_table(self: Box<Self>) -> Result<(), String> {
+                self.0.lock().unwrap().dropped += 1;
+                Ok(())
+            }
+        }
+        let seen = Arc::new(Mutex::new(Seen::default()));
+        let spec = window(bson!({"$first": "$n"}), false);
+        let (_, report) = memlimit::captured(|| {
+            let _b = memlimit::with_budgets(Budgets {
+                window_fields: 10_000,
+                ..Default::default()
+            });
+            let _t = crate::spill_table::with_tables(Some(Arc::new(Engine(seen.clone()))));
+            set_window_fields_each(
+                &spec,
+                docs(),
+                &Document::new(),
+                None,
+                None,
+                None,
+                &mut |_| Ok(()),
+            )
+        });
+        let stats = &report.windows[0];
+        let seen = seen.lock().unwrap();
+        assert!(stats.spills > 0);
+        assert_eq!((seen.tables, seen.dropped), (1, 1));
+        assert_eq!(seen.ids, (1..=seen.ids.len() as i64).collect::<Vec<_>>());
+        assert_eq!(stats.spilled_records, seen.ids.len() as i64);
+        assert_eq!(stats.spilled_data_storage_size, 4096);
     }
 
     /// Linux mongod 8.2.12 (x86-64 and arm64), 2026-11-08 (RM-327).

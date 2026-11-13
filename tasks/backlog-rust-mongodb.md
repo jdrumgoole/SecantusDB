@@ -1491,19 +1491,49 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
   246 SnapshotUnavailable, by name, rather than answer as of now; without
   `atClusterTime` it reads the latest data, which is correct. `secantusd-rs`
   creates its stores the other way, mongod's (RM-210).
-- [ ] **A `$setWindowFields`'s spill takes this server's size on disk,
-      not mongod's.** A sort's and a classic `$group`'s spill files are
-      mongod 8.2's sorter files to the byte (`test_spill_file_storage_size`,
-      `test_group_spill_storage_size`). mongod spills a `$setWindowFields`'s
-      partition cache to a WiredTiger temporary table
-      (`spilledDataStorageSize: 4096`), where this server writes a file of
-      its own (310800); the engine crate cannot reach a WiredTiger table
-      today. Two more spills are this server's and unmeasured: an SBE
-      `$group` (mongod: a WiredTiger record store; its budget is not
-      settable at runtime) and a `$median` / `$percentile` state (mongod
-      writes its t-digest; this server keeps, and writes, the values).
-      Backlog-ID: RM-325
-      Verify: tests/backlog/test_rm_found_2026_10_26.py::test_spill_storage_size
+- [ ] **A spill the spill engine writes out takes this server's size on
+      disk, not mongod's.** A `$setWindowFields` spills to a table of a
+      second WiredTiger instance at `<dbpath>/_tmp/spilldb`, as mongod 8.2's
+      does (RM-325's fix), and while the table stays in that engine's cache
+      both report the 4096 bytes WiredTiger creates its file with. Past
+      about 14 MB mongod writes pages out, the same every run: 73728 bytes
+      for 28 MB, 204800 for 60 MB (mongod 8.2.11, 2026-11-13). Its tables
+      are zstd-compressed at level -7 (`spillWiredTigerBlockCompressor`),
+      which the vendored WiredTiger is not built with, and it is WiredTiger
+      12.0; this server's uncompressed table leaves its file at 4096 or
+      writes megabytes (2420736 at 60 MB), as its eviction threads happen
+      to run. Found 2026-11-13 working RM-325.
+      Verify: tests/backlog/test_rm_found_2026_11_13_rm325.py::test_a_window_spill_the_engine_writes_out_is_mongods_size
+      Backlog-ID: RM-611
+- [ ] **An SBE `$group`'s budget cannot be set at startup, and its spill
+      is this server's.** mongod 8.2.11 takes
+      `internalQuerySlotBasedExecutionHashAggApproxMemoryUseInBytesBeforeSpill`
+      on its command line (not at runtime), and at 50000 spills a slot-based
+      `$group` `$push` of 300 1000-byte strings 7 times, 312300 bytes, into
+      a table of its spill engine (`groupSpilledDataStorageSize` 4096).
+      `secantusd-rs` refuses the parameter ("Unknown --setParameter"), so
+      the SBE `$group`'s budget is always 100 MiB and what it spills is
+      unmeasured. Found 2026-11-13 working RM-325 (its remainder).
+      Verify: tests/backlog/test_rm_found_2026_11_13_rm325.py::test_an_sbe_group_spills_as_mongods
+      Backlog-ID: RM-612
+- [ ] **A `$median` / `$percentile` spills the values, where mongod spills
+      its t-digest.** A classic `$group` of `{$median: {input: "$n", method:
+      "approximate"}}` over 300 groups of one value each, under a 5000-byte
+      budget, spills 84000 bytes on mongod 8.2.11 (`groupSpilledBytes`,
+      its accumulator's t-digest) and 100800 here, which keeps and writes the
+      values. The spill count is RM-502's. Found 2026-11-13 working RM-325
+      (its remainder).
+      Verify: tests/backlog/test_rm_found_2026_11_13_rm325.py::test_a_median_spills_mongods_state
+      Backlog-ID: RM-613
+- [ ] **`serverStatus` has no `spillWiredTiger` section.** mongod 8.2.11
+      reports its spill engine's statistics there from startup (`uri`
+      `"statistics:"`, `storageSize` 0 while nothing is spilled, `version`,
+      and the block-manager and cache counters;
+      `spillWiredTigerServerStatusVerbosity` 1). This server opens its spill
+      engine at the first spill and reports none of it. Found 2026-11-13
+      working RM-325.
+      Verify: tests/backlog/test_rm_found_2026_11_13_rm325.py::test_server_status_reports_the_spill_engine
+      Backlog-ID: RM-614
 - [ ] **An SBE sort's spilled records are not the size of mongod's.**
       mongod 8.2.11's slot-based sort in front of a `$group`, over 300
       documents of a 1000-byte `s` under a 50000-byte budget, writes 13 runs

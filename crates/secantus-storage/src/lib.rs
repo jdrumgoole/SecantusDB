@@ -60,6 +60,7 @@ pub mod pitr_archive;
 pub mod repair;
 pub mod replay;
 pub mod share_locks;
+pub mod spill;
 
 mod index_build;
 mod lockfile;

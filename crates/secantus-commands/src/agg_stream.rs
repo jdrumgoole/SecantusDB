@@ -841,6 +841,7 @@ impl AggStream {
         let _command = crate::aggregate::InCommand::enter(&self.ns);
         let _engine = secantus_core::sbe::enter(false);
         let _budgets = secantus_core::memlimit::with_budgets(self.budgets);
+        let _spill = secantus_core::spill_table::with_tables(storage.spill_tables());
         let docs = crate::aggregate::run_segmented(
             Vec::new(),
             &[Bson::Document(doc! { "$unionWith": spec })],
@@ -1053,6 +1054,7 @@ impl AggStream {
             self.command.get_bool("allowDiskUse").unwrap_or(true),
         );
         let _budgets = secantus_core::memlimit::with_budgets(self.budgets);
+        let _spill = secantus_core::spill_table::with_tables(storage.spill_tables());
         crate::aggregate::run_segmented(
             docs,
             &stages,
