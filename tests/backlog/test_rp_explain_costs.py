@@ -101,6 +101,21 @@ _ANALYSED_TWO_INDEXES = _ANALYSED + [
     "analyze c4",
 ]
 
+# Those, twenty and thirty analysed rows, the second's key its primary key,
+# and a weakly correlated column under a non-unique index (RP-354).
+_ANALYSED_INDEXED_SMALL = _ANALYSED + [
+    "create table z (a int, b text)",
+    "insert into z select g, 'z' from generate_series(1, 20) g",
+    "create table kz (a int primary key, b text)",
+    "insert into kz select g, 'k' from generate_series(1, 30) g",
+    "create table k2 (x int, y int)",
+    "insert into k2 select g, g % 100 from generate_series(1, 1000) g",
+    "create index k2_y_idx on k2 (y)",
+    "analyze z",
+    "analyze kz",
+    "analyze k2",
+]
+
 # Those, a ten-row table analysed and one never analysed (RP-329).
 _ANALYSED_SMALL = _ANALYSED + [
     "create table zs (a int, b text)",
@@ -2359,10 +2374,12 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "        ->  Seq Scan on e e3  (cost=0.00..15.00 rows=1000 width=7)",
         ],
     ),
-    # Still open (RP-354): a join of three tables, the third indexed, its
-    # Index Scan parameterized by the lower join's row under a Memoize.
+    # Split from RP-354 and fixed: a join of three tables, the third
+    # indexed, its Index Scan parameterized by the lower join's row under a
+    # Memoize -- `get_loop_count` the parameterizing table's own rows, the
+    # Memoize's calls the lower join's; before, every node printed zeros.
     "nested loop of three relations into an index": (
-        "RP-354",
+        "RP-329",
         _ANALYSED,
         "explain select * from e join e e2 on e.a < e2.a join k on e2.a < k.a",
         [
@@ -2377,6 +2394,87 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "        Cache Mode: binary",
             "        ->  Index Scan using k_pkey on k  (cost=0.28..6.14 rows=333 width=7)",
             "              Index Cond: (a > e2.a)",
+        ],
+    ),
+    # Split from RP-354 and fixed: the same over small tables, whose
+    # Memoize caches the scan; four tables, the last indexed; a `<>` moved
+    # into the scan with the index qual (its operand twice in the cache
+    # key); and two indexed tables each parameterized by the first.
+    "nested loop of three small relations into a memoized index": (
+        "RP-329",
+        _ANALYSED_INDEXED_SMALL,
+        "explain select * from z join z z2 on z.a < z2.a join kz on z2.a < kz.a",
+        [
+            "Nested Loop  (cost=0.15..45.74 rows=1330 width=18)",
+            "  ->  Nested Loop  (cost=0.00..8.45 rows=133 width=12)",
+            "        Join Filter: (z.a < z2.a)",
+            "        ->  Seq Scan on z  (cost=0.00..1.20 rows=20 width=6)",
+            "        ->  Materialize  (cost=0.00..1.30 rows=20 width=6)",
+            "              ->  Seq Scan on z z2  (cost=0.00..1.20 rows=20 width=6)",
+            "  ->  Memoize  (cost=0.15..0.92 rows=10 width=6)",
+            "        Cache Key: z2.a",
+            "        Cache Mode: binary",
+            "        ->  Index Scan using kz_pkey on kz  (cost=0.14..0.91 rows=10 width=6)",
+            "              Index Cond: (a > z2.a)",
+        ],
+    ),
+    "nested loop of four relations into an index": (
+        "RP-329",
+        _ANALYSED,
+        "explain select * from e join e e2 on e.a < e2.a join e e3 on e2.a < e3.a"
+        " join k on e3.a < k.a",
+        [
+            "Nested Loop  (cost=0.29..799404034.34 rows=37037000000 width=28)",
+            "  ->  Nested Loop  (cost=0.00..5015045.00 rows=111111000 width=21)",
+            "        Join Filter: (e2.a < e3.a)",
+            "        ->  Nested Loop  (cost=0.00..15032.50 rows=333333 width=14)",
+            "              Join Filter: (e.a < e2.a)",
+            "              ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
+            "              ->  Materialize  (cost=0.00..20.00 rows=1000 width=7)",
+            "                    ->  Seq Scan on e e2  (cost=0.00..15.00 rows=1000 width=7)",
+            "        ->  Materialize  (cost=0.00..20.00 rows=1000 width=7)",
+            "              ->  Seq Scan on e e3  (cost=0.00..15.00 rows=1000 width=7)",
+            "  ->  Memoize  (cost=0.29..6.15 rows=333 width=7)",
+            "        Cache Key: e3.a",
+            "        Cache Mode: binary",
+            "        ->  Index Scan using k_pkey on k  (cost=0.28..6.14 rows=333 width=7)",
+            "              Index Cond: (a > e3.a)",
+        ],
+    ),
+    "nested loop of three relations into an index with a <> in its scan": (
+        "RP-329",
+        _ANALYSED_INDEXED_SMALL,
+        "explain select * from z join z z2 on z.a < z2.a join kz on z2.a < kz.a and z2.a <> kz.a",
+        [
+            "Nested Loop  (cost=0.15..46.26 rows=1286 width=18)",
+            "  ->  Nested Loop  (cost=0.00..8.45 rows=133 width=12)",
+            "        Join Filter: (z.a < z2.a)",
+            "        ->  Seq Scan on z  (cost=0.00..1.20 rows=20 width=6)",
+            "        ->  Materialize  (cost=0.00..1.30 rows=20 width=6)",
+            "              ->  Seq Scan on z z2  (cost=0.00..1.20 rows=20 width=6)",
+            "  ->  Memoize  (cost=0.15..0.95 rows=10 width=6)",
+            "        Cache Key: z2.a, z2.a",
+            "        Cache Mode: binary",
+            "        ->  Index Scan using kz_pkey on kz  (cost=0.14..0.94 rows=10 width=6)",
+            "              Index Cond: (a > z2.a)",
+        ],
+    ),
+    "nested loop of three relations into two indexes": (
+        "RP-329",
+        _ANALYSED_INDEXED_SMALL,
+        "explain select * from z join kz on z.a < kz.a join kz kz2 on z.a < kz2.a",
+        [
+            "Nested Loop  (cost=0.15..58.09 rows=2000 width=18)",
+            "  ->  Nested Loop  (cost=0.00..11.55 rows=200 width=12)",
+            "        Join Filter: (z.a < kz.a)",
+            "        ->  Seq Scan on kz  (cost=0.00..1.30 rows=30 width=6)",
+            "        ->  Materialize  (cost=0.00..1.30 rows=20 width=6)",
+            "              ->  Seq Scan on z  (cost=0.00..1.20 rows=20 width=6)",
+            "  ->  Memoize  (cost=0.15..0.92 rows=10 width=6)",
+            "        Cache Key: z.a",
+            "        Cache Mode: binary",
+            "        ->  Index Scan using kz_pkey on kz kz2  (cost=0.14..0.91 rows=10 width=6)",
+            "              Index Cond: (a > z.a)",
         ],
     ),
     # Split from RP-354 and fixed: an inequality between the inner's key
@@ -2526,8 +2624,10 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "        Index Cond: (a > e.a)",
         ],
     ),
-    # Still open (RP-354): a LEFT join's ON conjunct over its preserved
-    # side that is a regex match.
+    # Fixed (RP-354): a LEFT join's ON conjunct over its preserved side
+    # that is a regex match printed zeros; `patternsel` now estimates a
+    # regex from its fixed prefix (`regex_fixed_prefix`) and the MCVs and
+    # histogram entries it matches.
     "a left join's on conjunct over the preserved side is a regex match": (
         "RP-354",
         _ANALYSED,
@@ -4381,6 +4481,73 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "        Heap Fetches: 45",
         ],
     ),
+    # A chain of three tables' Nested Loops: still unannotated below the
+    # top join (RP-390's remainder).
+    "analyze of a nested loop of three relations": (
+        "RP-390",
+        _ANALYSED_INDEXED_SMALL,
+        "explain (analyze, costs off, timing off, summary off)"
+        " select * from z join z z2 on z.a < z2.a join z z3 on z2.a < z3.a",
+        [
+            "Nested Loop (actual rows=1140 loops=1)",
+            "  Join Filter: (z2.a < z3.a)",
+            "  Rows Removed by Join Filter: 2660",
+            "  ->  Nested Loop (actual rows=190 loops=1)",
+            "        Join Filter: (z.a < z2.a)",
+            "        Rows Removed by Join Filter: 210",
+            "        ->  Seq Scan on z (actual rows=20 loops=1)",
+            "        ->  Materialize (actual rows=20 loops=20)",
+            "              ->  Seq Scan on z z2 (actual rows=20 loops=1)",
+            "  ->  Materialize (actual rows=20 loops=190)",
+            "        ->  Seq Scan on z z3 (actual rows=20 loops=1)",
+        ],
+    ),
+    "analyze of a nested loop of three relations into a memoized index": (
+        "RP-390",
+        _ANALYSED_INDEXED_SMALL,
+        "explain (analyze, costs off, timing off, summary off)"
+        " select * from z join z z2 on z.a < z2.a join kz on z2.a < kz.a",
+        [
+            "Nested Loop (actual rows=3040 loops=1)",
+            "  ->  Nested Loop (actual rows=190 loops=1)",
+            "        Join Filter: (z.a < z2.a)",
+            "        Rows Removed by Join Filter: 210",
+            "        ->  Seq Scan on z (actual rows=20 loops=1)",
+            "        ->  Materialize (actual rows=20 loops=20)",
+            "              ->  Seq Scan on z z2 (actual rows=20 loops=1)",
+            "  ->  Memoize (actual rows=16 loops=190)",
+            "        Cache Key: z2.a",
+            "        Cache Mode: binary",
+            "        Hits: 171  Misses: 19  Evictions: 0  Overflows: 0  Memory Usage: 15kB",
+            "        ->  Index Scan using kz_pkey on kz (actual rows=19 loops=19)",
+            "              Index Cond: (a > z2.a)",
+        ],
+    ),
+    # An index over a weakly correlated column (RP-926): a nested loop's
+    # inner scan of it is priced a little high, more so the fewer the
+    # loops. (Its wide range is `test_a_wide_range_over_a_weakly_correlated_index`.)
+    "nested loop into a weakly correlated index": (
+        "RP-926",
+        _ANALYSED_INDEXED_SMALL,
+        "explain select * from e join k2 on e.a < k2.y",
+        [
+            "Nested Loop  (cost=0.28..9483.50 rows=333333 width=15)",
+            "  ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
+            "  ->  Index Scan using k2_y_idx on k2  (cost=0.28..6.14 rows=333 width=8)",
+            "        Index Cond: (y > e.a)",
+        ],
+    ),
+    "nested loop of few rows into a weakly correlated index": (
+        "RP-926",
+        _ANALYSED_INDEXED_SMALL,
+        "explain select * from z join k2 on z.a < k2.y",
+        [
+            "Nested Loop  (cost=0.28..225.85 rows=6667 width=14)",
+            "  ->  Seq Scan on z  (cost=0.00..1.20 rows=20 width=6)",
+            "  ->  Index Scan using k2_y_idx on k2  (cost=0.28..7.90 rows=333 width=8)",
+            "        Index Cond: (y > z.a)",
+        ],
+    ),
     # A LEFT join filter over a char(n) column: still unannotated (RP-390's
     # remainder).
     "analyze of a left nested loop over a char(n) join filter": (
@@ -4634,6 +4801,30 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "              Filter: (c ~~ 'xxx%'::text)",
         ],
     ),
+    # The same two shapes with a regex match, whose estimate RP-354 built:
+    # still zeros (found while working RP-354).
+    "estimate of a regex match over a table never analysed": (
+        "RP-423",
+        _ANALYSED_STRINGS,
+        "explain select * from zu where c ~ 'ab'",
+        [
+            "Seq Scan on zu  (cost=0.00..25.88 rows=254 width=36)",
+            "  Filter: (c ~ 'ab'::text)",
+        ],
+    ),
+    "estimate of a join over a scan filtered by a regex match": (
+        "RP-423",
+        _ANALYSED_STRINGS,
+        "explain select * from e join w on e.a = w.a where w.c ~ '^w00'",
+        [
+            "Hash Join  (cost=19.64..39.30 rows=91 width=17)",
+            "  Hash Cond: (e.a = w.a)",
+            "  ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
+            "  ->  Hash  (cost=18.50..18.50 rows=91 width=10)",
+            "        ->  Seq Scan on w  (cost=0.00..18.50 rows=91 width=10)",
+            "              Filter: (c ~ '^w00'::text)",
+        ],
+    ),
     # Still open: a LIKE's ESCAPE is a `like_escape` call PostgreSQL folds
     # into the pattern constant, which `patternsel` then estimates.
     "a like with an escape clause is a folded pattern": (
@@ -4645,8 +4836,10 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "  Filter: (b ~~ 'v1\\%'::text)",
         ],
     ),
+    # Split from RP-423 and fixed with RP-354: a regex match's scan
+    # printed zeros.
     "estimate of an anchored regex match": (
-        "RP-423",
+        "RP-354",
         _ANALYSED_THIRTY,
         "explain select * from s where c ~ '^xx'",
         [
@@ -4655,7 +4848,7 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
         ],
     ),
     "estimate of an unanchored regex match": (
-        "RP-423",
+        "RP-354",
         _ANALYSED_STRINGS,
         "explain select * from w where c ~ 'w01'",
         [
@@ -5194,6 +5387,7 @@ def _marked(name: str, item: str) -> Any:
         "RP-350",
         "RP-351",
         "RP-352",
+        "RP-354",
         "RP-355",
         "RP-359",
         "RP-360",
@@ -5334,6 +5528,26 @@ def test_an_index_only_scan_after_a_delete_and_vacuum(rust_pg: Any) -> None:
         "Index Only Scan using k_pkey on k (actual rows=8 loops=1)",
         "  Index Cond: (a < 10)",
         "  Heap Fetches: 0",
+    ]
+
+
+@pytest.mark.backlog("RP-926")
+def test_a_wide_range_over_a_weakly_correlated_index(rust_pg: Any) -> None:
+    """PostgreSQL 15.19 scans the heap for a range of 290 of 1,000 rows of
+    a column `g % 100` under a non-unique index; this server prints the
+    index scan it reads, unpriced, once the table is committed (inside the
+    transaction that made it, it prints PostgreSQL's plan)."""
+    steps = [
+        "create table k2 (x int, y int)",
+        "insert into k2 select g, g % 100 from generate_series(1, 1000) g",
+        "create index k2_y_idx on k2 (y)",
+        "analyze k2",
+        "explain select * from k2 where y > 70",
+    ]
+    got = run_autocommit(fresh_db(_dsn(rust_pg)), steps)
+    assert got[-1] == [
+        "Seq Scan on k2  (cost=0.00..17.50 rows=290 width=8)",
+        "  Filter: (y > 70)",
     ]
 
 

@@ -376,6 +376,18 @@ pub fn shadowed_by_catalog(name: &str) -> bool {
     CATALOG_TYPE_NAMES.contains(&name)
 }
 
+/// Does `name`, as a type lookup's key holds it, reach a `pg_catalog`
+/// type: a `pg_type` name (`oid`, `pg_node_tree`), its array (`text[]`,
+/// `_int4`) or a quoted one (`"char"`)? `pg_catalog` is searched first, so
+/// no such name reaches a user type. A key keeps a quoted name's case with
+/// its quotes stripped (`"Text"` is `Text`), and an upper-case letter is
+/// never a built-in's, so such a key is not one even though `oid_of_name`
+/// would fold it.
+pub fn is_catalog_type_name(name: &str) -> bool {
+    !name.bytes().any(|b| b.is_ascii_uppercase())
+        && (shadowed_by_catalog(name) || oid_of_name(name).is_some())
+}
+
 /// Whether `name` (an array's element name, or a scalar's) is a built-in
 /// type, in any spelling PostgreSQL accepts.
 pub fn is_builtin_type(name: &str) -> bool {

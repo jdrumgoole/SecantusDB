@@ -108,6 +108,43 @@ def pg_alone(tmp_path: Path) -> Iterator[Any]:
 GROWTH_TABLES = 400
 
 
+@pytest.fixture
+def pg_pair(tmp_path: Path) -> Iterator[tuple[Any, Any]]:
+    """Connections to two `secantusd-pg`s of the test's own: one schema
+    stays empty while the test grows the other."""
+    from tests.test_rust_pgserver_slice import _Server
+
+    (tmp_path / "small").mkdir()
+    (tmp_path / "large").mkdir()
+    with (
+        _Server(tmp_path / "small") as small_server,
+        _Server(tmp_path / "large") as large_server,
+        small_server.connect() as small,
+        large_server.connect() as large,
+    ):
+        yield small, large
+
+
+def _alternating_firsts(
+    small: Any, large: Any, prefix: str, rounds: int = 5
+) -> tuple[float, float]:
+    """The fastest of `rounds` first runs of the collation query straight
+    after a `CREATE TABLE` on each connection, the two taking turns: runs
+    taken one server after the other met the machine's load at different
+    times, and a load that rose between them failed a server that had
+    not slowed (2026-11-13)."""
+    firsts: dict[str, list[float]] = {"small": [], "large": []}
+    for i in range(rounds):
+        for side, conn in (("small", small), ("large", large)):
+            table = f"{prefix}_{side}_{i}"
+            conn.execute(f'CREATE TABLE {table} (v text COLLATE "C")')
+            query = COLLATION_QUERY.replace("'rp_cx'", f"'{table}'")
+            start = time.monotonic()
+            assert conn.execute(query).fetchall() == [("v", "C")]
+            firsts[side].append(time.monotonic() - start)
+    return min(firsts["small"]), min(firsts["large"])
+
+
 @pytest.mark.backlog_fixed("RP-715")
 def test_the_first_catalog_query_after_ddl_does_not_grow_with_the_schema(
     pg_alone: Any,
@@ -137,35 +174,68 @@ def test_the_first_catalog_query_after_ddl_does_not_grow_with_the_schema(
     )
 
 
-@pytest.mark.backlog("RP-911")
+@pytest.mark.backlog_fixed("RP-911")
 def test_the_first_catalog_query_after_ddl_costs_the_same_at_800_tables(
-    pg_alone: Any,
+    pg_pair: tuple[Any, Any],
 ) -> None:
     """PostgreSQL 15.19 answers the first collation query after a `CREATE
     TABLE` in the same time however many other tables there are (0.33 ms
     with 200, 0.20 ms with 400, private cluster, 2026-11-12). A debug
     `secantusd-pg` took about 0.011 s with no other table and 0.036 s with
-    800, and since the republication stopped copying the definitions and
-    re-reading every table's index list, about 0.010 s and 0.027 s
-    (2026-11-12), and since the index relations are derived once per
-    catalog version, about 0.010 s and 0.022 s, and since unchanged catalog
-    documents and table definitions are shared across versions, about
-    0.010 s and 0.018 s (2026-11-13): the statement after any DDL still
-    derives the session's per-version catalog listings
-    (`install_session_state`) from every table.
+    800, and after three passes over the republication (2026-11-12 and
+    -13) about 0.010 s and 0.018 s. Since the planner derives the row
+    types, the plain tables' `tableoid` and the publishable relations from
+    the documents they were published with only when a statement looks one
+    up, a `pg_catalog` type's name is answered without them, and a keyed
+    `pg_attribute` read decodes its own relation's composite alone, about
+    0.010 s and 0.014 s (2026-11-13).
 
-    The fastest of five first-after-DDL runs with 800 more tables against
-    the fastest with none, in one server, within a quarter again plus 2 ms.
-    The bound was half again plus 5 ms until 2026-11-13, when the gap
-    shrank to about 12 ms and that bound fell inside the runs' noise: two
-    runs in five passed with the statement still twice as slow."""
-    small, _ = _first_and_warm(pg_alone, "rp911a", rounds=5)
+    The fastest of five first-after-DDL runs on a server with 800 more
+    tables against the fastest on one with none, taking turns, within half
+    again plus 2 ms. The bound was half again plus 5 ms until 2026-11-13,
+    when the gap shrank to about 12 ms and 5 ms fell inside the runs'
+    noise. A quarter again plus 2 ms, tried the same day, passed a debug
+    build here (10.1 ms and 13.7 ms) only through its 2 ms, and failed CI,
+    whose runs are about three times slower (29 ms and 41 ms, PR #2716):
+    the ratio is about 1.4 on both, so the absolute term is kept small.
+    Until the same day the two were measured one after the other on one
+    server, and a machine loaded by another build failed it twice in six.
+    What is left of the growth is the next test's."""
+    small_conn, large_conn = pg_pair
     for i in range(2 * GROWTH_TABLES):
-        pg_alone.execute(f"CREATE TABLE rp911_grow_{i} (a int, b text)")
-    large, _ = _first_and_warm(pg_alone, "rp911b", rounds=5)
-    assert large < 1.25 * small + 0.002, (
+        large_conn.execute(f"CREATE TABLE rp911_grow_{i} (a int, b text)")
+    small, large = _alternating_firsts(small_conn, large_conn, "rp911a")
+    assert large < 1.5 * small + 0.002, (
         f"first query after DDL {small * 1000:.0f} ms with no other table, "
         f"{large * 1000:.0f} ms with {2 * GROWTH_TABLES}"
+    )
+
+
+@pytest.mark.backlog("RP-911")
+def test_the_first_catalog_query_after_ddl_costs_the_same_at_800_tables_within_a_tenth(
+    pg_pair: tuple[Any, Any],
+) -> None:
+    """PostgreSQL 15.19 answers the first collation query after a `CREATE
+    TABLE` in the same time however many other tables there are (0.33 ms
+    with 200, 0.20 ms with 400, private cluster, 2026-11-12): DDL
+    invalidates only the cache entries of the rows it changed (`inval.c`).
+    A debug `secantusd-pg` takes about 0.010 s with no other table and
+    0.014 s with 800 (2026-11-13): the statement after any DDL still lists
+    the constraint definitions, the comments, the index relations and the
+    relation oids from every table, and reads every row type's catalog
+    document, for each catalog version.
+
+    The fastest of five first-after-DDL runs on a server with 800 more
+    tables against the fastest on one with none, taking turns, within a
+    tenth again plus 1 ms: the growth the previous test's bound still
+    allows (about 3.5 ms) fails it by more than a millisecond."""
+    small_conn, large_conn = pg_pair
+    for i in range(2 * GROWTH_TABLES):
+        large_conn.execute(f"CREATE TABLE rp911_grow_{i} (a int, b text)")
+    small, large = _alternating_firsts(small_conn, large_conn, "rp911c")
+    assert large < 1.1 * small + 0.001, (
+        f"first query after DDL {small * 1000:.1f} ms with no other table, "
+        f"{large * 1000:.1f} ms with {2 * GROWTH_TABLES}"
     )
 
 

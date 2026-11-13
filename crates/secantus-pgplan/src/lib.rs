@@ -16,6 +16,7 @@ use bson::{doc, Bson, Document};
 pub mod acl;
 mod agg_hoist;
 mod agg_support;
+pub mod deferred;
 mod domain_scope;
 pub use domain_scope::{select_output_domains, select_target_domain};
 mod targetlist_size;
@@ -35280,8 +35281,8 @@ fn quote_type_path(name: &str) -> String {
 /// A composite type's resolution NAME by oid -- the reverse of
 /// `user_composite_oid`, for rendering its regtype.
 fn user_composite_name(oid: i64) -> Option<String> {
-    PLAN_USER_COMPOSITES.with(|t| {
-        t.borrow()
+    deferred::read(&PLAN_USER_COMPOSITES, |t| {
+        t.items
             .iter()
             .find(|(_, o, _)| *o == oid)
             .map(|(n, _, _)| n.clone())
@@ -35326,20 +35327,25 @@ thread_local! {
 thread_local! {
     /// The oids `pg_relation_is_publishable` answers true for, installed
     /// with the relations.
-    static PUBLISHABLE_RELATIONS: std::cell::RefCell<Vec<i64>> =
-        const { std::cell::RefCell::new(Vec::new()) };
+    static PUBLISHABLE_RELATIONS: deferred::Slot<Vec<i64>> = deferred::Slot::default();
 }
 
 /// The relations a publication could hold (see [`relation_is_publishable`]).
 pub fn set_publishable_relations(oids: Vec<i64>) {
-    PUBLISHABLE_RELATIONS.with(|t| *t.borrow_mut() = oids);
+    PUBLISHABLE_RELATIONS.with(|t| t.set(oids));
+}
+
+/// The publishable relations `build` lists, at the first lookup (see
+/// [`deferred`]).
+pub fn defer_publishable_relations(build: impl FnOnce() -> Vec<i64> + 'static) {
+    PUBLISHABLE_RELATIONS.with(|t| t.defer(build));
 }
 
 /// `pg_relation_is_publishable(oid)`: true for a user table that is not
 /// temporary, false for any other relation (a catalog, a view, an index, a
 /// sequence), NULL for an oid that names no relation.
 pub fn relation_is_publishable(oid: i64) -> Option<bool> {
-    if PUBLISHABLE_RELATIONS.with(|t| t.borrow().contains(&oid)) {
+    if deferred::read(&PUBLISHABLE_RELATIONS, |t| t.contains(&oid)) {
         return Some(true);
     }
     table_is_visible(oid).map(|_| false)
@@ -36531,13 +36537,9 @@ thread_local! {
     /// User-defined types (enums, today): `(name, oid)`, set by the wire
     /// layer per statement from the shared store. The planner is pure; the
     /// catalog is not, so the catalog comes TO the planner.
-    static PLAN_USER_TYPES: std::cell::RefCell<Vec<(String, i64, Vec<String>)>> =
-        const { std::cell::RefCell::new(Vec::new()) };
-    /// `PLAN_USER_TYPES`' position of each name's first entry: a lookup
-    /// runs per value cast or assigned, and a scan grew it with the number
-    /// of types (RP-014).
-    static PLAN_USER_TYPES_BY_NAME: std::cell::RefCell<std::collections::HashMap<String, usize>> =
-        std::cell::RefCell::new(std::collections::HashMap::new());
+    /// Derived at the first lookup after each publication (RP-911).
+    static PLAN_USER_TYPES: deferred::Slot<NamedTable<(String, i64, Vec<String>)>> =
+        deferred::Slot::default();
     static PLAN_TIMEZONE: std::cell::RefCell<TimeZoneSetting> =
         const { std::cell::RefCell::new(TimeZoneSetting::Utc) };
 }
@@ -36726,20 +36728,45 @@ pub fn take_warnings() -> Vec<(String, String)> {
 /// Install the user-defined types for the statements that follow on this
 /// thread. The wire layer reads them from the shared store per statement.
 pub fn set_user_types(types: Vec<(String, i64, Vec<String>)>) {
-    PLAN_USER_TYPES_BY_NAME.with(|ix| *ix.borrow_mut() = first_positions(&types, |t| &t.0));
-    PLAN_USER_TYPES.with(|t| *t.borrow_mut() = types);
+    PLAN_USER_TYPES.with(|t| t.set(NamedTable::new(types)));
 }
 
-/// Each name's first position in `items`.
-fn first_positions<T>(
-    items: &[T],
-    name: impl Fn(&T) -> &String,
-) -> std::collections::HashMap<String, usize> {
-    let mut out = std::collections::HashMap::with_capacity(items.len());
-    for (i, item) in items.iter().enumerate() {
-        out.entry(name(item).clone()).or_insert(i);
+/// The user types `build` lists, listed at the first lookup (see
+/// [`deferred`]).
+pub fn defer_user_types(build: impl FnOnce() -> Vec<(String, i64, Vec<String>)> + 'static) {
+    PLAN_USER_TYPES.with(|t| t.defer(move || NamedTable::new(build())));
+}
+
+/// Entries named by their first field, with each name's first position: a
+/// lookup runs per value cast or assigned, and a scan grew it with the
+/// number of types (RP-014).
+struct NamedTable<T> {
+    items: Vec<T>,
+    by_name: std::collections::HashMap<String, usize>,
+}
+
+impl<T> Default for NamedTable<T> {
+    fn default() -> Self {
+        Self {
+            items: Vec::new(),
+            by_name: std::collections::HashMap::new(),
+        }
     }
-    out
+}
+
+impl<A: AsRef<str>, B, C> NamedTable<(A, B, C)> {
+    fn new(items: Vec<(A, B, C)>) -> Self {
+        let mut by_name = std::collections::HashMap::with_capacity(items.len());
+        for (i, item) in items.iter().enumerate() {
+            by_name.entry(item.0.as_ref().to_string()).or_insert(i);
+        }
+        Self { items, by_name }
+    }
+
+    /// The first entry named `name`.
+    fn named(&self, name: &str) -> Option<&(A, B, C)> {
+        self.by_name.get(name).and_then(|&i| self.items.get(i))
+    }
 }
 
 thread_local! {
@@ -36762,12 +36789,10 @@ thread_local! {
     /// a per-call catalog read. Composites carry no labels, so they are held
     /// apart from the enum-shaped `PLAN_USER_TYPES` (whose empty label list would
     /// otherwise route a composite cast into the enum arm).
-    static PLAN_USER_COMPOSITES: std::cell::RefCell<Vec<CompositeType>> =
-        const { std::cell::RefCell::new(Vec::new()) };
-    /// `PLAN_USER_COMPOSITES`' position of each name's first entry (see
-    /// `PLAN_USER_TYPES_BY_NAME`): every table's row type is one.
-    static PLAN_USER_COMPOSITES_BY_NAME: std::cell::RefCell<std::collections::HashMap<String, usize>> =
-        std::cell::RefCell::new(std::collections::HashMap::new());
+    /// Every table's row type is one; derived at the first lookup after
+    /// each publication (RP-911).
+    static PLAN_USER_COMPOSITES: deferred::Slot<NamedTable<CompositeType>> =
+        deferred::Slot::default();
 
     /// Custom MULTIRANGE types: `(resolution name -> multirange oid)`. The
     /// companion multirange PostgreSQL auto-creates for every `CREATE TYPE ...
@@ -36789,64 +36814,86 @@ thread_local! {
     /// The standalone composite types (`CREATE TYPE t AS (...)`), by
     /// resolution name: relations of kind `c`, which a FROM or a DML names
     /// to be told "is a composite type" -- not a table's row type.
-    static STANDALONE_COMPOSITES: std::cell::RefCell<Vec<String>> =
-        const { std::cell::RefCell::new(Vec::new()) };
+    static STANDALONE_COMPOSITES: deferred::Slot<Vec<String>> = deferred::Slot::default();
 }
 
 /// Install the standalone composite types' names.
 pub fn set_standalone_composites(names: Vec<String>) {
-    STANDALONE_COMPOSITES.with(|c| *c.borrow_mut() = names);
+    STANDALONE_COMPOSITES.with(|c| c.set(names));
+}
+
+/// The standalone composite types' names `build` lists, at the first
+/// lookup (see [`deferred`]).
+pub fn defer_standalone_composites(build: impl FnOnce() -> Vec<String> + 'static) {
+    STANDALONE_COMPOSITES.with(|c| c.defer(build));
 }
 
 /// Is `name` a standalone composite type?
 pub fn is_standalone_composite(name: &str) -> bool {
-    STANDALONE_COMPOSITES.with(|c| c.borrow().iter().any(|n| n == name))
+    deferred::read(&STANDALONE_COMPOSITES, |c| c.iter().any(|n| n == name))
 }
 
 /// Composite types: `(resolution name, oid, [(field name, field type)])`.
 pub fn set_user_composites(composites: Vec<CompositeType>) {
-    PLAN_USER_COMPOSITES_BY_NAME
-        .with(|ix| *ix.borrow_mut() = first_positions(&composites, |c| &c.0));
-    PLAN_USER_COMPOSITES.with(|t| *t.borrow_mut() = composites);
+    PLAN_USER_COMPOSITES.with(|t| t.set(NamedTable::new(composites)));
 }
+
+/// The composite types `build` lists, at the first lookup (see
+/// [`deferred`]).
+pub fn defer_user_composites(build: impl FnOnce() -> Vec<CompositeType> + 'static) {
+    PLAN_USER_COMPOSITES.with(|t| t.defer(move || NamedTable::new(build())));
+}
+
+/// A row type's `char(n)` field widths, by resolution name.
+pub type CompositeWidths = std::collections::HashMap<String, Vec<Option<usize>>>;
 
 thread_local! {
     /// The `char(n)` width of each field of a table's row type, by
     /// resolution name (`None` for a field that is not `char(n)`).
-    static PLAN_COMPOSITE_WIDTHS: std::cell::RefCell<std::collections::HashMap<String, Vec<Option<usize>>>> =
-        std::cell::RefCell::new(std::collections::HashMap::new());
+    static PLAN_COMPOSITE_WIDTHS: deferred::Slot<CompositeWidths> = deferred::Slot::default();
 }
 
 /// The `char(n)` widths of the row types' fields, installed with them.
-pub fn set_user_composite_widths(widths: std::collections::HashMap<String, Vec<Option<usize>>>) {
-    PLAN_COMPOSITE_WIDTHS.with(|t| *t.borrow_mut() = widths);
+pub fn set_user_composite_widths(widths: CompositeWidths) {
+    PLAN_COMPOSITE_WIDTHS.with(|t| t.set(widths));
+}
+
+/// The row types' `char(n)` widths `build` lists, at the first lookup (see
+/// [`deferred`]).
+pub fn defer_user_composite_widths(build: impl FnOnce() -> CompositeWidths + 'static) {
+    PLAN_COMPOSITE_WIDTHS.with(|t| t.defer(build));
 }
 
 /// A composite's field widths, found as `user_composite` finds the type.
 fn user_composite_widths(name: &str) -> Option<Vec<Option<usize>>> {
     let target = canonical_type_ref(name);
-    PLAN_COMPOSITE_WIDTHS.with(|t| {
-        t.borrow()
-            .iter()
-            .find(|(n, _)| **n == target)
-            .map(|(_, w)| w.clone())
-    })
+    deferred::read(&PLAN_COMPOSITE_WIDTHS, |t| t.get(&target).cloned())
 }
 
 /// A composite type's `(oid, fields)` by name, compared as `user_enum`
 /// compares it.
 fn user_composite(name: &str) -> Option<(i64, CompositeFields)> {
-    // No composite type, nothing to resolve the name for (RP-131).
-    if PLAN_USER_COMPOSITES_BY_NAME.with(|ix| ix.borrow().is_empty()) {
+    let target = canonical_type_ref(name);
+    if names_catalog_type(&target) {
         return None;
     }
-    let target = canonical_type_ref(name);
-    let at = PLAN_USER_COMPOSITES_BY_NAME.with(|ix| ix.borrow().get(&target).copied())?;
-    PLAN_USER_COMPOSITES.with(|t| {
-        t.borrow()
-            .get(at)
+    deferred::read(&PLAN_USER_COMPOSITES, |t| {
+        // No composite type, nothing to resolve the name for (RP-131).
+        if t.items.is_empty() {
+            return None;
+        }
+        t.named(&target)
             .map(|(_, oid, fields)| (*oid, fields.clone()))
     })
+}
+
+/// Does `target` name a `pg_catalog` type (`oid`, `text[]`, `"char"`,
+/// `pg_node_tree`)? `pg_catalog` is searched first, so such a name never
+/// reaches a user type, and the lookup is answered without deriving the
+/// published tables (RP-911): psql's catalog queries ask it of every
+/// operand's type. [`pgtypes::is_catalog_type_name`] has the rule.
+fn names_catalog_type(target: &str) -> bool {
+    pgtypes::is_catalog_type_name(target)
 }
 
 /// A composite type's fields by name, as `user_composite` finds it.
@@ -37285,13 +37332,16 @@ fn user_type_oid(name: &str) -> Option<i64> {
         return Some(d.oid);
     }
     let target = canonical_type_ref(name);
-    PLAN_USER_TYPES
-        .with(|t| {
-            t.borrow()
-                .iter()
-                .find(|(n, _, _)| *n == target)
-                .map(|(_, oid, _)| *oid)
+    (!names_catalog_type(&target))
+        .then(|| {
+            deferred::read(&PLAN_USER_TYPES, |t| {
+                t.items
+                    .iter()
+                    .find(|(n, _, _)| *n == target)
+                    .map(|(_, oid, _)| *oid)
+            })
         })
+        .flatten()
         .or_else(|| user_range_oid(name))
         .or_else(|| user_multirange_oid(name))
         // A shell has an oid but no representation: `to_regtype` answers NULL
@@ -37342,10 +37392,11 @@ fn user_enum(name: &str) -> Option<(i64, Vec<String>)> {
         Some(inner) => inner.to_string(),
         None => trimmed.to_string(),
     };
-    let at = PLAN_USER_TYPES_BY_NAME.with(|ix| ix.borrow().get(&target).copied())?;
-    PLAN_USER_TYPES.with(|t| {
-        t.borrow()
-            .get(at)
+    if names_catalog_type(&target) {
+        return None;
+    }
+    deferred::read(&PLAN_USER_TYPES, |t| {
+        t.named(&target)
             .map(|(_, oid, labels)| (*oid, labels.clone()))
     })
 }
@@ -37358,16 +37409,15 @@ pub fn user_type_name(oid: i64) -> Option<String> {
     if let Some(name) = domains::domain_name_of_oid(oid) {
         return Some(name);
     }
-    PLAN_USER_TYPES
-        .with(|t| {
-            t.borrow()
-                .iter()
-                .find(|(_, o, _)| *o == oid)
-                .map(|(n, _, _)| n.clone())
-        })
-        .or_else(|| user_range_name(oid))
-        .or_else(|| user_multirange_name(oid))
-        .or_else(|| user_base_type_name(oid))
+    deferred::read(&PLAN_USER_TYPES, |t| {
+        t.items
+            .iter()
+            .find(|(_, o, _)| *o == oid)
+            .map(|(n, _, _)| n.clone())
+    })
+    .or_else(|| user_range_name(oid))
+    .or_else(|| user_multirange_name(oid))
+    .or_else(|| user_base_type_name(oid))
 }
 
 /// A custom range type's resolution NAME by oid -- for rendering `pg_typeof`
@@ -50630,8 +50680,9 @@ fn explain_scan_array_quals(
 }
 
 /// A LIKE or ILIKE (or its negation) of a single relation's string column
-/// against a constant pattern (`ExplainOptions::scan_patterns`), with the
-/// regex its lowering matches with, which identifies it in the filter.
+/// against a constant pattern (`ExplainOptions::scan_patterns`), or with
+/// `is_regex` a regex match (`~`, `~*`, `!~`, `!~*`), with the regex its
+/// lowering matches with, which identifies it in the filter.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ScanPattern {
     pub field: String,
@@ -50639,12 +50690,14 @@ pub struct ScanPattern {
     pub pattern: String,
     pub insensitive: bool,
     pub negated: bool,
+    pub is_regex: bool,
 }
 
-/// A single-relation statement's LIKE / ILIKE conjuncts, at any depth of
-/// its WHERE's ANDs and ORs: a `text`, `varchar` or `name` column on the
-/// left, a string constant (bare or cast to `text`) with the default escape
-/// on the right, lowered as `lower_pattern_match` lowers it.
+/// A single-relation statement's LIKE / ILIKE and regex-match conjuncts,
+/// at any depth of its WHERE's ANDs and ORs: a `text`, `varchar` or `name`
+/// column on the left, a string constant (bare or cast to `text`) -- a
+/// LIKE's with the default escape -- on the right, lowered as
+/// `lower_pattern_match` lowers it.
 fn explain_scan_patterns(
     query: &N,
     lookup: &dyn Fn(&str) -> Option<TableDef>,
@@ -50681,9 +50734,6 @@ fn scan_pattern(e: &AExpr, def: &TableDef) -> Option<ScanPattern> {
         return None;
     }
     let (negated, insensitive, is_like) = pattern_operator(operator_name(e).ok()?)?;
-    if !is_like {
-        return None;
-    }
     let field = column_field(e.lexpr.as_deref(), def).ok()?;
     let column = def.columns.iter().find(|c| c.field() == field)?;
     if !matches!(
@@ -50710,6 +50760,16 @@ fn scan_pattern(e: &AExpr, def: &TableDef) -> Option<ScanPattern> {
         return None;
     };
     let pattern = s.sval.clone();
+    if !is_like {
+        return Some(ScanPattern {
+            regex: scalar::pg_regex_source(&pattern),
+            field,
+            pattern,
+            insensitive,
+            negated,
+            is_regex: true,
+        });
+    }
     if like_match::ends_in_escape(&pattern, Some('\\')) {
         return None;
     }
@@ -50719,6 +50779,7 @@ fn scan_pattern(e: &AExpr, def: &TableDef) -> Option<ScanPattern> {
         pattern,
         insensitive,
         negated,
+        is_regex: false,
     })
 }
 

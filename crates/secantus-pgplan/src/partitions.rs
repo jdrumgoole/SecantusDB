@@ -426,21 +426,24 @@ thread_local! {
     /// `(relation, SQL of its tableoid)`: a constant for a table, a CASE over
     /// the partition bounds for a partitioned one. Published by the executor
     /// beside the views.
-    static TABLEOIDS: std::cell::RefCell<Vec<(String, String)>> =
-        const { std::cell::RefCell::new(Vec::new()) };
+    static TABLEOIDS: crate::deferred::Slot<Vec<(String, String)>> =
+        crate::deferred::Slot::default();
 }
 
 /// Install the `tableoid` expressions for the statements that follow.
 pub fn set_tableoids(v: Vec<(String, String)>) {
-    TABLEOIDS.with(|t| *t.borrow_mut() = v);
+    TABLEOIDS.with(|t| t.set(v));
+}
+
+/// The `tableoid` expressions `build` lists, at the first statement that
+/// names the column (see [`crate::deferred`]).
+pub fn defer_tableoids(build: impl FnOnce() -> Vec<(String, String)> + 'static) {
+    TABLEOIDS.with(|t| t.defer(build));
 }
 
 fn tableoid_sql(name: &str) -> Option<String> {
-    let partitioned = TABLEOIDS.with(|t| {
-        t.borrow()
-            .iter()
-            .find(|(n, _)| n == name)
-            .map(|(_, s)| s.clone())
+    let partitioned = crate::deferred::read(&TABLEOIDS, |t| {
+        t.iter().find(|(n, _)| n == name).map(|(_, s)| s.clone())
     });
     // Any other relation is its own oid -- except an inheritance parent,
     // whose rows come from several tables: its union carries the column.

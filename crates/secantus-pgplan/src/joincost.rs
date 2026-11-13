@@ -844,7 +844,14 @@ pub fn cheapest_nest_loop_param(
     left: bool,
 ) -> NestLoopPlan {
     let orders: &[bool] = if left { &[false] } else { &[false, true] };
-    nest_loop_paths_over(&[(a, b, qual)], [None, None], orders, param, qual_startup).1
+    nest_loop_paths_over(
+        &[(a, b, qual)],
+        [None, None],
+        orders,
+        &[param],
+        qual_startup,
+    )
+    .1
 }
 
 /// [`cheapest_nest_loop`] where `a` or `b` may be `inner_unique` as the
@@ -888,7 +895,7 @@ fn nest_loop_paths_with(
     orders: &[bool],
     param: [Option<ParamInner>; 2],
 ) -> NestLoopPlan {
-    nest_loop_paths_over(&[(a, b, qual)], unique, orders, param, 0.0).1
+    nest_loop_paths_over(&[(a, b, qual)], unique, orders, &[param], 0.0).1
 }
 
 /// Two input relations of a join, each `(startup, total, rows, width)`,
@@ -906,11 +913,25 @@ pub fn cheapest_nest_loop_of(pairs: &[NestLoopPair]) -> Option<(usize, NestLoopP
     if pairs.is_empty() {
         return None;
     }
+    cheapest_nest_loop_of_param(pairs, &vec![[None, None]; pairs.len()])
+}
+
+/// [`cheapest_nest_loop_of`] where a pair's inner may be a base relation's
+/// index scan parameterized by a relation of its outer side (RP-354):
+/// `params[i]` is pair `i`'s, `[0]` with its `b` inner and `[1]` with its
+/// `a`, each weighed as [`cheapest_nest_loop_param`] weighs one.
+pub fn cheapest_nest_loop_of_param(
+    pairs: &[NestLoopPair],
+    params: &[[Option<ParamInner>; 2]],
+) -> Option<(usize, NestLoopPlan)> {
+    if pairs.is_empty() || params.len() != pairs.len() {
+        return None;
+    }
     Some(nest_loop_paths_over(
         pairs,
         [None, None],
         &[false, true],
-        [None, None],
+        params,
         0.0,
     ))
 }
@@ -919,7 +940,7 @@ fn nest_loop_paths_over(
     pairs: &[NestLoopPair],
     unique: [Option<(f64, f64)>; 2],
     orders: &[bool],
-    param: [Option<ParamInner>; 2],
+    params: &[[Option<ParamInner>; 2]],
     qual_startup: f64,
 ) -> (usize, NestLoopPlan) {
     let mut paths: Vec<JoinPath> = Vec::new();
@@ -934,7 +955,7 @@ fn nest_loop_paths_over(
             let inner = InPath::scan(i.0, i.1, i.2, None);
             let mat = material(&inner, i.3);
             materials[pair][usize::from(b_outer)] = (mat.startup, mat.total);
-            let param_inner = param[usize::from(b_outer)].map(|p| {
+            let param_inner = params[pair][usize::from(b_outer)].map(|p| {
                 let mut path = InPath::scan(p.startup, p.total, p.rows, None);
                 path.indexed = true;
                 (path, p.qual, p.memo)
@@ -2755,6 +2776,43 @@ mod tests {
         let (startup, total) = hash_join_stats(&side(false), &side(true), 0.1 * 0.001, &[b, a]);
         assert!((startup - 30.0).abs() < 1e-9, "{startup}");
         assert!((total - 50.25).abs() < 1e-9, "{total}");
+    }
+
+    /// A join relation built from two pairs (RP-354): a parameterized
+    /// inner belongs to its own pair only. Without one the cheaper pair
+    /// wins as [`cheapest_nest_loop_of`] picks it; with a cheap index scan
+    /// as the second pair's inner, parameterized by its outer and cached
+    /// under a Memoize over a thousand calls of ten values, the second
+    /// pair's memoized loop is kept.
+    #[test]
+    fn a_pairs_parameterized_inner_is_its_own() {
+        let small = (0.0, 15.0, 1000.0, 7);
+        let lower = (0.0, 15032.5, 333_333.0, 14);
+        let pairs: Vec<NestLoopPair> = vec![(small, small, 0.0025), (lower, small, 0.0025)];
+        let none = vec![[None, None]; 2];
+        assert_eq!(
+            cheapest_nest_loop_of_param(&pairs, &none),
+            cheapest_nest_loop_of(&pairs)
+        );
+        let inner = ParamInner {
+            startup: 0.28,
+            total: 6.14,
+            rows: 333.0,
+            qual: 0.0,
+            memo: Some(MemoKey::column(10.0, false, 1000.0, 1000.0)),
+        };
+        let (pick, plan) =
+            cheapest_nest_loop_of_param(&pairs, &[[None, None], [Some(inner), None]]).unwrap();
+        assert_eq!(pick, 0, "the first pair is still the cheaper");
+        assert!(!plan.param);
+        let only = &pairs[1..];
+        let (pick, plan) = cheapest_nest_loop_of_param(only, &[[Some(inner), None]]).unwrap();
+        assert_eq!(pick, 0);
+        assert!(
+            plan.param && !plan.b_outer && plan.memoize.is_some(),
+            "{plan:?}"
+        );
+        assert!(cheapest_nest_loop_of_param(only, &none).is_none());
     }
 
     /// `mergejoinscansel` (RP-366): over two integer columns whose values
