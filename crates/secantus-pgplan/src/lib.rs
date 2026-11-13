@@ -42017,8 +42017,20 @@ fn bpchar_args(f: &pg_query::protobuf::FuncCall, name: &str, args: Vec<Bson>) ->
                 }
                 let ty = static_type(node, &v);
                 // A string is its own text, except an inet, whose output drops
-                // a full host mask the stored text keeps.
-                if matches!(v, Bson::String(_)) && !matches!(ty.as_str(), "inet" | "cidr") {
+                // a full host mask the stored text keeps, and a date or
+                // timestamp, written in the session DateStyle (RP-894).
+                if matches!(v, Bson::String(_))
+                    && !matches!(
+                        ty.as_str(),
+                        "inet"
+                            | "cidr"
+                            | "date"
+                            | "timestamp"
+                            | "timestamp without time zone"
+                            | "timestamptz"
+                            | "timestamp with time zone"
+                    )
+                {
                     return v;
                 }
                 if CAST.contains(&name) {

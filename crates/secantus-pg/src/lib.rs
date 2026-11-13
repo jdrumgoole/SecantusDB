@@ -32619,7 +32619,7 @@ impl PgHandler {
                     Bson::Int32(_) | Bson::Int64(_) | Bson::Double(_) | Bson::Decimal128(_)
                 ) && !secantus_pgplan::numeric::is_wide_numeric(v) =>
             {
-                let text = secantus_pgplan::typeout::session_output_text(v, &c.pg_type);
+                let text = secantus_pgplan::typeout::output_text(v, &c.pg_type);
                 Bson::String(format!("'{}'::{label}", text.replace('\'', "''")))
             }
             Some(other) => {

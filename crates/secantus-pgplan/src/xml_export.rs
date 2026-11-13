@@ -97,7 +97,7 @@ fn xml_value(v: &Bson, ty: &str, base64: bool) -> String {
         return out;
     }
     let text = if typeout::needs_type(ty) {
-        typeout::output_text(v, ty)
+        typeout::iso_output_text(v, ty)
     } else {
         render_value_text(v)
     };

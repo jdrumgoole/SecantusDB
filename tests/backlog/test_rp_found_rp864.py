@@ -1,7 +1,7 @@
 """Gap test of the divergence found while working RP-864 (a temporal or
 bytea DEFAULT printed its internal form): the text a `date` or `timestamp`
-becomes through its output function inside an expression -- `concat`,
-`format`, a record's text -- is ISO whatever the session DateStyle (RP-894).
+became through its output function inside an expression -- `concat`,
+`format`, a record's text -- was ISO whatever the session DateStyle (RP-894).
 
 The expected answers were measured on PostgreSQL 15.19; none needs DDL.
 `to_json` is the control: JSON writes ISO under every DateStyle.

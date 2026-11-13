@@ -1139,7 +1139,10 @@ one beside it.
       depend on more than its own catalog row (its grants, its inheritance
       parents and children, the foreign keys naming it, the types its
       columns name), so each key has to carry them, or a stale entry is a
-      wrong answer.
+      wrong answer. Its gap test is a timing ratio and can pass once by
+      noise: a `gate_pg.sh` backlog step on 2026-11-13 (load average ~18)
+      reported it `FIXED?`, then it failed three of three runs alone (0.015 s
+      against 0.0117 s, the bar 1.1x). Rerun it alone before closing.
       Backlog-ID: RP-911
       Verify: tests/backlog/test_rp_catalog_latency.py::test_the_first_catalog_query_after_ddl_costs_the_same_at_800_tables_within_a_tenth
 
@@ -4239,22 +4242,3 @@ tests are in `tests/backlog/test_rp_found_rp565.py`.
       `x` and the second is 42809.
       Verify: tests/backlog/test_rp_found_rp565.py::test_a_temporary_row_type_hides_a_built_in_type
       Backlog-ID: RP-891
-
-## Found while working RP-864 (2026-11-12)
-
-Measured on PostgreSQL 15.19; none of it needs DDL.
-
-- [ ] **A `date` or `timestamp` made text inside an expression ignores the
-      DateStyle.** Under `set datestyle to 'German'`, `concat('2020-01-02'::date,
-      '|', '2020-01-01 12:00'::timestamp)` is `02.01.2020|01.01.2020 12:00:00`
-      on PostgreSQL 15.19, `format('%s', '2020-01-02'::date)` `02.01.2020`
-      and `row('2020-01-02'::date, '2020-01-01 12:00'::timestamp)::text`
-      `(02.01.2020,"01.01.2020 12:00:00")`: each calls `date_out` /
-      `timestamp_out`, which write in the session DateStyle. Here each is
-      ISO: `typeout::output_text` writes ISO, as JSON and XML (which stay
-      ISO under every DateStyle) need, and `needs_type` leaves `date` out,
-      so these paths print the stored text. `typeout::session_output_text`
-      (RP-864's DEFAULT printer) is the styled form; the fix is choosing it
-      at the output-function sites and not at JSON's and XML's.
-      Verify: tests/backlog/test_rp_found_rp864.py::test_a_date_as_text_in_an_expression_follows_the_datestyle
-      Backlog-ID: RP-894

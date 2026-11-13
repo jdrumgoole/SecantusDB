@@ -82,7 +82,7 @@ pub fn to_json_value(v: &Bson, ty: &str) -> Json {
         // A float4 is its shortest float4 text, not the f64 it is carried as.
         "float4" | "real" => match v {
             Bson::Double(d) if d.is_finite() => Json::Number(crate::geo::float4_text(*d as f32)),
-            other => Json::Str(crate::typeout::output_text(other, ty)),
+            other => Json::Str(crate::typeout::iso_output_text(other, ty)),
         },
         // The numbers are JSON numbers; every other built-in type is the
         // string its output function prints (`to_json('0/16'::pg_lsn)` is
@@ -90,7 +90,7 @@ pub fn to_json_value(v: &Bson, ty: &str) -> Json {
         "int2" | "int4" | "int8" | "smallint" | "integer" | "bigint" | "float8"
         | "double precision" | "numeric" | "decimal" | "" => number_or_text(v),
         t if crate::pgtypes::oid_of_name(t).is_some() => {
-            Json::Str(crate::typeout::output_text(v, t))
+            Json::Str(crate::typeout::iso_output_text(v, t))
         }
         "text" | "varchar" | "bpchar" | "name" | "char" | "unknown" | "date" | "time" | "uuid" => {
             Json::Str(crate::value_text(v))
