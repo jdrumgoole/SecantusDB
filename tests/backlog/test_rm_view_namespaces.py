@@ -148,17 +148,22 @@ def test_an_unacquired_drop_indexes_names_cmd_and_is_not_profiled(
     assert got["rust"] == got["mongod"]
 
 
-@pytest.mark.backlog("RM-486")
+@pytest.mark.backlog_fixed("RM-486")
 def test_an_explain_of_a_write_is_not_profiled(rust_mongo: Any, mongod_rs: Any) -> None:
     """mongod 8.2.11 writes no profile entry for an `explain` of an
-    `update`; this server writes one, named for the collection."""
-    got = _entries(
-        rust_mongo,
-        mongod_rs,
-        lambda d: d.command(
-            "explain", {"update": "c", "updates": [{"q": {}, "u": {"$set": {"a": 1}}}]}
-        ),
-    )
+    `update`, a `delete` or a `findAndModify`, at any verbosity; this server
+    wrote one, named for the collection."""
+
+    def op(db: Any) -> None:
+        for write in (
+            {"update": "c", "updates": [{"q": {}, "u": {"$set": {"a": 1}}}]},
+            {"delete": "c", "deletes": [{"q": {"x": 1}, "limit": 1}]},
+            {"findAndModify": "c", "query": {"x": 1}, "update": {"$set": {"a": 1}}},
+        ):
+            for verbosity in ("queryPlanner", "executionStats"):
+                db.command("explain", write, verbosity=verbosity)
+
+    got = _entries(rust_mongo, mongod_rs, op)
     assert got["mongod"] == []
     assert got["rust"] == got["mongod"]
 

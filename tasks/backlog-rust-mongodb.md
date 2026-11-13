@@ -1014,12 +1014,6 @@ These are explicit non-goals. Don't add them without a reason.
       RM-484, 2026-11-13.
       Verify: tests/backlog/test_rm_ts_ddl_lines.py::test_a_find_of_buckets_says_what_it_examined
       Backlog-ID: RM-586
-- [ ] **An `explain` of a write is profiled.** mongod 8.2.11 writes no
-      profile entry for an `explain` of an `update` (a `delete` or
-      `findAndModify` not measured); this server writes one, named for the
-      collection. Found while working RM-380, 2026-11-10.
-      Verify: tests/backlog/test_rm_view_namespaces.py::test_an_explain_of_a_write_is_not_profiled
-      Backlog-ID: RM-486
 - [ ] **An `update` or `delete` of a view writes no statement line.**
       mongod 8.2.11 refuses the statement and writes its line (`<db>.v`,
       `normal`, `ok: 0`, the refusal) before the command's; this server

@@ -145,8 +145,6 @@ _OPS: dict[str, Callable[[Any], Any]] = {
 _ENTRY_GAPS = {
     # mongod profiles a drop of a view; this server writes no entry.
     "drop of a view": "RM-384",
-    # mongod profiles no explain of a write; this server profiles one.
-    "explain of an update": "RM-486",
     # mongod profiles an insert into a buckets collection; this server
     # writes no entry.
     "insert into a time-series collection's buckets": "RM-585",
