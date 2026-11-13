@@ -2760,7 +2760,11 @@ fn range_dates(slots: &[usize], docs: &[Document], sort_by: Option<&Document>) -
 
 /// Inclusive `(low, high)` value-window indices: rows whose (ascending) sortBy
 /// value falls in `[cur + lo, cur + hi]`. Bounds: `"unbounded"` → open,
-/// `"current"` → `cur`, numeric offset → `cur + b * unit_ms`. A fixed-duration
+/// numeric offset → `cur + b * unit_ms`, and `"current"` → the document
+/// answered itself, not its sort value: mongod's `getEndpointsRangeBased`
+/// takes `"current"` as offset 0 from the current document, so a document
+/// tied with it on the sort key lies outside a `["unbounded", "current"]`
+/// window when it sorts after it (mongod 8.2.11, RM-508). A fixed-duration
 /// time `unit` scales the offset and pins the x-axis to the date sortBy's epoch
 /// millis (`range_dates`). mongod's rule holds both ways: `unit` requires a date
 /// sortBy, a date sortBy requires `unit`. A variable-length `unit`
@@ -2795,10 +2799,11 @@ fn range_window_bounds(
         _ => return Err(Fallback::Defer),
     };
     let cur = vals[slot];
+    let is_current = |b: &Bson| matches!(b, Bson::String(s) if s == "current");
     let edge = |b: &Bson| -> R<Option<f64>> {
         match b {
-            Bson::String(s) if s == "unbounded" => Ok(None),
-            Bson::String(s) if s == "current" => Ok(Some(cur)),
+            // `"current"` is a position, set below, not a value.
+            Bson::String(s) if s == "unbounded" || s == "current" => Ok(None),
             _ => as_number(b)
                 .map(|x| Some(cur + x * unit_ms))
                 .ok_or(Fallback::Defer),
@@ -2813,6 +2818,12 @@ fn range_window_bounds(
     let mut high = n as i64 - 1;
     while high >= 0 && hi.is_some_and(|h| vals[high as usize] > h) {
         high -= 1;
+    }
+    if is_current(&bounds[0]) {
+        low = slot as i64;
+    }
+    if is_current(&bounds[1]) {
+        high = slot as i64;
     }
     Ok((low, high))
 }
@@ -3201,5 +3212,121 @@ mod budget_tests {
             let err = format!("{:?}", run(&spec, memlimit::MAX_BYTES).unwrap_err());
             assert!(err.contains("5371602"), "{err}");
         }
+    }
+}
+
+#[cfg(test)]
+mod range_current_tests {
+    use super::*;
+    use bson::{bson, doc};
+
+    /// `{_id: i, t: $push, s: $sum, m: $min, c: $count}` of `_id` over a
+    /// `range` window with `bounds`, sorted by `n` of 1, 1, 2, 2, 2, 3.
+    fn windows(bounds: Bson) -> Vec<(Vec<i32>, i32, i32, i32)> {
+        let docs: Vec<Document> = [1, 1, 2, 2, 2, 3]
+            .iter()
+            .enumerate()
+            .map(|(i, n)| doc! {"_id": i as i32, "n": *n})
+            .collect();
+        let w = bson!({"range": bounds});
+        let spec = bson!({"sortBy": {"n": 1}, "output": {
+            "t": {"$push": "$_id", "window": w.clone()},
+            "s": {"$sum": "$_id", "window": w.clone()},
+            "m": {"$min": "$_id", "window": w.clone()},
+            "c": {"$count": {}, "window": w},
+        }});
+        let mut out = Vec::new();
+        set_window_fields_each(&spec, docs, &Document::new(), None, None, None, &mut |d| {
+            let t = d.get_array("t").unwrap();
+            let t = t.iter().map(|v| v.as_i32().unwrap()).collect();
+            out.push((
+                t,
+                d.get_i32("s").unwrap(),
+                d.get_i32("m").unwrap(),
+                d.get_i32("c").unwrap(),
+            ));
+            Ok(())
+        })
+        .unwrap();
+        out
+    }
+
+    /// A `range` window's `"current"` is the document answered, not its
+    /// sort value: a document tied with it is outside the window on the
+    /// side `"current"` closes (mongod 8.2.11, 2026-11-13, RM-508).
+    #[test]
+    fn a_range_windows_current_is_the_document() {
+        let pushes = |b: Bson| windows(b).into_iter().map(|w| w.0).collect::<Vec<_>>();
+        assert_eq!(
+            pushes(bson!(["unbounded", "current"])),
+            [
+                vec![0],
+                vec![0, 1],
+                vec![0, 1, 2],
+                vec![0, 1, 2, 3],
+                vec![0, 1, 2, 3, 4],
+                vec![0, 1, 2, 3, 4, 5]
+            ]
+        );
+        assert_eq!(
+            pushes(bson!(["current", "unbounded"])),
+            [
+                vec![0, 1, 2, 3, 4, 5],
+                vec![1, 2, 3, 4, 5],
+                vec![2, 3, 4, 5],
+                vec![3, 4, 5],
+                vec![4, 5],
+                vec![5]
+            ]
+        );
+        assert_eq!(
+            pushes(bson!(["current", "current"])),
+            [vec![0], vec![1], vec![2], vec![3], vec![4], vec![5]]
+        );
+        assert_eq!(
+            pushes(bson!([0, "current"])),
+            [
+                vec![0],
+                vec![0, 1],
+                vec![2],
+                vec![2, 3],
+                vec![2, 3, 4],
+                vec![5]
+            ]
+        );
+        assert_eq!(
+            pushes(bson!(["current", 0])),
+            [
+                vec![0, 1],
+                vec![1],
+                vec![2, 3, 4],
+                vec![3, 4],
+                vec![4],
+                vec![5]
+            ]
+        );
+        // The removable accumulators move with the same window.
+        assert_eq!(
+            windows(bson!([-1, "current"])),
+            [
+                (vec![0], 0, 0, 1),
+                (vec![0, 1], 1, 0, 2),
+                (vec![0, 1, 2], 3, 0, 3),
+                (vec![0, 1, 2, 3], 6, 0, 4),
+                (vec![0, 1, 2, 3, 4], 10, 0, 5),
+                (vec![2, 3, 4, 5], 14, 2, 4),
+            ]
+        );
+        assert_eq!(
+            windows(bson!(["current", 1])),
+            [
+                (vec![0, 1, 2, 3, 4], 10, 0, 5),
+                (vec![1, 2, 3, 4], 10, 1, 4),
+                (vec![2, 3, 4, 5], 14, 2, 4),
+                (vec![3, 4, 5], 12, 3, 3),
+                (vec![4, 5], 9, 4, 2),
+                (vec![5], 5, 5, 1),
+            ]
+        );
     }
 }

@@ -34,11 +34,11 @@ def _current_windows(client: Any) -> dict:
     return out
 
 
-@pytest.mark.backlog("RM-508")
+@pytest.mark.backlog_fixed("RM-508")
 def test_a_range_windows_current_is_the_document(rust_mongo: Any, mongod: Any) -> None:
     """A `range` window's `"current"` bound is the document answered, not
     its sort value: mongod's `["unbounded", "current"]` over `n` of 1, 1, 2,
-    2, 2, 3 gives `[0], [0, 1], [0, 1, 2], ...`; this server takes in the
+    2, 2, 3 gives `[0], [0, 1], [0, 1, 2], ...`; this server took in the
     documents tied with it (`[0, 1], [0, 1], [0, 1, 2, 3, 4], ...`)."""
     assert _current_windows(rust_mongo) == _current_windows(mongod)
 

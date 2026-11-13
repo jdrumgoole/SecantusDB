@@ -1556,17 +1556,6 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       9). Found 2026-11-13 (RM-506).
       Verify: tests/backlog/test_rm_found_2026_11_13_rm506.py::test_a_missing_field_counts_its_slot
       Backlog-ID: RM-616
-- [ ] **A `range` window's `"current"` bound takes in tied documents.**
-      mongod 8.2.1 reads `"current"` in a `range` window as the document
-      answered (`getEndpointsRangeBased`: offset 0), so over `n` of 1, 1,
-      2, 2, 2, 3 a `$push` of `_id` over `["unbounded", "current"]` gives
-      `[0], [0, 1], [0, 1, 2], ...`; this server bounds the window by the
-      current sort value (`range_window_bounds`), taking in every document
-      tied with it: `[0, 1], [0, 1], [0, 1, 2, 3, 4], ...`. The same for a
-      `"current"` lower bound. A wrong answer for any sort key with ties.
-      Found 2026-11-10 (RM-404).
-      Verify: tests/backlog/test_rm_found_2026_11_10_rm404.py::test_a_range_windows_current_is_the_document
-      Backlog-ID: RM-508
 - [ ] **`$integral` and the covariances count no memory in a window.**
       mongod 8.2.1 counts what they hold: `maxFunctionMemoryUsageBytes`
       3888 for a `["unbounded", 4]` `range` `$integral` over 40 documents,
