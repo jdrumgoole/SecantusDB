@@ -272,6 +272,12 @@ pub struct CommandContext {
     /// Set when the database has a profile filter: whether the filter
     /// matched, which decides the slow-query log line in place of `slowms`.
     pub slow_log: Option<bool>,
+    /// The command parsed, as mongod's `Command::parse` parses it: from here
+    /// on it is an operation, which the slow-query log may write a line for.
+    /// One refused as it parses -- an unknown or mistyped field, a namespace
+    /// that is not one, an unknown pipeline stage -- writes none (RM-386,
+    /// measured 8.2.11).
+    pub parsed: bool,
     /// Time this request spent WAITING for data rather than working: an
     /// awaitData `getMore` blocked on the oplog. Left out of the time the
     /// slow-operation log measures, or every idle change stream would log a
@@ -419,6 +425,7 @@ impl CommandContext {
             profiling: None,
             op_query: false,
             slow_log: None,
+            parsed: false,
             awaited: std::cell::Cell::new(std::time::Duration::ZERO),
             pending_batch: None,
             exec_stats: None,
@@ -1756,15 +1763,55 @@ fn collection_name_problem(name: &str, doc: &Document, db: &str) -> Option<Comma
     }
 }
 
-/// The parse a command's handler starts with, run ahead of the statement's
-/// locks: mongod parses a request before it runs it, and takes its locks
-/// inside the run, so a request it refuses as malformed takes no lock
-/// (RM-185, measured 8.2.11). The handler parses again, with the same code.
-fn parse_before_locks(name: &str, doc: &Document, db: &str) -> Result<(), CommandError> {
+/// The parse a command's handler starts with, run ahead of the command as
+/// mongod's `Command::parse` runs it: before authorization, the command's
+/// admission and its locks, so a request it refuses as malformed takes no
+/// lock (RM-185), and writes no `Slow query` line, no profile entry, and is
+/// not a connection's first command (RM-386, measured 8.2.11). The session
+/// fields are parsed with the command's own. The handler parses again, with
+/// the same code; what each handler parses as it runs instead is mongod's
+/// run-time parse (a filter, a sort, a stage's spec).
+fn parse_before_locks(
+    name: &str,
+    doc: &Document,
+    ctx: &CommandContext,
+) -> Result<(), CommandError> {
+    session::parse_fields(name, doc)?;
+    let db = ctx.db_name.as_str();
     match name {
-        "explain" => explain::parse(doc, db).map(drop),
+        "find" => find::parse(doc, db),
+        "insert" | "update" | "delete" => {
+            crud::write_parse(name, doc, ctx.raw_insert_documents.as_deref())
+        }
+        "aggregate" => aggregate::parse(doc, db, false).map(drop),
+        "count" => crud::count_parse(doc),
+        "findAndModify" | "findandmodify" => findandmodify::parse(doc),
+        "createIndexes" => argtypes::require_index_specs(doc),
+        "drop" => admin::drop_parse(doc),
+        "listCollections" => admin::list_collections_parse(doc),
+        "listIndexes" => admin::list_indexes_parse(doc),
+        "renameCollection" => admin::rename_collection_parse(doc),
+        "getMore" => cursors::get_more_parse(doc).map(drop),
+        "killCursors" => cursors::kill_cursors_parse(doc).map(drop),
+        "explain" => match explain::parse_ahead(doc, db)? {
+            Some((inner_name, inner)) => parse_explained(&inner_name, &inner, db),
+            None => Ok(()),
+        },
         "dataSize" | "datasize" => stats_admin::parse_data_size(doc).map(drop),
         "validateDBMetadata" => misc_admin::parse_validate_db_metadata(doc).map(drop),
+        _ => Ok(()),
+    }
+}
+
+/// The command an `explain` explains, parsed as `explain` parses it: as the
+/// command itself, except that an aggregate takes no `cursor`.
+fn parse_explained(name: &str, inner: &Document, db: &str) -> Result<(), CommandError> {
+    match name {
+        "find" => find::parse(inner, db),
+        "count" => crud::count_parse(inner),
+        "aggregate" => aggregate::parse(inner, db, true).map(drop),
+        "update" | "delete" => crud::write_parse(name, inner, None),
+        "findAndModify" | "findandmodify" => findandmodify::parse(inner),
         _ => Ok(()),
     }
 }
@@ -1856,6 +1903,9 @@ fn dispatch_inner(
                 | "autoCompact"
         )
     {
+        // mongod refuses it once the command has parsed: the refusal is
+        // logged (measured 8.2.11, `killOp` on another database, RM-386).
+        ctx.parsed = true;
         return CommandError::new(
             13,
             "Unauthorized",
@@ -1880,9 +1930,10 @@ fn dispatch_inner(
             }
             // mongod parses a command before it takes a lock, so one it
             // refuses as malformed takes none (RM-185).
-            if let Err(e) = parse_before_locks(name, doc, &ctx.db_name) {
+            if let Err(e) = parse_before_locks(name, doc, ctx) {
                 return e.into_reply();
             }
+            ctx.parsed = true;
             // Auth gating + RBAC run after CommandNotFound but before the
             // handler (mirrors `commands.py::dispatch`), so an unknown command
             // is still `59` rather than `13` even under `--auth`.
@@ -1980,6 +2031,13 @@ fn dispatch_inner(
                     return e.into_reply();
                 }
             }
+            // What mongod checks of the session fields once the command has
+            // parsed (a `txnNumber` with no `lsid`, `autocommit: true`, ...):
+            // the command is logged, and is not a connection's first command
+            // (measured 8.2.11, RM-386). `session::run` reads them again.
+            if let Err(e) = session::parse(name, doc) {
+                return e.into_reply();
+            }
             // The command has parsed, been authorized and passed its
             // concerns and `maxTimeMS`: it is about to run, which is where
             // mongod's `IngressHandshakeMetrics::onCommandReceived` counts a
@@ -2058,6 +2116,7 @@ fn dispatch_inner(
         None => {
             // A command mongod has and this server does not: mongod would
             // parse and run it, so it counts as it arrives.
+            ctx.parsed = mongod_commands::row(name).is_some();
             handshake::note_command(name, ctx, received);
             CommandError::command_not_found(name).into_reply()
         }

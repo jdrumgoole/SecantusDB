@@ -86,14 +86,14 @@ def _meta_read(db: Any) -> None:
     )
 
 
-@pytest.mark.backlog("RM-496")
+@pytest.mark.backlog_fixed("RM-496")
 def test_a_read_of_the_meta_index_names_the_index_over_the_buckets(
     rust_mongo: Any, mongod_rs: Any
 ) -> None:
     """mongod 8.2.11's line for a `find` of a time-series collection read
     through its default meta-and-time index names the index as the buckets
     keep it: `IXSCAN { meta: 1, control.min.t: 1, control.max.t: 1 }`. This
-    server's names it as `listIndexes` shows it, `IXSCAN { m: 1, t: 1 }`."""
+    server's named it as `listIndexes` shows it, `IXSCAN { m: 1, t: 1 }`."""
 
     def summary(client: Any, is_mongod: bool) -> Any:
         lines, _ = logged(client, is_mongod, _meta_read, lambda d: list(d.ts.find({"m": 1})))
@@ -101,6 +101,84 @@ def test_a_read_of_the_meta_index_names_the_index_over_the_buckets(
 
     want = summary(mongod_rs, True)
     assert want == ["IXSCAN { meta: 1, control.min.t: 1, control.max.t: 1 }"]
+    assert summary(rust_mongo, False) == want
+
+
+def _indexed_series(db: Any) -> None:
+    db.create_collection("ts", timeseries={"timeField": "t", "metaField": "m"})
+    db.ts.insert_many(
+        [
+            {"t": datetime.datetime(2024, 1, 1, 0, 0, i), "m": {"a": i % 3, "b": 1}, "v": i}
+            for i in range(30)
+        ]
+    )
+    db.ts.create_index([("v", 1)])
+    db.ts.create_index([("m.a", 1), ("t", -1)])
+    db.ts.create_index([("m.b", -1)])
+
+
+#: Reads of a time-series collection through each kind of index on it.
+_INDEXED_READS = {
+    "find on a meta subfield": lambda d: list(d.ts.find({"m.a": 1})),
+    "find on a descending meta subfield": lambda d: list(d.ts.find({"m.b": 1})),
+    "find on a measurement": lambda d: list(d.ts.find({"v": 3})),
+    "hinted find": lambda d: list(d.ts.find({}).hint([("v", 1)])),
+    "aggregate": lambda d: list(d.ts.aggregate([{"$match": {"m.a": 1}}])),
+    "count": lambda d: d.ts.count_documents({"m.a": 1}),
+    "distinct": lambda d: d.ts.distinct("v", {"m.a": 1}),
+}
+
+
+def _summaries(client: Any, is_mongod: bool, op: Any) -> Any:
+    lines, profile = logged(client, is_mongod, _indexed_series, op)
+    return (
+        [a.get("planSummary") for _, a in lines],
+        [p.get("planSummary") for p in profile],
+    )
+
+
+@pytest.mark.backlog_fixed("RM-496")
+def test_every_read_of_a_time_series_index_names_it_over_the_buckets(
+    rust_mongo: Any, mongod_rs: Any
+) -> None:
+    """mongod 8.2.11 names every index a time-series read uses as its
+    buckets keep it, in the `Slow query` line and the profile entry alike:
+    the meta field as `meta`, a measurement field as its pair of bounds,
+    `control.max` first for a descending key (`IXSCAN { meta.a: 1,
+    control.max.t: -1, control.min.t: -1 }` for `{m.a: 1, t: -1}`,
+    `IXSCAN { control.min.v: 1, control.max.v: 1 }` for `{v: 1}`), for a
+    `find`, an `aggregate`, a `count` and a `distinct`. This server named
+    them as `listIndexes` shows them (measured 2026-11-13)."""
+    want = {case: _summaries(mongod_rs, True, op) for case, op in _INDEXED_READS.items()}
+    assert want["find on a meta subfield"] == (
+        ["IXSCAN { meta.a: 1, control.max.t: -1, control.min.t: -1 }"],
+        ["IXSCAN { meta.a: 1, control.max.t: -1, control.min.t: -1 }"],
+    )
+    got = {case: _summaries(rust_mongo, False, op) for case, op in _INDEXED_READS.items()}
+    assert {k: v for k, v in got.items() if v != want[k]} == {}
+
+
+@pytest.mark.backlog("RM-600")
+def test_a_time_series_read_bounded_on_its_time_field_scans_the_clustered_buckets(
+    rust_mongo: Any, mongod_rs: Any
+) -> None:
+    """mongod 8.2.11 reads a time-series collection bounded on its time
+    field, with no index to serve the bound, as a `CLUSTERED_IXSCAN` of its
+    buckets: they are clustered by `_id`, whose timestamp is each bucket's
+    start, so the bound on `control.min.t` bounds the `_id`s read. This
+    server's line says `COLLSCAN` (measured 2026-11-13)."""
+
+    def summary(client: Any, is_mongod: bool) -> Any:
+        lines, profile = logged(
+            client,
+            is_mongod,
+            _meta_read,
+            lambda d: list(d.ts.find({"t": {"$gt": datetime.datetime(2024, 1, 1)}})),
+        )
+        return [a.get("planSummary") for _, a in lines], [p.get("planSummary") for p in profile]
+
+    want = summary(mongod_rs, True)
+    assert want == (["CLUSTERED_IXSCAN"], ["CLUSTERED_IXSCAN"])
     assert summary(rust_mongo, False) == want
 
 

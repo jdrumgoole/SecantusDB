@@ -14,6 +14,7 @@ use bson::{doc, Bson, Document};
 
 use super::shape::{self, Shape};
 use super::{bounds, catalog, parsed, plan, resolve_hint, Kind, Node, Query};
+use crate::ts_buckets::Layout;
 use crate::CommandContext;
 
 /// The shape of a `find`, `count`, `distinct` or `aggregate`; `None` for
@@ -58,19 +59,21 @@ pub(crate) fn reads_no_collection(request: &Document) -> bool {
 
 /// The leaf stages of `plan`, depth first, as a `planSummary` names them.
 pub(crate) fn leaves_of(plan: &Node, out: &mut Vec<String>) {
-    leaves(&plan.to_doc(None), out);
+    leaves(&plan.to_doc(None), None, out);
 }
 
-/// The leaf stages of an explain plan document, depth first.
-fn leaves(stage: &Document, out: &mut Vec<String>) {
+/// The leaf stages of an explain plan document, depth first. `buckets`: the
+/// layout of the time-series collection read, whose indexes are named as
+/// its buckets keep them.
+fn leaves(stage: &Document, buckets: Option<&Layout>, out: &mut Vec<String>) {
     let mut inner = false;
     if let Ok(input) = stage.get_document("inputStage") {
-        leaves(input, out);
+        leaves(input, buckets, out);
         inner = true;
     }
     if let Ok(inputs) = stage.get_array("inputStages") {
         for input in inputs.iter().filter_map(Bson::as_document) {
-            leaves(input, out);
+            leaves(input, buckets, out);
         }
         inner = true;
     }
@@ -82,7 +85,18 @@ fn leaves(stage: &Document, out: &mut Vec<String>) {
     };
     // An express stage gives its key pattern already printed.
     out.push(match stage.get("keyPattern") {
-        Some(Bson::Document(key)) => format!("{name} {}", bounds::render_key_pattern(key)),
+        // mongod reads a time-series collection's index on its buckets,
+        // and names it as they keep it: the meta field is `meta`, a
+        // measurement field its pair of bounds (measured 8.2.11,
+        // 2026-11-13: `IXSCAN { meta.a: 1, control.max.t: -1,
+        // control.min.t: -1 }` for an index on `{m.a: 1, t: -1}`).
+        Some(Bson::Document(key)) => match buckets {
+            Some(layout) => format!(
+                "{name} {}",
+                bounds::render_key_pattern(&crate::ts_buckets::bucket_key(key, layout))
+            ),
+            None => format!("{name} {}", bounds::render_key_pattern(key)),
+        },
         Some(Bson::String(key)) => format!("{name} {key}"),
         _ => name.to_string(),
     });
@@ -282,8 +296,12 @@ fn plan_info_with(
         Kind::Distinct(key) => plan::distinct(&q, &catalog, key, !s.filter.is_empty()),
         _ => return out,
     };
+    let buckets = storage
+        .get_collection_options(db, &s.coll)
+        .ok()
+        .and_then(|options| Layout::of(&options));
     let mut leaves_of = Vec::new();
-    leaves(&node.to_doc(None), &mut leaves_of);
+    leaves(&node.to_doc(None), buckets.as_ref(), &mut leaves_of);
     out.summary = (!leaves_of.is_empty()).then(|| leaves_of.join(", "));
     let scan = match &node {
         Node::Projection { input, .. } => input.as_ref(),
@@ -318,7 +336,7 @@ mod tests {
 
     fn summary(plan: Document) -> String {
         let mut out = Vec::new();
-        leaves(&plan, &mut out);
+        leaves(&plan, None, &mut out);
         out.join(", ")
     }
 
@@ -347,5 +365,33 @@ mod tests {
             "EXPRESS_IXSCAN { _id: 1 }"
         );
         assert_eq!(summary(doc! {"stage": "EOF"}), "EOF");
+    }
+
+    /// A time-series collection's indexes as mongod 8.2.11 named them in
+    /// its `planSummary` (RM-496): on its buckets.
+    #[test]
+    fn a_time_series_index_is_named_as_its_buckets_keep_it() {
+        let layout = Layout::of(&doc! {"timeseries": {"timeField": "t", "metaField": "m"}})
+            .expect("a time-series layout");
+        let named = |key: Document| {
+            let mut out = Vec::new();
+            let plan =
+                doc! {"stage": "FETCH", "inputStage": {"stage": "IXSCAN", "keyPattern": key}};
+            leaves(&plan, Some(&layout), &mut out);
+            out.join(", ")
+        };
+        assert_eq!(
+            named(doc! {"m": 1, "t": 1}),
+            "IXSCAN { meta: 1, control.min.t: 1, control.max.t: 1 }"
+        );
+        assert_eq!(
+            named(doc! {"m.a": 1, "t": -1}),
+            "IXSCAN { meta.a: 1, control.max.t: -1, control.min.t: -1 }"
+        );
+        assert_eq!(named(doc! {"m.b": -1}), "IXSCAN { meta.b: -1 }");
+        assert_eq!(
+            named(doc! {"v": 1}),
+            "IXSCAN { control.min.v: 1, control.max.v: 1 }"
+        );
     }
 }

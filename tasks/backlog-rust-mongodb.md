@@ -1105,6 +1105,83 @@ These are explicit non-goals. Don't add them without a reason.
       tables already list it. Found while working RM-495, 2026-11-13.
       Verify: tests/backlog/test_rm_found_2026_11_13_rm495.py::test_delete_indexes_is_drop_indexes
       Backlog-ID: RM-597
+- [ ] **A `create` or `dbStats` refused for a field runs before it is
+      refused.** mongod 8.2.11 refuses a `create` with an unknown or
+      mistyped field (`bogus`, `storageEngine: 1`, `viewOn: 1`,
+      `autoIndexId`) or a `size` out of range, and a `dbStats` with an
+      unknown field or a `scale` that is not a number, as the command
+      parses: not a connection's first command (6788700), no `Slow query`
+      line. This server parses them in the handler's run, so it counts and
+      logs each. RM-386 moved the parse of `find`, the writes, `aggregate`,
+      `count`, `findAndModify`, `getMore`, `killCursors`, `drop`,
+      `listCollections`, `listIndexes`, `createIndexes`,
+      `renameCollection` and `explain` ahead of the run
+      (`parse_before_locks`); `create`'s checks interleave parse and run
+      (its capped 72s and `viewOn`/`pipeline` types), so its split needs a
+      probe of each check. A `listDatabases` on a database other than
+      `admin` (13) also counts, where mongod's does not. Found while
+      working RM-386, 2026-11-13.
+      Verify: tests/backlog/test_rm_found_rm386.py::test_create_and_db_stats_refused_as_they_parse_never_run
+      Backlog-ID: RM-602
+- [ ] **A nested pipeline's unknown stage is "not supported", and a
+      `$unionWith` `pipeline: 1` runs.** mongod 8.2.11 parses the pipeline
+      of a `$facet`, a `$lookup` and a `$unionWith` with the command's own
+      (`LiteParsedPipeline`): an unknown stage in one is 40324, and a
+      `$unionWith` `pipeline` that is not an array is 14 ("A pipeline must
+      be an array of objects"). This server answers the first with
+      BadValue (2, "not supported by the Rust server") and runs the
+      second, answering ok with the collection twice. Found while working
+      RM-386, 2026-11-13.
+      Verify: tests/backlog/test_rm_found_rm386.py::test_a_nested_pipeline_is_parsed_with_the_command
+      Backlog-ID: RM-603
+- [ ] **A `$setWindowFields`, `$densify` or `$fill` field of the wrong
+      type is "not supported".** mongod 8.2.11 refuses `output: 1`,
+      `field: 1` with 14, "BSON field '$densify.field' is the wrong type
+      'int', expected type 'string'"; this server answers BadValue (2),
+      "aggregation pipeline uses a stage or operator not supported by the
+      Rust server". Found while working RM-386, 2026-11-13.
+      Verify: tests/backlog/test_rm_found_rm386.py::test_a_stage_field_of_the_wrong_type_is_a_type_mismatch
+      Backlog-ID: RM-604
+- [ ] **`$search`, `$vectorSearch` and `$listSearchIndexes` are refused
+      with an older mongod's code and message.** mongod 8.2.11 without
+      `mongot` refuses each as it runs with 31082 (SearchNotEnabled):
+      "Using $search and $vectorSearch aggregation stages requires
+      additional configuration. ..." for the first two, its own wording for
+      `$listSearchIndexes`. This server answers all three with 115
+      (CommandNotSupported) and `SEARCH_INDEX_ATLAS_MSG` ("... an
+      Atlas-compatible deployment to use this feature."). Found while
+      working RM-386, 2026-11-13.
+      Verify: tests/backlog/test_rm_found_rm386.py::test_an_atlas_stage_is_refused_as_mongod_refuses_it
+      Backlog-ID: RM-605
+- [ ] **A `getMore` with an int cursor id is refused for its type.**
+      mongod 8.2.11 reads `{getMore: 5, collection: "c"}` as cursor 5
+      (CursorNotFound, 43), and `{getMore: 1}` is refused for the missing
+      `collection`; this server refuses the int with 14, "BSON field
+      'getMore.getMore' is the wrong type 'int', expected type 'long'".
+      Found while working RM-386, 2026-11-13.
+      Verify: tests/backlog/test_rm_found_rm386.py::test_a_get_more_takes_an_int_cursor_id
+      Backlog-ID: RM-606
+- [ ] **A command refused as it runs is profiled where mongod's is not,
+      and the other way.** mongod 8.2.11 profiles a `distinct` refused for
+      its fields; it profiles no `findAndModify` with neither `update` nor
+      `remove` or with an undefined `$$variable`, no `createIndexes`
+      refused for a spec, no `create` refused for its capped options, no
+      write to a `system.` namespace it does not take, no `explain` of an
+      `insert`, no `dbStats` of `scale: 0`; and it profiles a
+      `$querySettings` stage refused for a field. This server does each the
+      other way (`profiler::refused_unprofiled` reads the reply's message
+      for some of these). Each is run, and logged, on both. Found while
+      working RM-386, 2026-11-13.
+      Verify: tests/backlog/test_rm_found_rm386.py::test_a_command_refused_as_it_runs_is_profiled_as_mongod_profiles_it
+      Backlog-ID: RM-607
+- [ ] **An `update` whose statement fails writes one `Slow query` line,
+      not two.** mongod 8.2.11 writes the statement's line (`<db>.c`) and
+      the command's (`<db>.$cmd`) for an `update` whose one statement is
+      refused as it parses its update (`u: {$bogus: {a: 1}}`, a write
+      error in an `ok: 1` reply); this server writes the command's alone.
+      Found while working RM-386, 2026-11-13.
+      Verify: tests/backlog/test_rm_found_rm386.py::test_an_update_with_a_failed_statement_writes_two_lines
+      Backlog-ID: RM-608
 - [ ] **Operations this server runs another way than mongod's plan say
       less.** Since RM-023 a read or a write's read that a stream runs as
       mongod's plan counts its keys and documents examined, and since
@@ -1150,13 +1227,15 @@ These are explicit non-goals. Don't add them without a reason.
       (`opdebug::note_planned`). Found while working RM-363, 2026-11-13.
       Verify: tests/backlog/test_rm_found_rm363.py::test_a_contested_read_says_it_was_multi_planned
       Backlog-ID: RM-599
-- [ ] **A read of a time-series collection's meta index names the index
-      as `listIndexes` shows it.** mongod 8.2.11's line for a `find({m: 1})`
-      of a time-series collection says `IXSCAN { meta: 1, control.min.t: 1,
-      control.max.t: 1 }`, the index as its buckets keep it; this server's
-      says `IXSCAN { m: 1, t: 1 }`. Found while working RM-363, 2026-11-10.
-      Verify: tests/backlog/test_rm_found_2026_11_10_rm363.py::test_a_read_of_the_meta_index_names_the_index_over_the_buckets
-      Backlog-ID: RM-496
+- [ ] **A time-series read bounded on its time field is not a clustered
+      scan of its buckets.** mongod 8.2.11's line for a `find({t: {$gt:
+      <date>}})` of a time-series collection, with no index serving the
+      bound, says `CLUSTERED_IXSCAN`: the buckets are clustered by `_id`,
+      whose timestamp is each bucket's start, so the bound on
+      `control.min.t` bounds the `_id`s read. This server's says
+      `COLLSCAN`. Found while working RM-496, 2026-11-13.
+      Backlog-ID: RM-600
+      Verify: tests/backlog/test_rm_found_2026_11_10_rm363.py::test_a_time_series_read_bounded_on_its_time_field_scans_the_clustered_buckets
 - [ ] **WiredTiger 11's interruptible cache wait is not on the line.**
       mongod 8.2.11's WiredTiger splits a cache wait into the share spent
       in interruptible eviction (`timeWaitingMicros.cacheInterruptibleMicros`)
@@ -1180,7 +1259,7 @@ These are explicit non-goals. Don't add them without a reason.
       here is not mongod's KeyString. (An insert's count varies by 8 bytes a
       skiplist level on both servers: WiredTiger draws each new key's depth
       at random.) Measured 2026-11-10. Found while working RM-385.
-      **Decision needed (2026-11-13):** the surplus is this store's shared
+      The surplus is this store's shared
       tables. Every key an insert writes carries the namespace as strings,
       because collections share sixteen document shards
       (`key_format=SSq`), every `_id` index is a row in
@@ -1196,76 +1275,39 @@ These are explicit non-goals. Don't add them without a reason.
       times 40) and nothing on mongod. Of the 51 bytes left at 9
       characters, about 40 are the prefixes (`db\0c\0` three times, plus
       `x_1\0`). The remaining ~11 are the encodings: the `_id` sort key
-      against KeyString, and the index entry's value. Options, the most
-      faithful first:
-      (a) **mongod's layout, recommended:** a table per collection keyed
-      by RecordId and a table per index keyed by KeyString, with the
-      catalog mapping namespace to ident. This closes this item and the
-      per-table half of RM-040 (`collStats.wiredTiger` / `indexDetails`,
-      real `storageSize` / `indexSize`, `$listCatalog` idents), and makes
-      the RM-192 `compact` scope decision unnecessary. It changes the
-      on-disk format both Rust servers share (a store migration, or a
-      format bump that refuses an old store), replaces `DOC_SHARDS` (a
-      table per collection gives the same per-collection file
-      independence), and the KeyString keys change the on-disk sort-key
-      rank (`sortkey.rs`, `entryFormat`). Several PRs; sequence storage
-      first, then KeyString.
-      (b) **Keep the shared tables, prefix each key with a short numeric
-      collection id or index id** in place of the names (1-2 bytes as a
-      packed `q`). This is still an on-disk format change, and a stand-in
-      for mongod's mechanism. It removes the name-length dependence and
-      about 34 of the 51 bytes; the gap test stays red at about 17 bytes
-      until the encodings also move to KeyString.
-      (c) **Scope decision:** `txnBytesDirty` counts this store's layout,
-      not mongod's. Retire the gap test with that reason, and keep the
-      update and delete counts, which already match.
+      against KeyString, and the index entry's value.
+      **Decided (Joe, 2026-11-13): mongod's layout.** A WiredTiger table
+      per collection keyed by RecordId (`key_format=q`) and a table per
+      index keyed by KeyString, with the catalog mapping each namespace to
+      its ident, as mongod does. It closes this item and the per-table half
+      of RM-040 (`collStats.wiredTiger` / `indexDetails`, real
+      `storageSize` / `indexSize`, `$listCatalog` idents), and makes the
+      RM-192 `compact` scope decision unnecessary. It changes the on-disk
+      format both Rust servers share: a format bump that refuses an old
+      store or a migration, replacing `DOC_SHARDS`, and the KeyString keys
+      change the on-disk sort-key rank (`sortkey.rs`, `entryFormat`).
+      Several PRs, storage first, then KeyString; each says in its PR that
+      the Rust PG server links it, and the PG session is told before the
+      format changes.
       Verify: tests/backlog/test_rm_355_364.py::test_an_insert_in_a_transaction_counts_mongods_dirty_bytes
       Backlog-ID: RM-499
 
 - [ ] **mongod's startup lines this server does not write.** Since RM-302
-  the log is mongod's structured log, and since 2026-11-10 this server
+  the log is mongod's structured log, and since 2026-11-13 this server
   starts it as mongod 8.2.11 does on `initandlisten`: `MongoDB starting`,
-  `Build Info` (23403), `Operating System` (51765) and `Options set by
-  command line` (21951, which carries RM-425's `parsed` until that is
-  fixed). mongod then writes about seventy more there -- the network
-  lines, `Opening WiredTiger` (22315) and the WiredTiger messages under
-  it, `WiredTiger opened` (4795906), the recovery, catalog, FCV, FTDC and
-  flow-control lines -- and ends with `mongod startup complete`
-  (8423403); this server writes none of them (measured 2026-10-24,
-  2026-11-07 and 2026-11-10). Found with RM-302.
+  `Build Info` (23403), `Operating System` (51765), `Options set by command
+  line` (21951, which carries RM-425's `parsed` until that is fixed), the
+  lock file's `Detected unclean shutdown` (22271), `Opening WiredTiger`
+  (22315), `WiredTiger opened` (4795906) and, last, `mongod startup
+  complete` (8423403). mongod writes about sixty more there that this
+  server does not: WiredTiger's own messages under `Opening WiredTiger`
+  (22430, from its `verbose=[recovery_progress:1,...]` and
+  `json_output=(error,message)` configuration), the network lines, the
+  storage-engine detection and recovery lines, the spill WiredTiger, the
+  durable catalog, FCV, FTDC and flow-control lines (measured 2026-10-24,
+  2026-11-07, 2026-11-10 and 2026-11-13). Found with RM-302.
   Backlog-ID: RM-305
-  Verify: tests/backlog/test_rm_001_028.py::test_startup_writes_the_storage_and_startup_complete_lines
-- [ ] **`buildInfo` names the architecture as Rust does.** mongod 8.2.11 on
-  macOS arm64 gives `arm64` as `buildEnvironment.distarch` and
-  `target_arch` (and in the `Build Info` startup line); this server gives
-  Rust's `std::env::consts::ARCH`, `aarch64` (measured 2026-11-10). Found
-  while working RM-305.
-  Backlog-ID: RM-500
-  Verify: tests/backlog/test_rm_found_2026_11_10.py::test_build_info_names_the_architecture_as_mongod_does
-- [ ] **A command its handler fails to parse is counted as a connection's
-  first command.** mongod 8.2.11 writes `Received first command on ingress
-  connection` (6788700) when a command is about to run: one its IDL parse,
-  its generic arguments, its concerns, `maxTimeMS` or its authorization
-  refuses is passed over, and the next command writes the line, timed from
-  the `hello`. This server writes it at the same point of its dispatcher
-  (since 2026-11-10), so the checks the dispatcher makes are passed over;
-  but its handlers parse their own fields inside the run, so a command
-  refused there -- `{find: "c", bogus: 1}` (40415), `{insert: "c",
-  documents: 1}` (14), an unknown pipeline stage (40324), `lsid: 1` (14),
-  and the like -- still counts. The fix is a parse step for each handler
-  ahead of its run, which the line can follow (measured 2026-11-10). Found
-  with RM-305.
-  (This was RM-481: A command refused as it parses writes a `Slow query`
-  line.) mongod 8.2.1 writes no line for a command its IDL parse refuses -- a
-  mistyped or missing field (14, 40414: `renameCollection: 5`, no `to`), an
-  unknown one (40415: `find` with `bogus`), a collection name that is not a
-  string (73: `find: 5`, `count: 5`), an unknown pipeline stage (40324: an
-  `aggregate` of a collection or a view, measured 8.2.11 while working RM-380)
-  -- as the operation never ran; this server writes one for each, since its
-  handlers parse and run in one step (as RM-386 has it). Found while working
-  RM-378, 2026-11-09.
-  Backlog-ID: RM-386
-  Verify: tests/backlog/test_rm_001_028.py::test_a_command_its_handler_fails_to_parse_is_not_the_first_command, tests/backlog/test_rm_slow_query_namespace.py::test_a_command_that_fails_to_parse_writes_no_line
+  Verify: tests/backlog/test_rm_001_028.py::test_startup_writes_wiredtigers_own_messages
 ### 7.091 mongod's slot-based engine (SBE) -- 2026-10-23
 
 mongod 8.2 runs the front of a pipeline in its slot-based engine when it can
@@ -1373,30 +1415,51 @@ Python behind the Rust server, a deferral answers 2 "aggregation pipeline
 uses a stage or operator not supported by the Rust server". The file has
 about forty such points; these are the ones measured.
 
-- [ ] **A write of many through an index, or on a contested plan, reads
+- [ ] **A write of many through an index of a clustered collection reads
       every candidate before it writes one.** mongod writes each document
       as its plan returns it, whatever the plan, so an updateMany or
       deleteMany out of `maxTimeMS` part-way has written some (mongod
       8.2.11, 2026-11-10, 100,000 documents, `maxTimeMS: 30`: through index
       `a_1` of a collection clustered by `_id` 4,599 updated and 11,280
-      deleted; a contested plan over `a_1` and `b_1` 1,536 updated and
-      10,030 deleted). A plan this server's write cannot stream -- a
-      clustered or time-series collection, a contested or geo plan --
-      leaves the write to the store, which since 2026-11-10 reads its
-      candidates a page at a time and writes each page first, so a
-      collection scan out of time keeps what it wrote. Two reads still run
-      whole before the first write, and a budget spent in them writes
-      nothing: the router's RecordIds of an index (`try_index_id_keys`,
-      read whole before the first page), and the read that picks a
-      contested plan (`explain::order::through_cache` runs `ordered_rows`
-      over every match; on a replica set a deleteMany's `delete_order`
-      does the same to work out mongod's order; both read from the code,
-      the nothing-written measured). The work is to read the
-      index a page at a time into the write, and to choose the contested
-      plan by mongod's trial period rather than a whole read; a geo plan
-      is the same shape, not yet probed.
+      deleted). A plan this server's write cannot stream -- a clustered or
+      time-series collection, a geo plan -- leaves the write to the store,
+      which since 2026-11-10 reads its candidates a page at a time and
+      writes each page first, so a collection scan out of time keeps what
+      it wrote. The router's RecordIds of an index (`try_index_id_keys`)
+      are still read whole before the first page, and a budget spent there
+      writes nothing. The work is to stream a clustered collection's plan
+      as an ordinary one's (its natural order is `_id`'s, which the stream
+      does not yet read), or to read the index a page at a time into the
+      write; a geo plan is the same shape, not yet probed. (A contested
+      plan is tried over what its candidates reach and streamed since
+      2026-11-13.)
       Backlog-ID: RM-390
       Verify: tests/backlog/test_rm_found_2026_11_10_rm390.py::test_a_write_of_many_out_of_time_keeps_what_it_wrote_whatever_its_plan
+- [ ] **A read whose plan two indexes contest reads every match.**
+      Over `{a: {$gte: 0}, b: {$gte: 0}}` with indexes `a_1` and `b_1`,
+      mongod 8.2.11 tries both plans for about 101 results and then runs
+      the winner only as far as the read needs, so a `find(...).limit(101)`
+      takes 0.3 ms, an `updateOne` 4-5 ms and an `explain` at
+      `queryPlanner` 0.3 ms whether the collection holds 10,000 documents
+      or 100,000. This server's time for each grows with the collection,
+      ten times over for ten times the documents (debug build, 2026-11-13:
+      80, 135 and 127 ms at 10,000; 710, 1,221 and 1,282 ms at 100,000), so
+      it reads every match before the limit, the single write or the plan
+      choice stops it. The answers are the same; the cost is the whole
+      read. A write of many has streamed a contested plan since
+      2026-11-13 (RM-390); a read, a write of one and `explain` do not.
+      Found while fixing RM-390's CI test, 2026-11-13.
+      Verify: tests/backlog/test_rm_found_2026_11_13_contested_reads.py::test_a_contested_read_costs_what_it_returns
+      Backlog-ID: RM-610
+- [ ] **A profile entry counts what it examined as int64, where mongod
+      writes int32.** mongod 8.2.11's `system.profile` entry for an
+      updateMany or a find holds `keysExamined` and `docsExamined` as
+      int32 (`{"$numberInt": "50"}`, measured 2026-11-13); this server's
+      holds them as int64, so a reader that checks the BSON type, or
+      compares entries exactly, sees a different document. Found while
+      working RM-390, 2026-11-13.
+      Verify: tests/backlog/test_rm_found_rm390.py::test_a_profile_entry_counts_what_it_examined_as_int32
+      Backlog-ID: RM-601
 - [ ] **A batched deleteMany tests each document's filter once, where
       mongod tests it twice.** mongod's batched multi-delete
       (`batchUserMultiDeletes`, on by default) tests a document when it

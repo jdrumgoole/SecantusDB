@@ -1166,8 +1166,10 @@ pub(crate) fn collection_uuid_text(storage: &dyn crate::Storage, db: &str, coll:
         .unwrap_or_default()
 }
 
-/// `drop` — drop a collection.
-pub fn drop(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
+/// `drop` as mongod's IDL parses it, before the command runs. A
+/// command refused here never ran -- no `Slow query` line, no profile entry,
+/// not a connection's first command (RM-386, measured 8.2.11).
+pub(crate) fn drop_parse(doc: &Document) -> Result<(), CommandError> {
     if let Some(field) = argtypes::unknown_field(
         doc,
         &["drop", "collectionUUID", "dropSystemBucketsCollection"],
@@ -1178,6 +1180,12 @@ pub fn drop(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
             format!("BSON field 'drop.{field}' is an unknown field."),
         ));
     }
+    Ok(())
+}
+
+/// `drop` — drop a collection.
+pub fn drop(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
+    drop_parse(doc)?;
     let coll = coll_arg(doc, "drop")?;
     let ns = format!("{}.{}", ctx.db_name, coll);
     // mongod keeps the profiler's collection while it writes to it.
@@ -1370,12 +1378,12 @@ pub fn archive_base_snapshot(doc: &Document, ctx: &mut CommandContext) -> Handle
     Ok(doc! { "path": path, "sizeBytes": size_bytes as i64, "ok": 1.0 })
 }
 
-/// `listCollections` — a cursor over the collections in the database, honouring
-/// `filter` (a query predicate over each entry) and `nameOnly`. Each entry's
-/// `options` reflects the collection's stored options (capped / validator /
-/// collation / timeseries / …) so drivers introspecting them see the real
-/// values. Mirrors `commands._list_collections`.
-pub fn list_collections(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
+/// `listCollections` as mongod's IDL parses it, before the command runs: its
+/// fields and their types. The filter is parsed as it runs (measured 8.2.11:
+/// `filter: {$bogus: 1}` counts). A command refused here never ran -- no
+/// `Slow query` line, no profile entry, not a connection's first command
+/// (RM-386, measured 8.2.11).
+pub(crate) fn list_collections_parse(doc: &Document) -> Result<(), CommandError> {
     argtypes::require_object(doc, "filter", "listCollections.filter")?;
     argtypes::require_object(doc, "cursor", "listCollections.cursor")?;
     argtypes::require_cursor_options(doc, "listCollections.cursor")?;
@@ -1394,17 +1402,6 @@ pub fn list_collections(doc: &Document, ctx: &mut CommandContext) -> HandlerResu
             ))
         }
     }
-    // mongod parses the filter before it lists anything, so an operator it
-    // does not know is refused even when nothing would have been tested.
-    if let Some(Bson::Document(f)) = doc.get("filter") {
-        if let Some((code, msg)) = argtypes::unknown_operator_in_filter(f) {
-            return Err(CommandError::new(
-                code,
-                crate::util::error_code_name(code),
-                msg,
-            ));
-        }
-    }
     const FIELDS: &[&str] = &[
         "listCollections",
         "cursor",
@@ -1419,6 +1416,27 @@ pub fn list_collections(doc: &Document, ctx: &mut CommandContext) -> HandlerResu
             "IDLUnknownField",
             format!("BSON field 'listCollections.{key}' is an unknown field."),
         ));
+    }
+    Ok(())
+}
+
+/// `listCollections` — a cursor over the collections in the database, honouring
+/// `filter` (a query predicate over each entry) and `nameOnly`. Each entry's
+/// `options` reflects the collection's stored options (capped / validator /
+/// collation / timeseries / …) so drivers introspecting them see the real
+/// values. Mirrors `commands._list_collections`.
+pub fn list_collections(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
+    list_collections_parse(doc)?;
+    // mongod parses the filter before it lists anything, so an operator it
+    // does not know is refused even when nothing would have been tested.
+    if let Some(Bson::Document(f)) = doc.get("filter") {
+        if let Some((code, msg)) = argtypes::unknown_operator_in_filter(f) {
+            return Err(CommandError::new(
+                code,
+                crate::util::error_code_name(code),
+                msg,
+            ));
+        }
     }
     let storage = ctx.storage()?;
     let cursors = ctx.cursors()?;
@@ -1744,8 +1762,10 @@ pub(crate) fn listed_collection_names(
     Ok(names)
 }
 
-/// `listIndexes` — a cursor over the indexes of a collection.
-pub fn list_indexes(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
+/// `listIndexes` as mongod's IDL parses it, before the command runs. A
+/// command refused here never ran -- no `Slow query` line, no profile entry,
+/// not a connection's first command (RM-386, measured 8.2.11).
+pub(crate) fn list_indexes_parse(doc: &Document) -> Result<(), CommandError> {
     // Nullable here, unlike aggregate's -- mongod accepts `cursor: null`.
     argtypes::require_object(doc, "cursor", "listIndexes.cursor")?;
     argtypes::require_cursor_options(doc, "listIndexes.cursor")?;
@@ -1764,6 +1784,12 @@ pub fn list_indexes(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
             format!("BSON field 'listIndexes.{key}' is an unknown field."),
         ));
     }
+    Ok(())
+}
+
+/// `listIndexes` — a cursor over the indexes of a collection.
+pub fn list_indexes(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
+    list_indexes_parse(doc)?;
     let coll = coll_arg(doc, "listIndexes")?;
     let storage = ctx.storage()?;
     let cursors = ctx.cursors()?;
@@ -4276,8 +4302,11 @@ pub fn drop_database(doc: &Document, ctx: &mut CommandContext) -> HandlerResult 
     Ok(doc! { "dropped": ctx.db_name.clone(), "ok": 1.0 })
 }
 
-/// `renameCollection` — rename `renameCollection` (a full `db.coll` ns) to `to`.
-pub fn rename_collection(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
+/// `renameCollection` as mongod's IDL parses it, before the command runs:
+/// its fields and their types, on any database. A command refused here
+/// never ran -- no `Slow query` line, no profile entry, not a connection's
+/// first command (RM-386, measured 8.2.11).
+pub(crate) fn rename_collection_parse(doc: &Document) -> Result<(), CommandError> {
     argtypes::require_required_string(
         doc,
         "renameCollection",
@@ -4289,6 +4318,29 @@ pub fn rename_collection(doc: &Document, ctx: &mut CommandContext) -> HandlerRes
     // refused (measured 2026-10-01).
     argtypes::require_required_string(doc, "to", "renameCollection.to")?;
     argtypes::require_bool_or_bindata(doc, "dropTarget", "renameCollection.dropTarget")?;
+    if let Some(field) = argtypes::unknown_field(
+        doc,
+        &[
+            "renameCollection",
+            "to",
+            "dropTarget",
+            "stayTemp",
+            "collectionUUID",
+        ],
+    ) {
+        return Err(CommandError::new(
+            40415,
+            "IDLUnknownField",
+            format!("BSON field 'renameCollection.{field}' is an unknown field."),
+        ));
+    }
+    Ok(())
+}
+
+/// `renameCollection` — rename `renameCollection` (a full `db.coll` ns) to `to`.
+pub fn rename_collection(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
+    rename_collection_parse(doc)?;
+    // Only then is a non-`admin` database refused (measured 2026-10-01).
     if ctx.db_name != "admin" {
         return Err(CommandError::new(
             13,
@@ -4321,22 +4373,6 @@ pub fn rename_collection(doc: &Document, ctx: &mut CommandContext) -> HandlerRes
         .get("dropTarget")
         .and_then(Bson::as_bool)
         .unwrap_or(false);
-    if let Some(field) = argtypes::unknown_field(
-        doc,
-        &[
-            "renameCollection",
-            "to",
-            "dropTarget",
-            "stayTemp",
-            "collectionUUID",
-        ],
-    ) {
-        return Err(CommandError::new(
-            40415,
-            "IDLUnknownField",
-            format!("BSON field 'renameCollection.{field}' is an unknown field."),
-        ));
-    }
     if let Some(refused) = crate::ddl_checks::rename(&src, &to) {
         return Err(refused);
     }

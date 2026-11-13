@@ -220,6 +220,21 @@ impl CmdStorage for StorageAdapter {
         self.inner.in_memory()
     }
 
+    fn opening(&self) -> Option<secantus_commands::storage::StoreOpening> {
+        let r = self.inner.open_record();
+        Some(secantus_commands::storage::StoreOpening {
+            started: r.started,
+            lock_file: r
+                .lock_file
+                .as_ref()
+                .map(|l| (l.path.clone(), l.unclean, l.took)),
+            new_store: r.new_store,
+            wt_config: r.wt_config.clone(),
+            wt_open: r.wt_open,
+            open: r.open,
+        })
+    }
+
     fn data_path(&self) -> Option<String> {
         Some(self.inner.home().to_string())
     }

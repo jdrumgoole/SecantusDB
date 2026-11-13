@@ -141,6 +141,147 @@ pub fn startup_details(require_auth: bool) -> [crate::logbuf::LogEntry; 3] {
     ]
 }
 
+/// The lines mongod writes on `initandlisten` as it opens its store, after
+/// the options (measured 8.2.11, 2026-11-13): `Detected unclean shutdown -
+/// Lock file is not empty` (22271, a warning) when the lock file still held
+/// a process id, `Opening WiredTiger` (22315) with the configuration
+/// `wiredtiger_open` was given, and `WiredTiger opened` (4795906) with how
+/// long that took.
+pub fn storage_opening_lines(
+    opening: &crate::storage::StoreOpening,
+) -> Vec<crate::logbuf::LogEntry> {
+    use crate::logbuf::LogEntry;
+    let mut lines = Vec::new();
+    if let Some((path, true, _)) = &opening.lock_file {
+        lines.push(
+            LogEntry::new(
+                "W",
+                "STORAGE",
+                22271,
+                "initandlisten",
+                "Detected unclean shutdown - Lock file is not empty",
+            )
+            .attr(doc! {"lockFile": path.as_str()}),
+        );
+    }
+    lines.push(
+        LogEntry::new("I", "STORAGE", 22315, "initandlisten", "Opening WiredTiger")
+            .attr(doc! {"config": opening.wt_config.as_str()}),
+    );
+    lines.push(
+        LogEntry::new(
+            "I",
+            "STORAGE",
+            4795906,
+            "initandlisten",
+            "WiredTiger opened",
+        )
+        .attr(doc! {"durationMillis": millis(opening.wt_open)}),
+    );
+    lines
+}
+
+/// Whole milliseconds, truncated, as mongod's `durationCount<Milliseconds>`.
+fn millis(d: std::time::Duration) -> i64 {
+    i64::try_from(d.as_millis()).unwrap_or(i64::MAX)
+}
+
+/// How long each of mongod's startup steps took, for `mongod startup
+/// complete`. A step this server does not take is zero, as mongod reports
+/// a step that took under a millisecond.
+#[derive(Debug, Clone, Default)]
+pub struct StartupTimes {
+    /// The lock file held no process id (or there was none).
+    pub clean: bool,
+    /// The store was new: mongod writes new metadata rather than validating
+    /// the existing metadata.
+    pub new_store: bool,
+    /// Started as a replica-set member.
+    pub replica_set: bool,
+    /// Binding the listening socket.
+    pub set_up_transport_layer: std::time::Duration,
+    /// Taking the lock file.
+    pub create_lock_file: std::time::Duration,
+    /// Opening the store, after the lock file.
+    pub create_storage_engine: std::time::Duration,
+    /// Recording the feature compatibility version.
+    pub initialize_fcv: std::time::Duration,
+    /// Reading the cluster parameters from disk (a standalone).
+    pub standalone_cluster_params: std::time::Duration,
+    /// Bringing the stored users up to date.
+    pub user_and_roles_graph: std::time::Duration,
+    /// Setting up the replica set's own collections and configuration.
+    pub start_up_repl_coord: std::time::Duration,
+    /// Recording the start in `local.startup_log`.
+    pub log_startup_options: std::time::Duration,
+    /// Starting the accept loop.
+    pub start_up_transport_layer: std::time::Duration,
+    /// From the start of the open to the end of the start.
+    pub total: std::time::Duration,
+}
+
+/// `mongod startup complete` (8423403), the last line mongod writes on
+/// `initandlisten`, after `Waiting for connections`: whether it started from
+/// a clean shutdown, and its steps' times in mongod 8.2.11's keys and order
+/// (measured 2026-11-13). The keys depend on the start: an existing store
+/// has `validateMetadataMillis` and a new one `writeNewMetadataMillis`; a
+/// standalone has `standaloneClusterParamsMillis` and a replica-set member
+/// `clusterTimeKeysManagerMillis`.
+pub fn startup_complete(t: &StartupTimes) -> crate::logbuf::LogEntry {
+    let mut stats = Document::new();
+    stats.insert("setUpPeriodicRunnerMillis", 0i64);
+    stats.insert("setUpOCSPMillis", 0i64);
+    stats.insert(
+        "setUpTransportLayerMillis",
+        millis(t.set_up_transport_layer),
+    );
+    stats.insert("initSyncCrashRecoveryMillis", 0i64);
+    stats.insert("createLockFileMillis", millis(t.create_lock_file));
+    stats.insert("getStorageEngineMetadataMillis", 0i64);
+    if !t.new_store {
+        stats.insert("validateMetadataMillis", 0i64);
+    }
+    stats.insert("createStorageEngineMillis", millis(t.create_storage_engine));
+    stats.insert("writePIDMillis", 0i64);
+    if t.new_store {
+        stats.insert("writeNewMetadataMillis", 0i64);
+    }
+    stats.insert("initializeFCVForIndexMillis", millis(t.initialize_fcv));
+    stats.insert("dropAbandonedIdentsMillis", 0i64);
+    if !t.replica_set {
+        stats.insert(
+            "standaloneClusterParamsMillis",
+            millis(t.standalone_cluster_params),
+        );
+    }
+    stats.insert("userAndRolesGraphMillis", millis(t.user_and_roles_graph));
+    stats.insert("waitForMajorityServiceMillis", 0i64);
+    if t.replica_set {
+        stats.insert("clusterTimeKeysManagerMillis", 0i64);
+    }
+    stats.insert("startUpReplCoordMillis", millis(t.start_up_repl_coord));
+    stats.insert("recoverChangeStreamMillis", 0i64);
+    stats.insert("logStartupOptionsMillis", millis(t.log_startup_options));
+    stats.insert(
+        "startUpTransportLayerMillis",
+        millis(t.start_up_transport_layer),
+    );
+    stats.insert("initAndListenTotalMillis", millis(t.total));
+    crate::logbuf::LogEntry::new(
+        "I",
+        "CONTROL",
+        8423403,
+        "initandlisten",
+        "mongod startup complete",
+    )
+    .attr(doc! {
+        "Summary of time elapsed": {
+            "Startup from clean shutdown?": t.clean,
+            "Statistics": stats,
+        }
+    })
+}
+
 /// `hostInfo`: the machine's own figures, in mongod's keys, types and order
 /// (measured 8.2.11 on macOS arm64, 2026-10-15). `hostname` is the host's
 /// name and the server's port, as mongod gives it. A figure this platform
@@ -624,6 +765,151 @@ mod tests {
         let all = dispatch(&doc! {"getParameter": "*"}, &mut ctx());
         assert!(all.get("authenticationMechanisms").is_some());
         assert!(all.get("logLevel").is_some());
+    }
+
+    fn statistics_keys(t: &StartupTimes) -> Vec<String> {
+        let entry = startup_complete(t);
+        let attr = entry.attr.unwrap();
+        let summary = attr.get_document("Summary of time elapsed").unwrap();
+        summary
+            .get_document("Statistics")
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect()
+    }
+
+    #[test]
+    fn startup_complete_has_mongods_keys_for_each_start() {
+        // mongod 8.2.11, 2026-11-13: a new standalone store.
+        let new_standalone = StartupTimes {
+            clean: true,
+            new_store: true,
+            ..StartupTimes::default()
+        };
+        assert_eq!(
+            statistics_keys(&new_standalone),
+            [
+                "setUpPeriodicRunnerMillis",
+                "setUpOCSPMillis",
+                "setUpTransportLayerMillis",
+                "initSyncCrashRecoveryMillis",
+                "createLockFileMillis",
+                "getStorageEngineMetadataMillis",
+                "createStorageEngineMillis",
+                "writePIDMillis",
+                "writeNewMetadataMillis",
+                "initializeFCVForIndexMillis",
+                "dropAbandonedIdentsMillis",
+                "standaloneClusterParamsMillis",
+                "userAndRolesGraphMillis",
+                "waitForMajorityServiceMillis",
+                "startUpReplCoordMillis",
+                "recoverChangeStreamMillis",
+                "logStartupOptionsMillis",
+                "startUpTransportLayerMillis",
+                "initAndListenTotalMillis",
+            ]
+        );
+        // A new store under --replSet.
+        let new_member = StartupTimes {
+            new_store: true,
+            replica_set: true,
+            ..StartupTimes::default()
+        };
+        assert_eq!(
+            statistics_keys(&new_member),
+            [
+                "setUpPeriodicRunnerMillis",
+                "setUpOCSPMillis",
+                "setUpTransportLayerMillis",
+                "initSyncCrashRecoveryMillis",
+                "createLockFileMillis",
+                "getStorageEngineMetadataMillis",
+                "createStorageEngineMillis",
+                "writePIDMillis",
+                "writeNewMetadataMillis",
+                "initializeFCVForIndexMillis",
+                "dropAbandonedIdentsMillis",
+                "userAndRolesGraphMillis",
+                "waitForMajorityServiceMillis",
+                "clusterTimeKeysManagerMillis",
+                "startUpReplCoordMillis",
+                "recoverChangeStreamMillis",
+                "logStartupOptionsMillis",
+                "startUpTransportLayerMillis",
+                "initAndListenTotalMillis",
+            ]
+        );
+        // An existing standalone store.
+        let existing = StartupTimes::default();
+        assert_eq!(
+            statistics_keys(&existing),
+            [
+                "setUpPeriodicRunnerMillis",
+                "setUpOCSPMillis",
+                "setUpTransportLayerMillis",
+                "initSyncCrashRecoveryMillis",
+                "createLockFileMillis",
+                "getStorageEngineMetadataMillis",
+                "validateMetadataMillis",
+                "createStorageEngineMillis",
+                "writePIDMillis",
+                "initializeFCVForIndexMillis",
+                "dropAbandonedIdentsMillis",
+                "standaloneClusterParamsMillis",
+                "userAndRolesGraphMillis",
+                "waitForMajorityServiceMillis",
+                "startUpReplCoordMillis",
+                "recoverChangeStreamMillis",
+                "logStartupOptionsMillis",
+                "startUpTransportLayerMillis",
+                "initAndListenTotalMillis",
+            ]
+        );
+        let attr = startup_complete(&existing).attr.unwrap();
+        let summary = attr.get_document("Summary of time elapsed").unwrap();
+        assert_eq!(
+            summary.keys().map(String::as_str).collect::<Vec<_>>(),
+            ["Startup from clean shutdown?", "Statistics"]
+        );
+        assert_eq!(summary.get_bool("Startup from clean shutdown?"), Ok(false));
+    }
+
+    #[test]
+    fn storage_opening_lines_warn_of_an_unclean_shutdown() {
+        let mut opening = crate::storage::StoreOpening {
+            started: std::time::Instant::now(),
+            lock_file: Some(("d/mongod.lock".into(), false, Default::default())),
+            new_store: false,
+            wt_config: "create,cache_size=1G".into(),
+            wt_open: std::time::Duration::from_millis(12),
+            open: Default::default(),
+        };
+        let ids = |o: &crate::storage::StoreOpening| -> Vec<i32> {
+            storage_opening_lines(o).iter().map(|e| e.id).collect()
+        };
+        assert_eq!(ids(&opening), [22315, 4795906]);
+        let lines = storage_opening_lines(&opening);
+        assert_eq!(
+            lines[0].attr.as_ref().unwrap(),
+            &doc! {"config": "create,cache_size=1G"}
+        );
+        assert_eq!(
+            lines[1].attr.as_ref().unwrap(),
+            &doc! {"durationMillis": 12i64}
+        );
+        opening.lock_file = Some(("d/mongod.lock".into(), true, Default::default()));
+        let lines = storage_opening_lines(&opening);
+        assert_eq!(
+            lines.iter().map(|e| e.id).collect::<Vec<_>>(),
+            [22271, 22315, 4795906]
+        );
+        assert_eq!(lines[0].severity, "W");
+        assert_eq!(
+            lines[0].attr.as_ref().unwrap(),
+            &doc! {"lockFile": "d/mongod.lock"}
+        );
     }
 
     #[test]

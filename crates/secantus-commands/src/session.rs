@@ -145,8 +145,17 @@ fn bool_field(doc: &Document, field: &str, command: &str) -> Result<Option<bool>
     }
 }
 
-/// Read and check a command's session fields.
-pub(crate) fn parse(name: &str, doc: &Document) -> Result<Envelope, CommandError> {
+/// A command's session fields as mongod's IDL parses them, with the command:
+/// their types and the session id's shape. A command refused here never
+/// ran -- no `Slow query` line, not a connection's first command (RM-386,
+/// measured 8.2.11).
+pub(crate) fn parse_fields(name: &str, doc: &Document) -> Result<(), CommandError> {
+    fields(name, doc).map(drop)
+}
+
+type Fields = (Option<Vec<u8>>, Option<i64>, Option<bool>, Option<bool>);
+
+fn fields(name: &str, doc: &Document) -> Result<Fields, CommandError> {
     let owner = struct_name(name);
     let lsid = match doc.get("lsid") {
         None | Some(Bson::Null) => None,
@@ -160,6 +169,15 @@ pub(crate) fn parse(name: &str, doc: &Document) -> Result<Envelope, CommandError
     };
     let autocommit = bool_field(doc, "autocommit", name)?;
     let start = bool_field(doc, "startTransaction", name)?;
+    Ok((lsid, txn_number, autocommit, start))
+}
+
+/// Read and check a command's session fields: their parse, and then what
+/// mongod checks of them once the command has parsed, before it runs (a
+/// `txnNumber` with no `lsid`, `autocommit: true`, ...: written to the slow
+/// log, and not a connection's first command, measured 8.2.11).
+pub(crate) fn parse(name: &str, doc: &Document) -> Result<Envelope, CommandError> {
+    let (lsid, txn_number, autocommit, start) = fields(name, doc)?;
 
     if txn_number.is_some() && lsid.is_none() {
         return Err(invalid_options(

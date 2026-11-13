@@ -700,15 +700,88 @@ def test_startup_writes_build_os_and_options_lines(rust_mongo: Any) -> None:
     assert _startup_ids(rust_mongo)[:4] == [4615611, 23403, 51765, 21951]
 
 
-@pytest.mark.backlog("RM-305")
+@pytest.mark.backlog_fixed("RM-305")
 def test_startup_writes_the_storage_and_startup_complete_lines(rust_mongo: Any) -> None:
     """After the options, mongod 8.2.11 writes `Opening WiredTiger` (22315)
     and `WiredTiger opened` (4795906) as it opens the store, and ends its
     start on `initandlisten` with `mongod startup complete` (8423403),
     among about seventy more lines (measured 2026-11-10 on a default
-    mongod). This server writes none of the three."""
+    mongod). This server wrote none of the three until 2026-11-13."""
     ids = [i for i in _startup_ids(rust_mongo) if i in (22315, 4795906, 8423403)]
     assert ids == [22315, 4795906, 8423403]
+
+
+def _startup_lines(client: Any) -> dict[int, dict]:
+    """The lines the server wrote on `initandlisten`, by id."""
+    return {
+        e["id"]: e
+        for e in map(json.loads, client.admin.command("getLog", "global")["log"])
+        if e["ctx"] == "initandlisten"
+    }
+
+
+def _summary(lines: dict[int, dict]) -> dict:
+    return lines[8423403]["attr"]["Summary of time elapsed"]
+
+
+@pytest.mark.backlog_fixed("RM-305")
+def test_startup_reads_an_unclean_shutdown_from_the_lock_file(tmp_path: Any) -> None:
+    """mongod 8.2.11 keeps `mongod.lock` in its dbpath: its pid while it
+    runs, emptied by a clean shutdown. On a start it writes `Detected unclean
+    shutdown - Lock file is not empty` (22271, a warning naming `lockFile`)
+    when the file still holds a pid, and `mongod startup complete` says
+    `Startup from clean shutdown?`; its statistics carry
+    `writeNewMetadataMillis` on a new dbpath and `validateMetadataMillis`
+    on an existing one (measured 2026-11-13: a new dbpath, a restart after
+    `shutdown`, a restart after SIGKILL). This server kept no lock file and
+    wrote none of it until 2026-11-13."""
+    import os
+    import signal
+
+    from tests.backlog.conftest import rust_mongo_server
+
+    store = tmp_path / "store"
+    lock = store / "mongod.lock"
+    with rust_mongo_server(store) as client:
+        lines = _startup_lines(client)
+        assert lock.read_text() == f"{int(lock.read_text())}\n"
+    assert 22271 not in lines
+    assert _summary(lines)["Startup from clean shutdown?"] is True
+    stats = _summary(lines)["Statistics"]
+    assert "writeNewMetadataMillis" in stats and "validateMetadataMillis" not in stats
+    assert lock.stat().st_size == 0, "a clean shutdown empties the lock file"
+
+    with rust_mongo_server(store) as client:
+        lines = _startup_lines(client)
+        os.kill(int(lock.read_text()), signal.SIGKILL)
+    assert 22271 not in lines
+    assert _summary(lines)["Startup from clean shutdown?"] is True
+    stats = _summary(lines)["Statistics"]
+    assert "validateMetadataMillis" in stats and "writeNewMetadataMillis" not in stats
+
+    with rust_mongo_server(store) as client:
+        lines = _startup_lines(client)
+    warning = lines[22271]
+    assert (warning["s"], warning["c"], warning["msg"]) == (
+        "W",
+        "STORAGE",
+        "Detected unclean shutdown - Lock file is not empty",
+    )
+    assert warning["attr"] == {"lockFile": str(lock)}
+    assert _summary(lines)["Startup from clean shutdown?"] is False
+
+
+@pytest.mark.backlog("RM-305")
+def test_startup_writes_wiredtigers_own_messages(rust_mongo: Any) -> None:
+    """Between `Opening WiredTiger` (22315) and `WiredTiger opened`
+    (4795906) mongod 8.2.11 writes WiredTiger's own messages, each a
+    `WiredTiger message` (22430) under `WTRECOV` / `WTEVICT` on
+    `initandlisten`: fourteen on a new dbpath (measured 2026-11-13), from its
+    `verbose=[recovery_progress:1,...]` and `json_output=(error,message)`
+    configuration. This server writes none."""
+    ids = _startup_ids(rust_mongo)
+    between = ids[ids.index(22315) + 1 : ids.index(4795906)]
+    assert 22430 in between, between
 
 
 def _op_msg(sock: socket.socket, command: dict, request_id: int) -> dict:
@@ -759,14 +832,15 @@ _REFUSED_IN_PARSE = {
 }
 
 
-@pytest.mark.backlog("RM-386")
+@pytest.mark.backlog_fixed("RM-386")
 def test_a_command_its_handler_fails_to_parse_is_not_the_first_command(rust_mongo: Any) -> None:
     """mongod 8.2.11 passes over, for `Received first command on ingress
     connection` (6788700), a command its IDL parse refuses -- an unknown
     field (40415), a field of the wrong type (14), an unknown pipeline stage
     (40324), an `lsid` that is not a document (14) -- and the next command
-    writes the line (measured 2026-11-10). This server parses these inside
-    the command's run, after the line, so it counts each."""
+    writes the line (measured 2026-11-10). This server parsed these inside
+    the command's run, after the line, so it counted each, until the
+    handlers' parse ran ahead of the command."""
     host, port = rust_mongo.address
     passed_over = {}
     for name, command in _REFUSED_IN_PARSE.items():

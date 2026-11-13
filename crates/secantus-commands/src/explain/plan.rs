@@ -1616,6 +1616,19 @@ fn candidates(
     out
 }
 
+/// Whether every plan mongod tries for the query reads through one index
+/// (a scan, or an OR of scans of a contained `$or`): no index
+/// intersection, and no rooted `$or`, whose branches are each tried apart.
+pub(crate) fn single_index_candidates(q: &Query, catalog: &[Arc<IndexInfo>]) -> bool {
+    let parts = clauses(q.canonical);
+    if matches!(parts.as_slice(), [only] if only.contains_key("$or")) {
+        return false;
+    }
+    candidates(&parts, q, catalog, None)
+        .iter()
+        .all(|(a, _)| !matches!(a.scan, Node::AndSorted(_)))
+}
+
 /// Whether mongod has more than one plan to try for the query, and so
 /// which it reads depends on its trial.
 pub(crate) fn contested(q: &Query, catalog: &[Arc<IndexInfo>]) -> bool {

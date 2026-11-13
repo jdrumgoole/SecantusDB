@@ -641,6 +641,18 @@ pub fn build_info(_doc: &Document, _ctx: &mut CommandContext) -> HandlerResult {
     Ok(reply)
 }
 
+/// The build's architecture as mongod names it in `buildInfo`'s
+/// `buildEnvironment` (`distarch`, `target_arch`) and the `Build Info`
+/// startup line. mongod takes the platform's own name, not the compiler's:
+/// macOS arm64 mongod 8.2.11 says `arm64` (measured 2026-11-13), where Rust's
+/// `std::env::consts::ARCH` says `aarch64`; Linux names agree with Rust's
+/// (`x86_64`, and `aarch64` on Linux arm64).
+pub const BUILD_ARCH: &str = if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+    "arm64"
+} else {
+    std::env::consts::ARCH
+};
+
 /// What `buildInfo` reports, without its `ok`: also the `buildinfo` of each
 /// `local.startup_log` record, as mongod writes both from one builder.
 pub fn build_info_document() -> Document {
@@ -660,13 +672,13 @@ pub fn build_info_document() -> Document {
         "openssl": {"running": "rustls"},
         "buildEnvironment": {
             "distmod": "",
-            "distarch": std::env::consts::ARCH,
+            "distarch": BUILD_ARCH,
             "cc": "rustc",
             "ccflags": "",
             "cxx": "",
             "cxxflags": "",
             "linkflags": "",
-            "target_arch": std::env::consts::ARCH,
+            "target_arch": BUILD_ARCH,
             "target_os": std::env::consts::OS,
             "cppdefines": "",
         },
@@ -847,6 +859,21 @@ mod tests {
 
     fn code_of(doc: Document) -> Option<i32> {
         validate_awaitable_arguments(&doc, 3).err().map(|e| e.code)
+    }
+
+    /// `buildInfo` names the architecture as mongod's build for the same
+    /// platform does: `arm64` on macOS arm64 (8.2.11), Rust's name elsewhere.
+    #[test]
+    fn build_environment_names_the_architecture_as_mongod_does() {
+        let info = build_info_document();
+        let env = info.get_document("buildEnvironment").unwrap();
+        let expected = if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+            "arm64"
+        } else {
+            std::env::consts::ARCH
+        };
+        assert_eq!(env.get_str("distarch").unwrap(), expected);
+        assert_eq!(env.get_str("target_arch").unwrap(), expected);
     }
 
     /// mongod's parse of the awaitable-hello arguments, measured 8.2.11.
@@ -1054,6 +1081,51 @@ mod tests {
         assert_eq!(first(&logs), 0);
         crate::dispatch(&doc! {"ping": 1, "$db": "admin"}, &mut ctx);
         assert_eq!(first(&logs), 1);
+    }
+
+    /// A command its handler's parse refuses -- an unknown field, a field of
+    /// the wrong type, an unknown pipeline stage, an `lsid` that is not a
+    /// document -- is refused before it runs: it has not parsed (so it gets
+    /// no `Slow query` line), and the next command writes 6788700 (mongod
+    /// 8.2.11, RM-386). These need no storage: the parse refuses them first.
+    #[test]
+    fn a_command_its_handler_refuses_as_it_parses_never_runs() {
+        for (refused, code) in [
+            (doc! {"find": "c", "bogus": 1, "$db": "d"}, 40415),
+            (doc! {"insert": "c", "documents": 1, "$db": "d"}, 14),
+            (
+                doc! {"aggregate": "c", "pipeline": [{"$bogus": 1}], "cursor": {}, "$db": "d"},
+                40324,
+            ),
+            (doc! {"count": "c", "bogus": 1, "$db": "d"}, 40415),
+            (doc! {"getMore": 5_i64, "collection": "", "$db": "d"}, 73),
+            (doc! {"ping": 1, "lsid": 1, "$db": "admin"}, 14),
+            (
+                doc! {"explain": {"find": "c", "limit": "x"}, "$db": "d"},
+                14,
+            ),
+            (
+                doc! {"renameCollection": 5, "to": "d.x", "$db": "admin"},
+                14,
+            ),
+        ] {
+            let (mut ctx, logs) = logging_ctx();
+            ctx.db_name = refused.get_str("$db").unwrap().to_string();
+            let reply = crate::dispatch(&refused, &mut ctx);
+            assert_eq!(reply.get_i32("code"), Ok(code), "{refused:?}: {reply:?}");
+            assert!(!ctx.parsed, "{refused:?} parsed");
+            let first = |logs: &crate::logbuf::LogBuffer| {
+                ids(logs)
+                    .into_iter()
+                    .filter(|(id, _)| *id == 6788700)
+                    .count()
+            };
+            assert_eq!(first(&logs), 0, "{refused:?} counted");
+            ctx.db_name = "admin".to_string();
+            crate::dispatch(&doc! {"ping": 1, "$db": "admin"}, &mut ctx);
+            assert!(ctx.parsed);
+            assert_eq!(first(&logs), 1, "{refused:?}");
+        }
     }
 
     /// The topologyVersion processId must be identical across calls — a changing

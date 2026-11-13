@@ -340,17 +340,21 @@ fn already_in_order(plan: &Node, via: &str) -> bool {
 /// each candidate's scans read from the store in the works asked for, as
 /// mongod's trial reads only what its plans reach.
 ///
-/// Which documents match is known, so the candidates' filters are not run
-/// and the documents need only their indexed fields. A partial index tests
-/// a filter of its own, on whole documents.
+/// When which documents match is known, the candidates' filters are not
+/// run and the documents need only their indexed fields. A partial index
+/// tests a filter of its own, on whole documents.
 struct Lazy<'a> {
     storage: &'a dyn Storage,
     ask: &'a Ask<'a>,
-    rows: &'a Rows,
-    /// The trial needs whole documents and runs every filter: some index
-    /// is partial (it tests a filter of its own), the query is a rooted
-    /// `$or`, whose branches are each tried against their own filter, or it
-    /// sorts, and a sort counts the bytes of what it holds.
+    /// What the query matches; `None` when it was not read first (a write
+    /// of many tried before it writes, RM-390): the trial then runs the
+    /// filters itself, as mongod's does.
+    rows: Option<&'a Rows>,
+    /// The trial needs whole documents and runs every filter: the matched
+    /// set is not known, some index is partial (it tests a filter of its
+    /// own), the query is a rooted `$or`, whose branches are each tried
+    /// against their own filter, or it sorts, and a sort counts the bytes
+    /// of what it holds.
     partial: bool,
     /// The top-level fields the indexes are keyed on.
     fields: BTreeSet<String>,
@@ -373,12 +377,12 @@ enum Whole {
 }
 
 impl<'a> Lazy<'a> {
-    /// The collection of `ask`, whose query matches `rows`, for a trial of
-    /// the plans over `catalog`.
+    /// The collection of `ask`, whose query matches `rows` (`None`: not
+    /// known), for a trial of the plans over `catalog`.
     fn new(
         storage: &'a dyn Storage,
         ask: &'a Ask<'a>,
-        rows: &'a Rows,
+        rows: Option<&'a Rows>,
         catalog: &[Arc<super::IndexInfo>],
         canonical: &Document,
     ) -> Lazy<'a> {
@@ -386,7 +390,8 @@ impl<'a> Lazy<'a> {
             storage,
             ask,
             rows,
-            partial: catalog.iter().any(|ix| ix.partial.is_some())
+            partial: rows.is_none()
+                || catalog.iter().any(|ix| ix.partial.is_some())
                 || (canonical.len() == 1 && canonical.contains_key("$or"))
                 || ask.sort.is_some_and(|s| !s.is_empty()),
             fields: catalog
@@ -412,9 +417,17 @@ impl Lazy<'_> {
                 }
             })
             .collect();
-        let matched: BTreeSet<i64> = self.rows.iter().map(|(recordid, _)| *recordid).collect();
+        if self.partial {
+            return Some((docs?, None));
+        }
+        let matched: BTreeSet<i64> = self
+            .rows
+            .into_iter()
+            .flatten()
+            .map(|(recordid, _)| *recordid)
+            .collect();
         let known: Vec<bool> = all.iter().map(|(r, _)| matched.contains(r)).collect();
-        Some((docs?, (!self.partial).then_some(known)))
+        Some((docs?, Some(known)))
     }
 
     /// The whole collection, when it holds no more than `cap` documents.
@@ -714,7 +727,7 @@ fn consult<'a>(
     let Some(hook) = ReadCache::new(storage, ask, canonical.clone(), full)? else {
         return Ok(None);
     };
-    let whole = Lazy::new(storage, ask, rows, &catalog, &canonical);
+    let whole = Lazy::new(storage, ask, Some(rows), &catalog, &canonical);
     let trial = plan::Trial {
         total: None,
         matched: Some(rows.len()),
@@ -1273,7 +1286,7 @@ fn tried(
     } else {
         None
     };
-    let whole = Lazy::new(storage, ask, &rows, catalog, canonical);
+    let whole = Lazy::new(storage, ask, Some(&rows), catalog, canonical);
     let trial = plan::Trial {
         total: None,
         matched: Some(rows.len()),
@@ -1533,7 +1546,7 @@ pub(crate) fn ordered_rows(storage: &dyn Storage, ask: &Ask) -> Result<Option<Ro
         } else {
             None
         };
-        let whole = Lazy::new(storage, ask, &rows, &catalog, &canonical);
+        let whole = Lazy::new(storage, ask, Some(&rows), &catalog, &canonical);
         // The plans the read chose through the plan cache.
         let trial = plan::Trial {
             total,
@@ -2476,10 +2489,24 @@ pub(crate) fn counted_plan(
         implies: &implied,
         trial: None,
     };
-    if plan::contested(&query, &catalog) {
+    let contested = plan::contested(&query, &catalog);
+    if contested && !tries_write(ask, planned, &query, &catalog) {
         return Ok(None);
     }
     let plan = match planned {
+        Planned::Write {
+            delete,
+            multi,
+            upsert,
+            returns,
+        } if contested => tried_write(
+            storage,
+            ask,
+            &query,
+            &catalog,
+            &canonical,
+            (delete, multi, upsert, returns),
+        )?,
         Planned::Count { .. } => plan::count(&query, &catalog),
         Planned::Distinct(key) => plan::distinct(&query, &catalog, key, !ask.filter.is_empty()),
         Planned::Write {
@@ -2505,6 +2532,99 @@ pub(crate) fn counted_plan(
         return Ok(None);
     }
     Ok(Some(plan))
+}
+
+/// Whether a contested `planned` read is tried here, before anything is
+/// read (RM-390): a write of many, which mongod tries over what its
+/// candidate plans reach and then writes each document the winner returns,
+/// so that one out of time part-way has written some. Not a sort, a geo
+/// predicate (read with its own scan), an `$expr`, whose variables the
+/// trial's filters are not given, or candidates a stream does not run (an
+/// index intersection, a rooted `$or`'s branches), which would leave the
+/// write to plan through the cache a second time.
+fn tries_write(
+    ask: &Ask,
+    planned: Planned,
+    query: &Query,
+    catalog: &[Arc<super::IndexInfo>],
+) -> bool {
+    matches!(planned, Planned::Write { multi: true, .. })
+        && ask.hint.is_none()
+        && ask.sort.is_none_or(|s| s.is_empty())
+        && !mentions_geo(ask.filter)
+        && !mentions_expr(ask.filter)
+        && plan::single_index_candidates(query, catalog)
+}
+
+/// Whether `filter` holds an `$expr` anywhere.
+fn mentions_expr(filter: &Document) -> bool {
+    fn walk(v: &Bson) -> bool {
+        match v {
+            Bson::Document(d) => d.iter().any(|(k, v)| k == "$expr" || walk(v)),
+            Bson::Array(items) => items.iter().any(walk),
+            _ => false,
+        }
+    }
+    filter.iter().any(|(k, v)| k == "$expr" || walk(v))
+}
+
+/// The plan mongod runs for a contested write of many ([`tries_write`]):
+/// its candidates tried through the plan cache, as the command's own read
+/// consults and writes it, over only what each candidate's scan reaches
+/// in the works the trial takes (`Lazy::reached`) -- not over every match
+/// read first, which read the whole collection before the first write.
+fn tried_write(
+    storage: &dyn Storage,
+    ask: &Ask,
+    query: &Query,
+    catalog: &[Arc<super::IndexInfo>],
+    canonical: &Document,
+    (delete, multi, upsert, returns): (bool, bool, bool, bool),
+) -> Result<Node, StorageError> {
+    let ask = Ask {
+        db: ask.db,
+        coll: ask.coll,
+        filter: ask.filter,
+        sort: ask.sort,
+        hint: ask.hint,
+        collation: ask.collation,
+        vars: ask.vars,
+        limit: ask.limit,
+        asked: crate::near::Asked {
+            cached: true,
+            ..ask.asked
+        },
+    };
+    let hook = ReadCache::new(storage, &ask, canonical.clone(), catalog_of(storage, &ask)?)?;
+    let whole = Lazy::new(storage, &ask, None, catalog, canonical);
+    let trial = plan::Trial {
+        total: None,
+        matched: None,
+        whole: &whole,
+        ranked: Default::default(),
+        cache: hook.as_ref().map(|h| h as &dyn plan::CacheHook),
+        cached_ran: Default::default(),
+    };
+    let plan = plan::write(
+        &Query {
+            trial: Some(&trial),
+            ..query.clone()
+        },
+        catalog,
+        delete,
+        multi,
+        upsert,
+        returns,
+    );
+    // The write ran the plan cache's active plan, or a trial's winner.
+    if hook.is_some() {
+        let from_plan_cache = trial.cached_ran.get();
+        crate::opdebug::note_planned(crate::opdebug::Planned {
+            from_multi_planner: !from_plan_cache,
+            from_plan_cache,
+        });
+    }
+    Ok(plan)
 }
 
 /// What a write's read of its documents found, run as mongod's plan runs

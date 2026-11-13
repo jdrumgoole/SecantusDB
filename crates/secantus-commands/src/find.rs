@@ -453,13 +453,19 @@ pub fn find(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     Ok(reply)
 }
 
-fn find_body(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
+/// `find` as mongod's IDL parses it, before the command runs: its fields,
+/// their types and ranges, and the tailable options that go together. A
+/// command refused here never ran -- no `Slow query` line, no profile entry,
+/// not a connection's first command (RM-386, measured 8.2.11). The sort, the
+/// `let` names, the filter and the projection are parsed as it runs, as
+/// mongod's canonical query parses them.
+pub(crate) fn parse(doc: &Document, db: &str) -> Result<(), CommandError> {
     let coll = coll_arg(doc, "find")?;
     if coll.starts_with('$') {
         return Err(CommandError::new(
             73,
             "InvalidNamespace",
-            format!("Invalid collection name specified '{}.{coll}'", ctx.db_name),
+            format!("Invalid collection name specified '{db}.{coll}'"),
         ));
     }
     if let Some(key) = argtypes::unknown_field(doc, FIND_FIELDS) {
@@ -494,18 +500,11 @@ fn find_body(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
             }
         }
     }
-    // `{$natural: ±1}` is storage order, which `find` runs as the `$natural`
-    // hint; any other spec is an ordinary sort.
-    let natural_hint = match doc.get("sort") {
-        Some(Bson::Document(sort)) => {
-            let natural = argtypes::natural_sort(sort, doc.get("hint"))?;
-            if natural.is_none() {
-                argtypes::require_sort_spec(sort)?;
-            }
-            natural
-        }
-        _ => None,
-    };
+    // A `$natural` sort is read as the command parses (`{$natural: 2}` is
+    // refused before it runs); any other sort spec as it runs.
+    if let Some(Bson::Document(sort)) = doc.get("sort") {
+        argtypes::natural_sort(sort, doc.get("hint"))?;
+    }
     // `min` / `max` are the Expected-field family, which REJECTS an explicit
     // null -- not the BSON-field family, which accepts it. Probed.
     argtypes::require_object_expected(doc, "min")?;
@@ -561,9 +560,27 @@ fn find_body(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
             ));
         }
     }
-    argtypes::require_let_names(doc)?;
     argtypes::require_object(doc, "readConcern", "FindCommandRequest.readConcern")?;
-    argtypes::require_hint(doc, "hint")?;
+    argtypes::require_hint(doc, "hint")
+}
+
+fn find_body(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
+    parse(doc, &ctx.db_name)?;
+    let coll = coll_arg(doc, "find")?;
+    // `{$natural: ±1}` is storage order, which `find` runs as the `$natural`
+    // hint; any other spec is an ordinary sort, checked as the query is
+    // canonicalised (measured 8.2.11: `sort: {a: "x"}` runs, and counts).
+    let natural_hint = match doc.get("sort") {
+        Some(Bson::Document(sort)) => {
+            let natural = argtypes::natural_sort(sort, doc.get("hint"))?;
+            if natural.is_none() {
+                argtypes::require_sort_spec(sort)?;
+            }
+            natural
+        }
+        _ => None,
+    };
+    argtypes::require_let_names(doc)?;
     // An undefined `$$variable` is a PARSE error (17276), not the storage
     // layer's generic "unsupported construct" BadValue.
     {

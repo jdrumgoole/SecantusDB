@@ -62,6 +62,8 @@ pub mod replay;
 pub mod share_locks;
 
 mod index_build;
+mod lockfile;
+pub use lockfile::LockFileRecord;
 mod scan_bounds;
 mod sizes;
 
@@ -206,6 +208,33 @@ pub struct StorageOptions {
     /// server's prepared transactions and read-committed rebases rely on
     /// that), and its writes commit at the first of them.
     pub transactions_logged_at_commit: bool,
+    /// Take mongod's lock file of this name (`mongod.lock`) in the home
+    /// before WiredTiger opens, and empty it on a clean close (see
+    /// `lockfile.rs`). The MongoDB server asks for it; `None` takes none.
+    pub lock_file: Option<String>,
+}
+
+/// What opening the store did and how long it took, for the startup lines
+/// mongod writes on `initandlisten` (`Opening WiredTiger`, `WiredTiger
+/// opened`, `mongod startup complete`).
+#[derive(Debug, Clone)]
+pub struct OpenRecord {
+    /// When the open began: the lock file is the first thing it takes.
+    pub started: Instant,
+    /// The lock file taken, when one was asked for.
+    pub lock_file: Option<LockFileRecord>,
+    /// The home held no WiredTiger store before this open (or the store is
+    /// in memory): mongod writes new metadata then, and validates the
+    /// existing metadata otherwise.
+    pub new_store: bool,
+    /// The configuration `wiredtiger_open` was given, as given.
+    pub wt_config: String,
+    /// How long `wiredtiger_open` took.
+    pub wt_open: Duration,
+    /// How long the whole open took after the lock file: WiredTiger, the
+    /// tables, the recovery and the upgrades (mongod's
+    /// `createStorageEngineMillis`).
+    pub open: Duration,
 }
 
 /// A block's own rows of one table: see [`Storage::block_overlay`].
@@ -5547,6 +5576,13 @@ pub struct Storage {
     /// Index builds in progress (RM-187): what writes to their collections
     /// must also record, and what `listIndexes` / `currentOp` show.
     index_builds: index_build::Registry,
+    /// What the open did, for the server's startup lines.
+    open_record: OpenRecord,
+    /// mongod's lock file, when asked for. Declared LAST so it drops after
+    /// every other field, the WiredTiger connection's last holders among
+    /// them: emptied only once the store is closed, as mongod clears it
+    /// after its storage engine shuts down.
+    lock_file: Option<lockfile::LockFile>,
 }
 
 /// Strictly-monotonic oplog bookkeeping: the next int64 seq to mint and the last
@@ -7978,7 +8014,13 @@ impl Storage {
             .clear();
         match first {
             Some(e) => Err(e),
-            None => Ok(()),
+            None => {
+                // A clean close: the lock file is emptied as it drops.
+                if let Some(lock) = &self.lock_file {
+                    lock.mark_clean();
+                }
+                Ok(())
+            }
         }
     }
     /// True when this store is the non-persistent (`in_memory=true`) variant.
@@ -8037,6 +8079,15 @@ impl Storage {
     /// explicit `Some` wins over the environment. This is what the Python
     /// `RustServer(...)` kwargs and the `secantusd-rs` flags thread through.
     pub fn open_with_options(home: &str, opts: &StorageOptions) -> Result<Storage> {
+        let started = Instant::now();
+        let (lock_file, lock_record) = match &opts.lock_file {
+            Some(name) => {
+                let (lock, record) = lockfile::LockFile::acquire(home, name)?;
+                (Some(lock), Some(record))
+            }
+            None => (None, None),
+        };
+        let engine_started = Instant::now();
         let config = opts
             .wt_config
             .clone()
@@ -8053,7 +8104,10 @@ impl Storage {
             .oplog_async
             .unwrap_or_else(|| std::env::var_os("SECANTUS_OPLOG_ASYNC").is_some());
         let in_memory = config.contains("in_memory=true");
+        let new_store = in_memory || !std::path::Path::new(home).join("WiredTiger.wt").exists();
+        let wt_started = Instant::now();
         let conn = Arc::new(Connection::open(home, config)?);
+        let wt_open = wt_started.elapsed();
         // An existing store's mode is the one its tables were created with,
         // read from WiredTiger's own metadata before anything is created: a
         // logged store records no mode of its own, and neither does a
@@ -8250,6 +8304,15 @@ impl Storage {
             insert_groups: AtomicI64::new(0),
             sizes,
             index_builds: index_build::Registry::default(),
+            open_record: OpenRecord {
+                started,
+                lock_file: lock_record,
+                new_store,
+                wt_config: config.to_string(),
+                wt_open,
+                open: Duration::ZERO,
+            },
+            lock_file,
         };
         // Before the store takes any write -- crash recovery's replay and the
         // upgrades below write documents, and each write moves the counts.
@@ -8290,7 +8353,13 @@ impl Storage {
         // Index builds a crash or shutdown interrupted run again from the
         // start, as mongod restarts them (RM-187).
         storage.restart_index_builds()?;
+        storage.open_record.open = engine_started.elapsed();
         Ok(storage)
+    }
+
+    /// What opening this store did, for the server's startup lines.
+    pub fn open_record(&self) -> &OpenRecord {
+        &self.open_record
     }
 
     /// Turn oplog emission on/off (mirrors `SecantusDBServer(enable_oplog=...)`).

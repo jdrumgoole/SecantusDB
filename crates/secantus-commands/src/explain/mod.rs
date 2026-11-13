@@ -2461,6 +2461,30 @@ pub(crate) fn parse(doc: &Document, db: &str) -> Result<Parsed, CommandError> {
 }
 
 /// mongod's refusal of an explained command it does not explain.
+/// [`parse`], as the dispatcher runs it ahead of the command: the explained
+/// command's name and body, which the dispatcher parses next, or `None` for
+/// a command mongod knows and cannot explain, which it refuses as the
+/// `explain` runs (`{explain: {insert: ...}}` is logged and counts as a
+/// connection's first command, measured 8.2.11, RM-386). An `explain` of an
+/// `explain` is refused as it parses, taking no lock (RM-185).
+pub(crate) fn parse_ahead(
+    doc: &Document,
+    db: &str,
+) -> Result<Option<(String, Document)>, CommandError> {
+    match parse(doc, db) {
+        Ok(parsed) => Ok(Some((parsed.name, parsed.inner))),
+        Err(e) if e.code == 20 && !explains_an_explain(doc) => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+fn explains_an_explain(doc: &Document) -> bool {
+    doc.get_document("explain")
+        .ok()
+        .and_then(|inner| inner.keys().next())
+        .is_some_and(|name| name == "explain")
+}
+
 fn unexplainable(name: &str) -> CommandError {
     if name == "explain" {
         err(20, "IllegalOperation", "Explain cannot explain itself.")
