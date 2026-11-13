@@ -364,12 +364,18 @@ pub fn apply_pipeline(
         // storage is kept through them once one changes it and a sort or a
         // window lies ahead to count it.
         // (`$unset` starts none: at the front mongod's scan takes it, as a
-        // projection that reads each document into new BSON.)
+        // projection that reads each document into new BSON. Nor does an
+        // inclusion `$project`, RM-519.)
         let modelled = matches!(
             name.as_str(),
             "$match" | "$unwind" | "$addFields" | "$set" | "$unset" | "$limit" | "$skip"
         ) || name == crate::sbe::ENGINE_STAGE
-            || name == INHIBIT_OPTIMIZATION;
+            || name == INHIBIT_OPTIMIZATION
+            || (name == "$project"
+                && spec
+                    .as_document()
+                    .and_then(docstore::Inclusion::parse)
+                    .is_some());
         let changes = matches!(name.as_str(), "$unwind" | "$addFields" | "$set");
         if stores.is_none() && changes && counts_storage(&pipeline[i + 1..]) {
             stores = Some(read_stores(&docs));
@@ -813,6 +819,10 @@ fn stored_stage(
         }
         return Ok((out, stores));
     }
+    let inclusion = match name {
+        "$project" => spec.as_document().and_then(docstore::Inclusion::parse),
+        _ => None,
+    };
     let mut out = Vec::with_capacity(docs.len());
     let mut kept = Vec::with_capacity(docs.len());
     let mut reads = Vec::new();
@@ -829,6 +839,11 @@ fn stored_stage(
             "$unset" => {
                 if let [o] = one.as_slice() {
                     kept.push(unset_storage(spec, s, o)?);
+                }
+            }
+            "$project" => {
+                if let ([o], Some(inc)) = (one.as_slice(), &inclusion) {
+                    kept.push(inc.apply(&d, &s, o, vars));
                 }
             }
             _ => kept.extend(std::iter::repeat_n(s, one.len())),

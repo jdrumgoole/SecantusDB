@@ -1716,15 +1716,35 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       and (206600, 230200). Found 2026-11-13 (RM-515).
       Verify: tests/backlog/test_rm_found_rm515.py::test_an_arrays_documents_a_stage_touched_are_sized_by_their_storage
       Backlog-ID: RM-636
-- [ ] **A document an inclusion `$project` built is sized as if it were
-      read.** Behind an `$unwind` (so not taken by the scan), mongod
-      8.2.11's `$project: {t: 1, n: 1}` builds each document it returns,
-      and the `$sort` after it counts that storage: 351300 bytes over 900
-      documents. This server counts each as the BSON it encodes, 188700:
-      the storage model (`docstore`, RM-408) stops at a `$project`. Found
-      2026-11-10 (RM-408).
-      Verify: tests/backlog/test_rm_found_rm408.py::test_a_document_a_project_built_is_sized_as_built
-      Backlog-ID: RM-519
+- [ ] **A `$sort` behind an exclusion `$project` counts each document
+      as the BSON it encodes.** mongod 8.2.11's exclusion `$project` keeps
+      the input's own storage and writes each excluded field out of it,
+      and projects a sub-document (`{"e.y": 0}`) into one of its own;
+      behind an `$unwind`, the `$sort` after it counts 4640 bytes over ten
+      documents for `{b: 0}` and 6930 for `{"e.y": 0}`. This server counts
+      2350 and 2850: the storage model (`docstore`, RM-408) models an
+      inclusion `$project` (RM-519) and stops at an exclusion. Found
+      2026-11-13 (RM-519).
+      Verify: tests/backlog/test_rm_found_rm519.py::test_a_sort_counts_what_an_exclusion_project_left
+      Backlog-ID: RM-637
+- [ ] **A `$project` behind a `$group` pushed into SBE is sized as if it
+      were read.** `[{$group: {_id: "$n", c: {$sum: 1}}}, {$project: {c:
+      1}}, {$sort: {c: 1}}]`: mongod 8.2.11's `$project` builds each
+      document (a `MutableDocument` with room for its two fields), and the
+      `$sort` counts 2450 bytes over ten groups; this server counts the
+      BSON each encodes, 1170, as it keeps no storage behind an SBE
+      `$group` (see also RM-435). Found 2026-11-13 (RM-519).
+      Verify: tests/backlog/test_rm_found_rm519.py::test_a_project_after_a_pushed_down_group_builds_its_documents
+      Backlog-ID: RM-638
+- [ ] **A `$sort` behind a `$setWindowFields` that sorted by the same key
+      is kept.** `[{$unwind: "$t"}, {$set: {w: 1}}, {$setWindowFields:
+      {sortBy: {n: 1}, ...}}, {$sort: {n: 1}}]`: mongod 8.2.11 drops the
+      trailing `$sort`, its explain ending at `$_internalSetWindowFields`;
+      this server keeps it and lists a `$sort` after the window, as it does
+      with a `$project` in the `$set`'s place. Behind the `$unwind` alone
+      it drops it, as mongod does. Found 2026-11-13 (RM-519).
+      Verify: tests/backlog/test_rm_found_rm519.py::test_a_sort_after_a_window_on_its_key_is_dropped
+      Backlog-ID: RM-639
 - [ ] **`find`, a leading `$sort` and `$setWindowFields` hand back
       documents whose sort keys tie in the order they were read.** mongod
       runs each through the same sorter as any other sort, and its

@@ -122,9 +122,10 @@ def _projected_sort(client: Any) -> int:
     return stages[-1]["totalDataSizeSortedBytesEstimate"]
 
 
-@pytest.mark.backlog("RM-519")
+@pytest.mark.backlog_fixed("RM-519")
 def test_a_document_a_project_built_is_sized_as_built(rust_mongo: Any, mongod: Any) -> None:
-    """mongod 8.2.11's inclusion `$project` behind an `$unwind` builds each
-    document it returns, and the `$sort` after it counts that storage:
-    351300 bytes over 900 documents."""
+    """mongod 8.2.11's inclusion `$project` behind an `$unwind` built each
+    document it returned, with room for every field its spec named, and the
+    `$sort` after it counted that storage: 351300 bytes over 900 documents.
+    This server counted the BSON each encoded, 188700."""
     assert _projected_sort(rust_mongo) == _projected_sort(mongod)

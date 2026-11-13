@@ -113,6 +113,9 @@ pub struct Stored {
     fields: Vec<(String, Held)>,
     /// The metadata's size, when it carries any.
     metadata: usize,
+    /// Whether a stage wrote to it (`_modified`): a document still as it
+    /// was read is "trivially convertible" back to its BSON.
+    modified: bool,
 }
 
 impl Stored {
@@ -127,12 +130,16 @@ impl Stored {
             buckets: 1,
             fields: Vec::new(),
             metadata: 0,
+            modified: false,
         }
     }
 
     /// A document built field by field (`MutableDocument()`).
     pub fn built() -> Self {
-        Stored::read(EMPTY_BSON)
+        Stored {
+            modified: true,
+            ..Stored::read(EMPTY_BSON)
+        }
     }
 
     /// A document built with room for `fields` fields first
@@ -311,6 +318,7 @@ impl Stored {
     }
 
     fn set_held(&mut self, name: &str, held: Held) {
+        self.modified = true;
         match self.cached(name) {
             Some(h) => *h = held,
             None => self.append(name, held),
@@ -319,7 +327,22 @@ impl Stored {
 
     /// `MutableDocument::addField`: a new field, never looked up.
     pub fn add_field(&mut self, name: &str, held: usize) {
+        self.modified = true;
         self.append(name, Held::Bytes(held));
+    }
+
+    /// What the cached field `name`'s value holds, when it is cached: a
+    /// copy of the `Value`, which shares a sub-document's storage.
+    fn held_of(&self, name: &str) -> Option<Held> {
+        self.fields
+            .iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, h)| h.clone())
+    }
+
+    /// Whether a stage wrote to the document.
+    pub fn modified(&self) -> bool {
+        self.modified
     }
 
     /// The document carries `bytes` of metadata from now on.
@@ -414,6 +437,310 @@ pub fn paths_read(expr: &Bson, out: &mut Vec<String>) {
             }
         }
         _ => {}
+    }
+}
+
+/// One level of an inclusion `$project` (`InclusionNode`,
+/// `projection_node.cpp`, 8.2.1): the fields it copies, the sub-projections
+/// under it and the fields it computes, the last two in the spec's order
+/// (`_orderToProcessAdditionsAndChildren`).
+#[derive(Debug, Default)]
+pub struct Inclusion {
+    projected: Vec<String>,
+    children: Vec<(String, Inclusion)>,
+    expressions: Vec<(String, Bson)>,
+    order: Vec<String>,
+}
+
+/// What a projection makes of a value, kept as far as its size needs.
+enum Built {
+    /// No value (`Value()`), which a document still gives a field to.
+    Missing,
+    /// A value copied or computed, and what it holds beyond its `Value`.
+    Leaf(Held),
+    /// A document the projection built, and its fields.
+    Doc(Stored, Vec<(String, Built)>),
+    /// An array it rebuilt element by element.
+    Array(Vec<Built>),
+}
+
+impl Built {
+    /// What the value holds beyond its `Value`. An array's missing
+    /// elements count nothing (measured 8.2.11: `{"r.x": 1}` over
+    /// `r: [3]` holds 40, as over `r: []`).
+    fn held(&self) -> usize {
+        match self {
+            Built::Missing => 0,
+            Built::Leaf(h) => h.size(),
+            Built::Doc(s, _) => s.approximate(),
+            Built::Array(vs) => {
+                memlimit::RC_VECTOR
+                    + vs.iter()
+                        .filter(|v| !matches!(v, Built::Missing))
+                        .map(|v| memlimit::VALUE + v.held())
+                        .sum::<usize>()
+            }
+        }
+    }
+
+    /// The `Value` a document's field holds: a copied one shares its
+    /// sub-document's storage.
+    fn as_held(&self) -> Held {
+        match self {
+            Built::Leaf(h) => h.clone(),
+            _ => Held::Bytes(self.held()),
+        }
+    }
+}
+
+/// Set `name` to `v` in a document being built (`MutableDocument::setField`).
+fn set_built(s: &mut Stored, fields: &mut Vec<(String, Built)>, name: &str, v: Built) {
+    s.set_held(name, v.as_held());
+    match fields.iter_mut().find(|(n, _)| n == name) {
+        Some((_, old)) => *old = v,
+        None => fields.push((name.to_string(), v)),
+    }
+}
+
+impl Inclusion {
+    /// The tree of an inclusion `$project` spec; `None` for any other
+    /// projection (an exclusion, or one with `$slice`, `$elemMatch` or
+    /// `$meta`), whose storage is not modelled.
+    pub fn parse(spec: &Document) -> Option<Inclusion> {
+        use crate::projection::{flag_truthy, is_computed_spec, is_flag_value};
+        let flat = crate::projection::flatten_projection_spec(spec).ok()?;
+        let mut root = Inclusion::default();
+        let mut id = None;
+        let mut included = false;
+        for (key, value) in &flat {
+            if key == "_id" && is_flag_value(value) {
+                id = Some(flag_truthy(value));
+                continue;
+            }
+            if key == "_id" || key.starts_with("_id.") {
+                id = Some(false);
+            }
+            let expr = if is_flag_value(value) {
+                if !flag_truthy(value) {
+                    return None;
+                }
+                None
+            } else if is_computed_spec(value) {
+                Some(value.clone())
+            } else {
+                return None;
+            };
+            root.insert(key, expr);
+            included = true;
+        }
+        if !included && id != Some(true) {
+            return None;
+        }
+        // `_id` is copied unless the spec excludes or computes it.
+        if id != Some(false) {
+            root.projected.insert(0, "_id".to_string());
+        }
+        Some(root)
+    }
+
+    fn insert(&mut self, path: &str, expr: Option<Bson>) {
+        match path.split_once('.') {
+            Some((head, rest)) => {
+                if !self.children.iter().any(|(n, _)| n == head) {
+                    self.order.push(head.to_string());
+                    self.children.push((head.to_string(), Inclusion::default()));
+                }
+                let (_, child) = self
+                    .children
+                    .iter_mut()
+                    .find(|(n, _)| n == head)
+                    .expect("just added");
+                child.insert(rest, expr);
+            }
+            None => match expr {
+                Some(e) => {
+                    self.order.push(path.to_string());
+                    self.expressions.push((path.to_string(), e));
+                }
+                None => self.projected.push(path.to_string()),
+            },
+        }
+    }
+
+    /// `subtreeContainsComputedFields`.
+    fn computed(&self) -> bool {
+        !self.expressions.is_empty() || self.children.iter().any(|(_, c)| c.computed())
+    }
+
+    fn child(&self, name: &str) -> Option<&Inclusion> {
+        self.children
+            .iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, c)| c)
+    }
+
+    /// The storage of what the projection makes of `input`, whose storage
+    /// is `s` (`ProjectionNode::applyToDocument`), `out` being that
+    /// result. A projection with nothing to compute takes a document no
+    /// stage wrote to straight from its BSON into new BSON
+    /// (`FastPathEligibleInclusionNode`); otherwise it builds the document
+    /// with room for every field it names (`MutableDocument(n)`), copying
+    /// each field it keeps in the input's order and then setting each
+    /// computed one (measured 8.2.11).
+    pub fn apply(&self, input: &Document, s: &Stored, out: &Document, vars: &Document) -> Stored {
+        let mut built = if !self.computed() && !s.modified() {
+            Stored::read(memlimit::bson_len(out))
+        } else {
+            // Copying a field caches it in the input (the field iterator's
+            // `constructInCache`), and what the computed fields read is
+            // cached there too: inside a sub-document, in the storage a
+            // copied field shares (RM-515).
+            let mut s_in = s.clone();
+            let (mut st, mut fields) = self.project_doc(input, Some(&mut s_in));
+            self.read_paths(input, &mut s_in);
+            if self.computed() {
+                self.apply_expressions(&mut st, &mut fields, input, Some(&s_in), vars);
+            }
+            st
+        };
+        built.set_metadata(s.metadata);
+        built
+    }
+
+    /// The reads each computed field's expression makes of `root`, whose
+    /// storage is `s`.
+    fn read_paths(&self, root: &Document, s: &mut Stored) {
+        for (_, expr) in &self.expressions {
+            let mut read = Vec::new();
+            paths_read(expr, &mut read);
+            for path in &read {
+                s.read_path(root, path);
+            }
+        }
+        for (_, child) in &self.children {
+            child.read_paths(root, s);
+        }
+    }
+
+    /// `initializeOutputDocument` and `applyProjections` over `doc`.
+    /// `cached`: the document's storage, whose cache holds the values a
+    /// stage set, and takes each field copied from its BSON.
+    fn project_doc(
+        &self,
+        doc: &Document,
+        mut cached: Option<&mut Stored>,
+    ) -> (Stored, Vec<(String, Built)>) {
+        let mut st =
+            Stored::reserved(self.projected.len() + self.children.len() + self.expressions.len());
+        let mut fields = Vec::new();
+        for (k, v) in doc {
+            let built = if self.projected.iter().any(|p| p == k) {
+                let copied = cached.as_deref_mut().and_then(|s| {
+                    s.read_field(doc, k);
+                    s.held_of(k)
+                });
+                Built::Leaf(copied.unwrap_or_else(|| Held::read(v)))
+            } else if let Some(child) = self.child(k) {
+                child.project_value(v)
+            } else {
+                continue;
+            };
+            st.set_held(k, built.as_held());
+            fields.push((k.clone(), built));
+        }
+        (st, fields)
+    }
+
+    /// `applyProjectionsToValue`: a document projected, an array element by
+    /// element (nested arrays too, as `$project` recurses), anything else
+    /// nothing.
+    fn project_value(&self, v: &Bson) -> Built {
+        match v {
+            Bson::Document(d) => {
+                let (st, fields) = self.project_doc(d, None);
+                Built::Doc(st, fields)
+            }
+            Bson::Array(a) => Built::Array(a.iter().map(|e| self.project_value(e)).collect()),
+            _ => Built::Missing,
+        }
+    }
+
+    /// `applyExpressions`: each sub-projection and computed field, in the
+    /// spec's order, set on the document being built.
+    fn apply_expressions(
+        &self,
+        st: &mut Stored,
+        fields: &mut Vec<(String, Built)>,
+        root: &Document,
+        input: Option<&Stored>,
+        vars: &Document,
+    ) {
+        for name in &self.order {
+            let v = match self.child(name) {
+                Some(child) => {
+                    let current = fields
+                        .iter_mut()
+                        .find(|(n, _)| n == name)
+                        .map(|(_, v)| std::mem::replace(v, Built::Missing))
+                        .unwrap_or(Built::Missing);
+                    child.expressions_to_value(current, root, vars)
+                }
+                None => {
+                    let expr = self
+                        .expressions
+                        .iter()
+                        .find(|(n, _)| n == name)
+                        .map(|(_, e)| e)
+                        .expect("an expression or a child");
+                    computed_value(expr, root, input, vars)
+                }
+            };
+            set_built(st, fields, name, v);
+        }
+    }
+
+    /// `applyExpressionsToValue`.
+    fn expressions_to_value(&self, v: Built, root: &Document, vars: &Document) -> Built {
+        match v {
+            Built::Doc(mut st, mut fields) => {
+                self.apply_expressions(&mut st, &mut fields, root, None, vars);
+                Built::Doc(st, fields)
+            }
+            Built::Array(vs) => Built::Array(
+                vs.into_iter()
+                    .map(|e| self.expressions_to_value(e, root, vars))
+                    .collect(),
+            ),
+            _ if self.computed() => {
+                // A value with no fields to set is replaced by a document of
+                // the computed ones (`{"a.b": {$literal: 1}}` over `{a: 1}`).
+                let mut st = Stored::built();
+                let mut fields = Vec::new();
+                self.apply_expressions(&mut st, &mut fields, root, None, vars);
+                Built::Doc(st, fields)
+            }
+            _ => Built::Missing,
+        }
+    }
+}
+
+/// What a computed field's expression gives over `root`: a field path to
+/// a value the input caches is that value, sharing a sub-document's
+/// storage.
+fn computed_value(expr: &Bson, root: &Document, input: Option<&Stored>, vars: &Document) -> Built {
+    if let (Bson::String(p), Some(s)) = (expr, input) {
+        if let Some(path) = p.strip_prefix('$').filter(|f| !f.starts_with('$')) {
+            if let Some(sub) = s.shared(path) {
+                return Built::Leaf(Held::Document(sub));
+            }
+            if let Some(h) = s.held_of(path) {
+                return Built::Leaf(h);
+            }
+        }
+    }
+    match crate::expressions::evaluate_or_missing(root, expr, vars) {
+        Ok(Bson::Undefined) | Err(_) => Built::Missing,
+        Ok(v) => Built::Leaf(Held::Bytes(produced_held(expr, &v))),
     }
 }
 
@@ -541,6 +868,79 @@ mod tests {
         let before = s.approximate();
         s.read_nested(&d, "e", "y");
         assert_eq!(s.approximate() - before, 2 * 202);
+    }
+
+    /// What an inclusion `$project` by `spec` builds of `input`, behind a
+    /// stage that wrote `t` (an `$unwind`), for a `$sort`.
+    fn projected(spec: Document, input: &Document) -> usize {
+        let mut s = Stored::read(memlimit::bson_len(input));
+        s.read_field(input, "t");
+        s.set_field("t", field_held(input, "t"));
+        let out = Document::new(); // unused: the input was written to
+        Inclusion::parse(&spec)
+            .expect("an inclusion")
+            .apply(input, &s, &out, &Document::new())
+            .for_sorter()
+    }
+
+    fn field_held(d: &Document, name: &str) -> usize {
+        d.get(name).map_or(0, held)
+    }
+
+    #[test]
+    fn an_inclusion_project_reserves_a_field_for_each_it_names() {
+        // mongod 8.2.11, `[{$unwind: "$t"}, {$project: ...}, {$sort}]`: each
+        // document less its 16-byte sort key.
+        let d = doc! { "_id": 1, "b": "y".repeat(100), "t": 1, "n": 1 };
+        assert_eq!(projected(doc! {"t": 1, "n": 1}, &d), 261);
+        assert_eq!(projected(doc! {"t": 1, "n": 1, "_id": 0}, &d), 229);
+        // A field the document lacks is still reserved for.
+        assert_eq!(projected(doc! {"t": 1, "n": 1, "zz": 1}, &d), 293);
+        // A computed field too, and what its value holds.
+        let concat = doc! {"t": 1, "n": 1, "x": {"$concat": ["$b", "!"]}};
+        assert_eq!(projected(concat, &d), 418);
+    }
+
+    #[test]
+    fn a_sub_projection_builds_documents_and_arrays_of_its_own() {
+        let d = doc! {
+            "_id": 1,
+            "e": {"x": 1, "y": "w".repeat(50)},
+            "r": [{"x": 1, "y": 2}, 3, {"y": 1}],
+            "t": 1,
+            "n": 1,
+        };
+        // `e`: a document with room for one field (205).
+        assert_eq!(projected(doc! {"t": 1, "e.x": 1}, &d), 261 + 205);
+        // `r`: 40 for the vector, 221 for each document, nothing for `3`.
+        assert_eq!(projected(doc! {"r.x": 1, "n": 1}, &d), 261 + 482);
+        // A computed field under `r`: the scalar becomes `{q: 2}` (237).
+        let q = doc! {"r.q": {"$add": [1, 1]}, "n": 1};
+        assert_eq!(projected(q, &d), 261 + 735);
+    }
+
+    #[test]
+    fn an_unwritten_document_is_projected_into_new_bson() {
+        let d = doc! { "_id": 1, "b": "y".repeat(100), "t": 5, "n": 1 };
+        let s = Stored::read(memlimit::bson_len(&d));
+        let out = doc! { "_id": 1, "t": 5, "n": 1 };
+        let inc = Inclusion::parse(&doc! {"t": 1, "n": 1}).expect("an inclusion");
+        assert_eq!(
+            inc.apply(&d, &s, &out, &Document::new()).for_sorter(),
+            memlimit::bson_len(&out) + STORAGE
+        );
+        // With something to compute it builds the document all the same.
+        let inc = Inclusion::parse(&doc! {"t": 1, "x": {"$add": [1, 1]}}).expect("an inclusion");
+        assert_eq!(inc.apply(&d, &s, &out, &Document::new()).for_sorter(), 261);
+    }
+
+    #[test]
+    fn only_an_inclusion_is_modelled() {
+        assert!(Inclusion::parse(&doc! {"b": 0}).is_none());
+        assert!(Inclusion::parse(&doc! {"_id": 0}).is_none());
+        assert!(Inclusion::parse(&doc! {"t": {"$slice": 1}}).is_none());
+        assert!(Inclusion::parse(&doc! {"_id": 1}).is_some());
+        assert!(Inclusion::parse(&doc! {"_id": 0, "t": 1}).is_some());
     }
 
     #[test]
