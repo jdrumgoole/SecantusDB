@@ -1012,6 +1012,7 @@ fn finish_join_source(
                         startup_ops: qual_startup_operators(c),
                         bounds: key_bounds(c),
                         inequality_keys: inequality_keys(c),
+                        operands: op_operands(c, &scope, params),
                         restrict: None,
                     })
                 })
@@ -2821,6 +2822,7 @@ fn build_join(
                         startup_ops: qual_startup_operators(c),
                         bounds: key_bounds(c),
                         inequality_keys: inequality_keys(c),
+                        operands: op_operands(c, &side_scope, params),
                         restrict: restriction_filter(c, [&left, &right], lookup, params),
                     });
                 }
@@ -3028,11 +3030,73 @@ pub struct JoinFilter {
     /// the other side's operand any expression of the outer row, RP-354).
     /// Empty for anything else, and where neither operand is one.
     pub inequality_keys: Vec<String>,
+    /// A two-operand operator's operands (an `OpExpr`), as
+    /// `paraminfo_get_equal_hashops` reads a clause moved into a
+    /// parameterized scan for a Memoize's cache key (RP-916). `None` for
+    /// any other conjunct: IS DISTINCT FROM is a `DistinctExpr`, an IN list
+    /// a `ScalarArrayOpExpr`.
+    pub operands: Option<[Operand; 2]>,
     /// A conjunct over one stored table's columns alone, as the clause
     /// `clause_selectivity` estimates as a restriction, from the table's
     /// statistics (an ON conjunct over a LEFT join's preserved side stays
     /// the join's filter, RP-354). `None` for anything else.
     pub restrict: Option<Restriction>,
+}
+
+/// One operand of [`JoinFilter::operands`]: its type's oid (`exprType`),
+/// `None` where it is not known, the joined keys it reads
+/// (`pull_var_clause`), in order, each once, and whether it is one bare
+/// key (a `Var`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Operand {
+    pub type_oid: Option<i64>,
+    pub keys: Vec<String>,
+    pub bare: bool,
+}
+
+/// [`JoinFilter::operands`] of `n`.
+fn op_operands(
+    n: &pg_query::protobuf::Node,
+    scope: &Scope,
+    params: &[Bson],
+) -> Option<[Operand; 2]> {
+    let Some(N::AExpr(e)) = n.node.as_ref() else {
+        return None;
+    };
+    if e.kind != pg_query::protobuf::AExprKind::AexprOp as i32 {
+        return None;
+    }
+    let operand = |x: &pg_query::protobuf::Node| {
+        let mut keys: Vec<String> = Vec::new();
+        let mut node = x.clone();
+        let _ = walk_expr(&mut node, &mut |y| {
+            if let Some(N::ColumnRef(c)) = y.node.as_ref() {
+                if let Some(k) = column_ref_name(c) {
+                    if !keys.contains(&k) {
+                        keys.push(k);
+                    }
+                }
+            }
+            Ok(())
+        });
+        let bare = bare_key(x).is_some();
+        let pg_type = match bare_key(x) {
+            Some(k) => scope
+                .cols
+                .iter()
+                .find(|c| c.key == k)
+                .map(|c| c.pg_type.clone()),
+            None => on_expr(x, scope, params)
+                .ok()
+                .map(|ce| crate::column_expr_type(&ce).to_string()),
+        };
+        Operand {
+            type_oid: pg_type.and_then(|t| crate::pgtypes::oid_of_name(&t)),
+            keys,
+            bare,
+        }
+    };
+    Some([operand(e.lexpr.as_deref()?), operand(e.rexpr.as_deref()?)])
 }
 
 /// [`JoinFilter::restrict`]: the conjunct lowered as its table's WHERE
@@ -3396,9 +3460,19 @@ fn in_list_of_constants(e: &pg_query::protobuf::AExpr) -> Option<usize> {
 /// AND / OR / NOT, columns and constants. A null test, a call (a LIKE's
 /// ESCAPE is `like_escape`) or a cast of a column costs otherwise.
 fn priced_by_operator_count(n: &pg_query::protobuf::Node) -> bool {
+    priced_by(n, false)
+}
+
+/// [`priced_by_operator_count`], and where `calls`, a call of a built-in
+/// [`plain_call_procost`] prices too.
+fn priced_by(n: &pg_query::protobuf::Node, calls: bool) -> bool {
     use pg_query::protobuf::AExprKind;
+    let priced_by_operator_count = |x: &pg_query::protobuf::Node| priced_by(x, calls);
     match n.node.as_ref() {
         Some(N::ColumnRef(_) | N::AConst(_)) => true,
+        Some(N::FuncCall(f)) if calls => {
+            plain_call_procost(f).is_some() && f.args.iter().all(priced_by_operator_count)
+        }
         Some(N::TypeCast(t)) => matches!(
             t.arg.as_deref().and_then(|a| a.node.as_ref()),
             Some(N::AConst(_))
@@ -3444,10 +3518,57 @@ pub struct KeyBound {
     pub arg_ops: f64,
 }
 
+/// The `procost` of a call of the built-in `f` that a cost can be read
+/// for whatever overload it resolves to (every overload's is the same)
+/// and that may be an index qual's operand: not VOLATILE
+/// (`match_clause_to_indexcol`), not a user's function, and a plain call
+/// -- no aggregate or window decoration, no VARIADIC, no named argument.
+fn plain_call_procost(f: &pg_query::protobuf::FuncCall) -> Option<f64> {
+    if f.agg_star
+        || f.agg_distinct
+        || f.func_variadic
+        || f.over.is_some()
+        || f.agg_filter.is_some()
+        || !f.agg_order.is_empty()
+        || f.args
+            .iter()
+            .any(|a| matches!(a.node.as_ref(), Some(N::NamedArgExpr(_))))
+    {
+        return None;
+    }
+    let name = crate::func_name(f)?;
+    if !crate::funcsig::is_builtin_function_name(&name)
+        || crate::correlated::user_function_for(&name, &f.args).is_some()
+        || crate::correlated::volatile_builtin(&name, f.args.len())
+    {
+        return None;
+    }
+    crate::sort_input::builtin_uniform_procost(&name)
+}
+
+/// What `cost_qual_eval` charges `n`, an index qual's other operand, once
+/// a scan (`index_other_operands_eval_cost`), in `cpu_operator_cost`
+/// units: [`qual_operators`]' operators and each call's `procost`. `None`
+/// where `n` is not built only of what [`priced_by`] prices with calls.
+fn bound_operand_cost(n: &pg_query::protobuf::Node) -> Option<f64> {
+    if !priced_by(n, true) {
+        return None;
+    }
+    let mut procost = 0.0;
+    let mut node = n.clone();
+    let _ = walk_expr(&mut node, &mut |x| {
+        if let Some(N::FuncCall(f)) = x.node.as_ref() {
+            procost += plain_call_procost(f).unwrap_or(0.0);
+        }
+        Ok(())
+    });
+    Some(qual_operators(n) + procost)
+}
+
 /// [`JoinFilter::bounds`] of `n`. The other operand must read no column
 /// of the key's table (`match_clause_to_indexcol` refuses one that does)
-/// and be built only of what [`qual_operators`] prices: a call could be
-/// volatile, which is never an index qual, and costs otherwise.
+/// and be built only of what [`bound_operand_cost`] prices: a VOLATILE
+/// call is never an index qual, and other calls cost their `procost`.
 fn key_bounds(n: &pg_query::protobuf::Node) -> Vec<KeyBound> {
     use pg_query::protobuf::AExprKind;
     let Some(N::AExpr(e)) = n.node.as_ref() else {
@@ -3480,13 +3601,16 @@ fn key_bounds(n: &pg_query::protobuf::Node) -> Vec<KeyBound> {
         let Some((alias, _)) = key.split_once(SEP) else {
             continue;
         };
-        if !priced_by_operator_count(other) || key_aliases(other).iter().any(|a| a == alias) {
+        if key_aliases(other).iter().any(|a| a == alias) {
             continue;
         }
+        let Some(arg_ops) = bound_operand_cost(other) else {
+            continue;
+        };
         out.push(KeyBound {
             key,
             op: op.to_string(),
-            arg_ops: qual_operators(other),
+            arg_ops,
         });
     }
     out

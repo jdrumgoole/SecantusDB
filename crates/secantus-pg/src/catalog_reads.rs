@@ -3299,7 +3299,7 @@ impl PgHandler {
 
 /// `GetDefaultOpClass`, for a column's index: the exact type's default,
 /// else a binary-coercible one's.
-fn default_opclass(typ: i64, am: i64) -> i64 {
+pub(crate) fn default_opclass(typ: i64, am: i64) -> i64 {
     let b = builtin();
     let classes = b.opclasses_by_am.get(&am).cloned().unwrap_or_default();
     classes

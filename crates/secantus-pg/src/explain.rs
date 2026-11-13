@@ -70,6 +70,46 @@ pub(crate) struct PlanNode {
     /// Under ANALYZE, a Hash node's table as `show_hash_info` prints it
     /// (RP-386).
     pub hash_info: Option<HashInfo>,
+    /// A Memoize node's cache (RP-916): what its rows hold, and under
+    /// ANALYZE what `show_memoize_info` prints.
+    pub memo: Option<MemoInfo>,
+}
+
+/// A Memoize node: the stored fields of each row its subplan returns, and
+/// under ANALYZE the cache's counts (`MemoizeInstrumentation`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemoInfo {
+    pub read: Vec<String>,
+    pub stats: Option<MemoStats>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MemoStats {
+    pub hits: usize,
+    pub misses: usize,
+    pub evictions: usize,
+    pub overflows: usize,
+    /// `mem_peak`, in bytes.
+    pub peak_bytes: usize,
+}
+
+impl MemoStats {
+    /// `mem_peak` in kB, rounded up.
+    pub(crate) fn peak_kb(&self) -> usize {
+        self.peak_bytes.div_ceil(1024)
+    }
+
+    /// `show_memoize_info`'s text line.
+    pub(crate) fn text(&self) -> String {
+        format!(
+            "Hits: {}  Misses: {}  Evictions: {}  Overflows: {}  Memory Usage: {}kB",
+            self.hits,
+            self.misses,
+            self.evictions,
+            self.overflows,
+            self.peak_kb()
+        )
+    }
 }
 
 /// A hash join's hash table after it was built (`HashInstrumentation`).
@@ -129,6 +169,7 @@ impl PlanNode {
             actual_loops: None,
             join_filter_removed: None,
             hash_info: None,
+            memo: None,
             skip_cond: false,
             implied_filter: None,
             param_cond: None,
@@ -760,6 +801,53 @@ pub(crate) fn param_index_inner(root: &mut PlanNode, p: &crate::scan_estimate::P
         .props
         .insert(0, ("Index Name".into(), p.index.clone()));
     inner.param_cond = Some((p.alias.clone(), p.column.clone()));
+    // Under a Memoize (`create_memoize_plan`), its rows and width the
+    // scan's; [`move_param_conds`] gives it its cache key.
+    if let Some((startup, total)) = p.memoize {
+        let scan = root.children.pop().expect("an inner side");
+        let (_, _, rows, width) = estimate_of(&scan);
+        let mut m = PlanNode::over("Memoize", scan);
+        m.estimate = Some((startup, total, rows, width));
+        m.memo = Some(MemoInfo {
+            read: p.read.clone(),
+            stats: None,
+        });
+        root.children.push(m);
+    }
+}
+
+/// A Nested Loop's inner side as the scan parameterized by the outer row:
+/// the inner itself, or the scan under its Memoize.
+pub(crate) fn param_scan(inner: &PlanNode) -> &PlanNode {
+    match inner.children.as_slice() {
+        [scan] if inner.name == "Memoize" => scan,
+        _ => inner,
+    }
+}
+
+/// `(l op r)`'s two operands, split at its comparison operator outside
+/// any parentheses or string literal.
+fn comparison_operands(c: &str) -> Option<(String, String)> {
+    let body = c.strip_prefix('(')?.strip_suffix(')')?;
+    let bytes = body.as_bytes();
+    let (mut depth, mut quoted) = (0i32, false);
+    for i in 0..bytes.len() {
+        match bytes[i] {
+            b'\'' => quoted = !quoted,
+            b'(' if !quoted => depth += 1,
+            b')' if !quoted => depth -= 1,
+            b' ' if !quoted && depth == 0 => {
+                for op in ["<=", ">=", "<>", "<", ">", "="] {
+                    let sep = format!(" {op} ");
+                    if body[i..].starts_with(&sep) {
+                        return Some((body[..i].to_string(), body[i + sep.len()..].to_string()));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 /// Move each nested loop's join clause that its inner index scan takes as
@@ -775,7 +863,7 @@ pub(crate) fn move_param_conds(root: &mut PlanNode) {
     if !root.name.starts_with("Nested Loop") || root.children.len() != 2 {
         return;
     }
-    let Some((alias, column)) = root.children[1].param_cond.clone() else {
+    let Some((alias, column)) = param_scan(&root.children[1]).param_cond.clone() else {
         return;
     };
     let Some(at) = root.details.iter().position(|(k, _)| k == "Join Filter") else {
@@ -788,6 +876,7 @@ pub(crate) fn move_param_conds(root: &mut PlanNode) {
     let own = format!("{alias}.{column}");
     let mut conds = Vec::new();
     let mut rest = Vec::new();
+    let written = conjuncts.clone();
     for c in conjuncts {
         match index_cond_text(&c, &own, &column) {
             Some(moved) => conds.push(moved),
@@ -813,7 +902,30 @@ pub(crate) fn move_param_conds(root: &mut PlanNode) {
         [one] => root.details[at].1 = one.clone(),
         many => root.details[at].1 = format!("({})", many.join(" AND ")),
     }
-    let inner = &mut root.children[1];
+    // A Memoize's cache key: each clause moved into the scan -- every one
+    // reading the inner side -- its operand over the outer side
+    // (`paraminfo_get_equal_hashops`), in the join's clause order, a
+    // repeat included; binary, as none of them is an operator a hash join
+    // could use (RP-916).
+    if root.children[1].name == "Memoize" {
+        let key: Vec<String> = written
+            .iter()
+            .filter(|c| mentions_alias(c, &alias))
+            .filter_map(|c| {
+                let (l, r) = comparison_operands(c)?;
+                Some(if mentions_alias(&l, &alias) { r } else { l })
+            })
+            .collect();
+        let memo = &mut root.children[1];
+        memo.details = vec![
+            ("Cache Key".into(), key.join(", ")),
+            ("Cache Mode".into(), "binary".into()),
+        ];
+    }
+    let inner = match root.children[1].name.as_str() {
+        "Memoize" => &mut root.children[1].children[0],
+        _ => &mut root.children[1],
+    };
     inner.details.insert(0, ("Index Cond".into(), cond));
     // A clause an index qual implies is not checked again
     // (`create_indexscan_plan`'s `predicate_implied_by`), though it was
@@ -1263,6 +1375,12 @@ pub(crate) fn render_text(
         if let (Some(h), Some(_)) = (n.hash_info, actual) {
             out.push(format!("{}{}", " ".repeat(2 + 6 * depth), h.text()));
         }
+        // `show_memoize_info`: only once the cache has missed.
+        if let (Some(m), Some(_)) = (n.memo.as_ref().and_then(|m| m.stats), actual) {
+            if m.misses > 0 {
+                out.push(format!("{}{}", " ".repeat(2 + 6 * depth), m.text()));
+            }
+        }
         for c in &n.children {
             let a = actual.and(c.actual_rows);
             walk(c, depth + 1, options, a, out);
@@ -1365,7 +1483,8 @@ fn structured(
             fields.push(("Inner Unique".into(), Value::Num(b.into())));
         }
         for (k, v) in &n.details {
-            let value = if k.ends_with("Key") {
+            // A Memoize's key is one text (`show_memoize_info`).
+            let value = if k.ends_with("Key") && k != "Cache Key" {
                 Value::Arr(v.split(", ").map(|s| Value::Str(s.to_string())).collect())
             } else {
                 Value::Str(v.clone())
@@ -1411,6 +1530,20 @@ fn structured(
             ));
             fields.push(("Exact Heap Blocks".into(), Value::Num(b.to_string())));
             fields.push(("Lossy Heap Blocks".into(), Value::Num("0".into())));
+        }
+        // A Memoize's cache (`show_memoize_info`), structured.
+        if let (Some(_), Some(m)) = (actual, n.memo.as_ref().and_then(|m| m.stats)) {
+            if m.misses > 0 {
+                for (k, v) in [
+                    ("Cache Hits", m.hits),
+                    ("Cache Misses", m.misses),
+                    ("Cache Evictions", m.evictions),
+                    ("Cache Overflows", m.overflows),
+                    ("Peak Memory Usage", m.peak_kb()),
+                ] {
+                    fields.push((k.into(), Value::Num(v.to_string())));
+                }
+            }
         }
         // A Hash node's table (`show_hash_info`), structured.
         if let (Some(_), Some(h)) = (actual, n.hash_info) {
@@ -2414,6 +2547,8 @@ mod join_type_tests {
                 alias: "k".into(),
                 column: "a".into(),
                 index_only: false,
+                read: Vec::new(),
+                memoize: None,
             },
         );
         root.details.push((
@@ -2442,6 +2577,8 @@ mod join_type_tests {
                 alias: "k".into(),
                 column: "a".into(),
                 index_only: false,
+                read: Vec::new(),
+                memoize: None,
             },
         );
         root.details.push((
@@ -2468,6 +2605,8 @@ mod join_type_tests {
                 alias: "k".into(),
                 column: "a".into(),
                 index_only: true,
+                read: Vec::new(),
+                memoize: None,
             },
         );
         assert_eq!(root.children[1].name, "Index Only Scan using k_pkey on k");
@@ -2499,6 +2638,8 @@ mod join_type_tests {
                     alias: "k".into(),
                     column: "a".into(),
                     index_only: false,
+                    read: Vec::new(),
+                    memoize: None,
                 },
             );
             root.details.push(("Join Filter".into(), filter.into()));
