@@ -4787,6 +4787,8 @@ pub fn join_conditions_split(
 ) -> Option<Vec<(String, Option<(String, String)>)>> {
     let mut p = Printer::new(cat, 0);
     p.legacy_joins = true;
+    // EXPLAIN prints the planned clauses, constants folded.
+    p.fold_consts = true;
     let mut rtes = Vec::new();
     p.collect_rtes(&s.from_clause, &mut rtes)?;
     p.scopes.push(rtes);
@@ -4924,6 +4926,8 @@ pub fn join_where(s: &pg_query::protobuf::SelectStmt, cat: &Catalog<'_>) -> Opti
     let w = s.where_clause.as_deref()?;
     let mut p = Printer::new(cat, 0);
     p.legacy_joins = true;
+    // EXPLAIN prints the planned clauses, constants folded.
+    p.fold_consts = true;
     let mut rtes = Vec::new();
     p.collect_rtes(&s.from_clause, &mut rtes)?;
     p.scopes.push(rtes);

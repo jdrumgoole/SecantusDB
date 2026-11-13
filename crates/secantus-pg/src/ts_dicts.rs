@@ -73,7 +73,7 @@ impl PgHandler {
     /// The database's dictionaries.
     pub(crate) fn user_ts_dicts(&self) -> Vec<UserDict> {
         self.type_catalog_docs(TS_DICT_COLLECTION)
-            .map(|docs| docs.iter().filter_map(dict_of_doc).collect())
+            .map(|docs| docs.iter().filter_map(|d| dict_of_doc(d)).collect())
             .unwrap_or_default()
     }
 
@@ -82,7 +82,7 @@ impl PgHandler {
             .ok()?
             .iter()
             .find(|d| d.get("oid").and_then(bson_i64) == Some(oid))
-            .cloned()
+            .map(|d| Document::clone(d))
     }
 
     fn write_ts_dict(&self, d: &UserDict, comment: Option<&str>) -> PgWireResult<()> {

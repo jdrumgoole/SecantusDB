@@ -1220,16 +1220,6 @@ fn a_view_refuses_writes_indexes_and_collection_commands() {
                  Namespace t.v1 is a view, not a collection",
             ),
             (
-                doc! {"renameCollection": "t.v1", "to": "t.v1b"},
-                166,
-                "cannot rename view: t.v1",
-            ),
-            (
-                doc! {"renameCollection": "t.other", "to": "t.v1", "dropTarget": true},
-                48,
-                "a view already exists with that name: t.v1",
-            ),
-            (
                 doc! {"find": "v1", "tailable": true},
                 168,
                 "Tailable cursors are not supported in aggregation.",
@@ -1244,6 +1234,37 @@ fn a_view_refuses_writes_indexes_and_collection_commands() {
             assert_eq!(reply.get_i32("code").unwrap(), code, "{cmd}: {reply}");
             assert_eq!(reply.get_str("errmsg").unwrap(), msg, "{cmd}");
         }
+        // A rename runs against `admin`; there a view is neither renamed nor
+        // renamed onto, and `system.views` is refused as a write to it
+        // (mongod 8.2.1, RM-482).
+        let was_db = std::mem::replace(&mut c.db_name, "admin".to_string());
+        for (cmd, code, msg) in [
+            (
+                doc! {"renameCollection": "t.v1", "to": "t.v1b"},
+                166,
+                "cannot rename view: t.v1",
+            ),
+            (
+                doc! {"renameCollection": "t.other", "to": "t.v1", "dropTarget": true},
+                48,
+                "a view already exists with that name: t.v1",
+            ),
+            (
+                doc! {"renameCollection": "t.system.views", "to": "t.v9"},
+                20,
+                "error with source namespace: cannot write to t.system.views",
+            ),
+            (
+                doc! {"renameCollection": "t.other", "to": "t.system.views"},
+                20,
+                "error with target namespace: cannot write to t.system.views",
+            ),
+        ] {
+            let reply = dispatch(&cmd, c);
+            assert_eq!(reply.get_i32("code").unwrap(), code, "{cmd}: {reply}");
+            assert_eq!(reply.get_str("errmsg").unwrap(), msg, "{cmd}");
+        }
+        c.db_name = was_db;
         // Nothing was written anywhere, and the view still reads its source.
         assert_eq!(view_ids(c, doc! {"find": "v1"}), vec![1, 4, 7]);
         assert_eq!(view_ids(c, doc! {"find": "other"}), vec![0, 1, 2]);

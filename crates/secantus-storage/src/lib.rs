@@ -14118,7 +14118,7 @@ impl Storage {
                         Ok(()) => {
                             c.remove()?;
                             undo_note_collection(db, coll, true);
-                            note_coll_table_write();
+                            note_coll_table_write(db, coll);
                         }
                         Err(e) if e.is_not_found() => {}
                         Err(e) => return Err(e.into()),
@@ -14169,7 +14169,7 @@ impl Storage {
                 match c.search() {
                     Ok(()) => {
                         c.remove()?;
-                        note_coll_table_write();
+                        note_coll_table_write(db, coll);
                     }
                     Err(e) if e.is_not_found() => {}
                     Err(e) => return Err(e.into()),
@@ -14246,7 +14246,7 @@ impl Storage {
         let _planner = PlannerScope::new();
         self.forget_record_ids(db, coll);
         // It writes the index catalog.
-        note_planner_write();
+        note_planner_write_of(db, coll);
         loop {
             let n = self.retry_write_conflicts("drop_collection purge(uniq)", || {
                 let session = self.op_session()?;
@@ -14404,7 +14404,7 @@ impl Storage {
                             Ok(()) => {
                                 rc.remove()?;
                                 undo_note_collection(db, c, true);
-                                note_coll_table_write();
+                                note_coll_table_write(db, c);
                             }
                             Err(e) if e.is_not_found() => {}
                             Err(e) => return Err(e.into()),
@@ -14434,7 +14434,7 @@ impl Storage {
                     match rc.search() {
                         Ok(()) => {
                             rc.remove()?;
-                            note_coll_table_write();
+                            note_coll_table_write(db, c);
                         }
                         Err(e) if e.is_not_found() => {}
                         Err(e) => return Err(e.into()),
@@ -14594,7 +14594,7 @@ impl Storage {
                     match c.search() {
                         Ok(()) => {
                             c.remove()?;
-                            note_coll_table_write();
+                            note_coll_table_write(dst_db, dst_coll);
                         }
                         Err(e) if e.is_not_found() => {}
                         Err(e) => return Err(e.into()),
@@ -14722,7 +14722,7 @@ impl Storage {
                 match rc.search() {
                     Ok(()) => {
                         rc.remove()?;
-                        note_coll_table_write();
+                        note_coll_table_write(src_db, src_coll);
                     }
                     Err(e) if e.is_not_found() => {}
                     Err(e) => return Err(e.into()),
@@ -14811,7 +14811,7 @@ impl Storage {
                 Ok(()) => {
                     c.remove()?;
                     undo_note_collection(dst_db, dst_coll, true);
-                    note_coll_table_write();
+                    note_coll_table_write(dst_db, dst_coll);
                 }
                 Err(e) if e.is_not_found() => {}
                 Err(e) => return Err(e.into()),
@@ -14891,7 +14891,7 @@ impl Storage {
             Ok(()) => {
                 rc.remove()?;
                 undo_note_collection(src_db, src_coll, true);
-                note_coll_table_write();
+                note_coll_table_write(src_db, src_coll);
             }
             Err(e) if e.is_not_found() => {}
             Err(e) => return Err(e.into()),
@@ -15561,7 +15561,7 @@ impl Storage {
         // Planner writes made here are released once they are visible.
         let _planner = PlannerScope::new();
         // It writes the index catalog.
-        note_planner_write();
+        note_planner_write_of(db, coll);
         let _g = self.lock.lock().unwrap_or_else(|e| e.into_inner());
         // DDL excludes in-flight CRUD on this namespace (global first,
         // then the collection lock — see `lock`'s ordering rules).
@@ -15764,7 +15764,7 @@ impl Storage {
         seq_after: i64,
     ) -> Result<Option<Document>> {
         // It writes the index catalog.
-        note_planner_write();
+        note_planner_write_of(db, coll);
         let geo = parse_geo_2d(key_spec, options);
         let geo_sphere = parse_geo_sphere(key_spec);
         ensure_collection(session, db, coll, self.data_nonlogged)?;
@@ -16024,7 +16024,7 @@ impl Storage {
         logged: bool,
     ) -> Result<()> {
         // It writes the index catalog.
-        note_planner_write();
+        note_planner_write_of(db, coll);
         let c = session.open_cursor(IDX_TABLE, None)?;
         c.set_key_sss(db, coll, name);
         c.set_value_u(payload);
@@ -16077,20 +16077,29 @@ impl Storage {
         // Lock-free read outside a transaction; inside one, the transaction's own
         // session, so a DROP / CREATE earlier in it is seen (see `op_session`).
         let session = self.op_session()?;
-        // Read once per catalog generation, as `index_descs_cached` is: the
-        // PostgreSQL server asks on every row it writes.
+        // Read once while the collection's index catalog stands: the
+        // PostgreSQL server asks on every row it writes, and for every table
+        // after any DDL. An entry is kept until a change of ITS collection
+        // (or one naming none) is numbered after the read, as PostgreSQL's
+        // relation cache keeps a relation's index list until an
+        // invalidation names that relation (RP-911); a change of another
+        // collection leaves it.
         let Some(gen) = self.planner_shared_gen(&session) else {
             return self.read_list_indexes(&session, db, coll).map(Arc::new);
         };
-        if let Some((g, list)) = catalog_entry(
+        let changed = index_catalog_changed(db, coll);
+        if let Some((read_at, list)) = catalog_entry(
             &self.list_cache.read().unwrap_or_else(|e| e.into_inner()),
             db,
             coll,
         ) {
-            if *g == gen {
+            if changed <= *read_at {
                 return Ok(Arc::clone(list));
             }
         }
+        // Numbered before the read: a change numbered after it may be one
+        // the read missed.
+        let read_at = INDEX_CATALOG_SERIAL.load(Ordering::SeqCst);
         let key = (db.to_string(), coll.to_string());
         let list = Arc::new(self.read_list_indexes(&session, db, coll)?);
         if planner_settled() == Some(gen)
@@ -16098,10 +16107,11 @@ impl Storage {
             && collection_registered(&session, db, coll)?
         {
             let mut cache = self.list_cache.write().unwrap_or_else(|e| e.into_inner());
-            if cache.values().any(|(g, _)| *g != gen) {
+            // Bounded: a dropped collection's entry is otherwise kept.
+            if cache.len() >= INDEX_CATALOG_CHANGES_MAX {
                 cache.clear();
             }
-            cache.insert(key, (gen, Arc::clone(&list)));
+            cache.insert(key, (read_at, Arc::clone(&list)));
         }
         Ok(list)
     }
@@ -16179,7 +16189,7 @@ impl Storage {
         // Planner writes made here are released once they are visible.
         let _planner = PlannerScope::new();
         // It writes the index catalog.
-        note_planner_write();
+        note_planner_write_of(db, coll);
         let _g = self.lock.lock().unwrap_or_else(|e| e.into_inner());
         // DDL excludes in-flight CRUD on this namespace (global first,
         // then the collection lock — see `lock`'s ordering rules).
@@ -16220,7 +16230,7 @@ impl Storage {
         // Planner writes made here are released once they are visible.
         let _planner = PlannerScope::new();
         // It writes the index catalog.
-        note_planner_write();
+        note_planner_write_of(db, coll);
         let _g = self.lock.lock().unwrap_or_else(|e| e.into_inner());
         // DDL excludes in-flight CRUD on this namespace (global first,
         // then the collection lock — see `lock`'s ordering rules).
@@ -16309,7 +16319,7 @@ impl Storage {
         // Planner writes made here are released once they are visible.
         let _planner = PlannerScope::new();
         // It writes the index catalog.
-        note_planner_write();
+        note_planner_write_of(db, coll);
         let _g = self.lock.lock().unwrap_or_else(|e| e.into_inner());
         // DDL excludes in-flight CRUD on this namespace (global first,
         // then the collection lock — see `lock`'s ordering rules).
@@ -16372,7 +16382,7 @@ impl Storage {
         // Planner writes made here are released once they are visible.
         let _planner = PlannerScope::new();
         // It writes the index catalog.
-        note_planner_write();
+        note_planner_write_of(db, coll);
         let _g = self.lock.lock().unwrap_or_else(|e| e.into_inner());
         // DDL excludes in-flight CRUD on this namespace (global first,
         // then the collection lock — see `lock`'s ordering rules).
@@ -17191,7 +17201,7 @@ impl Storage {
             if opts.get_bool("multikey").unwrap_or(false) && !grew {
                 continue; // already flagged, no new path — nothing to do
             }
-            note_planner_write();
+            note_planner_write_of(db, coll);
             opts.insert("multikey", Bson::Boolean(true));
             let mut recorded = Document::new();
             for (field, parts) in desc.key_spec.keys().zip(&paths) {
@@ -19297,7 +19307,7 @@ impl Storage {
 
     fn purge_collection_tables(&self, session: &Session, db: &str, coll: &str) -> Result<()> {
         // It writes the index catalog.
-        note_planner_write();
+        note_planner_write_of(db, coll);
         self.forget_record_ids(db, coll);
         // Unique-key claims die with the namespace (see purge_unique_claims):
         // a surviving claim would reject a later insert of the same value
@@ -21193,7 +21203,7 @@ impl Storage {
             have.sort();
         }
         if entry.paths != before {
-            note_planner_change();
+            note_planner_change_of(db, coll);
         }
         entry.scanned = true;
         Ok(entry.paths.clone())
@@ -21229,7 +21239,7 @@ impl Storage {
             parts.sort();
         }
         if entry.paths != before {
-            note_planner_change();
+            note_planner_change_of(db, coll);
         }
     }
 
@@ -25171,7 +25181,7 @@ fn ensure_collection(
             cur.set_value_u(&opts);
             cur.insert()?;
             undo_note_collection(db, coll, false);
-            note_coll_table_write();
+            note_coll_table_write(db, coll);
             // Lazy shard creation: make the collection's documents shard on first
             // creation (not all DOC_SHARDS at open). This branch runs only when the
             // collection is new, so it is the natural once-per-collection hook that
@@ -25951,8 +25961,23 @@ thread_local! {
     static PLANNER_PENDING: Cell<u64> = const { Cell::new(0) };
 }
 
-/// A write of something the planner reads is being made on this thread.
+/// A write of something the planner reads is being made on this thread,
+/// in collections it does not name: every collection's cached index list
+/// goes ([`note_index_catalog_reset`]).
 fn note_planner_write() {
+    note_planner_started();
+    note_index_catalog_reset();
+}
+
+/// [`note_planner_write`] of `(db, coll)`'s index catalog or registry row
+/// alone: only that collection's cached index list goes, as PostgreSQL's
+/// relation cache invalidation drops only the relation it names (RP-911).
+fn note_planner_write_of(db: &str, coll: &str) {
+    note_planner_started();
+    note_index_catalog_change(db, coll);
+}
+
+fn note_planner_started() {
     PLANNER_STARTED.fetch_add(1, Ordering::SeqCst);
     if !ACTIVE_TXN_SESSION.with(|c| c.get()).is_null() {
         let hp = ACTIVE_HANDLE.with(|c| c.get());
@@ -25965,10 +25990,64 @@ fn note_planner_write() {
     PLANNER_PENDING.with(|p| p.set(p.get() + 1));
 }
 
-/// An in-memory change the planner reads, visible at once.
-fn note_planner_change() {
+/// An in-memory change the planner reads of `(db, coll)`, visible at once.
+fn note_planner_change_of(db: &str, coll: &str) {
     PLANNER_STARTED.fetch_add(1, Ordering::SeqCst);
+    note_index_catalog_change(db, coll);
     PLANNER_FINISHED.fetch_add(1, Ordering::SeqCst);
+}
+
+/// Every change of the index catalog or the registry is numbered from one
+/// counter. A cached index list read when the counter stood at `n` holds
+/// while no change of its collection, and no reset, is numbered above `n`.
+/// Each is numbered AFTER [`PLANNER_STARTED`] moves: a read that finds the
+/// planner settled again after it either saw the change, or carries a
+/// number below it.
+static INDEX_CATALOG_SERIAL: AtomicU64 = AtomicU64::new(0);
+
+/// The number of the last change that named no collection.
+static INDEX_CATALOG_RESET: AtomicU64 = AtomicU64::new(0);
+
+/// More changed collections than this are forgotten for one reset, as
+/// PostgreSQL resets every cache of a backend that falls too far behind
+/// its invalidation queue.
+const INDEX_CATALOG_CHANGES_MAX: usize = 65_536;
+
+/// The number of each collection's last change, by `(db, coll)`, for every
+/// store (a name another store changed only costs a re-read).
+fn index_catalog_changes() -> &'static Mutex<HashMap<(String, String), u64>> {
+    static CHANGES: OnceLock<Mutex<HashMap<(String, String), u64>>> = OnceLock::new();
+    CHANGES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn note_index_catalog_change(db: &str, coll: &str) {
+    let mut changes = index_catalog_changes()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let n = INDEX_CATALOG_SERIAL.fetch_add(1, Ordering::SeqCst) + 1;
+    if changes.len() >= INDEX_CATALOG_CHANGES_MAX {
+        changes.clear();
+        INDEX_CATALOG_RESET.fetch_max(n, Ordering::SeqCst);
+        return;
+    }
+    changes.insert((db.to_string(), coll.to_string()), n);
+}
+
+fn note_index_catalog_reset() {
+    let n = INDEX_CATALOG_SERIAL.fetch_add(1, Ordering::SeqCst) + 1;
+    INDEX_CATALOG_RESET.fetch_max(n, Ordering::SeqCst);
+}
+
+/// The number of the last change that reached `(db, coll)`'s index list.
+fn index_catalog_changed(db: &str, coll: &str) -> u64 {
+    let changes = index_catalog_changes()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let own = changes
+        .get(&(db, coll) as &dyn CatalogKey)
+        .copied()
+        .unwrap_or(0);
+    own.max(INDEX_CATALOG_RESET.load(Ordering::SeqCst))
 }
 
 /// The generation `Storage::planner_indexes` caches under, `None` while a
@@ -26022,11 +26101,12 @@ impl Drop for PlannerScope {
     }
 }
 
-/// A write of the collection registry is being made on this thread: move
-/// [`COLL_TABLE_GEN`] on, and mark the user transaction it is part of.
-fn note_coll_table_write() {
+/// A write of `(db, coll)`'s collection registry row is being made on this
+/// thread: move [`COLL_TABLE_GEN`] on, and mark the user transaction it is
+/// part of.
+fn note_coll_table_write(db: &str, coll: &str) {
     COLL_TABLE_GEN.fetch_add(1, Ordering::SeqCst);
-    note_planner_write();
+    note_planner_write_of(db, coll);
     if ACTIVE_TXN_SESSION.with(|c| c.get()).is_null() {
         return;
     }
@@ -26091,7 +26171,7 @@ fn write_coll_options(session: &Session, db: &str, coll: &str, opts: &Document) 
     cur.set_key_ss(db, coll);
     cur.set_value_u(&blob);
     cur.insert()?; // overwrite cursor (default) -> upsert
-    note_coll_table_write();
+    note_coll_table_write(db, coll);
     Ok(())
 }
 

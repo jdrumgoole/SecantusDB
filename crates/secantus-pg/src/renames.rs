@@ -6,7 +6,7 @@
 use bson::{Bson, Document};
 use pgwire::api::results::{Response, Tag};
 use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
-use secantus_pgcatalog::SEQUENCE_COLLECTION;
+use secantus_pgcatalog::{TableDef, SEQUENCE_COLLECTION};
 
 use crate::{encode_doc, triggers::TRIGGER_COLLECTION, PgHandler};
 
@@ -80,7 +80,7 @@ impl PgHandler {
             ));
         };
         self.relation_name_free(to)?;
-        let mut def = ix.table.clone();
+        let mut def = TableDef::clone(&ix.table);
         let table = def.name.clone();
         if ix.primary {
             // The primary key's storage index is the `_id` one; only its
@@ -196,7 +196,7 @@ impl PgHandler {
         };
         // A constraint's index keeps its options with the constraint, in
         // the table's catalog entry.
-        let mut def = ix.table.clone();
+        let mut def = TableDef::clone(&ix.table);
         if ix.primary {
             let current = def
                 .extra
@@ -384,7 +384,7 @@ impl PgHandler {
         let Some(mut doc) = docs
             .iter()
             .find(|d| d.get_str("_id") == Ok(old.as_str()))
-            .cloned()
+            .map(|d| Document::clone(d))
         else {
             return Err(error(
                 "42704",
@@ -411,7 +411,7 @@ impl PgHandler {
         let Some(mut doc) = docs
             .iter()
             .find(|d| d.get_str("_id") == Ok(old.as_str()))
-            .cloned()
+            .map(|d| Document::clone(d))
         else {
             return Err(error(
                 "42704",
@@ -515,7 +515,7 @@ impl PgHandler {
                 self.type_catalog_docs(coll)?
             };
             for d in docs.iter() {
-                let mut doc = d.clone();
+                let mut doc = Document::clone(d);
                 let mut changed = false;
                 for key in ["base_tag", "subtype", "return_tag"] {
                     if let Some(v) = doc.get_mut(key) {
@@ -578,7 +578,7 @@ impl PgHandler {
                 .iter()
                 .find(|d| d.get_str("_id") == Ok(target))
             {
-                found = Some((*coll, d.clone()));
+                found = Some((*coll, Document::clone(d)));
                 break;
             }
         }
@@ -658,7 +658,7 @@ impl PgHandler {
                 .type_catalog_docs(Self::EXTENSION_COLLECTION)?
                 .iter()
                 .find(|d| d.get_str("_id") == Ok(target))
-                .cloned()
+                .map(|d| Document::clone(d))
             else {
                 if target == "plpgsql" {
                     return Err(error(
@@ -681,7 +681,7 @@ impl PgHandler {
                 .type_catalog_docs(Self::BASE_TYPE_COLLECTION)?
                 .iter()
                 .filter(|d| d.get_str("extension") == Ok(target))
-                .cloned()
+                .map(|d| Document::clone(d))
                 .collect();
             for doc in owned {
                 self.move_type(Self::BASE_TYPE_COLLECTION, doc, schema)?;
@@ -706,7 +706,7 @@ impl PgHandler {
                 .type_catalog_docs(coll)?
                 .iter()
                 .find(|d| d.get_str("_id") == Ok(target))
-                .cloned()
+                .map(|d| Document::clone(d))
             {
                 self.move_type(coll, d, schema)?;
                 return done(tag);
@@ -804,7 +804,7 @@ impl PgHandler {
             .type_catalog_docs(Self::COMPOSITE_COLLECTION)?
             .iter()
             .find(|d| d.get_str("_id") == Ok(target))
-            .cloned()
+            .map(|d| Document::clone(d))
         else {
             return Err(error(
                 "42704",
@@ -858,7 +858,7 @@ impl PgHandler {
             .type_catalog_docs(Self::DOMAIN_COLLECTION)?
             .iter()
             .find(|d| d.get_str("_id") == Ok(domain))
-            .cloned()
+            .map(|d| Document::clone(d))
         else {
             return Err(error(
                 "42704",
@@ -913,7 +913,7 @@ impl PgHandler {
             .type_catalog_docs(Self::SCHEMA_COLLECTION)?
             .iter()
             .find(|d| d.get_str("_id") == Ok(name))
-            .cloned()
+            .map(|d| Document::clone(d))
         {
             doc.insert("_id", to);
             self.delete_type_doc(Self::SCHEMA_COLLECTION, name)?;
@@ -930,7 +930,7 @@ impl PgHandler {
                     Some(bare) => format!("{to}.{bare}"),
                     None => id.clone(),
                 };
-                let mut doc = d.clone();
+                let mut doc = Document::clone(d);
                 doc.insert("schema", to);
                 doc.insert("_id", new_id.as_str());
                 self.delete_type_doc(coll, &id)?;
@@ -945,7 +945,7 @@ impl PgHandler {
             .iter()
         {
             if d.get_str("schema") == Ok(name) {
-                let mut doc = d.clone();
+                let mut doc = Document::clone(d);
                 doc.insert("schema", to);
                 let id = doc.get_str("_id").unwrap_or_default().to_string();
                 self.delete_type_doc(Self::FUNCTION_COLLECTION, &id)?;

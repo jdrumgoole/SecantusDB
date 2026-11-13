@@ -1091,18 +1091,66 @@ one beside it.
       the comments, each listed from every table. PostgreSQL invalidates
       only the cache entries of the rows a statement changed (`inval.c`).
       psql's `\d` collation subquery straight after a `CREATE TABLE`, debug
-      build, 2026-11-12: 0.011 s with no other table, 0.023 s with 400 and
-      0.036 s with 800 (PostgreSQL 15.19: 0.33 ms with 200, 0.20 ms with
-      400). The rest of RP-715 was fixed on 2026-11-12 (keyed `pg_type`
-      reads, unchanged table definitions reused across versions, no copies
-      of them, one oid map per listing). The faithful end state keys the
-      published state per relation and invalidates what a statement
-      changed; a user relation's entries depend on more than its own
-      catalog row (its grants, its inheritance parents and children, the
-      foreign keys naming it, the types its columns name), so each key has
-      to carry them, or a stale entry is a wrong answer.
+      build, 2026-11-13: about 0.010 s with no other table and 0.022 s with
+      800 (PostgreSQL 15.19: 0.33 ms with 200, 0.20 ms with 400). Fixed so
+      far: keyed `pg_type` reads, unchanged table definitions reused across
+      versions (RP-715); the republication reads the definitions in place
+      with one oid map, and the storage keeps each collection's index list
+      until a change of that collection (2026-11-12, from 0.036 s at 800);
+      the index relations derived once per catalog version and planner
+      generation rather than per ask, one oid map for the comments,
+      constraint definitions and `pg_attribute` fill instead of a catalog
+      fetch per table, and a composite found by name through a map rather
+      than a scan of every row type per described column (2026-11-13, from
+      0.027 s at 800); the type catalog's documents and the table
+      definitions shared (`Arc`) across versions, an unchanged one reused
+      by its stored bytes and its sorted place carried forward, and the
+      composite listings built once per version (2026-11-13, from 0.021 s
+      to 0.018 s at 800, 0.010 s with none). What is left, profiled at 800
+      tables (debug build, per catalog version): each listing deriving
+      every relation's entry again into owned values -- the oid map
+      (`relation_oids`), the row types' fields (`composite_fields`, under
+      `composites` and `composites_with_schema`), the index definitions
+      (`index_defs` over `derive_index_relations`), the tableoid texts, the
+      comments, the constraint definitions, `pg_type`'s and
+      `pg_attribute`'s rows, each 0.2 to 0.8 ms -- and the planner's
+      `set_*` tables rebuilt from those lists. The faithful end state
+      keys the published state per relation and invalidates what a
+      statement changed; a user relation's entries depend on more than its
+      own catalog row (its grants, its inheritance parents and children,
+      the foreign keys naming it, the types its columns name), so each key
+      has to carry them, or a stale entry is a wrong answer.
       Backlog-ID: RP-911
       Verify: tests/backlog/test_rp_catalog_latency.py::test_the_first_catalog_query_after_ddl_costs_the_same_at_800_tables
+
+## Found by a profile (2026-11-13)
+
+- [ ] **OPEN — `CREATE TABLE` grows with the number of tables.** A debug
+      `secantusd-pg` takes about 1.4 ms with no other table and 42 ms with
+      800 (2026-11-13); PostgreSQL 15.19 takes 0.41 ms and 0.37 ms (private
+      cluster). After the table is made, `btree_built` looks for its new
+      indexes' page models through `hash_shapes`, `am_shapes` and
+      `btree_shapes_all`, and each lists every table's index relations
+      (`index_relations`). While the statement runs, `shared_table_defs`
+      cannot use the per-version definitions (the catalog it wrote is not
+      yet a version), so each list reads and decodes the whole catalog
+      again: three full decodes per `CREATE TABLE`, most of its time at
+      800 tables. PostgreSQL builds the new relation's indexes from that
+      relation alone (`index_build` over the one heap). The fix asks the
+      new table's own index list, not every table's.
+      Backlog-ID: RP-921
+      Verify: tests/backlog/test_rp_catalog_latency.py::test_create_table_costs_the_same_at_400_tables
+
+- [ ] **OPEN — a renamed index loses its comment.** `COMMENT ON INDEX ix
+      IS 'c'` then `ALTER INDEX ix RENAME TO ix2`: PostgreSQL 15.19 answers
+      `obj_description('ix2'::regclass, 'pg_class')` with `c`, since a
+      comment is keyed by the object's oid (`pg_description.objoid`) and a
+      rename keeps the oid; `secantusd-pg` answers NULL, for a `CREATE
+      INDEX` and for a primary key's index alike (2026-11-13). The index
+      comments are stored under a key built from the index's name
+      (`index_comment_key`), which the rename does not move.
+      Backlog-ID: RP-923
+      Verify: tests/backlog/test_rp_found_rp911.py::test_an_index_comment_survives_a_rename
 
 ## Found by a CI run (2026-11-07)
 
@@ -1554,48 +1602,132 @@ a regression test.
       frequencies match (found while working RP-313).
       Verify: tests/backlog/test_rp_catalog_reads.py::test_a_catalog_columns_correlation_follows_the_heap
       Backlog-ID: RP-358
-- [ ] **EXPLAIN prints no estimate for most Nested Loops.** Since RP-329
-      a Nested Loop of two tables' sequential scans joined only by `<`,
-      `<=`, `>`, `>=` or `<>` conjuncts (or by none) prints
-      `cost_nestloop`'s estimate, its outer side and Materialize as
-      PostgreSQL 15.19 picks them: a comma join's WHERE, and since
-      2026-11-05 an inner or LEFT `JOIN ... ON` (a LEFT join keeps its
-      nullable side inner and never estimates fewer rows than its outer),
-      over a table with an index too when no clause could be its Index
-      Cond (a `<>`), and since 2026-11-06 the inner Index Scan
-      parameterized by an inequality between two keys, the join's other
-      clauses its Filter (`e.a < k.a`: `Index Scan using k_pkey on k` with
-      `Index Cond: (a > e.a)`), or Index Only Scan where the index holds
-      every column the side reads. Every other nested loop still prints
-      zeros: an inequality between the inner's
-      key and an expression of the outer side (`e.a + 1 < k.a`,
-      PostgreSQL's `Index Cond: (a > (e.a + 1))`), a key on a later
-      index column; and a join of three or more relations (found while
-      working RP-329). Since 2026-11-12 a LEFT join's WHERE over its
-      preserved side alone is that side's cheapest path, its scan Filter
-      or, where the index wins, its Index Cond (`k left join e on e.a <>
-      k.a where k.a > 990`), and an ON conjunct over the preserved side
-      alone is estimated as PostgreSQL keeps it, the join's filter, also
-      when the inner is read through its index parameterized by the outer
-      row (`e left join k on e.a < k.a and e.a > 990`). Since 2026-11-12
-      a join clause `<>` over a cast of either side's column is priced
-      with its cast (a `pg_cast` function one call, an I/O conversion
-      two) and estimated as an expression with no statistics, the
-      parameterized scan's Filter where the inner is indexed (`e left
-      join k on e.a < k.a and e.a <> k.b::int`). Still zeros: such a
-      preserved-side conjunct that costs other than its operators (an IN
-      list, a pattern, a cast of a column), and a `<>` whose operands
-      then differ in type (`e.a <> k.a::bigint`, PostgreSQL's `int48ne`,
-      `cost=0.28..11142.50 rows=333000` over `Index Scan using k_pkey on
-      k` `cost=0.28..7.81 rows=332`). (A binary-coercible cast is its
-      own item.) Since 2026-11-12 an inequality with no operand that is
-      the indexed side's key (`e.a < k.a + 1`) is the Join Filter over
-      that side's plain scan, or the parameterized scan's Filter beside a
-      key-to-key bound. Since 2026-11-12 two bounds on the index column
-      (`e.a < k.a and e.a > k.a`) are one `Index Cond` of both, a ninth of
-      the rows a scan.
+- [ ] **EXPLAIN prints no estimate for some Nested Loops.** The nested
+      loops of two tables' scans joined by inequalities, `<>` and the
+      conjuncts below are priced as PostgreSQL 15.19 plans them, and since
+      2026-11-13 so is a left-deep join of three to eight tables' scans by
+      `<`, `<=`, `>`, `>=` or `<>` over tables with no index
+      (`standard_join_search`'s levels and bushy pairs, each relation's
+      path list). Still zeros (PostgreSQL 15.19 on a private cluster,
+      `e` and `k` 1,000 analysed rows, `k.a` the primary key):
+      - a join of three tables whose third is indexed (`e join e e2 on
+        e.a < e2.a join k on e2.a < k.a`: a Memoize keyed by `e2.a` over
+        the parameterized Index Scan);
+      - a LEFT join's ON conjunct over its preserved side that is a regex
+        match (`e.b ~ 'v1'`, whose selectivity is RP-423's).
+      Since 2026-11-13 an IN list of constants there is priced (its
+      operator over half the list, or from nine constants PostgreSQL's
+      hashed list: one hash and one comparison a row, the table's build at
+      the join's startup) and estimated; one inside an `OR` is not, as a
+      lone scan's is not (RP-028). So is a cast of a column to an integer
+      or string type compared with a constant (`e.a::text <> '5'`), there
+      and on a lone scan, and a `<>` of three or more tables' join whose
+      operands are cast or coerced (`e2.a::numeric <> e3.a::numeric`). A
+      binary-coercible cast is RP-912; a join PostgreSQL orders otherwise,
+      RP-919. Since 2026-11-13 an inequality between the inner's key and a
+      call of a built-in over the outer row is the inner's Index Cond, the
+      call's `procost` its startup, under the Memoize PostgreSQL keys by
+      the call.
       Backlog-ID: RP-354
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[nested loop left join into an index on an expression of the outer side], tests/backlog/test_rp_explain_costs.py::test_plan[nested loop left join with a cross-type inequality into an index], tests/backlog/test_rp_explain_costs.py::test_plan[nested loop left join with a pattern over its preserved side], tests/backlog/test_rp_explain_costs.py::test_plan[nested loop of three relations]
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[nested loop of three relations into an index], tests/backlog/test_rp_explain_costs.py::test_plan[a left join's on conjunct over the preserved side is a regex match]
+- [ ] **A nested loop's Join Filter keeps the ON's written order.**
+      PostgreSQL 15.19 orders a join's qual list cheapest first
+      (`order_qual_clauses`, by `cost_qual_eval`, stable among equal
+      costs): `select * from e left join e e2 on e.a <> e2.a and
+      e.a::text <> '5' and e.a = 5` (`e` 1,000 analysed rows) prints
+      `Join Filter: ((e.a <> e2.a) AND (e.a = 5) AND ((e.a)::text <>
+      '5'::text))`, the cast's two functions after the one-operator
+      conjuncts; here the conjuncts are printed as written. The same for
+      arithmetic (`on e.a + 1 + 1 <> e2.a and e.a <> e2.a` puts `(e.a <>
+      e2.a)` first). The costs and rows match. A lone scan's Filter is
+      RP-406, a joined scan's RP-398. Measured on a private 15.19 cluster
+      (found while working RP-354).
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a nested loop's join filter in cost order]
+      Backlog-ID: RP-924
+- [ ] **A join of three tables by inequalities runs in its written
+      order, and a WHERE's join clauses all run at the top join.**
+      PostgreSQL's `standard_join_search` picks the order of an inner join
+      of three tables linked only by `<`, `<=`, `>`, `>=` or `<>` as it
+      does for equalities (`join_search.rs` searches only those): PostgreSQL
+      15.19 runs `select * from e join e e3 on e.a < e3.a join zs on e3.a >
+      zs.a` (`e` 1,000 analysed rows, `zs` ten) as `(e3 x zs) x e`, so its
+      rows come out in that loop's order (`limit 5` of `e.a` gives 1, 1, 2,
+      1, 2, here 1, 1, 1, 1, 1) and EXPLAIN prints that plan; here the tables
+      join as written and the plan is unpriced. A comma join's WHERE clause
+      over two tables is the Join Filter of the first join holding both
+      (`from e, e e2, e e3 where e.a < e2.a and e2.a < e3.a`: `(e.a < e2.a)`
+      on the lower Nested Loop); here both are the top join's, the lower
+      one a cross join. Measured on a private 15.19 cluster (found while
+      working RP-354).
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[nested loop of three relations joined in another order], tests/backlog/test_rp_explain_costs.py::test_plan[nested loop of three relations by a where]
+      Backlog-ID: RP-919
+- [ ] **The upper join of three tables prints its clauses in the ON's
+      order, not PostgreSQL's.** `build_joinrel_restrictlist` lists a
+      join's clauses from the lower join's tables' join lists, the first
+      table's clauses before the second's: PostgreSQL 15.19 prints `select
+      * from e join e e2 on e.a < e2.a join e e3 on e2.a < e3.a and e.a <
+      e3.a` with the top Nested Loop's `Join Filter: ((e.a < e3.a) AND
+      (e2.a < e3.a))`; here `((e2.a < e3.a) AND (e.a < e3.a))`. The costs and
+      rows match. Measured on a private 15.19 cluster (found while working
+      RP-354).
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[nested loop of three relations with two clauses above]
+      Backlog-ID: RP-920
+- [ ] **EXPLAIN prints no estimate for a LEFT join whose ON restricts
+      its nullable side beside an inequality into its index.** PostgreSQL
+      15.19 plans `explain select * from e left join k on e.a < k.a and
+      k.a <> 2` (both tables 1,000 analysed rows, `k.a` the primary key)
+      as `Nested Loop Left Join (cost=0.28..10320.00 rows=333000
+      width=14)` over `Index Scan using k_pkey on k (cost=0.28..6.98
+      rows=333 width=7)` with `Index Cond: (a > e.a)` and `Filter: (a <>
+      2)`; here the join prints zeros over two plain Seq Scans, `k`'s
+      Filter `(a <> 2)` and the join's `Join Filter: (e.a < k.a)`. An ON
+      conjunct over the preserved side is estimated (RP-354); one over
+      the nullable side alone is a restriction of the inner, which the
+      nested-loop estimate does not take. Measured on a private 15.19
+      cluster (found while working RP-354).
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[nested loop left join with an on restriction of its nullable side]
+      Backlog-ID: RP-918
+- [ ] **A comparison of real and double precision prints a cast
+      PostgreSQL does not make.** `real <> double precision` is the
+      cross-type operator `float48ne` (and `<`, `=`, ... likewise), which
+      takes both operands as they are; the plan here coerces the real
+      side first: PostgreSQL 15.19 prints `explain (costs off) select *
+      from fr where r <> f` (`r real`, `f float8`) with `Filter: (r <>
+      f)`, here `Filter: ((r)::double precision <> f)`. The values
+      compared are the same. Measured on a private 15.19 cluster (found
+      while working RP-354).
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[comparison of real and double precision]
+      Backlog-ID: RP-917
+- [ ] **EXPLAIN ANALYZE of a nested loop into an index on an expression
+      of the outer row prints no actual rows.** Its estimate is right, but
+      the actual-row count of a parameterized inner scan is only worked
+      out where its Index Cond compares the outer row's bare column:
+      PostgreSQL 15.19 prints `explain (analyze, timing off, summary off)
+      select * from e left join k on e.a + 1 < k.a` (`e`, `k` 1,000
+      analysed rows, `k.a` the primary key) with `(actual rows=1000
+      loops=1)` on `Seq Scan on e` and `(actual rows=499 loops=1000)` on
+      `Index Scan using k_pkey on k`; here both scans print no actual
+      block at all. The join's own count is right. The same where the
+      expression has few values and PostgreSQL caches the scan in a
+      Memoize (`select * from r, k where r.a + 1 < k.a`, `r.a` ten values:
+      `Hits: 990  Misses: 10  Evictions: 0  Overflows: 0  Memory Usage:
+      380kB`, the Index Scan's `loops=10`); here the Memoize prints no
+      actual block and no cache line. Measured on a private 15.19 cluster
+      (found while working RP-354, the Memoize while working RP-916).
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[analyze of a nested loop into an index on an expression of the outer side], tests/backlog/test_rp_explain_costs.py::test_plan[analyze of a memoize keyed by an expression of the outer side]
+      Backlog-ID: RP-914
+- [ ] **EXPLAIN VERBOSE prints no `Output` lists and no schema-qualified
+      names.** VERBOSE is accepted and then ignored: PostgreSQL 15.19 prints
+      `explain verbose select * from k where a > 5` (`k` 1,000 analysed
+      rows) as `Seq Scan on public.k` with `Output: a, b` and `Filter: (k.a
+      > 5)`; here `Seq Scan on k` and `Filter: (a > 5)`, as without
+      VERBOSE. A join's nodes each print their `Output` too (`Output: e.a,
+      e.b, e2.a, e2.b` on a Nested Loop, its Materialize's and Memoize's
+      likewise), and an inner index scan's `Index Cond` is qualified
+      (`(k.a > r.a)`). Measured on a private 15.19 cluster (found while
+      working RP-916).
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[explain verbose prints a scan's output list]
+      Backlog-ID: RP-925
 - [ ] **A binary-coercible cast is kept in a plan, and its scan is not
       priced.** A cast between binary-compatible types (`text` to
       `varchar` and back to `text` for the operator) is a `RelabelType`
@@ -1610,17 +1742,6 @@ a regression test.
       cluster (found while working RP-354).
       Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a seq scan filter over a binary-coercible cast], tests/backlog/test_rp_explain_costs.py::test_plan[a join filter over a binary-coercible cast]
       Backlog-ID: RP-912
-- [ ] **An IN list under a join prints as an ARRAY constructor.**
-      PostgreSQL folds `a in (1, 2, 3)` into one array constant and
-      prints it as its literal wherever the scan sits: PostgreSQL 15.19
-      prints `explain select * from e, k where e.a <> k.a and e.a in (1,
-      2, 3)` with the Materialized `Seq Scan on e`'s `Filter: (a = ANY
-      ('{1,2,3}'::integer[]))`; here `Filter: (a = ANY (ARRAY[1, 2, 3]))`.
-      A lone scan already prints the literal, and the costs and rows are
-      right. Measured on a private 15.19 cluster (found while working
-      RP-354).
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[an in list in a scan filter under a join is an array constant]
-      Backlog-ID: RP-913
 - [ ] **A function call in a nested loop's join filter is priced as
       nothing.** `cost_qual_eval` charges a call its `procost` for every
       pair the Join Filter checks: PostgreSQL 15.19 prints `select * from e
@@ -1800,6 +1921,19 @@ a regression test.
       RP-404).
       Verify: tests/backlog/test_rp_explain_costs.py::test_plan[estimate of a function call compared with a constant], tests/backlog/test_rp_explain_costs.py::test_plan[estimate of a join over a scan filtered by a LIKE], tests/backlog/test_rp_explain_costs.py::test_plan[estimate of a LIKE over an expression], tests/backlog/test_rp_explain_costs.py::test_plan[estimate of a LIKE over a table never analysed], tests/backlog/test_rp_explain_costs.py::test_plan[estimate of an anchored regex match], tests/backlog/test_rp_explain_costs.py::test_plan[estimate of an unanchored regex match]
       Backlog-ID: RP-423
+- [ ] **A LIKE with an ESCAPE clause prints a `like_escape` call and is
+      not estimated.** PostgreSQL folds `like_escape(pattern, escape)` of
+      two constants into the pattern rewritten with the default escape
+      (`eval_const_expressions`), which `patternsel` then estimates:
+      PostgreSQL 15.19 prints `explain select * from e where b like 'v1!%'
+      escape '!'` (`e` analysed, 1000 rows) as `Seq Scan on e
+      (cost=0.00..17.50 rows=1 width=7)` with `Filter: (b ~~
+      'v1\%'::text)`; here `Filter: (b ~~ like_escape('v1!%'::text,
+      '!'::text))` and zero costs. The same in a nested loop's Join Filter.
+      Its rows are right. Measured on a private 15.19 cluster (found while
+      working RP-354).
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a like with an escape clause is a folded pattern]
+      Backlog-ID: RP-915
 - [ ] **A lone scan's Filter does not put an expression's conjunct
       after a cheaper one.** PostgreSQL 15.19 orders a qual list cheapest
       first (`order_qual_clauses`, by `cost_qual_eval`): `select * from e

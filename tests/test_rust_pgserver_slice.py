@@ -16157,6 +16157,40 @@ def test_pg_index_lists_every_index(home: Path) -> None:
         ) == [("a",), ("b",)]
 
 
+def test_the_index_relations_follow_every_index_change(home: Path) -> None:
+    """The index relations are derived once per catalog version and planner
+    generation and reused by the statements that ask again (RP-911). An
+    index another connection creates, renames, comments or drops, and one
+    an open transaction block creates and then rolls back, must each show
+    at once in the connection that derived them first, as PostgreSQL's
+    relation cache invalidation shows them."""
+    indexes = (
+        "SELECT c.relname, to_regclass(c.relname)::text, "
+        "obj_description(c.oid, 'pg_class') FROM pg_index i "
+        "JOIN pg_class c ON c.oid = i.indexrelid "
+        "WHERE i.indrelid = 'mx'::regclass ORDER BY 1"
+    )
+    with _Server(home) as server, server.connect() as a, server.connect() as b:
+        a.execute("CREATE TABLE mx (id int PRIMARY KEY, v int, w text)")
+        assert _fetch(a, indexes) == [("mx_pkey", "mx_pkey", None)]
+        b.execute("CREATE INDEX mx_v ON mx (v)")
+        assert _fetch(a, indexes) == [("mx_pkey", "mx_pkey", None), ("mx_v", "mx_v", None)]
+        b.execute("COMMENT ON INDEX mx_v IS 'by v'")
+        assert _fetch(a, indexes) == [("mx_pkey", "mx_pkey", None), ("mx_v", "mx_v", "by v")]
+        b.execute("ALTER INDEX mx_v RENAME TO mx_v2")
+        # The comment does not follow the rename yet (RP-923).
+        assert [r[:2] for r in _fetch(a, indexes)] == [("mx_pkey", "mx_pkey"), ("mx_v2", "mx_v2")]
+        assert _fetch(a, "SELECT to_regclass('mx_v')::text") == [(None,)]
+        a.execute("BEGIN")
+        a.execute("CREATE INDEX mx_w ON mx (w)")
+        assert [r[0] for r in _fetch(a, indexes)] == ["mx_pkey", "mx_v2", "mx_w"]
+        a.execute("ROLLBACK")
+        assert [r[0] for r in _fetch(a, indexes)] == ["mx_pkey", "mx_v2"]
+        b.execute("DROP INDEX mx_v2")
+        assert [r[:2] for r in _fetch(a, indexes)] == [("mx_pkey", "mx_pkey")]
+        assert _fetch(a, "SELECT to_regclass('mx_v2')::text") == [(None,)]
+
+
 def test_order_by_a_computed_output_column(home: Path) -> None:
     """`ORDER BY 1` / `ORDER BY alias` over a computed column sorts by the
     computed value -- text order for `n::text` -- in plain, DISTINCT and

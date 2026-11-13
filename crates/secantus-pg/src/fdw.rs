@@ -55,7 +55,7 @@ impl PgHandler {
             .map(|d| {
                 d.iter()
                     .filter(|d| d.get_str("kind") == Ok(kind))
-                    .cloned()
+                    .map(|d| Document::clone(d))
                     .collect()
             })
             .unwrap_or_default()

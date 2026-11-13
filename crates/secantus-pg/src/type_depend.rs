@@ -226,7 +226,7 @@ impl PgHandler {
             type_oids.insert(n, oid);
         }
         let mut composites = Vec::new();
-        for (n, oid, fields) in self.composites()? {
+        for (n, oid, fields) in Arc::unwrap_or_clone(self.composites()?) {
             type_oids.insert(n.clone(), oid);
             if !self.row_type_of_table(&n)? {
                 composites.push((n, oid, fields));
@@ -373,7 +373,7 @@ impl PgHandler {
                 .type_catalog_docs(Self::COMPOSITE_COLLECTION)?
                 .iter()
                 .find(|c| c.get_str("composite") == Ok(composite.as_str()))
-                .cloned()
+                .map(|d| Document::clone(d))
             else {
                 continue;
             };

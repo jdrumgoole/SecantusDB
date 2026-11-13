@@ -62,7 +62,7 @@ impl PgHandler {
     /// The database's configurations.
     pub(crate) fn user_ts_configs(&self) -> Vec<UserConfig> {
         self.type_catalog_docs(TS_CONFIG_COLLECTION)
-            .map(|docs| docs.iter().filter_map(config_of_doc).collect())
+            .map(|docs| docs.iter().filter_map(|d| config_of_doc(d)).collect())
             .unwrap_or_default()
     }
 
@@ -71,7 +71,7 @@ impl PgHandler {
             .ok()?
             .iter()
             .find(|d| d.get("oid").and_then(bson_i64) == Some(oid))
-            .cloned()
+            .map(|d| Document::clone(d))
     }
 
     fn write_ts_config(&self, c: &UserConfig, comment: Option<&str>) -> PgWireResult<()> {

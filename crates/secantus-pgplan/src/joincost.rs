@@ -792,6 +792,9 @@ pub struct NestLoopPlan {
     pub material: Option<(f64, f64)>,
     /// Its inner side is the [`ParamInner`] scan (RP-354).
     pub param: bool,
+    /// That scan under a Memoize (`get_memoize_path`, RP-916): the
+    /// Memoize's `(startup, total)`.
+    pub memoize: Option<(f64, f64)>,
 }
 
 /// An inner side's index scan parameterized by the outer row (RP-354):
@@ -803,6 +806,10 @@ pub struct ParamInner {
     pub total: f64,
     pub rows: f64,
     pub qual: f64,
+    /// Its cache key, where a Memoize can cache it (`get_memoize_path`:
+    /// every clause moved into it a two-operand operator whose outer
+    /// operand's type hashes, none volatile, `enable_memoize` on).
+    pub memo: Option<MemoKey>,
 }
 
 /// `populate_joinrel_with_paths` for `a` and `b` (each `(startup, total,
@@ -824,15 +831,20 @@ pub fn cheapest_nest_loop(
 /// inner (`param[0]` for `b` inner, `param[1]` for `a`): each is weighed
 /// after the plain inner and before the Material of it, as
 /// `match_unsorted_outer` tries `cheapest_parameterized_paths` (RP-354).
+///
+/// `qual_startup` is the join quals' `cost_qual_eval` startup (a hashed IN
+/// list's table), which `final_cost_nestloop` adds to every path's startup
+/// and total.
 pub fn cheapest_nest_loop_param(
     a: (f64, f64, f64, i64),
     b: (f64, f64, f64, i64),
     qual: f64,
+    qual_startup: f64,
     param: [Option<ParamInner>; 2],
     left: bool,
 ) -> NestLoopPlan {
     let orders: &[bool] = if left { &[false] } else { &[false, true] };
-    nest_loop_paths_with(a, b, qual, [None, None], orders, param)
+    nest_loop_paths_over(&[(a, b, qual)], [None, None], orders, param, qual_startup).1
 }
 
 /// [`cheapest_nest_loop`] where `a` or `b` may be `inner_unique` as the
@@ -876,61 +888,120 @@ fn nest_loop_paths_with(
     orders: &[bool],
     param: [Option<ParamInner>; 2],
 ) -> NestLoopPlan {
+    nest_loop_paths_over(&[(a, b, qual)], unique, orders, param, 0.0).1
+}
+
+/// Two input relations of a join, each `(startup, total, rows, width)`,
+/// and the cost a row of the join clauses between them.
+pub type NestLoopPair = ((f64, f64, f64, i64), (f64, f64, f64, i64), f64);
+
+/// [`cheapest_nest_loop`] over every pair of input relations that makes
+/// one join relation (RP-354): `make_join_rel` calls
+/// `add_paths_to_joinrel` for each pair `join_search_one_level` finds, in
+/// its order, each `(a, b, qual)` weighed `a` outer then `b`, and every
+/// path goes into the one relation's list, so the cheapest of them all is
+/// kept (an earlier pair's path where two cost the same). Returns the
+/// winning pair's index and its plan; `None` for no pairs.
+pub fn cheapest_nest_loop_of(pairs: &[NestLoopPair]) -> Option<(usize, NestLoopPlan)> {
+    if pairs.is_empty() {
+        return None;
+    }
+    Some(nest_loop_paths_over(
+        pairs,
+        [None, None],
+        &[false, true],
+        [None, None],
+        0.0,
+    ))
+}
+
+fn nest_loop_paths_over(
+    pairs: &[NestLoopPair],
+    unique: [Option<(f64, f64)>; 2],
+    orders: &[bool],
+    param: [Option<ParamInner>; 2],
+    qual_startup: f64,
+) -> (usize, NestLoopPlan) {
     let mut paths: Vec<JoinPath> = Vec::new();
-    let mut materials = [(0.0, 0.0); 2];
-    for &b_outer in orders {
-        let (o, i) = if b_outer { (b, a) } else { (a, b) };
-        let outer = InPath::scan(o.0, o.1, o.2, None);
-        let inner = InPath::scan(i.0, i.1, i.2, None);
-        let mat = material(&inner, i.3);
-        materials[usize::from(b_outer)] = (mat.startup, mat.total);
-        let param_inner = param[usize::from(b_outer)].map(|p| {
-            let mut path = InPath::scan(p.startup, p.total, p.rows, None);
-            path.indexed = true;
-            (path, p.qual)
-        });
-        let mut inners: Vec<(usize, &InPath, f64)> = vec![(0, &inner, qual)];
-        if let Some((path, q)) = &param_inner {
-            inners.push((2, path, *q));
-        }
-        inners.push((1, &mat, qual));
-        for (kind, inner, qual) in inners {
-            let semi = unique[usize::from(!b_outer)];
-            let (startup, total) = nestloop_cost(&outer, inner, semi, false, qual);
-            add_path(
-                &mut paths,
-                JoinPath {
-                    startup,
-                    total,
-                    keyed: false,
-                    class: 0,
-                    method: JoinMethod::Other,
-                    // The pair it was built from: which side is outer, and
-                    // whether its inner is materialised.
-                    // and its inner: plain (0), materialised (1) or the
-                    // parameterized index scan (2).
-                    combo: usize::from(b_outer) * 3 + kind,
-                    a_path: DEFAULT_INPUT,
-                    b_path: DEFAULT_INPUT,
-                    rows: 0.0,
-                    req_outer: 0,
-                    rescan: (startup, total),
-                },
-                false,
-            );
+    // Each pair's Material of its inner, and Memoize of its parameterized
+    // inner, by outer side.
+    let mut materials = vec![[(0.0, 0.0); 2]; pairs.len()];
+    let mut memos = vec![[(0.0, 0.0); 2]; pairs.len()];
+    for (pair, &(a, b, qual)) in pairs.iter().enumerate() {
+        for &b_outer in orders {
+            let (o, i) = if b_outer { (b, a) } else { (a, b) };
+            let outer = InPath::scan(o.0, o.1, o.2, None);
+            let inner = InPath::scan(i.0, i.1, i.2, None);
+            let mat = material(&inner, i.3);
+            materials[pair][usize::from(b_outer)] = (mat.startup, mat.total);
+            let param_inner = param[usize::from(b_outer)].map(|p| {
+                let mut path = InPath::scan(p.startup, p.total, p.rows, None);
+                path.indexed = true;
+                (path, p.qual, p.memo)
+            });
+            // `get_memoize_path` over the parameterized scan, called once
+            // per outer row; none for an outer relation of fewer than two
+            // rows.
+            let memoized = param_inner.as_ref().and_then(|(path, q, memo)| {
+                let key = memo.as_ref().filter(|_| o.2 >= 2.0)?;
+                Some((memoize(path, key, o.2, i.3), *q))
+            });
+            if let Some((m, _)) = &memoized {
+                memos[pair][usize::from(b_outer)] = (m.startup, m.total);
+            }
+            let mut inners: Vec<(usize, &InPath, f64)> = vec![(0, &inner, qual)];
+            if let Some((path, q, _)) = &param_inner {
+                inners.push((2, path, *q));
+            }
+            if let Some((m, q)) = &memoized {
+                inners.push((3, m, *q));
+            }
+            inners.push((1, &mat, qual));
+            for (kind, inner, qual) in inners {
+                let semi = unique[usize::from(!b_outer)];
+                let (startup, total) = nestloop_cost(&outer, inner, semi, false, qual);
+                let (startup, total) = (startup + qual_startup, total + qual_startup);
+                add_path(
+                    &mut paths,
+                    JoinPath {
+                        startup,
+                        total,
+                        keyed: false,
+                        class: 0,
+                        method: JoinMethod::Other,
+                        // The pair it was built from, which side is outer,
+                        // and its inner: plain (0), materialised (1), the
+                        // parameterized index scan (2) or a Memoize of it
+                        // (3).
+                        combo: pair * 8 + usize::from(b_outer) * 4 + kind,
+                        a_path: DEFAULT_INPUT,
+                        b_path: DEFAULT_INPUT,
+                        rows: 0.0,
+                        req_outer: 0,
+                        rescan: (startup, total),
+                    },
+                    false,
+                );
+            }
         }
     }
     let best = paths[0];
-    let b_outer = best.combo >= 3;
-    let materialized = best.combo % 3 == 1;
-    NestLoopPlan {
-        b_outer,
-        materialized,
-        startup: best.startup,
-        total: best.total,
-        material: materialized.then_some(materials[usize::from(b_outer)]),
-        param: best.combo % 3 == 2,
-    }
+    let pair = best.combo / 8;
+    let b_outer = best.combo % 8 >= 4;
+    let kind = best.combo % 4;
+    let materialized = kind == 1;
+    (
+        pair,
+        NestLoopPlan {
+            b_outer,
+            materialized,
+            startup: best.startup,
+            total: best.total,
+            material: materialized.then_some(materials[pair][usize::from(b_outer)]),
+            param: kind >= 2,
+            memoize: (kind == 3).then_some(memos[pair][usize::from(b_outer)]),
+        },
+    )
 }
 
 /// A merge join, each side read in key order -- by its `ordered` index scan
@@ -1752,17 +1823,35 @@ impl InPath {
     }
 }
 
-/// A Memoize's cache key, the outer side's join key, as
-/// `estimate_num_groups` and `get_expr_width` see it: its distinct count
-/// (`get_variable_numdistinct`) and whether that is a default, its table's
-/// tuples and rows, and its width.
+/// A Memoize's cache key, the outer side's expressions, as
+/// `estimate_num_groups` sees them: the Vars they read, all of one table
+/// -- the product of their distinct counts (`get_variable_numdistinct`),
+/// the largest of them, how many there are, and whether any is a default
+/// -- and that table's tuples and rows.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct MemoKey {
     pub ndistinct: f64,
+    pub max_ndistinct: f64,
+    pub vars: u32,
     pub default: bool,
     pub tuples: f64,
     pub rel_rows: f64,
-    pub width: i64,
+}
+
+impl MemoKey {
+    /// A key of one column, `ndistinct` values (`default`: the 200 of a
+    /// column never analysed), of a table of `tuples` tuples and
+    /// `rel_rows` rows.
+    pub fn column(ndistinct: f64, default: bool, tuples: f64, rel_rows: f64) -> MemoKey {
+        MemoKey {
+            ndistinct,
+            max_ndistinct: ndistinct,
+            vars: 1,
+            default,
+            tuples,
+            rel_rows,
+        }
+    }
 }
 
 /// A join's input relation with its whole pathlist (`RelOptInfo::pathlist`,
@@ -1922,14 +2011,23 @@ fn material(inner: &InPath, width: i64) -> InPath {
 fn memoize(inner: &InPath, key: &MemoKey, calls: f64, width: i64) -> InPath {
     let tuples = inner.rows;
     // `ExecEstimateCacheEntryOverheadBytes`: a MemoizeEntry (24) and a
-    // MemoizeKey (24), and a MemoizeTuple (16) a row.
-    let est_entry_bytes =
-        relation_byte_size(tuples, width) + 24.0 + 24.0 + 16.0 * tuples + key.width as f64;
+    // MemoizeKey (24), and a MemoizeTuple (16) a row. PostgreSQL 15 leaves
+    // the key itself out ("XXX we also store the cache key").
+    let est_entry_bytes = relation_byte_size(tuples, width) + 24.0 + 24.0 + 16.0 * tuples;
     let est_cache_entries = (HASH_MEM_BYTES as f64 / est_entry_bytes).floor();
     let ndistinct = if key.default {
         calls
     } else {
-        let mut reldistinct = key.ndistinct.min(key.tuples);
+        // Clamped to the table's tuples, or a tenth of them for several
+        // Vars (though never below the largest Var's count).
+        let mut clamp = key.tuples;
+        if key.vars > 1 {
+            clamp *= 0.1;
+            if clamp < key.max_ndistinct {
+                clamp = key.max_ndistinct.min(key.tuples);
+            }
+        }
+        let mut reldistinct = key.ndistinct.min(clamp);
         if reldistinct > 0.0 && key.rel_rows < key.tuples {
             reldistinct *=
                 1.0 - ((key.tuples - key.rel_rows) / key.tuples).powf(key.tuples / reldistinct);
@@ -2909,6 +3007,33 @@ mod tests {
     }
 
     #[test]
+    fn a_join_of_three_relations_keeps_its_cheapest_pair() {
+        // `e join e e2 on e.a < e2.a join e e3 on e2.a < e3.a`, 1,000
+        // analysed rows each (PostgreSQL 15.19): {e, e2} is a Nested Loop
+        // over a Materialize of e2 (0.00..15032.50, 333,333 rows), and the
+        // three a Nested Loop of that over a Materialize of e3
+        // (0.00..5015045.00). {e2, e3} with e costs the same, so the
+        // earlier pair is kept.
+        let scan = (0.0, 15.0, 1000.0, 7);
+        let lower = cheapest_nest_loop(scan, scan, CPU_OPERATOR_COST);
+        assert!(close(lower.total, 15032.50), "{lower:?}");
+        assert!(!lower.b_outer && lower.material == Some((0.0, 20.0)));
+        let pair = (
+            (lower.startup, lower.total, 333_333.0, 14),
+            scan,
+            CPU_OPERATOR_COST,
+        );
+        let (pick, top) = cheapest_nest_loop_of(&[pair, pair]).expect("two pairs");
+        assert_eq!(pick, 0);
+        assert!(close(top.total, 5_015_045.0) && !top.b_outer, "{top:?}");
+        assert_eq!(top.material, Some((0.0, 20.0)));
+        // A dearer first pair loses to the second.
+        let dear = ((0.0, 30_000.0, 333_333.0, 14), scan, CPU_OPERATOR_COST);
+        assert_eq!(cheapest_nest_loop_of(&[dear, pair]).map(|p| p.0), Some(1));
+        assert!(cheapest_nest_loop_of(&[]).is_none());
+    }
+
+    #[test]
     fn the_method_postgres_picks_under_a_where_or_a_limit() {
         // `where jp.a >= 2 and jq.c < 4`: a bitmap heap scan of jp
         // (9.99..29.40) and a seq scan of jq (0.00..38.25), 753 rows each.
@@ -3101,17 +3226,58 @@ mod tests {
             indexed: true,
             ..InPath::scan(0.14, 0.76, 1.0, None)
         };
-        let key = MemoKey {
-            ndistinct: 20.0,
-            default: false,
-            tuples: 20.0,
-            rel_rows: 20.0,
-            width: 4,
-        };
+        let key = MemoKey::column(20.0, false, 20.0, 20.0);
         let m = memoize(&inner, &key, 204.0, 4);
         assert!(close(m.startup, 0.15) && close(m.total, 0.77), "{m:?}");
         let (s, t) = nestloop_cost(&outer, &m, None, false, 0.0);
         assert!(close(s, 1.60) && (t - 62.42).abs() < 0.15, "{s} {t}");
+    }
+
+    #[test]
+    fn a_memoize_keyed_by_two_vars_of_one_table() {
+        // PostgreSQL 15.19 (RP-916): `r8 left join k on r8.a < k.a and r8.s
+        // > k.a`, r8 1,000 rows of 7 and 13 values, is a Nested Loop
+        // (0.29..1648.71) over a Memoize (0.29..2.54) of k's Index Scan
+        // (0.28..2.53, 111 rows): 7 * 13 = 91 keys, under the tenth of the
+        // table two Vars are clamped to. The inputs are as EXPLAIN rounds
+        // them.
+        let outer = InPath::scan(0.0, 16.0, 1000.0, None);
+        let inner = InPath {
+            req_outer: 2,
+            indexed: true,
+            ..InPath::scan(0.28, 2.53, 111.0, None)
+        };
+        let key = MemoKey {
+            ndistinct: 91.0,
+            max_ndistinct: 13.0,
+            vars: 2,
+            default: false,
+            tuples: 1000.0,
+            rel_rows: 1000.0,
+        };
+        let m = memoize(&inner, &key, 1000.0, 7);
+        assert!(close(m.startup, 0.29) && close(m.total, 2.54), "{m:?}");
+        let (s, t) = nestloop_cost(&outer, &m, None, false, 0.0);
+        assert!(close(s, 0.29) && (t - 1648.71).abs() < 0.5, "{s} {t}");
+        // Ten times the keys are clamped to the tenth: 100.
+        let many = MemoKey {
+            ndistinct: 910.0,
+            ..key
+        };
+        let (_, t_many) =
+            nestloop_cost(&outer, &memoize(&inner, &many, 1000.0, 7), None, false, 0.0);
+        let hundred = MemoKey {
+            ndistinct: 100.0,
+            ..key
+        };
+        let (_, t_hundred) = nestloop_cost(
+            &outer,
+            &memoize(&inner, &hundred, 1000.0, 7),
+            None,
+            false,
+            0.0,
+        );
+        assert_eq!(t_many, t_hundred);
     }
 
     #[test]

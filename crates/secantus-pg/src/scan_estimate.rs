@@ -520,24 +520,31 @@ impl PgHandler {
             return None;
         }
         // A `<`, `<=`, `>` or `>=` between the sides can be an indexed
-        // side's parameterized Index Cond (RP-354), priced below where it
-        // compares two plain keys; a `<>` never is one (no B-tree
-        // strategy). Any other inequality could be one only where an
-        // operand is that side's key (or the index is over an
+        // side's parameterized Index Cond (RP-354), priced below where an
+        // operand is that side's plain key and the other reads only the
+        // other side (`e.a < k.a`, `e.a + 1 < k.a`); a `<>` never is one
+        // (no B-tree strategy). Any other could be one only where an
+        // operand is a cast of that side's key (or the index is over an
         // expression), which is not priced: an expression of the side's
         // keys (`e.a < k.a + 1`) matches no column index, so it stays the
         // join's filter over that side's plain scan. A LEFT join's
         // preserved side is never parameterized, so never one.
-        let opaque_keys: Vec<&str> = filters
-            .iter()
-            .filter(|f| {
-                !restriction(f) && matches!(f.kind, FilterKind::Inequality) && f.compare.is_none()
+        let inequalities = || {
+            filters
+                .iter()
+                .filter(|f| !restriction(f) && matches!(f.kind, FilterKind::Inequality))
+        };
+        let opaque_keys: Vec<&str> = inequalities()
+            .flat_map(|f| {
+                f.inequality_keys
+                    .iter()
+                    .filter(|k| !f.bounds.iter().any(|b| b.key == **k))
+                    .map(String::as_str)
             })
-            .flat_map(|f| f.inequality_keys.iter().map(String::as_str))
             .collect();
-        let opaque_inequality = filters.iter().any(|f| {
-            !restriction(f) && matches!(f.kind, FilterKind::Inequality) && f.compare.is_none()
-        });
+        // An operand that is not a bare key, which an index over an
+        // expression could match.
+        let opaque_inequality = inequalities().any(|f| f.bounds.len() < 2);
         let indexes = self.index_relations();
         let project = j.project.as_deref();
         // Each joined key's table and field, for `neqjoinsel`.
@@ -569,13 +576,13 @@ impl PgHandler {
                 // An indexed table's own filter may be an index scan's,
                 // priced below only on a LEFT join's preserved side.
                 || (indexes.iter().any(|ix| ix.table.name == leaf.table)
-                    && ((!preserved_side
-                        && opaque_inequality
-                        && (columns.iter().any(|(k, _)| opaque_keys.contains(&k.as_str()))
-                            || indexes
+                    && !preserved_side
+                    && (columns.iter().any(|(k, _)| opaque_keys.contains(&k.as_str()))
+                        || (opaque_inequality
+                            && indexes
                                 .iter()
-                                .any(|ix| ix.table.name == leaf.table && ix.keys.contains(&0))))
-                        || (!leaf.filter.is_empty() && !preserved_side)))
+                                .any(|ix| ix.table.name == leaf.table && ix.keys.contains(&0)))
+                        || !leaf.filter.is_empty()))
             {
                 return None;
             }
@@ -620,7 +627,21 @@ impl PgHandler {
         let (b, b_above, _) = side(right, false)?;
         let qual: f64 = filters
             .iter()
-            .map(|f| f.ops as f64 * costsize::CPU_OPERATOR_COST)
+            .map(|f| f.ops * costsize::CPU_OPERATOR_COST)
+            .sum();
+        // A hashed IN list's table, built once at the join's startup. Only
+        // a restriction kept on the join may hold one, so it is the same
+        // on every path, the parameterized one included; one in a clause
+        // movable into the inner's scan would be that scan's startup.
+        if filters
+            .iter()
+            .any(|f| !restriction(f) && f.startup_ops > 0.0)
+        {
+            return None;
+        }
+        let qual_startup: f64 = filters
+            .iter()
+            .map(|f| f.startup_ops * costsize::CPU_OPERATOR_COST)
             .sum();
         // `clauselist_selectivity`: the conjuncts' product, in order. A
         // `<>` (or IS DISTINCT FROM) is `neqjoinsel`, one minus
@@ -631,12 +652,17 @@ impl PgHandler {
         // multiplied in last, a column's two bounds as one range.
         let mut sel_factor = 1.0_f64;
         let mut ranges: Vec<Document> = Vec::new();
+        let mut exprs: Vec<secantus_pgplan::ExprQual> = Vec::new();
         for f in &filters {
             if let (true, Some(r)) = (restriction(f), &f.restrict) {
-                if single_bound(r) {
-                    ranges.push(r.clone());
+                if !r.exprs.is_empty() {
+                    exprs.extend(r.exprs.iter().cloned());
+                } else if single_bound(&r.filter) {
+                    ranges.push(r.filter.clone());
                 } else {
-                    sel_factor *= self.restriction_selectivity(&leaves.first()?.table, r)?;
+                    let _patterns = with_explain_patterns(&r.patterns);
+                    sel_factor *=
+                        self.restriction_selectivity(&leaves.first()?.table, &r.filter)?;
                 }
                 continue;
             }
@@ -647,35 +673,9 @@ impl PgHandler {
                         let (_, table, field) = key_columns.iter().find(|(c, _, _)| c == k)?;
                         self.analysed_key(table, field)
                     };
-                    let (x, y) = (stats(l)?, stats(r)?);
-                    if x.column.pg_type != y.column.pg_type {
-                        return None;
-                    }
-                    fn key(s: &AnalysedKey) -> secantus_pgplan::joincost::KeyStats<'_> {
-                        secantus_pgplan::joincost::KeyStats {
-                            ndistinct: s.ndistinct,
-                            default_ndistinct: false,
-                            null_frac: s.null_frac,
-                            mcv: &s.mcv,
-                        }
-                    }
-                    let eq = secantus_pgplan::joincost::eqjoinsel_inner(&key(&x), &key(&y));
-                    1.0 - eq.clamp(0.0, 1.0)
+                    neqjoinsel(&stats(l)?, &stats(r)?)?
                 }
-                // A cast key is an expression with no statistics: its
-                // distinct count `get_variable_numdistinct`'s default, no
-                // NULLs and no MCV list.
-                FilterKind::NotEqualCast(l, r) => {
-                    let (x, y) = (
-                        ne_operand(self, &key_columns, l)?,
-                        ne_operand(self, &key_columns, r)?,
-                    );
-                    if x.type_oid != y.type_oid {
-                        return None;
-                    }
-                    let eq = secantus_pgplan::joincost::eqjoinsel_inner(&x.stats(), &y.stats());
-                    1.0 - eq.clamp(0.0, 1.0)
-                }
+                FilterKind::NotEqualCast(l, r) => neqjoinsel_cast(self, &key_columns, l, r)?,
                 _ => return None,
             };
             sel_factor *= s;
@@ -686,6 +686,12 @@ impl PgHandler {
                 _ => bson::doc! { "$and": ranges },
             };
             sel_factor *= self.restriction_selectivity(&leaves.first()?.table, &filter)?;
+        }
+        // An expression's comparisons, as a single relation's scan
+        // estimates them: no statistics, two bounds on one expression a
+        // range (RP-354).
+        if !exprs.is_empty() {
+            sel_factor *= self.restriction_expr_selectivity(&leaves.first()?.table, &exprs)?;
         }
         // Each side as the inner of a nested loop through its index,
         // parameterized by the other side's row: `param[0]` is `b` inner
@@ -706,10 +712,12 @@ impl PgHandler {
         let kept: f64 = filters
             .iter()
             .filter(|f| restriction(f))
-            .map(|f| f.ops as f64 * costsize::CPU_OPERATOR_COST)
+            .map(|f| f.ops * costsize::CPU_OPERATOR_COST)
             .sum();
-        for (slot, (inner_leaf, outer_rows, inner_rows)) in
-            [(lb, a.2, b.2), (la, b.2, a.2)].into_iter().enumerate()
+        for (slot, (inner_leaf, outer_leaf, outer_rows, inner_rows)) in
+            [(lb, la, a.2, b.2), (la, lb, b.2, a.2)]
+                .into_iter()
+                .enumerate()
         {
             if left_join && slot == 1 {
                 break;
@@ -729,13 +737,20 @@ impl PgHandler {
                 ParamFound::Unmodelled => return None,
                 ParamFound::Scan(mut p, scan) => {
                     p.qual = kept;
+                    p.memo = self.memo_key(outer_leaf, inner_leaf, &movable, outer_rows)?;
                     param[slot] = Some(p);
                     param_scans[slot] = Some(scan);
                 }
             }
         }
-        let plan =
-            secantus_pgplan::joincost::cheapest_nest_loop_param(a, b, qual, param, left_join);
+        let plan = secantus_pgplan::joincost::cheapest_nest_loop_param(
+            a,
+            b,
+            qual,
+            qual_startup,
+            param,
+            left_join,
+        );
         let rows = if left_join {
             // `calc_joinrel_size_estimate`'s JOIN_LEFT: never fewer rows
             // than the outer side.
@@ -749,7 +764,10 @@ impl PgHandler {
             let slot = usize::from(plan.b_outer);
             let p = param[slot]?;
             let est = |e: Estimate| (p.startup, p.total, p.rows, e.3);
-            let scan = param_scans[slot].take();
+            let mut scan = param_scans[slot].take();
+            if let Some(s) = scan.as_mut() {
+                s.memoize = plan.memoize;
+            }
             if plan.b_outer {
                 (est(a), b, scan)
             } else {
@@ -765,9 +783,420 @@ impl PgHandler {
         Some((plan, a, b, join, scan, a_index))
     }
 
+    /// A left-deep chain of Nested Loops over three to eight tables'
+    /// sequential scans, written `a JOIN b ON .. JOIN c ON ..`, every
+    /// clause a `<`, `<=`, `>` or `>=` (`DEFAULT_INEQ_SEL`) or a `<>`
+    /// between two analysed columns (`neqjoinsel`) linking two of them,
+    /// over tables with no index (RP-354). `standard_join_search` as
+    /// PostgreSQL runs it: `join_search_one_level` builds each level's
+    /// join relations, in order, from each relation of the level below
+    /// with each table a clause links it to (a level-two pair once, in
+    /// FROM order) and then, from level four, from bushy pairs of two
+    /// lower levels' relations a clause links. `make_join_rel` weighs each
+    /// pair both ways into the one relation's path list
+    /// ([`joincost::cheapest_nest_loop_of`]); its rows are set once, by the
+    /// first pair built (`build_join_rel`, `calc_joinrel_size_estimate`).
+    /// A relation's width is the columns read above it
+    /// (`build_joinrel_tlist`): the query's, and a clause's to a table
+    /// outside it. `None` -- zeros -- unless every join PostgreSQL keeps
+    /// is this tree's: the first `i + 2` tables, the next joined above
+    /// them. The joins come back lowest first. (`join_collapse_limit`
+    /// keeps more than eight from being searched as one.)
+    pub(crate) fn nest_loop_chain_estimate(
+        &self,
+        sel: &secantus_pgplan::Select,
+    ) -> Option<Vec<NestLoopLevel>> {
+        use secantus_pgplan::joins::{FilterKind, JoinFilter, JoinKind, JoinNode, JoinRows};
+        use secantus_pgplan::Statement;
+        let sub = sel.sub.as_ref()?;
+        let Statement::JoinRows(j) = sub.plan.as_ref() else {
+            return None;
+        };
+        if sel.series.is_some()
+            || sel.join.is_some()
+            || !sel.windows.is_empty()
+            || !sel.order.is_empty()
+            || sel.limit.is_some()
+            || sel.offset != 0
+            || !matches!(sel.distinct, secantus_pgplan::Distinct::None)
+            || sel.with_ties
+            || sel.casts.iter().any(Option::is_some)
+            || ((!sel.filter.is_empty() || sel.residual.is_some()) && !j.where_modelled)
+            || j.where_spans_equality
+            || !j.where_filters.is_empty()
+        {
+            return None;
+        }
+        // An inner join with an ON of its own clauses only, no column it
+        // could hash or merge on.
+        fn inner_join(
+            node: &JoinNode,
+        ) -> Option<(&JoinNode, &JoinNode, &[secantus_pgplan::joins::JoinFilter])> {
+            let JoinNode::Join {
+                kind: JoinKind::Inner,
+                left,
+                right,
+                on: Some(_),
+                on_filters,
+                equi,
+                merged,
+                expr_keys,
+                ..
+            } = node
+            else {
+                return None;
+            };
+            if !equi.is_empty() || !merged.is_empty() || !expr_keys.is_empty() {
+                return None;
+            }
+            Some((left.as_ref(), right.as_ref(), on_filters.as_slice()))
+        }
+        // The left spine: each join's ON, and the tables from the
+        // bottom's two upward.
+        let mut nodes: Vec<&JoinNode> = Vec::new();
+        let mut filter_lists: Vec<&[JoinFilter]> = Vec::new();
+        let mut node = &j.tree;
+        while let Some((lower, leaf, filters)) = inner_join(node) {
+            nodes.push(leaf);
+            filter_lists.push(filters);
+            node = lower;
+        }
+        nodes.push(node);
+        nodes.reverse();
+        filter_lists.reverse();
+        let n = nodes.len();
+        if !(3..=8).contains(&n) {
+            return None;
+        }
+        let indexes = self.index_relations();
+        let project = j.project.as_deref();
+        // Each table: its alias, the stored table, its keys with their
+        // stored fields, and the fields its scan reads.
+        struct Leaf<'n> {
+            alias: &'n str,
+            table: &'n str,
+            filter: &'n Document,
+            keys: Vec<(&'n str, String)>,
+            read: Vec<String>,
+        }
+        let mut leaves: Vec<Leaf> = Vec::new();
+        for node in nodes.iter().copied() {
+            let JoinNode::Leaf { plan, def, columns } = node else {
+                return None;
+            };
+            let Statement::Select(leaf) = plan.as_ref() else {
+                return None;
+            };
+            if leaf.residual.is_some()
+                || leaf.sub.is_some()
+                || leaf.series.is_some()
+                || leaf.join.is_some()
+                || !leaf.windows.is_empty()
+                || !leaf.order.is_empty()
+                || leaf.limit.is_some()
+                || leaf.offset != 0
+                || !matches!(leaf.distinct, secantus_pgplan::Distinct::None)
+                || leaf.casts.iter().any(Option::is_some)
+                // An index could be a scan's path, or an inner's
+                // parameterized by the rows of the others.
+                || indexes.iter().any(|ix| ix.table.name == leaf.table)
+            {
+                return None;
+            }
+            let table = self.lookup(&leaf.table)?;
+            let mut keys = Vec::new();
+            for (key, f) in columns {
+                let c = def.columns.iter().find(|c| c.field() == *f)?;
+                keys.push((key.as_str(), table.field_of(&c.name)?));
+            }
+            let read = keys
+                .iter()
+                .filter(|(key, _)| JoinRows::carries(project, key))
+                .map(|(_, f)| f.clone())
+                .collect();
+            leaves.push(Leaf {
+                alias: def.name.as_str(),
+                table: leaf.table.as_str(),
+                filter: &leaf.filter,
+                keys,
+                read,
+            });
+        }
+        // Each clause: its cost a row, the tables it links (a bit each,
+        // in FROM order), the keys it reads and its selectivity.
+        struct Clause<'k> {
+            qual: f64,
+            set: u32,
+            keys: Vec<&'k str>,
+            sel: f64,
+        }
+        let stats = |k: &str| {
+            let leaf = leaves
+                .iter()
+                .find(|l| l.keys.iter().any(|(key, _)| *key == k))?;
+            let (_, field) = leaf.keys.iter().find(|(key, _)| *key == k)?;
+            self.analysed_key(leaf.table, field)
+        };
+        let key_columns: Vec<(String, String, String)> = leaves
+            .iter()
+            .flat_map(|l| {
+                l.keys
+                    .iter()
+                    .map(|(key, field)| (key.to_string(), l.table.to_string(), field.clone()))
+            })
+            .collect();
+        let mut clauses: Vec<Clause> = Vec::new();
+        for f in filter_lists.iter().copied().flatten() {
+            let secantus_pgplan::ColumnExpr::Row { fields, .. } = &f.expr else {
+                return None;
+            };
+            if f.restrict.is_some() || f.aliases.len() != 2 {
+                return None;
+            }
+            let sel = match &f.kind {
+                FilterKind::Inequality => 1.0 / 3.0,
+                FilterKind::NotEqual(l, r) => neqjoinsel(&stats(l)?, &stats(r)?)?,
+                FilterKind::NotEqualCast(l, r) => neqjoinsel_cast(self, &key_columns, l, r)?,
+                _ => return None,
+            };
+            let mut set = 0u32;
+            for alias in &f.aliases {
+                set |= 1 << leaves.iter().position(|l| l.alias == alias)?;
+            }
+            if set.count_ones() != 2 {
+                return None;
+            }
+            clauses.push(Clause {
+                qual: f.ops * costsize::CPU_OPERATOR_COST,
+                set,
+                keys: fields.iter().map(|(_, k, _)| k.as_str()).collect(),
+                sel,
+            });
+        }
+        // The clauses must link every table: a relation with none to the
+        // tables outside it is a clauseless join, not modelled.
+        let full = (1u32 << n) - 1;
+        let mut reached = 1u32;
+        loop {
+            let next = clauses
+                .iter()
+                .filter(|c| c.set & reached != 0)
+                .fold(reached, |acc, c| acc | c.set);
+            if next == reached {
+                break;
+            }
+            reached = next;
+        }
+        if reached != full {
+            return None;
+        }
+        let scans: Vec<Estimate> = leaves
+            .iter()
+            .map(|l| match self.scan_estimate(l.table, l.filter, &l.read)? {
+                (e, None) => Some(e),
+                _ => None,
+            })
+            .collect::<Option<_>>()?;
+        // The width of the columns of the tables in `set` read above it.
+        let width = |set: u32| -> Option<i64> {
+            let mut total = 0;
+            for (i, l) in leaves.iter().enumerate() {
+                if set & (1 << i) == 0 {
+                    continue;
+                }
+                let above: Vec<String> = l
+                    .keys
+                    .iter()
+                    .filter(|(key, _)| {
+                        project.is_none()
+                            || j.needed.iter().any(|n| n == key)
+                            || clauses
+                                .iter()
+                                .any(|c| c.set & !set != 0 && c.keys.contains(key))
+                    })
+                    .map(|(_, f)| f.clone())
+                    .collect();
+                let (e, None) = self.scan_estimate(l.table, &Document::new(), &above)? else {
+                    return None;
+                };
+                total += e.3;
+            }
+            Some(total)
+        };
+        // The clauses joining `a` to `b`: their cost a row and their
+        // selectivity.
+        let restrict = |a: u32, b: u32| -> (f64, f64) {
+            let mut qual = 0.0;
+            let mut sel_factor = 1.0;
+            for c in &clauses {
+                if c.set & a != 0 && c.set & b != 0 && c.set & !(a | b) == 0 {
+                    qual += c.qual;
+                    sel_factor *= c.sel;
+                }
+            }
+            (qual, sel_factor)
+        };
+        let linked = |a: u32, b: u32| clauses.iter().any(|c| c.set & a != 0 && c.set & b != 0);
+        // Each relation's estimate and, for a join, its kept path and the
+        // pair it was built from.
+        type Kept = (secantus_pgplan::joincost::NestLoopPlan, (u32, u32));
+        let mut rels: std::collections::HashMap<u32, (Estimate, Option<Kept>)> =
+            (0..n).map(|i| (1u32 << i, (scans[i], None))).collect();
+        let mut levels: Vec<Vec<u32>> = vec![Vec::new(), (0..n).map(|i| 1u32 << i).collect()];
+        for level in 2..=n {
+            // `make_join_rel`'s calls, in `join_search_one_level`'s order.
+            // A proper subset of linked tables always has a clause to one
+            // outside it, so no relation takes the clauseless branch.
+            let mut calls: Vec<(u32, u32)> = Vec::new();
+            for (at, &old) in levels[level - 1].iter().enumerate() {
+                let first = if level == 2 { at + 1 } else { 0 };
+                for &other in &levels[1][first..] {
+                    if old & other == 0 && linked(old, other) {
+                        calls.push((old, other));
+                    }
+                }
+            }
+            let mut k = 2;
+            while k <= level - k {
+                let other_level = level - k;
+                for (at, &old) in levels[k].iter().enumerate() {
+                    let first = if k == other_level { at + 1 } else { 0 };
+                    for &other in &levels[other_level][first..] {
+                        if old & other == 0 && linked(old, other) {
+                            calls.push((old, other));
+                        }
+                    }
+                }
+                k += 1;
+            }
+            let mut made: Vec<u32> = Vec::new();
+            for &(a, b) in &calls {
+                if !made.contains(&(a | b)) {
+                    made.push(a | b);
+                }
+            }
+            for &set in &made {
+                let built: Vec<(u32, u32)> = calls
+                    .iter()
+                    .copied()
+                    .filter(|&(a, b)| a | b == set)
+                    .collect();
+                let pairs: Vec<secantus_pgplan::joincost::NestLoopPair> = built
+                    .iter()
+                    .map(|&(a, b)| (rels[&a].0, rels[&b].0, restrict(a, b).0))
+                    .collect();
+                let (a, b) = built[0];
+                let rows =
+                    costsize::clamp_row_est(rels[&a].0 .2 * rels[&b].0 .2 * restrict(a, b).1);
+                let (pick, plan) = secantus_pgplan::joincost::cheapest_nest_loop_of(&pairs)?;
+                let est = (plan.startup, plan.total, rows, width(set)?);
+                rels.insert(set, (est, Some((plan, built[pick]))));
+            }
+            levels.push(made);
+        }
+        // Down the kept paths from the top: each must join this tree's
+        // lower relation and its next table.
+        let mut out = Vec::new();
+        let mut set = full;
+        for i in (1..n).rev() {
+            let (lower, leaf) = (set & !(1 << i), 1u32 << i);
+            let (est, kept) = rels.get(&set)?;
+            let (mut plan, pair) = (*kept)?;
+            if pair == (leaf, lower) {
+                plan.b_outer = !plan.b_outer;
+            } else if pair != (lower, leaf) {
+                return None;
+            }
+            out.push((plan, rels[&lower].0, scans[i], *est));
+            set = lower;
+        }
+        out.reverse();
+        Some(out)
+    }
+
+    /// `get_memoize_path` over a scan of `inner` parameterized by the row
+    /// of `outer` (`outer_rows` rows), the join clauses `moved` into it
+    /// (RP-916): its cache key (`paraminfo_get_equal_hashops`), each
+    /// clause's operand over `outer`, and that key's distinct count as
+    /// `estimate_num_groups` reads it -- the Vars the operands read, each
+    /// once, a column never analysed a default. `Some(None)` where
+    /// PostgreSQL makes no Memoize: `enable_memoize` off, a clause that is
+    /// not a two-operand operator with one operand over each side, or an
+    /// operand whose type has no hash support. `None` where this cannot
+    /// tell: an operand of a type whose hash support it does not know, or
+    /// an expression an expression index on `outer` could hold statistics
+    /// for.
+    fn memo_key(
+        &self,
+        outer: &SideLeaf,
+        inner: &SideLeaf,
+        moved: &[&secantus_pgplan::joins::JoinFilter],
+        outer_rows: f64,
+    ) -> Option<Option<secantus_pgplan::joincost::MemoKey>> {
+        if self.setting_is("enable_memoize", "off") || moved.is_empty() {
+            return Some(None);
+        }
+        let reads = |keys: &[String], leaf: &SideLeaf| {
+            !keys.is_empty()
+                && keys
+                    .iter()
+                    .all(|k| leaf.keys.iter().any(|(lk, ..)| lk == k))
+        };
+        let expression_index = self
+            .index_relations()
+            .iter()
+            .any(|ix| ix.table.name == outer.table && ix.keys.contains(&0));
+        let mut vars: Vec<String> = Vec::new();
+        for f in moved {
+            let Some([l, r]) = &f.operands else {
+                return Some(None);
+            };
+            let o = if reads(&l.keys, outer) && reads(&r.keys, inner) {
+                l
+            } else if reads(&r.keys, outer) && reads(&l.keys, inner) {
+                r
+            } else {
+                return Some(None);
+            };
+            if !hash_support(o.type_oid?)? {
+                return Some(None);
+            }
+            if !o.bare && expression_index {
+                return None;
+            }
+            for k in &o.keys {
+                if !vars.contains(k) {
+                    vars.push(k.clone());
+                }
+            }
+        }
+        let mut key = secantus_pgplan::joincost::MemoKey {
+            ndistinct: 1.0,
+            max_ndistinct: 1.0,
+            vars: 0,
+            default: false,
+            tuples: 0.0,
+            rel_rows: outer_rows,
+        };
+        for v in &vars {
+            let (_, field, _) = outer.keys.iter().find(|(k, ..)| k == v)?;
+            match self.analysed_key(&outer.table, field) {
+                Some(stats) => {
+                    key.ndistinct *= stats.ndistinct;
+                    key.max_ndistinct = key.max_ndistinct.max(stats.ndistinct);
+                    key.tuples = stats.tuples;
+                }
+                None => key.default = true,
+            }
+            key.vars += 1;
+        }
+        Some(Some(key))
+    }
+
     /// `leaf` as the inner side of a nested loop through one of its
     /// table's B-trees, its index qual one of `filters`' inequalities
-    /// between its leading column and the outer side's key (RP-354):
+    /// between one of its key columns and an expression of the outer side
+    /// (RP-354):
     /// `create_index_paths`' join clauses, `get_loop_count` the outer
     /// side's `outer_rows`. Every other join clause moves into the scan
     /// too (`join_clause_is_movable_into`), checked on each row it fetches,
@@ -775,8 +1204,8 @@ impl PgHandler {
     /// inner rows times every join clause's selectivity, as
     /// `get_parameterized_baserel_size` multiplies them; `inner_rows` is
     /// the plain scan's. [`ParamFound::Unmodelled`] where an index could serve
-    /// in a way not priced here: a later key column, clauses on two
-    /// columns or a table never analysed.
+    /// in a way not priced here: clauses on two columns, a hash or partial
+    /// index or a table never analysed.
     fn param_index_inner(
         &self,
         leaf: &SideLeaf,
@@ -802,88 +1231,113 @@ impl PgHandler {
                 })
                 .collect()
         };
-        // The comparisons naming one of this side's keys, as `(this side's
-        // stored field, SQL column, its operator written this side first,
-        // the filter's cost)`.
+        // The comparisons bounding one of this side's keys, as `(this
+        // side's stored field, SQL column, its operator written this side
+        // first, the filter's cost, its other operand's)`.
         let mut clauses = Vec::new();
         for f in filters {
-            let Some((l, op, r)) = &f.compare else {
-                continue;
-            };
-            let mine = |k: &str| leaf.keys.iter().find(|(key, _, _)| key == k);
-            let (own, op) = match (mine(l), mine(r)) {
-                (Some(_), Some(_)) => return ParamFound::Unmodelled,
-                (Some(k), None) => (k, op.clone()),
-                (None, Some(k)) => (k, commuted(op).to_string()),
-                (None, None) => continue,
-            };
-            clauses.push((own.1.clone(), own.2.clone(), op, f.ops));
+            for b in &f.bounds {
+                if let Some(own) = leaf.keys.iter().find(|(key, _, _)| *key == b.key) {
+                    clauses.push((own.1.clone(), own.2.clone(), b.op.clone(), f.ops, b.arg_ops));
+                }
+            }
         }
         let mut serving = Vec::new();
         for ix in &table_indexes {
             let Some(fields) = key_fields(ix) else {
                 return ParamFound::Unmodelled;
             };
-            for (field, _, _, _) in &clauses {
-                match fields.iter().position(|f| f == field) {
-                    Some(0) => serving.push((*ix, field.clone())),
-                    Some(_) => return ParamFound::Unmodelled,
-                    None => {}
+            for (field, ..) in &clauses {
+                if let Some(at) = fields.iter().position(|f| f == field) {
+                    serving.push((*ix, field.clone(), at > 0));
                 }
             }
         }
         if serving.is_empty() {
             return ParamFound::None;
         }
-        // One column over one index (the primary key is listed as both
-        // the SQL key and the storage's `_id` index: one relation), its
-        // every clause an index qual (`match_join_clauses_to_index`): two
-        // bounds (`e.a < k.a and e.a > k.a`) are one `Index Cond` of both.
+        // One column (the primary key is listed as both the SQL key and
+        // the storage's `_id` index: one relation), its every clause an
+        // index qual (`match_join_clauses_to_index`): two bounds (`e.a <
+        // k.a and e.a > k.a`) are one `Index Cond` of both. The column may
+        // be a later one of the index (`match_clause_to_index` matches
+        // every key column): `e.a < c2.y` over an index on `(x, y)` is
+        // `Index Cond: (y > e.a)`.
         let field = serving[0].1.clone();
-        if serving.iter().any(|(_, f)| *f != field) {
+        if serving.iter().any(|(_, f, _)| *f != field) {
             return ParamFound::Unmodelled;
         }
         let Some(key) = self.analysed_key(&leaf.table, &field) else {
             return ParamFound::Unmodelled;
         };
-        let Some(mut ki) = self.key_index(&leaf.table, &Document::new(), &field, &key, inner_rows)
-        else {
-            return ParamFound::Unmodelled;
-        };
-        // An index holding every column the side reads is scanned
-        // index-only (`check_index_only`), its heap fetches cut by the
-        // visibility map's all-visible fraction (`cost_index`); with
-        // `enable_indexonlyscan` off it is a plain index scan.
-        let index_only = !self.setting_is("enable_indexonlyscan", "off")
-            && leaf.read.iter().all(|f| ki.index.columns.contains(f));
-        if index_only {
-            ki.index.visible = ki.allvisfrac;
-        }
-        let own: Vec<_> = clauses.iter().filter(|(f, _, _, _)| *f == field).collect();
+        let own: Vec<_> = clauses.iter().filter(|(f, ..)| *f == field).collect();
         let column = &own[0].1;
         let bounds: Vec<bool> = own
             .iter()
-            .map(|(_, _, op, _)| op.starts_with('>'))
+            .map(|(_, _, op, ..)| op.starts_with('>'))
             .collect();
-        let ops: usize = own.iter().map(|(_, _, _, ops)| ops).sum();
+        let ops: f64 = own.iter().map(|(_, _, _, ops, _)| ops).sum();
+        let arg_ops: f64 = own.iter().map(|(.., arg_ops)| arg_ops).sum();
         // The other join clauses, a filter on each row the scan fetches.
-        let rest_ops = (filters.iter().map(|f| f.ops).sum::<usize>() - ops) as f64;
+        let rest_ops = filters.iter().map(|f| f.ops).sum::<f64>() - ops;
         let rest: Vec<(String, costsize::Qual)> = if rest_ops > 0.0 {
             vec![(String::new(), costsize::Qual::Filter(rest_ops))]
         } else {
             Vec::new()
         };
-        let Some((startup, total)) =
-            costsize::param_range_index_scan(&ki.rel, &ki.index, &rest, &bounds, outer_rows)
-        else {
-            return ParamFound::Unmodelled;
-        };
-        let Some(name) = serving
-            .iter()
-            .map(|(ix, _)| ix.name.clone())
-            .find(|n| !n.starts_with('_'))
-            .or_else(|| serving.first().map(|(ix, _)| ix.name.clone()))
-        else {
+        // Each index holding the column is a parameterized path of its
+        // own (`build_index_paths`, in the index list's oid order), and
+        // `add_path` keeps the cheapest: with the same parameterization,
+        // rows and no useful pathkeys, a path's total decides beyond the
+        // 1.01 fuzz, its startup between fuzzily equal totals, and between
+        // fuzzily equal paths the new one replaces the old only when
+        // cheaper beyond a 1.0000000001 fuzz (`e.a < c4.y` over indexes on
+        // `(x, y)` and `(y)`: `Index Scan using c4_y`).
+        let mut best: Option<(f64, f64, String, bool)> = None;
+        let mut seen: Vec<Vec<String>> = Vec::new();
+        for (ix, ..) in &serving {
+            let Some(columns) = key_fields(ix) else {
+                return ParamFound::Unmodelled;
+            };
+            if seen.contains(&columns) {
+                continue;
+            }
+            let Some(mut ki) = self.key_index_of(&leaf.table, &columns, &key, inner_rows) else {
+                return ParamFound::Unmodelled;
+            };
+            seen.push(columns.clone());
+            // An index holding every column the side reads is scanned
+            // index-only (`check_index_only`), its heap fetches cut by the
+            // visibility map's all-visible fraction (`cost_index`); with
+            // `enable_indexonlyscan` off it is a plain index scan.
+            let index_only = !self.setting_is("enable_indexonlyscan", "off")
+                && leaf.read.iter().all(|f| ki.index.columns.contains(f));
+            if index_only {
+                ki.index.visible = ki.allvisfrac;
+            }
+            let Some((startup, total)) = costsize::param_range_index_scan(
+                &ki.rel, &ki.index, &field, &rest, &bounds, arg_ops, outer_rows,
+            ) else {
+                return ParamFound::Unmodelled;
+            };
+            // The SQL name of the relation, not the storage's `_id` one.
+            let Some(name) = serving
+                .iter()
+                .filter(|(other, ..)| key_fields(other).as_ref() == Some(&columns))
+                .map(|(other, ..)| other.name.clone())
+                .find(|n| !n.starts_with('_'))
+                .or_else(|| Some(ix.name.clone()))
+            else {
+                return ParamFound::Unmodelled;
+            };
+            let replaces = best
+                .as_ref()
+                .is_none_or(|(s, t, ..)| costsize::fuzzily_cheaper((startup, total), (*s, *t)));
+            if replaces {
+                best = Some((startup, total, name, index_only));
+            }
+        }
+        let Some((startup, total, name, index_only)) = best else {
             return ParamFound::Unmodelled;
         };
         let alias = leaf
@@ -898,12 +1352,15 @@ impl PgHandler {
                 total,
                 rows: costsize::clamp_row_est(param_rows),
                 qual: 0.0,
+                memo: None,
             },
             ParamScan {
                 index: name,
                 alias,
                 column: column.clone(),
                 index_only,
+                read: leaf.read.clone(),
+                memoize: None,
             },
         )
     }
@@ -2055,6 +2512,60 @@ impl PgHandler {
         key: &AnalysedKey,
         rows: f64,
     ) -> Option<KeyIndex> {
+        self.key_index_at(table, filter, field, key, rows, false)
+    }
+
+    /// [`Self::key_index`], or with `later` the one plain B-tree holding
+    /// `field` past its first column (RP-354), correlated by its leading
+    /// column as `btcostestimate` is. `None` where another index holds
+    /// `field` at the other position.
+    fn key_index_at(
+        &self,
+        table: &str,
+        filter: &Document,
+        field: &str,
+        key: &AnalysedKey,
+        rows: f64,
+        later: bool,
+    ) -> Option<KeyIndex> {
+        self.key_index_by(table, filter, key, rows, |ix| {
+            let (leading, past) = (
+                ix.field == field,
+                ix.columns[1..].iter().any(|c| c == field),
+            );
+            if later {
+                (past, leading)
+            } else {
+                (leading, past)
+            }
+        })
+    }
+
+    /// The plain B-tree of `table` whose key columns are `columns`, sized
+    /// and correlated as [`Self::key_index`] does (RP-354): one of the
+    /// indexes a parameterized scan may read.
+    fn key_index_of(
+        &self,
+        table: &str,
+        columns: &[String],
+        key: &AnalysedKey,
+        rows: f64,
+    ) -> Option<KeyIndex> {
+        self.key_index_by(table, &Document::new(), key, rows, |ix| {
+            (ix.columns == columns, false)
+        })
+    }
+
+    /// The one plain B-tree `pick` says `(is the one, rules the estimate
+    /// out)` of, scanned with `filter`.
+    fn key_index_by(
+        &self,
+        table: &str,
+        filter: &Document,
+        key: &AnalysedKey,
+        rows: f64,
+        pick: impl Fn(&costsize::Index) -> (bool, bool),
+    ) -> Option<KeyIndex> {
         let count = self
             .storage
             .count_matching(self.db(), table, &Document::new(), None)
@@ -2066,12 +2577,13 @@ impl PgHandler {
         let correlations = Self::stats_correlations(&pt.def, stats);
         let mut found: Option<costsize::Index> = None;
         for ix in &mut indexes {
-            if quals.iter().any(|(f, _)| ix.columns.contains(f))
-                || ix.columns[1..].iter().any(|c| c == field)
-            {
+            // An index holding it at the other position is a path not
+            // priced here.
+            let (here, there) = pick(ix);
+            if quals.iter().any(|(f, _)| ix.columns.contains(f)) || there {
                 return None;
             }
-            if ix.field != field {
+            if !here {
                 continue;
             }
             if ix.hash || ix.predicate.is_some() || ix.tuples.is_some() {
@@ -2085,7 +2597,7 @@ impl PgHandler {
                 }
                 return None;
             }
-            let c = correlations.get(field).copied().flatten()?;
+            let c = correlations.get(&ix.field).copied().flatten()?;
             ix.correlation = if ix.columns.len() > 1 { c * 0.75 } else { c };
             if !ix.unique {
                 if let Some(Some((pages, height))) = self.dedup_index_size(table, ix) {
@@ -3288,6 +3800,25 @@ impl PgHandler {
         Some(self.where_selectivity(table, &pt, filter, &count)?.0)
     }
 
+    /// [`expr_selectivity`] of `quals`, comparisons of expressions over
+    /// user table `table`'s columns with constants.
+    fn restriction_expr_selectivity(
+        &self,
+        table: &str,
+        quals: &[secantus_pgplan::ExprQual],
+    ) -> Option<f64> {
+        let counted: std::cell::OnceCell<Option<usize>> = std::cell::OnceCell::new();
+        let count = || {
+            *counted.get_or_init(|| {
+                self.storage
+                    .count_matching(self.db(), table, &Document::new(), None)
+                    .ok()
+            })
+        };
+        let pt = self.planner_table_lazy(table, &count)?;
+        expr_selectivity(quals, pt.tuples)
+    }
+
     /// A built-in catalog of `pg_catalog`, sized and measured as `initdb`
     /// left it. Its rows written since are not counted: its heap's later
     /// pages are RP-291's, and PostgreSQL's estimate does not move with
@@ -3772,6 +4303,22 @@ impl PgHandler {
             .collect::<Option<_>>()?;
         let (_, _, rows, _) = self.user_seq_scan(table, filter, &[])?;
         Some(hashagg::estimate_groups(&keys, pt.tuples, rows) as f64)
+    }
+}
+
+#[cfg(test)]
+mod ne_operator_tests {
+    use super::ne_operator_exists;
+
+    /// `pg_operator` has `<>` over two integer types and over real and
+    /// double precision as they are; `int4 <> numeric` coerces first.
+    #[test]
+    fn cross_type_not_equal_operators() {
+        assert!(ne_operator_exists(23, 20)); // int48ne
+        assert!(ne_operator_exists(20, 21)); // int82ne
+        assert!(ne_operator_exists(700, 701)); // float48ne
+        assert!(!ne_operator_exists(23, 1700));
+        assert!(!ne_operator_exists(23, 25));
     }
 }
 
@@ -4408,6 +4955,28 @@ pub(crate) fn explain_patterns(patterns: &[secantus_pgplan::ScanPattern]) -> Pat
     PatternsGuard(())
 }
 
+/// Holds a join restriction's LIKE patterns beside the EXPLAIN's own
+/// until it is dropped.
+pub(crate) struct ExtraPatternsGuard(usize);
+
+impl Drop for ExtraPatternsGuard {
+    fn drop(&mut self) {
+        EXPLAIN_PATTERNS.with(|c| c.borrow_mut().truncate(self.0));
+    }
+}
+
+/// Add `patterns` (a join restriction's, [`secantus_pgplan::joins::Restriction`])
+/// to what this EXPLAIN's scans read a `$regex` clause as, until the guard
+/// is dropped.
+fn with_explain_patterns(patterns: &[secantus_pgplan::ScanPattern]) -> ExtraPatternsGuard {
+    EXPLAIN_PATTERNS.with(|c| {
+        let mut c = c.borrow_mut();
+        let len = c.len();
+        c.extend_from_slice(patterns);
+        ExtraPatternsGuard(len)
+    })
+}
+
 /// The LIKE / ILIKE pattern behind a lowered `$regex` clause on `field`:
 /// `(pattern, insensitive)`, or `None` where this EXPLAIN holds none that
 /// lowers to it (a regex operator's, say).
@@ -4669,15 +5238,6 @@ struct KeyIndex {
     allvisfrac: f64,
 }
 
-impl HashSide {
-    /// Its key column's average width, for a Memoize keyed on it.
-    fn key_index_width(&self) -> Option<i64> {
-        self.column
-            .as_ref()
-            .map(|(stats, _)| i64::from(stats.width))
-    }
-}
-
 /// [`PgHandler::nest_loop_estimate`]'s answer: the plan, the two scans'
 /// and the join's estimates, the inner's parameterized index scan and the
 /// preserved side's index path, where either is chosen.
@@ -4688,6 +5248,67 @@ pub(crate) type NestLoopEstimate = (
     Estimate,
     Option<ParamScan>,
     Option<ScanIndex>,
+);
+
+/// `neqjoinsel` of a `<>` (or IS DISTINCT FROM) between two analysed
+/// columns: one minus `eqjoinsel` over their statistics. Two integer
+/// types compare through their cross-type operator (`int48ne`):
+/// `eqjoinsel` matches their MCVs by value, which their shared `int_key`
+/// encoding does byte for byte. Any other pair of types is not estimated.
+fn neqjoinsel(x: &AnalysedKey, y: &AnalysedKey) -> Option<f64> {
+    if x.column.pg_type != y.column.pg_type {
+        let oid = |k: &AnalysedKey| secantus_pgplan::pgtypes::oid_of_name(&k.column.pg_type);
+        let (lt, rt) = (oid(x)?, oid(y)?);
+        let integer = |t: i64| matches!(t, 20 | 21 | 23);
+        if !(integer(lt) && integer(rt) && ne_operator_exists(lt, rt)) {
+            return None;
+        }
+    }
+    fn key(s: &AnalysedKey) -> secantus_pgplan::joincost::KeyStats<'_> {
+        secantus_pgplan::joincost::KeyStats {
+            ndistinct: s.ndistinct,
+            default_ndistinct: false,
+            null_frac: s.null_frac,
+            mcv: &s.mcv,
+        }
+    }
+    let eq = secantus_pgplan::joincost::eqjoinsel_inner(&key(x), &key(y));
+    Some(1.0 - eq.clamp(0.0, 1.0))
+}
+
+/// `neqjoinsel` of a `<>` between two joined keys of which one or both is
+/// cast: a cast key is an expression with no statistics, its distinct
+/// count `get_variable_numdistinct`'s default, no NULLs and no MCV list
+/// (`examine_variable`). Operands of two types compare through
+/// PostgreSQL's cross-type operator (`int48ne`) where one takes them as
+/// they are; one that coerces an operand first (`int4 <> numeric`) is not
+/// estimated. A cast key has no MCV list, so `eqjoinsel` never compares
+/// values.
+fn neqjoinsel_cast(
+    h: &PgHandler,
+    key_columns: &[(String, String, String)],
+    l: &secantus_pgplan::joins::CastKey,
+    r: &secantus_pgplan::joins::CastKey,
+) -> Option<f64> {
+    let (x, y) = (
+        ne_operand(h, key_columns, l)?,
+        ne_operand(h, key_columns, r)?,
+    );
+    if x.type_oid != y.type_oid && !ne_operator_exists(x.type_oid, y.type_oid) {
+        return None;
+    }
+    let eq = secantus_pgplan::joincost::eqjoinsel_inner(&x.stats(), &y.stats());
+    Some(1.0 - eq.clamp(0.0, 1.0))
+}
+
+/// One Nested Loop of [`PgHandler::nest_loop_chain_estimate`]'s answer:
+/// its plan and its two inputs' and its own estimates, its inputs in the
+/// order the join tree lists them.
+pub(crate) type NestLoopLevel = (
+    secantus_pgplan::joincost::NestLoopPlan,
+    Estimate,
+    Estimate,
+    Estimate,
 );
 
 /// A nested loop's side as [`PgHandler::nest_loop_estimate`] reads it: its
@@ -4764,6 +5385,19 @@ impl NeOperand {
             (selec, k.null_frac)
         };
         (1.0 - selec - null_frac).clamp(0.0, 1.0)
+    }
+}
+
+/// Does a built-in `<>` take a left operand of type `l` and a right one of
+/// type `r` exactly, both built-in oids -- a cross-type operator such as
+/// `int48ne` that `oper_select_candidate` picks with no coercion?
+fn ne_operator_exists(l: i64, r: i64) -> bool {
+    use secantus_pgplan::pgtypes::name_of_oid;
+    match (name_of_oid(l), name_of_oid(r)) {
+        (Some(l), Some(r)) => {
+            secantus_pgplan::binary_operator_result("<>", l, r).is_some_and(|t| t == "bool")
+        }
+        _ => false,
     }
 }
 
@@ -4844,6 +5478,11 @@ pub(crate) struct ParamScan {
     pub column: String,
     /// Read index-only: the index holds every column the side reads.
     pub index_only: bool,
+    /// The stored fields the scan returns (its relation's `reltarget`),
+    /// which a Memoize over it stores a row of each.
+    pub read: Vec<String>,
+    /// Under a Memoize (RP-916): the Memoize's `(startup, total)`.
+    pub memoize: Option<(f64, f64)>,
 }
 
 enum ParamFound {
@@ -4852,15 +5491,19 @@ enum ParamFound {
     Scan(secantus_pgplan::joincost::ParamInner, ParamScan),
 }
 
-/// A comparison operator with its operands swapped.
-fn commuted(op: &str) -> &str {
-    match op {
-        "<" => ">",
-        "<=" => ">=",
-        ">" => "<",
-        ">=" => "<=",
-        other => other,
+/// Whether the built-in type `oid` has hash support (`lookup_type_cache`'s
+/// `TYPECACHE_HASH_PROC`: a default hash operator class, its own or a
+/// binary-coercible type's). `None` for a type this does not know the
+/// answer for: a user's type, or one a polymorphic class (`array_ops`,
+/// `enum_ops`, ...) could serve.
+fn hash_support(oid: i64) -> Option<bool> {
+    /// `HASH_AM_OID`.
+    const HASH_AM: i64 = 405;
+    if crate::catalog_reads::default_opclass(oid, HASH_AM) != 0 {
+        return Some(true);
     }
+    // json, xml and the geometric types: no hash operator class at all.
+    matches!(oid, 114 | 142 | 600 | 601 | 602 | 603 | 604 | 628 | 718).then_some(false)
 }
 
 /// One analysed column's statistics (`PgHandler::analysed_key`).
@@ -4982,7 +5625,7 @@ fn hash_join_of(
     // `qp_qual_cost` on each tuple the hash clauses pass -- for a unique
     // inner side the outer rows that match, the filter's selectivity
     // among the semi-join factors (RP-381).
-    let qp = filter.ops as f64 * costsize::CPU_OPERATOR_COST;
+    let qp = filter.ops * costsize::CPU_OPERATOR_COST;
     let (startup, total) = joincost::hash_join_stats_filtered(
         &outer,
         &inner,
@@ -5157,7 +5800,7 @@ fn hash_join_of(
     let nest = joincost::cheapest_nest_loop_semi(
         a.scan,
         b.scan,
-        costsize::CPU_OPERATOR_COST * (1.0 + more.len() as f64 + filter.ops as f64),
+        costsize::CPU_OPERATOR_COST * (1.0 + more.len() as f64 + filter.ops),
         [semi(&a, unique_a), semi(&b, unique_b)],
     );
     if nest.total <= t0 * 1.01 {
@@ -5208,7 +5851,8 @@ fn unique_key_other_paths(
             return Some(out);
         }
         let k = s.key_index.as_ref()?;
-        let other_key = other.key_index_width()?;
+        // The Memoize over it is keyed on the other side's analysed column.
+        other.column.as_ref()?;
         let (st, tt) = costsize::ordered_index_scan_with(
             &k.rel,
             &k.index,
@@ -5220,13 +5864,7 @@ fn unique_key_other_paths(
         // clause's (`var_eq_non_const`), at most the rows.
         let ppi_rows = costsize::clamp_row_est(k.rel.tuples * k.where_sel / k.ndistinct.max(1.0))
             .min(s.scan.2);
-        let memo_key = MemoKey {
-            ndistinct: other.stats.0,
-            default: false,
-            tuples: other.tuples,
-            rel_rows: other.scan.2,
-            width: other_key,
-        };
+        let memo_key = MemoKey::column(other.stats.0, false, other.tuples, other.scan.2);
         let param = |(startup, total): (f64, f64)| InPath {
             startup,
             total,
@@ -5283,7 +5921,7 @@ fn unique_key_other_paths(
     let mut rel = JoinRel::without_hash(false);
     // The join filter, evaluated on each pair a path's clause passes (a
     // nested loop's every pair), RP-381.
-    rel.set_filter_cost(filter.ops as f64 * costsize::CPU_OPERATOR_COST);
+    rel.set_filter_cost(filter.ops * costsize::CPU_OPERATOR_COST);
     rel.add_paths_general(
         0,
         Some(CLASS),
@@ -5313,7 +5951,7 @@ fn unique_key_other_paths(
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct JoinFilterCost {
     pub(crate) count: usize,
-    pub(crate) ops: usize,
+    pub(crate) ops: f64,
     pub(crate) selectivity: f64,
 }
 
@@ -5321,7 +5959,7 @@ impl Default for JoinFilterCost {
     fn default() -> Self {
         Self {
             count: 0,
-            ops: 0,
+            ops: 0.0,
             selectivity: 1.0,
         }
     }

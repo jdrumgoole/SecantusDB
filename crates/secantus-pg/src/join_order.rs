@@ -2116,7 +2116,7 @@ impl PgHandler {
                 tables |= 1 << table_of(a)?;
             }
             let sel = crate::join_search::filter_selectivity(&f.kind, &nd_of)?;
-            out.push((tables, sel, f.ops as f64, i));
+            out.push((tables, sel, f.ops, i));
         }
         Some(out)
     }
@@ -2136,12 +2136,6 @@ impl PgHandler {
         let side_of = |t: usize, key: &str| {
             let (table, filter) = &search.tables[t];
             self.join_side(table, JoinKey::Column(column_of(key)?), filter, 0)
-        };
-        let width_of = |t: usize, key: &str| {
-            search.widths[t]
-                .iter()
-                .find(|(k, _)| k == key)
-                .map(|(_, w)| *w)
         };
         // Two edges between one pair of tables are several clauses.
         let mut pairs: Vec<(usize, usize)> = search
@@ -2172,13 +2166,12 @@ impl PgHandler {
                 };
                 for (u, u_key) in class.iter().filter(|(ct, _)| *ct != t) {
                     let outer = side_of(*u, u_key)?;
-                    let memo_key = MemoKey {
-                        ndistinct: outer.ndistinct,
-                        default: outer.default_ndistinct,
-                        tuples: outer.tuples,
-                        rel_rows: outer.rows,
-                        width: width_of(*u, u_key)?,
-                    };
+                    let memo_key = MemoKey::column(
+                        outer.ndistinct,
+                        outer.default_ndistinct,
+                        outer.tuples,
+                        outer.rows,
+                    );
                     keys.push((
                         class_id(k),
                         column_of(key)?.to_string(),
@@ -2198,13 +2191,12 @@ impl PgHandler {
                     continue;
                 };
                 let outer = side_of(u, u_key)?;
-                let memo_key = MemoKey {
-                    ndistinct: outer.ndistinct,
-                    default: outer.default_ndistinct,
-                    tuples: outer.tuples,
-                    rel_rows: outer.rows,
-                    width: width_of(u, u_key)?,
-                };
+                let memo_key = MemoKey::column(
+                    outer.ndistinct,
+                    outer.default_ndistinct,
+                    outer.tuples,
+                    outer.rows,
+                );
                 // An outer join's clause moves into a scan of its nullable
                 // side only: the preserved table's index serves no
                 // parameterized scan, only its order.

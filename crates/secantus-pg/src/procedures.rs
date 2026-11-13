@@ -392,6 +392,7 @@ impl PgHandler {
         let by_name: Vec<&Document> = docs
             .iter()
             .filter(|d| d.get_str("_id").is_ok_and(|id| reached.contains(&id)))
+            .map(|d| &**d)
             .collect();
         let shown = |types: &[String]| {
             format!(
@@ -427,6 +428,7 @@ impl PgHandler {
                 let found: Vec<&Document> = docs
                     .iter()
                     .filter(|d| d.get_str("_id").is_ok_and(|id| of_kind.contains(&id)))
+                    .map(|d| &**d)
                     .collect();
                 match found.as_slice() {
                     [one] => one,
@@ -444,7 +446,7 @@ impl PgHandler {
         let Some(mut doc) = raw
             .iter()
             .find(|d| d.get_str("_id") == Ok(id.as_str()))
-            .cloned()
+            .map(|d| Document::clone(d))
         else {
             return Err(error("42883", format!("{noun} {signature} does not exist")));
         };

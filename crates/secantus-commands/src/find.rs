@@ -259,6 +259,91 @@ fn aggregation_refusal(doc: &Document) -> Option<CommandError> {
     Some(CommandError::new(168, "InvalidPipelineOperator", message))
 }
 
+/// mongod's refusal of a `find` whose filter or projection does not parse,
+/// as a reply, in its parser's order: the filter's `$expr`s, an unknown
+/// expression operator, a `$jsonSchema`, then the projection. Each is
+/// refused before any document is read, even on an empty collection, and
+/// before a view or a time-series collection is resolved (RM-483).
+fn parse_problem(doc: &Document, ctx: &CommandContext) -> Result<Option<Document>, CommandError> {
+    let filter = doc_field(doc, "filter");
+    // Each `$expr` is parsed as mongod parses it: a malformed expression is
+    // refused before any document is read.
+    if let Err(f) = crate::aggregate::filter_expr_parse(&filter) {
+        return Ok(Some(crate::aggregate::parse_error(None, &f).into_reply()));
+    }
+    // An unrecognized `$expr` expression operator is rejected by mongod at parse
+    // time (before any scan), so surface `168 InvalidPipelineOperator` regardless
+    // of whether the collection is empty or any doc matches. (The per-doc scan
+    // path would otherwise map it to a generic BadValue.)
+    if let Some(op) = unknown_expr_operator_in_filter(&filter) {
+        return Ok(Some(
+            CommandError::new(
+                168,
+                "InvalidPipelineOperator",
+                format!("Unrecognized expression '{op}'"),
+            )
+            .into_reply(),
+        ));
+    }
+    // Same parse-time treatment for an invalid `$jsonSchema` keyword: mongod
+    // rejects it (9 FailedToParse / 14 TypeMismatch) before any scan, even on
+    // an empty collection — the per-doc path would silently ignore it.
+    if let Some((code, name, msg)) = json_schema_error_in_filter(&filter) {
+        return Ok(Some(CommandError::new(code, name, msg).into_reply()));
+    }
+    // An empty projection means "no projection".
+    let Some(spec) = doc
+        .get("projection")
+        .and_then(Bson::as_document)
+        .filter(|d| !d.is_empty())
+    else {
+        return Ok(None);
+    };
+    // mongod's projection parser, in its order: names, collisions,
+    // inclusion against exclusion, and every expression inside.
+    if let Err(f) = secantus_core::expr_parse::projection_spec(
+        spec,
+        secantus_core::expr_parse::ProjectionKind::Find,
+    ) {
+        return Ok(Some(crate::aggregate::parse_error(None, &f).into_reply()));
+    }
+    // A projection may not mix inclusion and exclusion (except `_id`). mongod
+    // rejects it at parse with a per-field 31254 / 31253 — the exact wording
+    // mongo-node-driver's projection-error tests assert.
+    if let Some(err) = projection_mix_error(spec) {
+        return Ok(Some(err.into_reply()));
+    }
+    // `$meta` projection parse-time validation: an unknown argument is a
+    // Location17308, and `{$meta: "textScore"}` without a `$text` query is a
+    // Location40218. (Recognized-but-unsupported args validate clean here and
+    // are omitted from the result by `apply_projection`.)
+    if let Some(err) = projection_meta_error(spec, &filter) {
+        return Ok(Some(err.into_reply()));
+    }
+    if let Some(e) = projection_expression_error(spec, doc.get("let"), ctx) {
+        return Err(e);
+    }
+    // Projection validation is parse-time in mongod, so an invalid spec
+    // errors even when nothing matches.
+    //
+    // A NAMED error is passed through: the path-collision check answers
+    // mongod's own 31249 / 31250, and rewriting it to a generic BadValue
+    // threw that away. Only a `Defer` -- the positional cases whose exact
+    // Location code (31276 / 31395 / 51246) this engine cannot reproduce --
+    // still falls back to the generic message.
+    let q = (!filter.is_empty()).then_some(&filter);
+    if let Err(err) = secantus_core::projection::validate_projection(spec, q) {
+        let reply = match err {
+            secantus_core::fallback::Fallback::Mongo { code, message, .. } => {
+                CommandError::new(code, crate::util::error_code_name(code), message)
+            }
+            _ => CommandError::new(2, "BadValue", "invalid positional projection"),
+        };
+        return Ok(Some(reply.into_reply()));
+    }
+    Ok(None)
+}
+
 /// `find` — run a query and open a cursor over the results.
 /// Build the aggregate command equivalent to a `find` on a view: the find's
 /// filter / sort / skip / limit / projection become pipeline stages (in that
@@ -499,6 +584,13 @@ fn find_body(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         }
     }
 
+    // mongod parses the find -- its filter and its projection -- before it
+    // resolves a view or a time-series collection, so a find that does not
+    // parse is refused naming what it names, with no `resolvedViews`
+    // (measured 8.2.11, RM-483).
+    if let Some(refused) = parse_problem(doc, ctx)? {
+        return Ok(refused);
+    }
     // A view: translate the find into the equivalent aggregate over the base
     // collection (the find options become pipeline stages after the view's own
     // pipeline) and delegate — the aggregate handler resolves the view. `find` and
@@ -548,29 +640,6 @@ fn find_body(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     }
 
     let filter = doc_field(doc, "filter");
-    // Each `$expr` is parsed as mongod parses it: a malformed expression is
-    // refused before any document is read.
-    if let Err(f) = crate::aggregate::filter_expr_parse(&filter) {
-        return Ok(crate::aggregate::parse_error(None, &f).into_reply());
-    }
-    // An unrecognized `$expr` expression operator is rejected by mongod at parse
-    // time (before any scan), so surface `168 InvalidPipelineOperator` regardless
-    // of whether the collection is empty or any doc matches. (The per-doc scan
-    // path below would otherwise map it to a generic BadValue.)
-    if let Some(op) = unknown_expr_operator_in_filter(&filter) {
-        return Ok(CommandError::new(
-            168,
-            "InvalidPipelineOperator",
-            format!("Unrecognized expression '{op}'"),
-        )
-        .into_reply());
-    }
-    // Same parse-time treatment for an invalid `$jsonSchema` keyword: mongod
-    // rejects it (9 FailedToParse / 14 TypeMismatch) before any scan, even on
-    // an empty collection — the per-doc path would silently ignore it.
-    if let Some((code, name, msg)) = json_schema_error_in_filter(&filter) {
-        return Ok(CommandError::new(code, name, msg).into_reply());
-    }
     // `$text` needs a text index, which this server cannot search: mongod's
     // 27 (measured 8.2.11).
     if let Some((code, errmsg)) =
@@ -597,54 +666,6 @@ fn find_body(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         .get("projection")
         .and_then(Bson::as_document)
         .filter(|d| !d.is_empty());
-    // A projection may not mix inclusion and exclusion (except `_id`). mongod
-    // rejects it at parse with a per-field 31254 / 31253 — the exact wording
-    // mongo-node-driver's projection-error tests assert.
-    if let Some(spec) = projection {
-        // mongod's projection parser, in its order: names, collisions,
-        // inclusion against exclusion, and every expression inside.
-        if let Err(f) = secantus_core::expr_parse::projection_spec(
-            spec,
-            secantus_core::expr_parse::ProjectionKind::Find,
-        ) {
-            return Ok(crate::aggregate::parse_error(None, &f).into_reply());
-        }
-        if let Some(err) = projection_mix_error(spec) {
-            return Ok(err.into_reply());
-        }
-        // `$meta` projection parse-time validation: an unknown argument is a
-        // Location17308, and `{$meta: "textScore"}` without a `$text` query is a
-        // Location40218. (Recognized-but-unsupported args validate clean here and
-        // are omitted from the result by `apply_projection`.)
-        if let Some(err) = projection_meta_error(spec, &filter) {
-            return Ok(err.into_reply());
-        }
-        if let Some(e) = projection_expression_error(spec, doc.get("let"), ctx) {
-            return Err(e);
-        }
-        // Projection validation is parse-time in mongod, so an invalid spec
-        // errors even when nothing matches.
-        //
-        // A NAMED error is passed through: the path-collision check answers
-        // mongod's own 31249 / 31250, and rewriting it to a generic BadValue
-        // threw that away. Only a `Defer` -- the positional cases whose exact
-        // Location code (31276 / 31395 / 51246) this engine cannot reproduce --
-        // still falls back to the generic message.
-        let q = if filter.is_empty() {
-            None
-        } else {
-            Some(&filter)
-        };
-        if let Err(err) = secantus_core::projection::validate_projection(spec, q) {
-            let reply = match err {
-                secantus_core::fallback::Fallback::Mongo { code, message, .. } => {
-                    CommandError::new(code, crate::util::error_code_name(code), message)
-                }
-                _ => CommandError::new(2, "BadValue", "invalid positional projection"),
-            };
-            return Ok(reply.into_reply());
-        }
-    }
     let hint = natural_hint.as_ref().or_else(|| argtypes::given_hint(doc));
     argtypes::require_natural_hint(hint)?;
     let collation = crate::util::effective_collation(storage, &ctx.db_name, &coll, doc)?;

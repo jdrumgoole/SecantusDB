@@ -7,6 +7,12 @@ mongod names a namespace's kind as its operation acquired it: `view` or
 a write, a `getMore`, DDL and any read that failed. A read of a view runs on
 the collection beneath it, and when it fails there its line and entry name
 that collection. An `explain` of a read names what it explains.
+
+A time-series collection's `collMod`, `collStats` and `dropIndexes` run on
+its buckets, whether they succeed or fail, and their line and entry name
+`<db>.system.buckets.ts`; any namespace named `system.buckets.` is
+`timeseriesBuckets`, whether or not a collection is behind it (RM-484,
+measured 8.2.11, 2026-11-13).
 """
 
 from __future__ import annotations
@@ -68,6 +74,27 @@ _OPS: dict[str, Callable[[Any], Any]] = {
         lambda d: list(d.ts.find({"$expr": {"$divide": [1, {"$subtract": ["$m", "$m"]}]}}))
     ),
     "find of a view that does not parse": _refused(lambda d: list(d.v.find({"x": {"$bogus": 1}}))),
+    # A find is parsed, its projection too, before a view or a time-series
+    # collection is resolved; an explained find or distinct is as well
+    # (RM-483).
+    "find of a view whose projection does not parse": _refused(
+        lambda d: list(d.v.find({}, projection={"a": 1, "b": 0}))
+    ),
+    "find of a time-series collection whose projection does not parse": _refused(
+        lambda d: list(d.ts.find({}, projection={"a": {"$bogusop": 1}}))
+    ),
+    "explain of a find of a view whose projection does not parse": _refused(
+        lambda d: d.command("explain", {"find": "v", "projection": {"a": {"$bogusop": 1}}})
+    ),
+    "explain of a find of a time-series collection that does not parse": _refused(
+        lambda d: d.command("explain", {"find": "ts", "filter": {"x": {"$bogus": 1}}})
+    ),
+    "explain of a distinct of a view that does not parse": _refused(
+        lambda d: d.command("explain", {"distinct": "v", "key": "x", "query": {"x": {"$bogus": 1}}})
+    ),
+    "explain of a count of a view that does not parse": _refused(
+        lambda d: d.command("explain", {"count": "v", "query": {"x": {"$bogus": 1}}})
+    ),
     "getMore of an aggregate of a view": lambda d: list(d.v.aggregate([], batchSize=4)),
     "insert into a view": _refused(lambda d: d.v.insert_one({"a": 1})),
     "insert into a time-series collection": lambda d: d.ts.insert_one(
@@ -80,6 +107,36 @@ _OPS: dict[str, Callable[[Any], Any]] = {
     "listIndexes of a time-series collection": lambda d: list(d.ts.list_indexes()),
     "distinct of a view": lambda d: d.v.distinct("x"),
     "distinct of a time-series collection": lambda d: d.ts.distinct("m"),
+    "collMod of a time-series collection": lambda d: d.command(
+        "collMod", "ts", expireAfterSeconds=100
+    ),
+    "collMod of a time-series collection's granularity": lambda d: d.command(
+        "collMod", "ts", timeseries={"granularity": "minutes"}
+    ),
+    "collMod of a time-series collection that fails": _refused(
+        lambda d: d.command("collMod", "ts", expireAfterSeconds=-5)
+    ),
+    "collMod of a time-series collection's missing index": _refused(
+        lambda d: d.command("collMod", "ts", index={"keyPattern": {"nope": 1}, "hidden": True})
+    ),
+    "collStats of a time-series collection": lambda d: d.command("collStats", "ts", scale=1024),
+    "dropIndexes of a time-series collection": lambda d: d.command("dropIndexes", "ts", index="*"),
+    "dropIndexes of a time-series collection's missing index": _refused(
+        lambda d: d.command("dropIndexes", "ts", index="nope")
+    ),
+    "$collStats of a time-series collection": lambda d: list(
+        d.ts.aggregate([{"$collStats": {"storageStats": {}}}])
+    ),
+    "drop of a time-series collection": lambda d: d.drop_collection("ts"),
+    "collStats of a time-series collection's buckets": lambda d: d.command(
+        "collStats", "system.buckets.ts"
+    ),
+    "collStats of a missing buckets collection": lambda d: d.command(
+        "collStats", "system.buckets.nope"
+    ),
+    "insert into a time-series collection's buckets": lambda d: d["system.buckets.ts"].insert_one(
+        {"control": {"version": 1}}
+    ),
 }
 
 
@@ -88,8 +145,9 @@ _OPS: dict[str, Callable[[Any], Any]] = {
 _ENTRY_GAPS = {
     # mongod profiles a drop of a view; this server writes no entry.
     "drop of a view": "RM-384",
-    # mongod profiles no explain of a write; this server profiles one.
-    "explain of an update": "RM-486",
+    # mongod profiles an insert into a buckets collection; this server
+    # writes no entry.
+    "insert into a time-series collection's buckets": "RM-585",
 }
 
 

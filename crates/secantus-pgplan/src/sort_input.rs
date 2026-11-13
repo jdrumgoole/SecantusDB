@@ -308,35 +308,63 @@ pub(crate) fn builtin_procost(name: &str) -> f64 {
     procosts().get(name).copied().unwrap_or(1.0)
 }
 
+/// A built-in function's `procost` where every overload of `name` has
+/// the same one, so the overload a call resolves to cannot change it;
+/// `None` where they differ or the name is not a built-in.
+pub(crate) fn builtin_uniform_procost(name: &str) -> Option<f64> {
+    static MAX: std::sync::OnceLock<std::collections::HashMap<String, f64>> =
+        std::sync::OnceLock::new();
+    let max = MAX.get_or_init(|| {
+        let mut out: std::collections::HashMap<String, f64> = std::collections::HashMap::new();
+        for (name, cost) in function_costs() {
+            out.entry(name)
+                .and_modify(|c| *c = c.max(cost))
+                .or_insert(cost);
+        }
+        out
+    });
+    let low = procosts().get(name)?;
+    (max.get(name) == Some(low)).then_some(*low)
+}
+
+/// Every built-in function's `(name, procost)`, an overload a row.
+fn function_costs() -> Vec<(String, f64)> {
+    let mut out = Vec::new();
+    for line in include_str!("pg15_function_defs.tsv").lines() {
+        let Some((_, def)) = line.split_once('\t') else {
+            continue;
+        };
+        let Some(rest) = def.split_once("FUNCTION pg_catalog.").map(|(_, r)| r) else {
+            continue;
+        };
+        let Some(name) = rest.split_once('(').map(|(n, _)| n.trim_matches('"')) else {
+            continue;
+        };
+        let language = def
+            .split_once(" LANGUAGE ")
+            .and_then(|(_, r)| r.split(['\\', ' ']).next())
+            .unwrap_or("internal");
+        let cost = def
+            .split_once(" COST ")
+            .and_then(|(_, r)| r.split(['\\', ' ']).next())
+            .and_then(|c| c.parse::<f64>().ok())
+            .unwrap_or(if matches!(language, "sql" | "plpgsql") {
+                100.0
+            } else {
+                1.0
+            });
+        out.push((name.to_string(), cost));
+    }
+    out
+}
+
 fn procosts() -> &'static std::collections::HashMap<String, f64> {
     static COSTS: std::sync::OnceLock<std::collections::HashMap<String, f64>> =
         std::sync::OnceLock::new();
     COSTS.get_or_init(|| {
         let mut out: std::collections::HashMap<String, f64> = std::collections::HashMap::new();
-        for line in include_str!("pg15_function_defs.tsv").lines() {
-            let Some((_, def)) = line.split_once('\t') else {
-                continue;
-            };
-            let Some(rest) = def.split_once("FUNCTION pg_catalog.").map(|(_, r)| r) else {
-                continue;
-            };
-            let Some(name) = rest.split_once('(').map(|(n, _)| n.trim_matches('"')) else {
-                continue;
-            };
-            let language = def
-                .split_once(" LANGUAGE ")
-                .and_then(|(_, r)| r.split(['\\', ' ']).next())
-                .unwrap_or("internal");
-            let cost = def
-                .split_once(" COST ")
-                .and_then(|(_, r)| r.split(['\\', ' ']).next())
-                .and_then(|c| c.parse::<f64>().ok())
-                .unwrap_or(if matches!(language, "sql" | "plpgsql") {
-                    100.0
-                } else {
-                    1.0
-                });
-            out.entry(name.to_string())
+        for (name, cost) in function_costs() {
+            out.entry(name)
                 .and_modify(|c| *c = c.min(cost))
                 .or_insert(cost);
         }
