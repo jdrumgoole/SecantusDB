@@ -72,15 +72,70 @@ def test_the_sort_key_passes_through_stages_that_keep_it(rust_mongo: Any, mongod
     assert _answers(rust_mongo, pipelines) == _answers(mongod, pipelines)
 
 
-@pytest.mark.backlog("RM-521")
+@pytest.mark.backlog_fixed("RM-521")
 def test_a_lookup_sub_pipeline_sort_sets_the_key(rust_mongo: Any, mongod: Any) -> None:
     """In a `$lookup` sub-pipeline, mongod 8.2.11 ranks by the key its
-    `$sort` set; this server's sub-pipeline sees none and ties them all."""
+    `$sort` set and gives it as `{$meta: "sortKey"}`; this server's
+    sub-pipeline saw none and tied them all, until RM-521 rewrote the
+    sub-pipeline's sort metadata as the top-level pipeline's is."""
+    meta = {"$addFields": {"m": {"$meta": "sortKey"}}}
     pipelines = {
         "sub-pipeline": [
             {"$limit": 1},
             {"$lookup": {"from": "c", "pipeline": [{"$sort": {"k": 1}}, RANK], "as": "j"}},
-        ]
+        ],
+        "$meta": [
+            {"$limit": 1},
+            {"$lookup": {"from": "c", "pipeline": [{"$sort": {"k": 1, "n": -1}}, meta], "as": "j"}},
+        ],
+        "join fields and a pipeline": [
+            {"$limit": 2},
+            {
+                "$lookup": {
+                    "from": "c",
+                    "localField": "k",
+                    "foreignField": "k",
+                    "pipeline": [{"$sort": {"n": -1}}, RANK, meta],
+                    "as": "j",
+                }
+            },
+        ],
+        "no $sort": [
+            {"$limit": 1},
+            {"$lookup": {"from": "c", "pipeline": [RANK, meta], "as": "j"}},
+        ],
+        "$match after the $sort": [
+            {"$limit": 1},
+            {
+                "$lookup": {
+                    "from": "c",
+                    "pipeline": [
+                        {"$sort": {"k": 1}},
+                        {"$match": {"$expr": {"$eq": [{"$meta": "sortKey"}, None]}}},
+                    ],
+                    "as": "j",
+                }
+            },
+        ],
+        "nested $lookup": [
+            {"$limit": 1},
+            {
+                "$lookup": {
+                    "from": "c",
+                    "pipeline": [
+                        {"$limit": 1},
+                        {
+                            "$lookup": {
+                                "from": "c",
+                                "pipeline": [{"$sort": {"k": 1}}, RANK],
+                                "as": "jj",
+                            }
+                        },
+                    ],
+                    "as": "j",
+                }
+            },
+        ],
     }
     assert _answers(rust_mongo, pipelines) == _answers(mongod, pipelines)
 

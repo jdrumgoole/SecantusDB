@@ -1592,16 +1592,35 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       partition key, then `sortBy`). This server ends the key at each
       (`agg_meta::KEEPS_SORT_METADATA`), so a `$_internalSetWindowFields`
       after one ranks every document 1 and `{$meta: "sortKey"}` reads `[]`.
-      Found 2026-11-10 (RM-410).
+      Found 2026-11-10 (RM-410). When `$lookup` keeps the key, the outer
+      rewrite's `replace_with` must not reach into its `pipeline`: that
+      sub-pipeline's `{$meta: "sortKey"}` reads its own key (RM-521).
       Verify: tests/backlog/test_rm_found_2026_11_10_rm410.py::test_the_sort_key_passes_through_stages_that_keep_it
       Backlog-ID: RM-520
-- [ ] **A `$lookup` sub-pipeline's `$sort` sets no sort key.** In a
-      `$lookup` pipeline, mongod 8.2.11 ranks a `$_internalSetWindowFields`
-      by the key the sub-pipeline's `$sort` set; this server does not run
-      `agg_meta::rewrite_sort_metadata` over a sub-pipeline, so every
-      document ties. Found 2026-11-10 (RM-410).
-      Verify: tests/backlog/test_rm_found_2026_11_10_rm410.py::test_a_lookup_sub_pipeline_sort_sets_the_key
-      Backlog-ID: RM-521
+- [ ] **A `$unionWith` sub-pipeline's `$sort` sets no sort key.** In a
+      `$unionWith` pipeline, mongod 8.2.11 ranks a
+      `$_internalSetWindowFields` by the key the sub-pipeline's `$sort` set
+      and gives it as `{$meta: "sortKey"}`; this server ties every document
+      and refuses the `$meta` (code 2). The same gap RM-521 closed for
+      `$lookup` (`apply_union_with` does not run
+      `agg_meta::rewrite_sort_metadata`). Found 2026-11-13 (RM-521).
+      Verify: tests/backlog/test_rm_found_2026_11_13_rm521.py::test_a_union_with_sub_pipeline_sort_sets_the_key
+      Backlog-ID: RM-624
+- [ ] **`{$meta: "sortKey"}` in a `$facet` is refused, not `[]`.** mongod
+      8.2.11 gives `[]` in a `$facet` pipeline, behind the facet's own
+      `$sort` too (its ranks tie there, which this server matches); this
+      server refuses the `$meta` with code 2. Found 2026-11-13 (RM-521).
+      Verify: tests/backlog/test_rm_found_2026_11_13_rm521.py::test_a_facet_sort_key_is_empty
+      Backlog-ID: RM-625
+- [ ] **A rank behind `$documents` and a `$sort` is answered, not
+      refused.** mongod 8.2.11 refuses a `$_internalSetWindowFields`
+      `$rank` there with 9973200 "Attempt to get sort key which has not been
+      populated", collectionless and in a `$lookup` pipeline alike; this
+      server ties the first and ranks the second by the `$sort`. Cause in
+      mongod not traced (RM-522 and RM-523 are the nearest shapes). Found
+      2026-11-13 (RM-521).
+      Verify: tests/backlog/test_rm_found_2026_11_13_rm521.py::test_a_sort_behind_documents_sets_no_key
+      Backlog-ID: RM-626
 - [ ] **A rank with no sort key at all is answered, not refused.** After a
       `$group` or a `$unionWith` a document carries no sort key
       (`{$meta: "sortKey"}` is missing there, not `[]`), and mongod 8.2.11
