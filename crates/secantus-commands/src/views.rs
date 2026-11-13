@@ -99,6 +99,16 @@ fn write_target(stage: &Document, db: &str) -> Option<(String, String)> {
     }
 }
 
+/// Whether mongod profiles `name`'s refusal of a view: a `listIndexes` or a
+/// `collStats` takes the view's namespace before it finds it is not a
+/// collection, and mongod 8.2.11 profiles it there (`<db>.v`, `ok: 0`, the
+/// refusal's `errCode`). A `findAndModify`, `createIndexes`, `dropIndexes`
+/// or `validate` of a view it profiles nowhere (measured 8.2.11,
+/// 2026-11-13, RM-488).
+pub(crate) fn refusal_is_profiled(name: &str) -> bool {
+    matches!(name, "listIndexes" | "collStats" | "collstats")
+}
+
 /// The reply to a command mongod refuses on a view, or `None` to run it.
 pub(crate) fn refusal(name: &str, doc: &Document, ctx: &CommandContext) -> Option<Document> {
     let storage = ctx.storage.as_ref()?;
@@ -133,6 +143,19 @@ pub(crate) fn refusal(name: &str, doc: &Document, ctx: &CommandContext) -> Optio
             let errors: Vec<Document> = (0..reported)
                 .map(|i| doc! { "index": i as i32, "code": 166_i32, "errmsg": msg.clone() })
                 .collect();
+            // Each statement it tried has a line of its own before the
+            // command's, an insert's none (measured 8.2.11, RM-487).
+            if name != "insert" {
+                let op = if name == "update" { "update" } else { "remove" };
+                let specs = doc.get_array(statements).map(Vec::as_slice).unwrap_or(&[]);
+                let in_txn = doc.get("autocommit") == Some(&Bson::Boolean(false));
+                let _slow = crate::slowop::enter(ctx);
+                let _current = crate::lock_manager::enter(ctx.locks.as_ref());
+                for (spec, error) in specs.iter().zip(&errors) {
+                    let spec = spec.as_document().cloned().unwrap_or_default();
+                    crate::profiler::refused_statement(db, coll, op, &spec, error, doc, !in_txn);
+                }
+            }
             let mut reply = doc! { "n": 0_i32 };
             if name == "update" {
                 reply.insert("nModified", 0_i32);

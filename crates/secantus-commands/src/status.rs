@@ -43,6 +43,7 @@
 //! zero standing in for something not counted is a lie. (`locks` joined the
 //! reported sections when the lock manager landed — RM-034, 2026-10-17.)
 
+use crate::util::ReplyOk;
 use std::sync::atomic::{AtomicI64, Ordering::Relaxed};
 use std::time::Duration;
 
@@ -82,12 +83,19 @@ fn mechanism_index(name: &str) -> Option<usize> {
 struct CommandSlot {
     total: AtomicI64,
     failed: AtomicI64,
+    /// Refused by a query setting's `reject: true` (411
+    /// `QueryRejectedBySettings`): counted here and in `total`, never in
+    /// `failed`, as mongod 8.2.11 counts it.
+    rejected: AtomicI64,
     array_filters: AtomicI64,
     pipeline: AtomicI64,
     validator_total: AtomicI64,
     validator_failed: AtomicI64,
     validator_json_schema: AtomicI64,
 }
+
+/// 411 `QueryRejectedBySettings`: a read a query setting refuses.
+const QUERY_REJECTED_BY_SETTINGS: i32 = 411;
 
 /// mongod's assertion counters wrap at 2^30.
 const ASSERT_ROLLOVER: i64 = 1 << 30;
@@ -204,7 +212,7 @@ impl StatusCounters {
             return;
         };
         let name = name.as_str();
-        let ok = reply.get_f64("ok").unwrap_or(0.0) == 1.0;
+        let ok = reply.ok_number().unwrap_or(0.0) == 1.0;
         let code = reply.get_i32("code").unwrap_or(0);
         let micros = elapsed.as_micros().min(i64::MAX as u128) as i64;
         // A command that did not parse never ran: mongod times it as a
@@ -227,7 +235,7 @@ impl StatusCounters {
             return;
         }
         if let Some(i) = command_slot(name).filter(|_| parsed) {
-            self.count_command(&self.commands[i], name, request, ok);
+            self.count_command(&self.commands[i], name, request, ok, code);
         }
         if !ok {
             self.assert_user(1);
@@ -248,10 +256,21 @@ impl StatusCounters {
         }
     }
 
-    fn count_command(&self, slot: &CommandSlot, name: &str, request: &Document, ok: bool) {
+    fn count_command(
+        &self,
+        slot: &CommandSlot,
+        name: &str,
+        request: &Document,
+        ok: bool,
+        code: i32,
+    ) {
         slot.total.fetch_add(1, Relaxed);
         if !ok {
-            slot.failed.fetch_add(1, Relaxed);
+            if code == QUERY_REJECTED_BY_SETTINGS {
+                slot.rejected.fetch_add(1, Relaxed);
+            } else {
+                slot.failed.fetch_add(1, Relaxed);
+            }
         }
         let statements: Vec<(bool, bool)> = match name {
             "update" => request
@@ -456,10 +475,12 @@ impl StatusCounters {
                     "arrayFilters": load(&slot.array_filters),
                     "failed": load(&slot.failed),
                     "pipeline": load(&slot.pipeline),
+                    "rejected": load(&slot.rejected),
                     "total": load(&slot.total),
                 },
                 "create" | "collMod" => doc! {
                     "failed": load(&slot.failed),
+                    "rejected": load(&slot.rejected),
                     "total": load(&slot.total),
                     "validator": {
                         "failed": load(&slot.validator_failed),
@@ -467,7 +488,11 @@ impl StatusCounters {
                         "total": load(&slot.validator_total),
                     },
                 },
-                _ => doc! { "failed": load(&slot.failed), "total": load(&slot.total) },
+                _ => doc! {
+                    "failed": load(&slot.failed),
+                    "rejected": load(&slot.rejected),
+                    "total": load(&slot.total),
+                },
             };
             out.insert(*name, entry);
         }
@@ -590,6 +615,32 @@ mod tests {
                 d.get_i64("returned").unwrap()
             ),
             (1, 1)
+        );
+    }
+
+    #[test]
+    fn a_query_settings_refusal_counts_rejected_not_failed() {
+        let s = StatusCounters::default();
+        let rejected = doc! {"ok": 0.0, "code": 411, "codeName": "QueryRejectedBySettings",
+        "errmsg": "Query rejected by admin query settings"};
+        let failed = doc! {"ok": 0.0, "code": 2, "codeName": "BadValue", "errmsg": "x"};
+        s.record(&doc! {"find": "c"}, &rejected, 0, Duration::ZERO);
+        s.record(&doc! {"find": "c"}, &failed, 0, Duration::ZERO);
+        let commands = s.commands();
+        let find = commands.get_document("find").unwrap();
+        assert_eq!(
+            find,
+            &doc! {"failed": 1_i64, "rejected": 1_i64, "total": 2_i64}
+        );
+        let update = commands.get_document("update").unwrap();
+        assert_eq!(
+            update.keys().collect::<Vec<_>>(),
+            ["arrayFilters", "failed", "pipeline", "rejected", "total"]
+        );
+        let create = commands.get_document("create").unwrap();
+        assert_eq!(
+            create.keys().collect::<Vec<_>>(),
+            ["failed", "rejected", "total", "validator"]
         );
     }
 

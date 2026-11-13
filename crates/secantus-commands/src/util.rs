@@ -539,10 +539,26 @@ pub(crate) fn read_error_on_namespace(err: StorageError, command: &str, ns: &str
     }
 }
 
-/// Map a storage error to a command-level `CommandError` (for non-batch
-/// commands like `count` / `find`). Read commands never carry an
-/// execution-time update error, so this drops the flag; `findAndModify`, which
-/// does, goes through [`command_error_during`].
+/// A reply's `ok` read as a number, whatever its BSON type, as mongod reads
+/// one: a view's `distinct` answers an int32 `ok`, where a collection's is a
+/// double, and `get_f64("ok")` took that for a failure (RM-490). It answers
+/// what `get_f64` would for a double, so a reader keeps its own default.
+pub(crate) trait ReplyOk {
+    fn ok_number(&self) -> bson::document::ValueAccessResult<f64>;
+}
+
+impl ReplyOk for Document {
+    fn ok_number(&self) -> bson::document::ValueAccessResult<f64> {
+        match self.get("ok") {
+            Some(Bson::Double(n)) => Ok(*n),
+            Some(Bson::Int32(n)) => Ok(f64::from(*n)),
+            Some(Bson::Int64(n)) => Ok(*n as f64),
+            Some(_) => Err(bson::document::ValueAccessError::UnexpectedType),
+            None => Err(bson::document::ValueAccessError::NotPresent),
+        }
+    }
+}
+
 /// Whether `reply` answers `ok: 1`, whatever its numeric type: a view's
 /// `distinct` answers an int32 one, as mongod's does.
 pub(crate) fn reply_ok(reply: &Document) -> bool {
@@ -557,7 +573,7 @@ pub(crate) fn reply_ok(reply: &Document) -> bool {
 /// Whether `reply` refuses a command that did not parse: mongod never ran
 /// it, so it is no statement of a transaction and no run of the command.
 pub(crate) fn did_not_parse(reply: &Document) -> bool {
-    reply.get_f64("ok").unwrap_or(0.0) != 1.0
+    reply.ok_number().unwrap_or(0.0) != 1.0
         && (matches!(reply.get_i32("code").unwrap_or(0), 16 | 40414 | 40415)
             || reply.get_str("errmsg").is_ok_and(|m| {
                 m.starts_with("BSON field '")
@@ -566,6 +582,10 @@ pub(crate) fn did_not_parse(reply: &Document) -> bool {
             }))
 }
 
+/// Map a storage error to a command-level `CommandError` (for non-batch
+/// commands like `count` / `find`). Read commands never carry an
+/// execution-time update error, so this drops the flag; `findAndModify`, which
+/// does, goes through [`command_error_during`].
 pub(crate) fn command_error(err: StorageError) -> CommandError {
     command_error_during(err, "")
 }
@@ -711,6 +731,21 @@ mod tests {
         assert!(!super::reply_ok(&doc! {"ok": 0.0}));
         assert!(!super::reply_ok(&doc! {"ok": 0_i32}));
         assert!(!super::reply_ok(&doc! {}));
+    }
+
+    /// A reply's `ok` reads as a number whatever its type, so a reader that
+    /// counts or logs a command does not take a view's int32 `ok` from
+    /// `distinct` for a failure (RM-490); a missing one keeps its default.
+    #[test]
+    fn a_replys_ok_reads_as_a_number_whatever_its_type() {
+        use super::ReplyOk;
+        use bson::doc;
+        assert_eq!(doc! {"ok": 1.0}.ok_number(), Ok(1.0));
+        assert_eq!(doc! {"ok": 1_i32}.ok_number(), Ok(1.0));
+        assert_eq!(doc! {"ok": 1_i64}.ok_number(), Ok(1.0));
+        assert_eq!(doc! {"ok": 0_i32}.ok_number(), Ok(0.0));
+        assert_eq!(doc! {}.ok_number().unwrap_or(1.0), 1.0);
+        assert!(doc! {"ok": "yes"}.ok_number().is_err());
     }
 
     /// mongod wraps an EXECUTION-time update error and leaves a parse error

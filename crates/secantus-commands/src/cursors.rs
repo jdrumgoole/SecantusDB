@@ -16,6 +16,7 @@
 //! `Storage` trait yet). Cursor *creation* (`find` / `aggregate` / `watch`) also
 //! lands later; until then cursors are registered programmatically.
 
+use crate::util::ReplyOk;
 use std::collections::{HashMap, VecDeque};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -197,6 +198,11 @@ struct Entry {
     time_limited: bool,
     /// The session, and the transaction of it, that opened the cursor.
     owner: Option<CursorOwner>,
+    /// The command that opened the cursor ran under a write concern, which
+    /// its `getMore`s run under too: mongod's `ClientCursor` keeps its
+    /// opener's, and a `find`'s is none, even where the find runs as an
+    /// `aggregate` (a view's, a time-series collection's; RM-489).
+    write_concern: bool,
     /// The `(db, user)` principals authenticated when the cursor was
     /// opened: only a session of the same users may read or kill it.
     users: Vec<(String, String)>,
@@ -308,6 +314,8 @@ pub struct CursorOwner {
 struct Opener {
     owner: Option<CursorOwner>,
     users: Vec<(String, String)>,
+    /// The command runs under a write concern (`opdebug::has_write_concern`).
+    write_concern: bool,
 }
 
 thread_local! {
@@ -317,22 +325,31 @@ thread_local! {
         std::cell::RefCell::new(Opener {
             owner: None,
             users: Vec::new(),
+            write_concern: false,
         })
     };
 }
 
 /// Run `f` as the command of `owner`'s session.
 pub fn with_owner<R>(owner: Option<CursorOwner>, f: impl FnOnce() -> R) -> R {
-    with_opener(owner, Vec::new(), f)
+    with_opener(owner, Vec::new(), false, f)
 }
 
-/// Run `f` as the command of `owner`'s session, authenticated as `users`.
+/// Run `f` as the command of `owner`'s session, authenticated as `users`,
+/// under a write concern when `write_concern`.
 pub fn with_opener<R>(
     owner: Option<CursorOwner>,
     users: Vec<(String, String)>,
+    write_concern: bool,
     f: impl FnOnce() -> R,
 ) -> R {
-    let outer = OWNER.with(|o| o.replace(Opener { owner, users }));
+    let outer = OWNER.with(|o| {
+        o.replace(Opener {
+            owner,
+            users,
+            write_concern,
+        })
+    });
     let result = f();
     OWNER.with(|o| o.replace(outer));
     result
@@ -344,6 +361,10 @@ fn current_owner() -> Option<CursorOwner> {
 
 fn current_users() -> Vec<(String, String)> {
     OWNER.with(|o| o.borrow().users.clone())
+}
+
+fn current_write_concern() -> bool {
+    OWNER.with(|o| o.borrow().write_concern)
 }
 
 /// Why the calling connection may not read cursor `id`: it was opened by
@@ -387,6 +408,8 @@ pub struct CursorInfo {
     pub change_stream: bool,
     /// A streaming cursor (`register_stream`).
     pub streaming: bool,
+    /// Its opener ran under a write concern, which its `getMore`s name.
+    pub write_concern: bool,
 }
 
 /// A `currentOp`-style description of a live cursor (no mutable state leaked).
@@ -498,6 +521,7 @@ impl CursorRegistry {
                 time_limited: false,
                 owner: current_owner(),
                 users: current_users(),
+                write_concern: current_write_concern(),
                 stream: None,
                 streaming: false,
                 locks_internally: false,
@@ -549,6 +573,7 @@ impl CursorRegistry {
                 time_limited: false,
                 owner: current_owner(),
                 users: current_users(),
+                write_concern: current_write_concern(),
                 stream: None,
                 streaming: false,
                 locks_internally: false,
@@ -579,6 +604,7 @@ impl CursorRegistry {
             has_remaining: !e.remaining.is_empty(),
             change_stream: e.change_stream,
             streaming: e.streaming,
+            write_concern: e.write_concern,
         })
     }
 
@@ -678,6 +704,7 @@ impl CursorRegistry {
         e.owner = old.owner.take();
         e.users = std::mem::take(&mut old.users);
         e.time_limited = old.time_limited;
+        e.write_concern = old.write_concern;
         // The client's cursor reads on: what closing it runs is not run yet.
         e.on_close = old.on_close.take().or(e.on_close.take());
         inner.cursors.insert(into, e);
@@ -1260,7 +1287,7 @@ pub fn get_more(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     // wouldn't tell a tailing client why its tail ended.
     let dropped = cursors.was_dropped(cursor_id);
     if info.streaming {
-        return stream_get_more(cursor_id, batch_size, &ns, dropped, ctx);
+        return stream_get_more(cursor_id, batch_size, &ns, dropped, info.write_concern, ctx);
     }
     if let Some(reason) = dropped {
         cursors.kill(&[cursor_id]);
@@ -1428,6 +1455,7 @@ pub fn get_more(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
                 exhausted,
                 plan_summary: counts.plan_summary,
                 originating_command: Some(origin),
+                write_concern: info.write_concern,
                 has_sort_stage: counts.has_sort_stage,
                 exec_stages: None,
                 write_run: None,
@@ -1459,6 +1487,7 @@ fn stream_get_more(
     batch_size: Option<i64>,
     ns: &str,
     dropped: Option<String>,
+    write_concern: bool,
     ctx: &mut CommandContext,
 ) -> HandlerResult {
     let cursors = ctx
@@ -1485,7 +1514,11 @@ fn stream_get_more(
         }
     }
     if let Some(command) = stream.deferred() {
-        return deferred_get_more(cursor_id, batch_size, ns, command, stream, &cursors, ctx);
+        let reply = deferred_get_more(cursor_id, batch_size, ns, command, stream, &cursors, ctx);
+        if let Some(e) = ctx.exec_stats.as_mut() {
+            e.write_concern = write_concern;
+        }
+        return reply;
     }
     let storage = ctx
         .storage
@@ -1520,6 +1553,7 @@ fn stream_get_more(
         exhausted: batch.exhausted,
         plan_summary: stream.plan_summary(),
         originating_command: Some(stream.originating_command()),
+        write_concern,
         has_sort_stage: stream.has_sort_stage(),
         exec_stages: ctx
             .profiling
@@ -1608,7 +1642,7 @@ fn deferred_get_more(
     cursor.insert("batchSize", Bson::Int64(size));
     run.insert("cursor", cursor);
     let reply = match crate::aggregate::aggregate(&run, ctx) {
-        Ok(reply) if reply.get_f64("ok") != Ok(0.0) => reply,
+        Ok(reply) if reply.ok_number() != Ok(0.0) => reply,
         Ok(reply) => {
             cursors.return_stream(cursor_id, stream, true);
             return Ok(reply);
@@ -1637,6 +1671,8 @@ fn deferred_get_more(
         exhausted: opened == 0,
         plan_summary: None,
         originating_command: Some(command),
+        // The caller's: the cursor the client holds.
+        write_concern: false,
         has_sort_stage: false,
         exec_stages: None,
         write_run: None,
@@ -2042,6 +2078,27 @@ mod tests {
         let cur = reply.get_document("cursor").unwrap();
         assert_eq!(c.pending_batch.as_ref().unwrap().batch.len(), 1);
         assert_eq!(cur.get_i64("id").unwrap(), 0, "exhausted ⇒ id 0");
+    }
+
+    #[test]
+    fn a_cursor_keeps_its_openers_write_concern() {
+        // mongod's `ClientCursor` keeps its opener's write concern, which
+        // its `getMore`s run under; a deferred cursor's pipeline, run by its
+        // first `getMore`, reads on under the client's id with the client's
+        // opener's (RM-489).
+        let reg = CursorRegistry::new();
+        let concerned = with_opener(None, Vec::new(), true, || {
+            reg.register("db.c", vec![b"x".to_vec(), b"y".to_vec()])
+                .unwrap()
+        });
+        let plain = with_owner(None, || {
+            reg.register("db.c", vec![b"x".to_vec(), b"y".to_vec()])
+                .unwrap()
+        });
+        assert!(reg.info(concerned).unwrap().write_concern);
+        assert!(!reg.info(plain).unwrap().write_concern);
+        assert!(reg.adopt(plain, concerned));
+        assert!(reg.info(concerned).unwrap().write_concern);
     }
 
     #[test]

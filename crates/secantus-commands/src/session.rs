@@ -15,6 +15,7 @@
 //!   (`retriedStmtIds`) and runs the rest.
 //! * A cursor belongs to the session, and the transaction, that opened it.
 
+use crate::util::ReplyOk;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
@@ -264,8 +265,12 @@ pub(crate) fn run(
     if let Some(s) = ctx.storage.as_ref() {
         s.set_oplog_session(txn_session);
     }
-    let reply =
-        crate::cursors::with_opener(owner, users, || run_checked(name, handler, doc, ctx, &env));
+    // A cursor the command opens keeps whether it runs under a write
+    // concern, as mongod's keeps its opener's (RM-489).
+    let write_concern = crate::opdebug::has_write_concern(doc);
+    let reply = crate::cursors::with_opener(owner, users, write_concern, || {
+        run_checked(name, handler, doc, ctx, &env)
+    });
     if let Some(s) = ctx.storage.as_ref() {
         s.set_oplog_session(None);
     }
@@ -957,7 +962,7 @@ fn statement(
     }
     crate::finish_txn_statement(registry, txn, &mut result);
     if let Some(ns) = target {
-        if result.get_f64("ok").unwrap_or(0.0) == 1.0 && !result.contains_key("writeErrors") {
+        if result.ok_number().unwrap_or(0.0) == 1.0 && !result.contains_key("writeErrors") {
             let wrote = match name {
                 "insert" => crate::util::as_i64_field(&result, "n") > 0,
                 "update" => result.contains_key("upserted"),
@@ -1043,7 +1048,7 @@ fn txn_write_targets(name: &str, doc: &Document, db_name: &str) -> Vec<(String, 
 // ------------------------------------------------------------ retryable writes
 
 fn ok(reply: &Document) -> bool {
-    reply.get_f64("ok").unwrap_or(0.0) == 1.0
+    reply.ok_number().unwrap_or(0.0) == 1.0
 }
 
 /// The statement id of each of a write command's `count` statements:

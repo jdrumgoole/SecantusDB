@@ -18,6 +18,7 @@
 //! has an entry of its own (`op: "update"` / `"remove"`, the statement as its
 //! `command`), and the command itself has none.
 
+use crate::util::ReplyOk;
 use std::cell::{Cell, RefCell};
 use std::time::Instant;
 
@@ -245,7 +246,7 @@ fn ends_in_out(doc: &Document) -> bool {
 /// words a wrong-typed field its own way (`Expected field filterto be of
 /// type object`, mongod's spelling).
 fn refused_unprofiled(name: &str, reply: &Document) -> bool {
-    if reply.get_f64("ok").unwrap_or(1.0) == 1.0 {
+    if reply.ok_number().unwrap_or(1.0) == 1.0 {
         // `drop` of a collection that does not exist answers ok, profiled
         // nowhere (measured). A view's drop answers `{ns, ok}`, with no
         // index count, and is profiled as a collection's (RM-384).
@@ -727,12 +728,15 @@ fn execution(name: &str, doc: &Document, ok: bool, ctx: &CommandContext, entry: 
     if replicated {
         entry.insert("readConcern", crate::opdebug::read_concern(doc));
     }
-    let concerned = match ctx
-        .exec_stats
-        .as_ref()
-        .and_then(|e| e.originating_command.as_ref())
-    {
-        Some(origin) if name == "getMore" => Some(origin),
+    // A `getMore` runs under the write concern its cursor was opened
+    // under: the opening `aggregate`'s, and none for a `find`'s, even one
+    // run as an `aggregate` (RM-489).
+    let concerned = match ctx.exec_stats.as_ref().and_then(|e| {
+        e.originating_command
+            .as_ref()
+            .map(|origin| (origin, e.write_concern))
+    }) {
+        Some((origin, opened_under)) if name == "getMore" => opened_under.then_some(origin),
         _ => crate::opdebug::takes_write_concern(name).then_some(doc),
     };
     if let Some(origin) = concerned.filter(|o| replicated && crate::opdebug::has_write_concern(o)) {
@@ -1504,6 +1508,66 @@ fn hint(spec: &Document, out: &mut Document) {
         }
         None => {}
     }
+}
+
+/// An `update` or `delete` statement `spec` of `db.coll` refused with
+/// `error` because the namespace is a view (RM-487). mongod acquires the
+/// namespace for the write, finds a view, refuses the statement and writes
+/// its `Slow query` line (`<db>.v`, `normal`, `ok: 0`, the refusal) before
+/// the command's, one line per statement it tried: the first alone of an
+/// ordered batch, each of an unordered one. Its acquisition is a write
+/// round (`round`), which a transaction's statement does not take here:
+/// its locks are the transaction's. The statement has no plan, so the line
+/// has no plan, hashes or counts, and no profile entry (measured 8.2.11).
+pub(crate) fn refused_statement(
+    db: &str,
+    coll: &str,
+    op: &'static str,
+    spec: &Document,
+    error: &Document,
+    request: &Document,
+    round: bool,
+) {
+    if !crate::slowop::armed() {
+        return;
+    }
+    let start = Instant::now();
+    let cpu = crate::opdebug::thread_cpu_nanos();
+    drop(round.then(|| crate::lock_manager::write_rounds(db, coll, 1)));
+    let worked = start.elapsed();
+    if !crate::slowop::will_log(worked) {
+        return;
+    }
+    let command = if op == "update" {
+        update_statement(spec)
+    } else {
+        delete_statement(spec)
+    };
+    let statement = Statement {
+        ns: format!("{db}.{coll}"),
+        db: db.to_string(),
+        op,
+        command,
+        outcome: StatementOutcome::Failed(error.clone()),
+        millis: worked.as_millis() as i64,
+        ran: Ran {
+            locks: crate::lock_manager::operation_locks(false),
+            flow_control: crate::lock_manager::flow_control_tickets(),
+            took_global: crate::lock_manager::took_global(),
+            read_concern: crate::slowop::replicated()
+                .then(|| crate::opdebug::read_concern(request)),
+            cpu_nanos: cpu
+                .zip(crate::opdebug::thread_cpu_nanos())
+                .map(|(a, b)| b - a),
+            storage: crate::opdebug::storage_section(
+                None,
+                crate::lock_manager::execution_admission().as_deref(),
+            ),
+            remote: crate::slowop::remote(),
+            ..Ran::default()
+        },
+    };
+    crate::slowop::statement_line("WRITE", statement.log_attributes(), worked);
 }
 
 #[cfg(test)]

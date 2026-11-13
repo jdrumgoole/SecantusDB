@@ -1314,7 +1314,7 @@ fn run_dispatch(
             // A successful drop resets the namespace's counters -- probed on
             // mongod 8.3.4, where a dropped-and-recreated collection restarts
             // from zero rather than carrying its history forward.
-            if name == "drop" && reply.get_f64("ok").unwrap_or(0.0) == 1.0 {
+            if name == "drop" && reply_ok(&reply) {
                 shared.top_stats.forget(&ns);
             }
         }
