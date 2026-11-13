@@ -1228,13 +1228,6 @@ These are explicit non-goals. Don't add them without a reason.
   2026-11-07 and 2026-11-10). Found with RM-302.
   Backlog-ID: RM-305
   Verify: tests/backlog/test_rm_001_028.py::test_startup_writes_the_storage_and_startup_complete_lines
-- [ ] **`buildInfo` names the architecture as Rust does.** mongod 8.2.11 on
-  macOS arm64 gives `arm64` as `buildEnvironment.distarch` and
-  `target_arch` (and in the `Build Info` startup line); this server gives
-  Rust's `std::env::consts::ARCH`, `aarch64` (measured 2026-11-10). Found
-  while working RM-305.
-  Backlog-ID: RM-500
-  Verify: tests/backlog/test_rm_found_2026_11_10.py::test_build_info_names_the_architecture_as_mongod_does
 - [ ] **A command its handler fails to parse is counted as a connection's
   first command.** mongod 8.2.11 writes `Received first command on ingress
   connection` (6788700) when a command is about to run: one its IDL parse,

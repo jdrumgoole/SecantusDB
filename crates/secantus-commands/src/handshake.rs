@@ -641,6 +641,18 @@ pub fn build_info(_doc: &Document, _ctx: &mut CommandContext) -> HandlerResult {
     Ok(reply)
 }
 
+/// The build's architecture as mongod names it in `buildInfo`'s
+/// `buildEnvironment` (`distarch`, `target_arch`) and the `Build Info`
+/// startup line. mongod takes the platform's own name, not the compiler's:
+/// macOS arm64 mongod 8.2.11 says `arm64` (measured 2026-11-13), where Rust's
+/// `std::env::consts::ARCH` says `aarch64`; Linux names agree with Rust's
+/// (`x86_64`, and `aarch64` on Linux arm64).
+pub const BUILD_ARCH: &str = if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+    "arm64"
+} else {
+    std::env::consts::ARCH
+};
+
 /// What `buildInfo` reports, without its `ok`: also the `buildinfo` of each
 /// `local.startup_log` record, as mongod writes both from one builder.
 pub fn build_info_document() -> Document {
@@ -660,13 +672,13 @@ pub fn build_info_document() -> Document {
         "openssl": {"running": "rustls"},
         "buildEnvironment": {
             "distmod": "",
-            "distarch": std::env::consts::ARCH,
+            "distarch": BUILD_ARCH,
             "cc": "rustc",
             "ccflags": "",
             "cxx": "",
             "cxxflags": "",
             "linkflags": "",
-            "target_arch": std::env::consts::ARCH,
+            "target_arch": BUILD_ARCH,
             "target_os": std::env::consts::OS,
             "cppdefines": "",
         },
@@ -847,6 +859,21 @@ mod tests {
 
     fn code_of(doc: Document) -> Option<i32> {
         validate_awaitable_arguments(&doc, 3).err().map(|e| e.code)
+    }
+
+    /// `buildInfo` names the architecture as mongod's build for the same
+    /// platform does: `arm64` on macOS arm64 (8.2.11), Rust's name elsewhere.
+    #[test]
+    fn build_environment_names_the_architecture_as_mongod_does() {
+        let info = build_info_document();
+        let env = info.get_document("buildEnvironment").unwrap();
+        let expected = if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+            "arm64"
+        } else {
+            std::env::consts::ARCH
+        };
+        assert_eq!(env.get_str("distarch").unwrap(), expected);
+        assert_eq!(env.get_str("target_arch").unwrap(), expected);
     }
 
     /// mongod's parse of the awaitable-hello arguments, measured 8.2.11.
