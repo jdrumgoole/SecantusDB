@@ -662,6 +662,11 @@ fn execution(name: &str, doc: &Document, ok: bool, ctx: &CommandContext, entry: 
     if let (true, Some(e)) = (ok, &ctx.exec_stats) {
         entry.insert("keysExamined", e.keys_examined);
         entry.insert("docsExamined", e.docs_examined);
+        // A `distinct` of a view ran an aggregation whose cursor it read to
+        // the end (RM-493; measured 8.2.11).
+        if e.exhausted {
+            entry.insert("cursorExhausted", true);
+        }
         if let Some(stages) = &e.exec_stages {
             entry.insert("execStats", stages.clone());
         }

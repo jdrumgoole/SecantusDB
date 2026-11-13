@@ -133,6 +133,7 @@ pub fn truthy(v: &Bson) -> bool {
 /// arguments and reading the arity out of its own message, not from docs.
 /// Mirrors `expressions._FIXED_ARITY`.
 const FIXED_ARITY: &[(&str, usize)] = &[
+    ("$_internalFindAllValuesAtPath", 1),
     ("$abs", 1),
     ("$acos", 1),
     ("$acosh", 1),
@@ -898,6 +899,7 @@ pub fn check_required_fields(op: &str, arg: &Bson) -> Result<(), Fallback> {
         "$sigmoid" => return sigmoid_parse(arg),
         "$switch" => return switch_parse(arg),
         "$sortArray" => return sort_array_parse(arg),
+        "$_internalFindAllValuesAtPath" => return find_all_values_path(arg).map(|_| ()),
         "$similarityCosine" | "$similarityDotProduct" | "$similarityEuclidean" => {
             return similarity_parse(op, arg).map(|_| ())
         }
@@ -1235,6 +1237,7 @@ fn apply_classic(op: &str, arg: &Bson, ctx: &Ctx) -> R {
         "$isNumber" => op_is_number(arg, ctx),
         "$isArray" => op_is_array(arg, ctx),
         "$toHashedIndexKey" => op_to_hashed_index_key(arg, ctx),
+        "$_internalFindAllValuesAtPath" => op_find_all_values_at_path(arg, ctx),
         "$strcasecmp" => op_strcasecmp(arg, ctx),
         "$replaceOne" => op_replace(arg, ctx, false),
         "$replaceAll" => op_replace(arg, ctx, true),
@@ -1411,6 +1414,7 @@ pub const KNOWN_EXPR_OPS: &[&str] = &[
     "$isNumber",
     "$isArray",
     "$toHashedIndexKey",
+    "$_internalFindAllValuesAtPath",
     "$strcasecmp",
     "$replaceOne",
     "$replaceAll",
@@ -9912,6 +9916,64 @@ fn op_is_number(arg: &Bson, ctx: &Ctx) -> R {
 /// [`crate::hashed`]). The argument is one expression, an array literal
 /// included: `{$toHashedIndexKey: [1]}` hashes the array `[1]`, and a missing
 /// value hashes as null (mongod 8.2.11).
+/// `$_internalFindAllValuesAtPath`'s path, as mongod 8.2.11's parser takes
+/// it: one constant (a `$literal` included, in a list of one or not), a
+/// string, a valid `FieldPath` (measured 2026-11-13). A list of another
+/// length is the 16020 arity check's.
+fn find_all_values_path(arg: &Bson) -> Result<Option<&str>, Fallback> {
+    let arg = match arg {
+        Bson::Array(a) if a.len() == 1 => &a[0],
+        Bson::Array(_) => return Ok(None),
+        other => other,
+    };
+    let constant = match arg {
+        Bson::String(s) if s.starts_with('$') => None,
+        Bson::Document(d) if d.len() == 1 => d.get("$literal").or_else(|| d.get("$const")),
+        Bson::Document(_) | Bson::Array(_) => None,
+        other => Some(other),
+    };
+    let Some(constant) = constant else {
+        return Err(Fallback::mongo(
+            5511201,
+            "Expected const expression as argument to _internalFindAllValuesAtPath",
+        )
+        .bare());
+    };
+    let Bson::String(path) = constant else {
+        return Err(Fallback::mongo(
+            9567004,
+            "$_internalFindAllValuesAtPath requires argument to be a string",
+        )
+        .bare());
+    };
+    if let Some(e) = crate::expr_parse::field_path_error(path) {
+        return Err(e);
+    }
+    Ok(Some(path))
+}
+
+/// `$_internalFindAllValuesAtPath`: every value at a dotted path, as a
+/// collection's `distinct` reads them -- an array met on the way is walked,
+/// one at its end gives its elements -- once each, in BSON order under the
+/// collation (mongod's `BSONElementSet`). mongod runs a `distinct` of a
+/// view through it (RM-493).
+fn op_find_all_values_at_path(arg: &Bson, ctx: &Ctx) -> R {
+    let Some(path) = find_all_values_path(arg)? else {
+        return Err(Fallback::Defer);
+    };
+    let (found, _) = crate::get_path_values(ctx.doc, path);
+    let mut values: Vec<Bson> = Vec::new();
+    for v in found {
+        match v {
+            Bson::Array(items) => values.extend(items.iter().cloned()),
+            other => values.push(other.clone()),
+        }
+    }
+    values.sort_by(crate::order::cmp);
+    values.dedup_by(|later, first| crate::order::cmp(later, first) == std::cmp::Ordering::Equal);
+    Ok(Bson::Array(values))
+}
+
 fn op_to_hashed_index_key(arg: &Bson, ctx: &Ctx) -> R {
     let v = eval(arg, ctx)?;
     Ok(Bson::Int64(crate::hashed::hash64(&v, is_missing(&v))))
@@ -12614,5 +12676,58 @@ mod added_in_82_tests {
         let _gate = gate_fcv(true);
         let gated = refused("$similarityEuclidean", Bson::Array(vec![]));
         assert_eq!(gated.as_mongo().unwrap().0, 224);
+    }
+}
+
+#[cfg(test)]
+mod find_all_values_at_path_tests {
+    //! `$_internalFindAllValuesAtPath`, which mongod 8.2.11 runs a `distinct`
+    //! of a view through (RM-493; measured 2026-11-13).
+    use super::*;
+    use bson::{bson, doc};
+
+    fn values(doc: &Document, arg: Bson) -> Result<Bson, Fallback> {
+        evaluate(
+            doc,
+            &bson!({"$_internalFindAllValuesAtPath": arg}),
+            &Document::new(),
+        )
+    }
+
+    fn code(r: Result<Bson, Fallback>) -> i32 {
+        r.expect_err("refused")
+            .as_mongo()
+            .expect("mongod's error")
+            .0
+    }
+
+    #[test]
+    fn reads_every_value_once_in_order() {
+        let d = doc! {"a": {"b": [1, 2, [3, 4], {"c": 1}]}};
+        assert_eq!(
+            values(&d, bson!("a.b")).unwrap(),
+            bson!([1, 2, {"c": 1}, [3, 4]])
+        );
+        let d = doc! {"a": [{"b": 1}, {"b": [5, 1.0]}, {"b": null}]};
+        assert_eq!(values(&d, bson!(["a.b"])).unwrap(), bson!([null, 1, 5]));
+        assert_eq!(
+            values(&d, bson!({"$literal": "a.0"})).unwrap(),
+            bson!([{"b": 1}])
+        );
+        assert_eq!(values(&doc! {}, bson!("a.b")).unwrap(), bson!([]));
+    }
+
+    #[test]
+    fn parses_as_mongod_does() {
+        assert_eq!(code(values(&doc! {}, bson!(1))), 9567004);
+        assert_eq!(code(values(&doc! {}, Bson::Null)), 9567004);
+        assert_eq!(code(values(&doc! {}, bson!("$a.b"))), 5511201);
+        assert_eq!(
+            code(values(&doc! {}, bson!({"$concat": ["a", ".b"]}))),
+            5511201
+        );
+        assert_eq!(code(values(&doc! {}, bson!(""))), 40352);
+        assert_eq!(code(values(&doc! {}, bson!("a..b"))), 15998);
+        assert_eq!(code(values(&doc! {}, bson!("a.$b"))), 16410);
     }
 }

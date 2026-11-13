@@ -150,36 +150,10 @@ pub fn distinct(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     let mut stages: Option<Document> = None;
     let mut values: Vec<Bson> = if on_view {
         crate::views::check_hint(storage, &ctx.db_name, &coll, hint, &filter)?;
-        // The view's pipeline, then the query: what mongod plans, and
-        // `notablescan` judges, whether or not it is set (RM-381).
-        let tail = if filter.is_empty() {
-            Vec::new()
-        } else {
-            vec![Bson::Document(bson::doc! { "$match": filter.clone() })]
-        };
-        let (base, pipeline) = crate::aggregate::resolve_view(storage, &ctx.db_name, &coll, tail)?;
-        let (query, sort) = crate::explain::pipeline_query(&base, &pipeline);
-        crate::notablescan::plan_and_check(
-            ctx,
-            &crate::notablescan::Read {
-                coll: &base,
-                filter: &query,
-                sort: sort.as_ref(),
-                hint: None,
-                collation: collation.as_ref(),
-                shown: Default::default(),
-            },
-        )?;
-        document_values(
-            &crate::aggregate::collection_documents(
-                storage,
-                &ctx.db_name,
-                &coll,
-                &filter,
-                collation.as_ref(),
-            )?,
-            &key,
-        )
+        match view_values(ctx, &coll, &key, &filter, hint, collation.as_ref())? {
+            Ok(values) => values,
+            Err(refused) => return Ok(refused),
+        }
     } else {
         let read = crate::notablescan::Read {
             coll: &coll,
@@ -267,6 +241,75 @@ pub fn distinct(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         });
     }
     Ok(doc! { "values": values, "ok": 1.0 })
+}
+
+/// A `distinct` of a view, run as mongod 8.2.11 runs it: the aggregation
+/// over the view that `ParsedDistinctCommand::asAggregationCommand` builds
+/// (the query's `$match`, then every value at `key` as one document each,
+/// gathered by a `$group`; its `explain` prints it, measured 2026-11-13),
+/// under the view's collation. Its plan is the one the line names, and what
+/// that plan examined and its exhausted cursor are the command's (RM-493).
+/// `Err`: the aggregation's refusal, as its reply.
+fn view_values(
+    ctx: &mut CommandContext,
+    view: &str,
+    key: &str,
+    filter: &Document,
+    hint: Option<&Bson>,
+    collation: Option<&secantus_core::collation::Collation>,
+) -> Result<Result<Vec<Bson>, Document>, CommandError> {
+    let mut pipeline: Vec<Bson> = Vec::new();
+    if !filter.is_empty() {
+        pipeline.push(Bson::Document(doc! { "$match": filter.clone() }));
+    }
+    pipeline.extend([
+        Bson::Document(doc! { "$replaceRoot": { "newRoot": {
+            "_internalUnwoundArray": { "$_internalFindAllValuesAtPath": key }
+        } } }),
+        Bson::Document(doc! { "$unwind": {
+            "path": "$_internalUnwoundArray",
+            "preserveNullAndEmptyArrays": true,
+        } }),
+        Bson::Document(doc! { "$group": {
+            "_id": Bson::Null,
+            "distinct": { "$addToSet": "$_internalUnwoundArray" },
+        } }),
+    ]);
+    let mut agg = doc! {
+        "aggregate": view,
+        "pipeline": pipeline,
+        "cursor": {},
+        "collation": match collation {
+            Some(c) => c.spec().clone(),
+            None => doc! { "locale": "simple" },
+        },
+    };
+    if let Some(hint) = hint {
+        agg.insert("hint", hint.clone());
+    }
+    let reply = crate::aggregate::aggregate_inline(&agg, ctx)?;
+    if !crate::util::reply_ok(&reply) {
+        return Ok(Err(reply));
+    }
+    let cursor = reply.get_document("cursor").ok();
+    let values = cursor
+        .and_then(|c| c.get_array("firstBatch").ok())
+        .and_then(|b| b.first())
+        .and_then(Bson::as_document)
+        .and_then(|d| d.get_array("distinct").ok())
+        .cloned()
+        .unwrap_or_default();
+    // A `$group` answers in one batch: the cursor is exhausted, and the
+    // read's counts are the command's, not a cursor's.
+    let mut stats = ctx
+        .exec_stats
+        .take()
+        .or_else(crate::opdebug::take_examined)
+        .unwrap_or_default();
+    stats.exhausted = cursor.and_then(|c| c.get_i64("id").ok()).unwrap_or(0) == 0;
+    stats.cursor_id = 0;
+    ctx.exec_stats = Some(stats);
+    Ok(Ok(values))
 }
 
 /// The values of `key`, read as mongod's plan for the `distinct` reads them

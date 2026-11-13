@@ -7,7 +7,7 @@ from typing import Any
 
 import pytest
 
-from tests.backlog.opdebug import logged, seed
+from tests.backlog.opdebug import fresh, logged, seed
 
 
 def _setup(db: Any) -> None:
@@ -134,12 +134,13 @@ def test_a_distinct_of_a_view_of_no_collection_says_how_long_it_planned(
     assert got["rust"] == got["mongod"]
 
 
-@pytest.mark.backlog("RM-493")
+@pytest.mark.backlog_fixed("RM-493")
 def test_a_distinct_of_a_view_counts_what_it_examined(rust_mongo: Any, mongod_rs: Any) -> None:
     """mongod 8.2.11's line for a `distinct` of a view counts the keys and
     documents its plan beneath the view examined, and says its cursor is
-    exhausted, as an `aggregate` of the view does; this server's says
-    neither (measured 2026-11-10, found while working RM-381)."""
+    exhausted, as an `aggregate` of the view does; this server's said
+    neither (measured 2026-11-10, found while working RM-381): it read the
+    view another way, where mongod runs the aggregation it prints."""
     got = {}
     for server, client, is_mongod in (("rust", rust_mongo, False), ("mongod", mongod_rs, True)):
         lines, _ = logged(client, is_mongod, _setup, lambda d: d.v.distinct("y"))
@@ -152,23 +153,66 @@ def test_a_distinct_of_a_view_counts_what_it_examined(rust_mongo: Any, mongod_rs
     assert got["rust"] == got["mongod"]
 
 
+#: What a line says of the plan it ran, and of the cache key it planned under.
+_PLAN = ("planSummary", "planCacheShapeHash", "planCacheKey", "queryFramework")
+
+
+@pytest.mark.backlog_fixed("RM-494")
+def test_an_aggregate_of_a_view_names_the_plan_beneath(rust_mongo: Any, mongod_rs: Any) -> None:
+    """mongod 8.2.11's lines for an `aggregate` of a view whose pipeline
+    bounds the index on `x` name the plan over the collection beneath
+    (`IXSCAN { x: 1 }`), with the cache hashes of that aggregate of the
+    collection, its `getMore`s too; this server's named a `COLLSCAN`, with
+    hashes of its own (measured 2026-11-10 and 2026-11-13, found while
+    working RM-381)."""
+    ops = (
+        lambda d: list(d.v.aggregate([{"$group": {"_id": "$y"}}])),
+        lambda d: list(d.v.aggregate([{"$match": {"x": {"$lt": 5}}}])),
+        lambda d: list(d.v.aggregate([], batchSize=4)),
+    )
+    got: dict = {"rust": [], "mongod": []}
+    for op in ops:
+        name = fresh("rm494")
+        for server, client, is_mongod in (
+            ("rust", rust_mongo, False),
+            ("mongod", mongod_rs, True),
+        ):
+            lines, _ = logged(client, is_mongod, _setup, op, name=name)
+            got[server] += [
+                (next(iter(attr.get("command", {})), ""), *(attr.get(k) for k in _PLAN))
+                for _, attr in lines
+            ]
+    assert [g[:2] for g in got["mongod"]] == [
+        ("aggregate", "IXSCAN { x: 1 }"),
+        ("aggregate", "IXSCAN { x: 1 }"),
+        ("aggregate", "IXSCAN { x: 1 }"),
+        ("getMore", "IXSCAN { x: 1 }"),
+        ("getMore", "IXSCAN { x: 1 }"),
+    ]
+    assert got["rust"] == got["mongod"]
+
+
 @pytest.mark.backlog("RM-494")
-def test_a_count_and_an_aggregate_of_a_view_name_the_plan_beneath(
-    rust_mongo: Any, mongod_rs: Any
-) -> None:
-    """mongod 8.2.11's lines for a `count_documents` and a `$group` of a view
-    whose pipeline bounds the index on `x` name the plans that read it
-    (`COUNT_SCAN { x: 1 }`, `IXSCAN { x: 1 }`); this server's name a
-    `COLLSCAN` (measured 2026-11-10, found while working RM-381)."""
-    got = {}
-    for server, client, is_mongod in (("rust", rust_mongo, False), ("mongod", mongod_rs, True)):
-        summaries = []
-        for op in (
-            lambda d: d.v.count_documents({}),
-            lambda d: list(d.v.aggregate([{"$group": {"_id": "$y"}}])),
+def test_a_count_documents_runs_a_count_scan(rust_mongo: Any, mongod_rs: Any) -> None:
+    """mongod 8.2.11 runs a `count_documents` -- a `$match` and a `$group`
+    that reads no field -- whose filter bounds the index on `x` as a
+    `COUNT_SCAN { x: 1 }` that examines no document, of a view as of the
+    collection beneath it; this server's line names an `IXSCAN { x: 1 }`
+    and counts the 11 documents it fetched (measured 2026-11-13)."""
+    ops = (
+        lambda d: d.v.count_documents({}),
+        lambda d: d.c.count_documents({"x": {"$gte": 1}}),
+    )
+    got: dict = {"rust": [], "mongod": []}
+    for op in ops:
+        for server, client, is_mongod in (
+            ("rust", rust_mongo, False),
+            ("mongod", mongod_rs, True),
         ):
             lines, _ = logged(client, is_mongod, _setup, op)
-            summaries += [attr.get("planSummary") for _, attr in lines]
-        got[server] = summaries
-    assert got["mongod"] == ["COUNT_SCAN { x: 1 }", "IXSCAN { x: 1 }"]
+            got[server] += [
+                (attr.get("planSummary"), attr.get("keysExamined"), attr.get("docsExamined"))
+                for _, attr in lines
+            ]
+    assert got["mongod"] == [("COUNT_SCAN { x: 1 }", 11, 0)] * 2
     assert got["rust"] == got["mongod"]

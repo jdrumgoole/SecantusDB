@@ -146,21 +146,31 @@ fn plan_info_with(
     let name = request.keys().next().map(String::as_str).unwrap_or("");
     let mut out = PlanInfo::default();
     // A read of a view is the view's pipeline over its collection, with the
-    // read's query after it: planned as that `aggregate`.
+    // read's query -- or an `aggregate`'s own pipeline -- after it: planned
+    // as that `aggregate`. mongod 8.2.11 names the plan over the collection
+    // beneath (`COUNT_SCAN { x: 1 }` for a `count_documents` of a view
+    // bounding `x`, `IXSCAN { x: 1 }` for a `$group`) and prints that
+    // aggregate's cache hashes (RM-494, measured 2026-11-13).
     if let Some(Bson::String(coll)) = request.get(name) {
-        if matches!(name, "find" | "count" | "distinct") && crate::views::is_view(storage, db, coll)
+        if matches!(name, "find" | "count" | "distinct" | "aggregate")
+            && crate::views::is_view(storage, db, coll)
         {
-            let mut tail: Vec<Bson> = Vec::new();
-            let filter = match name {
-                "find" => request.get_document("filter").ok(),
-                _ => request.get_document("query").ok(),
+            let tail: Vec<Bson> = if name == "aggregate" {
+                request.get_array("pipeline").cloned().unwrap_or_default()
+            } else {
+                let mut tail = Vec::new();
+                let filter = match name {
+                    "find" => request.get_document("filter").ok(),
+                    _ => request.get_document("query").ok(),
+                };
+                if let Some(f) = filter.filter(|f| !f.is_empty()) {
+                    tail.push(Bson::Document(doc! { "$match": f.clone() }));
+                }
+                if let Ok(sort) = request.get_document("sort") {
+                    tail.push(Bson::Document(doc! { "$sort": sort.clone() }));
+                }
+                tail
             };
-            if let Some(f) = filter.filter(|f| !f.is_empty()) {
-                tail.push(Bson::Document(doc! { "$match": f.clone() }));
-            }
-            if let Ok(sort) = request.get_document("sort") {
-                tail.push(Bson::Document(doc! { "$sort": sort.clone() }));
-            }
             let Ok((base, pipeline)) = crate::aggregate::resolve_view(storage, db, coll, tail)
             else {
                 return out;

@@ -223,16 +223,15 @@ pub(crate) fn failure(reply: &Document, out: &mut Document) {
     out.insert("errCode", code);
 }
 
-/// The collection a command names: its own value, `getMore`'s
-/// `collection`, or the collection of the read an `explain` explains
-/// (`find`, `aggregate`, `count`, `distinct`; mongod's line for an `explain`
-/// of a write names `<db>.$cmd`, measured 8.2.11, RM-380). A `validate`
-/// names none: mongod's validates its collection without taking its
-/// namespace for the operation, so its line names `<db>.$cmd` whether it
-/// validated a collection or refused a view (measured 8.2.11, RM-485).
+/// The collection a command names: its own value when it is one of
+/// [`names_its_collection`], `getMore`'s `collection`, or the collection of
+/// the read an `explain` explains (`find`, `aggregate`, `count`, `distinct`;
+/// mongod's line for an `explain` of a write names `<db>.$cmd`, measured
+/// 8.2.11, RM-380). Any other command names none, whatever its value says:
+/// a `dataSize`'s full namespace, a `getLog`'s log, a `ping: "c"`
+/// (RM-495).
 fn target_collection<'a>(name: &str, request: &'a Document) -> Option<&'a str> {
     let target = match name {
-        "validate" => return None,
         "getMore" => request.get("collection"),
         "explain" => {
             let inner = request.get_document("explain").ok()?;
@@ -242,12 +241,55 @@ fn target_collection<'a>(name: &str, request: &'a Document) -> Option<&'a str> {
             }
             inner.get(read)
         }
-        _ => request.get(name),
+        _ if names_its_collection(name) => request.get(name),
+        _ => return None,
     };
     match target {
         Some(bson::Bson::String(coll)) if !coll.is_empty() => Some(coll.as_str()),
         _ => None,
     }
+}
+
+/// Whether mongod's operation for `name` takes the collection its value
+/// names as its namespace, so the line names `<db>.<value>`: the commands
+/// whose line mongod 8.2.11 writes so (a sweep of every command in its
+/// `listCommands` with a string value, 2026-11-13, RM-495). Every other
+/// command -- `validate` (RM-485), `dataSize`, `getLog`, `dbCheck`,
+/// `setIndexCommitQuorum`, and those whose value is not a collection at all
+/// (`ping: "c"`) -- names `<db>.$cmd`. An `update` or a `delete` names
+/// its collection here and `<db>.$cmd` on the line ([`attributes`]).
+fn names_its_collection(name: &str) -> bool {
+    matches!(
+        name,
+        "find"
+            | "aggregate"
+            | "count"
+            | "distinct"
+            | "insert"
+            | "update"
+            | "delete"
+            | "findAndModify"
+            | "findandmodify"
+            | "mapReduce"
+            | "mapreduce"
+            | "create"
+            | "drop"
+            | "collMod"
+            | "collStats"
+            | "collstats"
+            | "createIndexes"
+            | "dropIndexes"
+            | "deleteIndexes"
+            | "listIndexes"
+            | "killCursors"
+            | "planCacheClear"
+            | "planCacheClearFilters"
+            | "planCacheListFilters"
+            | "planCacheSetFilter"
+            | "compact"
+            | "reIndex"
+            | "convertToCapped"
+    )
 }
 
 /// The database and collection a line names. A `renameCollection` runs
@@ -266,12 +308,27 @@ fn line_target<'a>(
     if crate::opdebug::refused_before_acquiring(name, reply) {
         return (db, None);
     }
-    if name != "renameCollection" {
-        return (db, target_collection(name, request));
+    let ran = reply.ok_number().unwrap_or(1.0) == 1.0;
+    match name {
+        "renameCollection" => {}
+        // These take a collection's namespace only once they have run: one
+        // that failed -- `compact` or `reIndex` on a replica-set member
+        // (IllegalOperation), a source that does not exist, a missing
+        // `size`, a clone's target that exists or is no name -- names
+        // `<db>.$cmd`, and a clone that ran names the collection it made
+        // (measured 8.2.11, RM-495).
+        "cloneCollectionAsCapped" => {
+            let target = request
+                .get_str("toCollection")
+                .ok()
+                .filter(|c| !c.is_empty());
+            return (db, target.filter(|_| ran));
+        }
+        "compact" | "reIndex" | "convertToCapped" if !ran => return (db, None),
+        _ => return (db, target_collection(name, request)),
     }
-    let renamed = reply.ok_number().unwrap_or(1.0) == 1.0;
     match request.get_str(name).ok().and_then(|ns| ns.split_once('.')) {
-        Some((source_db, coll)) if renamed && !source_db.is_empty() && !coll.is_empty() => {
+        Some((source_db, coll)) if ran && !source_db.is_empty() && !coll.is_empty() => {
             (source_db, Some(coll))
         }
         _ => (db, None),
@@ -857,6 +914,53 @@ mod tests {
         assert_eq!(ns(drop(), refused(26)), "a.$cmd");
         assert_eq!(ns(drop(), refused(27)), "a.v");
         assert_eq!(ns(drop(), doc! {"ok": 1.0}), "a.v");
+    }
+
+    /// A command whose string value is not its collection names
+    /// `<db>.$cmd`; `compact`, `reIndex`, `convertToCapped` and
+    /// `cloneCollectionAsCapped` name a collection only once they ran, the
+    /// clone its target, as mongod 8.2.11's lines do (RM-495).
+    #[test]
+    fn a_string_value_names_a_collection_only_for_a_command_that_takes_one() {
+        let ns = |request: Document, reply: Document| {
+            let attr = attributes(
+                &request,
+                &reply,
+                Document::new(),
+                "a",
+                Duration::ZERO,
+                Duration::ZERO,
+            );
+            attr.get_str("ns").unwrap().to_string()
+        };
+        let ok = || doc! {"ok": 1.0};
+        let refused = |code: i32| doc! {"ok": 0.0, "code": code, "errmsg": "x"};
+        assert_eq!(ns(doc! {"dataSize": "a.c"}, refused(73)), "a.$cmd");
+        assert_eq!(ns(doc! {"dataSize": "a.c"}, ok()), "a.$cmd");
+        assert_eq!(
+            ns(doc! {"getLog": "startupWarnings"}, refused(13)),
+            "a.$cmd"
+        );
+        assert_eq!(ns(doc! {"ping": "c"}, ok()), "a.$cmd");
+        assert_eq!(ns(doc! {"dbCheck": "c"}, ok()), "a.$cmd");
+        assert_eq!(ns(doc! {"compact": "c"}, refused(20)), "a.$cmd");
+        assert_eq!(ns(doc! {"compact": "c"}, ok()), "a.c");
+        assert_eq!(ns(doc! {"reIndex": "c"}, refused(20)), "a.$cmd");
+        assert_eq!(ns(doc! {"reIndex": "c"}, ok()), "a.c");
+        assert_eq!(ns(doc! {"convertToCapped": "c"}, refused(72)), "a.$cmd");
+        let clone = || doc! {"cloneCollectionAsCapped": "c", "toCollection": "k", "size": 1_i32};
+        assert_eq!(ns(clone(), ok()), "a.k");
+        assert_eq!(ns(clone(), refused(48)), "a.$cmd");
+        for name in [
+            "find",
+            "insert",
+            "create",
+            "collMod",
+            "listIndexes",
+            "killCursors",
+        ] {
+            assert_eq!(ns(doc! {name: "c"}, ok()), "a.c", "{name}");
+        }
     }
 
     /// A read of a view that failed is named where it failed, beneath the

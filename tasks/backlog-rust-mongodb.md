@@ -1058,50 +1058,66 @@ These are explicit non-goals. Don't add them without a reason.
       2026-11-13.
       Verify: tests/backlog/test_rm_view_namespaces.py::test_a_change_stream_of_a_view_writes_no_line
       Backlog-ID: RM-593
-- [ ] **A `distinct` of a view counts nothing it examined.** mongod 8.2.11
-      runs it as an aggregation over the collection beneath the view, and
-      its line counts what that plan examined (`keysExamined: 11,
-      docsExamined: 11, cursorExhausted: true` over an `IXSCAN { x: 1 }`),
-      as an `aggregate` of the view's does here; this server reads the
-      view's documents another way (`aggregate::collection_documents`) and
-      prints none of the three. Since RM-381 it plans that read, for the
-      `planningTimeMicros`, without running it. Found while working
-      RM-381, 2026-11-10.
-      Verify: tests/backlog/test_rm_view_lines.py::test_a_distinct_of_a_view_counts_what_it_examined
-      Backlog-ID: RM-493
-- [ ] **A `count` or `aggregate` of a view names a COLLSCAN beneath it.**
-      Over a view `{$match: {x: {$gte: 1}}}` on a collection indexed on
-      `x`, mongod 8.2.11's line for a `count_documents({})` names
-      `COUNT_SCAN { x: 1 }` (`docsExamined: 0`) and for a `$group` names
-      `IXSCAN { x: 1 }`; this server's name `COLLSCAN`, while counting 11
-      keys and 11 documents examined. Its explain of such a `count` is
-      RM-072. Found while working RM-381, 2026-11-10.
-      Verify: tests/backlog/test_rm_view_lines.py::test_a_count_and_an_aggregate_of_a_view_name_the_plan_beneath
+- [ ] **A `count_documents` names an `IXSCAN` where mongod runs a
+      `COUNT_SCAN`.** A `count_documents` is a `$match` and a `$group` that
+      reads no field. Where its filter bounds the index on `x` -- of a
+      collection, or of a view `{$match: {x: {$gte: 1}}}` over it -- mongod
+      8.2.11 runs a `COUNT_SCAN { x: 1 }` that examines 11 keys and no
+      document; this server fetches the 11 documents through an
+      `IXSCAN { x: 1 }`, and its line says so. A line's `planSummary` is
+      planned from the catalog (`explain/summary.rs`), and naming a
+      `COUNT_SCAN` there would name a plan that did not run: the executor
+      has to run the count scan first, which is the SBE `GROUP` over a
+      `COUNT_SCAN` of RM-071 (its explain of a view's `count` is RM-072).
+      An `aggregate` of a view otherwise names the plan beneath it since
+      2026-11-13. Found while working RM-381, 2026-11-10.
+      Verify: tests/backlog/test_rm_view_lines.py::test_a_count_documents_runs_a_count_scan
       Backlog-ID: RM-494
-- [ ] **A `Slow query` line takes a command's string argument for its
-      collection.** mongod 8.2.11's lines for a `dataSize: "<db>.c"`, a
-      `getLog` and a `compact: "c"` name `<db>.$cmd`; this server's name
-      `<db>.<db>.c`, `<db>.startupWarnings` and `<db>.c`
-      (`slowop::target_collection` reads any command's string value as
-      one; a `validate`'s names `<db>.$cmd` since RM-485). Found while
-      working RM-383, 2026-11-10; `compact` measured while working RM-485,
+- [ ] **A bare `"$"` is read as a missing field, not refused.** mongod
+      8.2.11 refuses `"$"` wherever an expression parses an operand (16872
+      "'$' by itself is not a valid FieldPath"): `{$project: {f: "$"}}`,
+      `{$toUpper: "$"}`, `{$concat: ["$", "x"]}`. This server answers each
+      as if it named a missing field (`{}`, `""`, `null`), and
+      `{$_internalFindAllValuesAtPath: "$"}` with that operator's 5511201.
+      The check belongs with the operand parse (`expr_parse::operand`),
+      before any operator's own. Found while working RM-493, 2026-11-13.
+      Verify: tests/backlog/test_rm_found_rm493.py::test_a_bare_dollar_is_no_field_path
+      Backlog-ID: RM-594
+- [ ] **A `Slow query` line names a collection a command refused before
+      it acquired one.** mongod 8.2.11's line for a `create` of a
+      collection that exists (which succeeds) and for a `findAndModify`
+      with neither `update` nor `remove` (FailedToParse) names `<db>.$cmd`;
+      this server's names `<db>.c`. Found while working RM-495, 2026-11-13.
+      Verify: tests/backlog/test_rm_found_2026_11_13_rm495.py::test_a_command_refused_before_it_acquires_its_collection_names_cmd
+      Backlog-ID: RM-595
+- [ ] **A `Slow query` line names a command's value, not the collection it
+      works through.** mongod 8.2.11's line for a `filemd5` names its
+      root's chunks (`<db>.fs.chunks`), for a `convertToCapped` the
+      temporary collection it builds (`<db>.tmpXXXXX.convertToCapped.c`),
+      for a `rolesInfo` of a role `admin.system.roles`; this server's name
+      `<db>.$cmd`, `<db>.c` and `<db>.$cmd`. Found while working RM-495,
       2026-11-13.
-      (This was RM-480: A `dataSize` line names `<db>.<db>.c`.) mongod 8.2.1's
-      `Slow query` line for a `dataSize`, whose argument is a full namespace,
-      names `<db>.$cmd`; this server's joins the command's database to the
-      argument. Found while working RM-378, 2026-11-09.
-      Verify: tests/backlog/test_rm_drop_reports.py::test_a_command_s_string_argument_is_not_its_collection, tests/backlog/test_rm_slow_query_namespace.py::test_a_data_size_line_names_its_own_namespace
-      Backlog-ID: RM-495
+      Verify: tests/backlog/test_rm_found_2026_11_13_rm495.py::test_a_line_names_the_collection_a_command_works_through
+      Backlog-ID: RM-596
+- [ ] **`deleteIndexes` is refused as a command this server does not
+      know.** mongod 8.2.11 runs it as `dropIndexes`'s alias; this server
+      answers CommandNotFound (59), though its lock, view and time-series
+      tables already list it. Found while working RM-495, 2026-11-13.
+      Verify: tests/backlog/test_rm_found_2026_11_13_rm495.py::test_delete_indexes_is_drop_indexes
+      Backlog-ID: RM-597
 - [ ] **Operations this server runs another way than mongod's plan say
       less.** Since RM-023 a read or a write's read that a stream runs as
       mongod's plan counts its keys and documents examined, and since
       RM-359 its profile entry carries its stages (`execStats`); these do
       neither:
       - a read two or more plans could serve, which mongod chooses by
-        trial, other than a `find`'s: an `aggregate`'s, a `count`'s, a
-        `distinct`'s, a write's. Its documents come from the store's
+        trial, other than a `find`'s or an `aggregate`'s that streams: an
+        `aggregate` that sorts or groups what its `$match` reads (mongod:
+        133 keys and documents over 400, this server none), a `count`'s,
+        a `distinct`'s, a write's. Its documents come from the store's
         router. mongod counts what the winner examined in its trial, and
-        since RM-349 a `find` streams the winner after its trial's buffer
+        since RM-349 a `find` (since 2026-11-13 an unsorted `aggregate` of
+        stages that stream) streams the winner after its trial's buffer
         and counts as mongod's does; the other readers still decline a
         contested plan (`order::stream_plan`);
       - a read of a time-series collection made whole: under a `$sort`, a
@@ -1112,9 +1128,28 @@ These are explicit non-goals. Don't add them without a reason.
         converts it to, and counts where a time-series `aggregate` streams;
       - a geo, `$near` or `$text` read (`$geoWithin` over a `2d` index:
         mongod 5 keys and 4 documents, this server none).
-      Measured 2026-10-27, 2026-11-07 and 2026-11-10.
+      Measured 2026-10-27, 2026-11-07, 2026-11-10 and 2026-11-13.
       Backlog-ID: RM-363
-      Verify: tests/backlog/test_rm_355_364.py::test_a_contested_aggregate_counts_what_it_examined, tests/backlog/test_rm_355_364.py::test_a_time_series_read_made_whole_counts_what_it_examined
+      Verify: tests/backlog/test_rm_355_364.py::test_a_contested_aggregate_that_does_not_stream_counts_what_it_examined, tests/backlog/test_rm_355_364.py::test_a_time_series_read_made_whole_counts_what_it_examined
+- [ ] **A contested read's line names the plan its trial lost.** For a
+      `find` or `aggregate` of `{x: {$lt: 30}, y: 1}` over indexes on `x`
+      and `y`, mongod 8.2.11's trial runs the index on `x`, its plan cache
+      entry and its line both say `IXSCAN { x: 1 }`; this server runs and
+      caches the same plan, but its line names `IXSCAN { y: 1 }`, the plan
+      its fixed preference puts first: `explain/summary.rs` plans the line's
+      summary from the catalog with no trial. The summary should be the
+      plan the read ran (the cached plan, or the trial's winner). Found
+      while working RM-363, 2026-11-13.
+      Verify: tests/backlog/test_rm_found_rm363.py::test_a_contested_read_names_the_plan_its_trial_chose
+      Backlog-ID: RM-598
+- [ ] **A line says nothing of how its plan was chosen.** mongod 8.2.11's
+      `Slow query` line for a read whose plan its trial chose says
+      `fromMultiPlanner: true` (and `fromPlanCache: true` for one that ran
+      the cache's active plan); this server's line carries neither, though
+      `explain/order.rs` notes both for `$queryStats`
+      (`opdebug::note_planned`). Found while working RM-363, 2026-11-13.
+      Verify: tests/backlog/test_rm_found_rm363.py::test_a_contested_read_says_it_was_multi_planned
+      Backlog-ID: RM-599
 - [ ] **A read of a time-series collection's meta index names the index
       as `listIndexes` shows it.** mongod 8.2.11's line for a `find({m: 1})`
       of a time-series collection says `IXSCAN { meta: 1, control.min.t: 1,
@@ -1145,6 +1180,45 @@ These are explicit non-goals. Don't add them without a reason.
       here is not mongod's KeyString. (An insert's count varies by 8 bytes a
       skiplist level on both servers: WiredTiger draws each new key's depth
       at random.) Measured 2026-11-10. Found while working RM-385.
+      **Decision needed (2026-11-13):** the surplus is this store's shared
+      tables. Every key an insert writes carries the namespace as strings,
+      because collections share sixteen document shards
+      (`key_format=SSq`), every `_id` index is a row in
+      `secantus_natural_seq` (`SSu`), and every secondary index is a row in
+      `secantus_index_entries` (`SSSu`, plus the index name). mongod keeps
+      one WiredTiger table per collection (`key_format=q`) and one per
+      index (KeyString keys), so no key names its namespace. Measured with
+      the gap test's insert of fifty documents into `c`, with the `_id` and
+      `x` indexes (`secantusd-rs` from `rm-batch` at 6bcd8f41, mongod
+      8.2.11): a 9-character database name gives 362.8 bytes per document
+      here against 311.6 on mongod. A 49-character name gives 481.4 here
+      against 313.8: 40 more characters cost 118.6 bytes here (three keys
+      times 40) and nothing on mongod. Of the 51 bytes left at 9
+      characters, about 40 are the prefixes (`db\0c\0` three times, plus
+      `x_1\0`). The remaining ~11 are the encodings: the `_id` sort key
+      against KeyString, and the index entry's value. Options, the most
+      faithful first:
+      (a) **mongod's layout, recommended:** a table per collection keyed
+      by RecordId and a table per index keyed by KeyString, with the
+      catalog mapping namespace to ident. This closes this item and the
+      per-table half of RM-040 (`collStats.wiredTiger` / `indexDetails`,
+      real `storageSize` / `indexSize`, `$listCatalog` idents), and makes
+      the RM-192 `compact` scope decision unnecessary. It changes the
+      on-disk format both Rust servers share (a store migration, or a
+      format bump that refuses an old store), replaces `DOC_SHARDS` (a
+      table per collection gives the same per-collection file
+      independence), and the KeyString keys change the on-disk sort-key
+      rank (`sortkey.rs`, `entryFormat`). Several PRs; sequence storage
+      first, then KeyString.
+      (b) **Keep the shared tables, prefix each key with a short numeric
+      collection id or index id** in place of the names (1-2 bytes as a
+      packed `q`). This is still an on-disk format change, and a stand-in
+      for mongod's mechanism. It removes the name-length dependence and
+      about 34 of the 51 bytes; the gap test stays red at about 17 bytes
+      until the encodings also move to KeyString.
+      (c) **Scope decision:** `txnBytesDirty` counts this store's layout,
+      not mongod's. Retire the gap test with that reason, and keep the
+      update and delete counts, which already match.
       Verify: tests/backlog/test_rm_355_364.py::test_an_insert_in_a_transaction_counts_mongods_dirty_bytes
       Backlog-ID: RM-499
 

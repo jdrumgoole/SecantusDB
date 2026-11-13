@@ -1135,7 +1135,8 @@ pub(crate) struct TrialBuffer {
     pub cached: bool,
 }
 
-/// [`stream_plan`] for a `find`, a contested plan included (RM-349): mongod
+/// [`stream_plan`] for a `find`, or an unsorted `aggregate` (RM-363), a
+/// contested plan included (RM-349): mongod
 /// tries the candidates over the collection when the command runs (or runs
 /// the plan its plan cache holds), keeps the winner's trial results and
 /// returns them first, and then reads on from where the winner stopped.
@@ -1207,8 +1208,11 @@ fn planned_stream(
     let (plan, buffer) = if !flags.min_max && plan::contested(&query, &catalog) {
         // Everything below that declines a plan is settled before the
         // trial, which writes the plan cache: a read that then declined
-        // would consult it a second time as it reads as before.
-        if !tries || !flags.sorts_documents || mentions_geo(ask.filter) {
+        // would consult it a second time as it reads as before. A read that
+        // takes no sort of whole documents (an `aggregate`'s, RM-363) is
+        // tried only when it asks for no sort, whose plan sorts nothing.
+        let sorts = flags.sorts_documents || ask.sort.is_none();
+        if !tries || !sorts || mentions_geo(ask.filter) {
             return Ok(None);
         }
         match tried(storage, ask, &query, &catalog, &canonical)? {

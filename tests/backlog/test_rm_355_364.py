@@ -1407,12 +1407,13 @@ def test_a_time_series_read_made_whole_counts_what_it_examined(
     assert answers["rust"] == answers["mongod"]
 
 
-@pytest.mark.backlog("RM-363")
+@pytest.mark.backlog_fixed("RM-363")
 def test_a_contested_aggregate_counts_what_it_examined(rust_mongo: Any, mongod_rs: Any) -> None:
     """mongod 8.2.11's line for an `aggregate` two indexes could serve counts
     what the plan it chose by trial examined (`keysExamined: 4,
-    docsExamined: 4`, measured 2026-11-10). This server reads it through its
-    store's router, and counts nothing."""
+    docsExamined: 4`, measured 2026-11-10). This server read it through its
+    store's router, and counted nothing, until the aggregate ran mongod's
+    trial and streamed the winner after it, as a `find` does (RM-363)."""
 
     def setup(db: Any) -> None:
         seed(db)
@@ -1422,6 +1423,113 @@ def test_a_contested_aggregate_counts_what_it_examined(rust_mongo: Any, mongod_r
     got = _both(rust_mongo, mongod_rs, lambda d: list(d.c.aggregate(pipeline)), setup)
     answers = {s: _counts(_line(lines, "aggregate")) for s, (lines, _) in got.items()}
     assert "keysExamined" in answers["mongod"]
+    assert answers["rust"] == answers["mongod"]
+
+
+def _four_hundred_contested(db: Any) -> None:
+    """400 documents over two indexes a `$match` on both fields contests."""
+    db.c.insert_many([{"_id": n, "x": n, "y": n % 3, "z": n % 7} for n in range(400)])
+    db.c.create_index("x")
+    db.c.create_index("y")
+
+
+_TWO_INDEXES = {"x": {"$gte": 2}, "y": 1}
+# The plan cache's entry names the winner; a line's `planSummary` names the
+# plan the trial lost (RM-598).
+_ITS_PLAN = _COUNTED
+
+
+def _contested_lines(rust_mongo: Any, mongod_rs: Any, op: Any) -> dict:
+    """Each server's lines for `op`, as what each counted and its plan,
+    with the plan cache's entries for the collection after it."""
+    caches: list = []
+
+    def run(db: Any) -> None:
+        try:
+            op(db)
+        finally:
+            caches.append(
+                [
+                    (e.get("isActive"), e.get("works"), e.get("cachedPlan"))
+                    for e in db.c.aggregate([{"$planCacheStats": {}}])
+                ]
+            )
+
+    answers = {}
+    # `_both` runs the operation on this server, then on mongod.
+    got = _both(rust_mongo, mongod_rs, run, _four_hundred_contested)
+    for (side, (lines, _)), cache in zip(got.items(), caches, strict=True):
+        counted = [
+            (next(iter(a.get("command", {})), ""), {k: a[k] for k in _ITS_PLAN if k in a})
+            for _, a in lines
+            if "$planCacheStats" not in str(a.get("command", {}).get("pipeline", ""))
+        ]
+        answers[side] = (counted, cache)
+    return answers
+
+
+_CONTESTED_PIPELINES = {
+    # The winner's trial fills its 101 and reads on: the first batch counts
+    # the trial, the `getMore`s what they read after it.
+    "read on past the trial": [{"$match": _TWO_INDEXES}],
+    "a skip and a limit": [{"$match": _TWO_INDEXES}, {"$skip": 3}, {"$limit": 20}],
+    "a limit the trial fills": [{"$match": _TWO_INDEXES}, {"$limit": 5}],
+    "a projection": [{"$match": _TWO_INDEXES}, {"$project": {"x": 1, "_id": 0}}],
+    "another index wins": [{"$match": {"x": {"$lt": 30}, "y": 1}}],
+}
+
+
+@pytest.mark.backlog_fixed("RM-363")
+@pytest.mark.parametrize("name", list(_CONTESTED_PIPELINES))
+def test_a_contested_aggregate_reads_on_from_its_trial(
+    rust_mongo: Any, mongod_rs: Any, name: str
+) -> None:
+    """mongod 8.2.11 tries the plans an `aggregate`'s `$match` contests when
+    the command runs, caches the winner, returns what the winner's trial
+    buffered and reads on from there: its first batch counts what the trial
+    examined, each `getMore` what it read after (measured 2026-11-13). This
+    server read a contested pipeline through its store's router and counted
+    nothing (RM-363)."""
+    pipeline = _CONTESTED_PIPELINES[name]
+    answers = _contested_lines(
+        rust_mongo, mongod_rs, lambda d: list(d.c.aggregate(pipeline, batchSize=50))
+    )
+    assert answers["mongod"][0][0][1].get("keysExamined", 0) > 0
+    assert answers["rust"] == answers["mongod"]
+
+
+@pytest.mark.backlog_fixed("RM-363")
+def test_a_contested_aggregate_runs_its_cached_plan(rust_mongo: Any, mongod_rs: Any) -> None:
+    """The same contested `aggregate` twice: mongod 8.2.11's second runs the
+    plan its first cached, and both lines count 102 keys and documents for
+    the first batch and 31 for the `getMore` (measured 2026-11-13)."""
+
+    def twice(db: Any) -> None:
+        for _ in range(2):
+            list(db.c.aggregate([{"$match": _TWO_INDEXES}]))
+
+    answers = _contested_lines(rust_mongo, mongod_rs, twice)
+    assert [c.get("keysExamined") for _, c in answers["mongod"][0]] == [102, 31, 102, 31]
+    assert answers["rust"] == answers["mongod"]
+
+
+@pytest.mark.backlog("RM-363")
+@pytest.mark.parametrize(
+    "stage", [{"$sort": {"z": 1}}, {"$group": {"_id": "$z", "n": {"$sum": 1}}}]
+)
+def test_a_contested_aggregate_that_does_not_stream_counts_what_it_examined(
+    rust_mongo: Any, mongod_rs: Any, stage: dict
+) -> None:
+    """mongod 8.2.11's line for a contested `aggregate` that sorts or groups
+    what its `$match` reads counts what the winner examined (133 keys and
+    documents for both, measured 2026-11-13). This server reads such a
+    pipeline whole through its store's router, and counts nothing."""
+    answers = _contested_lines(
+        rust_mongo,
+        mongod_rs,
+        lambda d: list(d.c.aggregate([{"$match": _TWO_INDEXES}, stage], batchSize=50)),
+    )
+    assert answers["mongod"][0][0][1].get("keysExamined") == 133
     assert answers["rust"] == answers["mongod"]
 
 
@@ -1657,3 +1765,29 @@ def test_an_insert_in_a_transaction_counts_mongods_dirty_bytes(
     }
     assert len(per_doc["mongod"]) == 1 and len(per_doc["rust"]) == 1, per_doc
     assert abs(per_doc["rust"][0] - per_doc["mongod"][0]) <= 8, per_doc
+
+
+@pytest.mark.backlog_fixed("RM-363")
+def test_a_contested_aggregate_sees_what_is_deleted_after_its_first_batch(
+    rust_mongo: Any, mongod_rs: Any
+) -> None:
+    """A contested `aggregate` read two at a time, every document deleted
+    after its first batch: mongod 8.2.11 returns what the winner's trial
+    buffered (101) and nothing past it (measured 2026-11-13). This server
+    read the pipeline whole when the command ran, and returned every
+    document that matched then."""
+    answers = {}
+    for side, client in (("rust", rust_mongo), ("mongod", mongod_rs)):
+        db = client[fresh("rm363")]
+        try:
+            db.c.insert_many([{"_id": n, "x": n, "y": n % 3} for n in range(3000)])
+            db.c.create_index("x")
+            db.c.create_index("y")
+            cursor = db.c.aggregate([{"$match": {"x": {"$gte": 2}, "y": 1}}], batchSize=2)
+            first = [next(cursor), next(cursor)]
+            db.c.delete_many({})
+            answers[side] = len(first) + len(list(cursor))
+        finally:
+            client.drop_database(db.name)
+    assert answers["mongod"] == 101
+    assert answers["rust"] == answers["mongod"]
