@@ -49,7 +49,7 @@ SORT_THEN_LIMIT: list[list] = [
 ]
 
 
-@pytest.mark.backlog("RM-427")
+@pytest.mark.backlog("RM-538")
 def test_sort_and_limit_after_the_cursor_are_one_stage(rust_mongo: Any, mongod: Any) -> None:
     """mongod 8.2.11 lists a `$sort` and the `$limit` after it as one
     `$sort` with `limit`, where the cursor does not absorb them: after a

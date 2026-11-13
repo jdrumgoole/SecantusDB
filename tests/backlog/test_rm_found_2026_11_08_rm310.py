@@ -50,7 +50,7 @@ def _distinct_scan_runs(client: Any) -> dict:
     }
 
 
-@pytest.mark.backlog("RM-446")
+@pytest.mark.backlog("RM-434")
 def test_a_distinct_scan_run_reports_its_work_counters(rust_mongo: Any, mongod: Any) -> None:
     """mongod 8.2.11's `executionStats` of a DISTINCT_SCAN plan, for
     `distinct` and for a `$group` it answers from one, gives every stage's

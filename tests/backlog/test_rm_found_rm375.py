@@ -153,13 +153,13 @@ def _spilled(client: Any, is_mongod: bool) -> dict:
     }
 
 
-@pytest.mark.backlog("RM-475")
+@pytest.mark.backlog_fixed("RM-475")
 def test_a_sort_of_index_keys_past_its_budget_spills(rust_mongo: Any, mongod: Any) -> None:
     """mongod 8.2.11's SORT of index keys spills past its budget with
     `allowDiskUse`: 2000 65-byte members under a 100000-byte budget spill
     twice, every record, 130000 bytes, and the profile entry says
-    `usedDisk` and `sortSpills: 2`. This server's counts the members but
-    never spills, and reports no disk used."""
+    `usedDisk` and `sortSpills: 2`. This server's counted the members but
+    never spilled, and reported no disk used (RM-475)."""
     answers = {"mongod": _spilled(mongod, True), "rust": _spilled(rust_mongo, False)}
     assert answers["mongod"] == {
         "entry usedDisk": True,

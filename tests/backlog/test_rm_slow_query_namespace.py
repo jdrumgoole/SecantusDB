@@ -140,7 +140,7 @@ def test_a_failed_rename_is_not_profiled(rust_mongo: Any, mongod_rs: Any) -> Non
     assert answers["rust"][1] == answers["mongod"][1]
 
 
-@pytest.mark.backlog("RM-480")
+@pytest.mark.backlog("RM-495")
 def test_a_data_size_line_names_its_own_namespace(rust_mongo: Any, mongod_rs: Any) -> None:
     """mongod 8.2.1's line for a `dataSize`, whose argument is a full
     namespace, names `<db>.$cmd`; this server's names `<db>.<db>.c`, the
@@ -154,7 +154,7 @@ def test_a_data_size_line_names_its_own_namespace(rust_mongo: Any, mongod_rs: An
     assert [ns for ns, _ in answers["rust"][0]] == [ns for ns, _ in answers["mongod"][0]]
 
 
-@pytest.mark.backlog("RM-481")
+@pytest.mark.backlog("RM-386")
 def test_a_command_that_fails_to_parse_writes_no_line(rust_mongo: Any, mongod_rs: Any) -> None:
     """mongod 8.2.1 writes no `Slow query` line for a command refused as it
     parses -- a mistyped or missing field (14, 40414), an unknown one

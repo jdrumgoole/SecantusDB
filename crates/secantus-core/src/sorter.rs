@@ -70,6 +70,10 @@ pub enum SortSource {
     /// A sort mongod runs in SBE (one a `$group` or `$lookup` is pushed
     /// down behind): rows of SBE values, the key's and the fields kept.
     Sbe,
+    /// The query layer's `SORT` of index keys (`type: "default"`, below
+    /// the FETCH): working-set members, each held as [`member_doc`] and
+    /// sized by its caller ([`sort_index_keys`]).
+    Member,
 }
 
 impl SortSource {
@@ -81,6 +85,8 @@ impl SortSource {
             SortSource::Unwound => 240,
             SortSource::BucketAuto => 333,
             SortSource::Sbe => 32,
+            // Never added: a member's size is its caller's.
+            SortSource::Member => 0,
         }
     }
 
@@ -255,6 +261,16 @@ fn write_record(
         SortSource::Stored | SortSource::Modified | SortSource::Unwound => {
             spill_file::write_document(&kept(d, sizing), out)
         }
+        SortSource::Member => match d.get(MEMBER_FIELD) {
+            Some(Bson::Binary(b)) => {
+                out.extend_from_slice(&b.bytes);
+                Ok(())
+            }
+            _ => Err(spill_file::Error {
+                what: "write",
+                detail: "a working-set member that is not one".into(),
+            }),
+        },
     }
 }
 
@@ -291,6 +307,7 @@ fn read_record(
         SortSource::Stored | SortSource::Modified | SortSource::Unwound => {
             (spill_file::read_document(at)?, 0)
         }
+        SortSource::Member => (member_doc(spill_file::read_index_key_member(at)?), 0),
     };
     Ok((keys, d, pos))
 }
@@ -859,28 +876,97 @@ pub fn member_size(sort_key: &[Bson], index_key: &[Bson]) -> usize {
     key_size(sort_key) + memlimit::index_key_len(index_key) + MEMBER
 }
 
-/// Count a sort of index keys as mongod's sorter counts it, `sizes` each
-/// member's [`member_size`] in sorted order, and hold it to `budget` as
-/// [`blocking_sort`] holds a sort of documents: refused (292) past it
-/// without disk use. `limit`: the sort's own, which keeps that many.
-pub fn count_members(sizes: &[usize], budget: usize, limit: Option<usize>) -> R<()> {
-    let effective = budget.saturating_sub(reserved(budget, FILE_ITERATOR));
-    let n = sizes.len() as i64;
-    if let Some(k) = limit {
-        // The top-k sorter keeps the k first, and its sorter of one counts
-        // no bytes (as `blocking_sort`'s, RM-374).
-        let held: usize = sizes.iter().take(k).sum();
-        memlimit::record_sort(n, if k == 1 { 0 } else { held as i64 });
-        if k > 1 && held > effective && !memlimit::disk_allowed() {
-            return Err(refused(budget));
+/// The snapshot a member was read in, as `WorkingSetMember::serialize`
+/// writes it: a number mongod draws from a process-wide counter as each
+/// storage transaction opens a snapshot, which this server does not keep.
+/// It moves only what the run compresses to (`spilledDataStorageSize`).
+const SNAPSHOT_ID: u64 = 0;
+
+/// Where a [`SortSource::Member`] item's document holds the member's
+/// serialized bytes.
+const MEMBER_FIELD: &str = "m";
+
+/// A serialized working-set member, as the sorter holds it.
+fn member_doc(bytes: Vec<u8>) -> Document {
+    let mut d = Document::new();
+    d.insert(
+        MEMBER_FIELD,
+        Bson::Binary(bson::Binary {
+            subtype: bson::spec::BinarySubtype::Generic,
+            bytes,
+        }),
+    );
+    d
+}
+
+/// A working-set member of mongod's `SORT` of index keys: its sort key's
+/// values, and the index entry it was found at.
+pub struct IndexKeyMember<'a> {
+    pub sort_key: Vec<Bson>,
+    /// The index's key pattern, as it was created.
+    pub key_pattern: &'a Document,
+    /// The values of the index key it was found at, in the index's order.
+    pub index_key: Vec<Bson>,
+    /// The index's place among those the plan's scans registered with its
+    /// working set (`WorkingSet::registerIndexIdent`), from 0.
+    pub index_id: u32,
+    pub rid: i64,
+}
+
+/// mongod 8.2's `SORT` of index keys (`type: "default"`, below the FETCH)
+/// over `members` in the order they came, run for what it counts: each
+/// member counts its [`member_size`], the sort is held to `budget` -- past
+/// it, refused (292) without disk use, and with it spilled to runs of the
+/// members as `WorkingSetMember::serialize` writes them (RM-475), merged
+/// as [`blocking_sort`]'s are. `descending`: each sort field's direction.
+/// `limit`: the sort's own, which keeps that many (its top-k sorter).
+///
+/// The caller orders the members itself; this answers only what the
+/// sorter counts and spills, into [`memlimit::report`].
+pub fn sort_index_keys(
+    members: Vec<IndexKeyMember>,
+    descending: &[bool],
+    budget: usize,
+    limit: Option<usize>,
+) -> R<()> {
+    let mut sizes = Vec::with_capacity(members.len());
+    let mut items = Vec::with_capacity(members.len());
+    for m in members {
+        sizes.push(memlimit::index_key_len(&m.index_key) + MEMBER);
+        let mut bytes = Vec::new();
+        spill_file::write_index_key_member(
+            m.key_pattern,
+            &m.index_key,
+            m.index_id,
+            SNAPSHOT_ID,
+            m.rid,
+            &mut bytes,
+        )
+        .map_err(|e| Fallback::mongo(1, format!("the sort could not {}: {}", e.what, e.detail)))?;
+        items.push((m.sort_key, member_doc(bytes)));
+    }
+    let cmp = |a: &[Bson], b: &[Bson]| {
+        for (i, (x, y)) in a.iter().zip(b).enumerate() {
+            let c = crate::order::cmp(x, y);
+            let c = if descending.get(i).copied().unwrap_or(false) {
+                c.reverse()
+            } else {
+                c
+            };
+            if c != Ordering::Equal {
+                return c;
+            }
         }
-        return Ok(());
-    }
-    let total: usize = sizes.iter().sum();
-    if total > effective && !memlimit::disk_allowed() {
-        return Err(refused(budget));
-    }
-    memlimit::record_sort(n, total as i64);
+        Ordering::Equal
+    };
+    let sizing = Sizing {
+        source: SortSource::Member,
+        fields: None,
+        budget,
+        added: None,
+        sizes: Some(&sizes),
+    };
+    sort_items(items, &cmp, &sizing, limit)?;
     Ok(())
 }
 
@@ -1148,20 +1234,80 @@ mod tests {
             member_size(&[Bson::Null], &[Bson::Int32(1), Bson::Null]),
             61
         );
-        let counted = |sizes: &[usize], budget: usize, limit: Option<usize>| {
+        let pattern = doc! { "y": 1, "x": 1 };
+        let members = |n: i32| -> Vec<IndexKeyMember> {
+            (0..n)
+                .map(|i| IndexKeyMember {
+                    sort_key: vec![Bson::Int32(i)],
+                    key_pattern: &pattern,
+                    index_key: vec![Bson::Int32(i % 3), Bson::Int32(i)],
+                    index_id: 0,
+                    rid: i64::from(i) + 1,
+                })
+                .collect()
+        };
+        let counted = |n: i32, budget: usize, limit: Option<usize>| {
             let _off = memlimit::allow_disk_use(false);
-            let (ran, report) = memlimit::captured(|| count_members(sizes, budget, limit));
+            let (ran, report) =
+                memlimit::captured(|| sort_index_keys(members(n), &[false], budget, limit));
             ran.map(|()| report.sort_total_data_size)
                 .map_err(|f| f.as_mongo().map(|(code, _)| code))
         };
         // Twelve members need the budget less one 136-byte file iterator;
         // a limit of three keeps three, a limit of one counts no bytes.
-        let twelve = [65; 12];
-        assert_eq!(counted(&twelve, 916, None), Ok(780));
-        assert_eq!(counted(&twelve, 915, None), Err(Some(292)));
-        assert_eq!(counted(&twelve, 331, Some(3)), Ok(195));
-        assert_eq!(counted(&twelve, 330, Some(3)), Err(Some(292)));
-        assert_eq!(counted(&twelve, 1, Some(1)), Ok(0));
+        assert_eq!(counted(12, 916, None), Ok(780));
+        assert_eq!(counted(12, 915, None), Err(Some(292)));
+        assert_eq!(counted(12, 331, Some(3)), Ok(195));
+        assert_eq!(counted(12, 330, Some(3)), Err(Some(292)));
+        assert_eq!(counted(12, 1, Some(1)), Ok(0));
+    }
+
+    #[test]
+    fn a_sort_of_index_keys_past_its_budget_spills_its_members() {
+        // mongod 8.2.11, the same sort over 2000 documents with
+        // `allowDiskUse` under a 100000-byte budget: two spills of every
+        // member, each written as `WorkingSetMember::serialize` writes it
+        // -- 65 bytes, as it counts -- and 130000 bytes in all (RM-475).
+        let pattern = doc! { "y": 1, "x": 1 };
+        let members: Vec<IndexKeyMember> = (0..2000)
+            .map(|i| IndexKeyMember {
+                sort_key: vec![Bson::Int32(i)],
+                key_pattern: &pattern,
+                index_key: vec![Bson::Int32(i % 3), Bson::Int32(i)],
+                index_id: 0,
+                rid: i64::from(i) + 1,
+            })
+            .collect();
+        let _on = memlimit::allow_disk_use(true);
+        let (ran, report) =
+            memlimit::captured(|| sort_index_keys(members, &[false], 100_000, None));
+        ran.unwrap();
+        assert!(report.used_disk);
+        assert_eq!(report.sort_total_data_size, 130_000);
+        assert_eq!(report.sort_spills, 2);
+        assert_eq!(report.sort_spilled_records, 2000);
+        assert_eq!(report.sort_spilled_bytes, 130_000);
+    }
+
+    #[test]
+    fn an_index_key_member_reads_back_as_it_was_written() {
+        let pattern = doc! { "y": 1, "x": -1 };
+        let mut out = Vec::new();
+        spill_file::write_index_key_member(
+            &pattern,
+            &[Bson::String("ab".into()), Bson::Null],
+            1,
+            7,
+            42,
+            &mut out,
+        )
+        .unwrap();
+        // State, count, the pattern (19), the key (4 + 9 + 2 + 1), the
+        // index id, the snapshot, the RecordId's format and value, no
+        // metadata.
+        assert_eq!(out.len(), 1 + 1 + 19 + 16 + 4 + 8 + 1 + 8 + 1);
+        let mut at = spill_file::Cursor::new(&out);
+        assert_eq!(spill_file::read_index_key_member(&mut at).unwrap(), out);
     }
 
     #[test]

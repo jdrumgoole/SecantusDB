@@ -183,11 +183,13 @@ fn untested(node: &Node) -> Node {
             pattern,
             limit,
             on_keys,
+            keeps_metadata,
             input,
         } => Node::Sort {
             pattern: pattern.clone(),
             limit: *limit,
             on_keys: *on_keys,
+            keeps_metadata: *keeps_metadata,
             input: Box::new(untested(input)),
         },
         Node::SortMerge { pattern, inputs } => Node::SortMerge {

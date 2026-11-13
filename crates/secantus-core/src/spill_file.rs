@@ -86,6 +86,76 @@ pub(crate) fn write_bson(d: &Document, out: &mut Vec<u8>) -> R<()> {
     crate::bsondoc::write(d, out).map_err(|e| err("encode a record for", e))
 }
 
+/// `WorkingSetMember::serialize` (`working_set.cpp`, mongod 8.2) of a
+/// member an index scan made (`RID_AND_IDX`, no document, no metadata): its
+/// state, the count of its index keys (one), the index's key pattern and
+/// the key as BSON -- the key's every field name empty --, the index's id
+/// in the plan's working set, the snapshot it was read in, then its
+/// RecordId's format (`Long`) and value, and a zero byte for no metadata.
+pub(crate) fn write_index_key_member(
+    key_pattern: &Document,
+    index_key: &[Bson],
+    index_id: u32,
+    snapshot_id: u64,
+    rid: i64,
+    out: &mut Vec<u8>,
+) -> R<()> {
+    /// `WorkingSetMember::RID_AND_IDX`.
+    const RID_AND_IDX: u8 = 1;
+    out.push(RID_AND_IDX);
+    out.push(1);
+    write_bson(key_pattern, out)?;
+    let start = out.len();
+    out.extend_from_slice(&[0; 4]);
+    for v in index_key {
+        let bson = element_bson(v)?;
+        // The element: past the length, before the document's NUL.
+        out.extend_from_slice(&bson[4..bson.len() - 1]);
+    }
+    out.push(0);
+    finish_doc(out, start)?;
+    out.extend_from_slice(&index_id.to_le_bytes());
+    out.extend_from_slice(&snapshot_id.to_le_bytes());
+    // `RecordIdFormat::Long`.
+    out.push(0);
+    out.extend_from_slice(&rid.to_le_bytes());
+    out.push(0);
+    Ok(())
+}
+
+/// The bytes a [`write_index_key_member`] wrote, read as
+/// `WorkingSetMember::deserialize` reads them.
+pub(crate) fn read_index_key_member(at: &mut Cursor) -> R<Vec<u8>> {
+    let start = at.pos;
+    if at.byte()? != 1 {
+        return Err(corrupt("a working-set member not of index keys"));
+    }
+    for _ in 0..at.byte()? {
+        for _ in 0..2 {
+            let len = usize::try_from(at.peek_i32()?)
+                .ok()
+                .filter(|n| *n >= 5)
+                .ok_or_else(|| corrupt("a key with a bad length"))?;
+            at.take(len)?;
+        }
+        at.take(4 + 8)?;
+    }
+    match at.byte()? {
+        0 => {
+            at.take(8)?;
+        }
+        1 => {
+            let n = at.len()?;
+            at.take(n)?;
+        }
+        _ => return Err(corrupt("a RecordId of no format")),
+    }
+    if at.byte()? != 0 {
+        return Err(corrupt("a working-set member with metadata"));
+    }
+    Ok(at.bytes[start..at.pos].to_vec())
+}
+
 /// The value a [`write_value`] wrote.
 pub(crate) fn read_value(at: &mut Cursor) -> R<Bson> {
     let mut bson = vec![0, 0, 0, 0];

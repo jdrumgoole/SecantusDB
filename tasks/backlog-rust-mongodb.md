@@ -689,17 +689,6 @@ These are explicit non-goals. Don't add them without a reason.
       which the run could share. Found 2026-11-12 (RM-466).
       Verify: tests/backlog/test_rm_found_rm466.py::test_a_later_match_replaces_the_one_plan_cache_stats_absorbed
       Backlog-ID: RM-554
-- [ ] **A SORT of index keys past its budget does not spill.** mongod
-      8.2.11's SORT below a FETCH (`type: "default"`) spills past its
-      budget with `allowDiskUse`: 2000 65-byte members under a
-      100000-byte budget spill twice (`spilledRecords: 2000`,
-      `spilledBytes: 130000`), and the profile entry says `usedDisk` and
-      `sortSpills: 2`. This server's counts its members and refuses one
-      past the budget without disk use as mongod does (RM-375), but with
-      disk use sorts in memory and reports no spill
-      (`secantus_core::sorter::count_members`). Found 2026-11-09 (RM-375).
-      Verify: tests/backlog/test_rm_found_rm375.py::test_a_sort_of_index_keys_past_its_budget_spills
-      Backlog-ID: RM-475
 - [ ] **An `$or` of one index sorts documents, not index keys.** mongod
       8.2.11 answers `find({$or: [{y: 0}, {y: {$gt: 1}}]}).sort({x: 1})`
       over `{y: 1, x: 1}` with one two-interval IXSCAN whose keys it sorts
@@ -720,29 +709,154 @@ These are explicit non-goals. Don't add them without a reason.
       b: -1}` and `{a: -1, b: 1}`). Found 2026-11-12 (RM-477).
       Verify: tests/backlog/test_rm_found_rm477.py::test_a_sort_merge_beside_a_null_scan_breaks_ties_as_mongod
       Backlog-ID: RM-559
-- [ ] **`returnKey` is not at the top of a sorted plan.** mongod 8.2.11
-      puts RETURN_KEY above a blocking sort and drops the projection:
-      `RETURN_KEY <- SORT <- COLLSCAN`, and `RETURN_KEY <- SORT <- FETCH <-
-      IXSCAN` where the index does not hold the sort. This server ignores
-      `returnKey` over a COLLSCAN (`PROJECTION_SIMPLE <- SORT <- COLLSCAN`)
-      and puts RETURN_KEY below the sort with no FETCH (`SORT <- RETURN_KEY
-      <- IXSCAN`). Found 2026-11-09 (RM-373).
-      Verify: tests/backlog/test_rm_found_2026_11_09_rm373.py::test_return_key_is_the_top_of_a_sorted_plan
-      Backlog-ID: RM-470
-- [ ] **An `$or` of index scans does not answer a covered projection.**
-      mongod 8.2.11 answers `{_id: 0, x: 1}` over an `$or` of two scans of
-      `{y: 1, x: 1}` from their keys (`SUBPLAN <- PROJECTION_DEFAULT <- OR
-      <- IXSCAN`, no FETCH). This server fetches each document
-      (`PROJECTION_SIMPLE <- FETCH <- OR`). Found 2026-11-09 (RM-373).
-      Verify: tests/backlog/test_rm_found_2026_11_09_rm373.py::test_an_or_of_scans_answers_a_covered_projection
-      Backlog-ID: RM-471
-- [ ] **A sort beside `showRecordId` is a `simple` sort.** mongod 8.2.11's
-      SORT under a `showRecordId` read's projection is `type: "default"`
-      (it keeps each document's RecordId); without `showRecordId` the same
-      read sorts `simple`. This server's is `simple` both ways. Found
-      2026-11-09 (RM-373).
-      Verify: tests/backlog/test_rm_found_2026_11_09_rm373.py::test_a_sort_beside_show_record_id_is_a_default_sort
-      Backlog-ID: RM-472
+- [ ] **`test_a_write_while_an_index_builds` reads mongod's answer off a
+      5 ms lock wait.** `tests/mongod_live/test_txn_catalog_changes.py`
+      asserts mongod 8.2.11 refuses a transaction's insert while an index
+      build is paused (`hangAfterStartingIndexBuild`) with WriteConflict
+      (112). In the RM gate at load 16-29 (2026-11-12, RM-475's run) mongod
+      answered LockTimeout (24, "Unable to acquire IX lock ... within
+      5ms") instead, before the Rust server was asked; a rerun at load 6
+      passed. Which answer mongod gives depends on whether the lock request
+      outlasts `maxTransactionLockRequestTimeoutMillis`, so the test's
+      reference answer is a race under load. Found 2026-11-12 (RM-475).
+      Verify: none -- an intermittent failure under load, 1 in 2 gate runs
+      Backlog-ID: RM-558
+- [ ] **A spilled SORT of index keys under a collation writes the
+      strings, not their collation keys.** mongod 8.2.11's SORT below a
+      FETCH computes each member's sort key under the command's collation
+      and spills that key: 2000 `"s{i}"` strings over `{y: 1, x: 1}` with
+      `{locale: "fr"}` under a 100000-byte budget spill 157780 bytes. This
+      server writes the string values (`stream.rs`'s `member_values`):
+      149780. What it counts in memory already agrees (140890). Found
+      2026-11-12 (RM-475).
+      Verify: tests/backlog/test_rm_found_rm475.py::test_a_spilled_sort_of_index_keys_writes_collation_keys
+      Backlog-ID: RM-555
+- [ ] **A spilled SORT of index keys compresses to a different size.**
+      Each member mongod 8.2.11 spills carries the id of the storage
+      snapshot it was read in, drawn from a process-wide counter every
+      storage transaction advances; this server writes 0
+      (`sorter::SNAPSHOT_ID`), and its `explain` writes each document's
+      place in the collection as its RecordId (`exec.rs`'s `key_members`). The uncompressed bytes agree, but
+      `spilledDataStorageSize` does not: 29061 against 31229 for 2000 int
+      members over `{y: 1, x: 1}` under a 100000-byte budget, and mongod's
+      own answer moves between runs of the same data (31229, 31231, 31240
+      measured 2026-11-12). **Decision needed (2026-11-12):** model the
+      counter (every WiredTiger snapshot this server opens since start,
+      which still could not reproduce mongod's background threads'), or
+      keep 0 and accept the storage size as approximate. Found 2026-11-12
+      (RM-475).
+      Verify: none -- mongod's own answer varies between runs; no test can pin it
+      Backlog-ID: RM-556
+- [ ] **A sort under `returnKey` is a `simple` sort, and a limited one
+      leaves ties in another order.** mongod 8.2.11's SORT under a
+      RETURN_KEY is `type: "default"` (it keeps each member's index key),
+      and `find({y: {$gte: 0}}).sort({z: 1}).limit(2).returnKey()` over
+      `{y: 1, x: 1}` returns `{y: 0, x: 6}` before `{y: 0, x: 0}`, which
+      tie on `z`. This server's SORT is `simple` (`Node::Sort`'s `on_keys`
+      says both "sorts keys below the FETCH" and the `default` type, as for
+      RM-472), and it returns `x` 0 before 6. Found 2026-11-12 (RM-470).
+      Verify: tests/backlog/test_rm_found_rm470.py::test_a_sort_under_return_key_is_a_default_sort
+      Backlog-ID: RM-566
+- [ ] **A `returnKey` point lookup on `_id` is not IDHACK.** mongod 8.2.11
+      answers `find({_id: 3}).returnKey()` by `RETURN_KEY <- IDHACK`; this
+      server plans `RETURN_KEY <- IXSCAN` (`find_plan` leaves the point
+      lookups to reads without `returnKey`). Found 2026-11-12 (RM-470).
+      Verify: tests/backlog/test_rm_found_rm470.py::test_return_key_of_an_id_point_lookup_is_idhack
+      Backlog-ID: RM-567
+- [ ] **`returnKey` drops a projection's `{$meta: "sortKey"}` field.**
+      mongod 8.2.11 keeps a projection's `sortKey` fields under `returnKey`
+      (`extractSortKeyMetaFieldsFromProjection`): `find({z: 0}, {k:
+      {$meta: "sortKey"}}).sort({z: 1}).returnKey()` returns `{k: [0]}`
+      for each document. This server returns the sort's field instead,
+      `{z: 0}`, and over an index `{y, x, z}` where mongod gives `{y, x,
+      k}`. Found 2026-11-12 (RM-470).
+      Verify: tests/backlog/test_rm_found_rm470.py::test_return_key_keeps_a_sort_key_meta_field
+      Backlog-ID: RM-568
+- [ ] **A `default` sort of documents counts the documents, not its
+      working-set members.** mongod 8.2.11's SORT of a read that keeps
+      each member's metadata (`showRecordId`, a projection's `{$meta:
+      "recordId"}`; `type: "default"` since RM-472) counts each member it
+      sorts: 1122 bytes `totalDataSizeSorted` for the six documents of
+      `find({z: 0}).sort({z: 1}).showRecordId()` (374 for two under a
+      `limit` of 2, 2244 for twelve over a FETCH), where the same read
+      without `showRecordId` sorts `simple` and counts 402. This server
+      counts 402 both ways: it sorts the documents as its `simple` sort
+      does. RM-473 is the same model over a covered projection. Found
+      2026-11-12 (RM-472).
+      Verify: tests/backlog/test_rm_found_rm472.py::test_a_default_sort_of_documents_counts_its_members
+      Backlog-ID: RM-577
+- [ ] **A `$near` read over a `2d` index explains as a COLLSCAN.** mongod
+      8.2.11 plans `find({loc: {$near: [0, 0]}})` over a `{loc: "2d"}`
+      index as `GEO_NEAR_2D` (`SORT <- GEO_NEAR_2D` under a `sort`); this
+      server's `explain` names a `COLLSCAN` for the same read. The
+      documents come back in mongod's order either way. Found 2026-11-12
+      (RM-472).
+      Verify: tests/backlog/test_rm_found_rm472.py::test_a_near_read_explains_as_geo_near_2d
+      Backlog-ID: RM-578
+- [ ] **Covered fields come back in the projection's order, not the key's.**
+      mongod 8.2.11 builds a covered row from the index key, so `{_id: 0,
+      x: 1, y: 1}` over `{y: 1, x: 1}` returns `{y: .., x: ..}`, from one
+      scan (`PROJECTION_COVERED`) or an `$or` of them (`PROJECTION_DEFAULT`
+      over the OR; a fetched branch's rows keep the document's order). This
+      server returns every row in the document's order, `{x: .., y: ..}`:
+      a field order a client sees. Found 2026-11-12 (RM-471).
+      Verify: tests/backlog/test_rm_found_rm471.py::test_covered_fields_come_back_in_the_key_patterns_order
+      Backlog-ID: RM-569
+- [ ] **A computed projection over index keys fetches.** mongod 8.2.11
+      answers `{_id: 0, x: 1, k: {$add: ["$x", 1]}}` from the keys of
+      `{y: 1, x: 1}` (`PROJECTION_DEFAULT <- IXSCAN`; over an `$or`, no
+      FETCH either): every field it reads is in the index. This server
+      fetches (`PROJECTION_DEFAULT <- FETCH <- IXSCAN`); `covers` refuses a
+      projection with an expression. Found 2026-11-12 (RM-471).
+      Verify: tests/backlog/test_rm_found_rm471.py::test_a_computed_projection_reads_index_keys
+      Backlog-ID: RM-570
+- [ ] **An `$or` over two indexes returns its branches out of order.**
+      mongod 8.2.11 reads `{$or: [{y: 0}, {x: {$gt: 8}}]}` over `{y: 1,
+      x: 1}` and `{x: 1}` branch by branch as its plan lists them,
+      `y_1_x_1` first: `_id` 0, 3, 6, 9, then 10, 11. This server's explain
+      lists the same order, but it returns the `x_1` branch first (9, 10,
+      11, 0, 3, 6). Sorted on `y` with `limit: 2` it then returns different
+      rows (`x` 9 and 0, where mongod returns 0 and 3), since the sort's
+      ties keep the read order. Found 2026-11-12 (RM-471).
+      Verify: tests/backlog/test_rm_found_rm471.py::test_an_or_of_two_indexes_returns_its_branches_in_order
+      Backlog-ID: RM-572
+- [ ] **An `{_id: 1}` projection is not covered.** mongod 8.2.11 answers
+      `find({y: 0}, {_id: 1})` from `{y: 1, _id: 1}`
+      (`PROJECTION_COVERED <- IXSCAN`), and from an `$or` over `_id_` and
+      that index (`PROJECTION_DEFAULT <- OR`). This server fetches each
+      document: `covers` refuses a projection of `_id` alone. Found
+      2026-11-12 (RM-471).
+      Verify: tests/backlog/test_rm_found_rm471.py::test_an_id_projection_is_covered
+      Backlog-ID: RM-573
+- [ ] **A clause beside an `$or` is rechecked in a FETCH.** mongod 8.2.11
+      pushes `x: {$lt: 10}` beside `{$or: [{y: 0}, {y: 1, x: {$gt:
+      3}}]}` into each branch's bounds over `{y: 1, x: 1}` and rechecks
+      nothing, so `{_id: 0, x: 1}` is answered from the keys
+      (`PROJECTION_DEFAULT <- OR <- IXSCAN`). This server's bounds are the
+      same, but it rechecks the clause in a FETCH over the OR (`FETCH`
+      filter `{x: {$lt: 10}}`), so it also fetches for a covered
+      projection. Found 2026-11-12 (RM-471).
+      Verify: tests/backlog/test_rm_found_rm471.py::test_a_clause_beside_an_or_is_answered_by_its_bounds
+      Backlog-ID: RM-574
+- [ ] **A sort over an `$or` with a fetched branch sorts documents.**
+      mongod 8.2.11's OR of `FETCH <- IXSCAN w_1` and `IXSCAN y_1_x_1` is
+      not fetched, and every branch carries `x` (a fetched one carries every
+      field), so `.sort({x: 1})` sorts the OR's members below a FETCH:
+      `SUBPLAN <- FETCH <- SORT (default) <- OR`; with `{_id: 0, x: 1}`,
+      `SORT <- PROJECTION_DEFAULT <- OR`, no FETCH. This server sorts
+      fetched documents above it (`SORT (simple) <- FETCH <- OR`): its
+      `keys_hold` takes only index-scan branches. Found 2026-11-12
+      (RM-471).
+      Verify: tests/backlog/test_rm_found_rm471.py::test_a_sort_over_an_or_with_a_fetched_branch_sorts_below_the_fetch
+      Backlog-ID: RM-575
+- [ ] **A rooted `$or`'s profile `planSummary` names one index twice.**
+      mongod 8.2.11's profile entry for `{$or: [{a: {$gte: 2}, b: {$gte:
+      3}}, {a: 0, b: 0}]}` over `a_1` and `b_1` says `IXSCAN { a: 1 },
+      IXSCAN { b: 1 }`, the index each branch won with. This server's
+      explain names the same two, but its profile entry says `IXSCAN { a: 1
+      }, IXSCAN { a: 1 }`. Found 2026-11-12 (RM-471).
+      Verify: tests/backlog/test_rm_found_rm471.py::test_a_rooted_ors_plan_summary_names_each_branchs_index
+      Backlog-ID: RM-576
 - [ ] **A SORT over a covered projection does not count what it sorted.**
       mongod 8.2.11's `SORT <- PROJECTION_COVERED <- IXSCAN` (`type:
       "default"`) counts 1584 bytes sorted for the twelve `{x}` members of
@@ -829,24 +943,6 @@ These are explicit non-goals. Don't add them without a reason.
       "<db>.nope"`). Found while working RM-378, 2026-11-09.
       Verify: tests/backlog/test_rm_slow_query_namespace.py::test_a_failed_rename_is_not_profiled
       Backlog-ID: RM-479
-- [ ] **A `dataSize` line names `<db>.<db>.c`.** mongod 8.2.1's `Slow
-      query` line for a `dataSize`, whose argument is a full namespace,
-      names `<db>.$cmd`; this server's joins the command's database to the
-      argument. Found while working RM-378, 2026-11-09.
-      Verify: tests/backlog/test_rm_slow_query_namespace.py::test_a_data_size_line_names_its_own_namespace
-      Backlog-ID: RM-480
-- [ ] **A command refused as it parses writes a `Slow query` line.**
-      mongod 8.2.1 writes no line for a command its IDL parse refuses -- a
-      mistyped or missing field (14, 40414: `renameCollection: 5`, no
-      `to`), an unknown one (40415: `find` with `bogus`), a collection name
-      that is not a string (73: `find: 5`, `count: 5`), an unknown pipeline
-      stage (40324: an `aggregate` of a collection or a view, measured
-      8.2.11 while working RM-380) -- as the operation
-      never ran; this server writes one for each, since its handlers parse
-      and run in one step (as RM-386 has it).
-      Found while working RM-378, 2026-11-09.
-      Verify: tests/backlog/test_rm_slow_query_namespace.py::test_a_command_that_fails_to_parse_writes_no_line
-      Backlog-ID: RM-481
 - [ ] **Renaming `<db>.system.views` is refused as a view.** mongod 8.2.1
       refuses it as a write to the namespace (20 IllegalOperation, "error
       with source namespace: cannot write to <db>.system.views"); this
@@ -942,7 +1038,11 @@ These are explicit non-goals. Don't add them without a reason.
       name `<db>.c`, `<db>.<db>.c` and `<db>.startupWarnings`
       (`slowop::target_collection` reads any command's string value as
       one). Found while working RM-383, 2026-11-10.
-      Verify: tests/backlog/test_rm_drop_reports.py::test_a_command_s_string_argument_is_not_its_collection
+      (This was RM-480: A `dataSize` line names `<db>.<db>.c`.) mongod 8.2.1's
+      `Slow query` line for a `dataSize`, whose argument is a full namespace,
+      names `<db>.$cmd`; this server's joins the command's database to the
+      argument. Found while working RM-378, 2026-11-09.
+      Verify: tests/backlog/test_rm_drop_reports.py::test_a_command_s_string_argument_is_not_its_collection, tests/backlog/test_rm_slow_query_namespace.py::test_a_data_size_line_names_its_own_namespace
       Backlog-ID: RM-495
 - [ ] **Operations this server runs another way than mongod's plan say
       less.** Since RM-023 a read or a write's read that a stream runs as
@@ -1033,8 +1133,17 @@ These are explicit non-goals. Don't add them without a reason.
   and the like -- still counts. The fix is a parse step for each handler
   ahead of its run, which the line can follow (measured 2026-11-10). Found
   with RM-305.
+  (This was RM-481: A command refused as it parses writes a `Slow query`
+  line.) mongod 8.2.1 writes no line for a command its IDL parse refuses -- a
+  mistyped or missing field (14, 40414: `renameCollection: 5`, no `to`), an
+  unknown one (40415: `find` with `bogus`), a collection name that is not a
+  string (73: `find: 5`, `count: 5`), an unknown pipeline stage (40324: an
+  `aggregate` of a collection or a view, measured 8.2.11 while working RM-380)
+  -- as the operation never ran; this server writes one for each, since its
+  handlers parse and run in one step (as RM-386 has it). Found while working
+  RM-378, 2026-11-09.
   Backlog-ID: RM-386
-  Verify: tests/backlog/test_rm_001_028.py::test_a_command_its_handler_fails_to_parse_is_not_the_first_command
+  Verify: tests/backlog/test_rm_001_028.py::test_a_command_its_handler_fails_to_parse_is_not_the_first_command, tests/backlog/test_rm_slow_query_namespace.py::test_a_command_that_fails_to_parse_writes_no_line
 ### 7.091 mongod's slot-based engine (SBE) -- 2026-10-23
 
 mongod 8.2 runs the front of a pipeline in its slot-based engine when it can
@@ -1496,7 +1605,17 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       `parsedQuery` is sorted. This server lists each with
       `parsed::parsed_query`, which sorts (`canonical_match` and `tidy` sort
       too). Found 2026-11-10 (RM-414).
-      Verify: tests/backlog/test_rm_found_2026_11_10_explain_rewrites.py::test_a_pipeline_match_lists_its_clauses_as_written
+      (This was RM-444: `explain` lists a `$match` after the cursor with its
+      clauses sorted.) mongod 8.2.11 lists a `$match` stage it does not move
+      into the query (behind a `$group` or a `$limit`) with its clauses in the
+      order they were written, and an `$expr`'s `$_internalExprEq` ahead of
+      the `$expr`: `[{$limit: 3}, {$match: {x: {$exists: true}, y: 1}}]` lists
+      `$and: [{x: {$exists: true}}, {y: {$eq: 1}}]`. This server lists the
+      clauses in the order mongod gives only the query's `parsedQuery`
+      (`MatchExpression::sortTree`): `y` first, and the `$expr` before its
+      `$_internalExprEq`. The documents are the same. Found 2026-11-09 working
+      RM-311.
+      Verify: tests/backlog/test_rm_found_2026_11_10_explain_rewrites.py::test_a_pipeline_match_lists_its_clauses_as_written, tests/backlog/test_rm_found_2026_11_09.py::test_explain_lists_a_match_after_the_cursor_in_written_order
       Backlog-ID: RM-537
 - [ ] **Explain lists stages mongod's optimizer rewrites as written.**
       mongod 8.2.11 drops a `$replaceWith: "$$ROOT"`, folds a `$limit` into
@@ -1505,7 +1624,13 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       (`{b: "$a"}`) ahead of it onto `a`, and lists `$sampleRate: 0.5` as
       `$expr: {$lt: [{$rand: {}}, {$const: 0.5}]}`. This server lists
       each stage as written. Found 2026-11-10 (RM-414).
-      Verify: tests/backlog/test_rm_found_2026_11_10_explain_rewrites.py::test_the_pipeline_rewrites_mongod_lists
+      (This was RM-427: `explain` lists a `$sort` and the `$limit` after it as
+      two stages where the cursor does not absorb them.) mongod 8.2.11 lists
+      one `$sort: {sortKey, limit}` after a `$replaceRoot`, in a `$facet`
+      sub-pipeline, and after a `$rankFusion` (its own `$sort` takes the
+      `limit`), and the stages before it then count every document, not the
+      `limit` the `$limit` pulled. Found 2026-11-08 working RM-200.
+      Verify: tests/backlog/test_rm_found_2026_11_10_explain_rewrites.py::test_the_pipeline_rewrites_mongod_lists, tests/backlog/test_rm_found_2026_11_08_explain_listing.py::test_sort_and_limit_after_the_cursor_are_one_stage
       Backlog-ID: RM-538
 - [ ] **Explain's stages lack some of mongod's statistics.** At
       `executionStats` mongod 8.2.11 gives the stages inside a `$facet` and
@@ -1525,7 +1650,8 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       ends the operation it names with 11601 wherever it next checks: a
       waiting getMore, or any scan's deadline poll. Open:
       - a row has no `currentOpTime`, `lsid`, `planSummary`,
-        `queryFramework`, `numYields`, `locks`, `queues` or `waitingForLock`;
+        `queryFramework`, `numYields`, `locks` or `waitingForLock` (`queues`
+        and `currentQueue` since RM-355, 2026-11-12);
         a getMore's `cursor` block has only its id; an idle cursor's has no
         `createdDate`, `lastAccessDate`, `nDocsReturned`, `nBatchesReturned`
         or `originatingCommand` (the cursor registry does not keep them; its
@@ -2127,7 +2253,15 @@ Still different, all 77:
       counts (`allPlansExecution` and `$planCacheStats` do carry the
       accounting the trial counted). `tools/probes/explain_commands.py`
       leaves these fields out of its comparison. Found 2026-11-08 (RM-342).
-      Verify: tests/backlog/test_rm_found_2026_11_08_rm342.py::test_explain_gives_each_stage_its_work_accounting
+      (This was RM-446: A DISTINCT_SCAN plan's `executionStats` gives no work
+      counters.) mongod 8.2.11's `executionStages` for a DISTINCT_SCAN plan --
+      of `distinct`, and of a `$group` it answers from one -- gives every
+      stage's `works`, `advanced`, `needTime`, `needYield`, `saveState`,
+      `restoreState` and `isEOF` (`distinct("x", {x: {$gt: 0}})` over `x_1`:
+      `works: 4`). This server's gives `nReturned` and the scan's own fields,
+      none of them. The trial's counters, in `allPlansExecution`, are given.
+      Found 2026-11-08 (RM-310).
+      Verify: tests/backlog/test_rm_found_2026_11_08_rm342.py::test_explain_gives_each_stage_its_work_accounting, tests/backlog/test_rm_found_2026_11_08_rm310.py::test_a_distinct_scan_run_reports_its_work_counters
       Backlog-ID: RM-434
 - [ ] **A `$sort` after a `$group` mongod pushes into SBE counts its
       documents smaller than mongod's.** `[{$group: {_id: "$a"}}, {$sort:
@@ -2360,7 +2494,7 @@ What is left, all on the RUST MongoDB server:
       classic `$cursor` / `stages` shape: any other filter (`{a: null}`'s
       `typeMatch`, `$in`'s `isMember`, `$ne`'s `!`, `$or`, ...), a sorted,
       projected or index-served front (`COUNT_SCAN`, `IXSCAN` /
-      `FETCH`), a skip or limit with a group that reads a field (mongod
+      `FETCH`; for `count` on a view, RM-072), a skip or limit with a group that reads a field (mongod
       puts its dependency projection among them), `$lookup`,
       `$sortByCount` / `$bucket` (not desugared before
       `secantus_core::sbe::pushdown`, which the executor shares), any other
@@ -2396,16 +2530,6 @@ What is left, all on the RUST MongoDB server:
       **Decided 2026-10-16 (Joe):** as RM-071, transcribe and execute.
       Backlog-ID: RM-072
       Verify: tests/backlog/test_rm_057_084.py::test_explain_of_count_on_a_view_over_an_index
-- [ ] **A DISTINCT_SCAN plan's `executionStats` gives no work counters.**
-      mongod 8.2.11's `executionStages` for a DISTINCT_SCAN plan -- of
-      `distinct`, and of a `$group` it answers from one -- gives every
-      stage's `works`, `advanced`, `needTime`, `needYield`, `saveState`,
-      `restoreState` and `isEOF` (`distinct("x", {x: {$gt: 0}})` over
-      `x_1`: `works: 4`). This server's gives `nReturned` and the scan's
-      own fields, none of them. The trial's counters, in
-      `allPlansExecution`, are given. Found 2026-11-08 (RM-310).
-      Backlog-ID: RM-446
-      Verify: tests/backlog/test_rm_found_2026_11_08_rm310.py::test_a_distinct_scan_run_reports_its_work_counters
 - [ ] **A DISTINCT_SCAN bounded on a trailing field examines fewer keys
       than mongod's.** mongod 8.2.11's DISTINCT_SCAN of `x_1_y_1` for
       `distinct("x", {x: {$gt: 0}, y: {$gt: 3}})` over `x = i % 4, y = i`
@@ -2419,18 +2543,6 @@ What is left, all on the RUST MongoDB server:
       2026-11-08 (RM-310).
       Backlog-ID: RM-447
       Verify: tests/backlog/test_rm_found_2026_11_08_rm310.py::test_a_distinct_scan_bounded_on_a_trailing_field_examines_mongods_keys
-- [ ] **`explain` lists a `$match` after the cursor with its clauses
-      sorted.** mongod 8.2.11 lists a `$match` stage it does not move into
-      the query (behind a `$group` or a `$limit`) with its clauses in the
-      order they were written, and an `$expr`'s `$_internalExprEq` ahead of
-      the `$expr`: `[{$limit: 3}, {$match: {x: {$exists: true}, y: 1}}]`
-      lists `$and: [{x: {$exists: true}}, {y: {$eq: 1}}]`. This server
-      lists the clauses in the order mongod gives only the query's
-      `parsedQuery` (`MatchExpression::sortTree`): `y` first, and the
-      `$expr` before its `$_internalExprEq`. The documents are the same.
-      Found 2026-11-09 working RM-311.
-      Verify: tests/backlog/test_rm_found_2026_11_09.py::test_explain_lists_a_match_after_the_cursor_in_written_order
-      Backlog-ID: RM-444
 - [ ] **`explain` of a `$unionWith` lists its sub-pipeline as written.**
       mongod 8.2.11 explains the sub-pipeline as it does the outer one: a
       `$cursor` of its own (its `queryPlanner`, and `executionStats` above
@@ -2443,14 +2555,6 @@ What is left, all on the RUST MongoDB server:
       2026-11-08 working RM-200.
       Backlog-ID: RM-426
       Verify: tests/backlog/test_rm_found_2026_11_08_explain_listing.py::test_union_with_sub_pipeline_is_explained
-- [ ] **`explain` lists a `$sort` and the `$limit` after it as two stages
-      where the cursor does not absorb them.** mongod 8.2.11 lists one
-      `$sort: {sortKey, limit}` after a `$replaceRoot`, in a `$facet`
-      sub-pipeline, and after a `$rankFusion` (its own `$sort` takes the
-      `limit`), and the stages before it then count every document, not
-      the `limit` the `$limit` pulled. Found 2026-11-08 working RM-200.
-      Backlog-ID: RM-427
-      Verify: tests/backlog/test_rm_found_2026_11_08_explain_listing.py::test_sort_and_limit_after_the_cursor_are_one_stage
 - [ ] **A `$facet` whose sub-pipeline keeps a sort key plans no
       `SORT_KEY_GENERATOR`.** mongod 8.2.11's `$cursor` under a `$facet`
       holding a `$sort` with `outputSortKeyMetadata` (a `$setWindowFields`
@@ -2470,17 +2574,6 @@ What is left, all on the RUST MongoDB server:
       RM-185.
       Backlog-ID: RM-432
       Verify: tests/backlog/test_rm_431_432.py::test_explain_parses_the_write_it_explains
-- [ ] **A rooted `$or` whose branches are tried has a FETCH over its OR.**
-      mongod 8.2.11 plans `{$or: [{a: {$gte: 2}, b: {$gte: 3}}, {a: 0, b:
-      0}]}` over `a_1` and `b_1` branch by branch, each branch's two plans
-      by trial, and its winning plan is SUBPLAN, OR, then each branch's
-      FETCH over its IXSCAN; this server's, in `explain` and in the profile
-      entry of the `find`, puts a FETCH between the SUBPLAN and the OR.
-      With one plan per branch (`find_or` in `test_rm_355_364.py`) there is
-      none. The counts are mongod's. Measured 2026-11-09; found while
-      working RM-349.
-      Verify: tests/backlog/test_rm_found_2026_11_09_rm349.py::test_a_rooted_or_of_tried_branches_has_no_fetch_over_its_or
-      Backlog-ID: RM-459
 
 ### 7.074 Change streams, command by command -- 2026-10-11
 
@@ -2683,6 +2776,17 @@ bytes are ICU's. What is left, there and beside it:
       **Decided 2026-10-16 (Joe):** `explain` reports mongod's plan, as it
       does; where the router reads differently, as here, the router is
       brought to the plan. Each such place is a performance bug.
+      (This was RM-119, from the removed "Collation server-wide" record.) Any
+      command `collation` forces a COLLSCAN plus an in-memory collation-aware
+      match / sort: `crates/secantus-storage/src/lib.rs` `find_matching_with`
+      sets `force_collscan = coll_opt.is_some()` ("Per-index-collation IXSCAN
+      is a later optimisation"), even when an index was built with the same
+      collation. Results are correct; the cost is a full scan. The Python
+      server already uses a collated index whose collation matches exactly
+      (`docs/indexes.md` "Per-index collation"; `numericOrdering` still
+      COLLSCANs there). Reproduce: create `{name: 1}` with `collation:
+      {locale: "en", strength: 2}`, then `find({name: "x"}).collation({locale:
+      "en", strength: 2})` and look at how the storage router reads it.
       Backlog-ID: RM-094
       Verify: none -- explain already reports IXSCAN (derived from mongod's rules); the gap is the router scanning, a cost no reply shows
 
@@ -2918,20 +3022,6 @@ race on demand, which is worth having if this area changes again.
   Diagnose before trusting week-over-week go comparisons.
   Backlog-ID: RM-118
   Verify: none -- Go gauge CI test-count discrepancy
-- [ ] **Per-index-collation IXSCAN on the Rust server** (from the removed
-  "Collation server-wide" record). Any command `collation` forces a COLLSCAN
-  plus an in-memory collation-aware match / sort:
-  `crates/secantus-storage/src/lib.rs` `find_matching_with` sets
-  `force_collscan = coll_opt.is_some()` ("Per-index-collation IXSCAN is a later
-  optimisation"), even when an index was built with the same collation. Results
-  are correct; the cost is a full scan. The Python server already uses a
-  collated index whose collation matches exactly (`docs/indexes.md` "Per-index
-  collation"; `numericOrdering` still COLLSCANs there). Reproduce: create
-  `{name: 1}` with `collation: {locale: "en", strength: 2}`, then
-  `find({name: "x"}).collation({locale: "en", strength: 2})` and look at how
-  the storage router reads it.
-  Backlog-ID: RM-119
-  Verify: none -- performance (router COLLSCAN); results correct and explain reports mongod's plan
 - [ ] **One-time: configure a PyPI Trusted Publisher for `secantus-core`.**
   On PyPI, add a Trusted Publisher for the (new) `secantus-core` project pointing
   at `.github/workflows/rust-wheels.yml` (environment `pypi`), mirroring the
@@ -3052,6 +3142,9 @@ unexplained.
   the SecantusDB side; the same counter on mongod's collection and oplog tables
   would give a like-for-like write-volume comparison. That is the measurement
   the 42x claim should have been built on.
+  (This was RM-134.) Also measure write amplification: bytes on disk per
+  insert, SecantusDB versus mongod at a fixed document size. The leading
+  hypothesis, and untested.
   Backlog-ID: RM-130
   Verify: none -- write-volume measurement campaign
 
@@ -3144,10 +3237,6 @@ above was of a fixed limit; the tail under probing is not yet measured.
 
 ### Where to go next
 
-- [ ] **Measure write amplification** — bytes on disk per insert, SecantusDB
-  versus mongod at a fixed document size. The leading hypothesis, and untested.
-  Backlog-ID: RM-134
-  Verify: none -- write-amplification measurement
 - [ ] **`--oplog-async` as a default** — worth 24% of the tail and 42% of the
   stalls on its own, independently of the cache story. Every write currently
   passes through one process-wide `Arc<Mutex<OplogState>>`.

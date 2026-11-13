@@ -620,8 +620,12 @@ fn tie_breaking_bonuses(plans: &[Node], stats: &[Stats], scores: &mut [f64], ord
 /// A plan stage's type and children, as `areNodesCompatible` compares them.
 fn kind_and_children(node: &Node) -> (String, Vec<&Node>) {
     let kind = match node {
-        Node::Sort { on_keys, .. } => {
-            if *on_keys {
+        Node::Sort {
+            on_keys,
+            keeps_metadata,
+            ..
+        } => {
+            if *on_keys || *keeps_metadata {
                 "SORT_DEFAULT".to_string()
             } else {
                 "SORT_SIMPLE".to_string()

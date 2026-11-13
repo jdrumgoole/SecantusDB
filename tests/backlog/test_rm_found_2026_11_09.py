@@ -29,7 +29,7 @@ def _listed_matches(client: Any) -> dict:
     return out
 
 
-@pytest.mark.backlog("RM-444")
+@pytest.mark.backlog("RM-537")
 def test_explain_lists_a_match_after_the_cursor_in_written_order(
     rust_mongo: Any, mongod: Any
 ) -> None:
