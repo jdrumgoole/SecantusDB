@@ -29,7 +29,33 @@ read `origin/<branch>`; step 7 has the landing. Never push to `main`.
 lane's, reused item after item so its cargo target and venv stay warm
 (step 2 has the switch, step 8 what to leave). Never remove it.
 
-One item, one branch, one PR, one merge, one teardown. Every step below
+**Bundle mode: `bundle RP-a,RP-b,...` in the arguments** (with `into` and
+`lane`, from a driver that hands one lane a bundle at a time). The items
+share one mechanism, and working them in one session keeps what the first
+one taught you for the rest (Joe, 2026-11-13: bigger items are bundled "so
+we don't lose context"). It changes these steps:
+
+- **Read every item in the bundle, and reproduce each, before writing
+  code** (steps 1-3). Plan the order: the item whose change the others
+  build on first. Skip an ID already gone from `origin/<branch>`.
+- **Claim once**, a branch named for the bundle (`bundle-<first ID>`).
+- **One commit per item**, each closing or trimming its own item, with its
+  own `changelog.d/` fragment and its own gap test re-marked (step 5). A
+  commit may close only part of an item (trim it, `backlog` "Working an
+  item" step 5).
+- **Gate and push as you go**: `gate_pg.sh --fast` after each item (or
+  each two small ones), then rebase and push to `<branch>` (step 7). Never
+  hold a gated commit unpushed while you start the next item: a session
+  that ends mid-bundle loses whatever is not on origin.
+- **Stop when the next item needs more than the context you have left**,
+  or the bundle is done. Leave every remaining item's text accurate: what
+  you learned about it goes into its prose, so the next session starts
+  from it.
+- **Report** `landed on <branch> at <sha>` with the LAST sha you pushed,
+  and one more line, plain text: `bundle left: RP-x RP-y` (the items still
+  open) or `bundle left: none`.
+
+One item (or one bundle), one branch, one PR, one merge, one teardown. Every step below
 points at the skill that owns its detail -- read that skill when you reach
 the step, do not work from memory.
 
