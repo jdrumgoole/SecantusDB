@@ -1024,6 +1024,14 @@ impl FunctionMemory {
         })
     }
 
+    /// What the function holds before its first answer in a partition.
+    fn at_start(&self) -> usize {
+        match self {
+            FunctionMemory::Removable { base, .. } => *base,
+            _ => 0,
+        }
+    }
+
     /// The bytes held once the window covers indices `from..=upto` of
     /// `slots`, answering `pos`, and the most held on the way there. A
     /// removable function takes in the values entering its window before
@@ -1402,17 +1410,40 @@ impl PartitionToken {
             _ => self.key,
         }
     }
+}
 
-    /// The most it holds at once: reading the next partition's first
-    /// document, the comparator holds that partition's key before it lets
-    /// this one's go (`maxTotalMemoryUsageBytes`, measured 8.2.1,
-    /// 2026-11-08: a partition of whole-partition `$first` peaks at its
-    /// documents, the next one's first and both keys).
-    fn peak(&self, read_next: bool) -> usize {
-        match self.next {
-            Some(_) if read_next => self.bytes(true) + self.key,
-            _ => self.key,
-        }
+// mongod's iterator counts its state through one `MemoryUsageToken`, and
+// `updateNextPartitionStateSize` replaces it by assigning a new token over
+// the old: the new one is added to the tracker before the old one is let
+// go, so for that moment the tracker holds both, and its largest total sees
+// them (`partition_iterator.cpp`, r8.2.1). It does so at two moments:
+//
+// - reading the next partition's first document (`getNextDocument`): the
+//   old token (this partition's key) and the new (that document and its
+//   key, which the comparator already holds), while the cache holds what
+//   it read and the functions what they held when the read happened;
+// - starting that partition (`advanceToNextPartition`): the cache is
+//   cleared and given that document, the old token still counts it and its
+//   key, the new one counts the key again, and the functions still hold the
+//   last partition's state (`doGetNext` resets them after `advance`).
+//
+// The first partition's start replaces an empty token, so it counts its key
+// once. Measured 8.2.11 (2026-11-13, RM-510): partitions of 1-20 documents
+// with keys of 16, 152 and 440 bytes, over range, document, running and
+// whole-partition windows.
+
+/// What a function held when the partition iterator read past the
+/// partition's end for it. A range window finds its endpoints before it
+/// adds a value (`getEndpoints`, then `addValue`), and so does a document
+/// window after its first answer (`update` reads its upper bound first);
+/// a document window's first answer (`initialize`) adds each document it
+/// reads before reading the next, so it holds the whole window by then.
+fn held_at_read(c: &OutField, pos: usize, before: usize, after: usize) -> usize {
+    let range = c.window.is_some_and(|w| w.contains_key("range"));
+    if pos == 0 && !range && c.op != "$derivative" {
+        after
+    } else {
+        before
     }
 }
 
@@ -1505,14 +1536,20 @@ fn run_cache(
         }
         Ok(())
     };
-    let mut outside_before = token.bytes(false);
-    let mut held_before = vec![0usize; compiled.len()];
+    // What each function holds before its first answer: a removable one its
+    // own size (`WindowFunctionExecRemovable` sets it on construction and on
+    // `reset`), the others nothing (r8.2.1; measured 8.2.11, RM-510).
+    let mut held_before: Vec<usize> = functions.iter().map(FunctionMemory::at_start).collect();
+    let mut outside_before = token.bytes(false) + held_before.iter().sum::<usize>();
     for pos in 0..n {
         let mut ahead = pos as i64;
         let mut reads = Vec::with_capacity(compiled.len());
         let mut empties = Vec::with_capacity(compiled.len());
+        let mut reaches = Vec::with_capacity(compiled.len());
         for c in compiled {
-            ahead = ahead.max(reach(c, pos, n, range_vals, range_dates)?.1);
+            let hi = reach(c, pos, n, range_vals, range_dates)?.1;
+            reaches.push(hi);
+            ahead = ahead.max(hi);
             // A function reads its window, not the iterator's look-ahead.
             let (from, upto) = match c.window {
                 None => (0, n as i64 - 1),
@@ -1531,35 +1568,45 @@ fn run_cache(
             outside_before,
             &mut stats.total,
         )?;
-        read_next |= ahead > last;
         // The functions update one after another: while one holds its
         // peak, those before it hold their new windows and those after it
-        // their old ones.
+        // their old ones. The first to ask past the partition's end makes
+        // the iterator read the next partition's first document.
         let mut functions_held = 0usize;
         let mut not_yet: usize = held_before.iter().sum();
-        for (((((f, c), window), max), before), empty) in functions
+        for ((((((f, c), window), max), before), empty), hi) in functions
             .iter_mut()
             .zip(compiled)
             .zip(&reads)
             .zip(stats.functions.iter_mut())
             .zip(held_before.iter_mut())
             .zip(&empties)
+            .zip(&reaches)
         {
             let (held, peak) = f.held(
                 c, pos, *window, *empty, slots, docs, sort_field, vars, sizer, ranks,
             )?;
             *max = (*max).max(peak);
             not_yet -= *before;
+            if *hi > last && !read_next {
+                if let Some((doc, key)) = token.next {
+                    let at_read = held_at_read(c, pos, *before, held);
+                    stats.total = stats.total.max(
+                        cache.used + functions_held + at_read + not_yet + token.key + doc + key,
+                    );
+                }
+                read_next = true;
+            }
             stats.total = stats
                 .total
-                .max(cache.used + functions_held + peak + not_yet + token.peak(read_next));
+                .max(cache.used + functions_held + peak + not_yet + token.bytes(read_next));
             *before = held;
             functions_held += held;
         }
         let outside = functions_held + token.bytes(read_next);
         stats.total = stats
             .total
-            .max(cache.used + functions_held + token.peak(read_next));
+            .max(cache.used + functions_held + token.bytes(read_next));
         outside_before = outside;
         if cache.used + outside > budget {
             if crate::memlimit::disk_allowed() {
@@ -1589,6 +1636,15 @@ fn run_cache(
                 let (_, s) = cache.held.pop_front().expect("a front");
                 cache.used -= s;
             }
+        } else if let Some((doc, key)) = token.next {
+            // Advancing past the last document reads the next partition's
+            // first, if no window did, and then starts that partition.
+            if !read_next {
+                stats.total = stats
+                    .total
+                    .max(cache.used + functions_held + token.key + doc + key);
+            }
+            stats.total = stats.total.max(2 * (doc + key) + functions_held);
         }
     }
     Ok(())
@@ -3102,6 +3158,40 @@ mod budget_tests {
             .map(|d| d.get(SORT_KEY_FIELD).unwrap())
             .collect();
         assert_eq!(back, keys.iter().collect::<Vec<_>>());
+    }
+
+    /// mongod's iterator replaces its token by assigning a new one over the
+    /// old, so it counts both for a moment (RM-510). Reading the next
+    /// partition's first document counts this partition's key and that
+    /// document with its key; starting that partition counts the document
+    /// in the cache and in the old token, and the key twice. A `[0, 0]`
+    /// `$first` keeps the document leaving its window, so with two
+    /// documents a partition the read peaks at three documents and two
+    /// keys, and with one the start at two of each (mongod 8.2.11:
+    /// 428 and 296 for documents of 132 bytes, 2026-11-13).
+    #[test]
+    fn replacing_the_partition_token_counts_both() {
+        let total = |per: i32| {
+            let docs: Vec<Document> = (0..2 * per)
+                .map(|i| doc! {"_id": i, "k": i / per, "n": i})
+                .collect();
+            let size = memlimit::document_size(&docs[0]);
+            assert!(docs.iter().all(|d| memlimit::document_size(d) == size));
+            let spec = window(
+                bson!({"$first": "$n", "window": {"documents": [0, 0]}}),
+                true,
+            );
+            let (_, report) = memlimit::captured(|| {
+                set_window_fields_each(&spec, docs, &Document::new(), None, None, None, &mut |_| {
+                    Ok(())
+                })
+            });
+            (report.windows[0].max_total_memory, size)
+        };
+        let (two, size) = total(2);
+        assert_eq!(two, (3 * size + 2 * memlimit::VALUE) as i64);
+        let (one, size) = total(1);
+        assert_eq!(one, (2 * size + 2 * memlimit::VALUE) as i64);
     }
 
     /// What `explain` lists for the stage: each function's most and the

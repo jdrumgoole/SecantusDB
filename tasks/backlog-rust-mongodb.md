@@ -1556,20 +1556,6 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       9). Found 2026-11-13 (RM-506).
       Verify: tests/backlog/test_rm_found_2026_11_13_rm506.py::test_a_missing_field_counts_its_slot
       Backlog-ID: RM-616
-- [ ] **A partitioned window's `maxTotalMemoryUsageBytes` is 16 bytes off.**
-      With `partitionBy` over three partitions of 40 small documents,
-      macOS mongod 8.2.1 reports 748 for a `range [-4, 4]` `$sum` (here
-      764), 2180 for a whole-partition `$sum` (2196), 480 for a running
-      `$sum` (464) and 432 for `$expMovingAvg` (416). Both directions, one
-      partition key's size; the least budgets agree, so the moment the
-      tracker sees differs, not what the budget counts. Cause not yet
-      traced. A window with no lower end over a function that keeps its
-      values is off by one value more: macOS mongod 8.2.11 reports 756 for
-      a partitioned `["unbounded", -1]` `$push` (here 724: 16 and one int's
-      16) and 1940 for `$integral` (here 1836: 16 and one point's 88;
-      RM-509). Found 2026-11-10 (RM-404).
-      Verify: tests/backlog/test_rm_found_2026_11_10_rm404.py::test_a_partitioned_windows_total_memory
-      Backlog-ID: RM-510
 - [ ] **`explain` with `executionStats` answers where a `$setWindowFields`
       fails.** mongod 8.2.11 runs the pipeline for `executionStats` and
       returns the executor's error: a `$sum` of `{$divide: [1, "$z"]}` over
