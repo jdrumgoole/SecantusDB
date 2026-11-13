@@ -675,25 +675,7 @@ impl PgHandler {
                     };
                     neqjoinsel(&stats(l)?, &stats(r)?)?
                 }
-                // A cast key is an expression with no statistics: its
-                // distinct count `get_variable_numdistinct`'s default, no
-                // NULLs and no MCV list.
-                FilterKind::NotEqualCast(l, r) => {
-                    let (x, y) = (
-                        ne_operand(self, &key_columns, l)?,
-                        ne_operand(self, &key_columns, r)?,
-                    );
-                    // Operands of two types compare through PostgreSQL's
-                    // cross-type operator (`int48ne`) where one takes them
-                    // as they are; one that coerces an operand first
-                    // (`int4 <> numeric`) is not estimated. A cast key has
-                    // no MCV list, so `eqjoinsel` never compares values.
-                    if x.type_oid != y.type_oid && !ne_operator_exists(x.type_oid, y.type_oid) {
-                        return None;
-                    }
-                    let eq = secantus_pgplan::joincost::eqjoinsel_inner(&x.stats(), &y.stats());
-                    1.0 - eq.clamp(0.0, 1.0)
-                }
+                FilterKind::NotEqualCast(l, r) => neqjoinsel_cast(self, &key_columns, l, r)?,
                 _ => return None,
             };
             sel_factor *= s;
@@ -949,6 +931,14 @@ impl PgHandler {
             let (_, field) = leaf.keys.iter().find(|(key, _)| *key == k)?;
             self.analysed_key(leaf.table, field)
         };
+        let key_columns: Vec<(String, String, String)> = leaves
+            .iter()
+            .flat_map(|l| {
+                l.keys
+                    .iter()
+                    .map(|(key, field)| (key.to_string(), l.table.to_string(), field.clone()))
+            })
+            .collect();
         let mut clauses: Vec<Clause> = Vec::new();
         for f in filter_lists.iter().copied().flatten() {
             let secantus_pgplan::ColumnExpr::Row { fields, .. } = &f.expr else {
@@ -960,6 +950,7 @@ impl PgHandler {
             let sel = match &f.kind {
                 FilterKind::Inequality => 1.0 / 3.0,
                 FilterKind::NotEqual(l, r) => neqjoinsel(&stats(l)?, &stats(r)?)?,
+                FilterKind::NotEqualCast(l, r) => neqjoinsel_cast(self, &key_columns, l, r)?,
                 _ => return None,
             };
             let mut set = 0u32;
@@ -5203,6 +5194,31 @@ fn neqjoinsel(x: &AnalysedKey, y: &AnalysedKey) -> Option<f64> {
         }
     }
     let eq = secantus_pgplan::joincost::eqjoinsel_inner(&key(x), &key(y));
+    Some(1.0 - eq.clamp(0.0, 1.0))
+}
+
+/// `neqjoinsel` of a `<>` between two joined keys of which one or both is
+/// cast: a cast key is an expression with no statistics, its distinct
+/// count `get_variable_numdistinct`'s default, no NULLs and no MCV list
+/// (`examine_variable`). Operands of two types compare through
+/// PostgreSQL's cross-type operator (`int48ne`) where one takes them as
+/// they are; one that coerces an operand first (`int4 <> numeric`) is not
+/// estimated. A cast key has no MCV list, so `eqjoinsel` never compares
+/// values.
+fn neqjoinsel_cast(
+    h: &PgHandler,
+    key_columns: &[(String, String, String)],
+    l: &secantus_pgplan::joins::CastKey,
+    r: &secantus_pgplan::joins::CastKey,
+) -> Option<f64> {
+    let (x, y) = (
+        ne_operand(h, key_columns, l)?,
+        ne_operand(h, key_columns, r)?,
+    );
+    if x.type_oid != y.type_oid && !ne_operator_exists(x.type_oid, y.type_oid) {
+        return None;
+    }
+    let eq = secantus_pgplan::joincost::eqjoinsel_inner(&x.stats(), &y.stats());
     Some(1.0 - eq.clamp(0.0, 1.0))
 }
 

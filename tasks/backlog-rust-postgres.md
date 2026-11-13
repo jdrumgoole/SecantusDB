@@ -1616,8 +1616,7 @@ a regression test.
         > length(e.b))`);
       - a join of three tables whose third is indexed (`e join e e2 on
         e.a < e2.a join k on e2.a < k.a`: a Memoize keyed by `e2.a` over
-        the parameterized Index Scan), or whose upper `<>` coerces its
-        operands (`e2.a::numeric <> e3.a::numeric`);
+        the parameterized Index Scan);
       - a LEFT join's ON conjunct over its preserved side that is a regex
         match (`e.b ~ 'v1'`, whose selectivity is RP-423's).
       Since 2026-11-13 an IN list of constants there is priced (its
@@ -1626,10 +1625,12 @@ a regression test.
       the join's startup) and estimated; one inside an `OR` is not, as a
       lone scan's is not (RP-028). So is a cast of a column to an integer
       or string type compared with a constant (`e.a::text <> '5'`), there
-      and on a lone scan. A binary-coercible cast is RP-912; a join
-      PostgreSQL orders otherwise, RP-919.
+      and on a lone scan, and a `<>` of three or more tables' join whose
+      operands are cast or coerced (`e2.a::numeric <> e3.a::numeric`). A
+      binary-coercible cast is RP-912; a join PostgreSQL orders otherwise,
+      RP-919.
       Backlog-ID: RP-354
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[nested loop into an index bounded by a call of the outer side], tests/backlog/test_rp_explain_costs.py::test_plan[nested loop of three relations into an index], tests/backlog/test_rp_explain_costs.py::test_plan[nested loop of three relations with a coerced <> above], tests/backlog/test_rp_explain_costs.py::test_plan[a left join's on conjunct over the preserved side is a regex match]
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[nested loop into an index bounded by a call of the outer side], tests/backlog/test_rp_explain_costs.py::test_plan[nested loop of three relations into an index], tests/backlog/test_rp_explain_costs.py::test_plan[a left join's on conjunct over the preserved side is a regex match]
 - [ ] **A nested loop's Join Filter keeps the ON's written order.**
       PostgreSQL 15.19 orders a join's qual list cheapest first
       (`order_qual_clauses`, by `cost_qual_eval`, stable among equal

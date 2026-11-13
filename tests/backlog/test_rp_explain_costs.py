@@ -2062,16 +2062,55 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "        ->  Seq Scan on e e3  (cost=0.00..15.00 rows=1000 width=7)",
         ],
     ),
-    # Still open (RP-354): a join of three tables whose upper `<>`
-    # coerces both operands, each an expression with no statistics.
+    # Split from RP-354 and fixed: a join of three tables whose upper `<>`
+    # casts both operands, each an expression with no statistics
+    # (`neqjoinsel` over `get_variable_numdistinct`'s default of 200);
+    # before, the join printed zeros.
     "nested loop of three relations with a coerced <> above": (
-        "RP-354",
+        "RP-329",
         _ANALYSED,
         "explain select * from e join e e2 on e.a < e2.a"
         " join e e3 on e2.a::numeric <> e3.a::numeric",
         [
             "Nested Loop  (cost=0.00..6681710.00 rows=331666335 width=21)",
             "  Join Filter: ((e2.a)::numeric <> (e3.a)::numeric)",
+            "  ->  Nested Loop  (cost=0.00..15032.50 rows=333333 width=14)",
+            "        Join Filter: (e.a < e2.a)",
+            "        ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
+            "        ->  Materialize  (cost=0.00..20.00 rows=1000 width=7)",
+            "              ->  Seq Scan on e e2  (cost=0.00..15.00 rows=1000 width=7)",
+            "  ->  Materialize  (cost=0.00..20.00 rows=1000 width=7)",
+            "        ->  Seq Scan on e e3  (cost=0.00..15.00 rows=1000 width=7)",
+        ],
+    ),
+    # One operand coerced for its operator (`int4 <> numeric` is
+    # `numeric <> numeric`).
+    "nested loop of three relations with a <> above coercing one operand": (
+        "RP-329",
+        _ANALYSED,
+        "explain select * from e join e e2 on e.a < e2.a join e e3 on e2.a <> e3.a::numeric",
+        [
+            "Nested Loop  (cost=0.00..6681710.00 rows=331666335 width=21)",
+            "  Join Filter: ((e2.a)::numeric <> (e3.a)::numeric)",
+            "  ->  Nested Loop  (cost=0.00..15032.50 rows=333333 width=14)",
+            "        Join Filter: (e.a < e2.a)",
+            "        ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
+            "        ->  Materialize  (cost=0.00..20.00 rows=1000 width=7)",
+            "              ->  Seq Scan on e e2  (cost=0.00..15.00 rows=1000 width=7)",
+            "  ->  Materialize  (cost=0.00..20.00 rows=1000 width=7)",
+            "        ->  Seq Scan on e e3  (cost=0.00..15.00 rows=1000 width=7)",
+        ],
+    ),
+    # A cast operand against an analysed column, through the cross-type
+    # `int84ne`: `eqjoinsel` takes the larger distinct count, the column's
+    # 1,000.
+    "nested loop of three relations with a <> above casting one operand": (
+        "RP-329",
+        _ANALYSED,
+        "explain select * from e join e e2 on e.a < e2.a join e e3 on e2.a::bigint <> e3.a",
+        [
+            "Nested Loop  (cost=0.00..5848377.50 rows=332999667 width=21)",
+            "  Join Filter: ((e2.a)::bigint <> e3.a)",
             "  ->  Nested Loop  (cost=0.00..15032.50 rows=333333 width=14)",
             "        Join Filter: (e.a < e2.a)",
             "        ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
