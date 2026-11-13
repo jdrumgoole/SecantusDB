@@ -215,6 +215,21 @@ pub fn apply_pipeline(
                 .map(|k| k.split('.').next().unwrap_or(k).to_string())
                 .collect();
             let limit = limit_for_pushdown(&pipeline[i + 1..]);
+            // An SBE sort's row holds the slots the stages after it read: not
+            // a field only its key reads, nor one only a `$match` in front of
+            // it read (measured 8.2.11, RM-504). Its key is a slot of its own.
+            let sbe_row = (source == Some(crate::sorter::SortSource::Sbe))
+                .then(|| {
+                    let mut after: Vec<Bson> = pipeline[i + 1..].to_vec();
+                    DOWNSTREAM.with(|d| after.extend(d.borrow().iter().cloned()));
+                    group::downstream_fields(&after)
+                })
+                .flatten();
+            let kept_fields = |source: crate::sorter::SortSource| match source {
+                crate::sorter::SortSource::QueryLayer => None,
+                crate::sorter::SortSource::Sbe => sbe_row.as_ref(),
+                _ => scanned.as_ref(),
+            };
             // The `$sort` a `$setWindowFields` runs behind attaches each
             // document's sort key as metadata, which it counts and the window
             // then holds; the query layer's does not (measured 8.2.11).
@@ -282,19 +297,13 @@ pub fn apply_pipeline(
                 }
                 (Some(source), Some(input)) => {
                     order = stable(&docs)?;
-                    let fields = match source {
-                        crate::sorter::SortSource::QueryLayer => None,
-                        _ => scanned.as_ref(),
-                    };
+                    let fields = kept_fields(source);
                     budgeted_sort_stage(input, spec, source, fields, None, None, limit)?;
                     docs.truncate(limit.unwrap_or(usize::MAX));
                     docs
                 }
                 (Some(source), None) => {
-                    let fields = match source {
-                        crate::sorter::SortSource::QueryLayer => None,
-                        _ => scanned.as_ref(),
-                    };
+                    let fields = kept_fields(source);
                     let added = (source == crate::sorter::SortSource::Modified
                         && !added.is_empty())
                     .then_some(&added);

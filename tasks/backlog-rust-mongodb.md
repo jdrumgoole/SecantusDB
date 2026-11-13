@@ -1504,21 +1504,13 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       writes its t-digest; this server keeps, and writes, the values).
       Backlog-ID: RM-325
       Verify: tests/backlog/test_rm_found_2026_10_26.py::test_spill_storage_size
-- [ ] **An SBE sort keeps a field only its key reads.** mongod 8.2.11's
-      slot-based sort in front of `{$group: {_id: "$k", f: {$first:
-      "$s"}}}` keeps `k` and `s` beside its key `n`, a row of 1064 bytes for
-      documents of a 1000-byte `s`, and over 300 of them under a 50000-byte
-      budget counts 274512 in `totalBytesSorted` and
-      `sortTotalDataSizeBytes` (six spills of 43 rows while reading). This
-      server's row also keeps `n` (1073), so it counts 276834. Found
-      2026-11-10 (RM-398).
-      Verify: tests/backlog/test_rm_326_sort_counts.py::test_sbe_sort_row_leaves_out_a_field_only_the_key_reads
-      Backlog-ID: RM-504
-- [ ] **An SBE sort's spilled records are a byte longer than mongod's.**
+- [ ] **An SBE sort's spilled records are not the size of mongod's.**
       mongod 8.2.11's slot-based sort in front of a `$group`, over 300
       documents of a 1000-byte `s` under a 50000-byte budget, writes 13 runs
       of 900 records in 927900 bytes (1031 a record); this server writes the
-      same runs in 928800 (1032). Found 2026-11-10 (RM-398).
+      same runs in 922500 (1025): it writes each row, `k` and `s` since
+      RM-504, as a BSON document rather than as SBE's row of values. Found
+      2026-11-10 (RM-398).
       Verify: tests/backlog/test_rm_326_sort_counts.py::test_sbe_sort_spilled_bytes
       Backlog-ID: RM-506
 - [ ] **A `range` window's `"current"` bound takes in tied documents.**

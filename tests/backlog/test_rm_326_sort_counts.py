@@ -336,13 +336,77 @@ def _sbe_sort_spilled(client: Any) -> dict:
     }
 
 
-@pytest.mark.backlog("RM-504")
+@pytest.mark.backlog_fixed("RM-504")
 def test_sbe_sort_row_leaves_out_a_field_only_the_key_reads(rust_mongo: Any, mongod: Any) -> None:
     """mongod 8.2.11's SBE sort in front of `{$group: {_id: "$k", f:
     {$first: "$s"}}}` keeps `k` and `s` beside its key, not `n`, which only
     the sort reads: a row of 1064, so its six spills while reading count
-    274512, where this server's rows of 1073 count 276834."""
+    274512, where this server's rows of 1073 counted 276834 until its row
+    kept only what the stages after the sort read."""
     assert _sbe_sort_spilled(rust_mongo) == _sbe_sort_spilled(mongod)
+
+
+SBE_ROWS = {
+    # The `$group` reads the key's field too: the row keeps it.
+    "the group reads the key": [
+        {"$sort": {"n": 1}},
+        {"$group": {"_id": "$k", "f": {"$first": "$s"}, "g": {"$last": "$n"}}},
+    ],
+    # A field only a `$match` in front of the sort reads is not kept.
+    "a $match before it": [
+        {"$match": {"t": {"$gte": 0}}},
+        {"$sort": {"n": 1}},
+        {"$group": {"_id": "$k", "f": {"$first": "$s"}}},
+    ],
+    "a compound key": [
+        {"$sort": {"n": 1, "t": -1}},
+        {"$group": {"_id": "$k", "f": {"$first": "$s"}}},
+    ],
+    # A dotted key reads `d.x`; the row keeps no `d`.
+    "a dotted key": [
+        {"$sort": {"d.x": 1}},
+        {"$group": {"_id": "$k", "f": {"$first": "$s"}}},
+    ],
+    # ... unless the `$group` reads under `d` too.
+    "a dotted key the group reads beside": [
+        {"$sort": {"d.x": 1}},
+        {"$group": {"_id": "$k", "f": {"$first": "$s"}, "y": {"$first": "$d.y"}}},
+    ],
+}
+
+
+def _sbe_sort_rows(client: Any) -> dict:
+    client.drop_database("rm504")
+    db = client.rm504
+    db.c.insert_many(
+        [
+            {"_id": i, "k": i % 7, "s": "x" * 1000, "n": i, "t": 2 * i, "d": {"x": i, "y": 3}}
+            for i in range(300)
+        ]
+    )
+    out = {}
+    for name, pipeline in SBE_ROWS.items():
+        before = _sort_metrics(client)
+        entry = _profiled(db, pipeline, SORT_BUDGET, f"rm504-{name}")
+        after = _sort_metrics(client)
+        out[name] = (
+            after["totalBytesSorted"] - before["totalBytesSorted"],
+            entry.get("sortTotalDataSizeBytes"),
+            entry.get("sortSpills"),
+        )
+    return out
+
+
+@pytest.mark.backlog_fixed("RM-504")
+def test_sbe_sort_row_keeps_what_the_stages_after_it_read(rust_mongo: Any, mongod: Any) -> None:
+    """mongod 8.2.11's SBE sort row holds what the stages after the sort
+    read, the key's own field included when they read it (276834 over 13
+    spills), and neither a field a `$match` in front of it read nor the
+    parent of a dotted key alone (274512); a compound key counts its second
+    value (276834), and `d.y` read beside a key on `d.x` keeps all of `d`
+    (321048 over 14). This server kept every field the pipeline read, and
+    with them all of `d` and `t`: 320754 and 321048 over 14 spills."""
+    assert _sbe_sort_rows(rust_mongo) == _sbe_sort_rows(mongod)
 
 
 def _sbe_sort_spilled_bytes(client: Any) -> dict:
@@ -359,7 +423,8 @@ def _sbe_sort_spilled_bytes(client: Any) -> dict:
 @pytest.mark.backlog("RM-506")
 def test_sbe_sort_spilled_bytes(rust_mongo: Any, mongod: Any) -> None:
     """mongod 8.2.11's SBE sort in front of a `$group` writes 13 runs of 900
-    records, 927900 bytes (1031 a record); this server writes 928800."""
+    records, 927900 bytes (1031 a record); this server writes 922500, its
+    rows as BSON documents."""
     assert _sbe_sort_spilled_bytes(rust_mongo) == _sbe_sort_spilled_bytes(mongod)
 
 
