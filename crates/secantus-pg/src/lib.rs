@@ -43821,27 +43821,42 @@ impl PgHandler {
                         }
                     }
                 }
-                // A Nested Loop of a Nested Loop of two tables'
-                // sequential scans and a third's (RP-354): PostgreSQL's
-                // search over the three, where it keeps this order.
+                // A left-deep chain of Nested Loops over three or more
+                // tables' sequential scans (RP-354): PostgreSQL's search
+                // over them, where it keeps this order.
                 let bare_scan = |c: &explain::PlanNode| {
                     c.children.is_empty() && c.name.starts_with("Seq Scan on ")
                 };
-                if tree.name == "Nested Loop"
-                    && tree.details.is_empty()
-                    && tree.children.len() == 2
-                    && tree.children[0].name == "Nested Loop"
-                    && tree.children[0].details.is_empty()
-                    && tree.children[0].children.len() == 2
-                    && tree.children[0].children.iter().all(bare_scan)
-                    && bare_scan(&tree.children[1])
-                {
+                let mut depth = 0;
+                let mut node = &tree;
+                let chain = loop {
+                    if node.name != "Nested Loop"
+                        || !node.details.is_empty()
+                        || node.children.len() != 2
+                        || !bare_scan(&node.children[1])
+                    {
+                        break false;
+                    }
+                    depth += 1;
+                    if bare_scan(&node.children[0]) {
+                        break true;
+                    }
+                    node = &node.children[0];
+                };
+                if chain && depth >= 2 {
                     if let Statement::Select(sel) = inner.as_ref() {
-                        if let Some(est) = self.nest_loop3_estimate(sel) {
-                            let (plan, a, b, join) = est.lower;
-                            explain::price_nest_loop(&mut tree.children[0], &plan, a, b, join);
-                            let (plan, a, b, join) = est.top;
-                            explain::price_nest_loop(&mut tree, &plan, a, b, join);
+                        if let Some(levels) = self.nest_loop_chain_estimate(sel) {
+                            if levels.len() == depth {
+                                // Lowest first, so each join above is
+                                // still the tree's when it is reached.
+                                for (i, (plan, a, b, join)) in levels.iter().enumerate() {
+                                    let mut node = &mut tree;
+                                    for _ in 0..depth - 1 - i {
+                                        node = &mut node.children[0];
+                                    }
+                                    explain::price_nest_loop(node, plan, *a, *b, *join);
+                                }
+                            }
                         }
                     }
                 }

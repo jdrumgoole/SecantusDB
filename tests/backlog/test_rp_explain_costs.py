@@ -2001,10 +2001,11 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "        Index Cond: (y > e.a)",
         ],
     ),
-    # Still open (RP-354): a join of three tables whose upper clause is a
-    # `<>` is priced as one of `<`: its selectivity `neqjoinsel`'s.
+    # Split from RP-354 and fixed: a join of three tables whose upper
+    # clause is a `<>` is priced as one of `<`, its selectivity
+    # `neqjoinsel`'s; before, the join printed zeros.
     "nested loop of three relations with a <> above": (
-        "RP-354",
+        "RP-329",
         _ANALYSED,
         "explain select * from e join e e2 on e.a < e2.a join e e3 on e2.a <> e3.a",
         [
@@ -2019,9 +2020,11 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "        ->  Seq Scan on e e3  (cost=0.00..15.00 rows=1000 width=7)",
         ],
     ),
-    # Still open (RP-354): a join of four tables, three Nested Loops.
+    # Split from RP-354 and fixed: a join of four tables, three Nested
+    # Loops, `standard_join_search` weighing the bushy join of two pairs
+    # too; before, the join printed zeros.
     "nested loop of four relations": (
-        "RP-354",
+        "RP-329",
         _ANALYSED,
         "explain select * from e join e e2 on e.a < e2.a join e e3 on e2.a < e3.a"
         " join e e4 on e3.a < e4.a",
@@ -2039,6 +2042,119 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "              ->  Seq Scan on e e3  (cost=0.00..15.00 rows=1000 width=7)",
             "  ->  Materialize  (cost=0.00..20.00 rows=1000 width=7)",
             "        ->  Seq Scan on e e4  (cost=0.00..15.00 rows=1000 width=7)",
+        ],
+    ),
+    # Split from RP-354 and fixed: three tables joined by `<>` alone, both
+    # joins `neqjoinsel`'s.
+    "nested loop of three relations by <> alone": (
+        "RP-329",
+        _ANALYSED,
+        "explain select * from e join e e2 on e.a <> e2.a join e e3 on e2.a <> e3.a",
+        [
+            "Nested Loop  (cost=0.00..15000050.00 rows=998001000 width=21)",
+            "  Join Filter: (e2.a <> e3.a)",
+            "  ->  Nested Loop  (cost=0.00..15032.50 rows=999000 width=14)",
+            "        Join Filter: (e.a <> e2.a)",
+            "        ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
+            "        ->  Materialize  (cost=0.00..20.00 rows=1000 width=7)",
+            "              ->  Seq Scan on e e2  (cost=0.00..15.00 rows=1000 width=7)",
+            "  ->  Materialize  (cost=0.00..20.00 rows=1000 width=7)",
+            "        ->  Seq Scan on e e3  (cost=0.00..15.00 rows=1000 width=7)",
+        ],
+    ),
+    # Still open (RP-354): a join of three tables whose upper `<>`
+    # coerces both operands, each an expression with no statistics.
+    "nested loop of three relations with a coerced <> above": (
+        "RP-354",
+        _ANALYSED,
+        "explain select * from e join e e2 on e.a < e2.a"
+        " join e e3 on e2.a::numeric <> e3.a::numeric",
+        [
+            "Nested Loop  (cost=0.00..6681710.00 rows=331666335 width=21)",
+            "  Join Filter: ((e2.a)::numeric <> (e3.a)::numeric)",
+            "  ->  Nested Loop  (cost=0.00..15032.50 rows=333333 width=14)",
+            "        Join Filter: (e.a < e2.a)",
+            "        ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
+            "        ->  Materialize  (cost=0.00..20.00 rows=1000 width=7)",
+            "              ->  Seq Scan on e e2  (cost=0.00..15.00 rows=1000 width=7)",
+            "  ->  Materialize  (cost=0.00..20.00 rows=1000 width=7)",
+            "        ->  Seq Scan on e e3  (cost=0.00..15.00 rows=1000 width=7)",
+        ],
+    ),
+    # Still open (RP-354): a join of three tables, the third indexed, its
+    # Index Scan parameterized by the lower join's row under a Memoize.
+    "nested loop of three relations into an index": (
+        "RP-354",
+        _ANALYSED,
+        "explain select * from e join e e2 on e.a < e2.a join k on e2.a < k.a",
+        [
+            "Nested Loop  (cost=0.29..2404325.85 rows=111111000 width=21)",
+            "  ->  Nested Loop  (cost=0.00..15032.50 rows=333333 width=14)",
+            "        Join Filter: (e.a < e2.a)",
+            "        ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
+            "        ->  Materialize  (cost=0.00..20.00 rows=1000 width=7)",
+            "              ->  Seq Scan on e e2  (cost=0.00..15.00 rows=1000 width=7)",
+            "  ->  Memoize  (cost=0.29..6.15 rows=333 width=7)",
+            "        Cache Key: e2.a",
+            "        Cache Mode: binary",
+            "        ->  Index Scan using k_pkey on k  (cost=0.28..6.14 rows=333 width=7)",
+            "              Index Cond: (a > e2.a)",
+        ],
+    ),
+    # Still open (RP-354): an inequality between the inner's key and a
+    # call over the outer row is its Index Cond, under a Memoize keyed by
+    # the call.
+    "nested loop into an index bounded by a call of the outer side": (
+        "RP-354",
+        _ANALYSED,
+        "explain select * from e, k where length(e.b) < k.a",
+        [
+            "Nested Loop  (cost=0.29..4256.70 rows=333333 width=14)",
+            "  ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
+            "  ->  Memoize  (cost=0.29..6.15 rows=333 width=7)",
+            "        Cache Key: length(e.b)",
+            "        Cache Mode: binary",
+            "        ->  Index Scan using k_pkey on k  (cost=0.28..6.14 rows=333 width=7)",
+            "              Index Cond: (a > length(e.b))",
+        ],
+    ),
+    # Still open (RP-354): a LEFT join's ON conjunct over its preserved
+    # side that costs other than its operators: an IN list (an array
+    # constant, `scalararraysel`), a regex match and a cast of a column.
+    "a left join's on conjunct over the preserved side is an in list": (
+        "RP-354",
+        _ANALYSED,
+        "explain select * from e left join e e2 on e.a <> e2.a and e.a in (1, 2, 3)",
+        [
+            "Nested Loop Left Join  (cost=0.00..18782.50 rows=2997 width=14)",
+            "  Join Filter: ((e.a <> e2.a) AND (e.a = ANY ('{1,2,3}'::integer[])))",
+            "  ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
+            "  ->  Materialize  (cost=0.00..20.00 rows=1000 width=7)",
+            "        ->  Seq Scan on e e2  (cost=0.00..15.00 rows=1000 width=7)",
+        ],
+    ),
+    "a left join's on conjunct over the preserved side is a regex match": (
+        "RP-354",
+        _ANALYSED,
+        "explain select * from e left join e e2 on e.a <> e2.a and e.b ~ 'v1'",
+        [
+            "Nested Loop Left Join  (cost=0.00..17532.50 rows=99900 width=14)",
+            "  Join Filter: ((e.a <> e2.a) AND (e.b ~ 'v1'::text))",
+            "  ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
+            "  ->  Materialize  (cost=0.00..20.00 rows=1000 width=7)",
+            "        ->  Seq Scan on e e2  (cost=0.00..15.00 rows=1000 width=7)",
+        ],
+    ),
+    "a left join's on conjunct over the preserved side casts a column": (
+        "RP-354",
+        _ANALYSED,
+        "explain select * from e left join e e2 on e.a <> e2.a and e.a::text <> '5'",
+        [
+            "Nested Loop Left Join  (cost=0.00..22532.50 rows=994005 width=14)",
+            "  Join Filter: ((e.a <> e2.a) AND ((e.a)::text <> '5'::text))",
+            "  ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
+            "  ->  Materialize  (cost=0.00..20.00 rows=1000 width=7)",
+            "        ->  Seq Scan on e e2  (cost=0.00..15.00 rows=1000 width=7)",
         ],
     ),
     # Still open: a binary-coercible cast (text to varchar, back to text

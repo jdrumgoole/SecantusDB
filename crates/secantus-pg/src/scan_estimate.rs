@@ -656,32 +656,7 @@ impl PgHandler {
                         let (_, table, field) = key_columns.iter().find(|(c, _, _)| c == k)?;
                         self.analysed_key(table, field)
                     };
-                    let (x, y) = (stats(l)?, stats(r)?);
-                    // Two integer types compare through their cross-type
-                    // operator (`int48ne`): `eqjoinsel` matches their MCVs
-                    // by value, which their shared `int_key` encoding
-                    // does byte for byte. Any other pair of types is not
-                    // estimated.
-                    if x.column.pg_type != y.column.pg_type {
-                        let oid = |k: &AnalysedKey| {
-                            secantus_pgplan::pgtypes::oid_of_name(&k.column.pg_type)
-                        };
-                        let (lt, rt) = (oid(&x)?, oid(&y)?);
-                        let integer = |t: i64| matches!(t, 20 | 21 | 23);
-                        if !(integer(lt) && integer(rt) && ne_operator_exists(lt, rt)) {
-                            return None;
-                        }
-                    }
-                    fn key(s: &AnalysedKey) -> secantus_pgplan::joincost::KeyStats<'_> {
-                        secantus_pgplan::joincost::KeyStats {
-                            ndistinct: s.ndistinct,
-                            default_ndistinct: false,
-                            null_frac: s.null_frac,
-                            mcv: &s.mcv,
-                        }
-                    }
-                    let eq = secantus_pgplan::joincost::eqjoinsel_inner(&key(&x), &key(&y));
-                    1.0 - eq.clamp(0.0, 1.0)
+                    neqjoinsel(&stats(l)?, &stats(r)?)?
                 }
                 // A cast key is an expression with no statistics: its
                 // distinct count `get_variable_numdistinct`'s default, no
@@ -791,26 +766,29 @@ impl PgHandler {
         Some((plan, a, b, join, scan, a_index))
     }
 
-    /// A Nested Loop of three tables' sequential scans, written
-    /// `a JOIN b ON .. JOIN c ON ..`, every clause a `<`, `<=`, `>` or
-    /// `>=` between two of them (`DEFAULT_INEQ_SEL` each), over tables
-    /// with no index (RP-354). `standard_join_search` as PostgreSQL runs
-    /// it for three relations: `join_search_one_level` joins each pair a
-    /// clause links into a two-table relation, in FROM order, its rows
-    /// `calc_joinrel_size_estimate` of the pair and its one path
-    /// [`joincost::cheapest_nest_loop`]'s; then each of those with each
-    /// table a clause links it to, every such pair's nested loops weighed
-    /// in the one relation's path list
-    /// ([`joincost::cheapest_nest_loop_of`]), its rows set once, by the
-    /// first pair built (`build_join_rel`). A relation's width is the
-    /// columns read above it (`build_joinrel_tlist`): the query's, and a
-    /// clause's to a table outside it. `None` -- zeros -- unless the pair
-    /// PostgreSQL keeps is this tree's: the first two tables below, the
-    /// third above.
-    pub(crate) fn nest_loop3_estimate(
+    /// A left-deep chain of Nested Loops over three to eight tables'
+    /// sequential scans, written `a JOIN b ON .. JOIN c ON ..`, every
+    /// clause a `<`, `<=`, `>` or `>=` (`DEFAULT_INEQ_SEL`) or a `<>`
+    /// between two analysed columns (`neqjoinsel`) linking two of them,
+    /// over tables with no index (RP-354). `standard_join_search` as
+    /// PostgreSQL runs it: `join_search_one_level` builds each level's
+    /// join relations, in order, from each relation of the level below
+    /// with each table a clause links it to (a level-two pair once, in
+    /// FROM order) and then, from level four, from bushy pairs of two
+    /// lower levels' relations a clause links. `make_join_rel` weighs each
+    /// pair both ways into the one relation's path list
+    /// ([`joincost::cheapest_nest_loop_of`]); its rows are set once, by the
+    /// first pair built (`build_join_rel`, `calc_joinrel_size_estimate`).
+    /// A relation's width is the columns read above it
+    /// (`build_joinrel_tlist`): the query's, and a clause's to a table
+    /// outside it. `None` -- zeros -- unless every join PostgreSQL keeps
+    /// is this tree's: the first `i + 2` tables, the next joined above
+    /// them. The joins come back lowest first. (`join_collapse_limit`
+    /// keeps more than eight from being searched as one.)
+    pub(crate) fn nest_loop_chain_estimate(
         &self,
         sel: &secantus_pgplan::Select,
-    ) -> Option<NestLoop3Estimate> {
+    ) -> Option<Vec<NestLoopLevel>> {
         use secantus_pgplan::joins::{FilterKind, JoinFilter, JoinKind, JoinNode, JoinRows};
         use secantus_pgplan::Statement;
         let sub = sel.sub.as_ref()?;
@@ -856,9 +834,23 @@ impl PgHandler {
             }
             Some((left.as_ref(), right.as_ref(), on_filters.as_slice()))
         }
-        let (lower, c_node, top_filters) = inner_join(&j.tree)?;
-        let (a_node, b_node, lower_filters) = inner_join(lower)?;
-        let nodes = [a_node, b_node, c_node];
+        // The left spine: each join's ON, and the tables from the
+        // bottom's two upward.
+        let mut nodes: Vec<&JoinNode> = Vec::new();
+        let mut filter_lists: Vec<&[JoinFilter]> = Vec::new();
+        let mut node = &j.tree;
+        while let Some((lower, leaf, filters)) = inner_join(node) {
+            nodes.push(leaf);
+            filter_lists.push(filters);
+            node = lower;
+        }
+        nodes.push(node);
+        nodes.reverse();
+        filter_lists.reverse();
+        let n = nodes.len();
+        if !(3..=8).contains(&n) {
+            return None;
+        }
         let indexes = self.index_relations();
         let project = j.project.as_deref();
         // Each table: its alias, the stored table, its keys with their
@@ -871,7 +863,7 @@ impl PgHandler {
             read: Vec<String>,
         }
         let mut leaves: Vec<Leaf> = Vec::new();
-        for node in nodes {
+        for node in nodes.iter().copied() {
             let JoinNode::Leaf { plan, def, columns } = node else {
                 return None;
             };
@@ -913,19 +905,34 @@ impl PgHandler {
                 read,
             });
         }
-        // Each clause, with the tables it links (a bit each, in FROM
-        // order) and the keys it reads.
-        let mut clauses: Vec<(&JoinFilter, u32, Vec<&str>)> = Vec::new();
-        for f in lower_filters.iter().chain(top_filters) {
+        // Each clause: its cost a row, the tables it links (a bit each,
+        // in FROM order), the keys it reads and its selectivity.
+        struct Clause<'k> {
+            qual: f64,
+            set: u32,
+            keys: Vec<&'k str>,
+            sel: f64,
+        }
+        let stats = |k: &str| {
+            let leaf = leaves
+                .iter()
+                .find(|l| l.keys.iter().any(|(key, _)| *key == k))?;
+            let (_, field) = leaf.keys.iter().find(|(key, _)| *key == k)?;
+            self.analysed_key(leaf.table, field)
+        };
+        let mut clauses: Vec<Clause> = Vec::new();
+        for f in filter_lists.iter().copied().flatten() {
             let secantus_pgplan::ColumnExpr::Row { fields, .. } = &f.expr else {
                 return None;
             };
-            if !matches!(f.kind, FilterKind::Inequality)
-                || f.restrict.is_some()
-                || f.aliases.len() != 2
-            {
+            if f.restrict.is_some() || f.aliases.len() != 2 {
                 return None;
             }
+            let sel = match &f.kind {
+                FilterKind::Inequality => 1.0 / 3.0,
+                FilterKind::NotEqual(l, r) => neqjoinsel(&stats(l)?, &stats(r)?)?,
+                _ => return None,
+            };
             let mut set = 0u32;
             for alias in &f.aliases {
                 set |= 1 << leaves.iter().position(|l| l.alias == alias)?;
@@ -933,11 +940,28 @@ impl PgHandler {
             if set.count_ones() != 2 {
                 return None;
             }
-            clauses.push((f, set, fields.iter().map(|(_, k, _)| k.as_str()).collect()));
+            clauses.push(Clause {
+                qual: f.ops as f64 * costsize::CPU_OPERATOR_COST,
+                set,
+                keys: fields.iter().map(|(_, k, _)| k.as_str()).collect(),
+                sel,
+            });
         }
-        // A table no clause reaches is a clauseless join, not modelled.
-        let linked = clauses.iter().fold(0, |acc, (_, set, _)| acc | set);
-        if linked != 0b111 {
+        // The clauses must link every table: a relation with none to the
+        // tables outside it is a clauseless join, not modelled.
+        let full = (1u32 << n) - 1;
+        let mut reached = 1u32;
+        loop {
+            let next = clauses
+                .iter()
+                .filter(|c| c.set & reached != 0)
+                .fold(reached, |acc, c| acc | c.set);
+            if next == reached {
+                break;
+            }
+            reached = next;
+        }
+        if reached != full {
             return None;
         }
         let scans: Vec<Estimate> = leaves
@@ -962,7 +986,7 @@ impl PgHandler {
                             || j.needed.iter().any(|n| n == key)
                             || clauses
                                 .iter()
-                                .any(|(_, cs, ks)| cs & !set != 0 && ks.contains(key))
+                                .any(|c| c.set & !set != 0 && c.keys.contains(key))
                     })
                     .map(|(_, f)| f.clone())
                     .collect();
@@ -973,64 +997,95 @@ impl PgHandler {
             }
             Some(total)
         };
-        // A pair's join clauses: their cost a row and their selectivity.
-        let restrict = |within: u32, outside: u32| -> (f64, f64) {
+        // The clauses joining `a` to `b`: their cost a row and their
+        // selectivity.
+        let restrict = |a: u32, b: u32| -> (f64, f64) {
             let mut qual = 0.0;
             let mut sel_factor = 1.0;
-            for (f, set, _) in &clauses {
-                if set & !within == 0 && set & !outside != 0 {
-                    qual += f.ops as f64 * costsize::CPU_OPERATOR_COST;
-                    sel_factor *= 1.0 / 3.0;
+            for c in &clauses {
+                if c.set & a != 0 && c.set & b != 0 && c.set & !(a | b) == 0 {
+                    qual += c.qual;
+                    sel_factor *= c.sel;
                 }
             }
             (qual, sel_factor)
         };
-        // `join_search_one_level`, level 2: each table with each later one
-        // a clause links it to.
-        let mut level2: Vec<(u32, Estimate, secantus_pgplan::joincost::NestLoopPlan)> = Vec::new();
-        for x in 0..3 {
-            for y in x + 1..3 {
-                let set = (1 << x) | (1 << y);
-                if !clauses.iter().any(|(_, s, _)| *s == set) {
-                    continue;
+        let linked = |a: u32, b: u32| clauses.iter().any(|c| c.set & a != 0 && c.set & b != 0);
+        // Each relation's estimate and, for a join, its kept path and the
+        // pair it was built from.
+        type Kept = (secantus_pgplan::joincost::NestLoopPlan, (u32, u32));
+        let mut rels: std::collections::HashMap<u32, (Estimate, Option<Kept>)> =
+            (0..n).map(|i| (1u32 << i, (scans[i], None))).collect();
+        let mut levels: Vec<Vec<u32>> = vec![Vec::new(), (0..n).map(|i| 1u32 << i).collect()];
+        for level in 2..=n {
+            // `make_join_rel`'s calls, in `join_search_one_level`'s order.
+            // A proper subset of linked tables always has a clause to one
+            // outside it, so no relation takes the clauseless branch.
+            let mut calls: Vec<(u32, u32)> = Vec::new();
+            for (at, &old) in levels[level - 1].iter().enumerate() {
+                let first = if level == 2 { at + 1 } else { 0 };
+                for &other in &levels[1][first..] {
+                    if old & other == 0 && linked(old, other) {
+                        calls.push((old, other));
+                    }
                 }
-                let (qual, s) = restrict(set, 0);
-                let (ex, ey) = (scans[x], scans[y]);
-                let plan = secantus_pgplan::joincost::cheapest_nest_loop(ex, ey, qual);
-                let rows = costsize::clamp_row_est(ex.2 * ey.2 * s);
+            }
+            let mut k = 2;
+            while k <= level - k {
+                let other_level = level - k;
+                for (at, &old) in levels[k].iter().enumerate() {
+                    let first = if k == other_level { at + 1 } else { 0 };
+                    for &other in &levels[other_level][first..] {
+                        if old & other == 0 && linked(old, other) {
+                            calls.push((old, other));
+                        }
+                    }
+                }
+                k += 1;
+            }
+            let mut made: Vec<u32> = Vec::new();
+            for &(a, b) in &calls {
+                if !made.contains(&(a | b)) {
+                    made.push(a | b);
+                }
+            }
+            for &set in &made {
+                let built: Vec<(u32, u32)> = calls
+                    .iter()
+                    .copied()
+                    .filter(|&(a, b)| a | b == set)
+                    .collect();
+                let pairs: Vec<secantus_pgplan::joincost::NestLoopPair> = built
+                    .iter()
+                    .map(|&(a, b)| (rels[&a].0, rels[&b].0, restrict(a, b).0))
+                    .collect();
+                let (a, b) = built[0];
+                let rows =
+                    costsize::clamp_row_est(rels[&a].0 .2 * rels[&b].0 .2 * restrict(a, b).1);
+                let (pick, plan) = secantus_pgplan::joincost::cheapest_nest_loop_of(&pairs)?;
                 let est = (plan.startup, plan.total, rows, width(set)?);
-                level2.push((set, est, plan));
+                rels.insert(set, (est, Some((plan, built[pick]))));
             }
+            levels.push(made);
         }
-        // Level 3: each of those with each table a clause links it to,
-        // the relation outer in the first call.
-        let mut pairs = Vec::new();
-        let mut built = Vec::new();
-        for (l, (set, est, _)) in level2.iter().enumerate() {
-            for (x, scan) in scans.iter().enumerate() {
-                let bit = 1u32 << x;
-                if set & bit != 0 || !clauses.iter().any(|(_, s, _)| s & bit != 0 && s & set != 0) {
-                    continue;
-                }
-                let (qual, _) = restrict(0b111, *set);
-                pairs.push((*est, *scan, qual));
-                built.push((l, x));
+        // Down the kept paths from the top: each must join this tree's
+        // lower relation and its next table.
+        let mut out = Vec::new();
+        let mut set = full;
+        for i in (1..n).rev() {
+            let (lower, leaf) = (set & !(1 << i), 1u32 << i);
+            let (est, kept) = rels.get(&set)?;
+            let (mut plan, pair) = (*kept)?;
+            if pair == (leaf, lower) {
+                plan.b_outer = !plan.b_outer;
+            } else if pair != (lower, leaf) {
+                return None;
             }
+            out.push((plan, rels[&lower].0, scans[i], *est));
+            set = lower;
         }
-        let (first_l, first_x) = *built.first()?;
-        let (_, s) = restrict(0b111, level2[first_l].0);
-        let rows = costsize::clamp_row_est(level2[first_l].1 .2 * scans[first_x].2 * s);
-        let (pick, top) = secantus_pgplan::joincost::cheapest_nest_loop_of(&pairs)?;
-        let (l, _) = built[pick];
-        let (set, lower_est, lower_plan) = level2[l];
-        if set != 0b011 {
-            return None;
-        }
-        let join = (top.startup, top.total, rows, width(0b111)?);
-        Some(NestLoop3Estimate {
-            lower: (lower_plan, scans[0], scans[1], lower_est),
-            top: (top, lower_est, scans[2], join),
-        })
+        out.reverse();
+        Some(out)
     }
 
     /// `leaf` as the inner side of a nested loop through one of its
@@ -5083,23 +5138,41 @@ pub(crate) type NestLoopEstimate = (
     Option<ScanIndex>,
 );
 
-/// [`PgHandler::nest_loop3_estimate`]'s answer: each Nested Loop's plan
-/// and its two inputs' and its own estimates, the lower join's then the
-/// one above it.
-pub(crate) struct NestLoop3Estimate {
-    pub lower: (
-        secantus_pgplan::joincost::NestLoopPlan,
-        Estimate,
-        Estimate,
-        Estimate,
-    ),
-    pub top: (
-        secantus_pgplan::joincost::NestLoopPlan,
-        Estimate,
-        Estimate,
-        Estimate,
-    ),
+/// `neqjoinsel` of a `<>` (or IS DISTINCT FROM) between two analysed
+/// columns: one minus `eqjoinsel` over their statistics. Two integer
+/// types compare through their cross-type operator (`int48ne`):
+/// `eqjoinsel` matches their MCVs by value, which their shared `int_key`
+/// encoding does byte for byte. Any other pair of types is not estimated.
+fn neqjoinsel(x: &AnalysedKey, y: &AnalysedKey) -> Option<f64> {
+    if x.column.pg_type != y.column.pg_type {
+        let oid = |k: &AnalysedKey| secantus_pgplan::pgtypes::oid_of_name(&k.column.pg_type);
+        let (lt, rt) = (oid(x)?, oid(y)?);
+        let integer = |t: i64| matches!(t, 20 | 21 | 23);
+        if !(integer(lt) && integer(rt) && ne_operator_exists(lt, rt)) {
+            return None;
+        }
+    }
+    fn key(s: &AnalysedKey) -> secantus_pgplan::joincost::KeyStats<'_> {
+        secantus_pgplan::joincost::KeyStats {
+            ndistinct: s.ndistinct,
+            default_ndistinct: false,
+            null_frac: s.null_frac,
+            mcv: &s.mcv,
+        }
+    }
+    let eq = secantus_pgplan::joincost::eqjoinsel_inner(&key(x), &key(y));
+    Some(1.0 - eq.clamp(0.0, 1.0))
 }
+
+/// One Nested Loop of [`PgHandler::nest_loop_chain_estimate`]'s answer:
+/// its plan and its two inputs' and its own estimates, its inputs in the
+/// order the join tree lists them.
+pub(crate) type NestLoopLevel = (
+    secantus_pgplan::joincost::NestLoopPlan,
+    Estimate,
+    Estimate,
+    Estimate,
+);
 
 /// A nested loop's side as [`PgHandler::nest_loop_estimate`] reads it: its
 /// table, each key with its stored field and SQL column, and the stored

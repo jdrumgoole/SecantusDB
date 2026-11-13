@@ -1564,78 +1564,31 @@ a regression test.
       frequencies match (found while working RP-313).
       Verify: tests/backlog/test_rp_catalog_reads.py::test_a_catalog_columns_correlation_follows_the_heap
       Backlog-ID: RP-358
-- [ ] **EXPLAIN prints no estimate for most Nested Loops.** Since RP-329
-      a Nested Loop of two tables' sequential scans joined only by `<`,
-      `<=`, `>`, `>=` or `<>` conjuncts (or by none) prints
-      `cost_nestloop`'s estimate, its outer side and Materialize as
-      PostgreSQL 15.19 picks them: a comma join's WHERE, and since
-      2026-11-05 an inner or LEFT `JOIN ... ON` (a LEFT join keeps its
-      nullable side inner and never estimates fewer rows than its outer),
-      over a table with an index too when no clause could be its Index
-      Cond (a `<>`), and since 2026-11-06 the inner Index Scan
-      parameterized by an inequality between two keys, the join's other
-      clauses its Filter (`e.a < k.a`: `Index Scan using k_pkey on k` with
-      `Index Cond: (a > e.a)`), or Index Only Scan where the index holds
-      every column the side reads. Every other nested loop still prints
-      zeros: an inequality between the inner's
-      key and an expression of the outer side (`e.a + 1 < k.a`,
-      PostgreSQL's `Index Cond: (a > (e.a + 1))`); and a join of three
-      or more relations (found while working RP-329). Since 2026-11-12 a
-      LEFT join's WHERE over its preserved side alone is that side's cheapest path, its scan Filter
-      or, where the index wins, its Index Cond (`k left join e on e.a <>
-      k.a where k.a > 990`), and an ON conjunct over the preserved side
-      alone is estimated as PostgreSQL keeps it, the join's filter, also
-      when the inner is read through its index parameterized by the outer
-      row (`e left join k on e.a < k.a and e.a > 990`). Since 2026-11-12
-      a join clause `<>` over a cast of either side's column is priced
-      with its cast (a `pg_cast` function one call, an I/O conversion
-      two) and estimated as an expression with no statistics, the
-      parameterized scan's Filter where the inner is indexed (`e left
-      join k on e.a < k.a and e.a <> k.b::int`). Since 2026-11-12 a LIKE
-      or ILIKE (or its negation) of a string column against a constant
-      pattern is one such conjunct, one operator a pair, estimated by
-      `patternsel` over the column's statistics (`e left join e e2 on e.a
-      <> e2.a and e.b like 'v1%'`). Still zeros: such a preserved-side
-      conjunct that costs other than its operators (an IN list, a cast of
-      a column, a regex match, whose selectivity is RP-423's). Since
-      2026-11-12 a `<>` (or IS DISTINCT FROM) no operator takes as its
-      operands' types is resolved by coercing one, as
-      `oper_select_candidate` does (`e.a <> k.a::numeric` is
-      `(e.a)::numeric <> (a)::numeric`), the coerced operand an expression
-      with no statistics and its cast's function one call a row; a
-      binary-coercible coercion is still zeros. Since 2026-11-12 a
-      `<>` whose operands differ in type through a cross-type operator
-      (`e.a <> k.a::bigint`, `int48ne`), and one between integer columns
-      of two types (`e.a <> h.a`, `h.a` bigint, their common values
-      matched by value), is estimated as one of a single type. (A
-      binary-coercible cast is its own item.) Since 2026-11-12 an inequality with no operand that is
-      the indexed side's key (`e.a < k.a + 1`) is the Join Filter over
-      that side's plain scan, or the parameterized scan's Filter beside a
-      key-to-key bound. Since 2026-11-12 two bounds on the index column
-      (`e.a < k.a and e.a > k.a`) are one `Index Cond` of both, a ninth of
-      the rows a scan. Since 2026-11-12 an expression of the outer side
-      against the inner's bare key is its Index Cond, its operators
-      evaluated once a scan (`e.a + 1 < k.a`: `Index Cond: (a > (e.a +
-      1))`), and an operand reading the key's own table no index qual
-      (`e.a + k.a < k.a`, the Join Filter); one holding a call is still
-      zeros (`length(e.b) < k.a`, PostgreSQL's Memoize over the Index
-      Scan). Since 2026-11-12 a join of three tables written `a JOIN b ON
-      .. JOIN c ON ..`, each clause an inequality between two of them
-      over tables with no index, is priced by PostgreSQL's search over the
-      three where it keeps that order (two Nested Loops, each inner
-      Materialized where cheaper); a join of four or more, one with a
-      `<>`, a cast or an indexed table, and one PostgreSQL orders
-      otherwise (its own item) are still zeros. Since 2026-11-13 a key on
-      a later index column is its Index Cond, every scan reading the
-      whole index (`e, c2 where e.a < c2.y` over an index on `(x, y)`:
-      `Index Only Scan using c2_xy` with `Index Cond: (y > e.a)`), and
-      since 2026-11-13 a key several indexes hold is a path through each,
-      `add_path` keeping the cheapest (`e, c4 where e.a < c4.y` over
-      indexes on `(x, y)` and `(y)`: `Index Scan using c4_y`). Still zeros:
-      a join of three tables whose upper clause is a `<>` (`e join e e2 on
-      e.a < e2.a join e e3 on e2.a <> e3.a`) and one of four tables.
+- [ ] **EXPLAIN prints no estimate for some Nested Loops.** The nested
+      loops of two tables' scans joined by inequalities, `<>` and the
+      conjuncts below are priced as PostgreSQL 15.19 plans them, and since
+      2026-11-13 so is a left-deep join of three to eight tables' scans by
+      `<`, `<=`, `>`, `>=` or `<>` over tables with no index
+      (`standard_join_search`'s levels and bushy pairs, each relation's
+      path list). Still zeros (PostgreSQL 15.19 on a private cluster,
+      `e` and `k` 1,000 analysed rows, `k.a` the primary key):
+      - an inequality between the inner's key and a call over the outer
+        row (`e, k where length(e.b) < k.a`: a Memoize keyed by
+        `length(e.b)` over `Index Scan using k_pkey` with `Index Cond: (a
+        > length(e.b))`);
+      - a join of three tables whose third is indexed (`e join e e2 on
+        e.a < e2.a join k on e2.a < k.a`: a Memoize keyed by `e2.a` over
+        the parameterized Index Scan), or whose upper `<>` coerces its
+        operands (`e2.a::numeric <> e3.a::numeric`);
+      - a LEFT join's ON conjunct over its preserved side that costs other
+        than its operators: an IN list (`e.a in (1, 2, 3)`, printed `e.a =
+        ANY ('{1,2,3}'::integer[])`), a regex match (`e.b ~ 'v1'`, whose
+        selectivity is RP-423's) and a cast of a column (`e.a::text <>
+        '5'`).
+      A binary-coercible cast is RP-912; a join PostgreSQL orders
+      otherwise, RP-919.
       Backlog-ID: RP-354
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[nested loop of three relations with a <> above], tests/backlog/test_rp_explain_costs.py::test_plan[nested loop of four relations]
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[nested loop into an index bounded by a call of the outer side], tests/backlog/test_rp_explain_costs.py::test_plan[nested loop of three relations into an index], tests/backlog/test_rp_explain_costs.py::test_plan[nested loop of three relations with a coerced <> above], tests/backlog/test_rp_explain_costs.py::test_plan[a left join's on conjunct over the preserved side is an in list], tests/backlog/test_rp_explain_costs.py::test_plan[a left join's on conjunct over the preserved side is a regex match], tests/backlog/test_rp_explain_costs.py::test_plan[a left join's on conjunct over the preserved side casts a column]
 - [ ] **A join of three tables by inequalities runs in its written
       order, and a WHERE's join clauses all run at the top join.**
       PostgreSQL's `standard_join_search` picks the order of an inner join
