@@ -24,6 +24,7 @@
 //!   of `{w: 1}` waits for nothing, and carries none.
 //! * A read's error goes under its executor wrapper.
 
+use crate::util::ReplyOk;
 use bson::{doc, Bson, Document};
 
 use crate::CommandContext;
@@ -48,7 +49,7 @@ fn is_find_and_modify(name: &str) -> bool {
 }
 
 fn ok(reply: &Document) -> bool {
-    reply.get_f64("ok").unwrap_or(0.0) == 1.0
+    reply.ok_number().unwrap_or(0.0) == 1.0
 }
 
 /// Whether a write statement failed with the budget's error: how an

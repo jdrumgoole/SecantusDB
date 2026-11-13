@@ -616,7 +616,9 @@ impl Column<'_> {
 
     /// `patternsel_common` (PostgreSQL 15.19's `like_support.c`) for a
     /// LIKE or ILIKE, or their negations, of this column against a
-    /// constant pattern with the default escape (RP-404). A pattern that
+    /// constant pattern with the default escape (RP-404), or with `regex`
+    /// a regex match (`~`, `~*`, `!~`, `!~*`), whose fixed prefix and rest
+    /// are `regex_fixed_prefix`'s ([`regex_fixed_prefix`]). A pattern that
     /// is its own fixed prefix is `var_eq_const` of it. Otherwise the
     /// histogram's inner entries the pattern matches
     /// (`histogram_selectivity`, at least 10 of them), blended under 100
@@ -628,22 +630,41 @@ impl Column<'_> {
     /// LIKE operator `patternsel` knows (`text`, `varchar`, `name`).
     /// `None` where the statistics are not modelled: a string not in a
     /// bytewise collation, an MCV list whose contents depend on an order
-    /// not reproduced, a value not UTF-8.
-    pub fn pattern_sel(&self, pattern: &str, insensitive: bool, negated: bool) -> Option<f64> {
+    /// not reproduced, a value not UTF-8, a regex whose prefix is not
+    /// modelled.
+    pub fn pattern_sel(
+        &self,
+        pattern: &str,
+        insensitive: bool,
+        negated: bool,
+        regex: bool,
+    ) -> Option<f64> {
         if self.stats.is_some() && !self.ordered {
             return None;
         }
         let nullfrac = self.null_frac();
-        let (prefix, rest_selec, status) =
-            like_fixed_prefix(pattern.as_bytes(), insensitive, self.c_collation);
-        let matches = |v: &[u8]| -> Option<bool> {
-            crate::like_match::like_match(
-                std::str::from_utf8(v).ok()?,
-                pattern,
-                Some('\\'),
-                insensitive,
+        let (prefix, rest_selec, status) = if regex {
+            regex_fixed_prefix(pattern, insensitive, self.c_collation)?
+        } else {
+            like_fixed_prefix(pattern.as_bytes(), insensitive, self.c_collation)
+        };
+        // The regex a regex match runs as (`eval_pattern_match_const`).
+        let compiled = if regex {
+            Some(
+                regex::RegexBuilder::new(&crate::scalar::pg_regex_source(pattern))
+                    .case_insensitive(insensitive)
+                    .build()
+                    .ok()?,
             )
-            .ok()
+        } else {
+            None
+        };
+        let matches = |v: &[u8]| -> Option<bool> {
+            let v = std::str::from_utf8(v).ok()?;
+            match &compiled {
+                Some(re) => Some(re.is_match(v)),
+                None => crate::like_match::like_match(v, pattern, Some('\\'), insensitive).ok(),
+            }
         };
         let result = if status == PrefixStatus::Exact {
             self.eq_sel(&prefix, false)?
@@ -819,6 +840,508 @@ fn like_selectivity(patt: &[u8]) -> f64 {
         pos += 1;
     }
     sel.min(1.0)
+}
+
+/// `regex_selectivity`'s guesses beyond `like_selectivity`'s: a bracket
+/// expression, and a quantifier.
+const CHAR_RANGE_SEL: f64 = 0.25;
+const PARTIAL_WILDCARD_SEL: f64 = 2.0;
+
+/// `regex_fixed_prefix` over a regex (an ARE) with the case sensitivity
+/// its operator gives it: the fixed prefix `pg_regprefix` reads from the
+/// compiled regex ([`regex_prefix`]), the selectivity of the rest
+/// (`regex_selectivity` of the whole pattern, the prefix's characters
+/// discounted), and whether the prefix is the whole match. `None` where
+/// the regex's prefix is not modelled.
+fn regex_fixed_prefix(
+    patt: &str,
+    insensitive: bool,
+    c_ctype: bool,
+) -> Option<(Vec<u8>, f64, PrefixStatus)> {
+    let (prefix, status) = regex_prefix(patt, insensitive, c_ctype)?;
+    let rest = match status {
+        PrefixStatus::Exact => 1.0,
+        PrefixStatus::Partial => regex_selectivity(patt.as_bytes(), prefix.len()),
+        PrefixStatus::None => regex_selectivity(patt.as_bytes(), 0),
+    };
+    Some((prefix.into_bytes(), rest, status))
+}
+
+/// One atom of a regex, as [`regex_prefix`] reads it, with its bounds.
+#[derive(Debug)]
+enum ReAtom {
+    /// One character: a state with one out-arc whose color, outside a
+    /// case-insensitive match of a cased letter, is that character alone.
+    Char(char),
+    /// A set of more than one character (`.`, a bracket, `\d`): a state
+    /// whose out-arcs are of several colors, or one color of several.
+    Set,
+    /// A parenthesized group's alternatives.
+    Group(Vec<Vec<QuantifiedAtom>>),
+}
+
+/// A [`ReAtom`] and its quantifier's bounds.
+type QuantifiedAtom = (ReAtom, u32, Option<u32>);
+
+/// `pg_regprefix`'s walk of a regex's NFA (`findprefix` in PostgreSQL
+/// 15.19's `regprefix.c`), read from the regex's text: a regex anchored by
+/// a leading `^` contributes each character a state reaches by one
+/// out-arc of a one-character color, stopping at the first state with a
+/// choice of characters (a set, an optional or repeated atom, a cased
+/// letter matched case-insensitively); a group's alternatives add the
+/// first character they all start with, if they do, and stop the walk.
+/// An atom bounded `{0}` is no atom. The prefix is exact when a `$` ends
+/// the regex right after it, and status `None` (`REG_NOMATCH`) when the
+/// regex is not anchored, alternates at its top, or fixes no first
+/// character. `None` for a regex whose NFA this does not model: a group
+/// repeated other than at most once, a constraint or anchor anywhere but
+/// a leading `^` and a trailing `$`, a back reference, a numeric
+/// character escape, embedded options or a director.
+fn regex_prefix(patt: &str, insensitive: bool, c_ctype: bool) -> Option<(String, PrefixStatus)> {
+    let chars: Vec<char> = patt.chars().collect();
+    if patt.starts_with("***") || patt.starts_with("(?") {
+        return None;
+    }
+    // An alternation at the top: the `pre` state's rainbow, or BOS arcs
+    // to more than one state.
+    if regex_has_bare(&chars, '|', true) {
+        return Some((String::new(), PrefixStatus::None));
+    }
+    if chars.first() != Some(&'^') {
+        // The `pre` state's rainbow: not anchored. A `^` further in
+        // anchors some branch, which is not modelled.
+        return if regex_has_bare(&chars, '^', false) {
+            None
+        } else {
+            Some((String::new(), PrefixStatus::None))
+        };
+    }
+    let exact_end = chars.len() >= 2 && chars[chars.len() - 1] == '$' && {
+        let backslashes = chars[1..chars.len() - 1]
+            .iter()
+            .rev()
+            .take_while(|c| **c == '\\')
+            .count();
+        backslashes % 2 == 0
+    };
+    let body = &chars[1..chars.len() - usize::from(exact_end)];
+    let mut pos = 0;
+    let alternatives = regex_atoms(body, &mut pos)?;
+    if pos != body.len() {
+        return None;
+    }
+    // The `pre` state's BOS arcs lead to more than one state.
+    let [atoms] = alternatives.as_slice() else {
+        return Some((String::new(), PrefixStatus::None));
+    };
+    let case_varies = |c: char| {
+        if c_ctype {
+            c.is_ascii_alphabetic()
+        } else {
+            c.to_lowercase().ne(std::iter::once(c)) || c.to_uppercase().ne(std::iter::once(c))
+        }
+    };
+    // Whether the walk went through every atom (`Some(true)`) or stopped
+    // at a choice (`Some(false)`).
+    fn walk(
+        atoms: &[QuantifiedAtom],
+        prefix: &mut String,
+        insensitive: bool,
+        case_varies: &dyn Fn(char) -> bool,
+    ) -> Option<bool> {
+        // The character every path through `atoms` starts with.
+        fn first_char(atoms: &[QuantifiedAtom]) -> Option<char> {
+            match atoms.iter().find(|a| a.2 != Some(0))? {
+                (ReAtom::Char(c), min, _) if *min > 0 => Some(*c),
+                (ReAtom::Group(alts), 1, Some(1)) => match alts.as_slice() {
+                    [only] => first_char(only),
+                    _ => None,
+                },
+                _ => None,
+            }
+        }
+        for (atom, min, max) in atoms {
+            if *max == Some(0) {
+                continue;
+            }
+            match atom {
+                ReAtom::Char(c) => {
+                    if insensitive && case_varies(*c) {
+                        return Some(false);
+                    }
+                    match max {
+                        // An exact count: that many states in a row.
+                        Some(n) if n == min => prefix.extend(std::iter::repeat_n(*c, *n as usize)),
+                        // `+`, `{m,}`: one, then the loop's choice.
+                        None if *min > 0 => {
+                            prefix.push(*c);
+                            return Some(false);
+                        }
+                        // Optional, or a bounded range: a choice at once.
+                        _ => return Some(false),
+                    }
+                }
+                ReAtom::Set => return Some(false),
+                ReAtom::Group(_) if *min == 0 => return Some(false),
+                ReAtom::Group(alts) if *max == Some(*min) => match alts.as_slice() {
+                    [inner] => {
+                        for _ in 0..*min {
+                            if !walk(inner, prefix, insensitive, case_varies)? {
+                                return Some(false);
+                            }
+                        }
+                    }
+                    // Out-arcs of one color to several states: its
+                    // character, and no further.
+                    _ => {
+                        let firsts: Vec<Option<char>> =
+                            alts.iter().map(|a| first_char(a)).collect();
+                        if let Some(Some(c)) = firsts.first() {
+                            if firsts.iter().all(|f| *f == Some(*c))
+                                && !(insensitive && case_varies(*c))
+                            {
+                                prefix.push(*c);
+                            }
+                        }
+                        return Some(false);
+                    }
+                },
+                ReAtom::Group(_) => return None,
+            }
+        }
+        Some(true)
+    }
+    let mut prefix = String::new();
+    let whole = walk(atoms, &mut prefix, insensitive, &case_varies)?;
+    let status = if whole && exact_end {
+        PrefixStatus::Exact
+    } else if !prefix.is_empty() {
+        PrefixStatus::Partial
+    } else {
+        PrefixStatus::None
+    };
+    Some((prefix, status))
+}
+
+/// Whether `c` appears in `chars` outside a bracket expression and not
+/// escaped, with `top` outside parentheses too.
+fn regex_has_bare(chars: &[char], c: char, top: bool) -> bool {
+    let mut i = 0;
+    let mut depth = 0usize;
+    while i < chars.len() {
+        match chars[i] {
+            '\\' => i += 1,
+            x if x == c && !(top && depth > 0) => return true,
+            '(' => depth += 1,
+            ')' => depth = depth.saturating_sub(1),
+            '[' => {
+                i += 1;
+                if chars.get(i) == Some(&'^') {
+                    i += 1;
+                }
+                if chars.get(i) == Some(&']') {
+                    i += 1;
+                }
+                while i < chars.len() && chars[i] != ']' {
+                    if chars[i] == '[' && matches!(chars.get(i + 1), Some(':' | '.' | '=')) {
+                        let close = chars[i + 1];
+                        i += 2;
+                        while i + 1 < chars.len() && !(chars[i] == close && chars[i + 1] == ']') {
+                            i += 1;
+                        }
+                        i += 1;
+                    }
+                    i += 1;
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    false
+}
+
+/// The alternatives of a regex's text from `*pos` to its end or the `)`
+/// closing the group it is inside, each its atoms with their quantifiers'
+/// bounds. `None` for what [`regex_prefix`] does not model.
+fn regex_atoms(chars: &[char], pos: &mut usize) -> Option<Vec<Vec<QuantifiedAtom>>> {
+    let mut alternatives = Vec::new();
+    let mut atoms: Vec<QuantifiedAtom> = Vec::new();
+    while *pos < chars.len() {
+        let c = chars[*pos];
+        let atom = match c {
+            ')' => break,
+            '|' => {
+                alternatives.push(std::mem::take(&mut atoms));
+                *pos += 1;
+                continue;
+            }
+            '^' | '$' => return None,
+            '*' | '+' | '?' | '{' => {
+                let (min, max) = regex_quantifier(chars, pos)?;
+                let last = atoms.last_mut()?;
+                if (last.1, last.2) != (1, Some(1)) {
+                    return None;
+                }
+                (last.1, last.2) = (min, max);
+                // A non-greedy quantifier's NFA is the greedy one's.
+                if chars.get(*pos) == Some(&'?') {
+                    *pos += 1;
+                }
+                if matches!(chars.get(*pos), Some('*' | '+' | '?' | '{')) {
+                    return None;
+                }
+                continue;
+            }
+            '(' => {
+                *pos += 1;
+                if chars.get(*pos) == Some(&'?') {
+                    if chars.get(*pos + 1) != Some(&':') {
+                        return None;
+                    }
+                    *pos += 2;
+                }
+                let inner = regex_atoms(chars, pos)?;
+                if chars.get(*pos) != Some(&')') {
+                    return None;
+                }
+                *pos += 1;
+                atoms.push((ReAtom::Group(inner), 1, Some(1)));
+                continue;
+            }
+            '.' => {
+                *pos += 1;
+                ReAtom::Set
+            }
+            '[' => regex_bracket(chars, pos)?,
+            '\\' => {
+                let e = *chars.get(*pos + 1)?;
+                *pos += 2;
+                match e {
+                    'd' | 'D' | 's' | 'S' | 'w' | 'W' => ReAtom::Set,
+                    'a' => ReAtom::Char('\u{7}'),
+                    'b' => ReAtom::Char('\u{8}'),
+                    'B' => ReAtom::Char('\\'),
+                    'e' => ReAtom::Char('\u{1b}'),
+                    'f' => ReAtom::Char('\u{c}'),
+                    'n' => ReAtom::Char('\n'),
+                    'r' => ReAtom::Char('\r'),
+                    't' => ReAtom::Char('\t'),
+                    'v' => ReAtom::Char('\u{b}'),
+                    e if !e.is_alphanumeric() => ReAtom::Char(e),
+                    _ => return None,
+                }
+            }
+            c => {
+                *pos += 1;
+                ReAtom::Char(c)
+            }
+        };
+        atoms.push((atom, 1, Some(1)));
+    }
+    alternatives.push(atoms);
+    Some(alternatives)
+}
+
+/// The bounds of the quantifier at `*pos` (`*`, `+`, `?`, `{m}`, `{m,}`,
+/// `{m,n}`), `*pos` moved past it.
+fn regex_quantifier(chars: &[char], pos: &mut usize) -> Option<(u32, Option<u32>)> {
+    let c = chars[*pos];
+    *pos += 1;
+    Some(match c {
+        '*' => (0, None),
+        '+' => (1, None),
+        '?' => (0, Some(1)),
+        _ => {
+            let close = chars[*pos..].iter().position(|c| *c == '}')? + *pos;
+            let inner: String = chars[*pos..close].iter().collect();
+            *pos = close + 1;
+            let number = |s: &str| -> Option<u32> {
+                (!s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))
+                    .then(|| s.parse().ok())
+                    .flatten()
+            };
+            match inner.split_once(',') {
+                None => {
+                    let m = number(&inner)?;
+                    (m, Some(m))
+                }
+                Some((m, "")) => (number(m)?, None),
+                Some((m, n)) => {
+                    let (m, n) = (number(m)?, number(n)?);
+                    if n < m {
+                        return None;
+                    }
+                    (m, Some(n))
+                }
+            }
+        }
+    })
+}
+
+/// The bracket expression at `*pos`, `*pos` moved past it: one character
+/// when it lists exactly one, a [`ReAtom::Set`] when it is negated or
+/// holds more (a character class or a range among them); `None` for a
+/// collating element, an equivalence class or an escape, not modelled.
+fn regex_bracket(chars: &[char], pos: &mut usize) -> Option<ReAtom> {
+    *pos += 1;
+    let negated = chars.get(*pos) == Some(&'^');
+    if negated {
+        *pos += 1;
+    }
+    let mut members: Vec<char> = Vec::new();
+    let mut class = false;
+    let mut first = true;
+    loop {
+        let c = *chars.get(*pos)?;
+        if c == ']' && !first {
+            *pos += 1;
+            break;
+        }
+        first = false;
+        match (c, chars.get(*pos + 1)) {
+            ('[', Some(':')) => {
+                let rest = &chars[*pos + 2..];
+                let end = rest.windows(2).position(|w| w == [':', ']'])?;
+                *pos += 2 + end + 2;
+                class = true;
+            }
+            ('[', Some('.' | '=')) | ('\\', _) => return None,
+            (lo, Some('-')) if chars.get(*pos + 2).is_some_and(|c| *c != ']') => {
+                let hi = chars[*pos + 2];
+                if hi == '\\' || hi == '[' {
+                    return None;
+                }
+                if lo == hi {
+                    if !members.contains(&lo) {
+                        members.push(lo);
+                    }
+                } else {
+                    class = true;
+                }
+                *pos += 3;
+            }
+            _ => {
+                if !members.contains(&c) {
+                    members.push(c);
+                }
+                *pos += 1;
+            }
+        }
+    }
+    Some(match (negated, class, members.as_slice()) {
+        (false, false, [c]) => ReAtom::Char(*c),
+        (false, false, []) => return None,
+        _ => ReAtom::Set,
+    })
+}
+
+/// `regex_selectivity_sub`: each fixed character `FIXED_CHAR_SEL`, each
+/// bracket expression `CHAR_RANGE_SEL` (its complement when negated),
+/// each `.` `ANY_CHAR_SEL`, each quantifier `PARTIAL_WILDCARD_SEL`, a
+/// parenthesized item its own contents' selectivity, and the alternatives
+/// of a `|` summed, the result capped at 1. Read over the pattern's bytes.
+fn regex_selectivity_sub(patt: &[u8]) -> f64 {
+    let mut sel = 1.0f64;
+    let mut paren_depth = 0usize;
+    let mut paren_pos = 0usize;
+    let mut pos = 0usize;
+    let len = patt.len();
+    while pos < len {
+        match patt[pos] {
+            b'(' => {
+                if paren_depth == 0 {
+                    paren_pos = pos;
+                }
+                paren_depth += 1;
+            }
+            b')' if paren_depth > 0 => {
+                paren_depth -= 1;
+                if paren_depth == 0 {
+                    sel *= regex_selectivity_sub(&patt[paren_pos + 1..pos]);
+                }
+            }
+            b'|' if paren_depth == 0 => {
+                sel += regex_selectivity_sub(&patt[pos + 1..]);
+                break;
+            }
+            b'[' => {
+                let mut negclass = false;
+                pos += 1;
+                if patt.get(pos) == Some(&b'^') {
+                    negclass = true;
+                    pos += 1;
+                }
+                if patt.get(pos) == Some(&b']') {
+                    pos += 1;
+                }
+                while pos < len && patt[pos] != b']' {
+                    pos += 1;
+                }
+                if paren_depth == 0 {
+                    sel *= if negclass {
+                        1.0 - CHAR_RANGE_SEL
+                    } else {
+                        CHAR_RANGE_SEL
+                    };
+                }
+            }
+            b'.' => {
+                if paren_depth == 0 {
+                    sel *= ANY_CHAR_SEL;
+                }
+            }
+            b'*' | b'?' | b'+' => {
+                if paren_depth == 0 {
+                    sel *= PARTIAL_WILDCARD_SEL;
+                }
+            }
+            b'{' => {
+                while pos < len && patt[pos] != b'}' {
+                    pos += 1;
+                }
+                if paren_depth == 0 {
+                    sel *= PARTIAL_WILDCARD_SEL;
+                }
+            }
+            b'\\' => {
+                pos += 1;
+                if pos >= len {
+                    break;
+                }
+                if paren_depth == 0 {
+                    sel *= FIXED_CHAR_SEL;
+                }
+            }
+            _ => {
+                if paren_depth == 0 {
+                    sel *= FIXED_CHAR_SEL;
+                }
+            }
+        }
+        pos += 1;
+    }
+    sel.min(1.0)
+}
+
+/// `regex_selectivity`: [`regex_selectivity_sub`] of the pattern less a
+/// trailing unescaped `$`, or, with none, times `FULL_WILDCARD_SEL` for the
+/// implied trailing wildcard; a fixed prefix of `fixed_prefix_len` bytes
+/// discounted (`FIXED_CHAR_SEL` each), and clamped to `[0, 1]`.
+fn regex_selectivity(patt: &[u8], fixed_prefix_len: usize) -> f64 {
+    let len = patt.len();
+    let mut sel = if len > 0 && patt[len - 1] == b'$' && (len == 1 || patt[len - 2] != b'\\') {
+        regex_selectivity_sub(&patt[..len - 1])
+    } else {
+        regex_selectivity_sub(patt) * FULL_WILDCARD_SEL
+    };
+    if fixed_prefix_len > 0 {
+        let prefixsel = FIXED_CHAR_SEL.powi(i32::try_from(fixed_prefix_len).unwrap_or(i32::MAX));
+        if prefixsel > 0.0 {
+            sel /= prefixsel;
+        }
+    }
+    sel.clamp(0.0, 1.0)
 }
 
 /// `make_greater_string` for a string in a bytewise collation: the
@@ -1071,13 +1594,117 @@ mod tests {
             ("X%", true, false, 30.0),
             ("y%", false, false, 1.0),
         ] {
-            let sel = col.pattern_sel(pattern, insensitive, negated).unwrap();
+            let sel = col
+                .pattern_sel(pattern, insensitive, negated, false)
+                .unwrap();
             assert_eq!(rows(sel), expected, "{pattern} {insensitive} {negated}");
         }
         let gt = col.clause_sel(Op::Gt, b"xxxx").unwrap();
         assert_eq!(rows(gt), 27.0);
         let lt = col.clause_sel(Op::Lt, b"xxx").unwrap();
         assert_eq!(rows(lt), 1.0);
+    }
+
+    /// `regex_fixed_prefix`'s prefixes, each measured on PostgreSQL 15.19
+    /// as the index condition a `~` (or `~*`) over a `C`-collated indexed
+    /// column takes (`c >= prefix AND c < greater`, or `c = prefix` when
+    /// exact); `None` where the walk is not modelled.
+    #[test]
+    fn regex_prefixes_match_postgres() {
+        use PrefixStatus::{Exact, None as NoMatch, Partial};
+        for (pattern, insensitive, expected) in [
+            ("^abc", false, Some(("abc", Partial))),
+            ("^abc", true, Some(("", NoMatch))),
+            ("^abc$", false, Some(("abc", Exact))),
+            ("^ab*c", false, Some(("a", Partial))),
+            ("^ab+c", false, Some(("ab", Partial))),
+            ("^ab{2}c", false, Some(("abbc", Partial))),
+            ("^ab{2,3}c", false, Some(("a", Partial))),
+            ("^ab{1,2}c", false, Some(("a", Partial))),
+            ("^ab{0,1}c", false, Some(("a", Partial))),
+            ("^ab{1,}c", false, Some(("ab", Partial))),
+            ("^ab{3,}c", false, Some(("ab", Partial))),
+            ("^ab{3,3}c", false, Some(("abbbc", Partial))),
+            ("^ab{1,1}c", false, Some(("abc", Partial))),
+            ("^a(bc){2}d", false, Some(("abcbcd", Partial))),
+            ("^a(b){2}", false, Some(("abb", Partial))),
+            ("^a(b)c+", false, Some(("abc", Partial))),
+            ("^ab{0}c", false, Some(("ac", Partial))),
+            ("^a{1}b", false, Some(("ab", Partial))),
+            ("^a(bc)d", false, Some(("abcd", Partial))),
+            ("^a(?:bc)d", false, Some(("abcd", Partial))),
+            ("^(a)", false, Some(("a", Partial))),
+            ("^a(bc)*d", false, Some(("a", Partial))),
+            ("^a(b|c)", false, Some(("a", Partial))),
+            ("^a(bc|bd)", false, Some(("ab", Partial))),
+            ("^a(b|bd)", false, Some(("ab", Partial))),
+            ("^a((b)c|bd)", false, Some(("ab", Partial))),
+            ("^a(bc|d)", false, Some(("a", Partial))),
+            ("^a(|b)", false, Some(("a", Partial))),
+            ("^a(b?c|bd)", false, Some(("a", Partial))),
+            ("^a(b|c)$", false, Some(("a", Partial))),
+            ("^a[b]c", false, Some(("abc", Partial))),
+            ("^[a-a]b", false, Some(("ab", Partial))),
+            ("^[]]x", false, Some(("]x", Partial))),
+            ("^[.]x", false, Some((".x", Partial))),
+            ("^a[bc]", false, Some(("a", Partial))),
+            ("^a[[:digit:]]", false, Some(("a", Partial))),
+            ("^a.c", false, Some(("a", Partial))),
+            (r"^a\.c", false, Some(("a.c", Partial))),
+            (r"^a\dc", false, Some(("a", Partial))),
+            (r"^a\tb", false, Some(("a\tb", Partial))),
+            (r"^a\Bb", false, Some(("a\\b", Partial))),
+            ("^ab*?c", false, Some(("a", Partial))),
+            ("^ab?", false, Some(("a", Partial))),
+            ("^a?b", false, Some(("", NoMatch))),
+            ("^aB", false, Some(("aB", Partial))),
+            ("^1x2", false, Some(("1x2", Partial))),
+            ("^1x2", true, Some(("1", Partial))),
+            ("^1[x]", true, Some(("1", Partial))),
+            ("^12$", true, Some(("12", Exact))),
+            (r"^1\$", false, Some(("1$", Partial))),
+            ("^$", false, Some(("", Exact))),
+            ("^", false, Some(("", NoMatch))),
+            ("abc", false, Some(("", NoMatch))),
+            ("^ab|^ac", false, Some(("", NoMatch))),
+            ("^a|b", false, Some(("", NoMatch))),
+            ("a|^b", false, Some(("", NoMatch))),
+            ("^a$|^b$", false, Some(("", NoMatch))),
+            // Not modelled: a group repeated at least once (`^(ab)+c` is
+            // `a`, `^a(b)+` is `ab`), an anchor inside, a back reference.
+            ("^(ab)+c", false, None),
+            ("(^a)", false, None),
+            ("^a\\1", false, None),
+        ] {
+            let got = regex_prefix(pattern, insensitive, true);
+            let got = got.as_ref().map(|(p, s)| (p.as_str(), *s));
+            assert_eq!(got, expected, "{pattern} {insensitive}");
+        }
+    }
+
+    /// `regex_selectivity`, transcribed from PostgreSQL 15.19's
+    /// `like_support.c`: an implied trailing wildcard without a `$`, the
+    /// fixed prefix discounted, the result clamped to 1.
+    #[test]
+    fn regex_selectivity_follows_postgres() {
+        let close = |a: f64, b: f64| (a - b).abs() < 1e-12;
+        // `w01`: three fixed characters and the trailing wildcard.
+        assert!(close(regex_selectivity(b"w01", 0), 0.2f64.powi(3) * 5.0));
+        // A trailing `$` drops the wildcard; an escaped one does not.
+        assert!(close(regex_selectivity(b"ab$", 0), 0.04));
+        assert!(close(regex_selectivity(br"a\$", 0), 0.04 * 5.0));
+        // Brackets, `.`, quantifiers, groups and alternatives.
+        assert!(close(
+            regex_selectivity(b"a[bc].x*$", 0),
+            0.2 * 0.25 * 0.9 * 0.2 * 2.0
+        ));
+        assert!(close(regex_selectivity(b"[^a]$", 0), 0.75));
+        assert!(close(regex_selectivity(b"(ab)c$", 0), 0.04 * 0.2));
+        assert!(close(regex_selectivity(b"ab|c$", 0), 0.04 + 0.2));
+        // `^abcd` with its prefix `abcd` discounted: the `^`, a fixed
+        // character, and the wildcard.
+        assert!(close(regex_selectivity(b"^abcd", 4), 1.0));
+        assert!(close(regex_selectivity(b"^abcd.x$", 4), 0.2 * 0.9 * 0.2));
     }
 
     /// `like_fixed_prefix` and `like_selectivity`: the prefix stops at the

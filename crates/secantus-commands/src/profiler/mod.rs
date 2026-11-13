@@ -24,7 +24,7 @@ mod record;
 
 pub(crate) use record::{
     begin, finish, mark_reached, note_modified, note_namespace, note_statement_exec, profiled,
-    Pending, StatementExec, Statements,
+    refused_statement, Pending, StatementExec, Statements,
 };
 
 use std::collections::HashMap;

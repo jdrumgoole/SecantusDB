@@ -125,6 +125,7 @@ mod util;
 mod validation_errors;
 mod views;
 
+use crate::util::ReplyOk;
 use std::sync::{Arc, Mutex};
 
 pub use auth::ConnectionAuth;
@@ -363,6 +364,9 @@ pub struct ExecStats {
     /// A `getMore`'s plan summary and the command that opened its cursor.
     pub plan_summary: Option<String>,
     pub originating_command: Option<Document>,
+    /// A `getMore`'s cursor was opened under a write concern, which the
+    /// `getMore` runs under (`CursorInfo::write_concern`, RM-489).
+    pub write_concern: bool,
     /// The plan sorts in memory (`hasSortStage`), which every batch of its
     /// cursor reports.
     pub has_sort_stage: bool,
@@ -1042,7 +1046,7 @@ fn dispatch_named(doc: &Document, ctx: &mut CommandContext) -> Document {
     });
     // `dropDatabase` resets the database's profiling settings (measured
     // 8.2.11: the level and filter are gone afterwards).
-    if name == "dropDatabase" && reply.get_f64("ok").unwrap_or(0.0) == 1.0 {
+    if name == "dropDatabase" && reply.ok_number().unwrap_or(0.0) == 1.0 {
         if let Some(p) = &ctx.profiler {
             p.forget(&ctx.db_name);
         }
@@ -1144,7 +1148,7 @@ fn status_authentication(
     if !matches!(name, "saslStart" | "saslContinue" | "authenticate") {
         return;
     }
-    let ok = reply.get_f64("ok").unwrap_or(0.0) == 1.0;
+    let ok = reply.ok_number().unwrap_or(0.0) == 1.0;
     let done = !ok || name == "authenticate" || reply.get_bool("done").unwrap_or(false);
     let Some(auth) = ctx.conn_auth.as_ref() else {
         return;
@@ -1217,7 +1221,7 @@ fn unacknowledged_write_reply(doc: &Document, reply: &mut Document) {
 ///   `provenance: "clientSupplied"`, in that order;
 /// - it sits immediately BEFORE `ok`, not after it.
 fn attach_write_concern_error(wc: &Document, provenance: &str, reply: &mut Document) {
-    if reply.get_f64("ok").unwrap_or(0.0) != 1.0 || reply.contains_key("writeConcernError") {
+    if reply.ok_number().unwrap_or(0.0) != 1.0 || reply.contains_key("writeConcernError") {
         return;
     }
     // A null `w` is the empty tag; a tag set echoes its counts as longs.
@@ -1400,7 +1404,7 @@ fn fail_on_write_concern_error(reply: &mut Document) {
     let Ok(wce) = reply.get_document("writeConcernError").cloned() else {
         return;
     };
-    if reply.get_f64("ok") != Ok(1.0) {
+    if reply.ok_number() != Ok(1.0) {
         return;
     }
     let details = wce
@@ -1431,7 +1435,7 @@ fn fail_drop_database_on_write_concern_error(
     let Ok(wce) = reply.get_document("writeConcernError").cloned() else {
         return;
     };
-    if reply.get_f64("ok") != Ok(1.0) || dropped == 0 {
+    if reply.ok_number() != Ok(1.0) || dropped == 0 {
         return;
     }
     let at = ctx.storage.as_ref().map_or(
@@ -1998,6 +2002,26 @@ fn dispatch_inner(
                     return reply;
                 }
                 if let Some(reply) = views::refusal(name, doc, ctx) {
+                    if views::refusal_is_profiled(name) {
+                        // mongod's `AutoGetCollectionForReadCommand` takes
+                        // the read's locks before it finds the view, and its
+                        // line and entry count them (RM-488).
+                        let facts = lock_manager::StorageFacts {
+                            storage: ctx.storage.as_ref(),
+                            db: &ctx.db_name,
+                        };
+                        let locks = lock_manager::Guard::statement(
+                            ctx.locks.as_ref(),
+                            doc,
+                            &ctx.db_name,
+                            &facts,
+                        );
+                        if let Some(Err(e)) = locks {
+                            return e.into_reply();
+                        }
+                        drop(locks);
+                        profiler::mark_reached(ctx);
+                    }
                     return reply;
                 }
             }
@@ -2013,7 +2037,7 @@ fn dispatch_inner(
             // running BOTH C lanes rather than assuming they moved together.
             if let Some(m) = &fp {
                 if let Some(wce) = &m.write_concern_error {
-                    if reply.get_f64("ok").unwrap_or(0.0) == 1.0
+                    if reply.ok_number().unwrap_or(0.0) == 1.0
                         && !reply.contains_key("writeConcernError")
                     {
                         reply.insert("writeConcernError", Bson::Document(wce.clone()));
@@ -2771,7 +2795,7 @@ fn finish_txn_statement(
     txn: &std::sync::Arc<std::sync::Mutex<transactions::Transaction>>,
     result: &mut Document,
 ) {
-    let ok = result.get_f64("ok").unwrap_or(0.0) == 1.0;
+    let ok = result.ok_number().unwrap_or(0.0) == 1.0;
     let failed = !ok || result.contains_key("writeErrors");
     if !failed {
         return;

@@ -15,6 +15,7 @@
 //! against that op, never as a command-level error, or a driver sees no partial
 //! result at all.
 
+use crate::util::ReplyOk;
 use bson::{doc, Bson, Document};
 
 use crate::transactions::{Applied, StmtRecord};
@@ -909,7 +910,7 @@ pub fn bulk_write(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
                 continue;
             }
         };
-        if reply.get_f64("ok").unwrap_or(1.0) == 0.0 {
+        if reply.ok_number().unwrap_or(1.0) == 0.0 {
             let code = reply.get_i32("code").unwrap_or(8);
             let msg = reply.get_str("errmsg").unwrap_or("").to_string();
             results.push(op_error(idx, code, &msg, Some(&reply), is_update));

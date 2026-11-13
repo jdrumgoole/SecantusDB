@@ -6,6 +6,7 @@
 //! any database and every database reads them back (probed on 8.2.11) -- and
 //! are not persisted across a restart.
 
+use crate::util::ReplyOk;
 use bson::Document;
 
 use crate::CommandContext;
@@ -187,7 +188,7 @@ pub(crate) fn statement_line(component: &'static str, mut attr: Document, worked
 /// `delete` reports its counts on each statement's line
 /// (`profiler::record`), not the command's.
 fn outcome(name: &str, reply: &Document, out: &mut Document) {
-    if reply.get_f64("ok").unwrap_or(1.0) != 1.0 {
+    if reply.ok_number().unwrap_or(1.0) != 1.0 {
         failure(reply, out);
         return;
     }
@@ -268,7 +269,7 @@ fn line_target<'a>(
     if name != "renameCollection" {
         return (db, target_collection(name, request));
     }
-    let renamed = reply.get_f64("ok").unwrap_or(1.0) == 1.0;
+    let renamed = reply.ok_number().unwrap_or(1.0) == 1.0;
     match request.get_str(name).ok().and_then(|ns| ns.split_once('.')) {
         Some((source_db, coll)) if renamed && !source_db.is_empty() && !coll.is_empty() => {
             (source_db, Some(coll))
@@ -326,7 +327,7 @@ pub fn read_attributes(request: &Document, reply: &Document, ctx: &CommandContex
     let mut out = Document::new();
     out.insert("isFromUserConnection", true);
     let (db, coll) = line_target(name, request, reply, &ctx.db_name);
-    let ok = reply.get_f64("ok").unwrap_or(1.0) == 1.0;
+    let ok = reply.ok_number().unwrap_or(1.0) == 1.0;
     // The namespace [`attributes`] names, moved beneath a view the read
     // failed under.
     if let (false, Some(coll)) = (ok, coll) {
@@ -467,14 +468,15 @@ pub fn read_attributes(request: &Document, reply: &Document, ctx: &CommandContex
     if replicated {
         out.insert("readConcern", crate::opdebug::read_concern(request));
     }
-    // A `getMore` runs under the write concern of the `aggregate` that
-    // opened its cursor.
-    let concerned = match ctx
-        .exec_stats
-        .as_ref()
-        .and_then(|e| e.originating_command.as_ref())
-    {
-        Some(origin) if name == "getMore" => Some(origin),
+    // A `getMore` runs under the write concern its cursor was opened
+    // under: the opening `aggregate`'s, and none for a `find`'s, even one
+    // run as an `aggregate` (RM-489).
+    let concerned = match ctx.exec_stats.as_ref().and_then(|e| {
+        e.originating_command
+            .as_ref()
+            .map(|origin| (origin, e.write_concern))
+    }) {
+        Some((origin, opened_under)) if name == "getMore" => opened_under.then_some(origin),
         _ => crate::opdebug::takes_write_concern(name).then_some(request),
     };
     if let Some(origin) = concerned.filter(|o| replicated && crate::opdebug::has_write_concern(o)) {

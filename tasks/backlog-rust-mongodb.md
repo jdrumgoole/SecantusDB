@@ -1014,40 +1014,50 @@ These are explicit non-goals. Don't add them without a reason.
       RM-484, 2026-11-13.
       Verify: tests/backlog/test_rm_ts_ddl_lines.py::test_a_find_of_buckets_says_what_it_examined
       Backlog-ID: RM-586
-- [ ] **An `update` or `delete` of a view writes no statement line.**
-      mongod 8.2.11 refuses the statement and writes its line (`<db>.v`,
-      `normal`, `ok: 0`, the refusal) before the command's; this server
-      writes the command's line alone. Found while working RM-380,
-      2026-11-10.
-      Verify: tests/backlog/test_rm_view_namespaces.py::test_a_write_to_a_view_has_a_statement_line
-      Backlog-ID: RM-487
-- [ ] **A refused `listIndexes` or `collStats` of a view is not profiled.**
-      mongod 8.2.11 writes an entry for each (`<db>.v`, `ok: 0`); this
-      server writes none. Found while working RM-380, 2026-11-10.
-      Verify: tests/backlog/test_rm_view_namespaces.py::test_a_refused_list_indexes_of_a_view_is_profiled
-      Backlog-ID: RM-488
-- [ ] **A `getMore` of a `find` of a view names a write concern.** mongod
-      8.2.11's line and profile entry for it carry no `writeConcern`, as
-      one of a `find` of a collection; this server's carry the one an
-      `aggregate`'s `getMore` runs under, since it runs the `find` as an
-      `aggregate`. Found while working RM-380, 2026-11-10.
-      Verify: tests/backlog/test_rm_view_namespaces.py::test_a_get_more_of_a_find_of_a_view_names_no_write_concern
-      Backlog-ID: RM-489
-- [ ] **A `distinct` of a view is counted as failed.** A view's `distinct`
-      answers `ok` as an int32, as mongod's does, and about 270 readers of
-      a reply's `ok` (`get_f64("ok")`) take it for a failure:
-      `serverStatus` counts it in `metrics.commands.distinct.failed`, where
-      mongod 8.2.11 does not, and the transaction, interrupt and
-      write-concern paths read it the same way. The profiler reads it with
-      `util::reply_ok` since RM-380. Found while working RM-380,
-      2026-11-10.
-      Verify: tests/backlog/test_rm_view_namespaces.py::test_a_distinct_of_a_view_is_not_counted_failed
-      Backlog-ID: RM-490
-- [ ] **`metrics.commands.<name>` has no `rejected`.** mongod 8.2.11 counts
-      `failed`, `rejected` and `total` for a command; this server counts
-      `failed` and `total`. Found while working RM-380, 2026-11-10.
-      Verify: tests/backlog/test_rm_view_namespaces.py::test_a_command_metric_counts_rejections
-      Backlog-ID: RM-491
+- [ ] **A refused write of a view counts fewer locks than mongod's.**
+      mongod 8.2.11 refuses a write of a view once it holds the namespace
+      for the write; this server refuses it earlier, in `views::refusal`,
+      before `session::run`, and its lines count fewer locks: a retryable
+      `update` / `delete` is refused before its session is checked out, so
+      its statement and command lines are one `ReplicationStateTransition`
+      w short (the transition lock `retryable_write_transition_lock`
+      takes); an `insert`'s line has none of its two write rounds (no
+      `Database` / `Collection`, no `flowControl`); a statement of a
+      transaction has `locks: {}` where mongod's has the transaction's
+      (`MultiDocumentTransactionsBarrier`, the rounds). The faithful fix
+      refuses the write where mongod does, after the session checkout and
+      the write's acquisition; whether a refused retryable write then uses
+      up its `txnNumber`, as on mongod, wants probing first. Found while
+      working RM-487, 2026-11-13.
+      Verify: tests/backlog/test_rm_view_namespaces.py::test_a_refused_write_of_a_view_takes_mongods_locks
+      Backlog-ID: RM-589
+- [ ] **A `$collStats` of a view is refused.** mongod 8.2.11 answers a
+      `$collStats: {}` or `{latencyStats: {}}` stage of a view (one
+      document, `ns`, `host`, `localTime`, and `latencyStats` when asked),
+      and refuses `count`, `storageStats` and `queryExecStats` (166); this
+      server refuses every `$collStats` of a view. Found while working
+      RM-488, 2026-11-13.
+      Verify: tests/backlog/test_rm_view_namespaces.py::test_a_coll_stats_stage_of_a_view_answers
+      Backlog-ID: RM-590
+- [ ] **An `$out` into a view is not profiled, and its line names the
+      source.** mongod 8.2.11 refuses it (166) with a line and a profile
+      entry naming the view (`<db>.v`, `ok: 0`); this server's line names
+      the collection the pipeline reads, and it writes no entry. Found
+      while working RM-488, 2026-11-13.
+      Verify: tests/backlog/test_rm_view_namespaces.py::test_an_out_into_a_view_names_the_view
+      Backlog-ID: RM-591
+- [ ] **A `$merge` into a view is not profiled.** mongod 8.2.11 refuses it
+      (166) and profiles the `aggregate` under the collection it reads
+      (`<db>.c`, `ok: 0`); this server writes no entry. Found while
+      working RM-488, 2026-11-13.
+      Verify: tests/backlog/test_rm_view_namespaces.py::test_a_merge_into_a_view_is_profiled
+      Backlog-ID: RM-592
+- [ ] **A `$changeStream` of a view writes a line.** Both servers refuse
+      it (166), and mongod 8.2.11 writes no `Slow query` line for it; this
+      server writes one (`<db>.v`, `ok: 0`). Found while working RM-488,
+      2026-11-13.
+      Verify: tests/backlog/test_rm_view_namespaces.py::test_a_change_stream_of_a_view_writes_no_line
+      Backlog-ID: RM-593
 - [ ] **A `distinct` of a view counts nothing it examined.** mongod 8.2.11
       runs it as an aggregation over the collection beneath the view, and
       its line counts what that plan examined (`keysExamined: 11,

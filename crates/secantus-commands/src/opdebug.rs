@@ -10,6 +10,7 @@
 //! [`LINE_ORDER`] and [`PROFILE_ORDER`] are those orders, measured against
 //! mongod 8.2.11 field by field (2026-10-27).
 
+use crate::util::ReplyOk;
 use bson::{doc, Bson, Document};
 
 use crate::storage::OperationCounts;
@@ -387,7 +388,7 @@ pub(crate) fn thread_cpu_nanos() -> Option<i64> {
 /// mongod reports the wait only then (an insert of a duplicate `_id`
 /// alone has none, measured 8.2.11).
 pub(crate) fn wrote_something(name: &str, reply: &Document) -> bool {
-    if reply.get_f64("ok").unwrap_or(0.0) != 1.0 {
+    if reply.ok_number().unwrap_or(0.0) != 1.0 {
         return false;
     }
     let n = |d: &Document| crate::util::as_i64(d.get("n").unwrap_or(&Bson::Null)).unwrap_or(0);

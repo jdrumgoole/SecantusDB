@@ -7,6 +7,7 @@
 //! (which drops the collection), and writing a bucket by hand, which the
 //! bucket catalog has to hear about. Shapes were read from `mongod` 8.2.11.
 
+use crate::util::ReplyOk;
 use bson::{doc, Bson, Document};
 
 use crate::ts_buckets::{self, Layout};
@@ -101,7 +102,7 @@ pub(crate) fn intercept(name: &str, doc: &Document, ctx: &mut CommandContext) ->
             let mut redirected = doc.clone();
             redirected.insert(name, base);
             let reply = dispatch(&redirected, ctx);
-            if reply.get_f64("ok").ok() != Some(1.0) {
+            if reply.ok_number().ok() != Some(1.0) {
                 return Some(reply);
             }
             Some(doc! { "nIndexesWas": indexes as i32, "ok": 1.0 })

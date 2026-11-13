@@ -938,9 +938,10 @@ enum WhereClause {
     /// `col NOT IN (...)` of these constants.
     NotIn(String, Vec<Bson>),
     /// `col LIKE pattern` (`ILIKE` when the first flag is set; `NOT` when
-    /// the second is), its pattern read from the EXPLAIN's own
+    /// the second is; a regex match, `~` and its kin, when the third is),
+    /// its pattern read from the EXPLAIN's own
     /// (`scan_estimate::explain_pattern`).
-    Pattern(String, String, bool, bool),
+    Pattern(String, String, bool, bool, bool),
     /// An `OR` of conjunctions.
     Or(Vec<Vec<WhereClause>>),
 }
@@ -1112,7 +1113,7 @@ fn lowered_clauses(filter: &Document) -> Option<Vec<WhereClause>> {
                     c,
                     WhereClause::Cmp(g, Op::Ne, _)
                     | WhereClause::NotIn(g, _)
-                    | WhereClause::Pattern(g, _, _, true)
+                    | WhereClause::Pattern(g, _, _, true, _)
                     if g == f
                 )
             })
@@ -1126,8 +1127,8 @@ fn lowered_clauses(filter: &Document) -> Option<Vec<WhereClause>> {
     Some(out)
 }
 
-/// A lowered pattern match (`{$regex, $options}`) on `field` as the LIKE or
-/// ILIKE its EXPLAIN holds; `None` for any other regex.
+/// A lowered pattern match (`{$regex, $options}`) on `field` as the LIKE,
+/// ILIKE or regex match its EXPLAIN holds; `None` for any other regex.
 fn pattern_clause(field: &str, spec: &Document, negated: bool) -> Option<WhereClause> {
     let regex = spec.get_str("$regex").ok()?;
     let insensitive = match spec.get("$options") {
@@ -1138,13 +1139,14 @@ fn pattern_clause(field: &str, spec: &Document, negated: bool) -> Option<WhereCl
     if spec.keys().any(|k| k != "$regex" && k != "$options") {
         return None;
     }
-    let (pattern, insensitive) =
+    let (pattern, insensitive, is_regex) =
         scan_estimate::explain_pattern(field, regex, insensitive, negated)?;
     Some(WhereClause::Pattern(
         field.to_string(),
         pattern,
         insensitive,
         negated,
+        is_regex,
     ))
 }
 
@@ -5904,7 +5906,7 @@ impl PgHandler {
         secantus_pgplan::set_views(views);
         secantus_pgplan::view_dml::set_checked_views(checked);
         secantus_pgplan::view_dml::set_view_defaults(self.view_column_defaults());
-        secantus_pgplan::partitions::set_tableoids(self.tableoid_expressions());
+        self.publish_tableoids();
         secantus_pgplan::regobj::set_namespaces(self.namespaces());
         // A role the open block created is named by `::regrole` in that
         // block, as PostgreSQL's syscache sees its own transaction's rows.
@@ -6053,12 +6055,21 @@ impl PgHandler {
         // and a map fetch per relation, for each listing below, made the
         // statement after any DDL grow with the schema (RP-911).
         let table_defs = self.shared_table_defs().unwrap_or_default();
-        let oids = self.relation_oids().unwrap_or_default();
-        let oid = |name: &str| Self::oid_in(&oids, name);
+        // Built only when a partitioned table or a partition asks for it.
+        let oids = std::cell::OnceCell::new();
+        let oid = |name: &str| {
+            Self::oid_in(
+                oids.get_or_init(|| self.relation_oids().unwrap_or_default()),
+                name,
+            )
+        };
         secantus_pgplan::set_partkey_defs(
             table_defs
                 .iter()
-                .filter_map(|t| Some((oid(&t.name)?, partition::partkey_text(t)?)))
+                .filter_map(|t| {
+                    let key = partition::partkey_text(t)?;
+                    Some((oid(&t.name)?, key))
+                })
                 .collect(),
         );
         secantus_pgplan::set_partition_parents(
@@ -6120,52 +6131,15 @@ impl PgHandler {
         // Enums resolve by name too. A `public` enum resolves by its bare name
         // (public is on the default search_path); a schema-qualified one
         // resolves only as `schema.name`, exactly like composites and ranges.
-        let mut types: Vec<(String, i64, Vec<String>)> = self
+        let enums: Vec<(String, i64, Vec<String>)> = self
             .enums_with_schema()
             .unwrap_or_default()
             .into_iter()
             .map(|(schema, name, oid, labels)| (Self::type_resolution(&schema, &name), oid, labels))
             .collect();
-        // Composites resolve by name too; they have no labels, so an empty
-        // label list stands in. A `public` composite resolves by its bare name
-        // (public is on the default search_path); a schema-qualified one
-        // resolves only as `schema.name`, so `to_regtype('testschema.t')` finds
-        // it while `to_regtype('t')` does not (matching PostgreSQL).
-        let mut composites: Vec<secantus_pgplan::CompositeType> = Vec::new();
-        // A table row type's `char(n)` widths, which a text literal cast to it
-        // pads to.
-        let composite_docs = self
-            .type_catalog_docs(Self::COMPOSITE_COLLECTION)
-            .unwrap_or_default();
-        let widths: std::collections::HashMap<String, Vec<Option<usize>>> = composite_docs
-            .iter()
-            .filter_map(|d| {
-                let w = d.get_array("widths").ok()?;
-                let schema = d.get_str("schema").unwrap_or("public");
-                let name = d.get_str("composite").ok()?;
-                Some((
-                    Self::type_resolution(schema, name),
-                    w.iter()
-                        .map(|v| match v {
-                            Bson::Int32(n) => usize::try_from(*n).ok(),
-                            _ => None,
-                        })
-                        .collect(),
-                ))
-            })
-            .collect();
-        secantus_pgplan::set_user_composite_widths(widths);
-        for (schema, name, oid, fields) in self.composites_with_schema().unwrap_or_default().iter()
-        {
-            let resolution = Self::type_resolution(schema, name);
-            types.push((resolution.clone(), *oid, Vec::new()));
-            // The field metadata rides its own channel so a composite VALUE cast
-            // (`'(1,x)'::testcomp`) resolves each field's type; the empty label
-            // list above keeps it OUT of the enum arm.
-            composites.push((resolution, *oid, fields.clone()));
-        }
         // A view's row type is a composite of its output columns, as a
         // table's is, under the oid `pg_type` lists it with.
+        let mut view_rows: Vec<secantus_pgplan::CompositeType> = Vec::new();
         for d in self
             .type_catalog_docs(Self::VIEW_COLLECTION)
             .unwrap_or_default()
@@ -6186,13 +6160,80 @@ impl PgHandler {
                 .collect();
             let (schema, bare) = secantus_pgplan::schemas::split_key(view);
             let resolution = Self::type_resolution(&schema, &bare);
-            let oid = self.view_type_relid(view);
-            types.push((resolution.clone(), oid, Vec::new()));
-            composites.push((resolution, oid, fields));
+            view_rows.push((resolution, self.view_type_relid(view), fields));
         }
-        secantus_pgplan::set_user_types(types);
-        secantus_pgplan::set_user_composites(composites);
-        secantus_pgplan::set_standalone_composites(
+        // Every table's row type is a composite, so the tables below are
+        // derived from the composite catalog's documents only when a
+        // statement looks one up (RP-911); the documents are the ones read
+        // now, so what is derived is what this catalog version holds.
+        let composite_docs = self
+            .type_catalog_docs(Self::COMPOSITE_COLLECTION)
+            .unwrap_or_default();
+        // Composites resolve by name too; they have no labels, so an empty
+        // label list stands in. A `public` composite resolves by its bare name
+        // (public is on the default search_path); a schema-qualified one
+        // resolves only as `schema.name`, so `to_regtype('testschema.t')` finds
+        // it while `to_regtype('t')` does not (matching PostgreSQL).
+        {
+            let docs = Arc::clone(&composite_docs);
+            let views: Vec<_> = view_rows
+                .iter()
+                .map(|(r, oid, _)| (r.clone(), *oid, Vec::new()))
+                .collect();
+            secantus_pgplan::defer_user_types(move || {
+                let mut types = enums;
+                types.extend(
+                    Self::composite_listing(docs)
+                        .iter()
+                        .map(|(schema, name, oid, _)| {
+                            (Self::type_resolution(schema, name), *oid, Vec::new())
+                        }),
+                );
+                types.extend(views);
+                types
+            });
+        }
+        // The field metadata rides its own channel so a composite VALUE cast
+        // (`'(1,x)'::testcomp`) resolves each field's type; the empty label
+        // list above keeps it OUT of the enum arm.
+        {
+            let docs = Arc::clone(&composite_docs);
+            secantus_pgplan::defer_user_composites(move || {
+                let mut composites: Vec<secantus_pgplan::CompositeType> =
+                    Self::composite_listing(docs)
+                        .iter()
+                        .map(|(schema, name, oid, fields)| {
+                            (Self::type_resolution(schema, name), *oid, fields.clone())
+                        })
+                        .collect();
+                composites.extend(view_rows);
+                composites
+            });
+        }
+        // A table row type's `char(n)` widths, which a text literal cast to it
+        // pads to.
+        {
+            let docs = Arc::clone(&composite_docs);
+            secantus_pgplan::defer_user_composite_widths(move || {
+                docs.iter()
+                    .filter_map(|d| {
+                        let w = d.get_array("widths").ok()?;
+                        let schema = d.get_str("schema").unwrap_or("public");
+                        let name = d.get_str("composite").ok()?;
+                        Some((
+                            Self::type_resolution(schema, name),
+                            w.iter()
+                                .map(|v| match v {
+                                    Bson::Int32(n) => usize::try_from(*n).ok(),
+                                    _ => None,
+                                })
+                                .collect(),
+                        ))
+                    })
+                    .collect()
+            });
+        }
+        secantus_pgplan::defer_standalone_composites(move || {
             composite_docs
                 .iter()
                 .filter(|d| !d.get_bool("relation").unwrap_or(false))
@@ -6203,8 +6244,8 @@ impl PgHandler {
                         name,
                     ))
                 })
-                .collect(),
-        );
+                .collect()
+        });
         // Custom ranges resolve their subtype at cast time and their oid for
         // regtype -- but they are NOT enums, so they stay OUT of set_user_types.
         // A schema-qualified range resolves as `schema.name`, so
@@ -6289,9 +6330,8 @@ impl PgHandler {
             self.relations()
         };
         secantus_pgplan::set_user_relations(relations);
-        // `pg_relation_is_publishable`: an ordinary or partitioned table that
-        // is not temporary (`is_publishable_class`). This server keeps no
-        // unlogged tables apart, and its own relations are below 16384.
+        // `pg_relation_is_publishable`'s tables, listed when a statement
+        // first asks (RP-911), from the catalog documents read now.
         {
             let matviews: Vec<String> = self
                 .matviews()
@@ -6299,18 +6339,23 @@ impl PgHandler {
                 .into_iter()
                 .map(|(n, _, _)| n)
                 .collect();
-            secantus_pgplan::set_publishable_relations(
-                table_defs
-                    .iter()
-                    .filter(|t| {
-                        !t.temp
-                            && !t.extra.get_bool("unlogged").unwrap_or(false)
-                            && !matviews.contains(&t.name)
-                            && !secantus_pgplan::fdw::is_foreign(t)
-                    })
-                    .filter_map(|t| oid(&t.name))
-                    .collect(),
-            );
+            let defs = Arc::clone(&table_defs);
+            match (
+                self.type_catalog_docs(Self::COMPOSITE_COLLECTION),
+                self.type_catalog_docs(Self::VIEW_COLLECTION),
+            ) {
+                (Ok(comps), Ok(views)) => {
+                    secantus_pgplan::defer_publishable_relations(move || {
+                        let oids = Self::relation_oids_of(comps, views);
+                        Self::publishable_relations(&defs, &matviews, &oids)
+                    });
+                }
+                _ => secantus_pgplan::set_publishable_relations(Self::publishable_relations(
+                    &defs,
+                    &matviews,
+                    &HashMap::new(),
+                )),
+            }
         }
         secantus_pgplan::schemas::set_relation_keys(
             table_defs
@@ -6320,6 +6365,26 @@ impl PgHandler {
                 .collect(),
         );
         complete
+    }
+
+    /// `pg_relation_is_publishable`'s tables: an ordinary or partitioned
+    /// table that is not temporary (`is_publishable_class`). This server
+    /// keeps no unlogged tables apart, and its own relations are below
+    /// 16384.
+    fn publishable_relations(
+        defs: &[Arc<TableDef>],
+        matviews: &[String],
+        oids: &HashMap<String, i64>,
+    ) -> Vec<i64> {
+        defs.iter()
+            .filter(|t| {
+                !t.temp
+                    && !t.extra.get_bool("unlogged").unwrap_or(false)
+                    && !matviews.contains(&t.name)
+                    && !secantus_pgplan::fdw::is_foreign(t)
+            })
+            .filter_map(|t| Self::oid_in(oids, &t.name))
+            .collect()
     }
 
     /// `information_schema.columns`' `data_type` and `udt_name` for a column
@@ -6404,6 +6469,12 @@ impl PgHandler {
                 | "jsonb"
                 | "oid"
         ) {
+            return None;
+        }
+        // Nor any other `pg_catalog` name (`regproc`, `"char"`,
+        // `aclitem[]`): a join over `pg_type` describes each of them, and
+        // the reads below list every user type (RP-911).
+        if secantus_pgplan::pgtypes::is_catalog_type_name(pg_type) {
             return None;
         }
         // An ARRAY of a domain is the domain's own array type, which
@@ -9214,11 +9285,12 @@ impl PgHandler {
                     WhereClause::Null(f, is_null) => {
                         others.push(columns[at(f)?].null_sel(*is_null));
                     }
-                    WhereClause::Pattern(f, pattern, insensitive, negated) => {
+                    WhereClause::Pattern(f, pattern, insensitive, negated, is_regex) => {
                         others.push(columns[at(f)?].pattern_sel(
                             pattern,
                             *insensitive,
                             *negated,
+                            *is_regex,
                         )?);
                     }
                     WhereClause::Or(arms) => {
@@ -9327,7 +9399,7 @@ impl PgHandler {
                     WhereClause::In(_, v) | WhereClause::NotIn(_, v) if v.len() >= 9 => None,
                     WhereClause::In(_, v) | WhereClause::NotIn(_, v) => Some(v.len() as f64 * 0.5),
                     WhereClause::Null(..) => Some(0.0),
-                    // `textlike` and its kin, `procost` 1.
+                    // `textlike`, `textregexeq` and their kin, `procost` 1.
                     WhereClause::Pattern(..) => Some(1.0),
                     WhereClause::Or(arms) => arms.iter().map(|a| ops(a)).sum(),
                 })
@@ -12340,20 +12412,25 @@ impl PgHandler {
         }) {
             return Ok(hit);
         }
-        let mut out = Vec::new();
-        for d in docs.iter() {
-            let name = d.get_str("composite").unwrap_or_default().to_string();
-            let oid = d
-                .get_i64("oid")
-                .or_else(|_| d.get_i32("oid").map(i64::from))
-                .unwrap_or(0);
-            let fields = Self::composite_fields(d);
-            out.push((name, oid, fields));
-        }
+        let mut out: Vec<_> = docs.iter().map(|d| Self::composite_entry(d)).collect();
         out.sort();
         let out = Arc::new(out);
         MEMO.with(|m| *m.borrow_mut() = Some((docs, Arc::clone(&out))));
         Ok(out)
+    }
+
+    /// One composite catalog document as [`Self::composites`] lists it.
+    fn composite_entry(d: &Document) -> (String, i64, CompositeFields) {
+        let name = d.get_str("composite").unwrap_or_default().to_string();
+        (name, Self::composite_doc_oid(d), Self::composite_fields(d))
+    }
+
+    /// A composite catalog document's type oid, as [`Self::composites`]
+    /// reads it.
+    fn composite_doc_oid(d: &Document) -> i64 {
+        d.get_i64("oid")
+            .or_else(|_| d.get_i32("oid").map(i64::from))
+            .unwrap_or(0)
     }
 
     /// A composite catalog doc's `fields`: `[[name, type, sub], ...]` as
@@ -12458,6 +12535,16 @@ impl PgHandler {
     /// for a caller asking for many: the catalog documents are fetched once
     /// rather than per relation (RP-715). `i64::MIN` marks a name with none.
     fn relation_oids(&self) -> Option<Arc<HashMap<String, i64>>> {
+        let comps = self.type_catalog_docs(Self::COMPOSITE_COLLECTION).ok()?;
+        let views = self.type_catalog_docs(Self::VIEW_COLLECTION).ok()?;
+        Some(Self::relation_oids_of(comps, views))
+    }
+
+    /// [`Self::relation_oids`] over the composite and view catalogs'
+    /// documents: a function of them alone, so a table published for the
+    /// planner to derive later can list the oids from the documents it
+    /// was published with (RP-911).
+    fn relation_oids_of(comps: CatalogDocs, views: CatalogDocs) -> Arc<HashMap<String, i64>> {
         type Memo = (CatalogDocs, CatalogDocs, Arc<HashMap<String, i64>>);
         thread_local! {
             /// Every relation's oid, by name, for the catalog documents it
@@ -12468,8 +12555,6 @@ impl PgHandler {
             /// unique while the memo stands.
             static MEMO: std::cell::RefCell<Option<Memo>> = const { std::cell::RefCell::new(None) };
         }
-        let comps = self.type_catalog_docs(Self::COMPOSITE_COLLECTION).ok()?;
-        let views = self.type_catalog_docs(Self::VIEW_COLLECTION).ok()?;
         let cached = MEMO.with(|m| {
             m.borrow().as_ref().and_then(|(c, v, map)| {
                 (Arc::ptr_eq(c, &comps) && Arc::ptr_eq(v, &views)).then(|| Arc::clone(map))
@@ -12517,7 +12602,7 @@ impl PgHandler {
                 map
             }
         };
-        Some(map)
+        map
     }
 
     /// Every table with a relation oid, as `(stored name, oid, temp)`, for
@@ -12951,6 +13036,144 @@ impl PgHandler {
         Ok(out)
     }
 
+    /// One table's index relations: its primary key, its stored indexes
+    /// and the unique constraints no stored index carries, from `t`, its
+    /// relation oid and its stored index list alone.
+    fn table_index_relations(
+        t: &Arc<TableDef>,
+        table_oid: Option<i64>,
+        stored: &[Document],
+    ) -> Vec<IndexRelation> {
+        let mut out = Vec::new();
+        let derived = |slot: i64, name: &str| match table_oid {
+            Some(o) if slot < 16 => Self::INDEX_OID_BAND + o * 16 + slot,
+            _ => Self::index_oid(name),
+        };
+        let position = |field: &str| -> i32 {
+            t.columns
+                .iter()
+                .position(|c| t.field_of(&c.name).as_deref() == Some(field))
+                .map_or(0, |i| i32::from(t.attnum(i)))
+        };
+        let pk: Vec<i32> = secantus_pgplan::ordered_pk_columns(t)
+            .iter()
+            .filter_map(|p| t.attnum_of(&p.name))
+            .map(i32::from)
+            .collect();
+        if !pk.is_empty() {
+            let name = pk_constraint_name(t);
+            // `ADD PRIMARY KEY USING INDEX` over an index with INCLUDE
+            // columns keeps them (by column name).
+            let include: Vec<i32> = t
+                .extra
+                .get_array("pk_include")
+                .map(|a| {
+                    a.iter()
+                        .filter_map(Bson::as_str)
+                        .filter_map(|c| t.columns.iter().position(|x| x.name == c))
+                        .map(|i| (i + 1) as i32)
+                        .collect()
+                })
+                .unwrap_or_default();
+            out.push(IndexRelation {
+                oid: t
+                    .extra
+                    .get_i64("pk_oid")
+                    .unwrap_or_else(|_| derived(1, &name)),
+                name,
+                table: t.clone(),
+                keys: pk,
+                include,
+                unique: true,
+                primary: true,
+                exclusion: false,
+            });
+        }
+        let mut names = std::collections::HashSet::new();
+        for ix in stored.iter() {
+            let Ok(name) = ix.get_str("name") else {
+                continue;
+            };
+            if name == "_id_" {
+                continue;
+            }
+            // An expression index's keys are its expressions: a bare
+            // column is that column, anything else 0 (`indkey`).
+            let keys: Vec<i32> = match Self::index_expressions(ix) {
+                Some((exprs, _)) => exprs
+                    .iter()
+                    .map(|e| {
+                        let bare = e
+                            .strip_prefix('"')
+                            .and_then(|r| r.strip_suffix('"'))
+                            .map_or_else(|| e.clone(), |r| r.replace("\"\"", "\""));
+                        t.attnum_of(&bare).map_or(0, i32::from)
+                    })
+                    .collect(),
+                None => ix
+                    .get_document("key")
+                    .map(|k| k.keys().map(|f| position(f)).collect())
+                    .unwrap_or_default(),
+            };
+            let unique = ix
+                .get_document("options")
+                .ok()
+                .and_then(|o| o.get_bool("unique").ok())
+                .or_else(|| ix.get_bool("unique").ok())
+                .unwrap_or(false)
+                || Self::computed_unique(ix);
+            names.insert(name.to_string());
+            let slot = t.unique_constraints.iter().position(|u| u.name == name);
+            let oid = match (ix.get_i64("sqlOid"), slot) {
+                (Ok(oid), _) => oid,
+                (_, Some(i)) => t.unique_constraints[i]
+                    .oid
+                    .unwrap_or_else(|| derived(2 + i as i64, name)),
+                _ => Self::index_oid(name),
+            };
+            let include: Vec<i32> = ix
+                .get_array("include")
+                .map(|a| a.iter().filter_map(Bson::as_str).map(&position).collect())
+                .unwrap_or_default();
+            out.push(IndexRelation {
+                oid,
+                name: name.to_string(),
+                table: t.clone(),
+                keys,
+                include,
+                unique,
+                primary: false,
+                exclusion: false,
+            });
+        }
+        for (i, u) in t.unique_constraints.iter().enumerate() {
+            if names.contains(&u.name) {
+                continue;
+            }
+            let keys: Vec<i32> = u
+                .columns
+                .iter()
+                .map(|c| {
+                    t.columns
+                        .iter()
+                        .position(|col| col.name == *c)
+                        .map_or(0, |i| (i + 1) as i32)
+                })
+                .collect();
+            out.push(IndexRelation {
+                oid: u.oid.unwrap_or_else(|| derived(2 + i as i64, &u.name)),
+                name: u.name.clone(),
+                table: t.clone(),
+                keys,
+                include: Vec::new(),
+                unique: !u.exclusion,
+                primary: u.primary,
+                exclusion: u.exclusion,
+            });
+        }
+        out
+    }
+
     /// [`Self::try_index_relations`], derived from `defs` and their `oids`
     /// and each table's stored index list.
     fn derive_index_relations(
@@ -12966,136 +13189,13 @@ impl PgHandler {
         };
         for t in defs.iter() {
             let table_oid = Self::oid_in(oids, &t.name).filter(|o| *o > 0);
-            let derived = |slot: i64, name: &str| match table_oid {
-                Some(o) if slot < 16 => Self::INDEX_OID_BAND + o * 16 + slot,
-                _ => Self::index_oid(name),
-            };
-            let position = |field: &str| -> i32 {
-                t.columns
-                    .iter()
-                    .position(|c| t.field_of(&c.name).as_deref() == Some(field))
-                    .map_or(0, |i| i32::from(t.attnum(i)))
-            };
-            let pk: Vec<i32> = secantus_pgplan::ordered_pk_columns(t)
-                .iter()
-                .filter_map(|p| t.attnum_of(&p.name))
-                .map(i32::from)
-                .collect();
-            if !pk.is_empty() {
-                let name = pk_constraint_name(t);
-                // `ADD PRIMARY KEY USING INDEX` over an index with INCLUDE
-                // columns keeps them (by column name).
-                let include: Vec<i32> = t
-                    .extra
-                    .get_array("pk_include")
-                    .map(|a| {
-                        a.iter()
-                            .filter_map(Bson::as_str)
-                            .filter_map(|c| t.columns.iter().position(|x| x.name == c))
-                            .map(|i| (i + 1) as i32)
-                            .collect()
-                    })
-                    .unwrap_or_default();
-                out.push(IndexRelation {
-                    oid: t
-                        .extra
-                        .get_i64("pk_oid")
-                        .unwrap_or_else(|_| derived(1, &name)),
-                    name,
-                    table: t.clone(),
-                    keys: pk,
-                    include,
-                    unique: true,
-                    primary: true,
-                    exclusion: false,
-                });
-            }
+            // Read in place: a copy of every table's list, for each catalog
+            // version, grew the statement after DDL with the schema (RP-911).
             let stored = self
                 .storage
-                .list_indexes(self.db(), &t.name)
+                .list_indexes_shared(self.db(), &t.name)
                 .map_err(|e| Self::storage_err("could not read the index list", e))?;
-            let mut names = std::collections::HashSet::new();
-            for ix in stored {
-                let Ok(name) = ix.get_str("name") else {
-                    continue;
-                };
-                if name == "_id_" {
-                    continue;
-                }
-                // An expression index's keys are its expressions: a bare
-                // column is that column, anything else 0 (`indkey`).
-                let keys: Vec<i32> = match Self::index_expressions(&ix) {
-                    Some((exprs, _)) => exprs
-                        .iter()
-                        .map(|e| {
-                            let bare = e
-                                .strip_prefix('"')
-                                .and_then(|r| r.strip_suffix('"'))
-                                .map_or_else(|| e.clone(), |r| r.replace("\"\"", "\""));
-                            t.attnum_of(&bare).map_or(0, i32::from)
-                        })
-                        .collect(),
-                    None => ix
-                        .get_document("key")
-                        .map(|k| k.keys().map(|f| position(f)).collect())
-                        .unwrap_or_default(),
-                };
-                let unique = ix
-                    .get_document("options")
-                    .ok()
-                    .and_then(|o| o.get_bool("unique").ok())
-                    .or_else(|| ix.get_bool("unique").ok())
-                    .unwrap_or(false)
-                    || Self::computed_unique(&ix);
-                names.insert(name.to_string());
-                let slot = t.unique_constraints.iter().position(|u| u.name == name);
-                let oid = match (ix.get_i64("sqlOid"), slot) {
-                    (Ok(oid), _) => oid,
-                    (_, Some(i)) => t.unique_constraints[i]
-                        .oid
-                        .unwrap_or_else(|| derived(2 + i as i64, name)),
-                    _ => Self::index_oid(name),
-                };
-                let include: Vec<i32> = ix
-                    .get_array("include")
-                    .map(|a| a.iter().filter_map(Bson::as_str).map(&position).collect())
-                    .unwrap_or_default();
-                out.push(IndexRelation {
-                    oid,
-                    name: name.to_string(),
-                    table: t.clone(),
-                    keys,
-                    include,
-                    unique,
-                    primary: false,
-                    exclusion: false,
-                });
-            }
-            for (i, u) in t.unique_constraints.iter().enumerate() {
-                if names.contains(&u.name) {
-                    continue;
-                }
-                let keys: Vec<i32> = u
-                    .columns
-                    .iter()
-                    .map(|c| {
-                        t.columns
-                            .iter()
-                            .position(|col| col.name == *c)
-                            .map_or(0, |i| (i + 1) as i32)
-                    })
-                    .collect();
-                out.push(IndexRelation {
-                    oid: u.oid.unwrap_or_else(|| derived(2 + i as i64, &u.name)),
-                    name: u.name.clone(),
-                    table: t.clone(),
-                    keys,
-                    include: Vec::new(),
-                    unique: !u.exclusion,
-                    primary: u.primary,
-                    exclusion: u.exclusion,
-                });
-            }
+            out.extend(Self::table_index_relations(t, table_oid, &stored));
         }
         // A partitioned table's index has one on every partition too, named
         // as PostgreSQL names them: the parent's suffix on the partition's
@@ -13180,18 +13280,26 @@ impl PgHandler {
     /// `pg_type.typname` and `pg_attribute` still use the BARE name; only
     /// duplicate-checking and `to_regtype` resolution consult the schema.
     fn composites_with_schema(&self) -> PgWireResult<Arc<Vec<CompositeWithSchema>>> {
+        Ok(Self::composite_listing(
+            self.type_catalog_docs(Self::COMPOSITE_COLLECTION)?,
+        ))
+    }
+
+    /// [`Self::composites_with_schema`] over the composite catalog's
+    /// documents `docs`: a function of them alone, so the planner may list
+    /// them later from the documents it was published with.
+    fn composite_listing(docs: CatalogDocs) -> Arc<Vec<CompositeWithSchema>> {
         type Memo = (CatalogDocs, Arc<Vec<CompositeWithSchema>>);
         thread_local! {
             /// For the documents it was built from, as `composites` keeps.
             static MEMO: std::cell::RefCell<Option<Memo>> = const { std::cell::RefCell::new(None) };
         }
-        let docs = self.type_catalog_docs(Self::COMPOSITE_COLLECTION)?;
         if let Some(hit) = MEMO.with(|m| {
             m.borrow()
                 .as_ref()
                 .and_then(|(d, out)| Arc::ptr_eq(d, &docs).then(|| Arc::clone(out)))
         }) {
-            return Ok(hit);
+            return hit;
         }
         let mut out = Vec::new();
         for d in docs.iter() {
@@ -13207,7 +13315,7 @@ impl PgHandler {
         out.sort();
         let out = Arc::new(out);
         MEMO.with(|m| *m.borrow_mut() = Some((docs, Arc::clone(&out))));
-        Ok(out)
+        out
     }
 
     /// The `__sql_ranges__` catalog: a doc `{range, oid, subtype}` per custom
@@ -24846,15 +24954,38 @@ impl PgHandler {
                 // the same relation oid, so listing both put every table
                 // column in twice -- once from the table and once from its
                 // row type, with different `attnotnull`.
-                let table_names: HashSet<&str> = defs.iter().map(|t| t.name.as_str()).collect();
+                let table_names = std::cell::OnceCell::new();
+                let is_table = |name: &str| {
+                    table_names
+                        .get_or_init(|| {
+                            defs.iter().map(|t| t.name.as_str()).collect::<HashSet<_>>()
+                        })
+                        .contains(name)
+                };
+                let composite_docs = self.type_catalog_docs(Self::COMPOSITE_COLLECTION).ok()?;
+                // A read of one relation's rows decodes that relation's
+                // composite alone, as PostgreSQL reads them through
+                // `pg_attribute`'s index on `attrelid`: listing every
+                // table's row type made the statement after any DDL grow
+                // with the schema (RP-911).
+                let composites = match key {
+                    Some(_) => {
+                        let mut out: Vec<_> = composite_docs
+                            .iter()
+                            .filter(|d| wanted(Self::composite_doc_oid(d)))
+                            .map(|d| Self::composite_entry(d))
+                            .collect();
+                        out.sort();
+                        Arc::new(out)
+                    }
+                    None => self.composites().ok()?,
+                };
                 // Each composite's attnums and dropped slots (ALTER TYPE ...
                 // DROP ATTRIBUTE keeps the slot), by oid.
-                let slots: HashMap<i64, (Vec<i32>, Vec<i32>)> = self
-                    .type_catalog_docs(Self::COMPOSITE_COLLECTION)
-                    .ok()?
+                let slots: HashMap<i64, (Vec<i32>, Vec<i32>)> = composite_docs
                     .iter()
                     .filter_map(|d| {
-                        let oid = d.get("oid").and_then(bson_i64)?;
+                        let oid = d.get("oid").and_then(bson_i64).filter(|o| wanted(*o))?;
                         let ints = |k: &str| -> Vec<i32> {
                             d.get_array(k)
                                 .map(|a| a.iter().filter_map(bson_i64).map(|n| n as i32).collect())
@@ -24863,9 +24994,9 @@ impl PgHandler {
                         Some((oid, (ints("attnums"), ints("dropped"))))
                     })
                     .collect();
-                for (cname, oid, fields) in self.composites().ok()?.iter() {
+                for (cname, oid, fields) in composites.iter() {
                     let oid = *oid;
-                    if table_names.contains(cname.as_str()) || !wanted(oid) {
+                    if !wanted(oid) || is_table(cname) {
                         continue;
                     }
                     let (attnums, dropped) = slots.get(&oid).cloned().unwrap_or_default();
@@ -44103,12 +44234,17 @@ impl PgHandler {
                             if levels.len() == depth {
                                 // Lowest first, so each join above is
                                 // still the tree's when it is reached.
-                                for (i, (plan, a, b, join)) in levels.iter().enumerate() {
+                                for (i, (plan, a, b, join, param)) in levels.iter().enumerate() {
                                     let mut node = &mut tree;
                                     for _ in 0..depth - 1 - i {
                                         node = &mut node.children[0];
                                     }
                                     explain::price_nest_loop(node, plan, *a, *b, *join);
+                                    // The inner read through its index
+                                    // (RP-354).
+                                    if let Some(p) = param {
+                                        explain::param_index_inner(node, p);
+                                    }
                                 }
                             }
                         }

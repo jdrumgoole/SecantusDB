@@ -271,6 +271,31 @@ impl PgHandler {
             .collect()
     }
 
+    /// Publish [`Self::tableoid_expressions`] for the planner. With no
+    /// partitioned table each is the table's own oid, a function of the
+    /// catalog documents read now, so the planner lists them when a
+    /// statement first names the column (RP-911). A partitioned table's
+    /// CASE evaluates its partitions' bounds, which is done here.
+    pub(crate) fn publish_tableoids(&self) {
+        let defs = self.shared_table_defs();
+        let comps = self.type_catalog_docs(Self::COMPOSITE_COLLECTION);
+        let views = self.type_catalog_docs(Self::VIEW_COLLECTION);
+        match (defs, comps, views) {
+            (Ok(defs), Ok(comps), Ok(views)) if !defs.iter().any(|d| is_partitioned(d)) => {
+                secantus_pgplan::partitions::defer_tableoids(move || {
+                    let oids = Self::relation_oids_of(comps, views);
+                    defs.iter()
+                        .map(|d| {
+                            let oid = Self::oid_in(&oids, &d.name).unwrap_or(0);
+                            (d.name.clone(), format!("{oid}::oid"))
+                        })
+                        .collect()
+                });
+            }
+            _ => secantus_pgplan::partitions::set_tableoids(self.tableoid_expressions()),
+        }
+    }
+
     /// Every table's `tableoid`: its own oid, or -- for a partitioned one --
     /// the oid of the leaf partition each row falls in.
     pub(crate) fn tableoid_expressions(&self) -> Vec<(String, String)> {

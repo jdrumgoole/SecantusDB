@@ -51,6 +51,7 @@
 //! and the lifted-`$match` fetch (COLLSCAN-forced); a collation the engine can't
 //! reproduce (non-ASCII / numericOrdering) surfaces as `BadValue`.
 
+use crate::util::ReplyOk;
 use bson::{doc, Bson, Document};
 
 use crate::argtypes;
@@ -5531,7 +5532,7 @@ fn apply_merge(
                 Ok(reply) => reply,
                 Err(e) => return Err(during(e)),
             };
-        if reply.get_f64("ok").unwrap_or(0.0) != 1.0 {
+        if reply.ok_number().unwrap_or(0.0) != 1.0 {
             return Err(during(write_error_of(&reply)));
         }
         if let Some(error) = reply
