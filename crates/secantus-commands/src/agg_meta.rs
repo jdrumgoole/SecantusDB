@@ -55,6 +55,8 @@ const KEEPS_SORT_METADATA: &[&str] = &[
     "$_secantusCarry",
     // Where the stages move between mongod's engines: no stage of its own.
     secantus_core::sbe::ENGINE_STAGE,
+    // Passes each document on as it is.
+    secantus_core::aggregate::INHIBIT_OPTIMIZATION,
 ];
 
 /// The `$_secantusSortKey` that writes the key of the `$sort` mongod runs a
@@ -126,6 +128,7 @@ const KEEPS_METADATA: &[&str] = &[
     "$sort",
     "$limit",
     "$skip",
+    secantus_core::aggregate::INHIBIT_OPTIMIZATION,
 ];
 
 /// What [`rewrite`] did.
@@ -336,6 +339,27 @@ fn union_adds_no_sort_key(stages: &[Bson], at: usize) -> bool {
     sub_drops || !between.iter().any(|s| mentions(s, "sortKey"))
 }
 
+/// Whether no stage writes a sort key because mongod's dependency analysis
+/// never asked for one. It walks the stages front to back and stops at the
+/// first `$_internalInhibitOptimization`, which says nothing of what it
+/// needs; a sort key read only behind that stage is not asked for, so the
+/// read and every `$sort` leave the documents with none at all (mongod
+/// 8.2.11, RM-518: `{$meta: "sortKey"}` there is missing and a rank is
+/// refused). A reader ahead of it asks, a `$lookup` or `$unionWith`
+/// sub-pipeline's for its own documents only, and a `$geoNear` sets the key
+/// whatever is asked.
+fn sort_key_unrequested(stages: &[Bson]) -> bool {
+    let Some(at) = stages
+        .iter()
+        .position(|s| name(s) == secantus_core::aggregate::INHIBIT_OPTIMIZATION)
+    else {
+        return false;
+    };
+    !stages[..at].iter().any(|s| {
+        name(s) == "$geoNear" || (!matches!(name(s), "$lookup" | "$unionWith") && reads_sort_key(s))
+    })
+}
+
 /// Mark the documents `$unionWith` adds as carrying no sort key: a stage
 /// at the end of its sub-pipeline, which the stage gets when it has none.
 fn mark_union_documents(stage: &mut Bson) {
@@ -439,6 +463,9 @@ pub(crate) fn rewrite_sort_metadata(
     let (mut keyless, mut marked) = (false, false);
     let n = stages.len();
     let all = std::mem::take(stages);
+    if sort_key_unrequested(&all) {
+        keyless = true;
+    }
     let unions: Vec<bool> = (0..all.len())
         .map(|i| name(&all[i]) == "$unionWith" && union_adds_no_sort_key(&all, i))
         .collect();
@@ -1039,5 +1066,42 @@ mod tests {
             stages,
             self::stages(vec![doc! { "$addFields": { "k": { "$literal": [] } } }])
         );
+    }
+
+    #[test]
+    fn a_sort_key_read_only_behind_an_inhibit_is_never_asked_for() {
+        let inhibit = doc! { "$_internalInhibitOptimization": {} };
+        let meta = doc! { "$addFields": { "m": { "$meta": "sortKey" } } };
+        let sort = doc! { "$sort": { "n": 1 } };
+        let unrequested = |v: Vec<Document>| sort_key_unrequested(&stages(v));
+        assert!(unrequested(vec![
+            sort.clone(),
+            inhibit.clone(),
+            meta.clone()
+        ]));
+        assert!(unrequested(vec![
+            inhibit.clone(),
+            sort.clone(),
+            meta.clone()
+        ]));
+        assert!(!unrequested(vec![
+            sort.clone(),
+            meta.clone(),
+            inhibit.clone(),
+            meta.clone()
+        ]));
+        assert!(!unrequested(vec![sort.clone(), meta.clone()]));
+        // A `$lookup`'s reader asks for its own documents' key only.
+        let lookup = doc! { "$lookup": { "from": "c", "pipeline": [meta.clone()], "as": "j" } };
+        assert!(unrequested(vec![lookup, inhibit.clone(), meta.clone()]));
+        // A `$geoNear` sets the key whatever is asked.
+        let geo = doc! { "$geoNear": { "near": [0, 0], "distanceField": "d" } };
+        assert!(!unrequested(vec![geo, inhibit.clone(), meta.clone()]));
+
+        // The documents carry no key at all: the read is missing.
+        let mut piped = stages(vec![sort.clone(), inhibit.clone(), meta]);
+        rewrite_sort_metadata(&mut piped, || Some(doc! { "n": 1 }));
+        assert!(!piped.iter().any(|s| mentions(s, "sortKey")));
+        assert!(piped.contains(&Bson::Document(doc! { "$addFields": { "m": "$$REMOVE" } })));
     }
 }

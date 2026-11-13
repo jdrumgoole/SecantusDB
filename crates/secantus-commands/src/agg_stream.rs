@@ -45,6 +45,7 @@ const STREAMING_STAGES: &[&str] = &[
     "$limit",
     "$lookup",
     "$unionWith",
+    secantus_core::aggregate::INHIBIT_OPTIMIZATION,
 ];
 
 /// The stages after a cursor stage whose `getNext` calls -- each one tick

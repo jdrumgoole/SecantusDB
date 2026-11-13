@@ -1753,6 +1753,7 @@ pub(crate) fn recognized_stage(name: &str) -> bool {
             | "$set"
             | "$setWindowFields"
             | "$_internalSetWindowFields"
+            | INHIBIT_OPTIMIZATION
             | "$skip"
             | "$sort"
             | "$sortByCount"
@@ -2163,6 +2164,7 @@ pub(crate) fn validate_stage_names(pipeline: &[Bson], db: &str) -> Result<(), Co
             "$densify" => validate_densify(d.get(name))?,
             "$fill" => validate_fill(d.get(name))?,
             "$queryStats" => validate_query_stats(d.get(name))?,
+            INHIBIT_OPTIMIZATION => validate_inhibit_optimization(d.get(name))?,
             "$querySettings" => {
                 crate::query_settings::validate_stage(d.get(name))?;
             }
@@ -2513,6 +2515,34 @@ fn validate_sample(spec: Option<&Bson>) -> Result<(), CommandError> {
         ));
     }
     Ok(())
+}
+
+pub(crate) use secantus_core::aggregate::INHIBIT_OPTIMIZATION;
+
+/// `$_internalInhibitOptimization` takes an empty object: anything but an
+/// object is a `TypeMismatch` (14), an object with a field a
+/// `FailedToParse` (9) (`createFromBson`, measured 8.2.11).
+fn validate_inhibit_optimization(spec: Option<&Bson>) -> Result<(), CommandError> {
+    match spec {
+        Some(Bson::Document(d)) if d.is_empty() => Ok(()),
+        Some(Bson::Document(d)) => Err(CommandError::new(
+            9,
+            "FailedToParse",
+            format!(
+                "{INHIBIT_OPTIMIZATION} must take an empty object but found: {}",
+                secantus_core::update::render_shell(&Bson::Document(d.clone()))
+            ),
+        )),
+        other => Err(CommandError::new(
+            14,
+            "TypeMismatch",
+            format!(
+                "{INHIBIT_OPTIMIZATION} must take a nested object but found: \
+                 {INHIBIT_OPTIMIZATION}: {}",
+                secantus_core::update::render_shell(other.unwrap_or(&Bson::Null))
+            ),
+        )),
+    }
 }
 
 /// `$unwind`'s string form must be a field PATH, i.e. `$`-prefixed.

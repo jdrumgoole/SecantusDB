@@ -1666,6 +1666,7 @@ fn streams(stage: &Document) -> bool {
                 | "$replaceRoot"
                 | "$replaceWith"
                 | "$skip"
+                | secantus_core::aggregate::INHIBIT_OPTIMIZATION
         )
     )
 }

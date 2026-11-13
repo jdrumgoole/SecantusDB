@@ -368,7 +368,8 @@ pub fn apply_pipeline(
         let modelled = matches!(
             name.as_str(),
             "$match" | "$unwind" | "$addFields" | "$set" | "$unset" | "$limit" | "$skip"
-        ) || name == crate::sbe::ENGINE_STAGE;
+        ) || name == crate::sbe::ENGINE_STAGE
+            || name == INHIBIT_OPTIMIZATION;
         let changes = matches!(name.as_str(), "$unwind" | "$addFields" | "$set");
         if stores.is_none() && changes && counts_storage(&pipeline[i + 1..]) {
             stores = Some(read_stores(&docs));
@@ -558,6 +559,9 @@ fn apply_stage(
         "$bucket" => group::bucket_stage(spec, &docs, vars),
         "$bucketAuto" => group::bucket_auto_stage(spec, &docs, vars),
         "$redact" => redact_stage(spec, docs, vars),
+        // Passes each document on; what it is for is that mongod's
+        // optimizer moves nothing across it (the command layer keeps that).
+        INHIBIT_OPTIMIZATION => Ok(docs),
         "$facet" => facet_stage(spec, docs, vars, coll),
         "$densify" => densify::densify_stage(spec, &docs),
         "$fill" => fill::fill_stage(spec, docs, vars),
@@ -644,6 +648,11 @@ fn window_sort_budget(
 
 /// The temporary field a computed `partitionBy` is evaluated into
 /// (`$setWindowFields`' own `$addFields`).
+/// `$_internalInhibitOptimization`: a stage that passes each document on,
+/// and that mongod's optimizer moves no stage across and keeps out of the
+/// query (`DocumentSourceInternalInhibitOptimization`).
+pub const INHIBIT_OPTIMIZATION: &str = "$_internalInhibitOptimization";
+
 const PARTITION_KEY: &str = "__internal_setWindowFields_partition_key";
 
 /// What the documents a `$setWindowFields` takes count, as the stages
@@ -791,7 +800,10 @@ fn stored_stage(
     coll: Option<&Collation>,
     tracks: Option<usize>,
 ) -> R<(Vec<Document>, Vec<docstore::Stored>)> {
-    if matches!(name, "$limit" | "$skip") || name == crate::sbe::ENGINE_STAGE {
+    if matches!(name, "$limit" | "$skip")
+        || name == crate::sbe::ENGINE_STAGE
+        || name == INHIBIT_OPTIMIZATION
+    {
         let n = docs.len();
         let out = apply_stage(name, spec, docs, vars, coll)?;
         if name == "$skip" {

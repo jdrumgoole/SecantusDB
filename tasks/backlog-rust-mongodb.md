@@ -1715,13 +1715,6 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       (288900, 308400) and (290700, 288300).
       Verify: tests/backlog/test_rm_found_rm408.py::test_a_sub_document_a_stage_touched_is_sized_by_its_storage
       Backlog-ID: RM-515
-- [ ] **`$_internalInhibitOptimization` is refused as an unknown stage.**
-      mongod 8.2.11 runs it -- it passes its documents on and keeps the
-      stages after it out of the scan -- so a pipeline with it answers as
-      one without. This server refuses it (40324, "Unrecognized pipeline
-      stage name"). Found 2026-11-10 (RM-408).
-      Verify: tests/backlog/test_rm_found_rm408.py::test_internal_inhibit_optimization_runs
-      Backlog-ID: RM-518
 - [ ] **A document an inclusion `$project` built is sized as if it were
       read.** Behind an `$unwind` (so not taken by the scan), mongod
       8.2.11's `$project: {t: 1, n: 1}` builds each document it returns,

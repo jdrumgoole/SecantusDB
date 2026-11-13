@@ -107,11 +107,12 @@ def _inhibited(client: Any) -> Any:
     return mongo_answer(lambda: [d["_id"] for d in db.c.aggregate(pipeline)])
 
 
-@pytest.mark.backlog("RM-518")
+@pytest.mark.backlog_fixed("RM-518")
 def test_internal_inhibit_optimization_runs(rust_mongo: Any, mongod: Any) -> None:
     """mongod 8.2.11 runs `$_internalInhibitOptimization`, a stage that
     passes its documents on and keeps the stages after it out of the scan:
-    the answer is that of the pipeline without it."""
+    the answer is that of the pipeline without it. This server refused it
+    as an unknown stage (40324) until RM-518 ran it."""
     assert _inhibited(rust_mongo) == _inhibited(mongod)
 
 
