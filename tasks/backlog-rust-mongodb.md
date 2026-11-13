@@ -1180,6 +1180,45 @@ These are explicit non-goals. Don't add them without a reason.
       here is not mongod's KeyString. (An insert's count varies by 8 bytes a
       skiplist level on both servers: WiredTiger draws each new key's depth
       at random.) Measured 2026-11-10. Found while working RM-385.
+      **Decision needed (2026-11-13):** the surplus is this store's shared
+      tables. Every key an insert writes carries the namespace as strings,
+      because collections share sixteen document shards
+      (`key_format=SSq`), every `_id` index is a row in
+      `secantus_natural_seq` (`SSu`), and every secondary index is a row in
+      `secantus_index_entries` (`SSSu`, plus the index name). mongod keeps
+      one WiredTiger table per collection (`key_format=q`) and one per
+      index (KeyString keys), so no key names its namespace. Measured with
+      the gap test's insert of fifty documents into `c`, with the `_id` and
+      `x` indexes (`secantusd-rs` from `rm-batch` at 6bcd8f41, mongod
+      8.2.11): a 9-character database name gives 362.8 bytes per document
+      here against 311.6 on mongod. A 49-character name gives 481.4 here
+      against 313.8: 40 more characters cost 118.6 bytes here (three keys
+      times 40) and nothing on mongod. Of the 51 bytes left at 9
+      characters, about 40 are the prefixes (`db\0c\0` three times, plus
+      `x_1\0`). The remaining ~11 are the encodings: the `_id` sort key
+      against KeyString, and the index entry's value. Options, the most
+      faithful first:
+      (a) **mongod's layout, recommended:** a table per collection keyed
+      by RecordId and a table per index keyed by KeyString, with the
+      catalog mapping namespace to ident. This closes this item and the
+      per-table half of RM-040 (`collStats.wiredTiger` / `indexDetails`,
+      real `storageSize` / `indexSize`, `$listCatalog` idents), and makes
+      the RM-192 `compact` scope decision unnecessary. It changes the
+      on-disk format both Rust servers share (a store migration, or a
+      format bump that refuses an old store), replaces `DOC_SHARDS` (a
+      table per collection gives the same per-collection file
+      independence), and the KeyString keys change the on-disk sort-key
+      rank (`sortkey.rs`, `entryFormat`). Several PRs; sequence storage
+      first, then KeyString.
+      (b) **Keep the shared tables, prefix each key with a short numeric
+      collection id or index id** in place of the names (1-2 bytes as a
+      packed `q`). This is still an on-disk format change, and a stand-in
+      for mongod's mechanism. It removes the name-length dependence and
+      about 34 of the 51 bytes; the gap test stays red at about 17 bytes
+      until the encodings also move to KeyString.
+      (c) **Scope decision:** `txnBytesDirty` counts this store's layout,
+      not mongod's. Retire the gap test with that reason, and keep the
+      update and delete counts, which already match.
       Verify: tests/backlog/test_rm_355_364.py::test_an_insert_in_a_transaction_counts_mongods_dirty_bytes
       Backlog-ID: RM-499
 
