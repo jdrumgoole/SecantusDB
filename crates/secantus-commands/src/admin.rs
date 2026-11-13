@@ -4341,14 +4341,16 @@ pub fn rename_collection(doc: &Document, ctx: &mut CommandContext) -> HandlerRes
     let (dst_db, dst_coll) = split_ns(&to);
 
     let storage = ctx.storage()?;
-    // mongod presents a time-series collection as a view, and a view is
-    // neither renamed nor renamed onto.
-    let is_time_series = |db: &str, coll: &str| {
+    // A view is neither renamed nor renamed onto, and mongod presents a
+    // time-series collection as one. Its namespace was checked first: mongod
+    // refuses `<db>.system.views`, which this storage presents as a view, as
+    // a write to it (20, measured 8.2.1, RM-482).
+    let is_view = |db: &str, coll: &str| {
         storage
             .get_collection_options(db, coll)
-            .is_ok_and(|o| o.contains_key("timeseries"))
+            .is_ok_and(|o| o.contains_key("viewOn") || o.contains_key("timeseries"))
     };
-    if is_time_series(&src_db, &src_coll) {
+    if is_view(&src_db, &src_coll) {
         return Ok(CommandError::new(
             166,
             "CommandNotSupportedOnView",
@@ -4356,7 +4358,7 @@ pub fn rename_collection(doc: &Document, ctx: &mut CommandContext) -> HandlerRes
         )
         .into_reply());
     }
-    if is_time_series(&dst_db, &dst_coll) {
+    if is_view(&dst_db, &dst_coll) {
         return Ok(CommandError::new(
             48,
             "NamespaceExists",

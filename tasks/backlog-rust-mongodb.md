@@ -961,13 +961,6 @@ These are explicit non-goals. Don't add them without a reason.
       Found while working RM-478, 2026-11-13.
       Verify: tests/backlog/test_rm_statement_line_comment.py::test_a_statement_line_carries_its_commands_comment
       Backlog-ID: RM-581
-- [ ] **Renaming `<db>.system.views` is refused as a view.** mongod 8.2.1
-      refuses it as a write to the namespace (20 IllegalOperation, "error
-      with source namespace: cannot write to <db>.system.views"); this
-      server answers 166 "cannot rename view: <db>.system.views". Found
-      while working RM-378, 2026-11-09.
-      Verify: tests/backlog/test_rm_rename_errors.py::test_renaming_system_views_is_a_write_to_it
-      Backlog-ID: RM-482
 - [ ] **A read of a view refused before it resolves the view resolves it
       anyway.** mongod 8.2.11 refuses a `find` of a view whose projection
       does not parse (`{a: {$bogusop: 1}}`), and an `explain` of a `find`
@@ -3348,7 +3341,11 @@ touched:
   the bucket refilled. The test passed three runs out of three on its own
   at low load. The same happened to this server's side in the RM gate of
   2026-11-09 (load average about 9: it answered two with `maxQueueDepth`
-  2, where mongod answered one); three runs on their own passed. The test depends on six connects landing within one
+  2, where mongod answered one); three runs on their own passed. In the
+  RM gate of 2026-11-13 (load average up to 18) the same queue-2 case
+  differed in a wait instead: this server answered its third connection
+  after a wait that rounded to 3 seconds, mongod after 2; four runs on
+  their own passed, at load 18. The test depends on six connects landing within one
   second, so it is flaky by construction: it needs a measurement that
   load cannot change (connect all six behind a barrier and record how
   long they took to land, or compare with the answer mongod gives when
