@@ -24,9 +24,9 @@ from tests.backlog.conftest import mongo_answer
 DOCS = 100_000
 
 
-def _write_out_of_time(client: Any, plan: str, op: str) -> tuple:
+def _write_out_of_time(client: Any, plan: str, op: str, budget: int = 30) -> tuple:
     """An updateMany (`$inc: {n: 1}`) or a deleteMany of 100,000 documents
-    with `maxTimeMS: 30`, its read `plan`: `clustered-index` reads index
+    with `maxTimeMS: budget`, its read `plan`: `clustered-index` reads index
     `a_1` of a collection clustered by `_id`, `contested` has indexes `a_1`
     and `b_1` both able to answer it. Its error code, and whether it had
     written some documents but not all."""
@@ -48,10 +48,10 @@ def _write_out_of_time(client: Any, plan: str, op: str) -> tuple:
         command = {
             "update": "c",
             "updates": [{"q": query, "u": {"$inc": {"n": 1}}, "multi": True}],
-            "maxTimeMS": 30,
+            "maxTimeMS": budget,
         }
     else:
-        command = {"delete": "c", "deletes": [{"q": query, "limit": 0}], "maxTimeMS": 30}
+        command = {"delete": "c", "deletes": [{"q": query, "limit": 0}], "maxTimeMS": budget}
     answer = mongo_answer(lambda: db.command(command))
     left = db.c.count_documents({"n": 0} if op == "update" else {})
     written = DOCS - left
@@ -86,6 +86,13 @@ def test_a_contested_write_of_many_out_of_time_keeps_what_it_wrote(
     read every match to choose the plan before it wrote one, and a budget
     spent there wrote nothing; it now tries the plan as mongod does and
     streams the winner into the write."""
-    theirs = _write_out_of_time(mongod_rs, "contested", op)
+    # 150 ms, not the 30 the gap was measured with: the plan trial before a
+    # streaming write's first document took about 30 ms in this server's
+    # debug build here and more on CI's runner, where at 30 ms it wrote
+    # nothing (PR #2722, 2026-11-13). Reading every match before the first
+    # write, the behaviour this guards against, costs about 1.25 s in that
+    # build, so 150 ms still tells the two apart; mongod 8.2.11 stops
+    # part-way at 150 ms too.
+    theirs = _write_out_of_time(mongod_rs, "contested", op, budget=150)
     assert theirs == (("err", 50), True), theirs
-    assert _write_out_of_time(rust_mongo, "contested", op) == theirs
+    assert _write_out_of_time(rust_mongo, "contested", op, budget=150) == theirs
