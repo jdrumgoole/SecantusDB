@@ -2247,8 +2247,7 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
         ],
     ),
     # Still open (RP-354): a LEFT join's ON conjunct over its preserved
-    # side that costs other than its operators: a regex match and a cast
-    # of a column.
+    # side that is a regex match.
     "a left join's on conjunct over the preserved side is a regex match": (
         "RP-354",
         _ANALYSED,
@@ -2261,13 +2260,98 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "        ->  Seq Scan on e e2  (cost=0.00..15.00 rows=1000 width=7)",
         ],
     ),
+    # Split from RP-354 and fixed: a cast of a column compared with a
+    # constant is an expression with no statistics (`examine_variable`),
+    # its cast a function call, or an I/O conversion's output and input
+    # functions, that `cost_qual_eval` charges; before, the scan or the
+    # nested loop printed zeros.
+    "a seq scan filter over a cast of a column": (
+        "RP-329",
+        _ANALYSED,
+        "explain select * from e where a::text <> '5'",
+        [
+            "Seq Scan on e  (cost=0.00..22.50 rows=995 width=7)",
+            "  Filter: ((a)::text <> '5'::text)",
+        ],
+    ),
+    "a seq scan filter over a cast of a column by its function": (
+        "RP-329",
+        _ANALYSED,
+        "explain select * from e where a::int8 > 5",
+        [
+            "Seq Scan on e  (cost=0.00..20.00 rows=333 width=7)",
+            "  Filter: ((a)::bigint > 5)",
+        ],
+    ),
+    "a seq scan filter over a cast of a text column": (
+        "RP-329",
+        _ANALYSED,
+        "explain select * from e where b::int < 3",
+        [
+            "Seq Scan on e  (cost=0.00..22.50 rows=333 width=7)",
+            "  Filter: ((b)::integer < 3)",
+        ],
+    ),
+    "a left join's on conjunct over the preserved side is a cast equal to a constant": (
+        "RP-329",
+        _ANALYSED,
+        "explain select * from e left join e e2 on e.a <> e2.a and e.a::text = '5'",
+        [
+            "Nested Loop Left Join  (cost=0.00..22532.50 rows=4995 width=14)",
+            "  Join Filter: ((e.a <> e2.a) AND ((e.a)::text = '5'::text))",
+            "  ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
+            "  ->  Materialize  (cost=0.00..20.00 rows=1000 width=7)",
+            "        ->  Seq Scan on e e2  (cost=0.00..15.00 rows=1000 width=7)",
+        ],
+    ),
+    # Two bounds on one expression are a range (`addRangeClause`).
+    "a left join's on conjuncts over the preserved side bound a cast": (
+        "RP-329",
+        _ANALYSED,
+        "explain select * from e left join e e2 on e.a <> e2.a"
+        " and e.a::text > '5' and e.a::text < '7'",
+        [
+            "Nested Loop Left Join  (cost=0.00..30032.50 rows=4995 width=14)",
+            "  Join Filter: ((e.a <> e2.a) AND ((e.a)::text > '5'::text)"
+            " AND ((e.a)::text < '7'::text))",
+            "  ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
+            "  ->  Materialize  (cost=0.00..20.00 rows=1000 width=7)",
+            "        ->  Seq Scan on e e2  (cost=0.00..15.00 rows=1000 width=7)",
+        ],
+    ),
+    "a left join into an index with a cast over the preserved side": (
+        "RP-329",
+        _ANALYSED,
+        "explain select * from e left join k on e.a < k.a and e.a::text <> '5'",
+        [
+            "Nested Loop Left Join  (cost=0.28..11985.00 rows=331667 width=14)",
+            "  Join Filter: ((e.a)::text <> '5'::text)",
+            "  ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
+            "  ->  Index Scan using k_pkey on k  (cost=0.28..6.14 rows=333 width=7)",
+            "        Index Cond: (a > e.a)",
+        ],
+    ),
     "a left join's on conjunct over the preserved side casts a column": (
-        "RP-354",
+        "RP-329",
         _ANALYSED,
         "explain select * from e left join e e2 on e.a <> e2.a and e.a::text <> '5'",
         [
             "Nested Loop Left Join  (cost=0.00..22532.50 rows=994005 width=14)",
             "  Join Filter: ((e.a <> e2.a) AND ((e.a)::text <> '5'::text))",
+            "  ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
+            "  ->  Materialize  (cost=0.00..20.00 rows=1000 width=7)",
+            "        ->  Seq Scan on e e2  (cost=0.00..15.00 rows=1000 width=7)",
+        ],
+    ),
+    # Still open: a nested loop's Join Filter is printed in the ON's
+    # written order, where `order_qual_clauses` puts it cheapest first.
+    "a nested loop's join filter in cost order": (
+        "RP-924",
+        _ANALYSED,
+        "explain select * from e left join e e2 on e.a <> e2.a and e.a::text <> '5' and e.a = 5",
+        [
+            "Nested Loop Left Join  (cost=0.00..25032.50 rows=1000 width=14)",
+            "  Join Filter: ((e.a <> e2.a) AND (e.a = 5) AND ((e.a)::text <> '5'::text))",
             "  ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
             "  ->  Materialize  (cost=0.00..20.00 rows=1000 width=7)",
             "        ->  Seq Scan on e e2  (cost=0.00..15.00 rows=1000 width=7)",

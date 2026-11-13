@@ -3039,20 +3039,25 @@ pub struct JoinFilter {
 /// over its stored fields, and the LIKE / ILIKE conjuncts behind that
 /// WHERE's `$regex` clauses, which `patternsel` estimates from the
 /// pattern, not the regex (as a single relation's scan reads them,
-/// `ExplainOptions::scan_patterns`).
+/// `ExplainOptions::scan_patterns`). A comparison of an expression with
+/// a constant (a cast of a column, `e.a::text <> '5'`) is instead its
+/// [`crate::ExprQual`], estimated as an expression with no statistics,
+/// its `filter` empty (RP-354).
 #[derive(Debug, Clone, PartialEq)]
 pub struct Restriction {
     pub filter: Document,
     pub patterns: Vec<ScanPattern>,
+    pub exprs: Vec<crate::ExprQual>,
 }
 
 /// `c`, a conjunct over joined keys, as the WHERE of the one stored
 /// table among `sides`' leaves whose keys it reads: each key renamed to
 /// the table's column, then lowered over the table's stored fields
 /// ([`JoinFilter::restrict`]). `None` when it reads more than one leaf, a
-/// leaf that is not a plain scan of a stored table, costs other than
-/// its operators ([`priced_by_operator_count`]), or does not lower to a
-/// filter.
+/// leaf that is not a plain scan of a stored table, or is neither priced
+/// by its operators ([`priced_by_operator_count`]) and lowered to a
+/// filter, nor a comparison of an expression with a constant
+/// ([`crate::expr_qual`]).
 fn restriction_filter(
     c: &pg_query::protobuf::Node,
     sides: [&JoinNode; 2],
@@ -3071,7 +3076,7 @@ fn restriction_filter(
         return None;
     }
     let table = lookup(&leaf.table)?;
-    if crate::correlated::has_volatile_call(c) || !priced_by_operator_count(c) {
+    if crate::correlated::has_volatile_call(c) {
         return None;
     }
     let mut node = c.clone();
@@ -3099,9 +3104,17 @@ fn restriction_filter(
     if !renamed {
         return None;
     }
+    if !priced_by_operator_count(c) {
+        return Some(Restriction {
+            filter: Document::new(),
+            patterns: Vec::new(),
+            exprs: vec![crate::expr_qual(&node, &table)?],
+        });
+    }
     Some(Restriction {
         filter: crate::lower_where(&node, &table, params).ok()?,
         patterns: crate::where_patterns(&node, &table),
+        exprs: Vec::new(),
     })
 }
 

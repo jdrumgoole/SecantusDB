@@ -50749,8 +50749,9 @@ pub struct ExprQual {
 /// arithmetic (`+`, `-`, `*`, `/`, `%`) over integer columns and integer
 /// literals, or `||` over `text` / `varchar` columns and string literals:
 /// operators that are each one function of `procost` 1, with no implicit
-/// cast between them (a cast is a function call of its own, not priced
-/// here). A function call, a cast or any other node is declined.
+/// cast between them; or an explicit cast of a column to an integer or
+/// string type (`a::text`, its function's cost, [`pg_casts::explicit_cast_cost`]).
+/// A function call, any other cast or any other node is declined.
 fn explain_scan_expr_quals(
     query: &N,
     lookup: &dyn Fn(&str) -> Option<TableDef>,
@@ -50861,6 +50862,52 @@ fn expr_side(n: &pg_query::protobuf::Node, def: &TableDef) -> Option<ExprSide> {
                 operators: if fields.is_empty() { 0 } else { below + 1 },
                 integer,
                 fields,
+            }
+        }
+        // A cast of a column to an integer or string type (RP-354): the
+        // cast's function, or its output and input functions where it is
+        // an I/O conversion, each of `procost` 1 (`cost_qual_eval` of a
+        // FuncExpr or CoerceViaIO). A binary-coercible cast is a
+        // RelabelType PostgreSQL strips (RP-912), not priced here; a cast
+        // of anything but a column is declined.
+        N::TypeCast(tc) => {
+            let tn = tc.type_name.as_ref()?;
+            if !tn.typmods.is_empty() || !tn.array_bounds.is_empty() || tn.setof || tn.pct_type {
+                return None;
+            }
+            let Some(N::String(name)) = tn.names.last()?.node.as_ref() else {
+                return None;
+            };
+            let target = pgtypes::oid_of_name(&name.sval)?;
+            let integer = match pgtypes::name_of_oid(target)? {
+                "int2" | "int4" | "int8" => true,
+                "text" | "varchar" => false,
+                _ => return None,
+            };
+            let arg = tc.arg.as_deref()?;
+            match arg.node.as_ref()? {
+                N::ColumnRef(_) => {}
+                // A cast of a constant is folded (`eval_const_expressions`).
+                N::AConst(_) => {
+                    return expr_side(arg, def).filter(|c| c.integer == integer);
+                }
+                _ => return None,
+            }
+            let arg = expr_side(arg, def)?;
+            let source = pgtypes::oid_of_name(&def.column(&arg.text)?.pg_type)?;
+            let cast = pg_casts::explicit_cast_cost(source, target)?;
+            let target_name = match pgtypes::name_of_oid(target)? {
+                "int2" => "smallint",
+                "int4" => "integer",
+                "int8" => "bigint",
+                "varchar" => "character varying",
+                t => t,
+            };
+            ExprSide {
+                text: format!("({})::{target_name}", arg.text),
+                operators: arg.operators + cast as u32,
+                integer,
+                fields: arg.fields,
             }
         }
         _ => return None,

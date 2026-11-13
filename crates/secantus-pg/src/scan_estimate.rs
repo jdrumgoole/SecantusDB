@@ -652,9 +652,12 @@ impl PgHandler {
         // multiplied in last, a column's two bounds as one range.
         let mut sel_factor = 1.0_f64;
         let mut ranges: Vec<Document> = Vec::new();
+        let mut exprs: Vec<secantus_pgplan::ExprQual> = Vec::new();
         for f in &filters {
             if let (true, Some(r)) = (restriction(f), &f.restrict) {
-                if single_bound(&r.filter) {
+                if !r.exprs.is_empty() {
+                    exprs.extend(r.exprs.iter().cloned());
+                } else if single_bound(&r.filter) {
                     ranges.push(r.filter.clone());
                 } else {
                     let _patterns = with_explain_patterns(&r.patterns);
@@ -701,6 +704,12 @@ impl PgHandler {
                 _ => bson::doc! { "$and": ranges },
             };
             sel_factor *= self.restriction_selectivity(&leaves.first()?.table, &filter)?;
+        }
+        // An expression's comparisons, as a single relation's scan
+        // estimates them: no statistics, two bounds on one expression a
+        // range (RP-354).
+        if !exprs.is_empty() {
+            sel_factor *= self.restriction_expr_selectivity(&leaves.first()?.table, &exprs)?;
         }
         // Each side as the inner of a nested loop through its index,
         // parameterized by the other side's row: `param[0]` is `b` inner
@@ -3710,6 +3719,25 @@ impl PgHandler {
         };
         let pt = self.planner_table_lazy(table, &count)?;
         Some(self.where_selectivity(table, &pt, filter, &count)?.0)
+    }
+
+    /// [`expr_selectivity`] of `quals`, comparisons of expressions over
+    /// user table `table`'s columns with constants.
+    fn restriction_expr_selectivity(
+        &self,
+        table: &str,
+        quals: &[secantus_pgplan::ExprQual],
+    ) -> Option<f64> {
+        let counted: std::cell::OnceCell<Option<usize>> = std::cell::OnceCell::new();
+        let count = || {
+            *counted.get_or_init(|| {
+                self.storage
+                    .count_matching(self.db(), table, &Document::new(), None)
+                    .ok()
+            })
+        };
+        let pt = self.planner_table_lazy(table, &count)?;
+        expr_selectivity(quals, pt.tuples)
     }
 
     /// A built-in catalog of `pg_catalog`, sized and measured as `initdb`
