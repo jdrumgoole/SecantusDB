@@ -954,7 +954,7 @@ impl<'a> Model<'a> {
         if rel.catalog && matches!(rel.kind, 'r') {
             let scan =
                 match &used {
-                    Some((ix, _, _)) => {
+                    Some((ix, covering, _)) => {
                         let n = self.h.cr_catalog_matches(rel, ix, &needs.eq_consts);
                         // The equalities on the index's leading columns are the
                         // scan's key.
@@ -970,7 +970,11 @@ impl<'a> Model<'a> {
                                     })
                                 })
                                 .collect();
-                        Scan::Index(ix.oid, key, n)
+                        if *covering {
+                            Scan::IndexOnly(ix.oid, key, n)
+                        } else {
+                            Scan::Index(ix.oid, key, n)
+                        }
                     }
                     None => Scan::Seq(rel.oid, self.h.cr_catalog_rows(rel)),
                 };

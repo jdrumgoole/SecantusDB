@@ -2160,6 +2160,217 @@ def test_catalog_heap_blocks(rust_pg: Any) -> None:
     assert heap_blocks(_dsn(rust_pg)) == EXPECTED_HEAP_BLOCKS
 
 
+# RP-291, its index-only slice: a catalog read directly through an index
+# holding every column it reads is an index-only scan (`IndexOnlyNext`),
+# which reads the visibility map's page once and fetches from the heap only
+# a tuple whose block the map does not mark all-visible -- a block `initdb`
+# left all-visible is not read, and a row written since (`rpc_t`'s) is on a
+# page its write cleared. The blocks each catalog counts in
+# `pg_statio_sys_tables` and each catalog index's `(numscans,
+# tuples_returned, tuples_fetched)`, measured as `EXPECTED_INDEX_BLOCKS`
+# was, on a fresh private cluster.
+INDEX_ONLY_STEPS = [
+    "a|",
+    "mark",
+    "a|select relname from pg_class where relname = 'rpc_t'",
+    "mark",
+    "a|select typname from pg_type where typname = 'int4'",
+    "mark",
+    "a|select relname from pg_class where relname = 'rpc_p'",
+    "mark",
+]
+
+
+def index_only_blocks(dsn: str) -> list[dict[str, int]]:
+    """Each catalog's `blocks_fetched` delta between `INDEX_ONLY_STEPS`' marks."""
+    return _block_deltas(dsn, INDEX_ONLY_STEPS, "pg_stat_sys_tables", "relid", True)
+
+
+EXPECTED_INDEX_ONLY_BLOCKS: list[dict[str, int]] = [
+    {
+        "pg_am": 1,
+        "pg_amproc": 1,
+        "pg_attribute": 4,
+        "pg_authid": 2,
+        "pg_class": 2,
+        "pg_database": 3,
+        "pg_index": 1,
+        "pg_namespace": 1,
+        "pg_opclass": 1,
+        "pg_proc": 2,
+        "pg_type": 1,
+    },
+    {
+        "pg_amop": 4,
+        "pg_attribute": 7,
+        "pg_class": 7,
+        "pg_index": 5,
+        "pg_operator": 2,
+        "pg_proc": 1,
+        "pg_statistic": 1,
+        "pg_tablespace": 1,
+        "pg_type": 3,
+    },
+    {"pg_class": 2, "pg_index": 1, "pg_statistic": 1, "pg_type": 1},
+    {"pg_class": 2},
+    {},
+]
+
+EXPECTED_INDEX_ONLY_READS: Any = [
+    {
+        "pg_am": [1, 1, 0],
+        "pg_amproc_fam_proc_index": [1, 3, 3],
+        "pg_attribute_relid_attnum_index": [4, 7, 7],
+        "pg_authid_oid_index": [1, 1, 1],
+        "pg_authid_rolname_index": [1, 1, 1],
+        "pg_class_oid_index": [2, 2, 2],
+        "pg_database_datname_index": [1, 1, 1],
+        "pg_database_oid_index": [2, 2, 2],
+        "pg_db_role_setting_databaseid_rol_index": [4, 0, 0],
+        "pg_index_indexrelid_index": [1, 1, 1],
+        "pg_namespace_nspname_index": [2, 1, 1],
+        "pg_opclass_oid_index": [1, 1, 1],
+        "pg_proc_oid_index": [1, 1, 1],
+        "pg_proc_proname_args_nsp_index": [1, 1, 1],
+        "pg_type_oid_index": [1, 1, 1],
+    },
+    {
+        "pg_amop_fam_strat_index": [1, 1, 1],
+        "pg_amop_opr_fam_index": [1, 4, 4],
+        "pg_attribute_relid_attnum_index": [7, 8, 8],
+        "pg_class_oid_index": [4, 4, 4],
+        "pg_class_relname_nsp_index": [2, 2, 2],
+        "pg_index_indexrelid_index": [3, 3, 3],
+        "pg_index_indrelid_index": [1, 3, 3],
+        "pg_operator_oid_index": [1, 1, 1],
+        "pg_operator_oprname_l_r_n_index": [1, 1, 1],
+        "pg_proc_oid_index": [1, 1, 1],
+        "pg_statistic_ext_relid_index": [1, 0, 0],
+        "pg_statistic_relid_att_inh_index": [1, 1, 1],
+        "pg_tablespace_oid_index": [1, 1, 1],
+        "pg_type_oid_index": [3, 3, 3],
+    },
+    {
+        "pg_class_oid_index": [1, 1, 1],
+        "pg_class_relname_nsp_index": [1, 1, 1],
+        "pg_index_indrelid_index": [1, 2, 2],
+        "pg_statistic_ext_relid_index": [1, 0, 0],
+        "pg_statistic_relid_att_inh_index": [1, 1, 1],
+        "pg_type_typname_nsp_index": [1, 1, 0],
+    },
+    {"pg_class_relname_nsp_index": [1, 1, 1]},
+    {},
+]
+
+
+@pytest.mark.backlog_fixed("RP-291")
+def test_an_index_only_catalog_scan_reads_the_visibility_map(rust_pg: Any) -> None:
+    """The index-only part of RP-291 (2026-11-13). `secantusd-pg` counted
+    an index-only scan as an index scan: no visibility map page, a heap
+    block for every tuple however all-visible its block, and none for a row
+    written after `initdb`."""
+    dsn = _dsn(rust_pg)
+    assert index_only_blocks(dsn) == EXPECTED_INDEX_ONLY_BLOCKS
+    assert catalog_reads(dsn, {"x": INDEX_ONLY_STEPS})["x"] == EXPECTED_INDEX_ONLY_READS
+
+
+# RP-291, what is left of it: DDL's rows clear the visibility map bit of
+# each `initdb` page they are written to (`heap_insert`'s
+# `visibilitymap_clear`), so an index-only scan then fetches the `initdb`
+# rows on that page too. `pg_class`'s rows for `pg_type` and `pg_class` are
+# on block 0, where this module's tables' rows go. Measured as
+# `EXPECTED_INDEX_BLOCKS` was.
+CLEARED_VM_STEPS = [
+    "a|",
+    "mark",
+    "a|select relname from pg_class where relname = 'pg_type'",
+    "mark",
+    "a|select oid from pg_class where oid = 1259",
+    "mark",
+]
+
+EXPECTED_CLEARED_VM_BLOCKS: list[dict[str, int]] = [
+    {
+        "pg_am": 1,
+        "pg_amproc": 1,
+        "pg_attribute": 4,
+        "pg_authid": 2,
+        "pg_class": 2,
+        "pg_database": 3,
+        "pg_index": 1,
+        "pg_namespace": 1,
+        "pg_opclass": 1,
+        "pg_proc": 2,
+        "pg_type": 1,
+    },
+    {
+        "pg_amop": 4,
+        "pg_attribute": 7,
+        "pg_class": 7,
+        "pg_index": 5,
+        "pg_operator": 2,
+        "pg_proc": 1,
+        "pg_statistic": 1,
+        "pg_tablespace": 1,
+        "pg_type": 3,
+    },
+    {
+        "pg_amop": 4,
+        "pg_cast": 3,
+        "pg_class": 2,
+        "pg_operator": 43,
+        "pg_proc": 1,
+        "pg_statistic": 1,
+        "pg_type": 39,
+    },
+    {},
+]
+
+
+@pytest.mark.backlog("RP-291")
+def test_a_page_ddl_wrote_to_is_not_all_visible(rust_pg: Any) -> None:
+    """PostgreSQL 15.19: once DDL has written a catalog row to an `initdb`
+    page, an index-only scan fetches that page's rows from the heap."""
+    blocks = _block_deltas(_dsn(rust_pg), CLEARED_VM_STEPS, "pg_stat_sys_tables", "relid", True)
+    assert blocks == EXPECTED_CLEARED_VM_BLOCKS
+
+
+# RP-935: the index a catalog read directly is scanned through, and how
+# much of it, as PostgreSQL 15.19 builds the index path from every clause.
+# Each case is a statement, its catalog's index name prefix, and each
+# matching index's `(numscans, tuples_returned)` over a new session's first
+# statement -- tuples fetched left out, as they follow the heap's places
+# (RP-291). Measured as `EXPECTED_INDEX_BLOCKS` was.
+INDEX_PATHS: dict[str, tuple[str, str, dict[str, list[int]]]] = {
+    "two equalities": (
+        "select attnum from pg_attribute where attrelid = 1259 and attnum = 1",
+        "pg_attribute_",
+        {"pg_attribute_relid_attnum_index": [5, 5]},
+    ),
+    "a range": (
+        "select relname from pg_class where relname >= 'pg_s' and relname < 'pg_t'",
+        "pg_class_relname",
+        {"pg_class_relname_nsp_index": [2, 74]},
+    ),
+}
+
+
+def index_path(dsn: str, sql: str, prefix: str) -> dict[str, list[int]]:
+    """The `(numscans, tuples_returned)` of each index named `prefix...`
+    over `sql` as a new session's first statement."""
+    reads = catalog_reads(dsn, {"x": ["a|", "mark", "a|" + sql, "mark"]})["x"][1]
+    return {k: v[:2] for k, v in reads.items() if k.startswith(prefix)}
+
+
+@pytest.mark.backlog("RP-935")
+@pytest.mark.parametrize("case", list(INDEX_PATHS))
+def test_a_catalog_scans_index_path(rust_pg: Any, case: str) -> None:
+    """PostgreSQL 15.19 scans a catalog read directly through the index its
+    clauses match best, bounded by every one of them."""
+    sql, prefix, expected = INDEX_PATHS[case]
+    assert index_path(_dsn(rust_pg), sql, prefix) == expected
+
+
 @pytest.mark.backlog_fixed("RP-311")
 def test_builtin_statistics(rust_pg: Any) -> None:
     """PostgreSQL 15.19: `initdb`'s ANALYZE leaves 404 `pg_statistic` rows
@@ -2687,6 +2898,23 @@ if __name__ == "__main__" and sys.argv[2:] == ["heap"]:
     print(
         "EXPECTED_HEAP_BLOCKS: list[dict[str, int]] = "
         + pprint.pformat(heap_blocks(sys.argv[1]), width=100, sort_dicts=False)
+    )
+    print(
+        "EXPECTED_INDEX_ONLY_BLOCKS: list[dict[str, int]] = "
+        + pprint.pformat(index_only_blocks(sys.argv[1]), width=100, sort_dicts=False)
+    )
+    print(
+        "EXPECTED_INDEX_ONLY_READS: Any = "
+        + pprint.pformat(
+            catalog_reads(sys.argv[1], {"x": INDEX_ONLY_STEPS})["x"], width=100, sort_dicts=False
+        )
+    )
+    for case, (sql, prefix, _) in INDEX_PATHS.items():
+        print(f"INDEX_PATHS[{case!r}]:", index_path(sys.argv[1], sql, prefix))
+    cleared = _block_deltas(sys.argv[1], CLEARED_VM_STEPS, "pg_stat_sys_tables", "relid", True)
+    print(
+        "EXPECTED_CLEARED_VM_BLOCKS: list[dict[str, int]] = "
+        + pprint.pformat(cleared, width=100, sort_dicts=False)
     )
 elif __name__ == "__main__":
     measured = catalog_reads(sys.argv[1])

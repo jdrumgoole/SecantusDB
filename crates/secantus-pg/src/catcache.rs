@@ -175,6 +175,9 @@ pub(crate) enum Scan {
     /// An index scan of `index` for the rows whose leading key columns are
     /// `key`, returning `n` live rows.
     Index(i64, Key, i64),
+    /// The same as an index-only scan (`IndexOnlyNext`): the heap is
+    /// fetched only for a tuple whose block is not all-visible.
+    IndexOnly(i64, Key, i64),
     /// A sequential scan of `rel` returning `n` rows.
     Seq(i64, i64),
 }
@@ -419,6 +422,11 @@ pub(crate) enum PageScan {
     /// are the key; no key for the planner's look at a B-tree's height
     /// (`_bt_getrootheight`), which reads its metapage alone.
     Index(i64, Option<Key>),
+    /// An index-only scan of the index for the rows whose leading key
+    /// columns are the key, returning the count of rows: the visibility
+    /// map, then the heap only for a tuple whose block it does not mark
+    /// all-visible.
+    IndexOnly(i64, Key, usize),
     /// A sequential scan of the table: every block of its heap.
     Seq(i64),
 }
@@ -447,6 +455,21 @@ impl Counter {
             self.scans
                 .borrow_mut()
                 .push(PageScan::Index(index, Some(key)));
+        }
+    }
+
+    /// An index-only scan of `index` for the rows whose leading key columns
+    /// are `key`, returning `rows`: only the tuples it fetches from the heap
+    /// count as fetched (`index_fetch_heap`'s `pgstat_count_heap_fetch`).
+    pub(crate) fn index_only(&self, index: i64, key: Key, rows: i64) {
+        if let Some(s) = &self.stats {
+            let n = usize::try_from(rows).unwrap_or(0);
+            let fetched = crate::catalog_btree::index_only_heap_fetches(index, &key, n)
+                .map_or(rows, |f| f as i64);
+            s.index_scan(index, rows, fetched);
+            self.scans
+                .borrow_mut()
+                .push(PageScan::IndexOnly(index, key, n));
         }
     }
 
@@ -492,6 +515,7 @@ impl Counter {
     pub(crate) fn scan(&self, scan: Scan) {
         match scan {
             Scan::Index(i, k, n) => self.index(i, k, n),
+            Scan::IndexOnly(i, k, n) => self.index_only(i, k, n),
             Scan::Seq(r, n) => self.seq(r, n),
         }
     }

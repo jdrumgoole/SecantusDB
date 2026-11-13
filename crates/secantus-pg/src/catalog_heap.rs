@@ -54,6 +54,9 @@ pub(crate) struct InitdbHeap {
     /// The visibility map's all-visible bit of each block
     /// (`VISIBILITYMAP_ALL_VISIBLE`); a heap without the fork has none set.
     pub(crate) all_visible: Vec<bool>,
+    /// Whether the heap has a visibility map fork at all: `vm_readbuf`
+    /// reads no page of one that does not exist.
+    pub(crate) vm_fork: bool,
 }
 
 impl InitdbHeap {
@@ -115,6 +118,7 @@ fn parse(text: &str) -> HashMap<i64, InitdbHeap> {
                         pages: Vec::new(),
                         fsm: None,
                         all_visible: Vec::new(),
+                        vm_fork: false,
                     },
                 );
                 current = Some(oid);
@@ -143,6 +147,7 @@ fn parse(text: &str) -> HashMap<i64, InitdbHeap> {
         }
         if let Some(rest) = line.strip_prefix("\\vm") {
             heap.all_visible = vec![false; heap.blocks as usize];
+            heap.vm_fork = true;
             for part in rest.trim().split(',').filter(|p| !p.is_empty()) {
                 let (a, b) = part.split_once('-').unwrap_or((part, part));
                 let (a, b): (usize, usize) = (a.parse().unwrap_or(0), b.parse().unwrap_or(0));
