@@ -3409,6 +3409,50 @@ fn create_and_drop_database_plan() {
     }
 }
 
+/// RP-911: a lookup of a `pg_catalog` type's name never reaches a user
+/// type, since `pg_catalog` is searched first, so it is answered without
+/// deriving the composite table the executor deferred. A key keeps a quoted
+/// name's case (`"Text"` is `Text`), and that is still a user type.
+#[test]
+fn a_catalog_type_lookup_derives_no_deferred_composite_table() {
+    for name in [
+        "oid",
+        "text[]",
+        "\"char\"",
+        "pg_node_tree",
+        "_int4",
+        "regproc",
+    ] {
+        assert!(
+            pgtypes::is_catalog_type_name(name),
+            "{name} is pg_catalog's"
+        );
+    }
+    for name in ["Text", "mood", "\"int\"", "public.text"] {
+        assert!(
+            !pgtypes::is_catalog_type_name(name),
+            "{name} is not pg_catalog's"
+        );
+    }
+    let derived = std::rc::Rc::new(std::cell::Cell::new(0));
+    let counter = std::rc::Rc::clone(&derived);
+    defer_user_composites(move || {
+        counter.set(counter.get() + 1);
+        vec![("Text".into(), 67_101, vec![("a".into(), "int4".into())])]
+    });
+    for name in ["oid", "text[]", "\"char\"", "pg_node_tree"] {
+        assert_eq!(user_composite_oid(name), None, "{name}");
+    }
+    assert_eq!(
+        derived.get(),
+        0,
+        "a catalog type's lookup derived the table"
+    );
+    assert_eq!(user_composite_oid("\"Text\""), Some(67_101));
+    assert_eq!(derived.get(), 1);
+    set_user_composites(Vec::new());
+}
+
 /// `to_regtype` resolves a user type's ARRAY -- `mood[]`, `rt1[]` for a
 /// table's row type, or PostgreSQL's internal `_rt1` spelling -- to the
 /// element's oid plus the array offset, and renders it back as `name[]`.

@@ -1091,7 +1091,7 @@ one beside it.
       the comments, each listed from every table. PostgreSQL invalidates
       only the cache entries of the rows a statement changed (`inval.c`).
       psql's `\d` collation subquery straight after a `CREATE TABLE`, debug
-      build, 2026-11-13: about 0.010 s with no other table and 0.022 s with
+      build, 2026-11-13: about 0.010 s with no other table and 0.014 s with
       800 (PostgreSQL 15.19: 0.33 ms with 200, 0.20 ms with 400). Fixed so
       far: keyed `pg_type` reads, unchanged table definitions reused across
       versions (RP-715); the republication reads the definitions in place
@@ -1106,22 +1106,33 @@ one beside it.
       definitions shared (`Arc`) across versions, an unchanged one reused
       by its stored bytes and its sorted place carried forward, and the
       composite listings built once per version (2026-11-13, from 0.021 s
-      to 0.018 s at 800, 0.010 s with none). What is left, profiled at 800
-      tables (debug build, per catalog version): each listing deriving
-      every relation's entry again into owned values -- the oid map
-      (`relation_oids`), the row types' fields (`composite_fields`, under
-      `composites` and `composites_with_schema`), the index definitions
-      (`index_defs` over `derive_index_relations`), the tableoid texts, the
-      comments, the constraint definitions, `pg_type`'s and
-      `pg_attribute`'s rows, each 0.2 to 0.8 ms -- and the planner's
-      `set_*` tables rebuilt from those lists. The faithful end state
-      keys the published state per relation and invalidates what a
-      statement changed; a user relation's entries depend on more than its
-      own catalog row (its grants, its inheritance parents and children,
-      the foreign keys naming it, the types its columns name), so each key
-      has to carry them, or a stale entry is a wrong answer.
+      to 0.018 s at 800, 0.010 s with none); the row types, the plain
+      tables' `tableoid` texts and the publishable relations published as
+      the catalog documents they derive from and derived at a statement's
+      first lookup, a `pg_catalog` type's name answered without them (in
+      the planner and in the RowDescription's wire types), a keyed
+      `pg_attribute` read decoding its own relation's composite alone, and
+      each table's index list read in place (2026-11-13, to 0.014 s at
+      800). What is left, profiled at 800 tables (debug build, per catalog
+      version, about 3.5 ms): the composite catalog's documents read and
+      compared afresh (0.5 ms), the oid map (`relation_oids`, 0.3 ms), the
+      constraint definitions (0.25 ms; they render through planner state,
+      `visible_name` and `check_constraint_text`, so cannot be derived
+      later from captured inputs), the index relations
+      (`derive_index_relations`, 0.5 ms, a cache lookup per table), the
+      comments (0.25 ms), the relations for `regclass` (0.2 ms) and a
+      keyed `pg_attribute` read's walk of every definition (twice, with
+      the catalog-read count). A per-table memo of the index relations by
+      the identity of their inputs was measured slower than deriving them
+      (its map work per version cost more than tables with no index). The
+      faithful end state keys the published state per relation and
+      invalidates what a statement changed; a user relation's entries
+      depend on more than its own catalog row (its grants, its inheritance
+      parents and children, the foreign keys naming it, the types its
+      columns name), so each key has to carry them, or a stale entry is a
+      wrong answer.
       Backlog-ID: RP-911
-      Verify: tests/backlog/test_rp_catalog_latency.py::test_the_first_catalog_query_after_ddl_costs_the_same_at_800_tables
+      Verify: tests/backlog/test_rp_catalog_latency.py::test_the_first_catalog_query_after_ddl_costs_the_same_at_800_tables_within_a_tenth
 
 ## Found by a profile (2026-11-13)
 
