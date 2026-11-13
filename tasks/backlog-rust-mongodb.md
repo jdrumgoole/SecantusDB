@@ -961,41 +961,59 @@ These are explicit non-goals. Don't add them without a reason.
       Found while working RM-478, 2026-11-13.
       Verify: tests/backlog/test_rm_statement_line_comment.py::test_a_statement_line_carries_its_commands_comment
       Backlog-ID: RM-581
-- [ ] **Renaming `<db>.system.views` is refused as a view.** mongod 8.2.1
-      refuses it as a write to the namespace (20 IllegalOperation, "error
-      with source namespace: cannot write to <db>.system.views"); this
-      server answers 166 "cannot rename view: <db>.system.views". Found
-      while working RM-378, 2026-11-09.
-      Verify: tests/backlog/test_rm_rename_errors.py::test_renaming_system_views_is_a_write_to_it
-      Backlog-ID: RM-482
-- [ ] **A read of a view refused before it resolves the view resolves it
-      anyway.** mongod 8.2.11 refuses a `find` of a view whose projection
-      does not parse (`{a: {$bogusop: 1}}`), and an `explain` of a `find`
-      of a view whose filter does not, before it resolves the view: its line
-      names the view (`<db>.v`, `normal`) and has no `resolvedViews`. This
-      server resolves the view first, so its line has `resolvedViews` and
-      names the collection beneath, as a read that failed after resolving
-      does (RM-380). Found while working RM-380, 2026-11-10.
-      Verify: tests/backlog/test_rm_view_namespaces.py::test_a_read_refused_before_it_resolves_names_the_view
-      Backlog-ID: RM-483
-- [ ] **A time-series collection's `collMod` and `collStats` lines name the
-      collection, not its buckets.** mongod 8.2.11's name
-      `<db>.system.buckets.ts`, `collectionType: "timeseriesBuckets"`; this
-      server's name `<db>.ts`, `normal`. Found while working RM-380,
-      2026-11-10.
-      Verify: tests/backlog/test_rm_view_namespaces.py::test_a_time_series_ddl_line_names_its_buckets
-      Backlog-ID: RM-484
-- [ ] **A refused `validate` or `dropIndexes` of a view names the view.**
-      mongod 8.2.11's line for each names `<db>.$cmd`; this server's names
-      `<db>.v`. Found while working RM-380, 2026-11-10.
-      Verify: tests/backlog/test_rm_view_namespaces.py::test_a_refused_validate_of_a_view_names_cmd
-      Backlog-ID: RM-485
-- [ ] **An `explain` of a write is profiled.** mongod 8.2.11 writes no
-      profile entry for an `explain` of an `update` (a `delete` or
-      `findAndModify` not measured); this server writes one, named for the
-      collection. Found while working RM-380, 2026-11-10.
-      Verify: tests/backlog/test_rm_view_namespaces.py::test_an_explain_of_a_write_is_not_profiled
-      Backlog-ID: RM-486
+- [ ] **A `dataSize` of a view answers.** mongod 8.2.11 refuses
+      `{dataSize: "<db>.v"}` of a view (166, CommandNotSupportedOnView);
+      this server answers `ok: 1`, sizing nothing. Found while working
+      RM-485, 2026-11-13.
+      Verify: tests/backlog/test_rm_view_ddl_refusals.py::test_a_data_size_of_a_view_is_refused
+      Backlog-ID: RM-587
+- [ ] **A `dropIndexes` of `system.views` is refused.** mongod 8.2.11 drops
+      `<db>.system.views`' indexes (`ok: 1`, its line and profile entry
+      naming `<db>.system.views`, `system`); this server refuses it with
+      NamespaceNotFound (26), though `system.views` exists. Found while
+      working RM-485, 2026-11-13.
+      Verify: tests/backlog/test_rm_view_ddl_refusals.py::test_a_drop_indexes_of_system_views_answers
+      Backlog-ID: RM-588
+- [ ] **A `createIndexes` that builds nothing names its collection.**
+      mongod 8.2.11's line for a `createIndexes` of an index that is there
+      already (`{x: 1}` on a collection, a time-series collection's own
+      `{m: 1, t: 1}`) names `<db>.$cmd`; this server's names the collection
+      (the time-series one's buckets since RM-484). Found while working
+      RM-484, 2026-11-13.
+      Verify: tests/backlog/test_rm_ts_ddl_lines.py::test_a_create_indexes_that_builds_nothing_names_cmd
+      Backlog-ID: RM-582
+- [ ] **An index build of a time-series collection writes no build line.**
+      mongod 8.2.11 writes two lines for a `createIndexes` that builds an
+      index of a time-series collection, the command's and its build
+      thread's, each naming `<db>.system.buckets.ts`; this server writes
+      the command's alone. Its time-series documents live in its column
+      store (`ts_store.rs`), so `create_indexes` finds the collection's
+      document table empty and takes the build for one of an empty
+      collection, which logs no line of its own. Found while working
+      RM-484, 2026-11-13.
+      Verify: tests/backlog/test_rm_ts_ddl_lines.py::test_a_time_series_index_build_has_its_line
+      Backlog-ID: RM-583
+- [ ] **A `collMod` of a missing collection names it, and is profiled.**
+      mongod 8.2.11's line for one (26, `NamespaceNotFound`) names
+      `<db>.$cmd`, and it writes no profile entry; this server's line names
+      the collection, and it writes an entry with `ok: 0`. Found while
+      working RM-484, 2026-11-13.
+      Verify: tests/backlog/test_rm_ts_ddl_lines.py::test_a_coll_mod_of_a_missing_collection_names_cmd
+      Backlog-ID: RM-584
+- [ ] **An `insert` into a time-series collection's buckets is not
+      profiled.** mongod 8.2.11 writes a profile entry for an `insert` into
+      `<db>.system.buckets.ts`; this server writes the line and no entry.
+      Found while working RM-484, 2026-11-13.
+      Verify: tests/backlog/test_rm_ts_ddl_lines.py::test_an_insert_into_buckets_is_profiled
+      Backlog-ID: RM-585
+- [ ] **A `find` of a time-series collection's buckets does not say what
+      it examined.** mongod 8.2.11's line for a `find` of
+      `<db>.system.buckets.ts` has `keysExamined`, `docsExamined` and
+      `nBatches`, as one of a collection's does; this server's has its
+      `planSummary` and `nreturned` and none of those. Found while working
+      RM-484, 2026-11-13.
+      Verify: tests/backlog/test_rm_ts_ddl_lines.py::test_a_find_of_buckets_says_what_it_examined
+      Backlog-ID: RM-586
 - [ ] **An `update` or `delete` of a view writes no statement line.**
       mongod 8.2.11 refuses the statement and writes its line (`<db>.v`,
       `normal`, `ok: 0`, the refusal) before the command's; this server
@@ -1051,11 +1069,13 @@ These are explicit non-goals. Don't add them without a reason.
       Verify: tests/backlog/test_rm_view_lines.py::test_a_count_and_an_aggregate_of_a_view_name_the_plan_beneath
       Backlog-ID: RM-494
 - [ ] **A `Slow query` line takes a command's string argument for its
-      collection.** mongod 8.2.11's lines for a `validate: "c"`, a
-      `dataSize: "<db>.c"` and a `getLog` name `<db>.$cmd`; this server's
-      name `<db>.c`, `<db>.<db>.c` and `<db>.startupWarnings`
+      collection.** mongod 8.2.11's lines for a `dataSize: "<db>.c"`, a
+      `getLog` and a `compact: "c"` name `<db>.$cmd`; this server's name
+      `<db>.<db>.c`, `<db>.startupWarnings` and `<db>.c`
       (`slowop::target_collection` reads any command's string value as
-      one). Found while working RM-383, 2026-11-10.
+      one; a `validate`'s names `<db>.$cmd` since RM-485). Found while
+      working RM-383, 2026-11-10; `compact` measured while working RM-485,
+      2026-11-13.
       (This was RM-480: A `dataSize` line names `<db>.<db>.c`.) mongod 8.2.1's
       `Slow query` line for a `dataSize`, whose argument is a full namespace,
       names `<db>.$cmd`; this server's joins the command's database to the
@@ -3348,7 +3368,11 @@ touched:
   the bucket refilled. The test passed three runs out of three on its own
   at low load. The same happened to this server's side in the RM gate of
   2026-11-09 (load average about 9: it answered two with `maxQueueDepth`
-  2, where mongod answered one); three runs on their own passed. The test depends on six connects landing within one
+  2, where mongod answered one); three runs on their own passed. In the
+  RM gate of 2026-11-13 (load average up to 18) the same queue-2 case
+  differed in a wait instead: this server answered its third connection
+  after a wait that rounded to 3 seconds, mongod after 2; four runs on
+  their own passed, at load 18. The test depends on six connects landing within one
   second, so it is flaky by construction: it needs a measurement that
   load cannot change (connect all six behind a barrier and record how
   long they took to land, or compare with the answer mongod gives when

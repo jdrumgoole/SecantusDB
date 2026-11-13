@@ -64,12 +64,12 @@ def _entries(rust_mongo: Any, mongod_rs: Any, op: Callable[[Any], Any]) -> dict:
     }
 
 
-@pytest.mark.backlog("RM-483")
+@pytest.mark.backlog_fixed("RM-483")
 def test_a_read_refused_before_it_resolves_names_the_view(rust_mongo: Any, mongod_rs: Any) -> None:
     """mongod 8.2.11 refuses a `find` of a view whose projection does not
     parse, and an `explain` of a `find` of a view whose filter does not,
     before it resolves the view: its line names the view, `normal`, with no
-    `resolvedViews`. This server resolves the view first."""
+    `resolvedViews`. This server resolved the view first."""
 
     def op(db: Any) -> None:
         _refused(lambda d: list(d.v.find({}, projection={"a": {"$bogusop": 1}})))(db)
@@ -85,11 +85,11 @@ def test_a_read_refused_before_it_resolves_names_the_view(rust_mongo: Any, mongo
     assert got["rust"] == got["mongod"]
 
 
-@pytest.mark.backlog("RM-484")
+@pytest.mark.backlog_fixed("RM-484")
 def test_a_time_series_ddl_line_names_its_buckets(rust_mongo: Any, mongod_rs: Any) -> None:
     """mongod 8.2.11's line for a `collMod` or a `collStats` of a time-series
     collection names its buckets, `<db>.system.buckets.ts`,
-    `timeseriesBuckets`; this server's names `<db>.ts`."""
+    `timeseriesBuckets`; this server's named `<db>.ts`, `normal`."""
 
     def op(db: Any) -> None:
         db.command("collMod", "ts", expireAfterSeconds=100)
@@ -103,10 +103,10 @@ def test_a_time_series_ddl_line_names_its_buckets(rust_mongo: Any, mongod_rs: An
     assert got["rust"] == got["mongod"]
 
 
-@pytest.mark.backlog("RM-485")
+@pytest.mark.backlog_fixed("RM-485")
 def test_a_refused_validate_of_a_view_names_cmd(rust_mongo: Any, mongod_rs: Any) -> None:
     """mongod 8.2.11's line for a `validate` or a `dropIndexes` of a view,
-    each refused, names `<db>.$cmd`; this server's names the view."""
+    each refused, names `<db>.$cmd`; this server's named the view."""
 
     def op(db: Any) -> None:
         _refused(lambda d: d.command("validate", "v"))(db)
@@ -120,17 +120,50 @@ def test_a_refused_validate_of_a_view_names_cmd(rust_mongo: Any, mongod_rs: Any)
     assert got["rust"] == got["mongod"]
 
 
-@pytest.mark.backlog("RM-486")
+@pytest.mark.backlog_fixed("RM-485")
+def test_an_unacquired_drop_indexes_names_cmd_and_is_not_profiled(
+    rust_mongo: Any, mongod_rs: Any
+) -> None:
+    """mongod 8.2.11's `dropIndexes` of a collection that does not exist is
+    refused before it acquires one: its line names `<db>.$cmd` and it is
+    profiled nowhere. One refused once it holds its collection (an index
+    that does not exist) names the collection and is profiled. This server
+    named the missing collection and profiled it."""
+
+    def op(db: Any) -> None:
+        _refused(lambda d: d.command("dropIndexes", "nope", index="*"))(db)
+        _refused(lambda d: d.command("dropIndexes", "c", index="nope_1"))(db)
+
+    got = {
+        server: (
+            [(_first(a), _ns(a), a.get("ok", 1), a.get("errCode")) for _, a in lines],
+            [(_first(e), _ns(e)) for e in entries],
+        )
+        for server, (lines, entries) in _both(rust_mongo, mongod_rs, op).items()
+    }
+    assert got["mongod"] == (
+        [("dropIndexes", "$cmd", 0, 26), ("dropIndexes", "c", 0, 27)],
+        [("dropIndexes", "c")],
+    )
+    assert got["rust"] == got["mongod"]
+
+
+@pytest.mark.backlog_fixed("RM-486")
 def test_an_explain_of_a_write_is_not_profiled(rust_mongo: Any, mongod_rs: Any) -> None:
     """mongod 8.2.11 writes no profile entry for an `explain` of an
-    `update`; this server writes one, named for the collection."""
-    got = _entries(
-        rust_mongo,
-        mongod_rs,
-        lambda d: d.command(
-            "explain", {"update": "c", "updates": [{"q": {}, "u": {"$set": {"a": 1}}}]}
-        ),
-    )
+    `update`, a `delete` or a `findAndModify`, at any verbosity; this server
+    wrote one, named for the collection."""
+
+    def op(db: Any) -> None:
+        for write in (
+            {"update": "c", "updates": [{"q": {}, "u": {"$set": {"a": 1}}}]},
+            {"delete": "c", "deletes": [{"q": {"x": 1}, "limit": 1}]},
+            {"findAndModify": "c", "query": {"x": 1}, "update": {"$set": {"a": 1}}},
+        ):
+            for verbosity in ("queryPlanner", "executionStats"):
+                db.command("explain", write, verbosity=verbosity)
+
+    got = _entries(rust_mongo, mongod_rs, op)
     assert got["mongod"] == []
     assert got["rust"] == got["mongod"]
 

@@ -189,7 +189,15 @@ fn target(name: &str, doc: &Document, db: &str) -> Option<(String, String)> {
         "dbStats" | "dbstats" => db.to_string(),
         "explain" => {
             let inner = doc.get_document("explain").ok()?;
-            let (_, coll) = inner.iter().next()?;
+            let (verb, coll) = inner.iter().next()?;
+            // An explain of a write never takes the collection's namespace
+            // for the operation -- its line names `<db>.$cmd` -- and mongod
+            // 8.2.11 profiles it nowhere, at any verbosity, answered or
+            // refused (RM-486). An explain of a read, an `$out` or a
+            // `mapReduce` is profiled under the collection.
+            if is_explained_write(verb) {
+                return None;
+            }
             match coll {
                 Bson::String(c) if !c.is_empty() => format!("{db}.{c}"),
                 _ => return None,
@@ -204,6 +212,15 @@ fn target(name: &str, doc: &Document, db: &str) -> Option<(String, String)> {
     };
     let target_db = ns.split('.').next().unwrap_or(db).to_string();
     Some((target_db, ns))
+}
+
+/// Whether an `explain` of `verb` explains a write: `update`, `delete` or
+/// `findAndModify`.
+fn is_explained_write(verb: &str) -> bool {
+    matches!(
+        verb,
+        "update" | "delete" | "findAndModify" | "findandmodify"
+    )
 }
 
 /// mongod's `op` for a command.
@@ -240,6 +257,12 @@ fn refused_unprofiled(name: &str, reply: &Document) -> bool {
     // (RM-378), and `admin` profiles no command: mongod 8.2.1 profiles it
     // nowhere (RM-479).
     if name == "renameCollection" {
+        return true;
+    }
+    // A `dropIndexes` refused before it acquired its collection (a view, a
+    // collection that does not exist) has no namespace to be profiled
+    // under: mongod 8.2.11 profiles it nowhere (RM-485).
+    if crate::opdebug::refused_before_acquiring(name, reply) {
         return true;
     }
     let code = reply.get_i32("code").unwrap_or(0);
@@ -279,6 +302,12 @@ pub(crate) fn finish(
     if !crate::util::reply_ok(reply) {
         if let Some(ns) = crate::opdebug::beneath_view(ctx, &pending.ns) {
             pending.ns = ns;
+        }
+    }
+    // A time-series collection's DDL is filed under its buckets (RM-484).
+    if let Some((db, coll)) = pending.ns.split_once('.') {
+        if let Some(buckets) = crate::opdebug::buckets_of(ctx, name, db, coll) {
+            pending.ns = format!("{db}.{buckets}");
         }
     }
     let millis = pending.start.elapsed().as_millis() as i64;
@@ -1508,6 +1537,30 @@ mod tests {
             None
         );
         assert_eq!(target("ping", &doc! {"ping": 1}, "a"), None);
+    }
+
+    /// An `explain` of a read is profiled under its collection; one of a
+    /// write nowhere, as mongod 8.2.11 has it (RM-486).
+    #[test]
+    fn an_explain_of_a_write_is_not_profiled() {
+        let explain = |inner: Document| target("explain", &doc! {"explain": inner}, "a");
+        for read in [
+            doc! {"find": "c"},
+            doc! {"aggregate": "c", "pipeline": [{"$out": "o"}]},
+            doc! {"count": "c"},
+            doc! {"distinct": "c", "key": "x"},
+            doc! {"mapReduce": "c"},
+        ] {
+            assert_eq!(explain(read), Some(("a".into(), "a.c".into())));
+        }
+        for write in [
+            doc! {"update": "c", "updates": []},
+            doc! {"delete": "c", "deletes": []},
+            doc! {"findAndModify": "c", "remove": true},
+            doc! {"findandmodify": "c", "remove": true},
+        ] {
+            assert_eq!(explain(write), None);
+        }
     }
 
     /// A `renameCollection` that renamed is profiled under its source; one

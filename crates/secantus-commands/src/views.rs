@@ -79,11 +79,6 @@ fn unsupported(msg: String) -> Document {
     CommandError::new(166, "CommandNotSupportedOnView", msg).into_reply()
 }
 
-/// `db.coll` split at the first dot.
-fn split_ns(ns: &str) -> Option<(&str, &str)> {
-    ns.split_once('.')
-}
-
 /// The namespace an `$out` / `$merge` stage writes to, when it names one in
 /// a form this reads (`"coll"`, `{db, coll}`, and `$merge`'s `into` of either).
 fn write_target(stage: &Document, db: &str) -> Option<(String, String)> {
@@ -154,23 +149,6 @@ pub(crate) fn refusal(name: &str, doc: &Document, ctx: &CommandContext) -> Optio
         "validate" => {
             let coll = doc.get_str(name).ok()?;
             view(coll).then(|| unsupported("Cannot validate a view".to_string()))
-        }
-        "renameCollection" => {
-            let source = doc.get_str(name).ok()?;
-            let target = doc.get_str("to").ok()?;
-            let (source_db, source_coll) = split_ns(source)?;
-            if is_view(storage.as_ref(), source_db, source_coll) {
-                return Some(unsupported(format!("cannot rename view: {source}")));
-            }
-            let (target_db, target_coll) = split_ns(target)?;
-            is_view(storage.as_ref(), target_db, target_coll).then(|| {
-                CommandError::new(
-                    48,
-                    "NamespaceExists",
-                    format!("a view already exists with that name: {target}"),
-                )
-                .into_reply()
-            })
         }
         "aggregate" => {
             let coll = doc.get_str(name).ok()?;
