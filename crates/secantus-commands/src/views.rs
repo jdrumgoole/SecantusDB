@@ -99,6 +99,16 @@ fn write_target(stage: &Document, db: &str) -> Option<(String, String)> {
     }
 }
 
+/// Whether mongod profiles `name`'s refusal of a view: a `listIndexes` or a
+/// `collStats` takes the view's namespace before it finds it is not a
+/// collection, and mongod 8.2.11 profiles it there (`<db>.v`, `ok: 0`, the
+/// refusal's `errCode`). A `findAndModify`, `createIndexes`, `dropIndexes`
+/// or `validate` of a view it profiles nowhere (measured 8.2.11,
+/// 2026-11-13, RM-488).
+pub(crate) fn refusal_is_profiled(name: &str) -> bool {
+    matches!(name, "listIndexes" | "collStats" | "collstats")
+}
+
 /// The reply to a command mongod refuses on a view, or `None` to run it.
 pub(crate) fn refusal(name: &str, doc: &Document, ctx: &CommandContext) -> Option<Document> {
     let storage = ctx.storage.as_ref()?;

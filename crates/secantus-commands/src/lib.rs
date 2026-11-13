@@ -2001,6 +2001,26 @@ fn dispatch_inner(
                     return reply;
                 }
                 if let Some(reply) = views::refusal(name, doc, ctx) {
+                    if views::refusal_is_profiled(name) {
+                        // mongod's `AutoGetCollectionForReadCommand` takes
+                        // the read's locks before it finds the view, and its
+                        // line and entry count them (RM-488).
+                        let facts = lock_manager::StorageFacts {
+                            storage: ctx.storage.as_ref(),
+                            db: &ctx.db_name,
+                        };
+                        let locks = lock_manager::Guard::statement(
+                            ctx.locks.as_ref(),
+                            doc,
+                            &ctx.db_name,
+                            &facts,
+                        );
+                        if let Some(Err(e)) = locks {
+                            return e.into_reply();
+                        }
+                        drop(locks);
+                        profiler::mark_reached(ctx);
+                    }
                     return reply;
                 }
             }

@@ -237,10 +237,10 @@ def test_an_unordered_write_to_a_view_has_a_line_per_statement(
     assert got["rust"] == got["mongod"]
 
 
-@pytest.mark.backlog("RM-488")
+@pytest.mark.backlog_fixed("RM-488")
 def test_a_refused_list_indexes_of_a_view_is_profiled(rust_mongo: Any, mongod_rs: Any) -> None:
     """mongod 8.2.11 profiles a `listIndexes` and a `collStats` of a view,
-    each refused; this server writes no entry for either."""
+    each refused; this server wrote no entry for either."""
 
     def op(db: Any) -> None:
         _refused(lambda d: list(d.v.list_indexes()))(db)
@@ -248,6 +248,36 @@ def test_a_refused_list_indexes_of_a_view_is_profiled(rust_mongo: Any, mongod_rs
 
     got = _entries(rust_mongo, mongod_rs, op)
     assert got["mongod"] == [("listIndexes", "v", 0.0), ("collStats", "v", 0.0)]
+    assert got["rust"] == got["mongod"]
+
+
+@pytest.mark.backlog_fixed("RM-488")
+def test_a_refused_list_indexes_of_a_view_counts_its_lock(rust_mongo: Any, mongod_rs: Any) -> None:
+    """mongod 8.2.11 takes a `listIndexes`'s or a `collStats`'s read lock
+    before it finds a view, so the line and the entry of one it refuses
+    have the fields, the `locks` and the `storage` section of a read: a
+    global IS on the line, two in the entry. This server refused before it
+    took the lock, and its line had `locks: {}` and no `storage`."""
+
+    def op(db: Any) -> None:
+        _refused(lambda d: list(d.v.list_indexes()))(db)
+        _refused(lambda d: d.command("collStats", "v"))(db)
+
+    got = {}
+    for server, (lines, entries) in _both(rust_mongo, mongod_rs, op).items():
+        got[server] = [
+            (_first(a), a.get("locks"), "storage" in a, a.get("errName")) for _, a in lines
+        ] + [
+            (_first(e), e.get("locks"), sorted(set(e) - {"ts"}), e.get("errName")) for e in entries
+        ]
+    line_locks = {"Global": {"acquireCount": {"r": 1}}}
+    entry_locks = {"Global": {"acquireCount": {"r": 2}}}
+    assert [g[:2] for g in got["mongod"]] == [
+        ("listIndexes", line_locks),
+        ("collStats", line_locks),
+        ("listIndexes", entry_locks),
+        ("collStats", entry_locks),
+    ]
     assert got["rust"] == got["mongod"]
 
 
@@ -353,4 +383,78 @@ def test_a_refused_write_of_a_view_takes_mongods_locks(rust_mongo: Any, mongod_r
     statement = got["mongod"][0]
     assert statement[:2] == ("q", "v")
     assert statement[2]["ReplicationStateTransition"] == {"acquireCount": {"w": 2}}
+    assert got["rust"] == got["mongod"]
+
+
+def _coll_stats_of_view(client: Any) -> list:
+    from tests.backlog.conftest import mongo_answer
+
+    db = client[fresh("collstats")]
+    _setup(db)
+    got = []
+    for spec in ({}, {"latencyStats": {}}, {"count": {}}, {"storageStats": {}}):
+        answer = mongo_answer(
+            lambda s=spec: [sorted(d) for d in db.v.aggregate([{"$collStats": s}])]
+        )
+        got.append(answer[:2])
+    client.drop_database(db.name)
+    return got
+
+
+@pytest.mark.backlog("RM-590")
+def test_a_coll_stats_stage_of_a_view_answers(rust_mongo: Any, mongod_rs: Any) -> None:
+    """mongod 8.2.11 answers a `$collStats: {}` or `{latencyStats: {}}` of a
+    view, and refuses `count` and `storageStats` (166); this server refuses
+    every `$collStats` of a view."""
+    got = {s: _coll_stats_of_view(c) for s, c in (("rust", rust_mongo), ("mongod", mongod_rs))}
+    assert got["mongod"] == [
+        ("ok", [["host", "localTime", "ns"]]),
+        ("ok", [["host", "latencyStats", "localTime", "ns"]]),
+        ("err", 166),
+        ("err", 166),
+    ]
+    assert got["rust"] == got["mongod"]
+
+
+@pytest.mark.backlog("RM-591")
+def test_an_out_into_a_view_names_the_view(rust_mongo: Any, mongod_rs: Any) -> None:
+    """mongod 8.2.11's line and profile entry for an `$out` into a view, which
+    it refuses, name the view; this server's line names the collection the
+    pipeline reads, and it writes no entry."""
+    got = {}
+    for server, (lines, entries) in _both(
+        rust_mongo, mongod_rs, _refused(lambda d: list(d.c.aggregate([{"$out": "v"}])))
+    ).items():
+        got[server] = [(_first(a), _ns(a), a.get("ok", 1)) for _, a in lines] + [
+            (_first(e), _ns(e), e.get("ok", 1)) for e in entries
+        ]
+    assert got["mongod"] == [("aggregate", "v", 0), ("aggregate", "v", 0.0)]
+    assert got["rust"] == got["mongod"]
+
+
+@pytest.mark.backlog("RM-592")
+def test_a_merge_into_a_view_is_profiled(rust_mongo: Any, mongod_rs: Any) -> None:
+    """mongod 8.2.11 profiles a `$merge` into a view, which it refuses, under
+    the collection the pipeline reads; this server writes no entry."""
+    got = _entries(
+        rust_mongo,
+        mongod_rs,
+        _refused(lambda d: list(d.c.aggregate([{"$merge": {"into": "v"}}]))),
+    )
+    assert got["mongod"] == [("aggregate", "c", 0.0)]
+    assert got["rust"] == got["mongod"]
+
+
+@pytest.mark.backlog("RM-593")
+def test_a_change_stream_of_a_view_writes_no_line(rust_mongo: Any, mongod_rs: Any) -> None:
+    """mongod 8.2.11 refuses a `$changeStream` of a view (166) and writes no
+    `Slow query` line for it; this server writes one."""
+    got = _lines(
+        rust_mongo,
+        mongod_rs,
+        _refused(
+            lambda d: d.command("aggregate", "v", pipeline=[{"$changeStream": {}}], cursor={})
+        ),
+    )
+    assert got["mongod"] == []
     assert got["rust"] == got["mongod"]

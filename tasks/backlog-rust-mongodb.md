@@ -1031,11 +1031,33 @@ These are explicit non-goals. Don't add them without a reason.
       working RM-487, 2026-11-13.
       Verify: tests/backlog/test_rm_view_namespaces.py::test_a_refused_write_of_a_view_takes_mongods_locks
       Backlog-ID: RM-589
-- [ ] **A refused `listIndexes` or `collStats` of a view is not profiled.**
-      mongod 8.2.11 writes an entry for each (`<db>.v`, `ok: 0`); this
-      server writes none. Found while working RM-380, 2026-11-10.
-      Verify: tests/backlog/test_rm_view_namespaces.py::test_a_refused_list_indexes_of_a_view_is_profiled
-      Backlog-ID: RM-488
+- [ ] **A `$collStats` of a view is refused.** mongod 8.2.11 answers a
+      `$collStats: {}` or `{latencyStats: {}}` stage of a view (one
+      document, `ns`, `host`, `localTime`, and `latencyStats` when asked),
+      and refuses `count`, `storageStats` and `queryExecStats` (166); this
+      server refuses every `$collStats` of a view. Found while working
+      RM-488, 2026-11-13.
+      Verify: tests/backlog/test_rm_view_namespaces.py::test_a_coll_stats_stage_of_a_view_answers
+      Backlog-ID: RM-590
+- [ ] **An `$out` into a view is not profiled, and its line names the
+      source.** mongod 8.2.11 refuses it (166) with a line and a profile
+      entry naming the view (`<db>.v`, `ok: 0`); this server's line names
+      the collection the pipeline reads, and it writes no entry. Found
+      while working RM-488, 2026-11-13.
+      Verify: tests/backlog/test_rm_view_namespaces.py::test_an_out_into_a_view_names_the_view
+      Backlog-ID: RM-591
+- [ ] **A `$merge` into a view is not profiled.** mongod 8.2.11 refuses it
+      (166) and profiles the `aggregate` under the collection it reads
+      (`<db>.c`, `ok: 0`); this server writes no entry. Found while
+      working RM-488, 2026-11-13.
+      Verify: tests/backlog/test_rm_view_namespaces.py::test_a_merge_into_a_view_is_profiled
+      Backlog-ID: RM-592
+- [ ] **A `$changeStream` of a view writes a line.** Both servers refuse
+      it (166), and mongod 8.2.11 writes no `Slow query` line for it; this
+      server writes one (`<db>.v`, `ok: 0`). Found while working RM-488,
+      2026-11-13.
+      Verify: tests/backlog/test_rm_view_namespaces.py::test_a_change_stream_of_a_view_writes_no_line
+      Backlog-ID: RM-593
 - [ ] **A `distinct` of a view is counted as failed.** A view's `distinct`
       answers `ok` as an int32, as mongod's does, and about 270 readers of
       a reply's `ok` (`get_f64("ok")`) take it for a failure:
