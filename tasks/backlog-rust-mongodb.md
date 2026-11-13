@@ -1069,14 +1069,20 @@ These are explicit non-goals. Don't add them without a reason.
       RM-381, 2026-11-10.
       Verify: tests/backlog/test_rm_view_lines.py::test_a_distinct_of_a_view_counts_what_it_examined
       Backlog-ID: RM-493
-- [ ] **A `count` or `aggregate` of a view names a COLLSCAN beneath it.**
-      Over a view `{$match: {x: {$gte: 1}}}` on a collection indexed on
-      `x`, mongod 8.2.11's line for a `count_documents({})` names
-      `COUNT_SCAN { x: 1 }` (`docsExamined: 0`) and for a `$group` names
-      `IXSCAN { x: 1 }`; this server's name `COLLSCAN`, while counting 11
-      keys and 11 documents examined. Its explain of such a `count` is
-      RM-072. Found while working RM-381, 2026-11-10.
-      Verify: tests/backlog/test_rm_view_lines.py::test_a_count_and_an_aggregate_of_a_view_name_the_plan_beneath
+- [ ] **A `count_documents` names an `IXSCAN` where mongod runs a
+      `COUNT_SCAN`.** A `count_documents` is a `$match` and a `$group` that
+      reads no field. Where its filter bounds the index on `x` -- of a
+      collection, or of a view `{$match: {x: {$gte: 1}}}` over it -- mongod
+      8.2.11 runs a `COUNT_SCAN { x: 1 }` that examines 11 keys and no
+      document; this server fetches the 11 documents through an
+      `IXSCAN { x: 1 }`, and its line says so. A line's `planSummary` is
+      planned from the catalog (`explain/summary.rs`), and naming a
+      `COUNT_SCAN` there would name a plan that did not run: the executor
+      has to run the count scan first, which is the SBE `GROUP` over a
+      `COUNT_SCAN` of RM-071 (its explain of a view's `count` is RM-072).
+      An `aggregate` of a view otherwise names the plan beneath it since
+      2026-11-13. Found while working RM-381, 2026-11-10.
+      Verify: tests/backlog/test_rm_view_lines.py::test_a_count_documents_runs_a_count_scan
       Backlog-ID: RM-494
 - [ ] **A `Slow query` line takes a command's string argument for its
       collection.** mongod 8.2.11's lines for a `dataSize: "<db>.c"`, a
