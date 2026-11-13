@@ -16178,8 +16178,8 @@ def test_the_index_relations_follow_every_index_change(home: Path) -> None:
         b.execute("COMMENT ON INDEX mx_v IS 'by v'")
         assert _fetch(a, indexes) == [("mx_pkey", "mx_pkey", None), ("mx_v", "mx_v", "by v")]
         b.execute("ALTER INDEX mx_v RENAME TO mx_v2")
-        # The comment does not follow the rename yet (RP-923).
-        assert [r[:2] for r in _fetch(a, indexes)] == [("mx_pkey", "mx_pkey"), ("mx_v2", "mx_v2")]
+        # The comment follows the rename, keyed by the index's oid (RP-923).
+        assert _fetch(a, indexes) == [("mx_pkey", "mx_pkey", None), ("mx_v2", "mx_v2", "by v")]
         assert _fetch(a, "SELECT to_regclass('mx_v')::text") == [(None,)]
         a.execute("BEGIN")
         a.execute("CREATE INDEX mx_w ON mx (w)")

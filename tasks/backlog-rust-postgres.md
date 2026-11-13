@@ -1213,16 +1213,17 @@ one beside it.
       Backlog-ID: RP-927
       Verify: tests/backlog/test_rp_catalog_latency.py::test_the_first_catalog_query_after_ddl_over_two_column_types_costs_the_same_at_400_tables
 
-- [ ] **OPEN — a renamed index loses its comment.** `COMMENT ON INDEX ix
-      IS 'c'` then `ALTER INDEX ix RENAME TO ix2`: PostgreSQL 15.19 answers
-      `obj_description('ix2'::regclass, 'pg_class')` with `c`, since a
-      comment is keyed by the object's oid (`pg_description.objoid`) and a
-      rename keeps the oid; `secantusd-pg` answers NULL, for a `CREATE
-      INDEX` and for a primary key's index alike (2026-11-13). The index
-      comments are stored under a key built from the index's name
-      (`index_comment_key`), which the rename does not move.
-      Backlog-ID: RP-923
-      Verify: tests/backlog/test_rp_found_rp911.py::test_an_index_comment_survives_a_rename
+## Found while working RP-923 (2026-11-13)
+
+- [ ] **OPEN — an index outside `public` cannot be renamed.** `ALTER INDEX
+      s.ix RENAME TO ix2`, and `ALTER INDEX ix RENAME TO ix2` with `s` on
+      the search path, rename the index of a table in schema `s` on
+      PostgreSQL 15.19; `secantusd-pg` answers 42P01 `relation "s.ix" does
+      not exist` for both (2026-11-13). `rename_index` matches the target
+      against the bare index name, so a schema-qualified target never
+      matches, and the bare one reaches it already qualified.
+      Backlog-ID: RP-933
+      Verify: tests/backlog/test_rp_found_rp923.py::test_an_index_outside_public_can_be_renamed
 
 ## Found by a CI run (2026-11-07)
 
