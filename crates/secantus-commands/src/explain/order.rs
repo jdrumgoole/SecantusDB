@@ -806,12 +806,6 @@ impl plan::CacheHook for ReadCache<'_> {
         if !(top || branch) || !cacheable(q) {
             return None;
         }
-        // A branch of a rooted `$or` in front of stages SBE runs is cached
-        // by mongod under a key this does not yet build (RM-429): it is
-        // left uncached rather than share the entry of a classic query.
-        if branch && self.ask.asked.sbe {
-            return None;
-        }
         let parts = super::cache_key::Parts {
             sort: if top { q.sort } else { None },
             // A branch is keyed with the query's projection (measured
@@ -819,7 +813,10 @@ impl plan::CacheHook for ReadCache<'_> {
             projection: self.ask.asked.projection,
             collation: q.collation,
             distinct: if top { self.ask.asked.distinct } else { None },
-            sbe: q.sbe,
+            // The subplanner plans a branch in the classic engine (so `q.sbe`
+            // is false for it), but keys it by whether the query runs in SBE.
+            sbe: if branch { self.ask.asked.sbe } else { q.sbe },
+            subplanner: branch,
         };
         let filter = if top { self.ask.filter } else { q.canonical };
         let implies = |partial: &Document| self.storage.query_implies_partial(filter, partial);

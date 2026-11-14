@@ -73,11 +73,12 @@ def _behind_sbe(client: Any) -> Any:
     return _entries(col)
 
 
-@pytest.mark.backlog("RM-429")
+@pytest.mark.backlog_fixed("RM-429")
 def test_an_or_branch_before_sbe_stages_is_cached(rust_mongo: Any, mongod: Any) -> None:
     """mongod 8.2.11 caches the branch of a rooted `$or` in front of a
     `$group` it runs in SBE as a classic entry (`worksType: "works"`) under
-    a key (`CA4248A6` here) that is neither the classic branch's
-    (`0B947F35`) nor the `s` key of the same clause; this server caches no
-    branch for such a pipeline."""
+    a key (`CA4248A6` here) whose shape ends in `o`, the flag
+    `encodeClassic` gives a subplanner's branch of an SBE-compatible query,
+    rather than `c` or `s`. This server cached no branch for such a
+    pipeline."""
     assert _behind_sbe(rust_mongo) == _behind_sbe(mongod)

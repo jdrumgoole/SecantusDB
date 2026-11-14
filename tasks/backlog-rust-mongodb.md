@@ -2458,16 +2458,6 @@ Still different, all 77:
       itself.
       Backlog-ID: RM-056
       Verify: none -- performance budget (timings against an earlier build)
-- [ ] **A rooted `$or` in front of stages SBE runs caches no branch.**
-      mongod 8.2.11 caches each branch as a classic entry (`worksType:
-      "works"`) under a key that is neither the classic branch's nor the `s`
-      key of the same clause with the pipeline's projection (`CA4248A6`
-      for the test's clause, where those two are `0B947F35` and
-      `6F377EC6`): its encoding is still to be found. Until then such a
-      branch is not cached here, so that it cannot share a classic
-      query's entry.
-      Backlog-ID: RM-429
-      Verify: tests/backlog/test_plan_cache_or_branches.py::test_an_or_branch_before_sbe_stages_is_cached
 - [ ] **`$planCacheStats` lists no `estimatedSizeBytes` on Linux.** The
       field is mongod's estimate of the entry's C++ objects, so its figure
       depends on how mongod was built (RM-341): this server reproduces

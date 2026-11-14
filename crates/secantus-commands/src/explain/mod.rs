@@ -817,6 +817,7 @@ fn cache_key_of(
         collation,
         distinct,
         sbe,
+        subplanner: false,
     };
     let ix = cache_key::Indexability {
         catalog: &full,
