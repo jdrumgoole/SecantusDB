@@ -62,7 +62,7 @@ def _replace_root_over_a_collection(client: Any) -> Any:
     return mongo_answer(explained)
 
 
-@pytest.mark.backlog("RM-536")
+@pytest.mark.backlog_fixed("RM-536")
 def test_a_match_moves_ahead_of_a_replace_root_into_the_query(
     rust_mongo: Any,
     mongod_rs: Any,  # noqa: F811
@@ -70,8 +70,9 @@ def test_a_match_moves_ahead_of_a_replace_root_into_the_query(
     """mongod 8.2.11 moves a `$match` behind `{$replaceRoot: {newRoot:
     "$x"}}` ahead of it, renamed onto `x` in an `$or` with `{x: {$type:
     [4]}}` and `{x: {$not: {$type: [3]}}}`, and the collection's query takes
-    it (`parsedQuery` is that `$or`). This server leaves the `$match` behind
-    the `$replaceRoot` and reads the whole collection."""
+    it (`parsedQuery` is that `$or`). This server left the `$match` behind
+    the `$replaceRoot` and read the whole collection until 2026-11-14: the
+    rewrite ran only after a pipeline's own source (RM-414)."""
     assert _replace_root_over_a_collection(rust_mongo) == _replace_root_over_a_collection(mongod_rs)
 
 
@@ -89,7 +90,7 @@ AS_WRITTEN = {
 }
 
 
-@pytest.mark.backlog("RM-537")
+@pytest.mark.backlog_fixed("RM-537")
 def test_a_pipeline_match_lists_its_clauses_as_written(
     rust_mongo: Any,
     mongod_rs: Any,  # noqa: F811
@@ -97,7 +98,8 @@ def test_a_pipeline_match_lists_its_clauses_as_written(
     """mongod 8.2.11 lists a pipeline's `$match` with its clauses in the
     order they were written (`{d: {$gt: 0}, c: 1}` as `$and: [d, c]`, an
     `$expr`'s `$_internalExprEq` ahead of the `$expr`); only a query's
-    `parsedQuery` is sorted. This server sorts them as `parsedQuery` does."""
+    `parsedQuery` is sorted. This server sorted them as `parsedQuery` does
+    until 2026-11-14."""
     assert _stages(rust_mongo, AS_WRITTEN, "queryPlanner") == _stages(
         mongod_rs, AS_WRITTEN, "queryPlanner"
     )
@@ -113,7 +115,7 @@ REWRITES = {
 }
 
 
-@pytest.mark.backlog("RM-538")
+@pytest.mark.backlog_fixed("RM-538")
 def test_the_pipeline_rewrites_mongod_lists(
     rust_mongo: Any,
     mongod_rs: Any,  # noqa: F811
@@ -122,7 +124,7 @@ def test_the_pipeline_rewrites_mongod_lists(
     into the `$sort` before it (`{$sort: {sortKey, limit: 1}}`), moves a
     `$match` on a field an `$addFields` / `$set` renames ahead of it onto
     the field it names, and lists `$sampleRate` as the `$expr` of `$rand`
-    it is. This server lists each stage as written."""
+    it is. This server listed each stage as written until 2026-11-14."""
     assert _stages(rust_mongo, REWRITES, "queryPlanner") == _stages(
         mongod_rs, REWRITES, "queryPlanner"
     )
@@ -145,7 +147,7 @@ DETAIL = {
 }
 
 
-@pytest.mark.backlog("RM-539")
+@pytest.mark.backlog_fixed("RM-539")
 def test_each_stage_reports_what_mongod_does(
     rust_mongo: Any,
     mongod_rs: Any,  # noqa: F811
@@ -155,9 +157,9 @@ def test_each_stage_reports_what_mongod_does(
     `$documents` as the stages it runs), a `$lookup` its
     `totalDocsExamined`, `totalKeysExamined`, `collectionScans` and
     `indexesUsed`, the `$group` a `$count` makes its memory figures, and a
-    `$sort` after `$documents` mongod's own size estimate. This server
-    leaves those out, and estimates the sort's size from the documents
-    alone."""
+    `$sort` after `$documents` mongod's own size estimate. This server left
+    those out, and estimated the sort's size from the documents' BSON,
+    until 2026-11-14."""
     assert _stages(rust_mongo, DETAIL, "executionStats") == _stages(
         mongod_rs, DETAIL, "executionStats"
     )

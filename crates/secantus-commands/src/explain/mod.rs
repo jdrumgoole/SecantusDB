@@ -37,6 +37,7 @@ pub(crate) mod plan_cache;
 mod sbe;
 mod shape;
 pub(crate) mod stream;
+mod sub_stages;
 pub(crate) mod summary;
 mod trial;
 
@@ -1600,18 +1601,36 @@ fn count_inline(
     pipeline: &[Document],
     options: &Document,
 ) -> i64 {
-    // The window's `$sort` runs as the `$sort` it is, and a `$match` moved
-    // ahead of a `$replaceRoot` as the `$match` it is.
+    // The window's `$sort` runs as the `$sort` it is, a `$match` moved
+    // ahead of a `$replaceRoot` as the `$match` it is, and a `$count` as
+    // the `$group` and `$project` mongod runs, whose `$group` reports its
+    // memory (RM-539).
     let stages: Vec<Bson> = pipeline
         .iter()
-        .map(|stage| {
+        .flat_map(|stage| {
             match (
                 stage.get(shape::WINDOW_SORT),
                 stage.get(hoist::PUSHED_MATCH),
+                stage.get_str("$count"),
             ) {
-                (Some(sort), _) => Bson::Document(doc! { "$sort": sort.clone() }),
-                (_, Some(filter)) => Bson::Document(doc! { "$match": filter.clone() }),
-                _ => Bson::Document(stage.clone()),
+                (Some(sort), _, _) => vec![Bson::Document(doc! { "$sort": sort.clone() })],
+                (_, Some(filter), _) => vec![Bson::Document(doc! { "$match": filter.clone() })],
+                // A name `$count` refuses runs as written, for its error.
+                (_, _, Ok(field))
+                    if stage.len() == 1
+                        && !field.is_empty()
+                        && !field.starts_with('$')
+                        && !field.contains('.')
+                        && field != "_id" =>
+                {
+                    vec![
+                        Bson::Document(
+                            doc! { "$group": { "_id": Bson::Null, field: { "$sum": 1 } } },
+                        ),
+                        Bson::Document(doc! { "$project": { field: true, "_id": false } }),
+                    ]
+                }
+                _ => vec![Bson::Document(stage.clone())],
             }
         })
         .collect();
@@ -2051,11 +2070,14 @@ fn reply_for(r: &Request, verbosity: Verbosity, ctx: &mut CommandContext) -> Han
                     spill_fields(&mut listed, spilled);
                 }
                 if let Some(n) = stage_counts.get(i) {
+                    let input = &r.pipeline[..taken + i];
+                    sub_stages::fill(ctx, &source, input, &s.options, stage, &mut listed);
                     counted(&mut listed, *n);
                 }
                 stages.push(Bson::Document(listed));
             }
         }
+        shape::fold_sort_limits(&mut stages);
         reply.insert("stages", stages);
         reply.insert("serverInfo", server_info(ctx));
         reply.insert("serverParameters", server_parameters(false));
@@ -2218,17 +2240,22 @@ fn sbe_reply(
         }
         stages.push(Bson::Document(listed));
     }
+    let taken = r.pipeline.len() - s.rest.len();
+    let source = Bson::String(s.coll.clone());
     for (i, stage) in s.rest.iter().enumerate().skip(p.pushed) {
         for mut listed in shape::listed_stage(stage, &db) {
             if let Some(spilled) = p.stage_spills.get(i) {
                 spill_fields(&mut listed, spilled);
             }
             if let Some(n) = p.stage_counts.get(i) {
+                let input = &r.pipeline[..taken + i];
+                sub_stages::fill(ctx, &source, input, &s.options, stage, &mut listed);
                 counted(&mut listed, *n);
             }
             stages.push(Bson::Document(listed));
         }
     }
+    shape::fold_sort_limits(&mut stages);
     reply.insert("stages", stages);
     reply.insert("serverInfo", server_info(ctx));
     reply.insert("serverParameters", server_parameters(false));
@@ -2827,7 +2854,7 @@ fn own_source_reply(
                     }
                 }
             }
-            let after: Vec<Document> = hoist::hoist_after_source(&after)
+            let after: Vec<Document> = hoist::hoist_matches(&after)
                 .into_iter()
                 .filter_map(|b| match b {
                     Bson::Document(d) => Some(d),
@@ -2891,11 +2918,14 @@ fn own_source_reply(
                 spill_fields(&mut listed, spilled);
             }
             if let Some(n) = counts.get(offset + i) {
+                let input = &run[..run_head.len() + i];
+                sub_stages::fill(ctx, target, input, &Document::new(), stage, &mut listed);
                 counted(&mut listed, *n);
             }
             stages.push(Bson::Document(listed));
         }
     }
+    shape::fold_sort_limits(&mut stages);
     let mut reply = doc! { "explainVersion": "1", "stages": stages };
     reply.insert("serverInfo", server_info(ctx));
     reply.insert("serverParameters", server_parameters(false));

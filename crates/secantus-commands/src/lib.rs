@@ -63,6 +63,7 @@ mod generic;
 mod hybrid;
 mod index_builds;
 mod index_filters;
+mod key_string;
 pub mod names;
 mod snapshot;
 #[cfg(any(target_os = "linux", test))]

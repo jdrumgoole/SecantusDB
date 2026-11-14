@@ -16,7 +16,7 @@
 //! the input passes through unchanged, deliberately — a half-right normaliser
 //! reads as authoritative while being wrong.
 
-use bson::{Bson, Document};
+use bson::{doc, Bson, Document};
 
 /// The order `$and`'s children come back in: mongod's `MatchExpression` type
 /// ordinal, then the path. So `{a: {$gt: 1}, b: 2}` reports `b`'s equality
@@ -441,6 +441,11 @@ fn clauses(filter: &Document) -> Vec<Document> {
                     }
                 }
             },
+            // The clause mongod parses it into (RM-538).
+            "$sampleRate" => match crate::expr_rewrite::sample_rate_clause(value) {
+                Some(parsed) => out.extend(clauses(&parsed)),
+                None => out.push(one("$sampleRate", value.clone())),
+            },
             other if other.starts_with('$') => out.push(one(other, value.clone())),
             other => out.extend(field_clauses(other, value)),
         }
@@ -506,6 +511,353 @@ pub fn canonical_match(filter: &Bson) -> Document {
     one(
         "$and",
         Bson::Array(expanded.into_iter().map(Bson::Document).collect()),
+    )
+}
+
+/// `filter` as mongod parses and optimises it for a pipeline `$match`
+/// (`DocumentSourceMatch`: `MatchExpression::optimize`, with no
+/// `sortTree`), which is how explain lists a `$match` the query does not
+/// take. Unlike `canonical_match` (the query's `parsedQuery`) nothing is
+/// sorted: clauses keep the order they were written in, and the tree is
+/// reshaped only as mongod 8.2's optimiser does it
+/// (`ListOfMatchExpression::getOptimizer`, `expression_tree.cpp`):
+///
+/// * an `$and` takes in the children of each `$and` among its children, and
+///   puts them AFTER its own (`{c: 1, $and: [{b: 1, a: 1}]}` is `[c, b, a]`),
+///   and an `$or` the same with `$or` children. `$all` and an `$expr` with
+///   index-usable twins (`[twin, $expr]`) parse to an `$and` of their own,
+///   and so go last too;
+/// * a constant is dropped where it changes nothing (`$alwaysTrue` from an
+///   `$and`, `$alwaysFalse` from an `$or` or a `$nor`), and decides the node
+///   where it decides the answer;
+/// * a node of one child is that child, and a `$nor` of one is its `$not`;
+/// * duplicates stay, and a `$nor` among other clauses stays a `$nor`;
+/// * an `$or`'s equalities and regexes on one path become that path's `$in`
+///   (`or_as_in`).
+///
+/// Leaves are parsed as `canonical_match` parses them. Measured on 8.2.11,
+/// 2026-11-14.
+pub fn match_as_written(filter: &Bson) -> Document {
+    let Bson::Document(doc) = filter else {
+        return Document::new();
+    };
+    written(doc)
+}
+
+/// One document's clauses, as the `$and` they parse to, optimised.
+fn written(doc: &Document) -> Document {
+    let mut children: Vec<Document> = Vec::new();
+    for (key, value) in doc {
+        match key.as_str() {
+            "$comment" => {}
+            "$and" | "$or" | "$nor" => {
+                let subs = match value {
+                    Bson::Array(subs) => subs.iter().filter_map(Bson::as_document).map(written),
+                    _ => {
+                        children.push(one(key, value.clone()));
+                        continue;
+                    }
+                };
+                children.push(optimized(key, subs.collect()));
+            }
+            "$expr" => match crate::expr_rewrite::expr_clauses(value) {
+                // A constant `$expr` optimises to an empty `$and` (`{}`), or
+                // to `$alwaysFalse`.
+                crate::expr_rewrite::ExprClauses::Constant(true) => children.push(Document::new()),
+                crate::expr_rewrite::ExprClauses::Constant(false) => {
+                    children.push(one("$alwaysFalse", Bson::Int32(1)))
+                }
+                crate::expr_rewrite::ExprClauses::Rewritten { expr, derived } => {
+                    // mongod's `ExprMatchExpression` optimises to an `$and`
+                    // of what `RewriteExpr` derives (one twin, or an `$and`
+                    // of several) and then itself, so one twin lists ahead
+                    // of the `$expr` and several after it.
+                    let mut twins: Vec<Document> = Vec::new();
+                    for twin in derived {
+                        match twin.iter().next() {
+                            Some((path, Bson::Document(p))) if p.contains_key("$in") => {
+                                twins.extend(field_clauses(path, &Bson::Document(p.clone())))
+                            }
+                            _ => twins.push(twin),
+                        }
+                    }
+                    let expr = one("$expr", expr);
+                    children.push(if twins.is_empty() {
+                        expr
+                    } else {
+                        optimized("$and", vec![optimized("$and", twins), expr])
+                    });
+                }
+            },
+            other if other.starts_with('$') => children.push(one(other, value.clone())),
+            path => children.extend(field_written(path, value)),
+        }
+    }
+    // A document of one clause parses to that clause, with no `$and` to
+    // drop a lone `$alwaysTrue` (measured 8.2.11).
+    if children.len() == 1 {
+        return children.pop().expect("one clause");
+    }
+    optimized("$and", children)
+}
+
+/// Whether an `$elemMatch` argument is its value form, which applies its
+/// operators to the elements themselves: its FIRST field is an operator,
+/// and not one of the pathless ones that take a whole document (mongod's
+/// `parseElemMatch`).
+fn elem_match_is_value(arg: &Document) -> bool {
+    arg.keys().next().is_some_and(|k| {
+        k.starts_with('$')
+            && !matches!(
+                k.as_str(),
+                "$and"
+                    | "$or"
+                    | "$nor"
+                    | "$expr"
+                    | "$where"
+                    | "$text"
+                    | "$comment"
+                    | "$jsonSchema"
+                    | "$alwaysTrue"
+                    | "$alwaysFalse"
+            )
+            && !k.starts_with("$_internal")
+    })
+}
+
+/// The clauses one `field: <value>` entry parses to, in the order written.
+fn field_written(path: &str, value: &Bson) -> Vec<Document> {
+    let Bson::Document(spec) = value else {
+        return field_clauses(path, value);
+    };
+    if !is_operator_doc(value) || spec.contains_key("$near") || spec.contains_key("$nearSphere") {
+        return field_clauses(path, value);
+    }
+    let mut out = Vec::new();
+    for (op, arg) in spec {
+        match (op.as_str(), arg) {
+            ("$options", _) => {}
+            ("$regex", _) => {
+                let mut clause = doc! { "$regex": arg.clone() };
+                if let Some(options) = spec.get("$options") {
+                    clause.insert("$options", options.clone());
+                }
+                out.extend(field_clauses(path, &Bson::Document(clause)));
+            }
+            // `$all` is an `$and` of its members.
+            ("$all", Bson::Array(items)) => {
+                let members = items
+                    .iter()
+                    .map(|member| match member {
+                        Bson::Document(d) if d.len() == 1 && d.contains_key("$elemMatch") => {
+                            let inner = d.get("$elemMatch").cloned().unwrap_or(Bson::Null);
+                            elem_match(path, &inner)
+                        }
+                        other => equal_to(path, other),
+                    })
+                    .collect();
+                out.push(if items.is_empty() {
+                    one("$alwaysFalse", Bson::Int32(1))
+                } else {
+                    optimized("$and", members)
+                });
+            }
+            ("$elemMatch", _) => out.push(elem_match(path, arg)),
+            // A `$not` of several operators is the `$not` of their `$and`.
+            ("$not", Bson::Document(inner))
+                if inner.keys().filter(|k| *k != "$options").count() > 1 =>
+            {
+                out.push(not_of(optimized(
+                    "$and",
+                    field_written(path, &Bson::Document(inner.clone())),
+                )))
+            }
+            // `$nin: []` is the `$not` of an `$alwaysFalse`, which has no
+            // path to print it under.
+            ("$nin", Bson::Array(items)) if items.is_empty() => out.push(doc! {
+                "$nor": [{ "$alwaysFalse": 1 }]
+            }),
+            _ => out.extend(field_clauses(path, &Bson::Document(one(op, arg.clone())))),
+        }
+    }
+    out
+}
+
+fn elem_match(path: &str, arg: &Bson) -> Document {
+    match arg {
+        Bson::Document(d) if !elem_match_is_value(d) => {
+            one(path, wrap("$elemMatch", Bson::Document(written(d))))
+        }
+        other => one(path, wrap("$elemMatch", other.clone())),
+    }
+}
+
+fn is_always(clause: &Document, which: &str) -> bool {
+    clause.len() == 1 && clause.contains_key(which)
+}
+
+fn trivially_true(clause: &Document) -> bool {
+    clause.is_empty() || is_always(clause, "$alwaysTrue")
+}
+
+/// The children of `clause` when it is a node of `kind` (`{kind: [...]}`).
+fn node_children(clause: &Document, kind: &str) -> Option<Vec<Document>> {
+    match clause.get(kind) {
+        Some(Bson::Array(items)) if clause.len() == 1 => Some(
+            items
+                .iter()
+                .filter_map(Bson::as_document)
+                .cloned()
+                .collect(),
+        ),
+        _ => None,
+    }
+}
+
+/// An `$and` / `$or` / `$nor` of these (already optimised) children,
+/// optimised as mongod's `ListOfMatchExpression::getOptimizer` does.
+fn optimized(kind: &str, children: Vec<Document>) -> Document {
+    let mut children = if kind == "$nor" {
+        children
+    } else {
+        let mut kept = Vec::new();
+        let mut absorbed = Vec::new();
+        for child in children {
+            match node_children(&child, kind) {
+                Some(grand) => absorbed.extend(grand),
+                None => kept.push(child),
+            }
+        }
+        kept.extend(absorbed);
+        kept
+    };
+    children.retain(|c| match kind {
+        "$and" => !trivially_true(c),
+        _ => !is_always(c, "$alwaysFalse"),
+    });
+    if children.is_empty() {
+        return if kind == "$or" {
+            one("$alwaysFalse", Bson::Int32(1))
+        } else {
+            Document::new()
+        };
+    }
+    if children.len() == 1 {
+        let only = children.pop().expect("one child");
+        if kind != "$nor" {
+            return only;
+        }
+        if !trivially_true(&only) {
+            return not_of(only);
+        }
+        children.push(only);
+    }
+    for child in &children {
+        match kind {
+            "$and" if is_always(child, "$alwaysFalse") => {
+                return one("$alwaysFalse", Bson::Int32(1))
+            }
+            "$or" if trivially_true(child) => return Document::new(),
+            "$nor" if trivially_true(child) => return one("$alwaysFalse", Bson::Int32(1)),
+            _ => {}
+        }
+    }
+    if kind == "$or" {
+        return or_as_in(children);
+    }
+    one(
+        kind,
+        Bson::Array(children.into_iter().map(Bson::Document).collect()),
+    )
+}
+
+/// The `$not` of `clause`: under its path where it has one, else a `$nor`
+/// of it (`NotMatchExpression`'s serialisation).
+fn not_of(clause: Document) -> Document {
+    match clause.iter().next() {
+        Some((path, pred)) if clause.len() == 1 && !path.starts_with('$') => {
+            one(path, wrap("$not", pred.clone()))
+        }
+        _ => one("$nor", Bson::Array(vec![Bson::Document(clause)])),
+    }
+}
+
+/// The value an `$or` branch may give an `$in` on its path: an equality to
+/// anything but a regex, or a regex.
+fn in_member(branch: &Document) -> Option<(String, Bson)> {
+    let [(path, Bson::Document(pred))] = branch.iter().collect::<Vec<_>>()[..] else {
+        return None;
+    };
+    if path.starts_with('$') {
+        return None;
+    }
+    if let (1, Some(v)) = (pred.len(), pred.get("$eq")) {
+        return (!matches!(v, Bson::RegularExpression(_))).then(|| (path.clone(), v.clone()));
+    }
+    let pattern = match pred.get("$regex")? {
+        Bson::String(s) => s.clone(),
+        Bson::RegularExpression(re) => re.pattern.clone(),
+        _ => return None,
+    };
+    let options = pred.get_str("$options").unwrap_or_default();
+    (pred.len() == 1 + usize::from(pred.contains_key("$options"))).then(|| {
+        (
+            path.clone(),
+            Bson::RegularExpression(bson::Regex {
+                pattern,
+                options: options.to_string(),
+            }),
+        )
+    })
+}
+
+/// mongod's rewrite of an `$or`'s equalities and regexes on one path into
+/// that path's `$in`. The `$or` lists the new `$in`s, then the branches no
+/// `$in` could take in the order written, then the equalities and regexes
+/// that were alone on their path.
+///
+/// mongod gathers them in an `stdx::unordered_map` keyed by path, and lists
+/// the `$in`s and the lone equalities in its iteration order, which changes
+/// from one mongod process to the next (measured 8.2.11, 2026-11-14: two
+/// runs listed `{$or: [{b: 1}, {a: 2}]}` as `[b, a]` and `[a, b]`). There is
+/// no order to match there; this lists each group in first-written order.
+fn or_as_in(children: Vec<Document>) -> Document {
+    let mut paths: Vec<(String, Vec<(Document, Bson)>)> = Vec::new();
+    let mut others: Vec<Document> = Vec::new();
+    for child in children {
+        let Some((path, value)) = in_member(&child) else {
+            others.push(child);
+            continue;
+        };
+        match paths.iter_mut().find(|(p, _)| *p == path) {
+            Some((_, members)) => members.push((child, value)),
+            None => paths.push((path, vec![(child, value)])),
+        }
+    }
+    let mut ins: Vec<Document> = Vec::new();
+    let mut alone: Vec<Document> = Vec::new();
+    for (path, mut members) in paths {
+        if members.len() == 1 {
+            alone.push(members.pop().expect("one").0);
+        } else {
+            let values = members.into_iter().map(|(_, v)| v).collect();
+            ins.push(one(&path, wrap("$in", Bson::Array(values))));
+        }
+    }
+    others.extend(alone);
+    if ins.is_empty() {
+        return one(
+            "$or",
+            Bson::Array(others.into_iter().map(Bson::Document).collect()),
+        );
+    }
+    if others.is_empty() && ins.len() == 1 {
+        return ins.pop().expect("one");
+    }
+    ins.extend(others);
+    one(
+        "$or",
+        Bson::Array(ins.into_iter().map(Bson::Document).collect()),
     )
 }
 
@@ -599,4 +951,124 @@ pub fn build_stage_tree(
         node = limit_stage;
     }
     node
+}
+
+#[cfg(test)]
+mod match_as_written_tests {
+    use super::match_as_written;
+    use bson::{doc, Bson, Document};
+
+    fn written(filter: Document) -> Document {
+        match_as_written(&Bson::Document(filter))
+    }
+
+    /// The shapes mongod 8.2.11 lists for a pipeline `$match` (measured
+    /// 2026-11-14), before the command layer's tidying.
+    #[test]
+    fn keeps_the_written_order_and_reshapes_as_mongod() {
+        let cases = [
+            (
+                doc! { "d": { "$gt": 0 }, "c": 1 },
+                doc! { "$and": [{ "d": { "$gt": 0 } }, { "c": { "$eq": 1 } }] },
+            ),
+            // An `$and`'s `$and` children go after its own.
+            (
+                doc! { "$and": [{ "b": 1 }, { "$and": [{ "z": 1 }, { "a": 1 }] }], "c": 1 },
+                doc! { "$and": [
+                    { "c": { "$eq": 1 } }, { "b": { "$eq": 1 } },
+                    { "z": { "$eq": 1 } }, { "a": { "$eq": 1 } },
+                ] },
+            ),
+            // An `$and` of one is that one, in its place.
+            (
+                doc! { "c": 1, "$and": [{ "b": 1 }], "d": 1 },
+                doc! { "$and": [{ "c": { "$eq": 1 } }, { "b": { "$eq": 1 } }, { "d": { "$eq": 1 } }] },
+            ),
+            // Duplicates stay.
+            (
+                doc! { "$and": [{ "b": 1 }, { "a": 1 }, { "b": 1 }] },
+                doc! { "$and": [{ "b": { "$eq": 1 } }, { "a": { "$eq": 1 } }, { "b": { "$eq": 1 } }] },
+            ),
+            // A `$nor` among other clauses stays one; a `$nor` of one is its `$not`.
+            (
+                doc! { "z": 1, "$nor": [{ "b": 1 }, { "a": 1 }] },
+                doc! { "$and": [
+                    { "z": { "$eq": 1 } },
+                    { "$nor": [{ "b": { "$eq": 1 } }, { "a": { "$eq": 1 } }] },
+                ] },
+            ),
+            (
+                doc! { "c": 1, "$nor": [{ "b": 1 }], "d": 1 },
+                doc! { "$and": [
+                    { "c": { "$eq": 1 } }, { "b": { "$not": { "$eq": 1 } } }, { "d": { "$eq": 1 } },
+                ] },
+            ),
+            (
+                doc! { "$nor": [{ "b": 1, "a": 2 }] },
+                doc! { "$nor": [{ "$and": [{ "b": { "$eq": 1 } }, { "a": { "$eq": 2 } }] }] },
+            ),
+            // `$all` is an `$and`, so it goes last.
+            (
+                doc! { "t": { "$all": [3, 1] }, "a": 1 },
+                doc! { "$and": [{ "a": { "$eq": 1 } }, { "t": { "$eq": 3 } }, { "t": { "$eq": 1 } }] },
+            ),
+            // An `$or`'s equalities on one path are an `$in`, listed first;
+            // an equality alone on its path goes last.
+            (
+                doc! { "$or": [{ "y": { "$gt": 1 } }, { "x": 2 }, { "x": 1 }] },
+                doc! { "$or": [{ "x": { "$in": [2, 1] } }, { "y": { "$gt": 1 } }] },
+            ),
+            (
+                doc! { "$or": [{ "x": 1 }, { "z": { "$gt": 1 } }, { "z": { "$gt": 1 } }] },
+                doc! { "$or": [
+                    { "z": { "$gt": 1 } }, { "z": { "$gt": 1 } }, { "x": { "$eq": 1 } },
+                ] },
+            ),
+            // An `$or` of `$alwaysFalse` and one clause is that clause.
+            (
+                doc! { "$or": [{ "a": { "$in": [] } }, { "b": { "$gt": 1 } }] },
+                doc! { "b": { "$gt": 1 } },
+            ),
+            // `$nin: []` is the `$not` of an `$alwaysFalse`.
+            (
+                doc! { "c": 1, "a": { "$nin": [] } },
+                doc! { "$and": [{ "c": { "$eq": 1 } }, { "$nor": [{ "$alwaysFalse": 1 }] }] },
+            ),
+            // A `$not` of two operators is the `$not` of their `$and`.
+            (
+                doc! { "a": { "$not": { "$lt": 9, "$gt": 3 } } },
+                doc! { "$nor": [{ "$and": [{ "a": { "$lt": 9 } }, { "a": { "$gt": 3 } }] }] },
+            ),
+            // An `$elemMatch` document whose first field is a path is a query.
+            (
+                doc! { "t": { "$elemMatch": { "b": 1, "$and": [{ "q": 1 }], "a": { "$gt": 0 } } } },
+                doc! { "t": { "$elemMatch": { "$and": [
+                    { "b": { "$eq": 1 } }, { "q": { "$eq": 1 } }, { "a": { "$gt": 0 } },
+                ] } } },
+            ),
+            (
+                doc! { "b": 1, "$comment": "x", "$alwaysTrue": 1, "a": 1 },
+                doc! { "$and": [{ "b": { "$eq": 1 } }, { "a": { "$eq": 1 } }] },
+            ),
+            (doc! { "$alwaysTrue": 1 }, doc! { "$alwaysTrue": 1 }),
+            (doc! { "$and": [{ "$alwaysTrue": 1 }] }, doc! {}),
+            (
+                doc! { "$or": [{ "$alwaysTrue": 1 }] },
+                doc! { "$alwaysTrue": 1 },
+            ),
+            (doc! { "$expr": true }, doc! {}),
+            (doc! { "$or": [{ "b": 1 }, { "$expr": true }] }, doc! {}),
+            (
+                doc! { "$nor": [{ "$expr": true }] },
+                doc! { "$alwaysFalse": 1 },
+            ),
+            (
+                doc! { "c": 1, "a": { "$in": [] } },
+                doc! { "$alwaysFalse": 1 },
+            ),
+        ];
+        for (filter, want) in cases {
+            assert_eq!(written(filter.clone()), want, "{filter}");
+        }
+    }
 }

@@ -228,7 +228,7 @@ fn build(
     if !query.rest.iter().all(streams) {
         return Ok(None);
     }
-    let hoisted = crate::explain::hoist::hoist_matches(ask.pipeline);
+    let hoisted = crate::explain::hoist::hoist_runnable(ask.pipeline);
     // The read and the stages SBE takes run in its engine, as when the
     // pipeline is read whole; a pipeline SBE takes part of is read whole.
     let pushed =
@@ -435,7 +435,7 @@ fn time_series(
     {
         return Ok(None);
     }
-    let hoisted = crate::explain::hoist::hoist_matches(ask.pipeline);
+    let hoisted = crate::explain::hoist::hoist_runnable(ask.pipeline);
     if crate::explain::sbe_pushdown(storage, ask.db, ask.coll, &hoisted, None, None).is_some() {
         return Ok(None);
     }

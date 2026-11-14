@@ -137,7 +137,9 @@ pub(crate) fn projection(rest: &[Document]) -> Option<Document> {
     for stage in rest {
         let (name, arg) = stage.iter().next()?;
         match (name.as_str(), arg) {
-            ("$match", Bson::Document(filter)) => {
+            // A `$match` moved ahead of a `$replaceRoot` reads as any other
+            // (measured 8.2.11, RM-536).
+            ("$match" | super::hoist::PUSHED_MATCH, Bson::Document(filter)) => {
                 let mut paths = Vec::new();
                 filter_paths(filter, &mut paths)?;
                 deps.read(paths);

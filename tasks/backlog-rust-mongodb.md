@@ -919,7 +919,7 @@ These are explicit non-goals. Don't add them without a reason.
         enumeration;
       - the other aggregates: one with a `$match` or `$redact` left after
         its read (mongod's optimizer moves some where this server's does
-        not: RM-538, RM-580), a `$limit` there (it stops its source short
+        not: RM-580), a `$limit` there (it stops its source short
         of the documents this server runs in one go), a `$lookup`,
         `$unionWith`, `$facet`, `$geoNear` or `$out` / `$merge`, a stage
         read whole that SBE does not take whole (a `$sort` after a
@@ -1926,55 +1926,61 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       RM-531.
       Verify: tests/backlog/test_rm_found_2026_11_14_rm531.py::test_a_run_time_error_names_the_commands_namespace
       Backlog-ID: RM-656
-- [ ] **A `$match` behind a `$replaceRoot` stays behind it over a
-      collection.** mongod 8.2.11 moves a `$match` behind
-      `{$replaceRoot: {newRoot: "$x"}}` (or `$replaceWith: "$x"`) ahead of
-      it, renamed onto `x` in an `$or` with `{x: {$type: [4]}}` and
-      `{x: {$not: {$type: [3]}}}` (which let through what the
-      `$replaceRoot` then refuses), and the collection's query takes it; it
-      also moves a `$skip` ahead of a `$project` / `$addFields` /
-      `$replaceRoot`. This server leaves both where they were written and
-      reads the whole collection. The rewrite runs for a collectionless
-      pipeline since RM-414 (`hoist::hoist_after_source`); over a collection
-      it would change the plan, so it is not applied there. Found
-      2026-11-10 (RM-414).
-      Verify: tests/backlog/test_rm_found_2026_11_10_explain_rewrites.py::test_a_match_moves_ahead_of_a_replace_root_into_the_query
-      Backlog-ID: RM-536
-- [ ] **A pipeline `$match` lists its clauses sorted.** mongod 8.2.11 lists
-      a `$match` stage's clauses in the order they were written
-      (`{d: {$gt: 0}, c: 1}` as `$and: [d, c]`; an `$expr`'s
-      `$_internalExprEq` ahead of the `$expr`; a `$match` moved ahead of a
-      `$replaceRoot` keeps its own order inside the `$or`); only a query's
-      `parsedQuery` is sorted. This server lists each with
-      `parsed::parsed_query`, which sorts (`canonical_match` and `tidy` sort
-      too). Found 2026-11-10 (RM-414).
-      (This was RM-444: `explain` lists a `$match` after the cursor with its
-      clauses sorted.) mongod 8.2.11 lists a `$match` stage it does not move
-      into the query (behind a `$group` or a `$limit`) with its clauses in the
-      order they were written, and an `$expr`'s `$_internalExprEq` ahead of
-      the `$expr`: `[{$limit: 3}, {$match: {x: {$exists: true}, y: 1}}]` lists
-      `$and: [{x: {$exists: true}}, {y: {$eq: 1}}]`. This server lists the
-      clauses in the order mongod gives only the query's `parsedQuery`
-      (`MatchExpression::sortTree`): `y` first, and the `$expr` before its
-      `$_internalExprEq`. The documents are the same. Found 2026-11-09 working
-      RM-311.
-      Verify: tests/backlog/test_rm_found_2026_11_10_explain_rewrites.py::test_a_pipeline_match_lists_its_clauses_as_written, tests/backlog/test_rm_found_2026_11_09.py::test_explain_lists_a_match_after_the_cursor_in_written_order
-      Backlog-ID: RM-537
-- [ ] **Explain lists stages mongod's optimizer rewrites as written.**
-      mongod 8.2.11 drops a `$replaceWith: "$$ROOT"`, folds a `$limit` into
-      the `$sort` before it (`{$sort: {sortKey, limit: 1}}`, no `$limit`
-      stage), moves a `$match` on a field an `$addFields` / `$set` renames
-      (`{b: "$a"}`) ahead of it onto `a`, and lists `$sampleRate: 0.5` as
-      `$expr: {$lt: [{$rand: {}}, {$const: 0.5}]}`. This server lists
-      each stage as written. Found 2026-11-10 (RM-414).
-      (This was RM-427: `explain` lists a `$sort` and the `$limit` after it as
-      two stages where the cursor does not absorb them.) mongod 8.2.11 lists
-      one `$sort: {sortKey, limit}` after a `$replaceRoot`, in a `$facet`
-      sub-pipeline, and after a `$rankFusion` (its own `$sort` takes the
-      `limit`), and the stages before it then count every document, not the
-      `limit` the `$limit` pulled. Found 2026-11-08 working RM-200.
-      Verify: tests/backlog/test_rm_found_2026_11_10_explain_rewrites.py::test_the_pipeline_rewrites_mongod_lists, tests/backlog/test_rm_found_2026_11_08_explain_listing.py::test_sort_and_limit_after_the_cursor_are_one_stage
-      Backlog-ID: RM-538
+- [ ] **A FETCH's residual `$or` lists its branches in `parsedQuery`'s
+      order.** mongod 8.2.11 lists the `$or` a FETCH filters by behind an
+      IXSCAN (`{k: {$gte: 2}, $or: [{"x.a": 1}, {x: {$type: [4]}}, {x: {$not:
+      {$type: [3]}}}]}` with an index on `k`) as `[{x: {$not: {$type: [3]}}},
+      {x: {$type: [4]}}, {"x.a": {$eq: 1}}]`, in a `find` and in the `$or` an
+      aggregate's `$replaceRoot` rewrite builds, though its `parsedQuery`
+      sorts the branches `x.a` first. This server lists the residual as
+      `parsedQuery` does. A rooted `$or` (SUBPLAN, COLLSCAN) agrees. Found
+      2026-11-14 working RM-536.
+      Verify: tests/backlog/test_rm_found_2026_11_14_rm536.py::test_a_residual_or_lists_its_branches_as_mongod_does
+      Backlog-ID: RM-658
+- [ ] **`explain` with `executionStats` answers where a `$replaceRoot`
+      fails.** mongod 8.2.11 runs the pipeline for `executionStats` and
+      returns the executor's error: `{$replaceRoot: {newRoot: "$x.b"}}` over
+      `{x: {a: 1, b: 1}}` is 40228, naming the document the read handed it
+      (`{x: {b: 1}}`), with no "Executor error" prefix. This server answers
+      with an `explain` document: `count_inline` (`explain/mod.rs`) takes a
+      run that failed for one of 0 documents, the root RM-617 (a
+      `$setWindowFields`) likely shares. Found 2026-11-14 working RM-536.
+      Verify: tests/backlog/test_rm_found_2026_11_14_rm536.py::test_explain_reports_a_replace_roots_run_time_error
+      Backlog-ID: RM-659
+- [ ] **A query's `parsedQuery` keeps three leaves as written.** mongod
+      8.2.11 parses an `$elemMatch` document whose FIRST field is a path as
+      a query (`{$elemMatch: {b: 1, $and: [{q: 1}], a: {$gt: 0}}}` is
+      `{$and: [b, q, a]}`; it is the value form only when the first field is
+      an operator other than `$and` / `$or` / `$nor` / `$expr` ...), a
+      `$not` of two operators as `{$nor: [{$and: [...]}]}`, and drops a
+      `{a: {$nin: []}}` beside another clause. This server's
+      `canonical_match` takes any `$`-key for the value form and echoes the
+      document, keeps `{$not: {$lt: 9, $gt: 3}}` whole, and keeps
+      `{a: {$not: {$in: []}}}` in the `$and`. A pipeline `$match`
+      (`match_as_written`) already parses all three as mongod does. Found
+      2026-11-14 working RM-537.
+      Verify: tests/backlog/test_rm_found_2026_11_14.py::test_parsed_query_parses_these_leaves_as_mongod
+      Backlog-ID: RM-660
+- [ ] **Explain lists a `$match` behind a `$group` or a `$$ROOT.x` new
+      root where mongod's optimizer does not leave it.** mongod 8.2.11 drops
+      a `$match` of nothing behind a `$group` (`{}`, and `{$sampleRate: 1}`,
+      which it parses into nothing), and its query then takes the whole
+      pipeline; it leaves `{$alwaysTrue: 1}` there, which this server moves
+      into the query. It moves a `$match` behind `{$replaceRoot: {newRoot:
+      "$$ROOT.x"}}` into the query renamed onto `x`, as behind `"$x"`
+      (RM-536), which this server leaves behind the stage. Found 2026-11-14
+      working RM-538.
+      Verify: tests/backlog/test_rm_found_2026_11_14_rm538.py::test_a_match_after_a_group_as_the_optimizer_leaves_it, tests/backlog/test_rm_found_2026_11_14_rm538.py::test_a_match_moves_ahead_of_a_root_variable_new_root
+      Backlog-ID: RM-662
+- [ ] **`explain` of a `$sampleRate` the run refuses succeeds.** mongod
+      8.2.11 refuses to explain `{$match: {$sampleRate: 2}}` (BadValue,
+      "numeric argument to $sampleRate must be in [0, 1]") and `{$sampleRate:
+      "x"}` (BadValue, "argument to $sampleRate must be a numeric type"), as
+      it refuses to run them; this server's run refuses both, but its
+      `explain` answers, listing the `$sampleRate` as written. Found
+      2026-11-14 working RM-538.
+      Verify: tests/backlog/test_rm_found_2026_11_14_rm538.py::test_explain_refuses_a_sample_rate_the_run_refuses
+      Backlog-ID: RM-663
 - [ ] **Explain leaves a `$match` after a `$redact` where it was
       written.** mongod 8.2.11 copies a `$match` that follows a `$redact`
       ahead of it and into the query (`[{$redact: "$$KEEP"}, {$match: {z:
@@ -1984,18 +1990,60 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       the collection so. Found 2026-11-12 (RM-360).
       Verify: tests/backlog/test_rm_found_2026_11_12_rm360.py::test_a_match_after_a_redact_is_copied_ahead_of_it
       Backlog-ID: RM-580
-- [ ] **Explain's stages lack some of mongod's statistics.** At
-      `executionStats` mongod 8.2.11 gives the stages inside a `$facet` and
-      a `$unionWith` their own `nReturned` (and lists the `$unionWith`'s
-      `$documents` as the `$queue` / `$project` / `$unwind` /
-      `$replaceRoot` it runs), a `$lookup` its `totalDocsExamined`,
-      `totalKeysExamined`, `collectionScans` and `indexesUsed`, the `$group`
-      a `$count` makes its `maxAccumulatorMemoryUsageBytes` and
-      `totalOutputDataSizeBytes`, and a `$sort` after `$documents` a
-      `totalDataSizeSortedBytesEstimate` of 245 for one document where this
-      server says 117. Found 2026-11-10 (RM-414).
-      Verify: tests/backlog/test_rm_found_2026_11_10_explain_rewrites.py::test_each_stage_reports_what_mongod_does
-      Backlog-ID: RM-539
+- [ ] **A `$unionWith` over a collection is explained as written.**
+      mongod 8.2.11 lists the pipeline a `$unionWith` runs over a
+      collection: a `$cursor` holding the query's own `queryPlanner` (and,
+      at `executionStats`, its `executionStats`), then the stages after it,
+      each with its `nReturned`; this server lists the stage as written
+      (`{$unionWith: "d"}`). One over `$documents` lists its stages since
+      RM-539. Found 2026-11-14 (RM-539).
+      Verify: tests/backlog/test_rm_found_2026_11_14_rm539.py::test_a_union_with_over_a_collection_lists_its_cursor
+      Backlog-ID: RM-681
+- [ ] **A `$lookup` over a collection reports nothing it examined.** At
+      `executionStats` mongod 8.2.11 gives a `$lookup` whose pipeline reads
+      a collection its `totalDocsExamined`, `totalKeysExamined`,
+      `collectionScans` and `indexesUsed`, summed over its runs: an
+      uncorrelated pipeline is run once and cached (2 documents, 1 scan for
+      3 outer documents), a correlated one at each (6 and 3). This server
+      reports them only for a pipeline over `$documents` (zeros, RM-539).
+      Found 2026-11-14 (RM-539).
+      Verify: tests/backlog/test_rm_found_2026_11_14_rm539.py::test_a_lookup_over_a_collection_reports_what_it_examined
+      Backlog-ID: RM-682
+- [ ] **A `$lookup` on `localField` / `foreignField` is explained as a
+      classic stage.** mongod 8.2.11 pushes it into SBE over a collection
+      and explains it so (`explainVersion` "2", no `stages`, an `EQ_LOOKUP`
+      on top of the query's plan); this server lists a `$cursor` and a
+      `$lookup` stage. Found 2026-11-14 (RM-539).
+      Verify: tests/backlog/test_rm_found_2026_11_14_rm539.py::test_a_lookup_on_join_fields_is_explained_as_sbe_runs_it
+      Backlog-ID: RM-683
+- [ ] **A 12-byte string is counted as held outside its `Value`.** mongod
+      8.2.11's classic `Value` keeps a string of up to 12 bytes inline (a
+      `$push` of one counts 136 bytes, a sort of a `$documents` document
+      holding one 245); `memlimit::SHORT_STR` is 11, so this server counts
+      36 bytes more for each such string, in every memory figure and
+      budget. Found 2026-11-14 (RM-539).
+      Verify: tests/backlog/test_rm_found_2026_11_14_rm539.py::test_a_twelve_byte_string_is_kept_in_its_value
+      Backlog-ID: RM-684
+- [ ] **A `$sort` that took a `$limit` reports the size of every document
+      it sorted.** mongod 8.2.11's `$sort` with a `limit` is a top-k sorter:
+      its `totalDataSizeSortedBytesEstimate` is the size of the documents it
+      keeps (490 for two `$documents` documents of 245), and 0 for a `limit`
+      of 1, in a `$facet` and outside one. Since RM-538 (2026-11-14) this
+      server lists the one `{$sort: {sortKey, limit}}` mongod does, but
+      measures each stage from a run that stops at it, so the `$sort` counts
+      every document it took (735 for three). Found 2026-11-14 (RM-539,
+      RM-538; the fold was RM-685).
+      Verify: tests/backlog/test_rm_found_2026_11_14_rm538.py::test_a_top_k_sort_reports_the_documents_it_keeps
+      Backlog-ID: RM-689
+- [ ] **A run of `$documents` counts its documents as read BSON.** mongod
+      8.2.11 counts each document a `$documents` makes as the storage its
+      expression object built (`metrics.query.sort.totalBytesSorted` grows
+      by 490 for `[{a: 1, b: 3}, {a: 2}]` sorted, as explain reports since
+      RM-539); `run_segmented` evaluates the stage and hands the documents
+      on as read, so a run counts 255, and its memory budget is held to
+      that. Found 2026-11-14 (RM-539).
+      Verify: tests/backlog/test_rm_found_2026_11_14_rm539.py::test_a_documents_sort_counts_the_documents_built
+      Backlog-ID: RM-686
 - [ ] **The operation rows `currentOp` lists lack mongod's detail.** Since
       2026-10-20 a registry of running operations stands behind
       `currentOp`, `$currentOp` (with `idleCursors`) and `killOp`, which
@@ -2012,27 +2060,23 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
         options are not applied.
       Backlog-ID: RM-216
       Verify: none -- the missing fields are mongod's internal accounting; the registry's own tests are backlog_fixed
-- [ ] **`dbCheck` refuses `extraIndexKeysCheck`, and `applyOps` some entries.**
-      mongod 8.2.11 (one-member replica set) runs `dbCheck` with
-      `validateMode: "extraIndexKeysCheck"` (115 here): it walks the named
-      index in batches of `maxDocsPerBatch` keys, a batch ending only where
-      the key changes, and writes a `batch` oplog entry per batch whose `md5`
-      is the MD5 of the batch's keys as KeyString V1 bytes, each with its
-      `kEnd` discriminator (4) and without its RecordId (checked by hand for
-      int keys, 2026-11-10), with `batchStart` / `batchEnd` /
-      `lastKeyChecked` as keys; an index that does not exist gets a
-      `dbCheckBatch` warning in `local.system.healthlog`. Building it needs a
-      KeyString encoder for every BSON type (key_string.cpp's doubles and
-      Decimal128 included) and each index kind's keys (hashed, 2dsphere,
-      wildcard, collated). mongod also takes `applyOps` `importCollection`,
+- [ ] **`dbCheck` `extraIndexKeysCheck` refuses Decimal128 keys and geo / wildcard indexes; `applyOps` some entries.**
+      Since 2026-11-14 the check walks an ascending, descending, compound,
+      multikey, sparse, partial or collated index as mongod 8.2.11 does
+      (KeyString V1 bytes, `crates/secantus-commands/src/key_string.rs`).
+      Open: a key holding a Decimal128 is refused (115; mongod encodes it,
+      a decimal equal to a double with the double's bytes, others with
+      key_string.cpp's decimal continuations), and so is a `2dsphere`,
+      `2d` or wildcard index, whose keys need each kind's key generator.
+      mongod also takes `applyOps` `importCollection`,
       `createDatabaseMetadata` and `modifyCollectionShardingIndexCatalog`
       entries (115 here). `dbCheck` also runs before it answers (mongod runs
       it in the background), walks a database's collections in name order
       (mongod's is its catalog's internal order) and does not apply
       `maxBytesPerBatch` / `maxBatchTimeMillis` / `maxCountPerSecond`.
-      Carried over from RM-219 when its last commands landed, 2026-11-08.
-      Verify: tests/backlog/test_rm_219_diag_query_settings.py::test_db_check_extra_index_keys
-      Backlog-ID: RM-416
+      Carried over from RM-416, 2026-11-14.
+      Verify: tests/backlog/test_rm_219_diag_query_settings.py::test_db_check_extra_index_keys_remainder, tests/backlog/test_rm_219_diag_query_settings.py::test_apply_ops_other_entries
+      Backlog-ID: RM-688
 - [ ] **`applyOps` applies a `u` replacement of a missing document.** A `u`
       entry whose `o` is a whole document with `o2`'s `_id`, for a document
       that does not exist and without `b: true`, is inserted here; mongod

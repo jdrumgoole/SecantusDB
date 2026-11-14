@@ -70,6 +70,10 @@ enum Held {
     /// A sub-document's storage, which the field's `Value` points at, and
     /// any other `Value` set from it.
     Document(Rc<RefCell<Stored>>),
+    /// An array an expression built (`RCVector`): what each element holds,
+    /// a document an expression object built its own storage, which an
+    /// `$unwind` hands to the field it sets (RM-539).
+    Array(Vec<Held>),
 }
 
 impl Held {
@@ -77,6 +81,13 @@ impl Held {
         match self {
             Held::Bytes(n) => *n,
             Held::Document(s) => s.borrow().approximate(),
+            Held::Array(items) => {
+                memlimit::RC_VECTOR
+                    + items
+                        .iter()
+                        .map(|h| memlimit::VALUE + h.size())
+                        .sum::<usize>()
+            }
         }
     }
 
@@ -340,6 +351,45 @@ impl Stored {
             .map(|(_, h)| h.clone())
     }
 
+    /// `name` set to `v`, the value `expr` evaluated to
+    /// (`MutableDocument::setField` with an expression's result): a document
+    /// or an array the expression built keeps its own storage
+    /// ([`produced_held`]).
+    pub fn set_produced(&mut self, name: &str, expr: &Bson, v: &Bson) {
+        self.set_held(name, produced(expr, v));
+    }
+
+    /// `name`, a cached array an expression built, set to its element `at`
+    /// of `of` (`UnwindProcessor`: `setNestedField` with the element's
+    /// `Value`, which shares a document's storage). False when the cache
+    /// holds no such array, and nothing is set.
+    pub fn unwind_element(&mut self, name: &str, at: usize, of: usize) -> bool {
+        let element = match self.cached(name) {
+            Some(Held::Array(items)) if items.len() == of => items[at].clone(),
+            _ => return false,
+        };
+        self.set_held(name, element);
+        true
+    }
+
+    /// The storage of the sub-document at the dotted `path` of `doc`, the
+    /// document this storage holds, read into the cache (`$replaceRoot:
+    /// {newRoot: "$path"}`: the new root is that sub-document's storage).
+    /// `None` when the cache holds no sub-document there.
+    pub fn root(&mut self, doc: &Document, path: &str) -> Option<Stored> {
+        self.read_path(doc, path);
+        self.shared(path).map(|s| s.borrow().clone())
+    }
+
+    /// The storage of the document `expr`, an expression object, built as
+    /// `v` (`ExpressionObject::evaluate`). `None` for any other expression.
+    pub fn produced_root(expr: &Bson, v: &Bson) -> Option<Stored> {
+        match produced(expr, v) {
+            Held::Document(s) => Some(s.borrow().clone()),
+            _ => None,
+        }
+    }
+
     /// Whether a stage wrote to the document.
     pub fn modified(&self) -> bool {
         self.modified
@@ -388,23 +438,26 @@ fn is_object_expression(expr: &Document) -> bool {
 /// field added, a missing value too); an array literal builds a vector of
 /// its elements. Anything else is sized as a value read from BSON.
 pub fn produced_held(expr: &Bson, v: &Bson) -> usize {
+    produced(expr, v).size()
+}
+
+/// What `v`, the value `expr` evaluated to, holds, as [`produced_held`]
+/// counts it: with the storage of each document an expression object built.
+fn produced(expr: &Bson, v: &Bson) -> Held {
     match (expr, v) {
         (Bson::Document(e), Bson::Document(d)) if is_object_expression(e) => {
             let mut s = Stored::built();
             for (k, sub) in e {
-                let h = d.get(k).map_or(0, |val| produced_held(sub, val));
-                s.add_field(k, h);
+                let h = d.get(k).map_or(Held::Bytes(0), |val| produced(sub, val));
+                s.modified = true;
+                s.append(k, h);
             }
-            s.approximate()
+            Held::Document(Rc::new(RefCell::new(s)))
         }
         (Bson::Array(es), Bson::Array(vs)) if es.len() == vs.len() => {
-            memlimit::RC_VECTOR
-                + es.iter()
-                    .zip(vs)
-                    .map(|(e, v)| memlimit::VALUE + produced_held(e, v))
-                    .sum::<usize>()
+            Held::Array(es.iter().zip(vs).map(|(e, v)| produced(e, v)).collect())
         }
-        _ => held(v),
+        _ => Held::Bytes(held(v)),
     }
 }
 

@@ -616,7 +616,10 @@ fn stages_after_read(spec: &Spec, db: &str, user: &[Document], token: &Document)
             .next()
             .and_then(|s| s.get_document("$match").ok().cloned())
     };
-    let (front, rest) = match run.first().filter(|s| s.contains_key("$match")) {
+    // A `$match` moved ahead of a `$replaceRoot` joins the event types too
+    // (measured 8.2.11, RM-536).
+    let leads = |s: &&Document| s.contains_key("$match") || s.contains_key(hoist::PUSHED_MATCH);
+    let (front, rest) = match run.first().filter(leads) {
         Some(stage) => (listed_match(stage), &run[1..]),
         None => (None, &run[..]),
     };

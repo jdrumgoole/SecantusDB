@@ -301,13 +301,16 @@ fn is_paging(stage: &Document) -> bool {
 }
 
 /// A stage that hands on one document for each it reads: a `$skip` or
-/// `$limit` behind it may go ahead of it (`$score` too, RM-200).
+/// `$limit` behind it may go ahead of it (`$score` too, RM-200; a
+/// `$replaceRoot` / `$replaceWith`, measured 8.2.11, RM-536).
 fn keeps_count(stage: &Document) -> bool {
     [
         "$project",
         "$unset",
         "$addFields",
         "$set",
+        "$replaceRoot",
+        "$replaceWith",
         "$_secantusScore",
     ]
     .iter()
@@ -327,7 +330,10 @@ fn query_ahead(ahead: &[Bson]) -> bool {
         if is_paging(d) {
             paged = true;
             true
-        } else if d.contains_key("$match") || d.contains_key("$sort") || d.contains_key(WINDOW_SORT)
+        } else if d.contains_key("$match")
+            || d.contains_key(super::hoist::PUSHED_MATCH)
+            || d.contains_key("$sort")
+            || d.contains_key(WINDOW_SORT)
         {
             !paged
         } else {
@@ -395,7 +401,11 @@ pub(crate) fn absorb(shape: &mut Shape, pipeline: &[Document]) {
         };
         let paged = shape.skip > 0 || limit.is_some();
         match (name.as_str(), arg) {
-            ("$match", Bson::Document(m)) if !paged && shape.projection.is_none() => {
+            // A `$match` moved ahead of a `$replaceRoot` is the query's as
+            // any other (measured 8.2.11, RM-536).
+            ("$match" | super::hoist::PUSHED_MATCH, Bson::Document(m))
+                if !paged && shape.projection.is_none() =>
+            {
                 if !m.is_empty() {
                     filters.push(m.clone());
                 }
@@ -740,6 +750,88 @@ fn listed_internal_window(spec: &Document) -> Document {
     out
 }
 
+/// The listed stages with each `$sort` and the `$limit` it takes as one
+/// `$sort` with that `limit`, as mongod lists a `$sort` that absorbed a
+/// `$limit` (measured 8.2.11, RM-538: `{$sort: {sortKey: {a: -1}, limit:
+/// 1}}`). [`super::hoist::hoist_matches`] moved each `$limit` a `$sort`
+/// takes to stand behind it; the `$sort` a `$rankFusion` or `$scoreFusion`
+/// lists is followed by stages of its own (a `$replaceRoot`, a `$project`),
+/// which the `$limit` passes as it does a pipeline's, a `$skip`'s amount
+/// added to it. A window's `$sort` (`outputSortKeyMetadata`) takes none.
+/// The stages the `$limit` passed return no more than it lets through.
+pub(crate) fn fold_sort_limits(stages: &mut Vec<Bson>) {
+    let name = |s: &Bson| {
+        s.as_document()
+            .and_then(|d| d.keys().next().cloned())
+            .unwrap_or_default()
+    };
+    let amount = |s: &Bson, op: &str| s.as_document().and_then(|d| d.get(op)).and_then(as_i64);
+    let mut i = 0;
+    while i < stages.len() {
+        let takes = stages[i]
+            .as_document()
+            .and_then(|d| d.get_document("$sort").ok())
+            .is_some_and(|spec| {
+                spec.contains_key("sortKey")
+                    && !spec.contains_key("limit")
+                    && !spec.contains_key("outputSortKeyMetadata")
+            });
+        if !takes {
+            i += 1;
+            continue;
+        }
+        let mut skipped = 0_i64;
+        let mut j = i + 1;
+        let mut found = None;
+        while j < stages.len() {
+            match name(&stages[j]).as_str() {
+                "$skip" => match amount(&stages[j], "$skip").and_then(|n| skipped.checked_add(n)) {
+                    Some(sum) => skipped = sum,
+                    None => break,
+                },
+                "$limit" => {
+                    found = amount(&stages[j], "$limit")
+                        .and_then(|n| n.checked_add(skipped))
+                        .map(|total| (j, total));
+                    break;
+                }
+                "$project" | "$addFields" | "$set" | "$replaceRoot" | "$lookup" => {}
+                _ => break,
+            }
+            j += 1;
+        }
+        let Some((at, total)) = found else {
+            i += 1;
+            continue;
+        };
+        let removed = stages.remove(at);
+        let let_through = removed
+            .as_document()
+            .and_then(|d| d.get("nReturned"))
+            .and_then(as_i64);
+        // Each passed stage returns no more than what the `$limit` let
+        // through and the `$skip`s between it and the `$limit` dropped.
+        let mut dropped = 0_i64;
+        for k in (i..at).rev() {
+            let stage = &mut stages[k];
+            if let (Some(n), Some(Bson::Document(d))) = (let_through, Some(&mut *stage)) {
+                if let Some(own) = d.get("nReturned").and_then(as_i64) {
+                    d.insert("nReturned", Bson::Int64(own.min(n + dropped)));
+                }
+            }
+            if name(stage) == "$skip" {
+                dropped += amount(stage, "$skip").unwrap_or(0);
+            }
+        }
+        if let Some(Bson::Document(stage)) = stages.get_mut(i) {
+            if let Ok(spec) = stage.get_document_mut("$sort") {
+                spec.insert("limit", Bson::Int64(total));
+            }
+        }
+        i += 1;
+    }
+}
+
 /// A stage the planner left in the pipeline, as `explain` lists it: the
 /// stages mongod parses it into, each printed as mongod prints it back
 /// (measured 8.2.11).
@@ -784,7 +876,7 @@ pub(crate) fn listed_stage(stage: &Document, db: &str) -> Vec<Document> {
             one(doc! { "$sample": out })
         }
         ("$match", Bson::Document(filter)) => {
-            one(doc! { "$match": super::parsed::parsed_query(filter) })
+            one(doc! { "$match": super::parsed::parsed_match_stage(filter) })
         }
         (super::hoist::PUSHED_MATCH, Bson::Document(filter)) => {
             one(doc! { "$match": filter.clone() })
@@ -860,12 +952,59 @@ pub(crate) fn listed_stage(stage: &Document, db: &str) -> Vec<Document> {
                     return one(stage.clone());
                 };
                 let mut listed = vec![Bson::Document(doc! { "$internalFacetTeeConsumer": {} })];
-                for s in stages.iter().filter_map(Bson::as_document) {
+                // mongod optimizes the sub-pipeline as it does a pipeline
+                // (RM-538).
+                for s in super::hoist::optimized_sub_pipeline(stages)
+                    .iter()
+                    .filter_map(Bson::as_document)
+                {
                     listed.extend(listed_stage(s, db).into_iter().map(Bson::Document));
                 }
+                fold_sort_limits(&mut listed);
                 out.insert(field.clone(), listed);
             }
             one(doc! { "$facet": out })
+        }
+        // A `$unionWith` whose pipeline makes its own documents lists the
+        // stages it runs, `$documents` as the four it is (measured 8.2.11,
+        // RM-539). One over a collection lists its `$cursor` (RM-681).
+        ("$unionWith", Bson::Document(spec))
+            if !spec.contains_key("coll")
+                && spec
+                    .get_array("pipeline")
+                    .ok()
+                    .and_then(|p| p.first())
+                    .and_then(Bson::as_document)
+                    .is_some_and(|s| s.contains_key("$documents")) =>
+        {
+            // Optimized as a pipeline of its own: the `$replaceRoot` of
+            // `$documents` is one of the stages a `$match` moves ahead of.
+            let mut out = spec.clone();
+            let sub: Vec<&Document> = spec
+                .get_array("pipeline")
+                .into_iter()
+                .flatten()
+                .filter_map(Bson::as_document)
+                .collect();
+            let mut stages: Vec<Document> =
+                sub.first().map(|s| listed_stage(s, db)).unwrap_or_default();
+            stages.truncate(3);
+            let rest: Vec<Bson> = sub[1..]
+                .iter()
+                .map(|s| Bson::Document((*s).clone()))
+                .collect();
+            let mut after = desugared(&rest);
+            after.insert(
+                0,
+                Bson::Document(doc! { "$replaceRoot": { "newRoot": "$_tempDocumentsField" } }),
+            );
+            for stage in super::hoist::hoist_matches(&after) {
+                if let Bson::Document(d) = stage {
+                    stages.extend(listed_stage(&d, db));
+                }
+            }
+            out.insert("pipeline", stages);
+            one(doc! { "$unionWith": out })
         }
         // mongod's order, with the `let` a pipeline always has and the
         // `$cmd.aggregate` a `$lookup` without `from` reads (RM-413, 8.2.11).

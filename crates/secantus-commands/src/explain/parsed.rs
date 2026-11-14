@@ -43,17 +43,27 @@ fn branch_rank(branch: &Bson) -> (i32, String) {
     (op, key.clone())
 }
 
-/// One operator document, rewritten as mongod prints it. `sorted_in` is
-/// whether an `$in` lists its values sorted and once each, as `parsedQuery`
-/// does; mongod's query-tree text (`debug_string`) keeps them as written.
-fn operator(mut d: Document, sorted_in: bool) -> Document {
+/// How a parsed tree is printed.
+#[derive(Clone, Copy)]
+struct Style {
+    /// Whether an `$in` lists its values sorted and once each, as
+    /// `parsedQuery` and a pipeline `$match` do; mongod's query-tree text
+    /// (`debug_string`) keeps them as written.
+    sorted_in: bool,
+    /// Whether siblings are sorted (`MatchExpression::sortTree`), as in
+    /// `parsedQuery`; a pipeline `$match` keeps them as written.
+    sorted: bool,
+}
+
+/// One operator document, rewritten as mongod prints it.
+fn operator(mut d: Document, style: Style) -> Document {
     // `{$exists: false}` is `{$not: {$exists: true}}`.
     if d.len() == 1 && d.get("$exists").is_some_and(|v| !crate::util::truthy(v)) {
         return doc! { "$not": { "$exists": true } };
     }
     // `$in` lists its values once each, in sort order: `[1, 1.0]` is one
     // value, and so an equality (measured 8.2.11, 2026-11-08).
-    if let (true, Some(Bson::Array(items))) = (sorted_in, d.get_mut("$in")) {
+    if let (true, Some(Bson::Array(items))) = (style.sorted_in, d.get_mut("$in")) {
         items.sort_by(cmp);
         items.dedup_by(|a, b| sort_key(a) == sort_key(b));
     }
@@ -113,36 +123,36 @@ fn operator(mut d: Document, sorted_in: bool) -> Document {
             ),
             // The value form of `$elemMatch` sorts its operators.
             ("$elemMatch", Bson::Document(inner)) if inner.keys().all(|x| x.starts_with('$')) => {
-                let mut pairs: Vec<(String, Bson)> =
-                    operator(inner, sorted_in).into_iter().collect();
-                pairs.sort_by_key(|(op, _)| rank(op));
+                let mut pairs: Vec<(String, Bson)> = operator(inner, style).into_iter().collect();
+                if style.sorted {
+                    pairs.sort_by_key(|(op, _)| rank(op));
+                }
                 Bson::Document(pairs.into_iter().collect())
             }
             // The branches of `$or` and `$nor` sort like `$and`'s children.
             ("$or" | "$nor", Bson::Array(items)) => {
-                let mut branches: Vec<Bson> =
-                    items.into_iter().map(|b| tidy(b, sorted_in)).collect();
-                branches.sort_by_key(branch_rank);
+                let mut branches: Vec<Bson> = items.into_iter().map(|b| tidy(b, style)).collect();
+                if style.sorted {
+                    branches.sort_by_key(branch_rank);
+                }
                 Bson::Array(branches)
             }
-            (_, other) => tidy(other, sorted_in),
+            (_, other) => tidy(other, style),
         };
         out.insert(k, v);
     }
     out
 }
 
-fn tidy(value: Bson, sorted_in: bool) -> Bson {
+fn tidy(value: Bson, style: Style) -> Bson {
     match value {
         Bson::Document(d) if d.keys().next().is_some_and(|k| k.starts_with('$')) => {
-            Bson::Document(operator(d, sorted_in))
+            Bson::Document(operator(d, style))
         }
-        Bson::Document(d) => Bson::Document(
-            d.into_iter()
-                .map(|(k, v)| (k, tidy(v, sorted_in)))
-                .collect(),
-        ),
-        Bson::Array(a) => Bson::Array(a.into_iter().map(|v| tidy(v, sorted_in)).collect()),
+        Bson::Document(d) => {
+            Bson::Document(d.into_iter().map(|(k, v)| (k, tidy(v, style))).collect())
+        }
+        Bson::Array(a) => Bson::Array(a.into_iter().map(|v| tidy(v, style)).collect()),
         other => other,
     }
 }
@@ -186,6 +196,22 @@ pub(crate) fn parsed_query_as_written(filter: &Document) -> Document {
     parsed(filter, false)
 }
 
+/// A pipeline `$match` as explain lists it, where the query does not take
+/// it: parsed and optimised as `parsedQuery` is, but not sorted
+/// (`secantus_core::match_as_written`), so its clauses keep the order they
+/// were written in (measured 8.2.11, 2026-11-14).
+pub(crate) fn parsed_match_stage(filter: &Document) -> Document {
+    let written = secantus_core::match_as_written(&Bson::Document(with_schemas_parsed(filter)));
+    let style = Style {
+        sorted_in: true,
+        sorted: false,
+    };
+    match tidy(Bson::Document(written), style) {
+        Bson::Document(d) => d,
+        _ => Document::new(),
+    }
+}
+
 fn parsed(filter: &Document, sorted_in: bool) -> Document {
     let lone = filter.len() == 1 && !filter.contains_key("$and");
     let canonical = drop_always_true(
@@ -203,7 +229,11 @@ fn parsed(filter: &Document, sorted_in: bool) -> Document {
             return doc! { "$nor": [{ "$alwaysFalse": 1 }] };
         }
     }
-    match tidy(Bson::Document(canonical), sorted_in) {
+    let style = Style {
+        sorted_in,
+        sorted: true,
+    };
+    match tidy(Bson::Document(canonical), style) {
         Bson::Document(d) => optimize(d, sorted_in),
         _ => Document::new(),
     }

@@ -748,12 +748,79 @@ def _db_check_extra_keys(client: Any) -> Any:
     ]
 
 
-@pytest.mark.backlog("RM-416")
+@pytest.mark.backlog_fixed("RM-416")
 def test_db_check_extra_index_keys(rust_mongo: Any, mongod_rs: Any) -> None:  # noqa: F811
-    """mongod 8.2 runs `dbCheck`'s `extraIndexKeysCheck`: a batch entry per
+    """mongod 8.2 ran `dbCheck`'s `extraIndexKeysCheck`: a batch entry per
     run of index keys, ending on a key boundary, each carrying the MD5 of
-    the batch's KeyString-encoded keys."""
+    the batch's KeyString-encoded keys. The wider sweep is
+    `tests/mongod_live/test_db_check_extra_index_keys.py`."""
     assert _db_check_extra_keys(rust_mongo) == _db_check_extra_keys(mongod_rs)
+
+
+def _db_check_extra_keys_remainder(client: Any) -> list:
+    db = client["rm416r"]
+    client.drop_database("rm416r")
+    out: list = []
+    cases = [
+        (
+            "dec",
+            [{"_id": 1, "x": bson.Decimal128("1.5")}, {"_id": 2, "x": bson.Decimal128("0.1")}],
+            "x",
+        ),
+        ("geo", [{"_id": 1, "x": {"type": "Point", "coordinates": [1, 2]}}], [("x", "2dsphere")]),
+        ("flat", [{"_id": 1, "x": [1, 2]}], [("x", "2d")]),
+        ("wild", [{"_id": 1, "x": 1, "y": "a"}], [("$**", 1)]),
+    ]
+    for name, docs, key in cases:
+        db[name].insert_many(docs)
+        index = db[name].create_index(key)
+        try:
+            db.command(
+                {"dbCheck": name, "validateMode": "extraIndexKeysCheck", "secondaryIndex": index}
+            )
+        except pymongo.errors.OperationFailure as e:
+            out.append((name, "err", e.code))
+            continue
+        ns = f"rm416r.{name}"
+        deadline = time.monotonic() + 10
+        while True:
+            entries = [e["o"] for e in client.local["oplog.rs"].find({"o.dbCheck": ns})]
+            if any(o.get("type") == "stop" for o in entries) or time.monotonic() > deadline:
+                break
+            time.sleep(0.05)
+        out.append(
+            (name, [(o["md5"], o["lastKeyChecked"]) for o in entries if o.get("type") == "batch"])
+        )
+    client.drop_database("rm416r")
+    return out
+
+
+@pytest.mark.backlog("RM-688")
+def test_db_check_extra_index_keys_remainder(rust_mongo: Any, mongod_rs: Any) -> None:  # noqa: F811
+    """mongod 8.2 runs `extraIndexKeysCheck` over Decimal128 keys and over
+    2dsphere, 2d and wildcard indexes; this server refuses them (115)."""
+    assert _db_check_extra_keys_remainder(rust_mongo) == _db_check_extra_keys_remainder(mongod_rs)
+
+
+def _apply_ops_other_entries(client: Any) -> list:
+    out = []
+    for entry in [
+        {"op": "c", "ns": "rm416o.$cmd", "o": {"createDatabaseMetadata": "rm416o"}},
+        {"op": "c", "ns": "rm416o.$cmd", "o": {"importCollection": "rm416o.c"}},
+    ]:
+        try:
+            client.admin.command("applyOps", [entry])
+            out.append("ok")
+        except pymongo.errors.OperationFailure as e:
+            out.append(e.code)
+    return out
+
+
+@pytest.mark.backlog("RM-688")
+def test_apply_ops_other_entries(rust_mongo: Any, mongod_rs: Any) -> None:  # noqa: F811
+    """mongod 8.2 parses `applyOps` `createDatabaseMetadata` and
+    `importCollection` entries; this server refuses them as unknown (115)."""
+    assert _apply_ops_other_entries(rust_mongo) == _apply_ops_other_entries(mongod_rs)
 
 
 def _update_entries(client: Any) -> dict:

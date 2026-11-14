@@ -396,7 +396,15 @@ pub fn apply_pipeline(
         // inclusion `$project`, RM-519.)
         let modelled = matches!(
             name.as_str(),
-            "$match" | "$unwind" | "$addFields" | "$set" | "$unset" | "$limit" | "$skip"
+            "$match"
+                | "$unwind"
+                | "$addFields"
+                | "$set"
+                | "$unset"
+                | "$limit"
+                | "$skip"
+                | "$replaceRoot"
+                | "$replaceWith"
         ) || name == crate::sbe::ENGINE_STAGE
             || name == INHIBIT_OPTIMIZATION
             || (name == "$project"
@@ -876,6 +884,11 @@ fn stored_stage(
                     kept.push(inc.apply(&d, &s, o, vars));
                 }
             }
+            "$replaceRoot" | "$replaceWith" => {
+                if let [o] = one.as_slice() {
+                    kept.push(replaced_storage(name, spec, &d, s, o));
+                }
+            }
             _ => kept.extend(std::iter::repeat_n(s, one.len())),
         }
         out.extend(one);
@@ -908,9 +921,12 @@ fn unwound_storage(
     let array = matches!(paths::get_path(input, &path), Some(Bson::Array(_)));
     Ok(out
         .iter()
-        .map(|o| {
+        .enumerate()
+        .map(|(at, o)| {
             let mut c = s.clone();
-            if array {
+            // An element of an array an expression built is a `Value` of
+            // its own storage, which the field set to it shares (RM-539).
+            if array && !(path == top && c.unwind_element(top, at, out.len())) {
                 c.set_field(top, field_held(o, top));
             }
             if let Some(ix) = &index {
@@ -920,6 +936,36 @@ fn unwound_storage(
             c
         })
         .collect())
+}
+
+/// The storage of the document `$replaceRoot` / `$replaceWith` makes of
+/// `input` (RM-539): a field path's sub-document is its own storage, which
+/// the new root is (an element an `$unwind` took from an array an
+/// expression built, as a `$documents` gives); an expression object builds
+/// one; `$$ROOT` is the document itself. Any other new root is counted as
+/// read BSON.
+fn replaced_storage(
+    name: &str,
+    spec: &Bson,
+    input: &Document,
+    mut s: docstore::Stored,
+    out: &Document,
+) -> docstore::Stored {
+    let root = match name {
+        "$replaceRoot" => spec.as_document().and_then(|d| d.get("newRoot")),
+        _ => Some(spec),
+    };
+    let found = match root {
+        Some(Bson::String(p)) if p == "$$ROOT" || p == "$$CURRENT" => return s,
+        Some(Bson::String(p)) if p.starts_with('$') && !p.starts_with("$$") => {
+            s.root(input, &p[1..])
+        }
+        Some(expr @ Bson::Document(_)) => {
+            docstore::Stored::produced_root(expr, &Bson::Document(out.clone()))
+        }
+        _ => None,
+    };
+    found.unwrap_or_else(|| docstore::Stored::read(memlimit::bson_len(out)))
 }
 
 /// The storage of what `$addFields` / `$set` makes of `input`
@@ -967,8 +1013,10 @@ fn added_storage(
         };
         if top == k {
             if !shares(&mut s) {
-                let held = out.get(k).map_or(0, |v| docstore::produced_held(expr, v));
-                s.set_field(k, held);
+                match out.get(k) {
+                    Some(v) => s.set_produced(k, expr, v),
+                    None => s.set_field(k, 0),
+                }
             }
         } else {
             let leaf = paths::get_path(out, k).map_or(0, |v| docstore::produced_held(expr, v));
@@ -2814,6 +2862,33 @@ mod tests {
             });
             assert_eq!(report.keys_sorted, 6, "limit {k}");
         }
+    }
+
+    #[test]
+    fn a_sort_after_documents_counts_the_documents_an_expression_built() {
+        // `$documents` is an array of expression objects `$unwind`ed and
+        // made the root: each document is the storage its expression object
+        // built, whatever its BSON (mongod 8.2.11, `totalDataSizeSortedBytes
+        // Estimate` of `[{$documents: ...}, {$sort: {a: 1}}]`, RM-539).
+        let sorted = |docs: Bson| {
+            let pipeline = vec![
+                Bson::Document(doc! {"$addFields": {"_tempDocumentsField": docs}}),
+                Bson::Document(doc! {"$unwind": "$_tempDocumentsField"}),
+                Bson::Document(doc! {"$replaceRoot": {"newRoot": "$_tempDocumentsField"}}),
+                Bson::Document(doc! {"$sort": {"a": 1}}),
+            ];
+            memlimit::captured(|| run(vec![Document::new()], pipeline))
+                .1
+                .sort_total_data_size
+        };
+        assert_eq!(sorted(bson::bson!([{"a": 1, "b": 3}, {"a": 2}])), 490);
+        assert_eq!(sorted(bson::bson!([{"b": 1}])), 245);
+        assert_eq!(sorted(bson::bson!([{"a": 1, "b": 2, "c": 3, "d": 4}])), 373);
+        assert_eq!(sorted(bson::bson!([{"a": 1, "s": {"x": 1}}])), 482);
+        assert_eq!(sorted(bson::bson!([{"a": 1, "s": [1, 2]}])), 317);
+        assert_eq!(sorted(bson::bson!([{"a": 1, "s": "x".repeat(40)}])), 309);
+        let deep = bson::bson!([{"a": 2, "s": {"x": "y", "t": [1, {"q": 2}]}, "e": [], "n": null}]);
+        assert_eq!(sorted(deep), 959);
     }
 
     #[test]

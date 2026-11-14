@@ -194,7 +194,7 @@ fn through_replace_root(filter: &Document, pushed: bool, root: &str) -> Option<D
     let filter = if pushed {
         filter.clone()
     } else {
-        super::parsed::parsed_query(filter)
+        super::parsed::parsed_match_stage(filter)
     };
     if filter.is_empty() {
         return Some(filter);
@@ -218,8 +218,13 @@ fn through_replace_root(filter: &Document, pushed: bool, root: &str) -> Option<D
 
 /// What a stage a `$match` can move ahead of does to the fields.
 enum Reshape {
-    /// It writes or removes these paths and leaves the rest.
-    Writes(Vec<String>),
+    /// It writes or removes the paths `written` and leaves the rest, and
+    /// names fields for others in `renamed` (an `$addFields` / `$set` of
+    /// `{w: "$x"}`: `w` is `x`).
+    Writes {
+        written: Vec<String>,
+        renamed: Vec<(String, String)>,
+    },
     /// It keeps only these paths (an inclusion `$project`), and names these
     /// fields for others (`{w: "$x"}`: `w` is `x`).
     Keeps {
@@ -425,6 +430,15 @@ fn expr_through_projection(
         let (new, old) = renamed.iter().find(|(new, _)| within(p, new))?;
         Some(format!("{old}{}", &p[new.len()..]))
     };
+    expr_rewritten(v, &path_to)
+}
+
+/// An aggregation expression with each field path it reads as `path_to`
+/// gives it ahead of a stage, or `None` when it reads one the stage makes,
+/// reads the whole document, or draws a random number: mongod moves no
+/// predicate that does (8.2 `expression::isIndependentOf`, measured 8.2.11:
+/// `{$sampleRate: 0.5}` stays behind a `$set`, `$project` or `$sort`).
+fn expr_rewritten(v: &Bson, path_to: &dyn Fn(&str) -> Option<String>) -> Option<Bson> {
     match v {
         Bson::String(s) if s.starts_with("$$") => {
             let rest = &s[2..];
@@ -448,21 +462,22 @@ fn expr_through_projection(
         }
         Bson::Array(items) => items
             .iter()
-            .map(|i| expr_through_projection(i, kept, renamed))
+            .map(|i| expr_rewritten(i, path_to))
             .collect::<Option<Vec<_>>>()
             .map(Bson::Array),
         Bson::Document(d) if d.contains_key("$literal") => Some(v.clone()),
+        Bson::Document(d) if d.contains_key("$rand") => None,
         Bson::Document(d) if d.contains_key("$_internalFindAllValuesAtPath") => {
             let mut read = Vec::new();
             expr_paths(v, &mut read)?;
             read.iter()
-                .all(|r| kept.iter().any(|k| within(r, k)))
+                .all(|r| path_to(r).as_deref() == Some(r.as_str()))
                 .then(|| v.clone())
         }
         Bson::Document(d) => {
             let mut out = Document::new();
             for (k, i) in d {
-                out.insert(k.clone(), expr_through_projection(i, kept, renamed)?);
+                out.insert(k.clone(), expr_rewritten(i, path_to)?);
             }
             Some(Bson::Document(out))
         }
@@ -470,25 +485,46 @@ fn expr_through_projection(
     }
 }
 
+/// A stage that writes `written` and renames nothing.
+fn writes(written: Vec<String>) -> Reshape {
+    Reshape::Writes {
+        written,
+        renamed: Vec::new(),
+    }
+}
+
 fn reshapes(stage: &Bson) -> Option<Reshape> {
     let d = stage.as_document().filter(|d| d.len() == 1)?;
     if let Some(unwind) = d.get("$unwind") {
-        return unwind_paths(unwind).map(Reshape::Writes);
+        return unwind_paths(unwind).map(writes);
     }
     if let Ok(spec) = d
         .get_document("$addFields")
         .or_else(|_| d.get_document("$set"))
     {
-        return Some(Reshape::Writes(spec.keys().cloned().collect()));
+        // A field set to a field path of one component renames it (mongod
+        // 8.2 `ExpressionFieldPath::getComputedPaths`, as a `$group` key's;
+        // measured 8.2.11: `{$set: {q: "$b"}}` moves `{q: 1}` ahead as `{b:
+        // 1}`, `{q: "$x.a"}` and `{q: {r: "$b"}}` move nothing).
+        let mut renamed = Vec::new();
+        for (k, v) in spec {
+            if !k.contains('.') && matches!(v, Bson::String(_)) {
+                key_renames(k, v, &mut renamed);
+            }
+        }
+        return Some(Reshape::Writes {
+            written: spec.keys().cloned().collect(),
+            renamed,
+        });
     }
     match d.get("$unset")? {
-        Bson::String(p) => return Some(Reshape::Writes(vec![p.clone()])),
+        Bson::String(p) => return Some(writes(vec![p.clone()])),
         Bson::Array(ps) => {
             return ps
                 .iter()
                 .map(|p| p.as_str().map(str::to_string))
                 .collect::<Option<Vec<_>>>()
-                .map(Reshape::Writes)
+                .map(writes)
         }
         _ => {}
     }
@@ -521,7 +557,7 @@ fn projects(stage: &Bson) -> Option<Reshape> {
             .filter(|(_, v)| flag(v) == Some(false))
             .map(|(k, _)| k.clone())
             .collect();
-        return Some(Reshape::Writes(removed));
+        return Some(writes(removed));
     }
     let mut kept = Vec::new();
     let mut renamed = Vec::new();
@@ -588,25 +624,259 @@ fn through_projection(
         .then(|| doc! { key: value.clone() })
 }
 
+/// `clause` as it reads ahead of a stage that writes `written` and renames
+/// `renamed` ([`Reshape::Writes`]), or `None` when it reads something the
+/// stage writes and does not rename: a clause on a renamed field reads the
+/// field it names, inside a logical clause or an `$expr` too (mongod 8.2
+/// `applyRenamesToExpression`; measured 8.2.11).
+fn through_writes(
+    key: &str,
+    value: &Bson,
+    written: &[String],
+    renamed: &[(String, String)],
+) -> Option<Document> {
+    let within = |r: &str, p: &str| r == p || r.starts_with(&format!("{p}."));
+    let path_to = |p: &str| -> Option<String> {
+        if !written.iter().any(|w| paths_overlap(p, w)) {
+            return Some(p.to_string());
+        }
+        let (new, old) = renamed.iter().find(|(new, _)| within(p, new))?;
+        Some(format!("{old}{}", &p[new.len()..]))
+    };
+    if !key.starts_with('$') {
+        return Some(doc! { path_to(key)?: value.clone() });
+    }
+    match key {
+        "$and" | "$or" | "$nor" => {
+            let children = value
+                .as_array()?
+                .iter()
+                .map(|c| {
+                    move_whole(c.as_document()?, &|k, v| {
+                        through_writes(k, v, written, renamed)
+                    })
+                    .map(Bson::Document)
+                })
+                .collect::<Option<Vec<_>>>()?;
+            return Some(doc! { key: children });
+        }
+        "$expr" => return expr_rewritten(value, &path_to).map(|e| doc! { "$expr": e }),
+        _ => {}
+    }
+    let mut read = Vec::new();
+    clause_paths(key, value, &mut read)?;
+    read.iter()
+        .all(|r| path_to(r).as_deref() == Some(r.as_str()))
+        .then(|| doc! { key: value.clone() })
+}
+
+/// Whether a filter draws a random number (an `$expr` of `$rand`, a
+/// `$sampleRate`), which mongod never moves ([`expr_rewritten`]).
+fn draws_random(filter: &Document) -> bool {
+    filter.iter().any(|(k, v)| match k.as_str() {
+        "$expr" => secantus_core::expr_rewrite::draws_random(v),
+        "$sampleRate" => true,
+        "$and" | "$or" | "$nor" => v
+            .as_array()
+            .is_some_and(|cs| cs.iter().filter_map(Bson::as_document).any(draws_random)),
+        _ => false,
+    })
+}
+
+/// `filter` with each `$sampleRate` the clause mongod parses it into
+/// ([`secantus_core::expr_rewrite::sample_rate_clause`]): mongod moves and
+/// lists the parsed clause, `{$expr: {$lt: [{$rand: {}}, p]}}`, which a
+/// rate of 0 makes `{$alwaysFalse: 1}` and a rate of 1 nothing (measured
+/// 8.2.11, RM-538). A rate the run refuses is left for it to refuse.
+fn sample_rates_parsed(filter: &Document) -> Document {
+    let mut out = Document::new();
+    let mut more: Vec<Document> = Vec::new();
+    for (k, v) in filter {
+        match (k.as_str(), v) {
+            ("$sampleRate", rate) => {
+                let Some(parsed) = secantus_core::expr_rewrite::sample_rate_clause(rate) else {
+                    out.insert(k.clone(), v.clone());
+                    continue;
+                };
+                for (pk, pv) in parsed {
+                    if out.contains_key(&pk) || filter.contains_key(&pk) {
+                        more.push(doc! { pk: pv });
+                    } else {
+                        out.insert(pk, pv);
+                    }
+                }
+            }
+            ("$and" | "$or" | "$nor", Bson::Array(cs)) => {
+                let cs: Vec<Bson> = cs
+                    .iter()
+                    .map(|c| match c {
+                        Bson::Document(d) => Bson::Document(sample_rates_parsed(d)),
+                        other => other.clone(),
+                    })
+                    .collect();
+                out.insert(k.clone(), cs);
+            }
+            _ => {
+                out.insert(k.clone(), v.clone());
+            }
+        }
+    }
+    if more.is_empty() {
+        return out;
+    }
+    more.insert(0, out);
+    doc! { "$and": more.into_iter().map(Bson::Document).collect::<Vec<_>>() }
+}
+
+/// Whether a stage is a `$replaceRoot` / `$replaceWith` of the document
+/// itself (`$$ROOT`, `$$CURRENT`), which mongod's optimizer drops (measured
+/// 8.2.11, RM-538: `[{$replaceWith: "$$ROOT"}, {$match: {a: 1}}]` is the
+/// query `{a: {$eq: 1}}` and no stage).
+fn replaces_with_itself(stage: &Bson) -> bool {
+    let Some(d) = stage.as_document().filter(|d| d.len() == 1) else {
+        return false;
+    };
+    let root = match (d.get_document("$replaceRoot"), d.get("$replaceWith")) {
+        (Ok(spec), _) if spec.len() == 1 => spec.get("newRoot"),
+        (Err(_), Some(root)) => Some(root),
+        _ => None,
+    };
+    matches!(root, Some(Bson::String(s)) if s == "$$ROOT" || s == "$$CURRENT")
+}
+
+/// A stage that takes a `$limit` behind it as its own (mongod 8.2
+/// `DocumentSourceSort::doOptimizeAt`): a `$sort`, and the `$sort` that a
+/// `$sortByCount` or a `$bucket` ends with.
+fn takes_limit(stage: &Bson) -> bool {
+    stage
+        .as_document()
+        .filter(|d| d.len() == 1)
+        .is_some_and(|d| {
+            matches!(d.get("$sort"), Some(Bson::Document(_)))
+                || d.contains_key("$sortByCount")
+                || d.contains_key("$bucket")
+        })
+}
+
+/// A stage a `$limit` moves ahead of, to the `$sort` before it
+/// (`canSwapWithSkippingOrLimitingStage`): one that hands on one document
+/// for each it reads (measured 8.2.11: a `$project`, `$addFields`, `$set`,
+/// `$replaceRoot`, a `$lookup`; not an `$unwind`, `$group` or `$match`).
+fn limit_passes(stage: &Bson) -> bool {
+    transforms_one_by_one(stage)
+        || stage
+            .as_document()
+            .is_some_and(|d| d.len() == 1 && d.contains_key("$lookup"))
+}
+
+fn paging_amount(stage: &Bson, name: &str) -> Option<i64> {
+    stage
+        .as_document()
+        .filter(|d| d.len() == 1)
+        .and_then(|d| d.get(name))
+        .and_then(crate::util::as_i64)
+}
+
+/// `stages` with each `$limit` a `$sort` takes moved to stand right behind
+/// it, as mongod 8.2's `$sort` absorbs it (`DocumentSourceSort::doOptimizeAt`,
+/// measured 8.2.11, RM-538): over the stages a limit passes
+/// ([`limit_passes`]) and over a `$skip`, whose amount the limit then
+/// counts too (`[$sort, $skip: 1, $limit: 2]` is `$sort` with `limit: 3`,
+/// then the `$skip`), the smallest limit kept when there are several. An
+/// `explain` lists the `$sort` and the `$limit` behind it as one
+/// (`shape::fold_sort_limits`).
+fn sorts_take_limits(stages: &mut Vec<Bson>) {
+    let mut i = 0;
+    while i < stages.len() {
+        if !takes_limit(&stages[i]) {
+            i += 1;
+            continue;
+        }
+        let mut taken: Option<i64> = None;
+        let mut j = i + 1;
+        let mut skipped = 0_i64;
+        while j < stages.len() {
+            if let Some(n) = paging_amount(&stages[j], "$skip") {
+                match skipped.checked_add(n) {
+                    Some(sum) => {
+                        skipped = sum;
+                        j += 1;
+                        continue;
+                    }
+                    None => break,
+                }
+            }
+            if let Some(n) = paging_amount(&stages[j], "$limit") {
+                let Some(total) = n.checked_add(skipped) else {
+                    break;
+                };
+                stages.remove(j);
+                let limit = taken.map_or(total, |t| t.min(total));
+                let stage = Bson::Document(doc! { "$limit": Bson::Int64(limit) });
+                if taken.is_some() {
+                    stages[i + 1] = stage;
+                } else {
+                    stages.insert(i + 1, stage);
+                }
+                taken = Some(limit);
+                j = i + 2;
+                skipped = 0;
+                continue;
+            }
+            if !limit_passes(&stages[j]) {
+                break;
+            }
+            j += 1;
+        }
+        i += if taken.is_some() { 2 } else { 1 };
+    }
+}
+
 /// The pipeline as mongod reorders its front: a `$match` behind an
 /// `$addFields` / `$set` moves ahead of it, the clauses that read nothing
 /// the stage writes, and the `$match`es that lead are joined into one, which
 /// the read of the collection then takes (measured 8.2.11 by `explain`:
 /// `[{$addFields: {z: 1}}, {$match: {b: 2, z: 1}}]` reads `{b: 2}` and leaves
 /// `{z: 1}` behind the stage), and one behind a `$group` moves ahead of it
-/// onto the fields its key renames (RM-311).
+/// onto the fields its key renames (RM-311). A `$match` also moves ahead of
+/// a `$replaceRoot` of a field path, rewritten ([`through_replace_root`]),
+/// and a `$skip` ahead of a stage that transforms each document into one,
+/// over a collection as after a pipeline's own source (`$documents`, which
+/// is a `$replaceRoot` from `_tempDocumentsField` by then): measured 8.2.11,
+/// RM-414 and RM-536. A `$match` moved ahead of a `$replaceRoot` is a
+/// [`PUSHED_MATCH`]; [`runnable`] makes it the `$match` it is.
 pub(crate) fn hoist_matches(pipeline: &[Bson]) -> Vec<Bson> {
-    hoist(pipeline, false)
+    hoist(pipeline)
 }
 
-/// The stages after a pipeline's own source (`$documents`, which is a
-/// `$replaceRoot` from `_tempDocumentsField` by then, `$queryStats`, ...)
-/// as mongod reorders them: as [`hoist_matches`] does, and besides, a
-/// `$match` moves ahead of a `$replaceRoot` of a field path, rewritten
-/// ([`through_replace_root`]), and a `$skip` ahead of a stage that
-/// transforms each document into one (measured 8.2.11, RM-414).
-pub(crate) fn hoist_after_source(pipeline: &[Bson]) -> Vec<Bson> {
-    hoist(pipeline, true)
+/// A `$facet` sub-pipeline as mongod's optimizer leaves it, for `explain`
+/// to list: without a `$replaceRoot` of the document itself, and with each
+/// `$limit` its `$sort` takes behind it (RM-538).
+pub(crate) fn optimized_sub_pipeline(stages: &[Bson]) -> Vec<Bson> {
+    let mut out: Vec<Bson> = stages
+        .iter()
+        .filter(|s| !replaces_with_itself(s))
+        .cloned()
+        .collect();
+    sorts_take_limits(&mut out);
+    out
+}
+
+/// [`hoist_matches`], for a caller that runs the stages rather than lists
+/// them: each [`PUSHED_MATCH`] the `$match` it is.
+pub(crate) fn hoist_runnable(pipeline: &[Bson]) -> Vec<Bson> {
+    runnable(hoist(pipeline))
+}
+
+/// `stages` with each [`PUSHED_MATCH`] the `$match` it runs as.
+pub(crate) fn runnable(stages: Vec<Bson>) -> Vec<Bson> {
+    stages
+        .into_iter()
+        .map(|stage| {
+            let pushed = as_match(&stage).filter(|_| is_pushed(&stage)).cloned();
+            pushed.map_or(stage, |filter| Bson::Document(doc! { "$match": filter }))
+        })
+        .collect()
 }
 
 /// `pipeline` without each `$sort` a later one overrides, as mongod's
@@ -729,8 +999,19 @@ fn overridden(after: &[Bson]) -> bool {
     false
 }
 
-fn hoist(pipeline: &[Bson], after_source: bool) -> Vec<Bson> {
-    let mut out = drop_overridden_sorts(pipeline);
+fn hoist(pipeline: &[Bson]) -> Vec<Bson> {
+    let mut out: Vec<Bson> = drop_overridden_sorts(pipeline)
+        .into_iter()
+        .filter(|s| !replaces_with_itself(s))
+        .map(
+            |s| match s.as_document().and_then(|d| d.get_document("$match").ok()) {
+                Some(m) if draws_random(m) => {
+                    Bson::Document(doc! { "$match": sample_rates_parsed(m) })
+                }
+                _ => s,
+            },
+        )
+        .collect();
     // A `$skip` / `$limit` is a wall a `$match` never crosses, but mongod
     // still moves one behind it ahead of the stages after it (8.2.11:
     // `[{$limit: 3}, {$project: {x: 1}}, {$match: {x: 1}}]` lists `$match`
@@ -747,7 +1028,7 @@ fn hoist(pipeline: &[Bson], after_source: bool) -> Vec<Bson> {
             || projects(s).is_some()
             || groups(s).is_some()
             || as_sort(s).is_some()
-            || (after_source && transforms_one_by_one(s))
+            || transforms_one_by_one(s)
     };
     'again: loop {
         for at in 1..out.len() {
@@ -771,7 +1052,7 @@ fn hoist(pipeline: &[Bson], after_source: bool) -> Vec<Bson> {
                     continue 'again;
                 }
             }
-            if after_source && is_skip(&out[at]) && transforms_one_by_one(&out[at - 1]) {
+            if is_skip(&out[at]) && transforms_one_by_one(&out[at - 1]) {
                 out.swap(at - 1, at);
                 continue 'again;
             }
@@ -779,7 +1060,7 @@ fn hoist(pipeline: &[Bson], after_source: bool) -> Vec<Bson> {
                 continue;
             };
             let pushed = is_pushed(&out[at]);
-            if let Some(root) = new_root_path(&out[at - 1]).filter(|_| after_source) {
+            if let Some(root) = new_root_path(&out[at - 1]) {
                 let Some(moved) = through_replace_root(m, pushed, root) else {
                     continue;
                 };
@@ -791,15 +1072,20 @@ fn hoist(pipeline: &[Bson], after_source: bool) -> Vec<Bson> {
             let key = if pushed { PUSHED_MATCH } else { "$match" };
             // A `$match` behind a `$sort` goes ahead of it (measured 8.2.11:
             // `[{$project: {x: 1}}, {$sort: {x: 1}}, {$match: {x: 1}}]`
-            // reads `{x: 1}`).
-            if as_sort(&out[at - 1]).is_some() {
+            // reads `{x: 1}`), all but what draws a random number.
+            let sorted = as_sort(&out[at - 1]).is_some();
+            if sorted && !draws_random(m) {
                 out.swap(at - 1, at);
                 continue 'again;
             }
-            let Some(reshape) = reshapes(&out[at - 1])
-                .or_else(|| projects(&out[at - 1]))
-                .or_else(|| groups(&out[at - 1]))
-            else {
+            let Some(reshape) = (if sorted {
+                Some(writes(Vec::new()))
+            } else {
+                None
+            })
+            .or_else(|| reshapes(&out[at - 1]))
+            .or_else(|| projects(&out[at - 1]))
+            .or_else(|| groups(&out[at - 1])) else {
                 continue;
             };
             if let Reshape::Groups { id_fields, .. } = &reshape {
@@ -808,14 +1094,7 @@ fn hoist(pipeline: &[Bson], after_source: bool) -> Vec<Bson> {
                 }
             }
             let movable = |k: &str, v: &Bson| match &reshape {
-                Reshape::Writes(written) => {
-                    let mut read = Vec::new();
-                    (clause_paths(k, v, &mut read).is_some()
-                        && !read
-                            .iter()
-                            .any(|r| written.iter().any(|w| paths_overlap(r, w))))
-                    .then(|| doc! { k: v.clone() })
-                }
+                Reshape::Writes { written, renamed } => through_writes(k, v, written, renamed),
                 Reshape::Keeps {
                     kept: names,
                     renamed,
@@ -872,6 +1151,7 @@ fn hoist(pipeline: &[Bson], after_source: bool) -> Vec<Bson> {
         };
         out.splice(..lead, [Bson::Document(doc! { key: joined })]);
     }
+    sorts_take_limits(&mut out);
     out
 }
 
@@ -893,8 +1173,8 @@ pub(crate) fn unwind_paths(unwind: &Bson) -> Option<Vec<String>> {
 #[cfg(test)]
 mod tests {
     use super::{
-        drop_overridden_sorts, drop_overridden_sorts_everywhere, hoist_after_source, hoist_matches,
-        PUSHED_MATCH,
+        drop_overridden_sorts, drop_overridden_sorts_everywhere, hoist_matches,
+        optimized_sub_pipeline, runnable, PUSHED_MATCH,
     };
     use bson::{doc, Bson};
 
@@ -1001,11 +1281,11 @@ mod tests {
         let eq =
             |f: &str, v: i32| Bson::from(doc! { format!("_tempDocumentsField.{f}"): { "$eq": v } });
         assert_eq!(
-            hoist_after_source(&[root(), doc! { "$match": { "a": 1 } }.into()]),
+            hoist_matches(&[root(), doc! { "$match": { "a": 1 } }.into()]),
             vec![guarded(vec![t4.clone(), n3.clone(), eq("a", 1)]), root()]
         );
         assert_eq!(
-            hoist_after_source(&[root(), doc! { "$match": { "a": { "$gte": 1 } } }.into()]),
+            hoist_matches(&[root(), doc! { "$match": { "a": { "$gte": 1 } } }.into()]),
             vec![
                 guarded(vec![
                     doc! { "_tempDocumentsField.a": { "$gte": 1 } }.into(),
@@ -1017,7 +1297,7 @@ mod tests {
         );
         // Two `$match`es each move, then join.
         assert_eq!(
-            hoist_after_source(&[
+            hoist_matches(&[
                 root(),
                 doc! { "$match": { "a": 1 } }.into(),
                 doc! { "$match": { "b": 2 } }.into(),
@@ -1041,14 +1321,14 @@ mod tests {
             doc! { "$alwaysFalse": 1 },
         ] {
             let pipeline = vec![root(), doc! { "$match": filter.clone() }.into()];
-            assert_eq!(hoist_after_source(&pipeline), pipeline, "{filter}");
+            assert_eq!(hoist_matches(&pipeline), pipeline, "{filter}");
         }
         // A new root that is not a field path takes no `$match`.
         let pipeline = vec![
             doc! { "$replaceRoot": { "newRoot": { "z": "$a" } } }.into(),
             doc! { "$match": { "z": 1 } }.into(),
         ];
-        assert_eq!(hoist_after_source(&pipeline), pipeline);
+        assert_eq!(hoist_matches(&pipeline), pipeline);
     }
 
     #[test]
@@ -1056,13 +1336,194 @@ mod tests {
         let skip = Bson::from(doc! { "$skip": 1 });
         let project = Bson::from(doc! { "$project": { "a": 1 } });
         assert_eq!(
-            hoist_after_source(&[root(), project.clone(), skip.clone()]),
+            hoist_matches(&[root(), project.clone(), skip.clone()]),
             vec![skip.clone(), root(), project.clone()]
         );
-        // Over a collection the pipeline keeps its order.
+        // Over a collection too (measured 8.2.11, RM-536).
+        let over_x = Bson::from(doc! { "$replaceRoot": { "newRoot": "$x" } });
         assert_eq!(
-            hoist_matches(&[root(), project.clone(), skip.clone()]),
-            vec![root(), project, skip]
+            hoist_matches(&[over_x.clone(), skip.clone()]),
+            vec![skip, over_x]
         );
+    }
+
+    /// A `$match` behind `{$replaceRoot: {newRoot: "$x"}}` over a collection
+    /// moves ahead of it as it does after `$documents`, and runs as the
+    /// `$match` it is (measured 8.2.11, RM-536).
+    #[test]
+    fn a_match_moves_ahead_of_a_replace_root_over_a_collection() {
+        let over_x = Bson::from(doc! { "$replaceWith": "$x" });
+        let moved = hoist_matches(&[over_x.clone(), doc! { "$match": { "a": 1 } }.into()]);
+        let filter = doc! { "$or": [
+            { "x": { "$type": [4] } },
+            { "x": { "$not": { "$type": [3] } } },
+            { "x.a": { "$eq": 1 } },
+        ] };
+        assert_eq!(
+            moved,
+            vec![doc! { PUSHED_MATCH: filter.clone() }.into(), over_x.clone()]
+        );
+        assert_eq!(
+            runnable(moved),
+            vec![doc! { "$match": filter }.into(), over_x]
+        );
+    }
+
+    /// mongod 8.2.11 drops a `$replaceRoot` / `$replaceWith` of the document
+    /// itself, so a `$match` behind it leads (RM-538).
+    #[test]
+    fn a_replace_root_of_the_document_itself_goes() {
+        let m = Bson::from(doc! { "$match": { "a": 1 } });
+        for identity in [
+            doc! { "$replaceWith": "$$ROOT" },
+            doc! { "$replaceWith": "$$CURRENT" },
+            doc! { "$replaceRoot": { "newRoot": "$$ROOT" } },
+        ] {
+            assert_eq!(
+                hoist_matches(&[identity.into(), m.clone()]),
+                vec![m.clone()]
+            );
+        }
+        let kept = Bson::from(doc! { "$replaceWith": "$$ROOT.x" });
+        assert_eq!(hoist_matches(std::slice::from_ref(&kept)), vec![kept]);
+    }
+
+    /// A `$limit` goes to stand behind the `$sort` that takes it, over the
+    /// stages that keep the count and over a `$skip`, whose amount it adds;
+    /// the smallest limit stays (measured 8.2.11, RM-538).
+    #[test]
+    fn a_sort_takes_the_limit_behind_it() {
+        let group = Bson::from(doc! { "$group": { "_id": "$a" } });
+        let sort = Bson::from(doc! { "$sort": { "_id": 1 } });
+        let project = Bson::from(doc! { "$project": { "z": "$_id" } });
+        let limit = |n: i64| Bson::from(doc! { "$limit": n });
+        let skip = Bson::from(doc! { "$skip": 1 });
+        let unwind = Bson::from(doc! { "$unwind": "$t" });
+        assert_eq!(
+            hoist_matches(&[group.clone(), sort.clone(), project.clone(), limit(2)]),
+            vec![group.clone(), sort.clone(), limit(2), project.clone()]
+        );
+        assert_eq!(
+            hoist_matches(&[group.clone(), sort.clone(), skip.clone(), limit(2)]),
+            vec![group.clone(), sort.clone(), limit(3), skip.clone()]
+        );
+        assert_eq!(
+            hoist_matches(&[
+                group.clone(),
+                sort.clone(),
+                limit(2),
+                project.clone(),
+                limit(1)
+            ]),
+            vec![group.clone(), sort.clone(), limit(1), project.clone()]
+        );
+        // An `$unwind` changes the count: the `$limit` stays behind it.
+        let through_unwind = vec![group.clone(), sort.clone(), unwind, limit(2)];
+        assert_eq!(hoist_matches(&through_unwind), through_unwind);
+        // In a `$facet`, which `explain` lists optimized.
+        assert_eq!(
+            optimized_sub_pipeline(&[
+                doc! { "$replaceWith": "$$ROOT" }.into(),
+                sort.clone(),
+                project.clone(),
+                limit(2)
+            ]),
+            vec![sort, limit(2), project]
+        );
+    }
+
+    /// A `$match` on a field an `$addFields` / `$set` sets to a field path
+    /// of one component moves ahead of it onto that field, in a logical
+    /// clause and an `$expr` too; the rest stays (measured 8.2.11, RM-538).
+    #[test]
+    fn a_match_moves_through_a_rename() {
+        let set = Bson::from(doc! { "$set": { "q": "$b", "w": 5 } });
+        let moved = |filter: bson::Document| {
+            hoist_matches(&[set.clone(), doc! { "$match": filter }.into()])
+        };
+        assert_eq!(
+            moved(doc! { "q": 1, "w": 5 }),
+            vec![
+                doc! { "$match": { "b": 1 } }.into(),
+                set.clone(),
+                doc! { "$match": { "w": 5 } }.into()
+            ]
+        );
+        assert_eq!(
+            moved(doc! { "q.r": 1 }),
+            vec![doc! { "$match": { "b.r": 1 } }.into(), set.clone()]
+        );
+        assert_eq!(
+            moved(doc! { "$or": [{ "q": 1 }, { "a": 2 }] }),
+            vec![
+                doc! { "$match": { "$or": [{ "b": 1 }, { "a": 2 }] } }.into(),
+                set.clone()
+            ]
+        );
+        assert_eq!(
+            moved(doc! { "$expr": { "$eq": ["$q", 1] } }),
+            vec![
+                doc! { "$match": { "$expr": { "$eq": ["$b", 1] } } }.into(),
+                set.clone()
+            ]
+        );
+        // A dotted path or a document is no rename.
+        for spec in [doc! { "q": "$x.a" }, doc! { "q": { "r": "$b" } }] {
+            let pipeline: Vec<Bson> = vec![
+                doc! { "$set": spec }.into(),
+                doc! { "$match": { "q": 1 } }.into(),
+            ];
+            assert_eq!(hoist_matches(&pipeline), pipeline);
+        }
+    }
+
+    /// What draws a random number never moves: `$sampleRate` is the
+    /// `$expr` of `$rand` mongod parses it into, which stays behind a
+    /// `$set`, a `$sort` or a `$project` while the rest of its `$match`
+    /// moves (measured 8.2.11, RM-538).
+    #[test]
+    fn a_random_predicate_stays_where_it_was_written() {
+        let rand = doc! { "$expr": { "$lt": [{ "$rand": {} }, 0.5] } };
+        let group = Bson::from(doc! { "$group": { "_id": "$a" } });
+        for behind in [
+            doc! { "$set": { "c": 1 } },
+            doc! { "$sort": { "_id": 1 } },
+            doc! { "$project": { "_id": 1 } },
+        ] {
+            let got = hoist_matches(&[
+                group.clone(),
+                behind.clone().into(),
+                doc! { "$match": { "_id": 1, "$sampleRate": 0.5 } }.into(),
+            ]);
+            assert_eq!(
+                got,
+                vec![
+                    doc! { "$match": { "a": 1 } }.into(),
+                    group.clone(),
+                    behind.into(),
+                    doc! { "$match": rand.clone() }.into(),
+                ]
+            );
+        }
+        // A rate of 0 matches nothing, and moves; one of 1 is no clause.
+        assert_eq!(
+            hoist_matches(&[
+                group.clone(),
+                doc! { "$set": { "c": 1 } }.into(),
+                doc! { "$match": { "$sampleRate": 0 } }.into(),
+            ]),
+            vec![
+                doc! { "$match": { "$alwaysFalse": 1 } }.into(),
+                group.clone(),
+                doc! { "$set": { "c": 1 } }.into(),
+            ]
+        );
+        assert_eq!(
+            hoist_matches(&[doc! { "$match": { "a": 1, "$sampleRate": 1 } }.into()]),
+            vec![doc! { "$match": { "a": 1 } }.into()]
+        );
+        // A rate the run refuses is left for it to refuse.
+        let refused = vec![group, doc! { "$match": { "$sampleRate": 2 } }.into()];
+        assert_eq!(hoist_matches(&refused), refused);
     }
 }
