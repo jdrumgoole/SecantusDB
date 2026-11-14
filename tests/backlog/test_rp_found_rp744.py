@@ -383,15 +383,16 @@ def test_a_union_all_cursor_converts_each_branch_to_the_unified_types(
     assert ([r[0] for r in got], described) == (rows, {tuple(types)})
 
 
-@pytest.mark.backlog("RP-896")
+@pytest.mark.backlog_fixed("RP-896")
 def test_a_cursor_over_a_union_under_a_union_all_computes_its_rows_as_they_are_fetched(
     dsn: str,
 ) -> None:
     """PostgreSQL 15.19's Append reads its first branch before the UNION
     under it, so `fetch 1` answers that branch's first row. Here a UNION
-    under the UNION ALL makes the whole set operation run at the first
-    FETCH, which raises the first branch's second row's error. Measured on
-    the shared reference."""
+    under the UNION ALL made the whole set operation run at the first
+    FETCH, which raised the first branch's second row's error; the UNION
+    is now one more leaf of the Append. Measured on the shared
+    reference."""
     assert _steps(
         dsn,
         [
@@ -789,3 +790,22 @@ def test_a_refcursor_parameter_can_be_fetched(dsn: str) -> None:
             "rollback",
         ],
     ) == ["CREATE FUNCTION", "BEGIN", "DECLARE CURSOR", [(7,)], "ROLLBACK"]
+
+
+@pytest.mark.backlog_fixed("RP-896")
+def test_a_cursor_reads_an_intersect_leaf_after_the_branch_before_it(
+    dsn: str,
+) -> None:
+    """The same Append with an INTERSECT under it: PostgreSQL 15.19
+    answers the first branch's rows, then the INTERSECT's, and raises
+    only when the FETCH reaches the first branch's failing row."""
+    assert _steps(
+        dsn,
+        [
+            "begin",
+            "declare c cursor for select 1/(k - 1) from (values (2), (3)) s(k)"
+            " union all (select 7 intersect select 7)",
+            "fetch all from c",
+            "rollback",
+        ],
+    ) == ["BEGIN", "DECLARE CURSOR", [(1,), (0,), (7,)], "ROLLBACK"]

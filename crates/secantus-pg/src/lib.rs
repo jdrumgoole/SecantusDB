@@ -40128,27 +40128,32 @@ impl PgHandler {
     /// rows' values are captured (a plain SELECT's) and, for a leaf whose
     /// columns unification converts (`select 1 union all select 2.5`, an
     /// untyped literal), how its rows become the Append's `fields` as they
-    /// are read (RP-896); `None` to run it whole: a set operation of
-    /// another kind under it.
+    /// are read (RP-896). A set operation of another kind under it is one
+    /// leaf, run whole when the Append reaches it; `None` to run the
+    /// whole query at the first FETCH.
     fn append_leaves(
         &self,
         stmt: &Statement,
         fields: &[FieldInfo],
     ) -> Option<(AppendLeaves, Vec<FieldInfo>)> {
+        // A node the Append reads through; any other set operation is one
+        // more leaf, run when the Append reaches it.
+        fn appends(stmt: &Statement) -> bool {
+            matches!(stmt, Statement::SetOp(set)
+                if set.kind == secantus_pgplan::SetOpKind::Union
+                    && set.all
+                    && set.order.is_empty()
+                    && set.limit.is_none()
+                    && set.offset == 0
+                    && !set.with_ties)
+        }
         fn flatten(stmt: &Statement, out: &mut Vec<Statement>) -> bool {
             match stmt {
-                Statement::SetOp(set)
-                    if set.kind == secantus_pgplan::SetOpKind::Union
-                        && set.all
-                        && set.order.is_empty()
-                        && set.limit.is_none()
-                        && set.offset == 0
-                        && !set.with_ties =>
-                {
+                Statement::SetOp(set) if appends(stmt) => {
                     flatten(&set.left, out) && flatten(&set.right, out)
                 }
-                Statement::SetOp(_) => false,
-                Statement::Select(_)
+                Statement::SetOp(_)
+                | Statement::Select(_)
                 | Statement::SelectConstant(_)
                 | Statement::ValuesConstant(_)
                 | Statement::Aggregate(_) => {
@@ -40158,7 +40163,7 @@ impl PgHandler {
                 _ => false,
             }
         }
-        if !matches!(stmt, Statement::SetOp(_)) {
+        if !appends(stmt) {
             return None;
         }
         let mut leaves = Vec::new();
@@ -40193,7 +40198,7 @@ impl PgHandler {
             leaves: &mut std::slice::Iter<'_, Vec<FieldInfo>>,
         ) -> Option<Vec<Type>> {
             match stmt {
-                Statement::SetOp(set) => {
+                Statement::SetOp(set) if appends(stmt) => {
                     let left = unify(&set.left, leaves)?;
                     let right = unify(&set.right, leaves)?;
                     let leaf = |s: &Statement| !matches!(s, Statement::SetOp(_));

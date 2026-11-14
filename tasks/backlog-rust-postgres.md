@@ -3701,18 +3701,6 @@ still computed whole, and the cursor answers that differ either way.
       RP-895 (2026-11-14).
       Verify: tests/backlog/test_rp_found_rp744.py::test_cursor_to_xml_in_from_reads_the_cursor_once
       Backlog-ID: RP-963
-- [ ] **A cursor over a UNION ALL with a UNION, INTERSECT or EXCEPT under
-      it runs it whole at the first FETCH.** Since RP-896 a cursor over a
-      UNION ALL reads its branches in order as PostgreSQL's Append does,
-      each converted to the unified types as it is read
-      (`portal_stream::PendingRows::Converted`), but a set operation of
-      another kind under it (`select 1/(k - 1) from (values (2), (1)) s(k)
-      union all (select 5 union select 6)`) makes the whole run at the
-      first FETCH (`PgHandler::append_leaves` refuses it), which raises
-      22012 where PostgreSQL 15.19 answers `1`. Needs that set operation
-      run as one more leaf, its rows computed when the Append reaches it.
-      Verify: tests/backlog/test_rp_found_rp744.py::test_a_cursor_over_a_union_under_a_union_all_computes_its_rows_as_they_are_fetched
-      Backlog-ID: RP-896
 - [ ] **A cursor's WHERE is evaluated for every row at its first FETCH.**
       Since RP-897 a cursor's query runs at the first FETCH that needs a
       row (`portal_stream::PendingRows::Unstarted`), but the executor
