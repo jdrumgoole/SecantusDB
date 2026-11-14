@@ -103,12 +103,13 @@ def test_a_not_inside_elem_match_entry_reports_its_size(rust_mongo: Any, mongod:
     assert sizes(rust_mongo) == sizes(mongod)
 
 
-@pytest.mark.backlog("RM-437")
+@pytest.mark.backlog_fixed("RM-437")
 def test_a_sort_merge_candidate_counts_as_mongods(rust_mongo: Any, mongod: Any) -> None:
     """mongod 8.2.11's winning SORT_MERGE for `{a: {$in: [1, 2]}, b: {$lt:
     90}}` sorted by `c` over `a_1_c_1` and `b_1` reports 82 `works` and its
     `dupsTested` and `dupsDropped` in `creationExecStats`; this server's
-    reports 83 works and neither field."""
+    reported 83 works -- its FETCH worked the merge once more after the
+    merge was at its end -- and neither field."""
 
     def merge(client: Any) -> list:
         got = _entries(
@@ -154,33 +155,44 @@ def test_a_nin_candidate_reads_mongods_keys(rust_mongo: Any, mongod: Any) -> Non
     assert _losers(rust_mongo, q) == _losers(mongod, q)
 
 
-@pytest.mark.backlog("RM-439")
-def test_an_exists_candidates_filter_is_in_mongods_order(rust_mongo: Any, mongod: Any) -> None:
+@pytest.mark.backlog_fixed("RM-439")
+@pytest.mark.parametrize(
+    "q",
+    [
+        {"a": {"$lt": 5}, "b": {"$exists": True}},
+        {"a": {"$lt": 5}, "b": {"$exists": True}, "c": {"$gt": 1}},
+        {"c": {"$gt": 1}, "b": {"$regex": "x"}, "a": {"$lt": 5}},
+        {"a": {"$lt": 5}, "b": {"$exists": False}},
+    ],
+)
+def test_an_exists_candidates_filter_is_in_mongods_order(
+    rust_mongo: Any, mongod: Any, q: dict
+) -> None:
     """mongod 8.2.11's losing candidate for `{a: {$lt: 5}, b: {$exists:
     true}}` over `b_1` rechecks `{$and: [{b: {$exists: true}}, {a: {$lt:
-    5}}]}` in its FETCH -- the inexact `$exists` first; this server's puts
-    `a` first."""
-    q = {"a": {"$lt": 5}, "b": {"$exists": True}}
+    5}}]}` in its FETCH -- the inexact `$exists`, tagged with the index,
+    first (`sortUsingTags`); this server put `a` first."""
     assert _losers(rust_mongo, q) == _losers(mongod, q)
 
 
-@pytest.mark.backlog("RM-440")
+@pytest.mark.backlog_fixed("RM-440")
 def test_a_type_candidate_reads_mongods_keys(rust_mongo: Any, mongod: Any) -> None:
     """mongod 8.2.11's losing candidate for `{a: {$lt: 5}, b: {$type:
     "int"}}` over `b_1` rechecks `$type` against each key and returns all
     101 keys it examines (every `b` is an int) to its FETCH in the trial;
-    this server's, with the same bounds and filter, returns 6 -- the
-    documents the FETCH keeps."""
+    this server's returned 6 -- the documents the FETCH keeps -- because it
+    answered the scan's key filter with whether the whole query matched."""
     q = {"a": {"$lt": 5}, "b": {"$type": "int"}}
     assert _losers(rust_mongo, q) == _losers(mongod, q)
 
 
-@pytest.mark.backlog("RM-441")
+@pytest.mark.backlog_fixed("RM-441")
 def test_a_multikey_index_covers_a_field_that_holds_no_array(rust_mongo: Any, mongod: Any) -> None:
     """mongod 8.2.11 answers `find({a: {$lt: 5}}, {a: 1, _id: 0})` from
     `a_1_c_1` with a PROJECTION_COVERED over the IXSCAN although `c` holds
     an array in one document: `a` holds none, so its keys are its values.
-    This server fetches each document instead."""
+    This server fetched each document instead; the covered answer must
+    still be the fetched one."""
 
     def plan(client: Any) -> list:
         client.drop_database("rm341_found")
@@ -189,7 +201,8 @@ def test_a_multikey_index_covers_a_field_that_holds_no_array(rust_mongo: Any, mo
         col.insert_one({"_id": -1, "c": [1, 2]})
         col.create_index([("a", 1), ("c", 1)])
         e = col.find({"a": {"$lt": 5}}, {"a": 1, "_id": 0}).explain()
-        return [s["stage"] for s in _stages(e["queryPlanner"]["winningPlan"])]
+        rows = sorted(d["a"] for d in col.find({"a": {"$lt": 5}}, {"a": 1, "_id": 0}))
+        return [s["stage"] for s in _stages(e["queryPlanner"]["winningPlan"])], rows
 
-    assert plan(mongod) == ["PROJECTION_COVERED", "IXSCAN"]
+    assert plan(mongod)[0] == ["PROJECTION_COVERED", "IXSCAN"]
     assert plan(rust_mongo) == plan(mongod)

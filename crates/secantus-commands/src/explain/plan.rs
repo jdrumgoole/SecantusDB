@@ -917,18 +917,22 @@ fn scan_of(u: &IndexUse, parts: &[Document], backward: bool) -> IxScan {
 /// What the FETCH over one index rechecks, in mongod's order for it: by
 /// path, not the canonical order (`secantus_core::residual_key`) -- unless
 /// the index bounds no predicate at all (a hint to an unrelated index), when
-/// mongod 8.2.1 keeps the canonical order (RM-422).
+/// mongod 8.2.1 keeps the canonical order (RM-422). Predicates tagged with
+/// the index come first (RM-439).
 fn residual(u: &IndexUse, parts: &[Document]) -> Option<Document> {
-    let mut rest: Vec<Document> = parts
+    let mut rest: Vec<(usize, Document)> = parts
         .iter()
         .enumerate()
         .filter(|(i, _)| !u.covered.contains(i) && !u.on_key.contains(i))
-        .map(|(_, c)| c.clone())
+        .map(|(i, c)| (i, c.clone()))
         .collect();
-    if !u.covered.is_empty() || !u.on_key.is_empty() {
-        rest.sort_by_key(secantus_core::residual_key);
+    if !u.covered.is_empty() || !u.on_key.is_empty() || !u.tagged.is_empty() {
+        // `sortUsingTags`: a predicate tagged with the index (one that set
+        // bounds but the bounds do not decide, an inexact `$exists`) sorts
+        // ahead of the untagged ones, which follow by path (RM-439).
+        rest.sort_by_key(|(i, c)| (!u.tagged.contains(i), secantus_core::residual_key(c)));
     }
-    assemble(rest)
+    assemble(rest.into_iter().map(|(_, c)| c).collect())
 }
 
 /// When the leading fields are a few points and the sort follows them, mongod
@@ -1930,7 +1934,7 @@ fn truthy(v: &Bson) -> bool {
 
 /// Whether the index holds every field an inclusion projection returns.
 fn covers(index: &IndexInfo, projection: &Document) -> bool {
-    !index.is_multikey() && covers_with(projection, &|field| index.position(field).is_some())
+    covers_with(projection, &|field| index.holds_value(field))
 }
 
 /// mongod's `QuerySolutionNode::fetched` for the scan an access reads: a
@@ -1955,7 +1959,7 @@ fn fetched(node: &Node) -> bool {
 /// it).
 fn has_field(node: &Node, field: &str) -> bool {
     match node {
-        Node::IxScan(ix) => !ix.index.is_multikey() && ix.index.position(field).is_some(),
+        Node::IxScan(ix) => ix.index.holds_value(field),
         Node::Fetch { .. } => true,
         Node::Or(inputs) | Node::SortMerge { inputs, .. } => {
             !inputs.is_empty() && inputs.iter().all(|i| has_field(i, field))

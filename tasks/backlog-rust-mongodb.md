@@ -2509,36 +2509,6 @@ Still different, all 77:
       and an `AND_SORTED` winner. Found 2026-11-14 (RM-436).
       Verify: tests/backlog/test_rm_found_2026_11_08_rm341.py::test_a_not_inside_elem_match_entry_reports_its_size
       Backlog-ID: RM-694
-- [ ] **A SORT_MERGE candidate's trial counts are not mongod's.** For
-      `{a: {$in: [1, 2]}, b: {$lt: 90}}` sorted by `c` over `a_1_c_1` and
-      `b_1`, mongod 8.2.11's winning SORT_MERGE reports 82 `works` and its
-      `dupsTested` and `dupsDropped` in `creationExecStats`; this server's
-      reports 83 works and neither field. Found 2026-11-08 (RM-341).
-      Verify: tests/backlog/test_rm_found_2026_11_08_rm341.py::test_a_sort_merge_candidate_counts_as_mongods
-      Backlog-ID: RM-437
-- [ ] **A candidate's FETCH filter puts an inexact `$exists` after the
-      other predicates.** mongod 8.2.11's losing candidate for `{a: {$lt:
-      5}, b: {$exists: true}}` over `b_1` rechecks `{$and: [{b: {$exists:
-      true}}, {a: {$lt: 5}}]}`; this server's puts `a` first. Found
-      2026-11-08 (RM-341).
-      Verify: tests/backlog/test_rm_found_2026_11_08_rm341.py::test_an_exists_candidates_filter_is_in_mongods_order
-      Backlog-ID: RM-439
-- [ ] **A `$type` index filter returns too few keys in the trial.** mongod
-      8.2.11's losing candidate for `{a: {$lt: 5}, b: {$type: "int"}}` over
-      `b_1` rechecks `$type` against each key and hands all 101 it examines
-      (every `b` an int) to its FETCH; this server's, with the same bounds
-      and filter, hands over 6 -- the documents the FETCH keeps -- so its
-      FETCH's `docsExamined` is 6, not 101. Found 2026-11-08 (RM-341).
-      Verify: tests/backlog/test_rm_found_2026_11_08_rm341.py::test_a_type_candidate_reads_mongods_keys
-      Backlog-ID: RM-440
-- [ ] **A multikey index does not cover a field that holds no array.**
-      mongod 8.2.11 answers `find({a: {$lt: 5}}, {a: 1, _id: 0})` from
-      `a_1_c_1` with a PROJECTION_COVERED over the IXSCAN when only `c`
-      holds arrays (`multiKeyPaths: {a: [], c: ["c"]}`); this server
-      fetches every document (PROJECTION_SIMPLE over a FETCH), which also
-      changes the trial and the cached plan. Found 2026-11-08 (RM-341).
-      Verify: tests/backlog/test_rm_found_2026_11_08_rm341.py::test_a_multikey_index_covers_a_field_that_holds_no_array
-      Backlog-ID: RM-441
 
 ### 7.079 `$out` and `$merge` -- 2026-10-13
 

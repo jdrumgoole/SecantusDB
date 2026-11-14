@@ -147,7 +147,14 @@ impl<'a> Stage<'a> {
     }
 
     fn work(&mut self, env: &Env) -> Work {
-        let out = self.step(env);
+        // `FetchStage::doWork` answers IS_EOF without working its input
+        // once that input is at its end -- a SORT_MERGE that handed over its
+        // last head knows it is (RM-437).
+        let out = if matches!(self.node, Node::Fetch { .. }) && self.is_eof() {
+            Work::Eof
+        } else {
+            self.step(env)
+        };
         self.works += 1;
         match out {
             Work::Advanced(_) => self.returned += 1,
@@ -155,6 +162,16 @@ impl<'a> Stage<'a> {
             Work::NeedTime => self.need_time += 1,
         }
         out
+    }
+
+    /// Whether the stage reads a multikey index through its inputs, as
+    /// mongod's merge stages ask before deduplicating.
+    fn multikey(&self) -> bool {
+        match self.node {
+            Node::IxScan(ix) => ix.index.is_multikey(),
+            Node::Fetch { .. } | Node::Skip(..) => self.inputs[0].multikey(),
+            _ => false,
+        }
     }
 
     /// `PlanStage::isEOF()`, which the score reads: a stage that passes
@@ -363,9 +380,17 @@ impl<'a> Stage<'a> {
                 } else if let Some(&child) = queue.front() {
                     match self.inputs[child].work(env) {
                         Work::Advanced(row) => {
+                            // `MergeSortStage` tests for a repeat only when a
+                            // child reads a multikey index (`_dedup`).
+                            let dedup = self.inputs.iter().any(Stage::multikey);
+                            if dedup {
+                                bump(&mut self.extra, "dupsTested");
+                            }
                             if self.seen.insert(row) {
                                 queue.pop_front();
                                 self.heads.push(merge_head(pattern, env, row, child));
+                            } else if dedup {
+                                bump(&mut self.extra, "dupsDropped");
                             }
                         }
                         Work::Eof => {
@@ -822,4 +847,10 @@ pub(crate) fn worked_through(plan: &Node, env: &Env) -> Option<Stats> {
     let mut stage = Stage::new(plan, env, &mut cache)?;
     while !matches!(stage.work(env), Work::Eof) {}
     Some(stage.stats())
+}
+
+/// Adds one to the count `key` in `extra`.
+fn bump(extra: &mut Document, key: &str) {
+    let n = extra.get(key).and_then(crate::util::as_i64).unwrap_or(0);
+    extra.insert(key, num(n + 1));
 }

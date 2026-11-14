@@ -45,6 +45,15 @@ impl IndexInfo {
         self.key.keys().position(|k| k == field)
     }
 
+    /// mongod's `IndexScanNode::hasField` for one key field: the index
+    /// holds `field` and no component of its path holds an array, so its
+    /// keys are its values (mongod 8.2.11 covers `a` from `a_1_c_1` when
+    /// only `c` holds arrays, `multiKeyPaths: {a: [], c: ["c"]}`).
+    pub fn holds_value(&self, field: &str) -> bool {
+        self.position(field)
+            .is_some_and(|i| self.multikey_paths.get(i).is_none_or(|p| p.is_empty()))
+    }
+
     /// The flags every index-scanning stage carries, in mongod's order.
     /// `distinct`: a DISTINCT_SCAN states its fetching before the version.
     fn describe(&self, out: &mut Document, distinct: Option<bool>) {
