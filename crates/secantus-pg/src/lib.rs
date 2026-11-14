@@ -13896,6 +13896,16 @@ impl PgHandler {
             // `"int"` is kept as it prints (`pgtypes::user_type_key`).
             return name.to_string();
         }
+        // `format_type_be`: a type in another schema is `schema.name`, each
+        // part quoted on its own (`s567.t`, not `"s567.t"`).
+        let (schema, bare) = secantus_pgplan::schemas::split_key(name);
+        if schema != "public" {
+            return format!(
+                "{}.{}",
+                secantus_pgplan::scalar::quote_identifier(&schema),
+                secantus_pgplan::scalar::quote_identifier(&bare)
+            );
+        }
         secantus_pgplan::scalar::quote_identifier(name)
     }
 

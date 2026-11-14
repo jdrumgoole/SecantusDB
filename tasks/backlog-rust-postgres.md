@@ -2708,35 +2708,6 @@ and `fs(a int, c text)`.
       Backlog-ID: RP-524
       Verify: tests/backlog/test_rp_subquery_scope.py::test_write_name_error_position
 
-## Found while working RP-546 (2026-11-08)
-
-Measured on a private, freshly initdb'd PostgreSQL 15.19 cluster. The gap
-tests are in `tests/backlog/test_rp_found_rp546.py`.
-
-- [ ] **A `regprocedure` prints its name unquoted and a schema's type
-      quoted whole.** `regprocedureout` is `format_procedure`: `"Q
-      f567"(s567.t)` and `s567.h(s567.t)` on PostgreSQL 15.19. Here they are
-      `Q f567("s567.t")` and `s567.h("s567.t")` (`regobj::text`), and
-      `pg_describe_object` of a routine shares that text.
-      Backlog-ID: RP-567
-      Verify: tests/backlog/test_rp_found_rp546.py::test_regprocedure_quotes_as_format_procedure
-
-## Found while working RP-560 (2026-11-14)
-
-Measured on a private PostgreSQL 15.19 cluster. The gap test is in
-`tests/backlog/test_rp_found_rp546.py`.
-
-- [ ] **A cast over a type in another schema is described by the type's
-      bare or quoted key.** `getObjectDescription` of a cast is `cast from
-      %s to %s` over each type's `format_type_be`: a table `s9c.t` off the
-      search path gives `cast from s9c.t to integer` on PostgreSQL 15.19, in
-      DROP TABLE's and DROP FUNCTION's DETAIL and in the CASCADE notice, as
-      `pg_describe_object` already answers here. The DETAIL here names it
-      `cast from "t" to integer` and the notice `cast from "s9c.t" to
-      integer` (`display_cast_type` in `casts.rs`).
-      Verify: tests/backlog/test_rp_found_rp546.py::test_cast_over_a_schema_type_described_as_format_type
-      Backlog-ID: RP-951
-
 ## Found while working RP-527 (2026-11-08)
 
 Measured on a private PostgreSQL 15.19 cluster. The gap tests are in

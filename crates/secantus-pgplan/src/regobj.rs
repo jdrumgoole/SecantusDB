@@ -386,10 +386,24 @@ pub fn text(kind: &str, oid: i64) -> String {
                                     .get(b)
                                     .is_some_and(|p| p.2.iter().copied().eq(wanted.iter().copied()))
                             });
+                        // `format_procedure`: each part of the name quoted
+                        // where it needs it (`"Q f567"(integer)`).
+                        let (schema, bare) = crate::schemas::split_key(n);
+                        if n.contains('.') && schema == "public" {
+                            // A name already qualified by its owner (an
+                            // extension's schema) prints as it is kept.
+                            return format!("{n}({args})");
+                        }
+                        let bare = crate::scalar::quote_identifier(&bare);
                         if hidden {
-                            format!("public.{n}({args})")
+                            format!("public.{bare}({args})")
+                        } else if schema != "public" {
+                            format!(
+                                "{}.{bare}({args})",
+                                crate::scalar::quote_identifier(&schema)
+                            )
                         } else {
-                            format!("{n}({args})")
+                            format!("{bare}({args})")
                         }
                     })
             })
