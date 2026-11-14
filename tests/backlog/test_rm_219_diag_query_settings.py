@@ -541,13 +541,13 @@ def _ftdc_files(client: Any, dbpath: str) -> tuple:
     return reported == directory, any(re.fullmatch(pattern, n) for n in names)
 
 
-@pytest.mark.backlog("RM-417")
+@pytest.mark.backlog_fixed("RM-417")
 def test_samples_are_written_to_diagnostic_data(
     tmp_path: Any,
     mongod_rs: Any,  # noqa: F811
 ) -> None:
-    """mongod 8.2.11 writes its samples to `<dbpath>/diagnostic.data`, a
-    `metrics.<time>-00000` file it names in
+    """Like mongod 8.2.11, the server wrote its samples to
+    `<dbpath>/diagnostic.data`, a `metrics.<time>-00000` file it named in
     `diagnosticDataCollectionDirectoryPath`."""
     dbpath = mongod_rs.admin.command("getCmdLineOpts")["parsed"]["storage"]["dbPath"]
     store = str(tmp_path / "store")
@@ -555,6 +555,33 @@ def test_samples_are_written_to_diagnostic_data(
         _latest_sample(rust)
         ours = _ftdc_files(rust, store)
     assert ours == _ftdc_files(mongod_rs, dbpath) == (True, True)
+
+
+def _archive_types(dbpath: str) -> list:
+    """The `type` of each document in `diagnostic.data`'s archive files, in
+    file order."""
+    directory = os.path.join(dbpath, "diagnostic.data")
+    types = []
+    for name in sorted(os.listdir(directory)):
+        if name.startswith("metrics.") and name != "metrics.interim":
+            with open(os.path.join(directory, name), "rb") as f:
+                types += [d["type"] for d in bson.decode_all(f.read())]
+    return types
+
+
+@pytest.mark.backlog("RM-690")
+def test_the_archive_records_the_parameters(
+    tmp_path: Any,
+    mongod_rs: Any,  # noqa: F811
+) -> None:
+    """mongod 8.2.11 opens each archive file with its metadata (`type: 0`)
+    and then its periodic metadata (`type: 2`, `{start, getParameter,
+    getClusterParameter, end}`, `count: 0`), before the first chunk."""
+    dbpath = mongod_rs.admin.command("getCmdLineOpts")["parsed"]["storage"]["dbPath"]
+    store = str(tmp_path / "store")
+    with rust_mongo_server(store) as rust:
+        _latest_sample(rust)
+    assert _archive_types(store)[:2] == _archive_types(dbpath)[:2] == [0, 2]
 
 
 def _set_framework(client: Any, db: str, query: dict, framework: str) -> None:
@@ -619,13 +646,37 @@ def _debug_shape(client: Any) -> list:
     return debug
 
 
-@pytest.mark.backlog("RM-418")
+@pytest.mark.backlog_fixed("RM-418")
 def test_show_debug_query_shape(
     rust_mongo: Any,
     mongod_rs: Any,  # noqa: F811
 ) -> None:
-    """`showDebugQueryShape` adds each query's `debugQueryShape`."""
+    """`showDebugQueryShape` gave no `debugQueryShape`; each setting with a
+    representative query now carries its shape with debug type strings."""
     assert _debug_shape(rust_mongo) == _debug_shape(mongod_rs)
+
+
+def _unshaped_setting(client: Any) -> tuple:
+    client.drop_database("rm219j")
+    client.rm219j.a.insert_many([{"x": i} for i in range(3)])
+    query = {"find": "a", "filter": {"$jsonSchema": {"required": ["x"]}}}
+    try:
+        _set_framework(client, "rm219j", query, "classic")
+    except pymongo.errors.OperationFailure as e:
+        return ("err", e.code)
+    n = len(list(client.admin.aggregate([{"$querySettings": {}}])))
+    _clear(client)
+    return ("ok", n)
+
+
+@pytest.mark.backlog("RM-418")
+def test_setting_for_a_query_the_server_does_not_shape(
+    rust_mongo: Any,
+    mongod_rs: Any,  # noqa: F811
+) -> None:
+    """A setting for a query whose shape `query_shape.rs` does not compute
+    (a `$jsonSchema` filter) is kept, as on mongod."""
+    assert _unshaped_setting(rust_mongo) == _unshaped_setting(mongod_rs)
 
 
 def _oplog_storage_stats(client: Any) -> tuple:
@@ -846,10 +897,11 @@ def _update_entries(client: Any) -> dict:
     }
 
 
-@pytest.mark.backlog("RM-540")
+@pytest.mark.backlog_fixed("RM-540")
 def test_apply_ops_update_entries(rust_mongo: Any, mongod_rs: Any) -> None:  # noqa: F811
-    """mongod 8.2.11 does not apply a `u` replacement of a missing document
-    without `b: true` (the entry is `false` in `results`, the command 8), and
-    refuses a document past 16 MB that a `u` upsert would insert (17420) or
+    """RM-540 (fixed): as on mongod 8.2.11, this server did not apply a `u`
+    replacement of a missing document without `b: true` (the entry is `false`
+    in `results`, the command 8), and
+    refused a document past 16 MB that a `u` upsert would insert (17420) or
     an `i` entry would replace (17419)."""
     assert _update_entries(rust_mongo) == _update_entries(mongod_rs)

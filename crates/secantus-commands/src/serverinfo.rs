@@ -674,6 +674,29 @@ fn listed(test_commands: bool) -> Vec<(&'static str, bool, Bson)> {
             true,
             Bson::Int32(1000),
         ),
+        // The FTDC archive (`crate::ftdc_file`, RM-417); the directory is
+        // the dbpath's, answered by `ftdc_directory`.
+        (
+            "diagnosticDataCollectionDirectoryPath",
+            true,
+            Bson::String(String::new()),
+        ),
+        (
+            "diagnosticDataCollectionDirectorySizeMB",
+            true,
+            Bson::Int32(250),
+        ),
+        ("diagnosticDataCollectionFileSizeMB", true, Bson::Int32(10)),
+        (
+            "diagnosticDataCollectionSamplesPerChunk",
+            true,
+            Bson::Int32(300),
+        ),
+        (
+            "diagnosticDataCollectionSamplesPerInterimUpdate",
+            true,
+            Bson::Int32(10),
+        ),
         // Whether the logical session cache refreshes and reaps at all.
         (
             "disableLogicalSessionCacheRefresh",
@@ -830,6 +853,16 @@ fn listed(test_commands: bool) -> Vec<(&'static str, bool, Bson)> {
 /// switch the server was started with until a client sets them, as mongod
 /// reports a `--setParameter` startup value. `None` for any other parameter,
 /// or a backend with no monitor.
+/// The FTDC archive's directory, `<dbpath>/diagnostic.data` as the dbpath
+/// was given; empty for a server with no dbpath.
+pub(crate) fn ftdc_directory(ctx: &CommandContext) -> String {
+    ctx.storage()
+        .ok()
+        .and_then(|s| s.data_path())
+        .map(|d| crate::ftdc_file::directory_of(&d))
+        .unwrap_or_default()
+}
+
 pub(crate) fn ttl_monitor_param(ctx: &CommandContext, name: &str) -> Option<Bson> {
     let (secs, enabled, _, _) = ctx.storage().ok()?.ttl_monitor()?;
     match name {
@@ -921,6 +954,8 @@ pub fn get_parameter(doc: &Document, ctx: &mut CommandContext) -> HandlerResult 
         // it recorded one.
         let value = if name == "featureCompatibilityVersion" {
             Bson::Document(doc! {"version": crate::cluster_admin::current_fcv(ctx)})
+        } else if name == crate::ftdc_file::DIRECTORY_PATH {
+            Bson::String(ftdc_directory(ctx))
         } else {
             value
         };

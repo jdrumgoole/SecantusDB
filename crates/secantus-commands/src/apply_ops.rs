@@ -463,7 +463,10 @@ fn apply_entry(
             let post = match (diff, current) {
                 (Some(diff), Some(pre)) => apply_diff(pre, diff)?,
                 (Some(diff), None) if upsert => apply_diff(doc! {"_id": id.clone()}, diff)?,
-                (None, Some(_)) | (None, None) if upsert || o.get("_id") == Some(&id) => {
+                // A replacement of a missing document is applied only as an
+                // upsert: mongod 8.2.11 leaves it `false` in `results`.
+                (None, Some(_)) if o.get("_id") == Some(&id) => o.clone(),
+                (None, None) if upsert => {
                     if o.get("_id") != Some(&id) {
                         return Err(error(13596, "in Collection::updateDocument _id mismatch"));
                     }
@@ -526,6 +529,9 @@ fn apply_entry(
     }
 }
 
+/// The largest document a client may write (mongod's `BSONObjMaxUserSize`).
+const BSON_USER_MAX: usize = 16 * 1024 * 1024;
+
 fn is_timeseries(storage: &dyn crate::Storage, db: &str, coll: &str) -> bool {
     storage
         .get_collection_options(db, coll)
@@ -581,11 +587,26 @@ fn write_document(
     let filter = doc! {"_id": id.clone()};
     let outcome = storage
         .update_matching(db, coll, &filter, &doc, false, false)
-        .map_err(crate::util::command_error)?;
+        .map_err(|e| {
+            // A replacement past 16 MiB is 17419 under oplog application on
+            // mongod 8.2.11, with the update path's message.
+            let e = crate::util::command_error(e);
+            if e.code == 10334 && e.errmsg.starts_with("Resulting document after update") {
+                error(17419, e.errmsg)
+            } else {
+                e
+            }
+        })?;
     if outcome.matched > 0 {
         return Ok(Outcome::Applied);
     }
     let bytes = crate::bsondoc::to_vec(&doc).map_err(|e| error(1, e.to_string()))?;
+    if !insert_entry && bytes.len() > BSON_USER_MAX {
+        return Err(error(
+            17420,
+            format!("Document to upsert is larger than {BSON_USER_MAX}"),
+        ));
+    }
     let (_, errors) = if insert_entry {
         storage.insert_from_oplog_application(db, coll, vec![bytes], true)
     } else {

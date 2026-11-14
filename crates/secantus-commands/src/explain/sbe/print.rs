@@ -167,7 +167,64 @@ fn expr(e: &Expr, out: &mut Out) {
             expr(e, out);
             out.push(", int32)");
         }
+        Expr::InList(s, _) => out.push(&format!("s{s}")),
+        Expr::ObjSpec { fields, open } => {
+            let (shape, ret) = if *open {
+                ("Open", "RetInput")
+            } else {
+                ("Closed", "RetNothing")
+            };
+            out.push(&format!(
+                "MakeObjSpec([{}], {shape}, {ret}, 0)",
+                fields.join(", ")
+            ));
+        }
     }
+}
+
+/// An `InList` as the plan's environment prints it: `InList(1 "b" 2.5)`,
+/// its values as the command gave them. `None` for a value this printer
+/// is not known to write as mongod does.
+pub(super) fn in_list(values: &[Bson]) -> Option<String> {
+    let mut parts = Vec::with_capacity(values.len());
+    for v in values {
+        parts.push(list_value(v)?);
+    }
+    Some(format!("InList({})", parts.join(" ")))
+}
+
+/// One `InList` value (measured 8.2.11: `2.0 1.5 3 -0.0 1e+20 "a b"`,
+/// an int64 with no suffix, a double with a point or an exponent).
+pub(super) fn list_value(v: &Bson) -> Option<String> {
+    Some(match v {
+        Bson::Boolean(b) => b.to_string(),
+        Bson::Int32(n) => n.to_string(),
+        Bson::Int64(n) => n.to_string(),
+        Bson::Double(d) if d.is_finite() => {
+            let text = g17(*d);
+            // Written alike at any precision: six significant digits or
+            // fewer (what was measured).
+            let mantissa = text.split('e').next().unwrap_or(&text);
+            let digits = mantissa
+                .trim_start_matches('-')
+                .replace('.', "")
+                .trim_start_matches('0')
+                .trim_end_matches('0')
+                .len();
+            if digits > 6 {
+                return None;
+            }
+            if text.contains(['.', 'e']) {
+                text
+            } else {
+                format!("{text}.0")
+            }
+        }
+        Bson::String(s) if !s.contains(['"', '\\']) && !s.chars().any(char::is_control) => {
+            format!("\"{s}\"")
+        }
+        _ => return None,
+    })
 }
 
 fn op_text(op: BinOp) -> &'static str {

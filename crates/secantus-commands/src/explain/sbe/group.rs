@@ -189,8 +189,9 @@ pub(super) struct Scanned {
     pub record: Slot,
     /// The top-level fields the scan reads into slots.
     pub fields: Vec<(String, Slot)>,
-    /// The skip's and the limit's constants.
-    pub env: Vec<(Slot, i64)>,
+    /// The constants the plan's environment binds: each `$in`'s list, the
+    /// skip's and the limit's amounts, as the environment prints them.
+    pub env: Vec<(Slot, String)>,
     pub query_plan: Document,
 }
 
@@ -227,14 +228,18 @@ pub(super) fn scan(
         fields: scan_fields.clone(),
         uuid: uuid.to_string(),
     };
+    let mut env: Vec<(Slot, String)> = Vec::new();
     if let Some(f) = &front.filter {
+        let predicate = f.program(&field_slot, &mut || slots.next())?;
+        for (slot, values) in predicate.in_lists() {
+            env.push((slot, super::print::in_list(&values)?));
+        }
         root = Stage::Filter {
             node: 1,
-            predicate: f.program(&field_slot)?,
+            predicate,
             input: Box::new(root),
         };
     }
-    let mut env: Vec<(Slot, i64)> = Vec::new();
     let mut query_plan = doc! {
         "stage": "COLLSCAN",
         "planNodeId": 1,
@@ -262,8 +267,8 @@ pub(super) fn scan(
         let limit_slot = (limit > 0).then(|| slots.next());
         let skip_at = skip_slot.map(|s| (s, skip));
         let limit_at = limit_slot.map(|s| (s, limit));
-        env.extend(skip_at);
-        env.extend(limit_at);
+        env.extend(skip_at.map(|(s, n)| (s, n.to_string())));
+        env.extend(limit_at.map(|(s, n)| (s, n.to_string())));
         env.sort();
         root = Stage::LimitSkip {
             node: front_nodes,

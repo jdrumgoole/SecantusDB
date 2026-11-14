@@ -1071,6 +1071,7 @@ version = "0.5.3-beta.196"
 dependencies = [
  "base64",
  "bson",
+ "flate2",
  "hmac",
  "libc",
  "log",

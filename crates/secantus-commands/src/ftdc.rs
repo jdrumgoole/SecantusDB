@@ -25,8 +25,10 @@
 //! `diagnosticDataCollectionEnabled` and `diagnosticDataCollectionPeriodMillis`
 //! switch the sampling and set its period, as on mongod: a new period takes
 //! effect at its next boundary, and while sampling is off `getDiagnosticData`
-//! keeps answering the last sample. The samples are not written to
-//! `diagnostic.data` (RM-417).
+//! keeps answering the last sample. Each sample is also written to
+//! `<dbpath>/diagnostic.data` in mongod's file format (`crate::ftdc_file`,
+//! RM-417), every file opening with the metadata collectors: `buildInfo`,
+//! `getCmdLineOpts` and `hostInfo`.
 
 use std::sync::Mutex;
 use std::time::Duration;
@@ -57,6 +59,11 @@ pub fn schedule(params: &crate::params::ServerParams) -> (bool, Duration) {
 #[derive(Default)]
 pub struct Ftdc {
     latest: Mutex<Document>,
+    /// The archive writer, opened at the first sample of a server with a
+    /// dbpath; `None` again after a write fails.
+    writer: Mutex<Option<crate::ftdc_file::Writer>>,
+    /// Whether the writer has been opened (or found impossible) yet.
+    opened: std::sync::atomic::AtomicBool,
 }
 
 impl Ftdc {
@@ -75,8 +82,58 @@ impl Ftdc {
     /// Take a sample through `ctx` and keep it as the latest.
     pub fn collect(&self, ctx: &mut CommandContext) {
         let sample = sample(ctx);
+        self.write(&sample, ctx);
         *self.latest.lock().unwrap_or_else(|e| e.into_inner()) = sample;
     }
+
+    /// Write `sample` to `diagnostic.data`. A write that fails is logged and
+    /// stops the archive, as mongod's FTDC stops writing after an error;
+    /// the in-memory sample carries on.
+    fn write(&self, sample: &Document, ctx: &mut CommandContext) {
+        use std::sync::atomic::Ordering;
+        let mut writer = self.writer.lock().unwrap_or_else(|e| e.into_inner());
+        if !self.opened.swap(true, Ordering::SeqCst) {
+            let dir = ctx.storage().ok().and_then(|s| s.data_path());
+            *writer =
+                dir.map(|d| crate::ftdc_file::Writer::new(crate::ftdc_file::directory_of(&d)));
+        }
+        let Some(w) = writer.as_mut() else { return };
+        let limits = crate::ftdc_file::Limits::from_params(ctx.server_params.as_deref());
+        if let Err(e) = w.write(sample, limits, || metadata(ctx)) {
+            log::error!(
+                "FTDC: writing diagnostic.data failed, no further samples are written: {e}"
+            );
+            *writer = None;
+        }
+    }
+
+    /// Write the chunk in progress, when the server stops.
+    pub fn close(&self) {
+        let mut writer = self.writer.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(w) = writer.as_mut() {
+            if let Err(e) = w.close() {
+                log::error!("FTDC: closing diagnostic.data failed: {e}");
+            }
+        }
+        *writer = None;
+    }
+}
+
+/// The metadata at the head of every archive file (mongod's
+/// `registerStartupCollectors`): `buildInfo`, `getCmdLineOpts`, `hostInfo`.
+fn metadata(ctx: &mut CommandContext) -> Document {
+    let mut out = doc! {"start": DateTime::now()};
+    let start = DateTime::now();
+    let build = crate::handshake::build_info(&doc! {"buildInfo": 1}, ctx);
+    out.insert("buildInfo", stamped(start, build));
+    let start = DateTime::now();
+    let opts = crate::diagnostics::get_cmd_line_opts(&doc! {"getCmdLineOpts": 1}, ctx);
+    out.insert("getCmdLineOpts", stamped(start, opts));
+    let start = DateTime::now();
+    let host = crate::diagnostics::host_info(&doc! {"hostInfo": 1}, ctx);
+    out.insert("hostInfo", stamped(start, host));
+    out.insert("end", DateTime::now());
+    out
 }
 
 /// The next sampling time after `now_ms` (milliseconds since the epoch):

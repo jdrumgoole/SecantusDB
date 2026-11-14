@@ -618,6 +618,8 @@ fn ftdc_loop(shared: Arc<Shared>) {
             thread::sleep(Duration::from_millis((next - now) as u64).min(FTDC_POLL));
         }
     }
+    // mongod writes the chunk in progress to `diagnostic.data` as it stops.
+    shared.ftdc.close();
 }
 
 fn accept_loop(listener: TcpListener, shared: Arc<Shared>) {

@@ -2077,56 +2077,32 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       Carried over from RM-416, 2026-11-14.
       Verify: tests/backlog/test_rm_219_diag_query_settings.py::test_db_check_extra_index_keys_remainder, tests/backlog/test_rm_219_diag_query_settings.py::test_apply_ops_other_entries
       Backlog-ID: RM-688
-- [ ] **`applyOps` applies a `u` replacement of a missing document.** A `u`
-      entry whose `o` is a whole document with `o2`'s `_id`, for a document
-      that does not exist and without `b: true`, is inserted here; mongod
-      8.2.11 does not apply it (`false` in `results`, the command 8), as this
-      server's own module comment says. A `u` upsert of a document past
-      16 MB is 10334 "object to insert too large" here, 17420 "Document to
-      upsert is larger than 16777216" on mongod, and an `i` entry replacing
-      an existing document with one past 16 MB is 10334 here, 17419 on
-      mongod. Found 2026-11-10 while working RM-416.
-      Verify: tests/backlog/test_rm_219_diag_query_settings.py::test_apply_ops_update_entries
-      Backlog-ID: RM-540
-- [ ] **FTDC is a sample in memory only.** Since 2026-11-10 the sample
-      carries `transportLayerStats` and `diagnosticDataCollectionEnabled` /
-      `diagnosticDataCollectionPeriodMillis` switch it and set its period.
-      Open: nothing is written to `diagnostic.data` (mongod 8.2.11 keeps
-      `metrics.<time>-00000` files and `metrics.interim` there, and reports
-      the directory in `diagnosticDataCollectionDirectoryPath`), so the
-      other `diagnosticData*` parameters, which tune that writer, are not
-      registered (72 here). In `transportLayerStats` mongod also lists its
-      Unix domain socket (`/tmp/mongodb-<port>.sock`), which this server
-      does not listen on, and on Linux measures each TCP listener's backlog
-      depth and counts the connections it discards for a client that left;
-      macOS mongod reports 0 for both, as this server does everywhere (the
-      Linux measurement is not in the macOS binary; not probed on Linux).
-      Verify: tests/backlog/test_rm_219_diag_query_settings.py::test_samples_are_written_to_diagnostic_data
-      Backlog-ID: RM-417
-- [ ] **`setParameter` takes a double just past an int's range.**
-      mongod 8.2.11 refuses `2147483647.9` and `-2147483648.5` for an int
-      parameter (`transactionLifetimeLimitSeconds`,
-      `diagnosticDataCollectionPeriodMillis`) with 2 "Failed validating
-      <name>: Out of bounds coercing to integral value", and takes
-      `2147483647.0`: it bounds the double before truncating it. This
-      server's `params::integral` truncates first, so it stores 2147483647
-      for the first. Found 2026-11-10 (RM-417).
-      Verify: tests/backlog/test_rm_found_2026_11_10_rm417.py::test_an_int_parameter_bounds_the_double_before_truncating
-      Backlog-ID: RM-541
-- [ ] **`$querySettings` gives no `debugQueryShape`, and query settings
-      miss two of mongod's mechanisms.** Since 2026-11-08
+- [ ] **The FTDC archive writes no periodic metadata.** Since 2026-11-14
+      samples go to `diagnostic.data` in mongod's format (RM-417). Open:
+      mongod 8.2.11 also writes `type: 2` documents, `{start, getParameter,
+      getClusterParameter, end}` in full with `count: 0` after each file's
+      metadata and then only what changed; this server writes none.
+      `diagnosticDataCollectionEnableLatencyHistograms` and
+      `diagnosticDataCollectionVerboseTCMalloc`, which add to the sample,
+      are not registered (72 here). In `transportLayerStats` mongod also
+      lists its Unix domain socket (`/tmp/mongodb-<port>.sock`), which this
+      server does not listen on, and on Linux measures each TCP listener's
+      backlog depth and counts the connections it discards for a client
+      that left; macOS mongod reports 0 for both, as this server does
+      everywhere (not probed on Linux).
+      Verify: tests/backlog/test_rm_219_diag_query_settings.py::test_the_archive_records_the_parameters
+      Backlog-ID: RM-690
+- [ ] **Query settings miss two of mongod's mechanisms.** Since 2026-11-08
       `setQuerySettings` / `removeQuerySettings` / `$querySettings` keep
       mongod's settings, a read of their shape is refused (411) or planned
-      over its `indexHints` (RM-219), and since 2026-11-10 its
-      `queryFramework` chooses the engine (RM-418). Open:
-      `showDebugQueryShape` gives no `debugQueryShape` (mongod's shape with
-      each literal a debug type string, `{x: {$eq: "?number"}}`, which
-      RM-215's `query_shape::stats_shape` now serializes for `$queryStats`);
-      a query whose shape `query_shape.rs` does not compute
-      is refused 115; and a write made to `config.clusterParameters`
-      directly is read only at the next start (mongod's op observer
-      reloads it).
-      Verify: tests/backlog/test_rm_219_diag_query_settings.py::test_show_debug_query_shape
+      over its `indexHints` (RM-219), since 2026-11-10 its
+      `queryFramework` chooses the engine, and since 2026-11-14
+      `showDebugQueryShape` gives each `debugQueryShape` (RM-418). Open:
+      a query whose shape `query_shape.rs` does not compute (a
+      `$jsonSchema` filter) is refused 115 where mongod keeps the setting;
+      and a write made to `config.clusterParameters` directly is read only
+      at the next start (mongod's op observer reloads it).
+      Verify: tests/backlog/test_rm_219_diag_query_settings.py::test_setting_for_a_query_the_server_does_not_shape
       Backlog-ID: RM-418
 - [ ] **Under `queryFramework: "sbe"` an `aggregate` and a `distinct` are
       pushed into SBE as without the setting.** mongod 8.2.11's
@@ -2138,15 +2114,16 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       `$lookup`, and runs them classic. Found 2026-11-10 (RM-418).
       Verify: tests/backlog/test_rm_found_2026_11_10_rm418.py::test_sbe_framework_pushes_an_aggregate_and_a_distinct
       Backlog-ID: RM-542
-- [ ] **A `find` under `queryFramework: "sbe"` that is sorted, projected,
-      index-served or filtered beyond comparisons is explained in the
-      classic shape.** mongod 8.2.11 runs it in SBE and explains it so
-      (`nlj` / `ixseek` / `seek` over an index, `sort` and `project`
-      stages, `$in`'s `isMember`), as RM-071 describes for a pushed-down
-      `$group`'s front; this server runs it in SBE (its expressions answer
-      as SBE's) but builds the slot program only for a forward collection
-      scan, its comparison filter, skip and limit (`explain/sbe/find.rs`).
-      Found 2026-11-10 (RM-418).
+- [ ] **A `find` under `queryFramework: "sbe"` that is sorted or
+      index-served is explained in the classic shape.** mongod 8.2.11 runs
+      it in SBE and explains it so (`nlj` over an `ixseek` and a `seek` for
+      an index; a `sort` over a `project` of `getSortKeyAsc` for a sort);
+      this server builds the slot program only for a forward collection
+      scan, its filter (comparisons and `$in`s), skip, limit and a simple
+      projection of top-level fields (`explain/sbe/find.rs`). Also not
+      built: an `$in` holding null (mongod's `typeMatch` program), a
+      projection of a path or a computed field, and a projection under both
+      a skip and a limit. Found 2026-11-10 (RM-418).
       Verify: tests/backlog/test_rm_found_2026_11_10_rm418.py::test_sbe_find_shapes_are_explained_as_sbe
       Backlog-ID: RM-543
 - [ ] **A query's `planCacheKey` hashes its `indexHints` setting as unset.**

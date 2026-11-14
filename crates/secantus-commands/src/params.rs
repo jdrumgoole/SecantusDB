@@ -134,6 +134,26 @@ const SETTABLE: &[(&str, ParamKind)] = &[
         "diagnosticDataCollectionPeriodMillis",
         ParamKind::Int32AtLeast(100),
     ),
+    // The FTDC archive's limits (`crate::ftdc_file`, RM-417), read at every
+    // sample, with mongod 8.2.11's minimums. Its directory is fixed once
+    // set: a change is 220 (`ftdc_path_refusal`).
+    ("diagnosticDataCollectionDirectoryPath", ParamKind::Bool),
+    (
+        "diagnosticDataCollectionDirectorySizeMB",
+        ParamKind::Int32AtLeast(10),
+    ),
+    (
+        "diagnosticDataCollectionFileSizeMB",
+        ParamKind::Int32AtLeast(1),
+    ),
+    (
+        "diagnosticDataCollectionSamplesPerChunk",
+        ParamKind::Int32AtLeast(2),
+    ),
+    (
+        "diagnosticDataCollectionSamplesPerInterimUpdate",
+        ParamKind::Int32AtLeast(2),
+    ),
     // Refuse a query the planner would answer with a collection scan
     // (`crate::notablescan`); read on every query, so it is also kept in an
     // atomic beside the stored value.
@@ -777,16 +797,17 @@ pub(crate) fn integral(value: &Bson, int32: bool) -> Result<i64, &'static str> {
     if !n.is_finite() {
         return Err("Unable to coerce NaN/Inf to integral type");
     }
-    let n = n.trunc();
-    let (low, high) = if int32 {
-        (f64::from(i32::MIN), f64::from(i32::MAX))
+    // mongod bounds the double before truncating it (RM-541, measured
+    // 8.2.11): `2147483647.9` and `-2147483648.5` are out of an int's range.
+    let out_of_bounds = if int32 {
+        n < f64::from(i32::MIN) || n > f64::from(i32::MAX)
     } else {
-        (i64::MIN as f64, i64::MAX as f64)
+        n < i64::MIN as f64 || n >= i64::MAX as f64
     };
-    if n < low || n >= high + 1.0 {
+    if out_of_bounds {
         return Err("Out of bounds coercing to integral value");
     }
-    Ok(n as i64)
+    Ok(n.trunc() as i64)
 }
 
 /// mongod's words for a value `coerce` refused (measured 8.2.11).
@@ -922,6 +943,40 @@ fn coerce_named(
     coerce(kind, value).ok_or_else(|| refusal(kind, name, value))
 }
 
+/// mongod's refusal to move the FTDC directory once it is set, which it is
+/// from the start on a server with a dbpath (8.2.11, 2026-11-14: any value,
+/// of any type).
+fn ftdc_path_refusal(ctx: &CommandContext) -> CommandError {
+    let path = crate::serverinfo::ftdc_directory(ctx);
+    CommandError::new(
+        220,
+        "FTDCPathAlreadySet",
+        format!("FTDC path has already been set to '{path}'. It cannot be changed."),
+    )
+}
+
+/// mongod's check that an FTDC file fits in its directory, made AFTER the
+/// new value is stored: on 8.2.11 (2026-11-14) a refused
+/// `diagnosticDataCollectionFileSizeMB: 300` still reads back as 300, and
+/// the next change reports it as `was`.
+fn ftdc_sizes_agree(params: &ServerParams, name: &str) -> Result<(), CommandError> {
+    use crate::ftdc_file::{DIRECTORY_SIZE_MB, FILE_SIZE_MB};
+    let file = params.number(FILE_SIZE_MB, 10);
+    let directory = params.number(DIRECTORY_SIZE_MB, 250);
+    let why = match name {
+        FILE_SIZE_MB if file > directory => format!(
+            "{FILE_SIZE_MB} must be less than or equal to '{directory}' which is the current \
+             value of {DIRECTORY_SIZE_MB}."
+        ),
+        DIRECTORY_SIZE_MB if directory < file => format!(
+            "{DIRECTORY_SIZE_MB} must be greater than or equal to '{file}' which is the \
+             current value of {FILE_SIZE_MB}."
+        ),
+        _ => return Ok(()),
+    };
+    Err(CommandError::new(2, "BadValue", why))
+}
+
 /// `setParameter` — change a runtime-settable server parameter.
 pub fn set_parameter(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     if ctx.db_name != "admin" {
@@ -949,6 +1004,9 @@ pub fn set_parameter(doc: &Document, ctx: &mut CommandContext) -> HandlerResult 
     // mongod validates every named parameter BEFORE applying any of them, so a
     // batch that names one bad parameter changes nothing.
     for (name, value) in &requested {
+        if name.as_str() == crate::ftdc_file::DIRECTORY_PATH {
+            return Err(ftdc_path_refusal(ctx));
+        }
         // A parameter this server reports and does not let a client change.
         // Answering 20 and not 72 matters: 72 claims the parameter does not
         // exist, and `getParameter` would immediately contradict that. (mongod
@@ -1053,6 +1111,7 @@ pub fn set_parameter(doc: &Document, ctx: &mut CommandContext) -> HandlerResult 
             if let Some(s) = store.as_ref() {
                 s.set(name, coerced.clone());
                 s.apply_execution(name, &coerced)?;
+                ftdc_sizes_agree(s, name)?;
             }
         }
         if Some(name.as_str()) == first {
@@ -1067,6 +1126,20 @@ pub fn set_parameter(doc: &Document, ctx: &mut CommandContext) -> HandlerResult 
 mod tests {
     use super::*;
     use bson::doc;
+
+    #[test]
+    fn an_int_bounds_the_double_before_truncating() {
+        // RM-541: mongod 8.2.11 takes 2147483647.0, refuses 2147483647.9.
+        assert_eq!(integral(&Bson::Double(2147483647.0), true), Ok(2147483647));
+        assert_eq!(
+            integral(&Bson::Double(-2147483648.0), true),
+            Ok(-2147483648)
+        );
+        let oob = Err("Out of bounds coercing to integral value");
+        assert_eq!(integral(&Bson::Double(2147483647.9), true), oob);
+        assert_eq!(integral(&Bson::Double(-2147483648.5), true), oob);
+        assert_eq!(integral(&Bson::Double(-1.9), true), Ok(-1));
+    }
 
     fn ctx() -> CommandContext {
         let mut c = CommandContext::new(1);
