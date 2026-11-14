@@ -9,9 +9,17 @@
 //! exclusion of top-level fields. The plan's result is the scanned record,
 //! or the projected one. A sorted or index-served `find` is not built
 //! (`None`), nor a projection of a path, a computed field or a `$` operator.
+//!
+//! The same plan is what mongod runs for a `distinct`, and for an
+//! `aggregate` whose stages it takes into the query, under
+//! `queryFramework: "sbe"` (RM-542); the `$addFields` / `$set` stages of
+//! constants and top-level field paths after the query are built as the
+//! `PROJECTION_DEFAULT`s they become: a `project` binding each constant to
+//! a slot, then `makeBsonObj` over the record (measured 8.2.11,
+//! 2026-11-14).
 
 use super::expr::Expr;
-use super::group::{scan, Front, Scanned, Slots};
+use super::group::{arg_of, scan, Arg, Front, Scanned, Slots};
 use super::stage::Stage;
 use super::Plan;
 use bson::{doc, Bson, Document};
@@ -184,6 +192,110 @@ pub(super) fn build(uuid: &str, front: &Front, spec: Option<&Document>) -> Optio
             "inputStage": query_plan,
         };
     }
+    Some(Plan {
+        root,
+        result,
+        env,
+        query_plan,
+        eof: false,
+    })
+}
+
+/// The plan for a query with `adds` (`$addFields` specs, in order) over
+/// it. Each stage is its own `PROJECTION_DEFAULT` node, binding its
+/// constants there; the last makes the one object they all set. `None`
+/// when a field is not a new top-level name, or a value not a scalar
+/// constant or a top-level field path of the scanned document.
+pub(super) fn build_added(uuid: &str, front: &Front, adds: &[Document]) -> Option<Plan> {
+    let mut stages: Vec<Vec<(String, Arg)>> = Vec::new();
+    let mut names: Vec<String> = Vec::new();
+    for add in adds {
+        if add.is_empty() {
+            return None;
+        }
+        let mut args = Vec::new();
+        for (name, v) in add {
+            if name == "_id" || name.starts_with('$') || name.contains('.') || names.contains(name)
+            {
+                return None;
+            }
+            match arg_of(v)? {
+                // A field an earlier stage set is not the scan's.
+                Arg::Field(f) if names.contains(&f) => return None,
+                a @ (Arg::Const(_) | Arg::Field(_)) => args.push((name.clone(), a)),
+                _ => return None,
+            }
+        }
+        names.extend(args.iter().map(|(n, _)| n.clone()));
+        stages.push(args);
+    }
+    if stages.is_empty() {
+        return None;
+    }
+    let fields: BTreeSet<String> = stages
+        .iter()
+        .flatten()
+        .filter_map(|(_, a)| match a {
+            Arg::Field(f) => Some(f.clone()),
+            _ => None,
+        })
+        .collect();
+    // With two fields read, the order of their scan slots is not measured.
+    if fields.len() > 1 {
+        return None;
+    }
+    let mut slots = Slots(0);
+    let Scanned {
+        mut root,
+        record,
+        fields: scan_fields,
+        env,
+        mut query_plan,
+    } = scan(front, uuid, fields, &mut slots)?;
+    let mut node = front.nodes();
+    let mut values = Vec::new();
+    for args in &stages {
+        node += 1;
+        let mut consts = Vec::new();
+        let mut transform = Document::new();
+        for (name, a) in args {
+            match a {
+                Arg::Const(c) => {
+                    let s = slots.next();
+                    consts.push((s, Expr::Const(Some(c.clone()))));
+                    values.push(Expr::Slot(s));
+                    transform.insert(name.clone(), doc! { "$const": c.clone() });
+                }
+                Arg::Field(f) => {
+                    let s = scan_fields.iter().find(|(n, _)| n == f)?.1;
+                    values.push(Expr::Slot(s));
+                    transform.insert(name.clone(), Bson::String(format!("${f}")));
+                }
+                _ => return None,
+            }
+        }
+        if !consts.is_empty() {
+            root = Stage::Project {
+                node,
+                binds: consts,
+                input: Box::new(root),
+            };
+        }
+        query_plan = doc! {
+            "stage": "PROJECTION_DEFAULT",
+            "planNodeId": node as i32,
+            "transformBy": transform,
+            "inputStage": query_plan,
+        };
+    }
+    let result = slots.next();
+    let mut make = vec![Expr::SetSpec(names), Expr::Slot(record)];
+    make.extend(values);
+    root = Stage::Project {
+        node,
+        binds: vec![(result, Expr::func("makeBsonObj", make))],
+        input: Box::new(root),
+    };
     Some(Plan {
         root,
         result,
@@ -444,5 +556,87 @@ mod tests {
         ] {
             assert!(build("u", &x1(), Some(&spec)).is_none(), "{spec}");
         }
+    }
+
+    fn added(f: &Front, add: bson::Document) -> (String, String) {
+        let plan = super::build_added("u", f, &[add]).expect("built");
+        let sbp = plan.winning_plan(false);
+        let sbp = sbp.get_document("slotBasedPlan").unwrap();
+        (
+            sbp.get_str("slots").unwrap().to_string(),
+            sbp.get_str("stages").unwrap().to_string(),
+        )
+    }
+
+    /// Two `$addFields`: a node each, one object made at the last.
+    #[test]
+    fn two_add_fields_make_one_object() {
+        let f = front(doc! { "x": { "$eq": 1 } }, 0, 0);
+        let plan = super::build_added("u", &f, &[doc! { "z": 1 }, doc! { "w": 1 }]).unwrap();
+        let wp = plan.winning_plan(false);
+        let stages = wp
+            .get_document("slotBasedPlan")
+            .unwrap()
+            .get_str("stages")
+            .unwrap();
+        assert_eq!(
+            stages,
+            "[3] project [s6 = makeBsonObj(MakeObjSpec([z = Set(0), w = Set(1)], Open, NewObj, 0), s1, s4, s5)] \n\
+             [3] project [s5 = 1] \n\
+             [2] project [s4 = 1] \n\
+             [1] filter {traverseF(s3, lambda(l2.0) { ((move(l2.0) == 1) ?: false) }, false)} \n\
+             [1] scan s1 s2 none none none none none none [s3 = x] @\"u\" true false "
+        );
+        let qp = wp.get_document("queryPlan").unwrap();
+        assert_eq!(qp.get_i32("planNodeId"), Ok(3));
+        assert_eq!(
+            qp.get_document("transformBy").unwrap(),
+            &doc! { "w": { "$const": 1 } }
+        );
+        let inner = qp.get_document("inputStage").unwrap();
+        assert_eq!(inner.get_str("stage"), Ok("PROJECTION_DEFAULT"));
+        assert_eq!(inner.get_i32("planNodeId"), Ok(2));
+    }
+
+    /// The slot programs mongod 8.2.11 runs an `aggregate` of a `$match`
+    /// and an `$addFields` with under `queryFramework: "sbe"`, measured
+    /// 2026-11-14 (RM-542).
+    #[test]
+    fn add_fields_plans_are_mongods() {
+        let eq1 = || doc! { "x": { "$eq": 1 } };
+        let filter =
+            "[1] filter {traverseF(s3, lambda(l2.0) { ((move(l2.0) == 1) ?: false) }, false)} \n";
+        assert_eq!(
+            added(&front(eq1(), 0, 0), doc! { "z": 1 }),
+            (
+                "$$RESULT=s5 env: {  }".to_string(),
+                format!(
+                    "[2] project [s5 = makeBsonObj(MakeObjSpec([z = Set(0)], Open, NewObj, 0), s1, s4)] \n\
+                     [2] project [s4 = 1] \n{filter}\
+                     [1] scan s1 s2 none none none none none none [s3 = x] @\"u\" true false "
+                )
+            )
+        );
+        assert_eq!(
+            added(&front(doc! {}, 0, 0), doc! { "z": 1 }).1,
+            "[2] project [s4 = makeBsonObj(MakeObjSpec([z = Set(0)], Open, NewObj, 0), s1, s3)] \n\
+             [2] project [s3 = 1] \n\
+             [1] scan s1 s2 none none none none none none [] @\"u\" true false "
+        );
+        assert_eq!(
+            added(&front(eq1(), 0, 0), doc! { "z": "$y" }).1,
+            "[2] project [s5 = makeBsonObj(MakeObjSpec([z = Set(0)], Open, NewObj, 0), s1, s3)] \n\
+             [1] filter {traverseF(s4, lambda(l2.0) { ((move(l2.0) == 1) ?: false) }, false)} \n\
+             [1] scan s1 s2 none none none none none none [s3 = y, s4 = x] @\"u\" true false "
+        );
+        assert_eq!(
+            added(&front(eq1(), 0, 2), doc! { "z": 1 }).1,
+            format!(
+                "[3] project [s6 = makeBsonObj(MakeObjSpec([z = Set(0)], Open, NewObj, 0), s1, s5)] \n\
+                 [3] project [s5 = 1] \n\
+                 [2] limit s4 \n{filter}\
+                 [1] scan s1 s2 none none none none none none [s3 = x] @\"u\" true false "
+            )
+        );
     }
 }

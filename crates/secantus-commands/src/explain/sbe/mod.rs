@@ -15,7 +15,9 @@
 //! `$sum`, `$count`, `$avg`, `$first`, `$last`, `$min`, `$max`, `$push` and
 //! `$addToSet`. And a `find` a `queryFramework: "sbe"` query setting puts
 //! in SBE (RM-418, `find.rs`): the same collection scan, filter, skip and
-//! limit, with a simple projection over them. Everything else SBE runs is still
+//! limit, with a simple projection over them, which is also what it runs
+//! for a `distinct` and an `aggregate`'s query, with the `$addFields` an
+//! `aggregate` puts over it (RM-542). Everything else SBE runs is still
 //! explained in the classic shape (`tasks/backlog-rust-mongodb.md`, RM-071,
 //! RM-543).
 
@@ -58,6 +60,13 @@ pub(crate) fn group_plan(group: &Document, uuid: &str, last: bool, front: &Front
 /// `None` when its filter or projection is outside what is built here.
 pub(crate) fn find_plan(uuid: &str, front: &Front, projection: Option<&Document>) -> Option<Plan> {
     find::build(uuid, front, projection)
+}
+
+/// The plan for a query `front` with `adds` (`$addFields` specs, in
+/// order) over it, as `aggregate` runs it under `queryFramework: "sbe"`
+/// (RM-542). `None` when a spec is outside what is built here.
+pub(crate) fn added_plan(uuid: &str, front: &Front, adds: &[Document]) -> Option<Plan> {
+    find::build_added(uuid, front, adds)
 }
 
 /// The plan mongod builds over a collection that does not exist.
@@ -206,6 +215,23 @@ impl Plan {
                     (got, Some((loads + 1, loads)), eof)
                 }
             };
+            // With no group, nothing runs to the end before the top returns:
+            // each stage ran as far as the documents pulled from the top
+            // asked (RM-542).
+            let grouped = {
+                let mut at = Some(&self.root);
+                let mut found = false;
+                while let Some(st) = at {
+                    found |= matches!(st, Stage::Group { .. });
+                    at = st.input();
+                }
+                found
+            };
+            let counted = if !grouped && produced < n {
+                self.root.run(docs, Some(produced as usize)).1
+            } else {
+                counted
+            };
             // What the scan at the bottom read.
             let mut scan = &counted;
             while let Some(below) = scan.input.as_deref() {
@@ -213,7 +239,7 @@ impl Plan {
             }
             let examined = scan.reads;
             let pulled = Pulled { produced, eof };
-            let pulled = (!matches!(pull, Pull::Find)).then_some(&pulled);
+            let pulled = (grouped && !matches!(pull, Pull::Find)).then_some(&pulled);
             let stages = stats_doc(&self.root, &counted, pulled, saves);
             (stages, produced, examined)
         };

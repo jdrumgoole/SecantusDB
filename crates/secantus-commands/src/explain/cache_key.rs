@@ -18,7 +18,7 @@
 //! index on its path could serve it (`<1>`, `<10>`, ...), and for a
 //! partial index whether the query implies its filter (`(1)`);
 //! `planCacheKey` hashes it the same way, combined (boost's
-//! `hash_combine`) with the hash of the query settings, none here.
+//! `hash_combine`) with the hash of the read's query settings.
 
 use bson::{Bson, Document};
 use secantus_core::collation::Collation;
@@ -112,10 +112,9 @@ const NO_VALUE: u64 = 0x1234_5678;
 
 /// `query_settings::hash` of the running read's settings: its framework
 /// (`QueryFrameworkControlEnum`: `forceClassicEngine` 0, `trySbeEngine` 2),
-/// its index hints, each [`NO_VALUE`] when unset, and whether it is
-/// rejected. A setting's `comment` is not hashed (measured 8.2.11,
-/// 2026-11-10, RM-418). Not yet: index hints are hashed as unset, where
-/// mongod hashes the hints (RM-544).
+/// its index hints ([`index_hints_hash`]), each [`NO_VALUE`] when unset,
+/// and whether it is rejected. A setting's `comment` is not hashed
+/// (measured 8.2.11, 2026-11-10, RM-418).
 fn settings_hash() -> u64 {
     use crate::query_settings::{framework, Framework};
     let framework = match framework() {
@@ -123,10 +122,175 @@ fn settings_hash() -> u64 {
         Some(Framework::Classic) => 0,
         Some(Framework::Sbe) => 2,
     };
-    let reject = crate::query_settings::active().is_some_and(|s| s.get_bool("reject") == Ok(true));
+    let active = crate::query_settings::active();
+    let reject = active
+        .as_ref()
+        .is_some_and(|s| s.get_bool("reject") == Ok(true));
+    let hints = active
+        .as_ref()
+        .and_then(|s| s.get_array("indexHints").ok())
+        .map_or(NO_VALUE, |specs| index_hints_hash(specs));
     let h = hash_combine(0, framework);
-    let h = hash_combine(h, NO_VALUE);
+    let h = hash_combine(h, hints);
     hash_combine(h, u64::from(reject))
+}
+
+/// boost 1.88's `mulx`: the 128-bit product, its halves xored.
+fn mulx(x: u64, y: u64) -> u64 {
+    let r = u128::from(x) * u128::from(y);
+    (r as u64) ^ ((r >> 64) as u64)
+}
+
+/// boost 1.88's `hash_range` over contiguous bytes (64-bit `size_t`), as
+/// `boost::hash<std::string>` uses it with seed 0.
+fn boost_hash_bytes(p: &[u8]) -> u64 {
+    const Q: u64 = 0x9e37_79b9_7f4a_7c15;
+    const K: u64 = 0xdf44_2d22_ce48_59b9;
+    let read32 = |b: &[u8]| u64::from(u32::from_le_bytes(b[..4].try_into().expect("4 bytes")));
+    let mut n = p.len();
+    let mut w = mulx(Q, K);
+    let mut h = w ^ n as u64;
+    let mut at = 0;
+    while n >= 8 {
+        let v1 = u64::from_le_bytes(p[at..at + 8].try_into().expect("8 bytes"));
+        w = w.wrapping_add(Q);
+        h ^= mulx(v1.wrapping_add(w), K);
+        at += 8;
+        n -= 8;
+    }
+    let t = &p[at..];
+    let v1 = if n >= 4 {
+        (read32(&t[n - 4..]) << ((n - 4) * 8)) | read32(t)
+    } else if n >= 1 {
+        let x1 = (n - 1) & 2;
+        let x2 = n >> 1;
+        (u64::from(t[x1]) << (x1 * 8)) | (u64::from(t[x2]) << (x2 * 8)) | u64::from(t[0])
+    } else {
+        0
+    };
+    w = w.wrapping_add(Q);
+    h ^= mulx(v1.wrapping_add(w), K);
+    mulx(h.wrapping_add(w), K)
+}
+
+/// A `boost::optional<std::string>`, as `query_settings_hash.cpp` hashes it.
+fn optional_string(s: Option<&str>) -> u64 {
+    s.map_or(NO_VALUE, |s| boost_hash_bytes(s.as_bytes()))
+}
+
+/// `SimpleStringDataComparator::hash_combine`: `murmur3<8>` seeded with
+/// the running hash (cut to 32 bits, as `MurmurHash3_x64_128` takes it).
+fn murmur_combine(seed: u64, s: &[u8]) -> u64 {
+    murmur3_x64_128_h1(s, seed as u32)
+}
+
+/// `BSONComparatorInterfaceBase::hashCombineBSONElement` under
+/// `kConsiderFieldName`, for the values a key pattern holds. `None` for a
+/// type this port does not hash (a key pattern of ObjectIds, binaries,
+/// regexes, decimals, code).
+fn bson_element_hash(mut h: u64, name: &str, v: &Bson) -> Option<u64> {
+    let canonical: u64 = match v {
+        Bson::MinKey => u64::MAX,
+        Bson::Undefined => 0,
+        Bson::Null => 5,
+        Bson::Double(_) | Bson::Int32(_) | Bson::Int64(_) => 10,
+        Bson::String(_) => 15,
+        Bson::Document(_) => 20,
+        Bson::Array(_) => 25,
+        Bson::Boolean(_) => 40,
+        Bson::DateTime(_) => 45,
+        Bson::Timestamp(_) => 47,
+        Bson::MaxKey => 127,
+        _ => return None,
+    };
+    h = hash_combine(h, canonical);
+    if !name.is_empty() {
+        h = murmur_combine(h, name.as_bytes());
+    }
+    let number = |d: f64| {
+        let d = if d.is_nan() { f64::NAN } else { d + 0.0 };
+        d.to_bits()
+    };
+    Some(match v {
+        Bson::Boolean(b) => hash_combine(h, u64::from(*b)),
+        Bson::Timestamp(t) => hash_combine(h, (u64::from(t.time) << 32) | u64::from(t.increment)),
+        Bson::DateTime(d) => hash_combine(h, d.timestamp_millis() as u64),
+        Bson::Double(d) => hash_combine(h, number(*d)),
+        Bson::Int32(i) => hash_combine(h, number(f64::from(*i))),
+        Bson::Int64(i) => hash_combine(h, number(*i as f64)),
+        Bson::String(s) => murmur_combine(h, s.as_bytes()),
+        Bson::Document(d) => bson_object_hash(h, d)?,
+        Bson::Array(a) => {
+            let mut h = h;
+            for (i, e) in a.iter().enumerate() {
+                h = bson_element_hash(h, &i.to_string(), e)?;
+            }
+            h
+        }
+        _ => h,
+    })
+}
+
+fn bson_object_hash(mut h: u64, d: &Document) -> Option<u64> {
+    for (k, v) in d {
+        h = bson_element_hash(h, k, v)?;
+    }
+    Some(h)
+}
+
+/// `hash_value(const IndexHint&)`: a key pattern by
+/// `SimpleBSONObjComparator`, a name by `boost::hash<std::string>`, a
+/// `$natural` hint by its direction (`int8_t` 1 or -1).
+fn index_hint_hash(hint: &Bson) -> Option<u64> {
+    match hint {
+        Bson::String(name) => Some(boost_hash_bytes(name.as_bytes())),
+        Bson::Document(d) => match d.iter().next() {
+            Some((k, v)) if k == "$natural" && d.len() == 1 => {
+                let forward = match v {
+                    Bson::Int32(i) => *i == 1,
+                    Bson::Int64(i) => *i == 1,
+                    Bson::Double(f) => *f as i32 == 1,
+                    _ => return None,
+                };
+                Some(if forward { 1 } else { u64::MAX })
+            }
+            _ => bson_object_hash(0, d),
+        },
+        _ => None,
+    }
+}
+
+/// `hash_value` of the settings' `IndexHintSpecs`: `hash_range` over the
+/// specs, each the `hash_range` of its allowed indexes combined with its
+/// namespace (the `DatabaseName`'s bytes -- a length byte, then the name
+/// -- and the collection, each an optional). A hint this port cannot hash
+/// leaves the hints hashed as unset.
+fn index_hints_hash(specs: &[Bson]) -> u64 {
+    let spec_hash = |spec: &Bson| -> Option<u64> {
+        let spec = spec.as_document()?;
+        let mut h = 0;
+        for hint in spec.get_array("allowedIndexes").ok()? {
+            h = hash_combine(h, index_hint_hash(hint)?);
+        }
+        let ns = spec.get_document("ns").ok();
+        let db = ns
+            .and_then(|n| n.get_str("db").ok())
+            .map_or(NO_VALUE, |db| {
+                let mut bytes = vec![(db.len() & 0x7f) as u8];
+                bytes.extend_from_slice(db.as_bytes());
+                boost_hash_bytes(&bytes)
+            });
+        let coll = optional_string(ns.and_then(|n| n.get_str("coll").ok()));
+        Some(hash_combine(h, hash_combine(hash_combine(0, db), coll)))
+    };
+    let mut h = 0;
+    for spec in specs {
+        match spec_hash(spec) {
+            Some(s) => h = hash_combine(h, s),
+            None => return NO_VALUE,
+        }
+    }
+    h
 }
 
 /// `PlanCacheKeyInfo::planCacheKeyHash`, under the running read's query

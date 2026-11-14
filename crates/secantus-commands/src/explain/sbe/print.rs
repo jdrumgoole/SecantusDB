@@ -179,6 +179,17 @@ fn expr(e: &Expr, out: &mut Out) {
                 fields.join(", ")
             ));
         }
+        Expr::SetSpec(names) => {
+            let sets: Vec<String> = names
+                .iter()
+                .enumerate()
+                .map(|(i, n)| format!("{n} = Set({i})"))
+                .collect();
+            out.push(&format!(
+                "MakeObjSpec([{}], Open, NewObj, 0)",
+                sets.join(", ")
+            ));
+        }
     }
 }
 

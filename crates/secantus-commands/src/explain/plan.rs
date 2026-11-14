@@ -847,7 +847,9 @@ fn scan_of(u: &IndexUse, parts: &[Document], backward: bool) -> IxScan {
 }
 
 /// What the FETCH over one index rechecks, in mongod's order for it: by
-/// path, not the canonical order (`secantus_core::residual_key`).
+/// path, not the canonical order (`secantus_core::residual_key`) -- unless
+/// the index bounds no predicate at all (a hint to an unrelated index), when
+/// mongod 8.2.1 keeps the canonical order (RM-422).
 fn residual(u: &IndexUse, parts: &[Document]) -> Option<Document> {
     let mut rest: Vec<Document> = parts
         .iter()
@@ -855,7 +857,9 @@ fn residual(u: &IndexUse, parts: &[Document]) -> Option<Document> {
         .filter(|(i, _)| !u.covered.contains(i) && !u.on_key.contains(i))
         .map(|(_, c)| c.clone())
         .collect();
-    rest.sort_by_key(secantus_core::residual_key);
+    if !u.covered.is_empty() || !u.on_key.is_empty() {
+        rest.sort_by_key(secantus_core::residual_key);
+    }
     assemble(rest)
 }
 

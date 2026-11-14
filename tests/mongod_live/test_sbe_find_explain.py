@@ -11,6 +11,10 @@ a `$group` mongod would push into SBE stays classic. The whole reply is
 compared, slot program text included, with each server's collection UUID
 replaced by a placeholder; timings are not compared, nor the classic work
 counters RM-434 is about.
+
+Under `"sbe"` an `aggregate` and a `distinct` run their query in SBE too
+(RM-542), an `aggregate` with nothing pushed after the query and the
+`$addFields` that follow it taken in as `PROJECTION_DEFAULT`.
 """
 
 from __future__ import annotations
@@ -135,6 +139,83 @@ def test_classic_framework_explain_matches_mongod(
         _explain(rust_mongo, "c", DOCS, cmd, "classic", "queryPlanner"),
         _explain(mongod_rs, "c", DOCS, cmd, "classic", "queryPlanner"),
     )
+
+
+AGGREGATES = [
+    [],
+    [{"$match": {"x": 1}}],
+    [{"$addFields": {"z": 1}}],
+    [{"$match": {"x": 1}}, {"$unwind": "$y"}],
+    [{"$match": {"x": {"$gte": 1}}}, {"$unwind": "$y"}, {"$limit": 2}],
+    [{"$match": {"x": 1}}, {"$addFields": {"z": "$y"}}],
+    [{"$match": {"x": 1}}, {"$addFields": {"z": 1}}, {"$addFields": {"w": 1}}],
+    [{"$match": {"x": {"$gt": 1}}}, {"$skip": 1}, {"$set": {"z": "a"}}],
+    [{"$match": {"x": 1}}, {"$addFields": {"z": 1}}, {"$limit": 2}],
+]
+
+
+@pytest.mark.parametrize("verbosity", ["queryPlanner", "executionStats"])
+@pytest.mark.parametrize("pipeline", AGGREGATES, ids=[str(p) for p in AGGREGATES])
+def test_sbe_aggregate_explain_matches_mongod(
+    rust_mongo: Any, mongod_rs: Any, pipeline: list, verbosity: str
+) -> None:
+    """Under `"sbe"` an `aggregate` runs its query in SBE with nothing
+    pushed after it, an `$addFields` taken into it (RM-542)."""
+    cmd = {"aggregate": "c", "pipeline": pipeline, "cursor": {}}
+    same(
+        _explain(rust_mongo, "c", DOCS, cmd, "sbe", verbosity),
+        _explain(mongod_rs, "c", DOCS, cmd, "sbe", verbosity),
+    )
+
+
+@pytest.mark.parametrize("verbosity", ["queryPlanner", "executionStats"])
+def test_sbe_distinct_explain_matches_mongod(
+    rust_mongo: Any, mongod_rs: Any, verbosity: str
+) -> None:
+    """Under `"sbe"` a `distinct` runs its query in SBE, keyed as a `find`'s
+    (RM-542)."""
+    cmd = {"distinct": "c", "key": "y", "query": {"x": {"$gt": 1}}}
+    same(
+        _explain(rust_mongo, "c", DOCS, cmd, "sbe", verbosity),
+        _explain(mongod_rs, "c", DOCS, cmd, "sbe", verbosity),
+    )
+
+
+def _mod_by_zero(client: Any, cmd: dict) -> Any:
+    """The error the engine running `cmd` gives `$mod` by zero: SBE's
+    4848403, classic's 16610."""
+    db = client[DB]
+    if "c" not in db.list_collection_names():
+        db.c.insert_many([dict(d) for d in DOCS])
+    _clear(client)
+    client.admin.command(
+        {"setQuerySettings": dict(cmd, **{"$db": DB}), "settings": {"queryFramework": "sbe"}}
+    )
+    try:
+        db.command(cmd)
+    except Exception as e:  # noqa: BLE001 - the code is the answer
+        return getattr(e, "code", None)
+    finally:
+        _clear(client)
+    return None
+
+
+MOD_BY_ZERO = {"$expr": {"$eq": [{"$mod": ["$x", 0]}, 0]}}
+
+
+@pytest.mark.parametrize(
+    "cmd",
+    [
+        {"aggregate": "c", "pipeline": [{"$match": MOD_BY_ZERO}], "cursor": {}},
+        {"distinct": "c", "key": "y", "query": MOD_BY_ZERO},
+    ],
+    ids=["aggregate", "distinct"],
+)
+def test_sbe_framework_runs_aggregate_and_distinct_in_sbe(
+    rust_mongo: Any, mongod_rs: Any, cmd: dict
+) -> None:
+    """They answer as SBE does, not only explain so (RM-542)."""
+    assert _mod_by_zero(rust_mongo, cmd) == _mod_by_zero(mongod_rs, cmd)
 
 
 def _profiled(client: Any, framework: str) -> list:

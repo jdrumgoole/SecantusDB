@@ -24,10 +24,10 @@
 //!
 //! - runs in the engine its `queryFramework` names (`framework`): under
 //!   `"classic"` (mongod's `forceClassicEngine`) nothing is pushed into SBE,
-//!   and under `"sbe"` (`trySbeEngine`) a `find` SBE compiles runs there.
+//!   and under `"sbe"` (`trySbeEngine`) a `find`, a `distinct` and an
+//!   `aggregate`'s query SBE compiles run there (RM-542).
 //!
-//! Not yet: under `"sbe"` an `aggregate` and a `distinct` are pushed down
-//! as without the setting, and a write made to `config.clusterParameters`
+//! Not yet: a write made to `config.clusterParameters`
 //! directly is read only by the next server start (RM-418).
 
 use std::cell::RefCell;

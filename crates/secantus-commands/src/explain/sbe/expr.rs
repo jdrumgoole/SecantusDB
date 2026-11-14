@@ -60,6 +60,10 @@ pub(crate) enum Expr {
     /// `makeBsonObj`'s spec: the fields it keeps (`Closed`, the rest
     /// dropped) or drops (`Open`, the rest kept), in the projection's order.
     ObjSpec { fields: Vec<String>, open: bool },
+    /// `makeBsonObj`'s spec for an `$addFields`: the fields it sets, each
+    /// from the value argument of its position, over the input object
+    /// (`Open`, `NewObj`; RM-542).
+    SetSpec(Vec<String>),
 }
 
 /// The mask `typeMatch` and `fillType` take for null and undefined:
@@ -93,7 +97,8 @@ impl Expr {
             | Expr::Local { .. }
             | Expr::Const(_)
             | Expr::Int64(_)
-            | Expr::ObjSpec { .. } => {}
+            | Expr::ObjSpec { .. }
+            | Expr::SetSpec(_) => {}
         }
     }
 
@@ -296,6 +301,26 @@ fn traverse_p(input: Value, depth: Option<i64>, apply: &mut dyn FnMut(Value) -> 
     }
 }
 
+/// `makeBsonObj(SetSpec, root, values...)`: the root with each named field
+/// set to its value, a Nothing value removing it (RM-542).
+fn set_fields(names: &[String], args: &[Expr], env: &mut Env<'_>) -> Value {
+    let mut out = match args.get(1).map(|a| a.eval(env)) {
+        Some(Some(Bson::Document(d))) => d,
+        _ => Document::new(),
+    };
+    for (name, value) in names.iter().zip(&args[2..]) {
+        match value.eval(env) {
+            Some(v) => {
+                out.insert(name.clone(), v);
+            }
+            None => {
+                out.remove(name);
+            }
+        }
+    }
+    Some(Bson::Document(out))
+}
+
 /// `newObj` / `newBsonObj`: the named values, `Nothing` ones left out.
 fn new_obj(args: &[Value]) -> Value {
     let mut out = Document::new();
@@ -364,7 +389,7 @@ impl Expr {
             },
             Expr::InList(_, values) => Some(Bson::Array(values.clone())),
             // Read only by the `makeBsonObj` it is the spec of.
-            Expr::ObjSpec { .. } => None,
+            Expr::ObjSpec { .. } | Expr::SetSpec(_) => None,
             Expr::Func(name, args) => self.call(name, args, env),
         }
     }
@@ -434,6 +459,9 @@ impl Expr {
             // (`RetNothing`) for a closed spec, the input for an open one
             // (`RetInput`).
             "makeBsonObj" => {
+                if let Expr::SetSpec(names) = &args[0] {
+                    return set_fields(names, args, env);
+                }
                 let Expr::ObjSpec { fields, open } = &args[0] else {
                     return None;
                 };
