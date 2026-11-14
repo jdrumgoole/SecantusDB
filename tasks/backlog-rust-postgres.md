@@ -1175,14 +1175,6 @@ one beside it.
       Verify: tests/backlog/test_rp_found_rp921.py::test_a_partitions_copy_of_a_named_index_is_named_by_its_columns
       Backlog-ID: RP-930
 
-- [ ] **OPEN — a partitioned table's indexes show a page.** PostgreSQL
-      15.19 shows every index of a partitioned table (the parent's, and a
-      partitioned partition's) at `relpages` 0, `reltuples` 0: a
-      partitioned index has no storage. `secantusd-pg` answers 1 page for
-      each primary key and for the parent's own indexes.
-      Verify: tests/backlog/test_rp_found_rp921.py::test_a_partitioned_tables_indexes_have_no_pages
-      Backlog-ID: RP-931
-
 - [ ] **OPEN — a leaf partition's inherited indexes are shown as never
       built.** A leaf partition created under a partitioned table with a
       user index: PostgreSQL 15.19 builds each copy over the new heap and
@@ -1227,6 +1219,19 @@ one beside it.
       matches, and the bare one reaches it already qualified.
       Backlog-ID: RP-933
       Verify: tests/backlog/test_rp_found_rp923.py::test_an_index_outside_public_can_be_renamed
+
+## Found while working RP-931 (2026-11-14)
+
+- [ ] **OPEN — the size functions give a partitioned table's indexes a
+      page each.** A partitioned index has no storage, so PostgreSQL 15.19
+      answers 0 for `pg_relation_size` of one, and 0 for `pg_indexes_size`
+      and `pg_total_relation_size` of a partitioned table, rows or none
+      (2026-11-14). `secantusd-pg` answers 8192 per index and 8192 times
+      the index count for the other two: `size_call_here` sizes the
+      index from the root's B-tree model, which holds the whole tree's rows
+      (`partition.rs`), where `pg_class` now shows 0 pages (RP-931).
+      Verify: tests/backlog/test_rp_found_rp931.py::test_a_partitioned_tables_indexes_have_no_size
+      Backlog-ID: RP-949
 
 ## Found by a CI run (2026-11-07)
 

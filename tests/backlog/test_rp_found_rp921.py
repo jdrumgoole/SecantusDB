@@ -60,16 +60,32 @@ def test_a_partitions_copy_of_a_named_index_is_named_by_its_columns(pg: Any) -> 
     ]
 
 
-@pytest.mark.backlog("RP-931")
+@pytest.mark.backlog_fixed("RP-931")
 def test_a_partitioned_tables_indexes_have_no_pages(pg: Any) -> None:
     """A partitioned table's index has no storage of its own (`RELKIND_
-    PARTITIONED_INDEX`), so PostgreSQL shows it at 0 pages and 0 tuples:
+    PARTITIONED_INDEX`), so PostgreSQL showed it at 0 pages and 0 tuples:
     the parent's and the partitioned partition's indexes alike.
     `secantusd-pg` answered 1 page for each primary key, and for the
-    parent's own indexes (2026-11-13)."""
+    parent's own indexes, and 0 pages, -1 tuples for the partitioned
+    partition's copies of the others (2026-11-13)."""
     _partitioned(pg, "rp921p")
     rows = pg.execute(SIZES.format("'rp921p', 'rp921p_1'")).fetchall()
     assert [(r[1], r[2]) for r in rows] == [(0, 0.0)] * 6, rows
+
+
+@pytest.mark.backlog_fixed("RP-931")
+def test_maintenance_leaves_a_partitioned_tables_indexes_without_pages(pg: Any) -> None:
+    """No VACUUM, ANALYZE, TRUNCATE or REINDEX writes a partitioned index's
+    `pg_class` row (`vac_update_relstats` and `index_update_stats` reach
+    only relations with storage): PostgreSQL 15.19 still showed 0 pages,
+    0 tuples after each, with rows in the partitions (measured on a
+    one-level tree, and after ANALYZE on this one, 2026-11-14)."""
+    _partitioned(pg, "rp921m")
+    pg.execute("INSERT INTO rp921m SELECT g, g, g FROM generate_series(0, 49) g")
+    for statement in ("VACUUM ANALYZE", "TRUNCATE", "REINDEX TABLE"):
+        pg.execute(f"{statement} rp921m")
+        rows = pg.execute(SIZES.format("'rp921m', 'rp921m_1'")).fetchall()
+        assert [(r[1], r[2]) for r in rows] == [(0, 0.0)] * 6, (statement, rows)
 
 
 @pytest.mark.backlog("RP-932")
