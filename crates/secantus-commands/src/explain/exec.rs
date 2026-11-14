@@ -1406,5 +1406,19 @@ pub(crate) fn run(plan: &Node, env: &Env) -> Stats {
         root.extra.insert("nSkipped", num(skipped));
     }
     while root.pull(env).is_some() {}
-    root.stats()
+    let mut stats = root.stats();
+    if let Some(worked) = super::trial::worked_through(plan, env) {
+        graft_work(&mut stats, &worked);
+    }
+    stats
+}
+
+/// Each stage's work accounting from `worked`, a tree of the same plan.
+fn graft_work(stats: &mut Stats, worked: &Stats) {
+    stats.work = worked.work;
+    if stats.children.len() == worked.children.len() {
+        for (s, w) in stats.children.iter_mut().zip(&worked.children) {
+            graft_work(s, w);
+        }
+    }
 }

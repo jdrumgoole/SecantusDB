@@ -45,13 +45,13 @@ def test_a_scan_of_two_in_lists_examines_mongods_keys(rust_mongo: Any, mongod: A
         assert keys(rust_mongo, f) == keys(mongod, f)
 
 
-@pytest.mark.backlog("RM-434")
+@pytest.mark.backlog_fixed("RM-434")
 def test_explain_gives_each_stage_its_work_accounting(rust_mongo: Any, mongod: Any) -> None:
     """mongod 8.2.11's `executionStats` gives each stage of the winning
     plan its work accounting -- `works`, `advanced`, `needTime`,
     `needYield`, `isEOF`, and a FETCH's `alreadyHasObj`, an IXSCAN's
     `seeks`, `dupsTested` and `dupsDropped` -- for `{a: 3}` over `a_1_c_1`.
-    This server's stages carry only their `nReturned` and examined counts."""
+    This server's stages carried only their `nReturned` and examined counts."""
 
     def fields(client: Any) -> list:
         return [

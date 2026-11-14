@@ -2474,24 +2474,16 @@ Still different, all 77:
       built for, each fitted by probing that platform's mongod 8.2.11.**
       Backlog-ID: RM-442
       Verify: tests/backlog/test_rm_340_342_plan_cache_gaps.py::test_an_entry_reports_its_estimated_size_on_linux
-- [ ] **`explain`'s winning plan has no work accounting.** mongod 8.2.11's
-      `executionStats` gives each stage its `works`, `advanced`, `needTime`,
-      `needYield`, `isEOF` and timings, a FETCH its `alreadyHasObj`, an
-      IXSCAN its `seeks`, `dupsTested` and `dupsDropped`. This server's
-      `executionStages` give a stage only its `nReturned` and examined
-      counts (`allPlansExecution` and `$planCacheStats` do carry the
-      accounting the trial counted). `tools/probes/explain_commands.py`
-      leaves these fields out of its comparison. Found 2026-11-08 (RM-342).
-      (This was RM-446: A DISTINCT_SCAN plan's `executionStats` gives no work
-      counters.) mongod 8.2.11's `executionStages` for a DISTINCT_SCAN plan --
-      of `distinct`, and of a `$group` it answers from one -- gives every
-      stage's `works`, `advanced`, `needTime`, `needYield`, `saveState`,
-      `restoreState` and `isEOF` (`distinct("x", {x: {$gt: 0}})` over `x_1`:
-      `works: 4`). This server's gives `nReturned` and the scan's own fields,
-      none of them. The trial's counters, in `allPlansExecution`, are given.
-      Found 2026-11-08 (RM-310).
-      Verify: tests/backlog/test_rm_found_2026_11_08_rm342.py::test_explain_gives_each_stage_its_work_accounting, tests/backlog/test_rm_found_2026_11_08_rm310.py::test_a_distinct_scan_run_reports_its_work_counters
-      Backlog-ID: RM-434
+- [ ] **A `$cursor` the pipeline stops reading reports a plan run to its
+      end.** Under `[{$match: {a: {$gt: 2}}}, {$unwind: "$b"}, {$limit: 3}]`
+      (100 documents, `a_1`), mongod 8.2.11's `DocumentSourceCursor` loads one
+      batch of 32 documents and stops: its FETCH and IXSCAN report
+      `nReturned` 32, 32 works, `saveState` 2, `restoreState` 1, `isEOF` 0.
+      This server's classic run goes to the end (70 documents), and leaves the
+      work accounting out where its stages' counts are not mongod's
+      (`cursor_yields`). Found 2026-11-14 (RM-434).
+      Verify: tests/backlog/test_rm_found_2026_11_14_rm434.py::test_a_cursor_the_pipeline_stops_reading_reports_one_batch
+      Backlog-ID: RM-692
 - [ ] **A `$sort` after a `$group` mongod pushes into SBE counts its
       documents smaller than mongod's.** `[{$group: {_id: "$a"}}, {$sort:
       {_id: 1}}]` over ten documents: mongod 8.2.11's `$sort` reports

@@ -119,7 +119,7 @@ pub(crate) enum Pull {
 /// that comes back full is followed by another unless the stages after the
 /// cursor have their `demand`, so a plan that returns exactly a batch's
 /// worth is asked once more and answers nothing.
-fn batches(n: i64, demand: Option<i64>) -> (i64, i64, bool) {
+pub(crate) fn batches(n: i64, demand: Option<i64>) -> (i64, i64, bool) {
     let (mut got, mut loads, mut size) = (0_i64, 0_i64, INITIAL_BATCH);
     loop {
         let this = size.min(n - got);
