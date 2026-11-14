@@ -2611,22 +2611,6 @@ Measured on a private PostgreSQL 15.19 cluster with `fs(a int, c text)`
 holding `(1, 'y')`.
 
 
-## Found while working RP-515 (2026-11-11)
-
-Measured on a private PostgreSQL 15.19 cluster. The gap tests are in
-`tests/backlog/test_rp_found_rp515.py`.
-
-- [ ] **`pg_get_function_arguments` and `pg_get_function_result` print
-      names unquoted.** PostgreSQL 15.19's `print_function_arguments` and
-      `print_function_rettype` pass each parameter's and TABLE column's
-      name through `quote_identifier`: `create function "F 4"("A b" int,
-      "select" int)` prints `"A b" integer, "select" integer`, and
-      `returns table(x int, "Y z" text)` prints `TABLE(x integer, "Y z"
-      text)`. Here `A b integer, select integer` and `TABLE(x integer, Y z
-      text)`.
-      Verify: tests/backlog/test_rp_found_rp515.py::test_argument_and_column_names_are_quoted
-      Backlog-ID: RP-876
-
 ## Found while working RP-467 (2026-11-08)
 
 - [ ] **Two schemas' tables of one name are not `checkNameSpaceConflicts`'

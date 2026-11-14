@@ -45,9 +45,10 @@ def rows(dsn: str, query: str) -> list[tuple[Any, ...]]:
         return c.execute(query).fetchall()
 
 
-# RP-876: `print_function_arguments` and `print_function_rettype` quote
-# each parameter's and TABLE column's name with `quote_identifier`.
-@pytest.mark.backlog("RP-876")
+# RP-876 (fixed): names were printed unquoted. `print_function_arguments`
+# and `print_function_rettype` quote each parameter's and TABLE column's
+# name with `quote_identifier`.
+@pytest.mark.backlog_fixed("RP-876")
 def test_argument_and_column_names_are_quoted(dsn: str) -> None:
     assert rows(
         dsn,
