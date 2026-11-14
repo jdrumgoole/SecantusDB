@@ -107,9 +107,11 @@ one beside it.
   quirk applications must not rely on, and folding anything PostgreSQL does
   not would raise errors it does not -- worse than zero rows. No answer a
   query returns differs. A cursor shows it too: since RP-744 its select
-  list is computed as it is fetched, so `declare c cursor for select 1/0
-  from (values (1)) s(k)` raises at the first FETCH where PostgreSQL 15.19
-  raises at the DECLARE.
+  list is computed as it is fetched, and since RP-897 its WHERE runs at the
+  first FETCH, so `declare c cursor for select 1/0 from (values (1)) s(k)`
+  (or `... where 1/(k - 1) > 0`) raises at the first FETCH where
+  PostgreSQL 15.19, which pulls the one-row VALUES up and folds, raises at
+  the DECLARE.
 - **Known residual — PL/pgSQL `SQL expression` CONTEXT frame**
   (`tools/probes/plpgsql_expr_context.py`, 58 of 60 shapes match PostgreSQL
   15.19): `(array[1,2])[1]/0` (libpg_query deparses the subexpression without
@@ -3658,11 +3660,12 @@ statement is VALUES-only and runs there as written. The gap tests are in
 ## Found while working RP-744 (2026-11-12)
 
 Measured on PostgreSQL 15.19: the VALUES-only statements on the shared
-reference on port 5415, the ones that create a function or a sequence on a
-private cluster. The gap tests are in `tests/backlog/test_rp_found_rp744.py`.
-Since RP-744 a cursor computes a plain select list as it is fetched
-(`portal_stream::PendingRows`); these are the shapes that still run whole
-at the DECLARE, and the cursor answers that differ either way.
+reference on port 5415, the ones that create a function, a sequence or a
+table on a private cluster. The gap tests are in
+`tests/backlog/test_rp_found_rp744.py`. Since RP-744, RP-895, RP-896 and
+RP-897 a cursor runs its query at the first FETCH and computes its select
+list as it is fetched (`portal_stream::PendingRows`); these are the shapes
+still computed whole, and the cursor answers that differ either way.
 
 - [ ] **A cursor reads a row again without computing it again.** Since
       RP-744 the rows a cursor has computed are kept and read back, so a
@@ -3690,11 +3693,18 @@ at the DECLARE, and the cursor answers that differ either way.
       RP-895 (2026-11-14).
       Verify: tests/backlog/test_rp_found_rp744.py::test_cursor_to_xml_in_from_reads_the_cursor_once
       Backlog-ID: RP-963
-- [ ] **A cursor over a set operation computes its rows at the DECLARE.**
-      `declare c cursor for select 1/(k - 1) from (values (2), (1)) s(k)
-      union all select 5` raises 22012 at the DECLARE; PostgreSQL 15.19's
-      Append is run as it is fetched, and `fetch 1` answers `1`.
-      Verify: tests/backlog/test_rp_found_rp744.py::test_a_cursor_over_a_union_computes_its_rows_as_they_are_fetched
+- [ ] **A cursor over a set operation whose branches unification converts
+      runs it whole at the first FETCH.** Since RP-896 a cursor over a
+      UNION ALL reads its branches in order as PostgreSQL's Append does
+      (`portal_stream::PendingRows::Append`), but only when every
+      branch's columns are already of the set operation's types
+      (`PgHandler::append_leaves`). A branch that is converted (`select
+      1/(k - 1) from (values (2), (1)) s(k) union all select 2.5`, int to
+      numeric; an untyped literal or NULL), and a UNION, INTERSECT or
+      EXCEPT under the UNION ALL, make the whole set operation run at the
+      first FETCH, which raises 22012 where PostgreSQL 15.19 answers `1`.
+      Needs the branch's rows converted as they are read.
+      Verify: tests/backlog/test_rp_found_rp744.py::test_a_cursor_over_a_converting_union_computes_its_rows_as_they_are_fetched
       Backlog-ID: RP-896
 - [ ] **A cursor's WHERE is evaluated for every row at its first FETCH.**
       Since RP-897 a cursor's query runs at the first FETCH that needs a

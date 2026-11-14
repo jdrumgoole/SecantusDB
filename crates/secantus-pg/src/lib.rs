@@ -35135,10 +35135,12 @@ impl PgHandler {
                                 tz,
                                 tail: None,
                                 base: 0,
-                                pending: Some(portal_stream::PendingRows::deferred(
-                                    *query,
-                                    capture_typed,
-                                )),
+                                pending: Some(match self.append_leaves(&query) {
+                                    Some(leaves) => portal_stream::PendingRows::append(leaves),
+                                    None => {
+                                        portal_stream::PendingRows::deferred(*query, capture_typed)
+                                    }
+                                }),
                                 failed: false,
                                 current_of: None,
                                 held: false,
@@ -40110,6 +40112,68 @@ impl PgHandler {
                 "this query is not supported on one side of a set operation".into(),
             )))),
         }
+    }
+
+    /// A cursor's `UNION ALL` (no ORDER BY, LIMIT or OFFSET over it) as the
+    /// leaves PostgreSQL's Append reads in order, each with whether its
+    /// rows' values are captured (a plain SELECT's); `None` to run it whole.
+    /// Only when every leaf's columns are already of the set operation's
+    /// types, so a leaf's rows, encoded in its own description, are the
+    /// rows the whole would send: a leaf that unification would convert
+    /// (`select 1 union all select 2.5`, an untyped literal or NULL), or a
+    /// set operation of another kind under it, runs the whole at once.
+    fn append_leaves(&self, stmt: &Statement) -> Option<Vec<(Statement, bool)>> {
+        fn flatten(stmt: &Statement, out: &mut Vec<Statement>) -> bool {
+            match stmt {
+                Statement::SetOp(set)
+                    if set.kind == secantus_pgplan::SetOpKind::Union
+                        && set.all
+                        && set.order.is_empty()
+                        && set.limit.is_none()
+                        && set.offset == 0
+                        && !set.with_ties =>
+                {
+                    flatten(&set.left, out) && flatten(&set.right, out)
+                }
+                Statement::SetOp(_) => false,
+                Statement::Select(_)
+                | Statement::SelectConstant(_)
+                | Statement::ValuesConstant(_)
+                | Statement::Aggregate(_) => {
+                    out.push(stmt.clone());
+                    true
+                }
+                _ => false,
+            }
+        }
+        if !matches!(stmt, Statement::SetOp(_)) {
+            return None;
+        }
+        let mut leaves = Vec::new();
+        if !flatten(stmt, &mut leaves) {
+            return None;
+        }
+        let types = |leaf: &Statement| -> Option<Vec<Type>> {
+            let fields = self.describe_planned(leaf.clone()).ok().flatten()?;
+            let types: Vec<Type> = fields.iter().map(|f| f.datatype().clone()).collect();
+            (!types.contains(&Type::UNKNOWN)).then_some(types)
+        };
+        let first = types(leaves.first()?)?;
+        if !leaves[1..]
+            .iter()
+            .all(|l| types(l).as_ref() == Some(&first))
+        {
+            return None;
+        }
+        Some(
+            leaves
+                .into_iter()
+                .map(|l| {
+                    let capture = matches!(l, Statement::Select(_));
+                    (l, capture)
+                })
+                .collect(),
+        )
     }
 
     /// One group's value for an output column that is an EXPRESSION over the

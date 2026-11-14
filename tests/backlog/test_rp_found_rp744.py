@@ -8,7 +8,9 @@ computed every row's select list at the DECLARE):
   persisted at COMMIT) is not computed again, where PostgreSQL recomputes
   a volatile column;
 - `select * from cursor_to_xml(...)` reads the cursor twice;
-- a cursor over a set operation computes its rows at the DECLARE;
+- a cursor over a set operation computed its rows at the DECLARE (fixed
+  for a UNION ALL whose branches have its types, RP-896), and still runs
+  one whose branches unification converts whole;
 - a cursor's WHERE and Sort ran at the DECLARE, where PostgreSQL runs
   them at the first FETCH (fixed, RP-897), and its WHERE is still
   evaluated for every row at that FETCH (RP-961);
@@ -27,6 +29,7 @@ from __future__ import annotations
 
 import uuid
 from collections.abc import Iterator
+from decimal import Decimal
 
 import psycopg
 import pytest
@@ -221,11 +224,11 @@ def test_cursor_to_xml_in_from_reads_the_cursor_once(dsn: str) -> None:
     ]
 
 
-@pytest.mark.backlog("RP-896")
+@pytest.mark.backlog_fixed("RP-896")
 def test_a_cursor_over_a_union_computes_its_rows_as_they_are_fetched(dsn: str) -> None:
     """PostgreSQL 15.19 runs a cursor's Append as it is fetched: `fetch 1`
     computes the first branch's first row only. Here the set operation's
-    rows are all computed at the DECLARE, which raises the second row's
+    rows were all computed at the DECLARE, which raised the second row's
     error."""
     assert _steps(
         dsn,
@@ -236,6 +239,102 @@ def test_a_cursor_over_a_union_computes_its_rows_as_they_are_fetched(dsn: str) -
             "rollback",
         ],
     ) == ["BEGIN", "DECLARE CURSOR", [(1,)], "ROLLBACK"]
+
+
+@pytest.mark.backlog_fixed("RP-896")
+def test_a_union_all_cursor_reads_its_branches_in_order(dsn: str) -> None:
+    """A cursor over a UNION ALL reads its branches as PostgreSQL 15.19's
+    Append does: a SCROLL cursor moves back across them; a branch another
+    statement of the block made run keeps its error for the FETCH that
+    reaches it; and a branch reads the DECLARE's snapshot, so a row the
+    block inserts after the DECLARE is in neither. Measured on a private
+    PostgreSQL 15.19 cluster."""
+    n = uuid.uuid4().hex[:8]
+    t = f"rp896_{n}"
+    with psycopg.connect(dsn, autocommit=True) as c:
+        c.execute(f"create table {t} (k int)")
+        c.execute(f"insert into {t} values (1)")
+    assert [
+        _steps(
+            dsn,
+            [
+                "begin",
+                "declare c scroll cursor for select k from (values (1), (2)) s(k)"
+                " union all select k * 10 from (values (3), (4)) s(k) union all select 7",
+                "fetch 3 from c",
+                "fetch backward 2 from c",
+                "move all in c",
+                "fetch prior from c",
+                "fetch absolute 2 from c",
+                "rollback",
+            ],
+        ),
+        _steps(
+            dsn,
+            [
+                "begin",
+                "declare c cursor for select k from (values (1), (2)) s(k)"
+                " union all select 1/(k - 1) from (values (2), (1)) s(k)",
+                "select 1",
+                "fetch 3 from c",
+                "fetch 1 from c",
+                "rollback",
+            ],
+        ),
+        _steps(
+            dsn,
+            [
+                "begin",
+                f"declare c cursor for select k from {t} union all select k + 100 from {t}",
+                "fetch 1 from c",
+                f"insert into {t} values (2)",
+                "fetch all from c",
+                "rollback",
+            ],
+        ),
+    ] == [
+        [
+            "BEGIN",
+            "DECLARE CURSOR",
+            [(1,), (2,), (30,)],
+            [(2,), (1,)],
+            "MOVE 4",
+            [(7,)],
+            [(2,)],
+            "ROLLBACK",
+        ],
+        [
+            "BEGIN",
+            "DECLARE CURSOR",
+            [(1,)],
+            [(1,), (2,), (1,)],
+            ("22012", "division by zero"),
+            "ROLLBACK",
+        ],
+        ["BEGIN", "DECLARE CURSOR", [(1,)], "INSERT 0 1", [(101,)], "ROLLBACK"],
+    ]
+
+
+@pytest.mark.backlog("RP-896")
+def test_a_cursor_over_a_converting_union_computes_its_rows_as_they_are_fetched(
+    dsn: str,
+) -> None:
+    """PostgreSQL 15.19's Append converts a branch's rows to the set
+    operation's types as it reads them, so `fetch 1` over `select 1/(k - 1)
+    ... union all select 2.5` answers the first branch's first row as a
+    numeric. Here a branch whose columns unification converts makes the
+    whole set operation run at the first FETCH, which raises the second
+    row's error. Measured on the shared reference."""
+    assert _steps(
+        dsn,
+        [
+            "begin",
+            "declare c cursor for select 1/(k - 1) from (values (2), (1)) s(k)"
+            " union all select 2.5",
+            "fetch 1 from c",
+            "rollback",
+        ],
+    ) == ["BEGIN", "DECLARE CURSOR", [(Decimal("1"),)], "ROLLBACK"]
 
 
 @pytest.mark.backlog_fixed("RP-897")

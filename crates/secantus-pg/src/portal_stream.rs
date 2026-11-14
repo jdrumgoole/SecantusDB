@@ -1155,6 +1155,9 @@ pub(crate) enum PendingRows {
     /// before it moved the snapshot (`drain_block_scans`): the first FETCH
     /// that reaches a row raises it.
     Failed(PgWireError),
+    /// A `UNION ALL`'s leaves, read in order as PostgreSQL's Append reads
+    /// its subplans: a leaf runs when the one before it has ended (RP-896).
+    Append(std::collections::VecDeque<PendingRows>),
 }
 
 impl PendingRows {
@@ -1176,8 +1179,32 @@ impl PendingRows {
         }
     }
 
+    /// An Append of `leaves`, each run when the one before it ends.
+    pub(crate) fn append(leaves: Vec<(Statement, bool)>) -> Self {
+        Self::Append(
+            leaves
+                .into_iter()
+                .map(|(query, capture_typed)| Self::deferred(query, capture_typed))
+                .collect(),
+        )
+    }
+
+    /// Is there a query in it not run yet?
     fn is_unstarted(&self) -> bool {
-        matches!(self, Self::Unstarted { .. })
+        match self {
+            Self::Unstarted { .. } => true,
+            Self::Append(leaves) => leaves.iter().any(Self::is_unstarted),
+            _ => false,
+        }
+    }
+
+    /// Does a running stream in it read the database (`reads`)?
+    fn reads(&self) -> bool {
+        match self {
+            Self::Running { reads, .. } => *reads,
+            Self::Append(leaves) => leaves.iter().any(Self::reads),
+            _ => false,
+        }
     }
 }
 
@@ -1389,6 +1416,7 @@ impl PgHandler {
     /// it has not started.
     fn pull_rows(&self, pending: PendingRows, wanted: usize) -> Pulled {
         let (mut rows, capture_typed, reads, schema) = match pending {
+            PendingRows::Append(leaves) => return self.pull_append(leaves, wanted),
             PendingRows::Failed(e) => {
                 return Pulled {
                     rows: Vec::new(),
@@ -1481,6 +1509,47 @@ impl PgHandler {
         }
     }
 
+    /// Pull up to `wanted` rows from an Append's leaves, in order. Each
+    /// leaf's rows are encoded in its own row description, which has the
+    /// Append's column types (`PgHandler::append_leaves`), and the Append's
+    /// description stays the cursor's.
+    fn pull_append(
+        &self,
+        mut leaves: std::collections::VecDeque<PendingRows>,
+        wanted: usize,
+    ) -> Pulled {
+        let mut out = Pulled {
+            rows: Vec::new(),
+            captured: Some(Vec::new()),
+            schema: None,
+            rest: None,
+            failure: None,
+        };
+        while out.rows.len() < wanted {
+            let Some(leaf) = leaves.pop_front() else {
+                return out;
+            };
+            let pulled = self.pull_rows(leaf, wanted - out.rows.len());
+            out.captured = match (out.captured.take(), pulled.captured) {
+                (Some(mut all), Some(more)) if more.len() == pulled.rows.len() => {
+                    all.extend(more);
+                    Some(all)
+                }
+                _ => None,
+            };
+            out.rows.extend(pulled.rows);
+            if let Some(e) = pulled.failure {
+                out.failure = Some(e);
+                return out;
+            }
+            if let Some(rest) = pulled.rest {
+                leaves.push_front(rest);
+            }
+        }
+        out.rest = (!leaves.is_empty()).then_some(PendingRows::Append(leaves));
+        out
+    }
+
     /// Before a statement of the block moves its snapshot or writes, run
     /// every cursor's query not run yet (`PendingRows::Unstarted`), so it
     /// reads what the DECLARE's snapshot holds; its rows are still
@@ -1506,7 +1575,7 @@ impl PgHandler {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .iter()
-            .filter(|(_, c)| matches!(c.pending, Some(PendingRows::Running { reads: true, .. })))
+            .filter(|(_, c)| c.pending.as_ref().is_some_and(PendingRows::reads))
             .map(|(name, _)| name.clone())
             .collect();
         for name in reading {
@@ -1526,17 +1595,66 @@ impl PgHandler {
     /// Run cursor `name`'s query, not run yet, leaving its rows unpolled.
     fn start_one_deferred(&self, name: &str) {
         {
-            let Some(PendingRows::Unstarted {
-                query,
-                capture_typed,
-            }) = self
+            let pending = self
                 .cursors
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .get_mut(name)
-                .and_then(|c| c.pending.take())
-            else {
-                return;
+                .and_then(|c| c.pending.take());
+            let (query, capture_typed) = match pending {
+                Some(PendingRows::Unstarted {
+                    query,
+                    capture_typed,
+                }) => (query, capture_typed),
+                // Each leaf runs now, in the DECLARE's snapshot; a leaf
+                // that fails is kept, in its place, for the FETCH that
+                // reaches it.
+                Some(PendingRows::Append(leaves)) => {
+                    let leaves = leaves
+                        .into_iter()
+                        .map(|leaf| match leaf {
+                            PendingRows::Unstarted {
+                                query,
+                                capture_typed,
+                            } => {
+                                let started = self.start_pending(*query, capture_typed);
+                                match (started.failure, started.rest) {
+                                    (Some(e), _) => PendingRows::Failed(e),
+                                    (None, Some(rest)) if started.rows.is_empty() => rest,
+                                    // Rows its executor computed whole: a
+                                    // stream over them, their values read
+                                    // back from the text.
+                                    (None, _) => PendingRows::new(
+                                        futures::stream::iter(started.rows.into_iter().map(Ok))
+                                            .boxed(),
+                                        false,
+                                    ),
+                                }
+                            }
+                            other => other,
+                        })
+                        .collect();
+                    if let Some(c) = self
+                        .cursors
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .get_mut(name)
+                    {
+                        c.pending = Some(PendingRows::Append(leaves));
+                    }
+                    return;
+                }
+                other => {
+                    if let Some(c) = self
+                        .cursors
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .get_mut(name)
+                    {
+                        c.pending = other;
+                    }
+                    return;
+                }
             };
             let started = self.start_pending(*query, capture_typed);
             let mut cursors = self.cursors.lock().unwrap_or_else(|e| e.into_inner());
