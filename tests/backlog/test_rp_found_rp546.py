@@ -337,9 +337,9 @@ def test_multi_table_drop_detail_order(dsn: str) -> None:
 
 
 # A CASCADE DROP TABLE of several tables is one `performMultipleDeletions`
-# and so one notice, the last table's dependants first. Here each table is
+# and so one notice, the last table's dependants first. Each table was
 # dropped on its own, each with its own notice.
-@pytest.mark.backlog("RP-858")
+@pytest.mark.backlog_fixed("RP-858")
 def test_multi_table_drop_cascade_notice(dsn: str) -> None:
     notices: list[tuple[str | None, str | None]] = []
     with psycopg.connect(dsn, autocommit=True) as c:

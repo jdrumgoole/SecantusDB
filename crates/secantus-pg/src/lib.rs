@@ -15975,20 +15975,23 @@ impl PgHandler {
         })
     }
 
-    /// A RESTRICT DROP TABLE naming more than one table that exists is one
-    /// `performMultipleDeletions`: `reportDependentObjects` refuses the whole
-    /// statement under `cannot drop desired object(s)`, its DETAIL reading
-    /// `targetObjects` backwards -- the last table's dependants first, and an
-    /// object two of them reach named once, under the first table that
-    /// reaches it (RP-564). One table keeps its own name in the headline,
-    /// which the drop itself reports.
-    fn refuse_multi_table_drop(&self, present: &[String], dropping: &[String]) -> PgWireResult<()> {
+    /// A DROP TABLE naming more than one table that exists is one
+    /// `performMultipleDeletions`, and `reportDependentObjects` reports the
+    /// whole statement at once, reading `targetObjects` backwards: the last
+    /// table's dependants first, and an object two of them reach named
+    /// once, under the first table that reaches it. `None` for a statement
+    /// with fewer than two such tables, whose one drop reports itself.
+    fn multi_table_dependants(
+        &self,
+        present: &[String],
+        dropping: &[String],
+    ) -> PgWireResult<Option<Vec<(String, String)>>> {
         let existing: Vec<&String> = present
             .iter()
             .filter(|t| self.lookup(t).is_some())
             .collect();
         if existing.len() < 2 {
-            return Ok(());
+            return Ok(None);
         }
         let mut lines: Vec<(String, String)> = Vec::new();
         for table in existing.into_iter().rev() {
@@ -15999,7 +16002,17 @@ impl PgHandler {
                 .collect();
             lines.extend(self.table_dependants(table, &children, dropping)?.objects);
         }
-        let lines = row_type_depends::last_reached(lines);
+        Ok(Some(row_type_depends::last_reached(lines)))
+    }
+
+    /// A RESTRICT DROP TABLE of several tables ([`Self::multi_table_dependants`])
+    /// refuses the whole statement under `cannot drop desired object(s)`
+    /// (RP-564). One table keeps its own name in the headline, which the
+    /// drop itself reports.
+    fn refuse_multi_table_drop(&self, present: &[String], dropping: &[String]) -> PgWireResult<()> {
+        let Some(lines) = self.multi_table_dependants(present, dropping)? else {
+            return Ok(());
+        };
         if lines.is_empty() {
             return Ok(());
         }
@@ -45622,8 +45635,15 @@ impl PgHandler {
                     drop_kind::RelKind::Table
                 };
                 let present = self.check_drop_kinds(&drop.tables, right, drop.if_exists)?;
+                // A CASCADE of several tables is one notice for the whole
+                // statement, sent before any of them goes (RP-858).
+                let mut noticed = false;
                 if !drop.cascade {
                     self.refuse_multi_table_drop(&present, &drop.tables)?;
+                } else if let Some(lines) = self.multi_table_dependants(&present, &drop.tables)? {
+                    let descs: Vec<String> = lines.into_iter().map(|(o, _)| o).collect();
+                    self.cascade_notice(&descs);
+                    noticed = true;
                 }
                 for table in &present {
                     // `heap_drop_with_catalog`: as a TRUNCATE does.
@@ -45682,8 +45702,11 @@ impl PgHandler {
                                 );
                                 return Err(PgWireError::UserError(Box::new(info)));
                             }
-                            let descs: Vec<String> = objects.into_iter().map(|(o, _)| o).collect();
-                            self.cascade_notice(&descs);
+                            if !noticed {
+                                let descs: Vec<String> =
+                                    objects.into_iter().map(|(o, _)| o).collect();
+                                self.cascade_notice(&descs);
+                            }
                             self.drop_row_type_dependents(&row_type)?;
                             for (child, fk) in &fks {
                                 let mut def =

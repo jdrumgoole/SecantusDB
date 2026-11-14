@@ -2699,21 +2699,6 @@ tests are in `tests/backlog/test_rp_found_rp546.py`.
       Backlog-ID: RP-567
       Verify: tests/backlog/test_rp_found_rp546.py::test_regprocedure_quotes_as_format_procedure
 
-## Found while working RP-564 (2026-11-11)
-
-Measured on a private PostgreSQL 15.19 cluster. The gap test is in
-`tests/backlog/test_rp_found_rp546.py`.
-
-- [ ] **A DROP TABLE CASCADE of several tables sends one notice per
-      table.** PostgreSQL 15.19's `performMultipleDeletions` reports the
-      whole statement once: `drop table n564a, n564b cascade` is one
-      `drop cascades to 5 other objects`, the last table's dependants
-      first. Here each table is dropped on its own and sends its own
-      notice (`... 3 other objects`, then `... 2 other objects`). RESTRICT
-      already refuses the statement as one since RP-564.
-      Verify: tests/backlog/test_rp_found_rp546.py::test_multi_table_drop_cascade_notice
-      Backlog-ID: RP-858
-
 ## Found while working RP-527 (2026-11-08)
 
 Measured on a private PostgreSQL 15.19 cluster. The gap tests are in
