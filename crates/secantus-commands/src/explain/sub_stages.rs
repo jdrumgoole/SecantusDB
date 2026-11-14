@@ -94,15 +94,19 @@ fn facet(
         let Bson::Array(stages) = sub else {
             return;
         };
-        let stages: Vec<Document> = stages
-            .iter()
-            .filter_map(Bson::as_document)
-            .cloned()
+        // As mongod's optimizer leaves the pipeline (RM-538).
+        let stages: Vec<Document> = super::hoist::optimized_sub_pipeline(stages)
+            .into_iter()
+            .filter_map(|s| match s {
+                Bson::Document(d) => Some(d),
+                _ => None,
+            })
             .collect();
         let mut tee = doc! { "$internalFacetTeeConsumer": {} };
         counted(&mut tee, taken);
         let mut pipeline = vec![Bson::Document(tee)];
         pipeline.extend(listed_runs(ctx, target, &head, &stages, options, db));
+        shape::fold_sort_limits(&mut pipeline);
         filled.insert(field.clone(), pipeline);
     }
     *out = filled;

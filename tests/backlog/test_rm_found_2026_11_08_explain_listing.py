@@ -49,11 +49,12 @@ SORT_THEN_LIMIT: list[list] = [
 ]
 
 
-@pytest.mark.backlog("RM-538")
+@pytest.mark.backlog_fixed("RM-538")
 def test_sort_and_limit_after_the_cursor_are_one_stage(rust_mongo: Any, mongod: Any) -> None:
     """mongod 8.2.11 lists a `$sort` and the `$limit` after it as one
     `$sort` with `limit`, where the cursor does not absorb them: after a
-    `$replaceRoot`, and in a `$facet`."""
+    `$replaceRoot`, and in a `$facet`. This server listed two stages until
+    2026-11-14."""
     for pipeline in SORT_THEN_LIMIT:
         got = _explain(rust_mongo, pipeline)["stages"][1:]
         want = _explain(mongod, pipeline)["stages"][1:]

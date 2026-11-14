@@ -207,28 +207,43 @@ def test_a_twelve_byte_string_is_kept_in_its_value(
 
 
 def _facet_sort_limit(client: Any) -> Any:
-    return _explained(
-        client.admin,
-        1,
-        [
-            {"$documents": [{"a": 1}, {"a": 2}]},
-            {"$facet": {"x": [{"$sort": {"a": 1}}, {"$limit": 1}]}},
-        ],
-        "executionStats",
-        "$facet",
+    """The `$facet` as listed at `executionStats`, less the size its top-k
+    sort reports (RM-689)."""
+
+    def without_size(value: Any) -> Any:
+        if isinstance(value, dict):
+            return {
+                k: without_size(v)
+                for k, v in value.items()
+                if k != "totalDataSizeSortedBytesEstimate"
+            }
+        if isinstance(value, (list, tuple)):
+            return type(value)(without_size(v) for v in value)
+        return value
+
+    return without_size(
+        _explained(
+            client.admin,
+            1,
+            [
+                {"$documents": [{"a": 1}, {"a": 2}]},
+                {"$facet": {"x": [{"$sort": {"a": 1}}, {"$limit": 1}]}},
+            ],
+            "executionStats",
+            "$facet",
+        )
     )
 
 
-@pytest.mark.backlog("RM-685")
+@pytest.mark.backlog_fixed("RM-685")
 def test_a_sort_and_its_limit_in_a_facet_are_one_stage(
     rust_mongo: Any,
     mongod_rs: Any,  # noqa: F811
 ) -> None:
     """mongod 8.2.11 folds a `$limit` into the `$sort` before it inside a
-    `$facet`'s pipeline too, and the top-1 sort reports no bytes sorted
-    (`{$sort: {sortKey: {a: 1}, limit: 1}}`, `totalDataSizeSortedBytesEstimate`
-    0). This server lists the two stages, the sort counting both documents
-    (490). The fold outside a facet is RM-538."""
+    `$facet`'s pipeline too (`{$sort: {sortKey: {a: 1}, limit: 1}}`). This
+    server listed the two stages until RM-538 (2026-11-14). The size the
+    top-k sort reports is RM-689."""
     assert _facet_sort_limit(rust_mongo) == _facet_sort_limit(mongod_rs)
 
 

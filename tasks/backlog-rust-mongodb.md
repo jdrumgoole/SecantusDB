@@ -919,7 +919,7 @@ These are explicit non-goals. Don't add them without a reason.
         enumeration;
       - the other aggregates: one with a `$match` or `$redact` left after
         its read (mongod's optimizer moves some where this server's does
-        not: RM-538, RM-580), a `$limit` there (it stops its source short
+        not: RM-580), a `$limit` there (it stops its source short
         of the documents this server runs in one go), a `$lookup`,
         `$unionWith`, `$facet`, `$geoNear` or `$out` / `$merge`, a stage
         read whole that SBE does not take whole (a `$sort` after a
@@ -1961,21 +1961,26 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       2026-11-14 working RM-537.
       Verify: tests/backlog/test_rm_found_2026_11_14.py::test_parsed_query_parses_these_leaves_as_mongod
       Backlog-ID: RM-660
-- [ ] **Explain lists stages mongod's optimizer rewrites as written.**
-      mongod 8.2.11 drops a `$replaceWith: "$$ROOT"`, folds a `$limit` into
-      the `$sort` before it (`{$sort: {sortKey, limit: 1}}`, no `$limit`
-      stage), moves a `$match` on a field an `$addFields` / `$set` renames
-      (`{b: "$a"}`) ahead of it onto `a`, and lists `$sampleRate: 0.5` as
-      `$expr: {$lt: [{$rand: {}}, {$const: 0.5}]}`. This server lists
-      each stage as written. Found 2026-11-10 (RM-414).
-      (This was RM-427: `explain` lists a `$sort` and the `$limit` after it as
-      two stages where the cursor does not absorb them.) mongod 8.2.11 lists
-      one `$sort: {sortKey, limit}` after a `$replaceRoot`, in a `$facet`
-      sub-pipeline, and after a `$rankFusion` (its own `$sort` takes the
-      `limit`), and the stages before it then count every document, not the
-      `limit` the `$limit` pulled. Found 2026-11-08 working RM-200.
-      Verify: tests/backlog/test_rm_found_2026_11_10_explain_rewrites.py::test_the_pipeline_rewrites_mongod_lists, tests/backlog/test_rm_found_2026_11_08_explain_listing.py::test_sort_and_limit_after_the_cursor_are_one_stage
-      Backlog-ID: RM-538
+- [ ] **Explain lists a `$match` behind a `$group` or a `$$ROOT.x` new
+      root where mongod's optimizer does not leave it.** mongod 8.2.11 drops
+      a `$match` of nothing behind a `$group` (`{}`, and `{$sampleRate: 1}`,
+      which it parses into nothing), and its query then takes the whole
+      pipeline; it leaves `{$alwaysTrue: 1}` there, which this server moves
+      into the query. It moves a `$match` behind `{$replaceRoot: {newRoot:
+      "$$ROOT.x"}}` into the query renamed onto `x`, as behind `"$x"`
+      (RM-536), which this server leaves behind the stage. Found 2026-11-14
+      working RM-538.
+      Verify: tests/backlog/test_rm_found_2026_11_14_rm538.py::test_a_match_after_a_group_as_the_optimizer_leaves_it, tests/backlog/test_rm_found_2026_11_14_rm538.py::test_a_match_moves_ahead_of_a_root_variable_new_root
+      Backlog-ID: RM-662
+- [ ] **`explain` of a `$sampleRate` the run refuses succeeds.** mongod
+      8.2.11 refuses to explain `{$match: {$sampleRate: 2}}` (BadValue,
+      "numeric argument to $sampleRate must be in [0, 1]") and `{$sampleRate:
+      "x"}` (BadValue, "argument to $sampleRate must be a numeric type"), as
+      it refuses to run them; this server's run refuses both, but its
+      `explain` answers, listing the `$sampleRate` as written. Found
+      2026-11-14 working RM-538.
+      Verify: tests/backlog/test_rm_found_2026_11_14_rm538.py::test_explain_refuses_a_sample_rate_the_run_refuses
+      Backlog-ID: RM-663
 - [ ] **Explain leaves a `$match` after a `$redact` where it was
       written.** mongod 8.2.11 copies a `$match` that follows a `$redact`
       ahead of it and into the query (`[{$redact: "$$KEEP"}, {$match: {z:
@@ -2019,14 +2024,17 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       budget. Found 2026-11-14 (RM-539).
       Verify: tests/backlog/test_rm_found_2026_11_14_rm539.py::test_a_twelve_byte_string_is_kept_in_its_value
       Backlog-ID: RM-684
-- [ ] **A `$sort` and the `$limit` after it in a `$facet` are two stages.**
-      mongod 8.2.11 folds the `$limit` into the `$sort` inside a facet's
-      pipeline as well (`{$sort: {sortKey: {a: 1}, limit: 1}}`), and that
-      top-1 sort reports `totalDataSizeSortedBytesEstimate` 0; this server
-      lists the two stages, the sort counting every document (490 for two).
-      The fold outside a facet is RM-538. Found 2026-11-14 (RM-539).
-      Verify: tests/backlog/test_rm_found_2026_11_14_rm539.py::test_a_sort_and_its_limit_in_a_facet_are_one_stage
-      Backlog-ID: RM-685
+- [ ] **A `$sort` that took a `$limit` reports the size of every document
+      it sorted.** mongod 8.2.11's `$sort` with a `limit` is a top-k sorter:
+      its `totalDataSizeSortedBytesEstimate` is the size of the documents it
+      keeps (490 for two `$documents` documents of 245), and 0 for a `limit`
+      of 1, in a `$facet` and outside one. Since RM-538 (2026-11-14) this
+      server lists the one `{$sort: {sortKey, limit}}` mongod does, but
+      measures each stage from a run that stops at it, so the `$sort` counts
+      every document it took (735 for three). Found 2026-11-14 (RM-539,
+      RM-538; the fold was RM-685).
+      Verify: tests/backlog/test_rm_found_2026_11_14_rm538.py::test_a_top_k_sort_reports_the_documents_it_keeps
+      Backlog-ID: RM-689
 - [ ] **A run of `$documents` counts its documents as read BSON.** mongod
       8.2.11 counts each document a `$documents` makes as the storage its
       expression object built (`metrics.query.sort.totalBytesSorted` grows

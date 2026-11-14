@@ -2077,6 +2077,7 @@ fn reply_for(r: &Request, verbosity: Verbosity, ctx: &mut CommandContext) -> Han
                 stages.push(Bson::Document(listed));
             }
         }
+        shape::fold_sort_limits(&mut stages);
         reply.insert("stages", stages);
         reply.insert("serverInfo", server_info(ctx));
         reply.insert("serverParameters", server_parameters(false));
@@ -2254,6 +2255,7 @@ fn sbe_reply(
             stages.push(Bson::Document(listed));
         }
     }
+    shape::fold_sort_limits(&mut stages);
     reply.insert("stages", stages);
     reply.insert("serverInfo", server_info(ctx));
     reply.insert("serverParameters", server_parameters(false));
@@ -2923,6 +2925,7 @@ fn own_source_reply(
             stages.push(Bson::Document(listed));
         }
     }
+    shape::fold_sort_limits(&mut stages);
     let mut reply = doc! { "explainVersion": "1", "stages": stages };
     reply.insert("serverInfo", server_info(ctx));
     reply.insert("serverParameters", server_parameters(false));

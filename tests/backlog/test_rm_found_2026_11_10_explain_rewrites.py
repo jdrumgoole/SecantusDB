@@ -115,7 +115,7 @@ REWRITES = {
 }
 
 
-@pytest.mark.backlog("RM-538")
+@pytest.mark.backlog_fixed("RM-538")
 def test_the_pipeline_rewrites_mongod_lists(
     rust_mongo: Any,
     mongod_rs: Any,  # noqa: F811
@@ -124,7 +124,7 @@ def test_the_pipeline_rewrites_mongod_lists(
     into the `$sort` before it (`{$sort: {sortKey, limit: 1}}`), moves a
     `$match` on a field an `$addFields` / `$set` renames ahead of it onto
     the field it names, and lists `$sampleRate` as the `$expr` of `$rand`
-    it is. This server lists each stage as written."""
+    it is. This server listed each stage as written until 2026-11-14."""
     assert _stages(rust_mongo, REWRITES, "queryPlanner") == _stages(
         mongod_rs, REWRITES, "queryPlanner"
     )

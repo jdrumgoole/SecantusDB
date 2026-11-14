@@ -354,8 +354,56 @@ fn field_path(s: &str) -> Option<String> {
     (s.starts_with('$') && !s.starts_with("$$")).then(|| s.to_string())
 }
 
+/// Whether `e` draws a random number (`$rand`) anywhere outside a
+/// `$literal`: mongod folds no expression that does (`ExpressionRand` is
+/// not constant), so `{$lt: [{$rand: {}}, 0.5]}` is printed as it is, with
+/// `{$const: 0.5}` (measured 8.2.11, 2026-11-14).
+pub fn draws_random(e: &Bson) -> bool {
+    match e {
+        Bson::Array(a) => a.iter().any(draws_random),
+        Bson::Document(d) => d.iter().any(|(k, v)| match k.as_str() {
+            "$rand" => true,
+            "$literal" => false,
+            _ => draws_random(v),
+        }),
+        _ => false,
+    }
+}
+
+/// `{$sampleRate: p}` as mongod 8.2 parses it (`parseSampleRate`, measured
+/// 8.2.11, 2026-11-14): a rate of 0 is `{$alwaysFalse: 1}`, a rate of 1
+/// matches everything (the empty filter), and any other is `{$expr: {$lt:
+/// [{$rand: {}}, p]}}` with `p` a double. `None`: not a number in [0, 1],
+/// which the run refuses, left as written.
+pub fn sample_rate_clause(rate: &Bson) -> Option<Document> {
+    let p = match rate {
+        Bson::Decimal128(d) => d.to_string().parse::<f64>().ok(),
+        Bson::Double(_) | Bson::Int32(_) | Bson::Int64(_) => crate::numeric::as_float_like(rate),
+        _ => None,
+    }
+    .filter(|p| (0.0..=1.0).contains(p))?;
+    let mut out = Document::new();
+    if p == 0.0 {
+        out.insert("$alwaysFalse", 1);
+    } else if p < 1.0 {
+        let mut lt = Document::new();
+        lt.insert(
+            "$lt",
+            Bson::Array(vec![
+                one("$rand", Bson::Document(Document::new())),
+                Bson::Double(p),
+            ]),
+        );
+        out.insert("$expr", lt);
+    }
+    Some(out)
+}
+
 fn optimize(e: &Bson) -> Opt {
-    if is_constant(e) {
+    if matches!(e, Bson::Document(d) if d.len() == 1 && d.contains_key("$rand")) {
+        return Opt::Expr(e.clone());
+    }
+    if is_constant(e) && !draws_random(e) {
         // A constant mongod cannot evaluate is an error at run time; keep it
         // as written rather than guess its fold.
         return match evaluate_constant(e) {
@@ -630,5 +678,28 @@ mod tests {
         ] {
             assert!(!faults(e.clone()), "{e}");
         }
+    }
+
+    /// mongod 8.2.11 folds no expression that draws a random number, and
+    /// parses `$sampleRate` into one (`parseSampleRate`; RM-538).
+    #[test]
+    fn a_random_number_is_never_folded() {
+        let rand_lt = bson!({"$expr": {"$lt": [{"$rand": {}}, {"$const": 0.5}]}});
+        assert_eq!(
+            parsed(bson!({"$expr": {"$lt": [{"$rand": {}}, 0.5]}})),
+            rand_lt
+        );
+        assert_eq!(parsed(bson!({"$sampleRate": 0.5})), rand_lt);
+        assert_eq!(
+            parsed(bson!({"a": 1, "$sampleRate": 0.5})),
+            bson!({"$and": [{"a": {"$eq": 1}}, rand_lt.clone()]})
+        );
+        assert_eq!(
+            parsed(bson!({"$sampleRate": 0})),
+            bson!({"$alwaysFalse": 1})
+        );
+        assert_eq!(parsed(bson!({"$sampleRate": 1.0})), bson!({}));
+        // A rate the run refuses is left as written.
+        assert_eq!(parsed(bson!({"$sampleRate": 2})), bson!({"$sampleRate": 2}));
     }
 }

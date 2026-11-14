@@ -441,6 +441,11 @@ fn clauses(filter: &Document) -> Vec<Document> {
                     }
                 }
             },
+            // The clause mongod parses it into (RM-538).
+            "$sampleRate" => match crate::expr_rewrite::sample_rate_clause(value) {
+                Some(parsed) => out.extend(clauses(&parsed)),
+                None => out.push(one("$sampleRate", value.clone())),
+            },
             other if other.starts_with('$') => out.push(one(other, value.clone())),
             other => out.extend(field_clauses(other, value)),
         }
