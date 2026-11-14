@@ -2571,7 +2571,17 @@ holding `(1, 'y')`.
       since a joined row is keyed by the bare name, and `create view v as
       select t.a from s1.t t join s2.t on s2.t.a = t.a` is accepted, its
       definition then reading `t.a = t.a`. Measured on a private 15.19
-      cluster.
+      cluster. The join paths disagree with each other (probed 2026-11-14):
+      `from s1.t, s2.t` and `s1.t join s2.t on s2.t.a = s1.t.a` already run,
+      while `s1.t join s2.t on true` and `s1.t t join s2.t on true` are
+      42712. The 42712 checks are in `joins.rs` (`leaf_with_names` and the
+      registry in the join builder), which register a leaf by its bare
+      alias, and that alias is also the leaf's join-key base (`join_key`)
+      and its `ScopeCol::qual`. Faithful: give an unaliased leaf a key
+      base that names the relation (schema included), keep `qual` = the
+      bare name so that `t.a` naming two leaves is ambiguous (42P09) and
+      `s2.t.a` picks one, and compare registry entries by relation
+      identity for unaliased items, by name otherwise.
       Backlog-ID: RP-526
       Verify: tests/backlog/test_rp_found_rp467.py::test_same_name_relations_in_from
 
