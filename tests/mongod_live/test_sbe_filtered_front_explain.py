@@ -16,6 +16,7 @@ from typing import Any
 
 import pytest
 
+from tests.backlog.opdebug import no_timed_yields
 from tests.mongod_live.conftest import same
 from tests.mongod_live.test_sbe_group_explain import strip
 
@@ -72,9 +73,14 @@ def _setup(client: Any) -> Any:
 
 def _explain(client: Any, cmd: dict, verbosity: str) -> Any:
     db = _setup(client)
-    # Warm: the reply is compared from a second run.
-    db.command("explain", cmd, verbosity=verbosity)
-    return strip(db.command("explain", cmd, verbosity=verbosity), _uuid(db, "c"))
+    # Warm: the reply is compared from a second run. Time-based yields are
+    # off: under CI load either server can yield once more (`saveState` /
+    # `restoreState` 3/2 against 2/1, PG snapshot PR #2732, 2026-11-14), and
+    # the stages' counts are compared, not the machine's speed.
+    with no_timed_yields(client):
+        db.command("explain", cmd, verbosity=verbosity)
+        reply = db.command("explain", cmd, verbosity=verbosity)
+    return strip(reply, _uuid(db, "c"))
 
 
 VERBOSITIES = ["queryPlanner", "executionStats", "allPlansExecution"]
