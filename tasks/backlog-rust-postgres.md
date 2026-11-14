@@ -1177,15 +1177,6 @@ one beside it.
       Verify: tests/backlog/test_rp_found_rp921.py::test_a_partitions_copy_of_a_named_index_is_named_by_its_columns
       Backlog-ID: RP-930
 
-- [ ] **OPEN — a leaf partition's inherited indexes are shown as never
-      built.** A leaf partition created under a partitioned table with a
-      user index: PostgreSQL 15.19 builds each copy over the new heap and
-      records 1 page and 0 tuples (`index_update_stats`); `secantusd-pg`
-      answers 0 pages and -1 tuples for the copies of the user's indexes
-      (its primary key's copy is right).
-      Verify: tests/backlog/test_rp_found_rp921.py::test_a_leaf_partitions_inherited_indexes_are_built
-      Backlog-ID: RP-932
-
 - [ ] **OPEN — psql's `\d` column query straight after DDL builds all of
       `pg_type` for a table of two column types.** The collation subquery
       (`tests/backlog/test_rp_catalog_latency.py`'s `COLLATION_QUERY`) over
