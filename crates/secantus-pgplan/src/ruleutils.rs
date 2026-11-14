@@ -445,6 +445,29 @@ impl<'a> Printer<'a> {
     /// Resolve a column reference as ruleutils prints it: `(refname,
     /// column, type)`, the refname empty where the column prints
     /// unqualified (a "dangerous" merged USING column of an unnamed JOIN).
+    /// A whole-row reference `rel.*` to a relation in scope: the name it
+    /// prints as and its row type (`get_variable` of a whole-row Var).
+    fn whole_row(&self, c: &pg_query::protobuf::ColumnRef) -> Option<(String, String)> {
+        let [rel, star] = c.fields.as_slice() else {
+            return None;
+        };
+        if !matches!(star.node.as_ref(), Some(N::AStar(_))) {
+            return None;
+        }
+        let rel = sval(rel)?;
+        self.scopes.iter().rev().find_map(|scope| {
+            scope
+                .iter()
+                .find(|r| {
+                    r.kind == RteKind::Relation
+                        && r.hidden_by.is_none()
+                        && !r.name.is_empty()
+                        && r.name == rel
+                })
+                .map(|r| (r.refname.clone(), r.name.clone()))
+        })
+    }
+
     fn resolve(&self, fields: &[String]) -> Option<(String, String, String)> {
         let (scope, rte, col) = self.lookup(fields)?;
         self.var_name(scope, rte, col, 0)
@@ -551,7 +574,10 @@ impl<'a> Printer<'a> {
     /// literal or NULL.
     fn typ(&mut self, n: &Node) -> Option<String> {
         Some(match n.node.as_ref()? {
-            N::ColumnRef(c) => self.resolve(&names(&c.fields))?.2,
+            N::ColumnRef(c) => match self.whole_row(c) {
+                Some((_, rowtype)) => rowtype,
+                None => self.resolve(&names(&c.fields))?.2,
+            },
             N::AConst(c) => match c.val.as_ref() {
                 Some(Val::Ival(_)) => "int4".into(),
                 Some(Val::Fval(f)) => {
@@ -1213,6 +1239,11 @@ impl<'a> Printer<'a> {
     fn expr(&mut self, n: &Node) -> Option<()> {
         match n.node.as_ref()? {
             N::ColumnRef(c) => {
+                // A whole-row Var prints qualified even where columns do not.
+                if let Some((rel, _)) = self.whole_row(c) {
+                    self.buf.push_str(&format!("{}.*", q(&rel)));
+                    return Some(());
+                }
                 let fields = names(&c.fields);
                 let (rel, col, _) = self.resolve(&fields)?;
                 if self.unqualified || rel.is_empty() {
@@ -5316,6 +5347,23 @@ pub fn expr_def(sql: &str, def: &TableDef) -> Option<String> {
     let Some(N::ResTarget(rt)) = target.node.as_ref() else {
         return None;
     };
+    // The expression's one relation is the table: a whole-row reference
+    // stored under the name it had before a rename is still its row.
+    let mut val = rt.val.as_deref()?.clone();
+    let bare = crate::schemas::split_key(&def.name).1;
+    crate::walk_expr(&mut val, &mut |n| {
+        if let Some(N::ColumnRef(c)) = n.node.as_mut() {
+            if let [rel, star] = c.fields.as_mut_slice() {
+                if matches!(star.node.as_ref(), Some(N::AStar(_))) {
+                    if let Some(N::String(s)) = rel.node.as_mut() {
+                        s.sval.clone_from(&def.name);
+                    }
+                }
+            }
+        }
+        Ok(())
+    })
+    .ok()?;
     let none_lookup = |_: &str| None;
     let none_views = |_: &str| None;
     let cat = Catalog {
@@ -5325,7 +5373,7 @@ pub fn expr_def(sql: &str, def: &TableDef) -> Option<String> {
     let mut p = Printer::new(&cat, 0);
     p.unqualified = true;
     p.scopes.push(vec![Rte {
-        refname: def.name.clone(),
+        refname: bare,
         name: def.name.clone(),
         columns: def
             .columns
@@ -5335,7 +5383,7 @@ pub fn expr_def(sql: &str, def: &TableDef) -> Option<String> {
         qualified_only: false,
         ..Default::default()
     }]);
-    p.expr(rt.val.as_deref()?)?;
+    p.expr(&val)?;
     Some(p.buf)
 }
 

@@ -8857,6 +8857,7 @@ fn plan_alter_action(
                 .raw_expr
                 .as_ref()
                 .ok_or_else(|| Error::Parse("CHECK without an expression".into()))?;
+            let raw = &check_whole_row_refs(raw, &schemas::split_key(table).1, def)?;
             let expression = check_expression_text(raw)?;
             // Planned now, so an unknown column is 42703 at ALTER rather than
             // on the next INSERT. `ATAddCheckConstraint` hands
@@ -12753,8 +12754,11 @@ fn plan_create(c: &pg_query::protobuf::CreateStmt, analyse_defaults: bool) -> Re
     for (conname, raw) in checks {
         // The predicate's SQL text is the catalog record (`(a > 0)`);
         // planning it now surfaces an unknown column at CREATE.
+        let raw = check_whole_row_refs(&raw, &schemas::split_key(&table).1, &def)?;
         let expression = check_expression_text(&raw)?;
-        cook_check(&raw, &expression, &schemas::split_key(&table).1, &def)?;
+        with_cooking_rowtype(&def, || {
+            cook_check(&raw, &expression, &schemas::split_key(&table).1, &def)
+        })?;
         let name = if conname.is_empty() {
             // `<table>_<col>_check` when the predicate names exactly one
             // column, `<table>_check` otherwise, with a counter to keep the
@@ -13097,15 +13101,26 @@ fn cook_check(
     // the table lacks (42703) or a system column (42P10).
     let column = |refused_at: Option<i32>, whole: bool| -> Result<()> {
         match first_bad_column(raw, name, def) {
-            Some((at, system)) if whole || refused_at.is_none_or(|a| at < a) => match system {
-                Some(col) => {
+            Some((at, bad)) if whole || refused_at.is_none_or(|a| at < a) => {
+                if !matches!(bad, BadReference::Missing) {
                     set_error_location(at);
-                    Err(Error::InvalidColumnReference(format!(
-                        "system column \"{col}\" reference in check constraint is invalid"
-                    )))
                 }
-                None => plan_check_expression(expression, def).map(drop),
-            },
+                match bad {
+                    BadReference::System(col) => Err(Error::InvalidColumnReference(format!(
+                        "system column \"{col}\" reference in check constraint is invalid"
+                    ))),
+                    // `errorMissingColumn` names the row's relation.
+                    BadReference::Field(col) => Err(Error::Sqlstate(
+                        "42703",
+                        format!("column {name}.{col} does not exist"),
+                    )),
+                    BadReference::OtherTable(q) => Err(Error::Sqlstate(
+                        "42P01",
+                        format!("missing FROM-clause entry for table \"{q}\""),
+                    )),
+                    BadReference::Missing => plan_check_expression(expression, def).map(drop),
+                }
+            }
             _ => Ok(()),
         }
     };
@@ -13123,44 +13138,260 @@ fn cook_check(
     Err(refused)
 }
 
-/// Where the first column reference in `raw` that a CHECK over the table
-/// `name` (`def`) cannot take is written: one naming no column of the table
-/// (`None`), or a system column other than `tableoid` (`Some(name)`).
+/// A CHECK's references to its own table's whole row, `name` (`def`),
+/// resolved as `transformExpr` resolves them over the constraint's one
+/// range-table entry, so the stored text is what `pg_get_constraintdef`
+/// prints of the analysed tree (RP-860): a bare `t` naming no column is the
+/// whole-row Var, printed `t.*`; `(t).x` and `(t.*).x` are the column `x`
+/// itself (`ParseComplexProjection`); `ROW(t.*)` is a row of the columns
+/// (`ROW(x, y)`), and a bare `t` inside a ROW stays one record field, cast
+/// to the row type as ruleutils prints it to keep it from expanding.
+fn check_whole_row_refs(
+    raw: &pg_query::protobuf::Node,
+    name: &str,
+    def: &TableDef,
+) -> Result<pg_query::protobuf::Node> {
+    // `Some(true)` for `t.*`, `Some(false)` for a bare `t` naming no column.
+    let ours = |n: &pg_query::protobuf::Node| -> Option<bool> {
+        let Some(N::ColumnRef(c)) = n.node.as_ref() else {
+            return None;
+        };
+        match c.fields.as_slice() {
+            [q] => matches!(q.node.as_ref(), Some(N::String(s))
+                if s.sval == name
+                    && def.column(name).is_none()
+                    && !def.system_columns.iter().any(|c| c.name == name))
+            .then_some(false),
+            [q, star] => (matches!(q.node.as_ref(), Some(N::String(s)) if s.sval == name)
+                && matches!(star.node.as_ref(), Some(N::AStar(_))))
+            .then_some(true),
+            _ => None,
+        }
+    };
+    let location = |n: &pg_query::protobuf::Node| match n.node.as_ref() {
+        Some(N::ColumnRef(c)) => c.location,
+        _ => -1,
+    };
+    let star = |location: i32| pg_query::protobuf::Node {
+        node: Some(N::ColumnRef(pg_query::protobuf::ColumnRef {
+            fields: vec![
+                string_node(name),
+                pg_query::protobuf::Node {
+                    node: Some(N::AStar(pg_query::protobuf::AStar {})),
+                },
+            ],
+            location,
+        })),
+    };
+    let column = |col: &str, location: i32| {
+        let mut n = column_ref_node(col);
+        if let Some(N::ColumnRef(c)) = n.node.as_mut() {
+            c.location = location;
+        }
+        n
+    };
+    let mut out = raw.clone();
+    walk_expr(&mut out, &mut |n| {
+        if ours(n) == Some(false) {
+            *n = star(location(n));
+            return Ok(());
+        }
+        match n.node.as_mut() {
+            Some(N::AIndirection(ind)) => {
+                let Some(arg) = ind.arg.as_deref() else {
+                    return Ok(());
+                };
+                if ours(arg).is_none() {
+                    return Ok(());
+                }
+                let at = location(arg);
+                let col = match ind.indirection.first().and_then(|f| f.node.as_ref()) {
+                    Some(N::String(f)) if def.column(&f.sval).is_some() => f.sval.clone(),
+                    _ => return Ok(()),
+                };
+                ind.indirection.remove(0);
+                if ind.indirection.is_empty() {
+                    *n = column(&col, at);
+                } else {
+                    ind.arg = Some(Box::new(column(&col, at)));
+                }
+            }
+            Some(N::RowExpr(r)) => {
+                let args = std::mem::take(&mut r.args);
+                for a in args {
+                    match ours(&a) {
+                        Some(true) => r
+                            .args
+                            .extend(def.columns.iter().map(|c| column(&c.name, location(&a)))),
+                        Some(false) => r.args.push(pg_query::protobuf::Node {
+                            node: Some(N::TypeCast(Box::new(pg_query::protobuf::TypeCast {
+                                arg: Some(Box::new(star(location(&a)))),
+                                type_name: Some(type_name_node(&table_rowtype(name.to_string()))),
+                                location: -1,
+                            }))),
+                        }),
+                        None => r.args.push(a),
+                    }
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    })?;
+    Ok(out)
+}
+
+/// A stored expression's whole-row references (`t.*`, the one form
+/// `check_whole_row_refs` leaves) as the row of `def`'s columns, typed as
+/// the table's row type once that type exists (it does not yet while
+/// CREATE TABLE cooks the constraint). The expression has one range-table
+/// entry, the table, so the qualifier is not read: a renamed table's
+/// constraint still names its own row.
+fn plan_whole_row_refs(val: &mut pg_query::protobuf::Node, def: &TableDef) -> Result<()> {
+    let is_star = |n: &pg_query::protobuf::Node| match n.node.as_ref() {
+        Some(N::ColumnRef(c)) => {
+            c.fields.len() == 2 && matches!(c.fields[1].node.as_ref(), Some(N::AStar(_)))
+        }
+        _ => false,
+    };
+    let names: Vec<pg_query::protobuf::Node> =
+        def.columns.iter().map(|c| string_node(&c.name)).collect();
+    let rowtype = table_rowtype(schemas::split_key(&def.name).1);
+    let typed = user_composite(&rowtype).is_some();
+    walk_expr(val, &mut |n| {
+        if let Some(N::RowExpr(r)) = n.node.as_mut() {
+            if r.args.iter().any(is_star) {
+                let args = std::mem::take(&mut r.args);
+                for a in args {
+                    if is_star(&a) {
+                        r.args
+                            .extend(def.columns.iter().map(|c| column_ref_node(&c.name)));
+                    } else {
+                        r.args.push(a);
+                    }
+                }
+            }
+            return Ok(());
+        }
+        if !is_star(n) {
+            return Ok(());
+        }
+        let Some(N::ColumnRef(c)) = n.node.as_ref() else {
+            return Ok(());
+        };
+        let row = pg_query::protobuf::Node {
+            node: Some(N::RowExpr(Box::new(pg_query::protobuf::RowExpr {
+                xpr: None,
+                args: def
+                    .columns
+                    .iter()
+                    .map(|c| column_ref_node(&c.name))
+                    .collect(),
+                row_typeid: 0,
+                row_format: pg_query::protobuf::CoercionForm::CoerceImplicitCast as i32,
+                colnames: names.clone(),
+                location: c.location,
+            }))),
+        };
+        *n = if typed {
+            pg_query::protobuf::Node {
+                node: Some(N::TypeCast(Box::new(pg_query::protobuf::TypeCast {
+                    arg: Some(Box::new(row)),
+                    type_name: Some(type_name_node(&rowtype)),
+                    location: 0,
+                }))),
+            }
+        } else {
+            row
+        };
+        Ok(())
+    })
+}
+
+/// A reference a CHECK cannot take, as `first_bad_column` finds it.
+enum BadReference {
+    /// A column the table lacks.
+    Missing,
+    /// A system column other than `tableoid`.
+    System(String),
+    /// A field of the table's whole row that is no column of it
+    /// (`(t).nosuch`).
+    Field(String),
+    /// Another relation's whole row (`other.*`): the CHECK's range table
+    /// holds only its own table.
+    OtherTable(String),
+}
+
+/// Where the first reference in `raw` that a CHECK over the table `name`
+/// (`def`) cannot take is written, and what it is (`BadReference`).
 fn first_bad_column(
     raw: &pg_query::protobuf::Node,
     name: &str,
     def: &TableDef,
-) -> Option<(i32, Option<String>)> {
+) -> Option<(i32, BadReference)> {
     let system = |c: &str| {
         secantus_pgcatalog::SYSTEM_FIELDS
             .iter()
             .any(|(s, _, _)| *s == c)
     };
     let known = |c: &str| def.column(c).is_some() || def.system_columns.iter().any(|s| s.name == c);
-    let mut first: Option<(i32, Option<String>)> = None;
-    walk_column_refs(&mut raw.clone(), &mut |_, c| {
-        let parts: Vec<&str> = c
-            .fields
-            .iter()
-            .filter_map(|f| match f.node.as_ref() {
-                Some(N::String(s)) => Some(s.sval.as_str()),
+    // `Some(qualifier)` for a whole-row `q.*`.
+    let star_of = |c: &pg_query::protobuf::ColumnRef| -> Option<String> {
+        match c.fields.as_slice() {
+            [q, star] if matches!(star.node.as_ref(), Some(N::AStar(_))) => match q.node.as_ref() {
+                Some(N::String(s)) => Some(s.sval.clone()),
                 _ => None,
-            })
-            .collect();
-        let (ours, col) = match parts.as_slice() {
-            [col] => (true, *col),
-            [table, col] => (*table == name, *col),
-            _ => return Ok(()),
-        };
-        let bad = if ours && system(col) {
-            Some(Some(col.to_string()))
-        } else {
-            (!ours || !known(col)).then_some(None)
-        };
-        if let Some(bad) = bad {
-            if first.as_ref().is_none_or(|(f, _)| c.location < *f) {
-                first = Some((c.location, bad));
+            },
+            _ => None,
+        }
+    };
+    let mut first: Option<(i32, BadReference)> = None;
+    let mut note = |at: i32, bad: BadReference| {
+        if first.as_ref().is_none_or(|(f, _)| at < *f) {
+            first = Some((at, bad));
+        }
+    };
+    walk_expr(&mut raw.clone(), &mut |n| {
+        match n.node.as_ref() {
+            // `check_whole_row_refs` left a field of the row in place only
+            // when it names no column.
+            Some(N::AIndirection(ind)) => {
+                if let (Some(N::ColumnRef(c)), Some(N::String(f))) = (
+                    ind.arg.as_deref().and_then(|a| a.node.as_ref()),
+                    ind.indirection.first().and_then(|f| f.node.as_ref()),
+                ) {
+                    if star_of(c).as_deref() == Some(name) && def.column(&f.sval).is_none() {
+                        note(c.location, BadReference::Field(f.sval.clone()));
+                    }
+                }
             }
+            Some(N::ColumnRef(c)) => {
+                if let Some(q) = star_of(c) {
+                    if q != name {
+                        note(c.location, BadReference::OtherTable(q));
+                    }
+                    return Ok(());
+                }
+                let parts: Vec<&str> = c
+                    .fields
+                    .iter()
+                    .filter_map(|f| match f.node.as_ref() {
+                        Some(N::String(s)) => Some(s.sval.as_str()),
+                        _ => None,
+                    })
+                    .collect();
+                let (ours, col) = match parts.as_slice() {
+                    [col] => (true, *col),
+                    [table, col] => (*table == name, *col),
+                    _ => return Ok(()),
+                };
+                if ours && system(col) {
+                    note(c.location, BadReference::System(col.to_string()));
+                } else if !ours || !known(col) {
+                    note(c.location, BadReference::Missing);
+                }
+            }
+            _ => {}
         }
         Ok(())
     })
@@ -13183,6 +13414,9 @@ pub fn plan_check_expression(expression: &str, def: &TableDef) -> Result<ColumnE
             _ => None,
         })
         .ok_or_else(|| Error::Parse("CHECK expression is not an expression".into()))?;
+    let mut val = val.clone();
+    plan_whole_row_refs(&mut val, def)?;
+    let val = &val;
     let fields: Vec<RowField> = def
         .columns
         .iter()
@@ -37029,12 +37263,48 @@ fn user_composite_widths(name: &str) -> Option<Vec<Option<usize>>> {
     deferred::read(&PLAN_COMPOSITE_WIDTHS, |t| t.get(&target).cloned())
 }
 
+thread_local! {
+    /// The row type of the table CREATE TABLE is cooking constraints for:
+    /// `heap_create_with_catalog` makes the type before
+    /// `AddRelationNewConstraints` runs, so a CHECK may already compare or
+    /// cast to it (RP-860). Not yet published, so held here meanwhile.
+    static COOKING_ROWTYPE: std::cell::RefCell<Option<CompositeType>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Run `f` with the row type of `def`, a table being created, resolvable.
+fn with_cooking_rowtype<T>(def: &TableDef, f: impl FnOnce() -> T) -> T {
+    let name = canonical_type_ref(&table_rowtype(schemas::split_key(&def.name).1));
+    let fields = def
+        .columns
+        .iter()
+        .map(|c| (c.name.clone(), c.pg_type.clone()))
+        .collect();
+    struct Restore(Option<CompositeType>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            COOKING_ROWTYPE.with(|c| *c.borrow_mut() = self.0.take());
+        }
+    }
+    let _restore = Restore(COOKING_ROWTYPE.with(|c| c.replace(Some((name, 0, fields)))));
+    f()
+}
+
 /// A composite type's `(oid, fields)` by name, compared as `user_enum`
 /// compares it.
 fn user_composite(name: &str) -> Option<(i64, CompositeFields)> {
     let target = canonical_type_ref(name);
     if names_catalog_type(&target) {
         return None;
+    }
+    let cooking = COOKING_ROWTYPE.with(|c| {
+        c.borrow()
+            .as_ref()
+            .filter(|(n, _, _)| *n == target)
+            .map(|(_, oid, fields)| (*oid, fields.clone()))
+    });
+    if cooking.is_some() {
+        return cooking;
     }
     deferred::read(&PLAN_USER_COMPOSITES, |t| {
         // No composite type, nothing to resolve the name for (RP-131).

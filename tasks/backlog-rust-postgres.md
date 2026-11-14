@@ -3868,12 +3868,6 @@ Measured on a private PostgreSQL 15.19 cluster.
       evaluation has no `tableoid` to read.
       Verify: tests/backlog/test_rp_found_rp816.py::test_tableoid_in_a_check_is_a_column
       Backlog-ID: RP-859
-- [ ] **A whole-row reference in a CHECK is refused as unsupported.**
-      `create table t816 (x int check ((t816.*) is not null))` creates the
-      table on PostgreSQL 15.19; here it is 0A000 `this column is not
-      supported yet`.
-      Verify: tests/backlog/test_rp_found_rp816.py::test_a_whole_row_reference_in_a_check_is_taken
-      Backlog-ID: RP-860
 - [ ] **A CHECK takes another table's qualifier, and names a qualified
       missing column without it.** `create table t816 (x int, check
       (other.x = 1))` creates the table here; PostgreSQL 15.19 is 42P01
@@ -3892,6 +3886,40 @@ Measured on a private PostgreSQL 15.19 cluster.
       allowed); here the table is created.
       Verify: tests/backlog/test_rp_found_rp816.py::test_a_system_column_in_a_generated_column_is_42p10
       Backlog-ID: RP-862
+
+## Found while working RP-860 (2026-11-14)
+
+Measured on a private, freshly initdb'd PostgreSQL 15.19 cluster with the
+`_SETUP` in `tests/backlog/test_rp_found_rp860.py` (`t860 (x int)`).
+
+- [ ] **A column renamed under a CHECK leaves the CHECK naming the old
+      column, and the table takes no more rows.** After `alter table t860
+      add constraint k check (x > 0)` and `alter table t860 rename column x
+      to y`, PostgreSQL 15.19 still enforces the constraint on the column
+      (`insert ... values (0)` is 23514) and prints it `CHECK ((y > 0))`:
+      the stored tree holds the column's attnum, not its name. Here the
+      stored text still says `x`, so every INSERT is 42703 `column "x" does
+      not exist` and `pg_get_constraintdef` prints the old text. The fix renames the column in every stored CHECK
+      expression (and any other stored expression text keyed by column
+      name) where the rename is applied.
+      Verify: tests/backlog/test_rp_found_rp860.py::test_a_renamed_column_is_renamed_in_its_check
+      Backlog-ID: RP-939
+- [ ] **`pg_get_constraintdef` drops `NOT VALID` from a CHECK.** `alter
+      table t860 add constraint k check (x > 0) not valid` prints `CHECK
+      ((x > 0)) NOT VALID` on PostgreSQL 15.19 (`pg_get_constraintdef_worker`
+      appends it while `convalidated` is false); here `CHECK ((x > 0))`.
+      Verify: tests/backlog/test_rp_found_rp860.py::test_a_not_valid_check_prints_not_valid
+      Backlog-ID: RP-940
+- [ ] **A `regtype` comparison in a CHECK prints without its `oid`
+      casts.** `check (pg_typeof(x) = 'int4'::regtype)` prints `CHECK
+      (((pg_typeof(x))::oid = ('integer'::regtype)::oid))` on PostgreSQL
+      15.19: `regtype` has no `=`, so the parser resolves `oideq` over
+      binary-coercible casts, and ruleutils prints them. Here it is the
+      text as written, `CHECK ((pg_typeof(x) = 'int4'::regtype))`.
+      `ruleutils.rs` would need the operator resolution the analysed tree
+      records.
+      Verify: tests/backlog/test_rp_found_rp860.py::test_a_regtype_comparison_in_a_check_prints_its_oid_casts
+      Backlog-ID: RP-941
 
 ## Found while working RP-828 (2026-11-12)
 

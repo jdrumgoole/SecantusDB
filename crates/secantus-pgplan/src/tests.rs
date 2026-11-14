@@ -7424,6 +7424,106 @@ fn a_check_constraint_is_coerced_to_boolean() {
     }
 }
 
+/// A CHECK may name its table's whole row (RP-860): `t.*` and a bare `t`
+/// are the whole-row Var, stored as `pg_get_constraintdef` prints it;
+/// `(t).x` is the column `x`, which names the constraint; `ROW(t.*)` is a
+/// row of the columns. Another relation's row, a field the row lacks and
+/// the row as the whole condition are refused where PostgreSQL 15.19
+/// refuses them.
+#[test]
+fn a_check_takes_its_tables_whole_row() {
+    for (sql, name, text) in [
+        (
+            "create table w (x int check ((w.*) is not null))",
+            "w_check",
+            "CHECK ((w.* IS NOT NULL))",
+        ),
+        (
+            "create table w (x int, y text, check (w is not null))",
+            "w_check",
+            "CHECK ((w.* IS NOT NULL))",
+        ),
+        (
+            "create table w (x int, y int, check (row(w.*) is not null))",
+            "w_check",
+            "CHECK ((ROW(x, y) IS NOT NULL))",
+        ),
+        (
+            "create table w (x int, y text, check (w::text <> '(1,a)'))",
+            "w_check",
+            "CHECK (((w.*)::text <> '(1,a)'::text))",
+        ),
+        (
+            "create table w (x int, check ((w).x > 0))",
+            "w_x_check",
+            "CHECK ((x > 0))",
+        ),
+        (
+            "create table w (x int, check ((w.*) = row(1)::w))",
+            "w_check",
+            "CHECK ((w.* = ROW(1)::w))",
+        ),
+    ] {
+        let Statement::CreateTable(def, _) = plan_ok(sql) else {
+            panic!("{sql} is not a CREATE TABLE");
+        };
+        let [check] = def.check_constraints.as_slice() else {
+            panic!("{sql}: {:?}", def.check_constraints);
+        };
+        assert_eq!(check.name, name, "for {sql}");
+        // Once created, the table's row type is published.
+        set_user_composites(vec![(
+            "w".into(),
+            16400,
+            def.columns
+                .iter()
+                .map(|c| (c.name.clone(), c.pg_type.clone()))
+                .collect(),
+        )]);
+        let printed = crate::check_constraint_text(&check.expression, &def);
+        let planned = crate::plan_check_expression(&check.expression, &def);
+        set_user_composites(Vec::new());
+        assert_eq!(printed, text, "for {sql}");
+        planned.expect("plans per row");
+    }
+    for (sql, state, message, at) in [
+        (
+            "create table w (x int, check ((w.*).nosuch > 0))",
+            "42703",
+            "column w.nosuch does not exist",
+            31,
+        ),
+        (
+            "create table w (x int, check ((w).nosuch > 0))",
+            "42703",
+            "column w.nosuch does not exist",
+            31,
+        ),
+        (
+            "create table w (x int, check (other.* is not null))",
+            "42P01",
+            "missing FROM-clause entry for table \"other\"",
+            30,
+        ),
+        (
+            "create table w (x int, check (w.*))",
+            "42804",
+            "argument of CHECK must be type boolean, not type w",
+            30,
+        ),
+    ] {
+        take_error_location();
+        let err = plan(sql, &lookup).expect_err("should refuse");
+        assert_eq!(err.sqlstate(), state, "for {sql} (got {err})");
+        assert_eq!(err.to_string(), message, "for {sql}");
+        assert_eq!(
+            crate::errpos::error_position(sql, state, &err.to_string()),
+            Some(at as usize + 1),
+            "for {sql}"
+        );
+    }
+}
+
 /// A system column other than `tableoid` in a CHECK is 42P10 where
 /// `scanNSItemForColumn` meets it (RP-816): after a missing column written
 /// before it, before an argument refused after it, and with no position
