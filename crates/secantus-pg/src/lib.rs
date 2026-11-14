@@ -2002,9 +2002,14 @@ fn exits_transaction(sql: &str) -> bool {
 /// The interpreter's error as a wire error.
 fn wire_pl_error(e: plpgsql_fn::PlError) -> PgWireError {
     let mut info = ErrorInfo::new("ERROR".into(), e.sqlstate, e.message);
-    info.detail = e.detail;
+    info.detail = e.detail.map(String::from);
     info.hint = e.hint;
     info.where_context = e.context.map(String::from);
+    if let Some(internal) = e.internal {
+        let (query, position) = *internal;
+        info.internal_query = Some(query);
+        info.internal_position = position.map(|p| p.to_string());
+    }
     PgWireError::UserError(Box::new(info))
 }
 
@@ -2120,9 +2125,16 @@ fn pl_error(e: &PgWireError) -> plpgsql_fn::PlError {
     match e {
         PgWireError::UserError(info) => {
             let mut p = plpgsql_fn::PlError::new(&info.code, info.message.clone());
-            p.detail = info.detail.clone();
+            p.detail = info.detail.as_deref().map(Box::from);
             p.hint = info.hint.clone();
             p.context = info.where_context.as_deref().map(Box::from);
+            p.internal = info.internal_query.clone().map(|q| {
+                let at = info
+                    .internal_position
+                    .as_deref()
+                    .and_then(|p| p.parse().ok());
+                Box::new((q, at))
+            });
             p.from_sql = true;
             p
         }
@@ -15818,7 +15830,7 @@ impl PgHandler {
             };
             let to_wire = |e: plpgsql_fn::PlError| {
                 let mut info = ErrorInfo::new("ERROR".into(), e.sqlstate, e.message);
-                info.detail = e.detail;
+                info.detail = e.detail.map(String::from);
                 info.hint = e.hint;
                 // Folding while inlining runs only the immutable / stable
                 // part of the body: an error from a nested function that ran
@@ -21085,7 +21097,7 @@ impl PgHandler {
             }
             out.map_err(|e| {
                 let mut info = ErrorInfo::new("ERROR".into(), e.sqlstate, e.message);
-                info.detail = e.detail;
+                info.detail = e.detail.map(String::from);
                 PgWireError::UserError(Box::new(info))
             })?;
         }

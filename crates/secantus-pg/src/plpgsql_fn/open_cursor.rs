@@ -308,10 +308,10 @@ impl Interp<'_> {
         let frame = || bind_frame(text, mode);
         let raw = format!("SELECT {text}");
         let (sql, params, types) = self.bind(&raw).map_err(|e| e.with_sql_frame(frame))?;
-        let out = self.host.query(&sql, &params, &types).map_err(|e| {
-            let framed = !literal_input_error(&raw, &e);
-            e.with_sql_frame(|| if framed { frame() } else { None })
-        })?;
+        let out = self
+            .host
+            .query(&sql, &params, &types)
+            .map_err(|e| e.with_expr_frame(text, &raw, |_| frame()))?;
         // Not STRICT: a second row is not read (`tcount` 1).
         let domains = self.host.output_domains(&sql, &types);
         let first = out.rows.first().map(|r| r.as_slice());

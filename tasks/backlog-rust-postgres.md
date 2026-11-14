@@ -2905,16 +2905,16 @@ nothing. The gap tests are in `tests/backlog/test_rp_found_rp712.py`.
       'abcdef'"` on 15.19) and for a slice (`x[1:1] := array['abcd']`).
       Verify: tests/backlog/test_rp_found_rp712.py::test_overlong_varchar_assignment_is_framed_by_the_assignment
       Backlog-ID: RP-752
-- [ ] **An assignment's literal input error carries no internal query.**
-      `declare x int; begin x := 'abc';` is 22P02 with `internal_query` `x
-      := 'abc'` on PostgreSQL 15.19 (the literal is coerced as the
-      assignment is parsed); here no internal query is sent. The same class
-      as RP-488, in a shape its test does not reach. A `jsonb` literal is
-      another: `declare x jsonb; begin x := 'zz';` carries `x := 'zz'` as
-      its internal query and CONTEXT `JSON data, line 1: zz` then the `at
-      assignment` line on 15.19; here a `PL/pgSQL assignment "x := 'zz'"`
-      frame sits between them and no query is sent.
-      Verify: tests/backlog/test_rp_found_rp712.py::test_literal_input_error_in_an_assignment_carries_its_query
+- [ ] **An assignment's `json` / `jsonb` literal input error carries no
+      internal query.** `declare x jsonb; begin x := 'zz';` carries `x :=
+      'zz'` as its internal query (position 6) and CONTEXT `JSON data, line
+      1: zz` then the `at assignment` line on PostgreSQL 15.19; here a
+      `PL/pgSQL assignment "x := 'zz'"` frame sits between them and no
+      query is sent. A literal is recognised by the value its message
+      quotes (`input_error_literal` in `plpgsql_fn.rs`), and the json
+      message quotes none -- the same cause as RP-952 at the top level. The
+      integer case (RP-753's first half) is fixed.
+      Verify: tests/backlog/test_rp_found_rp712.py::test_json_literal_input_error_in_an_assignment_carries_its_query
       Backlog-ID: RP-753
 
 ## Found while working RP-750 (2026-11-14)

@@ -28,7 +28,7 @@ use serde_json::Value;
 pub struct PlError {
     pub sqlstate: String,
     pub message: String,
-    pub detail: Option<String>,
+    pub detail: Option<Box<str>>,
     pub hint: Option<String>,
     /// The CONTEXT stack, innermost first, as PostgreSQL prints it (boxed:
     /// the error travels in every `Result` here and is kept small).
@@ -42,6 +42,11 @@ pub struct PlError {
     /// This function's `PL/pgSQL function f() line N at X` frame is on
     /// the stack: an enclosing statement adds none.
     framed: bool,
+    /// The query an error raised while parsing it points into, and the
+    /// 1-based character position there (`_SPI_error_callback` turns a
+    /// cursor position into these): an input error on a literal. Boxed
+    /// together, as `context` is.
+    pub internal: Option<Box<(String, Option<usize>)>>,
 }
 
 impl PlError {
@@ -55,6 +60,7 @@ impl PlError {
             from_sql: false,
             sql_framed: false,
             framed: false,
+            internal: None,
         }
     }
 
@@ -79,6 +85,27 @@ impl PlError {
             self.sql_framed = true;
         }
         self
+    }
+
+    /// The frame for an error from the expression `text` (run as `raw`):
+    /// an input error on one of its literals is an internal query
+    /// pointing at the literal; any other takes `frame`.
+    fn with_expr_frame(
+        mut self,
+        text: &str,
+        raw: &str,
+        frame: impl FnOnce(&Self) -> Option<String>,
+    ) -> Self {
+        if self.from_sql && !self.sql_framed && !self.framed {
+            if let Some(lit) = input_error_literal(raw, &self) {
+                let at = text.find(&lit).map(|at| text[..at].chars().count() + 1);
+                self.internal = Some(Box::new((text.to_string(), at)));
+                self.sql_framed = true;
+                return self;
+            }
+        }
+        let f = frame(&self);
+        self.with_sql_frame(|| f)
     }
 
     fn unsupported(what: &str) -> Self {
@@ -715,7 +742,7 @@ fn plan_error(e: secantus_pgplan::Error) -> PlError {
     let mut err = match message.split_once("\nDetail: ") {
         Some((m, d)) => {
             let mut err = PlError::new(e.sqlstate(), m);
-            err.detail = Some(d.to_string());
+            err.detail = Some(d.into());
             err
         }
         None => PlError::new(e.sqlstate(), message.clone()),
@@ -1481,13 +1508,17 @@ fn bind_frame(text: &str, mode: u64) -> Option<String> {
 /// position, which `_SPI_error_callback` turns into an internal query
 /// position instead of a `SQL ...` CONTEXT frame.
 fn literal_input_error(sql: &str, err: &PlError) -> bool {
-    err.sqlstate.starts_with("22")
-        && err
-            .message
-            .strip_suffix('"')
-            .and_then(|m| m.rsplit_once(": \""))
-            .map(|(_, v)| v)
-            .is_some_and(|lit| sql.contains(&format!("'{}'", lit.replace('\'', "''"))))
+    input_error_literal(sql, err).is_some()
+}
+
+/// The quoted literal (`'abc'`) of `sql` an input error names.
+fn input_error_literal(sql: &str, err: &PlError) -> Option<String> {
+    if !err.sqlstate.starts_with("22") {
+        return None;
+    }
+    let (_, v) = err.message.strip_suffix('"')?.rsplit_once(": \"")?;
+    let lit = format!("'{}'", v.replace('\'', "''"));
+    sql.contains(&lit).then_some(lit)
 }
 
 fn expr_frame(
@@ -2122,17 +2153,14 @@ impl Interp<'_> {
             .bind(&sql)
             .map_err(|e| e.with_sql_frame(|| bind_frame(text, mode)))?;
         let out = self.host.query(&sql, &params, &types).map_err(|e| {
-            let fails = |q: &str| {
-                self.host
-                    .query(q, &[], &[])
-                    .is_err_and(|f| f.sqlstate == e.sqlstate)
-            };
-            let frame = if e.from_sql && !e.sql_framed && !e.framed {
-                expr_frame(text, mode, &raw, &e, &fails)
-            } else {
-                None
-            };
-            e.with_sql_frame(|| frame)
+            e.with_expr_frame(text, &raw, |e| {
+                let fails = |q: &str| {
+                    self.host
+                        .query(q, &[], &[])
+                        .is_err_and(|f| f.sqlstate == e.sqlstate)
+                };
+                expr_frame(text, mode, &raw, e, &fails)
+            })
         })?;
         if out.rows.len() > 1 {
             return Err(PlError::new("21000", "query returned more than one row"));
@@ -2219,17 +2247,14 @@ impl Interp<'_> {
             .bind(&sql)
             .map_err(|e| e.with_sql_frame(|| bind_frame(text, mode)))?;
         let out = self.host.query(&sql, &params, &types).map_err(|e| {
-            let fails = |q: &str| {
-                self.host
-                    .query(q, &[], &[])
-                    .is_err_and(|f| f.sqlstate == e.sqlstate)
-            };
-            let frame = if e.from_sql && !e.sql_framed && !e.framed {
-                expr_frame(text, mode, &raw, &e, &fails)
-            } else {
-                None
-            };
-            e.with_sql_frame(|| frame)
+            e.with_expr_frame(text, &raw, |e| {
+                let fails = |q: &str| {
+                    self.host
+                        .query(q, &[], &[])
+                        .is_err_and(|f| f.sqlstate == e.sqlstate)
+                };
+                expr_frame(text, mode, &raw, e, &fails)
+            })
         })?;
         let v = out
             .rows
@@ -3649,7 +3674,7 @@ impl Interp<'_> {
         if level == 19 && err.sqlstate == "00000" {
             err.sqlstate = "01000".into();
         }
-        err.detail = detail;
+        err.detail = detail.map(String::into_boxed_str);
         err.hint = hint;
         if level >= 21 {
             return Err(err);
@@ -3662,8 +3687,13 @@ impl Interp<'_> {
         };
         // `exec_stmt_raise` passes the DETAIL and HINT to `ereport` at
         // every level, a notice's included.
-        self.host
-            .notice(severity, &err.sqlstate, err.message, err.detail, err.hint);
+        self.host.notice(
+            severity,
+            &err.sqlstate,
+            err.message,
+            err.detail.map(String::from),
+            err.hint,
+        );
         Ok(Flow::Next)
     }
 }
