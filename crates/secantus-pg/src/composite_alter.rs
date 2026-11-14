@@ -89,6 +89,8 @@ impl PgHandler {
                 .cloned()
                 .unwrap_or_else(|_| vec![Bson::Null; fields.len()]);
             widths.resize(fields.len(), Bson::Null);
+            let mut ndims: Vec<Bson> = doc.get_array("ndims").cloned().unwrap_or_default();
+            ndims.resize(fields.len(), Bson::Int32(0));
             // Each attribute's attnum, and the dropped slots between them.
             let mut attnums: Vec<Bson> = doc
                 .get_array("attnums")
@@ -116,6 +118,7 @@ impl PgHandler {
                     name: attr,
                     ty,
                     typmod,
+                    ndims: nd,
                     ..
                 } => {
                     if names.contains(&attr) {
@@ -152,6 +155,7 @@ impl PgHandler {
                         Bson::Null
                     });
                     attnums.push(Bson::Int32(next as i32));
+                    ndims.push(Bson::Int32(nd));
                     self.rewrite_type_values(
                         name,
                         &Edit::Append {
@@ -183,6 +187,7 @@ impl PgHandler {
                     };
                     fields.remove(at);
                     widths.remove(at);
+                    ndims.remove(at);
                     dropped.push(attnums.remove(at));
                     self.rewrite_type_values(name, &Edit::Remove(at))?;
                     for t in &typed {
@@ -197,6 +202,7 @@ impl PgHandler {
                     name: attr,
                     ty,
                     typmod,
+                    ndims: nd,
                     ..
                 } => {
                     let Some(at) = names.iter().position(|n| *n == attr) else {
@@ -225,6 +231,7 @@ impl PgHandler {
                         Bson::String(key.clone()),
                         Bson::Null,
                     ]);
+                    ndims[at] = Bson::Int32(nd);
                     widths[at] = if key == "bpchar" && typmod > 4 {
                         Bson::Int32(typmod - 4)
                     } else {
@@ -241,6 +248,7 @@ impl PgHandler {
             }
             doc.insert("fields", fields);
             doc.insert("widths", widths);
+            doc.insert("ndims", ndims);
             doc.insert("attnums", attnums);
             doc.insert("dropped", dropped);
             self.delete_type_doc(Self::COMPOSITE_COLLECTION, name)?;

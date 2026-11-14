@@ -864,6 +864,8 @@ pub enum Statement {
         fields: Vec<(String, String)>,
         /// Each field's declared modifier (`atttypmod`, -1 for none).
         typmods: Vec<i32>,
+        /// Each field's declared array dimensions (`attndims`).
+        ndims: Vec<i32>,
     },
     /// `CREATE TYPE <name> AS RANGE (subtype = <type>)` -- a custom range type.
     CreateRange {
@@ -6440,6 +6442,7 @@ fn plan_node(
             };
             let mut fields = Vec::new();
             let mut typmods = Vec::new();
+            let mut ndims = Vec::new();
             for col in &ct.coldeflist {
                 let Some(N::ColumnDef(cd)) = col.node.as_ref() else {
                     return Err(Error::Unsupported("this composite field".into()));
@@ -6450,12 +6453,16 @@ fn plan_node(
                     .ok_or_else(|| Error::Parse("composite field without a type".into()))?;
                 fields.push((cd.colname.clone(), type_name_of(tn)));
                 typmods.push(declared_typmod(tn));
+                // `DefineCompositeType` builds the descriptor with
+                // `BuildDescForRelation`, which counts the written bounds.
+                ndims.push(declared_ndims(tn));
             }
             Ok(Statement::CreateComposite {
                 name,
                 schema,
                 fields,
                 typmods,
+                ndims,
             })
         }
         // `CREATE TYPE ... AS ENUM`. The name may be schema-qualified; with no
@@ -8322,7 +8329,7 @@ pub(crate) fn declared_typmod_public(tn: &pg_query::protobuf::TypeName) -> i32 {
 /// The array dimensions a type name is written with -- `int[][]` 2, `int
 /// ARRAY[4]` 1, `_int4` 0 -- which `pg_attribute.attndims` records
 /// (`BuildDescForRelation`: `list_length(typeName->arrayBounds)`).
-fn declared_ndims(tn: &pg_query::protobuf::TypeName) -> i32 {
+pub(crate) fn declared_ndims(tn: &pg_query::protobuf::TypeName) -> i32 {
     i32::try_from(tn.array_bounds.len()).unwrap_or(i32::MAX)
 }
 

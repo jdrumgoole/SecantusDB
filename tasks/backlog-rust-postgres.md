@@ -2904,20 +2904,6 @@ Measured on a private PostgreSQL 15.19 cluster with `create domain d607q
 as int`. The gap tests are in `tests/backlog/test_rp_found_rp607.py`.
 
 
-## Found while working RP-658 (2026-11-08)
-
-Measured on a private PostgreSQL 15.19 cluster. The gap tests are in
-`tests/backlog/test_rp_found_rp658.py`.
-
-- [ ] **A composite type's attribute has `attndims` 0.** `create type c as
-      (p int[][], q int, r text[])` gives `p`, `q` and `r` 2, 0 and 1 in
-      PostgreSQL 15.19's `pg_attribute` (`DefineCompositeType` builds the
-      descriptor with `BuildDescForRelation`, which counts the written
-      bounds); here each is 0: the composite's stored fields keep only a
-      type name. A table column records them since RP-658.
-      Verify: tests/backlog/test_rp_found_rp658.py::test_composite_attribute_attndims
-      Backlog-ID: RP-663
-
 ## Found while working RP-612 (2026-11-14)
 
 Measured on PostgreSQL 15.19; none of it needs DDL. The gap tests are in

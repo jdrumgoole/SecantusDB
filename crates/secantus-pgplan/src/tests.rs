@@ -8393,3 +8393,14 @@ fn a_checks_qualified_column_is_resolved_against_its_table() {
         );
     }
 }
+
+/// A composite's attributes count their written bounds too (RP-663).
+#[test]
+fn a_composite_records_its_attributes_declared_array_dimensions() {
+    let Statement::CreateComposite { ndims, .. } =
+        plan_ok("CREATE TYPE c AS (p int[][], q int, r text[], s _int4)")
+    else {
+        panic!("not a CREATE TYPE");
+    };
+    assert_eq!(ndims, vec![2, 0, 1, 0]);
+}

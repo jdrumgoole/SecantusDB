@@ -25693,7 +25693,9 @@ impl PgHandler {
                 };
                 // Each composite's attnums and dropped slots (ALTER TYPE ...
                 // DROP ATTRIBUTE keeps the slot), by oid.
-                let slots: HashMap<i64, (Vec<i32>, Vec<i32>)> = composite_docs
+                // (attnums, dropped slots, attndims) of each attribute.
+                type Slots = (Vec<i32>, Vec<i32>, Vec<i32>);
+                let slots: HashMap<i64, Slots> = composite_docs
                     .iter()
                     .filter_map(|d| {
                         let oid = d.get("oid").and_then(bson_i64).filter(|o| wanted(*o))?;
@@ -25702,7 +25704,7 @@ impl PgHandler {
                                 .map(|a| a.iter().filter_map(bson_i64).map(|n| n as i32).collect())
                                 .unwrap_or_default()
                         };
-                        Some((oid, (ints("attnums"), ints("dropped"))))
+                        Some((oid, (ints("attnums"), ints("dropped"), ints("ndims"))))
                     })
                     .collect();
                 for (cname, oid, fields) in composites.iter() {
@@ -25710,7 +25712,7 @@ impl PgHandler {
                     if !wanted(oid) || is_table(cname) {
                         continue;
                     }
-                    let (attnums, dropped) = slots.get(&oid).cloned().unwrap_or_default();
+                    let (attnums, dropped, ndims) = slots.get(&oid).cloned().unwrap_or_default();
                     for n in &dropped {
                         rows.push(Self::dropped_attribute_row(&def, oid, *n));
                     }
@@ -25731,6 +25733,10 @@ impl PgHandler {
                             def.field_of("attisdropped").expect("column"),
                             Bson::Boolean(false),
                         );
+                        // The `[]` it was declared with (RP-663).
+                        if let Some(field) = def.field_of("attndims") {
+                            d.insert(field, Bson::Int32(ndims.get(i).copied().unwrap_or(0)));
+                        }
                         d.insert(
                             def.field_of("attnotnull").expect("column"),
                             Bson::Boolean(false),
@@ -43398,6 +43404,7 @@ impl PgHandler {
                 schema,
                 fields,
                 typmods,
+                ndims,
             } => {
                 // A schema-qualified name (`CREATE TYPE s.t`) is a distinct type
                 // from a bare `t`; unqualified lands in `public`. A duplicate is
@@ -43466,6 +43473,8 @@ impl PgHandler {
                     "schema": &schema_name,
                     "fields": field_docs,
                     "widths": widths,
+                    // Each attribute's `attndims` (RP-663).
+                    "ndims": ndims.iter().map(|n| Bson::Int32(*n)).collect::<Vec<_>>(),
                     "oid": oid,
                 };
                 let bytes = encode_doc(&doc)
