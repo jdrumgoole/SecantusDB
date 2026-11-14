@@ -1158,6 +1158,84 @@ pub(crate) enum PendingRows {
     /// A `UNION ALL`'s leaves, read in order as PostgreSQL's Append reads
     /// its subplans: a leaf runs when the one before it has ended (RP-896).
     Append(std::collections::VecDeque<PendingRows>),
+    /// An Append leaf whose columns the set operation's unification
+    /// converts: each row is converted to the Append's types as it is read,
+    /// as the Result PostgreSQL puts over such a subplan does (RP-896).
+    Converted {
+        inner: Box<PendingRows>,
+        conversion: Arc<LeafConversion>,
+    },
+}
+
+/// How an Append leaf's rows become the Append's: the leaf's description,
+/// the Append's, and the columns whose type differs.
+pub(crate) struct LeafConversion {
+    pub(crate) from: Vec<FieldInfo>,
+    pub(crate) to: Arc<Vec<FieldInfo>>,
+    pub(crate) columns: Vec<usize>,
+    pub(crate) tz: secantus_pgplan::TimeZoneSetting,
+    pub(crate) ds: secantus_pgplan::DateStyle,
+    pub(crate) cenc: ClientEncoding,
+}
+
+impl LeafConversion {
+    /// One leaf row, encoded in text in the leaf's description, as the
+    /// Append's: each converted column read as its own type and cast to
+    /// the Append's, as `set_op_rows` converts a whole side.
+    fn convert(&self, row: &DataRow) -> PgWireResult<DataRow> {
+        let cells = split_data_row(row);
+        let mut values: Vec<Option<Bson>> = vec![None; cells.len()];
+        for &i in &self.columns {
+            let Some(Some(bytes)) = cells.get(i) else {
+                continue;
+            };
+            let text = std::str::from_utf8(bytes).map_err(|e| {
+                PgWireError::ApiError(Box::new(std::io::Error::other(e.to_string())))
+            })?;
+            let from = self.from[i].datatype();
+            let Some(target) = PgHandler::planner_type_name(self.to[i].datatype()) else {
+                continue;
+            };
+            values[i] = Some(if *from == Type::UNKNOWN {
+                secantus_pgplan::cast_unknown_text_to(text, &target, &self.tz)
+                    .map_err(|e| PgHandler::err(&e))?
+            } else {
+                let name = PgHandler::planner_type_name(from).unwrap_or_else(|| "text".into());
+                let v = secantus_pgplan::cast_text_to(text, &name, &self.tz)
+                    .map_err(|e| PgHandler::err(&e))?;
+                // `bpchar` to a string type drops its padding (`rtrim1`).
+                let v = match (v, from) {
+                    (Bson::String(t), &Type::BPCHAR) => {
+                        Bson::String(t.trim_end_matches(' ').to_string())
+                    }
+                    (v, _) => v,
+                };
+                secantus_pgplan::cast_value_with_tz(v, &target, &self.tz)
+                    .map_err(|e| PgHandler::err(&e))?
+            });
+        }
+        let encoded = split_data_row(&encode_typed_row(
+            &self.to, &values, &self.tz, &self.ds, self.cenc,
+        )?);
+        // The columns already of the Append's type go out as the leaf
+        // encoded them.
+        let mut data = BytesMut::new();
+        for (i, cell) in cells.into_iter().enumerate() {
+            let cell = if self.columns.contains(&i) {
+                encoded.get(i).cloned().flatten()
+            } else {
+                cell
+            };
+            match cell {
+                None => data.extend_from_slice(&(-1i32).to_be_bytes()),
+                Some(b) => {
+                    data.extend_from_slice(&(b.len() as i32).to_be_bytes());
+                    data.extend_from_slice(&b);
+                }
+            }
+        }
+        Ok(DataRow::new(data, row.field_count))
+    }
 }
 
 impl PendingRows {
@@ -1180,11 +1258,18 @@ impl PendingRows {
     }
 
     /// An Append of `leaves`, each run when the one before it ends.
-    pub(crate) fn append(leaves: Vec<(Statement, bool)>) -> Self {
+    pub(crate) fn append(leaves: Vec<(Statement, bool, Option<Arc<LeafConversion>>)>) -> Self {
         Self::Append(
             leaves
                 .into_iter()
-                .map(|(query, capture_typed)| Self::deferred(query, capture_typed))
+                .map(|(query, capture_typed, conversion)| match conversion {
+                    // Its values are read back from the converted text.
+                    Some(conversion) => Self::Converted {
+                        inner: Box::new(Self::deferred(query, false)),
+                        conversion,
+                    },
+                    None => Self::deferred(query, capture_typed),
+                })
                 .collect(),
         )
     }
@@ -1194,6 +1279,7 @@ impl PendingRows {
         match self {
             Self::Unstarted { .. } => true,
             Self::Append(leaves) => leaves.iter().any(Self::is_unstarted),
+            Self::Converted { inner, .. } => inner.is_unstarted(),
             _ => false,
         }
     }
@@ -1203,6 +1289,7 @@ impl PendingRows {
         match self {
             Self::Running { reads, .. } => *reads,
             Self::Append(leaves) => leaves.iter().any(Self::reads),
+            Self::Converted { inner, .. } => inner.reads(),
             _ => false,
         }
     }
@@ -1417,6 +1504,9 @@ impl PgHandler {
     fn pull_rows(&self, pending: PendingRows, wanted: usize) -> Pulled {
         let (mut rows, capture_typed, reads, schema) = match pending {
             PendingRows::Append(leaves) => return self.pull_append(leaves, wanted),
+            PendingRows::Converted { inner, conversion } => {
+                return self.pull_converted(*inner, conversion, wanted)
+            }
             PendingRows::Failed(e) => {
                 return Pulled {
                     rows: Vec::new(),
@@ -1509,6 +1599,39 @@ impl PgHandler {
         }
     }
 
+    /// Pull up to `wanted` rows from a converted Append leaf, each converted
+    /// as it is read; a row that will not convert raises when it is reached.
+    fn pull_converted(
+        &self,
+        inner: PendingRows,
+        conversion: Arc<LeafConversion>,
+        wanted: usize,
+    ) -> Pulled {
+        let pulled = self.pull_rows(inner, wanted);
+        let mut out = Pulled {
+            rows: Vec::with_capacity(pulled.rows.len()),
+            captured: None,
+            schema: None,
+            rest: None,
+            failure: None,
+        };
+        for row in &pulled.rows {
+            match conversion.convert(row) {
+                Ok(row) => out.rows.push(row),
+                Err(e) => {
+                    out.failure = Some(e);
+                    return out;
+                }
+            }
+        }
+        out.failure = pulled.failure;
+        out.rest = pulled.rest.map(|inner| PendingRows::Converted {
+            inner: Box::new(inner),
+            conversion,
+        });
+        out
+    }
+
     /// Pull up to `wanted` rows from an Append's leaves, in order. Each
     /// leaf's rows are encoded in its own row description, which has the
     /// Append's column types (`PgHandler::append_leaves`), and the Append's
@@ -1592,6 +1715,35 @@ impl PgHandler {
         }
     }
 
+    /// Run an Append leaf not run yet, in the DECLARE's snapshot; a leaf
+    /// that fails is kept, in its place, for the FETCH that reaches it.
+    fn start_leaf(&self, leaf: PendingRows) -> PendingRows {
+        match leaf {
+            PendingRows::Converted { inner, conversion } => PendingRows::Converted {
+                inner: Box::new(self.start_leaf(*inner)),
+                conversion,
+            },
+            PendingRows::Unstarted {
+                query,
+                capture_typed,
+            } => {
+                let started = self.start_pending(*query, capture_typed);
+                match (started.failure, started.rest) {
+                    (Some(e), _) => PendingRows::Failed(e),
+                    (None, Some(rest)) if started.rows.is_empty() => rest,
+                    // Rows its executor computed whole: a
+                    // stream over them, their values read
+                    // back from the text.
+                    (None, _) => PendingRows::new(
+                        futures::stream::iter(started.rows.into_iter().map(Ok)).boxed(),
+                        false,
+                    ),
+                }
+            }
+            other => other,
+        }
+    }
+
     /// Run cursor `name`'s query, not run yet, leaving its rows unpolled.
     fn start_one_deferred(&self, name: &str) {
         {
@@ -1612,27 +1764,7 @@ impl PgHandler {
                 Some(PendingRows::Append(leaves)) => {
                     let leaves = leaves
                         .into_iter()
-                        .map(|leaf| match leaf {
-                            PendingRows::Unstarted {
-                                query,
-                                capture_typed,
-                            } => {
-                                let started = self.start_pending(*query, capture_typed);
-                                match (started.failure, started.rest) {
-                                    (Some(e), _) => PendingRows::Failed(e),
-                                    (None, Some(rest)) if started.rows.is_empty() => rest,
-                                    // Rows its executor computed whole: a
-                                    // stream over them, their values read
-                                    // back from the text.
-                                    (None, _) => PendingRows::new(
-                                        futures::stream::iter(started.rows.into_iter().map(Ok))
-                                            .boxed(),
-                                        false,
-                                    ),
-                                }
-                            }
-                            other => other,
-                        })
+                        .map(|leaf| self.start_leaf(leaf))
                         .collect();
                     if let Some(c) = self
                         .cursors

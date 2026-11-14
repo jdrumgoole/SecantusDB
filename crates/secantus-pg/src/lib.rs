@@ -4644,6 +4644,10 @@ use txn_state::UncommittedTypes;
 /// DECLARE.
 type CapturedRows = Vec<Vec<Option<Bson>>>;
 
+/// A cursor's Append leaves: each query, whether its values are captured,
+/// and how its rows are converted to the Append's types.
+type AppendLeaves = Vec<(Statement, bool, Option<Arc<portal_stream::LeafConversion>>)>;
+
 /// `(child, parent)` pairs, and each parent's column names in order.
 type InheritanceTree = (Vec<(String, String)>, Vec<(String, Vec<String>)>);
 
@@ -35111,6 +35115,16 @@ impl PgHandler {
                                 .map_err(|e| Self::storage_err("transaction failed", e))?;
                         }
                     }
+                    // An Append's description is its leaves' types unified.
+                    let (pending, fields) = match self.append_leaves(&query, &fields) {
+                        Some((leaves, unified)) => {
+                            (portal_stream::PendingRows::append(leaves), unified)
+                        }
+                        None => (
+                            portal_stream::PendingRows::deferred(*query, capture_typed),
+                            fields,
+                        ),
+                    };
                     self.cursors
                         .lock()
                         .unwrap_or_else(|e| e.into_inner())
@@ -35135,12 +35149,7 @@ impl PgHandler {
                                 tz,
                                 tail: None,
                                 base: 0,
-                                pending: Some(match self.append_leaves(&query) {
-                                    Some(leaves) => portal_stream::PendingRows::append(leaves),
-                                    None => {
-                                        portal_stream::PendingRows::deferred(*query, capture_typed)
-                                    }
-                                }),
+                                pending: Some(pending),
                                 failed: false,
                                 current_of: None,
                                 held: false,
@@ -40116,13 +40125,16 @@ impl PgHandler {
 
     /// A cursor's `UNION ALL` (no ORDER BY, LIMIT or OFFSET over it) as the
     /// leaves PostgreSQL's Append reads in order, each with whether its
-    /// rows' values are captured (a plain SELECT's); `None` to run it whole.
-    /// Only when every leaf's columns are already of the set operation's
-    /// types, so a leaf's rows, encoded in its own description, are the
-    /// rows the whole would send: a leaf that unification would convert
-    /// (`select 1 union all select 2.5`, an untyped literal or NULL), or a
-    /// set operation of another kind under it, runs the whole at once.
-    fn append_leaves(&self, stmt: &Statement) -> Option<Vec<(Statement, bool)>> {
+    /// rows' values are captured (a plain SELECT's) and, for a leaf whose
+    /// columns unification converts (`select 1 union all select 2.5`, an
+    /// untyped literal), how its rows become the Append's `fields` as they
+    /// are read (RP-896); `None` to run it whole: a set operation of
+    /// another kind under it.
+    fn append_leaves(
+        &self,
+        stmt: &Statement,
+        fields: &[FieldInfo],
+    ) -> Option<(AppendLeaves, Vec<FieldInfo>)> {
         fn flatten(stmt: &Statement, out: &mut Vec<Statement>) -> bool {
             match stmt {
                 Statement::SetOp(set)
@@ -40153,27 +40165,123 @@ impl PgHandler {
         if !flatten(stmt, &mut leaves) {
             return None;
         }
-        let types = |leaf: &Statement| -> Option<Vec<Type>> {
-            let fields = self.describe_planned(leaf.clone()).ok().flatten()?;
-            let types: Vec<Type> = fields.iter().map(|f| f.datatype().clone()).collect();
-            (!types.contains(&Type::UNKNOWN)).then_some(types)
-        };
-        let first = types(leaves.first()?)?;
-        if !leaves[1..]
+        // Each leaf's own description, and the set operation's types:
+        // the sides unified as `transformSetOperationTree` does, the left
+        // and right of each node in turn (`set_op_rows`). An unresolved
+        // `unknown`, or sides that will not unify, runs the whole.
+        let described: Vec<Vec<FieldInfo>> = leaves
             .iter()
-            .all(|l| types(l).as_ref() == Some(&first))
-        {
+            .map(|l| self.describe_planned(l.clone()).ok().flatten())
+            .collect::<Option<_>>()?;
+        if described.iter().any(|d| d.len() != fields.len()) {
             return None;
         }
-        Some(
-            leaves
-                .into_iter()
-                .map(|l| {
-                    let capture = matches!(l, Statement::Select(_));
-                    (l, capture)
-                })
-                .collect(),
-        )
+        // A side's untyped literal columns (an untyped string or NULL), read
+        // as `set_op_rows` reads them: a constant side knows its own, any
+        // other side is read from the parse tree.
+        fn untyped(side: &Statement, parsed: &secantus_pgplan::UntypedTargets, i: usize) -> bool {
+            let flag = |v: &[bool]| v.get(i).copied().unwrap_or(false);
+            if matches!(side, Statement::SelectConstant(_)) {
+                flag(&PgHandler::null_constant_columns(side))
+                    || flag(&PgHandler::untyped_string_columns(side))
+            } else {
+                flag(&parsed.nulls) || flag(&parsed.strings)
+            }
+        }
+        fn unify(
+            stmt: &Statement,
+            leaves: &mut std::slice::Iter<'_, Vec<FieldInfo>>,
+        ) -> Option<Vec<Type>> {
+            match stmt {
+                Statement::SetOp(set) => {
+                    let left = unify(&set.left, leaves)?;
+                    let right = unify(&set.right, leaves)?;
+                    let leaf = |s: &Statement| !matches!(s, Statement::SetOp(_));
+                    left.iter()
+                        .zip(&right)
+                        .enumerate()
+                        .map(|(i, (l, r))| {
+                            let l_unknown =
+                                leaf(&set.left) && untyped(&set.left, &set.left_untyped, i);
+                            let r_unknown =
+                                leaf(&set.right) && untyped(&set.right, &set.right_untyped, i);
+                            match (l_unknown, r_unknown) {
+                                (true, false) => Some(r.clone()),
+                                (_, true) => Some(l.clone()),
+                                (false, false) => PgHandler::unify_set_op_type("UNION", l, r).ok(),
+                            }
+                        })
+                        .collect()
+                }
+                _ => Some(
+                    leaves
+                        .next()?
+                        .iter()
+                        .map(|f| f.datatype().clone())
+                        .collect(),
+                ),
+            }
+        }
+        let types = unify(stmt, &mut described.iter())?;
+        if types.contains(&Type::UNKNOWN) {
+            return None;
+        }
+        // A column whose type unification changed has no modifier
+        // (`select_common_typmod`).
+        let unified: Vec<FieldInfo> = fields
+            .iter()
+            .zip(&types)
+            .map(|(f, ty)| {
+                if f.datatype() == ty {
+                    f.clone()
+                } else {
+                    self.field_mod(f.name().to_string(), ty.clone(), -1)
+                }
+            })
+            .collect();
+        let to = Arc::new(unified.clone());
+        let (tz, ds, cenc) = (
+            self.session_timezone(),
+            self.session_datestyle(),
+            self.client_encoding(),
+        );
+        let leaves = leaves
+            .into_iter()
+            .zip(described)
+            .map(|(leaf, from)| {
+                let columns: Vec<usize> = from
+                    .iter()
+                    .zip(&unified)
+                    .enumerate()
+                    .filter(|(_, (f, t))| f.datatype() != t.datatype())
+                    .map(|(i, _)| i)
+                    .collect();
+                for &i in &columns {
+                    Self::planner_type_name(unified[i].datatype())?;
+                    if *from[i].datatype() != Type::UNKNOWN {
+                        Self::check_set_op_conversion(
+                            "UNION",
+                            from[i].datatype(),
+                            unified[i].datatype(),
+                        )
+                        .ok()?;
+                    }
+                }
+                let capture = matches!(leaf, Statement::Select(_));
+                let conversion = (!columns.is_empty()).then(|| {
+                    Arc::new(portal_stream::LeafConversion {
+                        from,
+                        to: to.clone(),
+                        columns,
+                        tz: tz.clone(),
+                        ds,
+                        cenc,
+                    })
+                });
+                Some((leaf, capture, conversion))
+            })
+            .collect::<Option<Vec<_>>>()?;
+        Some((leaves, unified))
     }
 
     /// One group's value for an output column that is an EXPRESSION over the
