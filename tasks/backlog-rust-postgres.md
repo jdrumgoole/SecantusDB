@@ -1851,7 +1851,17 @@ a regression test.
       e.b, e2.a, e2.b` on a Nested Loop, its Materialize's and Memoize's
       likewise), and an inner index scan's `Index Cond` is qualified
       (`(k.a > r.a)`). Measured on a private 15.19 cluster (found while
-      working RP-916).
+      working RP-916). Where to build it (read while working RP-840 and
+      RP-847, 2026-11-14): `ExplainOptions.verbose` is parsed and then
+      read by nothing; the plan's text is fixed up after `plan_tree` by
+      the `explain::attach_*` passes `secantus-pg/src/lib.rs` runs on the
+      tree (`attach_scan_quals`, `attach_sort_keys`,
+      `attach_series_scan`), each fed a deparse `plan_explain` computes
+      from the parse tree into `ExplainOptions`. The quals are printed by
+      ruleutils' `Printer` with `unqualified = true`; VERBOSE wants it
+      `false` (`k.a`), and each node's `Output` its targetlist deparsed
+      the same way -- for every node kind, which is why a scans-only
+      slice was not taken.
       Verify: tests/backlog/test_rp_explain_costs.py::test_plan[explain verbose prints a scan's output list]
       Backlog-ID: RP-925
 - [ ] **A binary-coercible cast is kept in a plan, and its scan is not
