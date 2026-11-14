@@ -86,12 +86,7 @@ pub(crate) struct StatsShape {
 /// [`hash`] this shapes a read of an internal database or a system
 /// collection too: mongod 8.2.11 records those.
 pub(crate) fn stats_shape(db: &str, request: &Document) -> Option<StatsShape> {
-    let name = request.keys().next()?.as_str();
-    let coll = match request.get(name)? {
-        Bson::String(coll) => coll.as_str(),
-        one if name == "aggregate" && number(one) == Some(1.0) => "$cmd.aggregate",
-        _ => return None,
-    };
+    let (name, coll) = stats_namespace(request)?;
     let digest = match name {
         "find" => find(db, request)?,
         "distinct" => distinct(db, request)?,
@@ -108,6 +103,24 @@ pub(crate) fn stats_shape(db: &str, request: &Document) -> Option<StatsShape> {
     })
 }
 
+/// The command's name and the collection its shape names.
+fn stats_namespace(request: &Document) -> Option<(&str, &str)> {
+    let name = request.keys().next()?.as_str();
+    let coll = match request.get(name)? {
+        Bson::String(coll) => coll.as_str(),
+        one if name == "aggregate" && number(one) == Some(1.0) => "$cmd.aggregate",
+        _ => return None,
+    };
+    Some((name, coll))
+}
+
+/// The debug shape [`stats_shape`] keeps, made again: `$queryStats` prints
+/// it under [`with_hmac`] when `transformIdentifiers` asks.
+pub(crate) fn debug_shape(db: &str, request: &Document) -> Option<Document> {
+    let (name, coll) = stats_namespace(request)?;
+    with_debug(|| shape_doc(db, coll, name, request))
+}
+
 /// A literal outside the shape -- a `$queryStats` key's `comment`,
 /// `maxTimeMS` or `batchSize` -- as its representative, or its debug type
 /// string when `debug`.
@@ -122,7 +135,7 @@ pub(crate) fn literal(v: &Bson, debug_form: bool) -> Option<Bson> {
 /// The query shape as a document (`Shape::toBson`): `cmdNs`, a non-empty
 /// collation, then what the command's own components append.
 fn shape_doc(db: &str, coll: &str, name: &str, request: &Document) -> Option<Document> {
-    let mut shape = doc! { "cmdNs": { "db": db, "coll": coll } };
+    let mut shape = doc! { "cmdNs": { "db": ident(db), "coll": ident(coll) } };
     if let Some(c) = optional_doc(request, "collation")?.filter(|c| !c.is_empty()) {
         shape.insert("collation", c);
     }
@@ -159,7 +172,7 @@ fn shape_doc(db: &str, coll: &str, name: &str, request: &Document) -> Option<Doc
         }
         "distinct" => {
             shape.insert("command", "distinct");
-            shape.insert("key", request.get_str("key").ok()?);
+            shape.insert("key", field_path(request.get_str("key").ok()?));
             let query = optional_doc(request, "query")?.unwrap_or_default();
             let query = filter_shape(&query)?;
             if !query.is_empty() {
@@ -233,12 +246,15 @@ fn find_projection(request: &Document) -> Option<Option<Document>> {
     };
     if request.get("showRecordId").and_then(Bson::as_bool) == Some(true) {
         let p = shown.get_or_insert_with(Document::new);
-        let id = (p.keys().last().map(String::as_str) == Some("_id"))
-            .then(|| p.remove("_id"))
+        // Under `transformIdentifiers` both names are HMACs (measured
+        // 8.2.11: `$recordId` as one identifier).
+        let id_key = field_path("_id");
+        let id = (p.keys().last() == Some(&id_key))
+            .then(|| p.remove(&id_key))
             .flatten();
-        p.insert("$recordId", doc! { "$meta": "recordId" });
+        p.insert(field_path("$recordId"), doc! { "$meta": "recordId" });
         if let Some(id) = id {
-            p.insert("_id", id);
+            p.insert(id_key, id);
         }
     }
     Some(shown)
@@ -345,6 +361,86 @@ fn with_debug<R>(f: impl FnOnce() -> R) -> R {
     let out = f();
     DEBUG.with(|d| d.set(was));
     out
+}
+
+// --------------------------------------------------------- identifiers --
+
+thread_local! {
+    /// The key `$queryStats`' `transformIdentifiers` gave: while it is set,
+    /// every identifier in the shape is printed as its HMAC-SHA-256.
+    static HMAC_KEY: std::cell::RefCell<Option<Vec<u8>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Run `f` with each identifier the shape names -- a field path's
+/// components, a namespace, a variable -- serialized as its HMAC-SHA-256
+/// under `key`, base64 (`SerializationOptions::transformIdentifiers` with
+/// `$queryStats`' `sha256HmacStringDataHasher`).
+pub(crate) fn with_hmac<R>(key: &[u8], f: impl FnOnce() -> R) -> R {
+    let was = HMAC_KEY.with(|k| k.replace(Some(key.to_vec())));
+    let out = f();
+    HMAC_KEY.with(|k| *k.borrow_mut() = was);
+    out
+}
+
+/// `serializeIdentifier`: `s`, or its HMAC under [`with_hmac`].
+pub(crate) fn ident(s: &str) -> String {
+    HMAC_KEY.with(|k| match k.borrow().as_deref() {
+        None => s.to_string(),
+        Some(key) => {
+            use base64::Engine;
+            use hmac::Mac;
+            let mut mac =
+                hmac::Hmac::<Sha256>::new_from_slice(key).expect("HMAC takes a key of any length");
+            mac.update(s.as_bytes());
+            base64::engine::general_purpose::STANDARD.encode(mac.finalize().into_bytes())
+        }
+    })
+}
+
+fn transforming() -> bool {
+    HMAC_KEY.with(|k| k.borrow().is_some())
+}
+
+/// `serializeFieldPath`: each dotted component as an identifier.
+pub(crate) fn field_path(path: &str) -> String {
+    if !transforming() {
+        return path.to_string();
+    }
+    path.split('.').map(ident).collect::<Vec<_>>().join(".")
+}
+
+/// The variables mongod defines itself (`Variables::kBuiltinVarNameToId`),
+/// and `CURRENT`, which names `ROOT` until something rebinds it.
+const BUILTIN_VARIABLES: &[&str] = &[
+    "ROOT",
+    "CURRENT",
+    "REMOVE",
+    "NOW",
+    "CLUSTER_TIME",
+    "JS_SCOPE",
+    "IS_MR",
+    "SEARCH_META",
+    "USER_ROLES",
+];
+
+/// `ExpressionFieldPath::serialize` of a `$path` or `$$variable.path`
+/// string: `$$CURRENT.a` is `$a`; under [`with_hmac`] a builtin variable
+/// keeps its name and the rest of the path is transformed.
+fn path_expression(s: &str) -> String {
+    let Some(rest) = s.strip_prefix("$$") else {
+        return format!("${}", field_path(&s[1..]));
+    };
+    let (var, tail) = match rest.split_once('.') {
+        Some((var, tail)) => (var, Some(tail)),
+        None => (rest, None),
+    };
+    match tail {
+        Some(tail) if var == "CURRENT" => format!("${}", field_path(tail)),
+        _ if !transforming() => s.to_string(),
+        None if BUILTIN_VARIABLES.contains(&var) => s.to_string(),
+        Some(tail) if BUILTIN_VARIABLES.contains(&var) => format!("$${var}.{}", field_path(tail)),
+        _ => format!("$${}", field_path(rest)),
+    }
 }
 
 /// mongod's debug type string of one value's type (`debugTypeString`),
@@ -492,7 +588,9 @@ fn array_rep<'a>(items: impl Iterator<Item = &'a Bson>) -> Option<Vec<Bson>> {
 
 /// `min` and `max`: each value a literal (`shapifyFlatObj`).
 fn flat_literals(d: &Document) -> Option<Document> {
-    d.iter().map(|(k, v)| Some((k.clone(), rep(v)?))).collect()
+    d.iter()
+        .map(|(k, v)| Some((field_path(k), rep(v)?)))
+        .collect()
 }
 
 /// A sort: each direction as 1 or -1; a `$meta` key is named
@@ -506,7 +604,7 @@ fn sort_shape(d: &Document) -> Option<Document> {
                     (format!("$computed{at}"), Bson::Document(meta.clone()))
                 }
                 other => (
-                    k.clone(),
+                    field_path(k),
                     Bson::Int32(if number(other)? < 0.0 { -1 } else { 1 }),
                 ),
             })
@@ -516,7 +614,7 @@ fn sort_shape(d: &Document) -> Option<Document> {
 
 fn let_shape(d: &Document) -> Option<Document> {
     d.iter()
-        .map(|(k, v)| Some((k.clone(), expr(v, true)?)))
+        .map(|(k, v)| Some((field_path(k), expr(v, true)?)))
         .collect()
 }
 
@@ -1087,14 +1185,14 @@ fn serialize(node: &Node, include_path: bool) -> Document {
     match node {
         Node::Leaf { path, rhs } => {
             if include_path {
-                doc! { path: rhs.clone() }
+                doc! { field_path(path): rhs.clone() }
             } else {
                 rhs.clone()
             }
         }
         Node::ElemValue { path, .. } | Node::ElemObject { path, .. } => {
             if include_path {
-                doc! { path: right_hand_side(node) }
+                doc! { field_path(path): right_hand_side(node) }
             } else {
                 right_hand_side(node)
             }
@@ -1128,7 +1226,7 @@ fn not(child: &Node, include_path: bool) -> Document {
         Node::Leaf { path, .. } | Node::ElemValue { path, .. } | Node::ElemObject { path, .. }
             if !path.starts_with('$') =>
         {
-            doc! { path: { "$not": right_hand_side(target) } }
+            doc! { field_path(path): { "$not": right_hand_side(target) } }
         }
         other => doc! { "$nor": [serialize(other, true)] },
     }
@@ -1301,7 +1399,9 @@ fn constant(v: &Bson, wrap: bool) -> Option<Bson> {
 /// An aggregation expression's representative shape.
 fn expr(v: &Bson, wrap: bool) -> Option<Bson> {
     match v {
-        Bson::String(s) if s.starts_with('$') => (s.len() > 1).then(|| v.clone()),
+        Bson::String(s) if s.starts_with('$') => {
+            (s.len() > 1).then(|| Bson::String(path_expression(s)))
+        }
         Bson::Document(d) if operator(d).is_some() => {
             let (op, arg) = operator(d)?;
             if d.len() != 1 {
@@ -1318,7 +1418,7 @@ fn expr(v: &Bson, wrap: bool) -> Option<Bson> {
         Bson::Document(_) | Bson::Array(_) if all_constant(v) => constant(&constant_value(v), wrap),
         Bson::Document(d) => d
             .iter()
-            .map(|(k, x)| Some((k.clone(), expr(x, true)?)))
+            .map(|(k, x)| Some((field_path(k), expr(x, true)?)))
             .collect::<Option<Document>>()
             .map(Bson::Document),
         Bson::Array(a) => a
@@ -1404,6 +1504,28 @@ fn kept_constant(v: &Bson) -> Bson {
         return value;
     }
     Bson::Document(doc! { "$const": value })
+}
+
+/// `$getField`'s and `$setField`'s `field`, a constant that is also a field
+/// path: kept as [`kept_constant`] keeps it, its name an identifier.
+fn field_name_constant(v: &Bson) -> Bson {
+    match kept_constant(v) {
+        Bson::String(s) => Bson::String(field_path(&s)),
+        Bson::Document(mut d) => {
+            if let Some(Bson::String(s)) = d.get("$const") {
+                let s = field_path(s);
+                d.insert("$const", s);
+            }
+            Bson::Document(d)
+        }
+        other => other,
+    }
+}
+
+/// A document whose keys are field paths, its values as written (a
+/// `$top`'s `sortBy`, `SortPattern::serialize`).
+fn field_paths(d: &Document) -> Document {
+    d.iter().map(|(k, v)| (field_path(k), v.clone())).collect()
 }
 
 /// The date-part operators: `{$op: {date, timezone}}` whichever way the
@@ -1546,7 +1668,7 @@ fn operator_shape(op: &str, arg: &Bson) -> Option<Document> {
             let vars = d.get_document("vars").ok()?;
             let vars: Document = vars
                 .iter()
-                .map(|(k, v)| Some((k.clone(), sub_expr(v)?)))
+                .map(|(k, v)| Some((ident(k), sub_expr(v)?)))
                 .collect::<Option<_>>()?;
             doc! { "$let": { "vars": vars, "in": sub_expr(d.get("in")?)? } }
         }
@@ -1563,7 +1685,7 @@ fn operator_shape(op: &str, arg: &Bson) -> Option<Document> {
             }
             let mut out = doc! {
                 "input": sub_expr(d.get("input")?)?,
-                "as": d.get("as").map_or(Some("this"), Bson::as_str)?,
+                "as": ident(d.get("as").map_or(Some("this"), Bson::as_str)?),
                 body: sub_expr(d.get(body)?)?,
             };
             if let Some(limit) = d.get("limit") {
@@ -1604,7 +1726,7 @@ fn operator_shape(op: &str, arg: &Bson) -> Option<Document> {
                 None if op == "$getField" => Bson::String("$$CURRENT".into()),
                 None => return None,
             };
-            let mut out = doc! { "field": kept_constant(field), "input": input };
+            let mut out = doc! { "field": field_name_constant(field), "input": input };
             match op {
                 "$setField" => {
                     out.insert("value", sub_expr(value?)?);
@@ -1823,7 +1945,11 @@ fn emit(tree: &[(String, PNode)]) -> Option<Document> {
                 PNode::Slice(_) => Bson::Document(doc! { "$slice": value }),
                 _ => value,
             };
-            Some((k.clone(), value))
+            let key = match k.strip_suffix(".$") {
+                Some(field) => format!("{}.$", field_path(field)),
+                None => field_path(k),
+            };
+            Some((key, value))
         })
         .collect()
 }
@@ -1917,7 +2043,7 @@ fn accumulator(acc: &Bson) -> Option<Document> {
                 out.insert("n", sub_expr(d.get("n")?)?);
             }
             out.insert("output", sub_expr(d.get("output")?)?);
-            out.insert("sortBy", d.get_document("sortBy").ok()?.clone());
+            out.insert("sortBy", field_paths(d.get_document("sortBy").ok()?));
             doc! { op: out }
         }
         "$firstN" | "$lastN" | "$maxN" | "$minN" | "$median" | "$percentile" => {
@@ -1948,7 +2074,7 @@ fn accumulator(acc: &Bson) -> Option<Document> {
 /// A `{name: <accumulator>}` map (`$group`'s fields, `$bucket`'s output).
 fn accumulators<'a>(fields: impl Iterator<Item = (&'a String, &'a Bson)>) -> Option<Document> {
     fields
-        .map(|(k, v)| Some((k.clone(), Bson::Document(accumulator(v)?))))
+        .map(|(k, v)| Some((field_path(k), Bson::Document(accumulator(v)?))))
         .collect()
 }
 
@@ -2075,8 +2201,13 @@ fn window_stages(
         Some(Partition::By(Bson::String(path)))
             if path.starts_with('$') && !path.starts_with("$$") =>
         {
-            order.insert(&path[1..], 1);
-            return finish(Some(Bson::String(path.clone())), sort, output, order);
+            order.insert(field_path(&path[1..]), 1);
+            return finish(
+                Some(Bson::String(path_expression(path))),
+                sort,
+                output,
+                order,
+            );
         }
         Some(Partition::By(e)) => Some(sub_expr(e)?),
         Some(Partition::Fields(value)) => Some(value),
@@ -2084,10 +2215,12 @@ fn window_stages(
     let partition = match computed {
         None => None,
         Some(value) => {
-            before.push(doc! { "$addFields": { PARTITION_KEY: value } });
-            order.insert(PARTITION_KEY, 1);
-            after.push(doc! { "$project": { PARTITION_KEY: false, "_id": true } });
-            Some(Bson::String(format!("${PARTITION_KEY}")))
+            before.push(doc! { "$addFields": { field_path(PARTITION_KEY): value } });
+            order.insert(field_path(PARTITION_KEY), 1);
+            after.push(
+                doc! { "$project": { field_path(PARTITION_KEY): false, field_path("_id"): true } },
+            );
+            Some(Bson::String(path_expression(&format!("${PARTITION_KEY}"))))
         }
     };
     let mut out = before;
@@ -2167,12 +2300,12 @@ fn bucket(spec: &Document) -> Option<Vec<Document>> {
     match spec.get_document("output") {
         Ok(output) => group.extend(accumulators(output.iter())?),
         Err(_) => {
-            group.insert("count", count_of_one());
+            group.insert(field_path("count"), count_of_one());
         }
     }
     Some(vec![
         doc! { "$group": group },
-        doc! { "$sort": { "_id": 1 } },
+        doc! { "$sort": { field_path("_id"): 1 } },
     ])
 }
 
@@ -2190,7 +2323,10 @@ fn fill(spec: &Document) -> Option<Vec<Document>> {
                     let f = f
                         .as_str()
                         .filter(|f| !f.contains('.') && !f.starts_with('$'))?;
-                    Some((f.to_string(), Bson::String(format!("${f}"))))
+                    Some((
+                        field_path(f),
+                        Bson::String(path_expression(&format!("${f}"))),
+                    ))
                 })
                 .collect::<Option<Document>>()?;
             Some(Partition::Fields(Bson::Document(doc! { "$expr": object })))
@@ -2207,7 +2343,7 @@ fn fill(spec: &Document) -> Option<Vec<Document>> {
         let path = Bson::String(format!("${field}"));
         if let Some(v) = how.get("value") {
             values.insert(
-                field.clone(),
+                field_path(field),
                 nary("$ifNull", &Bson::Array(vec![path, v.clone()]))?,
             );
         } else {
@@ -2216,7 +2352,10 @@ fn fill(spec: &Document) -> Option<Vec<Document>> {
                 "linear" => "$linearFill",
                 _ => return None,
             };
-            methods.insert(field.clone(), doc! { op: path });
+            methods.insert(
+                field_path(field),
+                doc! { op: path_expression(&format!("${field}")) },
+            );
         }
     }
     let mut out = Vec::new();
@@ -2259,14 +2398,14 @@ fn densify(spec: &Document) -> Option<Vec<Document>> {
     }
     let mut order = Document::new();
     for p in &partitions {
-        order.insert(*p, 1);
+        order.insert(field_path(p), 1);
     }
-    order.insert(field, 1);
+    order.insert(field_path(field), 1);
     Some(vec![
         doc! { "$sort": order },
         doc! { "$_internalDensify": {
-            "field": field,
-            "partitionByFields": partitions,
+            "field": field_path(field),
+            "partitionByFields": partitions.iter().map(|p| field_path(p)).collect::<Vec<_>>(),
             "range": shaped,
         } },
     ])
@@ -2280,13 +2419,21 @@ fn merge(db: &str, coll: &str, spec: &Bson) -> Option<Document> {
         _ => return None,
     };
     let into = match spec.get("into")? {
-        Bson::String(coll) => doc! { "db": db, "coll": coll.clone() },
-        Bson::Document(d) => doc! { "db": d.get_str("db").ok()?, "coll": d.get_str("coll").ok()? },
+        Bson::String(coll) => doc! { "db": ident(db), "coll": ident(coll) },
+        Bson::Document(d) => doc! {
+            "db": ident(d.get_str("db").ok()?),
+            "coll": ident(d.get_str("coll").ok()?),
+        },
         _ => return None,
     };
     let on = match spec.get("on") {
-        None => Bson::String("_id".into()),
-        Some(v @ (Bson::String(_) | Bson::Array(_))) => v.clone(),
+        None => Bson::String(field_path("_id")),
+        Some(Bson::String(on)) => Bson::String(field_path(on)),
+        Some(Bson::Array(on)) => Bson::Array(
+            on.iter()
+                .map(|f| Some(Bson::String(field_path(f.as_str()?))))
+                .collect::<Option<_>>()?,
+        ),
         Some(_) => return None,
     };
     let mut out = doc! { "into": into, "on": on };
@@ -2296,7 +2443,7 @@ fn merge(db: &str, coll: &str, spec: &Bson) -> Option<Document> {
                 Ok(l) => let_shape(l)?,
                 Err(_) => Document::new(),
             };
-            vars.insert("new", "$$ROOT");
+            vars.insert(field_path("new"), "$$ROOT");
             out.insert("let", vars);
             out.insert("whenMatched", pipeline_shape(db, coll, pipeline)?);
         }
@@ -2418,12 +2565,12 @@ fn change_stream(spec: &Document) -> Option<Document> {
 fn geo_near(spec: &Document) -> Option<Document> {
     let mut out = Document::new();
     if let Some(key) = spec.get("key") {
-        out.insert("key", key.as_str()?);
+        out.insert("key", field_path(key.as_str()?));
     }
     out.insert("near", constant(spec.get("near")?, true)?);
     // Optional since 8.0: mongod 8.2.11 shapes `{near: [0, 0]}` with none.
     if let Some(f) = spec.get("distanceField") {
-        out.insert("distanceField", f.as_str()?);
+        out.insert("distanceField", field_path(f.as_str()?));
     }
     for k in ["maxDistance", "minDistance"] {
         if let Some(v) = spec.get(k) {
@@ -2435,12 +2582,13 @@ fn geo_near(spec: &Document) -> Option<Document> {
         None => Document::new(),
     };
     out.insert("query", query);
-    out.insert("spherical", true);
+    // A literal: a debug shape prints `?bool` (measured 8.2.11).
+    out.insert("spherical", lit(Bson::Boolean(true)));
     if let Some(v) = spec.get("distanceMultiplier") {
         out.insert("distanceMultiplier", rep(v)?);
     }
     if let Some(v) = spec.get("includeLocs") {
-        out.insert("includeLocs", v.as_str()?);
+        out.insert("includeLocs", field_path(v.as_str()?));
     }
     Some(out)
 }
@@ -2634,8 +2782,8 @@ fn rank_fusion(db: &str, coll: &str, spec: &Document) -> Option<Vec<Document>> {
             doc! { "$replaceWith": { "docs": "$$ROOT" } },
         )?);
         shaped.push(doc! { "$_internalSetWindowFields": {
-            "sortBy": { "order": 1 },
-            "output": { &rank: { "$rank": {} } },
+            "sortBy": { field_path("order"): 1 },
+            "output": { field_path(&rank): { "$rank": {} } },
         } });
         shaped.extend(built(
             db,
@@ -2661,7 +2809,7 @@ fn rank_fusion(db: &str, coll: &str, spec: &Document) -> Option<Vec<Document>> {
             out.extend(shaped);
         } else {
             let pipeline: Vec<Bson> = shaped.into_iter().map(Bson::Document).collect();
-            out.push(doc! { "$unionWith": { "coll": coll, "pipeline": pipeline } });
+            out.push(doc! { "$unionWith": { "coll": ident(coll), "pipeline": pipeline } });
         }
     }
     let path = |name: &str, suffix: &str| format!("${name}_{suffix}");
@@ -2855,9 +3003,13 @@ fn score_fusion(db: &str, coll: &str, spec: &Document) -> Option<Vec<Document>> 
         if normalization == "minMaxScaler" {
             let score = field(name, "score");
             shaped.push(doc! { "$_internalSetWindowFields": {
-                "sortBy": { &score: -1 },
-                "output": { &score: {
-                    "$minMaxScaler": { "input": format!("${score}"), "min": 0, "max": 1 },
+                "sortBy": { field_path(&score): -1 },
+                "output": { field_path(&score): {
+                    "$minMaxScaler": {
+                        "input": path_expression(&format!("${score}")),
+                        "min": 0,
+                        "max": 1,
+                    },
                     "window": { "documents": ["unbounded", "unbounded"] },
                 } },
             } });
@@ -2866,7 +3018,7 @@ fn score_fusion(db: &str, coll: &str, spec: &Document) -> Option<Vec<Document>> 
             out.extend(shaped);
         } else {
             let pipeline: Vec<Bson> = shaped.into_iter().map(Bson::Document).collect();
-            out.push(doc! { "$unionWith": { "coll": coll, "pipeline": pipeline } });
+            out.push(doc! { "$unionWith": { "coll": ident(coll), "pipeline": pipeline } });
         }
     }
     let mut push = Document::new();
@@ -2995,8 +3147,8 @@ fn stage_shape(db: &str, coll: &str, stage: &Document) -> Option<Vec<Document>> 
         "$count" => {
             let field = spec.as_str()?;
             vec![
-                doc! { "$group": { "_id": constant(&Bson::Null, true)?, field: count_of_one() } },
-                doc! { "$project": { field: true, "_id": false } },
+                doc! { "$group": { "_id": constant(&Bson::Null, true)?, field_path(field): count_of_one() } },
+                doc! { "$project": { field_path(field): true, field_path("_id"): false } },
             ]
         }
         "$group" => {
@@ -3025,15 +3177,15 @@ fn stage_shape(db: &str, coll: &str, stage: &Document) -> Option<Vec<Document>> 
             let mut out = Document::new();
             match spec {
                 Bson::String(path) => {
-                    out.insert("path", path.clone());
+                    out.insert("path", path_expression(path));
                 }
                 Bson::Document(d) => {
-                    out.insert("path", d.get_str("path").ok()?);
+                    out.insert("path", path_expression(d.get_str("path").ok()?));
                     if d.get("preserveNullAndEmptyArrays").is_some_and(true_value) {
                         out.insert("preserveNullAndEmptyArrays", lit(Bson::Boolean(true)));
                     }
                     if let Some(index) = d.get("includeArrayIndex") {
-                        out.insert("includeArrayIndex", index.as_str()?);
+                        out.insert("includeArrayIndex", field_path(index.as_str()?));
                     }
                 }
                 _ => return None,
@@ -3050,8 +3202,8 @@ fn stage_shape(db: &str, coll: &str, stage: &Document) -> Option<Vec<Document>> 
             vec![doc! { "$sample": { "size": lit(Bson::Int32(1)) } }]
         }
         "$sortByCount" => vec![
-            doc! { "$group": { "_id": expr(spec, true)?, "count": count_of_one() } },
-            doc! { "$sort": { "count": -1 } },
+            doc! { "$group": { "_id": expr(spec, true)?, field_path("count"): count_of_one() } },
+            doc! { "$sort": { field_path("count"): -1 } },
         ],
         "$lookup" => {
             let d = spec.as_document()?;
@@ -3066,11 +3218,14 @@ fn stage_shape(db: &str, coll: &str, stage: &Document) -> Option<Vec<Document>> 
             if d.keys().any(|k| !KEYS.contains(&k.as_str())) {
                 return None;
             }
-            let mut out = doc! { "from": d.get_str("from").ok()?, "as": d.get_str("as").ok()? };
+            let mut out = doc! {
+                "from": ident(d.get_str("from").ok()?),
+                "as": field_path(d.get_str("as").ok()?),
+            };
             match (d.get("localField"), d.get("foreignField")) {
                 (Some(l), Some(f)) => {
-                    out.insert("localField", l.as_str()?);
-                    out.insert("foreignField", f.as_str()?);
+                    out.insert("localField", field_path(l.as_str()?));
+                    out.insert("foreignField", field_path(f.as_str()?));
                 }
                 (None, None) => {}
                 _ => return None,
@@ -3107,7 +3262,7 @@ fn stage_shape(db: &str, coll: &str, stage: &Document) -> Option<Vec<Document>> 
                 .iter()
                 .map(|(k, p)| {
                     Some((
-                        k.clone(),
+                        field_path(k),
                         Bson::Array(pipeline_shape(db, coll, p.as_array()?)?),
                     ))
                 })
@@ -3130,19 +3285,19 @@ fn stage_shape(db: &str, coll: &str, stage: &Document) -> Option<Vec<Document>> 
                 }
                 _ => return None,
             };
-            vec![doc! { "$unionWith": { "coll": coll, "pipeline": pipeline } }]
+            vec![doc! { "$unionWith": { "coll": ident(coll), "pipeline": pipeline } }]
         }
         "$graphLookup" => {
             let d = spec.as_document()?;
             let mut out = doc! {
-                "from": d.get_str("from").ok()?,
-                "as": d.get_str("as").ok()?,
-                "connectToField": d.get_str("connectToField").ok()?,
-                "connectFromField": d.get_str("connectFromField").ok()?,
+                "from": ident(d.get_str("from").ok()?),
+                "as": field_path(d.get_str("as").ok()?),
+                "connectToField": field_path(d.get_str("connectToField").ok()?),
+                "connectFromField": field_path(d.get_str("connectFromField").ok()?),
                 "startWith": sub_expr(d.get("startWith")?)?,
             };
             if let Some(f) = d.get("depthField") {
-                out.insert("depthField", f.as_str()?);
+                out.insert("depthField", field_path(f.as_str()?));
             }
             if let Some(m) = d.get("maxDepth") {
                 out.insert("maxDepth", rep(m)?);
@@ -3163,7 +3318,7 @@ fn stage_shape(db: &str, coll: &str, stage: &Document) -> Option<Vec<Document>> 
             }
             let output = match d.get_document("output") {
                 Ok(o) => accumulators(o.iter())?,
-                Err(_) => doc! { "count": count_of_one() },
+                Err(_) => doc! { field_path("count"): count_of_one() },
             };
             out.insert("output", output);
             vec![doc! { "$bucketAuto": out }]
@@ -3175,7 +3330,7 @@ fn stage_shape(db: &str, coll: &str, stage: &Document) -> Option<Vec<Document>> 
                 .get_document("output")
                 .ok()?
                 .iter()
-                .map(|(k, v)| Some((k.clone(), Bson::Document(window_output(v)?))))
+                .map(|(k, v)| Some((field_path(k), Bson::Document(window_output(v)?))))
                 .collect::<Option<Document>>()?;
             let sort = match d.get("sortBy") {
                 Some(s) => Some(s.as_document()?),
@@ -3193,7 +3348,7 @@ fn stage_shape(db: &str, coll: &str, stage: &Document) -> Option<Vec<Document>> 
                 }
                 _ => return None,
             };
-            vec![doc! { "$out": { "coll": coll, "db": out_db } }]
+            vec![doc! { "$out": { "coll": ident(coll), "db": ident(out_db) } }]
         }
         "$merge" => vec![doc! { "$merge": merge(db, coll, spec)? }],
         "$geoNear" => vec![doc! { "$geoNear": geo_near(spec.as_document()?)? }],
@@ -3222,8 +3377,8 @@ fn stage_shape(db: &str, coll: &str, stage: &Document) -> Option<Vec<Document>> 
             let meta = || Bson::Document(doc! { "$meta": "score" });
             let mut out = vec![
                 doc! { "$setMetadata": { "score": sub_expr(d.get("score")?)? } },
-                doc! { "$replaceRoot": { "newRoot": { "docs": "$$ROOT" } } },
-                doc! { "$addFields": { "internal_raw_score": meta() } },
+                doc! { "$replaceRoot": { "newRoot": { field_path("docs"): "$$ROOT" } } },
+                doc! { "$addFields": { field_path("internal_raw_score"): meta() } },
             ];
             match d.get("normalization").map(Bson::as_str) {
                 None | Some(Some("none")) => {}
@@ -3233,13 +3388,13 @@ fn stage_shape(db: &str, coll: &str, stage: &Document) -> Option<Vec<Document>> 
                 Some(Some("minMaxScaler")) => {
                     const SCALED: &str = "internal_min_max_scaler_normalization_score";
                     out.push(doc! { "$_internalSetWindowFields": {
-                        "sortBy": { SCALED: -1 },
-                        "output": { SCALED: {
+                        "sortBy": { field_path(SCALED): -1 },
+                        "output": { field_path(SCALED): {
                             "$minMaxScaler": { "input": meta(), "min": 0, "max": 1 },
                             "window": { "documents": ["unbounded", "unbounded"] },
                         } },
                     } });
-                    out.push(doc! { "$setMetadata": { "score": format!("${SCALED}") } });
+                    out.push(doc! { "$setMetadata": { "score": path_expression(&format!("${SCALED}")) } });
                 }
                 _ => return None,
             }
@@ -3248,7 +3403,7 @@ fn stage_shape(db: &str, coll: &str, stage: &Document) -> Option<Vec<Document>> 
                 let weighted = Bson::Document(doc! { "$multiply": [meta(), w.clone()] });
                 out.push(doc! { "$setMetadata": { "score": sub_expr(&weighted)? } });
             }
-            out.push(doc! { "$replaceRoot": { "newRoot": "$docs" } });
+            out.push(doc! { "$replaceRoot": { "newRoot": path_expression("$docs") } });
             out
         }
         "$documents" => {
@@ -3262,9 +3417,9 @@ fn stage_shape(db: &str, coll: &str, stage: &Document) -> Option<Vec<Document>> 
             const FIELD: &str = "_tempDocumentsField";
             vec![
                 doc! { "$queue": lit(Bson::Array(vec![Bson::Document(doc! { "?": "?" })])) },
-                doc! { "$project": { "_id": true, FIELD: docs } },
-                doc! { "$unwind": { "path": format!("${FIELD}") } },
-                doc! { "$replaceRoot": { "newRoot": format!("${FIELD}") } },
+                doc! { "$project": { field_path("_id"): true, field_path(FIELD): docs } },
+                doc! { "$unwind": { "path": path_expression(&format!("${FIELD}")) } },
+                doc! { "$replaceRoot": { "newRoot": path_expression(&format!("${FIELD}")) } },
             ]
         }
         _ => return None,
@@ -3536,6 +3691,77 @@ mod tests {
                 "{command}"
             );
         }
+    }
+
+    /// `transformIdentifiers` under the key `0123456789abcdef` twice: the
+    /// key mongod 8.2.11 printed for this `find` (2026-11-14) -- each path
+    /// component and the namespace as its HMAC, `_id` too.
+    #[test]
+    fn identifiers_transform_as_mongods() {
+        let find = doc! {
+            "find": "c",
+            "filter": { "a": { "$gt": 1 }, "b.c": "x" },
+            "projection": { "a": 1 },
+            "sort": { "a": 1 },
+        };
+        let key = b"0123456789abcdef0123456789abcdef";
+        let shape = with_hmac(key, || debug_shape("rm215r", &find)).unwrap();
+        let a = "qiGHcjZFolIUi786rQ4g1MOihhI1u2WiZJZ6+dRvrsI=";
+        let c = "+GIsxB8Q0QqpsXvrZxWo5jG/74lb8GWX2mvtZvLgPSk=";
+        let b = "T0MsOqnZpzT9WNRha7ZJm1wuGIsixFBshsf92M9FAP4=";
+        let id = "v2F7SFtXfDR4NQAoA/jCbiq80fRAMT7Hw1mpgXcw8S8=";
+        assert_eq!(
+            shape,
+            doc! {
+                "cmdNs": { "db": "JYY2uxOLLDvknJ56kp7JhXENu7H0VD3LD3Le/6Gy0ws=", "coll": c },
+                "command": "find",
+                "filter": { "$and": [
+                    { a: { "$gt": "?number" } },
+                    { format!("{b}.{c}"): { "$eq": "?string" } },
+                ] },
+                "projection": { a: true, id: true },
+                "sort": { a: 1 },
+            }
+        );
+        // Outside `with_hmac`, nothing is transformed.
+        assert_eq!(
+            debug_shape("rm215r", &find)
+                .unwrap()
+                .get_document("sort")
+                .unwrap(),
+            &doc! { "a": 1 }
+        );
+    }
+
+    /// `ExpressionFieldPath::serialize`: `$$CURRENT.a` is `$a`; a builtin
+    /// variable keeps its name, a user's is transformed with its path.
+    #[test]
+    fn a_variable_keeps_its_name_only_when_builtin() {
+        let dollars = "$$";
+        assert_eq!(path_expression(&format!("{dollars}CURRENT.a")), "$a");
+        assert_eq!(
+            path_expression(&format!("{dollars}CURRENT")),
+            format!("{dollars}CURRENT")
+        );
+        let key = b"0123456789abcdef0123456789abcdef";
+        let (v, x) = with_hmac(key, || (ident("v"), ident("x")));
+        let got: Vec<String> = with_hmac(key, || {
+            ["ROOT", "NOW", "ROOT.x", "v.x"]
+                .iter()
+                .map(|p| path_expression(&format!("{dollars}{p}")))
+                .chain([path_expression("$x")])
+                .collect()
+        });
+        assert_eq!(
+            got,
+            [
+                format!("{dollars}ROOT"),
+                format!("{dollars}NOW"),
+                format!("{dollars}ROOT.{x}"),
+                format!("{dollars}{v}.{x}"),
+                format!("${x}"),
+            ]
+        );
     }
 
     #[test]

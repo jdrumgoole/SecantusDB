@@ -461,6 +461,13 @@ pub fn aggregate(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         return crate::explain::explain(&wrapped, ctx);
     }
 
+    // The stages that hold pipelines are parsed, and refuse what those
+    // pipelines hold, before the pipeline itself is checked as a whole
+    // (mongod 8.2.11: `[{$out: "x"}, {$facet: {a: [{$out: "y"}]}}]` is 40600).
+    if let Some(problem) = nested_stage_problem(&pipeline) {
+        return Ok(problem.into_reply());
+    }
+
     // `$out` / `$merge` may only be the final pipeline stage — mongod rejects a
     // non-terminal write stage with Location40601 before executing anything
     // (mongo-cxx-driver "out fails when not last").
@@ -491,9 +498,6 @@ pub fn aggregate(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
             "$geoNear was not the first stage in the pipeline after optimization. Is \
              optimization disabled or inhibited?",
         ));
-    }
-    if let Some(problem) = nested_write_stage(&pipeline) {
-        return Ok(problem.into_reply());
     }
     involved_view_collation(doc, ctx, coll.as_deref(), &pipeline)?;
 
@@ -2862,7 +2866,20 @@ fn documents_stage(
         .map_err(|_| bad_value("$documents expression not supported"))?;
     let arr = match value {
         Bson::Array(a) => a,
-        _ => return Err(bad_value("$documents argument must evaluate to an array")),
+        // mongod desugars `$documents` into a `$queue` the executor fills, so
+        // a value that is not an array fails at RUN time, under the executor
+        // prefix of the command running it -- `<db>.$cmd.aggregate`, or the
+        // outer collection's namespace inside a `$lookup` / `$unionWith`
+        // (RM-531, probed 8.2.11 for numbers, strings, null, booleans,
+        // documents, `$$ROOT` and `$$NOW`). This answered 2 BadValue.
+        _ => {
+            let ns = COMMAND_NS.with(|n| n.borrow().clone());
+            return Err(CommandError::new(
+                5858203,
+                crate::util::error_code_name(5858203),
+                wrap_pipeline_error("an array is expected".to_string(), false, ns.as_deref()),
+            ));
+        }
     };
     let mut out = Vec::with_capacity(arr.len());
     for elem in arr {
@@ -2934,10 +2951,16 @@ fn core_run(
     })
 }
 
-/// A writing stage inside another stage's pipeline, which mongod refuses
-/// before it runs anything (measured 8.2.11, 2026-10-13). These RAN, and
-/// wrote to the target from inside a `$facet`.
-fn nested_write_stage(pipeline: &[Bson]) -> Option<CommandError> {
+/// What mongod refuses in the pipelines a stage holds, as it parses that
+/// stage and so before it runs anything (measured 8.2.11, 2026-10-13 and
+/// 2026-11-14). A sub-pipeline's own stages are parsed first, so whatever
+/// they refuse comes first; then a `$lookup` or `$unionWith` refuses a
+/// writing stage in its pipeline (51047 / 31441), and a `$facet`, once its
+/// spec has the right shape and every facet has parsed, refuses the first
+/// stage of each facet in turn that may not run inside one (40600,
+/// `facet_pipeline_problem`). These
+/// RAN: a `$facet` wrote to the target, and ran a `$documents` (RM-530).
+fn nested_stage_problem(pipeline: &[Bson]) -> Option<CommandError> {
     fn writer(stages: &[Bson]) -> Option<&str> {
         stages
             .iter()
@@ -2945,48 +2968,146 @@ fn nested_write_stage(pipeline: &[Bson]) -> Option<CommandError> {
             .find(|name| matches!(*name, "$out" | "$merge"))
     }
     for stage in pipeline {
-        let Bson::Document(stage) = stage else {
+        let Some((name, spec)) = stage.as_document().and_then(|d| d.iter().next()) else {
             continue;
         };
-        let Some((name, spec)) = stage.iter().next() else {
-            continue;
-        };
-        let inner: Vec<&[Bson]> = match (name.as_str(), spec) {
-            ("$facet", Bson::Document(facets)) => facets
-                .values()
-                .filter_map(|p| p.as_array().map(Vec::as_slice))
-                .collect(),
-            ("$lookup" | "$unionWith", Bson::Document(spec)) => spec
-                .get_array("pipeline")
-                .ok()
-                .map(|p| vec![p.as_slice()])
-                .unwrap_or_default(),
-            _ => Vec::new(),
-        };
-        for stages in inner {
-            if let Some(found) = writer(stages) {
-                let (code, errmsg) = match name.as_str() {
-                    "$facet" => (
-                        40600,
-                        format!("{found} is not allowed to be used within a $facet stage"),
-                    ),
-                    "$lookup" => (
-                        51047,
-                        format!("{found} is not allowed within a $lookup's sub-pipeline"),
-                    ),
-                    _ => (
-                        31441,
-                        format!("{found} is not allowed within a $unionWith's sub-pipeline"),
-                    ),
+        match (name.as_str(), spec) {
+            ("$facet", _) => {
+                let facets = match facet_pipelines(Some(spec)) {
+                    Ok(facets) => facets,
+                    Err(e) => return Some(e),
                 };
-                return Some(CommandError::new(code, format!("Location{code}"), errmsg));
+                // Every facet is parsed before any is checked: `{a: [<a
+                // $documents in a $unionWith>], b: [{$facet: {}}]}` is b's 40169.
+                let parsed = facets
+                    .iter()
+                    .find_map(|(_, stages)| nested_stage_problem(stages));
+                if parsed.is_some() {
+                    return parsed;
+                }
+                let checked = facets
+                    .iter()
+                    .find_map(|(_, stages)| facet_pipeline_problem(stages));
+                if checked.is_some() {
+                    return checked;
+                }
             }
-            if let Some(problem) = nested_write_stage(stages) {
-                return Some(problem);
+            ("$lookup" | "$unionWith", Bson::Document(spec)) => {
+                let Ok(stages) = spec.get_array("pipeline") else {
+                    continue;
+                };
+                if let Some(problem) = nested_stage_problem(stages) {
+                    return Some(problem);
+                }
+                if let Some(found) = writer(stages) {
+                    let (code, errmsg) = if name == "$lookup" {
+                        (
+                            51047,
+                            format!("{found} is not allowed within a $lookup's sub-pipeline"),
+                        )
+                    } else {
+                        (
+                            31441,
+                            format!("{found} is not allowed within a $unionWith's sub-pipeline"),
+                        )
+                    };
+                    return Some(CommandError::new(code, format!("Location{code}"), errmsg));
+                }
             }
+            _ => {}
         }
     }
     None
+}
+
+/// A `$facet` spec's pipelines, in order, once the whole spec has the shape
+/// mongod reads before it parses any of them: a non-empty object (40169),
+/// each value an array (40170) of non-empty objects (40171).
+fn facet_pipelines(spec: Option<&Bson>) -> Result<Vec<(&str, &[Bson])>, CommandError> {
+    let s = spec
+        .and_then(Bson::as_document)
+        .filter(|d| !d.is_empty())
+        .ok_or_else(|| {
+            // mongod ECHOES the offending spec, which the message omitted.
+            let rendered = spec.map(argtypes::render_stage_value).unwrap_or_default();
+            CommandError::new(
+                40169,
+                "Location40169",
+                format!(
+                    "the $facet specification must be a non-empty object, \
+                     but found: $facet: {rendered}"
+                ),
+            )
+        })?;
+    let mut facets = Vec::with_capacity(s.len());
+    for (name, sub) in s {
+        let stages = sub.as_array().ok_or_else(|| {
+            CommandError::new(
+                40170,
+                "Location40170",
+                // mongod names the TYPE it found rather than restating the rule.
+                format!(
+                    "arguments to $facet must be arrays, {name} is type {}",
+                    secantus_core::query::bson_type_name(sub)
+                ),
+            )
+        })?;
+        if !stages
+            .iter()
+            .all(|stage| matches!(stage, Bson::Document(d) if !d.is_empty()))
+        {
+            return Err(CommandError::new(
+                40171,
+                "Location40171",
+                format!(
+                    "elements of arrays in $facet spec must be non-empty objects, \
+                     {name} argument contained an invalid element"
+                ),
+            ));
+        }
+        facets.push((name.as_str(), stages.as_slice()));
+    }
+    Ok(facets)
+}
+
+/// The first stage of a facet's pipeline that may not run inside a
+/// `$facet` (40600, mongod 8.2.11): one that writes, reads an index or a
+/// catalog of its own, another `$facet`, or a `$documents` -- named as
+/// itself, or as "`$documents` inside of" the `$lookup` / `$unionWith`
+/// reading no collection that holds one, however deep (RM-530).
+fn facet_pipeline_problem(stages: &[Bson]) -> Option<CommandError> {
+    stages.iter().find_map(|stage| {
+        let name = stage_name(stage);
+        let found = match name {
+            "$out" | "$merge" | "$geoNear" | "$facet" | "$documents" => name.to_string(),
+            crate::list_catalog::STAGE => name.to_string(),
+            _ => format!("$documents inside of {}", documents_holder(stage)?),
+        };
+        Some(CommandError::new(
+            40600,
+            "Location40600",
+            format!("{found} is not allowed to be used within a $facet stage"),
+        ))
+    })
+}
+
+/// The `$lookup` or `$unionWith`, in `stage` or the pipelines it holds, that
+/// reads no collection and runs a `$documents`: the outermost such stage
+/// that holds one itself, as mongod 8.2.11 names it. A `$documents` under a
+/// stage that reads a collection is refused there first (73), and one in a
+/// nested `$facet` by that `$facet`.
+fn documents_holder(stage: &Bson) -> Option<&str> {
+    sub_pipelines(stage)
+        .into_iter()
+        .filter(|(kind, _, _)| *kind != "$facet")
+        .find_map(|(kind, stages, reads)| {
+            let holds = stages.iter().any(|s| stage_name(s) == "$documents");
+            if holds && reads == Some(false) {
+                Some(kind)
+            } else {
+                stages.iter().find_map(documents_holder)
+            }
+        })
 }
 
 /// The kind of stage a sub-pipeline runs under.
@@ -3296,7 +3417,7 @@ fn apply_lookup(
             };
             let mut made = run(Vec::new(), source)?;
             if let (Some(lf), Some(ff)) = (local_field, foreign_field) {
-                let lv = secantus_core::get_path(&doc, lf).cloned();
+                let lv = lookup_local_value(&doc, lf);
                 made.retain(|fd| lookup_match(lv.as_ref(), secantus_core::get_path(fd, ff)));
             }
             let joined = run(made, rest)?;
@@ -3321,7 +3442,7 @@ fn apply_lookup(
             if foreign_field_has_leading_index(storage, db, from, ff)? {
                 let mut out = Vec::with_capacity(docs.len());
                 for doc in docs {
-                    let lv = secantus_core::get_path(&doc, lf).cloned();
+                    let lv = lookup_local_value(&doc, lf);
                     let joined = index_join_lookup(storage, db, from, ff, lv.as_ref())?;
                     lookup_budget(&joined, from)?;
                     let mut new = doc;
@@ -3374,7 +3495,7 @@ fn apply_lookup(
             let sub_vars = bind(&doc)?;
             let candidates: Vec<Document> = match (local_field, foreign_field) {
                 (Some(lf), Some(ff)) => {
-                    let lv = secantus_core::get_path(&doc, lf).cloned();
+                    let lv = lookup_local_value(&doc, lf);
                     foreign
                         .iter()
                         .filter(|fd| lookup_match(lv.as_ref(), secantus_core::get_path(fd, ff)))
@@ -3401,7 +3522,7 @@ fn apply_lookup(
                 .ok_or_else(|| bad_value("$lookup requires localField+foreignField or pipeline"))?;
             let ff = foreign_field
                 .ok_or_else(|| bad_value("$lookup requires localField+foreignField or pipeline"))?;
-            let lv = secantus_core::get_path(&doc, lf).cloned();
+            let lv = lookup_local_value(&doc, lf);
             foreign
                 .iter()
                 .filter(|fd| lookup_match(lv.as_ref(), secantus_core::get_path(fd, ff)))
@@ -3455,12 +3576,8 @@ fn index_join_lookup(
     local_value: Option<&Bson>,
 ) -> Result<Vec<Document>, CommandError> {
     let filter = match local_value {
-        Some(Bson::Array(a)) => {
-            if a.is_empty() {
-                return Ok(Vec::new());
-            }
-            doc! { foreign_field: { "$in": a.clone() } }
-        }
+        // `lookup_local_value` has already read an empty array as null.
+        Some(Bson::Array(a)) => doc! { foreign_field: { "$in": a.clone() } },
         other => doc! { foreign_field: other.cloned().unwrap_or(Bson::Null) },
     };
     collection_documents(storage, db, coll, &filter, None)
@@ -3572,74 +3689,16 @@ fn apply_facet(
     storage: &dyn crate::storage::Storage,
     collation: Option<&Collation>,
 ) -> Result<Vec<Document>, CommandError> {
-    // mongod validates the spec before running: a non-empty object (40169), each
-    // value an array (40170), each stage a non-empty object (40171), and no nested
-    // $facet (40600).
-    let s = spec
-        .and_then(Bson::as_document)
-        .filter(|d| !d.is_empty())
-        .ok_or_else(|| {
-            // mongod ECHOES the offending spec, which the message omitted.
-            let rendered = spec.map(argtypes::render_stage_value).unwrap_or_default();
-            CommandError::new(
-                40169,
-                "Location40169",
-                format!(
-                    "the $facet specification must be a non-empty object, \
-                     but found: $facet: {rendered}"
-                ),
-            )
-        })?;
+    // mongod refuses these as it parses the pipeline, which the command does
+    // before it runs (`nested_stage_problem`); a pipeline that reaches here
+    // another way is held to the same spec and the same stages.
+    let facets = facet_pipelines(spec)?;
     let mut out = Document::new();
     // The size of the document being built (RM-211).
     let mut used = 0usize;
-    for (name, sub) in s.iter() {
-        let sub_pipeline = sub.as_array().ok_or_else(|| {
-            CommandError::new(
-                40170,
-                "Location40170",
-                // mongod names the TYPE it found rather than restating the rule.
-                format!(
-                    "arguments to $facet must be arrays, {name} is type {}",
-                    secantus_core::query::bson_type_name(sub)
-                ),
-            )
-        })?;
-        for stage in sub_pipeline {
-            match stage {
-                Bson::Document(d) if d.contains_key("$facet") => {
-                    return Err(CommandError::new(
-                        40600,
-                        "Location40600",
-                        "$facet is not allowed to be used within a $facet stage",
-                    ));
-                }
-                Bson::Document(d) if d.contains_key("$geoNear") => {
-                    return Err(CommandError::new(
-                        40600,
-                        "Location40600",
-                        "$geoNear is not allowed to be used within a $facet stage",
-                    ));
-                }
-                Bson::Document(d) if d.contains_key(crate::list_catalog::STAGE) => {
-                    return Err(CommandError::new(
-                        40600,
-                        "Location40600",
-                        "$listCatalog is not allowed to be used within a $facet stage",
-                    ));
-                }
-                Bson::Document(d) if !d.is_empty() => {}
-                _ => {
-                    return Err(CommandError::new(
-                        40171,
-                        "Location40171",
-                        format!(
-                            "elements of arrays in $facet spec must be non-empty objects, \
-                             {name} argument contained an invalid element"
-                        ),
-                    ));
-                }
-            }
+    for (name, sub_pipeline) in facets {
+        if let Some(problem) = facet_pipeline_problem(sub_pipeline) {
+            return Err(problem);
         }
         // Each sub-pipeline runs over its own copy of the input docs.
         let res = run_segmented(
@@ -3657,7 +3716,7 @@ fn apply_facet(
             secantus_core::memlimit::facet_add(&mut used, d).map_err(budget_error)?;
         }
         out.insert(
-            name.clone(),
+            name.to_string(),
             Bson::Array(res.into_iter().map(Bson::Document).collect()),
         );
     }
@@ -3871,6 +3930,18 @@ pub(crate) fn set_field_path(doc: &mut Document, path: &str, value: Bson) {
             };
             set_field_path(child, rest, value);
         }
+    }
+}
+
+/// The value of `localField` a `$lookup` joins on. mongod builds its match
+/// from the values at the path, and when there are none -- the field is
+/// missing, or it is an empty array -- it matches null instead, so `[]` joins
+/// the foreign documents whose `foreignField` is missing, null or `[null]`
+/// (measured on 8.2.11, RM-529).
+fn lookup_local_value(doc: &Document, local_field: &str) -> Option<Bson> {
+    match secantus_core::get_path(doc, local_field) {
+        Some(Bson::Array(a)) if a.is_empty() => Some(Bson::Null),
+        other => other.cloned(),
     }
 }
 
@@ -6443,6 +6514,25 @@ mod malformed_pipeline_tests {
         .expect("a valid pipeline must not be rejected");
     }
 
+    /// An empty `localField` array joins what null joins -- a missing, null or
+    /// `[null]` foreign field, never `[]` or a value -- as on mongod 8.2.11
+    /// (RM-529).
+    #[test]
+    fn an_empty_local_array_joins_what_null_joins() {
+        let lv = lookup_local_value(&doc! {"arr": []}, "arr");
+        assert_eq!(lv, Some(Bson::Null));
+        let joins = |f: Option<Bson>| lookup_match(lv.as_ref(), f.as_ref());
+        assert!(joins(None));
+        assert!(joins(Some(Bson::Null)));
+        assert!(joins(Some(Bson::Array(vec![Bson::Null]))));
+        assert!(!joins(Some(Bson::Array(vec![]))));
+        assert!(!joins(Some(Bson::Int32(1))));
+        // A non-empty array still joins element by element.
+        let lv = lookup_local_value(&doc! {"arr": [1]}, "arr");
+        assert!(lookup_match(lv.as_ref(), Some(&Bson::Int32(1))));
+        assert!(!lookup_match(lv.as_ref(), Some(&Bson::Null)));
+    }
+
     /// `$lookup` is read before its fields are checked, in mongod 8.2.11's
     /// order: `from`, then `pipeline`, then, with no `from`, a pipeline that
     /// makes its own documents (RM-413).
@@ -6820,5 +6910,124 @@ mod query_stats_tests {
             nested(doc! {"$facet": {"f": [{"$match": {}}]}}, "t", true),
             None
         );
+    }
+}
+
+#[cfg(test)]
+mod nested_stage_tests {
+    use super::*;
+    use bson::{bson, doc};
+
+    fn problem(pipeline: Bson) -> Option<(i32, String)> {
+        let Bson::Array(stages) = pipeline else {
+            panic!("a pipeline is an array");
+        };
+        nested_stage_problem(&stages).map(|e| (e.code, e.errmsg))
+    }
+
+    fn not_in_facet(what: &str) -> Option<(i32, String)> {
+        Some((
+            40600,
+            format!("{what} is not allowed to be used within a $facet stage"),
+        ))
+    }
+
+    /// `$documents` in a `$facet` is refused as it is parsed, named as
+    /// itself or as inside the collectionless `$lookup` / `$unionWith` that
+    /// holds it (RM-530, mongod 8.2.11).
+    #[test]
+    fn documents_in_a_facet_is_refused_by_name() {
+        let d = bson!({"$documents": [{"b": 1}]});
+        let facet = |stages: Bson| bson!([{"$facet": {"a": stages}}]);
+        assert_eq!(
+            problem(facet(bson!([{"$match": {}}, d.clone()]))),
+            not_in_facet("$documents")
+        );
+        assert_eq!(
+            problem(facet(bson!([{"$unionWith": {"pipeline": [d.clone()]}}]))),
+            not_in_facet("$documents inside of $unionWith")
+        );
+        // The innermost collectionless stage, unless an outer one holds one.
+        let deep = bson!([{"$unionWith": {"coll": "c", "pipeline": [
+            {"$lookup": {"pipeline": [d.clone()], "as": "z"}},
+        ]}}]);
+        assert_eq!(
+            problem(facet(deep)),
+            not_in_facet("$documents inside of $lookup")
+        );
+        let both = bson!([{"$unionWith": {"pipeline": [
+            d.clone(), {"$lookup": {"pipeline": [d.clone()], "as": "z"}},
+        ]}}]);
+        assert_eq!(
+            problem(facet(both)),
+            not_in_facet("$documents inside of $unionWith")
+        );
+        // Under a stage that reads a collection it is that stage's 73, later.
+        let reads = bson!([{"$lookup": {"from": "c", "pipeline": [d.clone()], "as": "z"}}]);
+        assert_eq!(problem(facet(reads)), None);
+        // A nested `$facet` refuses its own first.
+        let inner =
+            bson!([{"$unionWith": {"pipeline": [d.clone(), {"$facet": {"x": [d.clone()]}}]}}]);
+        assert_eq!(problem(facet(inner)), not_in_facet("$documents"));
+    }
+
+    /// The order mongod 8.2.11 refuses in: the whole facet spec's shape, then
+    /// each facet in turn, its stages' own pipelines before its stages; and
+    /// all of it before the outer pipeline's `$out`-is-last check.
+    #[test]
+    fn nested_refusals_come_in_parse_order() {
+        let d = doc! {"$documents": [{"b": 1}]};
+        let out = doc! {"$out": "x"};
+        let writes_in_lookup =
+            doc! {"$lookup": {"from": "c", "as": "z", "pipeline": [out.clone()]}};
+        // Every facet's shape before any facet's stages.
+        let shape = bson!([{"$facet": {"a": [d.clone()], "b": [5]}}]);
+        assert_eq!(problem(shape).map(|p| p.0), Some(40171));
+        // A sub-pipeline's own refusal before the facet's.
+        let first = bson!([{"$facet": {"a": [d.clone(), writes_in_lookup.clone()]}}]);
+        assert_eq!(problem(first).map(|p| p.0), Some(51047));
+        // Facets in order, stages in order.
+        let ordered = bson!([{"$facet": {"a": [out.clone(), d.clone()], "b": [d.clone()]}}]);
+        assert_eq!(problem(ordered), not_in_facet("$out"));
+        // Every facet parses before any is checked.
+        let union = doc! {"$unionWith": {"pipeline": [d.clone()]}};
+        let later = bson!([{"$facet": {"a": [union], "b": [{"$facet": {}}]}}]);
+        assert_eq!(problem(later).map(|p| p.0), Some(40169));
+        // A `$unionWith` refuses its inner `$lookup`'s writer first.
+        let union =
+            bson!([{"$unionWith": {"coll": "c", "pipeline": [out.clone(), writes_in_lookup]}}]);
+        assert_eq!(problem(union).map(|p| p.0), Some(51047));
+        assert_eq!(problem(bson!([{"$facet": {}}])).map(|p| p.0), Some(40169));
+    }
+}
+
+#[cfg(test)]
+mod documents_argument_tests {
+    use super::*;
+
+    /// mongod 8.2.11 refuses a `$documents` argument that is not an array at
+    /// RUN time, under the executor prefix of the command running it (RM-531).
+    /// This answered 2 "$documents argument must evaluate to an array".
+    #[test]
+    fn a_non_array_is_an_executor_error_naming_the_command() {
+        for (ns, spec) in [
+            ("db.$cmd.aggregate", Bson::Int32(5)),
+            ("db.outer", Bson::String("abc".into())),
+            ("db.$cmd.aggregate", Bson::Null),
+            ("db.$cmd.aggregate", Bson::Document(doc! {"a": 1})),
+        ] {
+            let _command = InCommand::enter(ns);
+            let err = documents_stage(Some(&spec), &Document::new(), None).unwrap_err();
+            assert_eq!(err.code, 5858203, "{spec:?}");
+            assert_eq!(err.code_name, "Location5858203", "{spec:?}");
+            assert_eq!(
+                err.errmsg,
+                format!(
+                    "Executor error during aggregate command on namespace: {ns} :: \
+                     caused by :: an array is expected"
+                ),
+                "{spec:?}"
+            );
+        }
     }
 }

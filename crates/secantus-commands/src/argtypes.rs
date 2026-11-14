@@ -3706,7 +3706,14 @@ fn stage_field_problem(name: &str, spec: &Bson) -> Option<(i32, String)> {
         ),
         _ => return None,
     };
-    for field in d.keys() {
+    for (field, value) in d {
+        // `$lookup`'s IDL types its fields as it reads them, so a wrong type
+        // and an unknown field are reported in document order (RM-528).
+        if name == "$lookup" {
+            if let Some(problem) = lookup_field_type_problem(field, value) {
+                return Some(problem);
+            }
+        }
         // `$merge` reads its fields in order and names an unknown one when
         // it reaches it (`aggregate::merge_spec`).
         if known.contains(&field.as_str()) || name == "$merge" {
@@ -3779,12 +3786,77 @@ fn stage_field_problem(name: &str, spec: &Bson) -> Option<(i32, String)> {
         ));
     }
     if let Some(field) = required {
-        if !d.contains_key(field) {
+        // `$lookup`'s IDL reads a null `as` as an absent one.
+        let missing = match d.get(field) {
+            None => true,
+            Some(Bson::Null) => name == "$lookup",
+            Some(_) => false,
+        };
+        if missing {
             return Some((
                 40414,
                 format!("BSON field '{name}.{field}' is missing but a required field"),
             ));
         }
+    }
+    if name == "$lookup" {
+        return lookup_join_fields_problem(d);
+    }
+    None
+}
+
+/// A `$lookup` field of the wrong type, as mongod's IDL names it: `let` must
+/// be a document and `localField` / `foreignField` / `as` strings, a null
+/// standing for an absent field (measured 8.2.11, RM-528). `from` and
+/// `pipeline` are checked before this, by `aggregate::lookup_lite_parse`.
+fn lookup_field_type_problem(field: &str, value: &Bson) -> Option<(i32, String)> {
+    let expected = match field {
+        "let" => "object",
+        "localField" | "foreignField" | "as" => "string",
+        _ => return None,
+    };
+    let fits = match value {
+        Bson::Null => true,
+        Bson::Document(_) => expected == "object",
+        Bson::String(_) => expected == "string",
+        _ => false,
+    };
+    (!fits).then(|| {
+        (
+            14,
+            format!(
+                "BSON field '$lookup.{field}' is the wrong type '{}', expected type '{expected}'",
+                bson_type_name(value)
+            ),
+        )
+    })
+}
+
+/// What mongod's `$lookup` refuses once its fields have parsed: with a
+/// `pipeline`, one of `localField` / `foreignField` without the other;
+/// without one, anything but both, and then a `let` (9, measured 8.2.11,
+/// RM-528). A null or empty join field counts as absent.
+fn lookup_join_fields_problem(d: &Document) -> Option<(i32, String)> {
+    let named = |k: &str| matches!(d.get(k), Some(Bson::String(s)) if !s.is_empty());
+    let (local, foreign) = (named("localField"), named("foreignField"));
+    let has_pipeline = !matches!(d.get("pipeline"), None | Some(Bson::Null));
+    let joined = if has_pipeline {
+        local == foreign
+    } else {
+        local && foreign
+    };
+    if !joined {
+        return Some((
+            9,
+            "$lookup requires both or neither of 'localField' and 'foreignField' to be specified"
+                .to_string(),
+        ));
+    }
+    if !has_pipeline && !matches!(d.get("let"), None | Some(Bson::Null)) {
+        return Some((
+            9,
+            "$lookup with a 'let' argument must also specify 'pipeline'".to_string(),
+        ));
     }
     None
 }
@@ -3799,7 +3871,7 @@ mod stage_validation_order_tests {
     //! all, so none of this surface had ever been compared.
 
     use super::*;
-    use bson::Bson;
+    use bson::{doc, Bson};
 
     fn err(stage: &str, spec: Bson) -> (i32, String) {
         let mut d = bson::Document::new();
@@ -3951,6 +4023,92 @@ mod stage_validation_order_tests {
     fn but_an_unknown_field_wins_once_lookup_has_its_from() {
         let spec = doc_of(&[("from", Bson::String("c".into())), ("zz", Bson::Int32(1))]);
         assert_eq!(err("$lookup", spec).0, 40415);
+    }
+
+    /// RM-528, every answer measured on mongod 8.2.11 (2026-11-14).
+    #[test]
+    fn lookup_types_its_fields_in_order_then_pairs_the_join_fields() {
+        let lookup =
+            |spec: bson::Document| stage_spec_error(&[Bson::Document(doc! {"$lookup": spec})]);
+        let both_or_neither = Some((
+            9,
+            "$lookup requires both or neither of 'localField' and 'foreignField' to be specified"
+                .to_string(),
+        ));
+        assert_eq!(
+            lookup(doc! {"from": "c", "pipeline": [], "let": 5, "as": "z"}),
+            Some((
+                14,
+                "BSON field '$lookup.let' is the wrong type 'int', expected type 'object'"
+                    .to_string()
+            ))
+        );
+        // Document order decides between a wrong type and an unknown field,
+        // and both outrank a missing `as`.
+        assert_eq!(
+            lookup(doc! {"from": "c", "let": 5, "zz": 1}).map(|p| p.0),
+            Some(14)
+        );
+        assert_eq!(
+            lookup(doc! {"from": "c", "zz": 1, "let": 5}).map(|p| p.0),
+            Some(40415)
+        );
+        assert_eq!(
+            lookup(doc! {"from": "c", "localField": 5, "as": "z"}),
+            Some((
+                14,
+                "BSON field '$lookup.localField' is the wrong type 'int', expected type 'string'"
+                    .to_string()
+            ))
+        );
+        assert_eq!(
+            lookup(doc! {"from": "c", "pipeline": [], "as": 5}).map(|p| p.0),
+            Some(14)
+        );
+        // A null `as` is a missing one.
+        assert_eq!(
+            lookup(doc! {"from": "c", "localField": "a", "foreignField": "a", "as": null})
+                .map(|p| p.0),
+            Some(40414)
+        );
+        // A lone join field, with a pipeline or without; a null or empty one
+        // is absent.
+        assert_eq!(
+            lookup(doc! {"from": "c", "localField": "a", "as": "z"}),
+            both_or_neither
+        );
+        assert_eq!(
+            lookup(doc! {"from": "c", "pipeline": [], "foreignField": "a", "as": "z"}),
+            both_or_neither
+        );
+        assert_eq!(
+            lookup(doc! {"from": "c", "localField": "", "foreignField": "a", "as": "z"}),
+            both_or_neither
+        );
+        assert_eq!(lookup(doc! {"from": "c", "as": "z"}), both_or_neither);
+        assert_eq!(
+            lookup(doc! {"from": "c", "let": {"x": 1}, "as": "z"}),
+            both_or_neither
+        );
+        assert_eq!(
+            lookup(
+                doc! {"from": "c", "let": {}, "localField": "a", "foreignField": "a", "as": "z"}
+            ),
+            Some((
+                9,
+                "$lookup with a 'let' argument must also specify 'pipeline'".to_string()
+            ))
+        );
+        // What mongod runs.
+        for ok in [
+            doc! {"from": "c", "pipeline": [], "let": null, "as": "z"},
+            doc! {"from": "c", "pipeline": [], "localField": null, "foreignField": null, "as": "z"},
+            doc! {"from": "c", "let": null, "localField": "a", "foreignField": "a", "as": "z"},
+            doc! {"from": "c", "pipeline": [], "let": {"x": 1}, "localField": "a",
+            "foreignField": "a", "as": "z"},
+        ] {
+            assert_eq!(lookup(ok.clone()), None, "{ok}");
+        }
     }
 
     #[test]

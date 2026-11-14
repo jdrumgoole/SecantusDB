@@ -20,7 +20,7 @@ from typing import Any
 import bson
 import pymongo
 import pytest
-from bson import Int64
+from bson import Int64, json_util
 from bson.son import SON
 
 from tests.mongod_live.conftest import canonical, same
@@ -165,6 +165,104 @@ def _cases() -> list[tuple[str, SON]]:
             ]
         ),
     ]
+    # Where `transformIdentifiers` reaches (RM-532): each kind of field
+    # path, namespace and variable a key can hold.
+    agg = lambda coll, *stages: SON(  # noqa: E731
+        [("aggregate", coll), ("pipeline", list(stages)), ("cursor", {})]
+    )
+    extra += [
+        agg(
+            "geo",
+            {
+                "$geoNear": {
+                    "near": [0, 0],
+                    "key": "loc",
+                    "distanceField": "d.x",
+                    "includeLocs": "l",
+                }
+            },
+        ),
+        agg(
+            "c",
+            {
+                "$project": {
+                    "a": "$$CURRENT.x",
+                    "b": "$$NOW",
+                    "c": "$$REMOVE",
+                    "d": "$$ROOT.x.y",
+                    "e": "$$CURRENT",
+                    "f": "$$ROOT",
+                }
+            },
+        ),
+        SON([("find", "c"), ("filter", {"a": 1}), ("projection", {"a.$": 1})]),
+        SON([("find", "c"), ("filter", {}), ("hint", {"$natural": 1})]),
+        agg(
+            "c",
+            {"$group": {"_id": None, "t": {"$top": {"sortBy": {"x.y": 1}, "output": "$x"}}}},
+        ),
+        agg(
+            "c",
+            {
+                "$project": {
+                    "m": {"$map": {"input": "$a", "in": {"$add": ["$$this", 1]}}},
+                    "r": {
+                        "$reduce": {
+                            "input": "$a",
+                            "initialValue": {"s": 0},
+                            "in": {"s": {"$add": ["$$value.s", "$$this"]}},
+                        }
+                    },
+                }
+            },
+        ),
+        agg("c", {"$project": {"l": {"$let": {"vars": {"v": "$x"}, "in": "$$v.y"}}}}),
+        SON([("find", "c"), ("filter", {"$expr": {"$eq": ["$$v", "$x"]}}), ("let", {"v": 1})]),
+        agg(
+            "c",
+            {
+                "$setWindowFields": {
+                    "partitionBy": {"$mod": ["$x", 2]},
+                    "sortBy": {"x": 1},
+                    "output": {"s": {"$sum": "$x"}},
+                }
+            },
+        ),
+        agg(
+            "c",
+            {
+                "$fill": {
+                    "partitionByFields": ["y"],
+                    "sortBy": {"x": 1},
+                    "output": {"a": {"method": "locf"}, "b": {"value": 0}},
+                }
+            },
+        ),
+        agg(
+            "c",
+            {
+                "$merge": {
+                    "into": "mo",
+                    "on": "_id",
+                    "whenMatched": [{"$set": {"z": "$$new.x"}}],
+                    "let": {"q": "$x"},
+                }
+            },
+        ),
+        agg("c", {"$out": "oo"}),
+        agg(
+            "c",
+            {
+                "$project": {
+                    "g": {"$getField": "$x"},
+                    "h": {"$getField": {"field": "a.b", "input": "$$ROOT"}},
+                }
+            },
+        ),
+        SON([("distinct", "c"), ("key", "a.b")]),
+        agg("c", {"$sort": {"x": 1}}, {"$unwind": {"path": "$a", "includeArrayIndex": "i.j"}}),
+        agg("c", {"$score": {"score": "$x", "normalization": "minMaxScaler", "weight": 2}}),
+    ]
     out += [(f"key {c}", c) for c in extra]
     return [(name, c) for name, c in out if not any(x in name for x in _NOT_RUN)]
 
@@ -286,6 +384,42 @@ def test_a_query_is_recorded_under_mongods_key(recorded: Any, name: str) -> None
     ours, theirs = out[name]
     assert theirs[0] != "ok" or theirs[1], f"mongod recorded nothing for {name}"
     same(ours, theirs)
+
+
+# `transformIdentifiers`' key (RM-532): any 32 bytes or more, sensitive.
+_HMAC = {
+    "algorithm": "hmac-sha-256",
+    "hmacKey": bson.Binary(b"0123456789abcdef0123456789abcdef", 8),
+}
+
+
+@pytest.fixture(scope="module")
+def transformed(recorded: Any) -> list[dict[str, str]]:
+    """Each server's entries listed with every identifier as its HMAC, by
+    `keyHash`, once every case has run."""
+    clients, _ = recorded
+    return [
+        {
+            e["keyHash"]: canonical(e["key"])
+            for e in client.admin.aggregate([{"$queryStats": {"transformIdentifiers": _HMAC}}])
+        }
+        for client in clients
+    ]
+
+
+@pytest.mark.parametrize("name", [n for n, _ in CASES])
+def test_identifiers_are_transformed_as_mongods(
+    recorded: Any, transformed: list[dict[str, str]], name: str
+) -> None:
+    """`$queryStats` with `transformIdentifiers` prints each case's key
+    with every field path, namespace and variable as its HMAC-SHA-256, as
+    mongod does, a builtin variable and every literal left as they were."""
+    _, out = recorded
+    got = []
+    for at, (_, changed) in enumerate(out[name]):
+        hashes = [json_util.loads(c)["keyHash"] for c in changed]
+        got.append([transformed[at].get(h) for h in hashes])
+    same(got[0], got[1])
 
 
 def _entry(client: pymongo.MongoClient, coll: str) -> dict:

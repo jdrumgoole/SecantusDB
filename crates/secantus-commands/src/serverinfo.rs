@@ -784,6 +784,14 @@ fn listed(test_commands: bool) -> Vec<(&'static str, bool, Bson)> {
         // How many queries a second the query stats store records for
         // `$queryStats` (RM-215): its default, 0, records none.
         ("internalQueryStatsRateLimit", true, Bson::Int32(0)),
+        // The store's budget and its sampling (RM-532): 1% of memory, and
+        // no sampling, which leaves the rate limit to decide.
+        (
+            "internalQueryStatsCacheSize",
+            true,
+            Bson::String(crate::query_stats::DEFAULT_CACHE_SIZE.into()),
+        ),
+        ("internalQueryStatsSampleRate", true, Bson::Double(0.0)),
         // The logical session cache (`crate::logical_sessions`): how long a
         // session record lives, and how often the cache refreshes and reaps.
         // Startup only, as on mongod 8.2.11.

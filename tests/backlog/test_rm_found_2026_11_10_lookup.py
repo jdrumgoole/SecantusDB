@@ -33,7 +33,7 @@ def _lookup_spec_checks(client: Any) -> dict:
     }
 
 
-@pytest.mark.backlog("RM-528")
+@pytest.mark.backlog_fixed("RM-528")
 def test_lookup_refuses_a_bad_let_and_a_lone_join_field(
     rust_mongo: Any,
     mongod_rs: Any,  # noqa: F811
@@ -42,8 +42,8 @@ def test_lookup_refuses_a_bad_let_and_a_lone_join_field(
     "BSON field '$lookup.let' is the wrong type 'int', expected type
     'object'") and one with `localField` or `foreignField` but not both (9,
     "$lookup requires both or neither of 'localField' and 'foreignField' to
-    be specified"). This server runs the first, and the lone field with a
-    pipeline, and answers 2 to the lone field without one."""
+    be specified"). This server ran the first, and the lone field with a
+    pipeline, and answered 2 to the lone field without one."""
     assert _lookup_spec_checks(rust_mongo) == _lookup_spec_checks(mongod_rs)
 
 
@@ -71,27 +71,42 @@ def _empty_local_array(client: Any) -> dict:
             )
         )
 
-    return {
-        "simple": joined({"from": "f", "localField": "arr", "foreignField": "b"}),
-        "with_pipeline": joined(
+    simple = {"from": "f", "localField": "arr", "foreignField": "b"}
+    answers = {
+        "simple": joined(simple),
+        "with_pipeline": joined({**simple, "pipeline": [{"$project": {"_id": 1}}]}),
+        "collectionless": joined(
             {
-                "from": "f",
                 "localField": "arr",
                 "foreignField": "b",
-                "pipeline": [{"$project": {"_id": 1}}],
+                "pipeline": [
+                    {
+                        "$documents": [
+                            {"_id": "missing"},
+                            {"_id": "null", "b": None},
+                            {"_id": "empty", "b": []},
+                            {"_id": "one", "b": 1},
+                        ]
+                    }
+                ],
             }
         ),
     }
+    # The simple form over an index on the foreign field probes the index.
+    db.f.create_index("b")
+    answers["simple_indexed"] = joined(simple)
+    return answers
 
 
-@pytest.mark.backlog("RM-529")
+@pytest.mark.backlog_fixed("RM-529")
 def test_an_empty_local_array_joins_what_null_joins(
     rust_mongo: Any,
     mongod_rs: Any,  # noqa: F811
 ) -> None:
     """mongod 8.2.11 joins a `localField` that is an empty array as it joins
-    null: to the foreign documents whose field is missing, null or `[null]`.
-    This server joins it to none."""
+    null: to the foreign documents whose field is missing, null or `[null]`,
+    in the simple form (with or without an index on the foreign field), with
+    a pipeline and without `from`. This server joined it to none."""
     assert _empty_local_array(rust_mongo) == _empty_local_array(mongod_rs)
 
 
@@ -114,7 +129,7 @@ def _documents_in_facet(client: Any) -> dict:
     }
 
 
-@pytest.mark.backlog("RM-530")
+@pytest.mark.backlog_fixed("RM-530")
 def test_documents_is_refused_in_a_facet(
     rust_mongo: Any,
     mongod_rs: Any,  # noqa: F811
@@ -122,7 +137,7 @@ def test_documents_is_refused_in_a_facet(
     """mongod 8.2.11 refuses `$documents` in a `$facet` with 40600: "$documents
     is not allowed to be used within a $facet stage", or "$documents inside
     of $unionWith ..." / "... inside of $lookup ..." when a sub-pipeline in
-    the facet holds it. This server answers 73 to the first and runs the
+    the facet holds it. This server answered 73 to the first and ran the
     other two."""
     assert _documents_in_facet(rust_mongo) == _documents_in_facet(mongod_rs)
 
@@ -144,7 +159,7 @@ def _documents_not_an_array(client: Any) -> dict:
     }
 
 
-@pytest.mark.backlog("RM-531")
+@pytest.mark.backlog_fixed("RM-531")
 def test_documents_of_a_non_array_is_an_executor_error(
     rust_mongo: Any,
     mongod_rs: Any,  # noqa: F811
@@ -152,6 +167,6 @@ def test_documents_of_a_non_array_is_an_executor_error(
     """mongod 8.2.11 refuses `$documents: 5` with 5858203, "Executor error
     during aggregate command on namespace: <db>.$cmd.aggregate :: caused by
     :: an array is expected" (the outer collection's namespace inside a
-    `$lookup`). This server answers 2 "$documents argument must evaluate to
+    `$lookup`). This server answered 2 "$documents argument must evaluate to
     an array"."""
     assert _documents_not_an_array(rust_mongo) == _documents_not_an_array(mongod_rs)

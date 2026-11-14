@@ -25,9 +25,17 @@ def _delete_many_in_a_find_s_time(client: Any) -> Any:
     None."""
     slow = Slow(client)
     slow.seed(1, 1.0)
-    began = time.monotonic()
-    slow.run({"find": "c", "filter": SLOW})
-    budget = max(1, int((time.monotonic() - began) * 1000 * _BUDGET))
+    # The fastest of three: load can only make a `find` slower, and one
+    # slowed `find` sized the budget past a delete that tests the document
+    # twice, which then fitted (`None`) on mongod's or this server's side
+    # (PG snapshot PR #2732, CI run 43542109903, 2026-11-14). A delete
+    # slowed by load still runs out of the budget, as it should.
+    took = []
+    for _ in range(3):
+        began = time.monotonic()
+        slow.run({"find": "c", "filter": SLOW})
+        took.append(time.monotonic() - began)
+    budget = max(1, int(min(took) * 1000 * _BUDGET))
     slow.seed(1, 1.0)
     reply = slow.run({"delete": "c", "deletes": [{"q": SLOW, "limit": 0}], "maxTimeMS": budget})
     return reply.get("code") or next((e["code"] for e in reply.get("writeErrors", [])), None)

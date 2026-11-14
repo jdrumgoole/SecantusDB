@@ -1771,67 +1771,161 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
   every subtype-2 value. mongod 8.2.11 writes the bytes alone, which is not
   a valid subtype-2 value: pymongo refuses to decode the reply. Out of
   scope; nothing reads the old subtype as mongod emits it.
-- [ ] **`$queryStats`' remainder: cache size, explains, transformed
-      identifiers.** Since 2026-11-10 the query stats store records
-      `find`, `aggregate`, `distinct` and `count` under mongod's key, with
-      its metrics (`tests/mongod_live/test_query_stats.py`). mongod 8.2.11
-      also: reports `internalQueryStatsCacheSize` ("1%"), sizes the store
-      by it and evicts the least recent entries past it, and turns
-      `$queryStats` off (6579000) at "0MB"; samples by
-      `internalQueryStatsSampleRate`; records an `aggregate` that explains,
-      its key saying `explain: "queryPlanner"`; and lists every identifier
-      (field paths, namespaces, `let` names) as its HMAC-SHA-256 under
-      `transformIdentifiers`. This server reports neither parameter, keeps
-      every entry, records no explain, and refuses `transformIdentifiers`
-      (238) once the store has entries to print. Unmeasured: the key's
-      `writeConcern` and `$readPreference` (copied as the command gave
-      them), the order of `otherNss` past one namespace (mongod's is a hash
-      set's), and `fromMultiPlanner` for a rooted `$or` the subplanner
-      plans (counted false here). Found 2026-11-10 working RM-215.
-      Verify: tests/backlog/test_rm_found_2026_11_10_rm215.py::test_query_stats_remainder
+- [ ] **`$queryStats`' remainder: entry sizes, `otherNss` order, unmeasured
+      key components.** Since 2026-11-14 the store is mongod's partitioned
+      LRU cache, sized by `internalQueryStatsCacheSize` and sampled by
+      `internalQueryStatsSampleRate`, records an `aggregate` that explains,
+      and lists keys under `transformIdentifiers`
+      (`tests/mongod_live/test_query_stats.py`,
+      `tests/mongod_live/test_query_stats_store.py`). What is left: an
+      entry is charged its key's representative BSON plus a per-command
+      constant measured from mongod 8.2.11's
+      `queryStatsStoreSizeEstimateBytes`, not mongod's `sizeof` of its
+      parsed structures, so the point a partition starts evicting differs
+      by a few bytes an entry; `otherNss` past one namespace is in the
+      order the pipeline names them, where mongod's is a hash set's; and,
+      unmeasured, the key's `writeConcern` and `$readPreference` (copied as
+      the command gave them) and `fromMultiPlanner` for a rooted `$or` the
+      subplanner plans (counted false here). Found 2026-11-10 working
+      RM-215; trimmed 2026-11-14.
+      Verify: none -- the sizes are C++ object sizes this server does not
+      have, mongod's `otherNss` order is its hash set's, and the rest is
+      unmeasured: a probe must find a difference before a test can assert it
       Backlog-ID: RM-532
-- [ ] **A date-part operator's argument as an array of one fails.**
-      mongod 8.2.11 takes `{$year: ["$t"]}` (any of `$year` ... `$isoWeek`,
-      `$dayOfWeek`) as `{$year: "$t"}`: null for a missing field, the part
-      of a date. This server evaluates the array itself and fails with
-      16006 "can't convert from BSON type array to Date"; with
-      `[{date: "$t"}]` mongod's 16006 names an object where this server's
-      names an array. Found 2026-11-10 working RM-215, running the
-      query-shape corpus's expressions.
-      Verify: tests/backlog/test_rm_found_2026_11_10_rm215.py::test_a_date_part_takes_an_array_of_one
-      Backlog-ID: RM-533
-- [ ] **`$lookup` runs a `let` that is not a document, and a lone join field.**
-      mongod 8.2.11 refuses `let: 5` with 14 "BSON field '$lookup.let' is
-      the wrong type 'int', expected type 'object'", and `localField`
-      without `foreignField` (or the reverse) with 9 "$lookup requires both
-      or neither of 'localField' and 'foreignField' to be specified". This
-      server runs the first, runs the lone field when there is a pipeline,
-      and answers 2 without one. Found 2026-11-10 (RM-413).
-      Verify: tests/backlog/test_rm_found_2026_11_10_lookup.py::test_lookup_refuses_a_bad_let_and_a_lone_join_field
-      Backlog-ID: RM-528
-- [ ] **A `$lookup` whose `localField` is an empty array joins nothing.**
-      mongod 8.2.11 joins it as it joins null: to the foreign documents
-      whose `foreignField` is missing, null or `[null]`, in the simple form
-      and with a pipeline. This server's `lookup_match` finds no element to
-      compare and joins none. Found 2026-11-10 (RM-413).
-      Verify: tests/backlog/test_rm_found_2026_11_10_lookup.py::test_an_empty_local_array_joins_what_null_joins
-      Backlog-ID: RM-529
-- [ ] **`$documents` in a `$facet` is not refused with 40600.** mongod
-      8.2.11 refuses it with 40600 "$documents is not allowed to be used
-      within a $facet stage", and names the stage that holds it when a
-      `$unionWith` or `$lookup` in the facet does ("$documents inside of
-      $unionWith is not allowed ..."). This server answers 73 to the first
-      and runs the other two. Found 2026-11-10 (RM-413).
-      Verify: tests/backlog/test_rm_found_2026_11_10_lookup.py::test_documents_is_refused_in_a_facet
-      Backlog-ID: RM-530
-- [ ] **`$documents` of a non-array answers 2.** mongod 8.2.11 refuses
-      `$documents: 5` at run time with 5858203 "Executor error during
-      aggregate command on namespace: <db>.$cmd.aggregate :: caused by ::
-      an array is expected" (the outer collection's namespace inside a
-      `$lookup`). This server answers 2 "$documents argument must evaluate
-      to an array". Found 2026-11-10 (RM-413).
-      Verify: tests/backlog/test_rm_found_2026_11_10_lookup.py::test_documents_of_a_non_array_is_an_executor_error
-      Backlog-ID: RM-531
+- [ ] **A malformed stage spec inside a sub-pipeline is not refused as the
+      pipeline parses.** mongod 8.2.11 checks the stages of a `$facet`'s
+      and a `$lookup`'s pipelines as it parses the outer one, so over an
+      empty collection it refuses `{$facet: {a: [{$match: 5}]}}` with
+      15959, a `$lookup` in a facet whose `let` is `5` with 14, and a
+      `$lookup` in a `$lookup` pipeline with a lone `localField` with 9.
+      This server's `argtypes::stage_spec_error` reads the top level only:
+      it answers 2 to the first and runs the other two. Found 2026-11-14
+      working RM-528.
+      Verify: tests/backlog/test_rm_found_2026_11_14_rm528.py::test_stage_specs_in_a_sub_pipeline_are_checked_as_it_parses
+      Backlog-ID: RM-645
+- [ ] **`$lookup` runs a `$`-prefixed join field, an empty `as` and a bad
+      `let` name.** mongod 8.2.11 refuses `localField: "$a"` with 16410
+      "Consider using $getField or $setField for a field path with '.' or
+      '$'. :: caused by :: FieldPath field names may not start with '$',
+      given '$a'.", `as: ""` with 40352 "FieldPath cannot be constructed
+      with empty string", and `let: {X: 1}` with 9 "'X' starts with an
+      invalid character for a user variable name". This server runs all
+      three (the empty `as` writes a field named ""). Found 2026-11-14
+      working RM-528.
+      Verify: tests/backlog/test_rm_found_2026_11_14_rm528.py::test_lookup_refuses_a_bad_path_and_a_bad_let_name
+      Backlog-ID: RM-646
+- [ ] **A `find` sorted on `$natural` is recorded with the sort, not as a
+      hint.** mongod 8.2.11's `$queryStats` key for `{find: "c", sort:
+      {$natural: -1}}` has no `sort` in its shape and `hint: {$natural:
+      -1}`, a different `keyHash`. This server keeps the sort in the shape
+      and prints no hint. Found 2026-11-14 working RM-532.
+      Verify: tests/backlog/test_rm_found_2026_11_14_rm532.py::test_a_natural_sort_is_recorded_as_a_hint
+      Backlog-ID: RM-643
+- [ ] **A hybrid search's key names no `otherNss`.** mongod 8.2.11 lists
+      the collection of the `$unionWith` a `$rankFusion` (or
+      `$scoreFusion`) desugars its later input pipelines into under the
+      key's `otherNss`, the aggregate's own collection, and hashes the key
+      with it. This server walks the pipeline as written, finds no other
+      namespace, and prints none: the entry's `keyHash` differs. Found
+      2026-11-14 working RM-532.
+      Verify: tests/backlog/test_rm_found_2026_11_14_rm532.py::test_a_hybrid_search_names_the_collection_it_unions
+      Backlog-ID: RM-644
+- [ ] **A `$facet` element that is not a stage is refused without naming
+      it.** mongod 8.2.11's 40171 names the element: "elements of arrays in
+      $facet spec must be non-empty objects, b argument contained an
+      element of type int: 0: 5" (its type, its index and its value). This
+      server ends the message "... b argument contained an invalid
+      element". Found 2026-11-14 working RM-530.
+      Verify: tests/backlog/test_rm_found_2026_11_14_rm530.py::test_a_facet_element_refusal_names_the_element
+      Backlog-ID: RM-647
+- [ ] **A collectionless `$unionWith` without a `$documents` runs when it
+      is nested.** mongod 8.2.11 refuses a `$unionWith` naming no `coll`
+      whose pipeline does not begin with `$documents` (9, "$unionWith stage
+      without explicit collection must have a pipeline with $documents as
+      first stage") wherever it stands. This server refuses it at the top
+      level, but inside a `$facet`, `$lookup` or `$unionWith` runs its
+      pipeline over the collection the outer stage reads and unions those
+      documents in. Found 2026-11-14 working RM-530.
+      Verify: tests/backlog/test_rm_found_2026_11_14_rm530.py::test_a_nested_union_with_no_collection_must_make_its_documents
+      Backlog-ID: RM-648
+- [ ] **A nested `$lookup`'s bad `let` runs.** mongod 8.2.11 refuses a
+      `$lookup` whose `let` is not a document (14) or that has `localField`
+      without `foreignField` (9) inside a `$facet` or `$unionWith` as at
+      the top level (RM-528). This server runs the first there and answers
+      the second 2 ("$lookup requires localField+foreignField or
+      pipeline"). Found 2026-11-14 working RM-530.
+      Verify: tests/backlog/test_rm_found_2026_11_14_rm530.py::test_a_nested_lookup_spec_is_checked_as_it_is_parsed
+      Backlog-ID: RM-649
+- [ ] **`{$project: {}}` drops its envelope, and is "not supported" when
+      nested.** mongod 8.2.11 answers 51272 "Invalid $project :: caused by
+      :: projection specification must have at least one field" at the top
+      level and in a `$facet` or `$unionWith`. This server drops the
+      "Invalid $project :: caused by ::" at the top level and answers
+      BadValue (2, "not supported by the Rust server") nested. Found
+      2026-11-14 working RM-530.
+      Verify: tests/backlog/test_rm_found_2026_11_14_rm530.py::test_an_empty_projection_is_an_invalid_project
+      Backlog-ID: RM-650
+- [ ] **`$documents`'s parse refusals in a sub-pipeline.** mongod 8.2.11
+      refuses a `$documents` that is not its pipeline's first stage with
+      40602 ("$documents is only valid as the first stage in a pipeline")
+      under a `$unionWith` that reads a collection, and `{$documents: {}}`
+      with 51270 "Invalid $documents :: caused by :: Invalid empty
+      sub-projection: _tempDocumentsField". This server answers the first
+      73 ("'$documents' can only be run with {aggregate: 1}") and drops
+      the second's envelope. Found 2026-11-14 working RM-530.
+      Verify: tests/backlog/test_rm_found_2026_11_14_rm530.py::test_documents_refusals_in_a_sub_pipeline
+      Backlog-ID: RM-651
+- [ ] **A `$facet`'s 40600 comes after a later stage's parse error.**
+      mongod 8.2.11 parses a pipeline a stage at a time, so a `$facet`
+      holding a stage it refuses is refused before a later stage's
+      refusal: `[{$facet: {a: [<$documents>]}}, {$project: {}}]` is 40600,
+      and so is a facet's `$out` before a later `$match`'s `$where`. This
+      server checks every stage's expressions, projections and `$where`
+      in passes over the whole pipeline before the nested-pipeline pass
+      (`nested_stage_problem`), and answers the later stage's refusal.
+      Found 2026-11-14 working RM-530.
+      Verify: tests/backlog/test_rm_found_2026_11_14_rm530.py::test_a_facet_refusal_comes_before_a_later_stage
+      Backlog-ID: RM-652
+- [ ] **A `$documents` element that is not a document answers 2.**
+      mongod 8.2.11 refuses `$documents: [{a: 1}, 2]` at run time with 40228
+      "Executor error during aggregate command on namespace:
+      <db>.$cmd.aggregate :: caused by :: elements within the array passed
+      to $documents must evaluate to an object, but resulting value was: 2.
+      Type of resulting value: 'int'. Input document: {_tempDocumentsField:
+      2}" (the outer collection's namespace inside a `$lookup`). This server
+      answers 2 "each $documents element must be an object". Found
+      2026-11-14 working RM-531.
+      Verify: tests/backlog/test_rm_found_2026_11_14_rm531.py::test_a_documents_element_that_is_not_a_document_is_40228
+      Backlog-ID: RM-653
+- [ ] **A `$documents` expression that fails answers "expression not
+      supported".** mongod 8.2.11 answers `$documents: {$divide: [1, 0]}`
+      (or an element `{x: {$divide: [1, 0]}}`) with 2 "Failed to optimize
+      pipeline :: caused by :: can't $divide by zero", and one reading a
+      `$lookup` `let` variable under the executor prefix as well. This
+      server answers 2 "$documents expression not supported" to all three,
+      discarding the evaluator's own error. Found 2026-11-14 working RM-531.
+      Verify: tests/backlog/test_rm_found_2026_11_14_rm531.py::test_a_documents_expression_error_is_the_expressions
+      Backlog-ID: RM-654
+- [ ] **`$$NOW` is unbound inside a `$unionWith` pipeline.** mongod 8.2.11
+      runs `{$unionWith: {pipeline: [{$documents: [{t: "$$NOW"}]}]}}` (and a
+      later stage reading `$$NOW` there) with the command's date. This
+      server answers 2 "$documents expression not supported", or "not
+      supported by the Rust server" from a later stage. Found 2026-11-14
+      working RM-531.
+      Verify: tests/backlog/test_rm_found_2026_11_14_rm531.py::test_now_is_bound_in_a_union_with_pipeline
+      Backlog-ID: RM-655
+- [ ] **A run-time error in a sub-pipeline or after `$documents` names the
+      wrong namespace.** mongod 8.2.11 names the COMMAND's namespace under
+      "Executor error during aggregate command on namespace:" wherever the
+      failing stage runs: `<db>.$cmd.aggregate` for a collectionless
+      aggregate, the outer collection inside a `$lookup` / `$unionWith`
+      (with or without `from`). This server names `<db>.` (an empty
+      collection) after `$documents` and the FOREIGN collection inside a
+      `$lookup` / `$unionWith` with one: `run_segmented` builds the prefix
+      from its own `coll`, not from `COMMAND_NS`. Found 2026-11-14 working
+      RM-531.
+      Verify: tests/backlog/test_rm_found_2026_11_14_rm531.py::test_a_run_time_error_names_the_commands_namespace
+      Backlog-ID: RM-656
 - [ ] **A `$match` behind a `$replaceRoot` stays behind it over a
       collection.** mongod 8.2.11 moves a `$match` behind
       `{$replaceRoot: {newRoot: "$x"}}` (or `$replaceWith: "$x"`) ahead of
@@ -3585,7 +3679,8 @@ touched:
   after a wait that rounded to 3 seconds, mongod after 2; four runs on
   their own passed, at load 18. A later RM gate that day (RM-515) saw
   mongod answer two with no queue, as on 2026-11-08; three runs on their
-  own passed. The test depends on six connects landing within one
+  own passed. So did the RM-533 gate of 2026-11-14 (load average up to
+  32), and again three runs on their own passed. The test depends on six connects landing within one
   second, so it is flaky by construction: it needs a measurement that
   load cannot change (connect all six behind a barrier and record how
   long they took to land, or compare with the answer mongod gives when

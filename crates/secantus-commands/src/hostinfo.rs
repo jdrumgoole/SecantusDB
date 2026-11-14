@@ -8,6 +8,10 @@ pub(crate) struct Host {
     pub hostname: String,
     /// `uname -m`: `arm64` on Apple silicon, `x86_64`, `aarch64` on Linux.
     pub machine: String,
+    /// The machine's memory in bytes (`ProcessInfo::getMemSizeBytes`):
+    /// `hw.memsize` on macOS, `MemTotal` kB times 1024 on Linux.
+    pub mem_size_bytes: Option<u64>,
+    /// The same in whole MiB, rounded down (`hostInfo`'s `memSizeMB`).
     pub mem_size_mb: Option<i64>,
     pub mem_limit_mb: Option<i64>,
     pub logical_cores: i32,
@@ -39,6 +43,20 @@ fn uname() -> (String, String) {
 
 fn available_cores() -> i32 {
     std::thread::available_parallelism().map_or(1, |n| n.get() as i32)
+}
+
+/// Bytes as whole MiB, rounded down.
+#[cfg_attr(not(any(target_os = "macos", target_os = "linux")), allow(dead_code))]
+fn to_mb(bytes: u64) -> i64 {
+    i64::try_from(bytes / (1024 * 1024)).unwrap_or(i64::MAX)
+}
+
+/// `/proc/meminfo`'s `MemTotal` line, in bytes (its kB times 1024).
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn meminfo_total_bytes(text: &str) -> Option<u64> {
+    let line = text.lines().find(|l| l.starts_with("MemTotal:"))?;
+    let kb: u64 = line.split_whitespace().nth(1)?.parse().ok()?;
+    kb.checked_mul(1024)
 }
 
 #[cfg(target_os = "macos")]
@@ -94,7 +112,8 @@ mod platform {
 
     pub(super) fn read() -> Host {
         let (nodename, machine) = uname();
-        let mem = sysctl_int("hw.memsize").map(|b| b / (1024 * 1024));
+        let bytes = sysctl_int("hw.memsize").and_then(|b| u64::try_from(b).ok());
+        let mem = bytes.map(to_mb);
         let logical = sysctl_int("hw.logicalcpu").map_or_else(available_cores, |n| n as i32);
         let mut extra = Document::new();
         if let Some(v) = sysctl_string("kern.version") {
@@ -114,6 +133,7 @@ mod platform {
         Host {
             hostname: nodename,
             machine,
+            mem_size_bytes: bytes,
             mem_size_mb: mem,
             mem_limit_mb: mem,
             logical_cores: logical,
@@ -132,11 +152,11 @@ mod platform {
 mod platform {
     use super::*;
 
-    fn meminfo_mb() -> Option<i64> {
+    /// `MemTotal` in bytes: the kB `/proc/meminfo` gives, times 1024, as
+    /// mongod's `ProcessInfo` reads it.
+    fn meminfo_bytes() -> Option<u64> {
         let text = std::fs::read_to_string("/proc/meminfo").ok()?;
-        let line = text.lines().find(|l| l.starts_with("MemTotal:"))?;
-        let kb: i64 = line.split_whitespace().nth(1)?.parse().ok()?;
-        Some(kb / 1024)
+        meminfo_total_bytes(&text)
     }
 
     /// Distinct `(physical id, core id)` pairs and distinct `physical id`s.
@@ -186,10 +206,12 @@ mod platform {
         let release = std::fs::read_to_string("/proc/sys/kernel/osrelease")
             .map(|s| s.trim().to_string())
             .unwrap_or_default();
-        let mem = meminfo_mb();
+        let bytes = meminfo_bytes();
+        let mem = bytes.map(to_mb);
         Host {
             hostname: nodename,
             machine,
+            mem_size_bytes: bytes,
             mem_size_mb: mem,
             mem_limit_mb: mem,
             logical_cores: if online > 0 {
@@ -216,6 +238,7 @@ mod platform {
         Host {
             hostname: std::env::var("COMPUTERNAME").unwrap_or_default(),
             machine: std::env::consts::ARCH.into(),
+            mem_size_bytes: None,
             mem_size_mb: None,
             mem_limit_mb: None,
             logical_cores: available_cores(),
@@ -240,4 +263,20 @@ impl Host {
 /// `None` where it cannot be read.
 pub fn mem_size_mb() -> Option<i64> {
     Host::read().mem_size_mb
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// RM-657: the memory is kept in bytes, so 1% of it is not rounded to
+    /// whole MiB first. CI's runner: `MemTotal: 16365628 kB`.
+    #[test]
+    fn memtotal_is_kept_in_bytes() {
+        let text = "MemTotal:       16365628 kB\nMemFree:  1 kB\n";
+        let bytes = meminfo_total_bytes(text).unwrap();
+        assert_eq!(bytes, 16_758_403_072);
+        assert_eq!(to_mb(bytes), 15_982);
+        assert_eq!(meminfo_total_bytes("MemFree: 1 kB\n"), None);
+    }
 }
