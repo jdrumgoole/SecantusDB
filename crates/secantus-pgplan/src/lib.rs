@@ -25349,22 +25349,34 @@ fn declare_sublink_param(at: usize, t: &str) {
     });
 }
 
-/// The `typmods` a `TypeName` of length type `base` (`bpchar`, `varchar`)
-/// spells `typmod` with, as the parser leaves them for `character(3)`: the
-/// declared length, the varlena header taken off. Empty for any other type
-/// or no modifier.
+/// The `typmods` a `TypeName` of type `base` spells `typmod` with, as the
+/// parser leaves them -- `character(3)`, `numeric(5,2)`, `timestamp(3)` --
+/// the inverse of `declared_typmod`. A subquery's value is cast at its
+/// column's modifier, which `exprTypmod` of the SubLink is (RP-666,
+/// RP-497); the value already has it, so the cast changes none but a
+/// `char(n)`'s blanks. Empty for any other type or no modifier.
 fn length_typmods(base: &str, typmod: i32) -> Vec<pg_query::protobuf::Node> {
-    if !matches!(base, "bpchar" | "varchar") || typmod < 4 {
-        return Vec::new();
-    }
-    vec![pg_query::protobuf::Node {
-        node: Some(N::AConst(pg_query::protobuf::AConst {
-            val: Some(pg_query::protobuf::a_const::Val::Ival(
-                pg_query::protobuf::Integer { ival: typmod - 4 },
-            )),
-            ..Default::default()
-        })),
-    }]
+    let mods = match base {
+        "bpchar" | "varchar" if typmod >= 4 => vec![typmod - 4],
+        "numeric" if typmod >= 4 => {
+            let packed = typmod - 4;
+            // The low 11 bits are a signed scale (PostgreSQL 15).
+            let scale = ((packed & 0x7FF) ^ 0x400) - 0x400;
+            vec![packed >> 16, scale]
+        }
+        "time" | "timetz" | "timestamp" | "timestamptz" if typmod >= 0 => vec![typmod],
+        _ => Vec::new(),
+    };
+    mods.into_iter()
+        .map(|ival| pg_query::protobuf::Node {
+            node: Some(N::AConst(pg_query::protobuf::AConst {
+                val: Some(pg_query::protobuf::a_const::Val::Ival(
+                    pg_query::protobuf::Integer { ival },
+                )),
+                ..Default::default()
+            })),
+        })
+        .collect()
 }
 
 /// A `TypeName` for an internal type name (`int4`, `text[]`).

@@ -387,19 +387,26 @@ def test_typmod_planned_and_analysed(rust_pg: Any) -> None:
     assert got == [want for _, want in CONTEXTS]
 
 
-@pytest.mark.backlog("RP-497")
+@pytest.mark.backlog_fixed("RP-497")
 def test_typmod_from_scalar_subquery_and_computed_constants(rust_pg: Any) -> None:
     """On a private PostgreSQL 15.19 cluster a scalar subquery's column
     carries its select list's modifier in every reader, and a CASE whose
     WHEN folds to a constant -- a simple CASE over constants, or a
     computed condition -- is simplified before the planned readers see it.
-    Here the subquery is -1 everywhere, and only a literal `true` /
-    `false` / `null` condition is folded, so the others are -1 in the
-    planned readers too."""
+    The subquery was -1 everywhere, and only a literal `true` / `false` /
+    `null` condition was folded, so the others were -1 in the planned
+    readers too. Fixed by RP-497."""
     cases = [
         ("select (select 2.5::numeric(5,2)) a", _planned([327686], [327686])),
+        ("select (select 2.5::numeric(5,2) where false) a", _planned([327686], [327686])),
+        ("select (select 1.5::numeric(7,-1)) a", _planned([460803], [460803])),
+        ("select (select now()::timestamp(3)) a", _planned([3], [3])),
         ("select case 1 when 1 then 'a'::varchar(3) end a", _planned([7], [-1])),
         ("select case when 1 = 1 then 'a'::varchar(3) end a", _planned([7], [-1])),
+        (
+            "select case 1 when 2 then 'b'::text else 'a'::varchar(3) end a",
+            _planned([7], [-1]),
+        ),
     ]
     with rust_pg.connect() as c:
         c.autocommit = True

@@ -3245,26 +3245,6 @@ Measured on PostgreSQL 15.19.
       Verify: tests/backlog/test_rp_found_rp510.py::test_multirange_literal_detail
       Backlog-ID: RP-878
 
-## Found while working RP-493 (2026-11-07)
-
-Measured on a private PostgreSQL 15.19 cluster.
-
-- [ ] **A scalar subquery's column, and a CASE folded by a computed
-      constant, lose their type modifier.** `select (select
-      2.5::numeric(5,2))` carries 327686 in every reader on PostgreSQL (the
-      subquery's first column, `exprTypmod` of its SubLink); here it is -1
-      everywhere. And `eval_const_expressions` simplifies a CASE whose WHEN
-      folds to a constant before the planned readers (a portal's Describe,
-      a populating CREATE TABLE AS, a SELECT from a view) see it, so `case
-      1 when 1 then 'a'::varchar(3) end` and `case when 1 = 1 then
-      'a'::varchar(3) end` describe 7 there (-1 in a prepared statement's
-      Describe, a view's columns and WITH NO DATA, as here). Since RP-493
-      only a literal `true` / `false` / `null` condition, or a literal
-      COALESCE argument, is folded (`expr_typmod.rs`); a computed one needs
-      the constant evaluator's own verdict on what folds.
-      Verify: tests/backlog/test_rp_ctas_subquery.py::test_typmod_from_scalar_subquery_and_computed_constants
-      Backlog-ID: RP-497
-
 ## Found while working RP-316 (2026-11-02)
 
 - [ ] **Every CREATE VIEW takes over a second.** Each one rebuilds
