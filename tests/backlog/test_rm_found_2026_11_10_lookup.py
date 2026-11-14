@@ -33,7 +33,7 @@ def _lookup_spec_checks(client: Any) -> dict:
     }
 
 
-@pytest.mark.backlog("RM-528")
+@pytest.mark.backlog_fixed("RM-528")
 def test_lookup_refuses_a_bad_let_and_a_lone_join_field(
     rust_mongo: Any,
     mongod_rs: Any,  # noqa: F811
@@ -42,8 +42,8 @@ def test_lookup_refuses_a_bad_let_and_a_lone_join_field(
     "BSON field '$lookup.let' is the wrong type 'int', expected type
     'object'") and one with `localField` or `foreignField` but not both (9,
     "$lookup requires both or neither of 'localField' and 'foreignField' to
-    be specified"). This server runs the first, and the lone field with a
-    pipeline, and answers 2 to the lone field without one."""
+    be specified"). This server ran the first, and the lone field with a
+    pipeline, and answered 2 to the lone field without one."""
     assert _lookup_spec_checks(rust_mongo) == _lookup_spec_checks(mongod_rs)
 
 

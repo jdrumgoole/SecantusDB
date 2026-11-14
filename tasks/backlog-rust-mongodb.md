@@ -1790,15 +1790,28 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       plans (counted false here). Found 2026-11-10 working RM-215.
       Verify: tests/backlog/test_rm_found_2026_11_10_rm215.py::test_query_stats_remainder
       Backlog-ID: RM-532
-- [ ] **`$lookup` runs a `let` that is not a document, and a lone join field.**
-      mongod 8.2.11 refuses `let: 5` with 14 "BSON field '$lookup.let' is
-      the wrong type 'int', expected type 'object'", and `localField`
-      without `foreignField` (or the reverse) with 9 "$lookup requires both
-      or neither of 'localField' and 'foreignField' to be specified". This
-      server runs the first, runs the lone field when there is a pipeline,
-      and answers 2 without one. Found 2026-11-10 (RM-413).
-      Verify: tests/backlog/test_rm_found_2026_11_10_lookup.py::test_lookup_refuses_a_bad_let_and_a_lone_join_field
-      Backlog-ID: RM-528
+- [ ] **A malformed stage spec inside a sub-pipeline is not refused as the
+      pipeline parses.** mongod 8.2.11 checks the stages of a `$facet`'s
+      and a `$lookup`'s pipelines as it parses the outer one, so over an
+      empty collection it refuses `{$facet: {a: [{$match: 5}]}}` with
+      15959, a `$lookup` in a facet whose `let` is `5` with 14, and a
+      `$lookup` in a `$lookup` pipeline with a lone `localField` with 9.
+      This server's `argtypes::stage_spec_error` reads the top level only:
+      it answers 2 to the first and runs the other two. Found 2026-11-14
+      working RM-528.
+      Verify: tests/backlog/test_rm_found_2026_11_14_rm528.py::test_stage_specs_in_a_sub_pipeline_are_checked_as_it_parses
+      Backlog-ID: RM-645
+- [ ] **`$lookup` runs a `$`-prefixed join field, an empty `as` and a bad
+      `let` name.** mongod 8.2.11 refuses `localField: "$a"` with 16410
+      "Consider using $getField or $setField for a field path with '.' or
+      '$'. :: caused by :: FieldPath field names may not start with '$',
+      given '$a'.", `as: ""` with 40352 "FieldPath cannot be constructed
+      with empty string", and `let: {X: 1}` with 9 "'X' starts with an
+      invalid character for a user variable name". This server runs all
+      three (the empty `as` writes a field named ""). Found 2026-11-14
+      working RM-528.
+      Verify: tests/backlog/test_rm_found_2026_11_14_rm528.py::test_lookup_refuses_a_bad_path_and_a_bad_let_name
+      Backlog-ID: RM-646
 - [ ] **A `$lookup` whose `localField` is an empty array joins nothing.**
       mongod 8.2.11 joins it as it joins null: to the foreign documents
       whose `foreignField` is missing, null or `[null]`, in the simple form
