@@ -47,6 +47,17 @@ pub(crate) struct Scope {
     /// a PL/pgSQL variable bound into an expression is of its declared
     /// type (RP-670). Empty for a statement's own scope.
     params: Vec<Option<String>>,
+    /// The FROM items of the enclosing query level a LATERAL subquery sees
+    /// (`transformRangeSubselect` with `p_lateral_active`), searched when a
+    /// reference names nothing at this level (RP-674).
+    outer: Vec<(String, Option<Columns>)>,
+}
+
+thread_local! {
+    /// The outer items for the LATERAL subquery whose columns are being
+    /// measured, which its own FROM scope takes as `Scope::outer`.
+    static LATERAL_OUTER: std::cell::RefCell<Vec<(String, Option<Columns>)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
 }
 
 impl Scope {
@@ -56,6 +67,7 @@ impl Scope {
             items: vec![(alias, Some(table_columns(def)))],
             opaque: false,
             params: Vec::new(),
+            outer: Vec::new(),
         }
     }
 
@@ -71,7 +83,9 @@ impl Scope {
             items: Vec::new(),
             opaque: false,
             params: Vec::new(),
+            outer: LATERAL_OUTER.with(|o| o.borrow().clone()),
         };
+        LATERAL_OUTER.with(|o| o.borrow_mut().clear());
         for item in from {
             scope.add(item, lookup, ctes);
         }
@@ -95,7 +109,22 @@ impl Scope {
             }
             Some(N::RangeSubselect(sub)) => {
                 let columns = match sub.subquery.as_deref().and_then(|q| q.node.as_ref()) {
-                    Some(N::SelectStmt(q)) => output_columns(q, lookup, ctes),
+                    Some(N::SelectStmt(q)) => {
+                        // A subquery sees the outer levels its own level
+                        // sees, and a LATERAL one the items before it too.
+                        if q.op == SetOperation::SetopNone as i32 {
+                            let mut outer = if sub.lateral {
+                                self.items.clone()
+                            } else {
+                                Vec::new()
+                            };
+                            outer.extend(self.outer.iter().cloned());
+                            LATERAL_OUTER.with(|o| *o.borrow_mut() = outer);
+                        }
+                        let columns = output_columns(q, lookup, ctes);
+                        LATERAL_OUTER.with(|o| o.borrow_mut().clear());
+                        columns
+                    }
                     _ => None,
                 };
                 match sub.alias.as_ref() {
@@ -143,29 +172,71 @@ impl Scope {
         let Some(N::ColumnRef(c)) = node.node.as_ref() else {
             return None;
         };
-        let name = super::column_ref_name(c)?;
-        let candidates: Vec<&Columns> = match c.fields.as_slice() {
-            [_] if !self.opaque => self.items.iter().flat_map(|(_, c)| c.as_ref()).collect(),
-            [q, _] => {
-                let Some(N::String(q)) = q.node.as_ref() else {
-                    return None;
-                };
-                let mut named = self.items.iter().filter(|(n, _)| *n == q.sval);
-                match (named.next(), named.next()) {
-                    (Some((_, Some(columns))), None) => vec![columns],
-                    _ => return None,
-                }
-            }
-            _ => return None,
-        };
-        let mut matching = candidates
-            .into_iter()
-            .flat_map(|c| c.iter())
-            .filter(|(n, _)| *n == name);
-        match (matching.next(), matching.next()) {
-            (Some((_, Some(domain))), None) => Some(domain.as_str()),
-            _ => None,
+        // `colNameToVar` stops at the first level that has the name; a
+        // LATERAL subquery's outer level is searched only when its own
+        // cannot (RP-674).
+        if self.outer.is_empty() || names(&self.items, self.opaque, c) {
+            return resolve(&self.items, self.opaque, c);
         }
+        let opaque = self.outer.iter().any(|(_, c)| c.is_none());
+        resolve(&self.outer, opaque, c)
+    }
+}
+
+type Items = [(String, Option<Columns>)];
+
+/// Whether the reference `c` can name something among `items`: its
+/// qualifier is one of them, or (unqualified) a column of one, or their
+/// columns are not all known.
+fn names(items: &Items, opaque: bool, c: &pg_query::protobuf::ColumnRef) -> bool {
+    let Some(name) = super::column_ref_name(c) else {
+        return true;
+    };
+    match c.fields.as_slice() {
+        [_] => {
+            opaque
+                || items
+                    .iter()
+                    .flat_map(|(_, c)| c.iter().flatten())
+                    .any(|(n, _)| *n == name)
+        }
+        [q, _] => match q.node.as_ref() {
+            Some(N::String(q)) => items.iter().any(|(n, _)| *n == q.sval),
+            _ => true,
+        },
+        _ => true,
+    }
+}
+
+/// The domain of the column `c` names among `items`, when it names exactly
+/// one and that one is of a domain.
+fn resolve<'a>(
+    items: &'a Items,
+    opaque: bool,
+    c: &pg_query::protobuf::ColumnRef,
+) -> Option<&'a str> {
+    let name = super::column_ref_name(c)?;
+    let candidates: Vec<&Columns> = match c.fields.as_slice() {
+        [_] if !opaque => items.iter().flat_map(|(_, c)| c.as_ref()).collect(),
+        [q, _] => {
+            let Some(N::String(q)) = q.node.as_ref() else {
+                return None;
+            };
+            let mut named = items.iter().filter(|(n, _)| *n == q.sval);
+            match (named.next(), named.next()) {
+                (Some((_, Some(columns))), None) => vec![columns],
+                _ => return None,
+            }
+        }
+        _ => return None,
+    };
+    let mut matching = candidates
+        .into_iter()
+        .flat_map(|c| c.iter())
+        .filter(|(n, _)| *n == name);
+    match (matching.next(), matching.next()) {
+        (Some((_, Some(domain))), None) => Some(domain.as_str()),
+        _ => None,
     }
 }
 
@@ -724,6 +795,7 @@ fn write_scope(
         items: Vec::new(),
         opaque: false,
         params: Vec::new(),
+        outer: Vec::new(),
     };
     let (name, columns) = aliased(
         target.relname.clone(),

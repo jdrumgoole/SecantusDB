@@ -84,12 +84,12 @@ def test_array_of_star_over_a_domain_subquery_is_the_domains(dsn: str) -> None:
     assert got == (["d657c[]"], [('{"a b","xy "}',)])
 
 
-@pytest.mark.backlog("RP-674")
+@pytest.mark.backlog_fixed("RP-674")
 def test_lateral_column_of_an_outer_domain_column_is_the_domains(dsn: str) -> None:
     """A LATERAL subquery's column that is the outer row's domain column is
     of the domain on PostgreSQL 15.19 (its Var's type): `pg_typeof(b)` is
-    `d657c` and `array[b]` the domain's array, with the padding. Here they
-    are `character` and `character[]`, without it."""
+    `d657c` and `array[b]` the domain's array, with the padding. They were
+    `character` and `character[]`, without it, until RP-674."""
     with _connect(dsn) as c:
         got = _answer(
             c,
@@ -100,3 +100,27 @@ def test_lateral_column_of_an_outer_domain_column_is_the_domains(dsn: str) -> No
         ["regtype", "d657c[]"],
         [("d657c", '{"a b"}'), ("d657c", '{"xy "}')],
     )
+
+
+@pytest.mark.backlog_fixed("RP-674")
+@pytest.mark.parametrize(
+    ("query", "want"),
+    [
+        # A subquery nested in the LATERAL one sees the outer level too.
+        (
+            "select pg_typeof(b) from t657d x, lateral"
+            " (select b from (select x.a b) q) l order by i",
+            [("d657c",), ("d657c",)],
+        ),
+        # A name the subquery's own FROM has is that one, not the outer's.
+        (
+            "select pg_typeof(b) from t657d x cross join lateral"
+            " (select a b from (values (1)) v(a)) l order by i",
+            [("integer",), ("integer",)],
+        ),
+    ],
+)
+def test_lateral_scope_levels(query: str, want: list[tuple[str]], dsn: str) -> None:
+    """Measured on PostgreSQL 15.19 (RP-674's regression tests)."""
+    with _connect(dsn) as c:
+        assert c.execute(query).fetchall() == want

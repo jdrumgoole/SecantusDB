@@ -2791,14 +2791,6 @@ char(3)`, `t657d(a d657c, i int)` holding `('a b', 1)` and `('xy', 2)`, and
 its domain through a join, a WITH, a FROM subquery and a set operation all
 of whose branches are of the domain (`domain_scope.rs`).
 
-- [ ] **A LATERAL subquery's column that is an outer domain column is typed
-      by the domain's base.** `select pg_typeof(b), array[b] from t657d x
-      cross join lateral (select x.a b) l` is `d657c` and `d657c[]`, with
-      the padding, on PostgreSQL 15.19; here `character` and `character[]`,
-      without it. The subquery's scope does not see the outer FROM item it
-      references, so its column's type is not known.
-      Verify: tests/backlog/test_rp_found_rp657.py::test_lateral_column_of_an_outer_domain_column_is_the_domains
-      Backlog-ID: RP-674
 
 ## Found while working RP-672 (2026-11-09)
 
