@@ -3393,19 +3393,6 @@ RP-573 a DECLARE's type is looked up at CREATE FUNCTION and before a DO
 block runs (`check_plpgsql_declarations`), from the type text libpg_query
 keeps; what follows is what that lookup does not yet check.
 
-- [ ] **A PL/pgSQL DECLARE whose type text is not one type name is
-      created.** `read_datatype` passes the text to `parse_datatype` unless
-      it is a `%TYPE` of a variable or column it finds, and a text that is
-      not one type name is 42601 at the token, with the CONTEXT `invalid
-      type name "..."`: on PostgreSQL 15.19 `declare x nosuch573%type` is
-      `syntax error at or near "%"` at 78, `y nosuch573.x%type` the same at
-      87, `x int(3)` `syntax error at or near "("` at 72 and `x
-      varchar(nosuch)` `syntax error at or near "nosuch"` at 77. Here each
-      is created. libpg_query stubs the `%TYPE` lookups out
-      (`plpgsql_parse_wordtype` returns NULL), so finding the variable or
-      column is this server's to do, in the block scopes PL/pgSQL keeps.
-      Verify: tests/backlog/test_rp_found_rp573.py::test_declare_of_text_that_is_not_one_type_name
-      Backlog-ID: RP-617
 - [ ] **A `pg_temp` type in a session with no temporary schema is a
       missing type, not a missing schema.** `LookupExplicitNamespace`
       finds `pg_temp` only once the session has made its temp schema, so on

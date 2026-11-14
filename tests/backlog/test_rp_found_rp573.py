@@ -89,8 +89,10 @@ COMPILE_ERROR_POSITION = [
 ]
 
 
-@pytest.mark.backlog("RP-617")
+@pytest.mark.backlog_fixed("RP-617")
 def test_declare_of_text_that_is_not_one_type_name(dsn: str) -> None:
+    """A DECLARE whose type text was not one type name was created;
+    `typeStringToTypeName` refuses it with the grammar's syntax error."""
     assert _compiled(dsn, NOT_ONE_TYPE_NAME) == [
         ("42601", 'syntax error at or near "%"', "78", 'invalid type name "nosuch573%type"'),
         ("42601", 'syntax error at or near "%"', "87", 'invalid type name "nosuch573.x%type"'),

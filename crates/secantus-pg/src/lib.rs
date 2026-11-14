@@ -14614,13 +14614,18 @@ impl PgHandler {
                 }
                 None => match secantus_pgplan::plpgsql_declared_type(&d.typname) {
                     Ok(()) => continue,
+                    Err(refused @ secantus_pgplan::DeclaredTypeError::SyntaxAt(_, at)) => {
+                        at_percent = Some(at);
+                        refused
+                    }
                     Err(refused) => refused,
                 },
             };
             let offset =
                 plpgsql_fn::declared_type_offset(body, d).map(|at| at + at_percent.unwrap_or(0));
             let (e, at_type) = match refused {
-                secantus_pgplan::DeclaredTypeError::AtType(e) => (e, true),
+                secantus_pgplan::DeclaredTypeError::AtType(e)
+                | secantus_pgplan::DeclaredTypeError::SyntaxAt(e, _) => (e, true),
                 secantus_pgplan::DeclaredTypeError::Compile(e) => (e, false),
                 secantus_pgplan::DeclaredTypeError::PseudoType(t) => (
                     secantus_pgplan::Error::Sqlstate(
