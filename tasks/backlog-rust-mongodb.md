@@ -1296,7 +1296,7 @@ These are explicit non-goals. Don't add them without a reason.
   the log is mongod's structured log, and since 2026-11-13 this server
   starts it as mongod 8.2.11 does on `initandlisten`: `MongoDB starting`,
   `Build Info` (23403), `Operating System` (51765), `Options set by command
-  line` (21951, which carries RM-425's `parsed` until that is fixed), the
+  line` (21951), the
   lock file's `Detected unclean shutdown` (22271), `Opening WiredTiger`
   (22315), `WiredTiger opened` (4795906) and, last, `mongod startup
   complete` (8423403). mongod writes about sixty more there that this
@@ -2121,29 +2121,15 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       (RM-418).
       Verify: tests/backlog/test_rm_found_2026_11_10_rm418.py::test_sbe_find_shapes_are_explained_as_sbe
       Backlog-ID: RM-543
-- [ ] **An aggregate `$sort` on a `$meta` key is refused.** mongod 8.2.1
-      sorts `{$sort: {s: {$meta: "randVal"}}}` (and a `searchScore` key,
-      which has no value without `$search` and so ties); this server
-      refuses any `$meta` key in the stage with 2 "aggregation pipeline
-      uses a stage or operator not supported by the Rust server". A `find`
-      sort by `{$meta: "randVal"}` answers on both. Found 2026-11-08 while
-      working RM-332.
-      Verify: tests/backlog/test_rm_found_2026_11_08_rm332.py::test_a_sort_on_a_meta_key_runs
-      Backlog-ID: RM-423
-- [ ] **A retryable write retried after a crash under `--data-nonlogged` is
-      applied again.** A restarted server reads a session's
-      `config.transactions` row, its oplog entries and its
-      `config.image_collection` image back (since 2026-11-08), but that mode
-      writes the row and the image without an oplog entry and recovers its
-      data tables by replaying the oplog, so a SIGKILL loses both: a retried
-      insert fails on a duplicate key, a retried `findAndModify` changes the
-      document a second time. mongod 8.2.11 rebuilds the row and the image
-      from the oplog in recovery (its `SessionUpdateTracker`; the image from
-      the document the replayed write changed) and answers both retries as
-      after a clean restart. The fix is in `recover_from_oplog`
-      (`secantus-storage`), which the PG server links too.
-      Backlog-ID: RM-350
-      Verify: tests/backlog/test_rm_350_retry_after_restart.py::test_a_retry_after_a_crash_under_data_nonlogged_applies_nothing_twice
+- [ ] **A `$sort` on a field and `{$meta: "randVal"}` before a `$project`
+      is not refused.** mongod 8.2.11 refuses `[{$sort: {a: 1, s: {$meta:
+      "randVal"}}}, {$project: {a: 1, _id: 0}}]` with 16410 ("FieldPath
+      field names may not start with '$', given '$computed1'", from its
+      pipeline rewrite); the same sort alone, or `{$meta: "randVal"}` as the
+      only key, answers on both, and this server sorts the pipeline. Found
+      2026-11-14 while working RM-423.
+      Verify: tests/backlog/test_rm_found_2026_11_08_rm332.py::test_a_rand_sort_beside_a_field_under_a_project_is_refused
+      Backlog-ID: RM-691
 
 ### 7.085 The shared Rust storage, audited -- 2026-10-20
 
@@ -2193,16 +2179,6 @@ inject (a panic, a power loss, a failing checkpoint).
       collection, readable by a scan and not by `_id`.
       Backlog-ID: RM-318
       Verify: none -- needs a salvage that brings back a deleted document beside its replacement, which no quick test can stage
-- [ ] **`getCmdLineOpts` does not report the command line.** mongod 8.2.1
-      answers with `argv` as the process was started and `parsed` holding
-      each option given, under its configuration-file path (`--port 27031
-      --dbpath D` is `{net: {port: 27031}, storage: {dbPath: D}}`); this
-      server answers `argv: ["secantus"]` (and `--auth`) and `parsed: {net:
-      {}, storage: {}}` whatever it was started with. The same `parsed` is
-      the `cmdLine` of each `local.startup_log` record, which shares the
-      gap. Found while fixing RM-319 (2026-11-08).
-      Backlog-ID: RM-425
-      Verify: tests/backlog/test_rm_cmd_line_opts.py::test_get_cmd_line_opts_reports_the_command_line
 
 ### 7.084 What an authenticated user may run -- 2026-10-14
 
@@ -2289,65 +2265,6 @@ Still different:
       in memory answers 115 with this server's own text, because mongod's
       in-memory engine is Enterprise-only and its message could not be
       measured.
-- [ ] **`serverStatus.locks`: locks taken before a command parses, the
-      transaction commands, and the commands not measured.** The lock
-      manager (`lock_manager.rs`, RM-034) takes, outside a transaction, the
-      rounds mongod 8.2.11 takes (`statement_rounds`, measured per command):
-      reads, the write commands, `findAndModify`, `create` / `drop` /
-      `dropDatabase`, index builds, `dropIndexes`, `$out`, `dbStats`, and
-      `$merge`, which takes a write round per document as it writes
-      (`write_rounds`, two more when it creates its target, and with
-      `whenMatched: "fail"` mongod's retries after a duplicate). Since
-      2026-10-24 also the commands that read no data (none), `rolesInfo` /
-      `usersInfo`, `dataSize` / `filemd5` / the plan-cache commands,
-      `explain`, `dbHash` and `listDatabases` (one more global IS per
-      database whose size it reads), and the global IS of a slow
-      operation's log line (RM-299). All count as mongod's (the regression
-      tests in `tests/backlog/test_rm_185_locks.py`). An index build's count
-      of the global IS is not fixed on mongod: its build runs on a thread of
-      its own and the command takes the IS each time it looks at it, 1 to 4
-      times in one shape measured. This server takes mongod's usual count (2,
-      and 4 with every operation logged as slow: macOS 8.2.11 gave exactly
-      that in 20 of 20 runs; the Linux build sometimes polls once less), and
-      the tests accept any count mongod gave in its five runs for that one
-      lock (Joe, 2026-10-27). mongod takes a command's locks inside it,
-      after it parses, so a malformed one takes none: since 2026-11-08
-      `explain`, `dataSize`, the plan cache commands and
-      `validateDBMetadata` parse before their locks here too
-      (`parse_before_locks`), and `validateDBMetadata` takes a round on each
-      database it reads and on each of its collections. Still different:
-      the other commands find a malformed field in their handler, after
-      their locks -- `find` with a wrongly typed `filter` or an unknown
-      field, `aggregate` without `pipeline` or on `1` with no stage to read
-      from, `getMore` of a name, `listCollections` and `listDatabases` with
-      a wrongly typed `filter`, `insert`, `update`, `createIndexes` and
-      `dropIndexes` without their required field, and `dbStats` with a
-      wrongly typed `scale` take their chain or rounds where mongod takes
-      none; the transaction commands, which need a replica set, were measured on a
-      one-member mongod 8.2.11 set (2026-10-17) cannot be pinned the same
-      way: its replication threads take the global IS about twice in any
-      window, and its writes take rounds for the oplog and the session table
-      too (a plain insert three where a standalone takes one; a one-insert
-      transaction with its commit 3 collection IX, 2 global IX and 8 on the
-      state transition lock), machinery this server does not run; and the
-      commands neither measured on 2026-10-24 (a sweep of the 115 both
-      servers list, in valid forms) nor named above still take the generic
-      chain -- those that write, wait, change the server or need a replica
-      set were left out of the sweep. mongod's internal resources
-      (`Metadata`, `oplog`, `Mutex`, `MultiDocumentTransactionsBarrier`) are
-      locked by its background threads only and are absent here.
-      **Time-based plan yields** (measured 2026-10-21): mongod's executor
-      yields after `internalQueryExecYieldPeriodMS` (10 ms), and each re-take
-      of a lock counts. `$out` reads 7 global IS on Linux x86-64 8.2.12 (CI,
-      the exemplar build: Joe, 2026-10-21), 8 on macOS arm64 idle and 9 on a
-      loaded Mac; with the period off, macOS reads 7 too. So this server
-      takes Linux's 7, and the regression tests' reference mongod runs with
-      the period off, which gives Linux's counts on any machine and stops
-      them moving with load. The counts that still moved under load were
-      mongod's slow-operation log (RM-274, closed 2026-10-24): the tests set
-      `slowms` out of reach on both servers.
-      Backlog-ID: RM-185
-      Verify: tests/backlog/test_rm_185_locks.py::test_lock_counts_of_other_malformed_commands
 - **Scope decision — `replSetReconfig` takes one member, this server**
   (2026-10-20, under "Explicitly out of scope: real replica sets"). mongod
   8.2.11 accepts a configuration that adds a member it cannot reach and

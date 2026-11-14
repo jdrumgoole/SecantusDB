@@ -101,6 +101,13 @@ fn main() -> ExitCode {
         }
     };
 
+    // What `getCmdLineOpts` reports: the command line as the process was
+    // started, and the options it gave (RM-425).
+    secantus_commands::diagnostics::set_command_line(
+        std::env::args().collect(),
+        parsed.cmd_line.clone(),
+    );
+
     // Layer the TOML file (explicit --config or auto-discovered) underneath the
     // CLI flags, then derive the resolved run args (TLS pairing + standalone →
     // replica_set_name). A config error (missing file, unknown key/table,

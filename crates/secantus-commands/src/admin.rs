@@ -4075,23 +4075,30 @@ fn index_conflict(
 }
 
 /// `dropIndexes` — drop a named index, or all of them with `"*"`.
-pub fn drop_indexes(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
+/// `dropIndexes`'s `index`, parsed as mongod's IDL parses it: before the
+/// command's locks, so a request without it takes none (RM-185, measured
+/// 8.2.11). Returns the list of names when `index` is one.
+pub fn drop_indexes_parse(doc: &Document) -> Result<Option<Vec<String>>, CommandError> {
     // A list of names is a third form `index` takes, beside a name and a key.
     let names: Option<Vec<String>> = match doc.get("index") {
         Some(Bson::Array(a)) => a.iter().map(|v| v.as_str().map(String::from)).collect(),
         _ => None,
     };
     if doc.get("index").is_none() {
-        return Ok(CommandError::new(
+        return Err(CommandError::new(
             40414,
             "IDLFailedToParse",
             "BSON field 'dropIndexes.index' is missing but a required field",
-        )
-        .into_reply());
+        ));
     }
     if names.is_none() {
         argtypes::require_index_name_or_key(doc, "index", "dropIndexes.index")?;
     }
+    Ok(names)
+}
+
+pub fn drop_indexes(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
+    let names = drop_indexes_parse(doc)?;
     let coll = coll_arg(doc, "dropIndexes")?;
     let storage = ctx.storage()?;
     let exists = storage

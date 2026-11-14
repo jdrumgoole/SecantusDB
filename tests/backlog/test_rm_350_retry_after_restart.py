@@ -198,15 +198,16 @@ def test_each_kind_of_retry_after_a_restart(tmp_path: Any) -> None:
     ]
 
 
-@pytest.mark.backlog("RM-350")
+@pytest.mark.backlog_fixed("RM-350")
 def test_a_retry_after_a_crash_under_data_nonlogged_applies_nothing_twice(tmp_path: Any) -> None:
     """mongod 8.2.11 killed with SIGKILL after two journaled retryable
     writes answers their retries as after a clean restart: recovery rebuilds
     the session's `config.transactions` row and the `findAndModify`'s image
-    from the oplog. This server under `--data-nonlogged` writes both without
-    an oplog entry and recovers its data tables by replaying the oplog, so a
-    crash loses them: the insert fails on a duplicate key and the
-    `findAndModify` runs a second time."""
+    from the oplog. This server under `--data-nonlogged` wrote both without
+    an oplog entry and recovered its data tables by replaying the oplog, so a
+    crash lost them: the insert failed on a duplicate key and the
+    `findAndModify` ran a second time. Replay now rebuilds both, as mongod's
+    `SessionUpdateTracker` does."""
     store = str(tmp_path / "store")
     a, b = _session(), _session()
     journaled = {"writeConcern": {"j": True}}

@@ -77,19 +77,43 @@ pub fn fsync(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
 /// `getCmdLineOpts` — parsed command line; drivers read
 /// `parsed.security.authorization` to detect `--auth`.
 pub fn get_cmd_line_opts(_doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
-    let mut argv = vec![Bson::String("secantus".to_string())];
-    if ctx.require_auth {
-        argv.push(Bson::String("--auth".to_string()));
-    }
+    let argv: Vec<Bson> = match COMMAND_LINE.get() {
+        Some((argv, _)) => argv.iter().cloned().map(Bson::String).collect(),
+        None => {
+            let mut argv = vec![Bson::String("secantus".to_string())];
+            if ctx.require_auth {
+                argv.push(Bson::String("--auth".to_string()));
+            }
+            argv
+        }
+    };
     Ok(doc! { "argv": argv, "parsed": parsed_options(ctx.require_auth), "ok": 1.0 })
+}
+
+/// The process's command line, recorded once by the `secantusd-rs` binary
+/// before it serves: `argv` as the process was started, and the options it
+/// gave under their mongod configuration-file paths (RM-425). An embedded
+/// server has no command line and leaves it unset.
+static COMMAND_LINE: std::sync::OnceLock<(Vec<String>, Document)> = std::sync::OnceLock::new();
+
+/// Record the process's command line for `getCmdLineOpts`, the `Options set
+/// by command line` log line and `local.startup_log`'s `cmdLine`. The first
+/// call wins.
+pub fn set_command_line(argv: Vec<String>, parsed: Document) {
+    let _ = COMMAND_LINE.set((argv, parsed));
 }
 
 /// The options the server was started with, as `getCmdLineOpts` reports
 /// them under `parsed`; also the `cmdLine` of each `local.startup_log`
-/// record, which mongod takes from the same place.
+/// record, which mongod takes from the same place. Without a recorded
+/// command line (an embedded server) it is `{net: {}, storage: {}}`, and
+/// authorization from a configuration file shows as mongod shows it.
 pub fn parsed_options(require_auth: bool) -> Document {
-    let mut parsed = doc! { "net": {}, "storage": {} };
-    if require_auth {
+    let mut parsed = match COMMAND_LINE.get() {
+        Some((_, parsed)) => parsed.clone(),
+        None => doc! { "net": {}, "storage": {} },
+    };
+    if require_auth && !parsed.contains_key("security") {
         parsed.insert("security", doc! { "authorization": "enabled" });
     }
     parsed

@@ -175,7 +175,9 @@ def _same_counts(got: list, want: list) -> None:
         if label.startswith("createIndex"):
             polls = [run.get(_BUILD_POLLS, 0) for run in _RUNS[label]]
             mine = ours.get(_BUILD_POLLS, 0)
-            assert mine >= 1, label
+            # A build that ran polls at least once; a malformed request,
+            # which mongod refuses before any build, polls none.
+            assert mine >= min(1, min(polls)), label
             assert min(polls) <= mine <= max(polls), (
                 f"{label!r}: this server took {_BUILD_POLLS} {mine} times; "
                 f"mongod's five runs took {polls}"
@@ -798,10 +800,10 @@ def _parsed_after_locking(client: Any) -> list:
     )
 
 
-@pytest.mark.backlog("RM-185")
+@pytest.mark.backlog_fixed("RM-185")
 def test_lock_counts_of_other_malformed_commands(rust_mongo: Any, mongod: Any) -> None:
-    """The same, for commands whose handler finds the error after the
+    """The same, for commands whose handler found the error after the
     statement's locks: mongod refuses each having taken no lock, and this
-    server takes the command's chain or rounds first (measured 8.2.11,
-    2026-11-08)."""
+    server took the command's chain or rounds first (measured 8.2.11,
+    2026-11-08). Each parses before its locks now (RM-386, RM-185)."""
     _same_counts(_parsed_after_locking(rust_mongo), _reference(_parsed_after_locking, mongod))
