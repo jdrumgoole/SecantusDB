@@ -1096,6 +1096,8 @@ pub fn qualify(node: &mut N) -> Result<()> {
                 }
             }
         }
+        // Each relation named, as `(name as written, stored key)`.
+        let mut relations: Vec<(String, String)> = Vec::new();
         for (n, _, _) in node.nodes_mut() {
             // The walk does not descend into a TABLESAMPLE's relation.
             let r = match n {
@@ -1119,10 +1121,14 @@ pub fn qualify(node: &mut N) -> Result<()> {
                 {
                     return Err(not_on_path(&r.relname, r.location));
                 }
+                let bare = r.relname.clone();
                 if let Some(s) = qualify_reference(&mut *r, &ctes, trivial) {
                     if !schemas.contains(&s) {
                         schemas.push(s);
                     }
+                }
+                if !relations.contains(&(bare.clone(), r.relname.clone())) {
+                    relations.push((bare, r.relname.clone()));
                 }
             }
         }
@@ -1131,8 +1137,16 @@ pub fn qualify(node: &mut N) -> Result<()> {
                 if let pg_query::NodeMut::ColumnRef(c) = n {
                     let c = &mut *c;
                     if c.fields.len() >= 3 {
+                        // `s.t.col` where two relations named `t` are in
+                        // reach keeps its schema: `t.col` names neither.
+                        let shared = match c.fields[1].node.as_ref() {
+                            Some(N::String(t)) => {
+                                relations.iter().filter(|(b, _)| *b == t.sval).count() > 1
+                            }
+                            _ => false,
+                        };
                         if let Some(N::String(s)) = c.fields[0].node.as_ref() {
-                            if schemas.contains(&s.sval) {
+                            if schemas.contains(&s.sval) && !shared {
                                 c.fields.remove(0);
                             }
                         }

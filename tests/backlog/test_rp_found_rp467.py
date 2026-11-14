@@ -364,7 +364,8 @@ def namespace_answer(dsn: str, statement: str) -> Any:
 
 
 # Measured on PostgreSQL 15.19 with rq467n1.t holding 1, 2 and rq467n2.t
-# 1, 3. The comma form's `rq467n2.t.a` read rq467n1.t's rows here.
+# 1, 3. The comma form's `rq467n2.t.a` read rq467n1.t's rows here, and
+# every join of the two was 42712, until RP-526.
 SAME_NAME_RELATIONS = {
     "select 1 from rq467n1.t join rq467n2.t on true": [(1,), (1,), (1,), (1,)],
     "select rq467n2.t.a from rq467n1.t, rq467n2.t order by 1": [(1,), (1,), (3,), (3,)],
@@ -387,7 +388,7 @@ SAME_NAME_RELATIONS = {
 }
 
 
-@pytest.mark.backlog("RP-526")
+@pytest.mark.backlog_fixed("RP-526")
 @pytest.mark.parametrize("statement", list(SAME_NAME_RELATIONS))
 def test_same_name_relations_in_from(statement: str, dsn: str) -> None:
     assert namespace_answer(dsn, statement) == SAME_NAME_RELATIONS[statement]

@@ -12229,6 +12229,9 @@ fn plan_create_view(v: &pg_query::protobuf::ViewStmt) -> Result<Statement> {
     let Some(N::SelectStmt(select)) = query.node.as_ref() else {
         return Err(Error::Unsupported("a view over this statement".into()));
     };
+    // Checked here, where the tree still tells a written alias from one
+    // `schemas` added: the stored text is planned only when read.
+    joins::check_namespace_conflicts(select)?;
     let body = query.deparse().map_err(|e| Error::Parse(e.to_string()))?;
     let columns: Vec<String> = v
         .aliases

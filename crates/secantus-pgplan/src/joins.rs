@@ -488,7 +488,20 @@ impl Scope {
         let (alias, name) = match parts {
             [name] => (None, name),
             [alias, name] => (Some(alias), name),
-            [_, alias, name] => (Some(alias), name),
+            [schema, alias, name] => {
+                // `schema.t.col` names the unaliased item that IS that
+                // relation, where two items share the name `t`.
+                let base = relation_key_base(&crate::schemas::relation_key(schema, alias));
+                let hits: Vec<&ScopeCol> = self
+                    .cols
+                    .iter()
+                    .filter(|c| c.alias == base && &c.qual == alias && &c.name == name)
+                    .collect();
+                if let [one] = hits.as_slice() {
+                    return Ok(Some(one.key.clone()));
+                }
+                (Some(alias), name)
+            }
             _ => return Ok(None),
         };
         match alias {
@@ -510,6 +523,12 @@ impl Scope {
             Some(alias) => {
                 if !self.aliases.contains(alias) {
                     return Err(self.missing_entry(alias));
+                }
+                if self.aliases.iter().filter(|a| *a == alias).count() > 1 {
+                    return Err(Error::Sqlstate(
+                        "42P09",
+                        format!("table reference \"{alias}\" is ambiguous"),
+                    ));
                 }
                 let hits: Vec<&ScopeCol> = self
                     .cols
@@ -576,6 +595,11 @@ thread_local! {
     /// subquery leaf of one of these names carries its row as a column.
     static WHOLE_ROW_REFS: std::cell::RefCell<Vec<String>> =
         const { std::cell::RefCell::new(Vec::new()) };
+    /// The names two or more unaliased FROM items of different relations
+    /// share in the join being built (see `shared_names`), whose leaves are
+    /// keyed by their relation rather than by the name.
+    static SHARED_NAMES: std::cell::RefCell<Vec<String>> =
+        const { std::cell::RefCell::new(Vec::new()) };
     /// Join sources planned for the statement in flight, by placeholder name.
     static PLANNED_JOINS: std::cell::RefCell<Vec<(String, SubSource)>> =
         const { std::cell::RefCell::new(Vec::new()) };
@@ -623,17 +647,30 @@ pub(crate) fn plan_join_source(
         None => (s, &[][..]),
     };
     // A nested join (one inside a FROM subquery) plans with its own.
-    let (mut pushdown, nonnullable, ec, placed, moved) = pushdown_filters(s, lookup);
+    let (mut pushdown, mut nonnullable, mut ec, placed, moved) = pushdown_filters(s, lookup);
     for (alias, _, c) in nullable_pushed {
         let mut c = c.clone();
         strip_qualifier(&mut c);
         pushdown.push((alias.clone(), c));
     }
+    // The pushdown, NULL-proof and equivalence analyses key a conjunct by
+    // its qualifier's name, which here names more than one leaf: the join
+    // runs without them, its WHERE over the joined rows.
+    let shared = shared_names(s);
+    let (pushdown, moved, placed) = if shared.is_empty() {
+        (pushdown, moved, placed)
+    } else {
+        nonnullable.clear();
+        ec = None;
+        (Vec::new(), Vec::new(), vec![false; placed.len()])
+    };
+    let outer_shared = SHARED_NAMES.with(|p| p.replace(shared));
     let outer_pushdown = PUSHDOWN.with(|p| p.replace(pushdown));
     let outer_nonnullable = NONNULLABLE.with(|p| p.replace(nonnullable));
     let outer_ec = EC_PLAN.with(|p| p.replace(ec));
     let outer_whole = WHOLE_ROW_REFS.with(|p| p.replace(whole_row_names(s)));
     let built = build_tree(s, lookup, params);
+    SHARED_NAMES.with(|p| *p.borrow_mut() = outer_shared);
     PUSHDOWN.with(|p| *p.borrow_mut() = outer_pushdown);
     NONNULLABLE.with(|p| *p.borrow_mut() = outer_nonnullable);
     EC_PLAN.with(|p| *p.borrow_mut() = outer_ec);
@@ -675,6 +712,152 @@ pub(crate) fn plan_join_source(
         .map(|(_, p)| *p)
         .collect();
     finish_join_source(&rest, tree, scope, params, &placed)
+}
+
+/// The names of `s`'s FROM that `checkNameSpaceConflicts` lets two items
+/// share: every item of the name an unaliased relation, no two the same
+/// relation (`select 1 from s1.t join s2.t on true`). Any other repeat is
+/// left to the 42712 the leaves raise.
+fn shared_names(s: &pg_query::protobuf::SelectStmt) -> Vec<String> {
+    // (name, the relation of an unaliased table; None for any other item)
+    fn walk(n: &pg_query::protobuf::Node, out: &mut Vec<(String, Option<String>)>) {
+        match n.node.as_ref() {
+            Some(N::RangeVar(r)) => match r.alias.as_ref() {
+                Some(a) if crate::schemas::alias_written(r) => out.push((a.aliasname.clone(), None)),
+                Some(a) => out.push((a.aliasname.clone(), Some(r.relname.clone()))),
+                None => out.push((r.relname.clone(), Some(r.relname.clone()))),
+            },
+            Some(N::JoinExpr(j)) => {
+                if let Some(l) = j.larg.as_deref() {
+                    walk(l, out);
+                }
+                if let Some(r) = j.rarg.as_deref() {
+                    walk(r, out);
+                }
+                for a in j.alias.iter().chain(j.join_using_alias.iter()) {
+                    out.push((a.aliasname.clone(), None));
+                }
+            }
+            Some(N::RangeSubselect(rs)) => {
+                if let Some(a) = rs.alias.as_ref() {
+                    out.push((a.aliasname.clone(), None));
+                }
+            }
+            Some(N::RangeFunction(rf)) => {
+                if let Some(name) = rf
+                    .alias
+                    .as_ref()
+                    .map(|a| a.aliasname.clone())
+                    .or_else(|| range_function_name(rf))
+                {
+                    out.push((name, None));
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut items = Vec::new();
+    for f in &s.from_clause {
+        walk(f, &mut items);
+    }
+    let mut shared: Vec<String> = Vec::new();
+    for (name, _) in &items {
+        if shared.contains(name) {
+            continue;
+        }
+        let same: Vec<&Option<String>> = items
+            .iter()
+            .filter(|(n, _)| n == name)
+            .map(|(_, r)| r)
+            .collect();
+        let relations: Vec<&String> = same.iter().filter_map(|r| r.as_ref()).collect();
+        let distinct = relations
+            .iter()
+            .enumerate()
+            .all(|(i, r)| !relations[..i].contains(r));
+        if same.len() > 1 && relations.len() == same.len() && distinct {
+            shared.push(name.clone());
+        }
+    }
+    shared
+}
+
+/// `checkNameSpaceConflicts` over `s`'s FROM, for a statement whose SELECT
+/// is stored rather than planned (a view): two items of one name are 42712
+/// unless both are unaliased and different relations. An aliased JOIN
+/// shows only its alias above it; inside, its items are checked as a level
+/// of their own.
+pub(crate) fn check_namespace_conflicts(s: &pg_query::protobuf::SelectStmt) -> Result<()> {
+    fn level(
+        n: &pg_query::protobuf::Node,
+        out: &mut Vec<(String, Option<String>)>,
+    ) -> Result<()> {
+        match n.node.as_ref() {
+            Some(N::RangeVar(r)) => out.push(match r.alias.as_ref() {
+                Some(a) if crate::schemas::alias_written(r) => (a.aliasname.clone(), None),
+                Some(a) => (a.aliasname.clone(), Some(r.relname.clone())),
+                None => (r.relname.clone(), Some(r.relname.clone())),
+            }),
+            Some(N::JoinExpr(j)) => {
+                let mut inner = Vec::new();
+                for side in [j.larg.as_deref(), j.rarg.as_deref()].into_iter().flatten() {
+                    level(side, &mut inner)?;
+                }
+                if let Some(u) = j.join_using_alias.as_ref() {
+                    inner.push((u.aliasname.clone(), None));
+                }
+                match j.alias.as_ref() {
+                    Some(a) => {
+                        conflicts(&inner)?;
+                        out.push((a.aliasname.clone(), None));
+                    }
+                    None => out.extend(inner),
+                }
+            }
+            Some(N::RangeSubselect(rs)) => {
+                if let Some(a) = rs.alias.as_ref() {
+                    out.push((a.aliasname.clone(), None));
+                }
+            }
+            Some(N::RangeFunction(rf)) => {
+                if let Some(name) = rf
+                    .alias
+                    .as_ref()
+                    .map(|a| a.aliasname.clone())
+                    .or_else(|| range_function_name(rf))
+                {
+                    out.push((name, None));
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+    fn conflicts(items: &[(String, Option<String>)]) -> Result<()> {
+        for (i, (name, rel)) in items.iter().enumerate() {
+            for (other, other_rel) in &items[..i] {
+                let exempt = matches!((rel, other_rel), (Some(a), Some(b)) if a != b);
+                if other == name && !exempt {
+                    return Err(Error::Sqlstate(
+                        "42712",
+                        format!("table name \"{name}\" specified more than once"),
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+    let mut items = Vec::new();
+    for f in &s.from_clause {
+        level(f, &mut items)?;
+    }
+    conflicts(&items)
+}
+
+/// The key base of an unaliased leaf of a shared name: its relation's
+/// stored key, its schema separated by a character no key splits on.
+fn relation_key_base(relation: &str) -> String {
+    relation.replace('.', "\u{1e}")
 }
 
 /// The names `s` may refer to as a whole row: a one-part column reference,
@@ -1200,17 +1383,43 @@ fn build(
             } else {
                 None
             };
-            leaf_filtered(
+            // One of several unaliased items of this name: keyed by its
+            // relation, still named by the name (`checkNameSpaceConflicts`).
+            let shared = SHARED_NAMES.with(|n| n.borrow().contains(&alias));
+            let base = if shared {
+                relation_key_base(&r.relname)
+            } else {
+                alias.clone()
+            };
+            let (node, mut scope) = leaf_filtered(
                 pg_query::protobuf::Node {
                     node: Some(N::RangeVar(rv)),
                 },
-                &alias,
+                &base,
                 &colnames,
                 lookup,
                 params,
                 aliases,
                 filter,
-            )
+            )?;
+            if shared {
+                // The namespace holds the name, as each such item's entry.
+                if let Some(a) = aliases.iter_mut().rev().find(|a| **a == base) {
+                    *a = alias.clone();
+                }
+                scope.aliases = vec![alias.clone()];
+                for c in &mut scope.cols {
+                    if c.qual == base {
+                        c.qual = alias.clone();
+                    }
+                }
+                for (a, _) in &mut scope.rows {
+                    if *a == base {
+                        *a = alias.clone();
+                    }
+                }
+            }
+            Ok((node, scope))
         }
         Some(N::RangeSubselect(rs)) => {
             // LATERAL with nothing to its left is an ordinary subquery.
@@ -2925,6 +3134,11 @@ fn apply_join_alias(
             continue;
         }
         let name = entry.strip_prefix(SEP).unwrap_or(entry);
+        // Two items sharing a name are one name to hide.
+        let marked = format!("{SEP}{name}");
+        if registry.contains(&marked) && SHARED_NAMES.with(|n| n.borrow().iter().any(|n| n == name)) {
+            continue;
+        }
         if registry
             .iter()
             .any(|e| e.strip_prefix(SEP).unwrap_or(e) == name)
@@ -5182,6 +5396,69 @@ mod tests {
             panic!("a SELECT");
         };
         *s.where_clause.clone().unwrap()
+    }
+
+    /// `sql`'s SELECT, with its relations' schemas folded into their names
+    /// as `schemas` folds them (`s1.t` -> relname `s1.t`, alias `t` added).
+    fn folded_select(sql: &str) -> pg_query::protobuf::SelectStmt {
+        let mut parsed = pg_query::parse(sql).unwrap().protobuf;
+        let Some(N::SelectStmt(s)) = parsed.stmts[0]
+            .stmt
+            .as_mut()
+            .and_then(|n| n.node.as_mut())
+        else {
+            panic!("a SELECT");
+        };
+        for f in &mut s.from_clause {
+            walk_from(f);
+        }
+        (**s).clone()
+    }
+
+    fn walk_from(n: &mut pg_query::protobuf::Node) {
+        match n.node.as_mut() {
+            Some(N::RangeVar(r)) if !r.schemaname.is_empty() => {
+                let schema = std::mem::take(&mut r.schemaname);
+                if r.alias.is_none() {
+                    r.alias = Some(pg_query::protobuf::Alias {
+                        aliasname: r.relname.clone(),
+                        colnames: Vec::new(),
+                    });
+                    r.relpersistence = "a".into();
+                }
+                r.relname = format!("{schema}.{}", r.relname);
+            }
+            Some(N::JoinExpr(j)) => {
+                for side in [j.larg.as_deref_mut(), j.rarg.as_deref_mut()].into_iter().flatten() {
+                    walk_from(side);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// RP-526: two unaliased items of one name are allowed when they are
+    /// different relations, and only then.
+    #[test]
+    fn unaliased_relations_of_one_name_share_it() {
+        let ok = folded_select("select 1 from s1.t join s2.t on true");
+        assert_eq!(shared_names(&ok), vec!["t".to_string()]);
+        assert!(check_namespace_conflicts(&ok).is_ok());
+        for sql in [
+            "select 1 from s1.t t join s2.t on true",
+            "select 1 from s1.t join s1.t on true",
+            "select 1 from s1.t, (select 1) t",
+        ] {
+            let s = folded_select(sql);
+            assert!(shared_names(&s).is_empty(), "{sql}");
+            assert!(
+                matches!(check_namespace_conflicts(&s), Err(Error::Sqlstate("42712", _))),
+                "{sql}"
+            );
+        }
+        // An aliased JOIN shows only its alias.
+        let hidden = folded_select("select 1 from (s1.t join s2.u on true) j, s3.t");
+        assert!(check_namespace_conflicts(&hidden).is_ok());
     }
 
     #[test]
