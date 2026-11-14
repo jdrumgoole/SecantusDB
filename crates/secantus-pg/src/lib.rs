@@ -50405,24 +50405,17 @@ impl PgHandler {
 /// defaults are applied first (`apply_serial_defaults`); a column with
 /// neither stays absent, which reads as NULL.
 /// A column's folded DEFAULT as a row stores it. The default is kept as
-/// written (`column_default` prints `1.25`) and takes the column's modifier
-/// on the way in: a numeric(4,1) stores `1.3`, as an inserted literal would.
+/// written (`column_default` prints `1.25`) and is coerced to the column's
+/// type and modifier on the way in, as PostgreSQL coerces it when the INSERT
+/// runs it: a numeric(4,1) stores `1.3`, and a `varchar(2)` default `'abc'`
+/// is 22001, as an inserted literal would be.
 fn typed_default(column: &Column) -> PgWireResult<Option<Bson>> {
     let Some(default) = column.default.as_ref() else {
         return Ok(None);
     };
-    Ok(Some(match (column.pg_type.as_str(), column.typmod) {
-        ("numeric" | "decimal", t) if t > 4 => {
-            match secantus_pgplan::numeric::numeric_text(default) {
-                Some(text) => secantus_pgplan::numeric::numeric_bson(
-                    &secantus_pgplan::numeric::apply_numeric_typmod(&text, t)
-                        .map_err(|e| PgHandler::err(&e))?,
-                ),
-                None => default.clone(),
-            }
-        }
-        _ => default.clone(),
-    }))
+    secantus_pgplan::fit_assigned_length(default.clone(), &column.pg_type, column.typmod)
+        .map(Some)
+        .map_err(|e| PgHandler::err(&e))
 }
 
 fn apply_column_defaults(def: &TableDef, rows: &mut [Document]) -> PgWireResult<()> {

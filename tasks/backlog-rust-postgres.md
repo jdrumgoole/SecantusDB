@@ -2541,22 +2541,8 @@ Measured on a private PostgreSQL 15.19 cluster. The gap tests are in
       Verify: tests/backlog/test_rp_found_rp881.py::test_a_regclass_literal_in_a_default_is_resolved
       Backlog-ID: RP-888
 
-## Found while working RP-886 (2026-11-12)
 
-Measured on a private, freshly initdb'd PostgreSQL 15.19 cluster.
 
-- [ ] **A folded DEFAULT skips its column's length check.** `create table
-      t (a varchar(2) default 'abc', i int)` then `insert into t (i) values
-      (1)` is 22001 `value too long for type character varying(2)` on
-      PostgreSQL 15.19, and a `char(2)` column's `default 'xyz'` is 22001
-      `... character(2)`: the default is coerced to the column's type and
-      modifier when the INSERT runs it. Here both INSERTs succeed and store
-      the overlong value (`octet_length` 3): a constant default is folded
-      to a stored value at CREATE, and the value goes into the row without
-      the length coercion a written value gets. A `numeric(3,1)` default is
-      rounded, so the modifier reaches that type.
-      Verify: tests/backlog/test_rp_found_rp886.py::test_a_folded_default_is_coerced_to_its_column
-      Backlog-ID: RP-892
 ## Found while working RP-472 (2026-11-07)
 
 - [ ] **EXPLAIN of a user function in FROM prints no Function Scan.**
