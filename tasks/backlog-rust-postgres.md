@@ -2806,6 +2806,15 @@ Measured on a private PostgreSQL 15.19 cluster with the `_SETUP` in
       PRIMARY KEY (trimmed key, as-written value kept in the row -- a
       storage-layout change), UNIQUE through `value_unique`, and an
       indexed `=` over a trimmed index key.
+      Re-read 2026-11-14 (second bundle session, no code changed): add to
+      that list the pushed-down `=` filter. `cast_value`'s comment says
+      equality "lowers to a filter against the stored value", so a
+      `where a = 'xy'` over a stored `'xy '` would miss in the MQL engine,
+      which compares strings exactly. The faithful shape is a `bpchar`
+      comparison that ignores trailing blanks in every key and filter
+      path (`bpchareq` / `bcTruelen`), not a trimmed copy of the value;
+      that is several PRs touching the stored row, so it needs its own
+      planned sequence, not a bundle slot.
       Verify: tests/backlog/test_rp_found_rp672.py::test_create_table_as_of_an_unsized_bpchar_keeps_its_blanks
       Backlog-ID: RP-693
 
