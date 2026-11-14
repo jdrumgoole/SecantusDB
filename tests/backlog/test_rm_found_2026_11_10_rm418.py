@@ -192,10 +192,10 @@ def _optimization_time(client: Any) -> bool:
     return "optimizationTimeMillis" in e["queryPlanner"]
 
 
-@pytest.mark.backlog("RM-545")
+@pytest.mark.backlog_fixed("RM-545")
 def test_find_explain_gives_optimization_time(
     rust_mongo: Any,
     mongod_rs: Any,  # noqa: F811
 ) -> None:
-    """mongod's `queryPlanner` has `optimizationTimeMillis`."""
+    """A `find` explain lacked mongod's `optimizationTimeMillis`."""
     assert _optimization_time(rust_mongo) == _optimization_time(mongod_rs)

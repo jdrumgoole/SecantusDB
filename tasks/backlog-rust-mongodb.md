@@ -2126,13 +2126,6 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       a skip and a limit. Found 2026-11-10 (RM-418).
       Verify: tests/backlog/test_rm_found_2026_11_10_rm418.py::test_sbe_find_shapes_are_explained_as_sbe
       Backlog-ID: RM-543
-- [ ] **A `find`'s `explain` gives no `optimizationTimeMillis`.** mongod
-      8.2.11's `queryPlanner` carries it (0 on a small collection) after
-      `planCacheKey`, for a `find` with or without query settings; this
-      server's lists it only for a change stream. The live comparisons
-      drop it as a timing. Found 2026-11-10 (RM-418).
-      Verify: tests/backlog/test_rm_found_2026_11_10_rm418.py::test_find_explain_gives_optimization_time
-      Backlog-ID: RM-545
 - [ ] **A `$near` key inside a VALUE is refused as a misplaced `$near`.**
       `{a: {$eq: {$near: 1}}}`, `{a: {$ne: {$nearSphere: 1}}}`, `{a: {x:
       {$near: 1}}}` and `{a: {$all: [{x: {$near: 1}}]}}` are equalities on

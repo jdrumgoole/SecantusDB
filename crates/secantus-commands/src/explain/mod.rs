@@ -910,6 +910,10 @@ fn query_planner(
             out.insert("planCacheKey", cache_key::hex(c.key.key_hash));
         }
     }
+    // mongod 8.2.11 times the planning of every explained query here
+    // (0 on a small collection), a fast count and a missing collection
+    // included.
+    out.insert("optimizationTimeMillis", 0_i32);
     if s.optimized_pipeline {
         out.insert("optimizedPipeline", true);
     }
