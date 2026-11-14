@@ -142,8 +142,9 @@ fn is_timeseries_definition(definition: &Document) -> bool {
         .is_some_and(|stage| stage.contains_key("$_internalUnpackBucket"))
 }
 
-/// `dbStats`.
-pub fn db_stats(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
+/// `dbStats`'s fields, parsed as mongod's IDL parses them: before the
+/// command's locks, so a malformed one takes none (RM-185, measured 8.2.11).
+pub fn parse_db_stats(doc: &Document) -> Result<(i64, bool), CommandError> {
     let name = doc.keys().next().map_or("dbStats", String::as_str);
     unknown_field(doc, "dbStats", &[name, "scale", "freeStorage"])?;
     let scale = scale_of(doc, "dbStats")?.unwrap_or(1);
@@ -172,6 +173,12 @@ pub fn db_stats(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
             ))
         }
     };
+    Ok((scale, free))
+}
+
+/// `dbStats`.
+pub fn db_stats(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
+    let (scale, free) = parse_db_stats(doc)?;
     let t = totals(ctx, &ctx.db_name)?;
     let scaled = |n: i64| n as f64 / scale as f64;
     let mut out = doc! {
@@ -599,8 +606,9 @@ fn bounded_size(
     Ok((size, count))
 }
 
-/// `listDatabases`.
-pub fn list_databases(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
+/// `listDatabases`'s fields, parsed as mongod's IDL parses them: before
+/// the command's locks (RM-185, measured 8.2.11). Returns `nameOnly`.
+pub fn parse_list_databases(doc: &Document) -> Result<bool, CommandError> {
     unknown_field(
         doc,
         "listDatabases",
@@ -639,6 +647,12 @@ pub fn list_databases(doc: &Document, ctx: &mut CommandContext) -> HandlerResult
             ))
         }
     }
+    Ok(name_only)
+}
+
+/// `listDatabases`.
+pub fn list_databases(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
+    let name_only = parse_list_databases(doc)?;
     if ctx.db_name != "admin" {
         return Err(err(
             13,
