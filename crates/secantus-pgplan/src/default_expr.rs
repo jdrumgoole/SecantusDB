@@ -102,7 +102,7 @@ fn call(f: &mut FuncCall) -> Result<()> {
             walk_expr(a, &mut visit)?;
         }
     }
-    if let Some(missing) = missing_call_schema(f) {
+    if let Some(missing) = refused_call_name(f) {
         return Err(missing.error());
     }
     let builtin = match f.funcname.as_slice() {

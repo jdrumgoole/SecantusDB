@@ -2437,17 +2437,24 @@ Measured on PostgreSQL 15.19 (the data-modifying WITH on a private cluster).
       42883 `function public.nosuch(integer) does not exist` at 8, the name
       as written, schema and all (`pg_catalog.nosuch()` and a user schema's
       alike). Here the message is `function nosuch(integer) does not exist`
-      and the position the bare name's, 15. Measured on a private 15.19
-      cluster.
+      and the position the bare name's, 15. The three-part form in the
+      session's database alike: `select postgres.public.nosuch()` is
+      `function postgres.public.nosuch() does not exist` at 8 there, and
+      `function nosuch() does not exist` at 24 here. Measured on a private
+      15.19 cluster.
       Verify: tests/backlog/test_rp_qualified_calls.py::test_missing_function_keeps_its_schema
       Backlog-ID: RP-879
-- [ ] **A three-part function name is looked up by its last part.** On
-      PostgreSQL 15.19 `select a.b.c()` is 0A000 `cross-database references
-      are not implemented: a.b.c` at 8 (`DeconstructQualifiedName`, the
-      catalog not the current database). Here it is 42883 `function c()
-      does not exist` at 12. Measured on a private 15.19 cluster.
-      Verify: tests/backlog/test_rp_qualified_calls.py::test_three_part_function_name
-      Backlog-ID: RP-880
+- [ ] **A function found nowhere inside another call's arguments is
+      reported as the outer call's missing overload.** On PostgreSQL 15.19
+      `select abs(nosuch1())` is 42883 `function nosuch1() does not exist`
+      at 12: `transformFuncCall` analyses the arguments before it looks
+      the outer function up. Here it is `function abs(text) does not
+      exist` at 8 -- the inner call is typed and the outer lookup fails
+      first. (A refused qualified name inside the arguments,
+      `abs(a.b.c())`, is already answered right, RP-880.) Measured on
+      PostgreSQL 15.19.
+      Verify: tests/backlog/test_rp_qualified_calls.py::test_enclosing_call_waits_for_its_arguments
+      Backlog-ID: RP-950
 - [ ] **A missing relation qualified with `pg_temp` is named by the
       session's `pg_temp_N`.** On PostgreSQL 15.19 `select * from
       pg_temp.nosuch` is 42P01 `relation "pg_temp.nosuch" does not exist`
@@ -2671,19 +2678,6 @@ and `fs(a int, c text)`.
 Measured on a private, freshly initdb'd PostgreSQL 15.19 cluster. The gap
 tests are in `tests/backlog/test_rp_found_rp546.py`.
 
-- [ ] **DROP TABLE names a table's dependants by kind, not in creation
-      order.** PostgreSQL 15.19's `findDependentObjects` reads `pg_depend`
-      in creation order, so a view made before the table whose foreign key
-      references it is named first (`view o560v depends on table o560a`,
-      then the constraint), and a cast made between two functions over the
-      row type falls between them. Here the foreign keys always come before
-      the views (`drop table` and its CASCADE notice), and since RP-546 the
-      casts follow every routine: a cast's oid is derived from its types, not
-      drawn from the oid counter as `CastCreate` draws it, so its creation
-      order is not kept. `DROP SCHEMA ... CASCADE` names a routine over a
-      member's row type in the same order as here, not PostgreSQL's.
-      Backlog-ID: RP-560
-      Verify: tests/backlog/test_rp_found_rp546.py::test_drop_table_dependants_in_creation_order
 - [ ] **DROP TYPE of a table's row type with a routine over it names the
       routines.** PostgreSQL 15.19 answers `drop type r562` with 2BP01
       `cannot drop type r562 because table r562 requires it` whatever else
@@ -2699,20 +2693,21 @@ tests are in `tests/backlog/test_rp_found_rp546.py`.
       Backlog-ID: RP-567
       Verify: tests/backlog/test_rp_found_rp546.py::test_regprocedure_quotes_as_format_procedure
 
-## Found while working RP-564 (2026-11-11)
+## Found while working RP-560 (2026-11-14)
 
 Measured on a private PostgreSQL 15.19 cluster. The gap test is in
 `tests/backlog/test_rp_found_rp546.py`.
 
-- [ ] **A DROP TABLE CASCADE of several tables sends one notice per
-      table.** PostgreSQL 15.19's `performMultipleDeletions` reports the
-      whole statement once: `drop table n564a, n564b cascade` is one
-      `drop cascades to 5 other objects`, the last table's dependants
-      first. Here each table is dropped on its own and sends its own
-      notice (`... 3 other objects`, then `... 2 other objects`). RESTRICT
-      already refuses the statement as one since RP-564.
-      Verify: tests/backlog/test_rp_found_rp546.py::test_multi_table_drop_cascade_notice
-      Backlog-ID: RP-858
+- [ ] **A cast over a type in another schema is described by the type's
+      bare or quoted key.** `getObjectDescription` of a cast is `cast from
+      %s to %s` over each type's `format_type_be`: a table `s9c.t` off the
+      search path gives `cast from s9c.t to integer` on PostgreSQL 15.19, in
+      DROP TABLE's and DROP FUNCTION's DETAIL and in the CASCADE notice, as
+      `pg_describe_object` already answers here. The DETAIL here names it
+      `cast from "t" to integer` and the notice `cast from "s9c.t" to
+      integer` (`display_cast_type` in `casts.rs`).
+      Verify: tests/backlog/test_rp_found_rp546.py::test_cast_over_a_schema_type_described_as_format_type
+      Backlog-ID: RP-951
 
 ## Found while working RP-527 (2026-11-08)
 

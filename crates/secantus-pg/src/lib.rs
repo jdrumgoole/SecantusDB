@@ -12871,8 +12871,9 @@ impl PgHandler {
     /// table (RP-137). A new constraint draws one even if it carries an oid:
     /// one copied from another table (LIKE, a partition's) carries that
     /// table's. A renamed one is not new: it carries its own oid, which
-    /// `old` holds, and keeps it as PostgreSQL's index does. Whether any
-    /// was drawn.
+    /// `old` holds, and keeps it as PostgreSQL's index does. Each new
+    /// foreign key draws its constraint's oid the same way, last. Whether
+    /// any was drawn.
     fn assign_index_oids(&self, def: &mut TableDef, old: Option<&TableDef>) -> PgWireResult<bool> {
         let mut drew = false;
         let had_pk = old.is_some_and(|o| !secantus_pgplan::ordered_pk_columns(o).is_empty());
@@ -12892,6 +12893,23 @@ impl PgHandler {
             });
             if !known {
                 def.unique_constraints[i].oid = Some(self.mint_index_oid()?);
+                drew = true;
+            }
+        }
+        // A foreign key draws its constraint's oid after them, as
+        // `CREATE TABLE` adds its foreign keys last; a partition's copy of
+        // its parent's key is a constraint of its own, with its own oid
+        // (RP-560).
+        for i in 0..def.foreign_keys.len() {
+            let name = def.foreign_keys[i].name.clone();
+            let oid = def.foreign_keys[i].oid;
+            let known = old.is_some_and(|o| {
+                o.foreign_keys
+                    .iter()
+                    .any(|f| f.name == name || (oid.is_some() && f.oid == oid))
+            });
+            if !known {
+                def.foreign_keys[i].oid = Some(self.mint_global_oids(1)?);
                 drew = true;
             }
         }
@@ -15947,24 +15965,54 @@ impl PgHandler {
         // The routines and casts over its row type come first: that type is
         // made with the table (RP-546).
         let mut row_type = self.row_type_dependents(table)?;
-        // Each view, then what names ITS row type (RP-568).
         let table_lines = row_type.lines.clone();
-        let view_lines = self.reader_lines(&views, &mut row_type)?;
         // `getRelationDescription`: qualified only when not visible.
         let shown = secantus_pgplan::schemas::relation_visible_name;
-        let objects: Vec<(String, String)> = table_lines
-            .into_iter()
-            .chain(
-                kids.iter()
-                    .map(|(k, p)| (format!("table {}", shown(k)), format!("table {}", shown(p)))),
-            )
-            .chain(fks.iter().map(|(child, fk)| {
-                (
+        // Then the table's other dependants by oid, the order they were
+        // made in (RP-560): each inheritance child (and its own children),
+        // each foreign key referencing it, each view over it (then what
+        // reads that view, and what names its row type, RP-568). A key
+        // recorded before foreign keys drew oids follows them all.
+        let mut reached: Vec<(i64, Vec<(String, String)>)> = Vec::new();
+        for (k, p) in &kids {
+            // A grandchild goes with the child of `table` it descends from.
+            let mut top = (k, p);
+            while top.1 != table {
+                match kids.iter().find(|(c, _)| c == top.1) {
+                    Some((c, cp)) => top = (c, cp),
+                    None => break,
+                }
+            }
+            reached.push((
+                self.relation_oid(top.0).unwrap_or(i64::MAX),
+                vec![(format!("table {}", shown(k)), format!("table {}", shown(p)))],
+            ));
+        }
+        for (child, fk) in &fks {
+            reached.push((
+                fk.oid.unwrap_or(i64::MAX),
+                vec![(
                     format!("constraint {} on table {}", fk.name, shown(&child.name)),
                     format!("table {}", shown(table)),
-                )
-            }))
-            .chain(view_lines)
+                )],
+            ));
+        }
+        let mut start = 0;
+        while start < views.len() {
+            let end = views[start + 1..]
+                .iter()
+                .position(|d| d.on_key == table)
+                .map_or(views.len(), |i| start + 1 + i);
+            reached.push((
+                views[start].oid,
+                self.reader_lines(&views[start..end], &mut row_type)?,
+            ));
+            start = end;
+        }
+        reached.sort_by_key(|(oid, _)| *oid);
+        let objects: Vec<(String, String)> = table_lines
+            .into_iter()
+            .chain(reached.into_iter().flat_map(|(_, lines)| lines))
             .collect();
         Ok(TableDependants {
             fks,
@@ -15975,20 +16023,23 @@ impl PgHandler {
         })
     }
 
-    /// A RESTRICT DROP TABLE naming more than one table that exists is one
-    /// `performMultipleDeletions`: `reportDependentObjects` refuses the whole
-    /// statement under `cannot drop desired object(s)`, its DETAIL reading
-    /// `targetObjects` backwards -- the last table's dependants first, and an
-    /// object two of them reach named once, under the first table that
-    /// reaches it (RP-564). One table keeps its own name in the headline,
-    /// which the drop itself reports.
-    fn refuse_multi_table_drop(&self, present: &[String], dropping: &[String]) -> PgWireResult<()> {
+    /// A DROP TABLE naming more than one table that exists is one
+    /// `performMultipleDeletions`, and `reportDependentObjects` reports the
+    /// whole statement at once, reading `targetObjects` backwards: the last
+    /// table's dependants first, and an object two of them reach named
+    /// once, under the first table that reaches it. `None` for a statement
+    /// with fewer than two such tables, whose one drop reports itself.
+    fn multi_table_dependants(
+        &self,
+        present: &[String],
+        dropping: &[String],
+    ) -> PgWireResult<Option<Vec<(String, String)>>> {
         let existing: Vec<&String> = present
             .iter()
             .filter(|t| self.lookup(t).is_some())
             .collect();
         if existing.len() < 2 {
-            return Ok(());
+            return Ok(None);
         }
         let mut lines: Vec<(String, String)> = Vec::new();
         for table in existing.into_iter().rev() {
@@ -15999,7 +16050,47 @@ impl PgHandler {
                 .collect();
             lines.extend(self.table_dependants(table, &children, dropping)?.objects);
         }
-        let lines = row_type_depends::last_reached(lines);
+        Ok(Some(row_type_depends::last_reached(lines)))
+    }
+
+    /// What depends on relation `key` (of `kind`), a member of a schema a
+    /// DROP SCHEMA takes along with the other `members`: the `(object, what
+    /// it depends on)` pairs DROP TABLE or DROP VIEW of it would name,
+    /// unsettled, so the schema's walk settles them with its own.
+    fn member_dependants(
+        &self,
+        kind: &'static str,
+        key: &str,
+        members: &[String],
+    ) -> PgWireResult<Vec<(String, String)>> {
+        match kind {
+            "table" => {
+                let children: Vec<String> = self
+                    .partitions_of(key)?
+                    .into_iter()
+                    .map(|c| c.name)
+                    .collect();
+                Ok(self.table_dependants(key, &children, members)?.objects)
+            }
+            "view" | "materialized view" => {
+                let mut row_type = self.row_type_dependents(key)?;
+                let mut lines = row_type.lines.clone();
+                let readers = self.rule_dependents(kind, key, &mut vec![key.to_string()])?;
+                lines.extend(self.reader_lines(&readers, &mut row_type)?);
+                Ok(lines)
+            }
+            _ => Ok(Vec::new()),
+        }
+    }
+
+    /// A RESTRICT DROP TABLE of several tables ([`Self::multi_table_dependants`])
+    /// refuses the whole statement under `cannot drop desired object(s)`
+    /// (RP-564). One table keeps its own name in the headline, which the
+    /// drop itself reports.
+    fn refuse_multi_table_drop(&self, present: &[String], dropping: &[String]) -> PgWireResult<()> {
+        let Some(lines) = self.multi_table_dependants(present, dropping)? else {
+            return Ok(());
+        };
         if lines.is_empty() {
             return Ok(());
         }
@@ -27642,27 +27733,17 @@ struct TableDependants {
 }
 
 /// One reader `rule_dependents` found: a view or materialized view `key`
-/// and the relation `on_key` (of `on_kind`) it depends on.
+/// (relation oid `oid`) and the relation `on_key` (of `on_kind`) it
+/// depends on.
 struct RuleDependent {
     kind: &'static str,
     key: String,
+    oid: i64,
     on_kind: &'static str,
     on_key: String,
 }
 
 impl RuleDependent {
-    /// DROP's DETAIL line, `view v depends on table t`, with each name as
-    /// `name` shows it.
-    fn line(&self, name: impl Fn(&str) -> String) -> String {
-        format!(
-            "{} {} depends on {} {}",
-            self.kind,
-            name(&self.key),
-            self.on_kind,
-            name(&self.on_key)
-        )
-    }
-
     /// The reader as a CASCADE notice names it.
     fn desc(&self, name: impl Fn(&str) -> String) -> String {
         format!("{} {}", self.kind, name(&self.key))
@@ -27834,7 +27915,7 @@ impl PgHandler {
         seen: &mut Vec<String>,
         out: &mut Vec<RuleDependent>,
     ) {
-        for (_, reader_kind, reader, definition) in readers {
+        for (oid, reader_kind, reader, definition) in readers {
             if seen.contains(reader) {
                 continue;
             }
@@ -27848,6 +27929,7 @@ impl PgHandler {
             out.push(RuleDependent {
                 kind: reader_kind,
                 key: reader.clone(),
+                oid: *oid,
                 on_kind: kind,
                 on_key: key.to_string(),
             });
@@ -42566,15 +42648,18 @@ impl PgHandler {
                         },
                     ));
                 }
-                // Each member, then what depends on it in turn, depth first:
-                // a view or materialized view elsewhere over one of its
-                // relations, and what reads that (`(description, depends-on
-                // line)`).
+                // Each member, then what depends on it in turn, as DROP TABLE
+                // or DROP VIEW of it alone would name it: what names its row
+                // type, the foreign keys and inheritance children reaching
+                // into it, the views over it, and what reads those
+                // (`(description, depends-on line)`). An object reached twice
+                // (a routine in the schema over a member's row type) is
+                // named at its last place, as `last_reached` settles it
+                // (RP-560).
                 let members: Vec<String> = held
                     .iter()
                     .flat_map(|(_, h)| h.relations.iter().map(|(_, k)| k.clone()))
                     .collect();
-                let mut seen: Vec<String> = members.clone();
                 let mut tree: Vec<(String, String)> = Vec::new();
                 for (name, h) in &held {
                     for d in &h.descs {
@@ -42582,13 +42667,18 @@ impl PgHandler {
                         if let Some((kind, key)) =
                             h.relations.iter().find(|(k, r)| format!("{k} {r}") == *d)
                         {
-                            let shown = secantus_pgplan::schemas::visible_name;
-                            for dep in self.rule_dependents(kind, key, &mut seen)? {
-                                tree.push((dep.desc(shown), dep.line(shown)));
-                            }
+                            tree.extend(
+                                self.member_dependants(kind, key, &members)?
+                                    .into_iter()
+                                    .map(|(o, on)| {
+                                        let line = format!("{o} depends on {on}");
+                                        (o, line)
+                                    }),
+                            );
                         }
                     }
                 }
+                let tree = row_type_depends::last_reached(tree);
                 let depends: Vec<String> = tree.iter().map(|(_, l)| l.clone()).collect();
                 if !depends.is_empty() && !cascade {
                     let message = match present.as_slice() {
@@ -42604,10 +42694,12 @@ impl PgHandler {
                         Some("Use DROP ... CASCADE to drop the dependent objects too.".into());
                     return Err(PgWireError::UserError(Box::new(info)));
                 }
-                let mut descs: Vec<String> = tree.iter().map(|(d, _)| d.clone()).collect();
-                // The members' own drops reach further -- a view in another
-                // schema over a table in this one -- and PostgreSQL names
-                // those in the same notice, after the members.
+                let descs: Vec<String> = tree.iter().map(|(d, _)| d.clone()).collect();
+                // The members' own drops name what they reach in notices of
+                // their own; the walk above has already named everything
+                // PostgreSQL reports, and a foreign key between two members
+                // is not among it (an object its table's drop also reaches
+                // automatically is not reported), so theirs are held back.
                 let set_capture = |v: Option<Vec<String>>| {
                     std::mem::replace(
                         &mut *self
@@ -42621,13 +42713,8 @@ impl PgHandler {
                 let dropped: PgWireResult<()> = held
                     .iter()
                     .try_for_each(|(_, h)| self.drop_schema_relations(&h.relations));
-                let reached = set_capture(outer).unwrap_or_default();
+                set_capture(outer);
                 dropped?;
-                for d in reached {
-                    if !descs.contains(&d) {
-                        descs.push(d);
-                    }
-                }
                 self.cascade_notice(&descs);
                 for (_, h) in &held {
                     for f in &h.routines {
@@ -45622,8 +45709,15 @@ impl PgHandler {
                     drop_kind::RelKind::Table
                 };
                 let present = self.check_drop_kinds(&drop.tables, right, drop.if_exists)?;
+                // A CASCADE of several tables is one notice for the whole
+                // statement, sent before any of them goes (RP-858).
+                let mut noticed = false;
                 if !drop.cascade {
                     self.refuse_multi_table_drop(&present, &drop.tables)?;
+                } else if let Some(lines) = self.multi_table_dependants(&present, &drop.tables)? {
+                    let descs: Vec<String> = lines.into_iter().map(|(o, _)| o).collect();
+                    self.cascade_notice(&descs);
+                    noticed = true;
                 }
                 for table in &present {
                     // `heap_drop_with_catalog`: as a TRUNCATE does.
@@ -45682,8 +45776,11 @@ impl PgHandler {
                                 );
                                 return Err(PgWireError::UserError(Box::new(info)));
                             }
-                            let descs: Vec<String> = objects.into_iter().map(|(o, _)| o).collect();
-                            self.cascade_notice(&descs);
+                            if !noticed {
+                                let descs: Vec<String> =
+                                    objects.into_iter().map(|(o, _)| o).collect();
+                                self.cascade_notice(&descs);
+                            }
                             self.drop_row_type_dependents(&row_type)?;
                             for (child, fk) in &fks {
                                 let mut def =

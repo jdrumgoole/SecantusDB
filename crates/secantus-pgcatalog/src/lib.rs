@@ -480,6 +480,11 @@ pub struct ForeignKey {
     pub match_full: bool,
     /// `COMMENT ON CONSTRAINT`, shared with the Python server.
     pub comment: Option<String>,
+    /// The oid `CreateConstraintEntry` drew for it from PostgreSQL's one
+    /// counter, so its place in creation order among what depends on the
+    /// referenced table (RP-560). `None` for a key recorded before foreign
+    /// keys drew oids. Recorded only when set.
+    pub oid: Option<i64>,
 }
 
 impl CheckConstraint {
@@ -521,6 +526,9 @@ impl ForeignKey {
         if self.match_full {
             d.insert("match_full", true);
         }
+        if let Some(oid) = self.oid {
+            d.insert("oid", oid);
+        }
         d
     }
 
@@ -545,6 +553,7 @@ impl ForeignKey {
             initially_deferred: d.get_bool("initially_deferred").unwrap_or(false),
             match_full: d.get_bool("match_full").unwrap_or(false),
             comment: d.get_str("comment").ok().map(str::to_string),
+            oid: d.get_i64("oid").ok(),
         })
     }
 }

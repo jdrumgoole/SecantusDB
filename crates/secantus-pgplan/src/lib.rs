@@ -4896,13 +4896,11 @@ fn parse_one(sql: &str) -> Result<N> {
 
 /// The type names a statement writes: a cast's, a column's, and any the
 /// walk reaches on its own (it does not descend into the first two). And,
-/// from the same walk, the first call (by position) qualified with a
-/// schema that does not exist.
-fn statement_type_names(
-    node: &N,
-) -> (Vec<pg_query::protobuf::TypeName>, Option<MissingCallSchema>) {
+/// from the same walk, the first call (by position) whose qualified name
+/// is refused ([`refused_call_name`]).
+fn statement_type_names(node: &N) -> (Vec<pg_query::protobuf::TypeName>, Option<RefusedCallName>) {
     let mut out = Vec::new();
-    let mut call: Option<MissingCallSchema> = None;
+    let mut call: Option<RefusedCallName> = None;
     let columns = |elts: &[pg_query::protobuf::Node],
                    out: &mut Vec<pg_query::protobuf::TypeName>| {
         for e in elts {
@@ -4924,8 +4922,15 @@ fn statement_type_names(
         }
         _ => {}
     }
-    // pg_query's walk does not descend into a VALUES list's rows: each
-    // row's expressions are walked as roots of their own.
+    // pg_query's walk does not descend into a VALUES list's rows, nor into
+    // a call's FILTER, ORDER BY (WITHIN GROUP's too) or OVER, nor a named
+    // WINDOW: each of those expressions is walked as a root of its own.
+    fn window(w: &pg_query::protobuf::WindowDef) -> impl Iterator<Item = &N> {
+        w.partition_clause
+            .iter()
+            .chain(&w.order_clause)
+            .filter_map(|n| n.node.as_ref())
+    }
     let mut roots = vec![node];
     while let Some(root) = roots.pop() {
         for (n, _, _, _) in root.nodes() {
@@ -4934,13 +4939,23 @@ fn statement_type_names(
                 pg_query::NodeRef::TypeCast(tc) => out.extend(tc.type_name.clone()),
                 pg_query::NodeRef::ColumnDef(cd) => out.extend(cd.type_name.clone()),
                 pg_query::NodeRef::FuncCall(f) => {
-                    if let Some(missing) = missing_call_schema(f) {
+                    if let Some(missing) = refused_call_name(f) {
                         if call.as_ref().is_none_or(|c| f.location < c.location) {
                             call = Some(missing);
                         }
                     }
+                    roots.extend(f.agg_filter.as_deref().and_then(|n| n.node.as_ref()));
+                    roots.extend(f.agg_order.iter().filter_map(|n| n.node.as_ref()));
+                    if let Some(w) = f.over.as_deref() {
+                        roots.extend(window(w));
+                    }
                 }
                 pg_query::NodeRef::SelectStmt(sel) => {
+                    for w in &sel.window_clause {
+                        if let Some(N::WindowDef(w)) = w.node.as_ref() {
+                            roots.extend(window(w));
+                        }
+                    }
                     for row in &sel.values_lists {
                         match row.node.as_ref() {
                             Some(N::List(l)) => {
@@ -4958,60 +4973,87 @@ fn statement_type_names(
     (out, call)
 }
 
-/// The schema a `schema.function(...)` call names, when it does not exist.
-/// PostgreSQL looks the schema up before any function
-/// (`FuncnameGetCandidates` -> `LookupExplicitNamespace`), so a missing one
-/// is 3F000, not 42883 -- and a built-in is not found through it either.
-/// `pg_temp` exists once the session has made a temporary object. A
-/// three-part name is left to the lookup.
-fn missing_call_schema(f: &pg_query::protobuf::FuncCall) -> Option<MissingCallSchema> {
-    let [schema, name] = f.funcname.as_slice() else {
-        return None;
+/// What a qualified call's name is refused for before any function is
+/// looked for. PostgreSQL splits the name first (`FuncnameGetCandidates` ->
+/// `DeconstructQualifiedName`): a catalog other than the session's database
+/// is 0A000 and four or more parts 42601, each naming the whole name. Then
+/// it looks the schema up (`LookupExplicitNamespace`), so a missing one is
+/// 3F000, not 42883 -- and a built-in is not found through it either.
+/// `pg_temp` exists once the session has made a temporary object.
+fn refused_call_name(f: &pg_query::protobuf::FuncCall) -> Option<RefusedCallName> {
+    let parts: Option<Vec<&str>> = f
+        .funcname
+        .iter()
+        .map(|p| match p.node.as_ref() {
+            Some(N::String(s)) => Some(s.sval.as_str()),
+            _ => None,
+        })
+        .collect();
+    let parts = parts?;
+    let refused = |refusal| RefusedCallName {
+        location: f.location,
+        refusal,
+        function: parts.last().map(|s| s.to_string()).unwrap_or_default(),
     };
-    let (Some(N::String(s)), Some(N::String(name))) = (schema.node.as_ref(), name.node.as_ref())
-    else {
-        return None;
+    // `NameListToString`: the parts joined by dots, none quoted.
+    let written = || parts.join(".");
+    let schema = match parts.as_slice() {
+        [_] => return None,
+        [schema, _] => *schema,
+        [catalog, schema, _] => {
+            if *catalog != session_database() {
+                return Some(refused(CallNameRefusal::CrossDatabase(written())));
+            }
+            *schema
+        }
+        _ => return Some(refused(CallNameRefusal::TooManyDots(written()))),
     };
-    let schema = s.sval.as_str();
     let exists = if schema == "pg_temp" {
         schemas::temp_schema_in_use().is_some()
     } else {
         // A session's `pg_temp_N` is left to the lookup, as before.
         schema.starts_with("pg_temp_") || schemas::schema_exists(schema)
     };
-    (!exists).then(|| MissingCallSchema {
-        location: f.location,
-        schema: schema.to_string(),
-        function: name.sval.clone(),
-    })
+    (!exists).then(|| refused(CallNameRefusal::MissingSchema(schema.to_string())))
 }
 
-/// A call qualified with a schema that does not exist.
-struct MissingCallSchema {
+/// A call whose qualified name PostgreSQL refuses before it looks for the
+/// function.
+struct RefusedCallName {
     location: i32,
-    schema: String,
+    refusal: CallNameRefusal,
     /// The function's own name, as written.
     function: String,
 }
 
+/// Why a call's name is refused, each carrying what its message names.
+enum CallNameRefusal {
+    /// `db.schema.f()` with `db` not the session's database: the whole name.
+    CrossDatabase(String),
+    /// `a.b.c.f()`: the whole name.
+    TooManyDots(String),
+    /// A schema that does not exist.
+    MissingSchema(String),
+}
+
 thread_local! {
-    /// The first call of the statement a client sent whose schema does not
-    /// exist, for [`answer_missing_call_schema`]:
+    /// The first call of the statement a client sent whose qualified name
+    /// is refused, for [`answer_refused_call_name`]:
     /// cleared before that statement is parsed, and kept against the
     /// snippets its rewrites parse after it.
-    static MISSING_CALL_SCHEMA: std::cell::RefCell<Option<MissingCallSchema>> =
+    static REFUSED_CALL_NAME: std::cell::RefCell<Option<RefusedCallName>> =
         const { std::cell::RefCell::new(None) };
 }
 
 /// A qualified type name's schema must exist: `1::nosuch.t` is 3F000 at the
-/// type name, before anything looks for the type (15.19). A call's missing
-/// schema is recorded, not raised: PostgreSQL reaches it only when it
+/// type name, before anything looks for the type (15.19). A call's refused
+/// name is recorded, not raised: PostgreSQL reaches it only when it
 /// analyses the call, after the FROM clause, the call's arguments and the
 /// target entries before it.
 fn check_type_schemas(node: &N) -> Result<()> {
     let (types, call) = statement_type_names(node);
     if let Some(call) = call {
-        MISSING_CALL_SCHEMA.with(|m| {
+        REFUSED_CALL_NAME.with(|m| {
             m.borrow_mut().get_or_insert(call);
         });
     }
@@ -5039,25 +5081,26 @@ fn check_type_schemas(node: &N) -> Result<()> {
     Ok(())
 }
 
-/// The missing-schema call [`check_type_schemas`] found in the statement
-/// just parsed, taken.
-fn take_missing_call_schema() -> Option<MissingCallSchema> {
-    MISSING_CALL_SCHEMA.with(|m| m.borrow_mut().take())
+/// The refused call [`check_type_schemas`] found in the statement just
+/// parsed, taken.
+fn take_refused_call_name() -> Option<RefusedCallName> {
+    REFUSED_CALL_NAME.with(|m| m.borrow_mut().take())
 }
 
-/// Plan a statement holding a call in a schema that does not exist, and
+/// Plan a statement holding a call whose qualified name is refused, and
 /// answer as PostgreSQL does: an analysis error it meets first (a missing
 /// column or relation, a type mismatch, in the FROM clause, the call's
 /// arguments or an earlier target) stands, and so does another function
-/// found nowhere, written before the call. This call found nowhere, a
+/// found nowhere, written before the call and not holding it in its
+/// arguments. This call found nowhere, a
 /// refusal (0A000), a data error from folding a constant -- all of which
 /// PostgreSQL meets after analysis, or never -- or the plan succeeding is
-/// the schema's 3F000 at the call. Anything else (a cancel, a resource
+/// the name's refusal at the call. Anything else (a cancel, a resource
 /// limit) stands. Nothing runs while it plans: the statement never reaches
 /// the executor.
-fn answer_missing_call_schema(
+fn answer_refused_call_name(
     sql: &str,
-    missing: Option<MissingCallSchema>,
+    missing: Option<RefusedCallName>,
     plan: impl FnOnce() -> Result<Statement>,
 ) -> Result<Statement> {
     let Some(missing) = missing else {
@@ -5072,7 +5115,9 @@ fn answer_missing_call_schema(
                 if other != missing.function
                     && peek_error_location()
                         .or_else(|| first_call_location(sql, other))
-                        .is_some_and(|at| at < missing.location) =>
+                        .is_some_and(|at| {
+                            at < missing.location && !call_encloses(sql, at, missing.location)
+                        }) =>
             {
                 Err(e)
             }
@@ -5082,13 +5127,41 @@ fn answer_missing_call_schema(
     }
 }
 
-impl MissingCallSchema {
+/// Whether the call at `outer` holds the call at `inner` in its arguments,
+/// which PostgreSQL analyses before it looks the outer function up
+/// (`transformFuncCall`): `abs(a.b.c())` is the inner name's refusal, not
+/// `abs(text)` found nowhere.
+fn call_encloses(sql: &str, outer: i32, inner: i32) -> bool {
+    let Ok(tree) = parse_tree(sql) else {
+        return false;
+    };
+    tree.nodes().into_iter().any(|(n, _, _, _)| match n {
+        pg_query::NodeRef::FuncCall(f) if f.location == outer => {
+            f.args.iter().filter_map(|a| a.node.as_ref()).any(|a| {
+                a.nodes().into_iter().any(
+                    |(n, _, _, _)| matches!(n, pg_query::NodeRef::FuncCall(g) if g.location == inner),
+                )
+            })
+        }
+        _ => false,
+    })
+}
+
+impl RefusedCallName {
     fn error(&self) -> Error {
         set_error_location(self.location);
-        Error::Sqlstate(
-            "3F000",
-            format!("schema \"{}\" does not exist", self.schema),
-        )
+        match &self.refusal {
+            CallNameRefusal::CrossDatabase(name) => Error::FeatureNotSupported(format!(
+                "cross-database references are not implemented: {name}"
+            )),
+            CallNameRefusal::TooManyDots(name) => Error::Sqlstate(
+                "42601",
+                format!("improper qualified name (too many dotted names): {name}"),
+            ),
+            CallNameRefusal::MissingSchema(schema) => {
+                Error::Sqlstate("3F000", format!("schema \"{schema}\" does not exist"))
+            }
+        }
     }
 }
 
@@ -5276,7 +5349,7 @@ fn pattern_ops(node: &mut N) {
 /// search path does not reach is not found. (A stored definition -- a
 /// view's body -- keeps reading what it was created over.)
 fn parse_one_as_sent(sql: &str) -> Result<N> {
-    MISSING_CALL_SCHEMA.with(|m| *m.borrow_mut() = None);
+    REFUSED_CALL_NAME.with(|m| *m.borrow_mut() = None);
     let previous = schemas::AS_SENT.with(|f| f.replace(true));
     let out = parse_one(sql);
     schemas::AS_SENT.with(|f| f.set(previous));
@@ -5303,7 +5376,7 @@ pub fn plan_with_params(
     joins::clear_planned_joins();
     // A rewrite the parse runs may refuse the call already.
     let parsed = parse_one_as_sent(sql);
-    answer_missing_call_schema(sql, take_missing_call_schema(), || {
+    answer_refused_call_name(sql, take_refused_call_name(), || {
         let node = pg_query::protobuf::Node {
             node: Some(parsed?),
         };
@@ -5354,12 +5427,12 @@ pub fn plan_with_subqueries(
     run: SubqueryRunner<'_>,
 ) -> Result<Statement> {
     let parsed = parse_one_as_sent(sql);
-    let missing = take_missing_call_schema();
+    let missing = take_refused_call_name();
     // The statement as written, for a type error's qualified name: from the
     // memo again when one is raised, not cloned for every plan (a clone of a
     // 200,000-item IN list is a fifth of a second in which no cancel is
     // seen).
-    answer_missing_call_schema(sql, missing, || {
+    answer_refused_call_name(sql, missing, || {
         let node = pg_query::protobuf::Node {
             node: Some(parsed?),
         };
@@ -13019,6 +13092,7 @@ fn foreign_key_of(
             _ => false,
         },
         comment: None,
+        oid: None,
     })
 }
 

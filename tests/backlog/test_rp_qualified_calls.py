@@ -1,9 +1,11 @@
 """Gap tests of the qualified-name divergences found while working RP-485:
 RP-879 (a missing function in a named schema loses the schema from its
-message), RP-880 (a three-part function name is looked up by its last part),
-RP-881 (CREATE TABLE did not analyse a column's DEFAULT; fixed), RP-882 (a missing
-`pg_temp` relation is named by `pg_temp_N`) and RP-883 (the session's temp
-namespace does not follow its transactions).
+message), RP-880 (a three-part function name was looked up by its last part;
+fixed), RP-881 (CREATE TABLE did not analyse a column's DEFAULT; fixed), RP-882
+(a missing `pg_temp` relation is named by `pg_temp_N`), RP-883 (the session's
+temp namespace does not follow its transactions) and, found while working
+RP-880, RP-950 (a function found nowhere inside another call's arguments is
+reported as the outer call's missing overload).
 
 An answer is the last statement's rows, `("rowcount", n)` for a statement
 with none, or `(sqlstate, message, hint, position)` for an error, the
@@ -72,14 +74,85 @@ def test_missing_function_keeps_its_schema(query: str, dsn: str) -> None:
     assert answer(dsn, query) == MISSING_FUNCTION_IN_A_SCHEMA[query]
 
 
-@pytest.mark.backlog("RP-880")
-def test_three_part_function_name(dsn: str) -> None:
-    """A function named in another catalog is a cross-database reference."""
-    assert answer(dsn, "select a.b.c()") == (
-        "0A000",
-        "cross-database references are not implemented: a.b.c",
+def _cross_db(name: str, at: str) -> tuple[str, str, None, str]:
+    return ("0A000", f"cross-database references are not implemented: {name}", None, at)
+
+
+def _no_schema(schema: str, at: str) -> tuple[str, str, None, str]:
+    return ("3F000", f'schema "{schema}" does not exist', None, at)
+
+
+THREE_PART_FUNCTION_NAME = {
+    "select a.b.c()": _cross_db("a.b.c", "8"),
+    "select 1 + a.b.c()": _cross_db("a.b.c", "12"),
+    "select a.b.c(1::int)": _cross_db("a.b.c", "8"),
+    "select x.nosuch.f()": _cross_db("x.nosuch.f", "8"),
+    'select "POSTGRES".pg_catalog.abs(-1)': _cross_db("POSTGRES.pg_catalog.abs", "8"),
+    "select a.b.c(), nosuch1()": _cross_db("a.b.c", "8"),
+    "values (a.b.c())": _cross_db("a.b.c", "9"),
+    "select a.b.c.d()": (
+        "42601",
+        "improper qualified name (too many dotted names): a.b.c.d",
         None,
         "8",
+    ),
+    "select postgres.nosuch.f()": _no_schema("nosuch", "8"),
+    "select postgres.pg_catalog.abs(-1)": [(1,)],
+    "select Postgres.pg_catalog.abs(-1)": [(1,)],
+    # What PostgreSQL analyses first still comes first.
+    "select a.b.c(nosuchcol)": ("42703", 'column "nosuchcol" does not exist', None, "14"),
+    "select a.b.c() from nosuchtab": (
+        "42P01",
+        'relation "nosuchtab" does not exist',
+        None,
+        "21",
+    ),
+    "select nosuch1(), a.b.c()": (
+        "42883",
+        "function nosuch1() does not exist",
+        _NO_FUNCTION_HINT,
+        "8",
+    ),
+    "select x.f(), a.b.c()": _no_schema("x", "8"),
+    # A call's arguments are analysed before it is looked up.
+    "select abs(a.b.c())": _cross_db("a.b.c", "12"),
+    "select abs(nosuch.f())": _no_schema("nosuch", "12"),
+    "select nosuch1(nosuch.f())": _no_schema("nosuch", "16"),
+    # A call's FILTER, ORDER BY, WITHIN GROUP and OVER, and a named WINDOW.
+    "select count(*) filter (where a.b.c()) from pg_class": _cross_db("a.b.c", "31"),
+    "select count(*) filter (where nosuch.f()) from pg_class": _no_schema("nosuch", "31"),
+    "select count(*) filter (where abs(a.b.c()) > 0) from pg_class": _cross_db("a.b.c", "35"),
+    "select string_agg(relname, ',' order by a.b.c()) from pg_class": _cross_db("a.b.c", "41"),
+    "select percentile_cont(0.5) within group (order by a.b.c()) from pg_class": (
+        _cross_db("a.b.c", "52")
+    ),
+    "select row_number() over (partition by a.b.c()) from pg_class": _cross_db("a.b.c", "40"),
+    "select row_number() over (order by nosuch.f()) from pg_class": _no_schema("nosuch", "36"),
+    "select row_number() over w from pg_class window w as (order by a.b.c())": (
+        _cross_db("a.b.c", "64")
+    ),
+    "select count(*) filter (where 1::nosuch.t = 1) from pg_class": _no_schema("nosuch", "34"),
+}
+
+
+@pytest.mark.backlog_fixed("RP-880")
+@pytest.mark.parametrize("query", list(THREE_PART_FUNCTION_NAME))
+def test_three_part_function_name(query: str, dsn: str) -> None:
+    """A function named in another catalog was looked up by its last part;
+    it is a cross-database reference, refused before the schema is looked
+    up, wherever in the statement the call is."""
+    assert answer(dsn, query) == THREE_PART_FUNCTION_NAME[query]
+
+
+@pytest.mark.backlog("RP-950")
+def test_enclosing_call_waits_for_its_arguments(dsn: str) -> None:
+    """A function found nowhere inside another call's arguments is the
+    error, not the outer call's overload."""
+    assert answer(dsn, "select abs(nosuch1())") == (
+        "42883",
+        "function nosuch1() does not exist",
+        _NO_FUNCTION_HINT,
+        "12",
     )
 
 
