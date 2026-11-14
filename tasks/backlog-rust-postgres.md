@@ -3164,18 +3164,20 @@ Measured on PostgreSQL 15.19; none of it needs DDL. The gap tests are in
       Verify: tests/backlog/test_rp_found_rp575.py::test_vector_array_parameter
       Backlog-ID: RP-604
 
-## Found while working RP-603 (2026-11-08)
+## Found while working RP-612 (2026-11-14)
 
 Measured on PostgreSQL 15.19; none of it needs DDL. The gap tests are in
-`tests/backlog/test_rp_found_rp603.py`.
+`tests/backlog/test_rp_found_rp612.py`.
 
-- [ ] **`oidvector`'s comparison functions are refused.**
-      `btoidvectorcmp('1 2', '3')` is 1 on PostgreSQL 15.19, and
-      `oidvectorlt` .. `oidvectorne` answer as their operators; here each is
-      `function ... is not supported yet`. `cmpfn` has the B-tree support
-      functions of the byte-ordered types only.
-      Verify: tests/backlog/test_rp_found_rp603.py::test_oidvector_comparison_functions
-      Backlog-ID: RP-612
+- [ ] **`oidvector`'s hash functions and `oidvectortypes` are refused.**
+      `hashoidvector('1 2')` is 456323500 on PostgreSQL 15.19,
+      `hashoidvectorextended('1 2', 0)` 4561117610811519404 and
+      `oidvectortypes('23 25')` `integer, text`; here each is 0A000
+      `function ... is not supported yet`. The hashes are `hash_array` over
+      the oids (`hashfn` has the scalar types' hashes), and
+      `oidvectortypes` is `format_type` of each oid joined by `, `.
+      Verify: tests/backlog/test_rp_found_rp612.py::test_oidvector_hash_and_types
+      Backlog-ID: RP-957
 
 ## Found while working RP-529 (2026-11-08)
 

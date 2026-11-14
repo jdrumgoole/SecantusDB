@@ -522,6 +522,12 @@ oidgt	2	oid	oid	>
 oidle	2	oid	oid	<=
 oidlt	2	oid	oid	<
 oidne	2	oid	oid	<>
+oidvectoreq	2	oidvector	oidvector	=
+oidvectorge	2	oidvector	oidvector	>=
+oidvectorgt	2	oidvector	oidvector	>
+oidvectorle	2	oidvector	oidvector	<=
+oidvectorlt	2	oidvector	oidvector	<
+oidvectorne	2	oidvector	oidvector	<>
 on_pb	2	point	box	<@
 on_pl	2	point	line	<@
 on_ppath	2	point	path	<@

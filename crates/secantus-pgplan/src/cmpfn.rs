@@ -15,6 +15,10 @@
 //! `tsvector_cmp` / `tsquery_cmp` compare their types' storage layouts
 //! (`fts::vector_cmp` / `fts::query_cmp`, transcribed from PostgreSQL 15),
 //! and answer the sign too.
+//!
+//! `btoidvectorcmp` (`oid.c`) is not a byte comparison: the shorter vector
+//! first, by the difference of the lengths, then the first oid that differs,
+//! unsigned, as -1 / 1.
 
 use super::*;
 
@@ -107,6 +111,19 @@ fn network_cmp(a: &[u8], b: &[u8]) -> i32 {
     bitncmp(aa, ab, aa.len() * 8)
 }
 
+/// `btoidvectorcmp`: "We arbitrarily choose to sort first by vector
+/// length", answering `a->dim1 - b->dim1`, then -1 / 1 at the first oid
+/// that differs.
+fn oidvector_cmp(a: &[u32], b: &[u32]) -> i32 {
+    if a.len() != b.len() {
+        return a.len() as i32 - b.len() as i32;
+    }
+    a.iter()
+        .zip(b)
+        .find(|(x, y)| x != y)
+        .map_or(0, |(x, y)| if x > y { 1 } else { -1 })
+}
+
 /// The result type of `name` over `nargs`, when it is one of these.
 pub(crate) fn result_type(name: &str, nargs: usize) -> Option<&'static str> {
     (nargs == 2
@@ -128,6 +145,7 @@ pub(crate) fn result_type(name: &str, nargs: usize) -> Option<&'static str> {
                 | "jsonb_cmp"
                 | "tsvector_cmp"
                 | "tsquery_cmp"
+                | "btoidvectorcmp"
         ))
     .then_some("int4")
 }
@@ -182,6 +200,10 @@ pub(crate) fn call(name: &str, args: &[Bson]) -> Option<Result<Bson>> {
                 "tsquery_cmp" => crate::fts::query_cmp(
                     &crate::fts::parse_query(&text(&args[0]))?,
                     &crate::fts::parse_query(&text(&args[1]))?,
+                ),
+                "btoidvectorcmp" => oidvector_cmp(
+                    &crate::range_ops::oidvector_oids(&args[0])?,
+                    &crate::range_ops::oidvector_oids(&args[1])?,
                 ),
                 "btbpchar_pattern_cmp" => memcmp_then_length(
                     text(&args[0]).trim_end_matches(' ').as_bytes(),

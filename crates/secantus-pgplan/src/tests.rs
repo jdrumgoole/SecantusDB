@@ -8200,3 +8200,35 @@ fn a_call_name_is_deconstructed_before_its_schema_is_looked_up() {
     plan("select postgres.pg_catalog.abs(-2)", &lookup).expect("planned");
     set_session_database("");
 }
+
+/// RP-612: `btoidvectorcmp` answers the difference of the lengths when they
+/// differ, then -1 / 1 at the first oid that differs, unsigned, as `oid.c`
+/// does; NULL in, NULL out. The catalog spells the vector functions'
+/// arguments by the vector's own name, so an untyped literal is read as one.
+#[test]
+fn btoidvectorcmp_orders_by_length_then_unsigned_oid() {
+    let s = |t: &[&str]| t.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+    assert_eq!(
+        funcsig::selected_args("btoidvectorcmp", &s(&["unknown", "unknown"])),
+        Some(s(&["oidvector", "oidvector"]))
+    );
+    assert_eq!(
+        funcsig::selected_args("int2vectorout", &s(&["int2vector"])),
+        Some(s(&["int2vector"]))
+    );
+    let v = |s: &str| Bson::String(s.into());
+    for (a, b, want) in [
+        ("1 2", "3", 1),
+        ("3", "1 2 4", -2),
+        ("1 4294967295", "1 2", 1),
+        ("1 2", "1 2", 0),
+        ("", "", 0),
+    ] {
+        let got = crate::cmpfn::call("btoidvectorcmp", &[v(a), v(b)])
+            .expect("a comparison function")
+            .expect("compared");
+        assert_eq!(got, Bson::Int32(want), "btoidvectorcmp('{a}', '{b}')");
+    }
+    let null = crate::cmpfn::call("btoidvectorcmp", &[Bson::Null, v("3")]);
+    assert_eq!(null.expect("strict").expect("NULL"), Bson::Null);
+}

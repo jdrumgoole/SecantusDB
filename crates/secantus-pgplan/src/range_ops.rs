@@ -668,7 +668,7 @@ fn oidvector_keyed(oids: &[u32]) -> String {
 }
 
 /// An `oidvector`'s oids, each unsigned.
-fn oidvector_oids(v: &Bson) -> Result<Vec<u32>> {
+pub(crate) fn oidvector_oids(v: &Bson) -> Result<Vec<u32>> {
     let Bson::Array(items) = crate::cast_value(v.clone(), "oidvector")? else {
         return Err(Error::Unsupported(
             "an oidvector that is not an array".into(),
