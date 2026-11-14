@@ -2795,6 +2795,17 @@ Measured on a private PostgreSQL 15.19 cluster with the `_SETUP` in
       have to land with it, or before it behind trimmed keys (in
       `group_key_ident` at lib.rs ~2782, `join_text_hash`, and an `_id` key).
       So the first PR should be the keys, which change no answer.
+      Probed 2026-11-14 (bundle session, no code changed): an expression
+      keeps the blanks already (`octet_length('ab  '::bpchar)` is 4 here
+      as on 15.19); only the stored cell loses them, at `cast_value`'s
+      `target == "bpchar"` arm (secantus-pgplan lib.rs ~40876), which trims
+      every `bpchar` cast, sized or not. GROUP BY / DISTINCT / PARTITION BY
+      already key a `bpchar` value trimmed (`typed_ident`, RP-725) and
+      `join_text_hash` trims, so those two keys are done. What remains
+      before the write can keep blanks: the `_id` key of a `bpchar`
+      PRIMARY KEY (trimmed key, as-written value kept in the row -- a
+      storage-layout change), UNIQUE through `value_unique`, and an
+      indexed `=` over a trimmed index key.
       Verify: tests/backlog/test_rp_found_rp672.py::test_create_table_as_of_an_unsized_bpchar_keeps_its_blanks
       Backlog-ID: RP-693
 
