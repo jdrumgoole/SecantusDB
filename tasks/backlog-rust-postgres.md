@@ -1184,14 +1184,6 @@ one beside it.
       Verify: tests/backlog/test_rp_found_rp921.py::test_a_leaf_partitions_inherited_indexes_are_built
       Backlog-ID: RP-932
 
-- [ ] **OPEN — a hash index built on an empty table is shown as never
-      built.** `CREATE INDEX ... USING hash (a)` on an empty table:
-      PostgreSQL 15.19 records 6 pages (metapage, bitmap page, initial
-      buckets) and 0 tuples; `secantusd-pg` answers 0 pages and -1
-      tuples. `hash_built` builds the page model but records no size.
-      Verify: tests/backlog/test_rp_found_rp921.py::test_a_hash_index_on_an_empty_table_is_recorded_as_built
-      Backlog-ID: RP-929
-
 - [ ] **OPEN — psql's `\d` column query straight after DDL builds all of
       `pg_type` for a table of two column types.** The collation subquery
       (`tests/backlog/test_rp_catalog_latency.py`'s `COLLATION_QUERY`) over
@@ -1219,6 +1211,43 @@ one beside it.
       matches, and the bare one reaches it already qualified.
       Backlog-ID: RP-933
       Verify: tests/backlog/test_rp_found_rp923.py::test_an_index_outside_public_can_be_renamed
+
+## Found while working RP-929 (2026-11-14)
+
+Since RP-929 a hash index's build (CREATE INDEX, REINDEX, a rewrite)
+records its pages and index tuples, from the metapage model
+`hash_index.rs` keeps; TRUNCATE records 0 pages, -1 tuples. Measured on a
+private 15.19 cluster:
+
+- [ ] **OPEN — ANALYZE and VACUUM leave a hash index's size as its build
+      recorded it.** A hash index built on an empty `(a int)` table, then
+      3,000 rows: PostgreSQL 15.19's ANALYZE records 18 pages and 3,000
+      tuples, and a VACUUM after deleting 1,000 rows 18 and 2,000
+      (`hashvacuumcleanup` reports every time); `secantusd-pg` keeps the
+      build's 10 pages and 0 tuples. `btree_analyzed` and the VACUUM's
+      index pass record the B-trees only, and an unmodelled hash index
+      (`HashShape::modelled` false) keeps no metapage past its build.
+      Verify: tests/backlog/test_rp_found_rp929.py::test_analyze_and_vacuum_record_a_hash_indexs_size
+      Backlog-ID: RP-954
+
+- [ ] **OPEN — `pg_relation_size` of a hash index is 0.** Built on an
+      empty `(a int, b text)` table one is 6 pages, 49152 on PostgreSQL
+      15.19, and one split by 3,000 rows 18 pages, 147456;
+      `pg_indexes_size` of a table with two of the first is 98304.
+      `secantusd-pg` answers 0, 0 and 16384: `size_call_here` reads the
+      B-tree, GIN and GiST models and estimates any other index, where
+      the hash metapage model has the pages (`Meta::pages`).
+      Verify: tests/backlog/test_rp_found_rp929.py::test_a_hash_index_has_its_pages
+      Backlog-ID: RP-955
+
+- [ ] **OPEN — a hash index has no overflow pages.** 1,000 rows of one
+      key, all in one bucket: PostgreSQL 15.19 chains overflow pages to
+      the full bucket (`_hash_addovflpage`) and records 12 pages;
+      `secantusd-pg` records 6, the 4 buckets with the metapage and the
+      bitmap page. The metapage model counts buckets, not the tuples in
+      each; overflow needs each bucket's tuple count, moved by each split.
+      Verify: tests/backlog/test_rp_found_rp929.py::test_duplicate_hash_keys_fill_overflow_pages
+      Backlog-ID: RP-956
 
 ## Found while working RP-931 (2026-11-14)
 
