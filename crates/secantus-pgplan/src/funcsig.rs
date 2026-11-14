@@ -892,6 +892,15 @@ pub fn select_routine(cands: &[Vec<String>], args: &[String]) -> RoutineChoice {
 
 /// Whether some overload of `name` declares exactly `args` (so a call
 /// prints with no casts).
+/// The argument types of each `pg_catalog` overload of `name`: the
+/// candidates `LookupFuncWithArgs` finds among the built-ins.
+pub fn builtin_overloads(name: &str) -> Vec<Vec<String>> {
+    sigs()
+        .get(name)
+        .map(|o| o.iter().map(|s| s.args.clone()).collect())
+        .unwrap_or_default()
+}
+
 pub(crate) fn has_exact(name: &str, args: &[String]) -> bool {
     sigs().get(name).is_some_and(|o| {
         o.iter().any(|s| {

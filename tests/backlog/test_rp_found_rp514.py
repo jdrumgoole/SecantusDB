@@ -137,14 +137,21 @@ BUILTIN_ROUTINES = {
         None,
         None,
     ),
-    "comment on function abs(int) is 'x'": ("ok", None),
 }
 
 
-@pytest.mark.backlog("RP-519")
+@pytest.mark.backlog_fixed("RP-519")
 @pytest.mark.parametrize("query", list(BUILTIN_ROUTINES))
 def test_builtin_routine_resolved_by_its_overloads(query: str, dsn: str) -> None:
+    """A built-in routine was known by its name alone; it is now looked up
+    among its `pg_proc` overloads, every one a function."""
     assert answer(dsn, query) == BUILTIN_ROUTINES[query]
+
+
+@pytest.mark.backlog("RP-519")
+def test_builtin_routine_takes_a_comment(dsn: str) -> None:
+    """PostgreSQL 15.19 records `comment on function abs(int)`."""
+    assert answer(dsn, "comment on function abs(int) is 'x'") == ("ok", None)
 
 
 # A signature no routine has was reported with no position, as

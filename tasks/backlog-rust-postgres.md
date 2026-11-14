@@ -2580,20 +2580,16 @@ holding `(1, 'y')`.
 Measured on a private PostgreSQL 15.19 cluster. The gap tests are in
 `tests/backlog/test_rp_found_rp514.py`.
 
-- [ ] **A built-in routine is not looked up among its overloads or its
-      kind.** PostgreSQL 15.19 looks a built-in up in `pg_proc` like any
-      routine: `grant execute on function lower to public` and `comment on
-      function lower is 'x'` are 42725 `function name "lower" is not unique`
-      (`comment on routine abs` says `routine name`), and `grant execute on
-      procedure abs(int)` and `comment on procedure abs(int)` are 42809
-      `abs(integer) is not a procedure`. Here the bare-name GRANT succeeds,
-      the PROCEDURE forms are 42883 `procedure abs(integer) does not exist`,
-      and every COMMENT ON a built-in routine is refused as 0A000 (PostgreSQL
-      records `comment on function abs(int)`). `function_acl_key`
-      (object_acl.rs) knows a built-in only by `is_known_function(name)`:
-      the fix needs the built-in's overloads, and a place to keep a
-      built-in's comment.
-      Verify: tests/backlog/test_rp_found_rp514.py::test_builtin_routine_resolved_by_its_overloads
+- [ ] **A built-in routine takes no comment.** PostgreSQL 15.19 records
+      `comment on function abs(int) is 'x'` in `pg_description` (classoid
+      1255, the overload's `pg_proc` oid), replacing initdb's description.
+      Here every COMMENT ON a built-in routine is refused as 0A000: the
+      routine is now resolved among its overloads (`function_acl_key`), but
+      a built-in has no catalog document to hold the comment. Faithful:
+      keep it keyed by the overload's oid (from the pg_proc rows) and list
+      it in `pg_description_rows`; initdb's own built-in descriptions are
+      not served either.
+      Verify: tests/backlog/test_rp_found_rp514.py::test_builtin_routine_takes_a_comment
       Backlog-ID: RP-519
 
 ## Found while working RP-516 (2026-11-08)

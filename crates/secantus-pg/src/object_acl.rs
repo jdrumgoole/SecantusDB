@@ -525,23 +525,35 @@ impl PgHandler {
         let (name, args) = split_signature(signature);
         self.require_routine_schema(&name)?;
         let functions = self.functions()?;
-        // A built-in is a function: PROCEDURE never reaches one.
-        let builtin = kind != "procedure" && secantus_pgplan::is_known_function(&name);
+        // A built-in is looked up among its own `pg_proc` overloads, as any
+        // routine is (`LookupFuncWithArgs`; RP-519). Every one is a function.
+        let builtins = if secantus_pgplan::is_known_function(&name) {
+            secantus_pgplan::builtin_overloads(&name)
+        } else {
+            Vec::new()
+        };
+        let builtin_key = |types: &[String]| format!("{name}({})", types.join(","));
         match args {
             Some(types) => {
                 let candidates = Self::routines_named(&functions, &name);
                 if let Some(f) = candidates.iter().find(|f| f.param_types == types) {
                     return Ok(f.key.clone());
                 }
-                if candidates.is_empty() && builtin {
-                    // Keyed by the full signature, so `abs(int4)` and
-                    // `abs(numeric)` hold separate grants as in PostgreSQL.
-                    return Ok(format!("{name}({})", types.join(",")));
-                }
                 let shown: Vec<String> = types
                     .iter()
                     .map(|t| secantus_pgplan::display_type(t))
                     .collect();
+                if candidates.is_empty() && builtins.contains(&types) {
+                    if kind == "procedure" {
+                        return Err(Self::user_error(
+                            "42809",
+                            format!("{name}({}) is not a procedure", shown.join(", ")),
+                        ));
+                    }
+                    // Keyed by the full signature, so `abs(int4)` and
+                    // `abs(numeric)` hold separate grants as in PostgreSQL.
+                    return Ok(builtin_key(&types));
+                }
                 let noun = if kind == "procedure" {
                     "procedure"
                 } else {
@@ -552,11 +564,19 @@ impl PgHandler {
                     format!("{noun} {name}({}) does not exist", shown.join(", ")),
                 ))
             }
-            None => match Self::routines_of_kind(&functions, &name, kind).as_slice() {
-                [one] => Ok(one.key.clone()),
-                [] if builtin => Ok(name),
-                found => Err(Self::routine_lookup_error(kind, &name, found.len())),
-            },
+            None => {
+                let users = Self::routines_of_kind(&functions, &name, kind);
+                let builtins: &[Vec<String>] = if kind == "procedure" { &[] } else { &builtins };
+                match (users.as_slice(), builtins) {
+                    ([one], []) => Ok(one.key.clone()),
+                    ([], [one]) => Ok(builtin_key(one)),
+                    _ => Err(Self::routine_lookup_error(
+                        kind,
+                        &name,
+                        users.len() + builtins.len(),
+                    )),
+                }
+            }
         }
     }
 
