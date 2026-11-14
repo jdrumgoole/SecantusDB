@@ -2,8 +2,8 @@
 
 - a row comparison of zero-length rows answered instead of 0A000 (fixed:
   RP-849);
-- a row field that is an untyped literal is compared as a string, not
-  coerced to its pair's type;
+- a row field that is an untyped literal was compared as a string, not
+  coerced to its pair's type (fixed: RP-850);
 - a row comparison with a pattern operator (`~<~`) is refused.
 
 An answer is the rows and the column names, or `(sqlstate, message,
@@ -51,8 +51,8 @@ def test_zero_length_row_comparison_is_0a000(query: str, dsn: str) -> None:
 
 
 # Each pair's operator is resolved as the statement is analysed, so an
-# `unknown` literal field takes the other side's type. Here the literal is
-# compared as a string: 0A000 `comparing string with int32 ...`.
+# `unknown` literal field takes the other side's type. Here the literal was
+# compared as a string: 0A000 `comparing string with int32 ...` (RP-850).
 UNTYPED_LITERAL = {
     "select (1, '2') = (1, 2)": ([(True,)], ["?column?"]),
     "select (1, '2') < any (select 1, 3)": ([(True,)], ["?column?"]),
@@ -61,10 +61,24 @@ UNTYPED_LITERAL = {
         'invalid input syntax for type integer: "a"',
         "12",
     ),
+    "select ('2', 1) <= (2, 1)": ([(True,)], ["?column?"]),
+    "select (a, '3') > (2, b) from (values (2, 4)) v(a, b)": ([(False,)], ["?column?"]),
+    "select ('1.5', 2) < (1.6, 2)": ([(True,)], ["?column?"]),
+    "select ('t', 1) = (true, 1)": ([(True,)], ["?column?"]),
+    "select (1, '2') in ((1, 2), (3, 4))": ([(True,)], ["?column?"]),
+    "select (1, 'a') = any (select 1, 2)": (
+        "22P02",
+        'invalid input syntax for type integer: "a"',
+        "12",
+    ),
+    "explain (costs off) select 1 where (1, '2') = (1, 2)": (
+        [("Result",)],
+        ["QUERY PLAN"],
+    ),
 }
 
 
-@pytest.mark.backlog("RP-850")
+@pytest.mark.backlog_fixed("RP-850")
 @pytest.mark.parametrize("query", list(UNTYPED_LITERAL))
 def test_untyped_literal_in_a_row_takes_its_pairs_type(query: str, dsn: str) -> None:
     assert answer(dsn, query) == UNTYPED_LITERAL[query]

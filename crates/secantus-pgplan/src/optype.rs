@@ -1381,6 +1381,15 @@ fn check_aexpr(e: &pg_query::protobuf::AExpr, scope: &Scope) -> Result<()> {
                     return Err(refused);
                 }
                 row_against_non_row(&op, l, item, e.location, scope)?;
+                if let (Some(N::RowExpr(lr)), Some(N::RowExpr(ir))) =
+                    (l.node.as_ref(), item.node.as_ref())
+                {
+                    if lr.args.len() == ir.args.len() {
+                        for (a, b) in lr.args.iter().zip(&ir.args) {
+                            type_row_literal_pair(a, b, scope)?;
+                        }
+                    }
+                }
             }
         }
     }
@@ -1643,6 +1652,7 @@ fn check_aexpr(e: &pg_query::protobuf::AExpr, scope: &Scope) -> Result<()> {
         ) {
             if l.args.len() == r.args.len() {
                 for (a, b) in l.args.iter().zip(&r.args) {
+                    type_row_literal_pair(a, b, scope)?;
                     let (Some(at), Some(bt)) = (operand_type(a, scope), operand_type(b, scope))
                     else {
                         continue;
@@ -2922,6 +2932,79 @@ fn walk_other_clauses(node: &N, lookup: &dyn Fn(&str) -> Option<TableDef>) -> Re
 /// 42883 for a comparison with no operator between its operands' types.
 pub(crate) fn check(node: &N, lookup: &dyn Fn(&str) -> Option<TableDef>) -> Result<()> {
     regclass::analysing(|| check_in(node, &[], lookup))
+}
+
+thread_local! {
+    /// While `check` walks a statement: each untyped string literal of a
+    /// row comparison, by its location, and the type its pair gives it.
+    static ROW_LITERALS: std::cell::RefCell<Vec<(i32, String)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// One pair of a row comparison, its operator resolved as `make_op`
+/// resolves one: an untyped literal takes the other side's type, and must
+/// read as it, at the literal (RP-850).
+fn type_row_literal_pair(
+    a: &pg_query::protobuf::Node,
+    b: &pg_query::protobuf::Node,
+    scope: &Scope,
+) -> Result<()> {
+    for (lit, other) in [(a, b), (b, a)] {
+        if !is_untyped_literal(lit) || is_untyped_literal(other) {
+            continue;
+        }
+        if let Some(t) = operand_type(other, scope).filter(|t| category(t).is_some()) {
+            literal_fits(lit, &t)?;
+            record_row_literal(lit, &t);
+        }
+    }
+    Ok(())
+}
+
+fn record_row_literal(n: &pg_query::protobuf::Node, ty: &str) {
+    if let Some(N::AConst(c)) = n.node.as_ref() {
+        if !c.isnull && c.location >= 0 {
+            ROW_LITERALS.with(|r| r.borrow_mut().push((c.location, ty.to_string())));
+        }
+    }
+}
+
+/// `check`, then each untyped string literal it found in a row comparison
+/// cast to the type its pair resolved it to: `(1, '2') = (1, 2)` compares
+/// `'2'::int4` with `2`, as `make_row_comparison_op`'s per-pair `make_op`
+/// coerces it (RP-850). Without it the literal reached the record
+/// comparison as a string.
+pub(crate) fn check_and_type_row_literals(
+    node: &mut N,
+    lookup: &dyn Fn(&str) -> Option<TableDef>,
+) -> Result<()> {
+    ROW_LITERALS.with(|r| r.borrow_mut().clear());
+    let checked = check(node, lookup);
+    let found = ROW_LITERALS.with(|r| std::mem::take(&mut *r.borrow_mut()));
+    checked?;
+    if found.is_empty() {
+        return Ok(());
+    }
+    // SAFETY: the pointers `nodes_mut` hands out point into `node`, which
+    // outlives this loop; each RowExpr's own args are replaced in place and
+    // nothing else is touched while they are used.
+    unsafe {
+        for (n, _, _) in node.nodes_mut() {
+            let pg_query::NodeMut::RowExpr(row) = n else {
+                continue;
+            };
+            for arg in (*row).args.iter_mut() {
+                let Some(N::AConst(c)) = arg.node.as_ref() else {
+                    continue;
+                };
+                let Some((_, ty)) = found.iter().find(|(l, _)| *l == c.location) else {
+                    continue;
+                };
+                cast_untyped_literal(arg, ty);
+            }
+        }
+    }
+    Ok(())
 }
 
 /// A CHECK constraint's expression over the table `name` (`def`), as

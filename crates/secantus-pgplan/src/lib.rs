@@ -5815,10 +5815,12 @@ fn plan_with_subqueries_parsed(
 /// The refusals PostgreSQL makes at parse analysis, before anything is
 /// planned: an untyped value (42P18 / 42804), an operator with no overload
 /// for its operands' types (42883) and an ambiguous ORDER BY name (42702).
-fn analysis_refusals(inner: &N, lookup: &dyn Fn(&str) -> Option<TableDef>) -> Result<()> {
+/// A row comparison's untyped literals are cast to the types their pairs
+/// resolve them to as it goes (RP-850).
+fn analysis_refusals(inner: &mut N, lookup: &dyn Fn(&str) -> Option<TableDef>) -> Result<()> {
     func_cast::refuse_unresolved(inner)?;
     cancel::check()?;
-    optype::check(inner, lookup)?;
+    optype::check_and_type_row_literals(inner, lookup)?;
     cancel::check()?;
     if let N::SelectStmt(sel) = inner {
         order_by_ambiguity(sel)?;
@@ -5860,7 +5862,7 @@ fn plan_query_node(
         return Ok(st);
     }
     cancel::check()?;
-    if let Some(inner) = node.node.as_ref() {
+    if let Some(inner) = node.node.as_mut() {
         analysis_refusals(inner, lookup)?;
     }
     cancel::check()?;
@@ -11978,7 +11980,8 @@ fn plan_explain(
     // reads a single option, so a statement PostgreSQL refuses is refused
     // under every EXPLAIN form, ANALYZE included, ahead of an option's own
     // error (RP-419).
-    if let Some(q) = e.query.as_deref().and_then(|q| q.node.as_ref()) {
+    let mut analysed = e.query.as_deref().and_then(|q| q.node.clone());
+    if let Some(q) = analysed.as_mut() {
         analysis_refusals(q, lookup)?;
     }
     let mut options = ExplainOptions {
@@ -12066,11 +12069,7 @@ fn plan_explain(
     }
     options.timing = options.analyze && timing.unwrap_or(true);
     options.summary = summary.unwrap_or(options.analyze);
-    let mut query = e
-        .query
-        .as_deref()
-        .and_then(|q| q.node.clone())
-        .ok_or_else(|| Error::Parse("EXPLAIN without a statement".into()))?;
+    let mut query = analysed.ok_or_else(|| Error::Parse("EXPLAIN without a statement".into()))?;
     // The WHERE's constants are simplified before anything is planned
     // (`eval_const_expressions`, `canonicalize_qual`; RP-409).
     options.dummy_relation = const_quals::simplify_statement(&mut query, lookup)?;
@@ -25542,6 +25541,27 @@ fn length_typmods(base: &str, typmod: i32) -> Vec<pg_query::protobuf::Node> {
         .collect()
 }
 
+/// An untyped string literal cast to `ty`, the cast at the literal so its
+/// input error is reported there (`'a'::int4` is 22P02 at the `'a'`).
+pub(crate) fn cast_untyped_literal(n: &mut pg_query::protobuf::Node, ty: &str) {
+    let Some(N::AConst(c)) = n.node.as_ref() else {
+        return;
+    };
+    if c.isnull || !matches!(c.val, Some(pg_query::protobuf::a_const::Val::Sval(_))) {
+        return;
+    }
+    let mut type_name = type_name_node(ty);
+    type_name.location = c.location;
+    let lit = std::mem::take(n);
+    *n = pg_query::protobuf::Node {
+        node: Some(N::TypeCast(Box::new(pg_query::protobuf::TypeCast {
+            arg: Some(Box::new(lit)),
+            type_name: Some(type_name),
+            location: -1,
+        }))),
+    };
+}
+
 /// A `TypeName` for an internal type name (`int4`, `text[]`).
 fn type_name_node(ty: &str) -> pg_query::protobuf::TypeName {
     let (base, array) = match ty.strip_suffix("[]") {
@@ -26256,6 +26276,15 @@ fn row_subquery_comparison(
             }));
         }
     }
+    // An untyped literal field takes its column's type, as each pair's
+    // `make_op` coerces it (RP-850).
+    let mut row = row.clone();
+    if let Some(types) = types {
+        for (arg, t) in row.args.iter_mut().zip(types) {
+            cast_untyped_literal(arg, t);
+        }
+    }
+    let row = &row;
     // `IN` over hashable equalities is a hashed SubPlan, as PostgreSQL
     // plans it when the rows fit in its hash memory (`hashed_subplan`).
     if any && op == "=" {

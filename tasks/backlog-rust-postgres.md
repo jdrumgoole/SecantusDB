@@ -3778,16 +3778,6 @@ Measured on PostgreSQL 15.19 (the shared reference on port 5415): every
 statement is VALUES-only and runs there as written. The gap tests are in
 `tests/backlog/test_rp_found_rp727.py`.
 
-- [ ] **A row field that is an untyped literal is not coerced to its
-      pair's type.** `select (1, '2') = (1, 2)` and `(1, '2') < any
-      (select 1, 3)` are `t` on PostgreSQL 15.19: each pair's operator is
-      resolved as the statement is analysed, and the `unknown` literal
-      takes the other side's type. `(1, 'a') < (1, 2)` is then 22P02
-      `invalid input syntax for type integer: "a"` at 12. Here each is
-      0A000 `comparing string with int32 using ... is not supported yet`,
-      with no position: the literal is compared as a string.
-      Verify: tests/backlog/test_rp_found_rp727.py::test_untyped_literal_in_a_row_takes_its_pairs_type
-      Backlog-ID: RP-850
 - [ ] **A row comparison with a pattern operator is refused.** `select
       ('a', 'b') ~<~ ('a', 'c')` and `('a', 'b') ~<~ any (select 'a', 'c')`
       are `t` on PostgreSQL 15.19: `~<~` is a btree operator (of
