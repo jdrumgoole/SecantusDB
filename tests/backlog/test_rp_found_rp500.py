@@ -1,7 +1,7 @@
 """Gap tests of the divergences found while working RP-500 (CREATE FUNCTION
 checks a SQL body's constants, CALLs and result type): RP-507 (a constant
 an operator over a column or a parameter, an INSERT or UPDATE target or a
-COALESCE gives its type is not read at CREATE), RP-508 (DROP FUNCTION /
+COALESCE gives its type was not read at CREATE, fixed), RP-508 (DROP FUNCTION /
 PROCEDURE without arguments over the other kind, and DROP ROUTINE's
 notice), RP-509 (a CALL that leaves a defaulted parameter out, names its
 arguments, or passes a column), RP-510 (a malformed range literal had no DETAIL, fixed)
@@ -97,9 +97,10 @@ def _input(value: str, position: str) -> tuple[Any, ...]:
 
 _GX = "create function gx(p int) returns {} language sql as $$ {} $$"
 
-# RP-507: `transformExpr` coerces each of these constants to the type the
-# operator, the target column or COALESCE's other argument gives it, and
-# its input function refuses the text, at CREATE.
+# RP-507 (fixed): `transformExpr` coerces each of these constants to the
+# type the operator, the target column or COALESCE's other argument gives
+# it, and its input function refused the text, at CREATE, where this server
+# read only a cast's constant.
 OPERAND_CONSTANT_READ_AT_CREATE = {
     _GX.format("int", "select p + 'a'"): _input("a", "69"),
     _GX.format("int", "select a + 'q' from fe"): _input("q", "69"),
@@ -109,7 +110,7 @@ OPERAND_CONSTANT_READ_AT_CREATE = {
 }
 
 
-@pytest.mark.backlog("RP-507")
+@pytest.mark.backlog_fixed("RP-507")
 @pytest.mark.parametrize("query", list(OPERAND_CONSTANT_READ_AT_CREATE))
 def test_operand_constant_read_at_create(query: str, dsn: str) -> None:
     assert answer(dsn, query) == OPERAND_CONSTANT_READ_AT_CREATE[query]

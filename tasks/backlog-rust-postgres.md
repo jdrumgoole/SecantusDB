@@ -3227,21 +3227,6 @@ Measured on a private PostgreSQL 15.19 cluster with `fs(a int, c text)`,
 
 Measured on a private PostgreSQL 15.19 cluster with `fe(a int, b text)`.
 
-- [ ] **A string constant an operator over a column or a parameter, an
-      INSERT or UPDATE target, or COALESCE gives its type is not read at
-      CREATE.** PostgreSQL 15.19 coerces each while it analyses a SQL
-      function's body (`transformExpr`, `coerce_type`), so `create function
-      gx(p int) returns int language sql as $$ select p + 'a' $$` is 22P02
-      `invalid input syntax for type integer: "a"` at 69, and so are `select
-      a + 'q' from fe` (69), `insert into fe values ('q')` (82), `update fe
-      set a = 'q'` (77) and `select coalesce('q', 1)` (74). Here each CREATE
-      succeeds. Since RP-500 a cast's constant is read at CREATE, and an
-      operator's operand only where planning folds the comparison (`'a' =
-      1`, `a = 'q'` in a WHERE): the rest needs each constant's resolved
-      type from the analysis, which the planner does not keep. PREPARE has
-      the same shape (RP-511).
-      Backlog-ID: RP-507
-      Verify: tests/backlog/test_rp_found_rp500.py::test_operand_constant_read_at_create
 - [ ] **PREPARE evaluates a constant expression, and does not read a cast
       constant it does not evaluate.** PostgreSQL 15.19's PREPARE
       parse-analyses its statement and plans nothing: `prepare s1 as select

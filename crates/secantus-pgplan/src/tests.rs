@@ -8271,3 +8271,34 @@ fn an_input_functions_out_of_range_error_is_at_its_literal() {
         None
     );
 }
+
+/// An unknown parameter takes the type of a declared parameter, a cast or
+/// a numeric constant beside it, and COALESCE's typed argument (RP-507).
+#[test]
+fn an_unknown_parameter_takes_its_typed_operands_type() {
+    let none = |_: &str, _: ColumnRef<'_>| -> Option<String> { None };
+    let got =
+        |sql: &str, declared: &[Option<String>]| catalog_param_types_opt(sql, declared, &none);
+    assert_eq!(
+        got("select $1 + $2", &[Some("integer".into()), None])[1].as_deref(),
+        Some("integer")
+    );
+    assert_eq!(got("select $1 = 1", &[None])[0].as_deref(), Some("integer"));
+    assert_eq!(
+        got("select $1 = 3000000000", &[None])[0].as_deref(),
+        Some("bigint")
+    );
+    assert_eq!(
+        got("select $1 = 1.5", &[None])[0].as_deref(),
+        Some("numeric")
+    );
+    assert_eq!(
+        got("select coalesce($1, 1)", &[None])[0].as_deref(),
+        Some("integer")
+    );
+    assert_eq!(
+        got("select $1::int4 + $2", &[None, None])[1].as_deref(),
+        Some("int4")
+    );
+    assert_eq!(got("select $1 || 'x'", &[None])[0], None);
+}

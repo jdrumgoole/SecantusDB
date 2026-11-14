@@ -42151,6 +42151,58 @@ pub fn catalog_param_types_opt(
                             *slot = named_column_type(c);
                         }
                     }
+                    // An operand of a known type gives an unknown one its
+                    // type (`oper_select_candidate` assumes an unknown input
+                    // is of the other input's type): a declared parameter,
+                    // or a numeric constant (`$1 = 1` is an integer).
+                    for (this, other) in [(l, r), (r, l)] {
+                        let Some(N::ParamRef(p)) = this else {
+                            continue;
+                        };
+                        let Some(i) = usize::try_from(p.number)
+                            .ok()
+                            .and_then(|n| n.checked_sub(1))
+                        else {
+                            continue;
+                        };
+                        let other_type = match other {
+                            Some(N::ParamRef(q)) => usize::try_from(q.number)
+                                .ok()
+                                .and_then(|n| n.checked_sub(1))
+                                .and_then(|j| padded.get(j).cloned().flatten()),
+                            Some(N::AConst(c)) => numeric_const_type(c),
+                            Some(N::TypeCast(tc)) => tc.type_name.as_ref().map(type_name_of),
+                            _ => None,
+                        };
+                        if let (Some(slot @ None), Some(t)) = (inferred.get_mut(i), other_type) {
+                            *slot = Some(t);
+                        }
+                    }
+                }
+                // COALESCE's unknown arguments take the type
+                // `select_common_type` picks from its typed ones: the first
+                // one's, where the only others are unknown.
+                pg_query::NodeRef::CoalesceExpr(ce) => {
+                    let typed = ce.args.iter().find_map(|a| match a.node.as_ref() {
+                        Some(N::ParamRef(q)) => usize::try_from(q.number)
+                            .ok()
+                            .and_then(|n| n.checked_sub(1))
+                            .and_then(|j| padded.get(j).cloned().flatten()),
+                        Some(N::AConst(c)) => numeric_const_type(c),
+                        Some(N::ColumnRef(c)) => named_column_type(c),
+                        Some(N::TypeCast(tc)) => tc.type_name.as_ref().map(type_name_of),
+                        _ => None,
+                    });
+                    let Some(t) = typed else {
+                        continue;
+                    };
+                    for a in &ce.args {
+                        if let Some(i) = param_index(a) {
+                            if let Some(slot @ None) = inferred.get_mut(i) {
+                                *slot = Some(t.clone());
+                            }
+                        }
+                    }
                 }
                 pg_query::NodeRef::UpdateStmt(u) => {
                     let table = u
@@ -42228,6 +42280,24 @@ pub fn catalog_param_types_opt(
         }
     }
     inferred
+}
+
+/// The type a numeric constant has (`make_const`): `integer` within int4,
+/// `bigint` within int8, else `numeric`.
+fn numeric_const_type(c: &pg_query::protobuf::AConst) -> Option<String> {
+    use pg_query::protobuf::a_const::Val;
+    match c.val.as_ref()? {
+        Val::Ival(_) => Some("integer".into()),
+        Val::Fval(f) => Some(
+            if f.fval.parse::<i64>().is_ok() {
+                "bigint"
+            } else {
+                "numeric"
+            }
+            .into(),
+        ),
+        _ => None,
+    }
 }
 
 /// The functions whose arguments are `"any"` / VARIADIC `"any"`: nothing

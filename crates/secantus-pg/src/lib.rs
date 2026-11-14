@@ -14672,6 +14672,81 @@ impl PgHandler {
     /// A SQL-standard body (`BEGIN ATOMIC`, `RETURN`) is analysed as CREATE
     /// reads it (`interpret_AS_clause`), so `check_function_bodies = off`
     /// postpones only its result check.
+    /// The input error parse analysis raises for a string constant of
+    /// `sql` (`coerce_type` over an unknown-typed `Const`), and the
+    /// constant's byte offset: each constant a cast reads (RP-500), and
+    /// each one a parameter standing in its place would be inferred to
+    /// have a type for, an operator's, a target column's or COALESCE's
+    /// (RP-507). `declared` types `sql`'s own parameters. Nothing is
+    /// evaluated but the input function.
+    pub(crate) fn constant_input_error(
+        &self,
+        sql: &str,
+        declared: &[Option<String>],
+    ) -> Option<(PgWireError, usize)> {
+        let tz = self.session_timezone();
+        let run = |stmt: &Statement| self.subquery_rows(stmt);
+        let read = |probe: &str| -> Option<PgWireError> {
+            let got = secantus_pgplan::planning_without_running(|| {
+                secantus_pgplan::plan_with_session_types_and_subqueries(
+                    probe,
+                    &|n| self.lookup(n),
+                    &[],
+                    &[],
+                    &tz,
+                    Some(&run),
+                )
+                .and_then(|p| self.subquery_rows(&p))
+            });
+            let mut err = Self::err(&got.err()?);
+            if !sql_fn_validator::is_input_error(&err) {
+                return None;
+            }
+            if let PgWireError::UserError(info) = &mut err {
+                info.position = None;
+            }
+            Some(err)
+        };
+        for (lit, probe) in sql_fn_validator::literal_casts(sql) {
+            if let Some(err) = read(&probe) {
+                return Some((err, lit.at));
+            }
+        }
+        let n = declared.len().max(secantus_pgplan::max_param_number(sql));
+        let (as_params, bare) = sql_fn_validator::bare_constants_as_params(sql, n + 1);
+        if bare.is_empty() {
+            return None;
+        }
+        let mut with_bare = declared.to_vec();
+        with_bare.resize(n + bare.len(), None);
+        let column_type = |table: &str, column: secantus_pgplan::ColumnRef<'_>| {
+            self.lookup(table).and_then(|def| {
+                let col = match column {
+                    secantus_pgplan::ColumnRef::Name(name) => def.column(name),
+                    secantus_pgplan::ColumnRef::Position(pos) => def.columns.get(pos),
+                };
+                col.map(|c| c.pg_type.clone())
+            })
+        };
+        let inferred =
+            secantus_pgplan::catalog_param_types_opt(&as_params, &with_bare, &column_type);
+        for (lit, ty) in bare.iter().zip(inferred.into_iter().skip(n)) {
+            let Some(ty) = ty else {
+                continue;
+            };
+            // The input function is passed a typmod of -1.
+            let ty = match ty.find('(') {
+                Some(p) if !ty.starts_with("interval") => ty[..p].trim().to_string(),
+                _ => ty,
+            };
+            let probe = format!("select '{}'::{ty}", lit.value.replace('\'', "''"));
+            if let Some(err) = read(&probe) {
+                return Some((err, lit.at));
+            }
+        }
+        None
+    }
+
     fn check_sql_function_body(
         &self,
         fname: &str,
@@ -14833,24 +14908,13 @@ impl PgHandler {
                         }
                     }
                 }
-                // Each constant a cast reads is read by the cast type's
-                // input function while the statement is analysed, whether
-                // or not the expression is ever evaluated.
-                for (lit, probe) in sql_fn_validator::literal_casts(stmt) {
-                    let read = plan(&probe, &[], &[])
-                        .map_err(|e| Self::err(&e))
-                        .and_then(|p| {
-                            secantus_pgplan::planning_without_running(|| self.subquery_rows(&p))
-                                .map_err(|e| Self::err(&e))
-                        });
-                    if let Err(mut err) = read {
-                        if sql_fn_validator::is_input_error(&err) {
-                            if let PgWireError::UserError(info) = &mut err {
-                                info.position = None;
-                            }
-                            return Some((err, Some(in_body(lit.at))));
-                        }
-                    }
+                // Each constant a cast, an operator, a target column or
+                // COALESCE types is read by that type's input function
+                // while the statement is analysed, whether or not the
+                // expression is ever evaluated.
+                if let Some((err, at)) = self.constant_input_error(&bound, &declared) {
+                    let at = sql_fn_params::original_offset(&spans, at);
+                    return Some((err, Some(in_body(at))));
                 }
                 last = Some((stmt.to_string(), columns));
             }

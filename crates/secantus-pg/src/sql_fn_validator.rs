@@ -141,6 +141,68 @@ pub(crate) fn operand_literals(stmt: &str) -> Vec<Literal> {
     out
 }
 
+/// The statement with a fresh parameter (`$first`, `$first+1`, ...) for
+/// each string constant no cast reads, and those constants in order: what
+/// the parameters' inferred types are is the type parse analysis coerces
+/// each constant to (an unknown `Const` resolves as an unknown `Param`
+/// does), and its input function reads the text there (RP-507).
+pub(crate) fn bare_constants_as_params(stmt: &str, first: usize) -> (String, Vec<Literal>) {
+    let (Ok(tree), Ok(scanned)) = (pg_query::parse(stmt), pg_query::scan(stmt)) else {
+        return (stmt.to_string(), Vec::new());
+    };
+    // A cast's constant is read by `literal_casts`. `nodes()` does not
+    // reach every clause, a VALUES row or RETURNING among them, so the
+    // constants come from the scanner; a cast one it missed becomes a
+    // parameter the cast types, read the same way.
+    let cast: Vec<usize> = tree
+        .protobuf
+        .nodes()
+        .into_iter()
+        .filter_map(|(node, _, _, _)| match node {
+            NodeRef::TypeCast(tc) => tc.arg.as_deref().and_then(string_const).map(|l| l.at),
+            _ => None,
+        })
+        .collect();
+    let mut out = String::new();
+    let mut kept = Vec::new();
+    let mut from = 0;
+    for tok in &scanned.tokens {
+        if tok.token != pb::Token::Sconst as i32 {
+            continue;
+        }
+        let (Ok(at), Ok(end)) = (usize::try_from(tok.start), usize::try_from(tok.end)) else {
+            continue;
+        };
+        if cast.contains(&at) || at < from {
+            continue;
+        }
+        let Some(value) = string_value(&stmt[at..end]) else {
+            continue;
+        };
+        out.push_str(&stmt[from..at]);
+        out.push_str(&format!("${}", first + kept.len()));
+        from = end;
+        kept.push(Literal { at, value });
+    }
+    out.push_str(&stmt[from..]);
+    (out, kept)
+}
+
+/// The value of a string constant token, as the parser reads it.
+fn string_value(token: &str) -> Option<String> {
+    let tree = pg_query::parse(&format!("select {token}")).ok()?;
+    tree.protobuf
+        .nodes()
+        .into_iter()
+        .find_map(|(node, _, _, _)| match node {
+            NodeRef::AConst(c) => match c.val.as_ref() {
+                Some(pb::a_const::Val::Sval(v)) => Some(v.sval.clone()),
+                _ => None,
+            },
+            _ => None,
+        })
+}
+
 /// A `CALL`'s procedure as written: its name, where the name is, each
 /// argument that is a string constant, and the name each named one gives.
 pub(crate) struct CallTarget {
@@ -605,6 +667,18 @@ mod tests {
             operand_literals("select a from fe where a = 'q' and 1 in ('z', 'y') and 'x'::int = 1");
         let values: Vec<&str> = got.iter().map(|l| l.value.as_str()).collect();
         assert_eq!(values, ["q", "z", "y"]);
+    }
+
+    #[test]
+    fn a_bare_constant_becomes_a_parameter() {
+        let (sql, lits) =
+            bare_constants_as_params("insert into t values ('q', 'r'::int) returning a + 'z'", 2);
+        assert_eq!(sql, "insert into t values ($2, $3::int) returning a + $4");
+        let got: Vec<_> = lits.iter().map(|l| l.value.as_str()).collect();
+        assert_eq!(got, ["q", "r", "z"]);
+        let (sql, lits) = bare_constants_as_params("select 'x'::int, b || 'it''s'", 1);
+        assert_eq!(sql, "select 'x'::int, b || $1");
+        assert_eq!(lits[0].value, "it's");
     }
 
     #[test]
