@@ -46356,12 +46356,40 @@ fn expand_between(e: &pg_query::protobuf::AExpr) -> Option<pg_query::protobuf::N
 
 fn const_value_inner(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result<Bson> {
     // A constant cast, folded once for the expression (`expr_memo`).
-    if let Some(N::TypeCast(_)) = node.node.as_ref() {
-        if let Some(v) = expr_memo::folded(node, || const_value_node(node, params)) {
-            return v;
-        }
+    if let Some(N::TypeCast(tc)) = node.node.as_ref() {
+        let literal = literal_input_location(tc);
+        let v = expr_memo::folded(node, || const_value_node(node, params))
+            .unwrap_or_else(|| const_value_node(node, params));
+        return v.inspect_err(|e| {
+            if let Some(at) = literal {
+                if matches!(e.sqlstate(), "23514" | "23502") {
+                    set_error_location(at);
+                }
+            }
+        });
     }
     const_value_node(node, params)
+}
+
+/// The location of the untyped string literal `tc` reads through its
+/// target's input function, when that input checks domains of its own:
+/// `record_in` and `array_in` read each field or element with `domain_in`
+/// under the literal's parser error position, so a field's domain
+/// constraint fails at the literal (`'(0,x)'::ctp` is 23514 at 8 on
+/// PostgreSQL 15.19, RP-552). A cast straight to a domain reads the base
+/// type and checks the domain after, in a `CoerceToDomain` with no position
+/// (`'0'::pint`), so it has none.
+fn literal_input_location(tc: &pg_query::protobuf::TypeCast) -> Option<i32> {
+    let Some(N::AConst(c)) = tc.arg.as_deref().and_then(|a| a.node.as_ref()) else {
+        return None;
+    };
+    if !matches!(c.val, Some(pg_query::protobuf::a_const::Val::Sval(_))) || c.location < 0 {
+        return None;
+    }
+    let target = tc.type_name.as_ref().map(type_name_of)?;
+    domains::user_domain(&target)
+        .is_none()
+        .then_some(c.location)
 }
 
 /// A simple CASE's WHEN label as its comparison with the argument sees it.

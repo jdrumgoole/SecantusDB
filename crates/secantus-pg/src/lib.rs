@@ -2307,8 +2307,9 @@ impl plpgsql_fn::Host for PlHost<'_> {
         name: &str,
         direction: secantus_pgplan::FetchDirection,
         count: i64,
+        is_move: bool,
     ) -> Result<(u64, plpgsql_fn::QueryOut), plpgsql_fn::PlError> {
-        self.fetch_portal(name, direction, count)
+        self.fetch_portal(name, direction, count, is_move)
     }
 
     fn close_cursor(&self, name: &str) -> Result<(), plpgsql_fn::PlError> {
@@ -29939,6 +29940,21 @@ impl PgHandler {
         count: i64,
         is_move: bool,
     ) -> PgWireResult<(usize, Vec<Response>)> {
+        self.fetch_step(name, direction, count, is_move, !is_move)
+    }
+
+    /// `fetch_n`, where `as_fetch` says whether the step is a FETCH, which
+    /// on a zero count steps back to re-fetch the current row where a MOVE
+    /// only counts it. PL/pgSQL's FETCH takes the step as a MOVE
+    /// (`is_move`, no rows built) and reads the row from the cursor after.
+    pub(crate) fn fetch_step(
+        &self,
+        name: &str,
+        direction: secantus_pgplan::FetchDirection,
+        count: i64,
+        is_move: bool,
+        as_fetch: bool,
+    ) -> PgWireResult<(usize, Vec<Response>)> {
         use secantus_pgplan::FetchDirection as Fd;
         let mut cursors = self.cursors.lock().unwrap_or_else(|e| e.into_inner());
         let Some(cursor) = cursors.get_mut(name) else {
@@ -29951,6 +29967,17 @@ impl PgHandler {
         if let Err(message) = cursor.check_runnable(name) {
             return Err(Self::user_error("55000", message));
         }
+        // A zero count -- FORWARD 0, BACKWARD 0, RELATIVE 0 -- re-fetches the
+        // row the cursor sits on, if any (`DoPortalRunFetch`, "per SQL"):
+        // a MOVE answers 1 or 0 by whether there is one, a FETCH steps back
+        // one row and forward one again, so a NO SCROLL cursor refuses it
+        // with 55000 (RP-898).
+        let zero_count = count == 0 && !matches!(direction, Fd::Absolute);
+        let (direction, count) = if zero_count {
+            (Fd::Relative, 0)
+        } else {
+            (direction, count)
+        };
         // A streamed cursor reads what this FETCH reaches first, and a
         // cursor computes the rows it reaches (RP-744).
         if cursor.tail.is_some() {
@@ -29993,7 +30020,7 @@ impl PgHandler {
                 _ => 0,
             }
             .clamp(0, len + 1);
-            target < pos
+            target < pos || (zero_count && as_fetch && (1..=len).contains(&pos))
         } else {
             backward && wanted > 0
         };
@@ -41061,37 +41088,43 @@ impl PgHandler {
         // A negative count reads BACKWARD (SPI's FETCH_FORWARD with a
         // negative count), which only a SCROLL cursor may (55000, measured
         // on 15.19); its rows come nearest first.
-        if count < 0 && !cursor.is_scrollable {
-            return Err(PlanError::Sqlstate(
+        let scan_forward_only = || {
+            PlanError::Sqlstate(
                 "55000",
                 "cursor can only scan forward\nHint: Declare it with SCROLL option to enable backward scan."
                     .into(),
-            ));
-        }
-        if count == 0 {
-            return Ok(Vec::new());
+            )
+        };
+        if count < 0 && !cursor.is_scrollable {
+            return Err(scan_forward_only());
         }
         let backward = count < 0;
         let wanted = count.saturating_abs();
+        // A zero count re-fetches the row the cursor sits on, if any, by
+        // stepping back one row and forward one (`DoPortalRunFetch`), as a
+        // SQL `FETCH 0` does (RP-898).
+        let direction = match count {
+            0 => secantus_pgplan::FetchDirection::Relative,
+            _ if backward => secantus_pgplan::FetchDirection::Backward,
+            _ => secantus_pgplan::FetchDirection::Forward,
+        };
         if cursor.tail.is_some() {
-            let direction = if backward {
-                secantus_pgplan::FetchDirection::Backward
-            } else {
-                secantus_pgplan::FetchDirection::Forward
-            };
             self.fill_cursor(cursor, direction, wanted)
                 .map_err(Self::plan_error_of)?;
         }
-        let direction = if backward {
-            secantus_pgplan::FetchDirection::Backward
-        } else {
-            secantus_pgplan::FetchDirection::Forward
-        };
         self.fill_pending(cursor, direction, wanted)
             .map_err(Self::plan_error_of)?;
         let base = cursor.base;
         let len = (base + cursor.rows.len()) as i64;
-        let positions: Vec<i64> = if backward {
+        let positions: Vec<i64> = if count == 0 {
+            if !(1..=len).contains(&cursor.pos) {
+                Vec::new()
+            } else if cursor.is_scrollable {
+                vec![cursor.pos]
+            } else {
+                return Err(scan_forward_only());
+            }
+        } else if backward {
             let first = (cursor.pos - 1).min(len);
             let last = cursor.pos.saturating_sub(wanted).max(1);
             (last..=first).rev().collect()

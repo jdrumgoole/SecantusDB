@@ -1390,9 +1390,7 @@ fn check_aexpr(e: &pg_query::protobuf::AExpr, scope: &Scope) -> Result<()> {
         if let (Some(l), Some(r)) = (e.lexpr.as_deref(), e.rexpr.as_deref()) {
             if let Some(row) = row_operand_type(l, scope) {
                 let element = match r.node.as_ref() {
-                    Some(N::AArrayExpr(a)) if !a.elements.is_empty() => {
-                        common_type(&a.elements.iter().collect::<Vec<_>>(), scope)
-                    }
+                    Some(N::AArrayExpr(a)) => array_constructor_element(a, scope),
                     // A cast to an array type (`'{1}'::int[]`), which
                     // `operand_type` leaves untyped, or a typed array.
                     Some(N::TypeCast(tc)) => tc
@@ -3337,9 +3335,10 @@ fn row_against_non_row(
         return Ok(());
     }
     let (lr, rr) = (row_operand_type(l, scope), row_operand_type(r, scope));
+    let typed = |n| operand_type_declared(n, scope).or_else(|| array_operand_type(n, scope));
     let (Some(lt), Some(rt)) = (
-        lr.clone().or_else(|| operand_type_declared(l, scope)),
-        rr.clone().or_else(|| operand_type_declared(r, scope)),
+        lr.clone().or_else(|| typed(l)),
+        rr.clone().or_else(|| typed(r)),
     ) else {
         return Ok(());
     };
@@ -3351,13 +3350,62 @@ fn row_against_non_row(
         return Ok(());
     }
     if op == "||" {
+        // `anycompatible || anycompatiblearray` takes the row only beside
+        // an array of rows: `fs || array[1]` is 42883 `fs || integer[]`.
         let base = crate::domains::domain_base(other).unwrap_or_else(|| other.clone());
-        if category(&base) == Some("string") || base.ends_with("[]") {
+        let row_element = |t: &str| t == "record" || user_composite(t).is_some();
+        if category(&base) == Some("string") || base.strip_suffix("[]").is_some_and(row_element) {
             return Ok(());
         }
     }
     let op = if op == "!=" { "<>" } else { op };
     Err(mismatch(op, &lt, &rt, location))
+}
+
+/// The type of an array operand `operand_type_declared` leaves untyped: an
+/// `ARRAY[...]` constructor or a cast to an array type (`'{1}'::int[]`,
+/// `array[1]::bigint[]`). `None` when it cannot be typed here.
+fn array_operand_type(n: &pg_query::protobuf::Node, scope: &Scope) -> Option<String> {
+    match n.node.as_ref()? {
+        N::AArrayExpr(a) => array_constructor_element(a, scope).map(|t| format!("{t}[]")),
+        N::TypeCast(tc) => Some(type_name_of(tc.type_name.as_ref()?)).filter(|t| t.ends_with("[]")),
+        _ => None,
+    }
+}
+
+/// The element type of an `ARRAY[...]` constructor (`transformArrayExpr`):
+/// its elements' common type, untyped literals and NULLs alone `text`; for
+/// one of sub-arrays, their element types' common type, since an array type
+/// carries no dimension count (`ARRAY[ARRAY[1]]` is `integer[]`). An element
+/// that is itself an array (`ARRAY[int_array]`) gives its element type.
+fn array_constructor_element(a: &pg_query::protobuf::AArrayExpr, scope: &Scope) -> Option<String> {
+    if a.elements.is_empty() {
+        return None;
+    }
+    let nested: Vec<&pg_query::protobuf::AArrayExpr> = a
+        .elements
+        .iter()
+        .filter_map(|el| match el.node.as_ref() {
+            Some(N::AArrayExpr(s)) => Some(s),
+            _ => None,
+        })
+        .collect();
+    if nested.len() == a.elements.len() {
+        let mut out: Option<String> = None;
+        for s in nested {
+            let t = array_constructor_element(s, scope)?;
+            out = Some(match out {
+                None => t,
+                Some(o) => select_common(&o, &t)?,
+            });
+        }
+        return out;
+    }
+    if !nested.is_empty() {
+        return None;
+    }
+    let t = common_type(&a.elements.iter().collect::<Vec<_>>(), scope)?;
+    Some(t.trim_end_matches("[]").to_string())
 }
 
 /// A part's type category: a built-in one `category` knows, `record`'s

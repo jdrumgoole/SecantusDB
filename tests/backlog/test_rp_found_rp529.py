@@ -1,7 +1,7 @@
 """Gap tests of the divergences found while working RP-529 (a domain
 column's whole row is typed by the domain): RP-551 (a cast to a domain
 over `char(n)` was not blank-padded; fixed), RP-552 (a domain's CHECK error inside a
-record literal carries no position), RP-553 (a schema's domain named its
+record literal carried no position; fixed), RP-553 (a schema's domain named its
 CHECK after the qualified name; fixed), RP-554 (a scalar subquery's array of a row
 type was described as `text[]`; fixed), RP-555 (`ALTER DOMAIN ... NOT VALID`
 validated the rows; fixed) and RP-556 (`ALTER COLUMN TYPE` to a domain over the
@@ -123,9 +123,9 @@ def test_domain_cast_applies_base_typmod(query: str, dsn: str) -> None:
     assert answer(dsn, query) == BASE_TYPMOD[query]
 
 
-# A field's domain CHECK failing in a record literal is reported at the
-# literal, as its other input errors are.
-@pytest.mark.backlog("RP-552")
+# A field's domain CHECK failing in a record literal was reported with no
+# position; it is at the literal, as its other input errors are (RP-552).
+@pytest.mark.backlog_fixed("RP-552")
 def test_record_literal_domain_error_position(dsn: str) -> None:
     assert answer(dsn, "select '(0,x)'::ctp") == (
         "23514",
@@ -133,6 +133,32 @@ def test_record_literal_domain_error_position(dsn: str) -> None:
         None,
         "8",
     )
+
+
+# `record_in` and `array_in` read each field or element of an untyped
+# literal with `domain_in`, under the literal's error position, in any form
+# of the cast. A cast straight to the domain checks it afterwards, in a
+# `CoerceToDomain`, with no position; so does a cast of a RECORD, which is
+# no literal input (all measured on PostgreSQL 15.19).
+_PINT = 'value for domain pint violates check constraint "pint_check"'
+LITERAL_DOMAIN_POSITION = {
+    "select cast('(0,x)' as ctp)": ("23514", _PINT, None, "13"),
+    "select '(0,x)'::ctp::text": ("23514", _PINT, None, "8"),
+    "select 1, '(0,x)'::ctp": ("23514", _PINT, None, "11"),
+    """select '{"(0,x)"}'::ctp[]""": ("23514", _PINT, None, "8"),
+    "select '{1,0}'::pint[]": ("23514", _PINT, None, "8"),
+    "select cast('{0}' as pint[])": ("23514", _PINT, None, "13"),
+    "select row_to_json('(0,x)'::ctp)": ("23514", _PINT, None, "20"),
+    "select x from (select '(0,x)'::ctp x) s": ("23514", _PINT, None, "23"),
+    "select '0'::pint": ("23514", _PINT, None, None),
+    "select row(0, 'x')::ctp": ("23514", _PINT, None, None),
+}
+
+
+@pytest.mark.backlog_fixed("RP-552")
+@pytest.mark.parametrize("query", list(LITERAL_DOMAIN_POSITION))
+def test_literal_input_domain_error_position(query: str, dsn: str) -> None:
+    assert answer(dsn, query) == LITERAL_DOMAIN_POSITION[query]
 
 
 # An unnamed CHECK of a domain in a schema is named after the domain's own
