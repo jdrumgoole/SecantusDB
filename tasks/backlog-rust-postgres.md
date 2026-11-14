@@ -3005,19 +3005,6 @@ nothing. The gap tests are in `tests/backlog/test_rp_found_rp712.py`.
 Measured on a private PostgreSQL 15.19 cluster with the `_SCOPE_SETUP` in
 `tests/backlog/test_rp_found_rp664.py`.
 
-- [ ] **A subquery in DELETE RETURNING reads a USING item after the
-      delete.** `delete from t668 using (select a, b from t668) x where x.a
-      = t668.a returning (select x.b)` returns each deleted row's `b` on
-      PostgreSQL 15.19; here it is NULL. A USING-item reference outside a
-      subquery is read from the joined row before the delete
-      (`split_joined_returning`, `Delete::joined`); one inside a subquery
-      still takes the old path, a correlated subquery that finds the
-      joining row again after the rows are deleted, when the derived table
-      over the target no longer holds them. The same remainder as RP-686,
-      for UPDATE: the subquery's outer reference would have to read a
-      hidden `joined` value.
-      Verify: tests/backlog/test_rp_found_rp664.py::test_a_delete_returning_subquery_reads_a_using_item_as_it_was_before_the_delete
-      Backlog-ID: RP-938
 - [ ] **A correlated subquery in RETURNING reads the table after the
       write.** `delete from t668 returning (select count(*) from t668 z
       where z.a = t668.a)` is 1 per row on PostgreSQL 15.19, `update t668

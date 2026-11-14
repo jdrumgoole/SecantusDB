@@ -473,18 +473,30 @@ def test_delete_returning_reads_a_using_item_as_it_was_before_the_delete(
     assert _scoped_answer(dsn, query) == RETURNING_USING_BEFORE_DELETE[query]
 
 
-# The rest of RP-938: a SUBQUERY in RETURNING that reads a USING item still
-# finds the joining row after the delete, when a derived table over the
-# target no longer holds it.
+# The rest of RP-938: a SUBQUERY in RETURNING that reads a USING item found
+# the joining row again after the delete, when a derived table over the
+# target no longer held it (NULL). It now reads the joined row from before
+# the delete, as UPDATE's FROM items do (RP-686).
 RETURNING_USING_SUBQUERY = {
     "delete from t668 using (select a, b from t668) x where x.a = t668.a returning (select x.b)": (
         [(-1,), (5,), (-3,)],
         [],
     ),
+    "delete from t668 using u668 u where u.k = t668.a returning t668.a, (select u.v + t668.b)": (
+        [(-1, 9), (5, 55), (7, 67)],
+        [],
+    ),
+    "delete from t668 using (select a from t668) x where x.a = t668.a"
+    " returning (select x.*), (select (select x.*)), (select (x).a)": (
+        [(-1, -1, -1), (5, 5, 5), (7, 7, 7)],
+        [],
+    ),
+    "delete from t668 using u668 where u668.k = t668.a"
+    " returning (select u668.v from t668 limit 1)": ([(10,), (50,), (70,)], []),
 }
 
 
-@pytest.mark.backlog("RP-938")
+@pytest.mark.backlog_fixed("RP-938")
 @pytest.mark.parametrize("query", list(RETURNING_USING_SUBQUERY))
 def test_a_delete_returning_subquery_reads_a_using_item_as_it_was_before_the_delete(
     query: str, dsn: str
