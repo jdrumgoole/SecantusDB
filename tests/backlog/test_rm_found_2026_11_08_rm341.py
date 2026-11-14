@@ -32,10 +32,10 @@ def _stages(stage: Any) -> list:
     return out
 
 
-@pytest.mark.backlog("RM-436")
+@pytest.mark.backlog_fixed("RM-436")
 def test_entries_this_does_not_size_report_their_size(rust_mongo: Any, mongod: Any) -> None:
     """mongod 8.2.11 lists `estimatedSizeBytes` for every entry. This server
-    leaves it out where it does not build the entry's `PlanCacheIndexTree`:
+    left it out where it did not build the entry's `PlanCacheIndexTree`:
     a predicate inside `$elemMatch` (3215 on macOS arm64) and an `$or`
     beside other predicates (4912)."""
     only_on("darwin", why="RM-341 sizes entries with macOS arm64's layout")
@@ -52,6 +52,54 @@ def test_entries_this_does_not_size_report_their_size(rust_mongo: Any, mongod: A
         return out
 
     assert sizes(mongod) == [[3215], [4912]]
+    assert sizes(rust_mongo) == sizes(mongod)
+
+
+@pytest.mark.backlog_fixed("RM-436")
+def test_more_or_and_elem_match_entries_report_their_size(rust_mongo: Any, mongod: Any) -> None:
+    """mongod 8.2.11's sizes for an `OR` of three branches over two indexes
+    (4956), branches of ranges and `$in` (4979), and an `$elemMatch` of two
+    operators (3319), on macOS arm64 (measured 2026-11-14)."""
+    only_on("darwin", why="RM-341 sizes entries with macOS arm64's layout")
+    only_on("arm64", why="RM-341 sizes entries with macOS arm64's layout")
+    cases = [
+        (["a", "b", "c"], {"$or": [{"a": 3}, {"b": 5}, {"a": 7}], "c": {"$lt": 3}}),
+        (
+            ["a", "b", "c"],
+            {"$or": [{"a": {"$lt": 2}}, {"b": {"$in": [5, 6]}}], "c": {"$lt": 3}},
+        ),
+        (["a", "b"], {"a": {"$lt": 5}, "b": {"$elemMatch": {"$gt": 1, "$lt": 90}}}),
+    ]
+
+    def sizes(client: Any) -> list:
+        return [
+            [
+                e.get("estimatedSizeBytes")
+                for e in _entries(client, ix, lambda col, q=q: col.find(q))
+            ]
+            for ix, q in cases
+        ]
+
+    assert sizes(mongod) == [[4956], [4979], [3319]]
+    assert sizes(rust_mongo) == sizes(mongod)
+
+
+@pytest.mark.backlog("RM-694")
+def test_a_not_inside_elem_match_entry_reports_its_size(rust_mongo: Any, mongod: Any) -> None:
+    """mongod 8.2.11 sizes the entry for `{a: {$lt: 5}, b: {$elemMatch:
+    {$not: {$gt: 3}}}}` over `a_1` and `b_1` at 3350 on macOS arm64; this
+    server leaves `estimatedSizeBytes` out."""
+    only_on("darwin", why="RM-341 sizes entries with macOS arm64's layout")
+    only_on("arm64", why="RM-341 sizes entries with macOS arm64's layout")
+    q = {"a": {"$lt": 5}, "b": {"$elemMatch": {"$not": {"$gt": 3}}}}
+
+    def sizes(client: Any) -> list:
+        return [
+            e.get("estimatedSizeBytes")
+            for e in _entries(client, ["a", "b"], lambda col: col.find(q))
+        ]
+
+    assert sizes(mongod) == [3350]
     assert sizes(rust_mongo) == sizes(mongod)
 
 

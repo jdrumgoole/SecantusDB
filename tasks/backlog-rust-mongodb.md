@@ -2493,20 +2493,22 @@ Still different, all 77:
       already matches. Found 2026-11-14 (RM-435).
       Verify: tests/backlog/test_rm_found_rm435.py::test_a_group_mongod_pushes_into_sbe_is_pushed
       Backlog-ID: RM-693
-- [ ] **`estimatedSizeBytes` is left out of entries whose index tree this
-      server does not build.** It sizes an entry's `PlanCacheIndexTree`
-      from the canonical query and the clauses the winning plan's one index
-      was assigned (`plan::index_tags`, `entry_size::tagged_tree`). mongod
-      8.2.11 sizes every entry; this server leaves the field out where the
-      tree's nodes or tags are not modelled: a predicate inside
-      `$elemMatch` (its `ELEM_MATCH_*` node and the tags under it), an
-      `$or` or `$nor` that is not the root (an `OR` may take an
-      `OrPushdownTag` of its own), a `$not` over several predicates,
-      `$jsonSchema`, a winner that reads two indexes (`AND_SORTED` or an
-      `OR`, where `tagForSort` picks the lowest-numbered index), and an
-      `OR` stage among the candidates (`OrStats`). Found 2026-11-08 (RM-341).
-      Verify: tests/backlog/test_rm_found_2026_11_08_rm341.py::test_entries_this_does_not_size_report_their_size
-      Backlog-ID: RM-436
+- [ ] **`estimatedSizeBytes` is still left out of some entries whose
+      index tree this server does not build.** It sizes an entry's
+      `PlanCacheIndexTree` from the canonical query and the index tags of
+      its winner (`plan::index_tags`, `plan::or_tags`,
+      `entry_size::tagged_tree`): one index, or an `OR` of single-predicate
+      branches beside other clauses, and an untagged `$elemMatch` over
+      operators. mongod 8.2.11 sizes every entry; this server leaves the
+      field out for a `$not` inside `$elemMatch` (3350 for `{a: {$lt: 5}, b:
+      {$elemMatch: {$not: {$gt: 3}}}}` over `a_1` and `b_1` on macOS
+      arm64), the object form of `$elemMatch` and an `$elemMatch` the
+      winner's index reads, an `$or` that is the root or whose clauses
+      mongod pushes into the branches (`OrPushdownTag`), a branch of several
+      predicates, `$nor`, a `$not` over several predicates, `$jsonSchema`,
+      and an `AND_SORTED` winner. Found 2026-11-14 (RM-436).
+      Verify: tests/backlog/test_rm_found_2026_11_08_rm341.py::test_a_not_inside_elem_match_entry_reports_its_size
+      Backlog-ID: RM-694
 - [ ] **A SORT_MERGE candidate's trial counts are not mongod's.** For
       `{a: {$in: [1, 2]}, b: {$lt: 90}}` sorted by `c` over `a_1_c_1` and
       `b_1`, mongod 8.2.11's winning SORT_MERGE reports 82 `works` and its

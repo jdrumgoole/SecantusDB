@@ -930,7 +930,7 @@ impl plan::CacheHook for ReadCache<'_> {
             .unwrap_or_default();
         let signature = plan::signature(winner);
         let solution = plan::solution(winner);
-        let estimated_size = estimated_size(q, winner, &created_from, &creation);
+        let estimated_size = estimated_size(q, winner, &self.catalog, &created_from, &creation);
         super::plan_cache::set(
             &self.place,
             super::plan_cache::Entry {
@@ -964,26 +964,44 @@ impl plan::CacheHook for ReadCache<'_> {
 fn estimated_size(
     q: &Query,
     winner: &Node,
+    catalog: &[Arc<super::IndexInfo>],
     created_from: &Document,
     creation: &[Document],
 ) -> Option<i64> {
+    use super::entry_size::{ClauseTag, IndexCopy};
     let layout = super::entry_size::LAYOUT?;
-    let (index, tagged) = plan::index_tags(q, winner)?;
-    if !index.plain {
-        return None;
-    }
-    let copy = super::entry_size::IndexCopy {
-        name: index.name.clone(),
-        key: index.key.clone(),
-        // The `_id` index keeps no path-level multikey metadata.
-        multikey: if index.name == "_id_" {
-            vec![]
-        } else {
-            index.multikey_paths.iter().map(Vec::len).collect()
-        },
+    let copy = |index: &super::IndexInfo| -> Option<IndexCopy> {
+        if !index.plain {
+            return None;
+        }
+        Some(IndexCopy {
+            name: index.name.clone(),
+            key: index.key.clone(),
+            // The `_id` index keeps no path-level multikey metadata.
+            multikey: if index.name == "_id_" {
+                vec![]
+            } else {
+                index.multikey_paths.iter().map(Vec::len).collect()
+            },
+            number: catalog.iter().position(|c| c.name == index.name)?,
+        })
     };
     let clauses = plan::clauses(q.canonical);
-    let tree = super::entry_size::tagged_tree(q.canonical, &clauses, &tagged, &copy)?;
+    let mut tags = vec![ClauseTag::None; clauses.len()];
+    if let Some((index, tagged)) = plan::index_tags(q, winner) {
+        let one = copy(&index)?;
+        for i in tagged {
+            *tags.get_mut(i)? = ClauseTag::One(one.clone());
+        }
+    } else {
+        let (at, branches) = plan::or_tags(q, winner)?;
+        let branches = branches
+            .iter()
+            .map(|ix| copy(ix))
+            .collect::<Option<Vec<_>>>()?;
+        *tags.get_mut(at)? = ClauseTag::Or(branches);
+    }
+    let tree = super::entry_size::tagged_tree(q.canonical, &clauses, &tags)?;
     let size = super::entry_size::estimate(&layout, created_from, creation, &tree)?;
     i64::try_from(size).ok()
 }
