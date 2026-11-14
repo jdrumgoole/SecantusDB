@@ -3329,6 +3329,24 @@ keeps; what follows is what that lookup does not yet check.
       x alias for $2` in a one-argument function is 42704 `variable "$2"
       does not exist` at 82. Here the first has no position, and the second
       is 42601 with none. (A DO block's syntax errors are RP-492.)
+      **Decision needed (2026-11-14):** the server has no way to learn
+      the position or the SQLSTATE. Both errors come from `pl_gram.y`
+      through `plpgsql_scanner_errposition`, which sets
+      `internalerrposition` (relative to the body), and PostgreSQL's
+      `function_parse_error_transpose` moves that into the CREATE text.
+      libpg_query's `pg_query_parse_plpgsql` (pg_query 6.2.0,
+      `pg_query_parse_plpgsql.c`) copies only `message` and `cursorpos` from
+      the ErrorData. `cursorpos` is 0 here, and the crate keeps only the
+      message (`Error::Parse(String)`), so `parsed()` in `plpgsql_fn.rs`
+      labels every error 42601. Options, most faithful first:
+      (1) fork `pg_query` as a `secantus-*` crate (the way `pgwire` became
+      `secantus-pgwire`, since crates.io ignores `[patch]`) and have its
+      C copy `internalpos` and `sqlerrcode`, so the server transposes as
+      PostgreSQL does. This also gives every other PL compile error its
+      code and position. (2) Search the body for the named word or `$n`
+      and report that position. That is a stand-in, and it is ambiguous
+      when the name appears more than once. (3) Leave the item open.
+      Recommend (1).
       Verify: tests/backlog/test_rp_found_rp573.py::test_plpgsql_compile_error_in_create_has_a_position
       Backlog-ID: RP-621
 
