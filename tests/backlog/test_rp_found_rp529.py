@@ -334,8 +334,9 @@ def test_domain_constraint_not_valid_then_validate(dsn: str) -> None:
     assert _in_order(dsn, steps) == [a for _, a in NOT_VALID_THEN_VALIDATE]
 
 
-# A column retyped to a domain over its own type needs no USING.
-@pytest.mark.backlog("RP-556")
+# A column retyped to a domain over its own type needed no USING: the
+# domain was seen through to its base (`getBaseType`).
+@pytest.mark.backlog_fixed("RP-556")
 def test_alter_column_type_to_domain(dsn: str) -> None:
     assert _then(
         dsn,
@@ -343,3 +344,18 @@ def test_alter_column_type_to_domain(dsn: str) -> None:
         "select atttypid::regtype::text from pg_attribute"
         " where attrelid = 'falt'::regclass and attname = 'a'",
     ) == ("ALTER TABLE", [("pint",)])
+
+
+# The rows already there are checked against the domain on the way in.
+@pytest.mark.backlog_fixed("RP-556")
+def test_alter_column_type_to_domain_checks_rows(dsn: str) -> None:
+    with psycopg.connect(dsn, autocommit=True) as c:
+        for q in _SETUP:
+            c.execute(q)
+        c.execute("insert into falt values (-1)")
+        with pytest.raises(psycopg.Error) as e:
+            c.execute("alter table falt alter column a type pint")
+    assert (e.value.sqlstate, e.value.diag.message_primary) == (
+        "23514",
+        'value for domain pint violates check constraint "pint_check"',
+    )

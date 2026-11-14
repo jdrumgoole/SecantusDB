@@ -8688,9 +8688,12 @@ fn alter_type_is_automatic(from: &str, to: &str) -> bool {
 /// 4. otherwise an assignment to a STRING-category type goes through the
 ///    types' I/O functions (`CoerceViaIO`).
 ///
-/// A domain is not yet seen through to its base type (`getBaseType`), so a
-/// domain on either side finds no path (RP-556).
+/// A domain on either side is first seen through to its base type
+/// (`getBaseType`), so `int -> pint` is a relabelling followed by the
+/// domain's checks (RP-556).
 fn assignment_pathway(source: &str, target: &str) -> bool {
+    let source = &domains::base_type_and_typmod(source).map_or_else(|| source.to_string(), |b| b.0);
+    let target = &domains::base_type_and_typmod(target).map_or_else(|| target.to_string(), |b| b.0);
     const INT2VECTOROID: i64 = 22;
     const OIDVECTOROID: i64 = 30;
     let (Some(s), Some(t)) = (

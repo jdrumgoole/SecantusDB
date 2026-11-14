@@ -2921,20 +2921,6 @@ Measured on PostgreSQL 15.19; none of it needs DDL. The gap tests are in
       Verify: tests/backlog/test_rp_found_rp612.py::test_oidvector_hash_and_types
       Backlog-ID: RP-957
 
-## Found while working RP-529 (2026-11-08)
-
-Measured on a private PostgreSQL 15.19 cluster with `create domain dc3 as
-char(3)`, `create domain dc3n as dc3` and the rest of the `_SETUP` in
-`tests/backlog/test_rp_found_rp529.py`.
-
-- [ ] **`ALTER COLUMN TYPE` to a domain over the column's type is
-      refused.** `alter table falt alter column a type pint`, `a int` and
-      `pint` a domain over `int`, retypes the column on PostgreSQL 15.19
-      (an implicit cast to the domain, no USING needed); here it is 42804
-      `column "a" cannot be cast automatically to type pint`.
-      Backlog-ID: RP-556
-      Verify: tests/backlog/test_rp_found_rp529.py::test_alter_column_type_to_domain
-
 ## Found while working RP-552 (2026-11-14)
 
 Measured on PostgreSQL 15.19 with `create domain pint as int check (value >
