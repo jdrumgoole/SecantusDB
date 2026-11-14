@@ -620,6 +620,9 @@ struct Rewriter<'a> {
     /// Expressions this rewrite produced that carry a collation: a grouped
     /// nondeterministic column's representative value.
     derived: std::cell::RefCell<Vec<(pg_query::protobuf::Node, String)>>,
+    /// Visiting a qual (WHERE / HAVING / ON), where the planner reduces
+    /// `x = x` to `x IS NOT NULL` and so compares nothing.
+    in_qual: std::cell::Cell<bool>,
 }
 
 impl Rewriter<'_> {
@@ -1433,12 +1436,9 @@ impl Rewriter<'_> {
                     self.changed = true;
                 } else if self.indeterminate(key) {
                     // A sort by a column of no collation fails as it starts
-                    // (`varstr_sortsupport`'s `check_collation_set`) (RP-803).
-                    sb.node = Some(Box::new(Self::coll_key(
-                        key,
-                        crate::collation::INDETERMINATE,
-                    )));
-                    self.changed = true;
+                    // (`varstr_sortsupport`'s `check_collation_set`) (RP-803),
+                    // over no rows too (RP-820).
+                    return Err(crate::collation::indeterminate());
                 } else if let Some((collation, _)) = self.coll_of(key) {
                     sb.node = Some(Box::new(Self::coll_key(key, &collation)));
                     self.changed = true;
@@ -1472,6 +1472,27 @@ impl Rewriter<'_> {
                         let citext = crate::collation::CITEXT;
                         let nl = Self::coll_call("__coll_keys", l, citext);
                         let nr = Self::coll_call("__coll_keys", r, citext);
+                        if let Some(N::AExpr(e)) = node.node.as_mut() {
+                            e.lexpr = Some(Box::new(nl));
+                            e.rexpr = Some(Box::new(nr));
+                        }
+                        self.changed = true;
+                        return Ok(());
+                    }
+                }
+            }
+            // A string comparison between columns of no collation fails on
+            // each row it compares (`texteq` / `text_lt`'s
+            // `check_collation_set`), except `x = x` in a qual, which the
+            // planner reduces to `x IS NOT NULL` (RP-820).
+            if kind == Ok(AExprKind::AexprOp) && (ordered || equality) {
+                if let (Some(l), Some(r)) = (e.lexpr.as_deref(), e.rexpr.as_deref()) {
+                    let reduced = self.in_qual.get()
+                        && op.as_deref() == Some("=")
+                        && crate::same_expression(l, r);
+                    if self.indeterminate(l) && self.indeterminate(r) && !reduced {
+                        let none = crate::collation::INDETERMINATE;
+                        let (nl, nr) = (Self::coll_key(l, none), Self::coll_key(r, none));
                         if let Some(N::AExpr(e)) = node.node.as_mut() {
                             e.lexpr = Some(Box::new(nl));
                             e.rexpr = Some(Box::new(nr));
@@ -2525,6 +2546,7 @@ pub(crate) fn rewrite(
         changed: false,
         collate_locations: std::cell::RefCell::new(Vec::new()),
         derived: std::cell::RefCell::new(Vec::new()),
+        in_qual: std::cell::Cell::new(false),
     };
     // `ORDER BY <position>` / `ORDER BY <output name>` naming a plain enum
     // column: the sort is over the target's expression.
@@ -2599,6 +2621,15 @@ pub(crate) fn rewrite(
     // group), which still orders by the collation.
     let mut grouped: Vec<(pg_query::protobuf::Node, String)> = Vec::new();
     for g in &mut out.group_clause {
+        // A column of no collation fails as each row is hashed (`hashtext`'s
+        // `check_collation_set`) (RP-820); the select list reads the
+        // group's value, as over a nondeterministic collation.
+        if r.indeterminate(g) {
+            grouped.push((g.clone(), crate::collation::INDETERMINATE.to_string()));
+            *g = Rewriter::coll_key(g, crate::collation::INDETERMINATE_HASH);
+            r.changed = true;
+            continue;
+        }
         if let Some((c, _)) = r.coll_of(g) {
             if !crate::collation::resolve(&c)?.deterministic() {
                 grouped.push((g.clone(), c.clone()));
@@ -2702,6 +2733,12 @@ pub(crate) fn rewrite(
                 keys.clear();
                 break;
             };
+            // A column of no collation fails as rows are compared (RP-820).
+            if r.indeterminate(v) {
+                any = true;
+                keys.push(Rewriter::coll_key(v, crate::collation::INDETERMINATE));
+                continue;
+            }
             match r.coll_of(v) {
                 Some((c, _)) if !crate::collation::resolve(&c)?.deterministic() => {
                     any = true;
@@ -2731,6 +2768,13 @@ pub(crate) fn rewrite(
                 return Ok(());
             }
             if let [arg] = f.args.as_mut_slice() {
+                // Over a column of no collation it fails as values are
+                // compared (RP-820).
+                if r.indeterminate(arg) {
+                    *arg = Rewriter::coll_key(arg, crate::collation::INDETERMINATE);
+                    r.changed = true;
+                    return Ok(());
+                }
                 if let Some((c, _)) = r.coll_of(arg) {
                     match crate::collation::resolve(&c) {
                         Ok(res) if !res.deterministic() => {
@@ -2804,7 +2848,10 @@ pub(crate) fn rewrite(
         .into_iter()
         .chain(out.having_clause.as_deref_mut())
     {
-        r.expr(n)?;
+        r.in_qual.set(true);
+        let done = r.expr(n);
+        r.in_qual.set(false);
+        done?;
     }
     for w in &mut out.window_clause {
         if let Some(N::WindowDef(def)) = w.node.as_mut() {
@@ -2851,7 +2898,9 @@ pub(crate) fn rewrite_dml(
         changed: false,
         collate_locations: std::cell::RefCell::new(Vec::new()),
         derived: std::cell::RefCell::new(Vec::new()),
+        in_qual: std::cell::Cell::new(false),
     };
+    r.in_qual.set(true);
     r.expr(where_clause)?;
     Ok(r.changed)
 }
@@ -2897,6 +2946,7 @@ pub(crate) fn check_collate_operands(
         changed: false,
         collate_locations: std::cell::RefCell::new(Vec::new()),
         derived: std::cell::RefCell::new(Vec::new()),
+        in_qual: std::cell::Cell::new(false),
     };
     let exprs = s
         .sort_clause

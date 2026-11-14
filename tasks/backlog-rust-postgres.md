@@ -3715,28 +3715,6 @@ with ICU) with the `_SETUP` in `tests/backlog/test_rp_found_rp782.py`:
       Verify: tests/backlog/test_rp_found_rp782.py::test_pg_get_viewdef_of_a_system_view
       Backlog-ID: RP-798
 
-## Found while working RP-803 (2026-11-10)
-
-Measured on a private PostgreSQL 15.19 cluster (locale C.UTF-8, built
-with ICU) with the `_SETUP` in `tests/backlog/test_rp_found_rp782.py`.
-Since RP-803 a VALUES or set-operation column whose rows' implicit
-collations conflict has none (`collation::INDETERMINATE`): ORDER BY and
-`max` / `min` over it are 42P22, and `collation for` it is NULL.
-
-- [ ] **A column of no collation is still grouped, made distinct and
-      compared bytewise.** Over `(values ('a'::xu782f), ('B'::xc782f))
-      s(v)`, `group by v` is 42P22 `could not determine which collation to
-      use for string hashing` on PostgreSQL 15.19 (`hashtext`'s
-      `check_collation_set`), and `select distinct v`, `count(distinct
-      v)`, `select v = v` and `select v < v` are 42P22 `... for string
-      comparison` (`texteq`, `text_lt`); here each answers, bytewise. A
-      sort by it over no rows (`... where false order by v`) is 42P22 there,
-      as `varstr_sortsupport` checks as the sort starts; here it is empty,
-      since the check rides on each row's sort key. (`where v = v` answers
-      both rows on both: the planner reduces it to `v IS NOT NULL`.)
-      Verify: tests/backlog/test_rp_found_rp796.py::test_a_column_of_no_collation_is_not_hashed_or_compared
-      Backlog-ID: RP-820
-
 ## Found while working RP-808 (2026-11-10)
 
 Measured on a private, freshly initdb'd PostgreSQL 15.19 cluster with the
