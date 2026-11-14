@@ -45760,6 +45760,7 @@ impl PgHandler {
                     &options.scan_or_arms,
                     &index_columns,
                 );
+                explain::attach_sort_keys(&mut tree, &options.sort_keys);
                 explain::gate_scan(&mut tree, options.one_time_false);
                 if options.dummy_relation {
                     explain::dummy_relation(&mut tree);

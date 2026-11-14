@@ -4075,22 +4075,6 @@ varchar(3), w dv689, c char(3))`, `d689` an `int` with `check (value > 0)`.
       Verify: tests/backlog/test_rp_found_rp689.py::test_a_column_a_record_field_shares_is_ambiguous
       Backlog-ID: RP-838
 
-## Found while working RP-761 (2026-11-10)
-
-Measured on a private, freshly initdb'd PostgreSQL 15.19 cluster with the
-`_SETUP` in `tests/backlog/test_rp_found_rp761.py`: `t761(x int)`.
-
-- [ ] **EXPLAIN prints a computed sort key by its synthetic field.**
-      `explain (costs off) select x from t761 order by x + 1` prints `Sort
-      Key: ((x + 1))` on PostgreSQL 15.19, and a key that is a window
-      target `Sort Key: (sum(x) OVER (?)) DESC`; here the first is `Sort
-      Key: __order0` (the planner's field for a computed key) and the
-      second `Sort Key: sum DESC` (the target's output name). The Sort's
-      key wants deparsing as ruleutils does it (`deparse_expression` with
-      the plan's tlist), not the field it is computed into.
-      Verify: tests/backlog/test_rp_found_rp761.py::test_explain_prints_a_computed_sort_key_as_its_expression
-      Backlog-ID: RP-840
-
 ## Found while working RP-846 (2026-11-11)
 
 Measured on a private, freshly initdb'd PostgreSQL 15.19 cluster with the

@@ -3716,6 +3716,9 @@ pub struct ExplainOptions {
     /// and the plan is a `Result` with `One-Time Filter: false` where its
     /// scan (or join) would be (RP-409).
     pub dummy_relation: bool,
+    /// A single-relation SELECT's ORDER BY as its Sort's `Sort Key`
+    /// prints it, where a key is computed (RP-840).
+    pub sort_keys: Option<Vec<String>>,
 }
 
 /// `CREATE [OR REPLACE] VIEW`.
@@ -11694,6 +11697,7 @@ fn plan_explain(
         subquery_quals: Vec::new(),
         one_time_false: 0,
         dummy_relation: false,
+        sort_keys: None,
     };
     let (mut timing, mut summary) = (None, None);
     for o in &e.options {
@@ -11772,6 +11776,18 @@ fn plan_explain(
         }
     }
     let scan_quals = explain_scan_quals(&query, lookup).unwrap_or_default();
+    options.sort_keys = match &query {
+        N::SelectStmt(s) => match s.from_clause.as_slice() {
+            [item] => match item.node.as_ref() {
+                Some(N::RangeVar(rv)) => {
+                    lookup(&rv.relname).and_then(|def| ruleutils::explain_sort_keys(s, &def))
+                }
+                _ => None,
+            },
+            _ => None,
+        },
+        _ => None,
+    };
     let scan_or_arms = explain_scan_or_arms(&query, lookup).unwrap_or_default();
     options.scan_in_lengths = explain_scan_in_lengths(&query, lookup).unwrap_or_default();
     options.scan_array_quals = explain_scan_array_quals(&query, lookup);
