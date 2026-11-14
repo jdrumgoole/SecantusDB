@@ -56,10 +56,11 @@ impl PlHost<'_> {
         name: &str,
         direction: secantus_pgplan::FetchDirection,
         count: i64,
+        is_move: bool,
     ) -> Result<(u64, plpgsql_fn::QueryOut), plpgsql_fn::PlError> {
         let (moved, _) = self
             .h
-            .fetch_n(name, direction, count, true)
+            .fetch_step(name, direction, count, true, !is_move)
             .map_err(|e| pl_error(&e))?;
         let moved = moved as u64;
         let cursors = self.h.cursors.lock().unwrap_or_else(|e| e.into_inner());

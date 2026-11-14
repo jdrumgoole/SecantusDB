@@ -3654,13 +3654,6 @@ at the DECLARE, and the cursor answers that differ either way.
       cursor's.
       Verify: tests/backlog/test_rp_found_rp744.py::test_a_cursor_runs_its_query_at_the_first_fetch
       Backlog-ID: RP-897
-- [ ] **A zero-count FETCH answers no row.** On PostgreSQL 15.19 `FETCH
-      FORWARD 0`, `FETCH 0` and `FETCH BACKWARD 0` re-fetch the row the
-      cursor sits on, and `MOVE FORWARD 0` reports `MOVE 1`; here the three
-      answer no row and the MOVE reports `MOVE 0` (`FETCH RELATIVE 0`
-      already matches).
-      Verify: tests/backlog/test_rp_found_rp744.py::test_a_zero_count_fetch_refetches_the_current_row
-      Backlog-ID: RP-898
 - [ ] **A PL/pgSQL FETCH from a `refcursor` parameter is refused at CREATE
       FUNCTION.** `create function f(c refcursor) returns int language
       plpgsql as $$ declare r int; begin fetch c into r; return r; end $$`
@@ -3670,6 +3663,22 @@ at the DECLARE, and the cursor answers that differ either way.
       creates it, and the call reads the caller's cursor.
       Verify: tests/backlog/test_rp_found_rp744.py::test_a_refcursor_parameter_can_be_fetched
       Backlog-ID: RP-901
+
+## Found while working RP-898 (2026-11-14)
+
+Measured on PostgreSQL 15.19 (the shared reference on port 5415; a DO
+block creates no object). The gap test is in
+`tests/backlog/test_rp_found_rp898.py`.
+
+- [ ] **A PL/pgSQL FETCH of more than one row is refused with the wrong
+      SQLSTATE.** `do $$ declare c scroll cursor for select 1; r int;
+      begin if false then fetch forward 2 from c into r; end if; end $$`
+      is 0A000 `FETCH statement cannot return multiple rows` on PostgreSQL
+      15.19 (`pl_gram.y`'s `stmt_fetch`, at compile time), with the
+      statement position at the FETCH; here it is 42601 with no position
+      (`open_cursor::fetch_cursor`).
+      Verify: tests/backlog/test_rp_found_rp898.py::test_a_multi_row_plpgsql_fetch_is_feature_not_supported
+      Backlog-ID: RP-942
 
 ## Found while working RP-900 (2026-11-13)
 

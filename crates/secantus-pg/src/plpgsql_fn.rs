@@ -247,8 +247,9 @@ pub trait Host {
         name: &str,
         direction: secantus_pgplan::FetchDirection,
         count: i64,
+        is_move: bool,
     ) -> Result<(u64, QueryOut), PlError> {
-        let _ = (name, direction, count);
+        let _ = (name, direction, count, is_move);
         Err(PlError::unsupported("FETCH"))
     }
     /// `CLOSE` the portal `name`.

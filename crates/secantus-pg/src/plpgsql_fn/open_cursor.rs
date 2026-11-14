@@ -245,7 +245,7 @@ impl Interp<'_> {
         let stmts = body.get("body").unwrap_or(&Value::Null);
         let mut found = false;
         let flow = loop {
-            let (_, out) = self.host.fetch_cursor(portal, Fd::Forward, 1)?;
+            let (_, out) = self.host.fetch_cursor(portal, Fd::Forward, 1, false)?;
             let Some(row) = out.rows.first() else {
                 if !found {
                     self.assign_row(target, &out, None, &out.domains)?;
@@ -386,7 +386,7 @@ impl Interp<'_> {
             },
             None => body.get("how_many").and_then(Value::as_i64).unwrap_or(0),
         };
-        let (moved, out) = self.host.fetch_cursor(&portal, direction, count)?;
+        let (moved, out) = self.host.fetch_cursor(&portal, direction, count, is_move)?;
         if is_move {
             self.set_found(moved > 0);
             self.row_count = moved;

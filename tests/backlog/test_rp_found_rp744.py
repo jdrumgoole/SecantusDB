@@ -6,8 +6,8 @@ computed every row's select list at the DECLARE):
 - a cursor over a set operation computes its rows at the DECLARE;
 - a cursor's WHERE and Sort run at the DECLARE, where PostgreSQL runs
   them at the first FETCH;
-- `FETCH FORWARD 0` / `FETCH 0` / `FETCH BACKWARD 0` answer no row, and
-  `MOVE FORWARD 0` moves over none;
+- `FETCH FORWARD 0` / `FETCH 0` / `FETCH BACKWARD 0` answered no row, and
+  `MOVE FORWARD 0` moved over none (fixed, RP-898);
 - `pg_cursors.statement` is a deparse of the query, not the DECLARE text;
 - a PL/pgSQL `FETCH` from a `refcursor` parameter is refused at CREATE
   FUNCTION.
@@ -143,11 +143,11 @@ def test_a_cursor_runs_its_query_at_the_first_fetch(dsn: str) -> None:
     ]
 
 
-@pytest.mark.backlog("RP-898")
+@pytest.mark.backlog_fixed("RP-898")
 def test_a_zero_count_fetch_refetches_the_current_row(dsn: str) -> None:
     """PostgreSQL 15.19 answers `FETCH FORWARD 0`, `FETCH 0` and `FETCH
     BACKWARD 0` with the row the cursor sits on, and `MOVE FORWARD 0`
-    reports `MOVE 1`. Here the three answer no row and the MOVE reports
+    reports `MOVE 1`. Here the three answered no row and the MOVE reported
     `MOVE 0`."""
     assert _steps(
         dsn,
@@ -171,6 +171,137 @@ def test_a_zero_count_fetch_refetches_the_current_row(dsn: str) -> None:
         [(2,)],
         [(2,)],
         "MOVE 1",
+        "ROLLBACK",
+    ]
+
+
+@pytest.mark.backlog_fixed("RP-898")
+def test_a_zero_count_fetch_steps_back_on_a_no_scroll_cursor(dsn: str) -> None:
+    """PostgreSQL 15.19 re-fetches the current row by stepping back one row
+    and forward one (`DoPortalRunFetch`), so on a NO SCROLL cursor sitting
+    on a row a zero-count FETCH -- `RELATIVE 0` included -- is 55000, where
+    one before the first row answers no row and a MOVE only counts the
+    row. Measured on the shared reference."""
+    declare = "declare c no scroll cursor for select g from generate_series(1, 3) g"
+    assert _steps(
+        dsn,
+        [
+            "begin",
+            declare,
+            "fetch 0 from c",
+            "move 0 in c",
+            "fetch 1 from c",
+            "move forward 0 in c",
+            "move backward 0 in c",
+            "fetch backward 0 from c",
+            "rollback",
+            "begin",
+            declare,
+            "fetch 1 from c",
+            "fetch relative 0 from c",
+            "rollback",
+        ],
+    ) == [
+        "BEGIN",
+        "DECLARE CURSOR",
+        [],
+        "MOVE 0",
+        [(1,)],
+        "MOVE 1",
+        "MOVE 1",
+        ("55000", "cursor can only scan forward"),
+        "ROLLBACK",
+        "BEGIN",
+        "DECLARE CURSOR",
+        [(1,)],
+        ("55000", "cursor can only scan forward"),
+        "ROLLBACK",
+    ]
+
+
+@pytest.mark.backlog_fixed("RP-898")
+def test_a_plpgsql_zero_count_step_sees_the_current_row(dsn: str) -> None:
+    """In PL/pgSQL on PostgreSQL 15.19, `FETCH RELATIVE 0 ... INTO` reads
+    the row the cursor sits on and `MOVE RELATIVE 0` / `MOVE FORWARD 0`
+    set FOUND by it; on a NO SCROLL cursor the FETCH is 55000 and the MOVE
+    is not. Here a MOVE 0 set FOUND false and the NO SCROLL FETCH read the
+    row. DO blocks, measured on the shared reference."""
+    notices: list[str] = []
+    blocks = [
+        "do $$ declare c scroll cursor for select g from generate_series(1, 3) g;"
+        " r int; begin open c; fetch c into r; fetch c into r;"
+        " fetch relative 0 from c into r; raise notice 'r=% found=%', r, found;"
+        " move relative 0 in c; raise notice 'm=%', found;"
+        " move forward 0 in c; raise notice 'm0=%', found; end $$",
+        "do $$ declare c scroll cursor for select g from generate_series(1, 3) g;"
+        " r int; begin open c; move forward 0 in c; raise notice 'm=%', found;"
+        " fetch relative 0 from c into r; raise notice 'r=% found=%', r, found;"
+        " end $$",
+        "do $$ declare c no scroll cursor for select g from generate_series(1, 3) g;"
+        " r int; begin open c; fetch c into r; move forward 0 in c;"
+        " raise notice 'm=%', found; end $$",
+        "do $$ declare c no scroll cursor for select g from generate_series(1, 3) g;"
+        " r int; begin open c; fetch c into r; fetch relative 0 from c into r;"
+        " end $$",
+    ]
+    out: list[object] = []
+    with psycopg.connect(dsn, autocommit=True) as c:
+        c.add_notice_handler(lambda d: notices.append(d.message_primary or ""))
+        for b in blocks:
+            try:
+                c.execute(b)
+                out.append("ok")
+            except psycopg.Error as e:
+                out.append((e.sqlstate, str(e).splitlines()[0]))
+    assert (out, notices) == (
+        ["ok", "ok", "ok", ("55000", "cursor can only scan forward")],
+        ["r=2 found=t", "m=t", "m0=t", "m=f", "r=<NULL> found=f", "m=t"],
+    )
+
+
+@pytest.mark.backlog_fixed("RP-898")
+def test_cursor_to_xml_of_zero_rows_refetches_the_current_row(dsn: str) -> None:
+    """`cursor_to_xml(c, 0, ...)` reads through `SPI_cursor_fetch`, the
+    same `DoPortalRunFetch` step as `FETCH 0`: on PostgreSQL 15.19 it
+    answers the row the cursor sits on and leaves it there, nothing before
+    the first row or past the last, and 55000 on a NO SCROLL cursor sitting
+    on a row. Here it answered no row. Measured on the shared reference."""
+    xml0 = "select cursor_to_xml('c', 0, false, true, '')"
+    row1 = '<row xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">\n  <g>1</g>\n</row>\n\n'
+    assert _steps(
+        dsn,
+        [
+            "begin",
+            "declare c cursor for select g from generate_series(1, 3) g",
+            xml0,
+            "fetch 1 from c",
+            xml0,
+            "fetch next from c",
+            "fetch all from c",
+            xml0,
+            "rollback",
+            "begin",
+            "declare c no scroll cursor for select g from generate_series(1, 3) g",
+            xml0,
+            "fetch 1 from c",
+            xml0,
+            "rollback",
+        ],
+    ) == [
+        "BEGIN",
+        "DECLARE CURSOR",
+        [("",)],
+        [(1,)],
+        [(row1,)],
+        [(2,)],
+        [(3,)],
+        [("",)],
+        "ROLLBACK",
+        "BEGIN",
+        "DECLARE CURSOR",
+        [("",)],
+        [(1,)],
+        ("55000", "cursor can only scan forward"),
         "ROLLBACK",
     ]
 
