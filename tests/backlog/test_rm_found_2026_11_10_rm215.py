@@ -90,11 +90,11 @@ def _date_parts(client: Any) -> Any:
     ]
 
 
-@pytest.mark.backlog("RM-533")
+@pytest.mark.backlog_fixed("RM-533")
 def test_a_date_part_takes_an_array_of_one(rust_mongo: Any, mongod: Any) -> None:
     """mongod 8.2.11 takes a date-part operator's argument written as an
     array of one (`{$year: ["$t"]}`) as that one expression: null for a
-    missing field, the part of a date. This server evaluates the array
-    itself and fails with 16006 "can't convert from BSON type array to
+    missing field, the part of a date. This server evaluated the array
+    itself and failed with 16006 "can't convert from BSON type array to
     Date"."""
     assert _date_parts(rust_mongo) == _date_parts(mongod)

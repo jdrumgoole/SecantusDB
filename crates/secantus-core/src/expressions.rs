@@ -5147,8 +5147,10 @@ fn civil_from_days(z: i64) -> (i64, i64, i64) {
 /// The instant a date-operator OPERAND names, in epoch milliseconds.
 ///
 /// mongod accepts every BSON type that CARRIES a timestamp -- Date, ObjectId
-/// (its 4-byte generation time) and Timestamp (its seconds field) -- and a
-/// ONE-ELEMENT array is the argument itself. Probed 8.2.11 (2026-09-02):
+/// (its 4-byte generation time) and Timestamp (its seconds field). An array
+/// VALUE is not one: `{$year: "$a"}` with `a: [date]` is 16006 (RM-533; the
+/// one-element array mongod unwraps is the literal operand, which
+/// `date_operand_millis` unwraps). Probed 8.2.11 (2026-09-02):
 /// `{$year: ObjectId("64b7f9a2…")}` answers 2023, where this used to defer and
 /// so ERRORED on the standalone server for input mongod answers. The Python
 /// engine took the same fix.
@@ -5162,12 +5164,21 @@ fn timestamp_bearing_millis(v: &Bson) -> Option<i64> {
             Some(secs * 1000)
         }
         Bson::Timestamp(ts) => Some(i64::from(ts.time) * 1000),
-        Bson::Array(a) if a.len() == 1 => timestamp_bearing_millis(&a[0]),
         _ => None,
     }
 }
 
 fn date_operand_millis(arg: &Bson, ctx: &Ctx) -> Result<Option<i64>, Fallback> {
+    // mongod's `DateExpressionAcceptingTimeZone::parse` takes an operand
+    // written as an array of one as that one element, parsed as an operand:
+    // `{$year: ["$t"]}` is `{$year: "$t"}`, and `[{date: "$t"}]` is an OBJECT
+    // expression (16006 "... object to Date"), never the options form. Any
+    // other length was refused at parse (40536). Measured 8.2.11 (RM-533).
+    if let Bson::Array(a) = arg {
+        if let [only] = a.as_slice() {
+            return date_value_millis(only, ctx);
+        }
+    }
     if let Bson::Document(d) = arg {
         let is_operator = d.len() == 1 && d.keys().next().is_some_and(|k| k.starts_with('$'));
         if let (Some(date_expr), false) = (d.get("date"), is_operator) {
@@ -5188,6 +5199,11 @@ fn date_operand_millis(arg: &Bson, ctx: &Ctx) -> Result<Option<i64>, Fallback> {
             return Ok(Some(millis + offset_ms));
         }
     }
+    date_value_millis(arg, ctx)
+}
+
+/// A date operand that is an expression, not the `{date, timezone}` form.
+fn date_value_millis(arg: &Bson, ctx: &Ctx) -> Result<Option<i64>, Fallback> {
     let value = eval(arg, ctx)?;
     if matches!(value, Bson::Null) {
         return Ok(None); // null / missing -> null
@@ -12188,6 +12204,37 @@ mod timestamp_bearing_date_tests {
             eval_expr(bson::bson!({"$year": [oid()]})),
             Bson::Int32(2023)
         );
+    }
+
+    /// RM-533, measured 8.2.11 (2026-11-14): the literal array of one is
+    /// unwrapped before evaluation, so a field path in it is the operand --
+    /// null when missing -- and a `{date: ...}` in it is an object expression,
+    /// not the options form. An array VALUE is not unwrapped: 16006.
+    #[test]
+    fn the_unwrapped_element_is_an_operand_and_an_array_value_is_refused() {
+        let t = Bson::DateTime(bson::DateTime::from_millis(1_578_528_000_000));
+        let row = doc! {"t": t.clone(), "a": [t]};
+        let eval_in = |expr: Bson| evaluate(&row, &expr, &Document::new());
+        assert_eq!(
+            eval_in(bson::bson!({"$isoWeek": ["$t"]})).unwrap(),
+            Bson::Int32(2)
+        );
+        assert_eq!(
+            eval_in(bson::bson!({"$year": ["$missing"]})).unwrap(),
+            Bson::Null
+        );
+        for (expr, ty) in [
+            (bson::bson!({"$year": "$a"}), "array"),
+            (bson::bson!({"$year": {"date": "$a"}}), "array"),
+            (bson::bson!({"$isoWeek": [{"date": "$t"}]}), "object"),
+        ] {
+            let err = format!("{:?}", eval_in(expr.clone()).unwrap_err());
+            assert!(
+                err.contains("16006")
+                    && err.contains(&format!("can't convert from BSON type {ty} to Date")),
+                "{expr}: {err}"
+            );
+        }
     }
 
     #[test]

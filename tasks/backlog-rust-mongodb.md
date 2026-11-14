@@ -1790,16 +1790,6 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       plans (counted false here). Found 2026-11-10 working RM-215.
       Verify: tests/backlog/test_rm_found_2026_11_10_rm215.py::test_query_stats_remainder
       Backlog-ID: RM-532
-- [ ] **A date-part operator's argument as an array of one fails.**
-      mongod 8.2.11 takes `{$year: ["$t"]}` (any of `$year` ... `$isoWeek`,
-      `$dayOfWeek`) as `{$year: "$t"}`: null for a missing field, the part
-      of a date. This server evaluates the array itself and fails with
-      16006 "can't convert from BSON type array to Date"; with
-      `[{date: "$t"}]` mongod's 16006 names an object where this server's
-      names an array. Found 2026-11-10 working RM-215, running the
-      query-shape corpus's expressions.
-      Verify: tests/backlog/test_rm_found_2026_11_10_rm215.py::test_a_date_part_takes_an_array_of_one
-      Backlog-ID: RM-533
 - [ ] **`$lookup` runs a `let` that is not a document, and a lone join field.**
       mongod 8.2.11 refuses `let: 5` with 14 "BSON field '$lookup.let' is
       the wrong type 'int', expected type 'object'", and `localField`
@@ -3585,7 +3575,8 @@ touched:
   after a wait that rounded to 3 seconds, mongod after 2; four runs on
   their own passed, at load 18. A later RM gate that day (RM-515) saw
   mongod answer two with no queue, as on 2026-11-08; three runs on their
-  own passed. The test depends on six connects landing within one
+  own passed. So did the RM-533 gate of 2026-11-14 (load average up to
+  32), and again three runs on their own passed. The test depends on six connects landing within one
   second, so it is flaky by construction: it needs a measurement that
   load cannot change (connect all six behind a barrier and record how
   long they took to land, or compare with the answer mongod gives when
