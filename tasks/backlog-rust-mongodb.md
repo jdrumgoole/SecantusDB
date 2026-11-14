@@ -2077,17 +2077,6 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       Carried over from RM-416, 2026-11-14.
       Verify: tests/backlog/test_rm_219_diag_query_settings.py::test_db_check_extra_index_keys_remainder, tests/backlog/test_rm_219_diag_query_settings.py::test_apply_ops_other_entries
       Backlog-ID: RM-688
-- [ ] **`applyOps` applies a `u` replacement of a missing document.** A `u`
-      entry whose `o` is a whole document with `o2`'s `_id`, for a document
-      that does not exist and without `b: true`, is inserted here; mongod
-      8.2.11 does not apply it (`false` in `results`, the command 8), as this
-      server's own module comment says. A `u` upsert of a document past
-      16 MB is 10334 "object to insert too large" here, 17420 "Document to
-      upsert is larger than 16777216" on mongod, and an `i` entry replacing
-      an existing document with one past 16 MB is 10334 here, 17419 on
-      mongod. Found 2026-11-10 while working RM-416.
-      Verify: tests/backlog/test_rm_219_diag_query_settings.py::test_apply_ops_update_entries
-      Backlog-ID: RM-540
 - [ ] **FTDC is a sample in memory only.** Since 2026-11-10 the sample
       carries `transportLayerStats` and `diagnosticDataCollectionEnabled` /
       `diagnosticDataCollectionPeriodMillis` switch it and set its period.

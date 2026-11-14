@@ -846,10 +846,11 @@ def _update_entries(client: Any) -> dict:
     }
 
 
-@pytest.mark.backlog("RM-540")
+@pytest.mark.backlog_fixed("RM-540")
 def test_apply_ops_update_entries(rust_mongo: Any, mongod_rs: Any) -> None:  # noqa: F811
-    """mongod 8.2.11 does not apply a `u` replacement of a missing document
-    without `b: true` (the entry is `false` in `results`, the command 8), and
-    refuses a document past 16 MB that a `u` upsert would insert (17420) or
+    """RM-540 (fixed): as on mongod 8.2.11, this server did not apply a `u`
+    replacement of a missing document without `b: true` (the entry is `false`
+    in `results`, the command 8), and
+    refused a document past 16 MB that a `u` upsert would insert (17420) or
     an `i` entry would replace (17419)."""
     assert _update_entries(rust_mongo) == _update_entries(mongod_rs)
