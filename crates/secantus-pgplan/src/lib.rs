@@ -4571,26 +4571,59 @@ pub fn take_error_location() -> Option<i32> {
 /// The 1-based CHARACTER position of the first identifier token spelling
 /// `name` in `sql`, for an error's `P` field. A quoted identifier matches on
 /// its unquoted text; an unquoted one on its case-folded text.
+///
+/// A qualified `schema.name` matches the tokens `schema . name` written
+/// together and not continued by another `.` (a column reference
+/// `schema.name.col` is not the relation), at the qualifier, where
+/// PostgreSQL's `RangeVar` location points.
 pub fn identifier_position(sql: &str, name: &str) -> Option<usize> {
     let scanned = pg_query::scan(sql).ok()?;
     let ident = pg_query::protobuf::Token::Ident as i32;
-    for tok in &scanned.tokens {
+    let tokens = &scanned.tokens;
+    let spelled = |tok: &pg_query::protobuf::ScanToken| -> Option<String> {
         if tok.token != ident {
-            continue;
+            return None;
         }
-        let (start, end) = (tok.start as usize, tok.end as usize);
-        let text = sql.get(start..end)?;
-        let spelled = if let Some(inner) = text.strip_prefix('"').and_then(|t| t.strip_suffix('"'))
-        {
-            inner.replace("\"\"", "\"")
-        } else {
-            text.to_ascii_lowercase()
-        };
-        if spelled == name {
-            return Some(sql[..start].chars().count() + 1);
+        let text = sql.get(tok.start as usize..tok.end as usize)?;
+        Some(
+            if let Some(inner) = text.strip_prefix('"').and_then(|t| t.strip_suffix('"')) {
+                inner.replace("\"\"", "\"")
+            } else {
+                text.to_ascii_lowercase()
+            },
+        )
+    };
+    let is_dot = |i: usize| {
+        tokens
+            .get(i)
+            .and_then(|t| sql.get(t.start as usize..t.end as usize))
+            == Some(".")
+    };
+    let position =
+        |tok: &pg_query::protobuf::ScanToken| sql[..tok.start as usize].chars().count() + 1;
+    let qualified = name
+        .split_once('.')
+        .filter(|(s, n)| !s.is_empty() && !n.contains('.'));
+    if let Some((schema, bare)) = qualified {
+        for (i, tok) in tokens.iter().enumerate() {
+            if spelled(tok).as_deref() == Some(schema)
+                && is_dot(i + 1)
+                && tokens.get(i + 2).and_then(spelled).as_deref() == Some(bare)
+                && !is_dot(i + 3)
+            {
+                // A catalog-qualified `db.schema.name` points at the `db`.
+                let mut first = i;
+                while first >= 2 && is_dot(first - 1) && tokens[first - 2].token == ident {
+                    first -= 2;
+                }
+                return Some(position(&tokens[first]));
+            }
         }
     }
-    None
+    tokens
+        .iter()
+        .find(|tok| spelled(tok).as_deref() == Some(name))
+        .map(position)
 }
 
 /// libpg_query's own message, without the `Error splitting: ` / `Invalid

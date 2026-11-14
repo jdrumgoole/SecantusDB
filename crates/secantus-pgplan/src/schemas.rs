@@ -829,10 +829,19 @@ fn qualify_reference(r: &mut RangeVar, ctes: &[String], trivial: bool) -> Option
         return None;
     }
     if let Some(t) = names_temp_schema(&r.schemaname) {
+        let key = relation_key(&t, &r.relname);
+        // A `pg_temp` relation the session does not have is reported by the
+        // name as written (`relation "pg_temp.x" does not exist`), not by
+        // the namespace `pg_temp` stands for.
+        let key = if r.schemaname == "pg_temp" && !relation_exists(&key) {
+            format!("pg_temp.{}", r.relname)
+        } else {
+            key
+        };
         r.schemaname.clear();
         r.catalogname.clear();
         add_alias(r);
-        r.relname = relation_key(&t, &r.relname);
+        r.relname = key;
         return None;
     }
     if is_builtin(&r.schemaname) {

@@ -2486,14 +2486,22 @@ Measured on PostgreSQL 15.19 (the data-modifying WITH on a private cluster).
       PostgreSQL 15.19.
       Verify: tests/backlog/test_rp_qualified_calls.py::test_enclosing_call_waits_for_its_arguments
       Backlog-ID: RP-950
-- [ ] **A missing relation qualified with `pg_temp` is named by the
-      session's `pg_temp_N`.** On PostgreSQL 15.19 `select * from
-      pg_temp.nosuch` is 42P01 `relation "pg_temp.nosuch" does not exist`
-      at 15, the name as written, whether or not the session has a temp
-      table. Here it is `relation "pg_temp_N.nosuch" does not exist` at 23.
-      Measured on a private 15.19 cluster.
-      Verify: tests/backlog/test_rp_qualified_calls.py::test_pg_temp_relation_is_named_as_written
-      Backlog-ID: RP-882
+- [ ] **A missing relation qualified by another database is looked up,
+      not refused.** On PostgreSQL 15.19 `select * from x.pg_temp.nosuch`
+      is 0A000 `cross-database references are not implemented:
+      "x.pg_temp.nosuch"` at 15 (`RangeVarGetRelidExtended`). Here it is
+      42P01 `relation "pg_temp.nosuch" does not exist` at 15. Found while
+      working RP-882; measured on PostgreSQL 15.19.
+      Verify: tests/backlog/test_rp_qualified_calls.py::test_other_database_pg_temp_is_a_cross_database_reference
+      Backlog-ID: RP-964
+- [ ] **A missing relation in another session's `pg_temp_N` loses its
+      schema.** On PostgreSQL 15.19 `select * from pg_temp_1.nosuch` is
+      42P01 `relation "pg_temp_1.nosuch" does not exist` at 15. Here it is
+      `relation "nosuch" does not exist` at 25: `lookup_relation` falls back
+      to the bare name for any `pg_temp_*`. Found while working RP-882;
+      measured on PostgreSQL 15.19.
+      Verify: tests/backlog/test_rp_qualified_calls.py::test_other_sessions_temp_schema_relation_is_named_as_written
+      Backlog-ID: RP-965
 - [ ] **The session's temp namespace does not follow its transactions.**
       PostgreSQL 15.19 makes `myTempNamespace` with the first temporary
       object and forgets it when the transaction (or subtransaction) that

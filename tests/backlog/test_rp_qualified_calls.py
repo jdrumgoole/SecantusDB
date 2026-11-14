@@ -386,10 +386,11 @@ PG_TEMP_RELATION = {
 }
 
 
-@pytest.mark.backlog("RP-882")
+@pytest.mark.backlog_fixed("RP-882")
 @pytest.mark.parametrize("case", list(PG_TEMP_RELATION))
 def test_pg_temp_relation_is_named_as_written(case: str, dsn: str) -> None:
-    """A missing `pg_temp` relation is named `pg_temp`, at its name."""
+    """A missing `pg_temp` relation was named by the session's `pg_temp_N`
+    at its bare name; it is now named `pg_temp`, at the qualifier."""
     assert answer(dsn, *PG_TEMP_RELATION[case]) == (
         "42P01",
         'relation "pg_temp.nosuch" does not exist',
@@ -422,3 +423,55 @@ def test_temp_namespace_follows_transactions(case: str, dsn: str) -> None:
     """The temp namespace is made and unmade with its transaction."""
     statements, expected = TEMP_NAMESPACE[case]
     assert answer(dsn, *statements) == expected
+
+
+QUALIFIED_RELATION_POSITION = {
+    "user schema": (
+        ("create schema if not exists s882", "select * from s882.nosuch"),
+        ("42P01", 'relation "s882.nosuch" does not exist', None, "15"),
+    ),
+    "a column reference first": (
+        ("select pg_temp.nosuch.a from pg_temp.nosuch",),
+        ("42P01", 'relation "pg_temp.nosuch" does not exist', None, "30"),
+    ),
+    "catalog-qualified": (
+        ("select * from postgres.pg_temp.nosuch",),
+        ("42P01", 'relation "pg_temp.nosuch" does not exist', None, "15"),
+    ),
+}
+
+
+@pytest.mark.backlog_fixed("RP-882")
+@pytest.mark.parametrize("case", list(QUALIFIED_RELATION_POSITION))
+def test_qualified_missing_relation_points_at_its_qualifier(case: str, dsn: str) -> None:
+    """A missing qualified relation pointed at its bare name; it now points
+    at the reference's first part, as PostgreSQL 15.19's RangeVar location
+    does, and a `schema.name.col` column reference is not taken for it."""
+    statements, expected = QUALIFIED_RELATION_POSITION[case]
+    try:
+        assert answer(dsn, *statements) == expected
+    finally:
+        answer(dsn, "drop schema if exists s882")
+
+
+@pytest.mark.backlog("RP-964")
+def test_other_database_pg_temp_is_a_cross_database_reference(dsn: str) -> None:
+    """`x.pg_temp.nosuch` names another database: 0A000 on 15.19."""
+    assert answer(dsn, "select * from x.pg_temp.nosuch") == (
+        "0A000",
+        'cross-database references are not implemented: "x.pg_temp.nosuch"',
+        None,
+        "15",
+    )
+
+
+@pytest.mark.backlog("RP-965")
+def test_other_sessions_temp_schema_relation_is_named_as_written(dsn: str) -> None:
+    """A missing relation in a `pg_temp_N` that is not the session's keeps
+    its schema in the message, at the qualifier."""
+    assert answer(dsn, "select * from pg_temp_1.nosuch") == (
+        "42P01",
+        'relation "pg_temp_1.nosuch" does not exist',
+        None,
+        "15",
+    )
