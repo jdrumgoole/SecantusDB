@@ -8339,3 +8339,27 @@ fn an_unknown_parameter_takes_its_typed_operands_type() {
     );
     assert_eq!(got("select $1 #>> '{}'::jsonb", &[None])[0], None);
 }
+
+/// A system column other than `tableoid` in a generation expression is
+/// 42P10 at the reference, as on PostgreSQL 15.19 (RP-862).
+#[test]
+fn a_system_column_in_a_generation_expression_is_refused() {
+    let sql = "create table t816 (x int, y int generated always as (xmin::text::int) stored)";
+    take_error_location();
+    let err = plan(sql, &lookup).expect_err("should refuse");
+    assert_eq!(err.sqlstate(), "42P10", "got {err}");
+    assert_eq!(
+        err.to_string(),
+        "cannot use system column \"xmin\" in column generation expression"
+    );
+    assert_eq!(
+        crate::errpos::error_position(sql, "42P10", &err.to_string()),
+        Some(54)
+    );
+    take_error_location();
+    plan(
+        "create table t816 (x int, y oid generated always as (tableoid) stored)",
+        &lookup,
+    )
+    .expect("tableoid is allowed");
+}

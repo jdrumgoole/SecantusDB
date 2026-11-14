@@ -12820,6 +12820,7 @@ fn plan_create(c: &pg_query::protobuf::CreateStmt, analyse_defaults: bool) -> Re
                             let Some(raw) = k.raw_expr.as_ref() else {
                                 continue;
                             };
+                            generated_system_column(raw, &table)?;
                             column.extra.insert("generated", deparse_expr(raw)?);
                         }
                         Ok(CT::ConstrForeign) => {
@@ -13848,6 +13849,46 @@ fn first_bad_column(
     })
     .ok()?;
     first
+}
+
+/// `scanNSItemForColumn` under `EXPR_KIND_GENERATED_COLUMN`: a system
+/// column other than `tableoid` in a generation expression is 42P10 at the
+/// reference (RP-862). The first one written is the one refused.
+fn generated_system_column(raw: &pg_query::protobuf::Node, table: &str) -> Result<()> {
+    let mut first: Option<(i32, String)> = None;
+    walk_expr(&mut raw.clone(), &mut |n| {
+        if let Some(N::ColumnRef(c)) = n.node.as_ref() {
+            let parts: Vec<&str> = c
+                .fields
+                .iter()
+                .filter_map(|f| match f.node.as_ref() {
+                    Some(N::String(s)) => Some(s.sval.as_str()),
+                    _ => None,
+                })
+                .collect();
+            let col = match parts.as_slice() {
+                [col] => *col,
+                [t, col] if *t == table => *col,
+                _ => return Ok(()),
+            };
+            let system = secantus_pgcatalog::SYSTEM_FIELDS
+                .iter()
+                .any(|(s, _, _)| *s == col);
+            if system && first.as_ref().is_none_or(|(f, _)| c.location < *f) {
+                first = Some((c.location, col.to_string()));
+            }
+        }
+        Ok(())
+    })?;
+    match first {
+        Some((at, col)) => {
+            set_error_location(at);
+            Err(Error::InvalidColumnReference(format!(
+                "cannot use system column \"{col}\" in column generation expression"
+            )))
+        }
+        None => Ok(()),
+    }
 }
 
 /// Plan a CHECK constraint's predicate text over `def`'s columns as a row

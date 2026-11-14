@@ -3771,14 +3771,6 @@ Measured on a private PostgreSQL 15.19 cluster.
       and `column "nosuch" does not exist` at 39 here.
       Verify: tests/backlog/test_rp_found_rp816.py::test_a_checks_qualified_column_is_resolved_against_its_table
       Backlog-ID: RP-861
-- [ ] **A system column in a generated column's expression is accepted.**
-      `create table t816 (x int, y int generated always as
-      (xmin::text::int) stored)` is 42P10 `cannot use system column "xmin"
-      in column generation expression` at 54 on PostgreSQL 15.19
-      (`scanNSItemForColumn` under `EXPR_KIND_GENERATED_COLUMN`, `tableoid`
-      allowed); here the table is created.
-      Verify: tests/backlog/test_rp_found_rp816.py::test_a_system_column_in_a_generated_column_is_42p10
-      Backlog-ID: RP-862
 
 ## Found while working RP-860 (2026-11-14)
 
