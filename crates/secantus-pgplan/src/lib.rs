@@ -7781,6 +7781,9 @@ pub enum DeclaredTypeError {
     /// A pseudo-type, as printed: 0A000 `variable "x" has pseudo-type t`,
     /// with the compiler's frame (RP-618).
     PseudoType(&'static str),
+    /// Text that is not one type name (RP-617): `typeStringToTypeName`'s
+    /// syntax error, and the byte offset in the text of the token it is at.
+    SyntaxAt(Error, usize),
 }
 
 /// The relation a `name%ROWTYPE` names, as `plpgsql_parse_wordrowtype`
@@ -7857,6 +7860,32 @@ fn plpgsql_pseudo_type(tn: &pg_query::protobuf::TypeName) -> Option<&'static str
         .map(|(_, t)| *t)
 }
 
+/// `typeStringToTypeName`'s refusal of `text` (`raw_parser` in
+/// `RAW_PARSE_TYPE_NAME` mode): the grammar's syntax error, and the byte
+/// offset in `text` of the token it names (the end of the text for `at end
+/// of input`). `None` when the text is one type name.
+fn type_syntax_error(text: &str) -> Option<(String, usize)> {
+    const PREFIX: &str = "select null::";
+    let probe = format!("{PREFIX}{text}");
+    let message = match pg_query::parse(&probe) {
+        Ok(_) => return None,
+        Err(pg_query::Error::Parse(m)) => m,
+        Err(_) => return None,
+    };
+    if message.ends_with("at end of input") {
+        return Some((message, text.len()));
+    }
+    let near = message
+        .strip_prefix("syntax error at or near \"")?
+        .strip_suffix('"')?;
+    let scan = pg_query::scan(&probe).ok()?;
+    scan.tokens
+        .iter()
+        .filter(|t| t.start as usize >= PREFIX.len())
+        .find(|t| probe.get(t.start as usize..t.end as usize) == Some(near))
+        .map(|t| (message.clone(), t.start as usize - PREFIX.len()))
+}
+
 pub fn plpgsql_declared_type(text: &str) -> std::result::Result<(), DeclaredTypeError> {
     let text = text.trim();
     // The type text as SQL reads a cast's target type.
@@ -7903,7 +7932,10 @@ pub fn plpgsql_declared_type(text: &str) -> std::result::Result<(), DeclaredType
         return Ok(());
     }
     let Some(tn) = type_name(text) else {
-        return Ok(());
+        return match type_syntax_error(text) {
+            Some((message, at)) => Err(DeclaredTypeError::SyntaxAt(Error::Parse(message), at)),
+            None => Ok(()),
+        };
     };
     match routine_type_missing(&tn) {
         Ok(None) => {
@@ -8801,6 +8833,31 @@ pub fn plpgsql_io_folds(source: &str, target: &str) -> bool {
     };
     let (s, t) = (s.trim_end_matches("[]"), t.trim_end_matches("[]"));
     !stable_io(s, false) && !stable_io(t, true)
+}
+
+#[cfg(test)]
+mod declared_type_syntax_tests {
+    use super::*;
+
+    /// Text that is not one type name is the grammar's syntax error, at its
+    /// token in the text (RP-617).
+    #[test]
+    fn text_that_is_not_one_type_name_is_a_syntax_error() {
+        let at = |t: &str| match plpgsql_declared_type(t) {
+            Err(DeclaredTypeError::SyntaxAt(e, at)) => Some((e.to_string(), at)),
+            _ => None,
+        };
+        assert_eq!(
+            at("int(3)"),
+            Some(("syntax error at or near \"(\"".into(), 3))
+        );
+        assert_eq!(
+            at("varchar(nosuch)"),
+            Some(("syntax error at or near \"nosuch\"".into(), 8))
+        );
+        assert_eq!(at("varchar(3)"), None);
+        assert_eq!(at("int"), None);
+    }
 }
 
 #[cfg(test)]
@@ -53097,6 +53154,9 @@ mod rp573_declared_types {
             Err(DeclaredTypeError::AtType(e)) => Some((true, e.sqlstate().into(), e.to_string())),
             Err(DeclaredTypeError::Compile(e)) => Some((false, e.sqlstate().into(), e.to_string())),
             Err(DeclaredTypeError::PseudoType(t)) => Some((false, "0A000".into(), t.into())),
+            Err(DeclaredTypeError::SyntaxAt(e, _)) => {
+                Some((true, e.sqlstate().into(), e.to_string()))
+            }
         }
     }
 
@@ -53115,8 +53175,8 @@ mod rp573_declared_types {
     /// A DECLARE's type is looked up as `parse_datatype` and the
     /// `%ROWTYPE` lookups do (RP-573): a missing type at the type, a
     /// missing schema 3F000, a `%ROWTYPE`'s missing relation 42P01 with
-    /// no position; a `%TYPE` and a text that is not one type name are
-    /// not checked here.
+    /// no position; a `%TYPE` is not checked here, and a text that is not
+    /// one type name is the grammar's syntax error (RP-617).
     #[test]
     fn a_declared_type_is_looked_up() {
         for ok in [
@@ -53131,11 +53191,14 @@ mod rp573_declared_types {
             "text[3]",
             "x%type",
             "t.a%type",
-            "int(3)",
         ] {
             assert_eq!(refused(ok), None, "{ok}");
         }
         let at = |sqlstate: &str, message: &str| Some((true, sqlstate.into(), message.into()));
+        assert_eq!(
+            refused("int(3)"),
+            at("42601", "syntax error at or near \"(\"")
+        );
         assert_eq!(
             refused("nosuch573"),
             at("42704", "type \"nosuch573\" does not exist")

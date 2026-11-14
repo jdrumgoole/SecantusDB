@@ -14,6 +14,68 @@ use super::*;
 struct Tok<'a> {
     start: usize,
     text: &'a str,
+    /// An escape-string literal with an escape: the plain literal its
+    /// value spells (`E'a\\tb'` as `'a<tab>b'`).
+    decoded: Option<String>,
+}
+
+/// The plain literal an escape-string literal's body (`a\\tb`, between
+/// `E'` and `'`) reads as, its escapes decoded as the scanner decodes them
+/// (`scan.l`'s `xe` rules): `\b \f \n \r \t`, octal `\ooo`, hex `\xhh`,
+/// `\uXXXX`, `\UXXXXXXXX`, any other `\c` as `c`, and `''` as `'`.
+/// `None` when an escape names no character.
+fn decode_escape_literal(body: &str) -> Option<String> {
+    let mut out = String::with_capacity(body.len());
+    let mut it = body.chars().peekable();
+    let take = |it: &mut std::iter::Peekable<std::str::Chars>, n: usize, radix: u32| {
+        let mut v = 0u32;
+        let mut k = 0;
+        while k < n {
+            match it.peek().and_then(|c| c.to_digit(radix)) {
+                Some(d) => {
+                    v = v * radix + d;
+                    it.next();
+                    k += 1;
+                }
+                None => break,
+            }
+        }
+        (k > 0).then_some(v)
+    };
+    while let Some(c) = it.next() {
+        match c {
+            '\'' => {
+                it.next_if_eq(&'\'');
+                out.push('\'');
+            }
+            '\\' => match it.next()? {
+                'b' => out.push('\x08'),
+                'f' => out.push('\x0c'),
+                'n' => out.push('\n'),
+                'r' => out.push('\r'),
+                't' => out.push('\t'),
+                d @ '0'..='7' => {
+                    let mut v = d as u32 - '0' as u32;
+                    for _ in 0..2 {
+                        match it.peek().and_then(|c| c.to_digit(8)) {
+                            Some(x) => {
+                                v = v * 8 + x;
+                                it.next();
+                            }
+                            None => break,
+                        }
+                    }
+                    out.push(char::from_u32(v)?);
+                }
+                'x' => out.push(char::from_u32(take(&mut it, 2, 16)?)?),
+                'u' => out.push(char::from_u32(take(&mut it, 4, 16)?)?),
+                'U' => out.push(char::from_u32(take(&mut it, 8, 16)?)?),
+                other => out.push(other),
+            },
+            c => out.push(c),
+        }
+    }
+    Some(out)
 }
 
 fn unquote_ident(text: &str) -> String {
@@ -93,7 +155,9 @@ fn element_literal(toks: &[Tok], value: &str) -> Option<usize> {
         w[1].text == "::"
             && crate::vectors::is_vector(&w[2].text.to_ascii_lowercase())
             && w[0]
-                .text
+                .decoded
+                .as_deref()
+                .unwrap_or(w[0].text)
                 .strip_prefix('\'')
                 .and_then(|r| r.strip_suffix('\''))
                 .is_some_and(|body| vector_tail(&body.replace("''", "'")))
@@ -111,7 +175,7 @@ fn input_literal(toks: &[Tok], value: &str) -> Option<usize> {
     let lit = format!("'{}'", value.replace('\'', "''"));
     let i = toks
         .iter()
-        .position(|t| t.text == lit)
+        .position(|t| t.text == lit || t.decoded.as_deref() == Some(lit.as_str()))
         .or_else(|| element_literal(toks, value))?;
     // A literal cast to a string type first is a text VALUE when the
     // target's input function reads it, at execution, where there is
@@ -324,11 +388,20 @@ pub fn error_position(sql: &str, sqlstate: &str, message: &str) -> Option<usize>
             // its `E`: under `standard_conforming_strings = off` every
             // plain literal reaches here rewritten as one
             // (`escape_strings`), and the `E` maps back to its quote.
+            let decoded = text
+                .get(..2)
+                .filter(|p| p.eq_ignore_ascii_case("E'") && text.contains('\\'))
+                .and_then(|_| decode_escape_literal(text.get(2..text.len().checked_sub(1)?)?))
+                .map(|v| format!("'{}'", v.replace('\'', "''")));
             let text = match text.get(..2) {
                 Some("E'" | "e'") => &text[1..],
                 _ => text,
             };
-            Some(Tok { start: s, text })
+            Some(Tok {
+                start: s,
+                text,
+                decoded,
+            })
         })
         .collect();
     let pos = |start: usize| Some(sql.get(..start)?.chars().count() + 1);
@@ -807,5 +880,32 @@ fn regtype_literal_names(tok: &str, full: &str) -> bool {
         text.replace('"', "") == full
     } else {
         text.to_ascii_lowercase() == full
+    }
+}
+
+#[cfg(test)]
+mod escape_literal_tests {
+    use super::*;
+
+    #[test]
+    fn an_escaped_literal_input_error_is_placed_at_its_e() {
+        let msg = "invalid input syntax for type integer: \"a\tb\"";
+        assert_eq!(
+            error_position("select E'a\\tb'::int4", "22P02", msg),
+            Some(8)
+        );
+        let msg = "invalid input syntax for type smallint: \"1\t2\"";
+        assert_eq!(
+            error_position("select E'1\\t2'::int2vector", "22P02", msg),
+            Some(8)
+        );
+    }
+
+    #[test]
+    fn escapes_decode_as_the_scanner_reads_them() {
+        assert_eq!(
+            decode_escape_literal(r"a\101\x42C\q''").as_deref(),
+            Some("aABCq'")
+        );
     }
 }

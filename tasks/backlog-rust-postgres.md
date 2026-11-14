@@ -3393,19 +3393,6 @@ RP-573 a DECLARE's type is looked up at CREATE FUNCTION and before a DO
 block runs (`check_plpgsql_declarations`), from the type text libpg_query
 keeps; what follows is what that lookup does not yet check.
 
-- [ ] **A PL/pgSQL DECLARE whose type text is not one type name is
-      created.** `read_datatype` passes the text to `parse_datatype` unless
-      it is a `%TYPE` of a variable or column it finds, and a text that is
-      not one type name is 42601 at the token, with the CONTEXT `invalid
-      type name "..."`: on PostgreSQL 15.19 `declare x nosuch573%type` is
-      `syntax error at or near "%"` at 78, `y nosuch573.x%type` the same at
-      87, `x int(3)` `syntax error at or near "("` at 72 and `x
-      varchar(nosuch)` `syntax error at or near "nosuch"` at 77. Here each
-      is created. libpg_query stubs the `%TYPE` lookups out
-      (`plpgsql_parse_wordtype` returns NULL), so finding the variable or
-      column is this server's to do, in the block scopes PL/pgSQL keeps.
-      Verify: tests/backlog/test_rp_found_rp573.py::test_declare_of_text_that_is_not_one_type_name
-      Backlog-ID: RP-617
 - [ ] **A `pg_temp` type in a session with no temporary schema is a
       missing type, not a missing schema.** `LookupExplicitNamespace`
       finds `pg_temp` only once the session has made its temp schema, so on
@@ -3926,15 +3913,6 @@ Measured on PostgreSQL 15.19 (the shared reference on port 5415) with the
 `_SETUP` in `tests/backlog/test_rp_found_rp839.py` and `"Over845"` a domain
 over its `"Mx839"`.
 
-- [ ] **A PL/pgSQL declaration folds a quoted type name to lower case.**
-      `do $$ declare x "Over845" := 5; begin raise notice '%', x; end $$`
-      prints `NOTICE: 5` on PostgreSQL 15.19 (`parse_datatype` reads the
-      type as the grammar does, keeping a quoted name's case), and an
-      assignment of 0 to such a variable is 23514 `value for domain
-      "Over845" violates check constraint "Mx839_check"`. Here each is
-      42704 `type "over845" does not exist`.
-      Verify: tests/backlog/test_rp_found_rp839.py::test_a_plpgsql_declaration_keeps_a_quoted_types_case
-      Backlog-ID: RP-865
 
 ## Found while working RP-692 (2026-11-10)
 
@@ -4088,19 +4066,6 @@ statement is VALUES-only and runs there as written. The gap tests are in
       be used in an aggregate function`, at the same place.
       Verify: tests/backlog/test_rp_found_rp854.py::test_an_undefined_column_in_a_grouped_query_is_42703
       Backlog-ID: RP-874
-
-## Found while working RP-605 (2026-11-11)
-
-Measured on PostgreSQL 15.19; none of it needs DDL. The gap tests are in
-`tests/backlog/test_rp_found_rp605.py`.
-
-- [ ] **An escape-string literal's input error has no position when an
-      escape is in its value.** `select E'a\tb'::int4` is 22P02 at 8 on
-      PostgreSQL 15.19; here it has none, `errpos.rs` matching the quoted
-      value (with a real tab) against the literal's spelling (`\t`).
-      `E'x'::int4`, with no escape, is placed.
-      Verify: tests/backlog/test_rp_found_rp605.py::test_escaped_literal_input_error_has_a_position
-      Backlog-ID: RP-867
 
 ## Found while working RP-565 (2026-11-12)
 

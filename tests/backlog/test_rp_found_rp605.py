@@ -45,15 +45,15 @@ def test_out_of_range_literal_has_a_position(sql: str, dsn: str) -> None:
     assert _error(dsn, sql) == ("22003", OUT_OF_RANGE[sql], "8")
 
 
-# An escape-string literal whose value holds a decoded escape: at the
-# literal (position 8) too.
+# An escape-string literal whose value holds a decoded escape was
+# unplaced; it is at the literal (position 8) too.
 ESCAPED = {
     "select E'a\\tb'::int4": 'invalid input syntax for type integer: "a\tb"',
     "select E'1\\t2'::int2vector": 'invalid input syntax for type smallint: "1\t2"',
 }
 
 
-@pytest.mark.backlog("RP-867")
+@pytest.mark.backlog_fixed("RP-867")
 @pytest.mark.parametrize("sql", list(ESCAPED))
 def test_escaped_literal_input_error_has_a_position(sql: str, dsn: str) -> None:
     assert _error(dsn, sql) == ("22P02", ESCAPED[sql], "8")

@@ -184,8 +184,9 @@ def test_a_char_columns_default_casts_to_bpchar(dsn: str) -> None:
 # quoted identifier's case, and a domain's errors name it quoted. Here the
 # quoted name is folded to lower case and not found (42704 `type "over845"
 # does not exist`).
-@pytest.mark.backlog("RP-865")
+@pytest.mark.backlog_fixed("RP-865")
 def test_a_plpgsql_declaration_keeps_a_quoted_types_case(dsn: str) -> None:
+    """A PL/pgSQL declaration folded a quoted type name to lower case."""
     got = _answers(
         dsn,
         [

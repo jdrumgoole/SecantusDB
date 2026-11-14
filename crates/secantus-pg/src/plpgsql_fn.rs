@@ -1013,13 +1013,26 @@ pub fn declared_type_offset(body: &str, d: &Declared) -> Option<usize> {
 }
 
 /// A type name as PL/pgSQL records it (`pg_catalog.int4`, `int `,
-/// `pg_catalog."integer"`) in the server's canonical spelling.
+/// `pg_catalog."integer"`) in the server's canonical spelling. A quoted
+/// name keeps its case, as the grammar reads it (RP-865); the rest folds.
 fn canonical_type(raw: &str) -> String {
-    let t = raw
-        .trim()
-        .trim_start_matches("pg_catalog.")
-        .replace('"', "");
-    let t = t.trim().to_ascii_lowercase();
+    let t = raw.trim();
+    let t = t.strip_prefix("pg_catalog.").unwrap_or(t);
+    let mut folded = String::with_capacity(t.len());
+    let mut chars = t.chars().peekable();
+    let mut quoted = false;
+    while let Some(c) = chars.next() {
+        match c {
+            '"' if quoted && chars.peek() == Some(&'"') => {
+                chars.next();
+                folded.push('"');
+            }
+            '"' => quoted = !quoted,
+            c if quoted => folded.push(c),
+            c => folded.push(c.to_ascii_lowercase()),
+        }
+    }
+    let t = folded.trim().to_string();
     let (base, array) = match t.strip_suffix("[]") {
         Some(b) => (b.trim().to_string(), true),
         None => (t, false),
@@ -3683,8 +3696,34 @@ fn length_read_type(base: &str) -> String {
     }
 }
 
+/// A canonical type (see [`canonical_type`]) as SQL text: a name the
+/// grammar would fold (`Over845`) is quoted, so the cast names the same
+/// type (RP-865). A modifier or `[]` after the name is kept as written.
 fn sql_type(ty: &str) -> String {
-    ty.to_string()
+    let plain = |w: &str| {
+        w.chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_lowercase() || c == '_')
+            && w.chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '$')
+    };
+    let end = ty.find(['(', '[']).unwrap_or(ty.len());
+    let (name, rest) = ty.split_at(end);
+    let name = name.trim_end();
+    if name.contains(' ') || name.split('.').all(plain) {
+        return ty.to_string();
+    }
+    let quoted: Vec<String> = name
+        .split('.')
+        .map(|w| {
+            if plain(w) {
+                w.to_string()
+            } else {
+                format!("\"{}\"", w.replace('"', "\"\""))
+            }
+        })
+        .collect();
+    format!("{}{rest}", quoted.join("."))
 }
 
 /// A `CALL`'s arguments as written: the variable each names (a named
@@ -3730,6 +3769,20 @@ mod rp573_declarations {
     /// The variables a body declares, with their type text as written and
     /// their line; a routine's parameters and the compiler's own variables
     /// are not among them (RP-573).
+    /// A quoted type name keeps its case, and is quoted again where it is
+    /// spliced into a cast (RP-865).
+    #[test]
+    fn a_quoted_type_keeps_its_case() {
+        assert_eq!(canonical_type("\"Over845\""), "Over845");
+        assert_eq!(canonical_type("public.\"My\"\"T\""), "public.My\"T");
+        assert_eq!(canonical_type("pg_catalog.\"integer\""), "int4");
+        assert_eq!(canonical_type("VARCHAR(3)"), "varchar(3)");
+        assert_eq!(sql_type("Over845"), "\"Over845\"");
+        assert_eq!(sql_type("public.My\"T[]"), "public.\"My\"\"T\"[]");
+        assert_eq!(sql_type("varchar(3)"), "varchar(3)");
+        assert_eq!(sql_type("double precision"), "double precision");
+    }
+
     #[test]
     fn declared_types_are_the_bodys() {
         let sql = "create function f573(a int) returns int language plpgsql as $$\n\
