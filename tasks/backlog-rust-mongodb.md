@@ -2509,13 +2509,6 @@ Still different, all 77:
       and an `AND_SORTED` winner. Found 2026-11-14 (RM-436).
       Verify: tests/backlog/test_rm_found_2026_11_08_rm341.py::test_a_not_inside_elem_match_entry_reports_its_size
       Backlog-ID: RM-694
-- [ ] **A SORT_MERGE candidate's trial counts are not mongod's.** For
-      `{a: {$in: [1, 2]}, b: {$lt: 90}}` sorted by `c` over `a_1_c_1` and
-      `b_1`, mongod 8.2.11's winning SORT_MERGE reports 82 `works` and its
-      `dupsTested` and `dupsDropped` in `creationExecStats`; this server's
-      reports 83 works and neither field. Found 2026-11-08 (RM-341).
-      Verify: tests/backlog/test_rm_found_2026_11_08_rm341.py::test_a_sort_merge_candidate_counts_as_mongods
-      Backlog-ID: RM-437
 
 ### 7.079 `$out` and `$merge` -- 2026-10-13
 

@@ -103,12 +103,13 @@ def test_a_not_inside_elem_match_entry_reports_its_size(rust_mongo: Any, mongod:
     assert sizes(rust_mongo) == sizes(mongod)
 
 
-@pytest.mark.backlog("RM-437")
+@pytest.mark.backlog_fixed("RM-437")
 def test_a_sort_merge_candidate_counts_as_mongods(rust_mongo: Any, mongod: Any) -> None:
     """mongod 8.2.11's winning SORT_MERGE for `{a: {$in: [1, 2]}, b: {$lt:
     90}}` sorted by `c` over `a_1_c_1` and `b_1` reports 82 `works` and its
     `dupsTested` and `dupsDropped` in `creationExecStats`; this server's
-    reports 83 works and neither field."""
+    reported 83 works -- its FETCH worked the merge once more after the
+    merge was at its end -- and neither field."""
 
     def merge(client: Any) -> list:
         got = _entries(

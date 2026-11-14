@@ -1383,6 +1383,14 @@ pub(crate) fn fixed_extra(node: &Node, extra: &mut Document) {
                 extra.insert("spilledDataStorageSize", 0_i32);
             }
         }
+        // `MergeSortStats`: zero when no child is multikey.
+        Node::SortMerge { .. } => {
+            for key in ["dupsTested", "dupsDropped"] {
+                if !extra.contains_key(key) {
+                    extra.insert(key, 0_i32);
+                }
+            }
+        }
         Node::DistinctScan(..) => {
             extra.insert("docsExamined", 0_i32);
             extra.insert("chunkSkips", 0_i32);
