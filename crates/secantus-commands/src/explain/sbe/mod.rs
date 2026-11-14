@@ -15,7 +15,7 @@
 //! `$sum`, `$count`, `$avg`, `$first`, `$last`, `$min`, `$max`, `$push` and
 //! `$addToSet`. And a `find` a `queryFramework: "sbe"` query setting puts
 //! in SBE (RM-418, `find.rs`): the same collection scan, filter, skip and
-//! limit, with nothing over them. Everything else SBE runs is still
+//! limit, with a simple projection over them. Everything else SBE runs is still
 //! explained in the classic shape (`tasks/backlog-rust-mongodb.md`, RM-071,
 //! RM-543).
 
@@ -36,8 +36,9 @@ use stage::{Counted, Stage};
 pub(crate) struct Plan {
     root: Stage,
     result: Slot,
-    /// The constants the plan reads from slots: its skip and limit.
-    env: Vec<(Slot, i64)>,
+    /// The constants the plan reads from slots (its `$in` lists, skip and
+    /// limit), as its environment prints them.
+    env: Vec<(Slot, String)>,
     /// The `queryPlan`: the query solution the stages were built from.
     query_plan: Document,
     /// The collection does not exist: `limit 0` over `coscan`.
@@ -52,11 +53,11 @@ pub(crate) fn group_plan(group: &Document, uuid: &str, last: bool, front: &Front
     group::build(group, uuid, last, front)
 }
 
-/// The plan for a `find` whose query is `front`, a collection scan of the
-/// collection whose UUID is `uuid`. `None` when its filter is outside what
-/// is built here.
-pub(crate) fn find_plan(uuid: &str, front: &Front) -> Option<Plan> {
-    find::build(uuid, front)
+/// The plan for a `find` whose query is `front` and whose projection is
+/// `projection`, a collection scan of the collection whose UUID is `uuid`.
+/// `None` when its filter or projection is outside what is built here.
+pub(crate) fn find_plan(uuid: &str, front: &Front, projection: Option<&Document>) -> Option<Plan> {
+    find::build(uuid, front, projection)
 }
 
 /// The plan mongod builds over a collection that does not exist.

@@ -14,19 +14,29 @@
 //! `l6.0`, `d.e` `l3.0` and `l4.0`).
 //!
 //! Built here: `$eq`, `$lt`, `$lte`, `$gt` and `$gte` of a number (not NaN),
-//! a string or a boolean, on a path of named fields, and `$and`s of those.
+//! a string or a boolean, on a path of named fields, and `$and`s of those;
+//! for a `find` (`Filter::parse_find`), also an `$in` of such values but
+//! null: `isMember` against an `InList` the plan's environment binds, its
+//! values in the command's own order (the `parsedQuery` sorts them).
 //! Anything else returns `None` and the pipeline is explained classically.
 
 use super::expr::{BinOp, Expr, Slot};
 use bson::{Bson, Document};
 use std::collections::BTreeSet;
 
+/// What a leaf tests its path's values with.
+#[derive(Clone, Debug)]
+enum Test {
+    Compare(BinOp, Bson),
+    /// `$in`: the values as the command gave them.
+    In(Vec<Bson>),
+}
+
 /// One comparison of the filter.
 #[derive(Clone, Debug)]
 struct Leaf {
     path: Vec<String>,
-    op: BinOp,
-    value: Bson,
+    test: Test,
 }
 
 /// A filter, ready to be given its slots.
@@ -57,7 +67,7 @@ fn comparable(v: &Bson) -> bool {
     }
 }
 
-fn leaf(clause: &Document) -> Option<Leaf> {
+fn leaf(clause: &Document, raw: Option<&Document>) -> Option<Leaf> {
     let (path, cond) = clause.iter().next().filter(|_| clause.len() == 1)?;
     if path.starts_with('$') {
         return None;
@@ -73,24 +83,65 @@ fn leaf(clause: &Document) -> Option<Leaf> {
         return None;
     };
     let (name, value) = cond.iter().next().filter(|_| cond.len() == 1)?;
+    if name == "$in" {
+        let values = raw_in(raw?, path)?;
+        let printable = values
+            .iter()
+            .all(|v| comparable(v) && super::print::list_value(v).is_some());
+        return printable.then_some(Leaf {
+            path: parts,
+            test: Test::In(values),
+        });
+    }
     let op = op_of(name)?;
     comparable(value).then(|| Leaf {
         path: parts,
-        op,
-        value: value.clone(),
+        test: Test::Compare(op, value.clone()),
     })
+}
+
+/// The one `$in` on `path` in the command's filter `raw`, at its top level
+/// or in a top-level `$and`; `None` when there is not exactly one.
+fn raw_in(raw: &Document, path: &str) -> Option<Vec<Bson>> {
+    let mut found = Vec::new();
+    let mut look = |d: &Document| {
+        if let Some(Bson::Document(cond)) = d.get(path) {
+            if let Some(Bson::Array(values)) = cond.get("$in") {
+                found.push(values.clone());
+            }
+        }
+    };
+    look(raw);
+    if let Some(Bson::Array(clauses)) = raw.get("$and") {
+        for c in clauses {
+            if let Bson::Document(c) = c {
+                look(c);
+            }
+        }
+    }
+    (found.len() == 1).then(|| found.remove(0))
 }
 
 impl Filter {
     /// The filter of `parsed` (a `parsedQuery`); `None` when it is empty or
     /// outside what is built here.
     pub fn parse(parsed: &Document) -> Option<Filter> {
+        Self::parse_with(parsed, None)
+    }
+
+    /// The filter of a `find` whose command filter is `raw` and whose
+    /// `parsedQuery` is `parsed`: an `$in` is built too.
+    pub fn parse_find(parsed: &Document, raw: &Document) -> Option<Filter> {
+        Self::parse_with(parsed, Some(raw))
+    }
+
+    fn parse_with(parsed: &Document, raw: Option<&Document>) -> Option<Filter> {
         let leaves = match parsed.get("$and") {
             Some(Bson::Array(clauses)) if parsed.len() == 1 => clauses
                 .iter()
-                .map(|c| leaf(c.as_document()?))
+                .map(|c| leaf(c.as_document()?, raw))
                 .collect::<Option<Vec<Leaf>>>()?,
-            _ => vec![leaf(parsed)?],
+            _ => vec![leaf(parsed, raw)?],
         };
         Some(Filter { leaves })
     }
@@ -109,13 +160,33 @@ impl Filter {
         self.leaves.iter().map(|l| l.path.len() as u32).sum()
     }
 
-    /// The program, reading each top-level field from `slot_of`.
-    pub fn program(&self, slot_of: &dyn Fn(&str) -> Option<Slot>) -> Option<Expr> {
+    /// The program, reading each top-level field from `slot_of`; each
+    /// `$in`'s list takes the next slot of `slots`, in the program's order.
+    pub fn program(
+        &self,
+        slot_of: &dyn Fn(&str) -> Option<Slot>,
+        slots: &mut dyn FnMut() -> Slot,
+    ) -> Option<Expr> {
         let mut frame = self.lambdas();
         let mut built = Vec::new();
         for l in &self.leaves {
             let top = Expr::Slot(slot_of(&l.path[0])?);
-            built.push(traverse(top, l, 0, &mut frame));
+            let test: Box<dyn Fn(Expr) -> Expr> = match &l.test {
+                Test::In(values) => {
+                    let list = Expr::InList(slots(), values.clone());
+                    Box::new(move |v| Expr::func("isMember", vec![v, list.clone()]))
+                }
+                Test::Compare(op, value) => {
+                    let (op, value) = (*op, value.clone());
+                    Box::new(move |v| {
+                        Expr::fill_empty(
+                            Expr::bin(op, v, Expr::Const(Some(value.clone()))),
+                            Expr::Const(Some(Bson::Boolean(false))),
+                        )
+                    })
+                }
+            };
+            built.push(traverse(top, l, &*test, 0, &mut frame));
         }
         let mut out = built.pop()?;
         while let Some(prev) = built.pop() {
@@ -127,7 +198,13 @@ impl Filter {
 
 /// `traverseF` over `input`, the field `leaf.path[depth]` of the level
 /// above; frames are taken outermost first.
-fn traverse(input: Expr, leaf: &Leaf, depth: usize, frame: &mut u32) -> Expr {
+fn traverse(
+    input: Expr,
+    leaf: &Leaf,
+    test: &dyn Fn(Expr) -> Expr,
+    depth: usize,
+    frame: &mut u32,
+) -> Expr {
     *frame += 1;
     let mine = *frame;
     let local = Expr::Local {
@@ -135,10 +212,7 @@ fn traverse(input: Expr, leaf: &Leaf, depth: usize, frame: &mut u32) -> Expr {
         moved: true,
     };
     let body = if depth + 1 == leaf.path.len() {
-        Expr::fill_empty(
-            Expr::bin(leaf.op, local, Expr::Const(Some(leaf.value.clone()))),
-            Expr::Const(Some(Bson::Boolean(false))),
-        )
+        test(local)
     } else {
         let field = Expr::func(
             "getField",
@@ -147,7 +221,7 @@ fn traverse(input: Expr, leaf: &Leaf, depth: usize, frame: &mut u32) -> Expr {
                 Expr::Const(Some(Bson::String(leaf.path[depth + 1].clone()))),
             ],
         );
-        traverse(field, leaf, depth + 1, frame)
+        traverse(field, leaf, test, depth + 1, frame)
     };
     Expr::func(
         "traverseF",
@@ -171,7 +245,7 @@ mod tests {
     fn text(parsed: bson::Document, slots: &[(&str, u32)]) -> String {
         let f = Filter::parse(&parsed).unwrap();
         let slot = |n: &str| slots.iter().find(|(k, _)| *k == n).map(|(_, s)| *s);
-        expression(&f.program(&slot).unwrap())
+        expression(&f.program(&slot, &mut || 9).unwrap())
     }
 
     /// The filters mongod 8.2.11 prints, measured 2026-11-08.

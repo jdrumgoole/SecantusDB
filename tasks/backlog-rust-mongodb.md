@@ -2114,15 +2114,16 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       `$lookup`, and runs them classic. Found 2026-11-10 (RM-418).
       Verify: tests/backlog/test_rm_found_2026_11_10_rm418.py::test_sbe_framework_pushes_an_aggregate_and_a_distinct
       Backlog-ID: RM-542
-- [ ] **A `find` under `queryFramework: "sbe"` that is sorted, projected,
-      index-served or filtered beyond comparisons is explained in the
-      classic shape.** mongod 8.2.11 runs it in SBE and explains it so
-      (`nlj` / `ixseek` / `seek` over an index, `sort` and `project`
-      stages, `$in`'s `isMember`), as RM-071 describes for a pushed-down
-      `$group`'s front; this server runs it in SBE (its expressions answer
-      as SBE's) but builds the slot program only for a forward collection
-      scan, its comparison filter, skip and limit (`explain/sbe/find.rs`).
-      Found 2026-11-10 (RM-418).
+- [ ] **A `find` under `queryFramework: "sbe"` that is sorted or
+      index-served is explained in the classic shape.** mongod 8.2.11 runs
+      it in SBE and explains it so (`nlj` over an `ixseek` and a `seek` for
+      an index; a `sort` over a `project` of `getSortKeyAsc` for a sort);
+      this server builds the slot program only for a forward collection
+      scan, its filter (comparisons and `$in`s), skip, limit and a simple
+      projection of top-level fields (`explain/sbe/find.rs`). Also not
+      built: an `$in` holding null (mongod's `typeMatch` program), a
+      projection of a path or a computed field, and a projection under both
+      a skip and a limit. Found 2026-11-10 (RM-418).
       Verify: tests/backlog/test_rm_found_2026_11_10_rm418.py::test_sbe_find_shapes_are_explained_as_sbe
       Backlog-ID: RM-543
 - [ ] **A query's `planCacheKey` hashes its `indexHints` setting as unset.**

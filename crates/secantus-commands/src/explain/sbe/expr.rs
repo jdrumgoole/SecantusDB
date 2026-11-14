@@ -54,6 +54,12 @@ pub(crate) enum Expr {
     TypeMatch(Box<Expr>, u32),
     /// `ENumericConvert` to int32: `convert ( e, int32)`.
     ConvertInt32(Box<Expr>),
+    /// A slot the plan's environment binds to an `InList` (an `$in`'s
+    /// values, in the order the command gave them): prints `sN`.
+    InList(Slot, Vec<Bson>),
+    /// `makeBsonObj`'s spec: the fields it keeps (`Closed`, the rest
+    /// dropped) or drops (`Open`, the rest kept), in the projection's order.
+    ObjSpec { fields: Vec<String>, open: bool },
 }
 
 /// The mask `typeMatch` and `fillType` take for null and undefined:
@@ -61,6 +67,36 @@ pub(crate) enum Expr {
 pub(crate) const NULLISH_MASK: u32 = 1088;
 
 impl Expr {
+    /// The `InList`s the expression reads, in the order it prints them.
+    pub fn in_lists(&self) -> Vec<(Slot, Vec<Bson>)> {
+        let mut out = Vec::new();
+        self.collect_lists(&mut out);
+        out
+    }
+
+    fn collect_lists(&self, out: &mut Vec<(Slot, Vec<Bson>)>) {
+        match self {
+            Expr::InList(s, values) => out.push((*s, values.clone())),
+            Expr::Func(_, args) => args.iter().for_each(|a| a.collect_lists(out)),
+            Expr::Bin(_, l, r) => {
+                l.collect_lists(out);
+                r.collect_lists(out);
+            }
+            Expr::If(c, t, e) => {
+                c.collect_lists(out);
+                t.collect_lists(out);
+                e.collect_lists(out);
+            }
+            Expr::Not(e) | Expr::TypeMatch(e, _) | Expr::ConvertInt32(e) => e.collect_lists(out),
+            Expr::Lambda { body, .. } => body.collect_lists(out),
+            Expr::Slot(_)
+            | Expr::Local { .. }
+            | Expr::Const(_)
+            | Expr::Int64(_)
+            | Expr::ObjSpec { .. } => {}
+        }
+    }
+
     pub fn null() -> Expr {
         Expr::Const(Some(Bson::Null))
     }
@@ -326,6 +362,9 @@ impl Expr {
                 }
                 _ => None,
             },
+            Expr::InList(_, values) => Some(Bson::Array(values.clone())),
+            // Read only by the `makeBsonObj` it is the spec of.
+            Expr::ObjSpec { .. } => None,
             Expr::Func(name, args) => self.call(name, args, env),
         }
     }
@@ -374,6 +413,39 @@ impl Expr {
             "newObj" | "newBsonObj" => {
                 let vals: Vec<Value> = args.iter().map(|a| a.eval(env)).collect();
                 new_obj(&vals)
+            }
+            // `isMember(v, inList)`: `v` equals one of the list's values
+            // under BSON comparison; Nothing is a member of nothing.
+            "isMember" => {
+                let v = args[0].eval(env);
+                let list = args[1].eval(env);
+                match (v, list) {
+                    (Some(v), Some(Bson::Array(list))) => {
+                        Some(Bson::Boolean(list.iter().any(|m| {
+                            compare(&Some(m.clone()), &Some(v.clone())) == Ordering::Equal
+                        })))
+                    }
+                    (None, Some(_)) => Some(Bson::Boolean(false)),
+                    _ => None,
+                }
+            }
+            // `makeBsonObj(spec, root)`: the root's fields, kept or dropped
+            // by the spec, in the root's order; Nothing over a non-object
+            // (`RetNothing`) for a closed spec, the input for an open one
+            // (`RetInput`).
+            "makeBsonObj" => {
+                let Expr::ObjSpec { fields, open } = &args[0] else {
+                    return None;
+                };
+                match args[1].eval(env) {
+                    Some(Bson::Document(d)) => Some(Bson::Document(
+                        d.into_iter()
+                            .filter(|(k, _)| fields.contains(k) != *open)
+                            .collect(),
+                    )),
+                    other if *open => other,
+                    _ => None,
+                }
             }
             "isNumber" => args[0].eval(env).map(|v| Bson::Boolean(is_number(&v))),
             "fillType" => {

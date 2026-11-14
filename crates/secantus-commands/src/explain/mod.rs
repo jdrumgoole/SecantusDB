@@ -1957,8 +1957,9 @@ fn reply_for(r: &Request, verbosity: Verbosity, ctx: &mut CommandContext) -> Han
         }
     }
     // A `find` mongod runs in SBE (RM-418): over a forward collection scan
-    // with no sort, projection, hint or collation, its scan, filter, skip
-    // and limit; any other is still explained in the classic shape.
+    // with no sort, hint or collation, its scan, filter, skip, limit and a
+    // simple projection (RM-543); any other is still explained in the
+    // classic shape.
     if r.pipeline.is_empty() && front_runs_in_sbe(storage, &db, s, collation.as_ref(), &[]) {
         let built = if !t.exists {
             Some(sbe::eof_plan())
@@ -1971,14 +1972,13 @@ fn reply_for(r: &Request, verbosity: Verbosity, ctx: &mut CommandContext) -> Han
                 }
             );
             let simple = s.sort.as_ref().is_none_or(Document::is_empty)
-                && s.projection.as_ref().is_none_or(Document::is_empty)
                 && s.hint.is_none()
                 && collation.is_none()
                 && s.min_max.is_none()
                 && !s.return_key
                 && !s.show_record_id;
             let parsed = parsed::parsed_query(&s.filter);
-            let filter = sbe::Filter::parse(&parsed);
+            let filter = sbe::Filter::parse_find(&parsed, &s.filter);
             let on = sbe::Front {
                 parsed,
                 filter,
@@ -1988,7 +1988,7 @@ fn reply_for(r: &Request, verbosity: Verbosity, ctx: &mut CommandContext) -> Han
             let filtered = s.filter.is_empty() || on.filter.is_some();
             let uuid = crate::admin::collection_uuid_text(storage, &db, &s.coll);
             (scan && simple && filtered)
-                .then(|| sbe::find_plan(&uuid, &on))
+                .then(|| sbe::find_plan(&uuid, &on, s.projection.as_ref()))
                 .flatten()
         };
         if let Some(built) = built {
