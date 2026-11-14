@@ -74,11 +74,11 @@ def test_set_operation_of_char_domain_and_text_keeps_blanks(dsn: str) -> None:
     assert got == (["character[]"], [("['a b', 'xy ', 'e']",)])
 
 
-@pytest.mark.backlog("RP-673")
+@pytest.mark.backlog_fixed("RP-673")
 def test_array_of_star_over_a_domain_subquery_is_the_domains(dsn: str) -> None:
     """`select array(select * from (select a from t657d) s order by 1)` is
     the domain's array `d657c[]` on PostgreSQL 15.19, as `select a` there
-    is. Here it is `character[]`."""
+    is. It was `character[]`: a `*` target was not cast."""
     with _connect(dsn) as c:
         got = _answer(c, "select array(select * from (select a from t657d) s order by 1)")
     assert got == (["d657c[]"], [('{"a b","xy "}',)])

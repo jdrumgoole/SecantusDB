@@ -480,8 +480,27 @@ pub(crate) fn cast_first_columns(
     if leaves.iter().any(|d| d.as_deref() != Some(domain.as_str())) {
         return false;
     }
-    cast_leaves(s, &domain);
+    cast_leaves(s, lookup, &Ctes::new(), &domain);
     true
+}
+
+/// The column a `*` or `q.*` target stands for, as `q.column`, when it
+/// stands for exactly one: `ARRAY(select * ...)` over one column is that
+/// column's type (RP-673), so the star is written as the column to be cast.
+fn lone_star_column(v: &Node, scope: &Scope) -> Option<Node> {
+    let Some(N::ColumnRef(c)) = v.node.as_ref() else {
+        return None;
+    };
+    if !matches!(
+        c.fields.last().and_then(|f| f.node.as_ref()),
+        Some(N::AStar(_))
+    ) {
+        return None;
+    }
+    match star_sources(scope, &c.fields)?.as_slice() {
+        [(item, (column, Some(_)))] => Some(star_column_ref(item, column, c.location)),
+        _ => None,
+    }
 }
 
 /// Each leaf select's first target's domain, in order.
@@ -501,11 +520,12 @@ fn collect_leaves(
     let scope = Scope::of_select(s, lookup, ctes);
     let domain = match s.target_list.as_slice() {
         [target] => match target.node.as_ref() {
-            Some(N::ResTarget(rt)) => rt
-                .val
-                .as_deref()
-                .and_then(|v| scope.domain_of(v))
-                .map(str::to_string),
+            Some(N::ResTarget(rt)) => rt.val.as_deref().and_then(|v| {
+                let column = lone_star_column(v, &scope);
+                scope
+                    .domain_of(column.as_ref().unwrap_or(v))
+                    .map(str::to_string)
+            }),
             _ => None,
         },
         _ => None,
@@ -514,20 +534,36 @@ fn collect_leaves(
 }
 
 /// Cast every leaf select's one target to `domain` (a relabel).
-fn cast_leaves(s: &mut SelectStmt, domain: &str) {
+fn cast_leaves(
+    s: &mut SelectStmt,
+    lookup: &dyn Fn(&str) -> Option<TableDef>,
+    ctes: &Ctes,
+    domain: &str,
+) {
     if s.op != SetOperation::SetopNone as i32 {
+        let ctes = with_ctes(s, lookup, ctes);
         for side in [s.larg.as_deref_mut(), s.rarg.as_deref_mut()]
             .into_iter()
             .flatten()
         {
-            cast_leaves(side, domain);
+            cast_leaves(side, lookup, &ctes, domain);
         }
         return;
     }
+    let star = match s.target_list.as_slice() {
+        [target] => match target.node.as_ref() {
+            Some(N::ResTarget(rt)) => rt
+                .val
+                .as_deref()
+                .and_then(|v| lone_star_column(v, &Scope::of_select(s, lookup, ctes))),
+            _ => None,
+        },
+        _ => None,
+    };
     if let [target] = s.target_list.as_mut_slice() {
         if let Some(N::ResTarget(rt)) = target.node.as_mut() {
             if let Some(v) = rt.val.as_deref_mut() {
-                let arg = v.clone();
+                let arg = star.unwrap_or_else(|| v.clone());
                 *v = super::relabel_cast(arg, domain);
             }
         }
