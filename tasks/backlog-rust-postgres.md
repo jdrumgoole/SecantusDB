@@ -4133,17 +4133,16 @@ its first input gave.
 Measured on PostgreSQL 15.19 (the shared reference on port 5415): every
 statement is a FROM function and runs there as written.
 
-- [ ] **EXPLAIN of a `generate_series` in FROM prints no alias and no
-      Filter.** `explain (costs off) select 1 from generate_series(1, 2)
-      f(x) where x > 1` is `Function Scan on generate_series f` /
-      `Filter: (x > 1)` on PostgreSQL 15.19 (`ExplainNode` names the
-      alias, `show_scan_qual` the quals the scan applies to each row), and
-      a WHERE that runs per row (`f.x + 1 > 0`, since RP-703) is a
-      `Filter:` the same way. Here each prints the bare `Function Scan on
-      generate_series`, with or without the alias and the WHERE; with
-      costs, its estimate is `rows=0 width=0` where PostgreSQL's is
-      `rows=1 width=4`.
-      Verify: tests/backlog/test_rp_found_rp703.py::test_a_series_scan_explains_its_alias_and_filter
+- [ ] **EXPLAIN of a filtered `generate_series` in FROM is not priced.**
+      `explain select 1 from generate_series(1, 2) f(x) where x > 1` is
+      `Function Scan on generate_series f  (cost=0.00..0.03 rows=1
+      width=4)` on PostgreSQL 15.19 (`cost_functionscan`: the series' rows
+      times the default 1/3 inequality selectivity, the Filter's quals per
+      row), and with `x + 1 > 0` over ten rows `cost=0.00..0.15 rows=3`.
+      Here a series scan with a WHERE prints `rows=0 width=0`. Its alias
+      and `Filter:` line print as PostgreSQL's since RP-847's first slice;
+      an unfiltered scan's estimate was already right.
+      Verify: tests/backlog/test_rp_found_rp703.py::test_a_filtered_series_scan_is_priced
       Backlog-ID: RP-847
 
 ## Found while working RP-727 (2026-11-10)
