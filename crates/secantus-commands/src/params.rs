@@ -777,16 +777,17 @@ pub(crate) fn integral(value: &Bson, int32: bool) -> Result<i64, &'static str> {
     if !n.is_finite() {
         return Err("Unable to coerce NaN/Inf to integral type");
     }
-    let n = n.trunc();
-    let (low, high) = if int32 {
-        (f64::from(i32::MIN), f64::from(i32::MAX))
+    // mongod bounds the double before truncating it (RM-541, measured
+    // 8.2.11): `2147483647.9` and `-2147483648.5` are out of an int's range.
+    let out_of_bounds = if int32 {
+        n < f64::from(i32::MIN) || n > f64::from(i32::MAX)
     } else {
-        (i64::MIN as f64, i64::MAX as f64)
+        n < i64::MIN as f64 || n >= i64::MAX as f64
     };
-    if n < low || n >= high + 1.0 {
+    if out_of_bounds {
         return Err("Out of bounds coercing to integral value");
     }
-    Ok(n as i64)
+    Ok(n.trunc() as i64)
 }
 
 /// mongod's words for a value `coerce` refused (measured 8.2.11).
@@ -1067,6 +1068,20 @@ pub fn set_parameter(doc: &Document, ctx: &mut CommandContext) -> HandlerResult 
 mod tests {
     use super::*;
     use bson::doc;
+
+    #[test]
+    fn an_int_bounds_the_double_before_truncating() {
+        // RM-541: mongod 8.2.11 takes 2147483647.0, refuses 2147483647.9.
+        assert_eq!(integral(&Bson::Double(2147483647.0), true), Ok(2147483647));
+        assert_eq!(
+            integral(&Bson::Double(-2147483648.0), true),
+            Ok(-2147483648)
+        );
+        let oob = Err("Out of bounds coercing to integral value");
+        assert_eq!(integral(&Bson::Double(2147483647.9), true), oob);
+        assert_eq!(integral(&Bson::Double(-2147483648.5), true), oob);
+        assert_eq!(integral(&Bson::Double(-1.9), true), Ok(-1));
+    }
 
     fn ctx() -> CommandContext {
         let mut c = CommandContext::new(1);

@@ -27,9 +27,9 @@ def _edges(client: Any) -> list:
     return out
 
 
-@pytest.mark.backlog("RM-541")
+@pytest.mark.backlog_fixed("RM-541")
 def test_an_int_parameter_bounds_the_double_before_truncating(rust_mongo: Any, mongod: Any) -> None:
-    """mongod 8.2.11 takes `2147483647.0` for an int parameter and refuses
+    """mongod 8.2.11 took `2147483647.0` for an int parameter and refused
     `2147483647.9` and `-2147483648.5` as out of bounds, rather than
     truncating them into range first."""
     assert _edges(rust_mongo) == _edges(mongod)

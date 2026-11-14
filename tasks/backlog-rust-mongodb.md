@@ -2092,16 +2092,6 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       Linux measurement is not in the macOS binary; not probed on Linux).
       Verify: tests/backlog/test_rm_219_diag_query_settings.py::test_samples_are_written_to_diagnostic_data
       Backlog-ID: RM-417
-- [ ] **`setParameter` takes a double just past an int's range.**
-      mongod 8.2.11 refuses `2147483647.9` and `-2147483648.5` for an int
-      parameter (`transactionLifetimeLimitSeconds`,
-      `diagnosticDataCollectionPeriodMillis`) with 2 "Failed validating
-      <name>: Out of bounds coercing to integral value", and takes
-      `2147483647.0`: it bounds the double before truncating it. This
-      server's `params::integral` truncates first, so it stores 2147483647
-      for the first. Found 2026-11-10 (RM-417).
-      Verify: tests/backlog/test_rm_found_2026_11_10_rm417.py::test_an_int_parameter_bounds_the_double_before_truncating
-      Backlog-ID: RM-541
 - [ ] **`$querySettings` gives no `debugQueryShape`, and query settings
       miss two of mongod's mechanisms.** Since 2026-11-08
       `setQuerySettings` / `removeQuerySettings` / `$querySettings` keep
