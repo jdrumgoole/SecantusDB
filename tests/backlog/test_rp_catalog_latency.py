@@ -268,12 +268,17 @@ def test_create_table_costs_the_same_at_400_tables(pg_alone: Any) -> None:
     1.2 ms and 5.9 ms (RP-928 holds the rest).
 
     The fastest of five with 400 more tables against the fastest with none,
-    in one server, within half again plus 5 ms."""
+    in one server, within four times plus 5 ms: the growth this guards
+    against was about thirty times. Half again plus 5 ms failed CI on
+    2026-11-14 at 2.6 ms and 9.7 ms (PR #2744) and passed the same commits
+    on a rerun: CI runs about three times slower than a laptop, so the
+    residual growth RP-928 holds already fills most of a fixed 5 ms
+    there."""
     small = _fastest_create(pg_alone, "rp_ct_a")
     for i in range(GROWTH_TABLES):
         pg_alone.execute(f"CREATE TABLE rp_ct_grow_{i} (a int, b text)")
     large = _fastest_create(pg_alone, "rp_ct_b")
-    assert large < 1.5 * small + 0.005, (
+    assert large < 4 * small + 0.005, (
         f"CREATE TABLE {small * 1000:.1f} ms with no other table, "
         f"{large * 1000:.1f} ms with {GROWTH_TABLES}"
     )
