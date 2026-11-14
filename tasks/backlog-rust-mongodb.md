@@ -1519,10 +1519,13 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
 - [ ] **A `$median` / `$percentile` spills the values, where mongod spills
       its t-digest.** A classic `$group` of `{$median: {input: "$n", method:
       "approximate"}}` over 300 groups of one value each, under a 5000-byte
-      budget, spills 84000 bytes on mongod 8.2.11 (`groupSpilledBytes`,
-      its accumulator's t-digest) and 100800 here, which keeps and writes the
-      values. The spill count is RM-502's. Found 2026-11-13 working RM-325
-      (its remainder).
+      budget, writes a 5561-byte spill file on mongod 8.2.11
+      (`groupSpilledDataStorageSize`, its accumulator's t-digest) and 2948
+      here, which keeps and writes the values (an empty digest: 1986 to
+      1510). The memory counted is mongod's since RM-502 up to the t-digest's
+      first flush (6000 finite values); the centroids a flush makes are not
+      counted (`group::tdigest_buffer`), and need the same port. Found
+      2026-11-13 working RM-325 (its remainder).
       Verify: tests/backlog/test_rm_found_2026_11_13_rm325.py::test_a_median_spills_mongods_state
       Backlog-ID: RM-613
 - [ ] **`serverStatus` has no `spillWiredTiger` section.** mongod 8.2.11
@@ -1757,22 +1760,6 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       held to the budget as that sort is. Found 2026-11-14 working RM-527.
       Verify: tests/backlog/test_rm_found_rm527.py::test_window_sort_hoisted_past_unwind_orders_the_source_documents
       Backlog-ID: RM-640
-- [ ] **A classic `$group` counts its held values' and `_id`'s memory
-      unlike mongod, so it spills at other points.** Over 300 documents of a
-      1000-byte string, budget 5000, mongod 8.2.11 spills a `$first` /
-      `$last` / `$firstN` / `$maxN` of the string 60 times, as it does a
-      `$push` (each accumulator counts the `Value` it holds), where this
-      server spills 8 to 13 times: it counts a classic `$first` / `$last`
-      as its fixed size alone, a `$firstN` / `$maxN` / `$topN` / `$bottom`
-      short of mongod's (`$topN`: 38 spills to mongod's 75), and a
-      `$median` over it (20 to 17). An object `_id` goes the other way: mongod
-      counts the key it groups on (one field's value, or an array of the
-      fields'), this server the built `_id` document (`{_id: {n: "$n"}}`:
-      15 spills to 9; two fields under a `$push`: 75 to 60). The spill
-      file is mongod's (RM-325's fix); its size follows the runs. Found
-      2026-11-10 working RM-325.
-      Backlog-ID: RM-502
-      Verify: tests/backlog/test_rm_found_2026_10_26.py::test_group_held_value_spills
 - **Scope decision — SBE's `$concatArrays` refusal names a count mongod
   never set.** Over its budget mongod 8.2.11 says "Concatentating array of
   2 elements and N bytes with array of 87684434848907256 elements and M

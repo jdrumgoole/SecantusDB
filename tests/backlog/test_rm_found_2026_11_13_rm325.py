@@ -127,14 +127,19 @@ def _median_spilled_bytes(client: Any) -> Any:
             {"setParameter": 1, "internalDocumentSourceGroupMaxMemoryBytes": DEFAULT}
         )
     entry = db.system.profile.find_one({"command.comment": "median"}) or {}
-    return (entry.get("groupSpilledRecords"), entry.get("groupSpilledBytes"))
+    return (
+        entry.get("groupSpilledRecords"),
+        entry.get("groupSpilledBytes"),
+        entry.get("groupSpilledDataStorageSize"),
+    )
 
 
 @pytest.mark.backlog("RM-613")
 def test_a_median_spills_mongods_state(rust_mongo: Any, mongod: Any) -> None:
     """mongod 8.2.11's classic `$group` spills each group's `$median` as its
-    t-digest: 300 groups of one value each, 84000 bytes. This server spills
-    the values it keeps, 100800."""
+    t-digest: 300 groups of one value each, a 5561-byte spill file. This
+    server spills the values it keeps, 2948. (`groupSpilledBytes`, 84000, is
+    the memory estimate at each spill, mongod's since RM-502.)"""
     assert _median_spilled_bytes(rust_mongo) == _median_spilled_bytes(mongod)
 
 

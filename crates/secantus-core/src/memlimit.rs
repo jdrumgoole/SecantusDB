@@ -103,6 +103,18 @@ pub(crate) struct Layout {
     pub rank: usize,
     pub dense_rank: usize,
     pub document_number: usize,
+    /// A classic `$firstN` / `$lastN` (`AccumulatorFirstLastN`), its
+    /// `std::deque` the platform's; `$maxN` / `$minN`
+    /// (`AccumulatorMinMaxN`), its `std::multiset`; `$top` / `$bottom` (N)
+    /// (`AccumulatorTopBottomN`, one class for the four), its sort pattern,
+    /// key generator and `std::multimap`. Each before the values it keeps
+    /// (RM-502: macOS 8.2.11's `maxAccumulatorMemoryUsageBytes` over a group
+    /// of none, one and three; Linux 8.2.12's `groupSpilledBytes` over 300
+    /// groups of one 1000-byte string, CI 2026-11-13, which the libstdc++
+    /// deque's 80 bytes and tree's 48 account for).
+    pub first_last_n: usize,
+    pub min_max_n: usize,
+    pub top_bottom_n: usize,
 }
 
 /// libstdc++: Linux mongod 8.2.12, x86-64 and arm64 alike (2026-11-08,
@@ -119,6 +131,9 @@ pub(crate) const LIBSTDCXX: Layout = Layout {
     rank: 376,
     dense_rank: 368,
     document_number: 368,
+    first_last_n: 200,
+    min_max_n: 168,
+    top_bottom_n: 544,
 };
 
 /// libc++ on arm64: macOS mongod 8.2.1 and 8.2.11, which agree (2026-11-10,
@@ -141,6 +156,9 @@ pub(crate) const LIBCXX_ARM64: Layout = Layout {
     rank: 344,
     dense_rank: 336,
     document_number: 336,
+    first_last_n: 168,
+    min_max_n: 152,
+    top_bottom_n: 472,
 };
 
 /// The layout of the mongod build this server stands in for: macOS arm64's

@@ -344,7 +344,7 @@ fn merge_state(acc: Acc) -> R<Option<Bson>> {
         }
         // mongod writes its t-digest here; this server keeps the values.
         Acc::Percentile { values, .. } => doubles(values),
-        Acc::NElem { kind, n, vals } => Bson::Array(nelem_result(kind, n.unwrap_or(0), vals)?),
+        Acc::NElem { kind, n, vals, .. } => Bson::Array(nelem_result(kind, n.unwrap_or(0), vals)?),
         // `{generatedSortKey, output}` for each item kept, in sort order: the
         // key is the one sort field's value, or an array of them.
         Acc::TopN {
@@ -352,6 +352,7 @@ fn merge_state(acc: Acc) -> R<Option<Bson>> {
             n,
             dirs,
             items,
+            ..
         } => {
             let single = dirs.len() == 1;
             let kept = topn_kept(kind, n.unwrap_or(1), &dirs, items)?;
@@ -1096,6 +1097,7 @@ fn acc_to_doc(acc: Acc) -> R<Document> {
             is_median,
             ps,
             values,
+            ..
         } => {
             let mut d = doc! { "t": "percentile", "m": is_median, "v": doubles(values) };
             if let Some(ps) = ps {
@@ -1103,7 +1105,7 @@ fn acc_to_doc(acc: Acc) -> R<Document> {
             }
             d
         }
-        Acc::NElem { kind, n, vals } => {
+        Acc::NElem { kind, n, vals, .. } => {
             doc! { "t": "nElem", "k": nelem_code(kind), "n": opt_n(n), "v": vals }
         }
         Acc::TopN {
@@ -1111,6 +1113,7 @@ fn acc_to_doc(acc: Acc) -> R<Document> {
             n,
             dirs,
             items,
+            ..
         } => {
             let items: Vec<Bson> = items
                 .into_iter()
@@ -1159,6 +1162,7 @@ fn acc_from_doc(d: &Document) -> R<Acc> {
                 None => None,
             },
             values: doubles_of(d, "v")?,
+            buffered: 0,
         },
         "nElem" => Acc::NElem {
             kind: match d.get_i32("k").map_err(|_| Fallback::Defer)? {
@@ -1169,6 +1173,7 @@ fn acc_from_doc(d: &Document) -> R<Acc> {
             },
             n: n_of(d),
             vals: d.get_array("v").map_err(|_| Fallback::Defer)?.clone(),
+            mem: 0,
         },
         "topN" => Acc::TopN {
             kind: match d.get_i32("k").map_err(|_| Fallback::Defer)? {
@@ -1196,6 +1201,7 @@ fn acc_from_doc(d: &Document) -> R<Acc> {
                     _ => Err(Fallback::Defer),
                 })
                 .collect::<R<Vec<_>>>()?,
+            mem: 0,
         },
         _ => return Err(Fallback::Defer),
     })
