@@ -3661,20 +3661,6 @@ Measured on PostgreSQL 15.19 (the shared reference on port 5415): every
 statement is VALUES-only and runs there as written. The gap tests are in
 `tests/backlog/test_rp_found_rp732.py`.
 
-- [ ] **A sorted cursor computes an expensive column below its Sort.** A
-      cursor is planned with `cursor_tuple_fraction` (0.1), and
-      `make_sort_input_target` postpones an expensive column (more than
-      10 x `cpu_operator_cost`, `to_tsvector`'s `procost` is 100) past the
-      Sort whenever `tuple_fraction > 0`, as for a LIMIT: `declare c
-      cursor for select k, to_tsvector(case when k = 1 then 'nope' else
-      'simple' end::regconfig, 'a')::text from (values (1), (2)) s(k) order
-      by k desc` then `fetch 1` answers `(2, 'a':1)` on PostgreSQL 15.19.
-      Since RP-732 `sort_input.rs` sees only a LIMIT, so the column is
-      computed for every row and the first row's 42704 is raised. Needs the
-      Sort to run at the first FETCH too (found while working RP-744): a
-      column computed below the Sort is computed at the DECLARE.
-      Verify: tests/backlog/test_rp_found_rp732.py::test_a_sorted_cursor_postpones_an_expensive_column
-      Backlog-ID: RP-745
 - [ ] **A cast over a CASE of untyped literals reports a branch's input
       error at the literal.** `select (case when k = 1 then 'x' else '5'
       end)::int from (values (1)) s(k)` is 22P02 `invalid input syntax for

@@ -25,12 +25,44 @@ const EXPENSIVE_OPERATORS: f64 = 10.0;
 /// one -- a select list with more than one star -- which leaves every
 /// computed column to the projection after the Sort, as before RP-732.
 ///
-/// `tuple_fraction > 0` (a cursor's `cursor_tuple_fraction`) is not seen
-/// here: a DECLARE CURSOR is planned as a plain query, so only a LIMIT
-/// postpones an expensive column.
+/// A plain query is planned for its whole result (`tuple_fraction` 0), so
+/// only a LIMIT postpones an expensive column; a cursor's query is
+/// re-judged with its own fraction (`cursor_sort_input_columns`).
 pub(crate) fn sort_input_columns(
     s: &pg_query::protobuf::SelectStmt,
     columns: &[(String, String)],
+) -> Vec<bool> {
+    sort_input_columns_at(s, columns, 0.0)
+}
+
+/// `sort_input_columns` for a DECLARE CURSOR's query, which PostgreSQL
+/// plans with `CURSOR_OPT_FAST_PLAN` (gram.y sets it on every DECLARE):
+/// `standard_planner` takes `cursor_tuple_fraction` as its tuple fraction,
+/// 0.1 by default, and `make_sort_input_target` postpones an expensive
+/// column whenever it is above 0, as for a LIMIT (RP-745). A fraction of 1
+/// or more is planned as the whole result (0), one of 0 or less as the
+/// smallest fraction there is (1e-10, still above 0).
+pub(crate) fn cursor_sort_input_columns(
+    s: &pg_query::protobuf::SelectStmt,
+    columns: &[(String, String)],
+) -> Vec<bool> {
+    let fraction = session_setting("cursor_tuple_fraction")
+        .and_then(|v| v.trim().parse::<f64>().ok())
+        .unwrap_or(0.1);
+    let fraction = if fraction >= 1.0 {
+        0.0
+    } else if fraction <= 0.0 {
+        1e-10
+    } else {
+        fraction
+    };
+    sort_input_columns_at(s, columns, fraction)
+}
+
+fn sort_input_columns_at(
+    s: &pg_query::protobuf::SelectStmt,
+    columns: &[(String, String)],
+    tuple_fraction: f64,
 ) -> Vec<bool> {
     if s.sort_clause.is_empty() {
         return Vec::new();
@@ -78,7 +110,8 @@ pub(crate) fn sort_input_columns(
     let have_volatile = postponable.contains(&Some(Postpone::Volatile));
     let have_expensive = postponable.contains(&Some(Postpone::Expensive));
     // `parse->limitCount`: written at all (`LIMIT ALL` included).
-    let post_sort = have_volatile || (have_expensive && s.limit_count.is_some());
+    let post_sort =
+        have_volatile || (have_expensive && (s.limit_count.is_some() || tuple_fraction > 0.0));
     postponable
         .iter()
         .map(|p| !post_sort || p.is_none())
@@ -457,6 +490,13 @@ mod tests {
         assert_eq!(sort_input_columns(&s, &cols(3)), vec![true, true, false]);
         let s = select("select *, t.* from t order by 1");
         assert!(sort_input_columns(&s, &cols(4)).is_empty());
+    }
+
+    #[test]
+    fn a_cursor_postpones_an_expensive_column_as_a_limit_does() {
+        let s = select("select k, to_tsvector('x' || k) from t order by k");
+        assert_eq!(sort_input_columns_at(&s, &cols(2), 0.0), vec![true, true]);
+        assert_eq!(sort_input_columns_at(&s, &cols(2), 0.1), vec![true, false]);
     }
 
     #[test]

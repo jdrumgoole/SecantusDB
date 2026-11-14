@@ -5668,6 +5668,18 @@ fn plan_query_node(
 /// The DECLARE of `inner`, the cursor's planned query.
 fn declare_cursor(d: &pg_query::protobuf::DeclareCursorStmt, inner: Statement) -> Statement {
     let inner_node = d.query.as_ref().and_then(|q| q.node.as_ref());
+    // A cursor's query is planned for the share of its rows it expects to
+    // be fetched (`cursor_tuple_fraction`), which postpones an expensive
+    // column past the Sort as a LIMIT does (RP-745).
+    let mut inner = inner;
+    if let (Statement::Select(sel), Some(N::SelectStmt(s))) = (&mut inner, inner_node) {
+        if !sel.sort_input.is_empty() {
+            let judged = sort_input::cursor_sort_input_columns(s, &sel.columns);
+            if judged.len() == sel.sort_input.len() {
+                sel.sort_input = judged;
+            }
+        }
+    }
     // PostgreSQL's cursor-option bitmask (`nodes/parsenodes.h`).
     const CURSOR_OPT_BINARY: i32 = 0x0001;
     const CURSOR_OPT_SCROLL: i32 = 0x0002;
