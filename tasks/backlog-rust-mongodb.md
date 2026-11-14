@@ -2126,15 +2126,6 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       a skip and a limit. Found 2026-11-10 (RM-418).
       Verify: tests/backlog/test_rm_found_2026_11_10_rm418.py::test_sbe_find_shapes_are_explained_as_sbe
       Backlog-ID: RM-543
-- [ ] **A query's `planCacheKey` hashes its `indexHints` setting as unset.**
-      mongod 8.2.11 folds the read's query settings into the key
-      (`query_settings::hash`): the framework and `reject` are hashed here
-      since 2026-11-10 (RM-418), but a setting's `indexHints` is hashed as
-      an empty `boost::optional`, where mongod hashes the hints: `find({x:
-      1})` with `allowedIndexes: [{$natural: 1}]` keys as without settings
-      here and differently on mongod. Found 2026-11-10 (RM-418).
-      Verify: tests/backlog/test_rm_found_2026_11_10_rm418.py::test_plan_cache_key_hashes_index_hints
-      Backlog-ID: RM-544
 - [ ] **A `find`'s `explain` gives no `optimizationTimeMillis`.** mongod
       8.2.11's `queryPlanner` carries it (0 on a small collection) after
       `planCacheKey`, for a `find` with or without query settings; this

@@ -142,19 +142,49 @@ def test_sbe_find_in_and_projection_are_mongods(
     assert _built(rust_mongo, cmd) == _built(mongod_rs, cmd)
 
 
-def _hinted_key(client: Any) -> str:
+def _hinted_key(client: Any, hints: Any = None) -> str:
     cmd = {"find": "a", "filter": {"x": 1}}
-    hints = {"ns": {"db": DB, "coll": "a"}, "allowedIndexes": [{"$natural": 1}]}
-    return _explained(client, cmd, {"indexHints": hints})["queryPlanner"]["planCacheKey"]
+    if hints is None:
+        hints = {"ns": {"db": DB, "coll": "a"}, "allowedIndexes": [{"$natural": 1}]}
+    e = _explained(client, cmd, {"indexHints": hints}, index=True)
+    return e["queryPlanner"]["planCacheKey"]
 
 
-@pytest.mark.backlog("RM-544")
+@pytest.mark.backlog_fixed("RM-544")
 def test_plan_cache_key_hashes_index_hints(
     rust_mongo: Any,
     mongod_rs: Any,  # noqa: F811
 ) -> None:
-    """A setting's `indexHints` moves mongod's `planCacheKey`."""
+    """A setting's `indexHints` moves mongod's `planCacheKey`; this server
+    hashed the hints as unset."""
     assert _hinted_key(rust_mongo) == _hinted_key(mongod_rs)
+
+
+def _spec(*allowed: Any, coll: str = "a") -> dict:
+    return {"ns": {"db": DB, "coll": coll}, "allowedIndexes": list(allowed)}
+
+
+HINT_SHAPES = [
+    _spec({"$natural": -1}),
+    _spec("x_1"),
+    _spec({"x": 1}),
+    _spec({"x": -1.5, "y": "hashed"}),
+    _spec({"x": 1}, "x_1", {"$natural": 1}),
+    [_spec("x_1"), _spec({"y": 1}, coll="b")],
+    _spec({"a.b": Int64(1)}, "a_rather_long_index_name_over_sixteen_bytes"),
+]
+
+
+@pytest.mark.backlog_fixed("RM-544")
+@pytest.mark.parametrize("hints", HINT_SHAPES, ids=str)
+def test_plan_cache_key_hashes_each_hint_shape(
+    rust_mongo: Any,
+    mongod_rs: Any,  # noqa: F811
+    hints: Any,
+) -> None:
+    """Names, key patterns, `$natural` and several specs hash as mongod's
+    `query_settings_hash.cpp` hashes them."""
+    assert _hinted_key(rust_mongo, hints) == _hinted_key(mongod_rs, hints)
 
 
 def _optimization_time(client: Any) -> bool:
