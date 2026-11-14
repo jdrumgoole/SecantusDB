@@ -3797,22 +3797,6 @@ Measured on a private, freshly initdb'd PostgreSQL 15.19 cluster with the
 
 Measured on a private, freshly initdb'd PostgreSQL 15.19 cluster.
 
-- [ ] **A FOR loop or an OPEN over an INSERT, UPDATE or DELETE is 0A000.**
-      `SPI_cursor_open` takes any statement that returns rows, so on
-      PostgreSQL 15.19 `for x in update t set a = a + 1 returning a loop`
-      (or `in execute '...'`) walks the RETURNING rows, and `open c for
-      insert into t values (5) returning a` fetches 5. Without RETURNING it
-      is 42P11 `cannot open UPDATE query as cursor`. A procedure's COMMIT
-      inside a loop over a DML portal is 55000 `cannot perform transaction
-      commands inside a cursor loop that is not read-only`
-      (`HoldPinnedPortals` holds only a PORTAL_ONE_SELECT portal). Here
-      every one of them is 0A000 `this query is not supported on one side
-      of a set operation`: `open_portal` reads the rows through
-      `rows_with_schema`, which has no DML arm (the PL/pgSQL `returning`
-      host call runs one through `dml_returning_values`). The portal needs
-      to record that it is not read-only, for the 55000.
-      Verify: tests/backlog/test_rp_found_rp828.py::test_a_dml_statement_opens_as_a_portal
-      Backlog-ID: RP-905
 
 
 - [ ] **A portal whose query fails as it runs takes no number.**

@@ -1911,6 +1911,7 @@ impl PgHandler {
             failed: false,
             pinned: false,
             auto_held: false,
+            returning: false,
         }))
     }
 
