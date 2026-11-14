@@ -324,7 +324,7 @@ fn inside(key: &[u8], r: &(Vec<u8>, bool, Vec<u8>, bool)) -> bool {
 }
 
 /// What one call into an index scan did.
-enum Step {
+pub(crate) enum Step {
     Entry(usize),
     Seek,
     End,
@@ -384,6 +384,8 @@ pub(crate) struct Scan {
     ranges: Vec<Ranges>,
     /// The bounds are one contiguous run of keys: nothing outside is examined.
     contiguous: bool,
+    /// A DISTINCT_SCAN has counted the key past a contiguous run.
+    ended_beyond: bool,
     multikey: bool,
     filter: Option<Document>,
     pos: usize,
@@ -454,6 +456,7 @@ impl Scan {
             after_run,
             ranges,
             contiguous,
+            ended_beyond: false,
             multikey: ix.index.is_multikey(),
             filter: ix.filter.clone(),
             pos: 0,
@@ -722,6 +725,42 @@ impl Scan {
         (self.seeks, self.dups_tested, self.dups_dropped)
     }
 
+    /// One work of a DISTINCT_SCAN (mongod's `DistinctScan::doWork`): a key
+    /// it returns, after which it seeks past every key holding the same
+    /// leading `width` values; a key the bounds reject, which it examines
+    /// and seeks from (a key on the trailing fields' bounds' wrong side
+    /// included, RM-447); or the end, where the key past the bounds is
+    /// examined too.
+    pub(crate) fn work_distinct(
+        &mut self,
+        width: usize,
+        prefixes: &mut BTreeSet<Vec<Vec<u8>>>,
+    ) -> Step {
+        match self.work_entry() {
+            Step::Entry(row) => {
+                let key = &self.entries[self.pos - 1].0;
+                let prefix = key[..width.min(key.len())].to_vec();
+                while self.pos < self.entries.len() && self.entries[self.pos].0.starts_with(&prefix)
+                {
+                    self.pos += 1;
+                }
+                self.seek_pending = true;
+                if prefixes.insert(prefix) {
+                    Step::Entry(row)
+                } else {
+                    Step::Seek
+                }
+            }
+            Step::End => {
+                if self.contiguous && !std::mem::replace(&mut self.ended_beyond, true) {
+                    self.keys += i64::from(self.key_beyond());
+                }
+                Step::End
+            }
+            Step::Seek => Step::Seek,
+        }
+    }
+
     /// A DISTINCT_SCAN's next document: the first entry of a new value of
     /// the leading `width` fields (the scan seeks past the rest).
     pub(crate) fn next_distinct(
@@ -730,10 +769,10 @@ impl Scan {
         prefixes: &mut BTreeSet<Vec<Vec<u8>>>,
     ) -> Option<usize> {
         loop {
-            let row = self.next_entry()?;
-            let key = &self.entries[self.pos - 1].0;
-            if prefixes.insert(key[..width.min(key.len())].to_vec()) {
-                return Some(row);
+            match self.work_distinct(width, prefixes) {
+                Step::Entry(row) => return Some(row),
+                Step::Seek => continue,
+                Step::End => return None,
             }
         }
     }
@@ -887,20 +926,9 @@ impl<'a> Run<'a> {
             Node::DistinctScan(_, width, _) => {
                 // One entry per distinct value of the leading `width` fields.
                 let scan = self.scan.as_mut()?;
-                loop {
-                    let Some(row) = scan.next_entry() else {
-                        self.keys = self.prefixes.len() as i64 + i64::from(scan.key_beyond());
-                        return None;
-                    };
-                    let key = &scan.entries[scan.pos - 1].0;
-                    if self
-                        .prefixes
-                        .insert(key[..(*width).min(key.len())].to_vec())
-                    {
-                        self.keys = self.prefixes.len() as i64;
-                        return Some(row);
-                    }
-                }
+                let row = scan.next_distinct(*width, &mut self.prefixes);
+                self.keys = scan.keys;
+                row
             }
             Node::Fetch { filter, .. } => loop {
                 let row = self.inputs[0].pull(env)?;

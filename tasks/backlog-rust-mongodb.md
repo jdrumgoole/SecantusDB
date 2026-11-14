@@ -2704,19 +2704,6 @@ What is left, all on the RUST MongoDB server:
       **Decided 2026-10-16 (Joe):** as RM-071, transcribe and execute.
       Backlog-ID: RM-072
       Verify: tests/backlog/test_rm_057_084.py::test_explain_of_count_on_a_view_over_an_index
-- [ ] **A DISTINCT_SCAN bounded on a trailing field examines fewer keys
-      than mongod's.** mongod 8.2.11's DISTINCT_SCAN of `x_1_y_1` for
-      `distinct("x", {x: {$gt: 0}, y: {$gt: 3}})` over `x = i % 4, y = i`
-      (i 1 to 24) returns three keys and examines six, in eight works, in
-      its `executionStats` and in a `$group`'s trial. This server's
-      examines three, in four works. The plans ranked are the same. Not
-      RM-377's key past the bounds (fixed 2026-11-09, and none is past
-      these): by the source, `explain`'s DISTINCT_SCAN (`explain/exec.rs`)
-      counts one key per value it returns plus a key past the bounds,
-      never a key a seek lands on that the bounds on `y` reject. Found
-      2026-11-08 (RM-310).
-      Backlog-ID: RM-447
-      Verify: tests/backlog/test_rm_found_2026_11_08_rm310.py::test_a_distinct_scan_bounded_on_a_trailing_field_examines_mongods_keys
 - [ ] **`explain` of a `$unionWith` lists its sub-pipeline as written.**
       mongod 8.2.11 explains the sub-pipeline as it does the outer one: a
       `$cursor` of its own (its `queryPlanner`, and `executionStats` above

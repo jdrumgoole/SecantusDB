@@ -20,7 +20,7 @@
 //! stage counted during the trial is kept for `allPlansExecution`.
 
 use super::bounds::Interval;
-use super::exec::{entries, fixed_extra, merge_head, Entry, Env, Head, Scan, Work};
+use super::exec::{entries, fixed_extra, merge_head, Entry, Env, Head, Scan, Step, Work};
 use super::node::{num, IxScan, Node, Stats, WorkCounts};
 use bson::Document;
 use secantus_core::heap::Heap;
@@ -205,9 +205,10 @@ impl<'a> Stage<'a> {
                 let (Some(scan), prefixes) = (self.scan.as_mut(), &mut self.prefixes) else {
                     return Work::Eof;
                 };
-                match scan.next_distinct(*width, prefixes) {
-                    Some(row) => Work::Advanced(row),
-                    None => {
+                match scan.work_distinct(*width, prefixes) {
+                    Step::Entry(row) => Work::Advanced(row),
+                    Step::Seek => Work::NeedTime,
+                    Step::End => {
                         self.count = 1;
                         Work::Eof
                     }
@@ -419,7 +420,6 @@ impl<'a> Stage<'a> {
     /// The keys and documents the stage and its inputs have read.
     fn reads(&self) -> i64 {
         let keys = match (self.node, &self.scan) {
-            (Node::DistinctScan(..), Some(_)) => self.prefixes.len() as i64,
             (_, Some(scan)) => scan.keys(),
             _ => 0,
         };
@@ -437,10 +437,6 @@ impl<'a> Stage<'a> {
         }
         fixed_extra(self.node, &mut extra);
         let keys = match (self.node, &self.scan) {
-            // The key that ends the scan is examined in the work that ends it.
-            (Node::DistinctScan(..), Some(scan)) => {
-                self.prefixes.len() as i64 + i64::from(self.count > 0 && scan.key_beyond())
-            }
             (_, Some(scan)) => scan.keys(),
             _ => 0,
         };
