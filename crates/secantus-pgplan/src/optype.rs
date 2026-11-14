@@ -2493,6 +2493,12 @@ fn check_select(
     }
     for t in &s.target_list {
         walk(t, &scope, &cx)?;
+        // `transformSelectStmt` transforms the target list before the
+        // WHERE, so a missing output column is 42703 ahead of the WHERE's
+        // own errors (RP-429).
+        if s.where_clause.is_some() {
+            having_names_resolve(t, &scope)?;
+        }
     }
     if let Some(w) = s.where_clause.as_deref() {
         // Only at the top level: in a subquery an aggregate over the OUTER

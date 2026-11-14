@@ -2173,16 +2173,6 @@ a regression test.
       (found while working RP-408).
       Backlog-ID: RP-414
       Verify: tests/backlog/test_rp_column_errors.py::test_missing_column_reported_as_written
-- [ ] **A missing output column is reported after the WHERE's errors.**
-      PostgreSQL 15.19's `transformSelectStmt` transforms the target list
-      before the WHERE, so `select nosuch from e where 1`, `... where a =
-      true` and `... where 'x'` are each 42703 `column "nosuch" does not
-      exist` at 8; here the WHERE's 42804, 42883 or 22P02 comes first. The
-      FROM list, a JOIN's ON included, is analysed before both, which this
-      server already matches. Measured on a private 15.19 cluster (found
-      while working RP-424).
-      Verify: tests/backlog/test_rp_where_types.py::test_target_list_is_analysed_before_where
-      Backlog-ID: RP-429
 - [ ] **EXPLAIN of an UPDATE ... FROM or a DELETE ... USING prints a Seq
       Scan of the target alone.** The statement is rewritten into
       correlated subqueries over its FROM items (`rewrite_dml_from`), and
