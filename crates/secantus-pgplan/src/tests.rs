@@ -8328,4 +8328,14 @@ fn an_unknown_parameter_takes_its_typed_operands_type() {
         Some("int4")
     );
     assert_eq!(got("select $1 || 'x'", &[None])[0], None);
+    // Where no operator takes the known type twice, the candidate's.
+    assert_eq!(
+        got("select $1 || $2", &[Some("integer".into()), None])[1].as_deref(),
+        Some("text")
+    );
+    assert_eq!(
+        got("select '{}'::json #>> $1", &[None])[0].as_deref(),
+        Some("text[]")
+    );
+    assert_eq!(got("select $1 #>> '{}'::jsonb", &[None])[0], None);
 }

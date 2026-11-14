@@ -290,6 +290,68 @@ pub(crate) fn operator_ambiguous(op: &str, l: &str, r: &str) -> bool {
     cands.len() > 1
 }
 
+/// The type an UNKNOWN operand of the built-in binary operator `op` takes
+/// beside an operand of type `known` (on the left when `known_left`), as
+/// `oper` resolves it: `binary_oper_exact` first assumes the unknown input
+/// is of the other's type, and only where `op(known, known)` exists; else
+/// `oper_select_candidate` keeps the candidates the known operand fits,
+/// the most exact then the most preferred on its side, and where several
+/// remain the unknown position prefers the string category. `'int ' || 1`
+/// is `anytextcat`'s text, `'{}'::json #>> $1` is text[]. `None` when the
+/// type, the operator or the choice is not one this table can judge.
+pub(crate) fn unknown_operand_type(op: &str, known: &str, known_left: bool) -> Option<String> {
+    let cats = categories();
+    let written = known;
+    let known = crate::pgtypes::oid_of_name(known)
+        .and_then(crate::pgtypes::type_name_of_oid)
+        .map(|t| planner_type(&t))
+        .unwrap_or_else(|| planner_type(known));
+    if known == "unknown" || !cats.contains_key(&known) {
+        return None;
+    }
+    let all = binary_operators().get(op)?;
+    if all.iter().any(|(a, b)| *a == known && *b == known) {
+        return Some(written.to_string());
+    }
+    let sides = |c: &(String, String)| -> (String, String) {
+        if known_left {
+            c.clone()
+        } else {
+            (c.1.clone(), c.0.clone())
+        }
+    };
+    let mut cands: Vec<(String, String)> = all
+        .iter()
+        .map(sides)
+        .filter(|(k, _)| accepts(k, &known))
+        .collect();
+    let best = |cands: &mut Vec<(String, String)>, score: &dyn Fn(&str) -> bool| {
+        if cands.iter().any(|(k, _)| score(k)) {
+            cands.retain(|(k, _)| score(k));
+        }
+    };
+    best(&mut cands, &|k| k == known);
+    let known_cat = cats.get(&known).map(|c| c.0);
+    best(&mut cands, &|k| {
+        k == known || matches!(cats.get(k), Some((c, true)) if Some(*c) == known_cat)
+    });
+    if cands.len() > 1 {
+        let string = |u: &str| matches!(cats.get(u), Some(('S', _)));
+        if cands.iter().any(|(_, u)| string(u)) {
+            cands.retain(|(_, u)| string(u));
+            if cands.len() > 1 {
+                cands.retain(|(_, u)| matches!(cats.get(u.as_str()), Some(('S', true))));
+            }
+        }
+    }
+    let polymorphic =
+        |u: &str| u.starts_with("any") || matches!(u, "record" | "internal" | "cstring");
+    match cands.as_slice() {
+        [(_, u)] if !polymorphic(u) => Some(u.clone()),
+        _ => None,
+    }
+}
+
 /// The LEFT input type of the binary operator `op` that PostgreSQL resolves
 /// for `l op r` ([`operator_inputs`]). NULLIF takes this type (RP-076):
 /// `int4 = numeric` resolves to `numeric = numeric`, so `nullif(53,

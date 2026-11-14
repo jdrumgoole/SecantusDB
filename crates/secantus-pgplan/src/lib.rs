@@ -42269,11 +42269,18 @@ pub fn catalog_param_types_opt(
                             *slot = named_column_type(c);
                         }
                     }
-                    // An operand of a known type gives an unknown one its
-                    // type (`oper_select_candidate` assumes an unknown input
-                    // is of the other input's type): a declared parameter,
-                    // or a numeric constant (`$1 = 1` is an integer).
-                    for (this, other) in [(l, r), (r, l)] {
+                    // An operand of a known type gives an unknown one the
+                    // type `oper` resolves for it: the other input's where
+                    // that operator exists (`binary_oper_exact`, `$1 = 1` is
+                    // an integer), else the candidate's (`int || $1` is
+                    // anytextcat's text, `json #>> $1` text[]). The known
+                    // one is a declared parameter, a cast or a numeric
+                    // constant.
+                    let opname = e.name.last().and_then(|n| match n.node.as_ref() {
+                        Some(N::String(s)) => Some(s.sval.as_str()),
+                        _ => None,
+                    });
+                    for (known_left, (this, other)) in [(false, (l, r)), (true, (r, l))] {
                         let Some(N::ParamRef(p)) = this else {
                             continue;
                         };
@@ -42292,7 +42299,10 @@ pub fn catalog_param_types_opt(
                             Some(N::TypeCast(tc)) => tc.type_name.as_ref().map(type_name_of),
                             _ => None,
                         };
-                        if let (Some(slot @ None), Some(t)) = (inferred.get_mut(i), other_type) {
+                        let resolved = other_type.zip(opname).and_then(|(t, op)| {
+                            crate::funcsig::unknown_operand_type(op, &t, known_left)
+                        });
+                        if let (Some(slot @ None), Some(t)) = (inferred.get_mut(i), resolved) {
                             *slot = Some(t);
                         }
                     }
