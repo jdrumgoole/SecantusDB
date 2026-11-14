@@ -2052,27 +2052,23 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
         options are not applied.
       Backlog-ID: RM-216
       Verify: none -- the missing fields are mongod's internal accounting; the registry's own tests are backlog_fixed
-- [ ] **`dbCheck` refuses `extraIndexKeysCheck`, and `applyOps` some entries.**
-      mongod 8.2.11 (one-member replica set) runs `dbCheck` with
-      `validateMode: "extraIndexKeysCheck"` (115 here): it walks the named
-      index in batches of `maxDocsPerBatch` keys, a batch ending only where
-      the key changes, and writes a `batch` oplog entry per batch whose `md5`
-      is the MD5 of the batch's keys as KeyString V1 bytes, each with its
-      `kEnd` discriminator (4) and without its RecordId (checked by hand for
-      int keys, 2026-11-10), with `batchStart` / `batchEnd` /
-      `lastKeyChecked` as keys; an index that does not exist gets a
-      `dbCheckBatch` warning in `local.system.healthlog`. Building it needs a
-      KeyString encoder for every BSON type (key_string.cpp's doubles and
-      Decimal128 included) and each index kind's keys (hashed, 2dsphere,
-      wildcard, collated). mongod also takes `applyOps` `importCollection`,
+- [ ] **`dbCheck` `extraIndexKeysCheck` refuses Decimal128 keys and geo / wildcard indexes; `applyOps` some entries.**
+      Since 2026-11-14 the check walks an ascending, descending, compound,
+      multikey, sparse, partial or collated index as mongod 8.2.11 does
+      (KeyString V1 bytes, `crates/secantus-commands/src/key_string.rs`).
+      Open: a key holding a Decimal128 is refused (115; mongod encodes it,
+      a decimal equal to a double with the double's bytes, others with
+      key_string.cpp's decimal continuations), and so is a `2dsphere`,
+      `2d` or wildcard index, whose keys need each kind's key generator.
+      mongod also takes `applyOps` `importCollection`,
       `createDatabaseMetadata` and `modifyCollectionShardingIndexCatalog`
       entries (115 here). `dbCheck` also runs before it answers (mongod runs
       it in the background), walks a database's collections in name order
       (mongod's is its catalog's internal order) and does not apply
       `maxBytesPerBatch` / `maxBatchTimeMillis` / `maxCountPerSecond`.
-      Carried over from RM-219 when its last commands landed, 2026-11-08.
-      Verify: tests/backlog/test_rm_219_diag_query_settings.py::test_db_check_extra_index_keys
-      Backlog-ID: RM-416
+      Carried over from RM-416, 2026-11-14.
+      Verify: tests/backlog/test_rm_219_diag_query_settings.py::test_db_check_extra_index_keys_remainder, tests/backlog/test_rm_219_diag_query_settings.py::test_apply_ops_other_entries
+      Backlog-ID: RM-688
 - [ ] **`applyOps` applies a `u` replacement of a missing document.** A `u`
       entry whose `o` is a whole document with `o2`'s `_id`, for a document
       that does not exist and without `b: true`, is inserted here; mongod

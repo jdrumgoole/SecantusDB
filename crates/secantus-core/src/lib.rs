@@ -67,7 +67,7 @@ pub mod expr_rewrite;
 mod fill;
 mod group;
 mod group_spill;
-mod hashed;
+pub mod hashed;
 mod jsonschema;
 mod numeric;
 pub mod order;
