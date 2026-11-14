@@ -159,7 +159,7 @@ def _documents_not_an_array(client: Any) -> dict:
     }
 
 
-@pytest.mark.backlog("RM-531")
+@pytest.mark.backlog_fixed("RM-531")
 def test_documents_of_a_non_array_is_an_executor_error(
     rust_mongo: Any,
     mongod_rs: Any,  # noqa: F811
@@ -167,6 +167,6 @@ def test_documents_of_a_non_array_is_an_executor_error(
     """mongod 8.2.11 refuses `$documents: 5` with 5858203, "Executor error
     during aggregate command on namespace: <db>.$cmd.aggregate :: caused by
     :: an array is expected" (the outer collection's namespace inside a
-    `$lookup`). This server answers 2 "$documents argument must evaluate to
+    `$lookup`). This server answered 2 "$documents argument must evaluate to
     an array"."""
     assert _documents_not_an_array(rust_mongo) == _documents_not_an_array(mongod_rs)

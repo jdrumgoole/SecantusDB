@@ -1844,14 +1844,6 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       2026-11-14 working RM-532.
       Verify: tests/backlog/test_rm_found_2026_11_14_rm532.py::test_a_hybrid_search_names_the_collection_it_unions
       Backlog-ID: RM-644
-- [ ] **`$documents` of a non-array answers 2.** mongod 8.2.11 refuses
-      `$documents: 5` at run time with 5858203 "Executor error during
-      aggregate command on namespace: <db>.$cmd.aggregate :: caused by ::
-      an array is expected" (the outer collection's namespace inside a
-      `$lookup`). This server answers 2 "$documents argument must evaluate
-      to an array". Found 2026-11-10 (RM-413).
-      Verify: tests/backlog/test_rm_found_2026_11_10_lookup.py::test_documents_of_a_non_array_is_an_executor_error
-      Backlog-ID: RM-531
 - [ ] **A `$facet` element that is not a stage is refused without naming
       it.** mongod 8.2.11's 40171 names the element: "elements of arrays in
       $facet spec must be non-empty objects, b argument contained an
@@ -1908,6 +1900,46 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       Found 2026-11-14 working RM-530.
       Verify: tests/backlog/test_rm_found_2026_11_14_rm530.py::test_a_facet_refusal_comes_before_a_later_stage
       Backlog-ID: RM-652
+- [ ] **A `$documents` element that is not a document answers 2.**
+      mongod 8.2.11 refuses `$documents: [{a: 1}, 2]` at run time with 40228
+      "Executor error during aggregate command on namespace:
+      <db>.$cmd.aggregate :: caused by :: elements within the array passed
+      to $documents must evaluate to an object, but resulting value was: 2.
+      Type of resulting value: 'int'. Input document: {_tempDocumentsField:
+      2}" (the outer collection's namespace inside a `$lookup`). This server
+      answers 2 "each $documents element must be an object". Found
+      2026-11-14 working RM-531.
+      Verify: tests/backlog/test_rm_found_2026_11_14_rm531.py::test_a_documents_element_that_is_not_a_document_is_40228
+      Backlog-ID: RM-653
+- [ ] **A `$documents` expression that fails answers "expression not
+      supported".** mongod 8.2.11 answers `$documents: {$divide: [1, 0]}`
+      (or an element `{x: {$divide: [1, 0]}}`) with 2 "Failed to optimize
+      pipeline :: caused by :: can't $divide by zero", and one reading a
+      `$lookup` `let` variable under the executor prefix as well. This
+      server answers 2 "$documents expression not supported" to all three,
+      discarding the evaluator's own error. Found 2026-11-14 working RM-531.
+      Verify: tests/backlog/test_rm_found_2026_11_14_rm531.py::test_a_documents_expression_error_is_the_expressions
+      Backlog-ID: RM-654
+- [ ] **`$$NOW` is unbound inside a `$unionWith` pipeline.** mongod 8.2.11
+      runs `{$unionWith: {pipeline: [{$documents: [{t: "$$NOW"}]}]}}` (and a
+      later stage reading `$$NOW` there) with the command's date. This
+      server answers 2 "$documents expression not supported", or "not
+      supported by the Rust server" from a later stage. Found 2026-11-14
+      working RM-531.
+      Verify: tests/backlog/test_rm_found_2026_11_14_rm531.py::test_now_is_bound_in_a_union_with_pipeline
+      Backlog-ID: RM-655
+- [ ] **A run-time error in a sub-pipeline or after `$documents` names the
+      wrong namespace.** mongod 8.2.11 names the COMMAND's namespace under
+      "Executor error during aggregate command on namespace:" wherever the
+      failing stage runs: `<db>.$cmd.aggregate` for a collectionless
+      aggregate, the outer collection inside a `$lookup` / `$unionWith`
+      (with or without `from`). This server names `<db>.` (an empty
+      collection) after `$documents` and the FOREIGN collection inside a
+      `$lookup` / `$unionWith` with one: `run_segmented` builds the prefix
+      from its own `coll`, not from `COMMAND_NS`. Found 2026-11-14 working
+      RM-531.
+      Verify: tests/backlog/test_rm_found_2026_11_14_rm531.py::test_a_run_time_error_names_the_commands_namespace
+      Backlog-ID: RM-656
 - [ ] **A `$match` behind a `$replaceRoot` stays behind it over a
       collection.** mongod 8.2.11 moves a `$match` behind
       `{$replaceRoot: {newRoot: "$x"}}` (or `$replaceWith: "$x"`) ahead of

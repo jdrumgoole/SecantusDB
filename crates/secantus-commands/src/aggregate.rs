@@ -2866,7 +2866,20 @@ fn documents_stage(
         .map_err(|_| bad_value("$documents expression not supported"))?;
     let arr = match value {
         Bson::Array(a) => a,
-        _ => return Err(bad_value("$documents argument must evaluate to an array")),
+        // mongod desugars `$documents` into a `$queue` the executor fills, so
+        // a value that is not an array fails at RUN time, under the executor
+        // prefix of the command running it -- `<db>.$cmd.aggregate`, or the
+        // outer collection's namespace inside a `$lookup` / `$unionWith`
+        // (RM-531, probed 8.2.11 for numbers, strings, null, booleans,
+        // documents, `$$ROOT` and `$$NOW`). This answered 2 BadValue.
+        _ => {
+            let ns = COMMAND_NS.with(|n| n.borrow().clone());
+            return Err(CommandError::new(
+                5858203,
+                crate::util::error_code_name(5858203),
+                wrap_pipeline_error("an array is expected".to_string(), false, ns.as_deref()),
+            ));
+        }
     };
     let mut out = Vec::with_capacity(arr.len());
     for elem in arr {
@@ -6985,5 +6998,36 @@ mod nested_stage_tests {
             bson!([{"$unionWith": {"coll": "c", "pipeline": [out.clone(), writes_in_lookup]}}]);
         assert_eq!(problem(union).map(|p| p.0), Some(51047));
         assert_eq!(problem(bson!([{"$facet": {}}])).map(|p| p.0), Some(40169));
+    }
+}
+
+#[cfg(test)]
+mod documents_argument_tests {
+    use super::*;
+
+    /// mongod 8.2.11 refuses a `$documents` argument that is not an array at
+    /// RUN time, under the executor prefix of the command running it (RM-531).
+    /// This answered 2 "$documents argument must evaluate to an array".
+    #[test]
+    fn a_non_array_is_an_executor_error_naming_the_command() {
+        for (ns, spec) in [
+            ("db.$cmd.aggregate", Bson::Int32(5)),
+            ("db.outer", Bson::String("abc".into())),
+            ("db.$cmd.aggregate", Bson::Null),
+            ("db.$cmd.aggregate", Bson::Document(doc! {"a": 1})),
+        ] {
+            let _command = InCommand::enter(ns);
+            let err = documents_stage(Some(&spec), &Document::new(), None).unwrap_err();
+            assert_eq!(err.code, 5858203, "{spec:?}");
+            assert_eq!(err.code_name, "Location5858203", "{spec:?}");
+            assert_eq!(
+                err.errmsg,
+                format!(
+                    "Executor error during aggregate command on namespace: {ns} :: \
+                     caused by :: an array is expected"
+                ),
+                "{spec:?}"
+            );
+        }
     }
 }
