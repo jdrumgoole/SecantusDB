@@ -2121,15 +2121,15 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       (RM-418).
       Verify: tests/backlog/test_rm_found_2026_11_10_rm418.py::test_sbe_find_shapes_are_explained_as_sbe
       Backlog-ID: RM-543
-- [ ] **An aggregate `$sort` on a `$meta` key is refused.** mongod 8.2.1
-      sorts `{$sort: {s: {$meta: "randVal"}}}` (and a `searchScore` key,
-      which has no value without `$search` and so ties); this server
-      refuses any `$meta` key in the stage with 2 "aggregation pipeline
-      uses a stage or operator not supported by the Rust server". A `find`
-      sort by `{$meta: "randVal"}` answers on both. Found 2026-11-08 while
-      working RM-332.
-      Verify: tests/backlog/test_rm_found_2026_11_08_rm332.py::test_a_sort_on_a_meta_key_runs
-      Backlog-ID: RM-423
+- [ ] **A `$sort` on a field and `{$meta: "randVal"}` before a `$project`
+      is not refused.** mongod 8.2.11 refuses `[{$sort: {a: 1, s: {$meta:
+      "randVal"}}}, {$project: {a: 1, _id: 0}}]` with 16410 ("FieldPath
+      field names may not start with '$', given '$computed1'", from its
+      pipeline rewrite); the same sort alone, or `{$meta: "randVal"}` as the
+      only key, answers on both, and this server sorts the pipeline. Found
+      2026-11-14 while working RM-423.
+      Verify: tests/backlog/test_rm_found_2026_11_08_rm332.py::test_a_rand_sort_beside_a_field_under_a_project_is_refused
+      Backlog-ID: RM-691
 - [ ] **A retryable write retried after a crash under `--data-nonlogged` is
       applied again.** A restarted server reads a session's
       `config.transactions` row, its oplog entries and its

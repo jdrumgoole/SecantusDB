@@ -1163,13 +1163,26 @@ pub fn sort_documents_placed(
     sizing: &Sizing,
     limit: Option<usize>,
 ) -> R<(Vec<Document>, Vec<usize>)> {
-    let sort = crate::aggregate::sort_fields(spec)?;
+    let (sort, metas) = meta_sort_fields(spec)?;
     let mut keyed: Vec<(Vec<Bson>, Document)> = Vec::with_capacity(docs.len());
     for d in docs {
-        keyed.push((crate::aggregate::sort_key_values(&d, &sort)?, d));
+        let mut key = if sort.is_empty() {
+            Vec::new()
+        } else {
+            crate::aggregate::sort_key_values(&d, &sort)?
+        };
+        for (at, meta) in &metas {
+            key.insert(*at, meta.value());
+        }
+        keyed.push((key, d));
+    }
+    let mut dirs: Vec<bool> = sort.iter().map(|(_, rev)| *rev).collect();
+    for (at, _) in &metas {
+        // A `$meta` key sorts descending, as mongod's does.
+        dirs.insert(*at, true);
     }
     let cmp = |ka: &[Bson], kb: &[Bson]| {
-        for (i, (_, rev)) in sort.iter().enumerate() {
+        for (i, rev) in dirs.iter().enumerate() {
             let c = crate::order::cmp(&ka[i], &kb[i]);
             let c = if *rev { c.reverse() } else { c };
             if c != Ordering::Equal {
@@ -1185,9 +1198,83 @@ pub fn sort_documents_placed(
         .unzip())
 }
 
+/// A `$meta` key of a `$sort` stage.
+enum MetaKey {
+    /// `{$meta: "randVal"}`: a fresh random double for each document.
+    RandVal,
+    /// `{$meta: "searchScore"}`: no value without `$search`, so every
+    /// document ties on it.
+    SearchScore,
+}
+
+impl MetaKey {
+    fn value(&self) -> Bson {
+        match self {
+            MetaKey::RandVal => Bson::Double(rand::random::<f64>()),
+            MetaKey::SearchScore => Bson::Null,
+        }
+    }
+}
+
+/// The field keys of `spec`, and its `$meta` keys with the place each takes
+/// in the sort key. mongod 8.2.1 sorts a `$sort` stage by `{$meta:
+/// "randVal"}` and by `{$meta: "searchScore"}` (RM-423); any other `$meta`,
+/// and a spec with no key at all, is left to [`crate::aggregate::sort_fields`].
+#[allow(clippy::type_complexity)]
+fn meta_sort_fields(spec: &Bson) -> R<(Vec<(String, bool)>, Vec<(usize, MetaKey)>)> {
+    let Bson::Document(d) = spec else {
+        return Ok((crate::aggregate::sort_fields(spec)?, Vec::new()));
+    };
+    let meta = |v: &Bson| match v {
+        Bson::Document(m) if m.len() == 1 => match m.get("$meta") {
+            Some(Bson::String(k)) if k == "randVal" => Some(MetaKey::RandVal),
+            Some(Bson::String(k)) if k == "searchScore" => Some(MetaKey::SearchScore),
+            _ => None,
+        },
+        _ => None,
+    };
+    let mut fields = Document::new();
+    let mut metas = Vec::new();
+    for (i, (k, v)) in d.iter().enumerate() {
+        match meta(v) {
+            Some(m) => metas.push((i, m)),
+            None => {
+                fields.insert(k.clone(), v.clone());
+            }
+        }
+    }
+    if metas.is_empty() || !fields.is_empty() {
+        let sort = crate::aggregate::sort_fields(&Bson::Document(fields))?;
+        return Ok((sort, metas));
+    }
+    Ok((Vec::new(), metas))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// RM-423: a `searchScore` key ties every document, leaving the order
+    /// to the other keys and then to arrival; a `randVal` key alone sorts.
+    #[test]
+    fn a_meta_sort_key_ties_or_draws() {
+        let docs: Vec<Document> = (0..6).map(|i| doc! { "_id": i, "a": i % 2 }).collect();
+        let sizing = Sizing {
+            sizes: None,
+            source: SortSource::QueryLayer,
+            fields: None,
+            added: None,
+            budget: memlimit::MAX_BYTES,
+        };
+        let spec = Bson::Document(doc! { "a": -1, "s": { "$meta": "searchScore" } });
+        let out = sort_documents(docs.clone(), &spec, &sizing, None).unwrap();
+        let ids: Vec<i32> = out.iter().map(|d| d.get_i32("_id").unwrap()).collect();
+        assert_eq!(ids, vec![1, 3, 5, 0, 2, 4]);
+        let spec = Bson::Document(doc! { "s": { "$meta": "randVal" } });
+        assert_eq!(sort_documents(docs, &spec, &sizing, None).unwrap().len(), 6);
+        let spec = Bson::Document(doc! { "s": { "$meta": "textScore" } });
+        assert!(sort_documents(Vec::new(), &spec, &sizing, None).is_err());
+    }
 
     fn items(n: i32, len: usize) -> Vec<(Vec<Bson>, Document)> {
         (0..n)
