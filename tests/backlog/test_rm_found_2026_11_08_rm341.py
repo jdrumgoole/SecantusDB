@@ -174,13 +174,13 @@ def test_an_exists_candidates_filter_is_in_mongods_order(
     assert _losers(rust_mongo, q) == _losers(mongod, q)
 
 
-@pytest.mark.backlog("RM-440")
+@pytest.mark.backlog_fixed("RM-440")
 def test_a_type_candidate_reads_mongods_keys(rust_mongo: Any, mongod: Any) -> None:
     """mongod 8.2.11's losing candidate for `{a: {$lt: 5}, b: {$type:
     "int"}}` over `b_1` rechecks `$type` against each key and returns all
     101 keys it examines (every `b` is an int) to its FETCH in the trial;
-    this server's, with the same bounds and filter, returns 6 -- the
-    documents the FETCH keeps."""
+    this server's returned 6 -- the documents the FETCH keeps -- because it
+    answered the scan's key filter with whether the whole query matched."""
     q = {"a": {"$lt": 5}, "b": {"$type": "int"}}
     assert _losers(rust_mongo, q) == _losers(mongod, q)
 

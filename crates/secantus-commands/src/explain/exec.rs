@@ -30,8 +30,9 @@ pub(crate) struct Env<'a> {
     /// Per document, whether it matches the QUERY, when the caller already
     /// knows: a stage's filter is then answered from this and not run, so
     /// the documents need only hold the fields the indexes are keyed on.
-    /// Every filter a plan runs passes exactly the documents the query
-    /// matches, among those its scan returns.
+    /// Every FETCH or COLLSCAN filter a plan runs passes exactly the
+    /// documents the query matches, among those its scan returns; an index
+    /// scan's key filter is only part of the query and is always run.
     pub known: Option<&'a [bool]>,
     /// The command's filter, which a positional projection below a sort
     /// reads; `None` where no sort over one reports what it sorted.
@@ -43,6 +44,17 @@ impl Env<'_> {
         if let (Some(known), Some(_)) = (self.known, filter) {
             return known[row];
         }
+        self.evaluate(row, filter)
+    }
+
+    /// An index scan's filter over the keys: only part of the query (the
+    /// rest is its FETCH's), so `known` does not answer it. Its fields are
+    /// the index's, which the documents hold (RM-440).
+    pub(crate) fn key_matches(&self, row: usize, filter: &Option<Document>) -> bool {
+        self.evaluate(row, filter)
+    }
+
+    fn evaluate(&self, row: usize, filter: &Option<Document>) -> bool {
         match filter {
             None => true,
             Some(f) => {
@@ -676,7 +688,7 @@ impl Scan {
                 if repeat {
                     self.dups_dropped += 1;
                 }
-                if repeat || !env.matches(row, &self.filter) {
+                if repeat || !env.key_matches(row, &self.filter) {
                     Work::NeedTime
                 } else {
                     self.returning(row);
@@ -692,7 +704,7 @@ impl Scan {
             if self.multikey && !self.seen.insert(row) {
                 continue;
             }
-            if !env.matches(row, &self.filter) {
+            if !env.key_matches(row, &self.filter) {
                 continue;
             }
             self.returning(row);

@@ -2516,14 +2516,6 @@ Still different, all 77:
       reports 83 works and neither field. Found 2026-11-08 (RM-341).
       Verify: tests/backlog/test_rm_found_2026_11_08_rm341.py::test_a_sort_merge_candidate_counts_as_mongods
       Backlog-ID: RM-437
-- [ ] **A `$type` index filter returns too few keys in the trial.** mongod
-      8.2.11's losing candidate for `{a: {$lt: 5}, b: {$type: "int"}}` over
-      `b_1` rechecks `$type` against each key and hands all 101 it examines
-      (every `b` an int) to its FETCH; this server's, with the same bounds
-      and filter, hands over 6 -- the documents the FETCH keeps -- so its
-      FETCH's `docsExamined` is 6, not 101. Found 2026-11-08 (RM-341).
-      Verify: tests/backlog/test_rm_found_2026_11_08_rm341.py::test_a_type_candidate_reads_mongods_keys
-      Backlog-ID: RM-440
 - [ ] **A multikey index does not cover a field that holds no array.**
       mongod 8.2.11 answers `find({a: {$lt: 5}}, {a: 1, _id: 0})` from
       `a_1_c_1` with a PROJECTION_COVERED over the IXSCAN when only `c`
