@@ -30066,6 +30066,10 @@ impl PgHandler {
         as_fetch: bool,
     ) -> PgWireResult<(usize, Vec<Response>)> {
         use secantus_pgplan::FetchDirection as Fd;
+        // A cursor computes the rows this FETCH reaches, running its query
+        // first if no FETCH has yet (RP-744, RP-897). A zero count reaches
+        // only the row the cursor sits on, computed already.
+        self.fill_pending(name, direction, count)?;
         let mut cursors = self.cursors.lock().unwrap_or_else(|e| e.into_inner());
         let Some(cursor) = cursors.get_mut(name) else {
             return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
@@ -30088,12 +30092,10 @@ impl PgHandler {
         } else {
             (direction, count)
         };
-        // A streamed cursor reads what this FETCH reaches first, and a
-        // cursor computes the rows it reaches (RP-744).
+        // A streamed cursor reads what this FETCH reaches first.
         if cursor.tail.is_some() {
             self.fill_cursor(cursor, direction, count)?;
         }
-        self.fill_pending(cursor, direction, count)?;
         let base = cursor.base;
         let len = (base + cursor.rows.len()) as i64;
         let pos = cursor.pos;
@@ -34791,6 +34793,16 @@ impl PgHandler {
                 Statement::Transaction(TransactionControl::Rollback { .. })
             )
         {
+            // A COMMIT closes a cursor not run yet, or runs a WITH HOLD one
+            // whole (`persist_holdable_cursors`); a PREPARE closes it.
+            if !matches!(
+                stmt,
+                Statement::Transaction(
+                    TransactionControl::Commit { .. } | TransactionControl::Prepare(_)
+                )
+            ) {
+                self.start_deferred_cursors();
+            }
             self.drain_block_scans()?;
         }
         // Only the Execute's own top-level SELECT may stream; a statement
@@ -35045,6 +35057,86 @@ impl PgHandler {
                         }
                         return Ok(vec![Response::Execution(Tag::new("DECLARE CURSOR"))]);
                     }
+                }
+            }
+            // PortalStart only plans: the query runs at the first FETCH that
+            // needs a row, so a WHERE, a Sort or a select list that raises
+            // does so there, and a cursor no FETCH reads runs nothing
+            // (RP-897). It reads in the snapshot the DECLARE takes: another
+            // statement of the block runs it before it moves that snapshot
+            // (`start_deferred_cursors`). Its row description is the
+            // planner's until the run gives its own. Kept to run here: a
+            // WITH HOLD cursor declared outside a block, whose transaction
+            // ends now (PostgreSQL materialises it at that commit), and a
+            // simply updatable one, whose rows' ids are captured with them.
+            if in_block && updatable.is_none() {
+                let planned = match &*query {
+                    Statement::Select(_)
+                    | Statement::SetOp(_)
+                    | Statement::Aggregate(_)
+                    | Statement::SelectConstant(_)
+                    | Statement::ValuesConstant(_) => {
+                        self.describe_planned((*query).clone()).ok().flatten()
+                    }
+                    _ => None,
+                };
+                if let Some(fields) = planned {
+                    take_ids();
+                    self.cursor_capture
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .take();
+                    self.binary_results
+                        .store(binary, std::sync::atomic::Ordering::Relaxed);
+                    {
+                        let mut guard = self.txn.lock().unwrap_or_else(|e| e.into_inner());
+                        if let Some(handle) = guard.as_mut() {
+                            let handle = self.with_isolation(handle)?;
+                            self.storage
+                                .with_user_transaction(handle, || ())
+                                .map_err(|e| Self::storage_err("transaction failed", e))?;
+                        }
+                    }
+                    self.cursors
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .insert(
+                            name,
+                            CursorState {
+                                born: next_cursor_born(),
+                                schema: Arc::new(fields),
+                                domains: secantus_pgplan::select_output_domains(
+                                    &statement,
+                                    &[],
+                                    &|n: &str| self.lookup(n),
+                                ),
+                                rows: Vec::new(),
+                                pos: 0,
+                                statement,
+                                is_holdable: holdable,
+                                is_binary: is_binary_cursor,
+                                is_scrollable: scrollable,
+                                creation_time: bson::DateTime::now(),
+                                typed_rows: Some(Vec::new()),
+                                tz,
+                                tail: None,
+                                base: 0,
+                                pending: Some(portal_stream::PendingRows::deferred(
+                                    *query,
+                                    capture_typed,
+                                )),
+                                failed: false,
+                                current_of: None,
+                                held: false,
+                                pinned: false,
+                                auto_held: false,
+                            },
+                        );
+                    if holdable {
+                        self.holdable_declared
+                            .store(true, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    return Ok(vec![Response::Execution(Tag::new("DECLARE CURSOR"))]);
                 }
             }
             // INSIDE the block's transaction, as every other statement runs:
@@ -41186,7 +41278,7 @@ impl PgHandler {
         count: i64,
     ) -> std::result::Result<Vec<Vec<Bson>>, PlanError> {
         let mut cursors = self.cursors.lock().unwrap_or_else(|e| e.into_inner());
-        let Some(cursor) = cursors.get_mut(name) else {
+        let Some(mut cursor) = cursors.get_mut(name) else {
             return Err(PlanError::Sqlstate(
                 "34000",
                 format!("cursor \"{name}\" does not exist"),
@@ -41222,8 +41314,20 @@ impl PgHandler {
             self.fill_cursor(cursor, direction, wanted)
                 .map_err(Self::plan_error_of)?;
         }
-        self.fill_pending(cursor, direction, wanted)
-            .map_err(Self::plan_error_of)?;
+        // The rows it reaches are computed outside the cursor lock.
+        if cursor.pending.is_some() {
+            drop(cursors);
+            self.fill_pending(name, direction, wanted)
+                .map_err(Self::plan_error_of)?;
+            cursors = self.cursors.lock().unwrap_or_else(|e| e.into_inner());
+            let Some(again) = cursors.get_mut(name) else {
+                return Err(PlanError::Sqlstate(
+                    "34000",
+                    format!("cursor \"{name}\" does not exist"),
+                ));
+            };
+            cursor = again;
+        }
         let base = cursor.base;
         let len = (base + cursor.rows.len()) as i64;
         let positions: Vec<i64> = if count == 0 {

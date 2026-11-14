@@ -3717,16 +3717,17 @@ at the DECLARE, and the cursor answers that differ either way.
       Append is run as it is fetched, and `fetch 1` answers `1`.
       Verify: tests/backlog/test_rp_found_rp744.py::test_a_cursor_over_a_union_computes_its_rows_as_they_are_fetched
       Backlog-ID: RP-896
-- [ ] **A cursor's WHERE and Sort run at the DECLARE, not at the first
-      FETCH.** PostgreSQL 15.19's DECLARE only plans: `declare c cursor for
-      select k from (values (2), (0)) s(k) where 1/k > 0` succeeds and its
-      `fetch 1` raises 22012, as does a Sort over a select list that raises
-      (`... order by k desc`). Here the DECLARE runs the query and raises,
-      and no cursor is made. Deferring the run must keep the DECLARE's
-      snapshot: a row the block writes after the DECLARE is not the
-      cursor's.
-      Verify: tests/backlog/test_rp_found_rp744.py::test_a_cursor_runs_its_query_at_the_first_fetch
-      Backlog-ID: RP-897
+- [ ] **A cursor's WHERE is evaluated for every row at its first FETCH.**
+      Since RP-897 a cursor's query runs at the first FETCH that needs a
+      row (`portal_stream::PendingRows::Unstarted`), but the executor
+      evaluates the whole WHERE when it runs: `declare c cursor for select
+      k from (values (1), (2), (0)) s(k) where 10/k > 1` raises 22012 at
+      `fetch 1`, where PostgreSQL 15.19 filters as it is fetched and
+      answers `1`, then `2`, and the third FETCH raises. Needs the scan's
+      filter run in the row stream, as the select list is since RP-744.
+      Found while working RP-897 (2026-11-14).
+      Verify: tests/backlog/test_rp_found_rp744.py::test_a_cursors_where_filters_as_it_is_fetched
+      Backlog-ID: RP-961
 - [ ] **A PL/pgSQL FETCH from a `refcursor` parameter is refused at CREATE
       FUNCTION.** `create function f(c refcursor) returns int language
       plpgsql as $$ declare r int; begin fetch c into r; return r; end $$`
