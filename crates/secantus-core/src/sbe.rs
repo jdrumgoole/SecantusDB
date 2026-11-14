@@ -357,6 +357,21 @@ fn pushed(
 /// in SBE: the find layer and the chain pushed down after it. `None` when the
 /// whole pipeline runs in the classic engine.
 pub fn pushdown(pipeline: &[Bson], foreign_is_view: &dyn Fn(&str) -> bool) -> Option<usize> {
+    pushdown_under(pipeline, foreign_is_view, false)
+}
+
+/// [`pushdown`] under a framework control: `try_sbe_engine` is mongod's
+/// `trySbeEngine` (a `queryFramework: "sbe"` query setting, RM-542), under
+/// which the find layer runs in SBE on its own, with nothing pushed after
+/// it, and also takes an exclusion `$project` and the `$addFields` /
+/// `$set` stages that follow it (measured 8.2.11, 2026-11-14: `[]`,
+/// `[{$sort}]`, `[{$match}, {$addFields}]`, `[{$match}, {$unwind}]` all
+/// run their query in SBE; a `$jsonSchema` filter keeps it classic).
+pub fn pushdown_under(
+    pipeline: &[Bson],
+    foreign_is_view: &dyn Fn(&str) -> bool,
+    try_sbe_engine: bool,
+) -> Option<usize> {
     let mut at = 0;
     let mut layer_ok = true;
     let name_at = |i: usize| pipeline.get(i).and_then(stage);
@@ -381,8 +396,19 @@ pub fn pushdown(pipeline: &[Bson], foreign_is_view: &dyn Fn(&str) -> bool) -> Op
     };
     skip_limit(&mut at);
     if let Some(("$project", Bson::Document(p))) = name_at(at) {
-        if absorbable_projection(p, sorted) {
+        let absorbed = absorbable_projection(p, sorted)
+            || (try_sbe_engine && p.values().all(is_flag) && p.values().all(falsy));
+        if absorbed {
             layer_ok &= projection_compatible(p);
+            at += 1;
+            skip_limit(&mut at);
+        }
+    }
+    if try_sbe_engine {
+        while let Some(("$addFields" | "$set", Bson::Document(p))) = name_at(at) {
+            if !projection_compatible(p) {
+                break;
+            }
             at += 1;
             skip_limit(&mut at);
         }
@@ -399,7 +425,7 @@ pub fn pushdown(pipeline: &[Bson], foreign_is_view: &dyn Fn(&str) -> bool) -> Op
             None => break,
         }
     }
-    (at > layer && layer_ok).then_some(at)
+    ((at > layer || try_sbe_engine) && layer_ok).then_some(at)
 }
 
 /// `pipeline` with [`ENGINE_STAGE`] markers putting its stages `start..end`
@@ -753,6 +779,52 @@ mod tests {
         for (stages, want) in cases {
             assert_eq!(pushdown(&p(stages.clone()), &no_view), want, "{stages:?}");
         }
+    }
+
+    /// Under `trySbeEngine` the find layer runs in SBE with nothing pushed
+    /// after it (measured 8.2.11, 2026-11-14; RM-542).
+    #[test]
+    fn try_sbe_engine_pushes_the_find_layer_alone() {
+        let no_view = |_: &str| false;
+        let cases: Vec<(Vec<Document>, Option<usize>)> = vec![
+            (vec![], Some(0)),
+            (vec![doc! {"$match": {"x": 1}}], Some(1)),
+            (vec![doc! {"$sort": {"y": 1}}], Some(1)),
+            (
+                vec![doc! {"$match": {"x": 1}}, doc! {"$project": {"y": 0}}],
+                Some(2),
+            ),
+            (
+                vec![
+                    doc! {"$match": {"x": 1}},
+                    doc! {"$addFields": {"z": 1}},
+                    doc! {"$set": {"w": 1}},
+                    doc! {"$limit": 2},
+                ],
+                Some(4),
+            ),
+            (
+                vec![doc! {"$match": {"x": 1}}, doc! {"$unwind": "$y"}],
+                Some(1),
+            ),
+            (
+                vec![doc! {"$match": {"x": 1}}, doc! {"$group": {"_id": "$y"}}],
+                Some(2),
+            ),
+            (vec![doc! {"$match": {"$jsonSchema": {}}}], None),
+        ];
+        for (stages, want) in cases {
+            assert_eq!(
+                pushdown_under(&p(stages.clone()), &no_view, true),
+                want,
+                "{stages:?}"
+            );
+        }
+        // The default control still needs a stage pushed after the layer.
+        assert_eq!(
+            pushdown(&p(vec![doc! {"$match": {"x": 1}}]), &no_view),
+            None
+        );
     }
 
     #[test]

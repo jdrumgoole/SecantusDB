@@ -373,7 +373,11 @@ pub(crate) fn sbe_pushdown(
         return None;
     }
     let is_view = |from: &str| crate::views::is_view(storage, db, from);
-    secantus_core::sbe::pushdown(hoisted, &is_view)
+    // `queryFramework: "sbe"` (`trySbeEngine`) runs the find layer in SBE
+    // with nothing pushed after it (RM-542).
+    let try_sbe_engine =
+        crate::query_settings::framework() == Some(crate::query_settings::Framework::Sbe);
+    secantus_core::sbe::pushdown_under(hoisted, &is_view, try_sbe_engine)
 }
 
 /// Whether the read uses the collection's own collation.
@@ -798,12 +802,15 @@ fn cache_key_of(
 ) -> Option<cache_key::CacheKey> {
     let full = catalog(storage, db, &s.coll, None).ok()?;
     let implies = |partial: &Document| storage.query_implies_partial(&s.filter, partial);
+    let sbe = front_runs_in_sbe(storage, db, s, collation, pipeline);
     let (projection, distinct) = match &s.kind {
         Kind::Find => (s.projection.as_ref(), None),
+        // A `distinct` SBE runs is keyed as the `find` of its query
+        // (measured 8.2.11, 2026-11-14: `eqx||||fs`; RM-542).
+        Kind::Distinct(_) if sbe => (None, None),
         Kind::Distinct(key) => (None, Some(key.as_str())),
         _ => (None, None),
     };
-    let sbe = front_runs_in_sbe(storage, db, s, collation, pipeline);
     let parts = cache_key::Parts {
         sort: s.sort.as_ref().filter(|d| !d.is_empty()),
         projection,
@@ -829,8 +836,9 @@ fn front_runs_in_sbe(
     collation: Option<&Collation>,
     pipeline: &[Document],
 ) -> bool {
-    if pipeline.is_empty() {
-        return plain_find(s)
+    // An `aggregate` (or a view's read) with no stages is still a pipeline.
+    if pipeline.is_empty() && !s.pipeline {
+        return (plain_find(s) || plain_distinct(s))
             && find_runs_in_sbe(
                 storage,
                 db,
@@ -850,6 +858,13 @@ fn front_runs_in_sbe(
 /// A `find` command of a collection, not a view's pipeline.
 fn plain_find(s: &Shape) -> bool {
     matches!(s.kind, Kind::Find) && !s.pipeline
+}
+
+/// A `distinct` command of a collection, not a view's pipeline: under
+/// `queryFramework: "sbe"` mongod runs its query in SBE as a `find`'s
+/// (RM-542).
+fn plain_distinct(s: &Shape) -> bool {
+    matches!(s.kind, Kind::Distinct(_)) && !s.pipeline
 }
 
 /// The plan cache key mongod builds for the query `s` plans, as a `Slow
@@ -1955,16 +1970,25 @@ fn reply_for(r: &Request, verbosity: Verbosity, ctx: &mut CommandContext) -> Han
                 is_cached,
                 docs: &t.docs,
                 stage_counts: &stage_counts,
+                cursor_pulled,
                 stage_spills: &stage_spills,
             };
             return sbe_reply(r, planner, &sbe, verbosity, ctx);
         }
     }
-    // A `find` mongod runs in SBE (RM-418): over a forward collection scan
-    // with no sort, hint or collation, its scan, filter, skip, limit and a
-    // simple projection (RM-543); any other is still explained in the
-    // classic shape.
-    if r.pipeline.is_empty() && front_runs_in_sbe(storage, &db, s, collation.as_ref(), &[]) {
+    // A `find` mongod runs in SBE (RM-418), and under `queryFramework:
+    // "sbe"` a `distinct` and an `aggregate`'s query with what it takes
+    // after it (RM-542): over a forward collection scan with no sort, hint
+    // or collation, its scan, filter, skip, limit and a simple projection
+    // (RM-543), or an `aggregate`'s `$addFields`; any other is still
+    // explained in the classic shape.
+    let own_read = r.pipeline.is_empty() && !s.pipeline;
+    let layer = if own_read {
+        front_runs_in_sbe(storage, &db, s, collation.as_ref(), &[]).then(Vec::new)
+    } else {
+        sbe_layer(storage, &db, s, collation.as_ref(), &r.pipeline)
+    };
+    if let Some(added) = layer {
         let built = if !t.exists {
             Some(sbe::eof_plan())
         } else {
@@ -1991,20 +2015,27 @@ fn reply_for(r: &Request, verbosity: Verbosity, ctx: &mut CommandContext) -> Han
             };
             let filtered = s.filter.is_empty() || on.filter.is_some();
             let uuid = crate::admin::collection_uuid_text(storage, &db, &s.coll);
-            (scan && simple && filtered)
-                .then(|| sbe::find_plan(&uuid, &on, s.projection.as_ref()))
-                .flatten()
+            // An `aggregate`'s projection is not built here.
+            let projected = s.projection.as_ref().is_some_and(|p| !p.is_empty());
+            let built = |()| match added.as_slice() {
+                [] if own_read => sbe::find_plan(&uuid, &on, s.projection.as_ref()),
+                _ if projected => None,
+                [] => sbe::find_plan(&uuid, &on, None),
+                adds => sbe::added_plan(&uuid, &on, adds),
+            };
+            (scan && simple && filtered).then_some(()).and_then(built)
         };
         if let Some(built) = built {
             let is_cached = cache.as_ref().is_some_and(|c| c.cached(&plan));
             let sbe = Pushed {
                 plan: &built,
-                pushed: 0,
+                pushed: added.len(),
                 tail: &[],
                 is_cached,
                 docs: &t.docs,
-                stage_counts: &[],
-                stage_spills: &[],
+                stage_counts: &stage_counts,
+                cursor_pulled,
+                stage_spills: &stage_spills,
             };
             return sbe_reply(r, planner, &sbe, verbosity, ctx);
         }
@@ -2151,6 +2182,35 @@ fn sbe_front(
     })
 }
 
+/// Under `queryFramework: "sbe"`, the `$addFields` / `$set` specs of a
+/// pipeline whose query mongod runs in SBE with no stage pushed after it
+/// but those (RM-542); `None` when its query is not run in SBE that way.
+fn sbe_layer(
+    storage: &dyn crate::storage::Storage,
+    db: &str,
+    s: &Shape,
+    collation: Option<&Collation>,
+    pipeline: &[Document],
+) -> Option<Vec<Document>> {
+    if crate::query_settings::framework() != Some(crate::query_settings::Framework::Sbe) {
+        return None;
+    }
+    let stages: Vec<Bson> = pipeline.iter().cloned().map(Bson::Document).collect();
+    let hoisted = hoist::hoist_matches(&stages);
+    let n = sbe_pushdown(storage, db, &s.coll, &hoisted, s.hint.as_ref(), collation)?;
+    let taken = pipeline.len().checked_sub(s.rest.len())?;
+    let pushed = n.checked_sub(taken)?;
+    s.rest[..pushed]
+        .iter()
+        .map(|st| {
+            st.get_document("$addFields")
+                .or_else(|_| st.get_document("$set"))
+                .ok()
+                .cloned()
+        })
+        .collect()
+}
+
 /// A slot-based plan ready to report, with the per-stage counts of the
 /// classic stages after it.
 struct Pushed<'a> {
@@ -2162,6 +2222,9 @@ struct Pushed<'a> {
     is_cached: bool,
     docs: &'a [Document],
     stage_counts: &'a [i64],
+    /// What the stages after the `$cursor` pulled from it, under a
+    /// `$limit`; read only when no stage is pushed after the query.
+    cursor_pulled: Option<i64>,
     stage_spills: &'a [secantus_core::memlimit::SpillReport],
 }
 
@@ -2214,7 +2277,15 @@ fn sbe_reply(
     if wanted {
         // What the `$cursor` handed over: the count of the last stage it
         // runs, as the stages after it pulled it.
-        let handed = p.stage_counts.get(p.pushed - 1).copied().unwrap_or(0);
+        // With no stage pushed after the query (`queryFramework: "sbe"`,
+        // RM-542), what the query itself produced.
+        let handed = match p.pushed.checked_sub(1) {
+            Some(last) => p.stage_counts.get(last).copied().unwrap_or(0),
+            None => p.cursor_pulled.unwrap_or_else(|| {
+                let (_, n) = p.plan.execution_stats(p.docs, sbe::Pull::Whole, false);
+                n
+            }),
+        };
         let limit = s
             .rest
             .get(p.pushed)
@@ -2239,7 +2310,7 @@ fn sbe_reply(
     let mut stages = vec![Bson::Document(first)];
     for listed in p.tail {
         let mut listed = listed.clone();
-        if let Some(n) = p.stage_counts.get(p.pushed - 1) {
+        if let Some(n) = p.pushed.checked_sub(1).and_then(|i| p.stage_counts.get(i)) {
             counted(&mut listed, *n);
         }
         stages.push(Bson::Document(listed));

@@ -54,14 +54,15 @@ AGG_AND_DISTINCT = [
 ]
 
 
-@pytest.mark.backlog("RM-542")
+@pytest.mark.backlog_fixed("RM-542")
 @pytest.mark.parametrize("cmd", AGG_AND_DISTINCT, ids=["$match", "$match+$addFields", "distinct"])
 def test_sbe_framework_pushes_an_aggregate_and_a_distinct(
     rust_mongo: Any,
     mongod_rs: Any,  # noqa: F811
     cmd: dict,
 ) -> None:
-    """Under `queryFramework: "sbe"` mongod runs these in SBE."""
+    """Under `queryFramework: "sbe"` mongod runs these in SBE; this server
+    pushed them as without the setting until RM-542 was fixed."""
     assert _engine(rust_mongo, cmd) == _engine(mongod_rs, cmd)
 
 

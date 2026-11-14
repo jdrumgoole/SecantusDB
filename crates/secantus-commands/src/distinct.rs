@@ -138,6 +138,20 @@ pub fn distinct(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     crate::timeseries::check_hint(storage, &ctx.db_name, &coll, &filter, hint)?;
     crate::opdebug::note_resolved_views(storage, &ctx.db_name, Some(&coll), &[]);
     let on_view = crate::views::is_view(storage, &ctx.db_name, &coll);
+    // Under a query setting's `queryFramework: "sbe"` mongod runs the
+    // query in SBE, which decides how its expressions answer (RM-542).
+    let sbe = !on_view
+        && crate::explain::find_runs_in_sbe(
+            storage,
+            &ctx.db_name,
+            &coll,
+            &filter,
+            None,
+            0,
+            hint,
+            collation.as_ref(),
+        );
+    let _engine = secantus_core::sbe::enter(sbe);
     let as_view = on_view
         || storage
             .get_collection_options(&ctx.db_name, &coll)

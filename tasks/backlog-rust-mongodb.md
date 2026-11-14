@@ -2104,16 +2104,6 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       at the next start (mongod's op observer reloads it).
       Verify: tests/backlog/test_rm_219_diag_query_settings.py::test_setting_for_a_query_the_server_does_not_shape
       Backlog-ID: RM-418
-- [ ] **Under `queryFramework: "sbe"` an `aggregate` and a `distinct` are
-      pushed into SBE as without the setting.** mongod 8.2.11's
-      `trySbeEngine` runs a `distinct`, and an `aggregate` whose stages it
-      does not push past the query (`[{$match: ...}]`, a `$project` or
-      `$addFields` after it), in SBE (`explainVersion` "2", the
-      `queryHash` of the SBE-run query); this server keeps
-      `trySbeRestricted`'s rule there, which pushes only a `$group` or
-      `$lookup`, and runs them classic. Found 2026-11-10 (RM-418).
-      Verify: tests/backlog/test_rm_found_2026_11_10_rm418.py::test_sbe_framework_pushes_an_aggregate_and_a_distinct
-      Backlog-ID: RM-542
 - [ ] **A `find` under `queryFramework: "sbe"` that is sorted or
       index-served is explained in the classic shape.** mongod 8.2.11 runs
       it in SBE and explains it so (`nlj` over an `ixseek` and a `seek` for
@@ -2123,7 +2113,12 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       projection of top-level fields (`explain/sbe/find.rs`). Also not
       built: an `$in` holding null (mongod's `typeMatch` program), a
       projection of a path or a computed field, and a projection under both
-      a skip and a limit. Found 2026-11-10 (RM-418).
+      a skip and a limit. For an `aggregate` (RM-542) the `$addFields`
+      after its query are built when they set new top-level fields to
+      constants or one field path; an `aggregate` whose query is sorted or
+      `$project`ed, or whose `$addFields` compute, is explained classic
+      (its `queryHash` and `planCacheKey` are mongod's). Found 2026-11-10
+      (RM-418).
       Verify: tests/backlog/test_rm_found_2026_11_10_rm418.py::test_sbe_find_shapes_are_explained_as_sbe
       Backlog-ID: RM-543
 - [ ] **A `$near` key inside a VALUE is refused as a misplaced `$near`.**

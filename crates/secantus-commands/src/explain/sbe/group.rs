@@ -34,7 +34,7 @@ const CAPPED_BYTES: i32 = 104_857_600;
 
 /// An argument as the builder generates it, before slots are known.
 #[derive(Clone, Debug, PartialEq)]
-enum Arg {
+pub(super) enum Arg {
     /// `$$ROOT` / `$$CURRENT`: the scan's record slot.
     Root,
     /// A top-level field: its scan slot.
@@ -45,7 +45,7 @@ enum Arg {
     Const(Bson),
 }
 
-fn arg_of(v: &Bson) -> Option<Arg> {
+pub(super) fn arg_of(v: &Bson) -> Option<Arg> {
     match v {
         Bson::String(s) if s == "$$ROOT" || s == "$$CURRENT" => Some(Arg::Root),
         Bson::String(s) if s.starts_with("$$") => None,
