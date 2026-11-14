@@ -2571,10 +2571,18 @@ holding `(1, 'y')`.
       since a joined row is keyed by the bare name, and `create view v as
       select t.a from s1.t t join s2.t on s2.t.a = t.a` is accepted, its
       definition then reading `t.a = t.a`. Measured on a private 15.19
-      cluster. The join paths disagree with each other (probed 2026-11-14):
-      `from s1.t, s2.t` and `s1.t join s2.t on s2.t.a = s1.t.a` already run,
-      while `s1.t join s2.t on true` and `s1.t t join s2.t on true` are
-      42712. The 42712 checks are in `joins.rs` (`leaf_with_names` and the
+      cluster. Re-probed 2026-11-14 (gap test cases, `n1.t` = 1, 2 and
+      `n2.t` = 1, 3): every JOIN form of two unaliased `t` is 42712 here
+      (`on true`, `USING (a)`, `NATURAL`, a WHERE naming `n1.t.a`), where
+      PostgreSQL runs it and reports `t.a` as 42P09 `table reference "t" is
+      ambiguous` and a bare `a` as 42702. The comma form is worse: `select
+      n2.t.a from n1.t, n2.t where n2.t.a = 3` returns NO rows (PostgreSQL
+      two `3`s) -- `n2.t.a` reads `n1.t`'s column, a silent wrong answer --
+      and the same with ORDER BY is 42712. A three-name reference that does
+      not resolve to one entry by name is left three names long by
+      `schema_refs::column_ref` for the planner, which then resolves it by
+      the bare name. `select n1.t.a, n2.t.a from n1.t join n2.t on n2.t.a
+      = n1.t.a` does run. The 42712 checks are in `joins.rs` (`leaf_with_names` and the
       registry in the join builder), which register a leaf by its bare
       alias, and that alias is also the leaf's join-key base (`join_key`)
       and its `ScopeCol::qual`. Faithful: give an unaliased leaf a key

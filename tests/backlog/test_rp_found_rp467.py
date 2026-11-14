@@ -351,6 +351,8 @@ def namespace_answer(dsn: str, statement: str) -> Any:
         c.execute("create schema rq467n2")
         c.execute("create table rq467n1.t (a int)")
         c.execute("create table rq467n2.t (a int)")
+        c.execute("insert into rq467n1.t values (1), (2)")
+        c.execute("insert into rq467n2.t values (1), (3)")
         try:
             cur = c.execute(statement)
             return cur.fetchall() if cur.description else ("ok",)
@@ -361,8 +363,23 @@ def namespace_answer(dsn: str, statement: str) -> Any:
             c.execute("drop schema if exists rq467n1, rq467n2 cascade")
 
 
+# Measured on PostgreSQL 15.19 with rq467n1.t holding 1, 2 and rq467n2.t
+# 1, 3. The comma form's `rq467n2.t.a` read rq467n1.t's rows here.
 SAME_NAME_RELATIONS = {
-    "select 1 from rq467n1.t join rq467n2.t on true": [],
+    "select 1 from rq467n1.t join rq467n2.t on true": [(1,), (1,), (1,), (1,)],
+    "select rq467n2.t.a from rq467n1.t, rq467n2.t order by 1": [(1,), (1,), (3,), (3,)],
+    "select rq467n2.t.a from rq467n1.t, rq467n2.t where rq467n2.t.a = 3": [(3,), (3,)],
+    "select t.a from rq467n1.t join rq467n2.t on true": (
+        "42P09",
+        'table reference "t" is ambiguous',
+    ),
+    "select a from rq467n1.t join rq467n2.t on true": (
+        "42702",
+        'column reference "a" is ambiguous',
+    ),
+    "select * from rq467n1.t join rq467n2.t using (a)": [(1,)],
+    "select * from rq467n1.t natural join rq467n2.t": [(1,)],
+    "select count(*) from rq467n1.t join rq467n2.t on true where rq467n1.t.a = 1": [(2,)],
     "create view rq467nv as select t.a from rq467n1.t t join rq467n2.t on rq467n2.t.a = t.a": (
         "42712",
         'table name "t" specified more than once',
