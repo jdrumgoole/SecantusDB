@@ -1,8 +1,9 @@
 """What working RP-761 (a window call in an ORDER BY key) found.
 
-EXPLAIN prints a Sort's key by the synthetic field the planner gave it, not
-by the expression PostgreSQL deparses: a computed key is `__order0`, and a
-key that is a window target is the target's output name (`sum`).
+EXPLAIN printed a Sort's key by the synthetic field the planner gave it, not
+by the expression PostgreSQL deparses: a computed key was `__order0`, and a
+key that is a window target the target's output name (`sum`). Fixed by
+RP-840.
 
 The expected answers were measured on a private, freshly initdb'd
 PostgreSQL 15.19 cluster with `_SETUP`, which each statement runs after.
@@ -65,10 +66,10 @@ SORT_KEYS = {
 }
 
 
-@pytest.mark.backlog("RP-840")
+@pytest.mark.backlog_fixed("RP-840")
 @pytest.mark.parametrize("query", list(SORT_KEYS))
 def test_explain_prints_a_computed_sort_key_as_its_expression(dsn: str, query: str) -> None:
     """PostgreSQL 15.19 deparses a Sort's key (`((x + 1))`, `(sum(x) OVER
-    (?))`). Here a computed key prints as its synthetic field, `__order0`,
-    and a window target's key as the target's name, `sum`."""
+    (?))`). A computed key printed as its synthetic field, `__order0`, and
+    a window target's key as the target's name, `sum`, until RP-840."""
     assert _plan(dsn, query) == SORT_KEYS[query]

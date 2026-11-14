@@ -3716,6 +3716,13 @@ pub struct ExplainOptions {
     /// and the plan is a `Result` with `One-Time Filter: false` where its
     /// scan (or join) would be (RP-409).
     pub dummy_relation: bool,
+    /// A single-relation SELECT's ORDER BY as its Sort's `Sort Key`
+    /// prints it, where a key is computed (RP-840).
+    pub sort_keys: Option<Vec<String>>,
+    /// A SELECT over one `generate_series` in FROM: the alias its Function
+    /// Scan names (when it differs from the function's), and its WHERE as
+    /// the scan's `Filter` (RP-847).
+    pub series_scan: Option<(Option<String>, Option<String>)>,
 }
 
 /// `CREATE [OR REPLACE] VIEW`.
@@ -11694,6 +11701,8 @@ fn plan_explain(
         subquery_quals: Vec::new(),
         one_time_false: 0,
         dummy_relation: false,
+        sort_keys: None,
+        series_scan: None,
     };
     let (mut timing, mut summary) = (None, None);
     for o in &e.options {
@@ -11772,6 +11781,22 @@ fn plan_explain(
         }
     }
     let scan_quals = explain_scan_quals(&query, lookup).unwrap_or_default();
+    options.series_scan = match &query {
+        N::SelectStmt(s) => explain_series_scan(s),
+        _ => None,
+    };
+    options.sort_keys = match &query {
+        N::SelectStmt(s) => match s.from_clause.as_slice() {
+            [item] => match item.node.as_ref() {
+                Some(N::RangeVar(rv)) => {
+                    lookup(&rv.relname).and_then(|def| ruleutils::explain_sort_keys(s, &def))
+                }
+                _ => None,
+            },
+            _ => None,
+        },
+        _ => None,
+    };
     let scan_or_arms = explain_scan_or_arms(&query, lookup).unwrap_or_default();
     options.scan_in_lengths = explain_scan_in_lengths(&query, lookup).unwrap_or_default();
     options.scan_array_quals = explain_scan_array_quals(&query, lookup);
@@ -52281,6 +52306,69 @@ fn scan_where(query: &N) -> Option<(String, &pg_query::protobuf::Node)> {
         ),
         _ => return None,
     })
+}
+
+/// A SELECT over one `generate_series` in FROM, as its Function Scan
+/// prints (RP-847): `ExplainNode` names the alias where it differs from
+/// the function's name, and `show_scan_qual` prints the WHERE the scan
+/// applies to each row, its conjuncts ANDed.
+fn explain_series_scan(
+    s: &pg_query::protobuf::SelectStmt,
+) -> Option<(Option<String>, Option<String>)> {
+    let [item] = s.from_clause.as_slice() else {
+        return None;
+    };
+    let Some(N::RangeFunction(rf)) = item.node.as_ref() else {
+        return None;
+    };
+    if rf.ordinality || rf.is_rowsfrom || rf.functions.len() != 1 {
+        return None;
+    }
+    let Some(N::List(l)) = rf.functions[0].node.as_ref() else {
+        return None;
+    };
+    let Some(N::FuncCall(f)) = l.items.first().and_then(|n| n.node.as_ref()) else {
+        return None;
+    };
+    let mut name = f.funcname.iter().filter_map(|n| match n.node.as_ref() {
+        Some(N::String(s)) => Some(s.sval.as_str()),
+        _ => None,
+    });
+    if name.next_back() != Some("generate_series") {
+        return None;
+    }
+    let alias = rf
+        .alias
+        .as_ref()
+        .map(|a| a.aliasname.clone())
+        .filter(|a| a != "generate_series");
+    let column = rf
+        .alias
+        .as_ref()
+        .and_then(|a| {
+            a.colnames.first().and_then(|n| match n.node.as_ref() {
+                Some(N::String(s)) => Some(s.sval.clone()),
+                _ => None,
+            })
+        })
+        .or_else(|| alias.clone())
+        .unwrap_or_else(|| "generate_series".into());
+    let filter = match s.where_clause.as_deref() {
+        None => None,
+        Some(w) => {
+            let def = TableDef::new(
+                alias.as_deref().unwrap_or("generate_series"),
+                vec![secantus_pgcatalog::Column::new(&column, "int4", false)],
+            );
+            let parts = ruleutils::explain_conjuncts(w, &def)?;
+            let texts: Vec<String> = parts.into_iter().map(|(t, _)| t).collect();
+            Some(match texts.as_slice() {
+                [one] => one.clone(),
+                many => format!("({})", many.join(" AND ")),
+            })
+        }
+    };
+    Some((alias, filter))
 }
 
 /// A statement over ONE relation: its WHERE's conjuncts for EXPLAIN.

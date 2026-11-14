@@ -1784,6 +1784,55 @@ fn drop_filter_placeholder(scan: &mut PlanNode) {
         .retain(|(k, v)| !(k == "Filter" && v == FILTER_PLACEHOLDER));
 }
 
+/// A `generate_series` Function Scan's alias and Filter (RP-847).
+pub(crate) fn attach_series_scan(
+    root: &mut PlanNode,
+    series: &Option<(Option<String>, Option<String>)>,
+) {
+    let Some((alias, filter)) = series else {
+        return;
+    };
+    fn find(n: &mut PlanNode) -> Option<&mut PlanNode> {
+        if n.name == "Function Scan on generate_series" {
+            return Some(n);
+        }
+        n.children.iter_mut().find_map(find)
+    }
+    let Some(scan) = find(root) else {
+        return;
+    };
+    if let Some(a) = alias {
+        scan.name = format!(
+            "{} {}",
+            scan.name,
+            secantus_pgplan::scalar::quote_identifier(a)
+        );
+    }
+    if let Some(f) = filter {
+        if !scan.details.iter().any(|(k, _)| k == "Filter") {
+            scan.details.push(("Filter".into(), f.clone()));
+        }
+    }
+}
+
+/// A single-relation SELECT's ORDER BY Sort prints its keys as the
+/// planned expressions (RP-840): the Sort below any Limit / Unique.
+pub(crate) fn attach_sort_keys(root: &mut PlanNode, keys: &Option<Vec<String>>) {
+    let Some(keys) = keys else {
+        return;
+    };
+    let mut n = root;
+    while matches!(n.name.as_str(), "Limit" | "Unique") && n.children.len() == 1 {
+        n = &mut n.children[0];
+    }
+    if n.name != "Sort" {
+        return;
+    }
+    if let Some(d) = n.details.iter_mut().find(|(k, _)| k == "Sort Key") {
+        d.1 = keys.join(", ");
+    }
+}
+
 /// Put a single-relation statement's WHERE on its scan, as PostgreSQL shows
 /// it: the conjuncts an index scan's key constrains as `Index Cond`, the
 /// rest as `Filter`. A plan with more than one scan is left alone.
@@ -2868,6 +2917,8 @@ mod heap_fetches_tests {
             subquery_quals: Vec::new(),
             one_time_false: 0,
             dummy_relation: false,
+            sort_keys: None,
+            series_scan: None,
         }
     }
 

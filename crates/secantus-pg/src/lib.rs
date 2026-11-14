@@ -290,6 +290,10 @@ struct IndexRelation {
     unique: bool,
     primary: bool,
     exclusion: bool,
+    /// A partition's copy of an ancestor's index: the ancestor table and the
+    /// index's name there, whose stored definition the copy builds from
+    /// (`DefineIndex` recursing to each partition).
+    origin: Option<(String, String)>,
 }
 
 /// One queued `NotificationResponse`.
@@ -13199,6 +13203,7 @@ impl PgHandler {
                 unique: true,
                 primary: true,
                 exclusion: false,
+                origin: None,
             });
         }
         let mut names = std::collections::HashSet::new();
@@ -13256,6 +13261,7 @@ impl PgHandler {
                 unique,
                 primary: false,
                 exclusion: false,
+                origin: None,
             });
         }
         for (i, u) in t.unique_constraints.iter().enumerate() {
@@ -13281,6 +13287,7 @@ impl PgHandler {
                 unique: !u.exclusion,
                 primary: u.primary,
                 exclusion: u.exclusion,
+                origin: None,
             });
         }
         out
@@ -13334,6 +13341,7 @@ impl PgHandler {
                 unique: ix.unique,
                 primary: ix.primary,
                 exclusion: ix.exclusion,
+                origin: ix.origin.clone(),
             })
             .collect();
         while let Some(ix) = stack.pop() {
@@ -13349,6 +13357,7 @@ impl PgHandler {
                         unique: rel.unique,
                         primary: rel.primary,
                         exclusion: rel.exclusion,
+                        origin: rel.origin.clone(),
                     });
                 }
                 derived_ix.push(rel);
@@ -13386,6 +13395,10 @@ impl PgHandler {
             unique: ix.unique,
             primary: ix.primary,
             exclusion: ix.exclusion,
+            origin: ix
+                .origin
+                .clone()
+                .or_else(|| Some((ix.table.name.clone(), ix.name.clone()))),
         }
     }
 
@@ -45747,6 +45760,8 @@ impl PgHandler {
                     &options.scan_or_arms,
                     &index_columns,
                 );
+                explain::attach_sort_keys(&mut tree, &options.sort_keys);
+                explain::attach_series_scan(&mut tree, &options.series_scan);
                 explain::gate_scan(&mut tree, options.one_time_false);
                 if options.dummy_relation {
                     explain::dummy_relation(&mut tree);

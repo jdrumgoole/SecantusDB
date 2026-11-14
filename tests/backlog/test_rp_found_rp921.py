@@ -88,13 +88,14 @@ def test_maintenance_leaves_a_partitioned_tables_indexes_without_pages(pg: Any) 
         assert [(r[1], r[2]) for r in rows] == [(0, 0.0)] * 6, (statement, rows)
 
 
-@pytest.mark.backlog("RP-932")
+@pytest.mark.backlog_fixed("RP-932")
 def test_a_leaf_partitions_inherited_indexes_are_built(pg: Any) -> None:
     """A leaf partition's copies of its ancestors' indexes are built over
     its heap when it is created, as each of its own constraints' are, so
-    `index_update_stats` records 1 page (the metapage) and 0 tuples for
+    `index_update_stats` recorded 1 page (the metapage) and 0 tuples for
     every one. `secantusd-pg` showed the copies of the user's indexes as
-    never built: 0 pages, -1 tuples (2026-11-13)."""
+    never built, 0 pages, -1 tuples (2026-11-13): their definition was
+    looked up in the partition's own index list, not the ancestor's."""
     _partitioned(pg, "rp921l")
     rows = pg.execute(SIZES.format("'rp921l_1a'")).fetchall()
     assert [(r[1], r[2]) for r in rows] == [(1, 0.0)] * 3, rows

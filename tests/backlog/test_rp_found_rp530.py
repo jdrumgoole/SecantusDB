@@ -1,7 +1,7 @@
 """Gap tests of the divergences found while working RP-530 (a row beside a
 typed operand that is not a row has no operator): RP-590 (two different
 composite types were refused a comparison, fixed), RP-591 (an untyped literal
-beside a row is not read as `record`), RP-592 (a row beside an `ARRAY[...]`
+beside a row was not read as `record`, fixed), RP-592 (a row beside an `ARRAY[...]`
 named the row `text`, fixed) and RP-593 (an error a PREPARE's query raises carries
 the query's own offset).
 
@@ -86,12 +86,20 @@ UNTYPED_BESIDE_ROW = {
     "select fs = 'x' from fs": ("0A000", _ANONYMOUS, None, "13"),
     "select 'x' = fs from fs": ("0A000", _ANONYMOUS, None, "8"),
     "select (1,2) = 'x'": ("0A000", _ANONYMOUS, None, "16"),
+    "select row(1)::ct = '(1)'": ("0A000", _ANONYMOUS, None, "21"),
+    "select fs < 'x' from fs": ("0A000", _ANONYMOUS, None, "13"),
+    "select fs is distinct from 'x' from fs": ("0A000", _ANONYMOUS, None, "28"),
+    "select nullif(fs, 'x') from fs": ("0A000", _ANONYMOUS, None, "19"),
+    "select fs = null from fs": [(None,)],
 }
 
 
-@pytest.mark.backlog("RP-591")
+@pytest.mark.backlog_fixed("RP-591")
 @pytest.mark.parametrize("query", list(UNTYPED_BESIDE_ROW))
 def test_untyped_literal_beside_a_row(query: str, dsn: str) -> None:
+    """An untyped literal beside a row was read as `record` and refused at
+    the literal. Each was 0A000 `comparing document with string using =
+    is not supported yet`, with no position."""
     assert answer(dsn, query) == UNTYPED_BESIDE_ROW[query]
 
 

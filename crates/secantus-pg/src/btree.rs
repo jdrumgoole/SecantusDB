@@ -387,12 +387,17 @@ impl PgHandler {
             }
             unique = false;
         } else {
+            // A partition's copy is built from its ancestor's definition.
+            let (owner, name) = ix
+                .origin
+                .as_ref()
+                .map_or((&def.name, &ix.name), |(t, n)| (t, n));
             let stored = self
                 .storage
-                .list_indexes(self.db(), &def.name)
+                .list_indexes(self.db(), owner)
                 .ok()?
                 .into_iter()
-                .find(|d| d.get_str("name") == Ok(ix.name.as_str()))?;
+                .find(|d| d.get_str("name") == Ok(name.as_str()))?;
             let opt = |k: &str| {
                 stored.get(k).cloned().or_else(|| {
                     stored

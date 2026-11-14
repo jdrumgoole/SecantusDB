@@ -179,6 +179,9 @@ struct Printer<'a> {
     /// being printed, by its location there (`rte->alias != NULL`); see
     /// [`Printer::alias_written`].
     written_alias: std::rc::Rc<std::collections::HashMap<i32, bool>>,
+    /// EXPLAIN's deparse context carries no window clauses, so a window
+    /// call prints its window as `(?)` (`get_windowfunc_expr`).
+    explain_windows: bool,
 }
 
 /// What a sub-expression is printed inside, for `isSimpleNode`.
@@ -354,6 +357,7 @@ impl<'a> Printer<'a> {
             markers: false,
             legacy_joins: false,
             written_alias: std::rc::Rc::default(),
+            explain_windows: false,
         }
     }
 
@@ -2225,6 +2229,10 @@ impl<'a> Printer<'a> {
     }
 
     fn window_spec(&mut self, w: &pg_query::protobuf::WindowDef) -> Option<()> {
+        if self.explain_windows {
+            self.buf.push_str("(?)");
+            return Some(());
+        }
         if !w.name.is_empty() && w.partition_clause.is_empty() && w.order_clause.is_empty() {
             self.buf.push_str(&q(&w.name));
             return Some(());
@@ -5313,6 +5321,87 @@ fn expr_node_printed_with(
     }]);
     p.expr(n)?;
     Some(p.buf)
+}
+
+/// A single-relation SELECT's ORDER BY as its Sort's `Sort Key` prints
+/// it (`show_sort_group_keys`, RP-840): a column bare, any other key the
+/// planned expression its Var resolves to, parenthesised as `get_variable`
+/// does for a non-Var subplan output, its window calls `OVER (?)`. An
+/// ordinal key is its target's expression. `None` when every key is a
+/// plain column (the plan's own text is then right), or for a key the
+/// printer does not know.
+pub fn explain_sort_keys(
+    s: &pg_query::protobuf::SelectStmt,
+    def: &TableDef,
+) -> Option<Vec<String>> {
+    let none_lookup = |_: &str| None;
+    let none_views = |_: &str| None;
+    let cat = Catalog {
+        lookup: &none_lookup,
+        view_sql: &none_views,
+    };
+    let targets: Vec<&Node> = s
+        .target_list
+        .iter()
+        .filter_map(|t| match t.node.as_ref() {
+            Some(N::ResTarget(rt)) => rt.val.as_deref(),
+            _ => None,
+        })
+        .collect();
+    let mut computed = false;
+    let mut out = Vec::new();
+    for item in &s.sort_clause {
+        let Some(N::SortBy(sb)) = item.node.as_ref() else {
+            return None;
+        };
+        let mut key = sb.node.as_deref()?;
+        if let Some(N::AConst(c)) = key.node.as_ref() {
+            let Some(Val::Ival(v)) = c.val.as_ref() else {
+                return None;
+            };
+            key = targets.get(usize::try_from(v.ival).ok()?.checked_sub(1)?)?;
+        }
+        let text = match key.node.as_ref() {
+            Some(N::ColumnRef(c)) => {
+                let name = c.fields.last().and_then(sval)?;
+                // An output alias, or a column this does not resolve.
+                def.columns.iter().find(|col| col.name == name)?;
+                q(name)
+            }
+            _ => {
+                computed = true;
+                let mut p = Printer::new(&cat, 0);
+                p.unqualified = true;
+                p.fold_consts = true;
+                p.explain_windows = true;
+                p.scopes.push(vec![Rte {
+                    refname: def.name.clone(),
+                    name: def.name.clone(),
+                    columns: def
+                        .columns
+                        .iter()
+                        .map(|c| (c.name.clone(), base_type(&c.pg_type)))
+                        .collect(),
+                    qualified_only: false,
+                    ..Default::default()
+                }]);
+                p.expr(key)?;
+                format!("({})", p.buf)
+            }
+        };
+        let desc = sb.sortby_dir == pg_query::protobuf::SortByDir::SortbyDesc as i32;
+        let nulls = sb.sortby_nulls;
+        let first = pg_query::protobuf::SortByNulls::SortbyNullsFirst as i32;
+        let last = pg_query::protobuf::SortByNulls::SortbyNullsLast as i32;
+        let suffix = match (desc, nulls) {
+            (false, n) if n == first => " NULLS FIRST",
+            (false, _) => "",
+            (true, n) if n == last => " DESC NULLS LAST",
+            (true, _) => " DESC",
+        };
+        out.push(format!("{text}{suffix}"));
+    }
+    computed.then_some(out)
 }
 
 /// A FROM-less statement's unfolded WHERE as EXPLAIN prints it as the

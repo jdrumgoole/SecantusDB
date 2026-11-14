@@ -1177,15 +1177,6 @@ one beside it.
       Verify: tests/backlog/test_rp_found_rp921.py::test_a_partitions_copy_of_a_named_index_is_named_by_its_columns
       Backlog-ID: RP-930
 
-- [ ] **OPEN — a leaf partition's inherited indexes are shown as never
-      built.** A leaf partition created under a partitioned table with a
-      user index: PostgreSQL 15.19 builds each copy over the new heap and
-      records 1 page and 0 tuples (`index_update_stats`); `secantusd-pg`
-      answers 0 pages and -1 tuples for the copies of the user's indexes
-      (its primary key's copy is right).
-      Verify: tests/backlog/test_rp_found_rp921.py::test_a_leaf_partitions_inherited_indexes_are_built
-      Backlog-ID: RP-932
-
 - [ ] **OPEN — psql's `\d` column query straight after DDL builds all of
       `pg_type` for a table of two column types.** The collation subquery
       (`tests/backlog/test_rp_catalog_latency.py`'s `COLLATION_QUERY`) over
@@ -2764,14 +2755,6 @@ Measured on a private PostgreSQL 15.19 cluster with `fs(a int, c text)`
 holding `(1, 'y')`, `create type ct as (x int)` and `create type ct2 as (x
 int)`. The gap tests are in `tests/backlog/test_rp_found_rp530.py`.
 
-- [ ] **An untyped literal beside a row is not read as `record`.** `select
-      fs = 'x' from fs`, `'x' = fs` and `(1,2) = 'x'` are 0A000 `input of
-      anonymous composite types is not implemented` at the literal (13, 8,
-      16) on PostgreSQL 15.19: the operator resolves to `record = record`
-      and `record_in` refuses the literal. Here each is 0A000 `comparing
-      document with string using = is not supported yet`, with no position.
-      Verify: tests/backlog/test_rp_found_rp530.py::test_untyped_literal_beside_a_row
-      Backlog-ID: RP-591
 - [ ] **An error a PREPARE's query raises carries the query's own offset.**
       PREPARE plans the deparsed inner query, so a recorded location is an
       offset into `SELECT ...`, honoured whenever a token of the PREPARE
@@ -4084,22 +4067,6 @@ varchar(3), w dv689, c char(3))`, `d689` an `int` with `check (value > 0)`.
       Verify: tests/backlog/test_rp_found_rp689.py::test_a_column_a_record_field_shares_is_ambiguous
       Backlog-ID: RP-838
 
-## Found while working RP-761 (2026-11-10)
-
-Measured on a private, freshly initdb'd PostgreSQL 15.19 cluster with the
-`_SETUP` in `tests/backlog/test_rp_found_rp761.py`: `t761(x int)`.
-
-- [ ] **EXPLAIN prints a computed sort key by its synthetic field.**
-      `explain (costs off) select x from t761 order by x + 1` prints `Sort
-      Key: ((x + 1))` on PostgreSQL 15.19, and a key that is a window
-      target `Sort Key: (sum(x) OVER (?)) DESC`; here the first is `Sort
-      Key: __order0` (the planner's field for a computed key) and the
-      second `Sort Key: sum DESC` (the target's output name). The Sort's
-      key wants deparsing as ruleutils does it (`deparse_expression` with
-      the plan's tlist), not the field it is computed into.
-      Verify: tests/backlog/test_rp_found_rp761.py::test_explain_prints_a_computed_sort_key_as_its_expression
-      Backlog-ID: RP-840
-
 ## Found while working RP-846 (2026-11-11)
 
 Measured on a private, freshly initdb'd PostgreSQL 15.19 cluster with the
@@ -4166,17 +4133,16 @@ its first input gave.
 Measured on PostgreSQL 15.19 (the shared reference on port 5415): every
 statement is a FROM function and runs there as written.
 
-- [ ] **EXPLAIN of a `generate_series` in FROM prints no alias and no
-      Filter.** `explain (costs off) select 1 from generate_series(1, 2)
-      f(x) where x > 1` is `Function Scan on generate_series f` /
-      `Filter: (x > 1)` on PostgreSQL 15.19 (`ExplainNode` names the
-      alias, `show_scan_qual` the quals the scan applies to each row), and
-      a WHERE that runs per row (`f.x + 1 > 0`, since RP-703) is a
-      `Filter:` the same way. Here each prints the bare `Function Scan on
-      generate_series`, with or without the alias and the WHERE; with
-      costs, its estimate is `rows=0 width=0` where PostgreSQL's is
-      `rows=1 width=4`.
-      Verify: tests/backlog/test_rp_found_rp703.py::test_a_series_scan_explains_its_alias_and_filter
+- [ ] **EXPLAIN of a filtered `generate_series` in FROM is not priced.**
+      `explain select 1 from generate_series(1, 2) f(x) where x > 1` is
+      `Function Scan on generate_series f  (cost=0.00..0.03 rows=1
+      width=4)` on PostgreSQL 15.19 (`cost_functionscan`: the series' rows
+      times the default 1/3 inequality selectivity, the Filter's quals per
+      row), and with `x + 1 > 0` over ten rows `cost=0.00..0.15 rows=3`.
+      Here a series scan with a WHERE prints `rows=0 width=0`. Its alias
+      and `Filter:` line print as PostgreSQL's since RP-847's first slice;
+      an unfiltered scan's estimate was already right.
+      Verify: tests/backlog/test_rp_found_rp703.py::test_a_filtered_series_scan_is_priced
       Backlog-ID: RP-847
 
 ## Found while working RP-727 (2026-11-10)

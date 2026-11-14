@@ -3335,6 +3335,24 @@ fn row_against_non_row(
         return Ok(());
     }
     let (lr, rr) = (row_operand_type(l, scope), row_operand_type(r, scope));
+    // Beside a row an untyped literal is read as `record`, the operator
+    // resolving to `record = record`, and `record_in` refuses it at the
+    // literal (`fs = 'x'`, RP-591).
+    let lit = match (&lr, &rr) {
+        (Some(_), None) => Some(r),
+        (None, Some(_)) => Some(l),
+        _ => None,
+    };
+    if let Some(N::AConst(c)) = lit.and_then(|n| n.node.as_ref()) {
+        if is_record_operator(op)
+            && matches!(c.val, Some(pg_query::protobuf::a_const::Val::Sval(_)))
+        {
+            set_error_location(c.location);
+            return Err(Error::FeatureNotSupported(
+                "input of anonymous composite types is not implemented".into(),
+            ));
+        }
+    }
     let typed = |n| operand_type_declared(n, scope).or_else(|| array_operand_type(n, scope));
     let (Some(lt), Some(rt)) = (
         lr.clone().or_else(|| typed(l)),
