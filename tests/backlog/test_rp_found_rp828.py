@@ -74,9 +74,11 @@ DML_PORTAL = {
 }
 
 
-@pytest.mark.backlog("RP-905")
+@pytest.mark.backlog_fixed("RP-905")
 @pytest.mark.parametrize("statement", list(DML_PORTAL))
 def test_a_dml_statement_opens_as_a_portal(statement: str, dsn: str) -> None:
+    """A FOR loop or an OPEN over an INSERT, UPDATE or DELETE was 0A000: the
+    portal read rows only from a SELECT."""
     assert _answer(dsn, statement, setup=True) == DML_PORTAL[statement]
 
 
@@ -89,9 +91,11 @@ USING = {
 }
 
 
-@pytest.mark.backlog("RP-906")
+@pytest.mark.backlog_fixed("RP-906")
 @pytest.mark.parametrize("statement", list(USING))
 def test_a_dynamic_portal_binds_its_using_values(statement: str, dsn: str) -> None:
+    """A FOR loop or an OPEN over `EXECUTE ... USING` ran its query with no
+    parameters, so `$1` was 42P02."""
     assert _answer(dsn, statement) == USING[statement]
 
 

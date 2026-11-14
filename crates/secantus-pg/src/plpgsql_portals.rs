@@ -4,6 +4,24 @@
 
 use super::*;
 
+/// The command of a DML statement (`INSERT`, `UPDATE`, `DELETE`, `MERGE`)
+/// and whether it returns rows (a RETURNING list), as SPI reads the
+/// statement's raw parse; `None` for any other statement.
+fn dml_command(sql: &str) -> Option<(&'static str, bool)> {
+    use pg_query::protobuf::node::Node as N;
+    let tree = pg_query::parse(sql).ok()?;
+    let [stmt] = tree.protobuf.stmts.as_slice() else {
+        return None;
+    };
+    Some(match stmt.stmt.as_ref()?.node.as_ref()? {
+        N::InsertStmt(i) => ("INSERT", !i.returning_list.is_empty()),
+        N::UpdateStmt(u) => ("UPDATE", !u.returning_list.is_empty()),
+        N::DeleteStmt(d) => ("DELETE", !d.returning_list.is_empty()),
+        N::MergeStmt(_) => ("MERGE", false),
+        _ => return None,
+    })
+}
+
 impl PlHost<'_> {
     pub(crate) fn open_portal(
         &self,
@@ -14,10 +32,50 @@ impl PlHost<'_> {
         types: &[String],
         scroll: bool,
     ) -> Result<String, plpgsql_fn::PlError> {
+        // `SPI_cursor_open` takes any statement that returns rows: a DML
+        // statement's RETURNING rows are a `PORTAL_ONE_RETURNING` portal,
+        // and one with no RETURNING has none to open (RP-905).
+        let dml = dml_command(sql);
+        if let Some((command, false)) = dml {
+            return Err(pl_error(&PgHandler::user_error(
+                "42P11",
+                format!("cannot open {command} query as cursor"),
+            )));
+        }
+        if dml.is_some() {
+            self.check_volatility(sql, params, types)?;
+        }
         // A statement of its own, as `query` runs one: it sees what the
         // body wrote before it (a FOR loop's query reads here, RP-828).
         let level = statement_views::StatementLevel::enter(self.h);
         let stmt = self.plan(sql, params, types)?;
+        if dml.is_some() {
+            let read = self.joined(|| {
+                self.atomic(|| {
+                    self.h
+                        .capture_for_savepoints(&stmt)
+                        .and_then(|()| self.h.dml_returning_rows(stmt))
+                        .map_err(|e| pl_error(&e))
+                })
+            });
+            drop(level);
+            let (schema, rows) = read?;
+            let domains = vec![None; schema.len()];
+            let name = self
+                .h
+                .register_portal(name, statement, (schema, domains), rows, scroll, None)
+                .map_err(|e| pl_error(&e))?;
+            if let Some(c) = self
+                .h
+                .cursors
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get_mut(&name)
+            {
+                c.returning = true;
+            }
+            return Ok(name);
+        }
         // A simply updatable scan keeps each row's id, for `WHERE CURRENT
         // OF` (`current_of.rs`).
         let updatable = match &stmt {
@@ -162,6 +220,7 @@ impl PgHandler {
                 held: false,
                 pinned: false,
                 auto_held: false,
+                returning: false,
             },
         );
         Ok(name)

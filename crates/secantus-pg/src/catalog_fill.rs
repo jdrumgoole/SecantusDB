@@ -865,7 +865,10 @@ impl PgHandler {
                         let bare = if name.is_empty() {
                             format!("{prefix}{ty}")
                         } else {
-                            format!("{prefix}{name} {ty}")
+                            format!(
+                                "{prefix}{} {ty}",
+                                secantus_pgplan::scalar::quote_identifier(name)
+                            )
                         };
                         let default = defaults
                             .get(i)
@@ -896,7 +899,9 @@ impl PgHandler {
                                     let c = c.as_document()?;
                                     Some(format!(
                                         "{} {}",
-                                        c.get_str("name").ok()?,
+                                        secantus_pgplan::scalar::quote_identifier(
+                                            c.get_str("name").ok()?
+                                        ),
                                         self.display_type_name(c.get_str("type_tag").ok()?)
                                     ))
                                 })

@@ -2532,7 +2532,7 @@ impl plpgsql_fn::Host for PlHost<'_> {
         }
         // `_SPI_commit` / `_SPI_rollback`: a FOR loop's pinned cursor is
         // held first, so the loop reads on in the next transaction.
-        self.h.hold_pinned_cursors();
+        self.h.hold_pinned_cursors().map_err(|e| pl_error(&e))?;
         self.h
             .restart_transaction(commit, chain)
             .map_err(|e| pl_error(&e))
@@ -4833,6 +4833,10 @@ struct CursorState {
     /// across every later transaction end until the loop closes it, as
     /// `AtCommit_Portals` and `AtAbort_Portals` pass an auto-held portal by.
     auto_held: bool,
+    /// A PL/pgSQL portal over a DML statement's RETURNING rows
+    /// (`PORTAL_ONE_RETURNING`, RP-905): not read-only, so a COMMIT or
+    /// ROLLBACK while it is pinned is 55000 (`HoldPinnedPortals`).
+    returning: bool,
 }
 
 /// What `WHERE CURRENT OF` needs of a cursor (RP-072): the one table it
@@ -10278,6 +10282,31 @@ impl PgHandler {
         &self,
         stmt: Statement,
     ) -> PgWireResult<(ColumnTypes, Vec<Vec<Bson>>)> {
+        let (schema, rows) = self.dml_returning_rows(stmt)?;
+        let columns = schema
+            .iter()
+            .map(|f| {
+                let ty = secantus_pgplan::pgtypes::name_of_oid(i64::from(f.datatype().oid()))
+                    .unwrap_or("text")
+                    .to_string();
+                (f.name().to_string(), ty)
+            })
+            .collect();
+        let rows = rows
+            .into_iter()
+            .map(|r| r.into_iter().map(|v| v.unwrap_or(Bson::Null)).collect())
+            .collect();
+        Ok((columns, rows))
+    }
+
+    /// Run a DML statement and answer its RETURNING rows with their wire
+    /// description (none when it has no RETURNING): what
+    /// [`Self::dml_returning_values`] reads, and the rows of a PL/pgSQL
+    /// portal over a DML statement (RP-905).
+    pub(crate) fn dml_returning_rows(
+        &self,
+        stmt: Statement,
+    ) -> PgWireResult<(Vec<FieldInfo>, CapturedRows)> {
         let previous = self
             .cursor_capture
             .lock()
@@ -10300,31 +10329,16 @@ impl PgHandler {
                 return Err(e);
             }
         };
-        let mut columns = Vec::new();
+        let mut schema = Vec::new();
         for r in responses {
             if let Response::Query(q) = r {
-                columns = q
-                    .row_schema
-                    .iter()
-                    .map(|f| {
-                        let ty =
-                            secantus_pgplan::pgtypes::name_of_oid(i64::from(f.datatype().oid()))
-                                .unwrap_or("text")
-                                .to_string();
-                        (f.name().to_string(), ty)
-                    })
-                    .collect();
+                schema = q.row_schema.iter().cloned().collect();
                 // The rows are produced as the stream is read; reading it is
                 // what fills the capture.
                 futures::executor::block_on(q.data_rows.try_collect::<Vec<_>>())?;
             }
         }
-        let captured = restore(self).unwrap_or_default();
-        let rows = captured
-            .into_iter()
-            .map(|r| r.into_iter().map(|v| v.unwrap_or(Bson::Null)).collect())
-            .collect();
-        Ok((columns, rows))
+        Ok((schema, restore(self).unwrap_or_default()))
     }
 
     /// A wire error as a planner error, its SQLSTATE kept.
@@ -33894,11 +33908,22 @@ impl PgHandler {
     /// in the next transaction. Its rows are already materialised (a
     /// PL/pgSQL portal is, `register_portal`), which is what `HoldPortal`
     /// makes of the rest of a portal's rows.
-    pub(crate) fn hold_pinned_cursors(&self) {
+    ///
+    /// Only a read-only portal can be held: one over a DML statement's
+    /// RETURNING rows is 55000 (RP-905).
+    pub(crate) fn hold_pinned_cursors(&self) -> PgWireResult<()> {
         let mut cursors = self.cursors.lock().unwrap_or_else(|e| e.into_inner());
         for c in cursors.values_mut().filter(|c| c.pinned) {
+            if c.returning {
+                return Err(Self::user_error(
+                    "55000",
+                    "cannot perform transaction commands inside a cursor loop that is not read-only"
+                        .into(),
+                ));
+            }
             c.auto_held = true;
         }
+        Ok(())
     }
 
     /// Pin or unpin the cursor `name` (`PinPortal` / `UnpinPortal`).
@@ -35276,6 +35301,7 @@ impl PgHandler {
                                 held: false,
                                 pinned: false,
                                 auto_held: false,
+                                returning: false,
                             },
                         );
                     if holdable {
@@ -35381,6 +35407,7 @@ impl PgHandler {
                             held: false,
                             pinned: false,
                             auto_held: false,
+                            returning: false,
                         },
                     );
                 if holdable {
@@ -35438,6 +35465,7 @@ impl PgHandler {
                         held: holdable && !in_block,
                         pinned: false,
                         auto_held: false,
+                        returning: false,
                     },
                 );
             if holdable {
