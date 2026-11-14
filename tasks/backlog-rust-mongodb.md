@@ -1068,7 +1068,8 @@ These are explicit non-goals. Don't add them without a reason.
       planned from the catalog (`explain/summary.rs`), and naming a
       `COUNT_SCAN` there would name a plan that did not run: the executor
       has to run the count scan first, which is the SBE `GROUP` over a
-      `COUNT_SCAN` of RM-071 (its explain of a view's `count` is RM-072).
+      `COUNT_SCAN` of RM-071 (which `explain` builds and runs since
+      2026-11-14, RM-072).
       An `aggregate` of a view otherwise names the plan beneath it since
       2026-11-13. Found while working RM-381, 2026-11-10.
       Verify: tests/backlog/test_rm_view_lines.py::test_a_count_documents_runs_a_count_scan
@@ -2667,8 +2668,10 @@ What is left, all on the RUST MongoDB server:
       / `coscan` plan over a collection that does not exist. Still the
       classic `$cursor` / `stages` shape: any other filter (an `$in` holding
       null, `$exists`'s `exists`, a dotted `$eq: null`, `$or`, ...), a sorted,
-      projected or index-served front (`COUNT_SCAN`, `IXSCAN` /
-      `FETCH`; for `count` on a view, RM-072), a skip or limit with a group that reads a field (mongod
+      projected or index-served front (`IXSCAN` / `FETCH`; for `count` on
+      a view, RM-695; the `COUNT_SCAN` of a single-field
+      index under a group that reads no field is built since 2026-11-14,
+      RM-072), a skip or limit with a group that reads a field (mongod
       puts its dependency projection among them), `$lookup`,
       `$sortByCount` / `$bucket` (not desugared before
       `secantus_core::sbe::pushdown`, which the executor shares), any other
@@ -2690,20 +2693,22 @@ What is left, all on the RUST MongoDB server:
       stats all come from running the plan. Not a printed stand-in.
       Backlog-ID: RM-071
       Verify: tests/backlog/test_rm_057_084.py::test_explain_of_a_group_pushed_into_the_query, tests/backlog/test_rm_057_084.py::test_explain_of_a_filter_sbe_runs_beyond_comparisons
-- [ ] **`count` on a view whose filter an index serves** is explained by
-      mongod 8.2.11 as an SBE plan (`explainVersion: "2"`, a `queryPlan` of
-      `GROUP` over a `COUNT_SCAN` where the count reads no field, over
-      `FETCH` / `IXSCAN` where a filter is left); this server reports the
-      classic cursor with `FETCH` / `IXSCAN` and the `$count`'s `$group`.
-      Over a collection scan it matches mongod since 2026-11-08
-      (`tests/mongod_live/test_sbe_filtered_front_explain.py`). Needs the
-      SBE index scan stages, and the `COUNT_SCAN` a `$count` that reads no
-      field gets (also `aggregate: stages after the cursor` 7 and
-      `executionStats: aggregate` 6, under RM-071). `explain_commands.py`:
-      `a view` 4 and 5.
+- [ ] **`count` on a view whose filter a `FETCH` over an index scan
+      finishes** is explained by mongod 8.2.11 as an SBE plan
+      (`explainVersion: "2"`, a `queryPlan` of `GROUP` over `FETCH` /
+      `IXSCAN`, a `slotBasedPlan` of an `nlj` of an `ixseek` that reads the
+      key, record id, snapshot and index ident into slots, and a `limit 1`
+      `seek` of the document, under a `filter` of `traverseF`); this server
+      reports the classic cursor with `FETCH` / `IXSCAN` and the `$count`'s
+      `$group`. Reproduce: a view `{$match: {a: {$gt: 1}}}` over indexes
+      `a_1` and `b_-1`, `explain` of `{count: <view>, query: {b: 2}}`.
+      Where the index serves the whole filter and the count reads no
+      field, the `GROUP` over a `COUNT_SCAN` is built since 2026-11-14
+      (RM-072). Needs the `nlj` and `seek` stages and their stats, and the
+      index-key slots of `ixseek`. `explain_commands.py`: `a view` 5.
       **Decided 2026-10-16 (Joe):** as RM-071, transcribe and execute.
-      Backlog-ID: RM-072
-      Verify: tests/backlog/test_rm_057_084.py::test_explain_of_count_on_a_view_over_an_index
+      Verify: tests/backlog/test_rm_057_084.py::test_explain_of_count_on_a_view_fetching_from_an_index
+      Backlog-ID: RM-695
 - [ ] **`explain` of a `$unionWith` lists its sub-pipeline as written.**
       mongod 8.2.11 explains the sub-pipeline as it does the outer one: a
       `$cursor` of its own (its `queryPlanner`, and `executionStats` above
