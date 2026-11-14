@@ -2516,13 +2516,6 @@ Still different, all 77:
       reports 83 works and neither field. Found 2026-11-08 (RM-341).
       Verify: tests/backlog/test_rm_found_2026_11_08_rm341.py::test_a_sort_merge_candidate_counts_as_mongods
       Backlog-ID: RM-437
-- [ ] **A candidate's FETCH filter puts an inexact `$exists` after the
-      other predicates.** mongod 8.2.11's losing candidate for `{a: {$lt:
-      5}, b: {$exists: true}}` over `b_1` rechecks `{$and: [{b: {$exists:
-      true}}, {a: {$lt: 5}}]}`; this server's puts `a` first. Found
-      2026-11-08 (RM-341).
-      Verify: tests/backlog/test_rm_found_2026_11_08_rm341.py::test_an_exists_candidates_filter_is_in_mongods_order
-      Backlog-ID: RM-439
 - [ ] **A `$type` index filter returns too few keys in the trial.** mongod
       8.2.11's losing candidate for `{a: {$lt: 5}, b: {$type: "int"}}` over
       `b_1` rechecks `$type` against each key and hands all 101 it examines

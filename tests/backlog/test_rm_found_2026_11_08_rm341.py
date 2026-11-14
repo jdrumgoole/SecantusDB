@@ -154,13 +154,23 @@ def test_a_nin_candidate_reads_mongods_keys(rust_mongo: Any, mongod: Any) -> Non
     assert _losers(rust_mongo, q) == _losers(mongod, q)
 
 
-@pytest.mark.backlog("RM-439")
-def test_an_exists_candidates_filter_is_in_mongods_order(rust_mongo: Any, mongod: Any) -> None:
+@pytest.mark.backlog_fixed("RM-439")
+@pytest.mark.parametrize(
+    "q",
+    [
+        {"a": {"$lt": 5}, "b": {"$exists": True}},
+        {"a": {"$lt": 5}, "b": {"$exists": True}, "c": {"$gt": 1}},
+        {"c": {"$gt": 1}, "b": {"$regex": "x"}, "a": {"$lt": 5}},
+        {"a": {"$lt": 5}, "b": {"$exists": False}},
+    ],
+)
+def test_an_exists_candidates_filter_is_in_mongods_order(
+    rust_mongo: Any, mongod: Any, q: dict
+) -> None:
     """mongod 8.2.11's losing candidate for `{a: {$lt: 5}, b: {$exists:
     true}}` over `b_1` rechecks `{$and: [{b: {$exists: true}}, {a: {$lt:
-    5}}]}` in its FETCH -- the inexact `$exists` first; this server's puts
-    `a` first."""
-    q = {"a": {"$lt": 5}, "b": {"$exists": True}}
+    5}}]}` in its FETCH -- the inexact `$exists`, tagged with the index,
+    first (`sortUsingTags`); this server put `a` first."""
     assert _losers(rust_mongo, q) == _losers(mongod, q)
 
 
