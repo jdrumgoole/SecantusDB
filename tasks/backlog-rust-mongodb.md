@@ -1926,20 +1926,27 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       RM-531.
       Verify: tests/backlog/test_rm_found_2026_11_14_rm531.py::test_a_run_time_error_names_the_commands_namespace
       Backlog-ID: RM-656
-- [ ] **A `$match` behind a `$replaceRoot` stays behind it over a
-      collection.** mongod 8.2.11 moves a `$match` behind
-      `{$replaceRoot: {newRoot: "$x"}}` (or `$replaceWith: "$x"`) ahead of
-      it, renamed onto `x` in an `$or` with `{x: {$type: [4]}}` and
-      `{x: {$not: {$type: [3]}}}` (which let through what the
-      `$replaceRoot` then refuses), and the collection's query takes it; it
-      also moves a `$skip` ahead of a `$project` / `$addFields` /
-      `$replaceRoot`. This server leaves both where they were written and
-      reads the whole collection. The rewrite runs for a collectionless
-      pipeline since RM-414 (`hoist::hoist_after_source`); over a collection
-      it would change the plan, so it is not applied there. Found
-      2026-11-10 (RM-414).
-      Verify: tests/backlog/test_rm_found_2026_11_10_explain_rewrites.py::test_a_match_moves_ahead_of_a_replace_root_into_the_query
-      Backlog-ID: RM-536
+- [ ] **A FETCH's residual `$or` lists its branches in `parsedQuery`'s
+      order.** mongod 8.2.11 lists the `$or` a FETCH filters by behind an
+      IXSCAN (`{k: {$gte: 2}, $or: [{"x.a": 1}, {x: {$type: [4]}}, {x: {$not:
+      {$type: [3]}}}]}` with an index on `k`) as `[{x: {$not: {$type: [3]}}},
+      {x: {$type: [4]}}, {"x.a": {$eq: 1}}]`, in a `find` and in the `$or` an
+      aggregate's `$replaceRoot` rewrite builds, though its `parsedQuery`
+      sorts the branches `x.a` first. This server lists the residual as
+      `parsedQuery` does. A rooted `$or` (SUBPLAN, COLLSCAN) agrees. Found
+      2026-11-14 working RM-536.
+      Verify: tests/backlog/test_rm_found_2026_11_14_rm536.py::test_a_residual_or_lists_its_branches_as_mongod_does
+      Backlog-ID: RM-658
+- [ ] **`explain` with `executionStats` answers where a `$replaceRoot`
+      fails.** mongod 8.2.11 runs the pipeline for `executionStats` and
+      returns the executor's error: `{$replaceRoot: {newRoot: "$x.b"}}` over
+      `{x: {a: 1, b: 1}}` is 40228, naming the document the read handed it
+      (`{x: {b: 1}}`), with no "Executor error" prefix. This server answers
+      with an `explain` document: `count_inline` (`explain/mod.rs`) takes a
+      run that failed for one of 0 documents, the root RM-617 (a
+      `$setWindowFields`) likely shares. Found 2026-11-14 working RM-536.
+      Verify: tests/backlog/test_rm_found_2026_11_14_rm536.py::test_explain_reports_a_replace_roots_run_time_error
+      Backlog-ID: RM-659
 - [ ] **A pipeline `$match` lists its clauses sorted.** mongod 8.2.11 lists
       a `$match` stage's clauses in the order they were written
       (`{d: {$gt: 0}, c: 1}` as `$and: [d, c]`; an `$expr`'s

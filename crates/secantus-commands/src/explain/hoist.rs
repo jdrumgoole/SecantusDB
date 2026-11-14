@@ -594,19 +594,32 @@ fn through_projection(
 /// the read of the collection then takes (measured 8.2.11 by `explain`:
 /// `[{$addFields: {z: 1}}, {$match: {b: 2, z: 1}}]` reads `{b: 2}` and leaves
 /// `{z: 1}` behind the stage), and one behind a `$group` moves ahead of it
-/// onto the fields its key renames (RM-311).
+/// onto the fields its key renames (RM-311). A `$match` also moves ahead of
+/// a `$replaceRoot` of a field path, rewritten ([`through_replace_root`]),
+/// and a `$skip` ahead of a stage that transforms each document into one,
+/// over a collection as after a pipeline's own source (`$documents`, which
+/// is a `$replaceRoot` from `_tempDocumentsField` by then): measured 8.2.11,
+/// RM-414 and RM-536. A `$match` moved ahead of a `$replaceRoot` is a
+/// [`PUSHED_MATCH`]; [`runnable`] makes it the `$match` it is.
 pub(crate) fn hoist_matches(pipeline: &[Bson]) -> Vec<Bson> {
-    hoist(pipeline, false)
+    hoist(pipeline)
 }
 
-/// The stages after a pipeline's own source (`$documents`, which is a
-/// `$replaceRoot` from `_tempDocumentsField` by then, `$queryStats`, ...)
-/// as mongod reorders them: as [`hoist_matches`] does, and besides, a
-/// `$match` moves ahead of a `$replaceRoot` of a field path, rewritten
-/// ([`through_replace_root`]), and a `$skip` ahead of a stage that
-/// transforms each document into one (measured 8.2.11, RM-414).
-pub(crate) fn hoist_after_source(pipeline: &[Bson]) -> Vec<Bson> {
-    hoist(pipeline, true)
+/// [`hoist_matches`], for a caller that runs the stages rather than lists
+/// them: each [`PUSHED_MATCH`] the `$match` it is.
+pub(crate) fn hoist_runnable(pipeline: &[Bson]) -> Vec<Bson> {
+    runnable(hoist(pipeline))
+}
+
+/// `stages` with each [`PUSHED_MATCH`] the `$match` it runs as.
+pub(crate) fn runnable(stages: Vec<Bson>) -> Vec<Bson> {
+    stages
+        .into_iter()
+        .map(|stage| {
+            let pushed = as_match(&stage).filter(|_| is_pushed(&stage)).cloned();
+            pushed.map_or(stage, |filter| Bson::Document(doc! { "$match": filter }))
+        })
+        .collect()
 }
 
 /// `pipeline` without each `$sort` a later one overrides, as mongod's
@@ -729,7 +742,7 @@ fn overridden(after: &[Bson]) -> bool {
     false
 }
 
-fn hoist(pipeline: &[Bson], after_source: bool) -> Vec<Bson> {
+fn hoist(pipeline: &[Bson]) -> Vec<Bson> {
     let mut out = drop_overridden_sorts(pipeline);
     // A `$skip` / `$limit` is a wall a `$match` never crosses, but mongod
     // still moves one behind it ahead of the stages after it (8.2.11:
@@ -747,7 +760,7 @@ fn hoist(pipeline: &[Bson], after_source: bool) -> Vec<Bson> {
             || projects(s).is_some()
             || groups(s).is_some()
             || as_sort(s).is_some()
-            || (after_source && transforms_one_by_one(s))
+            || transforms_one_by_one(s)
     };
     'again: loop {
         for at in 1..out.len() {
@@ -771,7 +784,7 @@ fn hoist(pipeline: &[Bson], after_source: bool) -> Vec<Bson> {
                     continue 'again;
                 }
             }
-            if after_source && is_skip(&out[at]) && transforms_one_by_one(&out[at - 1]) {
+            if is_skip(&out[at]) && transforms_one_by_one(&out[at - 1]) {
                 out.swap(at - 1, at);
                 continue 'again;
             }
@@ -779,7 +792,7 @@ fn hoist(pipeline: &[Bson], after_source: bool) -> Vec<Bson> {
                 continue;
             };
             let pushed = is_pushed(&out[at]);
-            if let Some(root) = new_root_path(&out[at - 1]).filter(|_| after_source) {
+            if let Some(root) = new_root_path(&out[at - 1]) {
                 let Some(moved) = through_replace_root(m, pushed, root) else {
                     continue;
                 };
@@ -893,7 +906,7 @@ pub(crate) fn unwind_paths(unwind: &Bson) -> Option<Vec<String>> {
 #[cfg(test)]
 mod tests {
     use super::{
-        drop_overridden_sorts, drop_overridden_sorts_everywhere, hoist_after_source, hoist_matches,
+        drop_overridden_sorts, drop_overridden_sorts_everywhere, hoist_matches, runnable,
         PUSHED_MATCH,
     };
     use bson::{doc, Bson};
@@ -1001,11 +1014,11 @@ mod tests {
         let eq =
             |f: &str, v: i32| Bson::from(doc! { format!("_tempDocumentsField.{f}"): { "$eq": v } });
         assert_eq!(
-            hoist_after_source(&[root(), doc! { "$match": { "a": 1 } }.into()]),
+            hoist_matches(&[root(), doc! { "$match": { "a": 1 } }.into()]),
             vec![guarded(vec![t4.clone(), n3.clone(), eq("a", 1)]), root()]
         );
         assert_eq!(
-            hoist_after_source(&[root(), doc! { "$match": { "a": { "$gte": 1 } } }.into()]),
+            hoist_matches(&[root(), doc! { "$match": { "a": { "$gte": 1 } } }.into()]),
             vec![
                 guarded(vec![
                     doc! { "_tempDocumentsField.a": { "$gte": 1 } }.into(),
@@ -1017,7 +1030,7 @@ mod tests {
         );
         // Two `$match`es each move, then join.
         assert_eq!(
-            hoist_after_source(&[
+            hoist_matches(&[
                 root(),
                 doc! { "$match": { "a": 1 } }.into(),
                 doc! { "$match": { "b": 2 } }.into(),
@@ -1041,14 +1054,14 @@ mod tests {
             doc! { "$alwaysFalse": 1 },
         ] {
             let pipeline = vec![root(), doc! { "$match": filter.clone() }.into()];
-            assert_eq!(hoist_after_source(&pipeline), pipeline, "{filter}");
+            assert_eq!(hoist_matches(&pipeline), pipeline, "{filter}");
         }
         // A new root that is not a field path takes no `$match`.
         let pipeline = vec![
             doc! { "$replaceRoot": { "newRoot": { "z": "$a" } } }.into(),
             doc! { "$match": { "z": 1 } }.into(),
         ];
-        assert_eq!(hoist_after_source(&pipeline), pipeline);
+        assert_eq!(hoist_matches(&pipeline), pipeline);
     }
 
     #[test]
@@ -1056,13 +1069,36 @@ mod tests {
         let skip = Bson::from(doc! { "$skip": 1 });
         let project = Bson::from(doc! { "$project": { "a": 1 } });
         assert_eq!(
-            hoist_after_source(&[root(), project.clone(), skip.clone()]),
+            hoist_matches(&[root(), project.clone(), skip.clone()]),
             vec![skip.clone(), root(), project.clone()]
         );
-        // Over a collection the pipeline keeps its order.
+        // Over a collection too (measured 8.2.11, RM-536).
+        let over_x = Bson::from(doc! { "$replaceRoot": { "newRoot": "$x" } });
         assert_eq!(
-            hoist_matches(&[root(), project.clone(), skip.clone()]),
-            vec![root(), project, skip]
+            hoist_matches(&[over_x.clone(), skip.clone()]),
+            vec![skip, over_x]
+        );
+    }
+
+    /// A `$match` behind `{$replaceRoot: {newRoot: "$x"}}` over a collection
+    /// moves ahead of it as it does after `$documents`, and runs as the
+    /// `$match` it is (measured 8.2.11, RM-536).
+    #[test]
+    fn a_match_moves_ahead_of_a_replace_root_over_a_collection() {
+        let over_x = Bson::from(doc! { "$replaceWith": "$x" });
+        let moved = hoist_matches(&[over_x.clone(), doc! { "$match": { "a": 1 } }.into()]);
+        let filter = doc! { "$or": [
+            { "x": { "$type": [4] } },
+            { "x": { "$not": { "$type": [3] } } },
+            { "x.a": { "$eq": 1 } },
+        ] };
+        assert_eq!(
+            moved,
+            vec![doc! { PUSHED_MATCH: filter.clone() }.into(), over_x.clone()]
+        );
+        assert_eq!(
+            runnable(moved),
+            vec![doc! { "$match": filter }.into(), over_x]
         );
     }
 }

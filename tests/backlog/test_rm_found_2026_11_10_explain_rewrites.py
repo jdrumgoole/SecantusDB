@@ -62,7 +62,7 @@ def _replace_root_over_a_collection(client: Any) -> Any:
     return mongo_answer(explained)
 
 
-@pytest.mark.backlog("RM-536")
+@pytest.mark.backlog_fixed("RM-536")
 def test_a_match_moves_ahead_of_a_replace_root_into_the_query(
     rust_mongo: Any,
     mongod_rs: Any,  # noqa: F811
@@ -70,8 +70,9 @@ def test_a_match_moves_ahead_of_a_replace_root_into_the_query(
     """mongod 8.2.11 moves a `$match` behind `{$replaceRoot: {newRoot:
     "$x"}}` ahead of it, renamed onto `x` in an `$or` with `{x: {$type:
     [4]}}` and `{x: {$not: {$type: [3]}}}`, and the collection's query takes
-    it (`parsedQuery` is that `$or`). This server leaves the `$match` behind
-    the `$replaceRoot` and reads the whole collection."""
+    it (`parsedQuery` is that `$or`). This server left the `$match` behind
+    the `$replaceRoot` and read the whole collection until 2026-11-14: the
+    rewrite ran only after a pipeline's own source (RM-414)."""
     assert _replace_root_over_a_collection(rust_mongo) == _replace_root_over_a_collection(mongod_rs)
 
 

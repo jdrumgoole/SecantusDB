@@ -811,7 +811,7 @@ pub fn aggregate(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
                 let (filter, rest) = match geonear_candidate {
                     Some(cand) => (cand, pipeline),
                     None => {
-                        let hoisted = crate::explain::hoist::hoist_matches(&pipeline);
+                        let hoisted = crate::explain::hoist::hoist_runnable(&pipeline);
                         let (filter, rest) = lift_leading_match(&hoisted);
                         match crate::explain::sbe_pushdown(
                             storage,
@@ -3812,7 +3812,7 @@ fn apply_union_with(
         // mongod plans the sub-pipeline as a query of its own, so it has its
         // own pushdown into SBE (measured 8.2.11: `$mod` by zero in a
         // `$group` there is SBE's 4848403).
-        let hoisted = crate::explain::hoist::hoist_matches(sub);
+        let hoisted = crate::explain::hoist::hoist_runnable(sub);
         let sub = match crate::explain::sbe_pushdown(storage, db, from, &hoisted, None, collation) {
             Some(end) => {
                 if storage.collection_exists(db, from).unwrap_or(false) {

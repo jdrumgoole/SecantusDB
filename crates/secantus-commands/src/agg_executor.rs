@@ -161,7 +161,7 @@ pub(crate) fn holds_executor(
     coll: &str,
     pipeline: &[Bson],
 ) -> bool {
-    let stages: Vec<Document> = crate::explain::hoist::hoist_matches(pipeline)
+    let stages: Vec<Document> = crate::explain::hoist::hoist_runnable(pipeline)
         .into_iter()
         .filter_map(|s| match s {
             Bson::Document(d) => Some(d),

@@ -398,7 +398,7 @@ pub(crate) struct Absorbed {
 
 /// [`Absorbed`], from the stages after `$planCacheStats` (desugared).
 pub(crate) fn absorb_matches(mut rest: Vec<Bson>) -> Absorbed {
-    use super::hoist::{as_match, hoist_after_source, PUSHED_MATCH};
+    use super::hoist::{as_match, hoist_matches, PUSHED_MATCH};
     let mut held: Option<(Document, Document)> = None;
     // The stage's own first look: a `$match` right after it.
     if let Some(filter) = rest.first().and_then(as_match).cloned() {
@@ -410,7 +410,7 @@ pub(crate) fn absorb_matches(mut rest: Vec<Bson>) -> Absorbed {
         if at == 0 {
             break;
         }
-        let moved = hoist_after_source(&rest[..=at]);
+        let moved = hoist_matches(&rest[..=at]);
         let Some(front) = moved.first().and_then(as_match).cloned() else {
             break;
         };

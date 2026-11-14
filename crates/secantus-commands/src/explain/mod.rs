@@ -2827,7 +2827,7 @@ fn own_source_reply(
                     }
                 }
             }
-            let after: Vec<Document> = hoist::hoist_after_source(&after)
+            let after: Vec<Document> = hoist::hoist_matches(&after)
                 .into_iter()
                 .filter_map(|b| match b {
                     Bson::Document(d) => Some(d),

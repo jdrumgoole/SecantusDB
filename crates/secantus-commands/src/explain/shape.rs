@@ -301,13 +301,16 @@ fn is_paging(stage: &Document) -> bool {
 }
 
 /// A stage that hands on one document for each it reads: a `$skip` or
-/// `$limit` behind it may go ahead of it (`$score` too, RM-200).
+/// `$limit` behind it may go ahead of it (`$score` too, RM-200; a
+/// `$replaceRoot` / `$replaceWith`, measured 8.2.11, RM-536).
 fn keeps_count(stage: &Document) -> bool {
     [
         "$project",
         "$unset",
         "$addFields",
         "$set",
+        "$replaceRoot",
+        "$replaceWith",
         "$_secantusScore",
     ]
     .iter()
@@ -327,7 +330,10 @@ fn query_ahead(ahead: &[Bson]) -> bool {
         if is_paging(d) {
             paged = true;
             true
-        } else if d.contains_key("$match") || d.contains_key("$sort") || d.contains_key(WINDOW_SORT)
+        } else if d.contains_key("$match")
+            || d.contains_key(super::hoist::PUSHED_MATCH)
+            || d.contains_key("$sort")
+            || d.contains_key(WINDOW_SORT)
         {
             !paged
         } else {
@@ -395,7 +401,11 @@ pub(crate) fn absorb(shape: &mut Shape, pipeline: &[Document]) {
         };
         let paged = shape.skip > 0 || limit.is_some();
         match (name.as_str(), arg) {
-            ("$match", Bson::Document(m)) if !paged && shape.projection.is_none() => {
+            // A `$match` moved ahead of a `$replaceRoot` is the query's as
+            // any other (measured 8.2.11, RM-536).
+            ("$match" | super::hoist::PUSHED_MATCH, Bson::Document(m))
+                if !paged && shape.projection.is_none() =>
+            {
                 if !m.is_empty() {
                     filters.push(m.clone());
                 }
