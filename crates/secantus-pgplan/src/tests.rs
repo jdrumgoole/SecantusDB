@@ -6303,6 +6303,37 @@ fn a_row_beside_a_scalar_has_no_operator() {
     ] {
         assert!(analysed(sql).is_ok(), "{sql}: {:?}", analysed(sql).err());
     }
+    // RP-592: an array beside the row is typed as `transformArrayExpr`
+    // types it, and `||` takes the row only beside an array of rows. Each
+    // named the row `text`, or (`t || array[1]`, `nullif`) answered.
+    for (sql, want, at) in [
+        ("select array[1] = (1, 2)", "integer[] = record", 16),
+        ("select t = array[1] from t", "t = integer[]", 9),
+        ("select array[1] = t from t", "integer[] = t", 16),
+        ("select t = '{1}'::int[] from t", "t = integer[]", 9),
+        ("select t = array[1, 2.5] from t", "t = numeric[]", 9),
+        ("select t = array['x'] from t", "t = text[]", 9),
+        ("select t = array[array[1]] from t", "t = integer[]", 9),
+        ("select t = array[1]::bigint[] from t", "t = bigint[]", 9),
+        ("select nullif(t, array[1]) from t", "t = integer[]", 7),
+        ("select t || array[1] from t", "t || integer[]", 9),
+        ("select (1, 2) || array[1]", "record || integer[]", 14),
+        (
+            "select t <> all (array[array[1]]) from t",
+            "t <> integer",
+            9,
+        ),
+    ] {
+        take_error_location();
+        let err = analysed(sql).expect_err("should refuse");
+        assert_eq!(err.sqlstate(), "42883", "for {sql} (got {err})");
+        assert!(
+            err.to_string()
+                .contains(&format!("operator does not exist: {want}")),
+            "for {sql}: {err}"
+        );
+        assert_eq!(take_error_location(), Some(at), "for {sql}");
+    }
     // `ROW(...) = (SELECT ...)` is a row comparison SubLink, and a scalar
     // subquery of two columns is `transformSubLink`'s 42601: neither is
     // an operator's 42883.

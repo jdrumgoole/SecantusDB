@@ -2740,13 +2740,6 @@ int)`. The gap tests are in `tests/backlog/test_rp_found_rp530.py`.
       document with string using = is not supported yet`, with no position.
       Verify: tests/backlog/test_rp_found_rp530.py::test_untyped_literal_beside_a_row
       Backlog-ID: RP-591
-- [ ] **A row beside an `ARRAY[...]` names the row `text`.** `select
-      array[1] = (1,2)`, `fs = array[1]` and `array[1] = fs` are 42883
-      `operator does not exist: integer[] = record` (`fs = integer[]`,
-      `integer[] = fs`) on PostgreSQL 15.19; here they name the array
-      `int4[]` and the row `text`. The SQLSTATE and position match.
-      Verify: tests/backlog/test_rp_found_rp530.py::test_row_beside_an_array_constructor
-      Backlog-ID: RP-592
 - [ ] **An error a PREPARE's query raises carries the query's own offset.**
       PREPARE plans the deparsed inner query, so a recorded location is an
       offset into `SELECT ...`, honoured whenever a token of the PREPARE

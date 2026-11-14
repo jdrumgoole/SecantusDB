@@ -2,7 +2,7 @@
 typed operand that is not a row has no operator): RP-590 (two different
 composite types were refused a comparison, fixed), RP-591 (an untyped literal
 beside a row is not read as `record`), RP-592 (a row beside an `ARRAY[...]`
-names the row `text`) and RP-593 (an error a PREPARE's query raises carries
+named the row `text`, fixed) and RP-593 (an error a PREPARE's query raises carries
 the query's own offset).
 
 An answer is the rows, or `(sqlstate, message, hint, position)` for an
@@ -95,16 +95,39 @@ def test_untyped_literal_beside_a_row(query: str, dsn: str) -> None:
     assert answer(dsn, query) == UNTYPED_BESIDE_ROW[query]
 
 
+# The array is typed as `transformArrayExpr` types it, and `||` takes a
+# row only beside an array of rows (`anycompatible || anycompatiblearray`).
 ROW_BESIDE_ARRAY = {
     "select array[1] = (1,2)": _no_operator("integer[] = record", "17"),
     "select fs = array[1] from fs": _no_operator("fs = integer[]", "11"),
     "select array[1] = fs from fs": _no_operator("integer[] = fs", "17"),
+    "select fs = '{1}'::int[] from fs": _no_operator("fs = integer[]", "11"),
+    "select fs = array[1, 2.5] from fs": _no_operator("fs = numeric[]", "11"),
+    "select fs = array['x'] from fs": _no_operator("fs = text[]", "11"),
+    "select fs = array[null] from fs": _no_operator("fs = text[]", "11"),
+    "select fs = array[array[1]] from fs": _no_operator("fs = integer[]", "11"),
+    "select fs = array[1]::bigint[] from fs": _no_operator("fs = bigint[]", "11"),
+    "select row(1)::ct = array[1]": _no_operator("ct = integer[]", "19"),
+    "select fs is distinct from array[1] from fs": _no_operator("fs = integer[]", "11"),
+    "select nullif(fs, array[1]) from fs": _no_operator("fs = integer[]", "8"),
+    "select fs in (array[1]) from fs": _no_operator("fs = integer[]", "11"),
+    "select 1 from fs where fs in (fs, array[1])": _no_operator("fs = integer[]", "27"),
+    "select fs between array[1] and array[2] from fs": _no_operator("fs >= integer[]", "11"),
+    "select fs <> all (array[array[1]]) from fs": _no_operator("fs <> integer", "11"),
+    "select fs || array[1] from fs": _no_operator("fs || integer[]", "11"),
+    "select fs || '{x}'::text[] from fs": _no_operator("fs || text[]", "11"),
+    "select array[1] || (1,2)": _no_operator("integer[] || record", "17"),
+    "select fs || array[fs] from fs": [('{"(1,y)","(1,y)"}',)],
+    "select row(1)::ct || array[row(1)::ct]": [("{(1),(1)}",)],
 }
 
 
-@pytest.mark.backlog("RP-592")
+@pytest.mark.backlog_fixed("RP-592")
 @pytest.mark.parametrize("query", list(ROW_BESIDE_ARRAY))
 def test_row_beside_an_array_constructor(query: str, dsn: str) -> None:
+    """A row beside an array has no operator, naming both types as
+    written. Each named the row `text`; `nullif`, `fs || array[1]` and an
+    IN list answered, and IS DISTINCT and BETWEEN lost the position."""
     assert answer(dsn, query) == ROW_BESIDE_ARRAY[query]
 
 
