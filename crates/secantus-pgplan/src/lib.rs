@@ -27765,11 +27765,44 @@ fn cast_subquery_column_to_domain(
 /// Cast `node` to its column's domain when it is a bare reference to a
 /// domain column in `scope`; whether it was.
 fn cast_domain_column(node: &mut pg_query::protobuf::Node, scope: &domain_scope::Scope) -> bool {
-    let Some(domain) = scope.domain_of(node).map(str::to_string) else {
+    let Some(domain) = common_domain(node, scope) else {
         return false;
     };
     *node = relabel_cast(node.clone(), &domain);
     true
+}
+
+/// The domain `node` is of: a domain column's, or a CASE, COALESCE,
+/// GREATEST or LEAST whose every result is of that one domain --
+/// `select_common_type` keeps a type all its inputs share exactly, a
+/// domain included (RP-764). A CASE with no ELSE has an unknown NULL
+/// among its inputs, so they are not all the same type and the domain is
+/// smashed to its base: no domain.
+fn common_domain(node: &pg_query::protobuf::Node, scope: &domain_scope::Scope) -> Option<String> {
+    let arms: Vec<&pg_query::protobuf::Node> = match node.node.as_ref()? {
+        N::CoalesceExpr(c) => c.args.iter().collect(),
+        N::MinMaxExpr(m) => m.args.iter().collect(),
+        N::CaseExpr(c) if c.defresult.is_some() => c
+            .args
+            .iter()
+            .filter_map(|w| match w.node.as_ref() {
+                Some(N::CaseWhen(w)) => w.result.as_deref(),
+                _ => None,
+            })
+            .chain(c.defresult.as_deref())
+            .collect(),
+        N::CaseExpr(_) => return None,
+        _ => return scope.domain_of(node).map(str::to_string),
+    };
+    let mut out: Option<String> = None;
+    for a in arms {
+        let d = common_domain(a, scope)?;
+        if out.as_ref().is_some_and(|o| *o != d) {
+            return None;
+        }
+        out = Some(d);
+    }
+    out
 }
 
 /// `c::d` over a column of domain `d` is no coercion: the column is already

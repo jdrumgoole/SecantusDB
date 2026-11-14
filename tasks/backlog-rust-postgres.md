@@ -2831,18 +2831,6 @@ Measured on a private PostgreSQL 15.19 cluster with the `_SETUP` in
 `tests/backlog/test_rp_found_rp665.py`: `t665(a d665, c dc665, b int)`
 over `create domain d665 as int` and `create domain dc665 as char(4)`.
 
-- [ ] **A CASE, COALESCE, GREATEST or LEAST over domain columns alone is
-      typed by the domain's base.** `select pg_typeof(coalesce(a, a)) from
-      t665` is `d665` on PostgreSQL 15.19, and so are `case when ... then a
-      else a end`, `greatest(a, a)` and `least(a, a)`; `coalesce(c, c)` is
-      `dc665` (`select_common_type` keeps a type every input shares
-      exactly, a domain included). Here each is `integer` (`character`).
-      Since RP-665 the common type keeps a domain every input is OF -- a
-      scalar subquery over one is -- but a bare domain column reaches a
-      `pg_typeof` as its domain only directly (`rewrite_domain_typeof`),
-      so inside these it is still of its stored base type.
-      Verify: tests/backlog/test_rp_found_rp665.py::test_common_type_of_domain_columns_alone_is_the_domain
-      Backlog-ID: RP-764
 
 ## Found while working RP-656 (2026-11-08)
 
