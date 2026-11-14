@@ -3019,14 +3019,6 @@ and `(2, 'abcd', '{abcd}')`. The gap tests are in
 Measured on a private PostgreSQL 15.19 cluster with `create domain d607q
 as int`. The gap tests are in `tests/backlog/test_rp_found_rp607.py`.
 
-- [ ] **A domain over another domain's array type is refused.** `create
-      domain d607s as d607q[]` is made on PostgreSQL 15.19, with
-      `typbasetype` `d607q[]`, and `'{1,2}'::d607s::text` is `{1,2}`; here
-      the CREATE is 42704 `type "d607q[]" does not exist`: `create_domain`
-      knows a base by a built-in's name or a user type's, never a user
-      type's array. The DROP side follows such a domain already (RP-607).
-      Verify: tests/backlog/test_rp_found_rp607.py::test_domain_over_a_domain_array
-      Backlog-ID: RP-654
 
 ## Found while working RP-658 (2026-11-08)
 
