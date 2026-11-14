@@ -639,7 +639,8 @@ def test_a_blocking_sort_leaves_ties_as_mongods_sort_does(rust_mongo: Any, mongo
     the equal ones where the C++ library's introsort leaves them. This
     server kept them in the order it read them. The exemplar is Linux
     mongod, which links libstdc++ (Joe, 2026-11-12); macOS mongod's libc++
-    orders them its own way (`25, 105, 95, 115, 5, ...`, RM-526)."""
+    orders them its own way (`25, 105, 95, 115, 5, ...`), which this server
+    reproduces there since RM-526."""
     only_on("linux", why="the sort is libstdc++'s, the Linux build's")
     want = {
         "simple": _LIBSTDCXX_SIMPLE,

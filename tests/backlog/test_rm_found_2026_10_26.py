@@ -140,7 +140,7 @@ def test_linux_tied_spill_storage_size(rust_mongo: Any, mongod: Any) -> None:
     """Sorts by a key many documents share store Linux mongod 8.2.12's bytes
     once each run is sorted as libstdc++ sorts it: `{k: 1}` 51231 (this
     server stored 51244) and `find`'s `{k: -1}` 51232 (51242), CI
-    2026-11-10. macOS is RM-526."""
+    2026-11-10. macOS agrees since RM-526 (libc++'s `std::sort`)."""
     from tests.backlog.test_rm_326_sort_counts import _spill_storage
     from tests.backlog.test_rm_found_2026_11_10_rm395 import _tied_sort_storage
 
@@ -193,6 +193,17 @@ def _group_held_value_spills(client: Any) -> dict:
         "$maxN": {"_id": "$n", "f": {"$maxN": {"n": 2, "input": "$s"}}},
         "$topN": {"_id": "$n", "f": {"$topN": {"n": 2, "sortBy": {"n": -1}, "output": "$s"}}},
         "object _id": {"_id": {"n": "$n"}, "f": {"$first": "$zz"}},
+        # Groups of many documents, each keeping its last / best few.
+        "$lastN of many": {"_id": "$k", "f": {"$lastN": {"n": 3, "input": "$s"}}},
+        "$bottom": {"_id": "$n", "f": {"$bottom": {"sortBy": {"n": 1, "k": -1}, "output": "$s"}}},
+        "$topN of many": {
+            "_id": "$k",
+            "f": {"$topN": {"n": 3, "sortBy": {"n": 1}, "output": "$s"}},
+        },
+        # The t-digest and its buffer; two fields of an `_id`.
+        "$median": {"_id": "$n", "f": {"$median": {"input": "$s", "method": "approximate"}}},
+        "$median of n": {"_id": "$n", "f": {"$median": {"input": "$n", "method": "approximate"}}},
+        "two-field _id": {"_id": {"n": "$n", "k": "$k"}, "f": {"$push": "$s"}},
     }
     spills = {}
     for name, group in groups.items():
@@ -206,11 +217,15 @@ def _group_held_value_spills(client: Any) -> dict:
     return spills
 
 
-@pytest.mark.backlog("RM-502")
+@pytest.mark.backlog_fixed("RM-502")
 def test_group_held_value_spills(rust_mongo: Any, mongod: Any) -> None:
-    """mongod 8.2 counts the 1000-byte string a classic `$first` holds, and
-    spills 60 times as for a `$push` (this server: 9); it counts an object
-    `_id` as the key it groups on (9 spills; this server 15)."""
+    """mongod 8.2 counts the values a classic N accumulator keeps, each at
+    its `getApproximateSize` and released when it goes; this server counted
+    the accumulator alone (`$firstN` spilled 13 times to mongod's 60, `$topN`
+    38 to 75). It now keeps and counts what mongod keeps, over each
+    platform's accumulator sizes, and a `$median` counts its t-digest's
+    buffer (fixed 2026-11-14). `$first`, `$last` and an object `_id` were
+    already mongod's (RM-409)."""
     assert _group_held_value_spills(rust_mongo) == _group_held_value_spills(mongod)
 
 

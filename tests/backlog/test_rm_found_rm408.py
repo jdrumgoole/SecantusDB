@@ -56,14 +56,14 @@ def _sub_document_sizes(client: Any) -> dict:
     return out
 
 
-@pytest.mark.backlog("RM-515")
+@pytest.mark.backlog_fixed("RM-515")
 def test_a_sub_document_a_stage_touched_is_sized_by_its_storage(
     rust_mongo: Any, mongod: Any
 ) -> None:
-    """mongod 8.2.11 gives a sub-document read through (`$e.y`) or written
+    """mongod 8.2.11 gave a sub-document read through (`$e.y`) or written
     into (`e.z`) a cache of its own, which the window's sort and cache
-    count: (349500, 369000) and (305100, 324600) bytes over 300
-    documents."""
+    counted -- (349500, 369000) and (305100, 324600) bytes over 300
+    documents -- where this server sized it as the BSON it was read from."""
     assert _sub_document_sizes(rust_mongo) == _sub_document_sizes(mongod)
 
 
@@ -122,9 +122,10 @@ def _projected_sort(client: Any) -> int:
     return stages[-1]["totalDataSizeSortedBytesEstimate"]
 
 
-@pytest.mark.backlog("RM-519")
+@pytest.mark.backlog_fixed("RM-519")
 def test_a_document_a_project_built_is_sized_as_built(rust_mongo: Any, mongod: Any) -> None:
-    """mongod 8.2.11's inclusion `$project` behind an `$unwind` builds each
-    document it returns, and the `$sort` after it counts that storage:
-    351300 bytes over 900 documents."""
+    """mongod 8.2.11's inclusion `$project` behind an `$unwind` built each
+    document it returned, with room for every field its spec named, and the
+    `$sort` after it counted that storage: 351300 bytes over 900 documents.
+    This server counted the BSON each encoded, 188700."""
     assert _projected_sort(rust_mongo) == _projected_sort(mongod)

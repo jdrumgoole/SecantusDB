@@ -127,7 +127,7 @@ pub fn apply_pipeline(
                 Some((true, _)) if first => Some(crate::sorter::SortSource::QueryLayer),
                 _ => Some(sort_source(before)),
             };
-            let sizes = window_storage(
+            let mut sizes = window_storage(
                 spec,
                 &docs,
                 before,
@@ -137,13 +137,26 @@ pub fn apply_pipeline(
                 stores.take(),
                 &read_stores,
             );
+            // A sort mongod hoists ahead of an `$unwind` orders the
+            // documents the `$unwind` took, which are not the ones here:
+            // those keep the order they came in (RM-640).
+            let hoisted_past_unwind = !computed
+                && before.iter().any(|st| stage_name_of(st) == "$unwind")
+                && spec.as_document().is_some_and(|s| {
+                    hoists_to_front(
+                        before,
+                        s.get("partitionBy")
+                            .filter(|by| !is_constant_expression(by, &[])),
+                        s.get_document("sortBy").ok(),
+                    )
+                });
             if let Some(source) = source {
                 let fields = match source {
                     crate::sorter::SortSource::QueryLayer => None,
                     _ => scanned.as_ref(),
                 };
                 let before = memlimit::report();
-                let sorted = window_sort_budget(
+                let order = window_sort_budget(
                     &docs,
                     spec,
                     vars,
@@ -152,9 +165,24 @@ pub fn apply_pipeline(
                     sizes.as_ref().map(|(sort, _)| sort.as_slice()),
                 )?;
                 let sort = memlimit::report().less(&before);
+                // The stage takes its documents in the order that sort left
+                // them, so documents whose keys tie come as mongod's
+                // `std::sort` (or its spilled runs' merge) puts them, not as
+                // they were read (RM-527). The stage's own ordering is
+                // stable, so it keeps them there.
+                if let Some(order) = order.filter(|_| !hoisted_past_unwind) {
+                    let mut taken: Vec<Option<Document>> = docs.into_iter().map(Some).collect();
+                    docs = order
+                        .iter()
+                        .map(|&i| taken[i].take().expect("each place once"))
+                        .collect();
+                    if let Some((_, cache)) = sizes.as_mut() {
+                        *cache = order.iter().map(|&i| cache[i]).collect();
+                    }
+                }
                 if source == crate::sorter::SortSource::QueryLayer {
                     // The executor hands the stage its documents sorted.
-                    let sizes = sorted.iter().map(|(_, d)| memlimit::bson_len(d)).collect();
+                    let sizes = docs.iter().map(memlimit::bson_len).collect();
                     memlimit::note_cursor_read(memlimit::CursorRead {
                         sort,
                         sizes,
@@ -364,12 +392,18 @@ pub fn apply_pipeline(
         // storage is kept through them once one changes it and a sort or a
         // window lies ahead to count it.
         // (`$unset` starts none: at the front mongod's scan takes it, as a
-        // projection that reads each document into new BSON.)
+        // projection that reads each document into new BSON. Nor does an
+        // inclusion `$project`, RM-519.)
         let modelled = matches!(
             name.as_str(),
             "$match" | "$unwind" | "$addFields" | "$set" | "$unset" | "$limit" | "$skip"
         ) || name == crate::sbe::ENGINE_STAGE
-            || name == INHIBIT_OPTIMIZATION;
+            || name == INHIBIT_OPTIMIZATION
+            || (name == "$project"
+                && spec
+                    .as_document()
+                    .and_then(docstore::Inclusion::parse)
+                    .is_some());
         let changes = matches!(name.as_str(), "$unwind" | "$addFields" | "$set");
         if stores.is_none() && changes && counts_storage(&pipeline[i + 1..]) {
             stores = Some(read_stores(&docs));
@@ -589,8 +623,10 @@ fn apply_stage(
 
 /// The `$sort` mongod puts in front of a `$setWindowFields` (its
 /// `partitionBy` value, then its `sortBy`), counted against the sort budget
-/// and spilled, or refused, as any blocking sort is (RM-315). The stage then
-/// orders its partitions itself, as it always has.
+/// and spilled, or refused, as any blocking sort is (RM-315). Returns each
+/// document's place in `docs` in the order that sort leaves them -- ties in
+/// the C++ library's `std::sort` order, or as the runs of a spilled sort
+/// merge them (RM-527) -- or `None` when the stage sorts on nothing.
 fn window_sort_budget(
     docs: &[Document],
     spec: &Bson,
@@ -598,9 +634,9 @@ fn window_sort_budget(
     source: crate::sorter::SortSource,
     fields: Option<&std::collections::BTreeSet<String>>,
     sizes: Option<&[usize]>,
-) -> R<Vec<(Vec<Bson>, Document)>> {
+) -> R<Option<Vec<usize>>> {
     let Some(spec) = spec.as_document() else {
-        return Ok(Vec::new());
+        return Ok(None);
     };
     let by = spec.get("partitionBy");
     let sort = match spec.get("sortBy") {
@@ -608,7 +644,7 @@ fn window_sort_budget(
         _ => Vec::new(),
     };
     if by.is_none() && sort.is_empty() {
-        return Ok(Vec::new());
+        return Ok(None);
     }
     let mut items: Vec<(Vec<Bson>, Document)> = Vec::with_capacity(docs.len());
     for d in docs {
@@ -643,7 +679,7 @@ fn window_sort_budget(
         budget: crate::memlimit::budgets().sort,
         added: None,
     };
-    crate::sorter::blocking_sort(items, &cmp, &sizing, None)
+    crate::sorter::blocking_sort_order(items, &cmp, &sizing).map(Some)
 }
 
 /// The temporary field a computed `partitionBy` is evaluated into
@@ -699,9 +735,9 @@ fn window_storage(
     for (s, d) in st.iter_mut().zip(docs) {
         if let (true, Some(by)) = (computed, by) {
             let mut read = Vec::new();
-            docstore::fields_read(by, &mut read);
+            docstore::paths_read(by, &mut read);
             for f in &read {
-                s.read_field(d, f);
+                s.read_path(d, f);
             }
             let key = match expressions::evaluate(d, by, vars) {
                 Ok(Bson::Undefined) | Err(_) => None,
@@ -813,6 +849,10 @@ fn stored_stage(
         }
         return Ok((out, stores));
     }
+    let inclusion = match name {
+        "$project" => spec.as_document().and_then(docstore::Inclusion::parse),
+        _ => None,
+    };
     let mut out = Vec::with_capacity(docs.len());
     let mut kept = Vec::with_capacity(docs.len());
     let mut reads = Vec::new();
@@ -829,6 +869,11 @@ fn stored_stage(
             "$unset" => {
                 if let [o] = one.as_slice() {
                     kept.push(unset_storage(spec, s, o)?);
+                }
+            }
+            "$project" => {
+                if let ([o], Some(inc)) = (one.as_slice(), &inclusion) {
+                    kept.push(inc.apply(&d, &s, o, vars));
                 }
             }
             _ => kept.extend(std::iter::repeat_n(s, one.len())),
@@ -881,7 +926,11 @@ fn unwound_storage(
 /// (`AddFieldsProjectionExecutor`): the first field's expression reads
 /// from the input's storage, which the output still shares, then each
 /// field is set on the output's own copy -- the expressions after the first
-/// read from the input's, which the output no longer sees.
+/// read from the input's, which the output no longer sees but for the
+/// sub-documents the two still share (a field cached before the copy, and
+/// not written since: reading inside it caches into the one storage). A
+/// dotted field writes into a copy of the sub-document it names
+/// ([`docstore::Stored::set_path`], RM-515).
 fn added_storage(
     spec: &Bson,
     input: &Document,
@@ -891,21 +940,41 @@ fn added_storage(
     let Some(spec) = spec.as_document() else {
         return s;
     };
-    if let Some(first) = spec.values().next() {
+    let mut written: Vec<&str> = Vec::new();
+    for (n, (k, expr)) in spec.iter().enumerate() {
         let mut read = Vec::new();
-        docstore::fields_read(first, &mut read);
-        for f in &read {
-            s.read_field(input, f);
+        docstore::paths_read(expr, &mut read);
+        for path in &read {
+            if n == 0 {
+                s.read_path(input, path);
+            } else if let Some((top, rest)) = path.split_once('.') {
+                if s.has_cached(top) && !written.contains(&top) {
+                    s.read_nested(input, top, rest);
+                }
+            }
         }
-    }
-    for (k, expr) in spec {
         let top = k.split('.').next().unwrap_or_default();
-        let held = match out.get(top) {
-            None => 0,
-            Some(v) if top == k => docstore::produced_held(expr, v),
-            Some(v) => docstore::held(v),
+        // A field set to a path the output's cache holds a sub-document at
+        // shares that storage (a read of the input's own leaves none).
+        let shares = |s: &mut docstore::Stored| match expr {
+            Bson::String(p) if p.starts_with('$') && !p.starts_with("$$") => {
+                let path = &p[1..];
+                let from = path.split('.').next().unwrap_or_default();
+                let seen = n == 0 || !written.contains(&from);
+                seen && s.set_shared(k, path)
+            }
+            _ => false,
         };
-        s.set_field(top, held);
+        if top == k {
+            if !shares(&mut s) {
+                let held = out.get(k).map_or(0, |v| docstore::produced_held(expr, v));
+                s.set_field(k, held);
+            }
+        } else {
+            let leaf = paths::get_path(out, k).map_or(0, |v| docstore::produced_held(expr, v));
+            s.set_path(Some(input), out, k, leaf);
+        }
+        written.push(top);
     }
     s
 }
@@ -2626,6 +2695,55 @@ mod tests {
 
     fn run(docs: Vec<Document>, pipeline: Vec<Bson>) -> Vec<Document> {
         apply_pipeline(docs, &pipeline, &Document::new(), None).expect("should not fall back")
+    }
+
+    /// A `$setWindowFields` takes its documents in the order of the
+    /// `$sort` mongod runs it behind, whose `std::sort` reorders ties, not
+    /// in the order they came: what `$sort` on the same key gives (RM-527).
+    /// Behind an `$unwind` that sort is mongod's before it, so the documents
+    /// here keep their order (RM-640).
+    #[test]
+    fn a_window_takes_ties_in_its_sorts_order() {
+        let docs: Vec<Document> = (0..40).map(|i| doc! {"_id": i, "k": i % 3}).collect();
+        let ids = |out: Vec<Document>| -> Vec<i32> {
+            out.iter().map(|d| d.get_i32("_id").unwrap()).collect()
+        };
+        let sorted = ids(run(docs.clone(), vec![bson::bson!({"$sort": {"k": 1}})]));
+        let window = ids(run(
+            docs.clone(),
+            vec![bson::bson!({"$setWindowFields": {
+                "sortBy": {"k": 1},
+                "output": {"r": {"$documentNumber": {}}},
+            }})],
+        ));
+        assert_eq!(window, sorted);
+        // `std::sort` does reorder these ties, or the test proves nothing.
+        let read: Vec<i32> = (0..40).filter(|i| i % 3 == 0).collect();
+        assert_ne!(&window[..read.len()], read.as_slice());
+
+        let unwound = ids(run(
+            docs.iter()
+                .map(|d| {
+                    let mut d = d.clone();
+                    d.insert("a", vec![Bson::Int32(1), Bson::Int32(2)]);
+                    d
+                })
+                .collect(),
+            vec![
+                bson::bson!({"$unwind": "$a"}),
+                bson::bson!({"$setWindowFields": {
+                    "sortBy": {"k": 1},
+                    "output": {"r": {"$documentNumber": {}}},
+                }}),
+            ],
+        ));
+        let mut expected: Vec<i32> = Vec::new();
+        for k in 0..3 {
+            for i in (0..40).filter(|i| i % 3 == k) {
+                expected.extend([i, i]);
+            }
+        }
+        assert_eq!(unwound, expected);
     }
 
     /// The key of the `$sort` mongod runs a `$setWindowFields` behind: a

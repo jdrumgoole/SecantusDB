@@ -1519,10 +1519,13 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
 - [ ] **A `$median` / `$percentile` spills the values, where mongod spills
       its t-digest.** A classic `$group` of `{$median: {input: "$n", method:
       "approximate"}}` over 300 groups of one value each, under a 5000-byte
-      budget, spills 84000 bytes on mongod 8.2.11 (`groupSpilledBytes`,
-      its accumulator's t-digest) and 100800 here, which keeps and writes the
-      values. The spill count is RM-502's. Found 2026-11-13 working RM-325
-      (its remainder).
+      budget, writes a 5561-byte spill file on mongod 8.2.11
+      (`groupSpilledDataStorageSize`, its accumulator's t-digest) and 2948
+      here, which keeps and writes the values (an empty digest: 1986 to
+      1510). The memory counted is mongod's since RM-502 up to the t-digest's
+      first flush (6000 finite values); the centroids a flush makes are not
+      counted (`group::tdigest_buffer`), and need the same port. Found
+      2026-11-13 working RM-325 (its remainder).
       Verify: tests/backlog/test_rm_found_2026_11_13_rm325.py::test_a_median_spills_mongods_state
       Backlog-ID: RM-613
 - [ ] **`serverStatus` has no `spillWiredTiger` section.** mongod 8.2.11
@@ -1705,74 +1708,58 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       both do with no reader of the key after. Found 2026-11-13 (RM-520).
       Verify: tests/backlog/test_rm_found_2026_11_13_rm520.py::test_a_new_root_error_behind_a_sort_names_the_document
       Backlog-ID: RM-623
-- [ ] **A sub-document a stage reads or writes into is sized as if it
-      were read.** mongod 8.2.11 gives a sub-document a cache of its own
-      when a stage reads a field inside it (`$addFields: {q: "$e.y"}`) or
-      sets one (`$set: {"e.z": 1}`), and the sort and window behind count
-      it: (349500, 369000) and (305100, 324600) bytes over 300 documents.
-      This server's storage model (`docstore`, RM-408) caches top-level
-      fields only, and sizes the sub-document as the BSON it was read from:
-      (288900, 308400) and (290700, 288300).
-      Verify: tests/backlog/test_rm_found_rm408.py::test_a_sub_document_a_stage_touched_is_sized_by_its_storage
-      Backlog-ID: RM-515
-- [ ] **A document an inclusion `$project` built is sized as if it were
-      read.** Behind an `$unwind` (so not taken by the scan), mongod
-      8.2.11's `$project: {t: 1, n: 1}` builds each document it returns,
-      and the `$sort` after it counts that storage: 351300 bytes over 900
-      documents. This server counts each as the BSON it encodes, 188700:
-      the storage model (`docstore`, RM-408) stops at a `$project`. Found
-      2026-11-10 (RM-408).
-      Verify: tests/backlog/test_rm_found_rm408.py::test_a_document_a_project_built_is_sized_as_built
-      Backlog-ID: RM-519
-- [ ] **On macOS documents whose sort keys tie come in another order
-      than mongod's.** mongod's sorter sorts what it holds with
-      `std::sort`, which is not stable, so documents whose keys compare
-      equal come in the C++ library's order. This server sorts as
-      libstdc++, the Linux build's library, does (RM-402: Linux mongod
-      8.2.12 and this server agree on every case below), and on macOS keeps
-      them in the order they came, where mongod 8.2.11's libc++ reorders
-      them. Over 300 1-KB documents under a 50000-byte budget, a sort by
-      `{k: -1}` (seven values of `k`) stores 51260 bytes for its 13 spills
-      on mongod and 51242 here -- `find` and a pipeline's leading `$sort`
-      alike -- and `{k: 1}` 51240 and 51244 (this was RM-503); the 40
-      documents over three values of `k` a `$sort` after `$project`
-      returns come back 39, 3, 27, 9, ... from mongod and in their order
-      here. A sort whose keys are all different agrees. The fix is
-      libc++'s `std::sort`, step for step, where `stl::LIBCXX`. Checked on
-      macOS only. Found 2026-11-10 while working RM-395 and RM-400.
-      Verify: tests/backlog/test_rm_found_2026_11_10_rm395.py::test_tied_sort_spill_storage_size, tests/backlog/test_rm_326_sort_counts.py::test_descending_and_tied_spill_storage_size, tests/backlog/test_rm_found_2026_11_10_rm395.py::test_macos_tied_sort_order
-      Backlog-ID: RM-526
-- [ ] **`find`, a leading `$sort` and `$setWindowFields` hand back
-      documents whose sort keys tie in the order they were read.** mongod
-      runs each through the same sorter as any other sort, and its
-      `std::sort` reorders ties: 40 documents over three values of `k`
-      sorted by `{k: 1}` come back 39, 3, 27, 9, ... from all four of
-      `find`, `[{$sort}]`, `$setWindowFields` and a `$sort` after `$project`
-      on macOS mongod 8.2.11, and libstdc++'s `std::sort` (g++ 15.2), the
-      Linux build's, gives 0, 21, 18, 24, .... Since RM-402 the sorter here
-      (`sorter::sort_held`) gives the Linux order for a `$sort` after
-      another stage, and since RM-312 so do `find` and a leading `$sort`
-      (the read's `SORT`, `explain/order.rs` and `explain/stream.rs`); the
-      window stage's own sort is still stable. On macOS the order also
-      needs RM-526. Found 2026-11-10 working RM-402.
-      Verify: tests/backlog/test_rm_found_2026_11_10_rm402.py::test_tied_order_of_find_leading_sort_and_window
-      Backlog-ID: RM-527
-- [ ] **A classic `$group` counts its held values' and `_id`'s memory
-      unlike mongod, so it spills at other points.** Over 300 documents of a
-      1000-byte string, budget 5000, mongod 8.2.11 spills a `$first` /
-      `$last` / `$firstN` / `$maxN` of the string 60 times, as it does a
-      `$push` (each accumulator counts the `Value` it holds), where this
-      server spills 8 to 13 times: it counts a classic `$first` / `$last`
-      as its fixed size alone, a `$firstN` / `$maxN` / `$topN` / `$bottom`
-      short of mongod's (`$topN`: 38 spills to mongod's 75), and a
-      `$median` over it (20 to 17). An object `_id` goes the other way: mongod
-      counts the key it groups on (one field's value, or an array of the
-      fields'), this server the built `_id` document (`{_id: {n: "$n"}}`:
-      15 spills to 9; two fields under a `$push`: 75 to 60). The spill
-      file is mongod's (RM-325's fix); its size follows the runs. Found
-      2026-11-10 working RM-325.
-      Backlog-ID: RM-502
-      Verify: tests/backlog/test_rm_found_2026_10_26.py::test_group_held_value_spills
+- [ ] **A document inside an array a stage reads or writes into is sized
+      as if it were read.** mongod 8.2.11 gives each document in an array a
+      cache of its own when a stage reads a field through the array
+      (`$addFields: {q: "$t.y"}`) or sets one (`$set: {"t.w": 1}`), and the
+      sort and window behind count it: (236000, 259600) and (279200, 302800)
+      bytes over 200 documents of `t: [1, <30 bytes>, {q: 1, y: <50 bytes>}]`.
+      This server's storage model (`docstore`) follows a sub-document's
+      storage since RM-515, but not an array's elements: (195600, 219200)
+      and (206600, 230200). Found 2026-11-13 (RM-515).
+      Verify: tests/backlog/test_rm_found_rm515.py::test_an_arrays_documents_a_stage_touched_are_sized_by_their_storage
+      Backlog-ID: RM-636
+- [ ] **A `$sort` behind an exclusion `$project` counts each document
+      as the BSON it encodes.** mongod 8.2.11's exclusion `$project` keeps
+      the input's own storage and writes each excluded field out of it,
+      and projects a sub-document (`{"e.y": 0}`) into one of its own;
+      behind an `$unwind`, the `$sort` after it counts 4640 bytes over ten
+      documents for `{b: 0}` and 6930 for `{"e.y": 0}`. This server counts
+      2350 and 2850: the storage model (`docstore`, RM-408) models an
+      inclusion `$project` (RM-519) and stops at an exclusion. Found
+      2026-11-13 (RM-519).
+      Verify: tests/backlog/test_rm_found_rm519.py::test_a_sort_counts_what_an_exclusion_project_left
+      Backlog-ID: RM-637
+- [ ] **A `$project` behind a `$group` pushed into SBE is sized as if it
+      were read.** `[{$group: {_id: "$n", c: {$sum: 1}}}, {$project: {c:
+      1}}, {$sort: {c: 1}}]`: mongod 8.2.11's `$project` builds each
+      document (a `MutableDocument` with room for its two fields), and the
+      `$sort` counts 2450 bytes over ten groups; this server counts the
+      BSON each encodes, 1170, as it keeps no storage behind an SBE
+      `$group` (see also RM-435). Found 2026-11-13 (RM-519).
+      Verify: tests/backlog/test_rm_found_rm519.py::test_a_project_after_a_pushed_down_group_builds_its_documents
+      Backlog-ID: RM-638
+- [ ] **A `$sort` behind a `$setWindowFields` that sorted by the same key
+      is kept.** `[{$unwind: "$t"}, {$set: {w: 1}}, {$setWindowFields:
+      {sortBy: {n: 1}, ...}}, {$sort: {n: 1}}]`: mongod 8.2.11 drops the
+      trailing `$sort`, its explain ending at `$_internalSetWindowFields`;
+      this server keeps it and lists a `$sort` after the window, as it does
+      with a `$project` in the `$set`'s place. Behind the `$unwind` alone
+      it drops it, as mongod does. Found 2026-11-13 (RM-519).
+      Verify: tests/backlog/test_rm_found_rm519.py::test_a_sort_after_a_window_on_its_key_is_dropped
+      Backlog-ID: RM-639
+- [ ] **A `$setWindowFields` behind an `$unwind` hands back tied documents
+      in the order they were read.** mongod 8.2.11 hoists the window's
+      `$sort` ahead of an `$unwind` whose path it does not sort on, so it
+      sorts the documents the `$unwind` took, each then unwound in place:
+      `[{$unwind: "$a"}, {$setWindowFields: {sortBy: {k: 1}, ...}}]` over
+      60 documents of `a: [i % 4, 9]`, `k: i % 3` gives (0, 0), (0, 9),
+      (3, 3), (3, 9), (30, 2), ... on macOS. This server sorts nothing
+      there and keeps the order read, (6, 2) fifth. The fix sorts at the
+      `$unwind` (after the `$match`es in front, which mongod runs first),
+      held to the budget as that sort is. Found 2026-11-14 working RM-527.
+      Verify: tests/backlog/test_rm_found_rm527.py::test_window_sort_hoisted_past_unwind_orders_the_source_documents
+      Backlog-ID: RM-640
 - **Scope decision — SBE's `$concatArrays` refusal names a count mongod
   never set.** Over its budget mongod 8.2.11 says "Concatentating array of
   2 elements and N bytes with array of 87684434848907256 elements and M
@@ -3596,7 +3583,9 @@ touched:
   RM gate of 2026-11-13 (load average up to 18) the same queue-2 case
   differed in a wait instead: this server answered its third connection
   after a wait that rounded to 3 seconds, mongod after 2; four runs on
-  their own passed, at load 18. The test depends on six connects landing within one
+  their own passed, at load 18. A later RM gate that day (RM-515) saw
+  mongod answer two with no queue, as on 2026-11-08; three runs on their
+  own passed. The test depends on six connects landing within one
   second, so it is flaky by construction: it needs a measurement that
   load cannot change (connect all six behind a barrier and record how
   long they took to land, or compare with the answer mongod gives when

@@ -434,10 +434,15 @@ pub(crate) enum Acc {
     // `input` value; result computed at finalize. `n` is parsed from the spec on
     // the first `apply` (constant across the group). `$firstN`/`$lastN` keep null
     // values; `$maxN`/`$minN` drop them (mongod-faithful, three-way verified).
+    //
+    // The classic engine keeps only what mongod's keeps (at most `n`; see
+    // [`classic_nelem_take`]) and `mem` is its estimate of those values;
+    // SBE keeps every value and leaves `mem` at 0.
     NElem {
         kind: NElemKind,
         n: Option<usize>,
         vals: Vec<Bson>,
+        mem: usize,
     },
     // `$median` / `$percentile`: collect numeric values (int / long / double /
     // Decimal128 as f64; bool and NaN excluded — mongod-probed 7.0.12), then
@@ -445,19 +450,26 @@ pub(crate) enum Acc {
     // returned as a double; null / per-p nulls when no value was seen) at
     // finalize. `ps` parses from the spec on the first apply (None = $median).
     // An invalid spec defers to Python, which raises mongod's exact error.
+    //
+    // `buffered` counts the values mongod's t-digest buffers (finite ones;
+    // an infinity is only counted), for its memory.
     Percentile {
         is_median: bool,
         ps: Option<Vec<f64>>,
         values: Vec<f64>,
+        buffered: usize,
     },
     // `$top` / `$bottom` / `$topN` / `$bottomN`: collect `(sortBy-values, output)`
     // per doc; at finalize stable-sort by the `sortBy` directions and take the
     // top/bottom output(s). `n` and the sort directions are parsed on first apply.
+    // As for `NElem`, the classic engine keeps only mongod's kept items
+    // ([`classic_topn_take`]), with their estimate in `mem`.
     TopN {
         kind: TopNKind,
         n: Option<usize>,
         dirs: Vec<bool>, // true == descending
         items: Vec<(Vec<Bson>, Bson)>,
+        mem: usize,
     },
     // `$concatArrays` / `$setUnion` (accumulators since 8.1): every element of
     // each array operand, in order; `$setUnion` keeps the first of equal ones.
@@ -725,55 +737,65 @@ pub(crate) fn new_acc(op: &str) -> R<Acc> {
             kind: NElemKind::First,
             n: None,
             vals: Vec::new(),
+            mem: 0,
         },
         "$lastN" => Acc::NElem {
             kind: NElemKind::Last,
             n: None,
             vals: Vec::new(),
+            mem: 0,
         },
         "$maxN" => Acc::NElem {
             kind: NElemKind::Max,
             n: None,
             vals: Vec::new(),
+            mem: 0,
         },
         "$minN" => Acc::NElem {
             kind: NElemKind::Min,
             n: None,
             vals: Vec::new(),
+            mem: 0,
         },
         "$top" => Acc::TopN {
             kind: TopNKind::Top,
             n: None,
             dirs: Vec::new(),
             items: Vec::new(),
+            mem: 0,
         },
         "$bottom" => Acc::TopN {
             kind: TopNKind::Bottom,
             n: None,
             dirs: Vec::new(),
             items: Vec::new(),
+            mem: 0,
         },
         "$topN" => Acc::TopN {
             kind: TopNKind::TopN,
             n: None,
             dirs: Vec::new(),
             items: Vec::new(),
+            mem: 0,
         },
         "$bottomN" => Acc::TopN {
             kind: TopNKind::BottomN,
             n: None,
             dirs: Vec::new(),
             items: Vec::new(),
+            mem: 0,
         },
         "$median" => Acc::Percentile {
             is_median: true,
             ps: None,
             values: Vec::new(),
+            buffered: 0,
         },
         "$percentile" => Acc::Percentile {
             is_median: false,
             ps: None,
             values: Vec::new(),
+            buffered: 0,
         },
         "$concatArrays" => Acc::ConcatArrays(Capped::default()),
         "$setUnion" => Acc::SetUnion(Capped::default()),
@@ -997,6 +1019,7 @@ pub(crate) fn apply_acc(acc: &mut Acc, arg: &Bson, doc: &Document, vars: &Docume
             is_median,
             ps,
             values,
+            buffered,
         } => {
             let op = if *is_median { "$median" } else { "$percentile" };
             let (input, parsed) = percentile_spec(arg, op)?;
@@ -1006,25 +1029,35 @@ pub(crate) fn apply_acc(acc: &mut Acc, arg: &Bson, doc: &Document, vars: &Docume
             let v = eval(input, doc, vars)?;
             if let Some(f) = percentile_f64(&v) {
                 values.push(f);
+                if f.is_finite() {
+                    *buffered += 1;
+                }
             }
         }
-        Acc::NElem { n, vals, .. } => {
+        Acc::NElem { kind, n, vals, mem } => {
             // `arg` is `{n, input}`. Validate n (positive integral; integral double
             // accepted) and require `input`; anything invalid defers to Python,
-            // which raises the exact mongod code. `input` is collected per doc,
-            // null included (finalize drops nulls for max/min only).
+            // which raises the exact mongod code. SBE collects `input` per doc,
+            // null included (finalize drops nulls for max/min only); the
+            // classic engine keeps what mongod's does.
             let Bson::Document(d) = arg else {
                 return Err(Fallback::Defer);
             };
             let nn = group_n(d.get("n").ok_or(Fallback::Defer)?, vars)?;
             *n = Some(nn);
-            vals.push(eval(d.get("input").ok_or(Fallback::Defer)?, doc, vars)?);
+            let v = eval(d.get("input").ok_or(Fallback::Defer)?, doc, vars)?;
+            if crate::sbe::active() {
+                vals.push(v);
+            } else {
+                classic_nelem_take(*kind, nn, vals, mem, v)?;
+            }
         }
         Acc::TopN {
             kind,
             n,
             dirs,
             items,
+            mem,
         } => {
             // `arg` is `{n?, sortBy, output}`. Any invalid shape defers to Python,
             // which raises the exact mongod code (5788002-5, 10065, 5787908).
@@ -1091,7 +1124,11 @@ pub(crate) fn apply_acc(acc: &mut Acc, arg: &Bson, doc: &Document, vars: &Docume
                 })
                 .collect();
             let output = eval(d.get("output").unwrap(), doc, vars)?;
-            items.push((sort_vals, output));
+            if crate::sbe::active() {
+                items.push((sort_vals, output));
+            } else {
+                classic_topn_take(*kind, nn, dirs, items, mem, (sort_vals, output))?;
+            }
         }
     }
     Ok(())
@@ -1301,23 +1338,83 @@ pub(crate) type Keyed = (Vec<Bson>, Bson);
 fn classic_top_bottom_n(items: Vec<Keyed>, n: usize, top: bool, dirs: &[bool]) -> Vec<Keyed> {
     let mut kept: Vec<Keyed> = Vec::new();
     for item in items {
-        if kept.len() >= n {
-            if top {
-                if pattern_cmp(&kept[kept.len() - 1].0, &item.0, dirs) != Ordering::Greater {
-                    continue;
-                }
-                kept.pop();
-            } else {
-                if pattern_cmp(&item.0, &kept[0].0, dirs) != Ordering::Greater {
-                    continue;
-                }
-                kept.remove(0);
-            }
-        }
-        let at = kept.partition_point(|k| pattern_cmp(&k.0, &item.0, dirs) != Ordering::Greater);
-        kept.insert(at, item);
+        classic_top_bottom_step(&mut kept, item, n, top, dirs);
     }
     kept
+}
+
+/// One document into a classic `$top` / `$bottom` (N)'s map, as
+/// [`classic_top_bottom_n`] describes: `None` when the map does not take
+/// it, else the item it displaced, if any.
+fn classic_top_bottom_step(
+    kept: &mut Vec<Keyed>,
+    item: Keyed,
+    n: usize,
+    top: bool,
+    dirs: &[bool],
+) -> Option<Option<Keyed>> {
+    let mut out = None;
+    if kept.len() >= n {
+        if top {
+            if pattern_cmp(&kept[kept.len() - 1].0, &item.0, dirs) != Ordering::Greater {
+                return None;
+            }
+            out = kept.pop();
+        } else {
+            if pattern_cmp(&item.0, &kept[0].0, dirs) != Ordering::Greater {
+                return None;
+            }
+            out = Some(kept.remove(0));
+        }
+    }
+    let at = kept.partition_point(|k| pattern_cmp(&k.0, &item.0, dirs) != Ordering::Greater);
+    kept.insert(at, item);
+    Some(out)
+}
+
+/// What a classic `$top` / `$bottom` (N) counts for an item it keeps
+/// (`AccumulatorTopBottomN::_processValue`, 8.2): its sort key's and its
+/// output's `getApproximateSize` and `sizeof(KeyOutPair)`, two `Value`s. The
+/// key is the one sort field's value, or an array of them; an array field
+/// gives the element it sorts by.
+fn topn_item_size(item: &Keyed, dirs: &[bool]) -> usize {
+    let mut keys: Vec<Bson> = item
+        .0
+        .iter()
+        .zip(dirs)
+        .map(|(k, desc)| crate::order::sort_repr(k.clone(), *desc))
+        .collect();
+    let key = if keys.len() == 1 {
+        keys.pop().expect("one key")
+    } else {
+        Bson::Array(keys)
+    };
+    memlimit::classic_size(&key) + memlimit::classic_size(&item.1) + 2 * memlimit::VALUE
+}
+
+/// One document into a classic `$top` / `$bottom` (N): mongod's map keeps
+/// at most `n` items, an item it drops releasing its memory (8.2.11's
+/// `SimpleMemoryUsageToken`), so `mem` is the kept items' estimate.
+fn classic_topn_take(
+    kind: TopNKind,
+    n: usize,
+    dirs: &[bool],
+    items: &mut Vec<Keyed>,
+    mem: &mut usize,
+    item: Keyed,
+) -> R<()> {
+    if !item.0.iter().all(crate::order::is_sortable) {
+        return Err(Fallback::Defer);
+    }
+    let top = matches!(kind, TopNKind::Top | TopNKind::TopN);
+    let size = topn_item_size(&item, dirs);
+    if let Some(out) = classic_top_bottom_step(items, item, n, top, dirs) {
+        *mem += size;
+        if let Some(out) = out {
+            *mem -= topn_item_size(&out, dirs);
+        }
+    }
+    Ok(())
 }
 
 /// `$topN` / `$bottomN` as SBE keeps them (`aggTopBottomNAdd` and
@@ -1387,26 +1484,92 @@ pub(crate) fn nelem_result(kind: NElemKind, n: usize, vals: Vec<Bson>) -> R<Vec<
 fn classic_min_max_n(vals: Vec<Bson>, n: usize, largest: bool) -> Vec<Bson> {
     let mut kept: Vec<Bson> = Vec::new();
     for v in vals {
-        if kept.len() >= n {
-            if largest {
-                if crate::order::cmp(&v, &kept[0]) != Ordering::Greater {
-                    continue;
-                }
-                kept.remove(0);
-            } else {
-                if crate::order::cmp(&v, kept.last().expect("full")) != Ordering::Less {
-                    continue;
-                }
-                kept.pop();
-            }
-        }
-        let at = kept.partition_point(|k| crate::order::cmp(k, &v) != Ordering::Greater);
-        kept.insert(at, v);
+        classic_min_max_step(&mut kept, v, n, largest);
     }
     if largest {
         kept.reverse();
     }
     kept
+}
+
+/// One value into a classic `$maxN` / `$minN`'s multimap (ascending, as
+/// [`classic_min_max_n`] describes): `None` when the map does not take it,
+/// else the value it displaced, if any.
+fn classic_min_max_step(
+    kept: &mut Vec<Bson>,
+    v: Bson,
+    n: usize,
+    largest: bool,
+) -> Option<Option<Bson>> {
+    let mut out = None;
+    if kept.len() >= n {
+        if largest {
+            if crate::order::cmp(&v, &kept[0]) != Ordering::Greater {
+                return None;
+            }
+            out = Some(kept.remove(0));
+        } else {
+            if crate::order::cmp(&v, kept.last().expect("full")) != Ordering::Less {
+                return None;
+            }
+            out = kept.pop();
+        }
+    }
+    let at = kept.partition_point(|k| crate::order::cmp(k, &v) != Ordering::Greater);
+    kept.insert(at, v);
+    Some(out)
+}
+
+/// One value into a classic `$firstN` / `$lastN` / `$maxN` / `$minN`, as
+/// mongod's classic accumulator takes it (`AccumulatorFirstLastN` /
+/// `AccumulatorMinMaxN::_processValue`, 8.2.11): it keeps at most `n` values
+/// -- the first, the last, the largest or the smallest; `$maxN` / `$minN`
+/// skip a null -- and counts each one it keeps at its `getApproximateSize`,
+/// released when the value goes, so `mem` is the kept values' estimate.
+/// `vals` holds what [`nelem_result`] finalizes to the same answer: the kept
+/// values, in the multimap's order for `$maxN` / `$minN`, and for `$lastN`
+/// the last `n` of what it holds (trimmed from the front in batches).
+fn classic_nelem_take(
+    kind: NElemKind,
+    n: usize,
+    vals: &mut Vec<Bson>,
+    mem: &mut usize,
+    v: Bson,
+) -> R<()> {
+    match kind {
+        NElemKind::First => {
+            if vals.len() < n {
+                *mem += memlimit::classic_size(&v);
+                vals.push(v);
+            }
+        }
+        NElemKind::Last => {
+            *mem += memlimit::classic_size(&v);
+            vals.push(v);
+            if vals.len() > n {
+                *mem -= memlimit::classic_size(&vals[vals.len() - 1 - n]);
+                if vals.len() >= 2 * n {
+                    vals.drain(..vals.len() - n);
+                }
+            }
+        }
+        NElemKind::Max | NElemKind::Min => {
+            if is_null(&v) {
+                return Ok(());
+            }
+            if !crate::order::is_sortable(&v) {
+                return Err(Fallback::Defer);
+            }
+            let size = memlimit::classic_size(&v);
+            if let Some(out) = classic_min_max_step(vals, v, n, matches!(kind, NElemKind::Max)) {
+                *mem += size;
+                if let Some(out) = out {
+                    *mem -= memlimit::classic_size(&out);
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 /// `$maxN` / `$minN` as SBE keeps them (`aggMinMaxN`, 8.2.11): a heap of at
@@ -1577,13 +1740,14 @@ pub(crate) fn finalize(id: Bson, accs: Vec<(&str, Acc)>) -> R<Document> {
                 is_median,
                 ps,
                 values,
+                ..
             } => {
                 out.insert(
                     field.to_string(),
                     percentile_finalize(is_median, ps, values),
                 );
             }
-            Acc::NElem { kind, n, vals } => {
+            Acc::NElem { kind, n, vals, .. } => {
                 out.insert(
                     field.to_string(),
                     Bson::Array(nelem_result(kind, n.unwrap_or(0), vals)?),
@@ -1594,6 +1758,7 @@ pub(crate) fn finalize(id: Bson, accs: Vec<(&str, Acc)>) -> R<Document> {
                 n,
                 dirs,
                 items,
+                ..
             } => {
                 out.insert(
                     field.to_string(),
@@ -1635,13 +1800,15 @@ pub(crate) fn finalize_window_value(acc: Acc) -> R<Bson> {
             is_median,
             ps,
             values,
+            ..
         } => percentile_finalize(is_median, ps, values),
-        Acc::NElem { kind, n, vals } => Bson::Array(nelem_result(kind, n.unwrap_or(0), vals)?),
+        Acc::NElem { kind, n, vals, .. } => Bson::Array(nelem_result(kind, n.unwrap_or(0), vals)?),
         Acc::TopN {
             kind,
             n,
             dirs,
             items,
+            ..
         } => topn_result(kind, n.unwrap_or(1), &dirs, items)?,
     })
 }
@@ -2235,8 +2402,7 @@ fn expression_object_check(expr: &Bson) -> R<()> {
 
 /// mongod's estimate of one accumulator's memory: the classic engine's
 /// accumulator object and the values it holds, or SBE's values. Only what
-/// mongod is known to keep is counted -- a `$firstN` keeps n values there,
-/// not every one this state collects -- so the estimate errs low, never
+/// mongod is known to keep is counted, so the estimate errs low, never
 /// refusing a `$group` mongod runs.
 /// [`acc_memory`] as the classic engine counts it, whatever engine is
 /// running (`$setWindowFields` always runs in the classic engine).
@@ -2260,6 +2426,9 @@ fn acc_memory(acc: &Acc) -> usize {
         Acc::First(Some(v)) | Acc::Last(Some(v)) => {
             memlimit::classic_size(v.as_ref().unwrap_or(&Bson::Null)) - memlimit::VALUE
         }
+        // The values a classic N accumulator keeps (RM-502).
+        Acc::NElem { mem, .. } | Acc::TopN { mem, .. } if !sbe => *mem,
+        Acc::Percentile { buffered, .. } => tdigest_buffer(*buffered),
         Acc::MergeObjects(d) if sbe && !d.is_empty() => {
             memlimit::sbe_size(&Bson::Null) + memlimit::bson_len(d)
         }
@@ -2267,11 +2436,31 @@ fn acc_memory(acc: &Acc) -> usize {
     }
 }
 
+/// `sizeof(AccumulatorPercentile) + sizeof(TDigest)`, before its buffer.
+const PERCENTILE_BASE: usize = 256;
+
+/// `TDigest::flushBuffer` runs when the buffer reaches `bufferCoeff * delta`
+/// (3 x `internalQueryTdigestDelta`'s 2000).
+const TDIGEST_BUFFER: usize = 6000;
+
+/// What mongod's t-digest counts for its buffer of `buffered` values
+/// (`TDigest::memUsageBytes`, 8.2): the vector's capacity in doubles, which
+/// doubles from one as values arrive (macOS 8.2.11: one value 8 bytes, three
+/// 32) and keeps the capacity it reached when a flush empties it. The
+/// centroids a flush makes are not counted yet (RM-613).
+fn tdigest_buffer(buffered: usize) -> usize {
+    if buffered == 0 {
+        return 0;
+    }
+    buffered.min(TDIGEST_BUFFER).next_power_of_two() * std::mem::size_of::<f64>()
+}
+
 /// What mongod's classic accumulator object counts for itself (its
 /// `sizeof`), read from 8.2.11's `explain` (`maxAccumulatorMemoryUsageBytes`
-/// over five documents, 2026-10-26) on the Linux x86-64 build; `$sum` is
-/// the build's own ([`memlimit::LAYOUT`]: 184 on macOS arm64). The values a
-/// `$push`, `$addToSet`, `$min` or `$max` holds are counted on top.
+/// over five documents, 2026-10-26) on the Linux x86-64 build; `$sum` and
+/// the N accumulators are the build's own ([`memlimit::LAYOUT`]). The values
+/// a `$push`, `$addToSet`, `$min`, `$max`, N accumulator or `$median` holds
+/// are counted on top.
 fn classic_base(acc: &Acc) -> usize {
     match acc {
         Acc::Sum(_) | Acc::Count(_) => memlimit::LAYOUT.sum,
@@ -2283,14 +2472,13 @@ fn classic_base(acc: &Acc) -> usize {
         Acc::AddToSet(_) | Acc::SetUnion(_) => memlimit::ACCUMULATOR_BASE,
         Acc::StdDev { .. } => 128,
         Acc::NElem { kind, .. } => match kind {
-            NElemKind::First | NElemKind::Last => 200,
-            NElemKind::Max | NElemKind::Min => 168,
+            NElemKind::First | NElemKind::Last => memlimit::LAYOUT.first_last_n,
+            NElemKind::Max | NElemKind::Min => memlimit::LAYOUT.min_max_n,
         },
-        Acc::TopN { kind, .. } => match kind {
-            TopNKind::Top | TopNKind::Bottom => 608,
-            TopNKind::TopN | TopNKind::BottomN => 640,
-        },
-        Acc::Percentile { .. } => 320,
+        Acc::TopN { .. } => memlimit::LAYOUT.top_bottom_n,
+        // `AccumulatorPercentile` and its `TDigest`, whose members are the
+        // same size on both platforms (macOS 8.2.11: 256 over no value).
+        Acc::Percentile { .. } => PERCENTILE_BASE,
         Acc::Script => 0,
     }
 }
@@ -3865,6 +4053,131 @@ mod tests {
         assert_eq!(out[0].get("_id"), Some(&Bson::String("a".into())));
         assert_eq!(out[1].get("_id"), Some(&Bson::String("b".into())));
         assert_eq!(out[2].get("_id"), Some(&Bson::String("c".into())));
+    }
+}
+
+#[cfg(test)]
+mod held_value_memory_tests {
+    //! RM-502: a classic N accumulator keeps -- and counts -- what mongod's
+    //! keeps, and its kept values finalize to the answer every value gives.
+    use super::*;
+    use bson::doc;
+
+    fn values() -> Vec<Bson> {
+        // Ties (1, 1.0, 1L), nulls, and values that displace kept ones.
+        let mut v = vec![
+            Bson::Int32(1),
+            Bson::Null,
+            Bson::Double(1.0),
+            Bson::Int64(1),
+            Bson::String("b".repeat(30)),
+            Bson::Int32(7),
+        ];
+        for i in 0..40 {
+            v.push(Bson::Int32((i * 37) % 11));
+            v.push(Bson::String(format!("s{}", (i * 13) % 7)));
+        }
+        v
+    }
+
+    #[test]
+    fn kept_values_finalize_as_every_value_does() {
+        let _classic = crate::sbe::enter(false);
+        for kind in [
+            NElemKind::First,
+            NElemKind::Last,
+            NElemKind::Max,
+            NElemKind::Min,
+        ] {
+            for n in [1, 2, 3, 5, 200] {
+                let (mut kept, mut mem) = (Vec::new(), 0);
+                for v in values() {
+                    classic_nelem_take(kind, n, &mut kept, &mut mem, v).unwrap();
+                }
+                let held = nelem_result(kind, n, kept).unwrap();
+                assert_eq!(held, nelem_result(kind, n, values()).unwrap());
+                // What it counts is exactly the values it answers with.
+                let sizes: usize = held.iter().map(memlimit::classic_size).sum();
+                assert_eq!(mem, sizes, "n = {n}");
+            }
+        }
+    }
+
+    #[test]
+    fn kept_items_finalize_as_every_item_does() {
+        let _classic = crate::sbe::enter(false);
+        let items: Vec<Keyed> = values()
+            .into_iter()
+            .enumerate()
+            .map(|(i, v)| (vec![Bson::Int32((i as i32 * 7) % 5)], v))
+            .collect();
+        let dirs = [true];
+        for kind in [
+            TopNKind::Top,
+            TopNKind::Bottom,
+            TopNKind::TopN,
+            TopNKind::BottomN,
+        ] {
+            for n in [1, 3, 200] {
+                let n = if matches!(kind, TopNKind::Top | TopNKind::Bottom) {
+                    1
+                } else {
+                    n
+                };
+                let (mut kept, mut mem) = (Vec::new(), 0);
+                for item in items.clone() {
+                    classic_topn_take(kind, n, &dirs, &mut kept, &mut mem, item).unwrap();
+                }
+                let sizes: usize = kept.iter().map(|k| topn_item_size(k, &dirs)).sum();
+                assert_eq!(mem, sizes);
+                assert_eq!(
+                    topn_result(kind, n, &dirs, kept).unwrap(),
+                    topn_result(kind, n, &dirs, items.clone()).unwrap()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn an_item_counts_its_key_output_and_pair() {
+        // An int key (16) and a 1000-byte string (1040), and the pair's two
+        // `Value`s: macOS 8.2.11's `$topN` grows by 1088 an item.
+        let item = (vec![Bson::Int32(1)], Bson::String("x".repeat(1000)));
+        assert_eq!(topn_item_size(&item, &[true]), 1088);
+        // Two sort fields make the key an array of them.
+        let item = (vec![Bson::Int32(1), Bson::Int32(2)], Bson::Null);
+        let key = Bson::Array(vec![Bson::Int32(1), Bson::Int32(2)]);
+        assert_eq!(
+            topn_item_size(&item, &[true, false]),
+            memlimit::classic_size(&key) + 16 + 32
+        );
+    }
+
+    #[test]
+    fn the_tdigest_buffer_doubles_and_keeps_its_capacity() {
+        // macOS 8.2.11: 256 over no value, 264 over one, 288 over three, 320
+        // over five, 768 over forty.
+        let sizes: Vec<usize> = [0, 1, 3, 5, 40]
+            .into_iter()
+            .map(|n| PERCENTILE_BASE + tdigest_buffer(n))
+            .collect();
+        assert_eq!(sizes, vec![256, 264, 288, 320, 768]);
+        // Past the flush at 6000 the buffer keeps the 8192 it grew to.
+        assert_eq!(tdigest_buffer(6000), 8192 * 8);
+        assert_eq!(tdigest_buffer(50_000), 8192 * 8);
+    }
+
+    #[test]
+    fn a_classic_group_counts_what_its_n_accumulators_keep() {
+        let _classic = crate::sbe::enter(false);
+        let mut acc = new_acc("$lastN").unwrap();
+        let arg = Bson::Document(doc! {"n": 2, "input": "$s"});
+        for i in 0..50 {
+            let d = doc! {"s": "x".repeat(i)};
+            apply_acc(&mut acc, &arg, &d, &Document::new()).unwrap();
+        }
+        // The last two strings, 48 and 49 bytes: n + 40 each.
+        assert_eq!(acc_memory(&acc), memlimit::LAYOUT.first_last_n + 88 + 89);
     }
 }
 
