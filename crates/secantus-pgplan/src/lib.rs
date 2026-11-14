@@ -5331,7 +5331,7 @@ fn plan_with_params_parsed(
     }
     // Without a runner the subqueries this produces are refused, which is
     // the point: an `UPDATE ... FROM` must never plan as a plain UPDATE.
-    rewrite_dml_from(&mut node, lookup)?;
+    rewrite_dml_from(&mut node, lookup, params)?;
     plan_node(
         node.node
             .ok_or_else(|| Error::Parse("empty statement".into()))?,
@@ -5509,7 +5509,7 @@ fn plan_query_node(
     cancel::check()?;
     inline_dml_ctes(&mut node, lookup, &mut params, run)?;
     cancel::check()?;
-    rewrite_dml_from(&mut node, lookup)?;
+    rewrite_dml_from(&mut node, lookup, &params)?;
     cancel::check()?;
     materialize_recursive_ctes(&mut node, lookup, &mut params, run)?;
     cancel::check()?;
@@ -22150,7 +22150,7 @@ fn materialize_dml_ctes(
         attach_outer_ctes(&mut dml, &earlier, with.recursive);
         let mut p = params.clone();
         inline_dml_ctes(&mut dml, lookup, &mut p, run)?;
-        rewrite_dml_from(&mut dml, lookup)?;
+        rewrite_dml_from(&mut dml, lookup, &p)?;
         resolve_sublinks(&mut dml, lookup, &mut p, run)?;
         let plan = plan_node(
             dml.node
@@ -22620,6 +22620,7 @@ fn resolve_sublinks_scoped(
             for c in clauses {
                 resolve_sublinks_in_expr(c, lookup, params, run, Outer::Names(&outer))?;
             }
+            let outer = with_joined_returning(outer, &u.returning_list);
             for t in &mut u.returning_list {
                 if let Some(N::ResTarget(rt)) = t.node.as_mut() {
                     resolve_sublinks_in_target(rt, lookup, params, run, Outer::Names(&outer))?;
@@ -22633,6 +22634,7 @@ fn resolve_sublinks_scoped(
             if let Some(w) = d.where_clause.as_deref_mut() {
                 resolve_sublinks_in_expr(w, lookup, params, run, Outer::Names(&outer))?;
             }
+            let outer = with_joined_returning(outer, &d.returning_list);
             for n in &mut d.returning_list {
                 if let Some(N::ResTarget(rt)) = n.node.as_mut() {
                     resolve_sublinks_in_target(rt, lookup, params, run, Outer::Names(&outer))?;
@@ -22708,6 +22710,37 @@ fn resolve_sublinks_scoped(
     }
 }
 
+/// A write's outer columns for its RETURNING subqueries, with the hidden
+/// joined-row entries `split_joined_returning` added to the list: a
+/// subquery's outer reference to a FROM (USING) item reads one of them, as
+/// a column of the returned row (RP-686).
+fn with_joined_returning(
+    mut outer: Vec<String>,
+    returning: &[pg_query::protobuf::Node],
+) -> Vec<String> {
+    outer.extend(returning.iter().filter_map(|t| match t.node.as_ref() {
+        Some(N::ResTarget(rt)) if rt.name.starts_with(JOINED_RETURNING) => Some(rt.name.clone()),
+        _ => None,
+    }));
+    outer
+}
+
+/// The name of a write's `n`th hidden RETURNING entry: [`JOINED_RETURNING`],
+/// `n`, then the type of the FROM-item column it reads, after a unit
+/// separator, so a subquery's outer read of the entry is typed as the
+/// column (`correlated::outer_ref_type`). The FROM items are gone from the
+/// statement by the time its subqueries are planned.
+fn joined_returning_name(n: usize, ty: Option<&str>) -> String {
+    format!("{JOINED_RETURNING}{n}\u{1f}{}", ty.unwrap_or_default())
+}
+
+/// The type a hidden RETURNING entry's name carries
+/// (`joined_returning_name`).
+pub(crate) fn joined_returning_type(name: &str) -> Option<&str> {
+    let (_, ty) = name.strip_prefix(JOINED_RETURNING)?.split_once('\u{1f}')?;
+    (!ty.is_empty()).then_some(ty)
+}
+
 /// The name prefix of an UPDATE ... FROM's hidden RETURNING entries: a FROM
 /// item's value, read from the joined row before the write
 /// (`split_joined_returning`). The unit separator keeps it out of any name a
@@ -22756,6 +22789,7 @@ fn range_var_visible_name(r: &pg_query::protobuf::RangeVar) -> String {
 fn rewrite_dml_from(
     node: &mut pg_query::protobuf::Node,
     lookup: &dyn Fn(&str) -> Option<TableDef>,
+    params: &[Bson],
 ) -> Result<()> {
     // `location`: the expression the subquery stands for, so an error about
     // the value (a SET's 42804) points where PostgreSQL's does.
@@ -22824,9 +22858,26 @@ fn rewrite_dml_from(
         from_only: &[String],
         lookup: &dyn Fn(&str) -> Option<TableDef>,
     ) -> bool {
-        let Some(body @ N::SelectStmt(s)) = sl.subselect.as_deref().and_then(|q| q.node.as_ref())
-        else {
+        let Some(body) = sl.subselect.as_deref().and_then(|q| q.node.as_ref()) else {
             return false;
+        };
+        let Some(scope) = sublink_scope(body, lookup) else {
+            return false;
+        };
+        body.nodes().into_iter().any(|(n, _, _, _)| {
+            matches!(n, pg_query::NodeRef::ColumnRef(c)
+                if outer_from_ref(c, names, from_only, &scope))
+        })
+    }
+    /// The names a subquery binds itself, which hide a FROM item's: its
+    /// relations' names (`correlated::inner_names`) and the columns of the
+    /// relations and derived tables inside it. `None` when it is no SELECT.
+    fn sublink_scope(
+        body: &N,
+        lookup: &dyn Fn(&str) -> Option<TableDef>,
+    ) -> Option<(Vec<String>, Vec<String>)> {
+        let N::SelectStmt(s) = body else {
+            return None;
         };
         let inner = correlated::inner_names(s);
         let mut inner_columns: Vec<String> = Vec::new();
@@ -22848,26 +22899,60 @@ fn rewrite_dml_from(
                 _ => {}
             }
         }
-        body.nodes().into_iter().any(|(n, _, _, _)| {
-            let pg_query::NodeRef::ColumnRef(c) = n else {
-                return false;
-            };
-            let parts: Vec<&str> = c
-                .fields
-                .iter()
-                .filter_map(|f| match f.node.as_ref() {
-                    Some(N::String(s)) => Some(s.sval.as_str()),
-                    _ => None,
-                })
-                .collect();
-            match parts.as_slice() {
-                [one] => {
-                    from_only.iter().any(|c| c == one) && !inner_columns.iter().any(|c| c == one)
-                }
-                [.., q, _] => names.iter().any(|x| x == q) && !inner.iter().any(|x| x == q),
-                _ => false,
+        Some((inner, inner_columns))
+    }
+    /// Whether a column reference inside a subquery is an outer reference
+    /// to the write's target (`target`: its names, then its columns): a
+    /// qualifier the subquery does not bind that names it, or a bare name
+    /// the subquery's own tables do not have that is a target column or
+    /// the target's whole row.
+    fn outer_target_ref(
+        c: &pg_query::protobuf::ColumnRef,
+        (target_names, target_columns): (&[String], &[String]),
+        (inner, inner_columns): &(Vec<String>, Vec<String>),
+    ) -> bool {
+        let parts: Vec<&str> = c
+            .fields
+            .iter()
+            .filter_map(|f| match f.node.as_ref() {
+                Some(N::String(s)) => Some(s.sval.as_str()),
+                _ => None,
+            })
+            .collect();
+        match parts.as_slice() {
+            [one] => {
+                !inner_columns.iter().any(|c| c == one)
+                    && (target_columns.iter().any(|c| c == one)
+                        || (target_names.iter().any(|t| t == one)
+                            && !inner.iter().any(|x| x == one)))
             }
-        })
+            [.., q, _] => target_names.iter().any(|t| t == q) && !inner.iter().any(|x| x == q),
+            _ => false,
+        }
+    }
+    /// Whether a column reference inside a subquery is an outer reference
+    /// to a FROM item: a qualifier the subquery does not bind that names
+    /// one, or a bare name only a FROM item has and the subquery's own
+    /// tables do not.
+    fn outer_from_ref(
+        c: &pg_query::protobuf::ColumnRef,
+        names: &[String],
+        from_only: &[String],
+        (inner, inner_columns): &(Vec<String>, Vec<String>),
+    ) -> bool {
+        let parts: Vec<&str> = c
+            .fields
+            .iter()
+            .filter_map(|f| match f.node.as_ref() {
+                Some(N::String(s)) => Some(s.sval.as_str()),
+                _ => None,
+            })
+            .collect();
+        match parts.as_slice() {
+            [one] => from_only.iter().any(|c| c == one) && !inner_columns.iter().any(|c| c == one),
+            [.., q, _] => names.iter().any(|x| x == q) && !inner.iter().any(|x| x == q),
+            _ => false,
+        }
     }
     /// Whether `n` reads a FROM item: a reference qualified by one of its
     /// names, or an unqualified one only a FROM item has -- in `n` itself or
@@ -22936,13 +23021,16 @@ fn rewrite_dml_from(
     /// evaluates over the OLD row before any write; the item then reads that
     /// entry. `None` when the item cannot be split so: a subquery inside it
     /// reads a FROM item, or it reads one through `*`.
+    #[allow(clippy::too_many_arguments)]
     fn split_joined_returning(
         rt: &mut pg_query::protobuf::ResTarget,
         from: &[pg_query::protobuf::Node],
         cond: Option<&pg_query::protobuf::Node>,
         from_only: &[String],
+        target: (&[String], &[String]),
         joined: &mut Vec<pg_query::protobuf::Node>,
         lookup: &dyn Fn(&str) -> Option<TableDef>,
+        params: &[Bson],
     ) -> Result<Option<()>> {
         /// The names the FROM items are addressed by: an aliased table by
         /// its alias alone, so `t.a` in `UPDATE t ... FROM t s` is the
@@ -22969,17 +23057,27 @@ fn rewrite_dml_from(
         let Some(v) = rt.val.as_deref_mut() else {
             return Ok(None);
         };
+        let is_star = |c: &pg_query::protobuf::ColumnRef| {
+            c.fields.iter().any(|f| matches!(f.node, Some(N::AStar(_))))
+        };
         let mut splittable = true;
         let mut probe = v.clone();
         walk_expr(&mut probe, &mut |node| {
             match node.node.as_ref() {
-                Some(N::SubLink(sl)) if sublink_reads_from_items(sl, names, from_only, lookup) => {
-                    splittable = false;
+                // A subquery's outer reference to a FROM item's whole row.
+                Some(N::SubLink(sl)) => {
+                    let Some(body) = sl.subselect.as_deref().and_then(|q| q.node.as_ref()) else {
+                        return Ok(());
+                    };
+                    let Some(scope) = sublink_scope(body, lookup) else {
+                        return Ok(());
+                    };
+                    splittable &= !body.nodes().into_iter().any(|(n, _, _, _)| {
+                        matches!(n, pg_query::NodeRef::ColumnRef(c)
+                            if is_star(c) && outer_from_ref(c, names, from_only, &scope))
+                    });
                 }
-                Some(N::ColumnRef(c))
-                    if c.fields.iter().any(|f| matches!(f.node, Some(N::AStar(_))))
-                        && names_from_item(c, names, from_only) =>
-                {
+                Some(N::ColumnRef(c)) if is_star(c) && names_from_item(c, names, from_only) => {
                     splittable = false;
                 }
                 _ => {}
@@ -22995,31 +23093,45 @@ fn rewrite_dml_from(
             };
             rt.name = name;
         }
-        walk_expr(v, &mut |node| {
-            let Some(N::ColumnRef(c)) = node.node.as_ref() else {
-                return Ok(());
+        // A FROM-item reference's type, for its hidden entry.
+        let ref_type = |c: &pg_query::protobuf::ColumnRef| {
+            let parts: Vec<String> = c
+                .fields
+                .iter()
+                .filter_map(|f| match f.node.as_ref() {
+                    Some(N::String(s)) => Some(s.sval.clone()),
+                    _ => None,
+                })
+                .collect();
+            let depth = correlated::push_outer_from(from);
+            let ty = correlated::outer_ref_type(&parts, lookup, params);
+            correlated::pop_outer_from(depth);
+            ty
+        };
+        // `c` as the read of a hidden entry, the entry being `whole` (`c`
+        // itself, a FROM-item reference, when `None`) evaluated over the
+        // joined row before the write. A reference's entry carries its type,
+        // for a subquery's outer read of it.
+        let mut hide = |c: &mut pg_query::protobuf::ColumnRef,
+                        whole: Option<pg_query::protobuf::Node>| {
+            let (read, ty) = match whole {
+                Some(w) => (w, None),
+                None => (
+                    pg_query::protobuf::Node {
+                        node: Some(N::ColumnRef(c.clone())),
+                    },
+                    ref_type(c),
+                ),
             };
-            if !names_from_item(c, names, from_only) {
-                return Ok(());
-            }
-            let hidden = format!("{JOINED_RETURNING}{}", joined.len());
-            let at = c.location;
-            let read = std::mem::replace(
-                node,
-                pg_query::protobuf::Node {
-                    node: Some(N::ColumnRef(pg_query::protobuf::ColumnRef {
-                        fields: vec![pg_query::protobuf::Node {
-                            node: Some(N::String(pg_query::protobuf::String {
-                                sval: hidden.clone(),
-                            })),
-                        }],
-                        location: at,
-                    })),
-                },
-            );
+            let at = if c.location >= 0 {
+                c.location
+            } else {
+                expr_location(&read).unwrap_or(-1)
+            };
+            let hidden = joined_returning_name(joined.len(), ty.as_deref());
             joined.push(pg_query::protobuf::Node {
                 node: Some(N::ResTarget(Box::new(pg_query::protobuf::ResTarget {
-                    name: hidden,
+                    name: hidden.clone(),
                     val: Some(Box::new(sublink(
                         SubLinkType::ExprSublink,
                         select(read, from, cond, true),
@@ -23029,9 +23141,142 @@ fn rewrite_dml_from(
                     ..Default::default()
                 }))),
             });
+            *c = pg_query::protobuf::ColumnRef {
+                fields: vec![pg_query::protobuf::Node {
+                    node: Some(N::String(pg_query::protobuf::String { sval: hidden })),
+                }],
+                location: at,
+            };
+        };
+        walk_expr(v, &mut |node| {
+            let reads_target = match node.node.as_mut() {
+                Some(N::ColumnRef(c)) => {
+                    if names_from_item(c, names, from_only) {
+                        hide(c, None);
+                    }
+                    return Ok(());
+                }
+                Some(N::SubLink(sl)) => {
+                    let Some(body) = sl.subselect.as_deref().and_then(|q| q.node.as_ref()) else {
+                        return Ok(());
+                    };
+                    let Some(scope) = sublink_scope(body, lookup) else {
+                        return Ok(());
+                    };
+                    let mut reads_from = false;
+                    let mut reads_target = false;
+                    for (n, _, _, _) in body.nodes() {
+                        if let pg_query::NodeRef::ColumnRef(c) = n {
+                            reads_from |= outer_from_ref(c, names, from_only, &scope);
+                            reads_target |= outer_target_ref(c, target, &scope);
+                        }
+                    }
+                    if !reads_from {
+                        return Ok(());
+                    }
+                    // The tested expression of `x IN (...)` is this row's.
+                    if let Some(t) = sl.testexpr.as_deref().and_then(|t| t.node.as_ref()) {
+                        reads_target |= t.nodes().into_iter().any(|(n, _, _, _)| {
+                            matches!(n, pg_query::NodeRef::ColumnRef(c)
+                                if !names_from_item(c, names, from_only))
+                        });
+                    }
+                    reads_target
+                }
+                _ => return Ok(()),
+            };
+            // A subquery over the FROM items alone is the joined row's
+            // value, read whole before the write: PostgreSQL runs it with
+            // the joined tuple as its outer row, under the statement's
+            // snapshot, so a table it reads is as it was before the write
+            // (RP-686).
+            if !reads_target {
+                let read = std::mem::replace(
+                    node,
+                    pg_query::protobuf::Node {
+                        node: Some(N::ColumnRef(pg_query::protobuf::ColumnRef {
+                            location: -1,
+                            ..Default::default()
+                        })),
+                    },
+                );
+                if let Some(N::ColumnRef(c)) = node.node.as_mut() {
+                    hide(c, Some(read));
+                }
+                return Ok(());
+            }
+            // One that reads the target's NEW row too runs once per
+            // returned row, after the write, with each of its outer
+            // references to a FROM item read from the joined row: the
+            // value the target row joined with, however the write changed
+            // the join condition's columns.
+            let Some(N::SubLink(sl)) = node.node.as_mut() else {
+                return Ok(());
+            };
+            let Some(body) = sl.subselect.as_deref_mut().and_then(|q| q.node.as_mut()) else {
+                return Ok(());
+            };
+            let Some(scope) = sublink_scope(body, lookup) else {
+                return Ok(());
+            };
+            let mut refs: Vec<*mut pg_query::protobuf::ColumnRef> = Vec::new();
+            // SAFETY: the pointers `nodes_mut` hands out point into `body`,
+            // which outlives both loops. The first only reads; each
+            // reference the second replaces frees its own name parts alone,
+            // and no reference holds another.
+            unsafe {
+                for (n, _, _) in body.nodes_mut() {
+                    if let pg_query::NodeMut::ColumnRef(c) = n {
+                        if outer_from_ref(&*c, names, from_only, &scope) {
+                            refs.push(c);
+                        }
+                    }
+                }
+                for c in refs {
+                    hide(&mut *c, None);
+                }
+            }
             Ok(())
         })?;
         Ok(Some(()))
+    }
+    /// A subquery's `x.*` and `(x).a` over a FROM item, at any depth, as the
+    /// item's columns (`correlated::expand_outer_stars`,
+    /// `outer_field_selections`), expanded while the FROM items are still
+    /// the statement's: the qualified columns are what a RETURNING item's
+    /// FROM-item reads are found by, and read from the joined row
+    /// (RP-686). Each subquery is expanded with the levels around it.
+    fn expand_sublink_outer_rows(
+        node: &mut pg_query::protobuf::Node,
+        lookup: &dyn Fn(&str) -> Option<TableDef>,
+        params: &[Bson],
+    ) -> Result<()> {
+        walk_expr(node, &mut |n| {
+            let Some(N::SubLink(sl)) = n.node.as_mut() else {
+                return Ok(());
+            };
+            let Some(N::SelectStmt(s)) = sl.subselect.as_deref_mut().and_then(|q| q.node.as_mut())
+            else {
+                return Ok(());
+            };
+            correlated::outer_field_selections(s, lookup, params);
+            correlated::expand_outer_stars(s, lookup);
+            let depth = correlated::push_outer_from(&s.from_clause);
+            let mut out = Ok(());
+            for e in s
+                .target_list
+                .iter_mut()
+                .chain(s.where_clause.as_deref_mut())
+                .chain(s.having_clause.as_deref_mut())
+            {
+                out = expand_sublink_outer_rows(e, lookup, params);
+                if out.is_err() {
+                    break;
+                }
+            }
+            correlated::pop_outer_from(depth);
+            out
+        })
     }
     /// A RETURNING item that reads a FROM item reads the joined row through
     /// `split_joined_returning` where it can. Otherwise it becomes the correlated subquery that finds the
@@ -23047,9 +23292,11 @@ fn rewrite_dml_from(
         names: &[String],
         from_only: &[String],
         target_names: &[String],
+        target_columns: &[String],
         changed: &[String],
         joined: &mut Vec<pg_query::protobuf::Node>,
         lookup: &dyn Fn(&str) -> Option<TableDef>,
+        params: &[Bson],
     ) -> Result<()> {
         let mut cond_reads_changed = false;
         if let Some(c) = cond {
@@ -23079,11 +23326,28 @@ fn rewrite_dml_from(
             let Some(N::ResTarget(rt)) = n.node.as_mut() else {
                 continue;
             };
-            let Some(v) = rt.val.as_deref() else { continue };
+            let Some(v) = rt.val.as_deref_mut() else {
+                continue;
+            };
+            let depth = correlated::push_outer_from(from);
+            let expanded = expand_sublink_outer_rows(v, lookup, params);
+            correlated::pop_outer_from(depth);
+            expanded?;
             if !reads_from_items(v, names, from_only, lookup)? {
                 continue;
             }
-            if split_joined_returning(rt, from, cond, from_only, joined, lookup)?.is_some() {
+            if split_joined_returning(
+                rt,
+                from,
+                cond,
+                from_only,
+                (target_names, target_columns),
+                joined,
+                lookup,
+                params,
+            )?
+            .is_some()
+            {
                 continue;
             }
             let Some(v) = rt.val.as_deref() else { continue };
@@ -23250,9 +23514,11 @@ fn rewrite_dml_from(
                 &names,
                 &from_only,
                 &target_names,
+                &outer_columns(&u.relation, lookup),
                 &changed,
                 &mut joined,
                 lookup,
+                params,
             )?;
             u.returning_list.extend(joined);
             for t in &mut u.target_list {
@@ -23308,9 +23574,11 @@ fn rewrite_dml_from(
                 &names,
                 &from_only,
                 &target_names,
+                &outer_columns(&d.relation, lookup),
                 &[],
                 &mut joined,
                 lookup,
+                params,
             )?;
             d.returning_list.extend(joined);
             d.where_clause = Some(Box::new(sublink(

@@ -3000,29 +3000,6 @@ nothing. The gap tests are in `tests/backlog/test_rp_found_rp712.py`.
       Verify: tests/backlog/test_rp_found_rp712.py::test_literal_input_error_in_an_assignment_carries_its_query
       Backlog-ID: RP-753
 
-## Found while working RP-668 (2026-11-09)
-
-Measured on a private PostgreSQL 15.19 cluster with the `_SCOPE_SETUP` in
-`tests/backlog/test_rp_found_rp664.py`.
-
-- [ ] **A subquery in RETURNING that reads a FROM item is refused when the
-      join condition reads a column the UPDATE assigns.** `update t668 set
-      b = u668.v from u668 where t668.b < 0 and u668.k = 5 returning
-      t668.a, (select u668.v)` returns the joined row's `v` on PostgreSQL
-      15.19; here it is 0A000 `RETURNING a FROM item's column when the join
-      condition reads an updated column is not supported yet`. A FROM-item
-      reference outside a subquery is read from the joined row before the
-      write (`split_joined_returning`, `Update::joined`); one inside a
-      subquery still takes the old path, a correlated subquery that finds
-      the joining row again over the NEW row, refused when the new row may
-      no longer join. Reaching it means letting the subquery's outer
-      reference read a hidden `Update::joined` value, which the RETURNING
-      subquery resolver (`resolve_sublinks_in_target`, run before
-      `plan_update`) does not know. DELETE ... USING has the same remainder
-      (RP-938).
-      Verify: tests/backlog/test_rp_found_rp664.py::test_a_returning_subquery_over_a_from_item_when_the_join_reads_an_assigned_column
-      Backlog-ID: RP-686
-
 ## Found while working RP-686 (2026-11-14)
 
 Measured on a private PostgreSQL 15.19 cluster with the `_SCOPE_SETUP` in
@@ -3041,6 +3018,32 @@ Measured on a private PostgreSQL 15.19 cluster with the `_SCOPE_SETUP` in
       hidden `joined` value.
       Verify: tests/backlog/test_rp_found_rp664.py::test_a_delete_returning_subquery_reads_a_using_item_as_it_was_before_the_delete
       Backlog-ID: RP-938
+- [ ] **A correlated subquery in RETURNING reads the table after the
+      write.** `delete from t668 returning (select count(*) from t668 z
+      where z.a = t668.a)` is 1 per row on PostgreSQL 15.19, `update t668
+      set b = 100 returning (select z.b from t668 z where z.a = t668.a)`
+      returns each row's OLD `b`, and `insert into t668 values (9, 9)
+      returning (select count(*) from t668 z where z.a <= t668.a)` is 3:
+      RETURNING's subqueries run under the statement's snapshot, which
+      does not see the statement's own writes. Here they are 0, the new
+      `b` (100) and 4: a subquery correlated to the target row runs once
+      per returned row after the rows are written. (A subquery that reads
+      only an UPDATE's FROM or a DELETE's USING items is evaluated before
+      the write since RP-686, and reads the snapshot.)
+      Verify: tests/backlog/test_rp_found_rp664.py::test_a_returning_subquery_reads_the_statement_snapshot
+      Backlog-ID: RP-943
+- [ ] **An aggregate over outer references alone in a RETURNING subquery is
+      not refused.** `update t668 set a = 1 returning (select
+      array_agg(t668.b) from u668)` is 42803 `aggregate functions are not
+      allowed in RETURNING` on PostgreSQL 15.19 (an aggregate whose
+      arguments are all outer references belongs to the outer query level,
+      `check_agg_arguments`), as is the same over an UPDATE's FROM item
+      (`... from u668 where u668.k = t668.a returning (select max(u668.v)
+      from u668 z)`), a DELETE's and an INSERT's. Here the first returns
+      one array per row, the FROM-item one 21000, the DELETE and INSERT
+      ones a value per row.
+      Verify: tests/backlog/test_rp_found_rp664.py::test_an_outer_aggregate_in_a_returning_subquery_is_refused
+      Backlog-ID: RP-944
 
 ## Found while working RP-570 (2026-11-08)
 
