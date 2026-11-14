@@ -1,6 +1,7 @@
 """Gap tests of what was found while working RP-546 (a function over a
 table's row type depends on the table): RP-560 .. RP-568, and RP-858,
-found while working RP-564, and RP-893, found while working RP-561.
+found while working RP-564, RP-893, found while working RP-561, and
+RP-951, found while working RP-560.
 
 An answer is the rows, `"ok"` for a statement with none, or `(sqlstate,
 message, detail)` for an error. The expected answers were measured on a
@@ -42,10 +43,9 @@ def _refused(name: str, *lines: str) -> tuple[str, str, str]:
 # `findDependentObjects` reads `pg_depend` in its index order, which for
 # one referenced object is creation order: a view made before the table
 # whose foreign key references it is named first, and a cast made between
-# two functions over the row type falls between them. Here a table's
-# foreign keys always come before its views, and the casts after every
-# routine.
-@pytest.mark.backlog("RP-560")
+# two functions over the row type falls between them. A table's foreign
+# keys always came before its views, and the casts after every routine.
+@pytest.mark.backlog_fixed("RP-560")
 def test_drop_table_dependants_in_creation_order(dsn: str) -> None:
     with psycopg.connect(dsn, autocommit=True) as c:
         c.execute("drop table if exists o560b, o560a cascade")
@@ -74,6 +74,81 @@ def test_drop_table_dependants_in_creation_order(dsn: str) -> None:
             "cast from o560a to integer depends on type o560a",
             "function o560j(o560a) depends on type o560a",
         ),
+    ]
+
+
+# The rest of what RP-560 measured: a table's inheritance children, the
+# foreign keys referencing it and its views interleave by creation; a
+# routine over both `t` and `t[]` is named under `t`, its last place; and
+# DROP SCHEMA walks each member as DROP TABLE does, so a routine elsewhere
+# over a member's row type follows that member, and a foreign key between
+# two members is not named.
+@pytest.mark.backlog_fixed("RP-560")
+def test_drop_dependants_by_oid_in_more_shapes(dsn: str) -> None:
+    notices: list[tuple[str | None, str | None]] = []
+    with psycopg.connect(dsn, autocommit=True) as c:
+        c.execute("drop table if exists q560b, q560d, q560c, q560a cascade")
+        c.execute("drop table if exists r560 cascade")
+        c.execute("drop schema if exists s560 cascade")
+        c.execute("create table q560a (a int primary key)")
+        c.execute("create table q560b (b int references q560a)")
+        c.execute("create view q560v as select * from q560a")
+        c.execute("create table q560c (c int) inherits (q560a)")
+        c.execute("create table q560d (d int references q560a)")
+        c.execute("create table r560 (a int)")
+        c.execute("create function r560x(r560[]) returns int language sql as $$ select 1 $$")
+        c.execute("create function r560y(r560, r560[]) returns int language sql as $$ select 1 $$")
+        c.execute("create schema s560")
+        c.execute("create table s560.a (x int primary key)")
+        c.execute("create table s560.b (z int references s560.a)")
+        c.execute("create function s560g(s560.a) returns int language sql as $$ select 1 $$")
+        c.execute("create function s560.f(s560.a) returns int language sql as $$ select 1 $$")
+        try:
+            got = [
+                _run(c, "drop table q560a"),
+                _run(c, "drop table r560"),
+                _run(c, "drop schema s560"),
+            ]
+            c.add_notice_handler(
+                lambda d: notices.append((d.message_primary, d.message_detail)),
+            )
+            got.append(_run(c, "drop schema s560 cascade"))
+            got.append(list(notices))
+        finally:
+            c.execute("drop table if exists q560b, q560d, q560c, q560a cascade")
+            c.execute("drop table if exists r560 cascade")
+            c.execute("drop schema if exists s560 cascade")
+    assert got == [
+        _refused(
+            "q560a",
+            "constraint q560b_b_fkey on table q560b depends on table q560a",
+            "view q560v depends on table q560a",
+            "table q560c depends on table q560a",
+            "constraint q560d_d_fkey on table q560d depends on table q560a",
+        ),
+        _refused(
+            "r560",
+            "function r560x(r560[]) depends on type r560[]",
+            "function r560y(r560,r560[]) depends on type r560",
+        ),
+        (
+            "2BP01",
+            "cannot drop schema s560 because other objects depend on it",
+            "table s560.a depends on schema s560\n"
+            "function s560g(s560.a) depends on type s560.a\n"
+            "table s560.b depends on schema s560\n"
+            "function s560.f(s560.a) depends on schema s560",
+        ),
+        "ok",
+        [
+            (
+                "drop cascades to 4 other objects",
+                "drop cascades to table s560.a\n"
+                "drop cascades to function s560g(s560.a)\n"
+                "drop cascades to table s560.b\n"
+                "drop cascades to function s560.f(s560.a)",
+            )
+        ],
     ]
 
 
@@ -641,4 +716,52 @@ def test_row_type_dependants_through_nested_and_shared_views(dsn: str) -> None:
         ),
         "ok",
         [],
+    ]
+
+
+# `getObjectDescription` of a cast is `cast from %s to %s` over each type's
+# `format_type_be`, so a type in a schema off the search path is `s5.t`, in
+# a DROP's DETAIL and its CASCADE notice as in `pg_describe_object`. Here
+# the DETAIL names it `"t"` and the notice `"s5.t"`. Found while working
+# RP-560.
+@pytest.mark.backlog("RP-951")
+def test_cast_over_a_schema_type_described_as_format_type(dsn: str) -> None:
+    notices: list[tuple[str | None, str | None]] = []
+    with psycopg.connect(dsn, autocommit=True) as c:
+        c.execute("drop schema if exists s9c cascade")
+        c.execute("create schema s9c")
+        c.execute("create table s9c.t (a int)")
+        c.execute("create function c9c(s9c.t) returns int language sql as $$ select 1 $$")
+        c.execute("create cast (s9c.t as int) with function c9c(s9c.t)")
+        c.add_notice_handler(
+            lambda d: notices.append((d.message_primary, d.message_detail)),
+        )
+        try:
+            got = [
+                _run(c, "drop table s9c.t"),
+                _run(c, "drop function c9c(s9c.t)"),
+                _run(c, "drop table s9c.t cascade"),
+                list(notices),
+            ]
+        finally:
+            c.execute("drop schema if exists s9c cascade")
+            c.execute("drop function if exists c9c(s9c.t) cascade")
+    assert got == [
+        _refused(
+            "s9c.t",
+            "function c9c(s9c.t) depends on type s9c.t",
+            "cast from s9c.t to integer depends on type s9c.t",
+        ),
+        (
+            "2BP01",
+            "cannot drop function c9c(s9c.t) because other objects depend on it",
+            "cast from s9c.t to integer depends on function c9c(s9c.t)",
+        ),
+        "ok",
+        [
+            (
+                "drop cascades to 2 other objects",
+                "drop cascades to function c9c(s9c.t)\ndrop cascades to cast from s9c.t to integer",
+            )
+        ],
     ]

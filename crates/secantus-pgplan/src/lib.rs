@@ -13092,6 +13092,7 @@ fn foreign_key_of(
             _ => false,
         },
         comment: None,
+        oid: None,
     })
 }
 

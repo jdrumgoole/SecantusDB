@@ -23,10 +23,9 @@
 //! same way (RP-561).
 //!
 //! A routine's creation order is its oid, drawn from the oid counter as
-//! `ProcedureCreate` draws it, and an operator's, as `OperatorCreate` draws
-//! it: the two interleave by it. A cast's oid is derived from its types, not
-//! drawn, so the casts follow the routines rather than falling between
-//! them where PostgreSQL's creation order puts them.
+//! `ProcedureCreate` draws it, an operator's as `OperatorCreate` draws it,
+//! and a cast's as `CastCreate` does (RP-560): the three interleave by it.
+//! A cast made before casts drew oids follows them all.
 
 use super::*;
 
@@ -100,6 +99,14 @@ pub(crate) fn last_reached(lines: Vec<(String, String)>) -> Vec<(String, String)
         }
     }
     out
+}
+
+/// What [`PgHandler::row_type_dependents`] reaches from a type: a routine
+/// or operator (its place in the list it walks), or a cast `(key,
+/// description)`.
+enum Reached {
+    Routine(usize),
+    Cast(String, String),
 }
 
 /// `getObjectDescription` of a routine: `function`, a procedure's too, then
@@ -260,46 +267,64 @@ impl PgHandler {
 
         let mut out = RowTypeDependents::default();
         let functions = self.functions()?;
-        let mut implementing: Vec<(String, String, String)> = Vec::new();
         let groups = [
             (array.as_str(), array_oid, &array_text),
             (table, row_oid, &row_text),
         ];
+        // `findDependentObjects` reaches each type's dependants newest
+        // first, and the DETAIL reads what it recorded backwards: so each
+        // type's routines, operators and casts come out by oid, each
+        // routine followed by the casts it implements, and an object two
+        // places reach is left for `last_reached` to settle at its last
+        // place (a routine over `t` and `t[]` under `t`).
         for (on, on_oid, on_text) in groups {
-            for (_, is_operator, key, desc, types) in &routines {
-                let seen = if *is_operator {
-                    &mut out.operators
-                } else {
-                    &mut out.functions
-                };
-                if seen.contains(key) || !types.iter().any(|t| names(t, on, on_oid)) {
-                    continue;
-                }
-                seen.push(key.clone());
-                out.lines.push((desc.clone(), on_text.clone()));
-                if *is_operator {
-                    continue;
-                }
-                if let Some(f) = functions.iter().find(|f| f.key == *key) {
-                    for (cast, cast_desc) in self.casts_on_function(&f.name, &f.param_types) {
-                        implementing.push((cast, cast_desc, desc.clone()));
+            let mut reached: Vec<(i64, Reached)> = routines
+                .iter()
+                .enumerate()
+                .filter(|(_, (_, _, _, _, types))| types.iter().any(|t| names(t, on, on_oid)))
+                .map(|(i, (oid, ..))| (*oid, Reached::Routine(i)))
+                .collect();
+            if let Some(oid) = on_oid {
+                reached.extend(
+                    self.casts_on_type_by_oid(oid)
+                        .into_iter()
+                        .map(|(cast_oid, key, desc)| (cast_oid, Reached::Cast(key, desc))),
+                );
+            }
+            reached.sort_by_key(|(oid, _)| *oid);
+            for (_, what) in reached {
+                match what {
+                    Reached::Cast(key, desc) => {
+                        out.lines.push((desc, on_text.clone()));
+                        if !out.casts.contains(&key) {
+                            out.casts.push(key);
+                        }
+                    }
+                    Reached::Routine(i) => {
+                        let (_, is_operator, key, desc, _) = &routines[i];
+                        out.lines.push((desc.clone(), on_text.clone()));
+                        let seen = if *is_operator {
+                            &mut out.operators
+                        } else {
+                            &mut out.functions
+                        };
+                        if !seen.contains(key) {
+                            seen.push(key.clone());
+                        }
+                        if *is_operator {
+                            continue;
+                        }
+                        let Some(f) = functions.iter().find(|f| f.key == *key) else {
+                            continue;
+                        };
+                        for (cast, cast_desc) in self.casts_on_function(&f.name, &f.param_types) {
+                            out.lines.push((cast_desc, desc.clone()));
+                            if !out.casts.contains(&cast) {
+                                out.casts.push(cast);
+                            }
+                        }
                     }
                 }
-            }
-        }
-        for (oid, on_text) in [(array_oid, &array_text), (row_oid, &row_text)] {
-            let Some(oid) = oid else { continue };
-            for (key, desc) in self.casts_on_type(oid) {
-                if !out.casts.contains(&key) {
-                    out.lines.push((desc, on_text.clone()));
-                    out.casts.push(key);
-                }
-            }
-        }
-        for (key, desc, function) in implementing {
-            if !out.casts.contains(&key) {
-                out.lines.push((desc, function));
-                out.casts.push(key);
             }
         }
         for (oid, on_text) in [(array_oid, &array_text), (row_oid, &row_text)] {

@@ -2678,19 +2678,6 @@ and `fs(a int, c text)`.
 Measured on a private, freshly initdb'd PostgreSQL 15.19 cluster. The gap
 tests are in `tests/backlog/test_rp_found_rp546.py`.
 
-- [ ] **DROP TABLE names a table's dependants by kind, not in creation
-      order.** PostgreSQL 15.19's `findDependentObjects` reads `pg_depend`
-      in creation order, so a view made before the table whose foreign key
-      references it is named first (`view o560v depends on table o560a`,
-      then the constraint), and a cast made between two functions over the
-      row type falls between them. Here the foreign keys always come before
-      the views (`drop table` and its CASCADE notice), and since RP-546 the
-      casts follow every routine: a cast's oid is derived from its types, not
-      drawn from the oid counter as `CastCreate` draws it, so its creation
-      order is not kept. `DROP SCHEMA ... CASCADE` names a routine over a
-      member's row type in the same order as here, not PostgreSQL's.
-      Backlog-ID: RP-560
-      Verify: tests/backlog/test_rp_found_rp546.py::test_drop_table_dependants_in_creation_order
 - [ ] **DROP TYPE of a table's row type with a routine over it names the
       routines.** PostgreSQL 15.19 answers `drop type r562` with 2BP01
       `cannot drop type r562 because table r562 requires it` whatever else
@@ -2705,6 +2692,22 @@ tests are in `tests/backlog/test_rp_found_rp546.py`.
       `pg_describe_object` of a routine shares that text.
       Backlog-ID: RP-567
       Verify: tests/backlog/test_rp_found_rp546.py::test_regprocedure_quotes_as_format_procedure
+
+## Found while working RP-560 (2026-11-14)
+
+Measured on a private PostgreSQL 15.19 cluster. The gap test is in
+`tests/backlog/test_rp_found_rp546.py`.
+
+- [ ] **A cast over a type in another schema is described by the type's
+      bare or quoted key.** `getObjectDescription` of a cast is `cast from
+      %s to %s` over each type's `format_type_be`: a table `s9c.t` off the
+      search path gives `cast from s9c.t to integer` on PostgreSQL 15.19, in
+      DROP TABLE's and DROP FUNCTION's DETAIL and in the CASCADE notice, as
+      `pg_describe_object` already answers here. The DETAIL here names it
+      `cast from "t" to integer` and the notice `cast from "s9c.t" to
+      integer` (`display_cast_type` in `casts.rs`).
+      Verify: tests/backlog/test_rp_found_rp546.py::test_cast_over_a_schema_type_described_as_format_type
+      Backlog-ID: RP-951
 
 ## Found while working RP-527 (2026-11-08)
 

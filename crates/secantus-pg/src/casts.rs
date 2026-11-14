@@ -312,7 +312,9 @@ impl PgHandler {
         cast.source_oid = source_oid;
         cast.target_oid = target_oid;
         let key = cast_key(source_oid, target_oid);
-        cast.oid = Self::index_oid(&format!("cast:{key}"));
+        // `CastCreate` draws the cast's oid from the one counter, so its
+        // place in creation order among what names its types (RP-560).
+        cast.oid = self.mint_global_oids(1)?;
         let mut doc = bson::doc! {
             "_id": &key,
             "source": &cast.source,
@@ -368,38 +370,44 @@ impl PgHandler {
     }
 
     /// The user casts that name type `oid`, as `from X to Y` for a
-    /// dependency message.
+    /// dependency message, in creation order.
     pub(crate) fn casts_on_type(&self, oid: i64) -> Vec<(String, String)> {
-        self.user_casts()
-            .into_iter()
-            .filter(|c| c.source_oid == oid || c.target_oid == oid)
-            .map(|c| {
-                (
-                    cast_key(c.source_oid, c.target_oid),
-                    format!(
-                        "cast from {} to {}",
-                        self.display_cast_type(&c.source),
-                        self.display_cast_type(&c.target)
-                    ),
-                )
-            })
-            .collect()
+        Self::without_oids(self.casts_on_type_by_oid(oid))
     }
 
-    /// The user casts implemented by function `name(args)`.
+    /// [`Self::casts_on_type`] with each cast's oid first.
+    pub(crate) fn casts_on_type_by_oid(&self, oid: i64) -> Vec<(i64, String, String)> {
+        self.cast_entries(|c| c.source_oid == oid || c.target_oid == oid)
+    }
+
+    /// The user casts implemented by function `name(args)`, in creation
+    /// order.
     pub(crate) fn casts_on_function(&self, name: &str, args: &[String]) -> Vec<(String, String)> {
+        Self::without_oids(self.casts_on_function_by_oid(name, args))
+    }
+
+    /// [`Self::casts_on_function`] with each cast's oid first.
+    fn casts_on_function_by_oid(&self, name: &str, args: &[String]) -> Vec<(i64, String, String)> {
         let same = |a: &str, b: &str| type_oid(a).is_some() && type_oid(a) == type_oid(b);
-        self.user_casts()
-            .into_iter()
-            .filter(|c| {
-                c.function.as_ref().is_some_and(|(n, a)| {
-                    n == name
-                        && a.len() == args.len()
-                        && a.iter().zip(args).all(|(x, y)| same(x, y))
-                })
+        self.cast_entries(|c| {
+            c.function.as_ref().is_some_and(|(n, a)| {
+                n == name && a.len() == args.len() && a.iter().zip(args).all(|(x, y)| same(x, y))
             })
+        })
+    }
+
+    /// `(oid, catalog key, description)` of each user cast `keep` accepts,
+    /// by oid: the order `CastCreate` drew them in (RP-560). A cast made
+    /// before casts drew oids carries one derived from its types, far above
+    /// the counter's, and sorts last.
+    fn cast_entries(&self, keep: impl Fn(&UserCast) -> bool) -> Vec<(i64, String, String)> {
+        let mut found: Vec<(i64, String, String)> = self
+            .user_casts()
+            .into_iter()
+            .filter(|c| keep(c))
             .map(|c| {
                 (
+                    c.oid,
                     cast_key(c.source_oid, c.target_oid),
                     format!(
                         "cast from {} to {}",
@@ -408,7 +416,13 @@ impl PgHandler {
                     ),
                 )
             })
-            .collect()
+            .collect();
+        found.sort();
+        found
+    }
+
+    fn without_oids(entries: Vec<(i64, String, String)>) -> Vec<(String, String)> {
+        entries.into_iter().map(|(_, k, d)| (k, d)).collect()
     }
 
     pub(crate) fn drop_cast_key(&self, key: &str) -> PgWireResult<()> {
@@ -576,12 +590,12 @@ impl PgHandler {
 
     /// The user operators implemented by function `name(args)`:
     /// `DefineOperator` records a dependency on the operator's function
-    /// (RP-893). `(catalog key, description)`, in creation order.
-    pub(crate) fn operators_on_function(
+    /// (RP-893). `(oid, catalog key, description)`, in creation order.
+    fn operators_on_function_by_oid(
         &self,
         name: &str,
         args: &[String],
-    ) -> Vec<(String, String)> {
+    ) -> Vec<(i64, String, String)> {
         let same = |a: &str, b: &str| match (type_oid(a), type_oid(b)) {
             (Some(x), Some(y)) => x == y,
             _ => a.eq_ignore_ascii_case(b),
@@ -607,29 +621,26 @@ impl PgHandler {
             })
             .collect();
         found.sort();
-        found.into_iter().map(|(_, k, desc)| (k, desc)).collect()
+        found
     }
 
-    /// `DROP FUNCTION`: the casts and operators it implements depend on it.
-    /// A cast's oid is derived from its types rather than drawn, so the
-    /// casts are listed ahead of the operators rather than among them in
-    /// creation order.
+    /// `DROP FUNCTION`: the casts and operators it implements depend on it,
+    /// named together in creation order, by the oids `CastCreate` and
+    /// `OperatorCreate` drew (RP-560).
     pub(crate) fn drop_function_casts(
         &self,
         f: &crate::UserFunction,
         cascade: bool,
     ) -> PgWireResult<()> {
-        let casts = self.casts_on_function(&f.name, &f.param_types);
-        let operators = self.operators_on_function(&f.name, &f.param_types);
+        let casts = self.casts_on_function_by_oid(&f.name, &f.param_types);
+        let operators = self.operators_on_function_by_oid(&f.name, &f.param_types);
         if casts.is_empty() && operators.is_empty() {
             return Ok(());
         }
         let sig = self.routine_object_name(f);
-        let descs: Vec<String> = casts
-            .iter()
-            .chain(&operators)
-            .map(|(_, c)| c.clone())
-            .collect();
+        let mut both: Vec<&(i64, String, String)> = casts.iter().chain(&operators).collect();
+        both.sort_by_key(|(oid, ..)| *oid);
+        let descs: Vec<String> = both.into_iter().map(|(_, _, c)| c.clone()).collect();
         if !cascade {
             let lines = descs
                 .iter()
@@ -641,10 +652,10 @@ impl PgHandler {
             ));
         }
         self.cascade_notice(&descs);
-        for (key, _) in &casts {
+        for (_, key, _) in &casts {
             self.drop_cast_key(key)?;
         }
-        for (key, _) in &operators {
+        for (_, key, _) in &operators {
             self.delete_type_doc(crate::catalog_objects::OPERATOR_COLLECTION, key)?;
         }
         Ok(())
