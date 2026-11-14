@@ -17353,25 +17353,6 @@ impl PgHandler {
         Ok(names)
     }
 
-    /// [`Self::all_indexes`] by table name: every stored index but `_id_`,
-    /// with no table's definition decoded.
-    fn all_index_docs(&self) -> PgWireResult<Vec<(String, Document)>> {
-        let mut out = Vec::new();
-        for table in self.table_names()? {
-            let indexes = self
-                .storage
-                .list_indexes_shared(self.db(), &table)
-                .map_err(|e| Self::storage_err("could not list the indexes", e))?;
-            for ix in indexes.iter() {
-                if ix.get_str("name") == Ok("_id_") {
-                    continue;
-                }
-                out.push((table.clone(), ix.clone()));
-            }
-        }
-        Ok(out)
-    }
-
     fn all_indexes(&self) -> PgWireResult<Vec<(TableDef, Document)>> {
         let mut out = Vec::new();
         for def in self.shared_table_defs()?.iter() {
@@ -17398,12 +17379,33 @@ impl PgHandler {
         if self.lookup(&key).is_some() || self.views()?.iter().any(|(n, _)| *n == key) {
             return Ok(true);
         }
-        if self.composites()?.iter().any(|(n, _, _)| *n == key) {
+        if self.composite_keyed(&key)? {
             return Ok(true);
         }
-        Ok(self.all_index_docs()?.iter().any(|(t, ix)| {
-            ix.get_str("name") == Ok(name) && secantus_pgplan::schemas::split_key(t).0 == schema
-        }))
+        Ok(self
+            .index_owners(name)?
+            .iter()
+            .any(|t| secantus_pgplan::schemas::split_key(t).0 == schema))
+    }
+
+    /// Is there a composite type (a table's row type included) whose
+    /// relation key is `key`? The catalog is `_id`-sorted and keyed so, as
+    /// `pg_type` is found by name through its index: a listing of every
+    /// row type made each check grow with the schema (RP-928).
+    fn composite_keyed(&self, key: &str) -> PgWireResult<bool> {
+        let docs = self.type_catalog_docs(Self::COMPOSITE_COLLECTION)?;
+        let id = |d: &Document| d.get_str("_id").unwrap_or_default().to_string();
+        let at = docs.partition_point(|d| id(d).as_str() < key);
+        Ok(docs.get(at).is_some_and(|d| id(d) == key))
+    }
+
+    /// The tables holding a stored index named `name` (bare), from the
+    /// storage's index-name lookup rather than every table's index list
+    /// (RP-928).
+    fn index_owners(&self, name: &str) -> PgWireResult<Vec<String>> {
+        self.storage
+            .index_owners(self.db(), name)
+            .map_err(|e| Self::storage_err("could not list the indexes", e))
     }
 
     /// The index a DROP INDEX names: `schema.name` (the planner keys a
@@ -17441,13 +17443,10 @@ impl PgHandler {
         if self.lookup(name).is_some() || self.views()?.iter().any(|(n, _)| n == name) {
             return Ok(true);
         }
-        if self.composites()?.iter().any(|(n, _, _)| n == name) {
+        if self.composite_keyed(name)? {
             return Ok(true);
         }
-        Ok(self
-            .all_index_docs()?
-            .iter()
-            .any(|(_, ix)| ix.get_str("name") == Ok(name)))
+        Ok(!self.index_owners(name)?.is_empty())
     }
 
     /// The field an EXPRESSION index is keyed on in storage. No row has it,
@@ -42318,10 +42317,13 @@ impl PgHandler {
                     .collect();
                 if self.lookup(&def.name).is_some()
                     || self.views()?.iter().any(|(n, _)| *n == def.name)
-                    || self
-                        .all_index_docs()?
-                        .iter()
-                        .any(|(_, ix)| ix.get_str("name") == Ok(def.name.as_str()))
+                    || {
+                        // An index is named bare in its table's schema.
+                        let (schema, bare) = secantus_pgplan::schemas::split_key(&def.name);
+                        self.index_owners(&bare)?
+                            .iter()
+                            .any(|t| secantus_pgplan::schemas::split_key(t).0 == schema)
+                    }
                 {
                     // `IF NOT EXISTS` is a NO-OP on an existing table, tag and
                     // all -- PostgreSQL only adds a notice. Raising here made
@@ -42342,7 +42344,7 @@ impl PgHandler {
                 // range it is 42710 with the hint. A built-in type is in
                 // `pg_catalog`, so `create table int4 (...)` or `tid` is a
                 // new type in `public` and succeeds (15.19).
-                if self.composites()?.iter().any(|(n, _, _)| *n == def.name) {
+                if self.composite_keyed(&def.name)? {
                     return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
                         "ERROR".into(),
                         "42P07".into(),

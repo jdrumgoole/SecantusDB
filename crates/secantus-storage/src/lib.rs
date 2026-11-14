@@ -5439,6 +5439,10 @@ pub struct Storage {
     desc_cache: std::sync::RwLock<CatalogCache<Vec<IndexDesc>>>,
     options_cache: std::sync::RwLock<CatalogCache<Document>>,
     list_cache: std::sync::RwLock<CatalogCache<Vec<Document>>>,
+    /// Which collections of one database hold an index of each name: the
+    /// relation-name lookup [`Self::index_owners`] answers from, kept
+    /// current from the index catalog's change log (RP-928).
+    index_names: Mutex<Option<IndexNameIndex>>,
     /// Dirty budget for one multi-document transaction: ~15% of the cache
     /// (0.75 x WT's ~20% dirty-eviction trigger, the shape of mongod's
     /// `TransactionTooLargeForCache` threshold). A transaction's dirty
@@ -8275,6 +8279,7 @@ impl Storage {
             desc_cache: std::sync::RwLock::new(HashMap::new()),
             options_cache: std::sync::RwLock::new(HashMap::new()),
             list_cache: std::sync::RwLock::new(HashMap::new()),
+            index_names: Mutex::new(None),
             txn_dirty_limit: (parse_cache_bytes(config) as f64 * 0.20 * 0.75) as u64,
             cache_bytes: parse_cache_bytes(config),
             oplog_shards_created,
@@ -16189,6 +16194,126 @@ impl Storage {
             cache.insert(key, (read_at, Arc::clone(&list)));
         }
         Ok(list)
+    }
+
+    /// The collections of `db` holding a stored index named `name` (never
+    /// `_id_`), name-sorted. PostgreSQL finds a clashing relation by name
+    /// through `pg_class`'s name index (`get_relname_relid`); listing every
+    /// collection's indexes instead made each `CREATE TABLE` grow with the
+    /// schema (RP-928). The index is kept as PostgreSQL keeps a syscache:
+    /// each change of the index catalog is numbered and logged, a lookup
+    /// re-reads only the collections changed since it last read, and one
+    /// that fell behind the log is rebuilt from the catalog. Inside a
+    /// transaction the catalog is read directly, so its own DDL is seen.
+    pub fn index_owners(&self, db: &str, name: &str) -> Result<Vec<String>> {
+        let session = self.op_session()?;
+        let Some(gen) = self.planner_shared_gen(&session) else {
+            let built = self.build_index_names(&session, db, 0)?;
+            return Ok(built.owners(name));
+        };
+        let mut guard = self.index_names.lock().unwrap_or_else(|e| e.into_inner());
+        // Numbered before the reads: a change numbered after it may be one
+        // they missed, and is re-read next time.
+        let now = INDEX_CATALOG_SERIAL.load(Ordering::SeqCst);
+        let current = match guard.take() {
+            Some(idx) if idx.db == db => self.refresh_index_names(idx, now)?,
+            _ => None,
+        };
+        let idx = match current {
+            Some(idx) => idx,
+            None => self.build_index_names(&session, db, now)?,
+        };
+        let out = idx.owners(name);
+        if planner_settled() == Some(gen) {
+            *guard = Some(idx);
+        }
+        Ok(out)
+    }
+
+    /// Every stored index of `db`, read from the catalog table.
+    fn build_index_names(&self, session: &Session, db: &str, now: u64) -> Result<IndexNameIndex> {
+        let mut idx = IndexNameIndex {
+            db: db.to_string(),
+            read_at: now,
+            ..IndexNameIndex::default()
+        };
+        let cur = session.open_cursor(IDX_TABLE, None)?;
+        cur.set_key_sss(db, "", "");
+        let mut more = match cur.search_near() {
+            Ok(cmp) => cmp >= 0 || cur.next()?,
+            Err(e) if e.is_not_found() => false,
+            Err(e) => return Err(e.into()),
+        };
+        let mut rows: HashMap<String, Vec<String>> = HashMap::new();
+        while more {
+            let (d, c, name) = cur.get_key_sss()?;
+            if d != db {
+                break;
+            }
+            rows.entry(c).or_default().push(name);
+            more = cur.next()?;
+        }
+        for (coll, names) in rows {
+            if collection_registered(session, db, &coll)? {
+                idx.set(coll, names);
+            }
+        }
+        // A collection whose index catalog changed while it is not yet
+        // registered (created inside a transaction still open) commits
+        // with no further change: it is re-read until it is.
+        let changes = index_catalog_changes()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        for (d, c) in changes.keys() {
+            if d == db && !idx.by_coll.contains_key(c) && !collection_registered(session, db, c)? {
+                idx.unregistered.insert(c.clone());
+            }
+        }
+        Ok(idx)
+    }
+
+    /// `idx` brought up to `now` from the change log, or `None` when it
+    /// fell behind the log or a reset (the caller rebuilds).
+    fn refresh_index_names(&self, mut idx: IndexNameIndex, now: u64) -> Result<Option<IndexNameIndex>> {
+        if INDEX_CATALOG_RESET.load(Ordering::SeqCst) > idx.read_at {
+            return Ok(None);
+        }
+        let mut changed: BTreeSet<String> = std::mem::take(&mut idx.unregistered);
+        if now != idx.read_at {
+            // Every change numbered up to `now` is logged once the change
+            // map's lock is held: each is numbered and logged under it.
+            let _numbering = index_catalog_changes()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let log = index_catalog_log().lock().unwrap_or_else(|e| e.into_inner());
+            if log.0 > idx.read_at {
+                return Ok(None);
+            }
+            for (n, d, c) in log.1.iter().rev() {
+                if *n <= idx.read_at {
+                    break;
+                }
+                if *d == idx.db {
+                    changed.insert(c.clone());
+                }
+            }
+        }
+        let session = self.op_session()?;
+        for coll in changed {
+            let names: Vec<String> = self
+                .list_indexes_shared(&idx.db, &coll)?
+                .iter()
+                .filter_map(|ix| ix.get_str("name").ok())
+                .filter(|n| *n != ID_INDEX_NAME)
+                .map(str::to_string)
+                .collect();
+            if !collection_registered(&session, &idx.db, &coll)? {
+                idx.unregistered.insert(coll.clone());
+            }
+            idx.set(coll, names);
+        }
+        idx.read_at = now;
+        Ok(Some(idx))
     }
 
     /// [`Self::list_indexes`], read from the catalog.
@@ -26145,11 +26270,72 @@ fn index_catalog_changes() -> &'static Mutex<HashMap<(String, String), u64>> {
     CHANGES.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+/// The most recent changes of the index catalog, in number order, for
+/// [`Storage::index_owners`], with the number of the last one forgotten.
+type IndexCatalogLog = (u64, std::collections::VecDeque<(u64, String, String)>);
+
+fn index_catalog_log() -> &'static Mutex<IndexCatalogLog> {
+    static LOG: OnceLock<Mutex<IndexCatalogLog>> = OnceLock::new();
+    LOG.get_or_init(|| Mutex::new((0, std::collections::VecDeque::new())))
+}
+
+/// More logged changes than this are forgotten, oldest first: a lookup that
+/// fell further behind rebuilds.
+const INDEX_CATALOG_LOG_MAX: usize = 4096;
+
+/// [`Storage::index_owners`]'s index of one database's index names.
+#[derive(Default)]
+struct IndexNameIndex {
+    db: String,
+    /// The change number it is current to.
+    read_at: u64,
+    by_name: HashMap<String, BTreeSet<String>>,
+    by_coll: HashMap<String, Vec<String>>,
+    /// Collections re-read on every lookup until registered.
+    unregistered: BTreeSet<String>,
+}
+
+impl IndexNameIndex {
+    fn set(&mut self, coll: String, names: Vec<String>) {
+        for old in self.by_coll.remove(&coll).unwrap_or_default() {
+            if let Some(owners) = self.by_name.get_mut(&old) {
+                owners.remove(&coll);
+                if owners.is_empty() {
+                    self.by_name.remove(&old);
+                }
+            }
+        }
+        if names.is_empty() {
+            return;
+        }
+        for n in &names {
+            self.by_name.entry(n.clone()).or_default().insert(coll.clone());
+        }
+        self.by_coll.insert(coll, names);
+    }
+
+    fn owners(&self, name: &str) -> Vec<String> {
+        self.by_name
+            .get(name)
+            .map(|s| s.iter().cloned().collect())
+            .unwrap_or_default()
+    }
+}
+
 fn note_index_catalog_change(db: &str, coll: &str) {
     let mut changes = index_catalog_changes()
         .lock()
         .unwrap_or_else(|e| e.into_inner());
     let n = INDEX_CATALOG_SERIAL.fetch_add(1, Ordering::SeqCst) + 1;
+    {
+        let mut log = index_catalog_log().lock().unwrap_or_else(|e| e.into_inner());
+        log.1.push_back((n, db.to_string(), coll.to_string()));
+        while log.1.len() > INDEX_CATALOG_LOG_MAX {
+            if let Some((old, _, _)) = log.1.pop_front() {
+                log.0 = old;
+            }
+        }
+    }
     if changes.len() >= INDEX_CATALOG_CHANGES_MAX {
         changes.clear();
         INDEX_CATALOG_RESET.fetch_max(n, Ordering::SeqCst);

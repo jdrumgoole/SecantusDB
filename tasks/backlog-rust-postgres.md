@@ -1151,16 +1151,18 @@ one beside it.
 ## Found by a profile (2026-11-13)
 
 - [ ] **OPEN — `CREATE TABLE` still grows with the number of tables.**
-      A debug `secantusd-pg` takes about 1.2 ms with no other table and
-      5.9 ms with 800 (2026-11-13, after RP-921); PostgreSQL 15.19 takes
-      0.41 ms and 0.37 ms (private cluster), finding a clashing relation
-      by name through `pg_class`'s name index (`get_relname_relid`). The
-      statement's checks that the name is free list every composite type
-      (`composites()`) and every table's stored indexes
-      (`all_index_docs`, every table name read from the raw catalog while
-      the statement runs), so each grows with the schema. The faithful fix
-      is a lookup by name in a relation-name index, as `pg_class` keeps
-      one.
+      A debug `secantusd-pg` takes about 1.4 ms with no other table and
+      4.2 ms with 800 (2026-11-14); PostgreSQL 15.19 takes 0.41 ms and
+      0.37 ms (private cluster). Its checks that the name is free no
+      longer grow (2026-11-14: a composite found by its `_id` in the
+      sorted catalog, an index through `Storage::index_owners`, which is
+      kept current from the index catalog's change log; under 1% of the
+      statement's samples at 800). All that is left is the republication
+      at the statement's start after the previous DDL
+      (`install_user_types`, two thirds of the samples at 800: the
+      composite and table catalogs compared, `relations`,
+      `publish_tableoids`) -- RP-911's remainder, so this item closes
+      with RP-911's per-relation publication.
       Verify: tests/backlog/test_rp_catalog_latency.py::test_create_table_costs_the_same_at_800_tables_within_a_tenth
       Backlog-ID: RP-928
 
