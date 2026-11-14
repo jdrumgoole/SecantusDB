@@ -22990,7 +22990,14 @@ impl PgHandler {
                                     .is_some_and(|k| !schema_free(k))
                         });
                         let alone = pinned.as_ref().is_some_and(|(_, k)| schema_free(*k));
-                        (None, if another && !alone { None } else { pinned.clone() })
+                        (
+                            None,
+                            if another && !alone {
+                                None
+                            } else {
+                                pinned.clone()
+                            },
+                        )
                     }
                 },
                 (None, None) => (None, None),
