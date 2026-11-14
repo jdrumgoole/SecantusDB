@@ -55,9 +55,11 @@ TWO_DIMENSIONAL_TEXT = [
 ]
 
 
-@pytest.mark.backlog("RP-602")
+@pytest.mark.backlog_fixed("RP-602")
 @pytest.mark.parametrize("query", TWO_DIMENSIONAL_TEXT)
 def test_two_dimensional_vector_text(query: str, dsn: str) -> None:
+    """A two-dimensional vector printed as `{1,2}` where `int2vectorout`
+    refuses it with 42804."""
     with psycopg.connect(dsn, autocommit=True) as c:
         assert pg_answer(c, query) == ("err", "42804", "array is not a valid int2vector")
 

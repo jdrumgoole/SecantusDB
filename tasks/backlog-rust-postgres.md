@@ -3058,21 +3058,6 @@ Measured on a private PostgreSQL 15.19 cluster. The gap tests are in
       Verify: tests/backlog/test_rp_found_rp658.py::test_composite_attribute_attndims
       Backlog-ID: RP-663
 
-## Found while working RP-575 (2026-11-08)
-
-Measured on PostgreSQL 15.19; none of it needs DDL. The gap tests are in
-`tests/backlog/test_rp_found_rp575.py`.
-
-- [ ] **An `int2vector` of two dimensions prints as text.** `array_agg`
-      over vectors is `array_agg(anyarray)`, typed `int2vector` and holding
-      two dimensions, which `int2vectorout` refuses (`check_valid_int2vector`):
-      on PostgreSQL 15.19 `array_agg(v)::text` and `concat(array_agg(v))`
-      are 42804 `array is not a valid int2vector`. Here they are `{1,2}`.
-      The value sent as a column already is 42804 in text (RP-575); a cast
-      or `concat` prints it through `typeout`, which cannot fail.
-      Verify: tests/backlog/test_rp_found_rp575.py::test_two_dimensional_vector_text
-      Backlog-ID: RP-602
-
 ## Found while working RP-612 (2026-11-14)
 
 Measured on PostgreSQL 15.19; none of it needs DDL. The gap tests are in

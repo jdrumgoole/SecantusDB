@@ -34605,7 +34605,7 @@ fn plan_const_target(
                                 .iter()
                                 .map(|a| const_value(a, params))
                                 .collect::<Result<Vec<_>>>()?,
-                        ),
+                        )?,
                     )?,
                 };
                 if let Some(result) = typed_scalar_call(f, &name, &args) {
@@ -38943,6 +38943,7 @@ pub fn apply_column_expr(expr: &ColumnExpr, value: Bson, tz: &TimeZoneSetting) -
                     && matches!(prev, Some("int2vector" | "oidvector"))
                 {
                     if let Bson::Array(items) = &v {
+                        vectors::check_valid(&v, prev.unwrap_or_default())?;
                         let text: Vec<String> = items.iter().map(value_text).collect();
                         v = Bson::String(text.join(" "));
                         prev = Some(target);
@@ -43497,7 +43498,7 @@ fn typed_scalar_call(
 /// bpchar-to-text cast in front of a text function trims it -- except for
 /// the functions that take the value as it is (`octet_length` counts the
 /// blanks, `concat` / `format` print them).
-fn bpchar_args(f: &pg_query::protobuf::FuncCall, name: &str, args: Vec<Bson>) -> Vec<Bson> {
+fn bpchar_args(f: &pg_query::protobuf::FuncCall, name: &str, args: Vec<Bson>) -> Result<Vec<Bson>> {
     const PADDED: &[&str] = &["octet_length", "concat", "concat_ws", "format"];
     // The `"any"` functions print an argument by its type's OUTPUT function
     // (`concat(true)` is `t`), and `quote_literal` / `quote_nullable` are
@@ -43512,9 +43513,12 @@ fn bpchar_args(f: &pg_query::protobuf::FuncCall, name: &str, args: Vec<Bson>) ->
             .zip(f.args.iter())
             .map(|(v, node)| {
                 if v == Bson::Null {
-                    return v;
+                    return Ok(v);
                 }
                 let ty = static_type(node, &v);
+                // `int2vectorout` / `oidvectorout` refuse a value of two
+                // dimensions (`concat(array_agg(v))`, RP-602).
+                vectors::check_valid(&v, &ty)?;
                 // A string is its own text, except an inet, whose output drops
                 // a full host mask the stored text keeps, and a date or
                 // timestamp, written in the session DateStyle (RP-894).
@@ -43530,24 +43534,25 @@ fn bpchar_args(f: &pg_query::protobuf::FuncCall, name: &str, args: Vec<Bson>) ->
                             | "timestamp with time zone"
                     )
                 {
-                    return v;
+                    return Ok(v);
                 }
-                if CAST.contains(&name) {
+                Ok(if CAST.contains(&name) {
                     Bson::String(typeout::cast_text(&v, &ty))
                 } else if typeout::needs_type(&ty) || matches!(v, Bson::Boolean(_)) {
                     Bson::String(typeout::output_text(&v, &ty))
                 } else {
                     v
-                }
+                })
             })
-            .collect()
+            .collect::<Result<_>>()?
     } else {
         args
     };
     if PADDED.contains(&name) {
-        return args;
+        return Ok(args);
     }
-    args.into_iter()
+    Ok(args
+        .into_iter()
         .zip(f.args.iter())
         .map(|(v, node)| {
             if is_bpchar_type(&static_type(node, &v)) {
@@ -43556,7 +43561,7 @@ fn bpchar_args(f: &pg_query::protobuf::FuncCall, name: &str, args: Vec<Bson>) ->
                 v
             }
         })
-        .collect()
+        .collect())
 }
 
 /// A datetime (or JSON-constructor) function's result type from its call,
@@ -47900,7 +47905,8 @@ fn const_value_node(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result<
                 }
                 // `int2vector` / `oidvector` (pg_index.indkey) print their
                 // elements space-separated, with no braces: `2 3`.
-                ("int2vector" | "oidvector", Bson::Array(items)) => {
+                (ty @ ("int2vector" | "oidvector"), Bson::Array(items)) => {
+                    vectors::check_valid(&value, ty)?;
                     Some(items.iter().map(value_text).collect::<Vec<_>>().join(" "))
                 }
                 _ => None,
@@ -48821,7 +48827,7 @@ fn const_value_node(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result<
                     .iter()
                     .map(|a| const_value(a, params))
                     .collect::<Result<Vec<_>>>()?;
-                let args = bpchar_args(f, &name, args);
+                let args = bpchar_args(f, &name, args)?;
                 let args = vector_element_args(f, &name, args)?;
                 if let Some(result) = typed_scalar_call(f, &name, &args) {
                     return result;
@@ -48833,7 +48839,7 @@ fn const_value_node(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result<
                     .iter()
                     .map(|a| const_value(a, params))
                     .collect::<Result<Vec<_>>>()?;
-                return regexp_replace(&bpchar_args(f, &name, args));
+                return regexp_replace(&bpchar_args(f, &name, args)?);
             }
         }
     }
