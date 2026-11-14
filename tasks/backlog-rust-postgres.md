@@ -3786,26 +3786,6 @@ varchar(3), w dv689, c char(3))`, `d689` an `int` with `check (value > 0)`.
       Verify: tests/backlog/test_rp_found_rp689.py::test_a_column_a_record_field_shares_is_ambiguous
       Backlog-ID: RP-838
 
-## Found while working RP-846 (2026-11-11)
-
-Measured on a private, freshly initdb'd PostgreSQL 15.19 cluster with the
-`_SETUP` in `tests/backlog/test_rp_found_rp846.py`, the session's TimeZone
-`UTC`. Both answers come from `information_schema.columns.column_default`
-and `pg_get_expr(adbin, adrelid)`, which this server renders by one
-function, `default_expression`, from the folded value rather than from a
-stored expression tree.
-
-- [ ] **A DEFAULT written as an explicit cast with a modifier drops the
-      modifier.** `e char(4) default 'ab'::char(4)` and `e2 varchar(5)
-      default 'ab'::varchar(5)` are `'ab'::character(4)` and
-      `'ab'::character varying(5)` on PostgreSQL 15.19: the explicit cast
-      is a length coercion marked COERCE_EXPLICIT_CAST, which ruleutils
-      prints with its modifier. Here they are `'ab'::bpchar` and
-      `'ab'::character varying`, as an implicit coercion of a bare literal
-      prints: the explicit cast's modifier is not kept with the folded
-      value.
-      Verify: tests/backlog/test_rp_found_rp846.py::test_an_explicit_cast_default_keeps_its_modifier
-      Backlog-ID: RP-863
 
 ## Found while working RP-845 (2026-11-11)
 

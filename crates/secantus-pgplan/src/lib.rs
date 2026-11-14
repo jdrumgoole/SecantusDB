@@ -10097,6 +10097,28 @@ fn ruleutils_default(node: &pg_query::protobuf::Node) -> Option<String> {
             _ => None,
         }
     }
+    // An explicit cast of a literal to a sized `char(n)` / `varchar(n)` is a
+    // length coercion marked COERCE_EXPLICIT_CAST, which ruleutils prints
+    // with its modifier: `'ab'::character(4)` (RP-863).
+    if let Some(N::TypeCast(tc)) = node.node.as_ref() {
+        let tn = tc.type_name.as_ref()?;
+        let base = type_name_of(tn);
+        let typmod = declared_typmod(tn);
+        if let Some(N::AConst(c)) = tc.arg.as_deref().and_then(|a| a.node.as_ref()) {
+            if let Some(Val::Sval(s)) = c.val.as_ref() {
+                if tn.array_bounds.is_empty()
+                    && typmod > 4
+                    && matches!(base.as_str(), "bpchar" | "varchar")
+                {
+                    return Some(format!(
+                        "'{}'::{}",
+                        s.sval.replace('\'', "''"),
+                        crate::scalar::format_type_text(&base, Some(typmod))
+                    ));
+                }
+            }
+        }
+    }
     if matches!(
         node.node.as_ref(),
         Some(N::AConst(_)) | Some(N::TypeCast(_))
