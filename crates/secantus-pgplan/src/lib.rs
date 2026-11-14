@@ -50490,8 +50490,10 @@ fn composite_compare_is_per_row(e: &AExpr, def: &TableDef, params: &[Bson]) -> R
 
 /// Whether a declared type is a row type (`type_is_rowtype`): `record`, or a
 /// composite -- a table's, a view's or a `CREATE TYPE ... AS` one.
+/// A domain over one is a row type too: `type_is_rowtype` looks through it.
 fn type_is_rowtype(t: &str) -> bool {
-    t.eq_ignore_ascii_case("record") || user_composite(t).is_some()
+    let t = domain_base(t.to_string());
+    t.eq_ignore_ascii_case("record") || user_composite(&t).is_some()
 }
 
 /// `Unsupported` for an array column under `=`, `<>`, `<`, `<=`, `>`,

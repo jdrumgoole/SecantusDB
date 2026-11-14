@@ -3113,16 +3113,6 @@ Measured on a private PostgreSQL 15.19 cluster with `fs(a int, c text)`,
 `create domain dfs as fs` and `fd(k dfs)` holding `row(null, null)`,
 `row(1, null)`, `row(1, 'a')` and `null`.
 
-- [ ] **A domain over a table's row type is refused.** `create domain dfs
-      as fs` over a table `fs` is 42704 `type "fs" does not exist` here;
-      PostgreSQL 15.19 creates it (a domain may be over a composite since
-      PostgreSQL 11), and a column of it holds rows: `select count(*) from
-      fd where k is not null` is 1 and `... where k is null` 2, the null
-      test reading the fields because `type_is_rowtype` is true of the
-      domain. RP-534's per-row null test asks `type_is_rowtype` of the
-      column's declared type, so it needs to see through the domain then.
-      Backlog-ID: RP-538
-      Verify: tests/backlog/test_rp_found_rp534.py::test_domain_over_a_table_row_type
 
 ## Found while working RP-500 (2026-11-07)
 
