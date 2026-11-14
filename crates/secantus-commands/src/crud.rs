@@ -318,8 +318,6 @@ fn write_command_problem(doc: &Document, command: &str, in_sequence: bool) -> Op
         "encryptionInformation",
         "bypassEmptyTsReplacement",
         "collectionUUID",
-        "originalQuery",
-        "originalCollation",
         "rawData",
     ];
     const DELETE_FIELDS: &[&str] = &[
@@ -333,8 +331,6 @@ fn write_command_problem(doc: &Document, command: &str, in_sequence: bool) -> Op
         "runtimeConstants",
         "legacyRuntimeConstants",
         "collectionUUID",
-        "originalQuery",
-        "originalCollation",
         "rawData",
     ];
     const DELETE_STATEMENT_FIELDS: &[&str] = &["q", "limit", "collation", "hint", "sampleId"];
@@ -2041,9 +2037,6 @@ fn update_command_problem(doc: &Document) -> Option<CommandError> {
         "runtimeConstants",
         "legacyRuntimeConstants",
         "collectionUUID",
-        "originalQuery",
-        "originalCollation",
-        "sampleId",
         "rawData",
     ];
     const STATEMENT_FIELDS: &[&str] = &[

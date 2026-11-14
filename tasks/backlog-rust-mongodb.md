@@ -2604,17 +2604,6 @@ A `readConcern` with an `atClusterTime` older than the oldest timestamp is
       Backlog-ID: RM-170
       Verify: tests/backlog/test_rm_found_2026_10_16.py::test_include_query_stats_metrics_adds_a_metrics_document
 
-- [ ] **RUST MongoDB server: `insert`, `update` and `delete` take fields
-      mongod refuses as unknown.** `originalQuery` and `originalCollation`
-      on any of the three, and a command-level `sampleId` on `update`:
-      mongod 8.2.11 answers 40415 (`BSON field 'insert.originalQuery' is an
-      unknown field.`) and writes nothing; this server takes them, ignores
-      them and runs the write. Its field lists (`write_command_problem`,
-      `update_command_problem` in `crud.rs`) name them. Found 2026-11-09
-      while working RM-087.
-      Backlog-ID: RM-460
-      Verify: tests/backlog/test_rm_found_2026_11_09_rm087.py::test_a_write_refuses_fields_mongod_does_not_know
-
 ### 7.077 `update` and `findAndModify` -- 2026-10-12
 
 `tools/probes/update_commands.py`, mongod 8.2.11: 30 scenarios, 1,295
