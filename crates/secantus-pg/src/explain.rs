@@ -2919,6 +2919,7 @@ mod heap_fetches_tests {
             dummy_relation: false,
             sort_keys: None,
             series_scan: None,
+            series_qual: None,
         }
     }
 

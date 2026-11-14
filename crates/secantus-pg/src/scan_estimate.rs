@@ -4577,6 +4577,25 @@ pub(crate) fn series_scan_estimate(series: &secantus_pgplan::Series, columns: us
     )
 }
 
+/// `cost_functionscan` of a `generate_series` scan with a Filter (RP-847):
+/// every row the series yields pays `cpu_tuple_cost` and the quals, and
+/// the estimate is the rows times their selectivity. The scan returns its
+/// one column, which the Filter reads.
+pub(crate) fn filtered_series_scan_estimate(
+    series: &secantus_pgplan::Series,
+    qual: &secantus_pgplan::SeriesQual,
+) -> Estimate {
+    const CPU_OPERATOR_COST: f64 = 0.0025;
+    let (startup, _, rows, width) = series_scan_estimate(series, 1);
+    let per_row = costsize::CPU_TUPLE_COST + CPU_OPERATOR_COST * f64::from(qual.ops);
+    (
+        startup,
+        startup + per_row * rows,
+        clamp_rows(rows * qual.selectivity(rows)),
+        width,
+    )
+}
+
 #[cfg(test)]
 mod series_tests {
     use super::series_scan_estimate;

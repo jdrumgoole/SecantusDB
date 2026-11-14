@@ -3723,6 +3723,182 @@ pub struct ExplainOptions {
     /// Scan names (when it differs from the function's), and its WHERE as
     /// the scan's `Filter` (RP-847).
     pub series_scan: Option<(Option<String>, Option<String>)>,
+    /// That WHERE priced as `cost_functionscan` prices the scan's quals
+    /// (RP-847): its operators per row, and its selectivity given the
+    /// series' row count.
+    pub series_qual: Option<SeriesQual>,
+}
+
+/// A `generate_series` scan's WHERE as the planner prices it (RP-847).
+#[derive(Debug, Clone, PartialEq)]
+pub struct SeriesQual {
+    /// `cost_qual_eval`'s operators per row, each one `cpu_operator_cost`.
+    pub ops: u32,
+    /// The conjuncts, each an OR of comparisons; see `selectivity`.
+    conjuncts: Vec<Vec<SeriesCmp>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum SeriesCmp {
+    /// `=` (`eqsel`), or `<>` (`neqsel`) when negated.
+    Eq { negated: bool },
+    /// `<` `<=` (`below`) or `>` `>=` of the bare column against a
+    /// constant: a candidate for `addRangeClause`'s pairing.
+    ColumnIneq { below: bool },
+    /// Any other inequality: `DEFAULT_INEQ_SEL`.
+    Ineq,
+}
+
+impl SeriesQual {
+    /// `clauselist_selectivity` over a relation with no statistics of
+    /// `rows` tuples: `eqsel` is one over `get_variable_numdistinct`'s
+    /// default (the tuples, up to `DEFAULT_NUM_DISTINCT`), an inequality
+    /// `DEFAULT_INEQ_SEL`, a `<` / `>` pair on the column
+    /// `DEFAULT_RANGE_INEQ_SEL`, and an OR `s1 + s2 - s1 * s2`.
+    pub fn selectivity(&self, rows: f64) -> f64 {
+        const DEFAULT_INEQ_SEL: f64 = 0.3333333333333333;
+        const DEFAULT_RANGE_INEQ_SEL: f64 = 0.005;
+        let ndistinct = if rows < 200.0 {
+            rows.max(1.0).round()
+        } else {
+            200.0
+        };
+        let one = |c: &SeriesCmp| match c {
+            SeriesCmp::Eq { negated: false } => 1.0 / ndistinct,
+            SeriesCmp::Eq { negated: true } => 1.0 - 1.0 / ndistinct,
+            _ => DEFAULT_INEQ_SEL,
+        };
+        let (mut s, mut lo, mut hi) = (1.0, false, false);
+        for arms in &self.conjuncts {
+            match arms.as_slice() {
+                [SeriesCmp::ColumnIneq { below: true }] if !hi => hi = true,
+                [SeriesCmp::ColumnIneq { below: false }] if !lo => lo = true,
+                _ => {
+                    let mut or = 0.0;
+                    for a in arms {
+                        let x = one(a);
+                        or = or + x - or * x;
+                    }
+                    s *= or;
+                }
+            }
+        }
+        s * match (lo, hi) {
+            (true, true) => DEFAULT_RANGE_INEQ_SEL,
+            (true, false) | (false, true) => DEFAULT_INEQ_SEL,
+            _ => 1.0,
+        }
+    }
+}
+
+/// A series scan's WHERE priced (RP-847), over the one column `column`;
+/// `None` for a clause not modelled: a function call, a cast, a sublink,
+/// a comparison reading no column (a constant gate, not a Filter).
+fn series_qual(w: &pg_query::protobuf::Node, column: &str) -> Option<SeriesQual> {
+    fn operand(n: &pg_query::protobuf::Node, column: &str) -> Option<(u32, bool, bool)> {
+        // (operators, reads the column, is the bare column)
+        match n.node.as_ref()? {
+            N::AConst(_) => Some((0, false, false)),
+            N::ColumnRef(c) => match c.fields.last()?.node.as_ref()? {
+                N::String(s) if s.sval == column => Some((0, true, true)),
+                _ => None,
+            },
+            N::AExpr(e) if e.kind == AExprKind::AexprOp as i32 => {
+                let op = match e.name.last()?.node.as_ref()? {
+                    N::String(s) => s.sval.as_str(),
+                    _ => return None,
+                };
+                if !["+", "-", "*", "/", "%"].contains(&op) {
+                    return None;
+                }
+                let (mut ops, mut reads) = (0, false);
+                for side in [e.lexpr.as_deref(), e.rexpr.as_deref()]
+                    .into_iter()
+                    .flatten()
+                {
+                    let (o, r, _) = operand(side, column)?;
+                    ops += o;
+                    reads |= r;
+                }
+                Some((if reads { ops + 1 } else { 0 }, reads, false))
+            }
+            _ => None,
+        }
+    }
+    fn cmp(n: &pg_query::protobuf::Node, column: &str) -> Option<(u32, SeriesCmp)> {
+        let N::AExpr(e) = n.node.as_ref()? else {
+            return None;
+        };
+        if e.kind != AExprKind::AexprOp as i32 {
+            return None;
+        }
+        let op = match e.name.last()?.node.as_ref()? {
+            N::String(s) => s.sval.clone(),
+            _ => return None,
+        };
+        let l = operand(e.lexpr.as_deref()?, column)?;
+        let r = operand(e.rexpr.as_deref()?, column)?;
+        if l.1 == r.1 {
+            return None;
+        }
+        // The column's side first, the operator commuted to match.
+        let (bare, op) = if l.1 {
+            (l.2, op)
+        } else {
+            let c = match op.as_str() {
+                "<" => ">",
+                ">" => "<",
+                "<=" => ">=",
+                ">=" => "<=",
+                o => o,
+            };
+            (r.2, c.to_string())
+        };
+        let kind = match op.as_str() {
+            "=" => SeriesCmp::Eq { negated: false },
+            "<>" | "!=" => SeriesCmp::Eq { negated: true },
+            "<" | "<=" if bare => SeriesCmp::ColumnIneq { below: true },
+            ">" | ">=" if bare => SeriesCmp::ColumnIneq { below: false },
+            "<" | "<=" | ">" | ">=" => SeriesCmp::Ineq,
+            _ => return None,
+        };
+        Some((l.0 + r.0 + 1, kind))
+    }
+    fn arms(n: &pg_query::protobuf::Node, column: &str, out: &mut Vec<SeriesCmp>) -> Option<u32> {
+        if let Some(N::BoolExpr(b)) = n.node.as_ref() {
+            if BoolExprType::try_from(b.boolop) == Ok(BoolExprType::OrExpr) {
+                let mut ops = 0;
+                for a in &b.args {
+                    ops += arms(a, column, out)?;
+                }
+                return Some(ops);
+            }
+            return None;
+        }
+        let (ops, c) = cmp(n, column)?;
+        out.push(c);
+        Some(ops)
+    }
+    let mut conj = Vec::new();
+    fn flatten<'a>(n: &'a pg_query::protobuf::Node, out: &mut Vec<&'a pg_query::protobuf::Node>) {
+        if let Some(N::BoolExpr(b)) = n.node.as_ref() {
+            if BoolExprType::try_from(b.boolop) == Ok(BoolExprType::AndExpr) {
+                for a in &b.args {
+                    flatten(a, out);
+                }
+                return;
+            }
+        }
+        out.push(n);
+    }
+    flatten(w, &mut conj);
+    let (mut ops, mut conjuncts) = (0, Vec::new());
+    for c in conj {
+        let mut a = Vec::new();
+        ops += arms(c, column, &mut a)?;
+        conjuncts.push(a);
+    }
+    Some(SeriesQual { ops, conjuncts })
 }
 
 /// `CREATE [OR REPLACE] VIEW`.
@@ -11703,6 +11879,7 @@ fn plan_explain(
         dummy_relation: false,
         sort_keys: None,
         series_scan: None,
+        series_qual: None,
     };
     let (mut timing, mut summary) = (None, None);
     for o in &e.options {
@@ -11781,9 +11958,12 @@ fn plan_explain(
         }
     }
     let scan_quals = explain_scan_quals(&query, lookup).unwrap_or_default();
-    options.series_scan = match &query {
-        N::SelectStmt(s) => explain_series_scan(s),
-        _ => None,
+    (options.series_scan, options.series_qual) = match &query {
+        N::SelectStmt(s) => match explain_series_scan(s) {
+            Some((scan, qual)) => (Some(scan), qual),
+            None => (None, None),
+        },
+        _ => (None, None),
     };
     options.sort_keys = match &query {
         N::SelectStmt(s) => match s.from_clause.as_slice() {
@@ -52312,9 +52492,10 @@ fn scan_where(query: &N) -> Option<(String, &pg_query::protobuf::Node)> {
 /// prints (RP-847): `ExplainNode` names the alias where it differs from
 /// the function's name, and `show_scan_qual` prints the WHERE the scan
 /// applies to each row, its conjuncts ANDed.
+#[allow(clippy::type_complexity)]
 fn explain_series_scan(
     s: &pg_query::protobuf::SelectStmt,
-) -> Option<(Option<String>, Option<String>)> {
+) -> Option<((Option<String>, Option<String>), Option<SeriesQual>)> {
     let [item] = s.from_clause.as_slice() else {
         return None;
     };
@@ -52368,7 +52549,11 @@ fn explain_series_scan(
             })
         }
     };
-    Some((alias, filter))
+    let qual = s
+        .where_clause
+        .as_deref()
+        .and_then(|w| series_qual(w, &column));
+    Some(((alias, filter), qual))
 }
 
 /// A statement over ONE relation: its WHERE's conjuncts for EXPLAIN.
