@@ -3719,6 +3719,9 @@ pub struct ExplainOptions {
     /// A single-relation SELECT's ORDER BY as its Sort's `Sort Key`
     /// prints it, where a key is computed (RP-840).
     pub sort_keys: Option<Vec<String>>,
+    /// Under VERBOSE, a single-relation SELECT's scan as it prints then
+    /// (RP-925).
+    pub verbose_scan: Option<ruleutils::VerboseScan>,
     /// A SELECT over one `generate_series` in FROM: the alias its Function
     /// Scan names (when it differs from the function's), and its WHERE as
     /// the scan's `Filter` (RP-847).
@@ -11859,6 +11862,7 @@ fn plan_explain(
     let mut options = ExplainOptions {
         analyze: false,
         verbose: false,
+        verbose_scan: None,
         costs: true,
         timing: false,
         summary: false,
@@ -11970,6 +11974,18 @@ fn plan_explain(
             [item] => match item.node.as_ref() {
                 Some(N::RangeVar(rv)) => {
                     lookup(&rv.relname).and_then(|def| ruleutils::explain_sort_keys(s, &def))
+                }
+                _ => None,
+            },
+            _ => None,
+        },
+        _ => None,
+    };
+    options.verbose_scan = match &query {
+        N::SelectStmt(s) if options.verbose => match s.from_clause.as_slice() {
+            [item] => match item.node.as_ref() {
+                Some(N::RangeVar(rv)) => {
+                    lookup(&rv.relname).and_then(|def| ruleutils::explain_verbose_scan(s, &def))
                 }
                 _ => None,
             },

@@ -45789,6 +45789,7 @@ impl PgHandler {
                 explain::attach_join_where(&mut tree, &options.join_where, &index_columns);
                 explain::move_param_conds(&mut tree);
                 explain::apply_implied_filters(&mut tree);
+                explain::attach_verbose(&mut tree, &options.verbose_scan);
                 // ANALYZE runs the statement, as PostgreSQL's does -- a write
                 // is written -- and reports the rows it produced.
                 let actual = if options.analyze {

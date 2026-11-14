@@ -1842,28 +1842,35 @@ a regression test.
       (found while working RP-354, the Memoize while working RP-916).
       Verify: tests/backlog/test_rp_explain_costs.py::test_plan[analyze of a nested loop into an index on an expression of the outer side], tests/backlog/test_rp_explain_costs.py::test_plan[analyze of a memoize keyed by an expression of the outer side]
       Backlog-ID: RP-914
-- [ ] **EXPLAIN VERBOSE prints no `Output` lists and no schema-qualified
-      names.** VERBOSE is accepted and then ignored: PostgreSQL 15.19 prints
-      `explain verbose select * from k where a > 5` (`k` 1,000 analysed
-      rows) as `Seq Scan on public.k` with `Output: a, b` and `Filter: (k.a
-      > 5)`; here `Seq Scan on k` and `Filter: (a > 5)`, as without
-      VERBOSE. A join's nodes each print their `Output` too (`Output: e.a,
-      e.b, e2.a, e2.b` on a Nested Loop, its Materialize's and Memoize's
-      likewise), and an inner index scan's `Index Cond` is qualified
-      (`(k.a > r.a)`). Measured on a private 15.19 cluster (found while
-      working RP-916). Where to build it (read while working RP-840 and
-      RP-847, 2026-11-14): `ExplainOptions.verbose` is parsed and then
-      read by nothing; the plan's text is fixed up after `plan_tree` by
-      the `explain::attach_*` passes `secantus-pg/src/lib.rs` runs on the
-      tree (`attach_scan_quals`, `attach_sort_keys`,
-      `attach_series_scan`), each fed a deparse `plan_explain` computes
-      from the parse tree into `ExplainOptions`. The quals are printed by
-      ruleutils' `Printer` with `unqualified = true`; VERBOSE wants it
-      `false` (`k.a`), and each node's `Output` its targetlist deparsed
-      the same way -- for every node kind, which is why a scans-only
-      slice was not taken.
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[explain verbose prints a scan's output list]
-      Backlog-ID: RP-925
+- [ ] **EXPLAIN VERBOSE prints no `Output` lists above a scan.** A plan
+      that is one relation's scan prints as VERBOSE does (RP-925); any
+      other node prints as without it: PostgreSQL 15.19 prints `explain
+      verbose select * from k where a > 5 order by b` (`k` 1,000 analysed
+      rows) with `Output: a, b` and `Sort Key: k.b` on the Sort, and the
+      Seq Scan under it as `Seq Scan on public.k` with `Output: a, b` and
+      `Filter: (k.a > 5)`; here the plain plan. A join's nodes each print
+      their `Output` too (`Output: e.a, e.b, e2.a, e2.b` on a Nested Loop,
+      its Materialize's and Memoize's likewise), and an inner index scan's
+      `Index Cond` is qualified (`(k.a > r.a)`). Measured on a private
+      15.19 cluster (found while working RP-916). Where to build it: the
+      lone-scan case is `explain::attach_verbose`, fed by
+      `ruleutils::explain_verbose_scan` through
+      `ExplainOptions.verbose_scan`; every other node needs its targetlist
+      deparsed (`show_plan_tlist`, prefixed when the range table holds more
+      than one relation) and its quals and keys printed with `unqualified
+      = false`.
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[explain verbose of a sort over a scan]
+      Backlog-ID: RP-966
+- [ ] **A scan of an aliased relation loses its alias and its quals in
+      EXPLAIN.** PostgreSQL 15.19 prints `explain select * from k x where
+      x.a > 5` (`k` analysed) as `Seq Scan on k x (cost=0.00..17.50
+      rows=995 width=7)` with `Filter: (a > 5)`; here `Seq Scan on k` and
+      no Filter: the quals' printer scopes the table under its own name, so
+      `x.a` does not resolve and `explain_scan_quals` gives up. A VERBOSE
+      plan of it then prints as without VERBOSE too. Measured on a private
+      15.19 cluster (found while working RP-925).
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a scan of an aliased relation]
+      Backlog-ID: RP-967
 - [ ] **A binary-coercible cast is kept in a plan, and its scan is not
       priced.** A cast between binary-compatible types (`text` to
       `varchar` and back to `text` for the operator) is a `RelabelType`

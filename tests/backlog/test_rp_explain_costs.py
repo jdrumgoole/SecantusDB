@@ -1607,7 +1607,8 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "              Index Cond: (a > (r.a + 1))",
         ],
     ),
-    # Still open (RP-925): VERBOSE's output lists and qualified names.
+    # Fixed (RP-925): VERBOSE of a lone scan prints its output list and
+    # qualified names; above a scan it is still open (RP-966).
     "explain verbose prints a scan's output list": (
         "RP-925",
         _ANALYSED,
@@ -1616,6 +1617,48 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "Seq Scan on public.k  (cost=0.00..17.50 rows=995 width=7)",
             "  Output: a, b",
             "  Filter: (k.a > 5)",
+        ],
+    ),
+    "explain verbose of a scan with two conjuncts": (
+        "RP-925",
+        _ANALYSED,
+        "explain verbose select * from k where a > 5 and b <> 'x'",
+        [
+            "Seq Scan on public.k  (cost=0.00..20.00 rows=995 width=7)",
+            "  Output: a, b",
+            "  Filter: ((k.a > 5) AND (k.b <> 'x'::text))",
+        ],
+    ),
+    "a scan of an aliased relation": (
+        "RP-967",
+        _ANALYSED,
+        "explain select * from k x where x.a > 5",
+        [
+            "Seq Scan on k x  (cost=0.00..17.50 rows=995 width=7)",
+            "  Filter: (a > 5)",
+        ],
+    ),
+    "explain verbose of an index scan with an expression output": (
+        "RP-925",
+        _ANALYSED,
+        "explain verbose select b, a+1 from k where a = 5",
+        [
+            "Index Scan using k_pkey on public.k  (cost=0.28..8.29 rows=1 width=7)",
+            "  Output: b, (a + 1)",
+            "  Index Cond: (k.a = 5)",
+        ],
+    ),
+    "explain verbose of a sort over a scan": (
+        "RP-966",
+        _ANALYSED,
+        "explain verbose select * from k where a > 5 order by b",
+        [
+            "Sort  (cost=67.04..69.53 rows=995 width=7)",
+            "  Output: a, b",
+            "  Sort Key: k.b",
+            "  ->  Seq Scan on public.k  (cost=0.00..17.50 rows=995 width=7)",
+            "        Output: a, b",
+            "        Filter: (k.a > 5)",
         ],
     ),
     # Split from RP-354 and fixed: a `<>` whose operands differ in type
@@ -5427,6 +5470,7 @@ def _marked(name: str, item: str) -> Any:
         "RP-409",
         "RP-913",
         "RP-916",
+        "RP-925",
     )
     mark = pytest.mark.backlog_fixed if fixed else pytest.mark.backlog
     return pytest.param(name, marks=mark(item), id=name)
