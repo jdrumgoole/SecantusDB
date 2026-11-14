@@ -3913,15 +3913,6 @@ Measured on PostgreSQL 15.19 (the shared reference on port 5415) with the
 `_SETUP` in `tests/backlog/test_rp_found_rp839.py` and `"Over845"` a domain
 over its `"Mx839"`.
 
-- [ ] **A PL/pgSQL declaration folds a quoted type name to lower case.**
-      `do $$ declare x "Over845" := 5; begin raise notice '%', x; end $$`
-      prints `NOTICE: 5` on PostgreSQL 15.19 (`parse_datatype` reads the
-      type as the grammar does, keeping a quoted name's case), and an
-      assignment of 0 to such a variable is 23514 `value for domain
-      "Over845" violates check constraint "Mx839_check"`. Here each is
-      42704 `type "over845" does not exist`.
-      Verify: tests/backlog/test_rp_found_rp839.py::test_a_plpgsql_declaration_keeps_a_quoted_types_case
-      Backlog-ID: RP-865
 
 ## Found while working RP-692 (2026-11-10)
 
