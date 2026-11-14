@@ -16,6 +16,10 @@
 //! `$1::text || $2`, `quote_literal(anyelement)` is
 //! `quote_literal($1::text)`). They differ only for a boolean, which
 //! outputs as `t` and casts to `true`.
+//!
+//! A `date`, `timestamp` or `timestamptz` prints in the session `DateStyle`
+//! (`date_out` is `02.01.2020` under German), whichever flavour. JSON and
+//! XML write ISO under every DateStyle, so they take [`iso_output_text`].
 
 use crate::{session_datestyle, session_timezone, Bson};
 
@@ -30,6 +34,7 @@ pub fn needs_type(ty: &str) -> bool {
     matches!(
         ty,
         "tid"
+            | "date"
             | "pg_lsn"
             | "money"
             | "float4"
@@ -65,42 +70,53 @@ pub fn needs_type(ty: &str) -> bool {
     )
 }
 
-/// `ty`'s output function over a non-NULL `v`.
+/// `ty`'s output function over a non-NULL `v`, in the session's
+/// `DateStyle`: a `date` is `02.01.2020` under German, as `date_out` writes
+/// it in `concat`, `format`, a record field or `array_out` (RP-894), and in
+/// a catalog DEFAULT's text, which `get_const_expr` prints through the
+/// output function in the reading session's settings (RP-864).
 pub fn output_text(v: &Bson, ty: &str) -> String {
-    render(v, ty.trim(), false)
+    render(v, ty.trim(), false, true)
 }
 
-/// `ty`'s output function over a non-NULL `v` in the session's `DateStyle`
-/// as well: a `date`, `timestamp` or `timestamptz` is `02.01.2020` under
-/// German, where `output_text` writes ISO (which JSON and XML want). Used
-/// for a catalog DEFAULT's text, which `get_const_expr` prints through the
-/// output function in the reading session's settings (RP-864).
-pub fn session_output_text(v: &Bson, ty: &str) -> String {
-    let ds = session_datestyle();
-    match (ty.trim(), v) {
-        ("date", Bson::String(t)) => crate::render_date_styled(t, &ds),
-        ("timestamp" | "timestamp without time zone", _) => {
-            crate::timestamp_value_text_styled(v, &ds).unwrap_or_else(|| output_text(v, ty))
-        }
-        ("timestamptz" | "timestamp with time zone", _) => {
-            crate::timestamptz_value_text_styled(v, &session_timezone(), &ds)
-                .unwrap_or_else(|| output_text(v, ty))
-        }
-        _ => output_text(v, ty),
-    }
+/// `ty`'s output function over a non-NULL `v` with a date or timestamp in
+/// ISO, as JSON and XML write one under every `DateStyle`.
+pub fn iso_output_text(v: &Bson, ty: &str) -> String {
+    render(v, ty.trim(), false, false)
 }
 
 /// `v::text` for a non-NULL `v` of type `ty`.
 pub fn cast_text(v: &Bson, ty: &str) -> String {
-    render(v, ty.trim(), true)
+    render(v, ty.trim(), true, true)
 }
 
-fn render(v: &Bson, ty: &str, cast: bool) -> String {
+/// A `date`, `timestamp` or `timestamptz` in the session `DateStyle`; `None`
+/// for any other type.
+fn styled_datetime(v: &Bson, ty: &str) -> Option<String> {
+    let ds = session_datestyle();
+    match (ty, v) {
+        ("date", Bson::String(t)) => Some(crate::render_date_styled(t, &ds)),
+        ("timestamp" | "timestamp without time zone", _) => {
+            crate::timestamp_value_text_styled(v, &ds)
+        }
+        ("timestamptz" | "timestamp with time zone", _) => {
+            crate::timestamptz_value_text_styled(v, &session_timezone(), &ds)
+        }
+        _ => None,
+    }
+}
+
+fn render(v: &Bson, ty: &str, cast: bool, styled: bool) -> String {
     if let Some(elem) = ty.strip_suffix("[]") {
         if let Bson::Array(items) = v {
             // `array_out` prints each element by its OUTPUT function, a cast
             // to text included (`array[true]::text` is `{t}`).
-            return crate::value_text(&Bson::Array(element_texts(items, elem)));
+            return crate::value_text(&Bson::Array(element_texts(items, elem, styled)));
+        }
+    }
+    if styled {
+        if let Some(text) = styled_datetime(v, ty) {
+            return text;
         }
     }
     match (ty, v) {
@@ -143,20 +159,20 @@ pub fn array_elements(v: &Bson, ty: &str) -> Option<Vec<Option<String>>> {
         .map(|x| match x {
             Bson::Null => Some(None),
             Bson::Array(_) => None,
-            other => Some(Some(render(other, elem, false))),
+            other => Some(Some(render(other, elem, false, true))),
         })
         .collect()
 }
 
 /// An array's elements as their output text, NULLs kept, nested arrays
 /// walked, so the array printer quotes each as `array_out` does.
-fn element_texts(items: &[Bson], elem: &str) -> Vec<Bson> {
+fn element_texts(items: &[Bson], elem: &str, styled: bool) -> Vec<Bson> {
     items
         .iter()
         .map(|x| match x {
             Bson::Null => Bson::Null,
-            Bson::Array(inner) => Bson::Array(element_texts(inner, elem)),
-            other => Bson::String(render(other, elem, false)),
+            Bson::Array(inner) => Bson::Array(element_texts(inner, elem, styled)),
+            other => Bson::String(render(other, elem, false, styled)),
         })
         .collect()
 }
@@ -166,32 +182,32 @@ mod tests {
     use super::*;
     use crate::{set_session_datestyle, DateStyle};
 
-    // A catalog DEFAULT's `date` / `timestamp` is written in the session
-    // DateStyle, as PostgreSQL 15.19's `get_const_expr` writes it
-    // (`'02.01.2020'::date` under German); `output_text` stays ISO (RP-864).
+    // A `date` / `timestamp` is written in the session DateStyle, as
+    // PostgreSQL 15.19's `date_out` writes it (`02.01.2020` under German) in
+    // a catalog DEFAULT (RP-864) and in `concat` / `format` / a record
+    // (RP-894); `iso_output_text`, JSON's and XML's, stays ISO.
     #[test]
     fn a_date_and_a_timestamp_output_in_the_session_datestyle() {
         let ts = Bson::DateTime(bson::DateTime::from_millis(1_577_882_096_789));
         let date = Bson::String("2020-01-02".into());
         set_session_datestyle(DateStyle::parse("German"));
         let german = (
-            session_output_text(&date, "date"),
-            session_output_text(&ts, "timestamp"),
             output_text(&date, "date"),
-            output_text(&ts, "timestamp"),
+            cast_text(&ts, "timestamp"),
+            iso_output_text(&date, "date"),
+            iso_output_text(&ts, "timestamp"),
+            output_text(&Bson::Array(vec![date.clone(), Bson::Null]), "date[]"),
         );
         set_session_datestyle(DateStyle::default());
-        let iso = (
-            session_output_text(&date, "date"),
-            session_output_text(&ts, "timestamp"),
-        );
+        let iso = (output_text(&date, "date"), output_text(&ts, "timestamp"));
         assert_eq!(
             german,
             (
                 "02.01.2020".into(),
                 "01.01.2020 12:34:56.789".into(),
                 "2020-01-02".into(),
-                "2020-01-01 12:34:56.789".into()
+                "2020-01-01 12:34:56.789".into(),
+                "{02.01.2020,NULL}".into()
             )
         );
         assert_eq!(iso, ("2020-01-02".into(), "2020-01-01 12:34:56.789".into()));

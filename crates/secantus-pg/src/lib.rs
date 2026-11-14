@@ -32619,7 +32619,7 @@ impl PgHandler {
                     Bson::Int32(_) | Bson::Int64(_) | Bson::Double(_) | Bson::Decimal128(_)
                 ) && !secantus_pgplan::numeric::is_wide_numeric(v) =>
             {
-                let text = secantus_pgplan::typeout::session_output_text(v, &c.pg_type);
+                let text = secantus_pgplan::typeout::output_text(v, &c.pg_type);
                 Bson::String(format!("'{}'::{label}", text.replace('\'', "''")))
             }
             Some(other) => {
@@ -34789,13 +34789,22 @@ impl PgHandler {
         if let Statement::DeclareCursor {
             name,
             query,
-            statement,
             scrollable,
             join_scroll,
             holdable,
             binary: is_binary_cursor,
         } = stmt
         {
+            // `pg_cursors.statement` is the portal's source text: the whole
+            // query string the DECLARE arrived in, verbatim, as
+            // PerformCursorOpen copies `p_sourcetext` (15.19).
+            let statement = self
+                .statement_source
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .as_ref()
+                .map(|(source, _)| source.clone())
+                .unwrap_or_default();
             // Over a join, the join method PostgreSQL picks decides it --
             // read in the open transaction, which may have made its tables.
             let scrollable = join_scroll
@@ -34829,6 +34838,8 @@ impl PgHandler {
                 .unwrap_or_else(|e| e.into_inner())
                 .contains_key(&name)
             {
+                // An error in a block aborts it (RP-899).
+                self.note_failure();
                 return Err(Self::user_error(
                     "42P03",
                     format!("cursor \"{name}\" already exists"),
@@ -34936,6 +34947,7 @@ impl PgHandler {
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
                     .take();
+                self.note_failure();
                 return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
                     "ERROR".into(),
                     "0A000".into(),

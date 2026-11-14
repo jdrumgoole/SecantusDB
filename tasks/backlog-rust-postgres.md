@@ -1139,7 +1139,10 @@ one beside it.
       depend on more than its own catalog row (its grants, its inheritance
       parents and children, the foreign keys naming it, the types its
       columns name), so each key has to carry them, or a stale entry is a
-      wrong answer.
+      wrong answer. Its gap test is a timing ratio and can pass once by
+      noise: a `gate_pg.sh` backlog step on 2026-11-13 (load average ~18)
+      reported it `FIXED?`, then it failed three of three runs alone (0.015 s
+      against 0.0117 s, the bar 1.1x). Rerun it alone before closing.
       Backlog-ID: RP-911
       Verify: tests/backlog/test_rp_catalog_latency.py::test_the_first_catalog_query_after_ddl_costs_the_same_at_800_tables_within_a_tenth
 
@@ -3635,17 +3638,6 @@ at the DECLARE, and the cursor answers that differ either way.
       already matches).
       Verify: tests/backlog/test_rp_found_rp744.py::test_a_zero_count_fetch_refetches_the_current_row
       Backlog-ID: RP-898
-- [ ] **A DECLARE refused for a duplicate cursor name leaves the block
-      usable.** PostgreSQL 15.19 answers 42P03 `cursor "c" already exists`
-      and aborts the block, so the next statement is 25P02; here the block
-      runs on.
-      Verify: tests/backlog/test_rp_found_rp744.py::test_a_duplicate_cursor_name_aborts_the_block
-      Backlog-ID: RP-899
-- [ ] **`pg_cursors.statement` is a deparse of the query.** PostgreSQL
-      15.19 reports the DECLARE as submitted, verbatim (`declare  c   cursor
-      for select 1 -- x`); here it is `SELECT 1`.
-      Verify: tests/backlog/test_rp_found_rp744.py::test_pg_cursors_statement_is_the_declare_text
-      Backlog-ID: RP-900
 - [ ] **A PL/pgSQL FETCH from a `refcursor` parameter is refused at CREATE
       FUNCTION.** `create function f(c refcursor) returns int language
       plpgsql as $$ declare r int; begin fetch c into r; return r; end $$`
@@ -3655,6 +3647,22 @@ at the DECLARE, and the cursor answers that differ either way.
       creates it, and the call reads the caller's cursor.
       Verify: tests/backlog/test_rp_found_rp744.py::test_a_refcursor_parameter_can_be_fetched
       Backlog-ID: RP-901
+
+## Found while working RP-900 (2026-11-13)
+
+Measured on PostgreSQL 15.19 (the shared reference on port 5415). The gap
+test is in `tests/backlog/test_rp_found_rp900.py`.
+
+- [ ] **The extended protocol's unnamed portal is listed in `pg_cursors`.**
+      In a block, a parameterised statement (`select $1::int`, as psycopg
+      sends `select %s::int`) leaves a `pg_cursors` row named
+      `POSTGRESQL_DEFAULT_NAME`, pgwire's placeholder for the unnamed
+      portal, until the block ends; PostgreSQL 15.19 creates that portal
+      invisible (`exec_bind_message`) and lists none.
+      `wire_portals::note_wire_portal` skips only an empty name, and the
+      Bind hands it `DEFAULT_NAME`.
+      Verify: tests/backlog/test_rp_found_rp900.py::test_the_unnamed_portal_is_not_in_pg_cursors
+      Backlog-ID: RP-936
 
 ## Found while working RP-698 (2026-11-10)
 
@@ -4228,22 +4236,3 @@ tests are in `tests/backlog/test_rp_found_rp565.py`.
       `x` and the second is 42809.
       Verify: tests/backlog/test_rp_found_rp565.py::test_a_temporary_row_type_hides_a_built_in_type
       Backlog-ID: RP-891
-
-## Found while working RP-864 (2026-11-12)
-
-Measured on PostgreSQL 15.19; none of it needs DDL.
-
-- [ ] **A `date` or `timestamp` made text inside an expression ignores the
-      DateStyle.** Under `set datestyle to 'German'`, `concat('2020-01-02'::date,
-      '|', '2020-01-01 12:00'::timestamp)` is `02.01.2020|01.01.2020 12:00:00`
-      on PostgreSQL 15.19, `format('%s', '2020-01-02'::date)` `02.01.2020`
-      and `row('2020-01-02'::date, '2020-01-01 12:00'::timestamp)::text`
-      `(02.01.2020,"01.01.2020 12:00:00")`: each calls `date_out` /
-      `timestamp_out`, which write in the session DateStyle. Here each is
-      ISO: `typeout::output_text` writes ISO, as JSON and XML (which stay
-      ISO under every DateStyle) need, and `needs_type` leaves `date` out,
-      so these paths print the stored text. `typeout::session_output_text`
-      (RP-864's DEFAULT printer) is the styled form; the fix is choosing it
-      at the output-function sites and not at JSON's and XML's.
-      Verify: tests/backlog/test_rp_found_rp864.py::test_a_date_as_text_in_an_expression_follows_the_datestyle
-      Backlog-ID: RP-894

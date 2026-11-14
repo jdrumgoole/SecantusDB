@@ -1112,9 +1112,6 @@ pub enum Statement {
     DeclareCursor {
         name: String,
         query: Box<Statement>,
-        /// The deparsed inner query, for the `pg_cursors` catalog view's
-        /// `statement` column. Not re-executed -- only reported.
-        statement: String,
         /// Declared cursor options, surfaced by `pg_cursors`. A cursor declared
         /// `NO SCROLL` reports `is_scrollable = false`; anything else is
         /// scrollable here, since every cursor is materialised.
@@ -5556,16 +5553,9 @@ fn declare_cursor(d: &pg_query::protobuf::DeclareCursorStmt, inner: Statement) -
     const CURSOR_OPT_SCROLL: i32 = 0x0002;
     const CURSOR_OPT_NO_SCROLL: i32 = 0x0004;
     const CURSOR_OPT_HOLD: i32 = 0x0020;
-    // Deparse the inner query for `pg_cursors.statement`. Best-effort:
-    // an un-deparsable node leaves the column empty rather than failing
-    // the DECLARE, which no client reads that column to check.
-    let statement = inner_node
-        .and_then(|n| n.deparse().ok())
-        .unwrap_or_default();
     Statement::DeclareCursor {
         name: d.portalname.clone(),
         query: Box::new(inner),
-        statement,
         // Neither SCROLL nor NO SCROLL: whatever the plan can do.
         scrollable: if d.options & CURSOR_OPT_SCROLL != 0 {
             true
@@ -42027,8 +42017,20 @@ fn bpchar_args(f: &pg_query::protobuf::FuncCall, name: &str, args: Vec<Bson>) ->
                 }
                 let ty = static_type(node, &v);
                 // A string is its own text, except an inet, whose output drops
-                // a full host mask the stored text keeps.
-                if matches!(v, Bson::String(_)) && !matches!(ty.as_str(), "inet" | "cidr") {
+                // a full host mask the stored text keeps, and a date or
+                // timestamp, written in the session DateStyle (RP-894).
+                if matches!(v, Bson::String(_))
+                    && !matches!(
+                        ty.as_str(),
+                        "inet"
+                            | "cidr"
+                            | "date"
+                            | "timestamp"
+                            | "timestamp without time zone"
+                            | "timestamptz"
+                            | "timestamp with time zone"
+                    )
+                {
                     return v;
                 }
                 if CAST.contains(&name) {
