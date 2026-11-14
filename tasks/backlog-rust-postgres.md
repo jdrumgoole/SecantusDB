@@ -3137,16 +3137,6 @@ Measured on PostgreSQL 15.19; none of it needs DDL. The gap tests are in
       or `concat` prints it through `typeout`, which cannot fail.
       Verify: tests/backlog/test_rp_found_rp575.py::test_two_dimensional_vector_text
       Backlog-ID: RP-602
-- [ ] **A parameter declared `int2vector[]` or `oidvector[]` has no type.**
-      A Bind of `{"1 2",3}` with type oid 1006 is `int2vector[]` to
-      `pg_typeof($1)` on PostgreSQL 15.19, `($1)[2]::text` is `3` and
-      `cardinality($1)` 2, in text or binary format. Here the first is 42P18
-      `could not determine data type of parameter $1` and the others 42804 /
-      42883: oids 1006 and 1013 are in neither the parameter-type nor the
-      array-element table (`element_of_array_oid`), so the value stays its
-      raw text.
-      Verify: tests/backlog/test_rp_found_rp575.py::test_vector_array_parameter
-      Backlog-ID: RP-604
 
 ## Found while working RP-612 (2026-11-14)
 

@@ -264,10 +264,53 @@ fn recv(ty: &Type, buf: &mut Buf<'_>, utf8: bool) -> Result<bool, PgWireError> {
             Ok(true)
         }
         _ => match ty.kind() {
+            Kind::Array(element) if matches!(*ty, Type::INT2_VECTOR | Type::OID_VECTOR) => {
+                recv_vector(ty, element, buf, utf8)
+            }
             Kind::Array(element) => recv_array(element, buf, utf8),
             _ => Ok(false),
         },
     }
+}
+
+/// `int2vectorrecv` / `oidvectorrecv`: `array_recv` over the element, then
+/// the vector's own shape -- one dimension, subscripted from 0, no NULL --
+/// else 22P03 `invalid int2vector data`. An empty vector is refused too:
+/// `array_recv` answers a zero-length dimension with an array of none
+/// (measured on PostgreSQL 15.19).
+fn recv_vector(
+    ty: &Type,
+    element: &Type,
+    buf: &mut Buf<'_>,
+    utf8: bool,
+) -> Result<bool, PgWireError> {
+    let start = buf.pos;
+    recv_array(element, buf, utf8)?;
+    let mut head = Buf {
+        data: &buf.data[start..buf.pos],
+        pos: 0,
+    };
+    let ndim = head.i32()?;
+    // The flags word says nothing: `ARR_HASNULL` is whether one IS NULL.
+    head.i32()?;
+    head.i32()?;
+    let shaped = ndim == 1 && {
+        let (len, lb) = (head.i32()?, head.i32()?);
+        let mut null = false;
+        for _ in 0..len.max(0) {
+            let n = head.i32()?;
+            if n == -1 {
+                null = true;
+            } else {
+                head.bytes(n as usize)?;
+            }
+        }
+        len > 0 && lb == 0 && !null
+    };
+    if !shaped {
+        return Err(error("22P03", format!("invalid {} data", ty.name())));
+    }
+    Ok(true)
 }
 
 /// `array_recv`: the header, the dimensions, then each element through its
@@ -474,6 +517,30 @@ mod tests {
             (&Type::INTERVAL_ARRAY, "0000000100000000010101010000000100000000", "08P01 insufficient data left in message"),
             (&Type::INTERVAL_ARRAY, "000000000000000000000017", "42804 binary data has array element type 23 (integer) instead of expected 1186 (interval)"),
             (&Type::JSON_ARRAY, "000000000000000000000eda", "42804 binary data has array element type 3802 (jsonb) instead of expected 114 (json)"),
+        ];
+        for (ty, hex, want) in cases {
+            assert_eq!(code(ty, hex), *want, "{} {hex}", ty.name());
+        }
+    }
+
+    /// `int2vectorrecv` / `oidvectorrecv`: one dimension, from 0, no NULL,
+    /// none empty; an array of vectors holds each to it (RP-604). Each
+    /// answer measured on PostgreSQL 15.19 (2026-11-14).
+    #[test]
+    fn a_vector_is_received_as_postgresql_receives_one() {
+        let int2 = "22P03 invalid int2vector data";
+        let cases: &[(&Type, &str, &str)] = &[
+            (&Type::INT2_VECTOR, "00000001000000000000001500000002000000000000000200010000000200020000", "22P03 incorrect binary data format in bind parameter 1"),
+            (&Type::INT2_VECTOR, "0000000100000000000000150000000200000000000000020001000000020002", "ok"),
+            (&Type::INT2_VECTOR, "0000000100000000000000150000000000000000", int2),
+            (&Type::INT2_VECTOR, "000000000000000000000015", int2),
+            (&Type::INT2_VECTOR, "0000000100000000000000150000000200000001000000020001000000020002", int2),
+            (&Type::INT2_VECTOR, "0000000100000000000000150000000200000000000000020001ffffffff", int2),
+            (&Type::INT2_VECTOR, "00000001000000000000001700000001000000000000000400000001", "42804 binary data has array element type 23 (integer) instead of expected 21 (smallint)"),
+            (&Type::OID_VECTOR, "00000001000000000000001a00000001000000010000000400000001", "22P03 invalid oidvector data"),
+            (&Type::INT2_VECTOR_ARRAY, "00000001000000000000001600000002000000010000002000000001000000000000001500000002000000000000000200010000000200020000001a0000000100000000000000150000000100000000000000020003", "ok"),
+            (&Type::INT2_VECTOR_ARRAY, "0000000100000000000000160000000100000001000000200000000100000000000000150000000200000001000000020001000000020002", int2),
+            (&Type::OID_VECTOR_ARRAY, "00000001000000000000001e00000001000000010000002400000001000000000000001a000000020000000000000004000000010000000400000002", "ok"),
         ];
         for (ty, hex, want) in cases {
             assert_eq!(code(ty, hex), *want, "{} {hex}", ty.name());
