@@ -9962,10 +9962,12 @@ impl Storage {
                     Ok(None)
                 };
                 let outcome = before.and_then(|before| {
+                    let retry_before = self.replayed_retry_pre_image(&entry)?;
                     let applied = self.apply_replay_entry_idempotent(&entry)?;
                     if let (true, Some(record)) = (applied, before) {
                         self.write_pre_image_records_alone(&[record])?;
                     }
+                    self.replay_session_state(&entry, applied, retry_before)?;
                     Ok(applied)
                 });
                 REPLAY_TS.with(|c| c.set(0));
@@ -9992,6 +9994,112 @@ impl Storage {
         // Re-anchor so the next crash replays only its own gap (and the prune
         // clamp releases the window just replayed).
         self.stable_checkpoint()
+    }
+
+    /// The document a retryable `findAndModify`'s replayed entry changes, as
+    /// it stands before the replay, when the image a retry of it returns is
+    /// that pre-image (`rw.img: "preImage"`).
+    fn replayed_retry_pre_image(&self, entry: &Document) -> Result<Option<Document>> {
+        let Ok(rw) = entry.get_document("rw") else {
+            return Ok(None);
+        };
+        if rw.get_str("img") != Ok("preImage") {
+            return Ok(None);
+        }
+        self.replayed_target(entry)
+    }
+
+    /// The stored document an update or delete oplog entry names by `_id`.
+    fn replayed_target(&self, entry: &Document) -> Result<Option<Document>> {
+        let id = match entry.get_str("op") {
+            Ok("u") => entry.get_document("o2").ok().and_then(|o2| o2.get("_id")),
+            Ok("d") => entry.get_document("o").ok().and_then(|o| o.get("_id")),
+            _ => None,
+        };
+        let Some(id) = id else { return Ok(None) };
+        let Some((db, coll)) = entry.get_str("ns").ok().and_then(|ns| ns.split_once('.')) else {
+            return Ok(None);
+        };
+        match self.find_by_id(db, coll, id)? {
+            Some(bytes) => Ok(Some(decode_doc(&bytes)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// What mongod's `SessionUpdateTracker` rebuilds as recovery applies a
+    /// retryable write's oplog entry: the session's `config.transactions`
+    /// row (`{_id: lsid, txnNum, lastWriteOpTime, lastWriteDate}`) and, for
+    /// a `findAndModify` that changed a document, its retry image in
+    /// `config.image_collection`. A data-nonlogged store writes both without
+    /// an oplog entry into tables a crash rolls back to the checkpoint, so
+    /// replay is the only place they come back from (RM-350). An entry the
+    /// checkpoint already held (`applied` false) rewrites the row, which the
+    /// checkpoint may still lack, but no pre-image: the document it would be
+    /// read from is already changed.
+    fn replay_session_state(
+        &self,
+        entry: &Document,
+        applied: bool,
+        retry_before: Option<Document>,
+    ) -> Result<()> {
+        let Ok(rw) = entry.get_document("rw") else {
+            return Ok(());
+        };
+        let (Ok(lsid), Ok(txn)) = (rw.get_document("lsid"), rw.get_i64("txnNumber")) else {
+            return Ok(());
+        };
+        let Some(Bson::Timestamp(ts)) = entry.get("ts").cloned() else {
+            return Ok(());
+        };
+        let wall = entry
+            .get_datetime("wall")
+            .copied()
+            .unwrap_or_else(|_| bson::DateTime::now());
+        let no_vars = Document::new();
+        let upsert = |coll: &str, row: Document| -> Result<()> {
+            self.update_matching(
+                "config",
+                coll,
+                &bson::doc! {"_id": lsid.clone()},
+                &row,
+                false,
+                true,
+                &[],
+                &no_vars,
+                None,
+                None,
+                false,
+            )
+            .map(|_| ())
+        };
+        upsert(
+            "transactions",
+            bson::doc! {
+                "_id": lsid.clone(),
+                "txnNum": txn,
+                "lastWriteOpTime": {"ts": ts, "t": 1_i64},
+                "lastWriteDate": wall,
+            },
+        )?;
+        let image = match rw.get_str("img") {
+            Ok("postImage") => self.replayed_target(entry)?,
+            Ok("preImage") if applied => retry_before,
+            _ => None,
+        };
+        if let (Some(image), Ok(kind)) = (image, rw.get_str("img")) {
+            upsert(
+                "image_collection",
+                bson::doc! {
+                    "_id": lsid.clone(),
+                    "txnNum": txn,
+                    "ts": ts,
+                    "imageKind": kind,
+                    "image": image,
+                    "invalidated": false,
+                },
+            )?;
+        }
+        Ok(())
     }
 
     /// The `config.system.preimages` document crash recovery records for

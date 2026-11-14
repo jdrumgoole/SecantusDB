@@ -2130,20 +2130,6 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       2026-11-14 while working RM-423.
       Verify: tests/backlog/test_rm_found_2026_11_08_rm332.py::test_a_rand_sort_beside_a_field_under_a_project_is_refused
       Backlog-ID: RM-691
-- [ ] **A retryable write retried after a crash under `--data-nonlogged` is
-      applied again.** A restarted server reads a session's
-      `config.transactions` row, its oplog entries and its
-      `config.image_collection` image back (since 2026-11-08), but that mode
-      writes the row and the image without an oplog entry and recovers its
-      data tables by replaying the oplog, so a SIGKILL loses both: a retried
-      insert fails on a duplicate key, a retried `findAndModify` changes the
-      document a second time. mongod 8.2.11 rebuilds the row and the image
-      from the oplog in recovery (its `SessionUpdateTracker`; the image from
-      the document the replayed write changed) and answers both retries as
-      after a clean restart. The fix is in `recover_from_oplog`
-      (`secantus-storage`), which the PG server links too.
-      Backlog-ID: RM-350
-      Verify: tests/backlog/test_rm_350_retry_after_restart.py::test_a_retry_after_a_crash_under_data_nonlogged_applies_nothing_twice
 
 ### 7.085 The shared Rust storage, audited -- 2026-10-20
 
