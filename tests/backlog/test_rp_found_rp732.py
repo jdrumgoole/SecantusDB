@@ -3,8 +3,8 @@ below the Sort) found:
 
 - a DECLARE CURSOR computed every row's select list at the DECLARE, so a
   row no FETCH reaches raised its error there (RP-744, fixed);
-- a sorted cursor computes an expensive column below its Sort, where
-  PostgreSQL's `cursor_tuple_fraction` postpones it;
+- a sorted cursor computed an expensive column below its Sort, where
+  PostgreSQL's `cursor_tuple_fraction` postpones it (RP-745, fixed);
 - a cast over a CASE of untyped literals reports a branch's input error
   at the literal's position.
 
@@ -235,20 +235,47 @@ def test_a_plpgsql_fetch_computes_one_row(dsn: str) -> None:
     ]
 
 
-@pytest.mark.backlog("RP-745")
+@pytest.mark.backlog_fixed("RP-745")
 def test_a_sorted_cursor_postpones_an_expensive_column(dsn: str) -> None:
     """A cursor is planned with `cursor_tuple_fraction` (0.1), which
     `make_sort_input_target` treats as a LIMIT: an expensive column
     (`to_tsvector`, `procost` 100) is postponed past the Sort, so `fetch
     1` computes it for the row that sorts first only. PostgreSQL 15.19
-    answers that row; here the column is computed below the Sort for every
-    row, and the first row's missing configuration is raised."""
+    answers that row; here the column was computed below the Sort for
+    every row, and the first row's missing configuration was raised."""
     assert _fetch_one(
         dsn,
         "declare c cursor for select k, to_tsvector(case when k = 1 then 'nope'"
         " else 'simple' end::regconfig, 'a')::text from (values (1), (2)) s(k)"
         " order by k desc",
     ) == [(2, "'a':1")]
+
+
+@pytest.mark.backlog_fixed("RP-745")
+def test_cursor_tuple_fraction_decides_the_postponement(dsn: str) -> None:
+    """`standard_planner` plans a cursor for the whole result when
+    `cursor_tuple_fraction` is 1 or more, so the expensive column is
+    computed below the Sort for every row and the first row's error is
+    raised; at 0 it takes the smallest fraction above 0 and postpones it.
+    Measured on PostgreSQL 15.19."""
+    declare = (
+        "declare c cursor for select k, to_tsvector(case when k = 1 then 'nope'"
+        " else 'simple' end::regconfig, 'a')::text from (values (1), (2)) s(k)"
+        " order by k desc"
+    )
+    answers = []
+    for fraction in ("1", "0"):
+        with psycopg.connect(dsn) as c:
+            c.execute(f"set cursor_tuple_fraction = {fraction}")
+            try:
+                c.execute(declare)
+                answers.append(c.execute("fetch 1 from c").fetchall())
+            except psycopg.Error as e:
+                answers.append((e.sqlstate, str(e).splitlines()[0]))
+    assert answers == [
+        ("42704", 'text search configuration "nope" does not exist'),
+        [(2, "'a':1")],
+    ]
 
 
 @pytest.mark.backlog("RP-746")

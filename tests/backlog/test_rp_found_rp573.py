@@ -58,6 +58,8 @@ PSEUDO_TYPE = [
     _F.format("declare x anyelement; begin return 1; end"),
     "create function e573() returns int language plpgsql as $$\n"
     "declare\n  y int;\n  x void; begin return 1; end $$",
+    _F.format("declare x record; begin return 1; end"),
+    _F.format('declare x pg_catalog."any"; begin return 1; end'),
 ]
 
 # The compiler reads the body once, from the start: a declaration's missing
@@ -97,8 +99,10 @@ def test_declare_of_text_that_is_not_one_type_name(dsn: str) -> None:
     ]
 
 
-@pytest.mark.backlog("RP-618")
+@pytest.mark.backlog_fixed("RP-618")
 def test_declare_of_a_pseudo_type(dsn: str) -> None:
+    """A variable of a pseudo-type was created; `plpgsql_build_variable`
+    refuses one. `record` is a record variable, and `record[]` is refused."""
     assert _compiled(dsn, PSEUDO_TYPE) == [
         (
             "0A000",
@@ -111,6 +115,13 @@ def test_declare_of_a_pseudo_type(dsn: str) -> None:
             'variable "x" has pseudo-type void',
             None,
             'compilation of PL/pgSQL function "e573" near line 4',
+        ),
+        "ok",
+        (
+            "0A000",
+            'variable "x" has pseudo-type "any"',
+            None,
+            'compilation of PL/pgSQL function "e573" near line 1',
         ),
     ]
 

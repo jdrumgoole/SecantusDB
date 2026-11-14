@@ -2168,6 +2168,41 @@ fn row_compare(
     }
 }
 
+/// Does this computed column read the database in the snapshot of the
+/// statement that runs it: a correlated subquery, a user function that is
+/// not VOLATILE, a function the executor answers that is not volatile, or
+/// a user cast's function? PostgreSQL runs a non-volatile function in its
+/// caller's snapshot, so in a cursor's select list such a column reads what
+/// the DECLARE's snapshot holds whenever a FETCH computes it; a VOLATILE
+/// one takes a snapshot of its own for each statement it runs.
+pub fn reads_portal_snapshot(expr: &ColumnExpr) -> bool {
+    let ColumnExpr::Row { expr, .. } = expr else {
+        return false;
+    };
+    let mut node = (**expr).clone();
+    let mut found = false;
+    let _ = walk_expr(&mut node, &mut |n| {
+        if let Some(N::FuncCall(f)) = n.node.as_ref() {
+            found |= is_correlated(f)
+                || func_name(f).is_some_and(|name| match user_function_for(&name, &f.args) {
+                    Some(u) => !u.volatile,
+                    None => {
+                        executor_answers(name.as_str())
+                            && !volatile_builtin(name.as_str(), f.args.len())
+                    }
+                });
+        }
+        if let Some(N::TypeCast(tc)) = n.node.as_ref() {
+            found |= tc
+                .type_name
+                .as_ref()
+                .is_some_and(|t| crate::user_casts::casts_to(&crate::type_name_of(t)));
+        }
+        Ok(())
+    });
+    found
+}
+
 /// Does this computed column contain a correlated subquery? Such a column
 /// has to be evaluated where the executor's runner is installed, not lazily
 /// inside a row stream that outlives it.

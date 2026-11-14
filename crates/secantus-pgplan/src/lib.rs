@@ -5668,6 +5668,18 @@ fn plan_query_node(
 /// The DECLARE of `inner`, the cursor's planned query.
 fn declare_cursor(d: &pg_query::protobuf::DeclareCursorStmt, inner: Statement) -> Statement {
     let inner_node = d.query.as_ref().and_then(|q| q.node.as_ref());
+    // A cursor's query is planned for the share of its rows it expects to
+    // be fetched (`cursor_tuple_fraction`), which postpones an expensive
+    // column past the Sort as a LIMIT does (RP-745).
+    let mut inner = inner;
+    if let (Statement::Select(sel), Some(N::SelectStmt(s))) = (&mut inner, inner_node) {
+        if !sel.sort_input.is_empty() {
+            let judged = sort_input::cursor_sort_input_columns(s, &sel.columns);
+            if judged.len() == sel.sort_input.len() {
+                sel.sort_input = judged;
+            }
+        }
+    }
     // PostgreSQL's cursor-option bitmask (`nodes/parsenodes.h`).
     const CURSOR_OPT_BINARY: i32 = 0x0001;
     const CURSOR_OPT_SCROLL: i32 = 0x0002;
@@ -7510,6 +7522,9 @@ fn resolve_routine_types(
 pub enum DeclaredTypeError {
     AtType(Error),
     Compile(Error),
+    /// A pseudo-type, as printed: 0A000 `variable "x" has pseudo-type t`,
+    /// with the compiler's frame (RP-618).
+    PseudoType(&'static str),
 }
 
 /// The relation a `name%ROWTYPE` names, as `plpgsql_parse_wordrowtype`
@@ -7557,6 +7572,35 @@ fn rowtype_relation_missing(parts: &[String]) -> Result<()> {
 /// What this does not check is let through: a `%TYPE` (a variable or a
 /// column, resolved where it is used), and a text that is not one type
 /// name, which PostgreSQL refuses as a syntax error.
+/// The pseudo-type a declaration names, as `format_type_be` prints it:
+/// `plpgsql_build_variable` refuses a variable of one (`build_datatype`'s
+/// `PLPGSQL_TTYPE_PSEUDO`), `record` aside, which is a record variable.
+fn plpgsql_pseudo_type(tn: &pg_query::protobuf::TypeName) -> Option<&'static str> {
+    let parts: Vec<&str> = tn
+        .names
+        .iter()
+        .filter_map(|n| match n.node.as_ref()? {
+            N::String(s) => Some(s.sval.as_str()),
+            _ => None,
+        })
+        .collect();
+    let bare = match parts.as_slice() {
+        [bare] | ["pg_catalog", bare] => *bare,
+        _ => return None,
+    };
+    let printed = match (bare, tn.array_bounds.is_empty()) {
+        ("record", true) => return None,
+        ("record", false) => "record[]".to_string(),
+        ("any", true) => "\"any\"".to_string(),
+        (_, true) => bare.to_string(),
+        (_, false) => return None,
+    };
+    pgtypes::PSEUDO_TYPES
+        .iter()
+        .find(|(_, t)| *t == printed)
+        .map(|(_, t)| *t)
+}
+
 pub fn plpgsql_declared_type(text: &str) -> std::result::Result<(), DeclaredTypeError> {
     let text = text.trim();
     // The type text as SQL reads a cast's target type.
@@ -7606,7 +7650,9 @@ pub fn plpgsql_declared_type(text: &str) -> std::result::Result<(), DeclaredType
         return Ok(());
     };
     match routine_type_missing(&tn) {
-        Ok(None) => Ok(()),
+        Ok(None) => {
+            plpgsql_pseudo_type(&tn).map_or(Ok(()), |t| Err(DeclaredTypeError::PseudoType(t)))
+        }
         Ok(Some(t)) => Err(DeclaredTypeError::AtType(Error::UndefinedObject(format!(
             "type \"{t}\" does not exist"
         )))),
@@ -52330,7 +52376,20 @@ mod rp573_declared_types {
             Ok(()) => None,
             Err(DeclaredTypeError::AtType(e)) => Some((true, e.sqlstate().into(), e.to_string())),
             Err(DeclaredTypeError::Compile(e)) => Some((false, e.sqlstate().into(), e.to_string())),
+            Err(DeclaredTypeError::PseudoType(t)) => Some((false, "0A000".into(), t.into())),
         }
+    }
+
+    /// `plpgsql_build_variable` refuses a pseudo-type, `record` aside
+    /// (RP-618).
+    #[test]
+    fn a_pseudo_type_is_refused() {
+        let pseudo = |t: &str| Some((false, "0A000".to_string(), t.to_string()));
+        assert_eq!(refused("anyelement"), pseudo("anyelement"));
+        assert_eq!(refused("pg_catalog.void"), pseudo("void"));
+        assert_eq!(refused("\"any\""), pseudo("\"any\""));
+        assert_eq!(refused("record[]"), pseudo("record[]"));
+        assert_eq!(refused("record"), None);
     }
 
     /// A DECLARE's type is looked up as `parse_datatype` and the
