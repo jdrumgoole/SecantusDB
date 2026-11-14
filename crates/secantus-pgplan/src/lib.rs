@@ -25477,6 +25477,26 @@ fn declare_sublink_param(at: usize, t: &str) {
     });
 }
 
+/// The `typmods` a `numeric(p,s)` `TypeName` spells `typmod` with: the
+/// precision and the scale (`make_numeric_typmod` undone; the scale is an
+/// 11-bit signed field).
+fn numeric_typmods(typmod: i32) -> Vec<pg_query::protobuf::Node> {
+    let raw = typmod - 4;
+    let precision = (raw >> 16) & 0xffff;
+    let scale = ((raw & 0x7ff) ^ 1024) - 1024;
+    [precision, scale]
+        .into_iter()
+        .map(|ival| pg_query::protobuf::Node {
+            node: Some(N::AConst(pg_query::protobuf::AConst {
+                val: Some(pg_query::protobuf::a_const::Val::Ival(
+                    pg_query::protobuf::Integer { ival },
+                )),
+                ..Default::default()
+            })),
+        })
+        .collect()
+}
+
 /// The `typmods` a `TypeName` of type `base` spells `typmod` with, as the
 /// parser leaves them -- `character(3)`, `numeric(5,2)`, `timestamp(3)` --
 /// the inverse of `declared_typmod`. A subquery's value is cast at its
@@ -26024,7 +26044,13 @@ fn resolve_one_sublink(
             // through the base type at its modifier: a `char(n)` domain's
             // value, stored without its blanks, gets them back (RP-569).
             let domain = domains::user_domain(base).is_some();
-            if !domain && (!sublink_value_cast(base) || matches!(base, "int2vector" | "oidvector"))
+            // A `numeric(p,s)` column's array is cast to `numeric(p,s)[]`,
+            // which the values already fit, so it describes the modifier
+            // (RP-667).
+            let sized_numeric = base == "numeric" && typmod > 4;
+            if !domain
+                && !sized_numeric
+                && (!sublink_value_cast(base) || matches!(base, "int2vector" | "oidvector"))
             {
                 declare_sublink_param(params.len() - 1, &array);
                 return Ok(node);
@@ -26040,7 +26066,11 @@ fn resolve_one_sublink(
             // to `character(n)[]` gives them back, as `array[c]` and
             // `array_agg(c)` have them (RP-656).
             let mut type_name = type_name_node(&array);
-            type_name.typmods = length_typmods(base, typmod);
+            type_name.typmods = if sized_numeric {
+                numeric_typmods(typmod)
+            } else {
+                length_typmods(base, typmod)
+            };
             Ok(pg_query::protobuf::Node {
                 node: Some(N::TypeCast(Box::new(pg_query::protobuf::TypeCast {
                     arg: Some(Box::new(node)),

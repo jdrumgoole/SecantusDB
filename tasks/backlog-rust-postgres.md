@@ -2802,21 +2802,6 @@ Measured on a private PostgreSQL 15.19 cluster with the `_SETUP` in
 over `create domain d665 as int` and `create domain dc665 as char(4)`.
 
 
-## Found while working RP-656 (2026-11-08)
-
-Measured on a private PostgreSQL 15.19 cluster with the `_SETUP` in
-`tests/backlog/test_rp_found_rp656.py`: `t656(c char(3), v varchar(4), n
-numeric(5,2), ca char(3)[])` holding `('xy', 'ab', 2.5, '{a,bc}')`.
-
-- [ ] **An `ARRAY(select n ...)` over a `numeric(p,s)` column describes no
-      modifier.** `select array(select n from t656)` describes `numeric[]`
-      327686 on PostgreSQL 15.19 (`exprTypmod` of an ARRAY sublink is its
-      column's); here it is -1. Since RP-656 a `char(n)` or `varchar(n)`
-      column's array is cast at its modifier and describes it; a numeric
-      one is declared as `numeric[]`, which carries none.
-      Verify: tests/backlog/test_rp_found_rp656.py::test_array_sublink_of_numeric_describes_its_modifier
-      Backlog-ID: RP-667
-
 ## Found while working RP-682 (2026-11-11)
 
 Measured on PostgreSQL 15.19 (the shared reference on port 5415) with the
