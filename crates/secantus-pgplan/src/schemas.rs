@@ -1267,6 +1267,36 @@ pub fn qualify(node: &mut N) -> Result<()> {
                     | ObjectType::ObjectForeignTable)
             );
             let index = ObjectType::try_from(d.remove_type) == Ok(ObjectType::ObjectIndex);
+            // `DropErrorMsgNonExistent` asks for a written schema first: one
+            // that does not exist is 3F000, or under IF EXISTS skipped with
+            // its own notice (RP-533).
+            if relation_kind || index {
+                let mut kept = Vec::with_capacity(d.objects.len());
+                for o in std::mem::take(&mut d.objects) {
+                    let missing = match o.node.as_ref() {
+                        Some(N::List(l)) => match strings(l).as_deref() {
+                            Some([schema, _]) | Some([_, schema, _]) if !schema_exists(schema) => {
+                                Some(schema.clone())
+                            }
+                            _ => None,
+                        },
+                        _ => None,
+                    };
+                    match missing {
+                        Some(schema) if d.missing_ok => crate::fts::planner_notice(&format!(
+                            "schema \"{schema}\" does not exist, skipping"
+                        )),
+                        Some(schema) => {
+                            return Err(Error::Sqlstate(
+                                "3F000",
+                                format!("schema \"{schema}\" does not exist"),
+                            ))
+                        }
+                        None => kept.push(o),
+                    }
+                }
+                d.objects = kept;
+            }
             // With IF EXISTS, such a name is skipped with PostgreSQL's
             // notice, and is not dropped (RP-011).
             if relation_kind && d.missing_ok {
