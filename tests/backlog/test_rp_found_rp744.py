@@ -4,8 +4,9 @@ computed every row's select list at the DECLARE):
 - a user function call, a `nextval` or a scalar subquery in a cursor's
   select list is still computed for every row at the DECLARE;
 - a cursor over a set operation computes its rows at the DECLARE;
-- a cursor's WHERE and Sort run at the DECLARE, where PostgreSQL runs
-  them at the first FETCH;
+- a cursor's WHERE and Sort ran at the DECLARE, where PostgreSQL runs
+  them at the first FETCH (fixed, RP-897), and its WHERE is still
+  evaluated for every row at that FETCH (RP-961);
 - `FETCH FORWARD 0` / `FETCH 0` / `FETCH BACKWARD 0` answered no row, and
   `MOVE FORWARD 0` moved over none (fixed, RP-898);
 - `pg_cursors.statement` is a deparse of the query, not the DECLARE text;
@@ -112,11 +113,11 @@ def test_a_cursor_over_a_union_computes_its_rows_as_they_are_fetched(dsn: str) -
     ) == ["BEGIN", "DECLARE CURSOR", [(1,)], "ROLLBACK"]
 
 
-@pytest.mark.backlog("RP-897")
+@pytest.mark.backlog_fixed("RP-897")
 def test_a_cursor_runs_its_query_at_the_first_fetch(dsn: str) -> None:
     """PostgreSQL 15.19's DECLARE only plans (`PortalStart`): a WHERE or a
-    Sort that raises does so at the first FETCH. Here the query runs at the
-    DECLARE, which raises, and the cursor is never made."""
+    Sort that raises does so at the first FETCH. Here the query ran at the
+    DECLARE, which raised, and the cursor was never made."""
     assert [
         _steps(
             dsn,
@@ -140,6 +141,137 @@ def test_a_cursor_runs_its_query_at_the_first_fetch(dsn: str) -> None:
     ] == [
         ["BEGIN", "DECLARE CURSOR", ("22012", "division by zero"), "ROLLBACK"],
         ["BEGIN", "DECLARE CURSOR", ("22012", "division by zero"), "ROLLBACK"],
+    ]
+
+
+@pytest.mark.backlog_fixed("RP-897")
+def test_a_deferred_cursor_reads_the_declares_snapshot(dsn: str) -> None:
+    """A cursor's query runs at its first FETCH, but it reads what the
+    DECLARE's snapshot holds: rows the block inserts or updates after the
+    DECLARE are not the cursor's. Measured on a private PostgreSQL 15.19
+    cluster."""
+    n = uuid.uuid4().hex[:8]
+    t = f"rp897_{n}"
+    with psycopg.connect(dsn, autocommit=True) as c:
+        c.execute(f"create table {t} (k int)")
+        c.execute(f"insert into {t} values (1), (2)")
+    assert [
+        _steps(
+            dsn,
+            [
+                "begin",
+                f"declare c cursor for select k from {t} where k > 0 order by k",
+                f"insert into {t} values (3)",
+                "fetch all from c",
+                f"select count(*) from {t}",
+                "rollback",
+            ],
+        ),
+        _steps(
+            dsn,
+            [
+                "begin",
+                f"declare c cursor for select k from {t} where k > 0",
+                f"update {t} set k = k + 10",
+                "fetch all from c",
+                "rollback",
+            ],
+        ),
+    ] == [
+        ["BEGIN", "DECLARE CURSOR", "INSERT 0 1", [(1,), (2,)], [(3,)], "ROLLBACK"],
+        ["BEGIN", "DECLARE CURSOR", "UPDATE 2", [(1,), (2,)], "ROLLBACK"],
+    ]
+
+
+@pytest.mark.backlog_fixed("RP-897")
+def test_a_deferred_cursor_raises_at_its_fetch(dsn: str) -> None:
+    """A cursor's run that another statement of the block started (to keep
+    the DECLARE's snapshot) raises its error at the FETCH that reaches it,
+    as PostgreSQL 15.19's would; one no FETCH reads raises nothing, and a
+    WITH HOLD one runs whole at the COMMIT, which its error fails.
+    Measured on a private PostgreSQL 15.19 cluster."""
+    where = "select k from (values (2), (0)) s(k) where 1/k > 0"
+    assert [
+        _steps(
+            dsn,
+            [
+                "begin",
+                f"declare c cursor for {where}",
+                "select 1",
+                "fetch 1 from c",
+                "rollback",
+            ],
+        ),
+        _steps(dsn, ["begin", f"declare c cursor for {where}", "close c", "select 1", "commit"]),
+        _steps(
+            dsn,
+            ["begin", f"declare c cursor with hold for {where}", "commit", "fetch 1 from c"],
+        ),
+        _steps(
+            dsn,
+            [
+                "begin",
+                "declare c cursor with hold for select k, 1/(k - 1) from (values (2), (3)) s(k)"
+                " order by k",
+                "commit",
+                "fetch all from c",
+                "close c",
+            ],
+        ),
+        _steps(
+            dsn,
+            [
+                "begin",
+                f"declare c cursor for {where}",
+                "select name, statement from pg_cursors",
+                "fetch 1 from c",
+                "rollback",
+            ],
+        ),
+    ] == [
+        ["BEGIN", "DECLARE CURSOR", [(1,)], ("22012", "division by zero"), "ROLLBACK"],
+        ["BEGIN", "DECLARE CURSOR", "CLOSE CURSOR", [(1,)], "COMMIT"],
+        [
+            "BEGIN",
+            "DECLARE CURSOR",
+            ("22012", "division by zero"),
+            ("34000", 'cursor "c" does not exist'),
+        ],
+        ["BEGIN", "DECLARE CURSOR", "COMMIT", [(2, 1), (3, 0)], "CLOSE CURSOR"],
+        [
+            "BEGIN",
+            "DECLARE CURSOR",
+            [("c", f"declare c cursor for {where}")],
+            ("22012", "division by zero"),
+            "ROLLBACK",
+        ],
+    ]
+
+
+@pytest.mark.backlog("RP-961")
+def test_a_cursors_where_filters_as_it_is_fetched(dsn: str) -> None:
+    """PostgreSQL 15.19 filters a cursor's rows as it is fetched: with no
+    Sort, `fetch 1` evaluates the WHERE only up to the first row that
+    passes, so a later row's error is raised by the FETCH that reaches it.
+    Here the first FETCH evaluates the WHERE for every row and raises.
+    Measured on a private PostgreSQL 15.19 cluster."""
+    assert _steps(
+        dsn,
+        [
+            "begin",
+            "declare c cursor for select k from (values (1), (2), (0)) s(k) where 10/k > 1",
+            "fetch 1 from c",
+            "fetch 1 from c",
+            "fetch 1 from c",
+            "rollback",
+        ],
+    ) == [
+        "BEGIN",
+        "DECLARE CURSOR",
+        [(1,)],
+        [(2,)],
+        ("22012", "division by zero"),
+        "ROLLBACK",
     ]
 
 

@@ -2707,13 +2707,6 @@ and `fs(a int, c text)`.
 Measured on a private, freshly initdb'd PostgreSQL 15.19 cluster. The gap
 tests are in `tests/backlog/test_rp_found_rp546.py`.
 
-- [ ] **DROP TYPE of a table's row type with a routine over it names the
-      routines.** PostgreSQL 15.19 answers `drop type r562` with 2BP01
-      `cannot drop type r562 because table r562 requires it` whatever else
-      names the type; here a routine over it makes the answer that routine's
-      `other objects depend on it`. With no routine it already matches.
-      Backlog-ID: RP-562
-      Verify: tests/backlog/test_rp_found_rp546.py::test_drop_type_of_a_row_type_with_a_routine
 - [ ] **A `regprocedure` prints its name unquoted and a schema's type
       quoted whole.** `regprocedureout` is `format_procedure`: `"Q
       f567"(s567.t)` and `s567.h(s567.t)` on PostgreSQL 15.19. Here they are
@@ -3468,6 +3461,42 @@ tests are scenarios in `tests/backlog/test_rp_batch26.py`.
       Backlog-ID: RP-049
       Verify: none -- internal code structure; no answer differs from PostgreSQL
 
+## Found while working RP-619 (2026-11-14)
+
+Measured on a private PostgreSQL 15.19 cluster.
+
+- [ ] **A syntax error in a PL/pgSQL expression is placed at the end of
+      the statement, not in the body.** `check_sql_expr` parses each
+      expression as the compiler reads it, and the error is placed at the
+      expression's token, transposed into the statement: on PostgreSQL
+      15.19 `create function e619() returns int language plpgsql as $$
+      begin return 1 +; end $$` is `syntax error at end of input` at 75,
+      with `declare x int := 1 +;` at 79, and `do $$ declare x int := 1 +;
+      begin null; end $$` at 27. Here they are at 83, 103 and 47. And `do
+      $$ begin perform 1 +; end $$` is the same error at 24 there, found at
+      compile; here it is at 32, found when the PERFORM runs (CONTEXT
+      `PL/pgSQL function inline_code_block line 1 at PERFORM`). RP-621 is
+      the compile errors with no position, RP-492 a DO's grammar errors.
+      Verify: tests/backlog/test_rp_found_rp619.py::test_expression_syntax_error_is_placed_in_the_body
+      Backlog-ID: RP-958
+- [ ] **A DO block refuses PL/pgSQL's `#` compile options.**
+      `plpgsql_compile_inline` reads a DO body with the function grammar,
+      so `do $$ #variable_conflict use_column\n begin null; end $$` and
+      `#print_strict_params on` before a DECLARE run on PostgreSQL 15.19.
+      Here both are 42601 `syntax error at or near "#"` at 7 (`pl::parse`
+      refuses the `#` before the body reaches the interpreter).
+      Verify: tests/backlog/test_rp_found_rp619.py::test_do_block_takes_compile_options
+      Backlog-ID: RP-959
+- [ ] **A RETURN with a value in a routine returning void is accepted.**
+      `make_return_stmt` refuses it as it reads the RETURN, before the
+      expression is parsed: on PostgreSQL 15.19 `do $$ begin return 1; end
+      $$` is 42804 `RETURN cannot have a parameter in function returning
+      void` at 20, `return 1 +;` the same, and a `returns void` function's
+      `return 1 +;` the same at 73. Here the first runs, and the other two
+      are 42601 `syntax error at end of input` (31, 84).
+      Verify: tests/backlog/test_rp_found_rp619.py::test_return_with_a_value_in_a_void_routine
+      Backlog-ID: RP-960
+
 ## Found while working RP-573 (2026-11-08)
 
 Measured on a private PostgreSQL 15.19 cluster, each statement in a new
@@ -3497,13 +3526,6 @@ keeps; what follows is what that lookup does not yet check.
       is created.
       Verify: tests/backlog/test_rp_found_rp573.py::test_declare_of_a_pseudo_type
       Backlog-ID: RP-618
-- [ ] **A DECLARE's missing type is reported after a later syntax error.**
-      PL/pgSQL compiles the body in one pass, so `declare x nosuch573; begin
-      return 1 +; end` is 42704 `type "nosuch573" does not exist` at 69 on
-      PostgreSQL 15.19. Here the whole body is parsed first, and the answer
-      is 42601 `syntax error at end of input` at 104.
-      Verify: tests/backlog/test_rp_found_rp573.py::test_declare_type_found_before_a_later_syntax_error
-      Backlog-ID: RP-619
 - [ ] **A `pg_temp` type in a session with no temporary schema is a
       missing type, not a missing schema.** `LookupExplicitNamespace`
       finds `pg_temp` only once the session has made its temp schema, so on
@@ -3688,16 +3710,17 @@ at the DECLARE, and the cursor answers that differ either way.
       Append is run as it is fetched, and `fetch 1` answers `1`.
       Verify: tests/backlog/test_rp_found_rp744.py::test_a_cursor_over_a_union_computes_its_rows_as_they_are_fetched
       Backlog-ID: RP-896
-- [ ] **A cursor's WHERE and Sort run at the DECLARE, not at the first
-      FETCH.** PostgreSQL 15.19's DECLARE only plans: `declare c cursor for
-      select k from (values (2), (0)) s(k) where 1/k > 0` succeeds and its
-      `fetch 1` raises 22012, as does a Sort over a select list that raises
-      (`... order by k desc`). Here the DECLARE runs the query and raises,
-      and no cursor is made. Deferring the run must keep the DECLARE's
-      snapshot: a row the block writes after the DECLARE is not the
-      cursor's.
-      Verify: tests/backlog/test_rp_found_rp744.py::test_a_cursor_runs_its_query_at_the_first_fetch
-      Backlog-ID: RP-897
+- [ ] **A cursor's WHERE is evaluated for every row at its first FETCH.**
+      Since RP-897 a cursor's query runs at the first FETCH that needs a
+      row (`portal_stream::PendingRows::Unstarted`), but the executor
+      evaluates the whole WHERE when it runs: `declare c cursor for select
+      k from (values (1), (2), (0)) s(k) where 10/k > 1` raises 22012 at
+      `fetch 1`, where PostgreSQL 15.19 filters as it is fetched and
+      answers `1`, then `2`, and the third FETCH raises. Needs the scan's
+      filter run in the row stream, as the select list is since RP-744.
+      Found while working RP-897 (2026-11-14).
+      Verify: tests/backlog/test_rp_found_rp744.py::test_a_cursors_where_filters_as_it_is_fetched
+      Backlog-ID: RP-961
 - [ ] **A PL/pgSQL FETCH from a `refcursor` parameter is refused at CREATE
       FUNCTION.** `create function f(c refcursor) returns int language
       plpgsql as $$ declare r int; begin fetch c into r; return r; end $$`

@@ -61,9 +61,12 @@ PSEUDO_TYPE = [
 ]
 
 # The compiler reads the body once, from the start: a declaration's missing
-# type is found before a syntax error later in the body.
+# type is found before a syntax error later in the body, in the DECLARE
+# section or a nested block's.
 TYPE_BEFORE_SYNTAX = [
     _F.format("declare x nosuch573; begin return 1 +; end"),
+    _F.format("declare x nosuch573; y int := 1 +; begin return 1; end"),
+    _F.format("begin declare x nosuch573; begin null; end; return 1 +; end"),
 ]
 
 # `LookupExplicitNamespace("pg_temp")` in a session with no temporary
@@ -112,10 +115,14 @@ def test_declare_of_a_pseudo_type(dsn: str) -> None:
     ]
 
 
-@pytest.mark.backlog("RP-619")
+@pytest.mark.backlog_fixed("RP-619")
 def test_declare_type_found_before_a_later_syntax_error(dsn: str) -> None:
+    """A declaration's missing type was reported after a later syntax error:
+    the whole body was parsed before any type was looked up."""
     assert _compiled(dsn, TYPE_BEFORE_SYNTAX) == [
-        ("42704", 'type "nosuch573" does not exist', "69", None)
+        ("42704", 'type "nosuch573" does not exist', "69", None),
+        ("42704", 'type "nosuch573" does not exist', "69", None),
+        ("42704", 'type "nosuch573" does not exist', "75", None),
     ]
 
 

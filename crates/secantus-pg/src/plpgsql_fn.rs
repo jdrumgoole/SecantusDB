@@ -848,6 +848,126 @@ pub fn declared_types(create_sql: &str) -> Vec<Declared> {
         .unwrap_or_default()
 }
 
+/// For a body that does not parse: what PL/pgSQL's compiler had read of
+/// it when it stopped, as a body that does (RP-619). The compiler is one
+/// pass, and `read_datatype` looks a declaration's type up as the grammar
+/// reaches it, so every declaration before the error -- in a nested block
+/// too -- was looked up first, and a missing type among them is the error
+/// PostgreSQL reports. The answer is `create_sql` with the body cut after
+/// the last statement or declaration the compiler got through, and what
+/// was open there closed (`begin end;`, `end;`, `end if;`, `end loop;`,
+/// `end case;`). A cut whose closed text parses is a prefix the grammar
+/// accepts, so the compiler got that far whatever follows: a closer this
+/// scan guesses wrong only makes a cut fail, never pass. `None` when no
+/// cut parses.
+pub fn compiled_declarations(create_sql: &str) -> Option<String> {
+    use pg_query::protobuf::Token;
+    #[derive(Clone, Copy)]
+    enum Open {
+        Block {
+            declaring: bool,
+        },
+        Loop,
+        If,
+        Case,
+        /// A SQL `CASE` expression, closed by a bare `END`.
+        CaseExpr,
+    }
+    let (offset, body) = row_type::body_of(create_sql)?;
+    let scan = pg_query::scan(body).ok()?;
+    let tokens: Vec<(usize, String)> = scan
+        .tokens
+        .iter()
+        .filter(|t| t.token != Token::SqlComment as i32 && t.token != Token::CComment as i32)
+        .filter_map(|t| {
+            let text = body.get(t.start as usize..t.end as usize)?;
+            Some((t.end as usize, text.to_ascii_lowercase()))
+        })
+        .collect();
+    // Each place a statement or declaration ends, with what closes the
+    // constructs open there.
+    let mut cuts: Vec<(usize, String)> = Vec::new();
+    let mut open: Vec<Open> = Vec::new();
+    let mut depth = 0i32;
+    let mut i = 0;
+    while i < tokens.len() {
+        let text = tokens[i].1.as_str();
+        let prev = i.checked_sub(1).map(|p| tokens[p].1.as_str());
+        let starts_statement = matches!(
+            prev,
+            None | Some(";" | "begin" | "then" | "else" | "loop" | ">>")
+        );
+        match text {
+            "(" | "[" => depth += 1,
+            ")" | "]" => depth -= 1,
+            _ if depth > 0 => {}
+            "declare" => {
+                if !matches!(open.last(), Some(Open::Block { declaring: true })) {
+                    open.push(Open::Block { declaring: true });
+                }
+            }
+            "begin" => match open.last_mut() {
+                Some(Open::Block { declaring }) if *declaring => *declaring = false,
+                _ => open.push(Open::Block { declaring: false }),
+            },
+            "loop" => open.push(Open::Loop),
+            "if" if starts_statement => open.push(Open::If),
+            "case" if starts_statement => open.push(Open::Case),
+            "case" => open.push(Open::CaseExpr),
+            "end" => {
+                if matches!(
+                    tokens.get(i + 1).map(|t| t.1.as_str()),
+                    Some("if" | "loop" | "case")
+                ) {
+                    i += 1;
+                }
+                open.pop();
+            }
+            ";" => {
+                let closers: Option<String> = open
+                    .iter()
+                    .rev()
+                    .map(|o| match o {
+                        Open::Block { declaring: true } => Some(" begin end;"),
+                        Open::Block { declaring: false } => Some(" end;"),
+                        Open::Loop => Some(" end loop;"),
+                        Open::If => Some(" end if;"),
+                        Open::Case => Some(" end case;"),
+                        Open::CaseExpr => None,
+                    })
+                    .collect();
+                if let Some(closers) = closers.filter(|c| !c.is_empty()) {
+                    cuts.push((tokens[i].0, closers));
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    let tail = &create_sql[offset + body.len()..];
+    let stub = |k: usize| {
+        let (cut, closers) = &cuts[k];
+        format!("{}{closers} {tail}", &create_sql[..offset + cut])
+    };
+    let parses = |k: usize| validate(&stub(k)).is_ok();
+    // The last cut that parses: a prefix of an accepted prefix is accepted,
+    // so search for where acceptance ends.
+    let last = cuts.len().checked_sub(1)?;
+    if parses(last) {
+        return Some(stub(last));
+    }
+    let (mut lo, mut hi) = (-1isize, last as isize);
+    while hi - lo > 1 {
+        let mid = (lo + hi) / 2;
+        if parses(mid as usize) {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    usize::try_from(lo).ok().map(stub)
+}
+
 /// Where in `body` (a byte offset) the type of `d` begins: the first place
 /// from the start of its line where its text follows its name, with an
 /// optional `CONSTANT` between, as the declaration (`decl_varname
@@ -3628,6 +3748,59 @@ mod rp573_declarations {
             (4, "v", "s.t"),
         ];
         assert_eq!(got, want.map(|(l, n, t)| (l, n.to_string(), t.to_string())));
+    }
+
+    /// A body that does not parse is read as far as the compiler got:
+    /// past its declarations, nested blocks' included, up to the error,
+    /// through `#option`, a label, loops, IFs and CASE (RP-619).
+    #[test]
+    fn compiled_declarations_stop_where_the_compiler_stopped() {
+        let f = |body: &str| {
+            format!(
+                "CREATE FUNCTION f() RETURNS int AS $secantus_body${body}$secantus_body$ \
+                 LANGUAGE plpgsql"
+            )
+        };
+        let names = |body: &str| -> Vec<String> {
+            assert!(validate(&f(body)).is_err(), "{body}");
+            compiled_declarations(&f(body))
+                .map(|stub| {
+                    declared_types(&stub)
+                        .into_iter()
+                        .map(|d| d.refname)
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        let v = |n: &[&str]| n.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            names(" declare x nosuch; begin return 1 +; end "),
+            v(&["x"])
+        );
+        assert_eq!(
+            names(" declare x nosuch; y int := 1 +; z int; begin return 1; end "),
+            v(&["x"])
+        );
+        assert_eq!(
+            names(
+                " #variable_conflict use_column\n <<l>> declare a int; b t; begin return 1 +; end "
+            ),
+            v(&["a", "b"])
+        );
+        assert_eq!(names(" declare x int := 1 +; begin return 1; end "), v(&[]));
+        assert_eq!(
+            names(" begin declare x t; begin null; end; return 1 +; declare y t; begin end; end "),
+            v(&["x"])
+        );
+        assert_eq!(
+            names(
+                " begin if true then declare x t; begin null; end; else null; end if; \
+                 for i in 1..2 loop declare y t; begin null; end; end loop; \
+                 case 1 when 1 then declare z t; begin null; end; end case; \
+                 perform case when true then 1 end; return (1 +; end "
+            ),
+            v(&["x", "y", "z"])
+        );
     }
 
     /// A declared type is found after its variable's name, past a
