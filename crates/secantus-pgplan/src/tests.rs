@@ -8436,3 +8436,16 @@ fn an_aliased_scalar_functions_whole_row_is_its_value() {
         plan_select(s, &lookup, &[]).unwrap_or_else(|e| panic!("{sql}: {e:?}"));
     }
 }
+
+/// A sequence function's literal argument is read as `regclass` while the
+/// DEFAULT is analysed, so a relation it does not name is 42P01 at the
+/// literal (RP-888; PostgreSQL 15.19).
+#[test]
+fn a_regclass_literal_in_a_default_is_resolved() {
+    let sql = "create table t888 (a int default nextval('nosuch_seq'))";
+    take_error_location();
+    let err = plan(sql, &lookup).expect_err(sql);
+    assert_eq!(err.sqlstate(), "42P01", "{err}");
+    assert!(err.to_string().contains("\"nosuch_seq\""), "{err}");
+    assert_eq!(take_error_location(), Some(41));
+}

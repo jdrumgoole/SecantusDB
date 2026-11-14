@@ -2500,15 +2500,6 @@ Measured on a private PostgreSQL 15.19 cluster. The gap tests are in
       is skipped for such a statement, as PostgreSQL skips it.)
       Verify: tests/backlog/test_rp_found_rp881.py::test_if_not_exists_over_a_table_checks_nothing
       Backlog-ID: RP-887
-- [ ] **A DEFAULT's `nextval('nosuch_seq')` passes CREATE TABLE.**
-      `create table t (a int default nextval('nosuch_seq'))`
-      is 42P01 `relation "nosuch_seq" does not exist` at 42 on PostgreSQL
-      15.19: the literal is coerced to `nextval`'s `regclass` parameter
-      while the default is analysed, which runs `regclassin`. Here the
-      CREATE succeeds and the first INSERT fails. (An explicit
-      `'nosuch'::regclass` is already 42P01 at CREATE.)
-      Verify: tests/backlog/test_rp_found_rp881.py::test_a_regclass_literal_in_a_default_is_resolved
-      Backlog-ID: RP-888
 
 
 
