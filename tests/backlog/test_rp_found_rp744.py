@@ -9,8 +9,8 @@ computed every row's select list at the DECLARE):
   a volatile column;
 - `select * from cursor_to_xml(...)` reads the cursor twice;
 - a cursor over a set operation computed its rows at the DECLARE (fixed
-  for a UNION ALL whose branches have its types, RP-896), and still runs
-  one whose branches unification converts whole;
+  for a UNION ALL, its branches converted as they are read, RP-896), and
+  still runs one with a UNION, INTERSECT or EXCEPT under it whole;
 - a cursor's WHERE and Sort ran at the DECLARE, where PostgreSQL runs
   them at the first FETCH (fixed, RP-897), and its WHERE is still
   evaluated for every row at that FETCH (RP-961);
@@ -315,15 +315,15 @@ def test_a_union_all_cursor_reads_its_branches_in_order(dsn: str) -> None:
     ]
 
 
-@pytest.mark.backlog("RP-896")
+@pytest.mark.backlog_fixed("RP-896")
 def test_a_cursor_over_a_converting_union_computes_its_rows_as_they_are_fetched(
     dsn: str,
 ) -> None:
     """PostgreSQL 15.19's Append converts a branch's rows to the set
     operation's types as it reads them, so `fetch 1` over `select 1/(k - 1)
     ... union all select 2.5` answers the first branch's first row as a
-    numeric. Here a branch whose columns unification converts makes the
-    whole set operation run at the first FETCH, which raises the second
+    numeric. Here a branch whose columns unification converts made the
+    whole set operation run at the first FETCH, which raised the second
     row's error. Measured on the shared reference."""
     assert _steps(
         dsn,
@@ -335,6 +335,74 @@ def test_a_cursor_over_a_converting_union_computes_its_rows_as_they_are_fetched(
             "rollback",
         ],
     ) == ["BEGIN", "DECLARE CURSOR", [(Decimal("1"),)], "ROLLBACK"]
+
+
+@pytest.mark.backlog_fixed("RP-896")
+@pytest.mark.parametrize(
+    ("query", "rows", "types"),
+    [
+        (
+            "select 1 union all select 2.5 union all select null",
+            [(Decimal("1"),), (Decimal("2.5"),), (None,)],
+            [1700],
+        ),
+        ("select 'a'::char(3) union all select 'bb'::text", [("a  ",), ("bb",)], [1042]),
+        (
+            "select 0.1::float4 union all select 0.5::float8",
+            [(0.10000000149011612,), (0.5,)],
+            [701],
+        ),
+        (
+            "select k, 'x' from (values (1), (2)) s(k) union all select 2.5, 'y'::varchar(4)",
+            [(Decimal("1"), "x"), (Decimal("2"), "x"), (Decimal("2.5"), "y")],
+            [1700, 1043],
+        ),
+    ],
+)
+def test_a_union_all_cursor_converts_each_branch_to_the_unified_types(
+    dsn: str, query: str, rows: list[tuple[object, ...]], types: list[int]
+) -> None:
+    """Each row a cursor's Append reads is converted to the set operation's
+    unified types -- an int to numeric, a float4 to float8 by the cast, an
+    untyped literal to the other side's varchar, a `char(n)` kept padded --
+    and the FETCH describes those types, as PostgreSQL 15.19 answers (the
+    shared reference). Before RP-896 such a cursor ran whole; an Append
+    that kept the left side's types answered `3` for 2.5."""
+    with psycopg.connect(dsn, autocommit=True) as c:
+        c.execute("begin")
+        try:
+            c.execute(f"declare c cursor for {query}")
+            got: list[list[tuple[object, ...]]] = []
+            described: set[tuple[int, ...]] = set()
+            for _ in rows:
+                cur = c.execute("fetch 1 from c")
+                got.append(cur.fetchall())
+                described.add(tuple(d.type_code for d in cur.description or []))
+        finally:
+            c.execute("rollback")
+    assert ([r[0] for r in got], described) == (rows, {tuple(types)})
+
+
+@pytest.mark.backlog_fixed("RP-896")
+def test_a_cursor_over_a_union_under_a_union_all_computes_its_rows_as_they_are_fetched(
+    dsn: str,
+) -> None:
+    """PostgreSQL 15.19's Append reads its first branch before the UNION
+    under it, so `fetch 1` answers that branch's first row. Here a UNION
+    under the UNION ALL made the whole set operation run at the first
+    FETCH, which raised the first branch's second row's error; the UNION
+    is now one more leaf of the Append. Measured on the shared
+    reference."""
+    assert _steps(
+        dsn,
+        [
+            "begin",
+            "declare c cursor for select 1/(k - 1) from (values (2), (1)) s(k)"
+            " union all (select 5 union select 6)",
+            "fetch 1 from c",
+            "rollback",
+        ],
+    ) == ["BEGIN", "DECLARE CURSOR", [(1,)], "ROLLBACK"]
 
 
 @pytest.mark.backlog_fixed("RP-897")
@@ -722,3 +790,22 @@ def test_a_refcursor_parameter_can_be_fetched(dsn: str) -> None:
             "rollback",
         ],
     ) == ["CREATE FUNCTION", "BEGIN", "DECLARE CURSOR", [(7,)], "ROLLBACK"]
+
+
+@pytest.mark.backlog_fixed("RP-896")
+def test_a_cursor_reads_an_intersect_leaf_after_the_branch_before_it(
+    dsn: str,
+) -> None:
+    """The same Append with an INTERSECT under it: PostgreSQL 15.19
+    answers the first branch's rows, then the INTERSECT's, and raises
+    only when the FETCH reaches the first branch's failing row."""
+    assert _steps(
+        dsn,
+        [
+            "begin",
+            "declare c cursor for select 1/(k - 1) from (values (2), (3)) s(k)"
+            " union all (select 7 intersect select 7)",
+            "fetch all from c",
+            "rollback",
+        ],
+    ) == ["BEGIN", "DECLARE CURSOR", [(1,), (0,), (7,)], "ROLLBACK"]

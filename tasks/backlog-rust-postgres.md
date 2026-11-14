@@ -2486,14 +2486,22 @@ Measured on PostgreSQL 15.19 (the data-modifying WITH on a private cluster).
       PostgreSQL 15.19.
       Verify: tests/backlog/test_rp_qualified_calls.py::test_enclosing_call_waits_for_its_arguments
       Backlog-ID: RP-950
-- [ ] **A missing relation qualified with `pg_temp` is named by the
-      session's `pg_temp_N`.** On PostgreSQL 15.19 `select * from
-      pg_temp.nosuch` is 42P01 `relation "pg_temp.nosuch" does not exist`
-      at 15, the name as written, whether or not the session has a temp
-      table. Here it is `relation "pg_temp_N.nosuch" does not exist` at 23.
-      Measured on a private 15.19 cluster.
-      Verify: tests/backlog/test_rp_qualified_calls.py::test_pg_temp_relation_is_named_as_written
-      Backlog-ID: RP-882
+- [ ] **A missing relation qualified by another database is looked up,
+      not refused.** On PostgreSQL 15.19 `select * from x.pg_temp.nosuch`
+      is 0A000 `cross-database references are not implemented:
+      "x.pg_temp.nosuch"` at 15 (`RangeVarGetRelidExtended`). Here it is
+      42P01 `relation "pg_temp.nosuch" does not exist` at 15. Found while
+      working RP-882; measured on PostgreSQL 15.19.
+      Verify: tests/backlog/test_rp_qualified_calls.py::test_other_database_pg_temp_is_a_cross_database_reference
+      Backlog-ID: RP-964
+- [ ] **A missing relation in another session's `pg_temp_N` loses its
+      schema.** On PostgreSQL 15.19 `select * from pg_temp_1.nosuch` is
+      42P01 `relation "pg_temp_1.nosuch" does not exist` at 15. Here it is
+      `relation "nosuch" does not exist` at 25: `lookup_relation` falls back
+      to the bare name for any `pg_temp_*`. Found while working RP-882;
+      measured on PostgreSQL 15.19.
+      Verify: tests/backlog/test_rp_qualified_calls.py::test_other_sessions_temp_schema_relation_is_named_as_written
+      Backlog-ID: RP-965
 - [ ] **The session's temp namespace does not follow its transactions.**
       PostgreSQL 15.19 makes `myTempNamespace` with the first temporary
       object and forgets it when the transaction (or subtransaction) that
@@ -3693,19 +3701,6 @@ still computed whole, and the cursor answers that differ either way.
       RP-895 (2026-11-14).
       Verify: tests/backlog/test_rp_found_rp744.py::test_cursor_to_xml_in_from_reads_the_cursor_once
       Backlog-ID: RP-963
-- [ ] **A cursor over a set operation whose branches unification converts
-      runs it whole at the first FETCH.** Since RP-896 a cursor over a
-      UNION ALL reads its branches in order as PostgreSQL's Append does
-      (`portal_stream::PendingRows::Append`), but only when every
-      branch's columns are already of the set operation's types
-      (`PgHandler::append_leaves`). A branch that is converted (`select
-      1/(k - 1) from (values (2), (1)) s(k) union all select 2.5`, int to
-      numeric; an untyped literal or NULL), and a UNION, INTERSECT or
-      EXCEPT under the UNION ALL, make the whole set operation run at the
-      first FETCH, which raises 22012 where PostgreSQL 15.19 answers `1`.
-      Needs the branch's rows converted as they are read.
-      Verify: tests/backlog/test_rp_found_rp744.py::test_a_cursor_over_a_converting_union_computes_its_rows_as_they_are_fetched
-      Backlog-ID: RP-896
 - [ ] **A cursor's WHERE is evaluated for every row at its first FETCH.**
       Since RP-897 a cursor's query runs at the first FETCH that needs a
       row (`portal_stream::PendingRows::Unstarted`), but the executor
