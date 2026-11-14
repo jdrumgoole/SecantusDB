@@ -3986,15 +3986,6 @@ statement is VALUES-only and runs there as written. The gap tests are in
 Measured on a private, freshly initdb'd PostgreSQL 15.19 cluster. The gap
 tests are in `tests/backlog/test_rp_found_rp565.py`.
 
-- [ ] **A DROP's DETAIL names a foreign key by its schema-qualified key.**
-      `drop table s.p` with `s.child (b int references s.p)` is 2BP01 with
-      DETAIL `constraint child_b_fkey on table s.child depends on table
-      s.p` on PostgreSQL 15.19 (`getObjectDescription` prints `conname`),
-      and a temporary table's the same, `tc_b_fkey`. Here the constraint
-      is `s.child_b_fkey` and `pg_temp_N.tc_b_fkey`: the DETAIL takes the
-      stored key, though `pg_constraint.conname` is already right.
-      Verify: tests/backlog/test_rp_found_rp565.py::test_a_foreign_key_in_a_drop_detail_is_named_by_its_own_name
-      Backlog-ID: RP-890
 - [ ] **A temporary row type does not hide a built-in type of its name.**
       PostgreSQL searches the temporary schema for a type ahead of
       `pg_catalog` when the path does not name `pg_temp`: after `create

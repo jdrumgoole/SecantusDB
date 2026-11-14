@@ -13500,7 +13500,8 @@ fn foreign_key_of(
     let on_delete = action(&k.fk_del_action)?;
     let on_update = action(&k.fk_upd_action)?;
     let name = if k.conname.is_empty() {
-        format!("{table}_{}_fkey", columns.join("_"))
+        // Named after the bare relation name, as PostgreSQL does (RP-890).
+        format!("{}_{}_fkey", schemas::split_key(table).1, columns.join("_"))
     } else {
         k.conname.clone()
     };

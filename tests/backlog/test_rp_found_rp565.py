@@ -89,10 +89,10 @@ def test_a_bare_type_name_is_found_through_the_search_path(dsn: str) -> None:
 
 # `getObjectDescription` of a foreign key is `constraint <conname> on table
 # <relation>`, and `conname` is the constraint's own name, never
-# qualified: `pg_constraint` already has it so. A DROP's DETAIL names the
-# constraint by its catalog key instead, which carries the schema of a
-# table outside `public` (`s.child_b_fkey`), a temporary one's included.
-@pytest.mark.backlog("RP-890")
+# qualified. A DROP's DETAIL named the constraint `s.child_b_fkey`: a
+# generated foreign-key name was built from the schema-qualified table key,
+# so the stored name carried the schema (a temporary table's included).
+@pytest.mark.backlog_fixed("RP-890")
 def test_a_foreign_key_in_a_drop_detail_is_named_by_its_own_name(dsn: str) -> None:
     with psycopg.connect(dsn, autocommit=True) as c:
         c.execute("drop schema if exists sb890 cascade")
