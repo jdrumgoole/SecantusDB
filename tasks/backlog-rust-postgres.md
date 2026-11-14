@@ -3689,25 +3689,6 @@ statement is VALUES-only and runs there as written.
       Verify: tests/backlog/test_rp_found_rp756.py::test_a_set_operation_from_subquerys_column_is_typed
       Backlog-ID: RP-765
 
-## Found while working RP-769 (2026-11-10)
-
-Measured on a private PostgreSQL 15.19 cluster (locale C.UTF-8, built
-with ICU) with the `_SETUP` in `tests/backlog/test_rp_found_rp769.py`.
-Since RP-769 a domain, and its array type, takes its base type's
-collation (`catalog_fill.rs`'s `domain_collations`).
-
-- [ ] **`information_schema.columns.collation_name` shows only a declared
-      COLLATE.** PostgreSQL 15.19's view joins `pg_collation` on
-      `attcollation` and leaves out only `pg_catalog.default`, so a `name`
-      column, a `name[]` column and a column of a domain over `name` show
-      `C` (`collation_catalog` and `collation_schema` `pg_catalog`), and a
-      declared `collate "default"` shows nothing. Here the first three
-      show NULL and the last `default`: the row is built from the
-      column's declared collation alone (`lib.rs`, "Only a column that
-      DECLARES a collation shows one").
-      Verify: tests/backlog/test_rp_found_rp769.py::test_information_schema_columns_collation_is_the_columns
-      Backlog-ID: RP-783
-
 ## Found while working RP-782 (2026-11-10)
 
 Measured on a private PostgreSQL 15.19 cluster (locale C.UTF-8, built

@@ -165,8 +165,8 @@ def test_a_column_takes_its_domains_collate_clause(dsn: str) -> None:
 # `information_schema.columns` joins `pg_collation` on `attcollation`, and
 # leaves out only `pg_catalog.default`: a `name` column (or array, or
 # domain over `name`) shows `C`, and a declared `collate "default"` shows
-# nothing.
-@pytest.mark.backlog("RP-783")
+# nothing. Here only a declared COLLATE showed; fixed by RP-783.
+@pytest.mark.backlog_fixed("RP-783")
 def test_information_schema_columns_collation_is_the_columns(dsn: str) -> None:
     with _connect(dsn) as c:
         c.execute(

@@ -23086,8 +23086,26 @@ impl PgHandler {
                                 None => Bson::Null,
                             },
                         );
-                        // Only a column that DECLARES a collation shows one.
-                        let collation = c.extra.get_str("collation").ok();
+                        // The view joins `pg_collation` on `attcollation` --
+                        // the column's own COLLATE, else its type's (a
+                        // domain's declared one, else its base's) -- and
+                        // leaves out only `pg_catalog.default` (RP-783).
+                        let attcollation: Option<String> = c
+                            .extra
+                            .get_str("collation")
+                            .ok()
+                            .map(str::to_string)
+                            .or_else(|| {
+                                c.extra
+                                    .get_str("domain_type")
+                                    .ok()
+                                    .and_then(secantus_pgplan::domains::declared_collation)
+                                    .or_else(|| match c.pg_type.trim_end_matches("[]") {
+                                        "name" => Some("C".to_string()),
+                                        _ => None,
+                                    })
+                            });
+                        let collation = attcollation.as_deref().filter(|n| *n != "default");
                         d.insert(
                             f("collation_catalog"),
                             collation.map_or(Bson::Null, |_| Bson::String(db.clone())),
