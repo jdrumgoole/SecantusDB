@@ -14,12 +14,12 @@ import pytest
 from tests.backlog.conftest import pg_answer
 
 
-@pytest.mark.backlog("RP-933")
+@pytest.mark.backlog_fixed("RP-933")
 def test_an_index_outside_public_can_be_renamed(pg: Any) -> None:
     """`ALTER INDEX s.ix RENAME TO ix2` renames an index of a table in
     schema `s`, and so does the bare name when `s` is on the search path:
     PostgreSQL answers `ALTER INDEX` for each and lists the new name.
-    `secantusd-pg` answered 42P01 `relation "s.ix" does not exist` for
+    Until RP-933 `secantusd-pg` answered 42P01 `relation "s.ix" does not exist` for
     both forms (2026-11-13)."""
     pg.execute("DROP SCHEMA IF EXISTS rp923_s CASCADE")
     pg.execute("CREATE SCHEMA rp923_s")

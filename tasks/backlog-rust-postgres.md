@@ -1193,18 +1193,6 @@ one beside it.
       Backlog-ID: RP-927
       Verify: tests/backlog/test_rp_catalog_latency.py::test_the_first_catalog_query_after_ddl_over_two_column_types_costs_the_same_at_400_tables
 
-## Found while working RP-923 (2026-11-13)
-
-- [ ] **OPEN — an index outside `public` cannot be renamed.** `ALTER INDEX
-      s.ix RENAME TO ix2`, and `ALTER INDEX ix RENAME TO ix2` with `s` on
-      the search path, rename the index of a table in schema `s` on
-      PostgreSQL 15.19; `secantusd-pg` answers 42P01 `relation "s.ix" does
-      not exist` for both (2026-11-13). `rename_index` matches the target
-      against the bare index name, so a schema-qualified target never
-      matches, and the bare one reaches it already qualified.
-      Backlog-ID: RP-933
-      Verify: tests/backlog/test_rp_found_rp923.py::test_an_index_outside_public_can_be_renamed
-
 ## Found while working RP-929 (2026-11-14)
 
 Since RP-929 a hash index's build (CREATE INDEX, REINDEX, a rewrite)
