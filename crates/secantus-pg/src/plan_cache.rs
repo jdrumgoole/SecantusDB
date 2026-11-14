@@ -644,6 +644,9 @@ fn substitute_counting(
             for (_, _, _, e) in &mut u.set_exprs {
                 sub_expr(e, from, to, h);
             }
+            for (_, e) in &mut u.joined {
+                sub_expr(e, from, to, h);
+            }
             sub_doc(&mut u.filter, from, to, h);
             if let Some(e) = &mut u.residual {
                 sub_expr(e, from, to, h);
@@ -652,6 +655,9 @@ fn substitute_counting(
         Statement::Delete(d) => {
             sub_doc(&mut d.filter, from, to, h);
             if let Some(e) = &mut d.residual {
+                sub_expr(e, from, to, h);
+            }
+            for (_, e) in &mut d.joined {
                 sub_expr(e, from, to, h);
             }
         }

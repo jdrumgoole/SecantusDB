@@ -3012,19 +3012,42 @@ nothing. The gap tests are in `tests/backlog/test_rp_found_rp712.py`.
 Measured on a private PostgreSQL 15.19 cluster with the `_SCOPE_SETUP` in
 `tests/backlog/test_rp_found_rp664.py`.
 
-- [ ] **RETURNING a FROM item's column is refused when the join condition
-      reads a column the UPDATE assigns.** `update t668 set b = u668.v
-      from u668 where t668.b < 0 and u668.k = 5 returning t668.a, u668.v`
-      returns the joined row's `v` for each updated row on PostgreSQL
-      15.19 (the join is done once, before the rows are written); here it
-      is 0A000 `RETURNING a FROM item's column when the join condition
-      reads an updated column is not supported yet`, whether the FROM item
-      is a table or a subquery over the target. `rewrite_dml_from` finds
-      the joining row again for RETURNING with a correlated subquery over
-      the NEW row, so it refuses the case where the new row no longer
-      joins.
-      Verify: tests/backlog/test_rp_found_rp664.py::test_returning_a_from_item_when_the_join_reads_an_assigned_column
+- [ ] **A subquery in RETURNING that reads a FROM item is refused when the
+      join condition reads a column the UPDATE assigns.** `update t668 set
+      b = u668.v from u668 where t668.b < 0 and u668.k = 5 returning
+      t668.a, (select u668.v)` returns the joined row's `v` on PostgreSQL
+      15.19; here it is 0A000 `RETURNING a FROM item's column when the join
+      condition reads an updated column is not supported yet`. A FROM-item
+      reference outside a subquery is read from the joined row before the
+      write (`split_joined_returning`, `Update::joined`); one inside a
+      subquery still takes the old path, a correlated subquery that finds
+      the joining row again over the NEW row, refused when the new row may
+      no longer join. Reaching it means letting the subquery's outer
+      reference read a hidden `Update::joined` value, which the RETURNING
+      subquery resolver (`resolve_sublinks_in_target`, run before
+      `plan_update`) does not know. DELETE ... USING has the same remainder
+      (RP-938).
+      Verify: tests/backlog/test_rp_found_rp664.py::test_a_returning_subquery_over_a_from_item_when_the_join_reads_an_assigned_column
       Backlog-ID: RP-686
+
+## Found while working RP-686 (2026-11-14)
+
+Measured on a private PostgreSQL 15.19 cluster with the `_SCOPE_SETUP` in
+`tests/backlog/test_rp_found_rp664.py`.
+
+- [ ] **A subquery in DELETE RETURNING reads a USING item after the
+      delete.** `delete from t668 using (select a, b from t668) x where x.a
+      = t668.a returning (select x.b)` returns each deleted row's `b` on
+      PostgreSQL 15.19; here it is NULL. A USING-item reference outside a
+      subquery is read from the joined row before the delete
+      (`split_joined_returning`, `Delete::joined`); one inside a subquery
+      still takes the old path, a correlated subquery that finds the
+      joining row again after the rows are deleted, when the derived table
+      over the target no longer holds them. The same remainder as RP-686,
+      for UPDATE: the subquery's outer reference would have to read a
+      hidden `joined` value.
+      Verify: tests/backlog/test_rp_found_rp664.py::test_a_delete_returning_subquery_reads_a_using_item_as_it_was_before_the_delete
+      Backlog-ID: RP-938
 
 ## Found while working RP-570 (2026-11-08)
 
@@ -3848,12 +3871,6 @@ Measured on a private PostgreSQL 15.19 cluster.
       evaluation has no `tableoid` to read.
       Verify: tests/backlog/test_rp_found_rp816.py::test_tableoid_in_a_check_is_a_column
       Backlog-ID: RP-859
-- [ ] **A whole-row reference in a CHECK is refused as unsupported.**
-      `create table t816 (x int check ((t816.*) is not null))` creates the
-      table on PostgreSQL 15.19; here it is 0A000 `this column is not
-      supported yet`.
-      Verify: tests/backlog/test_rp_found_rp816.py::test_a_whole_row_reference_in_a_check_is_taken
-      Backlog-ID: RP-860
 - [ ] **A CHECK takes another table's qualifier, and names a qualified
       missing column without it.** `create table t816 (x int, check
       (other.x = 1))` creates the table here; PostgreSQL 15.19 is 42P01
@@ -3872,6 +3889,40 @@ Measured on a private PostgreSQL 15.19 cluster.
       allowed); here the table is created.
       Verify: tests/backlog/test_rp_found_rp816.py::test_a_system_column_in_a_generated_column_is_42p10
       Backlog-ID: RP-862
+
+## Found while working RP-860 (2026-11-14)
+
+Measured on a private, freshly initdb'd PostgreSQL 15.19 cluster with the
+`_SETUP` in `tests/backlog/test_rp_found_rp860.py` (`t860 (x int)`).
+
+- [ ] **A column renamed under a CHECK leaves the CHECK naming the old
+      column, and the table takes no more rows.** After `alter table t860
+      add constraint k check (x > 0)` and `alter table t860 rename column x
+      to y`, PostgreSQL 15.19 still enforces the constraint on the column
+      (`insert ... values (0)` is 23514) and prints it `CHECK ((y > 0))`:
+      the stored tree holds the column's attnum, not its name. Here the
+      stored text still says `x`, so every INSERT is 42703 `column "x" does
+      not exist` and `pg_get_constraintdef` prints the old text. The fix renames the column in every stored CHECK
+      expression (and any other stored expression text keyed by column
+      name) where the rename is applied.
+      Verify: tests/backlog/test_rp_found_rp860.py::test_a_renamed_column_is_renamed_in_its_check
+      Backlog-ID: RP-939
+- [ ] **`pg_get_constraintdef` drops `NOT VALID` from a CHECK.** `alter
+      table t860 add constraint k check (x > 0) not valid` prints `CHECK
+      ((x > 0)) NOT VALID` on PostgreSQL 15.19 (`pg_get_constraintdef_worker`
+      appends it while `convalidated` is false); here `CHECK ((x > 0))`.
+      Verify: tests/backlog/test_rp_found_rp860.py::test_a_not_valid_check_prints_not_valid
+      Backlog-ID: RP-940
+- [ ] **A `regtype` comparison in a CHECK prints without its `oid`
+      casts.** `check (pg_typeof(x) = 'int4'::regtype)` prints `CHECK
+      (((pg_typeof(x))::oid = ('integer'::regtype)::oid))` on PostgreSQL
+      15.19: `regtype` has no `=`, so the parser resolves `oideq` over
+      binary-coercible casts, and ruleutils prints them. Here it is the
+      text as written, `CHECK ((pg_typeof(x) = 'int4'::regtype))`.
+      `ruleutils.rs` would need the operator resolution the analysed tree
+      records.
+      Verify: tests/backlog/test_rp_found_rp860.py::test_a_regtype_comparison_in_a_check_prints_its_oid_casts
+      Backlog-ID: RP-941
 
 ## Found while working RP-828 (2026-11-12)
 

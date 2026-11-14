@@ -38797,6 +38797,20 @@ impl PgHandler {
     /// fixed result type), a plain one from the catalog. The describe pass and
     /// the executor share this rule or the client decodes rows against the
     /// wrong oid.
+    /// A write's joined-row values (`Update::joined` / `Delete::joined`),
+    /// each evaluated over the target row as it was before the write.
+    fn joined_values(
+        joined: &[(String, secantus_pgplan::ColumnExpr)],
+        row: &Document,
+    ) -> Result<Document, PgWireError> {
+        let mut values = Document::new();
+        for (field, expr) in joined {
+            let v = secantus_pgplan::apply_row_expr(expr, row).map_err(|e| Self::err(&e))?;
+            values.insert(field.clone(), v);
+        }
+        Ok(values)
+    }
+
     fn row_schema(
         &self,
         def: &TableDef,
@@ -47900,6 +47914,9 @@ impl PgHandler {
                     let raw = self.in_scan_order(&upd.table, &upd.filter, raw)?;
                     let mut writes = Vec::with_capacity(raw.len());
                     let mut new_rows = Vec::with_capacity(raw.len());
+                    // Each returned row's joined values (`Update::joined`),
+                    // read from the OLD row, parallel to `new_rows`.
+                    let mut joined_rows: Vec<Document> = Vec::new();
                     // Rows whose PRIMARY KEY changes: (old row, new row).
                     let mut rekeys: Vec<(Document, Document)> = Vec::new();
                     for bytes in &raw {
@@ -48016,6 +48033,9 @@ impl PgHandler {
                             if row_id(&after) != row_id(&row) {
                                 rekeyed = Some(after.clone());
                             }
+                            if !upd.joined.is_empty() {
+                                joined_rows.push(Self::joined_values(&upd.joined, &row)?);
+                            }
                             new_rows.push(after);
                         }
                         if let Some(after) = rekeyed {
@@ -48105,6 +48125,9 @@ impl PgHandler {
                             }
                         }
                     }
+                    for (row, values) in new_rows.iter_mut().zip(joined_rows) {
+                        row.extend(values);
+                    }
                     returned = new_rows;
                     matched
                 };
@@ -48182,7 +48205,12 @@ impl PgHandler {
                     {
                         let row: Document = decode_doc(&bytes)
                             .map_err(|e| Self::storage_err("could not decode a row", e))?;
+                        // The joined row is the plan's, read before the
+                        // row's BEFORE trigger runs.
+                        let values = Self::joined_values(&del.joined, &row)?;
                         if self.before_delete_row(def, &row)? {
+                            let mut row = row;
+                            row.extend(values);
                             kept.push(row);
                         }
                     }
@@ -48223,7 +48251,7 @@ impl PgHandler {
                 }
                 // RETURNING reports the rows as they were, so they are read
                 // before the delete removes them.
-                let doomed: Vec<Document> = match del.returning.as_ref() {
+                let mut doomed: Vec<Document> = match del.returning.as_ref() {
                     None => Vec::new(),
                     Some(_) => self
                         .storage
@@ -48234,6 +48262,11 @@ impl PgHandler {
                         .collect::<Result<_, _>>()
                         .map_err(|e| Self::storage_err("could not decode a row", e))?,
                 };
+                // ...and so is the row each one joins (`Delete::joined`).
+                for row in &mut doomed {
+                    let values = Self::joined_values(&del.joined, row)?;
+                    row.extend(values);
+                }
                 let deleted = self
                     .storage
                     .delete_matching(

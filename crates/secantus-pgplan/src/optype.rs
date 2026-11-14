@@ -2940,7 +2940,8 @@ pub(crate) fn check_constraint(
         ctes: Vec::new(),
         merged: Vec::new(),
         using_aliases: Vec::new(),
-        rowtypes: Vec::new(),
+        // The table's row type (RP-860).
+        rowtypes: vec![(0, crate::table_rowtype(name.to_string()))],
     };
     let cx = Cx {
         lookup,
@@ -3417,7 +3418,11 @@ fn clause_is_boolean(n: &pg_query::protobuf::Node, scope: &Scope, clause: &str) 
 /// `where d` over a domain on `int` is `... not type di811`.
 fn not_boolean(n: &pg_query::protobuf::Node, scope: &Scope) -> Option<String> {
     let declared = match n.node.as_ref()? {
-        N::ColumnRef(c) => scope.column_declared_type(c)?,
+        // A whole row is of a row type, which never coerces to boolean.
+        N::ColumnRef(c) => match scope.column_declared_type(c) {
+            Some(t) => t,
+            None => return scope.whole_row_type(c).map(|t| display_type(&t)),
+        },
         _ => operand_type_declared(n, scope)?,
     };
     let base = crate::domains::base_type_and_typmod(&declared)

@@ -14,7 +14,12 @@ found while working them:
   a UNION arm or a nested subquery was taken as bound beside it, so the
   target's name read as the subquery's own;
 - RETURNING a FROM item's column, when the join condition reads a column
-  the UPDATE assigns, is a named 0A000 (RP-686);
+  the UPDATE assigns, was a named 0A000 (RP-686, fixed but for a subquery
+  in RETURNING that reads the FROM item);
+- RETURNING read a FROM item after the write, so a FROM item over the
+  target saw the rows the statement had changed (UPDATE, RP-937, fixed) or
+  deleted (DELETE ... USING, RP-938, fixed but for a subquery in RETURNING
+  that reads the USING item);
 - a PL/pgSQL assignment to a record's field (`NEW.a := -5`) did not check
   the field's domain, so a trigger that assigned a bad value and then a
   good one was not refused (RP-670, fixed).
@@ -325,7 +330,9 @@ def test_a_name_bound_inside_a_derived_table_is_not_bound_beside_it(query: str, 
 
 # Found while working RP-668. An UPDATE ... FROM whose join condition reads
 # a column the UPDATE assigns, with a RETURNING item over the FROM item:
-# PostgreSQL returns the joined row's value; here it is a named 0A000.
+# PostgreSQL returns the joined row's value; it was a named 0A000, because
+# RETURNING found the joining row again over the NEW row (RP-686, fixed:
+# the FROM item's values are read from the joined row before the write).
 RETURNING_FROM = {
     "update t668 set b = x.b from (select b from t668 where a = 5) x"
     " where t668.b < 0 returning t668.a, x.b": (
@@ -337,13 +344,114 @@ RETURNING_FROM = {
         [(-1, 50), (7, 50)],
         [(-1, 50), (5, 5), (7, 50)],
     ),
+    # A FROM item's column beside the target's NEW one, in one expression.
+    "update t668 set b = u668.v from u668 where t668.b < 0 and u668.k = 5"
+    " returning u668.v + t668.b, u668.k * 2 as kk, case when v > 10 then k end": (
+        [(100, 10, 5), (100, 10, 5)],
+        [(-1, 50), (5, 5), (7, 50)],
+    ),
+    "update t668 t set b = u.v from u668 u where t.b < 0 and u.k = 5 returning t.a, v": (
+        [(-1, 50), (7, 50)],
+        [(-1, 50), (5, 5), (7, 50)],
+    ),
+}
+
+
+@pytest.mark.backlog_fixed("RP-686")
+@pytest.mark.parametrize("query", list(RETURNING_FROM))
+def test_returning_a_from_item_when_the_join_reads_an_assigned_column(query: str, dsn: str) -> None:
+    assert _scoped_answer(dsn, query) == RETURNING_FROM[query]
+
+
+# The rest of RP-686: a SUBQUERY in RETURNING that reads a FROM item, when
+# the join condition reads an assigned column, is still the named 0A000.
+RETURNING_FROM_SUBQUERY = {
+    "update t668 set b = u668.v from u668 where t668.b < 0 and u668.k = 5"
+    " returning t668.a, (select u668.v)": (
+        [(-1, 50), (7, 50)],
+        [(-1, 50), (5, 5), (7, 50)],
+    ),
 }
 
 
 @pytest.mark.backlog("RP-686")
-@pytest.mark.parametrize("query", list(RETURNING_FROM))
-def test_returning_a_from_item_when_the_join_reads_an_assigned_column(query: str, dsn: str) -> None:
-    assert _scoped_answer(dsn, query) == RETURNING_FROM[query]
+@pytest.mark.parametrize("query", list(RETURNING_FROM_SUBQUERY))
+def test_a_returning_subquery_over_a_from_item_when_the_join_reads_an_assigned_column(
+    query: str, dsn: str
+) -> None:
+    assert _scoped_answer(dsn, query) == RETURNING_FROM_SUBQUERY[query]
+
+
+# Found while working RP-686. RETURNING read a FROM item (USING item) by
+# finding the joining row again AFTER the write, so a FROM item over the
+# target saw the rows the statement had just changed or deleted; PostgreSQL
+# joins once, before the write, and returns the joined row's values.
+RETURNING_FROM_BEFORE_WRITE = {
+    "update t668 set b = x.b + 100 from (select a, b from t668) x"
+    " where x.a = t668.a returning t668.a, x.b": (
+        [(-1, -1), (5, 5), (7, -3)],
+        [(-1, 99), (5, 105), (7, 97)],
+    ),
+    # A self-join: `t668` is the target (the FROM item answers to `s`
+    # alone), so `t668.b` is the new value and `s.b` the old one.
+    "update t668 set b = s.b + 100 from t668 s where s.a = t668.a"
+    " returning t668.a, t668.b, s.b, s.b + t668.b": (
+        [(-1, 99, -1, 98), (5, 105, 5, 110), (7, 97, -3, 94)],
+        [(-1, 99), (5, 105), (7, 97)],
+    ),
+}
+
+
+@pytest.mark.backlog_fixed("RP-937")
+@pytest.mark.parametrize("query", list(RETURNING_FROM_BEFORE_WRITE))
+def test_update_returning_reads_a_from_item_as_it_was_before_the_write(
+    query: str, dsn: str
+) -> None:
+    assert _scoped_answer(dsn, query) == RETURNING_FROM_BEFORE_WRITE[query]
+
+
+RETURNING_USING_BEFORE_DELETE = {
+    "delete from t668 using (select a, b from t668) x"
+    " where x.a = t668.a and t668.b < 0 returning t668.a, x.b": (
+        [(-1, -1), (7, -3)],
+        [(5, 5)],
+    ),
+    "delete from t668 using t668 s where s.a = t668.a and t668.b < 0 returning t668.*, s.b": (
+        [(-1, -1, -1), (7, -3, -3)],
+        [(5, 5)],
+    ),
+    "delete from t668 t using u668 u where u.k = t.a returning t.a, v, u.v + t.b": (
+        [(-1, 10, 9), (5, 50, 55), (7, 70, 67)],
+        [],
+    ),
+}
+
+
+@pytest.mark.backlog_fixed("RP-938")
+@pytest.mark.parametrize("query", list(RETURNING_USING_BEFORE_DELETE))
+def test_delete_returning_reads_a_using_item_as_it_was_before_the_delete(
+    query: str, dsn: str
+) -> None:
+    assert _scoped_answer(dsn, query) == RETURNING_USING_BEFORE_DELETE[query]
+
+
+# The rest of RP-938: a SUBQUERY in RETURNING that reads a USING item still
+# finds the joining row after the delete, when a derived table over the
+# target no longer holds it.
+RETURNING_USING_SUBQUERY = {
+    "delete from t668 using (select a, b from t668) x where x.a = t668.a returning (select x.b)": (
+        [(-1,), (5,), (-3,)],
+        [],
+    ),
+}
+
+
+@pytest.mark.backlog("RP-938")
+@pytest.mark.parametrize("query", list(RETURNING_USING_SUBQUERY))
+def test_a_delete_returning_subquery_reads_a_using_item_as_it_was_before_the_delete(
+    query: str, dsn: str
+) -> None:
+    assert _scoped_answer(dsn, query) == RETURNING_USING_SUBQUERY[query]
 
 
 # A BEFORE ROW trigger on `t664t`, by the body of its function. PostgreSQL
