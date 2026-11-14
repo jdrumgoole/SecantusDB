@@ -1947,26 +1947,20 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       `$setWindowFields`) likely shares. Found 2026-11-14 working RM-536.
       Verify: tests/backlog/test_rm_found_2026_11_14_rm536.py::test_explain_reports_a_replace_roots_run_time_error
       Backlog-ID: RM-659
-- [ ] **A pipeline `$match` lists its clauses sorted.** mongod 8.2.11 lists
-      a `$match` stage's clauses in the order they were written
-      (`{d: {$gt: 0}, c: 1}` as `$and: [d, c]`; an `$expr`'s
-      `$_internalExprEq` ahead of the `$expr`; a `$match` moved ahead of a
-      `$replaceRoot` keeps its own order inside the `$or`); only a query's
-      `parsedQuery` is sorted. This server lists each with
-      `parsed::parsed_query`, which sorts (`canonical_match` and `tidy` sort
-      too). Found 2026-11-10 (RM-414).
-      (This was RM-444: `explain` lists a `$match` after the cursor with its
-      clauses sorted.) mongod 8.2.11 lists a `$match` stage it does not move
-      into the query (behind a `$group` or a `$limit`) with its clauses in the
-      order they were written, and an `$expr`'s `$_internalExprEq` ahead of
-      the `$expr`: `[{$limit: 3}, {$match: {x: {$exists: true}, y: 1}}]` lists
-      `$and: [{x: {$exists: true}}, {y: {$eq: 1}}]`. This server lists the
-      clauses in the order mongod gives only the query's `parsedQuery`
-      (`MatchExpression::sortTree`): `y` first, and the `$expr` before its
-      `$_internalExprEq`. The documents are the same. Found 2026-11-09 working
-      RM-311.
-      Verify: tests/backlog/test_rm_found_2026_11_10_explain_rewrites.py::test_a_pipeline_match_lists_its_clauses_as_written, tests/backlog/test_rm_found_2026_11_09.py::test_explain_lists_a_match_after_the_cursor_in_written_order
-      Backlog-ID: RM-537
+- [ ] **A query's `parsedQuery` keeps three leaves as written.** mongod
+      8.2.11 parses an `$elemMatch` document whose FIRST field is a path as
+      a query (`{$elemMatch: {b: 1, $and: [{q: 1}], a: {$gt: 0}}}` is
+      `{$and: [b, q, a]}`; it is the value form only when the first field is
+      an operator other than `$and` / `$or` / `$nor` / `$expr` ...), a
+      `$not` of two operators as `{$nor: [{$and: [...]}]}`, and drops a
+      `{a: {$nin: []}}` beside another clause. This server's
+      `canonical_match` takes any `$`-key for the value form and echoes the
+      document, keeps `{$not: {$lt: 9, $gt: 3}}` whole, and keeps
+      `{a: {$not: {$in: []}}}` in the `$and`. A pipeline `$match`
+      (`match_as_written`) already parses all three as mongod does. Found
+      2026-11-14 working RM-537.
+      Verify: tests/backlog/test_rm_found_2026_11_14.py::test_parsed_query_parses_these_leaves_as_mongod
+      Backlog-ID: RM-660
 - [ ] **Explain lists stages mongod's optimizer rewrites as written.**
       mongod 8.2.11 drops a `$replaceWith: "$$ROOT"`, folds a `$limit` into
       the `$sort` before it (`{$sort: {sortKey, limit: 1}}`, no `$limit`

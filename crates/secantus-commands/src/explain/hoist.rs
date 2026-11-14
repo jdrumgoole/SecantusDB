@@ -194,7 +194,7 @@ fn through_replace_root(filter: &Document, pushed: bool, root: &str) -> Option<D
     let filter = if pushed {
         filter.clone()
     } else {
-        super::parsed::parsed_query(filter)
+        super::parsed::parsed_match_stage(filter)
     };
     if filter.is_empty() {
         return Some(filter);

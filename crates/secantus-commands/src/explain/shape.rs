@@ -794,7 +794,7 @@ pub(crate) fn listed_stage(stage: &Document, db: &str) -> Vec<Document> {
             one(doc! { "$sample": out })
         }
         ("$match", Bson::Document(filter)) => {
-            one(doc! { "$match": super::parsed::parsed_query(filter) })
+            one(doc! { "$match": super::parsed::parsed_match_stage(filter) })
         }
         (super::hoist::PUSHED_MATCH, Bson::Document(filter)) => {
             one(doc! { "$match": filter.clone() })

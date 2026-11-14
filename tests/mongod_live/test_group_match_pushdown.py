@@ -12,9 +12,12 @@ an `$or` or `$expr` only whole. The same split, renames included, moves a
 query, the stages after the read and the documents. A `$group` listed
 after the read is left out: mongod runs it in its slot-based engine for
 more shapes than this server explains that way (RM-071). The winning plan
-is left out too: its projection's name is RM-445. The clauses of a
-`$match` left behind are compared in a fixed order, as RM-537 owns the
-order mongod lists them in. Measured on 8.2.11, 2026-11-09.
+is left out too: its projection's name is RM-445. A `$match` left behind
+is compared as listed (RM-537), except an `$or`'s branches, which are
+compared in a fixed order: mongod lists an `$or`'s lone equalities in the
+order of an unordered map, which changes from one mongod process to the
+next (`or_with_accumulator`). Measured on 8.2.11, 2026-11-09 and
+2026-11-14.
 """
 
 from __future__ import annotations
@@ -85,12 +88,12 @@ PIPELINES: dict[str, list[dict]] = {
 
 
 def _clauses_sorted(stage: dict) -> dict:
-    """A listed `$match` with its `$and` / `$or` children in a fixed order."""
+    """A listed `$match` with an `$or`'s branches in a fixed order."""
     m = stage.get("$match")
     if not isinstance(m, dict) or len(m) != 1:
         return stage
     ((op, children),) = m.items()
-    if op not in ("$and", "$or") or not isinstance(children, list):
+    if op != "$or" or not isinstance(children, list):
         return stage
     return {"$match": {op: sorted(children, key=lambda c: json_util.dumps(c, sort_keys=True))}}
 

@@ -29,14 +29,15 @@ def _listed_matches(client: Any) -> dict:
     return out
 
 
-@pytest.mark.backlog("RM-537")
+@pytest.mark.backlog_fixed("RM-537")
 def test_explain_lists_a_match_after_the_cursor_in_written_order(
     rust_mongo: Any, mongod: Any
 ) -> None:
     """mongod 8.2.11 lists a `$match` stage after the cursor with its
     clauses as written (`{x: {$exists: true}, y: 1}` is `$exists` then
     `$eq`), and an `$expr`'s `$_internalExprEq` ahead of the `$expr`; it
-    sorts only the query's `parsedQuery`."""
+    sorts only the query's `parsedQuery`. This server sorted them until
+    2026-11-14 (RM-537)."""
     got, want = _listed_matches(rust_mongo), _listed_matches(mongod)
     assert want["after_a_limit"] == [
         {"$match": {"$and": [{"x": {"$exists": True}}, {"y": {"$eq": 1}}]}}

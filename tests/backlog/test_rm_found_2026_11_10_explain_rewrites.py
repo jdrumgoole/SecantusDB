@@ -90,7 +90,7 @@ AS_WRITTEN = {
 }
 
 
-@pytest.mark.backlog("RM-537")
+@pytest.mark.backlog_fixed("RM-537")
 def test_a_pipeline_match_lists_its_clauses_as_written(
     rust_mongo: Any,
     mongod_rs: Any,  # noqa: F811
@@ -98,7 +98,8 @@ def test_a_pipeline_match_lists_its_clauses_as_written(
     """mongod 8.2.11 lists a pipeline's `$match` with its clauses in the
     order they were written (`{d: {$gt: 0}, c: 1}` as `$and: [d, c]`, an
     `$expr`'s `$_internalExprEq` ahead of the `$expr`); only a query's
-    `parsedQuery` is sorted. This server sorts them as `parsedQuery` does."""
+    `parsedQuery` is sorted. This server sorted them as `parsedQuery` does
+    until 2026-11-14."""
     assert _stages(rust_mongo, AS_WRITTEN, "queryPlanner") == _stages(
         mongod_rs, AS_WRITTEN, "queryPlanner"
     )
