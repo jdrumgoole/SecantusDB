@@ -1736,7 +1736,7 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       document (a `MutableDocument` with room for its two fields), and the
       `$sort` counts 2450 bytes over ten groups; this server counts the
       BSON each encodes, 1170, as it keeps no storage behind an SBE
-      `$group` (see also RM-435). Found 2026-11-13 (RM-519).
+      `$group`. Found 2026-11-13 (RM-519).
       Verify: tests/backlog/test_rm_found_rm519.py::test_a_project_after_a_pushed_down_group_builds_its_documents
       Backlog-ID: RM-638
 - [ ] **A `$sort` behind a `$setWindowFields` that sorted by the same key
@@ -2484,15 +2484,15 @@ Still different, all 77:
       (`cursor_yields`). Found 2026-11-14 (RM-434).
       Verify: tests/backlog/test_rm_found_2026_11_14_rm434.py::test_a_cursor_the_pipeline_stops_reading_reports_one_batch
       Backlog-ID: RM-692
-- [ ] **A `$sort` after a `$group` mongod pushes into SBE counts its
-      documents smaller than mongod's.** `[{$group: {_id: "$a"}}, {$sort:
-      {_id: 1}}]` over ten documents: mongod 8.2.11's `$sort` reports
-      `totalDataSizeSortedBytesEstimate` 735 for the three groups the SBE
-      plan hands it, this server's 351, its estimate of the same three
-      documents as the classic engine builds them. Found 2026-11-08
-      (RM-071).
-      Verify: tests/backlog/test_rm_found_2026_11_08_rm071.py::test_a_sort_after_a_pushed_down_group_sizes_what_sbe_hands_it
-      Backlog-ID: RM-435
+- [ ] **A `$group` whose `_id` takes `$mod`, or whose accumulator takes an
+      expression object, is not pushed into SBE.** `[{$group: {_id: {$mod:
+      ["$b", 2]}}}, {$sort: {_id: 1}}]`, and `{_id: "$a", q: {$push: {s:
+      "$s"}}}` (`$addToSet` too): mongod 8.2.11 runs the `$group` in SBE,
+      `explainVersion` "2" and no `$group` in `stages`; this server explains
+      version "1" with a classic `$group`. The `$sort`'s byte count after it
+      already matches. Found 2026-11-14 (RM-435).
+      Verify: tests/backlog/test_rm_found_rm435.py::test_a_group_mongod_pushes_into_sbe_is_pushed
+      Backlog-ID: RM-693
 - [ ] **`estimatedSizeBytes` is left out of entries whose index tree this
       server does not build.** It sizes an entry's `PlanCacheIndexTree`
       from the canonical query and the clauses the winning plan's one index

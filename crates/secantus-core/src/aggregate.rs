@@ -300,6 +300,35 @@ pub fn apply_pipeline(
                 .as_ref()
                 .filter(|_| pipeline_sort)
                 .map(|st| st.iter().map(docstore::Stored::for_sorter).collect());
+            // A `$group` mongod ran in SBE hands the classic `$sort` after it
+            // each group as a document built field by field from its slots
+            // (`MutableDocument`), over an empty BSON object (measured
+            // 8.2.11: `[{$group: {_id: "$a"}}, {$sort: {_id: 1}}]` counts
+            // 245 bytes a group, its 16-byte key included, RM-435).
+            let sizes = match sizes {
+                None if source == Some(crate::sorter::SortSource::Stored)
+                    && after_sbe_group(before) =>
+                {
+                    // A key that is a sub-document is the group's built one,
+                    // not a document read from BSON as the sorter sizes it.
+                    let fields = sort_fields(spec)?;
+                    docs.iter()
+                        .map(|d| {
+                            let key: usize = sort_key_values(d, &fields)?
+                                .iter()
+                                .filter_map(Bson::as_document)
+                                .map(|k| {
+                                    docstore::sbe_built(k).approximate()
+                                        - memlimit::document_size(k)
+                                })
+                                .sum();
+                            Ok(docstore::sbe_built(d).for_sorter() + key)
+                        })
+                        .collect::<R<Vec<usize>>>()
+                        .map(Some)?
+                }
+                sizes => sizes,
+            };
             // Where each document goes, to keep its storage beside it: the
             // sorter's own order where it sorts them, since its ties come
             // in the C++ library's order (`sorter::sort_held`).
@@ -2138,6 +2167,25 @@ pub fn limit_for_pushdown(after: &[Bson]) -> Option<usize> {
         }
     }
     limit
+}
+
+/// Whether `before` ends with the SBE section [`crate::sbe::mark`] closes
+/// after a `$group`: the documents it hands on are SBE's output.
+fn after_sbe_group(before: &[Bson]) -> bool {
+    let engine = |st: &Bson, on: bool| {
+        st.as_document()
+            .and_then(|d| d.get(crate::sbe::ENGINE_STAGE))
+            .and_then(Bson::as_bool)
+            == Some(on)
+    };
+    match before {
+        [.., group, last] => {
+            engine(last, false)
+                && stage_name_of(group) == "$group"
+                && before.iter().any(|st| engine(st, true))
+        }
+        _ => false,
+    }
 }
 
 /// Which of mongod's sorts a `$sort` after `before` is, for what each
