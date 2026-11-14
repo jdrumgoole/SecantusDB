@@ -877,6 +877,47 @@ pub(crate) fn listed_stage(stage: &Document, db: &str) -> Vec<Document> {
             }
             one(doc! { "$facet": out })
         }
+        // A `$unionWith` whose pipeline makes its own documents lists the
+        // stages it runs, `$documents` as the four it is (measured 8.2.11,
+        // RM-539). One over a collection lists its `$cursor` (RM-681).
+        ("$unionWith", Bson::Document(spec))
+            if !spec.contains_key("coll")
+                && spec
+                    .get_array("pipeline")
+                    .ok()
+                    .and_then(|p| p.first())
+                    .and_then(Bson::as_document)
+                    .is_some_and(|s| s.contains_key("$documents")) =>
+        {
+            // Optimized as a pipeline of its own: the `$replaceRoot` of
+            // `$documents` is one of the stages a `$match` moves ahead of.
+            let mut out = spec.clone();
+            let sub: Vec<&Document> = spec
+                .get_array("pipeline")
+                .into_iter()
+                .flatten()
+                .filter_map(Bson::as_document)
+                .collect();
+            let mut stages: Vec<Document> =
+                sub.first().map(|s| listed_stage(s, db)).unwrap_or_default();
+            stages.truncate(3);
+            let rest: Vec<Bson> = sub[1..]
+                .iter()
+                .map(|s| Bson::Document((*s).clone()))
+                .collect();
+            let mut after = desugared(&rest);
+            after.insert(
+                0,
+                Bson::Document(doc! { "$replaceRoot": { "newRoot": "$_tempDocumentsField" } }),
+            );
+            for stage in super::hoist::hoist_matches(&after) {
+                if let Bson::Document(d) = stage {
+                    stages.extend(listed_stage(&d, db));
+                }
+            }
+            out.insert("pipeline", stages);
+            one(doc! { "$unionWith": out })
+        }
         // mongod's order, with the `let` a pipeline always has and the
         // `$cmd.aggregate` a `$lookup` without `from` reads (RM-413, 8.2.11).
         ("$lookup", Bson::Document(spec)) if spec.contains_key("pipeline") => {

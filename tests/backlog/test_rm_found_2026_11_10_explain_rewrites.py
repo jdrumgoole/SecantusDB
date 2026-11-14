@@ -147,7 +147,7 @@ DETAIL = {
 }
 
 
-@pytest.mark.backlog("RM-539")
+@pytest.mark.backlog_fixed("RM-539")
 def test_each_stage_reports_what_mongod_does(
     rust_mongo: Any,
     mongod_rs: Any,  # noqa: F811
@@ -157,9 +157,9 @@ def test_each_stage_reports_what_mongod_does(
     `$documents` as the stages it runs), a `$lookup` its
     `totalDocsExamined`, `totalKeysExamined`, `collectionScans` and
     `indexesUsed`, the `$group` a `$count` makes its memory figures, and a
-    `$sort` after `$documents` mongod's own size estimate. This server
-    leaves those out, and estimates the sort's size from the documents
-    alone."""
+    `$sort` after `$documents` mongod's own size estimate. This server left
+    those out, and estimated the sort's size from the documents' BSON,
+    until 2026-11-14."""
     assert _stages(rust_mongo, DETAIL, "executionStats") == _stages(
         mongod_rs, DETAIL, "executionStats"
     )

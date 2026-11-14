@@ -1985,18 +1985,57 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       the collection so. Found 2026-11-12 (RM-360).
       Verify: tests/backlog/test_rm_found_2026_11_12_rm360.py::test_a_match_after_a_redact_is_copied_ahead_of_it
       Backlog-ID: RM-580
-- [ ] **Explain's stages lack some of mongod's statistics.** At
-      `executionStats` mongod 8.2.11 gives the stages inside a `$facet` and
-      a `$unionWith` their own `nReturned` (and lists the `$unionWith`'s
-      `$documents` as the `$queue` / `$project` / `$unwind` /
-      `$replaceRoot` it runs), a `$lookup` its `totalDocsExamined`,
-      `totalKeysExamined`, `collectionScans` and `indexesUsed`, the `$group`
-      a `$count` makes its `maxAccumulatorMemoryUsageBytes` and
-      `totalOutputDataSizeBytes`, and a `$sort` after `$documents` a
-      `totalDataSizeSortedBytesEstimate` of 245 for one document where this
-      server says 117. Found 2026-11-10 (RM-414).
-      Verify: tests/backlog/test_rm_found_2026_11_10_explain_rewrites.py::test_each_stage_reports_what_mongod_does
-      Backlog-ID: RM-539
+- [ ] **A `$unionWith` over a collection is explained as written.**
+      mongod 8.2.11 lists the pipeline a `$unionWith` runs over a
+      collection: a `$cursor` holding the query's own `queryPlanner` (and,
+      at `executionStats`, its `executionStats`), then the stages after it,
+      each with its `nReturned`; this server lists the stage as written
+      (`{$unionWith: "d"}`). One over `$documents` lists its stages since
+      RM-539. Found 2026-11-14 (RM-539).
+      Verify: tests/backlog/test_rm_found_2026_11_14_rm539.py::test_a_union_with_over_a_collection_lists_its_cursor
+      Backlog-ID: RM-681
+- [ ] **A `$lookup` over a collection reports nothing it examined.** At
+      `executionStats` mongod 8.2.11 gives a `$lookup` whose pipeline reads
+      a collection its `totalDocsExamined`, `totalKeysExamined`,
+      `collectionScans` and `indexesUsed`, summed over its runs: an
+      uncorrelated pipeline is run once and cached (2 documents, 1 scan for
+      3 outer documents), a correlated one at each (6 and 3). This server
+      reports them only for a pipeline over `$documents` (zeros, RM-539).
+      Found 2026-11-14 (RM-539).
+      Verify: tests/backlog/test_rm_found_2026_11_14_rm539.py::test_a_lookup_over_a_collection_reports_what_it_examined
+      Backlog-ID: RM-682
+- [ ] **A `$lookup` on `localField` / `foreignField` is explained as a
+      classic stage.** mongod 8.2.11 pushes it into SBE over a collection
+      and explains it so (`explainVersion` "2", no `stages`, an `EQ_LOOKUP`
+      on top of the query's plan); this server lists a `$cursor` and a
+      `$lookup` stage. Found 2026-11-14 (RM-539).
+      Verify: tests/backlog/test_rm_found_2026_11_14_rm539.py::test_a_lookup_on_join_fields_is_explained_as_sbe_runs_it
+      Backlog-ID: RM-683
+- [ ] **A 12-byte string is counted as held outside its `Value`.** mongod
+      8.2.11's classic `Value` keeps a string of up to 12 bytes inline (a
+      `$push` of one counts 136 bytes, a sort of a `$documents` document
+      holding one 245); `memlimit::SHORT_STR` is 11, so this server counts
+      36 bytes more for each such string, in every memory figure and
+      budget. Found 2026-11-14 (RM-539).
+      Verify: tests/backlog/test_rm_found_2026_11_14_rm539.py::test_a_twelve_byte_string_is_kept_in_its_value
+      Backlog-ID: RM-684
+- [ ] **A `$sort` and the `$limit` after it in a `$facet` are two stages.**
+      mongod 8.2.11 folds the `$limit` into the `$sort` inside a facet's
+      pipeline as well (`{$sort: {sortKey: {a: 1}, limit: 1}}`), and that
+      top-1 sort reports `totalDataSizeSortedBytesEstimate` 0; this server
+      lists the two stages, the sort counting every document (490 for two).
+      The fold outside a facet is RM-538. Found 2026-11-14 (RM-539).
+      Verify: tests/backlog/test_rm_found_2026_11_14_rm539.py::test_a_sort_and_its_limit_in_a_facet_are_one_stage
+      Backlog-ID: RM-685
+- [ ] **A run of `$documents` counts its documents as read BSON.** mongod
+      8.2.11 counts each document a `$documents` makes as the storage its
+      expression object built (`metrics.query.sort.totalBytesSorted` grows
+      by 490 for `[{a: 1, b: 3}, {a: 2}]` sorted, as explain reports since
+      RM-539); `run_segmented` evaluates the stage and hands the documents
+      on as read, so a run counts 255, and its memory budget is held to
+      that. Found 2026-11-14 (RM-539).
+      Verify: tests/backlog/test_rm_found_2026_11_14_rm539.py::test_a_documents_sort_counts_the_documents_built
+      Backlog-ID: RM-686
 - [ ] **The operation rows `currentOp` lists lack mongod's detail.** Since
       2026-10-20 a registry of running operations stands behind
       `currentOp`, `$currentOp` (with `idleCursors`) and `killOp`, which
