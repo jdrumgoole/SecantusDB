@@ -2121,14 +2121,6 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       (RM-418).
       Verify: tests/backlog/test_rm_found_2026_11_10_rm418.py::test_sbe_find_shapes_are_explained_as_sbe
       Backlog-ID: RM-543
-- [ ] **A hinted index that no predicate bounds sorts its FETCH filter by
-      path.** mongod 8.2.1 keeps the canonical order there: `{s: {$gte:
-      "a", $lte: "z"}, t: 1}` hinted to `u_1` fetches with `[t $eq, s $lte,
-      s $gte]`, this server with `[s $lte, s $gte, t $eq]`. Over an index
-      that does bound a predicate mongod sorts the rest by path, as this
-      server does. Found 2026-11-08 while working RM-331.
-      Backlog-ID: RM-422
-      Verify: tests/backlog/test_rm_found_2026_11_08_rm331.py::test_a_hint_that_bounds_nothing_keeps_the_canonical_filter_order
 - [ ] **An aggregate `$sort` on a `$meta` key is refused.** mongod 8.2.1
       sorts `{$sort: {s: {$meta: "randVal"}}}` (and a `searchScore` key,
       which has no value without `$search` and so ties); this server

@@ -24,12 +24,12 @@ def _hinted_fetch_filter(client: Any) -> Any:
     return plan.get("filter")
 
 
-@pytest.mark.backlog("RM-422")
+@pytest.mark.backlog_fixed("RM-422")
 def test_a_hint_that_bounds_nothing_keeps_the_canonical_filter_order(
     rust_mongo: Any, mongod: Any
 ) -> None:
     """mongod 8.2.1 keeps the FETCH filter over a hinted index that no
     predicate bounds in the canonical order, `$eq` before `$lte` and
-    `$gte` (`[t $eq, s $lte, s $gte]`); the Rust server sorts it by path
-    (`[s $lte, s $gte, t $eq]`)."""
+    `$gte` (`[t $eq, s $lte, s $gte]`); the Rust server sorted it by path
+    (`[s $lte, s $gte, t $eq]`) until RM-422 kept the canonical order."""
     assert _hinted_fetch_filter(rust_mongo) == _hinted_fetch_filter(mongod)
