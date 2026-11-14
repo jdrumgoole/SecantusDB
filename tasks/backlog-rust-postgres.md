@@ -2805,6 +2805,13 @@ Measured on a private PostgreSQL 15.19 cluster with the `_SETUP` in
       trimmed key with the as-written value kept in the row. Plan: (1)
       keep blanks for unsized `bpchar` on write, plus UNIQUE through
       `value_unique`; (2) a PK key; (3) GROUP BY / DISTINCT / indexed `=`.
+      Reviewed 2026-11-14 for a bundle session: step (1) cannot land
+      alone. Once the blanks are stored, a PK, GROUP BY, DISTINCT and an
+      indexed `=` over an unsized `bpchar` would separate `'k'` from
+      `'k '`, which is a wrong answer PostgreSQL never gives. (2) and (3)
+      have to land with it, or before it behind trimmed keys (in
+      `group_key_ident` at lib.rs ~2782, `join_text_hash`, and an `_id` key).
+      So the first PR should be the keys, which change no answer.
       Verify: tests/backlog/test_rp_found_rp672.py::test_create_table_as_of_an_unsized_bpchar_keeps_its_blanks
       Backlog-ID: RP-693
 
