@@ -2717,23 +2717,6 @@ gap tests are in `tests/backlog/test_rp_found_rp532.py`.
       Backlog-ID: RP-537
       Verify: tests/backlog/test_rp_found_rp532.py::test_alias_hides_relation_name
 
-## Found while working RP-557 (2026-11-08)
-
-Measured on a private PostgreSQL 15.19 cluster with `create domain d557 as
-char(3)` and `t557(c char(3), a d557)`. Each was wrong before RP-557's
-change too. The gap tests are in `tests/backlog/test_rp_found_rp557.py`.
-
-- [ ] **`min` / `max` over a `char(n)` column describe its width.** An
-      Aggref carries no modifier (`exprTypmod` has no case for it), so
-      `select min(c) from t557` and `select max(a) from t557` describe
-      `bpchar` -1 on PostgreSQL 15.19; here both are 7
-      (`aggregate_result_typmod` copies the column's). Since RP-671
-      `aggregate_output_def` carries the width too, as a FROM-subquery's
-      column, because it is what pads the trimmed value again: a fix must
-      keep the padding width and describe -1.
-      Verify: tests/backlog/test_rp_found_rp557.py::test_min_max_over_char_n_has_no_modifier
-      Backlog-ID: RP-659
-
 ## Found while working RP-590 (2026-11-08)
 
 Measured on a private PostgreSQL 15.19 cluster with the `_SETUP` in

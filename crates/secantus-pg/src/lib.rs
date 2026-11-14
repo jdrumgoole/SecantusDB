@@ -48409,15 +48409,16 @@ impl PgHandler {
                                     self.user_wire_type(t).unwrap_or_else(|| wire_type(t))
                                 }
                             };
-                            // `min` / `max` over `char(n)` answer that same
-                            // padded type, and the encoder pads on the way out.
                             let typmod = match col {
-                                OutputCol::Agg(i) => aggregate_result_typmod(&agg.items[*i]),
                                 OutputCol::Group(i) => {
                                     let g = &agg.group_by[*i];
                                     wire_typmod(&g.pg_type, g.typmod)
                                 }
-                                OutputCol::Expr(_) | OutputCol::Grouping(_) => -1,
+                                // An Aggref carries no modifier (`exprTypmod`), even
+                                // `min` over `char(n)` (RP-659).
+                                OutputCol::Agg(_) | OutputCol::Expr(_) | OutputCol::Grouping(_) => {
+                                    -1
+                                }
                             };
                             self.field_mod(name.clone(), ty, typmod)
                         })
@@ -48446,7 +48447,9 @@ impl PgHandler {
                     for (n, (_, col)) in select.iter().enumerate() {
                         let v = match col {
                             OutputCol::Group(i) => key[*i].clone().unwrap_or(Bson::Null),
-                            OutputCol::Agg(i) => vals[*i].clone(),
+                            OutputCol::Agg(i) => {
+                                aggregate_result_value(&expr_agg.items[*i], vals[*i].clone())
+                            }
                             OutputCol::Grouping(g) => vals
                                 .get(expr_agg.items.len() + *g)
                                 .cloned()
@@ -52487,14 +52490,18 @@ fn having_holds(
     }
 }
 
-/// The `atttypmod` an aggregate's result carries: only `min` / `max` over a
-/// `char(n)` column, which answer that same blank-padded type.
-fn aggregate_result_typmod(item: &AggItem) -> i32 {
-    match item.func {
-        AggFunc::Min | AggFunc::Max if item.source_type.as_deref() == Some("bpchar") => {
-            item.source_typmod
+/// An aggregate's result as it goes out: `min` / `max` over a `char(n)`
+/// column answer one of its values, which PostgreSQL keeps padded and this
+/// server keeps trimmed, so it is padded to the column's width here: the
+/// field's modifier, which pads a column's values, is -1, as an Aggref
+/// carries none (`exprTypmod`, RP-659).
+fn aggregate_result_value(item: &AggItem, v: Bson) -> Bson {
+    match (secantus_pgplan::bpchar_min_max_typmod(item), v) {
+        (m, Bson::String(t)) if m > 4 && t.chars().count() < (m - 4) as usize => {
+            let pad = (m - 4) as usize - t.chars().count();
+            Bson::String(format!("{t}{}", " ".repeat(pad)))
         }
-        _ => -1,
+        (_, v) => v,
     }
 }
 
@@ -56511,12 +56518,13 @@ impl PgHandler {
                         }
                     };
                     let typmod = match col {
-                        OutputCol::Agg(i) => aggregate_result_typmod(&agg.items[*i]),
                         OutputCol::Group(i) => {
                             let g = &agg.group_by[*i];
                             wire_typmod(&g.pg_type, g.typmod)
                         }
-                        OutputCol::Expr(_) | OutputCol::Grouping(_) => -1,
+                        // An Aggref carries no modifier (`exprTypmod`), even
+                        // `min` over `char(n)` (RP-659).
+                        OutputCol::Agg(_) | OutputCol::Expr(_) | OutputCol::Grouping(_) => -1,
                     };
                     self.field_mod(name.clone(), ty, typmod)
                 })

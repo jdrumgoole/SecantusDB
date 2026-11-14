@@ -48,11 +48,22 @@ def _typmods(c: psycopg.Connection, query: str) -> list[int]:
 
 # An Aggref carries no modifier (`exprTypmod` has no case for it), so
 # `min` / `max` over a `char(3)` column, or a domain over it, describe -1.
-@pytest.mark.backlog("RP-659")
+# Here both described 7, the column's width (RP-659).
+@pytest.mark.backlog_fixed("RP-659")
 @pytest.mark.parametrize("query", ["select min(c) from t557", "select max(a) from t557"])
 def test_min_max_over_char_n_has_no_modifier(query: str, dsn: str) -> None:
     with _connect(dsn) as c:
         assert _typmods(c, query) == [-1]
+
+
+# With the modifier -1 the value still goes out padded, as on 15.19:
+# `min(c)` over `char(3)` holding `'xy'` is `'xy '` (RP-659).
+@pytest.mark.backlog_fixed("RP-659")
+def test_min_over_char_n_still_padded(dsn: str) -> None:
+    with _connect(dsn) as c:
+        c.execute("insert into t557 (c) values ('xy')")
+        row = c.execute("select min(c), max(c) from t557 where c = 'xy'").fetchone()
+        assert row == ("xy ", "xy ")
 
 
 # `select_common_type` smashes a domain to its base type when the other
