@@ -1842,28 +1842,35 @@ a regression test.
       (found while working RP-354, the Memoize while working RP-916).
       Verify: tests/backlog/test_rp_explain_costs.py::test_plan[analyze of a nested loop into an index on an expression of the outer side], tests/backlog/test_rp_explain_costs.py::test_plan[analyze of a memoize keyed by an expression of the outer side]
       Backlog-ID: RP-914
-- [ ] **EXPLAIN VERBOSE prints no `Output` lists and no schema-qualified
-      names.** VERBOSE is accepted and then ignored: PostgreSQL 15.19 prints
-      `explain verbose select * from k where a > 5` (`k` 1,000 analysed
-      rows) as `Seq Scan on public.k` with `Output: a, b` and `Filter: (k.a
-      > 5)`; here `Seq Scan on k` and `Filter: (a > 5)`, as without
-      VERBOSE. A join's nodes each print their `Output` too (`Output: e.a,
-      e.b, e2.a, e2.b` on a Nested Loop, its Materialize's and Memoize's
-      likewise), and an inner index scan's `Index Cond` is qualified
-      (`(k.a > r.a)`). Measured on a private 15.19 cluster (found while
-      working RP-916). Where to build it (read while working RP-840 and
-      RP-847, 2026-11-14): `ExplainOptions.verbose` is parsed and then
-      read by nothing; the plan's text is fixed up after `plan_tree` by
-      the `explain::attach_*` passes `secantus-pg/src/lib.rs` runs on the
-      tree (`attach_scan_quals`, `attach_sort_keys`,
-      `attach_series_scan`), each fed a deparse `plan_explain` computes
-      from the parse tree into `ExplainOptions`. The quals are printed by
-      ruleutils' `Printer` with `unqualified = true`; VERBOSE wants it
-      `false` (`k.a`), and each node's `Output` its targetlist deparsed
-      the same way -- for every node kind, which is why a scans-only
-      slice was not taken.
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[explain verbose prints a scan's output list]
-      Backlog-ID: RP-925
+- [ ] **EXPLAIN VERBOSE prints no `Output` lists above a scan.** A plan
+      that is one relation's scan prints as VERBOSE does (RP-925); any
+      other node prints as without it: PostgreSQL 15.19 prints `explain
+      verbose select * from k where a > 5 order by b` (`k` 1,000 analysed
+      rows) with `Output: a, b` and `Sort Key: k.b` on the Sort, and the
+      Seq Scan under it as `Seq Scan on public.k` with `Output: a, b` and
+      `Filter: (k.a > 5)`; here the plain plan. A join's nodes each print
+      their `Output` too (`Output: e.a, e.b, e2.a, e2.b` on a Nested Loop,
+      its Materialize's and Memoize's likewise), and an inner index scan's
+      `Index Cond` is qualified (`(k.a > r.a)`). Measured on a private
+      15.19 cluster (found while working RP-916). Where to build it: the
+      lone-scan case is `explain::attach_verbose`, fed by
+      `ruleutils::explain_verbose_scan` through
+      `ExplainOptions.verbose_scan`; every other node needs its targetlist
+      deparsed (`show_plan_tlist`, prefixed when the range table holds more
+      than one relation) and its quals and keys printed with `unqualified
+      = false`.
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[explain verbose of a sort over a scan]
+      Backlog-ID: RP-966
+- [ ] **A scan of an aliased relation loses its alias and its quals in
+      EXPLAIN.** PostgreSQL 15.19 prints `explain select * from k x where
+      x.a > 5` (`k` analysed) as `Seq Scan on k x (cost=0.00..17.50
+      rows=995 width=7)` with `Filter: (a > 5)`; here `Seq Scan on k` and
+      no Filter: the quals' printer scopes the table under its own name, so
+      `x.a` does not resolve and `explain_scan_quals` gives up. A VERBOSE
+      plan of it then prints as without VERBOSE too. Measured on a private
+      15.19 cluster (found while working RP-925).
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a scan of an aliased relation]
+      Backlog-ID: RP-967
 - [ ] **A binary-coercible cast is kept in a plan, and its scan is not
       priced.** A cast between binary-compatible types (`text` to
       `varchar` and back to `text` for the operator) is a `RelabelType`
@@ -2464,18 +2471,6 @@ Measured on PostgreSQL 15.19 (the data-modifying WITH on a private cluster).
 
 ## Found while working RP-485 (2026-11-11)
 
-- [ ] **A call to a missing function in a named schema drops the schema
-      from the message.** On PostgreSQL 15.19 `select public.nosuch(1)` is
-      42883 `function public.nosuch(integer) does not exist` at 8, the name
-      as written, schema and all (`pg_catalog.nosuch()` and a user schema's
-      alike). Here the message is `function nosuch(integer) does not exist`
-      and the position the bare name's, 15. The three-part form in the
-      session's database alike: `select postgres.public.nosuch()` is
-      `function postgres.public.nosuch() does not exist` at 8 there, and
-      `function nosuch() does not exist` at 24 here. Measured on a private
-      15.19 cluster.
-      Verify: tests/backlog/test_rp_qualified_calls.py::test_missing_function_keeps_its_schema
-      Backlog-ID: RP-879
 - [ ] **A function found nowhere inside another call's arguments is
       reported as the outer call's missing overload.** On PostgreSQL 15.19
       `select abs(nosuch1())` is 42883 `function nosuch1() does not exist`
@@ -2632,16 +2627,6 @@ Measured on a private PostgreSQL 15.19 cluster. The gap tests are in
       Verify: tests/backlog/test_rp_found_rp515.py::test_argument_and_column_names_are_quoted
       Backlog-ID: RP-876
 
-- [ ] **A procedure's `pg_get_function_result` and `pg_get_functiondef`
-      read as a function's.** PostgreSQL 15.19's `pg_get_function_result`
-      is NULL for a procedure, and `pg_get_functiondef` prints `CREATE OR
-      REPLACE PROCEDURE public.gk(IN a integer, INOUT b text)`, no RETURNS
-      line, the body quoted `$procedure$`. Here the result is `record` and
-      the definition `CREATE OR REPLACE FUNCTION ... RETURNS record ...
-      $function$`.
-      Verify: tests/backlog/test_rp_found_rp515.py::test_procedure_result_and_definition
-      Backlog-ID: RP-877
-
 ## Found while working RP-467 (2026-11-08)
 
 - [ ] **Two schemas' tables of one name are not `checkNameSpaceConflicts`'
@@ -2713,35 +2698,6 @@ and `fs(a int, c text)`.
       Backlog-ID: RP-524
       Verify: tests/backlog/test_rp_subquery_scope.py::test_write_name_error_position
 
-## Found while working RP-546 (2026-11-08)
-
-Measured on a private, freshly initdb'd PostgreSQL 15.19 cluster. The gap
-tests are in `tests/backlog/test_rp_found_rp546.py`.
-
-- [ ] **A `regprocedure` prints its name unquoted and a schema's type
-      quoted whole.** `regprocedureout` is `format_procedure`: `"Q
-      f567"(s567.t)` and `s567.h(s567.t)` on PostgreSQL 15.19. Here they are
-      `Q f567("s567.t")` and `s567.h("s567.t")` (`regobj::text`), and
-      `pg_describe_object` of a routine shares that text.
-      Backlog-ID: RP-567
-      Verify: tests/backlog/test_rp_found_rp546.py::test_regprocedure_quotes_as_format_procedure
-
-## Found while working RP-560 (2026-11-14)
-
-Measured on a private PostgreSQL 15.19 cluster. The gap test is in
-`tests/backlog/test_rp_found_rp546.py`.
-
-- [ ] **A cast over a type in another schema is described by the type's
-      bare or quoted key.** `getObjectDescription` of a cast is `cast from
-      %s to %s` over each type's `format_type_be`: a table `s9c.t` off the
-      search path gives `cast from s9c.t to integer` on PostgreSQL 15.19, in
-      DROP TABLE's and DROP FUNCTION's DETAIL and in the CASCADE notice, as
-      `pg_describe_object` already answers here. The DETAIL here names it
-      `cast from "t" to integer` and the notice `cast from "s9c.t" to
-      integer` (`display_cast_type` in `casts.rs`).
-      Verify: tests/backlog/test_rp_found_rp546.py::test_cast_over_a_schema_type_described_as_format_type
-      Backlog-ID: RP-951
-
 ## Found while working RP-527 (2026-11-08)
 
 Measured on a private PostgreSQL 15.19 cluster. The gap tests are in
@@ -2782,15 +2738,6 @@ holding `(1, 'y')` twice, `(2, 'z')` and `(null, null)`, and `fk(k fs)`
 holding `row(null, null)`, `row(1, null)`, `row(1, 'a')` and `null`. The
 gap tests are in `tests/backlog/test_rp_found_rp532.py`.
 
-- [ ] **An ungrouped whole row's 42803 names its first column, with no
-      position.** PostgreSQL 15.19's `check_ungrouped_columns` names a
-      whole-row Var `fs.*` (`get_rte_attribute_name` of attribute 0), at
-      the reference: `select fs, count(*) from fs group by a` is `column
-      "fs.*" must appear in the GROUP BY clause ...` at 8, and `select
-      count(*) from fs having fs is not null` the same at 32. Here they
-      name `fs.c` and `fs.a`, with no position.
-      Backlog-ID: RP-536
-      Verify: tests/backlog/test_rp_found_rp532.py::test_ungrouped_whole_row
 - [ ] **A relation name its alias hides is reported at the FROM item.**
       Under `from fs x` the name `fs` names nothing, so PostgreSQL 15.19
       reports `select count(*) from fs x group by fs` and `... order by fs`
@@ -3111,21 +3058,6 @@ Measured on a private PostgreSQL 15.19 cluster. The gap tests are in
       Verify: tests/backlog/test_rp_found_rp658.py::test_composite_attribute_attndims
       Backlog-ID: RP-663
 
-## Found while working RP-575 (2026-11-08)
-
-Measured on PostgreSQL 15.19; none of it needs DDL. The gap tests are in
-`tests/backlog/test_rp_found_rp575.py`.
-
-- [ ] **An `int2vector` of two dimensions prints as text.** `array_agg`
-      over vectors is `array_agg(anyarray)`, typed `int2vector` and holding
-      two dimensions, which `int2vectorout` refuses (`check_valid_int2vector`):
-      on PostgreSQL 15.19 `array_agg(v)::text` and `concat(array_agg(v))`
-      are 42804 `array is not a valid int2vector`. Here they are `{1,2}`.
-      The value sent as a column already is 42804 in text (RP-575); a cast
-      or `concat` prints it through `typeout`, which cannot fail.
-      Verify: tests/backlog/test_rp_found_rp575.py::test_two_dimensional_vector_text
-      Backlog-ID: RP-602
-
 ## Found while working RP-612 (2026-11-14)
 
 Measured on PostgreSQL 15.19; none of it needs DDL. The gap tests are in
@@ -3220,35 +3152,16 @@ Measured on a private PostgreSQL 15.19 cluster with `fs(a int, c text)`,
 
 Measured on a private PostgreSQL 15.19 cluster with `fe(a int, b text)`.
 
-- [ ] **A string constant an operator over a column or a parameter, an
-      INSERT or UPDATE target, or COALESCE gives its type is not read at
-      CREATE.** PostgreSQL 15.19 coerces each while it analyses a SQL
-      function's body (`transformExpr`, `coerce_type`), so `create function
-      gx(p int) returns int language sql as $$ select p + 'a' $$` is 22P02
-      `invalid input syntax for type integer: "a"` at 69, and so are `select
-      a + 'q' from fe` (69), `insert into fe values ('q')` (82), `update fe
-      set a = 'q'` (77) and `select coalesce('q', 1)` (74). Here each CREATE
-      succeeds. Since RP-500 a cast's constant is read at CREATE, and an
-      operator's operand only where planning folds the comparison (`'a' =
-      1`, `a = 'q'` in a WHERE): the rest needs each constant's resolved
-      type from the analysis, which the planner does not keep. PREPARE has
-      the same shape (RP-511).
-      Backlog-ID: RP-507
-      Verify: tests/backlog/test_rp_found_rp500.py::test_operand_constant_read_at_create
-- [ ] **PREPARE evaluates a constant expression, and does not read a cast
-      constant it does not evaluate.** PostgreSQL 15.19's PREPARE
-      parse-analyses its statement and plans nothing: `prepare s1 as select
-      1/0` is prepared, while `prepare s2 as select 'x'::int from fe`,
-      `prepare s3 as select case when false then 'x'::int end` and `prepare
-      s4(int) as select $1 + 'a'` are 22P02 at the constant (22, 43, 32).
-      Here the first is 22012 `division by zero` and the other three are
-      prepared. The planner folds a FROM-less constant expression while it
-      plans and reads a constant only where it folds. Since RP-500 CREATE
-      FUNCTION reads every cast's constant (`sql_fn_validator::literal_casts`),
-      which PREPARE could share, but it also needs planning that does not
-      evaluate.
-      Backlog-ID: RP-511
-      Verify: tests/backlog/test_rp_found_rp500.py::test_prepare_analyses_without_evaluating
+- [ ] **CREATE VIEW evaluates a constant expression.** PostgreSQL
+      15.19's `DefineView` parse-analyses the query and plans nothing:
+      `create view rp511v as select 1/0 as x` is created, and only reading
+      it raises 22012. Here CREATE VIEW raises 22012 itself. Since RP-511 a
+      statement's Describe, a PREPARE and `CREATE TABLE AS ... WITH NO
+      DATA` fold no constant (`analysing_only`, inside
+      `with_analysed_typmods`); CREATE VIEW reaches a planning path outside
+      that scope.
+      Verify: tests/backlog/test_rp_found_rp500.py::test_create_view_analyses_without_evaluating
+      Backlog-ID: RP-968
 
 ## Found while working RP-510 (2026-11-11)
 
@@ -3268,26 +3181,6 @@ Measured on PostgreSQL 15.19.
       in place.
       Verify: tests/backlog/test_rp_found_rp510.py::test_multirange_literal_detail
       Backlog-ID: RP-878
-
-## Found while working RP-493 (2026-11-07)
-
-Measured on a private PostgreSQL 15.19 cluster.
-
-- [ ] **A scalar subquery's column, and a CASE folded by a computed
-      constant, lose their type modifier.** `select (select
-      2.5::numeric(5,2))` carries 327686 in every reader on PostgreSQL (the
-      subquery's first column, `exprTypmod` of its SubLink); here it is -1
-      everywhere. And `eval_const_expressions` simplifies a CASE whose WHEN
-      folds to a constant before the planned readers (a portal's Describe,
-      a populating CREATE TABLE AS, a SELECT from a view) see it, so `case
-      1 when 1 then 'a'::varchar(3) end` and `case when 1 = 1 then
-      'a'::varchar(3) end` describe 7 there (-1 in a prepared statement's
-      Describe, a view's columns and WITH NO DATA, as here). Since RP-493
-      only a literal `true` / `false` / `null` condition, or a literal
-      COALESCE argument, is folded (`expr_typmod.rs`); a computed one needs
-      the constant evaluator's own verdict on what folds.
-      Verify: tests/backlog/test_rp_ctas_subquery.py::test_typmod_from_scalar_subquery_and_computed_constants
-      Backlog-ID: RP-497
 
 ## Found while working RP-316 (2026-11-02)
 
@@ -3781,25 +3674,6 @@ statement is VALUES-only and runs there as written.
       Verify: tests/backlog/test_rp_found_rp756.py::test_a_set_operation_from_subquerys_column_is_typed
       Backlog-ID: RP-765
 
-## Found while working RP-769 (2026-11-10)
-
-Measured on a private PostgreSQL 15.19 cluster (locale C.UTF-8, built
-with ICU) with the `_SETUP` in `tests/backlog/test_rp_found_rp769.py`.
-Since RP-769 a domain, and its array type, takes its base type's
-collation (`catalog_fill.rs`'s `domain_collations`).
-
-- [ ] **`information_schema.columns.collation_name` shows only a declared
-      COLLATE.** PostgreSQL 15.19's view joins `pg_collation` on
-      `attcollation` and leaves out only `pg_catalog.default`, so a `name`
-      column, a `name[]` column and a column of a domain over `name` show
-      `C` (`collation_catalog` and `collation_schema` `pg_catalog`), and a
-      declared `collate "default"` shows nothing. Here the first three
-      show NULL and the last `default`: the row is built from the
-      column's declared collation alone (`lib.rs`, "Only a column that
-      DECLARES a collation shows one").
-      Verify: tests/backlog/test_rp_found_rp769.py::test_information_schema_columns_collation_is_the_columns
-      Backlog-ID: RP-783
-
 ## Found while working RP-782 (2026-11-10)
 
 Measured on a private PostgreSQL 15.19 cluster (locale C.UTF-8, built
@@ -3825,50 +3699,6 @@ with ICU) with the `_SETUP` in `tests/backlog/test_rp_found_rp782.py`:
       answers NULL, though a user view's definition is printed.
       Verify: tests/backlog/test_rp_found_rp782.py::test_pg_get_viewdef_of_a_system_view
       Backlog-ID: RP-798
-
-## Found while working RP-796 (2026-11-10)
-
-Measured on a private PostgreSQL 15.19 cluster (locale C.UTF-8, built
-with ICU) with the `_SETUP` in `tests/backlog/test_rp_found_rp782.py`
-(`xu782f` a domain over `text` `collate "und-x-icu"`, `xc782f` one
-`collate "C"`). The gap tests are in `tests/backlog/test_rp_found_rp796.py`.
-
-- [ ] **A `COLLATE` over an expression of a collated domain is 42804.**
-      `select 'a'::xu782f collate "C" < 'B'` is false on PostgreSQL 15.19,
-      `v::xu782f collate "C" < 'C'` over a VALUES list compares bytewise,
-      and `order by v::xu782f collate "C"` sorts `B, D, a, c`; here each is
-      42804 `collations are not supported by type xu782f` (a domain over a
-      domain too). `transformCollateClause` asks `type_is_collatable` of
-      the expression's type, which a domain over `text` is. The type
-      checks that refuse it list base type names (the FROM-less constant
-      `COLLATE` in `lib.rs`, among others) rather than asking
-      `collation::collatable`, which follows a domain to its base. A
-      `COLLATE` naming a locale collation (`"und-x-icu"`) over one is
-      answered.
-      Verify: tests/backlog/test_rp_found_rp796.py::test_collate_over_a_collated_domain_expression
-      Backlog-ID: RP-802
-
-## Found while working RP-803 (2026-11-10)
-
-Measured on a private PostgreSQL 15.19 cluster (locale C.UTF-8, built
-with ICU) with the `_SETUP` in `tests/backlog/test_rp_found_rp782.py`.
-Since RP-803 a VALUES or set-operation column whose rows' implicit
-collations conflict has none (`collation::INDETERMINATE`): ORDER BY and
-`max` / `min` over it are 42P22, and `collation for` it is NULL.
-
-- [ ] **A column of no collation is still grouped, made distinct and
-      compared bytewise.** Over `(values ('a'::xu782f), ('B'::xc782f))
-      s(v)`, `group by v` is 42P22 `could not determine which collation to
-      use for string hashing` on PostgreSQL 15.19 (`hashtext`'s
-      `check_collation_set`), and `select distinct v`, `count(distinct
-      v)`, `select v = v` and `select v < v` are 42P22 `... for string
-      comparison` (`texteq`, `text_lt`); here each answers, bytewise. A
-      sort by it over no rows (`... where false order by v`) is 42P22 there,
-      as `varstr_sortsupport` checks as the sort starts; here it is empty,
-      since the check rides on each row's sort key. (`where v = v` answers
-      both rows on both: the planner reduces it to `v IS NOT NULL`.)
-      Verify: tests/backlog/test_rp_found_rp796.py::test_a_column_of_no_collation_is_not_hashed_or_compared
-      Backlog-ID: RP-820
 
 ## Found while working RP-808 (2026-11-10)
 
@@ -3941,14 +3771,6 @@ Measured on a private PostgreSQL 15.19 cluster.
       and `column "nosuch" does not exist` at 39 here.
       Verify: tests/backlog/test_rp_found_rp816.py::test_a_checks_qualified_column_is_resolved_against_its_table
       Backlog-ID: RP-861
-- [ ] **A system column in a generated column's expression is accepted.**
-      `create table t816 (x int, y int generated always as
-      (xmin::text::int) stored)` is 42P10 `cannot use system column "xmin"
-      in column generation expression` at 54 on PostgreSQL 15.19
-      (`scanNSItemForColumn` under `EXPR_KIND_GENERATED_COLUMN`, `tableoid`
-      allowed); here the table is created.
-      Verify: tests/backlog/test_rp_found_rp816.py::test_a_system_column_in_a_generated_column_is_42p10
-      Backlog-ID: RP-862
 
 ## Found while working RP-860 (2026-11-14)
 

@@ -2785,6 +2785,40 @@ mod join_type_tests {
 
 /// A relation scan's node name: a Seq Scan, or an Index Scan or Index Only
 /// Scan over one of its indexes.
+/// `EXPLAIN VERBOSE` of a plan that is one relation's scan (RP-925): the
+/// relation schema-qualified, its `Output` list first, its quals
+/// prefixed. Every other plan prints as without VERBOSE.
+pub(crate) fn attach_verbose(
+    root: &mut PlanNode,
+    scan: &Option<secantus_pgplan::ruleutils::VerboseScan>,
+) {
+    let Some(v) = scan else {
+        return;
+    };
+    if !is_scan_name(&root.name) || !root.children.is_empty() {
+        return;
+    }
+    let plain = format!(" on {}", v.plain);
+    let Some(head) = root.name.strip_suffix(&plain) else {
+        return;
+    };
+    root.name = format!("{head} on {}", v.relation);
+    for (label, value) in &mut root.details {
+        if matches!(label.as_str(), "Filter" | "Index Cond" | "Recheck Cond") {
+            for (bare, qualified) in &v.quals {
+                if *value == *bare {
+                    value.clone_from(qualified);
+                } else {
+                    *value = value.replace(&format!("{bare} AND "), &format!("{qualified} AND "));
+                    *value = value.replace(&format!(" AND {bare}"), &format!(" AND {qualified}"));
+                }
+            }
+        }
+    }
+    root.details
+        .insert(0, ("Output".into(), v.output.join(", ")));
+}
+
 fn is_scan_name(name: &str) -> bool {
     name.starts_with("Seq Scan on ")
         || name.starts_with("Bitmap Heap Scan on ")
@@ -2899,6 +2933,7 @@ mod heap_fetches_tests {
         ExplainOptions {
             analyze: true,
             verbose: false,
+            verbose_scan: None,
             costs: false,
             timing: false,
             summary: false,

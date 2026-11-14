@@ -5176,6 +5176,33 @@ fn a_whole_row_is_grouped_by_and_tested_in_having() {
 }
 
 #[test]
+fn an_ungrouped_whole_row_is_named_t_star() {
+    // PostgreSQL 15.19's `check_ungrouped_columns` names a whole-row Var
+    // `t.*`, in the select list, ORDER BY and HAVING alike (RP-536).
+    for sql in [
+        "select t, count(*) from t group by n",
+        "select count(*) from t having t is not null",
+        "select count(*) from t group by n order by t",
+    ] {
+        let parsed = pg_query::parse(sql).unwrap();
+        let Some(N::SelectStmt(s)) = parsed.protobuf.stmts[0]
+            .stmt
+            .as_ref()
+            .and_then(|n| n.node.as_ref())
+        else {
+            panic!("not a SELECT: {sql}");
+        };
+        match whole_row_rewrite(s, &lookup, &[]) {
+            Err(Error::Grouping(m)) => assert!(m.starts_with("column \"t.*\" must appear"), "{m}"),
+            other => panic!("{sql}: {other:?}"),
+        }
+    }
+    // Grouped by the row itself, or by its ordinal, the row is grouped.
+    whole_rows_rewritten("select t, count(*) from t group by t");
+    whole_rows_rewritten("select t, count(*) from t group by 1");
+}
+
+#[test]
 fn a_field_of_a_whole_row_is_its_column() {
     // PostgreSQL 15.19's `ParseComplexProjection`: `(t).n` is t's column
     // n, so under `group by t` it is ungrouped (42803 at `t`), RP-532.
@@ -8270,4 +8297,69 @@ fn an_input_functions_out_of_range_error_is_at_its_literal() {
         error_position("select 2147483647 + 1", "22003", "integer out of range"),
         None
     );
+}
+
+/// An unknown parameter takes the type of a declared parameter, a cast or
+/// a numeric constant beside it, and COALESCE's typed argument (RP-507).
+#[test]
+fn an_unknown_parameter_takes_its_typed_operands_type() {
+    let none = |_: &str, _: ColumnRef<'_>| -> Option<String> { None };
+    let got =
+        |sql: &str, declared: &[Option<String>]| catalog_param_types_opt(sql, declared, &none);
+    assert_eq!(
+        got("select $1 + $2", &[Some("integer".into()), None])[1].as_deref(),
+        Some("integer")
+    );
+    assert_eq!(got("select $1 = 1", &[None])[0].as_deref(), Some("integer"));
+    assert_eq!(
+        got("select $1 = 3000000000", &[None])[0].as_deref(),
+        Some("bigint")
+    );
+    assert_eq!(
+        got("select $1 = 1.5", &[None])[0].as_deref(),
+        Some("numeric")
+    );
+    assert_eq!(
+        got("select coalesce($1, 1)", &[None])[0].as_deref(),
+        Some("integer")
+    );
+    assert_eq!(
+        got("select $1::int4 + $2", &[None, None])[1].as_deref(),
+        Some("int4")
+    );
+    assert_eq!(got("select $1 || 'x'", &[None])[0], None);
+    // Where no operator takes the known type twice, the candidate's.
+    assert_eq!(
+        got("select $1 || $2", &[Some("integer".into()), None])[1].as_deref(),
+        Some("text")
+    );
+    assert_eq!(
+        got("select '{}'::json #>> $1", &[None])[0].as_deref(),
+        Some("text[]")
+    );
+    assert_eq!(got("select $1 #>> '{}'::jsonb", &[None])[0], None);
+}
+
+/// A system column other than `tableoid` in a generation expression is
+/// 42P10 at the reference, as on PostgreSQL 15.19 (RP-862).
+#[test]
+fn a_system_column_in_a_generation_expression_is_refused() {
+    let sql = "create table t816 (x int, y int generated always as (xmin::text::int) stored)";
+    take_error_location();
+    let err = plan(sql, &lookup).expect_err("should refuse");
+    assert_eq!(err.sqlstate(), "42P10", "got {err}");
+    assert_eq!(
+        err.to_string(),
+        "cannot use system column \"xmin\" in column generation expression"
+    );
+    assert_eq!(
+        crate::errpos::error_position(sql, "42P10", &err.to_string()),
+        Some(54)
+    );
+    take_error_location();
+    plan(
+        "create table t816 (x int, y oid generated always as (tableoid) stored)",
+        &lookup,
+    )
+    .expect("tableoid is allowed");
 }

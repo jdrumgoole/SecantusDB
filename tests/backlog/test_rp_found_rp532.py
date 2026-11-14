@@ -94,7 +94,7 @@ def test_row_order_desc(query: str, dsn: str) -> None:
 
 # An ungrouped whole row is a Var of attribute 0, which
 # `check_ungrouped_columns` names `fs.*` (`get_rte_attribute_name`), at the
-# reference.
+# reference. It was named by its first column, with no position (RP-536).
 UNGROUPED_WHOLE_ROW = {
     "select fs, count(*) from fs group by a": (
         "42803",
@@ -111,7 +111,7 @@ UNGROUPED_WHOLE_ROW = {
 }
 
 
-@pytest.mark.backlog("RP-536")
+@pytest.mark.backlog_fixed("RP-536")
 @pytest.mark.parametrize("query", list(UNGROUPED_WHOLE_ROW))
 def test_ungrouped_whole_row(query: str, dsn: str) -> None:
     assert answer(dsn, query) == UNGROUPED_WHOLE_ROW[query]

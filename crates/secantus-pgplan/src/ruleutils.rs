@@ -5944,3 +5944,98 @@ mod join_where_tests {
         assert_eq!(got[0].1, None);
     }
 }
+
+/// A single-relation SELECT's scan as `EXPLAIN VERBOSE` prints it
+/// (RP-925): `ExplainNode` names the relation schema-qualified, with its
+/// alias; `show_plan_tlist` prints the target list as `Output`, prefixed
+/// only when the range table holds more than one relation; and
+/// `show_scan_qual` prints the quals prefixed (`useprefix` is
+/// `es->verbose`).
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct VerboseScan {
+    /// The relation as the node names it: `public.k`, `public.k x`.
+    pub relation: String,
+    /// The relation as the plain plan names it: `k`, `k x`.
+    pub plain: String,
+    pub output: Vec<String>,
+    /// Each WHERE conjunct: its text as the plain plan prints it, and
+    /// qualified.
+    pub quals: Vec<(String, String)>,
+}
+
+/// [`VerboseScan`] for a SELECT over one relation; `None` for any other
+/// shape, or an expression the printer does not know.
+pub fn explain_verbose_scan(
+    s: &pg_query::protobuf::SelectStmt,
+    def: &TableDef,
+) -> Option<VerboseScan> {
+    let [item] = s.from_clause.as_slice() else {
+        return None;
+    };
+    let Some(N::RangeVar(rv)) = item.node.as_ref() else {
+        return None;
+    };
+    let (schema, bare) = crate::schemas::split_key(&def.name);
+    let alias = rv.alias.as_ref().map(|a| a.aliasname.clone());
+    let refname = alias.clone().unwrap_or_else(|| bare.clone());
+    let none_lookup = |_: &str| None;
+    let none_views = |_: &str| None;
+    let cat = Catalog {
+        lookup: &none_lookup,
+        view_sql: &none_views,
+    };
+    let printer = |unqualified: bool| {
+        let mut p = Printer::new(&cat, 0);
+        p.unqualified = unqualified;
+        p.fold_consts = true;
+        p.scopes.push(vec![Rte {
+            refname: refname.clone(),
+            name: refname.clone(),
+            columns: def
+                .columns
+                .iter()
+                .map(|c| (c.name.clone(), base_type(&c.pg_type)))
+                .collect(),
+            qualified_only: false,
+            ..Default::default()
+        }]);
+        p
+    };
+    let mut output = Vec::new();
+    for t in &s.target_list {
+        let Some(N::ResTarget(rt)) = t.node.as_ref() else {
+            return None;
+        };
+        let val = rt.val.as_deref()?;
+        let star = matches!(
+            val.node.as_ref(),
+            Some(N::ColumnRef(c)) if c.fields.last().is_some_and(|f| matches!(f.node.as_ref(), Some(N::AStar(_))))
+        );
+        if star {
+            output.extend(def.columns.iter().map(|c| q(&c.name)));
+            continue;
+        }
+        let mut p = printer(true);
+        p.expr(val)?;
+        output.push(p.buf);
+    }
+    let mut quals = Vec::new();
+    if let Some(w) = s.where_clause.as_deref() {
+        let mut parts = Vec::new();
+        and_clauses(w, &mut parts);
+        for part in &parts {
+            let part: &Node = part;
+            let plain = expr_node_planned(part, def)?;
+            let mut p = printer(false);
+            p.expr(part)?;
+            quals.push((plain, p.buf));
+        }
+    }
+    let suffix = alias.map(|a| format!(" {}", q(&a))).unwrap_or_default();
+    Some(VerboseScan {
+        relation: format!("{}.{}{suffix}", q(&schema), q(&bare)),
+        plain: format!("{}{suffix}", q(&bare)),
+        output,
+        quals,
+    })
+}

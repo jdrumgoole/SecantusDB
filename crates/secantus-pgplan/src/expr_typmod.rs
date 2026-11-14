@@ -175,12 +175,12 @@ fn case_typed(c: &pg_query::protobuf::CaseExpr, cx: &Ctx) -> Option<(String, i32
         let Some(N::CaseWhen(w)) = w.node.as_ref() else {
             return None;
         };
-        // A simple CASE (`case x when 1 ...`) compares; its conditions are
-        // not literals, so every arm is kept.
-        let cond = if c.arg.is_some() || !cx.fold {
-            None
-        } else {
-            w.expr.as_deref().and_then(literal)
+        // A simple CASE (`case x when 1 ...`) compares its argument with
+        // each WHEN, which folds when both are constants (RP-497).
+        let cond = match (cx.fold, c.arg.as_deref(), w.expr.as_deref()) {
+            (false, ..) | (_, _, None) => None,
+            (true, Some(arg), Some(when)) => folded_truth(&equality(arg, when)),
+            (true, None, Some(when)) => literal(when).or_else(|| folded_truth(when)),
         };
         match cond {
             Some(Literal::Null | Literal::False) => continue,
@@ -194,6 +194,38 @@ fn case_typed(c: &pg_query::protobuf::CaseExpr, cx: &Ctx) -> Option<(String, i32
     // No ELSE is a NULL default, whose modifier is -1.
     let default = typed(default?, cx)?;
     agree(default, kept.into_iter(), cx)
+}
+
+/// What a condition `eval_const_expressions` folds is (RP-497): one of
+/// built-in operators over constants (`1 = 1`), evaluated as the planner
+/// evaluates it. `None` for one that does not fold, or whose evaluation
+/// raises (the planner would raise it; the modifier is not the answer).
+fn folded_truth(cond: &pg_query::protobuf::Node) -> Option<Literal> {
+    if !folds_to_constant(cond) {
+        return None;
+    }
+    match const_value(cond, &[]).ok()? {
+        Bson::Boolean(true) => Some(Literal::True),
+        Bson::Boolean(false) => Some(Literal::False),
+        Bson::Null => Some(Literal::Null),
+        _ => None,
+    }
+}
+
+/// `arg = when`, the test a simple CASE's arm makes.
+fn equality(
+    arg: &pg_query::protobuf::Node,
+    when: &pg_query::protobuf::Node,
+) -> pg_query::protobuf::Node {
+    pg_query::protobuf::Node {
+        node: Some(N::AExpr(Box::new(pg_query::protobuf::AExpr {
+            kind: AExprKind::AexprOp as i32,
+            name: vec![string_node("=")],
+            lexpr: Some(Box::new(arg.clone())),
+            rexpr: Some(Box::new(when.clone())),
+            location: -1,
+        }))),
+    }
 }
 
 /// A COALESCE after `eval_const_expressions`: NULL constants dropped, and

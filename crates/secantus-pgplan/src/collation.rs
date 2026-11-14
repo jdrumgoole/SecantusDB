@@ -101,6 +101,10 @@ pub const CITEXT: &str = "__citext";
 /// comparing by it is [`indeterminate`] when it runs.
 pub const INDETERMINATE: &str = "\u{1f}indeterminate";
 
+/// A hash key over a column of no collation: [`sort_key`] answers
+/// `hashtext`'s `check_collation_set` error for it (RP-820).
+pub const INDETERMINATE_HASH: &str = "\u{1f}indeterminate-hash";
+
 /// `check_collation_set`'s error: a string comparison reached with no
 /// collation.
 pub fn indeterminate() -> Error {
@@ -495,6 +499,12 @@ fn hex(bytes: &[u8]) -> String {
 pub fn sort_key(collation: &str, text: &str) -> Result<String> {
     if collation == INDETERMINATE {
         return Err(indeterminate());
+    }
+    if collation == INDETERMINATE_HASH {
+        return Err(Error::Sqlstate(
+            "42P22",
+            "could not determine which collation to use for string hashing".into(),
+        ));
     }
     Ok(match resolve(collation)? {
         // Byte order: the text's own bytes, hex, keep that order.

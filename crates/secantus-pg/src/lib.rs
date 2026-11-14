@@ -13896,6 +13896,16 @@ impl PgHandler {
             // `"int"` is kept as it prints (`pgtypes::user_type_key`).
             return name.to_string();
         }
+        // `format_type_be`: a type in another schema is `schema.name`, each
+        // part quoted on its own (`s567.t`, not `"s567.t"`).
+        let (schema, bare) = secantus_pgplan::schemas::split_key(name);
+        if schema != "public" {
+            return format!(
+                "{}.{}",
+                secantus_pgplan::scalar::quote_identifier(&schema),
+                secantus_pgplan::scalar::quote_identifier(&bare)
+            );
+        }
         secantus_pgplan::scalar::quote_identifier(name)
     }
 
@@ -14672,6 +14682,81 @@ impl PgHandler {
     /// A SQL-standard body (`BEGIN ATOMIC`, `RETURN`) is analysed as CREATE
     /// reads it (`interpret_AS_clause`), so `check_function_bodies = off`
     /// postpones only its result check.
+    /// The input error parse analysis raises for a string constant of
+    /// `sql` (`coerce_type` over an unknown-typed `Const`), and the
+    /// constant's byte offset: each constant a cast reads (RP-500), and
+    /// each one a parameter standing in its place would be inferred to
+    /// have a type for, an operator's, a target column's or COALESCE's
+    /// (RP-507). `declared` types `sql`'s own parameters. Nothing is
+    /// evaluated but the input function.
+    pub(crate) fn constant_input_error(
+        &self,
+        sql: &str,
+        declared: &[Option<String>],
+    ) -> Option<(PgWireError, usize)> {
+        let tz = self.session_timezone();
+        let run = |stmt: &Statement| self.subquery_rows(stmt);
+        let read = |probe: &str| -> Option<PgWireError> {
+            let got = secantus_pgplan::planning_without_running(|| {
+                secantus_pgplan::plan_with_session_types_and_subqueries(
+                    probe,
+                    &|n| self.lookup(n),
+                    &[],
+                    &[],
+                    &tz,
+                    Some(&run),
+                )
+                .and_then(|p| self.subquery_rows(&p))
+            });
+            let mut err = Self::err(&got.err()?);
+            if !sql_fn_validator::is_input_error(&err) {
+                return None;
+            }
+            if let PgWireError::UserError(info) = &mut err {
+                info.position = None;
+            }
+            Some(err)
+        };
+        for (lit, probe) in sql_fn_validator::literal_casts(sql) {
+            if let Some(err) = read(&probe) {
+                return Some((err, lit.at));
+            }
+        }
+        let n = declared.len().max(secantus_pgplan::max_param_number(sql));
+        let (as_params, bare) = sql_fn_validator::bare_constants_as_params(sql, n + 1);
+        if bare.is_empty() {
+            return None;
+        }
+        let mut with_bare = declared.to_vec();
+        with_bare.resize(n + bare.len(), None);
+        let column_type = |table: &str, column: secantus_pgplan::ColumnRef<'_>| {
+            self.lookup(table).and_then(|def| {
+                let col = match column {
+                    secantus_pgplan::ColumnRef::Name(name) => def.column(name),
+                    secantus_pgplan::ColumnRef::Position(pos) => def.columns.get(pos),
+                };
+                col.map(|c| c.pg_type.clone())
+            })
+        };
+        let inferred =
+            secantus_pgplan::catalog_param_types_opt(&as_params, &with_bare, &column_type);
+        for (lit, ty) in bare.iter().zip(inferred.into_iter().skip(n)) {
+            let Some(ty) = ty else {
+                continue;
+            };
+            // The input function is passed a typmod of -1.
+            let ty = match ty.find('(') {
+                Some(p) if !ty.starts_with("interval") => ty[..p].trim().to_string(),
+                _ => ty,
+            };
+            let probe = format!("select '{}'::{ty}", lit.value.replace('\'', "''"));
+            if let Some(err) = read(&probe) {
+                return Some((err, lit.at));
+            }
+        }
+        None
+    }
+
     fn check_sql_function_body(
         &self,
         fname: &str,
@@ -14833,24 +14918,13 @@ impl PgHandler {
                         }
                     }
                 }
-                // Each constant a cast reads is read by the cast type's
-                // input function while the statement is analysed, whether
-                // or not the expression is ever evaluated.
-                for (lit, probe) in sql_fn_validator::literal_casts(stmt) {
-                    let read = plan(&probe, &[], &[])
-                        .map_err(|e| Self::err(&e))
-                        .and_then(|p| {
-                            secantus_pgplan::planning_without_running(|| self.subquery_rows(&p))
-                                .map_err(|e| Self::err(&e))
-                        });
-                    if let Err(mut err) = read {
-                        if sql_fn_validator::is_input_error(&err) {
-                            if let PgWireError::UserError(info) = &mut err {
-                                info.position = None;
-                            }
-                            return Some((err, Some(in_body(lit.at))));
-                        }
-                    }
+                // Each constant a cast, an operator, a target column or
+                // COALESCE types is read by that type's input function
+                // while the statement is analysed, whether or not the
+                // expression is ever evaluated.
+                if let Some((err, at)) = self.constant_input_error(&bound, &declared) {
+                    let at = sql_fn_params::original_offset(&spans, at);
+                    return Some((err, Some(in_body(at))));
                 }
                 last = Some((stmt.to_string(), columns));
             }
@@ -23012,8 +23086,26 @@ impl PgHandler {
                                 None => Bson::Null,
                             },
                         );
-                        // Only a column that DECLARES a collation shows one.
-                        let collation = c.extra.get_str("collation").ok();
+                        // The view joins `pg_collation` on `attcollation` --
+                        // the column's own COLLATE, else its type's (a
+                        // domain's declared one, else its base's) -- and
+                        // leaves out only `pg_catalog.default` (RP-783).
+                        let attcollation: Option<String> = c
+                            .extra
+                            .get_str("collation")
+                            .ok()
+                            .map(str::to_string)
+                            .or_else(|| {
+                                c.extra
+                                    .get_str("domain_type")
+                                    .ok()
+                                    .and_then(secantus_pgplan::domains::declared_collation)
+                                    .or_else(|| match c.pg_type.trim_end_matches("[]") {
+                                        "name" => Some("C".to_string()),
+                                        _ => None,
+                                    })
+                            });
+                        let collation = attcollation.as_deref().filter(|n| *n != "default");
                         d.insert(
                             f("collation_catalog"),
                             collation.map_or(Bson::Null, |_| Bson::String(db.clone())),
@@ -26531,6 +26623,12 @@ impl PgHandler {
                         secantus_pgplan::identifier_position(sql, name)
                     }
                 }
+                _ if info.code == "42883" => {
+                    if let Some(m) = secantus_pgplan::qualify_missing_function(sql, &info.message) {
+                        info.message = m;
+                    }
+                    secantus_pgplan::error_position(sql, &info.code, &info.message)
+                }
                 _ => secantus_pgplan::error_position(sql, e.sqlstate(), &e.to_string()),
             };
             if let Some(pos) = pos {
@@ -26625,6 +26723,11 @@ impl PgHandler {
                 return e;
             }
             if info.position.is_none() && info.severity == "ERROR" {
+                if info.code == "42883" {
+                    if let Some(m) = secantus_pgplan::qualify_missing_function(sql, &info.message) {
+                        info.message = m;
+                    }
+                }
                 info.position = secantus_pgplan::error_position(sql, &info.code, &info.message)
                     .map(|p| p.to_string());
             }
@@ -45789,6 +45892,7 @@ impl PgHandler {
                 explain::attach_join_where(&mut tree, &options.join_where, &index_columns);
                 explain::move_param_conds(&mut tree);
                 explain::apply_implied_filters(&mut tree);
+                explain::attach_verbose(&mut tree, &options.verbose_scan);
                 // ANALYZE runs the statement, as PostgreSQL's does -- a write
                 // is written -- and reports the rows it produced.
                 let actual = if options.analyze {
@@ -47587,12 +47691,22 @@ impl PgHandler {
                     .max(secantus_pgplan::max_param_number(&query));
                 let mut declared = declared;
                 declared.resize(n, None);
+                // Analysis reads each string constant a cast or an
+                // operator types, evaluated or not (RP-511), at the
+                // constant.
+                if let Some((mut err, at)) = self.constant_input_error(&query, &declared) {
+                    if let (PgWireError::UserError(info), Some(start)) =
+                        (&mut err, text.find(query.as_str()))
+                    {
+                        info.position = Some((text[..start + at].chars().count() + 1).to_string());
+                    }
+                    return Err(err);
+                }
                 // Planned now, as PostgreSQL analyses it at PREPARE: a
                 // missing table is this statement's error, not EXECUTE's.
                 // Nothing in it runs until EXECUTE.
-                let fields = secantus_pgplan::planning_without_running(|| {
-                    self.describe_fields(&query, n, &declared)
-                })?;
+                let fields =
+                    secantus_pgplan::analysing_only(|| self.describe_fields(&query, n, &declared))?;
                 let column_type = |table: &str, column: secantus_pgplan::ColumnRef<'_>| {
                     self.lookup(table).and_then(|def| {
                         let col = match column {

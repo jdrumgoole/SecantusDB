@@ -1,6 +1,6 @@
 """Gap tests of the qualified-name divergences found while working RP-485:
-RP-879 (a missing function in a named schema loses the schema from its
-message), RP-880 (a three-part function name was looked up by its last part;
+RP-879 (a missing function in a named schema lost the schema from its
+message; fixed), RP-880 (a three-part function name was looked up by its last part;
 fixed), RP-881 (CREATE TABLE did not analyse a column's DEFAULT; fixed), RP-882
 (a missing `pg_temp` relation is named by `pg_temp_N`), RP-883 (the session's
 temp namespace does not follow its transactions) and, found while working
@@ -64,13 +64,26 @@ MISSING_FUNCTION_IN_A_SCHEMA = {
         _NO_FUNCTION_HINT,
         "8",
     ),
+    "select postgres.public.nosuch()": (
+        "42883",
+        "function postgres.public.nosuch() does not exist",
+        _NO_FUNCTION_HINT,
+        "8",
+    ),
+    "select 1 + public.nosuch(1)": (
+        "42883",
+        "function public.nosuch(integer) does not exist",
+        _NO_FUNCTION_HINT,
+        "12",
+    ),
 }
 
 
-@pytest.mark.backlog("RP-879")
+@pytest.mark.backlog_fixed("RP-879")
 @pytest.mark.parametrize("query", list(MISSING_FUNCTION_IN_A_SCHEMA))
 def test_missing_function_keeps_its_schema(query: str, dsn: str) -> None:
-    """A missing function in a named schema is named schema and all."""
+    """A missing function in a named schema was named by its bare name, at
+    the bare name; it is now named schema and all, at the schema."""
     assert answer(dsn, query) == MISSING_FUNCTION_IN_A_SCHEMA[query]
 
 

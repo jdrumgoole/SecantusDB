@@ -22,6 +22,23 @@ pub fn is_vector(ty: &str) -> bool {
     matches!(ty.trim(), "int2vector" | "oidvector")
 }
 
+/// `check_valid_int2vector` / `check_valid_oidvector`: a vector's output
+/// function refuses anything but one dimension, so `array_agg` over vectors
+/// (typed as the vector, holding two) cannot be printed (42804).
+pub fn check_valid(v: &Bson, ty: &str) -> crate::Result<()> {
+    let ty = ty.trim();
+    match v {
+        Bson::Array(items)
+            if is_vector(ty) && items.iter().any(|x| matches!(x, Bson::Array(_))) =>
+        {
+            Err(crate::Error::DatatypeMismatch(format!(
+                "array is not a valid {ty}"
+            )))
+        }
+        _ => Ok(()),
+    }
+}
+
 /// The element type of `ty` when it is an array of a vector type.
 pub fn vector_array_element(ty: &str) -> Option<&str> {
     let elem = ty.trim().strip_suffix("[]")?;
@@ -371,5 +388,16 @@ mod tests {
         assert_eq!(vector_array_element("int2vector[]"), Some("int2vector"));
         assert_eq!(vector_array_element("int2vector"), None);
         assert_eq!(vector_array_element("int4[]"), None);
+    }
+
+    #[test]
+    fn a_two_dimensional_vector_has_no_text() {
+        let two = Bson::Array(vec![ints(&[1, 2])]);
+        let err = check_valid(&two, "int2vector").unwrap_err();
+        assert!(
+            matches!(err, crate::Error::DatatypeMismatch(m) if m == "array is not a valid int2vector")
+        );
+        assert!(check_valid(&ints(&[1, 2]), "oidvector").is_ok());
+        assert!(check_valid(&two, "int2[]").is_ok());
     }
 }

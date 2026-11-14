@@ -253,11 +253,11 @@ def test_a_checks_qualified_column_is_resolved_against_its_table(
     assert _answer(dsn, query) == expected
 
 
-@pytest.mark.backlog("RP-862")
+@pytest.mark.backlog_fixed("RP-862")
 def test_a_system_column_in_a_generated_column_is_42p10(dsn: str) -> None:
     """`scanNSItemForColumn` refuses a system column other than `tableoid`
-    in a generation expression: 42P10 on PostgreSQL 15.19. Here the table
-    is created."""
+    in a generation expression: 42P10 on PostgreSQL 15.19. The table was
+    created here."""
     assert _answer(
         dsn, "create table t816 (x int, y int generated always as (xmin::text::int) stored)"
     ) == (

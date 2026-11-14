@@ -582,9 +582,9 @@ def test_routine_signature_types_are_looked_up(dsn: str) -> None:
 
 # `regprocedureout` is `format_procedure`: the name quoted as an identifier
 # needs, and each argument's `format_type_be`, which qualifies a type off
-# the search path without quoting the dot. Here the name goes unquoted and
-# a schema's type is quoted whole (`"s567.t"`).
-@pytest.mark.backlog("RP-567")
+# the search path without quoting the dot. The name went unquoted and a
+# schema's type was quoted whole (`"s567.t"`), until RP-567.
+@pytest.mark.backlog_fixed("RP-567")
 def test_regprocedure_quotes_as_format_procedure(dsn: str) -> None:
     with psycopg.connect(dsn, autocommit=True) as c:
         c.execute("drop schema if exists s567 cascade")
@@ -727,10 +727,10 @@ def test_row_type_dependants_through_nested_and_shared_views(dsn: str) -> None:
 
 # `getObjectDescription` of a cast is `cast from %s to %s` over each type's
 # `format_type_be`, so a type in a schema off the search path is `s5.t`, in
-# a DROP's DETAIL and its CASCADE notice as in `pg_describe_object`. Here
-# the DETAIL names it `"t"` and the notice `"s5.t"`. Found while working
-# RP-560.
-@pytest.mark.backlog("RP-951")
+# a DROP's DETAIL and its CASCADE notice as in `pg_describe_object`. The
+# DETAIL named it `"t"` and the notice `"s5.t"`, until RP-951 (found while
+# working RP-560).
+@pytest.mark.backlog_fixed("RP-951")
 def test_cast_over_a_schema_type_described_as_format_type(dsn: str) -> None:
     notices: list[tuple[str | None, str | None]] = []
     with psycopg.connect(dsn, autocommit=True) as c:

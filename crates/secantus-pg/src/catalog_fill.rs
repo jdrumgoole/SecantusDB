@@ -881,7 +881,11 @@ impl PgHandler {
                 let args: Vec<String> = pairs.iter().map(|(a, _)| a.clone()).collect();
                 let identity: Vec<String> = pairs.iter().map(|(_, b)| b.clone()).collect();
                 let ret = d.get_str("return_tag").unwrap_or("void");
-                let result = if d.get_bool("returns_trigger").unwrap_or(false) {
+                // A procedure has no result type: the empty text reads as
+                // `pg_get_function_result`'s NULL.
+                let result = if is_procedure {
+                    String::new()
+                } else if d.get_bool("returns_trigger").unwrap_or(false) {
                     "trigger".to_string()
                 } else if d.get_bool("is_table").unwrap_or(false) {
                     let cols: Vec<String> = d
@@ -1085,11 +1089,26 @@ impl PgHandler {
             .filter_map(|d| {
                 let oid = self.function_oid(d.get_str("_id").unwrap_or_default());
                 let (_, args, _, result) = sigs.iter().find(|(o, ..)| *o == oid)?;
+                // ruleutils' `pg_get_functiondef`: a procedure prints as
+                // PROCEDURE, with no RETURNS line, its body quoted
+                // `$procedure$`.
+                let is_procedure = d.get_bool("is_procedure").unwrap_or(false);
+                let (kind, tag) = if is_procedure {
+                    ("PROCEDURE", "$procedure$")
+                } else {
+                    ("FUNCTION", "$function$")
+                };
                 let mut text = format!(
-                    "CREATE OR REPLACE FUNCTION public.{}({args})\n RETURNS {result}\n LANGUAGE {}\n",
+                    "CREATE OR REPLACE {kind} public.{}({args})\n",
                     d.get_str("name").unwrap_or_default(),
-                    d.get_str("language").unwrap_or("sql"),
                 );
+                if !is_procedure {
+                    text.push_str(&format!(" RETURNS {result}\n"));
+                }
+                text.push_str(&format!(
+                    " LANGUAGE {}\n",
+                    d.get_str("language").unwrap_or("sql")
+                ));
                 match d.get_str("volatility").unwrap_or("volatile") {
                     "immutable" => text.push_str(" IMMUTABLE\n"),
                     "stable" => text.push_str(" STABLE\n"),
@@ -1099,7 +1118,7 @@ impl PgHandler {
                     text.push_str(" STRICT\n");
                 }
                 text.push_str(&format!(
-                    "AS $function${}$function$\n",
+                    "AS {tag}{}{tag}\n",
                     d.get_str("body").unwrap_or_default()
                 ));
                 Some((oid, text))

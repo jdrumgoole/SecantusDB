@@ -22,8 +22,8 @@ _INDETERMINATE = "42P22 could not determine which collation to use for string co
 
 # `COLLATE` is allowed over any expression of a collatable type, a domain
 # over `text` included (`transformCollateClause` asks `type_is_collatable`
-# of the expression's type).
-@pytest.mark.backlog("RP-802")
+# of the expression's type). Here it was 42804; fixed by RP-802.
+@pytest.mark.backlog_fixed("RP-802")
 def test_collate_over_a_collated_domain_expression(dsn: str) -> None:  # noqa: F811
     with _connect(dsn) as c:
         got = [
@@ -112,11 +112,12 @@ def test_a_column_of_conflicting_implicit_collations_has_none(dsn: str) -> None:
 # hashed or compared: GROUP BY hashes it (`hashtext`), DISTINCT and
 # `count(DISTINCT ...)` compare it, as does `v = v` / `v < v` in a select list
 # (`texteq`, `text_lt`); a sort fails as it starts, over no rows too. Here
-# each is answered bytewise, and the sort over no rows is empty.
+# each was answered bytewise, and the sort over no rows was empty; fixed by
+# RP-820.
 _HASHING = "42P22 could not determine which collation to use for string hashing"
 
 
-@pytest.mark.backlog("RP-820")
+@pytest.mark.backlog_fixed("RP-820")
 def test_a_column_of_no_collation_is_not_hashed_or_compared(dsn: str) -> None:  # noqa: F811
     with _connect(dsn) as c:
         got = [

@@ -1,12 +1,13 @@
 """Gap tests of the divergences found while working RP-500 (CREATE FUNCTION
 checks a SQL body's constants, CALLs and result type): RP-507 (a constant
 an operator over a column or a parameter, an INSERT or UPDATE target or a
-COALESCE gives its type is not read at CREATE), RP-508 (DROP FUNCTION /
+COALESCE gives its type was not read at CREATE, fixed), RP-508 (DROP FUNCTION /
 PROCEDURE without arguments over the other kind, and DROP ROUTINE's
 notice), RP-509 (a CALL that leaves a defaulted parameter out, names its
 arguments, or passes a column), RP-510 (a malformed range literal had no DETAIL, fixed)
-and RP-511 (PREPARE evaluates a constant expression and does not read a
-cast constant it does not evaluate).
+RP-511 (PREPARE evaluated a constant expression and did not read a cast
+constant it does not evaluate, fixed) and RP-968 (CREATE VIEW evaluates a
+constant expression).
 
 An answer is `("ok", rows, notices)`, or `(sqlstate, message, detail, hint,
 position, notices)` for an error. The expected answers were measured on a
@@ -97,9 +98,10 @@ def _input(value: str, position: str) -> tuple[Any, ...]:
 
 _GX = "create function gx(p int) returns {} language sql as $$ {} $$"
 
-# RP-507: `transformExpr` coerces each of these constants to the type the
-# operator, the target column or COALESCE's other argument gives it, and
-# its input function refuses the text, at CREATE.
+# RP-507 (fixed): `transformExpr` coerces each of these constants to the
+# type the operator, the target column or COALESCE's other argument gives
+# it, and its input function refused the text, at CREATE, where this server
+# read only a cast's constant.
 OPERAND_CONSTANT_READ_AT_CREATE = {
     _GX.format("int", "select p + 'a'"): _input("a", "69"),
     _GX.format("int", "select a + 'q' from fe"): _input("q", "69"),
@@ -109,7 +111,7 @@ OPERAND_CONSTANT_READ_AT_CREATE = {
 }
 
 
-@pytest.mark.backlog("RP-507")
+@pytest.mark.backlog_fixed("RP-507")
 @pytest.mark.parametrize("query", list(OPERAND_CONSTANT_READ_AT_CREATE))
 def test_operand_constant_read_at_create(query: str, dsn: str) -> None:
     assert answer(dsn, query) == OPERAND_CONSTANT_READ_AT_CREATE[query]
@@ -238,18 +240,80 @@ def test_range_literal_detail(query: str, dsn: str) -> None:
     )
 
 
-# RP-511: PREPARE parse-analyses its statement and plans nothing, so it
-# evaluates no expression (`1/0` is prepared) but reads every constant a
+# RP-511 (fixed): PREPARE parse-analyses its statement and plans nothing,
+# so it evaluates no expression (`1/0` is prepared) but reads every constant a
 # cast or an operator coerces, evaluated or not.
 PREPARE_ANALYSES = {
     "prepare s1 as select 1/0": ("ok", None, []),
+    "prepare s5 as select sqrt(-1)": ("ok", None, []),
+    "prepare s6 as select 1 where 1/0 = 1": ("ok", None, []),
+    "prepare s7 as select (1/0)::text": ("ok", None, []),
+}
+
+
+@pytest.mark.backlog_fixed("RP-511")
+@pytest.mark.parametrize("query", list(PREPARE_ANALYSES))
+def test_prepare_analyses_without_evaluating(query: str, dsn: str) -> None:
+    assert answer(dsn, query) == PREPARE_ANALYSES[query]
+
+
+@pytest.mark.backlog_fixed("RP-511")
+def test_prepared_constant_error_is_execute_s(dsn: str) -> None:
+    # The error PREPARE leaves is EXECUTE's; EXPLAIN plans, and
+    # `eval_const_expressions` raises it there (PostgreSQL 15.19).
+    with psycopg.connect(dsn, autocommit=True, prepare_threshold=None) as c:
+        c.execute("prepare z as select 1/0")
+        for q in ("execute z", "explain select 1/0"):
+            with pytest.raises(psycopg.errors.DivisionByZero):
+                c.execute(q)
+
+
+@pytest.mark.backlog_fixed("RP-511")
+def test_statement_describe_and_no_data_analyse_without_evaluating(dsn: str) -> None:
+    # A Parse + Describe describes the analysed query (int4), and
+    # `CREATE TABLE AS ... WITH NO DATA` reads its columns from it
+    # (`create_ctas_nodata`); a populating one plans and raises. Measured
+    # on PostgreSQL 15.19.
+    with psycopg.connect(dsn, autocommit=True) as c:
+        pg = c.pgconn
+        assert pg.prepare(b"rp511d", b"select 1/0").status == 1
+        described = pg.describe_prepared(b"rp511d")
+        assert (described.status, described.ftype(0)) == (1, 23)
+        c.execute("drop table if exists rp511n, rp511p")
+        c.execute("create table rp511n as select 1/0 as x with no data")
+        assert c.execute(
+            "select atttypid::regtype::text from pg_attribute"
+            " where attrelid = 'rp511n'::regclass and attname = 'x'"
+        ).fetchall() == [("integer",)]
+        with pytest.raises(psycopg.errors.DivisionByZero):
+            c.execute("create table rp511p as select 1/0 as x")
+        c.execute("drop table if exists rp511n, rp511p")
+
+
+@pytest.mark.backlog("RP-968")
+def test_create_view_analyses_without_evaluating(dsn: str) -> None:
+    # `DefineView` parse-analyses the query and plans nothing, so a view
+    # over `1/0` is created; reading it raises (PostgreSQL 15.19).
+    with psycopg.connect(dsn, autocommit=True) as c:
+        c.execute("drop view if exists rp511v")
+    try:
+        assert answer(dsn, "create view rp511v as select 1/0 as x") == ("ok", None, [])
+        assert answer(dsn, "select * from rp511v")[:2] == ("22012", "division by zero")
+    finally:
+        with psycopg.connect(dsn, autocommit=True) as c:
+            c.execute("drop view if exists rp511v")
+
+
+# RP-511 (fixed in part): PREPARE read no constant it did not evaluate;
+# now each one a cast or an operator types is read at the constant.
+PREPARE_READS_CONSTANTS = {
     "prepare s2 as select 'x'::int from fe": _input("x", "22"),
     "prepare s3 as select case when false then 'x'::int end": _input("x", "43"),
     "prepare s4(int) as select $1 + 'a'": _input("a", "32"),
 }
 
 
-@pytest.mark.backlog("RP-511")
-@pytest.mark.parametrize("query", list(PREPARE_ANALYSES))
-def test_prepare_analyses_without_evaluating(query: str, dsn: str) -> None:
-    assert answer(dsn, query) == PREPARE_ANALYSES[query]
+@pytest.mark.backlog_fixed("RP-511")
+@pytest.mark.parametrize("query", list(PREPARE_READS_CONSTANTS))
+def test_prepare_reads_constants(query: str, dsn: str) -> None:
+    assert answer(dsn, query) == PREPARE_READS_CONSTANTS[query]
