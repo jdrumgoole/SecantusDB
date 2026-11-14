@@ -28,7 +28,8 @@ def _error(dsn: str, sql: str) -> tuple[str | None, str, str | None]:
     return (e.sqlstate, str(e).splitlines()[0], e.diag.statement_position)
 
 
-# Each literal's out-of-range error, at the literal (position 8).
+# Each literal's out-of-range error was unplaced; it is at the literal
+# (position 8).
 OUT_OF_RANGE = {
     "select '70000'::int2": 'value "70000" is out of range for type smallint',
     "select '99999999999'::int4": 'value "99999999999" is out of range for type integer',
@@ -38,7 +39,7 @@ OUT_OF_RANGE = {
 }
 
 
-@pytest.mark.backlog("RP-866")
+@pytest.mark.backlog_fixed("RP-866")
 @pytest.mark.parametrize("sql", list(OUT_OF_RANGE))
 def test_out_of_range_literal_has_a_position(sql: str, dsn: str) -> None:
     assert _error(dsn, sql) == ("22003", OUT_OF_RANGE[sql], "8")

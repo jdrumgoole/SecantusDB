@@ -4272,15 +4272,6 @@ statement is VALUES-only and runs there as written. The gap tests are in
 Measured on PostgreSQL 15.19; none of it needs DDL. The gap tests are in
 `tests/backlog/test_rp_found_rp605.py`.
 
-- [ ] **A literal's out-of-range input error has no position.**
-      `select '70000'::int2` is 22003 `value "70000" is out of range for
-      type smallint` at 8 on PostgreSQL 15.19, and so is every 22003 an
-      input function raises for a constant (`'99999999999'::int4`,
-      `'70000 1'::int2vector`, an array element); here the 22003 has no
-      position. `errpos.rs` places a 22P02 at the literal it quotes but has
-      no 22003 arm.
-      Verify: tests/backlog/test_rp_found_rp605.py::test_out_of_range_literal_has_a_position
-      Backlog-ID: RP-866
 - [ ] **An escape-string literal's input error has no position when an
       escape is in its value.** `select E'a\tb'::int4` is 22P02 at 8 on
       PostgreSQL 15.19; here it has none, `errpos.rs` matching the quoted
