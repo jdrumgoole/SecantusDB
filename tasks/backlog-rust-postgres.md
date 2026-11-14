@@ -2916,13 +2916,6 @@ char(3)` and `t570(k int, t text, ta text[])` holding `(1, 'ab', '{ab}')`
 and `(2, 'abcd', '{abcd}')`. The gap tests are in
 `tests/backlog/test_rp_found_rp570.py`.
 
-- [ ] **A domain array literal's input error has no position.** `select
-      '{abcd}'::d570c[]` is 22001 at 8 on PostgreSQL 15.19 (`array_in` runs
-      `domain_in` while it reads the literal, as `'x'::int` is positioned
-      there); here the 22001 has no position. `positioned` places an error
-      by its SQLSTATE and message, and an assignment's 22001 has none.
-      Verify: tests/backlog/test_rp_found_rp570.py::test_domain_array_literal_error_position
-      Backlog-ID: RP-581
 
 ## Found while working RP-607 (2026-11-08)
 

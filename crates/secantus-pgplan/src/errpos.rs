@@ -787,11 +787,14 @@ pub fn error_position(sql: &str, sqlstate: &str, message: &str) -> Option<usize>
         // A `char(n)` field too long for a composite, read from a text
         // literal cast to the type (`'(abcd,x)'::t`): at the literal. An
         // assignment's 22001 (`insert ... values ('abcd')`) has no position.
+        // A literal cast to an array of a domain over `char(n)` is read by
+        // `array_in` through `domain_in`, and is placed the same way (RP-581).
         "22001" if m.starts_with("value too long for type character") => {
             let i = toks.windows(3).position(|w| {
                 w[0].text.starts_with('\'')
                     && w[1].text == "::"
-                    && crate::user_composite_oid(w[2].text).is_some()
+                    && (crate::user_composite_oid(w[2].text).is_some()
+                        || crate::domains::user_domain(w[2].text).is_some())
             })?;
             pos(toks[i].start)
         }

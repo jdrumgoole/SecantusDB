@@ -153,7 +153,7 @@ def test_column_cast_to_domain_applies_typmod(query: str, dsn: str) -> None:
 
 # `array_in` reads a domain's element with `domain_in` while it parses the
 # literal, so its input error is positioned at the literal, as `'x'::int`
-# is; an assignment's 22001 is not.
+# is; an assignment's 22001 is not. Unpositioned here until RP-581.
 LITERAL_ERRORS = {
     "select '{abcd}'::d570c[] is null": (
         "22001",
@@ -164,7 +164,7 @@ LITERAL_ERRORS = {
 }
 
 
-@pytest.mark.backlog("RP-581")
+@pytest.mark.backlog_fixed("RP-581")
 @pytest.mark.parametrize("query", list(LITERAL_ERRORS))
 def test_domain_array_literal_error_position(query: str, dsn: str) -> None:
     assert answer(dsn, query) == LITERAL_ERRORS[query]
