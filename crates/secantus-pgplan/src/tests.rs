@@ -308,6 +308,35 @@ fn update_and_delete_are_planned() {
     }
 }
 
+/// RETURNING over an UPDATE's FROM item reads the joined row, evaluated
+/// before the write (RP-686): the FROM item's references become hidden
+/// `joined` values, and the visible output keeps PostgreSQL's names.
+#[test]
+fn update_from_returning_reads_the_joined_row() {
+    let sql = "UPDATE t SET n = s.n FROM t s WHERE s.id = t.n \
+               RETURNING t.id, s.name, s.n + t.n, upper(s.name)";
+    match plan_with_subqueries(sql, &lookup, &[], &|_| Ok(Vec::new())).expect("should plan") {
+        Statement::Update(u) => {
+            // `t.id` and `t.n` are the target's (only `s` names the FROM
+            // item), read from the NEW row; `s.name` twice, and `s.n`.
+            assert_eq!(u.joined.len(), 3, "{:?}", u.joined);
+            assert!(u
+                .joined
+                .iter()
+                .all(|(f, _)| f.starts_with(JOINED_RETURNING)));
+            let returning = u.returning.expect("RETURNING");
+            let names: Vec<&str> = returning.columns.iter().map(|(n, _)| n.as_str()).collect();
+            assert_eq!(names, ["id", "name", "?column?", "upper"]);
+            // A bare joined read is typed by its own expression.
+            assert_eq!(
+                returning.casts[1].as_ref().map(column_expr_type),
+                Some("text")
+            );
+        }
+        other => panic!("wrong statement: {other:?}"),
+    }
+}
+
 #[test]
 fn shapes_sqlglot_mis_parses_reach_us_as_real_statements() {
     // `DROP TABLE a, b, c`, `BEGIN ...`, `MOVE FORWARD 2 IN c`,

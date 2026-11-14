@@ -3012,19 +3012,39 @@ nothing. The gap tests are in `tests/backlog/test_rp_found_rp712.py`.
 Measured on a private PostgreSQL 15.19 cluster with the `_SCOPE_SETUP` in
 `tests/backlog/test_rp_found_rp664.py`.
 
-- [ ] **RETURNING a FROM item's column is refused when the join condition
-      reads a column the UPDATE assigns.** `update t668 set b = u668.v
-      from u668 where t668.b < 0 and u668.k = 5 returning t668.a, u668.v`
-      returns the joined row's `v` for each updated row on PostgreSQL
-      15.19 (the join is done once, before the rows are written); here it
-      is 0A000 `RETURNING a FROM item's column when the join condition
-      reads an updated column is not supported yet`, whether the FROM item
-      is a table or a subquery over the target. `rewrite_dml_from` finds
-      the joining row again for RETURNING with a correlated subquery over
-      the NEW row, so it refuses the case where the new row no longer
-      joins.
-      Verify: tests/backlog/test_rp_found_rp664.py::test_returning_a_from_item_when_the_join_reads_an_assigned_column
+- [ ] **A subquery in RETURNING that reads a FROM item is refused when the
+      join condition reads a column the UPDATE assigns.** `update t668 set
+      b = u668.v from u668 where t668.b < 0 and u668.k = 5 returning
+      t668.a, (select u668.v)` returns the joined row's `v` on PostgreSQL
+      15.19; here it is 0A000 `RETURNING a FROM item's column when the join
+      condition reads an updated column is not supported yet`. A FROM-item
+      reference outside a subquery is read from the joined row before the
+      write (`split_joined_returning`, `Update::joined`); one inside a
+      subquery still takes the old path, a correlated subquery that finds
+      the joining row again over the NEW row, refused when the new row may
+      no longer join. Reaching it means letting the subquery's outer
+      reference read a hidden `Update::joined` value, which the RETURNING
+      subquery resolver (`resolve_sublinks_in_target`, run before
+      `plan_update`) does not know.
+      Verify: tests/backlog/test_rp_found_rp664.py::test_a_returning_subquery_over_a_from_item_when_the_join_reads_an_assigned_column
       Backlog-ID: RP-686
+
+## Found while working RP-686 (2026-11-14)
+
+Measured on a private PostgreSQL 15.19 cluster with the `_SCOPE_SETUP` in
+`tests/backlog/test_rp_found_rp664.py`.
+
+- [ ] **DELETE RETURNING reads a USING item after the delete.** `delete
+      from t668 using (select a, b from t668) x where x.a = t668.a and
+      t668.b < 0 returning t668.a, x.b` returns each deleted row's `b` on
+      PostgreSQL 15.19; here `x.b` is NULL: `rewrite_dml_from` reads a
+      USING item in RETURNING through a correlated subquery that finds the
+      joining row again after the rows are deleted, when the derived table
+      over the target no longer holds them. UPDATE reads its FROM items
+      from the joined row before the write (`Update::joined`); DELETE needs
+      the same.
+      Verify: tests/backlog/test_rp_found_rp664.py::test_delete_returning_reads_a_using_item_as_it_was_before_the_delete
+      Backlog-ID: RP-938
 
 ## Found while working RP-570 (2026-11-08)
 

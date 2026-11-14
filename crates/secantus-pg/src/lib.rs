@@ -47900,6 +47900,9 @@ impl PgHandler {
                     let raw = self.in_scan_order(&upd.table, &upd.filter, raw)?;
                     let mut writes = Vec::with_capacity(raw.len());
                     let mut new_rows = Vec::with_capacity(raw.len());
+                    // Each returned row's joined values (`Update::joined`),
+                    // read from the OLD row, parallel to `new_rows`.
+                    let mut joined_rows: Vec<Document> = Vec::new();
                     // Rows whose PRIMARY KEY changes: (old row, new row).
                     let mut rekeys: Vec<(Document, Document)> = Vec::new();
                     for bytes in &raw {
@@ -48016,6 +48019,15 @@ impl PgHandler {
                             if row_id(&after) != row_id(&row) {
                                 rekeyed = Some(after.clone());
                             }
+                            if !upd.joined.is_empty() {
+                                let mut values = Document::new();
+                                for (field, expr) in &upd.joined {
+                                    let v = secantus_pgplan::apply_row_expr(expr, &row)
+                                        .map_err(|e| Self::err(&e))?;
+                                    values.insert(field.clone(), v);
+                                }
+                                joined_rows.push(values);
+                            }
                             new_rows.push(after);
                         }
                         if let Some(after) = rekeyed {
@@ -48104,6 +48116,9 @@ impl PgHandler {
                                 }
                             }
                         }
+                    }
+                    for (row, values) in new_rows.iter_mut().zip(joined_rows) {
+                        row.extend(values);
                     }
                     returned = new_rows;
                     matched
