@@ -3366,16 +3366,6 @@ Measured on PostgreSQL 15.19; none needs an object.
       quoted or dollar-quoted name does not match.
       Verify: tests/backlog/test_rp_found_rp458.py::test_regclassin_errors
       Backlog-ID: RP-675
-- [ ] **The sequence functions over a relation that is not a sequence
-      answer 42P01.** `nextval('pg_class')`, `currval('pg_class')`,
-      `setval('pg_class', 1)` and `nextval('pg_class'::regclass)` are 42809
-      `"pg_class" is not a sequence` with no position on PostgreSQL 15.19
-      (`init_sequence` opens the relation, then checks its relkind), and
-      `nextval(1234)` is XX000 `could not open relation with OID 1234`.
-      Here each is 42P01 `relation "pg_class"` / `"1234" does not exist`,
-      at the argument.
-      Verify: tests/backlog/test_rp_found_rp458.py::test_sequence_function_over_a_relation_not_a_sequence
-      Backlog-ID: RP-676
 - [ ] **A named argument to a built-in whose parameters have no names is
       refused as a gap.** `select nextval(regclass := 'nosuchseq')` and
       `nextval(x => 'nosuchseq')` are 42883 `function nextval(regclass =>

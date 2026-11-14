@@ -70,11 +70,20 @@ NOT_A_SEQUENCE = {
 }
 
 
-@pytest.mark.backlog("RP-676")
+@pytest.mark.backlog_fixed("RP-676")
 @pytest.mark.parametrize("query", list(NOT_A_SEQUENCE))
 def test_sequence_function_over_a_relation_not_a_sequence(query: str, rust_pg: Any) -> None:
-    """A relation that is not a sequence, or a bare oid, is 42P01 here."""
+    """A relation that was not a sequence, or a bare oid, was 42P01 here."""
     assert answer(rust_pg, query) == NOT_A_SEQUENCE[query]
+
+
+@pytest.mark.backlog_fixed("RP-676")
+def test_sequence_named_by_its_oid_advances(rust_pg: Any) -> None:
+    """`nextval(oid)` opened the sequence by oid: it was 42P01 naming the
+    number (PostgreSQL 15.19 answers 1, then 2)."""
+    answer(rust_pg, "create sequence rp676_s")
+    assert answer(rust_pg, "select nextval('rp676_s'::regclass::oid)") == [(1,)]
+    assert answer(rust_pg, "select nextval(('rp676_s'::regclass)::oid::int8)") == [(2,)]
 
 
 NO_MATCH = (

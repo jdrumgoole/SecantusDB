@@ -32770,10 +32770,27 @@ impl PgHandler {
     /// PostgreSQL's `nextval` takes `regclass`, so the name arrives as a
     /// string literal (`nextval('s')`) and a schema qualifier is dropped --
     /// this server has one schema, so `public.s` and `s` name the same thing.
+    /// The sequence a sequence function's argument names, opened as
+    /// `init_sequence` opens it ([`Self::open_sequence`]).
+    fn sequence_relation_arg(&self, arg: &ConstCol) -> PgWireResult<Option<String>> {
+        let value = self.resolve_const_col(arg)?;
+        let name = self.sequence_name_arg(&ConstCol::Value(value.clone()))?;
+        if let Some(name) = &name {
+            self.open_sequence(&value, name)?;
+        }
+        Ok(name)
+    }
+
     fn sequence_name_arg(&self, arg: &ConstCol) -> PgWireResult<Option<String>> {
         let value = self.resolve_const_col(arg)?;
         // `nextval('s'::regclass)`: the regclass names the sequence by oid.
         if let Some(oid) = secantus_pgplan::regclass_oid(&value) {
+            return Ok(Some(secantus_pgplan::regclass_text(oid)));
+        }
+        // An oid (`nextval(oid)`, an implicit cast to regclass) names the
+        // relation by its oid too.
+        if let Bson::Int32(_) | Bson::Int64(_) = value {
+            let oid = bson_i64(&value).unwrap_or_default();
             return Ok(Some(secantus_pgplan::regclass_text(oid)));
         }
         Ok(match value {
@@ -33587,7 +33604,7 @@ impl PgHandler {
             return Ok(Bson::Double(f64::from(v as f32)));
         }
         let seq = |i: usize| -> PgWireResult<Option<String>> {
-            self.sequence_name_arg(&ConstCol::Value(args.get(i).cloned().unwrap_or(Bson::Null)))
+            self.sequence_relation_arg(&ConstCol::Value(args.get(i).cloned().unwrap_or(Bson::Null)))
         };
         match name {
             "nextval" => {
@@ -33639,6 +33656,48 @@ impl PgHandler {
                 "function {other}()"
             )))),
         }
+    }
+
+    /// `init_sequence`'s checks before a sequence function reads its
+    /// sequence: the relation is opened (an oid no relation has is XX000
+    /// `could not open relation with OID n`), then one that is not a
+    /// sequence is 42809, with no position (RP-676). A name no relation
+    /// has stays the 42P01 the read reports.
+    fn open_sequence(&self, arg: &Bson, key: &str) -> PgWireResult<()> {
+        if self.sequence_doc(key)?.is_some() {
+            return Ok(());
+        }
+        let oid = match arg {
+            Bson::Int32(i) => Some(i64::from(*i)),
+            Bson::Int64(i) => Some(*i),
+            Bson::String(s) => secantus_pgplan::cast_value_with_tz(
+                Bson::String(s.clone()),
+                "regclass",
+                &self.session_timezone(),
+            )
+            .ok()
+            .and_then(|v| secantus_pgplan::regclass_oid(&v)),
+            other => secantus_pgplan::regclass_oid(other),
+        };
+        let Some(oid) = oid else {
+            return Ok(());
+        };
+        let shown = secantus_pgplan::regclass_text(oid);
+        if shown == oid.to_string() {
+            return Err(Self::user_error(
+                "XX000",
+                format!("could not open relation with OID {oid}"),
+            ));
+        }
+        let relname = Self::relation_text_shown(&shown)
+            .rsplit('.')
+            .next()
+            .unwrap_or_default()
+            .to_string();
+        Err(Self::user_error(
+            "42809",
+            format!("\"{relname}\" is not a sequence"),
+        ))
     }
 
     fn lastval_value(&self) -> PgWireResult<Bson> {
@@ -36496,7 +36555,7 @@ impl PgHandler {
                 self.backend_pid.load(std::sync::atomic::Ordering::Relaxed),
             )),
             ConstCol::NextVal(seq) => {
-                let name = self.sequence_name_arg(seq)?;
+                let name = self.sequence_relation_arg(seq)?;
                 // A NULL sequence name is a NULL result rather than an error,
                 // which is what a strict function does with a NULL argument.
                 let Some(name) = name else {
@@ -36510,7 +36569,7 @@ impl PgHandler {
                 self.note_currval(&name, value);
                 Ok(Bson::Int64(value))
             }
-            ConstCol::CurrVal(seq) => match self.sequence_name_arg(seq)? {
+            ConstCol::CurrVal(seq) => match self.sequence_relation_arg(seq)? {
                 None => Ok(Bson::Null),
                 Some(name) => {
                     self.check_sequence_privilege(&name, &["USAGE", "SELECT"])?;
@@ -36541,7 +36600,7 @@ impl PgHandler {
                 value,
                 is_called,
             } => {
-                let Some(name) = self.sequence_name_arg(sequence)? else {
+                let Some(name) = self.sequence_relation_arg(sequence)? else {
                     return Ok(Bson::Null);
                 };
                 self.check_sequence_privilege(&name, &["UPDATE"])?;
