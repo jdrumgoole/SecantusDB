@@ -89,9 +89,11 @@ USING = {
 }
 
 
-@pytest.mark.backlog("RP-906")
+@pytest.mark.backlog_fixed("RP-906")
 @pytest.mark.parametrize("statement", list(USING))
 def test_a_dynamic_portal_binds_its_using_values(statement: str, dsn: str) -> None:
+    """A FOR loop or an OPEN over `EXECUTE ... USING` ran its query with no
+    parameters, so `$1` was 42P02."""
     assert _answer(dsn, statement) == USING[statement]
 
 

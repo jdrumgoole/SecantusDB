@@ -70,6 +70,16 @@ impl Interp<'_> {
         bound
     }
 
+    /// A dynamic statement's `USING` values (`exec_eval_using_params`),
+    /// each evaluated once, in order, when the statement runs: `$1` is the
+    /// first. Their types are the values' own.
+    pub(super) fn using_values(&self, body: &Value) -> Result<Vec<Bson>, PlError> {
+        body.get("params")
+            .and_then(Value::as_array)
+            .map(|ps| ps.iter().map(|p| self.eval(p)).collect())
+            .unwrap_or_else(|| Ok(Vec::new()))
+    }
+
     pub(super) fn open_cursor(&mut self, body: &Value) -> Result<Flow, PlError> {
         let var = cursor_var(body);
         // A bound cursor declares its options (`c NO SCROLL CURSOR FOR ...`).
@@ -84,7 +94,8 @@ impl Interp<'_> {
                 (q.0.to_string(), self.bind(q.0)?)
             } else if let Some(d) = body.get("dynquery") {
                 let text = self.dynamic_sql(d)?;
-                (text.clone(), (text, Vec::new(), Vec::new()))
+                let using = self.using_values(body)?;
+                (text.clone(), (text, using, Vec::new()))
             } else if let Some(q) = self.cursor_exprs.get(&var).cloned() {
                 let bound = self.bind_bound_cursor(var, body, &q)?;
                 (q, bound)
@@ -181,7 +192,8 @@ impl Interp<'_> {
         let query = body.get("query").unwrap_or(&Value::Null);
         let (statement, sql, params, types) = if dynamic {
             let sql = self.dynamic_sql(query)?;
-            (sql.clone(), sql, Vec::new(), Vec::new())
+            let using = self.using_values(body)?;
+            (sql.clone(), sql, using, Vec::new())
         } else {
             let (text, _) =
                 expr_query(query).ok_or_else(|| PlError::new("XX000", "a FOR without a query"))?;

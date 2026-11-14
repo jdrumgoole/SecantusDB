@@ -3814,14 +3814,6 @@ Measured on a private, freshly initdb'd PostgreSQL 15.19 cluster.
       Verify: tests/backlog/test_rp_found_rp828.py::test_a_dml_statement_opens_as_a_portal
       Backlog-ID: RP-905
 
-- [ ] **A FOR loop or an OPEN over `EXECUTE ... USING` ignores USING.**
-      `for x in execute 'select $1 as v, $2 as w' using 5, 'q'::text loop`
-      reads `5 q` on PostgreSQL 15.19 (`exec_dynquery_with_params`), and
-      `open c for execute 'select $1 as v' using 7` fetches 7. Here both
-      are 42P02 `there is no parameter $1`: the dynamic query is run with
-      no parameters (`for_query`, `open_cursor`'s dynamic arm).
-      Verify: tests/backlog/test_rp_found_rp828.py::test_a_dynamic_portal_binds_its_using_values
-      Backlog-ID: RP-906
 
 - [ ] **A portal whose query fails as it runs takes no number.**
       `SPI_cursor_open_internal` names an unnamed portal

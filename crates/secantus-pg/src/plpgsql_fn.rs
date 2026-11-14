@@ -3380,14 +3380,7 @@ impl Interp<'_> {
             "PLpgSQL_stmt_dynexecute" => {
                 let sql = self.dynamic_sql(body.get("query").unwrap_or(&Value::Null))?;
                 self.dyn_text = Some(sql.clone());
-                let using: Vec<Bson> = body
-                    .get("params")
-                    .and_then(Value::as_array)
-                    .cloned()
-                    .unwrap_or_default()
-                    .iter()
-                    .map(|p| self.eval(p))
-                    .collect::<Result<_, _>>()?;
+                let using = self.using_values(body)?;
                 let types: Vec<String> = Vec::new();
                 if body.get("into").and_then(Value::as_bool).unwrap_or(false) {
                     let out = self.host.query(&sql, &using, &types)?;
