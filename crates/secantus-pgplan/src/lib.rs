@@ -48377,12 +48377,14 @@ fn const_value_node(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result<
                         None => Ok(Bson::Null),
                     };
                 }
-                let pick = |a: &str, i: &str, r: &str| {
-                    Bson::String(match which {
-                        1 => a.to_string(),
-                        2 => i.to_string(),
-                        _ => r.to_string(),
-                    })
+                // `pg_get_function_result` of a procedure (an empty result
+                // text, user or built-in) is NULL: it has no `prorettype`
+                // to print.
+                let pick = |a: &str, i: &str, r: &str| match which {
+                    1 => Bson::String(a.to_string()),
+                    2 => Bson::String(i.to_string()),
+                    _ if r.is_empty() => Bson::Null,
+                    _ => Bson::String(r.to_string()),
                 };
                 let user = FUNCTION_SIGS.with(|d| {
                     d.borrow()
@@ -48392,14 +48394,7 @@ fn const_value_node(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result<
                 });
                 // A built-in's, as PostgreSQL 15.19 prints it (RP-228).
                 return Ok(user.unwrap_or_else(|| {
-                    builtin_function_sig(oid).map_or(Bson::Null, |(a, i, r)| {
-                        // `pg_get_function_result` of a procedure is NULL.
-                        if which == 3 && r.is_empty() {
-                            Bson::Null
-                        } else {
-                            pick(a, i, r)
-                        }
-                    })
+                    builtin_function_sig(oid).map_or(Bson::Null, |(a, i, r)| pick(a, i, r))
                 }));
             }
         }

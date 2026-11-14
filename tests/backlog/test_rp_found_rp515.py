@@ -63,9 +63,10 @@ def test_argument_and_column_names_are_quoted(dsn: str) -> None:
     ]
 
 
-# RP-877: a procedure has no result type (`pg_get_function_result` is
-# NULL), and `pg_get_functiondef` prints it as a PROCEDURE.
-@pytest.mark.backlog("RP-877")
+# RP-877 (fixed): a procedure had a result type (`record`) and
+# `pg_get_functiondef` printed it as a FUNCTION; PostgreSQL's
+# `pg_get_function_result` is NULL and its definition a PROCEDURE's.
+@pytest.mark.backlog_fixed("RP-877")
 def test_procedure_result_and_definition(dsn: str) -> None:
     assert rows(
         dsn,

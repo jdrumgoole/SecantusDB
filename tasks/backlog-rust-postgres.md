@@ -2627,16 +2627,6 @@ Measured on a private PostgreSQL 15.19 cluster. The gap tests are in
       Verify: tests/backlog/test_rp_found_rp515.py::test_argument_and_column_names_are_quoted
       Backlog-ID: RP-876
 
-- [ ] **A procedure's `pg_get_function_result` and `pg_get_functiondef`
-      read as a function's.** PostgreSQL 15.19's `pg_get_function_result`
-      is NULL for a procedure, and `pg_get_functiondef` prints `CREATE OR
-      REPLACE PROCEDURE public.gk(IN a integer, INOUT b text)`, no RETURNS
-      line, the body quoted `$procedure$`. Here the result is `record` and
-      the definition `CREATE OR REPLACE FUNCTION ... RETURNS record ...
-      $function$`.
-      Verify: tests/backlog/test_rp_found_rp515.py::test_procedure_result_and_definition
-      Backlog-ID: RP-877
-
 ## Found while working RP-467 (2026-11-08)
 
 - [ ] **Two schemas' tables of one name are not `checkNameSpaceConflicts`'
