@@ -62,14 +62,14 @@ def _remainder(client: Any) -> Any:
     return size, sorted(str(x) for x in explained), transformed
 
 
-@pytest.mark.backlog("RM-532")
+@pytest.mark.backlog_fixed("RM-532")
 def test_query_stats_remainder(own_servers: Any) -> None:
     """mongod 8.2.11 reports `internalQueryStatsCacheSize` ("1%"), records an
     `aggregate` that explains (its key says `explain:
     "queryPlanner"`), and lists its entries with every identifier as its
-    HMAC under `transformIdentifiers`. This server reports no cache size,
-    records no explain, and refuses `transformIdentifiers` (238) once its
-    store has entries."""
+    HMAC under `transformIdentifiers`. This server reported no cache size,
+    recorded no explain, and refused `transformIdentifiers` (238) once its
+    store had entries, until 2026-11-14."""
     ours, theirs = own_servers
     assert _remainder(ours) == _remainder(theirs)
 

@@ -115,6 +115,13 @@ pub enum ParamKind {
     /// One of execution admission control's parameters, coerced and
     /// validated as mongod does each (`admission::execution`, RM-355).
     Execution,
+    /// A memory size as a string (`internalQueryStatsCacheSize`): `"1%"`,
+    /// `"64MB"`, ... A value of any other type is refused as one that does
+    /// not coerce; a string that does not parse is 6007012.
+    MemorySize,
+    /// A number from 0 to 1, stored as a double
+    /// (`internalQueryStatsSampleRate`).
+    UnitInterval,
 }
 
 /// `(name, kind)` for every runtime-settable parameter.
@@ -135,6 +142,11 @@ const SETTABLE: &[(&str, ParamKind)] = &[
     // How many queries a second the query stats store records (RM-215):
     // 0 none, -1 every one. Applied to the store as it changes.
     ("internalQueryStatsRateLimit", ParamKind::Int32AtLeast(-1)),
+    // The query stats store's budget, whose change evicts down to it, and
+    // the fraction of queries it samples, which takes over from the rate
+    // limit while above 0 (RM-532).
+    ("internalQueryStatsCacheSize", ParamKind::MemorySize),
+    ("internalQueryStatsSampleRate", ParamKind::UnitInterval),
     // The TTL monitor, which these reach in the storage layer as well as
     // being stored here: a test sets the sleep to 1 to see a document expire
     // without waiting a minute.
@@ -705,6 +717,14 @@ fn coerce(kind: ParamKind, value: &Bson) -> Option<Bson> {
         },
         // Coerced by name (`coerce_named`).
         ParamKind::Execution => None,
+        ParamKind::MemorySize => match value {
+            Bson::String(s) => Some(Bson::String(s.clone())),
+            _ => None,
+        },
+        ParamKind::UnitInterval => match double(value) {
+            Some(d) if (0.0..=1.0).contains(&d) => Some(Bson::Double(d)),
+            _ => None,
+        },
         // Accepts every BSON type; only these four are falsey.
         ParamKind::Bool => Some(Bson::Boolean(
             !matches!(
@@ -802,6 +822,23 @@ fn refusal(kind: ParamKind, name: &str, value: &Bson) -> String {
             Some(_) => "Must be above minimum of 50 MB".to_string(),
             None => format!("Failed validating {name}: Unable to coerce value to correct type"),
         };
+    }
+    if kind == ParamKind::UnitInterval {
+        let g = |d: f64| crate::explain::debug_string::g(d, 6);
+        return match double(value) {
+            Some(d) if d < 0.0 => format!(
+                "Invalid value for parameter {name}: {} is not greater than or equal to 0",
+                g(d)
+            ),
+            Some(d) => format!(
+                "Invalid value for parameter {name}: {} is not less than or equal to 1",
+                g(d)
+            ),
+            None => format!("Failed validating {name}: Unable to coerce value to correct type"),
+        };
+    }
+    if kind == ParamKind::MemorySize {
+        return format!("Failed validating {name}: Unable to coerce value to correct type");
     }
     if kind == ParamKind::DoubleAboveZero {
         return match double(value) {
@@ -934,6 +971,16 @@ pub fn set_parameter(doc: &Document, ctx: &mut CommandContext) -> HandlerResult 
         if let Err(why) = coerce_named(name, kind, value, ctx) {
             return Err(CommandError::new(2, "BadValue", why));
         }
+        // `validateQueryStatsStoreSize`: the size must parse.
+        if let (ParamKind::MemorySize, Bson::String(text)) = (kind, value) {
+            if crate::query_stats::parse_size(text).is_none() {
+                return Err(CommandError::new(
+                    6007012,
+                    "Location6007012",
+                    "Unable to parse memory size string",
+                ));
+            }
+        }
     }
 
     let store = ctx.server_params.clone();
@@ -983,6 +1030,16 @@ pub fn set_parameter(doc: &Document, ctx: &mut CommandContext) -> HandlerResult 
                 ("internalQueryStatsRateLimit", Bson::Int32(n)) => {
                     if let Some(s) = store.as_ref() {
                         s.query_stats.set_rate_limit(*n);
+                    }
+                }
+                ("internalQueryStatsCacheSize", Bson::String(size)) => {
+                    if let Some(s) = store.as_ref() {
+                        s.query_stats.set_cache_size(size);
+                    }
+                }
+                ("internalQueryStatsSampleRate", Bson::Double(rate)) => {
+                    if let Some(s) = store.as_ref() {
+                        s.query_stats.set_sample_rate(*rate);
                     }
                 }
                 ("notablescan", Bson::Boolean(on)) => {

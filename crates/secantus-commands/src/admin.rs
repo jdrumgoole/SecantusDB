@@ -4489,6 +4489,10 @@ pub fn server_status(doc: &Document, ctx: &mut CommandContext) -> HandlerResult 
         metrics.insert("operation", status.operation());
         metrics.insert("query", status.query());
     }
+    // The query stats store's size and counters (RM-532).
+    if let Some(params) = ctx.server_params.as_ref() {
+        metrics.insert("queryStats", params.query_stats().server_status());
+    }
     // The TTL monitor's counters. Drivers' and users' tests wait on `passes`
     // to know a sweep has happened instead of sleeping for one.
     if let Some((_, _, passes, deleted)) = ctx.storage().ok().and_then(|s| s.ttl_monitor()) {

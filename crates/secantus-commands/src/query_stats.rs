@@ -17,11 +17,20 @@
 //! -- exhausted, killed, timed out or invalidated -- with what its
 //! `getMore`s added; a change stream's cursor, which never exhausts, at
 //! each of its operations. A command that fails is not recorded; a cursor
-//! a `getMore` fails on is, as it closes.
+//! a `getMore` fails on is, as it closes. An `aggregate` that explains is
+//! recorded with its verbosity in its key (RM-532).
+//!
+//! The store is mongod's partitioned LRU cache (RM-532): its budget is
+//! `internalQueryStatsCacheSize`, 0 bytes turns query stats off, and
+//! `internalQueryStatsSampleRate` above 0 samples in place of the rate
+//! limit. `$queryStats` with `transformIdentifiers` shapes each key again
+//! with every identifier as its HMAC-SHA-256 (`query_shape::with_hmac`).
+//! `serverStatus` reports the store under `metrics.queryStats`.
 
 use crate::util::ReplyOk;
-use std::collections::HashMap;
-use std::sync::atomic::{AtomicI32, AtomicUsize, Ordering};
+use std::borrow::Cow;
+use std::collections::{BTreeMap, HashMap};
+use std::sync::atomic::{AtomicI32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -32,16 +41,118 @@ use sha2::{Digest, Sha256};
 use crate::query_shape::StatsShape;
 use crate::CommandContext;
 
-/// The store, one per server.
-#[derive(Default)]
+/// The store, one per server: mongod's `QueryStatsStore`, a
+/// `PartitionedCache` of least-recently-used maps. Its budget,
+/// `internalQueryStatsCacheSize` (1% of the machine's memory, capped at
+/// 1 GB and at 25%), is split evenly across the partitions; a partition
+/// over its share evicts its least recently used entries. The number of
+/// partitions is fixed when the server starts: one per 16 MB of the
+/// budget, and at least one per logical core.
 pub struct QueryStatsStore {
     /// `internalQueryStatsRateLimit`.
     rate_limit: AtomicI32,
+    /// `internalQueryStatsSampleRate`, in thousandths rounded up
+    /// (`roundSampleRateToPerThousand`); above 0 it decides instead of the
+    /// rate limit.
+    sample_rate: AtomicI32,
     window: Mutex<Window>,
-    entries: Mutex<Entries>,
+    partitions: Vec<Mutex<Partition>>,
+    /// The budget in bytes, capped; 0 turns query stats off.
+    max_size: AtomicUsize,
+    /// `serverStatus`' `metrics.queryStats` counters.
+    max_size_metric: AtomicU64,
+    evicted: AtomicU64,
+    write_errors: AtomicU64,
+    rate_limited: AtomicU64,
+    hmac_errors: AtomicU64,
     /// The queries whose cursors are still open, by cursor id.
     open: Mutex<HashMap<i64, Open>>,
     open_count: AtomicUsize,
+}
+
+impl Default for QueryStatsStore {
+    fn default() -> Self {
+        let host = crate::hostinfo::Host::read();
+        let memory = memory_bytes(&host);
+        let size = cap_size(convert(DEFAULT_CACHE_SIZE, memory), memory);
+        let cores = usize::try_from(host.logical_cores.max(1)).unwrap_or(1);
+        Self::with_size(size, cores)
+    }
+}
+
+/// `internalQueryStatsCacheSize`'s default.
+pub(crate) const DEFAULT_CACHE_SIZE: &str = "1%";
+
+/// The machine's memory (`ProcessInfo::getMemSizeBytes`).
+fn memory_bytes(host: &crate::hostinfo::Host) -> u64 {
+    // A platform that cannot say is taken as 1 GB.
+    let mb = host.mem_size_mb.unwrap_or(1024).max(0);
+    u64::try_from(mb).unwrap_or(0) * 1024 * 1024
+}
+
+/// A size `internalQueryStatsCacheSize` names
+/// (`memory_util::MemorySize::parse`, `(?i)^\s*(\d+\.?\d*)\s*(B|KB|MB|GB|%)?\s*$`):
+/// a number, then optionally a unit -- `B`, `KB`, `MB`, `GB` or `%`, in
+/// any case -- with spaces around either.
+pub(crate) fn parse_size(text: &str) -> Option<(f64, char)> {
+    let t = text.trim_matches(|c: char| c.is_ascii_whitespace());
+    let whole = t.bytes().take_while(u8::is_ascii_digit).count();
+    if whole == 0 {
+        return None;
+    }
+    let mut end = whole;
+    if t.as_bytes().get(end) == Some(&b'.') {
+        end += 1 + t[end + 1..].bytes().take_while(u8::is_ascii_digit).count();
+    }
+    let (number, unit) = t.split_at(end);
+    let unit = match unit
+        .trim_start_matches(|c: char| c.is_ascii_whitespace())
+        .to_ascii_uppercase()
+        .as_str()
+    {
+        "" | "B" => 'B',
+        "KB" => 'K',
+        "MB" => 'M',
+        "GB" => 'G',
+        "%" => '%',
+        _ => return None,
+    };
+    Some((number.parse().ok()?, unit))
+}
+
+/// `convertToSizeInBytes`: a size, as a whole number of bytes.
+fn convert(text: &str, memory: u64) -> u64 {
+    let Some((n, unit)) = parse_size(text) else {
+        return 0;
+    };
+    let bytes = match unit {
+        '%' => n * (memory as f64 / 100.0),
+        'K' => n * 1024.0,
+        'M' => n * 1024.0 * 1024.0,
+        'G' => n * 1024.0 * 1024.0 * 1024.0,
+        _ => n,
+    };
+    bytes as u64
+}
+
+/// `capQueryStatsStoreSize`: at most 1 GB, and at most 25% of memory.
+fn cap_size(requested: u64, memory: u64) -> u64 {
+    let quarter = (25.0 * (memory as f64 / 100.0)) as u64;
+    requested.min(1024 * 1024 * 1024).min(quarter)
+}
+
+/// The bytes one entry is charged beyond its key's representative BSON:
+/// what mongod 8.2.11's `QueryStatsStoreEntryBudgetor` adds for the
+/// entry's own structures (`sizeof` of the entry, its hash and its key's
+/// components), measured per command from its
+/// `queryStatsStoreSizeEstimateBytes` (2026-11-14).
+fn entry_overhead(command: &str) -> usize {
+    match command {
+        "find" => 1191,
+        "aggregate" => 1096,
+        "distinct" => 1005,
+        _ => 990,
+    }
 }
 
 /// `RateLimiter::WindowBasedPolicy`: a one-second window, the previous
@@ -53,25 +164,102 @@ struct Window {
     current: u64,
 }
 
+/// One partition (`LRUKeyValue`): its entries by key hash, the least
+/// recently used first in `lru`.
 #[derive(Default)]
-struct Entries {
-    /// Key hashes in the order their entries were made.
-    order: Vec<String>,
-    by_hash: HashMap<String, Entry>,
+struct Partition {
+    entries: HashMap<String, Slot>,
+    lru: BTreeMap<u64, String>,
+    tick: u64,
+    /// The bytes its entries are charged.
+    size: usize,
+}
+
+struct Slot {
+    entry: Entry,
+    tick: u64,
+}
+
+impl Partition {
+    /// The entry under `hash`, made the most recently used (`get`).
+    fn get(&mut self, hash: &str) -> Option<&mut Entry> {
+        let slot = self.entries.get_mut(hash)?;
+        self.lru.remove(&slot.tick);
+        self.tick += 1;
+        slot.tick = self.tick;
+        self.lru.insert(self.tick, hash.to_string());
+        Some(&mut slot.entry)
+    }
+
+    /// Add `entry`, then evict down to `budget` (`add`); how many went.
+    fn add(&mut self, hash: &str, entry: Entry, budget: usize) -> u64 {
+        if let Some(old) = self.entries.remove(hash) {
+            self.lru.remove(&old.tick);
+            self.size -= old.entry.size;
+        }
+        self.tick += 1;
+        self.size += entry.size;
+        self.lru.insert(self.tick, hash.to_string());
+        self.entries.insert(
+            hash.to_string(),
+            Slot {
+                entry,
+                tick: self.tick,
+            },
+        );
+        self.evict(budget)
+    }
+
+    /// Evict the least recently used entries until the partition is within
+    /// `budget` (`evict`); how many went.
+    fn evict(&mut self, budget: usize) -> u64 {
+        let mut evicted = 0;
+        while self.size > budget {
+            let Some((_, hash)) = self.lru.pop_first() else {
+                break;
+            };
+            if let Some(slot) = self.entries.remove(&hash) {
+                self.size -= slot.entry.size;
+            }
+            evicted += 1;
+        }
+        evicted
+    }
 }
 
 struct Entry {
-    key: Document,
+    key: Arc<KeySource>,
     query_shape_hash: String,
+    /// What the entry is charged against its partition's share.
+    size: usize,
     metrics: Metrics,
 }
 
 /// What an entry is filed under.
 #[derive(Clone)]
 struct Key {
-    debug: Document,
+    source: Arc<KeySource>,
     hash: String,
     query_shape_hash: String,
+    size: usize,
+}
+
+/// What a key is printed from: its debug form, and the command it was made
+/// from, which `transformIdentifiers` shapes again -- mongod re-serializes
+/// the key it parsed.
+struct KeySource {
+    debug: Document,
+    db: String,
+    request: Document,
+    parts: Parts,
+}
+
+/// The key's components that come from the server, not the command.
+struct Parts {
+    client: Option<Document>,
+    collection_type: &'static str,
+    /// An `aggregate` that explains: its verbosity.
+    explain: Option<String>,
 }
 
 struct Open {
@@ -319,21 +507,108 @@ impl QueryStatsStore {
         Self::default()
     }
 
+    fn with_size(size: u64, cores: usize) -> Self {
+        // `ceil(size / 16 MB)`, and no fewer than the logical cores.
+        let wanted = usize::try_from(size.div_ceil(16 * 1024 * 1024)).unwrap_or(usize::MAX);
+        let partitions = wanted.max(cores).max(1);
+        QueryStatsStore {
+            rate_limit: AtomicI32::new(0),
+            sample_rate: AtomicI32::new(0),
+            window: Mutex::default(),
+            partitions: (0..partitions).map(|_| Mutex::default()).collect(),
+            max_size: AtomicUsize::new(usize::try_from(size).unwrap_or(usize::MAX)),
+            max_size_metric: AtomicU64::new(size),
+            evicted: AtomicU64::new(0),
+            write_errors: AtomicU64::new(0),
+            rate_limited: AtomicU64::new(0),
+            hmac_errors: AtomicU64::new(0),
+            open: Mutex::default(),
+            open_count: AtomicUsize::new(0),
+        }
+    }
+
     /// `internalQueryStatsRateLimit` changed.
     pub fn set_rate_limit(&self, limit: i32) {
         self.rate_limit.store(limit, Ordering::Relaxed);
     }
 
-    /// `shouldCollect`: off at 0, every query below 0, else what the
-    /// sliding window lets through.
+    /// `internalQueryStatsSampleRate` changed (`configureRateLimiter`).
+    pub fn set_sample_rate(&self, rate: f64) {
+        let per_thousand = (rate * 1000.0).ceil() as i32;
+        self.sample_rate.store(per_thousand, Ordering::Relaxed);
+    }
+
+    /// `internalQueryStatsCacheSize` changed (`updateCacheSize`): the
+    /// budget becomes the new size, capped, and each partition evicts down
+    /// to its share. The number of partitions stays as the server started.
+    pub fn set_cache_size(&self, text: &str) {
+        let memory = memory_bytes(&crate::hostinfo::Host::read());
+        let requested = convert(text, memory);
+        let capped = usize::try_from(cap_size(requested, memory)).unwrap_or(usize::MAX);
+        self.max_size.store(capped, Ordering::Relaxed);
+        self.max_size_metric.store(requested, Ordering::Relaxed);
+        let budget = self.budget();
+        let evicted: u64 = self
+            .partitions
+            .iter()
+            .map(|p| p.lock().unwrap_or_else(|e| e.into_inner()).evict(budget))
+            .sum();
+        self.evicted.fetch_add(evicted, Ordering::Relaxed);
+    }
+
+    /// `isQueryStatsEnabled`: a budget above 0 bytes.
+    pub(crate) fn enabled(&self) -> bool {
+        self.max_size.load(Ordering::Relaxed) > 0
+    }
+
+    /// Each partition's share of the budget.
+    fn budget(&self) -> usize {
+        self.max_size.load(Ordering::Relaxed) / self.partitions.len()
+    }
+
+    /// `serverStatus`' `metrics.queryStats`.
+    pub fn server_status(&self) -> Document {
+        let (mut entries, mut bytes) = (0usize, 0usize);
+        for p in &self.partitions {
+            let p = p.lock().unwrap_or_else(|e| e.into_inner());
+            entries += p.entries.len();
+            bytes += p.size;
+        }
+        let n = |v: u64| Bson::Int64(i64::try_from(v).unwrap_or(i64::MAX));
+        doc! {
+            "maxSizeBytes": n(self.max_size_metric.load(Ordering::Relaxed)),
+            "numEntries": n(entries as u64),
+            "numEvicted": n(self.evicted.load(Ordering::Relaxed)),
+            "numHmacApplicationErrors": n(self.hmac_errors.load(Ordering::Relaxed)),
+            "numPartitions": n(self.partitions.len() as u64),
+            "numQueryStatsStoreWriteErrors": n(self.write_errors.load(Ordering::Relaxed)),
+            "numRateLimitedRequests": n(self.rate_limited.load(Ordering::Relaxed)),
+            "queryStatsStoreSizeEstimateBytes": n(bytes as u64),
+        }
+    }
+
+    /// `shouldCollect`: by the sample rate when it is above 0, else by the
+    /// rate limit -- none at 0, every query below 0, else what the sliding
+    /// window lets through. A query either turns away is counted
+    /// (`numRateLimitedRequests`).
     fn should_collect(&self) -> bool {
-        let limit = self.rate_limit.load(Ordering::Relaxed);
-        if limit == 0 {
-            return false;
+        let sample = self.sample_rate.load(Ordering::Relaxed);
+        let admitted = if sample > 0 {
+            rand::random_range(0..1000) < sample
+        } else {
+            let limit = self.rate_limit.load(Ordering::Relaxed);
+            if limit == 0 {
+                return false;
+            }
+            limit < 0 || self.window_admits(limit)
+        };
+        if !admitted {
+            self.rate_limited.fetch_add(1, Ordering::Relaxed);
         }
-        if limit < 0 {
-            return true;
-        }
+        admitted
+    }
+
+    fn window_admits(&self, limit: i32) -> bool {
         let mut w = self.window.lock().unwrap_or_else(|e| e.into_inner());
         let now = Instant::now();
         let start = *w.start.get_or_insert(now);
@@ -357,39 +632,93 @@ impl QueryStatsStore {
         }
     }
 
-    fn write(&self, key: &Key, snapshot: &Snapshot) {
-        let now = DateTime::now();
-        let mut entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
-        let Entries { order, by_hash } = &mut *entries;
-        let entry = by_hash.entry(key.hash.clone()).or_insert_with(|| {
-            order.push(key.hash.clone());
-            Entry {
-                key: key.debug.clone(),
-                query_shape_hash: key.query_shape_hash.clone(),
-                metrics: Metrics::default(),
-            }
-        });
-        entry.metrics.update(snapshot, now);
+    /// The partition an entry lives in (`QueryStatsPartitioner`): its key's
+    /// hash modulo the number of partitions.
+    fn partition(&self, hash: &str) -> &Mutex<Partition> {
+        let digest = Sha256::digest(hash.as_bytes());
+        let n = u64::from_le_bytes(digest[..8].try_into().expect("eight bytes"));
+        let at = usize::try_from(n % self.partitions.len() as u64).unwrap_or(0);
+        &self.partitions[at]
     }
 
-    /// The entries, as `$queryStats` lists them.
-    pub fn rows(&self) -> Vec<Document> {
-        let as_of = DateTime::now();
-        let entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
-        entries
-            .order
-            .iter()
-            .filter_map(|hash| {
-                let e = entries.by_hash.get(hash)?;
-                Some(doc! {
-                    "key": e.key.clone(),
-                    "keyHash": hash.clone(),
-                    "queryShapeHash": e.query_shape_hash.clone(),
-                    "metrics": e.metrics.to_doc(),
+    /// `writeQueryStats`: add to the key's entry, or make one.
+    fn write(&self, key: &Key, snapshot: &Snapshot) {
+        // Turned off since the query began.
+        if !self.enabled() {
+            return;
+        }
+        let now = DateTime::now();
+        let budget = self.budget();
+        let mut p = self
+            .partition(&key.hash)
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some(entry) = p.get(&key.hash) {
+            entry.metrics.update(snapshot, now);
+            return;
+        }
+        let entry = Entry {
+            key: key.source.clone(),
+            query_shape_hash: key.query_shape_hash.clone(),
+            size: key.size,
+            metrics: Metrics::default(),
+        };
+        let evicted = p.add(&key.hash, entry, budget);
+        self.evicted.fetch_add(evicted, Ordering::Relaxed);
+        match p.get(&key.hash) {
+            Some(entry) => entry.metrics.update(snapshot, now),
+            // Larger than its partition's share: evicted as it went in.
+            None => {
+                self.write_errors.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+
+    /// The entries, as `$queryStats` lists them: partition by partition,
+    /// each most recently used first, as of when it was copied. With an
+    /// HMAC key each identifier is printed as its HMAC; an entry that
+    /// cannot be is left out and counted (`numHmacApplicationErrors`).
+    pub fn rows(&self, hmac_key: Option<&[u8]>) -> Vec<Document> {
+        let mut out = Vec::new();
+        for p in &self.partitions {
+            let copied: Vec<(String, Arc<KeySource>, String, Document)> = {
+                let p = p.lock().unwrap_or_else(|e| e.into_inner());
+                p.lru
+                    .values()
+                    .rev()
+                    .filter_map(|hash| {
+                        let e = &p.entries.get(hash)?.entry;
+                        Some((
+                            hash.clone(),
+                            e.key.clone(),
+                            e.query_shape_hash.clone(),
+                            e.metrics.to_doc(),
+                        ))
+                    })
+                    .collect()
+            };
+            let as_of = DateTime::now();
+            for (hash, source, query_shape_hash, metrics) in copied {
+                let key = match hmac_key {
+                    None => source.debug.clone(),
+                    Some(k) => match transformed_key(&source, k) {
+                        Some(key) => key,
+                        None => {
+                            self.hmac_errors.fetch_add(1, Ordering::Relaxed);
+                            continue;
+                        }
+                    },
+                };
+                out.push(doc! {
+                    "key": key,
+                    "keyHash": hash,
+                    "queryShapeHash": query_shape_hash,
+                    "metrics": metrics,
                     "asOf": as_of,
-                })
-            })
-            .collect()
+                });
+            }
+        }
+        out
     }
 
     fn open(&self, cursor_id: i64, key: Key, snapshot: Snapshot, never_exhausts: bool) {
@@ -494,23 +823,31 @@ pub(crate) fn set_current(store: Option<Arc<QueryStatsStore>>) {
     CURRENT.with(|c| *c.borrow_mut() = store);
 }
 
-/// `$queryStats`' rows (its argument checked already). With
-/// `transformIdentifiers` mongod prints each identifier as its HMAC, which
-/// this store cannot: it refuses once it has entries to print (RM-215's
-/// remainder in the backlog).
+/// `$queryStats`' rows (its argument checked already): every entry, each
+/// identifier as its HMAC when `transformIdentifiers` gives a key. With
+/// the store's budget at 0 bytes, mongod 8.2.11's 6579000.
 pub(crate) fn stage_rows(spec: Option<&Bson>) -> Result<Vec<Document>, crate::CommandError> {
-    let rows = CURRENT.with(|c| c.borrow().as_ref().map(|s| s.rows()).unwrap_or_default());
-    let transformed = spec
-        .and_then(Bson::as_document)
-        .is_some_and(|s| s.contains_key("transformIdentifiers"));
-    if transformed && !rows.is_empty() {
+    let Some(store) = CURRENT.with(|c| c.borrow().clone()) else {
+        return Ok(Vec::new());
+    };
+    if !store.enabled() {
         return Err(crate::CommandError::new(
-            238,
-            "NotImplemented",
-            "$queryStats with transformIdentifiers is not supported by this server",
+            6579000,
+            "Location6579000",
+            "Executor error during aggregate command on namespace: admin.$cmd.aggregate :: \
+             caused by :: Query stats is not enabled without the feature flag on and a cache \
+             size greater than 0 bytes",
         ));
     }
-    Ok(rows)
+    let key = spec
+        .and_then(Bson::as_document)
+        .and_then(|s| s.get_document("transformIdentifiers").ok())
+        .filter(|t| t.get_str("algorithm") == Ok("hmac-sha-256"))
+        .and_then(|t| match t.get("hmacKey") {
+            Some(Bson::Binary(b)) => Some(b.bytes.clone()),
+            _ => None,
+        });
+    Ok(store.rows(key.as_deref()))
 }
 
 /// The store of the server `ctx` runs on.
@@ -549,7 +886,7 @@ pub fn after_operation(
     };
     if !matches!(
         name,
-        "find" | "aggregate" | "count" | "distinct" | "getMore"
+        "find" | "aggregate" | "count" | "distinct" | "getMore" | "explain"
     ) {
         return;
     }
@@ -565,19 +902,24 @@ pub fn after_operation(
         }
         return;
     }
-    let ok = reply.ok_number().unwrap_or(0.0) == 1.0;
-    // An `aggregate` that explains is recorded with its verbosity, which
-    // this store does not shape (RM-215's remainder).
-    if !ok || request.contains_key("explain") || store.rate_limit.load(Ordering::Relaxed) == 0 {
+    // `registerRequest`: nothing while the store has no budget, nothing for
+    // a command that failed, and nothing the rate limiter turns away --
+    // all checked before the shape, which every query would otherwise pay
+    // for with query stats at their default, off.
+    if !store.enabled() || reply.ok_number().unwrap_or(0.0) != 1.0 {
         return;
     }
-    let Some(shape) = crate::query_shape::stats_shape(&ctx.db_name, request) else {
+    let Some((request, explain)) = recorded_request(request) else {
         return;
     };
     if !store.should_collect() {
         return;
     }
-    let key = key(request, ctx, &shape);
+    let name = request.keys().next().map(String::as_str).unwrap_or(name);
+    let Some(shape) = crate::query_shape::stats_shape(&ctx.db_name, &request) else {
+        return;
+    };
+    let key = key(&request, ctx, &shape, explain);
     let snapshot = snapshot(name, reply, ctx, worked);
     let cursor_id = reply
         .get_document("cursor")
@@ -588,7 +930,7 @@ pub fn after_operation(
         store.write(&key, &snapshot);
         return;
     }
-    let never_exhausts = changes(request);
+    let never_exhausts = changes(&request);
     if never_exhausts {
         store.write(&key, &snapshot);
     }
@@ -606,6 +948,36 @@ pub fn after_operation(
         on_close.disarm();
         store.closed(cursor_id);
     }
+}
+
+/// The command a query is recorded as, and the verbosity of an `aggregate`
+/// that explains: `{explain: true}` explains at `queryPlanner`, and the
+/// `explain` command at its `verbosity` (`allPlansExecution` by default),
+/// with its `comment` (measured 8.2.11, 2026-11-14). mongod records no
+/// explained `find`, `distinct` or `count`.
+fn recorded_request(request: &Document) -> Option<(Cow<'_, Document>, Option<String>)> {
+    if let Ok(inner) = request.get_document("explain") {
+        if inner.keys().next().map(String::as_str) != Some("aggregate") {
+            return None;
+        }
+        let mut inner = inner.clone();
+        if let (false, Some(comment)) = (inner.contains_key("comment"), request.get("comment")) {
+            inner.insert("comment", comment.clone());
+        }
+        let verbosity = request
+            .get_str("verbosity")
+            .unwrap_or("allPlansExecution")
+            .to_string();
+        return Some((Cow::Owned(inner), Some(verbosity)));
+    }
+    if request.contains_key("explain") {
+        let explains = request.get_bool("explain") == Ok(true);
+        return Some((
+            Cow::Borrowed(request),
+            explains.then(|| "queryPlanner".to_string()),
+        ));
+    }
+    Some((Cow::Borrowed(request), None))
 }
 
 /// A change stream's `aggregate`.
@@ -667,23 +1039,58 @@ fn snapshot(name: &str, reply: &Document, ctx: &CommandContext, worked: Duration
 
 /// The entry's key (`Key::toBson`): the shape, then the universal
 /// components in mongod's order, then the command's own.
-fn key(request: &Document, ctx: &CommandContext, shape: &StatsShape) -> Key {
-    let representative = key_doc(request, ctx, &shape.representative, false);
-    let debug = key_doc(request, ctx, &shape.debug, true);
+fn key(
+    request: &Document,
+    ctx: &CommandContext,
+    shape: &StatsShape,
+    explain: Option<String>,
+) -> Key {
+    let shape_ns = shape.representative.get_document("cmdNs").ok();
+    let coll = shape_ns.and_then(|n| n.get_str("coll").ok()).unwrap_or("");
+    let parts = Parts {
+        client: client(ctx),
+        collection_type: collection_type(request, ctx, &ctx.db_name, coll),
+        explain,
+    };
+    let representative = key_doc(request, &ctx.db_name, &parts, &shape.representative, false);
+    let debug = key_doc(request, &ctx.db_name, &parts, &shape.debug, true);
     let bytes = crate::bsondoc::to_vec(&representative).unwrap_or_default();
     let hash = base64::engine::general_purpose::STANDARD.encode(Sha256::digest(&bytes));
+    let command = request.keys().next().map(String::as_str).unwrap_or("");
     Key {
-        debug,
+        size: entry_overhead(command) + bytes.len(),
+        source: Arc::new(KeySource {
+            debug,
+            db: ctx.db_name.clone(),
+            request: request.clone(),
+            parts,
+        }),
         hash,
         query_shape_hash: shape.hash.clone(),
     }
+}
+
+/// The key with each identifier as its HMAC under `hmac_key`
+/// (`computeQueryStatsKey` with `transformIdentifiers`), or `None` when the
+/// command no longer shapes.
+fn transformed_key(source: &KeySource, hmac_key: &[u8]) -> Option<Document> {
+    crate::query_shape::with_hmac(hmac_key, || {
+        let shape = crate::query_shape::debug_shape(&source.db, &source.request)?;
+        Some(key_doc(
+            &source.request,
+            &source.db,
+            &source.parts,
+            &shape,
+            true,
+        ))
+    })
 }
 
 fn literal(v: &Bson, debug: bool) -> Bson {
     crate::query_shape::literal(v, debug).unwrap_or(Bson::Null)
 }
 
-fn key_doc(request: &Document, ctx: &CommandContext, shape: &Document, debug: bool) -> Document {
+fn key_doc(request: &Document, db: &str, parts: &Parts, shape: &Document, debug: bool) -> Document {
     let name = request.keys().next().map(String::as_str).unwrap_or("");
     let mut key = doc! { "queryShape": shape.clone() };
     // `UniversalKeyComponents::appendTo`.
@@ -704,15 +1111,10 @@ fn key_doc(request: &Document, ctx: &CommandContext, shape: &Document, debug: bo
     if let Ok(wc) = request.get_document("writeConcern") {
         key.insert("writeConcern", wc.clone());
     }
-    if let Some(client) = client(ctx) {
-        key.insert("client", client);
+    if let Some(client) = &parts.client {
+        key.insert("client", client.clone());
     }
-    let shape_ns = shape.get_document("cmdNs").ok();
-    let db = shape_ns
-        .and_then(|n| n.get_str("db").ok())
-        .unwrap_or(&ctx.db_name);
-    let coll = shape_ns.and_then(|n| n.get_str("coll").ok()).unwrap_or("");
-    key.insert("collectionType", collection_type(request, ctx, db, coll));
+    key.insert("collectionType", parts.collection_type);
     if let Some(hint) = hint(request) {
         key.insert("hint", hint);
     }
@@ -739,7 +1141,13 @@ fn key_doc(request: &Document, ctx: &CommandContext, shape: &Document, debug: bo
                     "otherNss",
                     others
                         .into_iter()
-                        .map(|(db, coll)| Bson::Document(doc! { "db": db, "coll": coll }))
+                        .map(|(db, coll)| {
+                            let (db, coll) = (
+                                crate::query_shape::ident(&db),
+                                crate::query_shape::ident(&coll),
+                            );
+                            Bson::Document(doc! { "db": db, "coll": coll })
+                        })
                         .collect::<Vec<_>>(),
                 );
             }
@@ -749,11 +1157,17 @@ fn key_doc(request: &Document, ctx: &CommandContext, shape: &Document, debug: bo
             {
                 key.insert("bypassDocumentValidation", v);
             }
-            // The cursor's batch size: mongod fills in its default.
-            key.insert(
-                "cursor",
-                doc! { "batchSize": literal(&Bson::Int64(0), debug) },
-            );
+            // The cursor's batch size, when the command has a cursor (one
+            // that explains need not): mongod fills in its default.
+            if request.contains_key("cursor") {
+                key.insert(
+                    "cursor",
+                    doc! { "batchSize": literal(&Bson::Int64(0), debug) },
+                );
+            }
+            if let Some(verbosity) = &parts.explain {
+                key.insert("explain", verbosity.as_str());
+            }
         }
         _ => {}
     }
@@ -807,11 +1221,21 @@ fn client(ctx: &CommandContext) -> Option<Document> {
     Some(client)
 }
 
-/// `extractHintShape`: an index's name or key pattern as given.
+/// `extractHintShape`: an index's name or key pattern as given, its
+/// fields (and a name) as field paths; `$natural` as it stands.
 fn hint(request: &Document) -> Option<Document> {
+    use crate::query_shape::field_path;
     match request.get("hint")? {
-        Bson::String(name) => Some(doc! { "$hint": name.clone() }),
-        Bson::Document(d) if !d.is_empty() => Some(d.clone()),
+        Bson::String(name) => Some(doc! { "$hint": field_path(name) }),
+        Bson::Document(d) if !d.is_empty() => Some(
+            d.iter()
+                .map(|(k, v)| match (k.as_str(), v) {
+                    ("$natural", _) => (k.clone(), v.clone()),
+                    ("$hint", Bson::String(name)) => (k.clone(), Bson::String(field_path(name))),
+                    _ => (field_path(k), v.clone()),
+                })
+                .collect(),
+        ),
         _ => None,
     }
 }
@@ -936,12 +1360,121 @@ mod tests {
         }
     }
 
-    fn key(hash: &str) -> Key {
+    fn sized(hash: &str, size: usize) -> Key {
+        let request = doc! { "find": "c", "filter": { "x": 1 } };
         Key {
-            debug: doc! { "queryShape": { "command": "find" } },
+            source: Arc::new(KeySource {
+                debug: doc! { "queryShape": { "command": "find" } },
+                db: "d".into(),
+                request,
+                parts: Parts {
+                    client: None,
+                    collection_type: "collection",
+                    explain: None,
+                },
+            }),
             hash: hash.into(),
             query_shape_hash: "H".into(),
+            size,
         }
+    }
+
+    fn key(hash: &str) -> Key {
+        sized(hash, 100)
+    }
+
+    #[test]
+    fn a_size_parses_as_mongods_memory_size_does() {
+        assert_eq!(parse_size("1%"), Some((1.0, '%')));
+        assert_eq!(parse_size(" 2 kb "), Some((2.0, 'K')));
+        assert_eq!(parse_size("1.5GB"), Some((1.5, 'G')));
+        assert_eq!(parse_size("10"), Some((10.0, 'B')));
+        assert_eq!(parse_size("3."), Some((3.0, 'B')));
+        for bad in ["", "abc", "5TB", "-1MB", "1e3MB", ".5MB", "1.2.3MB"] {
+            assert_eq!(parse_size(bad), None, "{bad}");
+        }
+        assert_eq!(convert("1%", 32 << 30), 343_597_383);
+        assert_eq!(convert("1.5MB", 0), 1_572_864);
+        // At most 1 GB, and at most a quarter of memory.
+        assert_eq!(cap_size(2 << 30, 32 << 30), 1 << 30);
+        assert_eq!(cap_size(2 << 30, 4 << 30), 1 << 30);
+        assert_eq!(cap_size(900 << 20, 2 << 30), 512 << 20);
+    }
+
+    #[test]
+    fn the_partitions_are_one_per_16_mb_and_at_least_one_per_core() {
+        assert_eq!(
+            QueryStatsStore::with_size(343_597_383, 12).partitions.len(),
+            21
+        );
+        assert_eq!(QueryStatsStore::with_size(1 << 20, 12).partitions.len(), 12);
+        assert_eq!(QueryStatsStore::with_size(0, 4).partitions.len(), 4);
+    }
+
+    #[test]
+    fn a_partition_over_its_share_evicts_its_least_recently_used() {
+        // One partition of 1000 bytes.
+        let store = QueryStatsStore::with_size(1000, 1);
+        store.set_rate_limit(-1);
+        store.write(&sized("a", 400), &snap(1, 1));
+        store.write(&sized("b", 400), &snap(1, 1));
+        // `a` is used again, so `b` is the least recently used.
+        store.write(&sized("a", 400), &snap(1, 1));
+        store.write(&sized("c", 400), &snap(1, 1));
+        let hashes: Vec<String> = store
+            .rows(None)
+            .iter()
+            .map(|r| r.get_str("keyHash").unwrap().to_string())
+            .collect();
+        assert_eq!(hashes, ["c", "a"]);
+        let status = store.server_status();
+        assert_eq!(status.get_i64("numEvicted").unwrap(), 1);
+        assert_eq!(status.get_i64("numEntries").unwrap(), 2);
+        assert_eq!(
+            status.get_i64("queryStatsStoreSizeEstimateBytes").unwrap(),
+            800
+        );
+        // Too large for the partition: in and out again, a write error.
+        store.write(&sized("d", 2000), &snap(1, 1));
+        let status = store.server_status();
+        assert_eq!(status.get_i64("numQueryStatsStoreWriteErrors").unwrap(), 1);
+        assert_eq!(status.get_i64("numEntries").unwrap(), 0);
+    }
+
+    #[test]
+    fn a_smaller_cache_size_evicts_and_zero_turns_query_stats_off() {
+        let store = QueryStatsStore::with_size(1000, 1);
+        store.write(&sized("a", 400), &snap(1, 1));
+        store.write(&sized("b", 400), &snap(1, 1));
+        store.set_cache_size("500B");
+        assert_eq!(store.rows(None).len(), 1);
+        assert_eq!(store.server_status().get_i64("maxSizeBytes").unwrap(), 500);
+        store.set_cache_size("0MB");
+        assert!(!store.enabled());
+        assert_eq!(store.rows(None).len(), 0);
+        store.write(&sized("c", 1), &snap(1, 1));
+        assert_eq!(store.rows(None).len(), 0);
+    }
+
+    #[test]
+    fn the_sample_rate_takes_over_from_the_rate_limit() {
+        let store = QueryStatsStore::new();
+        store.set_sample_rate(1.0);
+        assert!((0..50).all(|_| store.should_collect()));
+        store.set_sample_rate(0.0005);
+        assert_eq!(store.sample_rate.load(Ordering::Relaxed), 1);
+        store.set_sample_rate(0.0);
+        assert!(!store.should_collect());
+        store.set_rate_limit(1);
+        assert!(store.should_collect());
+        assert!(!store.should_collect());
+        assert_eq!(
+            store
+                .server_status()
+                .get_i64("numRateLimitedRequests")
+                .unwrap(),
+            1
+        );
     }
 
     #[test]
@@ -965,7 +1498,7 @@ mod tests {
         let store = QueryStatsStore::new();
         store.write(&key("k"), &snap(10, 2));
         store.write(&key("k"), &snap(30, 4));
-        let rows = store.rows();
+        let rows = store.rows(None);
         assert_eq!(rows.len(), 1);
         let m = rows[0].get_document("metrics").unwrap();
         assert_eq!(m.get_i64("execCount").unwrap(), 2);
@@ -993,13 +1526,13 @@ mod tests {
         store.open(7, key("k"), snap(100, 2), false);
         store.get_more_begins(7);
         store.get_more_ends(7, &snap(50, 2));
-        assert!(store.rows().is_empty());
+        assert!(store.rows(None).is_empty());
         // The last getMore exhausts it: closed while that getMore runs.
         store.get_more_begins(7);
         store.closed(7);
-        assert!(store.rows().is_empty());
+        assert!(store.rows(None).is_empty());
         store.get_more_ends(7, &snap(25, 1));
-        let rows = store.rows();
+        let rows = store.rows(None);
         let m = rows[0].get_document("metrics").unwrap();
         assert_eq!(m.get_i64("execCount").unwrap(), 1);
         assert_eq!(
@@ -1031,7 +1564,7 @@ mod tests {
         let store = QueryStatsStore::new();
         store.open(9, key("k"), snap(100, 2), false);
         store.closed(9);
-        let rows = store.rows();
+        let rows = store.rows(None);
         let m = rows[0].get_document("metrics").unwrap();
         assert_eq!(
             m.get_document("docsReturned")

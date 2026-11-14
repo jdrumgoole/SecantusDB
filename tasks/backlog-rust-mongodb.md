@@ -1771,24 +1771,26 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
   every subtype-2 value. mongod 8.2.11 writes the bytes alone, which is not
   a valid subtype-2 value: pymongo refuses to decode the reply. Out of
   scope; nothing reads the old subtype as mongod emits it.
-- [ ] **`$queryStats`' remainder: cache size, explains, transformed
-      identifiers.** Since 2026-11-10 the query stats store records
-      `find`, `aggregate`, `distinct` and `count` under mongod's key, with
-      its metrics (`tests/mongod_live/test_query_stats.py`). mongod 8.2.11
-      also: reports `internalQueryStatsCacheSize` ("1%"), sizes the store
-      by it and evicts the least recent entries past it, and turns
-      `$queryStats` off (6579000) at "0MB"; samples by
-      `internalQueryStatsSampleRate`; records an `aggregate` that explains,
-      its key saying `explain: "queryPlanner"`; and lists every identifier
-      (field paths, namespaces, `let` names) as its HMAC-SHA-256 under
-      `transformIdentifiers`. This server reports neither parameter, keeps
-      every entry, records no explain, and refuses `transformIdentifiers`
-      (238) once the store has entries to print. Unmeasured: the key's
-      `writeConcern` and `$readPreference` (copied as the command gave
-      them), the order of `otherNss` past one namespace (mongod's is a hash
-      set's), and `fromMultiPlanner` for a rooted `$or` the subplanner
-      plans (counted false here). Found 2026-11-10 working RM-215.
-      Verify: tests/backlog/test_rm_found_2026_11_10_rm215.py::test_query_stats_remainder
+- [ ] **`$queryStats`' remainder: entry sizes, `otherNss` order, unmeasured
+      key components.** Since 2026-11-14 the store is mongod's partitioned
+      LRU cache, sized by `internalQueryStatsCacheSize` and sampled by
+      `internalQueryStatsSampleRate`, records an `aggregate` that explains,
+      and lists keys under `transformIdentifiers`
+      (`tests/mongod_live/test_query_stats.py`,
+      `tests/mongod_live/test_query_stats_store.py`). What is left: an
+      entry is charged its key's representative BSON plus a per-command
+      constant measured from mongod 8.2.11's
+      `queryStatsStoreSizeEstimateBytes`, not mongod's `sizeof` of its
+      parsed structures, so the point a partition starts evicting differs
+      by a few bytes an entry; `otherNss` past one namespace is in the
+      order the pipeline names them, where mongod's is a hash set's; and,
+      unmeasured, the key's `writeConcern` and `$readPreference` (copied as
+      the command gave them) and `fromMultiPlanner` for a rooted `$or` the
+      subplanner plans (counted false here). Found 2026-11-10 working
+      RM-215; trimmed 2026-11-14.
+      Verify: none -- the sizes are C++ object sizes this server does not
+      have, mongod's `otherNss` order is its hash set's, and the rest is
+      unmeasured: a probe must find a difference before a test can assert it
       Backlog-ID: RM-532
 - [ ] **A malformed stage spec inside a sub-pipeline is not refused as the
       pipeline parses.** mongod 8.2.11 checks the stages of a `$facet`'s
@@ -1812,6 +1814,22 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       working RM-528.
       Verify: tests/backlog/test_rm_found_2026_11_14_rm528.py::test_lookup_refuses_a_bad_path_and_a_bad_let_name
       Backlog-ID: RM-646
+- [ ] **A `find` sorted on `$natural` is recorded with the sort, not as a
+      hint.** mongod 8.2.11's `$queryStats` key for `{find: "c", sort:
+      {$natural: -1}}` has no `sort` in its shape and `hint: {$natural:
+      -1}`, a different `keyHash`. This server keeps the sort in the shape
+      and prints no hint. Found 2026-11-14 working RM-532.
+      Verify: tests/backlog/test_rm_found_2026_11_14_rm532.py::test_a_natural_sort_is_recorded_as_a_hint
+      Backlog-ID: RM-643
+- [ ] **A hybrid search's key names no `otherNss`.** mongod 8.2.11 lists
+      the collection of the `$unionWith` a `$rankFusion` (or
+      `$scoreFusion`) desugars its later input pipelines into under the
+      key's `otherNss`, the aggregate's own collection, and hashes the key
+      with it. This server walks the pipeline as written, finds no other
+      namespace, and prints none: the entry's `keyHash` differs. Found
+      2026-11-14 working RM-532.
+      Verify: tests/backlog/test_rm_found_2026_11_14_rm532.py::test_a_hybrid_search_names_the_collection_it_unions
+      Backlog-ID: RM-644
 - [ ] **A `$lookup` whose `localField` is an empty array joins nothing.**
       mongod 8.2.11 joins it as it joins null: to the foreign documents
       whose `foreignField` is missing, null or `[null]`, in the simple form
