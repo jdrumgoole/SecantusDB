@@ -3518,14 +3518,6 @@ keeps; what follows is what that lookup does not yet check.
       column is this server's to do, in the block scopes PL/pgSQL keeps.
       Verify: tests/backlog/test_rp_found_rp573.py::test_declare_of_text_that_is_not_one_type_name
       Backlog-ID: RP-617
-- [ ] **A PL/pgSQL variable of a pseudo-type is created.**
-      `plpgsql_build_variable` refuses one: `declare x anyelement` is 0A000
-      `variable "x" has pseudo-type anyelement`, no position, CONTEXT
-      `compilation of PL/pgSQL function "e573" near line 1`, on PostgreSQL
-      15.19 (`void` the same, near the variable's line). Here the function
-      is created.
-      Verify: tests/backlog/test_rp_found_rp573.py::test_declare_of_a_pseudo_type
-      Backlog-ID: RP-618
 - [ ] **A `pg_temp` type in a session with no temporary schema is a
       missing type, not a missing schema.** `LookupExplicitNamespace`
       finds `pg_temp` only once the session has made its temp schema, so on

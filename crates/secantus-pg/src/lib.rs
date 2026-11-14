@@ -14595,6 +14595,13 @@ impl PgHandler {
             let (e, at_type) = match refused {
                 secantus_pgplan::DeclaredTypeError::AtType(e) => (e, true),
                 secantus_pgplan::DeclaredTypeError::Compile(e) => (e, false),
+                secantus_pgplan::DeclaredTypeError::PseudoType(t) => (
+                    secantus_pgplan::Error::Sqlstate(
+                        "0A000",
+                        format!("variable \"{}\" has pseudo-type {t}", d.refname),
+                    ),
+                    false,
+                ),
             };
             let mut err = Self::err(&e);
             if let PgWireError::UserError(info) = &mut err {
