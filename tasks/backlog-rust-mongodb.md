@@ -2092,20 +2092,17 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       everywhere (not probed on Linux).
       Verify: tests/backlog/test_rm_219_diag_query_settings.py::test_the_archive_records_the_parameters
       Backlog-ID: RM-690
-- [ ] **`$querySettings` gives no `debugQueryShape`, and query settings
-      miss two of mongod's mechanisms.** Since 2026-11-08
+- [ ] **Query settings miss two of mongod's mechanisms.** Since 2026-11-08
       `setQuerySettings` / `removeQuerySettings` / `$querySettings` keep
       mongod's settings, a read of their shape is refused (411) or planned
-      over its `indexHints` (RM-219), and since 2026-11-10 its
-      `queryFramework` chooses the engine (RM-418). Open:
-      `showDebugQueryShape` gives no `debugQueryShape` (mongod's shape with
-      each literal a debug type string, `{x: {$eq: "?number"}}`, which
-      RM-215's `query_shape::stats_shape` now serializes for `$queryStats`);
-      a query whose shape `query_shape.rs` does not compute
-      is refused 115; and a write made to `config.clusterParameters`
-      directly is read only at the next start (mongod's op observer
-      reloads it).
-      Verify: tests/backlog/test_rm_219_diag_query_settings.py::test_show_debug_query_shape
+      over its `indexHints` (RM-219), since 2026-11-10 its
+      `queryFramework` chooses the engine, and since 2026-11-14
+      `showDebugQueryShape` gives each `debugQueryShape` (RM-418). Open:
+      a query whose shape `query_shape.rs` does not compute (a
+      `$jsonSchema` filter) is refused 115 where mongod keeps the setting;
+      and a write made to `config.clusterParameters` directly is read only
+      at the next start (mongod's op observer reloads it).
+      Verify: tests/backlog/test_rm_219_diag_query_settings.py::test_setting_for_a_query_the_server_does_not_shape
       Backlog-ID: RM-418
 - [ ] **Under `queryFramework: "sbe"` an `aggregate` and a `distinct` are
       pushed into SBE as without the setting.** mongod 8.2.11's

@@ -646,13 +646,37 @@ def _debug_shape(client: Any) -> list:
     return debug
 
 
-@pytest.mark.backlog("RM-418")
+@pytest.mark.backlog_fixed("RM-418")
 def test_show_debug_query_shape(
     rust_mongo: Any,
     mongod_rs: Any,  # noqa: F811
 ) -> None:
-    """`showDebugQueryShape` adds each query's `debugQueryShape`."""
+    """`showDebugQueryShape` gave no `debugQueryShape`; each setting with a
+    representative query now carries its shape with debug type strings."""
     assert _debug_shape(rust_mongo) == _debug_shape(mongod_rs)
+
+
+def _unshaped_setting(client: Any) -> tuple:
+    client.drop_database("rm219j")
+    client.rm219j.a.insert_many([{"x": i} for i in range(3)])
+    query = {"find": "a", "filter": {"$jsonSchema": {"required": ["x"]}}}
+    try:
+        _set_framework(client, "rm219j", query, "classic")
+    except pymongo.errors.OperationFailure as e:
+        return ("err", e.code)
+    n = len(list(client.admin.aggregate([{"$querySettings": {}}])))
+    _clear(client)
+    return ("ok", n)
+
+
+@pytest.mark.backlog("RM-418")
+def test_setting_for_a_query_the_server_does_not_shape(
+    rust_mongo: Any,
+    mongod_rs: Any,  # noqa: F811
+) -> None:
+    """A setting for a query whose shape `query_shape.rs` does not compute
+    (a `$jsonSchema` filter) is kept, as on mongod."""
+    assert _unshaped_setting(rust_mongo) == _unshaped_setting(mongod_rs)
 
 
 def _oplog_storage_stats(client: Any) -> tuple:

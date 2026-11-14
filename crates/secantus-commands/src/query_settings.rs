@@ -27,8 +27,7 @@
 //!   and under `"sbe"` (`trySbeEngine`) a `find` SBE compiles runs there.
 //!
 //! Not yet: under `"sbe"` an `aggregate` and a `distinct` are pushed down
-//! as without the setting, `showDebugQueryShape` gives no
-//! `debugQueryShape`, and a write made to `config.clusterParameters`
+//! as without the setting, and a write made to `config.clusterParameters`
 //! directly is read only by the next server start (RM-418).
 
 use std::cell::RefCell;
@@ -710,14 +709,32 @@ pub(crate) fn validate_stage(spec: Option<&Bson>) -> Result<bool, CommandError> 
     Ok(show)
 }
 
-/// `$querySettings`'s documents: every setting. `showDebugQueryShape` is
-/// parsed but its `debugQueryShape` is not given (RM-418).
+/// `$querySettings`'s documents: every setting. Under
+/// `showDebugQueryShape` each one with a `representativeQuery` also
+/// carries its `debugQueryShape`: the query's shape with each literal a
+/// debug type string (`document_source_query_settings.cpp`).
 pub(crate) fn stage_rows(
     storage: &dyn crate::storage::Storage,
     spec: Option<&Bson>,
 ) -> Result<Vec<Document>, CommandError> {
-    validate_stage(spec)?;
-    Ok(entries_of(stored(storage)?.as_ref()))
+    let show = validate_stage(spec)?;
+    let mut rows = entries_of(stored(storage)?.as_ref());
+    if show {
+        for row in &mut rows {
+            if let Some(shape) = debug_query_shape(row) {
+                row.insert("debugQueryShape", shape);
+            }
+        }
+    }
+    Ok(rows)
+}
+
+/// The debug shape of a setting's `representativeQuery`, run against its
+/// `$db`.
+fn debug_query_shape(entry: &Document) -> Option<Document> {
+    let query = entry.get_document("representativeQuery").ok()?;
+    let db = query.get_str("$db").ok()?;
+    crate::query_shape::debug_shape(db, query)
 }
 
 // ------------------------------------------- the settings a read runs under --
