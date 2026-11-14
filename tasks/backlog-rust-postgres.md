@@ -3468,6 +3468,42 @@ tests are scenarios in `tests/backlog/test_rp_batch26.py`.
       Backlog-ID: RP-049
       Verify: none -- internal code structure; no answer differs from PostgreSQL
 
+## Found while working RP-619 (2026-11-14)
+
+Measured on a private PostgreSQL 15.19 cluster.
+
+- [ ] **A syntax error in a PL/pgSQL expression is placed at the end of
+      the statement, not in the body.** `check_sql_expr` parses each
+      expression as the compiler reads it, and the error is placed at the
+      expression's token, transposed into the statement: on PostgreSQL
+      15.19 `create function e619() returns int language plpgsql as $$
+      begin return 1 +; end $$` is `syntax error at end of input` at 75,
+      with `declare x int := 1 +;` at 79, and `do $$ declare x int := 1 +;
+      begin null; end $$` at 27. Here they are at 83, 103 and 47. And `do
+      $$ begin perform 1 +; end $$` is the same error at 24 there, found at
+      compile; here it is at 32, found when the PERFORM runs (CONTEXT
+      `PL/pgSQL function inline_code_block line 1 at PERFORM`). RP-621 is
+      the compile errors with no position, RP-492 a DO's grammar errors.
+      Verify: tests/backlog/test_rp_found_rp619.py::test_expression_syntax_error_is_placed_in_the_body
+      Backlog-ID: RP-958
+- [ ] **A DO block refuses PL/pgSQL's `#` compile options.**
+      `plpgsql_compile_inline` reads a DO body with the function grammar,
+      so `do $$ #variable_conflict use_column\n begin null; end $$` and
+      `#print_strict_params on` before a DECLARE run on PostgreSQL 15.19.
+      Here both are 42601 `syntax error at or near "#"` at 7 (`pl::parse`
+      refuses the `#` before the body reaches the interpreter).
+      Verify: tests/backlog/test_rp_found_rp619.py::test_do_block_takes_compile_options
+      Backlog-ID: RP-959
+- [ ] **A RETURN with a value in a routine returning void is accepted.**
+      `make_return_stmt` refuses it as it reads the RETURN, before the
+      expression is parsed: on PostgreSQL 15.19 `do $$ begin return 1; end
+      $$` is 42804 `RETURN cannot have a parameter in function returning
+      void` at 20, `return 1 +;` the same, and a `returns void` function's
+      `return 1 +;` the same at 73. Here the first runs, and the other two
+      are 42601 `syntax error at end of input` (31, 84).
+      Verify: tests/backlog/test_rp_found_rp619.py::test_return_with_a_value_in_a_void_routine
+      Backlog-ID: RP-960
+
 ## Found while working RP-573 (2026-11-08)
 
 Measured on a private PostgreSQL 15.19 cluster, each statement in a new
@@ -3497,13 +3533,6 @@ keeps; what follows is what that lookup does not yet check.
       is created.
       Verify: tests/backlog/test_rp_found_rp573.py::test_declare_of_a_pseudo_type
       Backlog-ID: RP-618
-- [ ] **A DECLARE's missing type is reported after a later syntax error.**
-      PL/pgSQL compiles the body in one pass, so `declare x nosuch573; begin
-      return 1 +; end` is 42704 `type "nosuch573" does not exist` at 69 on
-      PostgreSQL 15.19. Here the whole body is parsed first, and the answer
-      is 42601 `syntax error at end of input` at 104.
-      Verify: tests/backlog/test_rp_found_rp573.py::test_declare_type_found_before_a_later_syntax_error
-      Backlog-ID: RP-619
 - [ ] **A `pg_temp` type in a session with no temporary schema is a
       missing type, not a missing schema.** `LookupExplicitNamespace`
       finds `pg_temp` only once the session has made its temp schema, so on

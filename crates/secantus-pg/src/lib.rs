@@ -14435,15 +14435,11 @@ impl PgHandler {
                     &plpgsql_create_sql(&read_back),
                     &PlHost { h: self },
                 );
-                plpgsql_fn::validate(&create_sql).map_err(|e| {
-                    PgWireError::UserError(Box::new(ErrorInfo::new(
-                        "ERROR".into(),
-                        e.sqlstate,
-                        e.message,
-                    )))
-                })?;
+                let parsed = plpgsql_fn::validate(&create_sql);
                 // `plpgsql_validator` compiles the body only under
-                // `check_function_bodies` (RP-573).
+                // `check_function_bodies` (RP-573), in one pass: a
+                // declaration's missing type is found before a later
+                // error in the body (RP-619).
                 let checks = self
                     .settings
                     .lock()
@@ -14453,6 +14449,13 @@ impl PgHandler {
                 if checks {
                     self.check_plpgsql_declarations(&def.name, &create_sql, &def.body)?;
                 }
+                parsed.map_err(|e| {
+                    PgWireError::UserError(Box::new(ErrorInfo::new(
+                        "ERROR".into(),
+                        e.sqlstate,
+                        e.message,
+                    )))
+                })?;
             }
             _ => {
                 pg_query::split_with_parser(&def.body).map_err(|e| {
@@ -14541,6 +14544,20 @@ impl PgHandler {
         create_sql: &str,
         body: &str,
     ) -> PgWireResult<()> {
+        // A body that does not parse was compiled as far as its error, its
+        // declarations up to there looked up first (RP-619).
+        let compiled;
+        let create_sql = if plpgsql_fn::validate(create_sql).is_ok() {
+            create_sql
+        } else {
+            match plpgsql_fn::compiled_declarations(create_sql) {
+                Some(stub) => {
+                    compiled = stub;
+                    &compiled
+                }
+                None => return Ok(()),
+            }
+        };
         let declared = plpgsql_fn::declared_types(create_sql);
         if declared.is_empty() {
             return Ok(());

@@ -50,7 +50,7 @@ struct Candidate {
 /// The body of a CREATE text the server builds (`plpgsql_create_sql`, a DO
 /// block's wrapper): between its dollar-quote tags. Answers its byte offset
 /// and text.
-fn body_of(create_sql: &str) -> Option<(usize, &str)> {
+pub(super) fn body_of(create_sql: &str) -> Option<(usize, &str)> {
     for tag in ["$secantus_body$", "$secantus_do$"] {
         let Some(open) = create_sql.find(tag) else {
             continue;
