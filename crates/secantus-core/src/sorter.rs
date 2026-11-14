@@ -853,6 +853,19 @@ pub fn blocking_sort(
         .collect())
 }
 
+/// [`blocking_sort`], giving each item's place in `items` in the order the
+/// sort leaves them, for a caller that sorts its own copy of the items.
+pub fn blocking_sort_order(
+    items: Vec<(Vec<Bson>, Document)>,
+    cmp: &dyn Fn(&[Bson], &[Bson]) -> Ordering,
+    sizing: &Sizing,
+) -> R<Vec<usize>> {
+    Ok(sort_items(items, cmp, sizing, None)?
+        .into_iter()
+        .map(|(_, _, pos)| pos as usize)
+        .collect())
+}
+
 /// [`blocking_sort`], each item with its place in `items`.
 fn sort_items(
     items: Vec<(Vec<Bson>, Document)>,

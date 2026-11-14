@@ -1745,21 +1745,18 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       it drops it, as mongod does. Found 2026-11-13 (RM-519).
       Verify: tests/backlog/test_rm_found_rm519.py::test_a_sort_after_a_window_on_its_key_is_dropped
       Backlog-ID: RM-639
-- [ ] **`find`, a leading `$sort` and `$setWindowFields` hand back
-      documents whose sort keys tie in the order they were read.** mongod
-      runs each through the same sorter as any other sort, and its
-      `std::sort` reorders ties: 40 documents over three values of `k`
-      sorted by `{k: 1}` come back 39, 3, 27, 9, ... from all four of
-      `find`, `[{$sort}]`, `$setWindowFields` and a `$sort` after `$project`
-      on macOS mongod 8.2.11, and libstdc++'s `std::sort` (g++ 15.2), the
-      Linux build's, gives 0, 21, 18, 24, .... Since RM-402 the sorter here
-      (`sorter::sort_held`) gives the Linux order for a `$sort` after
-      another stage, and since RM-312 so do `find` and a leading `$sort`
-      (the read's `SORT`, `explain/order.rs` and `explain/stream.rs`), on
-      macOS libc++'s since RM-526; the window stage's own sort is still
-      stable. Found 2026-11-10 working RM-402.
-      Verify: tests/backlog/test_rm_found_2026_11_10_rm402.py::test_tied_order_of_find_leading_sort_and_window
-      Backlog-ID: RM-527
+- [ ] **A `$setWindowFields` behind an `$unwind` hands back tied documents
+      in the order they were read.** mongod 8.2.11 hoists the window's
+      `$sort` ahead of an `$unwind` whose path it does not sort on, so it
+      sorts the documents the `$unwind` took, each then unwound in place:
+      `[{$unwind: "$a"}, {$setWindowFields: {sortBy: {k: 1}, ...}}]` over
+      60 documents of `a: [i % 4, 9]`, `k: i % 3` gives (0, 0), (0, 9),
+      (3, 3), (3, 9), (30, 2), ... on macOS. This server sorts nothing
+      there and keeps the order read, (6, 2) fifth. The fix sorts at the
+      `$unwind` (after the `$match`es in front, which mongod runs first),
+      held to the budget as that sort is. Found 2026-11-14 working RM-527.
+      Verify: tests/backlog/test_rm_found_rm527.py::test_window_sort_hoisted_past_unwind_orders_the_source_documents
+      Backlog-ID: RM-640
 - [ ] **A classic `$group` counts its held values' and `_id`'s memory
       unlike mongod, so it spills at other points.** Over 300 documents of a
       1000-byte string, budget 5000, mongod 8.2.11 spills a `$first` /
