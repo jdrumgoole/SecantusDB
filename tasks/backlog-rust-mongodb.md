@@ -1451,20 +1451,6 @@ about forty such points; these are the ones measured.
       Found while fixing RM-390's CI test, 2026-11-13.
       Verify: tests/backlog/test_rm_found_2026_11_13_contested_reads.py::test_a_contested_read_costs_what_it_returns
       Backlog-ID: RM-610
-- [ ] **The query stats store's default budget is 1% of the memory in
-      whole megabytes.** mongod 8.2.11 sizes `internalQueryStatsCacheSize`
-      (`1%`) from `ProcessInfo::getMemSizeBytes`, Linux's `MemTotal` kB
-      times 1024; this server from `hostinfo`'s `mem_size_mb` times 1 MiB,
-      so on Linux `metrics.queryStats.maxSizeBytes` is a few hundred bytes
-      short (CI's runner, 2026-11-14: 167583416 against mongod's
-      167584030), and the partitions' shares with it. On macOS the memory
-      is a whole number of MiB and the two agree. The fix keeps the memory
-      in bytes in `hostinfo::Host` (`hw.memsize`; `MemTotal` kB times 1024)
-      and sizes the store from that, as mongod does. Found when snapshot PR
-      #2735 went red on `tests/mongod_live/test_query_stats_store.py::
-      test_a_smaller_budget_evicts`, added by RM-532.
-      Verify: tests/backlog/test_rm_found_2026_11_14_query_stats_size.py::test_the_query_stats_budget_is_a_share_of_the_memory_in_bytes
-      Backlog-ID: RM-657
 - [ ] **A profile entry counts what it examined as int64, where mongod
       writes int32.** mongod 8.2.11's `system.profile` entry for an
       updateMany or a find holds `keysExamined` and `docsExamined` as

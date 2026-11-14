@@ -85,9 +85,10 @@ pub(crate) const DEFAULT_CACHE_SIZE: &str = "1%";
 
 /// The machine's memory (`ProcessInfo::getMemSizeBytes`).
 fn memory_bytes(host: &crate::hostinfo::Host) -> u64 {
-    // A platform that cannot say is taken as 1 GB.
-    let mb = host.mem_size_mb.unwrap_or(1024).max(0);
-    u64::try_from(mb).unwrap_or(0) * 1024 * 1024
+    // In bytes, not whole MiB: on Linux `MemTotal` is kB, and 1% of it
+    // rounded to MiB first is a few hundred bytes short (RM-657). A
+    // platform that cannot say is taken as 1 GB.
+    host.mem_size_bytes.unwrap_or(1024 * 1024 * 1024)
 }
 
 /// A size `internalQueryStatsCacheSize` names
