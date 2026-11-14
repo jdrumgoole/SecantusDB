@@ -44829,6 +44829,20 @@ impl PgHandler {
                         }
                     }
                 }
+                // With a WHERE it prices the Filter's quals too (RP-847).
+                if tree.estimate.is_none()
+                    && tree.children.is_empty()
+                    && tree.name == "Function Scan on generate_series"
+                {
+                    if let (Statement::Select(sel), Some(qual)) =
+                        (inner.as_ref(), &options.series_qual)
+                    {
+                        if let Some(series) = &sel.series {
+                            tree.estimate =
+                                Some(scan_estimate::filtered_series_scan_estimate(series, qual));
+                        }
+                    }
+                }
                 // An INSERT, UPDATE or DELETE is a ModifyTable over a
                 // Result or the relation's sequential scan (RP-331).
                 if tree.children.len() == 1

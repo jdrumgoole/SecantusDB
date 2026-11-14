@@ -8248,3 +8248,26 @@ fn a_vector_is_an_array_to_the_polymorphic_resolution() {
         Some(s(&["anycompatiblearray", "anycompatible"]))
     );
 }
+
+#[test]
+fn an_input_functions_out_of_range_error_is_at_its_literal() {
+    for (sql, message) in [
+        (
+            "select '70000'::int2",
+            "value \"70000\" is out of range for type smallint",
+        ),
+        (
+            "select '{\"1 70000\"}'::int2vector[]",
+            "value \"70000\" is out of range for type smallint",
+        ),
+    ] {
+        take_error_location();
+        assert_eq!(error_position(sql, "22003", message), Some(8), "for {sql}");
+    }
+    // Arithmetic overflow names no literal: no position.
+    take_error_location();
+    assert_eq!(
+        error_position("select 2147483647 + 1", "22003", "integer out of range"),
+        None
+    );
+}

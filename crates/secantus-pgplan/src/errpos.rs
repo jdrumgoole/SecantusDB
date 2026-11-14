@@ -105,6 +105,31 @@ fn element_literal(toks: &[Tok], value: &str) -> Option<usize> {
     hits.next().is_none().then_some(i)
 }
 
+/// The token of the literal an input function read `value` from, or `None`
+/// when no literal holds it or it reached the function as a text value.
+fn input_literal(toks: &[Tok], value: &str) -> Option<usize> {
+    let lit = format!("'{}'", value.replace('\'', "''"));
+    let i = toks
+        .iter()
+        .position(|t| t.text == lit)
+        .or_else(|| element_literal(toks, value))?;
+    // A literal cast to a string type first is a text VALUE when the
+    // target's input function reads it, at execution, where there is
+    // no position (`int8('x'::text)`, measured on 15.19).
+    let string_type = |t: &str| {
+        ["text", "varchar", "name", "bpchar"]
+            .iter()
+            .any(|k| t.eq_ignore_ascii_case(k))
+    };
+    if toks.get(i + 1).is_some_and(|t| t.text == "::")
+        && toks.get(i + 2).is_some_and(|t| string_type(t.text))
+        && !toks.get(i + 3).is_some_and(|t| t.text.starts_with('['))
+    {
+        return None;
+    }
+    Some(toks[i].start)
+}
+
 /// `ALTER TABLE | INDEX | VIEW | SEQUENCE | MATERIALIZED VIEW | FOREIGN
 /// TABLE`, whose missing relation PostgreSQL reports without a position.
 pub fn alter_finds_relation_by_name(sql: &str) -> bool {
@@ -713,26 +738,14 @@ pub fn error_position(sql: &str, sqlstate: &str, message: &str) -> Option<usize>
             // `invalid input syntax for type integer: "abc"`: the literal.
             let (_, value) = m.rsplit_once(": \"")?;
             let value = value.strip_suffix('"')?;
-            let lit = format!("'{}'", value.replace('\'', "''"));
-            let i = toks
-                .iter()
-                .position(|t| t.text == lit)
-                .or_else(|| element_literal(&toks, value))?;
-            // A literal cast to a string type first is a text VALUE when the
-            // target's input function reads it, at execution, where there is
-            // no position (`int8('x'::text)`, measured on 15.19).
-            let string_type = |t: &str| {
-                ["text", "varchar", "name", "bpchar"]
-                    .iter()
-                    .any(|k| t.eq_ignore_ascii_case(k))
-            };
-            if toks.get(i + 1).is_some_and(|t| t.text == "::")
-                && toks.get(i + 2).is_some_and(|t| string_type(t.text))
-                && !toks.get(i + 3).is_some_and(|t| t.text.starts_with('['))
-            {
-                return None;
-            }
-            pos(toks[i].start)
+            input_literal(&toks, value).and_then(pos)
+        }
+        // An input function's `value "70000" is out of range for type
+        // smallint`: at the literal, as its 22P02 is.
+        "22003" => {
+            let rest = m.strip_prefix("value \"")?;
+            let (value, _) = rest.rsplit_once("\" is out of range for type ")?;
+            input_literal(&toks, value).and_then(pos)
         }
         // `regoperator`'s own refusals of its input: at the literal.
         "42P02" | "54023" if matches!(m, "missing argument" | "too many arguments") => {

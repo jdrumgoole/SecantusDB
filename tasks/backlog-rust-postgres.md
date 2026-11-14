@@ -1851,7 +1851,17 @@ a regression test.
       e.b, e2.a, e2.b` on a Nested Loop, its Materialize's and Memoize's
       likewise), and an inner index scan's `Index Cond` is qualified
       (`(k.a > r.a)`). Measured on a private 15.19 cluster (found while
-      working RP-916).
+      working RP-916). Where to build it (read while working RP-840 and
+      RP-847, 2026-11-14): `ExplainOptions.verbose` is parsed and then
+      read by nothing; the plan's text is fixed up after `plan_tree` by
+      the `explain::attach_*` passes `secantus-pg/src/lib.rs` runs on the
+      tree (`attach_scan_quals`, `attach_sort_keys`,
+      `attach_series_scan`), each fed a deparse `plan_explain` computes
+      from the parse tree into `ExplainOptions`. The quals are printed by
+      ruleutils' `Printer` with `unqualified = true`; VERBOSE wants it
+      `false` (`k.a`), and each node's `Output` its targetlist deparsed
+      the same way -- for every node kind, which is why a scans-only
+      slice was not taken.
       Verify: tests/backlog/test_rp_explain_costs.py::test_plan[explain verbose prints a scan's output list]
       Backlog-ID: RP-925
 - [ ] **A binary-coercible cast is kept in a plan, and its scan is not
@@ -4128,23 +4138,6 @@ its first input gave.
       Verify: tests/backlog/test_rp_found_rp692.py::test_an_intersect_over_a_join_puts_the_smaller_input_first
       Backlog-ID: RP-841
 
-## Found while working RP-703 (2026-11-10)
-
-Measured on PostgreSQL 15.19 (the shared reference on port 5415): every
-statement is a FROM function and runs there as written.
-
-- [ ] **EXPLAIN of a filtered `generate_series` in FROM is not priced.**
-      `explain select 1 from generate_series(1, 2) f(x) where x > 1` is
-      `Function Scan on generate_series f  (cost=0.00..0.03 rows=1
-      width=4)` on PostgreSQL 15.19 (`cost_functionscan`: the series' rows
-      times the default 1/3 inequality selectivity, the Filter's quals per
-      row), and with `x + 1 > 0` over ten rows `cost=0.00..0.15 rows=3`.
-      Here a series scan with a WHERE prints `rows=0 width=0`. Its alias
-      and `Filter:` line print as PostgreSQL's since RP-847's first slice;
-      an unfiltered scan's estimate was already right.
-      Verify: tests/backlog/test_rp_found_rp703.py::test_a_filtered_series_scan_is_priced
-      Backlog-ID: RP-847
-
 ## Found while working RP-727 (2026-11-10)
 
 Measured on PostgreSQL 15.19 (the shared reference on port 5415): every
@@ -4279,15 +4272,6 @@ statement is VALUES-only and runs there as written. The gap tests are in
 Measured on PostgreSQL 15.19; none of it needs DDL. The gap tests are in
 `tests/backlog/test_rp_found_rp605.py`.
 
-- [ ] **A literal's out-of-range input error has no position.**
-      `select '70000'::int2` is 22003 `value "70000" is out of range for
-      type smallint` at 8 on PostgreSQL 15.19, and so is every 22003 an
-      input function raises for a constant (`'99999999999'::int4`,
-      `'70000 1'::int2vector`, an array element); here the 22003 has no
-      position. `errpos.rs` places a 22P02 at the literal it quotes but has
-      no 22003 arm.
-      Verify: tests/backlog/test_rp_found_rp605.py::test_out_of_range_literal_has_a_position
-      Backlog-ID: RP-866
 - [ ] **An escape-string literal's input error has no position when an
       escape is in its value.** `select E'a\tb'::int4` is 22P02 at 8 on
       PostgreSQL 15.19; here it has none, `errpos.rs` matching the quoted
