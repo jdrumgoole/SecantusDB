@@ -2792,6 +2792,19 @@ Measured on a private PostgreSQL 15.19 cluster with the `_SETUP` in
       and an indexed `=` would separate them too. The faithful fix keeps
       the value as written and keys it by `bpchar`'s comparison (trailing
       blanks ignored), which reaches the storage keys: more than one PR.
+      Surveyed 2026-11-14 (no code changed): a sized `char(n)` stored
+      trimmed and padded on output is already PostgreSQL's answer, so only
+      the unsized column needs the as-written value. The trimmed form is
+      assumed at many sites that each need a `bpchar`-aware key instead:
+      `join_text_hash` (secantus-pg lib.rs), `coerce_to_column`'s
+      `bpchar[]` arm and `arrays.rs` equality, `hashpart.rs`,
+      `hashfn.rs` `hashbpchar`, `cmpfn.rs` `bpcharcmp`, and the sort-key
+      paths in lib.rs that trim before comparing. UNIQUE could reuse
+      `value_unique` / `check_collated_unique` (already used for jsonb and
+      nondeterministic collations); a PRIMARY KEY is `_id`, so it needs a
+      trimmed key with the as-written value kept in the row. Plan: (1)
+      keep blanks for unsized `bpchar` on write, plus UNIQUE through
+      `value_unique`; (2) a PK key; (3) GROUP BY / DISTINCT / indexed `=`.
       Verify: tests/backlog/test_rp_found_rp672.py::test_create_table_as_of_an_unsized_bpchar_keeps_its_blanks
       Backlog-ID: RP-693
 
