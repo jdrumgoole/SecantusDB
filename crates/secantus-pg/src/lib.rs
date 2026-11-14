@@ -4449,6 +4449,12 @@ pub struct PgHandler {
     /// rows stream is drained, and re-encodes them in the FETCH's format. `None`
     /// except during a DECLARE, so a plain SELECT pays only a cheap flag check.
     cursor_capture: std::sync::Arc<Mutex<Option<CapturedRows>>>,
+    /// Set while a cursor's query runs (`portal_stream::start_pending`):
+    /// its row stream is pulled where the executor's hooks are installed,
+    /// so a select-list column that runs through them (a user function, a
+    /// sequence function, a correlated subquery) is left to the stream and
+    /// computed for the rows a FETCH reaches (RP-895).
+    cursor_run: AtomicBool,
     /// Armed with `cursor_capture` by a DECLARE over a simply updatable
     /// scan: each output row's stored `_id`, for `WHERE CURRENT OF`.
     cursor_ids: std::sync::Arc<Mutex<Option<Vec<Bson>>>>,
@@ -5090,6 +5096,7 @@ impl PgHandler {
             stat_ended: AtomicBool::new(false),
             stat_abandoned: AtomicBool::new(false),
             cursor_capture: std::sync::Arc::new(Mutex::new(None)),
+            cursor_run: AtomicBool::new(false),
             cursor_ids: std::sync::Arc::new(Mutex::new(None)),
             session_serial: {
                 static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
@@ -33533,7 +33540,7 @@ impl PgHandler {
         secantus_pgplan::cancel::with_cancel_hook(&cancel, f)
     }
 
-    fn with_executor_hooks<R>(&self, f: impl FnOnce() -> R) -> R {
+    pub(crate) fn with_executor_hooks<R>(&self, f: impl FnOnce() -> R) -> R {
         let hook = |name: &str, args: &[Bson]| -> std::result::Result<Bson, PlanError> {
             // `nextval` / `setval` write the sequence, so a READ ONLY
             // transaction refuses them as it would an INSERT.
@@ -40715,11 +40722,14 @@ impl PgHandler {
         // A column holding a CORRELATED subquery is evaluated now, while the
         // runner that plans and runs it is installed; the stream below runs
         // after this returns. Its value rides the row under a synthetic key.
+        // A cursor's stream is pulled with the runner installed, and leaves
+        // it to the rows a FETCH reaches (RP-895).
         let mut docs = docs;
-        if casts
-            .iter()
-            .flatten()
-            .any(secantus_pgplan::correlated::has_correlated)
+        if !self.cursor_run.load(std::sync::atomic::Ordering::Relaxed)
+            && casts
+                .iter()
+                .flatten()
+                .any(secantus_pgplan::correlated::has_correlated)
         {
             self.correlated_scope(|| -> PgWireResult<()> {
                 for (i, cast) in casts.iter_mut().enumerate() {

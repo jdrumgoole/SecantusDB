@@ -2,7 +2,12 @@
 computed every row's select list at the DECLARE):
 
 - a user function call, a `nextval` or a scalar subquery in a cursor's
-  select list is still computed for every row at the DECLARE;
+  select list was still computed for every row at the DECLARE (fixed,
+  RP-895);
+- a row a cursor reads again (a backward FETCH, a WITH HOLD cursor
+  persisted at COMMIT) is not computed again, where PostgreSQL recomputes
+  a volatile column;
+- `select * from cursor_to_xml(...)` reads the cursor twice;
 - a cursor over a set operation computes its rows at the DECLARE;
 - a cursor's WHERE and Sort ran at the DECLARE, where PostgreSQL runs
   them at the first FETCH (fixed, RP-897), and its WHERE is still
@@ -47,13 +52,13 @@ def _steps(dsn: str, steps: list[str]) -> list[object]:
     return out
 
 
-@pytest.mark.backlog("RP-895")
+@pytest.mark.backlog_fixed("RP-895")
 def test_a_cursor_computes_a_function_call_as_it_is_fetched(dsn: str) -> None:
     """PostgreSQL 15.19 computes a user function call, a `nextval` and a
     scalar subquery in a cursor's select list for the rows a FETCH reaches:
     `fetch 1` answers the first row, and draws the sequence once. Here they
-    are computed for every row at the DECLARE, which raises the second
-    row's error and draws the sequence three times."""
+    were computed for every row at the DECLARE, which raised the second
+    row's error and drew the sequence three times."""
     n = uuid.uuid4().hex[:8]
     with psycopg.connect(dsn, autocommit=True) as c:
         c.execute(
@@ -93,6 +98,126 @@ def test_a_cursor_computes_a_function_call_as_it_is_fetched(dsn: str) -> None:
         ["BEGIN", "DECLARE CURSOR", [(1,)], "ROLLBACK"],
         ["BEGIN", "DECLARE CURSOR", [(1,)], [(1,)], "ROLLBACK"],
         ["BEGIN", "DECLARE CURSOR", [(1,)], "ROLLBACK"],
+    ]
+
+
+@pytest.mark.backlog_fixed("RP-895")
+def test_a_cursors_function_reads_the_snapshot_its_volatility_gives(dsn: str) -> None:
+    """A function in a cursor's select list runs at the FETCH that reaches
+    its row. PostgreSQL 15.19 runs a STABLE one in the portal's snapshot,
+    the DECLARE's, so a row the block inserts after the DECLARE is not
+    counted; a VOLATILE one takes a snapshot per statement and counts it.
+    A cursor closed unread draws no sequence value. Measured on a private
+    PostgreSQL 15.19 cluster."""
+    n = uuid.uuid4().hex[:8]
+    t, s = f"rp895_t_{n}", f"rp895_s_{n}"
+    with psycopg.connect(dsn, autocommit=True) as c:
+        c.execute(f"create table {t} (k int)")
+        c.execute(f"create sequence {s}")
+        for vol in ("volatile", "stable"):
+            c.execute(
+                f"create function rp895_{vol}_{n}(int) returns bigint language sql {vol}"
+                f" as 'select count(*) from {t}'"
+            )
+
+    def counted(vol: str) -> list[object]:
+        return _steps(
+            dsn,
+            [
+                "begin",
+                f"declare c cursor for select rp895_{vol}_{n}(k) from (values (1), (2)) s(k)",
+                "fetch 1 from c",
+                f"insert into {t} values (1)",
+                "fetch 1 from c",
+                "rollback",
+            ],
+        )
+
+    assert [
+        counted("volatile"),
+        counted("stable"),
+        _steps(
+            dsn,
+            [
+                "begin",
+                f"declare c cursor for select nextval('{s}') from generate_series(1, 3)",
+                "close c",
+                f"select nextval('{s}')",
+                "rollback",
+            ],
+        ),
+    ] == [
+        ["BEGIN", "DECLARE CURSOR", [(0,)], "INSERT 0 1", [(1,)], "ROLLBACK"],
+        ["BEGIN", "DECLARE CURSOR", [(0,)], "INSERT 0 1", [(0,)], "ROLLBACK"],
+        ["BEGIN", "DECLARE CURSOR", "CLOSE CURSOR", [(1,)], "ROLLBACK"],
+    ]
+
+
+@pytest.mark.backlog("RP-962")
+def test_a_cursor_recomputes_a_volatile_column_when_it_reads_a_row_again(dsn: str) -> None:
+    """PostgreSQL 15.19 reads a row again by running the plan again: a
+    backward FETCH, or a WITH HOLD cursor persisted at COMMIT
+    (`PersistHoldablePortal` rewinds and runs the query whole), computes
+    a `nextval` in the select list again. Here the rows computed once are
+    kept and read back. Measured on a private PostgreSQL 15.19 cluster."""
+    n = uuid.uuid4().hex[:8]
+    with psycopg.connect(dsn, autocommit=True) as c:
+        c.execute(f"create sequence rp_reread_a_{n}")
+        c.execute(f"create sequence rp_reread_b_{n}")
+    assert [
+        _steps(
+            dsn,
+            [
+                "begin",
+                f"declare c scroll cursor for select nextval('rp_reread_a_{n}')"
+                " from generate_series(1, 4)",
+                "fetch 2 from c",
+                "fetch backward 1 from c",
+                "fetch first from c",
+                "fetch 2 from c",
+                "rollback",
+            ],
+        ),
+        _steps(
+            dsn,
+            [
+                "begin",
+                f"declare c cursor with hold for select nextval('rp_reread_b_{n}')"
+                " from generate_series(1, 3)",
+                "fetch 1 from c",
+                "commit",
+                f"select currval('rp_reread_b_{n}')",
+                "fetch all from c",
+                "close c",
+            ],
+        ),
+    ] == [
+        ["BEGIN", "DECLARE CURSOR", [(1,), (2,)], [(3,)], [(4,)], [(5,), (6,)], "ROLLBACK"],
+        ["BEGIN", "DECLARE CURSOR", [(1,)], "COMMIT", [(4,)], [(3,), (4,)], "CLOSE CURSOR"],
+    ]
+
+
+@pytest.mark.backlog("RP-963")
+def test_cursor_to_xml_in_from_reads_the_cursor_once(dsn: str) -> None:
+    """`select * from cursor_to_xml('c', 1, ...)` reads one row of the
+    cursor on PostgreSQL 15.19, as the call in a select list does. Here the
+    call in FROM reads the cursor twice: it answers the second row, and the
+    FETCH after it the third. Measured on the shared reference."""
+    assert _steps(
+        dsn,
+        [
+            "begin",
+            "declare c cursor for select g from generate_series(1, 4) g",
+            "select * from cursor_to_xml('c', 1, false, true, '')",
+            "fetch 1 from c",
+            "rollback",
+        ],
+    ) == [
+        "BEGIN",
+        "DECLARE CURSOR",
+        [('<row xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">\n  <g>1</g>\n</row>\n\n',)],
+        [(2,)],
+        "ROLLBACK",
     ]
 
 

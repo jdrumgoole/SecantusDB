@@ -1146,6 +1146,10 @@ pub(crate) enum PendingRows {
         /// The DECLARE armed the typed capture (`cursor_capture`) for its
         /// rows: each pull arms it again, around the rows it computes.
         capture_typed: bool,
+        /// The select list left to the stream reads the database in the
+        /// DECLARE's snapshot (`correlated::reads_portal_snapshot`): the
+        /// rest is computed before another statement moves it.
+        reads: bool,
     },
     /// The run failed when another statement of the block made it run
     /// before it moved the snapshot (`drain_block_scans`): the first FETCH
@@ -1161,6 +1165,7 @@ impl PendingRows {
         Self::Running {
             rows,
             capture_typed,
+            reads: false,
         }
     }
 
@@ -1173,6 +1178,22 @@ impl PendingRows {
 
     fn is_unstarted(&self) -> bool {
         matches!(self, Self::Unstarted { .. })
+    }
+}
+
+/// Does `stmt`'s select list, left to its row stream when it runs as a
+/// cursor's query, read the database (`correlated::reads_portal_snapshot`)?
+fn reads_portal_snapshot(stmt: &Statement) -> bool {
+    match stmt {
+        Statement::Select(sel) => sel
+            .casts
+            .iter()
+            .flatten()
+            .any(secantus_pgplan::correlated::reads_portal_snapshot),
+        Statement::SetOp(set) => {
+            reads_portal_snapshot(&set.left) || reads_portal_snapshot(&set.right)
+        }
+        _ => false,
     }
 }
 
@@ -1288,6 +1309,7 @@ impl PgHandler {
     /// portal's plan, leaving its row stream unpolled. A failed run is the
     /// error.
     fn start_pending(&self, query: Statement, capture_typed: bool) -> Pulled {
+        let reads = reads_portal_snapshot(&query);
         // The rows are encoded in text, as the DECLARE's were, and the run
         // is a cursor's own, never a streamed portal's.
         let binary = self
@@ -1302,7 +1324,12 @@ impl PgHandler {
                 .unwrap_or_else(|e| e.into_inner())
                 .replace(Vec::new())
         });
+        let ran = self
+            .cursor_run
+            .swap(true, std::sync::atomic::Ordering::Relaxed);
         let out = self.in_open_transaction(|| self.execute(query, 0));
+        self.cursor_run
+            .store(ran, std::sync::atomic::Ordering::Relaxed);
         // What the run captured already: rows its executor computed whole.
         let computed = previous.and_then(|previous| {
             std::mem::replace(
@@ -1348,7 +1375,11 @@ impl PgHandler {
                 rows: Vec::new(),
                 captured: capture_typed.then(Vec::new),
                 schema: Some(schema),
-                rest: Some(PendingRows::new(q.data_rows, capture_typed)),
+                rest: Some(PendingRows::Running {
+                    rows: q.data_rows,
+                    capture_typed,
+                    reads,
+                }),
                 failure: None,
             },
         }
@@ -1357,7 +1388,7 @@ impl PgHandler {
     /// Pull up to `wanted` rows from `pending`, starting its run first when
     /// it has not started.
     fn pull_rows(&self, pending: PendingRows, wanted: usize) -> Pulled {
-        let (mut rows, capture_typed, schema) = match pending {
+        let (mut rows, capture_typed, reads, schema) = match pending {
             PendingRows::Failed(e) => {
                 return Pulled {
                     rows: Vec::new(),
@@ -1375,16 +1406,18 @@ impl PgHandler {
                 let Some(PendingRows::Running {
                     rows,
                     capture_typed,
+                    reads,
                 }) = started.rest
                 else {
                     return started;
                 };
-                (rows, capture_typed, started.schema)
+                (rows, capture_typed, reads, started.schema)
             }
             PendingRows::Running {
                 rows,
                 capture_typed,
-            } => (rows, capture_typed, None),
+                reads,
+            } => (rows, capture_typed, reads, None),
         };
         // The rows' values are captured as the stream computes them, into
         // the buffer the DECLARE armed; put back whatever it held.
@@ -1397,22 +1430,33 @@ impl PgHandler {
         let mut out = Vec::new();
         let mut ended = false;
         let mut failure = None;
-        while out.len() < wanted {
-            if let Err(e) = self.check_cancel() {
-                failure = Some(e);
-                break;
-            }
-            match futures::executor::block_on(rows.next()) {
-                Some(Ok(row)) => out.push(row),
-                Some(Err(e)) => {
-                    failure = Some(e);
-                    break;
+        // In the block's transaction, with the executor's hooks: a row's
+        // select list may call a function, draw a sequence or run a
+        // correlated subquery (RP-895).
+        let pulled = self.in_open_transaction(|| {
+            self.with_executor_hooks(|| {
+                while out.len() < wanted {
+                    if let Err(e) = self.check_cancel() {
+                        failure = Some(e);
+                        break;
+                    }
+                    match futures::executor::block_on(rows.next()) {
+                        Some(Ok(row)) => out.push(row),
+                        Some(Err(e)) => {
+                            failure = Some(e);
+                            break;
+                        }
+                        None => {
+                            ended = true;
+                            break;
+                        }
+                    }
                 }
-                None => {
-                    ended = true;
-                    break;
-                }
-            }
+            });
+            Ok(())
+        });
+        if let Err(e) = pulled {
+            failure.get_or_insert(e);
         }
         let captured = previous.and_then(|previous| {
             std::mem::replace(
@@ -1426,6 +1470,7 @@ impl PgHandler {
         let rest = (!ended && failure.is_none()).then_some(PendingRows::Running {
             rows,
             capture_typed,
+            reads,
         });
         Pulled {
             rows: out,
@@ -1450,7 +1495,37 @@ impl PgHandler {
             .filter(|(_, c)| c.pending.as_ref().is_some_and(PendingRows::is_unstarted))
             .map(|(name, _)| name.clone())
             .collect();
-        for name in names {
+        for name in &names {
+            self.start_one_deferred(name);
+        }
+        // A select list that reads the database computes its rest now, in
+        // the snapshot it would have read at each FETCH; an error is kept
+        // for the FETCH that reaches it.
+        let reading: Vec<String> = self
+            .cursors
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .filter(|(_, c)| matches!(c.pending, Some(PendingRows::Running { reads: true, .. })))
+            .map(|(name, _)| name.clone())
+            .collect();
+        for name in reading {
+            if let Err(e) = self.pull_pending(&name, None) {
+                if let Some(c) = self
+                    .cursors
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .get_mut(&name)
+                {
+                    c.pending = Some(PendingRows::Failed(e));
+                }
+            }
+        }
+    }
+
+    /// Run cursor `name`'s query, not run yet, leaving its rows unpolled.
+    fn start_one_deferred(&self, name: &str) {
+        {
             let Some(PendingRows::Unstarted {
                 query,
                 capture_typed,
@@ -1458,15 +1533,15 @@ impl PgHandler {
                 .cursors
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
-                .get_mut(&name)
+                .get_mut(name)
                 .and_then(|c| c.pending.take())
             else {
-                continue;
+                return;
             };
             let started = self.start_pending(*query, capture_typed);
             let mut cursors = self.cursors.lock().unwrap_or_else(|e| e.into_inner());
-            let Some(cursor) = cursors.get_mut(&name) else {
-                continue;
+            let Some(cursor) = cursors.get_mut(name) else {
+                return;
             };
             if let Some(schema) = started.schema {
                 cursor.schema = schema;

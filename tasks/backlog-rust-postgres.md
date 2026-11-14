@@ -3680,16 +3680,32 @@ Since RP-744 a cursor computes a plain select list as it is fetched
 (`portal_stream::PendingRows`); these are the shapes that still run whole
 at the DECLARE, and the cursor answers that differ either way.
 
-- [ ] **A cursor computes a function call, a `nextval` or a scalar
-      subquery in its select list at the DECLARE.** The executor computes
-      these before the row stream (they need the statement's hooks), so
-      `declare c cursor for select f(k) from (values (2), (1)) s(k)`, with
-      `f` raising for `k = 1`, raises at the DECLARE where PostgreSQL 15.19
-      answers `fetch 1` with the first row; `select nextval('s') from
-      generate_series(1, 3)` draws three values for a `fetch 1` (`currval`
-      is 3, PostgreSQL's 1); `select (select 1/(k - 1)) ...` raises too.
-      Verify: tests/backlog/test_rp_found_rp744.py::test_a_cursor_computes_a_function_call_as_it_is_fetched
-      Backlog-ID: RP-895
+- [ ] **A cursor reads a row again without computing it again.** Since
+      RP-744 the rows a cursor has computed are kept and read back, so a
+      `nextval` in its select list is drawn once per row. PostgreSQL 15.19
+      reads a row again by running the plan again: on a SCROLL cursor
+      over `select nextval('s') from generate_series(1, 4)`, `fetch 2`,
+      `fetch backward 1`, `fetch first` and `fetch 2` answer 1 2, 3, 4,
+      5 6, where this server answers 1 2, 1, 1, 2 3. A WITH HOLD cursor
+      is persisted at COMMIT by rewinding and running the query whole
+      (`PersistHoldablePortal`): after `fetch 1` and COMMIT, `currval` is
+      4 and `fetch all` answers 3 4 (here 3, and 2 3). Needs the
+      re-read to re-run the plan for a volatile select list, as
+      `ExecutorRewind` and a backward scan do. Found while working RP-895
+      (2026-11-14).
+      Verify: tests/backlog/test_rp_found_rp744.py::test_a_cursor_recomputes_a_volatile_column_when_it_reads_a_row_again
+      Backlog-ID: RP-962
+- [ ] **`select * from cursor_to_xml(...)` reads the cursor twice.** The
+      call in FROM fetches `count` rows twice: on a cursor over
+      `generate_series(1, 4)`, `select * from cursor_to_xml('c', 1, false,
+      true, '')` answers row 2 and the FETCH after it row 3, where
+      PostgreSQL 15.19 answers row 1 and then row 2, as `select
+      cursor_to_xml(...)` does here. A function in FROM looks to be run
+      once more than it is called (when planned and when run); a call
+      with a side effect is the case that shows it. Found while working
+      RP-895 (2026-11-14).
+      Verify: tests/backlog/test_rp_found_rp744.py::test_cursor_to_xml_in_from_reads_the_cursor_once
+      Backlog-ID: RP-963
 - [ ] **A cursor over a set operation computes its rows at the DECLARE.**
       `declare c cursor for select 1/(k - 1) from (values (2), (1)) s(k)
       union all select 5` raises 22012 at the DECLARE; PostgreSQL 15.19's
