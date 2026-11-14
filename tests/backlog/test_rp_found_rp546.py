@@ -303,19 +303,25 @@ def test_drop_function_of_two_prefix_operators(dsn: str) -> None:
 
 # A table's row type is the table's (an internal dependency): DROP TYPE of
 # it is `cannot drop type r562 because table r562 requires it`, whatever
-# else names the type. Here a routine over it makes the answer the
-# routines' 2BP01 instead (with no routine it already matches).
-@pytest.mark.backlog("RP-562")
+# else names the type, under CASCADE too, and nothing is dropped. A
+# routine over it made the answer the routines' 2BP01 instead (with no
+# routine it already matched), and CASCADE dropped the routine.
+@pytest.mark.backlog_fixed("RP-562")
 def test_drop_type_of_a_row_type_with_a_routine(dsn: str) -> None:
+    refused = ("2BP01", "cannot drop type r562 because table r562 requires it", None)
     with psycopg.connect(dsn, autocommit=True) as c:
         c.execute("drop table if exists r562 cascade")
         c.execute("create table r562 (a int)")
         c.execute("create function r562f(r562) returns int language sql as $$ select 1 $$")
         try:
-            got = _run(c, "drop type r562")
+            got = [_run(c, "drop type r562"), _run(c, "drop type r562 cascade")]
+            c.execute("create cast (r562 as int) with function r562f(r562)")
+            got += [_run(c, "drop type r562"), _run(c, "drop type if exists r562 cascade")]
+            left = _run(c, "select proname from pg_proc where proname = 'r562f'")
         finally:
             c.execute("drop table if exists r562 cascade")
-    assert got == ("2BP01", "cannot drop type r562 because table r562 requires it", None)
+    assert got == [refused] * 4
+    assert left == [("r562f",)]
 
 
 # `getObjectDescription` names a routine by `format_procedure`, its argument

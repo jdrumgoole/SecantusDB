@@ -2707,13 +2707,6 @@ and `fs(a int, c text)`.
 Measured on a private, freshly initdb'd PostgreSQL 15.19 cluster. The gap
 tests are in `tests/backlog/test_rp_found_rp546.py`.
 
-- [ ] **DROP TYPE of a table's row type with a routine over it names the
-      routines.** PostgreSQL 15.19 answers `drop type r562` with 2BP01
-      `cannot drop type r562 because table r562 requires it` whatever else
-      names the type; here a routine over it makes the answer that routine's
-      `other objects depend on it`. With no routine it already matches.
-      Backlog-ID: RP-562
-      Verify: tests/backlog/test_rp_found_rp546.py::test_drop_type_of_a_row_type_with_a_routine
 - [ ] **A `regprocedure` prints its name unquoted and a schema's type
       quoted whole.** `regprocedureout` is `format_procedure`: `"Q
       f567"(s567.t)` and `s567.h(s567.t)` on PostgreSQL 15.19. Here they are

@@ -43961,6 +43961,21 @@ impl PgHandler {
                             ),
                         ))));
                     }
+                    // A table's row type goes with the table, not on its own
+                    // (measured on 16). `findDependentObjects` reads the
+                    // type's own INTERNAL dependency on the table before any
+                    // dependent of it, so this is the answer whatever
+                    // routine or cast names the type, under CASCADE too
+                    // (RP-562, measured on 15.19).
+                    if self.row_type_of_table(name)? {
+                        let mut info = ErrorInfo::new(
+                            "ERROR".into(),
+                            "2BP01".into(), // dependent_objects_still_exist
+                            format!("cannot drop type {name} because table {name} requires it"),
+                        );
+                        info.hint = Some(format!("You can drop table {name} instead."));
+                        return Err(PgWireError::UserError(Box::new(info)));
+                    }
                     // Functions whose signature names it, and casts naming
                     // it, depend on any other kind of type. (A base type
                     // tracks its I/O functions below.)
@@ -44030,17 +44045,6 @@ impl PgHandler {
                         }
                         self.delete_type_doc(Self::BASE_TYPE_COLLECTION, name)?;
                         continue;
-                    }
-                    // A table's row type goes with the table, not on its own
-                    // (measured on 16).
-                    if self.row_type_of_table(name)? {
-                        let mut info = ErrorInfo::new(
-                            "ERROR".into(),
-                            "2BP01".into(), // dependent_objects_still_exist
-                            format!("cannot drop type {name} because table {name} requires it"),
-                        );
-                        info.hint = Some(format!("You can drop table {name} instead."));
-                        return Err(PgWireError::UserError(Box::new(info)));
                     }
                     // Columns, domains and composite fields of the type.
                     self.drop_type_value_dependents(std::slice::from_ref(name), &targets, cascade)?;
