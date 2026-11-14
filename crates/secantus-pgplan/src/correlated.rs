@@ -1474,15 +1474,15 @@ pub(crate) fn outer_field_selections(
     s: &mut pg_query::protobuf::SelectStmt,
     lookup: &dyn Fn(&str) -> Option<TableDef>,
     params: &[Bson],
-) {
+) -> Result<()> {
     if s.larg.is_some() || s.rarg.is_some() {
         for arm in [s.larg.as_deref_mut(), s.rarg.as_deref_mut()]
             .into_iter()
             .flatten()
         {
-            outer_field_selections(arm, lookup, params);
+            outer_field_selections(arm, lookup, params)?;
         }
-        return;
+        return Ok(());
     }
     let own = level_names(s);
     let ctes = VISIBLE_CTES.with(|v| v.borrow().clone());
@@ -1549,8 +1549,44 @@ pub(crate) fn outer_field_selections(
             }
         }
     }
+    // The whole row of an outer FROM function returning a base type is
+    // that value, so a field of it is 42809 at the `f` (RP-702), as
+    // `ParseFuncOrColumn` refuses column notation on a non-composite type.
+    let base_function_row = |name: &str| -> Option<String> {
+        if own.iter().any(|n| n == name) || own_columns.iter().any(|c| c == name) {
+            return None;
+        }
+        let levels = OUTER_FROM.with(|o| o.borrow().clone());
+        let item = levels
+            .iter()
+            .rev()
+            .find_map(|level| level.iter().find_map(|item| named_item(item, name)))?;
+        if !matches!(item.node.as_ref(), Some(N::RangeFunction(_))) {
+            return None;
+        }
+        let ty = outer_ref_type(&[name.to_string()], lookup, params)?;
+        let ty = crate::domains::domain_base(&ty).unwrap_or(ty);
+        let base = !ty.ends_with("[]")
+            && ty != "record"
+            && crate::user_composite(&ty).is_none()
+            && !crate::pgtypes::PSEUDO_TYPES.iter().any(|(_, n)| *n == ty)
+            && crate::pgtypes::oid_of_name(&ty).is_some();
+        base.then_some(ty)
+    };
     let mut rewrite = |n: &mut pg_query::protobuf::Node| -> Result<()> {
         if let Some((name, Some(field), at)) = selection(n) {
+            if let Some(ty) = base_function_row(&name) {
+                if at >= 0 {
+                    crate::set_error_location(at);
+                }
+                return Err(Error::Sqlstate(
+                    "42809",
+                    format!(
+                        "column notation .{field} applied to type {}, which is not a composite type",
+                        crate::display_type(&ty)
+                    ),
+                ));
+            }
             if whole_row(&name) {
                 n.node = Some(column(vec![string_node(&name), string_node(&field)], at));
             }
@@ -1566,8 +1602,9 @@ pub(crate) fn outer_field_selections(
         .chain(s.where_clause.as_deref_mut())
         .chain(s.having_clause.as_deref_mut())
     {
-        let _ = walk_expr(n, &mut rewrite);
+        walk_expr(n, &mut rewrite)?;
     }
+    Ok(())
 }
 
 /// The FROM item of one list that answers to `name`: a relation or a

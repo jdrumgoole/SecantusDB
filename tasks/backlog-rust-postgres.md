@@ -3309,16 +3309,6 @@ the column written out, so none is the star's. The gap tests are in
       subquery only.
       Verify: tests/backlog/test_rp_found_rp517.py::test_lateral_outer_columns
       Backlog-ID: RP-701
-- [ ] **A FROM function's whole row under a column alias is 42703 inside an
-      expression.** `select f + 1 from generate_series(1, 2) f(x)` answers
-      2, 3 on PostgreSQL 15.19, `coalesce(f)` and `(select f)` 1, 2 (the
-      whole row of a function returning a base type is that value), and
-      `(select (f).x)` is 42809 `column notation .x applied to type integer,
-      which is not a composite type` at 17; here each is 42703 `column "f"
-      does not exist`, though a bare `select f` answers, as does every form
-      over an unaliased `generate_series(1, 2) f`.
-      Verify: tests/backlog/test_rp_found_rp699.py::test_function_whole_row_under_a_column_alias
-      Backlog-ID: RP-702
 - [ ] **A field of an outer item's whole row in a LATERAL subquery is
       42703.** `select l.* from (values (3)) v(a), lateral (select (v).a + 0
       as k) l` answers `3` on PostgreSQL 15.19 and `lateral (select 1 as k

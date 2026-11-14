@@ -7385,15 +7385,23 @@ fn a_field_of_an_outer_whole_row_is_its_column() {
     let outer =
         parsed_select("select 1 from t, (values (1, 2)) v(a, c), generate_series(1, 2) f(x)");
     let depth = correlated::push_outer_from(&outer.from_clause);
-    let mut inner = parsed_select("select (v).a, (v).*, (f).x");
-    correlated::outer_field_selections(&mut inner, &lookup, &[]);
+    let mut inner = parsed_select("select (v).a, (v).*");
+    correlated::outer_field_selections(&mut inner, &lookup, &[]).unwrap();
     correlated::expand_outer_stars(&mut inner, &lookup);
     let mut own = parsed_select("select (v).a from (values (7)) w(v)");
-    correlated::outer_field_selections(&mut own, &lookup, &[]);
+    correlated::outer_field_selections(&mut own, &lookup, &[]).unwrap();
     let mut bound = parsed_select("select (v).a from (values (7)) v(a)");
-    correlated::outer_field_selections(&mut bound, &lookup, &[]);
+    correlated::outer_field_selections(&mut bound, &lookup, &[]).unwrap();
+    // RP-702: the function's whole row is its integer value, so a field of
+    // it is 42809.
+    let mut function = parsed_select("select (f).x");
+    let refused = correlated::outer_field_selections(&mut function, &lookup, &[]);
     correlated::pop_outer_from(depth);
-    assert_eq!(target_refs(&inner), ["v.a", "v.a", "v.c", "?"]);
+    assert!(
+        matches!(refused, Err(Error::Sqlstate("42809", ref m)) if m.contains("type integer")),
+        "{refused:?}"
+    );
+    assert_eq!(target_refs(&inner), ["v.a", "v.a", "v.c"]);
     assert_eq!(target_refs(&own), ["?"]);
     assert_eq!(target_refs(&bound), ["?"]);
 }
@@ -8403,4 +8411,28 @@ fn a_composite_records_its_attributes_declared_array_dimensions() {
         panic!("not a CREATE TYPE");
     };
     assert_eq!(ndims, vec![2, 0, 1, 0]);
+}
+
+#[test]
+fn an_aliased_scalar_functions_whole_row_is_its_value() {
+    // RP-702: `f` of `generate_series(1, 2) f(x)` is the function's value,
+    // read as its column `x`, inside an expression too.
+    for sql in [
+        "select f + 1 from generate_series(1, 2) f(x)",
+        "select coalesce(f) from generate_series(1, 2) f(x)",
+    ] {
+        let parsed = pg_query::parse(sql).unwrap();
+        let Some(N::SelectStmt(s)) = parsed.protobuf.stmts[0]
+            .stmt
+            .as_ref()
+            .and_then(|n| n.node.as_ref())
+        else {
+            panic!("not a SELECT: {sql}");
+        };
+        assert!(
+            whole_row_rewrite(s, &lookup, &[]).unwrap().is_some(),
+            "{sql}"
+        );
+        plan_select(s, &lookup, &[]).unwrap_or_else(|e| panic!("{sql}: {e:?}"));
+    }
 }

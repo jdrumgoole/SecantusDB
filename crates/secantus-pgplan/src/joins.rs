@@ -2386,7 +2386,7 @@ pub fn function_scan_rows(scan: &FunctionScan, params: &[Bson]) -> Result<Option
     Ok(Some(rows))
 }
 
-fn star_target() -> pg_query::protobuf::Node {
+pub(crate) fn star_target() -> pg_query::protobuf::Node {
     pg_query::protobuf::Node {
         node: Some(N::ResTarget(Box::new(pg_query::protobuf::ResTarget {
             val: Some(Box::new(pg_query::protobuf::Node {

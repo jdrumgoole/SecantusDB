@@ -23860,7 +23860,7 @@ fn rewrite_dml_from(
             else {
                 return Ok(());
             };
-            correlated::outer_field_selections(s, lookup, params);
+            correlated::outer_field_selections(s, lookup, params)?;
             correlated::expand_outer_stars(s, lookup);
             let depth = correlated::push_outer_from(&s.from_clause);
             let mut out = Ok(());
@@ -25767,7 +25767,7 @@ fn resolve_one_sublink(
     check_subquery_qualifiers(&inner)?;
     // A field of an outer FROM item's whole row is that item's column, and
     // its star the item's star (RP-699).
-    correlated::outer_field_selections(&mut inner, lookup, params);
+    correlated::outer_field_selections(&mut inner, lookup, params)?;
     // A star over an outer FROM item is that item's columns (RP-517).
     correlated::expand_outer_stars(&mut inner, lookup);
     if sl.sub_link_type == SubLinkType::ExistsSublink as i32 {
@@ -43214,6 +43214,30 @@ fn check_ungrouped_whole_row(
     }
 }
 
+/// Does the FROM function `rf` return one column? Planned for its output
+/// only, nothing in it called (as a subquery's names are, RP-472).
+fn function_returns_one_column(
+    rf: &pg_query::protobuf::RangeFunction,
+    lookup: &dyn Fn(&str) -> Option<TableDef>,
+    params: &[Bson],
+) -> Result<bool> {
+    let mut bare = rf.clone();
+    bare.alias = None;
+    let select = pg_query::protobuf::SelectStmt {
+        target_list: vec![joins::star_target()],
+        from_clause: vec![pg_query::protobuf::Node {
+            node: Some(N::RangeFunction(bare)),
+        }],
+        limit_option: pg_query::protobuf::LimitOption::Default as i32,
+        op: pg_query::protobuf::SetOperation::SetopNone as i32,
+        ..Default::default()
+    };
+    let def = correlated::without_calls(|| {
+        plan_select(&select, lookup, params).and_then(|stmt| sub_plan_def(&stmt, lookup))
+    })?;
+    Ok(def.columns.len() == 1)
+}
+
 /// Rewrite whole-row references over a single FROM item into `ROW(...)`
 /// of its columns, the field NAMES kept in the RowExpr's `colnames` (which
 /// is where PostgreSQL itself keeps them for a whole-row Var).
@@ -43250,9 +43274,19 @@ fn whole_row_rewrite(
             let Some(call) = joins::range_function_call(rf) else {
                 return Ok(None);
             };
-            let Some(own) = function_column_name(call) else {
+            // A function that does not name its column takes the alias's
+            // column name (`f(x)`); with no column alias, the alias names
+            // the column itself, which wins over the row.
+            let aliased_column = rf
+                .alias
+                .as_ref()
+                .filter(|a| a.colnames.len() == 1)
+                .and_then(|a| a.colnames.first())
+                .and_then(alias_colname);
+            let own = function_column_name(call);
+            if own.is_none() && aliased_column.is_none() {
                 return Ok(None);
-            };
+            }
             let Some(alias) = rf
                 .alias
                 .as_ref()
@@ -43265,12 +43299,20 @@ fn whole_row_rewrite(
             if !names_alias(s, &alias)? {
                 return Ok(None);
             }
-            let column = rf
+            // Its whole row is its one value only when it returns one
+            // column (RP-702); a row of several is not rewritten here.
+            if own.is_none() && !function_returns_one_column(rf, lookup, params)? {
+                return Ok(None);
+            }
+            let Some(column) = rf
                 .alias
                 .as_ref()
                 .and_then(|a| a.colnames.first())
                 .and_then(alias_colname)
-                .unwrap_or(own);
+                .or(own)
+            else {
+                return Ok(None);
+            };
             match func_name(call)
                 .and_then(|n| correlated::user_function_for(&n, &call.args))
                 .filter(|u| u.columns.is_empty() && user_composite(&u.return_type).is_some())

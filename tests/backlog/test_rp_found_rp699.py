@@ -42,8 +42,8 @@ def answer(dsn: str, query: str) -> Any:
 
 
 # The whole row of a function returning a base type is that value, whatever
-# its column is called; `(f).x` of it is 42809. Here each is 42703 `column
-# "f" does not exist`, though a bare `select f` answers.
+# its column is called; `(f).x` of it is 42809. Each was 42703 `column "f"
+# does not exist` (the last 0A000), though a bare `select f` answered.
 FUNCTION_WHOLE_ROW_ALIASED = {
     "select f + 1 from generate_series(1, 2) f(x)": ([(2,), (3,)], ["?column?"]),
     "select coalesce(f) from generate_series(1, 2) f(x)": ([(1,), (2,)], ["coalesce"]),
@@ -56,7 +56,7 @@ FUNCTION_WHOLE_ROW_ALIASED = {
 }
 
 
-@pytest.mark.backlog("RP-702")
+@pytest.mark.backlog_fixed("RP-702")
 @pytest.mark.parametrize("query", list(FUNCTION_WHOLE_ROW_ALIASED))
 def test_function_whole_row_under_a_column_alias(query: str, dsn: str) -> None:
     assert answer(dsn, query) == FUNCTION_WHOLE_ROW_ALIASED[query]
