@@ -2755,14 +2755,6 @@ Measured on a private PostgreSQL 15.19 cluster with `fs(a int, c text)`
 holding `(1, 'y')`, `create type ct as (x int)` and `create type ct2 as (x
 int)`. The gap tests are in `tests/backlog/test_rp_found_rp530.py`.
 
-- [ ] **An untyped literal beside a row is not read as `record`.** `select
-      fs = 'x' from fs`, `'x' = fs` and `(1,2) = 'x'` are 0A000 `input of
-      anonymous composite types is not implemented` at the literal (13, 8,
-      16) on PostgreSQL 15.19: the operator resolves to `record = record`
-      and `record_in` refuses the literal. Here each is 0A000 `comparing
-      document with string using = is not supported yet`, with no position.
-      Verify: tests/backlog/test_rp_found_rp530.py::test_untyped_literal_beside_a_row
-      Backlog-ID: RP-591
 - [ ] **An error a PREPARE's query raises carries the query's own offset.**
       PREPARE plans the deparsed inner query, so a recorded location is an
       offset into `SELECT ...`, honoured whenever a token of the PREPARE
