@@ -24,11 +24,12 @@ FILTERS: list[dict[str, Any]] = [
 ]
 
 
-@pytest.mark.backlog("RM-546")
+@pytest.mark.backlog_fixed("RM-546")
 def test_a_near_key_inside_a_value_is_an_equality(rust_mongo: Any, mongod: Any) -> None:
     """mongod 8.2.11 answers each filter as an equality (or, for `$all:
     [{$near: 1}]`, refuses it with `$all`'s own message); the Rust server
-    refuses every one with 2 "geo $near must be top-level expr"."""
+    refused every one with 2 "geo $near must be top-level expr", its check
+    finding the key inside values too."""
 
     def run(client: Any) -> list:
         coll = client.rm421f.c

@@ -34,13 +34,44 @@ fn parsed(cond: &Document) -> Result<Option<Near>, StorageError> {
     })
 }
 
-/// Whether a clause holds a `$near` anywhere under it.
+/// Whether a filter holds a `$near` where mongod reads an operator: as an
+/// operator of a field's condition, under `$not` / `$elemMatch`, or in a
+/// clause of `$and` / `$or` / `$nor`. A `$near` key inside a VALUE (the
+/// operand of `$eq`, `$ne`, `$in`, `$all`, ... or an embedded document
+/// compared by equality) is part of that value, not a `$near`.
+fn query_holds_near(filter: &Document) -> bool {
+    filter.iter().any(|(k, v)| match (k.as_str(), v) {
+        ("$and" | "$or" | "$nor", Bson::Array(clauses)) => clauses
+            .iter()
+            .any(|c| matches!(c, Bson::Document(d) if query_holds_near(d))),
+        (k, _) if k.starts_with('$') => false,
+        (_, v) => cond_holds_near(v),
+    })
+}
+
+/// Whether a field's condition holds a `$near` operator.
+fn cond_holds_near(v: &Bson) -> bool {
+    let Bson::Document(d) = v else { return false };
+    if !d.keys().next().is_some_and(|k| k.starts_with('$')) {
+        return false;
+    }
+    d.iter().any(|(k, v)| match k.as_str() {
+        "$near" | "$nearSphere" | "$geoNear" => true,
+        "$not" => cond_holds_near(v),
+        "$elemMatch" => match v {
+            Bson::Document(inner) => query_holds_near(inner) || cond_holds_near(v),
+            _ => false,
+        },
+        _ => false,
+    })
+}
+
 fn holds_near(v: &Bson) -> bool {
     match v {
-        Bson::Document(d) => d.iter().any(|(k, v)| {
-            matches!(k.as_str(), "$near" | "$nearSphere" | "$geoNear") || holds_near(v)
-        }),
-        Bson::Array(list) => list.iter().any(holds_near),
+        Bson::Document(d) => query_holds_near(d),
+        Bson::Array(list) => list
+            .iter()
+            .any(|c| matches!(c, Bson::Document(d) if query_holds_near(d))),
         _ => false,
     }
 }
@@ -70,7 +101,7 @@ fn walk(
                     near,
                     others: Vec::new(),
                 }),
-                None if holds_near(value) => {
+                None if cond_holds_near(value) => {
                     return Err(refuse(2, "geo $near must be top-level expr"));
                 }
                 None => others.push(format!("{field} {}", bson_value_repr(value))),
@@ -300,6 +331,37 @@ fn at_path(raw: &bson::RawDocument, path: &str) -> Option<Bson> {
                 at = at.as_document()?.get(part)?;
             }
             Some(at.clone())
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bson::doc;
+
+    #[test]
+    fn a_near_key_inside_a_value_is_not_a_near() {
+        for f in [
+            doc! {"a": {"$eq": {"$near": 1}}},
+            doc! {"a": {"$ne": {"$nearSphere": 1}}},
+            doc! {"a": {"x": {"$near": 1}}},
+            doc! {"a": {"$all": [{"x": {"$near": 1}}]}},
+            doc! {"a": {"$in": [{"$near": 1}]}},
+        ] {
+            assert!(!query_holds_near(&f), "{f}");
+        }
+    }
+
+    #[test]
+    fn a_near_operator_is_found_where_mongod_reads_one() {
+        for f in [
+            doc! {"a": {"$near": [0, 0]}},
+            doc! {"$or": [{"a": {"$near": [0, 0]}}]},
+            doc! {"a": {"$not": {"$near": [0, 0]}}},
+            doc! {"a": {"$elemMatch": {"b": {"$near": [0, 0]}}}},
+        ] {
+            assert!(query_holds_near(&f), "{f}");
         }
     }
 }
