@@ -817,6 +817,7 @@ fn cache_key_of(
         collation,
         distinct,
         sbe,
+        subplanner: false,
     };
     let ix = cache_key::Indexability {
         catalog: &full,
@@ -1390,6 +1391,33 @@ fn set_aside(st: &mut Stats) {
 }
 
 /// Raise each counter of `run` to what `trial` counted in the same stage.
+/// A `$cursor`'s plan, saved when the cursor is prepared and after each
+/// batch it loads, restored before each (`DocumentSourceCursor::loadBatch`).
+/// The plan here ran to its end; where the stages after the cursor stopped
+/// pulling first, mongod's stopped with them, and the run's work counts are
+/// not its: they are left out (RM-692).
+fn cursor_yields(run: &mut Stats, pulled: Option<i64>) {
+    if pulled.is_some_and(|p| p < run.n_returned) {
+        strip_work(run);
+        return;
+    }
+    let (_, loads, _) = sbe::batches(run.n_returned, None);
+    stream::yielded(
+        run,
+        stream::Yields {
+            saved: loads + 1,
+            restored: loads,
+        },
+    );
+}
+
+fn strip_work(stats: &mut Stats) {
+    stats.work = None;
+    for c in &mut stats.children {
+        strip_work(c);
+    }
+}
+
 fn at_least(run: &mut Stats, trial: &Stats) {
     run.n_returned = run.n_returned.max(trial.n_returned);
     run.keys = run.keys.max(trial.keys);
@@ -2067,6 +2095,9 @@ fn reply_for(r: &Request, verbosity: Verbosity, ctx: &mut CommandContext) -> Han
         // document after a trial that read them all).
         if let Some((_, _, trial)) = tried.first() {
             at_least(&mut run, trial);
+        }
+        if !s.rest.is_empty() {
+            cursor_yields(&mut run, cursor_pulled);
         }
         run
     });

@@ -57,6 +57,8 @@ pub(crate) struct Layout {
     pub projection_stats: u64,
     pub and_sorted_stats: u64,
     pub merge_sort_stats: u64,
+    /// `OrStats` (measured 8.2.11: an `OR` winner adds 32 bytes).
+    pub or_stats: u64,
     /// `std::string::capacity()` of a string of this length, built by copy.
     pub string_capacity: fn(usize) -> u64,
 }
@@ -81,6 +83,7 @@ pub(crate) const LIBCXX_ARM64: Layout = Layout {
     projection_stats: 24,
     and_sorted_stats: 32,
     merge_sort_stats: 40,
+    or_stats: 32,
     string_capacity: libcxx_string_capacity,
 };
 
@@ -122,6 +125,21 @@ pub(crate) struct IndexCopy {
     /// Per key field, how many path components are multikey; empty for an
     /// index without path-level multikey metadata (`_id_`).
     pub multikey: Vec<usize>,
+    /// Its position among the query's relevant indexes, the catalog's
+    /// order: `tagForSort` tags a node with its lowest-numbered index.
+    pub number: usize,
+}
+
+/// The index tags mongod's plan put on one clause of the conjunction.
+#[derive(Clone, Debug)]
+pub(crate) enum ClauseTag {
+    /// No index answers the clause: it is rechecked by a FETCH.
+    None,
+    /// The clause's predicate set the bounds of this index.
+    One(IndexCopy),
+    /// An `$or` whose every branch is one predicate that sets the bounds
+    /// of the index given for it, in the order of the branches.
+    Or(Vec<IndexCopy>),
 }
 
 /// A node of the `PlanCacheIndexTree`: the match expression's node, and the
@@ -228,6 +246,7 @@ fn stage(l: &Layout, s: &Document) -> Option<u64> {
         }
         // `failedAnd`, sized to the children.
         "AND_SORTED" => children.len() as u64 * 8 + l.and_sorted_stats,
+        "OR" => l.or_stats,
         _ => return None,
     };
     Some(size + specific + l.stage_stats)
@@ -261,17 +280,21 @@ pub(crate) fn estimate(
 /// `canonical` (its `parsedQuery`) when its plan assigned the clauses
 /// `tagged` to `index` (`QueryPlanner::cacheDataFromTaggedTree`, after
 /// `tagForSort`). `None` for an expression whose tree this does not build:
-/// an `$or` or `$nor` (an `OR` may take index tags of its own), an
-/// `$elemMatch`, a `$not` of several predicates, `$jsonSchema`.
+/// an `$or` or `$nor` that is not tagged as [`ClauseTag::Or`] (an `OR` may
+/// take an `OrPushdownTag` of its own), an `$elemMatch` with a tag, a
+/// `$not` of several predicates, `$jsonSchema`.
 pub(crate) fn tagged_tree(
     canonical: &Document,
     clauses: &[Document],
-    tagged: &std::collections::BTreeSet<usize>,
-    index: &IndexCopy,
+    tags: &[ClauseTag],
 ) -> Option<TreeNode> {
     let mut children = Vec::with_capacity(clauses.len());
     for (i, clause) in clauses.iter().enumerate() {
-        children.push(clause_node(clause, tagged.contains(&i).then_some(index))?);
+        children.push(match tags.get(i).unwrap_or(&ClauseTag::None) {
+            ClauseTag::None => clause_node(clause, None)?,
+            ClauseTag::One(ix) => clause_node(clause, Some(ix))?,
+            ClauseTag::Or(branches) => or_node(clause, branches)?,
+        });
     }
     let rooted_and = canonical.len() == 1 && canonical.contains_key("$and");
     if !rooted_and {
@@ -309,6 +332,23 @@ fn clause_node(clause: &Document, tag: Option<&IndexCopy>) -> Option<TreeNode> {
     };
     let ops: Vec<&str> = pred.keys().map(String::as_str).collect();
     match ops.as_slice() {
+        // An `ELEM_MATCH_VALUE` holds one node per operator; nothing below
+        // it carries a tag unless the plan's index read it. The object form
+        // and a `$not` inside are left out: no measured figure.
+        ["$elemMatch"] if tag.is_none() => {
+            let inner = pred.get_document("$elemMatch").ok()?;
+            let mut children = Vec::with_capacity(inner.len());
+            for (op, v) in inner {
+                if !op.starts_with('$') || op == "$not" {
+                    return None;
+                }
+                children.push(clause_node(&bson::doc! { path: { op: v.clone() } }, None)?);
+            }
+            Some(TreeNode {
+                entry: None,
+                children,
+            })
+        }
         ["$elemMatch"] => None,
         ["$not"] => {
             let one = match pred.get("$not")? {
@@ -329,11 +369,36 @@ fn clause_node(clause: &Document, tag: Option<&IndexCopy>) -> Option<TreeNode> {
     }
 }
 
+/// An `$or` whose branches are single predicates, each tagged with the
+/// index the plan read it from; the `OR` takes the lowest-numbered.
+fn or_node(clause: &Document, branches: &[IndexCopy]) -> Option<TreeNode> {
+    let list = clause.get_array("$or").ok()?;
+    if clause.len() != 1 || list.len() != branches.len() {
+        return None;
+    }
+    let mut children = Vec::with_capacity(list.len());
+    for (b, ix) in list.iter().zip(branches) {
+        let b = b.as_document()?;
+        if b.len() != 1 || b.keys().any(|k| k.starts_with('$')) {
+            return None;
+        }
+        children.push(clause_node(b, Some(ix))?);
+    }
+    Some(sort_tagged(TreeNode {
+        entry: None,
+        children,
+    }))
+}
+
 /// `tagForSort` for one internal node whose children are tagged already:
-/// it takes the tag of its lowest-numbered index. A tree here reads one
-/// index, so that is any child's.
+/// it takes the tag of its lowest-numbered index.
 fn sort_tagged(mut node: TreeNode) -> TreeNode {
-    node.entry = node.children.iter().find_map(|c| c.entry.clone());
+    node.entry = node
+        .children
+        .iter()
+        .filter_map(|c| c.entry.as_ref())
+        .min_by_key(|e| e.number)
+        .cloned();
     node
 }
 
@@ -370,6 +435,7 @@ mod tests {
             name: name.into(),
             key: doc! { "a": 1 },
             multikey: vec![0],
+            number: 1,
         }
     }
 
@@ -394,8 +460,8 @@ mod tests {
             { "a": { "$lt": 5 } }, { "b": { "$lt": 90 } },
         ] };
         let clauses = vec![doc! { "a": { "$lt": 5 } }, doc! { "b": { "$lt": 90 } }];
-        let tagged = [0].into_iter().collect();
-        let tree = tagged_tree(&canonical, &clauses, &tagged, &a_1(name)).unwrap();
+        let tags = [ClauseTag::One(a_1(name)), ClauseTag::None];
+        let tree = tagged_tree(&canonical, &clauses, &tags).unwrap();
         estimate(&LIBCXX_ARM64, &created, &creation, &tree).unwrap()
     }
 
@@ -425,8 +491,7 @@ mod tests {
         ];
         let canonical = doc! { "a": { "$lt": 5 } };
         let clauses = vec![canonical.clone()];
-        let tagged = [0].into_iter().collect();
-        let tree = tagged_tree(&canonical, &clauses, &tagged, &a_1("a_1")).unwrap();
+        let tree = tagged_tree(&canonical, &clauses, &[ClauseTag::One(a_1("a_1"))]).unwrap();
         assert_eq!(
             estimate(&LIBCXX_ARM64, &created, &creation, &tree),
             Some(2483)
@@ -435,16 +500,41 @@ mod tests {
 
     #[test]
     fn trees_it_does_not_build() {
-        let ix = a_1("a_1");
-        let none = std::collections::BTreeSet::new();
         for clause in [
             doc! { "$or": [{ "a": 1 }, { "b": 2 }] },
-            doc! { "a": { "$elemMatch": { "b": 1 } } },
             doc! { "a": { "$not": { "$gt": 1, "$lt": 5 } } },
             doc! { "$jsonSchema": {} },
         ] {
-            assert!(tagged_tree(&clause, std::slice::from_ref(&clause), &none, &ix).is_none());
+            assert!(tagged_tree(&clause, std::slice::from_ref(&clause), &[]).is_none());
         }
+        // An `$elemMatch` the plan's index read is not built.
+        let clause = doc! { "a": { "$elemMatch": { "b": 1 } } };
+        let tags = [ClauseTag::One(a_1("a_1"))];
+        assert!(tagged_tree(&clause, std::slice::from_ref(&clause), &tags).is_none());
+    }
+
+    #[test]
+    fn elem_match_and_or_trees() {
+        let clauses = [
+            doc! { "a": { "$lt": 5 } },
+            doc! { "b": { "$elemMatch": { "$gt": 1, "$lt": 90 } } },
+        ];
+        let canonical = doc! { "$and": clauses.to_vec() };
+        let tree = tagged_tree(&canonical, &clauses, &[ClauseTag::One(a_1("a_1"))]).unwrap();
+        assert_eq!(tree.children[1].children.len(), 2);
+        assert!(tree.children[1].entry.is_none());
+        let mut b_1 = a_1("b_1");
+        b_1.number = 2;
+        let clauses = [
+            doc! { "$or": [{ "b": 5 }, { "a": 3 }] },
+            doc! { "c": { "$lt": 3 } },
+        ];
+        let canonical = doc! { "$and": clauses.to_vec() };
+        let tags = [ClauseTag::Or(vec![b_1, a_1("a_1")]), ClauseTag::None];
+        let tree = tagged_tree(&canonical, &clauses, &tags).unwrap();
+        // `tagForSort`: the lowest-numbered index below, at every level.
+        assert_eq!(tree.entry.unwrap().name, "a_1");
+        assert_eq!(tree.children[0].entry.as_ref().unwrap().name, "a_1");
     }
 
     #[test]

@@ -3411,7 +3411,7 @@ impl WriteRun {
 }
 
 /// Every stage of `stats` went through `y`.
-fn yielded(stats: &mut Stats, y: Yields) {
+pub(crate) fn yielded(stats: &mut Stats, y: Yields) {
     if let Some(w) = stats.work.as_mut() {
         w.saved = y.saved;
         w.restored = y.restored;

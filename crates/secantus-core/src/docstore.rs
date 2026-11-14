@@ -461,6 +461,26 @@ fn produced(expr: &Bson, v: &Bson) -> Held {
     }
 }
 
+/// A document SBE hands the classic engine (`sbe::value` to `Document`,
+/// as a `$group` pushed into SBE returns its groups): built field by field
+/// over an empty BSON object, each sub-document a storage of its own built
+/// the same way (measured 8.2.11, RM-435).
+pub fn sbe_built(doc: &Document) -> Stored {
+    let mut s = Stored::built();
+    for (k, v) in doc {
+        s.append(k, sbe_value(v));
+    }
+    s
+}
+
+fn sbe_value(v: &Bson) -> Held {
+    match v {
+        Bson::Document(d) => Held::Document(Rc::new(RefCell::new(sbe_built(d)))),
+        Bson::Array(a) => Held::Array(a.iter().map(sbe_value).collect()),
+        _ => Held::Bytes(held(v)),
+    }
+}
+
 /// `Value::getApproximateSize` of `v`, the value `expr` evaluated to.
 pub fn produced_size(expr: &Bson, v: &Bson) -> usize {
     memlimit::VALUE + produced_held(expr, v)

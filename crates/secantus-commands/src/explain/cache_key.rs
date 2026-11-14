@@ -763,6 +763,9 @@ pub(crate) struct Parts<'a> {
     pub distinct: Option<&'a str>,
     /// Planned by the classic planner and run in SBE.
     pub sbe: bool,
+    /// A rooted `$or`'s branch, which the classic subplanner plans and
+    /// caches (`CanonicalQuery::forSubPlanner`).
+    pub subplanner: bool,
 }
 
 /// `encodeClassic`: the query shape.
@@ -780,7 +783,15 @@ pub(crate) fn shape(e: &Expr, p: &Parts) -> String {
         out.push('0');
     }
     out.push('f');
-    out.push(if p.sbe { 's' } else { 'c' });
+    // `c` for a plan the classic engine runs, `s` for one planned by the
+    // classic planner and run in SBE, and `o` for a subplanner's branch of
+    // a query SBE runs: its entry stores `works`, and the flag keeps a
+    // classic query from sharing it (mongod 8.2.11, RM-429).
+    out.push(match (p.sbe, p.subplanner) {
+        (false, _) => 'c',
+        (true, false) => 's',
+        (true, true) => 'o',
+    });
     out
 }
 
@@ -1037,6 +1048,27 @@ mod tests {
         assert_eq!(hex(compute_hash("res/im/||||fc")), "4F486929");
     }
 
+    /// A subplanner's branch of a query SBE runs ends its shape in `o`
+    /// (mongod 8.2.11, 2026-11-14: the branch `{a: {$lt: 3}, b: {$lt: 50}}`
+    /// of a rooted `$or` in front of a `$group`, over `a_1` and `b_1`, RM-429).
+    #[test]
+    fn a_subplanner_branch_of_an_sbe_query_is_keyed_o() {
+        let e = parse(&doc! { "a": {"$lt": 3}, "b": {"$lt": 50} }).unwrap();
+        let projection = doc! { "b": 1, "_id": 0 };
+        let parts = Parts {
+            sort: None,
+            projection: Some(&projection),
+            collation: None,
+            distinct: None,
+            sbe: true,
+            subplanner: true,
+        };
+        let s = shape(&e, &parts);
+        assert_eq!(s, "an[lta,ltb]||b||fo");
+        assert_eq!(hex(compute_hash(&s)), "EDB869B0");
+        assert_eq!(hex(key_hash(&format!("{s}<1><1>"))), "CA4248A6");
+    }
+
     /// The read's query settings move the key, not the shape hash (mongod
     /// 8.2.11, 2026-11-10: `find({x: 1})`, no index, RM-418).
     #[test]
@@ -1095,6 +1127,7 @@ mod tests {
             collation: None,
             distinct: None,
             sbe: false,
+            subplanner: false,
         };
         let shape_of = |q: Document| shape(&parse(&q).unwrap(), &none);
         assert_eq!(

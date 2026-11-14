@@ -813,3 +813,13 @@ pub(crate) fn within_reads(plan: &Node, env: &Env, need: i64, budget: i64) -> Op
         }
     }
 }
+
+/// The plan worked to its end, as mongod's executor works the winning plan
+/// (the trial's works and the run's after it are one stage tree's): what
+/// each stage counted. `None`: a stage this does not step.
+pub(crate) fn worked_through(plan: &Node, env: &Env) -> Option<Stats> {
+    let mut cache = Entries::new();
+    let mut stage = Stage::new(plan, env, &mut cache)?;
+    while !matches!(stage.work(env), Work::Eof) {}
+    Some(stage.stats())
+}

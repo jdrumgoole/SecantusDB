@@ -748,6 +748,7 @@ pub(super) fn reply(
             collation: None,
             distinct: None,
             sbe: false,
+            subplanner: false,
         },
         &cache_key::Indexability {
             catalog: &[],
@@ -874,6 +875,7 @@ mod tests {
                 collation: None,
                 distinct: None,
                 sbe: false,
+                subplanner: false,
             },
             &cache_key::Indexability {
                 catalog: &[],

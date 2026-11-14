@@ -1736,7 +1736,7 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       document (a `MutableDocument` with room for its two fields), and the
       `$sort` counts 2450 bytes over ten groups; this server counts the
       BSON each encodes, 1170, as it keeps no storage behind an SBE
-      `$group` (see also RM-435). Found 2026-11-13 (RM-519).
+      `$group`. Found 2026-11-13 (RM-519).
       Verify: tests/backlog/test_rm_found_rm519.py::test_a_project_after_a_pushed_down_group_builds_its_documents
       Backlog-ID: RM-638
 - [ ] **A `$sort` behind a `$setWindowFields` that sorted by the same key
@@ -2458,16 +2458,6 @@ Still different, all 77:
       itself.
       Backlog-ID: RM-056
       Verify: none -- performance budget (timings against an earlier build)
-- [ ] **A rooted `$or` in front of stages SBE runs caches no branch.**
-      mongod 8.2.11 caches each branch as a classic entry (`worksType:
-      "works"`) under a key that is neither the classic branch's nor the `s`
-      key of the same clause with the pipeline's projection (`CA4248A6`
-      for the test's clause, where those two are `0B947F35` and
-      `6F377EC6`): its encoding is still to be found. Until then such a
-      branch is not cached here, so that it cannot share a classic
-      query's entry.
-      Backlog-ID: RM-429
-      Verify: tests/backlog/test_plan_cache_or_branches.py::test_an_or_branch_before_sbe_stages_is_cached
 - [ ] **`$planCacheStats` lists no `estimatedSizeBytes` on Linux.** The
       field is mongod's estimate of the entry's C++ objects, so its figure
       depends on how mongod was built (RM-341): this server reproduces
@@ -2484,58 +2474,41 @@ Still different, all 77:
       built for, each fitted by probing that platform's mongod 8.2.11.**
       Backlog-ID: RM-442
       Verify: tests/backlog/test_rm_340_342_plan_cache_gaps.py::test_an_entry_reports_its_estimated_size_on_linux
-- [ ] **A compound index scan whose second field has several intervals
-      examines a key more than mongod's for each value of the first.**
-      Over `a_1_c_1` (2,000 documents, `a: i % 100`, `c: i % 7`), mongod
-      8.2.11 scans `{a: {$in: [3, 60]}, c: {$in: [1, 5]}}` examining 16 keys
-      with 5 seeks and `{a: 3, c: {$in: [1, 5]}}` 7 with 2; this server's
-      scan model (`exec::Scan`, which the trial steps) counts 18 with 7 and
-      8 with 3, in `explain` and in a plan cache entry's
-      `creationExecStats`, where the extra works also move the scores.
-      Found 2026-11-08 (RM-342).
-      Verify: tests/backlog/test_rm_found_2026_11_08_rm342.py::test_a_scan_of_two_in_lists_examines_mongods_keys
-      Backlog-ID: RM-433
-- [ ] **`explain`'s winning plan has no work accounting.** mongod 8.2.11's
-      `executionStats` gives each stage its `works`, `advanced`, `needTime`,
-      `needYield`, `isEOF` and timings, a FETCH its `alreadyHasObj`, an
-      IXSCAN its `seeks`, `dupsTested` and `dupsDropped`. This server's
-      `executionStages` give a stage only its `nReturned` and examined
-      counts (`allPlansExecution` and `$planCacheStats` do carry the
-      accounting the trial counted). `tools/probes/explain_commands.py`
-      leaves these fields out of its comparison. Found 2026-11-08 (RM-342).
-      (This was RM-446: A DISTINCT_SCAN plan's `executionStats` gives no work
-      counters.) mongod 8.2.11's `executionStages` for a DISTINCT_SCAN plan --
-      of `distinct`, and of a `$group` it answers from one -- gives every
-      stage's `works`, `advanced`, `needTime`, `needYield`, `saveState`,
-      `restoreState` and `isEOF` (`distinct("x", {x: {$gt: 0}})` over `x_1`:
-      `works: 4`). This server's gives `nReturned` and the scan's own fields,
-      none of them. The trial's counters, in `allPlansExecution`, are given.
-      Found 2026-11-08 (RM-310).
-      Verify: tests/backlog/test_rm_found_2026_11_08_rm342.py::test_explain_gives_each_stage_its_work_accounting, tests/backlog/test_rm_found_2026_11_08_rm310.py::test_a_distinct_scan_run_reports_its_work_counters
-      Backlog-ID: RM-434
-- [ ] **A `$sort` after a `$group` mongod pushes into SBE counts its
-      documents smaller than mongod's.** `[{$group: {_id: "$a"}}, {$sort:
-      {_id: 1}}]` over ten documents: mongod 8.2.11's `$sort` reports
-      `totalDataSizeSortedBytesEstimate` 735 for the three groups the SBE
-      plan hands it, this server's 351, its estimate of the same three
-      documents as the classic engine builds them. Found 2026-11-08
-      (RM-071).
-      Verify: tests/backlog/test_rm_found_2026_11_08_rm071.py::test_a_sort_after_a_pushed_down_group_sizes_what_sbe_hands_it
-      Backlog-ID: RM-435
-- [ ] **`estimatedSizeBytes` is left out of entries whose index tree this
-      server does not build.** It sizes an entry's `PlanCacheIndexTree`
-      from the canonical query and the clauses the winning plan's one index
-      was assigned (`plan::index_tags`, `entry_size::tagged_tree`). mongod
-      8.2.11 sizes every entry; this server leaves the field out where the
-      tree's nodes or tags are not modelled: a predicate inside
-      `$elemMatch` (its `ELEM_MATCH_*` node and the tags under it), an
-      `$or` or `$nor` that is not the root (an `OR` may take an
-      `OrPushdownTag` of its own), a `$not` over several predicates,
-      `$jsonSchema`, a winner that reads two indexes (`AND_SORTED` or an
-      `OR`, where `tagForSort` picks the lowest-numbered index), and an
-      `OR` stage among the candidates (`OrStats`). Found 2026-11-08 (RM-341).
-      Verify: tests/backlog/test_rm_found_2026_11_08_rm341.py::test_entries_this_does_not_size_report_their_size
-      Backlog-ID: RM-436
+- [ ] **A `$cursor` the pipeline stops reading reports a plan run to its
+      end.** Under `[{$match: {a: {$gt: 2}}}, {$unwind: "$b"}, {$limit: 3}]`
+      (100 documents, `a_1`), mongod 8.2.11's `DocumentSourceCursor` loads one
+      batch of 32 documents and stops: its FETCH and IXSCAN report
+      `nReturned` 32, 32 works, `saveState` 2, `restoreState` 1, `isEOF` 0.
+      This server's classic run goes to the end (70 documents), and leaves the
+      work accounting out where its stages' counts are not mongod's
+      (`cursor_yields`). Found 2026-11-14 (RM-434).
+      Verify: tests/backlog/test_rm_found_2026_11_14_rm434.py::test_a_cursor_the_pipeline_stops_reading_reports_one_batch
+      Backlog-ID: RM-692
+- [ ] **A `$group` whose `_id` takes `$mod`, or whose accumulator takes an
+      expression object, is not pushed into SBE.** `[{$group: {_id: {$mod:
+      ["$b", 2]}}}, {$sort: {_id: 1}}]`, and `{_id: "$a", q: {$push: {s:
+      "$s"}}}` (`$addToSet` too): mongod 8.2.11 runs the `$group` in SBE,
+      `explainVersion` "2" and no `$group` in `stages`; this server explains
+      version "1" with a classic `$group`. The `$sort`'s byte count after it
+      already matches. Found 2026-11-14 (RM-435).
+      Verify: tests/backlog/test_rm_found_rm435.py::test_a_group_mongod_pushes_into_sbe_is_pushed
+      Backlog-ID: RM-693
+- [ ] **`estimatedSizeBytes` is still left out of some entries whose
+      index tree this server does not build.** It sizes an entry's
+      `PlanCacheIndexTree` from the canonical query and the index tags of
+      its winner (`plan::index_tags`, `plan::or_tags`,
+      `entry_size::tagged_tree`): one index, or an `OR` of single-predicate
+      branches beside other clauses, and an untagged `$elemMatch` over
+      operators. mongod 8.2.11 sizes every entry; this server leaves the
+      field out for a `$not` inside `$elemMatch` (3350 for `{a: {$lt: 5}, b:
+      {$elemMatch: {$not: {$gt: 3}}}}` over `a_1` and `b_1` on macOS
+      arm64), the object form of `$elemMatch` and an `$elemMatch` the
+      winner's index reads, an `$or` that is the root or whose clauses
+      mongod pushes into the branches (`OrPushdownTag`), a branch of several
+      predicates, `$nor`, a `$not` over several predicates, `$jsonSchema`,
+      and an `AND_SORTED` winner. Found 2026-11-14 (RM-436).
+      Verify: tests/backlog/test_rm_found_2026_11_08_rm341.py::test_a_not_inside_elem_match_entry_reports_its_size
+      Backlog-ID: RM-694
 - [ ] **A SORT_MERGE candidate's trial counts are not mongod's.** For
       `{a: {$in: [1, 2]}, b: {$lt: 90}}` sorted by `c` over `a_1_c_1` and
       `b_1`, mongod 8.2.11's winning SORT_MERGE reports 82 `works` and its
@@ -2543,15 +2516,6 @@ Still different, all 77:
       reports 83 works and neither field. Found 2026-11-08 (RM-341).
       Verify: tests/backlog/test_rm_found_2026_11_08_rm341.py::test_a_sort_merge_candidate_counts_as_mongods
       Backlog-ID: RM-437
-- [ ] **A scan over several intervals of one field seeks and returns
-      differently in the trial.** mongod 8.2.11's losing candidate for
-      `{a: {$lt: 5}, b: {$nin: [3, 4]}}` reads `b_1` over three intervals,
-      examining 101 keys in 3 seeks and returning 99; this server's scan
-      model seeks twice and returns 100, in `creationExecStats` (and so in
-      its score). Perhaps RM-433's cause on one field. Found 2026-11-08
-      (RM-341).
-      Verify: tests/backlog/test_rm_found_2026_11_08_rm341.py::test_a_nin_candidate_reads_mongods_keys
-      Backlog-ID: RM-438
 - [ ] **A candidate's FETCH filter puts an inexact `$exists` after the
       other predicates.** mongod 8.2.11's losing candidate for `{a: {$lt:
       5}, b: {$exists: true}}` over `b_1` rechecks `{$and: [{b: {$exists:

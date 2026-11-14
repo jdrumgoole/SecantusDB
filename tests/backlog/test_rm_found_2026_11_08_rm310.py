@@ -50,12 +50,12 @@ def _distinct_scan_runs(client: Any) -> dict:
     }
 
 
-@pytest.mark.backlog("RM-434")
+@pytest.mark.backlog_fixed("RM-434")
 def test_a_distinct_scan_run_reports_its_work_counters(rust_mongo: Any, mongod: Any) -> None:
     """mongod 8.2.11's `executionStats` of a DISTINCT_SCAN plan, for
     `distinct` and for a `$group` it answers from one, gives every stage's
     `works`, `advanced`, `needTime`, `needYield`, `saveState`,
-    `restoreState` and `isEOF`. This server's gives none of them."""
+    `restoreState` and `isEOF`. This server's gave none of them."""
     got, want = _distinct_scan_runs(rust_mongo), _distinct_scan_runs(mongod)
     assert want["distinct"][1]["works"] == 4
     assert got == want

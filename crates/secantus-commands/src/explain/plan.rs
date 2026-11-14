@@ -774,6 +774,74 @@ pub(crate) fn index_tags(q: &Query, winner: &Node) -> Option<(Arc<IndexInfo>, BT
     Some((index.clone(), use_index(&index, &leaves, &parts, q).tagged))
 }
 
+/// For a plan that reads an `OR` of index scans beside other clauses
+/// (`{$or: [{a: 3}, {b: 5}], c: {$lt: 3}}` over `a_1` and `b_1`): which
+/// clause of `q.canonical` is the `$or`, and the index each of its branches
+/// was assigned -- mongod's index tags under the `OR`. `None` unless the
+/// query is a conjunction holding one `$or`, every branch is one predicate
+/// on the leading field of exactly one scanned index, and no scanned index
+/// holds a field of another clause (mongod could push that clause into the
+/// branches, under an `OrPushdownTag`).
+pub(crate) fn or_tags(q: &Query, winner: &Node) -> Option<(usize, Vec<Arc<IndexInfo>>)> {
+    let mut node = winner;
+    let inputs = loop {
+        match node {
+            Node::Fetch { input, .. }
+            | Node::Sort { input, .. }
+            | Node::Skip(_, input)
+            | Node::Limit(_, input)
+            | Node::Projection { input, .. } => node = input,
+            Node::Or(inputs) => break inputs,
+            _ => return None,
+        }
+    };
+    let mut scanned: Vec<Arc<IndexInfo>> = Vec::new();
+    for input in inputs {
+        let scan = match input {
+            Node::Fetch { input, .. } => input.as_ref(),
+            other => other,
+        };
+        let Node::IxScan(ix) = scan else { return None };
+        scanned.push(ix.index.clone());
+    }
+    let parts = clauses(q.canonical);
+    if parts.len() < 2 {
+        return None;
+    }
+    let mut ors = parts
+        .iter()
+        .enumerate()
+        .filter(|(_, p)| p.contains_key("$or"));
+    let (at, or) = ors.next()?;
+    if ors.next().is_some() {
+        return None;
+    }
+    let outer: BTreeSet<&str> = parts
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| *i != at)
+        .flat_map(|(_, p)| p.keys().map(String::as_str))
+        .collect();
+    if scanned
+        .iter()
+        .any(|ix| ix.fields().iter().any(|(f, _)| outer.contains(*f)))
+    {
+        return None;
+    }
+    let mut tags = Vec::new();
+    for branch in or.get_array("$or").ok()? {
+        let branch = branch.as_document()?;
+        let (path, _) = branch.iter().next().filter(|_| branch.len() == 1)?;
+        let mut by = scanned.iter().filter(|ix| ix.fields()[0].0 == path);
+        let one = by.next()?;
+        if by.any(|ix| ix.name != one.name) {
+            return None;
+        }
+        tags.push(one.clone());
+    }
+    Some((at, tags))
+}
+
 /// The access under what the rest of the query puts over it.
 fn access_of_plan(node: &Node) -> Option<&Node> {
     match node {
