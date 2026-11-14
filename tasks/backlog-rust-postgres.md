@@ -2857,14 +2857,6 @@ char(3)`, `t657d(a d657c, i int)` holding `('a b', 1)` and `('xy', 2)`, and
 its domain through a join, a WITH, a FROM subquery and a set operation all
 of whose branches are of the domain (`domain_scope.rs`).
 
-- [ ] **`ARRAY(select * ...)` over a one-column domain subquery is typed by
-      the domain's base.** `select array(select * from (select a from
-      t657d) s order by 1)` is `d657c[]` on PostgreSQL 15.19, as the same
-      query with `select a` is; here it is `character[]`. A `*` target is
-      not a column reference the cast can wrap
-      (`domain_scope::cast_first_columns`).
-      Verify: tests/backlog/test_rp_found_rp657.py::test_array_of_star_over_a_domain_subquery_is_the_domains
-      Backlog-ID: RP-673
 - [ ] **A LATERAL subquery's column that is an outer domain column is typed
       by the domain's base.** `select pg_typeof(b), array[b] from t657d x
       cross join lateral (select x.a b) l` is `d657c` and `d657c[]`, with
