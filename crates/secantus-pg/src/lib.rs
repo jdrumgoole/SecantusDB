@@ -20501,9 +20501,16 @@ impl PgHandler {
             ))));
         }
         let base_domain = self.domains()?.into_iter().find(|x| x.name == d.base);
+        // `typenameType`: a base written `t[]` is `t`'s array type, which
+        // a user type (a domain or an enum) has as well as a built-in.
+        let element = d.base.strip_suffix("[]").unwrap_or(&d.base);
         let known = secantus_pgplan::pgtypes::oid_of_name(&d.base).is_some()
             || base_domain.is_some()
-            || self.enums()?.iter().any(|(n, _, _)| *n == d.base);
+            || self.domains()?.iter().any(|x| x.name == element)
+            || self.enums()?.iter().any(|(n, _, _)| n == element)
+            // A domain may be over a composite, a table's row type
+            // included (PostgreSQL 11 on).
+            || self.composites()?.iter().any(|(n, _, _)| n == element);
         if !known {
             return Err(Self::undefined_domain(&d.base));
         }

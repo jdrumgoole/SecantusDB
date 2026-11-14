@@ -2831,18 +2831,6 @@ Measured on a private PostgreSQL 15.19 cluster with the `_SETUP` in
 `tests/backlog/test_rp_found_rp665.py`: `t665(a d665, c dc665, b int)`
 over `create domain d665 as int` and `create domain dc665 as char(4)`.
 
-- [ ] **A CASE, COALESCE, GREATEST or LEAST over domain columns alone is
-      typed by the domain's base.** `select pg_typeof(coalesce(a, a)) from
-      t665` is `d665` on PostgreSQL 15.19, and so are `case when ... then a
-      else a end`, `greatest(a, a)` and `least(a, a)`; `coalesce(c, c)` is
-      `dc665` (`select_common_type` keeps a type every input shares
-      exactly, a domain included). Here each is `integer` (`character`).
-      Since RP-665 the common type keeps a domain every input is OF -- a
-      scalar subquery over one is -- but a bare domain column reaches a
-      `pg_typeof` as its domain only directly (`rewrite_domain_typeof`),
-      so inside these it is still of its stored base type.
-      Verify: tests/backlog/test_rp_found_rp665.py::test_common_type_of_domain_columns_alone_is_the_domain
-      Backlog-ID: RP-764
 
 ## Found while working RP-656 (2026-11-08)
 
@@ -3019,14 +3007,6 @@ and `(2, 'abcd', '{abcd}')`. The gap tests are in
 Measured on a private PostgreSQL 15.19 cluster with `create domain d607q
 as int`. The gap tests are in `tests/backlog/test_rp_found_rp607.py`.
 
-- [ ] **A domain over another domain's array type is refused.** `create
-      domain d607s as d607q[]` is made on PostgreSQL 15.19, with
-      `typbasetype` `d607q[]`, and `'{1,2}'::d607s::text` is `{1,2}`; here
-      the CREATE is 42704 `type "d607q[]" does not exist`: `create_domain`
-      knows a base by a built-in's name or a user type's, never a user
-      type's array. The DROP side follows such a domain already (RP-607).
-      Verify: tests/backlog/test_rp_found_rp607.py::test_domain_over_a_domain_array
-      Backlog-ID: RP-654
 
 ## Found while working RP-658 (2026-11-08)
 
@@ -3121,16 +3101,6 @@ Measured on a private PostgreSQL 15.19 cluster with `fs(a int, c text)`,
 `create domain dfs as fs` and `fd(k dfs)` holding `row(null, null)`,
 `row(1, null)`, `row(1, 'a')` and `null`.
 
-- [ ] **A domain over a table's row type is refused.** `create domain dfs
-      as fs` over a table `fs` is 42704 `type "fs" does not exist` here;
-      PostgreSQL 15.19 creates it (a domain may be over a composite since
-      PostgreSQL 11), and a column of it holds rows: `select count(*) from
-      fd where k is not null` is 1 and `... where k is null` 2, the null
-      test reading the fields because `type_is_rowtype` is true of the
-      domain. RP-534's per-row null test asks `type_is_rowtype` of the
-      column's declared type, so it needs to see through the domain then.
-      Backlog-ID: RP-538
-      Verify: tests/backlog/test_rp_found_rp534.py::test_domain_over_a_table_row_type
 
 ## Found while working RP-500 (2026-11-07)
 
