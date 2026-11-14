@@ -17315,44 +17315,6 @@ impl PgHandler {
     /// Every index a `CREATE INDEX` or a UNIQUE constraint built, with the
     /// table it is on -- storage's own `_id_` excluded, since the primary key
     /// is reported as `<t>_pkey` from the catalog instead.
-    /// The names of the tables [`Self::shared_table_defs`] lists, in its
-    /// order. While a statement changes the catalog, or inside a user
-    /// transaction, that list reads and decodes every table's catalog row;
-    /// a caller after names alone (is an index called this?) reads them
-    /// from the raw rows instead, as PostgreSQL finds a relation by name
-    /// without building every relation's descriptor (RP-921).
-    fn table_names(&self) -> PgWireResult<Vec<String>> {
-        if !self.storage.in_user_txn() && !self.in_catalog_statement() {
-            return Ok(self
-                .shared_table_defs()?
-                .iter()
-                .map(|d| d.name.clone())
-                .collect());
-        }
-        let raw = self
-            .storage
-            .find_matching(self.db(), CATALOG_COLLECTION, &Document::new())
-            .map_err(|e| Self::storage_err("could not read the catalog", e))?;
-        // A table's row as `TableDef::from_document` accepts one: a `table`
-        // name and a `columns` array.
-        let mut names: Vec<String> = raw
-            .iter()
-            .filter_map(|b| {
-                let d = bson::RawDocument::from_bytes(b).ok()?;
-                d.get_array("columns").ok()?;
-                Some(d.get_str("table").ok()?.to_string())
-            })
-            .collect();
-        let pending = self.pending.tables();
-        names.retain(|n| !pending.contains_key(n));
-        names.extend(
-            pending
-                .values()
-                .filter_map(|d| d.as_ref().map(|d| d.name.clone())),
-        );
-        Ok(names)
-    }
-
     fn all_indexes(&self) -> PgWireResult<Vec<(TableDef, Document)>> {
         let mut out = Vec::new();
         for def in self.shared_table_defs()?.iter() {

@@ -16274,7 +16274,11 @@ impl Storage {
 
     /// `idx` brought up to `now` from the change log, or `None` when it
     /// fell behind the log or a reset (the caller rebuilds).
-    fn refresh_index_names(&self, mut idx: IndexNameIndex, now: u64) -> Result<Option<IndexNameIndex>> {
+    fn refresh_index_names(
+        &self,
+        mut idx: IndexNameIndex,
+        now: u64,
+    ) -> Result<Option<IndexNameIndex>> {
         if INDEX_CATALOG_RESET.load(Ordering::SeqCst) > idx.read_at {
             return Ok(None);
         }
@@ -16285,7 +16289,9 @@ impl Storage {
             let _numbering = index_catalog_changes()
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
-            let log = index_catalog_log().lock().unwrap_or_else(|e| e.into_inner());
+            let log = index_catalog_log()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             if log.0 > idx.read_at {
                 return Ok(None);
             }
@@ -26309,7 +26315,10 @@ impl IndexNameIndex {
             return;
         }
         for n in &names {
-            self.by_name.entry(n.clone()).or_default().insert(coll.clone());
+            self.by_name
+                .entry(n.clone())
+                .or_default()
+                .insert(coll.clone());
         }
         self.by_coll.insert(coll, names);
     }
@@ -26328,7 +26337,9 @@ fn note_index_catalog_change(db: &str, coll: &str) {
         .unwrap_or_else(|e| e.into_inner());
     let n = INDEX_CATALOG_SERIAL.fetch_add(1, Ordering::SeqCst) + 1;
     {
-        let mut log = index_catalog_log().lock().unwrap_or_else(|e| e.into_inner());
+        let mut log = index_catalog_log()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         log.1.push_back((n, db.to_string(), coll.to_string()));
         while log.1.len() > INDEX_CATALOG_LOG_MAX {
             if let Some((old, _, _)) = log.1.pop_front() {
