@@ -1971,7 +1971,7 @@ fn reply_for(r: &Request, verbosity: Verbosity, ctx: &mut CommandContext) -> Han
                 }
             );
             let parsed = parsed::parsed_query(&s.filter);
-            let filter = sbe::Filter::parse(&parsed);
+            let filter = sbe::Filter::parse_find(&parsed, &s.filter);
             let on = sbe::Front {
                 parsed,
                 filter,

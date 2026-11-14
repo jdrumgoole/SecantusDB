@@ -2656,16 +2656,17 @@ What is left, all on the RUST MongoDB server:
       prints and RUNS that plan for a `$group`, or the `$group` a `$count`
       is, over a forward collection scan with no sort, projection, hint or
       collation, whose filter is `$eq` / `$lt` / `$lte` / `$gt` / `$gte` of
-      a number, string or boolean on a path of named fields and the `$and`s
-      of those (`explain/sbe/filter.rs`), with a skip and a limit where the
+      a number, string or boolean on a path of named fields, `$eq: null`
+      on one field, an `$in` of such values, the `$not: {$eq}` a `$ne` is
+      (since 2026-11-14), and the `$and`s of those (`explain/sbe/filter.rs`), with a skip and a limit where the
       group reads no field (RM-072); whose `_id` is a field path, `$$ROOT`,
       a scalar constant or an object of those, whose arguments are field
       paths or `$$ROOT` (numeric constants for `$sum`), with `$sum`,
       `$count`, `$avg`, `$first`, `$last`, `$min`, `$max`, `$push` and
       `$addToSet`, and at most one distinct dotted path; and the `limit 0`
       / `coscan` plan over a collection that does not exist. Still the
-      classic `$cursor` / `stages` shape: any other filter (`{a: null}`'s
-      `typeMatch`, `$in`'s `isMember`, `$ne`'s `!`, `$or`, ...), a sorted,
+      classic `$cursor` / `stages` shape: any other filter (an `$in` holding
+      null, `$exists`'s `exists`, a dotted `$eq: null`, `$or`, ...), a sorted,
       projected or index-served front (`COUNT_SCAN`, `IXSCAN` /
       `FETCH`; for `count` on a view, RM-072), a skip or limit with a group that reads a field (mongod
       puts its dependency projection among them), `$lookup`,

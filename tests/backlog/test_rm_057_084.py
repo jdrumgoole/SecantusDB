@@ -423,9 +423,8 @@ def _sbe_filters(client: Any) -> Any:
     uuid_ = _uuid_text(db, name)
     out = []
     for pipeline in [
-        [{"$match": {"a": None}}, {"$count": "n"}],
-        [{"$match": {"a": {"$in": [1, 2]}}}, {"$count": "n"}],
-        [{"$match": {"a": {"$ne": 2}}}, {"$count": "n"}],
+        [{"$match": {"a": {"$in": [None, 1]}}}, {"$count": "n"}],
+        [{"$match": {"a": {"$in": [1, 2]}, "c": {"$exists": False}}}, {"$count": "n"}],
         [{"$match": {"a": {"$gt": 1}}}, {"$limit": 2}, {"$group": {"_id": "$b"}}],
     ]:
         ex = db.command("aggregate", name, pipeline=pipeline, explain=True)
@@ -436,11 +435,12 @@ def _sbe_filters(client: Any) -> Any:
 
 @pytest.mark.backlog("RM-071")
 def test_explain_of_a_filter_sbe_runs_beyond_comparisons(rust_mongo: Any, mongod: Any) -> None:
-    """mongod 8.2.11 runs a `$count` behind `{a: null}`, an `$in` or a `$ne`,
-    and a field-reading `$group` behind a `$limit`, in SBE: a `filter` of
-    `typeMatch`, `isMember` or `!` programs, and the dependency projection
-    among the paging. Comparisons and their `$and`s already are
-    (tests/mongod_live/test_sbe_filtered_front_explain.py)."""
+    """mongod 8.2.11 runs a `$count` behind an `$in` holding null or an
+    `$exists`, and a field-reading `$group` behind a `$limit`, in SBE: an
+    `isMember` of the null-folded value, an `exists` program, and the
+    dependency projection among the paging. Comparisons, `{a: null}`, an
+    `$in`, a `$ne` and their `$and`s already are (2026-11-14,
+    tests/mongod_live/test_sbe_filtered_front_explain.py)."""
     assert _sbe_filters(rust_mongo) == _sbe_filters(mongod)
 
 

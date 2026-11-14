@@ -52,6 +52,12 @@ PIPELINES = [
     [{"$match": {"a": {"$gt": 1}}}, {"$group": {"_id": None, "n": {"$sum": 1}}}],
     [{"$match": {"a": {"$gt": 1}}}, {"$limit": 2}, {"$group": {"_id": "$$ROOT"}}],
     [{"$match": {"a": {"$gte": 5}}}, {"$group": {"_id": None, "n": {"$sum": 1}}}, {"$limit": 1}],
+    # RM-071 (2026-11-14): `typeMatch`, `isMember` and `!` filters.
+    [{"$match": {"a": None}}, COUNT],
+    [{"$match": {"a": {"$ne": None}}}, COUNT],
+    [{"$match": {"a": {"$in": [1, 2, "str"]}}}, COUNT],
+    [{"$match": {"a": {"$ne": 2}}}, COUNT],
+    [{"$match": {"a": {"$ne": 2}, "b": {"$gt": 0}}}, {"$group": {"_id": "$b"}}],
 ]
 
 
