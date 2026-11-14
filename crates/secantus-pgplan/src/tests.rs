@@ -337,6 +337,26 @@ fn update_from_returning_reads_the_joined_row() {
     }
 }
 
+/// As `update_from_returning_reads_the_joined_row`, for DELETE ... USING
+/// (RP-938): the joined values are read over each row before it is deleted.
+#[test]
+fn delete_using_returning_reads_the_joined_row() {
+    let sql = "DELETE FROM t USING t s WHERE s.id = t.n RETURNING t.id, s.name";
+    match plan_with_subqueries(sql, &lookup, &[], &|_| Ok(Vec::new())).expect("should plan") {
+        Statement::Delete(d) => {
+            assert_eq!(d.joined.len(), 1, "{:?}", d.joined);
+            let returning = d.returning.expect("RETURNING");
+            let names: Vec<&str> = returning.columns.iter().map(|(n, _)| n.as_str()).collect();
+            assert_eq!(names, ["id", "name"]);
+            assert_eq!(
+                returning.casts[1].as_ref().map(column_expr_type),
+                Some("text")
+            );
+        }
+        other => panic!("wrong statement: {other:?}"),
+    }
+}
+
 #[test]
 fn shapes_sqlglot_mis_parses_reach_us_as_real_statements() {
     // `DROP TABLE a, b, c`, `BEGIN ...`, `MOVE FORWARD 2 IN c`,

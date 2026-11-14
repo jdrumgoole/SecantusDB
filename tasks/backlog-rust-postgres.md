@@ -3025,7 +3025,8 @@ Measured on a private PostgreSQL 15.19 cluster with the `_SCOPE_SETUP` in
       no longer join. Reaching it means letting the subquery's outer
       reference read a hidden `Update::joined` value, which the RETURNING
       subquery resolver (`resolve_sublinks_in_target`, run before
-      `plan_update`) does not know.
+      `plan_update`) does not know. DELETE ... USING has the same remainder
+      (RP-938).
       Verify: tests/backlog/test_rp_found_rp664.py::test_a_returning_subquery_over_a_from_item_when_the_join_reads_an_assigned_column
       Backlog-ID: RP-686
 
@@ -3034,16 +3035,18 @@ Measured on a private PostgreSQL 15.19 cluster with the `_SCOPE_SETUP` in
 Measured on a private PostgreSQL 15.19 cluster with the `_SCOPE_SETUP` in
 `tests/backlog/test_rp_found_rp664.py`.
 
-- [ ] **DELETE RETURNING reads a USING item after the delete.** `delete
-      from t668 using (select a, b from t668) x where x.a = t668.a and
-      t668.b < 0 returning t668.a, x.b` returns each deleted row's `b` on
-      PostgreSQL 15.19; here `x.b` is NULL: `rewrite_dml_from` reads a
-      USING item in RETURNING through a correlated subquery that finds the
+- [ ] **A subquery in DELETE RETURNING reads a USING item after the
+      delete.** `delete from t668 using (select a, b from t668) x where x.a
+      = t668.a returning (select x.b)` returns each deleted row's `b` on
+      PostgreSQL 15.19; here it is NULL. A USING-item reference outside a
+      subquery is read from the joined row before the delete
+      (`split_joined_returning`, `Delete::joined`); one inside a subquery
+      still takes the old path, a correlated subquery that finds the
       joining row again after the rows are deleted, when the derived table
-      over the target no longer holds them. UPDATE reads its FROM items
-      from the joined row before the write (`Update::joined`); DELETE needs
-      the same.
-      Verify: tests/backlog/test_rp_found_rp664.py::test_delete_returning_reads_a_using_item_as_it_was_before_the_delete
+      over the target no longer holds them. The same remainder as RP-686,
+      for UPDATE: the subquery's outer reference would have to read a
+      hidden `joined` value.
+      Verify: tests/backlog/test_rp_found_rp664.py::test_a_delete_returning_subquery_reads_a_using_item_as_it_was_before_the_delete
       Backlog-ID: RP-938
 
 ## Found while working RP-570 (2026-11-08)

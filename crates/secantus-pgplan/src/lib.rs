@@ -3780,8 +3780,12 @@ pub struct Update {
     /// and set on the returned row under that field for `returning` to read
     /// (RP-686). PostgreSQL joins once and returns from the joined tuple; a
     /// lookup after the write saw the rows the write had changed.
-    pub joined: Vec<(String, ColumnExpr)>,
+    pub joined: JoinedValues,
 }
+
+/// A write's joined-row values for RETURNING: (hidden field, expression
+/// over the target row as it was before the write). See `Update::joined`.
+pub type JoinedValues = Vec<(String, ColumnExpr)>;
 
 /// One `SET a[...] = v` assignment.
 #[derive(Debug, Clone, PartialEq)]
@@ -3821,6 +3825,9 @@ pub struct Delete {
     pub residual: Option<ColumnExpr>,
     /// `DELETE ... RETURNING`, over the rows as they were before the delete.
     pub returning: Option<Returning>,
+    /// As `Update::joined`: a USING item's values in the row each deleted
+    /// row joins, evaluated over that row before the delete (RP-938).
+    pub joined: JoinedValues,
 }
 
 /// Name an unsupported node in an error message.
@@ -22918,16 +22925,17 @@ fn rewrite_dml_from(
             _ => false,
         }
     }
-    /// An UPDATE's RETURNING item over the FROM items, read from the joined
-    /// row as PostgreSQL reads it: the join is done once, against the rows
-    /// as they were BEFORE the write, and RETURNING projects the target's
-    /// NEW columns beside the joined row's (`ExecUpdate` runs RETURNING over
-    /// the plan's joined tuple). Each FROM-item reference outside a
-    /// subquery becomes a hidden RETURNING entry ([`JOINED_RETURNING`]),
-    /// `(SELECT ref FROM f WHERE c LIMIT 1)`, which `plan_update` takes out
-    /// and the executor evaluates over the OLD row, with the SET values; the
-    /// item then reads that entry. `None` when the item cannot be split so:
-    /// a subquery inside it reads a FROM item, or it reads one through `*`.
+    /// A write's RETURNING item over the FROM (USING) items, read from the
+    /// joined row as PostgreSQL reads it: the join is done once, against
+    /// the rows as they were BEFORE the write, and RETURNING projects the
+    /// target's row (an UPDATE's NEW one) beside the joined row's
+    /// (`ExecUpdate` / `ExecDelete` run RETURNING over the plan's joined
+    /// tuple). Each FROM-item reference outside a subquery becomes a hidden
+    /// RETURNING entry ([`JOINED_RETURNING`]), `(SELECT ref FROM f WHERE c
+    /// LIMIT 1)`, which `plan_write_returning` takes out and the executor
+    /// evaluates over the OLD row before any write; the item then reads that
+    /// entry. `None` when the item cannot be split so: a subquery inside it
+    /// reads a FROM item, or it reads one through `*`.
     fn split_joined_returning(
         rt: &mut pg_query::protobuf::ResTarget,
         from: &[pg_query::protobuf::Node],
@@ -23025,9 +23033,8 @@ fn rewrite_dml_from(
         })?;
         Ok(Some(()))
     }
-    /// A RETURNING item that reads a FROM item. An UPDATE's (`joined` is
-    /// `Some`) reads the joined row through `split_joined_returning` where it
-    /// can. Otherwise it becomes the correlated subquery that finds the
+    /// A RETURNING item that reads a FROM item reads the joined row through
+    /// `split_joined_returning` where it can. Otherwise it becomes the correlated subquery that finds the
     /// joining row again, over the rows as they are after the write -- sound
     /// only when the join condition reads no column the statement CHANGES,
     /// since a condition over an updated column could then match a different
@@ -23041,7 +23048,7 @@ fn rewrite_dml_from(
         from_only: &[String],
         target_names: &[String],
         changed: &[String],
-        mut joined: Option<&mut Vec<pg_query::protobuf::Node>>,
+        joined: &mut Vec<pg_query::protobuf::Node>,
         lookup: &dyn Fn(&str) -> Option<TableDef>,
     ) -> Result<()> {
         let mut cond_reads_changed = false;
@@ -23076,10 +23083,8 @@ fn rewrite_dml_from(
             if !reads_from_items(v, names, from_only, lookup)? {
                 continue;
             }
-            if let Some(joined) = joined.as_deref_mut() {
-                if split_joined_returning(rt, from, cond, from_only, joined, lookup)?.is_some() {
-                    continue;
-                }
+            if split_joined_returning(rt, from, cond, from_only, joined, lookup)?.is_some() {
+                continue;
             }
             let Some(v) = rt.val.as_deref() else { continue };
             if cond_reads_changed {
@@ -23246,7 +23251,7 @@ fn rewrite_dml_from(
                 &from_only,
                 &target_names,
                 &changed,
-                Some(&mut joined),
+                &mut joined,
                 lookup,
             )?;
             u.returning_list.extend(joined);
@@ -23295,6 +23300,7 @@ fn rewrite_dml_from(
             let from = std::mem::take(&mut d.using_clause);
             let cond = d.where_clause.take();
             let (names, from_only, target_names) = dml_scopes(&d.relation, &from, lookup);
+            let mut joined = Vec::new();
             wrap_foreign_returning(
                 &mut d.returning_list,
                 &from,
@@ -23303,9 +23309,10 @@ fn rewrite_dml_from(
                 &from_only,
                 &target_names,
                 &[],
-                None,
+                &mut joined,
                 lookup,
             )?;
+            d.returning_list.extend(joined);
             d.where_clause = Some(Box::new(sublink(
                 SubLinkType::ExistsSublink,
                 select(one(), &from, cond.as_deref(), false),
@@ -45103,60 +45110,7 @@ fn plan_update(
             None => lower_where_or_residual(w, &def, params)?,
         },
     };
-    // The joined row's values RETURNING reads (`split_joined_returning`):
-    // planned over the old row, as a SET value is, and visible to the
-    // RETURNING list as columns of their own.
-    let (hidden, visible): (Vec<_>, Vec<_>) = u.returning_list.iter().partition(|t| {
-        matches!(t.node.as_ref(), Some(N::ResTarget(rt)) if rt.name.starts_with(JOINED_RETURNING))
-    });
-    let mut joined: Vec<(String, ColumnExpr)> = Vec::new();
-    let mut returning_def = def.clone();
-    for t in hidden {
-        let Some(N::ResTarget(rt)) = t.node.as_ref() else {
-            continue;
-        };
-        let val = rt
-            .val
-            .as_deref()
-            .ok_or_else(|| Error::Parse("RETURNING without a value".into()))?;
-        let (fields, sample) = row_fields();
-        let expr = row_column_expr(val, &fields, params, &sample)?;
-        returning_def.system_columns.push(Column {
-            field_override: Some(rt.name.clone()),
-            ..Column::new(&rt.name, column_expr_type(&expr), false)
-        });
-        joined.push((rt.name.clone(), expr));
-    }
-    let returning = if visible.is_empty() {
-        None
-    } else {
-        let visible: Vec<pg_query::protobuf::Node> = visible.into_iter().cloned().collect();
-        let (columns, mut casts) = plan_table_targets(&visible, &returning_def, params)?;
-        // A bare read of a joined value is typed by its expression: the
-        // executor describes an uncast column by the table it updates, which
-        // has no such column.
-        for ((_, field), cast) in columns.iter().zip(casts.iter_mut()) {
-            if cast.is_some() || !field.starts_with(JOINED_RETURNING) {
-                continue;
-            }
-            let Some(c) = returning_def.column(field) else {
-                continue;
-            };
-            let read = pg_query::protobuf::Node {
-                node: Some(N::ColumnRef(pg_query::protobuf::ColumnRef {
-                    fields: vec![pg_query::protobuf::Node {
-                        node: Some(N::String(pg_query::protobuf::String {
-                            sval: field.clone(),
-                        })),
-                    }],
-                    location: -1,
-                })),
-            };
-            let fields = vec![(field.clone(), field.clone(), c.pg_type.clone())];
-            *cast = Some(row_column_expr(&read, &fields, params, &Document::new())?);
-        }
-        Some(Returning { columns, casts })
-    };
+    let (returning, joined) = plan_write_returning(&u.returning_list, &def, params)?;
 
     Ok(Statement::Update(Update {
         table,
@@ -45172,6 +45126,81 @@ fn plan_update(
         returning,
         joined,
     }))
+}
+
+/// A write's RETURNING list, and the joined row's values it reads
+/// (`split_joined_returning`): each is planned over the OLD row, as an
+/// UPDATE's SET value is, and is visible to the RETURNING list as a column
+/// of its own (RP-686, RP-938).
+fn plan_write_returning(
+    list: &[pg_query::protobuf::Node],
+    def: &TableDef,
+    params: &[Bson],
+) -> Result<(Option<Returning>, JoinedValues)> {
+    let (hidden, visible): (Vec<_>, Vec<_>) = list.iter().partition(|t| {
+        matches!(t.node.as_ref(), Some(N::ResTarget(rt)) if rt.name.starts_with(JOINED_RETURNING))
+    });
+    let mut joined: JoinedValues = Vec::new();
+    let mut returning_def = def.clone();
+    if !hidden.is_empty() {
+        let fields: Vec<RowField> = def
+            .columns
+            .iter()
+            .chain(def.system_columns.iter())
+            .map(|c| {
+                note_bpchar_width(c);
+                (c.name.clone(), c.field(), c.pg_type.clone())
+            })
+            .collect();
+        let mut sample = Document::new();
+        for c in &def.columns {
+            sample.insert(c.field(), sample_value_for_type(&c.pg_type));
+        }
+        for t in hidden {
+            let Some(N::ResTarget(rt)) = t.node.as_ref() else {
+                continue;
+            };
+            let val = rt
+                .val
+                .as_deref()
+                .ok_or_else(|| Error::Parse("RETURNING without a value".into()))?;
+            let expr = row_column_expr(val, &fields, params, &sample)?;
+            returning_def.system_columns.push(Column {
+                field_override: Some(rt.name.clone()),
+                ..Column::new(&rt.name, column_expr_type(&expr), false)
+            });
+            joined.push((rt.name.clone(), expr));
+        }
+    }
+    if visible.is_empty() {
+        return Ok((None, joined));
+    }
+    let visible: Vec<pg_query::protobuf::Node> = visible.into_iter().cloned().collect();
+    let (columns, mut casts) = plan_table_targets(&visible, &returning_def, params)?;
+    // A bare read of a joined value is typed by its expression: the executor
+    // describes an uncast column by the table it writes, which has no such
+    // column.
+    for ((_, field), cast) in columns.iter().zip(casts.iter_mut()) {
+        if cast.is_some() || !field.starts_with(JOINED_RETURNING) {
+            continue;
+        }
+        let Some(c) = returning_def.column(field) else {
+            continue;
+        };
+        let read = pg_query::protobuf::Node {
+            node: Some(N::ColumnRef(pg_query::protobuf::ColumnRef {
+                fields: vec![pg_query::protobuf::Node {
+                    node: Some(N::String(pg_query::protobuf::String {
+                        sval: field.clone(),
+                    })),
+                }],
+                location: -1,
+            })),
+        };
+        let fields = vec![(field.clone(), field.clone(), c.pg_type.clone())];
+        *cast = Some(row_column_expr(&read, &fields, params, &Document::new())?);
+    }
+    Ok((Some(Returning { columns, casts }), joined))
 }
 
 /// Record one column's new value in an UPDATE's `$set` / `$unset` lists.
@@ -45598,18 +45627,14 @@ fn plan_delete(
             None => lower_where_or_residual(w, &def, params)?,
         },
     };
-    let returning = if d.returning_list.is_empty() {
-        None
-    } else {
-        let (columns, casts) = plan_table_targets(&d.returning_list, &def, params)?;
-        Some(Returning { columns, casts })
-    };
+    let (returning, joined) = plan_write_returning(&d.returning_list, &def, params)?;
 
     Ok(Statement::Delete(Delete {
         table,
         filter,
         residual,
         returning,
+        joined,
     }))
 }
 

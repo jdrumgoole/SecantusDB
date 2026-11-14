@@ -18,7 +18,8 @@ found while working them:
   in RETURNING that reads the FROM item);
 - RETURNING read a FROM item after the write, so a FROM item over the
   target saw the rows the statement had changed (UPDATE, RP-937, fixed) or
-  deleted (DELETE ... USING, RP-938);
+  deleted (DELETE ... USING, RP-938, fixed but for a subquery in RETURNING
+  that reads the USING item);
 - a PL/pgSQL assignment to a record's field (`NEW.a := -5`) did not check
   the field's domain, so a trigger that assigned a bad value and then a
   good one was not refused (RP-670, fixed).
@@ -415,15 +416,42 @@ RETURNING_USING_BEFORE_DELETE = {
         [(-1, -1), (7, -3)],
         [(5, 5)],
     ),
+    "delete from t668 using t668 s where s.a = t668.a and t668.b < 0 returning t668.*, s.b": (
+        [(-1, -1, -1), (7, -3, -3)],
+        [(5, 5)],
+    ),
+    "delete from t668 t using u668 u where u.k = t.a returning t.a, v, u.v + t.b": (
+        [(-1, 10, 9), (5, 50, 55), (7, 70, 67)],
+        [],
+    ),
 }
 
 
-@pytest.mark.backlog("RP-938")
+@pytest.mark.backlog_fixed("RP-938")
 @pytest.mark.parametrize("query", list(RETURNING_USING_BEFORE_DELETE))
 def test_delete_returning_reads_a_using_item_as_it_was_before_the_delete(
     query: str, dsn: str
 ) -> None:
     assert _scoped_answer(dsn, query) == RETURNING_USING_BEFORE_DELETE[query]
+
+
+# The rest of RP-938: a SUBQUERY in RETURNING that reads a USING item still
+# finds the joining row after the delete, when a derived table over the
+# target no longer holds it.
+RETURNING_USING_SUBQUERY = {
+    "delete from t668 using (select a, b from t668) x where x.a = t668.a returning (select x.b)": (
+        [(-1,), (5,), (-3,)],
+        [],
+    ),
+}
+
+
+@pytest.mark.backlog("RP-938")
+@pytest.mark.parametrize("query", list(RETURNING_USING_SUBQUERY))
+def test_a_delete_returning_subquery_reads_a_using_item_as_it_was_before_the_delete(
+    query: str, dsn: str
+) -> None:
+    assert _scoped_answer(dsn, query) == RETURNING_USING_SUBQUERY[query]
 
 
 # A BEFORE ROW trigger on `t664t`, by the body of its function. PostgreSQL

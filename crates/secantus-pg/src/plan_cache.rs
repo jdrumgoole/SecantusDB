@@ -657,6 +657,9 @@ fn substitute_counting(
             if let Some(e) = &mut d.residual {
                 sub_expr(e, from, to, h);
             }
+            for (_, e) in &mut d.joined {
+                sub_expr(e, from, to, h);
+            }
         }
         _ => return None,
     }
