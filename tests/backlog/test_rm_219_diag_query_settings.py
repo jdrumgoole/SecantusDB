@@ -541,13 +541,13 @@ def _ftdc_files(client: Any, dbpath: str) -> tuple:
     return reported == directory, any(re.fullmatch(pattern, n) for n in names)
 
 
-@pytest.mark.backlog("RM-417")
+@pytest.mark.backlog_fixed("RM-417")
 def test_samples_are_written_to_diagnostic_data(
     tmp_path: Any,
     mongod_rs: Any,  # noqa: F811
 ) -> None:
-    """mongod 8.2.11 writes its samples to `<dbpath>/diagnostic.data`, a
-    `metrics.<time>-00000` file it names in
+    """Like mongod 8.2.11, the server wrote its samples to
+    `<dbpath>/diagnostic.data`, a `metrics.<time>-00000` file it named in
     `diagnosticDataCollectionDirectoryPath`."""
     dbpath = mongod_rs.admin.command("getCmdLineOpts")["parsed"]["storage"]["dbPath"]
     store = str(tmp_path / "store")
@@ -555,6 +555,33 @@ def test_samples_are_written_to_diagnostic_data(
         _latest_sample(rust)
         ours = _ftdc_files(rust, store)
     assert ours == _ftdc_files(mongod_rs, dbpath) == (True, True)
+
+
+def _archive_types(dbpath: str) -> list:
+    """The `type` of each document in `diagnostic.data`'s archive files, in
+    file order."""
+    directory = os.path.join(dbpath, "diagnostic.data")
+    types = []
+    for name in sorted(os.listdir(directory)):
+        if name.startswith("metrics.") and name != "metrics.interim":
+            with open(os.path.join(directory, name), "rb") as f:
+                types += [d["type"] for d in bson.decode_all(f.read())]
+    return types
+
+
+@pytest.mark.backlog("RM-690")
+def test_the_archive_records_the_parameters(
+    tmp_path: Any,
+    mongod_rs: Any,  # noqa: F811
+) -> None:
+    """mongod 8.2.11 opens each archive file with its metadata (`type: 0`)
+    and then its periodic metadata (`type: 2`, `{start, getParameter,
+    getClusterParameter, end}`, `count: 0`), before the first chunk."""
+    dbpath = mongod_rs.admin.command("getCmdLineOpts")["parsed"]["storage"]["dbPath"]
+    store = str(tmp_path / "store")
+    with rust_mongo_server(store) as rust:
+        _latest_sample(rust)
+    assert _archive_types(store)[:2] == _archive_types(dbpath)[:2] == [0, 2]
 
 
 def _set_framework(client: Any, db: str, query: dict, framework: str) -> None:

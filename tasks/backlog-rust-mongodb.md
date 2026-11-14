@@ -2077,21 +2077,21 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       Carried over from RM-416, 2026-11-14.
       Verify: tests/backlog/test_rm_219_diag_query_settings.py::test_db_check_extra_index_keys_remainder, tests/backlog/test_rm_219_diag_query_settings.py::test_apply_ops_other_entries
       Backlog-ID: RM-688
-- [ ] **FTDC is a sample in memory only.** Since 2026-11-10 the sample
-      carries `transportLayerStats` and `diagnosticDataCollectionEnabled` /
-      `diagnosticDataCollectionPeriodMillis` switch it and set its period.
-      Open: nothing is written to `diagnostic.data` (mongod 8.2.11 keeps
-      `metrics.<time>-00000` files and `metrics.interim` there, and reports
-      the directory in `diagnosticDataCollectionDirectoryPath`), so the
-      other `diagnosticData*` parameters, which tune that writer, are not
-      registered (72 here). In `transportLayerStats` mongod also lists its
-      Unix domain socket (`/tmp/mongodb-<port>.sock`), which this server
-      does not listen on, and on Linux measures each TCP listener's backlog
-      depth and counts the connections it discards for a client that left;
-      macOS mongod reports 0 for both, as this server does everywhere (the
-      Linux measurement is not in the macOS binary; not probed on Linux).
-      Verify: tests/backlog/test_rm_219_diag_query_settings.py::test_samples_are_written_to_diagnostic_data
-      Backlog-ID: RM-417
+- [ ] **The FTDC archive writes no periodic metadata.** Since 2026-11-14
+      samples go to `diagnostic.data` in mongod's format (RM-417). Open:
+      mongod 8.2.11 also writes `type: 2` documents, `{start, getParameter,
+      getClusterParameter, end}` in full with `count: 0` after each file's
+      metadata and then only what changed; this server writes none.
+      `diagnosticDataCollectionEnableLatencyHistograms` and
+      `diagnosticDataCollectionVerboseTCMalloc`, which add to the sample,
+      are not registered (72 here). In `transportLayerStats` mongod also
+      lists its Unix domain socket (`/tmp/mongodb-<port>.sock`), which this
+      server does not listen on, and on Linux measures each TCP listener's
+      backlog depth and counts the connections it discards for a client
+      that left; macOS mongod reports 0 for both, as this server does
+      everywhere (not probed on Linux).
+      Verify: tests/backlog/test_rm_219_diag_query_settings.py::test_the_archive_records_the_parameters
+      Backlog-ID: RM-690
 - [ ] **`$querySettings` gives no `debugQueryShape`, and query settings
       miss two of mongod's mechanisms.** Since 2026-11-08
       `setQuerySettings` / `removeQuerySettings` / `$querySettings` keep

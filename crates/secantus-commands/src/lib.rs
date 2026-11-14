@@ -74,6 +74,7 @@ pub mod failpoints;
 pub mod find;
 pub mod findandmodify;
 pub mod ftdc;
+pub mod ftdc_file;
 pub mod handshake;
 mod hostinfo;
 pub use hostinfo::mem_size_mb;
