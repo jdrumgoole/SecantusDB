@@ -22,8 +22,8 @@ _INDETERMINATE = "42P22 could not determine which collation to use for string co
 
 # `COLLATE` is allowed over any expression of a collatable type, a domain
 # over `text` included (`transformCollateClause` asks `type_is_collatable`
-# of the expression's type).
-@pytest.mark.backlog("RP-802")
+# of the expression's type). Here it was 42804; fixed by RP-802.
+@pytest.mark.backlog_fixed("RP-802")
 def test_collate_over_a_collated_domain_expression(dsn: str) -> None:  # noqa: F811
     with _connect(dsn) as c:
         got = [

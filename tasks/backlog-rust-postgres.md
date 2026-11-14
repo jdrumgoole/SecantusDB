@@ -3734,28 +3734,6 @@ with ICU) with the `_SETUP` in `tests/backlog/test_rp_found_rp782.py`:
       Verify: tests/backlog/test_rp_found_rp782.py::test_pg_get_viewdef_of_a_system_view
       Backlog-ID: RP-798
 
-## Found while working RP-796 (2026-11-10)
-
-Measured on a private PostgreSQL 15.19 cluster (locale C.UTF-8, built
-with ICU) with the `_SETUP` in `tests/backlog/test_rp_found_rp782.py`
-(`xu782f` a domain over `text` `collate "und-x-icu"`, `xc782f` one
-`collate "C"`). The gap tests are in `tests/backlog/test_rp_found_rp796.py`.
-
-- [ ] **A `COLLATE` over an expression of a collated domain is 42804.**
-      `select 'a'::xu782f collate "C" < 'B'` is false on PostgreSQL 15.19,
-      `v::xu782f collate "C" < 'C'` over a VALUES list compares bytewise,
-      and `order by v::xu782f collate "C"` sorts `B, D, a, c`; here each is
-      42804 `collations are not supported by type xu782f` (a domain over a
-      domain too). `transformCollateClause` asks `type_is_collatable` of
-      the expression's type, which a domain over `text` is. The type
-      checks that refuse it list base type names (the FROM-less constant
-      `COLLATE` in `lib.rs`, among others) rather than asking
-      `collation::collatable`, which follows a domain to its base. A
-      `COLLATE` naming a locale collation (`"und-x-icu"`) over one is
-      answered.
-      Verify: tests/backlog/test_rp_found_rp796.py::test_collate_over_a_collated_domain_expression
-      Backlog-ID: RP-802
-
 ## Found while working RP-803 (2026-11-10)
 
 Measured on a private PostgreSQL 15.19 cluster (locale C.UTF-8, built

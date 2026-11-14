@@ -48118,10 +48118,9 @@ fn const_value_node(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result<
             .ok_or_else(|| Error::Parse("COLLATE without an operand".into()))?;
         let value = const_value(arg, params)?;
         let ty = static_type(arg, &value);
-        if !matches!(
-            ty.as_str(),
-            "text" | "varchar" | "bpchar" | "name" | "unknown"
-        ) {
+        // `transformCollateClause` asks `type_is_collatable`, which a domain
+        // over a collatable type is (RP-802).
+        if !collation::collatable(&ty) {
             return Err(Error::DatatypeMismatch(format!(
                 "collations are not supported by type {}",
                 display_type(&ty)
