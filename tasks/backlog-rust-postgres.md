@@ -2476,21 +2476,6 @@ Measured on PostgreSQL 15.19 (the data-modifying WITH on a private cluster).
       measured on PostgreSQL 15.19.
       Verify: tests/backlog/test_rp_qualified_calls.py::test_other_sessions_temp_schema_relation_is_named_as_written
       Backlog-ID: RP-965
-- [ ] **The session's temp namespace does not follow its transactions.**
-      PostgreSQL 15.19 makes `myTempNamespace` with the first temporary
-      object and forgets it when the transaction (or subtransaction) that
-      made it aborts (`AtEOXact_Namespace`). Here `pg_my_temp_schema()`
-      after `begin; create temp table tt(a int); rollback` is the
-      namespace's oid where PostgreSQL answers 0 (the session's list of temp
-      tables keeps the rolled-back name), and after `begin; create temp
-      table tt(a int); drop table tt; commit` the call `pg_temp.nosuch()` is
-      3F000 `schema "pg_temp" does not exist` where PostgreSQL answers 42883
-      (the namespace is latched only from a statement outside a
-      transaction, `install_temp_namespace`). Faithful: keep the namespace's
-      creating (sub)transaction, as `myTempNamespaceSubID` does. Measured on
-      a private 15.19 cluster.
-      Verify: tests/backlog/test_rp_qualified_calls.py::test_temp_namespace_follows_transactions
-      Backlog-ID: RP-883
 
 
 ## Found while working RP-881 (2026-11-12)

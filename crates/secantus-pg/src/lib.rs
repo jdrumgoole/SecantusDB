@@ -4559,9 +4559,11 @@ pub struct PgHandler {
     wire_dealloc: Mutex<Vec<String>>,
     /// The temporary tables this session created, dropped when it ends.
     temp_tables: Mutex<Vec<String>>,
-    /// The session's temp namespace has been made (PostgreSQL's
-    /// `myTempNamespace`; see [`Self::install_temp_namespace`]).
-    temp_namespace_made: AtomicBool,
+    /// The session's temp namespace (PostgreSQL's `myTempNamespace`; see
+    /// [`Self::install_temp_namespace`]): `None` until made, then the
+    /// savepoint level of the transaction that made it while that is
+    /// open (`myTempNamespaceSubID`), `Some(None)` once committed.
+    temp_namespace: Mutex<Option<Option<usize>>>,
     /// The open block declared a `WITH HOLD` cursor: another thing
     /// PostgreSQL refuses to PREPARE.
     holdable_declared: AtomicBool,
@@ -5147,7 +5149,7 @@ impl PgHandler {
             statement_source: Mutex::new(None),
             wire_dealloc: Mutex::new(Vec::new()),
             temp_tables: Mutex::new(Vec::new()),
-            temp_namespace_made: AtomicBool::new(false),
+            temp_namespace: Mutex::new(None),
             holdable_declared: AtomicBool::new(false),
             txn_gucs: Mutex::new(HashMap::new()),
             statement_gucs: Mutex::new(HashMap::new()),
@@ -5635,26 +5637,61 @@ impl PgHandler {
     }
 
     /// Whether the session's temp namespace exists, for an explicit
-    /// `pg_temp` (`LookupExplicitNamespace`): PostgreSQL's `myTempNamespace`,
-    /// made by the session's first temporary object and kept after its
-    /// last is dropped. Latched from the objects the planner was just
-    /// given, outside a transaction only: one a rolled-back transaction or
-    /// savepoint made leaves no namespace (`AtEOXact_Namespace`), and
-    /// inside one the planner sees the objects themselves. (An object made
-    /// and dropped inside one transaction that commits is missed.)
+    /// `pg_temp` (`LookupExplicitNamespace`) and `pg_my_temp_schema()`:
+    /// PostgreSQL's `myTempNamespace`, made by the session's first
+    /// temporary object and kept after its last is dropped. Latched from
+    /// the objects the planner was just given, with the savepoint level
+    /// it was made at while its transaction is open: the transaction or
+    /// savepoint that made it unmakes it when it aborts, and a RELEASE or
+    /// COMMIT hands it to the enclosing level (`AtEOXact_Namespace`,
+    /// `AtEOSubXact_Namespace`; RP-883).
     fn install_temp_namespace(&self) {
-        let made = &self.temp_namespace_made;
-        if !made.load(std::sync::atomic::Ordering::Relaxed)
-            && !self
-                .in_transaction
-                .load(std::sync::atomic::Ordering::Relaxed)
-            && secantus_pgplan::schemas::session_holds_temp()
-        {
-            made.store(true, std::sync::atomic::Ordering::Relaxed);
+        let mut ns = self
+            .temp_namespace
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if ns.is_none() && secantus_pgplan::schemas::session_holds_temp() {
+            *ns = Some(
+                self.in_transaction
+                    .load(std::sync::atomic::Ordering::Relaxed)
+                    .then(|| {
+                        self.savepoints
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .len()
+                    }),
+            );
         }
-        secantus_pgplan::schemas::set_temp_namespace_made(
-            made.load(std::sync::atomic::Ordering::Relaxed),
-        );
+        secantus_pgplan::schemas::set_temp_namespace_made(ns.is_some());
+    }
+
+    /// Whether the session's temp namespace has been made.
+    fn temp_namespace_made(&self) -> bool {
+        self.temp_namespace
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_some()
+    }
+
+    /// The temp namespace at the end of a (sub)transaction, `open` the
+    /// savepoints still open after it: made at a level the end aborted, it
+    /// is gone; made at one it committed, it moves to the enclosing level
+    /// (`None` for the top level's COMMIT).
+    fn end_temp_namespace_level(&self, open: Option<usize>, committed: bool) {
+        let mut ns = self
+            .temp_namespace
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some(Some(level)) = *ns {
+            let ended = open.is_none_or(|open| level >= open);
+            if ended {
+                *ns = if committed {
+                    Some(open.map(|o| o.min(level)))
+                } else {
+                    None
+                };
+            }
+        }
     }
 
     fn install_session_state(&self) {
@@ -13725,14 +13762,12 @@ impl PgHandler {
             ("information_schema".into(), 13679),
             ("pg_toast".into(), 99),
         ];
-        // The session's temp namespace exists once it holds a relation (or
-        // a function), as PostgreSQL's `pg_temp_N` does.
+        // The session's temp namespace exists once made (RP-883), or while
+        // it holds a relation (or a function), as PostgreSQL's `pg_temp_N`
+        // does.
         let own_temp = self.temp_schema_name();
-        if !self
-            .temp_tables
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .is_empty()
+        if self.temp_namespace_made()
+            || secantus_pgplan::schemas::session_holds_temp()
             || self
                 .type_catalog_docs_raw(Self::FUNCTION_COLLECTION)
                 .is_ok_and(|docs| {
@@ -33548,13 +33583,11 @@ impl PgHandler {
         // (RP-071). A NULL name is NULL, as there.
         if name == "pg_my_temp_schema" {
             // The session's `pg_temp_N`, once it exists; 0 before.
+            if !self.temp_namespace_made() && !secantus_pgplan::schemas::session_holds_temp() {
+                return Ok(Bson::Int64(0));
+            }
             let own = self.temp_schema_name();
-            return Ok(Bson::Int64(
-                self.namespaces()
-                    .into_iter()
-                    .find(|(n, _)| *n == own)
-                    .map_or(0, |(_, o)| o),
-            ));
+            return Ok(Bson::Int64(Self::index_oid(&format!("ns:{own}"))));
         }
         if name == "pg_get_serial_sequence" {
             let arg = |i: usize| {
@@ -35129,6 +35162,15 @@ impl PgHandler {
                 }
                 other => {
                     let out = self.transaction_control(other.clone());
+                    match other {
+                        TransactionControl::Commit { .. } | TransactionControl::Prepare(_) => {
+                            self.end_temp_namespace_level(None, out.is_ok())
+                        }
+                        TransactionControl::Rollback { .. } => {
+                            self.end_temp_namespace_level(None, false)
+                        }
+                        _ => {}
+                    }
                     // The block's transaction-scoped advisory locks end with
                     // it, and so do its marks (`catalog_touched` above has
                     // what the bump below needs).
@@ -38082,8 +38124,14 @@ impl PgHandler {
         let stats = self.stats();
         match control {
             TransactionControl::Savepoint(_) => stats.sub_begin(),
-            TransactionControl::Release(_) => stats.sub_end(depth, true),
-            TransactionControl::RollbackTo(_) => stats.sub_end(depth, false),
+            TransactionControl::Release(_) => {
+                stats.sub_end(depth, true);
+                self.end_temp_namespace_level(Some(depth - 1), true);
+            }
+            TransactionControl::RollbackTo(_) => {
+                stats.sub_end(depth, false);
+                self.end_temp_namespace_level(Some(depth - 1), false);
+            }
             _ => {}
         }
         Ok(out)
