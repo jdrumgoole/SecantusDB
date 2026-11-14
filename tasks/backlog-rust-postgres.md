@@ -4067,19 +4067,6 @@ statement is VALUES-only and runs there as written. The gap tests are in
       Verify: tests/backlog/test_rp_found_rp854.py::test_an_undefined_column_in_a_grouped_query_is_42703
       Backlog-ID: RP-874
 
-## Found while working RP-605 (2026-11-11)
-
-Measured on PostgreSQL 15.19; none of it needs DDL. The gap tests are in
-`tests/backlog/test_rp_found_rp605.py`.
-
-- [ ] **An escape-string literal's input error has no position when an
-      escape is in its value.** `select E'a\tb'::int4` is 22P02 at 8 on
-      PostgreSQL 15.19; here it has none, `errpos.rs` matching the quoted
-      value (with a real tab) against the literal's spelling (`\t`).
-      `E'x'::int4`, with no escape, is placed.
-      Verify: tests/backlog/test_rp_found_rp605.py::test_escaped_literal_input_error_has_a_position
-      Backlog-ID: RP-867
-
 ## Found while working RP-565 (2026-11-12)
 
 Measured on a private, freshly initdb'd PostgreSQL 15.19 cluster. The gap
