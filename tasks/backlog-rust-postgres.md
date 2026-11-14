@@ -2437,17 +2437,24 @@ Measured on PostgreSQL 15.19 (the data-modifying WITH on a private cluster).
       42883 `function public.nosuch(integer) does not exist` at 8, the name
       as written, schema and all (`pg_catalog.nosuch()` and a user schema's
       alike). Here the message is `function nosuch(integer) does not exist`
-      and the position the bare name's, 15. Measured on a private 15.19
-      cluster.
+      and the position the bare name's, 15. The three-part form in the
+      session's database alike: `select postgres.public.nosuch()` is
+      `function postgres.public.nosuch() does not exist` at 8 there, and
+      `function nosuch() does not exist` at 24 here. Measured on a private
+      15.19 cluster.
       Verify: tests/backlog/test_rp_qualified_calls.py::test_missing_function_keeps_its_schema
       Backlog-ID: RP-879
-- [ ] **A three-part function name is looked up by its last part.** On
-      PostgreSQL 15.19 `select a.b.c()` is 0A000 `cross-database references
-      are not implemented: a.b.c` at 8 (`DeconstructQualifiedName`, the
-      catalog not the current database). Here it is 42883 `function c()
-      does not exist` at 12. Measured on a private 15.19 cluster.
-      Verify: tests/backlog/test_rp_qualified_calls.py::test_three_part_function_name
-      Backlog-ID: RP-880
+- [ ] **A function found nowhere inside another call's arguments is
+      reported as the outer call's missing overload.** On PostgreSQL 15.19
+      `select abs(nosuch1())` is 42883 `function nosuch1() does not exist`
+      at 12: `transformFuncCall` analyses the arguments before it looks
+      the outer function up. Here it is `function abs(text) does not
+      exist` at 8 -- the inner call is typed and the outer lookup fails
+      first. (A refused qualified name inside the arguments,
+      `abs(a.b.c())`, is already answered right, RP-880.) Measured on
+      PostgreSQL 15.19.
+      Verify: tests/backlog/test_rp_qualified_calls.py::test_enclosing_call_waits_for_its_arguments
+      Backlog-ID: RP-950
 - [ ] **A missing relation qualified with `pg_temp` is named by the
       session's `pg_temp_N`.** On PostgreSQL 15.19 `select * from
       pg_temp.nosuch` is 42P01 `relation "pg_temp.nosuch" does not exist`

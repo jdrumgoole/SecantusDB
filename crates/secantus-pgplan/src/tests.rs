@@ -8135,3 +8135,60 @@ fn a_cast_of_a_column_is_an_expression_with_its_functions_cost() {
         assert_eq!(scan_expr_quals(sql), None, "{sql}");
     }
 }
+
+/// A three-part call name in another database is 0A000 naming the whole
+/// name, four parts are 42601, both at the call and before its schema is
+/// looked up; the session's own database leaves the schema to be looked up
+/// as for two parts (RP-880). Measured on PostgreSQL 15.19.
+#[test]
+fn a_call_name_is_deconstructed_before_its_schema_is_looked_up() {
+    set_session_database("postgres");
+    for (sql, sqlstate, message, at) in [
+        (
+            "select a.b.c()",
+            "0A000",
+            "cross-database references are not implemented: a.b.c",
+            7,
+        ),
+        (
+            "select 1 + x.nosuch_schema.abs(-1)",
+            "0A000",
+            "cross-database references are not implemented: x.nosuch_schema.abs",
+            11,
+        ),
+        (
+            "select a.b.c.d()",
+            "42601",
+            "improper qualified name (too many dotted names): a.b.c.d",
+            7,
+        ),
+        (
+            "select postgres.nosuch_schema.f()",
+            "3F000",
+            r#"schema "nosuch_schema" does not exist"#,
+            7,
+        ),
+    ] {
+        take_error_location();
+        let err = plan(sql, &lookup).unwrap_err();
+        assert_eq!(
+            (
+                err.sqlstate(),
+                err.to_string().as_str(),
+                take_error_location()
+            ),
+            (sqlstate, message, Some(at)),
+            "{sql}"
+        );
+    }
+    // An analysis error PostgreSQL meets first still comes first.
+    assert_eq!(
+        plan("select a.b.c() from nosuch_table", &lookup)
+            .unwrap_err()
+            .sqlstate(),
+        "42P01"
+    );
+    // The session's own database is no cross-database reference.
+    plan("select postgres.pg_catalog.abs(-2)", &lookup).expect("planned");
+    set_session_database("");
+}
