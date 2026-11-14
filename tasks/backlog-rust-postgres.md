@@ -3628,16 +3628,6 @@ Measured on a private PostgreSQL 15.19 cluster.
       evaluation has no `tableoid` to read.
       Verify: tests/backlog/test_rp_found_rp816.py::test_tableoid_in_a_check_is_a_column
       Backlog-ID: RP-859
-- [ ] **A CHECK takes another table's qualifier, and names a qualified
-      missing column without it.** `create table t816 (x int, check
-      (other.x = 1))` creates the table here; PostgreSQL 15.19 is 42P01
-      `missing FROM-clause entry for table "other"` at 34 (the CHECK's
-      range table holds only its own table). `check (t816.nosuch = 1)` is
-      42703 `column t816.nosuch does not exist` at 34 there
-      (`errorMissingColumn` names the qualifier, at the reference's start)
-      and `column "nosuch" does not exist` at 39 here.
-      Verify: tests/backlog/test_rp_found_rp816.py::test_a_checks_qualified_column_is_resolved_against_its_table
-      Backlog-ID: RP-861
 
 ## Found while working RP-860 (2026-11-14)
 

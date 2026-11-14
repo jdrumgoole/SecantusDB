@@ -8363,3 +8363,33 @@ fn a_system_column_in_a_generation_expression_is_refused() {
     )
     .expect("tableoid is allowed");
 }
+
+/// A CHECK's range table holds only its own table: another qualifier is
+/// 42P01, and a qualified missing column is named with its qualifier at the
+/// reference's start, as on PostgreSQL 15.19 (RP-861).
+#[test]
+fn a_checks_qualified_column_is_resolved_against_its_table() {
+    for (sql, state, msg, pos) in [
+        (
+            "create table t816 (x int, check (other.x = 1))",
+            "42P01",
+            "missing FROM-clause entry for table \"other\"",
+            34,
+        ),
+        (
+            "create table t816 (x int, check (t816.nosuch = 1))",
+            "42703",
+            "column t816.nosuch does not exist",
+            34,
+        ),
+    ] {
+        take_error_location();
+        let err = plan(sql, &lookup).expect_err("should refuse");
+        assert_eq!(err.sqlstate(), state, "got {err}");
+        assert_eq!(err.to_string(), msg);
+        assert_eq!(
+            crate::errpos::error_position(sql, state, &err.to_string()),
+            Some(pos)
+        );
+    }
+}

@@ -228,7 +228,7 @@ def test_a_whole_row_check_is_enforced(
     assert _script(dsn, statements) == expected
 
 
-@pytest.mark.backlog("RP-861")
+@pytest.mark.backlog_fixed("RP-861")
 @pytest.mark.parametrize(
     ("query", "expected"),
     [
@@ -248,8 +248,8 @@ def test_a_checks_qualified_column_is_resolved_against_its_table(
     """A CHECK's range table holds only its own table, so another table's
     name is 42P01 at the reference, and a missing column written with its
     qualifier is named with it (`errorMissingColumn`) at the reference's
-    start, on PostgreSQL 15.19. Here the first table is created and the
-    second error names `"nosuch"` at the column."""
+    start, on PostgreSQL 15.19. The first table was created here and the
+    second error named `"nosuch"` at the column."""
     assert _answer(dsn, query) == expected
 
 

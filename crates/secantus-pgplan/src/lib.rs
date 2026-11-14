@@ -13918,15 +13918,29 @@ fn first_bad_column(
                         _ => None,
                     })
                     .collect();
-                let (ours, col) = match parts.as_slice() {
-                    [col] => (true, *col),
-                    [table, col] => (*table == name, *col),
+                // The constraint's range table holds only its own table: any
+                // other qualifier is 42P01, and a qualified missing column
+                // is named with its qualifier (`errorMissingColumn`, RP-861).
+                let (qualified, col) = match parts.as_slice() {
+                    [col] => (false, *col),
+                    [table, col] if *table == name => (true, *col),
+                    [table, _] => {
+                        note(c.location, BadReference::OtherTable(table.to_string()));
+                        return Ok(());
+                    }
                     _ => return Ok(()),
                 };
-                if ours && system(col) {
+                if system(col) {
                     note(c.location, BadReference::System(col.to_string()));
-                } else if !ours || !known(col) {
-                    note(c.location, BadReference::Missing);
+                } else if !known(col) {
+                    note(
+                        c.location,
+                        if qualified {
+                            BadReference::Field(col.to_string())
+                        } else {
+                            BadReference::Missing
+                        },
+                    );
                 }
             }
             _ => {}
