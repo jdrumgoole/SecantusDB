@@ -33,6 +33,39 @@ pub struct ParsedRun {
     /// `--repair`: repair the store and exit instead of serving (mongod's
     /// `--repair`). Command line only, as mongod's is.
     pub repair: bool,
+    /// The options given on the command line, as mongod's `getCmdLineOpts`
+    /// reports them under `parsed`: each under its configuration-file path
+    /// (`--port 27031 --dbpath D` is `{net: {port: 27031}, storage: {dbPath:
+    /// D}}`), keys in order (mongod builds it from an ordered map). Only the
+    /// flags with a mongod option appear (RM-425).
+    pub cmd_line: bson::Document,
+}
+
+/// Put `value` at the dotted configuration path `path` in `doc`, creating
+/// the sub-documents on the way.
+fn set_option(doc: &mut bson::Document, path: &[&str], value: bson::Bson) {
+    let (last, parents) = path.split_last().expect("non-empty path");
+    let mut cur = doc;
+    for key in parents {
+        if !matches!(cur.get(*key), Some(bson::Bson::Document(_))) {
+            cur.insert(*key, bson::Document::new());
+        }
+        cur = cur.get_document_mut(*key).expect("just inserted");
+    }
+    cur.insert(*last, value);
+}
+
+/// Sort every level of `doc` by key, as mongod's option map is ordered.
+fn sort_options(doc: bson::Document) -> bson::Document {
+    let mut pairs: Vec<(String, bson::Bson)> = doc.into_iter().collect();
+    pairs.sort_by(|a, b| a.0.cmp(&b.0));
+    pairs
+        .into_iter()
+        .map(|(k, v)| match v {
+            bson::Bson::Document(d) => (k, bson::Bson::Document(sort_options(d))),
+            other => (k, other),
+        })
+        .collect()
 }
 
 /// A fully-resolved run configuration: where to bind, the WiredTiger home, and
@@ -269,6 +302,7 @@ pub fn parse_args(args: &[String]) -> Result<Parsed, String> {
     let mut tls_ca_file: Option<String> = None;
     let mut tls_require_client_cert = false;
     let mut repair = false;
+    let mut cmd_line = bson::Document::new();
 
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {
@@ -291,16 +325,33 @@ pub fn parse_args(args: &[String]) -> Result<Parsed, String> {
         match flag {
             "--help" | "-h" => return Ok(Parsed::Help(usage())),
             "--version" => return Ok(Parsed::Version(version_text("secantusd-rs"))),
-            "--config" => config_path = Some(PathBuf::from(take_value("--config")?)),
-            "--host" => o.host = Some(take_value("--host")?),
+            "--config" => {
+                let v = take_value("--config")?;
+                set_option(&mut cmd_line, &["config"], v.clone().into());
+                config_path = Some(PathBuf::from(v));
+            }
+            "--host" => {
+                let v = take_value("--host")?;
+                set_option(&mut cmd_line, &["net", "bindIp"], v.clone().into());
+                o.host = Some(v);
+            }
             "--port" => {
                 let raw = take_value("--port")?;
                 o.port =
                     Some(raw.parse::<u16>().map_err(|_| {
                         format!("--port expects an integer in 0..=65535, got {raw:?}")
                     })?);
+                set_option(
+                    &mut cmd_line,
+                    &["net", "port"],
+                    bson::Bson::Int32(i32::from(o.port.unwrap_or_default())),
+                );
             }
-            "--storage-path" => o.storage_path = Some(take_value("--storage-path")?),
+            "--storage-path" => {
+                let v = take_value("--storage-path")?;
+                set_option(&mut cmd_line, &["storage", "dbPath"], v.clone().into());
+                o.storage_path = Some(v);
+            }
             "--log-level" => {
                 let lvl = take_value("--log-level")?;
                 validate_log_level(&lvl, "secantusd-rs").map_err(|_| {
@@ -356,14 +407,27 @@ pub fn parse_args(args: &[String]) -> Result<Parsed, String> {
                     format!("--oplog-max-entries expects a non-negative integer, got {raw:?}")
                 })?);
             }
-            "--auth" => o.auth = Some(true),
+            "--auth" => {
+                set_option(
+                    &mut cmd_line,
+                    &["security", "authorization"],
+                    "enabled".into(),
+                );
+                o.auth = Some(true);
+            }
             "--standalone" => o.standalone = Some(true),
-            "--repair" => repair = true,
+            "--repair" => {
+                set_option(&mut cmd_line, &["repair"], true.into());
+                repair = true;
+            }
             "--enable-test-commands" => o.enable_test_commands = Some(true),
-            "--setParameter" => o
-                .set_parameters
-                .get_or_insert_with(Vec::new)
-                .push(take_value("--setParameter")?),
+            "--setParameter" => {
+                let v = take_value("--setParameter")?;
+                if let Some((name, value)) = v.split_once('=') {
+                    set_option(&mut cmd_line, &["setParameter", name], value.into());
+                }
+                o.set_parameters.get_or_insert_with(Vec::new).push(v);
+            }
             "--tls-cert-file" => tls_cert_file = Some(take_value("--tls-cert-file")?),
             "--tls-key-file" => tls_key_file = Some(take_value("--tls-key-file")?),
             "--tls-ca-file" => tls_ca_file = Some(take_value("--tls-ca-file")?),
@@ -415,6 +479,7 @@ pub fn parse_args(args: &[String]) -> Result<Parsed, String> {
         config_path,
         overrides: o,
         repair,
+        cmd_line: sort_options(cmd_line),
     })))
 }
 
@@ -548,6 +613,30 @@ mod tests {
     fn parse(words: &[&str]) -> Result<Parsed, String> {
         let owned: Vec<String> = words.iter().map(|s| s.to_string()).collect();
         parse_args(&owned)
+    }
+
+    #[test]
+    fn cmd_line_names_each_option_under_its_mongod_path() {
+        let pr = match parse(&[
+            "--storage-path",
+            "D",
+            "--port=27031",
+            "--auth",
+            "--oplog-async",
+        ])
+        .unwrap()
+        {
+            Parsed::Run(pr) => pr,
+            other => panic!("expected Run, got {other:?}"),
+        };
+        assert_eq!(
+            pr.cmd_line,
+            bson::doc! {
+                "net": {"port": 27031},
+                "security": {"authorization": "enabled"},
+                "storage": {"dbPath": "D"},
+            }
+        );
     }
 
     /// Parse into a [`ParsedRun`], then resolve with no TOML file so the result

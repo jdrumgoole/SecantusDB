@@ -17,9 +17,9 @@ import pytest
 from tests.backlog.conftest import _RS_BANNER, RS_BINARY, drain_output
 
 
-@pytest.mark.backlog("RM-425")
+@pytest.mark.backlog_fixed("RM-425")
 def test_get_cmd_line_opts_reports_the_command_line(tmp_path: pathlib.Path) -> None:
-    """mongod's `parsed` names each option it was given, and `argv` is the
+    """`parsed` named each option it was given, and `argv` was the
     command line itself."""
     store = tmp_path / "store"
     argv = [str(RS_BINARY), "--port", "0", "--storage-path", str(store)]

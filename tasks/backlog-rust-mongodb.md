@@ -1296,7 +1296,7 @@ These are explicit non-goals. Don't add them without a reason.
   the log is mongod's structured log, and since 2026-11-13 this server
   starts it as mongod 8.2.11 does on `initandlisten`: `MongoDB starting`,
   `Build Info` (23403), `Operating System` (51765), `Options set by command
-  line` (21951, which carries RM-425's `parsed` until that is fixed), the
+  line` (21951), the
   lock file's `Detected unclean shutdown` (22271), `Opening WiredTiger`
   (22315), `WiredTiger opened` (4795906) and, last, `mongod startup
   complete` (8423403). mongod writes about sixty more there that this
@@ -2193,16 +2193,6 @@ inject (a panic, a power loss, a failing checkpoint).
       collection, readable by a scan and not by `_id`.
       Backlog-ID: RM-318
       Verify: none -- needs a salvage that brings back a deleted document beside its replacement, which no quick test can stage
-- [ ] **`getCmdLineOpts` does not report the command line.** mongod 8.2.1
-      answers with `argv` as the process was started and `parsed` holding
-      each option given, under its configuration-file path (`--port 27031
-      --dbpath D` is `{net: {port: 27031}, storage: {dbPath: D}}`); this
-      server answers `argv: ["secantus"]` (and `--auth`) and `parsed: {net:
-      {}, storage: {}}` whatever it was started with. The same `parsed` is
-      the `cmdLine` of each `local.startup_log` record, which shares the
-      gap. Found while fixing RM-319 (2026-11-08).
-      Backlog-ID: RM-425
-      Verify: tests/backlog/test_rm_cmd_line_opts.py::test_get_cmd_line_opts_reports_the_command_line
 
 ### 7.084 What an authenticated user may run -- 2026-10-14
 
