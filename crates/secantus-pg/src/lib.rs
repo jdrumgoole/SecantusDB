@@ -22961,8 +22961,13 @@ impl PgHandler {
         // relation's rows (RP-715). One such build per catalog per cycle: a
         // second relation asked for in the same cycle -- a correlated
         // subquery's per-row lookups -- builds every row once, so a cycle
-        // never pays one build per outer row.
+        // never pays one build per outer row. A key whose build reads no
+        // user state (`pg_type`'s built-in oids) costs the same whatever
+        // the schema holds, so it is always built alone and does not count
+        // as another: a table of an `int` and a `text` column asked for two
+        // and built every user type (RP-927).
         let pinned = catalog_key(name, filter);
+        let schema_free = |k: i64| name == "pg_type" && k < Self::FIRST_USER_TYPE_OID;
         let keyed_name = pinned.as_ref().map(|(_, k)| format!("{name}\u{1f}{k}"));
         let (hit, build_key) = {
             let cache = self.virtual_cache.lock().unwrap_or_else(|e| e.into_inner());
@@ -22978,10 +22983,14 @@ impl PgHandler {
                     Some(rows) => (Some(rows), None),
                     None => {
                         let prefix = format!("{name}\u{1f}");
-                        let another = cache
-                            .iter()
-                            .any(|(n, (c, v, g, _))| n.starts_with(&prefix) && (*c, *v, *g) == key);
-                        (None, if another { None } else { pinned.clone() })
+                        let another = cache.iter().any(|(n, (c, v, g, _))| {
+                            (*c, *v, *g) == key
+                                && n.strip_prefix(&prefix)
+                                    .and_then(|k| k.parse::<i64>().ok())
+                                    .is_some_and(|k| !schema_free(k))
+                        });
+                        let alone = pinned.as_ref().is_some_and(|(_, k)| schema_free(*k));
+                        (None, if another && !alone { None } else { pinned.clone() })
                     }
                 },
                 (None, None) => (None, None),

@@ -298,7 +298,7 @@ def _fastest_first_over_two_types(pg: Any, prefix: str) -> float:
     return min(times)
 
 
-@pytest.mark.backlog("RP-927")
+@pytest.mark.backlog_fixed("RP-927")
 def test_the_first_catalog_query_after_ddl_over_two_column_types_costs_the_same_at_400_tables(
     pg_alone: Any,
 ) -> None:
@@ -306,7 +306,7 @@ def test_the_first_catalog_query_after_ddl_over_two_column_types_costs_the_same_
     and a `text` column, straight after its `CREATE TABLE`, in the same time
     however many other tables there are (0.35 ms with none, 0.33 ms with
     800, private cluster, 2026-11-13): the subquery reads one `pg_type` row
-    per column through the type oid's index. A debug `secantusd-pg` took
+    per column through the type oid's index. Before RP-927 a debug `secantusd-pg` took
     about 0.016 s with none and 0.10 s with 800 (2026-11-13): one keyed
     build per catalog per message cycle, so the second column's type, a
     second key in the cycle, builds every `pg_type` row, each table's row
@@ -344,4 +344,44 @@ def test_create_table_costs_the_same_at_800_tables_within_a_tenth(pg_alone: Any)
     assert large < 1.1 * small + 0.001, (
         f"CREATE TABLE {small * 1000:.1f} ms with no other table, "
         f"{large * 1000:.1f} ms with {2 * GROWTH_TABLES}"
+    )
+
+
+def _fastest_first_over_two_enums(pg: Any, prefix: str) -> float:
+    """The fastest of five first runs of the collation query straight after
+    a `CREATE TABLE` of two columns of two user enums."""
+    times = []
+    for i in range(5):
+        table = f"{prefix}_{i}"
+        pg.execute(f"CREATE TABLE {table} (a rp_e1, b rp_e2)")
+        query = COLLATION_QUERY.replace("'rp_cx'", f"'{table}'")
+        start = time.monotonic()
+        assert pg.execute(query).fetchall() == [("a", None), ("b", None)]
+        times.append(time.monotonic() - start)
+    return min(times)
+
+
+@pytest.mark.backlog("RP-970")
+def test_the_first_catalog_query_after_ddl_over_two_user_types_costs_the_same_at_400_tables(
+    pg_alone: Any,
+) -> None:
+    """PostgreSQL 15.19 answers the collation query for a table of two
+    columns of two user enums, straight after its `CREATE TABLE`, in the
+    same time however many other tables there are (0.15 ms with none, 0.22
+    ms with 400, private cluster, 2026-11-14): one `pg_type` row per column
+    through the oid index. A debug `secantusd-pg` took 22 ms with none and
+    79 ms with 400 (2026-11-14): a key of a user type builds every user
+    type, and the second one in a message cycle builds every row.
+
+    The bound is RP-927's: the fastest of five with 400 more tables against
+    the fastest with none, within half again plus 5 ms."""
+    pg_alone.execute("CREATE TYPE rp_e1 AS ENUM ('x')")
+    pg_alone.execute("CREATE TYPE rp_e2 AS ENUM ('y')")
+    small = _fastest_first_over_two_enums(pg_alone, "rp_te_a")
+    for i in range(GROWTH_TABLES):
+        pg_alone.execute(f"CREATE TABLE rp_te_grow_{i} (a int, b text)")
+    large = _fastest_first_over_two_enums(pg_alone, "rp_te_b")
+    assert large < 1.5 * small + 0.005, (
+        f"first query after DDL {small * 1000:.1f} ms with no other table, "
+        f"{large * 1000:.1f} ms with {GROWTH_TABLES}"
     )

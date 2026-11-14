@@ -1162,7 +1162,10 @@ one beside it.
       (`install_user_types`, two thirds of the samples at 800: the
       composite and table catalogs compared, `relations`,
       `publish_tableoids`) -- RP-911's remainder, so this item closes
-      with RP-911's per-relation publication.
+      with RP-911's per-relation publication. Its gap test is a timing
+      ratio and can pass once by noise: a `gate_pg.sh` backlog step on
+      2026-11-14 reported it `FIXED?`, then it failed three of three runs
+      alone (2.5-3.8 ms against 0.8-1.7 ms). Rerun it alone before closing.
       Verify: tests/backlog/test_rp_catalog_latency.py::test_create_table_costs_the_same_at_800_tables_within_a_tenth
       Backlog-ID: RP-928
 
@@ -1179,21 +1182,22 @@ one beside it.
       Verify: tests/backlog/test_rp_found_rp921.py::test_a_partitions_copy_of_a_named_index_is_named_by_its_columns
       Backlog-ID: RP-930
 
-- [ ] **OPEN — psql's `\d` column query straight after DDL builds all of
-      `pg_type` for a table of two column types.** The collation subquery
-      (`tests/backlog/test_rp_catalog_latency.py`'s `COLLATION_QUERY`) over
-      a table `(a int, b text)`, first after its `CREATE TABLE`: PostgreSQL
-      15.19 takes 0.35 ms with no other table and 0.33 ms with 800 (private
-      cluster, 2026-11-13); a debug `secantusd-pg` about 0.016 s with none
-      and 0.10 s with 800. `virtual_rows` builds one keyed read per catalog
-      per message cycle, and a second key in the cycle (the second column's
-      type) builds every row: every table's row type, each with its owner
-      from all of `pg_class` (`relation_owners`). PostgreSQL reads one
-      `pg_type` row per column through the oid index (`SearchSysCache`),
-      for as many keys as a statement asks. A table whose columns share one
-      type (the RP-911 test's) never reaches the second build.
-      Backlog-ID: RP-927
-      Verify: tests/backlog/test_rp_catalog_latency.py::test_the_first_catalog_query_after_ddl_over_two_column_types_costs_the_same_at_400_tables
+## Found while working RP-927 (2026-11-14)
+
+- [ ] **OPEN — psql's `\d` column query straight after DDL builds every
+      user type for a column of a user type.** The collation subquery
+      (`COLLATION_QUERY`) over a table `(a e1, b e2)` of two user enums,
+      first after its `CREATE TABLE`: PostgreSQL 15.19 takes 0.15 ms with
+      no other table and 0.22 ms with 400 (private cluster); a debug
+      `secantusd-pg` 22 ms and 79 ms. Since RP-927 a `pg_type` key of a
+      built-in oid builds alone, but a user type's key builds every enum,
+      composite (every table's row type) and range (`build_catalog_rows`'s
+      `user_types`), and a second user key in a message cycle builds every
+      row. PostgreSQL reads the one row through the oid index
+      (`SearchSysCache`): the faithful fix builds a user key's row from
+      that type's catalog entry alone.
+      Verify: tests/backlog/test_rp_catalog_latency.py::test_the_first_catalog_query_after_ddl_over_two_user_types_costs_the_same_at_400_tables
+      Backlog-ID: RP-970
 
 ## Found while working RP-929 (2026-11-14)
 
