@@ -8232,3 +8232,19 @@ fn btoidvectorcmp_orders_by_length_then_unsigned_oid() {
     let null = crate::cmpfn::call("btoidvectorcmp", &[Bson::Null, v("3")]);
     assert_eq!(null.expect("strict").expect("NULL"), Bson::Null);
 }
+
+/// RP-601: a vector is a true array to the polymorphic resolution, its
+/// element `int2` / `oid`: `cardinality(int2vector)` and
+/// `array_position(oidvector, oid)` resolve.
+#[test]
+fn a_vector_is_an_array_to_the_polymorphic_resolution() {
+    let s = |t: &[&str]| t.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+    assert_eq!(
+        funcsig::selected_args("cardinality", &s(&["int2vector"])),
+        Some(s(&["anyarray"]))
+    );
+    assert_eq!(
+        funcsig::selected_args("array_position", &s(&["oidvector", "oid"])),
+        Some(s(&["anycompatiblearray", "anycompatible"]))
+    );
+}

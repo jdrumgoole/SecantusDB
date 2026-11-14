@@ -3128,22 +3128,6 @@ Measured on a private PostgreSQL 15.19 cluster. The gap tests are in
 Measured on PostgreSQL 15.19; none of it needs DDL. The gap tests are in
 `tests/backlog/test_rp_found_rp575.py`.
 
-- [ ] **The array built-ins refuse an `int2vector` or `oidvector`.** Both
-      are true array types to PostgreSQL 15.19's polymorphic resolution
-      (`typsubscript` is `array_subscript_handler`, `typelem` int2 / oid),
-      subscripted from 0: `cardinality('1 2'::int2vector)` is 2,
-      `array_dims('1 2'::int2vector)` `[0:1]`, `array_to_string('1
-      2'::oidvector, ',')` `1,2`, `array_dims(indkey)` / `array_upper(indkey,
-      1)` of a one-column index `[0:0]` / 0, and `cardinality(array_agg(v))`
-      over vectors 2. Here each is 42883 `function ... does not exist`:
-      `funcsig::accepts` takes only a `[]` type for `anyarray`. Accepting
-      the vectors there is not enough: a vector reaches the built-ins with
-      no lower bound of its own (`[1:2]`, and `array_position` off by one),
-      and over a column through an evaluator that does not see its type.
-      `'1 2'::int2vector || '3'::int2vector` is `[0:2]={1,2,3}` on
-      PostgreSQL and `{1,2,3}` here, for the same reason.
-      Verify: tests/backlog/test_rp_found_rp575.py::test_array_builtins_over_a_vector
-      Backlog-ID: RP-601
 - [ ] **An `int2vector` of two dimensions prints as text.** `array_agg`
       over vectors is `array_agg(anyarray)`, typed `int2vector` and holding
       two dimensions, which `int2vectorout` refuses (`check_valid_int2vector`):

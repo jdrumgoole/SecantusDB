@@ -4107,7 +4107,7 @@ fn vector_element_args(
         .find_map(|t| vectors::vector_array_element(t))
         .map(str::to_owned)
     else {
-        return Ok(args);
+        return vector_array_args(name, args, &types);
     };
     args.into_iter()
         .zip(&types)
@@ -4117,6 +4117,38 @@ fn vector_element_args(
             } else {
                 Ok(v)
             }
+        })
+        .collect()
+}
+
+/// A vector where an array built-in declares `anyarray` (or
+/// `anycompatiblearray`) is that array, subscripted from 0 as the vector is:
+/// `array_dims('1 2'::int2vector)` is `[0:1]`, as the cast
+/// `'1 2'::int2vector::int2[]` has it (RP-601).
+fn vector_array_args(name: &str, args: Vec<Bson>, types: &[String]) -> Result<Vec<Bson>> {
+    if !types.iter().any(|t| vectors::is_vector(t)) {
+        return Ok(args);
+    }
+    let Some(params) = funcsig::selected_args(name, types) else {
+        return Ok(args);
+    };
+    args.into_iter()
+        .zip(types)
+        .zip(
+            params
+                .iter()
+                .map(String::as_str)
+                .chain(std::iter::repeat("")),
+        )
+        .map(|((v, t), p)| match array_element_type(t) {
+            Some(elem)
+                if vectors::is_vector(t)
+                    && matches!(p, "anyarray" | "anycompatiblearray")
+                    && matches!(v, Bson::Array(_)) =>
+            {
+                Ok(arrays::bounded(cast_value(v, &format!("{elem}[]"))?, &[0]))
+            }
+            _ => Ok(v),
         })
         .collect()
 }
@@ -19768,6 +19800,11 @@ fn plan_table_targets(
                         c.pg_type != "bpchar"
                             && c.pg_type != "tid"
                             && !(printing_function(f) && typeout::needs_type(&c.pg_type))
+                            // An array built-in over a vector column takes it
+                            // as an array subscripted from 0, which only the
+                            // general path's typed arguments know (RP-601).
+                            && !(func_name(f).is_some_and(|n| arrays::is_array_function(&n))
+                                && vectors::is_vector(&c.pg_type))
                     })
                 }) && !(printing_function(f)
                     && f.args
@@ -32038,10 +32075,19 @@ fn static_type_uncached(node: &pg_query::protobuf::Node, value: &Bson) -> String
                 )
             ) =>
         {
-            f.args
+            let types: Vec<String> = f.args.iter().map(|a| static_type(a, &Bson::Null)).collect();
+            // A vector argument is its element's array (`array_append(
+            // int2vector, int2)` is `smallint[]`, RP-601).
+            types
                 .iter()
-                .map(|a| static_type(a, &Bson::Null))
                 .find(|t| t.ends_with("[]"))
+                .cloned()
+                .or_else(|| {
+                    types
+                        .iter()
+                        .filter(|t| vectors::is_vector(t))
+                        .find_map(|t| array_element_type(t).map(|e| format!("{e}[]")))
+                })
                 .unwrap_or_else(|| inferred_type(value).to_string())
         }
         // The datetime functions, typed from their arguments' types.
@@ -32501,9 +32547,17 @@ fn static_type_uncached(node: &pg_query::protobuf::Node, value: &Bson) -> String
                 "||" => {
                     let (l, r) = (lt(), rt());
                     // An array beside anything is `array_cat` / `array_append`
-                    // / `array_prepend`, typed as the array.
+                    // / `array_prepend`, typed as the array; a vector is its
+                    // element's array (RP-601).
                     if let Some(t) = l.iter().chain(r.iter()).find(|t| t.ends_with("[]")) {
                         (*t).clone()
+                    } else if let Some(e) = l
+                        .iter()
+                        .chain(r.iter())
+                        .filter(|t| vectors::is_vector(t))
+                        .find_map(|t| array_element_type(t))
+                    {
+                        format!("{e}[]")
                     } else if l.map(String::as_str) == Some("bytea")
                         || r.map(String::as_str) == Some("bytea")
                     {
@@ -49229,6 +49283,15 @@ fn const_value_node(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result<
                 let ty = node.map(|n| static_type(n, &v)).unwrap_or_default();
                 match (ty.as_str(), &v) {
                     ("float4", Bson::Double(d)) => Bson::String(geo::float4_text(*d as f32)),
+                    // A vector is a true array to `||`'s `anycompatiblearray`,
+                    // coerced to its element's array and subscripted from 0:
+                    // `'1 2'::int2vector || '3'::int2vector` is
+                    // `[0:2]={1,2,3}` (RP-601).
+                    (t @ ("int2vector" | "oidvector"), Bson::Array(_)) => {
+                        let elem = array_element_type(t).expect("a vector has an element");
+                        cast_value(v.clone(), &format!("{elem}[]"))
+                            .map_or(v, |a| arrays::bounded(a, &[0]))
+                    }
                     ("tid", v) if *v != Bson::Null => Bson::String(tid::render_tid_value(v)),
                     ("timestamptz", _) => {
                         timestamptz_value_text(&v, &session_timezone()).map_or(v, Bson::String)
