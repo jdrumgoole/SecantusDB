@@ -199,6 +199,7 @@ pub use correlated::{
     DESCRIBE_QUERY, FETCH_CURSOR,
 };
 pub mod json;
+pub mod json_lex;
 pub mod jsonb_subs;
 pub mod jsonfn;
 pub mod jsonops;
@@ -16479,7 +16480,7 @@ pub(crate) fn populate_composite(
         Bson::Null => unreachable!(),
         other => {
             let text = value_text(other);
-            let parsed = json::parse(&text).map_err(json_parse_error)?;
+            let parsed = json::parse(&text).map_err(|e| json_input_error(&text, true, e))?;
             if !matches!(parsed, json::Json::Object(_)) {
                 return Err(Error::Sqlstate(
                     "22023",
@@ -40932,7 +40933,7 @@ fn cast_value_inner(value: Bson, target: &str) -> Result<Bson> {
                 {
                     None
                 }
-                Err(e) => return Err(json_parse_error(e)),
+                Err(e) => return Err(json_input_error(&text, target == "jsonb", e)),
             };
             Ok(Bson::String(match parsed {
                 Some(parsed) if target == "jsonb" => json::render_jsonb(&parsed),
@@ -42033,15 +42034,36 @@ fn is_range_family(name: &str) -> bool {
     range::is_range_type(element) || range::is_multirange_type(element)
 }
 
-/// PostgreSQL's error for JSON text that does not parse. The type is named
-/// `json` whether the input was json or jsonb, and the value is not quoted
-/// in the message (it goes in the CONTEXT line, which is not carried).
-fn json_parse_error(e: json::ParseError) -> Error {
-    match e {
-        json::ParseError::NulEscape => {
-            Error::UntranslatableCharacter("unsupported Unicode escape sequence".into())
-        }
-        _ => Error::InvalidText("invalid input syntax for type json".into()),
+/// PostgreSQL's error for JSON `text` that does not parse
+/// (`json_ereport_error`). The type is named `json` whether the input was
+/// json or jsonb, and the value is not quoted in the message: the DETAIL
+/// names the token and the CONTEXT shows the line up to it, as
+/// [`json_lex`] finds them. `jsonb` is `jsonb_in`'s mode, which decodes
+/// escapes and so rejects a lone surrogate or `\u0000`.
+fn json_input_error(text: &str, jsonb: bool, e: json::ParseError) -> Error {
+    let Some(found) = json_lex::input_error(text, jsonb) else {
+        // PostgreSQL's parser accepts what this one rejected: say so plainly
+        // rather than invent a position.
+        return match e {
+            json::ParseError::NulEscape => {
+                Error::UntranslatableCharacter("unsupported Unicode escape sequence".into())
+            }
+            _ => Error::InvalidText("invalid input syntax for type json".into()),
+        };
+    };
+    let message = if found.untranslatable {
+        "unsupported Unicode escape sequence"
+    } else {
+        "invalid input syntax for type json"
+    };
+    let message = format!(
+        "{message}\nDetail: {}\nContext: {}",
+        found.detail, found.context
+    );
+    if found.untranslatable {
+        Error::UntranslatableCharacter(message)
+    } else {
+        Error::InvalidText(message)
     }
 }
 
@@ -42057,7 +42079,7 @@ fn json_parse_error(e: json::ParseError) -> Error {
 /// PostgreSQL's rule and the reason these operators are usable at all.
 fn json_operator(op: &str, target: &str, lhs: &Bson, rhs: &Bson) -> Result<Bson> {
     let text = value_text(lhs);
-    let parsed = json::parse(&text).map_err(json_parse_error)?;
+    let parsed = json::parse(&text).map_err(|e| json_input_error(&text, target != "json", e))?;
     // `#>` and `#>>` take a PATH; the others take one key.
     let steps: Vec<String> = if op.starts_with('#') && op != "#" {
         match rhs {
@@ -42095,7 +42117,8 @@ fn json_operator(op: &str, target: &str, lhs: &Bson, rhs: &Bson) -> Result<Bson>
     // Containment compares by VALUE, so key order and whitespace do not count.
     if op == "@>" || op == "<@" {
         let other = value_text(rhs);
-        let other = json::parse(&other).map_err(json_parse_error)?;
+        let other =
+            json::parse(&other).map_err(|e| json_input_error(&other, target != "json", e))?;
         return Ok(Bson::Boolean(if op == "@>" {
             json::contains(&parsed, &other)
         } else {

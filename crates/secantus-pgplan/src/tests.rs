@@ -2579,10 +2579,18 @@ fn json_unicode_escapes_match_postgres() {
     assert_eq!(cast("json", r#""\u0000""#), r#""\u0000""#);
     let err = plan(r#"SELECT '"\ud83d"'::jsonb"#, &lookup).unwrap_err();
     assert_eq!(err.sqlstate(), "22P02");
-    assert_eq!(err.to_string(), "invalid input syntax for type json");
+    assert_eq!(
+        err.to_string(),
+        "invalid input syntax for type json\nDetail: Unicode low surrogate must follow a \
+         high surrogate.\nContext: JSON data, line 1: \"\\ud83d\""
+    );
     let err = plan(r#"SELECT '"\u0000"'::jsonb"#, &lookup).unwrap_err();
     assert_eq!(err.sqlstate(), "22P05");
-    assert_eq!(err.to_string(), "unsupported Unicode escape sequence");
+    assert_eq!(
+        err.to_string(),
+        "unsupported Unicode escape sequence\nDetail: \\u0000 cannot be converted to \
+         text.\nContext: JSON data, line 1: \"\\u0000..."
+    );
 }
 
 /// The scalar built-ins, every case measured against PostgreSQL 14.

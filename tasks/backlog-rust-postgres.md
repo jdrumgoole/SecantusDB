@@ -2974,13 +2974,6 @@ dv687, c char(3))`, `d687` an `int` with `check (value > 0)` and `dv687` a
 Measured on PostgreSQL 15.19 (port 5415) with statements that create
 nothing. The gap tests are in `tests/backlog/test_rp_found_rp712.py`.
 
-- [ ] **A `jsonb` input error carries no `JSON data` CONTEXT.** `select
-      't'::jsonb` is 22P02 `invalid input syntax for type json` with
-      CONTEXT `JSON data, line 1: t` on PostgreSQL 15.19 (`json_errcontext`);
-      here the CONTEXT is absent, and in a PL/pgSQL assignment (`x jsonb :=
-      true`) the line is missing from the stack.
-      Verify: tests/backlog/test_rp_found_rp712.py::test_jsonb_input_error_carries_its_json_data_context
-      Backlog-ID: RP-750
 - [ ] **An assignment's overlong `varchar(n)` value is 22001 with no
       assignment frame.** `declare x varchar(3); begin x := 'abcdef'::text;`
       carries CONTEXT `PL/pgSQL assignment "x := 'abcdef'::text"` above the
@@ -2996,9 +2989,35 @@ nothing. The gap tests are in `tests/backlog/test_rp_found_rp712.py`.
       `declare x int; begin x := 'abc';` is 22P02 with `internal_query` `x
       := 'abc'` on PostgreSQL 15.19 (the literal is coerced as the
       assignment is parsed); here no internal query is sent. The same class
-      as RP-488, in a shape its test does not reach.
+      as RP-488, in a shape its test does not reach. A `jsonb` literal is
+      another: `declare x jsonb; begin x := 'zz';` carries `x := 'zz'` as
+      its internal query and CONTEXT `JSON data, line 1: zz` then the `at
+      assignment` line on 15.19; here a `PL/pgSQL assignment "x := 'zz'"`
+      frame sits between them and no query is sent.
       Verify: tests/backlog/test_rp_found_rp712.py::test_literal_input_error_in_an_assignment_carries_its_query
       Backlog-ID: RP-753
+
+## Found while working RP-750 (2026-11-14)
+
+Measured on PostgreSQL 15.19 (port 5415) with statements that create
+nothing. The gap tests are in `tests/backlog/test_rp_found_rp750.py`.
+
+- [ ] **A `json` / `jsonb` input error on a constant has no position.**
+      `select 't'::jsonb` is 22P02 at 8 on PostgreSQL 15.19 (the literal),
+      `select 1, '[1,'::json` at 11, and `select json_typeof('x')` at 20;
+      here none is placed. `errpos.rs` finds a 22P02's literal by the
+      value the message quotes, and `invalid input syntax for type json`
+      quotes none: the input is only in the CONTEXT excerpt.
+      Verify: tests/backlog/test_rp_found_rp750.py::test_json_input_error_has_a_position
+      Backlog-ID: RP-952
+- [ ] **A type's input function called by name is refused.**
+      `select jsonb_in('{"b":1, "a":2}')` is `{"a": 2, "b": 1}` on
+      PostgreSQL 15.19 (the `unknown` literal coerces to `cstring`), as are
+      `json_in(...)` and `int4in('12')`; here each is 0A000 `function
+      jsonb_in(unknown) is not supported yet`. With a `text` argument both
+      servers answer 42883.
+      Verify: tests/backlog/test_rp_found_rp750.py::test_type_input_function_is_callable_by_name
+      Backlog-ID: RP-953
 
 ## Found while working RP-686 (2026-11-14)
 
