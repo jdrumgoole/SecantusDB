@@ -1545,6 +1545,11 @@ pub struct SetOpSelect {
     /// side's FROM (`select 1 union select null from t` is integer).
     pub left_untyped: UntypedTargets,
     pub right_untyped: UntypedTargets,
+    /// The domain each side's column is of, from the parse tree (empty
+    /// when not known): a domain side's type is the domain, not its base,
+    /// to `select_common_typmod` (RP-660).
+    pub left_domains: Vec<Option<String>>,
+    pub right_domains: Vec<Option<String>>,
 }
 
 /// Which select-list entries of one set-operation side are a bare untyped
@@ -20597,6 +20602,8 @@ fn plan_set_operation(
         with_ties: with_ties(s),
         left_untyped: UntypedTargets::of(larg),
         right_untyped: UntypedTargets::of(rarg),
+        left_domains: domain_scope::side_domains(larg, lookup),
+        right_domains: domain_scope::side_domains(rarg, lookup),
     }))
 }
 
@@ -31179,19 +31186,29 @@ pub fn set_op_output_def(
             set_op_common_type(&l.pg_type, &r.pg_type)
         };
         // `select_common_typmod`: an untyped literal side is
-        // `unknown`, coerced to the common type with no modifier.
-        fn side(untyped: bool, c: &Column) -> (&str, i32) {
+        // `unknown`, coerced to the common type with no modifier, and a
+        // domain side is of the domain, which `select_common_type` smashed
+        // to its base unless both sides are of it (RP-660).
+        let ld = set.left_domains.get(i).cloned().flatten();
+        let rd = set.right_domains.get(i).cloned().flatten();
+        let both = if ld.is_some() && ld == rd {
+            ld.clone()
+        } else {
+            None
+        };
+        fn side<'a>(untyped: bool, c: &'a Column, domain: Option<&'a str>) -> (&'a str, i32) {
             if untyped {
                 ("unknown", -1)
             } else {
-                (c.pg_type.as_str(), c.typmod)
+                (domain.unwrap_or(c.pg_type.as_str()), c.typmod)
             }
         }
+        let common_of = both.unwrap_or_else(|| common.clone());
         l.typmod = expr_typmod::common_typmod(
-            &common,
+            &common_of,
             &[
-                side(untyped(&set.left, i), l),
-                side(untyped(&set.right, i), r),
+                side(untyped(&set.left, i), l, ld.as_deref()),
+                side(untyped(&set.right, i), r, rd.as_deref()),
             ],
         );
         l.pg_type = common;

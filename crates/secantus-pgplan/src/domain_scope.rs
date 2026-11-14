@@ -701,6 +701,18 @@ fn expr_domain(
     }
 }
 
+/// The domain each column of a set operation's side `s` is of
+/// (`exprType`), for `select_common_typmod` (RP-660). Empty when the
+/// columns are not known.
+pub(crate) fn side_domains(
+    s: &SelectStmt,
+    lookup: &dyn Fn(&str) -> Option<TableDef>,
+) -> Vec<Option<String>> {
+    output_columns(s, lookup, &Ctes::new())
+        .map(|columns| columns.into_iter().map(|(_, d)| d).collect())
+        .unwrap_or_default()
+}
+
 /// The domain the one target of `sql`, a `SELECT <expr>` whose parameters
 /// are declared of `types`, is already of (`exprType`), when it is one.
 /// PL/pgSQL's `exec_assign_value` casts an assigned value from that type

@@ -67,7 +67,7 @@ SET_OP_TYPMOD = {
 }
 
 
-@pytest.mark.backlog("RP-660")
+@pytest.mark.backlog_fixed("RP-660")
 @pytest.mark.parametrize("query", list(SET_OP_TYPMOD))
 def test_set_op_of_a_domain_and_its_base_type(query: str, dsn: str) -> None:
     with _connect(dsn) as c:

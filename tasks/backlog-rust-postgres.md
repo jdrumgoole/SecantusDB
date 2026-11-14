@@ -2747,14 +2747,6 @@ change too. The gap tests are in `tests/backlog/test_rp_found_rp557.py`.
       keep the padding width and describe -1.
       Verify: tests/backlog/test_rp_found_rp557.py::test_min_max_over_char_n_has_no_modifier
       Backlog-ID: RP-659
-- [ ] **A set operation of a domain column and its base type keeps the
-      width.** `select a from t557 union select c from t557` (either order)
-      describes -1 on PostgreSQL 15.19: `select_common_type` smashes the
-      domain to `bpchar` and `select_common_typmod` finds the sides'
-      modifiers differ, the domain column's own being -1. Here it is 7.
-      Two sides of one type keep 7 in both.
-      Verify: tests/backlog/test_rp_found_rp557.py::test_set_op_of_a_domain_and_its_base_type
-      Backlog-ID: RP-660
 
 ## Found while working RP-590 (2026-11-08)
 

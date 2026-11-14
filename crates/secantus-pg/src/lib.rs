@@ -40686,11 +40686,17 @@ impl PgHandler {
             let typed_mod = |f: &FieldInfo, untyped: bool| {
                 (!untyped && *f.datatype() == ty).then(|| f.type_modifier())
             };
+            // A side of a domain is of the domain, which the common type
+            // keeps only when both sides are of it (RP-660).
+            let (ld, rd) = (
+                set.left_domains.get(i).cloned().flatten(),
+                set.right_domains.get(i).cloned().flatten(),
+            );
             let typmod = match (
                 typed_mod(l, flag(&left_nulls, i) || flag(&left_strs, i)),
                 typed_mod(r, flag(&right_nulls, i) || flag(&right_strs, i)),
             ) {
-                (Some(a), Some(b)) if a == b => a,
+                (Some(a), Some(b)) if a == b && ld == rd => a,
                 _ => -1,
             };
             schema.push(self.field_mod(l.name().to_string(), ty, typmod));
