@@ -2474,17 +2474,6 @@ Still different, all 77:
       built for, each fitted by probing that platform's mongod 8.2.11.**
       Backlog-ID: RM-442
       Verify: tests/backlog/test_rm_340_342_plan_cache_gaps.py::test_an_entry_reports_its_estimated_size_on_linux
-- [ ] **A compound index scan whose second field has several intervals
-      examines a key more than mongod's for each value of the first.**
-      Over `a_1_c_1` (2,000 documents, `a: i % 100`, `c: i % 7`), mongod
-      8.2.11 scans `{a: {$in: [3, 60]}, c: {$in: [1, 5]}}` examining 16 keys
-      with 5 seeks and `{a: 3, c: {$in: [1, 5]}}` 7 with 2; this server's
-      scan model (`exec::Scan`, which the trial steps) counts 18 with 7 and
-      8 with 3, in `explain` and in a plan cache entry's
-      `creationExecStats`, where the extra works also move the scores.
-      Found 2026-11-08 (RM-342).
-      Verify: tests/backlog/test_rm_found_2026_11_08_rm342.py::test_a_scan_of_two_in_lists_examines_mongods_keys
-      Backlog-ID: RM-433
 - [ ] **`explain`'s winning plan has no work accounting.** mongod 8.2.11's
       `executionStats` gives each stage its `works`, `advanced`, `needTime`,
       `needYield`, `isEOF` and timings, a FETCH its `alreadyHasObj`, an
@@ -2533,15 +2522,6 @@ Still different, all 77:
       reports 83 works and neither field. Found 2026-11-08 (RM-341).
       Verify: tests/backlog/test_rm_found_2026_11_08_rm341.py::test_a_sort_merge_candidate_counts_as_mongods
       Backlog-ID: RM-437
-- [ ] **A scan over several intervals of one field seeks and returns
-      differently in the trial.** mongod 8.2.11's losing candidate for
-      `{a: {$lt: 5}, b: {$nin: [3, 4]}}` reads `b_1` over three intervals,
-      examining 101 keys in 3 seeks and returning 99; this server's scan
-      model seeks twice and returns 100, in `creationExecStats` (and so in
-      its score). Perhaps RM-433's cause on one field. Found 2026-11-08
-      (RM-341).
-      Verify: tests/backlog/test_rm_found_2026_11_08_rm341.py::test_a_nin_candidate_reads_mongods_keys
-      Backlog-ID: RM-438
 - [ ] **A candidate's FETCH filter puts an inexact `$exists` after the
       other predicates.** mongod 8.2.11's losing candidate for `{a: {$lt:
       5}, b: {$exists: true}}` over `b_1` rechecks `{$and: [{b: {$exists:

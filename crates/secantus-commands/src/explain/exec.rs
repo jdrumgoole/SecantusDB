@@ -536,20 +536,23 @@ impl Scan {
         // `IndexBoundsChecker::getStartSeekPoint`: each field's first
         // interval's start. Where that start is exclusive, a key equal to it
         // there is still before the seek point.
-        let start: Vec<(&[u8], bool)> = self
+        let start: Vec<(Vec<u8>, bool)> = self
             .ranges
             .iter()
-            .map(|list| {
-                list.first()
-                    .map_or((&[][..], true), |r| (r.0.as_slice(), r.1))
-            })
+            .map(|list| list.first().map_or((vec![], true), |r| (r.0.clone(), r.1)))
             .collect();
+        self.skip_before(&start);
+    }
+
+    /// Move past every entry before the seek point `start` (each field's
+    /// value, and whether a key equal to it there is at the point or
+    /// before it).
+    fn skip_before(&mut self, start: &[(Vec<u8>, bool)]) {
         while self.pos < self.entries.len() {
             let key = &self.entries[self.pos].0;
             let before = key
                 .iter()
-                .map(Vec::as_slice)
-                .zip(start.iter().copied())
+                .zip(start)
                 .find_map(|(k, (s, inclusive))| {
                     if k != s {
                         Some(k < s)
@@ -565,6 +568,15 @@ impl Scan {
             }
             self.pos += 1;
         }
+    }
+
+    /// Whether every field before `field` holds its last interval, and that
+    /// interval is a point: no later key can fall inside the bounds again.
+    fn on_last_points(&self, key: &[Vec<u8>], field: usize) -> bool {
+        key[..field].iter().zip(&self.ranges).all(|(part, list)| {
+            list.last()
+                .is_some_and(|r| r.0 == r.2 && r.1 && r.3 && inside(part, r))
+        })
     }
 
     /// One unit of mongod's work: an entry inside the bounds, a key that
@@ -597,22 +609,40 @@ impl Scan {
                 return Step::End;
             }
             self.keys += 1;
-            if !ahead && field == 0 {
+            // `IndexBoundsChecker::checkKey`: past the last interval of a
+            // field, the scan is over when no earlier field can move on to
+            // another key -- the first field, or earlier fields each on the
+            // point that is their last interval.
+            if !ahead && self.on_last_points(&key, field) {
                 self.done = true;
                 return Step::End;
             }
-            // Seek: past every key that fails the same way.
-            let prefix = key[..field].to_vec();
             self.pos += 1;
-            while self.pos < self.entries.len() {
-                let other = &self.entries[self.pos].0;
-                if other[..field] != prefix[..] {
-                    break;
+            if ahead {
+                // Seek to the key's prefix, the field's next interval's
+                // start, and the first interval's start of each later field.
+                let part = &key[field];
+                let next = self.ranges[field]
+                    .iter()
+                    .find(|r| part.as_slice() < r.0.as_slice() || (!r.1 && part == &r.0))
+                    .map(|r| (r.0.clone(), r.1));
+                let mut start: Vec<(Vec<u8>, bool)> =
+                    key[..field].iter().map(|k| (k.clone(), true)).collect();
+                start.extend(next);
+                start.extend(
+                    self.ranges[field + 1..]
+                        .iter()
+                        .map(|list| list.first().map_or((vec![], true), |r| (r.0.clone(), r.1))),
+                );
+                self.skip_before(&start);
+            } else {
+                // Seek past every key with the same prefix.
+                let prefix = key[..field].to_vec();
+                while self.pos < self.entries.len()
+                    && self.entries[self.pos].0[..field] == prefix[..]
+                {
+                    self.pos += 1;
                 }
-                if ahead && !matches!(self.outside(other), Some((f, true)) if f == field) {
-                    break;
-                }
-                self.pos += 1;
             }
             self.seek_pending = true;
             return Step::Seek;

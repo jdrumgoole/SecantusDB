@@ -25,18 +25,24 @@ def _stages(stage: Any) -> list:
     return out
 
 
-@pytest.mark.backlog("RM-433")
+@pytest.mark.backlog_fixed("RM-433")
 def test_a_scan_of_two_in_lists_examines_mongods_keys(rust_mongo: Any, mongod: Any) -> None:
     """mongod 8.2.11 scans `{a: {$in: [3, 60]}, c: {$in: [1, 5]}}` over
     `a_1_c_1` (2,000 documents, `a: i % 100`, `c: i % 7`) examining 16
-    keys; this server's scan counts 18."""
+    keys with 5 seeks, and `{a: 3, c: {$in: [1, 5]}}` 7 with 2; this
+    server's scan counted 18 with 7 and 8 with 3: it went on past the last
+    interval of `c` when `a` was on its last point, and a seek to the next
+    `a` landed before the first interval of `c`."""
 
-    def keys(client: Any) -> list:
-        f = {"a": {"$in": [3, 60]}, "c": {"$in": [1, 5]}}
+    def keys(client: Any, f: dict) -> list:
         return [s.get("keysExamined") for s in _stages(_explained(client, f))]
 
-    assert keys(mongod) == [None, 16]
-    assert keys(rust_mongo) == keys(mongod)
+    two = {"a": {"$in": [3, 60]}, "c": {"$in": [1, 5]}}
+    one = {"a": 3, "c": {"$in": [1, 5]}}
+    assert keys(mongod, two) == [None, 16]
+    assert keys(mongod, one) == [None, 7]
+    for f in (two, one):
+        assert keys(rust_mongo, f) == keys(mongod, f)
 
 
 @pytest.mark.backlog("RM-434")

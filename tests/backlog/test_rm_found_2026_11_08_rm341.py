@@ -95,12 +95,13 @@ def _losers(client: Any, q: dict) -> list:
     return out
 
 
-@pytest.mark.backlog("RM-438")
+@pytest.mark.backlog_fixed("RM-438")
 def test_a_nin_candidate_reads_mongods_keys(rust_mongo: Any, mongod: Any) -> None:
     """mongod 8.2.11's losing candidate for `{a: {$lt: 5}, b: {$nin: [3,
     4]}}` -- `b_1` read over three intervals -- examines 101 keys in the
-    trial, seeking 3 times and returning 99; this server's seeks twice and
-    returns 100."""
+    trial, seeking 3 times and returning 99; this server's sought twice and
+    returned 100, until a seek to the next interval landed at its start
+    (RM-433's fix)."""
     q = {"a": {"$lt": 5}, "b": {"$nin": [3, 4]}}
     assert _losers(rust_mongo, q) == _losers(mongod, q)
 
