@@ -1934,7 +1934,7 @@ fn truthy(v: &Bson) -> bool {
 
 /// Whether the index holds every field an inclusion projection returns.
 fn covers(index: &IndexInfo, projection: &Document) -> bool {
-    !index.is_multikey() && covers_with(projection, &|field| index.position(field).is_some())
+    covers_with(projection, &|field| index.holds_value(field))
 }
 
 /// mongod's `QuerySolutionNode::fetched` for the scan an access reads: a
@@ -1959,7 +1959,7 @@ fn fetched(node: &Node) -> bool {
 /// it).
 fn has_field(node: &Node, field: &str) -> bool {
     match node {
-        Node::IxScan(ix) => !ix.index.is_multikey() && ix.index.position(field).is_some(),
+        Node::IxScan(ix) => ix.index.holds_value(field),
         Node::Fetch { .. } => true,
         Node::Or(inputs) | Node::SortMerge { inputs, .. } => {
             !inputs.is_empty() && inputs.iter().all(|i| has_field(i, field))

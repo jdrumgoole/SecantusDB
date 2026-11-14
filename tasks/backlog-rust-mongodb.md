@@ -2516,14 +2516,6 @@ Still different, all 77:
       reports 83 works and neither field. Found 2026-11-08 (RM-341).
       Verify: tests/backlog/test_rm_found_2026_11_08_rm341.py::test_a_sort_merge_candidate_counts_as_mongods
       Backlog-ID: RM-437
-- [ ] **A multikey index does not cover a field that holds no array.**
-      mongod 8.2.11 answers `find({a: {$lt: 5}}, {a: 1, _id: 0})` from
-      `a_1_c_1` with a PROJECTION_COVERED over the IXSCAN when only `c`
-      holds arrays (`multiKeyPaths: {a: [], c: ["c"]}`); this server
-      fetches every document (PROJECTION_SIMPLE over a FETCH), which also
-      changes the trial and the cached plan. Found 2026-11-08 (RM-341).
-      Verify: tests/backlog/test_rm_found_2026_11_08_rm341.py::test_a_multikey_index_covers_a_field_that_holds_no_array
-      Backlog-ID: RM-441
 
 ### 7.079 `$out` and `$merge` -- 2026-10-13
 

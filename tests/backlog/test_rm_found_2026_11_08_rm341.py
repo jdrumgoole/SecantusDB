@@ -185,12 +185,13 @@ def test_a_type_candidate_reads_mongods_keys(rust_mongo: Any, mongod: Any) -> No
     assert _losers(rust_mongo, q) == _losers(mongod, q)
 
 
-@pytest.mark.backlog("RM-441")
+@pytest.mark.backlog_fixed("RM-441")
 def test_a_multikey_index_covers_a_field_that_holds_no_array(rust_mongo: Any, mongod: Any) -> None:
     """mongod 8.2.11 answers `find({a: {$lt: 5}}, {a: 1, _id: 0})` from
     `a_1_c_1` with a PROJECTION_COVERED over the IXSCAN although `c` holds
     an array in one document: `a` holds none, so its keys are its values.
-    This server fetches each document instead."""
+    This server fetched each document instead; the covered answer must
+    still be the fetched one."""
 
     def plan(client: Any) -> list:
         client.drop_database("rm341_found")
@@ -199,7 +200,8 @@ def test_a_multikey_index_covers_a_field_that_holds_no_array(rust_mongo: Any, mo
         col.insert_one({"_id": -1, "c": [1, 2]})
         col.create_index([("a", 1), ("c", 1)])
         e = col.find({"a": {"$lt": 5}}, {"a": 1, "_id": 0}).explain()
-        return [s["stage"] for s in _stages(e["queryPlanner"]["winningPlan"])]
+        rows = sorted(d["a"] for d in col.find({"a": {"$lt": 5}}, {"a": 1, "_id": 0}))
+        return [s["stage"] for s in _stages(e["queryPlanner"]["winningPlan"])], rows
 
-    assert plan(mongod) == ["PROJECTION_COVERED", "IXSCAN"]
+    assert plan(mongod)[0] == ["PROJECTION_COVERED", "IXSCAN"]
     assert plan(rust_mongo) == plan(mongod)
