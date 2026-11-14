@@ -3152,13 +3152,6 @@ Measured on a private PostgreSQL 15.19 cluster with `create domain dc3 as
 char(3)`, `create domain dc3n as dc3` and the rest of the `_SETUP` in
 `tests/backlog/test_rp_found_rp529.py`.
 
-- [ ] **A domain's CHECK failing inside a record literal carries no
-      position.** `select '(0,x)'::ctp`, `ctp` a composite with a `pint`
-      field, is 23514 at 8 on PostgreSQL 15.19, at the literal as its other
-      input errors are (`'(abcd,1)'::fc` is 22001 at 8 here too); here the
-      23514 has no position.
-      Backlog-ID: RP-552
-      Verify: tests/backlog/test_rp_found_rp529.py::test_record_literal_domain_error_position
 - [ ] **`ALTER COLUMN TYPE` to a domain over the column's type is
       refused.** `alter table falt alter column a type pint`, `a int` and
       `pint` a domain over `int`, retypes the column on PostgreSQL 15.19
@@ -3166,6 +3159,50 @@ char(3)`, `create domain dc3n as dc3` and the rest of the `_SETUP` in
       `column "a" cannot be cast automatically to type pint`.
       Backlog-ID: RP-556
       Verify: tests/backlog/test_rp_found_rp529.py::test_alter_column_type_to_domain
+
+## Found while working RP-552 (2026-11-14)
+
+Measured on PostgreSQL 15.19 with `create domain pint as int check (value >
+0)`, `create domain nnint as int not null`, `create type ctp as (a pint, b
+text)` and `create table tct (c ctp, d pint[])` holding `('(1,x)', null)`.
+The gap tests are in `tests/backlog/test_rp_found_rp552.py`.
+
+- [ ] **An untyped literal written to a composite or domain-array column,
+      or coerced as an `ARRAY[]` element, reports a field's domain error
+      with no position.** `insert into tct(c) values ('(0,x)')` and
+      `insert into tct(d) values ('{0}')` are 23514 at 28 on PostgreSQL
+      15.19, `update tct set c = '(0,x)'` at 20 and `select
+      array['(0,x)']::ctp[]` at 14: `coerce_type` reads the literal with
+      `record_in` / `array_in` under its parser error position. Here each
+      has none. RP-552 recorded the literal's location for a TypeCast of
+      the literal only (`literal_input_location` in `const_value_inner`);
+      the write path and the `ARRAY[]` element coercion need the same.
+      Verify: tests/backlog/test_rp_found_rp552.py::test_assigned_literal_domain_error_position
+      Backlog-ID: RP-945
+- [ ] **A NULL element of a NOT NULL domain's array literal is accepted.**
+      `select '{NULL}'::nnint[]` is 23502 `domain nnint does not allow null
+      values` at 8 on PostgreSQL 15.19 (`array_in` reads each element with
+      `domain_in`, which refuses the NULL); here it is `{NULL}`.
+      Verify: tests/backlog/test_rp_found_rp552.py::test_not_null_domain_array_element
+      Backlog-ID: RP-946
+- [ ] **A composite column compared with an untyped literal reads the
+      literal as the column's type.** `select * from tct where c =
+      '(0,x)'` is 0A000 `input of anonymous composite types is not
+      implemented` at 29 on PostgreSQL 15.19: there is no `ctp = ctp`
+      operator, so `=` resolves to `record = record` and the literal to an
+      anonymous `record`, which has no input. Here the literal is read as
+      `ctp` (23514 for this one, a comparison for a valid one).
+      Verify: tests/backlog/test_rp_found_rp552.py::test_composite_column_equals_untyped_literal
+      Backlog-ID: RP-947
+- [ ] **Under `PREPARE`, an error's recorded location is counted in the
+      inner statement.** `prepare p5 as select 1::inet` is 42846 at 23 on
+      PostgreSQL 15.19 (at the `::`); here it is 9, the `::`'s offset in
+      `select 1::inet`, which lands on `p5`. `prepare p as select
+      '(0,x)'::ctp` is 23514 at 21 there, none here. The token search
+      (`errpos.rs`) finds a literal in the whole text, so errors that rely
+      on it are right; every `set_error_location` site is shifted.
+      Verify: tests/backlog/test_rp_found_rp552.py::test_prepare_error_location
+      Backlog-ID: RP-948
 
 ## Found while working RP-534 (2026-11-08)
 
