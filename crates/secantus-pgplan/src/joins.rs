@@ -723,7 +723,9 @@ fn shared_names(s: &pg_query::protobuf::SelectStmt) -> Vec<String> {
     fn walk(n: &pg_query::protobuf::Node, out: &mut Vec<(String, Option<String>)>) {
         match n.node.as_ref() {
             Some(N::RangeVar(r)) => match r.alias.as_ref() {
-                Some(a) if crate::schemas::alias_written(r) => out.push((a.aliasname.clone(), None)),
+                Some(a) if crate::schemas::alias_written(r) => {
+                    out.push((a.aliasname.clone(), None))
+                }
                 Some(a) => out.push((a.aliasname.clone(), Some(r.relname.clone()))),
                 None => out.push((r.relname.clone(), Some(r.relname.clone()))),
             },
@@ -788,10 +790,7 @@ fn shared_names(s: &pg_query::protobuf::SelectStmt) -> Vec<String> {
 /// shows only its alias above it; inside, its items are checked as a level
 /// of their own.
 pub(crate) fn check_namespace_conflicts(s: &pg_query::protobuf::SelectStmt) -> Result<()> {
-    fn level(
-        n: &pg_query::protobuf::Node,
-        out: &mut Vec<(String, Option<String>)>,
-    ) -> Result<()> {
+    fn level(n: &pg_query::protobuf::Node, out: &mut Vec<(String, Option<String>)>) -> Result<()> {
         match n.node.as_ref() {
             Some(N::RangeVar(r)) => out.push(match r.alias.as_ref() {
                 Some(a) if crate::schemas::alias_written(r) => (a.aliasname.clone(), None),
@@ -3136,7 +3135,8 @@ fn apply_join_alias(
         let name = entry.strip_prefix(SEP).unwrap_or(entry);
         // Two items sharing a name are one name to hide.
         let marked = format!("{SEP}{name}");
-        if registry.contains(&marked) && SHARED_NAMES.with(|n| n.borrow().iter().any(|n| n == name)) {
+        if registry.contains(&marked) && SHARED_NAMES.with(|n| n.borrow().iter().any(|n| n == name))
+        {
             continue;
         }
         if registry
@@ -5402,10 +5402,7 @@ mod tests {
     /// as `schemas` folds them (`s1.t` -> relname `s1.t`, alias `t` added).
     fn folded_select(sql: &str) -> pg_query::protobuf::SelectStmt {
         let mut parsed = pg_query::parse(sql).unwrap().protobuf;
-        let Some(N::SelectStmt(s)) = parsed.stmts[0]
-            .stmt
-            .as_mut()
-            .and_then(|n| n.node.as_mut())
+        let Some(N::SelectStmt(s)) = parsed.stmts[0].stmt.as_mut().and_then(|n| n.node.as_mut())
         else {
             panic!("a SELECT");
         };
@@ -5429,7 +5426,10 @@ mod tests {
                 r.relname = format!("{schema}.{}", r.relname);
             }
             Some(N::JoinExpr(j)) => {
-                for side in [j.larg.as_deref_mut(), j.rarg.as_deref_mut()].into_iter().flatten() {
+                for side in [j.larg.as_deref_mut(), j.rarg.as_deref_mut()]
+                    .into_iter()
+                    .flatten()
+                {
                     walk_from(side);
                 }
             }
@@ -5452,7 +5452,10 @@ mod tests {
             let s = folded_select(sql);
             assert!(shared_names(&s).is_empty(), "{sql}");
             assert!(
-                matches!(check_namespace_conflicts(&s), Err(Error::Sqlstate("42712", _))),
+                matches!(
+                    check_namespace_conflicts(&s),
+                    Err(Error::Sqlstate("42712", _))
+                ),
                 "{sql}"
             );
         }
