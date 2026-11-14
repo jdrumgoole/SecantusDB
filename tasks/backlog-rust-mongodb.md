@@ -1830,13 +1830,6 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       2026-11-14 working RM-532.
       Verify: tests/backlog/test_rm_found_2026_11_14_rm532.py::test_a_hybrid_search_names_the_collection_it_unions
       Backlog-ID: RM-644
-- [ ] **A `$lookup` whose `localField` is an empty array joins nothing.**
-      mongod 8.2.11 joins it as it joins null: to the foreign documents
-      whose `foreignField` is missing, null or `[null]`, in the simple form
-      and with a pipeline. This server's `lookup_match` finds no element to
-      compare and joins none. Found 2026-11-10 (RM-413).
-      Verify: tests/backlog/test_rm_found_2026_11_10_lookup.py::test_an_empty_local_array_joins_what_null_joins
-      Backlog-ID: RM-529
 - [ ] **`$documents` in a `$facet` is not refused with 40600.** mongod
       8.2.11 refuses it with 40600 "$documents is not allowed to be used
       within a $facet stage", and names the stage that holds it when a

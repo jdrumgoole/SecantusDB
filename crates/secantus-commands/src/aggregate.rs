@@ -3296,7 +3296,7 @@ fn apply_lookup(
             };
             let mut made = run(Vec::new(), source)?;
             if let (Some(lf), Some(ff)) = (local_field, foreign_field) {
-                let lv = secantus_core::get_path(&doc, lf).cloned();
+                let lv = lookup_local_value(&doc, lf);
                 made.retain(|fd| lookup_match(lv.as_ref(), secantus_core::get_path(fd, ff)));
             }
             let joined = run(made, rest)?;
@@ -3321,7 +3321,7 @@ fn apply_lookup(
             if foreign_field_has_leading_index(storage, db, from, ff)? {
                 let mut out = Vec::with_capacity(docs.len());
                 for doc in docs {
-                    let lv = secantus_core::get_path(&doc, lf).cloned();
+                    let lv = lookup_local_value(&doc, lf);
                     let joined = index_join_lookup(storage, db, from, ff, lv.as_ref())?;
                     lookup_budget(&joined, from)?;
                     let mut new = doc;
@@ -3374,7 +3374,7 @@ fn apply_lookup(
             let sub_vars = bind(&doc)?;
             let candidates: Vec<Document> = match (local_field, foreign_field) {
                 (Some(lf), Some(ff)) => {
-                    let lv = secantus_core::get_path(&doc, lf).cloned();
+                    let lv = lookup_local_value(&doc, lf);
                     foreign
                         .iter()
                         .filter(|fd| lookup_match(lv.as_ref(), secantus_core::get_path(fd, ff)))
@@ -3401,7 +3401,7 @@ fn apply_lookup(
                 .ok_or_else(|| bad_value("$lookup requires localField+foreignField or pipeline"))?;
             let ff = foreign_field
                 .ok_or_else(|| bad_value("$lookup requires localField+foreignField or pipeline"))?;
-            let lv = secantus_core::get_path(&doc, lf).cloned();
+            let lv = lookup_local_value(&doc, lf);
             foreign
                 .iter()
                 .filter(|fd| lookup_match(lv.as_ref(), secantus_core::get_path(fd, ff)))
@@ -3455,12 +3455,8 @@ fn index_join_lookup(
     local_value: Option<&Bson>,
 ) -> Result<Vec<Document>, CommandError> {
     let filter = match local_value {
-        Some(Bson::Array(a)) => {
-            if a.is_empty() {
-                return Ok(Vec::new());
-            }
-            doc! { foreign_field: { "$in": a.clone() } }
-        }
+        // `lookup_local_value` has already read an empty array as null.
+        Some(Bson::Array(a)) => doc! { foreign_field: { "$in": a.clone() } },
         other => doc! { foreign_field: other.cloned().unwrap_or(Bson::Null) },
     };
     collection_documents(storage, db, coll, &filter, None)
@@ -3871,6 +3867,18 @@ pub(crate) fn set_field_path(doc: &mut Document, path: &str, value: Bson) {
             };
             set_field_path(child, rest, value);
         }
+    }
+}
+
+/// The value of `localField` a `$lookup` joins on. mongod builds its match
+/// from the values at the path, and when there are none -- the field is
+/// missing, or it is an empty array -- it matches null instead, so `[]` joins
+/// the foreign documents whose `foreignField` is missing, null or `[null]`
+/// (measured on 8.2.11, RM-529).
+fn lookup_local_value(doc: &Document, local_field: &str) -> Option<Bson> {
+    match secantus_core::get_path(doc, local_field) {
+        Some(Bson::Array(a)) if a.is_empty() => Some(Bson::Null),
+        other => other.cloned(),
     }
 }
 
@@ -6441,6 +6449,25 @@ mod malformed_pipeline_tests {
             "test",
         )
         .expect("a valid pipeline must not be rejected");
+    }
+
+    /// An empty `localField` array joins what null joins -- a missing, null or
+    /// `[null]` foreign field, never `[]` or a value -- as on mongod 8.2.11
+    /// (RM-529).
+    #[test]
+    fn an_empty_local_array_joins_what_null_joins() {
+        let lv = lookup_local_value(&doc! {"arr": []}, "arr");
+        assert_eq!(lv, Some(Bson::Null));
+        let joins = |f: Option<Bson>| lookup_match(lv.as_ref(), f.as_ref());
+        assert!(joins(None));
+        assert!(joins(Some(Bson::Null)));
+        assert!(joins(Some(Bson::Array(vec![Bson::Null]))));
+        assert!(!joins(Some(Bson::Array(vec![]))));
+        assert!(!joins(Some(Bson::Int32(1))));
+        // A non-empty array still joins element by element.
+        let lv = lookup_local_value(&doc! {"arr": [1]}, "arr");
+        assert!(lookup_match(lv.as_ref(), Some(&Bson::Int32(1))));
+        assert!(!lookup_match(lv.as_ref(), Some(&Bson::Null)));
     }
 
     /// `$lookup` is read before its fields are checked, in mongod 8.2.11's

@@ -71,27 +71,42 @@ def _empty_local_array(client: Any) -> dict:
             )
         )
 
-    return {
-        "simple": joined({"from": "f", "localField": "arr", "foreignField": "b"}),
-        "with_pipeline": joined(
+    simple = {"from": "f", "localField": "arr", "foreignField": "b"}
+    answers = {
+        "simple": joined(simple),
+        "with_pipeline": joined({**simple, "pipeline": [{"$project": {"_id": 1}}]}),
+        "collectionless": joined(
             {
-                "from": "f",
                 "localField": "arr",
                 "foreignField": "b",
-                "pipeline": [{"$project": {"_id": 1}}],
+                "pipeline": [
+                    {
+                        "$documents": [
+                            {"_id": "missing"},
+                            {"_id": "null", "b": None},
+                            {"_id": "empty", "b": []},
+                            {"_id": "one", "b": 1},
+                        ]
+                    }
+                ],
             }
         ),
     }
+    # The simple form over an index on the foreign field probes the index.
+    db.f.create_index("b")
+    answers["simple_indexed"] = joined(simple)
+    return answers
 
 
-@pytest.mark.backlog("RM-529")
+@pytest.mark.backlog_fixed("RM-529")
 def test_an_empty_local_array_joins_what_null_joins(
     rust_mongo: Any,
     mongod_rs: Any,  # noqa: F811
 ) -> None:
     """mongod 8.2.11 joins a `localField` that is an empty array as it joins
-    null: to the foreign documents whose field is missing, null or `[null]`.
-    This server joins it to none."""
+    null: to the foreign documents whose field is missing, null or `[null]`,
+    in the simple form (with or without an index on the foreign field), with
+    a pipeline and without `from`. This server joined it to none."""
     assert _empty_local_array(rust_mongo) == _empty_local_array(mongod_rs)
 
 
