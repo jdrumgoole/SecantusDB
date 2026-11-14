@@ -688,8 +688,11 @@ pub fn error_position(sql: &str, sqlstate: &str, message: &str) -> Option<usize>
                 })?;
                 // A call named with its schema (`pg_catalog.lower(1)`) is
                 // reported at the schema, where the name starts (measured).
-                if full.contains('.') && i >= 2 && toks[i - 1].text == "." {
-                    return pos(toks[i - 2].start);
+                let mut i = i;
+                for _ in 0..full.matches('.').count() {
+                    if i >= 2 && toks[i - 1].text == "." {
+                        i -= 2;
+                    }
                 }
                 return pos(toks[i].start);
             }

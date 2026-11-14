@@ -26595,6 +26595,12 @@ impl PgHandler {
                         secantus_pgplan::identifier_position(sql, name)
                     }
                 }
+                _ if info.code == "42883" => {
+                    if let Some(m) = secantus_pgplan::qualify_missing_function(sql, &info.message) {
+                        info.message = m;
+                    }
+                    secantus_pgplan::error_position(sql, &info.code, &info.message)
+                }
                 _ => secantus_pgplan::error_position(sql, e.sqlstate(), &e.to_string()),
             };
             if let Some(pos) = pos {
@@ -26689,6 +26695,11 @@ impl PgHandler {
                 return e;
             }
             if info.position.is_none() && info.severity == "ERROR" {
+                if info.code == "42883" {
+                    if let Some(m) = secantus_pgplan::qualify_missing_function(sql, &info.message) {
+                        info.message = m;
+                    }
+                }
                 info.position = secantus_pgplan::error_position(sql, &info.code, &info.message)
                     .map(|p| p.to_string());
             }

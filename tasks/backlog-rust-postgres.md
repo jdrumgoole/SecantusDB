@@ -2471,18 +2471,6 @@ Measured on PostgreSQL 15.19 (the data-modifying WITH on a private cluster).
 
 ## Found while working RP-485 (2026-11-11)
 
-- [ ] **A call to a missing function in a named schema drops the schema
-      from the message.** On PostgreSQL 15.19 `select public.nosuch(1)` is
-      42883 `function public.nosuch(integer) does not exist` at 8, the name
-      as written, schema and all (`pg_catalog.nosuch()` and a user schema's
-      alike). Here the message is `function nosuch(integer) does not exist`
-      and the position the bare name's, 15. The three-part form in the
-      session's database alike: `select postgres.public.nosuch()` is
-      `function postgres.public.nosuch() does not exist` at 8 there, and
-      `function nosuch() does not exist` at 24 here. Measured on a private
-      15.19 cluster.
-      Verify: tests/backlog/test_rp_qualified_calls.py::test_missing_function_keeps_its_schema
-      Backlog-ID: RP-879
 - [ ] **A function found nowhere inside another call's arguments is
       reported as the outer call's missing overload.** On PostgreSQL 15.19
       `select abs(nosuch1())` is 42883 `function nosuch1() does not exist`

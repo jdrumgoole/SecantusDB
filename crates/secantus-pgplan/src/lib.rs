@@ -5450,6 +5450,43 @@ fn missing_function_name(e: &Error) -> Option<&str> {
     Some(name.rsplit('.').next().unwrap_or(name))
 }
 
+/// A missing function is named as the statement wrote it, schema and all
+/// (`function public.nosuch(integer) does not exist`, PostgreSQL's
+/// `func_signature_string` over the call's own name list): the planner's
+/// message carries the bare name its lowering kept. The call it means is
+/// the one at the error's location, or else the first call of that name.
+/// `None` when the message needs no change.
+pub fn qualify_missing_function(sql: &str, message: &str) -> Option<String> {
+    let (bare, rest) = message.strip_prefix("function ")?.split_once('(')?;
+    if bare.contains('.') || bare.contains('"') || !message.ends_with(") does not exist") {
+        return None;
+    }
+    let tree = parse_tree(sql).ok()?;
+    let mut calls: Vec<(i32, Vec<String>)> = tree
+        .nodes()
+        .into_iter()
+        .filter_map(|(n, _, _, _)| match n {
+            pg_query::NodeRef::FuncCall(f) => {
+                let parts: Vec<String> = f
+                    .funcname
+                    .iter()
+                    .filter_map(|n| match n.node.as_ref() {
+                        Some(N::String(s)) => Some(s.sval.clone()),
+                        _ => None,
+                    })
+                    .collect();
+                (parts.last().map(String::as_str) == Some(bare)).then_some((f.location, parts))
+            }
+            _ => None,
+        })
+        .collect();
+    calls.sort_by_key(|(l, _)| *l);
+    let (_, parts) = peek_error_location()
+        .and_then(|a| calls.iter().find(|(l, _)| *l == a))
+        .or_else(|| calls.first())?;
+    (parts.len() >= 2).then(|| format!("function {}({rest}", parts.join(".")))
+}
+
 /// A missing type is named as the statement wrote it, schema and all
 /// (`type "public.nosuch" does not exist`): the planner's own message
 /// carries the bare name its lowering kept.
