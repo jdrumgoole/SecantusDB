@@ -2,7 +2,7 @@
 ordering operators compared as int arrays): the network types' BETWEEN
 compared their text (RP-610, fixed), an array of `oidvector`s ordered its
 elements as int arrays (RP-611, fixed: the tests of both are now regression
-tests), and `oidvector`'s comparison functions are refused (RP-612).
+tests), and `oidvector`'s comparison functions were refused (RP-612, fixed).
 
 The expected answers were measured on PostgreSQL 15.19; none needs DDL.
 """
@@ -85,8 +85,10 @@ def test_oidvector_array_orders_by_btoidvectorcmp(query: str, dsn: str) -> None:
         assert pg_answer(c, query) == ("ok", OIDVECTOR_ARRAYS[query])
 
 
-@pytest.mark.backlog("RP-612")
+@pytest.mark.backlog_fixed("RP-612")
 def test_oidvector_comparison_functions(dsn: str) -> None:
+    """`btoidvectorcmp` and `oidvectorlt` .. `oidvectorne` were refused as
+    not supported, and an untyped literal argument was read as `oid[]`."""
     query = (
         "select btoidvectorcmp('1 2', '3'), oidvectorlt('1 2', '3'), oidvectorle('1 2', '3'), "
         "oidvectorgt('1 2', '3'), oidvectorge('1 2', '3'), oidvectoreq('1 2', '1 2'), "

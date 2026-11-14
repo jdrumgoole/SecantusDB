@@ -805,13 +805,14 @@ impl PgHandler {
     /// ALTER TABLE's constraints.
     pub(crate) fn btree_built(&self, table: &str, before: &[String]) -> PgWireResult<()> {
         let new_hash: Vec<String> = self
-            .hash_shapes(table)
+            .hash_index_shapes(table)
             .into_iter()
             .map(|s| s.name)
             .filter(|n| !before.contains(n))
             .collect();
         if !new_hash.is_empty() {
-            self.hash_built(table, Some(&new_hash));
+            let sizes = self.hash_built(table, Some(&new_hash));
+            self.record_hash_sizes(table, sizes)?;
         }
         let new_am: Vec<String> = self
             .am_shapes(table)
@@ -833,11 +834,20 @@ impl PgHandler {
         self.btree_build_record(table, Some(&new))
     }
 
+    /// [`Self::hash_built`]'s sizes recorded, as `index_update_stats`
+    /// records a build's.
+    fn record_hash_sizes(&self, table: &str, sizes: Vec<(String, u32, f64)>) -> PgWireResult<()> {
+        for (name, pages, tuples) in sizes {
+            self.record_index_size(table, &name, pages, tuples)?;
+        }
+        Ok(())
+    }
+
     /// The indexes of `table` with a page model: its B-trees, then its
     /// hash indexes (`btree_built`'s `before`).
     pub(crate) fn index_model_names(&self, table: &str) -> Vec<String> {
         let mut names = self.btree_names(table);
-        names.extend(self.hash_shapes(table).into_iter().map(|s| s.name));
+        names.extend(self.hash_index_shapes(table).into_iter().map(|s| s.name));
         names.extend(
             self.am_shapes(table)
                 .into_iter()
@@ -849,14 +859,16 @@ impl PgHandler {
     /// Every B-tree of `table` rebuilt and recorded: a rewrite of its heap
     /// (VACUUM FULL, CLUSTER, an ALTER that rewrites) reindexes it.
     pub(crate) fn btree_reindex(&self, table: &str) -> PgWireResult<()> {
-        self.hash_built(table, None);
+        let sizes = self.hash_built(table, None);
+        self.record_hash_sizes(table, sizes)?;
         self.am_built(table, None);
         self.btree_build_record(table, None)
     }
 
     /// REINDEX INDEX: that B-tree rebuilt and recorded.
     pub(crate) fn btree_reindex_one(&self, table: &str, index: &str) -> PgWireResult<()> {
-        self.hash_built(table, Some(&[index.to_string()]));
+        let sizes = self.hash_built(table, Some(&[index.to_string()]));
+        self.record_hash_sizes(table, sizes)?;
         self.am_built(table, Some(&[index.to_string()]));
         self.btree_build_record(table, Some(&[index.to_string()]))
     }
@@ -885,6 +897,9 @@ impl PgHandler {
         self.am_truncated(table);
         for name in self.btree_names(table) {
             self.record_index_size(table, &name, 0, -1.0)?;
+        }
+        for shape in self.hash_index_shapes(table) {
+            self.record_index_size(table, &shape.name, 0, -1.0)?;
         }
         Ok(())
     }

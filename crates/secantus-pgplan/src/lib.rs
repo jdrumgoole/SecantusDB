@@ -199,6 +199,7 @@ pub use correlated::{
     DESCRIBE_QUERY, FETCH_CURSOR,
 };
 pub mod json;
+pub mod json_lex;
 pub mod jsonb_subs;
 pub mod jsonfn;
 pub mod jsonops;
@@ -4106,7 +4107,7 @@ fn vector_element_args(
         .find_map(|t| vectors::vector_array_element(t))
         .map(str::to_owned)
     else {
-        return Ok(args);
+        return vector_array_args(name, args, &types);
     };
     args.into_iter()
         .zip(&types)
@@ -4116,6 +4117,38 @@ fn vector_element_args(
             } else {
                 Ok(v)
             }
+        })
+        .collect()
+}
+
+/// A vector where an array built-in declares `anyarray` (or
+/// `anycompatiblearray`) is that array, subscripted from 0 as the vector is:
+/// `array_dims('1 2'::int2vector)` is `[0:1]`, as the cast
+/// `'1 2'::int2vector::int2[]` has it (RP-601).
+fn vector_array_args(name: &str, args: Vec<Bson>, types: &[String]) -> Result<Vec<Bson>> {
+    if !types.iter().any(|t| vectors::is_vector(t)) {
+        return Ok(args);
+    }
+    let Some(params) = funcsig::selected_args(name, types) else {
+        return Ok(args);
+    };
+    args.into_iter()
+        .zip(types)
+        .zip(
+            params
+                .iter()
+                .map(String::as_str)
+                .chain(std::iter::repeat("")),
+        )
+        .map(|((v, t), p)| match array_element_type(t) {
+            Some(elem)
+                if vectors::is_vector(t)
+                    && matches!(p, "anyarray" | "anycompatiblearray")
+                    && matches!(v, Bson::Array(_)) =>
+            {
+                Ok(arrays::bounded(cast_value(v, &format!("{elem}[]"))?, &[0]))
+            }
+            _ => Ok(v),
         })
         .collect()
 }
@@ -16479,7 +16512,7 @@ pub(crate) fn populate_composite(
         Bson::Null => unreachable!(),
         other => {
             let text = value_text(other);
-            let parsed = json::parse(&text).map_err(json_parse_error)?;
+            let parsed = json::parse(&text).map_err(|e| json_input_error(&text, true, e))?;
             if !matches!(parsed, json::Json::Object(_)) {
                 return Err(Error::Sqlstate(
                     "22023",
@@ -19767,6 +19800,11 @@ fn plan_table_targets(
                         c.pg_type != "bpchar"
                             && c.pg_type != "tid"
                             && !(printing_function(f) && typeout::needs_type(&c.pg_type))
+                            // An array built-in over a vector column takes it
+                            // as an array subscripted from 0, which only the
+                            // general path's typed arguments know (RP-601).
+                            && !(func_name(f).is_some_and(|n| arrays::is_array_function(&n))
+                                && vectors::is_vector(&c.pg_type))
                     })
                 }) && !(printing_function(f)
                     && f.args
@@ -32037,10 +32075,19 @@ fn static_type_uncached(node: &pg_query::protobuf::Node, value: &Bson) -> String
                 )
             ) =>
         {
-            f.args
+            let types: Vec<String> = f.args.iter().map(|a| static_type(a, &Bson::Null)).collect();
+            // A vector argument is its element's array (`array_append(
+            // int2vector, int2)` is `smallint[]`, RP-601).
+            types
                 .iter()
-                .map(|a| static_type(a, &Bson::Null))
                 .find(|t| t.ends_with("[]"))
+                .cloned()
+                .or_else(|| {
+                    types
+                        .iter()
+                        .filter(|t| vectors::is_vector(t))
+                        .find_map(|t| array_element_type(t).map(|e| format!("{e}[]")))
+                })
                 .unwrap_or_else(|| inferred_type(value).to_string())
         }
         // The datetime functions, typed from their arguments' types.
@@ -32500,9 +32547,17 @@ fn static_type_uncached(node: &pg_query::protobuf::Node, value: &Bson) -> String
                 "||" => {
                     let (l, r) = (lt(), rt());
                     // An array beside anything is `array_cat` / `array_append`
-                    // / `array_prepend`, typed as the array.
+                    // / `array_prepend`, typed as the array; a vector is its
+                    // element's array (RP-601).
                     if let Some(t) = l.iter().chain(r.iter()).find(|t| t.ends_with("[]")) {
                         (*t).clone()
+                    } else if let Some(e) = l
+                        .iter()
+                        .chain(r.iter())
+                        .filter(|t| vectors::is_vector(t))
+                        .find_map(|t| array_element_type(t))
+                    {
+                        format!("{e}[]")
                     } else if l.map(String::as_str) == Some("bytea")
                         || r.map(String::as_str) == Some("bytea")
                     {
@@ -40932,7 +40987,7 @@ fn cast_value_inner(value: Bson, target: &str) -> Result<Bson> {
                 {
                     None
                 }
-                Err(e) => return Err(json_parse_error(e)),
+                Err(e) => return Err(json_input_error(&text, target == "jsonb", e)),
             };
             Ok(Bson::String(match parsed {
                 Some(parsed) if target == "jsonb" => json::render_jsonb(&parsed),
@@ -42033,15 +42088,36 @@ fn is_range_family(name: &str) -> bool {
     range::is_range_type(element) || range::is_multirange_type(element)
 }
 
-/// PostgreSQL's error for JSON text that does not parse. The type is named
-/// `json` whether the input was json or jsonb, and the value is not quoted
-/// in the message (it goes in the CONTEXT line, which is not carried).
-fn json_parse_error(e: json::ParseError) -> Error {
-    match e {
-        json::ParseError::NulEscape => {
-            Error::UntranslatableCharacter("unsupported Unicode escape sequence".into())
-        }
-        _ => Error::InvalidText("invalid input syntax for type json".into()),
+/// PostgreSQL's error for JSON `text` that does not parse
+/// (`json_ereport_error`). The type is named `json` whether the input was
+/// json or jsonb, and the value is not quoted in the message: the DETAIL
+/// names the token and the CONTEXT shows the line up to it, as
+/// [`json_lex`] finds them. `jsonb` is `jsonb_in`'s mode, which decodes
+/// escapes and so rejects a lone surrogate or `\u0000`.
+fn json_input_error(text: &str, jsonb: bool, e: json::ParseError) -> Error {
+    let Some(found) = json_lex::input_error(text, jsonb) else {
+        // PostgreSQL's parser accepts what this one rejected: say so plainly
+        // rather than invent a position.
+        return match e {
+            json::ParseError::NulEscape => {
+                Error::UntranslatableCharacter("unsupported Unicode escape sequence".into())
+            }
+            _ => Error::InvalidText("invalid input syntax for type json".into()),
+        };
+    };
+    let message = if found.untranslatable {
+        "unsupported Unicode escape sequence"
+    } else {
+        "invalid input syntax for type json"
+    };
+    let message = format!(
+        "{message}\nDetail: {}\nContext: {}",
+        found.detail, found.context
+    );
+    if found.untranslatable {
+        Error::UntranslatableCharacter(message)
+    } else {
+        Error::InvalidText(message)
     }
 }
 
@@ -42057,7 +42133,7 @@ fn json_parse_error(e: json::ParseError) -> Error {
 /// PostgreSQL's rule and the reason these operators are usable at all.
 fn json_operator(op: &str, target: &str, lhs: &Bson, rhs: &Bson) -> Result<Bson> {
     let text = value_text(lhs);
-    let parsed = json::parse(&text).map_err(json_parse_error)?;
+    let parsed = json::parse(&text).map_err(|e| json_input_error(&text, target != "json", e))?;
     // `#>` and `#>>` take a PATH; the others take one key.
     let steps: Vec<String> = if op.starts_with('#') && op != "#" {
         match rhs {
@@ -42095,7 +42171,8 @@ fn json_operator(op: &str, target: &str, lhs: &Bson, rhs: &Bson) -> Result<Bson>
     // Containment compares by VALUE, so key order and whitespace do not count.
     if op == "@>" || op == "<@" {
         let other = value_text(rhs);
-        let other = json::parse(&other).map_err(json_parse_error)?;
+        let other =
+            json::parse(&other).map_err(|e| json_input_error(&other, target != "json", e))?;
         return Ok(Bson::Boolean(if op == "@>" {
             json::contains(&parsed, &other)
         } else {
@@ -49206,6 +49283,15 @@ fn const_value_node(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result<
                 let ty = node.map(|n| static_type(n, &v)).unwrap_or_default();
                 match (ty.as_str(), &v) {
                     ("float4", Bson::Double(d)) => Bson::String(geo::float4_text(*d as f32)),
+                    // A vector is a true array to `||`'s `anycompatiblearray`,
+                    // coerced to its element's array and subscripted from 0:
+                    // `'1 2'::int2vector || '3'::int2vector` is
+                    // `[0:2]={1,2,3}` (RP-601).
+                    (t @ ("int2vector" | "oidvector"), Bson::Array(_)) => {
+                        let elem = array_element_type(t).expect("a vector has an element");
+                        cast_value(v.clone(), &format!("{elem}[]"))
+                            .map_or(v, |a| arrays::bounded(a, &[0]))
+                    }
                     ("tid", v) if *v != Bson::Null => Bson::String(tid::render_tid_value(v)),
                     ("timestamptz", _) => {
                         timestamptz_value_text(&v, &session_timezone()).map_or(v, Bson::String)

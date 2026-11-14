@@ -2579,10 +2579,18 @@ fn json_unicode_escapes_match_postgres() {
     assert_eq!(cast("json", r#""\u0000""#), r#""\u0000""#);
     let err = plan(r#"SELECT '"\ud83d"'::jsonb"#, &lookup).unwrap_err();
     assert_eq!(err.sqlstate(), "22P02");
-    assert_eq!(err.to_string(), "invalid input syntax for type json");
+    assert_eq!(
+        err.to_string(),
+        "invalid input syntax for type json\nDetail: Unicode low surrogate must follow a \
+         high surrogate.\nContext: JSON data, line 1: \"\\ud83d\""
+    );
     let err = plan(r#"SELECT '"\u0000"'::jsonb"#, &lookup).unwrap_err();
     assert_eq!(err.sqlstate(), "22P05");
-    assert_eq!(err.to_string(), "unsupported Unicode escape sequence");
+    assert_eq!(
+        err.to_string(),
+        "unsupported Unicode escape sequence\nDetail: \\u0000 cannot be converted to \
+         text.\nContext: JSON data, line 1: \"\\u0000..."
+    );
 }
 
 /// The scalar built-ins, every case measured against PostgreSQL 14.
@@ -8191,4 +8199,52 @@ fn a_call_name_is_deconstructed_before_its_schema_is_looked_up() {
     // The session's own database is no cross-database reference.
     plan("select postgres.pg_catalog.abs(-2)", &lookup).expect("planned");
     set_session_database("");
+}
+
+/// RP-612: `btoidvectorcmp` answers the difference of the lengths when they
+/// differ, then -1 / 1 at the first oid that differs, unsigned, as `oid.c`
+/// does; NULL in, NULL out. The catalog spells the vector functions'
+/// arguments by the vector's own name, so an untyped literal is read as one.
+#[test]
+fn btoidvectorcmp_orders_by_length_then_unsigned_oid() {
+    let s = |t: &[&str]| t.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+    assert_eq!(
+        funcsig::selected_args("btoidvectorcmp", &s(&["unknown", "unknown"])),
+        Some(s(&["oidvector", "oidvector"]))
+    );
+    assert_eq!(
+        funcsig::selected_args("int2vectorout", &s(&["int2vector"])),
+        Some(s(&["int2vector"]))
+    );
+    let v = |s: &str| Bson::String(s.into());
+    for (a, b, want) in [
+        ("1 2", "3", 1),
+        ("3", "1 2 4", -2),
+        ("1 4294967295", "1 2", 1),
+        ("1 2", "1 2", 0),
+        ("", "", 0),
+    ] {
+        let got = crate::cmpfn::call("btoidvectorcmp", &[v(a), v(b)])
+            .expect("a comparison function")
+            .expect("compared");
+        assert_eq!(got, Bson::Int32(want), "btoidvectorcmp('{a}', '{b}')");
+    }
+    let null = crate::cmpfn::call("btoidvectorcmp", &[Bson::Null, v("3")]);
+    assert_eq!(null.expect("strict").expect("NULL"), Bson::Null);
+}
+
+/// RP-601: a vector is a true array to the polymorphic resolution, its
+/// element `int2` / `oid`: `cardinality(int2vector)` and
+/// `array_position(oidvector, oid)` resolve.
+#[test]
+fn a_vector_is_an_array_to_the_polymorphic_resolution() {
+    let s = |t: &[&str]| t.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+    assert_eq!(
+        funcsig::selected_args("cardinality", &s(&["int2vector"])),
+        Some(s(&["anyarray"]))
+    );
+    assert_eq!(
+        funcsig::selected_args("array_position", &s(&["oidvector", "oid"])),
+        Some(s(&["anycompatiblearray", "anycompatible"]))
+    );
 }

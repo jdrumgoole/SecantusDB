@@ -100,7 +100,7 @@ def test_a_leaf_partitions_inherited_indexes_are_built(pg: Any) -> None:
     assert [(r[1], r[2]) for r in rows] == [(1, 0.0)] * 3, rows
 
 
-@pytest.mark.backlog("RP-929")
+@pytest.mark.backlog_fixed("RP-929")
 def test_a_hash_index_on_an_empty_table_is_recorded_as_built(pg: Any) -> None:
     """`CREATE INDEX ... USING hash` on an empty table: PostgreSQL's
     `hashbuild` lays out the metapage, the bitmap page and the initial
@@ -112,3 +112,60 @@ def test_a_hash_index_on_an_empty_table_is_recorded_as_built(pg: Any) -> None:
     pg.execute("CREATE INDEX rp921h_h ON rp921h USING hash (a)")
     rows = pg.execute(SIZES.format("'rp921h'")).fetchall()
     assert rows == [("rp921h_h", 6, 0.0)]
+
+
+@pytest.mark.backlog_fixed("RP-929")
+def test_every_hash_index_build_records_its_size(pg: Any) -> None:
+    """Each build of a hash index records its pages (the metapage, the
+    bitmap page and the buckets `_hash_init` sizes from the heap's
+    estimate) and its index tuples, NULL keys and rows outside a partial
+    index's WHERE left out; TRUNCATE forgets them, REINDEX records them
+    again. PostgreSQL 15.19's answers on a private cluster (2026-11-14):
+    `secantusd-pg` answered 0 pages, -1 tuples for every one, whether its
+    key's hash was reproduced (int, text, bigint) or not (numeric, a
+    collated text, a partial or an expression index)."""
+    for t in ("rp929a", "rp929b", "rp929c", "rp929d"):
+        pg.execute(f"DROP TABLE IF EXISTS {t}")
+    pg.execute("CREATE TABLE rp929a (a int, b text)")
+    pg.execute("INSERT INTO rp929a SELECT g, g::text FROM generate_series(1, 1000) g")
+    pg.execute("INSERT INTO rp929a VALUES (NULL, NULL)")
+    pg.execute("CREATE INDEX rp929a_h ON rp929a USING hash (a)")
+    pg.execute("CREATE INDEX rp929a_t ON rp929a USING hash (b)")
+    pg.execute("CREATE TABLE rp929b (a int)")
+    pg.execute("INSERT INTO rp929b SELECT g FROM generate_series(1, 100000) g")
+    pg.execute("CREATE INDEX rp929b_h ON rp929b USING hash (a)")
+    pg.execute("CREATE TABLE rp929c (a bigint)")
+    pg.execute("CREATE INDEX rp929c_h ON rp929c USING hash (a) WITH (fillfactor = 10)")
+    pg.execute('CREATE TABLE rp929d (a numeric, b text COLLATE "C")')
+    pg.execute("CREATE INDEX rp929d_h ON rp929d USING hash (a)")
+    pg.execute("CREATE INDEX rp929d_t ON rp929d USING hash (b)")
+    pg.execute("CREATE INDEX rp929d_p ON rp929d USING hash (a) WHERE a > 0")
+    tables = "'rp929a', 'rp929b', 'rp929c', 'rp929d'"
+    assert pg.execute(SIZES.format(tables)).fetchall() == [
+        ("rp929a_h", 6, 1000.0),
+        ("rp929a_t", 6, 1000.0),
+        ("rp929b_h", 514, 100000.0),
+        ("rp929c_h", 66, 0.0),
+        ("rp929d_h", 4, 0.0),
+        ("rp929d_p", 4, 0.0),
+        ("rp929d_t", 4, 0.0),
+    ]
+    pg.execute("DROP TABLE IF EXISTS rp929e")
+    pg.execute("CREATE TABLE rp929e (a numeric, b int)")
+    pg.execute("INSERT INTO rp929e SELECT g, g FROM generate_series(1, 1000) g")
+    pg.execute("INSERT INTO rp929e VALUES (NULL, 5)")
+    pg.execute("CREATE INDEX rp929e_p ON rp929e USING hash (b) WHERE a > 400")
+    pg.execute("CREATE INDEX rp929e_n ON rp929e USING hash (a)")
+    pg.execute("CREATE INDEX rp929e_e ON rp929e USING hash ((b % 7)) WHERE b > 100")
+    assert pg.execute(SIZES.format("'rp929e'")).fetchall() == [
+        ("rp929e_e", 6, 900.0),
+        ("rp929e_n", 6, 1000.0),
+        ("rp929e_p", 6, 600.0),
+    ]
+    pg.execute("TRUNCATE rp929b")
+    pg.execute("REINDEX INDEX rp929a_h")
+    assert pg.execute(SIZES.format("'rp929a', 'rp929b'")).fetchall() == [
+        ("rp929a_h", 6, 1000.0),
+        ("rp929a_t", 6, 1000.0),
+        ("rp929b_h", 0, -1.0),
+    ]

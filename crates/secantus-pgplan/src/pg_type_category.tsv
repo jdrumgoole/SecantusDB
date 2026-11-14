@@ -52,7 +52,7 @@ inet	I	1
 inet[]	A	0
 int2	N	0
 int2[]	A	0
-int2[]	A	0
+int2vector	A	0
 int2vector[]	A	0
 int4	N	0
 int4[]	A	0
@@ -96,7 +96,7 @@ numrange	R	0
 numrange[]	A	0
 oid	N	1
 oid[]	A	0
-oid[]	A	0
+oidvector	A	0
 oidvector[]	A	0
 path	G	0
 path[]	A	0

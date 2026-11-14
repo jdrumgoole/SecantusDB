@@ -26,6 +26,13 @@ pub(crate) struct HashShape {
     pub(crate) pg_type: String,
     /// Its `fillfactor` (75 unless `WITH` gave one), which its builds read.
     pub(crate) fillfactor: u32,
+    /// Whether its key's hash is reproduced, so SERIALIZABLE can name its
+    /// buckets. One that is not still has its size recorded at a build.
+    pub(crate) modelled: bool,
+    /// A partial index's WHERE, planned: only a row it holds true for is
+    /// indexed. An expression index's is already in its stored field, which
+    /// a row lacks when the WHERE does not hold.
+    pub(crate) predicate: Option<std::sync::Arc<secantus_pgplan::ColumnExpr>>,
 }
 
 impl HashShape {
@@ -143,10 +150,12 @@ impl Meta {
         Some((old, new))
     }
 
-    /// The pages it occupies: the metapage, the buckets and the first
-    /// bitmap page.
+    /// The pages it occupies (`RelationGetNumberOfBlocks`): the metapage,
+    /// the first bitmap page and the buckets of every splitpoint phase
+    /// begun, which `_hash_alloc_buckets` allocates whole when its first
+    /// bucket splits off. Overflow pages are not modelled.
     pub(crate) fn pages(&self) -> f64 {
-        f64::from(self.maxbucket + 1) + 2.0
+        f64::from(total_buckets(spare_index(self.maxbucket + 1))) + 2.0
     }
 }
 
@@ -198,6 +207,14 @@ impl crate::PgHandler {
     /// SERIALIZABLE scan, which then locks the whole table, so no conflict
     /// it would have caught is missed.
     pub(crate) fn hash_shapes(&self, table: &str) -> Vec<HashShape> {
+        let mut shapes = self.hash_index_shapes(table);
+        shapes.retain(|s| s.modelled);
+        shapes
+    }
+
+    /// Every hash index of `table`, modelled or not: each one's build
+    /// records its size.
+    pub(crate) fn hash_index_shapes(&self, table: &str) -> Vec<HashShape> {
         type Memo =
             HashMap<(usize, String), (u64, std::sync::Arc<HashMap<String, Vec<HashShape>>>)>;
         static MEMO: OnceLock<Mutex<Memo>> = OnceLock::new();
@@ -232,7 +249,7 @@ impl crate::PgHandler {
             self.index_relations()
         };
         for ix in relations {
-            if ix.primary || ix.exclusion || ix.keys.len() != 1 || ix.keys[0] <= 0 {
+            if ix.primary || ix.exclusion || ix.keys.len() != 1 {
                 continue;
             }
             let def = &ix.table;
@@ -254,9 +271,7 @@ impl crate::PgHandler {
                         .and_then(|o| o.get(k).cloned())
                 })
             };
-            if opt("sqlMethod").as_ref().and_then(Bson::as_str) != Some("hash")
-                || opt("sqlPredicate").is_some()
-            {
+            if opt("sqlMethod").as_ref().and_then(Bson::as_str) != Some("hash") {
                 continue;
             }
             let Some(field) = d
@@ -266,18 +281,34 @@ impl crate::PgHandler {
             else {
                 continue;
             };
-            let Some(col) = def.columns.iter().find(|c| c.field() == field) else {
-                continue;
+            // An expression's key is its stored field (`expr_index`).
+            let col = (ix.keys[0] > 0)
+                .then(|| def.columns.iter().find(|c| c.field() == field))
+                .flatten();
+            let predicate = match (col, opt("sqlPredicate")) {
+                (Some(_), Some(Bson::String(sql))) => {
+                    match secantus_pgplan::plan_check_expression(&sql, def) {
+                        Ok(p) => Some(std::sync::Arc::new(p)),
+                        Err(_) => continue,
+                    }
+                }
+                _ => None,
             };
-            let textual = matches!(
-                col.pg_type.as_str(),
-                "text" | "varchar" | "name" | "bpchar" | "character varying" | "character" | "char"
-            );
-            if !secantus_pgplan::hashpart::supported_type(&col.pg_type)
-                || (textual && col.extra.contains_key("collation"))
-            {
-                continue;
-            }
+            let modelled = col.is_some_and(|col| {
+                let textual = matches!(
+                    col.pg_type.as_str(),
+                    "text"
+                        | "varchar"
+                        | "name"
+                        | "bpchar"
+                        | "character varying"
+                        | "character"
+                        | "char"
+                );
+                secantus_pgplan::hashpart::supported_type(&col.pg_type)
+                    && !(textual && col.extra.contains_key("collation"))
+                    && opt("sqlPredicate").is_none()
+            });
             let fillfactor = match opt("sqlReloptions") {
                 Some(Bson::Array(a)) => a
                     .iter()
@@ -292,9 +323,11 @@ impl crate::PgHandler {
                 .push(HashShape {
                     oid: ix.oid,
                     name: ix.name.clone(),
-                    field: col.field(),
-                    pg_type: col.pg_type.clone(),
+                    field,
+                    pg_type: col.map(|c| c.pg_type.clone()).unwrap_or_default(),
                     fillfactor,
+                    modelled,
+                    predicate,
                 });
         }
         let m = std::sync::Arc::new(by_table);
@@ -306,9 +339,30 @@ impl crate::PgHandler {
         m.get(table).cloned().unwrap_or_default()
     }
 
+    /// The rows of `table` `shape` indexes: a key that is not NULL (a hash
+    /// index holds none), in a row its predicate holds true for.
+    fn hash_indexed(&self, table: &str, shape: &HashShape) -> usize {
+        let keyed = bson::doc! { shape.field.clone(): { "$ne": Bson::Null } };
+        let Some(p) = &shape.predicate else {
+            return self
+                .storage
+                .count_matching(self.db(), table, &keyed, None)
+                .unwrap_or(0);
+        };
+        let empty = Document::new();
+        self.table_docs(table)
+            .unwrap_or_default()
+            .iter()
+            .filter(|d| secantus_core::query::matches(d, &keyed, &empty, None).unwrap_or(false))
+            .filter(|d| secantus_pgplan::apply_row_expr(p, d).ok() == Some(Bson::Boolean(true)))
+            .count()
+    }
+
     /// `hashbuild` of `shape` over `table` as it is now: estimated as the
-    /// planner estimates the table, then each row inserted.
-    fn hash_build(&self, table: &str, shape: &HashShape) -> Meta {
+    /// planner estimates the table (`estimate_rel_size`), then each row it
+    /// indexes inserted. Its index tuples, which `index_update_stats`
+    /// records as `reltuples`.
+    fn hash_build(&self, table: &str, shape: &HashShape) -> (Meta, usize) {
         let count = self
             .storage
             .count_matching(self.db(), table, &Document::new(), None)
@@ -316,7 +370,8 @@ impl crate::PgHandler {
         let estimate = self
             .planner_table(table, count)
             .map_or(count as f64, |pt| pt.tuples);
-        built(estimate, count, shape.fillfactor)
+        let indexed = self.hash_indexed(table, shape);
+        (built(estimate, indexed, shape.fillfactor), indexed)
     }
 
     /// `index`'s metapage, built over the rows now if it has none.
@@ -334,7 +389,7 @@ impl crate::PgHandler {
             .unwrap_or_else(|e| e.into_inner())
             .contains_key(&(store, db.clone(), oid));
         // Built outside the lock: it reads the table.
-        let fresh = (!exists).then(|| self.hash_build(table, shape));
+        let fresh = (!exists).then(|| self.hash_build(table, shape).0);
         with_meta(
             store,
             &db,
@@ -345,18 +400,28 @@ impl crate::PgHandler {
     }
 
     /// CREATE INDEX, REINDEX or a rewrite: `table`'s hash indexes built
-    /// afresh over its rows (those `only` names, or every one).
-    pub(crate) fn hash_built(&self, table: &str, only: Option<&[String]>) {
-        for shape in self.hash_shapes(table) {
+    /// afresh over its rows (those `only` names, or every one). Each one's
+    /// name, pages and index tuples, for `index_update_stats`.
+    pub(crate) fn hash_built(
+        &self,
+        table: &str,
+        only: Option<&[String]>,
+    ) -> Vec<(String, u32, f64)> {
+        let mut sizes = Vec::new();
+        for shape in self.hash_index_shapes(table) {
             if only.is_some_and(|names| !names.contains(&shape.name)) {
                 continue;
             }
-            let meta = self.hash_build(table, &shape);
-            metas()
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .insert((self.hash_store(), self.db().to_string(), shape.oid), meta);
+            let (meta, indexed) = self.hash_build(table, &shape);
+            sizes.push((shape.name.clone(), meta.pages() as u32, indexed as f64));
+            if shape.modelled {
+                metas()
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert((self.hash_store(), self.db().to_string(), shape.oid), meta);
+            }
         }
+        sizes
     }
 
     /// TRUNCATE: each hash index starts empty, as `hashbuildempty` leaves it.
@@ -449,5 +514,24 @@ mod tests {
         // Bucket 2 now takes the keys whose low bits are 2.
         assert_eq!(m.bucket(6), 2);
         assert_eq!(m.bucket(7), 3 & 1);
+    }
+
+    #[test]
+    fn a_split_allocates_its_whole_splitpoint() {
+        // 4 buckets (6 pages, as CREATE INDEX on PostgreSQL 15.19 leaves an
+        // empty `(a int, b text)` table's), then a fifth: the phase of
+        // buckets 4-7 is allocated, 10 pages.
+        let mut m = Meta::init(1000.0, 75);
+        assert_eq!((m.maxbucket, m.pages()), (3, 6.0));
+        while m.insert().is_none() {}
+        assert_eq!((m.maxbucket, m.pages()), (4, 10.0));
+        // 3,000 rows into 8 buckets end at 10 buckets, in the phase of 16:
+        // 18 pages, as 15.19 measured (2026-11-14).
+        let mut m = Meta::init(2000.0, 75);
+        assert_eq!(m.pages(), 10.0);
+        for _ in 0..3000 {
+            m.insert();
+        }
+        assert_eq!((m.maxbucket, m.pages()), (9, 18.0));
     }
 }

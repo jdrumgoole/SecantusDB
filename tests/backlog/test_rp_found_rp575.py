@@ -1,8 +1,8 @@
 """Gap tests of the divergences found while working RP-575 (an array of
 `int2vector` or `oidvector` was a two-dimensional int array): RP-601 (the
-array built-ins refuse a vector), RP-602 (a two-dimensional `int2vector`
+array built-ins refused a vector, fixed), RP-602 (a two-dimensional `int2vector`
 prints as text), RP-603 (`oidvector`'s `<` compared element by element, fixed),
-RP-604 (a parameter declared `int2vector[]` has no type) and RP-605 (an
+RP-604 (a parameter declared `int2vector[]` had no type, fixed) and RP-605 (an
 `int2vector` input's out-of-range error quoted only its number, fixed).
 
 The expected answers were measured on PostgreSQL 15.19; none needs DDL.
@@ -38,9 +38,11 @@ ARRAY_BUILTINS: dict[str, list[tuple[object, ...]]] = {
 }
 
 
-@pytest.mark.backlog("RP-601")
+@pytest.mark.backlog_fixed("RP-601")
 @pytest.mark.parametrize("query", list(ARRAY_BUILTINS))
 def test_array_builtins_over_a_vector(query: str, dsn: str) -> None:
+    """The array built-ins refused a vector as 42883, and a vector reached
+    them, and `||`, with a lower bound of 1 instead of 0."""
     with psycopg.connect(dsn, autocommit=True) as c:
         assert pg_answer(c, query) == ("ok", ARRAY_BUILTINS[query])
 
@@ -157,13 +159,15 @@ def _int2vector_array(vectors: list[list[int]]) -> bytes:
     return out
 
 
-@pytest.mark.backlog("RP-604")
+@pytest.mark.backlog_fixed("RP-604")
 @pytest.mark.parametrize(
     ("value", "fmt"),
     [(b'{"1 2",3}', 0), (_int2vector_array([[1, 2], [3]]), 1)],
     ids=["text", "binary"],
 )
 def test_vector_array_parameter(value: bytes, fmt: int, dsn: str) -> None:
+    """A parameter declared `int2vector[]` (oid 1006) had no type and
+    stayed the client's text: 42P18 for `pg_typeof($1)`."""
     expected = {
         b"select pg_typeof($1)::text": b"int2vector[]",
         b"select ($1)[2]::text": b"3",

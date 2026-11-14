@@ -5,7 +5,8 @@ the types' text I/O):
 - a `numeric` out of `int4`'s range is 22003 `integer out of range` on
   PostgreSQL, with no value quoted; the message quoted the value (fixed,
   RP-749, with the `smallint` / `bigint` casts and NaN / infinity);
-- a `jsonb` input error carries the `JSON data, line 1: ...` CONTEXT line;
+- a `jsonb` input error carries the `JSON data, line 1: ...` CONTEXT line
+  and the DETAIL naming its token (fixed, RP-750);
 - a `money` variable prints through `cash_out` in a RAISE (`$5.25`);
 - an assignment's 22001 for an overlong `varchar(n)` value carries the
   `PL/pgSQL assignment "..."` frame;
@@ -114,14 +115,93 @@ def test_numeric_to_integer_errors_name_the_target_type(
     assert _answer(dsn, query) == ("error", state, message, context, None)
 
 
-@pytest.mark.backlog("RP-750")
+@pytest.mark.backlog_fixed("RP-750")
 def test_jsonb_input_error_carries_its_json_data_context(dsn: str) -> None:
+    """A jsonb input error carried no `JSON data` CONTEXT line."""
     assert _answer(dsn, "select 't'::jsonb") == (
         "error",
         "22P02",
         "invalid input syntax for type json",
         "JSON data, line 1: t",
         None,
+    )
+
+
+def _detail(dsn: str, query: str) -> object:
+    with psycopg.connect(dsn, autocommit=True) as c:
+        try:
+            c.execute(query)
+            return "ok"
+        except psycopg.Error as e:
+            return (e.sqlstate, e.diag.message_primary, e.diag.message_detail, e.diag.context)
+
+
+_SYNTAX = "invalid input syntax for type json"
+_ALPHABET = "abcdefghijklmnopqrstuvwxyz"
+
+
+@pytest.mark.backlog_fixed("RP-750")
+@pytest.mark.parametrize(
+    ("query", "detail", "context"),
+    [
+        ("select '{\"a\":1,}'::jsonb", 'Expected string, but found "}".', '{"a":1,}'),
+        # The excerpt is the error's own line, `...` where it was cut.
+        ("select E'[1,\\n2,\\nx]'::jsonb", 'Token "x" is invalid.', None),
+        ("select '{\"a\" 1}'::jsonb", 'Expected ":", but found "1".', '{"a" 1...'),
+        ("select ''::jsonb", "The input string ended unexpectedly.", ""),
+        ("select '[1 2]'::json", 'Expected "," or "]", but found "2".', "[1 2..."),
+        ("select '{} 1'::json", 'Expected end of input, but found "1".', "{} 1"),
+        ("select '{} x'::json", 'Token "x" is invalid.', "{} x"),
+        ("select '1.5x'::jsonb", 'Token "1.5x" is invalid.', "1.5x"),
+        ("select E'\"a\\tb\"'::jsonb", "Character with value 0x09 must be escaped.", '"a...'),
+        ("select '\"\\x\"'::jsonb", 'Escape sequence "\\x" is invalid.', '"\\x...'),
+        (
+            "select '\"\\u00zz\"'::jsonb",
+            '"\\u" must be followed by four hexadecimal digits.',
+            '"\\u00z...',
+        ),
+        (
+            "select '\"\\uD800\"'::jsonb",
+            "Unicode low surrogate must follow a high surrogate.",
+            '"\\uD800"',
+        ),
+        (
+            f"select '{_ALPHABET * 3} x'::jsonb",
+            f'Token "{_ALPHABET * 3}" is invalid.',
+            "...defghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyz...",
+        ),
+    ],
+)
+def test_json_input_error_names_its_token_and_line(
+    query: str, detail: str, context: str | None, dsn: str
+) -> None:
+    """Every JSON input error lacked PostgreSQL's DETAIL and its `JSON data`
+    excerpt, which follow `jsonapi.c`'s lexer cursor (measured on 15.19)."""
+    line = "JSON data, line 3: x..." if context is None else f"JSON data, line 1: {context}"
+    assert _detail(dsn, query) == ("22P02", _SYNTAX, detail, line)
+
+
+@pytest.mark.backlog_fixed("RP-750")
+def test_nul_escape_into_jsonb_names_its_line(dsn: str) -> None:
+    """`\\u0000` into jsonb was 22P05 with no DETAIL or CONTEXT."""
+    assert _detail(dsn, "select '\"a\\u0000b\"'::jsonb") == (
+        "22P05",
+        "unsupported Unicode escape sequence",
+        "\\u0000 cannot be converted to text.",
+        'JSON data, line 1: "a\\u0000...',
+    )
+
+
+@pytest.mark.backlog_fixed("RP-750")
+def test_jsonb_variable_default_error_keeps_its_json_line(dsn: str) -> None:
+    """In a PL/pgSQL default the `JSON data` line led the stack."""
+    query = "do $$ declare x jsonb := true; begin end $$"
+    assert _detail(dsn, query) == (
+        "22P02",
+        _SYNTAX,
+        'Token "t" is invalid.',
+        "JSON data, line 1: t\nPL/pgSQL function inline_code_block line 1"
+        " during statement block local variable initialization",
     )
 
 

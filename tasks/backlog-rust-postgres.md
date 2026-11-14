@@ -1184,14 +1184,6 @@ one beside it.
       Verify: tests/backlog/test_rp_found_rp921.py::test_a_leaf_partitions_inherited_indexes_are_built
       Backlog-ID: RP-932
 
-- [ ] **OPEN — a hash index built on an empty table is shown as never
-      built.** `CREATE INDEX ... USING hash (a)` on an empty table:
-      PostgreSQL 15.19 records 6 pages (metapage, bitmap page, initial
-      buckets) and 0 tuples; `secantusd-pg` answers 0 pages and -1
-      tuples. `hash_built` builds the page model but records no size.
-      Verify: tests/backlog/test_rp_found_rp921.py::test_a_hash_index_on_an_empty_table_is_recorded_as_built
-      Backlog-ID: RP-929
-
 - [ ] **OPEN — psql's `\d` column query straight after DDL builds all of
       `pg_type` for a table of two column types.** The collation subquery
       (`tests/backlog/test_rp_catalog_latency.py`'s `COLLATION_QUERY`) over
@@ -1219,6 +1211,43 @@ one beside it.
       matches, and the bare one reaches it already qualified.
       Backlog-ID: RP-933
       Verify: tests/backlog/test_rp_found_rp923.py::test_an_index_outside_public_can_be_renamed
+
+## Found while working RP-929 (2026-11-14)
+
+Since RP-929 a hash index's build (CREATE INDEX, REINDEX, a rewrite)
+records its pages and index tuples, from the metapage model
+`hash_index.rs` keeps; TRUNCATE records 0 pages, -1 tuples. Measured on a
+private 15.19 cluster:
+
+- [ ] **OPEN — ANALYZE and VACUUM leave a hash index's size as its build
+      recorded it.** A hash index built on an empty `(a int)` table, then
+      3,000 rows: PostgreSQL 15.19's ANALYZE records 18 pages and 3,000
+      tuples, and a VACUUM after deleting 1,000 rows 18 and 2,000
+      (`hashvacuumcleanup` reports every time); `secantusd-pg` keeps the
+      build's 10 pages and 0 tuples. `btree_analyzed` and the VACUUM's
+      index pass record the B-trees only, and an unmodelled hash index
+      (`HashShape::modelled` false) keeps no metapage past its build.
+      Verify: tests/backlog/test_rp_found_rp929.py::test_analyze_and_vacuum_record_a_hash_indexs_size
+      Backlog-ID: RP-954
+
+- [ ] **OPEN — `pg_relation_size` of a hash index is 0.** Built on an
+      empty `(a int, b text)` table one is 6 pages, 49152 on PostgreSQL
+      15.19, and one split by 3,000 rows 18 pages, 147456;
+      `pg_indexes_size` of a table with two of the first is 98304.
+      `secantusd-pg` answers 0, 0 and 16384: `size_call_here` reads the
+      B-tree, GIN and GiST models and estimates any other index, where
+      the hash metapage model has the pages (`Meta::pages`).
+      Verify: tests/backlog/test_rp_found_rp929.py::test_a_hash_index_has_its_pages
+      Backlog-ID: RP-955
+
+- [ ] **OPEN — a hash index has no overflow pages.** 1,000 rows of one
+      key, all in one bucket: PostgreSQL 15.19 chains overflow pages to
+      the full bucket (`_hash_addovflpage`) and records 12 pages;
+      `secantusd-pg` records 6, the 4 buckets with the metapage and the
+      bitmap page. The metapage model counts buckets, not the tuples in
+      each; overflow needs each bucket's tuple count, moved by each split.
+      Verify: tests/backlog/test_rp_found_rp929.py::test_duplicate_hash_keys_fill_overflow_pages
+      Backlog-ID: RP-956
 
 ## Found while working RP-931 (2026-11-14)
 
@@ -2974,13 +3003,6 @@ dv687, c char(3))`, `d687` an `int` with `check (value > 0)` and `dv687` a
 Measured on PostgreSQL 15.19 (port 5415) with statements that create
 nothing. The gap tests are in `tests/backlog/test_rp_found_rp712.py`.
 
-- [ ] **A `jsonb` input error carries no `JSON data` CONTEXT.** `select
-      't'::jsonb` is 22P02 `invalid input syntax for type json` with
-      CONTEXT `JSON data, line 1: t` on PostgreSQL 15.19 (`json_errcontext`);
-      here the CONTEXT is absent, and in a PL/pgSQL assignment (`x jsonb :=
-      true`) the line is missing from the stack.
-      Verify: tests/backlog/test_rp_found_rp712.py::test_jsonb_input_error_carries_its_json_data_context
-      Backlog-ID: RP-750
 - [ ] **An assignment's overlong `varchar(n)` value is 22001 with no
       assignment frame.** `declare x varchar(3); begin x := 'abcdef'::text;`
       carries CONTEXT `PL/pgSQL assignment "x := 'abcdef'::text"` above the
@@ -2996,9 +3018,35 @@ nothing. The gap tests are in `tests/backlog/test_rp_found_rp712.py`.
       `declare x int; begin x := 'abc';` is 22P02 with `internal_query` `x
       := 'abc'` on PostgreSQL 15.19 (the literal is coerced as the
       assignment is parsed); here no internal query is sent. The same class
-      as RP-488, in a shape its test does not reach.
+      as RP-488, in a shape its test does not reach. A `jsonb` literal is
+      another: `declare x jsonb; begin x := 'zz';` carries `x := 'zz'` as
+      its internal query and CONTEXT `JSON data, line 1: zz` then the `at
+      assignment` line on 15.19; here a `PL/pgSQL assignment "x := 'zz'"`
+      frame sits between them and no query is sent.
       Verify: tests/backlog/test_rp_found_rp712.py::test_literal_input_error_in_an_assignment_carries_its_query
       Backlog-ID: RP-753
+
+## Found while working RP-750 (2026-11-14)
+
+Measured on PostgreSQL 15.19 (port 5415) with statements that create
+nothing. The gap tests are in `tests/backlog/test_rp_found_rp750.py`.
+
+- [ ] **A `json` / `jsonb` input error on a constant has no position.**
+      `select 't'::jsonb` is 22P02 at 8 on PostgreSQL 15.19 (the literal),
+      `select 1, '[1,'::json` at 11, and `select json_typeof('x')` at 20;
+      here none is placed. `errpos.rs` finds a 22P02's literal by the
+      value the message quotes, and `invalid input syntax for type json`
+      quotes none: the input is only in the CONTEXT excerpt.
+      Verify: tests/backlog/test_rp_found_rp750.py::test_json_input_error_has_a_position
+      Backlog-ID: RP-952
+- [ ] **A type's input function called by name is refused.**
+      `select jsonb_in('{"b":1, "a":2}')` is `{"a": 2, "b": 1}` on
+      PostgreSQL 15.19 (the `unknown` literal coerces to `cstring`), as are
+      `json_in(...)` and `int4in('12')`; here each is 0A000 `function
+      jsonb_in(unknown) is not supported yet`. With a `text` argument both
+      servers answer 42883.
+      Verify: tests/backlog/test_rp_found_rp750.py::test_type_input_function_is_callable_by_name
+      Backlog-ID: RP-953
 
 ## Found while working RP-686 (2026-11-14)
 
@@ -3080,22 +3128,6 @@ Measured on a private PostgreSQL 15.19 cluster. The gap tests are in
 Measured on PostgreSQL 15.19; none of it needs DDL. The gap tests are in
 `tests/backlog/test_rp_found_rp575.py`.
 
-- [ ] **The array built-ins refuse an `int2vector` or `oidvector`.** Both
-      are true array types to PostgreSQL 15.19's polymorphic resolution
-      (`typsubscript` is `array_subscript_handler`, `typelem` int2 / oid),
-      subscripted from 0: `cardinality('1 2'::int2vector)` is 2,
-      `array_dims('1 2'::int2vector)` `[0:1]`, `array_to_string('1
-      2'::oidvector, ',')` `1,2`, `array_dims(indkey)` / `array_upper(indkey,
-      1)` of a one-column index `[0:0]` / 0, and `cardinality(array_agg(v))`
-      over vectors 2. Here each is 42883 `function ... does not exist`:
-      `funcsig::accepts` takes only a `[]` type for `anyarray`. Accepting
-      the vectors there is not enough: a vector reaches the built-ins with
-      no lower bound of its own (`[1:2]`, and `array_position` off by one),
-      and over a column through an evaluator that does not see its type.
-      `'1 2'::int2vector || '3'::int2vector` is `[0:2]={1,2,3}` on
-      PostgreSQL and `{1,2,3}` here, for the same reason.
-      Verify: tests/backlog/test_rp_found_rp575.py::test_array_builtins_over_a_vector
-      Backlog-ID: RP-601
 - [ ] **An `int2vector` of two dimensions prints as text.** `array_agg`
       over vectors is `array_agg(anyarray)`, typed `int2vector` and holding
       two dimensions, which `int2vectorout` refuses (`check_valid_int2vector`):
@@ -3105,29 +3137,21 @@ Measured on PostgreSQL 15.19; none of it needs DDL. The gap tests are in
       or `concat` prints it through `typeout`, which cannot fail.
       Verify: tests/backlog/test_rp_found_rp575.py::test_two_dimensional_vector_text
       Backlog-ID: RP-602
-- [ ] **A parameter declared `int2vector[]` or `oidvector[]` has no type.**
-      A Bind of `{"1 2",3}` with type oid 1006 is `int2vector[]` to
-      `pg_typeof($1)` on PostgreSQL 15.19, `($1)[2]::text` is `3` and
-      `cardinality($1)` 2, in text or binary format. Here the first is 42P18
-      `could not determine data type of parameter $1` and the others 42804 /
-      42883: oids 1006 and 1013 are in neither the parameter-type nor the
-      array-element table (`element_of_array_oid`), so the value stays its
-      raw text.
-      Verify: tests/backlog/test_rp_found_rp575.py::test_vector_array_parameter
-      Backlog-ID: RP-604
 
-## Found while working RP-603 (2026-11-08)
+## Found while working RP-612 (2026-11-14)
 
 Measured on PostgreSQL 15.19; none of it needs DDL. The gap tests are in
-`tests/backlog/test_rp_found_rp603.py`.
+`tests/backlog/test_rp_found_rp612.py`.
 
-- [ ] **`oidvector`'s comparison functions are refused.**
-      `btoidvectorcmp('1 2', '3')` is 1 on PostgreSQL 15.19, and
-      `oidvectorlt` .. `oidvectorne` answer as their operators; here each is
-      `function ... is not supported yet`. `cmpfn` has the B-tree support
-      functions of the byte-ordered types only.
-      Verify: tests/backlog/test_rp_found_rp603.py::test_oidvector_comparison_functions
-      Backlog-ID: RP-612
+- [ ] **`oidvector`'s hash functions and `oidvectortypes` are refused.**
+      `hashoidvector('1 2')` is 456323500 on PostgreSQL 15.19,
+      `hashoidvectorextended('1 2', 0)` 4561117610811519404 and
+      `oidvectortypes('23 25')` `integer, text`; here each is 0A000
+      `function ... is not supported yet`. The hashes are `hash_array` over
+      the oids (`hashfn` has the scalar types' hashes), and
+      `oidvectortypes` is `format_type` of each oid joined by `, `.
+      Verify: tests/backlog/test_rp_found_rp612.py::test_oidvector_hash_and_types
+      Backlog-ID: RP-957
 
 ## Found while working RP-529 (2026-11-08)
 

@@ -28209,6 +28209,10 @@ fn internal_type_name(ty: &Type) -> Option<String> {
             1005 => "int2[]",
             22 => "int2vector",
             30 => "oidvector",
+            // Without these an `int2vector[]` / `oidvector[]` parameter had no
+            // type, and stayed the client's text (RP-604).
+            1006 => "int2vector[]",
+            1013 => "oidvector[]",
             1007 => "int4[]",
             1016 => "int8[]",
             1021 => "float4[]",
@@ -54926,6 +54930,24 @@ fn decode_parameter(
                     bytes[..8].try_into().expect("checked"),
                 )),
             )),
+            // `int2vectorrecv` / `oidvectorrecv` (whose shape `binary_recv`
+            // checked): the array of int2 / oid, which is how a vector is
+            // carried, without the lower bound of 0 every vector has.
+            Some(22 | 30) => {
+                binary_array(bytes, tz, cenc, None).map(|v| secantus_pgplan::arrays::strip(&v))
+            }
+            // An array of vectors: each element one vector, carried as its
+            // text inside the array, as a cast to the array type has it
+            // (RP-604).
+            Some(oid @ (1006 | 1013)) => {
+                let elem = if oid == 1006 {
+                    "int2vector"
+                } else {
+                    "oidvector"
+                };
+                secantus_pgplan::vectors::elements(binary_array(bytes, tz, cenc, None)?, elem)
+                    .map_err(|e| PgHandler::err(&e))
+            }
             // Every array oid this server knows, decoded through the element's
             // own binary decoder rather than a per-type array reader.
             Some(oid) if element_of_array_oid(oid).is_some() => binary_array(bytes, tz, cenc, None),
@@ -55081,6 +55103,18 @@ fn decode_parameter(
             secantus_pgplan::cast_text_to(&text, &format!("{}[]", inner.name()), tz)
                 .map_err(|e| PgHandler::err(&e))
         }
+        // An `int2vector[]` / `oidvector[]` in text: each element read by
+        // the vector's input function (RP-604).
+        Some(oid @ (1006 | 1013)) => secantus_pgplan::cast_text_to(
+            &text,
+            if oid == 1006 {
+                "int2vector[]"
+            } else {
+                "oidvector[]"
+            },
+            tz,
+        )
+        .map_err(|e| PgHandler::err(&e)),
         Some(oid) if element_of_array_oid(oid).is_some() => {
             let element = element_of_array_oid(oid).expect("checked");
             secantus_pgplan::cast_text_to(&text, &format!("{element}[]"), tz)

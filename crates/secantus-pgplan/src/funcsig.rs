@@ -85,6 +85,24 @@ fn casts() -> &'static HashSet<(String, String)> {
     })
 }
 
+/// `get_element_type`: the element of a true array type -- one whose
+/// `typsubscript` is `array_subscript_handler`, which `int2vector` and
+/// `oidvector` are as well as every `elem[]` -- so the polymorphic
+/// resolution takes a vector for `anyarray`, its element `int2` / `oid`
+/// for `anyelement` (RP-601).
+fn array_elem(t: &str) -> Option<&str> {
+    t.strip_suffix("[]").or(match t {
+        "int2vector" => Some("int2"),
+        "oidvector" => Some("oid"),
+        _ => None,
+    })
+}
+
+/// Is `t` a true array type ([`array_elem`])?
+fn is_array(t: &str) -> bool {
+    array_elem(t).is_some()
+}
+
 /// Can an argument of type `arg` go where `param` is declared?
 fn accepts(param: &str, arg: &str) -> bool {
     if arg.is_empty() || arg == "unknown" || param == arg {
@@ -95,8 +113,8 @@ fn accepts(param: &str, arg: &str) -> bool {
     }
     match param {
         "any" | "anyelement" | "anycompatible" => return true,
-        "anyarray" | "anycompatiblearray" => return arg.ends_with("[]"),
-        "anynonarray" | "anycompatiblenonarray" => return !arg.ends_with("[]"),
+        "anyarray" | "anycompatiblearray" => return is_array(arg),
+        "anynonarray" | "anycompatiblenonarray" => return !is_array(arg),
         // An enum or a range is a user type here; anything not built in
         // is given the benefit of the doubt.
         "anyenum"
@@ -518,7 +536,7 @@ pub(crate) fn polymorphic_args(name: &str, args: &[String]) -> Option<Vec<String
             continue;
         }
         let e = if array(p) {
-            a.strip_suffix("[]")?.to_string()
+            array_elem(a)?.to_string()
         } else if scalar(p) {
             a.clone()
         } else {
@@ -952,7 +970,7 @@ pub(crate) fn set_result_type(name: &str, args: &[String]) -> Option<String> {
             .iter()
             .zip(args)
             .filter(|(p, _)| p.as_str() == "anyarray")
-            .map(|(_, a)| a.strip_suffix("[]").map(str::to_string));
+            .map(|(_, a)| array_elem(a).map(str::to_string));
         let first = elements.next()??;
         return elements
             .all(|e| e.as_deref() == Some(first.as_str()))
