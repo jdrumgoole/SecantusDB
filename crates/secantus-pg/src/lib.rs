@@ -47677,9 +47677,8 @@ impl PgHandler {
                 // Planned now, as PostgreSQL analyses it at PREPARE: a
                 // missing table is this statement's error, not EXECUTE's.
                 // Nothing in it runs until EXECUTE.
-                let fields = secantus_pgplan::planning_without_running(|| {
-                    self.describe_fields(&query, n, &declared)
-                })?;
+                let fields =
+                    secantus_pgplan::analysing_only(|| self.describe_fields(&query, n, &declared))?;
                 let column_type = |table: &str, column: secantus_pgplan::ColumnRef<'_>| {
                     self.lookup(table).and_then(|def| {
                         let col = match column {

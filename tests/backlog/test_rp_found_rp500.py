@@ -5,8 +5,9 @@ COALESCE gives its type was not read at CREATE, fixed), RP-508 (DROP FUNCTION /
 PROCEDURE without arguments over the other kind, and DROP ROUTINE's
 notice), RP-509 (a CALL that leaves a defaulted parameter out, names its
 arguments, or passes a column), RP-510 (a malformed range literal had no DETAIL, fixed)
-and RP-511 (PREPARE evaluates a constant expression; that it did not read a
-cast constant it does not evaluate is fixed).
+RP-511 (PREPARE evaluated a constant expression and did not read a cast
+constant it does not evaluate, fixed) and RP-968 (CREATE VIEW evaluates a
+constant expression).
 
 An answer is `("ok", rows, notices)`, or `(sqlstate, message, detail, hint,
 position, notices)` for an error. The expected answers were measured on a
@@ -239,18 +240,68 @@ def test_range_literal_detail(query: str, dsn: str) -> None:
     )
 
 
-# RP-511: PREPARE parse-analyses its statement and plans nothing, so it
-# evaluates no expression (`1/0` is prepared) but reads every constant a
+# RP-511 (fixed): PREPARE parse-analyses its statement and plans nothing,
+# so it evaluates no expression (`1/0` is prepared) but reads every constant a
 # cast or an operator coerces, evaluated or not.
 PREPARE_ANALYSES = {
     "prepare s1 as select 1/0": ("ok", None, []),
+    "prepare s5 as select sqrt(-1)": ("ok", None, []),
+    "prepare s6 as select 1 where 1/0 = 1": ("ok", None, []),
+    "prepare s7 as select (1/0)::text": ("ok", None, []),
 }
 
 
-@pytest.mark.backlog("RP-511")
+@pytest.mark.backlog_fixed("RP-511")
 @pytest.mark.parametrize("query", list(PREPARE_ANALYSES))
 def test_prepare_analyses_without_evaluating(query: str, dsn: str) -> None:
     assert answer(dsn, query) == PREPARE_ANALYSES[query]
+
+
+@pytest.mark.backlog_fixed("RP-511")
+def test_prepared_constant_error_is_execute_s(dsn: str) -> None:
+    # The error PREPARE leaves is EXECUTE's; EXPLAIN plans, and
+    # `eval_const_expressions` raises it there (PostgreSQL 15.19).
+    with psycopg.connect(dsn, autocommit=True, prepare_threshold=None) as c:
+        c.execute("prepare z as select 1/0")
+        for q in ("execute z", "explain select 1/0"):
+            with pytest.raises(psycopg.errors.DivisionByZero):
+                c.execute(q)
+
+
+@pytest.mark.backlog_fixed("RP-511")
+def test_statement_describe_and_no_data_analyse_without_evaluating(dsn: str) -> None:
+    # A Parse + Describe describes the analysed query (int4), and
+    # `CREATE TABLE AS ... WITH NO DATA` reads its columns from it
+    # (`create_ctas_nodata`); a populating one plans and raises. Measured
+    # on PostgreSQL 15.19.
+    with psycopg.connect(dsn, autocommit=True) as c:
+        pg = c.pgconn
+        assert pg.prepare(b"rp511d", b"select 1/0").status == 1
+        described = pg.describe_prepared(b"rp511d")
+        assert (described.status, described.ftype(0)) == (1, 23)
+        c.execute("drop table if exists rp511n, rp511p")
+        c.execute("create table rp511n as select 1/0 as x with no data")
+        assert c.execute(
+            "select atttypid::regtype::text from pg_attribute"
+            " where attrelid = 'rp511n'::regclass and attname = 'x'"
+        ).fetchall() == [("integer",)]
+        with pytest.raises(psycopg.errors.DivisionByZero):
+            c.execute("create table rp511p as select 1/0 as x")
+        c.execute("drop table if exists rp511n, rp511p")
+
+
+@pytest.mark.backlog("RP-968")
+def test_create_view_analyses_without_evaluating(dsn: str) -> None:
+    # `DefineView` parse-analyses the query and plans nothing, so a view
+    # over `1/0` is created; reading it raises (PostgreSQL 15.19).
+    with psycopg.connect(dsn, autocommit=True) as c:
+        c.execute("drop view if exists rp511v")
+    try:
+        assert answer(dsn, "create view rp511v as select 1/0 as x") == ("ok", None, [])
+        assert answer(dsn, "select * from rp511v")[:2] == ("22012", "division by zero")
+    finally:
+        with psycopg.connect(dsn, autocommit=True) as c:
+            c.execute("drop view if exists rp511v")
 
 
 # RP-511 (fixed in part): PREPARE read no constant it did not evaluate;

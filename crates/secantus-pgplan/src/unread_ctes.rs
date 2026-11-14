@@ -103,16 +103,3 @@ pub(crate) fn analyse_with(
     }
     Ok(())
 }
-
-/// An error parse analysis raises: an unknown or ambiguous name, a type
-/// mismatch (class 42, but for a refused privilege, which is checked when
-/// the statement runs), a missing schema, or a call no function answers.
-fn raised_by_analysis(e: &Error) -> bool {
-    match e {
-        Error::Unsupported(m) => fromless::names_missing_function(m),
-        e => {
-            let code = e.sqlstate();
-            (code.starts_with("42") && code != "42501") || code == "3F000"
-        }
-    }
-}

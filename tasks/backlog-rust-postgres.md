@@ -3215,17 +3215,16 @@ Measured on a private PostgreSQL 15.19 cluster with `fs(a int, c text)`,
 
 Measured on a private PostgreSQL 15.19 cluster with `fe(a int, b text)`.
 
-- [ ] **PREPARE evaluates a constant expression.** PostgreSQL 15.19's
-      PREPARE parse-analyses its statement and plans nothing: `prepare s1
-      as select 1/0` is prepared. Here it is 22012 `division by zero`, and
-      so is a protocol-level Parse + Describe of `select 1/0`: the planner
-      folds a FROM-less constant expression (`Statement::SelectConstant`)
-      while it plans, and the describe takes its types from that plan.
-      Needs planning that describes without evaluating. (Since RP-511's
-      first part, PREPARE reads each constant a cast or an operator types,
-      `constant_input_error`, as CREATE FUNCTION does.)
-      Backlog-ID: RP-511
-      Verify: tests/backlog/test_rp_found_rp500.py::test_prepare_analyses_without_evaluating
+- [ ] **CREATE VIEW evaluates a constant expression.** PostgreSQL
+      15.19's `DefineView` parse-analyses the query and plans nothing:
+      `create view rp511v as select 1/0 as x` is created, and only reading
+      it raises 22012. Here CREATE VIEW raises 22012 itself. Since RP-511 a
+      statement's Describe, a PREPARE and `CREATE TABLE AS ... WITH NO
+      DATA` fold no constant (`analysing_only`, inside
+      `with_analysed_typmods`); CREATE VIEW reaches a planning path outside
+      that scope.
+      Verify: tests/backlog/test_rp_found_rp500.py::test_create_view_analyses_without_evaluating
+      Backlog-ID: RP-968
 
 ## Found while working RP-510 (2026-11-11)
 

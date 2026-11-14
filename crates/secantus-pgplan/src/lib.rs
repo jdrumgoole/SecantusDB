@@ -24817,6 +24817,37 @@ pub fn planning_without_running<R>(f: impl FnOnce() -> R) -> R {
     out
 }
 
+/// Plan inside `f` as PostgreSQL's parse analysis reads a statement it
+/// does not plan (`PREPARE`): no constant expression is folded, so an error
+/// only evaluating one raises -- a division by zero, a value out of range
+/// -- is left to EXECUTE (RP-511), and every modifier is read unfolded
+/// ([`with_analysed_typmods`], the analysed query's description).
+/// EXPLAIN plans, and `eval_const_expressions` raises it there, so it does
+/// not use this.
+pub fn analysing_only<R>(f: impl FnOnce() -> R) -> R {
+    with_analysed_typmods(|| planning_without_running(f))
+}
+
+/// Whether the statement is only parse-analysed (a statement's Describe,
+/// a PREPARE, a view's columns, `CREATE TABLE AS ... WITH NO DATA`): what
+/// [`with_analysed_typmods`] marks.
+fn analysing_only_now() -> bool {
+    analysed_typmods()
+}
+
+/// An error parse analysis raises: an unknown or ambiguous name, a type
+/// mismatch (class 42, but for a refused privilege), a missing schema, or
+/// a call no function answers.
+pub(crate) fn raised_by_analysis(e: &Error) -> bool {
+    match e {
+        Error::Unsupported(m) => fromless::names_missing_function(m),
+        e => {
+            let code = e.sqlstate();
+            (code.starts_with("42") && code != "42501") || code == "3F000"
+        }
+    }
+}
+
 /// The first whole word `word` (any case) after the word `after`, as the
 /// statement spells it -- the token a syntax error quotes.
 fn written_word(sql: &str, word: &str, after: &str) -> Option<String> {
@@ -34180,768 +34211,35 @@ fn plan_select_constant(s: &pg_query::protobuf::SelectStmt, params: &[Bson]) -> 
     let where_true = where_true && limit != Some(0) && offset < 1;
     let mut columns: Vec<(String, ConstCol, String, i32)> = Vec::new();
     for t in &s.target_list {
-        let Some(N::ResTarget(rt)) = t.node.as_ref() else {
-            return Err(Error::Unsupported("this target".into()));
-        };
-        let (default_name, value, pg_type, typmod) = match rt
-            .val
-            .as_ref()
-            .and_then(|v| v.node.as_ref())
-        {
-            // A hashed SubPlan (`hashed_subplan`): a boolean, named as the
-            // row comparison it stands for is.
-            Some(N::FuncCall(f))
-                if f.funcname.len() == 1
-                    && func_name(f).as_deref() == Some(hashed_subplan::NAME) =>
-            {
-                let node = rt.val.as_deref().expect("a FuncCall target");
-                columns.push((
-                    if rt.name.is_empty() {
-                        "?column?".to_string()
-                    } else {
-                        rt.name.clone()
-                    },
-                    ConstCol::Value(const_value(node, params)?),
-                    "bool".to_string(),
-                    -1,
-                ));
-                continue;
-            }
-            // The per-row call a correlated subquery became, in the body of
-            // a FROM-less subquery around it (`(select (select a))`, RP-445):
-            // run with the outer row's values, typed as the subquery was.
-            Some(N::FuncCall(f)) if correlated::correlated_type(f).is_some() => {
-                let node = rt.val.as_deref().expect("a FuncCall target");
-                columns.push((
-                    if rt.name.is_empty() {
-                        "?column?".to_string()
-                    } else {
-                        rt.name.clone()
-                    },
-                    ConstCol::Value(const_value(node, params)?),
-                    correlated::correlated_type(f).expect("checked"),
-                    -1,
-                ));
-                continue;
-            }
-            Some(N::FuncCall(f)) => {
-                refuse_untyped_any_args(f)?;
-                if let Some(e) = function_absent_in_reference(f, params) {
+        let before = columns.len();
+        match plan_const_target(t, params, &mut columns) {
+            // Parse analysis evaluates nothing: an error only evaluating
+            // the target raises (`1/0`, `sqrt(-1)`) is EXECUTE's, and a
+            // PREPARE describes the column typed without a value (RP-511).
+            Err(e) if analysing_only_now() && !raised_by_analysis(&e) => {
+                take_error_location();
+                columns.truncate(before);
+                let Some(N::ResTarget(rt)) = t.node.as_ref() else {
                     return Err(e);
-                }
-                if let Some(u) =
-                    func_name(f).and_then(|n| correlated::user_function_for(&n, &f.args))
-                {
-                    if !u.returns_set {
-                        let node = rt.val.as_deref().expect("a FuncCall target");
-                        let value = const_value(node, params)?;
-                        columns.push((
-                            if rt.name.is_empty() { u.name.clone() } else { rt.name.clone() },
-                            ConstCol::Value(value),
-                            u.return_type.clone(),
-                            -1,
-                        ));
-                        continue;
-                    }
-                }
-                check_regex_options(f, params)?;
-                if let Some(t) = builtin_call_types(f, params)
-                    .and_then(|(name, types)| builtins::result_type(&name, &types))
-                {
-                    let node = rt.val.as_deref().expect("a FuncCall target");
-                    let value = const_value(node, params)?;
-                    columns.push((
-                        if rt.name.is_empty() {
-                            func_name(f).unwrap_or_default()
-                        } else {
-                            rt.name.clone()
-                        },
-                        ConstCol::Value(value),
-                        t,
-                        -1,
-                    ));
-                    continue;
-                }
-                let name = f
-                    .funcname
-                    .iter()
-                    .filter_map(|n| match n.node.as_ref()? {
-                        N::String(st) => Some(st.sval.clone()),
-                        _ => None,
-                    })
-                    .next_back()
-                    .unwrap_or_default();
-                if matches!(
-                    name.as_str(),
-                    "json_to_record" | "jsonb_to_record" | "json_to_recordset" | "jsonb_to_recordset"
-                ) {
-                    return Err(Error::Sqlstate(
-                        "0A000",
-                        format!("could not determine row type for result of {name}"),
-                    ));
-                }
-                // `pg_collation_for` as `enum_order` rewrote it.
-                if let Some(value) = collation_for_call(f, params) {
-                    columns.push((
-                        if rt.name.is_empty() { name.clone() } else { rt.name.clone() },
-                        ConstCol::Value(value?),
-                        "text".to_string(),
-                        -1,
-                    ));
-                    continue;
-                }
-                // The enum functions: typed as the enum (or its array).
-                if matches!(name.as_str(), "enum_first" | "enum_last" | "enum_range") {
-                    let node = rt.val.as_deref().expect("a FuncCall target");
-                    let value = const_value(node, params)?;
-                    columns.push((
-                        if rt.name.is_empty() { name.clone() } else { rt.name.clone() },
-                        ConstCol::Value(value.clone()),
-                        static_type(node, &value),
-                        -1,
-                    ));
-                    continue;
-                }
-                if let Some(t) = bit_function_type(f, &name) {
-                    let node = rt.val.as_deref().expect("a FuncCall target");
-                    columns.push((
-                        if rt.name.is_empty() { name.clone() } else { rt.name.clone() },
-                        ConstCol::Value(const_value(node, params)?),
-                        t,
-                        -1,
-                    ));
-                    continue;
-                }
-                // `pg_typeof(x)` reports the STATIC type of its argument,
-                // so it is answered from the same `static_type` the row
-                // description uses rather than from the value: `pg_typeof(NULL)`
-                // is `unknown`, which no value could tell us.
-                if name == "pg_typeof" {
-                    columns.push((
-                        if rt.name.is_empty() {
-                            "pg_typeof".to_string()
-                        } else {
-                            rt.name.clone()
-                        },
-                        ConstCol::Value(pg_typeof(f, params)?),
-                        "regtype".to_string(),
-                        -1,
-                    ));
-                    continue;
-                }
-                // `to_regtype` in a bare target list, same shape as above; the
-                // value itself is computed by `const_value`, which is also
-                // what evaluates it inside a WHERE clause.
-                if name == "to_regtype"
-                    || name == "to_regclass"
-                    || regobj::to_reg_kind(&name).is_some()
-                    || name == "pg_get_constraintdef"
-                    || name == "pg_get_viewdef"
-                    || name == "pg_get_indexdef"
-                    || name == "pg_get_triggerdef"
-                    || name == "pg_get_partkeydef"
-                    || name.starts_with("pg_get_statisticsobjdef")
-                    || name == "pg_get_function_arguments"
-                    || name == "pg_get_function_identity_arguments"
-                    || name == "pg_get_function_result"
-                    || name == "pg_get_function_arg_default"
-                    || name == "pg_get_functiondef"
-                    || (name.starts_with("has_") && name.ends_with("_privilege"))
-                {
-                    let node = rt.val.as_deref().expect("checked");
-                    columns.push((
-                        if rt.name.is_empty() { name.clone() } else { rt.name.clone() },
-                        ConstCol::Value(const_value(node, params)?),
-                        static_type(node, &Bson::Null),
-                        -1,
-                    ));
-                    continue;
-                }
-                // A scalar built-in in the target list. Without this a BARE
-                // `select upper('a')` failed while `select upper('a')::text`
-                // worked, because only the cast route goes through
-                // `const_value` -- and a probe whose every case carried a cast
-                // would never notice.
-                let type_name = range_constructor_type(f).unwrap_or_default();
-                if let (true, Some(text)) = (
-                    range::is_range_type(&type_name) || range::is_multirange_type(&type_name),
-                    sole_literal_string_arg(f),
-                ) {
-                    columns.push((
-                        if rt.name.is_empty() {
-                            name.clone()
-                        } else {
-                            rt.name.clone()
-                        },
-                        ConstCol::Value(cast_value(Bson::String(text), &type_name)?),
-                        type_name.clone(),
-                        -1,
-                    ));
-                    continue;
-                }
-                if range::is_multirange_type(&type_name) {
-                    let args = f
-                        .args
-                        .iter()
-                        .map(|a| const_value(a, params))
-                        .collect::<Result<Vec<_>>>()?;
-                    let types: Vec<String> =
-                        f.args.iter().zip(&args).map(|(a, v)| static_type(a, v)).collect();
-                    let value = range::render_multirange(&range::multirange_from_typed_args(
-                        &args, &types, &type_name,
-                    )?);
-                    columns.push((
-                        if rt.name.is_empty() {
-                            name.clone()
-                        } else {
-                            rt.name.clone()
-                        },
-                        ConstCol::Value(Bson::String(value)),
-                        type_name.clone(),
-                        -1,
-                    ));
-                    continue;
-                }
-                if range::is_range_type(&type_name) {
-                    let args = f
-                        .args
-                        .iter()
-                        .map(|a| const_value(a, params))
-                        .collect::<Result<Vec<_>>>()?;
-                    let literal_flags = !matches!(
-                        f.args.get(2).and_then(|a| a.node.as_ref()),
-                        Some(N::ParamRef(_))
-                    );
-                    let types: Vec<String> =
-                        f.args.iter().zip(&args).map(|(a, v)| static_type(a, v)).collect();
-                    let value = range::render(&range::from_typed_args(
-                        &args,
-                        &types,
-                        &type_name,
-                        literal_flags,
-                    )?);
-                    columns.push((
-                        if rt.name.is_empty() {
-                            name.clone()
-                        } else {
-                            rt.name.clone()
-                        },
-                        ConstCol::Value(Bson::String(value)),
-                        type_name.clone(),
-                        -1,
-                    ));
-                    continue;
-                }
-                if let Some(result) = range_accessor_value(f, params) {
-                    let (value, t) = result?;
-                    columns.push((
-                        if rt.name.is_empty() {
-                            name.clone()
-                        } else {
-                            rt.name.clone()
-                        },
-                        ConstCol::Value(value),
-                        t,
-                        -1,
-                    ));
-                    continue;
-                }
-                // `defers_to_connection` falls THROUGH to the `ConstCol`
-                // branch below: those three are answered by the server when
-                // they stand alone, and folding them here would freeze a
-                // `current_setting` the session may still change.
-                let name = overload_name(f, name);
-                // `pg_column_size` reads its argument's type (RP-074): through
-                // the expression evaluator, which has it.
-                if name == "pg_column_size" {
-                    let node = pg_query::protobuf::Node {
-                        node: Some(N::FuncCall(f.clone())),
-                    };
-                    columns.push((
-                        if rt.name.is_empty() {
-                            name.clone()
-                        } else {
-                            rt.name.clone()
-                        },
-                        ConstCol::Value(const_value(&node, params)?),
-                        "int4".into(),
-                        -1,
-                    ));
-                    continue;
-                }
-                let datetime_typed = datetime_result_type(f, &name);
-                if let Some(t) = datetime_typed.clone() {
-                    if let Some(value) = datetime_call(f, &name, params) {
-                        columns.push((
-                            if rt.name.is_empty() {
-                                name.clone()
-                            } else {
-                                rt.name.clone()
-                            },
-                            ConstCol::Value(value?),
-                            t,
-                            -1,
-                        ));
-                        continue;
-                    }
-                }
-                if scalar::is_scalar(&name)
-                    && !scalar::defers_to_connection(&name)
-                    && datetime_typed.is_none()
-                {
-                    let args = match named_call_args(f, &name, params) {
-                        Some(a) => a?,
-                        None => vector_element_args(
-                            f,
-                            &name,
-                            bpchar_args(
-                                f,
-                                &name,
-                                f.args
-                                    .iter()
-                                    .map(|a| const_value(a, params))
-                                    .collect::<Result<Vec<_>>>()?,
-                            ),
-                        )?,
-                    };
-                    if let Some(result) = typed_scalar_call(f, &name, &args) {
-                        let value = result?;
-                        // A NULL result cannot say its type -- and at DESCRIBE
-                        // time every parameter IS null, so `ascii($1)` typed
-                        // as text and the executed `91` went out as `'91'`
-                        // under oid 25. The function's declared result type
-                        // is what PostgreSQL reports there.
-                        // A `timestamptz` value is a bare date on the wire
-                        // and would read as `timestamp` from its shape.
-                        let declared = scalar::static_result_type(&name);
-                        // An ARRAY function's type is decided by `static_type`
-                        // from the CALL. Reading it off the value instead made
-                        // `string_to_array('', 'x')` -- an empty array -- report
-                        // `int4[]`, and every NULL-returning one report `text`.
-                        let t = if arrays::is_array_function(&name) || name == "__typmod_coerce" {
-                            match rt.val.as_deref() {
-                                Some(n) => static_type(n, &value),
-                                None => inferred_type(&value).to_string(),
-                            }
-                        } else if let Some(t) = (value == Bson::Null)
-                            .then(|| selected_call_type(f))
-                            .flatten()
-                            .filter(|t| !t.starts_with("any") && t != "record")
-                        {
-                            // A NULL from a call whose overload is known is
-                            // that overload's type: `abs(NULL)` reads its
-                            // literal as float8 (`func_select_candidate`), so
-                            // it is `double precision`, not abs's numeric.
-                            t
-                        } else if value == Bson::Null
-                            || declared == "timestamptz"
-                            || declared == "name"
-                            || declared == "name[]"
-                            // An `inet` is carried as its text.
-                            || declared == "inet"
-                            // A `"char"` is carried as its text, and so is an
-                            // `aclitem`.
-                            || declared == QUOTED_CHAR
-                            || declared.starts_with("aclitem")
-                            || fts::result_type(&name).is_some()
-                            || xml::result_type(&name).is_some()
-                            || validators::result_type(&name).is_some()
-                            || jsonops::result_type(&name).is_some()
-                            || mathfn::result_type(&name).is_some()
-                            || snapshots::result_type(&name).is_some()
-                            || geom::result_type(&name).is_some()
-                            || pgcrypto::result_type(&name).is_some()
-                            || (trgm::is_function(&name) && trgm::result_type(&name).is_some())
-                            || jsonpath::is_function(&name)
-                        {
-                            declared.to_string()
-                        } else {
-                            // The value cannot tell a `smallint` from an
-                            // `integer` or a `real` from a `double precision`;
-                            // the overload the call resolves to can.
-                            let inferred = inferred_type(&value);
-                            match (inferred, selected_call_type(f).as_deref()) {
-                                ("int4", Some("int2")) => "int2".to_string(),
-                                ("float8", Some("float4")) => "float4".to_string(),
-                                _ => inferred.to_string(),
-                            }
-                        };
-                        columns.push((
-                            if rt.name.is_empty() {
-                                name.clone()
-                            } else {
-                                rt.name.clone()
-                            },
-                            ConstCol::Value(value),
-                            t,
-                            -1,
-                        ));
-                        continue;
-                    }
-                }
-                if name == "regexp_replace" {
-                    let args = f
-                        .args
-                        .iter()
-                        .map(|a| const_value(a, params))
-                        .collect::<Result<Vec<_>>>()?;
-                    columns.push((
-                        if rt.name.is_empty() {
-                            "regexp_replace".to_string()
-                        } else {
-                            rt.name.clone()
-                        },
-                        ConstCol::Value(regexp_replace(&args)?),
-                        "text".to_string(),
-                        -1,
-                    ));
-                    continue;
-                }
-                if let Some(col) = guc_function(&name, f, params)? {
-                    let out_name = name.clone();
-                    columns.push((
-                        if rt.name.is_empty() {
-                            out_name
-                        } else {
-                            rt.name.clone()
-                        },
-                        col,
-                        "text".to_string(),
-                        -1,
-                    ));
-                    continue;
-                }
-                // `pg_sleep(seconds)`: a `void` column (oid 2278) rendered as
-                // the empty string; the wait itself belongs to execution, not
-                // planning (a DESCRIBE must not sleep). Probed PG 16.
-                if name == "pg_sleep" {
-                    if f.args.len() != 1 {
-                        return Err(Error::Unsupported(format!(
-                            "pg_sleep() with {} arguments",
-                            f.args.len()
-                        )));
-                    }
-                    let seconds = cast_value(const_value(&f.args[0], params)?, "float8")?;
-                    columns.push((
-                        if rt.name.is_empty() {
-                            "pg_sleep".to_string()
-                        } else {
-                            rt.name.clone()
-                        },
-                        ConstCol::Sleep(seconds),
-                        "void".to_string(),
-                        -1,
-                    ));
-                    continue;
-                }
-                // `pg_notify(channel, payload)` and `pg_listening_channels()`
-                // belong to the session, which only the server has.
-                if name == "pg_notify" {
-                    if f.args.len() != 2 {
-                        return Err(Error::Unsupported(format!(
-                            "pg_notify() with {} arguments",
-                            f.args.len()
-                        )));
-                    }
-                    let channel = const_value(&f.args[0], params)?;
-                    let payload = const_value(&f.args[1], params)?;
-                    columns.push((
-                        if rt.name.is_empty() {
-                            "pg_notify".to_string()
-                        } else {
-                            rt.name.clone()
-                        },
-                        ConstCol::PgNotify { channel, payload },
-                        "void".to_string(),
-                        -1,
-                    ));
-                    continue;
-                }
-                if name == "pg_listening_channels" {
-                    columns.push((
-                        if rt.name.is_empty() {
-                            "pg_listening_channels".to_string()
-                        } else {
-                            rt.name.clone()
-                        },
-                        ConstCol::ListeningChannels,
-                        "text".to_string(),
-                        -1,
-                    ));
-                    continue;
-                }
-                // `pg_backend_pid()` and `pg_terminate_backend(pid)` need the
-                // connection's identity, which the stateless planner does not
-                // have -- they become `ConstCol`s the server resolves.
-                // The sequence functions read and WRITE server state, so
-                // they become `ConstCol`s the server resolves rather than
-                // anything the stateless planner can fold.
-                // `lastval()` reads only this session's state; it is folded
-                // while planning the statement that executes (NULL, and no
-                // error, in a Describe's plan).
-                // The storage-size and advisory-lock functions, answered by
-                // the executor.
-                if let Some(ty) = correlated::executor_function_type(&name)
-                    .filter(|_| correlated::executor_answers(name.as_str()))
-                {
-                    let out = if rt.name.is_empty() {
-                        name.clone()
-                    } else {
-                        rt.name.clone()
-                    };
-                    let args = f
-                        .args
-                        .iter()
-                        .map(|a| const_value(a, params))
-                        .collect::<Result<Vec<_>>>()?;
-                    let value = correlated::call_sequence(&name, &args)?;
-                    columns.push((out, ConstCol::Value(value), ty.to_string(), -1));
-                    continue;
-                }
-                if name == "lastval" {
-                    let out = if rt.name.is_empty() {
-                        name.clone()
-                    } else {
-                        rt.name.clone()
-                    };
-                    let value = correlated::call_sequence("lastval", &[])?;
-                    columns.push((out, ConstCol::Value(value), "int8".to_string(), -1));
-                    continue;
-                }
-                if name == "pg_blocking_pids" {
-                    let out = if rt.name.is_empty() {
-                        name.clone()
-                    } else {
-                        rt.name.clone()
-                    };
-                    let arg = match f.args.first() {
-                        None => ConstCol::Value(Bson::Null),
-                        Some(node) => ConstCol::Value(const_value(node, params)?),
-                    };
-                    columns.push((
-                        out,
-                        ConstCol::BlockingPids(Box::new(arg)),
-                        "int4[]".to_string(),
-                        -1,
-                    ));
-                    continue;
-                }
-                if matches!(name.as_str(), "nextval" | "currval" | "setval")
-                    || name == "pg_get_serial_sequence"
-                {
-                    let arg = |i: usize| -> Result<ConstCol> {
-                        match f.args.get(i) {
-                            None => Ok(ConstCol::Value(Bson::Null)),
-                            Some(node) => Ok(ConstCol::Value(const_value(node, params)?)),
-                        }
-                    };
-                    let out = if rt.name.is_empty() {
-                        name.clone()
-                    } else {
-                        rt.name.clone()
-                    };
-                    let (col, ty) = match name.as_str() {
-                        "nextval" => (ConstCol::NextVal(Box::new(arg(0)?)), "int8"),
-                        "currval" => (ConstCol::CurrVal(Box::new(arg(0)?)), "int8"),
-                        "setval" => (
-                            ConstCol::SetVal {
-                                sequence: Box::new(arg(0)?),
-                                value: Box::new(arg(1)?),
-                                // The two-argument form leaves the sequence
-                                // CALLED, so the next draw is one past it.
-                                is_called: Box::new(if f.args.len() > 2 {
-                                    arg(2)?
-                                } else {
-                                    ConstCol::Value(Bson::Boolean(true))
-                                }),
-                            },
-                            "int8",
-                        ),
-                        _ => (
-                            ConstCol::SerialSequence {
-                                table: Box::new(arg(0)?),
-                                column: Box::new(arg(1)?),
-                            },
-                            "text",
-                        ),
-                    };
-                    columns.push((out, col, ty.to_string(), -1));
-                    continue;
-                }
-                if name == "pg_backend_pid" {
-                    columns.push((
-                        if rt.name.is_empty() {
-                            "pg_backend_pid".to_string()
-                        } else {
-                            rt.name.clone()
-                        },
-                        ConstCol::BackendPid,
-                        "int4".to_string(),
-                        -1,
-                    ));
-                    continue;
-                }
-                if name == "pg_terminate_backend" || name == "pg_cancel_backend" {
-                    let arg = f
-                        .args
-                        .first()
-                        .ok_or_else(|| Error::Unsupported(format!("{name}() without a PID")))?;
-                    // The PID may itself be `pg_backend_pid()` -- resolve that
-                    // nesting into a `BackendPid` the server fills in, so the
-                    // idiomatic `pg_terminate_backend(pg_backend_pid())` works.
-                    let is_backend_pid = matches!(
-                        arg.node.as_ref(),
-                        Some(N::FuncCall(inner)) if inner
-                            .funcname
-                            .iter()
-                            .filter_map(|n| match n.node.as_ref()? {
-                                N::String(st) => Some(st.sval.as_str()),
-                                _ => None,
-                            })
-                            .next_back()
-                            == Some("pg_backend_pid")
-                    );
-                    let inner = if is_backend_pid {
-                        ConstCol::BackendPid
-                    } else {
-                        ConstCol::Value(const_value(arg, params)?)
-                    };
-                    columns.push((
-                        if rt.name.is_empty() {
-                            name.clone()
-                        } else {
-                            rt.name.clone()
-                        },
-                        if name == "pg_cancel_backend" {
-                            ConstCol::CancelBackend(Box::new(inner))
-                        } else {
-                            ConstCol::TerminateBackend(Box::new(inner))
-                        },
-                        "bool".to_string(),
-                        -1,
-                    ));
-                    continue;
-                }
-                if name == "current_database" || name == "current_catalog" {
-                    (name, ConstCol::CurrentDatabase, "name".to_string(), -1)
-                } else {
-                    let v = session_function(&name)
-                        .ok_or_else(|| Error::Unsupported(disc(&N::FuncCall(f.clone()))))?;
-                    let t = inferred_type(&v).to_string();
-                    (name, ConstCol::Value(v), t, -1)
-                }
-            }
-            // `user`, `current_user`, `current_timestamp` and the other
-            // keyword functions: the role ones resolve on the server, which
-            // knows the session; `current_timestamp` is `now()`; the
-            // remaining date/time ones are refused by name.
-            Some(N::SqlvalueFunction(svf)) => {
-                use pg_query::protobuf::SqlValueFunctionOp as Op;
-                let op = Op::try_from(svf.op).unwrap_or(Op::SqlvalueFunctionOpUndefined);
-                if op == Op::SvfopCurrentTimestamp {
-                    columns.push((
-                        if rt.name.is_empty() {
-                            "current_timestamp".to_string()
-                        } else {
-                            rt.name.clone()
-                        },
-                        ConstCol::Value(scalar::now_value()),
-                        "timestamptz".to_string(),
-                        -1,
-                    ));
-                    continue;
-                }
-                let (name, col) = match op {
-                    Op::SvfopCurrentUser => ("current_user", ConstCol::CurrentUser),
-                    Op::SvfopUser => ("user", ConstCol::CurrentUser),
-                    Op::SvfopSessionUser => ("session_user", ConstCol::SessionUser),
-                    Op::SvfopCurrentRole => ("current_role", ConstCol::CurrentUser),
-                    Op::SvfopCurrentCatalog => ("current_catalog", ConstCol::CurrentDatabase),
-                    Op::SvfopCurrentSchema => (
-                        "current_schema",
-                        ConstCol::Value(Bson::String("public".into())),
-                    ),
-                    other => {
-                        // The date/time keywords: folded now, as
-                        // `current_timestamp` is above.
-                        let name = other
-                            .as_str_name()
-                            .trim_start_matches("SVFOP_")
-                            .trim_end_matches("_N")
-                            .to_ascii_lowercase();
-                        // `current_time(3)` carries its precision as its
-                        // modifier (RP-493).
-                        columns.push((
-                            if rt.name.is_empty() { name } else { rt.name.clone() },
-                            ConstCol::Value(sql_value_function(svf)?),
-                            sql_value_function_type(svf).to_string(),
-                            svf.typmod.max(-1),
-                        ));
-                        continue;
-                    }
                 };
-                (name.to_string(), col, "name".to_string(), -1)
-            }
-            // `current_database()` and friends spelled as bare column refs.
-            Some(N::ColumnRef(c)) => {
-                let name = c
-                    .fields
-                    .first()
-                    .and_then(|f| f.node.as_ref())
-                    .and_then(|n| match n {
-                        N::String(st) => Some(st.sval.clone()),
-                        _ => None,
-                    })
-                    .ok_or_else(|| Error::Unsupported("this target".into()))?;
-                if name == "current_database" || name == "current_catalog" {
-                    (name, ConstCol::CurrentDatabase, "name".to_string(), -1)
+                let Some(val) = rt.val.as_deref() else {
+                    return Err(e);
+                };
+                let name = if rt.name.is_empty() {
+                    expression_column_name(val)
                 } else {
-                    let v = session_function(&name)
-                        .ok_or_else(|| Error::UndefinedColumn(name.clone()))?;
-                    let t = inferred_type(&v).to_string();
-                    (name, ConstCol::Value(v), t, -1)
-                }
-            }
-            Some(
-                node @ (N::AConst(_)
-                | N::ParamRef(_)
-                | N::TypeCast(_)
-                | N::AExpr(_)
-                | N::BoolExpr(_)
-                | N::AArrayExpr(_)
-                | N::RowExpr(_)
-                | N::AIndirection(_)
-                | N::CoalesceExpr(_)
-                | N::MinMaxExpr(_)
-                | N::NullTest(_)
-                | N::BooleanTest(_)
-                // `select case when ... end` with no FROM. This list is an
-                // allow-list, so a node absent from it is refused even when
-                // `const_value` handles it perfectly well -- which is why CASE
-                // worked over a table and not here.
-                | N::CaseExpr(_)
-                | N::CollateClause(_)
-                | N::XmlExpr(_)
-                | N::XmlSerialize(_)),
-            ) => {
-                let val = rt.val.as_ref().expect("checked");
-                let v = const_value(val, params)?;
-                let t = static_type(val, &v);
-                let _ = node;
-                // `exprTypmod`: a cast's modifier, or one every operand of a
-                // CASE / COALESCE / ARRAY shares (RP-493).
+                    rt.name.clone()
+                };
                 let typmod = expr_typmod::raw_expr_typmod(val, &|_| None);
-                (expression_column_name(val), ConstCol::Value(v), t, typmod)
+                columns.push((
+                    name,
+                    ConstCol::Value(Bson::Null),
+                    static_type(val, &Bson::Null),
+                    typmod,
+                ));
             }
-            Some(other) => return Err(Error::Unsupported(disc(other))),
-            None => return Err(Error::Unsupported("an empty target".into())),
-        };
-        let out = if rt.name.is_empty() {
-            default_name
-        } else {
-            rt.name.clone()
-        };
-        columns.push((out, value, pg_type, typmod));
+            r => r?,
+        }
     }
     let untyped: Vec<bool> = s
         .target_list
@@ -34966,6 +34264,777 @@ fn plan_select_constant(s: &pg_query::protobuf::SelectStmt, params: &[Bson]) -> 
         source: None,
         untyped,
     }))
+}
+
+/// One target of a FROM-less select, planned onto `columns`.
+fn plan_const_target(
+    t: &pg_query::protobuf::Node,
+    params: &[Bson],
+    columns: &mut Vec<(String, ConstCol, String, i32)>,
+) -> Result<()> {
+    let Some(N::ResTarget(rt)) = t.node.as_ref() else {
+        return Err(Error::Unsupported("this target".into()));
+    };
+    let (default_name, value, pg_type, typmod) = match rt
+        .val
+        .as_ref()
+        .and_then(|v| v.node.as_ref())
+    {
+        // A hashed SubPlan (`hashed_subplan`): a boolean, named as the
+        // row comparison it stands for is.
+        Some(N::FuncCall(f))
+            if f.funcname.len() == 1
+                && func_name(f).as_deref() == Some(hashed_subplan::NAME) =>
+        {
+            let node = rt.val.as_deref().expect("a FuncCall target");
+            columns.push((
+                if rt.name.is_empty() {
+                    "?column?".to_string()
+                } else {
+                    rt.name.clone()
+                },
+                ConstCol::Value(const_value(node, params)?),
+                "bool".to_string(),
+                -1,
+            ));
+            return Ok(());
+        }
+        // The per-row call a correlated subquery became, in the body of
+        // a FROM-less subquery around it (`(select (select a))`, RP-445):
+        // run with the outer row's values, typed as the subquery was.
+        Some(N::FuncCall(f)) if correlated::correlated_type(f).is_some() => {
+            let node = rt.val.as_deref().expect("a FuncCall target");
+            columns.push((
+                if rt.name.is_empty() {
+                    "?column?".to_string()
+                } else {
+                    rt.name.clone()
+                },
+                ConstCol::Value(const_value(node, params)?),
+                correlated::correlated_type(f).expect("checked"),
+                -1,
+            ));
+            return Ok(());
+        }
+        Some(N::FuncCall(f)) => {
+            refuse_untyped_any_args(f)?;
+            if let Some(e) = function_absent_in_reference(f, params) {
+                return Err(e);
+            }
+            if let Some(u) =
+                func_name(f).and_then(|n| correlated::user_function_for(&n, &f.args))
+            {
+                if !u.returns_set {
+                    let node = rt.val.as_deref().expect("a FuncCall target");
+                    let value = const_value(node, params)?;
+                    columns.push((
+                        if rt.name.is_empty() { u.name.clone() } else { rt.name.clone() },
+                        ConstCol::Value(value),
+                        u.return_type.clone(),
+                        -1,
+                    ));
+                    return Ok(());
+                }
+            }
+            check_regex_options(f, params)?;
+            if let Some(t) = builtin_call_types(f, params)
+                .and_then(|(name, types)| builtins::result_type(&name, &types))
+            {
+                let node = rt.val.as_deref().expect("a FuncCall target");
+                let value = const_value(node, params)?;
+                columns.push((
+                    if rt.name.is_empty() {
+                        func_name(f).unwrap_or_default()
+                    } else {
+                        rt.name.clone()
+                    },
+                    ConstCol::Value(value),
+                    t,
+                    -1,
+                ));
+                return Ok(());
+            }
+            let name = f
+                .funcname
+                .iter()
+                .filter_map(|n| match n.node.as_ref()? {
+                    N::String(st) => Some(st.sval.clone()),
+                    _ => None,
+                })
+                .next_back()
+                .unwrap_or_default();
+            if matches!(
+                name.as_str(),
+                "json_to_record" | "jsonb_to_record" | "json_to_recordset" | "jsonb_to_recordset"
+            ) {
+                return Err(Error::Sqlstate(
+                    "0A000",
+                    format!("could not determine row type for result of {name}"),
+                ));
+            }
+            // `pg_collation_for` as `enum_order` rewrote it.
+            if let Some(value) = collation_for_call(f, params) {
+                columns.push((
+                    if rt.name.is_empty() { name.clone() } else { rt.name.clone() },
+                    ConstCol::Value(value?),
+                    "text".to_string(),
+                    -1,
+                ));
+                return Ok(());
+            }
+            // The enum functions: typed as the enum (or its array).
+            if matches!(name.as_str(), "enum_first" | "enum_last" | "enum_range") {
+                let node = rt.val.as_deref().expect("a FuncCall target");
+                let value = const_value(node, params)?;
+                columns.push((
+                    if rt.name.is_empty() { name.clone() } else { rt.name.clone() },
+                    ConstCol::Value(value.clone()),
+                    static_type(node, &value),
+                    -1,
+                ));
+                return Ok(());
+            }
+            if let Some(t) = bit_function_type(f, &name) {
+                let node = rt.val.as_deref().expect("a FuncCall target");
+                columns.push((
+                    if rt.name.is_empty() { name.clone() } else { rt.name.clone() },
+                    ConstCol::Value(const_value(node, params)?),
+                    t,
+                    -1,
+                ));
+                return Ok(());
+            }
+            // `pg_typeof(x)` reports the STATIC type of its argument,
+            // so it is answered from the same `static_type` the row
+            // description uses rather than from the value: `pg_typeof(NULL)`
+            // is `unknown`, which no value could tell us.
+            if name == "pg_typeof" {
+                columns.push((
+                    if rt.name.is_empty() {
+                        "pg_typeof".to_string()
+                    } else {
+                        rt.name.clone()
+                    },
+                    ConstCol::Value(pg_typeof(f, params)?),
+                    "regtype".to_string(),
+                    -1,
+                ));
+                return Ok(());
+            }
+            // `to_regtype` in a bare target list, same shape as above; the
+            // value itself is computed by `const_value`, which is also
+            // what evaluates it inside a WHERE clause.
+            if name == "to_regtype"
+                || name == "to_regclass"
+                || regobj::to_reg_kind(&name).is_some()
+                || name == "pg_get_constraintdef"
+                || name == "pg_get_viewdef"
+                || name == "pg_get_indexdef"
+                || name == "pg_get_triggerdef"
+                || name == "pg_get_partkeydef"
+                || name.starts_with("pg_get_statisticsobjdef")
+                || name == "pg_get_function_arguments"
+                || name == "pg_get_function_identity_arguments"
+                || name == "pg_get_function_result"
+                || name == "pg_get_function_arg_default"
+                || name == "pg_get_functiondef"
+                || (name.starts_with("has_") && name.ends_with("_privilege"))
+            {
+                let node = rt.val.as_deref().expect("checked");
+                columns.push((
+                    if rt.name.is_empty() { name.clone() } else { rt.name.clone() },
+                    ConstCol::Value(const_value(node, params)?),
+                    static_type(node, &Bson::Null),
+                    -1,
+                ));
+                return Ok(());
+            }
+            // A scalar built-in in the target list. Without this a BARE
+            // `select upper('a')` failed while `select upper('a')::text`
+            // worked, because only the cast route goes through
+            // `const_value` -- and a probe whose every case carried a cast
+            // would never notice.
+            let type_name = range_constructor_type(f).unwrap_or_default();
+            if let (true, Some(text)) = (
+                range::is_range_type(&type_name) || range::is_multirange_type(&type_name),
+                sole_literal_string_arg(f),
+            ) {
+                columns.push((
+                    if rt.name.is_empty() {
+                        name.clone()
+                    } else {
+                        rt.name.clone()
+                    },
+                    ConstCol::Value(cast_value(Bson::String(text), &type_name)?),
+                    type_name.clone(),
+                    -1,
+                ));
+                return Ok(());
+            }
+            if range::is_multirange_type(&type_name) {
+                let args = f
+                    .args
+                    .iter()
+                    .map(|a| const_value(a, params))
+                    .collect::<Result<Vec<_>>>()?;
+                let types: Vec<String> =
+                    f.args.iter().zip(&args).map(|(a, v)| static_type(a, v)).collect();
+                let value = range::render_multirange(&range::multirange_from_typed_args(
+                    &args, &types, &type_name,
+                )?);
+                columns.push((
+                    if rt.name.is_empty() {
+                        name.clone()
+                    } else {
+                        rt.name.clone()
+                    },
+                    ConstCol::Value(Bson::String(value)),
+                    type_name.clone(),
+                    -1,
+                ));
+                return Ok(());
+            }
+            if range::is_range_type(&type_name) {
+                let args = f
+                    .args
+                    .iter()
+                    .map(|a| const_value(a, params))
+                    .collect::<Result<Vec<_>>>()?;
+                let literal_flags = !matches!(
+                    f.args.get(2).and_then(|a| a.node.as_ref()),
+                    Some(N::ParamRef(_))
+                );
+                let types: Vec<String> =
+                    f.args.iter().zip(&args).map(|(a, v)| static_type(a, v)).collect();
+                let value = range::render(&range::from_typed_args(
+                    &args,
+                    &types,
+                    &type_name,
+                    literal_flags,
+                )?);
+                columns.push((
+                    if rt.name.is_empty() {
+                        name.clone()
+                    } else {
+                        rt.name.clone()
+                    },
+                    ConstCol::Value(Bson::String(value)),
+                    type_name.clone(),
+                    -1,
+                ));
+                return Ok(());
+            }
+            if let Some(result) = range_accessor_value(f, params) {
+                let (value, t) = result?;
+                columns.push((
+                    if rt.name.is_empty() {
+                        name.clone()
+                    } else {
+                        rt.name.clone()
+                    },
+                    ConstCol::Value(value),
+                    t,
+                    -1,
+                ));
+                return Ok(());
+            }
+            // `defers_to_connection` falls THROUGH to the `ConstCol`
+            // branch below: those three are answered by the server when
+            // they stand alone, and folding them here would freeze a
+            // `current_setting` the session may still change.
+            let name = overload_name(f, name);
+            // `pg_column_size` reads its argument's type (RP-074): through
+            // the expression evaluator, which has it.
+            if name == "pg_column_size" {
+                let node = pg_query::protobuf::Node {
+                    node: Some(N::FuncCall(f.clone())),
+                };
+                columns.push((
+                    if rt.name.is_empty() {
+                        name.clone()
+                    } else {
+                        rt.name.clone()
+                    },
+                    ConstCol::Value(const_value(&node, params)?),
+                    "int4".into(),
+                    -1,
+                ));
+                return Ok(());
+            }
+            let datetime_typed = datetime_result_type(f, &name);
+            if let Some(t) = datetime_typed.clone() {
+                if let Some(value) = datetime_call(f, &name, params) {
+                    columns.push((
+                        if rt.name.is_empty() {
+                            name.clone()
+                        } else {
+                            rt.name.clone()
+                        },
+                        ConstCol::Value(value?),
+                        t,
+                        -1,
+                    ));
+                    return Ok(());
+                }
+            }
+            if scalar::is_scalar(&name)
+                && !scalar::defers_to_connection(&name)
+                && datetime_typed.is_none()
+            {
+                let args = match named_call_args(f, &name, params) {
+                    Some(a) => a?,
+                    None => vector_element_args(
+                        f,
+                        &name,
+                        bpchar_args(
+                            f,
+                            &name,
+                            f.args
+                                .iter()
+                                .map(|a| const_value(a, params))
+                                .collect::<Result<Vec<_>>>()?,
+                        ),
+                    )?,
+                };
+                if let Some(result) = typed_scalar_call(f, &name, &args) {
+                    let value = result?;
+                    // A NULL result cannot say its type -- and at DESCRIBE
+                    // time every parameter IS null, so `ascii($1)` typed
+                    // as text and the executed `91` went out as `'91'`
+                    // under oid 25. The function's declared result type
+                    // is what PostgreSQL reports there.
+                    // A `timestamptz` value is a bare date on the wire
+                    // and would read as `timestamp` from its shape.
+                    let declared = scalar::static_result_type(&name);
+                    // An ARRAY function's type is decided by `static_type`
+                    // from the CALL. Reading it off the value instead made
+                    // `string_to_array('', 'x')` -- an empty array -- report
+                    // `int4[]`, and every NULL-returning one report `text`.
+                    let t = if arrays::is_array_function(&name) || name == "__typmod_coerce" {
+                        match rt.val.as_deref() {
+                            Some(n) => static_type(n, &value),
+                            None => inferred_type(&value).to_string(),
+                        }
+                    } else if let Some(t) = (value == Bson::Null)
+                        .then(|| selected_call_type(f))
+                        .flatten()
+                        .filter(|t| !t.starts_with("any") && t != "record")
+                    {
+                        // A NULL from a call whose overload is known is
+                        // that overload's type: `abs(NULL)` reads its
+                        // literal as float8 (`func_select_candidate`), so
+                        // it is `double precision`, not abs's numeric.
+                        t
+                    } else if value == Bson::Null
+                        || declared == "timestamptz"
+                        || declared == "name"
+                        || declared == "name[]"
+                        // An `inet` is carried as its text.
+                        || declared == "inet"
+                        // A `"char"` is carried as its text, and so is an
+                        // `aclitem`.
+                        || declared == QUOTED_CHAR
+                        || declared.starts_with("aclitem")
+                        || fts::result_type(&name).is_some()
+                        || xml::result_type(&name).is_some()
+                        || validators::result_type(&name).is_some()
+                        || jsonops::result_type(&name).is_some()
+                        || mathfn::result_type(&name).is_some()
+                        || snapshots::result_type(&name).is_some()
+                        || geom::result_type(&name).is_some()
+                        || pgcrypto::result_type(&name).is_some()
+                        || (trgm::is_function(&name) && trgm::result_type(&name).is_some())
+                        || jsonpath::is_function(&name)
+                    {
+                        declared.to_string()
+                    } else {
+                        // The value cannot tell a `smallint` from an
+                        // `integer` or a `real` from a `double precision`;
+                        // the overload the call resolves to can.
+                        let inferred = inferred_type(&value);
+                        match (inferred, selected_call_type(f).as_deref()) {
+                            ("int4", Some("int2")) => "int2".to_string(),
+                            ("float8", Some("float4")) => "float4".to_string(),
+                            _ => inferred.to_string(),
+                        }
+                    };
+                    columns.push((
+                        if rt.name.is_empty() {
+                            name.clone()
+                        } else {
+                            rt.name.clone()
+                        },
+                        ConstCol::Value(value),
+                        t,
+                        -1,
+                    ));
+                    return Ok(());
+                }
+            }
+            if name == "regexp_replace" {
+                let args = f
+                    .args
+                    .iter()
+                    .map(|a| const_value(a, params))
+                    .collect::<Result<Vec<_>>>()?;
+                columns.push((
+                    if rt.name.is_empty() {
+                        "regexp_replace".to_string()
+                    } else {
+                        rt.name.clone()
+                    },
+                    ConstCol::Value(regexp_replace(&args)?),
+                    "text".to_string(),
+                    -1,
+                ));
+                return Ok(());
+            }
+            if let Some(col) = guc_function(&name, f, params)? {
+                let out_name = name.clone();
+                columns.push((
+                    if rt.name.is_empty() {
+                        out_name
+                    } else {
+                        rt.name.clone()
+                    },
+                    col,
+                    "text".to_string(),
+                    -1,
+                ));
+                return Ok(());
+            }
+            // `pg_sleep(seconds)`: a `void` column (oid 2278) rendered as
+            // the empty string; the wait itself belongs to execution, not
+            // planning (a DESCRIBE must not sleep). Probed PG 16.
+            if name == "pg_sleep" {
+                if f.args.len() != 1 {
+                    return Err(Error::Unsupported(format!(
+                        "pg_sleep() with {} arguments",
+                        f.args.len()
+                    )));
+                }
+                let seconds = cast_value(const_value(&f.args[0], params)?, "float8")?;
+                columns.push((
+                    if rt.name.is_empty() {
+                        "pg_sleep".to_string()
+                    } else {
+                        rt.name.clone()
+                    },
+                    ConstCol::Sleep(seconds),
+                    "void".to_string(),
+                    -1,
+                ));
+                return Ok(());
+            }
+            // `pg_notify(channel, payload)` and `pg_listening_channels()`
+            // belong to the session, which only the server has.
+            if name == "pg_notify" {
+                if f.args.len() != 2 {
+                    return Err(Error::Unsupported(format!(
+                        "pg_notify() with {} arguments",
+                        f.args.len()
+                    )));
+                }
+                let channel = const_value(&f.args[0], params)?;
+                let payload = const_value(&f.args[1], params)?;
+                columns.push((
+                    if rt.name.is_empty() {
+                        "pg_notify".to_string()
+                    } else {
+                        rt.name.clone()
+                    },
+                    ConstCol::PgNotify { channel, payload },
+                    "void".to_string(),
+                    -1,
+                ));
+                return Ok(());
+            }
+            if name == "pg_listening_channels" {
+                columns.push((
+                    if rt.name.is_empty() {
+                        "pg_listening_channels".to_string()
+                    } else {
+                        rt.name.clone()
+                    },
+                    ConstCol::ListeningChannels,
+                    "text".to_string(),
+                    -1,
+                ));
+                return Ok(());
+            }
+            // `pg_backend_pid()` and `pg_terminate_backend(pid)` need the
+            // connection's identity, which the stateless planner does not
+            // have -- they become `ConstCol`s the server resolves.
+            // The sequence functions read and WRITE server state, so
+            // they become `ConstCol`s the server resolves rather than
+            // anything the stateless planner can fold.
+            // `lastval()` reads only this session's state; it is folded
+            // while planning the statement that executes (NULL, and no
+            // error, in a Describe's plan).
+            // The storage-size and advisory-lock functions, answered by
+            // the executor.
+            if let Some(ty) = correlated::executor_function_type(&name)
+                .filter(|_| correlated::executor_answers(name.as_str()))
+            {
+                let out = if rt.name.is_empty() {
+                    name.clone()
+                } else {
+                    rt.name.clone()
+                };
+                let args = f
+                    .args
+                    .iter()
+                    .map(|a| const_value(a, params))
+                    .collect::<Result<Vec<_>>>()?;
+                let value = correlated::call_sequence(&name, &args)?;
+                columns.push((out, ConstCol::Value(value), ty.to_string(), -1));
+                return Ok(());
+            }
+            if name == "lastval" {
+                let out = if rt.name.is_empty() {
+                    name.clone()
+                } else {
+                    rt.name.clone()
+                };
+                let value = correlated::call_sequence("lastval", &[])?;
+                columns.push((out, ConstCol::Value(value), "int8".to_string(), -1));
+                return Ok(());
+            }
+            if name == "pg_blocking_pids" {
+                let out = if rt.name.is_empty() {
+                    name.clone()
+                } else {
+                    rt.name.clone()
+                };
+                let arg = match f.args.first() {
+                    None => ConstCol::Value(Bson::Null),
+                    Some(node) => ConstCol::Value(const_value(node, params)?),
+                };
+                columns.push((
+                    out,
+                    ConstCol::BlockingPids(Box::new(arg)),
+                    "int4[]".to_string(),
+                    -1,
+                ));
+                return Ok(());
+            }
+            if matches!(name.as_str(), "nextval" | "currval" | "setval")
+                || name == "pg_get_serial_sequence"
+            {
+                let arg = |i: usize| -> Result<ConstCol> {
+                    match f.args.get(i) {
+                        None => Ok(ConstCol::Value(Bson::Null)),
+                        Some(node) => Ok(ConstCol::Value(const_value(node, params)?)),
+                    }
+                };
+                let out = if rt.name.is_empty() {
+                    name.clone()
+                } else {
+                    rt.name.clone()
+                };
+                let (col, ty) = match name.as_str() {
+                    "nextval" => (ConstCol::NextVal(Box::new(arg(0)?)), "int8"),
+                    "currval" => (ConstCol::CurrVal(Box::new(arg(0)?)), "int8"),
+                    "setval" => (
+                        ConstCol::SetVal {
+                            sequence: Box::new(arg(0)?),
+                            value: Box::new(arg(1)?),
+                            // The two-argument form leaves the sequence
+                            // CALLED, so the next draw is one past it.
+                            is_called: Box::new(if f.args.len() > 2 {
+                                arg(2)?
+                            } else {
+                                ConstCol::Value(Bson::Boolean(true))
+                            }),
+                        },
+                        "int8",
+                    ),
+                    _ => (
+                        ConstCol::SerialSequence {
+                            table: Box::new(arg(0)?),
+                            column: Box::new(arg(1)?),
+                        },
+                        "text",
+                    ),
+                };
+                columns.push((out, col, ty.to_string(), -1));
+                return Ok(());
+            }
+            if name == "pg_backend_pid" {
+                columns.push((
+                    if rt.name.is_empty() {
+                        "pg_backend_pid".to_string()
+                    } else {
+                        rt.name.clone()
+                    },
+                    ConstCol::BackendPid,
+                    "int4".to_string(),
+                    -1,
+                ));
+                return Ok(());
+            }
+            if name == "pg_terminate_backend" || name == "pg_cancel_backend" {
+                let arg = f
+                    .args
+                    .first()
+                    .ok_or_else(|| Error::Unsupported(format!("{name}() without a PID")))?;
+                // The PID may itself be `pg_backend_pid()` -- resolve that
+                // nesting into a `BackendPid` the server fills in, so the
+                // idiomatic `pg_terminate_backend(pg_backend_pid())` works.
+                let is_backend_pid = matches!(
+                    arg.node.as_ref(),
+                    Some(N::FuncCall(inner)) if inner
+                        .funcname
+                        .iter()
+                        .filter_map(|n| match n.node.as_ref()? {
+                            N::String(st) => Some(st.sval.as_str()),
+                            _ => None,
+                        })
+                        .next_back()
+                        == Some("pg_backend_pid")
+                );
+                let inner = if is_backend_pid {
+                    ConstCol::BackendPid
+                } else {
+                    ConstCol::Value(const_value(arg, params)?)
+                };
+                columns.push((
+                    if rt.name.is_empty() {
+                        name.clone()
+                    } else {
+                        rt.name.clone()
+                    },
+                    if name == "pg_cancel_backend" {
+                        ConstCol::CancelBackend(Box::new(inner))
+                    } else {
+                        ConstCol::TerminateBackend(Box::new(inner))
+                    },
+                    "bool".to_string(),
+                    -1,
+                ));
+                return Ok(());
+            }
+            if name == "current_database" || name == "current_catalog" {
+                (name, ConstCol::CurrentDatabase, "name".to_string(), -1)
+            } else {
+                let v = session_function(&name)
+                    .ok_or_else(|| Error::Unsupported(disc(&N::FuncCall(f.clone()))))?;
+                let t = inferred_type(&v).to_string();
+                (name, ConstCol::Value(v), t, -1)
+            }
+        }
+        // `user`, `current_user`, `current_timestamp` and the other
+        // keyword functions: the role ones resolve on the server, which
+        // knows the session; `current_timestamp` is `now()`; the
+        // remaining date/time ones are refused by name.
+        Some(N::SqlvalueFunction(svf)) => {
+            use pg_query::protobuf::SqlValueFunctionOp as Op;
+            let op = Op::try_from(svf.op).unwrap_or(Op::SqlvalueFunctionOpUndefined);
+            if op == Op::SvfopCurrentTimestamp {
+                columns.push((
+                    if rt.name.is_empty() {
+                        "current_timestamp".to_string()
+                    } else {
+                        rt.name.clone()
+                    },
+                    ConstCol::Value(scalar::now_value()),
+                    "timestamptz".to_string(),
+                    -1,
+                ));
+                return Ok(());
+            }
+            let (name, col) = match op {
+                Op::SvfopCurrentUser => ("current_user", ConstCol::CurrentUser),
+                Op::SvfopUser => ("user", ConstCol::CurrentUser),
+                Op::SvfopSessionUser => ("session_user", ConstCol::SessionUser),
+                Op::SvfopCurrentRole => ("current_role", ConstCol::CurrentUser),
+                Op::SvfopCurrentCatalog => ("current_catalog", ConstCol::CurrentDatabase),
+                Op::SvfopCurrentSchema => (
+                    "current_schema",
+                    ConstCol::Value(Bson::String("public".into())),
+                ),
+                other => {
+                    // The date/time keywords: folded now, as
+                    // `current_timestamp` is above.
+                    let name = other
+                        .as_str_name()
+                        .trim_start_matches("SVFOP_")
+                        .trim_end_matches("_N")
+                        .to_ascii_lowercase();
+                    // `current_time(3)` carries its precision as its
+                    // modifier (RP-493).
+                    columns.push((
+                        if rt.name.is_empty() { name } else { rt.name.clone() },
+                        ConstCol::Value(sql_value_function(svf)?),
+                        sql_value_function_type(svf).to_string(),
+                        svf.typmod.max(-1),
+                    ));
+                    return Ok(());
+                }
+            };
+            (name.to_string(), col, "name".to_string(), -1)
+        }
+        // `current_database()` and friends spelled as bare column refs.
+        Some(N::ColumnRef(c)) => {
+            let name = c
+                .fields
+                .first()
+                .and_then(|f| f.node.as_ref())
+                .and_then(|n| match n {
+                    N::String(st) => Some(st.sval.clone()),
+                    _ => None,
+                })
+                .ok_or_else(|| Error::Unsupported("this target".into()))?;
+            if name == "current_database" || name == "current_catalog" {
+                (name, ConstCol::CurrentDatabase, "name".to_string(), -1)
+            } else {
+                let v = session_function(&name)
+                    .ok_or_else(|| Error::UndefinedColumn(name.clone()))?;
+                let t = inferred_type(&v).to_string();
+                (name, ConstCol::Value(v), t, -1)
+            }
+        }
+        Some(
+            node @ (N::AConst(_)
+            | N::ParamRef(_)
+            | N::TypeCast(_)
+            | N::AExpr(_)
+            | N::BoolExpr(_)
+            | N::AArrayExpr(_)
+            | N::RowExpr(_)
+            | N::AIndirection(_)
+            | N::CoalesceExpr(_)
+            | N::MinMaxExpr(_)
+            | N::NullTest(_)
+            | N::BooleanTest(_)
+            // `select case when ... end` with no FROM. This list is an
+            // allow-list, so a node absent from it is refused even when
+            // `const_value` handles it perfectly well -- which is why CASE
+            // worked over a table and not here.
+            | N::CaseExpr(_)
+            | N::CollateClause(_)
+            | N::XmlExpr(_)
+            | N::XmlSerialize(_)),
+        ) => {
+            let val = rt.val.as_ref().expect("checked");
+            let v = const_value(val, params)?;
+            let t = static_type(val, &v);
+            let _ = node;
+            // `exprTypmod`: a cast's modifier, or one every operand of a
+            // CASE / COALESCE / ARRAY shares (RP-493).
+            let typmod = expr_typmod::raw_expr_typmod(val, &|_| None);
+            (expression_column_name(val), ConstCol::Value(v), t, typmod)
+        }
+        Some(other) => return Err(Error::Unsupported(disc(other))),
+        None => return Err(Error::Unsupported("an empty target".into())),
+    };
+    let out = if rt.name.is_empty() {
+        default_name
+    } else {
+        rt.name.clone()
+    };
+    columns.push((out, value, pg_type, typmod));
+    Ok(())
 }
 
 /// `SELECT ... FROM function(args) [AS alias[(col)]]` for a function that is
@@ -46958,7 +47027,16 @@ fn const_value(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result<Bson>
     if depth == 0 {
         TYPE_MEMO.with(|m| m.borrow_mut().clear());
     }
-    out
+    match out {
+        // Parse analysis folds nothing: an error only evaluating the
+        // constant raises (`1/0`) is EXECUTE's, so a PREPARE describes it
+        // as unevaluated, typed without a value (RP-511).
+        Err(e) if depth == 0 && analysing_only_now() && !raised_by_analysis(&e) => {
+            take_error_location();
+            Ok(Bson::Null)
+        }
+        out => out,
+    }
 }
 
 /// `smallint` arithmetic answers `smallint`, and a result past its range is
