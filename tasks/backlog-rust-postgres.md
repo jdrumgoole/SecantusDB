@@ -2585,22 +2585,22 @@ holding `(1, 'y')`.
       Backlog-ID: RP-526
       Verify: tests/backlog/test_rp_found_rp467.py::test_same_name_relations_in_from
 
-## Found while working RP-514 (2026-11-08)
+## Found while working RP-519 (2026-11-14)
 
-Measured on a private PostgreSQL 15.19 cluster. The gap tests are in
-`tests/backlog/test_rp_found_rp514.py`.
+Measured on a private PostgreSQL 15.19 cluster.
 
-- [ ] **A built-in routine takes no comment.** PostgreSQL 15.19 records
-      `comment on function abs(int) is 'x'` in `pg_description` (classoid
-      1255, the overload's `pg_proc` oid), replacing initdb's description.
-      Here every COMMENT ON a built-in routine is refused as 0A000: the
-      routine is now resolved among its overloads (`function_acl_key`), but
-      a built-in has no catalog document to hold the comment. Faithful:
-      keep it keyed by the overload's oid (from the pg_proc rows) and list
-      it in `pg_description_rows`; initdb's own built-in descriptions are
-      not served either.
-      Verify: tests/backlog/test_rp_found_rp514.py::test_builtin_routine_takes_a_comment
-      Backlog-ID: RP-519
+- [ ] **A built-in routine has no initdb description.** PostgreSQL 15.19
+      answers `obj_description('abs(int)'::regprocedure, 'pg_proc')` with
+      initdb's `absolute value` (from `pg_proc.dat`'s `descr`), and every
+      built-in routine has its row in `pg_description`. Here a built-in has
+      none until a COMMENT ON FUNCTION gives it one (RP-519 stores those by
+      the overload's oid). Faithful: carry initdb's `pg_description` rows
+      for `pg_proc` in the built-in catalog facts, served until a COMMENT
+      replaces or (IS NULL) removes one, as `schema_comments` does for
+      `public`; the other catalogs' initdb descriptions (types, operators,
+      access methods) are the same gap.
+      Verify: tests/backlog/test_rp_found_rp514.py::test_builtin_routine_has_initdb_description
+      Backlog-ID: RP-969
 
 ## Found while working RP-516 (2026-11-08)
 

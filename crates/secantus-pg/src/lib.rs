@@ -5545,6 +5545,9 @@ impl PgHandler {
     ];
     /// `COMMENT ON INDEX`, keyed by index name: the Python server's store.
     const INDEX_COMMENT_COLLECTION: &'static str = "__sql_index_comments__";
+    /// `COMMENT ON` a built-in routine: `{_id: <pg_proc oid>, comment}`,
+    /// one per overload as `pg_description` keys it (RP-519).
+    const BUILTIN_PROC_COMMENT_COLLECTION: &'static str = "__sql_builtin_proc_comments__";
     /// `COMMENT ON` every other kind of object the catalog has no row of its
     /// own to carry it on: `{_id: "<kind>\0<name>", kind, name, comment}`.
     const COMMENT_COLLECTION: &'static str = "__sql_comments__";
@@ -6189,8 +6192,9 @@ impl PgHandler {
                 .collect(),
         );
         // Every table's comments are listed when a statement first asks
-        // for one (RP-911); the reads they need are made now.
-        match self.object_comments_builder() {
+        // for one (RP-911); the reads they need are made now, under the
+        // open block's snapshot, so a COMMENT it made is read back in it.
+        match self.read_in_block(|| self.object_comments_builder()) {
             Ok(build) => secantus_pgplan::defer_object_comments(build),
             Err(e) => {
                 complete = false;
@@ -19276,6 +19280,32 @@ impl PgHandler {
         Ok(())
     }
 
+    /// The `pg_proc` oid of the built-in overload a `name(t1,t2)` key
+    /// ([`Self::function_acl_key`]) names.
+    fn builtin_proc_oid_of_key(key: &str) -> Option<i64> {
+        let (name, args) = key.strip_suffix(')')?.split_once('(')?;
+        let args: Vec<&str> = args.split(',').filter(|a| !a.is_empty()).collect();
+        let facts = crate::catalog_facts::builtin();
+        let type_name = |oid: &i64| facts.types.get(oid).map(|t| t.name.as_str());
+        let matches = |written: &str, oid: &i64| {
+            type_name(oid).is_some_and(|n| {
+                n == written
+                    || written
+                        .strip_suffix("[]")
+                        .is_some_and(|e| n.strip_prefix('_') == Some(e))
+            })
+        };
+        facts
+            .procs_by_name
+            .get(name)?
+            .iter()
+            .filter_map(|oid| facts.procs.get(oid))
+            .find(|p| {
+                p.args.len() == args.len() && p.args.iter().zip(&args).all(|(o, a)| matches(a, o))
+            })
+            .map(|p| p.oid)
+    }
+
     fn put_comment_doc(
         &self,
         collection: &'static str,
@@ -19465,11 +19495,20 @@ impl PgHandler {
                     .find(|d| d.get_str("_id") == Ok(key.as_str()))
                     .map(|d| Document::clone(d))
                 else {
-                    // A built-in routine has no catalog document to hold it.
-                    return Err(Self::user_error(
-                        "0A000",
-                        format!("COMMENT ON a built-in {kind} ({key}) is not supported"),
-                    ));
+                    // A built-in routine: `pg_description` keys the comment
+                    // by the overload's `pg_proc` oid (RP-519).
+                    let Some(oid) = Self::builtin_proc_oid_of_key(&key) else {
+                        return Err(Self::user_error(
+                            "0A000",
+                            format!("COMMENT ON a built-in {kind} ({key}) is not supported"),
+                        ));
+                    };
+                    let id = oid.to_string();
+                    return self.put_comment_doc(
+                        Self::BUILTIN_PROC_COMMENT_COLLECTION,
+                        &id,
+                        comment.map(|c| bson::doc! {"_id": &id, "oid": oid, "comment": c}),
+                    );
                 };
                 let id = key;
                 match comment {
@@ -21820,6 +21859,22 @@ impl PgHandler {
                 .chain(self.transform_comments())
                 .map(|(oid, c)| (oid, 0, c)),
         );
+        // COMMENT ON a built-in routine, by its overload's oid.
+        for d in self
+            .storage
+            .find_matching(
+                self.db(),
+                Self::BUILTIN_PROC_COMMENT_COLLECTION,
+                &Document::new(),
+            )
+            .map_err(|e| Self::storage_err("could not read the routine comments", e))?
+            .iter()
+            .filter_map(|b| decode_doc(b).ok())
+        {
+            if let (Some(oid), Ok(c)) = (d.get("oid").and_then(bson_i64), d.get_str("comment")) {
+                tail.push((oid, 0, c.to_string()));
+            }
+        }
         // COMMENT ON FUNCTION / PROCEDURE, kept on the function's record,
         // under the oid `pg_proc` gives it.
         for d in self.user_function_docs()? {
@@ -30921,6 +30976,7 @@ impl PgHandler {
             Statement::Comment { .. } => vec![
                 CATALOG_COLLECTION.to_string(),
                 Self::INDEX_COMMENT_COLLECTION.to_string(),
+                Self::BUILTIN_PROC_COMMENT_COLLECTION.to_string(),
                 Self::COMMENT_COLLECTION.to_string(),
                 Self::FUNCTION_COLLECTION.to_string(),
             ],
