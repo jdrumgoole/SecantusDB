@@ -47652,6 +47652,17 @@ impl PgHandler {
                     .max(secantus_pgplan::max_param_number(&query));
                 let mut declared = declared;
                 declared.resize(n, None);
+                // Analysis reads each string constant a cast or an
+                // operator types, evaluated or not (RP-511), at the
+                // constant.
+                if let Some((mut err, at)) = self.constant_input_error(&query, &declared) {
+                    if let (PgWireError::UserError(info), Some(start)) =
+                        (&mut err, text.find(query.as_str()))
+                    {
+                        info.position = Some((text[..start + at].chars().count() + 1).to_string());
+                    }
+                    return Err(err);
+                }
                 // Planned now, as PostgreSQL analyses it at PREPARE: a
                 // missing table is this statement's error, not EXECUTE's.
                 // Nothing in it runs until EXECUTE.

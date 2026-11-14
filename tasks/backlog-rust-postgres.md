@@ -3227,18 +3227,15 @@ Measured on a private PostgreSQL 15.19 cluster with `fs(a int, c text)`,
 
 Measured on a private PostgreSQL 15.19 cluster with `fe(a int, b text)`.
 
-- [ ] **PREPARE evaluates a constant expression, and does not read a cast
-      constant it does not evaluate.** PostgreSQL 15.19's PREPARE
-      parse-analyses its statement and plans nothing: `prepare s1 as select
-      1/0` is prepared, while `prepare s2 as select 'x'::int from fe`,
-      `prepare s3 as select case when false then 'x'::int end` and `prepare
-      s4(int) as select $1 + 'a'` are 22P02 at the constant (22, 43, 32).
-      Here the first is 22012 `division by zero` and the other three are
-      prepared. The planner folds a FROM-less constant expression while it
-      plans and reads a constant only where it folds. Since RP-500 CREATE
-      FUNCTION reads every cast's constant (`sql_fn_validator::literal_casts`),
-      which PREPARE could share, but it also needs planning that does not
-      evaluate.
+- [ ] **PREPARE evaluates a constant expression.** PostgreSQL 15.19's
+      PREPARE parse-analyses its statement and plans nothing: `prepare s1
+      as select 1/0` is prepared. Here it is 22012 `division by zero`, and
+      so is a protocol-level Parse + Describe of `select 1/0`: the planner
+      folds a FROM-less constant expression (`Statement::SelectConstant`)
+      while it plans, and the describe takes its types from that plan.
+      Needs planning that describes without evaluating. (Since RP-511's
+      first part, PREPARE reads each constant a cast or an operator types,
+      `constant_input_error`, as CREATE FUNCTION does.)
       Backlog-ID: RP-511
       Verify: tests/backlog/test_rp_found_rp500.py::test_prepare_analyses_without_evaluating
 

@@ -5,8 +5,8 @@ COALESCE gives its type was not read at CREATE, fixed), RP-508 (DROP FUNCTION /
 PROCEDURE without arguments over the other kind, and DROP ROUTINE's
 notice), RP-509 (a CALL that leaves a defaulted parameter out, names its
 arguments, or passes a column), RP-510 (a malformed range literal had no DETAIL, fixed)
-and RP-511 (PREPARE evaluates a constant expression and does not read a
-cast constant it does not evaluate).
+and RP-511 (PREPARE evaluates a constant expression; that it did not read a
+cast constant it does not evaluate is fixed).
 
 An answer is `("ok", rows, notices)`, or `(sqlstate, message, detail, hint,
 position, notices)` for an error. The expected answers were measured on a
@@ -244,9 +244,6 @@ def test_range_literal_detail(query: str, dsn: str) -> None:
 # cast or an operator coerces, evaluated or not.
 PREPARE_ANALYSES = {
     "prepare s1 as select 1/0": ("ok", None, []),
-    "prepare s2 as select 'x'::int from fe": _input("x", "22"),
-    "prepare s3 as select case when false then 'x'::int end": _input("x", "43"),
-    "prepare s4(int) as select $1 + 'a'": _input("a", "32"),
 }
 
 
@@ -254,3 +251,18 @@ PREPARE_ANALYSES = {
 @pytest.mark.parametrize("query", list(PREPARE_ANALYSES))
 def test_prepare_analyses_without_evaluating(query: str, dsn: str) -> None:
     assert answer(dsn, query) == PREPARE_ANALYSES[query]
+
+
+# RP-511 (fixed in part): PREPARE read no constant it did not evaluate;
+# now each one a cast or an operator types is read at the constant.
+PREPARE_READS_CONSTANTS = {
+    "prepare s2 as select 'x'::int from fe": _input("x", "22"),
+    "prepare s3 as select case when false then 'x'::int end": _input("x", "43"),
+    "prepare s4(int) as select $1 + 'a'": _input("a", "32"),
+}
+
+
+@pytest.mark.backlog_fixed("RP-511")
+@pytest.mark.parametrize("query", list(PREPARE_READS_CONSTANTS))
+def test_prepare_reads_constants(query: str, dsn: str) -> None:
+    assert answer(dsn, query) == PREPARE_READS_CONSTANTS[query]
