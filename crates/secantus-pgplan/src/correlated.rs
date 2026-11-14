@@ -1174,11 +1174,18 @@ fn range_function_visible_name(rf: &pg_query::protobuf::RangeFunction) -> Option
 }
 
 /// The type of an outer reference, innermost enclosing query first.
-fn outer_ref_type(
+pub(crate) fn outer_ref_type(
     parts: &[String],
     lookup: &dyn Fn(&str) -> Option<TableDef>,
     params: &[Bson],
 ) -> Option<String> {
+    // A write's hidden RETURNING entry, the joined row's value of a FROM
+    // item's column, is of that column's type (RP-686).
+    if let [one] = parts {
+        if one.starts_with(crate::JOINED_RETURNING) {
+            return crate::joined_returning_type(one).map(str::to_string);
+        }
+    }
     let levels = OUTER_FROM.with(|o| o.borrow().clone());
     let (qualifier, col) = match parts {
         [.., q, c] => (Some(q), c),

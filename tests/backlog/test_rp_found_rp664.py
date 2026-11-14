@@ -364,17 +364,55 @@ def test_returning_a_from_item_when_the_join_reads_an_assigned_column(query: str
 
 
 # The rest of RP-686: a SUBQUERY in RETURNING that reads a FROM item, when
-# the join condition reads an assigned column, is still the named 0A000.
+# the join condition reads an assigned column, was the named 0A000. Its
+# outer reference now reads the joined row from before the write, as the
+# subquery's outer row does in PostgreSQL, beside the target's NEW row.
 RETURNING_FROM_SUBQUERY = {
     "update t668 set b = u668.v from u668 where t668.b < 0 and u668.k = 5"
     " returning t668.a, (select u668.v)": (
         [(-1, 50), (7, 50)],
         [(-1, 50), (5, 5), (7, 50)],
     ),
+    # Beside the target's new value, and from a nested subquery.
+    "update t668 set b = u668.v from u668 where t668.b < 0 and u668.k = 5"
+    " returning (select u668.v + t668.b) as x, (select (select u668.v))": (
+        [(100, 50), (100, 50)],
+        [(-1, 50), (5, 5), (7, 50)],
+    ),
+    "update t668 set b = u668.v from u668 where t668.b < 0 and u668.k = 5"
+    " returning (select count(*) from u668 i where i.k < u668.k)": (
+        [(1,), (1,)],
+        [(-1, 50), (5, 5), (7, 50)],
+    ),
+    "update t668 t set b = u.v from u668 u where t.b < 0 and u.k = 5"
+    " returning (select u.v), (select v), (select t.b)": (
+        [(50, 50, 50), (50, 50, 50)],
+        [(-1, 50), (5, 5), (7, 50)],
+    ),
+    # A FROM item's star and whole-row field, as its columns.
+    "update t668 set b = x.a from (select a from t668) x where t668.b < 0 and x.a = t668.a"
+    " returning (select x.*), (select (x).a), (select (select x.*))": (
+        [(-1, -1, -1), (7, 7, 7)],
+        [(-1, -1), (5, 5), (7, 7)],
+    ),
+    "update t668 set b = u668.v from u668 where t668.b < 0 and u668.k = 5"
+    " returning (select u668.*)": ("error", "42601", "subquery must return only one column"),
+    "update t668 set b = s.b + 100 from t668 s where s.a = t668.a"
+    " returning (select s.b), (select t668.b)": (
+        [(-1, 99), (5, 105), (-3, 97)],
+        [(-1, 99), (5, 105), (7, 97)],
+    ),
+    # A subquery over the FROM items alone reads the statement's snapshot:
+    # the target table as it was before the write.
+    "update t668 set b = 100 from u668 where u668.k = t668.a"
+    " returning (select count(*) from t668 z where z.b = 100 and u668.k > 0)": (
+        [(0,), (0,), (0,)],
+        [(-1, 100), (5, 100), (7, 100)],
+    ),
 }
 
 
-@pytest.mark.backlog("RP-686")
+@pytest.mark.backlog_fixed("RP-686")
 @pytest.mark.parametrize("query", list(RETURNING_FROM_SUBQUERY))
 def test_a_returning_subquery_over_a_from_item_when_the_join_reads_an_assigned_column(
     query: str, dsn: str
@@ -435,23 +473,80 @@ def test_delete_returning_reads_a_using_item_as_it_was_before_the_delete(
     assert _scoped_answer(dsn, query) == RETURNING_USING_BEFORE_DELETE[query]
 
 
-# The rest of RP-938: a SUBQUERY in RETURNING that reads a USING item still
-# finds the joining row after the delete, when a derived table over the
-# target no longer holds it.
+# The rest of RP-938: a SUBQUERY in RETURNING that reads a USING item found
+# the joining row again after the delete, when a derived table over the
+# target no longer held it (NULL). It now reads the joined row from before
+# the delete, as UPDATE's FROM items do (RP-686).
 RETURNING_USING_SUBQUERY = {
     "delete from t668 using (select a, b from t668) x where x.a = t668.a returning (select x.b)": (
         [(-1,), (5,), (-3,)],
         [],
     ),
+    "delete from t668 using u668 u where u.k = t668.a returning t668.a, (select u.v + t668.b)": (
+        [(-1, 9), (5, 55), (7, 67)],
+        [],
+    ),
+    "delete from t668 using (select a from t668) x where x.a = t668.a"
+    " returning (select x.*), (select (select x.*)), (select (x).a)": (
+        [(-1, -1, -1), (5, 5, 5), (7, 7, 7)],
+        [],
+    ),
+    "delete from t668 using u668 where u668.k = t668.a"
+    " returning (select u668.v from t668 limit 1)": ([(10,), (50,), (70,)], []),
 }
 
 
-@pytest.mark.backlog("RP-938")
+@pytest.mark.backlog_fixed("RP-938")
 @pytest.mark.parametrize("query", list(RETURNING_USING_SUBQUERY))
 def test_a_delete_returning_subquery_reads_a_using_item_as_it_was_before_the_delete(
     query: str, dsn: str
 ) -> None:
     assert _scoped_answer(dsn, query) == RETURNING_USING_SUBQUERY[query]
+
+
+# Found while working RP-686. A subquery in RETURNING correlated to the
+# target row runs under the statement's snapshot on PostgreSQL, so a table
+# it reads is as it was before the statement's own writes; here it runs
+# after them.
+RETURNING_SNAPSHOT = {
+    "delete from t668 returning (select count(*) from t668 z where z.a = t668.a)": (
+        [(1,), (1,), (1,)],
+        [],
+    ),
+    "update t668 set b = 100 returning (select z.b from t668 z where z.a = t668.a)": (
+        [(-1,), (5,), (-3,)],
+        [(-1, 100), (5, 100), (7, 100)],
+    ),
+    "insert into t668 values (9, 9) returning (select count(*) from t668 z where z.a <= t668.a)": (
+        [(3,)],
+        [(-1, -1), (5, 5), (7, -3), (9, 9)],
+    ),
+}
+
+
+@pytest.mark.backlog("RP-943")
+@pytest.mark.parametrize("query", list(RETURNING_SNAPSHOT))
+def test_a_returning_subquery_reads_the_statement_snapshot(query: str, dsn: str) -> None:
+    assert _scoped_answer(dsn, query) == RETURNING_SNAPSHOT[query]
+
+
+# Found while working RP-686. An aggregate whose arguments are all outer
+# references belongs to the outer query level (`check_agg_arguments`),
+# which in RETURNING is 42803.
+_AGG_IN_RETURNING = ("error", "42803", "aggregate functions are not allowed in RETURNING")
+RETURNING_OUTER_AGGREGATE = [
+    "update t668 set a = 1 returning (select array_agg(t668.b) from u668)",
+    "update t668 set a = 9 from u668 where u668.k = t668.a"
+    " returning (select max(u668.v) from u668 z)",
+    "delete from t668 returning (select max(t668.b) from u668)",
+    "insert into t668 values (9, 9) returning (select max(t668.b) from u668)",
+]
+
+
+@pytest.mark.backlog("RP-944")
+@pytest.mark.parametrize("query", RETURNING_OUTER_AGGREGATE)
+def test_an_outer_aggregate_in_a_returning_subquery_is_refused(query: str, dsn: str) -> None:
+    assert _scoped_answer(dsn, query) == _AGG_IN_RETURNING
 
 
 # A BEFORE ROW trigger on `t664t`, by the body of its function. PostgreSQL

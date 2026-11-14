@@ -985,6 +985,8 @@ impl PgHandler {
 
     /// Record an index's `relpages` and `reltuples`, as `index_update_stats`
     /// (a build) and `vac_update_relstats` (VACUUM, ANALYZE) write them.
+    /// Neither reaches a partitioned table's index, which has no storage
+    /// (RP-931): its row keeps the 0 pages, 0 tuples it was created with.
     pub(crate) fn record_index_size(
         &self,
         table: &str,
@@ -992,6 +994,12 @@ impl PgHandler {
         pages: u32,
         tuples: f64,
     ) -> PgWireResult<()> {
+        if self
+            .lookup_ref(table)
+            .is_some_and(|def| crate::partition::is_partitioned(&def))
+        {
+            return Ok(());
+        }
         let key = Self::index_relstats_key(table, index);
         let doc = bson::doc! {
             "_id": key.as_str(),

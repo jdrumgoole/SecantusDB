@@ -23535,8 +23535,15 @@ impl PgHandler {
                     d.insert(f("relnatts"), Bson::Int32(ix.keys.len() as i32));
                     d.insert(f("relhasindex"), false);
                     // What its build, VACUUM or ANALYZE last recorded
-                    // (RP-196).
-                    let (pages, tuples, _) = sizes.get(&key).copied().unwrap_or((0, -1.0, 0));
+                    // (RP-196). A partitioned index has no storage: no
+                    // build, VACUUM or ANALYZE ever writes its row, which
+                    // keeps `index_create`'s zeroed 0 pages, 0 tuples
+                    // (RP-931).
+                    let (pages, tuples, _) = if partition::is_partitioned(&ix.table) {
+                        (0, 0.0, 0)
+                    } else {
+                        sizes.get(&key).copied().unwrap_or((0, -1.0, 0))
+                    };
                     d.insert(f("relpages"), Bson::Int32(pages));
                     d.insert(f("reltuples"), Bson::Double(tuples));
                     // An index is its table's owner's.

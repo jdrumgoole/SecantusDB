@@ -337,6 +337,31 @@ fn update_from_returning_reads_the_joined_row() {
     }
 }
 
+/// A subquery in RETURNING reads an UPDATE's FROM item from the joined row
+/// too (RP-686). One that also reads the target's NEW row keeps running per
+/// returned row, its FROM-item reference a hidden `joined` value whose name
+/// carries the column's type for the subquery's outer read; one over the
+/// FROM items alone is a hidden value whole, read before the write.
+#[test]
+fn update_from_returning_subquery_reads_the_joined_row() {
+    let sql = "UPDATE t SET n = s.n FROM t s WHERE s.id = t.n \
+               RETURNING t.id, (SELECT s.name || t.n), (SELECT (SELECT s.n))";
+    match plan_with_subqueries(sql, &lookup, &[], &|_| Ok(Vec::new())).expect("should plan") {
+        Statement::Update(u) => {
+            let types: Vec<Option<&str>> = u
+                .joined
+                .iter()
+                .map(|(f, _)| crate::joined_returning_type(f))
+                .collect();
+            assert_eq!(types, [Some("text"), None], "{:?}", u.joined);
+            let returning = u.returning.expect("RETURNING");
+            let names: Vec<&str> = returning.columns.iter().map(|(n, _)| n.as_str()).collect();
+            assert_eq!(names, ["id", "?column?", "n"]);
+        }
+        other => panic!("wrong statement: {other:?}"),
+    }
+}
+
 /// As `update_from_returning_reads_the_joined_row`, for DELETE ... USING
 /// (RP-938): the joined values are read over each row before it is deleted.
 #[test]
