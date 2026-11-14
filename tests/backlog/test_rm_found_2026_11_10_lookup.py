@@ -129,7 +129,7 @@ def _documents_in_facet(client: Any) -> dict:
     }
 
 
-@pytest.mark.backlog("RM-530")
+@pytest.mark.backlog_fixed("RM-530")
 def test_documents_is_refused_in_a_facet(
     rust_mongo: Any,
     mongod_rs: Any,  # noqa: F811
@@ -137,7 +137,7 @@ def test_documents_is_refused_in_a_facet(
     """mongod 8.2.11 refuses `$documents` in a `$facet` with 40600: "$documents
     is not allowed to be used within a $facet stage", or "$documents inside
     of $unionWith ..." / "... inside of $lookup ..." when a sub-pipeline in
-    the facet holds it. This server answers 73 to the first and runs the
+    the facet holds it. This server answered 73 to the first and ran the
     other two."""
     assert _documents_in_facet(rust_mongo) == _documents_in_facet(mongod_rs)
 

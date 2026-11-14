@@ -1844,14 +1844,6 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       2026-11-14 working RM-532.
       Verify: tests/backlog/test_rm_found_2026_11_14_rm532.py::test_a_hybrid_search_names_the_collection_it_unions
       Backlog-ID: RM-644
-- [ ] **`$documents` in a `$facet` is not refused with 40600.** mongod
-      8.2.11 refuses it with 40600 "$documents is not allowed to be used
-      within a $facet stage", and names the stage that holds it when a
-      `$unionWith` or `$lookup` in the facet does ("$documents inside of
-      $unionWith is not allowed ..."). This server answers 73 to the first
-      and runs the other two. Found 2026-11-10 (RM-413).
-      Verify: tests/backlog/test_rm_found_2026_11_10_lookup.py::test_documents_is_refused_in_a_facet
-      Backlog-ID: RM-530
 - [ ] **`$documents` of a non-array answers 2.** mongod 8.2.11 refuses
       `$documents: 5` at run time with 5858203 "Executor error during
       aggregate command on namespace: <db>.$cmd.aggregate :: caused by ::
@@ -1860,6 +1852,62 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       to an array". Found 2026-11-10 (RM-413).
       Verify: tests/backlog/test_rm_found_2026_11_10_lookup.py::test_documents_of_a_non_array_is_an_executor_error
       Backlog-ID: RM-531
+- [ ] **A `$facet` element that is not a stage is refused without naming
+      it.** mongod 8.2.11's 40171 names the element: "elements of arrays in
+      $facet spec must be non-empty objects, b argument contained an
+      element of type int: 0: 5" (its type, its index and its value). This
+      server ends the message "... b argument contained an invalid
+      element". Found 2026-11-14 working RM-530.
+      Verify: tests/backlog/test_rm_found_2026_11_14_rm530.py::test_a_facet_element_refusal_names_the_element
+      Backlog-ID: RM-647
+- [ ] **A collectionless `$unionWith` without a `$documents` runs when it
+      is nested.** mongod 8.2.11 refuses a `$unionWith` naming no `coll`
+      whose pipeline does not begin with `$documents` (9, "$unionWith stage
+      without explicit collection must have a pipeline with $documents as
+      first stage") wherever it stands. This server refuses it at the top
+      level, but inside a `$facet`, `$lookup` or `$unionWith` runs its
+      pipeline over the collection the outer stage reads and unions those
+      documents in. Found 2026-11-14 working RM-530.
+      Verify: tests/backlog/test_rm_found_2026_11_14_rm530.py::test_a_nested_union_with_no_collection_must_make_its_documents
+      Backlog-ID: RM-648
+- [ ] **A nested `$lookup`'s bad `let` runs.** mongod 8.2.11 refuses a
+      `$lookup` whose `let` is not a document (14) or that has `localField`
+      without `foreignField` (9) inside a `$facet` or `$unionWith` as at
+      the top level (RM-528). This server runs the first there and answers
+      the second 2 ("$lookup requires localField+foreignField or
+      pipeline"). Found 2026-11-14 working RM-530.
+      Verify: tests/backlog/test_rm_found_2026_11_14_rm530.py::test_a_nested_lookup_spec_is_checked_as_it_is_parsed
+      Backlog-ID: RM-649
+- [ ] **`{$project: {}}` drops its envelope, and is "not supported" when
+      nested.** mongod 8.2.11 answers 51272 "Invalid $project :: caused by
+      :: projection specification must have at least one field" at the top
+      level and in a `$facet` or `$unionWith`. This server drops the
+      "Invalid $project :: caused by ::" at the top level and answers
+      BadValue (2, "not supported by the Rust server") nested. Found
+      2026-11-14 working RM-530.
+      Verify: tests/backlog/test_rm_found_2026_11_14_rm530.py::test_an_empty_projection_is_an_invalid_project
+      Backlog-ID: RM-650
+- [ ] **`$documents`'s parse refusals in a sub-pipeline.** mongod 8.2.11
+      refuses a `$documents` that is not its pipeline's first stage with
+      40602 ("$documents is only valid as the first stage in a pipeline")
+      under a `$unionWith` that reads a collection, and `{$documents: {}}`
+      with 51270 "Invalid $documents :: caused by :: Invalid empty
+      sub-projection: _tempDocumentsField". This server answers the first
+      73 ("'$documents' can only be run with {aggregate: 1}") and drops
+      the second's envelope. Found 2026-11-14 working RM-530.
+      Verify: tests/backlog/test_rm_found_2026_11_14_rm530.py::test_documents_refusals_in_a_sub_pipeline
+      Backlog-ID: RM-651
+- [ ] **A `$facet`'s 40600 comes after a later stage's parse error.**
+      mongod 8.2.11 parses a pipeline a stage at a time, so a `$facet`
+      holding a stage it refuses is refused before a later stage's
+      refusal: `[{$facet: {a: [<$documents>]}}, {$project: {}}]` is 40600,
+      and so is a facet's `$out` before a later `$match`'s `$where`. This
+      server checks every stage's expressions, projections and `$where`
+      in passes over the whole pipeline before the nested-pipeline pass
+      (`nested_stage_problem`), and answers the later stage's refusal.
+      Found 2026-11-14 working RM-530.
+      Verify: tests/backlog/test_rm_found_2026_11_14_rm530.py::test_a_facet_refusal_comes_before_a_later_stage
+      Backlog-ID: RM-652
 - [ ] **A `$match` behind a `$replaceRoot` stays behind it over a
       collection.** mongod 8.2.11 moves a `$match` behind
       `{$replaceRoot: {newRoot: "$x"}}` (or `$replaceWith: "$x"`) ahead of
