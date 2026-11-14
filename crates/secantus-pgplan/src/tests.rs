@@ -5176,6 +5176,33 @@ fn a_whole_row_is_grouped_by_and_tested_in_having() {
 }
 
 #[test]
+fn an_ungrouped_whole_row_is_named_t_star() {
+    // PostgreSQL 15.19's `check_ungrouped_columns` names a whole-row Var
+    // `t.*`, in the select list, ORDER BY and HAVING alike (RP-536).
+    for sql in [
+        "select t, count(*) from t group by n",
+        "select count(*) from t having t is not null",
+        "select count(*) from t group by n order by t",
+    ] {
+        let parsed = pg_query::parse(sql).unwrap();
+        let Some(N::SelectStmt(s)) = parsed.protobuf.stmts[0]
+            .stmt
+            .as_ref()
+            .and_then(|n| n.node.as_ref())
+        else {
+            panic!("not a SELECT: {sql}");
+        };
+        match whole_row_rewrite(s, &lookup, &[]) {
+            Err(Error::Grouping(m)) => assert!(m.starts_with("column \"t.*\" must appear"), "{m}"),
+            other => panic!("{sql}: {other:?}"),
+        }
+    }
+    // Grouped by the row itself, or by its ordinal, the row is grouped.
+    whole_rows_rewritten("select t, count(*) from t group by t");
+    whole_rows_rewritten("select t, count(*) from t group by 1");
+}
+
+#[test]
 fn a_field_of_a_whole_row_is_its_column() {
     // PostgreSQL 15.19's `ParseComplexProjection`: `(t).n` is t's column
     // n, so under `group by t` it is ungrouped (42803 at `t`), RP-532.

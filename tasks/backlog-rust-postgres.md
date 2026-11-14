@@ -2777,15 +2777,6 @@ holding `(1, 'y')` twice, `(2, 'z')` and `(null, null)`, and `fk(k fs)`
 holding `row(null, null)`, `row(1, null)`, `row(1, 'a')` and `null`. The
 gap tests are in `tests/backlog/test_rp_found_rp532.py`.
 
-- [ ] **An ungrouped whole row's 42803 names its first column, with no
-      position.** PostgreSQL 15.19's `check_ungrouped_columns` names a
-      whole-row Var `fs.*` (`get_rte_attribute_name` of attribute 0), at
-      the reference: `select fs, count(*) from fs group by a` is `column
-      "fs.*" must appear in the GROUP BY clause ...` at 8, and `select
-      count(*) from fs having fs is not null` the same at 32. Here they
-      name `fs.c` and `fs.a`, with no position.
-      Backlog-ID: RP-536
-      Verify: tests/backlog/test_rp_found_rp532.py::test_ungrouped_whole_row
 - [ ] **A relation name its alias hides is reported at the FROM item.**
       Under `from fs x` the name `fs` names nothing, so PostgreSQL 15.19
       reports `select count(*) from fs x group by fs` and `... order by fs`

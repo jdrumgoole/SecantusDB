@@ -42799,6 +42799,155 @@ fn names_alias(s: &pg_query::protobuf::SelectStmt, alias: &str) -> Result<bool> 
         .any(|n| expr_any(n, &names)))
 }
 
+/// A grouped query's whole-row reference to its table, neither grouped by
+/// nor inside an aggregate: PostgreSQL's 42803, which
+/// `check_ungrouped_columns` names `t.*` (`get_rte_attribute_name` of
+/// attribute 0) at the reference (RP-536). The row is grouped only by a
+/// GROUP BY item that is the row itself, or by the table's whole primary
+/// key (`check_functional_grouping`).
+fn check_ungrouped_whole_row(
+    s: &pg_query::protobuf::SelectStmt,
+    alias: &str,
+    def: &TableDef,
+) -> Result<()> {
+    if def.columns.iter().any(|c| c.name == alias)
+        || !(!s.group_clause.is_empty() || s.having_clause.is_some() || has_aggregate(s))
+    {
+        return Ok(());
+    }
+    let field_names = |c: &pg_query::protobuf::ColumnRef| -> Vec<Option<String>> {
+        c.fields
+            .iter()
+            .map(|f| match f.node.as_ref() {
+                Some(N::String(sv)) => Some(sv.sval.clone()),
+                Some(N::AStar(_)) => Some("*".into()),
+                _ => None,
+            })
+            .collect()
+    };
+    let whole_row = |n: &pg_query::protobuf::Node| -> bool {
+        let Some(N::ColumnRef(c)) = n.node.as_ref() else {
+            return false;
+        };
+        match field_names(c).as_slice() {
+            [Some(a)] => a == alias,
+            [Some(a), Some(star)] => a == alias && star == "*",
+            _ => false,
+        }
+    };
+    let target_val = |i: usize| -> Option<&pg_query::protobuf::Node> {
+        match s.target_list.get(i)?.node.as_ref() {
+            Some(N::ResTarget(rt)) => rt.val.as_deref(),
+            _ => None,
+        }
+    };
+    let mut grouped_cols: Vec<String> = Vec::new();
+    for g in &s.group_clause {
+        let g = match g.node.as_ref() {
+            // `group by 1`: the select-list item it numbers.
+            Some(N::AConst(c)) => match &c.val {
+                Some(pg_query::protobuf::a_const::Val::Ival(i)) if i.ival >= 1 => {
+                    match target_val(i.ival as usize - 1) {
+                        Some(v) => v,
+                        None => continue,
+                    }
+                }
+                _ => continue,
+            },
+            _ => g,
+        };
+        if whole_row(g) {
+            return Ok(());
+        }
+        if let Some(N::ColumnRef(c)) = g.node.as_ref() {
+            match field_names(c).as_slice() {
+                [Some(col)] => grouped_cols.push(col.clone()),
+                [Some(q), Some(col)] if q == alias => grouped_cols.push(col.clone()),
+                _ => {}
+            }
+        }
+    }
+    let key: Vec<&str> = def
+        .columns
+        .iter()
+        .filter(|c| c.pk)
+        .map(|c| c.name.as_str())
+        .collect();
+    if !key.is_empty() && key.iter().all(|k| grouped_cols.iter().any(|g| g == k)) {
+        return Ok(());
+    }
+    let mut found: Option<i32> = None;
+    let mut scan = |n: &pg_query::protobuf::Node| -> Result<()> {
+        let mut n = n.clone();
+        walk_expr(&mut n, &mut |x| {
+            let opaque = match x.node.as_ref() {
+                Some(N::SubLink(_)) | Some(N::GroupingFunc(_)) => true,
+                Some(N::FuncCall(f)) => {
+                    f.over.is_none()
+                        && func_name(f)
+                            .as_deref()
+                            .is_some_and(|n| aggregate_func(n, f.agg_within_group).is_some())
+                }
+                Some(N::ColumnRef(c)) if found.is_none() && whole_row(x) => {
+                    found = Some(c.location);
+                    false
+                }
+                _ => false,
+            };
+            if opaque {
+                *x = pg_query::protobuf::Node { node: None };
+            }
+            Ok(())
+        })
+    };
+    for t in &s.target_list {
+        if let Some(N::ResTarget(rt)) = t.node.as_ref() {
+            if let Some(v) = rt.val.as_deref() {
+                // A select-list `t.*` is t's columns, not its row.
+                let star = matches!(v.node.as_ref(),
+                    Some(N::ColumnRef(c)) if c.fields.len() == 2 && whole_row(v));
+                if !star {
+                    scan(v)?;
+                }
+            }
+        }
+    }
+    // ORDER BY items are resjunk targets, checked with the select list.
+    let out_names: Vec<&str> = s
+        .target_list
+        .iter()
+        .filter_map(|t| match t.node.as_ref() {
+            Some(N::ResTarget(rt)) if !rt.name.is_empty() => Some(rt.name.as_str()),
+            _ => None,
+        })
+        .collect();
+    for sb in &s.sort_clause {
+        if let Some(N::SortBy(b)) = sb.node.as_ref() {
+            if let Some(n) = b.node.as_deref() {
+                let output = matches!(n.node.as_ref(), Some(N::ColumnRef(c))
+                    if c.fields.len() == 1 && out_names.contains(&alias));
+                if !output {
+                    scan(n)?;
+                }
+            }
+        }
+    }
+    if let Some(h) = s.having_clause.as_deref() {
+        scan(h)?;
+    }
+    match found {
+        None => Ok(()),
+        Some(location) => {
+            if location >= 0 {
+                set_error_location(location);
+            }
+            Err(Error::Grouping(format!(
+                "column \"{alias}.*\" must appear in the GROUP BY clause or be used in an aggregate function"
+            )))
+        }
+    }
+}
+
 /// Rewrite whole-row references over a single FROM item into `ROW(...)`
 /// of its columns, the field NAMES kept in the RowExpr's `colnames` (which
 /// is where PostgreSQL itself keeps them for a whole-row Var).
@@ -42878,6 +43027,7 @@ fn whole_row_rewrite(
             }
             match lookup(&relation_name(r)) {
                 Some(def) => {
+                    check_ungrouped_whole_row(s, &alias, &def)?;
                     rowtype = Some(table_rowtype(relation_name(r)));
                     (alias, def.columns.iter().map(|c| c.name.clone()).collect())
                 }
