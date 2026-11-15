@@ -3477,24 +3477,6 @@ Measured on a private, freshly initdb'd PostgreSQL 15.19 cluster with the
       Verify: tests/backlog/test_rp_found_rp860.py::test_a_regtype_comparison_in_a_check_prints_its_oid_casts
       Backlog-ID: RP-941
 
-## Found while working RP-828 (2026-11-12)
-
-Measured on a private, freshly initdb'd PostgreSQL 15.19 cluster.
-
-
-
-- [ ] **A portal whose query fails as it runs takes no number.**
-      `SPI_cursor_open_internal` names an unnamed portal
-      (`CreateNewPortal`) before it runs the query, so on PostgreSQL 15.19
-      a FOR loop or an OPEN over `select a/0 from (values (1)) v(a)` that
-      fails, caught, leaves the next portal `<unnamed portal 2>`. Here the
-      rows are read before `register_portal` names the portal, so the next
-      one is `<unnamed portal 1>`. (A constant `1/0` fails in PostgreSQL's
-      planner, before the portal is named, and takes no number there
-      either.)
-      Verify: tests/backlog/test_rp_found_rp828.py::test_a_portal_that_fails_running_takes_its_number
-      Backlog-ID: RP-907
-
 ## Found while working RP-822 (2026-11-10)
 
 - [ ] **A DROP or ALTER FUNCTION signature's `%TYPE` names no type.**

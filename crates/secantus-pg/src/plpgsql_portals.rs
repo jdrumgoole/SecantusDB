@@ -49,6 +49,15 @@ impl PlHost<'_> {
         // body wrote before it (a FOR loop's query reads here, RP-828).
         let level = statement_views::StatementLevel::enter(self.h);
         let stmt = self.plan(sql, params, types)?;
+        // `SPI_cursor_open_internal` names an unnamed portal
+        // (`CreateNewPortal`) once the query is planned and before it
+        // runs, so a query that fails as it runs has taken its number
+        // (RP-907); a planning error has not.
+        let reserved = match name {
+            Some(_) => None,
+            None => Some(self.h.next_unnamed_portal()),
+        };
+        let name = name.or(reserved.as_deref());
         if dml.is_some() {
             let read = self.joined(|| {
                 self.atomic(|| {
@@ -157,6 +166,22 @@ impl PlHost<'_> {
 }
 
 impl PgHandler {
+    /// The next `<unnamed portal N>` no cursor holds, as `CreateNewPortal`
+    /// takes it: the number is spent whether or not the portal survives.
+    pub(crate) fn next_unnamed_portal(&self) -> String {
+        let cursors = self.cursors.lock().unwrap_or_else(|e| e.into_inner());
+        loop {
+            let n = self
+                .portal_seq
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                + 1;
+            let candidate = format!("<unnamed portal {n}>");
+            if !cursors.contains_key(&candidate) {
+                return candidate;
+            }
+        }
+    }
+
     /// Keep `rows` as the cursor `name` (or the next `<unnamed portal N>`),
     /// of the row type `(schema, domains)`: its wire description and the
     /// domain each column is of (RP-807).
@@ -169,20 +194,11 @@ impl PgHandler {
         scroll: bool,
         current_of: Option<CurrentOf>,
     ) -> PgWireResult<String> {
-        let mut cursors = self.cursors.lock().unwrap_or_else(|e| e.into_inner());
         let name = match name {
             Some(n) => n.to_string(),
-            None => loop {
-                let n = self
-                    .portal_seq
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-                    + 1;
-                let candidate = format!("<unnamed portal {n}>");
-                if !cursors.contains_key(&candidate) {
-                    break candidate;
-                }
-            },
+            None => self.next_unnamed_portal(),
         };
+        let mut cursors = self.cursors.lock().unwrap_or_else(|e| e.into_inner());
         if cursors.contains_key(&name) {
             return Err(Self::user_error(
                 "42P03",
