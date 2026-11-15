@@ -682,13 +682,17 @@ WITH_UNDER_FROM_AND_EXISTS = {
     "select (with w as (select nosuch) select 1) from (values (1)) v(a)": _missing("27"),
     "select exists (select 'x'::int)": (*_X_INPUT, "23"),
     "select exists (select (select 'x'::int))": (*_X_INPUT, "31"),
+    "select (with w as (select a) select 1) from (values (1)) v(a)": None,
+    "select (with w as (select v.a) select 1) from (values (1)) v(a)": None,
+    "select exists (select '1'::int, 'x'::text)": None,
 }
 
 
-@pytest.mark.backlog("RP-504")
+@pytest.mark.backlog_fixed("RP-504")
 @pytest.mark.parametrize("query", list(WITH_UNDER_FROM_AND_EXISTS))
 def test_with_under_from_and_exists_literal(query: str, rust_pg: Any) -> None:
-    """Each answers a row here."""
+    """Each with an error answered a row here: the unread item's missing
+    name was let go, and the dropped select list's literal was not read."""
     assert answer(rust_pg, query) == WITH_UNDER_FROM_AND_EXISTS[query]
 
 

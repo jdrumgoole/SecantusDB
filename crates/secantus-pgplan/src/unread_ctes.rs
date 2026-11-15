@@ -174,7 +174,7 @@ pub(crate) fn analyse_with(
 /// The first untyped string literal under a cast in `body`, in the order
 /// written and before `before` when that is given, whose type's input
 /// function refuses it: that refusal, placed at the literal.
-fn literal_input_error(
+pub(crate) fn literal_input_error(
     body: &pg_query::protobuf::SelectStmt,
     params: &[Bson],
     before: Option<i32>,

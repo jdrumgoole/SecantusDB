@@ -25957,6 +25957,16 @@ fn resolve_one_sublink(
     correlated::expand_outer_stars(&mut inner, lookup);
     if sl.sub_link_type == SubLinkType::ExistsSublink as i32 {
         analyse_exists_target_sublinks(&inner, lookup, params, outer.is_empty())?;
+        // `transformTargetList` reads a cast literal through its type's
+        // input function before `simplify_EXISTS_query` drops the list, so
+        // `exists (select 'x'::int)` is 22P02 (RP-504).
+        let list = pg_query::protobuf::SelectStmt {
+            target_list: inner.target_list.clone(),
+            ..Default::default()
+        };
+        if let Some(e) = unread_ctes::literal_input_error(&list, params, None) {
+            return Err(e);
+        }
         simplify_exists(&mut inner, lookup);
     }
     // Its system views expand first, as the statement's do, so the
@@ -25981,10 +25991,20 @@ fn resolve_one_sublink(
         // (RP-504), with the enclosing levels' CTEs in scope. An item is
         // planned on its own, where an enclosing level's column is not in
         // scope, so under a level with columns a name it does not find is
-        // left alone (the backlog's RP-504 remainder).
+        // let go only when an enclosing level could supply it: a bare column
+        // one of them exposes, a relation one of them names.
         if inner.with_clause.is_some() {
+            let enclosed = |e: &Error| match e {
+                Error::UndefinedColumn(c) => {
+                    c.contains('.') || ENCLOSING_COLUMNS.with(|e| e.borrow().iter().any(|n| n == c))
+                }
+                Error::UndefinedTable(t) => {
+                    OUTER_RELATIONS.with(|o| o.borrow().iter().any(|n| n == t))
+                }
+                _ => matches!(e.sqlstate(), "42703" | "42P01"),
+            };
             match unread_ctes::analyse(&with_visible_ctes(&inner)?, lookup, params) {
-                Err(e) if !outer.is_empty() && matches!(e.sqlstate(), "42703" | "42P01") => {
+                Err(e) if !outer.is_empty() && enclosed(&e) => {
                     take_error_location();
                 }
                 r => r?,
