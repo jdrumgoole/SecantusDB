@@ -566,19 +566,6 @@ These are explicit non-goals. Don't add them without a reason.
       **Decided (Joe, 2026-11-08): build mongod's execution admission control in full, the faithful option: the ingress controller, then the read and write ticket pools with `throughputProbing` (replacing `admission.rs`'s opt-in write tickets), then the per-command admission counts, so the concurrency cap is on by default as on mongod. Several PRs, in that order.** The ingress controller landed 2026-11-08, the ticket pools 2026-11-09, and the per-command admission counts on the line 2026-11-09; what is left is above.
       Backlog-ID: RM-355
       Verify: tests/backlog/test_rm_355_364.py::test_ending_a_transaction_takes_mongods_execution_tickets
-- [ ] **An aggregate through its cursor stage counts too few execution
-      admissions.** mongod 8.2.11 lets an aggregate's locks go once its
-      pipeline is built, so each buffer its cursor stage fills takes the
-      global IS and an execution ticket of its own: an `$addFields` over
-      300 documents read 50 at a time is `Global: {r: 3}` and 4 execution
-      admissions on the `aggregate` line (the build, two buffers, the
-      storage statistics). Since RM-360 this server takes the global IS for
-      each buffer too, and its line has mongod's `locks`, but it holds the
-      statement's own locks to the end of the command, so the buffers' IS
-      ride its ticket and the line says 2. Its `getMore`s, which take no
-      lock of their own, count mongod's. Found 2026-11-12 (RM-360).
-      Verify: tests/backlog/test_rm_found_2026_11_12_rm360.py::test_each_cursor_stage_buffer_takes_an_execution_ticket
-      Backlog-ID: RM-579
 - [ ] **Some writes' `locks` are not mongod's.** Since 2026-11-07 a write
       counts mongod's flow control tickets (one per global IX taken apart)
       and a retryable write's session checkout and session row, and a

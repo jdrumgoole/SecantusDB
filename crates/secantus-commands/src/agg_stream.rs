@@ -950,6 +950,7 @@ impl AggStream {
                         // the global IS, its ticket, and the check the
                         // lock's grant makes (RM-360).
                         if self.modelled {
+                            crate::lock_manager::let_statement_ticket_go();
                             crate::lock_manager::global_read()?;
                         }
                         self.buffer = Some(n * 2);

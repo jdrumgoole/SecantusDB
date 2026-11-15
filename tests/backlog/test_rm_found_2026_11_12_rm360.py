@@ -44,7 +44,7 @@ def _seed(db: Any) -> None:
     db.c.insert_many([{"_id": n, "x": n} for n in range(300)])
 
 
-@pytest.mark.backlog("RM-579")
+@pytest.mark.backlog_fixed("RM-579")
 def test_each_cursor_stage_buffer_takes_an_execution_ticket(
     rust_mongo: Any, mongod_rs: Any
 ) -> None:
@@ -52,8 +52,8 @@ def test_each_cursor_stage_buffer_takes_an_execution_ticket(
     stage counts an execution admission for each buffer it fills, as each
     takes the global IS apart from the command's own: 50 documents of an
     `$addFields` are two buffers (32 and 64), `Global: {r: 3}` and 4
-    admissions. This server takes the same locks, but its buffers' ride the
-    ticket of the locks the command holds to its end: 2."""
+    admissions. This server's buffers rode the ticket of the locks the
+    command held to its end, and counted 2, until RM-579."""
     answers = {}
     for name, client, is_mongod in (("mongod", mongod_rs, True), ("rust", rust_mongo, False)):
         with no_timed_yields(client):
