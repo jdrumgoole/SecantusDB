@@ -42,7 +42,7 @@ def _answer(dsn: str, query: str) -> object:
 _UNGROUPED = 'column "v.b" must appear in the GROUP BY clause or be used in an aggregate function'
 
 
-@pytest.mark.backlog("RP-853")
+@pytest.mark.backlog_fixed("RP-853")
 @pytest.mark.parametrize(
     ("query", "position"),
     [
@@ -56,10 +56,9 @@ def test_an_ungrouped_column_beside_a_subquery_is_42803(
 ) -> None:
     """`check_ungrouped_columns` reports `b`, neither grouped nor inside an
     aggregate, as 42803 naming it `v.b`, at the column, on PostgreSQL
-    15.19. Here a grouped query with a subquery in its select list is split
-    (`agg_hoist`) and `b` is read from the grouped FROM subquery, which
-    has no such column: 42703 `column "b" does not exist`, with a HINT
-    that `v` has one."""
+    15.19. A grouped query with a subquery in its select list was split
+    (`agg_hoist`) and `b` read from the grouped FROM subquery, which had
+    no such column: 42703 `column "b" does not exist`."""
     assert _answer(dsn, query) == ("error", "42803", _UNGROUPED, position)
 
 

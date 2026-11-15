@@ -496,15 +496,11 @@ pub(crate) fn split(
             "subquery uses ungrouped column \"{col}\" from outer query"
         ))),
         (stmt, None) => {
-            if !s.group_clause.is_empty() || has_aggregate(s) {
-                Ok(Some(stmt))
-            } else {
-                // Grouped only by an aggregate a subquery holds for it: an
-                // outer column read outside one is 42803 as for any other
-                // aggregate query.
-                check_stray(s, &stmt, Some(&Level::of(s, lookup)))?;
-                Ok(Some(stmt))
-            }
+            // An outer column the split's outer query still reads that is
+            // neither grouped nor aggregated is 42803, as PostgreSQL's
+            // `check_ungrouped_columns` reports it.
+            check_stray(s, &stmt, Some(&Level::of(s, lookup)))?;
+            Ok(Some(stmt))
         }
     }
 }
@@ -756,13 +752,21 @@ fn check_stray(
     if let Some(mut parts) = stray {
         if parts.len() == 1 {
             if let [only] = s.from_clause.as_slice() {
-                if let Some(N::RangeVar(rv)) = only.node.as_ref() {
-                    let q = rv
-                        .alias
-                        .as_ref()
-                        .map(|a| a.aliasname.clone())
-                        .unwrap_or_else(|| rv.relname.clone());
-                    parts.insert(0, q);
+                match only.node.as_ref() {
+                    Some(N::RangeVar(rv)) => {
+                        let q = rv
+                            .alias
+                            .as_ref()
+                            .map(|a| a.aliasname.clone())
+                            .unwrap_or_else(|| rv.relname.clone());
+                        parts.insert(0, q);
+                    }
+                    Some(N::RangeSubselect(rs)) => {
+                        if let Some(a) = rs.alias.as_ref() {
+                            parts.insert(0, a.aliasname.clone());
+                        }
+                    }
+                    _ => {}
                 }
             }
         }

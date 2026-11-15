@@ -1491,7 +1491,6 @@ batch, their tests regression tests:
       Verify: tests/backlog/test_rp_top10_found.py::test_a_btree_gin_index_has_its_pages
 
 
-
 ## Found by batch 71 (2026-10-25)
 
 Found while building REINDEX SCHEMA (RP-196), and fixed in the same batch;
@@ -3178,18 +3177,3 @@ statement is VALUES-only and runs there as written. The gap test is in
 `tests/backlog/test_rp_found_rp849.py`.
 
 
-## Found while working RP-700 (2026-11-10)
-
-Measured on PostgreSQL 15.19 (the shared reference on port 5415): every
-statement is VALUES-only and runs there as written.
-
-- [ ] **An ungrouped column beside a subquery in a grouped select list is
-      42703, not 42803.** `select b, (select 1) from (values (1, 2)) v(a,
-      b) group by a` is 42803 `column "v.b" must appear in the GROUP BY
-      clause or be used in an aggregate function` at 8 on PostgreSQL 15.19,
-      and `select (select v.a), b ... group by 1` the same at 22. Here each
-      is 42703 `column "b" does not exist`, with a HINT that `v` has one:
-      `agg_hoist::split` reads `b` from the grouped FROM subquery it builds,
-      and calls `check_stray` only for a query with no GROUP BY.
-      Verify: tests/backlog/test_rp_found_rp700.py::test_an_ungrouped_column_beside_a_subquery_is_42803
-      Backlog-ID: RP-853
