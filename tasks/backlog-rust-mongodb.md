@@ -655,17 +655,6 @@ These are explicit non-goals. Don't add them without a reason.
       (`hybrid.rs`). Found 2026-11-12 (RM-358).
       Verify: tests/backlog/test_rm_found_rm358.py::test_score_fusion_combines_by_avg
       Backlog-ID: RM-553
-- [ ] **A SORT_MERGE beside a null scan breaks a tie another way than
-      mongod.** mongod 8.2.11 answers `find({a: {$in: [7, "b", 5,
-      null]}}).sort({b: 1})` over `{a: 1, b: 1}` with `FETCH <- SORT_MERGE`
-      of four scans, and returns `_id` 14 (no `a`, from the null scan)
-      before 13 (`a: 7`), which tie on `b`: `[3, 14, 13, 17]`. This server
-      plans the same merge and returns `[3, 13, 14, 17]`. Without the null
-      in the `$in` the two agree. These are the three `order` replies of
-      `tools/probes/find_order.py` (step 100 over `{a: 1, b: 1}`, `{a: 1,
-      b: -1}` and `{a: -1, b: 1}`). Found 2026-11-12 (RM-477).
-      Verify: tests/backlog/test_rm_found_rm477.py::test_a_sort_merge_beside_a_null_scan_breaks_ties_as_mongod
-      Backlog-ID: RM-559
 - [ ] **`test_a_write_while_an_index_builds` reads mongod's answer off a
       5 ms lock wait.** `tests/mongod_live/test_txn_catalog_changes.py`
       asserts mongod 8.2.11 refuses a transaction's insert while an index

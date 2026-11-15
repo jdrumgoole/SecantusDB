@@ -80,6 +80,38 @@ pub fn pop_heap<T, F: Fn(&T, &T) -> bool>(v: &mut [T], less: &F) {
     }
 }
 
+/// libc++'s `std::pop_heap` (the macOS build's), which takes the hole to a
+/// leaf first, so of two equal children it can hand back the other one
+/// (RM-559). `std::__pop_heap`: `__floyd_sift_down` takes the root's hole
+/// to a leaf, each step to the greater child (the left one when they are
+/// equal); the last element fills the hole and `__sift_up` raises it. The
+/// root rides down in the hole by swaps, so no element is cloned.
+pub fn libcxx_pop_heap<T, F: Fn(&T, &T) -> bool>(v: &mut [T], less: &F) {
+    let len = v.len();
+    if len < 2 {
+        return;
+    }
+    let mut hole = 0;
+    let mut child = 0;
+    loop {
+        child = 2 * child + 1;
+        if child + 1 < len && less(&v[child], &v[child + 1]) {
+            child += 1;
+        }
+        v.swap(hole, child);
+        hole = child;
+        if child > (len - 2) / 2 {
+            break;
+        }
+    }
+    let last = len - 1;
+    if hole != last {
+        v.swap(hole, last);
+        // `__sift_up` over the `hole + 1` elements before the filled hole.
+        push_up(&mut v[..last], hole, 0, less);
+    }
+}
+
 fn make_heap<T, F: Fn(&T, &T) -> bool>(v: &mut [T], less: &F) {
     let len = v.len();
     if len < 2 {

@@ -525,7 +525,8 @@ mod tests {
     fn near_ties_come_in_the_queues_order() {
         // mongod 8.2.12's Linux build (libstdc++'s heap): four points at
         // distance 1 from a 2d `$near` at the origin come back 2, 1, 3, 0.
-        // The macOS build (libc++'s) answers 2, 3, 0, 1 (RM-231).
+        // The macOS build (libc++'s) answers 2, 3, 0, 1 (RM-231), which a
+        // macOS arm64 build of this server reproduces (RM-559).
         let docs: Vec<Document> = [[1, 0], [0, 1], [-1, 0], [0, -1]]
             .iter()
             .enumerate()
@@ -537,7 +538,12 @@ mod tests {
         let ix = flat_index();
         let base = vec![FieldBounds::Full];
         let order = near::near_order(&ix, &base, &near, &docs, &[true; 4]).unwrap();
-        assert_eq!(order, [2, 1, 3, 0]);
+        let want = if crate::stl::LIBCXX {
+            [2, 3, 0, 1]
+        } else {
+            [2, 1, 3, 0]
+        };
+        assert_eq!(order, want);
     }
 
     /// A collection the test writes to between reads.
