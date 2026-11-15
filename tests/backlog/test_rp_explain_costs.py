@@ -4471,16 +4471,45 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "        ->  Seq Scan on s",
         ],
     ),
-    # Two different constants equal to one column of a joined table make
-    # the class contradictory: the whole join is a false One-Time Filter
-    # (found while working RP-395).
+    # Two different constants equal to one column of a joined table made
+    # the class contradictory: the column's relation is dummy, and so the
+    # whole inner join, a bare false One-Time Filter (RP-400, fixed).
     "a join whose where equates a column to two constants": (
-        "RP-400",
+        "RP-400:fixed",
         _ANALYSED_THIRTY,
         "explain (costs off) select * from s join e on s.a < e.a where e.b = 'v1' and e.b = 'v2'",
         [
             "Result",
             "  One-Time Filter: false",
+        ],
+    ),
+    # The same through aliases and a comma join, the second constant on the
+    # left of its `=` (RP-400, fixed).
+    "a comma join of aliases whose where equates a column to two constants": (
+        "RP-400:fixed",
+        _ANALYSED_THIRTY,
+        "explain (costs off) select * from s x, e y where x.a < y.a and y.b = 'v1' and 'v2' = y.b",
+        [
+            "Result",
+            "  One-Time Filter: false",
+        ],
+    ),
+    # Still open: in a LEFT join's ON the class's `false` is a pseudoconstant
+    # gating the nullable side's scan, which keeps the first constant.
+    "a left join's on equating its nullable column to two constants": (
+        "RP-400",
+        _ANALYSED_THIRTY,
+        "explain (costs off) select * from s left join e"
+        " on s.a < e.a and e.b = 'v1' and e.b = 'v2'",
+        [
+            "Nested Loop Left Join",
+            "  Join Filter: (s.a < e.a)",
+            "  ->  Seq Scan on s",
+            "  ->  Materialize",
+            "        ->  Result",
+            "              One-Time Filter: false",
+            "              ->  Seq Scan on e",
+            "                    Filter: (b = 'v1'::text)",
         ],
     ),
     # Split from RP-390 (as RP-403) and fixed: a Hash Join whose scans each have their
@@ -5604,6 +5633,12 @@ def run(dsn: str, setup: list[str], query: str) -> list[str]:
 
 
 def _marked(name: str, item: str) -> Any:
+    # `RP-nnn:fixed` is a scenario of an item still open in part: the part
+    # fixed (`backlog` "Working an item" step 5).
+    if item.endswith(":fixed"):
+        return pytest.param(
+            name, marks=pytest.mark.backlog_fixed(item.removesuffix(":fixed")), id=name
+        )
     fixed = item in (
         "RP-314",
         "RP-920",

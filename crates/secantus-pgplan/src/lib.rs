@@ -12260,6 +12260,9 @@ fn plan_explain(
     // scan keeps the first constant, each other distinct one is a `false`
     // gate (RP-350). Only planned, never run: under ANALYZE the statement
     // executes as written.
+    if !options.analyze && !options.dummy_relation && join_const_contradiction(&query, lookup) {
+        options.dummy_relation = true;
+    }
     if !options.analyze && !options.dummy_relation {
         if let Some(n) = reduce_const_classes(&mut query, lookup) {
             options.one_time_false = n;
@@ -53721,6 +53724,151 @@ fn reduce_const_classes(query: &mut N, lookup: &dyn Fn(&str) -> Option<TableDef>
     };
     s.where_clause = Some(Box::new(new_where));
     Some(gates)
+}
+
+/// A join of relations reached through inner joins only, whose WHERE makes
+/// one column's equivalence class hold two distinct constants (RP-400).
+/// `generate_base_implied_equalities_const` gives the column's relation the
+/// folded `false` as its own restriction (the class's relids are that one
+/// relation), `relation_excluded_by_constraints` makes it dummy, and a dummy
+/// member of an inner join makes the join dummy: the plan is a bare
+/// `Result` with `One-Time Filter: false`. Only the integer and text
+/// constants `reduce_const_classes` models; a NULL or another type's
+/// constant is left to the plain plan.
+fn join_const_contradiction(query: &N, lookup: &dyn Fn(&str) -> Option<TableDef>) -> bool {
+    use pg_query::protobuf::JoinType as J;
+    use pg_query::protobuf::Node as PNode;
+    let N::SelectStmt(s) = query else {
+        return false;
+    };
+    // (name the query refers to it by, its definition)
+    fn relations(
+        n: &PNode,
+        lookup: &dyn Fn(&str) -> Option<TableDef>,
+        out: &mut Vec<(String, TableDef)>,
+    ) -> bool {
+        match n.node.as_ref() {
+            Some(N::RangeVar(rv)) => {
+                let Some(def) = lookup(&rv.relname) else {
+                    return false;
+                };
+                let name = rv
+                    .alias
+                    .as_ref()
+                    .map(|a| a.aliasname.clone())
+                    .unwrap_or_else(|| rv.relname.clone());
+                out.push((name, def));
+                true
+            }
+            Some(N::JoinExpr(j)) => {
+                J::try_from(j.jointype) == Ok(J::JoinInner)
+                    && j.larg.as_deref().is_some_and(|l| relations(l, lookup, out))
+                    && j.rarg.as_deref().is_some_and(|r| relations(r, lookup, out))
+            }
+            _ => false,
+        }
+    }
+    let mut rels = Vec::new();
+    for item in &s.from_clause {
+        if !relations(item, lookup, &mut rels) {
+            return false;
+        }
+    }
+    if rels.len() < 2 {
+        return false;
+    }
+    let Some(where_clause) = s.where_clause.as_deref() else {
+        return false;
+    };
+    fn flatten<'a>(n: &'a PNode, out: &mut Vec<&'a PNode>) {
+        match n.node.as_ref() {
+            Some(N::BoolExpr(b)) if b.boolop == BoolExprType::AndExpr as i32 => {
+                for a in &b.args {
+                    flatten(a, out);
+                }
+            }
+            _ => out.push(n),
+        }
+    }
+    let mut parts = Vec::new();
+    flatten(where_clause, &mut parts);
+    // A column reference resolved to (relation index, column, its type).
+    let column = |n: Option<&PNode>| -> Option<(usize, String, String)> {
+        let Some(N::ColumnRef(c)) = n.and_then(|n| n.node.as_ref()) else {
+            return None;
+        };
+        let names: Vec<&str> = c
+            .fields
+            .iter()
+            .map(|f| match f.node.as_ref() {
+                Some(N::String(s)) => Some(s.sval.as_str()),
+                _ => None,
+            })
+            .collect::<Option<_>>()?;
+        let (qual, col) = match names.as_slice() {
+            [col] => (None, *col),
+            [t, col] => (Some(*t), *col),
+            _ => return None,
+        };
+        let mut hits = rels.iter().enumerate().filter(|(_, (name, def))| {
+            qual.is_none_or(|q| q == name) && def.columns.iter().any(|c| c.name == col)
+        });
+        let (i, (_, def)) = hits.next()?;
+        if hits.next().is_some() {
+            return None;
+        }
+        let ty = def.columns.iter().find(|c| c.name == col)?.pg_type.clone();
+        Some((
+            i,
+            col.to_string(),
+            ty.trim_start_matches("pg_catalog.").to_string(),
+        ))
+    };
+    #[derive(PartialEq)]
+    enum Value {
+        Int(i64),
+        Text(String),
+    }
+    let constant = |n: Option<&PNode>, ty: &str| -> Option<Value> {
+        let Some(N::AConst(c)) = n.and_then(|n| n.node.as_ref()) else {
+            return None;
+        };
+        if c.isnull {
+            return None;
+        }
+        let integer = matches!(ty, "int2" | "int4" | "int8");
+        match c.val.as_ref() {
+            Some(a_const::Val::Ival(v)) if integer => Some(Value::Int(i64::from(v.ival))),
+            Some(a_const::Val::Sval(v)) if integer => v.sval.trim().parse().ok().map(Value::Int),
+            Some(a_const::Val::Sval(v)) if ty == "text" => Some(Value::Text(v.sval.clone())),
+            _ => None,
+        }
+    };
+    let mut classes: Vec<((usize, String), Value)> = Vec::new();
+    for p in parts {
+        let Some(N::AExpr(e)) = p.node.as_ref() else {
+            continue;
+        };
+        if e.kind != AExprKind::AexprOp as i32 || operator_name(e).ok() != Some("=") {
+            continue;
+        }
+        let (l, r) = (e.lexpr.as_deref(), e.rexpr.as_deref());
+        let (col, other) = match (column(l), column(r)) {
+            (Some(c), None) => (c, r),
+            (None, Some(c)) => (c, l),
+            _ => continue,
+        };
+        let Some(value) = constant(other, &col.2) else {
+            continue;
+        };
+        let key = (col.0, col.1);
+        match classes.iter().find(|(k, _)| *k == key) {
+            Some((_, v)) if *v != value => return true,
+            Some(_) => {}
+            None => classes.push((key, value)),
+        }
+    }
+    false
 }
 
 /// A statement over ONE relation: its WHERE's `OR` conjuncts' arms for
