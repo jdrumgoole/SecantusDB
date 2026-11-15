@@ -2318,7 +2318,18 @@ impl Interp<'_> {
             .unwrap_or(Bson::Null);
         match (ty, length) {
             (Some(ty), Some((base, typmod))) => {
-                let v = self.host.fit_assigned(v, &base, typmod)?;
+                // The length coercion is part of an assignment's query
+                // (`transformPLAssignStmt`): over a constant it folds while
+                // the query is planned, and its error is framed by the
+                // assignment; over a variable it runs in the simple
+                // expression path, which frames nothing (RP-752).
+                let planned = matches!(mode, 3..=5)
+                    && select_target(&format!("SELECT {body}"))
+                        .is_some_and(|n| expression_folds(&n));
+                let v = self.host.fit_assigned(v, &base, typmod).map_err(|mut e| {
+                    e.from_sql |= planned;
+                    e.with_sql_frame(|| bind_frame(text, mode))
+                })?;
                 let out = self.host.query(
                     &format!("SELECT $1::{}", sql_type(&ty)),
                     &[v],

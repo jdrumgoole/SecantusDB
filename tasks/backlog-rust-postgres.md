@@ -2713,17 +2713,6 @@ dv687, c char(3))`, `d687` an `int` with `check (value > 0)` and `dv687` a
 Measured on PostgreSQL 15.19 (port 5415) with statements that create
 nothing. The gap tests are in `tests/backlog/test_rp_found_rp712.py`.
 
-- [ ] **An assignment's overlong `varchar(n)` value is 22001 with no
-      assignment frame.** `declare x varchar(3); begin x := 'abcdef'::text;`
-      carries CONTEXT `PL/pgSQL assignment "x := 'abcdef'::text"` above the
-      `at assignment` line on PostgreSQL 15.19: the length coercion is part
-      of the assignment's query and folds as it is planned. Here only the
-      `at assignment` line is sent: `fit_assigned` raises outside the
-      framed query. The same holds for an element of a `varchar(3)[]`
-      (`x[1] := 'abcdef'`, framed `PL/pgSQL assignment "x[1] :=
-      'abcdef'"` on 15.19) and for a slice (`x[1:1] := array['abcd']`).
-      Verify: tests/backlog/test_rp_found_rp712.py::test_overlong_varchar_assignment_is_framed_by_the_assignment
-      Backlog-ID: RP-752
 - [ ] **An assignment's `json` / `jsonb` literal input error carries no
       internal query.** `declare x jsonb; begin x := 'zz';` carries `x :=
       'zz'` as its internal query (position 6) and CONTEXT `JSON data, line

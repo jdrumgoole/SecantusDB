@@ -219,14 +219,39 @@ def test_money_variable_prints_through_cash_out(query: str, dsn: str) -> None:
     assert _answer(dsn, query) == ("ok", ["$5.25"])
 
 
-@pytest.mark.backlog("RP-752")
-def test_overlong_varchar_assignment_is_framed_by_the_assignment(dsn: str) -> None:
-    query = "do $$ declare x varchar(3); begin x := 'abcdef'::text; end $$"
+_FRAMED = 'PL/pgSQL assignment "{}"\n' + _AT_ASSIGNMENT
+
+
+@pytest.mark.backlog_fixed("RP-752")
+@pytest.mark.parametrize(
+    ("declare", "body", "context"),
+    [
+        ("x varchar(3)", "x := 'abcdef'::text", _FRAMED.format("x := 'abcdef'::text")),
+        ("x varchar(3)", "x := 'abc' || 'def'", _FRAMED.format("x := 'abc' || 'def'")),
+        ("x varchar(3)[]", "x[1] := 'abcdef'", _FRAMED.format("x[1] := 'abcdef'")),
+        (
+            "x varchar(3)[]",
+            "x[1:1] := array['abcd']",
+            _FRAMED.format("x[1:1] := array['abcd']"),
+        ),
+        # Over a variable the coercion runs in the simple expression path,
+        # which frames nothing.
+        ("y text := 'abcdef'; x varchar(3)", "x := y", _AT_ASSIGNMENT),
+        ("y text := 'abcdef'; x varchar(3)[]", "x[1] := y", _AT_ASSIGNMENT),
+    ],
+)
+def test_overlong_varchar_assignment_is_framed_by_the_assignment(
+    declare: str, body: str, context: str, dsn: str
+) -> None:
+    """An overlong varchar(n) assignment over a constant was sent with no
+    assignment frame: its length coercion folds while the assignment's
+    query is planned, so PostgreSQL 15.19 frames it."""
+    query = f"do $$ declare {declare}; begin {body}; end $$"
     assert _answer(dsn, query) == (
         "error",
         "22001",
         "value too long for type character varying(3)",
-        "PL/pgSQL assignment \"x := 'abcdef'::text\"\n" + _AT_ASSIGNMENT,
+        context,
         None,
     )
 
