@@ -2016,19 +2016,6 @@ a regression test.
       (found while working RP-404 and RP-354).
       Verify: tests/backlog/test_rp_explain_costs.py::test_plan[estimate of a function call compared with a constant], tests/backlog/test_rp_explain_costs.py::test_plan[estimate of a join over a scan filtered by a LIKE], tests/backlog/test_rp_explain_costs.py::test_plan[estimate of a LIKE over an expression], tests/backlog/test_rp_explain_costs.py::test_plan[estimate of a LIKE over a table never analysed], tests/backlog/test_rp_explain_costs.py::test_plan[estimate of a regex match over a table never analysed], tests/backlog/test_rp_explain_costs.py::test_plan[estimate of a join over a scan filtered by a regex match]
       Backlog-ID: RP-423
-- [ ] **A LIKE with an ESCAPE clause prints a `like_escape` call and is
-      not estimated.** PostgreSQL folds `like_escape(pattern, escape)` of
-      two constants into the pattern rewritten with the default escape
-      (`eval_const_expressions`), which `patternsel` then estimates:
-      PostgreSQL 15.19 prints `explain select * from e where b like 'v1!%'
-      escape '!'` (`e` analysed, 1000 rows) as `Seq Scan on e
-      (cost=0.00..17.50 rows=1 width=7)` with `Filter: (b ~~
-      'v1\%'::text)`; here `Filter: (b ~~ like_escape('v1!%'::text,
-      '!'::text))` and zero costs. The same in a nested loop's Join Filter.
-      Its rows are right. Measured on a private 15.19 cluster (found while
-      working RP-354).
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a like with an escape clause is a folded pattern]
-      Backlog-ID: RP-915
 - [ ] **A table whose only index is a composite one prices no scan of
       both its columns.** `create table t2 (a int, b int, c text)`, 5,000
       rows, `create index t2_ab on t2 (a, b)`, analysed: PostgreSQL 15.19
@@ -2127,16 +2114,6 @@ a regression test.
       working RP-409).
       Verify: tests/backlog/test_rp_explain_costs.py::test_plan[an aggregate over a dummy relation is priced], tests/backlog/test_rp_explain_costs.py::test_plan[a dummy join keeps its width]
       Backlog-ID: RP-420
-- [ ] **A COALESCE's constant arguments print unfolded.** PostgreSQL
-      15.19's `eval_const_expressions` drops a COALESCE's NULL arguments
-      and stops at its first non-NULL constant: `select * from e where
-      coalesce(null, a) = 1` is `Filter: (COALESCE(a) = 1)`, and
-      `coalesce(1, a) = 1` folds to true, a `Seq Scan on e` with no Filter.
-      Here `(COALESCE(NULL::integer, a) = 1)` and `(COALESCE(1, a) = 1)`.
-      Its rows are right. Measured on a private 15.19 cluster (found while
-      working RP-409).
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a coalesce drops its null arguments], tests/backlog/test_rp_explain_costs.py::test_plan[a coalesce of a constant first folds]
-      Backlog-ID: RP-421
 - [ ] **EXPLAIN of a plain FROM-subquery prints a Subquery Scan
       PostgreSQL pulls up.** `pull_up_subqueries` merges a simple subquery
       into its parent: `select * from (select * from e where a > 5) s` is

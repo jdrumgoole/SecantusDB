@@ -268,6 +268,14 @@ fn numeric_meet(a: &str, b: &str) -> Option<(&'static str, bool)> {
     })
 }
 
+/// ruleutils' `simple_quote_literal` under `standard_conforming_strings`
+/// (always on here): quotes doubled, a backslash left as it is and no `E`
+/// prefix. `quote_literal()` the SQL function is the one that writes
+/// `E'...'` (RP-915).
+fn simple_quote_literal(text: &str) -> String {
+    format!("'{}'", text.replace('\'', "''"))
+}
+
 /// The cast an operand of type `t` takes to an operator over `meet`
 /// ([`numeric_meet`]): none when it is that type, and none for a `real`
 /// meeting `double precision`, which the cross-type operators
@@ -1078,7 +1086,7 @@ impl<'a> Printer<'a> {
                             "int4" => self.const_number(&text, want),
                             _ => self.buf.push_str(&format!(
                                 "{}::{}",
-                                crate::scalar::quote_literal(&text),
+                                simple_quote_literal(&text),
                                 display_type(want)
                             )),
                         }
@@ -1222,7 +1230,7 @@ impl<'a> Printer<'a> {
                             };
                             self.buf.push_str(&format!(
                                 "{}::{}",
-                                crate::scalar::quote_literal(&text),
+                                simple_quote_literal(&text),
                                 display_type(t)
                             ));
                         }
@@ -1232,7 +1240,7 @@ impl<'a> Printer<'a> {
                                 .ok()?;
                             self.buf.push_str(&format!(
                                 "{}::interval",
-                                crate::scalar::quote_literal(&crate::value_text(&v))
+                                simple_quote_literal(&crate::value_text(&v))
                             ));
                         }
                         // An array constant prints as `array_out` gives it
@@ -1245,7 +1253,7 @@ impl<'a> Printer<'a> {
                             };
                             self.buf.push_str(&format!(
                                 "{}::{}",
-                                crate::scalar::quote_literal(&text),
+                                simple_quote_literal(&text),
                                 display_type(t)
                             ));
                         }
@@ -1254,12 +1262,12 @@ impl<'a> Printer<'a> {
                             let v = crate::json::parse(&lit).ok()?;
                             self.buf.push_str(&format!(
                                 "{}::jsonb",
-                                crate::scalar::quote_literal(&crate::json::render_jsonb(&v))
+                                simple_quote_literal(&crate::json::render_jsonb(&v))
                             ));
                         }
                         _ => self.buf.push_str(&format!(
                             "{}::{}",
-                            crate::scalar::quote_literal(&lit),
+                            simple_quote_literal(&lit),
                             display_type(t)
                         )),
                     }
@@ -1314,7 +1322,7 @@ impl<'a> Printer<'a> {
                 }
                 Some(Val::Sval(s)) => self
                     .buf
-                    .push_str(&format!("{}::text", crate::scalar::quote_literal(&s.sval))),
+                    .push_str(&format!("{}::text", simple_quote_literal(&s.sval))),
                 Some(Val::Bsval(_)) => return None,
             },
             N::TypeCast(tc) => {
@@ -1332,7 +1340,7 @@ impl<'a> Printer<'a> {
                             if let Some(Val::Sval(s)) = ac.val.as_ref() {
                                 self.buf.push_str(&format!(
                                     "{}::{label}",
-                                    crate::scalar::quote_literal(&s.sval)
+                                    simple_quote_literal(&s.sval)
                                 ));
                                 return Some(());
                             }
@@ -1351,10 +1359,9 @@ impl<'a> Printer<'a> {
                     if let Some(text) = folded_numeric_cast(arg, &target) {
                         match target.as_str() {
                             "int4" => self.const_number(&text, &target),
-                            _ => self.buf.push_str(&format!(
-                                "{}::{label}",
-                                crate::scalar::quote_literal(&text)
-                            )),
+                            _ => self
+                                .buf
+                                .push_str(&format!("{}::{label}", simple_quote_literal(&text))),
                         }
                         return Some(());
                     }
@@ -2050,7 +2057,7 @@ impl<'a> Printer<'a> {
                     Some(N::AConst(c)) if matches!(c.val, Some(Val::Sval(_)) | None) => {
                         match c.val.as_ref() {
                             Some(Val::Sval(sv)) => {
-                                self.buf.push_str(&crate::scalar::quote_literal(&sv.sval))
+                                self.buf.push_str(&simple_quote_literal(&sv.sval))
                             }
                             _ => self.buf.push_str("NULL"),
                         }
@@ -2260,9 +2267,7 @@ impl<'a> Printer<'a> {
                     return None;
                 };
                 match c.val.as_ref() {
-                    Some(Val::Sval(sv)) => {
-                        self.buf.push_str(&crate::scalar::quote_literal(&sv.sval))
-                    }
+                    Some(Val::Sval(sv)) => self.buf.push_str(&simple_quote_literal(&sv.sval)),
                     None => self.buf.push_str("NULL"),
                     _ => return None,
                 }

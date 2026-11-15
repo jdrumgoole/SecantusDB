@@ -5078,6 +5078,38 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
         "explain (costs off) select * from k where not (a > 5 or a < 3)",
         ["Index Scan using k_pkey on k", "  Index Cond: ((a <= 5) AND (a >= 3))"],
     ),
+    # More of `eval_const_expressions` over a COALESCE and a LIKE's
+    # ESCAPE, measured on PostgreSQL 15.19 (RP-421, RP-915).
+    "a coalesce ends at its first non-null constant": (
+        "RP-421",
+        _ANALYSED,
+        "explain (costs off) select * from e where coalesce(a, 2, b::int) = 1",
+        ["Seq Scan on e", "  Filter: (COALESCE(a, 2) = 1)"],
+    ),
+    "a coalesce of only nulls is a false one-time filter": (
+        "RP-421",
+        _ANALYSED,
+        "explain (costs off) select * from e where coalesce(null::int, null) = 1",
+        ["Result", "  One-Time Filter: false"],
+    ),
+    "a like with an empty escape doubles its backslashes": (
+        "RP-915",
+        _ANALYSED,
+        "explain (costs off) select * from e where b like 'a\\\\b' escape ''",
+        ["Seq Scan on e", "  Filter: (b ~~ 'a\\\\\\\\b'::text)"],
+    ),
+    "a join scan's like with an escape clause is a folded pattern": (
+        "RP-915",
+        _ANALYSED_THIRTY,
+        "explain (costs off) select * from e join s on e.b like 'v1!%' escape '!' and s.a < e.a",
+        [
+            "Nested Loop",
+            "  Join Filter: (s.a < e.a)",
+            "  ->  Seq Scan on e",
+            "        Filter: (b ~~ 'v1\\%'::text)",
+            "  ->  Seq Scan on s",
+        ],
+    ),
     "a scan filter's coerced constant is folded": (
         "RP-407",
         _ANALYSED,
@@ -5657,6 +5689,8 @@ def _marked(name: str, item: str) -> Any:
         "RP-407",
         "RP-917",
         "RP-412",
+        "RP-421",
+        "RP-915",
     )
     mark = pytest.mark.backlog_fixed if fixed else pytest.mark.backlog
     return pytest.param(name, marks=mark(item), id=name)
