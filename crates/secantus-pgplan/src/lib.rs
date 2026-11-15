@@ -6281,7 +6281,16 @@ fn plan_node(
         {
             subscriptions::plan_rename(&r)
         }
-        N::RenameStmt(r) => plan_rename(&r),
+        N::RenameStmt(mut r) => {
+            if routine_object_type(r.rename_type) {
+                if let Some(N::ObjectWithArgs(ow)) =
+                    r.object.as_deref_mut().and_then(|o| o.node.as_mut())
+                {
+                    resolve_signature_types(ow, lookup)?;
+                }
+            }
+            plan_rename(&r)
+        }
         N::AlterDatabaseStmt(a) => {
             let mut options = Vec::new();
             for o in &a.options {
@@ -6372,7 +6381,16 @@ fn plan_node(
             plan_create_table_as(&c, lookup, params)
         }
         N::SelectStmt(s) => plan_select(&s, lookup, params),
-        N::DropStmt(d) => plan_drop(&d),
+        N::DropStmt(mut d) => {
+            if routine_object_type(d.remove_type) {
+                for o in &mut d.objects {
+                    if let Some(N::ObjectWithArgs(ow)) = o.node.as_mut() {
+                        resolve_signature_types(ow, lookup)?;
+                    }
+                }
+            }
+            plan_drop(&d)
+        }
         N::CommentStmt(c) => plan_comment(&c),
         N::CreatePolicyStmt(c) => Ok(Statement::Policy(PolicyChange::Create {
             name: c.policy_name.clone(),
@@ -6727,7 +6745,12 @@ fn plan_node(
         }
         N::CreateFunctionStmt(f) => plan_create_function(&f, lookup),
         N::CallStmt(c) => plan_call(&c, params),
-        N::AlterFunctionStmt(a) => alter_routine::plan_alter(&a),
+        N::AlterFunctionStmt(mut a) => {
+            if let Some(ow) = a.func.as_mut() {
+                resolve_signature_types(ow, lookup)?;
+            }
+            alter_routine::plan_alter(&a)
+        }
         N::AlterObjectSchemaStmt(a) if alter_routine::plan_set_schema(&a).is_some() => {
             alter_routine::plan_set_schema(&a).expect("checked")
         }
@@ -7912,6 +7935,31 @@ fn resolve_routine_types(
         check_routine_types(&f)?;
     }
     Ok(f)
+}
+
+/// Whether a DROP or RENAME names a function, procedure or routine.
+fn routine_object_type(t: i32) -> bool {
+    matches!(
+        ObjectType::try_from(t),
+        Ok(ObjectType::ObjectFunction | ObjectType::ObjectProcedure | ObjectType::ObjectRoutine)
+    )
+}
+
+/// `LookupFuncWithArgs` looks each argument type of a signature up with
+/// `LookupTypeName`, so a `%TYPE` there is its column's type, with the
+/// NOTICE CREATE FUNCTION gives (RP-830).
+fn resolve_signature_types(
+    ow: &mut pg_query::protobuf::ObjectWithArgs,
+    lookup: &dyn Fn(&str) -> Option<TableDef>,
+) -> Result<()> {
+    for a in &mut ow.objargs {
+        if let Some(N::TypeName(tn)) = a.node.as_mut() {
+            if tn.pct_type {
+                *tn = plpgsql_pct_type::routine_percent_type(tn, lookup)?;
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Why a PL/pgSQL DECLARE's type was refused: by the type lookup

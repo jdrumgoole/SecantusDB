@@ -3179,21 +3179,6 @@ Measured on a private, freshly initdb'd PostgreSQL 15.19 cluster with the
       Verify: tests/backlog/test_rp_found_rp860.py::test_a_regtype_comparison_in_a_check_prints_its_oid_casts
       Backlog-ID: RP-941
 
-## Found while working RP-822 (2026-11-10)
-
-- [ ] **A DROP or ALTER FUNCTION signature's `%TYPE` names no type.**
-      `drop function f(t.v%type)` and `alter function f(t.v%type) rename
-      to g` over a `varchar(3)` column find `f(varchar)` on PostgreSQL
-      15.19 (`LookupFuncWithArgs` looks each argument type up with
-      `LookupTypeName`), with the NOTICE `type reference t.v%TYPE
-      converted to character varying`. Here the DROP is 42704 `type "t.v"
-      does not exist` and the ALTER 42883 `function f(t.v) does not
-      exist`. CREATE FUNCTION resolves one since RP-822
-      (`plpgsql_pct_type::routine_percent_type`), which a signature's
-      lookup can reuse.
-      Verify: tests/backlog/test_rp_found_rp822.py::test_a_signatures_percent_type_is_resolved
-      Backlog-ID: RP-830
-
 ## Found while working RP-751 (2026-11-10)
 
 Measured on PostgreSQL 15.19; none of it needs DDL. The gap tests are in
