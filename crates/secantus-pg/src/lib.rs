@@ -6042,6 +6042,20 @@ impl PgHandler {
         secantus_pgplan::view_dml::set_view_defaults(self.view_column_defaults());
         self.publish_tableoids();
         secantus_pgplan::regobj::set_namespaces(self.namespaces());
+        // Before the functions: `set_procs` splits an argument's type key
+        // (`s567.t`) by the schemas published here.
+        secantus_pgplan::schemas::set_user_schemas(
+            self.namespaces()
+                .into_iter()
+                .map(|(n, _)| n)
+                .filter(|n| {
+                    !matches!(
+                        n.as_str(),
+                        "public" | "pg_catalog" | "information_schema" | "pg_toast"
+                    )
+                })
+                .collect(),
+        );
         // A role the open block created is named by `::regrole` in that
         // block, as PostgreSQL's syscache sees its own transaction's rows.
         let roles = if self.block_wrote_catalog() {
@@ -6470,18 +6484,6 @@ impl PgHandler {
             self.user_access_methods()
                 .into_iter()
                 .map(|a| (a.name, a.kind))
-                .collect(),
-        );
-        secantus_pgplan::schemas::set_user_schemas(
-            self.namespaces()
-                .into_iter()
-                .map(|(n, _)| n)
-                .filter(|n| {
-                    !matches!(
-                        n.as_str(),
-                        "public" | "pg_catalog" | "information_schema" | "pg_toast"
-                    )
-                })
                 .collect(),
         );
         // An index the open block created is a relation in that block (its
