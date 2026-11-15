@@ -18,6 +18,7 @@ mod agg_hoist;
 mod agg_support;
 pub mod deferred;
 mod domain_scope;
+mod record_image;
 pub use domain_scope::{select_output_domains, select_target_domain};
 mod targetlist_size;
 pub use targetlist_size::MAX_HEAP_ATTRIBUTE_NUMBER;
@@ -33345,6 +33346,8 @@ fn static_type_uncached(node: &pg_query::protobuf::Node, value: &Bson) -> String
                     }
                 }
                 "=" | "<>" | "!=" | "<" | "<=" | ">" | ">=" => "bool".to_string(),
+                // `record_image_eq` .. `record_image_ge` (RP-650).
+                op if record_image::is_image_operator(op) => "bool".to_string(),
                 // LIKE / ILIKE / the regex match operators: a boolean, NULL
                 // operand or not (`'a' LIKE $1` at Describe time).
                 op if pattern_operator(op).is_some() && e.lexpr.is_some() => "bool".to_string(),
@@ -50127,6 +50130,13 @@ fn const_value_node(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result<
                     rhs = trim_bpchar_deep(read(rhs));
                 }
             }
+        }
+        // The `record_image` operators compare two record values by their
+        // fields' binary images (RP-650).
+        if record_image::is_image_operator(&op)
+            && (record_fields(&lhs).is_some() || record_fields(&rhs).is_some())
+        {
+            return record_image::compare(&op, &lhs, &rhs);
         }
         // Two records compare with rules that depend on whether each side is a
         // ROW CONSTRUCTOR or a composite VALUE (see record_compare). Only the

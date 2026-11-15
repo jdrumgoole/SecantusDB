@@ -2615,17 +2615,18 @@ gap tests are in `tests/backlog/test_rp_found_rp532.py`.
 Measured on a private PostgreSQL 15.19 cluster with the `_SETUP` in
 `tests/backlog/test_rp_found_rp590.py`.
 
-- [ ] **The `record_image` operators are refused.** `*=`, `*<>`, `*<`,
-      `*<=`, `*>` and `*>=` over two record values are `record_image_eq`
-      .. `record_image_ge` on PostgreSQL 15.19, which compare the fields'
-      binary images: `(select row(1.0)) *= (select row(1.00))` is `f` where
-      `=` is `t`, and `row(1, 'a')::ca *= row(1, 'a')::cd` is `t`. Between
-      two `ROW(...)` constructors the operator is applied field by field
-      (`make_row_comparison_op`), so `row(1) *= row(1)` is 42883 `operator
-      does not exist: integer *= integer` at 15. Here each is 0A000
-      `operator *= on these operands is not supported yet`.
-      Verify: tests/backlog/test_rp_found_rp590.py::test_record_image_operators
-      Backlog-ID: RP-650
+- [ ] **The `record_image` operators refuse most field types.** `*=` ..
+      `*>=` compare a record's fields by their binary images since RP-650,
+      but only for int2 / int4 / int8 / oid / bool / float4 / float8 /
+      numeric / text / varchar / bpchar / bytea fields. `(select
+      row('2024-01-02'::date)) *< (select row('2024-01-03'::date))` is `t`
+      on PostgreSQL 15.19 (a date is its int32 day number), and a uuid
+      compares its 16 bytes; here each is 0A000 `a record_image comparison
+      over a field of type date is not supported yet`. Every other type
+      needs its datum's image modelled (`record_image_cmp`: by-value words,
+      fixed-length by-reference bytes, varlena data).
+      Verify: tests/backlog/test_rp_found_rp590.py::test_record_image_over_other_field_types
+      Backlog-ID: RP-976
 
 ## Found while working RP-569 (2026-11-08)
 

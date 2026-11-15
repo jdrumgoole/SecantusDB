@@ -1333,6 +1333,22 @@ fn check_aexpr(e: &pg_query::protobuf::AExpr, scope: &Scope) -> Result<()> {
             }
         }
     }
+    // Between two ROW constructors a `record_image` operator is each
+    // pair's (`make_row_comparison_op`): `row(1) *= row(1)` looks for
+    // `integer *= integer`, which does not exist (RP-650).
+    if kind == Some(K::AexprOp) && crate::record_image::is_image_operator(&op) {
+        if let (Some(N::RowExpr(lr)), Some(N::RowExpr(rr))) = (
+            e.lexpr.as_deref().and_then(|n| n.node.as_ref()),
+            e.rexpr.as_deref().and_then(|n| n.node.as_ref()),
+        ) {
+            if lr.args.len() == rr.args.len() {
+                if let (Some(a), Some(b)) = (lr.args.first(), rr.args.first()) {
+                    let ty = |n| operand_type(n, scope).unwrap_or_else(|| "unknown".into());
+                    return Err(mismatch(&op, &ty(a), &ty(b), e.location));
+                }
+            }
+        }
+    }
     // A ROW beside a typed operand that is not one: no operator (RP-530).
     if matches!(
         kind,
