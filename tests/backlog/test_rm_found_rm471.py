@@ -50,12 +50,14 @@ YX = [("y", 1), ("x", 1)]
 XY = [("x", 1), ("y", 1)]
 
 
-@pytest.mark.backlog("RM-569")
+@pytest.mark.backlog_fixed("RM-569")
 def test_covered_fields_come_back_in_the_key_patterns_order(rust_mongo: Any, mongod: Any) -> None:
     """mongod 8.2.11 builds a covered row from the index key, so its fields
     come in the key pattern's order: `{_id: 0, x: 1, y: 1}` over `{y: 1,
     x: 1}` returns `{y: .., x: ..}`, from one scan or an `$or` of them.
-    This server returns them in the document's order, `{x: .., y: ..}`."""
+    This server returned them in the document's order, `{x: .., y: ..}`,
+    until a row a covered plan answers from a key took the key pattern's
+    order (2026-11-15)."""
     commands = {
         "one scan": {"find": "c", "filter": {"y": 0}, "projection": {"_id": 0, "x": 1, "y": 1}},
         "or": {

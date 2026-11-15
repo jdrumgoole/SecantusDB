@@ -728,15 +728,6 @@ These are explicit non-goals. Don't add them without a reason.
       (RM-472).
       Verify: tests/backlog/test_rm_found_rm472.py::test_a_near_read_explains_as_geo_near_2d
       Backlog-ID: RM-578
-- [ ] **Covered fields come back in the projection's order, not the key's.**
-      mongod 8.2.11 builds a covered row from the index key, so `{_id: 0,
-      x: 1, y: 1}` over `{y: 1, x: 1}` returns `{y: .., x: ..}`, from one
-      scan (`PROJECTION_COVERED`) or an `$or` of them (`PROJECTION_DEFAULT`
-      over the OR; a fetched branch's rows keep the document's order). This
-      server returns every row in the document's order, `{x: .., y: ..}`:
-      a field order a client sees. Found 2026-11-12 (RM-471).
-      Verify: tests/backlog/test_rm_found_rm471.py::test_covered_fields_come_back_in_the_key_patterns_order
-      Backlog-ID: RM-569
 - [ ] **A computed projection over index keys fetches.** mongod 8.2.11
       answers `{_id: 0, x: 1, k: {$add: ["$x", 1]}}` from the keys of
       `{y: 1, x: 1}` (`PROJECTION_DEFAULT <- IXSCAN`; over an `$or`, no
