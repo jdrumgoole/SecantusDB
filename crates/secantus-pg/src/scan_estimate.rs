@@ -1647,6 +1647,20 @@ impl PgHandler {
         Some((outer.field, inner.field.clone(), inner.read))
     }
 
+    /// A Hash node's input, a bare Seq Scan of `table` reading `read`
+    /// and hashing on `field`, priced as `hash_side` prices a join's
+    /// side: the rows and width `ExecChooseHashTableSize` sizes the table
+    /// from, where the plan above it is not priced (RP-390).
+    pub(crate) fn bare_hash_input_estimate(
+        &self,
+        table: &str,
+        field: &str,
+        read: &[String],
+    ) -> Option<Estimate> {
+        let side = self.hash_side(table, &Document::new(), field, read, read)?;
+        side.index.is_none().then_some(side.scan)
+    }
+
     pub(crate) fn hash_join_estimate(&self, sel: &secantus_pgplan::Select) -> Option<JoinEstimate> {
         let (a, b, more, filter, left_join) = self.joined_sides(sel)?;
         // A WHERE conjunct pushed into a side's scan (RP-365) is priced as

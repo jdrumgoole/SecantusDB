@@ -1966,11 +1966,12 @@ a regression test.
       unannotated: a LEFT join with a WHERE (unpriced too, RP-379), a
       parameterized inner index scan with its own Filter, a Merge Join (its
       Sorts' `Sort Method`), a hash table past `hash_mem` (several
-      batches), a join with an inner-unique inner side, and a chain whose
-      lower join is not a plain Nested Loop (`z join kz on z.a = kz.a join
-      z z2 on z2.a < kz.a`: PostgreSQL 15.19 annotates the lower Hash Join
-      and the top join's `Rows Removed by Join Filter: 210`; here the whole
-      plan below the top prints bare).
+      batches), and a join with an inner-unique inner side. A chain whose
+      lower join is a Hash Join (`z join kz on z.a = kz.a join z z2 on
+      z2.a < kz.a`) is counted since 2026-11-15, but is not priced: the
+      join search does not take its `<` clause, so the top join's inner
+      Seq Scan prints without the Materialize PostgreSQL 15.19 puts over
+      it (`Materialize (actual rows=20 loops=20)`).
       Measured on a private 15.19 cluster (found while working RP-386,
       the chain while working RP-354).
       Backlog-ID: RP-390

@@ -5629,3 +5629,15 @@ if __name__ == "__main__":
         got = run(fresh_db(sys.argv[1]), setup, query)
         if got != expected:
             print(f"{name}: {got!r}")
+
+
+@pytest.mark.backlog_fixed("RP-390")
+def test_a_chains_lower_hash_join_is_counted(rust_pg: Any) -> None:
+    """A nested loop over a lower Hash Join counted it: the Hash Join's
+    rows, its scans' and its Hash's buckets, and the top join's removed
+    pairs, as PostgreSQL 15.19 prints them (they printed bare). The top
+    join's inner Materialize is the chain's pricing, still open (RP-390's
+    `test_plan[analyze of a nested loop over a hash join]`)."""
+    _, setup, query, expected = SCENARIOS["analyze of a nested loop over a hash join"]
+    got = run(fresh_db(_dsn(rust_pg)), setup, query)
+    assert got[:9] == expected[:9]

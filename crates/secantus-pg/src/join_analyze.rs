@@ -187,96 +187,125 @@ impl PgHandler {
     /// A Hash Join of two Seq Scans on one key, its only qual; each scan
     /// bare or with its own Filter (RP-390).
     fn analyze_hash_join(&self, tree: &mut PlanNode, sel: &secantus_pgplan::Select, actual: usize) {
-        if tree.details.len() != 1 || tree.details[0].0 != "Hash Cond" {
-            return;
+        if let Some(counts) = self.count_hash_join(tree, sel, Some(actual), &[]) {
+            apply_hash_counts(tree, &counts);
+        }
+    }
+
+    /// A Hash Join's children counted, without touching the tree. `top`
+    /// is the rows the statement returned when this is the top join; a
+    /// lower join (the outer side of a nested loop, RP-390) returns the
+    /// rows it joined instead, which the join above runs over; `above` is
+    /// that join's filter, which may read the inner side's columns. `None`
+    /// where any count cannot be accounted for exactly.
+    fn count_hash_join(
+        &self,
+        tree: &PlanNode,
+        sel: &secantus_pgplan::Select,
+        top: Option<usize>,
+        above: &[&str],
+    ) -> Option<HashCounts> {
+        if tree.children.len() != 2 || tree.details.len() != 1 || tree.details[0].0 != "Hash Cond" {
+            return None;
         }
         let hash = &tree.children[1];
         if hash.name != "Hash" || hash.children.len() != 1 {
-            return;
+            return None;
         }
-        let Some((outer_table, outer_alias)) = filtered_seq_scan(&tree.children[0]) else {
-            return;
-        };
-        let Some((inner_table, inner_alias)) = filtered_seq_scan(&hash.children[0]) else {
-            return;
-        };
-        let Some((_, _, plan_rows, plan_width)) = hash.children[0].estimate else {
-            return;
-        };
-        let Some((outer_key, inner_key, read)) =
-            self.hash_join_reads(sel, &outer_alias, &inner_alias)
-        else {
-            return;
+        let (outer_table, outer_alias) = filtered_seq_scan(&tree.children[0])?;
+        let (inner_table, inner_alias) = filtered_seq_scan(&hash.children[0])?;
+        let (outer_key, inner_key, read, (_, _, plan_rows, plan_width)) = match top {
+            Some(_) => {
+                let estimate = hash.children[0].estimate?;
+                let (o, i, r) = self.hash_join_reads(sel, &outer_alias, &inner_alias)?;
+                (o, i, r, estimate)
+            }
+            None => self.lower_hash_reads(
+                sel,
+                &tree.details[0].1,
+                (&outer_table, &outer_alias),
+                (&inner_table, &inner_alias),
+                hash.children[0].details.is_empty(),
+                above,
+            )?,
         };
         // Each scan's rows: those of its table its Filter keeps
         // (`ExecScan`'s `nfiltered1` counts the rest).
-        let Some((outer_docs, outer_read)) =
-            self.scan_rows(sel, &tree.children[0], &outer_table, &outer_alias)
-        else {
-            return;
-        };
-        let Some((inner_docs, inner_read)) =
-            self.scan_rows(sel, &hash.children[0], &inner_table, &inner_alias)
-        else {
-            return;
-        };
+        let (outer_docs, outer_read) =
+            self.scan_rows(sel, &tree.children[0], &outer_table, &outer_alias)?;
+        let (inner_docs, inner_read) =
+            self.scan_rows(sel, &hash.children[0], &inner_table, &inner_alias)?;
         // An empty side stops the join before the other is read
         // (`ExecHashJoinImpl`'s empty-outer and empty-hash shortcuts).
         if outer_docs.is_empty() || inner_docs.is_empty() {
-            return;
+            return None;
         }
-        let Some(def) = self.defined_table(&inner_table) else {
-            return;
-        };
+        let def = self.defined_table(&inner_table)?;
         // A RIGHT join keeps the inner side's NULL keys in the table
         // (`keepNulls`); the others do not hash them.
         let right = tree.name == "Hash Right Join";
         let left = tree.name == "Hash Left Join";
         if !(right || left || tree.name == "Hash Join") {
-            return;
+            return None;
         }
-        let mut counts: std::collections::HashMap<Key, usize> = std::collections::HashMap::new();
+        // A lower join's rows are built for the join above; a RIGHT
+        // one's null-extended rows are not.
+        if top.is_none() && right {
+            return None;
+        }
+        let mut buckets: std::collections::HashMap<Key, Vec<usize>> =
+            std::collections::HashMap::new();
         let mut lens = Vec::new();
         let mut inner_nulls = 0usize;
-        for d in &inner_docs {
-            let Some(k) = key_of(d.get(&inner_key)) else {
-                return;
-            };
-            match k {
-                Some(k) => *counts.entry(k).or_default() += 1,
+        for (i, d) in inner_docs.iter().enumerate() {
+            match key_of(d.get(&inner_key))? {
+                Some(k) => buckets.entry(k).or_default().push(i),
                 None if right => inner_nulls += 1,
                 None => continue,
             }
-            let Some(len) = heap::minimal_tuple_len(&def, d, &read) else {
-                return;
-            };
-            lens.push(len);
+            lens.push(heap::minimal_tuple_len(&def, d, &read)?);
         }
         // The rows the join returns from these sides, which must be the
         // rows it did return: otherwise a scan read fewer rows than its
         // table holds, and these counts are not the plan's.
+        let inner_rows = if top.is_none() {
+            prefixed(&inner_docs, &inner_alias)
+        } else {
+            Vec::new()
+        };
+        let mut rows = Vec::new();
         let mut joined = 0usize;
         let mut matched: std::collections::HashSet<Key> = std::collections::HashSet::new();
         for d in &outer_docs {
-            let Some(k) = key_of(d.get(&outer_key)) else {
-                return;
-            };
-            let c = k.as_ref().and_then(|k| counts.get(k)).copied().unwrap_or(0);
+            let k = key_of(d.get(&outer_key))?;
+            let hits = k.as_ref().and_then(|k| buckets.get(k));
+            let c = hits.map_or(0, Vec::len);
             joined += if left { c.max(1) } else { c };
+            if top.is_none() {
+                let o = prefixed(std::slice::from_ref(d), &outer_alias).pop()?;
+                for &i in hits.into_iter().flatten() {
+                    let mut pair = o.clone();
+                    pair.extend(inner_rows[i].clone());
+                    rows.push(pair);
+                }
+                if left && c == 0 {
+                    rows.push(o);
+                }
+            }
             if c > 0 {
                 matched.extend(k);
             }
         }
         if right {
             joined += inner_nulls
-                + counts
+                + buckets
                     .iter()
                     .filter(|(k, _)| !matched.contains(*k))
-                    .map(|(_, c)| c)
+                    .map(|(_, v)| v.len())
                     .sum::<usize>();
         }
-        if joined != actual {
-            return;
+        if top.is_some_and(|actual| joined != actual) {
+            return None;
         }
         let multiplier = self
             .settings
@@ -287,23 +316,81 @@ impl PgHandler {
             .unwrap_or(2.0);
         let work_mem = self.kb_setting("work_mem", 4096) * 1024;
         let space_allowed = (work_mem as f64 * multiplier).min(usize::MAX as f64 / 2.0) as usize;
-        let Some(nbuckets) = initial_buckets(plan_rows, plan_width, space_allowed) else {
-            return;
+        let nbuckets = initial_buckets(plan_rows, plan_width, space_allowed)?;
+        let info = build_hash(&lens, nbuckets, space_allowed)?;
+        Some(HashCounts {
+            n_outer: outer_docs.len(),
+            outer_read,
+            n_inner: inner_docs.len(),
+            inner_read,
+            hashed: lens.len(),
+            info,
+            joined,
+            rows,
+            rels: vec![(outer_table, outer_alias), (inner_table, inner_alias)],
+        })
+    }
+
+    /// A lower Hash Join's keys, the inner side's fields its Hash node
+    /// stores, and its input's estimate, from the plan: its Hash Cond
+    /// `(x.c = y.d)`, the inner columns the statement returns or the join
+    /// above filters on, and that scan priced as the planner prices it
+    /// (the plan above a lower join is not priced, so its node carries no
+    /// estimate). A bare inner scan only.
+    #[allow(clippy::type_complexity)]
+    fn lower_hash_reads(
+        &self,
+        sel: &secantus_pgplan::Select,
+        cond: &str,
+        (outer_table, outer_alias): (&str, &str),
+        (inner_table, inner_alias): (&str, &str),
+        bare_inner: bool,
+        above: &[&str],
+    ) -> Option<(String, String, Vec<String>, crate::scan_estimate::Estimate)> {
+        if !bare_inner {
+            return None;
+        }
+        let body = cond.strip_prefix('(')?.strip_suffix(')')?;
+        let (l, r) = body.split_once(" = ")?;
+        let (la, lc) = l.split_once('.')?;
+        let (ra, rc) = r.split_once('.')?;
+        let (outer_col, inner_col) = if la == outer_alias && ra == inner_alias {
+            (lc, rc)
+        } else if ra == outer_alias && la == inner_alias {
+            (rc, lc)
+        } else {
+            return None;
         };
-        let Some(info) = build_hash(&lens, nbuckets, space_allowed) else {
-            return;
-        };
-        let removed =
-            |read: usize, kept: usize, n: &PlanNode| (!n.details.is_empty()).then(|| read - kept);
-        let outer = &mut tree.children[0];
-        outer.removed_by_filter = removed(outer_read, outer_docs.len(), outer);
-        outer.actual_rows = Some(outer_docs.len());
-        let hash = &mut tree.children[1];
-        hash.actual_rows = Some(lens.len());
-        hash.hash_info = Some(info);
-        let scan = &mut hash.children[0];
-        scan.removed_by_filter = removed(inner_read, inner_docs.len(), scan);
-        scan.actual_rows = Some(inner_docs.len());
+        let outer_def = self.defined_table(outer_table)?;
+        let inner_def = self.defined_table(inner_table)?;
+        let outer_key = outer_def.field_of(outer_col)?;
+        let inner_key = inner_def.field_of(inner_col)?;
+        let sep = secantus_pgplan::joins::SEP;
+        let mut read = Vec::new();
+        for c in &inner_def.columns {
+            let returned = sel.columns.iter().any(|(_, f)| {
+                f.split_once(sep)
+                    .is_some_and(|(a, col)| a == inner_alias && col == c.name)
+            });
+            let named = format!("{inner_alias}.{}", c.name);
+            let filtered = above.iter().any(|q| {
+                q.match_indices(&named).any(|(i, _)| {
+                    let before = q[..i].chars().next_back();
+                    let after = q[i + named.len()..].chars().next();
+                    let word =
+                        |ch: Option<char>| ch.is_some_and(|ch| ch.is_alphanumeric() || ch == '_');
+                    !word(before) && !word(after)
+                })
+            });
+            if returned || filtered {
+                read.push(inner_def.field_of(&c.name)?);
+            }
+        }
+        if !read.contains(&inner_key) {
+            read.push(inner_key.clone());
+        }
+        let estimate = self.bare_hash_input_estimate(inner_table, &inner_key, &read)?;
+        Some((outer_key, inner_key, read, estimate))
     }
 
     /// A Nested Loop over a Seq Scan (bare or with its own Filter, RP-390)
@@ -706,6 +793,11 @@ impl PgHandler {
                 .is_none()
         {
             OuterCounts::Join(Box::new(self.count_plain_nest_loop(outer_node, sel, None)?))
+        } else if outer_node.name.starts_with("Hash") && outer_node.name.ends_with(" Join") {
+            let above: Vec<&str> = cond.iter().map(String::as_str).collect();
+            OuterCounts::Hash(Box::new(
+                self.count_hash_join(outer_node, sel, None, &above)?,
+            ))
         } else {
             return None;
         };
@@ -724,11 +816,12 @@ impl PgHandler {
         let (outer_rows, mut rels) = match &outer {
             OuterCounts::Scan { rows, rels, .. } => (rows, rels.clone()),
             OuterCounts::Join(j) => (&j.rows, j.rels.clone()),
+            OuterCounts::Hash(h) => (&h.rows, h.rels.clone()),
         };
         rels.push((inner_table, inner_alias.clone()));
         let (n_outer, n_inner) = (outer_rows.len(), inner_docs.len());
         let pairs = n_outer.checked_mul(n_inner)?;
-        let chain = matches!(outer, OuterCounts::Join(_));
+        let chain = !matches!(outer, OuterCounts::Scan { .. });
         if top.is_some() && (n_outer == 0 || n_inner == 0) {
             return None;
         }
@@ -884,6 +977,41 @@ enum OuterCounts {
         rels: Vec<(String, String)>,
     },
     Join(Box<NestCounts>),
+    /// A lower Hash Join (RP-390).
+    Hash(Box<HashCounts>),
+}
+
+/// What running a Hash Join counted at each of its nodes.
+struct HashCounts {
+    n_outer: usize,
+    outer_read: usize,
+    n_inner: usize,
+    inner_read: usize,
+    /// The tuples the Hash node put in its table.
+    hashed: usize,
+    info: HashInfo,
+    /// The rows the join returned.
+    joined: usize,
+    /// Those rows, each relation's fields under its prefix (a lower
+    /// join's only; empty at the top).
+    rows: Vec<Document>,
+    /// `(table, alias)` of the outer and the inner relation.
+    rels: Vec<(String, String)>,
+}
+
+/// Print `counts` onto the Hash Join they were counted over.
+fn apply_hash_counts(tree: &mut PlanNode, counts: &HashCounts) {
+    let removed =
+        |read: usize, kept: usize, n: &PlanNode| (!n.details.is_empty()).then(|| read - kept);
+    let outer = &mut tree.children[0];
+    outer.removed_by_filter = removed(counts.outer_read, counts.n_outer, outer);
+    outer.actual_rows = Some(counts.n_outer);
+    let hash = &mut tree.children[1];
+    hash.actual_rows = Some(counts.hashed);
+    hash.hash_info = Some(counts.info);
+    let scan = &mut hash.children[0];
+    scan.removed_by_filter = removed(counts.inner_read, counts.n_inner, scan);
+    scan.actual_rows = Some(counts.n_inner);
 }
 
 /// What running a plain nested loop counted at each of its nodes.
@@ -920,6 +1048,12 @@ fn apply_nest_counts(tree: &mut PlanNode, counts: &NestCounts) {
             apply_nest_counts(o, j);
             o.actual_rows = Some(j.joined);
             j.joined
+        }
+        OuterCounts::Hash(h) => {
+            let o = &mut tree.children[0];
+            apply_hash_counts(o, h);
+            o.actual_rows = Some(h.joined);
+            h.joined
         }
     };
     if counts.filtered {
