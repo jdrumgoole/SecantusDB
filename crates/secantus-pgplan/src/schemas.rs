@@ -477,8 +477,8 @@ pub fn type_key(parts: &[String]) -> String {
 /// `activeSearchPath`'s order (`recomputeNamespacePath`): the session's
 /// temporary schema first, once it exists, unless the path names
 /// `pg_temp` itself, which puts it there; then the path's other schemas.
-/// `pg_catalog` is left out: a built-in is resolved before a user type is
-/// looked for. Relations and types are found in the temporary schema;
+/// `pg_catalog` is left out: [`resolve_type_names`] checks a temporary
+/// type ahead of the built-ins, and the path's others after. Relations and types are found in the temporary schema;
 /// functions and operators never are (`FuncnameGetCandidates`).
 fn type_search_order() -> Vec<String> {
     let temp = temp_schema_in_use();
@@ -559,6 +559,14 @@ pub fn resolve_type_names(node: &mut N) -> Result<()> {
             sval: schema.to_string(),
         })),
     };
+    let temp_before_catalog = {
+        let at = |n: &str| path.iter().position(|s| s == n);
+        match (at("pg_temp"), at("pg_catalog")) {
+            (Some(t), Some(c)) => t < c,
+            (Some(_), None) => false,
+            (None, _) => true,
+        }
+    };
     let resolve = |tn: &mut pg_query::protobuf::TypeName| -> Result<()> {
         if tn.pct_type {
             return Ok(());
@@ -578,6 +586,15 @@ pub fn resolve_type_names(node: &mut N) -> Result<()> {
             return Ok(());
         };
         let name = name.sval.clone();
+        // The temporary schema is searched ahead of `pg_catalog` unless the
+        // path places `pg_temp` after it (`recomputeNamespacePath`), so a
+        // temporary row type hides a built-in of its name.
+        if let Some(t) = temp.as_deref() {
+            if temp_before_catalog && crate::column_type_exists(&relation_key(t, &name)) {
+                tn.names.insert(0, schema_node(t));
+                return Ok(());
+            }
+        }
         if crate::pgtypes::is_builtin_type(&name) {
             return Ok(());
         }

@@ -3686,19 +3686,3 @@ statement is VALUES-only and runs there as written. The gap tests are in
       0A000, not 42P10 `GROUP BY position 9 is not in select list` at 49.
       Verify: tests/backlog/test_rp_found_rp854.py::test_a_group_by_position_inside_a_set_or_list_is_a_position
       Backlog-ID: RP-873
-
-## Found while working RP-565 (2026-11-12)
-
-Measured on a private, freshly initdb'd PostgreSQL 15.19 cluster. The gap
-tests are in `tests/backlog/test_rp_found_rp565.py`.
-
-- [ ] **A temporary row type does not hide a built-in type of its name.**
-      PostgreSQL searches the temporary schema for a type ahead of
-      `pg_catalog` when the path does not name `pg_temp`: after `create
-      temp table text (a int)`, `'x'::text` is 22P02 `malformed record
-      literal: "x"` and `('(1)'::text).a` is 1 on 15.19. Here a built-in
-      name is resolved before any user type is looked for
-      (`is_builtin_type` ahead of `type_schema_of`), so the first answers
-      `x` and the second is 42809.
-      Verify: tests/backlog/test_rp_found_rp565.py::test_a_temporary_row_type_hides_a_built_in_type
-      Backlog-ID: RP-891

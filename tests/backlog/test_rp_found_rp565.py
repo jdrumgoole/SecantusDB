@@ -124,9 +124,9 @@ def test_a_foreign_key_in_a_drop_detail_is_named_by_its_own_name(dsn: str) -> No
 # ("If it is not listed in the path then it is searched first (even before
 # pg_catalog)"): after `create temp table text (a int)`, `'x'::text` is the
 # row type's input, 22P02 `malformed record literal`, and `('(1)'::text).a`
-# is 1. Here a built-in name is resolved before any user type is looked
-# for, so the first answers `x` and the second is 42809.
-@pytest.mark.backlog("RP-891")
+# is 1. A built-in name was resolved before any user type was looked
+# for, so the first answered `x` and the second was 42809.
+@pytest.mark.backlog_fixed("RP-891")
 def test_a_temporary_row_type_hides_a_built_in_type(dsn: str) -> None:
     with psycopg.connect(dsn, autocommit=True) as c:
         c.execute("create temp table text (a int)")
@@ -136,5 +136,5 @@ def test_a_temporary_row_type_hides_a_built_in_type(dsn: str) -> None:
             c.execute("drop table if exists pg_temp.text")
     assert got == [
         [(1,)],
-        ("22P02", 'malformed record literal: "x"', None),
+        ("22P02", 'malformed record literal: "x"', "Missing left parenthesis."),
     ]
