@@ -4649,11 +4649,79 @@ fn pushdown_filters(
 pub(crate) fn prepare_on_quals(
     s: &pg_query::protobuf::SelectStmt,
 ) -> Option<pg_query::protobuf::SelectStmt> {
-    let folded = fold_constant_on_quals(s);
+    let deduped = drop_redundant_equalities(s);
+    let s = deduped.as_ref().unwrap_or(s);
+    let folded = fold_constant_on_quals(s).or(deduped.clone());
     let base = folded.as_ref().unwrap_or(s);
     let reduced = reduce_outer_joins(base).or(folded);
     let base = reduced.as_ref().unwrap_or(s);
     hoist_inner_on_conjuncts(base).or(reduced)
+}
+
+/// `s` with every WHERE equality an earlier one repeats dropped, or `None` when there is none
+/// (RP-402).
+///
+/// PostgreSQL's `process_equivalence` finds such a clause redundant: `e.b
+/// = k.b and e.b = k.b` is one join clause, `a = 5 and a = 5` one
+/// restriction. Taken only for an exact repeat (either way round) of an
+/// earlier `=` between columns (by their written names) and non-NULL
+/// literals: a clause redundant only by transitivity (`a = b and b = 5 and
+/// a = 5`) stays, as the classes here do not regenerate what PostgreSQL's
+/// would. Dropping a repeat is safe for the rows.
+fn drop_redundant_equalities(
+    s: &pg_query::protobuf::SelectStmt,
+) -> Option<pg_query::protobuf::SelectStmt> {
+    let w = s.where_clause.as_deref()?;
+    let mut conjuncts = Vec::new();
+    split_and(w, &mut conjuncts);
+    let member = |n: Option<&pg_query::protobuf::Node>| -> Option<String> {
+        match n?.node.as_ref()? {
+            N::ColumnRef(c) => {
+                let mut parts = Vec::new();
+                for f in &c.fields {
+                    match f.node.as_ref()? {
+                        N::String(s) => parts.push(s.sval.clone()),
+                        _ => return None,
+                    }
+                }
+                Some(format!("col:{}", parts.join(".")))
+            }
+            N::AConst(c) if !c.isnull => Some(format!("const:{:?}", c.val)),
+            _ => None,
+        }
+    };
+    let mut seen: Vec<(String, String)> = Vec::new();
+    let mut kept = Vec::with_capacity(conjuncts.len());
+    let mut dropped = false;
+    for c in conjuncts {
+        let sides = match c.node.as_ref() {
+            Some(N::AExpr(a))
+                if a.kind == pg_query::protobuf::AExprKind::AexprOp as i32
+                    && matches!(a.name.as_slice(), [one]
+                        if matches!(one.node.as_ref(), Some(N::String(op)) if op.sval == "=")) =>
+            {
+                member(a.lexpr.as_deref()).zip(member(a.rexpr.as_deref()))
+            }
+            _ => None,
+        };
+        // Two constants compare once, at plan time; not a class.
+        if let Some((l, r)) = sides.filter(|(l, r)| l.starts_with("col:") || r.starts_with("col:"))
+        {
+            let pair = if l <= r { (l, r) } else { (r, l) };
+            if seen.contains(&pair) {
+                dropped = true;
+                continue;
+            }
+            seen.push(pair);
+        }
+        kept.push(c.clone());
+    }
+    if !dropped {
+        return None;
+    }
+    let mut out = s.clone();
+    out.where_clause = and_of(kept).map(Box::new);
+    Some(out)
 }
 
 /// `s` with every LEFT or RIGHT join whose nullable side the WHERE proves

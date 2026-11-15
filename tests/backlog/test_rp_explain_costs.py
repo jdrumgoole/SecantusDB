@@ -5072,7 +5072,21 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "                    Index Cond: (a = e.a)",
         ],
     ),
-    # A join's equivalence classes drop a repeated conjunct
+    # Still open: a constant the class generates for the inner side's
+    # indexed column is that index scan's Index Cond, not a Filter.
+    "an equivalence class's generated constant is the inner index's cond": (
+        "RP-977",
+        _ANALYSED,
+        "explain select * from e, k where e.a = k.a and e.a = 5",
+        [
+            "Nested Loop  (cost=0.28..25.80 rows=1 width=14)",
+            "  ->  Seq Scan on e  (cost=0.00..17.50 rows=1 width=7)",
+            "        Filter: (a = 5)",
+            "  ->  Index Scan using k_pkey on k  (cost=0.28..8.29 rows=1 width=7)",
+            "        Index Cond: (a = 5)",
+        ],
+    ),
+    # A join's equivalence classes drop a repeated conjunct (RP-402, fixed)
     # (`process_equivalence` finds it redundant): the equality between the
     # tables is one hash clause, priced once (found while working RP-388).
     "comma join with a repeated join equality": (
@@ -5509,6 +5523,7 @@ def _marked(name: str, item: str) -> Any:
         "RP-396",
         "RP-398",
         "RP-399",
+        "RP-402",
         "RP-403",
         "RP-404",
         "RP-405",

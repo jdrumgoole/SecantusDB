@@ -2004,18 +2004,16 @@ a regression test.
       while working RP-395).
       Backlog-ID: RP-401
       Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a left join on a primary key merges through its index]
-- [ ] **A join's equivalence classes keep a repeated conjunct.** A
-      one-table SELECT matches PostgreSQL 15.19 (`where a = 5 and a = 5` is
-      `Filter: (a = 5)`), a join does not. `select * from e, k where e.b =
-      k.b and e.b = k.b` prints `Hash Cond: ((e.b = k.b) AND (e.b = k.b))`
-      and prices both (`rows=10000`), where PostgreSQL's
-      `process_equivalence` finds the second redundant: `Hash Cond: (e.b =
-      k.b)`, `rows=100000`. A repeated `e.a = 5` is `Filter: ((a = 5) AND
-      (a = 5))` on e's scan, priced twice (`cost=0.00..20.00`; PostgreSQL
-      `Filter: (a = 5)` at `17.50`). The rows are right. Measured on a
-      private 15.19 cluster (found while working RP-388).
-      Backlog-ID: RP-402
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[comma join with a repeated join equality], tests/backlog/test_rp_explain_costs.py::test_plan[comma join with a repeated constant equality]
+- [ ] **A constant an equivalence class generates for a join's inner
+      index scan is a Filter, not its Index Cond.** `select * from e, k
+      where e.a = k.a and e.a = 5` (`k.a` the primary key) is, on
+      PostgreSQL 15.19, a Nested Loop whose `Index Scan using k_pkey on k`
+      has `Index Cond: (a = 5)` (`generate_base_implied_equalities` gives
+      k its own `k.a = 5`, which the index takes); here the same scan
+      prints `Filter: (a = 5)`. The costs and rows match. Measured on a
+      private 15.19 cluster (found while working RP-402).
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[an equivalence class's generated constant is the inner index's cond]
+      Backlog-ID: RP-977
 - [ ] **EXPLAIN prints no estimate for a scan filtered by a function
       call, a pattern over an expression, or a pattern over a table never
       analysed.** Since RP-404 a comparison of integer or text
