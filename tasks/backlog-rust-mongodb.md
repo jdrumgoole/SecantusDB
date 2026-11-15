@@ -728,14 +728,6 @@ These are explicit non-goals. Don't add them without a reason.
       (RM-472).
       Verify: tests/backlog/test_rm_found_rm472.py::test_a_near_read_explains_as_geo_near_2d
       Backlog-ID: RM-578
-- [ ] **A computed projection over index keys fetches.** mongod 8.2.11
-      answers `{_id: 0, x: 1, k: {$add: ["$x", 1]}}` from the keys of
-      `{y: 1, x: 1}` (`PROJECTION_DEFAULT <- IXSCAN`; over an `$or`, no
-      FETCH either): every field it reads is in the index. This server
-      fetches (`PROJECTION_DEFAULT <- FETCH <- IXSCAN`); `covers` refuses a
-      projection with an expression. Found 2026-11-12 (RM-471).
-      Verify: tests/backlog/test_rm_found_rm471.py::test_a_computed_projection_reads_index_keys
-      Backlog-ID: RM-570
 - [ ] **An `$or` over two indexes returns its branches out of order.**
       mongod 8.2.11 reads `{$or: [{y: 0}, {x: {$gt: 8}}]}` over `{y: 1,
       x: 1}` and `{x: 1}` branch by branch as its plan lists them,

@@ -1982,6 +1982,23 @@ fn covers_with(projection: &Document, holds: &dyn Fn(&str) -> bool) -> bool {
         return false;
     }
     for (field, value) in projection {
+        // A computed field is answered from the keys when every field it
+        // reads is (mongod 8.2.11: `{k: {$add: ["$x", 1]}}` over `{y: 1,
+        // x: 1}` is `PROJECTION_DEFAULT <- IXSCAN`, RM-570).
+        let expression = match value {
+            Bson::Document(d) => d.len() == 1 && d.keys().all(|k| k.starts_with('$')),
+            Bson::String(s) => s.starts_with('$'),
+            _ => false,
+        };
+        if expression {
+            let mut reads = std::collections::BTreeSet::new();
+            if !secantus_core::expression_fields(value, &mut reads)
+                || !reads.iter().all(|f| holds(f))
+            {
+                return false;
+            }
+            continue;
+        }
         if matches!(value, Bson::Document(_) | Bson::Array(_) | Bson::String(_)) {
             return false;
         }

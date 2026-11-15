@@ -2113,7 +2113,7 @@ pub(crate) fn collect_match_fields(
 /// ignored: they resolve to array elements or already-evaluated values, never
 /// to a top-level document field, and the arrays/values they range over are
 /// themselves reached through `$path` strings collected here.
-pub(crate) fn collect_fields(expr: &Bson, out: &mut std::collections::BTreeSet<String>) -> bool {
+pub fn collect_fields(expr: &Bson, out: &mut std::collections::BTreeSet<String>) -> bool {
     match expr {
         Bson::String(s) => {
             if let Some(var) = s.strip_prefix("$$") {

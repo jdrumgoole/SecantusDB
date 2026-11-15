@@ -75,12 +75,13 @@ def test_covered_fields_come_back_in_the_key_patterns_order(rust_mongo: Any, mon
     assert answers["rust"] == answers["mongod"]
 
 
-@pytest.mark.backlog("RM-570")
+@pytest.mark.backlog_fixed("RM-570")
 def test_a_computed_projection_reads_index_keys(rust_mongo: Any, mongod: Any) -> None:
     """mongod 8.2.11 answers `{_id: 0, x: 1, k: {$add: ["$x", 1]}}` from the
     keys of `{y: 1, x: 1}`, everything it reads being in the index
-    (`PROJECTION_DEFAULT <- IXSCAN`). This server fetches each document
-    (`PROJECTION_DEFAULT <- FETCH <- IXSCAN`)."""
+    (`PROJECTION_DEFAULT <- IXSCAN`). This server fetched each document
+    (`PROJECTION_DEFAULT <- FETCH <- IXSCAN`): `covers` refused a projection
+    with an expression until RM-570's fix."""
     command = {
         "find": "c",
         "filter": {"y": 0},
@@ -91,6 +92,36 @@ def test_a_computed_projection_reads_index_keys(rust_mongo: Any, mongod: Any) ->
         for server, client in (("mongod", mongod), ("rust", rust_mongo))
     }
     assert answers["mongod"] == ["PROJECTION_DEFAULT", "IXSCAN"]
+    assert answers["rust"] == answers["mongod"]
+
+
+@pytest.mark.backlog_fixed("RM-570")
+def test_a_computed_projection_from_index_keys_returns_mongods_rows(
+    rust_mongo: Any, mongod: Any
+) -> None:
+    """The keys answer a computed projection with mongod 8.2.11's rows, from
+    one scan or an `$or` of them, a field-path string included; one reading
+    a field the index lacks (`z`) or `$$ROOT` still fetches."""
+    projections = [
+        {"_id": 0, "x": 1, "k": {"$add": ["$x", 1]}},
+        {"_id": 0, "k": "$x", "j": {"$multiply": ["$x", "$y"]}},
+        {"_id": 0, "k": {"$add": ["$x", "$z"]}},
+        {"_id": 0, "k": {"$size": {"$objectToArray": "$$ROOT"}}},
+    ]
+    filters = [{"y": 0}, {"$or": [{"y": 0}, {"y": 1, "x": {"$gt": 3}}]}]
+    answers = {
+        server: [
+            (
+                _rows(client, {"find": "c", "filter": f, "projection": p}, YX),
+                _chain(_plan(client, {"find": "c", "filter": f, "projection": p}, YX)),
+            )
+            for f in filters
+            for p in projections
+        ]
+        for server, client in (("mongod", mongod), ("rust", rust_mongo))
+    }
+    assert answers["mongod"][0][1] == ["PROJECTION_DEFAULT", "IXSCAN"]
+    assert "FETCH" in answers["mongod"][2][1]
     assert answers["rust"] == answers["mongod"]
 
 

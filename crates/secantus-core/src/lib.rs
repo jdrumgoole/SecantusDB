@@ -98,5 +98,6 @@ pub use numeric::{format_double_g, format_double_spec};
 // ahead of the stage, instead of materializing every field. The `group` module
 // itself stays private.
 pub use group::{
-    downstream_fields, percentile_spec, pipeline_prefix_fields, referenced_top_level_fields,
+    collect_fields as expression_fields, downstream_fields, percentile_spec,
+    pipeline_prefix_fields, referenced_top_level_fields,
 };
