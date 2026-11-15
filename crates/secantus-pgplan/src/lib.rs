@@ -16086,6 +16086,9 @@ fn plan_window_call(
         .as_deref()
         .ok_or_else(|| Error::Internal("a window call without OVER".into()))?;
     let name = func_name(f).unwrap_or_default();
+    if let Some(e) = ordered_set_aggregate_over(f, &name) {
+        return Err(e);
+    }
     let Some(func) = window_func_by_name(&name) else {
         return Err(over_on_unplanned_function(f, &name, def, params));
     };
@@ -16237,6 +16240,49 @@ pub(crate) fn is_builtin_aggregate_or_window(name: &str) -> bool {
             .collect()
     })
     .contains(name)
+}
+
+/// `ParseFuncOrColumn`'s refusal of an ordered-set (`aggkind` o) or
+/// hypothetical-set (`aggkind` h) aggregate under OVER, in its order: 42809
+/// when WITHIN GROUP is missing, then 0A000 for the OVER itself, naming the
+/// function as written, at the call. PostgreSQL 15's built-in ones are
+/// `percentile_cont`, `percentile_disc`, `mode` and the hypothetical `rank` /
+/// `dense_rank` / `percent_rank` / `cume_dist` (VARIADIC "any", so at least
+/// one argument -- with none they resolve to the window functions).
+fn ordered_set_aggregate_over(f: &pg_query::protobuf::FuncCall, name: &str) -> Option<Error> {
+    let hypothetical = matches!(name, "rank" | "dense_rank" | "percent_rank" | "cume_dist");
+    let ordered = if f.agg_within_group {
+        hypothetical || matches!(name, "percentile_cont" | "percentile_disc" | "mode")
+    } else {
+        // Without WITHIN GROUP the call's arity counts only its direct
+        // arguments: `percentile_cont(0.5)` and `mode()` match no function
+        // (42883), while `rank(1)` matches the VARIADIC hypothetical one.
+        hypothetical && !f.args.is_empty()
+    };
+    if !ordered {
+        return None;
+    }
+    let written = f
+        .funcname
+        .iter()
+        .filter_map(|n| match n.node.as_ref()? {
+            N::String(s) => Some(s.sval.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join(".");
+    set_error_location(f.location);
+    Some(if f.agg_within_group {
+        Error::Sqlstate(
+            "0A000",
+            format!("OVER is not supported for ordered-set aggregate {written}"),
+        )
+    } else {
+        Error::Sqlstate(
+            "42809",
+            format!("WITHIN GROUP is required for ordered-set aggregate {written}"),
+        )
+    })
 }
 
 /// The error for an OVER on a call the window planner has no function for.

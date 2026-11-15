@@ -2414,23 +2414,6 @@ Measured on a private PostgreSQL 15.19 cluster with the `_SETUP` in
 over `create domain d665 as int` and `create domain dc665 as char(4)`.
 
 
-## Found while working RP-682 (2026-11-11)
-
-Measured on PostgreSQL 15.19 (the shared reference on port 5415) with the
-VALUES-only statements of `tests/backlog/test_rp_found_rp682.py`.
-
-- [ ] **An ordered-set aggregate under OVER is not refused as
-      PostgreSQL refuses it.** `select rank(1) over ()` is 42809 `WITHIN
-      GROUP is required for ordered-set aggregate rank` on PostgreSQL 15.19
-      (with arguments `rank` resolves to the hypothetical-set aggregate);
-      here it answers 1, the window function. `percentile_cont(0.5) within
-      group (order by v) over ()` is 0A000 `OVER is not supported for
-      ordered-set aggregate percentile_cont` there and 0A000 `window
-      function percentile_cont() is not supported yet` here. Needs the
-      aggregates' `aggkind`, which the planner does not keep.
-      Verify: tests/backlog/test_rp_found_rp682.py::test_an_ordered_set_aggregate_over_a_window_is_refused
-      Backlog-ID: RP-869
-
 ## Found while working RP-670 (2026-11-09)
 
 Measured on a private PostgreSQL 15.19 cluster with the `_SETUP` in
