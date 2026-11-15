@@ -3241,22 +3241,6 @@ statement is VALUES-only and runs there as written. The gap test is in
 `tests/backlog/test_rp_found_rp849.py`.
 
 
-## Found while working RP-704 (2026-11-10)
-
-Measured on PostgreSQL 15.19 (the shared reference on port 5415): every
-statement reads only `VALUES` lists.
-
-- [ ] **`GROUP BY v` over a FROM subquery groups by its column, not
-      the row.** `select v.a from (values (1), (2)) v(a) group by v` is
-      42803 `column "v.a" must appear in the GROUP BY clause or be used in
-      an aggregate function` at 8 on PostgreSQL 15.19, and so is `select
-      v.* ... group by v`. Here both answer the rows: the whole-row
-      grouping rule (`check_ungrouped_whole_row`, RP-532 / RP-536) covers a
-      lone table only, and a subquery's `v` resolves as its column. (The
-      star over a subquery itself now expands, `expand_star_in_grouped`.)
-      Verify: tests/backlog/test_rp_found_rp699.py::test_group_by_a_from_subquery_row_leaves_its_columns_ungrouped
-      Backlog-ID: RP-852
-
 ## Found while working RP-700 (2026-11-10)
 
 Measured on PostgreSQL 15.19 (the shared reference on port 5415): every

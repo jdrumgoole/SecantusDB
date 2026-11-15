@@ -184,10 +184,19 @@ GROUPED_BY_SUBQUERY_ROW = {
         'column "v.a" must appear in the GROUP BY clause or be used in an aggregate function',
         "8",
     ),
+    "select v.b from (values (1, 2)) v(a, b) group by v, a": (
+        "42803",
+        'column "v.b" must appear in the GROUP BY clause or be used in an aggregate function',
+        "8",
+    ),
+    "select v.a from (values (1), (2)) v(a) group by v, a": ([(1,), (2,)], ["a"]),
+    "select count(*) from (values (1), (1)) v(a) group by v": ([(2,)], ["count"]),
 }
 
 
-@pytest.mark.backlog("RP-852")
+@pytest.mark.backlog_fixed("RP-852")
 @pytest.mark.parametrize("query", list(GROUPED_BY_SUBQUERY_ROW))
 def test_group_by_a_from_subquery_row_leaves_its_columns_ungrouped(query: str, dsn: str) -> None:
+    """`group by v` over a FROM subquery answered its columns as grouped;
+    they are now 42803 unless grouped themselves, as on PostgreSQL 15.19."""
     assert answer(dsn, query) == GROUPED_BY_SUBQUERY_ROW[query]
