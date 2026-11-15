@@ -151,9 +151,8 @@ def test_join_on_varchar_against_char_n(query: str, dsn: str) -> None:
 
 
 # PostgreSQL prints the condition as it resolved it: the `varchar` side
-# relabelled to `bpchar`, the `char(n)` column bare. Here both sides are
-# printed cast to `text`, the operator the hash compares by, which is not the
-# one PostgreSQL chose.
+# relabelled to `bpchar`, the `char(n)` column bare. Both sides were printed
+# cast to `text`, which is not the operator PostgreSQL chose (RP-738).
 EXPLAIN_JOIN_ON_VARCHAR_AGAINST_CHAR_N = {
     "explain (costs off) select x.k, y.k from ch726 x join ch726 y on x.v = y.c": (
         [
@@ -168,7 +167,7 @@ EXPLAIN_JOIN_ON_VARCHAR_AGAINST_CHAR_N = {
 }
 
 
-@pytest.mark.backlog("RP-738")
+@pytest.mark.backlog_fixed("RP-738")
 @pytest.mark.parametrize("query", list(EXPLAIN_JOIN_ON_VARCHAR_AGAINST_CHAR_N))
 def test_explain_join_on_varchar_against_char_n(query: str, dsn: str) -> None:
     assert answer(dsn, query) == EXPLAIN_JOIN_ON_VARCHAR_AGAINST_CHAR_N[query]

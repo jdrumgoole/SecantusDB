@@ -2709,19 +2709,28 @@ impl PgHandler {
                         .is_some_and(|c| fixed.contains(&c.field()))
                 })
         });
-        let key_indexed = indexes.iter().any(|ix| {
-            ix.table.name == table
-                && ix
-                    .keys
-                    .first()
-                    .and_then(|k| usize::try_from(*k).ok()?.checked_sub(1))
-                    .and_then(|i| ix.table.columns.get(i))
-                    .is_some_and(|c| c.field() == field)
-        });
+        let leading: Vec<_> = indexes
+            .iter()
+            .filter(|ix| {
+                ix.table.name == table
+                    && ix
+                        .keys
+                        .first()
+                        .and_then(|k| usize::try_from(*k).ok()?.checked_sub(1))
+                        .and_then(|i| ix.table.columns.get(i))
+                        .is_some_and(|c| c.field() == field)
+            })
+            .collect();
+        let key_indexed = !leading.is_empty();
         let key_index = if key_indexed && index.is_none() {
             self.key_index(table, filter, field, &key, scan.2)
         } else {
             None
+        };
+        // The name a merge reading `key_index` presorted prints (RP-401).
+        let key_index_name = match leading.as_slice() {
+            [ix] => Some(ix.name.clone()),
+            _ => None,
         };
         Some(HashSide {
             scan,
@@ -2737,6 +2746,7 @@ impl PgHandler {
             ordered,
             key_indexed,
             key_index,
+            key_index_name,
         })
     }
 
@@ -5500,6 +5510,8 @@ struct HashSide {
     /// the whole-index and parameterized scans a join on a unique key
     /// weighs (RP-377). `None` where it is not one plain B-tree.
     key_index: Option<KeyIndex>,
+    /// That index's name, where one index leads with the key (RP-401).
+    key_index_name: Option<String>,
 }
 
 /// A join key's B-tree index over an analysed table (RP-377): the table
@@ -6023,24 +6035,7 @@ fn hash_join_of(
     let merges = if redundant || multi || a.key_indexed || b.key_indexed {
         None
     } else {
-        fn column(s: &HashSide) -> Option<secantus_pgplan::colstats::Column<'_>> {
-            let (stats, slots) = s.column.as_ref()?;
-            Some(secantus_pgplan::colstats::Column {
-                stats: Some((*stats, slots)),
-                unique: s.unique,
-                boolean: false,
-                numeric: s.numeric,
-                ordered: s.ordered,
-                // A string key's place in a bin (`convert_string_to_scalar`)
-                // is not read for a merge's scan fractions yet: such a merge
-                // stays unpriced, as it was.
-                string: false,
-                c_collation: false,
-                actual: None,
-                tuples: s.tuples,
-            })
-        }
-        let (ca, cb) = (column(&a)?, column(&b)?);
+        let (ca, cb) = (merge_column(&a)?, merge_column(&b)?);
         let (mut ls, mut le, rs, re) = joincost::mergejoinscansel(&ca, &cb)?;
         // `initial_cost_mergejoin`: an outer join reads its preserved
         // input whole -- the LEFT join's left table, outer in the `JOIN_LEFT`
@@ -6159,9 +6154,32 @@ fn hash_join_of(
         return None;
     }
     if unique_key {
-        let other = unique_key_other_paths(&a, &b, &outer, &inner, rows, left_join, filter)?;
+        let (other, merge) =
+            unique_key_other_paths(&a, &b, &outer, &inner, rows, left_join, filter)?;
         if other <= t0 * 1.01 {
-            return None;
+            // A merge reading a side presorted by its key's index, cheaper
+            // beyond the fuzz factor, is the plan (RP-401); anything closer,
+            // or another method, is not priced.
+            let (plan, b_outer) = merge.filter(|_| other * 1.01 < t0)?;
+            let index_of = |s: &HashSide, presorted: bool| -> Option<Option<String>> {
+                if presorted {
+                    s.key_index_name.clone().map(Some)
+                } else {
+                    Some(s.index.clone())
+                }
+            };
+            let (first, second) = if b_outer { (&b, &a) } else { (&a, &b) };
+            let indexes = [
+                index_of(first, plan.presorted.0)?,
+                index_of(second, plan.presorted.1)?,
+            ];
+            return Some((
+                first.scan,
+                second.scan,
+                (plan.startup, plan.total, rows, width),
+                JoinPick::Merge { b_outer, plan },
+                indexes,
+            ));
         }
     }
     let b_first = matches!(
@@ -6174,6 +6192,25 @@ fn hash_join_of(
         (a.scan, b.scan, [a.index, b.index])
     };
     Some((o, i, (s0, t0, rows, width), pick, indexes))
+}
+
+/// A join key's column as `mergejoinscansel` reads it.
+fn merge_column(s: &HashSide) -> Option<secantus_pgplan::colstats::Column<'_>> {
+    let (stats, slots) = s.column.as_ref()?;
+    Some(secantus_pgplan::colstats::Column {
+        stats: Some((*stats, slots)),
+        unique: s.unique,
+        boolean: false,
+        numeric: s.numeric,
+        ordered: s.ordered,
+        // A string key's place in a bin (`convert_string_to_scalar`) is not
+        // read for a merge's scan fractions yet: such a merge stays
+        // unpriced, as it was.
+        string: false,
+        c_collation: false,
+        actual: None,
+        tuples: s.tuples,
+    })
 }
 
 /// The cheapest total of the merge joins and nested loops PostgreSQL's
@@ -6193,8 +6230,10 @@ fn unique_key_other_paths(
     rows: f64,
     left_join: bool,
     filter: JoinFilterCost,
-) -> Option<f64> {
-    use secantus_pgplan::joincost::{base_pathlist, InPath, JoinRel, MemoKey, RelPaths};
+) -> Option<(f64, Option<(secantus_pgplan::joincost::MergePlan, bool)>)> {
+    use secantus_pgplan::joincost::{
+        base_pathlist, InPath, JoinMethod, JoinRel, MemoKey, RelPaths,
+    };
     // The join clause's own class (an edge's, `Search`'s numbering).
     const CLASS: usize = 2;
     let paths = |s: &HashSide, other: &HashSide, other_bit: u32| -> Option<Vec<InPath>> {
@@ -6274,6 +6313,13 @@ fn unique_key_other_paths(
     // The join filter, evaluated on each pair a path's clause passes (a
     // nested loop's every pair), RP-381.
     rel.set_filter_cost(filter.ops * costsize::CPU_OPERATOR_COST);
+    // `initial_cost_mergejoin`'s scan fractions (RP-401): a merge stops
+    // reading an input past the other's largest key.
+    if let (Some(ca), Some(cb)) = (merge_column(a), merge_column(b)) {
+        if let Some(f) = secantus_pgplan::joincost::mergejoinscansel(&ca, &cb) {
+            rel.set_merge_scansel(f);
+        }
+    }
     rel.add_paths_general(
         0,
         Some(CLASS),
@@ -6286,11 +6332,31 @@ fn unique_key_other_paths(
         rows,
         0,
     );
-    rel.pathlist()
-        .iter()
+    let best = rel
+        .pathlist()
+        .into_iter()
         .filter(|p| p.req_outer == 0)
-        .map(|p| p.total)
-        .reduce(f64::min)
+        .reduce(|x, y| if y.total < x.total { y } else { x })?;
+    // A merge with a side read presorted through its index: the plan
+    // `explain::price_merge_join` draws.
+    let merge = match best.method {
+        JoinMethod::MergeOuterA {
+            a_by_index,
+            b_by_index,
+        }
+        | JoinMethod::MergeOuterB {
+            a_by_index,
+            b_by_index,
+        }
+        | JoinMethod::MergeRightB {
+            a_by_index,
+            b_by_index,
+        } if a_by_index || b_by_index => rel
+            .merge_plan(&best, &ra, &rb, left_join)
+            .map(|p| (p, !matches!(best.method, JoinMethod::MergeOuterA { .. }))),
+        _ => None,
+    };
+    Some((best.total, merge))
 }
 
 /// A priced two-table join: the printed outer scan's, the inner scan's and

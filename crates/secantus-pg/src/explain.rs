@@ -1126,19 +1126,30 @@ pub(crate) fn price_merge_join(
     let mut hash = root.children.pop().expect("two children");
     let right = hash.children.pop().expect("one child");
     let left = root.children.pop().expect("two children");
-    let (mut o, mut i, okey, ikey) = if b_outer {
+    let (o, i, okey, ikey) = if b_outer {
         (right, left, &keys.1, &keys.0)
     } else {
         (left, right, &keys.0, &keys.1)
     };
-    o.estimate = Some(outer);
-    i.estimate = Some(inner);
-    let mut osort = PlanNode::over("Sort", o);
-    osort.details.push(("Sort Key".into(), okey.clone()));
-    osort.estimate = Some((plan.outer_sort.0, plan.outer_sort.1, outer.2, outer.3));
-    let mut isort = PlanNode::over("Sort", i);
-    isort.details.push(("Sort Key".into(), ikey.clone()));
-    isort.estimate = Some((plan.inner_sort.0, plan.inner_sort.1, inner.2, inner.3));
+    // An input read presorted through its index (RP-401) is that scan,
+    // priced as the index's; any other is sorted on its key.
+    let input = |mut n: PlanNode,
+                 est: crate::scan_estimate::Estimate,
+                 sort: (f64, f64),
+                 presorted: bool,
+                 key: &String| {
+        if presorted {
+            n.estimate = Some((sort.0, sort.1, est.2, est.3));
+            return n;
+        }
+        n.estimate = Some(est);
+        let mut s = PlanNode::over("Sort", n);
+        s.details.push(("Sort Key".into(), key.clone()));
+        s.estimate = Some((sort.0, sort.1, est.2, est.3));
+        s
+    };
+    let osort = input(o, outer, plan.outer_sort, plan.presorted.0, okey);
+    let isort = input(i, inner, plan.inner_sort, plan.presorted.1, ikey);
     let inner_node = match plan.material {
         Some((s, t)) => {
             let mut m = PlanNode::over("Materialize", isort);

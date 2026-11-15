@@ -1491,7 +1491,6 @@ batch, their tests regression tests:
       Verify: tests/backlog/test_rp_top10_found.py::test_a_btree_gin_index_has_its_pages
 
 
-
 ## Found by batch 71 (2026-10-25)
 
 Found while building REINDEX SCHEMA (RP-196), and fixed in the same batch;
@@ -1959,35 +1958,6 @@ a regression test.
       cluster (found while working RP-393 and RP-397).
       Verify: tests/backlog/test_rp_explain_costs.py::test_plan[analyze of an inner join under an outer join with a one-table ON conjunct], tests/backlog/test_rp_explain_costs.py::test_plan[a left join's ON conjunct over a table of an inner join it null-extends]
       Backlog-ID: RP-978
-- [ ] **A LEFT join on an indexed key prints a Hash join where PostgreSQL
-      merges through the index.** `select * from s left join k on s.a =
-      k.a` (`k.a` the primary key) is, in PostgreSQL 15.19, a `Merge Right
-      Join` on `(k.a = s.a)` over `Index Scan using k_pkey on k` and a
-      Sort of `s` (cost 2.31..4.13); here a `Hash Right Join` over a `Seq
-      Scan on k` (cost 1.68..20.73), the same with a filter on `k`, and an
-      inner join of the two is a `Hash Join` where PostgreSQL's is a
-      `Merge Join`. The join search does not price a merge join whose
-      sorted input is an index scan. Its rows are right; the order they
-      come out in may not be. Measured on a private 15.19 cluster (found
-      while working RP-395).
-      Sized 2026-11-15 (working RP-908): the join IS weighed against a
-      merge through `k_pkey` -- `hash_join_of` (both the joined-rows and
-      the narrow path reach it) calls `unique_key_other_paths`, which
-      builds the merge paths through `JoinRel::add_paths_general` -- but
-      those merges read every input WHOLE: no `mergejoinscansel` is applied
-      to an index-ordered input, so the index scan costs its full 43.27
-      where PostgreSQL's merge stops at `k.a = 30` (outer end fraction
-      ~0.03: 0.28 + 2.04 startup, 4.13 total), and the 20.73 hash wins.
-      The fix is `initial_cost_mergejoin`'s scan fractions in the general
-      merge paths (shared with the multi-table search in `join_search.rs`,
-      so expect pinned plans to move), then a `JoinPick` for a merge with
-      one side presorted by its index, which `explain::price_merge_join`
-      draws with no Sort on that side. The same plan is wrong for `s join
-      k on s.a = k.a` (PostgreSQL: `Merge Join`, cost 2.31..4.13) and with
-      `where k.b = 'v1'` (`Merge Join` 2.31..3.86, its index scan
-      filtered); both print a priced Hash Join here.
-      Backlog-ID: RP-401
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a left join on a primary key merges through its index]
 - [ ] **A nested loop into an index prints no estimate where the inner
       side's own range on the indexed key joins its Index Cond.**
       PostgreSQL 15.19 plans `explain select * from e left join k on e.a <
@@ -2901,15 +2871,6 @@ Measured on a private PostgreSQL 15.19 cluster with the `_SETUP` in
 varchar(4), t text)` holding `(1, 'y', 'y', 'y')` and `(2, 'ab', 'ab ',
 'ab ')`.
 
-- [ ] **EXPLAIN of a JOIN ... ON a `varchar` column equal to a `char(n)`
-      one prints the Hash Cond through `text` casts.** `explain (costs
-      off) select x.k, y.k from ch726 x join ch726 y on x.v = y.c` prints
-      `Hash Cond: ((x.v)::bpchar = y.c)` on PostgreSQL 15.19, the operator
-      it resolved (`bpchareq`, the `varchar` side relabelled); here
-      `((x.v)::text = (y.c)::text)`. The rows are right since RP-736.
-      Found while working RP-736 (2026-11-09).
-      Verify: tests/backlog/test_rp_found_rp726.py::test_explain_join_on_varchar_against_char_n
-      Backlog-ID: RP-738
 
 ## Found while working RP-732 (2026-11-09)
 
@@ -3216,18 +3177,3 @@ statement is VALUES-only and runs there as written. The gap test is in
 `tests/backlog/test_rp_found_rp849.py`.
 
 
-## Found while working RP-700 (2026-11-10)
-
-Measured on PostgreSQL 15.19 (the shared reference on port 5415): every
-statement is VALUES-only and runs there as written.
-
-- [ ] **An ungrouped column beside a subquery in a grouped select list is
-      42703, not 42803.** `select b, (select 1) from (values (1, 2)) v(a,
-      b) group by a` is 42803 `column "v.b" must appear in the GROUP BY
-      clause or be used in an aggregate function` at 8 on PostgreSQL 15.19,
-      and `select (select v.a), b ... group by 1` the same at 22. Here each
-      is 42703 `column "b" does not exist`, with a HINT that `v` has one:
-      `agg_hoist::split` reads `b` from the grouped FROM subquery it builds,
-      and calls `check_stray` only for a query with no GROUP BY.
-      Verify: tests/backlog/test_rp_found_rp700.py::test_an_ungrouped_column_beside_a_subquery_is_42803
-      Backlog-ID: RP-853

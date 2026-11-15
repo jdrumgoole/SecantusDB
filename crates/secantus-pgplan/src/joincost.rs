@@ -166,11 +166,29 @@ const RANDOM_PAGE_COST: f64 = 4.0;
 fn merge_join_full(
     outer: &JoinSide,
     inner: &JoinSide,
-    outer_by_index: bool,
-    inner_by_index: bool,
+    by_index: (bool, bool),
+    scansel: (f64, f64, f64, f64),
     qp: f64,
     inner_markable: bool,
 ) -> Option<(f64, f64)> {
+    merge_join_plan(outer, inner, by_index, scansel, qp, inner_markable)
+        .map(|m| (m.startup, m.total))
+}
+
+/// [`merge_join_full`]'s plan: the join's cost and each input's, a
+/// presorted input's being its path's and a sorted one's its Sort's.
+/// `scansel` is `mergejoinscansel`'s fractions (outer start, outer end,
+/// inner start, inner end): `initial_cost_mergejoin` charges each input's
+/// startup up to its start fraction and its run between the two, and the
+/// clause on the rows read (RP-401).
+fn merge_join_plan(
+    outer: &JoinSide,
+    inner: &JoinSide,
+    (outer_by_index, inner_by_index): (bool, bool),
+    (os, oe, is, ie): (f64, f64, f64, f64),
+    qp: f64,
+    inner_markable: bool,
+) -> Option<MergePlan> {
     let input = |side: &JoinSide, by_index: bool| -> Option<(f64, f64)> {
         if by_index {
             side.ordered
@@ -178,30 +196,55 @@ fn merge_join_full(
             Some(cost_sort(side.scan.1, side.rows, side.width?, None))
         }
     };
-    let (os, ot) = input(outer, outer_by_index)?;
-    let (is, it) = input(inner, inner_by_index)?;
-    let startup = os + is;
-    let mut run = ot - os;
-    let inner_run = it - is;
+    let osort = input(outer, outer_by_index)?;
+    let isort = input(inner, inner_by_index)?;
+    let (outer_path_rows, inner_path_rows) = (outer.rows.max(1.0), inner.rows.max(1.0));
+    let outer_skip_rows = (outer_path_rows * os).round();
+    let inner_skip_rows = (inner_path_rows * is).round();
+    let outer_rows = clamp_row_est(outer_path_rows * oe);
+    let inner_rows = clamp_row_est(inner_path_rows * ie);
+    // Readjusted for the rounding above.
+    let os = outer_skip_rows / outer_path_rows;
+    let is = inner_skip_rows / inner_path_rows;
+    let oe = outer_rows / outer_path_rows;
+    let ie = inner_rows / inner_path_rows;
+    let mut startup = osort.0 + (osort.1 - osort.0) * os;
+    let mut run = (osort.1 - osort.0) * (oe - os);
+    startup += isort.0 + (isort.1 - isort.0) * is;
+    let inner_run = (isort.1 - isort.0) * (ie - is);
     let tuples = clamp_row_est(outer.rows * inner.rows * join_selectivity(outer, inner));
     let skip_mark_restore = inner.unique && qp == 0.0;
     let rescanned = if skip_mark_restore {
         0.0
     } else {
-        (tuples - inner.rows).max(0.0)
+        (tuples - inner_path_rows).max(0.0)
     };
-    let ratio = 1.0 + rescanned / inner.rows.max(1.0);
+    let ratio = 1.0 + rescanned / inner_rows;
     let bare = inner_run * ratio;
-    let materialized = inner_run + CPU_OPERATOR_COST * inner.rows * ratio;
+    let materialized = inner_run + CPU_OPERATOR_COST * inner_rows * ratio;
     let materialize = !skip_mark_restore
         && (materialized < bare
             || (inner_by_index && !inner_markable)
             || (!inner_by_index && relation_byte_size(inner.rows, inner.width?) > WORK_MEM_BYTES));
     run += if materialize { materialized } else { bare };
-    run += clause_cost(outer, inner) * (outer.rows + inner.rows * ratio);
+    let qual = clause_cost(outer, inner);
+    startup += qual * (outer_skip_rows + inner_skip_rows * ratio);
+    run += qual * ((outer_rows - outer_skip_rows) + (inner_rows - inner_skip_rows) * ratio);
     run += (CPU_TUPLE_COST + qp) * tuples;
-    Some((startup, startup + run))
+    let material =
+        materialize.then_some((isort.0, isort.1 + 2.0 * CPU_OPERATOR_COST * inner_path_rows));
+    Some(MergePlan {
+        startup,
+        total: startup + run,
+        outer_sort: osort,
+        inner_sort: isort,
+        material,
+        presorted: (outer_by_index, inner_by_index),
+    })
 }
+
+/// A merge reading both inputs whole (`mergejoinscansel` not applied).
+const WHOLE: (f64, f64, f64, f64) = (0.0, 1.0, 0.0, 1.0);
 
 /// The join clause's cost a tuple (`cost_qual_eval`): its `=` and each
 /// side's own operators.
@@ -729,6 +772,10 @@ pub struct MergePlan {
     pub inner_sort: (f64, f64),
     /// The inner is read through a Material node, and its cost.
     pub material: Option<(f64, f64)>,
+    /// The outer and inner inputs read presorted by their paths (an index
+    /// scan in the key's order), no Sort over them: their `*_sort` is then
+    /// that path's cost (RP-401).
+    pub presorted: (bool, bool),
 }
 
 /// `initial_cost_mergejoin` + `final_cost_mergejoin` for `outer` merged with
@@ -795,6 +842,7 @@ pub fn merge_join_sorted(
         outer_sort: osort,
         inner_sort: isort,
         material,
+        presorted: (false, false),
     }
 }
 
@@ -1561,6 +1609,10 @@ pub struct JoinRel {
     /// `add_paths_general` adds no hash join: the merge joins and nested
     /// loops a hash join priced elsewhere is weighed against (RP-377).
     no_hash: bool,
+    /// `mergejoinscansel`'s fractions for the merge joins
+    /// `add_paths_general` adds, `(a start, a end, b start, b end)`;
+    /// both inputs read whole where it is not set (RP-401).
+    scansel: (f64, f64, f64, f64),
 }
 
 impl JoinRel {
@@ -1581,6 +1633,7 @@ impl JoinRel {
             filter: 0.0,
             ppi_rows: Vec::new(),
             no_hash: false,
+            scansel: WHOLE,
         }
     }
 
@@ -1594,6 +1647,75 @@ impl JoinRel {
     /// their cost a tuple (`cost_qual_eval`).
     pub fn set_filter_cost(&mut self, per_tuple: f64) {
         self.filter = per_tuple;
+    }
+
+    /// `mergejoinscansel`'s fractions of its one clause, `(a start, a end,
+    /// b start, b end)`, for the merge joins `add_paths_general` adds next.
+    pub fn set_merge_scansel(&mut self, scansel: (f64, f64, f64, f64)) {
+        self.scansel = scansel;
+    }
+
+    /// The merge join `choice` (one of this relation's merge paths that
+    /// `add_paths_general` built from `a` and `b`) as a plan: its inputs'
+    /// costs, Sorts and Material (RP-401). `None` for any other method.
+    pub fn merge_plan(
+        &self,
+        choice: &JoinChoice,
+        a: &RelPaths<'_>,
+        b: &RelPaths<'_>,
+        left: bool,
+    ) -> Option<MergePlan> {
+        let (b_outer, a_idx, b_idx) = match choice.method {
+            JoinMethod::MergeOuterA {
+                a_by_index,
+                b_by_index,
+            } => (false, a_by_index, b_by_index),
+            JoinMethod::MergeOuterB {
+                a_by_index,
+                b_by_index,
+            }
+            | JoinMethod::MergeRightB {
+                a_by_index,
+                b_by_index,
+            } => (true, a_by_index, b_by_index),
+            _ => return None,
+        };
+        let (pa, pb) = (a.at(choice.a_path, a_idx), b.at(choice.b_path, b_idx));
+        let scansel = self.oriented_scansel(b_outer, left);
+        if b_outer {
+            merge_join_plan(
+                &pb,
+                &pa,
+                (b_idx, a_idx),
+                scansel,
+                self.filter,
+                a.set.count_ones() == 1,
+            )
+        } else {
+            merge_join_plan(
+                &pa,
+                &pb,
+                (a_idx, b_idx),
+                scansel,
+                self.filter,
+                b.set.count_ones() == 1,
+            )
+        }
+    }
+
+    /// The fractions with the outer side first; `initial_cost_mergejoin`
+    /// reads an outer join's preserved side (`a`) whole.
+    fn oriented_scansel(&self, b_outer: bool, left: bool) -> (f64, f64, f64, f64) {
+        let (mut as_, mut ae, bs, be) = self.scansel;
+        if left {
+            as_ = 0.0;
+            ae = 1.0;
+        }
+        if b_outer {
+            (bs, be, as_, ae)
+        } else {
+            (as_, ae, bs, be)
+        }
     }
 
     /// `add_paths_to_joinrel` for `a` joined to `b` (`left`: a LEFT join,
@@ -2267,6 +2389,10 @@ impl JoinRel {
         let no_hash = self.no_hash;
         let extra = self.extra;
         let qp = self.filter;
+        let scansels = [
+            self.oriented_scansel(false, left),
+            self.oriented_scansel(true, left),
+        ];
         let ppi = &mut self.ppi_rows;
         let paths = &mut self.paths;
         let multi = a.side.extra.n > 0;
@@ -2328,6 +2454,7 @@ impl JoinRel {
                 (a, b, a_class, b_class)
             };
             let right = b_outer && left;
+            let sel = scansels[usize::from(b_outer)];
             let ids = |o: usize, i: usize| if b_outer { (i, o) } else { (o, i) };
             let merge = |oi: bool, ii: bool| {
                 if right {
@@ -2367,9 +2494,14 @@ impl JoinRel {
             } else {
                 (outer.sorted_on(oct, o_class), inner.sorted_on(ict, i_class))
             };
-            if let Some(cost) =
-                merge_join_full(&outer.at(oct, os), &inner.at(ict, is), os, is, qp, markable)
-            {
+            if let Some(cost) = merge_join_full(
+                &outer.at(oct, os),
+                &inner.at(ict, is),
+                (os, is),
+                sel,
+                qp,
+                markable,
+            ) {
                 consider(cost, merge_order, merge(os, is), ids(oct, ict), None, 0);
             }
             // match_unsorted_outer.
@@ -2477,14 +2609,15 @@ impl JoinRel {
                     is
                 };
                 let o = outer.at(oi, true);
-                if let Some(cost) = merge_join_full(&o, &inner.at(ict, is), true, is, qp, markable)
+                if let Some(cost) =
+                    merge_join_full(&o, &inner.at(ict, is), (true, is), sel, qp, markable)
                 {
                     consider(cost, merge_order, merge(true, is), ids(oi, ict), None, req);
                 }
                 let Some(ic) = i_order else { continue };
                 for ip in inner.presorted_inners(ic, is) {
                     if let Some(cost) =
-                        merge_join_full(&o, &inner.at(ip, true), true, true, qp, markable)
+                        merge_join_full(&o, &inner.at(ip, true), (true, true), sel, qp, markable)
                     {
                         consider(cost, merge_order, merge(true, true), ids(oi, ip), None, req);
                     }
@@ -3077,6 +3210,52 @@ mod tests {
             default_ndistinct: true,
             ..pk()
         }
+    }
+
+    /// `initial_cost_mergejoin`'s scan fractions (RP-401): PostgreSQL
+    /// 15.19, `s` (30 rows, keys 1..30, width 20) joined to `k` (1,000
+    /// rows, a primary key 1..1000, its index scan 0.28..43.27, width 7):
+    /// the merge reads `k`'s index only to `k.a = 30` and costs
+    /// 2.31..4.13; read whole it would cost 43.27 and more.
+    #[test]
+    fn a_merge_stops_reading_its_index_at_the_other_sides_largest_key() {
+        let k = JoinSide {
+            rows: 1000.0,
+            tuples: 1000.0,
+            scan: (0.0, 15.0),
+            startup_scan: (0.0, 15.0),
+            ordered: Some((0.275, 43.275)),
+            scan_ordered: false,
+            unique: true,
+            ndistinct: 1000.0,
+            default_ndistinct: false,
+            key_ops: 0.0,
+            rel_rows: 1000.0,
+            width: Some(7),
+            extra: ExtraKeys::default(),
+        };
+        let s = JoinSide {
+            rows: 30.0,
+            tuples: 30.0,
+            scan: (0.0, 1.30),
+            startup_scan: (0.0, 1.30),
+            ordered: None,
+            unique: false,
+            ndistinct: 30.0,
+            rel_rows: 30.0,
+            width: Some(20),
+            ..k
+        };
+        let m = merge_join_plan(&k, &s, (true, false), (0.0, 0.03, 0.0, 1.0), 0.0, true)
+            .expect("a plan");
+        assert_eq!(format!("{:.2}..{:.2}", m.startup, m.total), "2.31..4.13");
+        assert_eq!(m.presorted, (true, false));
+        assert_eq!(
+            format!("{:.2}..{:.2}", m.inner_sort.0, m.inner_sort.1),
+            "2.04..2.11"
+        );
+        let whole = merge_join_plan(&k, &s, (true, false), WHOLE, 0.0, true).expect("a plan");
+        assert!(whole.total > 43.0, "{}", whole.total);
     }
 
     #[test]
