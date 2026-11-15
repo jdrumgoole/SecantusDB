@@ -4958,6 +4958,40 @@ fn an_aggregate_clause_on_a_plain_function_is_42809() {
 }
 
 #[test]
+fn an_ordered_set_aggregate_under_over_is_refused() {
+    // RP-869: `rank(1)` resolves to the hypothetical-set aggregate, so it
+    // needs WITHIN GROUP (42809); with WITHIN GROUP, OVER is 0A000. Answers
+    // measured on PostgreSQL 15.19.
+    for (q, code, want) in [
+        (
+            "select rank(1) over ()",
+            "42809",
+            "WITHIN GROUP is required for ordered-set aggregate rank",
+        ),
+        (
+            "select percentile_cont(0.5) within group (order by id) over () from t",
+            "0A000",
+            "OVER is not supported for ordered-set aggregate percentile_cont",
+        ),
+        (
+            "select rank(1) within group (order by id) over () from t",
+            "0A000",
+            "OVER is not supported for ordered-set aggregate rank",
+        ),
+    ] {
+        let _ = take_error_location();
+        let err = analysed(q).expect_err(q);
+        assert!(
+            matches!(&err, Error::Sqlstate(c, m) if *c == code && *m == want),
+            "{q}: {err:?}"
+        );
+        assert_eq!(take_error_location(), Some(7), "{q}");
+    }
+    // With no argument `rank` is still the window function.
+    analysed("select rank() over (order by id) from t").expect("rank()");
+}
+
+#[test]
 fn over_on_a_plain_function_is_42809_after_the_call_resolves() {
     // `ParseFuncOrColumn` resolves the arguments and the function, then
     // refuses an aggregate-only clause on a plain function, first one first
@@ -8237,7 +8271,8 @@ fn a_cast_of_a_column_is_an_expression_with_its_functions_cost() {
     // A folded constant cast on the other side costs nothing.
     let q = scan_expr_quals("select * from t where n::int2 = 5::int2").expect("priced");
     assert_eq!((q[0].op, q[0].operators), (colstats::Op::Eq, 2));
-    // Not priced: a binary-coercible cast (a RelabelType, RP-912), a
+    // Not priced as an expression: a binary-coercible cast (a RelabelType
+    // stripped before planning, RP-912, so a column qual), a
     // cast with a type modifier, a cast to a type outside the integer and
     // string families, and a cast of an expression.
     for sql in [

@@ -2849,9 +2849,9 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "        ->  Seq Scan on e e2  (cost=0.00..15.00 rows=1000 width=7)",
         ],
     ),
-    # Still open: a binary-coercible cast (text to varchar, back to text
-    # for the operator) is a RelabelType PostgreSQL strips, so the column
-    # keeps its statistics and prints bare; here the scan is not priced.
+    # Fixed: a binary-coercible cast (text to varchar, back to text for
+    # the operator) is a RelabelType PostgreSQL strips, so the column keeps
+    # its statistics and prints bare; the scan was not priced.
     "a seq scan filter over a binary-coercible cast": (
         "RP-912",
         _ANALYSED,
@@ -5796,6 +5796,7 @@ def _marked(name: str, item: str) -> Any:
         )
     fixed = item in (
         "RP-314",
+        "RP-912",
         "RP-918",
         "RP-920",
         "RP-317",

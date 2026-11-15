@@ -72,7 +72,7 @@ ORDERED_SET = {
 }
 
 
-@pytest.mark.backlog("RP-869")
+@pytest.mark.backlog_fixed("RP-869")
 @pytest.mark.parametrize("query", list(ORDERED_SET))
 def test_an_ordered_set_aggregate_over_a_window_is_refused(query: str, dsn: str) -> None:
     assert _rows(dsn, query) == ORDERED_SET[query]
