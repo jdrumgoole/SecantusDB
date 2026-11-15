@@ -738,16 +738,6 @@ These are explicit non-goals. Don't add them without a reason.
       ties keep the read order. Found 2026-11-12 (RM-471).
       Verify: tests/backlog/test_rm_found_rm471.py::test_an_or_of_two_indexes_returns_its_branches_in_order
       Backlog-ID: RM-572
-- [ ] **A clause beside an `$or` is rechecked in a FETCH.** mongod 8.2.11
-      pushes `x: {$lt: 10}` beside `{$or: [{y: 0}, {y: 1, x: {$gt:
-      3}}]}` into each branch's bounds over `{y: 1, x: 1}` and rechecks
-      nothing, so `{_id: 0, x: 1}` is answered from the keys
-      (`PROJECTION_DEFAULT <- OR <- IXSCAN`). This server's bounds are the
-      same, but it rechecks the clause in a FETCH over the OR (`FETCH`
-      filter `{x: {$lt: 10}}`), so it also fetches for a covered
-      projection. Found 2026-11-12 (RM-471).
-      Verify: tests/backlog/test_rm_found_rm471.py::test_a_clause_beside_an_or_is_answered_by_its_bounds
-      Backlog-ID: RM-574
 - [ ] **A sort over an `$or` with a fetched branch sorts documents.**
       mongod 8.2.11's OR of `FETCH <- IXSCAN w_1` and `IXSCAN y_1_x_1` is
       not fetched, and every branch carries `x` (a fetched one carries every

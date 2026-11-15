@@ -1150,14 +1150,18 @@ fn access_of(chosen: IndexUse, parts: &[Document], q: &Query) -> Access {
 /// rechecked against. `outer` holds the clauses beside the `$or`, which
 /// mongod pushes down into each branch (measured 8.2.11: `{$or: [{a: 3},
 /// {c: 5}], b: 2}` reads `a_1_b_1` with `b` bounded for the first branch);
-/// a branch reads only an index on a field the branch itself names, and
-/// the outer clauses are rechecked above the `OR`, not in a branch.
+/// a branch reads only an index on a field the branch itself names. An
+/// outer clause every branch's bounds decide is rechecked nowhere (8.2.11:
+/// `{$or: [{y: 0}, {y: 1, x: {$gt: 3}}], x: {$lt: 10}}` over `y_1_x_1`
+/// reads `PROJECTION_DEFAULT <- OR <- IXSCAN`, no FETCH); any other is
+/// rechecked above the `OR`, not in a branch. The third value says, per
+/// outer clause, whether it is rechecked.
 fn or_access(
     branches: &[Bson],
     outer: &[Document],
     q: &Query,
     catalog: &[Arc<IndexInfo>],
-) -> Option<(Node, Option<Document>)> {
+) -> Option<(Node, Option<Document>, Vec<bool>)> {
     // The subplanner plans each branch in the classic engine, whatever
     // runs the query (measured 8.2.11, 2026-11-08: a rooted `$or` behind a
     // `$group` caches its branch with `worksType: "works"`).
@@ -1173,6 +1177,7 @@ fn or_access(
     type Branch = (IxScan, bool, Document);
     let mut shared: Vec<(usize, Vec<Branch>)> = Vec::new();
     let mut own = Vec::new();
+    let mut rechecked = vec![false; outer.len()];
     for branch in branches {
         let doc = branch.as_document()?;
         let mut parts = clauses(doc);
@@ -1215,8 +1220,21 @@ fn or_access(
             Some(found) => found,
             None => index_access(&parts, &plain, &usable)?,
         };
-        // The outer clauses are rechecked above the `OR`.
+        // An outer clause this branch's bounds leave to a filter is
+        // rechecked above the `OR`.
         if !outer.is_empty() {
+            let mut left: Vec<Document> = access.fetch_filter.iter().flat_map(clauses).collect();
+            if let Node::IxScan(ix) = &access.scan {
+                left.extend(ix.filter.iter().flat_map(clauses));
+            }
+            if !matches!(access.scan, Node::IxScan(_)) {
+                rechecked.iter_mut().for_each(|r| *r = true);
+            }
+            for (k, clause) in outer.iter().enumerate() {
+                if left.contains(clause) {
+                    rechecked[k] = true;
+                }
+            }
             access.fetch_filter = access.fetch_filter.and_then(|f| {
                 assemble(
                     clauses(&f)
@@ -1290,7 +1308,7 @@ fn or_access(
         })
         .collect();
     if own.is_empty() && scans.len() == 1 {
-        return scans.pop();
+        return scans.pop().map(|(scan, filter)| (scan, filter, rechecked));
     }
     let fetched = |(scan, filter): (Node, Option<Document>)| match filter {
         Some(f) => Node::fetch(Some(f), scan),
@@ -1301,9 +1319,9 @@ fn or_access(
     inputs.extend(own);
     inputs.extend(last);
     if let Some(merged) = sort_of(q).and_then(|s| merge_branches(&inputs, s, q)) {
-        return Some((merged, None));
+        return Some((merged, None, rechecked));
     }
-    Some((Node::Or(inputs), None))
+    Some((Node::Or(inputs), None, rechecked))
 }
 
 /// The `$or`'s branches merged in the sort's order, when every branch's
@@ -1362,7 +1380,7 @@ fn access(q: &Query, catalog: &[Arc<IndexInfo>]) -> Access {
     if let [only] = parts.as_slice() {
         if let Ok(parsed) = only.get_array("$or") {
             if q.hint == Hint::None {
-                if let Some((scan, fetch_filter)) = or_access(parsed, &[], q, catalog) {
+                if let Some((scan, fetch_filter, _)) = or_access(parsed, &[], q, catalog) {
                     let sorted = matches!(scan, Node::SortMerge { .. });
                     return Access {
                         scan,
@@ -1398,7 +1416,9 @@ fn access(q: &Query, catalog: &[Arc<IndexInfo>]) -> Access {
             .filter(|(j, _)| *j != i)
             .map(|(_, c)| c.clone())
             .collect();
-        if let Some((scan, recheck)) = or_access(branches, &rest, q, catalog) {
+        if let Some((scan, recheck, kept)) = or_access(branches, &rest, q, catalog) {
+            let mut kept = kept.into_iter();
+            rest.retain(|_| kept.next().unwrap_or(true));
             rest.extend(recheck);
             let sorted = matches!(scan, Node::SortMerge { .. });
             return Access {
@@ -1662,7 +1682,9 @@ fn candidates(
                     .filter(|(j, _)| *j != at)
                     .map(|(_, c)| c.clone())
                     .collect();
-                if let Some((scan, recheck)) = or_access(branches, &rest, q, catalog) {
+                if let Some((scan, recheck, kept)) = or_access(branches, &rest, q, catalog) {
+                    let mut kept = kept.into_iter();
+                    rest.retain(|_| kept.next().unwrap_or(true));
                     rest.extend(recheck);
                     let sorted = matches!(scan, Node::SortMerge { .. });
                     out.push((

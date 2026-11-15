@@ -213,14 +213,15 @@ def test_an_id_projection_is_covered(rust_mongo: Any, mongod: Any) -> None:
     assert answers["rust"] == answers["mongod"]
 
 
-@pytest.mark.backlog("RM-574")
+@pytest.mark.backlog_fixed("RM-574")
 def test_a_clause_beside_an_or_is_answered_by_its_bounds(rust_mongo: Any, mongod: Any) -> None:
     """mongod 8.2.11 pushes `x: {$lt: 10}` beside `{$or: [{y: 0}, {y: 1,
     x: {$gt: 3}}]}` into each branch's bounds over `{y: 1, x: 1}` and
     rechecks nothing, so `{_id: 0, x: 1}` is answered from the keys
-    (`PROJECTION_DEFAULT <- OR <- IXSCAN`). This server's bounds are the
-    same, but it rechecks the clause in a FETCH (`PROJECTION_SIMPLE <-
-    FETCH <- OR`)."""
+    (`PROJECTION_DEFAULT <- OR <- IXSCAN`). This server's bounds were the
+    same, but it rechecked the clause in a FETCH (`PROJECTION_SIMPLE <-
+    FETCH <- OR`), until an outer clause every branch's bounds decide was
+    rechecked nowhere (2026-11-15)."""
     command = {
         "find": "c",
         "filter": {"$or": [{"y": 0}, {"y": 1, "x": {"$gt": 3}}], "x": {"$lt": 10}},
