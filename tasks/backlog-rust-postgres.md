@@ -1162,6 +1162,15 @@ one beside it.
       `regclass` list on every statement after DDL; a temp sequence is
       flagged when the list is deferred. The gap test then passed five of
       ten alone, and RP-928's eight of ten, at a load average near 14.)
+      (2026-11-15, after RP-928's `relation_oid` became a keyed lookup:
+      still five of ten alone at a load average near 12. A `sample` of a
+      `CREATE TABLE` loop at 800 tables, debug build, put the statement
+      start's republication at about half the samples: `patch_table_defs`
+      copying every definition (~10%), `publish_user_types`' index
+      relations (~6%), its `relations_derivation` temp check and the
+      `session_has_temp` scans (~4% each), `inheritance` (~3%). Each is a
+      linear pass, none quadratic, so what is left is the per-relation
+      keying above, not another lookup to swap in.)
       Backlog-ID: RP-911
       Verify: tests/backlog/test_rp_catalog_latency.py::test_the_first_catalog_query_after_ddl_costs_the_same_at_800_tables_within_a_tenth
 
