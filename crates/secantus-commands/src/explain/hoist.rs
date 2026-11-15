@@ -874,6 +874,10 @@ pub(crate) fn runnable(stages: Vec<Bson>) -> Vec<Bson> {
         .into_iter()
         .map(|stage| {
             let pushed = as_match(&stage).filter(|_| is_pushed(&stage)).cloned();
+            let pushed = pushed.or_else(|| {
+                let d = stage.as_document()?;
+                d.get_document(REDACT_MATCH).ok().cloned()
+            });
             pushed.map_or(stage, |filter| Bson::Document(doc! { "$match": filter }))
         })
         .collect()
@@ -999,6 +1003,158 @@ fn overridden(after: &[Bson]) -> bool {
     false
 }
 
+/// A copy of the part of each `$match` behind a `$redact` that the
+/// `$redact` cannot change the answer of, put ahead of the `$redact`, as
+/// mongod's `DocumentSourceRedact::doOptimizeAt` does with
+/// `DocumentSourceMatch::redactSafePortion` (measured 8.2.11, RM-580:
+/// `[{$redact: "$$KEEP"}, {$match: {z: 0}}]` reads `{z: {$eq: 0}}`). The
+/// `$match` behind stays where it is. This copy moves on ahead as any
+/// `$match`, into the query; [`list_matches_ahead_of_redacts`] puts the
+/// one mongod lists there.
+fn copy_matches_ahead_of_redacts(stages: &mut Vec<Bson>) {
+    let mut at = 0;
+    while at + 1 < stages.len() {
+        let redact = redact_uncopied(stages, at);
+        let safe = if redact {
+            as_match(&stages[at + 1])
+                .filter(|_| !is_pushed(&stages[at + 1]))
+                .map(redact_safe_portion)
+                .filter(|safe| !safe.is_empty())
+        } else {
+            None
+        };
+        if let Some(safe) = safe {
+            stages.insert(at, Bson::Document(doc! { "$match": safe }));
+            at += 1;
+        }
+        at += 1;
+    }
+}
+
+/// A [`REDACT_MATCH`] of the safe part of each `$match` behind a `$redact`,
+/// ahead of the `$redact`: mongod copies the `$match` again when it
+/// optimizes the stages left behind its cursor, so `explain` lists that
+/// copy there as well as reading the first (measured 8.2.11, RM-580:
+/// `[{$addFields: {q: 1}}, {$redact: "$$KEEP"}, {$match: {z: 0}}]` reads
+/// `{z: {$eq: 0}}` and lists `$addFields`, `$match`, `$redact`, `$match`).
+fn list_matches_ahead_of_redacts(stages: &mut Vec<Bson>) {
+    let mut at = 0;
+    while at + 1 < stages.len() {
+        let redact = redact_uncopied(stages, at);
+        let safe = if redact {
+            as_match(&stages[at + 1])
+                .map(redact_safe_portion)
+                .filter(|safe| !safe.is_empty())
+        } else {
+            None
+        };
+        if let Some(safe) = safe {
+            stages.insert(at, Bson::Document(doc! { REDACT_MATCH: safe }));
+            at += 1;
+        }
+        at += 1;
+    }
+}
+
+/// Whether `stages[at]` is a `$redact` not yet copied ahead of: the
+/// [`REDACT_MATCH`] listed there marks one copied, so hoisting the stages
+/// again, as `explain` does until nothing moves, copies nothing more.
+fn redact_uncopied(stages: &[Bson], at: usize) -> bool {
+    let redact = stages[at]
+        .as_document()
+        .is_some_and(|d| d.len() == 1 && d.contains_key("$redact"));
+    let copied = at > 0
+        && stages[at - 1]
+            .as_document()
+            .is_some_and(|d| d.contains_key(REDACT_MATCH));
+    redact && !copied
+}
+
+/// The `$match` [`list_matches_ahead_of_redacts`] puts ahead of a
+/// `$redact`: listed and run as a `$match`, but never moved or taken into
+/// the query.
+pub(crate) const REDACT_MATCH: &str = "$_secantusRedactMatch";
+
+/// mongod's `redactSafePortion`: the clauses of `filter` whose answer a
+/// `$redact` cannot change -- a field compared with a value that is not an
+/// array, a document, null or undefined (`$eq`, `$gt`, `$gte`, `$lt`,
+/// `$lte`, `$in` of such values), `$type`, `$regex`, `$mod` and
+/// `$elemMatch`, never `$exists` or `$size` (measured 8.2.11); an `$and` of what is safe in it, and an `$or` whose
+/// every branch has a safe part.
+fn redact_safe_portion(filter: &Document) -> Document {
+    // Each safe clause, in the order written; `true` for a field's.
+    let mut parts: Vec<(Document, bool)> = Vec::new();
+    for (key, value) in filter {
+        match key.as_str() {
+            "$or" => {
+                let Some(branches) = value.as_array() else {
+                    continue;
+                };
+                let safe: Option<Vec<Bson>> = branches
+                    .iter()
+                    .map(|b| {
+                        let part = redact_safe_portion(b.as_document()?);
+                        (!part.is_empty()).then_some(Bson::Document(part))
+                    })
+                    .collect();
+                if let Some(safe) = safe.filter(|s| !s.is_empty()) {
+                    parts.push((doc! { "$or": safe }, false));
+                }
+            }
+            "$and" => {
+                for b in value.as_array().into_iter().flatten() {
+                    if let Some(part) = b.as_document().map(redact_safe_portion) {
+                        if !part.is_empty() {
+                            parts.push((part, false));
+                        }
+                    }
+                }
+            }
+            k if k.starts_with('$') => {}
+            _ => match value {
+                Bson::Document(ops) if is_operator(ops) => {
+                    let safe: Document = ops
+                        .iter()
+                        .filter(|(op, v)| redact_safe_op(op, v))
+                        .map(|(op, v)| (op.clone(), v.clone()))
+                        .collect();
+                    // `$options` means nothing without its `$regex`.
+                    if !safe.is_empty() && !(safe.len() == 1 && safe.contains_key("$options")) {
+                        parts.push((doc! { key.clone(): safe }, true));
+                    }
+                }
+                v if redact_safe_value(v) => parts.push((doc! { key.clone(): v.clone() }, true)),
+                _ => {}
+            },
+        }
+    }
+    if parts.iter().all(|(_, field)| *field) {
+        return parts.into_iter().flat_map(|(d, _)| d).collect();
+    }
+    if parts.len() == 1 {
+        return parts.pop().map(|(d, _)| d).unwrap_or_default();
+    }
+    doc! { "$and": parts.into_iter().map(|(d, _)| Bson::Document(d)).collect::<Vec<_>>() }
+}
+
+fn redact_safe_value(v: &Bson) -> bool {
+    !matches!(
+        v,
+        Bson::Array(_) | Bson::Document(_) | Bson::Null | Bson::Undefined
+    )
+}
+
+fn redact_safe_op(op: &str, v: &Bson) -> bool {
+    match op {
+        "$eq" | "$gt" | "$gte" | "$lt" | "$lte" => redact_safe_value(v),
+        "$in" => v
+            .as_array()
+            .is_some_and(|items| items.iter().all(redact_safe_value)),
+        "$type" | "$regex" | "$options" | "$mod" | "$elemMatch" => true,
+        _ => false,
+    }
+}
+
 fn hoist(pipeline: &[Bson]) -> Vec<Bson> {
     let mut out: Vec<Bson> = drop_overridden_sorts(pipeline)
         .into_iter()
@@ -1012,6 +1168,7 @@ fn hoist(pipeline: &[Bson]) -> Vec<Bson> {
             },
         )
         .collect();
+    copy_matches_ahead_of_redacts(&mut out);
     // A `$skip` / `$limit` is a wall a `$match` never crosses, but mongod
     // still moves one behind it ahead of the stages after it (8.2.11:
     // `[{$limit: 3}, {$project: {x: 1}}, {$match: {x: 1}}]` lists `$match`
@@ -1151,6 +1308,7 @@ fn hoist(pipeline: &[Bson]) -> Vec<Bson> {
         };
         out.splice(..lead, [Bson::Document(doc! { key: joined })]);
     }
+    list_matches_ahead_of_redacts(&mut out);
     sorts_take_limits(&mut out);
     out
 }

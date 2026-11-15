@@ -35,11 +35,11 @@ def _statement_commands(client: Any, is_mongod: bool) -> list[dict]:
     ]
 
 
-@pytest.mark.backlog("RM-581")
+@pytest.mark.backlog_fixed("RM-581")
 def test_a_statement_line_carries_its_commands_comment(rust_mongo: Any, mongod_rs: Any) -> None:
     """mongod 8.2.11's line for a `delete` or `update` statement shows the
     statement with its command's `comment` (`{q, limit, comment}`,
-    `{q, u, multi, upsert, comment}`); this server's shows the statement without it."""
+    `{q, u, multi, upsert, comment}`); this server's showed the statement without it."""
     mongod = _statement_commands(mongod_rs, True)
     assert [c.get("comment") for c in mongod] == ["probe", "probe"]
     assert _statement_commands(rust_mongo, False) == mongod

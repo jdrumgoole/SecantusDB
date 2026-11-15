@@ -744,8 +744,7 @@ These are explicit non-goals. Don't add them without a reason.
         all for a cached plan, and this planner's candidates are not its
         enumeration;
       - the other aggregates: one with a `$match` or `$redact` left after
-        its read (mongod's optimizer moves some where this server's does
-        not: RM-580), a `$limit` there (it stops its source short
+        its read, a `$limit` there (it stops its source short
         of the documents this server runs in one go), a `$lookup`,
         `$unionWith`, `$facet`, `$geoNear` or `$out` / `$merge`, a stage
         read whole that SBE does not take whole (a `$sort` after a
@@ -779,14 +778,6 @@ These are explicit non-goals. Don't add them without a reason.
       e01df2d2 (2026-11-08), each command checked against a probe of its own.
       Backlog-ID: RM-360
       Verify: tests/backlog/test_rm_355_364.py::test_every_line_counts_its_interrupt_checks
-- [ ] **An `update` or `delete` statement's line leaves out the command's
-      `comment`.** mongod 8.2.11's `Slow query` line for each statement
-      shows it with its command's `comment` (`{q, limit, comment}`,
-      `{q, u, multi, upsert, comment}`); this server's shows the statement
-      alone, so a log search for the comment misses the statement's line.
-      Found while working RM-478, 2026-11-13.
-      Verify: tests/backlog/test_rm_statement_line_comment.py::test_a_statement_line_carries_its_commands_comment
-      Backlog-ID: RM-581
 - [ ] **A `dataSize` of a view answers.** mongod 8.2.11 refuses
       `{dataSize: "<db>.v"}` of a view (166, CommandNotSupportedOnView);
       this server answers `ok: 1`, sizing nothing. Found while working
@@ -800,32 +791,6 @@ These are explicit non-goals. Don't add them without a reason.
       working RM-485, 2026-11-13.
       Verify: tests/backlog/test_rm_view_ddl_refusals.py::test_a_drop_indexes_of_system_views_answers
       Backlog-ID: RM-588
-- [ ] **A `createIndexes` that builds nothing names its collection.**
-      mongod 8.2.11's line for a `createIndexes` of an index that is there
-      already (`{x: 1}` on a collection, a time-series collection's own
-      `{m: 1, t: 1}`) names `<db>.$cmd`; this server's names the collection
-      (the time-series one's buckets since RM-484). Found while working
-      RM-484, 2026-11-13.
-      Verify: tests/backlog/test_rm_ts_ddl_lines.py::test_a_create_indexes_that_builds_nothing_names_cmd
-      Backlog-ID: RM-582
-- [ ] **An index build of a time-series collection writes no build line.**
-      mongod 8.2.11 writes two lines for a `createIndexes` that builds an
-      index of a time-series collection, the command's and its build
-      thread's, each naming `<db>.system.buckets.ts`; this server writes
-      the command's alone. Its time-series documents live in its column
-      store (`ts_store.rs`), so `create_indexes` finds the collection's
-      document table empty and takes the build for one of an empty
-      collection, which logs no line of its own. Found while working
-      RM-484, 2026-11-13.
-      Verify: tests/backlog/test_rm_ts_ddl_lines.py::test_a_time_series_index_build_has_its_line
-      Backlog-ID: RM-583
-- [ ] **A `collMod` of a missing collection names it, and is profiled.**
-      mongod 8.2.11's line for one (26, `NamespaceNotFound`) names
-      `<db>.$cmd`, and it writes no profile entry; this server's line names
-      the collection, and it writes an entry with `ok: 0`. Found while
-      working RM-484, 2026-11-13.
-      Verify: tests/backlog/test_rm_ts_ddl_lines.py::test_a_coll_mod_of_a_missing_collection_names_cmd
-      Backlog-ID: RM-584
 - [ ] **An `insert` into a time-series collection's buckets is not
       profiled.** mongod 8.2.11 writes a profile entry for an `insert` into
       `<db>.system.buckets.ts`; this server writes the line and no entry.
@@ -1808,15 +1773,6 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       2026-11-14 working RM-538.
       Verify: tests/backlog/test_rm_found_2026_11_14_rm538.py::test_explain_refuses_a_sample_rate_the_run_refuses
       Backlog-ID: RM-663
-- [ ] **Explain leaves a `$match` after a `$redact` where it was
-      written.** mongod 8.2.11 copies a `$match` that follows a `$redact`
-      ahead of it and into the query (`[{$redact: "$$KEEP"}, {$match: {z:
-      0}}]` explains as a `$cursor` reading `{z: {$eq: 0}}`, then the
-      `$match`, the `$redact` and the `$match` again); this server lists
-      the two stages as written over a whole-collection `$cursor`, and reads
-      the collection so. Found 2026-11-12 (RM-360).
-      Verify: tests/backlog/test_rm_found_2026_11_12_rm360.py::test_a_match_after_a_redact_is_copied_ahead_of_it
-      Backlog-ID: RM-580
 - [ ] **A `$lookup` over a collection reports nothing it examined.** At
       `executionStats` mongod 8.2.11 gives a `$lookup` whose pipeline reads
       a collection its `totalDocsExamined`, `totalKeysExamined`,

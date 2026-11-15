@@ -1202,6 +1202,9 @@ pub(crate) struct Statements<'a> {
     /// The command's planning time when the statement now running began:
     /// it plans before it opens.
     planning_mark: Option<std::time::Duration>,
+    /// The command's `comment`, which mongod shows last in each statement
+    /// it logs and profiles (measured 8.2.11, RM-581).
+    comment: Option<Bson>,
 }
 
 struct Open {
@@ -1256,6 +1259,7 @@ impl<'a> Statements<'a> {
             open: None,
             storage,
             read_concern: crate::opdebug::read_concern(request),
+            comment: request.get("comment").cloned(),
             planning_mark: crate::explain::planning_spent(),
         }
     }
@@ -1283,7 +1287,7 @@ impl<'a> Statements<'a> {
                 db: db.to_string(),
                 coll: coll.to_string(),
                 op: "update",
-                command: update_statement(spec),
+                command: with_comment(update_statement(spec), self.comment.as_ref()),
                 start: Instant::now(),
                 n: i64::from(n),
                 modified: i64::from(modified),
@@ -1304,7 +1308,7 @@ impl<'a> Statements<'a> {
                 db: db.to_string(),
                 coll: coll.to_string(),
                 op: "remove",
-                command: delete_statement(spec),
+                command: with_comment(delete_statement(spec), self.comment.as_ref()),
                 start: Instant::now(),
                 n: i64::from(n),
                 modified: 0,
@@ -1503,6 +1507,15 @@ fn delete_statement(spec: &Document) -> Document {
     out
 }
 
+/// A statement as mongod shows it: with its command's `comment`, if any,
+/// as the last field (measured 8.2.11, RM-581).
+fn with_comment(mut statement: Document, comment: Option<&Bson>) -> Document {
+    if let Some(c) = comment {
+        statement.insert("comment", c.clone());
+    }
+    statement
+}
+
 /// A statement's `hint`, when it names one.
 fn hint(spec: &Document, out: &mut Document) {
     match spec.get("hint") {
@@ -1543,11 +1556,14 @@ pub(crate) fn refused_statement(
     if !crate::slowop::will_log(worked) {
         return;
     }
-    let command = if op == "update" {
-        update_statement(spec)
-    } else {
-        delete_statement(spec)
-    };
+    let command = with_comment(
+        if op == "update" {
+            update_statement(spec)
+        } else {
+            delete_statement(spec)
+        },
+        request.get("comment"),
+    );
     let statement = Statement {
         ns: format!("{db}.{coll}"),
         db: db.to_string(),

@@ -325,6 +325,12 @@ fn line_target<'a>(
             return (db, target.filter(|_| ran));
         }
         "compact" | "reIndex" | "convertToCapped" if !ran => return (db, None),
+        // A `createIndexes` that built nothing -- every index it asked for
+        // is there already -- names `<db>.$cmd`, a time-series collection's
+        // too (measured 8.2.11, RM-582).
+        "createIndexes" if reply.get_str("note") == Ok("all indexes already exist") => {
+            return (db, None)
+        }
         _ => return (db, target_collection(name, request)),
     }
     match request.get_str(name).ok().and_then(|ns| ns.split_once('.')) {
@@ -914,6 +920,30 @@ mod tests {
         assert_eq!(ns(drop(), refused(26)), "a.$cmd");
         assert_eq!(ns(drop(), refused(27)), "a.v");
         assert_eq!(ns(drop(), doc! {"ok": 1.0}), "a.v");
+    }
+
+    /// A `createIndexes` that built nothing names `<db>.$cmd`; one that
+    /// built an index names its collection, as mongod 8.2.11's lines do
+    /// (RM-582).
+    #[test]
+    fn a_create_indexes_that_builds_nothing_names_cmd() {
+        let ns = |reply: Document| {
+            let request = doc! {"createIndexes": "c", "indexes": [], "$db": "a"};
+            let attr = attributes(
+                &request,
+                &reply,
+                Document::new(),
+                "a",
+                Duration::ZERO,
+                Duration::ZERO,
+            );
+            attr.get_str("ns").unwrap().to_string()
+        };
+        let noop = doc! {"numIndexesBefore": 2, "numIndexesAfter": 2,
+        "note": "all indexes already exist", "ok": 1.0};
+        assert_eq!(ns(noop), "a.$cmd");
+        let built = doc! {"numIndexesBefore": 1, "numIndexesAfter": 2, "ok": 1.0};
+        assert_eq!(ns(built), "a.c");
     }
 
     /// A command whose string value is not its collection names
