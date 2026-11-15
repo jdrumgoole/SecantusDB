@@ -47,13 +47,17 @@ def test_return_key_keeps_the_residual_filter(rust_mongo: Any, mongod: Any) -> N
     assert answers["rust"] == answers["mongod"]
 
 
-@pytest.mark.backlog("RM-566")
+@pytest.mark.backlog_fixed("RM-566")
 def test_a_sort_under_return_key_is_a_default_sort(rust_mongo: Any, mongod: Any) -> None:
     """mongod 8.2.11's SORT under a RETURN_KEY is `type: "default"` (it
-    keeps each member's index key), and its top-two of
-    `find({y: {$gte: 0}}).sort({z: 1}).limit(2)` returns `x` 6 before 0,
-    which tie on `z`. This server's SORT is `simple`, and it returns 0
-    before 6."""
+    keeps each member's index key); this server's was `simple`.
+
+    The two documents tie on `z`, and the order they come out in is not
+    compared: under a sort with a limit it is the C++ library's heap, which
+    the Linux and macOS mongod builds break differently, and this server
+    keeps the order the plan reads them (the scope decision that retired
+    RM-049, `tasks/backlog-rust-mongodb.md`). mongod on macOS returns `x` 6
+    before 0 for this read with or without `returnKey`."""
     command = {
         "find": "c",
         "filter": {"y": {"$gte": 0}},
@@ -65,17 +69,24 @@ def test_a_sort_under_return_key_is_a_default_sort(rust_mongo: Any, mongod: Any)
         server: _answer(client, command)
         for server, client in (("mongod", mongod), ("rust", rust_mongo))
     }
-    assert answers["mongod"] == (
-        [("RETURN_KEY", None), ("SORT", "default"), ("FETCH", None), ("IXSCAN", None)],
-        [{"y": 0, "x": 6}, {"y": 0, "x": 0}],
-    )
-    assert answers["rust"] == answers["mongod"]
+    plans = {server: plan for server, (plan, _) in answers.items()}
+    keys = {server: sorted(d["x"] for d in docs) for server, (_, docs) in answers.items()}
+    assert plans["mongod"] == [
+        ("RETURN_KEY", None),
+        ("SORT", "default"),
+        ("FETCH", None),
+        ("IXSCAN", None),
+    ]
+    assert plans["rust"] == plans["mongod"]
+    assert keys["mongod"] == [0, 6]
+    assert keys["rust"] == keys["mongod"]
+    assert all(set(d) == {"y", "x"} for _, docs in answers.values() for d in docs)
 
 
-@pytest.mark.backlog("RM-567")
+@pytest.mark.backlog_fixed("RM-567")
 def test_return_key_of_an_id_point_lookup_is_idhack(rust_mongo: Any, mongod: Any) -> None:
     """mongod 8.2.11 answers `find({_id: 3}).returnKey()` by IDHACK
-    (`RETURN_KEY <- IDHACK`); this server plans `RETURN_KEY <- IXSCAN`."""
+    (`RETURN_KEY <- IDHACK`); this server planned `RETURN_KEY <- IXSCAN`."""
     command = {"find": "c", "filter": {"_id": 3}, "returnKey": True}
     answers = {
         server: _answer(client, command)
@@ -85,12 +96,12 @@ def test_return_key_of_an_id_point_lookup_is_idhack(rust_mongo: Any, mongod: Any
     assert answers["rust"] == answers["mongod"]
 
 
-@pytest.mark.backlog("RM-568")
+@pytest.mark.backlog_fixed("RM-568")
 def test_return_key_keeps_a_sort_key_meta_field(rust_mongo: Any, mongod: Any) -> None:
     """mongod 8.2.11 keeps a projection's `{$meta: "sortKey"}` fields under
     `returnKey` (`extractSortKeyMetaFieldsFromProjection`): over a COLLSCAN
-    each result is `{k: [0]}`. This server drops the field and returns the
-    sort's own field, `{z: 0}`."""
+    each result is `{k: [0]}`. This server dropped the field and returned
+    the sort's own field, `{z: 0}`."""
     command = {
         "find": "c",
         "filter": {"z": 0},
@@ -103,4 +114,36 @@ def test_return_key_keeps_a_sort_key_meta_field(rust_mongo: Any, mongod: Any) ->
         for server, client in (("mongod", mongod), ("rust", rust_mongo))
     }
     assert answers["mongod"] == [{"k": [0]}] * 6
+    assert answers["rust"] == answers["mongod"]
+
+
+@pytest.mark.backlog_fixed("RM-567")
+@pytest.mark.parametrize(
+    "extra, stages, docs",
+    [
+        ({"batchSize": 5}, [("RETURN_KEY", None), ("IDHACK", None)], [{"_id": 3}]),
+        ({"limit": 1}, [("RETURN_KEY", None), ("IDHACK", None)], [{"_id": 3}]),
+        ({"sort": {"x": 1}}, [("RETURN_KEY", None), ("IDHACK", None)], [{"_id": 3}]),
+        (
+            {"sort": {"x": 1}, "projection": {"k": {"$meta": "sortKey"}}},
+            [("RETURN_KEY", None), ("SORT_KEY_GENERATOR", None), ("IDHACK", None)],
+            [{"_id": 3, "k": [3]}],
+        ),
+        ({"hint": {"_id": 1}}, [("RETURN_KEY", None), ("IXSCAN", None)], [{"_id": 3}]),
+        ({"showRecordId": True}, [("RETURN_KEY", None), ("IXSCAN", None)], [{"_id": 3}]),
+        ({"collation": {"locale": "fr"}}, [("RETURN_KEY", None), ("IXSCAN", None)], [{"_id": 3}]),
+    ],
+)
+def test_return_key_id_lookup_variants(
+    rust_mongo: Any, mongod: Any, extra: dict, stages: list, docs: list
+) -> None:
+    """mongod 8.2.11 keeps IDHACK under `returnKey` at any batch size, under
+    a limit or a sort (a SORT_KEY_GENERATOR for a `sortKey` field), and
+    scans the index under a hint, `showRecordId` or another collation."""
+    command = {"find": "c", "filter": {"_id": 3}, "returnKey": True, **extra}
+    answers = {
+        server: _answer(client, command)
+        for server, client in (("mongod", mongod), ("rust", rust_mongo))
+    }
+    assert answers["mongod"] == (stages, docs)
     assert answers["rust"] == answers["mongod"]

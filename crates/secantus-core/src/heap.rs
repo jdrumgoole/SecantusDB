@@ -9,7 +9,9 @@
 //! (the macOS build) and libstdc++ (the Linux build) can hand the same
 //! equal entries back in different orders. The Linux build is the exemplar
 //! where builds differ (Joe, 2026-10-21), so this is libstdc++'s
-//! `push_heap` and `pop_heap` ([`crate::stl`]).
+//! `push_heap` and `pop_heap` ([`crate::stl`]); built for macOS arm64 it pops
+//! as libc++ does, as each platform's mongod is the reference there
+//! (RM-559). (libc++'s `push_heap` moves the same elements as libstdc++'s.)
 
 pub trait HeapOrder {
     /// The queue's comparator: `true` when `self` belongs BELOW `other`
@@ -62,7 +64,11 @@ impl<T: HeapOrder> Heap<T> {
     }
 
     pub fn pop(&mut self) -> Option<T> {
-        crate::stl::pop_heap(&mut self.c, &T::heap_less);
+        if crate::stl::LIBCXX {
+            crate::stl::libcxx_pop_heap(&mut self.c, &T::heap_less);
+        } else {
+            crate::stl::pop_heap(&mut self.c, &T::heap_less);
+        }
         self.c.pop()
     }
 }
@@ -92,12 +98,18 @@ mod tests {
     #[test]
     fn equal_entries_leave_in_heap_order() {
         // Four equal distances pushed in order 0..4: libstdc++'s sift
-        // steps hand them back 0, 2, 1, 3 (libc++'s: 0, 1, 3, 2).
+        // steps hand them back 0, 2, 1, 3, libc++'s (the macOS arm64
+        // build's) 0, 1, 3, 2.
         let mut h = Heap::new();
         for i in 0..4 {
             h.push(D(1.0, i));
         }
         let out: Vec<u32> = std::iter::from_fn(|| h.pop().map(|d| d.1)).collect();
-        assert_eq!(out, vec![0, 2, 1, 3]);
+        let want = if crate::stl::LIBCXX {
+            vec![0, 1, 3, 2]
+        } else {
+            vec![0, 2, 1, 3]
+        };
+        assert_eq!(out, want);
     }
 }

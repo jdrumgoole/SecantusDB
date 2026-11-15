@@ -20,7 +20,14 @@ from typing import Any
 import pytest
 from bson import Int64
 
-from tests.backlog.conftest import _RS_BANNER, RS_BINARY, drain_output, mongo_answer
+from tests.backlog.conftest import (
+    _RS_BANNER,
+    OS,
+    PLATFORM,
+    RS_BINARY,
+    drain_output,
+    mongo_answer,
+)
 
 pymongo = pytest.importorskip("pymongo")
 
@@ -484,12 +491,14 @@ def test_near_ties_in_scan_order(rust_mongo: Any) -> None:
     8.2.12 (libc++) answer [2, 3, 0, 1], which this server returned. The
     Linux build is the exemplar (Joe, 2026-10-21), so its answer is recorded
     here rather than asked of whichever mongod is on PATH. Was RM-041's
-    regression test."""
+    regression test. Since RM-559 a macOS arm64 build of this server uses
+    libc++'s heap, as that platform's mongod does, and answers macOS's."""
     docs = [{"_id": 0, "loc": [1, 0]}, {"_id": 1, "loc": [0, 1]}, {"_id": 2, "loc": [-1, 0]}]
     docs.append({"_id": 3, "loc": [0, -1]})
     command = {"find": "c", "filter": {"loc": {"$near": [0, 0]}}}
     got = _ids(_seed(rust_mongo, "rm041n", docs, [_index({"loc": "2d"})]), command)
-    assert got == ("ok", [2, 1, 3, 0])
+    want = [2, 3, 0, 1] if (OS, PLATFORM) == ("darwin", "arm64") else [2, 1, 3, 0]
+    assert got == ("ok", want)
 
 
 @pytest.mark.backlog_fixed("RM-231")

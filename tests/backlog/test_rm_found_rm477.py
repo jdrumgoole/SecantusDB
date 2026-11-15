@@ -7,6 +7,8 @@ from typing import Any
 
 import pytest
 
+from tests.backlog.conftest import OS, PLATFORM
+
 #: The four documents `tools/probes/find_order.py`'s step 100 shrinks to.
 _DOCS = [
     {"_id": 17, "a": "b", "b": 2},
@@ -33,15 +35,20 @@ def _merged(client: Any) -> tuple[list, list]:
     return stages, ids
 
 
-@pytest.mark.backlog("RM-559")
+@pytest.mark.backlog_fixed("RM-559")
 def test_a_sort_merge_beside_a_null_scan_breaks_ties_as_mongod(
     rust_mongo: Any, mongod: Any
 ) -> None:
     """mongod 8.2.11 answers `find({a: {$in: [7, "b", 5, null]}}).sort({b:
     1})` over `{a: 1, b: 1}` with a SORT_MERGE of four scans and returns 14
     (no `a`, from the null scan) before 13 (`a: 7`), which tie on `b`. This
-    server merges the same scans and returns 13 first. Without the null in
-    the `$in` the two agree."""
+    server merged the same scans and returned 13 first: its heap was
+    libstdc++'s on every platform, and the macOS arm64 mongod this asks
+    links libc++, whose `pop_heap` hands back the other of two equal
+    children. A macOS arm64 build now uses libc++'s heap. Linux mongod
+    (libstdc++) answers 13 first, as this server does there."""
     answers = {"mongod": _merged(mongod), "rust": _merged(rust_mongo)}
-    assert answers["mongod"] == (["FETCH", "SORT_MERGE"], [3, 14, 13, 17])
+    libcxx = (OS, PLATFORM) == ("darwin", "arm64")
+    want = [3, 14, 13, 17] if libcxx else [3, 13, 14, 17]
+    assert answers["mongod"] == (["FETCH", "SORT_MERGE"], want)
     assert answers["rust"] == answers["mongod"]

@@ -77,6 +77,22 @@ fn flat() -> Vec<Document> {
     ]
 }
 
+/// Whether this build stands in for macOS arm64's mongod, whose libc++ heap
+/// hands back a queue's ties in another order than Linux's libstdc++. The
+/// macOS literals below are mongod 8.2.11 on macOS arm64 (2026-11-15).
+const LIBCXX: bool = cfg!(all(target_os = "macos", target_arch = "aarch64"));
+
+/// The order of `$near` from the origin over `sphere()`: 20 and 4 are one
+/// point, which 17 holds, and the queue's heap hands back the three ties
+/// as the C++ library does -- libstdc++'s on Linux, libc++'s on macOS
+/// arm64 (RM-559). (The macOS mongod also moves 6, RM-393.)
+fn near_order() -> Vec<i32> {
+    let ties = if LIBCXX { [20, 4, 17] } else { [17, 4, 20] };
+    let mut out = vec![6, 1, 11, ties[0], 4, ties[2]];
+    out.extend([13, 14, 19, 2, 18, 10, 9, 3, 7, 8, 12, 5]);
+    out
+}
+
 fn seed(c: &mut CommandContext, docs: Vec<Document>, indexes: Vec<Document>) {
     dispatch_full(&doc! { "drop": "c" }, c);
     let reply = dispatch_full(&doc! { "insert": "c", "documents": docs }, c);
@@ -255,10 +271,7 @@ fn a_near_hinted_elsewhere_is_refused() {
             "{message}"
         );
         // Hinted to its own index, it is the search's order.
-        assert_eq!(
-            ids(&dispatch_full(&hinted("geo".into()), c)),
-            [6, 1, 11, 17, 4, 20, 13, 14, 19, 2, 18, 10, 9, 3, 7, 8, 12, 5]
-        );
+        assert_eq!(ids(&dispatch_full(&hinted("geo".into()), c)), near_order());
         // The same for `$geoNear`, whose hint is the aggregate's.
         let stage = |hint: Bson| {
             doc! { "aggregate": "c", "hint": hint, "cursor": {}, "pipeline": [
@@ -275,10 +288,7 @@ fn a_near_hinted_elsewhere_is_refused() {
             refusal(&dispatch_full(&stage(doc! { "$natural": 1 }.into()), c)).0,
             2
         );
-        assert_eq!(
-            ids(&dispatch_full(&stage("geo".into()), c)),
-            [6, 1, 11, 17, 4, 20, 13, 14, 19, 2, 18, 10, 9, 3, 7, 8, 12, 5]
-        );
+        assert_eq!(ids(&dispatch_full(&stage("geo".into()), c)), near_order());
     });
 }
 
@@ -293,24 +303,36 @@ fn near_returns_ties_in_its_searchs_order() {
         };
         // 20 and 4 are one point, and 17 holds it: the Linux build's queue
         // (libstdc++'s heap) hands back 17 first, then 4 and 20 (mongod
-        // 8.2.12; the macOS build's libc++ heap: 20, 4, 17). Linux answers
+        // 8.2.12; the macOS build's libc++ heap: 20, 4, 17, as a macOS arm64
+        // build of this server's, RM-559). Linux answers
         // 6, 1, 11 for the first three: it measures the line 6 at distance
         // 0, where the macOS build's fused arithmetic puts it 6.4e-12 m out
         // and after the point and the polygon (RM-393).
-        assert_eq!(
-            find(c, near(doc! {})),
-            [6, 1, 11, 17, 4, 20, 13, 14, 19, 2, 18, 10, 9, 3, 7, 8, 12, 5]
-        );
+        assert_eq!(find(c, near(doc! {})), near_order());
         // The rest of the query filters what the search returns.
         let mut filter = near(doc! {});
         filter.insert("k", "a");
-        assert_eq!(find(c, filter), [11, 17, 4, 13, 19, 9, 7, 8, 12]);
+        assert_eq!(
+            find(c, filter),
+            if LIBCXX {
+                [11, 4, 17, 13, 19, 9, 7, 8, 12]
+            } else {
+                [11, 17, 4, 13, 19, 9, 7, 8, 12]
+            }
+        );
         let reply = dispatch_full(
             &doc! { "aggregate": "c", "cursor": {}, "pipeline": [{ "$geoNear": {
             "near": point(0.0, 0.0), "distanceField": "d", "query": { "k": "a" } } }] },
             c,
         );
-        assert_eq!(ids(&reply), [11, 17, 4, 13, 19, 9, 7, 8, 12]);
+        assert_eq!(
+            ids(&reply),
+            if LIBCXX {
+                [11, 4, 17, 13, 19, 9, 7, 8, 12]
+            } else {
+                [11, 17, 4, 13, 19, 9, 7, 8, 12]
+            }
+        );
 
         // Four points at one distance from the centre of a `2d` search.
         seed(
@@ -323,12 +345,19 @@ fn near_returns_ties_in_its_searchs_order() {
             ],
             vec![geo("2d")],
         );
-        assert_eq!(find(c, doc! { "loc": { "$near": [0, 0] } }), [2, 1, 3, 0]);
+        assert_eq!(
+            find(c, doc! { "loc": { "$near": [0, 0] } }),
+            if LIBCXX { [2, 3, 0, 1] } else { [2, 1, 3, 0] }
+        );
 
         seed(c, flat(), vec![geo("2d")]);
         assert_eq!(
             find(c, doc! { "loc": { "$near": [0, 0] } }),
-            [1, 4, 20, 17, 13, 19, 21, 2, 18, 9, 3, 7, 8, 5, 12]
+            if LIBCXX {
+                [1, 4, 17, 20, 13, 21, 19, 2, 18, 9, 3, 7, 8, 5, 12]
+            } else {
+                [1, 4, 20, 17, 13, 19, 21, 2, 18, 9, 3, 7, 8, 5, 12]
+            }
         );
         // A sort over the search keeps its ties in the search's order.
         let sorted = dispatch_full(
@@ -337,7 +366,11 @@ fn near_returns_ties_in_its_searchs_order() {
         );
         assert_eq!(
             ids(&sorted),
-            [4, 17, 13, 19, 21, 9, 7, 8, 12, 1, 20, 2, 18, 3, 5]
+            if LIBCXX {
+                [4, 17, 13, 21, 19, 9, 7, 8, 12, 1, 20, 2, 18, 3, 5]
+            } else {
+                [4, 17, 13, 19, 21, 9, 7, 8, 12, 1, 20, 2, 18, 3, 5]
+            }
         );
     });
 }

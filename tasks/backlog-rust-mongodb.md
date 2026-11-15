@@ -655,26 +655,6 @@ These are explicit non-goals. Don't add them without a reason.
       (`hybrid.rs`). Found 2026-11-12 (RM-358).
       Verify: tests/backlog/test_rm_found_rm358.py::test_score_fusion_combines_by_avg
       Backlog-ID: RM-553
-- [ ] **An `$or` of one index sorts documents, not index keys.** mongod
-      8.2.11 answers `find({$or: [{y: 0}, {y: {$gt: 1}}]}).sort({x: 1})`
-      over `{y: 1, x: 1}` with one two-interval IXSCAN whose keys it sorts
-      below the FETCH (`SUBPLAN <- FETCH <- SORT <- IXSCAN`, `type:
-      "default"`, 520 counted for eight members). This server sorts the
-      fetched documents above the FETCH (`simple`, 480). Found 2026-11-12
-      (RM-476).
-      Verify: tests/backlog/test_rm_found_rm476.py::test_an_or_of_one_index_sorts_its_keys
-      Backlog-ID: RM-557
-- [ ] **A SORT_MERGE beside a null scan breaks a tie another way than
-      mongod.** mongod 8.2.11 answers `find({a: {$in: [7, "b", 5,
-      null]}}).sort({b: 1})` over `{a: 1, b: 1}` with `FETCH <- SORT_MERGE`
-      of four scans, and returns `_id` 14 (no `a`, from the null scan)
-      before 13 (`a: 7`), which tie on `b`: `[3, 14, 13, 17]`. This server
-      plans the same merge and returns `[3, 13, 14, 17]`. Without the null
-      in the `$in` the two agree. These are the three `order` replies of
-      `tools/probes/find_order.py` (step 100 over `{a: 1, b: 1}`, `{a: 1,
-      b: -1}` and `{a: -1, b: 1}`). Found 2026-11-12 (RM-477).
-      Verify: tests/backlog/test_rm_found_rm477.py::test_a_sort_merge_beside_a_null_scan_breaks_ties_as_mongod
-      Backlog-ID: RM-559
 - [ ] **`test_a_write_while_an_index_builds` reads mongod's answer off a
       5 ms lock wait.** `tests/mongod_live/test_txn_catalog_changes.py`
       asserts mongod 8.2.11 refuses a transaction's insert while an index
@@ -709,31 +689,15 @@ These are explicit non-goals. Don't add them without a reason.
       falls within mongod's own run-to-run spread of its answer.
       Verify: none -- mongod's own answer varies between runs; no test can pin it
       Backlog-ID: RM-556
-- [ ] **A sort under `returnKey` is a `simple` sort, and a limited one
-      leaves ties in another order.** mongod 8.2.11's SORT under a
-      RETURN_KEY is `type: "default"` (it keeps each member's index key),
-      and `find({y: {$gte: 0}}).sort({z: 1}).limit(2).returnKey()` over
-      `{y: 1, x: 1}` returns `{y: 0, x: 6}` before `{y: 0, x: 0}`, which
-      tie on `z`. This server's SORT is `simple` (`Node::Sort`'s `on_keys`
-      says both "sorts keys below the FETCH" and the `default` type, as for
-      RM-472), and it returns `x` 0 before 6. Found 2026-11-12 (RM-470).
-      Verify: tests/backlog/test_rm_found_rm470.py::test_a_sort_under_return_key_is_a_default_sort
-      Backlog-ID: RM-566
-- [ ] **A `returnKey` point lookup on `_id` is not IDHACK.** mongod 8.2.11
-      answers `find({_id: 3}).returnKey()` by `RETURN_KEY <- IDHACK`; this
-      server plans `RETURN_KEY <- IXSCAN` (`find_plan` leaves the point
-      lookups to reads without `returnKey`). Found 2026-11-12 (RM-470).
-      Verify: tests/backlog/test_rm_found_rm470.py::test_return_key_of_an_id_point_lookup_is_idhack
-      Backlog-ID: RM-567
-- [ ] **`returnKey` drops a projection's `{$meta: "sortKey"}` field.**
-      mongod 8.2.11 keeps a projection's `sortKey` fields under `returnKey`
-      (`extractSortKeyMetaFieldsFromProjection`): `find({z: 0}, {k:
-      {$meta: "sortKey"}}).sort({z: 1}).returnKey()` returns `{k: [0]}`
-      for each document. This server returns the sort's field instead,
-      `{z: 0}`, and over an index `{y, x, z}` where mongod gives `{y, x,
-      k}`. Found 2026-11-12 (RM-470).
-      Verify: tests/backlog/test_rm_found_rm470.py::test_return_key_keeps_a_sort_key_meta_field
-      Backlog-ID: RM-568
+- [ ] **`find` drops a projection's `{$meta: "sortKey"}` field.** mongod
+      8.2.11 gives each document the sort key as an array:
+      `find({}, {k: {$meta: "sortKey"}}).sort({x: 1})` over `{_id: 1, x:
+      [3, 1]}` returns `{_id: 1, x: [3, 1], k: [1]}`. This server returns
+      the document without `k` (`apply_projection` omits the field). Under
+      `returnKey` the field is kept since RM-568 (`find::sort_key_array`).
+      Found 2026-11-15 (RM-568).
+      Verify: tests/backlog/test_rm_found_rm568.py::test_find_keeps_a_sort_key_meta_field
+      Backlog-ID: RM-703
 - [ ] **A `default` sort of documents counts the documents, not its
       working-set members.** mongod 8.2.11's SORT of a read that keeps
       each member's metadata (`showRecordId`, a projection's `{$meta:
