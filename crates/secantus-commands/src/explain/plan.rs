@@ -2486,6 +2486,10 @@ fn wrap(a: Access, q: &Query) -> Node {
     ) -> bool {
         match node {
             Node::IxScan(ix) => in_key(s, &ix.index),
+            // A fetched branch carries every field (mongod 8.2.11's
+            // `hasField`): an OR of it and index scans that hold the sort's
+            // fields sorts below the FETCH (RM-575).
+            Node::Fetch { .. } => true,
             Node::Or(inputs) => inputs.iter().all(|i| keys_hold(i, s, in_key)),
             _ => false,
         }
@@ -2501,7 +2505,8 @@ fn wrap(a: Access, q: &Query) -> Node {
                     .index
                     .as_ref()
                     .map_or(in_key(s, &ix.index), |ix| in_key(s, ix)),
-                or @ Node::Or(_) => keys_hold(or, s, &in_key),
+                // An OR whose every branch fetched returns documents.
+                or @ Node::Or(_) => !fetched(or) && keys_hold(or, s, &in_key),
                 _ => false,
             }
     });

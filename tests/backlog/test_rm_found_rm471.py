@@ -236,16 +236,17 @@ def test_a_clause_beside_an_or_is_answered_by_its_bounds(rust_mongo: Any, mongod
     assert answers["rust"] == answers["mongod"]
 
 
-@pytest.mark.backlog("RM-575")
+@pytest.mark.backlog_fixed("RM-575")
 def test_a_sort_over_an_or_with_a_fetched_branch_sorts_below_the_fetch(
     rust_mongo: Any, mongod: Any
 ) -> None:
     """mongod 8.2.11's OR of `FETCH <- IXSCAN w_1` and `IXSCAN y_1_x_1` is
     not fetched, and every branch carries `x` (a fetched one carries every
     field), so `.sort({x: 1})` sorts the OR's members below a FETCH:
-    `SUBPLAN <- FETCH <- SORT (default) <- OR`. This server sorts the
-    fetched documents above it: `SUBPLAN <- SORT (simple) <- FETCH <-
-    OR`."""
+    `SUBPLAN <- FETCH <- SORT (default) <- OR`. This server sorted the
+    fetched documents above it (`SUBPLAN <- SORT (simple) <- FETCH <- OR`)
+    until its sort-on-keys check took a fetched branch as carrying every
+    field (2026-11-15). The rows it returns are mongod's too."""
     command = {"find": "c", "filter": {"$or": [{"y": 0}, {"w": 1, "z": 1}]}, "sort": {"x": 1}}
     answers = {
         server: _chain(_plan(client, command, YX, [("w", 1)]), "stage", "type")
@@ -260,6 +261,11 @@ def test_a_sort_over_an_or_with_a_fetched_branch_sorts_below_the_fetch(
         ("IXSCAN", None),
     ]
     assert answers["rust"] == answers["mongod"]
+    rows = {
+        server: _rows(client, command, YX, [("w", 1)])
+        for server, client in (("mongod", mongod), ("rust", rust_mongo))
+    }
+    assert rows["rust"] == rows["mongod"]
 
 
 @pytest.mark.backlog("RM-576")

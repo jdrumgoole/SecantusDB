@@ -728,17 +728,6 @@ These are explicit non-goals. Don't add them without a reason.
       (RM-472).
       Verify: tests/backlog/test_rm_found_rm472.py::test_a_near_read_explains_as_geo_near_2d
       Backlog-ID: RM-578
-- [ ] **A sort over an `$or` with a fetched branch sorts documents.**
-      mongod 8.2.11's OR of `FETCH <- IXSCAN w_1` and `IXSCAN y_1_x_1` is
-      not fetched, and every branch carries `x` (a fetched one carries every
-      field), so `.sort({x: 1})` sorts the OR's members below a FETCH:
-      `SUBPLAN <- FETCH <- SORT (default) <- OR`; with `{_id: 0, x: 1}`,
-      `SORT <- PROJECTION_DEFAULT <- OR`, no FETCH. This server sorts
-      fetched documents above it (`SORT (simple) <- FETCH <- OR`): its
-      `keys_hold` takes only index-scan branches. Found 2026-11-12
-      (RM-471).
-      Verify: tests/backlog/test_rm_found_rm471.py::test_a_sort_over_an_or_with_a_fetched_branch_sorts_below_the_fetch
-      Backlog-ID: RM-575
 - [ ] **A rooted `$or`'s profile `planSummary` names one index twice.**
       mongod 8.2.11's profile entry for `{$or: [{a: {$gte: 2}, b: {$gte:
       3}}, {a: 0, b: 0}]}` over `a_1` and `b_1` says `IXSCAN { a: 1 },
