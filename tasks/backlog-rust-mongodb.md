@@ -706,20 +706,6 @@ These are explicit non-goals. Don't add them without a reason.
       match. Found 2026-11-15 (RM-568).
       Verify: tests/backlog/test_rm_found_rm568b.py::test_return_key_with_a_sort_key_over_an_index_sort_explains_a_key_generator
       Backlog-ID: RM-706
-- [ ] **A `default` sort of documents counts the documents, not its
-      working-set members.** mongod 8.2.11's SORT of a read that keeps
-      each member's metadata (`showRecordId`, a projection's `{$meta:
-      "recordId"}`; `type: "default"` since RM-472) counts each member it
-      sorts: 1122 bytes `totalDataSizeSorted` for the six documents of
-      `find({z: 0}).sort({z: 1}).showRecordId()` (374 for two under a
-      `limit` of 2, 2244 for twelve over a FETCH), where the same read
-      without `showRecordId` sorts `simple` and counts 402. This server
-      counts 402 both ways: it sorts the documents as its `simple` sort
-      does. A SORT over a covered projection counts its members since
-      RM-473 (`sorter::sort_owned_objs`), the model this needs for a
-      member that holds a fetched document. Found 2026-11-12 (RM-472).
-      Verify: tests/backlog/test_rm_found_rm472.py::test_a_default_sort_of_documents_counts_its_members
-      Backlog-ID: RM-577
 - [ ] **A `$near` read over a `2d` index explains as a COLLSCAN.** mongod
       8.2.11 plans `find({loc: {$near: [0, 0]}})` over a `{loc: "2d"}`
       index as `GEO_NEAR_2D` (`SORT <- GEO_NEAR_2D` under a `sort`); this

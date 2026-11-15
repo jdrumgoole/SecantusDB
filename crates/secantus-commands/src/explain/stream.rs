@@ -1023,6 +1023,9 @@ enum Stage {
         /// The projection below the sort, and the command's filter its
         /// positional `$` reads: the sorter holds the projected documents.
         project: Option<Box<(Document, Option<Document>)>>,
+        /// A `default` sort: it holds each document as the working-set
+        /// member it was read in, its RecordId beside it (RM-472, RM-577).
+        keeps_metadata: bool,
         t: Tally,
         /// What its sorter counted (`totalDataSizeSorted`, the spills).
         report: Option<Box<secantus_core::memlimit::SpillReport>>,
@@ -1101,6 +1104,7 @@ fn member_values(
 /// documents that compare equal where `std::sort` leaves them without a
 /// limit and in the order they came under one; with what its sorter
 /// counted, when it ran one.
+#[allow(clippy::too_many_arguments)]
 fn sort_members(
     cx: &Cx,
     all: Vec<Member>,
@@ -1109,6 +1113,7 @@ fn sort_members(
     collation: Option<&Collation>,
     budget: Option<(secantus_core::memlimit::Budgets, bool)>,
     project: Option<&(Document, Option<Document>)>,
+    keeps_metadata: bool,
 ) -> Result<
     (
         VecDeque<Member>,
@@ -1136,20 +1141,32 @@ fn sort_members(
                 }
             })
             .collect::<Result<_, _>>()?;
-        let sizing = secantus_core::sorter::Sizing {
-            sizes: None,
-            source: secantus_core::sorter::SortSource::QueryLayer,
-            fields: None,
-            budget: budgets.sort,
-            added: None,
-        };
-        secantus_core::sorter::sort_documents(
-            decoded,
-            &Bson::Document(pattern.clone()),
-            &sizing,
-            top,
-        )
-        .map_err(sort_fault)?;
+        if keeps_metadata && project.is_none() && super::order::plain_sort(pattern) {
+            // A `default` sort: RID_AND_OBJ members (RM-577).
+            let rids = all.iter().filter(|m| m.doc.is_some()).map(|m| m.rid);
+            secantus_core::sorter::sort_rid_objs(
+                decoded.into_iter().zip(rids).collect(),
+                pattern,
+                budgets.sort,
+                top,
+            )
+            .map_err(sort_fault)?;
+        } else {
+            let sizing = secantus_core::sorter::Sizing {
+                sizes: None,
+                source: secantus_core::sorter::SortSource::QueryLayer,
+                fields: None,
+                budget: budgets.sort,
+                added: None,
+            };
+            secantus_core::sorter::sort_documents(
+                decoded,
+                &Bson::Document(pattern.clone()),
+                &sizing,
+                top,
+            )
+            .map_err(sort_fault)?;
+        }
         report = Some(secantus_core::memlimit::report().less(&before));
     }
     let blobs: Vec<&[u8]> = all
@@ -1647,6 +1664,7 @@ impl Stage {
                 collation,
                 budget,
                 project,
+                keeps_metadata,
                 t,
                 report,
                 kept,
@@ -1674,6 +1692,7 @@ impl Stage {
                         collation.as_ref(),
                         *budget,
                         project.as_deref(),
+                        *keeps_metadata,
                     )?;
                     *sorted = Some(out);
                     *report = counted.map(Box::new);
@@ -2291,8 +2310,8 @@ impl Stream {
             pattern,
             limit: sort_limit,
             on_keys,
+            keeps_metadata,
             input,
-            ..
         } = node
         {
             if *on_keys && of_keys(input) {
@@ -2319,6 +2338,7 @@ impl Stream {
                         }
                         _ => None,
                     },
+                    keeps_metadata: *keeps_metadata,
                     t: Tally::default(),
                     report: None,
                     kept: opts.keep_sort_input.then(Vec::new),

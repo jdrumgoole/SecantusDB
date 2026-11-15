@@ -141,16 +141,50 @@ pub(crate) fn write_owned_obj_member(doc: &Document, snapshot_id: u64, out: &mut
     Ok(())
 }
 
-/// The bytes a [`write_index_key_member`] or [`write_owned_obj_member`]
-/// wrote, read as `WorkingSetMember::deserialize` reads them.
+/// `WorkingSetMember::RID_AND_OBJ`.
+const RID_AND_OBJ: u8 = 2;
+
+/// `WorkingSetMember::serialize` (mongod 8.2) of a member holding a
+/// document read at a RecordId (`RID_AND_OBJ`: what a FETCH or a COLLSCAN
+/// hands a `default` SORT): its state, the snapshot, the document as
+/// `Document::serializeForSorter` writes it, the RecordId and a zero byte
+/// for no metadata. 19 bytes over the document alone (measured 8.2.11,
+/// `spilledBytes` of a `showRecordId` sort against the same `simple` one,
+/// RM-577).
+pub(crate) fn write_rid_and_obj_member(
+    doc: &Document,
+    snapshot_id: u64,
+    rid: i64,
+    out: &mut Vec<u8>,
+) -> R<()> {
+    out.push(RID_AND_OBJ);
+    out.extend_from_slice(&snapshot_id.to_le_bytes());
+    write_document(doc, out)?;
+    // `RecordIdFormat::Long`.
+    out.push(0);
+    out.extend_from_slice(&rid.to_le_bytes());
+    out.push(0);
+    Ok(())
+}
+
+/// The bytes a [`write_index_key_member`], [`write_owned_obj_member`] or
+/// [`write_rid_and_obj_member`] wrote, read as
+/// `WorkingSetMember::deserialize` reads them.
 pub(crate) fn read_member(at: &mut Cursor) -> R<Vec<u8>> {
-    if at.peek_byte()? != OWNED_OBJ {
+    let state = at.peek_byte()?;
+    if state != OWNED_OBJ && state != RID_AND_OBJ {
         return read_index_key_member(at);
     }
     let start = at.pos;
     at.take(1 + 8)?;
     let mut bson = Vec::new();
     document_to_bson(at, &mut bson)?;
+    if state == RID_AND_OBJ {
+        if at.byte()? != 0 {
+            return Err(corrupt("a RecordId not of the long format"));
+        }
+        at.take(8)?;
+    }
     if at.byte()? != 0 {
         return Err(corrupt("a working-set member with metadata"));
     }

@@ -273,6 +273,7 @@ impl<'a> Stage<'a> {
                 limit,
                 pattern,
                 input,
+                keeps_metadata,
                 ..
             } => {
                 if self.buffer.is_none() {
@@ -293,6 +294,7 @@ impl<'a> Stage<'a> {
                                 input,
                                 &all,
                                 keys,
+                                *keeps_metadata,
                                 env,
                             );
                             if let Some(n) = limit {
