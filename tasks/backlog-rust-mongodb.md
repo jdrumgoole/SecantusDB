@@ -738,14 +738,6 @@ These are explicit non-goals. Don't add them without a reason.
       ties keep the read order. Found 2026-11-12 (RM-471).
       Verify: tests/backlog/test_rm_found_rm471.py::test_an_or_of_two_indexes_returns_its_branches_in_order
       Backlog-ID: RM-572
-- [ ] **An `{_id: 1}` projection is not covered.** mongod 8.2.11 answers
-      `find({y: 0}, {_id: 1})` from `{y: 1, _id: 1}`
-      (`PROJECTION_COVERED <- IXSCAN`), and from an `$or` over `_id_` and
-      that index (`PROJECTION_DEFAULT <- OR`). This server fetches each
-      document: `covers` refuses a projection of `_id` alone. Found
-      2026-11-12 (RM-471).
-      Verify: tests/backlog/test_rm_found_rm471.py::test_an_id_projection_is_covered
-      Backlog-ID: RM-573
 - [ ] **A clause beside an `$or` is rechecked in a FETCH.** mongod 8.2.11
       pushes `x: {$lt: 10}` beside `{$or: [{y: 0}, {y: 1, x: {$gt:
       3}}]}` into each branch's bounds over `{y: 1, x: 1}` and rechecks

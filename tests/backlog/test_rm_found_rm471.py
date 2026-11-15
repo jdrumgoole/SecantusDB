@@ -185,17 +185,31 @@ def test_an_or_of_two_indexes_returns_its_branches_in_order(rust_mongo: Any, mon
     assert answers["rust"] == answers["mongod"]
 
 
-@pytest.mark.backlog("RM-573")
+@pytest.mark.backlog_fixed("RM-573")
 def test_an_id_projection_is_covered(rust_mongo: Any, mongod: Any) -> None:
     """mongod 8.2.11 answers `{_id: 1}` from an index that holds `_id`:
-    `PROJECTION_COVERED <- IXSCAN` over `{y: 1, _id: 1}`. This server
-    fetches each document (`PROJECTION_SIMPLE <- FETCH <- IXSCAN`)."""
+    `PROJECTION_COVERED <- IXSCAN` over `{y: 1, _id: 1}`, and
+    `PROJECTION_DEFAULT <- OR` over that index and `_id_`. This server
+    fetched each document (`PROJECTION_SIMPLE <- FETCH <- IXSCAN`) until
+    `covers` stopped refusing a projection of `_id` alone (2026-11-15)."""
     command = {"find": "c", "filter": {"y": 0}, "projection": {"_id": 1}}
+    or_command = {
+        "find": "c",
+        "filter": {"$or": [{"y": 0}, {"_id": {"$gt": 9}}]},
+        "projection": {"_id": 1},
+    }
+    yid = [("y", 1), ("_id", 1)]
     answers = {
-        server: _chain(_plan(client, command, [("y", 1), ("_id", 1)]))
+        server: (
+            _chain(_plan(client, command, yid)),
+            _chain(_plan(client, or_command, yid)),
+            _rows(client, command, yid),
+            sorted(_rows(client, or_command, yid)),
+        )
         for server, client in (("mongod", mongod), ("rust", rust_mongo))
     }
-    assert answers["mongod"] == ["PROJECTION_COVERED", "IXSCAN"]
+    assert answers["mongod"][0] == ["PROJECTION_COVERED", "IXSCAN"]
+    assert answers["mongod"][1][:3] == ["SUBPLAN", "PROJECTION_DEFAULT", "OR"]
     assert answers["rust"] == answers["mongod"]
 
 

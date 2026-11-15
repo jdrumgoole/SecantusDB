@@ -1978,7 +1978,11 @@ fn covers_with(projection: &Document, holds: &dyn Fn(&str) -> bool) -> bool {
         return false;
     }
     let mut id_out = false;
-    if projection.keys().all(|f| f == "_id") {
+    // `{_id: 0}` alone is an exclusion projection, never answered from the
+    // keys; `{_id: 1}` is, by an index that holds `_id` (mongod 8.2.11:
+    // `find({y: 0}, {_id: 1})` over `{y: 1, _id: 1}` is
+    // `PROJECTION_COVERED <- IXSCAN`, RM-573).
+    if projection.iter().all(|(f, v)| f == "_id" && !truthy(v)) {
         return false;
     }
     for (field, value) in projection {
