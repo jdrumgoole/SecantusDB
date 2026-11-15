@@ -1753,20 +1753,6 @@ a regression test.
       working RP-354).
       Verify: tests/backlog/test_rp_explain_costs.py::test_plan[nested loop into a weakly correlated index], tests/backlog/test_rp_explain_costs.py::test_plan[nested loop of few rows into a weakly correlated index], tests/backlog/test_rp_explain_costs.py::test_a_wide_range_over_a_weakly_correlated_index
       Backlog-ID: RP-926
-- [ ] **A nested loop's Join Filter keeps the ON's written order.**
-      PostgreSQL 15.19 orders a join's qual list cheapest first
-      (`order_qual_clauses`, by `cost_qual_eval`, stable among equal
-      costs): `select * from e left join e e2 on e.a <> e2.a and
-      e.a::text <> '5' and e.a = 5` (`e` 1,000 analysed rows) prints
-      `Join Filter: ((e.a <> e2.a) AND (e.a = 5) AND ((e.a)::text <>
-      '5'::text))`, the cast's two functions after the one-operator
-      conjuncts; here the conjuncts are printed as written. The same for
-      arithmetic (`on e.a + 1 + 1 <> e2.a and e.a <> e2.a` puts `(e.a <>
-      e2.a)` first). The costs and rows match. A lone scan's Filter is
-      RP-406, a joined scan's RP-398. Measured on a private 15.19 cluster
-      (found while working RP-354).
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a nested loop's join filter in cost order]
-      Backlog-ID: RP-924
 - [ ] **A join of three tables by inequalities runs in its written
       order, and a WHERE's join clauses all run at the top join.**
       PostgreSQL's `standard_join_search` picks the order of an inner join
@@ -1920,15 +1906,6 @@ a regression test.
       Measured on a private 15.19 cluster (found while working RP-354).
       Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a left join reduced to inner pushes its one-sided on conjunct]
       Backlog-ID: RP-902
-- [ ] **A BETWEEN among a join's ON conjuncts prints as one nested AND.**
-      PostgreSQL 15.19 expands `a BETWEEN x AND y` into two comparisons
-      and flattens them into the join's qual list: `select * from e left
-      join e e2 on e.a <> e2.a and e.a between 10 and 20` is `Join Filter:
-      ((e.a <> e2.a) AND (e.a >= 10) AND (e.a <= 20))`; here `((e.a <>
-      e2.a) AND ((e.a >= 10) AND (e.a <= 20)))`. The estimate is right.
-      Measured on a private 15.19 cluster (found while working RP-354).
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a between among a join's on conjuncts is flattened]
-      Backlog-ID: RP-903
 
 - [ ] **EXPLAIN ANALYZE's scan counters PostgreSQL prints that are still
       left out.** Since RP-383 a user table's heap pages carry the

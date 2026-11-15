@@ -2766,8 +2766,8 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "        ->  Seq Scan on e e2  (cost=0.00..15.00 rows=1000 width=7)",
         ],
     ),
-    # Still open: a nested loop's Join Filter is printed in the ON's
-    # written order, where `order_qual_clauses` puts it cheapest first.
+    # Was printed in the ON's written order; `order_qual_clauses` puts
+    # it cheapest first (RP-924, fixed).
     "a nested loop's join filter in cost order": (
         "RP-924",
         _ANALYSED,
@@ -5499,6 +5499,8 @@ def _marked(name: str, item: str) -> Any:
         "RP-409",
         "RP-913",
         "RP-916",
+        "RP-903",
+        "RP-924",
         "RP-925",
     )
     mark = pytest.mark.backlog_fixed if fixed else pytest.mark.backlog

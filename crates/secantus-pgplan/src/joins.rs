@@ -3814,7 +3814,7 @@ const HASHED_SAOP: usize = 9;
 /// answer settled halfway (`estimate_array_length`), or, for a hashed list,
 /// one hash and one comparison. A list of one element is the plain
 /// operator (`transformAExprIn`).
-fn qual_operators(n: &pg_query::protobuf::Node) -> f64 {
+pub(crate) fn qual_operators(n: &pg_query::protobuf::Node) -> f64 {
     let mut halves = 0.0;
     let mut node = n.clone();
     let _ = walk_expr(&mut node, &mut |x| {

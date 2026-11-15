@@ -4917,7 +4917,7 @@ pub fn join_conditions_split(
                     let mut parts = Vec::new();
                     and_clauses(q, &mut parts);
                     let mut hash = Vec::new();
-                    let mut rest: Vec<(usize, String)> = Vec::new();
+                    let mut rest: Vec<(f64, String)> = Vec::new();
                     for part in &parts {
                         let part: &Node = part;
                         p.buf.clear();
@@ -4928,12 +4928,14 @@ pub fn join_conditions_split(
                         } else {
                             // A cancel stops the walk; it stays pending
                             // for the statement's next cancellation point.
-                            rest.push((qual_operators(part).ok()?, text));
+                            qual_operators(part).ok()?;
+                            let ops = crate::joins::qual_operators(part) + io_casts(p, part) as f64;
+                            rest.push((ops, text));
                         }
                     }
                     // `order_qual_clauses`: the join filter cheapest first,
                     // a stable sort by each clause's operators.
-                    rest.sort_by_key(|(ops, _)| *ops);
+                    rest.sort_by(|a, b| a.0.total_cmp(&b.0));
                     let rest: Vec<String> = rest.into_iter().map(|(_, t)| t).collect();
                     let and = |v: &[String]| match v {
                         [one] => one.clone(),
@@ -4941,6 +4943,14 @@ pub fn join_conditions_split(
                     };
                     let split =
                         (!hash.is_empty() && !rest.is_empty()).then(|| (and(&hash), and(&rest)));
+                    // A nested loop's Join Filter is the whole qual list:
+                    // flattened (a BETWEEN expanded to its two
+                    // comparisons, RP-903) and cheapest first (RP-924).
+                    let whole = if hash.is_empty() && rest.len() > 1 {
+                        and(&rest)
+                    } else {
+                        whole
+                    };
                     out.push((whole, split));
                 }
                 None => out.push((String::new(), None)),
@@ -5161,6 +5171,44 @@ pub fn comma_join_conds(
 
 /// The operators a clause evaluates (`cost_qual_eval`, each one
 /// `cpu_operator_cost`).
+/// The operators a qual's casts of a column to text add: a cast from a
+/// type with no binary coercion to text is a `CoerceViaIO`, the source's
+/// output function and text's input function, one operator cost each
+/// (`cost_qual_eval_walker`, RP-924). A string column's cast is a
+/// RelabelType and free; a cast of a constant is folded.
+fn io_casts(p: &Printer<'_>, n: &Node) -> usize {
+    let mut count = 0;
+    let mut copy = n.clone();
+    let _ = crate::walk_expr(&mut copy, &mut |x| {
+        let Some(N::TypeCast(t)) = x.node.as_ref() else {
+            return Ok(());
+        };
+        let to_text = t
+            .type_name
+            .as_ref()
+            .and_then(|tn| names(&tn.names).pop())
+            .is_some_and(|n| n == "text");
+        let Some(N::ColumnRef(c)) = t.arg.as_deref().and_then(|a| a.node.as_ref()) else {
+            return Ok(());
+        };
+        let source = p
+            .lookup(&names(&c.fields))
+            .and_then(|(si, ri, ci)| Some(p.scopes.get(si)?.get(ri)?.columns.get(ci)?.1.clone()));
+        if to_text
+            && source.is_some_and(|ty| {
+                !matches!(
+                    ty.as_str(),
+                    "text" | "varchar" | "character varying" | "bpchar" | "character" | "name"
+                )
+            })
+        {
+            count += 2;
+        }
+        Ok(())
+    });
+    count
+}
+
 fn qual_operators(n: &Node) -> crate::Result<usize> {
     let mut count = 0;
     let mut copy = n.clone();
@@ -5172,6 +5220,7 @@ fn qual_operators(n: &Node) -> crate::Result<usize> {
                 count += 1;
             }
         }
+
         Ok(())
     })?;
     Ok(count)
