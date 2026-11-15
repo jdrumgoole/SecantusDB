@@ -591,6 +591,22 @@ pub fn create(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         storage
             .create_index(&ctx.db_name, &coll, &name, &key, &spec)
             .map_err(command_error)?;
+        // mongod builds it over the buckets, keyed as it keys it there
+        // (`{meta: 1, control.min.t: 1, control.max.t: 1}`): a read of the
+        // meta field scans it (RM-457).
+        if let Some(layout) = crate::ts_store::layout_of(storage, &ctx.db_name, &coll) {
+            let on_buckets = crate::ts_buckets::bucket_key(&key, &layout);
+            let spec = doc! { "key": on_buckets.clone(), "name": name.clone() };
+            storage
+                .create_index(
+                    &ctx.db_name,
+                    &crate::ts_store::buckets_ns(&coll),
+                    &name,
+                    &on_buckets,
+                    &spec,
+                )
+                .map_err(command_error)?;
+        }
     }
     Ok(doc! { "ok": 1.0 })
 }

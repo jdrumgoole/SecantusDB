@@ -2780,21 +2780,20 @@ differs on 5 scenarios. What is left:
       not yet confirmed from `explain`. Measured 2026-11-09.
       Backlog-ID: RM-456
       Verify: tests/backlog/test_rm_found_2026_11_09_rm348.py::test_a_time_series_projection_reads_a_bucket_at_a_time
-- [ ] **RUST MongoDB server: a time-series read an index over the buckets
-      could answer reads the collection at the command.** A filter on the
-      meta field (`{m: {$lt: 40}}`) is an index scan of the default
-      `m_1_t_1` index for mongod 8.2.11, which buffers 32 buckets in that
-      index's order -- series by series -- and returns 1,279 more after the
-      delete; this server reads such a read (and any over a collection with
-      an index of its own, or under a hint or a collation) whole: 3,199.
-      The buckets are stored since 2026-11-11, but the indexes are not
-      built over them: a time-series collection's index specs are kept on
-      the collection, every read scans the buckets in `_id` order, and
-      `collStats` reports its index sizes as 0. Streaming it means indexes
-      over the buckets and a bucket scan in an index's order. Measured
-      2026-11-09.
-      Backlog-ID: RM-457
-      Verify: tests/backlog/test_rm_found_2026_11_09_rm348.py::test_a_time_series_read_of_the_meta_index_buffers_its_buckets
+- [ ] **RUST MongoDB server: a time-series read under a hint, or over a
+      collection with an index of its own, reads the collection at the
+      command.** Hinted to `m_1_t_1` (`{$match: {v: {$gte: 0}}}`), mongod
+      8.2.11 scans that index over the buckets, buffering 32 series by
+      series, and returns 1,279 more after the delete; this server reads it
+      whole: 3,999. So too a read under a collation, and any read of a
+      collection with an index besides the default one. Since RM-457 the
+      default `m_1_t_1` index is built over the buckets at create and a
+      filter on the meta field scans it; an index `createIndexes` adds is
+      kept on the collection only, `dropIndexes` leaves the bucket copy of
+      `m_1_t_1` in place, and `collStats` still reports index sizes of 0.
+      Found while working RM-457, 2026-11-15.
+      Verify: tests/backlog/test_rm_found_2026_11_09_rm348.py::test_a_hinted_time_series_read_scans_the_index_over_the_buckets
+      Backlog-ID: RM-701
 - **Not probed (RM-083's remainder, 2026-10-17)** -- `oplogReplay`,
   `$meta: "textScore"` sorts, an `explain: true` aggregate. Every
   `{$meta}` shape measured on 8.2.11 matches since 2026-10-17, except a

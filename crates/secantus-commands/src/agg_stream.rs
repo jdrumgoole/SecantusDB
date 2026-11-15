@@ -446,12 +446,16 @@ fn time_series(
         .and_then(|o| crate::timeseries::Fields::of(&o))
         .and_then(|f| f.default_index())
         .map(|(name, _)| name);
-    let own_index = storage
-        .list_indexes(ask.db, ask.coll)
-        .map_err(read_error)?
+    let listed = storage.list_indexes(ask.db, ask.coll).map_err(read_error)?;
+    let names: Vec<&str> = listed
         .iter()
         .filter_map(|spec| spec.get_str("name").ok())
-        .any(|name| name != "_id_" && Some(name) != default_index.as_deref());
+        .collect();
+    let own_index = names
+        .iter()
+        .any(|name| *name != "_id_" && Some(*name) != default_index.as_deref());
+    // A dropped default index leaves its copy over the buckets: unused.
+    let default_index = default_index.filter(|d| names.contains(&d.as_str()));
     if own_index {
         return Ok(None);
     }
@@ -460,9 +464,19 @@ fn time_series(
     else {
         return Ok(None);
     };
-    if scan.filters_meta() {
-        return Ok(None);
-    }
+    // A filter on the meta field is mongod's scan of the default index
+    // over the buckets (RM-457).
+    let scan = if scan.filters_meta() {
+        match default_index {
+            Some(name) => match scan.through_index(storage, &name).map_err(read_error)? {
+                Some(scan) => scan,
+                None => return Ok(None),
+            },
+            None => return Ok(None),
+        }
+    } else {
+        scan
+    };
     let cursor = AggStream::new(
         Feed::Buckets(Box::new(scan)),
         Some(FIRST_BUFFER),

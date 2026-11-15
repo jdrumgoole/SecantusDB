@@ -63,15 +63,33 @@ def test_a_time_series_projection_reads_a_bucket_at_a_time(rust_mongo: Any, mong
     assert _after_delete(rust_mongo, read) == want
 
 
-@pytest.mark.backlog("RM-457")
+@pytest.mark.backlog_fixed("RM-457")
 def test_a_time_series_read_of_the_meta_index_buffers_its_buckets(
     rust_mongo: Any, mongod: Any
 ) -> None:
     """mongod 8.2.11 reads a filter on the meta field from the default
-    `m_1_t_1` index, buffering 32 buckets series by series: 1,279."""
+    `m_1_t_1` index, buffering 32 buckets series by series: 1,279. This
+    server read it whole, 3,199, until that index was built over the
+    buckets and the read scanned it."""
 
     def read(c: Any) -> Any:
         return c.aggregate([{"$match": {"m": {"$lt": 40}}}], batchSize=1)
+
+    want = _after_delete(mongod, read)
+    assert want == 1279
+    assert _after_delete(rust_mongo, read) == want
+
+
+@pytest.mark.backlog("RM-701")
+def test_a_hinted_time_series_read_scans_the_index_over_the_buckets(
+    rust_mongo: Any, mongod: Any
+) -> None:
+    """mongod 8.2.11 reads a time-series `aggregate` hinted to the default
+    `m_1_t_1` index by scanning that index over the buckets, buffering 32
+    of them series by series; this server reads a hinted read whole."""
+
+    def read(c: Any) -> Any:
+        return c.aggregate([{"$match": {"v": {"$gte": 0}}}], batchSize=1, hint="m_1_t_1")
 
     want = _after_delete(mongod, read)
     assert want == 1279
