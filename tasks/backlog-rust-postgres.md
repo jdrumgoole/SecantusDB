@@ -3664,17 +3664,6 @@ Measured on PostgreSQL 15.19 (the shared reference on port 5415): every
 statement is VALUES-only and runs there as written. The gap test is in
 `tests/backlog/test_rp_found_rp849.py`.
 
-- [ ] **A row beside an operand that is not a row looks its operator up
-      before a missing column is reported.** `select (1, nosuch) = (1)
-      from (values (1)) v(a)` and `(1, nosuch) in (1, 2)` are 42703
-      `column "nosuch" does not exist` at 12 on PostgreSQL 15.19:
-      `transformAExprOp` / `transformAExprIn` transform the operands
-      before `make_op` looks for `record = integer`. Here each is 42883
-      `operator does not exist: record = integer`: `row_against_non_row`
-      runs before the operands' names are resolved. (Two row constructors
-      resolve their operands' bare names first since RP-849.)
-      Verify: tests/backlog/test_rp_found_rp849.py::test_a_row_beside_a_non_row_transforms_its_operands_first
-      Backlog-ID: RP-875
 
 ## Found while working RP-704 (2026-11-10)
 

@@ -49,7 +49,7 @@ ROW_BESIDE_NON_ROW = {
 }
 
 
-@pytest.mark.backlog("RP-875")
+@pytest.mark.backlog_fixed("RP-875")
 @pytest.mark.parametrize("query", list(ROW_BESIDE_NON_ROW))
 def test_a_row_beside_a_non_row_transforms_its_operands_first(query: str, dsn: str) -> None:
     assert answer(dsn, query) == ROW_BESIDE_NON_ROW[query]

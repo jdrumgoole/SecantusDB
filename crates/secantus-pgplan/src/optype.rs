@@ -1380,7 +1380,18 @@ fn check_aexpr(e: &pg_query::protobuf::AExpr, scope: &Scope) -> Result<()> {
                     }
                     return Err(refused);
                 }
-                row_against_non_row(&op, l, item, e.location, scope)?;
+                if let Err(refused) = row_against_non_row(&op, l, item, e.location, scope) {
+                    // `transformAExprIn` transforms every item before it
+                    // looks up any operator (RP-875).
+                    let location = take_error_location();
+                    for n in std::iter::once(l).chain(&items.items) {
+                        having_names_resolve(n, scope)?;
+                    }
+                    if let Some(at) = location {
+                        set_error_location(at);
+                    }
+                    return Err(refused);
+                }
                 if let (Some(N::RowExpr(lr)), Some(N::RowExpr(ir))) =
                     (l.node.as_ref(), item.node.as_ref())
                 {
@@ -3476,6 +3487,10 @@ fn row_against_non_row(
             return Ok(());
         }
     }
+    // `transformAExprOp` transforms both operands before `make_op` looks
+    // the operator up: a missing column in either is 42703 first (RP-875).
+    having_names_resolve(l, scope)?;
+    having_names_resolve(r, scope)?;
     let op = if op == "!=" { "<>" } else { op };
     Err(mismatch(op, &lt, &rt, location))
 }
