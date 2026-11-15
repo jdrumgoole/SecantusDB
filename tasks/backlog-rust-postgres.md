@@ -1798,7 +1798,13 @@ a regression test.
       (`from e, e e2, e e3 where e.a < e2.a and e2.a < e3.a`: `(e.a < e2.a)`
       on the lower Nested Loop); here both are the top join's, the lower
       one a cross join. Measured on a private 15.19 cluster (found while
-      working RP-354).
+      working RP-354). Where to start (read 2026-11-15): the order search
+      is `join_search.rs`, which takes only column equalities; the
+      EXPLAIN side is `scan_estimate::nest_loop_chain_estimate`, which
+      prices only the left spine as written and declines any WHERE filter
+      (`!j.where_filters.is_empty()`) and any join without an ON, so a
+      comma join's lower cross joins print zeros. Both halves change the
+      executed order or the printed tree, not just a cost: two slices.
       Verify: tests/backlog/test_rp_explain_costs.py::test_plan[nested loop of three relations joined in another order], tests/backlog/test_rp_explain_costs.py::test_plan[nested loop of three relations by a where]
       Backlog-ID: RP-919
 - [ ] **EXPLAIN VERBOSE prints no `Output` lists above a scan.** A plan
