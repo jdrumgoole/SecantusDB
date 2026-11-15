@@ -32037,6 +32037,36 @@ fn finish_aggregate(
                     group_by: &mut Vec<GroupKey>,
                     group_prints: &mut Vec<String>|
      -> Result<usize> {
+        // A bare integer is a select-list POSITION wherever it stands -- at
+        // the top level, in a grouping set or in a parenthesised list, as
+        // `transformGroupClause` reads every flattened item through
+        // `findTargetlistEntrySQL92`.
+        let node = match node.node.as_ref() {
+            Some(N::AConst(c)) if matches!(c.val, Some(a_const::Val::Ival(_))) => {
+                let Some(a_const::Val::Ival(i)) = &c.val else {
+                    unreachable!()
+                };
+                let position = usize::try_from(i.ival).unwrap_or(0);
+                let target = position
+                    .checked_sub(1)
+                    .and_then(|k| s.target_list.get(k))
+                    .ok_or_else(|| {
+                        if c.location >= 0 {
+                            set_error_location(c.location);
+                        }
+                        Error::InvalidColumnReference(format!(
+                            "GROUP BY position {} is not in select list",
+                            i.ival
+                        ))
+                    })?;
+                match target.node.as_ref() {
+                    Some(N::ResTarget(rt)) => rt.val.as_deref(),
+                    _ => None,
+                }
+                .ok_or_else(|| Error::Unsupported("this GROUP BY position".into()))?
+            }
+            _ => node,
+        };
         let (key, print) = resolve_group_key(node, &def, &fields, params, &sample, s)?;
         // A key named twice is ONE key: `rollup (a, a)` and a select list
         // mentioning `a` must agree on which index they mean.
@@ -32129,31 +32159,10 @@ fn finish_aggregate(
                 continue;
             }
         }
-        let node = match g.node.as_ref() {
-            Some(N::AConst(c)) if matches!(c.val, Some(a_const::Val::Ival(_))) => {
-                let Some(a_const::Val::Ival(i)) = &c.val else {
-                    unreachable!()
-                };
-                let position = usize::try_from(i.ival).unwrap_or(0);
-                let target = position
-                    .checked_sub(1)
-                    .and_then(|k| s.target_list.get(k))
-                    .ok_or_else(|| {
-                        Error::InvalidColumnReference(format!(
-                            "GROUP BY position {} is not in select list",
-                            i.ival
-                        ))
-                    })?;
-                match target.node.as_ref() {
-                    Some(N::ResTarget(rt)) => rt.val.as_deref(),
-                    _ => None,
-                }
-                .ok_or_else(|| Error::Unsupported("this GROUP BY position".into()))?
-            }
-            Some(_) => g,
-            None => return Err(Error::Unsupported("an empty GROUP BY key".into())),
-        };
-        let index = push_key(node, &mut group_by, &mut group_prints)?;
+        if g.node.is_none() {
+            return Err(Error::Unsupported("an empty GROUP BY key".into()));
+        }
+        let index = push_key(g, &mut group_by, &mut group_prints)?;
         elements.push(GroupElement::Key(index));
     }
     let grouping_sets = expand_grouping_sets(&elements);

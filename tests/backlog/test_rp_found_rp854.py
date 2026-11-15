@@ -2,8 +2,8 @@
 
 - an ORDER BY constant that is no integer was not 42601 (fixed: RP-871);
 - a DISTINCT ON constant that is no integer was not 42601 (fixed: RP-872);
-- a GROUP BY position inside a grouping set or a parenthesised list is
-  not read as a position;
+- a GROUP BY position inside a grouping set or a parenthesised list was
+  not read as a position (fixed: RP-873);
 - a grouped query reports a column that does not exist as 42803, not
   42703.
 
@@ -143,7 +143,7 @@ def test_what_comes_before_a_distinct_on_constant(query: str, answer: object, ds
     assert _answer(dsn, query) == answer
 
 
-@pytest.mark.backlog("RP-873")
+@pytest.mark.backlog_fixed("RP-873")
 @pytest.mark.parametrize(
     ("query", "answer"),
     [
@@ -175,10 +175,10 @@ def test_a_group_by_position_inside_a_set_or_list_is_a_position(
     """`transformGroupClause` flattens grouping sets and a parenthesised
     list (`flatten_grouping_sets`) and reads each integer constant in them
     as a select-list position, as at the top level, on PostgreSQL 15.19.
-    Here the constant is grouped as a value: a column the position names
+    Here the constant was grouped as a value: a column the position names
     is 42803 `must appear in the GROUP BY clause`, and a position past the
-    select list is 0A000 `this target is not supported yet` or the
-    42601 of a later item."""
+    select list was 0A000 `this target is not supported yet` or the
+    42601 of a later item, until RP-873."""
     assert _answer(dsn, query) == answer
 
 

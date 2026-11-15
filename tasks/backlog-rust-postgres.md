@@ -3373,22 +3373,3 @@ statement is VALUES-only and runs there as written.
       and calls `check_stray` only for a query with no GROUP BY.
       Verify: tests/backlog/test_rp_found_rp700.py::test_an_ungrouped_column_beside_a_subquery_is_42803
       Backlog-ID: RP-853
-
-## Found while working RP-854 (2026-11-11)
-
-Measured on PostgreSQL 15.19 (the shared reference on port 5415): every
-statement is VALUES-only and runs there as written. The gap tests are in
-`tests/backlog/test_rp_found_rp854.py`.
-
-- [ ] **A GROUP BY position inside a grouping set or a parenthesised list
-      is grouped as a value.** `select a from (values (1), (2)) v(a) group
-      by rollup(1)` groups by `a` on PostgreSQL 15.19 (`flatten_grouping_sets`
-      flattens sets and an implicit row, and each integer in them is a
-      select-list position), and so do `grouping sets ((1), ())` and `select
-      a, a + 1 ... group by (1, 2)`. Here each is 42803 `column "a" must
-      appear in the GROUP BY clause`: `plan_aggregate` resolves a position
-      only at the top level, and pushes a set's or a row's elements as
-      expressions. A position past the select list there (`rollup(9)`) is
-      0A000, not 42P10 `GROUP BY position 9 is not in select list` at 49.
-      Verify: tests/backlog/test_rp_found_rp854.py::test_a_group_by_position_inside_a_set_or_list_is_a_position
-      Backlog-ID: RP-873

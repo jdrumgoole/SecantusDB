@@ -661,6 +661,21 @@ fn group_by_an_expression_or_a_position_keys_on_the_expression() {
     assert!(err
         .to_string()
         .contains("GROUP BY position 3 is not in select list"));
+    // A position inside a grouping set or a parenthesised list is a
+    // position too (RP-873).
+    for sql in [
+        "SELECT length(name), count(*) FROM t GROUP BY ROLLUP(3)",
+        "SELECT length(name), count(*) FROM t GROUP BY (3, 1)",
+    ] {
+        let err = plan(sql, &lookup).expect_err("must refuse");
+        assert_eq!(err.sqlstate(), "42P10", "{sql}");
+    }
+    for sql in [
+        "SELECT length(name), count(*) FROM t GROUP BY ROLLUP(1)",
+        "SELECT length(name), count(*) FROM t GROUP BY GROUPING SETS ((1), ())",
+    ] {
+        plan(sql, &lookup).unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
     // ORDER BY may name the key by position, alias, or expression.
     for sql in [
         "SELECT length(name) AS len, count(*) FROM t GROUP BY 1 ORDER BY 1 DESC",
