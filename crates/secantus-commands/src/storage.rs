@@ -1695,6 +1695,13 @@ pub trait Storage: Send + Sync {
         Ok(f())
     }
 
+    /// What this thread's last write conflict conflicted in, as mongod names
+    /// it in a 112's cause (`WiredTigerIdIndex::_insert: index: _id_; uri:
+    /// table:<ident>`), taken so it is reported once. Default: unknown.
+    fn take_write_conflict_cause(&self) -> Option<String> {
+        None
+    }
+
     /// Has the catalog entry of `db.coll` (its indexes, its options, its
     /// existence) changed since `handle`'s snapshot was taken? mongod refuses
     /// such a transaction's write there (112). Default: never.

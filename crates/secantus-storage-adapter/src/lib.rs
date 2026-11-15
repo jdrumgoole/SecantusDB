@@ -302,6 +302,10 @@ impl CmdStorage for StorageAdapter {
         self.inner.with_user_transaction(h, f).map_err(map_err)
     }
 
+    fn take_write_conflict_cause(&self) -> Option<String> {
+        secantus_storage::take_write_conflict_cause()
+    }
+
     fn catalog_changed_since_snapshot(
         &self,
         handle: &(dyn std::any::Any + Send),

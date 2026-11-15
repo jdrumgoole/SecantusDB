@@ -5749,6 +5749,11 @@ thread_local! {
     /// The document row this thread last wrote (or tried to): the row a
     /// write conflict surfacing from that write collided on.
     static LAST_ROW: RefCell<Option<WrittenRow>> = const { RefCell::new(None) };
+    /// What the last write conflict on this thread conflicted in, as mongod
+    /// names it in the 112's cause (`WiredTigerIdIndex::_insert: index: _id_;
+    /// uri: table:<ident>`): set where the `_id` index row is written, taken
+    /// by the command layer (RM-087).
+    static CONFLICT_CAUSE: RefCell<Option<String>> = const { RefCell::new(None) };
 
     /// Set by `with_statement_txn` for the duration of a sync-mode autocommit
     /// write statement. When true, `emit_oplog_entries` parks its minted range
@@ -6746,6 +6751,25 @@ fn test_point(point: TestPoint, row: &WrittenRow) {
 
 /// The document row this thread last wrote or tried to write. Read right
 /// after a write conflict, it is the row the conflict was on.
+/// Take the cause of the last write conflict this thread met, where the
+/// storage knows it: the `_id` index of an insert. `None` for a conflict
+/// with no named cause, or none at all.
+pub fn take_write_conflict_cause() -> Option<String> {
+    CONFLICT_CAUSE.with(|c| c.borrow_mut().take())
+}
+
+/// mongod's cause for a conflict writing a collection's `_id` index row.
+fn note_id_index_conflict<T>(r: Result<T>) -> Result<T> {
+    if matches!(r, Err(StorageError::WriteConflict)) {
+        CONFLICT_CAUSE.with(|c| {
+            *c.borrow_mut() = Some(format!(
+                "WiredTigerIdIndex::_insert: index: _id_; uri: {NAT_SEQ_TABLE}"
+            ))
+        });
+    }
+    r
+}
+
 pub fn last_row_written() -> Option<WrittenRow> {
     LAST_ROW.with(|l| l.borrow().clone())
 }
@@ -16948,14 +16972,15 @@ impl Storage {
         recordid: i64,
     ) -> Result<i64> {
         rev.reset()?;
-        note_id_key(db, coll, id_key)?;
+        CONFLICT_CAUSE.with(|c| c.borrow_mut().take());
+        note_id_index_conflict(note_id_key(db, coll, id_key))?;
         rev.set_key_ssu(db, &key_coll(db, coll), id_key);
         rev.set_value_q(recordid);
-        match rev.insert() {
+        note_id_index_conflict(match rev.insert() {
             Ok(()) => Ok(recordid),
             Err(e) if e.is_duplicate_key() => Err(StorageError::DuplicateId),
             Err(e) => Err(e.into()),
-        }
+        })
     }
 
     /// The `_id` index lookup: resolve a doc's `id_key` to its RecordId (the

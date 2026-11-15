@@ -2819,13 +2819,8 @@ scenarios (no server-side JavaScript, a scope decision), the collation key
 of a duplicate-key message (7.078) and the `createIndexes` below. The probe
 masks only the write-conflict cause. What is left:
 
-- [ ] **RUST MongoDB server: smaller differences.** A write conflict on
-      an insert has an empty cause where mongod names its index and table
-      (`Caused by :: WiredTigerIdIndex::_insert: index: _id_; uri:
-      table:<ident> ::`). A retryable insert counts a null among its
-      `documents` against `stmtIds` and refuses it (16), where mongod drops
-      the null first and inserts. The other session errors are worded for a
-      session with no user (not measured with one). A `createIndexes` that
+- [ ] **RUST MongoDB server: smaller differences.** The session errors
+      are worded for a session with no user (not measured with one). A `createIndexes` that
       waits on a transaction past `maxTimeMS` (the probe's "an index built
       under a transaction"): mongod 8.2.11 adds a `writeConcernError` (50)
       to its 50 in 2 runs of 2 on 2026-11-09, where this server answers a
@@ -2833,7 +2828,7 @@ masks only the write-conflict cause. What is left:
       and oplog-entry dumps of the statement-id and `findAndModify` retry
       errors are mongod's since 2026-11-09.)
       Backlog-ID: RM-087
-      Verify: tests/backlog/test_rm_085_112.py::test_an_insert_conflict_names_the_index_table, tests/backlog/test_rm_085_112.py::test_a_retryable_insert_does_not_count_a_null
+      Verify: none -- the wording is unmeasured with a user, and mongod's writeConcernError on the createIndexes timeout varies between runs (2 of 2 then, 0 of 12 before), so no test can pin one answer
 
 ### 7.071 Time-series collections -- 2026-10-11
 
