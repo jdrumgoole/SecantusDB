@@ -574,7 +574,8 @@ impl PgHandler {
                 || !matches!(leaf.distinct, secantus_pgplan::Distinct::None)
                 || leaf.casts.iter().any(Option::is_some)
                 // An indexed table's own filter may be an index scan's,
-                // priced below only on a LEFT join's preserved side.
+                // priced below only on a LEFT join's preserved side, or
+                // where no conjunct of it is an index qual (a `<>`, RP-918).
                 || (indexes.iter().any(|ix| ix.table.name == leaf.table)
                     && !preserved_side
                     && (columns.iter().any(|(k, _)| opaque_keys.contains(&k.as_str()))
@@ -582,7 +583,10 @@ impl PgHandler {
                             && indexes
                                 .iter()
                                 .any(|ix| ix.table.name == leaf.table && ix.keys.contains(&0)))
-                        || !leaf.filter.is_empty()))
+                        || (!leaf.filter.is_empty()
+                            && !self.own_quals(&leaf.table, &leaf.filter).is_some_and(|q| {
+                                q.iter().all(|(_, q)| matches!(q, costsize::Qual::Ne))
+                            }))))
             {
                 return None;
             }
@@ -616,10 +620,19 @@ impl PgHandler {
                 let name = def.columns.iter().find(|c| c.field() == *f)?.name.clone();
                 keys.push((key.clone(), stored(f)?, name));
             }
+            // Only a parameterized index scan reads them; the check above
+            // has refused an indexed inner whose quals are not modelled.
+            let quals = if preserved_side {
+                Vec::new()
+            } else {
+                self.own_quals(&leaf.table, &leaf.filter)
+                    .unwrap_or_default()
+            };
             leaves.push(SideLeaf {
                 table: leaf.table.clone(),
                 keys,
                 read,
+                quals,
             });
             Some((scan, width.3, index))
         };
@@ -1030,6 +1043,8 @@ impl PgHandler {
                 .map(|((k, f), name)| (k.to_string(), f.clone(), name.clone()))
                 .collect(),
             read: l.read.clone(),
+            // A chain's indexed table has no filter of its own.
+            quals: Vec::new(),
         };
         let mut params: Vec<Option<(u32, secantus_pgplan::joincost::ParamInner, ParamScan)>> =
             vec![None; n];
@@ -1393,11 +1408,13 @@ impl PgHandler {
         let arg_ops: f64 = own.iter().map(|(.., arg_ops)| arg_ops).sum();
         // The other join clauses, a filter on each row the scan fetches.
         let rest_ops = filters.iter().map(|f| f.ops).sum::<f64>() - ops;
-        let rest: Vec<(String, costsize::Qual)> = if rest_ops > 0.0 {
+        let mut rest: Vec<(String, costsize::Qual)> = if rest_ops > 0.0 {
             vec![(String::new(), costsize::Qual::Filter(rest_ops))]
         } else {
             Vec::new()
         };
+        // The side's own restriction, checked on each row too (RP-918).
+        rest.extend(leaf.quals.iter().cloned());
         // Each index holding the column is a parameterized path of its
         // own (`build_index_paths`, in the index list's oid order), and
         // `add_path` keeps the cheapest: with the same parameterization,
@@ -3871,6 +3888,26 @@ impl PgHandler {
         ))
     }
 
+    /// The quals `filter` is over user table `table`, as its scan's cost
+    /// model sees them; none for an empty filter.
+    fn own_quals(&self, table: &str, filter: &Document) -> Option<Vec<(String, costsize::Qual)>> {
+        if filter.is_empty() {
+            return Some(Vec::new());
+        }
+        let counted: std::cell::OnceCell<Option<usize>> = std::cell::OnceCell::new();
+        let count = || {
+            *counted.get_or_init(|| {
+                self.storage
+                    .count_matching(self.db(), table, &Document::new(), None)
+                    .ok()
+            })
+        };
+        let pt = self.planner_table_lazy(table, &count)?;
+        Some(with_in_lengths(
+            self.where_selectivity(table, &pt, filter, &count)?.1,
+        ))
+    }
+
     /// `clauselist_selectivity` of `filter` over user table `table`
     /// (`pt`), from its columns' statistics where it was analysed and
     /// PostgreSQL's defaults where not, and its quals as the cost model
@@ -5465,6 +5502,9 @@ struct SideLeaf {
     table: String,
     keys: Vec<(String, String, String)>,
     read: Vec<String>,
+    /// The side's own restriction, none an index qual: a parameterized
+    /// scan of it checks them on each row it fetches (RP-918).
+    quals: Vec<(String, costsize::Qual)>,
 }
 
 /// An operand of a `<>` between joined keys, for `eqjoinsel` and

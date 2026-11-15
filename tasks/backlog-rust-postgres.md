@@ -1774,21 +1774,6 @@ a regression test.
       working RP-354).
       Verify: tests/backlog/test_rp_explain_costs.py::test_plan[nested loop of three relations joined in another order], tests/backlog/test_rp_explain_costs.py::test_plan[nested loop of three relations by a where]
       Backlog-ID: RP-919
-- [ ] **EXPLAIN prints no estimate for a LEFT join whose ON restricts
-      its nullable side beside an inequality into its index.** PostgreSQL
-      15.19 plans `explain select * from e left join k on e.a < k.a and
-      k.a <> 2` (both tables 1,000 analysed rows, `k.a` the primary key)
-      as `Nested Loop Left Join (cost=0.28..10320.00 rows=333000
-      width=14)` over `Index Scan using k_pkey on k (cost=0.28..6.98
-      rows=333 width=7)` with `Index Cond: (a > e.a)` and `Filter: (a <>
-      2)`; here the join prints zeros over two plain Seq Scans, `k`'s
-      Filter `(a <> 2)` and the join's `Join Filter: (e.a < k.a)`. An ON
-      conjunct over the preserved side is estimated (RP-354); one over
-      the nullable side alone is a restriction of the inner, which the
-      nested-loop estimate does not take. Measured on a private 15.19
-      cluster (found while working RP-354).
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[nested loop left join with an on restriction of its nullable side]
-      Backlog-ID: RP-918
 - [ ] **EXPLAIN ANALYZE of a nested loop into an index on an expression
       of the outer row prints no actual rows.** Its estimate is right, but
       the actual-row count of a parameterized inner scan is only worked

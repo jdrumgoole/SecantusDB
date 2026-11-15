@@ -1834,15 +1834,41 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "        Filter: (f.x <> (a)::double precision)",
         ],
     ),
-    # Still open: a LEFT join's ON conjunct over its nullable side alone
-    # beside an inequality into that side's index is the parameterized
-    # scan's Filter.
+    # A LEFT join's ON conjunct over its nullable side alone beside an
+    # inequality into that side's index is the parameterized scan's Filter,
+    # checked on each row it fetches (RP-918, fixed).
     "nested loop left join with an on restriction of its nullable side": (
         "RP-918",
         _ANALYSED,
         "explain select * from e left join k on e.a < k.a and k.a <> 2",
         [
             "Nested Loop Left Join  (cost=0.28..10320.00 rows=333000 width=14)",
+            "  ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
+            "  ->  Index Scan using k_pkey on k  (cost=0.28..6.98 rows=333 width=7)",
+            "        Index Cond: (a > e.a)",
+            "        Filter: (a <> 2)",
+        ],
+    ),
+    # The same over another column of the side, and in an inner join,
+    # whose one-table ON conjunct is the scan's restriction (RP-918).
+    "nested loop left join with an on restriction of another nullable column": (
+        "RP-918",
+        _ANALYSED,
+        "explain select * from e left join k on e.a < k.a and k.b <> 'v2'",
+        [
+            "Nested Loop Left Join  (cost=0.28..9990.00 rows=300000 width=14)",
+            "  ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
+            "  ->  Index Scan using k_pkey on k  (cost=0.28..6.98 rows=300 width=7)",
+            "        Index Cond: (a > e.a)",
+            "        Filter: (b <> 'v2'::text)",
+        ],
+    ),
+    "nested loop into an index with a restriction of the inner side": (
+        "RP-918",
+        _ANALYSED,
+        "explain select * from e join k on e.a < k.a and k.a <> 2",
+        [
+            "Nested Loop  (cost=0.28..10320.00 rows=333000 width=14)",
             "  ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
             "  ->  Index Scan using k_pkey on k  (cost=0.28..6.98 rows=333 width=7)",
             "        Index Cond: (a > e.a)",
@@ -5683,6 +5709,7 @@ def _marked(name: str, item: str) -> Any:
         )
     fixed = item in (
         "RP-314",
+        "RP-918",
         "RP-920",
         "RP-317",
         "RP-318",
