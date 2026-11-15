@@ -16452,6 +16452,54 @@ pub(crate) fn simplify_exists(
     s.limit_count = None;
 }
 
+/// The subqueries of an EXISTS subquery's select list, parse-analysed
+/// before `simplify_exists` drops the list (RP-459): `transformSubLink`
+/// analyses them with the rest of it, and only the planner drops it, so
+/// `exists (select (select nosuch))` is 42703 while `exists (select
+/// (select 1/0))` is true. Each is planned without running and only an
+/// error parse analysis raises is the statement's. Planned on its own, a
+/// subquery reading the EXISTS subquery's FROM items or an enclosing
+/// level's columns would not find them, so a name it does not find is
+/// raised only where there are none (`isolated`).
+fn analyse_exists_target_sublinks(
+    s: &pg_query::protobuf::SelectStmt,
+    lookup: &dyn Fn(&str) -> Option<TableDef>,
+    params: &[Bson],
+    isolated: bool,
+) -> Result<()> {
+    if s.with_clause.is_some() || s.op != pg_query::protobuf::SetOperation::SetopNone as i32 {
+        return Ok(());
+    }
+    let isolated = isolated && s.from_clause.is_empty();
+    for t in &s.target_list {
+        let mut subs = Vec::new();
+        let _ = walk_expr(&mut t.clone(), &mut |n| {
+            if let Some(N::SubLink(sub)) = n.node.as_ref() {
+                if let Some(N::SelectStmt(q)) = sub.subselect.as_ref().and_then(|q| q.node.as_ref())
+                {
+                    subs.push((**q).clone());
+                }
+            }
+            Ok(())
+        });
+        for q in subs {
+            match planning_without_running(|| plan_select(&q, lookup, params)) {
+                Err(e)
+                    if raised_by_analysis(&e)
+                        && (isolated || !matches!(e.sqlstate(), "42703" | "42P01")) =>
+                {
+                    return Err(e)
+                }
+                Ok(_) => {}
+                Err(_) => {
+                    take_error_location();
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 /// The column references in an EXISTS subquery's select list, ORDER BY and
 /// DISTINCT ON that its own FROM cannot be seen to answer, each as a target
 /// of its own, in the order PostgreSQL analyses them.
@@ -25856,6 +25904,7 @@ fn resolve_one_sublink(
     // A star over an outer FROM item is that item's columns (RP-517).
     correlated::expand_outer_stars(&mut inner, lookup);
     if sl.sub_link_type == SubLinkType::ExistsSublink as i32 {
+        analyse_exists_target_sublinks(&inner, lookup, params, outer.is_empty())?;
         simplify_exists(&mut inner, lookup);
     }
     // Its system views expand first, as the statement's do, so the

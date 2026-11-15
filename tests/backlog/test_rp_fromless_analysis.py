@@ -272,15 +272,25 @@ EXISTS_NESTED = {
     "select exists (select (select nosuch))": _missing("31"),
     "select exists (select 1 + (select nosuch))": _missing("35"),
     "select exists (select (select 1/0))": None,
+    "select exists (select (select 1 from nosuchtab))": (
+        "42P01",
+        'relation "nosuchtab" does not exist',
+        None,
+        "38",
+    ),
+    # A nested subquery reading the EXISTS subquery's FROM item, or an
+    # enclosing level's, is no error.
+    "select exists (select (select a) from (values (1)) v(a))": None,
+    "select (select exists (select (select v.a))) from (values (1)) v(a)": None,
 }
 
 
-@pytest.mark.backlog("RP-459")
+@pytest.mark.backlog_fixed("RP-459")
 @pytest.mark.parametrize("query", list(EXISTS_NESTED))
 def test_exists_target_subquery_is_analysed(query: str, rust_pg: Any) -> None:
-    """A subquery inside an EXISTS subquery's list is dropped with the list
-    unanalysed, so a name it cannot resolve answers `true`. Kept, it would
-    run, and `(select 1/0)` is never run on PostgreSQL."""
+    """A subquery inside an EXISTS subquery's list was dropped with the
+    list unanalysed, so a name it could not resolve answered `true` (RP-459).
+    Kept, it would run, and `(select 1/0)` is never run on PostgreSQL."""
     assert answer(rust_pg, query) == EXISTS_NESTED[query]
 
 

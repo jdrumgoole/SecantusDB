@@ -2352,22 +2352,6 @@ Measured on a private PostgreSQL 15.19 cluster with `fe(a int, b text)`
 and `fs(a int, c text)`, one row each.
 
 
-## Found while working RP-444 (2026-11-07)
-
-- [ ] **A subquery inside an EXISTS subquery's select list is not
-      analysed.** `select exists (select (select nosuch))` and `select
-      exists (select 1 + (select nosuch))` answer `true` here; PostgreSQL
-      15.19's `transformSubLink` analyses the inner subquery with the rest
-      of the list, so each is 42703 `column "nosuch" does not exist` at 31
-      and 35. A statement PostgreSQL refuses runs. Since RP-444 a column
-      reference in the list, ORDER BY or DISTINCT ON is kept for the
-      planner when the subquery's own tables do not answer it; a nested
-      subquery cannot simply be kept, as it would then RUN (`exists (select
-      (select 1/0))` is `true` on PostgreSQL), so it needs an analysis that
-      plans without executing. Measured on PostgreSQL 15.19.
-      Verify: tests/backlog/test_rp_fromless_analysis.py::test_exists_target_subquery_is_analysed
-      Backlog-ID: RP-459
-
 ## Found while working RP-455 (2026-11-07)
 
 - [ ] **A subquery inside a FROM-subquery is offered a sibling's alias as
@@ -2411,6 +2395,9 @@ Measured on PostgreSQL 15.19 (the data-modifying WITH on a private cluster).
       level's columns are not in scope, so a name such an item does not find
       (42703, 42P01) is let go rather than raised: `select (with w as
       (select nosuch) select 1) from (values (1)) v(a)` answers 1 here.
+      The same planning leaves a literal in an EXISTS subquery's dropped
+      select list unread (`select exists (select (select 'x'::int))`, 22P02
+      at 31 there, `true` here).
       Verify: tests/backlog/test_rp_fromless_analysis.py::test_with_unread_literal_input
       Backlog-ID: RP-504
 
