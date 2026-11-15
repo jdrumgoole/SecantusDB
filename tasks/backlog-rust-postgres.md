@@ -2088,19 +2088,6 @@ a regression test.
       private 15.19 cluster (found while working RP-432).
       Verify: tests/backlog/test_rp_dml_from.py::test_missing_column_reported_before_ambiguous_one
       Backlog-ID: RP-436
-- [ ] **A cast literal's input error is reported after the operator
-      around it.** PostgreSQL 15.19's `transformTypeCast` runs a constant's
-      input function as the cast is transformed, before `make_op` looks the
-      operator up, so `select 'x'::int = true` is 22P02 `invalid input
-      syntax for type integer: "x"` at 8, `select 1 = 'x'::uuid` 22P02 at
-      12 and `select '2020-13-01'::date = 1` 22008 at 8; here each is the
-      operator's 42883 (`integer = boolean`, `integer = uuid`, `date =
-      integer`), from `optype` checking operand types before any cast's
-      value is read. The same in a simple CASE (`case 'x'::uuid when 1`).
-      A lone cast is 22P02 on both. Measured on PostgreSQL 15.19 (found
-      while working RP-439).
-      Verify: tests/backlog/test_rp_fromless_analysis.py::test_cast_literal_input_error_before_operator
-      Backlog-ID: RP-442
 - [ ] **A node above a dummy relation prints no estimate, and a dummy
       join no width.** Since RP-409 a WHERE that folds to constant false
       plans a `Result` with `One-Time Filter: false`, costing nothing, as

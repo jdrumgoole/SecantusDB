@@ -169,11 +169,11 @@ CAST_BEFORE_OPERATOR = {
 }
 
 
-@pytest.mark.backlog("RP-442")
+@pytest.mark.backlog_fixed("RP-442")
 @pytest.mark.parametrize("query", list(CAST_BEFORE_OPERATOR))
 def test_cast_literal_input_error_before_operator(query: str, rust_pg: Any) -> None:
-    """A lone `'x'::int` is 22P02 on both; beside an operator with no
-    overload for the two types it is that operator's 42883 here."""
+    """A lone `'x'::int` was 22P02 on both; beside an operator with no
+    overload for the two types it was that operator's 42883 here."""
     assert answer(rust_pg, query) == CAST_BEFORE_OPERATOR[query]
 
 

@@ -1957,6 +1957,7 @@ fn walk(n: &pg_query::protobuf::Node, scope: &Scope, cx: &Cx) -> Result<()> {
                 // no relation is the error first (RP-458).
                 let location = take_error_location();
                 for s in e.lexpr.iter().chain(e.rexpr.iter()) {
+                    cast_literals_read(s)?;
                     regclass::scan(s, scope)?;
                 }
                 if let Some(l) = location {
@@ -2134,6 +2135,9 @@ fn walk(n: &pg_query::protobuf::Node, scope: &Scope, cx: &Cx) -> Result<()> {
                 }
                 _ => operand_type(a, scope),
             });
+            if let Some(a) = c.arg.as_deref() {
+                cast_literals_read(a)?;
+            }
             if let Some(ty) = arg_type {
                 for w in &c.args {
                     if let Some(N::CaseWhen(w)) = w.node.as_ref() {
@@ -3247,6 +3251,30 @@ fn literal_fits(n: &pg_query::protobuf::Node, ty: &str) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// `transformTypeCast` runs a constant's input function as the cast is
+/// transformed, so an operand's `'x'::int` fails before the operator
+/// around it is looked up (RP-442): each cast literal, left to right.
+fn cast_literals_read(n: &pg_query::protobuf::Node) -> Result<()> {
+    match n.node.as_ref() {
+        Some(N::TypeCast(tc)) if tc.location >= 0 => {
+            if let (Some(arg), Some(tn)) = (tc.arg.as_deref(), tc.type_name.as_ref()) {
+                if tn.array_bounds.is_empty() && is_untyped_literal(arg) {
+                    return literal_fits(arg, &type_name_of(tn));
+                }
+                return cast_literals_read(arg);
+            }
+            Ok(())
+        }
+        Some(N::AExpr(e)) => {
+            for s in e.lexpr.iter().chain(e.rexpr.iter()) {
+                cast_literals_read(s)?;
+            }
+            Ok(())
+        }
+        _ => Ok(()),
+    }
 }
 
 /// A bare string literal or NULL: of type `unknown` where it is written.
