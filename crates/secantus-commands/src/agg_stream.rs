@@ -410,6 +410,33 @@ fn excludes_only(spec: &Bson) -> bool {
     matches!(spec, Bson::Document(d) if !d.is_empty() && d.values().all(zero))
 }
 
+/// A `$project` that only keeps fields by name (`{v: 1}`, `_id` left out or
+/// not): the fields mongod's `$_internalUnpackBucket` must unpack are then
+/// known, and its slot-based engine takes the pipeline.
+fn includes_only(spec: &Bson) -> bool {
+    fn kept(v: &Bson) -> bool {
+        match v {
+            Bson::Boolean(b) => *b,
+            Bson::Int32(n) => *n != 0,
+            Bson::Int64(n) => *n != 0,
+            Bson::Double(n) => *n != 0.0,
+            _ => false,
+        }
+    }
+    let Bson::Document(d) = spec else {
+        return false;
+    };
+    d.iter().any(|(k, v)| k != "_id" && kept(v))
+        && d.iter().all(|(k, v)| {
+            kept(v)
+                || (k == "_id"
+                    && matches!(
+                        v,
+                        Bson::Boolean(_) | Bson::Int32(_) | Bson::Int64(_) | Bson::Double(_)
+                    ))
+        })
+}
+
 /// The cursor of a pipeline over a time-series collection: its buckets read
 /// through the cursor stage, each unpacked as the cursor reaches it
 /// (`ts_buckets::BucketScan`, RM-348). Read whole instead: under a hint or
@@ -428,9 +455,27 @@ fn time_series(
                     .and_then(|d| d.get("$project"))
                     .is_some_and(excludes_only))
     };
+    let project = |s: &Bson| {
+        stage_name(s) == "$project"
+            && s.as_document()
+                .and_then(|d| d.get("$project"))
+                .is_some_and(includes_only)
+    };
+    // `$match` and an inclusion `$project` are the slot-based engine's: it
+    // unpacks bucket by bucket as the cursor asks, with no cursor-stage
+    // buffer (measured 8.2.11, 2026-11-15: the rest of the first bucket
+    // after a delete, 71, RM-456). An inclusion `$project` alone is read
+    // through the cursor stage's buffer like the stages above (2,303).
+    let per_bucket = ask.pipeline.iter().any(project)
+        && ask.pipeline.iter().any(|s| stage_name(s) == "$match")
+        && ask
+            .pipeline
+            .iter()
+            .all(|s| project(s) || stage_name(s) == "$match");
+    let only_projects = !ask.pipeline.is_empty() && ask.pipeline.iter().all(project);
     if ask.hint.is_some()
         || ask.collation.is_some()
-        || !ask.pipeline.iter().all(fits)
+        || !(per_bucket || only_projects || ask.pipeline.iter().all(fits))
         || ask.pipeline.iter().any(mentions_meta)
     {
         return Ok(None);
@@ -477,12 +522,13 @@ fn time_series(
     } else {
         scan
     };
-    let cursor = AggStream::new(
+    let mut cursor = AggStream::new(
         Feed::Buckets(Box::new(scan)),
-        Some(FIRST_BUFFER),
+        Some(if per_bucket { 1 } else { FIRST_BUFFER }),
         ask.pipeline.to_vec(),
         ask,
     );
+    cursor.per_bucket = per_bucket;
     Ok(Some((cursor, Vec::new())))
 }
 
@@ -719,6 +765,9 @@ struct AggStream {
     out_calls: VecDeque<u64>,
     /// The calls each stage owes the next document it passes on.
     owed: Vec<u64>,
+    /// A time-series read the slot-based engine unpacks one bucket at a
+    /// time, with no doubling cursor-stage buffer (RM-456).
+    per_bucket: bool,
 }
 
 fn stage_name(s: &Bson) -> &str {
@@ -772,6 +821,7 @@ impl AggStream {
             in_plan: 0,
             ticks: secantus_core::deadline::FRESH_TICKS,
             out_calls: VecDeque::new(),
+            per_bucket: false,
             owed: vec![0; stages_len],
         }
     }
@@ -943,7 +993,9 @@ impl AggStream {
             }
             Feed::Buckets(scan) => {
                 let n = self.buffer.unwrap_or(FIRST_BUFFER);
-                self.buffer = Some(n * 2);
+                if !self.per_bucket {
+                    self.buffer = Some(n * 2);
+                }
                 let read = scan.next_buffer(storage, n, BUFFER_BYTES)?;
                 Ok(StreamedBatch {
                     docs: read.docs,

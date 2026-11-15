@@ -2769,17 +2769,6 @@ cursor options, `getMore`, `killCursors`, the cursors of `aggregate` and the
 listing commands, tailable cursors, `count`, `distinct`). The Rust server
 differs on 5 scenarios. What is left:
 
-- [ ] **RUST MongoDB server: a time-series `aggregate` that needs only
-      some fields reads the collection at the command.** Behind an inclusion
-      `$project` (`{$project: {v: 1}}`) mongod 8.2.11 reads the buckets one
-      at a time as the cursor asks, not 32 at once: over the same 100
-      buckets it returns 71 more after the delete (the rest of the first
-      bucket), and this server, which streams only stages that need the
-      whole measurement, 3,999. Likely its slot-based engine, which takes
-      `$_internalUnpackBucket` once the fields it must unpack are known;
-      not yet confirmed from `explain`. Measured 2026-11-09.
-      Backlog-ID: RM-456
-      Verify: tests/backlog/test_rm_found_2026_11_09_rm348.py::test_a_time_series_projection_reads_a_bucket_at_a_time
 - [ ] **RUST MongoDB server: a time-series read under a hint, or over a
       collection with an index of its own, reads the collection at the
       command.** Hinted to `m_1_t_1` (`{$match: {v: {$gte: 0}}}`), mongod
@@ -2794,6 +2783,20 @@ differs on 5 scenarios. What is left:
       Found while working RM-457, 2026-11-15.
       Verify: tests/backlog/test_rm_found_2026_11_09_rm348.py::test_a_hinted_time_series_read_scans_the_index_over_the_buckets
       Backlog-ID: RM-701
+- [ ] **RUST MongoDB server: an insert into a time-series bucket the TTL
+      monitor removes fails.** Inserting into a bucket that has expired
+      while the TTL monitor runs every second, mongod 8.2.11 never fails an
+      insert (it writes a new bucket); this server returns the write error
+      112, "the time-series bucket was removed while it was written"
+      (`bucket_catalog.rs`: the update of the open bucket matched nothing),
+      to the client. Seen once in `tests/mongod_live/test_time_series_buckets.py::test_ttl_expires_whole_buckets`
+      in a gate run, reproduced by the gap test (a race: it inserts until
+      the first failure, up to 90 TTL passes). Also read, not yet probed:
+      `commit` returns `Ok` without writing when the bucket it staged into
+      is no longer open (`ts_store`'s delete clears it first), which may
+      lose a staged insert silently. Found working RM-456, 2026-11-15.
+      Verify: tests/backlog/test_rm_found_rm456.py::test_an_insert_into_a_bucket_the_ttl_monitor_removes_succeeds
+      Backlog-ID: RM-702
 - **Not probed (RM-083's remainder, 2026-10-17)** -- `oplogReplay`,
   `$meta: "textScore"` sorts, an `explain: true` aggregate. Every
   `{$meta}` shape measured on 8.2.11 matches since 2026-10-17, except a

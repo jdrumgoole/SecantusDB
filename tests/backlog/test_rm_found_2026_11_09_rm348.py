@@ -50,10 +50,12 @@ def test_a_time_series_find_goes_bucket_by_bucket(rust_mongo: Any, mongod: Any) 
     assert _after_delete(rust_mongo, read) == want
 
 
-@pytest.mark.backlog("RM-456")
+@pytest.mark.backlog_fixed("RM-456")
 def test_a_time_series_projection_reads_a_bucket_at_a_time(rust_mongo: Any, mongod: Any) -> None:
     """mongod 8.2.11 reads a time-series `aggregate` behind an inclusion
-    `$project` one bucket at a time: the rest of the first bucket, 71."""
+    `$project` one bucket at a time: the rest of the first bucket, 71.
+    This server read it whole, 3,999, until such a pipeline read its
+    buckets one at a time with no cursor-stage buffer."""
 
     def read(c: Any) -> Any:
         return c.aggregate([{"$match": {"v": {"$gte": 0}}}, {"$project": {"v": 1}}], batchSize=1)
