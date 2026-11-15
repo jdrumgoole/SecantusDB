@@ -1991,15 +1991,6 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       the collection so. Found 2026-11-12 (RM-360).
       Verify: tests/backlog/test_rm_found_2026_11_12_rm360.py::test_a_match_after_a_redact_is_copied_ahead_of_it
       Backlog-ID: RM-580
-- [ ] **A `$unionWith` over a collection is explained as written.**
-      mongod 8.2.11 lists the pipeline a `$unionWith` runs over a
-      collection: a `$cursor` holding the query's own `queryPlanner` (and,
-      at `executionStats`, its `executionStats`), then the stages after it,
-      each with its `nReturned`; this server lists the stage as written
-      (`{$unionWith: "d"}`). One over `$documents` lists its stages since
-      RM-539. Found 2026-11-14 (RM-539).
-      Verify: tests/backlog/test_rm_found_2026_11_14_rm539.py::test_a_union_with_over_a_collection_lists_its_cursor
-      Backlog-ID: RM-681
 - [ ] **A `$lookup` over a collection reports nothing it examined.** At
       `executionStats` mongod 8.2.11 gives a `$lookup` whose pipeline reads
       a collection its `totalDocsExamined`, `totalKeysExamined`,
@@ -2709,18 +2700,24 @@ What is left, all on the RUST MongoDB server:
       **Decided 2026-10-16 (Joe):** as RM-071, transcribe and execute.
       Verify: tests/backlog/test_rm_057_084.py::test_explain_of_count_on_a_view_fetching_from_an_index
       Backlog-ID: RM-695
-- [ ] **`explain` of a `$unionWith` lists its sub-pipeline as written.**
-      mongod 8.2.11 explains the sub-pipeline as it does the outer one: a
-      `$cursor` of its own (its `queryPlanner`, and `executionStats` above
-      that verbosity) holding the stages it absorbs, then the rest as
-      listed. `[{$unionWith: {coll: "s", pipeline: [{$match: {x: 1}},
-      {$project: {x: 1}}]}}]` is `$cursor` (`{x: {$eq: 1}}`,
-      `PROJECTION_SIMPLE`) on mongod and `$match`, `$project` here. A
-      `$rankFusion` or `$scoreFusion` input pipeline's `$unionWith` lists
-      its stages desugared (RM-200) but without that `$cursor`. Found
-      2026-11-08 working RM-200.
-      Backlog-ID: RM-426
-      Verify: tests/backlog/test_rm_found_2026_11_08_explain_listing.py::test_union_with_sub_pipeline_is_explained
+- [ ] **A fusion input pipeline's `$unionWith` lists no `$cursor`.**
+      mongod 8.2.11 explains the `$unionWith` a `$rankFusion` or
+      `$scoreFusion` input pipeline runs in as any `$unionWith` over a
+      collection (RM-426): a `$cursor` of its own, then the stages it did
+      not absorb. This server lists that pipeline's stages desugared
+      (RM-200) with no `$cursor`: it runs hidden stages the explain of a
+      sub-pipeline cannot parse. Split from RM-426 2026-11-15.
+      Verify: tests/backlog/test_rm_found_2026_11_15_rm426.py::test_a_fusion_input_union_opens_with_its_cursor
+      Backlog-ID: RM-696
+- [ ] **A `$group` read by a `DISTINCT_SCAN` hashes as another query.**
+      mongod 8.2.11 explains `[{$match: {x: {$gt: 2}}}, {$group: {_id:
+      "$x"}}]` over an index `{x: 1}` with `queryHash` /
+      `planCacheShapeHash` `76A99463` and `planCacheKey` `09B22F21`; this
+      server's plan is the same `PROJECTION_COVERED` over `DISTINCT_SCAN`
+      but hashes `FA2103B6` / `CBA7C409`, top-level and inside a
+      `$unionWith` alike. Found 2026-11-15 working RM-426.
+      Verify: tests/backlog/test_rm_found_2026_11_15_rm426.py::test_a_distinct_scan_group_hashes_as_mongod_does
+      Backlog-ID: RM-697
 - [ ] **A `$facet` whose sub-pipeline keeps a sort key plans no
       `SORT_KEY_GENERATOR`.** mongod 8.2.11's `$cursor` under a `$facet`
       holding a `$sort` with `outputSortKeyMetadata` (a `$setWindowFields`

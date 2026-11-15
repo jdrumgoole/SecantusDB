@@ -40,6 +40,7 @@ pub(crate) mod stream;
 mod sub_stages;
 pub(crate) mod summary;
 mod trial;
+mod union;
 
 use crate::util::{as_i64, command_error, decode_docs};
 use crate::{CommandContext, CommandError, HandlerResult, SERVER_VERSION};
@@ -930,7 +931,7 @@ fn query_planner(
     // (0 on a small collection), a fast count and a missing collection
     // included.
     out.insert("optimizationTimeMillis", 0_i32);
-    if s.optimized_pipeline {
+    if s.optimized_pipeline && !union::nested() {
         out.insert("optimizedPipeline", true);
     }
     out.insert("maxIndexedOrSolutionsReached", false);
@@ -2107,13 +2108,13 @@ fn reply_for(r: &Request, verbosity: Verbosity, ctx: &mut CommandContext) -> Han
         if let Some((_, _, trial)) = tried.first() {
             at_least(&mut run, trial);
         }
-        if !s.rest.is_empty() {
+        if !s.rest.is_empty() || union::nested() {
             cursor_yields(&mut run, cursor_pulled);
         }
         run
     });
     let mut reply = doc! { "explainVersion": "1" };
-    if s.rest.is_empty() {
+    if s.rest.is_empty() && !union::nested() {
         reply.insert("queryPlanner", planner);
         if let Some(st) = &stats {
             reply.insert(
@@ -2348,7 +2349,7 @@ fn sbe_reply(
 ) -> HandlerResult {
     let s = &r.shape;
     let db = ctx.db_name.clone();
-    let whole = s.rest.len() == p.pushed && p.tail.is_empty();
+    let whole = s.rest.len() == p.pushed && p.tail.is_empty() && !union::nested();
     let mut qp = Document::new();
     for (k, v) in planner {
         if k == "maxIndexedOrSolutionsReached" && whole && !r.pipeline.is_empty() {
@@ -2775,7 +2776,10 @@ fn explain_reply(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
             note_views(ctx);
             s
         }
-        "aggregate" => return aggregate(&inner, echo, inline, verbosity, ctx),
+        "aggregate" => {
+            let reply = aggregate(&inner, echo, inline, verbosity, ctx)?;
+            return Ok(union::explain_unions(reply, verbosity, ctx));
+        }
         "update" | "delete" => {
             let coll = collection(&inner, &name, &db)?;
             let s = if name == "update" {

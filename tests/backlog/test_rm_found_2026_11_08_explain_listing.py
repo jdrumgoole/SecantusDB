@@ -35,11 +35,12 @@ def _union_listing(client: Any) -> list:
     return out
 
 
-@pytest.mark.backlog("RM-426")
+@pytest.mark.backlog_fixed("RM-426")
 def test_union_with_sub_pipeline_is_explained(rust_mongo: Any, mongod: Any) -> None:
     """mongod 8.2.11 explains a `$unionWith`'s sub-pipeline: a `$cursor` of
     its own (`{x: {$eq: 1}}`, `PROJECTION_SIMPLE` over a `COLLSCAN`), then
-    the stages the cursor did not absorb."""
+    the stages the cursor did not absorb. This server listed the stages as
+    written until 2026-11-15."""
     assert _union_listing(rust_mongo) == _union_listing(mongod)
 
 
