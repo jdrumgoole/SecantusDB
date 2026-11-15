@@ -44,13 +44,14 @@ def _or_sorted(client: Any) -> tuple:
     )
 
 
-@pytest.mark.backlog("RM-557")
+@pytest.mark.backlog_fixed("RM-557")
 def test_an_or_of_one_index_sorts_its_keys(rust_mongo: Any, mongod: Any) -> None:
     """mongod 8.2.11 answers `find({$or: [{y: 0}, {y: {$gt: 1}}]}).sort({x:
     1})` over `{y: 1, x: 1}` with one two-interval IXSCAN whose keys it
     sorts below the FETCH (`SUBPLAN <- FETCH <- SORT default <- IXSCAN`,
-    520 counted for eight members). This server sorts the fetched
-    documents above the FETCH (`SORT simple`, 480)."""
+    520 counted for eight members). This server sorted the fetched
+    documents above the FETCH (`SORT simple`, 480): the merged scan was
+    planned with no index of its own to ask."""
     answers = {"mongod": _or_sorted(mongod), "rust": _or_sorted(rust_mongo)}
     assert answers["mongod"] == (["SUBPLAN", "FETCH", "SORT default", "IXSCAN"], 520, 8)
     assert answers["rust"] == answers["mongod"]

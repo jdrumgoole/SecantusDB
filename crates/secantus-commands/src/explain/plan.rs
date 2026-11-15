@@ -2420,7 +2420,14 @@ fn wrap(a: Access, q: &Query) -> Node {
     let sort_on_keys = blocking.is_some_and(|s| {
         a.fetch_filter.is_none()
             && match &a.scan {
-                Node::IxScan(_) => a.index.as_ref().is_some_and(|ix| in_key(s, ix)),
+                // An `$or` of one index's predicates is one scan of their
+                // intervals, planned with no `Access::index`: its keys sort
+                // below the FETCH all the same (mongod 8.2.11: `SUBPLAN <-
+                // FETCH <- SORT default <- IXSCAN`, RM-557).
+                Node::IxScan(ix) => a
+                    .index
+                    .as_ref()
+                    .map_or(in_key(s, &ix.index), |ix| in_key(s, ix)),
                 or @ Node::Or(_) => keys_hold(or, s, &in_key),
                 _ => false,
             }

@@ -655,15 +655,6 @@ These are explicit non-goals. Don't add them without a reason.
       (`hybrid.rs`). Found 2026-11-12 (RM-358).
       Verify: tests/backlog/test_rm_found_rm358.py::test_score_fusion_combines_by_avg
       Backlog-ID: RM-553
-- [ ] **An `$or` of one index sorts documents, not index keys.** mongod
-      8.2.11 answers `find({$or: [{y: 0}, {y: {$gt: 1}}]}).sort({x: 1})`
-      over `{y: 1, x: 1}` with one two-interval IXSCAN whose keys it sorts
-      below the FETCH (`SUBPLAN <- FETCH <- SORT <- IXSCAN`, `type:
-      "default"`, 520 counted for eight members). This server sorts the
-      fetched documents above the FETCH (`simple`, 480). Found 2026-11-12
-      (RM-476).
-      Verify: tests/backlog/test_rm_found_rm476.py::test_an_or_of_one_index_sorts_its_keys
-      Backlog-ID: RM-557
 - [ ] **A SORT_MERGE beside a null scan breaks a tie another way than
       mongod.** mongod 8.2.11 answers `find({a: {$in: [7, "b", 5,
       null]}}).sort({b: 1})` over `{a: 1, b: 1}` with `FETCH <- SORT_MERGE`
