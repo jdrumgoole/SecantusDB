@@ -2036,20 +2036,6 @@ a regression test.
       RP-435).
       Verify: tests/backlog/test_rp_dml_from.py::test_explain_prints_the_join
       Backlog-ID: RP-1019
-- [ ] **An UPDATE ... FROM or DELETE ... USING reports an ambiguous name
-      ahead of a missing column written before it.** `rewrite_dml_from`'s
-      42702 check reads every expression of the statement before anything
-      else is resolved; PostgreSQL 15.19's `transformUpdateStmt` analyses
-      the WHERE before the SET list, each left to right, and stops at the
-      first bad column. So `update k set a = a from (select 1 as a) t where
-      t.nosuch = 1`, `update k set b = b from e where e.nosuch = 1` and
-      `update k set b = 'x' from e where nosuch = 1 and b = 'y'` are 42702
-      `column reference "a"` / `"b" is ambiguous` here and 42703 `column
-      t.nosuch` / `e.nosuch` / `"nosuch" does not exist` there. A name
-      written before the missing one keeps its 42702 on both. Measured on a
-      private 15.19 cluster (found while working RP-432).
-      Verify: tests/backlog/test_rp_dml_from.py::test_missing_column_reported_before_ambiguous_one
-      Backlog-ID: RP-436
 - [ ] **A node above a dummy relation prints no estimate, and a dummy
       join no width.** Since RP-409 a WHERE that folds to constant false
       plans a `Result` with `One-Time Filter: false`, costing nothing, as

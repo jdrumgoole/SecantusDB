@@ -24678,8 +24678,11 @@ fn rewrite_dml_from_inner(
     }
     match node.node.as_mut() {
         Some(N::UpdateStmt(u)) if !u.from_clause.is_empty() => {
-            let mut exprs: Vec<&pg_query::protobuf::Node> = u.returning_list.iter().collect();
-            exprs.extend(u.where_clause.as_deref());
+            // `transformUpdateStmt`'s order (`write_name_exprs`): the
+            // WHERE, RETURNING, then the SET list (RP-436).
+            let mut exprs: Vec<&pg_query::protobuf::Node> =
+                u.where_clause.iter().map(|w| &**w).collect();
+            exprs.extend(u.returning_list.iter());
             for t in &u.target_list {
                 if let Some(N::ResTarget(rt)) = t.node.as_ref() {
                     exprs.extend(rt.val.as_deref());
@@ -24751,8 +24754,9 @@ fn rewrite_dml_from_inner(
             )));
         }
         Some(N::DeleteStmt(d)) if !d.using_clause.is_empty() => {
-            let mut exprs: Vec<&pg_query::protobuf::Node> = d.returning_list.iter().collect();
-            exprs.extend(d.where_clause.as_deref());
+            let mut exprs: Vec<&pg_query::protobuf::Node> =
+                d.where_clause.iter().map(|w| &**w).collect();
+            exprs.extend(d.returning_list.iter());
             refuse_ambiguous(&d.relation, &d.using_clause, &exprs, lookup)?;
             let from = std::mem::take(&mut d.using_clause);
             let cond = d.where_clause.take();
@@ -24900,27 +24904,101 @@ fn refuse_ambiguous(
             *counts.entry(c).or_default() += 1;
         }
     }
-    let mut ambiguous: Option<String> = None;
+    // Each relation of the statement's level, by the name it is addressed
+    // by, with its columns where they can be told without planning it. A
+    // missing column is reported only when every relation's columns are
+    // known: otherwise the planner's own 42703 stands.
+    let mut items: Vec<(String, Option<Vec<String>>)> = Vec::new();
+    if let Some(r) = relation {
+        items.push((
+            range_var_visible_name(r),
+            lookup(&r.relname).map(|_| target.clone()),
+        ));
+    }
+    let mut all_known = relation.is_some() && items.iter().all(|(_, c)| c.is_some());
+    for item in from {
+        let name = match item.node.as_ref() {
+            Some(N::RangeVar(r)) => Some(range_var_visible_name(r)),
+            Some(N::RangeSubselect(rs)) => rs.alias.as_ref().map(|a| a.aliasname.clone()),
+            _ => None,
+        };
+        match name {
+            Some(n) => {
+                // A derived table's columns are known only when each output
+                // is named (not `*`, not a set operation).
+                let cols = from_item_columns(item, lookup).filter(|c| match item.node.as_ref() {
+                    Some(N::RangeSubselect(rs)) => {
+                        rs.alias.as_ref().is_some_and(|a| !a.colnames.is_empty())
+                            || matches!(
+                                rs.subquery.as_deref().and_then(|q| q.node.as_ref()),
+                                Some(N::SelectStmt(s)) if !s.target_list.is_empty()
+                                    && s.target_list.len() == c.len()
+                            )
+                    }
+                    _ => true,
+                });
+                all_known &= cols.is_some();
+                items.push((n, cols));
+            }
+            None => all_known = false,
+        }
+    }
+    // PostgreSQL resolves each reference in turn and stops at the first bad
+    // one (RP-436): a missing column before an ambiguous one is 42703.
+    let mut first_error: Option<Error> = None;
     for e in exprs {
         let mut e = (*e).clone();
         walk_expr(&mut e, &mut |node| {
-            if let Some(N::ColumnRef(c)) = node.node.as_ref() {
-                if let [f] = c.fields.as_slice() {
-                    if let Some(N::String(s)) = f.node.as_ref() {
-                        if ambiguous.is_none() && counts.get(&s.sval).is_some_and(|n| *n > 1) {
-                            ambiguous = Some(s.sval.clone());
+            if first_error.is_some() {
+                return Ok(());
+            }
+            let Some(N::ColumnRef(c)) = node.node.as_ref() else {
+                return Ok(());
+            };
+            let parts: Vec<&str> = c
+                .fields
+                .iter()
+                .map(|f| match f.node.as_ref() {
+                    Some(N::String(s)) => Some(s.sval.as_str()),
+                    _ => None,
+                })
+                .collect::<Option<_>>()
+                .unwrap_or_default();
+            match parts.as_slice() {
+                [one] => {
+                    let n = counts.get(*one).copied().unwrap_or(0);
+                    if n > 1 {
+                        first_error = Some(Error::Sqlstate(
+                            "42702",
+                            format!("column reference \"{one}\" is ambiguous"),
+                        ));
+                    } else if n == 0 && all_known && !items.iter().any(|(name, _)| name == one) {
+                        set_error_location(c.location);
+                        first_error = Some(Error::Sqlstate(
+                            "42703",
+                            format!("column \"{one}\" does not exist"),
+                        ));
+                    }
+                }
+                [q, col] if all_known => {
+                    let mut named = items.iter().filter(|(name, _)| name == q);
+                    if let (Some((_, Some(cols))), None) = (named.next(), named.next()) {
+                        if !cols.iter().any(|c| c == col) {
+                            set_error_location(c.location);
+                            first_error = Some(Error::Sqlstate(
+                                "42703",
+                                format!("column {q}.{col} does not exist"),
+                            ));
                         }
                     }
                 }
+                _ => {}
             }
             Ok(())
         })?;
     }
-    match ambiguous {
-        Some(name) => Err(Error::Sqlstate(
-            "42702",
-            format!("column reference \"{name}\" is ambiguous"),
-        )),
+    match first_error {
+        Some(e) => Err(e),
         None => Ok(()),
     }
 }

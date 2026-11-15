@@ -235,11 +235,11 @@ def test_explain_prints_the_join(rust_pg: Any) -> None:
     ]
 
 
-@pytest.mark.backlog("RP-436")
+@pytest.mark.backlog_fixed("RP-436")
 def test_missing_column_reported_before_ambiguous_one(rust_pg: Any) -> None:
     """PostgreSQL's `transformUpdateStmt` analyses the WHERE before the SET
     list, each left to right, and reports the first bad column it meets: a
-    missing one there is 42703 even when a later name is ambiguous."""
+    missing one there was 42702 here when a later name was ambiguous."""
     assert _answers(
         rust_pg,
         [
