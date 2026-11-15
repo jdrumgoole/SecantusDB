@@ -18,6 +18,7 @@ mod agg_hoist;
 mod agg_support;
 pub mod deferred;
 mod domain_scope;
+mod join_alias;
 mod record_image;
 mod relabel;
 pub use domain_scope::{select_output_domains, select_target_domain};
@@ -12373,6 +12374,8 @@ fn plan_explain(
     options.timing = options.analyze && timing.unwrap_or(true);
     options.summary = summary.unwrap_or(options.analyze);
     let mut query = analysed.ok_or_else(|| Error::Parse("EXPLAIN without a statement".into()))?;
+    // A join alias's columns are its sides' own (RP-471).
+    join_alias::flatten_join_aliases(&mut query, lookup)?;
     // The WHERE's constants are simplified before anything is planned
     // (`eval_const_expressions`, `canonicalize_qual`; RP-409).
     options.dummy_relation = const_quals::simplify_statement(&mut query, lookup)?;

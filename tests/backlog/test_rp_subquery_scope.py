@@ -681,8 +681,8 @@ _JOIN_PLAN = [
 
 # PostgreSQL flattens a join alias's columns to the sides' own
 # (`flatten_join_alias_vars`), so `j.b = 'x'` is `fe`'s scan filter and the
-# plan is the unaliased one's. Here the aliased form prints no Hash Cond
-# and keeps the conjunct above the join.
+# plan is the unaliased one's. The aliased form printed no Hash Cond and
+# kept the conjunct above the join (RP-471).
 ALIASED_JOIN_PLAN = {
     "explain (costs off) select fs.c from fs join fe on fs.a = fe.a where fe.b = 'x'": _JOIN_PLAN,
     "explain (costs off) select j.c from (fs join fe on fs.a = fe.a) as j where j.b = 'x'": (
@@ -691,7 +691,7 @@ ALIASED_JOIN_PLAN = {
 }
 
 
-@pytest.mark.backlog("RP-471")
+@pytest.mark.backlog_fixed("RP-471")
 @pytest.mark.parametrize("query", list(ALIASED_JOIN_PLAN))
 def test_aliased_join_plan(query: str, dsn: str) -> None:
     assert answer(dsn, query) == ALIASED_JOIN_PLAN[query]

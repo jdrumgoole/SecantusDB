@@ -2245,17 +2245,6 @@ Measured on PostgreSQL 15.19 (the data-modifying WITH on a private cluster).
       Verify: tests/backlog/test_rp_subquery_scope.py::test_hidden_join_name_reused_by_subquery
       Backlog-ID: RP-972
 
-- [ ] **EXPLAIN of an aliased JOIN prints no Hash Cond and keeps its WHERE
-      above the join.** PostgreSQL flattens a join alias's columns to the
-      sides' own (`flatten_join_alias_vars`), so `explain (costs off)
-      select j.c from (fs join fe on fs.a = fe.a) as j where j.b = 'x'`
-      prints the unaliased query's plan: `Hash Cond: (fs.a = fe.a)` and
-      `Filter: (b = 'x'::text)` on `fe`'s scan. Here neither line is
-      printed: the WHERE pushdown and the equivalence classes
-      (`pushdown_filters`) stop at an aliased JOIN, as a conjunct naming
-      `j` has no leaf to go to. The rows are right; the plan text is not.
-      Backlog-ID: RP-471
-      Verify: tests/backlog/test_rp_subquery_scope.py::test_aliased_join_plan
 
 ## Found while working RP-479 (2026-11-08)
 
