@@ -95,4 +95,8 @@ def test_a_contested_write_of_many_out_of_time_keeps_what_it_wrote(
     # part-way at 150 ms too.
     theirs = _write_out_of_time(mongod_rs, "contested", op, budget=150)
     assert theirs == (("err", 50), True), theirs
-    assert _write_out_of_time(rust_mongo, "contested", op, budget=150) == theirs
+    # This server gets 400 ms: at 150 CI's debug build still wrote nothing
+    # (PR #2764, 2026-11-15). 400 is about 13 times its first write here and
+    # under a third of reading every match first, which costs 1.25 s here
+    # and more on CI.
+    assert _write_out_of_time(rust_mongo, "contested", op, budget=400) == theirs
