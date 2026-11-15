@@ -3739,7 +3739,17 @@ fn row_sublink_pairs(
         else {
             continue;
         };
-        if crate::funcsig::operator_resolves(op, &l, &t) == Some(false) {
+        // The `text_pattern_ops` operators take `text` and `bpchar`, which
+        // every string type reaches (RP-851); the planner rewrites them to
+        // `<` .. `>` under `COLLATE "C"`, so they are not in its table.
+        let refused = if matches!(op, "~<~" | "~<=~" | "~>=~" | "~>~") {
+            [&l, &t]
+                .iter()
+                .any(|t| category(t).is_some_and(|c| c != "string"))
+        } else {
+            crate::funcsig::operator_resolves(op, &l, &t) == Some(false)
+        };
+        if refused {
             return Err(mismatch(op, &l, &t, location));
         }
     }

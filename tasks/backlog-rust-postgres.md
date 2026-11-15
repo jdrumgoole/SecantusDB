@@ -3635,18 +3635,16 @@ Measured on PostgreSQL 15.19 (the shared reference on port 5415): every
 statement is VALUES-only and runs there as written. The gap tests are in
 `tests/backlog/test_rp_found_rp727.py`.
 
-- [ ] **A row comparison with a pattern operator is refused.** `select
-      ('a', 'b') ~<~ ('a', 'c')` and `('a', 'b') ~<~ any (select 'a', 'c')`
-      are `t` on PostgreSQL 15.19: `~<~` is a btree operator (of
-      `text_pattern_ops`), so `make_row_comparison_op` builds a
-      RowCompareExpr of it as of `<`. Here the first is 42804 `collations
-      are not supported by type record` and the second 0A000 `a row
-      comparison with ~<~ and a subquery is not supported yet`. Since RP-849
-      rows of no fields are 0A000 `cannot compare rows of zero length`
-      under any operator, `row() ~<~ any (select)` included, but `row()
-      ~<~ row()` is still the 42804: the collation check runs first.
-      Verify: tests/backlog/test_rp_found_rp727.py::test_row_comparison_with_a_pattern_operator
-      Backlog-ID: RP-851
+- [ ] **A row comparison with a pattern operator over fields that are not
+      strings is a collation error.** `select (1, 2) ~<~ (1, 3)` is 42883
+      `operator does not exist: integer ~<~ integer` at 15 on PostgreSQL
+      15.19 (`make_row_comparison_op` looks up each pair's operator). Here
+      it is 42804 `collations are not supported by type integer` with no
+      position: `pattern_ops` rewrites `~<~` to `<` and collates each
+      field `"C"` before any operand is typed. The subquery form (`(1, 2)
+      ~<~ any (select 1, 3)`) is right since RP-851.
+      Verify: tests/backlog/test_rp_found_rp727.py::test_row_pattern_operator_over_non_strings
+      Backlog-ID: RP-973
 
 ## Found while working RP-849 (2026-11-11)
 

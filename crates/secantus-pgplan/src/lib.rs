@@ -5632,10 +5632,22 @@ fn pattern_ops(node: &mut N) {
                             Some(pg_query::protobuf::a_const::Val::Sval(_))))
                 };
                 e.name = vec![string_node(to)];
-                if literal(&e.rexpr) && !literal(&e.lexpr) {
-                    e.lexpr = collate(e.lexpr.take());
+                let side = if literal(&e.rexpr) && !literal(&e.lexpr) {
+                    &mut e.lexpr
                 } else {
-                    e.rexpr = collate(e.rexpr.take());
+                    &mut e.rexpr
+                };
+                // Between two rows the operator is each pair's
+                // (`make_row_comparison_op`, a RowCompareExpr of `~<~` as
+                // of `<`): the fields are collated, not the row, which
+                // has no collation (RP-851).
+                if let Some(N::RowExpr(r)) = side.as_deref_mut().and_then(|n| n.node.as_mut()) {
+                    for a in r.args.iter_mut() {
+                        let taken = std::mem::take(a);
+                        *a = *collate(Some(Box::new(taken))).expect("given");
+                    }
+                } else {
+                    *side = collate(side.take());
                 }
             }
         }
@@ -26255,6 +26267,54 @@ fn resolve_one_sublink(
     }
 }
 
+/// One pair of a row comparison as an operator node: a `text_pattern_ops`
+/// operator is planned as `pattern_ops` plans it, the plain comparison
+/// under `COLLATE "C"` (RP-851).
+pub(crate) fn row_pair_node(
+    op: &str,
+    lhs: pg_query::protobuf::Node,
+    rhs: pg_query::protobuf::Node,
+) -> pg_query::protobuf::Node {
+    let (op, rhs) = match op {
+        "~<~" | "~<=~" | "~>=~" | "~>~" if !user_ops::defines(op) => (
+            &op[1..op.len() - 1],
+            pg_query::protobuf::Node {
+                node: Some(N::CollateClause(Box::new(
+                    pg_query::protobuf::CollateClause {
+                        arg: Some(Box::new(rhs)),
+                        collname: vec![string_node("C")],
+                        location: -1,
+                    },
+                ))),
+            },
+        ),
+        _ => (op, rhs),
+    };
+    pg_query::protobuf::Node {
+        node: Some(N::AExpr(Box::new(AExpr {
+            kind: AExprKind::AexprOp as i32,
+            name: vec![string_node(op)],
+            lexpr: Some(Box::new(lhs)),
+            rexpr: Some(Box::new(rhs)),
+            location: -1,
+        }))),
+    }
+}
+
+/// An ordering operator a row comparison decides pair by pair, and the
+/// strict form it takes at the first unequal pair: the btree operators of
+/// the default opclasses and of `text_pattern_ops` (`~<~` .. `~>~`), whose
+/// pairs are equal exactly when `=` says so (RP-851).
+pub(crate) fn row_order_strict(op: &str) -> Option<&'static str> {
+    Some(match op {
+        "<" | "<=" => "<",
+        ">" | ">=" => ">",
+        "~<~" | "~<=~" => "~<~",
+        "~>~" | "~>=~" => "~>~",
+        _ => return None,
+    })
+}
+
 /// `(a, b) IN (SELECT x, y ...)` / `(a, b) NOT IN (...)` over the subquery's
 /// rows, as the boolean tree a row comparison means: `IN` is an OR over the
 /// rows of `a = x AND b = y`, `NOT IN` an AND over the rows of `a <> x OR b
@@ -26296,7 +26356,7 @@ fn row_subquery_comparison(
             "cannot compare rows of zero length".into(),
         ));
     }
-    let ordered = matches!(op.as_str(), "<" | "<=" | ">" | ">=");
+    let ordered = row_order_strict(&op).is_some();
     if !ordered && !matches!(op.as_str(), "=" | "<>") {
         return Err(Error::Unsupported(format!(
             "a row comparison with {op} and a subquery"
@@ -26352,15 +26412,7 @@ fn row_subquery_comparison(
                 Some(t) if is_bpchar_type(t) => relabel_cast(value, t),
                 _ => value,
             };
-            pg_query::protobuf::Node {
-                node: Some(N::AExpr(Box::new(AExpr {
-                    kind: AExprKind::AexprOp as i32,
-                    name: vec![string_node(op)],
-                    lexpr: Some(Box::new(lhs.clone())),
-                    rexpr: Some(Box::new(rhs)),
-                    location: -1,
-                }))),
-            }
+            row_pair_node(op, lhs.clone(), rhs)
         };
     let mut arms = Vec::with_capacity(rows.len());
     for r in rows {
@@ -26373,7 +26425,7 @@ fn row_subquery_comparison(
             // built from the last pair out: a decided pair settles its OR
             // or AND whatever lies beyond it, and an unknown one leaves
             // the whole unknown.
-            let strict = &op[..1];
+            let strict = row_order_strict(&op).expect("ordered");
             let last = width - 1;
             let mut values: Vec<Bson> = r;
             let mut tree = pair(

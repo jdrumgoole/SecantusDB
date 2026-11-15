@@ -2138,15 +2138,7 @@ fn pair_compare(
         }
         None => param,
     };
-    let pair = pg_query::protobuf::Node {
-        node: Some(N::AExpr(Box::new(AExpr {
-            kind: AExprKind::AexprOp as i32,
-            name: vec![string_node(op)],
-            lexpr: Some(Box::new(field.clone())),
-            rexpr: Some(Box::new(rhs)),
-            location: -1,
-        }))),
-    };
+    let pair = crate::row_pair_node(op, field.clone(), rhs);
     const_value(&pair, &extended)
 }
 
@@ -2189,15 +2181,16 @@ fn row_compare(
                 Bson::Boolean(decides)
             })
         }
-        "<" | "<=" | ">" | ">=" => {
+        _ if crate::row_order_strict(op).is_some() => {
+            let strict = crate::row_order_strict(op).expect("ordered");
             for i in 0..t.args.len() {
                 match pair(i, "=")? {
                     Bson::Boolean(true) => continue,
-                    Bson::Boolean(false) => return pair(i, &op[..1]),
+                    Bson::Boolean(false) => return pair(i, strict),
                     _ => return Ok(Bson::Null),
                 }
             }
-            Ok(Bson::Boolean(matches!(op, "<=" | ">=")))
+            Ok(Bson::Boolean(matches!(op, "<=" | ">=" | "~<=~" | "~>=~")))
         }
         _ => Err(Error::Unsupported(format!(
             "a row comparison with {op} and a subquery"
