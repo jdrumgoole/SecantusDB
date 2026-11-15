@@ -361,7 +361,7 @@ pub(crate) fn inner_names(s: &pg_query::protobuf::SelectStmt) -> Vec<String> {
 /// join's alias, an aliased JOIN hiding its sides -- the rules of
 /// `inner_names`) and its WITH's CTE names, but nothing inside a derived
 /// table or a subquery, which are levels of their own.
-fn level_names(s: &pg_query::protobuf::SelectStmt) -> Vec<String> {
+pub(crate) fn level_names(s: &pg_query::protobuf::SelectStmt) -> Vec<String> {
     fn from_item(item: &pg_query::protobuf::Node, names: &mut Vec<String>) {
         match item.node.as_ref() {
             Some(N::RangeVar(r)) => names.push(

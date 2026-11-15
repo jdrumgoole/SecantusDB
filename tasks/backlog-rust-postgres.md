@@ -3177,27 +3177,6 @@ Measured on PostgreSQL 15.19; none needs an object.
       Verify: tests/backlog/test_rp_found_rp458.py::test_named_argument_to_a_builtin_without_argument_names
       Backlog-ID: RP-677
 
-## Found while working RP-517 (2026-11-09)
-
-Measured on a private PostgreSQL 15.19 cluster with `fe(a int, b text)` and
-`fs(a int, c text)` holding `(1, 'x')` and `(1, 'y')`. Each also fails with
-the column written out, so none is the star's. The gap tests are in
-`tests/backlog/test_rp_found_rp517.py`.
-
-- [ ] **A LATERAL subquery's outer column is named by its type, and a star
-      over an outer item there is 42P01.** `select l.* from (values (3))
-      v(a), lateral (select v.a) l` names its column `a` on PostgreSQL 15.19
-      (`FigureColname`), and `lateral (select fe.a, fe.b) l` names `a`, `b`;
-      here they are `int4` and `int4`, `text`. `lateral (select v.*) l` and
-      `lateral (select fe.* from fs) l` answer the outer item's columns
-      there (`ExpandColumnRefStar` finds it in the level's range table);
-      here each is 42P01 `invalid reference to FROM-clause entry for table
-      "v"` (`"fe"`) with the hint that the entry cannot be referenced from
-      this part of the query. RP-517 expanded such a star in an expression
-      subquery only.
-      Verify: tests/backlog/test_rp_found_rp517.py::test_lateral_outer_columns
-      Backlog-ID: RP-701
-
 ## Found while working RP-697 (2026-11-09)
 
 Measured on a private PostgreSQL 15.19 cluster with the `_SETUP` in

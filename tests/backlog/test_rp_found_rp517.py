@@ -337,19 +337,27 @@ def test_group_by_a_correlated_subquery_target(query: str, dsn: str) -> None:
 
 # A LATERAL subquery's column is named as any select-list column is
 # (`FigureColname`: `v.a` is `a`), and a star there over an earlier FROM
-# item is that item's columns (`ExpandColumnRefStar`). Here the names are
-# the columns' types (`int4`, `text`), and each star is 42P01 `invalid
+# item is that item's columns (`ExpandColumnRefStar`). The names were the
+# columns' types (`int4`, `text`), and each star was 42P01 `invalid
 # reference to FROM-clause entry`, with the hint that the entry cannot be
-# referenced from this part of the query.
+# referenced from this part of the query (RP-701).
 LATERAL_OUTER_COLUMNS = {
     "select l.* from (values (3)) v(a), lateral (select v.a) l": ([(3,)], ["a"]),
     "select l.* from fe, lateral (select fe.a, fe.b) l": ([(1, "x")], ["a", "b"]),
     "select l.* from (values (3)) v(a), lateral (select v.*) l": ([(3,)], ["a"]),
     "select l.* from fe, lateral (select fe.* from fs) l": ([(1, "x")], ["a", "b"]),
+    # A set operation is named by its first arm, and a star over a side of
+    # a USING join is that side's columns, its copy of the merged one too.
+    "select l.* from fe, lateral (select fe.a union select 2) l order by 1": (
+        [(1,), (2,)],
+        ["a"],
+    ),
+    "select l.* from (fe join fs using (a)), lateral (select fe.*) l": ([(1, "x")], ["a", "b"]),
+    "select l.* from (values (3)) v(a), lateral (select v.a + 1) l": ([(4,)], ["?column?"]),
 }
 
 
-@pytest.mark.backlog("RP-701")
+@pytest.mark.backlog_fixed("RP-701")
 @pytest.mark.parametrize("query", list(LATERAL_OUTER_COLUMNS))
 def test_lateral_outer_columns(query: str, dsn: str) -> None:
     assert answer(dsn, query) == LATERAL_OUTER_COLUMNS[query]

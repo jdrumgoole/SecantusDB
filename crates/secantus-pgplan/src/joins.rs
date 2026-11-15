@@ -1620,6 +1620,91 @@ fn scalar_alias(names: Vec<String>, function: bool, alias: &str, width: usize) -
     }
 }
 
+/// A LATERAL subquery's select list as `transformTargetList` reads it
+/// before its references to the left become parameters (RP-701): a star
+/// over a left FROM item is that item's columns (`ExpandColumnRefStar`
+/// finds the item in the level's range table), and a column reference is
+/// named by its column (`FigureColname`), not by the parameter's type.
+fn left_targets_as_written(inner: &mut pg_query::protobuf::SelectStmt, left: &Scope) {
+    // A set operation's arms are levels of their own, and its columns are
+    // named by its first arm's.
+    if inner.larg.is_some() || inner.rarg.is_some() {
+        for arm in [inner.larg.as_deref_mut(), inner.rarg.as_deref_mut()]
+            .into_iter()
+            .flatten()
+        {
+            left_targets_as_written(arm, left);
+        }
+        return;
+    }
+    let own = crate::correlated::level_names(inner);
+    let string = |v: &str| pg_query::protobuf::Node {
+        node: Some(N::String(pg_query::protobuf::String {
+            sval: v.to_string(),
+        })),
+    };
+    let mut out = Vec::with_capacity(inner.target_list.len());
+    for mut t in std::mem::take(&mut inner.target_list) {
+        if let Some(N::ResTarget(rt)) = t.node.as_mut() {
+            if let Some(N::ColumnRef(c)) = rt.val.as_deref().and_then(|v| v.node.as_ref()) {
+                let parts: Vec<Option<&str>> = c
+                    .fields
+                    .iter()
+                    .map(|f| match f.node.as_ref() {
+                        Some(N::String(s)) => Some(s.sval.as_str()),
+                        _ => None,
+                    })
+                    .collect();
+                let star = c
+                    .fields
+                    .last()
+                    .is_some_and(|f| matches!(f.node, Some(N::AStar(_))));
+                match parts.as_slice() {
+                    [Some(q), None] if star && !own.iter().any(|o| o == q) => {
+                        // A side of a USING join keeps its own copy of the
+                        // merged column, which its star expands to.
+                        let columns: Vec<&ScopeCol> = left
+                            .cols
+                            .iter()
+                            .filter(|col| col.alias == *q && (col.star || !col.bare))
+                            .collect();
+                        if !columns.is_empty() {
+                            let at = c.location;
+                            let q = q.to_string();
+                            for col in columns {
+                                out.push(pg_query::protobuf::Node {
+                                    node: Some(N::ResTarget(Box::new(
+                                        pg_query::protobuf::ResTarget {
+                                            name: col.name.clone(),
+                                            val: Some(Box::new(pg_query::protobuf::Node {
+                                                node: Some(N::ColumnRef(
+                                                    pg_query::protobuf::ColumnRef {
+                                                        fields: vec![string(&q), string(&col.name)],
+                                                        location: at,
+                                                    },
+                                                )),
+                                            })),
+                                            location: at,
+                                            ..Default::default()
+                                        },
+                                    ))),
+                                });
+                            }
+                            continue;
+                        }
+                    }
+                    [.., Some(column)] if rt.name.is_empty() => {
+                        rt.name = column.to_string();
+                    }
+                    _ => {}
+                }
+            }
+        }
+        out.push(t);
+    }
+    inner.target_list = out;
+}
+
 /// A FROM item that reads the row to its LEFT -- a `LATERAL` subquery, or a
 /// function whose arguments name a column there (a function in FROM is
 /// implicitly lateral, as in PostgreSQL) -- planned as SQL re-run per left
@@ -1687,6 +1772,7 @@ fn lateral_leaf(
                     Ok(Some(_))
                 )
         })?;
+        left_targets_as_written(&mut inner, left);
     }
     // The references to the left side, each bound to a parameter.
     let mut keys: Vec<String> = Vec::new();
