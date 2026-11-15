@@ -728,16 +728,6 @@ These are explicit non-goals. Don't add them without a reason.
       (RM-472).
       Verify: tests/backlog/test_rm_found_rm472.py::test_a_near_read_explains_as_geo_near_2d
       Backlog-ID: RM-578
-- [ ] **An `$or` over two indexes returns its branches out of order.**
-      mongod 8.2.11 reads `{$or: [{y: 0}, {x: {$gt: 8}}]}` over `{y: 1,
-      x: 1}` and `{x: 1}` branch by branch as its plan lists them,
-      `y_1_x_1` first: `_id` 0, 3, 6, 9, then 10, 11. This server's explain
-      lists the same order, but it returns the `x_1` branch first (9, 10,
-      11, 0, 3, 6). Sorted on `y` with `limit: 2` it then returns different
-      rows (`x` 9 and 0, where mongod returns 0 and 3), since the sort's
-      ties keep the read order. Found 2026-11-12 (RM-471).
-      Verify: tests/backlog/test_rm_found_rm471.py::test_an_or_of_two_indexes_returns_its_branches_in_order
-      Backlog-ID: RM-572
 - [ ] **A sort over an `$or` with a fetched branch sorts documents.**
       mongod 8.2.11's OR of `FETCH <- IXSCAN w_1` and `IXSCAN y_1_x_1` is
       not fetched, and every branch carries `x` (a fetched one carries every

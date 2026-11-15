@@ -157,13 +157,14 @@ def test_return_key_drops_the_projection(rust_mongo: Any, mongod: Any) -> None:
     assert answers["rust"] == answers["mongod"]
 
 
-@pytest.mark.backlog("RM-572")
+@pytest.mark.backlog_fixed("RM-572")
 def test_an_or_of_two_indexes_returns_its_branches_in_order(rust_mongo: Any, mongod: Any) -> None:
     """mongod 8.2.11 reads `{$or: [{y: 0}, {x: {$gt: 8}}]}` over `{y: 1,
     x: 1}` and `{x: 1}` branch by branch as its plan lists them, `y_1_x_1`
     first: `_id` 0, 3, 6, 9, then 10, 11. This server returns the `x_1`
-    branch first (9, 10, 11, 0, 3, 6), the order its own explain does not
-    list -- and so, sorted on `y` with a limit, a different two rows."""
+    branch first (9, 10, 11, 0, 3, 6), the order its own explain did not
+    list -- and so, sorted on `y` with a limit, a different two rows --
+    until the planner's catalog came in build order, not by name."""
     commands = {
         "plain": {"find": "c", "filter": {"$or": [{"y": 0}, {"x": {"$gt": 8}}]}},
         "sorted, limit": {
