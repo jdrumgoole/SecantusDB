@@ -843,6 +843,61 @@ fn fromless_outer_names(inner: &pg_query::protobuf::SelectStmt, outer: &[String]
     names
 }
 
+/// `transformSetOperationStmt`: a set operation's ORDER BY sees only its
+/// output columns, so a name resolving to the outer row is a sort
+/// expression, which it refuses (RP-767). A name neither level has stays
+/// 42703, found by planning.
+fn set_operation_order_by_outer(
+    inner: &pg_query::protobuf::SelectStmt,
+    outer: &[String],
+    outer_refs: &[Vec<String>],
+) -> Result<()> {
+    if inner.larg.is_none() {
+        return Ok(());
+    }
+    let mut leftmost = inner;
+    while let Some(l) = leftmost.larg.as_deref() {
+        leftmost = l;
+    }
+    let output: Vec<String> = leftmost
+        .target_list
+        .iter()
+        .filter_map(|t| match t.node.as_ref()? {
+            N::ResTarget(rt) if !rt.name.is_empty() => Some(rt.name.clone()),
+            N::ResTarget(rt) => match rt.val.as_ref()?.node.as_ref()? {
+                N::ColumnRef(c) => parts_of(c)?.pop(),
+                _ => None,
+            },
+            _ => None,
+        })
+        .collect();
+    for sb in &inner.sort_clause {
+        let Some(N::SortBy(sb)) = sb.node.as_ref() else {
+            continue;
+        };
+        let Some(N::ColumnRef(c)) = sb.node.as_deref().and_then(|n| n.node.as_ref()) else {
+            continue;
+        };
+        let Some(parts) = parts_of(c) else {
+            continue;
+        };
+        let is_outer = match parts.as_slice() {
+            [name] => !output.contains(name) && outer.contains(name),
+            _ => outer_refs.contains(&parts),
+        };
+        if is_outer {
+            crate::set_error_location(c.location);
+            return Err(Error::Sqlstate(
+                "0A000",
+                "invalid UNION/INTERSECT/EXCEPT ORDER BY clause\nDetail: Only result column \
+                 names can be used, not expressions or functions."
+                    .into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn correlate(
     sl: &pg_query::protobuf::SubLink,
     shape: &pg_query::protobuf::SubLink,
@@ -891,6 +946,7 @@ pub(crate) fn correlate(
         }
         Ok(())
     })?;
+    set_operation_order_by_outer(inner, outer, &outer_refs)?;
     // Unqualified ones, found by planning: a name the subquery cannot resolve
     // that the outer query has is a correlation; anything else is a typo.
     let first = params.len() + 1;

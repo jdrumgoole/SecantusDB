@@ -3016,22 +3016,6 @@ test is in `tests/backlog/test_rp_found_rp900.py`.
       Verify: tests/backlog/test_rp_found_rp900.py::test_the_unnamed_portal_is_not_in_pg_cursors
       Backlog-ID: RP-936
 
-## Found while working RP-698 (2026-11-10)
-
-Measured on PostgreSQL 15.19 (the shared reference on port 5415).
-
-- [ ] **An outer column in a set operation's ORDER BY is 42703.** `select
-      (select a from (values (1)) t(a) union select 9 order by b limit 1)
-      from (values (5, 6)) v(a, b)` is 0A000 `invalid UNION/INTERSECT/EXCEPT
-      ORDER BY clause`, DETAIL `Only result column names can be used, not
-      expressions or functions.`, at 65 on PostgreSQL 15.19: the ORDER BY
-      sees only the output columns, so `b` resolves to the outer row and is
-      a sort expression (`transformSetOperationStmt`); `order by v.b` is the
-      same. Here each is 42703 `column "b" does not exist`. A name neither
-      level has is 42703 on both.
-      Verify: tests/backlog/test_rp_found_rp698.py::test_an_outer_column_in_a_set_operations_order_by
-      Backlog-ID: RP-767
-
 ## Found while working RP-756 (2026-11-10)
 
 Measured on PostgreSQL 15.19 (the shared reference on port 5415): every
