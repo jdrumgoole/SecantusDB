@@ -16206,10 +16206,32 @@ impl Storage {
     /// that fell behind the log is rebuilt from the catalog. Inside a
     /// transaction the catalog is read directly, so its own DDL is seen.
     pub fn index_owners(&self, db: &str, name: &str) -> Result<Vec<String>> {
+        self.with_index_names(db, |idx| idx.owners(name))
+    }
+
+    /// The collections of `db` that may hold a stored index other than
+    /// `_id_`: every one that holds one, and every one whose index catalog
+    /// changed while it was not yet registered. A collection outside it
+    /// holds none, so a reader deriving every table's index relations reads
+    /// no index list for it (RP-911), as PostgreSQL's `RelationGetIndexList`
+    /// is answered from the relcache entry rather than a catalog scan.
+    pub fn indexed_collections(&self, db: &str) -> Result<HashSet<String>> {
+        self.with_index_names(db, |idx| {
+            idx.by_coll
+                .keys()
+                .chain(idx.unregistered.iter())
+                .cloned()
+                .collect()
+        })
+    }
+
+    /// `f` over `db`'s index-name map, brought current (see
+    /// [`Self::index_owners`]).
+    fn with_index_names<R>(&self, db: &str, f: impl FnOnce(&IndexNameIndex) -> R) -> Result<R> {
         let session = self.op_session()?;
         let Some(gen) = self.planner_shared_gen(&session) else {
             let built = self.build_index_names(&session, db, 0)?;
-            return Ok(built.owners(name));
+            return Ok(f(&built));
         };
         let mut guard = self.index_names.lock().unwrap_or_else(|e| e.into_inner());
         // Numbered before the reads: a change numbered after it may be one
@@ -16223,7 +16245,7 @@ impl Storage {
             Some(idx) => idx,
             None => self.build_index_names(&session, db, now)?,
         };
-        let out = idx.owners(name);
+        let out = f(&idx);
         if planner_settled() == Some(gen) {
             *guard = Some(idx);
         }

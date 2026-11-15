@@ -6440,13 +6440,14 @@ impl PgHandler {
         );
         // An index the open block created is a relation in that block (its
         // tables reach planning through the overlay; indexes do not).
-        let relations = if self.block_wrote_catalog() {
-            self.in_open_transaction(|| Ok(self.relations()))
-                .unwrap_or_else(|_| self.relations())
+        if self.block_wrote_catalog() {
+            let relations = self
+                .in_open_transaction(|| Ok(self.relations()))
+                .unwrap_or_else(|_| self.relations());
+            secantus_pgplan::set_user_relations(relations);
         } else {
-            self.relations()
-        };
-        secantus_pgplan::set_user_relations(relations);
+            secantus_pgplan::defer_user_relations(self.relations_derivation());
+        }
         // `pg_relation_is_publishable`'s tables, listed when a statement
         // first asks (RP-911), from the catalog documents read now.
         {
@@ -12751,54 +12752,72 @@ impl PgHandler {
     /// Every table with a relation oid, as `(stored name, oid, temp)`, for
     /// the planner's `regclass` resolution.
     pub(crate) fn relations(&self) -> Vec<(String, i64, bool)> {
-        let docs = match self.type_catalog_docs(Self::COMPOSITE_COLLECTION) {
-            Ok(docs) => docs,
-            Err(_) => return Vec::new(),
-        };
-        let temps: std::collections::HashSet<String> = self
-            .shared_table_defs()
+        self.relations_derivation()()
+    }
+
+    /// [`Self::relations`] as a derivation over the catalog read now, for
+    /// the planner to run at a statement's first relation lookup (RP-911):
+    /// listing every composite for each catalog version grew the statement
+    /// after any DDL with the schema, where PostgreSQL reads `pg_class` by
+    /// name only for a relation it is asked about.
+    fn relations_derivation(&self) -> impl FnOnce() -> Vec<(String, i64, bool)> + 'static {
+        let docs = self.type_catalog_docs(Self::COMPOSITE_COLLECTION);
+        let defs = self.shared_table_defs().unwrap_or_default();
+        let indexes = self.index_relations();
+        let views: Vec<(String, i64)> = self
+            .views()
             .unwrap_or_default()
-            .iter()
-            .filter(|d| d.temp)
-            .map(|d| d.name.clone())
-            .collect();
-        // A standalone composite (`CREATE TYPE t AS (...)`) is a relation
-        // too, relkind `c`, under its own oid (`typrelid`).
-        docs.iter()
-            .filter_map(|d| {
-                let name = d.get_str("_id").ok()?.to_string();
-                let oid = Self::composite_relid(d)?;
-                let temp = temps.contains(&name);
-                Some((name, oid, temp))
+            .into_iter()
+            .map(|(name, _)| {
+                let oid = self.view_relid(&name);
+                (name, oid)
             })
-            .chain(self.index_relations().into_iter().map(|ix| {
-                let temp = temps.contains(&ix.table.name);
-                // An index lives in its table's schema, so it carries that
-                // schema's key (`test_schema.ix`) like any relation there.
-                let (schema, _) = secantus_pgplan::schemas::split_key(&ix.table.name);
-                let name = if ix.name.contains('.') {
-                    ix.name
-                } else {
-                    secantus_pgplan::schemas::relation_key(&schema, &ix.name)
-                };
-                (name, ix.oid, temp)
-            }))
-            .chain(
-                self.views()
-                    .unwrap_or_default()
-                    .into_iter()
-                    .map(|(name, _)| {
-                        let oid = self.view_relid(&name);
-                        (name, oid, false)
-                    }),
-            )
-            // A sequence is a relation too: `'s'::regclass` names it --
-            // including one this open transaction created or dropped.
-            .chain(self.sequence_names().into_iter().map(|name| {
+            .collect();
+        // A sequence is a relation too: `'s'::regclass` names it --
+        // including one this open transaction created or dropped.
+        let sequences: Vec<(String, i64)> = self
+            .sequence_names()
+            .into_iter()
+            .map(|name| {
                 let oid = self.sequence_relid(&name);
-                (name, oid, false)
-            }))
-            .collect()
+                (name, oid)
+            })
+            .collect();
+        move || {
+            let Ok(docs) = docs else {
+                return Vec::new();
+            };
+            let temps: std::collections::HashSet<&str> = defs
+                .iter()
+                .filter(|d| d.temp)
+                .map(|d| d.name.as_str())
+                .collect();
+            // A standalone composite (`CREATE TYPE t AS (...)`) is a relation
+            // too, relkind `c`, under its own oid (`typrelid`).
+            docs.iter()
+                .filter_map(|d| {
+                    let name = d.get_str("_id").ok()?;
+                    let oid = Self::composite_relid(d)?;
+                    let temp = temps.contains(name);
+                    Some((name.to_string(), oid, temp))
+                })
+                .chain(indexes.into_iter().map(|ix| {
+                    let temp = temps.contains(ix.table.name.as_str());
+                    // An index lives in its table's schema, so it carries
+                    // that schema's key (`test_schema.ix`) like any relation
+                    // there.
+                    let (schema, _) = secantus_pgplan::schemas::split_key(&ix.table.name);
+                    let name = if ix.name.contains('.') {
+                        ix.name
+                    } else {
+                        secantus_pgplan::schemas::relation_key(&schema, &ix.name)
+                    };
+                    (name, ix.oid, temp)
+                }))
+                .chain(views.into_iter().map(|(name, oid)| (name, oid, false)))
+                .chain(sequences.into_iter().map(|(name, oid)| (name, oid, false)))
+                .collect()
+        }
     }
 
     /// A composite's RELATION oid (`pg_class.oid`, `pg_type.typrelid`). A
@@ -13373,7 +13392,23 @@ impl PgHandler {
                 .filter(|d| partition::parent_of(d) == Some(parent))
                 .collect()
         };
+        // The tables that hold a stored index, from the storage's index-name
+        // map, which is kept current from the index catalog's change log:
+        // reading every table's list for each catalog version grew the
+        // statement after DDL with the schema (RP-911).
+        let indexed = self
+            .storage
+            .indexed_collections(self.db())
+            .map_err(|e| Self::storage_err("could not read the index list", e))?;
         for t in defs.iter() {
+            // A table with no key, no unique constraint and no index of its
+            // own has no index relation: no list read, no oid lookup.
+            if !indexed.contains(&t.name)
+                && !t.columns.iter().any(|c| c.pk)
+                && t.unique_constraints.is_empty()
+            {
+                continue;
+            }
             // Read in place: a copy of every table's list, for each catalog
             // version, grew the statement after DDL with the schema (RP-911).
             let stored = self

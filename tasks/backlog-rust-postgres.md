@@ -1124,16 +1124,26 @@ one beside it.
       a table with no key, unique constraint or index of its own skipped
       before any oid lookup in the index relations, and the oid map built
       only when a table has one (2026-11-13: the republication per catalog
-      version at about 800 tables, sampled, from 3.4 ms to 2.6 ms). What is
-      left, measured at 800 tables (debug build, 2026-11-13): the
-      republication (a `SELECT 1` straight after DDL) costs about 2.0 ms
-      more than with none -- the composite catalog read afresh and compared
+      version at about 800 tables, sampled, from 3.4 ms to 2.6 ms); a
+      table's index list read only when the storage's index-name map
+      (RP-928's, kept current from the index catalog's change log) says it
+      holds an index, and the relations for `regclass` listed at a
+      statement's first relation lookup (2026-11-15: a `SELECT 1` straight
+      after a `CREATE TABLE` at 800 tables, median of a loop, from 8.1 ms
+      to 4.0 ms; the collation query's gap ratio from 0.017/0.013 s to
+      0.013/0.010 s). What is left, sampled at 800 tables (debug build,
+      2026-11-15): the republication is still about two thirds of the
+      statement -- the composite catalog read afresh and compared
       (`committed_type_catalog_docs`, first read by `publish_tableoids`,
-      about 0.6 ms), the table catalog read and compared
-      (`committed_table_defs`, 0.3 ms), each table's index list
-      (`list_indexes_shared`, 0.2 ms), the relations for `regclass`
-      (`relations`, 0.4 ms) and the inheritance (0.1 ms); and the query's
-      own catalog reads after it, about 1.2 ms more. A per-table memo of the index relations by
+      about 40% of it), the table catalog read and compared
+      (`committed_table_defs`, about 20%), `namespaces` and the inheritance
+      (about 10%); and the collation query still lists every relation at
+      its `regclass` lookup. Both full reads need what PostgreSQL's
+      `inval.c` carries: a log of the catalog rows each committed
+      statement changed (key, not collection), numbered at commit as the
+      index catalog's change log is, so a reader re-reads only those rows;
+      a write logged before its transaction commits must be logged again
+      at commit, or a reader in between keeps the old row. A per-table memo of the index relations by
       the identity of their inputs was measured slower than deriving them
       (its map work per version cost more than tables with no index). The
       faithful end state keys the published state per relation and
@@ -1159,9 +1169,10 @@ one beside it.
       kept current from the index catalog's change log; under 1% of the
       statement's samples at 800). All that is left is the republication
       at the statement's start after the previous DDL
-      (`install_user_types`, two thirds of the samples at 800: the
-      composite and table catalogs compared, `relations`,
-      `publish_tableoids`) -- RP-911's remainder, so this item closes
+      (`install_user_types`: the composite and table catalogs read and
+      compared, `publish_tableoids`; since 2026-11-15 no longer each
+      table's index list or `relations`, a loop's median at 800 from
+      8.9 ms to 4.6 ms) -- RP-911's remainder, so this item closes
       with RP-911's per-relation publication. Its gap test is a timing
       ratio and can pass once by noise: a `gate_pg.sh` backlog step on
       2026-11-14 reported it `FIXED?`, then it failed three of three runs

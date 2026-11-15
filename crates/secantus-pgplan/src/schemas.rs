@@ -151,8 +151,9 @@ fn session_has_temp() -> bool {
     let has = temp_schema().is_some_and(|t| {
         let prefix = format!("{t}.");
         RELATION_KEYS.with(|k| k.borrow().iter().any(|n| n.starts_with(&prefix)))
-            || PLAN_USER_RELATIONS
-                .with(|r| r.borrow().iter().any(|(n, _, _)| n.starts_with(&prefix)))
+            || crate::deferred::read(&PLAN_USER_RELATIONS, |r| {
+                r.iter().any(|(n, _, _)| n.starts_with(&prefix))
+            })
     });
     MEMO.with(|m| m.set(Some((epoch, has))));
     has
@@ -738,7 +739,7 @@ fn not_on_path(name: &str, location: i32) -> Error {
 
 pub(crate) fn relation_exists(key: &str) -> bool {
     RELATION_KEYS.with(|k| k.borrow().contains(key))
-        || PLAN_USER_RELATIONS.with(|t| t.borrow().iter().any(|(n, _, _)| n == key))
+        || crate::deferred::read(&PLAN_USER_RELATIONS, |t| t.iter().any(|(n, _, _)| n == key))
 }
 
 /// The key an UNQUALIFIED reference resolves to: the first schema on the path

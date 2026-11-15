@@ -36800,8 +36800,13 @@ thread_local! {
     /// and a regclass value renders without a catalog read. The oid is the
     /// table's `pg_class` oid -- the same number `pg_attribute.attrelid` and
     /// the RowDescription's `ftable` carry.
-    static PLAN_USER_RELATIONS: std::cell::RefCell<Vec<(String, i64, bool)>> =
-        const { std::cell::RefCell::new(Vec::new()) };
+    ///
+    /// Derived at the first lookup when published with
+    /// [`defer_user_relations`] (RP-911): a statement that names no
+    /// relation lists none, as PostgreSQL's `get_relname_relid` reads
+    /// `pg_class` only for a name it is asked.
+    pub(crate) static PLAN_USER_RELATIONS: deferred::Slot<Vec<(String, i64, bool)>> =
+        deferred::Slot::default();
 }
 
 thread_local! {
@@ -36834,7 +36839,13 @@ pub fn relation_is_publishable(oid: i64) -> Option<bool> {
 /// Relations: `(name, oid, temp)`.
 pub fn set_user_relations(relations: Vec<(String, i64, bool)>) {
     schemas::bump_resolve_epoch();
-    PLAN_USER_RELATIONS.with(|t| *t.borrow_mut() = relations);
+    PLAN_USER_RELATIONS.with(|t| t.set(relations));
+}
+
+/// The relations `build` lists, at the first lookup (see [`deferred`]).
+pub fn defer_user_relations(build: impl FnOnce() -> Vec<(String, i64, bool)> + 'static) {
+    schemas::bump_resolve_epoch();
+    PLAN_USER_RELATIONS.with(|t| t.defer(build));
 }
 
 /// PostgreSQL's own relations -- every `pg_catalog`, `information_schema` and
@@ -36933,9 +36944,8 @@ pub fn ordered_pk_columns(def: &TableDef) -> Vec<&Column> {
 /// `None` (SQL NULL) for an oid naming no relation, as PostgreSQL answers.
 pub fn table_is_visible(oid: i64) -> Option<bool> {
     let path = schemas::search_path();
-    if let Some((key, temp)) = PLAN_USER_RELATIONS.with(|t| {
-        t.borrow()
-            .iter()
+    if let Some((key, temp)) = crate::deferred::read(&PLAN_USER_RELATIONS, |t| {
+        t.iter()
             .find(|(_, o, _)| *o == oid)
             .map(|(n, _, tmp)| (n.clone(), *tmp))
     }) {
@@ -36970,9 +36980,8 @@ pub fn regclass_text(oid: i64) -> String {
     if oid == 0 {
         return "-".to_string();
     }
-    if let Some(name) = PLAN_USER_RELATIONS.with(|t| {
-        t.borrow()
-            .iter()
+    if let Some(name) = crate::deferred::read(&PLAN_USER_RELATIONS, |t| {
+        t.iter()
             .find(|(_, o, _)| *o == oid)
             .map(|(n, _, _)| n.clone())
     }) {
@@ -37112,9 +37121,8 @@ fn resolve_regclass(text: &str) -> Result<i64> {
 /// there is no such relation, or no such schema.
 pub(crate) fn relation_oid(schema: Option<&str>, name: &str) -> Option<i64> {
     let user = |stored: &str, temp: Option<bool>| -> Option<i64> {
-        PLAN_USER_RELATIONS.with(|t| {
-            t.borrow()
-                .iter()
+        crate::deferred::read(&PLAN_USER_RELATIONS, |t| {
+            t.iter()
                 .find(|(n, _, is_temp)| n == stored && temp.is_none_or(|want| want == *is_temp))
                 .map(|(_, oid, _)| *oid)
         })
@@ -49010,9 +49018,8 @@ fn const_value_node(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result<
                 // (its GRANTs and owners); a catalog relation is readable by
                 // everyone, as PostgreSQL's are.
                 let key = oid.and_then(|oid| {
-                    PLAN_USER_RELATIONS.with(|t| {
-                        t.borrow()
-                            .iter()
+                    crate::deferred::read(&PLAN_USER_RELATIONS, |t| {
+                        t.iter()
                             .find(|(_, o, temp)| *o == oid && !*temp)
                             .map(|(k, _, _)| k.clone())
                     })

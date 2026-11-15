@@ -69,3 +69,44 @@ def test_create_table_finds_a_clashing_index_or_composite_by_name(tmp_path: Path
             except psycopg.Error as e:
                 got.append((statement, e.sqlstate or "?"))
     assert got == STEPS
+
+
+#: Each statement and PostgreSQL 15.19's rows (`None` for no result set),
+#: private cluster, 2026-11-15.
+INDEX_STEPS: list[tuple[str, list[tuple[object, ...]] | None]] = [
+    ("CREATE TABLE r1 (a int)", None),
+    ("CREATE TABLE r2 (a int)", None),
+    ("SELECT indexrelid::regclass::text FROM pg_index WHERE indrelid = 'r1'::regclass", []),
+    ("CREATE INDEX r1_ix ON r1 (a)", None),
+    (
+        "SELECT indexrelid::regclass::text FROM pg_index WHERE indrelid = 'r1'::regclass",
+        [("r1_ix",)],
+    ),
+    ("SELECT to_regclass('r1_ix') IS NOT NULL", [(True,)]),
+    ("BEGIN", None),
+    ("CREATE INDEX r2_ix ON r2 (a)", None),
+    ("SELECT to_regclass('r2_ix') IS NOT NULL", [(True,)]),
+    ("SELECT indexname FROM pg_indexes WHERE tablename = 'r2'", [("r2_ix",)]),
+    ("ROLLBACK", None),
+    ("SELECT to_regclass('r2_ix') IS NOT NULL", [(False,)]),
+    ("SELECT count(*) FROM pg_indexes WHERE tablename = 'r2'", [(0,)]),
+    ("DROP INDEX r1_ix", None),
+    ("SELECT to_regclass('r1_ix') IS NOT NULL", [(False,)]),
+    ("SELECT count(*) FROM pg_index WHERE indrelid = 'r1'::regclass", [(0,)]),
+]
+
+
+def test_a_tables_index_relations_follow_its_index_ddl(tmp_path: Path) -> None:
+    """Each answer is PostgreSQL 15.19's. Since RP-911 a table's index
+    relations are derived only for a table the storage's index-name map
+    says holds an index, and the relations a `regclass` resolves against
+    are listed at a statement's first lookup: an index made, made and
+    rolled back in a block, or dropped must still appear and go as the
+    catalog says."""
+    got = []
+    with _Server(tmp_path) as server, server.connect() as conn:
+        conn.autocommit = True
+        for statement, _ in INDEX_STEPS:
+            cur = conn.execute(statement)
+            got.append((statement, cur.fetchall() if cur.description else None))
+    assert got == INDEX_STEPS
