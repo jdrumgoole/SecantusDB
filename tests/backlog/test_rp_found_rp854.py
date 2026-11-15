@@ -182,7 +182,7 @@ def test_a_group_by_position_inside_a_set_or_list_is_a_position(
     assert _answer(dsn, query) == answer
 
 
-@pytest.mark.backlog("RP-874")
+@pytest.mark.backlog_fixed("RP-874")
 @pytest.mark.parametrize(
     ("query", "position"),
     [
@@ -196,8 +196,8 @@ def test_an_undefined_column_in_a_grouped_query_is_42703(
     """`transformColumnRef` fails on a name no FROM item has while the
     select list is analysed, before `parseCheckAggregates` looks at what
     is grouped: 42703 `column "nosuch" does not exist` on PostgreSQL 15.19.
-    Here it is 42803 `column "nosuch" must appear in the GROUP BY clause or
-    be used in an aggregate function`."""
+    It was 42803 `column "nosuch" must appear in the GROUP BY clause or
+    be used in an aggregate function`, until RP-874."""
     assert _answer(dsn, query) == (
         "error",
         "42703",

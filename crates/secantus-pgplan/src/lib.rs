@@ -31806,6 +31806,22 @@ fn finish_aggregate(
                 // qualified grouped column was a 42803 naming the ALIAS.
                 let col =
                     column_ref_name(c).ok_or_else(|| Error::Unsupported("this target".into()))?;
+                // A name no FROM item has is 42703 before it is ungrouped:
+                // `transformColumnRef` runs while the select list is
+                // analysed, before `parseCheckAggregates`.
+                if def.column(&col).is_none()
+                    && !group_by.iter().any(|k| k.name == col)
+                    && !def.columns.iter().any(|dc| {
+                        dc.field() == col
+                            || dc.name.rsplit('\u{1f}').next() == Some(col.as_str())
+                            || dc.name.rsplit('.').next() == Some(col.as_str())
+                    })
+                {
+                    if c.location >= 0 {
+                        set_error_location(c.location);
+                    }
+                    return Err(Error::UndefinedColumn(col));
+                }
                 // A bare column alongside an aggregate must be grouped by --
                 // PostgreSQL errors 42803 otherwise, and so do we.
                 let idx = group_by

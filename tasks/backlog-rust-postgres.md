@@ -3766,14 +3766,6 @@ statement is VALUES-only and runs there as written. The gap tests are in
       0A000, not 42P10 `GROUP BY position 9 is not in select list` at 49.
       Verify: tests/backlog/test_rp_found_rp854.py::test_a_group_by_position_inside_a_set_or_list_is_a_position
       Backlog-ID: RP-873
-- [ ] **A grouped query reports a column that does not exist as 42803.**
-      `select nosuch from (values (1)) v(a) group by a` is 42703 `column
-      "nosuch" does not exist` at 8 on PostgreSQL 15.19 (`transformColumnRef`,
-      while the select list is analysed, before `parseCheckAggregates`).
-      Here it is 42803 `column "nosuch" must appear in the GROUP BY clause or
-      be used in an aggregate function`, at the same place.
-      Verify: tests/backlog/test_rp_found_rp854.py::test_an_undefined_column_in_a_grouped_query_is_42703
-      Backlog-ID: RP-874
 
 ## Found while working RP-565 (2026-11-12)
 
