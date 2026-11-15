@@ -75,13 +75,13 @@ def test_a_create_indexes_that_builds_nothing_names_cmd(rust_mongo: Any, mongod_
     assert got["rust"]["lines"] == got["mongod"]["lines"]
 
 
-@pytest.mark.backlog("RM-583")
+@pytest.mark.backlog_fixed("RM-583")
 def test_a_time_series_index_build_has_its_line(rust_mongo: Any, mongod_rs: Any) -> None:
     """mongod 8.2.11 writes two lines for a `createIndexes` that builds an
     index of a time-series collection, the command's and its build
-    thread's, each naming `<db>.system.buckets.ts`; this server writes the
-    command's alone (it keeps a time-series collection's documents in its
-    column store, so the build finds the collection empty)."""
+    thread's, each naming `<db>.system.buckets.ts`; this server wrote the
+    command's alone, as it asked the collection's empty document table and
+    not its buckets whether the build scans anything."""
     got = _named(rust_mongo, mongod_rs, lambda d: d.ts.create_index("m"))
     assert got["mongod"]["lines"] == [
         ("createIndexes", "system.buckets.ts", "timeseriesBuckets", 1),

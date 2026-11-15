@@ -2299,6 +2299,14 @@ pub fn create_indexes(doc: &Document, ctx: &mut CommandContext) -> HandlerResult
         storage.collection_count_at_most(&ctx.db_name, &coll, 0),
         Ok(Some(0))
     );
+    // A time-series collection's documents are its buckets (`ts_store`),
+    // which mongod's build thread scans, so it is those that say whether
+    // the build logs a line of its own (RM-583).
+    let scans_buckets = ts_fields.is_some()
+        && !matches!(
+            storage.collection_count_at_most(&ctx.db_name, &crate::ts_store::buckets_ns(&coll), 0),
+            Ok(Some(0))
+        );
     let build_started = std::time::Instant::now();
     // The build is an operation of its own on mongod, on a thread of its
     // own: what it does to the store is not the command's (RM-023).
@@ -2706,7 +2714,7 @@ pub fn create_indexes(doc: &Document, ctx: &mut CommandContext) -> HandlerResult
     // command, which logs alone.
     let build_storage = crate::opdebug::storage_section(storage.operation_counts().as_ref(), None);
     std::mem::drop(build_counts);
-    if any_created && scans {
+    if any_created && (scans || scans_buckets) {
         // A time-series collection's index is built on its buckets (RM-484).
         let built_on = crate::opdebug::buckets_of(ctx, "createIndexes", &ctx.db_name, &coll)
             .unwrap_or_else(|| coll.clone());

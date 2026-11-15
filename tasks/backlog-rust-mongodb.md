@@ -791,17 +791,6 @@ These are explicit non-goals. Don't add them without a reason.
       working RM-485, 2026-11-13.
       Verify: tests/backlog/test_rm_view_ddl_refusals.py::test_a_drop_indexes_of_system_views_answers
       Backlog-ID: RM-588
-- [ ] **An index build of a time-series collection writes no build line.**
-      mongod 8.2.11 writes two lines for a `createIndexes` that builds an
-      index of a time-series collection, the command's and its build
-      thread's, each naming `<db>.system.buckets.ts`; this server writes
-      the command's alone. Its time-series documents live in its column
-      store (`ts_store.rs`), so `create_indexes` finds the collection's
-      document table empty and takes the build for one of an empty
-      collection, which logs no line of its own. Found while working
-      RM-484, 2026-11-13.
-      Verify: tests/backlog/test_rm_ts_ddl_lines.py::test_a_time_series_index_build_has_its_line
-      Backlog-ID: RM-583
 - [ ] **An `insert` into a time-series collection's buckets is not
       profiled.** mongod 8.2.11 writes a profile entry for an `insert` into
       `<db>.system.buckets.ts`; this server writes the line and no entry.
