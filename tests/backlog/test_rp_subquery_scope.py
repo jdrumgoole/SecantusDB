@@ -390,18 +390,43 @@ def test_from_subquery_sibling_is_not_visible(query: str, dsn: str) -> None:
 
 
 # Found while working RP-454. An aliased JOIN hides its sides' names, so
-# another FROM item may reuse one; here the two leaves' keys would be one
-# (a joined row is keyed by the table's alias), and it is refused by name.
+# another FROM item may reuse one; the two leaves' keys were one (a joined
+# row was keyed by the table's alias), and it was refused by name (0A000).
+# Each leaf of such a name is now keyed apart.
 HIDDEN_NAME_REUSED = {
     "select * from (fs join fe using (a)) as j, fs": [(1, "y", "x", 1, "y")],
     "select * from fs, (fs join fe using (a)) as j": [(1, "y", 1, "y", "x")],
+    "select fs.a, fs.c, j.b from (fs join fe using (a)) as j, fs": [(1, "y", "x")],
+    "select * from (fs join fe using (a)) as j join fs on fs.a = j.a where fs.c = 'y'": [
+        (1, "y", "x", 1, "y")
+    ],
+    "select fs from (fs join fe using (a)) as j, fs": [("(1,y)",)],
+    "select * from (fs join fe using (a)) as j, (fs join fe using (a)) as k": [
+        (1, "y", "x", 1, "y", "x")
+    ],
+    "select * from (fs join fe using (a)) as j left join fs on false": [(1, "y", "x", None, None)],
+    "select count(*) from (fs join fe on fs.a = fe.a) as j, fs where fs.a = 1": [(1,)],
+    "select * from (fs join fe using (a)) as j, fs where j.c = fs.c": [(1, "y", "x", 1, "y")],
 }
 
 
-@pytest.mark.backlog("RP-469")
+@pytest.mark.backlog_fixed("RP-469")
 @pytest.mark.parametrize("query", list(HIDDEN_NAME_REUSED))
 def test_hidden_join_name_reused(query: str, dsn: str) -> None:
     assert answer(dsn, query) == HIDDEN_NAME_REUSED[query]
+
+
+# Found while working RP-469: only a table leaf is keyed apart, so a
+# subquery or function reusing the hidden name is still refused (0A000). RP-972.
+HIDDEN_NAME_REUSED_BY_SUBQUERY = {
+    "select * from (fs join fe using (a)) as j, (select 2 as z) fs": [(1, "y", "x", 2)],
+}
+
+
+@pytest.mark.backlog("RP-972")
+@pytest.mark.parametrize("query", list(HIDDEN_NAME_REUSED_BY_SUBQUERY))
+def test_hidden_join_name_reused_by_subquery(query: str, dsn: str) -> None:
+    assert answer(dsn, query) == HIDDEN_NAME_REUSED_BY_SUBQUERY[query]
 
 
 # A FROM item's name alone is its whole row; over a join it was 42703

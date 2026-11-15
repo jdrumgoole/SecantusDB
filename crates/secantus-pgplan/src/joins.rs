@@ -600,6 +600,12 @@ thread_local! {
     /// keyed by their relation rather than by the name.
     static SHARED_NAMES: std::cell::RefCell<Vec<String>> =
         const { std::cell::RefCell::new(Vec::new()) };
+    /// The table names an aliased JOIN hides that another FROM item of the
+    /// join being built reuses (see `hidden_reused_names`): each leaf of
+    /// such a name is keyed apart, by `REKEYED`'s count.
+    static HIDDEN_REUSED: std::cell::RefCell<Vec<String>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+    static REKEYED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     /// Join sources planned for the statement in flight, by placeholder name.
     static PLANNED_JOINS: std::cell::RefCell<Vec<(String, SubSource)>> =
         const { std::cell::RefCell::new(Vec::new()) };
@@ -657,7 +663,8 @@ pub(crate) fn plan_join_source(
     // its qualifier's name, which here names more than one leaf: the join
     // runs without them, its WHERE over the joined rows.
     let shared = shared_names(s);
-    let (pushdown, moved, placed) = if shared.is_empty() {
+    let hidden_reused = hidden_reused_names(s);
+    let (pushdown, moved, placed) = if shared.is_empty() && hidden_reused.is_empty() {
         (pushdown, moved, placed)
     } else {
         nonnullable.clear();
@@ -665,12 +672,14 @@ pub(crate) fn plan_join_source(
         (Vec::new(), Vec::new(), vec![false; placed.len()])
     };
     let outer_shared = SHARED_NAMES.with(|p| p.replace(shared));
+    let outer_hidden = HIDDEN_REUSED.with(|p| p.replace(hidden_reused));
     let outer_pushdown = PUSHDOWN.with(|p| p.replace(pushdown));
     let outer_nonnullable = NONNULLABLE.with(|p| p.replace(nonnullable));
     let outer_ec = EC_PLAN.with(|p| p.replace(ec));
     let outer_whole = WHOLE_ROW_REFS.with(|p| p.replace(whole_row_names(s)));
     let built = build_tree(s, lookup, params);
     SHARED_NAMES.with(|p| *p.borrow_mut() = outer_shared);
+    HIDDEN_REUSED.with(|p| *p.borrow_mut() = outer_hidden);
     PUSHDOWN.with(|p| *p.borrow_mut() = outer_pushdown);
     NONNULLABLE.with(|p| *p.borrow_mut() = outer_nonnullable);
     EC_PLAN.with(|p| *p.borrow_mut() = outer_ec);
@@ -782,6 +791,77 @@ fn shared_names(s: &pg_query::protobuf::SelectStmt) -> Vec<String> {
         }
     }
     shared
+}
+
+/// The names of `s`'s FROM that an aliased JOIN hides and another FROM
+/// item reuses (`(fs join fe) as j, fs`), which PostgreSQL allows: the
+/// alias hides the sides' names, so the two never meet in one namespace.
+/// Only names every item of which is a table: their leaves are keyed apart
+/// (a joined row is keyed by its leaf's base, which would otherwise be the
+/// name for both); another kind of leaf is still refused by name.
+fn hidden_reused_names(s: &pg_query::protobuf::SelectStmt) -> Vec<String> {
+    // (name, is a table, inside an aliased JOIN)
+    fn walk(n: &pg_query::protobuf::Node, inside: bool, out: &mut Vec<(String, bool, bool)>) {
+        match n.node.as_ref() {
+            Some(N::RangeVar(r)) => {
+                let name = r
+                    .alias
+                    .as_ref()
+                    .map(|a| a.aliasname.clone())
+                    .filter(|a| !a.is_empty())
+                    .unwrap_or_else(|| r.relname.clone());
+                out.push((name, true, inside));
+            }
+            Some(N::JoinExpr(j)) => {
+                let side_inside = inside || j.alias.is_some();
+                for side in [j.larg.as_deref(), j.rarg.as_deref()].into_iter().flatten() {
+                    walk(side, side_inside, out);
+                }
+                for a in j.join_using_alias.iter() {
+                    out.push((a.aliasname.clone(), false, side_inside));
+                }
+                if let Some(a) = j.alias.as_ref() {
+                    out.push((a.aliasname.clone(), false, inside));
+                }
+            }
+            Some(N::RangeSubselect(rs)) => {
+                if let Some(a) = rs.alias.as_ref() {
+                    out.push((a.aliasname.clone(), false, inside));
+                }
+            }
+            Some(N::RangeFunction(rf)) => {
+                if let Some(name) = rf
+                    .alias
+                    .as_ref()
+                    .map(|a| a.aliasname.clone())
+                    .or_else(|| range_function_name(rf))
+                {
+                    out.push((name, false, inside));
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut items = Vec::new();
+    for f in &s.from_clause {
+        walk(f, false, &mut items);
+    }
+    let mut out: Vec<String> = Vec::new();
+    for (name, _, _) in &items {
+        let same: Vec<_> = items.iter().filter(|(n, _, _)| n == name).collect();
+        if !out.contains(name)
+            && same.len() > 1
+            && same.iter().all(|(_, table, _)| *table)
+            && same.iter().any(|(_, _, inside)| *inside)
+        {
+            out.push(name.clone());
+        }
+    }
+    out
+}
+
+fn hidden_reused(name: &str) -> bool {
+    HIDDEN_REUSED.with(|n| n.borrow().iter().any(|n| n == name))
 }
 
 /// `checkNameSpaceConflicts` over `s`'s FROM, for a statement whose SELECT
@@ -970,6 +1050,8 @@ fn whole_row_names(s: &pg_query::protobuf::SelectStmt) -> Vec<String> {
 
 /// Is `alias` named as a whole row by the join being built?
 fn whole_row_named(alias: &str) -> bool {
+    // A leaf keyed apart (`hidden_reused_names`) is named by its name.
+    let alias = alias.split_once('\u{1d}').map_or(alias, |(n, _)| n);
     WHOLE_ROW_REFS.with(|w| w.borrow().iter().any(|n| n == alias))
 }
 
@@ -1385,8 +1467,18 @@ fn build(
             // One of several unaliased items of this name: keyed by its
             // relation, still named by the name (`checkNameSpaceConflicts`).
             let shared = SHARED_NAMES.with(|n| n.borrow().contains(&alias));
+            // A name an aliased JOIN hides and another item reuses: each
+            // leaf of it keyed apart, still named by the name.
+            let rekeyed = !shared && hidden_reused(&alias);
             let base = if shared {
                 relation_key_base(&r.relname)
+            } else if rekeyed {
+                let n = REKEYED.with(|c| {
+                    let n = c.get();
+                    c.set(n + 1);
+                    n
+                });
+                format!("{alias}\u{1d}{n}")
             } else {
                 alias.clone()
             };
@@ -1401,7 +1493,7 @@ fn build(
                 aliases,
                 filter,
             )?;
-            if shared {
+            if shared || rekeyed {
                 // The namespace holds the name, as each such item's entry.
                 if let Some(a) = aliases.iter_mut().rev().find(|a| **a == base) {
                     *a = alias.clone();
@@ -3145,6 +3237,10 @@ fn apply_join_alias(
         let marked = format!("{SEP}{name}");
         if registry.contains(&marked) && SHARED_NAMES.with(|n| n.borrow().iter().any(|n| n == name))
         {
+            continue;
+        }
+        if hidden_reused(name) {
+            // Its leaf is keyed apart: the name simply leaves.
             continue;
         }
         if registry

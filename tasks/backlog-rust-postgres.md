@@ -2498,17 +2498,18 @@ Measured on a private PostgreSQL 15.19 cluster. The gap tests are in
 
 ## Found while working RP-454 (2026-11-07)
 
-- [ ] **A FROM item named as a table an aliased JOIN hides is refused.**
-      An aliased JOIN hides its sides' names, so PostgreSQL 15.19 lets
-      another FROM item reuse one: `select * from (fs join fe using (a)) as
-      j, fs` and `select * from fs, (fs join fe using (a)) as j` each answer
-      their row. Here each is 0A000 `a FROM item named "fs" beside an
-      aliased JOIN that hides that name is not supported yet`: a joined row
-      is keyed by its table's alias (`alias<U+001F>column`), so the two `fs`
-      leaves would share their keys. Fixing it needs leaf keys that are not
-      the alias the query wrote.
-      Backlog-ID: RP-469
-      Verify: tests/backlog/test_rp_subquery_scope.py::test_hidden_join_name_reused
+- [ ] **A subquery or function named as a table an aliased JOIN hides is
+      refused.** PostgreSQL 15.19 answers `select * from (fs join fe using
+      (a)) as j, (select 2 as z) fs` with `(1, 'y', 'x', 2)`. Here it is
+      0A000 `a FROM item named "fs" beside an aliased JOIN that hides that
+      name is not supported yet`. RP-469 keyed each TABLE leaf of such a
+      name apart (`hidden_reused_names`, a `\u{1d}<n>` key base); a
+      subquery or function leaf still keys by the name it is written as
+      (`leaf_with_names`, the RangeSubselect / RangeFunction arms), so the
+      refusal stays for any name one of those carries.
+      Verify: tests/backlog/test_rp_subquery_scope.py::test_hidden_join_name_reused_by_subquery
+      Backlog-ID: RP-972
+
 - [ ] **EXPLAIN of an aliased JOIN prints no Hash Cond and keeps its WHERE
       above the join.** PostgreSQL flattens a join alias's columns to the
       sides' own (`flatten_join_alias_vars`), so `explain (costs off)

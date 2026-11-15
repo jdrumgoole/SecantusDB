@@ -4398,12 +4398,29 @@ fn an_aliased_join_resolves_names_as_postgresql_does() {
             "select * from fs join fe using (a) join fe x on a = x.a",
             "42702",
         ),
-        // PostgreSQL answers these (RP-469): the two leaves' keys would be one.
-        ("select * from (fs join fe using (a)) as j, fs", "0A000"),
-        ("select * from fs, (fs join fe using (a)) as j", "0A000"),
+        // PostgreSQL answers this (RP-972): only a table leaf of a hidden
+        // name is keyed apart (RP-469), so a subquery's keys would be one.
+        (
+            "select * from (fs join fe using (a)) as j, (select 2 as z) fs",
+            "0A000",
+        ),
     ] {
         let err = plan(q).expect_err(q);
         assert_eq!(err.sqlstate(), want, "for {q} (got {err})");
+    }
+    // RP-469: a table the alias hides may be named again beside it; each
+    // leaf of the name is keyed apart, so the two never share a key.
+    for q in [
+        "select * from (fs join fe using (a)) as j, fs",
+        "select * from fs, (fs join fe using (a)) as j",
+        "select fs from (fs join fe using (a)) as j, fs",
+    ] {
+        let Ok(Statement::Select(s)) = plan(q) else {
+            panic!("for {q}: not planned as a SELECT")
+        };
+        let cols: Vec<&String> = s.columns.iter().map(|(_, k)| k).collect();
+        let distinct = cols.iter().enumerate().all(|(i, k)| !cols[..i].contains(k));
+        assert!(distinct, "for {q}: shared keys {cols:?}");
     }
 }
 
