@@ -1010,7 +1010,8 @@ fn dispatch_named(doc: &Document, ctx: &mut CommandContext) -> Document {
     // A journaled write is acknowledged only once the journal holds it:
     // mongod's `waitUntilDurable`. Before this, `j` was echoed and no sync
     // followed, and a SIGKILL lost writes acknowledged with `j: true`.
-    if wants_journal(name, doc, client_wc, default_wc.as_ref()) {
+    let standalone = ctx.replica_set_name.is_none();
+    if wants_journal(name, doc, client_wc, default_wc.as_ref(), standalone) {
         if let Some(storage) = &ctx.storage {
             let waited = std::time::Instant::now();
             let wait_locks = lock_manager::journal_wait(ctx.locks.as_ref());
@@ -1328,6 +1329,7 @@ fn wants_journal(
     doc: &Document,
     client_wc: Option<&Document>,
     default_wc: Option<&Document>,
+    standalone: bool,
 ) -> bool {
     let in_transaction = doc.contains_key("autocommit");
     let takes =
@@ -1337,7 +1339,9 @@ fn wants_journal(
     }
     let wc = client_wc.filter(|wc| !wc.is_empty()).or(default_wc);
     let Some(wc) = wc else {
-        return true; // the implicit `{w: "majority"}`
+        // A replica set's implicit `{w: "majority"}`; a standalone's
+        // implicit `{w: 1}` waits for nothing (RM-551).
+        return !standalone;
     };
     let truthy = |v: &Bson| match v {
         Bson::Boolean(b) => *b,

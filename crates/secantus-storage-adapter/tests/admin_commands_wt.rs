@@ -18,8 +18,11 @@ use secantus_commands::CommandContext;
 /// Dispatch on `db`.
 fn on(c: &mut CommandContext, db: &str, command: Document) -> Document {
     let was = std::mem::replace(&mut c.db_name, db.to_string());
-    let reply = dispatch_full(&command, c);
+    let mut reply = dispatch_full(&command, c);
     c.db_name = was;
+    // A member's gossip, which the expectations here leave out.
+    reply.remove("$clusterTime");
+    reply.remove("operationTime");
     reply
 }
 
@@ -375,6 +378,8 @@ const WC: &str = "defaultWriteConcern";
 #[test]
 fn default_rw_concern_implicit_until_set() {
     with_wt(|c| {
+        // A member: a standalone refuses the default-concern commands (RM-551).
+        c.replica_set_name = Some("secantus".into());
         let reply = admin(c, doc! {"getDefaultRWConcern": 1});
         assert_eq!(
             reply,
@@ -418,6 +423,8 @@ fn default_rw_concern_implicit_until_set() {
 #[test]
 fn set_default_rw_concern_refusals() {
     with_wt(|c| {
+        // A member: a standalone refuses the default-concern commands (RM-551).
+        c.replica_set_name = Some("secantus".into());
         let cases: Vec<(Document, i32, &str)> = vec![
             (
                 doc! {SET: 1},
@@ -472,6 +479,8 @@ fn set_default_rw_concern_refusals() {
 #[test]
 fn set_default_rw_concern_stores_and_reads_back() {
     with_wt(|c| {
+        // A member: a standalone refuses the default-concern commands (RM-551).
+        c.replica_set_name = Some("secantus".into());
         // Unsetting a write concern that was never set is allowed, and
         // leaves a settings document that only says when.
         let reply = admin(c, doc! {SET: 1, WC: {}});
@@ -625,6 +634,8 @@ fn default_rw_concern_survives_a_restart() {
             .with_storage(adapter)
             .with_cursors(Arc::new(CursorRegistry::new()));
         ctx.db_name = "admin".into();
+        // A member: a standalone refuses the default-concern commands (RM-551).
+        ctx.replica_set_name = Some("secantus".into());
         ctx
     };
     let set_at;
@@ -668,6 +679,8 @@ fn default_rw_concern_survives_a_restart() {
 #[test]
 fn a_default_write_concern_no_node_satisfies() {
     with_wt(|c| {
+        // A member: a standalone refuses the default-concern commands (RM-551).
+        c.replica_set_name = Some("secantus".into());
         let reply = admin(c, doc! {SET: 1, WC: {"w": 3}});
         assert_eq!(code(&reply), None, "{reply}");
         // A write with no write concern of its own is held to the default,
@@ -914,6 +927,8 @@ fn as_nobody(c: &mut CommandContext) {
 #[test]
 fn who_may_run_them() {
     with_wt(|c| {
+        // A member: a standalone refuses the default-concern commands (RM-551).
+        c.replica_set_name = Some("secantus".into());
         for (name, role) in [
             ("monitor", "clusterMonitor"),
             ("host", "hostManager"),
@@ -983,5 +998,34 @@ fn who_may_run_them() {
             assert_eq!(code(&reply), want, "{user} on {db}: {command}: {reply}");
         }
         as_nobody(c);
+    });
+}
+
+/// A standalone refuses both default-concern commands with 51300, after
+/// their fields are parsed (mongod 8.2.11 as a standalone, 2026-11-15;
+/// RM-551).
+#[test]
+fn default_rw_concern_refused_on_a_standalone() {
+    with_wt(|c| {
+        let was = c.replica_set_name.take();
+        for name in ["getDefaultRWConcern", SET] {
+            let reply = admin(c, doc! {name: 1, WC: {"w": 1}});
+            let reply = if name == SET {
+                reply
+            } else {
+                admin(c, doc! {name: 1})
+            };
+            assert_eq!(code(&reply), Some(51300), "{reply}");
+            assert_eq!(
+                reply.get_str("errmsg"),
+                Ok(format!("'{name}' is not supported on standalone nodes.").as_str())
+            );
+            assert_eq!(code(&admin(c, doc! {name: 1, "bogus": 1})), Some(40415));
+        }
+        assert_eq!(
+            code(&admin(c, doc! {"getDefaultRWConcern": 1, "inMemory": "x"})),
+            Some(14)
+        );
+        c.replica_set_name = was;
     });
 }

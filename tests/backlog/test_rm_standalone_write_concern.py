@@ -1,4 +1,4 @@
-"""RM-551: a standalone's write concern is a replica set's.
+"""RM-551 (fixed): a standalone's write concern was a replica set's.
 
 `secantusd-rs --standalone` keeps the replica-set member's write-concern
 machinery: its implicit default is `w: "majority"`, so a write sent without
@@ -67,11 +67,11 @@ def _answers(client: Any) -> dict:
     }
 
 
-@pytest.mark.backlog("RM-551")
+@pytest.mark.backlog_fixed("RM-551")
 def test_a_standalone_implies_w_1(rust_standalone: Any, mongod: Any) -> None:
     """mongod 8.2.11 as a standalone: an insert with no write concern takes
     one write round and no journal wait (`w: 1` implied), and both
-    default-concern commands answer 51300. This server's standalone waited
+    default-concern commands answer 51300. Before RM-551 this server's standalone waited
     for the journal (one more transition IX and global IS) and accepted
     `setDefaultRWConcern`."""
     want = _answers(mongod)
