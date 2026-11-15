@@ -12246,6 +12246,7 @@ fn plan_explain(
                 let mut first = nullable_side_scan_quals(nullable_pushed, &cat);
                 first.append(&mut options.join_where);
                 options.join_where = first;
+                ruleutils::order_merged_scan_quals(&mut options.join_where);
             }
             let split = ruleutils::join_conditions_split(s, &cat).unwrap_or_default();
             let conds: Vec<String> = split.iter().map(|(c, _)| c.clone()).collect();

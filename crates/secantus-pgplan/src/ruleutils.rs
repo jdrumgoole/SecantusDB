@@ -4720,6 +4720,16 @@ fn qual_order(
     parts: &[std::borrow::Cow<'_, Node>],
     printed: Vec<(String, Option<String>)>,
 ) -> Vec<(String, Option<String>)> {
+    let texts: Vec<&str> = printed.iter().map(|p| p.0.as_str()).collect();
+    match qual_permutation(parts, &texts) {
+        Some(order) => order.into_iter().map(|i| printed[i].clone()).collect(),
+        None => printed,
+    }
+}
+
+/// [`qual_order`] as the positions of `parts` in PostgreSQL's order;
+/// `None` where it keeps them as written.
+fn qual_permutation(parts: &[std::borrow::Cow<'_, Node>], texts: &[&str]) -> Option<Vec<usize>> {
     use crate::costsize::CPU_OPERATOR_COST as OP;
     let literal = |n: Option<&Node>| match n.and_then(|n| n.node.as_ref()) {
         Some(N::AConst(_)) => true,
@@ -4775,15 +4785,13 @@ fn qual_order(
             _ => None,
         }
     };
-    let mut keyed = Vec::with_capacity(printed.len());
+    let mut keyed = Vec::with_capacity(texts.len());
     let mut classes: Vec<String> = Vec::new();
-    for (i, (p, item)) in parts.iter().zip(printed.iter()).enumerate() {
-        let Some((cost, class)) = classify(p, &item.0) else {
-            return printed;
-        };
+    for (i, (p, text)) in parts.iter().zip(texts.iter()).enumerate() {
+        let (cost, class) = classify(p, text)?;
         if let Some(c) = &class {
             if classes.contains(c) {
-                return printed;
+                return None;
             }
             classes.push(c.clone());
         }
@@ -4792,10 +4800,7 @@ fn qual_order(
     // The classes' clauses after the rest, then a stable sort by cost.
     keyed.sort_by_key(|k| k.0);
     keyed.sort_by(|a, b| a.1.total_cmp(&b.1));
-    keyed
-        .into_iter()
-        .map(|(_, _, i)| printed[i].clone())
-        .collect()
+    Some(keyed.into_iter().map(|(_, _, i)| i).collect())
 }
 
 /// Each JOIN's ON condition in a SELECT's FROM, post-order (a left-deep
@@ -5089,7 +5094,63 @@ pub fn join_where(s: &pg_query::protobuf::SelectStmt, cat: &Catalog<'_>) -> Opti
         let column = home.as_ref().and_then(|_| qual_column(part));
         out.push((text, home, column));
     }
+    order_scan_quals(&mut out, &parts);
     Some(out)
+}
+
+/// Each scan's own conjuncts among `quals` (one per node of `parts`) in
+/// the order a lone scan's are ([`qual_order`], RP-398), back in the
+/// positions they held; left as they are when the two lists differ in
+/// length.
+fn order_scan_quals(quals: &mut [JoinQual], parts: &[std::borrow::Cow<'_, Node>]) {
+    if quals.len() != parts.len() {
+        return;
+    }
+    let mut homes: Vec<String> = Vec::new();
+    for q in quals.iter() {
+        if let Some(h) = &q.1 {
+            if !homes.contains(h) {
+                homes.push(h.clone());
+            }
+        }
+    }
+    for h in &homes {
+        let slots: Vec<usize> = (0..quals.len())
+            .filter(|i| quals[*i].1.as_ref() == Some(h))
+            .collect();
+        let mine: Vec<std::borrow::Cow<'_, Node>> =
+            slots.iter().map(|i| parts[*i].clone()).collect();
+        let texts: Vec<&str> = slots.iter().map(|i| quals[*i].0.as_str()).collect();
+        if let Some(order) = qual_permutation(&mine, &texts) {
+            let moved: Vec<JoinQual> = order.iter().map(|k| quals[slots[*k]].clone()).collect();
+            for (slot, q) in slots.iter().zip(moved) {
+                quals[*slot] = q;
+            }
+        }
+    }
+}
+
+/// [`order_scan_quals`] over quals gathered from more than one list (an
+/// outer join's ON conjuncts pushed to its nullable side, then the
+/// WHERE's), each node read back from the scan qual's printed text, which
+/// is the planned expression.
+pub fn order_merged_scan_quals(quals: &mut [JoinQual]) {
+    let nodes: Option<Vec<Node>> = quals
+        .iter()
+        .map(|q| {
+            let tree = pg_query::parse(&format!("select 1 where {}", q.0)).ok()?;
+            let stmt = tree.protobuf.stmts.first()?.stmt.as_deref()?;
+            match stmt.node.as_ref()? {
+                N::SelectStmt(sel) => sel.where_clause.as_deref().cloned(),
+                _ => None,
+            }
+        })
+        .collect();
+    if let Some(nodes) = nodes {
+        let parts: Vec<std::borrow::Cow<'_, Node>> =
+            nodes.iter().map(std::borrow::Cow::Borrowed).collect();
+        order_scan_quals(quals, &parts);
+    }
 }
 
 /// A comma join of two relations (`FROM e, k`, RP-372): its WHERE's
@@ -5169,8 +5230,6 @@ pub fn comma_join_conds(
     })
 }
 
-/// The operators a clause evaluates (`cost_qual_eval`, each one
-/// `cpu_operator_cost`).
 /// The operators a qual's casts of a column to text add: a cast from a
 /// type with no binary coercion to text is a `CoerceViaIO`, the source's
 /// output function and text's input function, one operator cost each
@@ -5209,6 +5268,8 @@ fn io_casts(p: &Printer<'_>, n: &Node) -> usize {
     count
 }
 
+/// The operators a clause evaluates (`cost_qual_eval`, each one
+/// `cpu_operator_cost`).
 fn qual_operators(n: &Node) -> crate::Result<usize> {
     let mut count = 0;
     let mut copy = n.clone();

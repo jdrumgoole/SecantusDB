@@ -4108,13 +4108,28 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "        ->  Seq Scan on s",
         ],
     ),
-    # A join's scan Filter in PostgreSQL's qual order: an equality to a
-    # constant after the rest (`generate_base_implied_equalities`), as a
+    # A join's scan Filter in PostgreSQL's qual order (RP-398, fixed): an
+    # equality to a constant after the rest (`generate_base_implied_equalities`), as a
     # lone scan prints it (found while working RP-395).
     "a joined scan's filter puts its equality to a constant last": (
         "RP-398",
         _ANALYSED_THIRTY,
         "explain (costs off) select * from s join e on s.a < e.a where e.b = 'v3' and e.a > 5",
+        [
+            "Nested Loop",
+            "  Join Filter: (s.a < e.a)",
+            "  ->  Seq Scan on e",
+            "        Filter: ((a > 5) AND (b = 'v3'::text))",
+            "  ->  Materialize",
+            "        ->  Seq Scan on s",
+        ],
+    ),
+    # The same for a LEFT join the WHERE reduces to an inner one: its ON
+    # conjunct over the nullable side joins that scan's list (RP-398).
+    "a reduced left join's scan filter puts its equality to a constant last": (
+        "RP-398",
+        _ANALYSED_THIRTY,
+        "explain (costs off) select * from s left join e on s.a < e.a and e.b = 'v3' where e.a > 5",
         [
             "Nested Loop",
             "  Join Filter: (s.a < e.a)",
@@ -5492,6 +5507,7 @@ def _marked(name: str, item: str) -> Any:
         "RP-394",
         "RP-395",
         "RP-396",
+        "RP-398",
         "RP-399",
         "RP-403",
         "RP-404",

@@ -1993,17 +1993,6 @@ a regression test.
       working RP-395).
       Backlog-ID: RP-397
       Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a left join's ON conjunct over a table of an inner join it null-extends]
-- [ ] **A joined scan's Filter keeps its conjuncts in written order.** A
-      lone scan prints them in PostgreSQL's order (`qual_order`, RP-348:
-      an equality to a constant after the rest, then by cost), but a
-      join's scan does not: `select * from s join e on s.a < e.a where e.b
-      = 'v3' and e.a > 5` prints `Filter: ((b = 'v3'::text) AND (a > 5))`,
-      where PostgreSQL 15.19 prints `((a > 5) AND (b = 'v3'::text))`. The
-      same for a LEFT join that the WHERE reduces to an inner one, whose
-      ON conjunct over the nullable side leads its scan's Filter (RP-395).
-      Measured on a private 15.19 cluster (found while working RP-395).
-      Backlog-ID: RP-398
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a joined scan's filter puts its equality to a constant last]
 - [ ] **A join whose WHERE equates a column to two constants still scans.**
       PostgreSQL 15.19 finds the equivalence class contradictory and plans
       no scan: `select * from s join e on s.a < e.a where e.b = 'v1' and
@@ -2083,7 +2072,7 @@ a regression test.
       where a + 1 > 996 and b = 'v1'` is `Filter: ((b = 'v1'::text) AND
       ((a + 1) > 996))`, the expression's two operators after the
       column's one. Here the conjuncts are printed as written (a join's
-      scan keeps the written order in other cases too, RP-398). Measured
+      scan shares that ordering, so is wrong the same way). Measured
       on a private 15.19 cluster (found while working RP-403). The same
       for an OR, which costs its operators (`a not between 15 and 55 and b
       <> 'v3'` is `Filter: ((b <> 'v3'::text) AND ((a < 15) OR (a >
