@@ -1178,6 +1178,34 @@ one beside it.
       Backlog-ID: RP-911
       Verify: tests/backlog/test_rp_catalog_latency.py::test_the_first_catalog_query_after_ddl_costs_the_same_at_800_tables_within_a_tenth
 
+## Found while working RP-908 (2026-11-15)
+
+- [ ] **EXPLAIN of a NOT EXISTS prints a filtered Seq Scan, not PostgreSQL's
+      Hash Anti Join.** `select * from e where not exists (select 1 from e
+      e2 where e2.a = e.a)` is, in PostgreSQL 15.19, `Hash Anti Join
+      (cost=27.50..46.25 rows=1 width=7)` on `(e.a = e2.a)`, the Hash over
+      a Seq Scan of `e2` of width 4 (`convert_EXISTS_sublink_to_join`);
+      here a Seq Scan on e with a `Filter`. Its rows are right. The anti
+      cost (`hash_anti_join_of` in `scan_estimate.rs`, RP-908) is there to
+      reuse once the sublink is pulled up into a join. Measured on a
+      private 15.19 cluster.
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a not exists over an equality is a hash anti join]
+      Backlog-ID: RP-980
+- [ ] **A LEFT join on an expression key whose WHERE keeps only the
+      unmatched rows prints a Nested Loop Left Join, not a Hash Anti
+      Join.** `select * from e left join e e2 on e.a = e2.a + 1 where e2.a
+      is null` is, in PostgreSQL 15.19, `Hash Anti Join
+      (cost=27.50..133.88 rows=500 width=14)` on `(e.a = (e2.a + 1))`;
+      here a `Nested Loop Left Join` with `Filter: (e2.a IS NULL)` and
+      zero costs (and under ANALYZE its scans print no actuals). RP-908
+      recognises the anti join only where the ON is strict through a bare
+      key (`left_anti_key`); an expression key is neither hashed here nor
+      priced as one (`eqjoinsel_semi` over an expression has no
+      statistics: `rows=500` is its 0.5 default). Measured on a private
+      15.19 cluster.
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a left join on an expression key where the nullable side is null is a hash anti join]
+      Backlog-ID: RP-981
+
 ## Found while working RP-911 (2026-11-15)
 
 - [ ] **OPEN — `CREATE TYPE pg_temp.t AS (...)` makes no type in the temp
@@ -1847,30 +1875,6 @@ a regression test.
       Verify: tests/backlog/test_rp_explain_costs.py::test_plan[nested loop left join with a function call in its join filter]
       Backlog-ID: RP-910
 
-- [ ] **EXPLAIN of a LEFT join whose WHERE keeps only the unmatched rows
-      prints a Left Join, not an Anti Join.** `reduce_outer_joins` turns a
-      LEFT join whose WHERE tests a column of the nullable side that the
-      ON makes strict `IS NULL` into `JOIN_ANTI`: PostgreSQL 15.19 prints
-      `select * from e left join e e2 on e.a <> e2.a where e2.a is null` as
-      `Nested Loop Anti Join (cost=0.00..65.00 rows=1 width=14)` with no
-      Filter, the inner side Materialized, and the same over `e.a = e2.a`
-      as `Hash Anti Join (cost=27.50..46.25 rows=1 width=14)`. Here each is
-      a Left Join with `Filter: (e2.a IS NULL)` above it and zero costs.
-      Its rows are right. Measured on a private 15.19 cluster (found while
-      working RP-354).
-      Sized 2026-11-15: no anti join exists anywhere in the server -- no
-      `JoinKind` for one in `secantus-pgplan::joins`, no plan node, no
-      cost path (the only `Anti` is `explain.rs`'s node-name table), and
-      `not exists (select 1 from e e2 where e2.a = e.a)`, PostgreSQL's
-      `Hash Anti Join`, prints a Seq Scan with `Filter: (...)`. So this
-      needs the join kind first (`reduce_outer_joins`' JOIN_ANTI step
-      beside the RP-902 reduction in `joins.rs`, the executor emitting an
-      outer row with no match), then `final_cost_nestloop` /
-      `final_cost_hashjoin`'s `JOIN_ANTI` arms and `calc_joinrel_size_estimate`'s
-      anti selectivity (`rows=1` here is the clamp). NOT EXISTS
-      (`convert_EXISTS_sublink_to_join`) would reuse it.
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a left join where the nullable side is null is an anti join], tests/backlog/test_rp_explain_costs.py::test_plan[a left join on an equality where the nullable side is null is an anti join]
-      Backlog-ID: RP-908
 
 - [ ] **EXPLAIN ANALYZE's scan counters PostgreSQL prints that are still
       left out.** Since RP-383 a user table's heap pages carry the

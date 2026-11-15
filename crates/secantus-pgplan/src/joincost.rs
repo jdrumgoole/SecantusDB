@@ -343,7 +343,15 @@ pub fn hash_join(outer: &JoinSide, inner: &JoinSide) -> (f64, f64) {
 /// the hash clause passes (`final_cost_hashjoin`'s `qp_qual_cost` over
 /// `hashjointuples`).
 fn hash_join_qp(outer: &JoinSide, inner: &JoinSide, qp: f64) -> (f64, f64) {
-    hash_join_core(outer, inner, qp, join_selectivity(outer, inner), 1.0, &[])
+    hash_join_core(
+        outer,
+        inner,
+        qp,
+        join_selectivity(outer, inner),
+        1.0,
+        &[],
+        None,
+    )
 }
 
 /// One join key's statistics as `eqjoinsel` and
@@ -443,7 +451,7 @@ pub fn hash_join_stats(
     sel: f64,
     inner_keys: &[KeyStats<'_>],
 ) -> (f64, f64) {
-    hash_join_core(outer, inner, 0.0, sel, 1.0, inner_keys)
+    hash_join_core(outer, inner, 0.0, sel, 1.0, inner_keys, None)
 }
 
 /// [`hash_join_stats`] with join filters beside the hash clauses: `qp`
@@ -460,7 +468,41 @@ pub fn hash_join_stats_filtered(
     qp: f64,
     inner_keys: &[KeyStats<'_>],
 ) -> (f64, f64) {
-    hash_join_core(outer, inner, qp, sel, filter_sel, inner_keys)
+    hash_join_core(outer, inner, qp, sel, filter_sel, inner_keys, None)
+}
+
+/// An anti join hashing `inner` (RP-908): `final_cost_hashjoin`'s
+/// JOIN_ANTI, each outer row's probe stopping at its first match, the
+/// join's tuples the outer rows that match none. `factors` are
+/// `compute_semi_anti_join_factors`' `(outer match fraction, match
+/// count)`; `sel` is the clause's inner-join selectivity.
+pub fn hash_anti_join(
+    outer: &JoinSide,
+    inner: &JoinSide,
+    sel: f64,
+    factors: (f64, f64),
+    inner_keys: &[KeyStats<'_>],
+) -> (f64, f64) {
+    hash_join_core(outer, inner, 0.0, sel, 1.0, inner_keys, Some(factors))
+}
+
+/// `eqjoinsel_semi` (also JOIN_ANTI's) of `k1 = k2` where neither key has
+/// a most-common-values list: the share of the outer rows with a match,
+/// `nd2` clamped to the inner relation's `inner_rows`. `None` where an
+/// MCV list would be compared, which this does not model.
+pub fn eqjoinsel_semi_no_mcv(k1: &KeyStats<'_>, k2: &KeyStats<'_>, inner_rows: f64) -> Option<f64> {
+    if !k1.mcv.is_empty() || !k2.mcv.is_empty() {
+        return None;
+    }
+    let nd1 = k1.ndistinct;
+    let nd2 = k2.ndistinct.min(inner_rows);
+    Some(if k1.default_ndistinct || k2.default_ndistinct {
+        0.5 * (1.0 - k1.null_frac)
+    } else if nd1 <= nd2 || nd2 < 0.0 {
+        1.0 - k1.null_frac
+    } else {
+        nd2 / nd1 * (1.0 - k1.null_frac)
+    })
 }
 
 fn hash_join_core(
@@ -470,6 +512,7 @@ fn hash_join_core(
     sel: f64,
     filter_sel: f64,
     inner_keys: &[KeyStats<'_>],
+    anti: Option<(f64, f64)>,
 ) -> (f64, f64) {
     let mut startup = outer.scan.0 + inner.scan.1;
     let mut run = outer.scan.1 - outer.scan.0;
@@ -559,9 +602,11 @@ fn hash_join_core(
         }
         bucket
     };
-    let tuples = if inner.unique {
-        let match_frac = sel * filter_sel;
-        let match_count = (match_frac * inner.rows / match_frac).max(1.0);
+    let tuples = if inner.unique || anti.is_some() {
+        let (match_frac, match_count) = anti.unwrap_or_else(|| {
+            let match_frac = sel * filter_sel;
+            (match_frac, (match_frac * inner.rows / match_frac).max(1.0))
+        });
         let matched = (outer.rows * match_frac).round();
         let scan_frac = 2.0 / (match_count + 1.0);
         run += clause_cost(outer, inner)
@@ -572,7 +617,11 @@ fn hash_join_core(
             * (outer.rows - matched)
             * clamp_row_est(inner.rows / buckets)
             * 0.05;
-        matched
+        if anti.is_some() {
+            outer.rows - matched
+        } else {
+            matched
+        }
     } else {
         run +=
             clause_cost(outer, inner) * outer.rows * clamp_row_est(inner.rows * bucketsize) * 0.5;
@@ -875,6 +924,18 @@ pub fn cheapest_nest_loop_left(
     qual: f64,
 ) -> NestLoopPlan {
     nest_loop_paths(a, b, qual, [None, None], &[false])
+}
+
+/// [`cheapest_nest_loop_left`] of an anti join (RP-908): `b`, the inner,
+/// read until an outer row's first match, `factors` the join's
+/// `(outer match fraction, match count)` (`compute_semi_anti_join_factors`).
+pub fn cheapest_nest_loop_anti(
+    a: (f64, f64, f64, i64),
+    b: (f64, f64, f64, i64),
+    qual: f64,
+    factors: (f64, f64),
+) -> NestLoopPlan {
+    nest_loop_paths(a, b, qual, [None, Some(factors)], &[false])
 }
 
 fn nest_loop_paths(
@@ -2791,6 +2852,27 @@ pub fn limit_choice(paths: &[JoinChoice], rows: f64, count: f64, offset: f64) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_anti_join_matches_every_outer_row_of_a_unique_key() {
+        // `eqjoinsel_semi` of two unique keys with no MCV lists: every
+        // non-NULL outer row has a match (RP-908).
+        let k = KeyStats {
+            ndistinct: 1000.0,
+            default_ndistinct: false,
+            null_frac: 0.0,
+            mcv: &[],
+        };
+        assert_eq!(eqjoinsel_semi_no_mcv(&k, &k, 1000.0), Some(1.0));
+        let half = KeyStats {
+            ndistinct: 500.0,
+            ..k
+        };
+        assert_eq!(eqjoinsel_semi_no_mcv(&k, &half, 1000.0), Some(0.5));
+        let mcv = [(vec![1u8], 0.5f32)];
+        let with_mcv = KeyStats { mcv: &mcv, ..k };
+        assert_eq!(eqjoinsel_semi_no_mcv(&with_mcv, &k, 1000.0), None);
+    }
 
     /// PostgreSQL 15.19's EXPLAIN of two Incremental Sorts under a LIMIT 5
     /// over merge joins of two 3,000-row tables never analysed (RP-028):

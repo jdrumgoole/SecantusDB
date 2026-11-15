@@ -3032,9 +3032,10 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
     ),
     # ------------- RP-908 a LEFT join whose WHERE keeps only unmatched rows
     # `reduce_outer_joins` makes a LEFT join whose WHERE tests the nullable
-    # side's join-strict column IS NULL an anti join.
+    # side's join-strict column IS NULL an anti join; it printed a Left
+    # Join under that Filter, unpriced (RP-908, fixed).
     "a left join where the nullable side is null is an anti join": (
-        "RP-908",
+        "RP-908:fixed",
         _ANALYSED,
         "explain select * from e left join e e2 on e.a <> e2.a where e2.a is null",
         [
@@ -3045,14 +3046,44 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "        ->  Seq Scan on e e2  (cost=0.00..15.00 rows=1000 width=7)",
         ],
     ),
-    # The same over an equality: a Hash Anti Join.
+    # The same over an equality: a Hash Anti Join (RP-908, fixed).
     "a left join on an equality where the nullable side is null is an anti join": (
-        "RP-908",
+        "RP-908:fixed",
         _ANALYSED,
         "explain select * from e left join e e2 on e.a = e2.a where e2.a is null",
         [
             "Hash Anti Join  (cost=27.50..46.25 rows=1 width=14)",
             "  Hash Cond: (e.a = e2.a)",
+            "  ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
+            "  ->  Hash  (cost=15.00..15.00 rows=1000 width=7)",
+            "        ->  Seq Scan on e e2  (cost=0.00..15.00 rows=1000 width=7)",
+        ],
+    ),
+    # ------------- RP-980 a NOT EXISTS pulled up into an anti join
+    # `convert_EXISTS_sublink_to_join` makes it the Hash Anti Join of the
+    # two, the inner reading only its key (found while working RP-908).
+    "a not exists over an equality is a hash anti join": (
+        "RP-980",
+        _ANALYSED,
+        "explain select * from e where not exists (select 1 from e e2 where e2.a = e.a)",
+        [
+            "Hash Anti Join  (cost=27.50..46.25 rows=1 width=7)",
+            "  Hash Cond: (e.a = e2.a)",
+            "  ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
+            "  ->  Hash  (cost=15.00..15.00 rows=1000 width=4)",
+            "        ->  Seq Scan on e e2  (cost=0.00..15.00 rows=1000 width=4)",
+        ],
+    ),
+    # ------------- RP-981 an anti join on an expression key
+    # The ON strict in the nullable side's key through an expression is an
+    # anti join too, hashed on the expression (found while working RP-908).
+    "a left join on an expression key where the nullable side is null is a hash anti join": (
+        "RP-981",
+        _ANALYSED,
+        "explain select * from e left join e e2 on e.a = e2.a + 1 where e2.a is null",
+        [
+            "Hash Anti Join  (cost=27.50..133.88 rows=500 width=14)",
+            "  Hash Cond: (e.a = (e2.a + 1))",
             "  ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
             "  ->  Hash  (cost=15.00..15.00 rows=1000 width=7)",
             "        ->  Seq Scan on e e2  (cost=0.00..15.00 rows=1000 width=7)",

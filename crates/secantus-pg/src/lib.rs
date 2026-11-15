@@ -45685,10 +45685,24 @@ impl PgHandler {
                 // `cost_hashjoin` with `eqjoinsel` over their MCV lists.
                 // A side the storage planner reads through an index is
                 // priced too, as the path PostgreSQL keeps (RP-369).
+                // A LEFT join whose WHERE keeps only its NULL-extended rows
+                // is the anti join `reduce_outer_joins` makes of it, the
+                // `IS NULL` absorbed (RP-908).
+                if let Statement::Select(sel) = inner.as_ref() {
+                    if PgHandler::left_anti_key(sel).is_some() {
+                        match tree.name.as_str() {
+                            "Hash Left Join" => tree.name = "Hash Anti Join".into(),
+                            "Nested Loop Left Join" => tree.name = "Nested Loop Anti Join".into(),
+                            _ => {}
+                        }
+                    }
+                }
                 let plain_scan =
                     |n: &str| n.starts_with("Seq Scan on ") || n.starts_with("Index Scan using ");
-                if matches!(tree.name.as_str(), "Hash Join" | "Hash Left Join")
-                    && tree.children.len() == 2
+                if matches!(
+                    tree.name.as_str(),
+                    "Hash Join" | "Hash Left Join" | "Hash Anti Join"
+                ) && tree.children.len() == 2
                     && tree.children[0].children.is_empty()
                     && plain_scan(&tree.children[0].name)
                     && tree.children[1].name == "Hash"
@@ -45732,8 +45746,10 @@ impl PgHandler {
                 // clause to hash or merge on (RP-329): `cost_nestloop` over
                 // each side's Seq Scan, the inner materialised when that
                 // is cheaper, the outer the cheaper order's.
-                if matches!(tree.name.as_str(), "Nested Loop" | "Nested Loop Left Join")
-                    && tree.details.is_empty()
+                if matches!(
+                    tree.name.as_str(),
+                    "Nested Loop" | "Nested Loop Left Join" | "Nested Loop Anti Join"
+                ) && tree.details.is_empty()
                     && tree.children.len() == 2
                     && tree
                         .children

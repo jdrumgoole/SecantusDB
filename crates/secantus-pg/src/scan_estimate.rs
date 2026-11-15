@@ -422,6 +422,47 @@ impl PgHandler {
     /// that wins, which the last element names (RP-354). `None` -- zeros
     /// -- where an index the model does not price could serve, or anything
     /// else sits in the plan.
+    /// The nullable side's key a LEFT join's WHERE tests `IS NULL` where
+    /// the join's ON is strict in that key -- an equality on it, or a
+    /// `<>` reading it -- so a NULL-extended row is the only one the
+    /// WHERE keeps: `reduce_outer_joins` makes such a join `JOIN_ANTI`,
+    /// and the `IS NULL` is no longer checked above it (RP-908).
+    pub(crate) fn left_anti_key(sel: &secantus_pgplan::Select) -> Option<String> {
+        use secantus_pgplan::joins::{FilterKind, JoinKind, JoinNode};
+        use secantus_pgplan::Statement;
+        let Statement::JoinRows(j) = sel.sub.as_ref()?.plan.as_ref() else {
+            return None;
+        };
+        let JoinNode::Join {
+            kind: JoinKind::Left,
+            right,
+            on,
+            on_filters,
+            equi,
+            ..
+        } = &j.tree
+        else {
+            return None;
+        };
+        let JoinNode::Leaf { def, .. } = right.as_ref() else {
+            return None;
+        };
+        if sel.residual.is_some() || !j.where_filters.is_empty() || sel.filter.len() != 1 {
+            return None;
+        }
+        let (k, v) = sel.filter.iter().next()?;
+        let prefix = format!("{}{}", def.name, secantus_pgplan::joins::SEP);
+        if !k.starts_with(&prefix) || *v != bson::Bson::Null {
+            return None;
+        }
+        let strict = equi.iter().any(|(l, r)| l == k || r == k)
+            || (on.is_some()
+                && on_filters
+                    .iter()
+                    .any(|f| matches!(&f.kind, FilterKind::NotEqual(l, r) if l == k || r == k)));
+        strict.then(|| k.clone())
+    }
+
     pub(crate) fn nest_loop_estimate(
         &self,
         sel: &secantus_pgplan::Select,
@@ -441,7 +482,9 @@ impl PgHandler {
             || !matches!(sel.distinct, secantus_pgplan::Distinct::None)
             || sel.with_ties
             || sel.casts.iter().any(Option::is_some)
-            || ((!sel.filter.is_empty() || sel.residual.is_some()) && !j.where_modelled)
+            || ((!sel.filter.is_empty() || sel.residual.is_some())
+                && !j.where_modelled
+                && Self::left_anti_key(sel).is_none())
             || j.where_spans_equality
             || j.where_span_aliases.len() != j.where_filters.len()
         {
@@ -470,6 +513,7 @@ impl PgHandler {
         // pushed to that side's scan (`distribute_qual_to_rels`), its
         // Filter, and is modelled there (RP-354). Any other WHERE runs
         // above the join, which is not.
+        let anti = Self::left_anti_key(sel);
         let left_join = match kind {
             JoinKind::Inner => false,
             JoinKind::Left => {
@@ -479,9 +523,10 @@ impl PgHandler {
                 let prefix = format!("{}{}", def.name, secantus_pgplan::joins::SEP);
                 let mut fields = Vec::new();
                 filter_fields(&sel.filter, &mut fields)?;
-                if !j.where_filters.is_empty()
-                    || sel.residual.is_some()
-                    || fields.iter().any(|f| !f.starts_with(&prefix))
+                if anti.is_none()
+                    && (!j.where_filters.is_empty()
+                        || sel.residual.is_some()
+                        || fields.iter().any(|f| !f.starts_with(&prefix)))
                 {
                     return None;
                 }
@@ -755,6 +800,44 @@ impl PgHandler {
                     param_scans[slot] = Some(scan);
                 }
             }
+        }
+        // An anti join (RP-908): `compute_semi_anti_join_factors` over
+        // its `<>` clauses, whose `neqjoinsel` for JOIN_ANTI is the share
+        // of the outer operand not NULL; `final_cost_nestloop` stops each
+        // outer row's inner scan at its first match, and
+        // `calc_joinrel_size_estimate` keeps the outer rows matching none.
+        if anti.is_some() {
+            if param.iter().any(Option::is_some) || qual_startup != 0.0 {
+                return None;
+            }
+            let mut jselec = 1.0_f64;
+            for f in &filters {
+                let FilterKind::NotEqual(l, _) = &f.kind else {
+                    return None;
+                };
+                let (_, table, field) = key_columns.iter().find(|(c, _, _)| c == l)?;
+                jselec *= 1.0 - self.analysed_key(table, field)?.null_frac;
+            }
+            let match_count = if jselec > 0.0 {
+                (sel_factor * b.2 / jselec).max(1.0)
+            } else {
+                1.0
+            };
+            let plan = secantus_pgplan::joincost::cheapest_nest_loop_anti(
+                a,
+                b,
+                qual,
+                (jselec, match_count),
+            );
+            let rows = costsize::clamp_row_est(a.2 * (1.0 - jselec));
+            return Some((
+                plan,
+                a,
+                b,
+                (plan.startup, plan.total, rows, a_above + b_above),
+                None,
+                a_index,
+            ));
         }
         let plan = secantus_pgplan::joincost::cheapest_nest_loop_param(
             a,
@@ -1704,6 +1787,12 @@ impl PgHandler {
             .iter()
             .map(|(l, r)| Some((priced(l)?, priced(r)?)))
             .collect::<Option<_>>()?;
+        if left_join && Self::left_anti_key(sel).is_some() {
+            if !more.is_empty() || filter.count != 0 {
+                return None;
+            }
+            return hash_anti_join_of(priced(&a)?, priced(&b)?);
+        }
         hash_join_of(priced(&a)?, priced(&b)?, &more, left_join, false, filter)
     }
 
@@ -1741,7 +1830,7 @@ impl PgHandler {
             || !matches!(sel.distinct, secantus_pgplan::Distinct::None)
             || sel.with_ties
             || sel.casts.iter().any(Option::is_some)
-            || !j.where_modelled
+            || (!j.where_modelled && Self::left_anti_key(sel).is_none())
         {
             return None;
         }
@@ -1765,7 +1854,11 @@ impl PgHandler {
         // nullable side can reduce it to an inner join
         // (`reduce_outer_joins`): only one with no WHERE is priced
         // (RP-379).
-        if left_join && (!sel.filter.is_empty() || sel.residual.is_some()) {
+        // One whose WHERE keeps only its NULL-extended rows is an anti
+        // join, priced by the caller (RP-908); that WHERE is not pushed to
+        // a scan.
+        let anti = left_join && Self::left_anti_key(sel).is_some();
+        if left_join && !anti && (!sel.filter.is_empty() || sel.residual.is_some()) {
             return None;
         }
         // An ON's conjuncts beside its equalities are the join's filter,
@@ -1843,7 +1936,11 @@ impl PgHandler {
         // joined keys: PostgreSQL pushes each down to that table's scan
         // (`distribute_qual_to_rels`), as it does a reduced LEFT join's
         // (RP-365). `None` for any other shape of filter.
-        let above_filter = joined_conjuncts(&sel.filter)?;
+        let above_filter = if anti {
+            Vec::new()
+        } else {
+            joined_conjuncts(&sel.filter)?
+        };
         // A side's scan, whichever of its columns is the key: the scan's
         // filter, ANDed from its own WHERE and this side's share of the
         // conjuncts above the join, and the fields it carries above the
@@ -5707,6 +5804,74 @@ struct AnalysedKey {
 
 /// The most further equality clauses [`hash_join_of`] prices.
 const MORE_HASH_CLAUSES: usize = 3;
+
+/// The Hash Anti Join of `a`, the preserved side, to `b` hashed (RP-908):
+/// `final_cost_hashjoin`'s JOIN_ANTI over `compute_semi_anti_join_factors`
+/// (`eqjoinsel_semi` the outer match fraction, `eqjoinsel_inner` over the
+/// inner rows the match count), its rows the outer rows matching none
+/// (`calc_joinrel_size_estimate`). PostgreSQL 15 hashes only the nullable
+/// side of an anti join. It also weighs a Merge Anti Join, which is not
+/// priced here: the hash join is answered only where it is cheaper than
+/// the two Sorts a merge must start with, so no merge can beat it; a
+/// side read through an index (presorted for a merge) is not priced.
+fn hash_anti_join_of(a: HashSide, b: HashSide) -> Option<JoinEstimate> {
+    use secantus_pgplan::joincost::{self, JoinSide, KeyStats};
+    if a.pg_type != b.pg_type
+        || a.index.is_some()
+        || b.index.is_some()
+        || a.key_indexed
+        || b.key_indexed
+    {
+        return None;
+    }
+    fn key(s: &HashSide) -> KeyStats<'_> {
+        KeyStats {
+            ndistinct: s.stats.0,
+            default_ndistinct: false,
+            null_frac: s.stats.1,
+            mcv: &s.stats.2,
+        }
+    }
+    let (ka, kb) = (key(&a), key(&b));
+    let side = |s: &HashSide| JoinSide {
+        rows: s.scan.2,
+        tuples: s.tuples,
+        scan: (s.scan.0, s.scan.1),
+        startup_scan: (s.scan.0, s.scan.1),
+        ordered: None,
+        scan_ordered: false,
+        unique: false,
+        ndistinct: s.stats.0,
+        default_ndistinct: false,
+        key_ops: 0.0,
+        rel_rows: s.scan.2,
+        width: Some(s.scan.3),
+        extra: joincost::ExtraKeys::default(),
+    };
+    let (outer, inner) = (side(&a), side(&b));
+    let nselec = joincost::eqjoinsel_inner(&ka, &kb);
+    let jselec = joincost::eqjoinsel_semi_no_mcv(&ka, &kb, inner.rows)?;
+    let match_count = if jselec > 0.0 {
+        (nselec * inner.rows / jselec).max(1.0)
+    } else {
+        1.0
+    };
+    let (startup, total) =
+        joincost::hash_anti_join(&outer, &inner, nselec, (jselec, match_count), &[kb]);
+    let sorts = joincost::cost_sort(a.scan.1, a.scan.2, a.scan.3, None).0
+        + joincost::cost_sort(b.scan.1, b.scan.2, b.scan.3, None).0;
+    if total >= sorts {
+        return None;
+    }
+    let rows = costsize::clamp_row_est(outer.rows * (1.0 - jselec));
+    Some((
+        a.scan,
+        b.scan,
+        (startup, total, rows, a.above + b.above),
+        JoinPick::Hash { swap: false },
+        [a.index, b.index],
+    ))
+}
 
 /// `cost_hashjoin` over two priced sides, the hashed one PostgreSQL's
 /// `add_path` keeps (RP-330, RP-359): the printed outer scan's, the hashed

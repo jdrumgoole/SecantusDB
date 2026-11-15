@@ -751,8 +751,10 @@ pub(crate) fn price_nest_loop(
     b: crate::scan_estimate::Estimate,
     join: crate::scan_estimate::Estimate,
 ) {
-    if !matches!(root.name.as_str(), "Nested Loop" | "Nested Loop Left Join")
-        || root.children.len() != 2
+    if !matches!(
+        root.name.as_str(),
+        "Nested Loop" | "Nested Loop Left Join" | "Nested Loop Anti Join"
+    ) || root.children.len() != 2
     {
         return;
     }
@@ -1287,7 +1289,11 @@ pub(crate) fn price_hash_join(
     join: crate::scan_estimate::Estimate,
     swap: bool,
 ) {
-    if !matches!(root.name.as_str(), "Hash Join" | "Hash Left Join") || root.children.len() != 2 {
+    if !matches!(
+        root.name.as_str(),
+        "Hash Join" | "Hash Left Join" | "Hash Anti Join"
+    ) || root.children.len() != 2
+    {
         return;
     }
     if root.children[1].name != "Hash" || root.children[1].children.len() != 1 {
@@ -2566,6 +2572,12 @@ pub(crate) fn attach_join_where(
             let inner = home.is_none()
                 && (n.name == "Hash Join" || n.name == "Nested Loop" || n.name == "Merge Join");
             let label = if inner { "Join Filter" } else { "Filter" };
+            // An anti join's `IS NULL`, the only WHERE it has, is what
+            // made it one: `reduce_outer_joins` leaves nothing to check
+            // above it (RP-908).
+            if home.is_none() && n.name.ends_with(" Anti Join") {
+                continue;
+            }
             if home.is_some() {
                 drop_filter_placeholder(n);
             }
