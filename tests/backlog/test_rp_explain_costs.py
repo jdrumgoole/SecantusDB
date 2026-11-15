@@ -4574,10 +4574,10 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "  One-Time Filter: false",
         ],
     ),
-    # Still open: in a LEFT join's ON the class's `false` is a pseudoconstant
-    # gating the nullable side's scan, which keeps the first constant.
+    # In a LEFT join's ON the class's `false` is a pseudoconstant gating the
+    # nullable side's scan, which keeps the first constant (RP-400, fixed).
     "a left join's on equating its nullable column to two constants": (
-        "RP-400",
+        "RP-400:fixed",
         _ANALYSED_THIRTY,
         "explain (costs off) select * from s left join e"
         " on s.a < e.a and e.b = 'v1' and e.b = 'v2'",

@@ -3726,6 +3726,10 @@ pub struct ExplainOptions {
     /// class generates, which gate the scan as a `Result`'s
     /// `One-Time Filter` (RP-350). Zero when there are none.
     pub one_time_false: usize,
+    /// A LEFT join whose ON equates a column of its nullable side to two or
+    /// more distinct constants: that side's name and how many `false`
+    /// pseudoconstants gate its scan as a `Result` (RP-400).
+    pub nullable_gate: Option<(String, usize)>,
     /// The WHERE folded to a constant FALSE or NULL: the relation is dummy,
     /// and the plan is a `Result` with `One-Time Filter: false` where its
     /// scan (or join) would be (RP-409).
@@ -12219,6 +12223,7 @@ fn plan_explain(
         join_where: Vec::new(),
         subquery_quals: Vec::new(),
         one_time_false: 0,
+        nullable_gate: None,
         dummy_relation: false,
         sort_keys: None,
         series_scan: None,
@@ -12315,6 +12320,7 @@ fn plan_explain(
         if let Some(n) = reduce_const_classes(&mut query, lookup) {
             options.one_time_false = n;
         }
+        options.nullable_gate = reduce_left_join_on_classes(&mut query, lookup);
     }
     let scan_quals = explain_scan_quals(&query, lookup).unwrap_or_default();
     (options.series_scan, options.series_qual) = match &query {
@@ -53855,6 +53861,182 @@ fn reduce_const_classes(query: &mut N, lookup: &dyn Fn(&str) -> Option<TableDef>
     };
     s.where_clause = Some(Box::new(new_where));
     Some(gates)
+}
+
+/// A two-table LEFT join whose ON equates a column of the nullable side to
+/// two or more distinct constants (RP-400). The ON's conjuncts over that
+/// side alone are its restrictions; `generate_base_implied_equalities_const`
+/// keeps the class's first constant as the scan's Filter and turns each
+/// other distinct one into a `false` pseudoconstant, which
+/// `create_gating_plan` puts on a `Result` over the nullable side's scan.
+/// The outer join itself stays: its preserved rows come out unmatched.
+/// Drops the redundant conjuncts from the ON and returns (the nullable
+/// side's name, the number of `false`s). Integer and text constants only,
+/// as [`reduce_const_classes`] models them.
+fn reduce_left_join_on_classes(
+    query: &mut N,
+    lookup: &dyn Fn(&str) -> Option<TableDef>,
+) -> Option<(String, usize)> {
+    use pg_query::protobuf::JoinType as J;
+    use pg_query::protobuf::Node as PNode;
+    let N::SelectStmt(s) = query else {
+        return None;
+    };
+    let [item] = s.from_clause.as_mut_slice() else {
+        return None;
+    };
+    let Some(N::JoinExpr(j)) = item.node.as_mut() else {
+        return None;
+    };
+    if J::try_from(j.jointype) != Ok(J::JoinLeft) || j.is_natural || !j.using_clause.is_empty() {
+        return None;
+    }
+    let rel = |n: Option<&PNode>| -> Option<(String, TableDef)> {
+        let Some(N::RangeVar(rv)) = n.and_then(|n| n.node.as_ref()) else {
+            return None;
+        };
+        let def = lookup(&rv.relname)?;
+        let name = rv
+            .alias
+            .as_ref()
+            .map(|a| a.aliasname.clone())
+            .unwrap_or_else(|| rv.relname.clone());
+        Some((name, def))
+    };
+    let (lname, ldef) = rel(j.larg.as_deref())?;
+    let (rname, rdef) = rel(j.rarg.as_deref())?;
+    if lname == rname {
+        return None;
+    }
+    let quals = j.quals.as_deref()?;
+    fn flatten(n: &PNode, out: &mut Vec<PNode>) {
+        match n.node.as_ref() {
+            Some(N::BoolExpr(b)) if b.boolop == BoolExprType::AndExpr as i32 => {
+                for a in &b.args {
+                    flatten(a, out);
+                }
+            }
+            _ => out.push(n.clone()),
+        }
+    }
+    let mut parts = Vec::new();
+    flatten(quals, &mut parts);
+    // A column of the nullable side, with its type.
+    let column = |n: Option<&PNode>| -> Option<(String, String)> {
+        let Some(N::ColumnRef(c)) = n.and_then(|n| n.node.as_ref()) else {
+            return None;
+        };
+        let names: Vec<&str> = c
+            .fields
+            .iter()
+            .map(|f| match f.node.as_ref() {
+                Some(N::String(s)) => Some(s.sval.as_str()),
+                _ => None,
+            })
+            .collect::<Option<_>>()?;
+        let has = |d: &TableDef, col: &str| d.columns.iter().any(|c| c.name == col);
+        let col = match names.as_slice() {
+            [col] if has(&rdef, col) && !has(&ldef, col) => *col,
+            [t, col] if *t == rname && has(&rdef, col) => *col,
+            _ => return None,
+        };
+        let ty = rdef.columns.iter().find(|c| c.name == col)?.pg_type.clone();
+        Some((
+            col.to_string(),
+            ty.trim_start_matches("pg_catalog.").to_string(),
+        ))
+    };
+    #[derive(PartialEq)]
+    enum Value {
+        Int(i64),
+        Text(String),
+    }
+    let constant = |n: Option<&PNode>, ty: &str| -> Option<std::result::Result<Value, ()>> {
+        let Some(N::AConst(c)) = n.and_then(|n| n.node.as_ref()) else {
+            return None;
+        };
+        if c.isnull {
+            return Some(Err(()));
+        }
+        let integer = matches!(ty, "int2" | "int4" | "int8");
+        Some(match c.val.as_ref() {
+            Some(a_const::Val::Ival(v)) if integer => Ok(Value::Int(i64::from(v.ival))),
+            Some(a_const::Val::Sval(v)) if integer => {
+                v.sval.trim().parse::<i64>().map(Value::Int).map_err(|_| ())
+            }
+            Some(a_const::Val::Sval(v)) if ty == "text" => Ok(Value::Text(v.sval.clone())),
+            _ => return None,
+        })
+    };
+    let mut classes: Vec<(String, Vec<Value>)> = Vec::new();
+    let mut keep = Vec::with_capacity(parts.len());
+    let mut gates = 0usize;
+    for p in &parts {
+        let member = match p.node.as_ref() {
+            Some(N::AExpr(e))
+                if e.kind == AExprKind::AexprOp as i32 && operator_name(e).ok() == Some("=") =>
+            {
+                let (l, r) = (e.lexpr.as_deref(), e.rexpr.as_deref());
+                match (column(l), column(r)) {
+                    (Some(c), None) => Some((c, r, false)),
+                    (None, Some(c)) => Some((c, l, true)),
+                    _ => None,
+                }
+            }
+            _ => None,
+        };
+        let Some(((col, ty), other, reversed)) = member else {
+            keep.push(true);
+            continue;
+        };
+        let value = match constant(other, &ty) {
+            None => {
+                keep.push(true);
+                continue;
+            }
+            Some(Err(())) => return None,
+            Some(Ok(v)) => v,
+        };
+        match classes.iter_mut().find(|(c, _)| *c == col) {
+            None => {
+                // The kept member is printed as written; a constant on the
+                // left would print commuted, which is not modelled.
+                if reversed {
+                    return None;
+                }
+                classes.push((col, vec![value]));
+                keep.push(true);
+            }
+            Some((_, members)) => {
+                if !members.contains(&value) {
+                    members.push(value);
+                    gates += 1;
+                }
+                keep.push(false);
+            }
+        }
+    }
+    if gates == 0 {
+        return None;
+    }
+    let kept: Vec<PNode> = parts
+        .into_iter()
+        .zip(keep)
+        .filter_map(|(p, k)| k.then_some(p))
+        .collect();
+    let new_quals = match <[PNode; 1]>::try_from(kept) {
+        Ok([one]) => one,
+        Err(args) => PNode {
+            node: Some(N::BoolExpr(Box::new(pg_query::protobuf::BoolExpr {
+                xpr: None,
+                boolop: BoolExprType::AndExpr as i32,
+                args,
+                location: -1,
+            }))),
+        },
+    };
+    j.quals = Some(Box::new(new_quals));
+    Some((rname, gates))
 }
 
 /// A join of relations reached through inner joins only, whose WHERE makes

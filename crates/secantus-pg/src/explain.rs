@@ -2049,6 +2049,35 @@ pub(crate) fn gate_scan(root: &mut PlanNode, falses: usize) {
     scan.children.push(child);
 }
 
+/// Gate the scan of one named relation with `falses` `false`
+/// pseudoconstants (RP-400): a LEFT join's nullable side whose ON made an
+/// equivalence class contradictory, as `create_gating_plan` builds it
+/// beneath the join (and any Materialize over the scan).
+pub(crate) fn gate_named_scan(root: &mut PlanNode, gate: &Option<(String, usize)>) {
+    let Some((name, falses)) = gate else {
+        return;
+    };
+    fn find<'a>(n: &'a mut PlanNode, name: &str) -> Option<&'a mut PlanNode> {
+        if is_scan_name(&n.name) {
+            let rel = n.name.rsplit_once(" on ").map(|(_, r)| r)?;
+            return (rel.split_whitespace().last() == Some(name)).then_some(n);
+        }
+        n.children.iter_mut().find_map(|c| find(c, name))
+    }
+    let Some(scan) = find(root, name) else {
+        return;
+    };
+    let filter = if *falses == 1 {
+        "false".to_string()
+    } else {
+        format!("({})", vec!["false"; *falses].join(" AND "))
+    };
+    let child = std::mem::replace(scan, PlanNode::new("Result"));
+    scan.estimate = child.estimate;
+    scan.details.push(("One-Time Filter".into(), filter));
+    scan.children.push(child);
+}
+
 /// A relation whose WHERE folded to constant FALSE or NULL is dummy
 /// (`relation_excluded_by_constraints`, RP-409): where its scan, or the join
 /// of its tables, would be, PostgreSQL prints a `Result` costing nothing
@@ -3044,6 +3073,7 @@ mod heap_fetches_tests {
             join_where: Vec::new(),
             subquery_quals: Vec::new(),
             one_time_false: 0,
+            nullable_gate: None,
             dummy_relation: false,
             sort_keys: None,
             series_scan: None,

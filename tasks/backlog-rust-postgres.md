@@ -1955,19 +1955,6 @@ a regression test.
       cluster (found while working RP-393 and RP-397).
       Verify: tests/backlog/test_rp_explain_costs.py::test_plan[analyze of an inner join under an outer join with a one-table ON conjunct], tests/backlog/test_rp_explain_costs.py::test_plan[a left join's ON conjunct over a table of an inner join it null-extends]
       Backlog-ID: RP-978
-- [ ] **A LEFT join's ON that equates its nullable side's column to two
-      constants still scans that side.** PostgreSQL 15.19 finds the
-      equivalence class contradictory and gates the nullable side's scan
-      under a `Result` with `One-Time Filter: false`: `select * from s left
-      join e on s.a < e.a and e.b = 'v1' and e.b = 'v2'` with the scan's
-      `Filter: (b = 'v1'::text)` under it; here no Result, and `e`'s scan
-      prints `Filter: ((b = 'v1'::text) AND (b = 'v2'::text))`. Its rows
-      are right. The same in a WHERE over inner joins is a dummy join since
-      2026-11-15 (`join_const_contradiction`); the ON case is a pseudoconstant
-      at the outer join's nullable side, not a dummy relation. Measured on
-      a private 15.19 cluster (found while working RP-395).
-      Backlog-ID: RP-400
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a left join's on equating its nullable column to two constants]
 - [ ] **A LEFT join on an indexed key prints a Hash join where PostgreSQL
       merges through the index.** `select * from s left join k on s.a =
       k.a` (`k.a` the primary key) is, in PostgreSQL 15.19, a `Merge Right
