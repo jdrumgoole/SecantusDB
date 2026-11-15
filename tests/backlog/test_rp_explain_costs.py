@@ -1574,8 +1574,8 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "        ->  Seq Scan on k  (cost=0.00..15.00 rows=1000 width=7)",
         ],
     ),
-    # Still open: EXPLAIN ANALYZE counts a parameterized scan's rows only
-    # where its Index Cond compares the outer row's bare column.
+    # Fixed: EXPLAIN ANALYZE counted a parameterized scan's rows only
+    # where its Index Cond compared the outer row's bare column.
     "analyze of a nested loop into an index on an expression of the outer side": (
         "RP-914",
         _ANALYSED,
@@ -1589,7 +1589,7 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "        Index Cond: (a > (e.a + 1))",
         ],
     ),
-    # Still open (RP-914): the same under the Memoize an expression of few
+    # Fixed (RP-914): the same under the Memoize an expression of few
     # values gets, its cache's counts and its scan's.
     "analyze of a memoize keyed by an expression of the outer side": (
         "RP-914",
@@ -5796,6 +5796,7 @@ def _marked(name: str, item: str) -> Any:
         )
     fixed = item in (
         "RP-314",
+        "RP-914",
         "RP-912",
         "RP-918",
         "RP-920",

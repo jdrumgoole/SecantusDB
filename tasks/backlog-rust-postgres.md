@@ -1801,24 +1801,6 @@ a regression test.
       working RP-354).
       Verify: tests/backlog/test_rp_explain_costs.py::test_plan[nested loop of three relations joined in another order], tests/backlog/test_rp_explain_costs.py::test_plan[nested loop of three relations by a where]
       Backlog-ID: RP-919
-- [ ] **EXPLAIN ANALYZE of a nested loop into an index on an expression
-      of the outer row prints no actual rows.** Its estimate is right, but
-      the actual-row count of a parameterized inner scan is only worked
-      out where its Index Cond compares the outer row's bare column:
-      PostgreSQL 15.19 prints `explain (analyze, timing off, summary off)
-      select * from e left join k on e.a + 1 < k.a` (`e`, `k` 1,000
-      analysed rows, `k.a` the primary key) with `(actual rows=1000
-      loops=1)` on `Seq Scan on e` and `(actual rows=499 loops=1000)` on
-      `Index Scan using k_pkey on k`; here both scans print no actual
-      block at all. The join's own count is right. The same where the
-      expression has few values and PostgreSQL caches the scan in a
-      Memoize (`select * from r, k where r.a + 1 < k.a`, `r.a` ten values:
-      `Hits: 990  Misses: 10  Evictions: 0  Overflows: 0  Memory Usage:
-      380kB`, the Index Scan's `loops=10`); here the Memoize prints no
-      actual block and no cache line. Measured on a private 15.19 cluster
-      (found while working RP-354, the Memoize while working RP-916).
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[analyze of a nested loop into an index on an expression of the outer side], tests/backlog/test_rp_explain_costs.py::test_plan[analyze of a memoize keyed by an expression of the outer side]
-      Backlog-ID: RP-914
 - [ ] **EXPLAIN VERBOSE prints no `Output` lists above a scan.** A plan
       that is one relation's scan prints as VERBOSE does (RP-925); any
       other node prints as without it: PostgreSQL 15.19 prints `explain
