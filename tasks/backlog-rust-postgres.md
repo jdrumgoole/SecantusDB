@@ -3493,16 +3493,6 @@ Measured on a private, freshly initdb'd PostgreSQL 15.19 cluster with the
 `_SETUP` in `tests/backlog/test_rp_found_rp811.py`: `c811(x int, a int[])`
 and `create domain di811 as int`.
 
-- [ ] **A domain's CHECK and a partial index's WHERE are not coerced to
-      boolean.** `create domain d as int check (value)` is 42804 `argument
-      of CHECK must be type boolean, not type integer` on PostgreSQL 15.19
-      (`domainAddConstraint`'s `coerce_to_boolean`), and `check (value is
-      true)` its test's own 42804, both with no position; `create index on
-      c811 (x) where x` is 42804 `argument of WHERE ...` at the `x` (32,
-      `transformIndexStmt`). Here the domain and the index are created. A
-      table's CHECK is coerced since RP-811 (`optype::check_constraint`).
-      Verify: tests/backlog/test_rp_found_rp811.py::test_a_domain_check_and_an_index_predicate_are_coerced_to_boolean
-      Backlog-ID: RP-813
 - [ ] **ALTER TABLE's expressions are not coerced to boolean when no row
       reaches them, and SET DEFAULT's error has a position.** On PostgreSQL
       15.19 `alter table c811 alter column x type bool using (x is true)`

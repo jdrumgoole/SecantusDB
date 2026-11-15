@@ -3017,6 +3017,17 @@ pub(crate) fn check_constraint(
     name: &str,
     def: &TableDef,
 ) -> Result<()> {
+    boolean_clause(raw, name, def, "CHECK")
+}
+
+/// [`check_constraint`] under another clause's name: a partial index's
+/// WHERE (`transformIndexStmt`, RP-813) is coerced the same way.
+pub(crate) fn boolean_clause(
+    raw: &pg_query::protobuf::Node,
+    name: &str,
+    def: &TableDef,
+    clause: &str,
+) -> Result<()> {
     let lookup: &dyn Fn(&str) -> Option<TableDef> = &|_| None;
     let scope = Scope {
         tables: vec![(name.to_string(), def.clone())],
@@ -3036,7 +3047,7 @@ pub(crate) fn check_constraint(
     };
     regclass::analysing(|| {
         walk(raw, &scope, &cx)?;
-        clause_is_boolean(raw, &scope, "CHECK")
+        clause_is_boolean(raw, &scope, clause)
     })
 }
 

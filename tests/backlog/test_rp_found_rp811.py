@@ -60,7 +60,7 @@ def _not_boolean(test: str, typ: str, position: int | None) -> tuple[str, str, s
     )
 
 
-@pytest.mark.backlog("RP-813")
+@pytest.mark.backlog_fixed("RP-813")
 @pytest.mark.parametrize(
     ("query", "expected"),
     [
@@ -77,8 +77,8 @@ def test_a_domain_check_and_an_index_predicate_are_coerced_to_boolean(
 ) -> None:
     """`domainAddConstraint` coerces a domain's CHECK to boolean (with no
     position: it has no query text) and `transformIndexStmt` a partial
-    index's WHERE: each is 42804 on PostgreSQL 15.19. Here the domain and
-    the index are created."""
+    index's WHERE: each is 42804 on PostgreSQL 15.19. The domain and
+    the index were created."""
     assert _answer(dsn, query) == expected
 
 

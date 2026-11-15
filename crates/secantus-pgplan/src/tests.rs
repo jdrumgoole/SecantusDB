@@ -8466,3 +8466,44 @@ fn an_operator_is_resolved_after_a_reference_to_its_left() {
         assert_eq!(take_error_location(), Some(at), "for {sql}");
     }
 }
+
+/// A domain's CHECK (`domainAddConstraint`, no position) and a partial
+/// index's WHERE (`transformIndexStmt`, at the argument) are coerced to
+/// boolean (RP-813). Measured on PostgreSQL 15.19.
+#[test]
+fn a_domain_check_and_an_index_predicate_are_coerced_to_boolean() {
+    for (sql, want, at) in [
+        (
+            "create domain d as int check (value)",
+            "argument of CHECK must be type boolean, not type integer",
+            None,
+        ),
+        (
+            "create domain d as int check (value is true)",
+            "argument of IS TRUE must be type boolean, not type integer",
+            None,
+        ),
+        (
+            "create index on t (n) where n",
+            "argument of WHERE must be type boolean, not type integer",
+            Some(29),
+        ),
+    ] {
+        take_error_location();
+        let err = plan(sql, &lookup).expect_err("should refuse");
+        assert_eq!(err.sqlstate(), "42804", "for {sql} (got {err})");
+        assert!(err.to_string().contains(want), "for {sql}: {err}");
+        assert_eq!(
+            crate::errpos::error_position(sql, "42804", &err.to_string()),
+            at,
+            "for {sql}"
+        );
+    }
+    for sql in [
+        "create domain d as int check (value > 0)",
+        "create domain d as bool check (value)",
+        "create index on t (n) where n > 0",
+    ] {
+        plan(sql, &lookup).expect("should plan");
+    }
+}

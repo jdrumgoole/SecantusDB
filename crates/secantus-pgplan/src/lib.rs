@@ -11436,6 +11436,8 @@ fn plan_create_index(
     let (predicate, predicate_sql) = match i.where_clause.as_deref() {
         None => (None, None),
         Some(w) => {
+            // `transformIndexStmt` coerces the predicate to boolean (RP-813).
+            optype::boolean_clause(w, &schemas::split_key(&table).1, &def, "WHERE")?;
             let sql = render_index_predicate(w, &def)
                 .or_else(|| deparse_expr(w).ok().map(|s| format!("({s})")))
                 .unwrap_or_default();
