@@ -6038,6 +6038,21 @@ fn plan_node(
     }
     match node {
         N::CreateStmt(c) => {
+            // `IF NOT EXISTS` over a relation that exists is a NOTICE before
+            // anything else is looked at (`transformCreateStmt`): columns,
+            // types, defaults and constraints go unchecked (RP-887).
+            if c.if_not_exists
+                && c.relation
+                    .as_ref()
+                    .is_some_and(|r| lookup(&relation_name(r)).is_some())
+            {
+                let bare = pg_query::protobuf::CreateStmt {
+                    relation: c.relation.clone(),
+                    if_not_exists: true,
+                    ..Default::default()
+                };
+                return plan_create(&bare, false);
+            }
             catalog_stmts::check_tablespace(&c.tablespacename)?;
             // `INHERITS (p)` -- not a partition's `PARTITION OF`, which
             // arrives with a bound.
@@ -6066,13 +6081,7 @@ fn plan_node(
             };
             let (c, extra, column_options) = partitions::lower_create(&c, lookup)?;
             let like_columns = like_column_names(&c, lookup);
-            // `IF NOT EXISTS` over a relation that exists is a NOTICE before
-            // anything is analysed (`transformCreateStmt`).
-            let skipped = c.if_not_exists
-                && c.relation
-                    .as_ref()
-                    .is_some_and(|r| lookup(&relation_name(r)).is_some());
-            let mut st = plan_create(&expand_table_like(&c, lookup)?, !skipped)?;
+            let mut st = plan_create(&expand_table_like(&c, lookup)?, true)?;
             if let Statement::CreateTable(def, _) = &mut st {
                 // A column PostgreSQL defines from a type OID -- one LIKE
                 // (a partition's too) or `OF type` brings -- has no array

@@ -2426,25 +2426,6 @@ Measured on PostgreSQL 15.19 (the data-modifying WITH on a private cluster).
       Backlog-ID: RP-965
 
 
-## Found while working RP-881 (2026-11-12)
-
-Measured on a private PostgreSQL 15.19 cluster. The gap tests are in
-`tests/backlog/test_rp_found_rp881.py`.
-
-- [ ] **CREATE TABLE IF NOT EXISTS over a table that exists checks its
-      columns.** PostgreSQL 15.19's `transformCreateStmt` finds the
-      relation first and answers with a NOTICE (`relation "t" already
-      exists, skipping`), looking at nothing else: `create table if not
-      exists t (a nosuchtype)`, `(a int, a int)` and `(a int default 'x')`
-      all succeed. Here they are 42704, 42701 and 22P02: the column types,
-      names and literal defaults are checked while planning, before the
-      executor looks for the table. (Since RP-881 the defaults' analysis
-      is skipped for such a statement, as PostgreSQL skips it.)
-      Verify: tests/backlog/test_rp_found_rp881.py::test_if_not_exists_over_a_table_checks_nothing
-      Backlog-ID: RP-887
-
-
-
 ## Found while working RP-472 (2026-11-07)
 
 - [ ] **EXPLAIN of a user function in FROM prints no Function Scan.**

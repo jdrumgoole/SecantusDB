@@ -143,10 +143,10 @@ IF_NOT_EXISTS = {
 }
 
 
-@pytest.mark.backlog("RP-887")
+@pytest.mark.backlog_fixed("RP-887")
 @pytest.mark.parametrize("case", list(IF_NOT_EXISTS))
 def test_if_not_exists_over_a_table_checks_nothing(case: str, dsn: str) -> None:
-    """IF NOT EXISTS over a table that exists skips before any check."""
+    """IF NOT EXISTS over a table that exists skipped before any check."""
     try:
         assert answer(dsn, "create table t890 (a int)", IF_NOT_EXISTS[case]) == CREATED
     finally:
