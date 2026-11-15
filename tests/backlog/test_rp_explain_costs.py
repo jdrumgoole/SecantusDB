@@ -4591,10 +4591,11 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "        Index Cond: (y > z.a)",
         ],
     ),
-    # A LEFT join filter over a char(n) column: still unannotated (RP-390's
-    # remainder).
+    # Split from RP-390 and fixed: a LEFT join filter over a char(n) column
+    # reads the column blank-padded, so its pairs are counted and the
+    # children annotated (they printed bare).
     "analyze of a left nested loop over a char(n) join filter": (
-        "RP-390",
+        "RP-389",
         _ANALYSED_THIRTY
         + [
             "create table cc (a int, b char(4))",

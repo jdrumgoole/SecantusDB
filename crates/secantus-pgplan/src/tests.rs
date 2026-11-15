@@ -4257,6 +4257,24 @@ fn a_pair_expression_reads_each_sides_row() {
     assert!(plan_pair_expression("(x.a < e.a)", ("s", &s), ("e", &e)).is_err());
 }
 
+/// A join qual over a char(n) column reads it blank-padded to its width,
+/// as PostgreSQL stores it (RP-390).
+#[test]
+fn a_pair_expression_pads_a_char_n_column() {
+    let mut b = Column::new("b", "bpchar", false);
+    b.typmod = 8;
+    let cc = TableDef::new("cc", vec![b]);
+    let s = TableDef::new("s", vec![Column::new("c", "text", false)]);
+    let qual = plan_pair_expression("(octet_length(cc.b) = 4)", ("cc", &cc), ("s", &s)).unwrap();
+    let mut d = Document::new();
+    d.insert(
+        format!("{PAIR_OUTER_PREFIX}{}", cc.columns[0].field()),
+        "ab",
+    );
+    d.insert(format!("{PAIR_INNER_PREFIX}{}", s.columns[0].field()), "x");
+    assert_eq!(apply_row_expr(&qual, &d).unwrap(), Bson::Boolean(true));
+}
+
 /// EXPLAIN analyses its statement before it reads an option, as
 /// `transformExplainStmt` runs before `ExplainQuery` (RP-419). Each answer
 /// was measured on PostgreSQL 15.19.

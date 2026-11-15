@@ -1958,9 +1958,8 @@ a regression test.
       `Rows Removed by Filter` (`select * from s join e on s.a < e.a where
       e.b = 'v1'`), as PostgreSQL 15.19 counts them, and since RP-403 a
       Hash Join's and a parameterized Nested Loop's outer Seq Scans theirs
-      too. Still unannotated: a LEFT join filter over a char(n) column
-      (`cc left join s on cc.b < s.c`, `b char(4)`: `Seq Scan on cc
-      (actual rows=30 loops=1)`), a LEFT join with a WHERE (unpriced too,
+      too, and since 2026-11-15 a LEFT join filter over a char(n)
+      column. Still unannotated: a LEFT join with a WHERE (unpriced too,
       RP-379), a parameterized inner index scan with its own Filter, a
       Merge Join (its Sorts' `Sort Method`), a hash table past `hash_mem`
       (several batches), a join with an inner-unique inner side, and the
@@ -1973,7 +1972,7 @@ a regression test.
       Measured on a private 15.19 cluster (found while working RP-386,
       the chain while working RP-354).
       Backlog-ID: RP-390
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[analyze of a left nested loop over a char(n) join filter], tests/backlog/test_rp_explain_costs.py::test_plan[analyze of a nested loop of three relations], tests/backlog/test_rp_explain_costs.py::test_plan[analyze of a nested loop of three relations into a memoized index]
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[analyze of a nested loop of three relations], tests/backlog/test_rp_explain_costs.py::test_plan[analyze of a nested loop of three relations into a memoized index]
 - [ ] **An inner join nested in an outer join keeps its one-table ON
       conjuncts in its Join Filter.** Since RP-391 / RP-392 an inner
       join's ON conjunct over one table is that table's scan Filter, but

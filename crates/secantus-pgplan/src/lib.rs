@@ -14190,12 +14190,17 @@ pub fn plan_pair_expression(
     let mut sample = Document::new();
     for (prefix, def) in [(PAIR_OUTER_PREFIX, outer.1), (PAIR_INNER_PREFIX, inner.1)] {
         for c in def.columns.iter() {
-            // A char(n) column's width is keyed by its own field name, which
-            // the prefix hides: refuse rather than compare it unpadded.
-            if c.pg_type == "bpchar" {
-                return Err(Error::Unsupported("a char(n) column in a join qual".into()));
-            }
             let field = format!("{prefix}{}", c.field());
+            // A char(n) column's width, keyed by its prefixed field, so the
+            // pair's value is blank-padded as the column's own is (RP-390).
+            ROW_WIDTHS.with(|w| {
+                let mut w = w.borrow_mut();
+                if matches!(c.pg_type.as_str(), "bpchar" | "bpchar[]") && c.typmod > 4 {
+                    w.insert(field.clone(), (c.typmod - 4) as usize);
+                } else {
+                    w.remove(&field);
+                }
+            });
             sample.insert(field.clone(), sample_value_for_type(&c.pg_type));
             fields.push((format!("{prefix}{}", c.name), field, c.pg_type.clone()));
         }
