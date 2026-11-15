@@ -2452,19 +2452,6 @@ Measured on PostgreSQL 15.19 (the data-modifying WITH on a private cluster).
       Verify: tests/backlog/test_rp_do_compile_errors.py::test_compile_error_has_a_position
       Backlog-ID: RP-492
 
-## Found while working RP-463 (2026-11-07)
-
-- [ ] **An expression's error in a PL/pgSQL statement carries no QUERY and
-      no internal position.** `do $$ declare x int; begin raise notice '%',
-      nosuch.x; end $$` is 42P01 on both, but PostgreSQL 15.19 sends
-      `internal_query` `nosuch.x` and `internal_position` 1 (psql prints
-      `LINE 1: nosuch.x` and `QUERY:`); here neither field is sent. Called
-      as a function (`return nosuch.x` in `lbe()`), the error here instead
-      carries a statement position, 8, into `select lbe()`, where
-      PostgreSQL sends none. Measured on a private 15.19 cluster.
-      Verify: tests/backlog/test_rp_plpgsql_labels.py::test_expression_error_carries_its_query
-      Backlog-ID: RP-488
-
 ## Found while working RP-485 (2026-11-11)
 
 - [ ] **A function found nowhere inside another call's arguments is

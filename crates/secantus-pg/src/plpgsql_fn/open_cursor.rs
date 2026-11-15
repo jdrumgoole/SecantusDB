@@ -311,7 +311,7 @@ impl Interp<'_> {
         let out = self
             .host
             .query(&sql, &params, &types)
-            .map_err(|e| e.with_expr_frame(text, &raw, |_| frame()))?;
+            .map_err(|e| e.with_expr_frame(text, &raw, &sql, |_| frame()))?;
         // Not STRICT: a second row is not read (`tcount` 1).
         let domains = self.host.output_domains(&sql, &types);
         let first = out.rows.first().map(|r| r.as_slice());

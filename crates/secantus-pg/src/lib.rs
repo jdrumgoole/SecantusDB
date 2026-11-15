@@ -2180,6 +2180,7 @@ fn pl_error(e: &PgWireError) -> plpgsql_fn::PlError {
                     .and_then(|p| p.parse().ok());
                 Box::new((q, at))
             });
+            p.position = info.position.as_deref().and_then(|p| p.parse().ok());
             p.from_sql = true;
             p
         }
@@ -16083,6 +16084,11 @@ impl PgHandler {
                     (Some(inner), None) => Some(inner.into()),
                     (None, f) => f.clone(),
                 };
+                if let Some(internal) = e.internal {
+                    let (query, position) = *internal;
+                    info.internal_query = Some(query);
+                    info.internal_position = position.map(|p| p.to_string());
+                }
                 PgWireError::UserError(Box::new(info))
             };
             if is_query {
@@ -26881,6 +26887,10 @@ impl PgHandler {
         // A planner message may carry PostgreSQL's DETAIL / HINT line after
         // the primary one; each travels in its own field, not the message.
         let text = e.to_string();
+        let (text, internal) = match text.split_once("\nInternal: ") {
+            Some((m, i)) => (m.to_string(), i.split_once('\t')),
+            None => (text.clone(), None),
+        };
         let (text, context) = match text.split_once("\nContext: ") {
             Some((m, c)) => (m.to_string(), Some(c.to_string())),
             None => (text, None),
@@ -26912,6 +26922,10 @@ impl PgHandler {
             info.schema = Some(schema);
             info.datatype = Some(name);
             info.constraint = Some(constraint);
+        }
+        if let Some((at, q)) = internal {
+            info.internal_query = Some(q.to_string());
+            info.internal_position = (!at.is_empty()).then(|| at.to_string());
         }
         PgWireError::UserError(Box::new(info))
     }
@@ -27030,7 +27044,10 @@ impl PgHandler {
             {
                 return e;
             }
-            if info.position.is_none() && info.severity == "ERROR" {
+            // An error inside an internal query (a PL/pgSQL expression) is
+            // placed there, not in the statement.
+            if info.position.is_none() && info.internal_query.is_none() && info.severity == "ERROR"
+            {
                 if info.code == "42883" {
                     if let Some(m) = secantus_pgplan::qualify_missing_function(sql, &info.message) {
                         info.message = m;
@@ -34000,6 +34017,12 @@ impl PgHandler {
                 }
                 if let Some(c) = &info.where_context {
                     text.push_str(&format!("\nContext: {c}"));
+                }
+                // An internal query (an expression in a PL/pgSQL body) and
+                // its position ride last, `<position>\t<query>`.
+                if let Some(q) = &info.internal_query {
+                    let at = info.internal_position.as_deref().unwrap_or_default();
+                    text.push_str(&format!("\nInternal: {at}\t{q}"));
                 }
                 PlanError::Sqlstate(Box::leak(info.code.clone().into_boxed_str()), text)
             }

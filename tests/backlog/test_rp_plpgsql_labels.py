@@ -5,8 +5,8 @@ declares, and a FOR loop's label its loop variable, as `plpgsql_ns_lookup`
 searches the namespace from the innermost level out. Found while working
 it: RP-486 (fixed: a DO block with a label was a syntax error), RP-487
 (fixed: a bare name read after an inner block or a FOR loop ends was the
-inner level's variable) and RP-488 (an expression's error in a PL/pgSQL
-statement carries no QUERY and no internal position). Found while working
+inner level's variable) and RP-488 (fixed: an expression's error in a PL/pgSQL
+statement carried no QUERY and no internal position). Found while working
 RP-487: RP-491 (fixed: a block's variables were initialised once, when the
 function started, not each time the block is entered).
 
@@ -281,10 +281,47 @@ EXPRESSION_ERROR = {
             "1",
         ),
     ),
+    # An assignment's query is the whole statement, as written.
+    "declare x int; begin x := nosuch.x + 1; end": (
+        [],
+        (
+            "42P01",
+            'missing FROM-clause entry for table "nosuch"',
+            None,
+            "x := nosuch.x + 1",
+            "6",
+        ),
+    ),
 }
 
 
-@pytest.mark.backlog("RP-488")
+@pytest.mark.backlog_fixed("RP-488")
 @pytest.mark.parametrize("body", list(EXPRESSION_ERROR))
 def test_expression_error_carries_its_query(body: str, dsn: str) -> None:
+    """An expression's analysis error carried no QUERY and no internal
+    position; `_SPI_error_callback` moves its cursor position there."""
     assert _do(dsn, body) == EXPRESSION_ERROR[body]
+
+
+@pytest.mark.backlog_fixed("RP-488")
+def test_function_expression_error_carries_its_query(dsn: str) -> None:
+    """Called as a function, the error carried a statement position into
+    the calling `select`, where PostgreSQL sends the internal query."""
+    with psycopg.connect(dsn, autocommit=True) as c:
+        c.execute(
+            "create or replace function rp488() returns int language plpgsql"
+            " as $$ begin return nosuch.x; end $$"
+        )
+        try:
+            with pytest.raises(psycopg.Error) as caught:
+                c.execute("select rp488()")
+        finally:
+            c.execute("drop function rp488()")
+    d = caught.value.diag
+    assert (
+        d.sqlstate,
+        d.statement_position,
+        d.internal_query,
+        d.internal_position,
+        d.context,
+    ) == ("42P01", None, "nosuch.x", "1", "PL/pgSQL function rp488() line 1 at RETURN")

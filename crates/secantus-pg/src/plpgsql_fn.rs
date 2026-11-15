@@ -47,6 +47,11 @@ pub struct PlError {
     /// cursor position into these): an input error on a literal. Boxed
     /// together, as `context` is.
     pub internal: Option<Box<(String, Option<usize>)>>,
+    /// The 1-based character position the error carries in the query
+    /// that raised it (the statement's, before `_SPI_error_callback`
+    /// moves it into the internal query).
+    /// (Four bytes: it sits in the flags' padding.)
+    pub position: Option<std::num::NonZeroU32>,
 }
 
 impl PlError {
@@ -61,6 +66,7 @@ impl PlError {
             sql_framed: false,
             framed: false,
             internal: None,
+            position: None,
         }
     }
 
@@ -94,9 +100,35 @@ impl PlError {
         mut self,
         text: &str,
         raw: &str,
+        sql: &str,
         frame: impl FnOnce(&Self) -> Option<String>,
     ) -> Self {
         if self.from_sql && !self.sql_framed && !self.framed {
+            let analysis = self.sqlstate.starts_with("42") && self.sqlstate != "42501"
+                || self.sqlstate == "3F000";
+            let at = self
+                .position
+                .take()
+                .filter(|_| analysis)
+                .map(|p| p.get() as usize)
+                .or_else(|| {
+                    analysis
+                        .then(|| {
+                            secantus_pgplan::error_position(sql, &self.sqlstate, &self.message)
+                        })
+                        .flatten()
+                });
+            if let Some(at) = at {
+                // `_SPI_error_callback`: an error with a cursor position
+                // into the query moves it to an internal query, the
+                // expression as written, and adds no CONTEXT frame.
+                self.internal = Some(Box::new((
+                    text.to_string(),
+                    expr_position(text, raw, sql, at),
+                )));
+                self.sql_framed = true;
+                return self;
+            }
             if let Some(lit) = input_error_literal(raw, &self) {
                 let at = text.find(&lit).map(|at| text[..at].chars().count() + 1);
                 self.internal = Some(Box::new((text.to_string(), at)));
@@ -1511,6 +1543,28 @@ fn literal_input_error(sql: &str, err: &PlError) -> bool {
     input_error_literal(sql, err).is_some()
 }
 
+/// The position in the expression `text` of the 1-based character
+/// position `at` in `sql`, the query `raw` (`SELECT <part of text>`, or
+/// `text` itself) became once its variables were bound. `None` when the
+/// position falls past a bound variable, where the two queries differ.
+fn expr_position(text: &str, raw: &str, sql: &str, at: usize) -> Option<usize> {
+    let before = at.checked_sub(1)?;
+    let raw_c: Vec<char> = raw.chars().collect();
+    let sql_c: Vec<char> = sql.chars().collect();
+    if before > raw_c.len() || before > sql_c.len() || raw_c[..before] != sql_c[..before] {
+        return None;
+    }
+    // The part of `text` the query holds: all of it, or an assignment's
+    // value (`x := <value>`, which may be wrapped in a cast to `x`'s type).
+    let part = [text, text.split_once(":=").map_or("", |(_, r)| r.trim())]
+        .into_iter()
+        .find(|p| !p.is_empty() && raw.contains(*p))?;
+    let in_raw = raw_c.len() - raw[raw.find(part)?..].chars().count();
+    let in_text = text[..text.find(part)?].chars().count();
+    let off = before.checked_sub(in_raw)?;
+    (off <= part.chars().count()).then_some(in_text + off + 1)
+}
+
 /// The quoted literal (`'abc'`) of `sql` an input error names.
 fn input_error_literal(sql: &str, err: &PlError) -> Option<String> {
     if !err.sqlstate.starts_with("22") {
@@ -2153,7 +2207,7 @@ impl Interp<'_> {
             .bind(&sql)
             .map_err(|e| e.with_sql_frame(|| bind_frame(text, mode)))?;
         let out = self.host.query(&sql, &params, &types).map_err(|e| {
-            e.with_expr_frame(text, &raw, |e| {
+            e.with_expr_frame(text, &raw, &sql, |e| {
                 let fails = |q: &str| {
                     self.host
                         .query(q, &[], &[])
@@ -2247,7 +2301,7 @@ impl Interp<'_> {
             .bind(&sql)
             .map_err(|e| e.with_sql_frame(|| bind_frame(text, mode)))?;
         let out = self.host.query(&sql, &params, &types).map_err(|e| {
-            e.with_expr_frame(text, &raw, |e| {
+            e.with_expr_frame(text, &raw, &sql, |e| {
                 let fails = |q: &str| {
                     self.host
                         .query(q, &[], &[])
