@@ -3074,6 +3074,28 @@ pub(crate) fn boolean_clause(
     def: &TableDef,
     clause: &str,
 ) -> Result<()> {
+    over_table(raw, name, def, Some(clause))
+}
+
+/// An expression over the table `name` (`def`) analysed as `transformExpr`
+/// analyses it, with no coercion of the whole: ALTER TABLE's `USING` and a
+/// generated column's expression are transformed whatever rows the table
+/// holds, so `x is true` over an `int` is 42804 over an empty table
+/// (RP-815).
+pub(crate) fn table_expression(
+    raw: &pg_query::protobuf::Node,
+    name: &str,
+    def: &TableDef,
+) -> Result<()> {
+    over_table(raw, name, def, None)
+}
+
+fn over_table(
+    raw: &pg_query::protobuf::Node,
+    name: &str,
+    def: &TableDef,
+    clause: Option<&str>,
+) -> Result<()> {
     let lookup: &dyn Fn(&str) -> Option<TableDef> = &|_| None;
     let scope = Scope {
         tables: vec![(name.to_string(), def.clone())],
@@ -3093,7 +3115,10 @@ pub(crate) fn boolean_clause(
     };
     regclass::analysing(|| {
         walk(raw, &scope, &cx)?;
-        clause_is_boolean(raw, &scope, clause)
+        match clause {
+            Some(clause) => clause_is_boolean(raw, &scope, clause),
+            None => Ok(()),
+        }
     })
 }
 

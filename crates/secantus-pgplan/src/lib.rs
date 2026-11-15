@@ -9132,8 +9132,22 @@ fn plan_alter_action(
             let Some(N::ColumnDef(cd)) = cmd.def.as_ref().and_then(|d| d.node.as_ref()) else {
                 return Err(Error::Parse("ADD COLUMN without a column".into()));
             };
+            let column = plan_added_column(cd, params, table)?;
+            // `cookDefault` transforms a generated column's expression
+            // whatever rows the table holds, under a parse state with no
+            // query text (RP-815).
+            for con in &cd.constraints {
+                if let Some(N::Constraint(k)) = con.node.as_ref() {
+                    if CT::try_from(k.contype) == Ok(CT::ConstrGenerated) {
+                        if let Some(raw) = k.raw_expr.as_deref() {
+                            optype::table_expression(raw, &schemas::split_key(table).1, def)
+                                .inspect_err(|_| set_error_unpositioned())?;
+                        }
+                    }
+                }
+            }
             Ok(AlterTableAction::AddColumn {
-                column: plan_added_column(cd, params, table)?,
+                column,
                 if_not_exists: cmd.missing_ok,
             })
         }
@@ -9174,7 +9188,12 @@ fn plan_alter_action(
                     // needs nothing evaluated now; it is analysed all the
                     // same (RP-881).
                     default_expr::analyse_unpositioned(raw)?;
-                    Some(cooked_default_value_or_expr(raw, &column.pg_type, params)?)
+                    // `AddRelationNewConstraints` cooks it under a parse
+                    // state with no query text: no position (RP-815).
+                    Some(
+                        cooked_default_value_or_expr(raw, &column.pg_type, params)
+                            .inspect_err(|_| set_error_unpositioned())?,
+                    )
                 }
             };
             let (value, expr) = match value {
@@ -9310,6 +9329,11 @@ fn plan_alter_action(
             };
             // `USING <expr>` computes the new value from the row instead of
             // casting the old one, so the automatic-cast rule does not apply.
+            // `ATPrepAlterColumnType` transforms it whatever rows the table
+            // holds (RP-815).
+            if let Some(raw) = cd.raw_default.as_deref() {
+                optype::table_expression(raw, &schemas::split_key(table).1, def)?;
+            }
             let using = cd.raw_default.as_deref().map(deparse_expr).transpose()?;
             let ty = cd
                 .type_name

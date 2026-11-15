@@ -3216,24 +3216,6 @@ s text)`.
       Verify: tests/backlog/test_rp_found_rp808.py::test_a_connectives_argument_is_reported_at_its_leftmost_token
       Backlog-ID: RP-812
 
-## Found while working RP-811 (2026-11-10)
-
-Measured on a private, freshly initdb'd PostgreSQL 15.19 cluster with the
-`_SETUP` in `tests/backlog/test_rp_found_rp811.py`: `c811(x int, a int[])`
-and `create domain di811 as int`.
-
-- [ ] **ALTER TABLE's expressions are not coerced to boolean when no row
-      reaches them, and SET DEFAULT's error has a position.** On PostgreSQL
-      15.19 `alter table c811 alter column x type bool using (x is true)`
-      is 42804 `argument of IS TRUE ...` at 50 and `add column y bool
-      generated always as (x is true) stored` the same 42804 with no
-      position, both over an empty table; here each is `ALTER TABLE`, the
-      expression judged only per row. `alter column x set default (1 is
-      true)` is that 42804 with no position (`AddRelationNewConstraints`
-      gets no query text from ALTER TABLE); here it is placed at the `1`.
-      Verify: tests/backlog/test_rp_found_rp811.py::test_alter_table_expressions_are_coerced_to_boolean
-      Backlog-ID: RP-815
-
 ## Found while working RP-816 (2026-11-11)
 
 Measured on a private PostgreSQL 15.19 cluster.
