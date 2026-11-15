@@ -153,13 +153,13 @@ pub(crate) fn pull_up_constant_subqueries(query: &mut N) -> Result<()> {
 }
 
 /// An `UPDATE ... FROM` or `DELETE ... USING` with a FROM item left, as the
-/// join PostgreSQL plans it under its ModifyTable (RP-435): `SELECT * FROM
+/// join PostgreSQL plans it under its ModifyTable (RP-435): `SELECT <SET values> FROM
 /// <target>, <from items> WHERE <where>`, the target first as it is the
 /// range table's first entry. Returns the ModifyTable node's name (`Delete
 /// on k`), or `None` (and leaves the statement) when there is no join.
 /// Only EXPLAIN without ANALYZE uses it: the statement is not run.
 pub(crate) fn dml_join_as_select(query: &mut N) -> Option<String> {
-    let (verb, relation, from, where_clause) = match query {
+    let (verb, relation, from, where_clause) = match &*query {
         N::UpdateStmt(u) if u.with_clause.is_none() && !u.from_clause.is_empty() => (
             "Update",
             u.relation.as_ref()?,
@@ -178,26 +178,31 @@ pub(crate) fn dml_join_as_select(query: &mut N) -> Option<String> {
         Some(a) => format!("{verb} on {} {}", relation.relname, a.aliasname),
         None => format!("{verb} on {}", relation.relname),
     };
-    let star = Node {
-        node: Some(N::ResTarget(Box::new(pg_query::protobuf::ResTarget {
-            val: Some(Box::new(Node {
-                node: Some(N::ColumnRef(pg_query::protobuf::ColumnRef {
-                    fields: vec![Node {
-                        node: Some(N::AStar(pg_query::protobuf::AStar {})),
-                    }],
-                    location: -1,
-                })),
-            })),
-            location: -1,
-            ..Default::default()
-        }))),
+    // The join's target list is what the SET list reads; the row identity
+    // (`ctid`) each relation adds is the plan's (`add_row_identity`).
+    let target_list: Vec<Node> = match &*query {
+        N::UpdateStmt(u) => u
+            .target_list
+            .iter()
+            .filter_map(|t| match t.node.as_ref() {
+                Some(N::ResTarget(r)) => Some(Node {
+                    node: Some(N::ResTarget(Box::new(pg_query::protobuf::ResTarget {
+                        val: r.val.clone(),
+                        location: -1,
+                        ..Default::default()
+                    }))),
+                }),
+                _ => None,
+            })
+            .collect(),
+        _ => Vec::new(),
     };
     let mut from_clause = vec![Node {
         node: Some(N::RangeVar(relation.clone())),
     }];
     from_clause.extend(from.iter().cloned());
     let select = pg_query::protobuf::SelectStmt {
-        target_list: vec![star],
+        target_list,
         from_clause,
         where_clause: where_clause.clone(),
         limit_option: pg_query::protobuf::LimitOption::Default as i32,

@@ -104,18 +104,20 @@ def test_explain_plans_the_join(rust_pg: Any) -> None:
     assert got[3][1][0] == ("Delete on k  (cost=1.23..2.36 rows=0 width=0)",)
 
 
-@pytest.mark.backlog("RP-435")
+@pytest.mark.backlog_fixed("RP-435")
 def test_explain_join_widths(rust_pg: Any) -> None:
-    """A DML join carries each relation's `ctid` and the columns the SET
+    """A DML join carried each relation's `ctid` and the columns the SET
     list reads, not the tables' every column: PostgreSQL 15.19's join is
-    `width=12` for a DELETE and `width=44` for `set b = 'x'`, each scan
-    `width=10` (`ctid` and `a`)."""
+    `width=12` for a DELETE, each scan `width=10` (`ctid` and `a`); with
+    `set b = e.b` the join is 15 and `e`'s scan 13, with `set a = e.a` the
+    join 16. It printed the widths of the tables' every column."""
     got = _answers(
         rust_pg,
         _ANALYSED
         + [
             "explain delete from k using e where k.a = e.a",
-            "explain update k set b = 'x' from e where k.a = e.a",
+            "explain update k set b = e.b from e where k.a = e.a",
+            "explain update k set a = e.a from e where k.a = e.a",
         ],
     )[len(_ANALYSED) :]
     assert got == [
@@ -130,6 +132,43 @@ def test_explain_join_widths(rust_pg: Any) -> None:
                 ("              ->  Seq Scan on k  (cost=0.00..1.10 rows=10 width=10)",),
             ],
         ),
+        (
+            "ok",
+            [
+                ("Update on k  (cost=1.23..2.36 rows=0 width=0)",),
+                ("  ->  Hash Join  (cost=1.23..2.36 rows=10 width=15)",),
+                ("        Hash Cond: (e.a = k.a)",),
+                ("        ->  Seq Scan on e  (cost=0.00..1.10 rows=10 width=13)",),
+                ("        ->  Hash  (cost=1.10..1.10 rows=10 width=10)",),
+                ("              ->  Seq Scan on k  (cost=0.00..1.10 rows=10 width=10)",),
+            ],
+        ),
+        (
+            "ok",
+            [
+                ("Update on k  (cost=1.23..2.36 rows=0 width=0)",),
+                ("  ->  Hash Join  (cost=1.23..2.36 rows=10 width=16)",),
+                ("        Hash Cond: (e.a = k.a)",),
+                ("        ->  Seq Scan on e  (cost=0.00..1.10 rows=10 width=10)",),
+                ("        ->  Hash  (cost=1.10..1.10 rows=10 width=10)",),
+                ("              ->  Seq Scan on k  (cost=0.00..1.10 rows=10 width=10)",),
+            ],
+        ),
+    ]
+
+
+@pytest.mark.backlog("RP-435")
+def test_explain_join_width_of_a_computed_set_value(rust_pg: Any) -> None:
+    """A SET value computed from a constant is a column of the join's target
+    list, of its type's width: PostgreSQL 15.19's `set b = 'x'` join is
+    `width=44` (two `ctid`s and a `text`), each scan `width=10`. Here the
+    plan is unpriced, as any join whose select list computes an
+    expression is."""
+    got = _answers(
+        rust_pg,
+        _ANALYSED + ["explain update k set b = 'x' from e where k.a = e.a"],
+    )[len(_ANALYSED) :]
+    assert got == [
         (
             "ok",
             [

@@ -2018,20 +2018,20 @@ a regression test.
       (found while working RP-408).
       Backlog-ID: RP-414
       Verify: tests/backlog/test_rp_column_errors.py::test_missing_column_reported_as_written
-- [ ] **EXPLAIN of an UPDATE ... FROM or a DELETE ... USING a table
-      prints the join's widths from every column of its tables.** Since
-      2026-11-15 the statement is explained as the SELECT join it is
-      (`dml_join_as_select`) under its ModifyTable, so the plan's shape
-      and costs are PostgreSQL's. The widths are that SELECT's `*`:
-      PostgreSQL 15.19's join target list is each relation's `ctid` and
-      what the SET list reads, its scans `ctid` and the join key. With
-      `e(a int, b text)` and `k(a int primary key, b text)` analysed, 10
-      rows each, `explain delete from k using e where k.a = e.a` is `Hash
-      Join (... width=12)` over scans of `width=10`, here 14 and 7; `update
-      k set b = 'x' ...` is `width=44`, here 14. EXPLAIN VERBOSE's
-      `Output:` lists (`k.ctid, e.ctid`) follow from the same target list.
+- [ ] **EXPLAIN of an UPDATE ... FROM whose SET value is computed prints
+      the join unpriced.** The DML join's target list is each relation's
+      `ctid` and what the SET list reads (`dml_join_as_select`,
+      `add_row_identity`), so a DELETE ... USING and a SET of plain columns
+      print PostgreSQL's widths. A SET value that computes (`set b =
+      'x'`) is an expression in the join's select list, and any join
+      whose select list computes one is unpriced here (`select 'x' from k,
+      e where k.a = e.a` too). PostgreSQL 15.19 prints `explain update k
+      set b = 'x' from e where k.a = e.a` (`e(a int, b text)`, `k(a int
+      primary key, b text)`, analysed, 10 rows each) as `Hash Join
+      (cost=1.23..2.36 rows=10 width=44)` over scans of `width=10`.
+      EXPLAIN VERBOSE's `Output:` lists (`k.ctid, e.ctid`) wait on RP-966.
       Measured on a private 15.19 cluster (found while working RP-432).
-      Verify: tests/backlog/test_rp_dml_from.py::test_explain_join_widths
+      Verify: tests/backlog/test_rp_dml_from.py::test_explain_join_width_of_a_computed_set_value
       Backlog-ID: RP-435
 - [ ] **A hash join of two tables never analysed is unpriced, and its
       sides stay in written order.** `hash_side` prices a side only from
