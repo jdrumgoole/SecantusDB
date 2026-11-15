@@ -224,6 +224,26 @@ def test_cursor_to_xml_in_from_reads_the_cursor_once(dsn: str) -> None:
     ]
 
 
+@pytest.mark.backlog_fixed("RP-901")
+def test_a_refcursor_parameter_can_be_moved_and_closed(dsn: str) -> None:
+    """MOVE, a FETCH with a direction, and CLOSE over a `refcursor`
+    parameter read the caller's cursor, as on PostgreSQL 15.19."""
+    n = uuid.uuid4().hex[:8]
+    assert _steps(
+        dsn,
+        [
+            f"create function rp901_mv_{n}(c refcursor) returns int language plpgsql as "
+            "$$ declare r int; begin move forward 1 in c; fetch next from c into r; "
+            "close c; return r; end $$",
+            "begin",
+            "declare c cursor for select k from (values (7), (8), (9)) s(k)",
+            f"select rp901_mv_{n}('c')",
+            "select count(*) from pg_cursors where name = 'c'",
+            "rollback",
+        ],
+    ) == ["CREATE FUNCTION", "BEGIN", "DECLARE CURSOR", [(8,)], [(0,)], "ROLLBACK"]
+
+
 @pytest.mark.backlog_fixed("RP-896")
 def test_a_cursor_over_a_union_computes_its_rows_as_they_are_fetched(dsn: str) -> None:
     """PostgreSQL 15.19 runs a cursor's Append as it is fetched: `fetch 1`
@@ -772,11 +792,11 @@ def test_pg_cursors_statement_is_the_declare_text(dsn: str) -> None:
     ) == ["BEGIN", "DECLARE CURSOR", [("declare  c   cursor for select 1 -- x",)], "ROLLBACK"]
 
 
-@pytest.mark.backlog("RP-901")
+@pytest.mark.backlog_fixed("RP-901")
 def test_a_refcursor_parameter_can_be_fetched(dsn: str) -> None:
     """PostgreSQL 15.19 creates a PL/pgSQL function that FETCHes from its
-    `refcursor` parameter, and the call reads the caller's cursor. Here the
-    CREATE FUNCTION is refused, 42601 `variable "c" must be of type cursor
+    `refcursor` parameter, and the call reads the caller's cursor. The
+    CREATE FUNCTION was refused, 42601 `variable "c" must be of type cursor
     or refcursor`."""
     n = uuid.uuid4().hex[:8]
     assert _steps(

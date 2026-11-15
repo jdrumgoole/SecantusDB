@@ -3390,15 +3390,6 @@ still computed whole, and the cursor answers that differ either way.
       Found while working RP-897 (2026-11-14).
       Verify: tests/backlog/test_rp_found_rp744.py::test_a_cursors_where_filters_as_it_is_fetched
       Backlog-ID: RP-961
-- [ ] **A PL/pgSQL FETCH from a `refcursor` parameter is refused at CREATE
-      FUNCTION.** `create function f(c refcursor) returns int language
-      plpgsql as $$ declare r int; begin fetch c into r; return r; end $$`
-      is 42601 `variable "c" must be of type cursor or refcursor`:
-      libpg_query types a parameter as `unknown`, and only an OPEN of one
-      is rerouted (`open_cursor::cursor_param_rewrite`). PostgreSQL 15.19
-      creates it, and the call reads the caller's cursor.
-      Verify: tests/backlog/test_rp_found_rp744.py::test_a_refcursor_parameter_can_be_fetched
-      Backlog-ID: RP-901
 
 ## Found while working RP-898 (2026-11-14)
 
