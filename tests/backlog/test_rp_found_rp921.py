@@ -34,13 +34,14 @@ def _partitioned(pg: Any, p: str) -> None:
     pg.execute(f"CREATE TABLE {p}_1a PARTITION OF {p}_1 FOR VALUES FROM (0) TO (50)")
 
 
-@pytest.mark.backlog("RP-930")
+@pytest.mark.backlog_fixed("RP-930")
 def test_a_partitions_copy_of_a_named_index_is_named_by_its_columns(pg: Any) -> None:
-    """PostgreSQL names a partition's copy of a partitioned table's index
+    """PostgreSQL named a partition's copy of a partitioned table's index
     afresh (`ChooseRelationName` over the key columns, `DefineIndex`), never
     from the parent index's name: `p_1_a_b_idx` for the user's `p_ab`, and
     `p_1_c_idx` for `p_c`. `secantusd-pg` took the parent's name minus the
-    parent table's prefix, answering `p_1_ab` and `p_1_c` (2026-11-13)."""
+    parent table's prefix, answering `p_1_ab` and `p_1_c` (2026-11-13), until
+    RP-930 named the copy as `ChooseIndexName` does."""
     _partitioned(pg, "rp921n")
     names = [
         r[0]

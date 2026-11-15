@@ -13475,18 +13475,40 @@ impl PgHandler {
     /// `child`, named as PostgreSQL names it: the parent's suffix on the
     /// partition's name (`m_lo_pkey`), or `<partition>_<columns>_idx` for an
     /// index the user named.
+    /// A partition's copy of an ancestor's index, named afresh as
+    /// PostgreSQL's `DefineIndex` names it (`ChooseIndexName`): the
+    /// partition's name, the key and INCLUDE columns (`expr` for an
+    /// expression), and `pkey` / `excl` / `key` / `idx` -- never from the
+    /// parent index's own name (RP-930).
     fn partition_index(ix: &IndexRelation, child: &Arc<TableDef>) -> IndexRelation {
-        let name = match ix.name.strip_prefix(&format!("{}_", ix.table.name)) {
-            Some(rest) => format!("{}_{rest}", child.name),
-            None => {
-                let cols: Vec<&str> = ix
-                    .keys
-                    .iter()
-                    .filter_map(|k| child.columns.get((*k as usize).wrapping_sub(1)))
-                    .map(|c| c.name.as_str())
-                    .collect();
-                format!("{}_{}_idx", child.name, cols.join("_"))
-            }
+        let constraint = ix
+            .table
+            .unique_constraints
+            .iter()
+            .any(|u| u.name == ix.name);
+        let name = if ix.primary {
+            format!("{}_pkey", child.name)
+        } else {
+            let cols: Vec<&str> = ix
+                .keys
+                .iter()
+                .chain(ix.include.iter())
+                .map(|k| match *k {
+                    0 => "expr",
+                    k => child
+                        .columns
+                        .get((k as usize).wrapping_sub(1))
+                        .map_or("expr", |c| c.name.as_str()),
+                })
+                .collect();
+            let label = if ix.exclusion {
+                "excl"
+            } else if constraint {
+                "key"
+            } else {
+                "idx"
+            };
+            format!("{}_{}_{label}", child.name, cols.join("_"))
         };
         IndexRelation {
             oid: Self::index_oid(&name),

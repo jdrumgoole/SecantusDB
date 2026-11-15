@@ -1203,19 +1203,6 @@ one beside it.
       Verify: tests/backlog/test_rp_catalog_latency.py::test_create_table_costs_the_same_at_800_tables_within_a_tenth
       Backlog-ID: RP-928
 
-## Found while working RP-921 (2026-11-13)
-
-- [ ] **OPEN — a partition's copy of a user-named index keeps the
-      parent's name.** `CREATE INDEX p_ab ON p (a, b)` on a partitioned
-      `p`, then `CREATE TABLE p_1 PARTITION OF p ...`: PostgreSQL 15.19
-      names the copy `p_1_a_b_idx` (`DefineIndex` picks a fresh name over
-      the key columns, `ChooseRelationName`); `secantusd-pg` answers
-      `p_1_ab`, the parent index's name with the parent table's prefix
-      swapped for the partition's (`partition_index`). The swap happens to
-      agree for the default names (`p_pkey`, `p_b_key`, `p_c_idx`).
-      Verify: tests/backlog/test_rp_found_rp921.py::test_a_partitions_copy_of_a_named_index_is_named_by_its_columns
-      Backlog-ID: RP-930
-
 ## Found while working RP-927 (2026-11-14)
 
 - [ ] **OPEN — psql's `\d` column query straight after DDL builds every
