@@ -157,13 +157,13 @@ def test_explain_join_widths(rust_pg: Any) -> None:
     ]
 
 
-@pytest.mark.backlog("RP-435")
+@pytest.mark.backlog_fixed("RP-435")
 def test_explain_join_width_of_a_computed_set_value(rust_pg: Any) -> None:
     """A SET value computed from a constant is a column of the join's target
     list, of its type's width: PostgreSQL 15.19's `set b = 'x'` join is
-    `width=44` (two `ctid`s and a `text`), each scan `width=10`. Here the
-    plan is unpriced, as any join whose select list computes an
-    expression is."""
+    `width=44` (two `ctid`s and a `text`), each scan `width=10`. The plan
+    was unpriced, as any join whose select list computed an expression
+    was."""
     got = _answers(
         rust_pg,
         _ANALYSED + ["explain update k set b = 'x' from e where k.a = e.a"],
@@ -178,6 +178,33 @@ def test_explain_join_width_of_a_computed_set_value(rust_pg: Any) -> None:
                 ("        ->  Seq Scan on e  (cost=0.00..1.10 rows=10 width=10)",),
                 ("        ->  Hash  (cost=1.10..1.10 rows=10 width=10)",),
                 ("              ->  Seq Scan on k  (cost=0.00..1.10 rows=10 width=10)",),
+            ],
+        ),
+    ]
+
+
+@pytest.mark.backlog_fixed("RP-435")
+@pytest.mark.parametrize(
+    ("sql", "width"),
+    [
+        ("explain select 'x' from k, e where k.a = e.a", 32),
+        ("explain select 'x', 1 from k join e on k.a = e.a", 36),
+    ],
+)
+def test_explain_join_of_a_constant_select_list(rust_pg: Any, sql: str, width: int) -> None:
+    """A constant in a join's select list adds its type's width to the
+    join, on a comma join and an ON join alike, as PostgreSQL 15.19 prints
+    them; each scan reads only its key."""
+    got = _answers(rust_pg, _ANALYSED + [sql])[len(_ANALYSED) :]
+    assert got == [
+        (
+            "ok",
+            [
+                (f"Hash Join  (cost=1.23..2.36 rows=10 width={width})",),
+                ("  Hash Cond: (e.a = k.a)",),
+                ("  ->  Seq Scan on e  (cost=0.00..1.10 rows=10 width=4)",),
+                ("  ->  Hash  (cost=1.10..1.10 rows=10 width=4)",),
+                ("        ->  Seq Scan on k  (cost=0.00..1.10 rows=10 width=4)",),
             ],
         ),
     ]
