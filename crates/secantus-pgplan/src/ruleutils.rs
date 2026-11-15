@@ -268,6 +268,36 @@ fn numeric_meet(a: &str, b: &str) -> Option<(&'static str, bool)> {
     })
 }
 
+/// The cast an operand of type `t` takes to an operator over `meet`
+/// ([`numeric_meet`]): none when it is that type, and none for a `real`
+/// meeting `double precision`, which the cross-type operators
+/// (`float48eq`, `float48pl`, ...) take as it is (RP-917).
+fn float_side<'m>(t: &str, meet: &'m str) -> &'m str {
+    if t == meet || (t == "float4" && meet == "float8") {
+        ""
+    } else {
+        meet
+    }
+}
+
+/// A `double precision` as `float8out` prints it: the shortest digits that
+/// read back exactly, in exponent form (`1e+20`, `1e-05`) below 1e-4 and
+/// from 1e15 (`DBL_DIG`).
+fn float8_text(v: f64) -> String {
+    if v == 0.0 || !v.is_finite() {
+        return format!("{v}");
+    }
+    let sci = format!("{v:e}");
+    let (mant, exp) = sci.split_once('e').unwrap_or((&sci, "0"));
+    let exp: i32 = exp.parse().unwrap_or(0);
+    if (-4..15).contains(&exp) {
+        format!("{v}")
+    } else {
+        let sign = if exp < 0 { '-' } else { '+' };
+        format!("{mant}e{sign}{:02}", exp.abs())
+    }
+}
+
 /// A function's known signature: `(argument type every argument coerces to,
 /// result)`; `None` result means the first argument's type.
 fn function_sig(name: &str) -> Option<(Option<&'static str>, Option<&'static str>)> {
@@ -881,9 +911,11 @@ impl<'a> Printer<'a> {
                     let res = if w(l) >= w(r) { l } else { r };
                     return Some((String::new(), String::new(), res.to_string()));
                 }
-                let lt = if l == meet { "" } else { meet };
-                let rt = if r == meet { "" } else { meet };
-                return Some((lt.into(), rt.into(), meet.into()));
+                return Some((
+                    float_side(l, meet).into(),
+                    float_side(r, meet).into(),
+                    meet.into(),
+                ));
             }
             // date +/- integer is a date; date - date an integer.
             return match (l, r, op) {
@@ -980,9 +1012,7 @@ impl<'a> Printer<'a> {
             if !cast || (is_int(l) && is_int(r)) {
                 return Some((String::new(), String::new()));
             }
-            let lt = if l == meet { "" } else { meet };
-            let rt = if r == meet { "" } else { meet };
-            return Some((lt.into(), rt.into()));
+            return Some((float_side(l, meet).into(), float_side(r, meet).into()));
         }
         if is_stringish(l) && is_stringish(r) {
             // `text = name` and `name = text` are operators of their own
@@ -1037,6 +1067,22 @@ impl<'a> Printer<'a> {
                             self.buf.push_str(&format!("'{}'::oid", i.ival));
                             return Some(());
                         }
+                    }
+                }
+                // A constant coerced to its operator's type is folded by
+                // `eval_const_expressions` into a constant of that type
+                // (RP-407), as a cast written on it is (RP-370).
+                if self.fold_consts {
+                    if let Some(text) = folded_numeric_cast(n, want) {
+                        match want {
+                            "int4" => self.const_number(&text, want),
+                            _ => self.buf.push_str(&format!(
+                                "{}::{}",
+                                crate::scalar::quote_literal(&text),
+                                display_type(want)
+                            )),
+                        }
+                        return Some(());
                     }
                 }
                 if self.pretty {
@@ -4773,15 +4819,18 @@ fn qual_permutation(
         if !crate::joins::priced_by_operator_count(n) {
             return None;
         }
+        let cost = (crate::joins::qual_operators(n) + column_coercions(text, types) as f64) * OP;
         if let Some(N::AExpr(e)) = n.node.as_ref() {
             if e.kind == AExprKind::AexprOp as i32 && crate::operator_name(e).ok()? == "=" {
-                return None;
+                // An expression equal to a constant joins an equivalence
+                // class of its own, keyed by the expression.
+                if !literal(e.rexpr.as_deref()) {
+                    return None;
+                }
+                return Some((cost, Some(format!("{:?}", e.lexpr))));
             }
         }
-        Some((
-            (crate::joins::qual_operators(n) + column_coercions(text, types) as f64) * OP,
-            None,
-        ))
+        Some((cost, None))
     };
     // (cost, the column of an equivalence class it joins).
     let classify = |n: &Node, text: &str| -> Option<(f64, Option<String>)> {
@@ -5420,6 +5469,14 @@ fn folded_numeric_cast(arg: &Node, target: &str) -> Option<String> {
     let Some(N::AConst(c)) = arg.node.as_ref() else {
         return None;
     };
+    if target == "float8" {
+        let v: f64 = match c.val.as_ref()? {
+            Val::Ival(i) => i.ival.into(),
+            Val::Fval(f) => f.fval.parse().ok()?,
+            _ => return None,
+        };
+        return Some(float8_text(v));
+    }
     let v: i128 = match c.val.as_ref()? {
         Val::Ival(i) => i.ival.into(),
         Val::Fval(f) => f.fval.parse().ok()?,
@@ -5430,6 +5487,8 @@ fn folded_numeric_cast(arg: &Node, target: &str) -> Option<String> {
         "int4" => i32::try_from(v).is_ok(),
         "int8" => i64::try_from(v).is_ok(),
         "numeric" | "text" => true,
+        // Printed as the integer while below `FLT_DIG`'s exponent.
+        "float4" => v.unsigned_abs() < 1_000_000,
         _ => false,
     };
     fits.then(|| v.to_string())

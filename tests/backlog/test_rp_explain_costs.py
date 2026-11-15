@@ -2086,6 +2086,36 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "  Filter: (r <> f)",
         ],
     ),
+    # A real meeting a double precision, a numeric or an integer is taken
+    # as it is by the cross-type float48 operators; the other side is cast
+    # (measured on PostgreSQL 15.19, RP-917).
+    "a real compared with a numeric constant": (
+        "RP-917",
+        ["create table fr (r real, f float8, i int, n numeric)"],
+        "explain (costs off) select * from fr where r < 1.5",
+        [
+            "Seq Scan on fr",
+            "  Filter: (r < '1.5'::double precision)",
+        ],
+    ),
+    "a real plus an integer": (
+        "RP-917",
+        ["create table fr (r real, f float8, i int, n numeric)"],
+        "explain (costs off) select * from fr where r + i > 1",
+        [
+            "Seq Scan on fr",
+            "  Filter: ((r + (i)::double precision) > '1'::double precision)",
+        ],
+    ),
+    "a real times a double compared with a numeric": (
+        "RP-917",
+        ["create table fr (r real, f float8, i int, n numeric)"],
+        "explain (costs off) select * from fr where r * f > n",
+        [
+            "Seq Scan on fr",
+            "  Filter: ((r * f) > (n)::double precision)",
+        ],
+    ),
     # Split from RP-354 and fixed: an ON conjunct over the preserved side
     # that is a pattern match is one operator of the Join Filter, its
     # selectivity `patternsel` over the column's statistics; before, the
@@ -4995,6 +5025,28 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
     # a typed literal (`eval_const_expressions`) before the Filter is
     # printed; here the coercion prints unfolded (found while working
     # RP-405).
+    # A constant coerced to double precision is folded in float8out's
+    # form (measured on PostgreSQL 15.19, RP-407).
+    "a constant coerced to double precision is folded": (
+        "RP-407",
+        ["create table fr (r real, f float8, i int, n numeric)"],
+        "explain (costs off) select * from fr where f > 0.00001 and r > 1e20",
+        [
+            "Seq Scan on fr",
+            "  Filter: ((f > '1e-05'::double precision) AND (r > '1e+20'::double precision))",
+        ],
+    ),
+    # An expression equal to a constant is an equivalence class's, placed
+    # after the other quals.
+    "a coerced column equal to a folded constant": (
+        "RP-407",
+        _ANALYSED,
+        "explain (costs off) select * from e where a::numeric = 4 and b <> 'v'",
+        [
+            "Seq Scan on e",
+            "  Filter: ((b <> 'v'::text) AND ((a)::numeric = '4'::numeric))",
+        ],
+    ),
     "a scan filter's coerced constant is folded": (
         "RP-407",
         _ANALYSED,
@@ -5571,6 +5623,8 @@ def _marked(name: str, item: str) -> Any:
         "RP-924",
         "RP-925",
         "RP-406",
+        "RP-407",
+        "RP-917",
     )
     mark = pytest.mark.backlog_fixed if fixed else pytest.mark.backlog
     return pytest.param(name, marks=mark(item), id=name)

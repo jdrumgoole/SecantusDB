@@ -1785,17 +1785,6 @@ a regression test.
       cluster (found while working RP-354).
       Verify: tests/backlog/test_rp_explain_costs.py::test_plan[nested loop left join with an on restriction of its nullable side]
       Backlog-ID: RP-918
-- [ ] **A comparison of real and double precision prints a cast
-      PostgreSQL does not make.** `real <> double precision` is the
-      cross-type operator `float48ne` (and `<`, `=`, ... likewise), which
-      takes both operands as they are; the plan here coerces the real
-      side first: PostgreSQL 15.19 prints `explain (costs off) select *
-      from fr where r <> f` (`r real`, `f float8`) with `Filter: (r <>
-      f)`, here `Filter: ((r)::double precision <> f)`. The values
-      compared are the same. Measured on a private 15.19 cluster (found
-      while working RP-354).
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[comparison of real and double precision]
-      Backlog-ID: RP-917
 - [ ] **EXPLAIN ANALYZE of a nested loop into an index on an expression
       of the outer row prints no actual rows.** Its estimate is right, but
       the actual-row count of a parameterized inner scan is only worked
@@ -2040,16 +2029,6 @@ a regression test.
       working RP-354).
       Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a like with an escape clause is a folded pattern]
       Backlog-ID: RP-915
-- [ ] **A constant coerced to its operator's type prints unfolded.**
-      PostgreSQL 15.19 folds the coercion of an integer literal compared
-      with a numeric before it prints the qual
-      (`eval_const_expressions`): `select * from e where a::numeric > 4`
-      is `Filter: ((a)::numeric > '4'::numeric)`; here `((a)::numeric >
-      (4)::numeric)`, alone or as a join's scan. A cast written on the
-      constant is folded already (RP-370). Measured on a private 15.19
-      cluster (found while working RP-405).
-      Backlog-ID: RP-407
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a scan filter's coerced constant is folded]
 - [ ] **A table whose only index is a composite one prices no scan of
       both its columns.** `create table t2 (a int, b int, c text)`, 5,000
       rows, `create index t2_ab on t2 (a, b)`, analysed: PostgreSQL 15.19
