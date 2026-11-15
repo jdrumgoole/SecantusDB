@@ -50,12 +50,14 @@ YX = [("y", 1), ("x", 1)]
 XY = [("x", 1), ("y", 1)]
 
 
-@pytest.mark.backlog("RM-569")
+@pytest.mark.backlog_fixed("RM-569")
 def test_covered_fields_come_back_in_the_key_patterns_order(rust_mongo: Any, mongod: Any) -> None:
     """mongod 8.2.11 builds a covered row from the index key, so its fields
     come in the key pattern's order: `{_id: 0, x: 1, y: 1}` over `{y: 1,
     x: 1}` returns `{y: .., x: ..}`, from one scan or an `$or` of them.
-    This server returns them in the document's order, `{x: .., y: ..}`."""
+    This server returned them in the document's order, `{x: .., y: ..}`,
+    until a row a covered plan answers from a key took the key pattern's
+    order (2026-11-15)."""
     commands = {
         "one scan": {"find": "c", "filter": {"y": 0}, "projection": {"_id": 0, "x": 1, "y": 1}},
         "or": {
@@ -73,12 +75,13 @@ def test_covered_fields_come_back_in_the_key_patterns_order(rust_mongo: Any, mon
     assert answers["rust"] == answers["mongod"]
 
 
-@pytest.mark.backlog("RM-570")
+@pytest.mark.backlog_fixed("RM-570")
 def test_a_computed_projection_reads_index_keys(rust_mongo: Any, mongod: Any) -> None:
     """mongod 8.2.11 answers `{_id: 0, x: 1, k: {$add: ["$x", 1]}}` from the
     keys of `{y: 1, x: 1}`, everything it reads being in the index
-    (`PROJECTION_DEFAULT <- IXSCAN`). This server fetches each document
-    (`PROJECTION_DEFAULT <- FETCH <- IXSCAN`)."""
+    (`PROJECTION_DEFAULT <- IXSCAN`). This server fetched each document
+    (`PROJECTION_DEFAULT <- FETCH <- IXSCAN`): `covers` refused a projection
+    with an expression until RM-570's fix."""
     command = {
         "find": "c",
         "filter": {"y": 0},
@@ -89,6 +92,36 @@ def test_a_computed_projection_reads_index_keys(rust_mongo: Any, mongod: Any) ->
         for server, client in (("mongod", mongod), ("rust", rust_mongo))
     }
     assert answers["mongod"] == ["PROJECTION_DEFAULT", "IXSCAN"]
+    assert answers["rust"] == answers["mongod"]
+
+
+@pytest.mark.backlog_fixed("RM-570")
+def test_a_computed_projection_from_index_keys_returns_mongods_rows(
+    rust_mongo: Any, mongod: Any
+) -> None:
+    """The keys answer a computed projection with mongod 8.2.11's rows, from
+    one scan or an `$or` of them, a field-path string included; one reading
+    a field the index lacks (`z`) or `$$ROOT` still fetches."""
+    projections = [
+        {"_id": 0, "x": 1, "k": {"$add": ["$x", 1]}},
+        {"_id": 0, "k": "$x", "j": {"$multiply": ["$x", "$y"]}},
+        {"_id": 0, "k": {"$add": ["$x", "$z"]}},
+        {"_id": 0, "k": {"$size": {"$objectToArray": "$$ROOT"}}},
+    ]
+    filters = [{"y": 0}, {"$or": [{"y": 0}, {"y": 1, "x": {"$gt": 3}}]}]
+    answers = {
+        server: [
+            (
+                _rows(client, {"find": "c", "filter": f, "projection": p}, YX),
+                _chain(_plan(client, {"find": "c", "filter": f, "projection": p}, YX)),
+            )
+            for f in filters
+            for p in projections
+        ]
+        for server, client in (("mongod", mongod), ("rust", rust_mongo))
+    }
+    assert answers["mongod"][0][1] == ["PROJECTION_DEFAULT", "IXSCAN"]
+    assert "FETCH" in answers["mongod"][2][1]
     assert answers["rust"] == answers["mongod"]
 
 
@@ -152,28 +185,43 @@ def test_an_or_of_two_indexes_returns_its_branches_in_order(rust_mongo: Any, mon
     assert answers["rust"] == answers["mongod"]
 
 
-@pytest.mark.backlog("RM-573")
+@pytest.mark.backlog_fixed("RM-573")
 def test_an_id_projection_is_covered(rust_mongo: Any, mongod: Any) -> None:
     """mongod 8.2.11 answers `{_id: 1}` from an index that holds `_id`:
-    `PROJECTION_COVERED <- IXSCAN` over `{y: 1, _id: 1}`. This server
-    fetches each document (`PROJECTION_SIMPLE <- FETCH <- IXSCAN`)."""
+    `PROJECTION_COVERED <- IXSCAN` over `{y: 1, _id: 1}`, and
+    `PROJECTION_DEFAULT <- OR` over that index and `_id_`. This server
+    fetched each document (`PROJECTION_SIMPLE <- FETCH <- IXSCAN`) until
+    `covers` stopped refusing a projection of `_id` alone (2026-11-15)."""
     command = {"find": "c", "filter": {"y": 0}, "projection": {"_id": 1}}
+    or_command = {
+        "find": "c",
+        "filter": {"$or": [{"y": 0}, {"_id": {"$gt": 9}}]},
+        "projection": {"_id": 1},
+    }
+    yid = [("y", 1), ("_id", 1)]
     answers = {
-        server: _chain(_plan(client, command, [("y", 1), ("_id", 1)]))
+        server: (
+            _chain(_plan(client, command, yid)),
+            _chain(_plan(client, or_command, yid)),
+            _rows(client, command, yid),
+            sorted(_rows(client, or_command, yid)),
+        )
         for server, client in (("mongod", mongod), ("rust", rust_mongo))
     }
-    assert answers["mongod"] == ["PROJECTION_COVERED", "IXSCAN"]
+    assert answers["mongod"][0] == ["PROJECTION_COVERED", "IXSCAN"]
+    assert answers["mongod"][1][:3] == ["SUBPLAN", "PROJECTION_DEFAULT", "OR"]
     assert answers["rust"] == answers["mongod"]
 
 
-@pytest.mark.backlog("RM-574")
+@pytest.mark.backlog_fixed("RM-574")
 def test_a_clause_beside_an_or_is_answered_by_its_bounds(rust_mongo: Any, mongod: Any) -> None:
     """mongod 8.2.11 pushes `x: {$lt: 10}` beside `{$or: [{y: 0}, {y: 1,
     x: {$gt: 3}}]}` into each branch's bounds over `{y: 1, x: 1}` and
     rechecks nothing, so `{_id: 0, x: 1}` is answered from the keys
-    (`PROJECTION_DEFAULT <- OR <- IXSCAN`). This server's bounds are the
-    same, but it rechecks the clause in a FETCH (`PROJECTION_SIMPLE <-
-    FETCH <- OR`)."""
+    (`PROJECTION_DEFAULT <- OR <- IXSCAN`). This server's bounds were the
+    same, but it rechecked the clause in a FETCH (`PROJECTION_SIMPLE <-
+    FETCH <- OR`), until an outer clause every branch's bounds decide was
+    rechecked nowhere (2026-11-15)."""
     command = {
         "find": "c",
         "filter": {"$or": [{"y": 0}, {"y": 1, "x": {"$gt": 3}}], "x": {"$lt": 10}},

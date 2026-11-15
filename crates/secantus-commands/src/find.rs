@@ -1403,7 +1403,11 @@ fn shape_streamed(
     batch: crate::explain::stream::Batch,
 ) -> Result<Vec<Vec<u8>>, CommandError> {
     let crate::explain::stream::Batch {
-        docs, rids, keys, ..
+        docs,
+        rids,
+        keys,
+        covered,
+        ..
     } = batch;
     if cursor.return_key {
         // An IDHACK reads no index entry: its key is the document's `_id`
@@ -1541,6 +1545,17 @@ fn shape_streamed(
             projected
         }
     };
+    // A row a covered plan answered from an index key is built of the key:
+    // its fields come in the key pattern's order, not the document's
+    // (mongod 8.2.11: `{_id: 0, x: 1, y: 1}` over `{y: 1, x: 1}` returns
+    // `{y, x}`, from one scan or an `$or`'s unfetched branch, RM-569).
+    if cursor.projection.is_some() {
+        for (doc, pattern) in out.iter_mut().zip(&covered) {
+            if let Some(pattern) = pattern {
+                *doc = in_key_order(std::mem::take(doc), pattern);
+            }
+        }
+    }
     if cursor.show_record_id {
         for (doc, rid) in out.iter_mut().zip(&rids) {
             doc.insert("$recordId", Bson::Int64(*rid));
@@ -2409,6 +2424,21 @@ pub(crate) fn projection_expression_error(
 /// Apply a projection spec to each result doc via `secantus_core::projection`.
 /// A `Fallback` (a projection the Rust engine can't reproduce exactly) surfaces
 /// as `BadValue` — the Rust server only ships what the Rust engine supports.
+/// `doc`'s fields in the order of `pattern`, an index's key pattern: the
+/// top-level field each key field is in, first come first, then the fields
+/// no key field names, as they were.
+fn in_key_order(mut doc: Document, pattern: &Document) -> Document {
+    let mut out = Document::new();
+    for field in pattern.keys() {
+        let top = field.split('.').next().unwrap_or(field);
+        if let Some(v) = doc.remove(top) {
+            out.insert(top, v);
+        }
+    }
+    out.extend(doc);
+    out
+}
+
 fn project_to_docs(
     docs: Vec<Vec<u8>>,
     spec: &Document,

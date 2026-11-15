@@ -698,6 +698,14 @@ These are explicit non-goals. Don't add them without a reason.
       Found 2026-11-15 (RM-568).
       Verify: tests/backlog/test_rm_found_rm568.py::test_find_keeps_a_sort_key_meta_field
       Backlog-ID: RM-703
+- [ ] **A `returnKey` read with a `sortKey` field over an index's order
+      has no SORT_KEY_GENERATOR.** mongod 8.2.11 plans `find({y: {$gte:
+      0}}, {k: {$meta: "sortKey"}}).sort({y: 1}).returnKey()` over `{y: 1,
+      x: 1}` as `RETURN_KEY <- SORT_KEY_GENERATOR <- IXSCAN`; this
+      server's explain names `RETURN_KEY <- IXSCAN`. The keys returned
+      match. Found 2026-11-15 (RM-568).
+      Verify: tests/backlog/test_rm_found_rm568b.py::test_return_key_with_a_sort_key_over_an_index_sort_explains_a_key_generator
+      Backlog-ID: RM-706
 - [ ] **A `default` sort of documents counts the documents, not its
       working-set members.** mongod 8.2.11's SORT of a read that keeps
       each member's metadata (`showRecordId`, a projection's `{$meta:
@@ -720,23 +728,6 @@ These are explicit non-goals. Don't add them without a reason.
       (RM-472).
       Verify: tests/backlog/test_rm_found_rm472.py::test_a_near_read_explains_as_geo_near_2d
       Backlog-ID: RM-578
-- [ ] **Covered fields come back in the projection's order, not the key's.**
-      mongod 8.2.11 builds a covered row from the index key, so `{_id: 0,
-      x: 1, y: 1}` over `{y: 1, x: 1}` returns `{y: .., x: ..}`, from one
-      scan (`PROJECTION_COVERED`) or an `$or` of them (`PROJECTION_DEFAULT`
-      over the OR; a fetched branch's rows keep the document's order). This
-      server returns every row in the document's order, `{x: .., y: ..}`:
-      a field order a client sees. Found 2026-11-12 (RM-471).
-      Verify: tests/backlog/test_rm_found_rm471.py::test_covered_fields_come_back_in_the_key_patterns_order
-      Backlog-ID: RM-569
-- [ ] **A computed projection over index keys fetches.** mongod 8.2.11
-      answers `{_id: 0, x: 1, k: {$add: ["$x", 1]}}` from the keys of
-      `{y: 1, x: 1}` (`PROJECTION_DEFAULT <- IXSCAN`; over an `$or`, no
-      FETCH either): every field it reads is in the index. This server
-      fetches (`PROJECTION_DEFAULT <- FETCH <- IXSCAN`); `covers` refuses a
-      projection with an expression. Found 2026-11-12 (RM-471).
-      Verify: tests/backlog/test_rm_found_rm471.py::test_a_computed_projection_reads_index_keys
-      Backlog-ID: RM-570
 - [ ] **An `$or` over two indexes returns its branches out of order.**
       mongod 8.2.11 reads `{$or: [{y: 0}, {x: {$gt: 8}}]}` over `{y: 1,
       x: 1}` and `{x: 1}` branch by branch as its plan lists them,
@@ -747,24 +738,6 @@ These are explicit non-goals. Don't add them without a reason.
       ties keep the read order. Found 2026-11-12 (RM-471).
       Verify: tests/backlog/test_rm_found_rm471.py::test_an_or_of_two_indexes_returns_its_branches_in_order
       Backlog-ID: RM-572
-- [ ] **An `{_id: 1}` projection is not covered.** mongod 8.2.11 answers
-      `find({y: 0}, {_id: 1})` from `{y: 1, _id: 1}`
-      (`PROJECTION_COVERED <- IXSCAN`), and from an `$or` over `_id_` and
-      that index (`PROJECTION_DEFAULT <- OR`). This server fetches each
-      document: `covers` refuses a projection of `_id` alone. Found
-      2026-11-12 (RM-471).
-      Verify: tests/backlog/test_rm_found_rm471.py::test_an_id_projection_is_covered
-      Backlog-ID: RM-573
-- [ ] **A clause beside an `$or` is rechecked in a FETCH.** mongod 8.2.11
-      pushes `x: {$lt: 10}` beside `{$or: [{y: 0}, {y: 1, x: {$gt:
-      3}}]}` into each branch's bounds over `{y: 1, x: 1}` and rechecks
-      nothing, so `{_id: 0, x: 1}` is answered from the keys
-      (`PROJECTION_DEFAULT <- OR <- IXSCAN`). This server's bounds are the
-      same, but it rechecks the clause in a FETCH over the OR (`FETCH`
-      filter `{x: {$lt: 10}}`), so it also fetches for a covered
-      projection. Found 2026-11-12 (RM-471).
-      Verify: tests/backlog/test_rm_found_rm471.py::test_a_clause_beside_an_or_is_answered_by_its_bounds
-      Backlog-ID: RM-574
 - [ ] **A sort over an `$or` with a fetched branch sorts documents.**
       mongod 8.2.11's OR of `FETCH <- IXSCAN w_1` and `IXSCAN y_1_x_1` is
       not fetched, and every branch carries `x` (a fetched one carries every

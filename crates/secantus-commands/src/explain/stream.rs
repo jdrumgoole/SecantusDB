@@ -154,6 +154,10 @@ pub(crate) struct Batch {
     pub docs: Vec<Vec<u8>>,
     pub rids: Vec<i64>,
     pub keys: Vec<Option<Document>>,
+    /// Per document, the key pattern of the index a covered plan answered
+    /// it from: mongod builds that row of the key, in the pattern's order
+    /// (RM-569).
+    pub covered: Vec<Option<Document>>,
     /// The statement's yields (`deadline::yields`) when each document was
     /// read: a write that holds it past a later yield reads it again.
     pub yields: Vec<i64>,
@@ -221,6 +225,9 @@ struct Member {
     entry: Option<EntryKey>,
     /// Found before the last yield and not fetched since.
     stale: bool,
+    /// Returned by an index scan no FETCH reads for: a covered plan's,
+    /// answered from the index key (RM-569).
+    from_keys: bool,
 }
 
 /// One result, with what a caller may want of it.
@@ -230,6 +237,8 @@ struct Found {
     entry: Option<EntryKey>,
     /// The statement's yields when the plan returned it.
     yields: i64,
+    /// Answered from the index key (`Member::from_keys`).
+    from_keys: bool,
 }
 
 /// The plan's state between batches.
@@ -575,6 +584,7 @@ impl IndexScan {
                         parts: e.asc,
                     }),
                     stale: false,
+                    from_keys: false,
                 }));
             };
             let contiguous = match &self.limits {
@@ -737,6 +747,7 @@ impl CollScan {
                     doc: Some(blob),
                     entry: None,
                     stale: false,
+                    from_keys: false,
                 }));
             }
         }
@@ -1296,6 +1307,7 @@ impl Stage {
                     doc: Some(blob),
                     entry: None,
                     stale: false,
+                    from_keys: false,
                 }))
             }
             Stage::Coll(_) | Stage::Ix(_) | Stage::Merge(_) => {
@@ -1332,6 +1344,7 @@ impl Stage {
                             doc: Some(blob),
                             entry: None,
                             stale: false,
+                            from_keys: false,
                         });
                     }
                 };
@@ -1406,6 +1419,7 @@ impl Stage {
                             }
                         }
                         member.doc = Some(blob);
+                        member.from_keys = !*counted;
                         return Ok(Some(member));
                     }
                     let Some(mut m) = input.next(cx)? else {
@@ -1418,6 +1432,9 @@ impl Stage {
                         return Ok(None);
                     };
                     if m.doc.is_none() {
+                        // The FETCH a covered plan has here reads what
+                        // mongod answers from the key (RM-569).
+                        m.from_keys = !*counted;
                         let Some(blob) = cx.read(m.rid)? else {
                             continue;
                         };
@@ -2601,6 +2618,7 @@ impl Stream {
                     rid: m.rid,
                     entry: m.entry,
                     yields: secantus_core::deadline::yields(),
+                    from_keys: m.from_keys,
                 });
             }
             Ok(())
@@ -2784,6 +2802,7 @@ impl Stream {
             docs: Vec::with_capacity(out.len()),
             rids: Vec::with_capacity(out.len()),
             keys: Vec::with_capacity(out.len()),
+            covered: Vec::with_capacity(out.len()),
             yields: Vec::with_capacity(out.len()),
             exhausted,
             keys_examined: self.keys,
@@ -2797,6 +2816,13 @@ impl Stream {
             batch.docs.push(found.doc);
             batch.rids.push(found.rid);
             batch.keys.push(key);
+            batch.covered.push(
+                found
+                    .entry
+                    .as_ref()
+                    .filter(|_| found.from_keys)
+                    .map(|e| e.meta.key.clone()),
+            );
             batch.yields.push(found.yields);
         }
         Ok(batch)
