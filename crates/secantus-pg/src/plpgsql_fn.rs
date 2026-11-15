@@ -1572,9 +1572,67 @@ fn input_error_literal(sql: &str, err: &PlError) -> Option<String> {
     if !err.sqlstate.starts_with("22") {
         return None;
     }
+    if err
+        .message
+        .starts_with("invalid input syntax for type json")
+    {
+        return json_input_error_literal(sql, err);
+    }
     let (_, v) = err.message.strip_suffix('"')?.rsplit_once(": \"")?;
     let lit = format!("'{}'", v.replace('\'', "''"));
     sql.contains(&lit).then_some(lit)
+}
+
+/// The json message quotes no value: the input is only in the CONTEXT
+/// line `JSON data, line N: <excerpt>` (`report_json_context`), whose
+/// excerpt is a run of one line of the input, `...`-prefixed when cut.
+/// The literal is the one string constant in `sql` holding it.
+fn json_input_error_literal(sql: &str, err: &PlError) -> Option<String> {
+    let ctx = err.context.as_deref()?.lines().next()?;
+    let rest = ctx.strip_prefix("JSON data, line ")?;
+    let (_, excerpt) = rest.split_once(": ")?;
+    let excerpt = excerpt.strip_prefix("...").unwrap_or(excerpt);
+    let excerpt = excerpt.strip_suffix("...").unwrap_or(excerpt);
+    let mut found: Option<String> = None;
+    for lit in string_literals(sql) {
+        let body = lit[1..lit.len() - 1].replace("''", "'");
+        if body.contains(excerpt) {
+            if found.as_ref().is_some_and(|f| *f != lit) {
+                return None;
+            }
+            found = Some(lit);
+        }
+    }
+    found
+}
+
+/// Every `'...'` constant in `sql`, quotes included, `''` kept escaped.
+fn string_literals(sql: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let b = sql.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'\'' {
+            let start = i;
+            i += 1;
+            loop {
+                if i >= b.len() {
+                    return out;
+                }
+                if b[i] == b'\'' {
+                    if i + 1 < b.len() && b[i + 1] == b'\'' {
+                        i += 2;
+                        continue;
+                    }
+                    break;
+                }
+                i += 1;
+            }
+            out.push(sql[start..=i].to_string());
+        }
+        i += 1;
+    }
+    out
 }
 
 fn expr_frame(

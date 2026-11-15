@@ -289,8 +289,11 @@ def test_literal_input_error_in_an_assignment_carries_its_query(
     assert _answer_at(dsn, query) == ("22P02", *expected)
 
 
-@pytest.mark.backlog("RP-753")
+@pytest.mark.backlog_fixed("RP-753")
 def test_json_literal_input_error_in_an_assignment_carries_its_query(dsn: str) -> None:
+    """A json literal's input error in an assignment carried no internal
+    query: its message quotes no value, so the literal is now found from
+    the `JSON data` CONTEXT excerpt."""
     query = "do $$ declare x jsonb; begin x := 'zz'; end $$"
     assert _answer_at(dsn, query) == (
         "22P02",

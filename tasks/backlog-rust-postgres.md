@@ -2481,22 +2481,6 @@ dv687, c char(3))`, `d687` an `int` with `check (value > 0)` and `dv687` a
       Backlog-ID: RP-690
       Verify: none -- seen once, under load; a timing that does not fail on demand
 
-## Found while working RP-712 (2026-11-10)
-
-Measured on PostgreSQL 15.19 (port 5415) with statements that create
-nothing. The gap tests are in `tests/backlog/test_rp_found_rp712.py`.
-
-- [ ] **An assignment's `json` / `jsonb` literal input error carries no
-      internal query.** `declare x jsonb; begin x := 'zz';` carries `x :=
-      'zz'` as its internal query (position 6) and CONTEXT `JSON data, line
-      1: zz` then the `at assignment` line on PostgreSQL 15.19; here a
-      `PL/pgSQL assignment "x := 'zz'"` frame sits between them and no
-      query is sent. A literal is recognised by the value its message
-      quotes (`input_error_literal` in `plpgsql_fn.rs`), and the json
-      message quotes none -- the same cause as RP-952 at the top level. The
-      integer case (RP-753's first half) is fixed.
-      Verify: tests/backlog/test_rp_found_rp712.py::test_json_literal_input_error_in_an_assignment_carries_its_query
-      Backlog-ID: RP-753
 
 ## Found while working RP-750 (2026-11-14)
 
