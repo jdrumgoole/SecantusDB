@@ -125,7 +125,7 @@ def test_uncorrelated_ordered_row_any(query: str, dsn: str) -> None:
 
 # `make_row_comparison_op` resolves each pair's operator as the statement
 # is analysed: `c = k`, text against integer, is 42883 at the row's
-# operator, even when no row is ever compared. Here it is 0A000 `comparing
+# operator, even when no row is ever compared. It was 0A000 `comparing
 # string with int32 using = is not supported yet` with no position, and no
 # error at all over no rows.
 ROW_PAIR_WITH_NO_OPERATOR = {
@@ -147,7 +147,7 @@ ROW_PAIR_WITH_NO_OPERATOR = {
 }
 
 
-@pytest.mark.backlog("RP-728")
+@pytest.mark.backlog_fixed("RP-728")
 @pytest.mark.parametrize("query", list(ROW_PAIR_WITH_NO_OPERATOR))
 def test_row_pair_with_no_operator_is_42883(query: str, dsn: str) -> None:
     assert answer(dsn, query) == ROW_PAIR_WITH_NO_OPERATOR[query]

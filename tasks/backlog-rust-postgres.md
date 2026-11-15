@@ -3267,17 +3267,6 @@ Measured on a private PostgreSQL 15.19 cluster with the `_SETUP` in
 `tests/backlog/test_rp_found_rp697.py`: `rn697(k int, a int, c text)` and
 `ch697(k int, c char(3), v varchar(4))`.
 
-- [ ] **A row compared with a subquery whose column has no operator with
-      the row's field is not 42883.** `(a, c) = (select 1, 2)`, `c` text,
-      is 42883 `operator does not exist: text = integer` at 18 on
-      PostgreSQL 15.19 (`make_row_comparison_op` resolves each pair's
-      operator as the statement is analysed), and so is a correlated `in`
-      -- even over no rows (`... where false`). Here each is 0A000
-      `comparing string with int32 using = is not supported yet` with no
-      position, raised only when a row is compared, and nothing at all
-      over no rows.
-      Verify: tests/backlog/test_rp_found_rp697.py::test_row_pair_with_no_operator_is_42883
-      Backlog-ID: RP-728
 
 ## Found while working RP-726 (2026-11-09)
 

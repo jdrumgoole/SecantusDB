@@ -1345,7 +1345,11 @@ fn check_aexpr(e: &pg_query::protobuf::AExpr, scope: &Scope) -> Result<()> {
             let row_compare = kind == Some(K::AexprOp)
                 && matches!(l.node.as_ref(), Some(N::RowExpr(_)))
                 && matches!(r.node.as_ref(), Some(N::SubLink(_)));
-            if !row_compare {
+            if row_compare {
+                if let Some(N::SubLink(sl)) = r.node.as_ref() {
+                    row_sublink_pairs(&op, l, sl.subselect.as_deref(), e.location, scope)?;
+                }
+            } else {
                 if kind != Some(K::AexprNullif) {
                     let distinct = kind != Some(K::AexprOp);
                     row_pair_arity(l, r, distinct, e.location, &[l, r], scope)?;
@@ -2202,6 +2206,19 @@ fn walk(n: &pg_query::protobuf::Node, scope: &Scope, cx: &Cx) -> Result<()> {
             if let Some(N::SelectStmt(sel)) = sl.subselect.as_deref().and_then(|n| n.node.as_ref())
             {
                 check_select(sel, &cx.ctes, cx.lookup, Some(scope))?;
+            }
+            if matches!(
+                pg_query::protobuf::SubLinkType::try_from(sl.sub_link_type),
+                Ok(pg_query::protobuf::SubLinkType::AnySublink
+                    | pg_query::protobuf::SubLinkType::AllSublink)
+            ) {
+                if let Some(t) = sl.testexpr.as_deref() {
+                    let op = match sl.oper_name.last().and_then(|n| n.node.as_ref()) {
+                        Some(N::String(s)) => s.sval.clone(),
+                        _ => "=".to_string(),
+                    };
+                    row_sublink_pairs(&op, t, sl.subselect.as_deref(), sl.location, scope)?;
+                }
             }
         }
         // `__alias_check(name, expr, args...)` (`builtin_alias`): an
@@ -3206,9 +3223,18 @@ fn first_output_type(
     sub: &pg_query::protobuf::SelectStmt,
     scope: &Scope,
 ) -> Option<Option<String>> {
+    nth_output_type(sub, 0, scope)
+}
+
+/// `first_output_type` for the subquery's `n`th output column.
+fn nth_output_type(
+    sub: &pg_query::protobuf::SelectStmt,
+    n: usize,
+    scope: &Scope,
+) -> Option<Option<String>> {
     if sub.op != pg_query::protobuf::SetOperation::SetopNone as i32 {
-        let left = first_output_type(sub.larg.as_deref()?, scope)?;
-        let right = first_output_type(sub.rarg.as_deref()?, scope)?;
+        let left = nth_output_type(sub.larg.as_deref()?, n, scope)?;
+        let right = nth_output_type(sub.rarg.as_deref()?, n, scope)?;
         return match (left, right) {
             (None, t) | (t, None) => Some(t),
             (Some(l), Some(r)) => (l == r).then_some(Some(l)),
@@ -3217,7 +3243,7 @@ fn first_output_type(
     if sub.with_clause.is_some() || !sub.values_lists.is_empty() {
         return None;
     }
-    let Some(N::ResTarget(rt)) = sub.target_list.first()?.node.as_ref() else {
+    let Some(N::ResTarget(rt)) = sub.target_list.get(n)?.node.as_ref() else {
         return None;
     };
     let val = rt.val.as_deref()?;
@@ -3685,6 +3711,39 @@ fn boolean_test_argument(
     Err(Error::DatatypeMismatch(format!(
         "argument of {test} must be type boolean, not type {ty}"
     )))
+}
+
+/// `ROW(...) op (SELECT ...)` and `ROW(...) op ANY (SELECT ...)`:
+/// `make_row_comparison_op` resolves each pair's operator, the row's field
+/// against the subquery's column, as the statement is analysed -- so a pair
+/// with no operator is 42883 even when no row is ever compared (RP-728).
+fn row_sublink_pairs(
+    op: &str,
+    row: &pg_query::protobuf::Node,
+    sub: Option<&pg_query::protobuf::Node>,
+    location: i32,
+    scope: &Scope,
+) -> Result<()> {
+    let Some(N::RowExpr(r)) = row.node.as_ref() else {
+        return Ok(());
+    };
+    let Some(N::SelectStmt(sel)) = sub.and_then(|n| n.node.as_ref()) else {
+        return Ok(());
+    };
+    if r.args.len() < 2 || sel.target_list.len() != r.args.len() {
+        return Ok(());
+    }
+    let op = if op == "!=" { "<>" } else { op };
+    for (i, a) in r.args.iter().enumerate() {
+        let (Some(l), Some(Some(t))) = (operand_type(a, scope), nth_output_type(sel, i, scope))
+        else {
+            continue;
+        };
+        if crate::funcsig::operator_resolves(op, &l, &t) == Some(false) {
+            return Err(mismatch(op, &l, &t, location));
+        }
+    }
+    Ok(())
 }
 
 /// `x IN (SELECT y ...)` / `x op ANY (SELECT y ...)`: the operator between
