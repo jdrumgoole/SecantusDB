@@ -39,13 +39,14 @@ def _seed_documents(db: Any) -> None:
     db.c.create_index([("y", 1), ("x", 1)])
 
 
-@pytest.mark.backlog("RM-577")
+@pytest.mark.backlog_fixed("RM-577")
 def test_a_default_sort_of_documents_counts_its_members(rust_mongo: Any, mongod: Any) -> None:
     """mongod 8.2.11's `default` SORT of a `showRecordId` read counts each
     working-set member it sorts (`totalDataSizeSorted`): 1122 for six
     documents over a COLLSCAN, 374 for two under a `limit`, 2244 for twelve
     over a FETCH. Without `showRecordId` the same read sorts `simple` and
-    counts 402. This server counts the documents, 402, both ways."""
+    counts 402. This server counted the documents, 402, both ways, until it
+    held each as its RID_AND_OBJ member (RM-577)."""
     commands = {
         "collscan": {"find": "c", "filter": {"z": 0}, "sort": {"z": 1}, "showRecordId": True},
         "limit": {
@@ -83,10 +84,10 @@ def _seed_points(db: Any) -> None:
     db.c.create_index([("loc", "2d")])
 
 
-@pytest.mark.backlog("RM-578")
+@pytest.mark.backlog_fixed("RM-578")
 def test_a_near_read_explains_as_geo_near_2d(rust_mongo: Any, mongod: Any) -> None:
     """mongod 8.2.11 plans a `$near` read over a `2d` index as `GEO_NEAR_2D`
-    (`SORT <- GEO_NEAR_2D` under a `sort`). This server's `explain` names a
+    (`SORT <- GEO_NEAR_2D` under a `sort`). This server's `explain` named a
     COLLSCAN."""
     commands = {
         "near": {"find": "c", "filter": {"loc": {"$near": [0, 0]}}},

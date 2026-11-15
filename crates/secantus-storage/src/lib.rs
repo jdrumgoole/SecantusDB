@@ -21722,10 +21722,18 @@ impl Storage {
             }
             out.push((e, paths));
         }
+        // `listIndexes`' order, which is mongod's catalog order: `_id_`
+        // first, then build order, then name. The planner sorts an `$or`'s
+        // branches by it, so name order read them out of order (RM-572).
         out.sort_by(|a, b| {
-            a.0.get_str("name")
-                .unwrap_or("")
-                .cmp(b.0.get_str("name").unwrap_or(""))
+            let key = |d: &Document| {
+                (
+                    d.get_str("name") != Ok(ID_INDEX_NAME),
+                    build_seq(d),
+                    d.get_str("name").unwrap_or("").to_string(),
+                )
+            };
+            key(&a.0).cmp(&key(&b.0))
         });
         Ok(out)
     }
@@ -27912,6 +27920,43 @@ mod tests {
     /// rebuilt when the store opens (RM-080), and its entries are then in
     /// mongod's order: walking `{s: -1}` meets `"ab"` before `"a"`, as
     /// mongod 8.2.11's walk does.
+    /// The planner's catalog comes in `listIndexes`' build order, mongod's
+    /// catalog order, not by name: the planner sorts an `$or`'s branches by
+    /// it, and `y_1_x_1` built before `x_1_y_1` is read first (RM-572).
+    #[test]
+    fn planner_indexes_come_in_build_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let st = Storage::open(dir.path().to_str().unwrap()).unwrap();
+        st.insert(
+            "app",
+            "c",
+            vec![encode_doc(&doc! {"_id": 1, "x": 1, "y": 1}).unwrap()],
+            true,
+        )
+        .unwrap();
+        for (name, key) in [
+            ("y_1_x_1", doc! {"y": 1, "x": 1}),
+            ("x_1_y_1", doc! {"x": 1, "y": 1}),
+        ] {
+            st.create_index("app", "c", name, &key, &Document::new())
+                .unwrap();
+        }
+        let planner: Vec<String> = st
+            .planner_indexes("app", "c")
+            .unwrap()
+            .iter()
+            .map(|(d, _)| d.get_str("name").unwrap().to_string())
+            .collect();
+        let listed: Vec<String> = st
+            .list_indexes("app", "c")
+            .unwrap()
+            .iter()
+            .map(|d| d.get_str("name").unwrap().to_string())
+            .collect();
+        assert_eq!(planner, ["_id_", "y_1_x_1", "x_1_y_1"]);
+        assert_eq!(planner, listed);
+    }
+
     #[test]
     fn open_rebuilds_an_entry_format_5_index() {
         let dir = tempfile::tempdir().unwrap();

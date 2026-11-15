@@ -1598,6 +1598,20 @@ pub fn global_read() -> Result<(), crate::CommandError> {
     Ok(())
 }
 
+/// Return the running statement's execution ticket for good, keeping its
+/// locks: mongod's `aggregate` lets its collection lock go once its
+/// pipeline is built, so each buffer its cursor stage fills takes the
+/// global IS and a ticket of its own (`DocumentSourceCursor::loadBatch`,
+/// RM-579) rather than riding the command's.
+pub fn let_statement_ticket_go() {
+    let held = CURRENT
+        .with(|c| c.borrow().clone())
+        .zip(STATEMENT_OWNER.with(std::cell::Cell::get));
+    if let Some((lm, owner)) = held {
+        lm.drop_ticket(owner);
+    }
+}
+
 /// The running statement's lock manager, if one is wired.
 pub fn current() -> Option<std::sync::Arc<LockManager>> {
     CURRENT.with(|c| c.borrow().clone())

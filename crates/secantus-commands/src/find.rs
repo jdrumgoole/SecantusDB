@@ -1775,6 +1775,15 @@ fn stream_find(
         validate_empty_result(asked.filter, asked.let_vars, asked.collation)?;
     }
     let has_sort_stage = cursor.stream.has_sort_stage();
+    // The plan this read ran, as its profile entry, log line and `getMore`s
+    // name it: the trial's winner where there was one (RM-576).
+    let (db_name, coll_name) = asked.ns.split_once('.').unwrap_or((asked.ns, ""));
+    let summary = crate::explain::summary::summary_of_plan(
+        &cursor.plan,
+        storage.as_ref(),
+        db_name,
+        coll_name,
+    );
     let exec_stages = ctx
         .profiling
         .is_some()
@@ -1783,7 +1792,7 @@ fn stream_find(
     let cursor_id = if batch.exhausted || asked.single_batch {
         0
     } else {
-        cursor.summary = crate::explain::summary::plan_summary(doc, ctx);
+        cursor.summary = summary.clone();
         ctx.cursors()?
             .register_stream(asked.ns, Box::new(cursor))
             .map_err(|e| CommandError::new(1, "InternalError", format!("cursor registry: {e:?}")))?
@@ -1793,7 +1802,7 @@ fn stream_find(
         docs_examined: batch.docs_examined,
         cursor_id,
         exhausted: batch.exhausted,
-        plan_summary: None,
+        plan_summary: summary,
         originating_command: None,
         write_concern: false,
         has_sort_stage,

@@ -904,6 +904,20 @@ impl<'a> Run<'a> {
                 }
                 None
             }
+            // The documents the search returns, in storage order: the
+            // search's own rings and their counts are not modelled here.
+            Node::GeoNear { clause, .. } => {
+                let clause = Some(clause.clone());
+                while self.pos < env.docs.len() {
+                    let row = self.pos;
+                    self.pos += 1;
+                    self.docs += 1;
+                    if env.key_matches(row, &clause) {
+                        return Some(row);
+                    }
+                }
+                None
+            }
             Node::IxScan(_) => {
                 let scan = self.scan.as_mut()?;
                 let row = scan.next(env);
@@ -1000,6 +1014,7 @@ impl<'a> Run<'a> {
                 limit,
                 pattern,
                 input,
+                keeps_metadata,
                 ..
             } => {
                 if self.buffer.is_none() {
@@ -1008,7 +1023,16 @@ impl<'a> Run<'a> {
                         all.push(row);
                     }
                     let keys = key_members(pattern, &all, env, |r| self.inputs[0].found(r));
-                    sort_stats(&mut self.extra, pattern, *limit, input, &all, keys, env);
+                    sort_stats(
+                        &mut self.extra,
+                        pattern,
+                        *limit,
+                        input,
+                        &all,
+                        keys,
+                        *keeps_metadata,
+                        env,
+                    );
                     if let Some(n) = limit {
                         all.truncate(*n as usize);
                     }
@@ -1259,7 +1283,10 @@ pub(crate) struct KeyMember {
 /// A `SORT`'s memory and spill counters (RM-315): the rows it sorts, run
 /// through the sorter its budget holds, as mongod's executes it. `keys`:
 /// a SORT of index keys' members, counted as its sorter counts them
-/// (RM-476), not the documents behind them.
+/// (RM-476), not the documents behind them. `keeps_metadata`: a `default`
+/// sort of documents, which holds each as the working-set member it was
+/// read in (RM-577).
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn sort_stats(
     extra: &mut Document,
     pattern: &Document,
@@ -1267,6 +1294,7 @@ pub(crate) fn sort_stats(
     input: &Node,
     rows: &[usize],
     keys: Option<Vec<KeyMember>>,
+    keeps_metadata: bool,
     env: &Env,
 ) {
     if !crate::explain::order::plain_sort(pattern) {
@@ -1340,6 +1368,27 @@ pub(crate) fn sort_stats(
                 members,
                 &descending,
                 budget,
+                top.filter(|&k| k > 0),
+            )
+        });
+        if ran.is_ok() {
+            sort_extra(extra, &report);
+        }
+        return;
+    }
+    if keeps_metadata && !matches!(input, Node::Projection { .. }) {
+        // A `default` sort of the documents read: RID_AND_OBJ members, each
+        // row's place standing for its RecordId, as `key_members`' do.
+        let docs = rows
+            .iter()
+            .map(|&r| (env.docs[r].clone(), r as i64 + 1))
+            .collect();
+        let (ran, report) = secantus_core::memlimit::captured(|| {
+            let _disk = secantus_core::memlimit::allow_disk_use(true);
+            secantus_core::sorter::sort_rid_objs(
+                docs,
+                pattern,
+                secantus_core::memlimit::budgets().sort,
                 top.filter(|&k| k > 0),
             )
         });

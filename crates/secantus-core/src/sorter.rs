@@ -1109,6 +1109,48 @@ pub fn sort_owned_objs(
     sort_members(items, &sizes, descending, budget, limit)
 }
 
+/// What a member's RecordId adds to what it counts
+/// (`WorkingSetMember::getMemUsage`): mongod 8.2.11 counts 32 bytes more
+/// for each document of a `default` sort than for the same document
+/// `PROJECTION_COVERED` built, whatever the document (RM-577).
+const RECORD_ID: usize = 32;
+
+/// What a document read at a RecordId counts beside its sort key, as a
+/// `RID_AND_OBJ` working-set member.
+pub fn rid_obj_size(doc: &Document) -> usize {
+    owned_obj_size(doc) + RECORD_ID
+}
+
+/// mongod 8.2's `default` SORT over documents a FETCH or a COLLSCAN read
+/// (`showRecordId`, or a projection reading a `$meta` the simple sort
+/// would drop: RM-472), run for what it counts: each `RID_AND_OBJ`
+/// working-set member its sort key and [`rid_obj_size`], held to `budget`
+/// and spilled, past it with disk use, as `WorkingSetMember::serialize`
+/// writes the member (RM-577). `docs`: each document with the RecordId it
+/// was read at, in the order they came; `spec` a plain sort pattern. As
+/// [`sort_index_keys`], the caller orders the documents itself.
+pub fn sort_rid_objs(
+    docs: Vec<(Document, i64)>,
+    spec: &Document,
+    budget: usize,
+    limit: Option<usize>,
+) -> R<()> {
+    let sort = crate::aggregate::sort_fields(&Bson::Document(spec.clone()))?;
+    let descending: Vec<bool> = sort.iter().map(|(_, rev)| *rev).collect();
+    let mut sizes = Vec::with_capacity(docs.len());
+    let mut items = Vec::with_capacity(docs.len());
+    for (doc, rid) in docs {
+        let key = crate::aggregate::sort_key_values(&doc, &sort)?;
+        sizes.push(rid_obj_size(&doc));
+        let mut bytes = Vec::new();
+        spill_file::write_rid_and_obj_member(&doc, SNAPSHOT_ID, rid, &mut bytes).map_err(|e| {
+            Fallback::mongo(1, format!("the sort could not {}: {}", e.what, e.detail))
+        })?;
+        items.push((key, member_doc(bytes)));
+    }
+    sort_members(items, &sizes, &descending, budget, limit)
+}
+
 /// Run working-set members, each held as [`member_doc`] and counting its
 /// size in `sizes` beside its key, through a query-layer sorter.
 fn sort_members(
@@ -1253,6 +1295,20 @@ fn meta_sort_fields(spec: &Bson) -> R<(Vec<(String, bool)>, Vec<(usize, MetaKey)
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// RM-577: a `default` sort of documents counts each RID_AND_OBJ
+    /// member, 173 bytes for `{_id: 1, z: 1}` under an int sort key
+    /// (mongod 8.2.11), and spills it 19 bytes over the document alone.
+    #[test]
+    fn a_default_sort_of_documents_counts_its_members() {
+        let d = doc! { "_id": 1, "z": 1 };
+        assert_eq!(key_size(&[Bson::Int32(1)]) + rid_obj_size(&d), 173);
+        let mut member = Vec::new();
+        spill_file::write_rid_and_obj_member(&d, 0, 7, &mut member).unwrap();
+        let mut alone = Vec::new();
+        spill_file::write_document(&d, &mut alone).unwrap();
+        assert_eq!(member.len(), alone.len() + 19);
+    }
 
     /// RM-423: a `searchScore` key ties every document, leaving the order
     /// to the other keys and then to arrival; a `randVal` key alone sorts.

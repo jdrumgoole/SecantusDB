@@ -262,6 +262,7 @@ fn scans_collection(plan: &Node) -> bool {
             inputs.iter().any(scans_collection)
         }
         Node::IxScan(_)
+        | Node::GeoNear { .. }
         | Node::Eof(_)
         | Node::Express { .. }
         | Node::IdHack(_)

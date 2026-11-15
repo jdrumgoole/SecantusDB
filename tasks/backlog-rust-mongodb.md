@@ -566,19 +566,6 @@ These are explicit non-goals. Don't add them without a reason.
       **Decided (Joe, 2026-11-08): build mongod's execution admission control in full, the faithful option: the ingress controller, then the read and write ticket pools with `throughputProbing` (replacing `admission.rs`'s opt-in write tickets), then the per-command admission counts, so the concurrency cap is on by default as on mongod. Several PRs, in that order.** The ingress controller landed 2026-11-08, the ticket pools 2026-11-09, and the per-command admission counts on the line 2026-11-09; what is left is above.
       Backlog-ID: RM-355
       Verify: tests/backlog/test_rm_355_364.py::test_ending_a_transaction_takes_mongods_execution_tickets
-- [ ] **An aggregate through its cursor stage counts too few execution
-      admissions.** mongod 8.2.11 lets an aggregate's locks go once its
-      pipeline is built, so each buffer its cursor stage fills takes the
-      global IS and an execution ticket of its own: an `$addFields` over
-      300 documents read 50 at a time is `Global: {r: 3}` and 4 execution
-      admissions on the `aggregate` line (the build, two buffers, the
-      storage statistics). Since RM-360 this server takes the global IS for
-      each buffer too, and its line has mongod's `locks`, but it holds the
-      statement's own locks to the end of the command, so the buffers' IS
-      ride its ticket and the line says 2. Its `getMore`s, which take no
-      lock of their own, count mongod's. Found 2026-11-12 (RM-360).
-      Verify: tests/backlog/test_rm_found_2026_11_12_rm360.py::test_each_cursor_stage_buffer_takes_an_execution_ticket
-      Backlog-ID: RM-579
 - [ ] **Some writes' `locks` are not mongod's.** Since 2026-11-07 a write
       counts mongod's flow control tickets (one per global IX taken apart)
       and a retryable write's session checkout and session row, and a
@@ -706,57 +693,16 @@ These are explicit non-goals. Don't add them without a reason.
       match. Found 2026-11-15 (RM-568).
       Verify: tests/backlog/test_rm_found_rm568b.py::test_return_key_with_a_sort_key_over_an_index_sort_explains_a_key_generator
       Backlog-ID: RM-706
-- [ ] **A `default` sort of documents counts the documents, not its
-      working-set members.** mongod 8.2.11's SORT of a read that keeps
-      each member's metadata (`showRecordId`, a projection's `{$meta:
-      "recordId"}`; `type: "default"` since RM-472) counts each member it
-      sorts: 1122 bytes `totalDataSizeSorted` for the six documents of
-      `find({z: 0}).sort({z: 1}).showRecordId()` (374 for two under a
-      `limit` of 2, 2244 for twelve over a FETCH), where the same read
-      without `showRecordId` sorts `simple` and counts 402. This server
-      counts 402 both ways: it sorts the documents as its `simple` sort
-      does. A SORT over a covered projection counts its members since
-      RM-473 (`sorter::sort_owned_objs`), the model this needs for a
-      member that holds a fetched document. Found 2026-11-12 (RM-472).
-      Verify: tests/backlog/test_rm_found_rm472.py::test_a_default_sort_of_documents_counts_its_members
-      Backlog-ID: RM-577
-- [ ] **A `$near` read over a `2d` index explains as a COLLSCAN.** mongod
-      8.2.11 plans `find({loc: {$near: [0, 0]}})` over a `{loc: "2d"}`
-      index as `GEO_NEAR_2D` (`SORT <- GEO_NEAR_2D` under a `sort`); this
-      server's `explain` names a `COLLSCAN` for the same read. The
-      documents come back in mongod's order either way. Found 2026-11-12
-      (RM-472).
-      Verify: tests/backlog/test_rm_found_rm472.py::test_a_near_read_explains_as_geo_near_2d
-      Backlog-ID: RM-578
-- [ ] **An `$or` over two indexes returns its branches out of order.**
-      mongod 8.2.11 reads `{$or: [{y: 0}, {x: {$gt: 8}}]}` over `{y: 1,
-      x: 1}` and `{x: 1}` branch by branch as its plan lists them,
-      `y_1_x_1` first: `_id` 0, 3, 6, 9, then 10, 11. This server's explain
-      lists the same order, but it returns the `x_1` branch first (9, 10,
-      11, 0, 3, 6). Sorted on `y` with `limit: 2` it then returns different
-      rows (`x` 9 and 0, where mongod returns 0 and 3), since the sort's
-      ties keep the read order. Found 2026-11-12 (RM-471).
-      Verify: tests/backlog/test_rm_found_rm471.py::test_an_or_of_two_indexes_returns_its_branches_in_order
-      Backlog-ID: RM-572
-- [ ] **A sort over an `$or` with a fetched branch sorts documents.**
-      mongod 8.2.11's OR of `FETCH <- IXSCAN w_1` and `IXSCAN y_1_x_1` is
-      not fetched, and every branch carries `x` (a fetched one carries every
-      field), so `.sort({x: 1})` sorts the OR's members below a FETCH:
-      `SUBPLAN <- FETCH <- SORT (default) <- OR`; with `{_id: 0, x: 1}`,
-      `SORT <- PROJECTION_DEFAULT <- OR`, no FETCH. This server sorts
-      fetched documents above it (`SORT (simple) <- FETCH <- OR`): its
-      `keys_hold` takes only index-scan branches. Found 2026-11-12
-      (RM-471).
-      Verify: tests/backlog/test_rm_found_rm471.py::test_a_sort_over_an_or_with_a_fetched_branch_sorts_below_the_fetch
-      Backlog-ID: RM-575
-- [ ] **A rooted `$or`'s profile `planSummary` names one index twice.**
-      mongod 8.2.11's profile entry for `{$or: [{a: {$gte: 2}, b: {$gte:
-      3}}, {a: 0, b: 0}]}` over `a_1` and `b_1` says `IXSCAN { a: 1 },
-      IXSCAN { b: 1 }`, the index each branch won with. This server's
-      explain names the same two, but its profile entry says `IXSCAN { a: 1
-      }, IXSCAN { a: 1 }`. Found 2026-11-12 (RM-471).
-      Verify: tests/backlog/test_rm_found_rm471.py::test_a_rooted_ors_plan_summary_names_each_branchs_index
-      Backlog-ID: RM-576
+- [ ] **A GEO_NEAR stage's `executionStats` are not mongod's.** mongod
+      8.2.11's GEO_NEAR_2D for `find({loc: {$near: [0, 0]}})` over twelve
+      points and a `{loc: "2d"}` index reports `searchIntervals`, an
+      `inputStages` list of the rings' index scans, the stage's work
+      counts, and 52 `totalKeysExamined`; this server's stage (planned
+      since RM-578, `Node::GeoNear`) prints none of them and counts 0 keys,
+      its executionStats walking the documents in storage order
+      (`exec.rs`). Found 2026-11-15 (RM-578).
+      Verify: tests/backlog/test_rm_found_rm578.py::test_a_geo_near_stage_reports_mongods_execution_stats
+      Backlog-ID: RM-707
 - [ ] **Some lines have no `numInterruptChecks`.** Since 2026-11-08 this
       server checks for interrupt where mongod 8.2 does, and counts it
       (`secantus_core::deadline::check_for_interrupt`): at dispatch, at
