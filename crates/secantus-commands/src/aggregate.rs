@@ -731,12 +731,17 @@ pub fn aggregate(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
             ) {
                 (ns, Vec::new(), pipeline)
             } else if first_stage_has(&pipeline, "$planCacheStats") {
-                // mongod's plan cache for the collection. A `$match` right
-                // after the stage is absorbed into it.
-                let absorbed = pipeline
-                    .get(1)
-                    .and_then(Bson::as_document)
-                    .and_then(|d| d.get_document("$match").ok().filter(|_| d.len() == 1));
+                // mongod's plan cache for the collection. The stage absorbs
+                // the `$match` right after it, and in its place each later
+                // `$match` a stage swaps ahead of itself (RM-554), as
+                // `explain` lists it.
+                let taken = crate::explain::plan_cache::absorb_matches(
+                    crate::explain::shape::desugared(&pipeline[1..]),
+                );
+                let absorbed = taken
+                    .run
+                    .as_ref()
+                    .and_then(|m| m.get_document("$match").ok());
                 let port = ctx.server_address.as_ref().map_or(27017, |(_, p)| *p);
                 let host = format!("{}:{port}", crate::dbhash::host_name());
                 let matched = |entry: &Document| match absorbed {
@@ -756,8 +761,7 @@ pub fn aggregate(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
                     &host,
                     &matched,
                 )?;
-                let rest = if absorbed.is_some() { 2 } else { 1 };
-                (ns, entries, pipeline[rest.min(pipeline.len())..].to_vec())
+                (ns, entries, taken.rest)
             } else if first_stage_has(&pipeline, crate::list_catalog::STAGE) {
                 // Through a view, the entry of the collection beneath it.
                 let entries = crate::list_catalog::entries(storage, &ctx.db_name, Some(c))?;

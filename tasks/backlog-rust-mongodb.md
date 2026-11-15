@@ -655,19 +655,6 @@ These are explicit non-goals. Don't add them without a reason.
       (`hybrid.rs`). Found 2026-11-12 (RM-358).
       Verify: tests/backlog/test_rm_found_rm358.py::test_score_fusion_combines_by_avg
       Backlog-ID: RM-553
-- [ ] **A later `$match` does not replace the one `$planCacheStats` absorbed.**
-      mongod 8.2.11's `$planCacheStats` absorbs the `$match` right after
-      it, and absorbs again, in place of the first, each `$match` a later
-      stage swaps ahead of itself (`doOptimizeAt` overwrites
-      `_absorbedMatch`): `[{$planCacheStats: {}}, {$match: {isActive:
-      false}}, {$project: {isActive: 1, works: 1}}, {$match: {works: {$gte:
-      0}}}]` returns every entry, the first filter lost. This server's stage
-      (`aggregate.rs`) keeps the first `$match` and runs the second after
-      the `$project`, returning none of three active entries. `explain`
-      already lists it as mongod does (`plan_cache::absorb_matches`, RM-466),
-      which the run could share. Found 2026-11-12 (RM-466).
-      Verify: tests/backlog/test_rm_found_rm466.py::test_a_later_match_replaces_the_one_plan_cache_stats_absorbed
-      Backlog-ID: RM-554
 - [ ] **An `$or` of one index sorts documents, not index keys.** mongod
       8.2.11 answers `find({$or: [{y: 0}, {y: {$gt: 1}}]}).sort({x: 1})`
       over `{y: 1, x: 1}` with one two-interval IXSCAN whose keys it sorts

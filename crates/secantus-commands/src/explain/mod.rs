@@ -35,7 +35,7 @@ mod parsed;
 mod plan;
 pub(crate) mod plan_cache;
 mod sbe;
-mod shape;
+pub(crate) mod shape;
 pub(crate) mod stream;
 mod sub_stages;
 pub(crate) mod summary;
