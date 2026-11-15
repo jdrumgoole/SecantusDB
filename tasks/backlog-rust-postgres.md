@@ -2353,19 +2353,20 @@ Measured on a private PostgreSQL 15.19 cluster.
 
 Measured on PostgreSQL 15.19 (the data-modifying WITH on a private cluster).
 
-- [ ] **What `transformWithClause` checks of a WITH is not all checked.**
-      An unread item's literal input is not read as its type: `with w as
-      (select 'x'::int) select 1` is 22P02 at 19 on PostgreSQL 15.19, `1`
-      here (the item is planned without running, and the cast only fails
-      when evaluated). And a WITH of a subquery expression under a level
-      with FROM items has its unread items planned on their own, where that
-      level's columns are not in scope, so a name such an item does not find
-      (42703, 42P01) is let go rather than raised: `select (with w as
-      (select nosuch) select 1) from (values (1)) v(a)` answers 1 here.
-      The same planning leaves a literal in an EXISTS subquery's dropped
-      select list unread (`select exists (select (select 'x'::int))`, 22P02
-      at 31 there, `true` here).
-      Verify: tests/backlog/test_rp_fromless_analysis.py::test_with_unread_literal_input
+- [ ] **A subquery expression's unread WITH item under a FROM, and an
+      EXISTS subquery's dropped select list, are not all analysed.** A WITH
+      of a subquery expression under a level with FROM items has its unread
+      items planned on their own, where that level's columns are not in
+      scope, so a name such an item does not find (42703, 42P01) is let go
+      rather than raised: `select (with w as (select nosuch) select 1) from
+      (values (1)) v(a)` is 42703 at 27 on PostgreSQL 15.19 and answers 1
+      here. And a literal in an EXISTS subquery's dropped select list is not
+      read as its type: `select exists (select 'x'::int)` is 22P02 at 23
+      there, `select exists (select (select 'x'::int))` at 31; both answer
+      `true` here. (An unread WITH item's own literal is read, through
+      `unread_ctes::literal_input_error`; the EXISTS case wants the same
+      read of the list `simplify_EXISTS_query` later drops.)
+      Verify: tests/backlog/test_rp_fromless_analysis.py::test_with_under_from_and_exists_literal
       Backlog-ID: RP-504
 
 ## Found while working RP-486 (2026-11-07)

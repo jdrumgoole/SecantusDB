@@ -123,7 +123,18 @@ pub(crate) fn analyse_with(
         return Ok(());
     };
     for (i, (name, body, aliases)) in defs.iter().enumerate().take(last + 1) {
+        take_error_location();
         let planned = planning_without_running(|| plan_select(body, lookup, params));
+        // `transformTypeCast` reads an untyped literal through its type's
+        // input function as the cast is analysed, so an unread item's
+        // `'x'::int` is 22P02 -- before any error written after it.
+        let at = match &planned {
+            Err(_) => peek_error_location(),
+            Ok(_) => None,
+        };
+        if let Some(e) = literal_input_error(body, params, at) {
+            return Err(e);
+        }
         match planned {
             Ok(_) => {
                 if let Some(columns) = domain_scope::output_columns(body, lookup, &Vec::new()) {
@@ -158,4 +169,63 @@ pub(crate) fn analyse_with(
         }
     }
     Ok(())
+}
+
+/// The first untyped string literal under a cast in `body`, in the order
+/// written and before `before` when that is given, whose type's input
+/// function refuses it: that refusal, placed at the literal.
+fn literal_input_error(
+    body: &pg_query::protobuf::SelectStmt,
+    params: &[Bson],
+    before: Option<i32>,
+) -> Option<Error> {
+    let node = pg_query::protobuf::Node {
+        node: Some(N::SelectStmt(Box::new(body.clone()))),
+    };
+    let mut casts: Vec<(i32, pg_query::protobuf::Node)> = node
+        .node
+        .as_ref()?
+        .nodes()
+        .into_iter()
+        .filter_map(|(n, _, _, _)| match n {
+            pg_query::NodeRef::TypeCast(tc) => {
+                match tc.arg.as_deref().and_then(|a| a.node.as_ref()) {
+                    Some(N::AConst(c))
+                        if matches!(c.val, Some(pg_query::protobuf::a_const::Val::Sval(_)))
+                            && c.location >= 0 =>
+                    {
+                        Some((
+                            c.location,
+                            pg_query::protobuf::Node {
+                                node: Some(N::TypeCast(Box::new(tc.clone()))),
+                            },
+                        ))
+                    }
+                    _ => None,
+                }
+            }
+            _ => None,
+        })
+        .collect();
+    casts.sort_by_key(|(at, _)| *at);
+    for (at, cast) in casts {
+        if before.is_some_and(|b| at >= b) {
+            break;
+        }
+        take_error_location();
+        match correlated::without_side_effects(|| const_value(&cast, params)) {
+            Err(e) if e.sqlstate().starts_with("22") => {
+                take_error_location();
+                set_error_location(at);
+                return Some(e);
+            }
+            _ => {
+                take_error_location();
+            }
+        }
+    }
+    if let Some(b) = before {
+        set_error_location(b);
+    }
+    None
 }

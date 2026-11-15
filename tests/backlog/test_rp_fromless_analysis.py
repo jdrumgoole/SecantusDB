@@ -651,15 +651,45 @@ def test_with_clause_checks(query: str, rust_pg: Any) -> None:
     assert answer(rust_pg, query) == WITH_CHECKS[query]
 
 
-@pytest.mark.backlog("RP-504")
-def test_with_unread_literal_input(rust_pg: Any) -> None:
-    """An unread item's literal is not read as its type, so it runs here."""
-    assert answer(rust_pg, "with w as (select 'x'::int) select 1") == (
-        "22P02",
-        'invalid input syntax for type integer: "x"',
-        None,
+_X_INPUT = ("22P02", 'invalid input syntax for type integer: "x"', None)
+WITH_LITERAL_INPUT = {
+    "with w as (select 'x'::int) select 1": (*_X_INPUT, "19"),
+    "with w as (select 'x'::int, nosuch) select 1": (*_X_INPUT, "19"),
+    "with w as (select nosuch, 'x'::int) select 1": _missing("19"),
+    "with w as (select (select 'x'::int)) select 1": (*_X_INPUT, "27"),
+    "select (with w as (select 'x'::int) select 1)": (*_X_INPUT, "27"),
+    "with w as (select '2020-13-01'::date) select 1": (
+        "22008",
+        'date/time field value out of range: "2020-13-01"',
+        'Perhaps you need a different "datestyle" setting.',
         "19",
-    )
+    ),
+    "with w as (select '1'::int) select 1": None,
+}
+
+
+@pytest.mark.backlog_fixed("RP-504")
+@pytest.mark.parametrize("query", list(WITH_LITERAL_INPUT))
+def test_with_unread_literal_input(query: str, rust_pg: Any) -> None:
+    """An unread item's literal was not read as its type, so it ran here."""
+    assert answer(rust_pg, query) == WITH_LITERAL_INPUT[query]
+
+
+# The rest of RP-504, measured on PostgreSQL 15.19: an unread item of a
+# subquery expression's WITH under a level with FROM items, and a literal
+# in an EXISTS subquery's dropped select list.
+WITH_UNDER_FROM_AND_EXISTS = {
+    "select (with w as (select nosuch) select 1) from (values (1)) v(a)": _missing("27"),
+    "select exists (select 'x'::int)": (*_X_INPUT, "23"),
+    "select exists (select (select 'x'::int))": (*_X_INPUT, "31"),
+}
+
+
+@pytest.mark.backlog("RP-504")
+@pytest.mark.parametrize("query", list(WITH_UNDER_FROM_AND_EXISTS))
+def test_with_under_from_and_exists_literal(query: str, rust_pg: Any) -> None:
+    """Each answers a row here."""
+    assert answer(rust_pg, query) == WITH_UNDER_FROM_AND_EXISTS[query]
 
 
 # Found while working RP-501, measured on PostgreSQL 15.19: a subquery's
