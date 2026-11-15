@@ -278,6 +278,21 @@ fn slots(list: &[u32]) -> String {
 /// One stage's line, then the lines of the stages under it.
 fn stage(st: &Stage, lines: &mut Vec<String>) {
     match st {
+        Stage::IxSeek {
+            node,
+            record_id,
+            low,
+            high,
+            index,
+            uuid,
+            ..
+        } => {
+            lines.push(format!(
+                "[{node}] ixseek {} {} none s{record_id} none none [] @\"{uuid}\" @\"{index}\" true ",
+                key_string(low),
+                key_string(high)
+            ));
+        }
         Stage::Scan {
             node,
             record,
@@ -353,6 +368,13 @@ fn stage(st: &Stage, lines: &mut Vec<String>) {
     }
 }
 
+/// A seek key as `debugPrint` prints a KeyString: `KS(` and its bytes in
+/// upper-case hex.
+fn key_string(bytes: &[u8]) -> String {
+    let hex: String = bytes.iter().map(|b| format!("{b:02X}")).collect();
+    format!("KS({hex})")
+}
+
 /// `slotBasedPlan.stages`.
 pub(super) fn stages(root: &Stage) -> String {
     let mut lines = Vec::new();
@@ -363,6 +385,25 @@ pub(super) fn stages(root: &Stage) -> String {
 /// The fields `executionStats` adds for each kind of stage.
 pub(super) fn specific_stats(st: &Stage, counted: &Counted, out: &mut Document) {
     match st {
+        Stage::IxSeek {
+            record_id,
+            low,
+            high,
+            index,
+            ..
+        } => {
+            out.insert("indexName", index.clone());
+            out.insert("keysExamined", super::number(counted.keys));
+            out.insert("seeks", super::number(counted.seeks));
+            out.insert("numReads", super::number(counted.reads));
+            out.insert("recordIdSlot", super::number(*record_id as i64));
+            out.insert("outputSlots", Bson::Array(vec![]));
+            // `indexKeysToInclude`: a bitset of the key fields read into
+            // slots, none here.
+            out.insert("indexKeysToInclude", "0".repeat(32));
+            out.insert("seekKeyLow", format!("{} ", key_string(low)));
+            out.insert("seekKeyHigh", format!("{} ", key_string(high)));
+        }
         Stage::Scan {
             record,
             record_id,

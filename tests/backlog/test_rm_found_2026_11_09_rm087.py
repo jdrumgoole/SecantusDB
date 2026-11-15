@@ -52,11 +52,11 @@ def test_a_mistyped_update_statement_applies_none(rust_mongo: Any, mongod: Any) 
     assert got == ref
 
 
-@pytest.mark.backlog("RM-460")
+@pytest.mark.backlog_fixed("RM-460")
 def test_a_write_refuses_fields_mongod_does_not_know(rust_mongo: Any, mongod: Any) -> None:
     """mongod 8.2.11 answers 40415 to `originalQuery` and `originalCollation`
     on `insert`, `update` and `delete`, and to a command-level `sampleId` on
-    `update`, and writes nothing; the Rust server runs the write."""
+    `update`, and writes nothing; the Rust server ran the write."""
     sample = bson.Binary(uuid.UUID(int=5).bytes, 4)
 
     def run(client: Any) -> tuple:

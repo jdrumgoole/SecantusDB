@@ -116,7 +116,7 @@ fn facet(
 /// stages `$documents` is (`$queue`, `$project`, `$unwind`,
 /// `$replaceRoot`), which it lists with the documents' expression as parsed,
 /// not folded into one constant (measured 8.2.11). One over a collection is
-/// RM-681.
+/// explained as an aggregate of its own (`super::union`, RM-426).
 fn union_with(
     ctx: &mut CommandContext,
     options: &Document,

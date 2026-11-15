@@ -90,7 +90,7 @@ fn hidden() -> Bson {
     Bson::Array(vec![Bson::from(SCORE), Bson::from(SCORE_DETAILS)])
 }
 
-fn has_hybrid(v: &Bson) -> bool {
+pub(super) fn has_hybrid(v: &Bson) -> bool {
     match v {
         Bson::Document(d) => d
             .iter()

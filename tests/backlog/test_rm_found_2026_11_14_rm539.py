@@ -62,7 +62,7 @@ def _union_over_a_collection(client: Any) -> dict:
     }
 
 
-@pytest.mark.backlog("RM-681")
+@pytest.mark.backlog_fixed("RM-681")
 def test_a_union_with_over_a_collection_lists_its_cursor(
     rust_mongo: Any,
     mongod_rs: Any,  # noqa: F811
@@ -70,8 +70,8 @@ def test_a_union_with_over_a_collection_lists_its_cursor(
     """mongod 8.2.11 lists a `$unionWith` over a collection with its
     pipeline as it runs it: a `$cursor` holding the query's own
     `queryPlanner` (and, run, its `executionStats`), then the stages after
-    it, each with its `nReturned`. This server lists the stage as
-    written."""
+    it, each with its `nReturned`. This server listed the stage as
+    written until 2026-11-15 (fixed with RM-426)."""
     assert _union_over_a_collection(rust_mongo) == _union_over_a_collection(mongod_rs)
 
 

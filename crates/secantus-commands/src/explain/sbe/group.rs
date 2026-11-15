@@ -170,6 +170,24 @@ pub(crate) struct Front {
     pub filter: Option<Filter>,
     pub skip: i64,
     pub limit: i64,
+    /// The query is a `COUNT_SCAN` of an index rather than a collection
+    /// scan (RM-072): a group that reads no field over an index scan whose
+    /// documents need no fetch.
+    pub seek: Option<Seek>,
+}
+
+/// A `COUNT_SCAN` as `buildCountScan` builds it: an `ixseek` between two
+/// KeyStrings of a single-field index.
+pub(crate) struct Seek {
+    /// The seek keys, with their discriminators.
+    pub low: Vec<u8>,
+    pub high: Vec<u8>,
+    /// The index's (top-level) key field and its direction.
+    pub path: String,
+    pub descending: bool,
+    pub index: String,
+    /// The `COUNT_SCAN` node of `queryPlan`, less its stage and node id.
+    pub described: Document,
 }
 
 impl Front {
@@ -207,6 +225,31 @@ pub(super) fn scan(
     slots: &mut Slots,
 ) -> Option<Scanned> {
     let (skip, limit) = (front.skip.max(0), front.limit.max(0));
+    if let Some(seek) = &front.seek {
+        if front.filter.is_some() || skip > 0 || limit > 0 || !fields.is_empty() {
+            return None;
+        }
+        let record_id = slots.next();
+        let mut query_plan = doc! { "stage": "COUNT_SCAN", "planNodeId": 1 };
+        query_plan.extend(seek.described.clone());
+        return Some(Scanned {
+            root: Stage::IxSeek {
+                node: 1,
+                record_id,
+                low: seek.low.clone(),
+                high: seek.high.clone(),
+                path: seek.path.clone(),
+                descending: seek.descending,
+                index: seek.index.clone(),
+                uuid: uuid.to_string(),
+            },
+            // No record is read: nothing may ask for `$$ROOT`.
+            record: 0,
+            fields: vec![],
+            env: vec![],
+            query_plan,
+        });
+    }
     let front_nodes = front.nodes();
     let merged_skip = (skip > 0 && limit > 0).then(|| slots.next());
     let record = slots.next();
@@ -316,6 +359,9 @@ pub(super) fn build(group: &Document, uuid: &str, last: bool, front: &Front) -> 
         })
         .collect();
     let whole_document = args.iter().any(|a| matches!(a, Arg::Root));
+    if front.seek.is_some() && (whole_document || !paths.is_empty()) {
+        return None;
+    }
     let projected = !fields.is_empty() && !whole_document;
     if projected && (front.skip > 0 || front.limit > 0) {
         return None;

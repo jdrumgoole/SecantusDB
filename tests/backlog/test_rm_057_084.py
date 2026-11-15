@@ -423,9 +423,8 @@ def _sbe_filters(client: Any) -> Any:
     uuid_ = _uuid_text(db, name)
     out = []
     for pipeline in [
-        [{"$match": {"a": None}}, {"$count": "n"}],
-        [{"$match": {"a": {"$in": [1, 2]}}}, {"$count": "n"}],
-        [{"$match": {"a": {"$ne": 2}}}, {"$count": "n"}],
+        [{"$match": {"a": {"$in": [None, 1]}}}, {"$count": "n"}],
+        [{"$match": {"a": {"$in": [1, 2]}, "c": {"$exists": False}}}, {"$count": "n"}],
         [{"$match": {"a": {"$gt": 1}}}, {"$limit": 2}, {"$group": {"_id": "$b"}}],
     ]:
         ex = db.command("aggregate", name, pipeline=pipeline, explain=True)
@@ -436,11 +435,12 @@ def _sbe_filters(client: Any) -> Any:
 
 @pytest.mark.backlog("RM-071")
 def test_explain_of_a_filter_sbe_runs_beyond_comparisons(rust_mongo: Any, mongod: Any) -> None:
-    """mongod 8.2.11 runs a `$count` behind `{a: null}`, an `$in` or a `$ne`,
-    and a field-reading `$group` behind a `$limit`, in SBE: a `filter` of
-    `typeMatch`, `isMember` or `!` programs, and the dependency projection
-    among the paging. Comparisons and their `$and`s already are
-    (tests/mongod_live/test_sbe_filtered_front_explain.py)."""
+    """mongod 8.2.11 runs a `$count` behind an `$in` holding null or an
+    `$exists`, and a field-reading `$group` behind a `$limit`, in SBE: an
+    `isMember` of the null-folded value, an `exists` program, and the
+    dependency projection among the paging. Comparisons, `{a: null}`, an
+    `$in`, a `$ne` and their `$and`s already are (2026-11-14,
+    tests/mongod_live/test_sbe_filtered_front_explain.py)."""
     assert _sbe_filters(rust_mongo) == _sbe_filters(mongod)
 
 
@@ -463,27 +463,37 @@ def test_explain_of_count_on_a_view(rust_mongo: Any, mongod: Any) -> None:
     assert _view_count_explain(rust_mongo) == _view_count_explain(mongod)
 
 
-def _view_count_over_an_index(client: Any) -> Any:
+def _view_count_over_an_index(client: Any, query: dict | None) -> Any:
     db = client["rm072i"]
     name = _name()
     db[name].insert_many([{"a": i, "b": i % 3} for i in range(20)])
     db[name].create_index("a")
     db[name].create_index([("b", -1)])
     db.command("create", name + "_v", viewOn=name, pipeline=[{"$match": {"a": {"$gt": 1}}}])
-    out = []
-    for cmd in [{"count": name + "_v"}, {"count": name + "_v", "query": {"b": 2}}]:
-        ex = db.command("explain", cmd, verbosity="queryPlanner")
-        plan = ex["stages"][0]["$cursor"]["queryPlanner"]["winningPlan"]
-        out.append((ex.get("explainVersion"), plan.get("queryPlan", plan)))
-    return out
+    cmd: dict = {"count": name + "_v"}
+    if query is not None:
+        cmd["query"] = query
+    ex = db.command("explain", cmd, verbosity="queryPlanner")
+    plan = ex["stages"][0]["$cursor"]["queryPlanner"]["winningPlan"]
+    return ex.get("explainVersion"), plan.get("queryPlan", plan)
 
 
-@pytest.mark.backlog("RM-072")
+@pytest.mark.backlog_fixed("RM-072")
 def test_explain_of_count_on_a_view_over_an_index(rust_mongo: Any, mongod: Any) -> None:
     """mongod 8.2.11 explains `count` on a view whose filter an index serves
-    as a slot-based plan too: a `GROUP` over a `COUNT_SCAN` where the count
-    reads no field, over `FETCH` and `IXSCAN` where a filter is left."""
-    assert _view_count_over_an_index(rust_mongo) == _view_count_over_an_index(mongod)
+    whole as a slot-based plan: a `GROUP` over a `COUNT_SCAN`, since the
+    count reads no field. Fixed 2026-11-14 (the `ixseek` of `sbe/stage.rs`;
+    tests/mongod_live/test_sbe_count_scan_explain.py)."""
+    assert _view_count_over_an_index(rust_mongo, None) == _view_count_over_an_index(mongod, None)
+
+
+@pytest.mark.backlog("RM-695")
+def test_explain_of_count_on_a_view_fetching_from_an_index(rust_mongo: Any, mongod: Any) -> None:
+    """mongod 8.2.11 explains `count` on a view whose filter is left to a
+    `FETCH` over an `IXSCAN` as a slot-based plan too: a `GROUP` over the
+    `FETCH` and `IXSCAN`, run as an `nlj` of an `ixseek` and a `seek`."""
+    q = {"b": 2}
+    assert _view_count_over_an_index(rust_mongo, q) == _view_count_over_an_index(mongod, q)
 
 
 def _expr_false_stage(client: Any) -> Any:

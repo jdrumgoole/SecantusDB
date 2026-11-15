@@ -40,6 +40,7 @@ pub(crate) mod stream;
 mod sub_stages;
 pub(crate) mod summary;
 mod trial;
+mod union;
 
 use crate::util::{as_i64, command_error, decode_docs};
 use crate::{CommandContext, CommandError, HandlerResult, SERVER_VERSION};
@@ -930,7 +931,7 @@ fn query_planner(
     // (0 on a small collection), a fast count and a missing collection
     // included.
     out.insert("optimizationTimeMillis", 0_i32);
-    if s.optimized_pipeline {
+    if s.optimized_pipeline && !union::nested() {
         out.insert("optimizedPipeline", true);
     }
     out.insert("maxIndexedOrSolutionsReached", false);
@@ -1971,12 +1972,22 @@ fn reply_for(r: &Request, verbosity: Verbosity, ctx: &mut CommandContext) -> Han
                 }
             );
             let parsed = parsed::parsed_query(&s.filter);
-            let filter = sbe::Filter::parse(&parsed);
+            // The one plan is an index scan whose documents need no fetch:
+            // a group that reads no field counts its keys (RM-072).
+            let seek = (tried.len() <= 1 && s.skip == 0 && s.limit == 0)
+                .then(|| count_seek(&plan))
+                .flatten();
+            let filter = if seek.is_some() {
+                None
+            } else {
+                sbe::Filter::parse_find(&parsed, &s.filter)
+            };
             let on = sbe::Front {
                 parsed,
                 filter,
                 skip: s.skip,
                 limit: s.limit,
+                seek,
             };
             let filtered = s.filter.is_empty() || on.filter.is_some();
             let uuid = crate::admin::collection_uuid_text(storage, &db, &s.coll);
@@ -1984,7 +1995,7 @@ fn reply_for(r: &Request, verbosity: Verbosity, ctx: &mut CommandContext) -> Han
             front
                 .group
                 .as_ref()
-                .filter(|_| forward_scan && filtered)
+                .filter(|_| (forward_scan && filtered) || on.seek.is_some())
                 .and_then(|g| sbe::group_plan(g, &uuid, last, &on))
         } else {
             Some(sbe::eof_plan())
@@ -2040,6 +2051,7 @@ fn reply_for(r: &Request, verbosity: Verbosity, ctx: &mut CommandContext) -> Han
                 filter,
                 skip: s.skip,
                 limit: s.limit,
+                seek: None,
             };
             let filtered = s.filter.is_empty() || on.filter.is_some();
             let uuid = crate::admin::collection_uuid_text(storage, &db, &s.coll);
@@ -2096,13 +2108,13 @@ fn reply_for(r: &Request, verbosity: Verbosity, ctx: &mut CommandContext) -> Han
         if let Some((_, _, trial)) = tried.first() {
             at_least(&mut run, trial);
         }
-        if !s.rest.is_empty() {
+        if !s.rest.is_empty() || union::nested() {
             cursor_yields(&mut run, cursor_pulled);
         }
         run
     });
     let mut reply = doc! { "explainVersion": "1" };
-    if s.rest.is_empty() {
+    if s.rest.is_empty() && !union::nested() {
         reply.insert("queryPlanner", planner);
         if let Some(st) = &stats {
             reply.insert(
@@ -2151,6 +2163,72 @@ fn reply_for(r: &Request, verbosity: Verbosity, ctx: &mut CommandContext) -> Han
     }
     reply.insert("ok", 1.0);
     Ok(reply)
+}
+
+/// The `COUNT_SCAN` mongod plans in place of `plan` for a group that reads
+/// no field (`QueryPlannerAnalysis::turnIxscanIntoCount`): a `FETCH` with
+/// no filter over an `IXSCAN` with none, of one interval. Built here for
+/// a forward scan of a plain single-field index on a top-level field that
+/// is not multikey, sparse or partial and has no collation; `None` for
+/// any other plan, which stays in the classic shape.
+fn count_seek(plan: &Node) -> Option<sbe::Seek> {
+    let Node::Fetch { filter, input } = plan else {
+        return None;
+    };
+    let Node::IxScan(ix) = &**input else {
+        return None;
+    };
+    let index = &ix.index;
+    let [(field, dir)] = index.fields()[..] else {
+        return None;
+    };
+    // A count plans with `IS_COUNT`, under which an equality to null over
+    // an index that is not multikey is answered by its null keys: the
+    // fetch that tells null from missing is not needed (measured 8.2.11:
+    // `{a: null}` over `a_1` is a `COUNT_SCAN` of `[null, null]`).
+    let null_only = filter.as_ref().is_none_or(|f| {
+        f.len() == 1
+            && f.get_document(field)
+                .is_ok_and(|e| e.len() == 1 && matches!(e.get("$eq"), Some(Bson::Null)))
+    });
+    if !null_only {
+        return None;
+    }
+    if ix.filter.is_some()
+        || ix.backward
+        || ix.no_bounds
+        || !index.plain
+        || index.is_multikey()
+        || index.sparse
+        || index.partial.is_some()
+        || index.collation.is_some()
+        || field.contains('.')
+    {
+        return None;
+    }
+    let (start, start_incl, end, end_incl) = ix.single_range()?;
+    let descending = dir < 0;
+    // A seek key is the bound's KeyString with a discriminator for its
+    // `kEnd`: `kExclusiveBefore` (1) sorts ahead of every entry with that
+    // key, `kExclusiveAfter` (254) behind them.
+    let seek_key = |v: &Bson, before: bool| -> Option<Vec<u8>> {
+        let mut key = crate::key_string::encode_key(&[(v, descending)], None).ok()?;
+        key.pop();
+        key.push(if before { 1 } else { 254 });
+        Some(key)
+    };
+    let low = seek_key(start.get(field)?, start_incl)?;
+    let high = seek_key(end.get(field)?, !end_incl)?;
+    let mut described = Node::CountScan(ix.clone()).to_doc(None);
+    described.remove("stage");
+    Some(sbe::Seek {
+        low,
+        high,
+        path: field.to_string(),
+        descending,
+        index: index.name.clone(),
+        described,
+    })
 }
 
 /// What mongod runs in SBE after the query a pipeline's leading stages
@@ -2271,7 +2349,7 @@ fn sbe_reply(
 ) -> HandlerResult {
     let s = &r.shape;
     let db = ctx.db_name.clone();
-    let whole = s.rest.len() == p.pushed && p.tail.is_empty();
+    let whole = s.rest.len() == p.pushed && p.tail.is_empty() && !union::nested();
     let mut qp = Document::new();
     for (k, v) in planner {
         if k == "maxIndexedOrSolutionsReached" && whole && !r.pipeline.is_empty() {
@@ -2698,7 +2776,10 @@ fn explain_reply(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
             note_views(ctx);
             s
         }
-        "aggregate" => return aggregate(&inner, echo, inline, verbosity, ctx),
+        "aggregate" => {
+            let reply = aggregate(&inner, echo, inline, verbosity, ctx)?;
+            return Ok(union::explain_unions(reply, verbosity, ctx));
+        }
         "update" | "delete" => {
             let coll = collection(&inner, &name, &db)?;
             let s = if name == "update" {

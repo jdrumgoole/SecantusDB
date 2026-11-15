@@ -73,15 +73,15 @@ def _trailing_bound(client: Any) -> tuple:
     return stats["nReturned"], stats["totalKeysExamined"], stats["totalDocsExamined"]
 
 
-@pytest.mark.backlog("RM-447")
+@pytest.mark.backlog_fixed("RM-447")
 def test_a_distinct_scan_bounded_on_a_trailing_field_examines_mongods_keys(
     rust_mongo: Any, mongod: Any
 ) -> None:
     """mongod 8.2.11's DISTINCT_SCAN of `x_1_y_1` for `distinct("x", {x:
     {$gt: 0}, y: {$gt: 3}})` over `x = i % 4, y = i` (i 1 to 24) returns
-    three keys and examines six (eight works). This server's examines
-    three. Perhaps the same seek as RM-377's key past the bounds, once per
-    value of `x`: not confirmed in the source."""
+    three keys and examines six (seven works). This server's examined
+    three: its DISTINCT_SCAN counted a key per value it returned, never a
+    key a seek landed on that the bounds on `y` rejected."""
     got, want = _trailing_bound(rust_mongo), _trailing_bound(mongod)
     assert want == (3, 6, 0)
     assert got == want

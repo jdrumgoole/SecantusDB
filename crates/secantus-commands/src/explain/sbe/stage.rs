@@ -159,6 +159,21 @@ pub(crate) enum Stage {
         binds: Vec<(Slot, Expr)>,
         input: Box<Stage>,
     },
+    /// `SimpleIndexScanStage` (`ixseek`) over one interval of a
+    /// single-field index, as a `COUNT_SCAN` builds it: it reads no key into
+    /// a slot, only each entry's record id. `low` / `high` are the seek
+    /// KeyStrings with their discriminators; `path` and `descending` are the
+    /// index's key field, a top-level one.
+    IxSeek {
+        node: u32,
+        record_id: Slot,
+        low: Vec<u8>,
+        high: Vec<u8>,
+        path: String,
+        descending: bool,
+        index: String,
+        uuid: String,
+    },
     /// `HashAggStage`.
     Group {
         node: u32,
@@ -175,6 +190,9 @@ pub(crate) struct Counted {
     pub reads: i64,
     /// A filter's `numTested`.
     pub tested: i64,
+    /// An index scan's `keysExamined` and `seeks`.
+    pub keys: i64,
+    pub seeks: i64,
     /// The stage was asked for a row after its last one.
     pub eof: bool,
     pub input: Option<Box<Counted>>,
@@ -225,6 +243,7 @@ impl Stage {
             | Stage::Filter { node, .. }
             | Stage::LimitSkip { node, .. }
             | Stage::Project { node, .. }
+            | Stage::IxSeek { node, .. }
             | Stage::Group { node, .. } => *node,
         }
     }
@@ -264,6 +283,58 @@ impl Stage {
                         reads: n,
                         eof,
                         input: None,
+                        ..Counted::default()
+                    },
+                )
+            }
+            Stage::IxSeek {
+                record_id,
+                low,
+                high,
+                path,
+                descending,
+                ..
+            } => {
+                // The index holds one entry per document, its key the
+                // KeyString of the field's value (null when missing), in
+                // key and then record id order. The seek lands on the
+                // first entry after `low` and reads on until one is past
+                // `high` or the index ends: one read more than it returns.
+                let mut entries: Vec<(Vec<u8>, i64)> = Vec::new();
+                for (i, d) in docs.iter().enumerate() {
+                    let v = d.get(path).cloned().unwrap_or(Bson::Null);
+                    let Ok(key) = crate::key_string::encode_key(&[(&v, *descending)], None) else {
+                        continue;
+                    };
+                    entries.push((key, i as i64 + 1));
+                }
+                entries.sort();
+                let found: Vec<i64> = entries
+                    .into_iter()
+                    .filter(|(k, _)| {
+                        k.as_slice() > low.as_slice() && k.as_slice() < high.as_slice()
+                    })
+                    .map(|(_, id)| id)
+                    .collect();
+                let take = demand.map_or(found.len(), |d| d.min(found.len()));
+                let eof = demand.is_none_or(|d| found.len() < d);
+                let rows: Vec<Row> = found[..take]
+                    .iter()
+                    .map(|id| {
+                        let mut row = Row::new();
+                        row.insert(*record_id, Some(Bson::Int64(*id)));
+                        row
+                    })
+                    .collect();
+                let n = rows.len() as i64;
+                (
+                    rows,
+                    Counted {
+                        returned: n,
+                        reads: n + i64::from(eof),
+                        keys: n,
+                        seeks: 1,
+                        eof,
                         ..Counted::default()
                     },
                 )
@@ -412,6 +483,7 @@ impl Stage {
     pub fn name(&self) -> &'static str {
         match self {
             Stage::Scan { .. } => "scan",
+            Stage::IxSeek { .. } => "ixseek",
             Stage::Filter { .. } => "filter",
             Stage::LimitSkip { skip: None, .. } => "limit",
             Stage::LimitSkip { .. } => "limitskip",
@@ -422,7 +494,7 @@ impl Stage {
 
     pub fn input(&self) -> Option<&Stage> {
         match self {
-            Stage::Scan { .. } => None,
+            Stage::Scan { .. } | Stage::IxSeek { .. } => None,
             Stage::Filter { input, .. }
             | Stage::LimitSkip { input, .. }
             | Stage::Project { input, .. }

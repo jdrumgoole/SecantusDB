@@ -967,7 +967,8 @@ pub(crate) fn listed_stage(stage: &Document, db: &str) -> Vec<Document> {
         }
         // A `$unionWith` whose pipeline makes its own documents lists the
         // stages it runs, `$documents` as the four it is (measured 8.2.11,
-        // RM-539). One over a collection lists its `$cursor` (RM-681).
+        // RM-539). One over a collection is explained as an aggregate of its own
+        // after the listing (`union::explain_unions`, RM-426).
         ("$unionWith", Bson::Document(spec))
             if !spec.contains_key("coll")
                 && spec

@@ -15,14 +15,21 @@
 //!
 //! Built here: `$eq`, `$lt`, `$lte`, `$gt` and `$gte` of a number (not NaN),
 //! a string or a boolean, on a path of named fields, and `$and`s of those;
-//! for a `find` (`Filter::parse_find`), also an `$in` of such values but
+//! given the command's filter (`Filter::parse_find`), also an `$in` of such values but
 //! null: `isMember` against an `InList` the plan's environment binds, its
-//! values in the command's own order (the `parsedQuery` sorts them).
+//! values in the command's own order (the `parsedQuery` sorts them). An
+//! `$eq: null` on a one-field path (`typeMatch` folding undefined and
+//! Nothing to null) and the `$not: {$eq: c}` a `$ne` canonicalises to
+//! (`!(traverseF(...))`) are built too (RM-071).
 //! Anything else returns `None` and the pipeline is explained classically.
 
 use super::expr::{BinOp, Expr, Slot};
 use bson::{Bson, Document};
 use std::collections::BTreeSet;
+
+/// `getBSONTypeMask(Undefined)`: the mask `typeMatch` folds to null in an
+/// `$eq: null`.
+const UNDEFINED_MASK: u32 = 1024;
 
 /// What a leaf tests its path's values with.
 #[derive(Clone, Debug)]
@@ -30,6 +37,9 @@ enum Test {
     Compare(BinOp, Bson),
     /// `$in`: the values as the command gave them.
     In(Vec<Bson>),
+    /// `$eq: null`: null, undefined or missing (`generateComparison`'s
+    /// null case, `typeMatch` of undefined folding it to null).
+    Null,
 }
 
 /// One comparison of the filter.
@@ -37,6 +47,9 @@ enum Test {
 struct Leaf {
     path: Vec<String>,
     test: Test,
+    /// Under a `$not` (a `$ne` canonicalises to `$not: {$eq}`): the
+    /// traversal's answer negated, `!(traverseF(...))`.
+    negated: bool,
 }
 
 /// A filter, ready to be given its slots.
@@ -82,8 +95,32 @@ fn leaf(clause: &Document, raw: Option<&Document>) -> Option<Leaf> {
     let Bson::Document(cond) = cond else {
         return None;
     };
-    let (name, value) = cond.iter().next().filter(|_| cond.len() == 1)?;
+    let (mut name, mut value) = cond.iter().next().filter(|_| cond.len() == 1)?;
+    let mut negated = false;
+    if name == "$not" {
+        // Only the `$not: {$eq: c}` a `$ne` becomes (measured 2026-11-14).
+        let Bson::Document(inner) = value else {
+            return None;
+        };
+        let (n, v) = inner.iter().next().filter(|_| inner.len() == 1)?;
+        if n != "$eq" {
+            return None;
+        }
+        (name, value, negated) = (n, v, true);
+    }
+    if name == "$eq" && matches!(value, Bson::Null) {
+        // Measured on a one-field path only: a dotted path's null test
+        // reads the levels above it as well.
+        return (parts.len() == 1).then_some(Leaf {
+            path: parts,
+            test: Test::Null,
+            negated,
+        });
+    }
     if name == "$in" {
+        if negated {
+            return None;
+        }
         let values = raw_in(raw?, path)?;
         let printable = values
             .iter()
@@ -91,12 +128,14 @@ fn leaf(clause: &Document, raw: Option<&Document>) -> Option<Leaf> {
         return printable.then_some(Leaf {
             path: parts,
             test: Test::In(values),
+            negated,
         });
     }
     let op = op_of(name)?;
     comparable(value).then(|| Leaf {
         path: parts,
         test: Test::Compare(op, value.clone()),
+        negated,
     })
 }
 
@@ -124,7 +163,8 @@ fn raw_in(raw: &Document, path: &str) -> Option<Vec<Bson>> {
 
 impl Filter {
     /// The filter of `parsed` (a `parsedQuery`); `None` when it is empty or
-    /// outside what is built here.
+    /// outside what is built here; the tests' form, without an `$in`.
+    #[cfg(test)]
     pub fn parse(parsed: &Document) -> Option<Filter> {
         Self::parse_with(parsed, None)
     }
@@ -176,6 +216,31 @@ impl Filter {
                     let list = Expr::InList(slots(), values.clone());
                     Box::new(move |v| Expr::func("isMember", vec![v, list.clone()]))
                 }
+                // `((if (typeMatch(l, 1024) ?: true) then null else
+                // move(l) == null) ?: false)`: Nothing and undefined read
+                // as null.
+                Test::Null => Box::new(|v| {
+                    let Expr::Local { frame, .. } = v else {
+                        unreachable!("a traversal's lambda reads its local")
+                    };
+                    let read = Expr::Local {
+                        frame,
+                        moved: false,
+                    };
+                    let nullish = Expr::fill_empty(
+                        Expr::TypeMatch(Box::new(read), UNDEFINED_MASK),
+                        Expr::Const(Some(Bson::Boolean(true))),
+                    );
+                    let folded = Expr::If(
+                        Box::new(nullish),
+                        Box::new(Expr::Const(Some(Bson::Null))),
+                        Box::new(v),
+                    );
+                    Expr::fill_empty(
+                        Expr::bin(BinOp::Eq, folded, Expr::Const(Some(Bson::Null))),
+                        Expr::Const(Some(Bson::Boolean(false))),
+                    )
+                }),
                 Test::Compare(op, value) => {
                     let (op, value) = (*op, value.clone());
                     Box::new(move |v| {
@@ -186,7 +251,8 @@ impl Filter {
                     })
                 }
             };
-            built.push(traverse(top, l, &*test, 0, &mut frame));
+            let t = traverse(top, l, &*test, 0, &mut frame);
+            built.push(if l.negated { Expr::Not(Box::new(t)) } else { t });
         }
         let mut out = built.pop()?;
         while let Some(prev) = built.pop() {
@@ -277,6 +343,21 @@ mod tests {
             text(doc! { "t": { "$eq": true } }, &[("t", 3)]),
             "traverseF(s3, lambda(l2.0) { ((move(l2.0) == true) ?: false) }, false)"
         );
+        // RM-071, measured 2026-11-14.
+        assert_eq!(
+            text(doc! { "a": { "$not": { "$eq": 2 } } }, &[("a", 3)]),
+            "!(traverseF(s3, lambda(l2.0) { ((move(l2.0) == 2) ?: false) }, false))"
+        );
+        assert_eq!(
+            text(doc! { "a": { "$not": { "$eq": null } } }, &[("a", 3)]),
+            "!(traverseF(s3, lambda(l2.0) { ((\n    if (typeMatch(l2.0, 1024) ?: true) \n    \
+             then null \n    else move(l2.0) \n== null) ?: false) }, false))"
+        );
+        assert_eq!(
+            text(doc! { "a": { "$eq": null } }, &[("a", 3)]),
+            "traverseF(s3, lambda(l2.0) { ((\n    if (typeMatch(l2.0, 1024) ?: true) \n    \
+             then null \n    else move(l2.0) \n== null) ?: false) }, false)"
+        );
     }
 
     /// What is not built here is left to the classic explain.
@@ -284,9 +365,9 @@ mod tests {
     fn other_filters_are_not_built() {
         for parsed in [
             doc! {},
-            doc! { "a": { "$eq": null } },
             doc! { "a": { "$in": [1, 2] } },
-            doc! { "a": { "$not": { "$eq": 2 } } },
+            doc! { "a": { "$not": { "$gt": 2 } } },
+            doc! { "a.b": { "$eq": null } },
             doc! { "a.0": { "$gt": 1 } },
             doc! { "a": { "$gt": f64::NAN } },
             doc! { "$or": [{ "a": { "$eq": 1 } }, { "b": { "$eq": 1 } }] },

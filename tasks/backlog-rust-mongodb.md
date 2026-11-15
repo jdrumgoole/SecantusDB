@@ -1068,7 +1068,8 @@ These are explicit non-goals. Don't add them without a reason.
       planned from the catalog (`explain/summary.rs`), and naming a
       `COUNT_SCAN` there would name a plan that did not run: the executor
       has to run the count scan first, which is the SBE `GROUP` over a
-      `COUNT_SCAN` of RM-071 (its explain of a view's `count` is RM-072).
+      `COUNT_SCAN` of RM-071 (which `explain` builds and runs since
+      2026-11-14, RM-072).
       An `aggregate` of a view otherwise names the plan beneath it since
       2026-11-13. Found while working RM-381, 2026-11-10.
       Verify: tests/backlog/test_rm_view_lines.py::test_a_count_documents_runs_a_count_scan
@@ -1990,15 +1991,6 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       the collection so. Found 2026-11-12 (RM-360).
       Verify: tests/backlog/test_rm_found_2026_11_12_rm360.py::test_a_match_after_a_redact_is_copied_ahead_of_it
       Backlog-ID: RM-580
-- [ ] **A `$unionWith` over a collection is explained as written.**
-      mongod 8.2.11 lists the pipeline a `$unionWith` runs over a
-      collection: a `$cursor` holding the query's own `queryPlanner` (and,
-      at `executionStats`, its `executionStats`), then the stages after it,
-      each with its `nReturned`; this server lists the stage as written
-      (`{$unionWith: "d"}`). One over `$documents` lists its stages since
-      RM-539. Found 2026-11-14 (RM-539).
-      Verify: tests/backlog/test_rm_found_2026_11_14_rm539.py::test_a_union_with_over_a_collection_lists_its_cursor
-      Backlog-ID: RM-681
 - [ ] **A `$lookup` over a collection reports nothing it examined.** At
       `executionStats` mongod 8.2.11 gives a `$lookup` whose pipeline reads
       a collection its `totalDocsExamined`, `totalKeysExamined`,
@@ -2604,17 +2596,6 @@ A `readConcern` with an `atClusterTime` older than the oldest timestamp is
       Backlog-ID: RM-170
       Verify: tests/backlog/test_rm_found_2026_10_16.py::test_include_query_stats_metrics_adds_a_metrics_document
 
-- [ ] **RUST MongoDB server: `insert`, `update` and `delete` take fields
-      mongod refuses as unknown.** `originalQuery` and `originalCollation`
-      on any of the three, and a command-level `sampleId` on `update`:
-      mongod 8.2.11 answers 40415 (`BSON field 'insert.originalQuery' is an
-      unknown field.`) and writes nothing; this server takes them, ignores
-      them and runs the write. Its field lists (`write_command_problem`,
-      `update_command_problem` in `crud.rs`) name them. Found 2026-11-09
-      while working RM-087.
-      Backlog-ID: RM-460
-      Verify: tests/backlog/test_rm_found_2026_11_09_rm087.py::test_a_write_refuses_fields_mongod_does_not_know
-
 ### 7.077 `update` and `findAndModify` -- 2026-10-12
 
 `tools/probes/update_commands.py`, mongod 8.2.11: 30 scenarios, 1,295
@@ -2667,18 +2648,21 @@ What is left, all on the RUST MongoDB server:
       prints and RUNS that plan for a `$group`, or the `$group` a `$count`
       is, over a forward collection scan with no sort, projection, hint or
       collation, whose filter is `$eq` / `$lt` / `$lte` / `$gt` / `$gte` of
-      a number, string or boolean on a path of named fields and the `$and`s
-      of those (`explain/sbe/filter.rs`), with a skip and a limit where the
+      a number, string or boolean on a path of named fields, `$eq: null`
+      on one field, an `$in` of such values, the `$not: {$eq}` a `$ne` is
+      (since 2026-11-14), and the `$and`s of those (`explain/sbe/filter.rs`), with a skip and a limit where the
       group reads no field (RM-072); whose `_id` is a field path, `$$ROOT`,
       a scalar constant or an object of those, whose arguments are field
       paths or `$$ROOT` (numeric constants for `$sum`), with `$sum`,
       `$count`, `$avg`, `$first`, `$last`, `$min`, `$max`, `$push` and
       `$addToSet`, and at most one distinct dotted path; and the `limit 0`
       / `coscan` plan over a collection that does not exist. Still the
-      classic `$cursor` / `stages` shape: any other filter (`{a: null}`'s
-      `typeMatch`, `$in`'s `isMember`, `$ne`'s `!`, `$or`, ...), a sorted,
-      projected or index-served front (`COUNT_SCAN`, `IXSCAN` /
-      `FETCH`; for `count` on a view, RM-072), a skip or limit with a group that reads a field (mongod
+      classic `$cursor` / `stages` shape: any other filter (an `$in` holding
+      null, `$exists`'s `exists`, a dotted `$eq: null`, `$or`, ...), a sorted,
+      projected or index-served front (`IXSCAN` / `FETCH`; for `count` on
+      a view, RM-695; the `COUNT_SCAN` of a single-field
+      index under a group that reads no field is built since 2026-11-14,
+      RM-072), a skip or limit with a group that reads a field (mongod
       puts its dependency projection among them), `$lookup`,
       `$sortByCount` / `$bucket` (not desugared before
       `secantus_core::sbe::pushdown`, which the executor shares), any other
@@ -2700,45 +2684,40 @@ What is left, all on the RUST MongoDB server:
       stats all come from running the plan. Not a printed stand-in.
       Backlog-ID: RM-071
       Verify: tests/backlog/test_rm_057_084.py::test_explain_of_a_group_pushed_into_the_query, tests/backlog/test_rm_057_084.py::test_explain_of_a_filter_sbe_runs_beyond_comparisons
-- [ ] **`count` on a view whose filter an index serves** is explained by
-      mongod 8.2.11 as an SBE plan (`explainVersion: "2"`, a `queryPlan` of
-      `GROUP` over a `COUNT_SCAN` where the count reads no field, over
-      `FETCH` / `IXSCAN` where a filter is left); this server reports the
-      classic cursor with `FETCH` / `IXSCAN` and the `$count`'s `$group`.
-      Over a collection scan it matches mongod since 2026-11-08
-      (`tests/mongod_live/test_sbe_filtered_front_explain.py`). Needs the
-      SBE index scan stages, and the `COUNT_SCAN` a `$count` that reads no
-      field gets (also `aggregate: stages after the cursor` 7 and
-      `executionStats: aggregate` 6, under RM-071). `explain_commands.py`:
-      `a view` 4 and 5.
+- [ ] **`count` on a view whose filter a `FETCH` over an index scan
+      finishes** is explained by mongod 8.2.11 as an SBE plan
+      (`explainVersion: "2"`, a `queryPlan` of `GROUP` over `FETCH` /
+      `IXSCAN`, a `slotBasedPlan` of an `nlj` of an `ixseek` that reads the
+      key, record id, snapshot and index ident into slots, and a `limit 1`
+      `seek` of the document, under a `filter` of `traverseF`); this server
+      reports the classic cursor with `FETCH` / `IXSCAN` and the `$count`'s
+      `$group`. Reproduce: a view `{$match: {a: {$gt: 1}}}` over indexes
+      `a_1` and `b_-1`, `explain` of `{count: <view>, query: {b: 2}}`.
+      Where the index serves the whole filter and the count reads no
+      field, the `GROUP` over a `COUNT_SCAN` is built since 2026-11-14
+      (RM-072). Needs the `nlj` and `seek` stages and their stats, and the
+      index-key slots of `ixseek`. `explain_commands.py`: `a view` 5.
       **Decided 2026-10-16 (Joe):** as RM-071, transcribe and execute.
-      Backlog-ID: RM-072
-      Verify: tests/backlog/test_rm_057_084.py::test_explain_of_count_on_a_view_over_an_index
-- [ ] **A DISTINCT_SCAN bounded on a trailing field examines fewer keys
-      than mongod's.** mongod 8.2.11's DISTINCT_SCAN of `x_1_y_1` for
-      `distinct("x", {x: {$gt: 0}, y: {$gt: 3}})` over `x = i % 4, y = i`
-      (i 1 to 24) returns three keys and examines six, in eight works, in
-      its `executionStats` and in a `$group`'s trial. This server's
-      examines three, in four works. The plans ranked are the same. Not
-      RM-377's key past the bounds (fixed 2026-11-09, and none is past
-      these): by the source, `explain`'s DISTINCT_SCAN (`explain/exec.rs`)
-      counts one key per value it returns plus a key past the bounds,
-      never a key a seek lands on that the bounds on `y` reject. Found
-      2026-11-08 (RM-310).
-      Backlog-ID: RM-447
-      Verify: tests/backlog/test_rm_found_2026_11_08_rm310.py::test_a_distinct_scan_bounded_on_a_trailing_field_examines_mongods_keys
-- [ ] **`explain` of a `$unionWith` lists its sub-pipeline as written.**
-      mongod 8.2.11 explains the sub-pipeline as it does the outer one: a
-      `$cursor` of its own (its `queryPlanner`, and `executionStats` above
-      that verbosity) holding the stages it absorbs, then the rest as
-      listed. `[{$unionWith: {coll: "s", pipeline: [{$match: {x: 1}},
-      {$project: {x: 1}}]}}]` is `$cursor` (`{x: {$eq: 1}}`,
-      `PROJECTION_SIMPLE`) on mongod and `$match`, `$project` here. A
-      `$rankFusion` or `$scoreFusion` input pipeline's `$unionWith` lists
-      its stages desugared (RM-200) but without that `$cursor`. Found
-      2026-11-08 working RM-200.
-      Backlog-ID: RM-426
-      Verify: tests/backlog/test_rm_found_2026_11_08_explain_listing.py::test_union_with_sub_pipeline_is_explained
+      Verify: tests/backlog/test_rm_057_084.py::test_explain_of_count_on_a_view_fetching_from_an_index
+      Backlog-ID: RM-695
+- [ ] **A fusion input pipeline's `$unionWith` lists no `$cursor`.**
+      mongod 8.2.11 explains the `$unionWith` a `$rankFusion` or
+      `$scoreFusion` input pipeline runs in as any `$unionWith` over a
+      collection (RM-426): a `$cursor` of its own, then the stages it did
+      not absorb. This server lists that pipeline's stages desugared
+      (RM-200) with no `$cursor`: it runs hidden stages the explain of a
+      sub-pipeline cannot parse. Split from RM-426 2026-11-15.
+      Verify: tests/backlog/test_rm_found_2026_11_15_rm426.py::test_a_fusion_input_union_opens_with_its_cursor
+      Backlog-ID: RM-696
+- [ ] **A `$group` read by a `DISTINCT_SCAN` hashes as another query.**
+      mongod 8.2.11 explains `[{$match: {x: {$gt: 2}}}, {$group: {_id:
+      "$x"}}]` over an index `{x: 1}` with `queryHash` /
+      `planCacheShapeHash` `76A99463` and `planCacheKey` `09B22F21`; this
+      server's plan is the same `PROJECTION_COVERED` over `DISTINCT_SCAN`
+      but hashes `FA2103B6` / `CBA7C409`, top-level and inside a
+      `$unionWith` alike. Found 2026-11-15 working RM-426.
+      Verify: tests/backlog/test_rm_found_2026_11_15_rm426.py::test_a_distinct_scan_group_hashes_as_mongod_does
+      Backlog-ID: RM-697
 - [ ] **A `$facet` whose sub-pipeline keeps a sort key plans no
       `SORT_KEY_GENERATOR`.** mongod 8.2.11's `$cursor` under a `$facet`
       holding a `$sort` with `outputSortKeyMetadata` (a `$setWindowFields`

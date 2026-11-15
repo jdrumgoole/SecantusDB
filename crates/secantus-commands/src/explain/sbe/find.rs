@@ -132,6 +132,7 @@ pub(super) fn build(uuid: &str, front: &Front, spec: Option<&Document>) -> Optio
         filter: front.filter.clone(),
         skip: front.skip,
         limit: 0,
+        seek: None,
     };
     let Scanned {
         root,
@@ -317,6 +318,7 @@ mod tests {
             parsed,
             skip,
             limit,
+            seek: None,
         }
     }
 
@@ -402,6 +404,7 @@ mod tests {
             parsed,
             skip,
             limit,
+            seek: None,
         }
     }
 

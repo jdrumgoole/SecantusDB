@@ -31,7 +31,7 @@ mod stage;
 use bson::{doc, Bson, Document};
 use expr::Slot;
 pub(crate) use filter::Filter;
-pub(crate) use group::Front;
+pub(crate) use group::{Front, Seek};
 use stage::{Counted, Stage};
 
 /// A built slot-based plan.
@@ -169,7 +169,7 @@ impl Plan {
         pull: Pull,
         all_plans: bool,
     ) -> (Document, i64) {
-        let (stages, produced, examined) = if self.eof {
+        let (stages, produced, examined, keys) = if self.eof {
             // Under a `$cursor`, saved and restored around its one batch.
             let (saved, restored) = match pull {
                 Pull::Whole | Pull::Find => (0, 0),
@@ -201,7 +201,7 @@ impl Plan {
                     "isEOF": 0_i32,
                 },
             };
-            (stages, 0, 0)
+            (stages, 0, 0, 0)
         } else {
             let (rows, counted) = self.root.run(docs, None);
             let n = rows.len() as i64;
@@ -237,17 +237,22 @@ impl Plan {
             while let Some(below) = scan.input.as_deref() {
                 scan = below;
             }
-            let examined = scan.reads;
+            // An index seek examines keys and no document.
+            let (examined, keys) = if scan.seeks > 0 {
+                (0, scan.keys)
+            } else {
+                (scan.reads, 0)
+            };
             let pulled = Pulled { produced, eof };
             let pulled = (grouped && !matches!(pull, Pull::Find)).then_some(&pulled);
             let stages = stats_doc(&self.root, &counted, pulled, saves);
-            (stages, produced, examined)
+            (stages, produced, examined, keys)
         };
         let mut out = doc! {
             "executionSuccess": true,
             "nReturned": number(produced),
             "executionTimeMillis": 0_i32,
-            "totalKeysExamined": 0_i32,
+            "totalKeysExamined": number(keys),
             "totalDocsExamined": number(examined),
             "executionStages": stages,
         };
