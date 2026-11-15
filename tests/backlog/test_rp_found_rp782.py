@@ -87,8 +87,9 @@ def test_a_cast_to_a_collated_domain_takes_its_collation(dsn: str) -> None:
 
 
 # `information_schema.sql` declares `character_data` and `yes_or_no`
-# `COLLATE "C"`, and its views' text columns are of those domains.
-@pytest.mark.backlog("RP-797")
+# `COLLATE "C"`, and its views' text columns are of those domains: they
+# were "default" here until RP-797.
+@pytest.mark.backlog_fixed("RP-797")
 def test_information_schema_character_data_columns_are_collated_c(dsn: str) -> None:
     with _connect(dsn) as c:
         got = [

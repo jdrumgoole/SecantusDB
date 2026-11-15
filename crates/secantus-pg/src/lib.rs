@@ -22347,6 +22347,16 @@ impl PgHandler {
         // PostgreSQL 15's column SET and ORDER, so `SELECT *` reads by
         // position as it would there.
         catalog_order::conform(name, &mut def);
+        // `information_schema.sql` types every text column of its views by
+        // `character_data` or `yes_or_no`, both declared `COLLATE "C"`
+        // (RP-797); `sql_identifier` is over `name`, "C" already.
+        if name.starts_with("information_schema.") {
+            for column in &mut def.columns {
+                if column.pg_type == "varchar" && column.extra.get("collation").is_none() {
+                    column.extra.insert("collation", "C");
+                }
+            }
+        }
         for column in &mut def.columns {
             if column.source.is_none() {
                 column.source = catalog_meta::system_column_source(name, &column.name);

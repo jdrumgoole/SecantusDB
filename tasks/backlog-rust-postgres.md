@@ -3424,17 +3424,6 @@ with ICU) with the `_SETUP` in `tests/backlog/test_rp_found_rp782.py`:
 `xu782f` a domain over `text` `collate "und-x-icu"`, `xc782f` one
 `collate "C"`.
 
-- [ ] **`information_schema`'s text columns are not collated "C".**
-      `information_schema.sql` declares `character_data` and `yes_or_no`
-      `COLLATE "C"` (kept on the built-in domains since RP-782), and its
-      views' columns are of those domains and of `sql_identifier`, so
-      `collation for (data_type)` of `information_schema.columns` is
-      `"C"` on PostgreSQL 15.19; here it is `"default"`, as is
-      `is_insertable_into` of `information_schema.tables`. The views'
-      columns are typed by their base types (`varchar`), so they also sort
-      by the database's collation.
-      Verify: tests/backlog/test_rp_found_rp782.py::test_information_schema_character_data_columns_are_collated_c
-      Backlog-ID: RP-797
 - [ ] **`pg_get_viewdef` of a system view is NULL.** `select
       pg_get_viewdef('pg_tables'::regclass)` deparses the view's rule on
       PostgreSQL 15.19 (` SELECT n.nspname AS schemaname, ...`), as it does
