@@ -2019,20 +2019,34 @@ a regression test.
       Backlog-ID: RP-414
       Verify: tests/backlog/test_rp_column_errors.py::test_missing_column_reported_as_written
 - [ ] **EXPLAIN of an UPDATE ... FROM or a DELETE ... USING a table
-      prints a Seq Scan of the target alone.** The statement is rewritten
-      into correlated subqueries over its FROM items (`rewrite_dml_from`),
-      and EXPLAIN prints that rewrite's scan (`Statement::Delete` /
-      `Update` in `explain.rs` is a ModifyTable over `table_scan` only):
-      `explain (costs off) delete from k using e where k.a = e.a` is `Seq
-      Scan on k`, where PostgreSQL 15.19 prints a `Hash Join` with `Hash
-      Cond: (e.a = k.a)` over both tables. Closing it means planning the
-      DML's join as the SELECT join path plans it and putting that tree
-      under the ModifyTable. (A one-row constant subquery in FROM / USING
-      is pulled up since 2026-11-15, `dml_pullup.rs`.) Measured on a
-      private 15.19 cluster with `e(a int, b text)` and `k(a int primary
-      key, b text)` (found while working RP-432).
-      Verify: tests/backlog/test_rp_dml_from.py::test_explain_prints_the_join
+      prints the join's widths from every column of its tables.** Since
+      2026-11-15 the statement is explained as the SELECT join it is
+      (`dml_join_as_select`) under its ModifyTable, so the plan's shape
+      and costs are PostgreSQL's. The widths are that SELECT's `*`:
+      PostgreSQL 15.19's join target list is each relation's `ctid` and
+      what the SET list reads, its scans `ctid` and the join key. With
+      `e(a int, b text)` and `k(a int primary key, b text)` analysed, 10
+      rows each, `explain delete from k using e where k.a = e.a` is `Hash
+      Join (... width=12)` over scans of `width=10`, here 14 and 7; `update
+      k set b = 'x' ...` is `width=44`, here 14. EXPLAIN VERBOSE's
+      `Output:` lists (`k.ctid, e.ctid`) follow from the same target list.
+      Measured on a private 15.19 cluster (found while working RP-432).
+      Verify: tests/backlog/test_rp_dml_from.py::test_explain_join_widths
       Backlog-ID: RP-435
+- [ ] **A hash join of two tables never analysed is unpriced, and its
+      sides stay in written order.** `hash_side` prices a side only from
+      `analysed_key`, which needs `pg_statistic` rows. PostgreSQL 15.19
+      prices it anyway: each table at its default size (1,270 rows for an
+      empty or unvacuumed one), `eqjoinsel` from `get_variable_numdistinct`
+      (the 200 default, a unique column's row count). So `explain select *
+      from k, e where k.a = e.a` over fresh `e(a int, b text)` (10 rows) and
+      `k(a int primary key, b text)` is `Hash Join (cost=38.58..64.62
+      rows=1270 width=72)`, `Hash Cond: (e.a = k.a)`, `e` outer and `k`
+      hashed; here unpriced, `k` outer. The same plan is a DELETE ...
+      USING's. Measured on a private 15.19 cluster (found while working
+      RP-435).
+      Verify: tests/backlog/test_rp_dml_from.py::test_explain_prints_the_join
+      Backlog-ID: RP-1019
 - [ ] **An UPDATE ... FROM or DELETE ... USING reports an ambiguous name
       ahead of a missing column written before it.** `rewrite_dml_from`'s
       42702 check reads every expression of the statement before anything

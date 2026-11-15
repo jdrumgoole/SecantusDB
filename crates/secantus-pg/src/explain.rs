@@ -176,7 +176,7 @@ impl PlanNode {
         }
     }
 
-    fn over(name: impl Into<String>, child: PlanNode) -> Self {
+    pub(crate) fn over(name: impl Into<String>, child: PlanNode) -> Self {
         let mut n = PlanNode::new(name);
         n.children.push(child);
         n
@@ -3098,6 +3098,7 @@ mod heap_fetches_tests {
             one_time_false: 0,
             nullable_gate: None,
             dummy_relation: false,
+            modify_table: None,
             sort_keys: None,
             series_scan: None,
             series_qual: None,

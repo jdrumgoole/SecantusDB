@@ -46643,6 +46643,14 @@ impl PgHandler {
                     // (RP-386).
                     self.analyze_join_children(&mut tree, sel, rows);
                 }
+                // An UPDATE ... FROM / DELETE ... USING explained as its
+                // join: the ModifyTable over it, costing what the join
+                // does and returning nothing (RP-435).
+                if let Some(name) = &options.modify_table {
+                    let estimate = tree.estimate.map(|(s, t, _, _)| (s, t, 0.0, 0));
+                    tree = explain::PlanNode::over(name.clone(), tree);
+                    tree.estimate = estimate;
+                }
                 let (ty, lines) = if options.format == "json" {
                     (
                         Type::JSON,
