@@ -209,6 +209,12 @@ fn arith_priority(op: &str) -> u8 {
     }
 }
 
+/// Whether `from` converts to `to` by a RelabelType (`pg_cast`'s
+/// binary-coercible `castmethod = 'b'`), among the string types.
+fn binary_coercible(from: &str, to: &str) -> bool {
+    matches!((from, to), ("text", "varchar") | ("varchar", "text"))
+}
+
 /// `format_type` of a type with no modifier: a bare `char` is `bpchar`.
 fn display_type(t: &str) -> String {
     match t {
@@ -1079,6 +1085,27 @@ impl<'a> Printer<'a> {
             if own == "unknown" {
                 // An untyped literal or NULL takes the wanted type directly.
                 return self.const_as(n, want);
+            }
+            // A cast between binary-compatible types is a RelabelType, and
+            // `eval_const_expressions` collapses a chain of them into one
+            // relabel to the wanted type, none when the innermost operand
+            // already has it: `b::varchar <> 'x'` over a text `b` plans
+            // as `b <> 'x'::text` (RP-912).
+            if self.fold_consts && own != want && binary_coercible(&own, want) {
+                if let Some(N::TypeCast(tc)) = n.node.as_ref() {
+                    let typmod = tc
+                        .type_name
+                        .as_ref()
+                        .map_or(0, crate::declared_typmod_public);
+                    if let (Some(arg), true) = (tc.arg.as_deref(), typmod < 0) {
+                        if self
+                            .typ(arg)
+                            .is_some_and(|t| t == want || binary_coercible(&t, want))
+                        {
+                            return self.child(arg, want, parent);
+                        }
+                    }
+                }
             }
             if own != want {
                 if self.fold_consts && want == "oid" {

@@ -19,6 +19,7 @@ mod agg_support;
 pub mod deferred;
 mod domain_scope;
 mod record_image;
+mod relabel;
 pub use domain_scope::{select_output_domains, select_target_domain};
 mod targetlist_size;
 pub use targetlist_size::MAX_HEAP_ATTRIBUTE_NUMBER;
@@ -12375,6 +12376,7 @@ fn plan_explain(
     // The WHERE's constants are simplified before anything is planned
     // (`eval_const_expressions`, `canonicalize_qual`; RP-409).
     options.dummy_relation = const_quals::simplify_statement(&mut query, lookup)?;
+    relabel::strip_relabels(&mut query, lookup)?;
     // A column's equalities to constants become one equivalence class: the
     // scan keeps the first constant, each other distinct one is a `false`
     // gate (RP-350). Only planned, never run: under ANALYZE the statement

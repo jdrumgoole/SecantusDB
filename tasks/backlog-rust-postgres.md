@@ -1848,20 +1848,6 @@ a regression test.
       15.19 cluster (found while working RP-925).
       Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a scan of an aliased relation]
       Backlog-ID: RP-967
-- [ ] **A binary-coercible cast is kept in a plan, and its scan is not
-      priced.** A cast between binary-compatible types (`text` to
-      `varchar` and back to `text` for the operator) is a `RelabelType`
-      `eval_const_expressions` strips, so the column keeps its statistics
-      and prints bare: PostgreSQL 15.19 prints `explain select * from e
-      where b::varchar <> 'x'` (`e` analysed, 1000 rows) as `Seq Scan on e
-      (cost=0.00..17.50 rows=1000 width=7)` with `Filter: (b <>
-      'x'::text)`; here `Filter: (((b)::character varying)::text <>
-      'x'::text)` and zero costs. The same in a nested loop's Join Filter
-      (`e, k where e.b::varchar <> k.b`, PostgreSQL's `cost=0.00..15032.50
-      rows=900000`). Its rows are right. Measured on a private 15.19
-      cluster (found while working RP-354).
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a seq scan filter over a binary-coercible cast], tests/backlog/test_rp_explain_costs.py::test_plan[a join filter over a binary-coercible cast]
-      Backlog-ID: RP-912
 - [ ] **A function call in a nested loop's join filter is priced as
       nothing.** `cost_qual_eval` charges a call its `procost` for every
       pair the Join Filter checks: PostgreSQL 15.19 prints `select * from e

@@ -8237,7 +8237,8 @@ fn a_cast_of_a_column_is_an_expression_with_its_functions_cost() {
     // A folded constant cast on the other side costs nothing.
     let q = scan_expr_quals("select * from t where n::int2 = 5::int2").expect("priced");
     assert_eq!((q[0].op, q[0].operators), (colstats::Op::Eq, 2));
-    // Not priced: a binary-coercible cast (a RelabelType, RP-912), a
+    // Not priced as an expression: a binary-coercible cast (a RelabelType
+    // stripped before planning, RP-912, so a column qual), a
     // cast with a type modifier, a cast to a type outside the integer and
     // string families, and a cast of an expression.
     for sql in [
