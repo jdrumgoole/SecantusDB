@@ -629,10 +629,18 @@ pub(crate) fn namespace_kind(db: &str, coll: &str) -> Option<&'static str> {
 /// (NamespaceNotFound) is refused so; one refused once it holds the
 /// collection -- an index that does not exist, the `_id` index -- names
 /// the collection and is profiled (measured 8.2.11, 2026-11-13, RM-485).
+/// A `collMod` of a collection that does not exist (NamespaceNotFound) is
+/// refused so too (measured 8.2.11, RM-584).
 pub(crate) fn refused_before_acquiring(name: &str, reply: &Document) -> bool {
-    matches!(name, "dropIndexes" | "deleteIndexes")
-        && !crate::util::reply_ok(reply)
-        && matches!(reply.get_i32("code"), Ok(26 | 166))
+    if crate::util::reply_ok(reply) {
+        return false;
+    }
+    let code = reply.get_i32("code");
+    match name {
+        "dropIndexes" | "deleteIndexes" => matches!(code, Ok(26 | 166)),
+        "collMod" => code == Ok(26),
+        _ => false,
+    }
 }
 
 /// The kind a line names `db.coll` by: `system` for a `system.`
@@ -709,6 +717,16 @@ pub(crate) fn remote(ctx: &CommandContext) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A `collMod` of a collection that does not exist is refused before it
+    /// acquires one; one refused for a bad option is not (RM-584).
+    #[test]
+    fn a_coll_mod_of_a_missing_collection_acquires_nothing() {
+        let refused = |code: i32| doc! {"ok": 0.0, "code": code, "errmsg": "x"};
+        assert!(refused_before_acquiring("collMod", &refused(26)));
+        assert!(!refused_before_acquiring("collMod", &refused(72)));
+        assert!(!refused_before_acquiring("collMod", &doc! {"ok": 1.0}));
+    }
 
     #[test]
     fn a_storage_section_leaves_out_what_is_zero() {

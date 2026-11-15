@@ -90,12 +90,12 @@ def test_a_time_series_index_build_has_its_line(rust_mongo: Any, mongod_rs: Any)
     assert got["rust"]["lines"] == got["mongod"]["lines"]
 
 
-@pytest.mark.backlog("RM-584")
+@pytest.mark.backlog_fixed("RM-584")
 def test_a_coll_mod_of_a_missing_collection_names_cmd(rust_mongo: Any, mongod_rs: Any) -> None:
     """mongod 8.2.11's line for a `collMod` of a collection that does not
     exist (26, `NamespaceNotFound`) names `<db>.$cmd`, and it writes no
-    profile entry; this server's line names the collection, and it
-    profiles it."""
+    profile entry; this server's line named the collection, and it
+    profiled it."""
 
     def op(db: Any) -> None:
         with contextlib.suppress(PyMongoError):

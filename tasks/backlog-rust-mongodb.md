@@ -802,13 +802,6 @@ These are explicit non-goals. Don't add them without a reason.
       RM-484, 2026-11-13.
       Verify: tests/backlog/test_rm_ts_ddl_lines.py::test_a_time_series_index_build_has_its_line
       Backlog-ID: RM-583
-- [ ] **A `collMod` of a missing collection names it, and is profiled.**
-      mongod 8.2.11's line for one (26, `NamespaceNotFound`) names
-      `<db>.$cmd`, and it writes no profile entry; this server's line names
-      the collection, and it writes an entry with `ok: 0`. Found while
-      working RM-484, 2026-11-13.
-      Verify: tests/backlog/test_rm_ts_ddl_lines.py::test_a_coll_mod_of_a_missing_collection_names_cmd
-      Backlog-ID: RM-584
 - [ ] **An `insert` into a time-series collection's buckets is not
       profiled.** mongod 8.2.11 writes a profile entry for an `insert` into
       `<db>.system.buckets.ts`; this server writes the line and no entry.
