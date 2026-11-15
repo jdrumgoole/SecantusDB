@@ -3280,16 +3280,15 @@ statement is VALUES-only and runs there as written. The gap test is in
 Measured on PostgreSQL 15.19 (the shared reference on port 5415): every
 statement reads only `VALUES` lists.
 
-- [ ] **A star over a FROM subquery in a grouped query is 42803 with no
-      column name.** `select v.* from (values (1), (1)) v(a) group by a`
-      answers `1`, column `a`, on PostgreSQL 15.19, and so does `(v).*`
-      beside a `count(*)` grouped by `v.a`; `... group by v` is 42803
-      `column "v.a" must appear in the GROUP BY clause or be used in an
-      aggregate function` at 8. Here each is 42803 `column "" must appear
-      in the GROUP BY clause ...` with no position: `expand_star_in_grouped`
-      expands a star over a lone table only, so the star reaches the
-      grouping check unexpanded.
-      Verify: tests/backlog/test_rp_found_rp699.py::test_a_star_over_a_from_subquery_in_a_grouped_query
+- [ ] **`GROUP BY v` over a FROM subquery groups by its column, not
+      the row.** `select v.a from (values (1), (2)) v(a) group by v` is
+      42803 `column "v.a" must appear in the GROUP BY clause or be used in
+      an aggregate function` at 8 on PostgreSQL 15.19, and so is `select
+      v.* ... group by v`. Here both answer the rows: the whole-row
+      grouping rule (`check_ungrouped_whole_row`, RP-532 / RP-536) covers a
+      lone table only, and a subquery's `v` resolves as its column. (The
+      star over a subquery itself now expands, `expand_star_in_grouped`.)
+      Verify: tests/backlog/test_rp_found_rp699.py::test_group_by_a_from_subquery_row_leaves_its_columns_ungrouped
       Backlog-ID: RP-852
 
 ## Found while working RP-700 (2026-11-10)

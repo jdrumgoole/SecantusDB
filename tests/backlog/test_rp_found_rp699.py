@@ -161,7 +161,25 @@ GROUPED_SUBQUERY_STAR = {
         [(1, 2)],
         ["a", "count"],
     ),
+}
+
+
+@pytest.mark.backlog_fixed("RP-852")
+@pytest.mark.parametrize("query", list(GROUPED_SUBQUERY_STAR))
+def test_a_star_over_a_from_subquery_in_a_grouped_query(query: str, dsn: str) -> None:
+    """A star over a FROM subquery in a grouped query reached the grouping
+    check unexpanded, as 42803 `column ""`; it now expands to the
+    subquery's columns, as on PostgreSQL 15.19."""
+    assert answer(dsn, query) == GROUPED_SUBQUERY_STAR[query]
+
+
+GROUPED_BY_SUBQUERY_ROW = {
     "select v.* from (values (1)) v(a) group by v": (
+        "42803",
+        'column "v.a" must appear in the GROUP BY clause or be used in an aggregate function',
+        "8",
+    ),
+    "select v.a from (values (1), (2)) v(a) group by v": (
         "42803",
         'column "v.a" must appear in the GROUP BY clause or be used in an aggregate function',
         "8",
@@ -170,6 +188,6 @@ GROUPED_SUBQUERY_STAR = {
 
 
 @pytest.mark.backlog("RP-852")
-@pytest.mark.parametrize("query", list(GROUPED_SUBQUERY_STAR))
-def test_a_star_over_a_from_subquery_in_a_grouped_query(query: str, dsn: str) -> None:
-    assert answer(dsn, query) == GROUPED_SUBQUERY_STAR[query]
+@pytest.mark.parametrize("query", list(GROUPED_BY_SUBQUERY_ROW))
+def test_group_by_a_from_subquery_row_leaves_its_columns_ungrouped(query: str, dsn: str) -> None:
+    assert answer(dsn, query) == GROUPED_BY_SUBQUERY_ROW[query]

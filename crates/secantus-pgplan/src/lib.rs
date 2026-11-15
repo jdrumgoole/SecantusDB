@@ -22182,48 +22182,75 @@ fn expand_star_in_grouped(
     let [item] = s.from_clause.as_slice() else {
         return None;
     };
-    let Some(N::RangeVar(rv)) = item.node.as_ref() else {
-        return None;
+    let (alias, rv) = match item.node.as_ref() {
+        Some(N::RangeVar(rv)) => (
+            rv.alias
+                .as_ref()
+                .map_or_else(|| rv.relname.clone(), |a| a.aliasname.clone()),
+            Some(rv),
+        ),
+        Some(N::RangeSubselect(sub)) => (sub.alias.as_ref()?.aliasname.clone(), None),
+        _ => return None,
     };
-    let alias = rv
-        .alias
-        .as_ref()
-        .map_or_else(|| rv.relname.clone(), |a| a.aliasname.clone());
-    let is_star = |c: &pg_query::protobuf::ColumnRef| -> bool {
-        match c.fields.as_slice() {
-            [one] => matches!(one.node.as_ref(), Some(N::AStar(_))),
-            [q, one] => {
-                matches!(one.node.as_ref(), Some(N::AStar(_)))
-                    && matches!(q.node.as_ref(), Some(N::String(x)) if x.sval == alias)
-            }
-            _ => false,
+    // The star's own location: PostgreSQL reports a grouping error on an
+    // expanded column at the star that produced it.
+    let star_at = |t: &pg_query::protobuf::Node| -> Option<i32> {
+        let Some(N::ResTarget(rt)) = t.node.as_ref() else {
+            return None;
+        };
+        match rt.val.as_deref().and_then(|v| v.node.as_ref()) {
+            Some(N::ColumnRef(c)) => match c.fields.as_slice() {
+                [one] if matches!(one.node.as_ref(), Some(N::AStar(_))) => Some(c.location),
+                [q, one]
+                    if matches!(one.node.as_ref(), Some(N::AStar(_)))
+                        && matches!(q.node.as_ref(), Some(N::String(x)) if x.sval == alias) =>
+                {
+                    Some(c.location)
+                }
+                _ => None,
+            },
+            // `(v).*`: the whole-row reference, expanded.
+            Some(N::AIndirection(ind)) => match (
+                ind.arg.as_deref().and_then(|a| a.node.as_ref()),
+                ind.indirection.as_slice(),
+            ) {
+                (Some(N::ColumnRef(c)), [one])
+                    if matches!(one.node.as_ref(), Some(N::AStar(_)))
+                        && matches!(c.fields.as_slice(), [q]
+                            if matches!(q.node.as_ref(), Some(N::String(x)) if x.sval == alias)) =>
+                {
+                    Some(c.location)
+                }
+                _ => None,
+            },
+            _ => None,
         }
     };
-    let has_star = s.target_list.iter().any(|t| {
-        matches!(t.node.as_ref(), Some(N::ResTarget(rt))
-            if matches!(rt.val.as_deref().and_then(|v| v.node.as_ref()),
-                Some(N::ColumnRef(c)) if is_star(c)))
-    });
-    if !has_star {
+    if !s.target_list.iter().any(|t| star_at(t).is_some()) {
         return None;
     }
-    let def = lookup(&relation_name(rv))?;
+    let columns: Vec<String> = match (rv, item.node.as_ref()) {
+        (Some(rv), _) => lookup(&relation_name(rv))?
+            .columns
+            .iter()
+            .map(|c| c.name.clone())
+            .collect(),
+        (None, Some(N::RangeSubselect(sub))) => subselect_columns(sub)?,
+        _ => return None,
+    };
     let mut out = s.clone();
     out.target_list = Vec::new();
     for t in &s.target_list {
-        let star = matches!(t.node.as_ref(), Some(N::ResTarget(rt))
-            if matches!(rt.val.as_deref().and_then(|v| v.node.as_ref()),
-                Some(N::ColumnRef(c)) if is_star(c)));
-        if !star {
+        let Some(location) = star_at(t) else {
             out.target_list.push(t.clone());
             continue;
-        }
-        for col in &def.columns {
+        };
+        for col in &columns {
             out.target_list.push(pg_query::protobuf::Node {
                 node: Some(N::ResTarget(Box::new(pg_query::protobuf::ResTarget {
                     val: Some(Box::new(pg_query::protobuf::Node {
                         node: Some(N::ColumnRef(pg_query::protobuf::ColumnRef {
-                            fields: [alias.as_str(), col.name.as_str()]
+                            fields: [alias.as_str(), col.as_str()]
                                 .iter()
                                 .map(|p| pg_query::protobuf::Node {
                                     node: Some(N::String(pg_query::protobuf::String {
@@ -22231,16 +22258,72 @@ fn expand_star_in_grouped(
                                     })),
                                 })
                                 .collect(),
-                            location: -1,
+                            location,
                         })),
                     })),
-                    location: -1,
+                    location,
                     ..Default::default()
                 }))),
             });
         }
     }
     Some(out)
+}
+
+/// The output column names of a FROM subquery: its alias's column list,
+/// then (past it) the names its own targets carry, `columnN` for a VALUES
+/// list. `None` when a name is not known from the statement alone.
+fn subselect_columns(sub: &pg_query::protobuf::RangeSubselect) -> Option<Vec<String>> {
+    let inner = match sub.subquery.as_deref().and_then(|q| q.node.as_ref()) {
+        Some(N::SelectStmt(sel)) => sel,
+        _ => return None,
+    };
+    let own: Vec<Option<String>> = if let Some(row) = inner.values_lists.first() {
+        let Some(N::List(l)) = row.node.as_ref() else {
+            return None;
+        };
+        (1..=l.items.len())
+            .map(|i| Some(format!("column{i}")))
+            .collect()
+    } else if inner.op == pg_query::protobuf::SetOperation::SetopNone as i32 {
+        inner
+            .target_list
+            .iter()
+            .map(|t| match t.node.as_ref() {
+                Some(N::ResTarget(rt)) if !rt.name.is_empty() => Some(rt.name.clone()),
+                Some(N::ResTarget(rt)) => match rt.val.as_deref().and_then(|v| v.node.as_ref()) {
+                    Some(N::ColumnRef(c)) => match c.fields.last().and_then(|f| f.node.as_ref()) {
+                        Some(N::String(x)) => Some(x.sval.clone()),
+                        _ => None,
+                    },
+                    _ => None,
+                },
+                _ => None,
+            })
+            .collect()
+    } else {
+        return None;
+    };
+    let aliased: Vec<String> = sub
+        .alias
+        .as_ref()
+        .map(|a| {
+            a.colnames
+                .iter()
+                .filter_map(|n| match n.node.as_ref() {
+                    Some(N::String(x)) => Some(x.sval.clone()),
+                    _ => None,
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    if aliased.len() > own.len() {
+        return None;
+    }
+    own.into_iter()
+        .enumerate()
+        .map(|(i, n)| aliased.get(i).cloned().or(n))
+        .collect()
 }
 
 /// Whether an ORDER BY item names an aggregate call: directly, by its
