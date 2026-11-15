@@ -1945,6 +1945,14 @@ a regression test.
       bitmap past `work_mem`, whose
       pages go lossy (`Heap Blocks: exact=... lossy=...`). Measured on a
       private 15.19 cluster (found while working RP-383).
+      Sized 2026-11-15: `user_index_ctids` (lib.rs) refuses any heap with
+      `has_dead_entries`, and the heap model keeps no index entries: a
+      dead non-HOT version's key is not recorded (`Xmax` holds only the
+      row's `_id`, and the update may have changed the key), and nothing
+      models `_bt_killitems` -- PostgreSQL's first scan fetches the dead
+      entry (`Heap Fetches: 2`) and kills it, so a second scan prints 1.
+      The fix is an index-entry model (key per version, killed bit,
+      removed by VACUUM's index pass), persisted beside the heap.
       Backlog-ID: RP-384
       Verify: tests/backlog/test_rp_explain_costs.py::test_plan[analyze of an index-only scan over a dead version]
 - [ ] **EXPLAIN ANALYZE prints no counts below most other joins.** Since
@@ -1974,6 +1982,12 @@ a regression test.
       it (`Materialize (actual rows=20 loops=20)`).
       Measured on a private 15.19 cluster (found while working RP-386,
       the chain while working RP-354).
+      Sized 2026-11-15: `nest_loop_chain_estimate` (scan_estimate.rs)
+      admits only inner joins with no hash or merge clause (`inner_join`
+      refuses a non-empty `equi`), so the Materialize needs the join
+      search to build hash-join paths for a level's relations
+      (`hash_inner_and_outer`) beside its nested loops, then price the
+      top nested loop's inner through `cost_material`.
       Backlog-ID: RP-390
       Verify: tests/backlog/test_rp_explain_costs.py::test_plan[analyze of a nested loop over a hash join]
 - [ ] **An inner join nested in an outer join keeps its one-table ON
