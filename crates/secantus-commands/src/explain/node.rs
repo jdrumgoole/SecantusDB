@@ -201,6 +201,14 @@ pub(crate) enum Node {
     /// own to keep one (`analyzeDataAccess`, RM-428).
     SortKeyGenerator(Box<Node>),
     Subplan(Box<Node>),
+    /// A `$near`'s ring search of a geo index: GEO_NEAR_2D, or
+    /// GEO_NEAR_2DSPHERE when `sphere` (RM-578). It returns documents.
+    GeoNear {
+        index: Arc<IndexInfo>,
+        sphere: bool,
+        /// The `$near` clause, which the search answers.
+        clause: Document,
+    },
     Eof(&'static str),
     /// A point lookup through a unique index: `path == value`.
     Express {
@@ -458,6 +466,21 @@ impl Node {
                 out.insert("stage", "SUBPLAN");
                 counted(&mut out);
                 input_of(&mut out, input);
+            }
+            Node::GeoNear { index, sphere, .. } => {
+                out.insert(
+                    "stage",
+                    if *sphere {
+                        "GEO_NEAR_2DSPHERE"
+                    } else {
+                        "GEO_NEAR_2D"
+                    },
+                );
+                counted(&mut out);
+                out.insert("keyPattern", index.key.clone());
+                out.insert("indexName", index.name.clone());
+                out.insert("indexVersion", index.version);
+                extra(&mut out);
             }
             Node::Eof(kind) => {
                 out.insert("stage", "EOF");

@@ -1375,6 +1375,10 @@ fn access(q: &Query, catalog: &[Arc<IndexInfo>]) -> Access {
         return collscan(false, backward);
     }
     let parts = clauses(q.canonical);
+    // A `$near` is the geo index's ring search (RM-578).
+    if let Some(found) = geo_near_access(&parts, q, catalog) {
+        return found;
+    }
     let mut only_or = false;
     // A filter that is only an `$or` is planned branch by branch.
     if let [only] = parts.as_slice() {
@@ -1436,6 +1440,68 @@ fn access(q: &Query, catalog: &[Arc<IndexInfo>]) -> Access {
         return found;
     }
     collscan(only_or, false)
+}
+
+/// mongod's plan of a `$near` / `$nearSphere`: the ring search of a geo
+/// index whose leading field the predicate names, GEO_NEAR_2D or
+/// GEO_NEAR_2DSPHERE, the query's other clauses a FETCH's filter above it
+/// (measured 8.2.11: `FETCH {z: {$eq: 1}} <- GEO_NEAR_2D`). The stage
+/// returns documents, so there is no FETCH without them. A `2d` index is
+/// preferred to a `2dsphere` one, as the order's search prefers it
+/// (`geo::check_near_hint` has the same compatibility rule); a hint
+/// restricts the choice to the index it names.
+fn geo_near_access(parts: &[Document], q: &Query, catalog: &[Arc<IndexInfo>]) -> Option<Access> {
+    let near_clause = |c: &Document| {
+        c.len() == 1
+            && c.values().next().is_some_and(|v| {
+                matches!(v, Bson::Document(d) if d.contains_key("$near") || d.contains_key("$nearSphere"))
+            })
+    };
+    let at = parts.iter().position(near_clause)?;
+    let found = crate::near::find_near(&parts[at]).ok()??;
+    let mut candidates: Vec<(&Arc<IndexInfo>, bool)> = catalog
+        .iter()
+        .filter(|ix| match &q.hint {
+            Hint::Index(name) => &ix.name == name,
+            _ => true,
+        })
+        .filter_map(|ix| {
+            let (field, kind) = ix.key.iter().next()?;
+            if field != &found.field {
+                return None;
+            }
+            match kind.as_str()? {
+                "2d" if !found.near.geojson => Some((ix, false)),
+                "2dsphere" if found.near.spherical => Some((ix, true)),
+                _ => None,
+            }
+        })
+        .collect();
+    candidates.sort_by_key(|(_, sphere)| *sphere);
+    let (index, sphere) = candidates.into_iter().next()?;
+    let rest: Vec<Document> = parts
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| *i != at)
+        .map(|(_, c)| c.clone())
+        .collect();
+    let fetch_filter = if rest.is_empty() {
+        None
+    } else {
+        assemble(rest)
+    };
+    Some(Access {
+        scan: Node::GeoNear {
+            index: index.clone(),
+            sphere,
+            clause: parts[at].clone(),
+        },
+        indexed: fetch_filter.is_some(),
+        fetch_filter,
+        index: None,
+        sorted: false,
+        subplan: false,
+    })
 }
 
 /// The walks of whole indexes that return the documents in the sort order,

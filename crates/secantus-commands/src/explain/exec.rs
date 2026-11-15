@@ -904,6 +904,20 @@ impl<'a> Run<'a> {
                 }
                 None
             }
+            // The documents the search returns, in storage order: the
+            // search's own rings and their counts are not modelled here.
+            Node::GeoNear { clause, .. } => {
+                let clause = Some(clause.clone());
+                while self.pos < env.docs.len() {
+                    let row = self.pos;
+                    self.pos += 1;
+                    self.docs += 1;
+                    if env.key_matches(row, &clause) {
+                        return Some(row);
+                    }
+                }
+                None
+            }
             Node::IxScan(_) => {
                 let scan = self.scan.as_mut()?;
                 let row = scan.next(env);

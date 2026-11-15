@@ -693,14 +693,16 @@ These are explicit non-goals. Don't add them without a reason.
       match. Found 2026-11-15 (RM-568).
       Verify: tests/backlog/test_rm_found_rm568b.py::test_return_key_with_a_sort_key_over_an_index_sort_explains_a_key_generator
       Backlog-ID: RM-706
-- [ ] **A `$near` read over a `2d` index explains as a COLLSCAN.** mongod
-      8.2.11 plans `find({loc: {$near: [0, 0]}})` over a `{loc: "2d"}`
-      index as `GEO_NEAR_2D` (`SORT <- GEO_NEAR_2D` under a `sort`); this
-      server's `explain` names a `COLLSCAN` for the same read. The
-      documents come back in mongod's order either way. Found 2026-11-12
-      (RM-472).
-      Verify: tests/backlog/test_rm_found_rm472.py::test_a_near_read_explains_as_geo_near_2d
-      Backlog-ID: RM-578
+- [ ] **A GEO_NEAR stage's `executionStats` are not mongod's.** mongod
+      8.2.11's GEO_NEAR_2D for `find({loc: {$near: [0, 0]}})` over twelve
+      points and a `{loc: "2d"}` index reports `searchIntervals`, an
+      `inputStages` list of the rings' index scans, the stage's work
+      counts, and 52 `totalKeysExamined`; this server's stage (planned
+      since RM-578, `Node::GeoNear`) prints none of them and counts 0 keys,
+      its executionStats walking the documents in storage order
+      (`exec.rs`). Found 2026-11-15 (RM-578).
+      Verify: tests/backlog/test_rm_found_rm578.py::test_a_geo_near_stage_reports_mongods_execution_stats
+      Backlog-ID: RM-707
 - [ ] **Some lines have no `numInterruptChecks`.** Since 2026-11-08 this
       server checks for interrupt where mongod 8.2 does, and counts it
       (`secantus_core::deadline::check_for_interrupt`): at dispatch, at
