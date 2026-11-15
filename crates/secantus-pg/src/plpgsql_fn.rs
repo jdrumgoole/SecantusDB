@@ -14,8 +14,8 @@
 //! (`pg_query::scan`), which is what PL/pgSQL itself does with its parser
 //! hooks: an identifier naming a variable, not called as a function and not
 //! the second half of a qualified name, becomes `$n::<type>`; `rec.field`
-//! becomes the field's value. A column that shares a variable's name is read
-//! as the variable -- PostgreSQL would raise an ambiguity there instead.
+//! becomes the field's value. A column reference that names both a variable
+//! and a FROM item's column is 42702, as `#variable_conflict error` has it.
 
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
@@ -458,6 +458,9 @@ struct Interp<'a> {
     handling: Option<PlError>,
     /// Bound cursors' queries, by datum number (`open_cursor`).
     cursor_exprs: HashMap<usize, String>,
+    /// `#variable_conflict` is `error` (the default): a reference that
+    /// names both a variable and a table column is 42702 (RP-838).
+    conflict_error: bool,
     /// A bound cursor's declared options (`SCROLL` / `NO SCROLL`), by datum.
     cursor_options: HashMap<usize, u64>,
     /// A bound cursor's argument row (`c CURSOR (k int) FOR ...`), by datum:
@@ -1220,6 +1223,16 @@ fn condition_matches(cond: &Value, sqlstate: &str) -> bool {
     }
 }
 
+/// The body's `#variable_conflict` option is `error` (the default, as
+/// `plpgsql.variable_conflict` is): no `use_variable` / `use_column`.
+fn variable_conflict_is_error(create_sql: &str) -> bool {
+    let lower = create_sql.to_ascii_lowercase();
+    !lower.match_indices("#variable_conflict").any(|(at, m)| {
+        let rest = lower[at + m.len()..].trim_start();
+        rest.starts_with("use_variable") || rest.starts_with("use_column")
+    })
+}
+
 /// Run one call of a PL/pgSQL function.
 pub fn run(create_sql: &str, inv: Invocation<'_>, host: &dyn Host) -> Result<Outcome, PlError> {
     // A variable of a composite type is a record of that type (RP-689).
@@ -1337,6 +1350,7 @@ pub fn run(create_sql: &str, inv: Invocation<'_>, host: &dyn Host) -> Result<Out
         }
     }
     let mut interp = Interp {
+        conflict_error: variable_conflict_is_error(create_sql),
         datums,
         arg_slots,
         fn_name: fname,
@@ -1862,6 +1876,9 @@ impl Interp<'_> {
     /// The SQL an expression becomes, with its variables bound: `(sql,
     /// params, types)`.
     fn bind(&self, text: &str) -> Result<(String, Vec<Bson>, Vec<String>), PlError> {
+        if self.conflict_error {
+            self.check_column_conflicts(text)?;
+        }
         let scan = pg_query::scan(text).map_err(|e| PlError::new("42601", e.to_string()))?;
         let tokens = scan.tokens;
         let tok = |i: usize| -> Option<&str> {
@@ -2085,6 +2102,115 @@ impl Interp<'_> {
         Ok((out, params, types))
     }
 
+    /// `plpgsql_post_column_ref` under `#variable_conflict error`: a
+    /// reference `r.f` the parser resolves as a column of a FROM item `r`
+    /// that also names the record variable `r` is ambiguous (42702).
+    fn check_column_conflicts(&self, text: &str) -> Result<(), PlError> {
+        use pg_query::protobuf::node::Node as N;
+        let Ok(parsed) = pg_query::parse(text) else {
+            return Ok(());
+        };
+        let word = |n: &pg_query::protobuf::Node| match n.node.as_ref() {
+            Some(N::String(s)) => Some(s.sval.clone()),
+            _ => None,
+        };
+        let mut tables: HashMap<String, Option<Vec<String>>> = HashMap::new();
+        let mut has_column = |rel: &str, col: &str| -> bool {
+            tables
+                .entry(rel.to_string())
+                .or_insert_with(|| {
+                    self.host
+                        .row_type(rel)
+                        .map(|(_, cols)| cols.into_iter().map(|(n, _)| n).collect())
+                })
+                .as_ref()
+                .is_some_and(|c| c.iter().any(|n| n == col))
+        };
+        for (node, _, _, _) in parsed.protobuf.nodes() {
+            // The FROM items a statement's expressions see, by refname.
+            let mut items: Vec<(String, String)> = Vec::new();
+            let (from, scope): (
+                Vec<&pg_query::protobuf::Node>,
+                Vec<&pg_query::protobuf::Node>,
+            ) = match node {
+                pg_query::NodeRef::SelectStmt(s) => (
+                    s.from_clause.iter().collect(),
+                    s.target_list
+                        .iter()
+                        .chain(s.where_clause.as_deref())
+                        .chain(s.having_clause.as_deref())
+                        .chain(s.group_clause.iter())
+                        .chain(s.sort_clause.iter())
+                        .collect(),
+                ),
+                _ => continue,
+            };
+            let mut stack = from;
+            while let Some(f) = stack.pop() {
+                match f.node.as_ref() {
+                    Some(N::RangeVar(rv)) => {
+                        let refname = rv
+                            .alias
+                            .as_ref()
+                            .map(|a| a.aliasname.clone())
+                            .unwrap_or_else(|| rv.relname.clone());
+                        let rel = if rv.schemaname.is_empty() {
+                            rv.relname.clone()
+                        } else {
+                            format!("{}.{}", rv.schemaname, rv.relname)
+                        };
+                        items.push((refname, rel));
+                    }
+                    Some(N::JoinExpr(j)) => {
+                        stack.extend(j.larg.as_deref());
+                        stack.extend(j.rarg.as_deref());
+                    }
+                    _ => {}
+                }
+            }
+            if items.is_empty() {
+                continue;
+            }
+            for e in scope.into_iter().filter_map(|e| e.node.as_ref()) {
+                for (n, _, _, _) in e.nodes() {
+                    let pg_query::NodeRef::ColumnRef(c) = n else {
+                        continue;
+                    };
+                    let words: Vec<String> = c.fields.iter().filter_map(word).collect();
+                    let conflict = match words.as_slice() {
+                        [q, f] if words.len() == c.fields.len() => {
+                            (self.record_field(q, f).is_some()
+                                || self.qualifying_record(q, f).is_some())
+                                && items.iter().any(|(r, rel)| r == q && has_column(rel, f))
+                        }
+                        [n] if c.fields.len() == 1 => {
+                            self.scalar(n).is_some()
+                                && items.iter().any(|(_, rel)| has_column(rel, n))
+                        }
+                        _ => false,
+                    };
+                    if conflict {
+                        let mut e = PlError::new(
+                            "42702",
+                            format!("column reference \"{}\" is ambiguous", words.join(".")),
+                        );
+                        e.detail = Some(
+                            "It could refer to either a PL/pgSQL variable or a table column."
+                                .into(),
+                        );
+                        e.from_sql = true;
+                        e.position =
+                            u32::try_from(text[..c.location.max(0) as usize].chars().count() + 1)
+                                .ok()
+                                .and_then(std::num::NonZeroU32::new);
+                        return Err(e);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// The value of a variable, or of a record as a whole (NULL while
     /// nothing has filled it), by datum number.
     fn datum_value(&self, d: usize) -> Option<(Bson, String)> {
@@ -2300,7 +2426,7 @@ impl Interp<'_> {
         let raw = sql.clone();
         let (sql, params, types) = self
             .bind(&sql)
-            .map_err(|e| e.with_sql_frame(|| bind_frame(text, mode)))?;
+            .map_err(|e| e.with_expr_frame(text, &raw, &raw, |_| bind_frame(text, mode)))?;
         let out = self.host.query(&sql, &params, &types).map_err(|e| {
             e.with_expr_frame(text, &raw, &sql, |e| {
                 let fails = |q: &str| {
@@ -2394,7 +2520,7 @@ impl Interp<'_> {
         let raw = sql.clone();
         let (sql, params, types) = self
             .bind(&sql)
-            .map_err(|e| e.with_sql_frame(|| bind_frame(text, mode)))?;
+            .map_err(|e| e.with_expr_frame(text, &raw, &raw, |_| bind_frame(text, mode)))?;
         let out = self.host.query(&sql, &params, &types).map_err(|e| {
             e.with_expr_frame(text, &raw, &sql, |e| {
                 let fails = |q: &str| {
@@ -3040,6 +3166,14 @@ impl Interp<'_> {
             _ => None,
         };
         if let Some(t) = sql_text {
+            if let (Some(at), true, false) = (e.position, e.from_sql, e.sql_framed || e.framed) {
+                // `_SPI_error_callback`: an error with a cursor position
+                // into the statement (one binding it raised, RP-838) moves
+                // it to an internal query, with no CONTEXT frame.
+                e.position = None;
+                e.internal = Some(Box::new((t.clone(), Some(at.get() as usize))));
+                e.sql_framed = true;
+            }
             e = e.with_sql_frame(|| Some(format!("SQL statement \"{t}\"")));
         }
         let line = body.get("lineno").and_then(Value::as_u64).unwrap_or(0);

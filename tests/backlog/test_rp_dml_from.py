@@ -15,17 +15,16 @@ import pytest
 from tests.backlog.test_rp_analysis_order import _answers
 
 
-@pytest.mark.backlog("RP-435")
-def test_explain_prints_the_join_and_the_index_scan(rust_pg: Any) -> None:
-    """EXPLAIN of an UPDATE ... FROM or a DELETE ... USING prints the plan
-    PostgreSQL makes for the join: a FROM-subquery of one row pulled up into
-    an Index Cond on the target's key, and a table in USING hash-joined."""
+@pytest.mark.backlog_fixed("RP-435")
+def test_explain_pulls_up_a_constant_subquery(rust_pg: Any) -> None:
+    """EXPLAIN of an UPDATE ... FROM or a DELETE ... USING a one-row
+    constant subquery pulled it up into an Index Cond on the target's key
+    (`pull_up_subqueries`); it printed a Seq Scan of the target."""
     assert _answers(
         rust_pg,
         [
             "explain (costs off) delete from k using (select 50 as a) t where k.a = t.a",
             "explain (costs off) update k set b = 'x' from (select 50 as a) t where k.a = t.a",
-            "explain (costs off) delete from k using e where k.a = e.a",
         ],
     ) == [
         (
@@ -44,6 +43,17 @@ def test_explain_prints_the_join_and_the_index_scan(rust_pg: Any) -> None:
                 ("        Index Cond: (a = 50)",),
             ],
         ),
+    ]
+
+
+@pytest.mark.backlog("RP-435")
+def test_explain_prints_the_join(rust_pg: Any) -> None:
+    """EXPLAIN of a DELETE ... USING a table prints the hash join
+    PostgreSQL makes of it."""
+    assert _answers(
+        rust_pg,
+        ["explain (costs off) delete from k using e where k.a = e.a"],
+    ) == [
         (
             "ok",
             [

@@ -7,8 +7,10 @@ found while working it:
   fixed: these are its regression tests beside the gap test in
   `test_rp_found_rp670.py`);
 - reading a field a record does not have was 42P01 (RP-837, fixed);
-- a qualified column reference that a record variable's field shares is
-  read as the field, not refused as ambiguous (RP-838).
+- a qualified column reference that a record variable's field shares was
+  read as the field, not refused as ambiguous (RP-838, fixed);
+- a FROM item's alias that names a record variable is substituted as the
+  variable's value, a syntax error (RP-982).
 
 The expected answers were measured on a private, freshly initdb'd
 PostgreSQL 15.19 cluster with `_SETUP`.
@@ -172,9 +174,79 @@ def test_a_missing_record_field_is_42703_in_every_statement(query: str, dsn: str
     assert _answer(dsn, query) == MISSING_FIELD_EVERYWHERE[query]
 
 
-@pytest.mark.backlog("RP-838")
+@pytest.mark.backlog_fixed("RP-838")
 def test_a_column_a_record_field_shares_is_ambiguous(dsn: str) -> None:
-    # `plpgsql_variable_conflict` is `error` by default: `r.a` names both
-    # the FROM item `r`'s column and the variable `r`'s field.
+    """Was: the field substituted as `$2`, then 42601 (RP-838).
+
+    `plpgsql_variable_conflict` is `error` by default: `r.a` names both
+    the FROM item `r`'s column and the variable `r`'s field.
+    """
     query = _R % "raise exception '%', (select r.a from t689 r);"
     assert _answer(dsn, query) == ("error", "42702", 'column reference "r.a" is ambiguous')
+
+
+def _verbose(dsn: str, query: str) -> tuple[object, ...]:
+    with psycopg.connect(dsn, autocommit=True) as c, pytest.raises(psycopg.Error) as info:
+        c.execute(query)
+    d = info.value.diag
+    return (
+        d.sqlstate,
+        d.message_primary,
+        d.message_detail,
+        d.internal_query,
+        d.internal_position,
+        d.context,
+    )
+
+
+_DETAIL = "It could refer to either a PL/pgSQL variable or a table column."
+# As PostgreSQL 15.19 reports each (`plpgsql_post_column_ref`, framed by
+# `_SPI_error_callback`): the query is the expression or statement as
+# written, the position the reference's; a FROM item of another name, or
+# a column the item lacks, is no conflict.
+AMBIGUOUS = {
+    _R % "raise exception '%', (select r.a from t689 r);": (
+        "(select r.a from t689 r)",
+        "9",
+        "PL/pgSQL function inline_code_block line 1 at RAISE",
+    ),
+    _R % "perform r.a from t689 r;": (
+        "SELECT r.a from t689 r",
+        "8",
+        "PL/pgSQL function inline_code_block line 1 at PERFORM",
+    ),
+    "do $$ declare r t689; x int; begin x := (select r.a from t689 r); end $$": (
+        "x := (select r.a from t689 r)",
+        "14",
+        "PL/pgSQL function inline_code_block line 1 at assignment",
+    ),
+}
+
+
+@pytest.mark.backlog_fixed("RP-838")
+@pytest.mark.parametrize("query", list(AMBIGUOUS))
+def test_an_ambiguous_reference_points_into_its_query(query: str, dsn: str) -> None:
+    q, at, context = AMBIGUOUS[query]
+    expected = ("42702", 'column reference "r.a" is ambiguous', _DETAIL, q, at, context)
+    assert _verbose(dsn, query) == expected
+
+
+@pytest.mark.backlog_fixed("RP-838")
+def test_a_bare_column_a_variable_shares_is_ambiguous(dsn: str) -> None:
+    query = "do $$ declare v int; begin raise exception '%', (select v from t689); end $$"
+    assert _answer(dsn, query) == ("error", "42702", 'column reference "v" is ambiguous')
+
+
+@pytest.mark.backlog_fixed("RP-838")
+def test_no_conflict_without_a_from_item_of_that_name(dsn: str) -> None:
+    body = "raise exception '%', (select r.a from t689 x limit 1);"
+    assert _answer(dsn, _R % body) == _raised("<NULL>")
+
+
+@pytest.mark.backlog("RP-982")
+def test_a_from_alias_a_record_variable_shares_is_not_the_variable(dsn: str) -> None:
+    # `s689.st` has no column `a`, so `r.a` is the variable's field (NULL);
+    # the alias `r` itself is no column reference, and PL/pgSQL never
+    # substitutes it.
+    body = "raise exception '%', (select r.a from s689.st r limit 1);"
+    assert _answer(dsn, _R % body) == _raised("<NULL>")

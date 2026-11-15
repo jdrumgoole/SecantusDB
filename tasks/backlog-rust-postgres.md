@@ -2036,19 +2036,20 @@ a regression test.
       (found while working RP-408).
       Backlog-ID: RP-414
       Verify: tests/backlog/test_rp_column_errors.py::test_missing_column_reported_as_written
-- [ ] **EXPLAIN of an UPDATE ... FROM or a DELETE ... USING prints a Seq
-      Scan of the target alone.** The statement is rewritten into
-      correlated subqueries over its FROM items (`rewrite_dml_from`), and
-      EXPLAIN prints that rewrite's scan: `explain (costs off) delete from k
-      using (select 50 as a) t where k.a = t.a` (and the UPDATE ... FROM
-      form) is `Seq Scan on k`, where PostgreSQL 15.19 pulls the subquery
-      up into `Index Scan using k_pkey on k` with `Index Cond: (a = 50)`;
-      `delete from k using e where k.a = e.a` prints no join, where
-      PostgreSQL prints a `Hash Join` with `Hash Cond: (e.a = k.a)` over
-      both tables. Measured on a private 15.19 cluster with `e(a int, b
-      text)` and `k(a int primary key, b text)` (found while working
-      RP-432).
-      Verify: tests/backlog/test_rp_dml_from.py::test_explain_prints_the_join_and_the_index_scan
+- [ ] **EXPLAIN of an UPDATE ... FROM or a DELETE ... USING a table
+      prints a Seq Scan of the target alone.** The statement is rewritten
+      into correlated subqueries over its FROM items (`rewrite_dml_from`),
+      and EXPLAIN prints that rewrite's scan (`Statement::Delete` /
+      `Update` in `explain.rs` is a ModifyTable over `table_scan` only):
+      `explain (costs off) delete from k using e where k.a = e.a` is `Seq
+      Scan on k`, where PostgreSQL 15.19 prints a `Hash Join` with `Hash
+      Cond: (e.a = k.a)` over both tables. Closing it means planning the
+      DML's join as the SELECT join path plans it and putting that tree
+      under the ModifyTable. (A one-row constant subquery in FROM / USING
+      is pulled up since 2026-11-15, `dml_pullup.rs`.) Measured on a
+      private 15.19 cluster with `e(a int, b text)` and `k(a int primary
+      key, b text)` (found while working RP-432).
+      Verify: tests/backlog/test_rp_dml_from.py::test_explain_prints_the_join
       Backlog-ID: RP-435
 - [ ] **An UPDATE ... FROM or DELETE ... USING reports an ambiguous name
       ahead of a missing column written before it.** `rewrite_dml_from`'s
@@ -2245,17 +2246,6 @@ Measured on PostgreSQL 15.19 (the data-modifying WITH on a private cluster).
       Verify: tests/backlog/test_rp_subquery_scope.py::test_hidden_join_name_reused_by_subquery
       Backlog-ID: RP-972
 
-- [ ] **EXPLAIN of an aliased JOIN prints no Hash Cond and keeps its WHERE
-      above the join.** PostgreSQL flattens a join alias's columns to the
-      sides' own (`flatten_join_alias_vars`), so `explain (costs off)
-      select j.c from (fs join fe on fs.a = fe.a) as j where j.b = 'x'`
-      prints the unaliased query's plan: `Hash Cond: (fs.a = fe.a)` and
-      `Filter: (b = 'x'::text)` on `fe`'s scan. Here neither line is
-      printed: the WHERE pushdown and the equivalence classes
-      (`pushdown_filters`) stop at an aliased JOIN, as a conjunct naming
-      `j` has no leaf to go to. The rows are right; the plan text is not.
-      Backlog-ID: RP-471
-      Verify: tests/backlog/test_rp_subquery_scope.py::test_aliased_join_plan
 
 ## Found while working RP-479 (2026-11-08)
 
@@ -3077,18 +3067,17 @@ Measured on a private, freshly initdb'd PostgreSQL 15.19 cluster with the
 `_SETUP` in `tests/backlog/test_rp_found_rp689.py`: `t689(a d689, v
 varchar(3), w dv689, c char(3))`, `d689` an `int` with `check (value > 0)`.
 
-- [ ] **A column a record variable's field shares is not ambiguous.** With
-      `declare r t689`, `(select r.a from t689 r)` is 42702 `column
-      reference "r.a" is ambiguous` on PostgreSQL 15.19
-      (`plpgsql.variable_conflict` is `error` by default, and
-      `plpgsql_pre_column_ref` / `resolve_column_ref` find both the FROM
-      item's column and the variable's field); here the variable's field is
-      substituted as a parameter, which the subquery then rejects as 42601
-      `syntax error at or near "$2"`. The interpreter reads any name a
-      variable has as the variable (the module comment of
-      `plpgsql_fn.rs` says so), a bare column name included.
-      Verify: tests/backlog/test_rp_found_rp689.py::test_a_column_a_record_field_shares_is_ambiguous
-      Backlog-ID: RP-838
+- [ ] **A FROM alias that names a record variable is substituted.** With
+      `declare r t689`, `(select r.a from s689.st r limit 1)` (`s689.st`
+      has no column `a`) is NULL on PostgreSQL 15.19: `r.a` is the
+      variable's field, and the alias `r` is no column reference. Here the
+      binder (`Interp::bind` in `plpgsql_fn.rs`, which works on tokens) also
+      replaces the alias token with the record's value, so the subquery is
+      42601 `syntax error at or near "$2"`. A fix binds only the tokens the
+      parse tree has as column references (RP-838 added such a parse of the
+      bound text, `check_column_conflicts`).
+      Verify: tests/backlog/test_rp_found_rp689.py::test_a_from_alias_a_record_variable_shares_is_not_the_variable
+      Backlog-ID: RP-982
 
 
 ## Found while working RP-845 (2026-11-11)
