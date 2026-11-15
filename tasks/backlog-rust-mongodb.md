@@ -646,17 +646,6 @@ These are explicit non-goals. Don't add them without a reason.
       the shaped ones were.
       Backlog-ID: RM-358
       Verify: tests/backlog/test_rm_355_364.py::test_a_query_of_every_kind_names_its_query_shape
-- [ ] **An `explain` of `$geoNear` fails.** mongod 8.2.11 explains
-      `aggregate` of `[{$geoNear: {near: [0, 0]}}]` over a collection with
-      a `2d` index, with or without `distanceField`, and prints its
-      `queryShapeHash`. This server runs the stage itself, but its
-      `explain` runs the pipeline against a namespace of its own
-      (`explain.dry.run`, `explain/mod.rs`) and fails with 26 (`$geoNear
-      requires a geo index to run, but <db>.explain.dry.run does not
-      exist`), as RM-466 did for `$planCacheStats`. A `$rankFusion` with a
-      `$geoNear` input fails the same way. Found 2026-11-12 (RM-358).
-      Verify: tests/backlog/test_rm_found_rm358.py::test_an_explain_of_geo_near_runs
-      Backlog-ID: RM-552
 - [ ] **`$scoreFusion` combines by `"average"`, not `"avg"`.** mongod
       8.2.11's `combination.method` is `"avg"` or `"expression"` (its IDL
       enum, `kAvg: "avg"`) and refuses `"average"` with 2 (`Enumeration
