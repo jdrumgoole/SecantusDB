@@ -2,7 +2,7 @@
 (2026-11-07).
 
 - RP-492: a syntax error in a block the function interpreter compiles
-  carries no statement position.
+  carried no statement position (fixed: it points at its token).
 
 The expected answers were measured on PostgreSQL 15.19; a DO block that
 does not run creates no object, so the shared reference cluster answers
@@ -57,7 +57,7 @@ COMPILE_ERROR = {
 }
 
 
-@pytest.mark.backlog("RP-492")
+@pytest.mark.backlog_fixed("RP-492")
 @pytest.mark.parametrize("body", list(COMPILE_ERROR))
 def test_compile_error_has_a_position(body: str, dsn: str) -> None:
     assert _do(dsn, body) == COMPILE_ERROR[body]

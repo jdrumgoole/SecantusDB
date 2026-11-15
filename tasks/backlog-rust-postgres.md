@@ -2349,18 +2349,6 @@ Measured on PostgreSQL 15.19 (the data-modifying WITH on a private cluster).
 
 ## Found while working RP-486 (2026-11-07)
 
-- [ ] **A syntax error in a DO block the interpreter compiles carries no
-      position.** A body with a DECLARE section or a label is compiled by
-      the function interpreter, and its 42601 reaches the client with no
-      statement position: `do $$ declare x int; begin raise notice 'z' end
-      $$` is `syntax error at or near "end"` at 45 on PostgreSQL 15.19,
-      `do $$ <<blk>> begin raise notice 'z' end $$` the same at 38, and
-      `do $$ <<blk>> begin raise notice 'z'; end nope $$` `end label "nope"
-      differs from block's label "blk"` at 43. Here each message matches
-      and no position is sent. (The fast path for a plain `begin ... end`
-      body already points at the token.)
-      Verify: tests/backlog/test_rp_do_compile_errors.py::test_compile_error_has_a_position
-      Backlog-ID: RP-492
 
 ## Found while working RP-485 (2026-11-11)
 

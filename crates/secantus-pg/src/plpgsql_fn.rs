@@ -162,6 +162,8 @@ pub struct QueryOut {
 
 /// What the interpreter asks of the server.
 mod block_scope;
+mod errpos;
+pub use errpos::compile_error_offset;
 mod open_cursor;
 mod percent_type;
 mod row_type;
