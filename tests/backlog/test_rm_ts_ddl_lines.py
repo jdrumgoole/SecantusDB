@@ -56,11 +56,11 @@ def _named(rust_mongo: Any, mongod_rs: Any, op: Callable[[Any], Any]) -> dict:
     }
 
 
-@pytest.mark.backlog("RM-582")
+@pytest.mark.backlog_fixed("RM-582")
 def test_a_create_indexes_that_builds_nothing_names_cmd(rust_mongo: Any, mongod_rs: Any) -> None:
     """mongod 8.2.11's line for a `createIndexes` of an index that is there
     already -- `{x: 1}` on a collection, a time-series collection's own
-    `{m: 1, t: 1}` -- names `<db>.$cmd`; this server's names the
+    `{m: 1, t: 1}` -- names `<db>.$cmd`; this server's named the
     collection."""
 
     def op(db: Any) -> None:

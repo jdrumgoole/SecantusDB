@@ -791,14 +791,6 @@ These are explicit non-goals. Don't add them without a reason.
       working RM-485, 2026-11-13.
       Verify: tests/backlog/test_rm_view_ddl_refusals.py::test_a_drop_indexes_of_system_views_answers
       Backlog-ID: RM-588
-- [ ] **A `createIndexes` that builds nothing names its collection.**
-      mongod 8.2.11's line for a `createIndexes` of an index that is there
-      already (`{x: 1}` on a collection, a time-series collection's own
-      `{m: 1, t: 1}`) names `<db>.$cmd`; this server's names the collection
-      (the time-series one's buckets since RM-484). Found while working
-      RM-484, 2026-11-13.
-      Verify: tests/backlog/test_rm_ts_ddl_lines.py::test_a_create_indexes_that_builds_nothing_names_cmd
-      Backlog-ID: RM-582
 - [ ] **An index build of a time-series collection writes no build line.**
       mongod 8.2.11 writes two lines for a `createIndexes` that builds an
       index of a time-series collection, the command's and its build
