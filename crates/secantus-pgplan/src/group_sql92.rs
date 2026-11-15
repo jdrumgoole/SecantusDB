@@ -141,6 +141,24 @@ fn raised_before_group_by(e: &Error) -> bool {
     }
 }
 
+/// `s`'s WINDOW clause with each definition emptied to `()`, its name and
+/// reference kept: `transformWindowDefinitions` runs after GROUP BY and
+/// DISTINCT ON in `transformSelectStmt`, so a cut planned for the errors
+/// ahead of a constant's must not analyse a definition's own expressions,
+/// while an `over w` still names its window (RP-885).
+fn blank_windows(s: &mut SelectStmt) {
+    for n in &mut s.window_clause {
+        if let Some(pg_query::NodeEnum::WindowDef(w)) = n.node.as_mut() {
+            w.partition_clause.clear();
+            w.order_clause.clear();
+            w.start_offset = None;
+            w.end_offset = None;
+            // `over ()`'s mask: RANGE UNBOUNDED PRECEDING AND CURRENT ROW.
+            w.frame_options = 0x422;
+        }
+    }
+}
+
 /// PostgreSQL's 42601 for a GROUP BY constant that is no integer, unless
 /// the statement fails earlier (module docs). `plan` plans a statement.
 pub(crate) fn check(s: &SelectStmt, plan: &dyn Fn(&SelectStmt) -> Result<Statement>) -> Result<()> {
@@ -150,6 +168,7 @@ pub(crate) fn check(s: &SelectStmt, plan: &dyn Fn(&SelectStmt) -> Result<Stateme
     let mut cut = s.clone();
     cut.group_clause = kept;
     cut.distinct_clause.clear();
+    blank_windows(&mut cut);
     if let Err(e) = plan(&cut) {
         if raised_before_group_by(&e) {
             return Err(e);
@@ -182,6 +201,7 @@ pub(crate) fn check_distinct_on(
     cut.limit_count = None;
     cut.limit_offset = None;
     cut.locking_clause.clear();
+    blank_windows(&mut cut);
     // The clauses analysed before DISTINCT ON, then its items before this
     // one. Planned with them, a statement can fail the ORDER BY match,
     // which is checked only after every item, ahead of an ORDER BY error
@@ -274,6 +294,7 @@ pub(crate) fn check_order_by(
     };
     let mut cut = s.clone();
     cut.sort_clause = s.sort_clause[..before].to_vec();
+    blank_windows(&mut cut);
     cut.group_clause.clear();
     cut.distinct_clause.clear();
     cut.limit_count = None;

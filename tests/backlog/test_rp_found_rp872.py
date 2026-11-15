@@ -75,7 +75,7 @@ def test_a_distinct_on_position_is_checked_against_the_select_list(
     assert _answer(dsn, query) == answer
 
 
-@pytest.mark.backlog("RP-885")
+@pytest.mark.backlog_fixed("RP-885")
 @pytest.mark.parametrize(
     ("query", "answer"),
     [
@@ -96,7 +96,8 @@ def test_a_window_definition_is_analysed_after_the_constant(
 ) -> None:
     """`transformSelectStmt` runs `transformWindowDefinitions` after the
     GROUP BY and DISTINCT ON clauses on PostgreSQL 15.19, so a constant's
-    42601 comes first. Here the window's 42703 does."""
+    42601 comes first. Before RP-885 the window's 42703 did: the cut
+    statement planned for the earlier errors analysed the definitions."""
     assert _answer(dsn, query) == answer
 
 

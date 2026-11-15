@@ -3537,18 +3537,6 @@ Measured on PostgreSQL 15.19 (the shared reference on port 5415): every
 statement is VALUES-only and runs there as written. The gap tests are in
 `tests/backlog/test_rp_found_rp854.py`.
 
-- [ ] **A window definition's error comes ahead of a GROUP BY or DISTINCT ON
-      constant's.** `select count(*) over w from (values (1)) v(a) group by
-      2.5 window w as (order by nosuch)` is 42601 `non-integer constant in
-      GROUP BY` at 56 on PostgreSQL 15.19, and with `distinct on (1.5)` in
-      place of the GROUP BY it is `non-integer constant in DISTINCT ON` at
-      21: `transformWindowDefinitions` runs after both clauses in
-      `transformSelectStmt`. Here each is the window's 42703 `column
-      "nosuch" does not exist`: `group_sql92`'s cut statement keeps the
-      WINDOW clause, and dropping it would leave `over w` naming no window.
-      Found while working RP-872 (2026-11-12).
-      Verify: tests/backlog/test_rp_found_rp872.py::test_a_window_definition_is_analysed_after_the_constant
-      Backlog-ID: RP-885
 - [ ] **A GROUP BY position inside a grouping set or a parenthesised list
       is grouped as a value.** `select a from (values (1), (2)) v(a) group
       by rollup(1)` groups by `a` on PostgreSQL 15.19 (`flatten_grouping_sets`
