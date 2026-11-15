@@ -8584,3 +8584,23 @@ fn tableoid_in_a_check_is_a_column() {
         "argument of CHECK must be type boolean, not type oid"
     );
 }
+
+/// A write's unknown bare column is located at the reference PostgreSQL
+/// transforms first -- WHERE, then RETURNING, then SET -- not at the first
+/// matching word of the text, the target (RP-524).
+#[test]
+fn a_writes_unknown_column_is_at_the_reference_transformed_first() {
+    for (sql, needle) in [
+        ("update t x set name = t::text", "t::"),
+        ("update t x set name = 'q' where t is null", "t is"),
+        ("update t set name = zz where zz = 1", "zz = 1"),
+        ("update t set name = zz returning zz", "zz\0"),
+        ("delete from t where n = 1 returning zz", "zz\0"),
+    ] {
+        let at = format!("{sql}\0").find(needle).unwrap() as i32;
+        take_error_location();
+        let err = plan(sql, &lookup).expect_err(sql);
+        assert_eq!(err.sqlstate(), "42703", "{sql}: {err}");
+        assert_eq!(take_error_location(), Some(at), "{sql}");
+    }
+}

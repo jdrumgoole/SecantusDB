@@ -5882,6 +5882,20 @@ fn analysis_refusals(
 /// [`plan_with_subqueries`] for one parsed statement.
 fn plan_query_node(
     sql: &str,
+    node: pg_query::protobuf::Node,
+    lookup: &dyn Fn(&str) -> Option<TableDef>,
+    params: &[Bson],
+    run: SubqueryRunner<'_>,
+) -> Result<Statement> {
+    let exprs = node.node.as_ref().map(write_name_exprs).unwrap_or_default();
+    locate_write_name_error(
+        plan_query_node_inner(sql, node, lookup, params, run),
+        &exprs,
+    )
+}
+
+fn plan_query_node_inner(
+    sql: &str,
     mut node: pg_query::protobuf::Node,
     lookup: &dyn Fn(&str) -> Option<TableDef>,
     params: &[Bson],
@@ -7076,8 +7090,14 @@ fn plan_node(
                 Err(_) => Err(Error::Unsupported("this transaction statement".into())),
             }
         }
-        N::UpdateStmt(u) => plan_update(&u, lookup, params),
-        N::DeleteStmt(d) => plan_delete(&d, lookup, params),
+        N::UpdateStmt(u) => {
+            let exprs = write_name_exprs(&N::UpdateStmt(u.clone()));
+            locate_write_name_error(plan_update(&u, lookup, params), &exprs)
+        }
+        N::DeleteStmt(d) => {
+            let exprs = write_name_exprs(&N::DeleteStmt(d.clone()));
+            locate_write_name_error(plan_delete(&d, lookup, params), &exprs)
+        }
         N::TruncateStmt(t) => plan_truncate(&t, lookup),
         other => Err(Error::Unsupported(disc(&other))),
     }
@@ -23592,6 +23612,15 @@ fn range_var_visible_name(r: &pg_query::protobuf::RangeVar) -> String {
 /// A RETURNING item that reads a FROM item reads the joined row
 /// (`wrap_foreign_returning`).
 fn rewrite_dml_from(
+    node: &mut pg_query::protobuf::Node,
+    lookup: &dyn Fn(&str) -> Option<TableDef>,
+    params: &[Bson],
+) -> Result<()> {
+    let exprs = node.node.as_ref().map(write_name_exprs).unwrap_or_default();
+    locate_write_name_error(rewrite_dml_from_inner(node, lookup, params), &exprs)
+}
+
+fn rewrite_dml_from_inner(
     node: &mut pg_query::protobuf::Node,
     lookup: &dyn Fn(&str) -> Option<TableDef>,
     params: &[Bson],
@@ -46599,6 +46628,76 @@ fn rewrite_write_target_rows(
         })?;
     }
     Ok(())
+}
+
+/// A write's expressions in the order PostgreSQL transforms them:
+/// `transformUpdateStmt` reads WHERE, then RETURNING, then SET;
+/// `transformDeleteStmt` WHERE, then RETURNING (RP-524). Cloned, so the
+/// caller may go on to rewrite the statement.
+fn write_name_exprs(stmt: &N) -> Vec<pg_query::protobuf::Node> {
+    let (wh, ret, set): (_, &[_], &[_]) = match stmt {
+        N::UpdateStmt(u) => (u.where_clause.as_deref(), &u.returning_list, &u.target_list),
+        N::DeleteStmt(d) => (d.where_clause.as_deref(), &d.returning_list, &[]),
+        _ => return Vec::new(),
+    };
+    wh.into_iter()
+        .chain(returning_vals(ret))
+        .chain(returning_vals(set))
+        .cloned()
+        .collect()
+}
+
+/// The values of a target or RETURNING list's `ResTarget`s.
+fn returning_vals(
+    list: &[pg_query::protobuf::Node],
+) -> impl Iterator<Item = &pg_query::protobuf::Node> {
+    list.iter().filter_map(|t| match t.node.as_ref() {
+        Some(N::ResTarget(rt)) => rt.val.as_deref(),
+        _ => None,
+    })
+}
+
+/// A write's unknown (42703) or ambiguous (42702) bare column raised with
+/// no location: PostgreSQL's `transformColumnRef` reports it at the
+/// `ColumnRef` as written, so point it at the first bare reference of that
+/// name in `exprs`, taken in the order the statement is transformed
+/// (RP-524), rather than leave it to a search of the text, which finds the
+/// target or a FROM item of the same name first.
+fn locate_write_name_error<T>(out: Result<T>, exprs: &[pg_query::protobuf::Node]) -> Result<T> {
+    let Err(e) = &out else {
+        return out;
+    };
+    if peek_error_location().is_some() || error_unpositioned() {
+        return out;
+    }
+    let name = match e {
+        Error::UndefinedColumn(n) => n.clone(),
+        Error::Sqlstate("42702", m) => match m
+            .strip_prefix("column reference \"")
+            .and_then(|r| r.strip_suffix("\" is ambiguous"))
+        {
+            Some(n) => n.to_string(),
+            None => return out,
+        },
+        _ => return out,
+    };
+    let found = std::cell::Cell::new(None);
+    let bare = |n: &pg_query::protobuf::Node| match n.node.as_ref() {
+        Some(N::ColumnRef(c))
+            if c.fields.len() == 1
+                && matches!(c.fields[0].node.as_ref(), Some(N::String(sv)) if sv.sval == name) =>
+        {
+            found.set(Some(c.location));
+            true
+        }
+        _ => false,
+    };
+    if exprs.iter().any(|e| expr_any(e, &bare)) {
+        if let Some(loc) = found.get() {
+            set_error_location(loc);
+        }
+    }
+    out
 }
 
 /// The expressions of a write's RETURNING list.

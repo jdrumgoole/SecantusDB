@@ -1591,7 +1591,7 @@ WRITE_NAME_ERROR_POSITION = {
 }
 
 
-@pytest.mark.backlog("RP-524")
+@pytest.mark.backlog_fixed("RP-524")
 @pytest.mark.parametrize("query", list(WRITE_NAME_ERROR_POSITION))
 def test_write_name_error_position(query: str, dsn: str) -> None:
     assert answer(dsn, query) == WRITE_NAME_ERROR_POSITION[query]

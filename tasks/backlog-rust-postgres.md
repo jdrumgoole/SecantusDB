@@ -2419,22 +2419,6 @@ Measured on a private PostgreSQL 15.19 cluster.
       Verify: tests/backlog/test_rp_found_rp514.py::test_builtin_routine_has_initdb_description
       Backlog-ID: RP-969
 
-## Found while working RP-516 (2026-11-08)
-
-Measured on a private PostgreSQL 15.19 cluster with `fe(a int, b text)`
-and `fs(a int, c text)`.
-
-- [ ] **A write's name error is reported away from the reference.**
-      PostgreSQL 15.19 positions each at the name as written. Here `update
-      fs x set c = fs::text` and `... where fs is null` are 42703 at 8 (the
-      target), not 21 / 31; `update fs set c = 'q' from fe e where e.a =
-      fs.a returning fe` is 42703 at 28 (the FROM item), not 60; and an
-      ambiguous bare column in an UPDATE ... FROM's or DELETE ... USING's
-      RETURNING (`returning a`) is 42702 with no position, not 59 / 53.
-      RP-414 has the reference's name and qualifier; this is where it is.
-      Backlog-ID: RP-524
-      Verify: tests/backlog/test_rp_subquery_scope.py::test_write_name_error_position
-
 ## Found while working RP-527 (2026-11-08)
 
 Measured on a private PostgreSQL 15.19 cluster. The gap tests are in
