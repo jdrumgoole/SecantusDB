@@ -2967,24 +2967,6 @@ with ICU) with the `_SETUP` in `tests/backlog/test_rp_found_rp782.py`:
       Verify: tests/backlog/test_rp_found_rp782.py::test_pg_get_viewdef_of_the_remaining_system_views
       Backlog-ID: RP-798
 
-## Found while working RP-808 (2026-11-10)
-
-Measured on a private, freshly initdb'd PostgreSQL 15.19 cluster with the
-`_SETUP` in `tests/backlog/test_rp_found_rp808.py`: `t808(i int, b bool,
-s text)`.
-
-- [ ] **AND / OR / NOT report a non-boolean argument at the operator.**
-      `coerce_to_boolean` reports at the argument's `exprLocation`, an
-      operator expression's leftmost token: `select ('x' || 'y') and
-      true` is 42804 at position 9 on PostgreSQL 15.19, `(s || 'y') or
-      true` at 9, `insert ... values (1 and true)` at the `1` (30). Here
-      they are reported at the `||` or the `and` (25, 11, 36), and `not
-      ('x' || 'y')` one character early (12 for 13). `optype`'s
-      `bool_argument` and `const_value`'s BoolExpr arm use
-      `expr_location`; RP-808's boolean test uses `srf_place::leftmost`.
-      Verify: tests/backlog/test_rp_found_rp808.py::test_a_connectives_argument_is_reported_at_its_leftmost_token
-      Backlog-ID: RP-812
-
 ## Found while working RP-816 (2026-11-11)
 
 Measured on a private PostgreSQL 15.19 cluster.
