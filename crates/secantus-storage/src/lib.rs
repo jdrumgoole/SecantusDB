@@ -395,6 +395,9 @@ pub struct UserTransactionHandle {
     /// entry): what its commit is recorded as touching ([`NS_COMMITS`]).
     written_ns: Vec<WrittenNs>,
     unattributed: bool,
+    /// The catalog documents it wrote, logged at its commit
+    /// ([`CatalogDocChange`]).
+    catalog_docs: CatalogDocWrites,
     /// [`COLL_TABLE_GEN`] just before the transaction's snapshot was taken:
     /// while it is still current, the registry this snapshot sees is the
     /// one every other session sees too (see `is_timeseries`).
@@ -6502,7 +6505,199 @@ thread_local! {
     static STMT_OPLOG_NS: RefCell<Vec<WrittenNs>> = const { RefCell::new(Vec::new()) };
     /// The statement transaction wrote something no collection accounts for.
     static STMT_UNATTRIBUTED: Cell<bool> = const { Cell::new(false) };
+    /// The catalog documents the same statement transaction wrote.
+    static STMT_CATALOG_DOCS: RefCell<CatalogDocWrites> = RefCell::new(CatalogDocWrites::default());
 }
+
+/// One change of a catalog collection's documents (a collection named
+/// `__...`), as [`Storage::catalog_doc_changes_since`] reports it: the
+/// document with `_id` `id` of `(db, coll)` was inserted, replaced or
+/// deleted, or -- `id` `None` -- any of `(db, coll)`'s documents may have
+/// changed (every collection of `db` when `coll` is empty, every database's
+/// when `db` is too). PostgreSQL's `inval.c` keeps the same record: each
+/// committed transaction's changed catalog rows, by key, so a backend
+/// rebuilds only the cache entries they name (RP-911).
+#[derive(Clone, Debug, PartialEq)]
+pub struct CatalogDocChange {
+    pub db: String,
+    pub coll: String,
+    pub id: Option<Bson>,
+}
+
+impl CatalogDocChange {
+    /// Does it reach `(db, coll)`'s documents?
+    pub fn reaches(&self, db: &str, coll: &str) -> bool {
+        (self.db.is_empty() || self.db == db) && (self.coll.is_empty() || self.coll == coll)
+    }
+}
+
+/// The catalog documents one transaction wrote, logged at its commit.
+#[derive(Default, Debug)]
+struct CatalogDocWrites {
+    changes: Vec<CatalogDocChange>,
+    /// It wrote something whose catalog documents are not known (a command
+    /// naming a catalog collection, a write no entry attributes): its
+    /// commit counts as changing every catalog document.
+    unknown: bool,
+}
+
+impl CatalogDocWrites {
+    fn note_entry(&mut self, e: &OplogEntry, op: Option<&str>, name: Option<&str>) {
+        let Some((db, coll)) = name.and_then(|n| n.split_once('.')) else {
+            self.unknown = true;
+            return;
+        };
+        match op {
+            Some("i" | "u" | "d") => {
+                if !coll.starts_with("__") {
+                    return;
+                }
+                let holder = if op == Some("u") { "o2" } else { "o" };
+                let id = match e {
+                    OplogEntry::Doc(d) => d
+                        .get_document(holder)
+                        .ok()
+                        .and_then(|o| o.get("_id").cloned()),
+                    OplogEntry::Raw(r) => r
+                        .get_document(holder)
+                        .ok()
+                        .and_then(|o| o.get("_id").ok().flatten())
+                        .and_then(|v| Bson::try_from(v.to_raw_bson()).ok()),
+                };
+                self.changes.push(CatalogDocChange {
+                    db: db.to_string(),
+                    coll: coll.to_string(),
+                    id,
+                });
+            }
+            // A no-op names no document.
+            Some("n") => {}
+            Some("c") => self.note_command(e, db),
+            _ => self.whole(db, ""),
+        }
+    }
+
+    /// `(db, coll)`'s documents (every catalog collection of `db` when
+    /// `coll` is empty) may all have changed.
+    fn whole(&mut self, db: &str, coll: &str) {
+        self.changes.push(CatalogDocChange {
+            db: db.to_string(),
+            coll: coll.to_string(),
+            id: None,
+        });
+    }
+
+    /// A command entry: the catalog collections whose documents it can
+    /// change, read off its `o`. A collection's creation and its index
+    /// commands change no document; a drop or a rename changes all of the
+    /// collections it names; anything else counts as every catalog
+    /// collection of the database.
+    fn note_command(&mut self, e: &OplogEntry, db: &str) {
+        let first: Option<(String, Option<String>, Option<String>)> = match e {
+            OplogEntry::Doc(d) => d.get_document("o").ok().and_then(|o| {
+                let (k, v) = o.iter().next()?;
+                Some((
+                    k.clone(),
+                    v.as_str().map(str::to_string),
+                    o.get_str("to").ok().map(str::to_string),
+                ))
+            }),
+            OplogEntry::Raw(r) => r.get_document("o").ok().and_then(|o| {
+                let (k, v) = o.iter().next()?.ok()?;
+                Some((
+                    k.to_string(),
+                    v.as_str().map(str::to_string),
+                    o.get_str("to").ok().map(str::to_string),
+                ))
+            }),
+        };
+        let Some((cmd, arg, to)) = first else {
+            return self.whole(db, "");
+        };
+        match cmd.as_str() {
+            "create" | "createIndexes" | "dropIndexes" | "startIndexBuild" | "commitIndexBuild"
+            | "abortIndexBuild" | "collMod" => {}
+            "drop" => match arg {
+                Some(c) if !c.starts_with("__") => {}
+                Some(c) => self.whole(db, &c),
+                None => self.whole(db, ""),
+            },
+            "renameCollection" => {
+                for ns in [arg, to] {
+                    match ns.as_deref().and_then(|n| n.split_once('.')) {
+                        Some((_, c)) if !c.starts_with("__") => {}
+                        Some((d, c)) => self.whole(d, c),
+                        None => self.whole(db, ""),
+                    }
+                }
+            }
+            _ => self.whole(db, ""),
+        }
+    }
+
+    fn extend(&mut self, other: CatalogDocWrites) {
+        self.unknown |= other.unknown;
+        self.changes.extend(other.changes);
+    }
+
+    /// Log what a committed transaction wrote. `exact` is false when its
+    /// commit could not attribute its writes; `rows` are the collections it
+    /// wrote rows of, and a catalog collection among them that no entry
+    /// names counts as changed throughout.
+    fn log_committed(mut self, exact: bool, rows: &[(String, String)]) {
+        for (db, coll) in rows {
+            let coll = row_collection(coll);
+            if coll.starts_with("__") && !self.changes.iter().any(|c| c.db == *db && c.coll == coll)
+            {
+                self.changes.push(CatalogDocChange {
+                    db: db.clone(),
+                    coll: coll.to_string(),
+                    id: None,
+                });
+            }
+        }
+        if !exact || self.unknown {
+            self.changes = vec![CatalogDocChange {
+                db: String::new(),
+                coll: String::new(),
+                id: None,
+            }];
+        }
+        if self.changes.is_empty() {
+            return;
+        }
+        let mut log = catalog_doc_log().lock().unwrap_or_else(|e| e.into_inner());
+        for c in self.changes {
+            log.serial += 1;
+            let n = log.serial;
+            log.entries.push_back((n, c));
+            while log.entries.len() > CATALOG_DOC_LOG_MAX {
+                if let Some((old, _)) = log.entries.pop_front() {
+                    log.forgotten = old;
+                }
+            }
+        }
+    }
+}
+
+/// Every committed change of a catalog document, numbered in commit order.
+#[derive(Default)]
+struct CatalogDocLog {
+    serial: u64,
+    /// The number of the last change forgotten.
+    forgotten: u64,
+    entries: std::collections::VecDeque<(u64, CatalogDocChange)>,
+}
+
+fn catalog_doc_log() -> &'static Mutex<CatalogDocLog> {
+    static LOG: OnceLock<Mutex<CatalogDocLog>> = OnceLock::new();
+    LOG.get_or_init(|| Mutex::new(CatalogDocLog::default()))
+}
+
+/// More logged changes than this are forgotten, oldest first: a reader that
+/// fell further behind re-reads everything, as PostgreSQL resets the caches
+/// of a backend that falls behind its invalidation queue.
+const CATALOG_DOC_LOG_MAX: usize = 8192;
 
 /// Record what the oplog entries a write is emitting say it wrote: each
 /// insert / update / delete names its collection; any other entry (a
@@ -6511,11 +6706,13 @@ thread_local! {
 fn note_written_entries(entries: &[OplogEntry]) {
     let mut ns: Vec<WrittenNs> = Vec::new();
     let mut unattributed = false;
+    let mut catalog = CatalogDocWrites::default();
     for e in entries {
         let (op, name) = match e {
             OplogEntry::Doc(d) => (d.get_str("op").ok(), d.get_str("ns").ok()),
             OplogEntry::Raw(r) => raw_op_ns(r),
         };
+        catalog.note_entry(e, op, name);
         let changed = match op {
             Some("i") => false,
             Some("u" | "d") => true,
@@ -6536,6 +6733,7 @@ fn note_written_entries(entries: &[OplogEntry]) {
         // running on this thread, as `note_coll_table_write` uses it.
         let h = unsafe { &mut *hp };
         h.unattributed |= unattributed;
+        h.catalog_docs.extend(catalog);
         for (db, coll, changed) in ns {
             add_written(&mut h.written_ns, &db, &coll, changed);
         }
@@ -6544,8 +6742,10 @@ fn note_written_entries(entries: &[OplogEntry]) {
         // cannot be attributed, so make every commit on this thread global
         // until the statement scope resets it.
         STMT_UNATTRIBUTED.with(|u| u.set(true));
+        STMT_CATALOG_DOCS.with(|c| c.borrow_mut().unknown = true);
     } else {
         STMT_UNATTRIBUTED.with(|u| u.set(u.get() || unattributed));
+        STMT_CATALOG_DOCS.with(|c| c.borrow_mut().extend(catalog));
         STMT_OPLOG_NS.with(|w| {
             let mut w = w.borrow_mut();
             for (db, coll, changed) in ns {
@@ -8423,6 +8623,38 @@ impl Storage {
         self.prune_ctx.max_entries.store(n, Ordering::Relaxed);
     }
 
+    /// The number of the last committed change of a catalog document
+    /// ([`CatalogDocChange`]): a reader records it BEFORE it reads, and
+    /// [`Storage::catalog_doc_changes_since`] names what moved after.
+    pub fn catalog_doc_serial(&self) -> u64 {
+        catalog_doc_log()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .serial
+    }
+
+    /// The catalog documents committed changes numbered above `since`
+    /// changed, and the number of the last, or `None` when the log no
+    /// longer reaches back to `since` (the reader re-reads everything).
+    /// Every change is logged after its commit and before the commit
+    /// returns, so a reader that sees a commit's effect in any other way
+    /// (a PostgreSQL-layer catalog version) finds its keys here.
+    pub fn catalog_doc_changes_since(&self, since: u64) -> Option<(u64, Vec<CatalogDocChange>)> {
+        let log = catalog_doc_log().lock().unwrap_or_else(|e| e.into_inner());
+        if log.forgotten > since || since > log.serial {
+            return None;
+        }
+        let mut out: Vec<CatalogDocChange> = log
+            .entries
+            .iter()
+            .rev()
+            .take_while(|(n, _)| *n > since)
+            .map(|(_, c)| c.clone())
+            .collect();
+        out.reverse();
+        Some((log.serial, out))
+    }
+
     /// Whether this store keeps an oplog at all.
     pub fn oplog_enabled(&self) -> bool {
         self.enable_oplog
@@ -8661,10 +8893,16 @@ impl Storage {
         // enclosing scope's are kept aside and put back after.
         // Restored on drop: a statement transaction nested in another's
         // scope (`outside_user_transaction`) records its own writes only.
-        struct WrittenScope(Vec<(String, String)>, Vec<WrittenNs>, bool);
+        struct WrittenScope(
+            Vec<(String, String)>,
+            Vec<WrittenNs>,
+            bool,
+            CatalogDocWrites,
+        );
         impl Drop for WrittenScope {
             fn drop(&mut self) {
                 STMT_UNATTRIBUTED.with(|u| u.set(self.2));
+                STMT_CATALOG_DOCS.with(|c| *c.borrow_mut() = std::mem::take(&mut self.3));
                 STMT_WRITTEN.with(|w| *w.borrow_mut() = std::mem::take(&mut self.0));
                 STMT_OPLOG_NS.with(|w| *w.borrow_mut() = std::mem::take(&mut self.1));
             }
@@ -8673,6 +8911,7 @@ impl Storage {
             STMT_WRITTEN.with(|w| std::mem::take(&mut *w.borrow_mut())),
             STMT_OPLOG_NS.with(|w| std::mem::take(&mut *w.borrow_mut())),
             STMT_UNATTRIBUTED.with(|u| u.replace(false)),
+            STMT_CATALOG_DOCS.with(|c| std::mem::take(&mut *c.borrow_mut())),
         );
         session.begin_transaction(None)?;
         match f() {
@@ -8719,6 +8958,14 @@ impl Storage {
                     }
                     return Err(e.into());
                 }
+                // Committed: what it wrote of the catalog is logged before
+                // anything after the statement can read it (RP-911).
+                STMT_CATALOG_DOCS
+                    .with(|c| std::mem::take(&mut *c.borrow_mut()))
+                    .log_committed(
+                        self.enable_oplog && self.async_oplog.is_none(),
+                        &STMT_WRITTEN.with(|w| w.borrow().clone()),
+                    );
                 if async_mode {
                     // Committed: mint seqs for the buffered entries and hand them
                     // to the drainer (which persists them + wakes tailers).
@@ -11370,6 +11617,7 @@ impl Storage {
             deferred_keys: BTreeMap::new(),
             written_ns: Vec::new(),
             unattributed: false,
+            catalog_docs: CatalogDocWrites::default(),
             registry_gen: 0,
             planner_gen: None,
             catalog_epoch: 0,
@@ -11818,6 +12066,18 @@ impl Storage {
                     return Err(e.into());
                 }
                 LAST_COMMIT_TS.with(|t| t.set(first_ts.map(u64_ts)));
+                // What it wrote of the catalog, logged before the commit
+                // returns to anything that could read past it (RP-911).
+                {
+                    let rows = handle
+                        .held
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .collections
+                        .clone();
+                    std::mem::take(&mut handle.catalog_docs)
+                        .log_committed(self.enable_oplog && self.async_oplog.is_none(), &rows);
+                }
                 if let Some(end) = handle.minted_ranges.iter().map(|r| r.1).max() {
                     note_logged(end);
                 }
@@ -11867,6 +12127,7 @@ impl Storage {
     /// Roll back the transaction's WT session, then **close** it. Idempotent;
     /// best-effort rollback (closing the session also rolls back).
     pub fn rollback_user_transaction(&self, handle: &mut UserTransactionHandle) -> Result<()> {
+        handle.catalog_docs = CatalogDocWrites::default();
         self.rollback_user_transaction_inner(handle, true)
     }
 

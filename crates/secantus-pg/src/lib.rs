@@ -810,6 +810,51 @@ fn catalog_cache() -> &'static CatalogCache {
     })
 }
 
+/// A stored document's `_id`, when it is a string.
+fn raw_string_id(b: &[u8]) -> Option<String> {
+    bson::RawDocument::from_bytes(b)
+        .ok()?
+        .get_str("_id")
+        .ok()
+        .map(str::to_string)
+}
+
+/// Per `(storage, db, collection)`, the last committed read of a type
+/// catalog collection and the catalog key log's position it is current to:
+/// what [`PgHandler::patched_type_catalog`] patches from (RP-911).
+type CatalogPatchBases<K, V> = Mutex<HashMap<K, (u64, V)>>;
+
+fn type_catalog_bases() -> &'static CatalogPatchBases<(usize, String, &'static str), CatalogDocs> {
+    static BASES: OnceLock<CatalogPatchBases<(usize, String, &'static str), CatalogDocs>> =
+        OnceLock::new();
+    BASES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn catalog_patch_base<K: std::hash::Hash + Eq, V: Clone>(
+    bases: &CatalogPatchBases<K, V>,
+    key: &K,
+) -> Option<(u64, V)> {
+    bases
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(key)
+        .cloned()
+}
+
+/// Record a committed read current to `serial`, unless one current to a
+/// later position is already recorded.
+fn set_catalog_patch_base<K: std::hash::Hash + Eq, V: Clone>(
+    bases: &CatalogPatchBases<K, V>,
+    key: K,
+    serial: u64,
+    value: &V,
+) {
+    let mut b = bases.lock().unwrap_or_else(|e| e.into_inner());
+    if b.get(&key).is_none_or(|(s, _)| *s <= serial) {
+        b.insert(key, (serial, value.clone()));
+    }
+}
+
 /// Declare the committed type catalog changed (or possibly changed): every
 /// cached collection is re-read on its next use, on every connection.
 fn bump_catalog_version() {
@@ -12356,11 +12401,27 @@ impl PgHandler {
             front(&docs);
             return Ok(docs);
         }
-        let raw = self
-            .storage
-            .find_matching(self.db(), collection, &Document::new())
-            .map_err(|e| Self::storage_err("could not read the type catalog", e))?;
-        let docs = Self::decode_type_catalog(key.clone(), raw)?;
+        // The key log's position BEFORE the read: a commit landing during it
+        // is named again by the next reader's patch.
+        let serial = self.storage.catalog_doc_serial();
+        let patched = if self.storage.in_user_txn() {
+            None
+        } else {
+            self.patched_type_catalog(&key)?
+        };
+        let (serial, docs) = match patched {
+            Some(p) => p,
+            None => {
+                let raw = self
+                    .storage
+                    .find_matching(self.db(), collection, &Document::new())
+                    .map_err(|e| Self::storage_err("could not read the type catalog", e))?;
+                (serial, Self::decode_type_catalog(key.clone(), raw)?)
+            }
+        };
+        if !self.storage.in_user_txn() {
+            set_catalog_patch_base(type_catalog_bases(), key.clone(), serial, &docs);
+        }
         // A read that was in flight while the version moved must not be
         // recorded as current: store it under the version it was read AT,
         // so a bump during the read still forces the next reader to storage.
@@ -12373,6 +12434,72 @@ impl PgHandler {
             front(&docs);
         }
         Ok(docs)
+    }
+
+    /// One type-catalog collection's committed rows brought up to date from
+    /// the last full read or patch by re-reading only the documents the
+    /// storage's catalog key log names, as PostgreSQL's `inval.c` has a
+    /// backend rebuild only the syscache entries a commit invalidated
+    /// (RP-911). `None` when there is nothing to patch from, the log no
+    /// longer reaches it, or a change names no single document.
+    fn patched_type_catalog(
+        &self,
+        key: &(usize, String, &'static str),
+    ) -> PgWireResult<Option<(u64, CatalogDocs)>> {
+        let Some((base, docs)) = catalog_patch_base(type_catalog_bases(), key) else {
+            return Ok(None);
+        };
+        let Some((now, ids)) = self.changed_catalog_ids(base, key.2) else {
+            return Ok(None);
+        };
+        if ids.is_empty() {
+            return Ok(Some((now, docs)));
+        }
+        let mut out: Vec<Arc<Document>> = docs.as_ref().clone();
+        for id in ids {
+            let raw = self
+                .storage
+                .find_by_id(self.db(), key.2, &Bson::String(id.clone()))
+                .map_err(|e| Self::storage_err("could not read the type catalog", e))?;
+            let at = out.binary_search_by(|d| d.get_str("_id").unwrap_or_default().cmp(&id));
+            match (raw, at) {
+                (Some(b), at) => {
+                    let doc = Arc::new(
+                        decode_doc(&b)
+                            .map_err(|e| Self::storage_err("could not decode a type", e))?,
+                    );
+                    match at {
+                        Ok(i) => out[i] = doc,
+                        Err(i) => out.insert(i, doc),
+                    }
+                }
+                (None, Ok(i)) => {
+                    out.remove(i);
+                }
+                (None, Err(_)) => {}
+            }
+        }
+        Ok(Some((now, Arc::new(out))))
+    }
+
+    /// The string `_id`s of `coll`'s documents committed changes numbered
+    /// above `since` changed, and the number of the last change; `None`
+    /// when the log no longer reaches `since`, a change names the whole
+    /// collection or an `_id` that is not a string, or too many changed for
+    /// re-reading them one by one to beat a full read.
+    fn changed_catalog_ids(&self, since: u64, coll: &str) -> Option<(u64, Vec<String>)> {
+        const PATCH_MAX: usize = 64;
+        let (now, changes) = self.storage.catalog_doc_changes_since(since)?;
+        let mut ids: Vec<String> = Vec::new();
+        for c in changes.iter().filter(|c| c.reaches(self.db(), coll)) {
+            match &c.id {
+                Some(Bson::String(id)) if !c.coll.is_empty() => ids.push(id.clone()),
+                _ => return None,
+            }
+        }
+        ids.sort();
+        ids.dedup();
+        (ids.len() <= PATCH_MAX).then_some((now, ids))
     }
 
     /// One type-catalog collection's stored documents decoded, `_id`-sorted.
@@ -50267,11 +50394,16 @@ impl PgHandler {
     /// (on a session of its own) and shared; `None` while this session's
     /// transaction has catalog changes of its own (`catalog_untouched`).
     fn committed_table_defs(&self) -> Option<TableDefs> {
-        /// One catalog version's definitions, and each one's stored bytes.
+        /// One catalog version's definitions, each one's stored bytes and
+        /// string `_id` (`None` when the ids are not all strings in sorted
+        /// order, which a patch relies on), and the catalog key log's
+        /// position the read is current to.
         struct Entry {
             version: u64,
+            serial: u64,
             defs: TableDefs,
             raw: Arc<Vec<Vec<u8>>>,
+            ids: Option<Arc<Vec<String>>>,
         }
         type Cache = Mutex<HashMap<(usize, String), Entry>>;
         static CACHE: std::sync::OnceLock<Cache> = std::sync::OnceLock::new();
@@ -50285,30 +50417,77 @@ impl PgHandler {
         let version = catalog_cache()
             .version
             .load(std::sync::atomic::Ordering::SeqCst);
-        if let Some(e) = cache.lock().unwrap_or_else(|e| e.into_inner()).get(&key) {
-            if e.version == version {
-                return Some(Arc::clone(&e.defs));
+        let serial = self.storage.catalog_doc_serial();
+        let (old_raw, old_defs, old_ids, old_serial) = {
+            let c = cache.lock().unwrap_or_else(|e| e.into_inner());
+            match c.get(&key) {
+                Some(e) if e.version == version => return Some(Arc::clone(&e.defs)),
+                Some(e) => (
+                    Arc::clone(&e.raw),
+                    Arc::clone(&e.defs),
+                    e.ids.clone(),
+                    Some(e.serial),
+                ),
+                None => Default::default(),
             }
-        }
-        let raw = self
-            .storage
-            .outside_user_transaction(|| {
-                self.storage
-                    .find_matching(self.db(), CATALOG_COLLECTION, &Document::new())
-            })
-            .ok()?;
-        // A definition whose stored bytes are those the previous version
-        // decoded is that definition again: only what a statement changed is
-        // decoded anew, as PostgreSQL rebuilds only the relcache entries an
-        // invalidation names (RP-715). Both reads come in the catalog's key
-        // order, so the previous version's entry for a document is at the
-        // cursor, or just past an entry the statement dropped or changed.
-        let (old_raw, old_defs) = cache
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .get(&key)
-            .map(|e| (Arc::clone(&e.raw), Arc::clone(&e.defs)))
-            .unwrap_or_default();
+        };
+        // Only the definitions the catalog key log says a commit changed are
+        // read again, as PostgreSQL rebuilds only the relcache entries an
+        // invalidation names (RP-911).
+        let patched = match (old_ids, old_serial) {
+            (Some(ids), Some(since)) => self
+                .changed_catalog_ids(since, CATALOG_COLLECTION)
+                .and_then(|(now, changed)| {
+                    self.patch_table_defs(&old_raw, &old_defs, &ids, &changed)
+                        .map(|p| (now, p))
+                }),
+            _ => None,
+        };
+        let (serial, defs, kept, ids) = match patched {
+            Some((now, (defs, raw, ids))) => (now, defs, raw, Some(ids)),
+            None => {
+                let raw = self
+                    .storage
+                    .outside_user_transaction(|| {
+                        self.storage
+                            .find_matching(self.db(), CATALOG_COLLECTION, &Document::new())
+                    })
+                    .ok()?;
+                let (defs, kept) = Self::decode_table_defs(raw, &old_raw, &old_defs);
+                let ids: Option<Vec<String>> = kept
+                    .iter()
+                    .map(|b| raw_string_id(b))
+                    .collect::<Option<Vec<String>>>()
+                    .filter(|ids| ids.windows(2).all(|w| w[0] < w[1]));
+                (serial, defs, kept, ids)
+            }
+        };
+        let defs = Arc::new(defs);
+        cache.lock().unwrap_or_else(|e| e.into_inner()).insert(
+            key,
+            Entry {
+                version,
+                serial,
+                defs: Arc::clone(&defs),
+                raw: Arc::new(kept),
+                ids: ids.map(Arc::new),
+            },
+        );
+        Some(defs)
+    }
+
+    /// A catalog read's definitions, sharing each one whose stored bytes
+    /// are those the previous version decoded: only what a statement
+    /// changed is decoded anew, as PostgreSQL rebuilds only the relcache
+    /// entries an invalidation names (RP-715). Both reads come in the
+    /// catalog's key order, so the previous version's entry for a document
+    /// is at the cursor, or just past an entry the statement dropped or
+    /// changed.
+    fn decode_table_defs(
+        raw: Vec<Vec<u8>>,
+        old_raw: &[Vec<u8>],
+        old_defs: &[Arc<TableDef>],
+    ) -> (Vec<Arc<TableDef>>, Vec<Vec<u8>>) {
         let mut cursor = 0;
         let mut defs = Vec::with_capacity(raw.len());
         let mut kept = Vec::with_capacity(raw.len());
@@ -50330,16 +50509,71 @@ impl PgHandler {
             defs.push(def);
             kept.push(b);
         }
-        let defs = Arc::new(defs);
-        cache.lock().unwrap_or_else(|e| e.into_inner()).insert(
-            key,
-            Entry {
-                version,
-                defs: Arc::clone(&defs),
-                raw: Arc::new(kept),
-            },
-        );
-        Some(defs)
+        (defs, kept)
+    }
+
+    /// The previous read's definitions with the documents `changed` names
+    /// read again (inserted, replaced or removed at their `_id`'s place in
+    /// `ids`, the sorted string `_id`s of `raw`), or `None` when one cannot
+    /// be read or decoded (the caller reads everything).
+    #[allow(clippy::type_complexity)]
+    fn patch_table_defs(
+        &self,
+        raw: &[Vec<u8>],
+        defs: &[Arc<TableDef>],
+        ids: &[String],
+        changed: &[String],
+    ) -> Option<(Vec<Arc<TableDef>>, Vec<Vec<u8>>, Vec<String>)> {
+        let mut raw = raw.to_vec();
+        let mut defs = defs.to_vec();
+        let mut ids = ids.to_vec();
+        for id in changed {
+            let b = self
+                .storage
+                .outside_user_transaction(|| {
+                    self.storage.find_by_id(
+                        self.db(),
+                        CATALOG_COLLECTION,
+                        &Bson::String(id.clone()),
+                    )
+                })
+                .ok()?;
+            let at = ids.binary_search(id);
+            match b {
+                Some(b) => {
+                    // A document that is no definition is left out, as the
+                    // full read leaves it out.
+                    let def = decode_doc(&b)
+                        .ok()
+                        .and_then(|d| TableDef::from_document(&d));
+                    match (def, at) {
+                        (Some(def), Ok(i)) => {
+                            defs[i] = Arc::new(def);
+                            raw[i] = b;
+                        }
+                        (Some(def), Err(i)) => {
+                            defs.insert(i, Arc::new(def));
+                            raw.insert(i, b);
+                            ids.insert(i, id.clone());
+                        }
+                        (None, Ok(i)) => {
+                            defs.remove(i);
+                            raw.remove(i);
+                            ids.remove(i);
+                        }
+                        (None, Err(_)) => {}
+                    }
+                }
+                None => {
+                    if let Ok(i) = at {
+                        defs.remove(i);
+                        raw.remove(i);
+                        ids.remove(i);
+                    }
+                }
+            }
+        }
+        Some((defs, raw, ids))
     }
 
     /// The parent side of a DELETE from `def`: a row another table's row

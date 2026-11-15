@@ -1131,53 +1131,33 @@ one beside it.
       statement's first relation lookup (2026-11-15: a `SELECT 1` straight
       after a `CREATE TABLE` at 800 tables, median of a loop, from 8.1 ms
       to 4.0 ms; the collation query's gap ratio from 0.017/0.013 s to
-      0.013/0.010 s). What is left, sampled at 800 tables (debug build,
-      2026-11-15): the republication is still about two thirds of the
-      statement -- the composite catalog read afresh and compared
-      (`committed_type_catalog_docs`, first read by `publish_tableoids`,
-      about 40% of it), the table catalog read and compared
-      (`committed_table_defs`, about 20%), `namespaces` and the inheritance
-      (about 10%); and the collation query still lists every relation at
-      its `regclass` lookup. Both full reads need what PostgreSQL's
-      `inval.c` carries: a log of the catalog rows each committed
-      statement changed (key, not collection), numbered at commit as the
-      index catalog's change log is, so a reader re-reads only those rows;
-      a write logged before its transaction commits must be logged again
-      at commit, or a reader in between keeps the old row. A per-table memo of the index relations by
-      the identity of their inputs was measured slower than deriving them
-      (its map work per version cost more than tables with no index). The
-      faithful end state keys the published state per relation and
-      invalidates what a statement changed; a user relation's entries
-      depend on more than its own catalog row (its grants, its inheritance
-      parents and children, the foreign keys naming it, the types its
-      columns name), so each key has to carry them, or a stale entry is a
-      wrong answer. Its gap test is a timing ratio and can pass once by
-      noise: a `gate_pg.sh` backlog step on 2026-11-13 (load average ~18)
-      reported it `FIXED?`, then it failed three of three runs alone (0.015 s
-      against 0.0117 s, the bar 1.1x). Rerun it alone before closing.
-      Where to start (read 2026-11-15): the committed catalog's only
-      freshness signal is `catalog_cache().version`, one global counter
-      `bump_catalog_version` moves (11 sites in `lib.rs`, 2 in `owned.rs`)
-      with no key of what changed, so `committed_type_catalog_docs` and
-      `committed_table_defs` can only re-scan (`find_matching`) and compare
-      bytes. The storage's index-catalog log (`note_index_catalog_change`,
-      `refresh_index_names`, numbered under `index_catalog_changes`'s lock,
-      a reader past the log rebuilding) is the template, but no storage
-      write path logs a catalog DOCUMENT's `_id`: the fix needs a hook on
-      document insert / update / delete for `__`-prefixed collections, the
-      keys a user transaction wrote re-logged at its commit, and the two
-      readers patching their previous version by those keys.
-      Sized 2026-11-15: about 130 references to the composite catalog in
-      `secantus-pg` alone, written through `insert_type_doc` /
-      `delete_type_doc`, `insert_checked` and direct storage calls, and
-      undone by transaction and savepoint rollback. A key log kept in the
-      PG layer would miss whichever path is not routed through it, and that
-      would serve a stale catalog. The hook belongs on the storage's own
-      document write paths (`insert_one` / `insert_documents` /
-      `replace_by_id` / `delete_by_id` / `update_matching*` /
-      `delete_matching*`, transaction commit, collection drop) for
-      `__`-prefixed collections. That is shared code: plan it as its own
-      slice, gated with `--storage`.
+      0.013/0.010 s); the composite and table catalogs patched from the
+      storage's catalog key log (`Storage::catalog_doc_changes_since`:
+      each committed `__`-collection document write's `_id`, read off its
+      oplog entry and logged at commit, as `inval.c` queues the catalog
+      rows a transaction changed), so the statement after DDL re-reads
+      only the documents its commit changed (2026-11-15: their full reads
+      and decodes gone from a profile at 800 tables; the gap ratio, best
+      of five, from 16.6/13.7 ms to 12.5/10.4 and 15.0/12.2 ms, one run
+      in three under the bar; a loop's median 16.3 ms at 800 against
+      15.8 ms with none). What is left, sampled at 800 tables (debug
+      build, 2026-11-15), each a pass over every relation per catalog
+      version, about 2 ms in all: `publish_user_types` republishing every
+      table's row type, `session_has_temp`'s scan for a temp table
+      (`install_temp_namespace`), `install_session_state`'s per-table
+      closures and `inheritance`, `patch_table_defs` copying the 800
+      definitions' stored bytes, and `relation_oids` listing every
+      relation at the collation query's `regclass` lookup. (A per-table
+      memo of the index relations by the identity of their inputs was
+      measured slower than deriving them, 2026-11-13.) The faithful
+      end state keys the published state per relation and invalidates
+      what the key log names; a user relation's entries depend on more
+      than its own catalog row (its grants, its inheritance parents and
+      children, the foreign keys naming it, the types its columns name),
+      so each key has to carry them, or a stale entry is a wrong answer.
+      Its gap test is a timing ratio and can pass once by noise (a
+      `gate_pg.sh` backlog step on 2026-11-13 reported it `FIXED?`, then
+      it failed three of three runs alone): rerun it alone before closing.
       Backlog-ID: RP-911
       Verify: tests/backlog/test_rp_catalog_latency.py::test_the_first_catalog_query_after_ddl_costs_the_same_at_800_tables_within_a_tenth
 
