@@ -53,6 +53,28 @@ pub(crate) fn analyse_with(
     if with.recursive {
         return Ok(());
     }
+    // `transformWithClause` refuses a name given twice before it analyses
+    // any item, at the second (RP-504).
+    let items: Vec<&pg_query::protobuf::CommonTableExpr> = with
+        .ctes
+        .iter()
+        .filter_map(|c| match c.node.as_ref() {
+            Some(N::CommonTableExpr(c)) => Some(&**c),
+            _ => None,
+        })
+        .collect();
+    for (i, c) in items.iter().enumerate() {
+        if let Some(dup) = items[i + 1..].iter().find(|d| d.ctename == c.ctename) {
+            set_error_location(dup.location);
+            return Err(Error::Sqlstate(
+                "42712",
+                format!(
+                    "WITH query name \"{}\" specified more than once",
+                    dup.ctename
+                ),
+            ));
+        }
+    }
     let names: Vec<&str> = with
         .ctes
         .iter()
@@ -82,16 +104,61 @@ pub(crate) fn analyse_with(
                 .iter()
                 .any(|later| reads(later, names[i]))
     };
-    let Some(last_unread) = (0..names.len()).rev().find(|&i| !read(i)) else {
+    // An item with a column alias list, or one naming an item written after
+    // it, is analysed too: `analyzeCTETargetList` counts the aliases against
+    // the item's columns (42P10), and `parserOpenTable` hints at a forward
+    // reference (RP-504), neither of which the inlined statement reports.
+    let forward = |i: usize| {
+        names[i + 1..]
+            .iter()
+            .any(|later| reads(&with.ctes[i], later))
+    };
+    let Some(last) = (0..names.len())
+        .rev()
+        .find(|&i| !read(i) || !items[i].aliascolnames.is_empty() || forward(i))
+    else {
         return Ok(());
     };
     let Ok(defs) = cte_defs(with) else {
         return Ok(());
     };
-    for (_, body, _) in defs.iter().take(last_unread + 1) {
+    for (i, (name, body, aliases)) in defs.iter().enumerate().take(last + 1) {
+        take_error_location();
         let planned = planning_without_running(|| plan_select(body, lookup, params));
+        // `transformTypeCast` reads an untyped literal through its type's
+        // input function as the cast is analysed, so an unread item's
+        // `'x'::int` is 22P02 -- before any error written after it.
+        let at = match &planned {
+            Err(_) => peek_error_location(),
+            Ok(_) => None,
+        };
+        if let Some(e) = literal_input_error(body, params, at) {
+            return Err(e);
+        }
         match planned {
-            Ok(_) => {}
+            Ok(_) => {
+                if let Some(columns) = domain_scope::output_columns(body, lookup, &Vec::new()) {
+                    if columns.len() < aliases.len() {
+                        set_error_location(items[i].location);
+                        return Err(Error::Sqlstate(
+                            "42P10",
+                            format!(
+                                "WITH query \"{name}\" has {} columns available but {} columns specified",
+                                columns.len(),
+                                aliases.len()
+                            ),
+                        ));
+                    }
+                }
+            }
+            Err(Error::UndefinedTable(t)) if names[i + 1..].contains(&t.as_str()) => {
+                return Err(Error::Sqlstate(
+                    "42P01",
+                    format!(
+                        "relation \"{t}\" does not exist\nHint: Use WITH RECURSIVE, or re-order the WITH items to remove forward references."
+                    ),
+                ));
+            }
             Err(e) if raised_by_analysis(&e) => return Err(e),
             // An error only running the item raises (a division by zero, a
             // value's input), or a shape this server refuses, which a
@@ -102,4 +169,63 @@ pub(crate) fn analyse_with(
         }
     }
     Ok(())
+}
+
+/// The first untyped string literal under a cast in `body`, in the order
+/// written and before `before` when that is given, whose type's input
+/// function refuses it: that refusal, placed at the literal.
+pub(crate) fn literal_input_error(
+    body: &pg_query::protobuf::SelectStmt,
+    params: &[Bson],
+    before: Option<i32>,
+) -> Option<Error> {
+    let node = pg_query::protobuf::Node {
+        node: Some(N::SelectStmt(Box::new(body.clone()))),
+    };
+    let mut casts: Vec<(i32, pg_query::protobuf::Node)> = node
+        .node
+        .as_ref()?
+        .nodes()
+        .into_iter()
+        .filter_map(|(n, _, _, _)| match n {
+            pg_query::NodeRef::TypeCast(tc) => {
+                match tc.arg.as_deref().and_then(|a| a.node.as_ref()) {
+                    Some(N::AConst(c))
+                        if matches!(c.val, Some(pg_query::protobuf::a_const::Val::Sval(_)))
+                            && c.location >= 0 =>
+                    {
+                        Some((
+                            c.location,
+                            pg_query::protobuf::Node {
+                                node: Some(N::TypeCast(Box::new(tc.clone()))),
+                            },
+                        ))
+                    }
+                    _ => None,
+                }
+            }
+            _ => None,
+        })
+        .collect();
+    casts.sort_by_key(|(at, _)| *at);
+    for (at, cast) in casts {
+        if before.is_some_and(|b| at >= b) {
+            break;
+        }
+        take_error_location();
+        match correlated::without_side_effects(|| const_value(&cast, params)) {
+            Err(e) if e.sqlstate().starts_with("22") => {
+                take_error_location();
+                set_error_location(at);
+                return Some(e);
+            }
+            _ => {
+                take_error_location();
+            }
+        }
+    }
+    if let Some(b) = before {
+        set_error_location(b);
+    }
+    None
 }

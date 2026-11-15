@@ -1,6 +1,6 @@
 """Gap test of a divergence found while working RP-822 (a CREATE
 FUNCTION's `%TYPE` parameter was not resolved): a routine named by its
-signature in DROP or ALTER FUNCTION does not resolve one either.
+signature in DROP or ALTER FUNCTION did not resolve one either.
 
 `LookupFuncWithArgs` looks each argument type up with `LookupTypeName`,
 so `t.c%TYPE` there is the column's type, with the same NOTICE CREATE
@@ -58,7 +58,7 @@ SIGNATURES = {
 }
 
 
-@pytest.mark.backlog("RP-830")
+@pytest.mark.backlog_fixed("RP-830")
 @pytest.mark.parametrize("statement", list(SIGNATURES))
 def test_a_signatures_percent_type_is_resolved(statement: str, dsn: str) -> None:
     assert _run(dsn, statement) == SIGNATURES[statement]

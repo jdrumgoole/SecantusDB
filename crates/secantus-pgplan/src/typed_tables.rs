@@ -96,6 +96,8 @@ pub enum AttributeAction {
         name: String,
         ty: String,
         typmod: i32,
+        /// The declared array dimensions (`attndims`).
+        ndims: i32,
         cascade: bool,
     },
     /// `DROP ATTRIBUTE [IF EXISTS] name`.
@@ -109,6 +111,8 @@ pub enum AttributeAction {
         name: String,
         ty: String,
         typmod: i32,
+        /// The declared array dimensions (`attndims`).
+        ndims: i32,
         cascade: bool,
     },
 }
@@ -131,28 +135,35 @@ pub(crate) fn plan_alter_type(
             return Err(Error::Unsupported("this ALTER TYPE action".into()));
         };
         let cascade = DropBehavior::try_from(cmd.behavior) == Ok(DropBehavior::DropCascade);
-        let typed = |cmd: &pg_query::protobuf::AlterTableCmd| -> Result<(String, String, i32)> {
-            let Some(N::ColumnDef(cd)) = cmd.def.as_ref().and_then(|d| d.node.as_ref()) else {
-                return Err(Error::Parse("ALTER TYPE attribute without a type".into()));
+        let typed =
+            |cmd: &pg_query::protobuf::AlterTableCmd| -> Result<(String, String, i32, i32)> {
+                let Some(N::ColumnDef(cd)) = cmd.def.as_ref().and_then(|d| d.node.as_ref()) else {
+                    return Err(Error::Parse("ALTER TYPE attribute without a type".into()));
+                };
+                let tn = cd
+                    .type_name
+                    .as_ref()
+                    .ok_or_else(|| Error::Parse("ALTER TYPE attribute without a type".into()))?;
+                let attr = if cd.colname.is_empty() {
+                    cmd.name.clone()
+                } else {
+                    cd.colname.clone()
+                };
+                Ok((
+                    attr,
+                    type_name_of(tn),
+                    declared_typmod(tn),
+                    crate::declared_ndims(tn),
+                ))
             };
-            let tn = cd
-                .type_name
-                .as_ref()
-                .ok_or_else(|| Error::Parse("ALTER TYPE attribute without a type".into()))?;
-            let attr = if cd.colname.is_empty() {
-                cmd.name.clone()
-            } else {
-                cd.colname.clone()
-            };
-            Ok((attr, type_name_of(tn), declared_typmod(tn)))
-        };
         actions.push(match AT::try_from(cmd.subtype) {
             Ok(AT::AtAddColumn) => {
-                let (name, ty, typmod) = typed(cmd)?;
+                let (name, ty, typmod, ndims) = typed(cmd)?;
                 AttributeAction::Add {
                     name,
                     ty,
                     typmod,
+                    ndims,
                     cascade,
                 }
             }
@@ -162,11 +173,12 @@ pub(crate) fn plan_alter_type(
                 cascade,
             },
             Ok(AT::AtAlterColumnType) => {
-                let (_, ty, typmod) = typed(cmd)?;
+                let (_, ty, typmod, ndims) = typed(cmd)?;
                 AttributeAction::AlterType {
                     name: cmd.name.clone(),
                     ty,
                     typmod,
+                    ndims,
                     cascade,
                 }
             }

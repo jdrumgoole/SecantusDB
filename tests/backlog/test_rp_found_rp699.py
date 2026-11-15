@@ -6,8 +6,8 @@ FROM function's column or a whole row's field keeps its type) found:
 - a correlated subquery in the WHERE of a query over a FROM function was
   42883 and named the internal per-row call (RP-703, fixed);
 - `(v).*` in a select list was 0A000 (RP-704, fixed);
-- a field of an outer item's whole row in a LATERAL subquery is 42703
-  (RP-705).
+- a field of an outer item's whole row in a LATERAL subquery was 42703
+  (RP-705, fixed).
 
 And what working RP-704 found: a star over a FROM subquery in a grouped
 query is 42803 with no column name (RP-852).
@@ -42,8 +42,8 @@ def answer(dsn: str, query: str) -> Any:
 
 
 # The whole row of a function returning a base type is that value, whatever
-# its column is called; `(f).x` of it is 42809. Here each is 42703 `column
-# "f" does not exist`, though a bare `select f` answers.
+# its column is called; `(f).x` of it is 42809. Each was 42703 `column "f"
+# does not exist` (the last 0A000), though a bare `select f` answered.
 FUNCTION_WHOLE_ROW_ALIASED = {
     "select f + 1 from generate_series(1, 2) f(x)": ([(2,), (3,)], ["?column?"]),
     "select coalesce(f) from generate_series(1, 2) f(x)": ([(1,), (2,)], ["coalesce"]),
@@ -56,7 +56,7 @@ FUNCTION_WHOLE_ROW_ALIASED = {
 }
 
 
-@pytest.mark.backlog("RP-702")
+@pytest.mark.backlog_fixed("RP-702")
 @pytest.mark.parametrize("query", list(FUNCTION_WHOLE_ROW_ALIASED))
 def test_function_whole_row_under_a_column_alias(query: str, dsn: str) -> None:
     assert answer(dsn, query) == FUNCTION_WHOLE_ROW_ALIASED[query]
@@ -134,7 +134,7 @@ def test_whole_row_star_in_a_select_list(query: str, dsn: str) -> None:
 
 
 # A LATERAL subquery reads the earlier item's whole row as an expression
-# subquery does. Here each is 42703 `column "v" does not exist` at the `v`.
+# subquery does. Each was 42703 `column "v" does not exist` at the `v`.
 LATERAL_WHOLE_ROW_FIELD = {
     "select l.* from (values (3)) v(a), lateral (select (v).a + 0 as k) l": ([(3,)], ["k"]),
     "select l.k from (values (3)) v(a), lateral (select 1 as k where (v).a = 3) l": (
@@ -144,7 +144,7 @@ LATERAL_WHOLE_ROW_FIELD = {
 }
 
 
-@pytest.mark.backlog("RP-705")
+@pytest.mark.backlog_fixed("RP-705")
 @pytest.mark.parametrize("query", list(LATERAL_WHOLE_ROW_FIELD))
 def test_lateral_whole_row_field(query: str, dsn: str) -> None:
     assert answer(dsn, query) == LATERAL_WHOLE_ROW_FIELD[query]
@@ -161,7 +161,25 @@ GROUPED_SUBQUERY_STAR = {
         [(1, 2)],
         ["a", "count"],
     ),
+}
+
+
+@pytest.mark.backlog_fixed("RP-852")
+@pytest.mark.parametrize("query", list(GROUPED_SUBQUERY_STAR))
+def test_a_star_over_a_from_subquery_in_a_grouped_query(query: str, dsn: str) -> None:
+    """A star over a FROM subquery in a grouped query reached the grouping
+    check unexpanded, as 42803 `column ""`; it now expands to the
+    subquery's columns, as on PostgreSQL 15.19."""
+    assert answer(dsn, query) == GROUPED_SUBQUERY_STAR[query]
+
+
+GROUPED_BY_SUBQUERY_ROW = {
     "select v.* from (values (1)) v(a) group by v": (
+        "42803",
+        'column "v.a" must appear in the GROUP BY clause or be used in an aggregate function',
+        "8",
+    ),
+    "select v.a from (values (1), (2)) v(a) group by v": (
         "42803",
         'column "v.a" must appear in the GROUP BY clause or be used in an aggregate function',
         "8",
@@ -170,6 +188,6 @@ GROUPED_SUBQUERY_STAR = {
 
 
 @pytest.mark.backlog("RP-852")
-@pytest.mark.parametrize("query", list(GROUPED_SUBQUERY_STAR))
-def test_a_star_over_a_from_subquery_in_a_grouped_query(query: str, dsn: str) -> None:
-    assert answer(dsn, query) == GROUPED_SUBQUERY_STAR[query]
+@pytest.mark.parametrize("query", list(GROUPED_BY_SUBQUERY_ROW))
+def test_group_by_a_from_subquery_row_leaves_its_columns_ungrouped(query: str, dsn: str) -> None:
+    assert answer(dsn, query) == GROUPED_BY_SUBQUERY_ROW[query]

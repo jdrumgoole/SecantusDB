@@ -321,10 +321,11 @@ def test_writes_read_their_ctes_everywhere(rust_pg: Any) -> None:
     ]
 
 
-@pytest.mark.backlog("RP-428")
+@pytest.mark.backlog_fixed("RP-428")
 def test_explain_resolves_names_before_options(rust_pg: Any) -> None:
-    """`transformExplainStmt` resolves the statement's relations, functions
-    and literals before `ExplainQuery` reads an option."""
+    """EXPLAIN resolved the statement's relations, functions and literals
+    before reading an option, as `transformExplainStmt` runs before
+    `ExplainQuery`."""
     assert _answers(
         rust_pg,
         [

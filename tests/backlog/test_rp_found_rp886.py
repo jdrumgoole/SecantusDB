@@ -1,5 +1,5 @@
 """Gap test of the DEFAULT divergence found while working RP-886: RP-892, a folded
-DEFAULT skips its column's length check.
+DEFAULT skipped its column's length check.
 
 An answer is the last statement's rows, `("rowcount", n)` for a statement
 with none, or `(sqlstate, message, hint, position)` for an error, the
@@ -33,7 +33,7 @@ TOO_LONG = {
 }
 
 
-@pytest.mark.backlog("RP-892")
+@pytest.mark.backlog_fixed("RP-892")
 @pytest.mark.parametrize("column", list(TOO_LONG))
 def test_a_folded_default_is_coerced_to_its_column(column: str, dsn: str) -> None:
     """A DEFAULT is coerced to its column's type and modifier when an

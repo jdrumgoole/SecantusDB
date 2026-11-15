@@ -412,6 +412,7 @@ fn constraints_of(
     domain: &str,
     nodes: &[pg_query::protobuf::Node],
     existing: &[String],
+    base: Option<&str>,
 ) -> Result<DomainConstraints> {
     use pg_query::protobuf::ConstrType as CT;
     let mut not_null = None;
@@ -448,6 +449,16 @@ fn constraints_of(
                 } else {
                     k.conname.clone()
                 };
+                if let Some(base) = base {
+                    // `domainAddConstraint` coerces the CHECK to boolean
+                    // under a parse state with no query text (RP-813).
+                    let def = secantus_pgcatalog::TableDef::new(
+                        "",
+                        vec![secantus_pgcatalog::Column::new("value", base, false)],
+                    );
+                    crate::optype::check_constraint(raw, "", &def)
+                        .inspect_err(|_| crate::set_error_unpositioned())?;
+                }
                 checks.push((name, deparse_expr(raw)?));
             }
             Ok(CT::ConstrDefault) => {
@@ -505,7 +516,7 @@ pub(crate) fn plan_create_domain(c: &pg_query::protobuf::CreateDomainStmt) -> Re
         }
         None => None,
     };
-    let (not_null, checks, default_sql) = constraints_of(&name, &c.constraints, &[])?;
+    let (not_null, checks, default_sql) = constraints_of(&name, &c.constraints, &[], Some(&base))?;
     Ok(Statement::CreateDomain(Domain {
         name,
         oid: 0,
@@ -558,12 +569,13 @@ pub(crate) fn plan_alter_domain(a: &pg_query::protobuf::AlterDomainStmt) -> Resu
         "N" => DomainChange::NotNull(false),
         "O" => DomainChange::NotNull(true),
         "C" => {
+            let base = user_domain(&name).map(|d| d.base);
             let existing = user_domain(&name)
                 .map(|d| d.checks.into_iter().map(|(n, _)| n).collect::<Vec<_>>())
                 .unwrap_or_default();
             let nodes: Vec<pg_query::protobuf::Node> =
                 a.def.as_deref().cloned().into_iter().collect();
-            let (_, mut checks, _) = constraints_of(&name, &nodes, &existing)?;
+            let (_, mut checks, _) = constraints_of(&name, &nodes, &existing, base.as_deref())?;
             let (cname, expr) = checks
                 .pop()
                 .ok_or_else(|| Error::Unsupported("this ALTER DOMAIN constraint".into()))?;

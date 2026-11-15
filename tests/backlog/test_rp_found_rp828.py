@@ -118,7 +118,7 @@ NUMBERING = {
 }
 
 
-@pytest.mark.backlog("RP-907")
+@pytest.mark.backlog_fixed("RP-907")
 @pytest.mark.parametrize("statement", list(NUMBERING))
 def test_a_portal_that_fails_running_takes_its_number(statement: str, dsn: str) -> None:
     assert _answer(dsn, statement) == NUMBERING[statement]

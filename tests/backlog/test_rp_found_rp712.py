@@ -10,8 +10,9 @@ the types' text I/O):
 - a `money` variable prints through `cash_out` in a RAISE (`$5.25`);
 - an assignment's 22001 for an overlong `varchar(n)` value carries the
   `PL/pgSQL assignment "..."` frame;
-- an assignment's input error on a literal carries the assignment's text
-  as its internal query.
+- an expression's input error on a literal carries the expression's text
+  as its internal query (fixed for a message that quotes the literal,
+  RP-753; a `json` / `jsonb` literal is still open).
 
 The expected answers were measured on PostgreSQL 15.19. None of the
 statements creates an object.
@@ -218,25 +219,85 @@ def test_money_variable_prints_through_cash_out(query: str, dsn: str) -> None:
     assert _answer(dsn, query) == ("ok", ["$5.25"])
 
 
-@pytest.mark.backlog("RP-752")
-def test_overlong_varchar_assignment_is_framed_by_the_assignment(dsn: str) -> None:
-    query = "do $$ declare x varchar(3); begin x := 'abcdef'::text; end $$"
+_FRAMED = 'PL/pgSQL assignment "{}"\n' + _AT_ASSIGNMENT
+
+
+@pytest.mark.backlog_fixed("RP-752")
+@pytest.mark.parametrize(
+    ("declare", "body", "context"),
+    [
+        ("x varchar(3)", "x := 'abcdef'::text", _FRAMED.format("x := 'abcdef'::text")),
+        ("x varchar(3)", "x := 'abc' || 'def'", _FRAMED.format("x := 'abc' || 'def'")),
+        ("x varchar(3)[]", "x[1] := 'abcdef'", _FRAMED.format("x[1] := 'abcdef'")),
+        (
+            "x varchar(3)[]",
+            "x[1:1] := array['abcd']",
+            _FRAMED.format("x[1:1] := array['abcd']"),
+        ),
+        # Over a variable the coercion runs in the simple expression path,
+        # which frames nothing.
+        ("y text := 'abcdef'; x varchar(3)", "x := y", _AT_ASSIGNMENT),
+        ("y text := 'abcdef'; x varchar(3)[]", "x[1] := y", _AT_ASSIGNMENT),
+    ],
+)
+def test_overlong_varchar_assignment_is_framed_by_the_assignment(
+    declare: str, body: str, context: str, dsn: str
+) -> None:
+    """An overlong varchar(n) assignment over a constant was sent with no
+    assignment frame: its length coercion folds while the assignment's
+    query is planned, so PostgreSQL 15.19 frames it."""
+    query = f"do $$ declare {declare}; begin {body}; end $$"
     assert _answer(dsn, query) == (
         "error",
         "22001",
         "value too long for type character varying(3)",
-        "PL/pgSQL assignment \"x := 'abcdef'::text\"\n" + _AT_ASSIGNMENT,
+        context,
         None,
     )
 
 
-@pytest.mark.backlog("RP-753")
-def test_literal_input_error_in_an_assignment_carries_its_query(dsn: str) -> None:
-    query = "do $$ declare x int; begin x := 'abc'; end $$"
-    assert _answer(dsn, query) == (
-        "error",
+def _answer_at(dsn: str, query: str) -> object:
+    with psycopg.connect(dsn, autocommit=True) as c:
+        try:
+            c.execute(query)
+        except psycopg.Error as e:
+            d = e.diag
+            return (e.sqlstate, d.context, d.internal_query, d.internal_position)
+    return "ok"
+
+
+_INT_ERROR = "PL/pgSQL function inline_code_block line 1 at "
+
+
+@pytest.mark.backlog_fixed("RP-753")
+@pytest.mark.parametrize(
+    ("body", "expected"),
+    [
+        ("x := 'abc'", (_INT_ERROR + "assignment", "x := 'abc'", "6")),
+        ("x := 1 + 'abc'", (_INT_ERROR + "assignment", "x := 1 + 'abc'", "10")),
+        ("x := 'abc'::int", (_INT_ERROR + "assignment", "x := 'abc'::int", "6")),
+        ("raise notice '%', 'abc'::int", (_INT_ERROR + "RAISE", "'abc'::int", "1")),
+        ("if 'abc'::int = 1 then end if", (_INT_ERROR + "IF", "'abc'::int = 1", "1")),
+    ],
+)
+def test_literal_input_error_in_an_assignment_carries_its_query(
+    body: str, expected: tuple[str, str, str], dsn: str
+) -> None:
+    """A literal's input error in a PL/pgSQL expression carried no internal
+    query: `_SPI_error_callback` turns its cursor position into one."""
+    query = f"do $$ declare x int; begin {body}; end $$"
+    assert _answer_at(dsn, query) == ("22P02", *expected)
+
+
+@pytest.mark.backlog_fixed("RP-753")
+def test_json_literal_input_error_in_an_assignment_carries_its_query(dsn: str) -> None:
+    """A json literal's input error in an assignment carried no internal
+    query: its message quotes no value, so the literal is now found from
+    the `JSON data` CONTEXT excerpt."""
+    query = "do $$ declare x jsonb; begin x := 'zz'; end $$"
+    assert _answer_at(dsn, query) == (
         "22P02",
-        'invalid input syntax for type integer: "abc"',
-        _AT_ASSIGNMENT,
-        "x := 'abc'",
+        "JSON data, line 1: zz\n" + _AT_ASSIGNMENT,
+        "x := 'zz'",
+        "6",
     )

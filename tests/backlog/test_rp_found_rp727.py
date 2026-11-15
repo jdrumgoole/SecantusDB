@@ -2,8 +2,8 @@
 
 - a row comparison of zero-length rows answered instead of 0A000 (fixed:
   RP-849);
-- a row field that is an untyped literal is compared as a string, not
-  coerced to its pair's type;
+- a row field that is an untyped literal was compared as a string, not
+  coerced to its pair's type (fixed: RP-850);
 - a row comparison with a pattern operator (`~<~`) is refused.
 
 An answer is the rows and the column names, or `(sqlstate, message,
@@ -51,8 +51,8 @@ def test_zero_length_row_comparison_is_0a000(query: str, dsn: str) -> None:
 
 
 # Each pair's operator is resolved as the statement is analysed, so an
-# `unknown` literal field takes the other side's type. Here the literal is
-# compared as a string: 0A000 `comparing string with int32 ...`.
+# `unknown` literal field takes the other side's type. Here the literal was
+# compared as a string: 0A000 `comparing string with int32 ...` (RP-850).
 UNTYPED_LITERAL = {
     "select (1, '2') = (1, 2)": ([(True,)], ["?column?"]),
     "select (1, '2') < any (select 1, 3)": ([(True,)], ["?column?"]),
@@ -61,24 +61,55 @@ UNTYPED_LITERAL = {
         'invalid input syntax for type integer: "a"',
         "12",
     ),
+    "select ('2', 1) <= (2, 1)": ([(True,)], ["?column?"]),
+    "select (a, '3') > (2, b) from (values (2, 4)) v(a, b)": ([(False,)], ["?column?"]),
+    "select ('1.5', 2) < (1.6, 2)": ([(True,)], ["?column?"]),
+    "select ('t', 1) = (true, 1)": ([(True,)], ["?column?"]),
+    "select (1, '2') in ((1, 2), (3, 4))": ([(True,)], ["?column?"]),
+    "select (1, 'a') = any (select 1, 2)": (
+        "22P02",
+        'invalid input syntax for type integer: "a"',
+        "12",
+    ),
+    "explain (costs off) select 1 where (1, '2') = (1, 2)": (
+        [("Result",)],
+        ["QUERY PLAN"],
+    ),
 }
 
 
-@pytest.mark.backlog("RP-850")
+@pytest.mark.backlog_fixed("RP-850")
 @pytest.mark.parametrize("query", list(UNTYPED_LITERAL))
 def test_untyped_literal_in_a_row_takes_its_pairs_type(query: str, dsn: str) -> None:
     assert answer(dsn, query) == UNTYPED_LITERAL[query]
 
 
 # `~<~` is a btree operator of `text_pattern_ops`, so a row comparison
-# with it is a RowCompareExpr as one with `<` is. Here 42804 / 0A000.
+# with it is a RowCompareExpr as one with `<` is. These were 42804 / 0A000.
 PATTERN_OPERATOR = {
     "select ('a', 'b') ~<~ ('a', 'c')": ([(True,)], ["?column?"]),
     "select ('a', 'b') ~<~ any (select 'a', 'c')": ([(True,)], ["?column?"]),
 }
 
 
-@pytest.mark.backlog("RP-851")
+@pytest.mark.backlog_fixed("RP-851")
 @pytest.mark.parametrize("query", list(PATTERN_OPERATOR))
 def test_row_comparison_with_a_pattern_operator(query: str, dsn: str) -> None:
     assert answer(dsn, query) == PATTERN_OPERATOR[query]
+
+
+# Each pair's operator is looked up before anything is collated: `integer
+# ~<~ integer` does not exist. Here `pattern_ops` collates the fields first.
+PATTERN_OVER_NON_STRINGS = {
+    "select (1, 2) ~<~ (1, 3)": (
+        "42883",
+        "operator does not exist: integer ~<~ integer",
+        "15",
+    ),
+}
+
+
+@pytest.mark.backlog("RP-973")
+@pytest.mark.parametrize("query", list(PATTERN_OVER_NON_STRINGS))
+def test_row_pattern_operator_over_non_strings(query: str, dsn: str) -> None:
+    assert answer(dsn, query) == PATTERN_OVER_NON_STRINGS[query]

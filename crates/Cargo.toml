@@ -37,6 +37,8 @@ members = [
     "secantus-commands",
     "secantus-pgcatalog",
     "secantus-pgplan",
+    # SecantusDB's fork of pg_query 6.2.0, which secantus-pgplan links.
+    "secantus-pg-query",
     "secantus-server",
     "secantus-auth",
     "secantus-bench",

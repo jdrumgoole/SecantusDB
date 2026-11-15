@@ -57,8 +57,8 @@ def _defaults(dsn: str, table: str) -> list[object]:
 # An explicit `'ab'::char(4)` is a length coercion marked
 # COERCE_EXPLICIT_CAST, which ruleutils prints with its modifier
 # (`get_coercion_expr` by `format_type_with_typemod(rettype,
-# coercedTypmod)`). Here the modifier is dropped.
-@pytest.mark.backlog("RP-863")
+# coercedTypmod)`). The modifier was dropped until RP-863.
+@pytest.mark.backlog_fixed("RP-863")
 def test_an_explicit_cast_default_keeps_its_modifier(dsn: str) -> None:
     assert _defaults(dsn, "y846") == [
         [("e", "'ab'::character(4)"), ("e2", "'ab'::character varying(5)")],

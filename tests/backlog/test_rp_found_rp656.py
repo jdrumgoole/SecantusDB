@@ -109,7 +109,7 @@ def test_scalar_subquery_keeps_char_padding(query: str, dsn: str) -> None:
 
 # `exprTypmod` of an ARRAY sublink is its column's, whatever the type: a
 # `numeric(5,2)` column's array describes 327686 ((5 << 16 | 2) + 4).
-@pytest.mark.backlog("RP-667")
+@pytest.mark.backlog_fixed("RP-667")
 def test_array_sublink_of_numeric_describes_its_modifier(dsn: str) -> None:
     got = _answer(dsn, "select array(select n from t656)")
     assert got[:2] == (_NUMERIC_ARRAY, 327686)

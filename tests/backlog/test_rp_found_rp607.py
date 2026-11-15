@@ -99,9 +99,9 @@ def test_domain_array_in_a_schema_and_a_composite(dsn: str) -> None:
     )
 
 
-@pytest.mark.backlog("RP-654")
+@pytest.mark.backlog_fixed("RP-654")
 def test_domain_over_a_domain_array(dsn: str) -> None:
-    """A domain's base may be another domain's array type."""
+    """A domain's base may be another domain's array type (RP-654, fixed)."""
     with psycopg.connect(dsn, autocommit=True) as c:
         for q in [*_RESET, "create domain d607q as int"]:
             c.execute(q)

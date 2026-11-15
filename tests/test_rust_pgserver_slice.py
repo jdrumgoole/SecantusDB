@@ -1801,7 +1801,7 @@ def test_regclass_names_a_relation(home: Path) -> None:
         assert cur.fetchone() == (1259, '"Order"')
         for sql, sqlstate, message in [
             ("select 'nope'::regclass", "42P01", 'relation "nope" does not exist'),
-            ("select 'Nope.T1'::regclass", "42P01", 'relation "nope.t1" does not exist'),
+            ("select 'Nope.T1'::regclass", "3F000", 'schema "nope" does not exist'),
             ("select 'Order'::regclass", "42P01", 'relation "order" does not exist'),
             ("select 'a b'::regclass", "42602", "invalid name syntax"),
             ("select 't1'::regclass::regtype", "42846", "cannot cast type regclass to regtype"),

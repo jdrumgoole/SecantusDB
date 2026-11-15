@@ -124,6 +124,7 @@ fn read(c: &pg_query::protobuf::AConst) -> Result<()> {
         Ok(_) => Ok(()),
         Err(e) => {
             set_error_location(c.location);
+            crate::set_regclass_literal_location(c.location);
             Err(e)
         }
     }

@@ -1333,6 +1333,22 @@ fn check_aexpr(e: &pg_query::protobuf::AExpr, scope: &Scope) -> Result<()> {
             }
         }
     }
+    // Between two ROW constructors a `record_image` operator is each
+    // pair's (`make_row_comparison_op`): `row(1) *= row(1)` looks for
+    // `integer *= integer`, which does not exist (RP-650).
+    if kind == Some(K::AexprOp) && crate::record_image::is_image_operator(&op) {
+        if let (Some(N::RowExpr(lr)), Some(N::RowExpr(rr))) = (
+            e.lexpr.as_deref().and_then(|n| n.node.as_ref()),
+            e.rexpr.as_deref().and_then(|n| n.node.as_ref()),
+        ) {
+            if lr.args.len() == rr.args.len() {
+                if let (Some(a), Some(b)) = (lr.args.first(), rr.args.first()) {
+                    let ty = |n| operand_type(n, scope).unwrap_or_else(|| "unknown".into());
+                    return Err(mismatch(&op, &ty(a), &ty(b), e.location));
+                }
+            }
+        }
+    }
     // A ROW beside a typed operand that is not one: no operator (RP-530).
     if matches!(
         kind,
@@ -1345,7 +1361,11 @@ fn check_aexpr(e: &pg_query::protobuf::AExpr, scope: &Scope) -> Result<()> {
             let row_compare = kind == Some(K::AexprOp)
                 && matches!(l.node.as_ref(), Some(N::RowExpr(_)))
                 && matches!(r.node.as_ref(), Some(N::SubLink(_)));
-            if !row_compare {
+            if row_compare {
+                if let Some(N::SubLink(sl)) = r.node.as_ref() {
+                    row_sublink_pairs(&op, l, sl.subselect.as_deref(), e.location, scope)?;
+                }
+            } else {
                 if kind != Some(K::AexprNullif) {
                     let distinct = kind != Some(K::AexprOp);
                     row_pair_arity(l, r, distinct, e.location, &[l, r], scope)?;
@@ -1380,7 +1400,27 @@ fn check_aexpr(e: &pg_query::protobuf::AExpr, scope: &Scope) -> Result<()> {
                     }
                     return Err(refused);
                 }
-                row_against_non_row(&op, l, item, e.location, scope)?;
+                if let Err(refused) = row_against_non_row(&op, l, item, e.location, scope) {
+                    // `transformAExprIn` transforms every item before it
+                    // looks up any operator (RP-875).
+                    let location = take_error_location();
+                    for n in std::iter::once(l).chain(&items.items) {
+                        having_names_resolve(n, scope)?;
+                    }
+                    if let Some(at) = location {
+                        set_error_location(at);
+                    }
+                    return Err(refused);
+                }
+                if let (Some(N::RowExpr(lr)), Some(N::RowExpr(ir))) =
+                    (l.node.as_ref(), item.node.as_ref())
+                {
+                    if lr.args.len() == ir.args.len() {
+                        for (a, b) in lr.args.iter().zip(&ir.args) {
+                            type_row_literal_pair(a, b, scope)?;
+                        }
+                    }
+                }
             }
         }
     }
@@ -1643,6 +1683,7 @@ fn check_aexpr(e: &pg_query::protobuf::AExpr, scope: &Scope) -> Result<()> {
         ) {
             if l.args.len() == r.args.len() {
                 for (a, b) in l.args.iter().zip(&r.args) {
+                    type_row_literal_pair(a, b, scope)?;
                     let (Some(at), Some(bt)) = (operand_type(a, scope), operand_type(b, scope))
                     else {
                         continue;
@@ -1916,6 +1957,7 @@ fn walk(n: &pg_query::protobuf::Node, scope: &Scope, cx: &Cx) -> Result<()> {
                 // no relation is the error first (RP-458).
                 let location = take_error_location();
                 for s in e.lexpr.iter().chain(e.rexpr.iter()) {
+                    cast_literals_read(s)?;
                     regclass::scan(s, scope)?;
                 }
                 if let Some(l) = location {
@@ -2093,6 +2135,9 @@ fn walk(n: &pg_query::protobuf::Node, scope: &Scope, cx: &Cx) -> Result<()> {
                 }
                 _ => operand_type(a, scope),
             });
+            if let Some(a) = c.arg.as_deref() {
+                cast_literals_read(a)?;
+            }
             if let Some(ty) = arg_type {
                 for w in &c.args {
                     if let Some(N::CaseWhen(w)) = w.node.as_ref() {
@@ -2181,6 +2226,19 @@ fn walk(n: &pg_query::protobuf::Node, scope: &Scope, cx: &Cx) -> Result<()> {
             if let Some(N::SelectStmt(sel)) = sl.subselect.as_deref().and_then(|n| n.node.as_ref())
             {
                 check_select(sel, &cx.ctes, cx.lookup, Some(scope))?;
+            }
+            if matches!(
+                pg_query::protobuf::SubLinkType::try_from(sl.sub_link_type),
+                Ok(pg_query::protobuf::SubLinkType::AnySublink
+                    | pg_query::protobuf::SubLinkType::AllSublink)
+            ) {
+                if let Some(t) = sl.testexpr.as_deref() {
+                    let op = match sl.oper_name.last().and_then(|n| n.node.as_ref()) {
+                        Some(N::String(s)) => s.sval.clone(),
+                        _ => "=".to_string(),
+                    };
+                    row_sublink_pairs(&op, t, sl.subselect.as_deref(), sl.location, scope)?;
+                }
             }
         }
         // `__alias_check(name, expr, args...)` (`builtin_alias`): an
@@ -2493,6 +2551,12 @@ fn check_select(
     }
     for t in &s.target_list {
         walk(t, &scope, &cx)?;
+        // `transformSelectStmt` transforms the target list before the
+        // WHERE, so a missing output column is 42703 ahead of the WHERE's
+        // own errors (RP-429).
+        if s.where_clause.is_some() {
+            having_names_resolve(t, &scope)?;
+        }
     }
     if let Some(w) = s.where_clause.as_deref() {
         // Only at the top level: in a subquery an aggregate over the OUTER
@@ -2553,10 +2617,10 @@ fn sibling_reference(s: &pg_query::protobuf::SelectStmt, parent: Option<&Scope>)
             _ => {}
         }
     }
+    // Only the items to a subquery's left are in the range table when it is
+    // analysed (`transformFromClauseItem`); a name of one to its right is a
+    // missing entry (RP-460).
     let mut siblings = Vec::new();
-    for item in &s.from_clause {
-        item_name(item, &mut siblings);
-    }
     let in_outer = |name: &str| {
         let mut p = parent;
         while let Some(sc) = p {
@@ -2568,6 +2632,8 @@ fn sibling_reference(s: &pg_query::protobuf::SelectStmt, parent: Option<&Scope>)
         false
     };
     for item in &s.from_clause {
+        let left = siblings.clone();
+        item_name(item, &mut siblings);
         let Some(N::RangeSubselect(rs)) = item.node.as_ref() else {
             continue;
         };
@@ -2595,7 +2661,7 @@ fn sibling_reference(s: &pg_query::protobuf::SelectStmt, parent: Option<&Scope>)
                     continue;
                 };
                 let name = q.sval.as_str();
-                if siblings.iter().any(|n| n == name) && !in_outer(name) {
+                if left.iter().any(|n| n == name) && !in_outer(name) {
                     set_error_location(c.location);
                     return Err(Error::Sqlstate(
                         "42P01",
@@ -2918,6 +2984,79 @@ pub(crate) fn check(node: &N, lookup: &dyn Fn(&str) -> Option<TableDef>) -> Resu
     regclass::analysing(|| check_in(node, &[], lookup))
 }
 
+thread_local! {
+    /// While `check` walks a statement: each untyped string literal of a
+    /// row comparison, by its location, and the type its pair gives it.
+    static ROW_LITERALS: std::cell::RefCell<Vec<(i32, String)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// One pair of a row comparison, its operator resolved as `make_op`
+/// resolves one: an untyped literal takes the other side's type, and must
+/// read as it, at the literal (RP-850).
+fn type_row_literal_pair(
+    a: &pg_query::protobuf::Node,
+    b: &pg_query::protobuf::Node,
+    scope: &Scope,
+) -> Result<()> {
+    for (lit, other) in [(a, b), (b, a)] {
+        if !is_untyped_literal(lit) || is_untyped_literal(other) {
+            continue;
+        }
+        if let Some(t) = operand_type(other, scope).filter(|t| category(t).is_some()) {
+            literal_fits(lit, &t)?;
+            record_row_literal(lit, &t);
+        }
+    }
+    Ok(())
+}
+
+fn record_row_literal(n: &pg_query::protobuf::Node, ty: &str) {
+    if let Some(N::AConst(c)) = n.node.as_ref() {
+        if !c.isnull && c.location >= 0 {
+            ROW_LITERALS.with(|r| r.borrow_mut().push((c.location, ty.to_string())));
+        }
+    }
+}
+
+/// `check`, then each untyped string literal it found in a row comparison
+/// cast to the type its pair resolved it to: `(1, '2') = (1, 2)` compares
+/// `'2'::int4` with `2`, as `make_row_comparison_op`'s per-pair `make_op`
+/// coerces it (RP-850). Without it the literal reached the record
+/// comparison as a string.
+pub(crate) fn check_and_type_row_literals(
+    node: &mut N,
+    lookup: &dyn Fn(&str) -> Option<TableDef>,
+) -> Result<()> {
+    ROW_LITERALS.with(|r| r.borrow_mut().clear());
+    let checked = check(node, lookup);
+    let found = ROW_LITERALS.with(|r| std::mem::take(&mut *r.borrow_mut()));
+    checked?;
+    if found.is_empty() {
+        return Ok(());
+    }
+    // SAFETY: the pointers `nodes_mut` hands out point into `node`, which
+    // outlives this loop; each RowExpr's own args are replaced in place and
+    // nothing else is touched while they are used.
+    unsafe {
+        for (n, _, _) in node.nodes_mut() {
+            let pg_query::NodeMut::RowExpr(row) = n else {
+                continue;
+            };
+            for arg in (*row).args.iter_mut() {
+                let Some(N::AConst(c)) = arg.node.as_ref() else {
+                    continue;
+                };
+                let Some((_, ty)) = found.iter().find(|(l, _)| *l == c.location) else {
+                    continue;
+                };
+                cast_untyped_literal(arg, ty);
+            }
+        }
+    }
+    Ok(())
+}
+
 /// A CHECK constraint's expression over the table `name` (`def`), as
 /// `cookConstraint` judges it: `transformExpr` analyses it -- so a test's
 /// or a connective's argument is coerced to boolean under its own name --
@@ -2927,6 +3066,39 @@ pub(crate) fn check_constraint(
     raw: &pg_query::protobuf::Node,
     name: &str,
     def: &TableDef,
+) -> Result<()> {
+    boolean_clause(raw, name, def, "CHECK")
+}
+
+/// [`check_constraint`] under another clause's name: a partial index's
+/// WHERE (`transformIndexStmt`, RP-813) is coerced the same way.
+pub(crate) fn boolean_clause(
+    raw: &pg_query::protobuf::Node,
+    name: &str,
+    def: &TableDef,
+    clause: &str,
+) -> Result<()> {
+    over_table(raw, name, def, Some(clause))
+}
+
+/// An expression over the table `name` (`def`) analysed as `transformExpr`
+/// analyses it, with no coercion of the whole: ALTER TABLE's `USING` and a
+/// generated column's expression are transformed whatever rows the table
+/// holds, so `x is true` over an `int` is 42804 over an empty table
+/// (RP-815).
+pub(crate) fn table_expression(
+    raw: &pg_query::protobuf::Node,
+    name: &str,
+    def: &TableDef,
+) -> Result<()> {
+    over_table(raw, name, def, None)
+}
+
+fn over_table(
+    raw: &pg_query::protobuf::Node,
+    name: &str,
+    def: &TableDef,
+    clause: Option<&str>,
 ) -> Result<()> {
     let lookup: &dyn Fn(&str) -> Option<TableDef> = &|_| None;
     let scope = Scope {
@@ -2947,7 +3119,10 @@ pub(crate) fn check_constraint(
     };
     regclass::analysing(|| {
         walk(raw, &scope, &cx)?;
-        clause_is_boolean(raw, &scope, "CHECK")
+        match clause {
+            Some(clause) => clause_is_boolean(raw, &scope, clause),
+            None => Ok(()),
+        }
     })
 }
 
@@ -3078,6 +3253,30 @@ fn literal_fits(n: &pg_query::protobuf::Node, ty: &str) -> Result<()> {
     Ok(())
 }
 
+/// `transformTypeCast` runs a constant's input function as the cast is
+/// transformed, so an operand's `'x'::int` fails before the operator
+/// around it is looked up (RP-442): each cast literal, left to right.
+fn cast_literals_read(n: &pg_query::protobuf::Node) -> Result<()> {
+    match n.node.as_ref() {
+        Some(N::TypeCast(tc)) if tc.location >= 0 => {
+            if let (Some(arg), Some(tn)) = (tc.arg.as_deref(), tc.type_name.as_ref()) {
+                if tn.array_bounds.is_empty() && is_untyped_literal(arg) {
+                    return literal_fits(arg, &type_name_of(tn));
+                }
+                return cast_literals_read(arg);
+            }
+            Ok(())
+        }
+        Some(N::AExpr(e)) => {
+            for s in e.lexpr.iter().chain(e.rexpr.iter()) {
+                cast_literals_read(s)?;
+            }
+            Ok(())
+        }
+        _ => Ok(()),
+    }
+}
+
 /// A bare string literal or NULL: of type `unknown` where it is written.
 fn is_untyped_literal(n: &pg_query::protobuf::Node) -> bool {
     matches!(n.node.as_ref(), Some(N::AConst(c))
@@ -3095,9 +3294,18 @@ fn first_output_type(
     sub: &pg_query::protobuf::SelectStmt,
     scope: &Scope,
 ) -> Option<Option<String>> {
+    nth_output_type(sub, 0, scope)
+}
+
+/// `first_output_type` for the subquery's `n`th output column.
+fn nth_output_type(
+    sub: &pg_query::protobuf::SelectStmt,
+    n: usize,
+    scope: &Scope,
+) -> Option<Option<String>> {
     if sub.op != pg_query::protobuf::SetOperation::SetopNone as i32 {
-        let left = first_output_type(sub.larg.as_deref()?, scope)?;
-        let right = first_output_type(sub.rarg.as_deref()?, scope)?;
+        let left = nth_output_type(sub.larg.as_deref()?, n, scope)?;
+        let right = nth_output_type(sub.rarg.as_deref()?, n, scope)?;
         return match (left, right) {
             (None, t) | (t, None) => Some(t),
             (Some(l), Some(r)) => (l == r).then_some(Some(l)),
@@ -3106,7 +3314,7 @@ fn first_output_type(
     if sub.with_clause.is_some() || !sub.values_lists.is_empty() {
         return None;
     }
-    let Some(N::ResTarget(rt)) = sub.target_list.first()?.node.as_ref() else {
+    let Some(N::ResTarget(rt)) = sub.target_list.get(n)?.node.as_ref() else {
         return None;
     };
     let val = rt.val.as_deref()?;
@@ -3376,6 +3584,10 @@ fn row_against_non_row(
             return Ok(());
         }
     }
+    // `transformAExprOp` transforms both operands before `make_op` looks
+    // the operator up: a missing column in either is 42703 first (RP-875).
+    having_names_resolve(l, scope)?;
+    having_names_resolve(r, scope)?;
     let op = if op == "!=" { "<>" } else { op };
     Err(mismatch(op, &lt, &rt, location))
 }
@@ -3496,7 +3708,29 @@ fn not_boolean(n: &pg_query::protobuf::Node, scope: &Scope) -> Option<String> {
     if matches!(base.as_str(), "bool" | "boolean") {
         return None;
     }
-    (base.ends_with("[]") || category(&base).is_some()).then(|| display_type(&declared))
+    // The oid family and the system columns' types, outside `category`
+    // and no more coercible to boolean (RP-859: `check
+    // (tableoid)` is `... not type oid`).
+    let identifier = matches!(
+        base.as_str(),
+        "oid"
+            | "regclass"
+            | "regtype"
+            | "regproc"
+            | "regprocedure"
+            | "regoper"
+            | "regoperator"
+            | "regnamespace"
+            | "regrole"
+            | "regconfig"
+            | "regdictionary"
+            | "regcollation"
+            | "xid"
+            | "cid"
+            | "tid"
+    );
+    (identifier || base.ends_with("[]") || category(&base).is_some())
+        .then(|| display_type(&declared))
 }
 
 /// `coerce_to_boolean` of an untyped literal: 22P02 when `boolin` cannot
@@ -3570,6 +3804,49 @@ fn boolean_test_argument(
     Err(Error::DatatypeMismatch(format!(
         "argument of {test} must be type boolean, not type {ty}"
     )))
+}
+
+/// `ROW(...) op (SELECT ...)` and `ROW(...) op ANY (SELECT ...)`:
+/// `make_row_comparison_op` resolves each pair's operator, the row's field
+/// against the subquery's column, as the statement is analysed -- so a pair
+/// with no operator is 42883 even when no row is ever compared (RP-728).
+fn row_sublink_pairs(
+    op: &str,
+    row: &pg_query::protobuf::Node,
+    sub: Option<&pg_query::protobuf::Node>,
+    location: i32,
+    scope: &Scope,
+) -> Result<()> {
+    let Some(N::RowExpr(r)) = row.node.as_ref() else {
+        return Ok(());
+    };
+    let Some(N::SelectStmt(sel)) = sub.and_then(|n| n.node.as_ref()) else {
+        return Ok(());
+    };
+    if r.args.len() < 2 || sel.target_list.len() != r.args.len() {
+        return Ok(());
+    }
+    let op = if op == "!=" { "<>" } else { op };
+    for (i, a) in r.args.iter().enumerate() {
+        let (Some(l), Some(Some(t))) = (operand_type(a, scope), nth_output_type(sel, i, scope))
+        else {
+            continue;
+        };
+        // The `text_pattern_ops` operators take `text` and `bpchar`, which
+        // every string type reaches (RP-851); the planner rewrites them to
+        // `<` .. `>` under `COLLATE "C"`, so they are not in its table.
+        let refused = if matches!(op, "~<~" | "~<=~" | "~>=~" | "~>~") {
+            [&l, &t]
+                .iter()
+                .any(|t| category(t).is_some_and(|c| c != "string"))
+        } else {
+            crate::funcsig::operator_resolves(op, &l, &t) == Some(false)
+        };
+        if refused {
+            return Err(mismatch(op, &l, &t, location));
+        }
+    }
+    Ok(())
 }
 
 /// `x IN (SELECT y ...)` / `x op ANY (SELECT y ...)`: the operator between

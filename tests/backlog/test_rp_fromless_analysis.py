@@ -169,11 +169,11 @@ CAST_BEFORE_OPERATOR = {
 }
 
 
-@pytest.mark.backlog("RP-442")
+@pytest.mark.backlog_fixed("RP-442")
 @pytest.mark.parametrize("query", list(CAST_BEFORE_OPERATOR))
 def test_cast_literal_input_error_before_operator(query: str, rust_pg: Any) -> None:
-    """A lone `'x'::int` is 22P02 on both; beside an operator with no
-    overload for the two types it is that operator's 42883 here."""
+    """A lone `'x'::int` was 22P02 on both; beside an operator with no
+    overload for the two types it was that operator's 42883 here."""
     assert answer(rust_pg, query) == CAST_BEFORE_OPERATOR[query]
 
 
@@ -272,15 +272,25 @@ EXISTS_NESTED = {
     "select exists (select (select nosuch))": _missing("31"),
     "select exists (select 1 + (select nosuch))": _missing("35"),
     "select exists (select (select 1/0))": None,
+    "select exists (select (select 1 from nosuchtab))": (
+        "42P01",
+        'relation "nosuchtab" does not exist',
+        None,
+        "38",
+    ),
+    # A nested subquery reading the EXISTS subquery's FROM item, or an
+    # enclosing level's, is no error.
+    "select exists (select (select a) from (values (1)) v(a))": None,
+    "select (select exists (select (select v.a))) from (values (1)) v(a)": None,
 }
 
 
-@pytest.mark.backlog("RP-459")
+@pytest.mark.backlog_fixed("RP-459")
 @pytest.mark.parametrize("query", list(EXISTS_NESTED))
 def test_exists_target_subquery_is_analysed(query: str, rust_pg: Any) -> None:
-    """A subquery inside an EXISTS subquery's list is dropped with the list
-    unanalysed, so a name it cannot resolve answers `true`. Kept, it would
-    run, and `(select 1/0)` is never run on PostgreSQL."""
+    """A subquery inside an EXISTS subquery's list was dropped with the
+    list unanalysed, so a name it could not resolve answered `true` (RP-459).
+    Kept, it would run, and `(select 1/0)` is never run on PostgreSQL."""
     assert answer(rust_pg, query) == EXISTS_NESTED[query]
 
 
@@ -358,9 +368,9 @@ def test_star_with_no_from(query: str, rust_pg: Any) -> None:
     assert answer(rust_pg, query) == STAR_WITH_NO_FROM[query]
 
 
-@pytest.mark.backlog("RP-447")
+@pytest.mark.backlog_fixed("RP-447")
 def test_missing_column_before_operator_to_its_right(rust_pg: Any) -> None:
-    """42883 `operator does not exist: integer + boolean` at 20 here."""
+    """Was 42883 `operator does not exist: integer + boolean` at 20."""
     assert answer(rust_pg, "select nosuch + (1 + true)") == _missing("8")
 
 
@@ -615,12 +625,6 @@ _FORWARD = (
 _TOO_MANY = ("42P10", 'WITH query "w" has 1 columns available but 2 columns specified', None, "6")
 _TWICE = ("42712", 'WITH query name "w" specified more than once', None, "25")
 WITH_CHECKS = {
-    "with w as (select 'x'::int) select 1": (
-        "22P02",
-        'invalid input syntax for type integer: "x"',
-        None,
-        "19",
-    ),
     "select (with w as (select nosuch) select 1)": _missing("27"),
     "with v as (select a from w), w as (select 1 as a) select 1": _FORWARD,
     "with v as (select a from w), w as (select 1 as a) select * from v": _FORWARD,
@@ -628,15 +632,68 @@ WITH_CHECKS = {
     "with w(x, y) as (select 1) select * from w": _TOO_MANY,
     "with w as (select 1 a), w as (select 2 a) select 1": _TWICE,
     "with w as (select 1 a), w as (select 2 a) select * from w": _TWICE,
+    # An unread item reading an enclosing level's column or CTE, and one
+    # only running would fail, are no error.
+    "select (with w as (select v.a + 1) select 7) from (values (1)) v(a)": None,
+    "select * from (values (1)) v(a) where exists (with w as (select v.a) select 1)": None,
+    "with o as (select 5 c) select (with w as (select c from o) select 1)": None,
+    "select (with w as (select 1/0) select 1)": None,
 }
 
 
-@pytest.mark.backlog("RP-504")
+@pytest.mark.backlog_fixed("RP-504")
 @pytest.mark.parametrize("query", list(WITH_CHECKS))
 def test_with_clause_checks(query: str, rust_pg: Any) -> None:
-    """Each runs here, or is 42601 `table "w" has 1 columns available but
-    2 columns specified` with no position, or misses the HINT."""
+    """Each ran here, or was 42601 `table "w" has 1 columns available but
+    2 columns specified` with no position, or missed the HINT: a WITH in a
+    subquery expression was not analysed, nor was an item's alias list
+    counted, a name given twice refused, or a forward reference hinted."""
     assert answer(rust_pg, query) == WITH_CHECKS[query]
+
+
+_X_INPUT = ("22P02", 'invalid input syntax for type integer: "x"', None)
+WITH_LITERAL_INPUT = {
+    "with w as (select 'x'::int) select 1": (*_X_INPUT, "19"),
+    "with w as (select 'x'::int, nosuch) select 1": (*_X_INPUT, "19"),
+    "with w as (select nosuch, 'x'::int) select 1": _missing("19"),
+    "with w as (select (select 'x'::int)) select 1": (*_X_INPUT, "27"),
+    "select (with w as (select 'x'::int) select 1)": (*_X_INPUT, "27"),
+    "with w as (select '2020-13-01'::date) select 1": (
+        "22008",
+        'date/time field value out of range: "2020-13-01"',
+        'Perhaps you need a different "datestyle" setting.',
+        "19",
+    ),
+    "with w as (select '1'::int) select 1": None,
+}
+
+
+@pytest.mark.backlog_fixed("RP-504")
+@pytest.mark.parametrize("query", list(WITH_LITERAL_INPUT))
+def test_with_unread_literal_input(query: str, rust_pg: Any) -> None:
+    """An unread item's literal was not read as its type, so it ran here."""
+    assert answer(rust_pg, query) == WITH_LITERAL_INPUT[query]
+
+
+# The rest of RP-504, measured on PostgreSQL 15.19: an unread item of a
+# subquery expression's WITH under a level with FROM items, and a literal
+# in an EXISTS subquery's dropped select list.
+WITH_UNDER_FROM_AND_EXISTS = {
+    "select (with w as (select nosuch) select 1) from (values (1)) v(a)": _missing("27"),
+    "select exists (select 'x'::int)": (*_X_INPUT, "23"),
+    "select exists (select (select 'x'::int))": (*_X_INPUT, "31"),
+    "select (with w as (select a) select 1) from (values (1)) v(a)": None,
+    "select (with w as (select v.a) select 1) from (values (1)) v(a)": None,
+    "select exists (select '1'::int, 'x'::text)": None,
+}
+
+
+@pytest.mark.backlog_fixed("RP-504")
+@pytest.mark.parametrize("query", list(WITH_UNDER_FROM_AND_EXISTS))
+def test_with_under_from_and_exists_literal(query: str, rust_pg: Any) -> None:
+    """Each with an error answered a row here: the unread item's missing
+    name was let go, and the dropped select list's literal was not read."""
+    assert answer(rust_pg, query) == WITH_UNDER_FROM_AND_EXISTS[query]
 
 
 # Found while working RP-501, measured on PostgreSQL 15.19: a subquery's

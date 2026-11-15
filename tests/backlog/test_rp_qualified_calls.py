@@ -427,13 +427,46 @@ TEMP_NAMESPACE = {
         ),
         ("42883", "function pg_temp.nosuch() does not exist", _NO_FUNCTION_HINT, "8"),
     ),
+    # Measured on 15.19: a savepoint rolled back unmakes it, a released
+    # one hands it to the transaction, whose COMMIT keeps it.
+    "made in a savepoint rolled back": (
+        (
+            "begin",
+            "savepoint a",
+            "create temp table tt883(a int)",
+            "rollback to a",
+            "commit",
+            "select pg_my_temp_schema() = 0",
+        ),
+        [(True,)],
+    ),
+    "made in a released savepoint": (
+        (
+            "begin",
+            "savepoint a",
+            "create temp table tt883(a int)",
+            "release a",
+            "drop table tt883",
+            "commit",
+            "select pg_my_temp_schema() = 0",
+        ),
+        [(False,)],
+    ),
+    # Measured on 15.19: a temp sequence makes it too, though it is not a
+    # table or a view (RP-911 asks whether one exists without listing
+    # every relation).
+    "made by a temp sequence": (
+        ("create temp sequence sq911", "select pg_my_temp_schema() = 0"),
+        [(False,)],
+    ),
 }
 
 
-@pytest.mark.backlog("RP-883")
+@pytest.mark.backlog_fixed("RP-883")
 @pytest.mark.parametrize("case", list(TEMP_NAMESPACE))
 def test_temp_namespace_follows_transactions(case: str, dsn: str) -> None:
-    """The temp namespace is made and unmade with its transaction."""
+    """The temp namespace did not follow its transactions; it is now made
+    and unmade with the (sub)transaction that made it."""
     statements, expected = TEMP_NAMESPACE[case]
     assert answer(dsn, *statements) == expected
 
@@ -488,3 +521,17 @@ def test_other_sessions_temp_schema_relation_is_named_as_written(dsn: str) -> No
         None,
         "15",
     )
+
+
+@pytest.mark.backlog("RP-971")
+def test_standalone_temp_composite_is_in_the_temp_schema(dsn: str) -> None:
+    """`CREATE TYPE pg_temp.t AS (...)` makes a composite in the session's
+    temp schema, which it makes: on 15.19 the type resolves as
+    `pg_temp.t` and `pg_my_temp_schema()` is no longer 0."""
+    assert answer(
+        dsn,
+        "create type pg_temp.ct911 as (a int)",
+        "select (select typnamespace from pg_type"
+        " where oid = 'pg_temp.ct911'::regtype) = pg_my_temp_schema(),"
+        " pg_my_temp_schema() = 0",
+    ) == [(True, False)]

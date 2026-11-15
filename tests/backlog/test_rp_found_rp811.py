@@ -60,7 +60,7 @@ def _not_boolean(test: str, typ: str, position: int | None) -> tuple[str, str, s
     )
 
 
-@pytest.mark.backlog("RP-813")
+@pytest.mark.backlog_fixed("RP-813")
 @pytest.mark.parametrize(
     ("query", "expected"),
     [
@@ -77,8 +77,8 @@ def test_a_domain_check_and_an_index_predicate_are_coerced_to_boolean(
 ) -> None:
     """`domainAddConstraint` coerces a domain's CHECK to boolean (with no
     position: it has no query text) and `transformIndexStmt` a partial
-    index's WHERE: each is 42804 on PostgreSQL 15.19. Here the domain and
-    the index are created."""
+    index's WHERE: each is 42804 on PostgreSQL 15.19. The domain and
+    the index were created."""
     assert _answer(dsn, query) == expected
 
 
@@ -154,7 +154,7 @@ def test_a_boolean_coercion_follows_a_domain_to_its_base(
     assert got == expected
 
 
-@pytest.mark.backlog("RP-815")
+@pytest.mark.backlog_fixed("RP-815")
 @pytest.mark.parametrize(
     ("query", "expected"),
     [
@@ -179,8 +179,8 @@ def test_alter_table_expressions_are_coerced_to_boolean(
     expression whatever the rows, so an `int` under IS TRUE is 42804 on
     PostgreSQL 15.19 over an empty table; the generated column's and the
     DEFAULT's go through `AddRelationNewConstraints`, which ALTER TABLE
-    hands no query text, so they carry no position. Here the first two are
-    `ALTER TABLE` and the third is placed at the `1`."""
+    hands no query text, so they carry no position. The first two were
+    `ALTER TABLE` and the third was placed at the `1`."""
     assert _answer(dsn, query) == expected
 
 

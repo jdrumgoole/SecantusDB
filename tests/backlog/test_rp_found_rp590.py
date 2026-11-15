@@ -1,6 +1,6 @@
 """RP-590's WHERE regression, and the gap test of what was found while
-working it: RP-650 (the `record_image` operators `*=` .. `*>=` are
-refused).
+working it: RP-650 (the `record_image` operators `*=` .. `*>=` were
+refused; fixed).
 
 Two different composite types compare through `record = record`, which
 `record_eq` / `record_cmp` run field by field (`test_rp_found_rp530.py`
@@ -127,10 +127,37 @@ RECORD_IMAGE = {
         "You might need to add explicit type casts.",
         "15",
     ),
+    # A by-value datum compares as the unsigned word it is stored as.
+    "select (select row(-1)) *< (select row(1)), (select row(-1)) *> (select row(1))": [
+        (False, True)
+    ],
+    "select (select row(null::int)) *> (select row(1))": [(True,)],
+    "select (select row(10000.0)) *< (select row(9999.99))": [(False,)],
+    "select (select row(1, 'a')) *< (select row(1, 'ab'))": (
+        "XX000",
+        "unexpected attlen: -2",
+        None,
+        None,
+    ),
 }
 
 
-@pytest.mark.backlog("RP-650")
+@pytest.mark.backlog_fixed("RP-650")
 @pytest.mark.parametrize("query", list(RECORD_IMAGE))
 def test_record_image_operators(query: str, dsn: str) -> None:
     assert answer(dsn, query) == RECORD_IMAGE[query]
+
+
+# `record_image_cmp` compares every by-value or varlena datum, whatever its
+# type: a date is its int32 day number, a uuid its 16 bytes.
+RECORD_IMAGE_OTHER_TYPES = {
+    "select (select row('2024-01-02'::date)) *< (select row('2024-01-03'::date))": [(True,)],
+    "select (select row('00000000-0000-0000-0000-000000000001'::uuid))"
+    " *= (select row('00000000-0000-0000-0000-000000000001'::uuid))": [(True,)],
+}
+
+
+@pytest.mark.backlog("RP-976")
+@pytest.mark.parametrize("query", list(RECORD_IMAGE_OTHER_TYPES))
+def test_record_image_over_other_field_types(query: str, dsn: str) -> None:
+    assert answer(dsn, query) == RECORD_IMAGE_OTHER_TYPES[query]

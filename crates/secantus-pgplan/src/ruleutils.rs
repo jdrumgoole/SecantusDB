@@ -111,6 +111,10 @@ struct JoinRte {
 /// whose first field is this marker.
 const VAR_MARK: &str = "\u{1f}var";
 
+/// A FROM function: (the call, the name the query uses for it, its
+/// columns' names and types).
+type FunctionItem = (Node, String, Vec<(String, String)>);
+
 fn var_ref(scope: usize, rte: usize, col: usize) -> Node {
     column_ref(&[
         VAR_MARK,
@@ -266,6 +270,44 @@ fn numeric_meet(a: &str, b: &str) -> Option<(&'static str, bool)> {
         2 => ("numeric", true),
         _ => ("float8", true),
     })
+}
+
+/// ruleutils' `simple_quote_literal` under `standard_conforming_strings`
+/// (always on here): quotes doubled, a backslash left as it is and no `E`
+/// prefix. `quote_literal()` the SQL function is the one that writes
+/// `E'...'` (RP-915).
+fn simple_quote_literal(text: &str) -> String {
+    format!("'{}'", text.replace('\'', "''"))
+}
+
+/// The cast an operand of type `t` takes to an operator over `meet`
+/// ([`numeric_meet`]): none when it is that type, and none for a `real`
+/// meeting `double precision`, which the cross-type operators
+/// (`float48eq`, `float48pl`, ...) take as it is (RP-917).
+fn float_side<'m>(t: &str, meet: &'m str) -> &'m str {
+    if t == meet || (t == "float4" && meet == "float8") {
+        ""
+    } else {
+        meet
+    }
+}
+
+/// A `double precision` as `float8out` prints it: the shortest digits that
+/// read back exactly, in exponent form (`1e+20`, `1e-05`) below 1e-4 and
+/// from 1e15 (`DBL_DIG`).
+fn float8_text(v: f64) -> String {
+    if v == 0.0 || !v.is_finite() {
+        return format!("{v}");
+    }
+    let sci = format!("{v:e}");
+    let (mant, exp) = sci.split_once('e').unwrap_or((&sci, "0"));
+    let exp: i32 = exp.parse().unwrap_or(0);
+    if (-4..15).contains(&exp) {
+        format!("{v}")
+    } else {
+        let sign = if exp < 0 { '-' } else { '+' };
+        format!("{mant}e{sign}{:02}", exp.abs())
+    }
 }
 
 /// A function's known signature: `(argument type every argument coerces to,
@@ -881,9 +923,11 @@ impl<'a> Printer<'a> {
                     let res = if w(l) >= w(r) { l } else { r };
                     return Some((String::new(), String::new(), res.to_string()));
                 }
-                let lt = if l == meet { "" } else { meet };
-                let rt = if r == meet { "" } else { meet };
-                return Some((lt.into(), rt.into(), meet.into()));
+                return Some((
+                    float_side(l, meet).into(),
+                    float_side(r, meet).into(),
+                    meet.into(),
+                ));
             }
             // date +/- integer is a date; date - date an integer.
             return match (l, r, op) {
@@ -980,9 +1024,7 @@ impl<'a> Printer<'a> {
             if !cast || (is_int(l) && is_int(r)) {
                 return Some((String::new(), String::new()));
             }
-            let lt = if l == meet { "" } else { meet };
-            let rt = if r == meet { "" } else { meet };
-            return Some((lt.into(), rt.into()));
+            return Some((float_side(l, meet).into(), float_side(r, meet).into()));
         }
         if is_stringish(l) && is_stringish(r) {
             // `text = name` and `name = text` are operators of their own
@@ -1037,6 +1079,22 @@ impl<'a> Printer<'a> {
                             self.buf.push_str(&format!("'{}'::oid", i.ival));
                             return Some(());
                         }
+                    }
+                }
+                // A constant coerced to its operator's type is folded by
+                // `eval_const_expressions` into a constant of that type
+                // (RP-407), as a cast written on it is (RP-370).
+                if self.fold_consts {
+                    if let Some(text) = folded_numeric_cast(n, want) {
+                        match want {
+                            "int4" => self.const_number(&text, want),
+                            _ => self.buf.push_str(&format!(
+                                "{}::{}",
+                                simple_quote_literal(&text),
+                                display_type(want)
+                            )),
+                        }
+                        return Some(());
                     }
                 }
                 if self.pretty {
@@ -1176,7 +1234,7 @@ impl<'a> Printer<'a> {
                             };
                             self.buf.push_str(&format!(
                                 "{}::{}",
-                                crate::scalar::quote_literal(&text),
+                                simple_quote_literal(&text),
                                 display_type(t)
                             ));
                         }
@@ -1186,7 +1244,7 @@ impl<'a> Printer<'a> {
                                 .ok()?;
                             self.buf.push_str(&format!(
                                 "{}::interval",
-                                crate::scalar::quote_literal(&crate::value_text(&v))
+                                simple_quote_literal(&crate::value_text(&v))
                             ));
                         }
                         // An array constant prints as `array_out` gives it
@@ -1199,7 +1257,7 @@ impl<'a> Printer<'a> {
                             };
                             self.buf.push_str(&format!(
                                 "{}::{}",
-                                crate::scalar::quote_literal(&text),
+                                simple_quote_literal(&text),
                                 display_type(t)
                             ));
                         }
@@ -1208,12 +1266,12 @@ impl<'a> Printer<'a> {
                             let v = crate::json::parse(&lit).ok()?;
                             self.buf.push_str(&format!(
                                 "{}::jsonb",
-                                crate::scalar::quote_literal(&crate::json::render_jsonb(&v))
+                                simple_quote_literal(&crate::json::render_jsonb(&v))
                             ));
                         }
                         _ => self.buf.push_str(&format!(
                             "{}::{}",
-                            crate::scalar::quote_literal(&lit),
+                            simple_quote_literal(&lit),
                             display_type(t)
                         )),
                     }
@@ -1268,7 +1326,7 @@ impl<'a> Printer<'a> {
                 }
                 Some(Val::Sval(s)) => self
                     .buf
-                    .push_str(&format!("{}::text", crate::scalar::quote_literal(&s.sval))),
+                    .push_str(&format!("{}::text", simple_quote_literal(&s.sval))),
                 Some(Val::Bsval(_)) => return None,
             },
             N::TypeCast(tc) => {
@@ -1286,7 +1344,7 @@ impl<'a> Printer<'a> {
                             if let Some(Val::Sval(s)) = ac.val.as_ref() {
                                 self.buf.push_str(&format!(
                                     "{}::{label}",
-                                    crate::scalar::quote_literal(&s.sval)
+                                    simple_quote_literal(&s.sval)
                                 ));
                                 return Some(());
                             }
@@ -1305,10 +1363,9 @@ impl<'a> Printer<'a> {
                     if let Some(text) = folded_numeric_cast(arg, &target) {
                         match target.as_str() {
                             "int4" => self.const_number(&text, &target),
-                            _ => self.buf.push_str(&format!(
-                                "{}::{label}",
-                                crate::scalar::quote_literal(&text)
-                            )),
+                            _ => self
+                                .buf
+                                .push_str(&format!("{}::{label}", simple_quote_literal(&text))),
                         }
                         return Some(());
                     }
@@ -2004,7 +2061,7 @@ impl<'a> Printer<'a> {
                     Some(N::AConst(c)) if matches!(c.val, Some(Val::Sval(_)) | None) => {
                         match c.val.as_ref() {
                             Some(Val::Sval(sv)) => {
-                                self.buf.push_str(&crate::scalar::quote_literal(&sv.sval))
+                                self.buf.push_str(&simple_quote_literal(&sv.sval))
                             }
                             _ => self.buf.push_str("NULL"),
                         }
@@ -2214,9 +2271,7 @@ impl<'a> Printer<'a> {
                     return None;
                 };
                 match c.val.as_ref() {
-                    Some(Val::Sval(sv)) => {
-                        self.buf.push_str(&crate::scalar::quote_literal(&sv.sval))
-                    }
+                    Some(Val::Sval(sv)) => self.buf.push_str(&simple_quote_literal(&sv.sval)),
                     None => self.buf.push_str("NULL"),
                     _ => return None,
                 }
@@ -2734,10 +2789,8 @@ impl Printer<'_> {
             }
             N::JoinExpr(j) => return self.collect_join(j, out),
             N::RangeFunction(rf) => {
-                let (call, name, column, ty) = self.function_item(rf)?;
-                let _ = call;
+                let (_, name, columns) = self.function_item(rf)?;
                 let refname = self.unique_refname(&name, out);
-                let columns = vec![(column, ty)];
                 out.push(Rte {
                     refname,
                     name,
@@ -2943,12 +2996,10 @@ impl Printer<'_> {
         Some(idx)
     }
     /// A FROM item that is one plain call of a function returning a scalar
-    /// (`generate_series(1, 10) g`): (the call, the name the query uses
-    /// for it, its one column's name and type).
-    fn function_item(
-        &mut self,
-        rf: &pg_query::protobuf::RangeFunction,
-    ) -> Option<(Node, String, String, String)> {
+    /// (`generate_series(1, 10) g`), or of a built-in returning a record of
+    /// OUT parameters (`pg_show_all_settings() a`): (the call, the name the
+    /// query uses for it, its columns' names and types).
+    fn function_item(&mut self, rf: &pg_query::protobuf::RangeFunction) -> Option<FunctionItem> {
         if rf.lateral || rf.ordinality || rf.is_rowsfrom || !rf.coldeflist.is_empty() {
             return None;
         }
@@ -2970,6 +3021,29 @@ impl Printer<'_> {
         let fname = crate::func_name(f)?;
         if f.agg_star || f.over.is_some() || !f.agg_order.is_empty() {
             return None;
+        }
+        if let Some(mut columns) = f
+            .args
+            .is_empty()
+            .then(|| crate::builtin_out_columns(&fname))
+            .flatten()
+        {
+            // The OUT parameters name the columns; an alias may rename
+            // the leading ones (`addRangeTableEntryForFunction`).
+            let name = match rf.alias.as_ref() {
+                Some(a) => {
+                    let cols = names(&a.colnames);
+                    if cols.len() > columns.len() {
+                        return None;
+                    }
+                    for (c, n) in columns.iter_mut().zip(cols) {
+                        c.0 = n;
+                    }
+                    a.aliasname.clone()
+                }
+                None => fname,
+            };
+            return Some((call, name, columns));
         }
         let args = f
             .args
@@ -3014,7 +3088,7 @@ impl Printer<'_> {
             }
             None => (fname.clone(), fname),
         };
-        Some((call, name, column, ty))
+        Some((call, name, vec![(column, ty)]))
     }
 
     /// `set_rtable_names`: `name`, or `name_N` for the least N free, when an
@@ -3787,7 +3861,7 @@ impl Printer<'_> {
             N::RangeFunction(rf) => {
                 let rte = entry(self, *at)?;
                 *at += 1;
-                let (call, _, _, _) = self.function_item(rf)?;
+                let (call, _, _) = self.function_item(rf)?;
                 self.expr(&call)?;
                 self.buf.push(' ');
                 self.buf.push_str(&q(&rte.refname));
@@ -4610,7 +4684,7 @@ pub fn explain_conjuncts(
             Some((text, qual_column(p)))
         })
         .collect::<Option<Vec<_>>>()
-        .map(|printed| qual_order(&parts, printed))
+        .map(|printed| qual_order(&parts, printed, &def_types(def)))
 }
 
 /// Each top-level `OR` conjunct of a WHERE, by the text
@@ -4719,7 +4793,22 @@ fn qual_column(p: &Node) -> Option<String> {
 fn qual_order(
     parts: &[std::borrow::Cow<'_, Node>],
     printed: Vec<(String, Option<String>)>,
+    types: &dyn Fn(&str) -> Option<String>,
 ) -> Vec<(String, Option<String>)> {
+    let texts: Vec<&str> = printed.iter().map(|p| p.0.as_str()).collect();
+    match qual_permutation(parts, &texts, types) {
+        Some(order) => order.into_iter().map(|i| printed[i].clone()).collect(),
+        None => printed,
+    }
+}
+
+/// [`qual_order`] as the positions of `parts` in PostgreSQL's order;
+/// `None` where it keeps them as written.
+fn qual_permutation(
+    parts: &[std::borrow::Cow<'_, Node>],
+    texts: &[&str],
+    types: &dyn Fn(&str) -> Option<String>,
+) -> Option<Vec<usize>> {
     use crate::costsize::CPU_OPERATOR_COST as OP;
     let literal = |n: Option<&Node>| match n.and_then(|n| n.node.as_ref()) {
         Some(N::AConst(_)) => true,
@@ -4733,14 +4822,52 @@ fn qual_order(
         Some(N::ColumnRef(c)) => names(&c.fields).pop(),
         _ => None,
     };
+    // Any other clause built only of what `cost_qual_eval` prices by its
+    // operators (RP-406): those operators, and one more per coercion of a
+    // column the printer shows (`(a)::numeric`, a function call; a
+    // relabelling to text is free). An equality stays unmodelled: it
+    // joins an equivalence class, which is placed otherwise.
+    let priced = |n: &Node, text: &str| -> Option<(f64, Option<String>)> {
+        // A cast written on a column is priced from the text, as the
+        // printer's coercions are.
+        let mut bare = n.clone();
+        let _ = crate::walk_expr(&mut bare, &mut |x| {
+            if let Some(N::TypeCast(t)) = x.node.as_ref() {
+                if let Some(arg) = t
+                    .arg
+                    .as_deref()
+                    .filter(|a| matches!(a.node, Some(N::ColumnRef(_))))
+                {
+                    *x = arg.clone();
+                }
+            }
+            Ok(())
+        });
+        let n = &bare;
+        if !crate::joins::priced_by_operator_count(n) {
+            return None;
+        }
+        let cost = (crate::joins::qual_operators(n) + column_coercions(text, types) as f64) * OP;
+        if let Some(N::AExpr(e)) = n.node.as_ref() {
+            if e.kind == AExprKind::AexprOp as i32 && crate::operator_name(e).ok()? == "=" {
+                // An expression equal to a constant joins an equivalence
+                // class of its own, keyed by the expression.
+                if !literal(e.rexpr.as_deref()) {
+                    return None;
+                }
+                return Some((cost, Some(format!("{:?}", e.lexpr))));
+            }
+        }
+        Some((cost, None))
+    };
     // (cost, the column of an equivalence class it joins).
     let classify = |n: &Node, text: &str| -> Option<(f64, Option<String>)> {
         // A coercion of the column that is a function call (not varchar's
-        // relabelling to text) costs an operator more: not modelled.
+        // relabelling to text) costs an operator more.
         if text.starts_with("((") && !text.contains(")::text ") {
-            return None;
+            return priced(n, text);
         }
-        match n.node.as_ref()? {
+        (|| match n.node.as_ref()? {
             N::AExpr(e) if e.kind == AExprKind::AexprOp as i32 => {
                 let op = crate::operator_name(e).ok()?;
                 if !matches!(op, "=" | "<>" | "!=" | "<" | "<=" | ">" | ">=") {
@@ -4773,17 +4900,16 @@ fn qual_order(
                 Some((0.0, None))
             }
             _ => None,
-        }
+        })()
+        .or_else(|| priced(n, text))
     };
-    let mut keyed = Vec::with_capacity(printed.len());
+    let mut keyed = Vec::with_capacity(texts.len());
     let mut classes: Vec<String> = Vec::new();
-    for (i, (p, item)) in parts.iter().zip(printed.iter()).enumerate() {
-        let Some((cost, class)) = classify(p, &item.0) else {
-            return printed;
-        };
+    for (i, (p, text)) in parts.iter().zip(texts.iter()).enumerate() {
+        let (cost, class) = classify(p, text)?;
         if let Some(c) = &class {
             if classes.contains(c) {
-                return printed;
+                return None;
             }
             classes.push(c.clone());
         }
@@ -4792,10 +4918,58 @@ fn qual_order(
     // The classes' clauses after the rest, then a stable sort by cost.
     keyed.sort_by_key(|k| k.0);
     keyed.sort_by(|a, b| a.1.total_cmp(&b.1));
-    keyed
-        .into_iter()
-        .map(|(_, _, i)| printed[i].clone())
-        .collect()
+    Some(keyed.into_iter().map(|(_, _, i)| i).collect())
+}
+
+/// A table's column types by name, for [`qual_order`].
+fn def_types(def: &TableDef) -> impl Fn(&str) -> Option<String> + '_ {
+    |col| {
+        def.columns
+            .iter()
+            .find(|c| c.name == col)
+            .map(|c| c.pg_type.clone())
+    }
+}
+
+/// The coercions of a column a printed qual shows that are a call
+/// (`(a)::numeric`), each costing one operator; a relabelling to text is
+/// free, a cast of a column of a type with no binary coercion to text a
+/// `CoerceViaIO` of two (output and input function). A column whose type
+/// `types` does not know counts a cast to text as free.
+fn column_coercions(text: &str, types: &dyn Fn(&str) -> Option<String>) -> usize {
+    let b = text.as_bytes();
+    let mut count = 0;
+    for (i, _) in text.match_indices(")::") {
+        // `(ident)::` -- a column, not a parenthesised expression or a
+        // quoted literal.
+        let Some(open) = text[..i].rfind('(') else {
+            continue;
+        };
+        let inner = &text[open + 1..i];
+        if inner.is_empty()
+            || !inner
+                .bytes()
+                .all(|c| c.is_ascii_alphanumeric() || c == b'_' || c == b'.' || c == b'"')
+            || inner.bytes().next().is_some_and(|c| c.is_ascii_digit())
+        {
+            continue;
+        }
+        let rest = &text[i + 3..];
+        if rest.starts_with("text") && !b.get(i + 7).is_some_and(|c| c.is_ascii_alphanumeric()) {
+            let ty = types(inner.trim_matches('"'));
+            if ty.is_some_and(|t| {
+                !matches!(
+                    base_type(&t).as_str(),
+                    "text" | "varchar" | "character varying" | "bpchar" | "character" | "name"
+                )
+            }) {
+                count += 2;
+            }
+            continue;
+        }
+        count += 1;
+    }
+    count
 }
 
 /// Each JOIN's ON condition in a SELECT's FROM, post-order (a left-deep
@@ -4917,7 +5091,7 @@ pub fn join_conditions_split(
                     let mut parts = Vec::new();
                     and_clauses(q, &mut parts);
                     let mut hash = Vec::new();
-                    let mut rest: Vec<(usize, String)> = Vec::new();
+                    let mut rest: Vec<(f64, String)> = Vec::new();
                     for part in &parts {
                         let part: &Node = part;
                         p.buf.clear();
@@ -4928,12 +5102,14 @@ pub fn join_conditions_split(
                         } else {
                             // A cancel stops the walk; it stays pending
                             // for the statement's next cancellation point.
-                            rest.push((qual_operators(part).ok()?, text));
+                            qual_operators(part).ok()?;
+                            let ops = crate::joins::qual_operators(part) + io_casts(p, part) as f64;
+                            rest.push((ops, text));
                         }
                     }
                     // `order_qual_clauses`: the join filter cheapest first,
                     // a stable sort by each clause's operators.
-                    rest.sort_by_key(|(ops, _)| *ops);
+                    rest.sort_by(|a, b| a.0.total_cmp(&b.0));
                     let rest: Vec<String> = rest.into_iter().map(|(_, t)| t).collect();
                     let and = |v: &[String]| match v {
                         [one] => one.clone(),
@@ -4941,6 +5117,14 @@ pub fn join_conditions_split(
                     };
                     let split =
                         (!hash.is_empty() && !rest.is_empty()).then(|| (and(&hash), and(&rest)));
+                    // A nested loop's Join Filter is the whole qual list:
+                    // flattened (a BETWEEN expanded to its two
+                    // comparisons, RP-903) and cheapest first (RP-924).
+                    let whole = if hash.is_empty() && rest.len() > 1 {
+                        and(&rest)
+                    } else {
+                        whole
+                    };
                     out.push((whole, split));
                 }
                 None => out.push((String::new(), None)),
@@ -5079,7 +5263,77 @@ pub fn join_where(s: &pg_query::protobuf::SelectStmt, cat: &Catalog<'_>) -> Opti
         let column = home.as_ref().and_then(|_| qual_column(part));
         out.push((text, home, column));
     }
+    let types = |home: &str, col: &str| {
+        p.scopes
+            .last()?
+            .iter()
+            .find(|r| r.refname == home || r.name == home)?
+            .columns
+            .iter()
+            .find(|c| c.0 == col)
+            .map(|c| c.1.clone())
+    };
+    order_scan_quals(&mut out, &parts, &types);
     Some(out)
+}
+
+/// Each scan's own conjuncts among `quals` (one per node of `parts`) in
+/// the order a lone scan's are ([`qual_order`], RP-398), back in the
+/// positions they held; left as they are when the two lists differ in
+/// length.
+fn order_scan_quals(
+    quals: &mut [JoinQual],
+    parts: &[std::borrow::Cow<'_, Node>],
+    types: &dyn Fn(&str, &str) -> Option<String>,
+) {
+    if quals.len() != parts.len() {
+        return;
+    }
+    let mut homes: Vec<String> = Vec::new();
+    for q in quals.iter() {
+        if let Some(h) = &q.1 {
+            if !homes.contains(h) {
+                homes.push(h.clone());
+            }
+        }
+    }
+    for h in &homes {
+        let slots: Vec<usize> = (0..quals.len())
+            .filter(|i| quals[*i].1.as_ref() == Some(h))
+            .collect();
+        let mine: Vec<std::borrow::Cow<'_, Node>> =
+            slots.iter().map(|i| parts[*i].clone()).collect();
+        let texts: Vec<&str> = slots.iter().map(|i| quals[*i].0.as_str()).collect();
+        if let Some(order) = qual_permutation(&mine, &texts, &|c| types(h, c)) {
+            let moved: Vec<JoinQual> = order.iter().map(|k| quals[slots[*k]].clone()).collect();
+            for (slot, q) in slots.iter().zip(moved) {
+                quals[*slot] = q;
+            }
+        }
+    }
+}
+
+/// [`order_scan_quals`] over quals gathered from more than one list (an
+/// outer join's ON conjuncts pushed to its nullable side, then the
+/// WHERE's), each node read back from the scan qual's printed text, which
+/// is the planned expression.
+pub fn order_merged_scan_quals(quals: &mut [JoinQual]) {
+    let nodes: Option<Vec<Node>> = quals
+        .iter()
+        .map(|q| {
+            let tree = pg_query::parse(&format!("select 1 where {}", q.0)).ok()?;
+            let stmt = tree.protobuf.stmts.first()?.stmt.as_deref()?;
+            match stmt.node.as_ref()? {
+                N::SelectStmt(sel) => sel.where_clause.as_deref().cloned(),
+                _ => None,
+            }
+        })
+        .collect();
+    if let Some(nodes) = nodes {
+        let parts: Vec<std::borrow::Cow<'_, Node>> =
+            nodes.iter().map(std::borrow::Cow::Borrowed).collect();
+        order_scan_quals(quals, &parts, &|_, _| None);
+    }
 }
 
 /// A comma join of two relations (`FROM e, k`, RP-372): its WHERE's
@@ -5159,6 +5413,44 @@ pub fn comma_join_conds(
     })
 }
 
+/// The operators a qual's casts of a column to text add: a cast from a
+/// type with no binary coercion to text is a `CoerceViaIO`, the source's
+/// output function and text's input function, one operator cost each
+/// (`cost_qual_eval_walker`, RP-924). A string column's cast is a
+/// RelabelType and free; a cast of a constant is folded.
+fn io_casts(p: &Printer<'_>, n: &Node) -> usize {
+    let mut count = 0;
+    let mut copy = n.clone();
+    let _ = crate::walk_expr(&mut copy, &mut |x| {
+        let Some(N::TypeCast(t)) = x.node.as_ref() else {
+            return Ok(());
+        };
+        let to_text = t
+            .type_name
+            .as_ref()
+            .and_then(|tn| names(&tn.names).pop())
+            .is_some_and(|n| n == "text");
+        let Some(N::ColumnRef(c)) = t.arg.as_deref().and_then(|a| a.node.as_ref()) else {
+            return Ok(());
+        };
+        let source = p
+            .lookup(&names(&c.fields))
+            .and_then(|(si, ri, ci)| Some(p.scopes.get(si)?.get(ri)?.columns.get(ci)?.1.clone()));
+        if to_text
+            && source.is_some_and(|ty| {
+                !matches!(
+                    ty.as_str(),
+                    "text" | "varchar" | "character varying" | "bpchar" | "character" | "name"
+                )
+            })
+        {
+            count += 2;
+        }
+        Ok(())
+    });
+    count
+}
+
 /// The operators a clause evaluates (`cost_qual_eval`, each one
 /// `cpu_operator_cost`).
 fn qual_operators(n: &Node) -> crate::Result<usize> {
@@ -5172,6 +5464,7 @@ fn qual_operators(n: &Node) -> crate::Result<usize> {
                 count += 1;
             }
         }
+
         Ok(())
     })?;
     Ok(count)
@@ -5204,6 +5497,14 @@ fn folded_numeric_cast(arg: &Node, target: &str) -> Option<String> {
     let Some(N::AConst(c)) = arg.node.as_ref() else {
         return None;
     };
+    if target == "float8" {
+        let v: f64 = match c.val.as_ref()? {
+            Val::Ival(i) => i.ival.into(),
+            Val::Fval(f) => f.fval.parse().ok()?,
+            _ => return None,
+        };
+        return Some(float8_text(v));
+    }
     let v: i128 = match c.val.as_ref()? {
         Val::Ival(i) => i.ival.into(),
         Val::Fval(f) => f.fval.parse().ok()?,
@@ -5214,6 +5515,8 @@ fn folded_numeric_cast(arg: &Node, target: &str) -> Option<String> {
         "int4" => i32::try_from(v).is_ok(),
         "int8" => i64::try_from(v).is_ok(),
         "numeric" | "text" => true,
+        // Printed as the integer while below `FLT_DIG`'s exponent.
+        "float4" => v.unsigned_abs() < 1_000_000,
         _ => false,
     };
     fits.then(|| v.to_string())
@@ -5282,7 +5585,7 @@ pub fn explain_subquery_conjuncts(where_clause: &Node, def: &TableDef) -> Option
         .collect::<Option<Vec<_>>>()?;
     // In the planner's order, as a scan's (RP-348).
     Some(
-        qual_order(&parts, printed)
+        qual_order(&parts, printed, &def_types(def))
             .into_iter()
             .map(|(text, _)| text)
             .collect(),
@@ -6038,4 +6341,40 @@ pub fn explain_verbose_scan(
         output,
         quals,
     })
+}
+
+#[cfg(test)]
+mod out_parameter_function_tests {
+    use super::*;
+
+    #[test]
+    fn a_record_of_out_parameters_in_from_prints_its_column_list() {
+        // PostgreSQL 15.19 (RP-798): `pg_settings` is `SELECT * FROM
+        // pg_show_all_settings() AS A`; ruleutils expands the star to the
+        // OUT parameters and prints them as the alias's column list.
+        let none_t = |_: &str| None;
+        let none_v = |_: &str| None;
+        let cat = Catalog {
+            lookup: &none_t,
+            view_sql: &none_v,
+        };
+        let got = viewdef(
+            "SELECT * FROM pg_show_all_settings() AS A(n, s)",
+            None,
+            &cat,
+        )
+        .unwrap();
+        assert!(
+            got.starts_with(" SELECT a.n,\n    a.s,\n    a.unit,"),
+            "{got}"
+        );
+        assert!(
+            got.ends_with(
+                "FROM pg_show_all_settings() a(n, s, unit, category, short_desc, extra_desc, \
+                 context, vartype, source, min_val, max_val, enumvals, boot_val, reset_val, \
+                 sourcefile, sourceline, pending_restart);"
+            ),
+            "{got}"
+        );
+    }
 }

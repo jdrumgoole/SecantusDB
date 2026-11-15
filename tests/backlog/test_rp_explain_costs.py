@@ -1834,9 +1834,9 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "        Filter: (f.x <> (a)::double precision)",
         ],
     ),
-    # Still open: a LEFT join's ON conjunct over its nullable side alone
-    # beside an inequality into that side's index is the parameterized
-    # scan's Filter.
+    # A LEFT join's ON conjunct over its nullable side alone beside an
+    # inequality into that side's index is the parameterized scan's Filter,
+    # checked on each row it fetches (RP-918, fixed).
     "nested loop left join with an on restriction of its nullable side": (
         "RP-918",
         _ANALYSED,
@@ -1847,6 +1847,45 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "  ->  Index Scan using k_pkey on k  (cost=0.28..6.98 rows=333 width=7)",
             "        Index Cond: (a > e.a)",
             "        Filter: (a <> 2)",
+        ],
+    ),
+    # The same over another column of the side, and in an inner join,
+    # whose one-table ON conjunct is the scan's restriction (RP-918).
+    "nested loop left join with an on restriction of another nullable column": (
+        "RP-918",
+        _ANALYSED,
+        "explain select * from e left join k on e.a < k.a and k.b <> 'v2'",
+        [
+            "Nested Loop Left Join  (cost=0.28..9990.00 rows=300000 width=14)",
+            "  ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
+            "  ->  Index Scan using k_pkey on k  (cost=0.28..6.98 rows=300 width=7)",
+            "        Index Cond: (a > e.a)",
+            "        Filter: (b <> 'v2'::text)",
+        ],
+    ),
+    "nested loop into an index with a restriction of the inner side": (
+        "RP-918",
+        _ANALYSED,
+        "explain select * from e join k on e.a < k.a and k.a <> 2",
+        [
+            "Nested Loop  (cost=0.28..10320.00 rows=333000 width=14)",
+            "  ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
+            "  ->  Index Scan using k_pkey on k  (cost=0.28..6.98 rows=333 width=7)",
+            "        Index Cond: (a > e.a)",
+            "        Filter: (a <> 2)",
+        ],
+    ),
+    # Still open: a bound of the inner side's own on its indexed key joins
+    # the parameterized scan's Index Cond (found while working RP-918).
+    "nested loop into an index with a range of the inner side": (
+        "RP-979",
+        _ANALYSED,
+        "explain select * from e left join k on e.a < k.a and k.a > 2",
+        [
+            "Nested Loop Left Join  (cost=0.28..10320.00 rows=332667 width=14)",
+            "  ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
+            "  ->  Index Scan using k_pkey on k  (cost=0.28..6.98 rows=333 width=7)",
+            "        Index Cond: ((a > e.a) AND (a > 2))",
         ],
     ),
     # Fixed (RP-916): a parameterized index scan under an outer side with
@@ -2086,6 +2125,36 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "  Filter: (r <> f)",
         ],
     ),
+    # A real meeting a double precision, a numeric or an integer is taken
+    # as it is by the cross-type float48 operators; the other side is cast
+    # (measured on PostgreSQL 15.19, RP-917).
+    "a real compared with a numeric constant": (
+        "RP-917",
+        ["create table fr (r real, f float8, i int, n numeric)"],
+        "explain (costs off) select * from fr where r < 1.5",
+        [
+            "Seq Scan on fr",
+            "  Filter: (r < '1.5'::double precision)",
+        ],
+    ),
+    "a real plus an integer": (
+        "RP-917",
+        ["create table fr (r real, f float8, i int, n numeric)"],
+        "explain (costs off) select * from fr where r + i > 1",
+        [
+            "Seq Scan on fr",
+            "  Filter: ((r + (i)::double precision) > '1'::double precision)",
+        ],
+    ),
+    "a real times a double compared with a numeric": (
+        "RP-917",
+        ["create table fr (r real, f float8, i int, n numeric)"],
+        "explain (costs off) select * from fr where r * f > n",
+        [
+            "Seq Scan on fr",
+            "  Filter: ((r * f) > (n)::double precision)",
+        ],
+    ),
     # Split from RP-354 and fixed: an ON conjunct over the preserved side
     # that is a pattern match is one operator of the Join Filter, its
     # selectivity `patternsel` over the column's statistics; before, the
@@ -2250,9 +2319,9 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "        ->  Seq Scan on e e3  (cost=0.00..15.00 rows=1000 width=7)",
         ],
     ),
-    # Still open: the upper join's clauses print in the order of the
-    # lower join's tables' join lists (`build_joinrel_restrictlist`), the
-    # clause to `e` before the one to `e2`; here as the ON wrote them.
+    # Fixed: the upper join's clauses print in the order of the lower
+    # join's tables' join lists (`build_joinrel_restrictlist`), the clause
+    # to `e` before the one to `e2`; before, as the ON wrote them.
     "nested loop of three relations with two clauses above": (
         "RP-920",
         _ANALYSED,
@@ -2766,8 +2835,8 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "        ->  Seq Scan on e e2  (cost=0.00..15.00 rows=1000 width=7)",
         ],
     ),
-    # Still open: a nested loop's Join Filter is printed in the ON's
-    # written order, where `order_qual_clauses` puts it cheapest first.
+    # Was printed in the ON's written order; `order_qual_clauses` puts
+    # it cheapest first (RP-924, fixed).
     "a nested loop's join filter in cost order": (
         "RP-924",
         _ANALYSED,
@@ -2963,9 +3032,10 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
     ),
     # ------------- RP-908 a LEFT join whose WHERE keeps only unmatched rows
     # `reduce_outer_joins` makes a LEFT join whose WHERE tests the nullable
-    # side's join-strict column IS NULL an anti join.
+    # side's join-strict column IS NULL an anti join; it printed a Left
+    # Join under that Filter, unpriced (RP-908, fixed).
     "a left join where the nullable side is null is an anti join": (
-        "RP-908",
+        "RP-908:fixed",
         _ANALYSED,
         "explain select * from e left join e e2 on e.a <> e2.a where e2.a is null",
         [
@@ -2976,14 +3046,44 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "        ->  Seq Scan on e e2  (cost=0.00..15.00 rows=1000 width=7)",
         ],
     ),
-    # The same over an equality: a Hash Anti Join.
+    # The same over an equality: a Hash Anti Join (RP-908, fixed).
     "a left join on an equality where the nullable side is null is an anti join": (
-        "RP-908",
+        "RP-908:fixed",
         _ANALYSED,
         "explain select * from e left join e e2 on e.a = e2.a where e2.a is null",
         [
             "Hash Anti Join  (cost=27.50..46.25 rows=1 width=14)",
             "  Hash Cond: (e.a = e2.a)",
+            "  ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
+            "  ->  Hash  (cost=15.00..15.00 rows=1000 width=7)",
+            "        ->  Seq Scan on e e2  (cost=0.00..15.00 rows=1000 width=7)",
+        ],
+    ),
+    # ------------- RP-980 a NOT EXISTS pulled up into an anti join
+    # `convert_EXISTS_sublink_to_join` makes it the Hash Anti Join of the
+    # two, the inner reading only its key (found while working RP-908).
+    "a not exists over an equality is a hash anti join": (
+        "RP-980",
+        _ANALYSED,
+        "explain select * from e where not exists (select 1 from e e2 where e2.a = e.a)",
+        [
+            "Hash Anti Join  (cost=27.50..46.25 rows=1 width=7)",
+            "  Hash Cond: (e.a = e2.a)",
+            "  ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
+            "  ->  Hash  (cost=15.00..15.00 rows=1000 width=4)",
+            "        ->  Seq Scan on e e2  (cost=0.00..15.00 rows=1000 width=4)",
+        ],
+    ),
+    # ------------- RP-981 an anti join on an expression key
+    # The ON strict in the nullable side's key through an expression is an
+    # anti join too, hashed on the expression (found while working RP-908).
+    "a left join on an expression key where the nullable side is null is a hash anti join": (
+        "RP-981",
+        _ANALYSED,
+        "explain select * from e left join e e2 on e.a = e2.a + 1 where e2.a is null",
+        [
+            "Hash Anti Join  (cost=27.50..133.88 rows=500 width=14)",
+            "  Hash Cond: (e.a = (e2.a + 1))",
             "  ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
             "  ->  Hash  (cost=15.00..15.00 rows=1000 width=7)",
             "        ->  Seq Scan on e e2  (cost=0.00..15.00 rows=1000 width=7)",
@@ -4088,10 +4188,10 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
         ],
     ),
     # A LEFT join's ON conjunct over one table of an inner join on its
-    # nullable side is that table's scan Filter too (found while working
-    # RP-395).
+    # nullable side is that table's scan Filter too (RP-397, fixed); still
+    # open: the join search's order and method around it (RP-978).
     "a left join's ON conjunct over a table of an inner join it null-extends": (
-        "RP-397",
+        "RP-978",
         _ANALYSED_THIRTY,
         "explain (costs off)"
         " select * from s left join (e join k on e.a < k.a) on s.a = e.a and k.b = 'v3'",
@@ -4108,13 +4208,69 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "        ->  Seq Scan on s",
         ],
     ),
-    # A join's scan Filter in PostgreSQL's qual order: an equality to a
-    # constant after the rest (`generate_base_implied_equalities`), as a
+    # Where the join search keeps the written order, the conjunct prints
+    # on its scan as PostgreSQL places it (RP-397, fixed).
+    "a left join's ON conjunct over the hashed table of an inner join": (
+        "RP-397:fixed",
+        _ANALYSED_THIRTY,
+        "explain (costs off) select * from s left join (e join s s2 on e.a = s2.a)"
+        " on s.a = e.a and s2.c = 'xx'",
+        [
+            "Hash Left Join",
+            "  Hash Cond: (s.a = e.a)",
+            "  ->  Seq Scan on s",
+            "  ->  Hash",
+            "        ->  Hash Join",
+            "              Hash Cond: (e.a = s2.a)",
+            "              ->  Seq Scan on e",
+            "              ->  Hash",
+            "                    ->  Seq Scan on s s2",
+            "                          Filter: (c = 'xx'::text)",
+        ],
+    ),
+    # An inner join's one-table ON conjunct under an outer join is its
+    # table's scan Filter, beside the outer join's own (RP-393, fixed).
+    "an inner join's one-table ON conjunct under an outer join": (
+        "RP-393:fixed",
+        _ANALYSED_THIRTY,
+        "explain (costs off) select * from s left join"
+        " (e join s s2 on e.a = s2.a and s2.c = 'xx') on s.a = s2.a and e.b = 'v3'",
+        [
+            "Hash Left Join",
+            "  Hash Cond: (s.a = s2.a)",
+            "  ->  Seq Scan on s",
+            "  ->  Hash",
+            "        ->  Hash Join",
+            "              Hash Cond: (e.a = s2.a)",
+            "              ->  Seq Scan on e",
+            "                    Filter: (b = 'v3'::text)",
+            "              ->  Hash",
+            "                    ->  Seq Scan on s s2",
+            "                          Filter: (c = 'xx'::text)",
+        ],
+    ),
+    # A join's scan Filter in PostgreSQL's qual order (RP-398, fixed): an
+    # equality to a constant after the rest (`generate_base_implied_equalities`), as a
     # lone scan prints it (found while working RP-395).
     "a joined scan's filter puts its equality to a constant last": (
         "RP-398",
         _ANALYSED_THIRTY,
         "explain (costs off) select * from s join e on s.a < e.a where e.b = 'v3' and e.a > 5",
+        [
+            "Nested Loop",
+            "  Join Filter: (s.a < e.a)",
+            "  ->  Seq Scan on e",
+            "        Filter: ((a > 5) AND (b = 'v3'::text))",
+            "  ->  Materialize",
+            "        ->  Seq Scan on s",
+        ],
+    ),
+    # The same for a LEFT join the WHERE reduces to an inner one: its ON
+    # conjunct over the nullable side joins that scan's list (RP-398).
+    "a reduced left join's scan filter puts its equality to a constant last": (
+        "RP-398",
+        _ANALYSED_THIRTY,
+        "explain (costs off) select * from s left join e on s.a < e.a and e.b = 'v3' where e.a > 5",
         [
             "Nested Loop",
             "  Join Filter: (s.a < e.a)",
@@ -4426,16 +4582,45 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "        ->  Seq Scan on s",
         ],
     ),
-    # Two different constants equal to one column of a joined table make
-    # the class contradictory: the whole join is a false One-Time Filter
-    # (found while working RP-395).
+    # Two different constants equal to one column of a joined table made
+    # the class contradictory: the column's relation is dummy, and so the
+    # whole inner join, a bare false One-Time Filter (RP-400, fixed).
     "a join whose where equates a column to two constants": (
-        "RP-400",
+        "RP-400:fixed",
         _ANALYSED_THIRTY,
         "explain (costs off) select * from s join e on s.a < e.a where e.b = 'v1' and e.b = 'v2'",
         [
             "Result",
             "  One-Time Filter: false",
+        ],
+    ),
+    # The same through aliases and a comma join, the second constant on the
+    # left of its `=` (RP-400, fixed).
+    "a comma join of aliases whose where equates a column to two constants": (
+        "RP-400:fixed",
+        _ANALYSED_THIRTY,
+        "explain (costs off) select * from s x, e y where x.a < y.a and y.b = 'v1' and 'v2' = y.b",
+        [
+            "Result",
+            "  One-Time Filter: false",
+        ],
+    ),
+    # In a LEFT join's ON the class's `false` is a pseudoconstant gating the
+    # nullable side's scan, which keeps the first constant (RP-400, fixed).
+    "a left join's on equating its nullable column to two constants": (
+        "RP-400:fixed",
+        _ANALYSED_THIRTY,
+        "explain (costs off) select * from s left join e"
+        " on s.a < e.a and e.b = 'v1' and e.b = 'v2'",
+        [
+            "Nested Loop Left Join",
+            "  Join Filter: (s.a < e.a)",
+            "  ->  Seq Scan on s",
+            "  ->  Materialize",
+            "        ->  Result",
+            "              One-Time Filter: false",
+            "              ->  Seq Scan on e",
+            "                    Filter: (b = 'v1'::text)",
         ],
     ),
     # Split from RP-390 (as RP-403) and fixed: a Hash Join whose scans each have their
@@ -4526,8 +4711,11 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
     ),
     # A chain of three tables' Nested Loops: still unannotated below the
     # top join (RP-390's remainder).
+    # Split from RP-390 and fixed: a chain of plain nested loops counts
+    # each lower join's rows by running its filter over its pairs (only
+    # the top join printed counts).
     "analyze of a nested loop of three relations": (
-        "RP-390",
+        "RP-389",
         _ANALYSED_INDEXED_SMALL,
         "explain (analyze, costs off, timing off, summary off)"
         " select * from z join z z2 on z.a < z2.a join z z3 on z2.a < z3.a",
@@ -4545,8 +4733,12 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "        ->  Seq Scan on z z3 (actual rows=20 loops=1)",
         ],
     ),
+    # Split from RP-390 and fixed: a chain's top join whose inner side is a
+    # Memoize over a parameterized index scan counts the lower join's rows,
+    # and the Memoize its cache, as the scan's outer rows (they printed
+    # bare).
     "analyze of a nested loop of three relations into a memoized index": (
-        "RP-390",
+        "RP-389",
         _ANALYSED_INDEXED_SMALL,
         "explain (analyze, costs off, timing off, summary off)"
         " select * from z join z z2 on z.a < z2.a join kz on z2.a < kz.a",
@@ -4564,6 +4756,27 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "        Hits: 171  Misses: 19  Evictions: 0  Overflows: 0  Memory Usage: 15kB",
             "        ->  Index Scan using kz_pkey on kz (actual rows=19 loops=19)",
             "              Index Cond: (a > z2.a)",
+        ],
+    ),
+    # A chain whose lower join is a Hash Join: the top Nested Loop's outer
+    # side prints bare here (RP-390's remainder).
+    "analyze of a nested loop over a hash join": (
+        "RP-390",
+        _ANALYSED_INDEXED_SMALL,
+        "explain (analyze, costs off, timing off, summary off)"
+        " select * from z join kz on z.a = kz.a join z z2 on z2.a < kz.a",
+        [
+            "Nested Loop (actual rows=190 loops=1)",
+            "  Join Filter: (z2.a < kz.a)",
+            "  Rows Removed by Join Filter: 210",
+            "  ->  Hash Join (actual rows=20 loops=1)",
+            "        Hash Cond: (z.a = kz.a)",
+            "        ->  Seq Scan on z (actual rows=20 loops=1)",
+            "        ->  Hash (actual rows=30 loops=1)",
+            "              Buckets: 1024  Batches: 1  Memory Usage: 10kB",
+            "              ->  Seq Scan on kz (actual rows=30 loops=1)",
+            "  ->  Materialize (actual rows=20 loops=20)",
+            "        ->  Seq Scan on z z2 (actual rows=20 loops=1)",
         ],
     ),
     # An index over a weakly correlated column (RP-926): a nested loop's
@@ -4591,10 +4804,11 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "        Index Cond: (y > z.a)",
         ],
     ),
-    # A LEFT join filter over a char(n) column: still unannotated (RP-390's
-    # remainder).
+    # Split from RP-390 and fixed: a LEFT join filter over a char(n) column
+    # reads the column blank-padded, so its pairs are counted and the
+    # children annotated (they printed bare).
     "analyze of a left nested loop over a char(n) join filter": (
-        "RP-390",
+        "RP-389",
         _ANALYSED_THIRTY
         + [
             "create table cc (a int, b char(4))",
@@ -4951,6 +5165,91 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
     # a typed literal (`eval_const_expressions`) before the Filter is
     # printed; here the coercion prints unfolded (found while working
     # RP-405).
+    # A constant coerced to double precision is folded in float8out's
+    # form (measured on PostgreSQL 15.19, RP-407).
+    "a constant coerced to double precision is folded": (
+        "RP-407",
+        ["create table fr (r real, f float8, i int, n numeric)"],
+        "explain (costs off) select * from fr where f > 0.00001 and r > 1e20",
+        [
+            "Seq Scan on fr",
+            "  Filter: ((f > '1e-05'::double precision) AND (r > '1e+20'::double precision))",
+        ],
+    ),
+    # An expression equal to a constant is an equivalence class's, placed
+    # after the other quals.
+    "a coerced column equal to a folded constant": (
+        "RP-407",
+        _ANALYSED,
+        "explain (costs off) select * from e where a::numeric = 4 and b <> 'v'",
+        [
+            "Seq Scan on e",
+            "  Filter: ((b <> 'v'::text) AND ((a)::numeric = '4'::numeric))",
+        ],
+    ),
+    # `negate_clause` over a NOT BETWEEN, an IN list and a regex match,
+    # and the AND that comes out flattened into the scan's quals (measured
+    # on PostgreSQL 15.19, RP-412).
+    "a not over a not between is its two comparisons": (
+        "RP-412",
+        _ANALYSED,
+        "explain (costs off) select * from e"
+        " where not (b ilike 'x%') and not (a not between 1 and 5)",
+        [
+            "Seq Scan on e",
+            "  Filter: ((b !~~* 'x%'::text) AND (a >= 1) AND (a <= 5))",
+        ],
+    ),
+    "a not over an in list is its negator over all": (
+        "RP-412",
+        _ANALYSED,
+        "explain (costs off) select * from e where not (a in (1,2))",
+        ["Seq Scan on e", "  Filter: (a <> ALL ('{1,2}'::integer[]))"],
+    ),
+    "a not over an and of a regex and a null test": (
+        "RP-412",
+        _ANALYSED,
+        "explain (costs off) select * from e where not (b ~ 'x' and a is null)",
+        ["Seq Scan on e", "  Filter: ((b !~ 'x'::text) OR (a IS NOT NULL))"],
+    ),
+    "a not over an or is two index conditions": (
+        "RP-412",
+        _ANALYSED,
+        "explain (costs off) select * from k where not (a > 5 or a < 3)",
+        ["Index Scan using k_pkey on k", "  Index Cond: ((a <= 5) AND (a >= 3))"],
+    ),
+    # More of `eval_const_expressions` over a COALESCE and a LIKE's
+    # ESCAPE, measured on PostgreSQL 15.19 (RP-421, RP-915).
+    "a coalesce ends at its first non-null constant": (
+        "RP-421",
+        _ANALYSED,
+        "explain (costs off) select * from e where coalesce(a, 2, b::int) = 1",
+        ["Seq Scan on e", "  Filter: (COALESCE(a, 2) = 1)"],
+    ),
+    "a coalesce of only nulls is a false one-time filter": (
+        "RP-421",
+        _ANALYSED,
+        "explain (costs off) select * from e where coalesce(null::int, null) = 1",
+        ["Result", "  One-Time Filter: false"],
+    ),
+    "a like with an empty escape doubles its backslashes": (
+        "RP-915",
+        _ANALYSED,
+        "explain (costs off) select * from e where b like 'a\\\\b' escape ''",
+        ["Seq Scan on e", "  Filter: (b ~~ 'a\\\\\\\\b'::text)"],
+    ),
+    "a join scan's like with an escape clause is a folded pattern": (
+        "RP-915",
+        _ANALYSED_THIRTY,
+        "explain (costs off) select * from e join s on e.b like 'v1!%' escape '!' and s.a < e.a",
+        [
+            "Nested Loop",
+            "  Join Filter: (s.a < e.a)",
+            "  ->  Seq Scan on e",
+            "        Filter: (b ~~ 'v1\\%'::text)",
+            "  ->  Seq Scan on s",
+        ],
+    ),
     "a scan filter's coerced constant is folded": (
         "RP-407",
         _ANALYSED,
@@ -4964,6 +5263,41 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
     # (`order_qual_clauses`): the operator over a column before the one
     # over an expression. Here they keep the WHERE's order (found while
     # working RP-402).
+    # A coercion of a column that is a call costs an operator: a cast to
+    # numeric one, an integer's cast to text (`CoerceViaIO`) two
+    # (`cost_qual_eval`; measured on PostgreSQL 15.19, RP-406).
+    "a scan filter's coerced column after a cheaper conjunct": (
+        "RP-406",
+        _ANALYSED,
+        "explain (costs off) select * from e where a between 1 and 5.5 and b <> 'v3'",
+        [
+            "Seq Scan on e",
+            "  Filter: ((a >= 1) AND (b <> 'v3'::text) AND ((a)::numeric <= 5.5))",
+        ],
+    ),
+    "a scan filter's column cast to text after a cheaper conjunct": (
+        "RP-406",
+        _ANALYSED,
+        "explain (costs off) select * from e where a::text > '5' and b <> 'v1'",
+        [
+            "Seq Scan on e",
+            "  Filter: ((b <> 'v1'::text) AND ((a)::text > '5'::text))",
+        ],
+    ),
+    "a join's scan filter's column cast to text after a cheaper conjunct": (
+        "RP-406",
+        _ANALYSED_THIRTY,
+        "explain (costs off) select * from e x join s on s.a = x.a"
+        " where x.a::text > '5' and x.b <> 'v1'",
+        [
+            "Hash Join",
+            "  Hash Cond: (x.a = s.a)",
+            "  ->  Seq Scan on e x",
+            "        Filter: ((b <> 'v1'::text) AND ((a)::text > '5'::text))",
+            "  ->  Hash",
+            "        ->  Seq Scan on s",
+        ],
+    ),
     "a scan filter's conjuncts in cost order": (
         "RP-406",
         _ANALYSED,
@@ -5010,9 +5344,10 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
         ],
     ),
     # An inner join nested inside an outer join: its one-table ON conjunct
-    # is still its table's scan Filter (found while working RP-392).
+    # is its table's scan Filter (RP-393, fixed); still open: the nested
+    # join's search and its counts (RP-978).
     "analyze of an inner join under an outer join with a one-table ON conjunct": (
-        "RP-393",
+        "RP-978",
         _ANALYSED_THIRTY,
         "explain (analyze, costs off, timing off, summary off)"
         " select * from s left join (e join k on e.a > 998 and k.a = e.a) on true",
@@ -5028,7 +5363,21 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "                    Index Cond: (a = e.a)",
         ],
     ),
-    # A join's equivalence classes drop a repeated conjunct
+    # Still open: a constant the class generates for the inner side's
+    # indexed column is that index scan's Index Cond, not a Filter.
+    "an equivalence class's generated constant is the inner index's cond": (
+        "RP-977",
+        _ANALYSED,
+        "explain select * from e, k where e.a = k.a and e.a = 5",
+        [
+            "Nested Loop  (cost=0.28..25.80 rows=1 width=14)",
+            "  ->  Seq Scan on e  (cost=0.00..17.50 rows=1 width=7)",
+            "        Filter: (a = 5)",
+            "  ->  Index Scan using k_pkey on k  (cost=0.28..8.29 rows=1 width=7)",
+            "        Index Cond: (a = 5)",
+        ],
+    ),
+    # A join's equivalence classes drop a repeated conjunct (RP-402, fixed)
     # (`process_equivalence` finds it redundant): the equality between the
     # tables is one hash clause, priced once (found while working RP-388).
     "comma join with a repeated join equality": (
@@ -5396,8 +5745,16 @@ def run(dsn: str, setup: list[str], query: str) -> list[str]:
 
 
 def _marked(name: str, item: str) -> Any:
+    # `RP-nnn:fixed` is a scenario of an item still open in part: the part
+    # fixed (`backlog` "Working an item" step 5).
+    if item.endswith(":fixed"):
+        return pytest.param(
+            name, marks=pytest.mark.backlog_fixed(item.removesuffix(":fixed")), id=name
+        )
     fixed = item in (
         "RP-314",
+        "RP-918",
+        "RP-920",
         "RP-317",
         "RP-318",
         "RP-319",
@@ -5463,14 +5820,25 @@ def _marked(name: str, item: str) -> Any:
         "RP-394",
         "RP-395",
         "RP-396",
+        "RP-398",
         "RP-399",
+        "RP-402",
         "RP-403",
         "RP-404",
         "RP-405",
         "RP-409",
         "RP-913",
         "RP-916",
+        "RP-902",
+        "RP-903",
+        "RP-924",
         "RP-925",
+        "RP-406",
+        "RP-407",
+        "RP-917",
+        "RP-412",
+        "RP-421",
+        "RP-915",
     )
     mark = pytest.mark.backlog_fixed if fixed else pytest.mark.backlog
     return pytest.param(name, marks=mark(item), id=name)
@@ -5600,3 +5968,15 @@ if __name__ == "__main__":
         got = run(fresh_db(sys.argv[1]), setup, query)
         if got != expected:
             print(f"{name}: {got!r}")
+
+
+@pytest.mark.backlog_fixed("RP-390")
+def test_a_chains_lower_hash_join_is_counted(rust_pg: Any) -> None:
+    """A nested loop over a lower Hash Join counted it: the Hash Join's
+    rows, its scans' and its Hash's buckets, and the top join's removed
+    pairs, as PostgreSQL 15.19 prints them (they printed bare). The top
+    join's inner Materialize is the chain's pricing, still open (RP-390's
+    `test_plan[analyze of a nested loop over a hash join]`)."""
+    _, setup, query, expected = SCENARIOS["analyze of a nested loop over a hash join"]
+    got = run(fresh_db(_dsn(rust_pg)), setup, query)
+    assert got[:9] == expected[:9]

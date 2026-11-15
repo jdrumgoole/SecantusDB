@@ -624,7 +624,11 @@ pub fn param_range_index_scan(
     if index.hash
         || bounds.is_empty()
         || !index.columns.iter().any(|c| c == column)
-        || quals.iter().any(|(f, _)| index.columns.contains(f))
+        // A `<>` on an index column is no index qual, only a filter of
+        // each row fetched (RP-918); any other would join the Index Cond.
+        || quals
+            .iter()
+            .any(|(f, q)| index.columns.contains(f) && !matches!(q, Qual::Ne))
     {
         return None;
     }

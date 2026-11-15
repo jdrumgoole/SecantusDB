@@ -1,8 +1,8 @@
 """Gap tests of the divergences found while working RP-665 (a scalar
 subquery over a domain column was typed by the domain's base):
 
-- a CASE, COALESCE, GREATEST or LEAST over domain columns alone is typed by
-  the domain's base (RP-764).
+- a CASE, COALESCE, GREATEST or LEAST over domain columns alone was typed by
+  the domain's base (RP-764, fixed).
 
 The expected answers were measured on a private, freshly initdb'd
 PostgreSQL 15.19 cluster with `_SETUP`, which each statement runs after.
@@ -61,7 +61,7 @@ COMMON = {
 }
 
 
-@pytest.mark.backlog("RP-764")
+@pytest.mark.backlog_fixed("RP-764")
 @pytest.mark.parametrize("query", list(COMMON))
 def test_common_type_of_domain_columns_alone_is_the_domain(query: str, dsn: str) -> None:
     with _connect(dsn) as c:

@@ -1,5 +1,6 @@
-"""Gap test of the divergence found while working RP-528 (a DROP of the
-wrong kind of relation): a DROP naming a schema that does not exist.
+"""Regression test of RP-533, found while working RP-528 (a DROP of the
+wrong kind of relation): a DROP naming a schema that does not exist was
+reported as a missing relation.
 
 PostgreSQL's `DropErrorMsgNonExistent` asks for the schema first: a
 qualified name in a schema that does not exist is 3F000 `schema "x" does not
@@ -50,7 +51,7 @@ MISSING_SCHEMA = {
 }
 
 
-@pytest.mark.backlog("RP-533")
+@pytest.mark.backlog_fixed("RP-533")
 @pytest.mark.parametrize("drop", list(MISSING_SCHEMA))
 def test_drop_in_a_missing_schema(drop: str, rust_pg: object) -> None:
     dsn = _dsn(rust_pg) + " dbname=postgres"

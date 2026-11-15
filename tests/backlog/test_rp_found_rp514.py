@@ -137,14 +137,80 @@ BUILTIN_ROUTINES = {
         None,
         None,
     ),
-    "comment on function abs(int) is 'x'": ("ok", None),
 }
 
 
-@pytest.mark.backlog("RP-519")
+@pytest.mark.backlog_fixed("RP-519")
 @pytest.mark.parametrize("query", list(BUILTIN_ROUTINES))
 def test_builtin_routine_resolved_by_its_overloads(query: str, dsn: str) -> None:
+    """A built-in routine was known by its name alone; it is now looked up
+    among its `pg_proc` overloads, every one a function."""
     assert answer(dsn, query) == BUILTIN_ROUTINES[query]
+
+
+@pytest.mark.backlog_fixed("RP-519")
+def test_builtin_routine_takes_a_comment(dsn: str) -> None:
+    """`comment on function abs(int)` was recorded, as PostgreSQL 15.19
+    records it."""
+    assert answer(dsn, "comment on function abs(int) is 'x'") == ("ok", None)
+
+
+# Measured on PostgreSQL 15.19: the comment is a `pg_description` row of
+# `pg_proc` keyed by the overload's oid, so `abs(bigint)` and `int4abs`
+# (another oid) do not carry it, and IS NULL removes it.
+BUILTIN_COMMENT = {
+    "pg_description": (
+        [
+            "comment on function abs(int) is 'x'",
+            "select classoid::regclass::text, objsubid, description from pg_description "
+            "where objoid = 'abs(int)'::regprocedure",
+        ],
+        [("pg_proc", 0, "x")],
+    ),
+    "one overload": (
+        [
+            "comment on function abs(int) is 'x'",
+            "select obj_description('abs(int)'::regprocedure, 'pg_proc'), "
+            "obj_description('abs(bigint)'::regprocedure, 'pg_proc') is distinct from 'x', "
+            "obj_description('int4abs(int)'::regprocedure, 'pg_proc') is distinct from 'x'",
+        ],
+        [("x", True, True)],
+    ),
+    "polymorphic": (
+        [
+            "comment on function array_length(anyarray, int) is 'z'",
+            "select obj_description('array_length(anyarray,int)'::regprocedure, 'pg_proc')",
+        ],
+        [("z",)],
+    ),
+    "removed": (
+        [
+            "comment on function abs(int) is 'x'",
+            "comment on function abs(int) is null",
+            "select count(*) from pg_description where objoid = 'abs(int)'::regprocedure "
+            "and description = 'x'",
+        ],
+        [(0,)],
+    ),
+}
+
+
+@pytest.mark.backlog_fixed("RP-519")
+@pytest.mark.parametrize("case", list(BUILTIN_COMMENT))
+def test_builtin_routine_comment_in_pg_description(case: str, dsn: str) -> None:
+    queries, rows = BUILTIN_COMMENT[case]
+    assert answer(dsn, *queries) == ("ok", rows)
+
+
+@pytest.mark.backlog_fixed("RP-519")
+def test_builtin_routine_comment_rolls_back(dsn: str) -> None:
+    answer(dsn, "comment on function abs(int) is 'x'")
+    with psycopg.connect(dsn, autocommit=True) as c:
+        got = c.execute(
+            "select count(*) from pg_description where objoid = "
+            "'abs(int)'::regprocedure and description = 'x'"
+        ).fetchone()
+    assert got == (0,)
 
 
 # A signature no routine has was reported with no position, as
@@ -181,3 +247,38 @@ MISSING_SIGNATURE = {
 @pytest.mark.parametrize("query", list(MISSING_SIGNATURE))
 def test_grant_missing_signature_has_no_position(query: str, dsn: str) -> None:
     assert answer(dsn, query) == MISSING_SIGNATURE[query]
+
+
+# The comments the planner answers `obj_description` from were read outside
+# the open block, so a COMMENT ON INDEX was not seen in the transaction
+# that made it (found while working RP-519).
+@pytest.mark.backlog_fixed("RP-519")
+def test_index_comment_seen_in_its_transaction(dsn: str) -> None:
+    got = answer(
+        dsn,
+        "create table rq519t (a int)",
+        "create index rq519ix on rq519t (a)",
+        "commit",
+        "begin",
+        "comment on index rq519ix is 'i'",
+        "select obj_description('rq519ix'::regclass, 'pg_class')",
+    )
+    with psycopg.connect(dsn, autocommit=True) as c:
+        c.execute("drop table if exists rq519t")
+    assert got == ("ok", [("i",)])
+
+
+# initdb's descriptions of the built-in routines (`pg_description` from
+# `pg_proc.dat`), measured on PostgreSQL 15.19.
+INITDB_DESCRIPTIONS = {
+    "abs(int)": "absolute value",
+    "int4abs(integer)": "implementation of @ operator",
+    "array_length(anyarray,int)": "array length",
+}
+
+
+@pytest.mark.backlog("RP-969")
+@pytest.mark.parametrize("routine", list(INITDB_DESCRIPTIONS))
+def test_builtin_routine_has_initdb_description(routine: str, dsn: str) -> None:
+    got = answer(dsn, f"select obj_description('{routine}'::regprocedure, 'pg_proc')")
+    assert got == ("ok", [(INITDB_DESCRIPTIONS[routine],)])

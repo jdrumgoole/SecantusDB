@@ -141,6 +141,24 @@ fn raised_before_group_by(e: &Error) -> bool {
     }
 }
 
+/// `s`'s WINDOW clause with each definition emptied to `()`, its name and
+/// reference kept: `transformWindowDefinitions` runs after GROUP BY and
+/// DISTINCT ON in `transformSelectStmt`, so a cut planned for the errors
+/// ahead of a constant's must not analyse a definition's own expressions,
+/// while an `over w` still names its window (RP-885).
+fn blank_windows(s: &mut SelectStmt) {
+    for n in &mut s.window_clause {
+        if let Some(pg_query::NodeEnum::WindowDef(w)) = n.node.as_mut() {
+            w.partition_clause.clear();
+            w.order_clause.clear();
+            w.start_offset = None;
+            w.end_offset = None;
+            // `over ()`'s mask: RANGE UNBOUNDED PRECEDING AND CURRENT ROW.
+            w.frame_options = 0x422;
+        }
+    }
+}
+
 /// PostgreSQL's 42601 for a GROUP BY constant that is no integer, unless
 /// the statement fails earlier (module docs). `plan` plans a statement.
 pub(crate) fn check(s: &SelectStmt, plan: &dyn Fn(&SelectStmt) -> Result<Statement>) -> Result<()> {
@@ -150,6 +168,7 @@ pub(crate) fn check(s: &SelectStmt, plan: &dyn Fn(&SelectStmt) -> Result<Stateme
     let mut cut = s.clone();
     cut.group_clause = kept;
     cut.distinct_clause.clear();
+    blank_windows(&mut cut);
     if let Err(e) = plan(&cut) {
         if raised_before_group_by(&e) {
             return Err(e);
@@ -182,6 +201,7 @@ pub(crate) fn check_distinct_on(
     cut.limit_count = None;
     cut.limit_offset = None;
     cut.locking_clause.clear();
+    blank_windows(&mut cut);
     // The clauses analysed before DISTINCT ON, then its items before this
     // one. Planned with them, a statement can fail the ORDER BY match,
     // which is checked only after every item, ahead of an ORDER BY error
@@ -245,4 +265,49 @@ pub(crate) fn distinct_on_star_positions(
         changed = true;
     }
     changed.then_some(out)
+}
+
+/// PostgreSQL's 42601 for an ORDER BY constant that is no integer
+/// (RP-871). `transformSortClause` runs after the FROM list, the select
+/// list, WHERE and HAVING, and before GROUP BY, DISTINCT, LIMIT and the
+/// locking clause, analysing its items in order; so the statement is
+/// planned with those dropped and the ORDER BY cut before the constant,
+/// and an error from that plan raised in the earlier clauses is the
+/// answer. Runs before [`check`], whose GROUP BY error comes after.
+pub(crate) fn check_order_by(
+    s: &SelectStmt,
+    plan: &dyn Fn(&SelectStmt) -> Result<Statement>,
+) -> Result<()> {
+    let refused = s.sort_clause.iter().enumerate().find_map(|(i, item)| {
+        let Some(N::SortBy(sb)) = item.node.as_ref() else {
+            return None;
+        };
+        match sb.node.as_deref().and_then(|n| n.node.as_ref()) {
+            Some(N::AConst(c)) if !matches!(c.val, Some(a_const::Val::Ival(_))) => {
+                Some((c.location, i))
+            }
+            _ => None,
+        }
+    });
+    let Some((at, before)) = refused else {
+        return Ok(());
+    };
+    let mut cut = s.clone();
+    cut.sort_clause = s.sort_clause[..before].to_vec();
+    blank_windows(&mut cut);
+    cut.group_clause.clear();
+    cut.distinct_clause.clear();
+    cut.limit_count = None;
+    cut.limit_offset = None;
+    cut.locking_clause.clear();
+    if let Err(e) = plan(&cut) {
+        if raised_before_group_by(&e) {
+            return Err(e);
+        }
+    }
+    set_error_location(at);
+    Err(Error::Sqlstate(
+        "42601",
+        "non-integer constant in ORDER BY".into(),
+    ))
 }

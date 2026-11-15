@@ -101,7 +101,9 @@ secantus-storage = { version = "=0.5.3-beta.196", path = "../secantus-storage" }
 secantus-auth = { version = "=0.5.3-beta.196", path = "../secantus-auth" }
 # PostgreSQL's own PL/pgSQL grammar (`parse_plpgsql`) and scanner, for user
 # functions; the JSON tree the former returns.
-pg_query = "6"
+# SecantusDB's fork of pg_query 6.2.0 (crates/secantus-pg-query), keeping a
+# PL/pgSQL compile error's SQLSTATE and position (RP-621).
+pg_query = { package = "secantus-pg-query", version = "=0.1.0-beta.17", path = "../secantus-pg-query" }
 serde_json = "1"
 rand = "0.9"
 # "termination" so SIGTERM is caught too, not just SIGINT: a supervisor or a

@@ -454,8 +454,18 @@ fn column_ref(c: &mut pb::ColumnRef, levels: &[Level]) -> Step {
                 .map(|(ei, _)| (li, ei))
         })
     };
-    // As a two-name reference finds an `eref`.
-    let by_name = |name: &str| innermost(&|_, _, e| e.visible && e.eref == name);
+    // As a two-name reference finds an `eref`: nothing when the level
+    // holding it has two of that name (`table reference is ambiguous`).
+    let by_name = |name: &str| {
+        let found = innermost(&|_, _, e| e.visible && e.eref == name)?;
+        let twice = levels[found.0]
+            .entries
+            .iter()
+            .filter(|e| e.visible && e.eref == name)
+            .count()
+            > 1;
+        (!twice).then_some(found)
+    };
     if let Some(found) = innermost(&|li, ei, e| e.visible && !e.aliased && is_relid(li, ei)) {
         // Read as the entry's own name when that finds the same entry.
         if by_name(&rel) == Some(found) {

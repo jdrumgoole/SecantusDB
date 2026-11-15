@@ -73,7 +73,7 @@ FUNCTION_IN_FROM = {
 }
 
 
-@pytest.mark.backlog("RP-413")
+@pytest.mark.backlog_fixed("RP-413")
 @pytest.mark.parametrize("query", list(FUNCTION_IN_FROM))
 def test_function_in_from_hint(query: str, dsn: str) -> None:
     assert answer(dsn, query) == FUNCTION_IN_FROM[query]

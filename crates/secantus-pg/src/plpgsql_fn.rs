@@ -28,7 +28,7 @@ use serde_json::Value;
 pub struct PlError {
     pub sqlstate: String,
     pub message: String,
-    pub detail: Option<String>,
+    pub detail: Option<Box<str>>,
     pub hint: Option<String>,
     /// The CONTEXT stack, innermost first, as PostgreSQL prints it (boxed:
     /// the error travels in every `Result` here and is kept small).
@@ -42,6 +42,16 @@ pub struct PlError {
     /// This function's `PL/pgSQL function f() line N at X` frame is on
     /// the stack: an enclosing statement adds none.
     framed: bool,
+    /// The query an error raised while parsing it points into, and the
+    /// 1-based character position there (`_SPI_error_callback` turns a
+    /// cursor position into these): an input error on a literal. Boxed
+    /// together, as `context` is.
+    pub internal: Option<Box<(String, Option<usize>)>>,
+    /// The 1-based character position the error carries in the query
+    /// that raised it (the statement's, before `_SPI_error_callback`
+    /// moves it into the internal query).
+    /// (Four bytes: it sits in the flags' padding.)
+    pub position: Option<std::num::NonZeroU32>,
 }
 
 impl PlError {
@@ -55,6 +65,8 @@ impl PlError {
             from_sql: false,
             sql_framed: false,
             framed: false,
+            internal: None,
+            position: None,
         }
     }
 
@@ -81,6 +93,53 @@ impl PlError {
         self
     }
 
+    /// The frame for an error from the expression `text` (run as `raw`):
+    /// an input error on one of its literals is an internal query
+    /// pointing at the literal; any other takes `frame`.
+    fn with_expr_frame(
+        mut self,
+        text: &str,
+        raw: &str,
+        sql: &str,
+        frame: impl FnOnce(&Self) -> Option<String>,
+    ) -> Self {
+        if self.from_sql && !self.sql_framed && !self.framed {
+            let analysis = self.sqlstate.starts_with("42") && self.sqlstate != "42501"
+                || self.sqlstate == "3F000";
+            let at = self
+                .position
+                .take()
+                .filter(|_| analysis)
+                .map(|p| p.get() as usize)
+                .or_else(|| {
+                    analysis
+                        .then(|| {
+                            secantus_pgplan::error_position(sql, &self.sqlstate, &self.message)
+                        })
+                        .flatten()
+                });
+            if let Some(at) = at {
+                // `_SPI_error_callback`: an error with a cursor position
+                // into the query moves it to an internal query, the
+                // expression as written, and adds no CONTEXT frame.
+                self.internal = Some(Box::new((
+                    text.to_string(),
+                    expr_position(text, raw, sql, at),
+                )));
+                self.sql_framed = true;
+                return self;
+            }
+            if let Some(lit) = input_error_literal(raw, &self) {
+                let at = text.find(&lit).map(|at| text[..at].chars().count() + 1);
+                self.internal = Some(Box::new((text.to_string(), at)));
+                self.sql_framed = true;
+                return self;
+            }
+        }
+        let f = frame(&self);
+        self.with_sql_frame(|| f)
+    }
+
     fn unsupported(what: &str) -> Self {
         PlError::new(
             "0A000",
@@ -103,6 +162,8 @@ pub struct QueryOut {
 
 /// What the interpreter asks of the server.
 mod block_scope;
+mod errpos;
+pub use errpos::compile_error_offset;
 mod open_cursor;
 mod percent_type;
 mod row_type;
@@ -500,14 +561,19 @@ fn parsed(create_sql: &str) -> Result<Value, PlError> {
             None => break,
         }
     }
-    let v = pg_query::parse_plpgsql(&rewritten).map_err(|e| {
-        let text = e.to_string();
-        PlError::new(
-            "42601",
-            text.strip_prefix("Invalid statement: ")
-                .unwrap_or(&text)
-                .to_string(),
-        )
+    let v = pg_query::parse_plpgsql_detailed(&rewritten).map_err(|e| {
+        let mut err = compile_error(e);
+        // A position in the rewritten body is not one in the routine's: the
+        // unrewritten text's own error places it, when it is the same one.
+        if rewritten != create_sql {
+            let original = pg_query::parse_plpgsql_detailed(create_sql)
+                .err()
+                .map(compile_error);
+            err.position = original
+                .filter(|o| o.message == err.message)
+                .and_then(|o| o.position);
+        }
+        err
     })?;
     let mut f = v
         .get(0)
@@ -520,6 +586,36 @@ fn parsed(create_sql: &str) -> Result<Value, PlError> {
         .unwrap_or_else(|e| e.into_inner())
         .insert(create_sql.to_string(), f.clone());
     Ok(f)
+}
+
+/// A compile error of `parse_plpgsql`: its SQLSTATE, and in `position` the
+/// 1-based character of the routine's source the PL/pgSQL scanner placed it
+/// at (`internalerrposition`), which the caller transposes into its
+/// statement as `function_parse_error_transpose` does (RP-621).
+fn compile_error(e: pg_query::PlpgsqlError) -> PlError {
+    match e {
+        pg_query::PlpgsqlError::Compile {
+            message,
+            sqlstate,
+            internalpos,
+            ..
+        } => {
+            let mut err = PlError::new(&sqlstate, message);
+            err.position = u32::try_from(internalpos)
+                .ok()
+                .and_then(std::num::NonZeroU32::new);
+            err
+        }
+        pg_query::PlpgsqlError::Other(e) => {
+            let text = e.to_string();
+            PlError::new(
+                "42601",
+                text.strip_prefix("Invalid statement: ")
+                    .unwrap_or(&text)
+                    .to_string(),
+            )
+        }
+    }
 }
 
 /// Every SQL text a PL/pgSQL body can run, each as a statement (an
@@ -715,7 +811,7 @@ fn plan_error(e: secantus_pgplan::Error) -> PlError {
     let mut err = match message.split_once("\nDetail: ") {
         Some((m, d)) => {
             let mut err = PlError::new(e.sqlstate(), m);
-            err.detail = Some(d.to_string());
+            err.detail = Some(d.into());
             err
         }
         None => PlError::new(e.sqlstate(), message.clone()),
@@ -1481,13 +1577,97 @@ fn bind_frame(text: &str, mode: u64) -> Option<String> {
 /// position, which `_SPI_error_callback` turns into an internal query
 /// position instead of a `SQL ...` CONTEXT frame.
 fn literal_input_error(sql: &str, err: &PlError) -> bool {
-    err.sqlstate.starts_with("22")
-        && err
-            .message
-            .strip_suffix('"')
-            .and_then(|m| m.rsplit_once(": \""))
-            .map(|(_, v)| v)
-            .is_some_and(|lit| sql.contains(&format!("'{}'", lit.replace('\'', "''"))))
+    input_error_literal(sql, err).is_some()
+}
+
+/// The position in the expression `text` of the 1-based character
+/// position `at` in `sql`, the query `raw` (`SELECT <part of text>`, or
+/// `text` itself) became once its variables were bound. `None` when the
+/// position falls past a bound variable, where the two queries differ.
+fn expr_position(text: &str, raw: &str, sql: &str, at: usize) -> Option<usize> {
+    let before = at.checked_sub(1)?;
+    let raw_c: Vec<char> = raw.chars().collect();
+    let sql_c: Vec<char> = sql.chars().collect();
+    if before > raw_c.len() || before > sql_c.len() || raw_c[..before] != sql_c[..before] {
+        return None;
+    }
+    // The part of `text` the query holds: all of it, or an assignment's
+    // value (`x := <value>`, which may be wrapped in a cast to `x`'s type).
+    let part = [text, text.split_once(":=").map_or("", |(_, r)| r.trim())]
+        .into_iter()
+        .find(|p| !p.is_empty() && raw.contains(*p))?;
+    let in_raw = raw_c.len() - raw[raw.find(part)?..].chars().count();
+    let in_text = text[..text.find(part)?].chars().count();
+    let off = before.checked_sub(in_raw)?;
+    (off <= part.chars().count()).then_some(in_text + off + 1)
+}
+
+/// The quoted literal (`'abc'`) of `sql` an input error names.
+fn input_error_literal(sql: &str, err: &PlError) -> Option<String> {
+    if !err.sqlstate.starts_with("22") {
+        return None;
+    }
+    if err
+        .message
+        .starts_with("invalid input syntax for type json")
+    {
+        return json_input_error_literal(sql, err);
+    }
+    let (_, v) = err.message.strip_suffix('"')?.rsplit_once(": \"")?;
+    let lit = format!("'{}'", v.replace('\'', "''"));
+    sql.contains(&lit).then_some(lit)
+}
+
+/// The json message quotes no value: the input is only in the CONTEXT
+/// line `JSON data, line N: <excerpt>` (`report_json_context`), whose
+/// excerpt is a run of one line of the input, `...`-prefixed when cut.
+/// The literal is the one string constant in `sql` holding it.
+fn json_input_error_literal(sql: &str, err: &PlError) -> Option<String> {
+    let ctx = err.context.as_deref()?.lines().next()?;
+    let rest = ctx.strip_prefix("JSON data, line ")?;
+    let (_, excerpt) = rest.split_once(": ")?;
+    let excerpt = excerpt.strip_prefix("...").unwrap_or(excerpt);
+    let excerpt = excerpt.strip_suffix("...").unwrap_or(excerpt);
+    let mut found: Option<String> = None;
+    for lit in string_literals(sql) {
+        let body = lit[1..lit.len() - 1].replace("''", "'");
+        if body.contains(excerpt) {
+            if found.as_ref().is_some_and(|f| *f != lit) {
+                return None;
+            }
+            found = Some(lit);
+        }
+    }
+    found
+}
+
+/// Every `'...'` constant in `sql`, quotes included, `''` kept escaped.
+fn string_literals(sql: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let b = sql.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'\'' {
+            let start = i;
+            i += 1;
+            loop {
+                if i >= b.len() {
+                    return out;
+                }
+                if b[i] == b'\'' {
+                    if i + 1 < b.len() && b[i + 1] == b'\'' {
+                        i += 2;
+                        continue;
+                    }
+                    break;
+                }
+                i += 1;
+            }
+            out.push(sql[start..=i].to_string());
+        }
+        i += 1;
+    }
+    out
 }
 
 fn expr_frame(
@@ -2122,17 +2302,14 @@ impl Interp<'_> {
             .bind(&sql)
             .map_err(|e| e.with_sql_frame(|| bind_frame(text, mode)))?;
         let out = self.host.query(&sql, &params, &types).map_err(|e| {
-            let fails = |q: &str| {
-                self.host
-                    .query(q, &[], &[])
-                    .is_err_and(|f| f.sqlstate == e.sqlstate)
-            };
-            let frame = if e.from_sql && !e.sql_framed && !e.framed {
-                expr_frame(text, mode, &raw, &e, &fails)
-            } else {
-                None
-            };
-            e.with_sql_frame(|| frame)
+            e.with_expr_frame(text, &raw, &sql, |e| {
+                let fails = |q: &str| {
+                    self.host
+                        .query(q, &[], &[])
+                        .is_err_and(|f| f.sqlstate == e.sqlstate)
+                };
+                expr_frame(text, mode, &raw, e, &fails)
+            })
         })?;
         if out.rows.len() > 1 {
             return Err(PlError::new("21000", "query returned more than one row"));
@@ -2219,17 +2396,14 @@ impl Interp<'_> {
             .bind(&sql)
             .map_err(|e| e.with_sql_frame(|| bind_frame(text, mode)))?;
         let out = self.host.query(&sql, &params, &types).map_err(|e| {
-            let fails = |q: &str| {
-                self.host
-                    .query(q, &[], &[])
-                    .is_err_and(|f| f.sqlstate == e.sqlstate)
-            };
-            let frame = if e.from_sql && !e.sql_framed && !e.framed {
-                expr_frame(text, mode, &raw, &e, &fails)
-            } else {
-                None
-            };
-            e.with_sql_frame(|| frame)
+            e.with_expr_frame(text, &raw, &sql, |e| {
+                let fails = |q: &str| {
+                    self.host
+                        .query(q, &[], &[])
+                        .is_err_and(|f| f.sqlstate == e.sqlstate)
+                };
+                expr_frame(text, mode, &raw, e, &fails)
+            })
         })?;
         let v = out
             .rows
@@ -2239,7 +2413,18 @@ impl Interp<'_> {
             .unwrap_or(Bson::Null);
         match (ty, length) {
             (Some(ty), Some((base, typmod))) => {
-                let v = self.host.fit_assigned(v, &base, typmod)?;
+                // The length coercion is part of an assignment's query
+                // (`transformPLAssignStmt`): over a constant it folds while
+                // the query is planned, and its error is framed by the
+                // assignment; over a variable it runs in the simple
+                // expression path, which frames nothing (RP-752).
+                let planned = matches!(mode, 3..=5)
+                    && select_target(&format!("SELECT {body}"))
+                        .is_some_and(|n| expression_folds(&n));
+                let v = self.host.fit_assigned(v, &base, typmod).map_err(|mut e| {
+                    e.from_sql |= planned;
+                    e.with_sql_frame(|| bind_frame(text, mode))
+                })?;
                 let out = self.host.query(
                     &format!("SELECT $1::{}", sql_type(&ty)),
                     &[v],
@@ -3649,7 +3834,7 @@ impl Interp<'_> {
         if level == 19 && err.sqlstate == "00000" {
             err.sqlstate = "01000".into();
         }
-        err.detail = detail;
+        err.detail = detail.map(String::into_boxed_str);
         err.hint = hint;
         if level >= 21 {
             return Err(err);
@@ -3662,8 +3847,13 @@ impl Interp<'_> {
         };
         // `exec_stmt_raise` passes the DETAIL and HINT to `ereport` at
         // every level, a notice's included.
-        self.host
-            .notice(severity, &err.sqlstate, err.message, err.detail, err.hint);
+        self.host.notice(
+            severity,
+            &err.sqlstate,
+            err.message,
+            err.detail.map(String::from),
+            err.hint,
+        );
         Ok(Flow::Next)
     }
 }

@@ -61,11 +61,15 @@ impl PgHandler {
     /// backs a UNIQUE / PRIMARY KEY constraint renames the constraint too,
     /// as PostgreSQL's does.
     fn rename_index(&self, index: &str, to: &str, missing_ok: bool) -> PgWireResult<Vec<Response>> {
-        let Some(ix) = self
-            .index_relations()
-            .into_iter()
-            .find(|ix| ix.name == index)
-        else {
+        // The target may arrive schema-qualified, written so or resolved
+        // through the search path; the index's own name is the bare part.
+        let (schema, bare) = secantus_pgplan::schemas::split_key(index);
+        let bare = bare.as_str();
+        let qualified = index.contains('.');
+        let Some(ix) = self.index_relations().into_iter().find(|ix| {
+            ix.name == bare
+                && (!qualified || secantus_pgplan::schemas::split_key(&ix.table.name).0 == schema)
+        }) else {
             if missing_ok {
                 self.notice(
                     "00000",
@@ -95,7 +99,7 @@ impl PgHandler {
             .list_indexes(self.db(), &table)
             .map_err(|e| Self::storage_err("could not read the indexes", e))?
             .into_iter()
-            .find(|d| d.get_str("name") == Ok(index));
+            .find(|d| d.get_str("name") == Ok(bare));
         if let Some(stored) = stored {
             let key = stored.get_document("key").cloned().unwrap_or_default();
             let mut options = stored.clone();
@@ -107,7 +111,7 @@ impl PgHandler {
             // named after the index: that field moves with the name.
             if stored.contains_key("sqlExpressions") {
                 let (old_field, new_field) = (
-                    Self::expression_index_field(index),
+                    Self::expression_index_field(bare),
                     Self::expression_index_field(to),
                 );
                 self.rewrite_rows(&table, |d| {
@@ -134,10 +138,10 @@ impl PgHandler {
                 .create_index(self.db(), &table, to, &key_spec, &options)
                 .map_err(|e| Self::storage_err("could not rename the index", e))?;
             self.storage
-                .drop_index(self.db(), &table, index)
+                .drop_index(self.db(), &table, bare)
                 .map_err(|e| Self::storage_err("could not rename the index", e))?;
         }
-        if let Some(u) = def.unique_constraints.iter_mut().find(|u| u.name == index) {
+        if let Some(u) = def.unique_constraints.iter_mut().find(|u| u.name == bare) {
             u.name = to.to_string();
             self.rewrite_catalog(&table, &def)?;
         }

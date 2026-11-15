@@ -207,11 +207,12 @@ def test_untyped_literal_in_every_boolean_position(rust_pg: Any) -> None:
     ]
 
 
-@pytest.mark.backlog("RP-429")
+@pytest.mark.backlog_fixed("RP-429")
 def test_target_list_is_analysed_before_where(rust_pg: Any) -> None:
     """`transformSelectStmt` transforms the target list before the WHERE,
-    so a missing output column is 42703 ahead of any error in the WHERE;
-    the FROM list, ON included, comes before both (the last case)."""
+    so a missing output column was to be 42703 ahead of any error in the
+    WHERE; before RP-429 the WHERE's 22P02 / 42804 / 42883 came first. The
+    FROM list, ON included, comes before both (the last case)."""
     assert _positioned(
         rust_pg,
         [

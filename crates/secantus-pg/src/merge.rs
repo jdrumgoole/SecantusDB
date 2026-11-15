@@ -81,7 +81,7 @@ impl PgHandler {
         let run = |sql: &str, params: &[Bson]| -> PgWireResult<u64> {
             crate::plpgsql_fn::Host::execute(&host, sql, params, &[]).map_err(|e| {
                 let mut info = ErrorInfo::new("ERROR".into(), e.sqlstate, e.message);
-                info.detail = e.detail;
+                info.detail = e.detail.map(String::from);
                 PgWireError::UserError(Box::new(info))
             })
         };

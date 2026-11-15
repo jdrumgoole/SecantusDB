@@ -56,19 +56,27 @@ def test_alter_type_between_array_types(dsn: str) -> None:
     ]
 
 
-@pytest.mark.backlog("RP-663")
+@pytest.mark.backlog_fixed("RP-663")
 def test_composite_attribute_attndims(dsn: str) -> None:
     """A composite type's attribute records the dimensions it was declared
     with too (`DefineCompositeType` builds its descriptor with
     `BuildDescForRelation`): after `create type c658z as (p int[][], q int,
-    r text[])` PostgreSQL 15.19's `pg_attribute` has 2, 0 and 1."""
+    r text[])` PostgreSQL 15.19's `pg_attribute` has 2, 0 and 1, and ALTER
+    TYPE's ADD / ALTER ATTRIBUTE count the new type's bounds as well. Each
+    was 0 until RP-663 recorded them on the composite."""
+    q = (
+        "select attname::text, attndims from pg_attribute "
+        "where attrelid = 'c658z'::regclass and not attisdropped order by attnum"
+    )
     with psycopg.connect(dsn, autocommit=True) as c:
         c.execute("drop type if exists c658z")
         c.execute("create type c658z as (p int[][], q int, r text[])")
-        got = pg_answer(
-            c,
-            "select attname::text, attndims from pg_attribute "
-            "where attrelid = 'c658z'::regclass order by attnum",
+        created = pg_answer(c, q)
+        c.execute(
+            "alter type c658z add attribute s int[][][], "
+            "alter attribute q type int[], drop attribute r"
         )
+        altered = pg_answer(c, q)
         c.execute("drop type c658z")
-    assert got == ("ok", [("p", 2), ("q", 0), ("r", 1)])
+    assert created == ("ok", [("p", 2), ("q", 0), ("r", 1)])
+    assert altered == ("ok", [("p", 2), ("q", 1), ("s", 3)])

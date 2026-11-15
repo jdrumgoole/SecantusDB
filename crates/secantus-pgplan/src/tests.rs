@@ -661,6 +661,21 @@ fn group_by_an_expression_or_a_position_keys_on_the_expression() {
     assert!(err
         .to_string()
         .contains("GROUP BY position 3 is not in select list"));
+    // A position inside a grouping set or a parenthesised list is a
+    // position too (RP-873).
+    for sql in [
+        "SELECT length(name), count(*) FROM t GROUP BY ROLLUP(3)",
+        "SELECT length(name), count(*) FROM t GROUP BY (3, 1)",
+    ] {
+        let err = plan(sql, &lookup).expect_err("must refuse");
+        assert_eq!(err.sqlstate(), "42P10", "{sql}");
+    }
+    for sql in [
+        "SELECT length(name), count(*) FROM t GROUP BY ROLLUP(1)",
+        "SELECT length(name), count(*) FROM t GROUP BY GROUPING SETS ((1), ())",
+    ] {
+        plan(sql, &lookup).unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
     // ORDER BY may name the key by position, alias, or expression.
     for sql in [
         "SELECT length(name) AS len, count(*) FROM t GROUP BY 1 ORDER BY 1 DESC",
@@ -4257,6 +4272,45 @@ fn a_pair_expression_reads_each_sides_row() {
     assert!(plan_pair_expression("(x.a < e.a)", ("s", &s), ("e", &e)).is_err());
 }
 
+/// A join qual over a char(n) column reads it blank-padded to its width,
+/// as PostgreSQL stores it (RP-390).
+#[test]
+fn a_pair_expression_pads_a_char_n_column() {
+    let mut b = Column::new("b", "bpchar", false);
+    b.typmod = 8;
+    let cc = TableDef::new("cc", vec![b]);
+    let s = TableDef::new("s", vec![Column::new("c", "text", false)]);
+    let qual = plan_pair_expression("(octet_length(cc.b) = 4)", ("cc", &cc), ("s", &s)).unwrap();
+    let mut d = Document::new();
+    d.insert(
+        format!("{PAIR_OUTER_PREFIX}{}", cc.columns[0].field()),
+        "ab",
+    );
+    d.insert(format!("{PAIR_INNER_PREFIX}{}", s.columns[0].field()), "x");
+    assert_eq!(apply_row_expr(&qual, &d).unwrap(), Bson::Boolean(true));
+}
+
+/// A join qual over a chain of relations reads each alias's row under
+/// its own prefix, and refuses an alias not in the chain (RP-390).
+#[test]
+fn a_relations_expression_reads_each_aliass_row() {
+    let z = TableDef::new("z", vec![Column::new("a", "int4", false)]);
+    let rels = [("z", "r0.", &z), ("z2", "r1.", &z), ("z3", "r2.", &z)];
+    let qual = plan_relations_expression("((z.a < z2.a) and (z2.a < z3.a))", &rels).unwrap();
+    let row = |a: i32, b: i32, c: i32| {
+        let f = z.columns[0].field();
+        let mut d = Document::new();
+        d.insert(format!("r0.{f}"), a);
+        d.insert(format!("r1.{f}"), b);
+        d.insert(format!("r2.{f}"), c);
+        apply_row_expr(&qual, &d).unwrap()
+    };
+    assert_eq!(row(1, 2, 3), Bson::Boolean(true));
+    assert_eq!(row(1, 3, 2), Bson::Boolean(false));
+    assert!(plan_relations_expression("(z.a < x.a)", &rels).is_err());
+    assert!(plan_relations_expression("(z.a < 1)", &[("z", "a.", &z), ("z", "b.", &z)]).is_err());
+}
+
 /// EXPLAIN analyses its statement before it reads an option, as
 /// `transformExplainStmt` runs before `ExplainQuery` (RP-419). Each answer
 /// was measured on PostgreSQL 15.19.
@@ -4398,12 +4452,29 @@ fn an_aliased_join_resolves_names_as_postgresql_does() {
             "select * from fs join fe using (a) join fe x on a = x.a",
             "42702",
         ),
-        // PostgreSQL answers these (RP-469): the two leaves' keys would be one.
-        ("select * from (fs join fe using (a)) as j, fs", "0A000"),
-        ("select * from fs, (fs join fe using (a)) as j", "0A000"),
+        // PostgreSQL answers this (RP-972): only a table leaf of a hidden
+        // name is keyed apart (RP-469), so a subquery's keys would be one.
+        (
+            "select * from (fs join fe using (a)) as j, (select 2 as z) fs",
+            "0A000",
+        ),
     ] {
         let err = plan(q).expect_err(q);
         assert_eq!(err.sqlstate(), want, "for {q} (got {err})");
+    }
+    // RP-469: a table the alias hides may be named again beside it; each
+    // leaf of the name is keyed apart, so the two never share a key.
+    for q in [
+        "select * from (fs join fe using (a)) as j, fs",
+        "select * from fs, (fs join fe using (a)) as j",
+        "select fs from (fs join fe using (a)) as j, fs",
+    ] {
+        let Ok(Statement::Select(s)) = plan(q) else {
+            panic!("for {q}: not planned as a SELECT")
+        };
+        let cols: Vec<&String> = s.columns.iter().map(|(_, k)| k).collect();
+        let distinct = cols.iter().enumerate().all(|(i, k)| !cols[..i].contains(k));
+        assert!(distinct, "for {q}: shared keys {cols:?}");
     }
 }
 
@@ -7385,15 +7456,23 @@ fn a_field_of_an_outer_whole_row_is_its_column() {
     let outer =
         parsed_select("select 1 from t, (values (1, 2)) v(a, c), generate_series(1, 2) f(x)");
     let depth = correlated::push_outer_from(&outer.from_clause);
-    let mut inner = parsed_select("select (v).a, (v).*, (f).x");
-    correlated::outer_field_selections(&mut inner, &lookup, &[]);
+    let mut inner = parsed_select("select (v).a, (v).*");
+    correlated::outer_field_selections(&mut inner, &lookup, &[]).unwrap();
     correlated::expand_outer_stars(&mut inner, &lookup);
     let mut own = parsed_select("select (v).a from (values (7)) w(v)");
-    correlated::outer_field_selections(&mut own, &lookup, &[]);
+    correlated::outer_field_selections(&mut own, &lookup, &[]).unwrap();
     let mut bound = parsed_select("select (v).a from (values (7)) v(a)");
-    correlated::outer_field_selections(&mut bound, &lookup, &[]);
+    correlated::outer_field_selections(&mut bound, &lookup, &[]).unwrap();
+    // RP-702: the function's whole row is its integer value, so a field of
+    // it is 42809.
+    let mut function = parsed_select("select (f).x");
+    let refused = correlated::outer_field_selections(&mut function, &lookup, &[]);
     correlated::pop_outer_from(depth);
-    assert_eq!(target_refs(&inner), ["v.a", "v.a", "v.c", "?"]);
+    assert!(
+        matches!(refused, Err(Error::Sqlstate("42809", ref m)) if m.contains("type integer")),
+        "{refused:?}"
+    );
+    assert_eq!(target_refs(&inner), ["v.a", "v.a", "v.c"]);
     assert_eq!(target_refs(&own), ["?"]);
     assert_eq!(target_refs(&bound), ["?"]);
 }
@@ -8362,4 +8441,181 @@ fn a_system_column_in_a_generation_expression_is_refused() {
         &lookup,
     )
     .expect("tableoid is allowed");
+}
+
+/// A CHECK's range table holds only its own table: another qualifier is
+/// 42P01, and a qualified missing column is named with its qualifier at the
+/// reference's start, as on PostgreSQL 15.19 (RP-861).
+#[test]
+fn a_checks_qualified_column_is_resolved_against_its_table() {
+    for (sql, state, msg, pos) in [
+        (
+            "create table t816 (x int, check (other.x = 1))",
+            "42P01",
+            "missing FROM-clause entry for table \"other\"",
+            34,
+        ),
+        (
+            "create table t816 (x int, check (t816.nosuch = 1))",
+            "42703",
+            "column t816.nosuch does not exist",
+            34,
+        ),
+    ] {
+        take_error_location();
+        let err = plan(sql, &lookup).expect_err("should refuse");
+        assert_eq!(err.sqlstate(), state, "got {err}");
+        assert_eq!(err.to_string(), msg);
+        assert_eq!(
+            crate::errpos::error_position(sql, state, &err.to_string()),
+            Some(pos)
+        );
+    }
+}
+
+/// A composite's attributes count their written bounds too (RP-663).
+#[test]
+fn a_composite_records_its_attributes_declared_array_dimensions() {
+    let Statement::CreateComposite { ndims, .. } =
+        plan_ok("CREATE TYPE c AS (p int[][], q int, r text[], s _int4)")
+    else {
+        panic!("not a CREATE TYPE");
+    };
+    assert_eq!(ndims, vec![2, 0, 1, 0]);
+}
+
+#[test]
+fn an_aliased_scalar_functions_whole_row_is_its_value() {
+    // RP-702: `f` of `generate_series(1, 2) f(x)` is the function's value,
+    // read as its column `x`, inside an expression too.
+    for sql in [
+        "select f + 1 from generate_series(1, 2) f(x)",
+        "select coalesce(f) from generate_series(1, 2) f(x)",
+    ] {
+        let parsed = pg_query::parse(sql).unwrap();
+        let Some(N::SelectStmt(s)) = parsed.protobuf.stmts[0]
+            .stmt
+            .as_ref()
+            .and_then(|n| n.node.as_ref())
+        else {
+            panic!("not a SELECT: {sql}");
+        };
+        assert!(
+            whole_row_rewrite(s, &lookup, &[]).unwrap().is_some(),
+            "{sql}"
+        );
+        plan_select(s, &lookup, &[]).unwrap_or_else(|e| panic!("{sql}: {e:?}"));
+    }
+}
+
+/// A sequence function's literal argument is read as `regclass` while the
+/// DEFAULT is analysed, so a relation it does not name is 42P01 at the
+/// literal (RP-888; PostgreSQL 15.19).
+#[test]
+fn a_regclass_literal_in_a_default_is_resolved() {
+    let sql = "create table t888 (a int default nextval('nosuch_seq'))";
+    take_error_location();
+    let err = plan(sql, &lookup).expect_err(sql);
+    assert_eq!(err.sqlstate(), "42P01", "{err}");
+    assert!(err.to_string().contains("\"nosuch_seq\""), "{err}");
+    assert_eq!(take_error_location(), Some(41));
+}
+
+#[test]
+fn an_operator_is_resolved_after_a_reference_to_its_left() {
+    // `make_op` runs after its operands are analysed (RP-447): a missing
+    // column to an operator's left fails first, one to its right after.
+    for (sql, state, at) in [
+        ("select nosuch + (1 + true)", "42703", 7),
+        ("select (1 + true) + nosuch", "42883", 10),
+        ("select 1/0, nosuch", "42703", 12),
+        ("select ('x' || 'y')::int + nosuch", "42703", 27),
+    ] {
+        take_error_location();
+        let err = analysed(sql).expect_err("should refuse");
+        assert_eq!(err.sqlstate(), state, "for {sql} (got {err})");
+        assert_eq!(take_error_location(), Some(at), "for {sql}");
+    }
+}
+
+/// A domain's CHECK (`domainAddConstraint`, no position) and a partial
+/// index's WHERE (`transformIndexStmt`, at the argument) are coerced to
+/// boolean (RP-813). Measured on PostgreSQL 15.19.
+#[test]
+fn a_domain_check_and_an_index_predicate_are_coerced_to_boolean() {
+    for (sql, want, at) in [
+        (
+            "create domain d as int check (value)",
+            "argument of CHECK must be type boolean, not type integer",
+            None,
+        ),
+        (
+            "create domain d as int check (value is true)",
+            "argument of IS TRUE must be type boolean, not type integer",
+            None,
+        ),
+        (
+            "create index on t (n) where n",
+            "argument of WHERE must be type boolean, not type integer",
+            Some(29),
+        ),
+    ] {
+        take_error_location();
+        let err = plan(sql, &lookup).expect_err("should refuse");
+        assert_eq!(err.sqlstate(), "42804", "for {sql} (got {err})");
+        assert!(err.to_string().contains(want), "for {sql}: {err}");
+        assert_eq!(
+            crate::errpos::error_position(sql, "42804", &err.to_string()),
+            at,
+            "for {sql}"
+        );
+    }
+    for sql in [
+        "create domain d as int check (value > 0)",
+        "create domain d as bool check (value)",
+        "create index on t (n) where n > 0",
+    ] {
+        plan(sql, &lookup).expect("should plan");
+    }
+}
+
+/// `tableoid` is the one system column a CHECK may name: the constraint is
+/// created, and a bare `tableoid` is refused as a non-boolean `oid`, as on
+/// PostgreSQL 15.19 (RP-859).
+#[test]
+fn tableoid_in_a_check_is_a_column() {
+    take_error_location();
+    plan(
+        "create table t816 (x int check (tableoid::int > 0))",
+        &lookup,
+    )
+    .expect("tableoid is allowed");
+    take_error_location();
+    let err =
+        plan("create table t816 (x int check (tableoid))", &lookup).expect_err("should refuse");
+    assert_eq!(err.sqlstate(), "42804", "got {err}");
+    assert_eq!(
+        err.to_string(),
+        "argument of CHECK must be type boolean, not type oid"
+    );
+}
+
+/// A write's unknown bare column is located at the reference PostgreSQL
+/// transforms first -- WHERE, then RETURNING, then SET -- not at the first
+/// matching word of the text, the target (RP-524).
+#[test]
+fn a_writes_unknown_column_is_at_the_reference_transformed_first() {
+    for (sql, needle) in [
+        ("update t x set name = t::text", "t::"),
+        ("update t x set name = 'q' where t is null", "t is"),
+        ("update t set name = zz where zz = 1", "zz = 1"),
+        ("update t set name = zz returning zz", "zz\0"),
+        ("delete from t where n = 1 returning zz", "zz\0"),
+    ] {
+        let at = format!("{sql}\0").find(needle).unwrap() as i32;
+        take_error_location();
+        let err = plan(sql, &lookup).expect_err(sql);
+        assert_eq!(err.sqlstate(), "42703", "{sql}: {err}");
+        assert_eq!(take_error_location(), Some(at), "{sql}");
+    }
 }

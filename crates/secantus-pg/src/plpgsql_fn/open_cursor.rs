@@ -308,10 +308,10 @@ impl Interp<'_> {
         let frame = || bind_frame(text, mode);
         let raw = format!("SELECT {text}");
         let (sql, params, types) = self.bind(&raw).map_err(|e| e.with_sql_frame(frame))?;
-        let out = self.host.query(&sql, &params, &types).map_err(|e| {
-            let framed = !literal_input_error(&raw, &e);
-            e.with_sql_frame(|| if framed { frame() } else { None })
-        })?;
+        let out = self
+            .host
+            .query(&sql, &params, &types)
+            .map_err(|e| e.with_expr_frame(text, &raw, &sql, |_| frame()))?;
         // Not STRICT: a second row is not read (`tcount` 1).
         let domains = self.host.output_domains(&sql, &types);
         let first = out.rows.first().map(|r| r.as_slice());
@@ -507,7 +507,8 @@ pub(super) fn cursor_exprs(f: &Value) -> HashMap<usize, String> {
 /// `variable "x" must be of type cursor or refcursor` names a PARAMETER the
 /// grammar could not type. Rewrite each `OPEN x` to open a declared local
 /// `__refcur_x` and copy its name back: `__refcur_x := x; OPEN __refcur_x
-/// ...; x := __refcur_x;`. `None` when the text holds nothing to rewrite.
+/// ...; x := __refcur_x;`, and each `FETCH` / `MOVE` / `CLOSE x` to read
+/// through it: `__refcur_x := x; FETCH __refcur_x ...;`. `None` when the text holds nothing to rewrite.
 pub(super) fn cursor_param_rewrite(sql: &str, var: &str) -> Option<String> {
     let lower = sql.to_ascii_lowercase();
     let local = format!("__refcur_{var}");
@@ -539,31 +540,9 @@ pub(super) fn cursor_param_rewrite(sql: &str, var: &str) -> Option<String> {
     };
     let mut changed = false;
     let bytes = sql.as_bytes();
-    while i < sql.len() {
-        let open = word_at(i, "open") && {
-            let mut j = i + 4;
-            while j < bytes.len() && bytes[j].is_ascii_whitespace() {
-                j += 1;
-            }
-            word_at(j, &var.to_ascii_lowercase()) && {
-                i = j + var.len();
-                true
-            }
-        };
-        if !open {
-            out.push(bytes[i] as char);
-            if !bytes[i].is_ascii() {
-                // Copy the whole multi-byte character.
-                let ch = sql[i..].chars().next().expect("char");
-                out.pop();
-                out.push(ch);
-                i += ch.len_utf8();
-                continue;
-            }
-            i += 1;
-            continue;
-        }
-        // The statement runs to the next `;` outside quotes.
+    let var_lower = var.to_ascii_lowercase();
+    // The end of the statement at `i`: the next `;` outside quotes.
+    let stmt_end = |i: usize| {
         let mut j = i;
         let mut quote: Option<u8> = None;
         while j < bytes.len() {
@@ -575,11 +554,58 @@ pub(super) fn cursor_param_rewrite(sql: &str, var: &str) -> Option<String> {
             }
             j += 1;
         }
-        out.push_str(&format!("{local} := {var}; OPEN {local}"));
-        out.push_str(&sql[i..j.min(sql.len())]);
-        out.push_str(&format!("; {var} := {local}"));
-        i = j;
-        changed = true;
+        j
+    };
+    while i < sql.len() {
+        let open = word_at(i, "open") && {
+            let mut j = i + 4;
+            while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+                j += 1;
+            }
+            word_at(j, &var_lower) && {
+                i = j + var.len();
+                true
+            }
+        };
+        if open {
+            let j = stmt_end(i);
+            out.push_str(&format!("{local} := {var}; OPEN {local}"));
+            out.push_str(&sql[i..j]);
+            out.push_str(&format!("; {var} := {local}"));
+            i = j;
+            changed = true;
+            continue;
+        }
+        // FETCH / MOVE / CLOSE name the cursor as their last word before
+        // INTO (or the end): read it through the local, as `pl_gram.y`
+        // would read the parameter itself.
+        let kw = ["fetch", "move", "close"]
+            .into_iter()
+            .find(|w| word_at(i, w));
+        if let Some(kw) = kw {
+            let j = stmt_end(i);
+            let into = (i..j).find(|&k| word_at(k, "into")).unwrap_or(j);
+            let at = (i + kw.len()..into).rev().find(|&k| word_at(k, &var_lower));
+            if let Some(at) = at {
+                out.push_str(&format!("{local} := {var}; "));
+                out.push_str(&sql[i..at]);
+                out.push_str(&local);
+                out.push_str(&sql[at + var.len()..j]);
+                i = j;
+                changed = true;
+                continue;
+            }
+        }
+        out.push(bytes[i] as char);
+        if !bytes[i].is_ascii() {
+            // Copy the whole multi-byte character.
+            let ch = sql[i..].chars().next().expect("char");
+            out.pop();
+            out.push(ch);
+            i += ch.len_utf8();
+            continue;
+        }
+        i += 1;
     }
     changed.then_some(out)
 }

@@ -150,12 +150,23 @@ fn session_has_temp() -> bool {
     }
     let has = temp_schema().is_some_and(|t| {
         let prefix = format!("{t}.");
-        RELATION_KEYS.with(|k| k.borrow().iter().any(|n| n.starts_with(&prefix)))
-            || PLAN_USER_RELATIONS
-                .with(|r| r.borrow().iter().any(|(n, _, _)| n.starts_with(&prefix)))
+        TEMP_OUTSIDE_KEYS.with(std::cell::Cell::get)
+            || RELATION_KEYS.with(|k| k.borrow().iter().any(|n| n.starts_with(&prefix)))
     });
     MEMO.with(|m| m.set(Some((epoch, has))));
     has
+}
+
+thread_local! {
+    /// Whether a relation in the temp schema is published that the
+    /// relation keys do not hold (see `defer_user_relations`).
+    static TEMP_OUTSIDE_KEYS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Record whether a temp relation lies outside the relation keys.
+pub(crate) fn set_temp_outside_keys(has: bool) {
+    bump_resolve_epoch();
+    TEMP_OUTSIDE_KEYS.with(|t| t.set(has));
 }
 
 /// Install every relation's catalog key for the statements that follow.
@@ -466,8 +477,8 @@ pub fn type_key(parts: &[String]) -> String {
 /// `activeSearchPath`'s order (`recomputeNamespacePath`): the session's
 /// temporary schema first, once it exists, unless the path names
 /// `pg_temp` itself, which puts it there; then the path's other schemas.
-/// `pg_catalog` is left out: a built-in is resolved before a user type is
-/// looked for. Relations and types are found in the temporary schema;
+/// `pg_catalog` is left out: [`resolve_type_names`] checks a temporary
+/// type ahead of the built-ins, and the path's others after. Relations and types are found in the temporary schema;
 /// functions and operators never are (`FuncnameGetCandidates`).
 fn type_search_order() -> Vec<String> {
     let temp = temp_schema_in_use();
@@ -548,6 +559,14 @@ pub fn resolve_type_names(node: &mut N) -> Result<()> {
             sval: schema.to_string(),
         })),
     };
+    let temp_before_catalog = {
+        let at = |n: &str| path.iter().position(|s| s == n);
+        match (at("pg_temp"), at("pg_catalog")) {
+            (Some(t), Some(c)) => t < c,
+            (Some(_), None) => false,
+            (None, _) => true,
+        }
+    };
     let resolve = |tn: &mut pg_query::protobuf::TypeName| -> Result<()> {
         if tn.pct_type {
             return Ok(());
@@ -567,6 +586,15 @@ pub fn resolve_type_names(node: &mut N) -> Result<()> {
             return Ok(());
         };
         let name = name.sval.clone();
+        // The temporary schema is searched ahead of `pg_catalog` unless the
+        // path places `pg_temp` after it (`recomputeNamespacePath`), so a
+        // temporary row type hides a built-in of its name.
+        if let Some(t) = temp.as_deref() {
+            if temp_before_catalog && crate::column_type_exists(&relation_key(t, &name)) {
+                tn.names.insert(0, schema_node(t));
+                return Ok(());
+            }
+        }
         if crate::pgtypes::is_builtin_type(&name) {
             return Ok(());
         }
@@ -738,7 +766,7 @@ fn not_on_path(name: &str, location: i32) -> Error {
 
 pub(crate) fn relation_exists(key: &str) -> bool {
     RELATION_KEYS.with(|k| k.borrow().contains(key))
-        || PLAN_USER_RELATIONS.with(|t| t.borrow().iter().any(|(n, _, _)| n == key))
+        || crate::deferred::read(&PLAN_USER_RELATIONS, |t| t.iter().any(|(n, _, _)| n == key))
 }
 
 /// The key an UNQUALIFIED reference resolves to: the first schema on the path
@@ -1096,6 +1124,8 @@ pub fn qualify(node: &mut N) -> Result<()> {
                 }
             }
         }
+        // Each relation named, as `(name as written, stored key)`.
+        let mut relations: Vec<(String, String)> = Vec::new();
         for (n, _, _) in node.nodes_mut() {
             // The walk does not descend into a TABLESAMPLE's relation.
             let r = match n {
@@ -1119,10 +1149,14 @@ pub fn qualify(node: &mut N) -> Result<()> {
                 {
                     return Err(not_on_path(&r.relname, r.location));
                 }
+                let bare = r.relname.clone();
                 if let Some(s) = qualify_reference(&mut *r, &ctes, trivial) {
                     if !schemas.contains(&s) {
                         schemas.push(s);
                     }
+                }
+                if !relations.contains(&(bare.clone(), r.relname.clone())) {
+                    relations.push((bare, r.relname.clone()));
                 }
             }
         }
@@ -1131,8 +1165,16 @@ pub fn qualify(node: &mut N) -> Result<()> {
                 if let pg_query::NodeMut::ColumnRef(c) = n {
                     let c = &mut *c;
                     if c.fields.len() >= 3 {
+                        // `s.t.col` where two relations named `t` are in
+                        // reach keeps its schema: `t.col` names neither.
+                        let shared = match c.fields[1].node.as_ref() {
+                            Some(N::String(t)) => {
+                                relations.iter().filter(|(b, _)| *b == t.sval).count() > 1
+                            }
+                            _ => false,
+                        };
                         if let Some(N::String(s)) = c.fields[0].node.as_ref() {
-                            if schemas.contains(&s.sval) {
+                            if schemas.contains(&s.sval) && !shared {
                                 c.fields.remove(0);
                             }
                         }
@@ -1267,6 +1309,36 @@ pub fn qualify(node: &mut N) -> Result<()> {
                     | ObjectType::ObjectForeignTable)
             );
             let index = ObjectType::try_from(d.remove_type) == Ok(ObjectType::ObjectIndex);
+            // `DropErrorMsgNonExistent` asks for a written schema first: one
+            // that does not exist is 3F000, or under IF EXISTS skipped with
+            // its own notice (RP-533).
+            if relation_kind || index {
+                let mut kept = Vec::with_capacity(d.objects.len());
+                for o in std::mem::take(&mut d.objects) {
+                    let missing = match o.node.as_ref() {
+                        Some(N::List(l)) => match strings(l).as_deref() {
+                            Some([schema, _]) | Some([_, schema, _]) if !schema_exists(schema) => {
+                                Some(schema.clone())
+                            }
+                            _ => None,
+                        },
+                        _ => None,
+                    };
+                    match missing {
+                        Some(schema) if d.missing_ok => crate::fts::planner_notice(&format!(
+                            "schema \"{schema}\" does not exist, skipping"
+                        )),
+                        Some(schema) => {
+                            return Err(Error::Sqlstate(
+                                "3F000",
+                                format!("schema \"{schema}\" does not exist"),
+                            ))
+                        }
+                        None => kept.push(o),
+                    }
+                }
+                d.objects = kept;
+            }
             // With IF EXISTS, such a name is skipped with PostgreSQL's
             // notice, and is not dropped (RP-011).
             if relation_kind && d.missing_ok {

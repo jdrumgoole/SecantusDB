@@ -69,10 +69,17 @@ impl PgHandler {
             // exact error context, the block runs on the function
             // interpreter: declarations, control flow, handlers, INTO.
             Err(ParseError::Unsupported(_)) => {
-                let sql = format!(
-                    "CREATE FUNCTION inline_code_block() RETURNS void AS \
-                     $secantus_do${body}\n$secantus_do$ LANGUAGE plpgsql"
-                );
+                let wrap = |body: &str| {
+                    format!(
+                        "CREATE FUNCTION inline_code_block() RETURNS void AS \
+                         $secantus_do${body}\n$secantus_do$ LANGUAGE plpgsql"
+                    )
+                };
+                // Parsed as `run` parses it, row-typed variables as records.
+                let compiled = |body: &str| {
+                    crate::plpgsql_fn::with_row_types(&wrap(body), &crate::PlHost { h: self })
+                };
+                let sql = wrap(body);
                 // `plpgsql_compile_inline` compiles the whole block, its
                 // declarations' types looked up, before any of it runs
                 // (RP-573).
@@ -81,6 +88,23 @@ impl PgHandler {
                     &crate::plpgsql_fn::with_row_types(&sql, &crate::PlHost { h: self }),
                     body,
                 )?;
+                // A grammar error points at its token in the statement, as
+                // `function_parse_error_transpose` places it (RP-492).
+                if let Err(e) = crate::plpgsql_fn::validate(&compiled(body)) {
+                    let message = e.message.clone();
+                    let PgWireError::UserError(mut info) = crate::wire_pl_error(e) else {
+                        unreachable!("wire_pl_error makes a user error")
+                    };
+                    let offset =
+                        crate::plpgsql_fn::compile_error_offset(body, &message, &|prefix| {
+                            crate::plpgsql_fn::validate(&compiled(prefix)).map_err(|e| e.message)
+                        });
+                    if let (Some(offset), Some(start)) = (offset, query.find(body)) {
+                        let before = query[..start].chars().count();
+                        info.position = Some((before + offset + 1).to_string());
+                    }
+                    return Err(PgWireError::UserError(info));
+                }
                 // Alone in its query string outside a block, the body may
                 // COMMIT; anywhere else it is atomic.
                 let prev = self.txn_control.swap(

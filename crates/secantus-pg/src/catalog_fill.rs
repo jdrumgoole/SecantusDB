@@ -1027,7 +1027,9 @@ impl PgHandler {
                     3079
                 } else if relations.contains(&oid) {
                     1259
-                } else if functions.contains(&oid) {
+                } else if functions.contains(&oid)
+                    || crate::catalog_facts::builtin().procs.contains_key(&oid)
+                {
                     1255
                 } else {
                     1247

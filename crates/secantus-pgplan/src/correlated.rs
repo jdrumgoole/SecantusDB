@@ -361,7 +361,7 @@ pub(crate) fn inner_names(s: &pg_query::protobuf::SelectStmt) -> Vec<String> {
 /// join's alias, an aliased JOIN hiding its sides -- the rules of
 /// `inner_names`) and its WITH's CTE names, but nothing inside a derived
 /// table or a subquery, which are levels of their own.
-fn level_names(s: &pg_query::protobuf::SelectStmt) -> Vec<String> {
+pub(crate) fn level_names(s: &pg_query::protobuf::SelectStmt) -> Vec<String> {
     fn from_item(item: &pg_query::protobuf::Node, names: &mut Vec<String>) {
         match item.node.as_ref() {
             Some(N::RangeVar(r)) => names.push(
@@ -1474,15 +1474,15 @@ pub(crate) fn outer_field_selections(
     s: &mut pg_query::protobuf::SelectStmt,
     lookup: &dyn Fn(&str) -> Option<TableDef>,
     params: &[Bson],
-) {
+) -> Result<()> {
     if s.larg.is_some() || s.rarg.is_some() {
         for arm in [s.larg.as_deref_mut(), s.rarg.as_deref_mut()]
             .into_iter()
             .flatten()
         {
-            outer_field_selections(arm, lookup, params);
+            outer_field_selections(arm, lookup, params)?;
         }
-        return;
+        return Ok(());
     }
     let own = level_names(s);
     let ctes = VISIBLE_CTES.with(|v| v.borrow().clone());
@@ -1549,8 +1549,44 @@ pub(crate) fn outer_field_selections(
             }
         }
     }
+    // The whole row of an outer FROM function returning a base type is
+    // that value, so a field of it is 42809 at the `f` (RP-702), as
+    // `ParseFuncOrColumn` refuses column notation on a non-composite type.
+    let base_function_row = |name: &str| -> Option<String> {
+        if own.iter().any(|n| n == name) || own_columns.iter().any(|c| c == name) {
+            return None;
+        }
+        let levels = OUTER_FROM.with(|o| o.borrow().clone());
+        let item = levels
+            .iter()
+            .rev()
+            .find_map(|level| level.iter().find_map(|item| named_item(item, name)))?;
+        if !matches!(item.node.as_ref(), Some(N::RangeFunction(_))) {
+            return None;
+        }
+        let ty = outer_ref_type(&[name.to_string()], lookup, params)?;
+        let ty = crate::domains::domain_base(&ty).unwrap_or(ty);
+        let base = !ty.ends_with("[]")
+            && ty != "record"
+            && crate::user_composite(&ty).is_none()
+            && !crate::pgtypes::PSEUDO_TYPES.iter().any(|(_, n)| *n == ty)
+            && crate::pgtypes::oid_of_name(&ty).is_some();
+        base.then_some(ty)
+    };
     let mut rewrite = |n: &mut pg_query::protobuf::Node| -> Result<()> {
         if let Some((name, Some(field), at)) = selection(n) {
+            if let Some(ty) = base_function_row(&name) {
+                if at >= 0 {
+                    crate::set_error_location(at);
+                }
+                return Err(Error::Sqlstate(
+                    "42809",
+                    format!(
+                        "column notation .{field} applied to type {}, which is not a composite type",
+                        crate::display_type(&ty)
+                    ),
+                ));
+            }
             if whole_row(&name) {
                 n.node = Some(column(vec![string_node(&name), string_node(&field)], at));
             }
@@ -1566,8 +1602,56 @@ pub(crate) fn outer_field_selections(
         .chain(s.where_clause.as_deref_mut())
         .chain(s.having_clause.as_deref_mut())
     {
-        let _ = walk_expr(n, &mut rewrite);
+        walk_expr(n, &mut rewrite)?;
     }
+    Ok(())
+}
+
+/// `(v).a` in a LATERAL subquery, where `v` is a FROM item to its left,
+/// is that item's column `v.a` (RP-705), as `outer_field_selections` reads
+/// it for an expression subquery: PostgreSQL's `transformIndirection`
+/// selects the field of the left item's whole-row Var, which
+/// `ParseFuncOrColumn` turns into the item's own column. `left_column`
+/// answers whether the left side has `v.a`; a name the subquery's own FROM
+/// answers to, or one of its columns, is the subquery's and stays.
+pub(crate) fn lateral_field_selections(
+    s: &mut pg_query::protobuf::SelectStmt,
+    lookup: &dyn Fn(&str) -> Option<TableDef>,
+    left_column: &dyn Fn(&str, &str) -> bool,
+) -> Result<()> {
+    let own = level_names(s);
+    let ctes = VISIBLE_CTES.with(|v| v.borrow().clone());
+    let mut own_columns = Vec::new();
+    for item in &s.from_clause {
+        collect_from_columns(item, lookup, &ctes, &mut own_columns);
+    }
+    walk_select(s, &mut |n| {
+        let Some(N::AIndirection(ind)) = n.node.as_ref() else {
+            return Ok(());
+        };
+        let Some(N::ColumnRef(c)) = ind.arg.as_deref().and_then(|a| a.node.as_ref()) else {
+            return Ok(());
+        };
+        let Some(Ok::<[String; 1], _>([name])) = parts_of(c).map(|p| p.try_into()) else {
+            return Ok(());
+        };
+        let [f] = ind.indirection.as_slice() else {
+            return Ok(());
+        };
+        let Some(N::String(field)) = f.node.as_ref() else {
+            return Ok(());
+        };
+        if own.contains(&name) || own_columns.contains(&name) || !left_column(&name, &field.sval) {
+            return Ok(());
+        }
+        let location = c.location;
+        let fields = vec![string_node(&name), string_node(&field.sval)];
+        n.node = Some(N::ColumnRef(pg_query::protobuf::ColumnRef {
+            fields,
+            location,
+        }));
+        Ok(())
+    })
 }
 
 /// The FROM item of one list that answers to `name`: a relation or a
@@ -2101,15 +2185,7 @@ fn pair_compare(
         }
         None => param,
     };
-    let pair = pg_query::protobuf::Node {
-        node: Some(N::AExpr(Box::new(AExpr {
-            kind: AExprKind::AexprOp as i32,
-            name: vec![string_node(op)],
-            lexpr: Some(Box::new(field.clone())),
-            rexpr: Some(Box::new(rhs)),
-            location: -1,
-        }))),
-    };
+    let pair = crate::row_pair_node(op, field.clone(), rhs);
     const_value(&pair, &extended)
 }
 
@@ -2152,15 +2228,16 @@ fn row_compare(
                 Bson::Boolean(decides)
             })
         }
-        "<" | "<=" | ">" | ">=" => {
+        _ if crate::row_order_strict(op).is_some() => {
+            let strict = crate::row_order_strict(op).expect("ordered");
             for i in 0..t.args.len() {
                 match pair(i, "=")? {
                     Bson::Boolean(true) => continue,
-                    Bson::Boolean(false) => return pair(i, &op[..1]),
+                    Bson::Boolean(false) => return pair(i, strict),
                     _ => return Ok(Bson::Null),
                 }
             }
-            Ok(Bson::Boolean(matches!(op, "<=" | ">=")))
+            Ok(Bson::Boolean(matches!(op, "<=" | ">=" | "~<=~" | "~>=~")))
         }
         _ => Err(Error::Unsupported(format!(
             "a row comparison with {op} and a subquery"

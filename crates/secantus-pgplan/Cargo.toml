@@ -30,7 +30,9 @@ chrono = { version = "0.4.45", default-features = false, features = ["std"] }
 # rule) rather than to a guess. Already used by `secantus-core` for the same
 # reason on the MongoDB side.
 chrono-tz = { version = "0.10", default-features = false }
-pg_query = "6"
+# SecantusDB's fork of pg_query 6.2.0 (crates/secantus-pg-query), keeping a
+# PL/pgSQL compile error's SQLSTATE and position (RP-621).
+pg_query = { package = "secantus-pg-query", version = "=0.1.0-beta.17", path = "../secantus-pg-query" }
 # A generic walk over a raw parse tree (`raw_expression_tree_walker`), for
 # WITH RECURSIVE's dependency graph and recursion checks: the tree, as the
 # JSON its serde derive writes, reaches every field.

@@ -604,6 +604,29 @@ def test_regprocedure_quotes_as_format_procedure(dsn: str) -> None:
     assert got == [('"Q f567"(s567.t)',), ("s567.h(s567.t)",)]
 
 
+# A connection's first statement publishes the functions before its user
+# schemas, so a fresh connection printed `s567n.h("s567n.t")`: the argument's
+# type key was split by an empty schema list (fixed forward after RP-567).
+@pytest.mark.backlog_fixed("RP-567")
+def test_regprocedure_argument_schema_on_a_new_connection(dsn: str) -> None:
+    with psycopg.connect(dsn, autocommit=True) as c:
+        c.execute("drop schema if exists s567n cascade")
+        c.execute("create schema s567n")
+        c.execute("create table s567n.t (a int)")
+        c.execute("create function s567n.h(s567n.t) returns int language sql as $$ select 1 $$")
+    try:
+        with psycopg.connect(dsn, autocommit=True) as c:
+            got = _run(
+                c,
+                "select oid::regprocedure::text from pg_proc"
+                " where pronamespace = 's567n'::regnamespace",
+            )
+    finally:
+        with psycopg.connect(dsn, autocommit=True) as c:
+            c.execute("drop schema if exists s567n cascade")
+    assert got == [("s567n.h(s567n.t)",)]
+
+
 # A view dropped by DROP TABLE ... CASCADE takes what names its row type
 # with it: `drop table w568` names `function w568f(w568v) depends on type
 # w568v` after the view, and CASCADE drops the function. The DETAIL named

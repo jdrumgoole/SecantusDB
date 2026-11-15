@@ -1,9 +1,9 @@
 """What working RP-870 (more aggregates over a window) found:
 
 - RP-904: an aggregate called with the wrong number of arguments
-  (`stddev(v, v)`, `corr(v)`) is this server's 0A000 `an aggregate with this
+  (`stddev(v, v)`, `corr(v)`) was this server's 0A000 `an aggregate with this
   many arguments`, with or without OVER, where PostgreSQL has no such
-  function: 42883 naming the argument types.
+  function: 42883 naming the argument types. Fixed: it is 42883 here too.
 
 Measured on PostgreSQL 15.19 (the shared reference on port 5415), VALUES-only
 statements as written.
@@ -39,7 +39,7 @@ WRONG_ARITY = {
 }
 
 
-@pytest.mark.backlog("RP-904")
+@pytest.mark.backlog_fixed("RP-904")
 @pytest.mark.parametrize("query", list(WRONG_ARITY))
 def test_an_aggregate_with_the_wrong_arity_is_42883(query: str, dsn: str) -> None:
     assert _rows(dsn, query) == (

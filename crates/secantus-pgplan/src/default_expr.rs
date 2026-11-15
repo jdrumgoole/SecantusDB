@@ -138,6 +138,9 @@ fn call(f: &mut FuncCall) -> Result<()> {
             "aggregate functions are not allowed in {KIND}"
         )));
     }
+    if builtin && matches!(name.as_str(), "nextval" | "currval" | "setval") {
+        regclass_argument(f)?;
+    }
     resolve(f)?;
     if f.agg_star
         || f.agg_distinct
@@ -234,6 +237,21 @@ pub(crate) fn folding_error_stands(raw: &Node, pg_type: &str, e: Error) -> Resul
     }
     take_error_location();
     Ok(())
+}
+
+/// The sequence functions' first parameter is `regclass` (RP-888): an
+/// untyped literal there is coerced by `regclassin` while the default is
+/// analysed, so a relation it does not name is 42P01 at the literal.
+fn regclass_argument(f: &FuncCall) -> Result<()> {
+    let Some(arg) = f.args.first() else {
+        return Ok(());
+    };
+    let (Some(s), Some(N::AConst(c))) = (string_literal(arg), arg.node.as_ref()) else {
+        return Ok(());
+    };
+    resolve_regclass(s)
+        .map(|_| ())
+        .inspect_err(|_| set_error_location(c.location))
 }
 
 /// The value of a string constant (an `A_Const` of type unknown).

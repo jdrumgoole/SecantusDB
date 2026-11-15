@@ -143,10 +143,10 @@ IF_NOT_EXISTS = {
 }
 
 
-@pytest.mark.backlog("RP-887")
+@pytest.mark.backlog_fixed("RP-887")
 @pytest.mark.parametrize("case", list(IF_NOT_EXISTS))
 def test_if_not_exists_over_a_table_checks_nothing(case: str, dsn: str) -> None:
-    """IF NOT EXISTS over a table that exists skips before any check."""
+    """IF NOT EXISTS over a table that exists skipped before any check."""
     try:
         assert answer(dsn, "create table t890 (a int)", IF_NOT_EXISTS[case]) == CREATED
     finally:
@@ -163,11 +163,11 @@ REGCLASS_DEFAULT = {
 }
 
 
-@pytest.mark.backlog("RP-888")
+@pytest.mark.backlog_fixed("RP-888")
 @pytest.mark.parametrize("statement", list(REGCLASS_DEFAULT))
 def test_a_regclass_literal_in_a_default_is_resolved(statement: str, dsn: str) -> None:
-    """An untyped literal a DEFAULT passes as `regclass` names a relation
-    that must exist."""
+    """An untyped literal a DEFAULT passed as `regclass` had to name a
+    relation that existed (fixed: 42P01 at CREATE)."""
     try:
         assert answer(dsn, statement) == REGCLASS_DEFAULT[statement]
     finally:

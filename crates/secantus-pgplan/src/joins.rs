@@ -488,7 +488,20 @@ impl Scope {
         let (alias, name) = match parts {
             [name] => (None, name),
             [alias, name] => (Some(alias), name),
-            [_, alias, name] => (Some(alias), name),
+            [schema, alias, name] => {
+                // `schema.t.col` names the unaliased item that IS that
+                // relation, where two items share the name `t`.
+                let base = relation_key_base(&crate::schemas::relation_key(schema, alias));
+                let hits: Vec<&ScopeCol> = self
+                    .cols
+                    .iter()
+                    .filter(|c| c.alias == base && &c.qual == alias && &c.name == name)
+                    .collect();
+                if let [one] = hits.as_slice() {
+                    return Ok(Some(one.key.clone()));
+                }
+                (Some(alias), name)
+            }
             _ => return Ok(None),
         };
         match alias {
@@ -510,6 +523,12 @@ impl Scope {
             Some(alias) => {
                 if !self.aliases.contains(alias) {
                     return Err(self.missing_entry(alias));
+                }
+                if self.aliases.iter().filter(|a| *a == alias).count() > 1 {
+                    return Err(Error::Sqlstate(
+                        "42P09",
+                        format!("table reference \"{alias}\" is ambiguous"),
+                    ));
                 }
                 let hits: Vec<&ScopeCol> = self
                     .cols
@@ -576,6 +595,17 @@ thread_local! {
     /// subquery leaf of one of these names carries its row as a column.
     static WHOLE_ROW_REFS: std::cell::RefCell<Vec<String>> =
         const { std::cell::RefCell::new(Vec::new()) };
+    /// The names two or more unaliased FROM items of different relations
+    /// share in the join being built (see `shared_names`), whose leaves are
+    /// keyed by their relation rather than by the name.
+    static SHARED_NAMES: std::cell::RefCell<Vec<String>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+    /// The table names an aliased JOIN hides that another FROM item of the
+    /// join being built reuses (see `hidden_reused_names`): each leaf of
+    /// such a name is keyed apart, by `REKEYED`'s count.
+    static HIDDEN_REUSED: std::cell::RefCell<Vec<String>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+    static REKEYED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     /// Join sources planned for the statement in flight, by placeholder name.
     static PLANNED_JOINS: std::cell::RefCell<Vec<(String, SubSource)>> =
         const { std::cell::RefCell::new(Vec::new()) };
@@ -623,17 +653,33 @@ pub(crate) fn plan_join_source(
         None => (s, &[][..]),
     };
     // A nested join (one inside a FROM subquery) plans with its own.
-    let (mut pushdown, nonnullable, ec, placed, moved) = pushdown_filters(s, lookup);
+    let (mut pushdown, mut nonnullable, mut ec, placed, moved) = pushdown_filters(s, lookup);
     for (alias, _, c) in nullable_pushed {
         let mut c = c.clone();
         strip_qualifier(&mut c);
         pushdown.push((alias.clone(), c));
     }
+    // The pushdown, NULL-proof and equivalence analyses key a conjunct by
+    // its qualifier's name, which here names more than one leaf: the join
+    // runs without them, its WHERE over the joined rows.
+    let shared = shared_names(s);
+    let hidden_reused = hidden_reused_names(s);
+    let (pushdown, moved, placed) = if shared.is_empty() && hidden_reused.is_empty() {
+        (pushdown, moved, placed)
+    } else {
+        nonnullable.clear();
+        ec = None;
+        (Vec::new(), Vec::new(), vec![false; placed.len()])
+    };
+    let outer_shared = SHARED_NAMES.with(|p| p.replace(shared));
+    let outer_hidden = HIDDEN_REUSED.with(|p| p.replace(hidden_reused));
     let outer_pushdown = PUSHDOWN.with(|p| p.replace(pushdown));
     let outer_nonnullable = NONNULLABLE.with(|p| p.replace(nonnullable));
     let outer_ec = EC_PLAN.with(|p| p.replace(ec));
     let outer_whole = WHOLE_ROW_REFS.with(|p| p.replace(whole_row_names(s)));
     let built = build_tree(s, lookup, params);
+    SHARED_NAMES.with(|p| *p.borrow_mut() = outer_shared);
+    HIDDEN_REUSED.with(|p| *p.borrow_mut() = outer_hidden);
     PUSHDOWN.with(|p| *p.borrow_mut() = outer_pushdown);
     NONNULLABLE.with(|p| *p.borrow_mut() = outer_nonnullable);
     EC_PLAN.with(|p| *p.borrow_mut() = outer_ec);
@@ -675,6 +721,222 @@ pub(crate) fn plan_join_source(
         .map(|(_, p)| *p)
         .collect();
     finish_join_source(&rest, tree, scope, params, &placed)
+}
+
+/// The names of `s`'s FROM that `checkNameSpaceConflicts` lets two items
+/// share: every item of the name an unaliased relation, no two the same
+/// relation (`select 1 from s1.t join s2.t on true`). Any other repeat is
+/// left to the 42712 the leaves raise.
+fn shared_names(s: &pg_query::protobuf::SelectStmt) -> Vec<String> {
+    // (name, the relation of an unaliased table; None for any other item)
+    fn walk(n: &pg_query::protobuf::Node, out: &mut Vec<(String, Option<String>)>) {
+        match n.node.as_ref() {
+            Some(N::RangeVar(r)) => match r.alias.as_ref() {
+                Some(a) if crate::schemas::alias_written(r) => {
+                    out.push((a.aliasname.clone(), None))
+                }
+                Some(a) => out.push((a.aliasname.clone(), Some(r.relname.clone()))),
+                None => out.push((r.relname.clone(), Some(r.relname.clone()))),
+            },
+            Some(N::JoinExpr(j)) => {
+                if let Some(l) = j.larg.as_deref() {
+                    walk(l, out);
+                }
+                if let Some(r) = j.rarg.as_deref() {
+                    walk(r, out);
+                }
+                for a in j.alias.iter().chain(j.join_using_alias.iter()) {
+                    out.push((a.aliasname.clone(), None));
+                }
+            }
+            Some(N::RangeSubselect(rs)) => {
+                if let Some(a) = rs.alias.as_ref() {
+                    out.push((a.aliasname.clone(), None));
+                }
+            }
+            Some(N::RangeFunction(rf)) => {
+                if let Some(name) = rf
+                    .alias
+                    .as_ref()
+                    .map(|a| a.aliasname.clone())
+                    .or_else(|| range_function_name(rf))
+                {
+                    out.push((name, None));
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut items = Vec::new();
+    for f in &s.from_clause {
+        walk(f, &mut items);
+    }
+    let mut shared: Vec<String> = Vec::new();
+    for (name, _) in &items {
+        if shared.contains(name) {
+            continue;
+        }
+        let same: Vec<&Option<String>> = items
+            .iter()
+            .filter(|(n, _)| n == name)
+            .map(|(_, r)| r)
+            .collect();
+        let relations: Vec<&String> = same.iter().filter_map(|r| r.as_ref()).collect();
+        let distinct = relations
+            .iter()
+            .enumerate()
+            .all(|(i, r)| !relations[..i].contains(r));
+        if same.len() > 1 && relations.len() == same.len() && distinct {
+            shared.push(name.clone());
+        }
+    }
+    shared
+}
+
+/// The names of `s`'s FROM that an aliased JOIN hides and another FROM
+/// item reuses (`(fs join fe) as j, fs`), which PostgreSQL allows: the
+/// alias hides the sides' names, so the two never meet in one namespace.
+/// Only names every item of which is a table: their leaves are keyed apart
+/// (a joined row is keyed by its leaf's base, which would otherwise be the
+/// name for both); another kind of leaf is still refused by name.
+fn hidden_reused_names(s: &pg_query::protobuf::SelectStmt) -> Vec<String> {
+    // (name, is a table, inside an aliased JOIN)
+    fn walk(n: &pg_query::protobuf::Node, inside: bool, out: &mut Vec<(String, bool, bool)>) {
+        match n.node.as_ref() {
+            Some(N::RangeVar(r)) => {
+                let name = r
+                    .alias
+                    .as_ref()
+                    .map(|a| a.aliasname.clone())
+                    .filter(|a| !a.is_empty())
+                    .unwrap_or_else(|| r.relname.clone());
+                out.push((name, true, inside));
+            }
+            Some(N::JoinExpr(j)) => {
+                let side_inside = inside || j.alias.is_some();
+                for side in [j.larg.as_deref(), j.rarg.as_deref()].into_iter().flatten() {
+                    walk(side, side_inside, out);
+                }
+                for a in j.join_using_alias.iter() {
+                    out.push((a.aliasname.clone(), false, side_inside));
+                }
+                if let Some(a) = j.alias.as_ref() {
+                    out.push((a.aliasname.clone(), false, inside));
+                }
+            }
+            Some(N::RangeSubselect(rs)) => {
+                if let Some(a) = rs.alias.as_ref() {
+                    out.push((a.aliasname.clone(), false, inside));
+                }
+            }
+            Some(N::RangeFunction(rf)) => {
+                if let Some(name) = rf
+                    .alias
+                    .as_ref()
+                    .map(|a| a.aliasname.clone())
+                    .or_else(|| range_function_name(rf))
+                {
+                    out.push((name, false, inside));
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut items = Vec::new();
+    for f in &s.from_clause {
+        walk(f, false, &mut items);
+    }
+    let mut out: Vec<String> = Vec::new();
+    for (name, _, _) in &items {
+        let same: Vec<_> = items.iter().filter(|(n, _, _)| n == name).collect();
+        if !out.contains(name)
+            && same.len() > 1
+            && same.iter().all(|(_, table, _)| *table)
+            && same.iter().any(|(_, _, inside)| *inside)
+        {
+            out.push(name.clone());
+        }
+    }
+    out
+}
+
+fn hidden_reused(name: &str) -> bool {
+    HIDDEN_REUSED.with(|n| n.borrow().iter().any(|n| n == name))
+}
+
+/// `checkNameSpaceConflicts` over `s`'s FROM, for a statement whose SELECT
+/// is stored rather than planned (a view): two items of one name are 42712
+/// unless both are unaliased and different relations. An aliased JOIN
+/// shows only its alias above it; inside, its items are checked as a level
+/// of their own.
+pub(crate) fn check_namespace_conflicts(s: &pg_query::protobuf::SelectStmt) -> Result<()> {
+    fn level(n: &pg_query::protobuf::Node, out: &mut Vec<(String, Option<String>)>) -> Result<()> {
+        match n.node.as_ref() {
+            Some(N::RangeVar(r)) => out.push(match r.alias.as_ref() {
+                Some(a) if crate::schemas::alias_written(r) => (a.aliasname.clone(), None),
+                Some(a) => (a.aliasname.clone(), Some(r.relname.clone())),
+                None => (r.relname.clone(), Some(r.relname.clone())),
+            }),
+            Some(N::JoinExpr(j)) => {
+                let mut inner = Vec::new();
+                for side in [j.larg.as_deref(), j.rarg.as_deref()].into_iter().flatten() {
+                    level(side, &mut inner)?;
+                }
+                if let Some(u) = j.join_using_alias.as_ref() {
+                    inner.push((u.aliasname.clone(), None));
+                }
+                match j.alias.as_ref() {
+                    Some(a) => {
+                        conflicts(&inner)?;
+                        out.push((a.aliasname.clone(), None));
+                    }
+                    None => out.extend(inner),
+                }
+            }
+            Some(N::RangeSubselect(rs)) => {
+                if let Some(a) = rs.alias.as_ref() {
+                    out.push((a.aliasname.clone(), None));
+                }
+            }
+            Some(N::RangeFunction(rf)) => {
+                if let Some(name) = rf
+                    .alias
+                    .as_ref()
+                    .map(|a| a.aliasname.clone())
+                    .or_else(|| range_function_name(rf))
+                {
+                    out.push((name, None));
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+    fn conflicts(items: &[(String, Option<String>)]) -> Result<()> {
+        for (i, (name, rel)) in items.iter().enumerate() {
+            for (other, other_rel) in &items[..i] {
+                let exempt = matches!((rel, other_rel), (Some(a), Some(b)) if a != b);
+                if other == name && !exempt {
+                    return Err(Error::Sqlstate(
+                        "42712",
+                        format!("table name \"{name}\" specified more than once"),
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+    let mut items = Vec::new();
+    for f in &s.from_clause {
+        level(f, &mut items)?;
+    }
+    conflicts(&items)
+}
+
+/// The key base of an unaliased leaf of a shared name: its relation's
+/// stored key, its schema separated by a character no key splits on.
+fn relation_key_base(relation: &str) -> String {
+    relation.replace('.', "\u{1e}")
 }
 
 /// The names `s` may refer to as a whole row: a one-part column reference,
@@ -788,6 +1050,8 @@ fn whole_row_names(s: &pg_query::protobuf::SelectStmt) -> Vec<String> {
 
 /// Is `alias` named as a whole row by the join being built?
 fn whole_row_named(alias: &str) -> bool {
+    // A leaf keyed apart (`hidden_reused_names`) is named by its name.
+    let alias = alias.split_once('\u{1d}').map_or(alias, |(n, _)| n);
     WHOLE_ROW_REFS.with(|w| w.borrow().iter().any(|n| n == alias))
 }
 
@@ -1200,17 +1464,53 @@ fn build(
             } else {
                 None
             };
-            leaf_filtered(
+            // One of several unaliased items of this name: keyed by its
+            // relation, still named by the name (`checkNameSpaceConflicts`).
+            let shared = SHARED_NAMES.with(|n| n.borrow().contains(&alias));
+            // A name an aliased JOIN hides and another item reuses: each
+            // leaf of it keyed apart, still named by the name.
+            let rekeyed = !shared && hidden_reused(&alias);
+            let base = if shared {
+                relation_key_base(&r.relname)
+            } else if rekeyed {
+                let n = REKEYED.with(|c| {
+                    let n = c.get();
+                    c.set(n + 1);
+                    n
+                });
+                format!("{alias}\u{1d}{n}")
+            } else {
+                alias.clone()
+            };
+            let (node, mut scope) = leaf_filtered(
                 pg_query::protobuf::Node {
                     node: Some(N::RangeVar(rv)),
                 },
-                &alias,
+                &base,
                 &colnames,
                 lookup,
                 params,
                 aliases,
                 filter,
-            )
+            )?;
+            if shared || rekeyed {
+                // The namespace holds the name, as each such item's entry.
+                if let Some(a) = aliases.iter_mut().rev().find(|a| **a == base) {
+                    *a = alias.clone();
+                }
+                scope.aliases = vec![alias.clone()];
+                for c in &mut scope.cols {
+                    if c.qual == base {
+                        c.qual = alias.clone();
+                    }
+                }
+                for (a, _) in &mut scope.rows {
+                    if *a == base {
+                        *a = alias.clone();
+                    }
+                }
+            }
+            Ok((node, scope))
         }
         Some(N::RangeSubselect(rs)) => {
             // LATERAL with nothing to its left is an ordinary subquery.
@@ -1320,6 +1620,91 @@ fn scalar_alias(names: Vec<String>, function: bool, alias: &str, width: usize) -
     }
 }
 
+/// A LATERAL subquery's select list as `transformTargetList` reads it
+/// before its references to the left become parameters (RP-701): a star
+/// over a left FROM item is that item's columns (`ExpandColumnRefStar`
+/// finds the item in the level's range table), and a column reference is
+/// named by its column (`FigureColname`), not by the parameter's type.
+fn left_targets_as_written(inner: &mut pg_query::protobuf::SelectStmt, left: &Scope) {
+    // A set operation's arms are levels of their own, and its columns are
+    // named by its first arm's.
+    if inner.larg.is_some() || inner.rarg.is_some() {
+        for arm in [inner.larg.as_deref_mut(), inner.rarg.as_deref_mut()]
+            .into_iter()
+            .flatten()
+        {
+            left_targets_as_written(arm, left);
+        }
+        return;
+    }
+    let own = crate::correlated::level_names(inner);
+    let string = |v: &str| pg_query::protobuf::Node {
+        node: Some(N::String(pg_query::protobuf::String {
+            sval: v.to_string(),
+        })),
+    };
+    let mut out = Vec::with_capacity(inner.target_list.len());
+    for mut t in std::mem::take(&mut inner.target_list) {
+        if let Some(N::ResTarget(rt)) = t.node.as_mut() {
+            if let Some(N::ColumnRef(c)) = rt.val.as_deref().and_then(|v| v.node.as_ref()) {
+                let parts: Vec<Option<&str>> = c
+                    .fields
+                    .iter()
+                    .map(|f| match f.node.as_ref() {
+                        Some(N::String(s)) => Some(s.sval.as_str()),
+                        _ => None,
+                    })
+                    .collect();
+                let star = c
+                    .fields
+                    .last()
+                    .is_some_and(|f| matches!(f.node, Some(N::AStar(_))));
+                match parts.as_slice() {
+                    [Some(q), None] if star && !own.iter().any(|o| o == q) => {
+                        // A side of a USING join keeps its own copy of the
+                        // merged column, which its star expands to.
+                        let columns: Vec<&ScopeCol> = left
+                            .cols
+                            .iter()
+                            .filter(|col| col.alias == *q && (col.star || !col.bare))
+                            .collect();
+                        if !columns.is_empty() {
+                            let at = c.location;
+                            let q = q.to_string();
+                            for col in columns {
+                                out.push(pg_query::protobuf::Node {
+                                    node: Some(N::ResTarget(Box::new(
+                                        pg_query::protobuf::ResTarget {
+                                            name: col.name.clone(),
+                                            val: Some(Box::new(pg_query::protobuf::Node {
+                                                node: Some(N::ColumnRef(
+                                                    pg_query::protobuf::ColumnRef {
+                                                        fields: vec![string(&q), string(&col.name)],
+                                                        location: at,
+                                                    },
+                                                )),
+                                            })),
+                                            location: at,
+                                            ..Default::default()
+                                        },
+                                    ))),
+                                });
+                            }
+                            continue;
+                        }
+                    }
+                    [.., Some(column)] if rt.name.is_empty() => {
+                        rt.name = column.to_string();
+                    }
+                    _ => {}
+                }
+            }
+        }
+        out.push(t);
+    }
+    inner.target_list = out;
+}
+
 /// A FROM item that reads the row to its LEFT -- a `LATERAL` subquery, or a
 /// function whose arguments name a column there (a function in FROM is
 /// implicitly lateral, as in PostgreSQL) -- planned as SQL re-run per left
@@ -1378,6 +1763,17 @@ fn lateral_leaf(
         }
         _ => return Ok(None),
     };
+    // A field of a left item's whole row is that item's column (RP-705).
+    if !function {
+        crate::correlated::lateral_field_selections(&mut inner, lookup, &|name, field| {
+            left.aliases.iter().any(|a| a == name)
+                && matches!(
+                    left.resolve(&[name.to_string(), field.to_string()]),
+                    Ok(Some(_))
+                )
+        })?;
+        left_targets_as_written(&mut inner, left);
+    }
     // The references to the left side, each bound to a parameter.
     let mut keys: Vec<String> = Vec::new();
     let mut types: Vec<String> = Vec::new();
@@ -2178,7 +2574,7 @@ pub fn function_scan_rows(scan: &FunctionScan, params: &[Bson]) -> Result<Option
     Ok(Some(rows))
 }
 
-fn star_target() -> pg_query::protobuf::Node {
+pub(crate) fn star_target() -> pg_query::protobuf::Node {
     pg_query::protobuf::Node {
         node: Some(N::ResTarget(Box::new(pg_query::protobuf::ResTarget {
             val: Some(Box::new(pg_query::protobuf::Node {
@@ -2623,7 +3019,15 @@ fn build_join(
     let mut merged = Vec::new();
     let mut merged_cols = Vec::new();
     let mut hidden: Vec<String> = Vec::new();
-    for name in &using {
+    for (i, name) in using.iter().enumerate() {
+        // `transformFromClauseItem` refuses a repeated USING name before it
+        // looks the name up in either side (PostgreSQL 15.19, RP-857).
+        if !j.using_clause.is_empty() && using[..i].contains(name) {
+            return Err(Error::Sqlstate(
+                "42701",
+                format!("column name \"{name}\" appears more than once in USING clause"),
+            ));
+        }
         let side = |scope: &Scope, which: &str| -> Result<ScopeCol> {
             let hits: Vec<&ScopeCol> = scope
                 .cols
@@ -2925,6 +3329,16 @@ fn apply_join_alias(
             continue;
         }
         let name = entry.strip_prefix(SEP).unwrap_or(entry);
+        // Two items sharing a name are one name to hide.
+        let marked = format!("{SEP}{name}");
+        if registry.contains(&marked) && SHARED_NAMES.with(|n| n.borrow().iter().any(|n| n == name))
+        {
+            continue;
+        }
+        if hidden_reused(name) {
+            // Its leaf is keyed apart: the name simply leaves.
+            continue;
+        }
         if registry
             .iter()
             .any(|e| e.strip_prefix(SEP).unwrap_or(e) == name)
@@ -3400,7 +3814,7 @@ const HASHED_SAOP: usize = 9;
 /// answer settled halfway (`estimate_array_length`), or, for a hashed list,
 /// one hash and one comparison. A list of one element is the plain
 /// operator (`transformAExprIn`).
-fn qual_operators(n: &pg_query::protobuf::Node) -> f64 {
+pub(crate) fn qual_operators(n: &pg_query::protobuf::Node) -> f64 {
     let mut halves = 0.0;
     let mut node = n.clone();
     let _ = walk_expr(&mut node, &mut |x| {
@@ -3459,7 +3873,7 @@ fn in_list_of_constants(e: &pg_query::protobuf::AExpr) -> Option<usize> {
 /// list of constants ([`qual_startup_operators`] its hash table's build),
 /// AND / OR / NOT, columns and constants. A null test, a call (a LIKE's
 /// ESCAPE is `like_escape`) or a cast of a column costs otherwise.
-fn priced_by_operator_count(n: &pg_query::protobuf::Node) -> bool {
+pub(crate) fn priced_by_operator_count(n: &pg_query::protobuf::Node) -> bool {
     priced_by(n, false)
 }
 
@@ -4235,9 +4649,140 @@ fn pushdown_filters(
 pub(crate) fn prepare_on_quals(
     s: &pg_query::protobuf::SelectStmt,
 ) -> Option<pg_query::protobuf::SelectStmt> {
-    let folded = fold_constant_on_quals(s);
+    let deduped = drop_redundant_equalities(s);
+    let s = deduped.as_ref().unwrap_or(s);
+    let folded = fold_constant_on_quals(s).or(deduped.clone());
     let base = folded.as_ref().unwrap_or(s);
-    hoist_inner_on_conjuncts(base).or(folded)
+    let reduced = reduce_outer_joins(base).or(folded);
+    let base = reduced.as_ref().unwrap_or(s);
+    hoist_inner_on_conjuncts(base).or(reduced)
+}
+
+/// `s` with every WHERE equality an earlier one repeats dropped, or `None` when there is none
+/// (RP-402).
+///
+/// PostgreSQL's `process_equivalence` finds such a clause redundant: `e.b
+/// = k.b and e.b = k.b` is one join clause, `a = 5 and a = 5` one
+/// restriction. Taken only for an exact repeat (either way round) of an
+/// earlier `=` between columns (by their written names) and non-NULL
+/// literals: a clause redundant only by transitivity (`a = b and b = 5 and
+/// a = 5`) stays, as the classes here do not regenerate what PostgreSQL's
+/// would. Dropping a repeat is safe for the rows.
+fn drop_redundant_equalities(
+    s: &pg_query::protobuf::SelectStmt,
+) -> Option<pg_query::protobuf::SelectStmt> {
+    let w = s.where_clause.as_deref()?;
+    let mut conjuncts = Vec::new();
+    split_and(w, &mut conjuncts);
+    let member = |n: Option<&pg_query::protobuf::Node>| -> Option<String> {
+        match n?.node.as_ref()? {
+            N::ColumnRef(c) => {
+                let mut parts = Vec::new();
+                for f in &c.fields {
+                    match f.node.as_ref()? {
+                        N::String(s) => parts.push(s.sval.clone()),
+                        _ => return None,
+                    }
+                }
+                Some(format!("col:{}", parts.join(".")))
+            }
+            N::AConst(c) if !c.isnull => Some(format!("const:{:?}", c.val)),
+            _ => None,
+        }
+    };
+    let mut seen: Vec<(String, String)> = Vec::new();
+    let mut kept = Vec::with_capacity(conjuncts.len());
+    let mut dropped = false;
+    for c in conjuncts {
+        let sides = match c.node.as_ref() {
+            Some(N::AExpr(a))
+                if a.kind == pg_query::protobuf::AExprKind::AexprOp as i32
+                    && matches!(a.name.as_slice(), [one]
+                        if matches!(one.node.as_ref(), Some(N::String(op)) if op.sval == "=")) =>
+            {
+                member(a.lexpr.as_deref()).zip(member(a.rexpr.as_deref()))
+            }
+            _ => None,
+        };
+        // Two constants compare once, at plan time; not a class.
+        if let Some((l, r)) = sides.filter(|(l, r)| l.starts_with("col:") || r.starts_with("col:"))
+        {
+            let pair = if l <= r { (l, r) } else { (r, l) };
+            if seen.contains(&pair) {
+                dropped = true;
+                continue;
+            }
+            seen.push(pair);
+        }
+        kept.push(c.clone());
+    }
+    if !dropped {
+        return None;
+    }
+    let mut out = s.clone();
+    out.where_clause = and_of(kept).map(Box::new);
+    Some(out)
+}
+
+/// `s` with every LEFT or RIGHT join whose nullable side the WHERE proves
+/// non-NULL made an inner join, or `None` when there is none (RP-902).
+///
+/// PostgreSQL's `reduce_outer_joins` rewrites the join tree this way
+/// before `deconstruct_jointree` distributes the quals, so the reduced
+/// join's ON conjuncts over one side go to that side's scan as an inner
+/// join's do. A WHERE conjunct proves a side non-NULL by
+/// [`strict_aliases`]' terms, its columns qualified; an aliased JOIN,
+/// which hides its leaves from the WHERE, and a FULL join are left alone.
+fn reduce_outer_joins(
+    s: &pg_query::protobuf::SelectStmt,
+) -> Option<pg_query::protobuf::SelectStmt> {
+    use pg_query::protobuf::JoinType;
+    let w = s.where_clause.as_deref()?;
+    let mut conjuncts = Vec::new();
+    split_and(w, &mut conjuncts);
+    let nonnull: Vec<String> = conjuncts
+        .iter()
+        .flat_map(|c| strict_aliases(c, &|_| None))
+        .collect();
+    if nonnull.is_empty() {
+        return None;
+    }
+    fn walk(item: &mut pg_query::protobuf::Node, nonnull: &[String], changed: &mut bool) {
+        let Some(N::JoinExpr(j)) = item.node.as_mut() else {
+            return;
+        };
+        if j.alias.is_some() {
+            return;
+        }
+        let proven = |side: Option<&pg_query::protobuf::Node>| {
+            let mut below = Vec::new();
+            if let Some(side) = side {
+                table_aliases(side, &mut below);
+            }
+            below.iter().any(|a| nonnull.contains(a))
+        };
+        let reduce = match JoinType::try_from(j.jointype) {
+            Ok(JoinType::JoinLeft) => proven(j.rarg.as_deref()),
+            Ok(JoinType::JoinRight) => proven(j.larg.as_deref()),
+            _ => false,
+        };
+        if reduce && !j.is_natural && j.using_clause.is_empty() {
+            j.jointype = JoinType::JoinInner as i32;
+            *changed = true;
+        }
+        for side in [j.larg.as_deref_mut(), j.rarg.as_deref_mut()]
+            .into_iter()
+            .flatten()
+        {
+            walk(side, nonnull, changed);
+        }
+    }
+    let mut out = s.clone();
+    let mut changed = false;
+    for item in &mut out.from_clause {
+        walk(item, &nonnull, &mut changed);
+    }
+    changed.then_some(out)
 }
 
 /// `s` with every literal TRUE argument of a join's ON dropped, or `None`
@@ -4398,7 +4943,9 @@ pub(crate) type NullableSideQual = (
 /// A conjunct over the preserved side stays in the Join Filter (it does
 /// not remove preserved rows), and so does any conjunct a FULL join has.
 /// Taken only where the nullable side is one stored table whose columns
-/// keep their names (a leaf `build` gives a pushed filter), only for a
+/// keep their names (a leaf `build` gives a pushed filter), or a tree of
+/// plain inner joins of them, whose own one-table ON conjuncts are taken
+/// too (RP-393, RP-397), only for a
 /// FROM of one join tree (the FROM whose quals EXPLAIN places), and only
 /// for a conjunct of `single_alias`'s shape: every column qualified by the
 /// side's alias, immutable parts, no subquery.
@@ -4427,32 +4974,112 @@ pub(crate) fn nullable_side_on_conjuncts(
         let Some(nullable) = nullable else {
             return;
         };
-        let Some(N::RangeVar(r)) = nullable.node.as_ref() else {
+        let Some(leaves) = inner_tree_leaves(nullable) else {
             return;
         };
-        let mut leaves = Vec::new();
-        filtered_leaves(nullable, &mut leaves);
-        let [alias] = leaves.as_slice() else {
-            return;
+        let mine = |c: &pg_query::protobuf::Node| {
+            single_alias(c, &|_| None)
+                .and_then(|a| leaves.iter().find(|(alias, _)| *alias == a).cloned())
         };
-        let (alias, table) = (alias.clone(), r.clone());
+        // An inner join on the nullable side places its own one-table ON
+        // conjuncts in their tables' scans too (RP-393), on RP-391's terms:
+        // a join left with no clause of its own keeps its ON.
+        let side = match JoinType::try_from(j.jointype) {
+            Ok(JoinType::JoinLeft) => j.rarg.as_deref_mut(),
+            _ => j.larg.as_deref_mut(),
+        };
+        if let Some(side) = side {
+            inner_on(side, &mine, out);
+        }
         let Some(quals) = j.quals.as_deref() else {
             return;
         };
         let mut conjuncts = Vec::new();
         split_and(quals, &mut conjuncts);
-        let (mine, kept): (Vec<_>, Vec<_>) = conjuncts
-            .into_iter()
-            .partition(|c| single_alias(c, &|_| None).as_deref() == Some(alias.as_str()));
-        if mine.is_empty() {
+        let (taken, kept): (Vec<_>, Vec<_>) =
+            conjuncts.into_iter().partition(|c| mine(c).is_some());
+        if taken.is_empty() {
             return;
         }
-        out.extend(
-            mine.into_iter()
-                .map(|c| (alias.clone(), table.clone(), c.clone())),
-        );
+        out.extend(taken.into_iter().map(|c| {
+            let (alias, table) = mine(c).expect("partitioned");
+            (alias, table, c.clone())
+        }));
         let kept: Vec<pg_query::protobuf::Node> = kept.into_iter().cloned().collect();
         j.quals = and_of(kept).map(Box::new);
+    }
+    fn inner_on(
+        item: &mut pg_query::protobuf::Node,
+        mine: &dyn Fn(&pg_query::protobuf::Node) -> Option<(String, pg_query::protobuf::RangeVar)>,
+        out: &mut Vec<NullableSideQual>,
+    ) {
+        let Some(N::JoinExpr(j)) = item.node.as_mut() else {
+            return;
+        };
+        for side in [j.larg.as_deref_mut(), j.rarg.as_deref_mut()]
+            .into_iter()
+            .flatten()
+        {
+            inner_on(side, mine, out);
+        }
+        let Some(quals) = j.quals.as_deref() else {
+            return;
+        };
+        let mut conjuncts = Vec::new();
+        split_and(quals, &mut conjuncts);
+        let (taken, kept): (Vec<_>, Vec<_>) =
+            conjuncts.into_iter().partition(|c| mine(c).is_some());
+        if taken.is_empty() || kept.is_empty() {
+            return;
+        }
+        out.extend(taken.into_iter().map(|c| {
+            let (alias, table) = mine(c).expect("partitioned");
+            (alias, table, c.clone())
+        }));
+        let kept: Vec<pg_query::protobuf::Node> = kept.into_iter().cloned().collect();
+        j.quals = and_of(kept).map(Box::new);
+    }
+    /// The table leaves of a nullable side that is one stored table, or a
+    /// tree of plain inner joins of them (RP-397): `distribute_qual_to_rels`
+    /// pushes a conjunct over one of them through the inner joins, but not
+    /// through a lower outer join's nullable side.
+    fn inner_tree_leaves(
+        n: &pg_query::protobuf::Node,
+    ) -> Option<Vec<(String, pg_query::protobuf::RangeVar)>> {
+        fn walk(
+            n: &pg_query::protobuf::Node,
+            out: &mut Vec<(String, pg_query::protobuf::RangeVar)>,
+        ) -> bool {
+            match n.node.as_ref() {
+                Some(N::RangeVar(r)) => {
+                    let mut leaves = Vec::new();
+                    filtered_leaves(n, &mut leaves);
+                    let [alias] = leaves.as_slice() else {
+                        return false;
+                    };
+                    out.push((alias.clone(), r.clone()));
+                    true
+                }
+                Some(N::JoinExpr(j)) => {
+                    j.alias.is_none()
+                        && !j.is_natural
+                        && j.using_clause.is_empty()
+                        && j.jointype == JoinType::JoinInner as i32
+                        && j.larg.as_deref().is_some_and(|l| walk(l, out))
+                        && j.rarg.as_deref().is_some_and(|r| walk(r, out))
+                }
+                _ => false,
+            }
+        }
+        let mut out = Vec::new();
+        if !walk(n, &mut out) {
+            return None;
+        }
+        // A name two leaves share is not one table's.
+        let mut names: Vec<&str> = out.iter().map(|(a, _)| a.as_str()).collect();
+        names.sort_unstable();
+        names.dedup();
+        (names.len() == out.len()).then_some(out)
     }
     let [only] = s.from_clause.as_slice() else {
         return None;
@@ -5184,6 +5811,72 @@ mod tests {
         *s.where_clause.clone().unwrap()
     }
 
+    /// `sql`'s SELECT, with its relations' schemas folded into their names
+    /// as `schemas` folds them (`s1.t` -> relname `s1.t`, alias `t` added).
+    fn folded_select(sql: &str) -> pg_query::protobuf::SelectStmt {
+        let mut parsed = pg_query::parse(sql).unwrap().protobuf;
+        let Some(N::SelectStmt(s)) = parsed.stmts[0].stmt.as_mut().and_then(|n| n.node.as_mut())
+        else {
+            panic!("a SELECT");
+        };
+        for f in &mut s.from_clause {
+            walk_from(f);
+        }
+        (**s).clone()
+    }
+
+    fn walk_from(n: &mut pg_query::protobuf::Node) {
+        match n.node.as_mut() {
+            Some(N::RangeVar(r)) if !r.schemaname.is_empty() => {
+                let schema = std::mem::take(&mut r.schemaname);
+                if r.alias.is_none() {
+                    r.alias = Some(pg_query::protobuf::Alias {
+                        aliasname: r.relname.clone(),
+                        colnames: Vec::new(),
+                    });
+                    r.relpersistence = "a".into();
+                }
+                r.relname = format!("{schema}.{}", r.relname);
+            }
+            Some(N::JoinExpr(j)) => {
+                for side in [j.larg.as_deref_mut(), j.rarg.as_deref_mut()]
+                    .into_iter()
+                    .flatten()
+                {
+                    walk_from(side);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// RP-526: two unaliased items of one name are allowed when they are
+    /// different relations, and only then.
+    #[test]
+    fn unaliased_relations_of_one_name_share_it() {
+        let ok = folded_select("select 1 from s1.t join s2.t on true");
+        assert_eq!(shared_names(&ok), vec!["t".to_string()]);
+        assert!(check_namespace_conflicts(&ok).is_ok());
+        for sql in [
+            "select 1 from s1.t t join s2.t on true",
+            "select 1 from s1.t join s1.t on true",
+            "select 1 from s1.t, (select 1) t",
+        ] {
+            let s = folded_select(sql);
+            assert!(shared_names(&s).is_empty(), "{sql}");
+            assert!(
+                matches!(
+                    check_namespace_conflicts(&s),
+                    Err(Error::Sqlstate("42712", _))
+                ),
+                "{sql}"
+            );
+        }
+        // An aliased JOIN shows only its alias.
+        let hidden = folded_select("select 1 from (s1.t join s2.u on true) j, s3.t");
+        assert!(check_namespace_conflicts(&hidden).is_ok());
+    }
+
     #[test]
     fn a_between_is_its_comparisons() {
         // `transformAExprBetween`: two comparisons, four when SYMMETRIC
@@ -5419,12 +6112,33 @@ mod tests {
             nullable_pushed("select * from s full join e on s.a = e.a and e.b = 'v3'"),
             None
         );
-        // Not modelled: a nullable side that is a join or has renamed
-        // columns, an unqualified column, a subquery, a volatile call.
+        // RP-397: through an inner join on the nullable side, to its table.
+        let (pushed, rest) =
+            nullable_pushed("select * from s left join (e join k on e.a = k.a) on k.b = 'x'")
+                .unwrap();
+        assert_eq!(pushed, vec!["k: k.b = 'x'"]);
         assert_eq!(
-            nullable_pushed("select * from s left join (e join k on e.a = k.a) on k.b = 'x'"),
+            rest,
+            "SELECT * FROM s LEFT JOIN (e JOIN k ON e.a = k.a) ON true"
+        );
+        // RP-393: that inner join's own one-table ON conjunct, too; one
+        // whose ON would be left empty keeps it (RP-391's terms).
+        let (pushed, _) = nullable_pushed(
+            "select * from s left join (e join k on e.a = k.a and e.a > 9) on true",
+        )
+        .unwrap();
+        assert_eq!(pushed, vec!["e: e.a > 9"]);
+        assert_eq!(
+            nullable_pushed("select * from s left join (e join k on e.a > 9) on true"),
             None
         );
+        // Not through a lower outer join's nullable side.
+        assert_eq!(
+            nullable_pushed("select * from s left join (e left join k on e.a = k.a) on k.b = 'x'"),
+            None
+        );
+        // Not modelled: a nullable side with renamed columns, an
+        // unqualified column, a subquery, a volatile call.
         assert_eq!(
             nullable_pushed("select * from s left join e as e(x, y) on e.y = 'v3'"),
             None

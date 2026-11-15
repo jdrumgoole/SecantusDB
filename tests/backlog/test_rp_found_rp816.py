@@ -1,7 +1,9 @@
 """Gap tests of the divergences found while working RP-816 (a system column
 in a CHECK refused with 42P10):
 
-- `tableoid` in a CHECK names no column;
+- `tableoid` in a CHECK names no column (fixed, RP-859);
+- a CHECK naming its own table by `regclass` is refused at CREATE;
+- a partition's CHECK violation names the partitioned table;
 - a whole-row reference in a CHECK is refused as unsupported (fixed,
   RP-860);
 - a CHECK's qualified column reference: another table's name is accepted,
@@ -46,7 +48,7 @@ def _answer(dsn: str, query: str) -> object:
         return cur.statusmessage
 
 
-@pytest.mark.backlog("RP-859")
+@pytest.mark.backlog_fixed("RP-859")
 @pytest.mark.parametrize(
     ("query", "expected"),
     [
@@ -61,9 +63,49 @@ def _answer(dsn: str, query: str) -> object:
 def test_tableoid_in_a_check_is_a_column(dsn: str, query: str, expected: object) -> None:
     """`scanNSItemForColumn` lets a CHECK name `tableoid`, the one system
     column it allows: the constraint is created on PostgreSQL 15.19, and a
-    bare `tableoid` is coerced to boolean like any `oid`. Here each is
+    bare `tableoid` is coerced to boolean like any `oid`. Here each was
     42703 `column "tableoid" does not exist`."""
     assert _answer(dsn, query) == expected
+
+
+@pytest.mark.backlog_fixed("RP-859")
+def test_a_checks_tableoid_is_the_rows_relation(dsn: str) -> None:
+    """A CHECK's `tableoid` is the oid of the relation the row is stored
+    in: its own table, or the leaf partition a row of a partitioned table
+    lands in (PostgreSQL 15.19 answers below, but for the relation the
+    violation names), and the generated name is `<table>_tableoid_check`."""
+    got = _script(
+        dsn,
+        [
+            "drop table if exists p859",
+            "alter table c816 add check (tableoid = 'c816'::regclass)",
+            "insert into c816 values (1)",
+            "create table p859 (x int, check (tableoid::regclass::text = 'p859a'))"
+            " partition by list (x)",
+            "create table p859a partition of p859 for values in (1)",
+            "create table p859b partition of p859 for values in (2)",
+            "insert into p859 values (1)",
+            "insert into p859 values (2)",
+            "drop table p859",
+        ],
+    )
+    assert got == [
+        "DROP TABLE",
+        "ALTER TABLE",
+        "INSERT 0 1",
+        "CREATE TABLE",
+        "CREATE TABLE",
+        "CREATE TABLE",
+        "INSERT 0 1",
+        (
+            "error",
+            "23514",
+            # PostgreSQL names the leaf, `p859b`: RP-975.
+            'new row for relation "p859" violates check constraint "p859_tableoid_check"',
+            None,
+        ),
+        "DROP TABLE",
+    ]
 
 
 @pytest.mark.backlog_fixed("RP-860")
@@ -228,7 +270,7 @@ def test_a_whole_row_check_is_enforced(
     assert _script(dsn, statements) == expected
 
 
-@pytest.mark.backlog("RP-861")
+@pytest.mark.backlog_fixed("RP-861")
 @pytest.mark.parametrize(
     ("query", "expected"),
     [
@@ -248,8 +290,8 @@ def test_a_checks_qualified_column_is_resolved_against_its_table(
     """A CHECK's range table holds only its own table, so another table's
     name is 42P01 at the reference, and a missing column written with its
     qualifier is named with it (`errorMissingColumn`) at the reference's
-    start, on PostgreSQL 15.19. Here the first table is created and the
-    second error names `"nosuch"` at the column."""
+    start, on PostgreSQL 15.19. The first table was created here and the
+    second error named `"nosuch"` at the column."""
     assert _answer(dsn, query) == expected
 
 
@@ -265,4 +307,39 @@ def test_a_system_column_in_a_generated_column_is_42p10(dsn: str) -> None:
         "42P10",
         'cannot use system column "xmin" in column generation expression',
         "54",
+    )
+
+
+@pytest.mark.backlog("RP-974")
+def test_a_checks_regclass_of_its_own_table_resolves_at_create(dsn: str) -> None:
+    """`cookConstraint` runs after `heap_create_with_catalog`, so a CHECK
+    may name its own table by `regclass`: `create table t816 (x int, check
+    (tableoid = 't816'::regclass))` is CREATE TABLE on PostgreSQL 15.19.
+    Here it is 42P01 `relation "t816" does not exist` at 14."""
+    assert _answer(dsn, "create table t816 (x int, check (tableoid = 't816'::regclass))") == (
+        "CREATE TABLE"
+    )
+
+
+@pytest.mark.backlog("RP-975")
+def test_a_partitions_check_violation_names_the_leaf(dsn: str) -> None:
+    """`ExecConstraints` reports the leaf partition's result relation: a
+    row routed through `p974` into `p974b` that fails a CHECK is 23514
+    `new row for relation "p974b" ...` on PostgreSQL 15.19. Here it names
+    the partitioned table, `p974`."""
+    got = _script(
+        dsn,
+        [
+            "drop table if exists p974",
+            "create table p974 (x int check (x < 2)) partition by list (x)",
+            "create table p974b partition of p974 for values in (2)",
+            "insert into p974 values (2)",
+            "drop table p974",
+        ],
+    )
+    assert got[3] == (
+        "error",
+        "23514",
+        'new row for relation "p974b" violates check constraint "p974_x_check"',
+        None,
     )

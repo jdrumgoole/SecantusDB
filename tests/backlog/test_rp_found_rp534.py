@@ -48,7 +48,7 @@ def answer(dsn: str, query: str) -> Any:
 # A domain may be over a composite type (PostgreSQL 11 on), a table's row
 # type included, and its values are rows: `type_is_rowtype` is true of the
 # domain, so a null test over a column of it reads the fields, as it does
-# over the composite itself. Here `create domain dfs as fs` is 42704 `type
+# over the composite itself. Until RP-538 `create domain dfs as fs` was 42704 `type
 # "fs" does not exist`.
 DOMAIN_OVER_COMPOSITE = {
     "select k is null, k is not null from fd": [
@@ -62,7 +62,7 @@ DOMAIN_OVER_COMPOSITE = {
 }
 
 
-@pytest.mark.backlog("RP-538")
+@pytest.mark.backlog_fixed("RP-538")
 @pytest.mark.parametrize("query", list(DOMAIN_OVER_COMPOSITE))
 def test_domain_over_a_table_row_type(query: str, dsn: str) -> None:
     assert answer(dsn, query) == DOMAIN_OVER_COMPOSITE[query]

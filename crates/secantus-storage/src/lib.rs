@@ -395,6 +395,9 @@ pub struct UserTransactionHandle {
     /// entry): what its commit is recorded as touching ([`NS_COMMITS`]).
     written_ns: Vec<WrittenNs>,
     unattributed: bool,
+    /// The catalog documents it wrote, logged at its commit
+    /// ([`CatalogDocChange`]).
+    catalog_docs: CatalogDocWrites,
     /// [`COLL_TABLE_GEN`] just before the transaction's snapshot was taken:
     /// while it is still current, the registry this snapshot sees is the
     /// one every other session sees too (see `is_timeseries`).
@@ -5439,6 +5442,10 @@ pub struct Storage {
     desc_cache: std::sync::RwLock<CatalogCache<Vec<IndexDesc>>>,
     options_cache: std::sync::RwLock<CatalogCache<Document>>,
     list_cache: std::sync::RwLock<CatalogCache<Vec<Document>>>,
+    /// Which collections of one database hold an index of each name: the
+    /// relation-name lookup [`Self::index_owners`] answers from, kept
+    /// current from the index catalog's change log (RP-928).
+    index_names: Mutex<Option<IndexNameIndex>>,
     /// Dirty budget for one multi-document transaction: ~15% of the cache
     /// (0.75 x WT's ~20% dirty-eviction trigger, the shape of mongod's
     /// `TransactionTooLargeForCache` threshold). A transaction's dirty
@@ -6503,7 +6510,199 @@ thread_local! {
     static STMT_OPLOG_NS: RefCell<Vec<WrittenNs>> = const { RefCell::new(Vec::new()) };
     /// The statement transaction wrote something no collection accounts for.
     static STMT_UNATTRIBUTED: Cell<bool> = const { Cell::new(false) };
+    /// The catalog documents the same statement transaction wrote.
+    static STMT_CATALOG_DOCS: RefCell<CatalogDocWrites> = RefCell::new(CatalogDocWrites::default());
 }
+
+/// One change of a catalog collection's documents (a collection named
+/// `__...`), as [`Storage::catalog_doc_changes_since`] reports it: the
+/// document with `_id` `id` of `(db, coll)` was inserted, replaced or
+/// deleted, or -- `id` `None` -- any of `(db, coll)`'s documents may have
+/// changed (every collection of `db` when `coll` is empty, every database's
+/// when `db` is too). PostgreSQL's `inval.c` keeps the same record: each
+/// committed transaction's changed catalog rows, by key, so a backend
+/// rebuilds only the cache entries they name (RP-911).
+#[derive(Clone, Debug, PartialEq)]
+pub struct CatalogDocChange {
+    pub db: String,
+    pub coll: String,
+    pub id: Option<Bson>,
+}
+
+impl CatalogDocChange {
+    /// Does it reach `(db, coll)`'s documents?
+    pub fn reaches(&self, db: &str, coll: &str) -> bool {
+        (self.db.is_empty() || self.db == db) && (self.coll.is_empty() || self.coll == coll)
+    }
+}
+
+/// The catalog documents one transaction wrote, logged at its commit.
+#[derive(Default, Debug)]
+struct CatalogDocWrites {
+    changes: Vec<CatalogDocChange>,
+    /// It wrote something whose catalog documents are not known (a command
+    /// naming a catalog collection, a write no entry attributes): its
+    /// commit counts as changing every catalog document.
+    unknown: bool,
+}
+
+impl CatalogDocWrites {
+    fn note_entry(&mut self, e: &OplogEntry, op: Option<&str>, name: Option<&str>) {
+        let Some((db, coll)) = name.and_then(|n| n.split_once('.')) else {
+            self.unknown = true;
+            return;
+        };
+        match op {
+            Some("i" | "u" | "d") => {
+                if !coll.starts_with("__") {
+                    return;
+                }
+                let holder = if op == Some("u") { "o2" } else { "o" };
+                let id = match e {
+                    OplogEntry::Doc(d) => d
+                        .get_document(holder)
+                        .ok()
+                        .and_then(|o| o.get("_id").cloned()),
+                    OplogEntry::Raw(r) => r
+                        .get_document(holder)
+                        .ok()
+                        .and_then(|o| o.get("_id").ok().flatten())
+                        .and_then(|v| Bson::try_from(v.to_raw_bson()).ok()),
+                };
+                self.changes.push(CatalogDocChange {
+                    db: db.to_string(),
+                    coll: coll.to_string(),
+                    id,
+                });
+            }
+            // A no-op names no document.
+            Some("n") => {}
+            Some("c") => self.note_command(e, db),
+            _ => self.whole(db, ""),
+        }
+    }
+
+    /// `(db, coll)`'s documents (every catalog collection of `db` when
+    /// `coll` is empty) may all have changed.
+    fn whole(&mut self, db: &str, coll: &str) {
+        self.changes.push(CatalogDocChange {
+            db: db.to_string(),
+            coll: coll.to_string(),
+            id: None,
+        });
+    }
+
+    /// A command entry: the catalog collections whose documents it can
+    /// change, read off its `o`. A collection's creation and its index
+    /// commands change no document; a drop or a rename changes all of the
+    /// collections it names; anything else counts as every catalog
+    /// collection of the database.
+    fn note_command(&mut self, e: &OplogEntry, db: &str) {
+        let first: Option<(String, Option<String>, Option<String>)> = match e {
+            OplogEntry::Doc(d) => d.get_document("o").ok().and_then(|o| {
+                let (k, v) = o.iter().next()?;
+                Some((
+                    k.clone(),
+                    v.as_str().map(str::to_string),
+                    o.get_str("to").ok().map(str::to_string),
+                ))
+            }),
+            OplogEntry::Raw(r) => r.get_document("o").ok().and_then(|o| {
+                let (k, v) = o.iter().next()?.ok()?;
+                Some((
+                    k.to_string(),
+                    v.as_str().map(str::to_string),
+                    o.get_str("to").ok().map(str::to_string),
+                ))
+            }),
+        };
+        let Some((cmd, arg, to)) = first else {
+            return self.whole(db, "");
+        };
+        match cmd.as_str() {
+            "create" | "createIndexes" | "dropIndexes" | "startIndexBuild" | "commitIndexBuild"
+            | "abortIndexBuild" | "collMod" => {}
+            "drop" => match arg {
+                Some(c) if !c.starts_with("__") => {}
+                Some(c) => self.whole(db, &c),
+                None => self.whole(db, ""),
+            },
+            "renameCollection" => {
+                for ns in [arg, to] {
+                    match ns.as_deref().and_then(|n| n.split_once('.')) {
+                        Some((_, c)) if !c.starts_with("__") => {}
+                        Some((d, c)) => self.whole(d, c),
+                        None => self.whole(db, ""),
+                    }
+                }
+            }
+            _ => self.whole(db, ""),
+        }
+    }
+
+    fn extend(&mut self, other: CatalogDocWrites) {
+        self.unknown |= other.unknown;
+        self.changes.extend(other.changes);
+    }
+
+    /// Log what a committed transaction wrote. `exact` is false when its
+    /// commit could not attribute its writes; `rows` are the collections it
+    /// wrote rows of, and a catalog collection among them that no entry
+    /// names counts as changed throughout.
+    fn log_committed(mut self, exact: bool, rows: &[(String, String)]) {
+        for (db, coll) in rows {
+            let coll = row_collection(coll);
+            if coll.starts_with("__") && !self.changes.iter().any(|c| c.db == *db && c.coll == coll)
+            {
+                self.changes.push(CatalogDocChange {
+                    db: db.clone(),
+                    coll: coll.to_string(),
+                    id: None,
+                });
+            }
+        }
+        if !exact || self.unknown {
+            self.changes = vec![CatalogDocChange {
+                db: String::new(),
+                coll: String::new(),
+                id: None,
+            }];
+        }
+        if self.changes.is_empty() {
+            return;
+        }
+        let mut log = catalog_doc_log().lock().unwrap_or_else(|e| e.into_inner());
+        for c in self.changes {
+            log.serial += 1;
+            let n = log.serial;
+            log.entries.push_back((n, c));
+            while log.entries.len() > CATALOG_DOC_LOG_MAX {
+                if let Some((old, _)) = log.entries.pop_front() {
+                    log.forgotten = old;
+                }
+            }
+        }
+    }
+}
+
+/// Every committed change of a catalog document, numbered in commit order.
+#[derive(Default)]
+struct CatalogDocLog {
+    serial: u64,
+    /// The number of the last change forgotten.
+    forgotten: u64,
+    entries: std::collections::VecDeque<(u64, CatalogDocChange)>,
+}
+
+fn catalog_doc_log() -> &'static Mutex<CatalogDocLog> {
+    static LOG: OnceLock<Mutex<CatalogDocLog>> = OnceLock::new();
+    LOG.get_or_init(|| Mutex::new(CatalogDocLog::default()))
+}
+
+/// More logged changes than this are forgotten, oldest first: a reader that
+/// fell further behind re-reads everything, as PostgreSQL resets the caches
+/// of a backend that falls behind its invalidation queue.
+const CATALOG_DOC_LOG_MAX: usize = 8192;
 
 /// Record what the oplog entries a write is emitting say it wrote: each
 /// insert / update / delete names its collection; any other entry (a
@@ -6512,11 +6711,13 @@ thread_local! {
 fn note_written_entries(entries: &[OplogEntry]) {
     let mut ns: Vec<WrittenNs> = Vec::new();
     let mut unattributed = false;
+    let mut catalog = CatalogDocWrites::default();
     for e in entries {
         let (op, name) = match e {
             OplogEntry::Doc(d) => (d.get_str("op").ok(), d.get_str("ns").ok()),
             OplogEntry::Raw(r) => raw_op_ns(r),
         };
+        catalog.note_entry(e, op, name);
         let changed = match op {
             Some("i") => false,
             Some("u" | "d") => true,
@@ -6537,6 +6738,7 @@ fn note_written_entries(entries: &[OplogEntry]) {
         // running on this thread, as `note_coll_table_write` uses it.
         let h = unsafe { &mut *hp };
         h.unattributed |= unattributed;
+        h.catalog_docs.extend(catalog);
         for (db, coll, changed) in ns {
             add_written(&mut h.written_ns, &db, &coll, changed);
         }
@@ -6545,8 +6747,10 @@ fn note_written_entries(entries: &[OplogEntry]) {
         // cannot be attributed, so make every commit on this thread global
         // until the statement scope resets it.
         STMT_UNATTRIBUTED.with(|u| u.set(true));
+        STMT_CATALOG_DOCS.with(|c| c.borrow_mut().unknown = true);
     } else {
         STMT_UNATTRIBUTED.with(|u| u.set(u.get() || unattributed));
+        STMT_CATALOG_DOCS.with(|c| c.borrow_mut().extend(catalog));
         STMT_OPLOG_NS.with(|w| {
             let mut w = w.borrow_mut();
             for (db, coll, changed) in ns {
@@ -8299,6 +8503,7 @@ impl Storage {
             desc_cache: std::sync::RwLock::new(HashMap::new()),
             options_cache: std::sync::RwLock::new(HashMap::new()),
             list_cache: std::sync::RwLock::new(HashMap::new()),
+            index_names: Mutex::new(None),
             txn_dirty_limit: (parse_cache_bytes(config) as f64 * 0.20 * 0.75) as u64,
             cache_bytes: parse_cache_bytes(config),
             oplog_shards_created,
@@ -8440,6 +8645,38 @@ impl Storage {
     /// changes it while the server runs; the next sweep applies it.
     pub fn set_oplog_max_entries(&self, n: usize) {
         self.prune_ctx.max_entries.store(n, Ordering::Relaxed);
+    }
+
+    /// The number of the last committed change of a catalog document
+    /// ([`CatalogDocChange`]): a reader records it BEFORE it reads, and
+    /// [`Storage::catalog_doc_changes_since`] names what moved after.
+    pub fn catalog_doc_serial(&self) -> u64 {
+        catalog_doc_log()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .serial
+    }
+
+    /// The catalog documents committed changes numbered above `since`
+    /// changed, and the number of the last, or `None` when the log no
+    /// longer reaches back to `since` (the reader re-reads everything).
+    /// Every change is logged after its commit and before the commit
+    /// returns, so a reader that sees a commit's effect in any other way
+    /// (a PostgreSQL-layer catalog version) finds its keys here.
+    pub fn catalog_doc_changes_since(&self, since: u64) -> Option<(u64, Vec<CatalogDocChange>)> {
+        let log = catalog_doc_log().lock().unwrap_or_else(|e| e.into_inner());
+        if log.forgotten > since || since > log.serial {
+            return None;
+        }
+        let mut out: Vec<CatalogDocChange> = log
+            .entries
+            .iter()
+            .rev()
+            .take_while(|(n, _)| *n > since)
+            .map(|(_, c)| c.clone())
+            .collect();
+        out.reverse();
+        Some((log.serial, out))
     }
 
     /// Whether this store keeps an oplog at all.
@@ -8680,10 +8917,16 @@ impl Storage {
         // enclosing scope's are kept aside and put back after.
         // Restored on drop: a statement transaction nested in another's
         // scope (`outside_user_transaction`) records its own writes only.
-        struct WrittenScope(Vec<(String, String)>, Vec<WrittenNs>, bool);
+        struct WrittenScope(
+            Vec<(String, String)>,
+            Vec<WrittenNs>,
+            bool,
+            CatalogDocWrites,
+        );
         impl Drop for WrittenScope {
             fn drop(&mut self) {
                 STMT_UNATTRIBUTED.with(|u| u.set(self.2));
+                STMT_CATALOG_DOCS.with(|c| *c.borrow_mut() = std::mem::take(&mut self.3));
                 STMT_WRITTEN.with(|w| *w.borrow_mut() = std::mem::take(&mut self.0));
                 STMT_OPLOG_NS.with(|w| *w.borrow_mut() = std::mem::take(&mut self.1));
             }
@@ -8692,6 +8935,7 @@ impl Storage {
             STMT_WRITTEN.with(|w| std::mem::take(&mut *w.borrow_mut())),
             STMT_OPLOG_NS.with(|w| std::mem::take(&mut *w.borrow_mut())),
             STMT_UNATTRIBUTED.with(|u| u.replace(false)),
+            STMT_CATALOG_DOCS.with(|c| std::mem::take(&mut *c.borrow_mut())),
         );
         session.begin_transaction(None)?;
         match f() {
@@ -8738,6 +8982,14 @@ impl Storage {
                     }
                     return Err(e.into());
                 }
+                // Committed: what it wrote of the catalog is logged before
+                // anything after the statement can read it (RP-911).
+                STMT_CATALOG_DOCS
+                    .with(|c| std::mem::take(&mut *c.borrow_mut()))
+                    .log_committed(
+                        self.enable_oplog && self.async_oplog.is_none(),
+                        &STMT_WRITTEN.with(|w| w.borrow().clone()),
+                    );
                 if async_mode {
                     // Committed: mint seqs for the buffered entries and hand them
                     // to the drainer (which persists them + wakes tailers).
@@ -11497,6 +11749,7 @@ impl Storage {
             deferred_keys: BTreeMap::new(),
             written_ns: Vec::new(),
             unattributed: false,
+            catalog_docs: CatalogDocWrites::default(),
             registry_gen: 0,
             planner_gen: None,
             catalog_epoch: 0,
@@ -11945,6 +12198,18 @@ impl Storage {
                     return Err(e.into());
                 }
                 LAST_COMMIT_TS.with(|t| t.set(first_ts.map(u64_ts)));
+                // What it wrote of the catalog, logged before the commit
+                // returns to anything that could read past it (RP-911).
+                {
+                    let rows = handle
+                        .held
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .collections
+                        .clone();
+                    std::mem::take(&mut handle.catalog_docs)
+                        .log_committed(self.enable_oplog && self.async_oplog.is_none(), &rows);
+                }
                 if let Some(end) = handle.minted_ranges.iter().map(|r| r.1).max() {
                     note_logged(end);
                 }
@@ -11994,6 +12259,7 @@ impl Storage {
     /// Roll back the transaction's WT session, then **close** it. Idempotent;
     /// best-effort rollback (closing the session also rolls back).
     pub fn rollback_user_transaction(&self, handle: &mut UserTransactionHandle) -> Result<()> {
+        handle.catalog_docs = CatalogDocWrites::default();
         self.rollback_user_transaction_inner(handle, true)
     }
 
@@ -16321,6 +16587,154 @@ impl Storage {
             cache.insert(key, (read_at, Arc::clone(&list)));
         }
         Ok(list)
+    }
+
+    /// The collections of `db` holding a stored index named `name` (never
+    /// `_id_`), name-sorted. PostgreSQL finds a clashing relation by name
+    /// through `pg_class`'s name index (`get_relname_relid`); listing every
+    /// collection's indexes instead made each `CREATE TABLE` grow with the
+    /// schema (RP-928). The index is kept as PostgreSQL keeps a syscache:
+    /// each change of the index catalog is numbered and logged, a lookup
+    /// re-reads only the collections changed since it last read, and one
+    /// that fell behind the log is rebuilt from the catalog. Inside a
+    /// transaction the catalog is read directly, so its own DDL is seen.
+    pub fn index_owners(&self, db: &str, name: &str) -> Result<Vec<String>> {
+        self.with_index_names(db, |idx| idx.owners(name))
+    }
+
+    /// The collections of `db` that may hold a stored index other than
+    /// `_id_`: every one that holds one, and every one whose index catalog
+    /// changed while it was not yet registered. A collection outside it
+    /// holds none, so a reader deriving every table's index relations reads
+    /// no index list for it (RP-911), as PostgreSQL's `RelationGetIndexList`
+    /// is answered from the relcache entry rather than a catalog scan.
+    pub fn indexed_collections(&self, db: &str) -> Result<HashSet<String>> {
+        self.with_index_names(db, |idx| {
+            idx.by_coll
+                .keys()
+                .chain(idx.unregistered.iter())
+                .cloned()
+                .collect()
+        })
+    }
+
+    /// `f` over `db`'s index-name map, brought current (see
+    /// [`Self::index_owners`]).
+    fn with_index_names<R>(&self, db: &str, f: impl FnOnce(&IndexNameIndex) -> R) -> Result<R> {
+        let session = self.op_session()?;
+        let Some(gen) = self.planner_shared_gen(&session) else {
+            let built = self.build_index_names(&session, db, 0)?;
+            return Ok(f(&built));
+        };
+        let mut guard = self.index_names.lock().unwrap_or_else(|e| e.into_inner());
+        // Numbered before the reads: a change numbered after it may be one
+        // they missed, and is re-read next time.
+        let now = INDEX_CATALOG_SERIAL.load(Ordering::SeqCst);
+        let current = match guard.take() {
+            Some(idx) if idx.db == db => self.refresh_index_names(idx, now)?,
+            _ => None,
+        };
+        let idx = match current {
+            Some(idx) => idx,
+            None => self.build_index_names(&session, db, now)?,
+        };
+        let out = f(&idx);
+        if planner_settled() == Some(gen) {
+            *guard = Some(idx);
+        }
+        Ok(out)
+    }
+
+    /// Every stored index of `db`, read from the catalog table.
+    fn build_index_names(&self, session: &Session, db: &str, now: u64) -> Result<IndexNameIndex> {
+        let mut idx = IndexNameIndex {
+            db: db.to_string(),
+            read_at: now,
+            ..IndexNameIndex::default()
+        };
+        let cur = session.open_cursor(IDX_TABLE, None)?;
+        cur.set_key_sss(db, "", "");
+        let mut more = match cur.search_near() {
+            Ok(cmp) => cmp >= 0 || cur.next()?,
+            Err(e) if e.is_not_found() => false,
+            Err(e) => return Err(e.into()),
+        };
+        let mut rows: HashMap<String, Vec<String>> = HashMap::new();
+        while more {
+            let (d, c, name) = cur.get_key_sss()?;
+            if d != db {
+                break;
+            }
+            rows.entry(c).or_default().push(name);
+            more = cur.next()?;
+        }
+        for (coll, names) in rows {
+            if collection_registered(session, db, &coll)? {
+                idx.set(coll, names);
+            }
+        }
+        // A collection whose index catalog changed while it is not yet
+        // registered (created inside a transaction still open) commits
+        // with no further change: it is re-read until it is.
+        let changes = index_catalog_changes()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        for (d, c) in changes.keys() {
+            if d == db && !idx.by_coll.contains_key(c) && !collection_registered(session, db, c)? {
+                idx.unregistered.insert(c.clone());
+            }
+        }
+        Ok(idx)
+    }
+
+    /// `idx` brought up to `now` from the change log, or `None` when it
+    /// fell behind the log or a reset (the caller rebuilds).
+    fn refresh_index_names(
+        &self,
+        mut idx: IndexNameIndex,
+        now: u64,
+    ) -> Result<Option<IndexNameIndex>> {
+        if INDEX_CATALOG_RESET.load(Ordering::SeqCst) > idx.read_at {
+            return Ok(None);
+        }
+        let mut changed: BTreeSet<String> = std::mem::take(&mut idx.unregistered);
+        if now != idx.read_at {
+            // Every change numbered up to `now` is logged once the change
+            // map's lock is held: each is numbered and logged under it.
+            let _numbering = index_catalog_changes()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let log = index_catalog_log()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if log.0 > idx.read_at {
+                return Ok(None);
+            }
+            for (n, d, c) in log.1.iter().rev() {
+                if *n <= idx.read_at {
+                    break;
+                }
+                if *d == idx.db {
+                    changed.insert(c.clone());
+                }
+            }
+        }
+        let session = self.op_session()?;
+        for coll in changed {
+            let names: Vec<String> = self
+                .list_indexes_shared(&idx.db, &coll)?
+                .iter()
+                .filter_map(|ix| ix.get_str("name").ok())
+                .filter(|n| *n != ID_INDEX_NAME)
+                .map(str::to_string)
+                .collect();
+            if !collection_registered(&session, &idx.db, &coll)? {
+                idx.unregistered.insert(coll.clone());
+            }
+            idx.set(coll, names);
+        }
+        idx.read_at = now;
+        Ok(Some(idx))
     }
 
     /// [`Self::list_indexes`], read from the catalog.
@@ -26279,11 +26693,77 @@ fn index_catalog_changes() -> &'static Mutex<HashMap<(String, String), u64>> {
     CHANGES.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+/// The most recent changes of the index catalog, in number order, for
+/// [`Storage::index_owners`], with the number of the last one forgotten.
+type IndexCatalogLog = (u64, std::collections::VecDeque<(u64, String, String)>);
+
+fn index_catalog_log() -> &'static Mutex<IndexCatalogLog> {
+    static LOG: OnceLock<Mutex<IndexCatalogLog>> = OnceLock::new();
+    LOG.get_or_init(|| Mutex::new((0, std::collections::VecDeque::new())))
+}
+
+/// More logged changes than this are forgotten, oldest first: a lookup that
+/// fell further behind rebuilds.
+const INDEX_CATALOG_LOG_MAX: usize = 4096;
+
+/// [`Storage::index_owners`]'s index of one database's index names.
+#[derive(Default)]
+struct IndexNameIndex {
+    db: String,
+    /// The change number it is current to.
+    read_at: u64,
+    by_name: HashMap<String, BTreeSet<String>>,
+    by_coll: HashMap<String, Vec<String>>,
+    /// Collections re-read on every lookup until registered.
+    unregistered: BTreeSet<String>,
+}
+
+impl IndexNameIndex {
+    fn set(&mut self, coll: String, names: Vec<String>) {
+        for old in self.by_coll.remove(&coll).unwrap_or_default() {
+            if let Some(owners) = self.by_name.get_mut(&old) {
+                owners.remove(&coll);
+                if owners.is_empty() {
+                    self.by_name.remove(&old);
+                }
+            }
+        }
+        if names.is_empty() {
+            return;
+        }
+        for n in &names {
+            self.by_name
+                .entry(n.clone())
+                .or_default()
+                .insert(coll.clone());
+        }
+        self.by_coll.insert(coll, names);
+    }
+
+    fn owners(&self, name: &str) -> Vec<String> {
+        self.by_name
+            .get(name)
+            .map(|s| s.iter().cloned().collect())
+            .unwrap_or_default()
+    }
+}
+
 fn note_index_catalog_change(db: &str, coll: &str) {
     let mut changes = index_catalog_changes()
         .lock()
         .unwrap_or_else(|e| e.into_inner());
     let n = INDEX_CATALOG_SERIAL.fetch_add(1, Ordering::SeqCst) + 1;
+    {
+        let mut log = index_catalog_log()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        log.1.push_back((n, db.to_string(), coll.to_string()));
+        while log.1.len() > INDEX_CATALOG_LOG_MAX {
+            if let Some((old, _, _)) = log.1.pop_front() {
+                log.0 = old;
+            }
+        }
+    }
     if changes.len() >= INDEX_CATALOG_CHANGES_MAX {
         changes.clear();
         INDEX_CATALOG_RESET.fetch_max(n, Ordering::SeqCst);

@@ -1124,86 +1124,115 @@ one beside it.
       a table with no key, unique constraint or index of its own skipped
       before any oid lookup in the index relations, and the oid map built
       only when a table has one (2026-11-13: the republication per catalog
-      version at about 800 tables, sampled, from 3.4 ms to 2.6 ms). What is
-      left, measured at 800 tables (debug build, 2026-11-13): the
-      republication (a `SELECT 1` straight after DDL) costs about 2.0 ms
-      more than with none -- the composite catalog read afresh and compared
-      (`committed_type_catalog_docs`, first read by `publish_tableoids`,
-      about 0.6 ms), the table catalog read and compared
-      (`committed_table_defs`, 0.3 ms), each table's index list
-      (`list_indexes_shared`, 0.2 ms), the relations for `regclass`
-      (`relations`, 0.4 ms) and the inheritance (0.1 ms); and the query's
-      own catalog reads after it, about 1.2 ms more. A per-table memo of the index relations by
-      the identity of their inputs was measured slower than deriving them
-      (its map work per version cost more than tables with no index). The
-      faithful end state keys the published state per relation and
-      invalidates what a statement changed; a user relation's entries
-      depend on more than its own catalog row (its grants, its inheritance
-      parents and children, the foreign keys naming it, the types its
-      columns name), so each key has to carry them, or a stale entry is a
-      wrong answer. Its gap test is a timing ratio and can pass once by
-      noise: a `gate_pg.sh` backlog step on 2026-11-13 (load average ~18)
-      reported it `FIXED?`, then it failed three of three runs alone (0.015 s
-      against 0.0117 s, the bar 1.1x). Rerun it alone before closing.
+      version at about 800 tables, sampled, from 3.4 ms to 2.6 ms); a
+      table's index list read only when the storage's index-name map
+      (RP-928's, kept current from the index catalog's change log) says it
+      holds an index, and the relations for `regclass` listed at a
+      statement's first relation lookup (2026-11-15: a `SELECT 1` straight
+      after a `CREATE TABLE` at 800 tables, median of a loop, from 8.1 ms
+      to 4.0 ms; the collation query's gap ratio from 0.017/0.013 s to
+      0.013/0.010 s); the composite and table catalogs patched from the
+      storage's catalog key log (`Storage::catalog_doc_changes_since`:
+      each committed `__`-collection document write's `_id`, read off its
+      oplog entry and logged at commit, as `inval.c` queues the catalog
+      rows a transaction changed), so the statement after DDL re-reads
+      only the documents its commit changed (2026-11-15: their full reads
+      and decodes gone from a profile at 800 tables; the gap ratio, best
+      of five, from 16.6/13.7 ms to 12.5/10.4 and 15.0/12.2 ms, one run
+      in three under the bar; a loop's median 16.3 ms at 800 against
+      15.8 ms with none). What is left, sampled at 800 tables (debug
+      build, 2026-11-15), each a pass over every relation per catalog
+      version, about 2 ms in all: `publish_user_types` republishing every
+      table's row type, `install_session_state`'s per-table
+      closures and `inheritance`, `patch_table_defs` copying the 800
+      definitions' stored bytes, and `relation_oids` listing every
+      relation at the collation query's `regclass` lookup. (A per-table
+      memo of the index relations by the identity of their inputs was
+      measured slower than deriving them, 2026-11-13.) The faithful
+      end state keys the published state per relation and invalidates
+      what the key log names; a user relation's entries depend on more
+      than its own catalog row (its grants, its inheritance parents and
+      children, the foreign keys naming it, the types its columns name),
+      so each key has to carry them, or a stale entry is a wrong answer.
+      Its gap test is a timing ratio and can pass once by noise (a
+      `gate_pg.sh` backlog step on 2026-11-13 reported it `FIXED?`, then
+      it failed three of three runs alone): rerun it alone before closing.
+      (2026-11-15: whether the session holds a temp relation, for its temp
+      namespace, no longer lists every relation -- it forced the deferred
+      `regclass` list on every statement after DDL; a temp sequence is
+      flagged when the list is deferred. The gap test then passed five of
+      ten alone, and RP-928's eight of ten, at a load average near 14.)
+      (2026-11-15, after RP-928's `relation_oid` became a keyed lookup:
+      still five of ten alone at a load average near 12. A `sample` of a
+      `CREATE TABLE` loop at 800 tables, debug build, put the statement
+      start's republication at about half the samples: `patch_table_defs`
+      copying every definition (~10%), `publish_user_types`' index
+      relations (~6%), its `relations_derivation` temp check and the
+      `session_has_temp` scans (~4% each), `inheritance` (~3%). Each is a
+      linear pass, none quadratic, so what is left is the per-relation
+      keying above, not another lookup to swap in.)
+      (2026-11-15, in a pg-batch lane, cause of the spread unknown: it passed
+      in two of four runs, so the remainder sits at its tenth's edge; a
+      FIXED? from one run is not a fix, and a close needs it to pass
+      every run.)
       Backlog-ID: RP-911
       Verify: tests/backlog/test_rp_catalog_latency.py::test_the_first_catalog_query_after_ddl_costs_the_same_at_800_tables_within_a_tenth
 
-## Found by a profile (2026-11-13)
+## Found while working RP-908 (2026-11-15)
 
-- [ ] **OPEN — `CREATE TABLE` still grows with the number of tables.**
-      A debug `secantusd-pg` takes about 1.2 ms with no other table and
-      5.9 ms with 800 (2026-11-13, after RP-921); PostgreSQL 15.19 takes
-      0.41 ms and 0.37 ms (private cluster), finding a clashing relation
-      by name through `pg_class`'s name index (`get_relname_relid`). The
-      statement's checks that the name is free list every composite type
-      (`composites()`) and every table's stored indexes
-      (`all_index_docs`, every table name read from the raw catalog while
-      the statement runs), so each grows with the schema. The faithful fix
-      is a lookup by name in a relation-name index, as `pg_class` keeps
-      one.
-      Verify: tests/backlog/test_rp_catalog_latency.py::test_create_table_costs_the_same_at_800_tables_within_a_tenth
-      Backlog-ID: RP-928
+- [ ] **EXPLAIN of a NOT EXISTS prints a filtered Seq Scan, not PostgreSQL's
+      Hash Anti Join.** `select * from e where not exists (select 1 from e
+      e2 where e2.a = e.a)` is, in PostgreSQL 15.19, `Hash Anti Join
+      (cost=27.50..46.25 rows=1 width=7)` on `(e.a = e2.a)`, the Hash over
+      a Seq Scan of `e2` of width 4 (`convert_EXISTS_sublink_to_join`);
+      here a Seq Scan on e with a `Filter`. Its rows are right. The anti
+      cost (`hash_anti_join_of` in `scan_estimate.rs`, RP-908) is there to
+      reuse once the sublink is pulled up into a join. Measured on a
+      private 15.19 cluster.
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a not exists over an equality is a hash anti join]
+      Backlog-ID: RP-980
+- [ ] **A LEFT join on an expression key whose WHERE keeps only the
+      unmatched rows prints a Nested Loop Left Join, not a Hash Anti
+      Join.** `select * from e left join e e2 on e.a = e2.a + 1 where e2.a
+      is null` is, in PostgreSQL 15.19, `Hash Anti Join
+      (cost=27.50..133.88 rows=500 width=14)` on `(e.a = (e2.a + 1))`;
+      here a `Nested Loop Left Join` with `Filter: (e2.a IS NULL)` and
+      zero costs (and under ANALYZE its scans print no actuals). RP-908
+      recognises the anti join only where the ON is strict through a bare
+      key (`left_anti_key`); an expression key is neither hashed here nor
+      priced as one (`eqjoinsel_semi` over an expression has no
+      statistics: `rows=500` is its 0.5 default). Measured on a private
+      15.19 cluster.
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a left join on an expression key where the nullable side is null is a hash anti join]
+      Backlog-ID: RP-981
 
-## Found while working RP-921 (2026-11-13)
+## Found while working RP-911 (2026-11-15)
 
-- [ ] **OPEN — a partition's copy of a user-named index keeps the
-      parent's name.** `CREATE INDEX p_ab ON p (a, b)` on a partitioned
-      `p`, then `CREATE TABLE p_1 PARTITION OF p ...`: PostgreSQL 15.19
-      names the copy `p_1_a_b_idx` (`DefineIndex` picks a fresh name over
-      the key columns, `ChooseRelationName`); `secantusd-pg` answers
-      `p_1_ab`, the parent index's name with the parent table's prefix
-      swapped for the partition's (`partition_index`). The swap happens to
-      agree for the default names (`p_pkey`, `p_b_key`, `p_c_idx`).
-      Verify: tests/backlog/test_rp_found_rp921.py::test_a_partitions_copy_of_a_named_index_is_named_by_its_columns
-      Backlog-ID: RP-930
+- [ ] **OPEN — `CREATE TYPE pg_temp.t AS (...)` makes no type in the temp
+      schema.** PostgreSQL 15.19 creates the composite in the session's
+      temp namespace (making it): `'pg_temp.t'::regtype` resolves, its
+      `typnamespace` is `pg_my_temp_schema()`, and that is no longer 0.
+      `secantusd-pg` answers 42704 `type "pg_temp.t" does not exist` to
+      the cast.
+      Verify: tests/backlog/test_rp_qualified_calls.py::test_standalone_temp_composite_is_in_the_temp_schema
+      Backlog-ID: RP-971
 
-- [ ] **OPEN — psql's `\d` column query straight after DDL builds all of
-      `pg_type` for a table of two column types.** The collation subquery
-      (`tests/backlog/test_rp_catalog_latency.py`'s `COLLATION_QUERY`) over
-      a table `(a int, b text)`, first after its `CREATE TABLE`: PostgreSQL
-      15.19 takes 0.35 ms with no other table and 0.33 ms with 800 (private
-      cluster, 2026-11-13); a debug `secantusd-pg` about 0.016 s with none
-      and 0.10 s with 800. `virtual_rows` builds one keyed read per catalog
-      per message cycle, and a second key in the cycle (the second column's
-      type) builds every row: every table's row type, each with its owner
-      from all of `pg_class` (`relation_owners`). PostgreSQL reads one
-      `pg_type` row per column through the oid index (`SearchSysCache`),
-      for as many keys as a statement asks. A table whose columns share one
-      type (the RP-911 test's) never reaches the second build.
-      Backlog-ID: RP-927
-      Verify: tests/backlog/test_rp_catalog_latency.py::test_the_first_catalog_query_after_ddl_over_two_column_types_costs_the_same_at_400_tables
+## Found while working RP-927 (2026-11-14)
 
-## Found while working RP-923 (2026-11-13)
-
-- [ ] **OPEN — an index outside `public` cannot be renamed.** `ALTER INDEX
-      s.ix RENAME TO ix2`, and `ALTER INDEX ix RENAME TO ix2` with `s` on
-      the search path, rename the index of a table in schema `s` on
-      PostgreSQL 15.19; `secantusd-pg` answers 42P01 `relation "s.ix" does
-      not exist` for both (2026-11-13). `rename_index` matches the target
-      against the bare index name, so a schema-qualified target never
-      matches, and the bare one reaches it already qualified.
-      Backlog-ID: RP-933
-      Verify: tests/backlog/test_rp_found_rp923.py::test_an_index_outside_public_can_be_renamed
+- [ ] **OPEN — psql's `\d` column query straight after DDL builds every
+      user type for a column of a user type.** The collation subquery
+      (`COLLATION_QUERY`) over a table `(a e1, b e2)` of two user enums,
+      first after its `CREATE TABLE`: PostgreSQL 15.19 takes 0.15 ms with
+      no other table and 0.22 ms with 400 (private cluster); a debug
+      `secantusd-pg` 22 ms and 79 ms. Since RP-927 a `pg_type` key of a
+      built-in oid builds alone, but a user type's key builds every enum,
+      composite (every table's row type) and range (`build_catalog_rows`'s
+      `user_types`), and a second user key in a message cycle builds every
+      row. PostgreSQL reads the one row through the oid index
+      (`SearchSysCache`): the faithful fix builds a user key's row from
+      that type's catalog entry alone.
+      Verify: tests/backlog/test_rp_catalog_latency.py::test_the_first_catalog_query_after_ddl_over_two_user_types_costs_the_same_at_400_tables
+      Backlog-ID: RP-970
 
 ## Found while working RP-929 (2026-11-14)
 
@@ -1756,20 +1785,6 @@ a regression test.
       working RP-354).
       Verify: tests/backlog/test_rp_explain_costs.py::test_plan[nested loop into a weakly correlated index], tests/backlog/test_rp_explain_costs.py::test_plan[nested loop of few rows into a weakly correlated index], tests/backlog/test_rp_explain_costs.py::test_a_wide_range_over_a_weakly_correlated_index
       Backlog-ID: RP-926
-- [ ] **A nested loop's Join Filter keeps the ON's written order.**
-      PostgreSQL 15.19 orders a join's qual list cheapest first
-      (`order_qual_clauses`, by `cost_qual_eval`, stable among equal
-      costs): `select * from e left join e e2 on e.a <> e2.a and
-      e.a::text <> '5' and e.a = 5` (`e` 1,000 analysed rows) prints
-      `Join Filter: ((e.a <> e2.a) AND (e.a = 5) AND ((e.a)::text <>
-      '5'::text))`, the cast's two functions after the one-operator
-      conjuncts; here the conjuncts are printed as written. The same for
-      arithmetic (`on e.a + 1 + 1 <> e2.a and e.a <> e2.a` puts `(e.a <>
-      e2.a)` first). The costs and rows match. A lone scan's Filter is
-      RP-406, a joined scan's RP-398. Measured on a private 15.19 cluster
-      (found while working RP-354).
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a nested loop's join filter in cost order]
-      Backlog-ID: RP-924
 - [ ] **A join of three tables by inequalities runs in its written
       order, and a WHERE's join clauses all run at the top join.**
       PostgreSQL's `standard_join_search` picks the order of an inner join
@@ -1787,43 +1802,6 @@ a regression test.
       working RP-354).
       Verify: tests/backlog/test_rp_explain_costs.py::test_plan[nested loop of three relations joined in another order], tests/backlog/test_rp_explain_costs.py::test_plan[nested loop of three relations by a where]
       Backlog-ID: RP-919
-- [ ] **The upper join of three tables prints its clauses in the ON's
-      order, not PostgreSQL's.** `build_joinrel_restrictlist` lists a
-      join's clauses from the lower join's tables' join lists, the first
-      table's clauses before the second's: PostgreSQL 15.19 prints `select
-      * from e join e e2 on e.a < e2.a join e e3 on e2.a < e3.a and e.a <
-      e3.a` with the top Nested Loop's `Join Filter: ((e.a < e3.a) AND
-      (e2.a < e3.a))`; here `((e2.a < e3.a) AND (e.a < e3.a))`. The costs and
-      rows match. Measured on a private 15.19 cluster (found while working
-      RP-354).
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[nested loop of three relations with two clauses above]
-      Backlog-ID: RP-920
-- [ ] **EXPLAIN prints no estimate for a LEFT join whose ON restricts
-      its nullable side beside an inequality into its index.** PostgreSQL
-      15.19 plans `explain select * from e left join k on e.a < k.a and
-      k.a <> 2` (both tables 1,000 analysed rows, `k.a` the primary key)
-      as `Nested Loop Left Join (cost=0.28..10320.00 rows=333000
-      width=14)` over `Index Scan using k_pkey on k (cost=0.28..6.98
-      rows=333 width=7)` with `Index Cond: (a > e.a)` and `Filter: (a <>
-      2)`; here the join prints zeros over two plain Seq Scans, `k`'s
-      Filter `(a <> 2)` and the join's `Join Filter: (e.a < k.a)`. An ON
-      conjunct over the preserved side is estimated (RP-354); one over
-      the nullable side alone is a restriction of the inner, which the
-      nested-loop estimate does not take. Measured on a private 15.19
-      cluster (found while working RP-354).
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[nested loop left join with an on restriction of its nullable side]
-      Backlog-ID: RP-918
-- [ ] **A comparison of real and double precision prints a cast
-      PostgreSQL does not make.** `real <> double precision` is the
-      cross-type operator `float48ne` (and `<`, `=`, ... likewise), which
-      takes both operands as they are; the plan here coerces the real
-      side first: PostgreSQL 15.19 prints `explain (costs off) select *
-      from fr where r <> f` (`r real`, `f float8`) with `Filter: (r <>
-      f)`, here `Filter: ((r)::double precision <> f)`. The values
-      compared are the same. Measured on a private 15.19 cluster (found
-      while working RP-354).
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[comparison of real and double precision]
-      Backlog-ID: RP-917
 - [ ] **EXPLAIN ANALYZE of a nested loop into an index on an expression
       of the outer row prints no actual rows.** Its estimate is right, but
       the actual-row count of a parameterized inner scan is only worked
@@ -1897,41 +1875,6 @@ a regression test.
       Verify: tests/backlog/test_rp_explain_costs.py::test_plan[nested loop left join with a function call in its join filter]
       Backlog-ID: RP-910
 
-- [ ] **EXPLAIN of a LEFT join whose WHERE keeps only the unmatched rows
-      prints a Left Join, not an Anti Join.** `reduce_outer_joins` turns a
-      LEFT join whose WHERE tests a column of the nullable side that the
-      ON makes strict `IS NULL` into `JOIN_ANTI`: PostgreSQL 15.19 prints
-      `select * from e left join e e2 on e.a <> e2.a where e2.a is null` as
-      `Nested Loop Anti Join (cost=0.00..65.00 rows=1 width=14)` with no
-      Filter, the inner side Materialized, and the same over `e.a = e2.a`
-      as `Hash Anti Join (cost=27.50..46.25 rows=1 width=14)`. Here each is
-      a Left Join with `Filter: (e2.a IS NULL)` above it and zero costs.
-      Its rows are right. Measured on a private 15.19 cluster (found while
-      working RP-354).
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a left join where the nullable side is null is an anti join], tests/backlog/test_rp_explain_costs.py::test_plan[a left join on an equality where the nullable side is null is an anti join]
-      Backlog-ID: RP-908
-- [ ] **A LEFT join reduced to an inner one keeps its ON's one-sided
-      conjunct in its Join Filter.** A WHERE that rejects the nullable
-      side's NULLs makes the LEFT join inner (`reduce_outer_joins`), and
-      PostgreSQL 15.19 then pushes an ON conjunct over one side to that
-      side's scan: `select * from e left join e e2 on e.a <> e2.a and e.a
-      > 990 where e2.b = 'v1'` is a Nested Loop with `Join Filter: (e.a <>
-      e2.a)` over `Seq Scan on e e2` (`Filter: (b = 'v1'::text)`) and a
-      Materialize of `Seq Scan on e` with `Filter: (a > 990)`. Here the
-      Join Filter keeps `(e.a > 990)` and `e`'s scan reads every row. An
-      inner join written as such already pushes it. Its rows are right.
-      Measured on a private 15.19 cluster (found while working RP-354).
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a left join reduced to inner pushes its one-sided on conjunct]
-      Backlog-ID: RP-902
-- [ ] **A BETWEEN among a join's ON conjuncts prints as one nested AND.**
-      PostgreSQL 15.19 expands `a BETWEEN x AND y` into two comparisons
-      and flattens them into the join's qual list: `select * from e left
-      join e e2 on e.a <> e2.a and e.a between 10 and 20` is `Join Filter:
-      ((e.a <> e2.a) AND (e.a >= 10) AND (e.a <= 20))`; here `((e.a <>
-      e2.a) AND ((e.a >= 10) AND (e.a <= 20)))`. The estimate is right.
-      Measured on a private 15.19 cluster (found while working RP-354).
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a between among a join's on conjuncts is flattened]
-      Backlog-ID: RP-903
 
 - [ ] **EXPLAIN ANALYZE's scan counters PostgreSQL prints that are still
       left out.** Since RP-383 a user table's heap pages carry the
@@ -1948,6 +1891,14 @@ a regression test.
       bitmap past `work_mem`, whose
       pages go lossy (`Heap Blocks: exact=... lossy=...`). Measured on a
       private 15.19 cluster (found while working RP-383).
+      Sized 2026-11-15: `user_index_ctids` (lib.rs) refuses any heap with
+      `has_dead_entries`, and the heap model keeps no index entries: a
+      dead non-HOT version's key is not recorded (`Xmax` holds only the
+      row's `_id`, and the update may have changed the key), and nothing
+      models `_bt_killitems` -- PostgreSQL's first scan fetches the dead
+      entry (`Heap Fetches: 2`) and kills it, so a second scan prints 1.
+      The fix is an index-entry model (key per version, killed bit,
+      removed by VACUUM's index pass), persisted beside the heap.
       Backlog-ID: RP-384
       Verify: tests/backlog/test_rp_explain_costs.py::test_plan[analyze of an index-only scan over a dead version]
 - [ ] **EXPLAIN ANALYZE prints no counts below most other joins.** Since
@@ -1961,70 +1912,53 @@ a regression test.
       `Rows Removed by Filter` (`select * from s join e on s.a < e.a where
       e.b = 'v1'`), as PostgreSQL 15.19 counts them, and since RP-403 a
       Hash Join's and a parameterized Nested Loop's outer Seq Scans theirs
-      too. Still unannotated: a LEFT join filter over a char(n) column
-      (`cc left join s on cc.b < s.c`, `b char(4)`: `Seq Scan on cc
-      (actual rows=30 loops=1)`), a LEFT join with a WHERE (unpriced too,
-      RP-379), a parameterized inner index scan with its own Filter, a
-      Merge Join (its Sorts' `Sort Method`), a hash table past `hash_mem`
-      (several batches), a join with an inner-unique inner side, and the
-      joins below the top one of a chain of three or more tables (`z join
-      z z2 on z.a < z2.a join z z3 on z2.a < z3.a`, `z` twenty rows: only
-      the top Nested Loop prints `actual rows` and `Rows Removed by Join
-      Filter`; PostgreSQL's lower Nested Loop is `(actual rows=190
-      loops=1)`, its Materialize `(actual rows=20 loops=20)`, and a
-      Memoize over an index scan its `Hits: 171  Misses: 19` line).
+      too, and since 2026-11-15 a LEFT join filter over a char(n)
+      column and a chain of plain Nested Loops over Seq Scans (`z join z
+      z2 on z.a < z2.a join z z3 on z2.a < z3.a`), and since 2026-11-15
+      a chain whose top join's inner side is a Memoize over an index scan
+      (`z join z z2 on z.a < z2.a join kz on z2.a < kz.a`). Still
+      unannotated: a LEFT join with a WHERE (unpriced too, RP-379), a
+      parameterized inner index scan with its own Filter, a Merge Join (its
+      Sorts' `Sort Method`), a hash table past `hash_mem` (several
+      batches), and a join with an inner-unique inner side. A chain whose
+      lower join is a Hash Join (`z join kz on z.a = kz.a join z z2 on
+      z2.a < kz.a`) is counted since 2026-11-15, but is not priced: the
+      join search does not take its `<` clause, so the top join's inner
+      Seq Scan prints without the Materialize PostgreSQL 15.19 puts over
+      it (`Materialize (actual rows=20 loops=20)`).
       Measured on a private 15.19 cluster (found while working RP-386,
       the chain while working RP-354).
+      Sized 2026-11-15: `nest_loop_chain_estimate` (scan_estimate.rs)
+      admits only inner joins with no hash or merge clause (`inner_join`
+      refuses a non-empty `equi`), so the Materialize needs the join
+      search to build hash-join paths for a level's relations
+      (`hash_inner_and_outer`) beside its nested loops, then price the
+      top nested loop's inner through `cost_material`.
       Backlog-ID: RP-390
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[analyze of a left nested loop over a char(n) join filter], tests/backlog/test_rp_explain_costs.py::test_plan[analyze of a nested loop of three relations], tests/backlog/test_rp_explain_costs.py::test_plan[analyze of a nested loop of three relations into a memoized index]
-- [ ] **An inner join nested in an outer join keeps its one-table ON
-      conjuncts in its Join Filter.** Since RP-391 / RP-392 an inner
-      join's ON conjunct over one table is that table's scan Filter, but
-      only for joins reached from the FROM through inner joins. PostgreSQL
-      15.19's `distribute_qual_to_rels` places an inner join's qual the
-      same below an outer join: `select * from s left join (e join k on
-      e.a > 998 and k.a = e.a) on true` runs `Filter: (a > 998)` on `Seq
-      Scan on e`; here the Hash Join keeps `Join Filter: (e.a > 998)`. Its
-      rows are right. Measured on a private 15.19 cluster (found while
-      working RP-392).
-      Backlog-ID: RP-393
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[analyze of an inner join under an outer join with a one-table ON conjunct]
-- [ ] **A LEFT join's ON conjunct over a table inside an inner join on its
-      nullable side stays in its Join Filter.** Since RP-395 an outer
-      join's ON conjunct over its nullable side runs in that side's scan
-      when the side is one table. PostgreSQL 15.19's
-      `distribute_qual_to_rels` also pushes it through inner joins on that
-      side: `select * from s left join (e join k on e.a < k.a) on s.a = e.a
-      and k.b = 'v3'` is a `Hash Right Join` whose `Seq Scan on k` has
-      `Filter: (b = 'v3'::text)`; here the Hash Left Join keeps `Join
-      Filter: (k.b = 'v3'::text)` and no estimate. Its rows are right. Not
-      through a lower outer join's nullable side, where PostgreSQL keeps it
-      at the join too. Measured on a private 15.19 cluster (found while
-      working RP-395).
-      Backlog-ID: RP-397
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a left join's ON conjunct over a table of an inner join it null-extends]
-- [ ] **A joined scan's Filter keeps its conjuncts in written order.** A
-      lone scan prints them in PostgreSQL's order (`qual_order`, RP-348:
-      an equality to a constant after the rest, then by cost), but a
-      join's scan does not: `select * from s join e on s.a < e.a where e.b
-      = 'v3' and e.a > 5` prints `Filter: ((b = 'v3'::text) AND (a > 5))`,
-      where PostgreSQL 15.19 prints `((a > 5) AND (b = 'v3'::text))`. The
-      same for a LEFT join that the WHERE reduces to an inner one, whose
-      ON conjunct over the nullable side leads its scan's Filter (RP-395).
-      Measured on a private 15.19 cluster (found while working RP-395).
-      Backlog-ID: RP-398
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a joined scan's filter puts its equality to a constant last]
-- [ ] **A join whose WHERE equates a column to two constants still scans.**
-      PostgreSQL 15.19 finds the equivalence class contradictory and plans
-      no scan: `select * from s join e on s.a < e.a where e.b = 'v1' and
-      e.b = 'v2'` is `Result` with `One-Time Filter: false`, and a LEFT
-      join's ON doing the same (`on s.a < e.a and e.b = 'v1' and e.b =
-      'v2'`) gates the nullable side's scan under a `Result`. Here a lone
-      scan does it (RP-350), but a join's scan prints `Filter: ((b =
-      'v1'::text) AND (b = 'v2'::text))`. Its rows are right. Measured on a
-      private 15.19 cluster (found while working RP-395).
-      Backlog-ID: RP-400
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a join whose where equates a column to two constants]
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[analyze of a nested loop over a hash join]
+- [ ] **A join nested in an outer join prints no estimate, and its join
+      order and method are not PostgreSQL's.** Since 2026-11-15 an inner
+      join's one-table ON conjuncts under an outer join, and an outer
+      join's ON conjunct over one table of an inner join on its nullable
+      side, run in their tables' scans (RP-393, RP-397), and where the join
+      search keeps the written order the plan prints as PostgreSQL 15.19's
+      does (`s left join (e join s s2 on e.a = s2.a) on s.a = e.a and s2.c =
+      'xx'`). But every node of such a plan prints `cost=0.00..0.00 rows=0
+      width=0`, and the join is not searched: `select * from s left join (e
+      join k on e.a > 998 and k.a = e.a) on true` is, in PostgreSQL, a
+      `Nested Loop Left Join` over a `Materialize` of a `Nested Loop` into
+      `Index Scan using k_pkey on k` (`Index Cond: (a = e.a)`,
+      cost=0.28..36.16 rows=60); here a Hash Join of two Seq Scans with no
+      Materialize, and under ANALYZE no actual block below the top join.
+      `select * from s left join (e join k on e.a < k.a) on s.a = e.a and
+      k.b = 'v3'` is PostgreSQL's `Hash Right Join` with `s` hashed and a
+      `Materialize` over `k`; here a `Hash Left Join` hashing the inner
+      join. The same inner join alone (`e join k on k.a = e.a where e.a >
+      998`) prints no estimate either: a range on the join key of a hash
+      join is not priced. Its rows are right. Measured on a private 15.19
+      cluster (found while working RP-393 and RP-397).
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[analyze of an inner join under an outer join with a one-table ON conjunct], tests/backlog/test_rp_explain_costs.py::test_plan[a left join's ON conjunct over a table of an inner join it null-extends]
+      Backlog-ID: RP-978
 - [ ] **A LEFT join on an indexed key prints a Hash join where PostgreSQL
       merges through the index.** `select * from s left join k on s.a =
       k.a` (`k.a` the primary key) is, in PostgreSQL 15.19, a `Merge Right
@@ -2036,20 +1970,48 @@ a regression test.
       sorted input is an index scan. Its rows are right; the order they
       come out in may not be. Measured on a private 15.19 cluster (found
       while working RP-395).
+      Sized 2026-11-15 (working RP-908): the join IS weighed against a
+      merge through `k_pkey` -- `hash_join_of` (both the joined-rows and
+      the narrow path reach it) calls `unique_key_other_paths`, which
+      builds the merge paths through `JoinRel::add_paths_general` -- but
+      those merges read every input WHOLE: no `mergejoinscansel` is applied
+      to an index-ordered input, so the index scan costs its full 43.27
+      where PostgreSQL's merge stops at `k.a = 30` (outer end fraction
+      ~0.03: 0.28 + 2.04 startup, 4.13 total), and the 20.73 hash wins.
+      The fix is `initial_cost_mergejoin`'s scan fractions in the general
+      merge paths (shared with the multi-table search in `join_search.rs`,
+      so expect pinned plans to move), then a `JoinPick` for a merge with
+      one side presorted by its index, which `explain::price_merge_join`
+      draws with no Sort on that side. The same plan is wrong for `s join
+      k on s.a = k.a` (PostgreSQL: `Merge Join`, cost 2.31..4.13) and with
+      `where k.b = 'v1'` (`Merge Join` 2.31..3.86, its index scan
+      filtered); both print a priced Hash Join here.
       Backlog-ID: RP-401
       Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a left join on a primary key merges through its index]
-- [ ] **A join's equivalence classes keep a repeated conjunct.** A
-      one-table SELECT matches PostgreSQL 15.19 (`where a = 5 and a = 5` is
-      `Filter: (a = 5)`), a join does not. `select * from e, k where e.b =
-      k.b and e.b = k.b` prints `Hash Cond: ((e.b = k.b) AND (e.b = k.b))`
-      and prices both (`rows=10000`), where PostgreSQL's
-      `process_equivalence` finds the second redundant: `Hash Cond: (e.b =
-      k.b)`, `rows=100000`. A repeated `e.a = 5` is `Filter: ((a = 5) AND
-      (a = 5))` on e's scan, priced twice (`cost=0.00..20.00`; PostgreSQL
-      `Filter: (a = 5)` at `17.50`). The rows are right. Measured on a
-      private 15.19 cluster (found while working RP-388).
-      Backlog-ID: RP-402
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[comma join with a repeated join equality], tests/backlog/test_rp_explain_costs.py::test_plan[comma join with a repeated constant equality]
+- [ ] **A nested loop into an index prints no estimate where the inner
+      side's own range on the indexed key joins its Index Cond.**
+      PostgreSQL 15.19 plans `explain select * from e left join k on e.a <
+      k.a and k.a > 2` (`e`, `k` 1,000 analysed rows, `k.a` the primary
+      key) as `Nested Loop Left Join (cost=0.28..10320.00 rows=332667
+      width=14)` over `Index Scan using k_pkey on k (cost=0.28..6.98
+      rows=333 width=7)` with `Index Cond: ((a > e.a) AND (a > 2))`; here
+      zeros over two Seq Scans and a `Join Filter: (e.a < k.a)`. A `<>` of
+      the inner side's own is that scan's Filter since RP-918; a bound is
+      an index qual, which `costsize::param_range_index_scan` refuses
+      beside the join clause. Its rows are right. Measured on a private
+      15.19 cluster (found while working RP-918).
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[nested loop into an index with a range of the inner side]
+      Backlog-ID: RP-979
+- [ ] **A constant an equivalence class generates for a join's inner
+      index scan is a Filter, not its Index Cond.** `select * from e, k
+      where e.a = k.a and e.a = 5` (`k.a` the primary key) is, on
+      PostgreSQL 15.19, a Nested Loop whose `Index Scan using k_pkey on k`
+      has `Index Cond: (a = 5)` (`generate_base_implied_equalities` gives
+      k its own `k.a = 5`, which the index takes); here the same scan
+      prints `Filter: (a = 5)`. The costs and rows match. Measured on a
+      private 15.19 cluster (found while working RP-402).
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[an equivalence class's generated constant is the inner index's cond]
+      Backlog-ID: RP-977
 - [ ] **EXPLAIN prints no estimate for a scan filtered by a function
       call, a pattern over an expression, or a pattern over a table never
       analysed.** Since RP-404 a comparison of integer or text
@@ -2074,45 +2036,6 @@ a regression test.
       (found while working RP-404 and RP-354).
       Verify: tests/backlog/test_rp_explain_costs.py::test_plan[estimate of a function call compared with a constant], tests/backlog/test_rp_explain_costs.py::test_plan[estimate of a join over a scan filtered by a LIKE], tests/backlog/test_rp_explain_costs.py::test_plan[estimate of a LIKE over an expression], tests/backlog/test_rp_explain_costs.py::test_plan[estimate of a LIKE over a table never analysed], tests/backlog/test_rp_explain_costs.py::test_plan[estimate of a regex match over a table never analysed], tests/backlog/test_rp_explain_costs.py::test_plan[estimate of a join over a scan filtered by a regex match]
       Backlog-ID: RP-423
-- [ ] **A LIKE with an ESCAPE clause prints a `like_escape` call and is
-      not estimated.** PostgreSQL folds `like_escape(pattern, escape)` of
-      two constants into the pattern rewritten with the default escape
-      (`eval_const_expressions`), which `patternsel` then estimates:
-      PostgreSQL 15.19 prints `explain select * from e where b like 'v1!%'
-      escape '!'` (`e` analysed, 1000 rows) as `Seq Scan on e
-      (cost=0.00..17.50 rows=1 width=7)` with `Filter: (b ~~
-      'v1\%'::text)`; here `Filter: (b ~~ like_escape('v1!%'::text,
-      '!'::text))` and zero costs. The same in a nested loop's Join Filter.
-      Its rows are right. Measured on a private 15.19 cluster (found while
-      working RP-354).
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a like with an escape clause is a folded pattern]
-      Backlog-ID: RP-915
-- [ ] **A lone scan's Filter does not put an expression's conjunct
-      after a cheaper one.** PostgreSQL 15.19 orders a qual list cheapest
-      first (`order_qual_clauses`, by `cost_qual_eval`): `select * from e
-      where a + 1 > 996 and b = 'v1'` is `Filter: ((b = 'v1'::text) AND
-      ((a + 1) > 996))`, the expression's two operators after the
-      column's one. Here the conjuncts are printed as written (a join's
-      scan keeps the written order in other cases too, RP-398). Measured
-      on a private 15.19 cluster (found while working RP-403). The same
-      for an OR, which costs its operators (`a not between 15 and 55 and b
-      <> 'v3'` is `Filter: ((b <> 'v3'::text) AND ((a < 15) OR (a >
-      55)))`), and for a coerced column (`a between 1 and 5.5 and b <>
-      'v3'` puts `((a)::numeric <= 5.5)` after `(b <> 'v3'::text)`, the
-      cast a function call); here both keep the written order (found while
-      working RP-399).
-      Backlog-ID: RP-406
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a scan filter's conjuncts in cost order], tests/backlog/test_rp_explain_costs.py::test_plan[a scan filter's or after a cheaper conjunct]
-- [ ] **A constant coerced to its operator's type prints unfolded.**
-      PostgreSQL 15.19 folds the coercion of an integer literal compared
-      with a numeric before it prints the qual
-      (`eval_const_expressions`): `select * from e where a::numeric > 4`
-      is `Filter: ((a)::numeric > '4'::numeric)`; here `((a)::numeric >
-      (4)::numeric)`, alone or as a join's scan. A cast written on the
-      constant is folded already (RP-370). Measured on a private 15.19
-      cluster (found while working RP-405).
-      Backlog-ID: RP-407
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a scan filter's coerced constant is folded]
 - [ ] **A table whose only index is a composite one prices no scan of
       both its columns.** `create table t2 (a int, b int, c text)`, 5,000
       rows, `create index t2_ab on t2 (a, b)`, analysed: PostgreSQL 15.19
@@ -2138,34 +2061,6 @@ a regression test.
       cluster (found while working RP-399).
       Backlog-ID: RP-411
       Verify: tests/backlog/test_rp_explain_costs.py::test_plan[an in subquery is a hash semi join], tests/backlog/test_rp_explain_costs.py::test_plan[an exists subquery is a hash semi join]
-- [ ] **A NOT over an AND, an OR or a BETWEEN prints as written, not
-      pushed onto its arms.** PostgreSQL 15.19's `negate_clause` (during
-      `eval_const_expressions`) applies De Morgan and replaces each
-      operator by its negator: `select * from e where not (a > 15 or b =
-      'v3')` is `Filter: ((a <= 15) AND (b <> 'v3'::text))` and `not (a
-      between 15 and 55)` is `Filter: ((a < 15) OR (a > 55))`; here
-      `(NOT ((a > 15) OR (b = 'v3'::text)))` and `(NOT ((a >= 15) AND (a
-      <= 55)))`. An AND that comes out is then flattened into the scan's
-      quals, which can change the index conditions and the estimate. Its
-      rows are right. Measured on a private 15.19 cluster (found while
-      working RP-399). With a NULL arm the pushed-down AND is constant
-      false: `not (a > 1 or null)` is `Result` with `One-Time Filter:
-      false` there, a `Seq Scan` with `Filter: (NOT ((a > 1) OR
-      NULL::boolean))` here (found while working RP-409).
-      Backlog-ID: RP-412
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a not over an or is the and of its negated arms], tests/backlog/test_rp_explain_costs.py::test_plan[a not over a between is the or of its negators], tests/backlog/test_rp_explain_costs.py::test_plan[a not over an or with a null arm is a false one-time filter]
-- [ ] **A function in FROM leaves a missing column with no HINT.** Since
-      RP-408 a 42703 carries PostgreSQL's `errorMissingColumn` hint, but
-      only when every range table entry in reach has columns this server
-      can tell: a function in FROM has the columns of its result type,
-      which the hint's search does not know, so it gives none.
-      PostgreSQL 15.19: `select * from generate_series(1,2) g where gg =
-      1` hints `Perhaps you meant to reference the column "g.g".`, and
-      `select * from e, generate_series(1, 2) g where bb = 1` hints
-      `"e.b"`; here neither has a HINT. Measured on a private 15.19
-      cluster (found while working RP-408).
-      Backlog-ID: RP-413
-      Verify: tests/backlog/test_rp_column_errors.py::test_function_in_from_hint
 - [ ] **A missing column's 42703 names the wrong reference, or drops its
       qualifier.** PostgreSQL 15.19 reports the first missing column in
       the order it analyses the statement, by the name as written and at
@@ -2185,16 +2080,6 @@ a regression test.
       (found while working RP-408).
       Backlog-ID: RP-414
       Verify: tests/backlog/test_rp_column_errors.py::test_missing_column_reported_as_written
-- [ ] **A missing output column is reported after the WHERE's errors.**
-      PostgreSQL 15.19's `transformSelectStmt` transforms the target list
-      before the WHERE, so `select nosuch from e where 1`, `... where a =
-      true` and `... where 'x'` are each 42703 `column "nosuch" does not
-      exist` at 8; here the WHERE's 42804, 42883 or 22P02 comes first. The
-      FROM list, a JOIN's ON included, is analysed before both, which this
-      server already matches. Measured on a private 15.19 cluster (found
-      while working RP-424).
-      Verify: tests/backlog/test_rp_where_types.py::test_target_list_is_analysed_before_where
-      Backlog-ID: RP-429
 - [ ] **EXPLAIN of an UPDATE ... FROM or a DELETE ... USING prints a Seq
       Scan of the target alone.** The statement is rewritten into
       correlated subqueries over its FROM items (`rewrite_dml_from`), and
@@ -2223,42 +2108,6 @@ a regression test.
       private 15.19 cluster (found while working RP-432).
       Verify: tests/backlog/test_rp_dml_from.py::test_missing_column_reported_before_ambiguous_one
       Backlog-ID: RP-436
-- [ ] **An operator's type error is reported ahead of a missing column to
-      its left.** `select nosuch + (1 + true)` is 42883 `operator does not
-      exist: integer + boolean` here, from `optype` checking every operator
-      before the planner meets the column; PostgreSQL 15.19 analyses the
-      left operand first and answers 42703 `column "nosuch" does not exist`
-      at 8. The operator to the reference's LEFT already comes first on
-      both (`select (1 + true) + nosuch`). The same pass as RP-442. Measured
-      on PostgreSQL 15.19 (found while working RP-441).
-      Verify: tests/backlog/test_rp_fromless_analysis.py::test_missing_column_before_operator_to_its_right
-      Backlog-ID: RP-447
-- [ ] **A cast literal's input error is reported after the operator
-      around it.** PostgreSQL 15.19's `transformTypeCast` runs a constant's
-      input function as the cast is transformed, before `make_op` looks the
-      operator up, so `select 'x'::int = true` is 22P02 `invalid input
-      syntax for type integer: "x"` at 8, `select 1 = 'x'::uuid` 22P02 at
-      12 and `select '2020-13-01'::date = 1` 22008 at 8; here each is the
-      operator's 42883 (`integer = boolean`, `integer = uuid`, `date =
-      integer`), from `optype` checking operand types before any cast's
-      value is read. The same in a simple CASE (`case 'x'::uuid when 1`).
-      A lone cast is 22P02 on both. Measured on PostgreSQL 15.19 (found
-      while working RP-439).
-      Verify: tests/backlog/test_rp_fromless_analysis.py::test_cast_literal_input_error_before_operator
-      Backlog-ID: RP-442
-- [ ] **EXPLAIN reports its option's error ahead of a missing relation, a
-      missing function or a bad literal.** PostgreSQL 15.19 analyses the
-      statement before `ExplainQuery` reads an option, so `explain (bogus)
-      select * from nosuch` is 42P01, `explain (bogus) select nosuchfn(a)
-      from e` 42883 and `explain (bogus) select * from e where a = 'x'`
-      22P02; here each is 42601 `unrecognized EXPLAIN option "bogus"`.
-      Since RP-419 the operator-type, untyped-value and ORDER BY checks run
-      first; these are resolved while planning, after the options. A
-      planner-time error (`explain (bogus) select 1/0`) correctly stays
-      behind the option's. Measured on a private 15.19 cluster (found
-      while working RP-419).
-      Backlog-ID: RP-428
-      Verify: tests/backlog/test_rp_analysis_order.py::test_explain_resolves_names_before_options
 - [ ] **A node above a dummy relation prints no estimate, and a dummy
       join no width.** Since RP-409 a WHERE that folds to constant false
       plans a `Result` with `One-Time Filter: false`, costing nothing, as
@@ -2272,16 +2121,6 @@ a regression test.
       working RP-409).
       Verify: tests/backlog/test_rp_explain_costs.py::test_plan[an aggregate over a dummy relation is priced], tests/backlog/test_rp_explain_costs.py::test_plan[a dummy join keeps its width]
       Backlog-ID: RP-420
-- [ ] **A COALESCE's constant arguments print unfolded.** PostgreSQL
-      15.19's `eval_const_expressions` drops a COALESCE's NULL arguments
-      and stops at its first non-NULL constant: `select * from e where
-      coalesce(null, a) = 1` is `Filter: (COALESCE(a) = 1)`, and
-      `coalesce(1, a) = 1` folds to true, a `Seq Scan on e` with no Filter.
-      Here `(COALESCE(NULL::integer, a) = 1)` and `(COALESCE(1, a) = 1)`.
-      Its rows are right. Measured on a private 15.19 cluster (found while
-      working RP-409).
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a coalesce drops its null arguments], tests/backlog/test_rp_explain_costs.py::test_plan[a coalesce of a constant first folds]
-      Backlog-ID: RP-421
 - [ ] **EXPLAIN of a plain FROM-subquery prints a Subquery Scan
       PostgreSQL pulls up.** `pull_up_subqueries` merges a simple subquery
       into its parent: `select * from (select * from e where a > 5) s` is
@@ -2375,43 +2214,6 @@ Measured on a private PostgreSQL 15.19 cluster with `fe(a int, b text)`
 and `fs(a int, c text)`, one row each.
 
 
-## Found while working RP-444 (2026-11-07)
-
-- [ ] **A subquery inside an EXISTS subquery's select list is not
-      analysed.** `select exists (select (select nosuch))` and `select
-      exists (select 1 + (select nosuch))` answer `true` here; PostgreSQL
-      15.19's `transformSubLink` analyses the inner subquery with the rest
-      of the list, so each is 42703 `column "nosuch" does not exist` at 31
-      and 35. A statement PostgreSQL refuses runs. Since RP-444 a column
-      reference in the list, ORDER BY or DISTINCT ON is kept for the
-      planner when the subquery's own tables do not answer it; a nested
-      subquery cannot simply be kept, as it would then RUN (`exists (select
-      (select 1/0))` is `true` on PostgreSQL), so it needs an analysis that
-      plans without executing. Measured on PostgreSQL 15.19.
-      Verify: tests/backlog/test_rp_fromless_analysis.py::test_exists_target_subquery_is_analysed
-      Backlog-ID: RP-459
-
-## Found while working RP-455 (2026-11-07)
-
-- [ ] **A subquery inside a FROM-subquery is offered a sibling's alias as
-      its hint.** PostgreSQL 15.19 analyses a FROM-subquery that is not
-      LATERAL with the FROM items before it in its level's range table but
-      out of its namespace (`p_lateral_only`), so `select * from fe x,
-      (select (select fe.a)) s` and `select * from fe x, (select 1 where
-      exists (select fe.a)) s` are 42P01 `invalid reference to FROM-clause
-      entry for table "fe"` with the hint `There is an entry for table "x",
-      but it cannot be referenced from this part of the query.`; here the
-      hint is `Perhaps you meant to reference the table alias "x".`, an
-      alias the client cannot use there. `resolve_sublinks_in_select`
-      pushes the whole FROM, every item visible, onto `OUTER_RELATIONS` and
-      `OUTER_RANGE_LEVELS` before it resolves the FROM-subqueries, so
-      `missing_rte_hint` finds the alias visible; a LATERAL one may see only
-      the items to its left. (The EXISTS forms naming the sibling itself,
-      `exists (select x.a)`, answered rows when this was filed; RP-444 made
-      them 42P01.) Measured on PostgreSQL 15.19.
-      Verify: tests/backlog/test_rp_subquery_scope.py::test_from_subquery_sibling_is_not_visible
-      Backlog-ID: RP-460
-
 ## Found while working RP-451 (2026-11-07)
 
 Measured on a private PostgreSQL 15.19 cluster with `fe(a int, b text)` and
@@ -2425,49 +2227,9 @@ Measured on a private PostgreSQL 15.19 cluster.
 
 Measured on PostgreSQL 15.19 (the data-modifying WITH on a private cluster).
 
-- [ ] **What `transformWithClause` checks of a WITH is not all checked.**
-      Since RP-501 an unread item is planned without being run, so its
-      names and types are checked, but not: an unread item's literal input
-      (`with w as (select 'x'::int) select 1` is 22P02 at 19 there, `1`
-      here); an item of a WITH inside a subquery expression (`select (with
-      w as (select nosuch) select 1)`, 42703 at 27 there, `1` here); the
-      forward reference's HINT `Use WITH RECURSIVE, or re-order the WITH
-      items to remove forward references.`; an alias list longer than the
-      item's columns (`with w(x, y) as (select 1)`, 42P10 `WITH query "w"
-      has 1 columns available but 2 columns specified` at 6 there; here
-      42601 `table "w" ...` with no position when read, and nothing when
-      not); and a name given twice (42712 `WITH query name "w" specified
-      more than once` at the second, 25; here the first wins).
-      Verify: tests/backlog/test_rp_fromless_analysis.py::test_with_clause_checks
-      Backlog-ID: RP-504
 
 ## Found while working RP-486 (2026-11-07)
 
-- [ ] **A syntax error in a DO block the interpreter compiles carries no
-      position.** A body with a DECLARE section or a label is compiled by
-      the function interpreter, and its 42601 reaches the client with no
-      statement position: `do $$ declare x int; begin raise notice 'z' end
-      $$` is `syntax error at or near "end"` at 45 on PostgreSQL 15.19,
-      `do $$ <<blk>> begin raise notice 'z' end $$` the same at 38, and
-      `do $$ <<blk>> begin raise notice 'z'; end nope $$` `end label "nope"
-      differs from block's label "blk"` at 43. Here each message matches
-      and no position is sent. (The fast path for a plain `begin ... end`
-      body already points at the token.)
-      Verify: tests/backlog/test_rp_do_compile_errors.py::test_compile_error_has_a_position
-      Backlog-ID: RP-492
-
-## Found while working RP-463 (2026-11-07)
-
-- [ ] **An expression's error in a PL/pgSQL statement carries no QUERY and
-      no internal position.** `do $$ declare x int; begin raise notice '%',
-      nosuch.x; end $$` is 42P01 on both, but PostgreSQL 15.19 sends
-      `internal_query` `nosuch.x` and `internal_position` 1 (psql prints
-      `LINE 1: nosuch.x` and `QUERY:`); here neither field is sent. Called
-      as a function (`return nosuch.x` in `lbe()`), the error here instead
-      carries a statement position, 8, into `select lbe()`, where
-      PostgreSQL sends none. Measured on a private 15.19 cluster.
-      Verify: tests/backlog/test_rp_plpgsql_labels.py::test_expression_error_carries_its_query
-      Backlog-ID: RP-488
 
 ## Found while working RP-485 (2026-11-11)
 
@@ -2498,65 +2260,8 @@ Measured on PostgreSQL 15.19 (the data-modifying WITH on a private cluster).
       measured on PostgreSQL 15.19.
       Verify: tests/backlog/test_rp_qualified_calls.py::test_other_sessions_temp_schema_relation_is_named_as_written
       Backlog-ID: RP-965
-- [ ] **The session's temp namespace does not follow its transactions.**
-      PostgreSQL 15.19 makes `myTempNamespace` with the first temporary
-      object and forgets it when the transaction (or subtransaction) that
-      made it aborts (`AtEOXact_Namespace`). Here `pg_my_temp_schema()`
-      after `begin; create temp table tt(a int); rollback` is the
-      namespace's oid where PostgreSQL answers 0 (the session's list of temp
-      tables keeps the rolled-back name), and after `begin; create temp
-      table tt(a int); drop table tt; commit` the call `pg_temp.nosuch()` is
-      3F000 `schema "pg_temp" does not exist` where PostgreSQL answers 42883
-      (the namespace is latched only from a statement outside a
-      transaction, `install_temp_namespace`). Faithful: keep the namespace's
-      creating (sub)transaction, as `myTempNamespaceSubID` does. Measured on
-      a private 15.19 cluster.
-      Verify: tests/backlog/test_rp_qualified_calls.py::test_temp_namespace_follows_transactions
-      Backlog-ID: RP-883
 
 
-## Found while working RP-881 (2026-11-12)
-
-Measured on a private PostgreSQL 15.19 cluster. The gap tests are in
-`tests/backlog/test_rp_found_rp881.py`.
-
-- [ ] **CREATE TABLE IF NOT EXISTS over a table that exists checks its
-      columns.** PostgreSQL 15.19's `transformCreateStmt` finds the
-      relation first and answers with a NOTICE (`relation "t" already
-      exists, skipping`), looking at nothing else: `create table if not
-      exists t (a nosuchtype)`, `(a int, a int)` and `(a int default 'x')`
-      all succeed. Here they are 42704, 42701 and 22P02: the column types,
-      names and literal defaults are checked while planning, before the
-      executor looks for the table. (Since RP-881 the defaults' analysis
-      is skipped for such a statement, as PostgreSQL skips it.)
-      Verify: tests/backlog/test_rp_found_rp881.py::test_if_not_exists_over_a_table_checks_nothing
-      Backlog-ID: RP-887
-- [ ] **A DEFAULT's `nextval('nosuch_seq')` passes CREATE TABLE.**
-      `create table t (a int default nextval('nosuch_seq'))`
-      is 42P01 `relation "nosuch_seq" does not exist` at 42 on PostgreSQL
-      15.19: the literal is coerced to `nextval`'s `regclass` parameter
-      while the default is analysed, which runs `regclassin`. Here the
-      CREATE succeeds and the first INSERT fails. (An explicit
-      `'nosuch'::regclass` is already 42P01 at CREATE.)
-      Verify: tests/backlog/test_rp_found_rp881.py::test_a_regclass_literal_in_a_default_is_resolved
-      Backlog-ID: RP-888
-
-## Found while working RP-886 (2026-11-12)
-
-Measured on a private, freshly initdb'd PostgreSQL 15.19 cluster.
-
-- [ ] **A folded DEFAULT skips its column's length check.** `create table
-      t (a varchar(2) default 'abc', i int)` then `insert into t (i) values
-      (1)` is 22001 `value too long for type character varying(2)` on
-      PostgreSQL 15.19, and a `char(2)` column's `default 'xyz'` is 22001
-      `... character(2)`: the default is coerced to the column's type and
-      modifier when the INSERT runs it. Here both INSERTs succeed and store
-      the overlong value (`octet_length` 3): a constant default is folded
-      to a stored value at CREATE, and the value goes into the row without
-      the length coercion a written value gets. A `numeric(3,1)` default is
-      rounded, so the modifier reaches that type.
-      Verify: tests/backlog/test_rp_found_rp886.py::test_a_folded_default_is_coerced_to_its_column
-      Backlog-ID: RP-892
 ## Found while working RP-472 (2026-11-07)
 
 - [ ] **EXPLAIN of a user function in FROM prints no Function Scan.**
@@ -2572,17 +2277,18 @@ Measured on a private, freshly initdb'd PostgreSQL 15.19 cluster.
 
 ## Found while working RP-454 (2026-11-07)
 
-- [ ] **A FROM item named as a table an aliased JOIN hides is refused.**
-      An aliased JOIN hides its sides' names, so PostgreSQL 15.19 lets
-      another FROM item reuse one: `select * from (fs join fe using (a)) as
-      j, fs` and `select * from fs, (fs join fe using (a)) as j` each answer
-      their row. Here each is 0A000 `a FROM item named "fs" beside an
-      aliased JOIN that hides that name is not supported yet`: a joined row
-      is keyed by its table's alias (`alias<U+001F>column`), so the two `fs`
-      leaves would share their keys. Fixing it needs leaf keys that are not
-      the alias the query wrote.
-      Backlog-ID: RP-469
-      Verify: tests/backlog/test_rp_subquery_scope.py::test_hidden_join_name_reused
+- [ ] **A subquery or function named as a table an aliased JOIN hides is
+      refused.** PostgreSQL 15.19 answers `select * from (fs join fe using
+      (a)) as j, (select 2 as z) fs` with `(1, 'y', 'x', 2)`. Here it is
+      0A000 `a FROM item named "fs" beside an aliased JOIN that hides that
+      name is not supported yet`. RP-469 keyed each TABLE leaf of such a
+      name apart (`hidden_reused_names`, a `\u{1d}<n>` key base); a
+      subquery or function leaf still keys by the name it is written as
+      (`leaf_with_names`, the RangeSubselect / RangeFunction arms), so the
+      refusal stays for any name one of those carries.
+      Verify: tests/backlog/test_rp_subquery_scope.py::test_hidden_join_name_reused_by_subquery
+      Backlog-ID: RP-972
+
 - [ ] **EXPLAIN of an aliased JOIN prints no Hash Cond and keeps its WHERE
       above the join.** PostgreSQL flattens a join alias's columns to the
       sides' own (`flatten_join_alias_vars`), so `explain (costs off)
@@ -2595,92 +2301,28 @@ Measured on a private, freshly initdb'd PostgreSQL 15.19 cluster.
       Backlog-ID: RP-471
       Verify: tests/backlog/test_rp_subquery_scope.py::test_aliased_join_plan
 
-## Found while working RP-481 (2026-11-10)
-
-- [ ] **A USING list that names a column twice is not refused.**
-      PostgreSQL 15.19's `transformFromClauseItem` refuses `select * from
-      fs join fe using (a, a)` with 42701 `column name "a" appears more
-      than once in USING clause` (no position); here it runs and returns
-      the join's rows.
-      Verify: tests/backlog/test_rp_subquery_scope.py::test_using_clause_repeats_a_column
-      Backlog-ID: RP-857
-
 ## Found while working RP-479 (2026-11-08)
 
 Measured on a private PostgreSQL 15.19 cluster with `fs(a int, c text)`
 holding `(1, 'y')`.
 
 
-## Found while working RP-467 (2026-11-08)
+## Found while working RP-519 (2026-11-14)
 
-- [ ] **Two schemas' tables of one name are not `checkNameSpaceConflicts`'
-      exception.** PostgreSQL lets two unaliased FROM items share a name
-      when they are different relations (`select 1 from s1.t join s2.t on
-      true` runs, and only a `t.a` naming both is ambiguous), and refuses an
-      alias equal to another item's name (42712 `table name "t" specified
-      more than once`). Here the join of two unaliased `t` is that 42712,
-      since a joined row is keyed by the bare name, and `create view v as
-      select t.a from s1.t t join s2.t on s2.t.a = t.a` is accepted, its
-      definition then reading `t.a = t.a`. Measured on a private 15.19
-      cluster.
-      Backlog-ID: RP-526
-      Verify: tests/backlog/test_rp_found_rp467.py::test_same_name_relations_in_from
+Measured on a private PostgreSQL 15.19 cluster.
 
-## Found while working RP-528 (2026-11-08)
-
-Measured on a private PostgreSQL 15.19 cluster. The gap test is in
-`tests/backlog/test_rp_found_rp528.py`.
-
-- [ ] **A DROP naming a schema that does not exist reports the relation
-      missing.** PostgreSQL 15.19's `DropErrorMsgNonExistent` asks for the
-      schema first: `drop table nosch.t` (and `view`, `materialized view`,
-      `index`, `sequence`) is 3F000 `schema "nosch" does not exist`, and
-      under IF EXISTS the NOTICE is `schema "nosch" does not exist,
-      skipping`. Here each is the relation's own 42P01 / 42704 (`table
-      "nosch.t" does not exist`) or its skipping NOTICE. The planner keys a
-      qualified name in an unknown schema as `nosch.t`, which `split_key`
-      cannot tell from a quoted `"nosch.t"` in `public` (PostgreSQL reports
-      that one as a missing table): the fix needs the written schema from
-      the parse tree.
-      Verify: tests/backlog/test_rp_found_rp528.py::test_drop_in_a_missing_schema
-      Backlog-ID: RP-533
-
-## Found while working RP-514 (2026-11-08)
-
-Measured on a private PostgreSQL 15.19 cluster. The gap tests are in
-`tests/backlog/test_rp_found_rp514.py`.
-
-- [ ] **A built-in routine is not looked up among its overloads or its
-      kind.** PostgreSQL 15.19 looks a built-in up in `pg_proc` like any
-      routine: `grant execute on function lower to public` and `comment on
-      function lower is 'x'` are 42725 `function name "lower" is not unique`
-      (`comment on routine abs` says `routine name`), and `grant execute on
-      procedure abs(int)` and `comment on procedure abs(int)` are 42809
-      `abs(integer) is not a procedure`. Here the bare-name GRANT succeeds,
-      the PROCEDURE forms are 42883 `procedure abs(integer) does not exist`,
-      and every COMMENT ON a built-in routine is refused as 0A000 (PostgreSQL
-      records `comment on function abs(int)`). `function_acl_key`
-      (object_acl.rs) knows a built-in only by `is_known_function(name)`:
-      the fix needs the built-in's overloads, and a place to keep a
-      built-in's comment.
-      Verify: tests/backlog/test_rp_found_rp514.py::test_builtin_routine_resolved_by_its_overloads
-      Backlog-ID: RP-519
-
-## Found while working RP-516 (2026-11-08)
-
-Measured on a private PostgreSQL 15.19 cluster with `fe(a int, b text)`
-and `fs(a int, c text)`.
-
-- [ ] **A write's name error is reported away from the reference.**
-      PostgreSQL 15.19 positions each at the name as written. Here `update
-      fs x set c = fs::text` and `... where fs is null` are 42703 at 8 (the
-      target), not 21 / 31; `update fs set c = 'q' from fe e where e.a =
-      fs.a returning fe` is 42703 at 28 (the FROM item), not 60; and an
-      ambiguous bare column in an UPDATE ... FROM's or DELETE ... USING's
-      RETURNING (`returning a`) is 42702 with no position, not 59 / 53.
-      RP-414 has the reference's name and qualifier; this is where it is.
-      Backlog-ID: RP-524
-      Verify: tests/backlog/test_rp_subquery_scope.py::test_write_name_error_position
+- [ ] **A built-in routine has no initdb description.** PostgreSQL 15.19
+      answers `obj_description('abs(int)'::regprocedure, 'pg_proc')` with
+      initdb's `absolute value` (from `pg_proc.dat`'s `descr`), and every
+      built-in routine has its row in `pg_description`. Here a built-in has
+      none until a COMMENT ON FUNCTION gives it one (RP-519 stores those by
+      the overload's oid). Faithful: carry initdb's `pg_description` rows
+      for `pg_proc` in the built-in catalog facts, served until a COMMENT
+      replaces or (IS NULL) removes one, as `schema_comments` does for
+      `public`; the other catalogs' initdb descriptions (types, operators,
+      access methods) are the same gap.
+      Verify: tests/backlog/test_rp_found_rp514.py::test_builtin_routine_has_initdb_description
+      Backlog-ID: RP-969
 
 ## Found while working RP-527 (2026-11-08)
 
@@ -2699,22 +2341,6 @@ Measured on a private PostgreSQL 15.19 cluster. The gap tests are in
       Backlog-ID: RP-545
       Verify: tests/backlog/test_rp_found_rp527.py::test_missing_from_relation_reported_first
 
-## Found while working RP-530 (2026-11-08)
-
-Measured on a private PostgreSQL 15.19 cluster with `fs(a int, c text)`
-holding `(1, 'y')`, `create type ct as (x int)` and `create type ct2 as (x
-int)`. The gap tests are in `tests/backlog/test_rp_found_rp530.py`.
-
-- [ ] **An error a PREPARE's query raises carries the query's own offset.**
-      PREPARE plans the deparsed inner query, so a recorded location is an
-      offset into `SELECT ...`, honoured whenever a token of the PREPARE
-      text happens to start there: `prepare p1(int) as select 12 = true`
-      is 42883 at 30 on PostgreSQL 15.19 and at 11 here (the `(` of
-      `p1(int)`). An offset that lands on no token falls back to the text
-      search, which is why most look right.
-      Verify: tests/backlog/test_rp_found_rp530.py::test_prepare_error_position
-      Backlog-ID: RP-593
-
 ## Found while working RP-532 (2026-11-08)
 
 Measured on a private PostgreSQL 15.19 cluster with `fs(a int, c text)`
@@ -2722,56 +2348,24 @@ holding `(1, 'y')` twice, `(2, 'z')` and `(null, null)`, and `fk(k fs)`
 holding `row(null, null)`, `row(1, null)`, `row(1, 'a')` and `null`. The
 gap tests are in `tests/backlog/test_rp_found_rp532.py`.
 
-- [ ] **A relation name its alias hides is reported at the FROM item.**
-      Under `from fs x` the name `fs` names nothing, so PostgreSQL 15.19
-      reports `select count(*) from fs x group by fs` and `... order by fs`
-      as 42703 `column "fs" does not exist` at 36, the reference. Here the
-      first is positioned at 22 (the FROM item), and the second is 42803
-      `column "x.fs" must appear in the GROUP BY clause ...` at 22.
-      Backlog-ID: RP-537
-      Verify: tests/backlog/test_rp_found_rp532.py::test_alias_hides_relation_name
-
-## Found while working RP-557 (2026-11-08)
-
-Measured on a private PostgreSQL 15.19 cluster with `create domain d557 as
-char(3)` and `t557(c char(3), a d557)`. Each was wrong before RP-557's
-change too. The gap tests are in `tests/backlog/test_rp_found_rp557.py`.
-
-- [ ] **`min` / `max` over a `char(n)` column describe its width.** An
-      Aggref carries no modifier (`exprTypmod` has no case for it), so
-      `select min(c) from t557` and `select max(a) from t557` describe
-      `bpchar` -1 on PostgreSQL 15.19; here both are 7
-      (`aggregate_result_typmod` copies the column's). Since RP-671
-      `aggregate_output_def` carries the width too, as a FROM-subquery's
-      column, because it is what pads the trimmed value again: a fix must
-      keep the padding width and describe -1.
-      Verify: tests/backlog/test_rp_found_rp557.py::test_min_max_over_char_n_has_no_modifier
-      Backlog-ID: RP-659
-- [ ] **A set operation of a domain column and its base type keeps the
-      width.** `select a from t557 union select c from t557` (either order)
-      describes -1 on PostgreSQL 15.19: `select_common_type` smashes the
-      domain to `bpchar` and `select_common_typmod` finds the sides'
-      modifiers differ, the domain column's own being -1. Here it is 7.
-      Two sides of one type keep 7 in both.
-      Verify: tests/backlog/test_rp_found_rp557.py::test_set_op_of_a_domain_and_its_base_type
-      Backlog-ID: RP-660
 
 ## Found while working RP-590 (2026-11-08)
 
 Measured on a private PostgreSQL 15.19 cluster with the `_SETUP` in
 `tests/backlog/test_rp_found_rp590.py`.
 
-- [ ] **The `record_image` operators are refused.** `*=`, `*<>`, `*<`,
-      `*<=`, `*>` and `*>=` over two record values are `record_image_eq`
-      .. `record_image_ge` on PostgreSQL 15.19, which compare the fields'
-      binary images: `(select row(1.0)) *= (select row(1.00))` is `f` where
-      `=` is `t`, and `row(1, 'a')::ca *= row(1, 'a')::cd` is `t`. Between
-      two `ROW(...)` constructors the operator is applied field by field
-      (`make_row_comparison_op`), so `row(1) *= row(1)` is 42883 `operator
-      does not exist: integer *= integer` at 15. Here each is 0A000
-      `operator *= on these operands is not supported yet`.
-      Verify: tests/backlog/test_rp_found_rp590.py::test_record_image_operators
-      Backlog-ID: RP-650
+- [ ] **The `record_image` operators refuse most field types.** `*=` ..
+      `*>=` compare a record's fields by their binary images since RP-650,
+      but only for int2 / int4 / int8 / oid / bool / float4 / float8 /
+      numeric / text / varchar / bpchar / bytea fields. `(select
+      row('2024-01-02'::date)) *< (select row('2024-01-03'::date))` is `t`
+      on PostgreSQL 15.19 (a date is its int32 day number), and a uuid
+      compares its 16 bytes; here each is 0A000 `a record_image comparison
+      over a field of type date is not supported yet`. Every other type
+      needs its datum's image modelled (`record_image_cmp`: by-value words,
+      fixed-length by-reference bytes, varlena data).
+      Verify: tests/backlog/test_rp_found_rp590.py::test_record_image_over_other_field_types
+      Backlog-ID: RP-976
 
 ## Found while working RP-569 (2026-11-08)
 
@@ -2791,14 +2385,6 @@ char(3)`, `t657d(a d657c, i int)` holding `('a b', 1)` and `('xy', 2)`, and
 its domain through a join, a WITH, a FROM subquery and a set operation all
 of whose branches are of the domain (`domain_scope.rs`).
 
-- [ ] **A LATERAL subquery's column that is an outer domain column is typed
-      by the domain's base.** `select pg_typeof(b), array[b] from t657d x
-      cross join lateral (select x.a b) l` is `d657c` and `d657c[]`, with
-      the padding, on PostgreSQL 15.19; here `character` and `character[]`,
-      without it. The subquery's scope does not see the outer FROM item it
-      references, so its column's type is not known.
-      Verify: tests/backlog/test_rp_found_rp657.py::test_lateral_column_of_an_outer_domain_column_is_the_domains
-      Backlog-ID: RP-674
 
 ## Found while working RP-672 (2026-11-09)
 
@@ -2822,6 +2408,46 @@ Measured on a private PostgreSQL 15.19 cluster with the `_SETUP` in
       and an indexed `=` would separate them too. The faithful fix keeps
       the value as written and keys it by `bpchar`'s comparison (trailing
       blanks ignored), which reaches the storage keys: more than one PR.
+      Surveyed 2026-11-14 (no code changed): a sized `char(n)` stored
+      trimmed and padded on output is already PostgreSQL's answer, so only
+      the unsized column needs the as-written value. The trimmed form is
+      assumed at many sites that each need a `bpchar`-aware key instead:
+      `join_text_hash` (secantus-pg lib.rs), `coerce_to_column`'s
+      `bpchar[]` arm and `arrays.rs` equality, `hashpart.rs`,
+      `hashfn.rs` `hashbpchar`, `cmpfn.rs` `bpcharcmp`, and the sort-key
+      paths in lib.rs that trim before comparing. UNIQUE could reuse
+      `value_unique` / `check_collated_unique` (already used for jsonb and
+      nondeterministic collations); a PRIMARY KEY is `_id`, so it needs a
+      trimmed key with the as-written value kept in the row. Plan: (1)
+      keep blanks for unsized `bpchar` on write, plus UNIQUE through
+      `value_unique`; (2) a PK key; (3) GROUP BY / DISTINCT / indexed `=`.
+      Reviewed 2026-11-14 for a bundle session: step (1) cannot land
+      alone. Once the blanks are stored, a PK, GROUP BY, DISTINCT and an
+      indexed `=` over an unsized `bpchar` would separate `'k'` from
+      `'k '`, which is a wrong answer PostgreSQL never gives. (2) and (3)
+      have to land with it, or before it behind trimmed keys (in
+      `group_key_ident` at lib.rs ~2782, `join_text_hash`, and an `_id` key).
+      So the first PR should be the keys, which change no answer.
+      Probed 2026-11-14 (bundle session, no code changed): an expression
+      keeps the blanks already (`octet_length('ab  '::bpchar)` is 4 here
+      as on 15.19); only the stored cell loses them, at `cast_value`'s
+      `target == "bpchar"` arm (secantus-pgplan lib.rs ~40876), which trims
+      every `bpchar` cast, sized or not. GROUP BY / DISTINCT / PARTITION BY
+      already key a `bpchar` value trimmed (`typed_ident`, RP-725) and
+      `join_text_hash` trims, so those two keys are done. What remains
+      before the write can keep blanks: the `_id` key of a `bpchar`
+      PRIMARY KEY (trimmed key, as-written value kept in the row -- a
+      storage-layout change), UNIQUE through `value_unique`, and an
+      indexed `=` over a trimmed index key.
+      Re-read 2026-11-14 (second bundle session, no code changed): add to
+      that list the pushed-down `=` filter. `cast_value`'s comment says
+      equality "lowers to a filter against the stored value", so a
+      `where a = 'xy'` over a stored `'xy '` would miss in the MQL engine,
+      which compares strings exactly. The faithful shape is a `bpchar`
+      comparison that ignores trailing blanks in every key and filter
+      path (`bpchareq` / `bcTruelen`), not a trimmed copy of the value;
+      that is several PRs touching the stored row, so it needs its own
+      planned sequence, not a bundle slot.
       Verify: tests/backlog/test_rp_found_rp672.py::test_create_table_as_of_an_unsized_bpchar_keeps_its_blanks
       Backlog-ID: RP-693
 
@@ -2831,33 +2457,6 @@ Measured on a private PostgreSQL 15.19 cluster with the `_SETUP` in
 `tests/backlog/test_rp_found_rp665.py`: `t665(a d665, c dc665, b int)`
 over `create domain d665 as int` and `create domain dc665 as char(4)`.
 
-- [ ] **A CASE, COALESCE, GREATEST or LEAST over domain columns alone is
-      typed by the domain's base.** `select pg_typeof(coalesce(a, a)) from
-      t665` is `d665` on PostgreSQL 15.19, and so are `case when ... then a
-      else a end`, `greatest(a, a)` and `least(a, a)`; `coalesce(c, c)` is
-      `dc665` (`select_common_type` keeps a type every input shares
-      exactly, a domain included). Here each is `integer` (`character`).
-      Since RP-665 the common type keeps a domain every input is OF -- a
-      scalar subquery over one is -- but a bare domain column reaches a
-      `pg_typeof` as its domain only directly (`rewrite_domain_typeof`),
-      so inside these it is still of its stored base type.
-      Verify: tests/backlog/test_rp_found_rp665.py::test_common_type_of_domain_columns_alone_is_the_domain
-      Backlog-ID: RP-764
-
-## Found while working RP-656 (2026-11-08)
-
-Measured on a private PostgreSQL 15.19 cluster with the `_SETUP` in
-`tests/backlog/test_rp_found_rp656.py`: `t656(c char(3), v varchar(4), n
-numeric(5,2), ca char(3)[])` holding `('xy', 'ab', 2.5, '{a,bc}')`.
-
-- [ ] **An `ARRAY(select n ...)` over a `numeric(p,s)` column describes no
-      modifier.** `select array(select n from t656)` describes `numeric[]`
-      327686 on PostgreSQL 15.19 (`exprTypmod` of an ARRAY sublink is its
-      column's); here it is -1. Since RP-656 a `char(n)` or `varchar(n)`
-      column's array is cast at its modifier and describes it; a numeric
-      one is declared as `numeric[]`, which carries none.
-      Verify: tests/backlog/test_rp_found_rp656.py::test_array_sublink_of_numeric_describes_its_modifier
-      Backlog-ID: RP-667
 
 ## Found while working RP-682 (2026-11-11)
 
@@ -2875,21 +2474,6 @@ VALUES-only statements of `tests/backlog/test_rp_found_rp682.py`.
       aggregates' `aggkind`, which the planner does not keep.
       Verify: tests/backlog/test_rp_found_rp682.py::test_an_ordered_set_aggregate_over_a_window_is_refused
       Backlog-ID: RP-869
-
-## Found while working RP-870 (2026-11-12)
-
-Measured on PostgreSQL 15.19 (the shared reference on port 5415) with the
-VALUES-only statements of `tests/backlog/test_rp_found_rp870.py`.
-
-- [ ] **An aggregate called with the wrong number of arguments is a gap,
-      not a missing function.** `select stddev(v, v) from (values (1))
-      s(v)` is 42883 `function stddev(integer, integer) does not exist` on
-      PostgreSQL 15.19, and `corr(v)` is `function corr(integer) does not
-      exist`; here both are 0A000 `an aggregate with this many arguments is
-      not supported yet`, with or without OVER (`plan_aggregate_item`'s
-      argument-count check).
-      Verify: tests/backlog/test_rp_found_rp870.py::test_an_aggregate_with_the_wrong_arity_is_42883
-      Backlog-ID: RP-904
 
 ## Found while working RP-670 (2026-11-09)
 
@@ -2917,33 +2501,6 @@ dv687, c char(3))`, `d687` an `int` with `check (value > 0)` and `dv687` a
       Backlog-ID: RP-690
       Verify: none -- seen once, under load; a timing that does not fail on demand
 
-## Found while working RP-712 (2026-11-10)
-
-Measured on PostgreSQL 15.19 (port 5415) with statements that create
-nothing. The gap tests are in `tests/backlog/test_rp_found_rp712.py`.
-
-- [ ] **An assignment's overlong `varchar(n)` value is 22001 with no
-      assignment frame.** `declare x varchar(3); begin x := 'abcdef'::text;`
-      carries CONTEXT `PL/pgSQL assignment "x := 'abcdef'::text"` above the
-      `at assignment` line on PostgreSQL 15.19: the length coercion is part
-      of the assignment's query and folds as it is planned. Here only the
-      `at assignment` line is sent: `fit_assigned` raises outside the
-      framed query. The same holds for an element of a `varchar(3)[]`
-      (`x[1] := 'abcdef'`, framed `PL/pgSQL assignment "x[1] :=
-      'abcdef'"` on 15.19) and for a slice (`x[1:1] := array['abcd']`).
-      Verify: tests/backlog/test_rp_found_rp712.py::test_overlong_varchar_assignment_is_framed_by_the_assignment
-      Backlog-ID: RP-752
-- [ ] **An assignment's literal input error carries no internal query.**
-      `declare x int; begin x := 'abc';` is 22P02 with `internal_query` `x
-      := 'abc'` on PostgreSQL 15.19 (the literal is coerced as the
-      assignment is parsed); here no internal query is sent. The same class
-      as RP-488, in a shape its test does not reach. A `jsonb` literal is
-      another: `declare x jsonb; begin x := 'zz';` carries `x := 'zz'` as
-      its internal query and CONTEXT `JSON data, line 1: zz` then the `at
-      assignment` line on 15.19; here a `PL/pgSQL assignment "x := 'zz'"`
-      frame sits between them and no query is sent.
-      Verify: tests/backlog/test_rp_found_rp712.py::test_literal_input_error_in_an_assignment_carries_its_query
-      Backlog-ID: RP-753
 
 ## Found while working RP-750 (2026-11-14)
 
@@ -3006,41 +2563,12 @@ char(3)` and `t570(k int, t text, ta text[])` holding `(1, 'ab', '{ab}')`
 and `(2, 'abcd', '{abcd}')`. The gap tests are in
 `tests/backlog/test_rp_found_rp570.py`.
 
-- [ ] **A domain array literal's input error has no position.** `select
-      '{abcd}'::d570c[]` is 22001 at 8 on PostgreSQL 15.19 (`array_in` runs
-      `domain_in` while it reads the literal, as `'x'::int` is positioned
-      there); here the 22001 has no position. `positioned` places an error
-      by its SQLSTATE and message, and an assignment's 22001 has none.
-      Verify: tests/backlog/test_rp_found_rp570.py::test_domain_array_literal_error_position
-      Backlog-ID: RP-581
 
 ## Found while working RP-607 (2026-11-08)
 
 Measured on a private PostgreSQL 15.19 cluster with `create domain d607q
 as int`. The gap tests are in `tests/backlog/test_rp_found_rp607.py`.
 
-- [ ] **A domain over another domain's array type is refused.** `create
-      domain d607s as d607q[]` is made on PostgreSQL 15.19, with
-      `typbasetype` `d607q[]`, and `'{1,2}'::d607s::text` is `{1,2}`; here
-      the CREATE is 42704 `type "d607q[]" does not exist`: `create_domain`
-      knows a base by a built-in's name or a user type's, never a user
-      type's array. The DROP side follows such a domain already (RP-607).
-      Verify: tests/backlog/test_rp_found_rp607.py::test_domain_over_a_domain_array
-      Backlog-ID: RP-654
-
-## Found while working RP-658 (2026-11-08)
-
-Measured on a private PostgreSQL 15.19 cluster. The gap tests are in
-`tests/backlog/test_rp_found_rp658.py`.
-
-- [ ] **A composite type's attribute has `attndims` 0.** `create type c as
-      (p int[][], q int, r text[])` gives `p`, `q` and `r` 2, 0 and 1 in
-      PostgreSQL 15.19's `pg_attribute` (`DefineCompositeType` builds the
-      descriptor with `BuildDescForRelation`, which counts the written
-      bounds); here each is 0: the composite's stored fields keep only a
-      type name. A table column records them since RP-658.
-      Verify: tests/backlog/test_rp_found_rp658.py::test_composite_attribute_attndims
-      Backlog-ID: RP-663
 
 ## Found while working RP-612 (2026-11-14)
 
@@ -3056,20 +2584,6 @@ Measured on PostgreSQL 15.19; none of it needs DDL. The gap tests are in
       `oidvectortypes` is `format_type` of each oid joined by `, `.
       Verify: tests/backlog/test_rp_found_rp612.py::test_oidvector_hash_and_types
       Backlog-ID: RP-957
-
-## Found while working RP-529 (2026-11-08)
-
-Measured on a private PostgreSQL 15.19 cluster with `create domain dc3 as
-char(3)`, `create domain dc3n as dc3` and the rest of the `_SETUP` in
-`tests/backlog/test_rp_found_rp529.py`.
-
-- [ ] **`ALTER COLUMN TYPE` to a domain over the column's type is
-      refused.** `alter table falt alter column a type pint`, `a int` and
-      `pint` a domain over `int`, retypes the column on PostgreSQL 15.19
-      (an implicit cast to the domain, no USING needed); here it is 42804
-      `column "a" cannot be cast automatically to type pint`.
-      Backlog-ID: RP-556
-      Verify: tests/backlog/test_rp_found_rp529.py::test_alter_column_type_to_domain
 
 ## Found while working RP-552 (2026-11-14)
 
@@ -3121,16 +2635,6 @@ Measured on a private PostgreSQL 15.19 cluster with `fs(a int, c text)`,
 `create domain dfs as fs` and `fd(k dfs)` holding `row(null, null)`,
 `row(1, null)`, `row(1, 'a')` and `null`.
 
-- [ ] **A domain over a table's row type is refused.** `create domain dfs
-      as fs` over a table `fs` is 42704 `type "fs" does not exist` here;
-      PostgreSQL 15.19 creates it (a domain may be over a composite since
-      PostgreSQL 11), and a column of it holds rows: `select count(*) from
-      fd where k is not null` is 1 and `... where k is null` 2, the null
-      test reading the fields because `type_is_rowtype` is true of the
-      domain. RP-534's per-row null test asks `type_is_rowtype` of the
-      column's declared type, so it needs to see through the domain then.
-      Backlog-ID: RP-538
-      Verify: tests/backlog/test_rp_found_rp534.py::test_domain_over_a_table_row_type
 
 ## Found while working RP-500 (2026-11-07)
 
@@ -3341,14 +2845,14 @@ Measured on a private PostgreSQL 15.19 cluster.
       the statement, not in the body.** `check_sql_expr` parses each
       expression as the compiler reads it, and the error is placed at the
       expression's token, transposed into the statement: on PostgreSQL
-      15.19 `create function e619() returns int language plpgsql as $$
-      begin return 1 +; end $$` is `syntax error at end of input` at 75,
-      with `declare x int := 1 +;` at 79, and `do $$ declare x int := 1 +;
-      begin null; end $$` at 27. Here they are at 83, 103 and 47. And `do
-      $$ begin perform 1 +; end $$` is the same error at 24 there, found at
-      compile; here it is at 32, found when the PERFORM runs (CONTEXT
-      `PL/pgSQL function inline_code_block line 1 at PERFORM`). RP-621 is
-      the compile errors with no position, RP-492 a DO's grammar errors.
+      15.19 `do $$ declare x int := 1 +; begin null; end $$` is `syntax
+      error at end of input` at 27; here it is at 47. And `do $$ begin
+      perform 1 +; end $$` is the same error at 24 there, found at compile;
+      here it has no position, found when the PERFORM runs (CONTEXT
+      `PL/pgSQL function inline_code_block line 1 at PERFORM`). A CREATE
+      FUNCTION's (75 and 79) are placed since RP-621, which transposes the
+      scanner's `internalpos`; a DO block's error is not transposed yet
+      (RP-492 a DO's grammar errors).
       Verify: tests/backlog/test_rp_found_rp619.py::test_expression_syntax_error_is_placed_in_the_body
       Backlog-ID: RP-958
 - [ ] **A DO block refuses PL/pgSQL's `#` compile options.**
@@ -3365,7 +2869,7 @@ Measured on a private PostgreSQL 15.19 cluster.
       $$` is 42804 `RETURN cannot have a parameter in function returning
       void` at 20, `return 1 +;` the same, and a `returns void` function's
       `return 1 +;` the same at 73. Here the first runs, and the other two
-      are 42601 `syntax error at end of input` (31, 84).
+      are 42601 `syntax error at end of input` (31, 76).
       Verify: tests/backlog/test_rp_found_rp619.py::test_return_with_a_value_in_a_void_routine
       Backlog-ID: RP-960
 
@@ -3377,51 +2881,11 @@ RP-573 a DECLARE's type is looked up at CREATE FUNCTION and before a DO
 block runs (`check_plpgsql_declarations`), from the type text libpg_query
 keeps; what follows is what that lookup does not yet check.
 
-- [ ] **A `pg_temp` type in a session with no temporary schema is a
-      missing type, not a missing schema.** `LookupExplicitNamespace`
-      finds `pg_temp` only once the session has made its temp schema, so on
-      PostgreSQL 15.19 `create function e573(a pg_temp.nosuch) ...` is 3F000
-      `schema "pg_temp" does not exist` with no position, and `declare x
-      pg_temp.nosuch` the same at 69. Here they are 42704 `type
-      pg_temp.nosuch does not exist` and `type "pg_temp.nosuch" does not
-      exist` (`routine_type_missing` lets `pg_temp` through as a schema).
-      Verify: tests/backlog/test_rp_found_rp573.py::test_pg_temp_type_in_a_session_with_no_temp_schema
-      Backlog-ID: RP-620
-- [ ] **A PL/pgSQL compile error in a CREATE FUNCTION's body has no
-      position.** `declare x int; begin y := 1; return 1; end` is 42601
-      `"y" is not a known variable` at 80 on PostgreSQL 15.19, and `declare
-      x alias for $2` in a one-argument function is 42704 `variable "$2"
-      does not exist` at 82. Here the first has no position, and the second
-      is 42601 with none. (A DO block's syntax errors are RP-492.)
-      Verify: tests/backlog/test_rp_found_rp573.py::test_plpgsql_compile_error_in_create_has_a_position
-      Backlog-ID: RP-621
 
 ## Found while working RP-458 (2026-11-08)
 
 Measured on PostgreSQL 15.19; none needs an object.
 
-- [ ] **`regclassin` reports a missing schema as a missing relation, and a
-      quoted name's 42P01 has no position.** `select 'nosuch.s'::regclass`
-      and `pg_relation_size('nosuch.s')` are 3F000 `schema "nosuch" does not
-      exist` at the literal (8, 25) on PostgreSQL (`RangeVarGetRelid` looks
-      the schema up first); here they are 42P01 `relation "nosuch.s" does
-      not exist`. And `select '"Nosuch"'::regclass` and `select
-      nextval($$nosuchseq$$)` are 42P01 at the literal (8, 16) there and
-      have no position here: the server places a 42P01 by searching the
-      statement for the name (`err_in`, `identifier_position`), which a
-      quoted or dollar-quoted name does not match.
-      Verify: tests/backlog/test_rp_found_rp458.py::test_regclassin_errors
-      Backlog-ID: RP-675
-- [ ] **The sequence functions over a relation that is not a sequence
-      answer 42P01.** `nextval('pg_class')`, `currval('pg_class')`,
-      `setval('pg_class', 1)` and `nextval('pg_class'::regclass)` are 42809
-      `"pg_class" is not a sequence` with no position on PostgreSQL 15.19
-      (`init_sequence` opens the relation, then checks its relkind), and
-      `nextval(1234)` is XX000 `could not open relation with OID 1234`.
-      Here each is 42P01 `relation "pg_class"` / `"1234" does not exist`,
-      at the argument.
-      Verify: tests/backlog/test_rp_found_rp458.py::test_sequence_function_over_a_relation_not_a_sequence
-      Backlog-ID: RP-676
 - [ ] **A named argument to a built-in whose parameters have no names is
       refused as a gap.** `select nextval(regclass := 'nosuchseq')` and
       `nextval(x => 'nosuchseq')` are 42883 `function nextval(regclass =>
@@ -3432,62 +2896,12 @@ Measured on PostgreSQL 15.19; none needs an object.
       Verify: tests/backlog/test_rp_found_rp458.py::test_named_argument_to_a_builtin_without_argument_names
       Backlog-ID: RP-677
 
-## Found while working RP-517 (2026-11-09)
-
-Measured on a private PostgreSQL 15.19 cluster with `fe(a int, b text)` and
-`fs(a int, c text)` holding `(1, 'x')` and `(1, 'y')`. Each also fails with
-the column written out, so none is the star's. The gap tests are in
-`tests/backlog/test_rp_found_rp517.py`.
-
-- [ ] **A LATERAL subquery's outer column is named by its type, and a star
-      over an outer item there is 42P01.** `select l.* from (values (3))
-      v(a), lateral (select v.a) l` names its column `a` on PostgreSQL 15.19
-      (`FigureColname`), and `lateral (select fe.a, fe.b) l` names `a`, `b`;
-      here they are `int4` and `int4`, `text`. `lateral (select v.*) l` and
-      `lateral (select fe.* from fs) l` answer the outer item's columns
-      there (`ExpandColumnRefStar` finds it in the level's range table);
-      here each is 42P01 `invalid reference to FROM-clause entry for table
-      "v"` (`"fe"`) with the hint that the entry cannot be referenced from
-      this part of the query. RP-517 expanded such a star in an expression
-      subquery only.
-      Verify: tests/backlog/test_rp_found_rp517.py::test_lateral_outer_columns
-      Backlog-ID: RP-701
-- [ ] **A FROM function's whole row under a column alias is 42703 inside an
-      expression.** `select f + 1 from generate_series(1, 2) f(x)` answers
-      2, 3 on PostgreSQL 15.19, `coalesce(f)` and `(select f)` 1, 2 (the
-      whole row of a function returning a base type is that value), and
-      `(select (f).x)` is 42809 `column notation .x applied to type integer,
-      which is not a composite type` at 17; here each is 42703 `column "f"
-      does not exist`, though a bare `select f` answers, as does every form
-      over an unaliased `generate_series(1, 2) f`.
-      Verify: tests/backlog/test_rp_found_rp699.py::test_function_whole_row_under_a_column_alias
-      Backlog-ID: RP-702
-- [ ] **A field of an outer item's whole row in a LATERAL subquery is
-      42703.** `select l.* from (values (3)) v(a), lateral (select (v).a + 0
-      as k) l` answers `3` on PostgreSQL 15.19 and `lateral (select 1 as k
-      where (v).a = 3)` `1`; here each is 42703 `column "v" does not exist`
-      at the `v`. `v.a` there is answered, and since RP-699 `(v).a` in an
-      expression subquery is too.
-      Verify: tests/backlog/test_rp_found_rp699.py::test_lateral_whole_row_field
-      Backlog-ID: RP-705
-
 ## Found while working RP-697 (2026-11-09)
 
 Measured on a private PostgreSQL 15.19 cluster with the `_SETUP` in
 `tests/backlog/test_rp_found_rp697.py`: `rn697(k int, a int, c text)` and
 `ch697(k int, c char(3), v varchar(4))`.
 
-- [ ] **A row compared with a subquery whose column has no operator with
-      the row's field is not 42883.** `(a, c) = (select 1, 2)`, `c` text,
-      is 42883 `operator does not exist: text = integer` at 18 on
-      PostgreSQL 15.19 (`make_row_comparison_op` resolves each pair's
-      operator as the statement is analysed), and so is a correlated `in`
-      -- even over no rows (`... where false`). Here each is 0A000
-      `comparing string with int32 using = is not supported yet` with no
-      position, raised only when a row is compared, and nothing at all
-      over no rows.
-      Verify: tests/backlog/test_rp_found_rp697.py::test_row_pair_with_no_operator_is_42883
-      Backlog-ID: RP-728
 
 ## Found while working RP-726 (2026-11-09)
 
@@ -3569,15 +2983,6 @@ still computed whole, and the cursor answers that differ either way.
       Found while working RP-897 (2026-11-14).
       Verify: tests/backlog/test_rp_found_rp744.py::test_a_cursors_where_filters_as_it_is_fetched
       Backlog-ID: RP-961
-- [ ] **A PL/pgSQL FETCH from a `refcursor` parameter is refused at CREATE
-      FUNCTION.** `create function f(c refcursor) returns int language
-      plpgsql as $$ declare r int; begin fetch c into r; return r; end $$`
-      is 42601 `variable "c" must be of type cursor or refcursor`:
-      libpg_query types a parameter as `unknown`, and only an OPEN of one
-      is rerouted (`open_cursor::cursor_param_rewrite`). PostgreSQL 15.19
-      creates it, and the call reads the caller's cursor.
-      Verify: tests/backlog/test_rp_found_rp744.py::test_a_refcursor_parameter_can_be_fetched
-      Backlog-ID: RP-901
 
 ## Found while working RP-898 (2026-11-14)
 
@@ -3652,23 +3057,23 @@ with ICU) with the `_SETUP` in `tests/backlog/test_rp_found_rp782.py`:
 `xu782f` a domain over `text` `collate "und-x-icu"`, `xc782f` one
 `collate "C"`.
 
-- [ ] **`information_schema`'s text columns are not collated "C".**
-      `information_schema.sql` declares `character_data` and `yes_or_no`
-      `COLLATE "C"` (kept on the built-in domains since RP-782), and its
-      views' columns are of those domains and of `sql_identifier`, so
-      `collation for (data_type)` of `information_schema.columns` is
-      `"C"` on PostgreSQL 15.19; here it is `"default"`, as is
-      `is_insertable_into` of `information_schema.tables`. The views'
-      columns are typed by their base types (`varchar`), so they also sort
-      by the database's collation.
-      Verify: tests/backlog/test_rp_found_rp782.py::test_information_schema_character_data_columns_are_collated_c
-      Backlog-ID: RP-797
-- [ ] **`pg_get_viewdef` of a system view is NULL.** `select
-      pg_get_viewdef('pg_tables'::regclass)` deparses the view's rule on
-      PostgreSQL 15.19 (` SELECT n.nspname AS schemaname, ...`), as it does
-      for every `pg_catalog` and `information_schema` view; here every one
-      answers NULL, though a user view's definition is printed.
-      Verify: tests/backlog/test_rp_found_rp782.py::test_pg_get_viewdef_of_a_system_view
+- [ ] **`pg_get_viewdef` of most system views is NULL.** PostgreSQL
+      15.19 deparses every `pg_catalog` and `information_schema` view's
+      rule. Here `system_view_defs` prints `system_views.sql`'s queries
+      through `ruleutils`, which reproduces 38 of the 75 `pg_catalog`
+      views exactly (`pg_tables`, `pg_roles`, `pg_stats`, `pg_settings`,
+      `pg_locks`, ...; none printed wrong, measured 2026-11-15) and
+      leaves the rest NULL rather than print them as written. Remaining:
+      the 37 other `pg_catalog` views (`pg_sequences`, `pg_policies`,
+      `pg_seclabels`, `pg_publication_tables`, `pg_stats_ext*`, and every
+      `pg_stat_*` / `pg_statio_*` view), which the printer refuses; and
+      every `information_schema` view, left out because the printer casts
+      to the bare domain where ruleutils qualifies it and casts a literal
+      to the base type first
+      (`('c'::character varying)::information_schema.character_data`,
+      `(x)::information_schema.sql_identifier`). A function in FROM
+      returning a record of OUT parameters prints since 2026-11-15.
+      Verify: tests/backlog/test_rp_found_rp782.py::test_pg_get_viewdef_of_the_remaining_system_views
       Backlog-ID: RP-798
 
 ## Found while working RP-808 (2026-11-10)
@@ -3689,59 +3094,26 @@ s text)`.
       Verify: tests/backlog/test_rp_found_rp808.py::test_a_connectives_argument_is_reported_at_its_leftmost_token
       Backlog-ID: RP-812
 
-## Found while working RP-811 (2026-11-10)
-
-Measured on a private, freshly initdb'd PostgreSQL 15.19 cluster with the
-`_SETUP` in `tests/backlog/test_rp_found_rp811.py`: `c811(x int, a int[])`
-and `create domain di811 as int`.
-
-- [ ] **A domain's CHECK and a partial index's WHERE are not coerced to
-      boolean.** `create domain d as int check (value)` is 42804 `argument
-      of CHECK must be type boolean, not type integer` on PostgreSQL 15.19
-      (`domainAddConstraint`'s `coerce_to_boolean`), and `check (value is
-      true)` its test's own 42804, both with no position; `create index on
-      c811 (x) where x` is 42804 `argument of WHERE ...` at the `x` (32,
-      `transformIndexStmt`). Here the domain and the index are created. A
-      table's CHECK is coerced since RP-811 (`optype::check_constraint`).
-      Verify: tests/backlog/test_rp_found_rp811.py::test_a_domain_check_and_an_index_predicate_are_coerced_to_boolean
-      Backlog-ID: RP-813
-- [ ] **ALTER TABLE's expressions are not coerced to boolean when no row
-      reaches them, and SET DEFAULT's error has a position.** On PostgreSQL
-      15.19 `alter table c811 alter column x type bool using (x is true)`
-      is 42804 `argument of IS TRUE ...` at 50 and `add column y bool
-      generated always as (x is true) stored` the same 42804 with no
-      position, both over an empty table; here each is `ALTER TABLE`, the
-      expression judged only per row. `alter column x set default (1 is
-      true)` is that 42804 with no position (`AddRelationNewConstraints`
-      gets no query text from ALTER TABLE); here it is placed at the `1`.
-      Verify: tests/backlog/test_rp_found_rp811.py::test_alter_table_expressions_are_coerced_to_boolean
-      Backlog-ID: RP-815
-
 ## Found while working RP-816 (2026-11-11)
 
 Measured on a private PostgreSQL 15.19 cluster.
 
-- [ ] **`tableoid` in a CHECK names no column.** `create table t816 (x int
-      check (tableoid::int > 0))` and `alter table c816 add constraint k
-      check (tableoid::int > 0)` create the constraint on PostgreSQL 15.19
-      (`scanNSItemForColumn` allows `tableoid`, alone of the system
-      columns, under `EXPR_KIND_CHECK_CONSTRAINT`), and `check (tableoid)`
-      is 42804 `argument of CHECK must be type boolean, not type oid` at
-      33. Here each is 42703 `column "tableoid" does not exist`: a SELECT's
-      `tableoid` is rewritten in `partitions.rs`, and a CHECK's row
-      evaluation has no `tableoid` to read.
-      Verify: tests/backlog/test_rp_found_rp816.py::test_tableoid_in_a_check_is_a_column
-      Backlog-ID: RP-859
-- [ ] **A CHECK takes another table's qualifier, and names a qualified
-      missing column without it.** `create table t816 (x int, check
-      (other.x = 1))` creates the table here; PostgreSQL 15.19 is 42P01
-      `missing FROM-clause entry for table "other"` at 34 (the CHECK's
-      range table holds only its own table). `check (t816.nosuch = 1)` is
-      42703 `column t816.nosuch does not exist` at 34 there
-      (`errorMissingColumn` names the qualifier, at the reference's start)
-      and `column "nosuch" does not exist` at 39 here.
-      Verify: tests/backlog/test_rp_found_rp816.py::test_a_checks_qualified_column_is_resolved_against_its_table
-      Backlog-ID: RP-861
+- [ ] **A CHECK naming its own table by `regclass` is refused at CREATE
+      TABLE.** `create table t816 (x int, check (tableoid =
+      't816'::regclass))` is CREATE TABLE on PostgreSQL 15.19
+      (`cookConstraint` runs after the relation exists); here it is 42P01
+      `relation "t816" does not exist` at 14. `alter table ... add check`
+      over an existing table is taken.
+      Verify: tests/backlog/test_rp_found_rp816.py::test_a_checks_regclass_of_its_own_table_resolves_at_create
+      Backlog-ID: RP-974
+- [ ] **A CHECK violated by a row routed into a partition names the
+      partitioned table, not the leaf.** `insert into p974 values (2)`,
+      routed into `p974b` and failing `check (x < 2)`, is 23514 `new row
+      for relation "p974b" violates check constraint "p974_x_check"` on
+      PostgreSQL 15.19 (`ExecConstraints` reports the leaf's result
+      relation); here the relation is `p974`.
+      Verify: tests/backlog/test_rp_found_rp816.py::test_a_partitions_check_violation_names_the_leaf
+      Backlog-ID: RP-975
 
 ## Found while working RP-860 (2026-11-14)
 
@@ -3776,39 +3148,6 @@ Measured on a private, freshly initdb'd PostgreSQL 15.19 cluster with the
       records.
       Verify: tests/backlog/test_rp_found_rp860.py::test_a_regtype_comparison_in_a_check_prints_its_oid_casts
       Backlog-ID: RP-941
-
-## Found while working RP-828 (2026-11-12)
-
-Measured on a private, freshly initdb'd PostgreSQL 15.19 cluster.
-
-
-
-- [ ] **A portal whose query fails as it runs takes no number.**
-      `SPI_cursor_open_internal` names an unnamed portal
-      (`CreateNewPortal`) before it runs the query, so on PostgreSQL 15.19
-      a FOR loop or an OPEN over `select a/0 from (values (1)) v(a)` that
-      fails, caught, leaves the next portal `<unnamed portal 2>`. Here the
-      rows are read before `register_portal` names the portal, so the next
-      one is `<unnamed portal 1>`. (A constant `1/0` fails in PostgreSQL's
-      planner, before the portal is named, and takes no number there
-      either.)
-      Verify: tests/backlog/test_rp_found_rp828.py::test_a_portal_that_fails_running_takes_its_number
-      Backlog-ID: RP-907
-
-## Found while working RP-822 (2026-11-10)
-
-- [ ] **A DROP or ALTER FUNCTION signature's `%TYPE` names no type.**
-      `drop function f(t.v%type)` and `alter function f(t.v%type) rename
-      to g` over a `varchar(3)` column find `f(varchar)` on PostgreSQL
-      15.19 (`LookupFuncWithArgs` looks each argument type up with
-      `LookupTypeName`), with the NOTICE `type reference t.v%TYPE
-      converted to character varying`. Here the DROP is 42704 `type "t.v"
-      does not exist` and the ALTER 42883 `function f(t.v) does not
-      exist`. CREATE FUNCTION resolves one since RP-822
-      (`plpgsql_pct_type::routine_percent_type`), which a signature's
-      lookup can reuse.
-      Verify: tests/backlog/test_rp_found_rp822.py::test_a_signatures_percent_type_is_resolved
-      Backlog-ID: RP-830
 
 ## Found while working RP-751 (2026-11-10)
 
@@ -3846,26 +3185,6 @@ varchar(3), w dv689, c char(3))`, `d689` an `int` with `check (value > 0)`.
       Verify: tests/backlog/test_rp_found_rp689.py::test_a_column_a_record_field_shares_is_ambiguous
       Backlog-ID: RP-838
 
-## Found while working RP-846 (2026-11-11)
-
-Measured on a private, freshly initdb'd PostgreSQL 15.19 cluster with the
-`_SETUP` in `tests/backlog/test_rp_found_rp846.py`, the session's TimeZone
-`UTC`. Both answers come from `information_schema.columns.column_default`
-and `pg_get_expr(adbin, adrelid)`, which this server renders by one
-function, `default_expression`, from the folded value rather than from a
-stored expression tree.
-
-- [ ] **A DEFAULT written as an explicit cast with a modifier drops the
-      modifier.** `e char(4) default 'ab'::char(4)` and `e2 varchar(5)
-      default 'ab'::varchar(5)` are `'ab'::character(4)` and
-      `'ab'::character varying(5)` on PostgreSQL 15.19: the explicit cast
-      is a length coercion marked COERCE_EXPLICIT_CAST, which ruleutils
-      prints with its modifier. Here they are `'ab'::bpchar` and
-      `'ab'::character varying`, as an implicit coercion of a bare literal
-      prints: the explicit cast's modifier is not kept with the folded
-      value.
-      Verify: tests/backlog/test_rp_found_rp846.py::test_an_explicit_cast_default_keeps_its_modifier
-      Backlog-ID: RP-863
 
 ## Found while working RP-845 (2026-11-11)
 
@@ -3904,28 +3223,16 @@ Measured on PostgreSQL 15.19 (the shared reference on port 5415): every
 statement is VALUES-only and runs there as written. The gap tests are in
 `tests/backlog/test_rp_found_rp727.py`.
 
-- [ ] **A row field that is an untyped literal is not coerced to its
-      pair's type.** `select (1, '2') = (1, 2)` and `(1, '2') < any
-      (select 1, 3)` are `t` on PostgreSQL 15.19: each pair's operator is
-      resolved as the statement is analysed, and the `unknown` literal
-      takes the other side's type. `(1, 'a') < (1, 2)` is then 22P02
-      `invalid input syntax for type integer: "a"` at 12. Here each is
-      0A000 `comparing string with int32 using ... is not supported yet`,
-      with no position: the literal is compared as a string.
-      Verify: tests/backlog/test_rp_found_rp727.py::test_untyped_literal_in_a_row_takes_its_pairs_type
-      Backlog-ID: RP-850
-- [ ] **A row comparison with a pattern operator is refused.** `select
-      ('a', 'b') ~<~ ('a', 'c')` and `('a', 'b') ~<~ any (select 'a', 'c')`
-      are `t` on PostgreSQL 15.19: `~<~` is a btree operator (of
-      `text_pattern_ops`), so `make_row_comparison_op` builds a
-      RowCompareExpr of it as of `<`. Here the first is 42804 `collations
-      are not supported by type record` and the second 0A000 `a row
-      comparison with ~<~ and a subquery is not supported yet`. Since RP-849
-      rows of no fields are 0A000 `cannot compare rows of zero length`
-      under any operator, `row() ~<~ any (select)` included, but `row()
-      ~<~ row()` is still the 42804: the collation check runs first.
-      Verify: tests/backlog/test_rp_found_rp727.py::test_row_comparison_with_a_pattern_operator
-      Backlog-ID: RP-851
+- [ ] **A row comparison with a pattern operator over fields that are not
+      strings is a collation error.** `select (1, 2) ~<~ (1, 3)` is 42883
+      `operator does not exist: integer ~<~ integer` at 15 on PostgreSQL
+      15.19 (`make_row_comparison_op` looks up each pair's operator). Here
+      it is 42804 `collations are not supported by type integer` with no
+      position: `pattern_ops` rewrites `~<~` to `<` and collates each
+      field `"C"` before any operand is typed. The subquery form (`(1, 2)
+      ~<~ any (select 1, 3)`) is right since RP-851.
+      Verify: tests/backlog/test_rp_found_rp727.py::test_row_pattern_operator_over_non_strings
+      Backlog-ID: RP-973
 
 ## Found while working RP-849 (2026-11-11)
 
@@ -3933,33 +3240,21 @@ Measured on PostgreSQL 15.19 (the shared reference on port 5415): every
 statement is VALUES-only and runs there as written. The gap test is in
 `tests/backlog/test_rp_found_rp849.py`.
 
-- [ ] **A row beside an operand that is not a row looks its operator up
-      before a missing column is reported.** `select (1, nosuch) = (1)
-      from (values (1)) v(a)` and `(1, nosuch) in (1, 2)` are 42703
-      `column "nosuch" does not exist` at 12 on PostgreSQL 15.19:
-      `transformAExprOp` / `transformAExprIn` transform the operands
-      before `make_op` looks for `record = integer`. Here each is 42883
-      `operator does not exist: record = integer`: `row_against_non_row`
-      runs before the operands' names are resolved. (Two row constructors
-      resolve their operands' bare names first since RP-849.)
-      Verify: tests/backlog/test_rp_found_rp849.py::test_a_row_beside_a_non_row_transforms_its_operands_first
-      Backlog-ID: RP-875
 
 ## Found while working RP-704 (2026-11-10)
 
 Measured on PostgreSQL 15.19 (the shared reference on port 5415): every
 statement reads only `VALUES` lists.
 
-- [ ] **A star over a FROM subquery in a grouped query is 42803 with no
-      column name.** `select v.* from (values (1), (1)) v(a) group by a`
-      answers `1`, column `a`, on PostgreSQL 15.19, and so does `(v).*`
-      beside a `count(*)` grouped by `v.a`; `... group by v` is 42803
-      `column "v.a" must appear in the GROUP BY clause or be used in an
-      aggregate function` at 8. Here each is 42803 `column "" must appear
-      in the GROUP BY clause ...` with no position: `expand_star_in_grouped`
-      expands a star over a lone table only, so the star reaches the
-      grouping check unexpanded.
-      Verify: tests/backlog/test_rp_found_rp699.py::test_a_star_over_a_from_subquery_in_a_grouped_query
+- [ ] **`GROUP BY v` over a FROM subquery groups by its column, not
+      the row.** `select v.a from (values (1), (2)) v(a) group by v` is
+      42803 `column "v.a" must appear in the GROUP BY clause or be used in
+      an aggregate function` at 8 on PostgreSQL 15.19, and so is `select
+      v.* ... group by v`. Here both answer the rows: the whole-row
+      grouping rule (`check_ungrouped_whole_row`, RP-532 / RP-536) covers a
+      lone table only, and a subquery's `v` resolves as its column. (The
+      star over a subquery itself now expands, `expand_star_in_grouped`.)
+      Verify: tests/backlog/test_rp_found_rp699.py::test_group_by_a_from_subquery_row_leaves_its_columns_ungrouped
       Backlog-ID: RP-852
 
 ## Found while working RP-700 (2026-11-10)
@@ -3977,77 +3272,3 @@ statement is VALUES-only and runs there as written.
       and calls `check_stray` only for a query with no GROUP BY.
       Verify: tests/backlog/test_rp_found_rp700.py::test_an_ungrouped_column_beside_a_subquery_is_42803
       Backlog-ID: RP-853
-
-## Found while working RP-854 (2026-11-11)
-
-Measured on PostgreSQL 15.19 (the shared reference on port 5415): every
-statement is VALUES-only and runs there as written. The gap tests are in
-`tests/backlog/test_rp_found_rp854.py`.
-
-- [ ] **An ORDER BY constant that is no integer is not 42601.** `select 1
-      from (values (1)) v(a) order by 2.5` is 42601 `non-integer constant
-      in ORDER BY` at 42 on PostgreSQL 15.19 (`findTargetlistEntrySQL92`),
-      and `select a ... group by a order by 'x'` the same at 53. Here the
-      first is 0A000 `ORDER BY over an expression is not supported yet` and
-      the second returns its row. The GROUP BY half is `group_sql92.rs`
-      (RP-854); a statement with both is answered for its GROUP BY
-      constant until this one is fixed, where PostgreSQL names the ORDER BY.
-      Verify: tests/backlog/test_rp_found_rp854.py::test_a_non_integer_order_by_constant_is_42601
-      Backlog-ID: RP-871
-- [ ] **A window definition's error comes ahead of a GROUP BY or DISTINCT ON
-      constant's.** `select count(*) over w from (values (1)) v(a) group by
-      2.5 window w as (order by nosuch)` is 42601 `non-integer constant in
-      GROUP BY` at 56 on PostgreSQL 15.19, and with `distinct on (1.5)` in
-      place of the GROUP BY it is `non-integer constant in DISTINCT ON` at
-      21: `transformWindowDefinitions` runs after both clauses in
-      `transformSelectStmt`. Here each is the window's 42703 `column
-      "nosuch" does not exist`: `group_sql92`'s cut statement keeps the
-      WINDOW clause, and dropping it would leave `over w` naming no window.
-      Found while working RP-872 (2026-11-12).
-      Verify: tests/backlog/test_rp_found_rp872.py::test_a_window_definition_is_analysed_after_the_constant
-      Backlog-ID: RP-885
-- [ ] **A GROUP BY position inside a grouping set or a parenthesised list
-      is grouped as a value.** `select a from (values (1), (2)) v(a) group
-      by rollup(1)` groups by `a` on PostgreSQL 15.19 (`flatten_grouping_sets`
-      flattens sets and an implicit row, and each integer in them is a
-      select-list position), and so do `grouping sets ((1), ())` and `select
-      a, a + 1 ... group by (1, 2)`. Here each is 42803 `column "a" must
-      appear in the GROUP BY clause`: `plan_aggregate` resolves a position
-      only at the top level, and pushes a set's or a row's elements as
-      expressions. A position past the select list there (`rollup(9)`) is
-      0A000, not 42P10 `GROUP BY position 9 is not in select list` at 49.
-      Verify: tests/backlog/test_rp_found_rp854.py::test_a_group_by_position_inside_a_set_or_list_is_a_position
-      Backlog-ID: RP-873
-- [ ] **A grouped query reports a column that does not exist as 42803.**
-      `select nosuch from (values (1)) v(a) group by a` is 42703 `column
-      "nosuch" does not exist` at 8 on PostgreSQL 15.19 (`transformColumnRef`,
-      while the select list is analysed, before `parseCheckAggregates`).
-      Here it is 42803 `column "nosuch" must appear in the GROUP BY clause or
-      be used in an aggregate function`, at the same place.
-      Verify: tests/backlog/test_rp_found_rp854.py::test_an_undefined_column_in_a_grouped_query_is_42703
-      Backlog-ID: RP-874
-
-## Found while working RP-565 (2026-11-12)
-
-Measured on a private, freshly initdb'd PostgreSQL 15.19 cluster. The gap
-tests are in `tests/backlog/test_rp_found_rp565.py`.
-
-- [ ] **A DROP's DETAIL names a foreign key by its schema-qualified key.**
-      `drop table s.p` with `s.child (b int references s.p)` is 2BP01 with
-      DETAIL `constraint child_b_fkey on table s.child depends on table
-      s.p` on PostgreSQL 15.19 (`getObjectDescription` prints `conname`),
-      and a temporary table's the same, `tc_b_fkey`. Here the constraint
-      is `s.child_b_fkey` and `pg_temp_N.tc_b_fkey`: the DETAIL takes the
-      stored key, though `pg_constraint.conname` is already right.
-      Verify: tests/backlog/test_rp_found_rp565.py::test_a_foreign_key_in_a_drop_detail_is_named_by_its_own_name
-      Backlog-ID: RP-890
-- [ ] **A temporary row type does not hide a built-in type of its name.**
-      PostgreSQL searches the temporary schema for a type ahead of
-      `pg_catalog` when the path does not name `pg_temp`: after `create
-      temp table text (a int)`, `'x'::text` is 22P02 `malformed record
-      literal: "x"` and `('(1)'::text).a` is 1 on 15.19. Here a built-in
-      name is resolved before any user type is looked for
-      (`is_builtin_type` ahead of `type_schema_of`), so the first answers
-      `x` and the second is 42809.
-      Verify: tests/backlog/test_rp_found_rp565.py::test_a_temporary_row_type_hides_a_built_in_type
-      Backlog-ID: RP-891
