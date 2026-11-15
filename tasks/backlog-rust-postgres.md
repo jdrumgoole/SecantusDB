@@ -2036,19 +2036,20 @@ a regression test.
       (found while working RP-408).
       Backlog-ID: RP-414
       Verify: tests/backlog/test_rp_column_errors.py::test_missing_column_reported_as_written
-- [ ] **EXPLAIN of an UPDATE ... FROM or a DELETE ... USING prints a Seq
-      Scan of the target alone.** The statement is rewritten into
-      correlated subqueries over its FROM items (`rewrite_dml_from`), and
-      EXPLAIN prints that rewrite's scan: `explain (costs off) delete from k
-      using (select 50 as a) t where k.a = t.a` (and the UPDATE ... FROM
-      form) is `Seq Scan on k`, where PostgreSQL 15.19 pulls the subquery
-      up into `Index Scan using k_pkey on k` with `Index Cond: (a = 50)`;
-      `delete from k using e where k.a = e.a` prints no join, where
-      PostgreSQL prints a `Hash Join` with `Hash Cond: (e.a = k.a)` over
-      both tables. Measured on a private 15.19 cluster with `e(a int, b
-      text)` and `k(a int primary key, b text)` (found while working
-      RP-432).
-      Verify: tests/backlog/test_rp_dml_from.py::test_explain_prints_the_join_and_the_index_scan
+- [ ] **EXPLAIN of an UPDATE ... FROM or a DELETE ... USING a table
+      prints a Seq Scan of the target alone.** The statement is rewritten
+      into correlated subqueries over its FROM items (`rewrite_dml_from`),
+      and EXPLAIN prints that rewrite's scan (`Statement::Delete` /
+      `Update` in `explain.rs` is a ModifyTable over `table_scan` only):
+      `explain (costs off) delete from k using e where k.a = e.a` is `Seq
+      Scan on k`, where PostgreSQL 15.19 prints a `Hash Join` with `Hash
+      Cond: (e.a = k.a)` over both tables. Closing it means planning the
+      DML's join as the SELECT join path plans it and putting that tree
+      under the ModifyTable. (A one-row constant subquery in FROM / USING
+      is pulled up since 2026-11-15, `dml_pullup.rs`.) Measured on a
+      private 15.19 cluster with `e(a int, b text)` and `k(a int primary
+      key, b text)` (found while working RP-432).
+      Verify: tests/backlog/test_rp_dml_from.py::test_explain_prints_the_join
       Backlog-ID: RP-435
 - [ ] **An UPDATE ... FROM or DELETE ... USING reports an ambiguous name
       ahead of a missing column written before it.** `rewrite_dml_from`'s
