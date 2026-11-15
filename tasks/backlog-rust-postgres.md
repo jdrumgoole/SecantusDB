@@ -1171,15 +1171,21 @@ one beside it.
       sorted catalog, an index through `Storage::index_owners`, which is
       kept current from the index catalog's change log; under 1% of the
       statement's samples at 800). All that is left is the republication
-      at the statement's start after the previous DDL
-      (`install_user_types`: the composite and table catalogs read and
-      compared, `publish_tableoids`; since 2026-11-15 no longer each
-      table's index list or `relations`, a loop's median at 800 from
-      8.9 ms to 4.6 ms) -- RP-911's remainder, so this item closes
-      with RP-911's per-relation publication. Its gap test is a timing
-      ratio and can pass once by noise: a `gate_pg.sh` backlog step on
-      2026-11-14 reported it `FIXED?`, then it failed three of three runs
-      alone (2.5-3.8 ms against 0.8-1.7 ms). Rerun it alone before closing.
+      at the statement's start after the previous DDL, which a run of
+      `CREATE TABLE`s pays on each (`install_user_types`; since
+      2026-11-15 no longer each table's index list or `relations`, and
+      the composite and table catalogs patched from the storage's catalog
+      key log rather than read and compared). Measured 2026-11-15 on a
+      debug build, best of five alone: 1.0-1.2 ms with none and, in the
+      runs that failed, 2.4-2.9 ms with 800 -- what
+      grows is RP-911's per-relation remainder (`publish_user_types`,
+      `session_has_temp`, `install_session_state`, `inheritance`), so this
+      item closes with RP-911's per-relation publication. A `CREATE
+      TABLE` after a statement that already republished costs the same
+      with 800 tables (a loop's median 1.6 ms against 1.5 ms). Its gap
+      test is a timing ratio and passes by noise: seven of seven alone on
+      one build, two of eight on the next. Rerun it ten times alone
+      before closing.
       Verify: tests/backlog/test_rp_catalog_latency.py::test_create_table_costs_the_same_at_800_tables_within_a_tenth
       Backlog-ID: RP-928
 
