@@ -1039,12 +1039,15 @@ type MemberValues = (Vec<Bson>, Vec<Bson>);
 
 /// What mongod's sort of index keys holds of `m`: its sort key's values,
 /// and the values of the index key it was found at, read from `blob`, its
-/// document -- of a multikey field, the element the entry keys. `None`:
-/// `m` was found at no index entry.
+/// document -- of a multikey field, the element the entry keys. Under a
+/// `collation` the sort key holds each string's collation key, as mongod's
+/// does (`getCollationComparisonKey`, RM-555). `None`: `m` was found at no
+/// index entry.
 fn member_values(
     pattern: &[(String, bool)],
     m: &Member,
     blob: &[u8],
+    collation: Option<&Collation>,
 ) -> Result<Option<MemberValues>, StorageError> {
     let Some(entry) = &m.entry else {
         return Ok(None);
@@ -1073,6 +1076,10 @@ fn member_values(
                 .iter()
                 .position(|f| f == field)
                 .map_or(Bson::Null, |at| values[at].clone())
+        })
+        .map(|v| match collation {
+            Some(c) => secantus_core::collation::comparison_key(&v, c),
+            None => v,
         })
         .collect();
     Ok(Some((sort_key, values)))
@@ -1511,7 +1518,7 @@ impl Stage {
                             _ => pattern_key(pattern, &m),
                         };
                         let values = match (budget.is_some(), blob.as_deref()) {
-                            (true, Some(b)) => member_values(pattern, &m, b)?,
+                            (true, Some(b)) => member_values(pattern, &m, b, collation.as_ref())?,
                             _ => None,
                         };
                         all.push((key, m, values));

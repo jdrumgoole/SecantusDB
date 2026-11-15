@@ -629,6 +629,24 @@ pub fn sort_key(s: &str, c: &Collation) -> Vec<u8> {
     c.collator.sort_key(s)
 }
 
+/// `CollatorInterface::getComparisonKey` over `v`, as a sort key keeps it
+/// (`Value::getCollationComparisonKey`): each string, also inside an array
+/// or a document, replaced by its collation key: a string of the key's
+/// bytes, which need not be UTF-8 (then its carrier,
+/// [`crate::bsondoc::invalid_utf8`]).
+pub fn comparison_key(v: &Bson, c: &Collation) -> Bson {
+    match v {
+        Bson::String(s) => crate::bsondoc::string_from_bytes(sort_key(s, c)),
+        Bson::Array(a) => Bson::Array(a.iter().map(|e| comparison_key(e, c)).collect()),
+        Bson::Document(d) => Bson::Document(
+            d.iter()
+                .map(|(k, e)| (k.clone(), comparison_key(e, c)))
+                .collect(),
+        ),
+        other => other.clone(),
+    }
+}
+
 /// The bytes an index entry holds for a string under the collation.
 pub fn normalize_index_bytes(s: &str, c: &Collation) -> Option<Vec<u8>> {
     Some(sort_key(s, c))
@@ -765,6 +783,23 @@ mod tests {
         assert_eq!(compare("coté", "côte", &ca), Some(Ordering::Greater));
         assert_eq!(compare("coté", "côte", &ca_off), Some(Ordering::Less));
         assert_eq!(ca.spec().get_bool("backwards"), Ok(true));
+    }
+
+    #[test]
+    fn a_comparison_key_is_the_string_of_its_sort_key() {
+        // RM-555: what a spilled sort key holds under a collation.
+        let coll = c(doc! {"locale": "fr"});
+        let key = comparison_key(&Bson::String("s1".into()), &coll);
+        let bytes = sort_key("s1", &coll);
+        match &key {
+            Bson::String(s) => assert_eq!(s.as_bytes(), bytes.as_slice()),
+            other => assert_eq!(
+                crate::bsondoc::as_invalid_utf8(other),
+                Some(bytes.as_slice())
+            ),
+        }
+        let nested = comparison_key(&Bson::Array(vec![Bson::Int32(1), "s1".into()]), &coll);
+        assert_eq!(nested, Bson::Array(vec![Bson::Int32(1), key]));
     }
 
     #[test]

@@ -687,16 +687,6 @@ These are explicit non-goals. Don't add them without a reason.
       reference answer is a race under load. Found 2026-11-12 (RM-475).
       Verify: none -- an intermittent failure under load, 1 in 2 gate runs
       Backlog-ID: RM-558
-- [ ] **A spilled SORT of index keys under a collation writes the
-      strings, not their collation keys.** mongod 8.2.11's SORT below a
-      FETCH computes each member's sort key under the command's collation
-      and spills that key: 2000 `"s{i}"` strings over `{y: 1, x: 1}` with
-      `{locale: "fr"}` under a 100000-byte budget spill 157780 bytes. This
-      server writes the string values (`stream.rs`'s `member_values`):
-      149780. What it counts in memory already agrees (140890). Found
-      2026-11-12 (RM-475).
-      Verify: tests/backlog/test_rm_found_rm475.py::test_a_spilled_sort_of_index_keys_writes_collation_keys
-      Backlog-ID: RM-555
 - [ ] **A spilled SORT of index keys compresses to a different size.**
       Each member mongod 8.2.11 spills carries the id of the storage
       snapshot it was read in, drawn from a process-wide counter every
