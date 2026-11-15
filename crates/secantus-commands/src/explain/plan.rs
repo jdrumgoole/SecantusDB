@@ -2347,7 +2347,9 @@ fn keeps_metadata(q: &Query, projection: Option<&Document>) -> bool {
             _ => false,
         }
     }
-    q.show_record_id || projection.is_some_and(|p| p.values().any(reads_metadata))
+    // `returnKey` keeps each member's index key, which the `simple` sort
+    // would discard (measured 8.2.11, RM-566: `RETURN_KEY <- SORT default`).
+    q.return_key || q.show_record_id || projection.is_some_and(|p| p.values().any(reads_metadata))
 }
 
 fn runs_below_sort(projection: &Document, sort: &Document) -> bool {

@@ -700,16 +700,6 @@ These are explicit non-goals. Don't add them without a reason.
       falls within mongod's own run-to-run spread of its answer.
       Verify: none -- mongod's own answer varies between runs; no test can pin it
       Backlog-ID: RM-556
-- [ ] **A sort under `returnKey` is a `simple` sort, and a limited one
-      leaves ties in another order.** mongod 8.2.11's SORT under a
-      RETURN_KEY is `type: "default"` (it keeps each member's index key),
-      and `find({y: {$gte: 0}}).sort({z: 1}).limit(2).returnKey()` over
-      `{y: 1, x: 1}` returns `{y: 0, x: 6}` before `{y: 0, x: 0}`, which
-      tie on `z`. This server's SORT is `simple` (`Node::Sort`'s `on_keys`
-      says both "sorts keys below the FETCH" and the `default` type, as for
-      RM-472), and it returns `x` 0 before 6. Found 2026-11-12 (RM-470).
-      Verify: tests/backlog/test_rm_found_rm470.py::test_a_sort_under_return_key_is_a_default_sort
-      Backlog-ID: RM-566
 - [ ] **A `returnKey` point lookup on `_id` is not IDHACK.** mongod 8.2.11
       answers `find({_id: 3}).returnKey()` by `RETURN_KEY <- IDHACK`; this
       server plans `RETURN_KEY <- IXSCAN` (`find_plan` leaves the point
