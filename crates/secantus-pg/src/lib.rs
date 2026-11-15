@@ -27029,6 +27029,7 @@ impl PgHandler {
                         position,
                         &info.message,
                         &columns,
+                        &|n: &str| self.lookup(n),
                     );
                 }
             }

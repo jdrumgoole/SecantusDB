@@ -2151,18 +2151,6 @@ a regression test.
       NULL::boolean))` here (found while working RP-409).
       Backlog-ID: RP-412
       Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a not over an or is the and of its negated arms], tests/backlog/test_rp_explain_costs.py::test_plan[a not over a between is the or of its negators], tests/backlog/test_rp_explain_costs.py::test_plan[a not over an or with a null arm is a false one-time filter]
-- [ ] **A function in FROM leaves a missing column with no HINT.** Since
-      RP-408 a 42703 carries PostgreSQL's `errorMissingColumn` hint, but
-      only when every range table entry in reach has columns this server
-      can tell: a function in FROM has the columns of its result type,
-      which the hint's search does not know, so it gives none.
-      PostgreSQL 15.19: `select * from generate_series(1,2) g where gg =
-      1` hints `Perhaps you meant to reference the column "g.g".`, and
-      `select * from e, generate_series(1, 2) g where bb = 1` hints
-      `"e.b"`; here neither has a HINT. Measured on a private 15.19
-      cluster (found while working RP-408).
-      Backlog-ID: RP-413
-      Verify: tests/backlog/test_rp_column_errors.py::test_function_in_from_hint
 - [ ] **A missing column's 42703 names the wrong reference, or drops its
       qualifier.** PostgreSQL 15.19 reports the first missing column in
       the order it analyses the statement, by the name as written and at

@@ -14,9 +14,9 @@
 //! range table is gone, so the search is run again over the statement as
 //! written: the reference is the column reference at the error's position,
 //! and each level's range table is rebuilt from its FROM clause in the order
-//! PostgreSQL's parse analysis adds the entries. An entry whose columns are
-//! not known here (a function in FROM, RP-413) makes the search give no hint rather
-//! than a different one.
+//! PostgreSQL's parse analysis adds the entries (a function in FROM by its
+//! result type's columns, RP-413). An entry whose columns are not known here
+//! makes the search give no hint rather than a different one.
 
 use super::*;
 use pg_query::protobuf as pb;
@@ -59,8 +59,7 @@ struct Finder<'a> {
     location: i32,
     /// A relation's columns by name.
     columns: &'a dyn Fn(&str) -> Option<Vec<String>>,
-    /// A FROM function's columns; `None` leaves them unknown, as for the
-    /// hint (RP-413).
+    /// A FROM function's columns; `None` leaves them unknown.
     functions: Option<FunctionColumns<'a>>,
     /// The CTEs in scope, innermost WITH last: `(name, columns)`.
     ctes: Vec<Vec<(String, Option<Vec<String>>)>>,
@@ -69,14 +68,17 @@ struct Finder<'a> {
 /// The HINT PostgreSQL sends with the 42703 `message` this server raised
 /// for `sql`, at `position` (1-based, in characters, as the error's `P`
 /// field). `columns` gives a relation's columns by name (a table's or a
-/// view's). `None` when PostgreSQL sends none, or when the reference or its
-/// range tables cannot be told.
+/// view's); `lookup` the table definitions a FROM function's result type is
+/// found from (RP-413). `None` when PostgreSQL sends none, or when the
+/// reference or its range tables cannot be told.
 pub fn missing_column_hint(
     sql: &str,
     position: usize,
     message: &str,
     columns: &dyn Fn(&str) -> Option<Vec<String>>,
+    lookup: &dyn Fn(&str) -> Option<TableDef>,
 ) -> Option<String> {
+    let functions = |rf: &pb::RangeFunction| joins::function_columns(rf, lookup, &[]);
     let byte = sql.char_indices().nth(position.checked_sub(1)?)?.0;
     let mut node = pb::Node {
         node: Some(parse_one_as_sent(sql).ok()?),
@@ -84,7 +86,7 @@ pub fn missing_column_hint(
     let mut finder = Finder {
         location: i32::try_from(byte).ok()?,
         columns,
-        functions: None,
+        functions: Some(&functions),
         ctes: Vec::new(),
     };
     let found = match finder.statement(&mut node) {
@@ -887,6 +889,34 @@ mod tests {
         };
         let ctes = s.with_clause.map(|w| w.ctes).unwrap_or_default();
         from_item_columns(item, &columns, &functions, &ctes)
+    }
+
+    // A function in FROM is searched by its result type's columns, as
+    // PostgreSQL 15.19 hints (RP-413).
+    #[test]
+    fn function_in_from_is_searched() {
+        let columns = |name: &str| (name == "e").then(|| vec!["a".to_string(), "b".to_string()]);
+        let hint = |sql: &str, pos: usize, msg: &str| {
+            missing_column_hint(sql, pos, msg, &columns, &|_: &str| None)
+        };
+        assert_eq!(
+            hint(
+                "select * from generate_series(1,2) g where gg = 1",
+                44,
+                "column \"gg\" does not exist"
+            )
+            .as_deref(),
+            Some("Perhaps you meant to reference the column \"g.g\".")
+        );
+        assert_eq!(
+            hint(
+                "select * from e, generate_series(1, 2) g where bb = 1",
+                48,
+                "column \"bb\" does not exist"
+            )
+            .as_deref(),
+            Some("Perhaps you meant to reference the column \"e.b\".")
+        );
     }
 
     fn v(cols: &[&str]) -> Option<Vec<String>> {
