@@ -1165,34 +1165,6 @@ one beside it.
       Backlog-ID: RP-911
       Verify: tests/backlog/test_rp_catalog_latency.py::test_the_first_catalog_query_after_ddl_costs_the_same_at_800_tables_within_a_tenth
 
-## Found by a profile (2026-11-13)
-
-- [ ] **OPEN — `CREATE TABLE` still grows with the number of tables.**
-      A debug `secantusd-pg` takes about 1.4 ms with no other table and
-      4.2 ms with 800 (2026-11-14); PostgreSQL 15.19 takes 0.41 ms and
-      0.37 ms (private cluster). Its checks that the name is free no
-      longer grow (2026-11-14: a composite found by its `_id` in the
-      sorted catalog, an index through `Storage::index_owners`, which is
-      kept current from the index catalog's change log; under 1% of the
-      statement's samples at 800). All that is left is the republication
-      at the statement's start after the previous DDL, which a run of
-      `CREATE TABLE`s pays on each (`install_user_types`; since
-      2026-11-15 no longer each table's index list or `relations`, and
-      the composite and table catalogs patched from the storage's catalog
-      key log rather than read and compared). Measured 2026-11-15 on a
-      debug build, best of five alone: 1.0-1.2 ms with none and, in the
-      runs that failed, 2.4-2.9 ms with 800 -- what
-      grows is RP-911's per-relation remainder (`publish_user_types`,
-      `session_has_temp`, `install_session_state`, `inheritance`), so this
-      item closes with RP-911's per-relation publication. A `CREATE
-      TABLE` after a statement that already republished costs the same
-      with 800 tables (a loop's median 1.6 ms against 1.5 ms). Its gap
-      test is a timing ratio and passes by noise: seven of seven alone on
-      one build, two of eight on the next. Rerun it ten times alone
-      before closing.
-      Verify: tests/backlog/test_rp_catalog_latency.py::test_create_table_costs_the_same_at_800_tables_within_a_tenth
-      Backlog-ID: RP-928
-
 ## Found while working RP-911 (2026-11-15)
 
 - [ ] **OPEN — `CREATE TYPE pg_temp.t AS (...)` makes no type in the temp

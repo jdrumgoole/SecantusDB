@@ -324,7 +324,7 @@ def test_the_first_catalog_query_after_ddl_over_two_column_types_costs_the_same_
     )
 
 
-@pytest.mark.backlog("RP-928")
+@pytest.mark.backlog_fixed("RP-928")
 def test_create_table_costs_the_same_at_800_tables_within_a_tenth(pg_alone: Any) -> None:
     """PostgreSQL 15.19 runs a `CREATE TABLE` in the same time however many
     other tables there are (0.41 ms with none, 0.37 ms with 800, private
@@ -333,6 +333,11 @@ def test_create_table_costs_the_same_at_800_tables_within_a_tenth(pg_alone: Any)
     stopped reading every table (RP-921), a debug `secantusd-pg` took about
     1.2 ms with none and 5.9 ms with 800 (2026-11-13): its checks that the
     name is free list every composite type and every table's indexes.
+    Those became lookups by name (2026-11-14), and the last pass over every
+    relation, the hash-index check's map of every relation's oid rebuilt
+    after the statement's own catalog write, became a lookup of the one
+    relation's key (2026-11-15: 2.9 ms to 1.6 ms with 800, nineteen of
+    twenty runs alone within the bound at a load average near 13).
 
     The fastest of five with 800 more tables against the fastest with none,
     in one server, within a tenth again plus 1 ms: the growth the previous

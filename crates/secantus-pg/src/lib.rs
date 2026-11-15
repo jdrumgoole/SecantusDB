@@ -12795,8 +12795,39 @@ impl PgHandler {
     /// `pg_type.typrelid` and `pg_attribute.attrelid` already key on it, so
     /// it is what `'t'::regclass::oid` and the RowDescription's `ftable`
     /// report. A table created before row types were recorded has none.
+    ///
+    /// One relation is found by its key in the `_id`-sorted composite
+    /// catalog, as `pg_class` is searched by name through its index: the
+    /// map of every relation, rebuilt after each catalog write, made a
+    /// `CREATE TABLE` grow with the schema (RP-928).
     fn relation_oid(&self, name: &str) -> Option<i64> {
-        Self::oid_in(self.relation_oids()?.as_ref(), name)
+        let comps = self.type_catalog_docs(Self::COMPOSITE_COLLECTION).ok()?;
+        let views = self.type_catalog_docs(Self::VIEW_COLLECTION).ok()?;
+        Self::relation_oid_of(&comps, &views, name)
+    }
+
+    /// [`Self::relation_oid`] over the catalogs' documents: the answer
+    /// [`Self::relation_oids_of`]' map gives for `name`.
+    fn relation_oid_of(comps: &CatalogDocs, views: &CatalogDocs, name: &str) -> Option<i64> {
+        let id = |d: &Document| d.get_str("_id").ok().map(str::to_string);
+        let at = comps.partition_point(|d| id(d).as_deref().unwrap_or_default() < name);
+        let first = comps[at..]
+            .iter()
+            .take_while(|d| id(d).as_deref() == Some(name))
+            .find(|d| d.get_bool("relation").unwrap_or(false));
+        if let Some(d) = first {
+            if let Some(oid) = Self::composite_relid(d) {
+                return Some(oid);
+            }
+        }
+        views.iter().find_map(|d| {
+            let n = d.get_str("view").or_else(|_| d.get_str("_id")).ok()?;
+            (n == name && d.get_str("definition").is_ok()).then(|| {
+                d.get("oid")
+                    .and_then(bson_i64)
+                    .unwrap_or_else(|| Self::view_oid(n))
+            })
+        })
     }
 
     /// A relation's oid in [`Self::relation_oids`]' map.
