@@ -2,8 +2,8 @@
 typed operand that is not a row has no operator): RP-590 (two different
 composite types were refused a comparison, fixed), RP-591 (an untyped literal
 beside a row was not read as `record`, fixed), RP-592 (a row beside an `ARRAY[...]`
-named the row `text`, fixed) and RP-593 (an error a PREPARE's query raises carries
-the query's own offset).
+named the row `text`, fixed) and RP-593 (an error a PREPARE's query raises carried
+the query's own offset, fixed).
 
 An answer is the rows, or `(sqlstate, message, hint, position)` for an
 error. The expected answers were measured on a private, freshly initdb'd
@@ -139,8 +139,9 @@ def test_row_beside_an_array_constructor(query: str, dsn: str) -> None:
     assert answer(dsn, query) == ROW_BESIDE_ARRAY[query]
 
 
-@pytest.mark.backlog("RP-593")
+@pytest.mark.backlog_fixed("RP-593")
 def test_prepare_error_position(dsn: str) -> None:
-    """The position is in the PREPARE's own text, at the operator."""
+    """The position is in the PREPARE's own text, at the operator. It was
+    an offset into the deparsed query, landing on the `(` of `p1(int)`."""
     query = "prepare p1(int) as select 12 = true"
     assert answer(dsn, query) == _no_operator("integer = boolean", "30")

@@ -27103,6 +27103,46 @@ impl PgHandler {
         }
     }
 
+    /// A PREPARE's planning error `e`, positioned in the client's text:
+    /// the query planned was deparsed, so its recorded location counts in
+    /// that, not in the statement (RP-593). The query as written is
+    /// analysed again for the error's position there, which `positioned`
+    /// keeps.
+    fn prepare_error_in_source(
+        &self,
+        mut e: PgWireError,
+        source: Option<&(usize, String)>,
+        n: usize,
+        declared: &[Option<String>],
+    ) -> PgWireError {
+        let _ = secantus_pgplan::take_error_location();
+        let PgWireError::UserError(info) = &mut e else {
+            return e;
+        };
+        if info.position.is_some() {
+            return e;
+        }
+        let Some((start, body)) = source else {
+            return e;
+        };
+        let again =
+            secantus_pgplan::analysing_only(|| self.describe_fields(body, n, declared)).err();
+        let Some(PgWireError::UserError(again)) = again.map(|a| Self::positioned(a, body)) else {
+            let _ = secantus_pgplan::take_error_location();
+            return e;
+        };
+        if again.code == info.code && again.message == info.message {
+            if let Some(at) = again
+                .position
+                .as_deref()
+                .and_then(|p| p.parse::<usize>().ok())
+            {
+                info.position = Some((at + *start).to_string());
+            }
+        }
+        e
+    }
+
     /// An error raised while RUNNING `sql` (not planning it), given the
     /// position PostgreSQL would point at when the statement names it.
     fn positioned(mut e: PgWireError, sql: &str) -> PgWireError {
@@ -48191,6 +48231,7 @@ impl PgHandler {
                 arg_types,
                 query,
                 text,
+                source,
             } => {
                 if self
                     .prepared
@@ -48226,7 +48267,10 @@ impl PgHandler {
                 // missing table is this statement's error, not EXECUTE's.
                 // Nothing in it runs until EXECUTE.
                 let fields =
-                    secantus_pgplan::analysing_only(|| self.describe_fields(&query, n, &declared))?;
+                    secantus_pgplan::analysing_only(|| self.describe_fields(&query, n, &declared))
+                        .map_err(|e| {
+                            self.prepare_error_in_source(e, source.as_ref(), n, &declared)
+                        })?;
                 let column_type = |table: &str, column: secantus_pgplan::ColumnRef<'_>| {
                     self.lookup(table).and_then(|def| {
                         let col = match column {

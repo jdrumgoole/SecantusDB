@@ -1191,6 +1191,11 @@ pub enum Statement {
         arg_types: Vec<String>,
         query: String,
         text: String,
+        /// The query as the client wrote it, and how many characters of the
+        /// statement precede it: PostgreSQL analyses the PREPARE's own parse
+        /// tree, so an error's position counts in the client's text
+        /// (RP-593).
+        source: Option<(usize, String)>,
     },
     /// `EXECUTE name [(args)]`, the arguments already evaluated.
     SqlExecute {
@@ -5715,6 +5720,44 @@ pub fn plan_with_params(
         };
         plan_with_params_parsed(sql, node, lookup, params)
     })
+    .map(|st| with_prepare_source(sql, st))
+}
+
+/// A `SqlPrepare`, with the query's text as `sql` holds it: what follows
+/// the first `AS` outside parentheses.
+fn with_prepare_source(sql: &str, st: Statement) -> Statement {
+    let Statement::SqlPrepare {
+        name,
+        arg_types,
+        query,
+        text,
+        source: None,
+    } = st
+    else {
+        return st;
+    };
+    let source = pg_query::scan(sql).ok().and_then(|scan| {
+        let t = scan.tokens;
+        let mut depth = 0i32;
+        let at = t.iter().position(|tok| {
+            match &sql[tok.start as usize..tok.end as usize] {
+                "(" => depth += 1,
+                ")" => depth -= 1,
+                _ => {}
+            }
+            depth == 0 && tok.token == pg_query::protobuf::Token::As as i32
+        })?;
+        let start = t.get(at + 1)?.start as usize;
+        let body = sql[start..].trim_end().trim_end_matches(';').trim_end();
+        Some((sql[..start].chars().count(), body.to_string()))
+    });
+    Statement::SqlPrepare {
+        name,
+        arg_types,
+        query,
+        text,
+        source,
+    }
 }
 
 fn plan_with_params_parsed(
@@ -5773,6 +5816,7 @@ pub fn plan_with_subqueries(
         cancel::check()?;
         plan_with_subqueries_parsed(sql, node, lookup, params, run)
     })
+    .map(|st| with_prepare_source(sql, st))
     .map_err(|e| {
         if !matches!(&e, Error::UndefinedObject(m) if m.starts_with("type \"")) {
             return e;
@@ -6918,6 +6962,7 @@ fn plan_node(
                 }
                 .deparse()
                 .map_err(|e| Error::Parse(e.to_string()))?,
+                source: None,
             })
         }
         N::ExecuteStmt(e) => Ok(Statement::SqlExecute {

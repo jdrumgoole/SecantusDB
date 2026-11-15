@@ -2321,22 +2321,6 @@ Measured on a private PostgreSQL 15.19 cluster. The gap tests are in
       Backlog-ID: RP-545
       Verify: tests/backlog/test_rp_found_rp527.py::test_missing_from_relation_reported_first
 
-## Found while working RP-530 (2026-11-08)
-
-Measured on a private PostgreSQL 15.19 cluster with `fs(a int, c text)`
-holding `(1, 'y')`, `create type ct as (x int)` and `create type ct2 as (x
-int)`. The gap tests are in `tests/backlog/test_rp_found_rp530.py`.
-
-- [ ] **An error a PREPARE's query raises carries the query's own offset.**
-      PREPARE plans the deparsed inner query, so a recorded location is an
-      offset into `SELECT ...`, honoured whenever a token of the PREPARE
-      text happens to start there: `prepare p1(int) as select 12 = true`
-      is 42883 at 30 on PostgreSQL 15.19 and at 11 here (the `(` of
-      `p1(int)`). An offset that lands on no token falls back to the text
-      search, which is why most look right.
-      Verify: tests/backlog/test_rp_found_rp530.py::test_prepare_error_position
-      Backlog-ID: RP-593
-
 ## Found while working RP-532 (2026-11-08)
 
 Measured on a private PostgreSQL 15.19 cluster with `fs(a int, c text)`
