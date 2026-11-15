@@ -3316,12 +3316,21 @@ with ICU) with the `_SETUP` in `tests/backlog/test_rp_found_rp782.py`:
 `xu782f` a domain over `text` `collate "und-x-icu"`, `xc782f` one
 `collate "C"`.
 
-- [ ] **`pg_get_viewdef` of a system view is NULL.** `select
-      pg_get_viewdef('pg_tables'::regclass)` deparses the view's rule on
-      PostgreSQL 15.19 (` SELECT n.nspname AS schemaname, ...`), as it does
-      for every `pg_catalog` and `information_schema` view; here every one
-      answers NULL, though a user view's definition is printed.
-      Verify: tests/backlog/test_rp_found_rp782.py::test_pg_get_viewdef_of_a_system_view
+- [ ] **`pg_get_viewdef` of most system views is NULL.** PostgreSQL
+      15.19 deparses every `pg_catalog` and `information_schema` view's
+      rule. Here `system_view_defs` prints `system_views.sql`'s queries
+      through `ruleutils`, which reproduces 16 of the 140 exactly
+      (`pg_tables`, `pg_roles`, `pg_stats`, ...; measured 2026-11-15) and
+      leaves the rest NULL rather than print them as written. Two shapes
+      remain: a function in FROM, printed with its column definition list
+      (`pg_settings`: `FROM pg_show_all_settings() a(name, setting, ...)`,
+      `pg_locks`; the printer refuses `SELECT * FROM f() a`), and every
+      `information_schema` view, left out because the printer casts to the
+      bare domain where ruleutils qualifies it and casts a literal to the
+      base type first (`('c'::character varying)::information_schema.character_data`,
+      `(x)::information_schema.sql_identifier`); 22 of them it would print
+      wrong that way, the rest it refuses.
+      Verify: tests/backlog/test_rp_found_rp782.py::test_pg_get_viewdef_of_the_remaining_system_views
       Backlog-ID: RP-798
 
 ## Found while working RP-808 (2026-11-10)

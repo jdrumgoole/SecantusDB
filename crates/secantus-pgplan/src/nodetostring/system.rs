@@ -97,3 +97,50 @@ fn lookup(cat: &Catalog, path: &[Oid], schema: &str, name: &str) -> Option<Oid> 
     };
     cat.rels_named(name).find(|r| r.nsp == nsp).map(|r| r.oid)
 }
+
+/// Every view the two files create: `(schema, name, query SQL)`, the
+/// query deparsed from the `CREATE VIEW` as `initdb` parses it, for
+/// `pg_get_viewdef` to print (RP-798).
+pub fn system_view_queries() -> &'static [(String, String, String)] {
+    static OUT: std::sync::OnceLock<Vec<(String, String, String)>> = std::sync::OnceLock::new();
+    OUT.get_or_init(|| {
+        let mut out = Vec::new();
+        for (file, schema) in [
+            (SYSTEM_VIEWS, "pg_catalog"),
+            (INFORMATION_SCHEMA, "information_schema"),
+        ] {
+            for chunk in split_initdb_file(file) {
+                let Ok(parsed) = pg_query::parse(&chunk) else {
+                    continue;
+                };
+                for raw in &parsed.protobuf.stmts {
+                    let Some(N::ViewStmt(v)) = raw.stmt.as_ref().and_then(|s| s.node.as_ref())
+                    else {
+                        continue;
+                    };
+                    let (Some(rv), Some(q)) = (v.view.as_ref(), v.query.as_ref()) else {
+                        continue;
+                    };
+                    let query = pg_query::protobuf::ParseResult {
+                        version: parsed.protobuf.version,
+                        stmts: vec![pg_query::protobuf::RawStmt {
+                            stmt: Some(Box::new((**q).clone())),
+                            stmt_location: 0,
+                            stmt_len: 0,
+                        }],
+                    };
+                    let Ok(sql) = pg_query::deparse(&query) else {
+                        continue;
+                    };
+                    let nsp = if rv.schemaname.is_empty() {
+                        schema
+                    } else {
+                        rv.schemaname.as_str()
+                    };
+                    out.push((nsp.to_string(), rv.relname.clone(), sql));
+                }
+            }
+        }
+        out
+    })
+}

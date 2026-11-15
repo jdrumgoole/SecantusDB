@@ -17487,7 +17487,52 @@ impl PgHandler {
                 .unwrap_or_else(|| format!(" {definition};"));
                 (oid, name, text)
             })
+            .chain(Self::system_view_defs(mode).iter().cloned())
             .collect()
+    }
+
+    /// Every `pg_catalog` view's definition, as `view_defs_as` prints it
+    /// in `mode` (RP-798): `system_views.sql`'s queries printed by ruleutils over the
+    /// system relations alone, once per process, as they are the same
+    /// for every database. A view the printer does not reproduce is left
+    /// out (NULL), never printed as written.
+    fn system_view_defs(mode: u8) -> &'static [(i64, String, String)] {
+        static DEFS: [OnceLock<Vec<(i64, String, String)>>; 3] =
+            [OnceLock::new(), OnceLock::new(), OnceLock::new()];
+        DEFS[usize::from(mode.min(2))].get_or_init(|| {
+            let queries = secantus_pgplan::nodetostring::system::system_view_queries();
+            let lookup = |n: &str| Self::virtual_table(n);
+            let view_sql = |n: &str| {
+                queries
+                    .iter()
+                    .find(|(_, v, _)| v == n)
+                    .map(|(_, _, q)| q.clone())
+            };
+            let cat = secantus_pgplan::ruleutils::Catalog {
+                lookup: &lookup,
+                view_sql: &view_sql,
+            };
+            catalog_meta::system_class_lines()
+                .filter_map(|line| {
+                    let mut f = line.split('\t');
+                    let oid: i64 = f.next()?.parse().ok()?;
+                    let name = f.next()?;
+                    let nsp = f.next()?;
+                    (f.next()? == "v").then_some(())?;
+                    // The printer types an `information_schema` domain cast
+                    // as the bare domain, where ruleutils qualifies it and
+                    // casts a literal to the base type first (RP-798).
+                    (nsp == "pg_catalog").then_some(())?;
+                    let (_, _, sql) = queries.iter().find(|(s, v, _)| s == nsp && v == name)?;
+                    let text = match mode {
+                        1 => secantus_pgplan::ruleutils::viewdef_pretty(sql, None, &cat),
+                        2 => secantus_pgplan::ruleutils::viewdef_marked(sql, None, &cat),
+                        _ => secantus_pgplan::ruleutils::viewdef(sql, None, &cat),
+                    }?;
+                    Some((oid, name.to_string(), text))
+                })
+                .collect()
+        })
     }
 
     fn views(&self) -> PgWireResult<Vec<(String, String)>> {
