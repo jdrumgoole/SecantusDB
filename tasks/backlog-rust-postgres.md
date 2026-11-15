@@ -1167,6 +1167,17 @@ one beside it.
       document insert / update / delete for `__`-prefixed collections, the
       keys a user transaction wrote re-logged at its commit, and the two
       readers patching their previous version by those keys.
+      Sized 2026-11-15: about 130 references to the composite catalog in
+      `secantus-pg` alone, written through `insert_type_doc` /
+      `delete_type_doc`, `insert_checked` and direct storage calls, and
+      undone by transaction and savepoint rollback. A key log kept in the
+      PG layer would miss whichever path is not routed through it, and that
+      would serve a stale catalog. The hook belongs on the storage's own
+      document write paths (`insert_one` / `insert_documents` /
+      `replace_by_id` / `delete_by_id` / `update_matching*` /
+      `delete_matching*`, transaction commit, collection drop) for
+      `__`-prefixed collections. That is shared code: plan it as its own
+      slice, gated with `--storage`.
       Backlog-ID: RP-911
       Verify: tests/backlog/test_rp_catalog_latency.py::test_the_first_catalog_query_after_ddl_costs_the_same_at_800_tables_within_a_tenth
 
