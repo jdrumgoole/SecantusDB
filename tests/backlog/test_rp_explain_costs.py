@@ -5008,6 +5008,41 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
     # (`order_qual_clauses`): the operator over a column before the one
     # over an expression. Here they keep the WHERE's order (found while
     # working RP-402).
+    # A coercion of a column that is a call costs an operator: a cast to
+    # numeric one, an integer's cast to text (`CoerceViaIO`) two
+    # (`cost_qual_eval`; measured on PostgreSQL 15.19, RP-406).
+    "a scan filter's coerced column after a cheaper conjunct": (
+        "RP-406",
+        _ANALYSED,
+        "explain (costs off) select * from e where a between 1 and 5.5 and b <> 'v3'",
+        [
+            "Seq Scan on e",
+            "  Filter: ((a >= 1) AND (b <> 'v3'::text) AND ((a)::numeric <= 5.5))",
+        ],
+    ),
+    "a scan filter's column cast to text after a cheaper conjunct": (
+        "RP-406",
+        _ANALYSED,
+        "explain (costs off) select * from e where a::text > '5' and b <> 'v1'",
+        [
+            "Seq Scan on e",
+            "  Filter: ((b <> 'v1'::text) AND ((a)::text > '5'::text))",
+        ],
+    ),
+    "a join's scan filter's column cast to text after a cheaper conjunct": (
+        "RP-406",
+        _ANALYSED_THIRTY,
+        "explain (costs off) select * from e x join s on s.a = x.a"
+        " where x.a::text > '5' and x.b <> 'v1'",
+        [
+            "Hash Join",
+            "  Hash Cond: (x.a = s.a)",
+            "  ->  Seq Scan on e x",
+            "        Filter: ((b <> 'v1'::text) AND ((a)::text > '5'::text))",
+            "  ->  Hash",
+            "        ->  Seq Scan on s",
+        ],
+    ),
     "a scan filter's conjuncts in cost order": (
         "RP-406",
         _ANALYSED,
@@ -5535,6 +5570,7 @@ def _marked(name: str, item: str) -> Any:
         "RP-903",
         "RP-924",
         "RP-925",
+        "RP-406",
     )
     mark = pytest.mark.backlog_fixed if fixed else pytest.mark.backlog
     return pytest.param(name, marks=mark(item), id=name)

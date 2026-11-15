@@ -4610,7 +4610,7 @@ pub fn explain_conjuncts(
             Some((text, qual_column(p)))
         })
         .collect::<Option<Vec<_>>>()
-        .map(|printed| qual_order(&parts, printed))
+        .map(|printed| qual_order(&parts, printed, &def_types(def)))
 }
 
 /// Each top-level `OR` conjunct of a WHERE, by the text
@@ -4719,9 +4719,10 @@ fn qual_column(p: &Node) -> Option<String> {
 fn qual_order(
     parts: &[std::borrow::Cow<'_, Node>],
     printed: Vec<(String, Option<String>)>,
+    types: &dyn Fn(&str) -> Option<String>,
 ) -> Vec<(String, Option<String>)> {
     let texts: Vec<&str> = printed.iter().map(|p| p.0.as_str()).collect();
-    match qual_permutation(parts, &texts) {
+    match qual_permutation(parts, &texts, types) {
         Some(order) => order.into_iter().map(|i| printed[i].clone()).collect(),
         None => printed,
     }
@@ -4729,7 +4730,11 @@ fn qual_order(
 
 /// [`qual_order`] as the positions of `parts` in PostgreSQL's order;
 /// `None` where it keeps them as written.
-fn qual_permutation(parts: &[std::borrow::Cow<'_, Node>], texts: &[&str]) -> Option<Vec<usize>> {
+fn qual_permutation(
+    parts: &[std::borrow::Cow<'_, Node>],
+    texts: &[&str],
+    types: &dyn Fn(&str) -> Option<String>,
+) -> Option<Vec<usize>> {
     use crate::costsize::CPU_OPERATOR_COST as OP;
     let literal = |n: Option<&Node>| match n.and_then(|n| n.node.as_ref()) {
         Some(N::AConst(_)) => true,
@@ -4743,14 +4748,49 @@ fn qual_permutation(parts: &[std::borrow::Cow<'_, Node>], texts: &[&str]) -> Opt
         Some(N::ColumnRef(c)) => names(&c.fields).pop(),
         _ => None,
     };
+    // Any other clause built only of what `cost_qual_eval` prices by its
+    // operators (RP-406): those operators, and one more per coercion of a
+    // column the printer shows (`(a)::numeric`, a function call; a
+    // relabelling to text is free). An equality stays unmodelled: it
+    // joins an equivalence class, which is placed otherwise.
+    let priced = |n: &Node, text: &str| -> Option<(f64, Option<String>)> {
+        // A cast written on a column is priced from the text, as the
+        // printer's coercions are.
+        let mut bare = n.clone();
+        let _ = crate::walk_expr(&mut bare, &mut |x| {
+            if let Some(N::TypeCast(t)) = x.node.as_ref() {
+                if let Some(arg) = t
+                    .arg
+                    .as_deref()
+                    .filter(|a| matches!(a.node, Some(N::ColumnRef(_))))
+                {
+                    *x = arg.clone();
+                }
+            }
+            Ok(())
+        });
+        let n = &bare;
+        if !crate::joins::priced_by_operator_count(n) {
+            return None;
+        }
+        if let Some(N::AExpr(e)) = n.node.as_ref() {
+            if e.kind == AExprKind::AexprOp as i32 && crate::operator_name(e).ok()? == "=" {
+                return None;
+            }
+        }
+        Some((
+            (crate::joins::qual_operators(n) + column_coercions(text, types) as f64) * OP,
+            None,
+        ))
+    };
     // (cost, the column of an equivalence class it joins).
     let classify = |n: &Node, text: &str| -> Option<(f64, Option<String>)> {
         // A coercion of the column that is a function call (not varchar's
-        // relabelling to text) costs an operator more: not modelled.
+        // relabelling to text) costs an operator more.
         if text.starts_with("((") && !text.contains(")::text ") {
-            return None;
+            return priced(n, text);
         }
-        match n.node.as_ref()? {
+        (|| match n.node.as_ref()? {
             N::AExpr(e) if e.kind == AExprKind::AexprOp as i32 => {
                 let op = crate::operator_name(e).ok()?;
                 if !matches!(op, "=" | "<>" | "!=" | "<" | "<=" | ">" | ">=") {
@@ -4783,7 +4823,8 @@ fn qual_permutation(parts: &[std::borrow::Cow<'_, Node>], texts: &[&str]) -> Opt
                 Some((0.0, None))
             }
             _ => None,
-        }
+        })()
+        .or_else(|| priced(n, text))
     };
     let mut keyed = Vec::with_capacity(texts.len());
     let mut classes: Vec<String> = Vec::new();
@@ -4801,6 +4842,57 @@ fn qual_permutation(parts: &[std::borrow::Cow<'_, Node>], texts: &[&str]) -> Opt
     keyed.sort_by_key(|k| k.0);
     keyed.sort_by(|a, b| a.1.total_cmp(&b.1));
     Some(keyed.into_iter().map(|(_, _, i)| i).collect())
+}
+
+/// A table's column types by name, for [`qual_order`].
+fn def_types(def: &TableDef) -> impl Fn(&str) -> Option<String> + '_ {
+    |col| {
+        def.columns
+            .iter()
+            .find(|c| c.name == col)
+            .map(|c| c.pg_type.clone())
+    }
+}
+
+/// The coercions of a column a printed qual shows that are a call
+/// (`(a)::numeric`), each costing one operator; a relabelling to text is
+/// free, a cast of a column of a type with no binary coercion to text a
+/// `CoerceViaIO` of two (output and input function). A column whose type
+/// `types` does not know counts a cast to text as free.
+fn column_coercions(text: &str, types: &dyn Fn(&str) -> Option<String>) -> usize {
+    let b = text.as_bytes();
+    let mut count = 0;
+    for (i, _) in text.match_indices(")::") {
+        // `(ident)::` -- a column, not a parenthesised expression or a
+        // quoted literal.
+        let Some(open) = text[..i].rfind('(') else {
+            continue;
+        };
+        let inner = &text[open + 1..i];
+        if inner.is_empty()
+            || !inner
+                .bytes()
+                .all(|c| c.is_ascii_alphanumeric() || c == b'_' || c == b'.' || c == b'"')
+            || inner.bytes().next().is_some_and(|c| c.is_ascii_digit())
+        {
+            continue;
+        }
+        let rest = &text[i + 3..];
+        if rest.starts_with("text") && !b.get(i + 7).is_some_and(|c| c.is_ascii_alphanumeric()) {
+            let ty = types(inner.trim_matches('"'));
+            if ty.is_some_and(|t| {
+                !matches!(
+                    base_type(&t).as_str(),
+                    "text" | "varchar" | "character varying" | "bpchar" | "character" | "name"
+                )
+            }) {
+                count += 2;
+            }
+            continue;
+        }
+        count += 1;
+    }
+    count
 }
 
 /// Each JOIN's ON condition in a SELECT's FROM, post-order (a left-deep
@@ -5094,7 +5186,17 @@ pub fn join_where(s: &pg_query::protobuf::SelectStmt, cat: &Catalog<'_>) -> Opti
         let column = home.as_ref().and_then(|_| qual_column(part));
         out.push((text, home, column));
     }
-    order_scan_quals(&mut out, &parts);
+    let types = |home: &str, col: &str| {
+        p.scopes
+            .last()?
+            .iter()
+            .find(|r| r.refname == home || r.name == home)?
+            .columns
+            .iter()
+            .find(|c| c.0 == col)
+            .map(|c| c.1.clone())
+    };
+    order_scan_quals(&mut out, &parts, &types);
     Some(out)
 }
 
@@ -5102,7 +5204,11 @@ pub fn join_where(s: &pg_query::protobuf::SelectStmt, cat: &Catalog<'_>) -> Opti
 /// the order a lone scan's are ([`qual_order`], RP-398), back in the
 /// positions they held; left as they are when the two lists differ in
 /// length.
-fn order_scan_quals(quals: &mut [JoinQual], parts: &[std::borrow::Cow<'_, Node>]) {
+fn order_scan_quals(
+    quals: &mut [JoinQual],
+    parts: &[std::borrow::Cow<'_, Node>],
+    types: &dyn Fn(&str, &str) -> Option<String>,
+) {
     if quals.len() != parts.len() {
         return;
     }
@@ -5121,7 +5227,7 @@ fn order_scan_quals(quals: &mut [JoinQual], parts: &[std::borrow::Cow<'_, Node>]
         let mine: Vec<std::borrow::Cow<'_, Node>> =
             slots.iter().map(|i| parts[*i].clone()).collect();
         let texts: Vec<&str> = slots.iter().map(|i| quals[*i].0.as_str()).collect();
-        if let Some(order) = qual_permutation(&mine, &texts) {
+        if let Some(order) = qual_permutation(&mine, &texts, &|c| types(h, c)) {
             let moved: Vec<JoinQual> = order.iter().map(|k| quals[slots[*k]].clone()).collect();
             for (slot, q) in slots.iter().zip(moved) {
                 quals[*slot] = q;
@@ -5149,7 +5255,7 @@ pub fn order_merged_scan_quals(quals: &mut [JoinQual]) {
     if let Some(nodes) = nodes {
         let parts: Vec<std::borrow::Cow<'_, Node>> =
             nodes.iter().map(std::borrow::Cow::Borrowed).collect();
-        order_scan_quals(quals, &parts);
+        order_scan_quals(quals, &parts, &|_, _| None);
     }
 }
 
@@ -5392,7 +5498,7 @@ pub fn explain_subquery_conjuncts(where_clause: &Node, def: &TableDef) -> Option
         .collect::<Option<Vec<_>>>()?;
     // In the planner's order, as a scan's (RP-348).
     Some(
-        qual_order(&parts, printed)
+        qual_order(&parts, printed, &def_types(def))
             .into_iter()
             .map(|(text, _)| text)
             .collect(),

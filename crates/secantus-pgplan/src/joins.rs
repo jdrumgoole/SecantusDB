@@ -3873,7 +3873,7 @@ fn in_list_of_constants(e: &pg_query::protobuf::AExpr) -> Option<usize> {
 /// list of constants ([`qual_startup_operators`] its hash table's build),
 /// AND / OR / NOT, columns and constants. A null test, a call (a LIKE's
 /// ESCAPE is `like_escape`) or a cast of a column costs otherwise.
-fn priced_by_operator_count(n: &pg_query::protobuf::Node) -> bool {
+pub(crate) fn priced_by_operator_count(n: &pg_query::protobuf::Node) -> bool {
     priced_by(n, false)
 }
 

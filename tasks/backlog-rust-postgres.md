@@ -2040,22 +2040,6 @@ a regression test.
       working RP-354).
       Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a like with an escape clause is a folded pattern]
       Backlog-ID: RP-915
-- [ ] **A lone scan's Filter does not put an expression's conjunct
-      after a cheaper one.** PostgreSQL 15.19 orders a qual list cheapest
-      first (`order_qual_clauses`, by `cost_qual_eval`): `select * from e
-      where a + 1 > 996 and b = 'v1'` is `Filter: ((b = 'v1'::text) AND
-      ((a + 1) > 996))`, the expression's two operators after the
-      column's one. Here the conjuncts are printed as written (a join's
-      scan shares that ordering, so is wrong the same way). Measured
-      on a private 15.19 cluster (found while working RP-403). The same
-      for an OR, which costs its operators (`a not between 15 and 55 and b
-      <> 'v3'` is `Filter: ((b <> 'v3'::text) AND ((a < 15) OR (a >
-      55)))`), and for a coerced column (`a between 1 and 5.5 and b <>
-      'v3'` puts `((a)::numeric <= 5.5)` after `(b <> 'v3'::text)`, the
-      cast a function call); here both keep the written order (found while
-      working RP-399).
-      Backlog-ID: RP-406
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a scan filter's conjuncts in cost order], tests/backlog/test_rp_explain_costs.py::test_plan[a scan filter's or after a cheaper conjunct]
 - [ ] **A constant coerced to its operator's type prints unfolded.**
       PostgreSQL 15.19 folds the coercion of an integer literal compared
       with a numeric before it prints the qual
