@@ -591,6 +591,22 @@ pub fn create(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         storage
             .create_index(&ctx.db_name, &coll, &name, &key, &spec)
             .map_err(command_error)?;
+        // mongod builds it over the buckets, keyed as it keys it there
+        // (`{meta: 1, control.min.t: 1, control.max.t: 1}`): a read of the
+        // meta field scans it (RM-457).
+        if let Some(layout) = crate::ts_store::layout_of(storage, &ctx.db_name, &coll) {
+            let on_buckets = crate::ts_buckets::bucket_key(&key, &layout);
+            let spec = doc! { "key": on_buckets.clone(), "name": name.clone() };
+            storage
+                .create_index(
+                    &ctx.db_name,
+                    &crate::ts_store::buckets_ns(&coll),
+                    &name,
+                    &on_buckets,
+                    &spec,
+                )
+                .map_err(command_error)?;
+        }
     }
     Ok(doc! { "ok": 1.0 })
 }
@@ -1946,6 +1962,7 @@ pub(crate) fn listed_indexes(
         ix.remove("buildSeq");
         ix.remove("binDataOrder");
         ix.remove("multikeyPaths");
+        ix.remove(TS_ORIGINAL_SPEC);
         *ix = listed_spec(std::mem::take(ix));
     }
     // The `_id` index of a collection with a default collation carries it.
@@ -2473,6 +2490,19 @@ pub fn create_indexes(doc: &Document, ctx: &mut CommandContext) -> HandlerResult
         // falsy value is dropped so it doesn't come back from listIndexes
         // (mongo-ruby-driver `hidden is false` asserts hidden isn't echoed).
         let mut spec = s.clone();
+        // A partial index on a time-series collection keeps the spec as
+        // asked, which `listIndexes` of its buckets shows as `originalSpec`
+        // (mongod 8.2.11): the fields as given, then `key` and `v` (RM-548).
+        if ts_fields.is_some() && s.contains_key("partialFilterExpression") {
+            let mut original: Document = s
+                .iter()
+                .filter(|(k, _)| k.as_str() != "key" && k.as_str() != "v")
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect();
+            original.insert("key", key.clone());
+            original.insert("v", s.get("v").cloned().unwrap_or(Bson::Int32(2)));
+            spec.insert(TS_ORIGINAL_SPEC, original);
+        }
         for opt in ["hidden", "sparse", "unique"] {
             if spec.get(opt).is_some_and(is_falsy) {
                 spec.remove(opt);
@@ -3942,7 +3972,12 @@ fn equivalent_spec_text(spec: &Document) -> String {
 /// The options that make two index specs different indexes.
 /// Catalog bookkeeping that is not part of an index's options (and that
 /// `listIndexes` already hides from clients).
+/// The catalog's copy of a time-series partial index's spec as asked
+/// (RM-548), listed on the buckets as `originalSpec`.
+pub(crate) const TS_ORIGINAL_SPEC: &str = "timeseriesOriginalSpec";
+
 pub(crate) const INDEX_CATALOG_ONLY: &[&str] = &[
+    TS_ORIGINAL_SPEC,
     // `createIndexes`'s own mark on an index still being built (RM-187).
     BUILDING_MARK,
     "entryFormat",

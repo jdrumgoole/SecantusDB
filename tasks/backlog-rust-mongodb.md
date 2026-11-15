@@ -2769,32 +2769,34 @@ cursor options, `getMore`, `killCursors`, the cursors of `aggregate` and the
 listing commands, tailable cursors, `count`, `distinct`). The Rust server
 differs on 5 scenarios. What is left:
 
-- [ ] **RUST MongoDB server: a time-series `aggregate` that needs only
-      some fields reads the collection at the command.** Behind an inclusion
-      `$project` (`{$project: {v: 1}}`) mongod 8.2.11 reads the buckets one
-      at a time as the cursor asks, not 32 at once: over the same 100
-      buckets it returns 71 more after the delete (the rest of the first
-      bucket), and this server, which streams only stages that need the
-      whole measurement, 3,999. Likely its slot-based engine, which takes
-      `$_internalUnpackBucket` once the fields it must unpack are known;
-      not yet confirmed from `explain`. Measured 2026-11-09.
-      Backlog-ID: RM-456
-      Verify: tests/backlog/test_rm_found_2026_11_09_rm348.py::test_a_time_series_projection_reads_a_bucket_at_a_time
-- [ ] **RUST MongoDB server: a time-series read an index over the buckets
-      could answer reads the collection at the command.** A filter on the
-      meta field (`{m: {$lt: 40}}`) is an index scan of the default
-      `m_1_t_1` index for mongod 8.2.11, which buffers 32 buckets in that
-      index's order -- series by series -- and returns 1,279 more after the
-      delete; this server reads such a read (and any over a collection with
-      an index of its own, or under a hint or a collation) whole: 3,199.
-      The buckets are stored since 2026-11-11, but the indexes are not
-      built over them: a time-series collection's index specs are kept on
-      the collection, every read scans the buckets in `_id` order, and
-      `collStats` reports its index sizes as 0. Streaming it means indexes
-      over the buckets and a bucket scan in an index's order. Measured
-      2026-11-09.
-      Backlog-ID: RM-457
-      Verify: tests/backlog/test_rm_found_2026_11_09_rm348.py::test_a_time_series_read_of_the_meta_index_buffers_its_buckets
+- [ ] **RUST MongoDB server: a time-series read under a hint, or over a
+      collection with an index of its own, reads the collection at the
+      command.** Hinted to `m_1_t_1` (`{$match: {v: {$gte: 0}}}`), mongod
+      8.2.11 scans that index over the buckets, buffering 32 series by
+      series, and returns 1,279 more after the delete; this server reads it
+      whole: 3,999. So too a read under a collation, and any read of a
+      collection with an index besides the default one. Since RM-457 the
+      default `m_1_t_1` index is built over the buckets at create and a
+      filter on the meta field scans it; an index `createIndexes` adds is
+      kept on the collection only, `dropIndexes` leaves the bucket copy of
+      `m_1_t_1` in place, and `collStats` still reports index sizes of 0.
+      Found while working RM-457, 2026-11-15.
+      Verify: tests/backlog/test_rm_found_2026_11_09_rm348.py::test_a_hinted_time_series_read_scans_the_index_over_the_buckets
+      Backlog-ID: RM-701
+- [ ] **RUST MongoDB server: an insert into a time-series bucket the TTL
+      monitor removes fails.** Inserting into a bucket that has expired
+      while the TTL monitor runs every second, mongod 8.2.11 never fails an
+      insert (it writes a new bucket); this server returns the write error
+      112, "the time-series bucket was removed while it was written"
+      (`bucket_catalog.rs`: the update of the open bucket matched nothing),
+      to the client. Seen once in `tests/mongod_live/test_time_series_buckets.py::test_ttl_expires_whole_buckets`
+      in a gate run, reproduced by the gap test (a race: it inserts until
+      the first failure, up to 90 TTL passes). Also read, not yet probed:
+      `commit` returns `Ok` without writing when the bucket it staged into
+      is no longer open (`ts_store`'s delete clears it first), which may
+      lose a staged insert silently. Found working RM-456, 2026-11-15.
+      Verify: tests/backlog/test_rm_found_rm456.py::test_an_insert_into_a_bucket_the_ttl_monitor_removes_succeeds
+      Backlog-ID: RM-702
 - **Not probed (RM-083's remainder, 2026-10-17)** -- `oplogReplay`,
   `$meta: "textScore"` sorts, an `explain: true` aggregate. Every
   `{$meta}` shape measured on 8.2.11 matches since 2026-10-17, except a
@@ -2817,13 +2819,8 @@ scenarios (no server-side JavaScript, a scope decision), the collation key
 of a duplicate-key message (7.078) and the `createIndexes` below. The probe
 masks only the write-conflict cause. What is left:
 
-- [ ] **RUST MongoDB server: smaller differences.** A write conflict on
-      an insert has an empty cause where mongod names its index and table
-      (`Caused by :: WiredTigerIdIndex::_insert: index: _id_; uri:
-      table:<ident> ::`). A retryable insert counts a null among its
-      `documents` against `stmtIds` and refuses it (16), where mongod drops
-      the null first and inserts. The other session errors are worded for a
-      session with no user (not measured with one). A `createIndexes` that
+- [ ] **RUST MongoDB server: smaller differences.** The session errors
+      are worded for a session with no user (not measured with one). A `createIndexes` that
       waits on a transaction past `maxTimeMS` (the probe's "an index built
       under a transaction"): mongod 8.2.11 adds a `writeConcernError` (50)
       to its 50 in 2 runs of 2 on 2026-11-09, where this server answers a
@@ -2831,7 +2828,7 @@ masks only the write-conflict cause. What is left:
       and oplog-entry dumps of the statement-id and `findAndModify` retry
       errors are mongod's since 2026-11-09.)
       Backlog-ID: RM-087
-      Verify: tests/backlog/test_rm_085_112.py::test_an_insert_conflict_names_the_index_table, tests/backlog/test_rm_085_112.py::test_a_retryable_insert_does_not_count_a_null
+      Verify: none -- the wording is unmeasured with a user, and mongod's writeConcernError on the createIndexes timeout varies between runs (2 of 2 then, 0 of 12 before), so no test can pin one answer
 
 ### 7.071 Time-series collections -- 2026-10-11
 
@@ -2848,19 +2845,6 @@ bucket documents in `system.buckets.<name>`, each data field mongod's
 compressed column, placed by mongod's bucket catalog
 (`crates/secantus-commands/src/bucket_catalog.rs`). What is left:
 
-- [ ] **RUST MongoDB server: `listIndexes` of `system.buckets.<name>`
-      shows a TTL or partial index as the time-series collection keeps it.**
-      mongod 8.2.11 keeps a TTL index on the time field as
-      `{control.min.<time>: 1}` on the buckets, its partial filter on the
-      meta field as one on `meta` (`{meta: {$eq: "a"}}`), and the index as
-      asked in `originalSpec`; this server lists the bound pair
-      `{control.min.t: 1, control.max.t: 1}` and the filter as given, with
-      no `originalSpec`. The index specs are kept on the time-series
-      collection and translated for the listing (`ts_bucket_ns::bucket_indexes`);
-      the TTL pass already expires buckets by `control.min.<time>`.
-      Measured 2026-11-11.
-      Verify: tests/backlog/test_rm_found_2026_11_11_rm088.py::test_bucket_indexes_list_a_ttl_index_as_mongod_keeps_it
-      Backlog-ID: RM-548
 - [ ] **RUST MongoDB server: the bucket catalog keeps no account of its
       memory.** mongod 8.2.11 reports a `bucketCatalog` section in
       `serverStatus` once a time-series collection is written to
@@ -2881,16 +2865,6 @@ compressed column, placed by mongod's bucket catalog
       decided 2026-10-16) does not depend on it and is built.
       Verify: tests/backlog/test_rm_found_2026_11_11_rm088.py::test_server_status_reports_the_bucket_catalog
       Backlog-ID: RM-549
-- [ ] **RUST MongoDB server: a measurement holding a BSONColumn binary
-      is stored** (found 2026-11-09 while building the bucket encoder).
-      mongod 8.2.11 refuses a measurement whose data field is, or holds at
-      any depth, a binary of subtype 7: `12506300`, `time-series insert
-      failed: <ns> :: caused by :: Timeseries collections cannot store
-      BSONColumn data`, and stores nothing; this server inserts it. The
-      check is `BSONColumnBuilder::append`'s, so it covers the data fields
-      only (the meta field is not appended to a column; not measured).
-      Backlog-ID: RM-462
-      Verify: tests/backlog/test_rm_462.py::test_a_measurement_cannot_hold_a_bsoncolumn
 - **Scope decision — a `hashed` index on a time-series collection** is
   refused as on any collection: hashed indexes are out of scope.
 - **Scope decision — `listCollections` order around time-series buckets.**

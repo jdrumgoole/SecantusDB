@@ -305,6 +305,16 @@ pub(crate) struct BucketScan {
     filter: Document,
     /// The `_id` of the last bucket buffered.
     after: Option<[u8; 12]>,
+    /// The index over the buckets the scan reads in the order of, and the
+    /// last entry it reached and the buckets it has met (a multikey index
+    /// holds a bucket more than once).
+    index: Option<IndexPosition>,
+}
+
+struct IndexPosition {
+    name: String,
+    last: Option<(Vec<u8>, i64)>,
+    seen: std::collections::HashSet<i64>,
 }
 
 /// What one refill of a [`BucketScan`] buffered.
@@ -347,7 +357,38 @@ impl BucketScan {
             layout,
             filter,
             after: None,
+            index: None,
         }))
+    }
+
+    /// This scan read in the order of index `name` over the buckets, as
+    /// mongod's IXSCAN of it under `$_internalUnpackBucket`; `None` when
+    /// the buckets hold no such index or the store cannot stream it.
+    pub(crate) fn through_index(
+        mut self,
+        storage: &dyn crate::storage::Storage,
+        name: &str,
+    ) -> Result<Option<BucketScan>, crate::storage::StorageError> {
+        let ns = crate::ts_store::buckets_ns(&self.coll);
+        if !storage
+            .list_indexes(&self.db, &ns)?
+            .iter()
+            .any(|ix| ix.get_str("name") == Ok(name))
+        {
+            return Ok(None);
+        }
+        if storage
+            .index_entries_from(&self.db, &ns, name, &[], None, 0, false)?
+            .is_none()
+        {
+            return Ok(None);
+        }
+        self.index = Some(IndexPosition {
+            name: name.to_string(),
+            last: None,
+            seen: Default::default(),
+        });
+        Ok(Some(self))
     }
 
     /// The bucket-level filter names the meta field, which an index over
@@ -376,6 +417,9 @@ impl BucketScan {
         want: usize,
         max_bytes: usize,
     ) -> Result<Buffered, CommandError> {
+        if self.index.is_some() {
+            return self.next_indexed(storage, want, max_bytes);
+        }
         let rows = crate::ts_store::stored_bucket_bytes(storage, &self.db, &self.coll)?;
         let mut out = Buffered {
             docs: Vec::new(),
@@ -412,6 +456,84 @@ impl BucketScan {
             }
         }
         Ok(out)
+    }
+}
+
+impl BucketScan {
+    /// [`Self::next_buffer`] through the index: its entries from the last
+    /// one reached, each bucket fetched as it is now.
+    fn next_indexed(
+        &mut self,
+        storage: &dyn crate::storage::Storage,
+        want: usize,
+        max_bytes: usize,
+    ) -> Result<Buffered, CommandError> {
+        let ns = crate::ts_store::buckets_ns(&self.coll);
+        let err = |e| crate::util::command_error(e);
+        let mut out = Buffered {
+            docs: Vec::new(),
+            exhausted: false,
+            examined: 0,
+        };
+        let (mut count, mut bytes) = (0usize, 0usize);
+        const CHUNK: usize = 64;
+        loop {
+            if count >= want || (count > 0 && bytes > max_bytes) {
+                return Ok(out);
+            }
+            let Some(pos) = self.index.as_mut() else {
+                out.exhausted = true;
+                return Ok(out);
+            };
+            let (from, after) = match &pos.last {
+                Some((k, rid)) => (k.clone(), Some(*rid)),
+                None => (Vec::new(), None),
+            };
+            let entries = storage
+                .index_entries_from(&self.db, &ns, &pos.name, &from, after, CHUNK, false)
+                .map_err(err)?
+                .unwrap_or_default();
+            if entries.is_empty() {
+                out.exhausted = true;
+                return Ok(out);
+            }
+            let mut stopped = false;
+            for (key, rid) in entries {
+                if count >= want || (count > 0 && bytes > max_bytes) {
+                    stopped = true;
+                    break;
+                }
+                let pos = self.index.as_mut().expect("indexed scan");
+                pos.last = Some((key, rid));
+                if !pos.seen.insert(rid) {
+                    continue;
+                }
+                let Some(Some(raw)) = storage
+                    .records_by_id(&self.db, &ns, &[rid])
+                    .map_err(err)?
+                    .and_then(|mut v| v.pop())
+                else {
+                    continue;
+                };
+                out.examined += 1;
+                let document = secantus_core::bsondoc::from_bytes(&raw[..])
+                    .map_err(|e| CommandError::new(8, "UnknownError", e.to_string()))?;
+                if !self.filter.is_empty() && !bucket_matches(&document, &self.filter)? {
+                    continue;
+                }
+                bytes += raw.len();
+                count += 1;
+                for m in crate::ts_store::unpack(&document, &self.layout)? {
+                    out.docs.push(
+                        crate::bsondoc::to_vec(&m)
+                            .map_err(|e| CommandError::new(8, "UnknownError", e.to_string()))?,
+                    );
+                }
+            }
+            if stopped {
+                return Ok(out);
+            }
+        }
     }
 }
 

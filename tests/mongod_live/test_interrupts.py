@@ -273,7 +273,11 @@ def _killed_batch(client: Any, ordered: bool) -> tuple:
         "lsid": lsid,
         "txnNumber": Int64(5),
     }
-    reply, _ = slow.killed(command, "killSessions", lsid=lsid)
+    # Kill once the first statement has committed, not at a fixed 0.3 s: on
+    # CI's debug build none had by then, and a batch killed before its first
+    # statement keeps nothing (PR #2764, 2026-11-15), as `_killed_bulk_write`
+    # found for bulkWrite (#2689).
+    reply, _ = slow.killed(command, "killSessions", lsid=lsid, until=lambda: slow.state()[1] >= 1)
     count, applied = slow.state()
     retry = slow.run(command)
     # Where the kill lands decides the wrapper, on mongod as here: inside a

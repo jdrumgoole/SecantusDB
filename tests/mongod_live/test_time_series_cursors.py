@@ -67,6 +67,13 @@ SCENARIOS: dict[str, tuple[list, Callable[[Any], None]]] = {
     "then $addFields": ([MATCH, {"$addFields": {"w": 1}}], _delete_all),
     "then $unset": ([MATCH, {"$unset": "m"}], _delete_all),
     "then an exclusion $project": ([MATCH, {"$project": {"m": 0}}], _delete_all),
+    "then an inclusion $project (RM-456)": ([MATCH, {"$project": {"v": 1}}], _delete_all),
+    "an inclusion $project leaving out _id": (
+        [MATCH, {"$project": {"v": 1, "_id": 0}}],
+        _delete_all,
+    ),
+    "an inclusion $project before a $match": ([{"$project": {"v": 1}}, MATCH], _delete_all),
+    "an inclusion $project alone": ([{"$project": {"v": 1, "_id": 0}}], _delete_all),
     "then $skip": ([MATCH, {"$skip": 1}], _delete_all),
     "then $limit": ([MATCH, {"$limit": 5000}], _delete_all),
     "a later bucket written, an earlier one passed": ([], _write_late_and_early),

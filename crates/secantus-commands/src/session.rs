@@ -952,6 +952,8 @@ fn statement(
     let mut result = {
         let mut t = txn.lock().unwrap_or_else(|e| e.into_inner());
         let handle = t.handle.as_mut().expect("handle created above").as_mut();
+        // A cause left by an earlier statement is not this one's.
+        let _ = storage.take_write_conflict_cause();
         match storage.run_in_user_transaction(handle, &mut || crate::run_handler(handler, doc, ctx))
         {
             Ok(r) => r,
@@ -971,11 +973,16 @@ fn statement(
         return result;
     }
     if name == "insert" && code == 112 {
-        // An insert conflicts on an index, and mongod names its own table for
-        // that index as the cause, or nothing.
+        // An insert conflicts on an index, and mongod names that index and
+        // its table as the cause (`WiredTigerIdIndex::_insert: ...` for the
+        // `_id` index), or nothing where the storage does not say (RM-087).
+        let cause = storage.take_write_conflict_cause().unwrap_or_default();
         result.insert(
             "errmsg",
-            "Caused by ::  :: Please retry your operation or multi-document transaction.",
+            format!(
+                "Caused by :: {cause} :: Please retry your operation or multi-document \
+                 transaction."
+            ),
         );
     }
     crate::finish_txn_statement(registry, txn, &mut result);
@@ -1247,9 +1254,11 @@ fn retryable_write(
     // The statement ids are part of the command: a malformed set is refused
     // before the session's number moves.
     let count = match name {
+        // mongod drops a null from `documents` before it counts them
+        // against `stmtIds` (RM-087, 8.2.11).
         "insert" => match (&ctx.raw_insert_documents, doc.get_array("documents")) {
             (Some(raw), _) => raw.len(),
-            (None, Ok(docs)) => docs.len(),
+            (None, Ok(docs)) => docs.iter().filter(|d| !matches!(d, Bson::Null)).count(),
             _ => 0,
         },
         "update" => doc.get_array("updates").map_or(0, Vec::len),

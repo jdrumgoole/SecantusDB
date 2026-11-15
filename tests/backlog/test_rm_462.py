@@ -25,10 +25,10 @@ def _insert_column(client: Any, value: Any) -> tuple:
     return got, stored
 
 
-@pytest.mark.backlog("RM-462")
+@pytest.mark.backlog_fixed("RM-462")
 def test_a_measurement_cannot_hold_a_bsoncolumn(rust_mongo: Any, mongod: Any) -> None:
     """mongod 8.2.11 refuses a data field that is, or holds, a binary of
-    subtype 7, and stores nothing (the Rust server inserts it)."""
+    subtype 7, and stores nothing; the Rust server inserted it."""
     column = bson.Binary(b"\x10\x00\x01\x00\x00\x00\x00", 7)
     refused = (
         "err",

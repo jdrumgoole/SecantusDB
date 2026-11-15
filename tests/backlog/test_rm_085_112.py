@@ -361,12 +361,12 @@ def test_a_find_and_modify_retry_quotes_the_request_and_its_oplog_entry(
     assert got == ref
 
 
-@pytest.mark.backlog("RM-087")
+@pytest.mark.backlog_fixed("RM-087")
 def test_an_insert_conflict_names_the_index_table(rust_mongo: Any, mongod_rs: Any) -> None:
     """mongod 8.2.11: a transaction's insert of an `_id` another open
     transaction inserted answers 112, naming the index and the table it
     conflicted in (`WiredTigerIdIndex::_insert: index: _id_; uri:
-    table:<ident>`); the Rust server's cause is empty."""
+    table:<ident>`); the Rust server's cause was empty until 2026-11-15."""
     coll = _name("rm087")
 
     def probe(client: Any) -> str:
@@ -388,12 +388,12 @@ def test_an_insert_conflict_names_the_index_table(rust_mongo: Any, mongod_rs: An
     assert got == ref
 
 
-@pytest.mark.backlog("RM-087")
+@pytest.mark.backlog_fixed("RM-087")
 def test_a_retryable_insert_does_not_count_a_null(rust_mongo: Any, mongod_rs: Any) -> None:
     """mongod 8.2.11 drops a null from an insert's `documents` before it
     counts them against `stmtIds`: a retryable insert of `[{_id: 1}, null]`
     with one statement id inserts the document. The Rust server's session
-    layer counts the null and refuses it (16)."""
+    layer counted the null and refused it (16) until 2026-11-15."""
     coll = _name("rm087")
     request = SON(
         [
