@@ -116,9 +116,10 @@ NAMED_ARGUMENTS = {
 }
 
 
-@pytest.mark.backlog("RP-677")
+@pytest.mark.backlog_fixed("RP-677")
 @pytest.mark.parametrize("query", list(NAMED_ARGUMENTS))
 def test_named_argument_to_a_builtin_without_argument_names(query: str, rust_pg: Any) -> None:
-    """A named argument to `nextval` is 0A000 `NamedArgExpr is not
-    supported yet` here, with no position."""
+    """A named argument to `nextval` was 0A000 `NamedArgExpr is not
+    supported yet` here, with no position; it is now 42883 naming the call
+    with the argument as `name => type`, as on PostgreSQL."""
     assert answer(rust_pg, query) == NAMED_ARGUMENTS[query]

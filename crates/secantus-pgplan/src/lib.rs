@@ -4121,21 +4121,66 @@ fn refuse_qualified_builtins(node: &N) -> Result<()> {
     Ok(())
 }
 
+/// A named argument matches only a parameter `pg_proc.proargnames` names
+/// (`FuncnameGetCandidates` / `MatchNamedCall`): a built-in with no
+/// argument names at all, `nextval` say, has no candidate for such a call,
+/// which is 42883 naming it with each named argument as `name => type`.
+fn refuse_named_args_to_unnamed_builtins(node: &N) -> Result<()> {
+    for (n, _, _, _) in node.nodes() {
+        let pg_query::NodeRef::FuncCall(f) = n else {
+            continue;
+        };
+        if !f
+            .args
+            .iter()
+            .any(|a| matches!(a.node.as_ref(), Some(N::NamedArgExpr(_))))
+        {
+            continue;
+        }
+        let Some(name) = func_name(f) else {
+            continue;
+        };
+        if f.funcname.len() > 1 && !func_schema_is_pg_catalog(f) {
+            continue;
+        }
+        if !funcsig::is_builtin_function_name(&name)
+            || named_args::has_argument_names(&name)
+            || correlated::user_function_named(&name)
+        {
+            continue;
+        }
+        return Err(no_such_call(f, &name));
+    }
+    Ok(())
+}
+
+fn func_schema_is_pg_catalog(f: &pg_query::protobuf::FuncCall) -> bool {
+    matches!(
+        f.funcname.first().and_then(|n| n.node.as_ref()),
+        Some(N::String(s)) if s.sval == "pg_catalog"
+    )
+}
+
 /// 42883 for a call PostgreSQL finds no function for, at the call, its
 /// arguments' types as it prints them (`unknown` for a bare literal).
 fn no_such_call(f: &pg_query::protobuf::FuncCall, written: &str) -> Error {
-    let types: Vec<String> = f
-        .args
-        .iter()
-        .map(|a| match a.node.as_ref() {
+    fn arg_type(a: &pg_query::protobuf::Node) -> String {
+        match a.node.as_ref() {
             Some(N::AConst(c))
                 if c.isnull || matches!(c.val, Some(pg_query::protobuf::a_const::Val::Sval(_))) =>
             {
                 "unknown".to_string()
             }
+            // `funcname_signature_string` prints a named argument as
+            // `name => type`.
+            Some(N::NamedArgExpr(na)) => match na.arg.as_deref() {
+                Some(v) => format!("{} => {}", na.name, arg_type(v)),
+                None => format!("{} => unknown", na.name),
+            },
             _ => display_type(&static_type(a, &Bson::Null)),
-        })
-        .collect();
+        }
+    }
+    let types: Vec<String> = f.args.iter().map(arg_type).collect();
     set_error_location(f.location);
     Error::UndefinedFunction(format!(
         "function {written}({}) does not exist",
@@ -6108,6 +6153,7 @@ fn plan_node(
     schemas::resolve_shadowed_calls(&mut node, lookup)?;
     collation::citext_operators(&mut node, lookup)?;
     refuse_qualified_builtins(&node)?;
+    refuse_named_args_to_unnamed_builtins(&node)?;
     refuse_invisible_extension_functions(&node)?;
     if let Some(st) = fdw::plan(&node, lookup, params)? {
         return Ok(st);

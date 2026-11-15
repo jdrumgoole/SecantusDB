@@ -2886,15 +2886,6 @@ keeps; what follows is what that lookup does not yet check.
 
 Measured on PostgreSQL 15.19; none needs an object.
 
-- [ ] **A named argument to a built-in whose parameters have no names is
-      refused as a gap.** `select nextval(regclass := 'nosuchseq')` and
-      `nextval(x => 'nosuchseq')` are 42883 `function nextval(regclass =>
-      unknown) does not exist` (`x => unknown`) at 8 with the
-      no-function-matches HINT on PostgreSQL 15.19 (`proargnames` is NULL
-      for `nextval`, so no candidate takes a named argument); here they are
-      0A000 `NamedArgExpr is not supported yet` with no position.
-      Verify: tests/backlog/test_rp_found_rp458.py::test_named_argument_to_a_builtin_without_argument_names
-      Backlog-ID: RP-677
 
 ## Found while working RP-697 (2026-11-09)
 
