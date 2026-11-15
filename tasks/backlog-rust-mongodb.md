@@ -698,6 +698,14 @@ These are explicit non-goals. Don't add them without a reason.
       Found 2026-11-15 (RM-568).
       Verify: tests/backlog/test_rm_found_rm568.py::test_find_keeps_a_sort_key_meta_field
       Backlog-ID: RM-703
+- [ ] **A `returnKey` read with a `sortKey` field over an index's order
+      has no SORT_KEY_GENERATOR.** mongod 8.2.11 plans `find({y: {$gte:
+      0}}, {k: {$meta: "sortKey"}}).sort({y: 1}).returnKey()` over `{y: 1,
+      x: 1}` as `RETURN_KEY <- SORT_KEY_GENERATOR <- IXSCAN`; this
+      server's explain names `RETURN_KEY <- IXSCAN`. The keys returned
+      match. Found 2026-11-15 (RM-568).
+      Verify: tests/backlog/test_rm_found_rm568b.py::test_return_key_with_a_sort_key_over_an_index_sort_explains_a_key_generator
+      Backlog-ID: RM-706
 - [ ] **A `default` sort of documents counts the documents, not its
       working-set members.** mongod 8.2.11's SORT of a read that keeps
       each member's metadata (`showRecordId`, a projection's `{$meta:
