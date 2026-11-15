@@ -139,12 +139,25 @@ def test_declare_type_found_before_a_later_syntax_error(dsn: str) -> None:
     ]
 
 
-@pytest.mark.backlog("RP-620")
+@pytest.mark.backlog_fixed("RP-620")
 def test_pg_temp_type_in_a_session_with_no_temp_schema(dsn: str) -> None:
     assert _compiled(dsn, PG_TEMP_UNMADE) == [
         ("3F000", 'schema "pg_temp" does not exist', None, None),
         ("3F000", 'schema "pg_temp" does not exist', "69", None),
     ]
+
+
+@pytest.mark.backlog_fixed("RP-620")
+def test_pg_temp_type_once_the_temp_schema_is_made(dsn: str) -> None:
+    """RP-620's other side: with a temporary table made, `pg_temp` names
+    the session's schema and its row type is a type (PostgreSQL 15.19)."""
+    with psycopg.connect(dsn, autocommit=True) as c:
+        c.execute("create temp table tt620(a int)")
+        c.execute(
+            "create function f620(a pg_temp.tt620) returns int language plpgsql"
+            " as $$ declare x pg_temp.tt620; begin return 1; end $$"
+        )
+        c.execute("drop function f620")
 
 
 @pytest.mark.backlog("RP-621")

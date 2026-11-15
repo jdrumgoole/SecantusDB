@@ -3212,16 +3212,6 @@ RP-573 a DECLARE's type is looked up at CREATE FUNCTION and before a DO
 block runs (`check_plpgsql_declarations`), from the type text libpg_query
 keeps; what follows is what that lookup does not yet check.
 
-- [ ] **A `pg_temp` type in a session with no temporary schema is a
-      missing type, not a missing schema.** `LookupExplicitNamespace`
-      finds `pg_temp` only once the session has made its temp schema, so on
-      PostgreSQL 15.19 `create function e573(a pg_temp.nosuch) ...` is 3F000
-      `schema "pg_temp" does not exist` with no position, and `declare x
-      pg_temp.nosuch` the same at 69. Here they are 42704 `type
-      pg_temp.nosuch does not exist` and `type "pg_temp.nosuch" does not
-      exist` (`routine_type_missing` lets `pg_temp` through as a schema).
-      Verify: tests/backlog/test_rp_found_rp573.py::test_pg_temp_type_in_a_session_with_no_temp_schema
-      Backlog-ID: RP-620
 - [ ] **A PL/pgSQL compile error in a CREATE FUNCTION's body has no
       position.** `declare x int; begin y := 1; return 1; end` is 42601
       `"y" is not a known variable` at 80 on PostgreSQL 15.19, and `declare

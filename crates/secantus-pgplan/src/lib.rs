@@ -7679,7 +7679,14 @@ fn routine_type_missing(tn: &pg_query::protobuf::TypeName) -> Result<Option<Stri
         })
         .collect();
     if let [schema, _] = parts.as_slice() {
-        if !is_pg_temp_schema(schema) && !schemas::schema_exists(schema) {
+        // `LookupExplicitNamespace` finds `pg_temp` only once the session
+        // has made its temporary schema (RP-620).
+        let exists = if schema == "pg_temp" {
+            schemas::temp_schema_in_use().is_some()
+        } else {
+            is_pg_temp_schema(schema) || schemas::schema_exists(schema)
+        };
+        if !exists {
             return Err(Error::Sqlstate(
                 "3F000",
                 format!("schema \"{schema}\" does not exist"),
