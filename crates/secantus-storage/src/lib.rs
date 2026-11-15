@@ -25367,6 +25367,7 @@ fn index_event_spec(payload: &Document, name: &str) -> Document {
                     | "pythonKeys"
                     | "buildSeq"
                     | "multikeyPaths"
+                    | "timeseriesOriginalSpec"
             ) {
                 spec.insert(k.clone(), v.clone());
             }

@@ -2845,19 +2845,6 @@ bucket documents in `system.buckets.<name>`, each data field mongod's
 compressed column, placed by mongod's bucket catalog
 (`crates/secantus-commands/src/bucket_catalog.rs`). What is left:
 
-- [ ] **RUST MongoDB server: `listIndexes` of `system.buckets.<name>`
-      shows a TTL or partial index as the time-series collection keeps it.**
-      mongod 8.2.11 keeps a TTL index on the time field as
-      `{control.min.<time>: 1}` on the buckets, its partial filter on the
-      meta field as one on `meta` (`{meta: {$eq: "a"}}`), and the index as
-      asked in `originalSpec`; this server lists the bound pair
-      `{control.min.t: 1, control.max.t: 1}` and the filter as given, with
-      no `originalSpec`. The index specs are kept on the time-series
-      collection and translated for the listing (`ts_bucket_ns::bucket_indexes`);
-      the TTL pass already expires buckets by `control.min.<time>`.
-      Measured 2026-11-11.
-      Verify: tests/backlog/test_rm_found_2026_11_11_rm088.py::test_bucket_indexes_list_a_ttl_index_as_mongod_keeps_it
-      Backlog-ID: RM-548
 - [ ] **RUST MongoDB server: the bucket catalog keeps no account of its
       memory.** mongod 8.2.11 reports a `bucketCatalog` section in
       `serverStatus` once a time-series collection is written to

@@ -125,17 +125,60 @@ pub(crate) fn bucket_indexes(
     Ok(indexes
         .into_iter()
         .filter(|ix| ix.get_str("name") != Ok("_id_"))
-        .map(|mut ix| {
-            if let Ok(key) = ix.get_document("key") {
-                let key = ts_buckets::bucket_key(key, layout);
-                ix.insert("key", key);
-            }
-            for internal in crate::admin::INDEX_CATALOG_ONLY {
-                ix.remove(*internal);
-            }
-            ix
-        })
+        .map(|ix| listed_on_buckets(ix, layout))
         .collect())
+}
+
+/// One index of a time-series collection as mongod lists it on the buckets
+/// (8.2.11): `v`, the key on the buckets, the name, the partial filter over
+/// the buckets, the other options, and the spec as asked (`originalSpec`)
+/// for a partial index. A TTL index on the time field is keyed on
+/// `control.min.<time>` alone, the field the TTL monitor reads.
+fn listed_on_buckets(ix: Document, layout: &Layout) -> Document {
+    let mut out = Document::new();
+    if let Some(v) = ix.get("v") {
+        out.insert("v", v.clone());
+    }
+    if let Ok(key) = ix.get_document("key") {
+        let ttl_on_time = ix.contains_key("expireAfterSeconds")
+            && key.len() == 1
+            && key.keys().next().map(String::as_str) == Some(layout.time.as_str());
+        let bucket_key = if ttl_on_time {
+            let mut k = Document::new();
+            for (_, direction) in key {
+                k.insert(format!("control.min.{}", layout.time), direction.clone());
+            }
+            k
+        } else {
+            ts_buckets::bucket_key(key, layout)
+        };
+        out.insert("key", bucket_key);
+    }
+    if let Some(name) = ix.get("name") {
+        out.insert("name", name.clone());
+    }
+    if let Ok(filter) = ix.get_document("partialFilterExpression") {
+        out.insert(
+            "partialFilterExpression",
+            crate::timeseries::index_bucket_filter(
+                filter,
+                &layout.time,
+                layout.meta.as_deref(),
+                layout.span_ms,
+            ),
+        );
+    }
+    for (k, v) in &ix {
+        let skip = matches!(k.as_str(), "v" | "key" | "name" | "partialFilterExpression")
+            || crate::admin::INDEX_CATALOG_ONLY.contains(&k.as_str());
+        if !skip {
+            out.insert(k.clone(), v.clone());
+        }
+    }
+    if let Ok(original) = ix.get_document(crate::admin::TS_ORIGINAL_SPEC) {
+        out.insert("originalSpec", original.clone());
+    }
+    out
 }
 
 /// Forget, in the bucket catalog, every bucket a write's filters match.

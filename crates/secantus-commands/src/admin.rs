@@ -1962,6 +1962,7 @@ pub(crate) fn listed_indexes(
         ix.remove("buildSeq");
         ix.remove("binDataOrder");
         ix.remove("multikeyPaths");
+        ix.remove(TS_ORIGINAL_SPEC);
         *ix = listed_spec(std::mem::take(ix));
     }
     // The `_id` index of a collection with a default collation carries it.
@@ -2489,6 +2490,19 @@ pub fn create_indexes(doc: &Document, ctx: &mut CommandContext) -> HandlerResult
         // falsy value is dropped so it doesn't come back from listIndexes
         // (mongo-ruby-driver `hidden is false` asserts hidden isn't echoed).
         let mut spec = s.clone();
+        // A partial index on a time-series collection keeps the spec as
+        // asked, which `listIndexes` of its buckets shows as `originalSpec`
+        // (mongod 8.2.11): the fields as given, then `key` and `v` (RM-548).
+        if ts_fields.is_some() && s.contains_key("partialFilterExpression") {
+            let mut original: Document = s
+                .iter()
+                .filter(|(k, _)| k.as_str() != "key" && k.as_str() != "v")
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect();
+            original.insert("key", key.clone());
+            original.insert("v", s.get("v").cloned().unwrap_or(Bson::Int32(2)));
+            spec.insert(TS_ORIGINAL_SPEC, original);
+        }
         for opt in ["hidden", "sparse", "unique"] {
             if spec.get(opt).is_some_and(is_falsy) {
                 spec.remove(opt);
@@ -3958,7 +3972,12 @@ fn equivalent_spec_text(spec: &Document) -> String {
 /// The options that make two index specs different indexes.
 /// Catalog bookkeeping that is not part of an index's options (and that
 /// `listIndexes` already hides from clients).
+/// The catalog's copy of a time-series partial index's spec as asked
+/// (RM-548), listed on the buckets as `originalSpec`.
+pub(crate) const TS_ORIGINAL_SPEC: &str = "timeseriesOriginalSpec";
+
 pub(crate) const INDEX_CATALOG_ONLY: &[&str] = &[
+    TS_ORIGINAL_SPEC,
     // `createIndexes`'s own mark on an index still being built (RM-187).
     BUILDING_MARK,
     "entryFormat",

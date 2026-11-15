@@ -541,14 +541,38 @@ pub(crate) fn bucket_filter(
         time,
         meta,
         span_ms: span_secs * 1000,
+        index: false,
     };
     and_of(fields.clauses(filter))
+}
+
+/// A partial index's filter on a time-series collection as mongod keeps it
+/// on the buckets (measured 8.2.11, 2026-11-15): each top-level field's
+/// bucket predicates, an `$and` when there are several; the meta field's
+/// renamed `meta`, an implicit equality spelled `$eq`; a measurement's
+/// equality as `control.min <=` then `control.max >=`; and no bound on the
+/// bucket `_id`, which the query form adds for the time field (RM-548).
+pub(crate) fn index_bucket_filter(
+    filter: &Document,
+    time: &str,
+    meta: Option<&str>,
+    span_ms: i64,
+) -> Document {
+    let fields = BucketFields {
+        time,
+        meta,
+        span_ms,
+        index: true,
+    };
+    fields.index_clauses(filter)
 }
 
 struct BucketFields<'a> {
     time: &'a str,
     meta: Option<&'a str>,
     span_ms: i64,
+    /// A partial index's filter rather than a query's.
+    index: bool,
 }
 
 fn and_of(clauses: Vec<Document>) -> Document {
@@ -569,6 +593,34 @@ fn pred(path: &str, op: &str, value: Bson) -> Document {
 }
 
 impl BucketFields<'_> {
+    fn index_clauses(&self, filter: &Document) -> Document {
+        let mut out = Document::new();
+        for (key, value) in filter {
+            if key == "$and" {
+                if let Bson::Array(items) = value {
+                    for item in items.iter().filter_map(Bson::as_document) {
+                        out.extend(self.index_clauses(item));
+                    }
+                    continue;
+                }
+            }
+            if key.starts_with('$') {
+                out.insert(key.clone(), value.clone());
+                continue;
+            }
+            let clauses = self.field(key, value);
+            match clauses.len() {
+                0 => {}
+                1 => out.extend(clauses.into_iter().next().expect("one")),
+                _ => {
+                    let list: Vec<Bson> = clauses.into_iter().map(Bson::Document).collect();
+                    out.insert("$and", list);
+                }
+            }
+        }
+        out
+    }
+
     fn clauses(&self, filter: &Document) -> Vec<Document> {
         let mut out = Vec::new();
         for (key, value) in filter {
@@ -605,7 +657,15 @@ impl BucketFields<'_> {
                 .filter(|r| r.is_empty() || r.starts_with('.'))
             {
                 let mut out = Document::new();
-                out.insert(format!("meta{rest}"), value.clone());
+                let implicit_eq = !matches!(
+                    value,
+                    Bson::Document(ops) if ops.keys().next().is_some_and(|k| k.starts_with('$'))
+                );
+                if self.index && implicit_eq {
+                    out.insert(format!("meta{rest}"), doc! { "$eq": value.clone() });
+                } else {
+                    out.insert(format!("meta{rest}"), value.clone());
+                }
                 return vec![out];
             }
         }
@@ -681,6 +741,10 @@ impl BucketFields<'_> {
             "$gte" => vec![pred(&max, "$_internalExprGte", v())],
             "$lt" => vec![pred(&min, "$_internalExprLt", v())],
             "$lte" => vec![pred(&min, "$_internalExprLte", v())],
+            _ if self.index => vec![
+                pred(&min, "$_internalExprLte", v()),
+                pred(&max, "$_internalExprGte", v()),
+            ],
             _ => vec![
                 pred(&max, "$_internalExprGte", v()),
                 pred(&min, "$_internalExprLte", v()),
@@ -700,6 +764,25 @@ impl BucketFields<'_> {
             Bson::ObjectId(bson::oid::ObjectId::from_bytes(bytes))
         };
         let (at_low, at_high) = (at - self.span_ms, at + self.span_ms);
+        let mut out = self.time_bounds_with_id(op, at, at_low, at_high, max, min, &date, &id);
+        if self.index {
+            out.retain(|p| !p.contains_key("_id"));
+        }
+        out
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn time_bounds_with_id(
+        &self,
+        op: &str,
+        at: i64,
+        at_low: i64,
+        at_high: i64,
+        max: &str,
+        min: &str,
+        date: &dyn Fn(i64) -> Bson,
+        id: &dyn Fn(i64, u8) -> Bson,
+    ) -> Vec<Document> {
         match op {
             "$gt" => vec![
                 pred("_id", "$gt", id(at_low, 0xff)),
@@ -778,6 +861,35 @@ pub(crate) fn check_hint(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A partial index's filter on the buckets, as mongod 8.2.11 lists it
+    /// (RM-548).
+    #[test]
+    fn index_filters_on_the_buckets() {
+        let f = |filter: Document| index_bucket_filter(&filter, "t", Some("m"), 3_600_000);
+        assert_eq!(f(doc! {"m": "a"}), doc! {"meta": {"$eq": "a"}});
+        assert_eq!(f(doc! {"m": {"$gt": 1}}), doc! {"meta": {"$gt": 1}});
+        assert_eq!(
+            f(doc! {"m": "a", "x": {"$gte": 2}}),
+            doc! {"meta": {"$eq": "a"}, "control.max.x": {"$_internalExprGte": 2}}
+        );
+        assert_eq!(
+            f(doc! {"x": 3}),
+            doc! {"$and": [
+                {"control.min.x": {"$_internalExprLte": 3}},
+                {"control.max.x": {"$_internalExprGte": 3}},
+            ]}
+        );
+        let at = bson::DateTime::from_millis(1_767_225_600_000);
+        let hour_before = bson::DateTime::from_millis(1_767_225_600_000 - 3_600_000);
+        assert_eq!(
+            f(doc! {"t": {"$gt": at}}),
+            doc! {"$and": [
+                {"control.max.t": {"$_internalExprGt": at}},
+                {"control.min.t": {"$_internalExprGt": hour_before}},
+            ]}
+        );
+    }
 
     fn define(ts: Document) -> Result<Option<Document>, CommandError> {
         definition(&doc! {"create": "w", "timeseries": ts}, "db.w")
