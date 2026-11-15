@@ -1875,6 +1875,19 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "        Filter: (a <> 2)",
         ],
     ),
+    # Still open: a bound of the inner side's own on its indexed key joins
+    # the parameterized scan's Index Cond (found while working RP-918).
+    "nested loop into an index with a range of the inner side": (
+        "RP-979",
+        _ANALYSED,
+        "explain select * from e left join k on e.a < k.a and k.a > 2",
+        [
+            "Nested Loop Left Join  (cost=0.28..10320.00 rows=332667 width=14)",
+            "  ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
+            "  ->  Index Scan using k_pkey on k  (cost=0.28..6.98 rows=333 width=7)",
+            "        Index Cond: ((a > e.a) AND (a > 2))",
+        ],
+    ),
     # Fixed (RP-916): a parameterized index scan under an outer side with
     # few distinct values is cached by a Memoize (`get_memoize_path`,
     # `cost_memoize_rescan`); before, the Index Scan sat under the join

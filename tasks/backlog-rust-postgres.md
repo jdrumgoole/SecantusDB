@@ -1858,6 +1858,17 @@ a regression test.
       a Left Join with `Filter: (e2.a IS NULL)` above it and zero costs.
       Its rows are right. Measured on a private 15.19 cluster (found while
       working RP-354).
+      Sized 2026-11-15: no anti join exists anywhere in the server -- no
+      `JoinKind` for one in `secantus-pgplan::joins`, no plan node, no
+      cost path (the only `Anti` is `explain.rs`'s node-name table), and
+      `not exists (select 1 from e e2 where e2.a = e.a)`, PostgreSQL's
+      `Hash Anti Join`, prints a Seq Scan with `Filter: (...)`. So this
+      needs the join kind first (`reduce_outer_joins`' JOIN_ANTI step
+      beside the RP-902 reduction in `joins.rs`, the executor emitting an
+      outer row with no match), then `final_cost_nestloop` /
+      `final_cost_hashjoin`'s `JOIN_ANTI` arms and `calc_joinrel_size_estimate`'s
+      anti selectivity (`rows=1` here is the clamp). NOT EXISTS
+      (`convert_EXISTS_sublink_to_join`) would reuse it.
       Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a left join where the nullable side is null is an anti join], tests/backlog/test_rp_explain_costs.py::test_plan[a left join on an equality where the nullable side is null is an anti join]
       Backlog-ID: RP-908
 
@@ -1970,6 +1981,20 @@ a regression test.
       while working RP-395).
       Backlog-ID: RP-401
       Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a left join on a primary key merges through its index]
+- [ ] **A nested loop into an index prints no estimate where the inner
+      side's own range on the indexed key joins its Index Cond.**
+      PostgreSQL 15.19 plans `explain select * from e left join k on e.a <
+      k.a and k.a > 2` (`e`, `k` 1,000 analysed rows, `k.a` the primary
+      key) as `Nested Loop Left Join (cost=0.28..10320.00 rows=332667
+      width=14)` over `Index Scan using k_pkey on k (cost=0.28..6.98
+      rows=333 width=7)` with `Index Cond: ((a > e.a) AND (a > 2))`; here
+      zeros over two Seq Scans and a `Join Filter: (e.a < k.a)`. A `<>` of
+      the inner side's own is that scan's Filter since RP-918; a bound is
+      an index qual, which `costsize::param_range_index_scan` refuses
+      beside the join clause. Its rows are right. Measured on a private
+      15.19 cluster (found while working RP-918).
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[nested loop into an index with a range of the inner side]
+      Backlog-ID: RP-979
 - [ ] **A constant an equivalence class generates for a join's inner
       index scan is a Filter, not its Index Cond.** `select * from e, k
       where e.a = k.a and e.a = 5` (`k.a` the primary key) is, on
