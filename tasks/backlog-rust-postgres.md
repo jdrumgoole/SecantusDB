@@ -1155,6 +1155,18 @@ one beside it.
       noise: a `gate_pg.sh` backlog step on 2026-11-13 (load average ~18)
       reported it `FIXED?`, then it failed three of three runs alone (0.015 s
       against 0.0117 s, the bar 1.1x). Rerun it alone before closing.
+      Where to start (read 2026-11-15): the committed catalog's only
+      freshness signal is `catalog_cache().version`, one global counter
+      `bump_catalog_version` moves (11 sites in `lib.rs`, 2 in `owned.rs`)
+      with no key of what changed, so `committed_type_catalog_docs` and
+      `committed_table_defs` can only re-scan (`find_matching`) and compare
+      bytes. The storage's index-catalog log (`note_index_catalog_change`,
+      `refresh_index_names`, numbered under `index_catalog_changes`'s lock,
+      a reader past the log rebuilding) is the template, but no storage
+      write path logs a catalog DOCUMENT's `_id`: the fix needs a hook on
+      document insert / update / delete for `__`-prefixed collections, the
+      keys a user transaction wrote re-logged at its commit, and the two
+      readers patching their previous version by those keys.
       Backlog-ID: RP-911
       Verify: tests/backlog/test_rp_catalog_latency.py::test_the_first_catalog_query_after_ddl_costs_the_same_at_800_tables_within_a_tenth
 
