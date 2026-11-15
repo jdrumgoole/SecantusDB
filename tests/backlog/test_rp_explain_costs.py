@@ -4118,10 +4118,10 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
         ],
     ),
     # A LEFT join's ON conjunct over one table of an inner join on its
-    # nullable side is that table's scan Filter too (found while working
-    # RP-395).
+    # nullable side is that table's scan Filter too (RP-397, fixed); still
+    # open: the join search's order and method around it (RP-978).
     "a left join's ON conjunct over a table of an inner join it null-extends": (
-        "RP-397",
+        "RP-978",
         _ANALYSED_THIRTY,
         "explain (costs off)"
         " select * from s left join (e join k on e.a < k.a) on s.a = e.a and k.b = 'v3'",
@@ -4136,6 +4136,47 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "                    Filter: (b = 'v3'::text)",
             "  ->  Hash",
             "        ->  Seq Scan on s",
+        ],
+    ),
+    # Where the join search keeps the written order, the conjunct prints
+    # on its scan as PostgreSQL places it (RP-397, fixed).
+    "a left join's ON conjunct over the hashed table of an inner join": (
+        "RP-397:fixed",
+        _ANALYSED_THIRTY,
+        "explain (costs off) select * from s left join (e join s s2 on e.a = s2.a)"
+        " on s.a = e.a and s2.c = 'xx'",
+        [
+            "Hash Left Join",
+            "  Hash Cond: (s.a = e.a)",
+            "  ->  Seq Scan on s",
+            "  ->  Hash",
+            "        ->  Hash Join",
+            "              Hash Cond: (e.a = s2.a)",
+            "              ->  Seq Scan on e",
+            "              ->  Hash",
+            "                    ->  Seq Scan on s s2",
+            "                          Filter: (c = 'xx'::text)",
+        ],
+    ),
+    # An inner join's one-table ON conjunct under an outer join is its
+    # table's scan Filter, beside the outer join's own (RP-393, fixed).
+    "an inner join's one-table ON conjunct under an outer join": (
+        "RP-393:fixed",
+        _ANALYSED_THIRTY,
+        "explain (costs off) select * from s left join"
+        " (e join s s2 on e.a = s2.a and s2.c = 'xx') on s.a = s2.a and e.b = 'v3'",
+        [
+            "Hash Left Join",
+            "  Hash Cond: (s.a = s2.a)",
+            "  ->  Seq Scan on s",
+            "  ->  Hash",
+            "        ->  Hash Join",
+            "              Hash Cond: (e.a = s2.a)",
+            "              ->  Seq Scan on e",
+            "                    Filter: (b = 'v3'::text)",
+            "              ->  Hash",
+            "                    ->  Seq Scan on s s2",
+            "                          Filter: (c = 'xx'::text)",
         ],
     ),
     # A join's scan Filter in PostgreSQL's qual order (RP-398, fixed): an
@@ -5233,9 +5274,10 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
         ],
     ),
     # An inner join nested inside an outer join: its one-table ON conjunct
-    # is still its table's scan Filter (found while working RP-392).
+    # is its table's scan Filter (RP-393, fixed); still open: the nested
+    # join's search and its counts (RP-978).
     "analyze of an inner join under an outer join with a one-table ON conjunct": (
-        "RP-393",
+        "RP-978",
         _ANALYSED_THIRTY,
         "explain (analyze, costs off, timing off, summary off)"
         " select * from s left join (e join k on e.a > 998 and k.a = e.a) on true",

@@ -1171,6 +1171,10 @@ one beside it.
       `session_has_temp` scans (~4% each), `inheritance` (~3%). Each is a
       linear pass, none quadratic, so what is left is the per-relation
       keying above, not another lookup to swap in.)
+      (2026-11-15, in a pg-batch lane, cause of the spread unknown: it passed
+      in two of four runs, so the remainder sits at its tenth's edge; a
+      FIXED? from one run is not a fix, and a close needs it to pass
+      every run.)
       Backlog-ID: RP-911
       Verify: tests/backlog/test_rp_catalog_latency.py::test_the_first_catalog_query_after_ddl_costs_the_same_at_800_tables_within_a_tenth
 
@@ -1932,32 +1936,29 @@ a regression test.
       top nested loop's inner through `cost_material`.
       Backlog-ID: RP-390
       Verify: tests/backlog/test_rp_explain_costs.py::test_plan[analyze of a nested loop over a hash join]
-- [ ] **An inner join nested in an outer join keeps its one-table ON
-      conjuncts in its Join Filter.** Since RP-391 / RP-392 an inner
-      join's ON conjunct over one table is that table's scan Filter, but
-      only for joins reached from the FROM through inner joins. PostgreSQL
-      15.19's `distribute_qual_to_rels` places an inner join's qual the
-      same below an outer join: `select * from s left join (e join k on
-      e.a > 998 and k.a = e.a) on true` runs `Filter: (a > 998)` on `Seq
-      Scan on e`; here the Hash Join keeps `Join Filter: (e.a > 998)`. Its
-      rows are right. Measured on a private 15.19 cluster (found while
-      working RP-392).
-      Backlog-ID: RP-393
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[analyze of an inner join under an outer join with a one-table ON conjunct]
-- [ ] **A LEFT join's ON conjunct over a table inside an inner join on its
-      nullable side stays in its Join Filter.** Since RP-395 an outer
-      join's ON conjunct over its nullable side runs in that side's scan
-      when the side is one table. PostgreSQL 15.19's
-      `distribute_qual_to_rels` also pushes it through inner joins on that
-      side: `select * from s left join (e join k on e.a < k.a) on s.a = e.a
-      and k.b = 'v3'` is a `Hash Right Join` whose `Seq Scan on k` has
-      `Filter: (b = 'v3'::text)`; here the Hash Left Join keeps `Join
-      Filter: (k.b = 'v3'::text)` and no estimate. Its rows are right. Not
-      through a lower outer join's nullable side, where PostgreSQL keeps it
-      at the join too. Measured on a private 15.19 cluster (found while
-      working RP-395).
-      Backlog-ID: RP-397
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a left join's ON conjunct over a table of an inner join it null-extends]
+- [ ] **A join nested in an outer join prints no estimate, and its join
+      order and method are not PostgreSQL's.** Since 2026-11-15 an inner
+      join's one-table ON conjuncts under an outer join, and an outer
+      join's ON conjunct over one table of an inner join on its nullable
+      side, run in their tables' scans (RP-393, RP-397), and where the join
+      search keeps the written order the plan prints as PostgreSQL 15.19's
+      does (`s left join (e join s s2 on e.a = s2.a) on s.a = e.a and s2.c =
+      'xx'`). But every node of such a plan prints `cost=0.00..0.00 rows=0
+      width=0`, and the join is not searched: `select * from s left join (e
+      join k on e.a > 998 and k.a = e.a) on true` is, in PostgreSQL, a
+      `Nested Loop Left Join` over a `Materialize` of a `Nested Loop` into
+      `Index Scan using k_pkey on k` (`Index Cond: (a = e.a)`,
+      cost=0.28..36.16 rows=60); here a Hash Join of two Seq Scans with no
+      Materialize, and under ANALYZE no actual block below the top join.
+      `select * from s left join (e join k on e.a < k.a) on s.a = e.a and
+      k.b = 'v3'` is PostgreSQL's `Hash Right Join` with `s` hashed and a
+      `Materialize` over `k`; here a `Hash Left Join` hashing the inner
+      join. The same inner join alone (`e join k on k.a = e.a where e.a >
+      998`) prints no estimate either: a range on the join key of a hash
+      join is not priced. Its rows are right. Measured on a private 15.19
+      cluster (found while working RP-393 and RP-397).
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[analyze of an inner join under an outer join with a one-table ON conjunct], tests/backlog/test_rp_explain_costs.py::test_plan[a left join's ON conjunct over a table of an inner join it null-extends]
+      Backlog-ID: RP-978
 - [ ] **A LEFT join's ON that equates its nullable side's column to two
       constants still scans that side.** PostgreSQL 15.19 finds the
       equivalence class contradictory and gates the nullable side's scan

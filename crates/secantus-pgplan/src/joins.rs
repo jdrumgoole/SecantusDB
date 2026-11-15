@@ -4943,7 +4943,9 @@ pub(crate) type NullableSideQual = (
 /// A conjunct over the preserved side stays in the Join Filter (it does
 /// not remove preserved rows), and so does any conjunct a FULL join has.
 /// Taken only where the nullable side is one stored table whose columns
-/// keep their names (a leaf `build` gives a pushed filter), only for a
+/// keep their names (a leaf `build` gives a pushed filter), or a tree of
+/// plain inner joins of them, whose own one-table ON conjuncts are taken
+/// too (RP-393, RP-397), only for a
 /// FROM of one join tree (the FROM whose quals EXPLAIN places), and only
 /// for a conjunct of `single_alias`'s shape: every column qualified by the
 /// side's alias, immutable parts, no subquery.
@@ -4972,32 +4974,112 @@ pub(crate) fn nullable_side_on_conjuncts(
         let Some(nullable) = nullable else {
             return;
         };
-        let Some(N::RangeVar(r)) = nullable.node.as_ref() else {
+        let Some(leaves) = inner_tree_leaves(nullable) else {
             return;
         };
-        let mut leaves = Vec::new();
-        filtered_leaves(nullable, &mut leaves);
-        let [alias] = leaves.as_slice() else {
-            return;
+        let mine = |c: &pg_query::protobuf::Node| {
+            single_alias(c, &|_| None)
+                .and_then(|a| leaves.iter().find(|(alias, _)| *alias == a).cloned())
         };
-        let (alias, table) = (alias.clone(), r.clone());
+        // An inner join on the nullable side places its own one-table ON
+        // conjuncts in their tables' scans too (RP-393), on RP-391's terms:
+        // a join left with no clause of its own keeps its ON.
+        let side = match JoinType::try_from(j.jointype) {
+            Ok(JoinType::JoinLeft) => j.rarg.as_deref_mut(),
+            _ => j.larg.as_deref_mut(),
+        };
+        if let Some(side) = side {
+            inner_on(side, &mine, out);
+        }
         let Some(quals) = j.quals.as_deref() else {
             return;
         };
         let mut conjuncts = Vec::new();
         split_and(quals, &mut conjuncts);
-        let (mine, kept): (Vec<_>, Vec<_>) = conjuncts
-            .into_iter()
-            .partition(|c| single_alias(c, &|_| None).as_deref() == Some(alias.as_str()));
-        if mine.is_empty() {
+        let (taken, kept): (Vec<_>, Vec<_>) =
+            conjuncts.into_iter().partition(|c| mine(c).is_some());
+        if taken.is_empty() {
             return;
         }
-        out.extend(
-            mine.into_iter()
-                .map(|c| (alias.clone(), table.clone(), c.clone())),
-        );
+        out.extend(taken.into_iter().map(|c| {
+            let (alias, table) = mine(c).expect("partitioned");
+            (alias, table, c.clone())
+        }));
         let kept: Vec<pg_query::protobuf::Node> = kept.into_iter().cloned().collect();
         j.quals = and_of(kept).map(Box::new);
+    }
+    fn inner_on(
+        item: &mut pg_query::protobuf::Node,
+        mine: &dyn Fn(&pg_query::protobuf::Node) -> Option<(String, pg_query::protobuf::RangeVar)>,
+        out: &mut Vec<NullableSideQual>,
+    ) {
+        let Some(N::JoinExpr(j)) = item.node.as_mut() else {
+            return;
+        };
+        for side in [j.larg.as_deref_mut(), j.rarg.as_deref_mut()]
+            .into_iter()
+            .flatten()
+        {
+            inner_on(side, mine, out);
+        }
+        let Some(quals) = j.quals.as_deref() else {
+            return;
+        };
+        let mut conjuncts = Vec::new();
+        split_and(quals, &mut conjuncts);
+        let (taken, kept): (Vec<_>, Vec<_>) =
+            conjuncts.into_iter().partition(|c| mine(c).is_some());
+        if taken.is_empty() || kept.is_empty() {
+            return;
+        }
+        out.extend(taken.into_iter().map(|c| {
+            let (alias, table) = mine(c).expect("partitioned");
+            (alias, table, c.clone())
+        }));
+        let kept: Vec<pg_query::protobuf::Node> = kept.into_iter().cloned().collect();
+        j.quals = and_of(kept).map(Box::new);
+    }
+    /// The table leaves of a nullable side that is one stored table, or a
+    /// tree of plain inner joins of them (RP-397): `distribute_qual_to_rels`
+    /// pushes a conjunct over one of them through the inner joins, but not
+    /// through a lower outer join's nullable side.
+    fn inner_tree_leaves(
+        n: &pg_query::protobuf::Node,
+    ) -> Option<Vec<(String, pg_query::protobuf::RangeVar)>> {
+        fn walk(
+            n: &pg_query::protobuf::Node,
+            out: &mut Vec<(String, pg_query::protobuf::RangeVar)>,
+        ) -> bool {
+            match n.node.as_ref() {
+                Some(N::RangeVar(r)) => {
+                    let mut leaves = Vec::new();
+                    filtered_leaves(n, &mut leaves);
+                    let [alias] = leaves.as_slice() else {
+                        return false;
+                    };
+                    out.push((alias.clone(), r.clone()));
+                    true
+                }
+                Some(N::JoinExpr(j)) => {
+                    j.alias.is_none()
+                        && !j.is_natural
+                        && j.using_clause.is_empty()
+                        && j.jointype == JoinType::JoinInner as i32
+                        && j.larg.as_deref().is_some_and(|l| walk(l, out))
+                        && j.rarg.as_deref().is_some_and(|r| walk(r, out))
+                }
+                _ => false,
+            }
+        }
+        let mut out = Vec::new();
+        if !walk(n, &mut out) {
+            return None;
+        }
+        // A name two leaves share is not one table's.
+        let mut names: Vec<&str> = out.iter().map(|(a, _)| a.as_str()).collect();
+        names.sort_unstable();
+        names.dedup();
+        (names.len() == out.len()).then_some(out)
     }
     let [only] = s.from_clause.as_slice() else {
         return None;
@@ -6030,12 +6112,33 @@ mod tests {
             nullable_pushed("select * from s full join e on s.a = e.a and e.b = 'v3'"),
             None
         );
-        // Not modelled: a nullable side that is a join or has renamed
-        // columns, an unqualified column, a subquery, a volatile call.
+        // RP-397: through an inner join on the nullable side, to its table.
+        let (pushed, rest) =
+            nullable_pushed("select * from s left join (e join k on e.a = k.a) on k.b = 'x'")
+                .unwrap();
+        assert_eq!(pushed, vec!["k: k.b = 'x'"]);
         assert_eq!(
-            nullable_pushed("select * from s left join (e join k on e.a = k.a) on k.b = 'x'"),
+            rest,
+            "SELECT * FROM s LEFT JOIN (e JOIN k ON e.a = k.a) ON true"
+        );
+        // RP-393: that inner join's own one-table ON conjunct, too; one
+        // whose ON would be left empty keeps it (RP-391's terms).
+        let (pushed, _) = nullable_pushed(
+            "select * from s left join (e join k on e.a = k.a and e.a > 9) on true",
+        )
+        .unwrap();
+        assert_eq!(pushed, vec!["e: e.a > 9"]);
+        assert_eq!(
+            nullable_pushed("select * from s left join (e join k on e.a > 9) on true"),
             None
         );
+        // Not through a lower outer join's nullable side.
+        assert_eq!(
+            nullable_pushed("select * from s left join (e left join k on e.a = k.a) on k.b = 'x'"),
+            None
+        );
+        // Not modelled: a nullable side with renamed columns, an
+        // unqualified column, a subquery, a volatile call.
         assert_eq!(
             nullable_pushed("select * from s left join e as e(x, y) on e.y = 'v3'"),
             None
