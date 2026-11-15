@@ -579,17 +579,6 @@ These are explicit non-goals. Don't add them without a reason.
       lock of their own, count mongod's. Found 2026-11-12 (RM-360).
       Verify: tests/backlog/test_rm_found_2026_11_12_rm360.py::test_each_cursor_stage_buffer_takes_an_execution_ticket
       Backlog-ID: RM-579
-- [ ] **The connection establishment rate limiter has no bypass list.**
-      mongod 8.2.11's `ingressConnectionEstablishmentRateLimiterBypass` (a
-      CIDR range list, `{ranges: []}` by default, set at startup or at
-      runtime) exempts the clients it names from the connection
-      establishment rate limiter, which counts them in
-      `queues.ingressSessionEstablishment.exemptedAdmissions` and
-      `connections.establishmentRateLimit.exempted`. This server does not
-      register the parameter (`getParameter` answers 72), so every client
-      is limited and both counts stay 0. Found working RM-355, 2026-11-12.
-      Backlog-ID: RM-550
-      Verify: tests/backlog/test_rm_355_364.py::test_the_connection_rate_limiter_has_its_bypass_list
 - [ ] **Some writes' `locks` are not mongod's.** Since 2026-11-07 a write
       counts mongod's flow control tickets (one per global IX taken apart)
       and a retryable write's session checkout and session row, and a
@@ -631,18 +620,6 @@ These are explicit non-goals. Don't add them without a reason.
         (four in its entry, four execution admissions) and once here.
       Backlog-ID: RM-357
       Verify: tests/backlog/test_rm_355_364.py::test_more_writes_report_mongods_locks
-- [ ] **A standalone's write concern is a replica set's.** `secantusd-rs
-      --standalone` keeps the member's write-concern machinery: a write sent
-      with no write concern takes the implicit `w: "majority"` and waits for
-      the journal (one more transition IX and global IS in its `locks`), and
-      `setDefaultRWConcern` and `getDefaultRWConcern` answer. mongod 8.2.11
-      as a standalone implies `w: 1` (no journal wait) and refuses both with
-      51300 (measured 2026-11-12). RM-185's lock comparison, which runs this
-      server as a standalone, sets a stored `w: 1` default until this is
-      fixed (`tests/backlog/test_rm_185_locks.py`, `rust_mongo`): the fix
-      drops that call.
-      Backlog-ID: RM-551
-      Verify: tests/backlog/test_rm_standalone_write_concern.py::test_a_standalone_implies_w_1
 - [ ] **Some queries have no `queryShapeHash`.** Since 2026-11-07 a
       `find`'s, `distinct`'s and `aggregate`'s line, profile entry and
       `explain` carry mongod's `queryShapeHash` (`secantus-commands`
@@ -669,17 +646,6 @@ These are explicit non-goals. Don't add them without a reason.
       the shaped ones were.
       Backlog-ID: RM-358
       Verify: tests/backlog/test_rm_355_364.py::test_a_query_of_every_kind_names_its_query_shape
-- [ ] **An `explain` of `$geoNear` fails.** mongod 8.2.11 explains
-      `aggregate` of `[{$geoNear: {near: [0, 0]}}]` over a collection with
-      a `2d` index, with or without `distanceField`, and prints its
-      `queryShapeHash`. This server runs the stage itself, but its
-      `explain` runs the pipeline against a namespace of its own
-      (`explain.dry.run`, `explain/mod.rs`) and fails with 26 (`$geoNear
-      requires a geo index to run, but <db>.explain.dry.run does not
-      exist`), as RM-466 did for `$planCacheStats`. A `$rankFusion` with a
-      `$geoNear` input fails the same way. Found 2026-11-12 (RM-358).
-      Verify: tests/backlog/test_rm_found_rm358.py::test_an_explain_of_geo_near_runs
-      Backlog-ID: RM-552
 - [ ] **`$scoreFusion` combines by `"average"`, not `"avg"`.** mongod
       8.2.11's `combination.method` is `"avg"` or `"expression"` (its IDL
       enum, `kAvg: "avg"`) and refuses `"average"` with 2 (`Enumeration
@@ -689,19 +655,6 @@ These are explicit non-goals. Don't add them without a reason.
       (`hybrid.rs`). Found 2026-11-12 (RM-358).
       Verify: tests/backlog/test_rm_found_rm358.py::test_score_fusion_combines_by_avg
       Backlog-ID: RM-553
-- [ ] **A later `$match` does not replace the one `$planCacheStats` absorbed.**
-      mongod 8.2.11's `$planCacheStats` absorbs the `$match` right after
-      it, and absorbs again, in place of the first, each `$match` a later
-      stage swaps ahead of itself (`doOptimizeAt` overwrites
-      `_absorbedMatch`): `[{$planCacheStats: {}}, {$match: {isActive:
-      false}}, {$project: {isActive: 1, works: 1}}, {$match: {works: {$gte:
-      0}}}]` returns every entry, the first filter lost. This server's stage
-      (`aggregate.rs`) keeps the first `$match` and runs the second after
-      the `$project`, returning none of three active entries. `explain`
-      already lists it as mongod does (`plan_cache::absorb_matches`, RM-466),
-      which the run could share. Found 2026-11-12 (RM-466).
-      Verify: tests/backlog/test_rm_found_rm466.py::test_a_later_match_replaces_the_one_plan_cache_stats_absorbed
-      Backlog-ID: RM-554
 - [ ] **An `$or` of one index sorts documents, not index keys.** mongod
       8.2.11 answers `find({$or: [{y: 0}, {y: {$gt: 1}}]}).sort({x: 1})`
       over `{y: 1, x: 1}` with one two-interval IXSCAN whose keys it sorts
@@ -734,16 +687,6 @@ These are explicit non-goals. Don't add them without a reason.
       reference answer is a race under load. Found 2026-11-12 (RM-475).
       Verify: none -- an intermittent failure under load, 1 in 2 gate runs
       Backlog-ID: RM-558
-- [ ] **A spilled SORT of index keys under a collation writes the
-      strings, not their collation keys.** mongod 8.2.11's SORT below a
-      FETCH computes each member's sort key under the command's collation
-      and spills that key: 2000 `"s{i}"` strings over `{y: 1, x: 1}` with
-      `{locale: "fr"}` under a 100000-byte budget spill 157780 bytes. This
-      server writes the string values (`stream.rs`'s `member_values`):
-      149780. What it counts in memory already agrees (140890). Found
-      2026-11-12 (RM-475).
-      Verify: tests/backlog/test_rm_found_rm475.py::test_a_spilled_sort_of_index_keys_writes_collation_keys
-      Backlog-ID: RM-555
 - [ ] **A spilled SORT of index keys compresses to a different size.**
       Each member mongod 8.2.11 spills carries the id of the storage
       snapshot it was read in, drawn from a process-wide counter every

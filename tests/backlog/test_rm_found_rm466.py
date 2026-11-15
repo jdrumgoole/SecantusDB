@@ -29,16 +29,16 @@ def _entries(client: Any, pipeline: list) -> dict:
         client.drop_database("rm_found_rm466")
 
 
-@pytest.mark.backlog("RM-554")
+@pytest.mark.backlog_fixed("RM-554")
 def test_a_later_match_replaces_the_one_plan_cache_stats_absorbed(
     rust_mongo: Any, mongod: Any
 ) -> None:
     """mongod 8.2.11's `$planCacheStats` absorbs the `$match` right after it,
     and then absorbs a later `$match` that a `$project` swaps ahead of
     itself in place of the first, whose filter is lost: every entry comes
-    back, inactive or not. This server's stage keeps the first `$match` and
-    runs the second after the `$project`, so none of the (active) entries
-    passes `isActive: false`."""
+    back, inactive or not. This server's stage kept the first `$match` and
+    ran the second after the `$project`, so none of the (active) entries
+    passed `isActive: false`; it now absorbs as `explain` lists it."""
     pipeline = [
         _P,
         {"$match": {"isActive": False}},

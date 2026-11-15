@@ -45,6 +45,20 @@ fn unknown_field(path: &str, field: &str) -> CommandError {
     )
 }
 
+/// mongod refuses both default-concern commands on a standalone, after
+/// its IDL has parsed the command (measured 8.2.11, 2026-11-15: an unknown
+/// field is 40415 and a mistyped `inMemory` 14 first; RM-551).
+fn refuse_on_standalone(name: &str, ctx: &CommandContext) -> Result<(), CommandError> {
+    if ctx.replica_set_name.is_some() {
+        return Ok(());
+    }
+    Err(CommandError::new(
+        51300,
+        "Location51300",
+        format!("'{name}' is not supported on standalone nodes."),
+    ))
+}
+
 fn type_name(v: &Bson) -> &'static str {
     secantus_core::query::bson_type_name(v)
 }
@@ -70,6 +84,8 @@ pub(crate) fn stored(ctx: &CommandContext) -> Result<Option<Document>, CommandEr
 /// the stored one, or `None` for mongod's implicit `w: "majority"` (which
 /// a one-member set always satisfies).
 pub(crate) fn default_write_concern(ctx: &CommandContext) -> Option<Document> {
+    // A standalone keeps no defaults: its implicit one is `w: 1` (RM-551).
+    ctx.replica_set_name.as_ref()?;
     if let Some(p) = &ctx.server_params {
         if let Some(cached) = p.rw_defaults_cached() {
             return cached.and_then(|d| d.get_document("defaultWriteConcern").ok().cloned());
@@ -163,6 +179,7 @@ pub fn get_default_rw_concern(doc: &Document, ctx: &mut CommandContext) -> Handl
             k => return Err(unknown_field("getDefaultRWConcern", k)),
         }
     }
+    refuse_on_standalone("getDefaultRWConcern", ctx)?;
     let settings = stored(ctx)?;
     Ok(reply(settings.as_ref(), in_memory))
 }
@@ -492,6 +509,7 @@ pub fn set_default_rw_concern(doc: &Document, ctx: &mut CommandContext) -> Handl
             k => return Err(unknown_field("setDefaultRWConcern", k)),
         }
     }
+    refuse_on_standalone("setDefaultRWConcern", ctx)?;
     if matches!(read, Given::Absent) && matches!(write, Given::Absent) {
         return Err(bad_value(
             "At least one of the \"defaultReadConcern\" or \"defaultWriteConcern\" fields must \

@@ -66,13 +66,6 @@ def rust_mongo(tmp_path_factory: pytest.TempPathFactory) -> Iterator[Any]:
     with rust_mongo_server(tmp_path_factory.mktemp("rm185"), "--standalone") as server:
         host, port = server.address
         client = pymongo.MongoClient(host, port, serverSelectionTimeoutMS=10_000, **_BASE_ROUNDS)
-        # A command sent without a write concern takes the standalone's
-        # `w: 1`, which this server's standalone does not imply yet: it
-        # waits for the journal as a replica set's `w: "majority"` does, and
-        # accepts `setDefaultRWConcern`, which mongod's standalone refuses
-        # (RM-551). Its stored default stands in until that is fixed, and
-        # this call fails loudly when it is.
-        client.admin.command("setDefaultRWConcern", defaultWriteConcern={"w": 1})
         try:
             yield client
         finally:

@@ -122,6 +122,10 @@ pub enum ParamKind {
     /// A number from 0 to 1, stored as a double
     /// (`internalQueryStatsSampleRate`).
     UnitInterval,
+    /// A CIDR range list, `{ranges: [string]}` (`admission::cidr`):
+    /// stored with each range in mongod's canonical form, refused with the
+    /// IDL parser's codes.
+    CidrRangeList,
 }
 
 /// `(name, kind)` for every runtime-settable parameter.
@@ -210,6 +214,11 @@ const SETTABLE: &[(&str, ParamKind)] = &[
     (
         "ingressConnectionEstablishmentMaxQueueDepth",
         ParamKind::Int32AtLeast(0),
+    ),
+    // The clients the limiter exempts (`admission::cidr`, RM-550).
+    (
+        "ingressConnectionEstablishmentRateLimiterBypass",
+        ParamKind::CidrRangeList,
     ),
     // mongod's execution admission control (`admission::execution`),
     // applied to its pools and monitor as they change (RM-355).
@@ -437,6 +446,14 @@ impl ServerParams {
     /// Set a parameter the server was started with (`--setParameter`),
     /// which `getParameter` then reports and the server honours.
     pub fn set_startup(&self, name: &str, value: Bson) {
+        // A range list is kept in mongod's canonical form, as `setParameter`
+        // keeps it.
+        let value = match kind_of(name) {
+            Some(ParamKind::CidrRangeList) => {
+                coerce(ParamKind::CidrRangeList, &value).unwrap_or(value)
+            }
+            _ => value,
+        };
         self.set(name, value);
     }
 
@@ -465,12 +482,18 @@ impl ServerParams {
     /// after waiting its turn, or not at all (`false`: close it unanswered,
     /// as mongod ends a session whose `throttleIfNeeded` failed).
     /// `disconnected` says whether the client has gone while it waits.
-    pub fn admit_connection(&self, disconnected: &mut dyn FnMut() -> bool) -> bool {
+    pub fn admit_connection(
+        &self,
+        peer: Option<std::net::IpAddr>,
+        disconnected: &mut dyn FnMut() -> bool,
+    ) -> bool {
         use crate::admission::rate_limiter::ENABLED;
         if !matches!(self.get(ENABLED), Some(Bson::Boolean(true))) {
             return true;
         }
-        self.establishment.throttle_if_needed(disconnected).is_ok()
+        self.establishment
+            .throttle_if_needed(peer, disconnected)
+            .is_ok()
     }
 
     /// mongod's connection establishment rate limiter (RM-355).
@@ -737,6 +760,9 @@ fn coerce(kind: ParamKind, value: &Bson) -> Option<Bson> {
         },
         // Coerced by name (`coerce_named`).
         ParamKind::Execution => None,
+        ParamKind::CidrRangeList => crate::admission::cidr::parse(value)
+            .ok()
+            .map(|ranges| Bson::Document(crate::admission::cidr::to_document(&ranges))),
         ParamKind::MemorySize => match value {
             Bson::String(s) => Some(Bson::String(s.clone())),
             _ => None,
@@ -1026,6 +1052,9 @@ pub fn set_parameter(doc: &Document, ctx: &mut CommandContext) -> HandlerResult 
                 format!("attempted to set unrecognized parameter [{name}]{HELP_SUFFIX}"),
             ));
         };
+        if kind == ParamKind::CidrRangeList {
+            crate::admission::cidr::parse(value)?;
+        }
         if let Err(why) = coerce_named(name, kind, value, ctx) {
             return Err(CommandError::new(2, "BadValue", why));
         }
@@ -1350,7 +1379,7 @@ mod tests {
     #[test]
     fn the_bucket_admits_a_token_at_a_time() {
         let params = ServerParams::new();
-        assert!(params.admit_connection(&mut || false));
+        assert!(params.admit_connection(None, &mut || false));
         params.set(
             "ingressConnectionEstablishmentRateLimiterEnabled",
             Bson::Boolean(true),
@@ -1360,8 +1389,8 @@ mod tests {
             "ingressConnectionEstablishmentBurstCapacitySecs",
             Bson::Double(1.0),
         );
-        assert!(params.admit_connection(&mut || false));
-        assert!(!params.admit_connection(&mut || false));
+        assert!(params.admit_connection(None, &mut || false));
+        assert!(!params.admit_connection(None, &mut || false));
     }
 
     /// The TTL monitor's two parameters (mongod 8.2.11, 2026-10-10). Both

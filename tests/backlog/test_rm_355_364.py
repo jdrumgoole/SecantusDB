@@ -328,12 +328,12 @@ def test_ending_a_transaction_takes_mongods_execution_tickets(
     assert got["rust"] == got["mongod"]
 
 
-@pytest.mark.backlog("RM-550")
+@pytest.mark.backlog_fixed("RM-550")
 def test_the_connection_rate_limiter_has_its_bypass_list(rust_mongo: Any, mongod_rs: Any) -> None:
     """mongod 8.2.11 exempts the clients in
     `ingressConnectionEstablishmentRateLimiterBypass`, a CIDR range list
     (`{ranges: []}` by default), from its connection establishment rate
-    limiter, and counts them as `exemptedAdmissions`. This server does not
+    limiter, and counts them as `exemptedAdmissions`. This server did not
     register the parameter (measured 2026-11-12)."""
     answers = {}
     for server, client in (("rust", rust_mongo), ("mongod", mongod_rs)):
@@ -346,6 +346,58 @@ def test_the_connection_rate_limiter_has_its_bypass_list(rust_mongo: Any, mongod
             answers[server] = e.code
     assert answers["mongod"] == {"ranges": []}
     assert answers["rust"] == answers["mongod"]
+
+
+@pytest.mark.backlog_fixed("RM-550")
+def test_the_bypass_list_reads_back_and_exempts_its_clients(
+    rust_mongo: Any, mongod_rs: Any
+) -> None:
+    """mongod 8.2.11 stores each range in canonical form (a string that is
+    no CIDR as given), refuses a malformed list with the IDL parser's codes,
+    and counts a client in the list as exempted in both
+    `queues.ingressSessionEstablishment` and `connections` (2026-11-15)."""
+    name = "ingressConnectionEstablishmentRateLimiterBypass"
+    out = {}
+    for server, client in (("rust", rust_mongo), ("mongod", mongod_rs)):
+        admin = client.admin
+        host, port = client.address
+        got: list[Any] = []
+        for value in (
+            {"ranges": ["127.0.0.1", "0:0::1", "10.1.2.3/8", "bogus"]},
+            {"ranges": "a"},
+            {"ranges": [1]},
+            {"x": 1},
+            {},
+            "x",
+        ):
+            try:
+                admin.command("setParameter", 1, **{name: value})
+                got.append(admin.command("getParameter", 1, **{name: 1})[name])
+            except pymongo.errors.OperationFailure as e:
+                got.append(e.code)
+
+        def counts(admin: Any = admin) -> tuple[int, int]:
+            s = admin.command("serverStatus")
+            return (
+                s["queues"]["ingressSessionEstablishment"]["exemptedAdmissions"],
+                s["connections"]["establishmentRateLimit"]["exempted"],
+            )
+
+        before = counts()
+        admin.command("setParameter", 1, ingressConnectionEstablishmentRateLimiterEnabled=True)
+        try:
+            extra = pymongo.MongoClient(host, port, directConnection=True)
+            extra.admin.command("ping")
+            extra.close()
+            after = counts()
+        finally:
+            admin.command("setParameter", 1, ingressConnectionEstablishmentRateLimiterEnabled=False)
+            admin.command("setParameter", 1, **{name: {"ranges": []}})
+        got.append(after[0] - before[0] == after[1] - before[1] and after[0] > before[0])
+        out[server] = got
+    assert out["mongod"][0] == {"ranges": ["127.0.0.1/32", "::1/128", "10.1.2.3/8", "bogus"]}
+    assert out["mongod"][1:6] == [14, 14, 40415, 40414, 10065]
+    assert out["rust"] == out["mongod"]
 
 
 # ------------------------------------------------------------- RM-356 --

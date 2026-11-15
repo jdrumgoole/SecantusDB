@@ -13,6 +13,7 @@
 //! and [`execution`], its execution control's read and write pools; beside
 //! them, [`rate_limiter`], the connection establishment rate limiter.
 
+pub mod cidr;
 pub mod execution;
 pub mod ingress;
 pub mod rate_limiter;

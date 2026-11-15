@@ -35,7 +35,7 @@ mod parsed;
 mod plan;
 pub(crate) mod plan_cache;
 mod sbe;
-mod shape;
+pub(crate) mod shape;
 pub(crate) mod stream;
 mod sub_stages;
 pub(crate) mod summary;
@@ -2990,6 +2990,12 @@ fn aggregate(
         // Nor a plan cache for `$planCacheStats` to read, which `explain`
         // lists without reading it (RM-466).
         Err(e) if e.code == 50933 && plan_cache_stats => {}
+        // Nor a geo index for `$geoNear` to find there: the stage's own
+        // arguments were checked before it looked (RM-552).
+        Err(e)
+            if e.code == 26
+                && e.errmsg.starts_with("$geoNear requires a geo index")
+                && e.errmsg.ends_with(&format!(".{DRY} does not exist")) => {}
         other => other?,
     }
     let db = ctx.db_name.clone();

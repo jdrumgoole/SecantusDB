@@ -756,6 +756,10 @@ fn classic_string(len: usize) -> usize {
 
 /// The classic engine's size of a value (`Value::getApproximateSize`).
 pub fn classic_size(v: &Bson) -> usize {
+    if let Some(bytes) = crate::bsondoc::as_invalid_utf8(v) {
+        // A string whose bytes are not UTF-8, in its carrier.
+        return classic_string(bytes.len());
+    }
     match v {
         Bson::String(s) | Bson::JavaScriptCode(s) | Bson::Symbol(s) => classic_string(s.len()),
         Bson::RegularExpression(r) => classic_string(r.pattern.len() + 1 + r.options.len()),

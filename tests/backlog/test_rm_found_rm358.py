@@ -38,14 +38,14 @@ def test_an_explain_of_plan_cache_stats_names_its_stage(rust_mongo: Any, mongod:
 # ------------------------------------------------- found 2026-11-12 --
 
 
-@pytest.mark.backlog("RM-552")
+@pytest.mark.backlog_fixed("RM-552")
 def test_an_explain_of_geo_near_runs(rust_mongo: Any, mongod: Any) -> None:
     """mongod 8.2.11 explains `aggregate` of `[{$geoNear: {near: [0, 0]}}]`
     over a collection with a `2d` index, with or without `distanceField`,
-    and prints its `queryShapeHash`. This server's explain fails with 26
+    and prints its `queryShapeHash`. This server's explain failed with 26
     (`$geoNear requires a geo index to run, but <db>.explain.dry.run does
-    not exist`): it runs the pipeline against a namespace of its own, as
-    RM-466 does for `$planCacheStats` (found 2026-11-12, RM-358)."""
+    not exist`): it ran the pipeline against a namespace of its own, as
+    RM-466 did for `$planCacheStats` (found 2026-11-12, RM-358)."""
 
     def explain(client: Any, spec: dict) -> Any:
         db = client["rm_found_rm358_geo"]
