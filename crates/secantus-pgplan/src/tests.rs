@@ -8449,3 +8449,20 @@ fn a_regclass_literal_in_a_default_is_resolved() {
     assert!(err.to_string().contains("\"nosuch_seq\""), "{err}");
     assert_eq!(take_error_location(), Some(41));
 }
+
+#[test]
+fn an_operator_is_resolved_after_a_reference_to_its_left() {
+    // `make_op` runs after its operands are analysed (RP-447): a missing
+    // column to an operator's left fails first, one to its right after.
+    for (sql, state, at) in [
+        ("select nosuch + (1 + true)", "42703", 7),
+        ("select (1 + true) + nosuch", "42883", 10),
+        ("select 1/0, nosuch", "42703", 12),
+        ("select ('x' || 'y')::int + nosuch", "42703", 27),
+    ] {
+        take_error_location();
+        let err = analysed(sql).expect_err("should refuse");
+        assert_eq!(err.sqlstate(), state, "for {sql} (got {err})");
+        assert_eq!(take_error_location(), Some(at), "for {sql}");
+    }
+}

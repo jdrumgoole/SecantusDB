@@ -358,9 +358,9 @@ def test_star_with_no_from(query: str, rust_pg: Any) -> None:
     assert answer(rust_pg, query) == STAR_WITH_NO_FROM[query]
 
 
-@pytest.mark.backlog("RP-447")
+@pytest.mark.backlog_fixed("RP-447")
 def test_missing_column_before_operator_to_its_right(rust_pg: Any) -> None:
-    """42883 `operator does not exist: integer + boolean` at 20 here."""
+    """Was 42883 `operator does not exist: integer + boolean` at 20."""
     assert answer(rust_pg, "select nosuch + (1 + true)") == _missing("8")
 
 

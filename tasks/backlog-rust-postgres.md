@@ -2241,16 +2241,6 @@ a regression test.
       private 15.19 cluster (found while working RP-432).
       Verify: tests/backlog/test_rp_dml_from.py::test_missing_column_reported_before_ambiguous_one
       Backlog-ID: RP-436
-- [ ] **An operator's type error is reported ahead of a missing column to
-      its left.** `select nosuch + (1 + true)` is 42883 `operator does not
-      exist: integer + boolean` here, from `optype` checking every operator
-      before the planner meets the column; PostgreSQL 15.19 analyses the
-      left operand first and answers 42703 `column "nosuch" does not exist`
-      at 8. The operator to the reference's LEFT already comes first on
-      both (`select (1 + true) + nosuch`). The same pass as RP-442. Measured
-      on PostgreSQL 15.19 (found while working RP-441).
-      Verify: tests/backlog/test_rp_fromless_analysis.py::test_missing_column_before_operator_to_its_right
-      Backlog-ID: RP-447
 - [ ] **A cast literal's input error is reported after the operator
       around it.** PostgreSQL 15.19's `transformTypeCast` runs a constant's
       input function as the cast is transformed, before `make_op` looks the

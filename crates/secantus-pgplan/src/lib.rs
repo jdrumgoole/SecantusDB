@@ -5819,7 +5819,20 @@ fn plan_with_subqueries_parsed(
 /// for its operands' types (42883) and an ambiguous ORDER BY name (42702).
 /// A row comparison's untyped literals are cast to the types their pairs
 /// resolve them to as it goes (RP-850).
-fn analysis_refusals(inner: &mut N, lookup: &dyn Fn(&str) -> Option<TableDef>) -> Result<()> {
+fn analysis_refusals(
+    inner: &mut N,
+    lookup: &dyn Fn(&str) -> Option<TableDef>,
+    params: &[Bson],
+) -> Result<()> {
+    // A FROM-less select's references fail in parse-analysis order, ahead
+    // of an operator to their right (RP-447). A WITH list is analysed
+    // before the body, so its items' errors come first: such a select is
+    // left to `plan_select`, which checks the CTEs and then the body.
+    if let N::SelectStmt(sel) = inner {
+        if sel.with_clause.is_none() {
+            fromless::check_column_refs(sel, params)?;
+        }
+    }
     func_cast::refuse_unresolved(inner)?;
     cancel::check()?;
     optype::check_and_type_row_literals(inner, lookup)?;
@@ -5865,7 +5878,7 @@ fn plan_query_node(
     }
     cancel::check()?;
     if let Some(inner) = node.node.as_mut() {
-        analysis_refusals(inner, lookup)?;
+        analysis_refusals(inner, lookup, params)?;
     }
     cancel::check()?;
     if let Some(inner) = node.node.as_mut() {
@@ -11999,7 +12012,7 @@ fn plan_explain(
     // error (RP-419).
     let mut analysed = e.query.as_deref().and_then(|q| q.node.clone());
     if let Some(q) = analysed.as_mut() {
-        analysis_refusals(q, lookup)?;
+        analysis_refusals(q, lookup, params)?;
     }
     let mut options = ExplainOptions {
         analyze: false,

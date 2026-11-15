@@ -131,11 +131,21 @@ fn visit_node(n: &mut Node, ordered: Option<&[Bson]>, windows: &mut Vec<Node>) -
                 });
             }
             match ordered {
-                Some(params) => missing_function(f, params),
+                Some(params) => {
+                    analysed_alone(&Node {
+                        node: Some(N::FuncCall(f.clone())),
+                    })?;
+                    missing_function(f, params)
+                }
                 None => Ok(()),
             }
         }
         Some(N::ColumnRef(c)) => missing(c),
+        // An operator is looked up as `make_op` meets it, after its
+        // operands, so one with no reference under it fails before a
+        // reference to its right (RP-447): `select nosuch + (1 + true)` is
+        // 42703, `select (1 + true) + nosuch` 42883.
+        Some(N::AExpr(_)) if ordered.is_some() => analysed_alone(n),
         Some(N::TypeCast(tc)) => match (ordered, tc.arg.as_deref()) {
             (Some(params), Some(arg)) if is_string_literal(arg) => {
                 let cast = Node {
@@ -198,6 +208,40 @@ fn missing_function(f: &pg_query::protobuf::FuncCall, params: &[Bson]) -> Result
         Err(Error::Unsupported(m)) if names_missing_function(&m) => Err(Error::Unsupported(m)),
         _ => Ok(()),
     }
+}
+
+/// What `optype` refuses in an operator or a call with neither a column
+/// reference nor a subquery under it (a subquery reads tables this walk
+/// does not look up), checked as its node is met: an operator with no
+/// overload for its operands (42883), a `regclass` literal naming no
+/// relation (42P01, RP-458). Anything else is left to the passes after
+/// this one.
+fn analysed_alone(n: &Node) -> Result<()> {
+    let mut self_contained = true;
+    let _ = walk_expr(&mut n.clone(), &mut |m| {
+        self_contained &= !matches!(m.node.as_ref(), Some(N::ColumnRef(_) | N::SubLink(_)));
+        Ok(())
+    });
+    if !self_contained {
+        return Ok(());
+    }
+    let select = N::SelectStmt(Box::new(SelectStmt {
+        target_list: vec![Node {
+            node: Some(N::ResTarget(Box::new(pg_query::protobuf::ResTarget {
+                val: Some(Box::new(n.clone())),
+                location: -1,
+                ..Default::default()
+            }))),
+        }],
+        op: pg_query::protobuf::SetOperation::SetopNone as i32,
+        limit_option: pg_query::protobuf::LimitOption::Default as i32,
+        ..Default::default()
+    }));
+    let checked = crate::optype::check(&select, &|_| None);
+    if checked.is_ok() {
+        take_error_location();
+    }
+    checked
 }
 
 /// Whether a planner refusal `function name(types)` names a function that
