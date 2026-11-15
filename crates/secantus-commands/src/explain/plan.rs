@@ -2294,6 +2294,34 @@ fn find_plan(q: &Query, catalog: &[Arc<IndexInfo>]) -> Node {
     if never(q) {
         return Node::Eof("predicateEvalsToFalse");
     }
+    // An `_id` point lookup under `returnKey` is an IDHACK at any batch
+    // size, under a limit or a sort, which it does not run (measured
+    // 8.2.11, RM-567: `RETURN_KEY <- IDHACK`, and `RETURN_KEY <-
+    // SORT_KEY_GENERATOR <- IDHACK` for a projection's `{$meta: "sortKey"}`);
+    // not with a hint, a skip, `min` / `max`, `showRecordId` or a collation
+    // the `_id` index does not have, which scan the index.
+    if let (true, Some(("_id", value))) = (
+        q.return_key && q.hint == Hint::None && q.skip == 0 && !q.min_max && !q.show_record_id,
+        point_lookup(q.canonical),
+    ) {
+        let id_index = catalog.iter().any(|ix| {
+            ix.plain
+                && ix.key.len() == 1
+                && ix.position("_id") == Some(0)
+                && !collation_differs(ix, q.collation)
+        });
+        if id_index {
+            let mut node = Node::IdHack(value.clone());
+            let sort_key = q.projection.is_some_and(|p| {
+                p.values()
+                    .any(|v| secantus_core::projection::meta_spec(v) == Some("sortKey"))
+            });
+            if q.sort.is_some_and(|s| !s.is_empty()) && sort_key {
+                node = Node::SortKeyGenerator(Box::new(node));
+            }
+            return Node::ReturnKey(Box::new(node));
+        }
+    }
     let simple = q.hint == Hint::None && q.skip == 0 && !q.min_max && !q.return_key;
     if let (true, Some((path, value))) = (simple && !q.show_record_id, point_lookup(q.canonical)) {
         let index = catalog.iter().find(|ix| {

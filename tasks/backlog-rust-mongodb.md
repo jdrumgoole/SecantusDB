@@ -689,12 +689,6 @@ These are explicit non-goals. Don't add them without a reason.
       falls within mongod's own run-to-run spread of its answer.
       Verify: none -- mongod's own answer varies between runs; no test can pin it
       Backlog-ID: RM-556
-- [ ] **A `returnKey` point lookup on `_id` is not IDHACK.** mongod 8.2.11
-      answers `find({_id: 3}).returnKey()` by `RETURN_KEY <- IDHACK`; this
-      server plans `RETURN_KEY <- IXSCAN` (`find_plan` leaves the point
-      lookups to reads without `returnKey`). Found 2026-11-12 (RM-470).
-      Verify: tests/backlog/test_rm_found_rm470.py::test_return_key_of_an_id_point_lookup_is_idhack
-      Backlog-ID: RM-567
 - [ ] **`find` drops a projection's `{$meta: "sortKey"}` field.** mongod
       8.2.11 gives each document the sort key as an array:
       `find({}, {k: {$meta: "sortKey"}}).sort({x: 1})` over `{_id: 1, x:

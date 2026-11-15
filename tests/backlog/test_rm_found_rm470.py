@@ -83,10 +83,10 @@ def test_a_sort_under_return_key_is_a_default_sort(rust_mongo: Any, mongod: Any)
     assert all(set(d) == {"y", "x"} for _, docs in answers.values() for d in docs)
 
 
-@pytest.mark.backlog("RM-567")
+@pytest.mark.backlog_fixed("RM-567")
 def test_return_key_of_an_id_point_lookup_is_idhack(rust_mongo: Any, mongod: Any) -> None:
     """mongod 8.2.11 answers `find({_id: 3}).returnKey()` by IDHACK
-    (`RETURN_KEY <- IDHACK`); this server plans `RETURN_KEY <- IXSCAN`."""
+    (`RETURN_KEY <- IDHACK`); this server planned `RETURN_KEY <- IXSCAN`."""
     command = {"find": "c", "filter": {"_id": 3}, "returnKey": True}
     answers = {
         server: _answer(client, command)
@@ -114,4 +114,36 @@ def test_return_key_keeps_a_sort_key_meta_field(rust_mongo: Any, mongod: Any) ->
         for server, client in (("mongod", mongod), ("rust", rust_mongo))
     }
     assert answers["mongod"] == [{"k": [0]}] * 6
+    assert answers["rust"] == answers["mongod"]
+
+
+@pytest.mark.backlog_fixed("RM-567")
+@pytest.mark.parametrize(
+    "extra, stages, docs",
+    [
+        ({"batchSize": 5}, [("RETURN_KEY", None), ("IDHACK", None)], [{"_id": 3}]),
+        ({"limit": 1}, [("RETURN_KEY", None), ("IDHACK", None)], [{"_id": 3}]),
+        ({"sort": {"x": 1}}, [("RETURN_KEY", None), ("IDHACK", None)], [{"_id": 3}]),
+        (
+            {"sort": {"x": 1}, "projection": {"k": {"$meta": "sortKey"}}},
+            [("RETURN_KEY", None), ("SORT_KEY_GENERATOR", None), ("IDHACK", None)],
+            [{"_id": 3, "k": [3]}],
+        ),
+        ({"hint": {"_id": 1}}, [("RETURN_KEY", None), ("IXSCAN", None)], [{"_id": 3}]),
+        ({"showRecordId": True}, [("RETURN_KEY", None), ("IXSCAN", None)], [{"_id": 3}]),
+        ({"collation": {"locale": "fr"}}, [("RETURN_KEY", None), ("IXSCAN", None)], [{"_id": 3}]),
+    ],
+)
+def test_return_key_id_lookup_variants(
+    rust_mongo: Any, mongod: Any, extra: dict, stages: list, docs: list
+) -> None:
+    """mongod 8.2.11 keeps IDHACK under `returnKey` at any batch size, under
+    a limit or a sort (a SORT_KEY_GENERATOR for a `sortKey` field), and
+    scans the index under a hint, `showRecordId` or another collation."""
+    command = {"find": "c", "filter": {"_id": 3}, "returnKey": True, **extra}
+    answers = {
+        server: _answer(client, command)
+        for server, client in (("mongod", mongod), ("rust", rust_mongo))
+    }
+    assert answers["mongod"] == (stages, docs)
     assert answers["rust"] == answers["mongod"]

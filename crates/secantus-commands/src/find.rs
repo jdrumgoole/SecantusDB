@@ -1406,7 +1406,36 @@ fn shape_streamed(
         docs, rids, keys, ..
     } = batch;
     if cursor.return_key {
-        let mut out: Vec<Document> = keys.into_iter().map(Option::unwrap_or_default).collect();
+        // An IDHACK reads no index entry: its key is the document's `_id`
+        // (measured 8.2.11, RM-567: `{_id: 3}`).
+        fn id_hack(node: &crate::explain::Node) -> bool {
+            match node {
+                crate::explain::Node::IdHack(_) => true,
+                crate::explain::Node::ReturnKey(input)
+                | crate::explain::Node::SortKeyGenerator(input) => id_hack(input),
+                _ => false,
+            }
+        }
+        let by_id = id_hack(&cursor.plan);
+        let mut out: Vec<Document> = Vec::with_capacity(keys.len());
+        for (i, key) in keys.into_iter().enumerate() {
+            out.push(match (key, docs.get(i)) {
+                (Some(key), _) => key,
+                (None, Some(bytes)) if by_id => {
+                    let raw = bson::RawDocument::from_bytes(bytes.as_slice())
+                        .map_err(|e| CommandError::new(1, "InternalError", e.to_string()))?;
+                    let mut key = Document::new();
+                    if let Some(id) = raw.get("_id").ok().flatten() {
+                        let id: Bson = id.try_into().map_err(|e: bson::raw::Error| {
+                            CommandError::new(1, "InternalError", e.to_string())
+                        })?;
+                        key.insert("_id", id);
+                    }
+                    key
+                }
+                (None, _) => Document::new(),
+            });
+        }
         // A projection's `{$meta: "sortKey"}` fields stay, after the index
         // key, each the sort key as an array; one an index field already
         // names keeps that field's place (`extractSortKeyMetaFieldsFromProjection`;
