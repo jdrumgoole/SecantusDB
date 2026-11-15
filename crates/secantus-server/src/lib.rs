@@ -655,7 +655,7 @@ fn accept_loop(listener: TcpListener, shared: Arc<Shared>) {
             }
         }
         match listener.accept() {
-            Ok((stream, _peer)) => {
+            Ok((stream, peer)) => {
                 // Disable Nagle: reply paths write small frames back-to-back
                 // and with Nagle on the second write waits for the peer's
                 // delayed ACK — ~40ms per round trip on Linux CI, invisible
@@ -680,7 +680,7 @@ fn accept_loop(listener: TcpListener, shared: Arc<Shared>) {
                     // whose client goes while it waits is let go.
                     if !conn_shared
                         .server_params
-                        .admit_connection(&mut || client_disconnected(&stream))
+                        .admit_connection(Some(peer.ip()), &mut || client_disconnected(&stream))
                     {
                         refuse_unanswered(stream);
                         drop(conn_shared);

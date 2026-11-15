@@ -579,17 +579,6 @@ These are explicit non-goals. Don't add them without a reason.
       lock of their own, count mongod's. Found 2026-11-12 (RM-360).
       Verify: tests/backlog/test_rm_found_2026_11_12_rm360.py::test_each_cursor_stage_buffer_takes_an_execution_ticket
       Backlog-ID: RM-579
-- [ ] **The connection establishment rate limiter has no bypass list.**
-      mongod 8.2.11's `ingressConnectionEstablishmentRateLimiterBypass` (a
-      CIDR range list, `{ranges: []}` by default, set at startup or at
-      runtime) exempts the clients it names from the connection
-      establishment rate limiter, which counts them in
-      `queues.ingressSessionEstablishment.exemptedAdmissions` and
-      `connections.establishmentRateLimit.exempted`. This server does not
-      register the parameter (`getParameter` answers 72), so every client
-      is limited and both counts stay 0. Found working RM-355, 2026-11-12.
-      Backlog-ID: RM-550
-      Verify: tests/backlog/test_rm_355_364.py::test_the_connection_rate_limiter_has_its_bypass_list
 - [ ] **Some writes' `locks` are not mongod's.** Since 2026-11-07 a write
       counts mongod's flow control tickets (one per global IX taken apart)
       and a retryable write's session checkout and session row, and a

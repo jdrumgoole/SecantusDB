@@ -744,6 +744,11 @@ fn listed(test_commands: bool) -> Vec<(&'static str, bool, Bson)> {
             Bson::Int32(0),
         ),
         (
+            "ingressConnectionEstablishmentRateLimiterBypass",
+            true,
+            Bson::Document(bson::doc! {"ranges": []}),
+        ),
+        (
             "ingressConnectionEstablishmentRateLimiterEnabled",
             true,
             Bson::Boolean(false),

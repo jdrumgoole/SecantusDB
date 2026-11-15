@@ -382,6 +382,9 @@ pub struct SessionEstablishmentRateLimiter {
     /// back with the other (mongod reads the other parameter's global).
     rate_per_sec: Mutex<(f64, f64)>,
     interrupted_due_to_client_disconnect: AtomicI64,
+    /// `ingressConnectionEstablishmentRateLimiterBypass`: the clients the
+    /// limiter exempts (RM-550).
+    bypass: Mutex<Vec<super::cidr::Range>>,
 }
 
 impl Default for SessionEstablishmentRateLimiter {
@@ -394,6 +397,7 @@ impl Default for SessionEstablishmentRateLimiter {
             limiter: RateLimiter::new(rate, burst, 0, "SessionEstablishmentRateLimiter"),
             rate_per_sec: Mutex::new((rate, burst)),
             interrupted_due_to_client_disconnect: AtomicI64::new(0),
+            bypass: Mutex::new(Vec::new()),
         }
     }
 }
@@ -402,6 +406,12 @@ impl SessionEstablishmentRateLimiter {
     /// Apply a parameter `setParameter` (or startup) set, as its
     /// `on_update` hook does. Other names are not the limiter's.
     pub fn apply(&self, name: &str, value: &Bson) {
+        if name == super::cidr::BYPASS {
+            if let Ok(ranges) = super::cidr::parse(value) {
+                *self.bypass.lock().unwrap_or_else(|e| e.into_inner()) = ranges;
+            }
+            return;
+        }
         let number = match value {
             Bson::Int32(n) => f64::from(*n),
             Bson::Int64(n) => *n as f64,
@@ -423,13 +433,27 @@ impl SessionEstablishmentRateLimiter {
         }
     }
 
-    /// mongod's `throttleIfNeeded`: take a token or sleep until one is due.
-    /// `disconnected` says whether the client has gone; one that has gone
-    /// while it slept is counted and refused.
+    /// mongod's `throttleIfNeeded`: a client at `peer` in the bypass list
+    /// is admitted at once and counted as exempted; any other takes a token
+    /// or sleeps until one is due. `disconnected` says whether the client
+    /// has gone; one that has gone while it slept is counted and refused.
     pub fn throttle_if_needed(
         &self,
+        peer: Option<std::net::IpAddr>,
         disconnected: &mut dyn FnMut() -> bool,
     ) -> Result<(), Refused> {
+        if let Some(peer) = peer {
+            let exempt = self
+                .bypass
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .iter()
+                .any(|range| range.contains(peer));
+            if exempt {
+                self.limiter.record_exemption();
+                return Ok(());
+            }
+        }
         let mut gone = false;
         let result = self.limiter.acquire_token(&mut || {
             gone = disconnected();
@@ -469,6 +493,38 @@ impl SessionEstablishmentRateLimiter {
 mod tests {
     use super::*;
 
+    /// A client in the bypass list takes no token and is counted as
+    /// exempted, in both places mongod 8.2.11 counts it (2026-11-15).
+    #[test]
+    fn a_client_in_the_bypass_list_is_exempted() {
+        let limiter = SessionEstablishmentRateLimiter::default();
+        limiter.apply(RATE_PER_SEC, &Bson::Int32(1));
+        limiter.apply(BURST_CAPACITY_SECS, &Bson::Double(1.0));
+        limiter.apply(
+            super::super::cidr::BYPASS,
+            &Bson::Document(doc! {"ranges": ["127.0.0.0/8"]}),
+        );
+        let local = Some("127.0.0.1".parse().unwrap());
+        for _ in 0..3 {
+            assert_eq!(limiter.throttle_if_needed(local, &mut || false), Ok(()));
+        }
+        let other = Some("10.0.0.1".parse().unwrap());
+        assert_eq!(limiter.throttle_if_needed(other, &mut || false), Ok(()));
+        assert!(limiter.throttle_if_needed(other, &mut || false).is_err());
+        let stats = limiter.stats_queues();
+        assert_eq!(stats.get_i64("exemptedAdmissions"), Ok(3));
+        assert_eq!(stats.get_i64("successfulAdmissions"), Ok(1));
+        let mut connections = Document::new();
+        limiter.append_stats_connections(&mut connections);
+        assert_eq!(
+            connections
+                .get_document("establishmentRateLimit")
+                .unwrap()
+                .get_i64("exempted"),
+            Ok(3)
+        );
+    }
+
     /// With the defaults the bucket is bottomless, and mongod prints its
     /// tokens as INT64_MAX (measured 8.2.11: 9.223372036854776e18).
     #[test]
@@ -477,7 +533,7 @@ mod tests {
         let stats = limiter.stats_queues();
         assert_eq!(stats.get_f64("totalAvailableTokens"), Ok(i64::MAX as f64));
         assert!(!stats.contains_key("averageTimeQueuedMicros"));
-        assert_eq!(limiter.throttle_if_needed(&mut || false), Ok(()));
+        assert_eq!(limiter.throttle_if_needed(None, &mut || false), Ok(()));
         assert_eq!(
             limiter.stats_queues().get_f64("averageTimeQueuedMicros"),
             Ok(0.0)
@@ -491,9 +547,9 @@ mod tests {
         let limiter = SessionEstablishmentRateLimiter::default();
         limiter.apply(RATE_PER_SEC, &Bson::Int32(1));
         limiter.apply(BURST_CAPACITY_SECS, &Bson::Double(1.0));
-        assert_eq!(limiter.throttle_if_needed(&mut || false), Ok(()));
+        assert_eq!(limiter.throttle_if_needed(None, &mut || false), Ok(()));
         assert_eq!(
-            limiter.throttle_if_needed(&mut || false),
+            limiter.throttle_if_needed(None, &mut || false),
             Err(Refused::Rejected(
                 "Rate limiter 'SessionEstablishmentRateLimiter' maximum queue depth (0) exceeded"
                     .to_string()
@@ -516,9 +572,9 @@ mod tests {
         limiter.apply(RATE_PER_SEC, &Bson::Int32(20));
         limiter.apply(BURST_CAPACITY_SECS, &Bson::Double(0.05));
         limiter.apply(MAX_QUEUE_DEPTH, &Bson::Int32(1));
-        assert_eq!(limiter.throttle_if_needed(&mut || false), Ok(()));
+        assert_eq!(limiter.throttle_if_needed(None, &mut || false), Ok(()));
         let started = Instant::now();
-        assert_eq!(limiter.throttle_if_needed(&mut || false), Ok(()));
+        assert_eq!(limiter.throttle_if_needed(None, &mut || false), Ok(()));
         assert!(started.elapsed() >= Duration::from_millis(40));
         let stats = limiter.stats_queues();
         assert_eq!(stats.get_i64("addedToQueue"), Ok(1));
@@ -535,12 +591,12 @@ mod tests {
         limiter.apply(RATE_PER_SEC, &Bson::Int32(1));
         limiter.apply(BURST_CAPACITY_SECS, &Bson::Double(1.0));
         limiter.apply(MAX_QUEUE_DEPTH, &Bson::Int32(1));
-        assert_eq!(limiter.throttle_if_needed(&mut || false), Ok(()));
+        assert_eq!(limiter.throttle_if_needed(None, &mut || false), Ok(()));
         // A token borrowed by a connection already asleep: the next one's is
         // ~2 s away, and its client goes at the first check, after ~1 s.
         limiter.limiter.bucket().return_tokens(-1.0);
         assert_eq!(
-            limiter.throttle_if_needed(&mut || true),
+            limiter.throttle_if_needed(None, &mut || true),
             Err(Refused::Interrupted)
         );
         let stats = limiter.stats_queues();
