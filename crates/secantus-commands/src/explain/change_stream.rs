@@ -26,8 +26,7 @@
 //!
 //! Not reproduced: the rewrites of the other event fields and of `$expr`
 //! (RM-698), the Boolean simplifier mongod runs over the unwind's filter
-//! (RM-699), the counts of a read that starts before the end of the oplog
-//! (RM-453), and the change stream's `queryShapeHash` (RM-454).
+//! (RM-699), and the change stream's `queryShapeHash` (RM-454).
 
 use bson::{doc, Bson, Document, Timestamp};
 
@@ -997,6 +996,111 @@ fn stages_after_read(spec: &Spec, db: &str, user: &[Document], token: &Document)
     out
 }
 
+/// What the explain's run of a change stream found (RM-453).
+struct Run {
+    /// Oplog entries at or after the start time: the scan's `docsExamined`.
+    examined: usize,
+    /// Of those, the entries the stream's filter keeps.
+    matched: usize,
+    /// The events the stream makes of them, invalidations included.
+    events: Vec<Document>,
+    invalidates: usize,
+}
+
+/// Run the read mongod runs for `explain` of a change stream: the oplog
+/// from `start` through the filter, and the events of the stream from the
+/// seq `after`, as the stream itself polls them.
+fn run_read(
+    storage: &dyn crate::storage::Storage,
+    scope: &Scope,
+    raw: &Document,
+    pipeline: &[Document],
+    filter: &Document,
+    start: Timestamp,
+    after: i64,
+) -> Result<Run, crate::CommandError> {
+    let fault = |e: crate::storage::StorageError| {
+        crate::CommandError::new(1, "InternalError", format!("{e:?}"))
+    };
+    let from = doc! { "ts": { "$gte": start } };
+    let examined = storage
+        .find("local", "oplog.rs", &from, None, None)
+        .map_err(fault)?
+        .len();
+    let read = doc! { "$and": [from, filter.clone()] };
+    let matched = storage
+        .find("local", "oplog.rs", &read, None, None)
+        .map_err(fault)?
+        .len();
+    let cs_scope = match scope {
+        Scope::Coll { db, coll } => crate::storage::ChangeStreamScope::Coll {
+            db: (*db).to_string(),
+            coll: (*coll).to_string(),
+        },
+        Scope::Db(db) => crate::storage::ChangeStreamScope::Db((*db).to_string()),
+        Scope::Cluster => crate::storage::ChangeStreamScope::Cluster,
+    };
+    let opts = crate::storage::ChangeStreamOptions {
+        full_document: raw.get_str("fullDocument").unwrap_or("default").to_string(),
+        full_document_before_change: raw
+            .get_str("fullDocumentBeforeChange")
+            .unwrap_or("off")
+            .to_string(),
+        show_expanded_events: raw.get_bool("showExpandedEvents").unwrap_or(false),
+        split_large_events: pipeline
+            .iter()
+            .any(|s| s.contains_key("$changeStreamSplitLargeEvent")),
+        start_ts: raw.get_timestamp("startAtOperationTime").ok(),
+    };
+    let tail = storage.oplog_tail_seq();
+    let mut position = after;
+    let mut events = Vec::new();
+    let mut invalidates = 0;
+    while position < tail {
+        let batch = storage
+            .change_stream_poll(&cs_scope, &opts, position, 1000)
+            .map_err(fault)?;
+        for bytes in &batch.events {
+            let d = secantus_core::bsondoc::from_bytes(bytes)
+                .map_err(|e| crate::CommandError::new(1, "InternalError", e.to_string()))?;
+            if d.get_str("operationType") == Ok("invalidate") {
+                invalidates += 1;
+            }
+            events.push(d);
+        }
+        if batch.invalidated || batch.fatal.is_some() || batch.new_position <= position {
+            break;
+        }
+        position = batch.new_position;
+    }
+    Ok(Run {
+        examined,
+        matched,
+        events,
+        invalidates,
+    })
+}
+
+/// The events a listed stage passes on: an internal `$changeStream` stage
+/// passes every event; any other stage is run over them as listed.
+fn pass(events: Vec<Document>, stage: &Document) -> Vec<Document> {
+    if stage.contains_key("$changeStream") {
+        return events;
+    }
+    let mut run = stage.clone();
+    run.remove("nReturned");
+    run.remove("executionTimeMillisEstimate");
+    match secantus_core::aggregate::apply_pipeline(
+        events.clone(),
+        &[Bson::Document(run)],
+        &Document::new(),
+        None,
+    ) {
+        Ok(out) => out,
+        Err(_) => events,
+    }
+}
+
 /// A plan stage's counters, as a tailable read of the oplog that found
 /// nothing leaves them.
 fn idle_counters(out: &mut Document) {
@@ -1046,29 +1150,40 @@ pub(super) fn reply(
         let bytes = storage.high_water_mark_token(seq);
         secantus_core::bsondoc::from_bytes(&bytes).unwrap_or_default()
     };
-    let (start, token) = match (spec.resume(), raw.get_timestamp("startAtOperationTime")) {
-        (Some((_, token)), _) => (
-            token_time(token).unwrap_or(Timestamp {
-                time: 0,
-                increment: 0,
-            }),
-            token.clone(),
-        ),
+    let (start, token, from_seq) = match (spec.resume(), raw.get_timestamp("startAtOperationTime"))
+    {
+        (Some((_, token)), _) => {
+            let from_seq = match storage.resume_token_seq(token) {
+                Some(seq) if storage.resume_token_is_event(token) => seq - 1,
+                Some(seq) => seq,
+                None => storage.oplog_tail_seq(),
+            };
+            (
+                token_time(token).unwrap_or(Timestamp {
+                    time: 0,
+                    increment: 0,
+                }),
+                token.clone(),
+                from_seq,
+            )
+        }
         (None, Ok(ts)) => {
             let seq = match storage.seq_for_timestamp(ts) {
                 0 => storage.oplog_tail_seq(),
                 seq => seq - 1,
             };
-            (ts, at_seq(seq))
+            (ts, at_seq(seq), seq)
         }
         (None, Err(_)) => {
             let now = storage.peek_cluster_time();
+            let tail = storage.oplog_tail_seq();
             (
                 Timestamp {
                     time: now.time,
                     increment: now.increment + 1,
                 },
-                at_seq(storage.oplog_tail_seq()),
+                at_seq(tail),
+                tail,
             )
         }
     };
@@ -1104,7 +1219,7 @@ pub(super) fn reply(
     };
     let mut planner = doc! {
         "namespace": "local.oplog.rs",
-        "parsedQuery": filter,
+        "parsedQuery": filter.clone(),
         "indexFilterSet": false,
     };
     if let Some(key) = &key {
@@ -1135,22 +1250,42 @@ pub(super) fn reply(
 
     let mut cursor = doc! { "queryPlanner": planner };
     let wanted = verbosity != Verbosity::QueryPlanner;
-    if wanted {
+    // Under `executionStats` mongod runs the read: the scan examines every
+    // oplog entry from the start time, the filter keeps the entries of the
+    // stream, and each later stage counts what it passes on (RM-453).
+    let counts = if wanted {
+        Some(run_read(
+            storage, &scope, raw, pipeline, &filter, start, from_seq,
+        )?)
+    } else {
+        None
+    };
+    if let Some(run) = &counts {
+        let examined = run.examined as i32;
+        let matched = run.matched as i32;
         let mut collscan = doc! { "stage": "COLLSCAN", "filter": scan.get("filter").cloned() };
         idle_counters(&mut collscan);
+        let busy = |d: &mut Document| {
+            d.insert("nReturned", matched);
+            d.insert("works", examined + 1);
+            d.insert("advanced", matched);
+            d.insert("needTime", examined - matched);
+        };
+        busy(&mut collscan);
         collscan.insert("direction", "forward");
         collscan.insert("minRecord", min_record);
-        collscan.insert("docsExamined", 0_i32);
+        collscan.insert("docsExamined", examined);
         let mut projected = doc! { "isCached": false, "stage": "PROJECTION_SIMPLE" };
         idle_counters(&mut projected);
+        busy(&mut projected);
         projected.insert("transformBy", transform_by);
         projected.insert("inputStage", collscan);
         let mut stats = doc! {
             "executionSuccess": true,
-            "nReturned": 0_i32,
+            "nReturned": matched,
             "executionTimeMillis": 0_i32,
             "totalKeysExamined": 0_i32,
-            "totalDocsExamined": 0_i32,
+            "totalDocsExamined": examined,
             "executionStages": projected,
         };
         if verbosity == Verbosity::AllPlans {
@@ -1174,9 +1309,20 @@ pub(super) fn reply(
         "resumeToken": token.clone(),
     } });
     stages.extend(after);
-    if wanted {
-        for stage in &mut stages {
-            stage.insert("nReturned", 0_i64);
+    if let Some(run) = &counts {
+        let mut events = run.events.clone();
+        for (i, stage) in stages.iter_mut().enumerate() {
+            let n = match i {
+                0 => run.matched,
+                // Before `$_internalChangeStreamCheckInvalidate` adds it,
+                // the stream has no invalidate event.
+                1 | 2 => run.events.len() - run.invalidates,
+                _ => {
+                    events = pass(events, stage);
+                    events.len()
+                }
+            };
+            stage.insert("nReturned", n as i64);
             stage.insert("executionTimeMillisEstimate", 0_i64);
         }
     }

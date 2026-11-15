@@ -48,11 +48,12 @@ def _counted(client: Any) -> tuple:
     return stats["nReturned"], [s["nReturned"] for s in e["stages"]]
 
 
-@pytest.mark.backlog("RM-453")
+@pytest.mark.backlog_fixed("RM-453")
 def test_execution_stats_count_what_the_read_found(rust_mongo: Any, mongod_rs: Any) -> None:
     """A stream that starts before three inserts: mongod 8.2.11's
     `executionStats` reads the oplog from the start time and counts the
-    three entries at every stage."""
+    three entries at every stage. This server counted none until the
+    explain ran the read (`explain/change_stream.rs::run_read`)."""
     want = _counted(mongod_rs)
     assert want == (3, [3, 3, 3, 3, 3, 3])
     assert _counted(rust_mongo) == want

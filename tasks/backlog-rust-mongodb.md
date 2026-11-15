@@ -2753,17 +2753,14 @@ would see them. What is left:
       (2026-11-15, found working RM-452).
       Verify: tests/backlog/test_rm_found_2026_11_15_rm452.py::test_the_unwind_filter_is_simplified
       Backlog-ID: RM-699
-- [ ] **RUST MongoDB server: `executionStats` of a change stream counts
-      nothing.** mongod 8.2.11 runs the oplog read under `executionStats`:
-      a stream started before three inserts counts the three entries at
-      every stage, and the `COLLSCAN` its `docsExamined` (2026-11-09). This
-      server reports what a new stream at the end of the oplog finds -- no
-      entry, at every stage -- which is mongod's answer only for that
-      stream. `docsExamined` also counts mongod's own oplog entries (its
-      periodic no-ops), which this server's oplog does not keep (found
-      working RM-076).
-      Verify: tests/backlog/test_rm_found_2026_11_09_rm076.py::test_execution_stats_count_what_the_read_found
-      Backlog-ID: RM-453
+- [ ] **RUST MongoDB server: a change stream's `docsExamined` leaves out
+      mongod's own oplog entries.** mongod 8.2.11's `executionStats` of a
+      change stream counts every oplog entry its scan reads from the start
+      time, its periodic no-ops among them; this server's oplog keeps no
+      no-op entries, so its `docsExamined` counts only the writes (the
+      counts of the entries the stream keeps match since RM-453, 2026-11-15).
+      Verify: none -- mongod writes its no-ops on a timer, so no test can pin how many a scan reads
+      Backlog-ID: RM-700
 
 ### 7.073 The cursor commands -- 2026-10-11
 
