@@ -21422,14 +21422,22 @@ fn plan_aggregate_item(
                 ),
             ));
         }
-        if func == AggFunc::StringAgg {
-            return Err(Error::Unsupported(
-                "string_agg takes a value and a separator".into(),
-            ));
+        // No aggregate of this name takes this many arguments: PostgreSQL's
+        // lookup by name and argument types finds no candidate (42883,
+        // `ParseFuncOrColumn`), naming every argument's type (RP-904).
+        let mut types = Vec::with_capacity(f.args.len());
+        for (i, (arg, lit)) in f.args.iter().zip(call_arg_types(f, params)).enumerate() {
+            let t = if lit == "unknown" {
+                None
+            } else {
+                resolve(arg, format!("__agg{index}_arg{i}"))?.1
+            };
+            types.push(display_type(t.as_deref().unwrap_or("unknown")));
         }
-        return Err(Error::Unsupported(
-            "an aggregate with this many arguments".into(),
-        ));
+        return Err(Error::UndefinedFunction(format!(
+            "function {name}({}) does not exist",
+            types.join(", ")
+        )));
     }
     item.order = plan_aggregate_order(&f.agg_order, def, params)?;
     let (field, ty, typmod, expr) = resolve(&f.args[0], format!("__agg{index}"))?;
