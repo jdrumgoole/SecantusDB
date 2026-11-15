@@ -2825,14 +2825,14 @@ Measured on a private PostgreSQL 15.19 cluster.
       the statement, not in the body.** `check_sql_expr` parses each
       expression as the compiler reads it, and the error is placed at the
       expression's token, transposed into the statement: on PostgreSQL
-      15.19 `create function e619() returns int language plpgsql as $$
-      begin return 1 +; end $$` is `syntax error at end of input` at 75,
-      with `declare x int := 1 +;` at 79, and `do $$ declare x int := 1 +;
-      begin null; end $$` at 27. Here they are at 83, 103 and 47. And `do
-      $$ begin perform 1 +; end $$` is the same error at 24 there, found at
-      compile; here it is at 32, found when the PERFORM runs (CONTEXT
-      `PL/pgSQL function inline_code_block line 1 at PERFORM`). RP-621 is
-      the compile errors with no position, RP-492 a DO's grammar errors.
+      15.19 `do $$ declare x int := 1 +; begin null; end $$` is `syntax
+      error at end of input` at 27; here it is at 47. And `do $$ begin
+      perform 1 +; end $$` is the same error at 24 there, found at compile;
+      here it has no position, found when the PERFORM runs (CONTEXT
+      `PL/pgSQL function inline_code_block line 1 at PERFORM`). A CREATE
+      FUNCTION's (75 and 79) are placed since RP-621, which transposes the
+      scanner's `internalpos`; a DO block's error is not transposed yet
+      (RP-492 a DO's grammar errors).
       Verify: tests/backlog/test_rp_found_rp619.py::test_expression_syntax_error_is_placed_in_the_body
       Backlog-ID: RP-958
 - [ ] **A DO block refuses PL/pgSQL's `#` compile options.**
@@ -2849,7 +2849,7 @@ Measured on a private PostgreSQL 15.19 cluster.
       $$` is 42804 `RETURN cannot have a parameter in function returning
       void` at 20, `return 1 +;` the same, and a `returns void` function's
       `return 1 +;` the same at 73. Here the first runs, and the other two
-      are 42601 `syntax error at end of input` (31, 84).
+      are 42601 `syntax error at end of input` (31, 76).
       Verify: tests/backlog/test_rp_found_rp619.py::test_return_with_a_value_in_a_void_routine
       Backlog-ID: RP-960
 
@@ -2861,29 +2861,6 @@ RP-573 a DECLARE's type is looked up at CREATE FUNCTION and before a DO
 block runs (`check_plpgsql_declarations`), from the type text libpg_query
 keeps; what follows is what that lookup does not yet check.
 
-- [ ] **A PL/pgSQL compile error in a CREATE FUNCTION's body has no
-      position.** `declare x int; begin y := 1; return 1; end` is 42601
-      `"y" is not a known variable` at 80 on PostgreSQL 15.19, and `declare
-      x alias for $2` in a one-argument function is 42704 `variable "$2"
-      does not exist` at 82. Here the first has no position, and the second
-      is 42601 with none. (A DO block's syntax errors are RP-492.)
-      **Decided (Joe, 2026-11-14): fork `pg_query`.** The server has no way to learn
-      the position or the SQLSTATE. Both errors come from `pl_gram.y`
-      through `plpgsql_scanner_errposition`, which sets
-      `internalerrposition` (relative to the body), and PostgreSQL's
-      `function_parse_error_transpose` moves that into the CREATE text.
-      libpg_query's `pg_query_parse_plpgsql` (pg_query 6.2.0,
-      `pg_query_parse_plpgsql.c`) copies only `message` and `cursorpos` from
-      the ErrorData. `cursorpos` is 0 here, and the crate keeps only the
-      message (`Error::Parse(String)`), so `parsed()` in `plpgsql_fn.rs`
-      labels every error 42601. Build: fork `pg_query` as a `secantus-*` crate (the way `pgwire`
-      became `secantus-pgwire`, since crates.io ignores `[patch]`), have
-      its C copy `internalpos` and `sqlerrcode` out of the ErrorData, and
-      transpose the position into the CREATE text as
-      `function_parse_error_transpose` does, so every PL/pgSQL compile
-      error carries its real code and position.
-      Verify: tests/backlog/test_rp_found_rp573.py::test_plpgsql_compile_error_in_create_has_a_position
-      Backlog-ID: RP-621
 
 ## Found while working RP-458 (2026-11-08)
 

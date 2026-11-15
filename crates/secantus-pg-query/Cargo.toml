@@ -1,0 +1,46 @@
+[package]
+# SecantusDB's fork of pg_query 6.2.0 (pganalyze/pg_query.rs), published as
+# `secantus-pg-query` and depended on as `pg_query`. A fork rather than
+# `[patch.crates-io]`, because crates.io ignores patches. The one change:
+# `parse_plpgsql_error` hands back a PL/pgSQL compile error's SQLSTATE and
+# its position in the body (`internalpos`), which upstream drops (RP-621).
+name = "secantus-pg-query"
+description = "SecantusDB's fork of pg_query 6.2.0: PostgreSQL's own parser via libpg_query, keeping a PL/pgSQL compile error's SQLSTATE and position."
+version = "0.1.0-beta.17"
+edition = "2021"
+documentation = "https://docs.rs/pg_query"
+license = "MIT"
+repository = "https://github.com/jdrumgoole/SecantusDB"
+readme = "README.md"
+include = [
+    # pg_query.rs
+    "README.md", "build.rs", "src/**/*.rs",
+    # libpg_query
+    "Makefile",
+    "libpg_query/*.h",
+    "libpg_query/{src,vendor}/**/*.{c,h}",
+    "libpg_query/protobuf/pg_query.pb-c.{c,h}",
+    "libpg_query/protobuf/pg_query.proto",
+]
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[lib]
+name = "pg_query"
+path = "src/lib.rs"
+
+[dependencies]
+itertools = "0.10.3"
+prost = "0.13.5"
+serde = { version = "1.0.139", features = ["derive"] }
+serde_json = "1.0.82"
+thiserror = "1.0.31"
+
+[build-dependencies]
+bindgen = "0.66.1"
+clippy = { version = "0.0.302", optional = true }
+prost-build = "0.13.5"
+fs_extra = "1.2.0"
+cc = "1.0.83"
+glob = "0.3.1"
+

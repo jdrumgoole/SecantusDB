@@ -561,14 +561,19 @@ fn parsed(create_sql: &str) -> Result<Value, PlError> {
             None => break,
         }
     }
-    let v = pg_query::parse_plpgsql(&rewritten).map_err(|e| {
-        let text = e.to_string();
-        PlError::new(
-            "42601",
-            text.strip_prefix("Invalid statement: ")
-                .unwrap_or(&text)
-                .to_string(),
-        )
+    let v = pg_query::parse_plpgsql_detailed(&rewritten).map_err(|e| {
+        let mut err = compile_error(e);
+        // A position in the rewritten body is not one in the routine's: the
+        // unrewritten text's own error places it, when it is the same one.
+        if rewritten != create_sql {
+            let original = pg_query::parse_plpgsql_detailed(create_sql)
+                .err()
+                .map(compile_error);
+            err.position = original
+                .filter(|o| o.message == err.message)
+                .and_then(|o| o.position);
+        }
+        err
     })?;
     let mut f = v
         .get(0)
@@ -581,6 +586,36 @@ fn parsed(create_sql: &str) -> Result<Value, PlError> {
         .unwrap_or_else(|e| e.into_inner())
         .insert(create_sql.to_string(), f.clone());
     Ok(f)
+}
+
+/// A compile error of `parse_plpgsql`: its SQLSTATE, and in `position` the
+/// 1-based character of the routine's source the PL/pgSQL scanner placed it
+/// at (`internalerrposition`), which the caller transposes into its
+/// statement as `function_parse_error_transpose` does (RP-621).
+fn compile_error(e: pg_query::PlpgsqlError) -> PlError {
+    match e {
+        pg_query::PlpgsqlError::Compile {
+            message,
+            sqlstate,
+            internalpos,
+            ..
+        } => {
+            let mut err = PlError::new(&sqlstate, message);
+            err.position = u32::try_from(internalpos)
+                .ok()
+                .and_then(std::num::NonZeroU32::new);
+            err
+        }
+        pg_query::PlpgsqlError::Other(e) => {
+            let text = e.to_string();
+            PlError::new(
+                "42601",
+                text.strip_prefix("Invalid statement: ")
+                    .unwrap_or(&text)
+                    .to_string(),
+            )
+        }
+    }
 }
 
 /// Every SQL text a PL/pgSQL body can run, each as a statement (an

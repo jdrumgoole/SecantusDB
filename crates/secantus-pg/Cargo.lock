@@ -1697,24 +1697,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "pg_query"
-version = "6.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "42a66643c4aa9c929b68b2c9e30d6c4d955bfd1e87e255ce6c5d0c026082436c"
-dependencies = [
- "bindgen",
- "cc",
- "fs_extra",
- "glob",
- "itertools 0.10.5",
- "prost",
- "prost-build",
- "serde",
- "serde_json",
- "thiserror 1.0.69",
-]
-
-[[package]]
 name = "phf"
 version = "0.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2322,7 +2304,6 @@ dependencies = [
  "libc",
  "md-5 0.10.6",
  "mimalloc",
- "pg_query",
  "pkcs8",
  "postgres-types",
  "rand 0.9.5",
@@ -2331,6 +2312,7 @@ dependencies = [
  "rustls-pki-types",
  "secantus-auth",
  "secantus-core",
+ "secantus-pg-query",
  "secantus-pgcatalog",
  "secantus-pgplan",
  "secantus-pgwire",
@@ -2342,6 +2324,22 @@ dependencies = [
  "tokio",
  "tokio-postgres",
  "tokio-rustls",
+]
+
+[[package]]
+name = "secantus-pg-query"
+version = "0.1.0-beta.17"
+dependencies = [
+ "bindgen",
+ "cc",
+ "fs_extra",
+ "glob",
+ "itertools 0.10.5",
+ "prost",
+ "prost-build",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
 ]
 
 [[package]]
@@ -2374,11 +2372,11 @@ dependencies = [
  "md-5 0.10.6",
  "num-bigint",
  "num-traits",
- "pg_query",
  "prost",
  "pwhash",
  "regex",
  "rust-stemmers",
+ "secantus-pg-query",
  "secantus-pgcatalog",
  "serde_json",
  "sha1",

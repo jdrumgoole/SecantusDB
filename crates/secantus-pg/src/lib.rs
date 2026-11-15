@@ -14761,10 +14761,8 @@ impl PgHandler {
             "plpgsql" => {
                 // A variable of a composite type is compiled as a record of
                 // it, which the catalog decides (RP-689).
-                let create_sql = plpgsql_fn::with_row_types(
-                    &plpgsql_create_sql(&read_back),
-                    &PlHost { h: self },
-                );
+                let plain_sql = plpgsql_create_sql(&read_back);
+                let create_sql = plpgsql_fn::with_row_types(&plain_sql, &PlHost { h: self });
                 let parsed = plpgsql_fn::validate(&create_sql);
                 // `plpgsql_validator` compiles the body only under
                 // `check_function_bodies` (RP-573), in one pass: a
@@ -14780,11 +14778,32 @@ impl PgHandler {
                     self.check_plpgsql_declarations(&def.name, &create_sql, &def.body)?;
                 }
                 parsed.map_err(|e| {
-                    PgWireError::UserError(Box::new(ErrorInfo::new(
-                        "ERROR".into(),
-                        e.sqlstate,
-                        e.message,
-                    )))
+                    // The scanner's position is in the body the compiler
+                    // read; one the row-type rewrite moved is taken from the
+                    // body as written, when it raises the same error.
+                    let at = if create_sql == plain_sql {
+                        e.position
+                    } else {
+                        plpgsql_fn::validate(&plain_sql)
+                            .err()
+                            .filter(|o| o.message == e.message)
+                            .and_then(|o| o.position)
+                    };
+                    let mut info = ErrorInfo::new("ERROR".into(), e.sqlstate, e.message);
+                    // `function_parse_error_transpose`.
+                    info.position = at.and_then(|at| {
+                        let (source, index) = self
+                            .statement_source
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .clone()
+                            .unwrap_or_default();
+                        sql_fn_params::match_prosrc_to_query(&def.body, &source, at.get() as usize)
+                            .and_then(|p| p.checked_sub(statement_offset_in_source(&source, index)))
+                            .filter(|p| *p > 0)
+                            .map(|p| p.to_string())
+                    });
+                    PgWireError::UserError(Box::new(info))
                 })?;
             }
             _ => {

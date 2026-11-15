@@ -160,8 +160,11 @@ def test_pg_temp_type_once_the_temp_schema_is_made(dsn: str) -> None:
         c.execute("drop function f620")
 
 
-@pytest.mark.backlog("RP-621")
+@pytest.mark.backlog_fixed("RP-621")
 def test_plpgsql_compile_error_in_create_has_a_position(dsn: str) -> None:
+    """A PL/pgSQL compile error in a CREATE FUNCTION had no position and was
+    always 42601; the forked pg_query now hands back the ErrorData's
+    SQLSTATE and `internalpos`, transposed into the statement."""
     assert _compiled(dsn, COMPILE_ERROR_POSITION) == [
         ("42601", '"y" is not a known variable', "80", None),
         ("42704", 'variable "$2" does not exist', "82", None),

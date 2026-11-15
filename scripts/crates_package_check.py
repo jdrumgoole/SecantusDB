@@ -56,6 +56,7 @@ MDB_ORDER = (
 )
 
 PG_ORDER = (
+    "secantus-pg-query",  # SecantusDB's fork of pg_query; the library is `pg_query`
     "secantus-pgcatalog",
     "secantus-pgplan",
     "secantus-pgwire",  # SecantusDB's fork of pgwire; the library is `pgwire`

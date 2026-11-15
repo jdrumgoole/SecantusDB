@@ -14,7 +14,7 @@ rewrite, the old version must appear nowhere it was replaced, and every
 lockfile must still resolve ``--locked`` -- the release workflows build
 ``--locked``, so a lockfile the bump left inconsistent fails on release day.
 
-The PostgreSQL crates (``secantus-pgcatalog``, ``secantus-pgplan``,
+The PostgreSQL crates (``secantus-pg-query``, ``secantus-pgcatalog``, ``secantus-pgplan``,
 ``secantus-pgwire``, ``secantus-pg``) carry their own lockstep line, bumped
 with ``--line pg``; each line's bump leaves the other alone, because the two
 version strings never coincide. A PG crate's ``=`` pins on MongoDB-side crates
