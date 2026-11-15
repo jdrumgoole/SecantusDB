@@ -1778,7 +1778,13 @@ a regression test.
       e3.a` with the top Nested Loop's `Join Filter: ((e.a < e3.a) AND
       (e2.a < e3.a))`; here `((e2.a < e3.a) AND (e.a < e3.a))`. The costs and
       rows match. Measured on a private 15.19 cluster (found while working
-      RP-354).
+      RP-354). Sizing (RP-903 bundle, 2026-11-15): the order is the outer
+      rel's `joininfo` then the inner's, and a join rel's `joininfo` lists
+      its base rels' clauses in relid order, so the answer depends on which
+      side the join search put outer. `join_conditions_split`
+      (`ruleutils.rs`) prints from the ON alone and cannot know that; the
+      order has to come from the chosen plan, in `secantus-pg`'s EXPLAIN,
+      after the cost sort (`order_qual_clauses` is stable).
       Verify: tests/backlog/test_rp_explain_costs.py::test_plan[nested loop of three relations with two clauses above]
       Backlog-ID: RP-920
 - [ ] **EXPLAIN prints no estimate for a LEFT join whose ON restricts
