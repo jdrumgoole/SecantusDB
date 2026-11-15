@@ -12108,62 +12108,79 @@ fn plan_explain(
         series_qual: None,
     };
     let (mut timing, mut summary) = (None, None);
-    for o in &e.options {
-        let Some(N::DefElem(d)) = o.node.as_ref() else {
-            continue;
+    // `transformExplainStmt` resolves the statement's names and literals
+    // before `ExplainQuery` reads an option, so an option's error stands
+    // only when analysing the statement raises none; a planner-time error
+    // (`1/0`, folded by `eval_const_expressions`) stays behind it (RP-428).
+    let option_error = |err: Error| -> Error {
+        let Some(q) = analysed.clone() else {
+            return err;
         };
-        let text = d.arg.as_deref().and_then(|a| match a.node.as_ref() {
-            Some(N::String(s)) => Some(s.sval.to_ascii_lowercase()),
-            Some(N::Boolean(b)) => Some(b.boolval.to_string()),
-            Some(N::Integer(i)) => Some(i.ival.to_string()),
-            _ => None,
-        });
-        let flag = || -> Result<bool> {
-            match text.as_deref() {
-                None | Some("true" | "on" | "1") => Ok(true),
-                Some("false" | "off" | "0") => Ok(false),
-                Some(_) => Err(Error::Sqlstate(
-                    "22023",
-                    format!("{} requires a Boolean value", d.defname),
-                )),
-            }
-        };
-        match d.defname.as_str() {
-            "analyze" => options.analyze = flag()?,
-            "verbose" => options.verbose = flag()?,
-            "costs" => options.costs = flag()?,
-            "timing" => timing = Some(flag()?),
-            "summary" => summary = Some(flag()?),
-            "buffers" | "settings" | "wal" => {
-                flag()?;
-            }
-            "format" => match text.as_deref() {
-                Some(f @ ("text" | "json" | "yaml" | "xml")) => options.format = f.to_string(),
+        match analysing_only(|| plan_node(q, lookup, params)) {
+            Err(a) if raised_by_analysis(&a) || a.sqlstate() == "22P02" => a,
+            _ => err,
+        }
+    };
+    let parsed: Result<()> = (|| {
+        for o in &e.options {
+            let Some(N::DefElem(d)) = o.node.as_ref() else {
+                continue;
+            };
+            let text = d.arg.as_deref().and_then(|a| match a.node.as_ref() {
+                Some(N::String(s)) => Some(s.sval.to_ascii_lowercase()),
+                Some(N::Boolean(b)) => Some(b.boolval.to_string()),
+                Some(N::Integer(i)) => Some(i.ival.to_string()),
+                _ => None,
+            });
+            let flag = || -> Result<bool> {
+                match text.as_deref() {
+                    None | Some("true" | "on" | "1") => Ok(true),
+                    Some("false" | "off" | "0") => Ok(false),
+                    Some(_) => Err(Error::Sqlstate(
+                        "22023",
+                        format!("{} requires a Boolean value", d.defname),
+                    )),
+                }
+            };
+            match d.defname.as_str() {
+                "analyze" => options.analyze = flag()?,
+                "verbose" => options.verbose = flag()?,
+                "costs" => options.costs = flag()?,
+                "timing" => timing = Some(flag()?),
+                "summary" => summary = Some(flag()?),
+                "buffers" | "settings" | "wal" => {
+                    flag()?;
+                }
+                "format" => match text.as_deref() {
+                    Some(f @ ("text" | "json" | "yaml" | "xml")) => options.format = f.to_string(),
+                    other => {
+                        return Err(Error::Sqlstate(
+                            "22023",
+                            format!(
+                                "unrecognized value for EXPLAIN option \"format\": \"{}\"",
+                                other.unwrap_or_default()
+                            ),
+                        ))
+                    }
+                },
                 other => {
                     return Err(Error::Sqlstate(
-                        "22023",
-                        format!(
-                            "unrecognized value for EXPLAIN option \"format\": \"{}\"",
-                            other.unwrap_or_default()
-                        ),
+                        "42601",
+                        format!("unrecognized EXPLAIN option \"{other}\""),
                     ))
                 }
-            },
-            other => {
-                return Err(Error::Sqlstate(
-                    "42601",
-                    format!("unrecognized EXPLAIN option \"{other}\""),
-                ))
             }
         }
-    }
-    // `ExplainQuery`'s checks and defaults.
-    if timing == Some(true) && !options.analyze {
-        return Err(Error::Sqlstate(
-            "22023",
-            "EXPLAIN option TIMING requires ANALYZE".into(),
-        ));
-    }
+        // `ExplainQuery`'s checks and defaults.
+        if timing == Some(true) && !options.analyze {
+            return Err(Error::Sqlstate(
+                "22023",
+                "EXPLAIN option TIMING requires ANALYZE".into(),
+            ));
+        }
+        Ok(())
+    })();
+    parsed.map_err(option_error)?;
     options.timing = options.analyze && timing.unwrap_or(true);
     options.summary = summary.unwrap_or(options.analyze);
     let mut query = analysed.ok_or_else(|| Error::Parse("EXPLAIN without a statement".into()))?;

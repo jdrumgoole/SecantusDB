@@ -2184,19 +2184,6 @@ a regression test.
       while working RP-439).
       Verify: tests/backlog/test_rp_fromless_analysis.py::test_cast_literal_input_error_before_operator
       Backlog-ID: RP-442
-- [ ] **EXPLAIN reports its option's error ahead of a missing relation, a
-      missing function or a bad literal.** PostgreSQL 15.19 analyses the
-      statement before `ExplainQuery` reads an option, so `explain (bogus)
-      select * from nosuch` is 42P01, `explain (bogus) select nosuchfn(a)
-      from e` 42883 and `explain (bogus) select * from e where a = 'x'`
-      22P02; here each is 42601 `unrecognized EXPLAIN option "bogus"`.
-      Since RP-419 the operator-type, untyped-value and ORDER BY checks run
-      first; these are resolved while planning, after the options. A
-      planner-time error (`explain (bogus) select 1/0`) correctly stays
-      behind the option's. Measured on a private 15.19 cluster (found
-      while working RP-419).
-      Backlog-ID: RP-428
-      Verify: tests/backlog/test_rp_analysis_order.py::test_explain_resolves_names_before_options
 - [ ] **A node above a dummy relation prints no estimate, and a dummy
       join no width.** Since RP-409 a WHERE that folds to constant false
       plans a `Result` with `One-Time Filter: false`, costing nothing, as
