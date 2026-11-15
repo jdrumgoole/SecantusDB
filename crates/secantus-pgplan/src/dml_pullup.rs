@@ -151,3 +151,59 @@ pub(crate) fn pull_up_constant_subqueries(query: &mut N) -> Result<()> {
     }
     Ok(())
 }
+
+/// An `UPDATE ... FROM` or `DELETE ... USING` with a FROM item left, as the
+/// join PostgreSQL plans it under its ModifyTable (RP-435): `SELECT * FROM
+/// <target>, <from items> WHERE <where>`, the target first as it is the
+/// range table's first entry. Returns the ModifyTable node's name (`Delete
+/// on k`), or `None` (and leaves the statement) when there is no join.
+/// Only EXPLAIN without ANALYZE uses it: the statement is not run.
+pub(crate) fn dml_join_as_select(query: &mut N) -> Option<String> {
+    let (verb, relation, from, where_clause) = match query {
+        N::UpdateStmt(u) if u.with_clause.is_none() && !u.from_clause.is_empty() => (
+            "Update",
+            u.relation.as_ref()?,
+            &u.from_clause,
+            &u.where_clause,
+        ),
+        N::DeleteStmt(d) if d.with_clause.is_none() && !d.using_clause.is_empty() => (
+            "Delete",
+            d.relation.as_ref()?,
+            &d.using_clause,
+            &d.where_clause,
+        ),
+        _ => return None,
+    };
+    let name = match &relation.alias {
+        Some(a) => format!("{verb} on {} {}", relation.relname, a.aliasname),
+        None => format!("{verb} on {}", relation.relname),
+    };
+    let star = Node {
+        node: Some(N::ResTarget(Box::new(pg_query::protobuf::ResTarget {
+            val: Some(Box::new(Node {
+                node: Some(N::ColumnRef(pg_query::protobuf::ColumnRef {
+                    fields: vec![Node {
+                        node: Some(N::AStar(pg_query::protobuf::AStar {})),
+                    }],
+                    location: -1,
+                })),
+            })),
+            location: -1,
+            ..Default::default()
+        }))),
+    };
+    let mut from_clause = vec![Node {
+        node: Some(N::RangeVar(relation.clone())),
+    }];
+    from_clause.extend(from.iter().cloned());
+    let select = pg_query::protobuf::SelectStmt {
+        target_list: vec![star],
+        from_clause,
+        where_clause: where_clause.clone(),
+        limit_option: pg_query::protobuf::LimitOption::Default as i32,
+        op: pg_query::protobuf::SetOperation::SetopNone as i32,
+        ..Default::default()
+    };
+    *query = N::SelectStmt(Box::new(select));
+    Some(name)
+}

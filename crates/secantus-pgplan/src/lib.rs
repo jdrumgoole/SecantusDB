@@ -3737,6 +3737,9 @@ pub struct ExplainOptions {
     /// and the plan is a `Result` with `One-Time Filter: false` where its
     /// scan (or join) would be (RP-409).
     pub dummy_relation: bool,
+    /// An UPDATE ... FROM / DELETE ... USING explained as its join: the
+    /// ModifyTable node (`Delete on k`) the join's plan sits under (RP-435).
+    pub modify_table: Option<String>,
     /// A single-relation SELECT's ORDER BY as its Sort's `Sort Key`
     /// prints it, where a key is computed (RP-840).
     pub sort_keys: Option<Vec<String>>,
@@ -12294,6 +12297,7 @@ fn plan_explain(
         one_time_false: 0,
         nullable_gate: None,
         dummy_relation: false,
+        modify_table: None,
         sort_keys: None,
         series_scan: None,
         series_qual: None,
@@ -12377,6 +12381,10 @@ fn plan_explain(
     let mut query = analysed.ok_or_else(|| Error::Parse("EXPLAIN without a statement".into()))?;
     // A one-row constant FROM / USING subquery is pulled up (RP-435).
     dml_pullup::pull_up_constant_subqueries(&mut query)?;
+    // One with a FROM item left is planned as the join it is (RP-435).
+    if !options.analyze {
+        options.modify_table = dml_pullup::dml_join_as_select(&mut query);
+    }
     // A join alias's columns are its sides' own (RP-471).
     join_alias::flatten_join_aliases(&mut query, lookup)?;
     // The WHERE's constants are simplified before anything is planned

@@ -46,10 +46,111 @@ def test_explain_pulls_up_a_constant_subquery(rust_pg: Any) -> None:
     ]
 
 
+_ANALYSED = ["insert into k select * from e", "analyze e", "analyze k"]
+
+
+@pytest.mark.backlog_fixed("RP-435")
+def test_explain_plans_the_join(rust_pg: Any) -> None:
+    """EXPLAIN of an UPDATE ... FROM or a DELETE ... USING a table planned
+    the join PostgreSQL makes of it, under the ModifyTable; it printed a Seq
+    Scan of the target alone."""
+    got = _answers(
+        rust_pg,
+        _ANALYSED
+        + [
+            "explain (costs off) delete from k using e where k.a = e.a",
+            "explain (costs off) update k x set b = e.b from e where x.a = e.a",
+            "explain (costs off) delete from k using e where k.a = e.a and e.b = 'v3'",
+            "explain delete from k using e where k.a = e.a",
+        ],
+    )[len(_ANALYSED) :]
+    assert got[:3] == [
+        (
+            "ok",
+            [
+                ("Delete on k",),
+                ("  ->  Hash Join",),
+                ("        Hash Cond: (e.a = k.a)",),
+                ("        ->  Seq Scan on e",),
+                ("        ->  Hash",),
+                ("              ->  Seq Scan on k",),
+            ],
+        ),
+        (
+            "ok",
+            [
+                ("Update on k x",),
+                ("  ->  Hash Join",),
+                ("        Hash Cond: (e.a = x.a)",),
+                ("        ->  Seq Scan on e",),
+                ("        ->  Hash",),
+                ("              ->  Seq Scan on k x",),
+            ],
+        ),
+        (
+            "ok",
+            [
+                ("Delete on k",),
+                ("  ->  Hash Join",),
+                ("        Hash Cond: (k.a = e.a)",),
+                ("        ->  Seq Scan on k",),
+                ("        ->  Hash",),
+                ("              ->  Seq Scan on e",),
+                ("                    Filter: (b = 'v3'::text)",),
+            ],
+        ),
+    ]
+    # The ModifyTable costs what its join does and returns nothing.
+    assert got[3][1][0] == ("Delete on k  (cost=1.23..2.36 rows=0 width=0)",)
+
+
 @pytest.mark.backlog("RP-435")
+def test_explain_join_widths(rust_pg: Any) -> None:
+    """A DML join carries each relation's `ctid` and the columns the SET
+    list reads, not the tables' every column: PostgreSQL 15.19's join is
+    `width=12` for a DELETE and `width=44` for `set b = 'x'`, each scan
+    `width=10` (`ctid` and `a`)."""
+    got = _answers(
+        rust_pg,
+        _ANALYSED
+        + [
+            "explain delete from k using e where k.a = e.a",
+            "explain update k set b = 'x' from e where k.a = e.a",
+        ],
+    )[len(_ANALYSED) :]
+    assert got == [
+        (
+            "ok",
+            [
+                ("Delete on k  (cost=1.23..2.36 rows=0 width=0)",),
+                ("  ->  Hash Join  (cost=1.23..2.36 rows=10 width=12)",),
+                ("        Hash Cond: (e.a = k.a)",),
+                ("        ->  Seq Scan on e  (cost=0.00..1.10 rows=10 width=10)",),
+                ("        ->  Hash  (cost=1.10..1.10 rows=10 width=10)",),
+                ("              ->  Seq Scan on k  (cost=0.00..1.10 rows=10 width=10)",),
+            ],
+        ),
+        (
+            "ok",
+            [
+                ("Update on k  (cost=1.23..2.36 rows=0 width=0)",),
+                ("  ->  Hash Join  (cost=1.23..2.36 rows=10 width=44)",),
+                ("        Hash Cond: (e.a = k.a)",),
+                ("        ->  Seq Scan on e  (cost=0.00..1.10 rows=10 width=10)",),
+                ("        ->  Hash  (cost=1.10..1.10 rows=10 width=10)",),
+                ("              ->  Seq Scan on k  (cost=0.00..1.10 rows=10 width=10)",),
+            ],
+        ),
+    ]
+
+
+@pytest.mark.backlog("RP-1019")
 def test_explain_prints_the_join(rust_pg: Any) -> None:
     """EXPLAIN of a DELETE ... USING a table prints the hash join
-    PostgreSQL makes of it."""
+    PostgreSQL makes of it over two tables never analysed: priced from
+    their default sizes (1,270 rows each), the hashed side is `k`. Here
+    the join is unpriced and its sides stay in written order, as for the
+    SELECT `select * from k, e where k.a = e.a`."""
     assert _answers(
         rust_pg,
         ["explain (costs off) delete from k using e where k.a = e.a"],

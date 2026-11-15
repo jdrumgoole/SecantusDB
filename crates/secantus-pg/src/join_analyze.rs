@@ -21,6 +21,29 @@ const BUCKET_POINTER: usize = 8;
 /// `MaxAllocSize`.
 const MAX_ALLOC: usize = 0x3fff_ffff;
 
+/// An Index Cond's outer operand: `alias.column`, offset 0, or
+/// `(alias.column + n)` / `(alias.column - n)` for an integer `n`.
+fn outer_operand(s: &str) -> Option<(&str, i64)> {
+    let Some(inner) = s.strip_prefix('(').and_then(|s| s.strip_suffix(')')) else {
+        return (!s.contains([' ', '('])).then_some((s, 0));
+    };
+    let mut parts = inner.split(' ');
+    let (Some(col), Some(op), Some(n), None) =
+        (parts.next(), parts.next(), parts.next(), parts.next())
+    else {
+        return None;
+    };
+    if col.contains('(') {
+        return None;
+    }
+    let n: i64 = n.parse().ok()?;
+    match op {
+        "+" => Some((col, n)),
+        "-" => Some((col, -n)),
+        _ => None,
+    }
+}
+
 /// A plain scan leaf of the plan: its table and the alias its join names.
 fn leaf_relation(n: &PlanNode) -> Option<(String, String)> {
     if !n.children.is_empty() {
@@ -445,7 +468,7 @@ impl PgHandler {
         // Each conjunct `(column op alias.column)`, as `move_param_conds`
         // writes it, all over the one index column: two bounds are one
         // Index Cond of both.
-        let mut quals: Vec<(&str, &str)> = Vec::new();
+        let mut quals: Vec<(&str, &str, i64)> = Vec::new();
         let mut col = None;
         let mut param_alias: Option<&str> = None;
         let conjuncts = crate::explain::split_conjuncts(cond);
@@ -453,10 +476,14 @@ impl PgHandler {
             let Some(body) = c.strip_prefix('(').and_then(|c| c.strip_suffix(')')) else {
                 return;
             };
-            let mut parts = body.split(' ');
-            let (Some(own), Some(op), Some(other), None) =
-                (parts.next(), parts.next(), parts.next(), parts.next())
+            let mut parts = body.splitn(3, ' ');
+            let (Some(own), Some(op), Some(other)) = (parts.next(), parts.next(), parts.next())
             else {
+                return;
+            };
+            // The outer side: `alias.column`, or (RP-914) that column plus
+            // or minus an integer constant, `(e.a + 1)`.
+            let Some((other, offset)) = outer_operand(other) else {
                 return;
             };
             let Some((alias, outer_col)) = other.split_once('.') else {
@@ -470,7 +497,7 @@ impl PgHandler {
             }
             col = Some(own);
             param_alias = Some(alias);
-            quals.push((op, outer_col));
+            quals.push((op, outer_col, offset));
         }
         let (Some(col), Some(param_alias)) = (col, param_alias) else {
             return;
@@ -508,7 +535,7 @@ impl PgHandler {
         };
         let Some(outer_fields) = quals
             .iter()
-            .map(|(op, c)| Some((*op, outer_def.field_of(c)?)))
+            .map(|(op, c, o)| Some((*op, outer_def.field_of(c)?, *o)))
             .collect::<Option<Vec<_>>>()
         else {
             return;
@@ -592,7 +619,11 @@ impl PgHandler {
         if memoized {
             let written: Vec<String> = quals
                 .iter()
-                .map(|(_, c)| format!("{outer_alias}.{c}"))
+                .map(|(_, c, o)| match o {
+                    0 => format!("{outer_alias}.{c}"),
+                    o if *o > 0 => format!("({outer_alias}.{c} + {o})"),
+                    o => format!("({outer_alias}.{c} - {})", -o),
+                })
                 .collect();
             let key = tree.children[1]
                 .details
@@ -603,7 +634,7 @@ impl PgHandler {
                 return;
             }
         }
-        let param_fields: Vec<String> = outer_fields.iter().map(|(_, f)| f.clone()).collect();
+        let param_fields: Vec<String> = outer_fields.iter().map(|(_, f, _)| f.clone()).collect();
         let row_lens: Vec<usize> = match &memo_read {
             Some(read) => {
                 let Some(lens) = keyed_docs
@@ -628,7 +659,7 @@ impl PgHandler {
             let mut cache_key = Vec::with_capacity(outer_fields.len());
             let mut params = Vec::with_capacity(outer_fields.len());
             let mut null = false;
-            for (op, f) in &outer_fields {
+            for (op, f, offset) in &outer_fields {
                 let Some(k) = key_of(d.get(f)) else {
                     return;
                 };
@@ -637,7 +668,7 @@ impl PgHandler {
                     // A NULL parameter makes the index scan return nothing.
                     None | Some(Bson::Null) => null = true,
                     v => match number(v) {
-                        Some(n) => params.push((*op, n)),
+                        Some(n) => params.push((*op, n + *offset as f64)),
                         None => return,
                     },
                 }
