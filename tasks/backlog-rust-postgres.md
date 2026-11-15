@@ -1893,19 +1893,6 @@ a regression test.
       working RP-354).
       Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a left join where the nullable side is null is an anti join], tests/backlog/test_rp_explain_costs.py::test_plan[a left join on an equality where the nullable side is null is an anti join]
       Backlog-ID: RP-908
-- [ ] **A LEFT join reduced to an inner one keeps its ON's one-sided
-      conjunct in its Join Filter.** A WHERE that rejects the nullable
-      side's NULLs makes the LEFT join inner (`reduce_outer_joins`), and
-      PostgreSQL 15.19 then pushes an ON conjunct over one side to that
-      side's scan: `select * from e left join e e2 on e.a <> e2.a and e.a
-      > 990 where e2.b = 'v1'` is a Nested Loop with `Join Filter: (e.a <>
-      e2.a)` over `Seq Scan on e e2` (`Filter: (b = 'v1'::text)`) and a
-      Materialize of `Seq Scan on e` with `Filter: (a > 990)`. Here the
-      Join Filter keeps `(e.a > 990)` and `e`'s scan reads every row. An
-      inner join written as such already pushes it. Its rows are right.
-      Measured on a private 15.19 cluster (found while working RP-354).
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a left join reduced to inner pushes its one-sided on conjunct]
-      Backlog-ID: RP-902
 
 - [ ] **EXPLAIN ANALYZE's scan counters PostgreSQL prints that are still
       left out.** Since RP-383 a user table's heap pages carry the

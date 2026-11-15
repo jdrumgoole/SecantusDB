@@ -4651,7 +4651,70 @@ pub(crate) fn prepare_on_quals(
 ) -> Option<pg_query::protobuf::SelectStmt> {
     let folded = fold_constant_on_quals(s);
     let base = folded.as_ref().unwrap_or(s);
-    hoist_inner_on_conjuncts(base).or(folded)
+    let reduced = reduce_outer_joins(base).or(folded);
+    let base = reduced.as_ref().unwrap_or(s);
+    hoist_inner_on_conjuncts(base).or(reduced)
+}
+
+/// `s` with every LEFT or RIGHT join whose nullable side the WHERE proves
+/// non-NULL made an inner join, or `None` when there is none (RP-902).
+///
+/// PostgreSQL's `reduce_outer_joins` rewrites the join tree this way
+/// before `deconstruct_jointree` distributes the quals, so the reduced
+/// join's ON conjuncts over one side go to that side's scan as an inner
+/// join's do. A WHERE conjunct proves a side non-NULL by
+/// [`strict_aliases`]' terms, its columns qualified; an aliased JOIN,
+/// which hides its leaves from the WHERE, and a FULL join are left alone.
+fn reduce_outer_joins(
+    s: &pg_query::protobuf::SelectStmt,
+) -> Option<pg_query::protobuf::SelectStmt> {
+    use pg_query::protobuf::JoinType;
+    let w = s.where_clause.as_deref()?;
+    let mut conjuncts = Vec::new();
+    split_and(w, &mut conjuncts);
+    let nonnull: Vec<String> = conjuncts
+        .iter()
+        .flat_map(|c| strict_aliases(c, &|_| None))
+        .collect();
+    if nonnull.is_empty() {
+        return None;
+    }
+    fn walk(item: &mut pg_query::protobuf::Node, nonnull: &[String], changed: &mut bool) {
+        let Some(N::JoinExpr(j)) = item.node.as_mut() else {
+            return;
+        };
+        if j.alias.is_some() {
+            return;
+        }
+        let proven = |side: Option<&pg_query::protobuf::Node>| {
+            let mut below = Vec::new();
+            if let Some(side) = side {
+                table_aliases(side, &mut below);
+            }
+            below.iter().any(|a| nonnull.contains(a))
+        };
+        let reduce = match JoinType::try_from(j.jointype) {
+            Ok(JoinType::JoinLeft) => proven(j.rarg.as_deref()),
+            Ok(JoinType::JoinRight) => proven(j.larg.as_deref()),
+            _ => false,
+        };
+        if reduce && !j.is_natural && j.using_clause.is_empty() {
+            j.jointype = JoinType::JoinInner as i32;
+            *changed = true;
+        }
+        for side in [j.larg.as_deref_mut(), j.rarg.as_deref_mut()]
+            .into_iter()
+            .flatten()
+        {
+            walk(side, nonnull, changed);
+        }
+    }
+    let mut out = s.clone();
+    let mut changed = false;
+    for item in &mut out.from_clause {
+        walk(item, &nonnull, &mut changed);
+    }
+    changed.then_some(out)
 }
 
 /// `s` with every literal TRUE argument of a join's ON dropped, or `None`
