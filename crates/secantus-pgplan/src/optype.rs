@@ -2613,10 +2613,10 @@ fn sibling_reference(s: &pg_query::protobuf::SelectStmt, parent: Option<&Scope>)
             _ => {}
         }
     }
+    // Only the items to a subquery's left are in the range table when it is
+    // analysed (`transformFromClauseItem`); a name of one to its right is a
+    // missing entry (RP-460).
     let mut siblings = Vec::new();
-    for item in &s.from_clause {
-        item_name(item, &mut siblings);
-    }
     let in_outer = |name: &str| {
         let mut p = parent;
         while let Some(sc) = p {
@@ -2628,6 +2628,8 @@ fn sibling_reference(s: &pg_query::protobuf::SelectStmt, parent: Option<&Scope>)
         false
     };
     for item in &s.from_clause {
+        let left = siblings.clone();
+        item_name(item, &mut siblings);
         let Some(N::RangeSubselect(rs)) = item.node.as_ref() else {
             continue;
         };
@@ -2655,7 +2657,7 @@ fn sibling_reference(s: &pg_query::protobuf::SelectStmt, parent: Option<&Scope>)
                     continue;
                 };
                 let name = q.sval.as_str();
-                if siblings.iter().any(|n| n == name) && !in_outer(name) {
+                if left.iter().any(|n| n == name) && !in_outer(name) {
                     set_error_location(c.location);
                     return Err(Error::Sqlstate(
                         "42P01",

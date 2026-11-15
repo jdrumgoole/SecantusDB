@@ -380,12 +380,30 @@ def test_returning_subquery_reads_the_from(query: str, dsn: str) -> None:
 FROM_SUBQUERY_SIBLING = {
     "select * from fe x, (select (select fe.a)) s": _entry("fe", "x", "37"),
     "select * from fe x, (select 1 where exists (select fe.a)) s": _entry("fe", "x", "52"),
+    "select * from fe x join (select (select x.a)) s on true": _entry("x", "x", "41"),
+    # An item to the right is not in the range table yet: a missing entry.
+    "select * from (select (select y.a)) s, fe y": (
+        "42P01",
+        'missing FROM-clause entry for table "y"',
+        None,
+        "31",
+    ),
+    # A LATERAL one sees the items to its left by their visible names.
+    "select * from fe x, lateral (select (select fe.a)) s": (
+        "42P01",
+        'invalid reference to FROM-clause entry for table "fe"',
+        'Perhaps you meant to reference the table alias "x".',
+        "45",
+    ),
 }
 
 
-@pytest.mark.backlog("RP-460")
+@pytest.mark.backlog_fixed("RP-460")
 @pytest.mark.parametrize("query", list(FROM_SUBQUERY_SIBLING))
 def test_from_subquery_sibling_is_not_visible(query: str, dsn: str) -> None:
+    """A subquery inside a FROM-subquery was offered a sibling's alias as
+    its hint, an alias it cannot use there, and a sibling to its right was
+    an entry rather than a missing one (RP-460)."""
     assert answer(dsn, query) == FROM_SUBQUERY_SIBLING[query]
 
 

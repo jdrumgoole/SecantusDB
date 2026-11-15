@@ -24736,6 +24736,48 @@ impl FromScope<'_> {
     }
 }
 
+/// The enclosing level's range table as a FROM-subquery of it sees it,
+/// while that subquery is resolved (RP-460): `transformFromClauseItem`
+/// has added only the items to its left, and a subquery that is not
+/// LATERAL sees none of them (`p_lateral_only`), so a reference to one is
+/// "invalid reference", with the hint that the entry cannot be referenced
+/// from this part of the query, never one offering an alias it cannot use.
+/// A write's level, whose targets come first, is left as it is.
+struct FromItemLevel(Option<RangeLevel>);
+
+impl FromItemLevel {
+    fn enter(scope: &FromScope<'_>, lateral: bool) -> Self {
+        let mut left: Vec<pg_query::protobuf::Node> = scope.level.from[..scope.before].to_vec();
+        left.extend(scope.joined.iter().cloned());
+        let whole = range_level(&scope.level.from, &[], false);
+        let mut level = range_level(&left, &[], false);
+        if !lateral {
+            level.visible.clear();
+        }
+        let saved = OUTER_RANGE_LEVELS.with(|o| {
+            let mut o = o.borrow_mut();
+            let top = o.last_mut()?;
+            if top.entries.len() != whole.entries.len() || top.names != whole.names {
+                return None;
+            }
+            Some(std::mem::replace(top, level))
+        });
+        FromItemLevel(saved)
+    }
+}
+
+impl Drop for FromItemLevel {
+    fn drop(&mut self) {
+        if let Some(saved) = self.0.take() {
+            OUTER_RANGE_LEVELS.with(|o| {
+                if let Some(top) = o.borrow_mut().last_mut() {
+                    *top = saved;
+                }
+            });
+        }
+    }
+}
+
 /// `has_left`: a FROM item stands to this one's left (see
 /// `rowsfrom::rewrite`).
 fn resolve_sublinks_in_from(
@@ -24764,6 +24806,7 @@ fn resolve_sublinks_in_from(
     match item.node.as_mut() {
         Some(N::RangeSubselect(rs)) => {
             let lateral = rs.lateral;
+            let _level = FromItemLevel::enter(scope, lateral);
             match rs.subquery.as_deref_mut().and_then(|q| q.node.as_mut()) {
                 // A LATERAL subquery's left siblings are the next namespace
                 // out for the subqueries inside it, as an enclosing query's
@@ -29756,11 +29799,29 @@ fn invalid_from_reference(e: Error, s: &pg_query::protobuf::SelectStmt) -> Error
             _ => {}
         }
     }
-    let mut here = Vec::new();
-    for item in &s.from_clause {
-        names(item, &mut here);
+    // Only an item to the left of a FROM-subquery is in the range table
+    // when that subquery is analysed; one to the right of every subquery
+    // stays a missing entry (RP-460).
+    fn scan(n: &pg_query::protobuf::Node, here: &mut Vec<String>, left: &mut Vec<String>) {
+        match n.node.as_ref() {
+            Some(N::JoinExpr(j)) => {
+                for side in [j.larg.as_deref(), j.rarg.as_deref()].into_iter().flatten() {
+                    scan(side, here, left);
+                }
+            }
+            Some(N::RangeSubselect(_)) => {
+                *left = here.clone();
+                names(n, here);
+            }
+            _ => names(n, here),
+        }
     }
-    if here.iter().any(|n| n == name) {
+    let mut here = Vec::new();
+    let mut left_of_a_subquery = Vec::new();
+    for item in &s.from_clause {
+        scan(item, &mut here, &mut left_of_a_subquery);
+    }
+    if left_of_a_subquery.iter().any(|n| n == name) {
         Error::Sqlstate(
             "42P01",
             format!(

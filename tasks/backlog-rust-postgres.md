@@ -2352,27 +2352,6 @@ Measured on a private PostgreSQL 15.19 cluster with `fe(a int, b text)`
 and `fs(a int, c text)`, one row each.
 
 
-## Found while working RP-455 (2026-11-07)
-
-- [ ] **A subquery inside a FROM-subquery is offered a sibling's alias as
-      its hint.** PostgreSQL 15.19 analyses a FROM-subquery that is not
-      LATERAL with the FROM items before it in its level's range table but
-      out of its namespace (`p_lateral_only`), so `select * from fe x,
-      (select (select fe.a)) s` and `select * from fe x, (select 1 where
-      exists (select fe.a)) s` are 42P01 `invalid reference to FROM-clause
-      entry for table "fe"` with the hint `There is an entry for table "x",
-      but it cannot be referenced from this part of the query.`; here the
-      hint is `Perhaps you meant to reference the table alias "x".`, an
-      alias the client cannot use there. `resolve_sublinks_in_select`
-      pushes the whole FROM, every item visible, onto `OUTER_RELATIONS` and
-      `OUTER_RANGE_LEVELS` before it resolves the FROM-subqueries, so
-      `missing_rte_hint` finds the alias visible; a LATERAL one may see only
-      the items to its left. (The EXISTS forms naming the sibling itself,
-      `exists (select x.a)`, answered rows when this was filed; RP-444 made
-      them 42P01.) Measured on PostgreSQL 15.19.
-      Verify: tests/backlog/test_rp_subquery_scope.py::test_from_subquery_sibling_is_not_visible
-      Backlog-ID: RP-460
-
 ## Found while working RP-451 (2026-11-07)
 
 Measured on a private PostgreSQL 15.19 cluster with `fe(a int, b text)` and
