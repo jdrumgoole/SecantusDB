@@ -1,6 +1,6 @@
 """What working RP-698 (a correlated set operation) found:
 
-- an outer column in a set operation's ORDER BY is 42703 `column "b" does
+- an outer column in a set operation's ORDER BY was 42703 `column "b" does
   not exist`, where PostgreSQL's `transformSetOperationStmt` resolves it
   to the outer row and refuses it as 0A000 `invalid UNION/INTERSECT/EXCEPT
   ORDER BY clause` (RP-767).
@@ -61,7 +61,7 @@ SET_OPERATION_ORDER_BY_OUTER = {
 }
 
 
-@pytest.mark.backlog("RP-767")
+@pytest.mark.backlog_fixed("RP-767")
 @pytest.mark.parametrize("query", list(SET_OPERATION_ORDER_BY_OUTER))
 def test_an_outer_column_in_a_set_operations_order_by(query: str, dsn: str) -> None:
     assert answer(dsn, query) == SET_OPERATION_ORDER_BY_OUTER[query]

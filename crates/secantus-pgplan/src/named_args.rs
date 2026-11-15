@@ -49,6 +49,11 @@ fn named(a: &pg_query::protobuf::Node) -> Option<&pg_query::protobuf::NamedArgEx
     }
 }
 
+/// Does some overload of this built-in name its arguments?
+pub(crate) fn has_argument_names(name: &str) -> bool {
+    signatures().contains_key(name)
+}
+
 /// Is this a call to a built-in with a named argument?
 pub(crate) fn wanted(f: &pg_query::protobuf::FuncCall) -> bool {
     f.args.iter().any(|a| named(a).is_some())

@@ -2886,15 +2886,6 @@ keeps; what follows is what that lookup does not yet check.
 
 Measured on PostgreSQL 15.19; none needs an object.
 
-- [ ] **A named argument to a built-in whose parameters have no names is
-      refused as a gap.** `select nextval(regclass := 'nosuchseq')` and
-      `nextval(x => 'nosuchseq')` are 42883 `function nextval(regclass =>
-      unknown) does not exist` (`x => unknown`) at 8 with the
-      no-function-matches HINT on PostgreSQL 15.19 (`proargnames` is NULL
-      for `nextval`, so no candidate takes a named argument); here they are
-      0A000 `NamedArgExpr is not supported yet` with no position.
-      Verify: tests/backlog/test_rp_found_rp458.py::test_named_argument_to_a_builtin_without_argument_names
-      Backlog-ID: RP-677
 
 ## Found while working RP-697 (2026-11-09)
 
@@ -3015,22 +3006,6 @@ test is in `tests/backlog/test_rp_found_rp900.py`.
       Bind hands it `DEFAULT_NAME`.
       Verify: tests/backlog/test_rp_found_rp900.py::test_the_unnamed_portal_is_not_in_pg_cursors
       Backlog-ID: RP-936
-
-## Found while working RP-698 (2026-11-10)
-
-Measured on PostgreSQL 15.19 (the shared reference on port 5415).
-
-- [ ] **An outer column in a set operation's ORDER BY is 42703.** `select
-      (select a from (values (1)) t(a) union select 9 order by b limit 1)
-      from (values (5, 6)) v(a, b)` is 0A000 `invalid UNION/INTERSECT/EXCEPT
-      ORDER BY clause`, DETAIL `Only result column names can be used, not
-      expressions or functions.`, at 65 on PostgreSQL 15.19: the ORDER BY
-      sees only the output columns, so `b` resolves to the outer row and is
-      a sort expression (`transformSetOperationStmt`); `order by v.b` is the
-      same. Here each is 42703 `column "b" does not exist`. A name neither
-      level has is 42703 on both.
-      Verify: tests/backlog/test_rp_found_rp698.py::test_an_outer_column_in_a_set_operations_order_by
-      Backlog-ID: RP-767
 
 ## Found while working RP-756 (2026-11-10)
 
@@ -3240,22 +3215,6 @@ Measured on PostgreSQL 15.19 (the shared reference on port 5415): every
 statement is VALUES-only and runs there as written. The gap test is in
 `tests/backlog/test_rp_found_rp849.py`.
 
-
-## Found while working RP-704 (2026-11-10)
-
-Measured on PostgreSQL 15.19 (the shared reference on port 5415): every
-statement reads only `VALUES` lists.
-
-- [ ] **`GROUP BY v` over a FROM subquery groups by its column, not
-      the row.** `select v.a from (values (1), (2)) v(a) group by v` is
-      42803 `column "v.a" must appear in the GROUP BY clause or be used in
-      an aggregate function` at 8 on PostgreSQL 15.19, and so is `select
-      v.* ... group by v`. Here both answer the rows: the whole-row
-      grouping rule (`check_ungrouped_whole_row`, RP-532 / RP-536) covers a
-      lone table only, and a subquery's `v` resolves as its column. (The
-      star over a subquery itself now expands, `expand_star_in_grouped`.)
-      Verify: tests/backlog/test_rp_found_rp699.py::test_group_by_a_from_subquery_row_leaves_its_columns_ungrouped
-      Backlog-ID: RP-852
 
 ## Found while working RP-700 (2026-11-10)
 

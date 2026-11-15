@@ -4121,21 +4121,66 @@ fn refuse_qualified_builtins(node: &N) -> Result<()> {
     Ok(())
 }
 
+/// A named argument matches only a parameter `pg_proc.proargnames` names
+/// (`FuncnameGetCandidates` / `MatchNamedCall`): a built-in with no
+/// argument names at all, `nextval` say, has no candidate for such a call,
+/// which is 42883 naming it with each named argument as `name => type`.
+fn refuse_named_args_to_unnamed_builtins(node: &N) -> Result<()> {
+    for (n, _, _, _) in node.nodes() {
+        let pg_query::NodeRef::FuncCall(f) = n else {
+            continue;
+        };
+        if !f
+            .args
+            .iter()
+            .any(|a| matches!(a.node.as_ref(), Some(N::NamedArgExpr(_))))
+        {
+            continue;
+        }
+        let Some(name) = func_name(f) else {
+            continue;
+        };
+        if f.funcname.len() > 1 && !func_schema_is_pg_catalog(f) {
+            continue;
+        }
+        if !funcsig::is_builtin_function_name(&name)
+            || named_args::has_argument_names(&name)
+            || correlated::user_function_named(&name)
+        {
+            continue;
+        }
+        return Err(no_such_call(f, &name));
+    }
+    Ok(())
+}
+
+fn func_schema_is_pg_catalog(f: &pg_query::protobuf::FuncCall) -> bool {
+    matches!(
+        f.funcname.first().and_then(|n| n.node.as_ref()),
+        Some(N::String(s)) if s.sval == "pg_catalog"
+    )
+}
+
 /// 42883 for a call PostgreSQL finds no function for, at the call, its
 /// arguments' types as it prints them (`unknown` for a bare literal).
 fn no_such_call(f: &pg_query::protobuf::FuncCall, written: &str) -> Error {
-    let types: Vec<String> = f
-        .args
-        .iter()
-        .map(|a| match a.node.as_ref() {
+    fn arg_type(a: &pg_query::protobuf::Node) -> String {
+        match a.node.as_ref() {
             Some(N::AConst(c))
                 if c.isnull || matches!(c.val, Some(pg_query::protobuf::a_const::Val::Sval(_))) =>
             {
                 "unknown".to_string()
             }
+            // `funcname_signature_string` prints a named argument as
+            // `name => type`.
+            Some(N::NamedArgExpr(na)) => match na.arg.as_deref() {
+                Some(v) => format!("{} => {}", na.name, arg_type(v)),
+                None => format!("{} => unknown", na.name),
+            },
             _ => display_type(&static_type(a, &Bson::Null)),
-        })
-        .collect();
+        }
+    }
+    let types: Vec<String> = f.args.iter().map(arg_type).collect();
     set_error_location(f.location);
     Error::UndefinedFunction(format!(
         "function {written}({}) does not exist",
@@ -6108,6 +6153,7 @@ fn plan_node(
     schemas::resolve_shadowed_calls(&mut node, lookup)?;
     collation::citext_operators(&mut node, lookup)?;
     refuse_qualified_builtins(&node)?;
+    refuse_named_args_to_unnamed_builtins(&node)?;
     refuse_invisible_extension_functions(&node)?;
     if let Some(st) = fdw::plan(&node, lookup, params)? {
         return Ok(st);
@@ -43894,6 +43940,137 @@ fn check_ungrouped_whole_row(
     }
 }
 
+/// A grouped query over a FROM subquery grouped by the subquery's row
+/// (`group by v`): its columns are not grouped by that, as PostgreSQL has
+/// no functional dependency of a column on a subquery's row
+/// (`check_ungrouped_columns`), so a column of it outside an aggregate --
+/// a select-list `v.*` included, at the star -- is 42803 (RP-852).
+fn check_columns_under_row_grouping(
+    s: &pg_query::protobuf::SelectStmt,
+    alias: &str,
+    cols: &[String],
+) -> Result<()> {
+    if cols.iter().any(|c| c == alias) {
+        return Ok(());
+    }
+    let names = |c: &pg_query::protobuf::ColumnRef| -> Vec<Option<String>> {
+        c.fields
+            .iter()
+            .map(|f| match f.node.as_ref() {
+                Some(N::String(sv)) => Some(sv.sval.clone()),
+                Some(N::AStar(_)) => Some("*".into()),
+                _ => None,
+            })
+            .collect()
+    };
+    let target_val = |i: usize| -> Option<&pg_query::protobuf::Node> {
+        match s.target_list.get(i)?.node.as_ref() {
+            Some(N::ResTarget(rt)) => rt.val.as_deref(),
+            _ => None,
+        }
+    };
+    let mut by_row = false;
+    let mut grouped: Vec<String> = Vec::new();
+    for g in &s.group_clause {
+        let g = match g.node.as_ref() {
+            Some(N::AConst(c)) => match &c.val {
+                Some(pg_query::protobuf::a_const::Val::Ival(i)) if i.ival >= 1 => {
+                    match target_val(i.ival as usize - 1) {
+                        Some(v) => v,
+                        None => continue,
+                    }
+                }
+                _ => continue,
+            },
+            _ => g,
+        };
+        let Some(N::ColumnRef(c)) = g.node.as_ref() else {
+            // Any other grouping item: leave the statement to the
+            // grouping check proper.
+            return Ok(());
+        };
+        match names(c).as_slice() {
+            [Some(a)] if a == alias => by_row = true,
+            [Some(a), Some(star)] if a == alias && star == "*" => by_row = true,
+            [Some(col)] | [Some(_), Some(col)] => grouped.push(col.clone()),
+            _ => return Ok(()),
+        }
+    }
+    if !by_row {
+        return Ok(());
+    }
+    let ungrouped = |col: &str| cols.iter().any(|c| c == col) && !grouped.iter().any(|g| g == col);
+    let mut found: Option<(i32, String)> = None;
+    let scan = |n: &pg_query::protobuf::Node, found: &mut Option<(i32, String)>| -> Result<()> {
+        let mut n = n.clone();
+        walk_expr(&mut n, &mut |x| {
+            let opaque = match x.node.as_ref() {
+                Some(N::SubLink(_)) | Some(N::GroupingFunc(_)) => true,
+                Some(N::FuncCall(f)) => {
+                    f.over.is_none()
+                        && func_name(f)
+                            .as_deref()
+                            .is_some_and(|n| aggregate_func(n, f.agg_within_group).is_some())
+                }
+                Some(N::ColumnRef(c)) if found.is_none() => {
+                    let col = match names(c).as_slice() {
+                        [Some(col)] => Some(col.clone()),
+                        [Some(a), Some(col)] if a == alias => Some(col.clone()),
+                        _ => None,
+                    };
+                    if let Some(col) = col.filter(|c| c != "*" && ungrouped(c)) {
+                        *found = Some((c.location, col));
+                    }
+                    false
+                }
+                _ => false,
+            };
+            if opaque {
+                *x = pg_query::protobuf::Node { node: None };
+            }
+            Ok(())
+        })
+    };
+    for t in &s.target_list {
+        let Some(N::ResTarget(rt)) = t.node.as_ref() else {
+            continue;
+        };
+        let Some(v) = rt.val.as_deref() else {
+            continue;
+        };
+        if let Some(N::ColumnRef(c)) = v.node.as_ref() {
+            let star = match names(c).as_slice() {
+                [Some(a), Some(st)] => a == alias && st == "*",
+                [Some(st)] => st == "*",
+                _ => false,
+            };
+            if star {
+                if found.is_none() {
+                    if let Some(col) = cols.iter().find(|c| ungrouped(c)) {
+                        found = Some((c.location, col.clone()));
+                    }
+                }
+                continue;
+            }
+        }
+        scan(v, &mut found)?;
+    }
+    if let Some(h) = s.having_clause.as_deref() {
+        scan(h, &mut found)?;
+    }
+    match found {
+        None => Ok(()),
+        Some((location, col)) => {
+            if location >= 0 {
+                set_error_location(location);
+            }
+            Err(Error::Grouping(format!(
+                "column \"{alias}.{col}\" must appear in the GROUP BY clause or be used in an aggregate function"
+            )))
+        }
+    }
+}
+
 /// Does the FROM function `rf` return one column? Planned for its output
 /// only, nothing in it called (as a subquery's names are, RP-472).
 fn function_returns_one_column(
@@ -44080,6 +44257,7 @@ fn whole_row_rewrite(
                     rowtype = Some(table_rowtype(table));
                 }
             }
+            check_columns_under_row_grouping(s, &alias, &cols)?;
             (alias, cols)
         }
         _ => return Ok(None),
