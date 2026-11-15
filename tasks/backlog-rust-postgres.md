@@ -3482,17 +3482,22 @@ and `create domain di811 as int`.
 
 Measured on a private PostgreSQL 15.19 cluster.
 
-- [ ] **`tableoid` in a CHECK names no column.** `create table t816 (x int
-      check (tableoid::int > 0))` and `alter table c816 add constraint k
-      check (tableoid::int > 0)` create the constraint on PostgreSQL 15.19
-      (`scanNSItemForColumn` allows `tableoid`, alone of the system
-      columns, under `EXPR_KIND_CHECK_CONSTRAINT`), and `check (tableoid)`
-      is 42804 `argument of CHECK must be type boolean, not type oid` at
-      33. Here each is 42703 `column "tableoid" does not exist`: a SELECT's
-      `tableoid` is rewritten in `partitions.rs`, and a CHECK's row
-      evaluation has no `tableoid` to read.
-      Verify: tests/backlog/test_rp_found_rp816.py::test_tableoid_in_a_check_is_a_column
-      Backlog-ID: RP-859
+- [ ] **A CHECK naming its own table by `regclass` is refused at CREATE
+      TABLE.** `create table t816 (x int, check (tableoid =
+      't816'::regclass))` is CREATE TABLE on PostgreSQL 15.19
+      (`cookConstraint` runs after the relation exists); here it is 42P01
+      `relation "t816" does not exist` at 14. `alter table ... add check`
+      over an existing table is taken.
+      Verify: tests/backlog/test_rp_found_rp816.py::test_a_checks_regclass_of_its_own_table_resolves_at_create
+      Backlog-ID: RP-974
+- [ ] **A CHECK violated by a row routed into a partition names the
+      partitioned table, not the leaf.** `insert into p974 values (2)`,
+      routed into `p974b` and failing `check (x < 2)`, is 23514 `new row
+      for relation "p974b" violates check constraint "p974_x_check"` on
+      PostgreSQL 15.19 (`ExecConstraints` reports the leaf's result
+      relation); here the relation is `p974`.
+      Verify: tests/backlog/test_rp_found_rp816.py::test_a_partitions_check_violation_names_the_leaf
+      Backlog-ID: RP-975
 
 ## Found while working RP-860 (2026-11-14)
 

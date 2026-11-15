@@ -453,6 +453,17 @@ fn tableoid_sql(name: &str) -> Option<String> {
     })
 }
 
+/// A CHECK's `tableoid` over the table `name` (RP-859): the published
+/// expression -- the table's oid, or the leaf partition's for a row of a
+/// partitioned one -- or, while the table is still being created and has
+/// none, `0::oid`, which only the CHECK's validation at CREATE reads.
+pub(crate) fn check_tableoid_node(name: &str) -> Result<pg_query::protobuf::Node> {
+    let published = crate::deferred::read(&TABLEOIDS, |t| {
+        t.iter().find(|(n, _)| n == name).map(|(_, s)| s.clone())
+    });
+    domains::parse_default_sql(published.as_deref().unwrap_or("0::oid"))
+}
+
 /// Does the statement name the `tableoid` system column anywhere?
 pub(crate) fn mentions_tableoid(s: &pg_query::protobuf::SelectStmt) -> bool {
     s.target_list

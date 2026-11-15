@@ -3637,7 +3637,29 @@ fn not_boolean(n: &pg_query::protobuf::Node, scope: &Scope) -> Option<String> {
     if matches!(base.as_str(), "bool" | "boolean") {
         return None;
     }
-    (base.ends_with("[]") || category(&base).is_some()).then(|| display_type(&declared))
+    // The oid family and the system columns' types, outside `category`
+    // and no more coercible to boolean (RP-859: `check
+    // (tableoid)` is `... not type oid`).
+    let identifier = matches!(
+        base.as_str(),
+        "oid"
+            | "regclass"
+            | "regtype"
+            | "regproc"
+            | "regprocedure"
+            | "regoper"
+            | "regoperator"
+            | "regnamespace"
+            | "regrole"
+            | "regconfig"
+            | "regdictionary"
+            | "regcollation"
+            | "xid"
+            | "cid"
+            | "tid"
+    );
+    (identifier || base.ends_with("[]") || category(&base).is_some())
+        .then(|| display_type(&declared))
 }
 
 /// `coerce_to_boolean` of an untyped literal: 22P02 when `boolin` cannot

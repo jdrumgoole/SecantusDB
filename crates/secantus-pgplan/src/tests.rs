@@ -8524,3 +8524,24 @@ fn a_domain_check_and_an_index_predicate_are_coerced_to_boolean() {
         plan(sql, &lookup).expect("should plan");
     }
 }
+
+/// `tableoid` is the one system column a CHECK may name: the constraint is
+/// created, and a bare `tableoid` is refused as a non-boolean `oid`, as on
+/// PostgreSQL 15.19 (RP-859).
+#[test]
+fn tableoid_in_a_check_is_a_column() {
+    take_error_location();
+    plan(
+        "create table t816 (x int check (tableoid::int > 0))",
+        &lookup,
+    )
+    .expect("tableoid is allowed");
+    take_error_location();
+    let err =
+        plan("create table t816 (x int check (tableoid))", &lookup).expect_err("should refuse");
+    assert_eq!(err.sqlstate(), "42804", "got {err}");
+    assert_eq!(
+        err.to_string(),
+        "argument of CHECK must be type boolean, not type oid"
+    );
+}

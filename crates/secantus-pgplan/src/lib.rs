@@ -9388,7 +9388,7 @@ fn plan_alter_action(
             cook_check(raw, &expression, &schemas::split_key(table).1, def)
                 .inspect_err(|_| set_error_unpositioned())?;
             let name = if k.conname.is_empty() {
-                let named = columns_referenced(raw, def);
+                let named = check_columns_referenced(raw, def);
                 let base = match named.as_slice() {
                     [one] => format!("{table}_{one}_check"),
                     _ => format!("{table}_check"),
@@ -13345,7 +13345,7 @@ fn plan_create(c: &pg_query::protobuf::CreateStmt, analyse_defaults: bool) -> Re
             // `<table>_<col>_check` when the predicate names exactly one
             // column, `<table>_check` otherwise, with a counter to keep the
             // name unique within the table (`ChooseConstraintName`).
-            let named = columns_referenced(&raw, &def);
+            let named = check_columns_referenced(&raw, &def);
             let base = match named.as_slice() {
                 [one] => format!("{table}_{one}_check"),
                 _ => format!("{table}_check"),
@@ -13509,6 +13509,17 @@ fn string_list(nodes: &[pg_query::protobuf::Node]) -> Vec<String> {
 /// Which of `def`'s columns `node` references, in column order. Each column
 /// is probed the way `references_columns` probes for any: rewriting against
 /// every field but that one fails on exactly that column iff it is named.
+/// [`columns_referenced`] by a CHECK, where `tableoid` is a column: the
+/// generated name of `check (tableoid = ...)` is `<table>_tableoid_check`,
+/// as `AddRelationNewConstraints` names it from its one Var (RP-859).
+fn check_columns_referenced(node: &pg_query::protobuf::Node, def: &TableDef) -> Vec<String> {
+    let mut def = def.clone();
+    if def.column("tableoid").is_none() {
+        def.columns.push(Column::new("tableoid", "oid", false));
+    }
+    columns_referenced(node, &def)
+}
+
 fn columns_referenced(node: &pg_query::protobuf::Node, def: &TableDef) -> Vec<String> {
     let all: Vec<RowField> = def
         .columns
@@ -13681,6 +13692,8 @@ fn cook_check(
     name: &str,
     def: &TableDef,
 ) -> Result<()> {
+    // `tableoid` is a column to a CHECK, typed `oid` (RP-859).
+    let def = &with_check_tableoid(def);
     // The column reference `transformExpr` refuses first, if any: a column
     // the table lacks (42703) or a system column (42P10).
     let column = |refused_at: Option<i32>, whole: bool| -> Result<()> {
@@ -13892,6 +13905,39 @@ fn plan_whole_row_refs(val: &mut pg_query::protobuf::Node, def: &TableDef) -> Re
     })
 }
 
+/// A CHECK's `tableoid` (bare, or qualified by its table `name`) replaced
+/// by the expression of the row's relation oid: `scanNSItemForColumn`
+/// allows it alone of the system columns under
+/// `EXPR_KIND_CHECK_CONSTRAINT`, and the row carries no field for it
+/// (RP-859).
+fn plan_check_tableoid(val: &mut pg_query::protobuf::Node, name: &str) -> Result<()> {
+    walk_expr(val, &mut |n| {
+        let Some(N::ColumnRef(c)) = n.node.as_ref() else {
+            return Ok(());
+        };
+        let is = |f: &pg_query::protobuf::Node, v: &str| matches!(f.node.as_ref(), Some(N::String(s)) if s.sval == v);
+        let ours = match c.fields.as_slice() {
+            [col] => is(col, "tableoid"),
+            [table, col] => is(table, name) && is(col, "tableoid"),
+            _ => false,
+        };
+        if ours {
+            *n = partitions::check_tableoid_node(name)?;
+        }
+        Ok(())
+    })
+}
+
+/// `def` with `tableoid` among its system columns, as a CHECK sees it.
+fn with_check_tableoid(def: &TableDef) -> TableDef {
+    let mut def = def.clone();
+    if def.column("tableoid").is_none() {
+        def.system_columns
+            .push(Column::new("tableoid", "oid", false));
+    }
+    def
+}
+
 /// A reference a CHECK cannot take, as `first_bad_column` finds it.
 enum BadReference {
     /// A column the table lacks.
@@ -14054,6 +14100,7 @@ pub fn plan_check_expression(expression: &str, def: &TableDef) -> Result<ColumnE
         .ok_or_else(|| Error::Parse("CHECK expression is not an expression".into()))?;
     let mut val = val.clone();
     plan_whole_row_refs(&mut val, def)?;
+    plan_check_tableoid(&mut val, &def.name)?;
     let val = &val;
     let fields: Vec<RowField> = def
         .columns
