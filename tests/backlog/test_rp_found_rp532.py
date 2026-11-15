@@ -118,7 +118,8 @@ def test_ungrouped_whole_row(query: str, dsn: str) -> None:
 
 
 # Under an alias the relation's own name names nothing: a bare `fs` is a
-# missing column, at the reference, in every clause.
+# missing column, at the reference, in every clause. GROUP BY was reported
+# at the FROM item until RP-537 recorded the reference's location.
 ALIAS_HIDES_RELATION = {
     "select count(*) from fs x group by fs": (
         "42703",
@@ -135,7 +136,7 @@ ALIAS_HIDES_RELATION = {
 }
 
 
-@pytest.mark.backlog("RP-537")
+@pytest.mark.backlog_fixed("RP-537")
 @pytest.mark.parametrize("query", list(ALIAS_HIDES_RELATION))
 def test_alias_hides_relation_name(query: str, dsn: str) -> None:
     assert answer(dsn, query) == ALIAS_HIDES_RELATION[query]

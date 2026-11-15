@@ -2519,14 +2519,6 @@ holding `(1, 'y')` twice, `(2, 'z')` and `(null, null)`, and `fk(k fs)`
 holding `row(null, null)`, `row(1, null)`, `row(1, 'a')` and `null`. The
 gap tests are in `tests/backlog/test_rp_found_rp532.py`.
 
-- [ ] **A relation name its alias hides is reported at the FROM item.**
-      Under `from fs x` the name `fs` names nothing, so PostgreSQL 15.19
-      reports `select count(*) from fs x group by fs` and `... order by fs`
-      as 42703 `column "fs" does not exist` at 36, the reference. Here the
-      first is positioned at 22 (the FROM item), and the second is 42803
-      `column "x.fs" must appear in the GROUP BY clause ...` at 22.
-      Backlog-ID: RP-537
-      Verify: tests/backlog/test_rp_found_rp532.py::test_alias_hides_relation_name
 
 ## Found while working RP-590 (2026-11-08)
 

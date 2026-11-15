@@ -21926,9 +21926,13 @@ fn resolve_group_key(
         Some(N::ColumnRef(c)) => {
             let name = column_ref_name(c)
                 .ok_or_else(|| Error::Unsupported("this GROUP BY expression".into()))?;
-            let column = def
-                .column(&name)
-                .ok_or_else(|| Error::UndefinedColumn(name.clone()))?;
+            // PostgreSQL reports a missing GROUP BY column at its reference,
+            // never at a FROM item a text search would find first: under
+            // `from fs x` the name `fs` names nothing (RP-537).
+            let column = def.column(&name).ok_or_else(|| {
+                set_error_location(c.location);
+                Error::UndefinedColumn(name.clone())
+            })?;
             Ok((
                 GroupKey {
                     name,
