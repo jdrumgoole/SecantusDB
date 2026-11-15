@@ -46647,6 +46647,7 @@ impl PgHandler {
                 // join: the ModifyTable over it, costing what the join
                 // does and returning nothing (RP-435).
                 if let Some(name) = &options.modify_table {
+                    explain::add_row_identity(&mut tree);
                     let estimate = tree.estimate.map(|(s, t, _, _)| (s, t, 0.0, 0));
                     tree = explain::PlanNode::over(name.clone(), tree);
                     tree.estimate = estimate;

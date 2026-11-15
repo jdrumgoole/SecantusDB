@@ -50364,15 +50364,22 @@ fn const_value_node(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result<
             match value {
                 Bson::Null => Ok(None),
                 Bson::Boolean(v) => Ok(Some(v)),
-                other => Err(Error::DatatypeMismatch(format!(
-                    "argument of {} must be type boolean, not type {}",
-                    match BoolExprType::try_from(b.boolop) {
-                        Ok(BoolExprType::AndExpr) => "AND",
-                        Ok(BoolExprType::OrExpr) => "OR",
-                        _ => "NOT",
-                    },
-                    display_type(inferred_type(&other))
-                ))),
+                other => Err({
+                    // At the argument's leftmost token, as `coerce_to_boolean`.
+                    let loc = crate::srf_place::leftmost(n);
+                    if loc >= 0 {
+                        set_error_location(loc);
+                    }
+                    Error::DatatypeMismatch(format!(
+                        "argument of {} must be type boolean, not type {}",
+                        match BoolExprType::try_from(b.boolop) {
+                            Ok(BoolExprType::AndExpr) => "AND",
+                            Ok(BoolExprType::OrExpr) => "OR",
+                            _ => "NOT",
+                        },
+                        display_type(inferred_type(&other))
+                    ))
+                }),
             }
         };
         let out = match BoolExprType::try_from(b.boolop) {

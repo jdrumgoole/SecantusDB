@@ -1733,7 +1733,7 @@ impl PgHandler {
             }
             return Some((outer_key, inner_key, read));
         }
-        let (a, b, more, _, _) = self.joined_sides(sel)?;
+        let (a, b, more, _, _, _) = self.joined_sides(sel)?;
         if !more.is_empty() {
             return None;
         }
@@ -1762,7 +1762,7 @@ impl PgHandler {
     }
 
     pub(crate) fn hash_join_estimate(&self, sel: &secantus_pgplan::Select) -> Option<JoinEstimate> {
-        let (a, b, more, filter, left_join) = self.joined_sides(sel)?;
+        let (a, b, more, filter, left_join, target_width) = self.joined_sides(sel)?;
         // A WHERE conjunct pushed into a side's scan (RP-365) is priced as
         // that scan's filter, through an index where that is the cheaper
         // path (RP-369, in `hash_side`). Not where it names the join key: a
@@ -1791,9 +1791,13 @@ impl PgHandler {
             if !more.is_empty() || filter.count != 0 {
                 return None;
             }
-            return hash_anti_join_of(priced(&a)?, priced(&b)?);
+            let mut est = hash_anti_join_of(priced(&a)?, priced(&b)?)?;
+            est.2 .3 += target_width;
+            return Some(est);
         }
-        hash_join_of(priced(&a)?, priced(&b)?, &more, left_join, false, filter)
+        let mut est = hash_join_of(priced(&a)?, priced(&b)?, &more, left_join, false, filter)?;
+        est.2 .3 += target_width;
+        Some(est)
     }
 
     /// The two sides of an inner join of two stored tables planned as
@@ -1814,6 +1818,7 @@ impl PgHandler {
         Vec<(JoinedSide, JoinedSide)>,
         JoinFilterCost,
         bool,
+        i64,
     )> {
         use secantus_pgplan::joins::{JoinKind, JoinNode, JoinRows};
         use secantus_pgplan::Statement;
@@ -1829,7 +1834,6 @@ impl PgHandler {
             || sel.offset != 0
             || !matches!(sel.distinct, secantus_pgplan::Distinct::None)
             || sel.with_ties
-            || sel.casts.iter().any(Option::is_some)
             || (!j.where_modelled && Self::left_anti_key(sel).is_none())
         {
             return None;
@@ -1850,6 +1854,17 @@ impl PgHandler {
             return None;
         };
         let left_join = *kind == JoinKind::Left;
+        // A constant in the select list is a column of the join's target
+        // list, of its type's width (`set_pathtarget_cost_width`) and no
+        // cost to evaluate (RP-435); any other computed entry stays
+        // unpriced.
+        let mut target_width = 0;
+        for c in sel.casts.iter().flatten() {
+            let secantus_pgplan::ColumnExpr::Const { result_type, .. } = c else {
+                return None;
+            };
+            target_width += type_width(result_type, -1);
+        }
         // A LEFT join's WHERE is applied above it, where a conjunct on the
         // nullable side can reduce it to an inner join
         // (`reduce_outer_joins`): only one with no WHERE is priced
@@ -2111,7 +2126,7 @@ impl PgHandler {
             ops: filters.iter().map(|f| f.ops).sum(),
             selectivity,
         };
-        Some((a, b, more, filter, left_join))
+        Some((a, b, more, filter, left_join, target_width))
     }
 
     /// The Nested Loop of an inner join planned as joined rows whose WHERE
@@ -2137,7 +2152,7 @@ impl PgHandler {
         (String, String),
         [Option<String>; 2],
     )> {
-        let (mut a, mut b, more, filter, left_join) = self.joined_sides(sel)?;
+        let (mut a, mut b, more, filter, left_join, target_width) = self.joined_sides(sel)?;
         if !more.is_empty() || a.table == b.table || filter.count != 0 || left_join {
             return None;
         }
@@ -2213,7 +2228,12 @@ impl PgHandler {
             plan,
             sa,
             sb,
-            (plan.startup, plan.total, rows, width(&a)? + width(&b)?),
+            (
+                plan.startup,
+                plan.total,
+                rows,
+                width(&a)? + width(&b)? + target_width,
+            ),
             added,
             from,
             [ia, ib],
@@ -2282,10 +2302,20 @@ impl PgHandler {
             || j.left_sub.is_some()
             || j.right_sub.is_some()
             || j.order.is_some()
-            || j.exprs.iter().any(Option::is_some)
         {
             return None;
         }
+        // A constant in the select list adds its type's width to the
+        // join's and reads neither side (RP-435); any other computed entry
+        // stays unpriced.
+        let mut target_width = 0;
+        for c in j.exprs.iter().flatten() {
+            let secantus_pgplan::ColumnExpr::Const { result_type, .. } = c else {
+                return None;
+            };
+            target_width += type_width(result_type, -1);
+        }
+        let is_const = |i: usize| j.exprs.get(i).is_some_and(Option::is_some);
         let (a, b) = j.on.as_ref()?;
         // Each side's WHERE as its scan's filter (RP-362). A predicate on a
         // join key puts a constant in the key's equivalence class: an
@@ -2329,8 +2359,9 @@ impl PgHandler {
             let above: Vec<String> = j
                 .columns
                 .iter()
-                .filter(|(_, side, _)| side == alias)
-                .map(|(_, _, c)| def.field_of(c))
+                .enumerate()
+                .filter(|(i, (_, side, _))| side == alias && !is_const(*i))
+                .map(|(_, (_, _, c))| def.field_of(c))
                 .collect::<Option<_>>()?;
             let field = def.field_of(key)?;
             let mut read = above.clone();
@@ -2344,14 +2375,16 @@ impl PgHandler {
         if j.left.1 == j.right.1 {
             return None;
         }
-        hash_join_of(
+        let mut est = hash_join_of(
             side(&j.left)?,
             side(&j.right)?,
             &[],
             left_join,
             redundant,
             JoinFilterCost::default(),
-        )
+        )?;
+        est.2 .3 += target_width;
+        Some(est)
     }
 
     /// [`Self::nest_loop_estimate`] for a cross join planned on the narrow

@@ -6,7 +6,7 @@ its kin over a value that is not boolean):
 - a CHECK constraint's expression was not coerced to boolean (RP-811,
   fixed);
 - AND / OR / NOT report a non-boolean argument at the operator, not at the
-  argument's leftmost token (RP-812).
+  argument's leftmost token (RP-812, fixed).
 
 The expected answers were measured on a private, freshly initdb'd
 PostgreSQL 15.19 cluster with `_SETUP`, which each statement runs after.
@@ -187,7 +187,7 @@ def test_a_check_constraint_is_coerced_to_boolean(dsn: str, query: str, expected
     assert _answer(dsn, query) == expected
 
 
-@pytest.mark.backlog("RP-812")
+@pytest.mark.backlog_fixed("RP-812")
 @pytest.mark.parametrize(
     ("query", "expected"),
     [
@@ -202,6 +202,6 @@ def test_a_connectives_argument_is_reported_at_its_leftmost_token(
 ) -> None:
     """`coerce_to_boolean` reports at `exprLocation` of the argument, which
     for an operator expression is its leftmost token: `('x' || 'y') and
-    true` is 42804 at the `'x'` on PostgreSQL 15.19. Here it is reported at
-    the `||` (or the `and`)."""
+    true` is 42804 at the `'x'` on PostgreSQL 15.19. It was reported at the
+    `||` (or the `and`)."""
     assert _answer(dsn, query) == expected

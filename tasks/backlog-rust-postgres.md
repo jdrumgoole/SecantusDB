@@ -1798,7 +1798,13 @@ a regression test.
       (`from e, e e2, e e3 where e.a < e2.a and e2.a < e3.a`: `(e.a < e2.a)`
       on the lower Nested Loop); here both are the top join's, the lower
       one a cross join. Measured on a private 15.19 cluster (found while
-      working RP-354).
+      working RP-354). Where to start (read 2026-11-15): the order search
+      is `join_search.rs`, which takes only column equalities; the
+      EXPLAIN side is `scan_estimate::nest_loop_chain_estimate`, which
+      prices only the left spine as written and declines any WHERE filter
+      (`!j.where_filters.is_empty()`) and any join without an ON, so a
+      comma join's lower cross joins print zeros. Both halves change the
+      executed order or the printed tree, not just a cost: two slices.
       Verify: tests/backlog/test_rp_explain_costs.py::test_plan[nested loop of three relations joined in another order], tests/backlog/test_rp_explain_costs.py::test_plan[nested loop of three relations by a where]
       Backlog-ID: RP-919
 - [ ] **EXPLAIN VERBOSE prints no `Output` lists above a scan.** A plan
@@ -2018,21 +2024,6 @@ a regression test.
       (found while working RP-408).
       Backlog-ID: RP-414
       Verify: tests/backlog/test_rp_column_errors.py::test_missing_column_reported_as_written
-- [ ] **EXPLAIN of an UPDATE ... FROM or a DELETE ... USING a table
-      prints the join's widths from every column of its tables.** Since
-      2026-11-15 the statement is explained as the SELECT join it is
-      (`dml_join_as_select`) under its ModifyTable, so the plan's shape
-      and costs are PostgreSQL's. The widths are that SELECT's `*`:
-      PostgreSQL 15.19's join target list is each relation's `ctid` and
-      what the SET list reads, its scans `ctid` and the join key. With
-      `e(a int, b text)` and `k(a int primary key, b text)` analysed, 10
-      rows each, `explain delete from k using e where k.a = e.a` is `Hash
-      Join (... width=12)` over scans of `width=10`, here 14 and 7; `update
-      k set b = 'x' ...` is `width=44`, here 14. EXPLAIN VERBOSE's
-      `Output:` lists (`k.ctid, e.ctid`) follow from the same target list.
-      Measured on a private 15.19 cluster (found while working RP-432).
-      Verify: tests/backlog/test_rp_dml_from.py::test_explain_join_widths
-      Backlog-ID: RP-435
 - [ ] **A hash join of two tables never analysed is unpriced, and its
       sides stay in written order.** `hash_side` prices a side only from
       `analysed_key`, which needs `pg_statistic` rows. PostgreSQL 15.19
@@ -2966,24 +2957,6 @@ with ICU) with the `_SETUP` in `tests/backlog/test_rp_found_rp782.py`:
       returning a record of OUT parameters prints since 2026-11-15.
       Verify: tests/backlog/test_rp_found_rp782.py::test_pg_get_viewdef_of_the_remaining_system_views
       Backlog-ID: RP-798
-
-## Found while working RP-808 (2026-11-10)
-
-Measured on a private, freshly initdb'd PostgreSQL 15.19 cluster with the
-`_SETUP` in `tests/backlog/test_rp_found_rp808.py`: `t808(i int, b bool,
-s text)`.
-
-- [ ] **AND / OR / NOT report a non-boolean argument at the operator.**
-      `coerce_to_boolean` reports at the argument's `exprLocation`, an
-      operator expression's leftmost token: `select ('x' || 'y') and
-      true` is 42804 at position 9 on PostgreSQL 15.19, `(s || 'y') or
-      true` at 9, `insert ... values (1 and true)` at the `1` (30). Here
-      they are reported at the `||` or the `and` (25, 11, 36), and `not
-      ('x' || 'y')` one character early (12 for 13). `optype`'s
-      `bool_argument` and `const_value`'s BoolExpr arm use
-      `expr_location`; RP-808's boolean test uses `srf_place::leftmost`.
-      Verify: tests/backlog/test_rp_found_rp808.py::test_a_connectives_argument_is_reported_at_its_leftmost_token
-      Backlog-ID: RP-812
 
 ## Found while working RP-816 (2026-11-11)
 

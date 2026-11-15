@@ -14,6 +14,28 @@ use bson::Document;
 use secantus_pgplan::joins::{JoinKind, JoinNode};
 use secantus_pgplan::{ExplainOptions, Statement};
 
+/// The row identity a DML join's plan carries (RP-435): every relation's
+/// scan emits its `ctid` (6 bytes) for the ModifyTable, and every node above
+/// it passes each one up (`add_row_identity_columns`, `build_joinrel_tlist`).
+/// A Bitmap Index Scan returns a bitmap, no tuple, and keeps its width 0.
+/// Returns the relations under `node`.
+pub(crate) fn add_row_identity(node: &mut PlanNode) -> i64 {
+    if node.name.starts_with("Bitmap Index Scan")
+        || node.name == "BitmapOr"
+        || node.name == "BitmapAnd"
+    {
+        return 0;
+    }
+    let mut relations: i64 = node.children.iter_mut().map(add_row_identity).sum();
+    if node.children.is_empty() || node.name.starts_with("Bitmap Heap Scan") {
+        relations += 1;
+    }
+    if let Some(e) = node.estimate.as_mut() {
+        e.3 += 6 * relations;
+    }
+    relations
+}
+
 /// One plan node: its header, its detail lines, its children.
 pub(crate) struct PlanNode {
     pub name: String,

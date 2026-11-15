@@ -3756,7 +3756,10 @@ fn bool_argument(
     let Some(t) = not_boolean(arg, scope) else {
         return Ok(());
     };
-    if let Some(loc) = expr_location(arg) {
+    // `coerce_to_boolean` reports at `exprLocation`: an operator
+    // expression's leftmost token (`('x' || 'y') and true` at the `'x'`).
+    let loc = crate::srf_place::leftmost(arg);
+    if let Some(loc) = (loc >= 0).then_some(loc).or_else(|| expr_location(arg)) {
         set_error_location(loc);
     }
     Err(Error::DatatypeMismatch(format!(
