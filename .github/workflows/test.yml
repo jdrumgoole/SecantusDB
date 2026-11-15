@@ -1831,6 +1831,11 @@ jobs:
           # 3-minute test on its own: no shard of this lane gets below that.
           if [ "${{ matrix.shard }}" = "server" ]; then
           files="tests/test_rust_pgserver_slice.py"
+          # The catalog's storage key log (the statement after DDL patches
+          # the catalogs from it) and relation-name resolution across
+          # schemas. Binary only.
+          files="$files tests/test_rust_pg_catalog_key_log.py"
+          files="$files tests/test_rust_pgserver_relation_names.py"
           else
           files=""
           # The DIFFERENTIAL suite, whole: 836 cases against the PostgreSQL 14

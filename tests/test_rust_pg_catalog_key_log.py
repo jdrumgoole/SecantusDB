@@ -12,7 +12,9 @@ from typing import Any
 
 import pytest
 
-from tests.test_rust_pgserver_slice import _Server
+from tests.test_rust_pgserver_slice import BINARY, _Server
+
+pytestmark = pytest.mark.skipif(not BINARY.exists(), reason="secantusd-pg not built")
 
 COLUMNS = (
     "SELECT attname FROM pg_attribute WHERE attrelid = %s::regclass "
