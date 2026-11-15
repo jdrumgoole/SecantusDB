@@ -779,14 +779,6 @@ These are explicit non-goals. Don't add them without a reason.
       e01df2d2 (2026-11-08), each command checked against a probe of its own.
       Backlog-ID: RM-360
       Verify: tests/backlog/test_rm_355_364.py::test_every_line_counts_its_interrupt_checks
-- [ ] **An `update` or `delete` statement's line leaves out the command's
-      `comment`.** mongod 8.2.11's `Slow query` line for each statement
-      shows it with its command's `comment` (`{q, limit, comment}`,
-      `{q, u, multi, upsert, comment}`); this server's shows the statement
-      alone, so a log search for the comment misses the statement's line.
-      Found while working RM-478, 2026-11-13.
-      Verify: tests/backlog/test_rm_statement_line_comment.py::test_a_statement_line_carries_its_commands_comment
-      Backlog-ID: RM-581
 - [ ] **A `dataSize` of a view answers.** mongod 8.2.11 refuses
       `{dataSize: "<db>.v"}` of a view (166, CommandNotSupportedOnView);
       this server answers `ok: 1`, sizing nothing. Found while working
