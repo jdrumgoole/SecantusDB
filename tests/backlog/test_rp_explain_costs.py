@@ -5047,6 +5047,37 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "  Filter: ((b <> 'v'::text) AND ((a)::numeric = '4'::numeric))",
         ],
     ),
+    # `negate_clause` over a NOT BETWEEN, an IN list and a regex match,
+    # and the AND that comes out flattened into the scan's quals (measured
+    # on PostgreSQL 15.19, RP-412).
+    "a not over a not between is its two comparisons": (
+        "RP-412",
+        _ANALYSED,
+        "explain (costs off) select * from e"
+        " where not (b ilike 'x%') and not (a not between 1 and 5)",
+        [
+            "Seq Scan on e",
+            "  Filter: ((b !~~* 'x%'::text) AND (a >= 1) AND (a <= 5))",
+        ],
+    ),
+    "a not over an in list is its negator over all": (
+        "RP-412",
+        _ANALYSED,
+        "explain (costs off) select * from e where not (a in (1,2))",
+        ["Seq Scan on e", "  Filter: (a <> ALL ('{1,2}'::integer[]))"],
+    ),
+    "a not over an and of a regex and a null test": (
+        "RP-412",
+        _ANALYSED,
+        "explain (costs off) select * from e where not (b ~ 'x' and a is null)",
+        ["Seq Scan on e", "  Filter: ((b !~ 'x'::text) OR (a IS NOT NULL))"],
+    ),
+    "a not over an or is two index conditions": (
+        "RP-412",
+        _ANALYSED,
+        "explain (costs off) select * from k where not (a > 5 or a < 3)",
+        ["Index Scan using k_pkey on k", "  Index Cond: ((a <= 5) AND (a >= 3))"],
+    ),
     "a scan filter's coerced constant is folded": (
         "RP-407",
         _ANALYSED,
@@ -5625,6 +5656,7 @@ def _marked(name: str, item: str) -> Any:
         "RP-406",
         "RP-407",
         "RP-917",
+        "RP-412",
     )
     mark = pytest.mark.backlog_fixed if fixed else pytest.mark.backlog
     return pytest.param(name, marks=mark(item), id=name)

@@ -17,8 +17,10 @@
 //! is `false`, no scan under it. One that ends TRUE is no qual at all.
 //!
 //! Only the boolean structure reached from the WHERE through AND, OR and NOT
-//! is simplified; a NOT over anything else is left as written (pushing it
-//! onto its arms, `negate_clause`, is RP-412's).
+//! is simplified. A NOT is pushed onto what it negates (`negate_clause`,
+//! RP-412): De Morgan over an AND or an OR, a comparison, LIKE or IN by its
+//! negator, a null test by its opposite; a NOT over anything else is left as
+//! written.
 
 use super::*;
 
@@ -98,13 +100,86 @@ fn bool_expr(op: BoolExprType, args: Vec<pg_query::protobuf::Node>) -> pg_query:
     }
 }
 
+/// `negate_clause`: the clause `NOT n` is, pushed one level down; `None`
+/// where PostgreSQL keeps the NOT.
+fn negate(n: &pg_query::protobuf::Node) -> Option<pg_query::protobuf::Node> {
+    let not = |a: &pg_query::protobuf::Node| bool_expr(BoolExprType::NotExpr, vec![a.clone()]);
+    match n.node.as_ref()? {
+        N::BoolExpr(b) => match BoolExprType::try_from(b.boolop).ok()? {
+            BoolExprType::AndExpr => Some(bool_expr(
+                BoolExprType::OrExpr,
+                b.args.iter().map(not).collect(),
+            )),
+            BoolExprType::OrExpr => Some(bool_expr(
+                BoolExprType::AndExpr,
+                b.args.iter().map(not).collect(),
+            )),
+            BoolExprType::NotExpr => b.args.first().cloned(),
+            BoolExprType::Undefined => None,
+        },
+        N::NullTest(t) => {
+            let mut t = t.clone();
+            t.nulltesttype = if t.nulltesttype == pg_query::protobuf::NullTestType::IsNull as i32 {
+                pg_query::protobuf::NullTestType::IsNotNull as i32
+            } else {
+                pg_query::protobuf::NullTestType::IsNull as i32
+            };
+            Some(pg_query::protobuf::Node {
+                node: Some(N::NullTest(t)),
+            })
+        }
+        N::AExpr(e) => {
+            let kind = AExprKind::try_from(e.kind).ok()?;
+            // A [NOT] BETWEEN is the AND (OR) of its two comparisons by
+            // now.
+            if matches!(kind, AExprKind::AexprBetween | AExprKind::AexprNotBetween) {
+                return negate(&expand_between(e)?);
+            }
+            let negator = match (kind, crate::operator_name(e).ok()?) {
+                (AExprKind::AexprOp, "=") => "<>",
+                (AExprKind::AexprOp, "<>" | "!=") => "=",
+                (AExprKind::AexprOp, "<") => ">=",
+                (AExprKind::AexprOp, ">=") => "<",
+                (AExprKind::AexprOp, ">") => "<=",
+                (AExprKind::AexprOp, "<=") => ">",
+                (AExprKind::AexprOp, "~") => "!~",
+                (AExprKind::AexprOp, "!~") => "~",
+                (AExprKind::AexprOp, "~*") => "!~*",
+                (AExprKind::AexprOp, "!~*") => "~*",
+                (AExprKind::AexprLike, "~~") => "!~~",
+                (AExprKind::AexprLike, "!~~") => "~~",
+                (AExprKind::AexprIlike, "~~*") => "!~~*",
+                (AExprKind::AexprIlike, "!~~*") => "~~*",
+                (AExprKind::AexprIn, "=") => "<>",
+                (AExprKind::AexprIn, "<>") => "=",
+                _ => return None,
+            };
+            // A prefix operator has no negator here.
+            e.lexpr.as_ref()?;
+            let mut e = e.clone();
+            e.name = vec![string_node(negator)];
+            Some(pg_query::protobuf::Node {
+                node: Some(N::AExpr(e)),
+            })
+        }
+        _ => None,
+    }
+}
+
 /// Does a constant appear anywhere in the qual's boolean structure, or a
-/// BETWEEN a NULL bound makes one: the cheap test before cloning.
+/// BETWEEN a NULL bound makes one, or a NOT that [`negate`] pushes down:
+/// the cheap test before cloning.
 fn has_constant(n: &pg_query::protobuf::Node) -> bool {
     if bool_const(n).is_some() {
         return true;
     }
     match n.node.as_ref() {
+        Some(N::BoolExpr(b))
+            if b.boolop == BoolExprType::NotExpr as i32
+                && b.args.first().is_some_and(|a| negate(a).is_some()) =>
+        {
+            true
+        }
         Some(N::BoolExpr(b)) => b.args.iter().any(has_constant),
         Some(N::NullTest(t)) => t.arg.as_deref().is_some_and(strict_fold::null_through),
         Some(N::AExpr(e)) => {
@@ -155,6 +230,11 @@ fn simplify(n: pg_query::protobuf::Node) -> Result<pg_query::protobuf::Node> {
         return Ok(n);
     };
     let op = BoolExprType::try_from(b.boolop).map_err(|e| Error::Parse(e.to_string()))?;
+    if op == BoolExprType::NotExpr {
+        if let Some(pushed) = b.args.first().and_then(negate) {
+            return simplify(pushed);
+        }
+    }
     let args = b
         .args
         .iter()
@@ -413,13 +493,36 @@ mod tests {
         assert_eq!(simplified("select * from e where a > 5 and true"), "a > 5");
     }
 
+    /// `negate_clause`, measured on PostgreSQL 15.19 (RP-412).
+    #[test]
+    fn a_not_is_pushed_onto_its_arms() {
+        assert_eq!(simplified("select * from e where not (a > 5)"), "a <= 5");
+        assert_eq!(
+            simplified("select * from e where not (a > 15 or b = 'v3')"),
+            "a <= 15 AND b <> 'v3'"
+        );
+        assert_eq!(
+            simplified("select * from e where not (a between 15 and 55)"),
+            "a < 15 OR a > 55"
+        );
+        assert_eq!(
+            simplified("select * from e where not (a is null or b like 'x%')"),
+            "a IS NOT NULL AND b NOT LIKE 'x%'"
+        );
+        assert_eq!(simplified("select * from e where not not (a < 1)"), "a < 1");
+        assert_eq!(
+            simplified("select * from e where not (a > 1 or null)"),
+            "False"
+        );
+    }
+
     #[test]
     fn nothing_constant_is_left_alone() {
         for sql in [
             "select * from e where a > 5",
             "select * from e where a is null",
             "select * from e where a between 1 and 15",
-            "select * from e where not (a > 5)",
+            "select * from e where not a",
             "select * from e where a is not null",
         ] {
             assert_eq!(simplified(sql), "unchanged", "{sql}");

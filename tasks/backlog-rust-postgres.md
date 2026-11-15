@@ -2054,22 +2054,6 @@ a regression test.
       cluster (found while working RP-399).
       Backlog-ID: RP-411
       Verify: tests/backlog/test_rp_explain_costs.py::test_plan[an in subquery is a hash semi join], tests/backlog/test_rp_explain_costs.py::test_plan[an exists subquery is a hash semi join]
-- [ ] **A NOT over an AND, an OR or a BETWEEN prints as written, not
-      pushed onto its arms.** PostgreSQL 15.19's `negate_clause` (during
-      `eval_const_expressions`) applies De Morgan and replaces each
-      operator by its negator: `select * from e where not (a > 15 or b =
-      'v3')` is `Filter: ((a <= 15) AND (b <> 'v3'::text))` and `not (a
-      between 15 and 55)` is `Filter: ((a < 15) OR (a > 55))`; here
-      `(NOT ((a > 15) OR (b = 'v3'::text)))` and `(NOT ((a >= 15) AND (a
-      <= 55)))`. An AND that comes out is then flattened into the scan's
-      quals, which can change the index conditions and the estimate. Its
-      rows are right. Measured on a private 15.19 cluster (found while
-      working RP-399). With a NULL arm the pushed-down AND is constant
-      false: `not (a > 1 or null)` is `Result` with `One-Time Filter:
-      false` there, a `Seq Scan` with `Filter: (NOT ((a > 1) OR
-      NULL::boolean))` here (found while working RP-409).
-      Backlog-ID: RP-412
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a not over an or is the and of its negated arms], tests/backlog/test_rp_explain_costs.py::test_plan[a not over a between is the or of its negators], tests/backlog/test_rp_explain_costs.py::test_plan[a not over an or with a null arm is a false one-time filter]
 - [ ] **A missing column's 42703 names the wrong reference, or drops its
       qualifier.** PostgreSQL 15.19 reports the first missing column in
       the order it analyses the statement, by the name as written and at
