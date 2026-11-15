@@ -695,15 +695,15 @@ These are explicit non-goals. Don't add them without a reason.
       lookups to reads without `returnKey`). Found 2026-11-12 (RM-470).
       Verify: tests/backlog/test_rm_found_rm470.py::test_return_key_of_an_id_point_lookup_is_idhack
       Backlog-ID: RM-567
-- [ ] **`returnKey` drops a projection's `{$meta: "sortKey"}` field.**
-      mongod 8.2.11 keeps a projection's `sortKey` fields under `returnKey`
-      (`extractSortKeyMetaFieldsFromProjection`): `find({z: 0}, {k:
-      {$meta: "sortKey"}}).sort({z: 1}).returnKey()` returns `{k: [0]}`
-      for each document. This server returns the sort's field instead,
-      `{z: 0}`, and over an index `{y, x, z}` where mongod gives `{y, x,
-      k}`. Found 2026-11-12 (RM-470).
-      Verify: tests/backlog/test_rm_found_rm470.py::test_return_key_keeps_a_sort_key_meta_field
-      Backlog-ID: RM-568
+- [ ] **`find` drops a projection's `{$meta: "sortKey"}` field.** mongod
+      8.2.11 gives each document the sort key as an array:
+      `find({}, {k: {$meta: "sortKey"}}).sort({x: 1})` over `{_id: 1, x:
+      [3, 1]}` returns `{_id: 1, x: [3, 1], k: [1]}`. This server returns
+      the document without `k` (`apply_projection` omits the field). Under
+      `returnKey` the field is kept since RM-568 (`find::sort_key_array`).
+      Found 2026-11-15 (RM-568).
+      Verify: tests/backlog/test_rm_found_rm568.py::test_find_keeps_a_sort_key_meta_field
+      Backlog-ID: RM-703
 - [ ] **A `default` sort of documents counts the documents, not its
       working-set members.** mongod 8.2.11's SORT of a read that keeps
       each member's metadata (`showRecordId`, a projection's `{$meta:

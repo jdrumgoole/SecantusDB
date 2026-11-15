@@ -96,12 +96,12 @@ def test_return_key_of_an_id_point_lookup_is_idhack(rust_mongo: Any, mongod: Any
     assert answers["rust"] == answers["mongod"]
 
 
-@pytest.mark.backlog("RM-568")
+@pytest.mark.backlog_fixed("RM-568")
 def test_return_key_keeps_a_sort_key_meta_field(rust_mongo: Any, mongod: Any) -> None:
     """mongod 8.2.11 keeps a projection's `{$meta: "sortKey"}` fields under
     `returnKey` (`extractSortKeyMetaFieldsFromProjection`): over a COLLSCAN
-    each result is `{k: [0]}`. This server drops the field and returns the
-    sort's own field, `{z: 0}`."""
+    each result is `{k: [0]}`. This server dropped the field and returned
+    the sort's own field, `{z: 0}`."""
     command = {
         "find": "c",
         "filter": {"z": 0},

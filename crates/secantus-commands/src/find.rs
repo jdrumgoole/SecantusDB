@@ -320,6 +320,19 @@ fn parse_problem(doc: &Document, ctx: &CommandContext) -> Result<Option<Document
     if let Some(err) = projection_meta_error(spec, &filter) {
         return Ok(Some(err.into_reply()));
     }
+    // mongod 8.2.11 refuses a top-level `{$meta: "sortKey"}` in a read with
+    // no sort, `returnKey` or not (`BadValue`, measured 2026-11-15, RM-567).
+    let has_sort = doc.get_document("sort").is_ok_and(|s| !s.is_empty());
+    if !has_sort && !sort_key_meta_fields(spec).is_empty() {
+        return Ok(Some(
+            CommandError::new(
+                2,
+                "BadValue",
+                "cannot use sortKey $meta projection without a sort",
+            )
+            .into_reply(),
+        ));
+    }
     if let Some(e) = projection_expression_error(spec, doc.get("let"), ctx) {
         return Err(e);
     }
@@ -808,7 +821,9 @@ fn find_body(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         None
     };
     // A projection's `$meta` streams when it asks for what a streamed read
-    // keeps: each document's RecordId and the key it was found at.
+    // keeps: each document's RecordId and the key it was found at, and,
+    // under `returnKey`, a top-level sort key (RM-567).
+    let returns_key = bool_field(doc, "returnKey", false);
     let metas_stream = |p: &Document| {
         fn ok(v: &Bson) -> bool {
             match secantus_core::projection::meta_spec(v) {
@@ -820,7 +835,9 @@ fn find_body(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
                 },
             }
         }
-        p.values().all(ok)
+        p.values().all(|v| {
+            ok(v) || (returns_key && secantus_core::projection::meta_spec(v) == Some("sortKey"))
+        })
     };
     let streamable = !tailable
         && exists
@@ -1179,14 +1196,11 @@ fn find_body(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
                     }
                 }
             }
-            if let Some(s) = sort {
-                for k in s.keys() {
-                    if !key_fields.iter().any(|f| f == k) {
-                        key_fields.push(k.clone());
-                    }
-                }
-            }
         }
+        let sort_key_fields = match projection {
+            Some(spec) if return_key => sort_key_meta_fields(spec),
+            _ => Vec::new(),
+        };
         // `showRecordId` adds to the projected document; only `returnKey`
         // replaces it.
         let projected_first = match projection {
@@ -1211,6 +1225,17 @@ fn find_body(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
                 for f in &key_fields {
                     if let Some(v) = d.get(f) {
                         o.insert(f.clone(), v.clone());
+                    }
+                }
+                // A projection's `{$meta: "sortKey"}` fields stay, after the
+                // index key, each the sort key as an array; one an index field
+                // already names keeps that field's place
+                // (`extractSortKeyMetaFieldsFromProjection`; measured 8.2.11,
+                // RM-567).
+                if let (false, Some(s)) = (sort_key_fields.is_empty(), sort) {
+                    let key = sort_key_array(&d, s, &ns)?;
+                    for f in &sort_key_fields {
+                        o.insert(f.clone(), key.clone());
                     }
                 }
                 rewritten.push(o);
@@ -1381,7 +1406,32 @@ fn shape_streamed(
         docs, rids, keys, ..
     } = batch;
     if cursor.return_key {
-        let out: Vec<Document> = keys.into_iter().map(Option::unwrap_or_default).collect();
+        let mut out: Vec<Document> = keys.into_iter().map(Option::unwrap_or_default).collect();
+        // A projection's `{$meta: "sortKey"}` fields stay, after the index
+        // key, each the sort key as an array; one an index field already
+        // names keeps that field's place (`extractSortKeyMetaFieldsFromProjection`;
+        // measured 8.2.11, RM-567). A covered read has no document: its
+        // index key holds the sort's fields.
+        let fields = cursor
+            .projection
+            .as_ref()
+            .map(sort_key_meta_fields)
+            .unwrap_or_default();
+        if let (false, Some(sort)) = (fields.is_empty(), cursor.command.get_document("sort").ok()) {
+            for (i, o) in out.iter_mut().enumerate() {
+                let key = match docs.get(i) {
+                    Some(bytes) => {
+                        let d = secantus_core::bsondoc::from_bytes(bytes.as_slice())
+                            .map_err(|e| CommandError::new(1, "InternalError", e.to_string()))?;
+                        sort_key_array(&d, sort, &cursor.ns)?
+                    }
+                    None => sort_key_array(o, sort, &cursor.ns)?,
+                };
+                for f in &fields {
+                    o.insert(f.clone(), key.clone());
+                }
+            }
+        }
         return crate::util::encode_docs(out);
     }
     let mut out: Vec<Document> = match &cursor.projection {
@@ -2223,6 +2273,37 @@ fn query_has_text(query: &Document) -> bool {
 /// requires text score metadata, but it is not available`). Recognized-but-
 /// unsupported args (`indexKey` / `recordId` / `sortKey` / …) validate clean and
 /// are omitted from the result by `secantus_core::projection::apply_projection`.
+/// `d`'s `{$meta: "sortKey"}` under `sort`: the value of each sort field,
+/// as an array (mongod 8.2.11, RM-567).
+fn sort_key_array(d: &Document, sort: &Document, ns: &str) -> Result<Bson, CommandError> {
+    let fields =
+        secantus_core::aggregate::sort_fields(&Bson::Document(sort.clone())).map_err(|_| {
+            CommandError::new(2, "BadValue", "sort is not supported by the Rust server")
+        })?;
+    let key =
+        secantus_core::aggregate::sort_key_values(d, &fields).map_err(|f| match f.as_mongo() {
+            Some((code, msg)) => CommandError::new(
+                code,
+                crate::util::error_code_name(code),
+                format!("Executor error during find command: {ns} :: caused by :: {msg}"),
+            ),
+            None => CommandError::new(
+                2,
+                "BadValue",
+                "sort key is not supported by the Rust server",
+            ),
+        })?;
+    Ok(Bson::Array(key))
+}
+
+/// The fields a projection gives `{$meta: "sortKey"}`, in its order.
+fn sort_key_meta_fields(spec: &Document) -> Vec<String> {
+    spec.iter()
+        .filter(|(_, v)| secantus_core::projection::meta_spec(v) == Some("sortKey"))
+        .map(|(k, _)| k.clone())
+        .collect()
+}
+
 fn projection_meta_error(spec: &Document, filter: &Document) -> Option<CommandError> {
     for v in spec.values() {
         let Some(arg) = secantus_core::projection::meta_spec(v) else {
