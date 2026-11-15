@@ -1143,8 +1143,7 @@ one beside it.
       15.8 ms with none). What is left, sampled at 800 tables (debug
       build, 2026-11-15), each a pass over every relation per catalog
       version, about 2 ms in all: `publish_user_types` republishing every
-      table's row type, `session_has_temp`'s scan for a temp table
-      (`install_temp_namespace`), `install_session_state`'s per-table
+      table's row type, `install_session_state`'s per-table
       closures and `inheritance`, `patch_table_defs` copying the 800
       definitions' stored bytes, and `relation_oids` listing every
       relation at the collation query's `regclass` lookup. (A per-table
@@ -1158,6 +1157,11 @@ one beside it.
       Its gap test is a timing ratio and can pass once by noise (a
       `gate_pg.sh` backlog step on 2026-11-13 reported it `FIXED?`, then
       it failed three of three runs alone): rerun it alone before closing.
+      (2026-11-15: whether the session holds a temp relation, for its temp
+      namespace, no longer lists every relation -- it forced the deferred
+      `regclass` list on every statement after DDL; a temp sequence is
+      flagged when the list is deferred. The gap test then passed five of
+      ten alone, and RP-928's eight of ten, at a load average near 14.)
       Backlog-ID: RP-911
       Verify: tests/backlog/test_rp_catalog_latency.py::test_the_first_catalog_query_after_ddl_costs_the_same_at_800_tables_within_a_tenth
 
@@ -1188,6 +1192,17 @@ one beside it.
       before closing.
       Verify: tests/backlog/test_rp_catalog_latency.py::test_create_table_costs_the_same_at_800_tables_within_a_tenth
       Backlog-ID: RP-928
+
+## Found while working RP-911 (2026-11-15)
+
+- [ ] **OPEN — `CREATE TYPE pg_temp.t AS (...)` makes no type in the temp
+      schema.** PostgreSQL 15.19 creates the composite in the session's
+      temp namespace (making it): `'pg_temp.t'::regtype` resolves, its
+      `typnamespace` is `pg_my_temp_schema()`, and that is no longer 0.
+      `secantusd-pg` answers 42704 `type "pg_temp.t" does not exist` to
+      the cast.
+      Verify: tests/backlog/test_rp_qualified_calls.py::test_standalone_temp_composite_is_in_the_temp_schema
+      Backlog-ID: RP-971
 
 ## Found while working RP-927 (2026-11-14)
 

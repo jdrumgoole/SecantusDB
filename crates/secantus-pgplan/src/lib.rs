@@ -36873,12 +36873,24 @@ pub fn relation_is_publishable(oid: i64) -> Option<bool> {
 /// Relations: `(name, oid, temp)`.
 pub fn set_user_relations(relations: Vec<(String, i64, bool)>) {
     schemas::bump_resolve_epoch();
+    let temp = schemas::temp_schema().map(|t| format!("{t}."));
+    schemas::set_temp_outside_keys(
+        temp.is_some_and(|p| relations.iter().any(|(n, _, _)| n.starts_with(&p))),
+    );
     PLAN_USER_RELATIONS.with(|t| t.set(relations));
 }
 
 /// The relations `build` lists, at the first lookup (see [`deferred`]).
-pub fn defer_user_relations(build: impl FnOnce() -> Vec<(String, i64, bool)> + 'static) {
+/// `temp_outside_keys`: whether one of them is in the session's temp
+/// schema though not among the relation keys (a temp sequence, a
+/// standalone temp composite), so asking whether the session holds a temp
+/// relation does not list them all (RP-911).
+pub fn defer_user_relations(
+    build: impl FnOnce() -> Vec<(String, i64, bool)> + 'static,
+    temp_outside_keys: bool,
+) {
     schemas::bump_resolve_epoch();
+    schemas::set_temp_outside_keys(temp_outside_keys);
     PLAN_USER_RELATIONS.with(|t| t.defer(build));
 }
 

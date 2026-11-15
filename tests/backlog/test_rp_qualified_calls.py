@@ -452,6 +452,13 @@ TEMP_NAMESPACE = {
         ),
         [(False,)],
     ),
+    # Measured on 15.19: a temp sequence makes it too, though it is not a
+    # table or a view (RP-911 asks whether one exists without listing
+    # every relation).
+    "made by a temp sequence": (
+        ("create temp sequence sq911", "select pg_my_temp_schema() = 0"),
+        [(False,)],
+    ),
 }
 
 
@@ -514,3 +521,17 @@ def test_other_sessions_temp_schema_relation_is_named_as_written(dsn: str) -> No
         None,
         "15",
     )
+
+
+@pytest.mark.backlog("RP-971")
+def test_standalone_temp_composite_is_in_the_temp_schema(dsn: str) -> None:
+    """`CREATE TYPE pg_temp.t AS (...)` makes a composite in the session's
+    temp schema, which it makes: on 15.19 the type resolves as
+    `pg_temp.t` and `pg_my_temp_schema()` is no longer 0."""
+    assert answer(
+        dsn,
+        "create type pg_temp.ct911 as (a int)",
+        "select (select typnamespace from pg_type"
+        " where oid = 'pg_temp.ct911'::regtype) = pg_my_temp_schema(),"
+        " pg_my_temp_schema() = 0",
+    ) == [(True, False)]

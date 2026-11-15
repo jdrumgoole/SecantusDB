@@ -6491,7 +6491,8 @@ impl PgHandler {
                 .unwrap_or_else(|_| self.relations());
             secantus_pgplan::set_user_relations(relations);
         } else {
-            secantus_pgplan::defer_user_relations(self.relations_derivation());
+            let (build, temp_outside_keys) = self.relations_derivation();
+            secantus_pgplan::defer_user_relations(build, temp_outside_keys);
         }
         // `pg_relation_is_publishable`'s tables, listed when a statement
         // first asks (RP-911), from the catalog documents read now.
@@ -12879,7 +12880,7 @@ impl PgHandler {
     /// Every table with a relation oid, as `(stored name, oid, temp)`, for
     /// the planner's `regclass` resolution.
     pub(crate) fn relations(&self) -> Vec<(String, i64, bool)> {
-        self.relations_derivation()()
+        self.relations_derivation().0()
     }
 
     /// [`Self::relations`] as a derivation over the catalog read now, for
@@ -12887,7 +12888,9 @@ impl PgHandler {
     /// listing every composite for each catalog version grew the statement
     /// after any DDL with the schema, where PostgreSQL reads `pg_class` by
     /// name only for a relation it is asked about.
-    fn relations_derivation(&self) -> impl FnOnce() -> Vec<(String, i64, bool)> + 'static {
+    /// With whether a temp sequence or a standalone temp composite is
+    /// among them, which the relation keys do not hold.
+    fn relations_derivation(&self) -> (impl FnOnce() -> Vec<(String, i64, bool)> + 'static, bool) {
         let docs = self.type_catalog_docs(Self::COMPOSITE_COLLECTION);
         let defs = self.shared_table_defs().unwrap_or_default();
         let indexes = self.index_relations();
@@ -12910,7 +12913,16 @@ impl PgHandler {
                 (name, oid)
             })
             .collect();
-        move || {
+        let temp_prefix = format!("{}.", self.temp_schema_name());
+        let temp_outside_keys = sequences.iter().any(|(n, _)| n.starts_with(&temp_prefix))
+            || docs.as_ref().is_ok_and(|docs| {
+                docs.iter().any(|d| {
+                    d.get_str("_id").is_ok_and(|n| {
+                        n.starts_with(&temp_prefix) && !defs.iter().any(|t| t.name == n)
+                    })
+                })
+            });
+        let build = move || {
             let Ok(docs) = docs else {
                 return Vec::new();
             };
@@ -12944,7 +12956,8 @@ impl PgHandler {
                 .chain(views.into_iter().map(|(name, oid)| (name, oid, false)))
                 .chain(sequences.into_iter().map(|(name, oid)| (name, oid, false)))
                 .collect()
-        }
+        };
+        (build, temp_outside_keys)
     }
 
     /// A composite's RELATION oid (`pg_class.oid`, `pg_type.typrelid`). A

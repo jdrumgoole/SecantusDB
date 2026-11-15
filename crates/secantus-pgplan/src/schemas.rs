@@ -150,13 +150,23 @@ fn session_has_temp() -> bool {
     }
     let has = temp_schema().is_some_and(|t| {
         let prefix = format!("{t}.");
-        RELATION_KEYS.with(|k| k.borrow().iter().any(|n| n.starts_with(&prefix)))
-            || crate::deferred::read(&PLAN_USER_RELATIONS, |r| {
-                r.iter().any(|(n, _, _)| n.starts_with(&prefix))
-            })
+        TEMP_OUTSIDE_KEYS.with(std::cell::Cell::get)
+            || RELATION_KEYS.with(|k| k.borrow().iter().any(|n| n.starts_with(&prefix)))
     });
     MEMO.with(|m| m.set(Some((epoch, has))));
     has
+}
+
+thread_local! {
+    /// Whether a relation in the temp schema is published that the
+    /// relation keys do not hold (see `defer_user_relations`).
+    static TEMP_OUTSIDE_KEYS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Record whether a temp relation lies outside the relation keys.
+pub(crate) fn set_temp_outside_keys(has: bool) {
+    bump_resolve_epoch();
+    TEMP_OUTSIDE_KEYS.with(|t| t.set(has));
 }
 
 /// Install every relation's catalog key for the statements that follow.
