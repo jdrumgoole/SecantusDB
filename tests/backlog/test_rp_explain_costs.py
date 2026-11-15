@@ -4526,8 +4526,11 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
     ),
     # A chain of three tables' Nested Loops: still unannotated below the
     # top join (RP-390's remainder).
+    # Split from RP-390 and fixed: a chain of plain nested loops counts
+    # each lower join's rows by running its filter over its pairs (only
+    # the top join printed counts).
     "analyze of a nested loop of three relations": (
-        "RP-390",
+        "RP-389",
         _ANALYSED_INDEXED_SMALL,
         "explain (analyze, costs off, timing off, summary off)"
         " select * from z join z z2 on z.a < z2.a join z z3 on z2.a < z3.a",

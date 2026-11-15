@@ -4275,6 +4275,27 @@ fn a_pair_expression_pads_a_char_n_column() {
     assert_eq!(apply_row_expr(&qual, &d).unwrap(), Bson::Boolean(true));
 }
 
+/// A join qual over a chain of relations reads each alias's row under
+/// its own prefix, and refuses an alias not in the chain (RP-390).
+#[test]
+fn a_relations_expression_reads_each_aliass_row() {
+    let z = TableDef::new("z", vec![Column::new("a", "int4", false)]);
+    let rels = [("z", "r0.", &z), ("z2", "r1.", &z), ("z3", "r2.", &z)];
+    let qual = plan_relations_expression("((z.a < z2.a) and (z2.a < z3.a))", &rels).unwrap();
+    let row = |a: i32, b: i32, c: i32| {
+        let f = z.columns[0].field();
+        let mut d = Document::new();
+        d.insert(format!("r0.{f}"), a);
+        d.insert(format!("r1.{f}"), b);
+        d.insert(format!("r2.{f}"), c);
+        apply_row_expr(&qual, &d).unwrap()
+    };
+    assert_eq!(row(1, 2, 3), Bson::Boolean(true));
+    assert_eq!(row(1, 3, 2), Bson::Boolean(false));
+    assert!(plan_relations_expression("(z.a < x.a)", &rels).is_err());
+    assert!(plan_relations_expression("(z.a < 1)", &[("z", "a.", &z), ("z", "b.", &z)]).is_err());
+}
+
 /// EXPLAIN analyses its statement before it reads an option, as
 /// `transformExplainStmt` runs before `ExplainQuery` (RP-419). Each answer
 /// was measured on PostgreSQL 15.19.

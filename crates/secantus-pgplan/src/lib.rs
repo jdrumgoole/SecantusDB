@@ -14150,6 +14150,30 @@ pub fn plan_pair_expression(
     if outer.0 == inner.0 {
         return Err(Error::Unsupported("a join of one alias to itself".into()));
     }
+    plan_relations_expression(
+        expression,
+        &[
+            (outer.0, PAIR_OUTER_PREFIX, outer.1),
+            (inner.0, PAIR_INNER_PREFIX, inner.1),
+        ],
+    )
+}
+
+/// Plan a join qual's text over any number of relations, each `(alias,
+/// prefix, def)`: every `alias.col` becomes that relation's column under
+/// its `prefix`, so `apply_row_expr` evaluates it over a document holding
+/// each relation's row under its own prefix (a join tree's joined tuple,
+/// RP-390). An unqualified reference, or one to an alias not listed, is
+/// refused, as is an alias listed twice.
+pub fn plan_relations_expression(
+    expression: &str,
+    relations: &[(&str, &str, &TableDef)],
+) -> Result<ColumnExpr> {
+    for (i, r) in relations.iter().enumerate() {
+        if relations[..i].iter().any(|o| o.0 == r.0) {
+            return Err(Error::Unsupported("a join of one alias to itself".into()));
+        }
+    }
     let N::SelectStmt(mut sel) = parse_one(&format!("SELECT {expression}"))? else {
         return Err(Error::Parse("join qual is not an expression".into()));
     };
@@ -14169,11 +14193,7 @@ pub fn plan_pair_expression(
         let (Some(alias), Some(column), 2) = (name(0), name(1), c.fields.len()) else {
             return Err(Error::Unsupported("an unqualified join column".into()));
         };
-        let prefix = if alias == outer.0 {
-            PAIR_OUTER_PREFIX
-        } else if alias == inner.0 {
-            PAIR_INNER_PREFIX
-        } else {
+        let Some((_, prefix, _)) = relations.iter().find(|r| r.0 == alias) else {
             return Err(Error::Unsupported(format!("a column of {alias}")));
         };
         *n = N::ColumnRef(pg_query::protobuf::ColumnRef {
@@ -14188,11 +14208,12 @@ pub fn plan_pair_expression(
     })?;
     let mut fields: Vec<RowField> = Vec::new();
     let mut sample = Document::new();
-    for (prefix, def) in [(PAIR_OUTER_PREFIX, outer.1), (PAIR_INNER_PREFIX, inner.1)] {
+    for (_, prefix, def) in relations {
         for c in def.columns.iter() {
             let field = format!("{prefix}{}", c.field());
             // A char(n) column's width, keyed by its prefixed field, so the
-            // pair's value is blank-padded as the column's own is (RP-390).
+            // joined row's value is blank-padded as the column's own is
+            // (RP-390).
             ROW_WIDTHS.with(|w| {
                 let mut w = w.borrow_mut();
                 if matches!(c.pg_type.as_str(), "bpchar" | "bpchar[]") && c.typmod > 4 {
