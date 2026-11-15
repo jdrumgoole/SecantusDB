@@ -2865,16 +2865,6 @@ compressed column, placed by mongod's bucket catalog
       decided 2026-10-16) does not depend on it and is built.
       Verify: tests/backlog/test_rm_found_2026_11_11_rm088.py::test_server_status_reports_the_bucket_catalog
       Backlog-ID: RM-549
-- [ ] **RUST MongoDB server: a measurement holding a BSONColumn binary
-      is stored** (found 2026-11-09 while building the bucket encoder).
-      mongod 8.2.11 refuses a measurement whose data field is, or holds at
-      any depth, a binary of subtype 7: `12506300`, `time-series insert
-      failed: <ns> :: caused by :: Timeseries collections cannot store
-      BSONColumn data`, and stores nothing; this server inserts it. The
-      check is `BSONColumnBuilder::append`'s, so it covers the data fields
-      only (the meta field is not appended to a column; not measured).
-      Backlog-ID: RM-462
-      Verify: tests/backlog/test_rm_462.py::test_a_measurement_cannot_hold_a_bsoncolumn
 - **Scope decision — a `hashed` index on a time-series collection** is
   refused as on any collection: hashed indexes are out of scope.
 - **Scope decision — `listCollections` order around time-series buckets.**

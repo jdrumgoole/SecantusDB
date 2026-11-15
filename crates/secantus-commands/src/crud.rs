@@ -1110,6 +1110,23 @@ pub fn insert(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
             }
             continue;
         }
+        if ts_fields
+            .as_ref()
+            .is_some_and(|f| crate::timeseries::holds_bson_column(d, f))
+        {
+            pre_errors.push(doc! {
+                "index": index as i32,
+                "code": 12506300,
+                "errmsg": format!(
+                    "time-series insert failed: {db}.{coll} :: caused by :: Timeseries \
+                     collections cannot store BSONColumn data"
+                ),
+            });
+            if ordered {
+                break;
+            }
+            continue;
+        }
         // Collection validator (code 121, DocumentValidationFailure). mongod
         // attaches an `errInfo` (failingDocumentId + per-operator details) that
         // drivers' errorResponse tests read; mirror it.

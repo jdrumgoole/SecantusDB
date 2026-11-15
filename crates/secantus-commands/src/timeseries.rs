@@ -279,6 +279,23 @@ pub(crate) fn measurement_problem(doc: &Document, fields: &Fields) -> Option<Str
     }
 }
 
+/// Whether a measurement's data fields hold, at any depth, a binary of
+/// subtype 7 (BSONColumn), which mongod 8.2.11 refuses (code 12506300) from
+/// `BSONColumnBuilder::append`. The meta field is not appended to a column.
+pub(crate) fn holds_bson_column(doc: &Document, fields: &Fields) -> bool {
+    fn column(v: &Bson) -> bool {
+        match v {
+            Bson::Binary(b) => u8::from(b.subtype) == 7,
+            Bson::Document(d) => d.values().any(column),
+            Bson::Array(a) => a.iter().any(column),
+            _ => false,
+        }
+    }
+    doc.iter()
+        .filter(|(k, _)| fields.meta.as_deref() != Some(k.as_str()))
+        .any(|(_, v)| column(v))
+}
+
 /// Whether `path` is the meta field or a path inside it.
 fn in_meta(path: &str, meta: &str) -> bool {
     path == meta
