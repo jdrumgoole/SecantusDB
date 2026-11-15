@@ -2207,7 +2207,53 @@ impl Drop for NestedStatement<'_> {
     }
 }
 
+impl PgHandler {
+    /// A notice's CONTEXT: `own` (the raising statement's lines, when it
+    /// is on no frame) and then each PL/pgSQL statement running, innermost
+    /// first, as `error_context_stack` collects them.
+    pub(crate) fn pl_context(&self, own: Option<String>) -> Option<String> {
+        let frames = self.pl_frames.lock().unwrap_or_else(|e| e.into_inner());
+        let mut ctx = own.unwrap_or_default();
+        for f in frames.iter().rev() {
+            if !ctx.is_empty() {
+                ctx.push('\n');
+            }
+            ctx.push_str(f);
+        }
+        (!ctx.is_empty()).then_some(ctx)
+    }
+
+    /// Enter a PL/pgSQL statement whose CONTEXT lines are `frame`.
+    pub(crate) fn push_pl_frame(&self, frame: String) {
+        self.pl_frames
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(frame);
+    }
+
+    pub(crate) fn pop_pl_frame(&self) {
+        self.pl_frames
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .pop();
+    }
+}
+
 impl plpgsql_fn::Host for PlHost<'_> {
+    fn push_frame(&self, frame: String) {
+        self.h.push_pl_frame(frame);
+    }
+    fn swap_frame(&self, frame: String) -> String {
+        let mut frames = self.h.pl_frames.lock().unwrap_or_else(|e| e.into_inner());
+        match frames.last_mut() {
+            Some(top) => std::mem::replace(top, frame),
+            None => frame,
+        }
+    }
+    fn pop_frame(&self) {
+        self.h.pop_pl_frame();
+    }
+
     fn percent_type(&self, words: &[String]) -> Option<String> {
         self.h.install_user_types();
         secantus_pgplan::plpgsql_percent_type_outer(words, &|n| self.h.lookup(n))
@@ -2607,6 +2653,9 @@ impl plpgsql_fn::Host for PlHost<'_> {
         let mut info = ErrorInfo::new(severity.into(), sqlstate.into(), message);
         info.detail = detail;
         info.hint = hint;
+        // `plpgsql_exec_error_callback` frames every `ereport`, a notice's
+        // too: the statement raising it, then each caller's.
+        info.where_context = self.h.pl_context(None);
         self.h
             .pending_notices
             .lock()
@@ -4334,6 +4383,10 @@ pub struct PgHandler {
     /// `RAISE NOTICE` / `WARNING` / `INFO`), sent to the client by the query
     /// handlers before the statement's own result or error.
     pending_notices: Mutex<Vec<ErrorInfo>>,
+    /// The PL/pgSQL statements running, outermost first, each as its
+    /// CONTEXT lines (`SQL statement "..."` then `PL/pgSQL function ...
+    /// line N at ...`): the `error_context_stack` a notice is framed by.
+    pl_frames: Mutex<Vec<String>>,
     /// The texts `apply_string_syntax` rewrote, newest last: (rewritten,
     /// as sent, the map between them), so an error positioned in the
     /// rewritten text is reported where the client wrote it.
@@ -5130,6 +5183,7 @@ impl PgHandler {
             block_scans: Mutex::new(Vec::new()),
             settings: Arc::new(Mutex::new(GucMap::from(default_settings()))),
             pending_notices: Mutex::new(Vec::new()),
+            pl_frames: Mutex::new(Vec::new()),
             string_maps: Mutex::new(Vec::new()),
             live_notices: Mutex::new(None),
             pending_params: Mutex::new(Vec::new()),

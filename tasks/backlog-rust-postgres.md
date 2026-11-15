@@ -3031,17 +3031,22 @@ Measured on a private, freshly initdb'd PostgreSQL 15.19 cluster with the
 Measured on PostgreSQL 15.19; none of it needs DDL. The gap tests are in
 `tests/backlog/test_rp_found_rp751.py`.
 
-- [ ] **A RAISE below ERROR carries no CONTEXT.** `do $$ declare x int;
-      begin raise notice 'm'; end $$` notices `m` with CONTEXT
-      `PL/pgSQL function inline_code_block line 1 at RAISE` on PostgreSQL
-      15.19 (`plpgsql_exec_error_callback` runs for every `ereport`, a
-      notice's included); here the NOTICE, WARNING or INFO has no
-      CONTEXT. An error raised there carries the frame already; a notice
-      needs the interpreter's current statement and the frames of the
-      callers above it (`SQL statement "..."`, the calling function's
-      line) as an error collects them on the way out.
-      Verify: tests/backlog/test_rp_found_rp751.py::test_a_notice_carries_its_context
-      Backlog-ID: RP-833
+
+## Found while working RP-833 (2026-11-15)
+
+Measured on PostgreSQL 15.19 (the shared reference on port 5415). The gap
+test is in `tests/backlog/test_rp_found_rp833.py`.
+
+- [ ] **A function in `pg_temp` is labelled without its schema.** A RAISE
+      in `pg_temp.f833()` carries CONTEXT `PL/pgSQL function
+      pg_temp_3.f833() line 1 at RAISE` on PostgreSQL 15.19:
+      `plpgsql_compile` labels a function by `format_procedure`, which
+      qualifies one whose schema is not on the search path, and `pg_temp`
+      is searched for no function. Here it is `f833()`
+      (`function_label` in `plpgsql_fn.rs` reads the CREATE text's bare
+      name); the same label frames an error.
+      Verify: tests/backlog/test_rp_found_rp833.py::test_a_pg_temp_function_is_labelled_with_its_schema
+      Backlog-ID: RP-1018
 
 ## Found while working RP-689 (2026-11-10)
 

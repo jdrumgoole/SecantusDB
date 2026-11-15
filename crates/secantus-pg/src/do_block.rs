@@ -189,7 +189,15 @@ impl PgHandler {
             .swap(false, std::sync::atomic::Ordering::Relaxed);
         // The statement's own text is its source (RP-203), as SPI parses it.
         let outer_source = self.enter_statement_source(sql);
+        // A notice raised while it runs is framed by it, as an error is.
+        let frame = if is_expr {
+            format!("SQL expression \"{}\"", &sql["SELECT ".len()..])
+        } else {
+            format!("SQL statement \"{sql}\"")
+        };
+        self.push_pl_frame(format!("{frame}\n{}", block_context(line, at)));
         let out = Box::pin(self.run_typed(sql, &[], &[], 0)).await;
+        self.pop_pl_frame();
         self.restore_statement_source(outer_source);
         self.binary_results
             .store(binary, std::sync::atomic::Ordering::Relaxed);
@@ -368,7 +376,7 @@ impl PgHandler {
         info.datatype = datatype;
         info.table = table;
         info.schema = schema;
-        info.where_context = Some(block_context(line, "RAISE"));
+        info.where_context = self.pl_context(Some(block_context(line, "RAISE")));
         if level == Level::Exception {
             return Err(PgWireError::UserError(Box::new(info)));
         }

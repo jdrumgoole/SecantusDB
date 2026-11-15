@@ -188,6 +188,18 @@ pub trait Host {
     fn query(&self, sql: &str, params: &[Bson], types: &[String]) -> Result<QueryOut, PlError>;
     /// Run a statement for its effect; answers the rows it affected.
     fn execute(&self, sql: &str, params: &[Bson], types: &[String]) -> Result<u64, PlError>;
+    /// Enter a statement: `frame` is its CONTEXT lines, outermost last,
+    /// for a notice raised while it runs.
+    fn push_frame(&self, frame: String) {
+        let _ = frame;
+    }
+    /// Replace the running function's frame with the statement it now
+    /// runs; answers the frame it replaced.
+    fn swap_frame(&self, frame: String) -> String {
+        frame
+    }
+    /// Leave the statement `push_frame` entered.
+    fn pop_frame(&self) {}
     /// A `RAISE` below ERROR: its severity, SQLSTATE and message, with
     /// the DETAIL and HINT its `USING` options gave.
     fn notice(
@@ -431,6 +443,8 @@ enum Flow {
 type ExpressionTypes = HashMap<(String, Vec<String>), Option<String>>;
 
 struct Interp<'a> {
+    /// Statements of this function running, nested (`notice_frame`).
+    stmt_depth: usize,
     datums: Vec<Datum>,
     /// The datum of each argument, in declared order, for `$n`.
     arg_slots: Vec<usize>,
@@ -1350,6 +1364,7 @@ pub fn run(create_sql: &str, inv: Invocation<'_>, host: &dyn Host) -> Result<Out
         }
     }
     let mut interp = Interp {
+        stmt_depth: 0,
         conflict_error: variable_conflict_is_error(create_sql),
         datums,
         arg_slots,
@@ -3138,6 +3153,27 @@ impl Interp<'_> {
         }
     }
 
+    /// The CONTEXT lines a notice raised inside statement `kind` carries
+    /// for it: the `SQL statement "..."` it runs, then this function's line.
+    fn notice_frame(&self, kind: &str, body: &Value) -> String {
+        let line = body.get("lineno").and_then(Value::as_u64).unwrap_or(0);
+        let func = format!(
+            "PL/pgSQL function {} line {line} at {}",
+            self.label,
+            stmt_typename(kind, body)
+        );
+        let key = match kind {
+            "PLpgSQL_stmt_execsql" => "sqlstmt",
+            "PLpgSQL_stmt_perform" => "expr",
+            "PLpgSQL_stmt_return_query" | "PLpgSQL_stmt_fors" => "query",
+            _ => return func,
+        };
+        match body.get(key).and_then(|q| expr_query(q)) {
+            Some((t, _)) => format!("SQL statement \"{t}\"\n{func}"),
+            None => func,
+        }
+    }
+
     /// Run one statement; an error leaving it gets this function's CONTEXT
     /// frame (`PL/pgSQL function f() line N at RETURN`), plus the
     /// `SQL statement "..."` frame of a statement it ran.
@@ -3145,7 +3181,30 @@ impl Interp<'_> {
         let Some((kind, body)) = s.as_object().and_then(|o| o.iter().next()) else {
             return Ok(Flow::Next);
         };
+        // `estate->err_stmt`: one frame per function, naming the statement
+        // it runs now, the innermost of nested ones.
+        let framed = kind != "PLpgSQL_stmt_block";
+        let outer = framed.then(|| {
+            let frame = self.notice_frame(kind, body);
+            self.stmt_depth += 1;
+            if self.stmt_depth == 1 {
+                self.host.push_frame(frame);
+                None
+            } else {
+                Some(self.host.swap_frame(frame))
+            }
+        });
         let out = self.stmt_inner(s);
+        match outer {
+            Some(Some(prev)) => {
+                self.host.swap_frame(prev);
+            }
+            Some(None) => self.host.pop_frame(),
+            None => {}
+        }
+        if framed {
+            self.stmt_depth -= 1;
+        }
         let Err(mut e) = out else {
             return out;
         };
