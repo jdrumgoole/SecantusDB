@@ -1959,35 +1959,6 @@ a regression test.
       cluster (found while working RP-393 and RP-397).
       Verify: tests/backlog/test_rp_explain_costs.py::test_plan[analyze of an inner join under an outer join with a one-table ON conjunct], tests/backlog/test_rp_explain_costs.py::test_plan[a left join's ON conjunct over a table of an inner join it null-extends]
       Backlog-ID: RP-978
-- [ ] **A LEFT join on an indexed key prints a Hash join where PostgreSQL
-      merges through the index.** `select * from s left join k on s.a =
-      k.a` (`k.a` the primary key) is, in PostgreSQL 15.19, a `Merge Right
-      Join` on `(k.a = s.a)` over `Index Scan using k_pkey on k` and a
-      Sort of `s` (cost 2.31..4.13); here a `Hash Right Join` over a `Seq
-      Scan on k` (cost 1.68..20.73), the same with a filter on `k`, and an
-      inner join of the two is a `Hash Join` where PostgreSQL's is a
-      `Merge Join`. The join search does not price a merge join whose
-      sorted input is an index scan. Its rows are right; the order they
-      come out in may not be. Measured on a private 15.19 cluster (found
-      while working RP-395).
-      Sized 2026-11-15 (working RP-908): the join IS weighed against a
-      merge through `k_pkey` -- `hash_join_of` (both the joined-rows and
-      the narrow path reach it) calls `unique_key_other_paths`, which
-      builds the merge paths through `JoinRel::add_paths_general` -- but
-      those merges read every input WHOLE: no `mergejoinscansel` is applied
-      to an index-ordered input, so the index scan costs its full 43.27
-      where PostgreSQL's merge stops at `k.a = 30` (outer end fraction
-      ~0.03: 0.28 + 2.04 startup, 4.13 total), and the 20.73 hash wins.
-      The fix is `initial_cost_mergejoin`'s scan fractions in the general
-      merge paths (shared with the multi-table search in `join_search.rs`,
-      so expect pinned plans to move), then a `JoinPick` for a merge with
-      one side presorted by its index, which `explain::price_merge_join`
-      draws with no Sort on that side. The same plan is wrong for `s join
-      k on s.a = k.a` (PostgreSQL: `Merge Join`, cost 2.31..4.13) and with
-      `where k.b = 'v1'` (`Merge Join` 2.31..3.86, its index scan
-      filtered); both print a priced Hash Join here.
-      Backlog-ID: RP-401
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a left join on a primary key merges through its index]
 - [ ] **A nested loop into an index prints no estimate where the inner
       side's own range on the indexed key joins its Index Cond.**
       PostgreSQL 15.19 plans `explain select * from e left join k on e.a <

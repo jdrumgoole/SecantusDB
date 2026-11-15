@@ -4566,9 +4566,10 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
         "explain (costs off) select * from e where not (a between 15 and 55)",
         ["Seq Scan on e", "  Filter: ((a < 15) OR (a > 55))"],
     ),
-    # A LEFT join on an indexed key is a Merge Right Join reading the
-    # index in key order, its other side sorted (found while working
-    # RP-395).
+    # A LEFT join on an indexed key was a Hash Right Join; it is the Merge
+    # Right Join reading the index in key order, its other side sorted,
+    # the merge stopping at the other side's largest key
+    # (`mergejoinscansel`, RP-401, fixed).
     "a left join on a primary key merges through its index": (
         "RP-401",
         _ANALYSED_THIRTY,
@@ -4580,6 +4581,48 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "  ->  Sort",
             "        Sort Key: s.a",
             "        ->  Seq Scan on s",
+        ],
+    ),
+    # Its costs, and the inner join's, with and without a filter on the
+    # indexed side (RP-401, fixed).
+    "a left join on a primary key merges through its index, priced": (
+        "RP-401",
+        _ANALYSED_THIRTY,
+        "explain select * from s left join k on s.a = k.a",
+        [
+            "Merge Right Join  (cost=2.31..4.13 rows=30 width=27)",
+            "  Merge Cond: (k.a = s.a)",
+            "  ->  Index Scan using k_pkey on k  (cost=0.28..43.27 rows=1000 width=7)",
+            "  ->  Sort  (cost=2.04..2.11 rows=30 width=20)",
+            "        Sort Key: s.a",
+            "        ->  Seq Scan on s  (cost=0.00..1.30 rows=30 width=20)",
+        ],
+    ),
+    "an inner join on a primary key merges through its index": (
+        "RP-401",
+        _ANALYSED_THIRTY,
+        "explain select * from s join k on s.a = k.a",
+        [
+            "Merge Join  (cost=2.31..4.13 rows=30 width=27)",
+            "  Merge Cond: (k.a = s.a)",
+            "  ->  Index Scan using k_pkey on k  (cost=0.28..43.27 rows=1000 width=7)",
+            "  ->  Sort  (cost=2.04..2.11 rows=30 width=20)",
+            "        Sort Key: s.a",
+            "        ->  Seq Scan on s  (cost=0.00..1.30 rows=30 width=20)",
+        ],
+    ),
+    "an inner join on a primary key merges through its filtered index": (
+        "RP-401",
+        _ANALYSED_THIRTY,
+        "explain select * from s join k on s.a = k.a where k.b = 'v1'",
+        [
+            "Merge Join  (cost=2.31..3.86 rows=3 width=27)",
+            "  Merge Cond: (k.a = s.a)",
+            "  ->  Index Scan using k_pkey on k  (cost=0.28..45.77 rows=100 width=7)",
+            "        Filter: (b = 'v1'::text)",
+            "  ->  Sort  (cost=2.04..2.11 rows=30 width=20)",
+            "        Sort Key: s.a",
+            "        ->  Seq Scan on s  (cost=0.00..1.30 rows=30 width=20)",
         ],
     ),
     # Two different constants equal to one column of a joined table made
@@ -5822,6 +5865,7 @@ def _marked(name: str, item: str) -> Any:
         "RP-396",
         "RP-398",
         "RP-399",
+        "RP-401",
         "RP-402",
         "RP-403",
         "RP-404",
