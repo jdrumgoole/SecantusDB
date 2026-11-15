@@ -268,13 +268,13 @@ def test_a_sort_over_an_or_with_a_fetched_branch_sorts_below_the_fetch(
     assert rows["rust"] == rows["mongod"]
 
 
-@pytest.mark.backlog("RM-576")
+@pytest.mark.backlog_fixed("RM-576")
 def test_a_rooted_ors_plan_summary_names_each_branchs_index(rust_mongo: Any, mongod: Any) -> None:
     """mongod 8.2.11's profile entry for `{$or: [{a: {$gte: 2}, b: {$gte:
     3}}, {a: 0, b: 0}]}` over `a_1` and `b_1` names the index each branch
     won with: `IXSCAN { a: 1 }, IXSCAN { b: 1 }`. This server's explain
-    names the same two, but its profile entry says `IXSCAN { a: 1 }, IXSCAN
-    { a: 1 }`."""
+    named the same two, but its profile entry said `IXSCAN { a: 1 }, IXSCAN
+    { a: 1 }`, planned again from the catalog alone."""
 
     def run(client: Any) -> Any:
         db = client["rm_found_471_" + uuid.uuid4().hex[:8]]

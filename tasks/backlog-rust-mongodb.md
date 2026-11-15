@@ -728,14 +728,6 @@ These are explicit non-goals. Don't add them without a reason.
       (RM-472).
       Verify: tests/backlog/test_rm_found_rm472.py::test_a_near_read_explains_as_geo_near_2d
       Backlog-ID: RM-578
-- [ ] **A rooted `$or`'s profile `planSummary` names one index twice.**
-      mongod 8.2.11's profile entry for `{$or: [{a: {$gte: 2}, b: {$gte:
-      3}}, {a: 0, b: 0}]}` over `a_1` and `b_1` says `IXSCAN { a: 1 },
-      IXSCAN { b: 1 }`, the index each branch won with. This server's
-      explain names the same two, but its profile entry says `IXSCAN { a: 1
-      }, IXSCAN { a: 1 }`. Found 2026-11-12 (RM-471).
-      Verify: tests/backlog/test_rm_found_rm471.py::test_a_rooted_ors_plan_summary_names_each_branchs_index
-      Backlog-ID: RM-576
 - [ ] **Some lines have no `numInterruptChecks`.** Since 2026-11-08 this
       server checks for interrupt where mongod 8.2 does, and counts it
       (`secantus_core::deadline::check_for_interrupt`): at dispatch, at

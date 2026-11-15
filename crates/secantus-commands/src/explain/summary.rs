@@ -102,6 +102,25 @@ fn leaves(stage: &Document, buckets: Option<&Layout>, out: &mut Vec<String>) {
     });
 }
 
+/// The `planSummary` of `plan`, the plan a read of `coll` on `db` ran:
+/// its leaves, named as [`leaves`] names them. A read that chose its plan
+/// by trial names the plan that won, which the catalog alone cannot say
+/// (RM-576: mongod 8.2.11 names each `$or` branch's winning index).
+pub(crate) fn summary_of_plan(
+    plan: &Node,
+    storage: &dyn crate::storage::Storage,
+    db: &str,
+    coll: &str,
+) -> Option<String> {
+    let buckets = storage
+        .get_collection_options(db, coll)
+        .ok()
+        .and_then(|options| Layout::of(&options));
+    let mut out = Vec::new();
+    leaves(&plan.to_doc(None), buckets.as_ref(), &mut out);
+    (!out.is_empty()).then(|| out.join(", "))
+}
+
 /// The `planSummary` for `request`, or `None` for a command with no plan.
 pub(crate) fn plan_summary(request: &Document, ctx: &CommandContext) -> Option<String> {
     match ctx.storage().ok() {
