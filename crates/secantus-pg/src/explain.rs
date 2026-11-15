@@ -1181,6 +1181,74 @@ fn outer_first(n: &PlanNode, c: &str) -> Option<bool> {
     }
 }
 
+/// A nested loop's ON conjuncts in the order PostgreSQL lists them
+/// (RP-920): `build_joinrel_restrictlist` takes the outer rel's `joininfo`
+/// first, and a join rel's `joininfo` holds its base rels' clauses in
+/// the order of its own outer and inner sides, so each conjunct goes by
+/// the first relation of the outer subtree it names, ties kept in ON
+/// order (`order_qual_clauses` is stable). Anything not a plain AND of
+/// parenthesised conjuncts, each naming an outer relation, is left as is.
+fn joininfo_order(n: &PlanNode, c: &str) -> String {
+    let Some(inner) = c.strip_prefix('(').and_then(|t| t.strip_suffix(')')) else {
+        return c.to_string();
+    };
+    if !(inner.starts_with('(') && inner.ends_with(')') && inner.contains(") AND (")) {
+        return c.to_string();
+    }
+    if n.children.len() != 2 {
+        return c.to_string();
+    }
+    let parts: Vec<&str> = inner.split(" AND ").collect();
+    if parts
+        .iter()
+        .any(|p| !(p.starts_with('(') && p.ends_with(')')))
+    {
+        return c.to_string();
+    }
+    let mut outer = Vec::new();
+    relation_names(&n.children[0], &mut outer);
+    let mut keyed = Vec::new();
+    for p in &parts {
+        let quals = qualifiers(p);
+        let Some(rank) = outer.iter().position(|o| quals.contains(o)) else {
+            return c.to_string();
+        };
+        keyed.push((rank, *p));
+    }
+    keyed.sort_by_key(|k| k.0);
+    let parts: Vec<&str> = keyed.into_iter().map(|(_, p)| p).collect();
+    format!("({})", parts.join(" AND "))
+}
+
+/// The qualifiers of the qualified columns in a printed expression: each
+/// `name` of a `name.column` outside a string literal.
+fn qualifiers(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let b = text.as_bytes();
+    let word = |c: u8| c.is_ascii_alphanumeric() || c == b'_';
+    let mut i = 0;
+    let mut quoted = false;
+    while i < b.len() {
+        if b[i] == b'\'' {
+            quoted = !quoted;
+            i += 1;
+            continue;
+        }
+        if !quoted && word(b[i]) && (i == 0 || !word(b[i - 1]) && b[i - 1] != b'.') {
+            let start = i;
+            while i < b.len() && word(b[i]) {
+                i += 1;
+            }
+            if i < b.len() && b[i] == b'.' && !b[start].is_ascii_digit() {
+                out.push(text[start..i].to_string());
+            }
+            continue;
+        }
+        i += 1;
+    }
+    out
+}
+
 /// The names a subtree's scans go by in a qualified column: each scan's
 /// alias, or its relation's name when it has none.
 fn relation_names(n: &PlanNode, out: &mut Vec<String>) {
@@ -2213,6 +2281,12 @@ pub(crate) fn attach_join_conds(
         }
         if let Some(c) = conds.get(*next) {
             if !c.is_empty() && !n.skip_cond {
+                let c = if label == "Join Filter" {
+                    joininfo_order(n, c)
+                } else {
+                    c.clone()
+                };
+                let c = &c;
                 let c = match outer_first(n, c) {
                     Some(true) => commute_equality(c).unwrap_or_else(|| c.clone()),
                     Some(false) => c.clone(),
@@ -2474,6 +2548,25 @@ pub(crate) fn attach_join_where(
 #[cfg(test)]
 mod cost_tests {
     use super::*;
+
+    #[test]
+    fn a_nested_loops_conjuncts_follow_its_outer_relations() {
+        let scan = |rel: &str, alias: &str| {
+            let mut n = PlanNode::new(format!("Seq Scan on {rel} {alias}"));
+            n.props.push(("Relation Name".into(), rel.into()));
+            n.props.push(("Alias".into(), alias.into()));
+            n
+        };
+        let mut lower = PlanNode::new("Nested Loop");
+        lower.children = vec![scan("e", "e"), scan("e", "e2")];
+        let mut top = PlanNode::new("Nested Loop");
+        top.children = vec![lower, scan("e", "e3")];
+        assert_eq!(
+            joininfo_order(&top, "((e2.a < e3.a) AND (e.a < e3.a))"),
+            "((e.a < e3.a) AND (e2.a < e3.a))"
+        );
+        assert_eq!(joininfo_order(&top, "(e2.a < e3.a)"), "(e2.a < e3.a)");
+    }
 
     #[test]
     fn a_node_prints_its_estimate_or_zeros() {

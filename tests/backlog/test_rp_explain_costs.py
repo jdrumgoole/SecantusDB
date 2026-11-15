@@ -2250,9 +2250,9 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "        ->  Seq Scan on e e3  (cost=0.00..15.00 rows=1000 width=7)",
         ],
     ),
-    # Still open: the upper join's clauses print in the order of the
-    # lower join's tables' join lists (`build_joinrel_restrictlist`), the
-    # clause to `e` before the one to `e2`; here as the ON wrote them.
+    # Fixed: the upper join's clauses print in the order of the lower
+    # join's tables' join lists (`build_joinrel_restrictlist`), the clause
+    # to `e` before the one to `e2`; before, as the ON wrote them.
     "nested loop of three relations with two clauses above": (
         "RP-920",
         _ANALYSED,
@@ -5456,6 +5456,7 @@ def run(dsn: str, setup: list[str], query: str) -> list[str]:
 def _marked(name: str, item: str) -> Any:
     fixed = item in (
         "RP-314",
+        "RP-920",
         "RP-317",
         "RP-318",
         "RP-319",
