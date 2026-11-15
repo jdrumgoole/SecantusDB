@@ -1970,6 +1970,22 @@ a regression test.
       sorted input is an index scan. Its rows are right; the order they
       come out in may not be. Measured on a private 15.19 cluster (found
       while working RP-395).
+      Sized 2026-11-15 (working RP-908): the join IS weighed against a
+      merge through `k_pkey` -- `hash_join_of` (both the joined-rows and
+      the narrow path reach it) calls `unique_key_other_paths`, which
+      builds the merge paths through `JoinRel::add_paths_general` -- but
+      those merges read every input WHOLE: no `mergejoinscansel` is applied
+      to an index-ordered input, so the index scan costs its full 43.27
+      where PostgreSQL's merge stops at `k.a = 30` (outer end fraction
+      ~0.03: 0.28 + 2.04 startup, 4.13 total), and the 20.73 hash wins.
+      The fix is `initial_cost_mergejoin`'s scan fractions in the general
+      merge paths (shared with the multi-table search in `join_search.rs`,
+      so expect pinned plans to move), then a `JoinPick` for a merge with
+      one side presorted by its index, which `explain::price_merge_join`
+      draws with no Sort on that side. The same plan is wrong for `s join
+      k on s.a = k.a` (PostgreSQL: `Merge Join`, cost 2.31..4.13) and with
+      `where k.b = 'v1'` (`Merge Join` 2.31..3.86, its index scan
+      filtered); both print a priced Hash Join here.
       Backlog-ID: RP-401
       Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a left join on a primary key merges through its index]
 - [ ] **A nested loop into an index prints no estimate where the inner
