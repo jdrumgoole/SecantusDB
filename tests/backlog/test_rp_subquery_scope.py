@@ -617,7 +617,7 @@ def test_using_column_missing_has_no_position(query: str, dsn: str) -> None:
 # Found while working RP-481. `transformFromClauseItem` refuses a USING
 # list that names a column twice (PostgreSQL 15.19, no position); here the
 # join ran.
-@pytest.mark.backlog("RP-857")
+@pytest.mark.backlog_fixed("RP-857")
 def test_using_clause_repeats_a_column(dsn: str) -> None:
     assert answer(dsn, "select * from fs join fe using (a, a)") == (
         "42701",

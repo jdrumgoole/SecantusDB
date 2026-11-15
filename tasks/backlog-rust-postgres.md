@@ -2552,16 +2552,6 @@ Measured on a private PostgreSQL 15.19 cluster. The gap tests are in
       Backlog-ID: RP-471
       Verify: tests/backlog/test_rp_subquery_scope.py::test_aliased_join_plan
 
-## Found while working RP-481 (2026-11-10)
-
-- [ ] **A USING list that names a column twice is not refused.**
-      PostgreSQL 15.19's `transformFromClauseItem` refuses `select * from
-      fs join fe using (a, a)` with 42701 `column name "a" appears more
-      than once in USING clause` (no position); here it runs and returns
-      the join's rows.
-      Verify: tests/backlog/test_rp_subquery_scope.py::test_using_clause_repeats_a_column
-      Backlog-ID: RP-857
-
 ## Found while working RP-479 (2026-11-08)
 
 Measured on a private PostgreSQL 15.19 cluster with `fs(a int, c text)`

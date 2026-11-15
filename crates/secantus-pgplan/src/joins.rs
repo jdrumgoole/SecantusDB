@@ -2831,7 +2831,15 @@ fn build_join(
     let mut merged = Vec::new();
     let mut merged_cols = Vec::new();
     let mut hidden: Vec<String> = Vec::new();
-    for name in &using {
+    for (i, name) in using.iter().enumerate() {
+        // `transformFromClauseItem` refuses a repeated USING name before it
+        // looks the name up in either side (PostgreSQL 15.19, RP-857).
+        if !j.using_clause.is_empty() && using[..i].contains(name) {
+            return Err(Error::Sqlstate(
+                "42701",
+                format!("column name \"{name}\" appears more than once in USING clause"),
+            ));
+        }
         let side = |scope: &Scope, which: &str| -> Result<ScopeCol> {
             let hits: Vec<&ScopeCol> = scope
                 .cols
