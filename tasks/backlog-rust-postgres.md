@@ -3788,16 +3788,6 @@ Measured on PostgreSQL 15.19 (the shared reference on port 5415): every
 statement is VALUES-only and runs there as written. The gap tests are in
 `tests/backlog/test_rp_found_rp854.py`.
 
-- [ ] **An ORDER BY constant that is no integer is not 42601.** `select 1
-      from (values (1)) v(a) order by 2.5` is 42601 `non-integer constant
-      in ORDER BY` at 42 on PostgreSQL 15.19 (`findTargetlistEntrySQL92`),
-      and `select a ... group by a order by 'x'` the same at 53. Here the
-      first is 0A000 `ORDER BY over an expression is not supported yet` and
-      the second returns its row. The GROUP BY half is `group_sql92.rs`
-      (RP-854); a statement with both is answered for its GROUP BY
-      constant until this one is fixed, where PostgreSQL names the ORDER BY.
-      Verify: tests/backlog/test_rp_found_rp854.py::test_a_non_integer_order_by_constant_is_42601
-      Backlog-ID: RP-871
 - [ ] **A window definition's error comes ahead of a GROUP BY or DISTINCT ON
       constant's.** `select count(*) over w from (values (1)) v(a) group by
       2.5 window w as (order by nosuch)` is 42601 `non-integer constant in

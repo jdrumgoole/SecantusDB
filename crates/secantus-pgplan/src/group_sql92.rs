@@ -246,3 +246,47 @@ pub(crate) fn distinct_on_star_positions(
     }
     changed.then_some(out)
 }
+
+/// PostgreSQL's 42601 for an ORDER BY constant that is no integer
+/// (RP-871). `transformSortClause` runs after the FROM list, the select
+/// list, WHERE and HAVING, and before GROUP BY, DISTINCT, LIMIT and the
+/// locking clause, analysing its items in order; so the statement is
+/// planned with those dropped and the ORDER BY cut before the constant,
+/// and an error from that plan raised in the earlier clauses is the
+/// answer. Runs before [`check`], whose GROUP BY error comes after.
+pub(crate) fn check_order_by(
+    s: &SelectStmt,
+    plan: &dyn Fn(&SelectStmt) -> Result<Statement>,
+) -> Result<()> {
+    let refused = s.sort_clause.iter().enumerate().find_map(|(i, item)| {
+        let Some(N::SortBy(sb)) = item.node.as_ref() else {
+            return None;
+        };
+        match sb.node.as_deref().and_then(|n| n.node.as_ref()) {
+            Some(N::AConst(c)) if !matches!(c.val, Some(a_const::Val::Ival(_))) => {
+                Some((c.location, i))
+            }
+            _ => None,
+        }
+    });
+    let Some((at, before)) = refused else {
+        return Ok(());
+    };
+    let mut cut = s.clone();
+    cut.sort_clause = s.sort_clause[..before].to_vec();
+    cut.group_clause.clear();
+    cut.distinct_clause.clear();
+    cut.limit_count = None;
+    cut.limit_offset = None;
+    cut.locking_clause.clear();
+    if let Err(e) = plan(&cut) {
+        if raised_before_group_by(&e) {
+            return Err(e);
+        }
+    }
+    set_error_location(at);
+    Err(Error::Sqlstate(
+        "42601",
+        "non-integer constant in ORDER BY".into(),
+    ))
+}

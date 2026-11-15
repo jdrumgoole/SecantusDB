@@ -28977,6 +28977,9 @@ fn plan_select(
 ) -> Result<Statement> {
     // A cancellation point at every pass: each rewrite below re-enters here.
     cancel::check()?;
+    // An ORDER BY constant that is no integer is 42601, analysed before
+    // GROUP BY (RP-871).
+    group_sql92::check_order_by(s, &|cut| plan_select(cut, lookup, params))?;
     // A GROUP BY constant that is no integer is 42601, after what parse
     // analysis meets before it (RP-854).
     group_sql92::check(s, &|cut| plan_select(cut, lookup, params))?;

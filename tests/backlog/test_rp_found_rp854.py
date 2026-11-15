@@ -1,6 +1,6 @@
 """What working RP-854 (a GROUP BY constant that is no integer) found:
 
-- an ORDER BY constant that is no integer is not 42601;
+- an ORDER BY constant that is no integer was not 42601 (fixed: RP-871);
 - a DISTINCT ON constant that is no integer was not 42601 (fixed: RP-872);
 - a GROUP BY position inside a grouping set or a parenthesised list is
   not read as a position;
@@ -37,19 +37,27 @@ def _answer(dsn: str, query: str) -> object:
             return ("error", e.sqlstate, str(e).splitlines()[0], e.diag.statement_position)
 
 
-@pytest.mark.backlog("RP-871")
+@pytest.mark.backlog_fixed("RP-871")
 @pytest.mark.parametrize(
     ("query", "position"),
     [
         ("select 1 from (values (1)) v(a) order by 2.5", "42"),
         ("select a from (values (1)) v(a) group by a order by 'x'", "53"),
+        ("select 1 from (values (1)) v(a) order by a, 'x'", "45"),
+        ("select 1 from (values (1)) v(a) order by 1.5 desc", "42"),
+        ("select 1 from (values (1)) v(a) group by 2.5 order by 'x'", "55"),
+        ("select a from (values (1)) v(a) order by (-1.5)", "43"),
+        ("select 1 union select 2 order by 'x'", "34"),
+        ("select a, b from (values (1,2)) v(a,b) group by a order by 'x'", "60"),
+        ("select 1 from (values (1)) v(a) order by null nulls first", "42"),
     ],
 )
 def test_a_non_integer_order_by_constant_is_42601(query: str, position: str, dsn: str) -> None:
     """`findTargetlistEntrySQL92` refuses an ORDER BY constant that is no
     integer as 42601 `non-integer constant in ORDER BY` at the constant on
-    PostgreSQL 15.19. Here the first is 0A000 `ORDER BY over an expression
-    is not supported yet`, and the second returns its row."""
+    PostgreSQL 15.19, ahead of a GROUP BY constant's. The first was 0A000
+    `ORDER BY over an expression is not supported yet`, and the second
+    returned its row."""
     assert _answer(dsn, query) == (
         "error",
         "42601",
@@ -195,4 +203,15 @@ def test_an_undefined_column_in_a_grouped_query_is_42703(
         "42703",
         'column "nosuch" does not exist',
         position,
+    )
+
+
+@pytest.mark.backlog_fixed("RP-871")
+def test_an_order_by_item_before_the_constant_fails_first(dsn: str) -> None:
+    """An earlier ORDER BY item's own error came before the constant's."""
+    assert _answer(dsn, "select 1 from (values (1)) v(a) order by nosuch, 'x'") == (
+        "error",
+        "42703",
+        'column "nosuch" does not exist',
+        "42",
     )
