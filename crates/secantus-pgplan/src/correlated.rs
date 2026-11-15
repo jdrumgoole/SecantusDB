@@ -1607,6 +1607,53 @@ pub(crate) fn outer_field_selections(
     Ok(())
 }
 
+/// `(v).a` in a LATERAL subquery, where `v` is a FROM item to its left,
+/// is that item's column `v.a` (RP-705), as `outer_field_selections` reads
+/// it for an expression subquery: PostgreSQL's `transformIndirection`
+/// selects the field of the left item's whole-row Var, which
+/// `ParseFuncOrColumn` turns into the item's own column. `left_column`
+/// answers whether the left side has `v.a`; a name the subquery's own FROM
+/// answers to, or one of its columns, is the subquery's and stays.
+pub(crate) fn lateral_field_selections(
+    s: &mut pg_query::protobuf::SelectStmt,
+    lookup: &dyn Fn(&str) -> Option<TableDef>,
+    left_column: &dyn Fn(&str, &str) -> bool,
+) -> Result<()> {
+    let own = level_names(s);
+    let ctes = VISIBLE_CTES.with(|v| v.borrow().clone());
+    let mut own_columns = Vec::new();
+    for item in &s.from_clause {
+        collect_from_columns(item, lookup, &ctes, &mut own_columns);
+    }
+    walk_select(s, &mut |n| {
+        let Some(N::AIndirection(ind)) = n.node.as_ref() else {
+            return Ok(());
+        };
+        let Some(N::ColumnRef(c)) = ind.arg.as_deref().and_then(|a| a.node.as_ref()) else {
+            return Ok(());
+        };
+        let Some(Ok::<[String; 1], _>([name])) = parts_of(c).map(|p| p.try_into()) else {
+            return Ok(());
+        };
+        let [f] = ind.indirection.as_slice() else {
+            return Ok(());
+        };
+        let Some(N::String(field)) = f.node.as_ref() else {
+            return Ok(());
+        };
+        if own.contains(&name) || own_columns.contains(&name) || !left_column(&name, &field.sval) {
+            return Ok(());
+        }
+        let location = c.location;
+        let fields = vec![string_node(&name), string_node(&field.sval)];
+        n.node = Some(N::ColumnRef(pg_query::protobuf::ColumnRef {
+            fields,
+            location,
+        }));
+        Ok(())
+    })
+}
+
 /// The FROM item of one list that answers to `name`: a relation or a
 /// derived table by its alias (a relation without one by its name), an
 /// aliased JOIN by its alias alone, an unaliased one by its sides' names.

@@ -3237,14 +3237,6 @@ the column written out, so none is the star's. The gap tests are in
       subquery only.
       Verify: tests/backlog/test_rp_found_rp517.py::test_lateral_outer_columns
       Backlog-ID: RP-701
-- [ ] **A field of an outer item's whole row in a LATERAL subquery is
-      42703.** `select l.* from (values (3)) v(a), lateral (select (v).a + 0
-      as k) l` answers `3` on PostgreSQL 15.19 and `lateral (select 1 as k
-      where (v).a = 3)` `1`; here each is 42703 `column "v" does not exist`
-      at the `v`. `v.a` there is answered, and since RP-699 `(v).a` in an
-      expression subquery is too.
-      Verify: tests/backlog/test_rp_found_rp699.py::test_lateral_whole_row_field
-      Backlog-ID: RP-705
 
 ## Found while working RP-697 (2026-11-09)
 

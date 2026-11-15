@@ -1678,6 +1678,16 @@ fn lateral_leaf(
         }
         _ => return Ok(None),
     };
+    // A field of a left item's whole row is that item's column (RP-705).
+    if !function {
+        crate::correlated::lateral_field_selections(&mut inner, lookup, &|name, field| {
+            left.aliases.iter().any(|a| a == name)
+                && matches!(
+                    left.resolve(&[name.to_string(), field.to_string()]),
+                    Ok(Some(_))
+                )
+        })?;
+    }
     // The references to the left side, each bound to a parameter.
     let mut keys: Vec<String> = Vec::new();
     let mut types: Vec<String> = Vec::new();

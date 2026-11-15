@@ -6,8 +6,8 @@ FROM function's column or a whole row's field keeps its type) found:
 - a correlated subquery in the WHERE of a query over a FROM function was
   42883 and named the internal per-row call (RP-703, fixed);
 - `(v).*` in a select list was 0A000 (RP-704, fixed);
-- a field of an outer item's whole row in a LATERAL subquery is 42703
-  (RP-705).
+- a field of an outer item's whole row in a LATERAL subquery was 42703
+  (RP-705, fixed).
 
 And what working RP-704 found: a star over a FROM subquery in a grouped
 query is 42803 with no column name (RP-852).
@@ -134,7 +134,7 @@ def test_whole_row_star_in_a_select_list(query: str, dsn: str) -> None:
 
 
 # A LATERAL subquery reads the earlier item's whole row as an expression
-# subquery does. Here each is 42703 `column "v" does not exist` at the `v`.
+# subquery does. Each was 42703 `column "v" does not exist` at the `v`.
 LATERAL_WHOLE_ROW_FIELD = {
     "select l.* from (values (3)) v(a), lateral (select (v).a + 0 as k) l": ([(3,)], ["k"]),
     "select l.k from (values (3)) v(a), lateral (select 1 as k where (v).a = 3) l": (
@@ -144,7 +144,7 @@ LATERAL_WHOLE_ROW_FIELD = {
 }
 
 
-@pytest.mark.backlog("RP-705")
+@pytest.mark.backlog_fixed("RP-705")
 @pytest.mark.parametrize("query", list(LATERAL_WHOLE_ROW_FIELD))
 def test_lateral_whole_row_field(query: str, dsn: str) -> None:
     assert answer(dsn, query) == LATERAL_WHOLE_ROW_FIELD[query]
