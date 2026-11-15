@@ -253,6 +253,7 @@ fn scans_collection(plan: &Node) -> bool {
         | Node::Limit(_, input)
         | Node::Projection { input, .. }
         | Node::ReturnKey(input)
+        | Node::SortKeyGenerator(input)
         | Node::Subplan(input)
         | Node::Count(input)
         | Node::Update(input)
@@ -752,8 +753,80 @@ fn plan_for(
             plan::write(&q, &t.catalog, true, *multi, false, *returns)
         }
     };
-    let ranked = std::mem::take(&mut *trial.ranked.borrow_mut());
+    let mut ranked = std::mem::take(&mut *trial.ranked.borrow_mut());
+    // A later stage reading each document's sort key, with no sort of the
+    // query's own to keep one, has the query compute it (RM-428).
+    if matches!(s.kind, Kind::Find)
+        && s.sort.as_ref().is_none_or(Document::is_empty)
+        && deps::reads_sort_key(
+            &s.rest
+                .iter()
+                .cloned()
+                .map(Bson::Document)
+                .collect::<Vec<_>>(),
+        )
+    {
+        for r in &mut ranked {
+            r.plan = sort_key_generator(
+                std::mem::replace(&mut r.plan, Node::FastCount),
+                Some(&mut r.stats),
+            );
+        }
+        return Ok((sort_key_generator(node, None), ranked));
+    }
     Ok((node, ranked))
+}
+
+/// `plan` with a SORT_KEY_GENERATOR under its paging and projection, as
+/// `analyzeDataAccess` places one (measured 8.2.11: `SORT_KEY_GENERATOR <-
+/// COLLSCAN`), and `stats` given the stage's level, which passes its
+/// input's documents on.
+fn sort_key_generator(plan: Node, stats: Option<&mut Stats>) -> Node {
+    match plan {
+        Node::Limit(n, input) => Node::Limit(
+            n,
+            Box::new(sort_key_generator(
+                *input,
+                stats.and_then(|s| s.children.first_mut()),
+            )),
+        ),
+        Node::Skip(n, input) => Node::Skip(
+            n,
+            Box::new(sort_key_generator(
+                *input,
+                stats.and_then(|s| s.children.first_mut()),
+            )),
+        ),
+        Node::Subplan(input) => Node::Subplan(Box::new(sort_key_generator(
+            *input,
+            stats.and_then(|s| s.children.first_mut()),
+        ))),
+        Node::Projection { name, spec, input } => Node::Projection {
+            name,
+            spec,
+            input: Box::new(sort_key_generator(
+                *input,
+                stats.and_then(|s| s.children.first_mut()),
+            )),
+        },
+        other => {
+            if let Some(st) = stats {
+                let inner = std::mem::take(st);
+                *st = Stats {
+                    n_returned: inner.n_returned,
+                    work: inner.work.map(|w| node::WorkCounts {
+                        seeks: 0,
+                        dups_tested: 0,
+                        dups_dropped: 0,
+                        ..w
+                    }),
+                    children: vec![inner],
+                    ..Stats::default()
+                };
+            }
+            Node::SortKeyGenerator(Box::new(other))
+        }
+    }
 }
 
 /// The plan cache as `explain` reports it for the query `s` plans: the

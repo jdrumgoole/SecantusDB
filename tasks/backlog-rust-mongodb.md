@@ -2718,14 +2718,6 @@ What is left, all on the RUST MongoDB server:
       `$unionWith` alike. Found 2026-11-15 working RM-426.
       Verify: tests/backlog/test_rm_found_2026_11_15_rm426.py::test_a_distinct_scan_group_hashes_as_mongod_does
       Backlog-ID: RM-697
-- [ ] **A `$facet` whose sub-pipeline keeps a sort key plans no
-      `SORT_KEY_GENERATOR`.** mongod 8.2.11's `$cursor` under a `$facet`
-      holding a `$sort` with `outputSortKeyMetadata` (a `$setWindowFields`
-      `$rank`, a `$rankFusion` input) is `SORT_KEY_GENERATOR` over the
-      `COLLSCAN`; this server's is the `COLLSCAN`. Found 2026-11-08 working
-      RM-200.
-      Backlog-ID: RM-428
-      Verify: tests/backlog/test_rm_found_2026_11_08_explain_listing.py::test_facet_that_reads_sort_keys_has_a_key_generator
 
 ### 7.074 Change streams, command by command -- 2026-10-11
 

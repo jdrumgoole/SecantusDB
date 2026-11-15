@@ -196,6 +196,10 @@ pub(crate) enum Node {
         input: Box<Node>,
     },
     ReturnKey(Box<Node>),
+    /// Computes each document's sort key for a later stage that reads it
+    /// (`{$meta: "sortKey"}`, a `$rank`), where the plan has no sort of its
+    /// own to keep one (`analyzeDataAccess`, RM-428).
+    SortKeyGenerator(Box<Node>),
     Subplan(Box<Node>),
     Eof(&'static str),
     /// A point lookup through a unique index: `path == value`.
@@ -442,6 +446,11 @@ impl Node {
             }
             Node::ReturnKey(input) => {
                 out.insert("stage", "RETURN_KEY");
+                counted(&mut out);
+                input_of(&mut out, input);
+            }
+            Node::SortKeyGenerator(input) => {
+                out.insert("stage", "SORT_KEY_GENERATOR");
                 counted(&mut out);
                 input_of(&mut out, input);
             }

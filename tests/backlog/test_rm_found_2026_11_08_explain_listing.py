@@ -78,9 +78,63 @@ def _facet_cursor(client: Any) -> str:
     return reply["stages"][0]["$cursor"]["queryPlanner"]["winningPlan"]["stage"]
 
 
-@pytest.mark.backlog("RM-428")
+@pytest.mark.backlog_fixed("RM-428")
 def test_facet_that_reads_sort_keys_has_a_key_generator(rust_mongo: Any, mongod: Any) -> None:
     """mongod 8.2.11 plans a `SORT_KEY_GENERATOR` over the scan under a
     `$facet` whose sub-pipeline keeps a sort key (`outputSortKeyMetadata`:
-    a `$setWindowFields` `$rank`, a `$rankFusion` input)."""
+    a `$setWindowFields` `$rank`, a `$rankFusion` input). This server
+    planned the bare `COLLSCAN` until 2026-11-15."""
     assert _facet_cursor(rust_mongo) == _facet_cursor(mongod) == "SORT_KEY_GENERATOR"
+
+
+def _window(op: str, **extra: Any) -> dict:
+    return {"$setWindowFields": {**extra, "sortBy": {"x": -1}, "output": {"r": {op: {}}}}}
+
+
+_ADD = {"$addFields": {"z": 1}}
+
+# Pipelines whose cursor reads a sort key a later stage needs, or does not
+# (measured 8.2.11, 2026-11-15).
+SORT_KEY_READS: dict[str, list] = {
+    "facet-rank": [{"$facet": {"f": [_window("$rank")]}}],
+    "facet-dense-rank": [{"$facet": {"f": [_window("$denseRank")]}}],
+    "facet-document-number": [{"$facet": {"f": [_window("$documentNumber")]}}],
+    "facet-partitioned": [{"$facet": {"f": [_window("$rank", partitionBy="$y")]}}],
+    "facet-sum": [{"$facet": {"f": [_window("$sum")]}}],
+    "facet-meta": [
+        {"$facet": {"f": [{"$sort": {"x": 1}}, {"$project": {"k": {"$meta": "sortKey"}}}]}}
+    ],
+    "facet-two": [{"$facet": {"f": [_window("$rank")], "g": [{"$match": {"x": 1}}]}}],
+    "match-facet": [{"$match": {"x": {"$gt": 1}}}, {"$facet": {"f": [_window("$rank")]}}],
+    "add-fields-rank": [_ADD, _window("$rank")],
+    "add-fields-sort-meta": [
+        _ADD,
+        {"$sort": {"x": 1}},
+        {"$project": {"k": {"$meta": "sortKey"}}},
+    ],
+    "group-then-rank": [_ADD, {"$group": {"_id": "$x"}}, _window("$rank")],
+    "lookup-rank": [{"$lookup": {"from": "s", "pipeline": [_window("$rank")], "as": "j"}}],
+    "sorted-then-rank": [{"$sort": {"x": 1}}, _ADD, _window("$rank")],
+}
+
+
+@pytest.mark.backlog_fixed("RM-428")
+@pytest.mark.parametrize("name", list(SORT_KEY_READS))
+def test_cursor_computes_the_sort_key_a_later_stage_reads(
+    rust_mongo: Any, mongod: Any, name: str
+) -> None:
+    """mongod 8.2.11 puts a `SORT_KEY_GENERATOR` in the cursor's plan when a
+    later stage reads the sort key (a `$rank`-like window, `{$meta:
+    "sortKey"}`, in a `$facet` too) and the query sorts nothing itself; not
+    behind a `$group`, nor for a `$lookup`'s pipeline."""
+
+    def plan(client: Any) -> dict:
+        reply = _explain(client, SORT_KEY_READS[name])
+        planner = (
+            reply["stages"][0]["$cursor"]["queryPlanner"]
+            if "stages" in reply
+            else (reply["queryPlanner"])
+        )
+        return planner["winningPlan"]
+
+    assert plan(rust_mongo) == plan(mongod)

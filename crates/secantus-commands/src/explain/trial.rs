@@ -70,6 +70,7 @@ impl<'a> Stage<'a> {
             | Node::Skip(_, input)
             | Node::Limit(_, input)
             | Node::ReturnKey(input)
+            | Node::SortKeyGenerator(input)
             | Node::Subplan(input) => vec![input],
             Node::Or(inputs) | Node::AndSorted(inputs) | Node::SortMerge { inputs, .. } => {
                 inputs.iter().collect()
@@ -183,6 +184,7 @@ impl<'a> Stage<'a> {
             | Node::Projection { .. }
             | Node::Skip(..)
             | Node::ReturnKey(_)
+            | Node::SortKeyGenerator(_)
             | Node::Subplan(_) => self.ended || self.inputs[0].is_eof(),
             Node::Limit(n, _) => self.ended || self.count >= *n || self.inputs[0].is_eof(),
             Node::Or(_) => self.ended || self.pos >= self.inputs.len(),
@@ -242,9 +244,10 @@ impl<'a> Stage<'a> {
                 }
                 other => other,
             },
-            Node::Projection { .. } | Node::ReturnKey(_) | Node::Subplan(_) => {
-                self.inputs[0].work(env)
-            }
+            Node::Projection { .. }
+            | Node::ReturnKey(_)
+            | Node::SortKeyGenerator(_)
+            | Node::Subplan(_) => self.inputs[0].work(env),
             Node::Skip(n, _) => match self.inputs[0].work(env) {
                 Work::Advanced(_) if self.count < *n => {
                     self.count += 1;
@@ -480,6 +483,7 @@ fn holds(node: &Node, pick: &dyn Fn(&Node) -> bool) -> bool {
         | Node::Skip(_, input)
         | Node::Limit(_, input)
         | Node::ReturnKey(input)
+        | Node::SortKeyGenerator(input)
         | Node::Subplan(input) => holds(input, pick),
         Node::Or(inputs) | Node::AndSorted(inputs) | Node::SortMerge { inputs, .. } => {
             inputs.iter().any(|n| holds(n, pick))
@@ -666,6 +670,7 @@ fn kind_and_children(node: &Node) -> (String, Vec<&Node>) {
         | Node::Skip(_, input)
         | Node::Limit(_, input)
         | Node::ReturnKey(input)
+        | Node::SortKeyGenerator(input)
         | Node::Subplan(input)
         | Node::Count(input)
         | Node::Update(input)

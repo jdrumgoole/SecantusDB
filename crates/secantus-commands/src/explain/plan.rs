@@ -64,6 +64,7 @@ fn planning_checks(node: &Node, distinct_without_query: bool) {
             | Node::Limit(_, input)
             | Node::Projection { input, .. }
             | Node::ReturnKey(input)
+            | Node::SortKeyGenerator(input)
             | Node::Count(input)
             | Node::Update(input)
             | Node::Delete { input, .. } => leaves(input),
@@ -314,6 +315,7 @@ pub(crate) fn solution(node: &Node) -> String {
             | Node::Limit(_, input)
             | Node::Projection { input, .. }
             | Node::ReturnKey(input)
+            | Node::SortKeyGenerator(input)
             | Node::Subplan(input) => vec![input],
             Node::Or(inputs) | Node::AndSorted(inputs) | Node::SortMerge { inputs, .. } => {
                 inputs.iter().collect()
@@ -380,6 +382,7 @@ pub(crate) fn signature(node: &Node) -> String {
             | Node::Limit(_, input)
             | Node::Projection { input, .. }
             | Node::ReturnKey(input)
+            | Node::SortKeyGenerator(input)
             | Node::Count(input)
             | Node::Update(input)
             | Node::Delete { input, .. } => return walk(input, out),
