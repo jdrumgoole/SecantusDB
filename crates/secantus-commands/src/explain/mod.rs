@@ -2665,8 +2665,23 @@ pub(crate) fn parse(doc: &Document, db: &str) -> Result<Parsed, CommandError> {
     }
     let lowered = name.to_ascii_lowercase();
     match name.as_str() {
-        "find" | "count" | "distinct" | "update" | "delete" => {
+        "find" | "count" | "distinct" => {
             collection(&inner, &name, db)?;
+        }
+        // mongod parses an explained write in full before it explains it:
+        // its fields first, then the namespace, then the batch's size, and
+        // an `insert` it then refuses to explain (RM-432, measured 8.2.11).
+        "insert" | "update" | "delete" => {
+            if let Some(problem) = crate::crud::write_parse_problem(&name, &inner, None) {
+                if problem.code == 16 {
+                    collection(&inner, &name, db)?;
+                }
+                return Err(problem);
+            }
+            collection(&inner, &name, db)?;
+            if name == "insert" {
+                return Err(unexplainable(&name));
+            }
         }
         "aggregate" => {}
         _ if lowered == "findandmodify" || lowered == "mapreduce" => {

@@ -2726,17 +2726,6 @@ What is left, all on the RUST MongoDB server:
       RM-200.
       Backlog-ID: RM-428
       Verify: tests/backlog/test_rm_found_2026_11_08_explain_listing.py::test_facet_that_reads_sort_keys_has_a_key_generator
-- [ ] **`explain` of a write misses a required field mongod's parser
-      finds first.** mongod parses the explained command in full before it
-      explains it, required fields before the namespace's type:
-      `{explain: {insert: "x"}}` is 40414 "BSON field 'insert.documents' is
-      missing but a required field", where this server answers 20 "Cannot
-      explain cmd: insert"; `{explain: {update: 1}}` and `{explain: {delete:
-      1}}` name the missing `updates` / `deletes` (40414) where this server
-      refuses the namespace (73). Measured 8.2.11; found 2026-11-08 working
-      RM-185.
-      Backlog-ID: RM-432
-      Verify: tests/backlog/test_rm_431_432.py::test_explain_parses_the_write_it_explains
 
 ### 7.074 Change streams, command by command -- 2026-10-11
 
