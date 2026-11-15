@@ -4740,6 +4740,28 @@ pub(crate) fn set_error_location(location: i32) {
     }
 }
 
+thread_local! {
+    /// Where the `regclass` literal whose lookup failed sits (RP-675).
+    static REGCLASS_LITERAL_LOCATION: std::cell::Cell<Option<i32>> = const { std::cell::Cell::new(None) };
+}
+
+/// Record the location of the `regclass` literal whose lookup failed.
+pub(crate) fn set_regclass_literal_location(location: i32) {
+    if location >= 0 {
+        REGCLASS_LITERAL_LOCATION.with(|l| l.set(Some(location)));
+    }
+}
+
+/// The 1-based character position in `sql` of the `regclass` literal whose
+/// lookup raised the last planning error, consumed. PostgreSQL's
+/// `regclassin` reports at the literal however the name inside it is
+/// written (quoted, dollar-quoted), so this beats a search for the name.
+pub fn take_regclass_literal_position(sql: Option<&str>) -> Option<usize> {
+    let loc = REGCLASS_LITERAL_LOCATION.with(std::cell::Cell::take)?;
+    let sql = sql?;
+    Some(sql.get(..usize::try_from(loc).ok()?)?.chars().count() + 1)
+}
+
 /// The location the last planning error recorded, left in place.
 fn peek_error_location() -> Option<i32> {
     ERROR_LOCATION.with(std::cell::Cell::get)
@@ -4750,6 +4772,7 @@ fn peek_error_location() -> Option<i32> {
 /// [`set_error_unpositioned`] with it).
 pub fn take_error_location() -> Option<i32> {
     ERROR_UNPOSITIONED.with(|u| u.set(false));
+    let _ = take_regclass_literal_position(None);
     ERROR_LOCATION.with(std::cell::Cell::take)
 }
 
@@ -37441,6 +37464,14 @@ fn resolve_regclass(text: &str) -> Result<i64> {
             )))
         }
     };
+    // `RangeVarGetRelid` looks the schema up before the relation in it
+    // (`LookupExplicitNamespace`): a missing one is 3F000 (RP-675).
+    if let Some(s) = schema.filter(|s| !schemas::schema_exists(s)) {
+        return Err(Error::Sqlstate(
+            "3F000",
+            format!("schema \"{s}\" does not exist"),
+        ));
+    }
     relation_oid(schema, name).ok_or_else(|| {
         Error::UndefinedTable(match schema {
             Some(s) => format!("{s}.{name}"),
@@ -49263,7 +49294,9 @@ fn const_value_node(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result<
             return Ok(match const_value(arg, params)? {
                 Bson::String(name) => match resolve_regclass(&name) {
                     Ok(oid) => regclass_value(oid),
-                    Err(Error::UndefinedTable(_)) => Bson::Null,
+                    // `RangeVarGetRelid` with `missing_ok`: no such
+                    // relation, or no such schema, is NULL.
+                    Err(Error::UndefinedTable(_) | Error::Sqlstate("3F000", _)) => Bson::Null,
                     Err(e) => return Err(e),
                 },
                 _ => Bson::Null,

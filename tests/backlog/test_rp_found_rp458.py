@@ -45,12 +45,19 @@ REGCLASSIN_ERRORS = {
 }
 
 
-@pytest.mark.backlog("RP-675")
+@pytest.mark.backlog_fixed("RP-675")
 @pytest.mark.parametrize("query", list(REGCLASSIN_ERRORS))
 def test_regclassin_errors(query: str, rust_pg: Any) -> None:
-    """A missing schema is 42P01 naming the whole name, and a 42P01 whose
-    name is quoted or dollar-quoted in the statement has no position."""
+    """A missing schema was 42P01 naming the whole name, and a 42P01 whose
+    name was quoted or dollar-quoted in the statement had no position."""
     assert answer(rust_pg, query) == REGCLASSIN_ERRORS[query]
+
+
+@pytest.mark.backlog_fixed("RP-675")
+def test_to_regclass_over_a_missing_schema_is_null(rust_pg: Any) -> None:
+    """`to_regclass` looks up with `missing_ok`: a missing schema is NULL on
+    PostgreSQL 15.19, not the 3F000 the cast raises."""
+    assert answer(rust_pg, "select to_regclass('nosuch.s')") == [(None,)]
 
 
 NOT_A_SEQUENCE = {

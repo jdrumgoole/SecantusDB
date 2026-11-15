@@ -3117,18 +3117,6 @@ keeps; what follows is what that lookup does not yet check.
 
 Measured on PostgreSQL 15.19; none needs an object.
 
-- [ ] **`regclassin` reports a missing schema as a missing relation, and a
-      quoted name's 42P01 has no position.** `select 'nosuch.s'::regclass`
-      and `pg_relation_size('nosuch.s')` are 3F000 `schema "nosuch" does not
-      exist` at the literal (8, 25) on PostgreSQL (`RangeVarGetRelid` looks
-      the schema up first); here they are 42P01 `relation "nosuch.s" does
-      not exist`. And `select '"Nosuch"'::regclass` and `select
-      nextval($$nosuchseq$$)` are 42P01 at the literal (8, 16) there and
-      have no position here: the server places a 42P01 by searching the
-      statement for the name (`err_in`, `identifier_position`), which a
-      quoted or dollar-quoted name does not match.
-      Verify: tests/backlog/test_rp_found_rp458.py::test_regclassin_errors
-      Backlog-ID: RP-675
 - [ ] **A named argument to a built-in whose parameters have no names is
       refused as a gap.** `select nextval(regclass := 'nosuchseq')` and
       `nextval(x => 'nosuchseq')` are 42883 `function nextval(regclass =>

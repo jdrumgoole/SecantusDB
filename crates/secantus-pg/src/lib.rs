@@ -27024,8 +27024,11 @@ impl PgHandler {
         if let PgWireError::UserError(info) = &mut out {
             let pos = match e {
                 PlanError::UndefinedTable(name) => {
+                    let literal = secantus_pgplan::take_regclass_literal_position(Some(sql));
                     let _ = secantus_pgplan::take_error_location();
-                    if secantus_pgplan::alter_finds_relation_by_name(sql) {
+                    if literal.is_some() {
+                        literal
+                    } else if secantus_pgplan::alter_finds_relation_by_name(sql) {
                         None
                     } else {
                         secantus_pgplan::identifier_position(sql, name)
