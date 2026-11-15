@@ -2233,7 +2233,9 @@ impl Stream {
                     covered = *name == "PROJECTION_COVERED";
                     node = input;
                 }
-                Node::ReturnKey(input) | Node::Subplan(input) => node = input,
+                Node::ReturnKey(input) | Node::SortKeyGenerator(input) | Node::Subplan(input) => {
+                    node = input
+                }
                 Node::Limit(n, input) if limit.is_none() && skip == 0 => {
                     limit = Some(*n);
                     node = input;
@@ -2958,7 +2960,10 @@ impl Stream {
     /// stream's own `skip` and `limit` (as `of_plan_with` takes them).
     fn top(&self, node: &Node, y: Yields, limited: bool, skipped: bool) -> Option<Report> {
         match node {
-            Node::Projection { input, .. } | Node::ReturnKey(input) | Node::Subplan(input) => {
+            Node::Projection { input, .. }
+            | Node::ReturnKey(input)
+            | Node::SortKeyGenerator(input)
+            | Node::Subplan(input) => {
                 let c = self.top(input, y, limited, skipped)?;
                 Some(pass(c, y))
             }
@@ -3129,9 +3134,13 @@ fn dups(t: &Tally) -> Document {
 /// What `stage`, running `node` of the plan, did.
 fn report(node: &Node, stage: &Stage, y: Yields) -> Option<Report> {
     match (node, stage) {
-        (Node::Projection { input, .. } | Node::ReturnKey(input) | Node::Subplan(input), _) => {
-            Some(pass(report(input, stage, y)?, y))
-        }
+        (
+            Node::Projection { input, .. }
+            | Node::ReturnKey(input)
+            | Node::SortKeyGenerator(input)
+            | Node::Subplan(input),
+            _,
+        ) => Some(pass(report(input, stage, y)?, y)),
         // The FETCH that reads a fetching DISTINCT_SCAN's documents is the
         // scan's own (`isFetching`).
         (

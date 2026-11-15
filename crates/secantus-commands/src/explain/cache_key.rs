@@ -465,7 +465,14 @@ pub(crate) fn parse(q: &Document) -> Option<Expr> {
                     .iter()
                     .map(|c| c.as_document().and_then(parse))
                     .collect::<Option<Vec<_>>>()?;
-                Expr::Logical(code, children)
+                match (code, <[Expr; 1]>::try_from(children)) {
+                    // A `$not` of a tree prints as the one-child `$nor` of
+                    // it (`NotMatchExpression::serialize`); the optimizer
+                    // leaves no other one-child `$nor` (RM-452).
+                    ("nr", Ok([child])) => Expr::Not(Box::new(child)),
+                    (_, Ok([child])) => Expr::Logical(code, vec![child]),
+                    (_, Err(children)) => Expr::Logical(code, children),
+                }
             }
             "$expr" => Expr::Bare("xp"),
             "$where" => Expr::Bare("wh"),

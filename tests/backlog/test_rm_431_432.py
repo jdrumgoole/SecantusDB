@@ -1,6 +1,6 @@
 """RM-431 and RM-432: required fields mongod's parser finds missing, which
 this server answered otherwise (measured 8.2.11, 2026-11-08). RM-431 is
-fixed; RM-432 is open."""
+fixed, and so is RM-432."""
 
 from __future__ import annotations
 
@@ -78,14 +78,26 @@ _EXPLAINED = [
     [("explain", {"insert": "x"})],
     [("explain", {"update": 1})],
     [("explain", {"delete": 1})],
+    [("explain", SON([("insert", 1), ("documents", [{}])]))],
+    [("explain", SON([("insert", "x"), ("documents", 5)]))],
+    [("explain", SON([("insert", "x"), ("documents", [{}])]))],
+    [("explain", SON([("insert", "x"), ("documents", []), ("bogus", 1)]))],
+    [("explain", SON([("update", 1), ("updates", [])]))],
+    [("explain", SON([("update", "x"), ("updates", [])]))],
+    [("explain", SON([("update", "x"), ("updates", 5)]))],
+    [("explain", SON([("update", "x"), ("updates", [{}])]))],
+    [("explain", SON([("update", 1), ("bogus", 1)]))],
+    [("explain", SON([("delete", 1), ("deletes", [])]))],
+    [("explain", SON([("delete", "x"), ("deletes", [])]))],
+    [("explain", SON([("delete", "x"), ("deletes", [{}])]))],
 ]
 
 
-@pytest.mark.backlog("RM-432")
+@pytest.mark.backlog_fixed("RM-432")
 @pytest.mark.parametrize("command", _EXPLAINED, ids=[repr(c) for c in _EXPLAINED])
 def test_explain_parses_the_write_it_explains(rust_mongo: Any, mongod: Any, command: list) -> None:
-    """mongod parses an explained write in full before it explains it, and
-    finds a required field missing before the namespace's type: an
-    `insert` without `documents` is 40414, not "Cannot explain cmd" (20), and
-    `{update: 1}` names its missing `updates`, not the namespace (73)."""
+    """mongod parses an explained write in full before it explains it: its
+    fields, then the namespace, then the batch's size. An `insert` without
+    `documents` was "Cannot explain cmd" (20) here, not 40414, and `{update:
+    1}` was refused on its namespace (73), not its missing `updates`."""
     assert _answer(rust_mongo, command) == _answer(mongod, command)

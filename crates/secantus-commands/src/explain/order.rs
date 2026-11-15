@@ -73,6 +73,7 @@ fn access(node: &Node) -> &Node {
         | Node::Skip(_, input)
         | Node::Limit(_, input)
         | Node::ReturnKey(input)
+        | Node::SortKeyGenerator(input)
         | Node::Subplan(input) => access(input),
         other => other,
     }
@@ -556,6 +557,7 @@ fn trial_leaves<'n>(node: &'n Node, out: &mut Vec<&'n Node>) -> bool {
         | Node::Skip(_, input)
         | Node::Limit(_, input)
         | Node::ReturnKey(input)
+        | Node::SortKeyGenerator(input)
         | Node::Subplan(input) => trial_leaves(input, out),
         Node::Or(inputs) | Node::AndSorted(inputs) | Node::SortMerge { inputs, .. } => {
             inputs.iter().all(|n| trial_leaves(n, out))
@@ -1356,6 +1358,7 @@ fn subplanned(node: &Node) -> bool {
         | Node::Limit(_, input)
         | Node::Skip(_, input)
         | Node::ReturnKey(input)
+        | Node::SortKeyGenerator(input)
         | Node::Sort { input, .. } => subplanned(input),
         _ => false,
     }
@@ -2090,6 +2093,7 @@ fn used_indexes(node: &Node, out: &mut Vec<String>) {
         | Node::Limit(_, input)
         | Node::Projection { input, .. }
         | Node::ReturnKey(input)
+        | Node::SortKeyGenerator(input)
         | Node::Subplan(input)
         | Node::Count(input)
         | Node::Update(input)

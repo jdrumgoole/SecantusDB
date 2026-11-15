@@ -457,8 +457,20 @@ pub(crate) fn absorb(shape: &mut Shape, pipeline: &[Document]) {
         _ => doc! { "$and": filters.into_iter().map(Bson::Document).collect::<Vec<_>>() },
     };
     shape.rest = pipeline[taken..].to_vec();
-    // The fields the stages left over read, projected in the query.
-    if shape.projection.is_none() && !shape.rest.is_empty() {
+    // The fields the stages left over read, projected in the query; none
+    // when they read the sort key the query then computes (measured
+    // 8.2.11, RM-428: `[{$addFields}, {$project: {x: 1}}, {$setWindowFields
+    // ... $rank}]` reads `SORT_KEY_GENERATOR <- COLLSCAN`).
+    let computes_sort_key = shape.sort.as_ref().is_none_or(Document::is_empty)
+        && super::deps::reads_sort_key(
+            &shape
+                .rest
+                .iter()
+                .cloned()
+                .map(Bson::Document)
+                .collect::<Vec<_>>(),
+        );
+    if shape.projection.is_none() && !shape.rest.is_empty() && !computes_sort_key {
         shape.projection = super::deps::projection(&shape.rest);
     }
     shape.optimized_pipeline = shape.rest.is_empty();

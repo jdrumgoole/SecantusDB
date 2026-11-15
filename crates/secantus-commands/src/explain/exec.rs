@@ -806,6 +806,7 @@ impl<'a> Run<'a> {
             | Node::Delete { input, .. } => vec![input],
             Node::Skip(_, input) | Node::Limit(_, input) => vec![input],
             Node::ReturnKey(input)
+            | Node::SortKeyGenerator(input)
             | Node::Subplan(input)
             | Node::Count(input)
             | Node::Update(input) => vec![input],
@@ -1030,9 +1031,10 @@ impl<'a> Run<'a> {
                 }
                 self.inputs[0].pull(env)
             }
-            Node::Projection { .. } | Node::ReturnKey(_) | Node::Subplan(_) => {
-                self.inputs[0].pull(env)
-            }
+            Node::Projection { .. }
+            | Node::ReturnKey(_)
+            | Node::SortKeyGenerator(_)
+            | Node::Subplan(_) => self.inputs[0].pull(env),
             Node::Eof(_) | Node::FastCount => None,
             Node::Express { index, value } => {
                 if self.pos > 0 {

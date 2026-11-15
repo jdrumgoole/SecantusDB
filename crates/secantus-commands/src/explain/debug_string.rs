@@ -52,6 +52,13 @@ impl<'a> CanonicalQuery<'a> {
         )
     }
 
+    /// `error processing query: <this> <reason>`, as mongod words a query
+    /// it refused before planning (a tailable read of a collection that is
+    /// not capped, RM-498).
+    pub(crate) fn query_error(&self, reason: &str) -> String {
+        format!("error processing query: {} {reason}", self.render())
+    }
+
     fn render(&self) -> String {
         let mut out = format!("ns={}", self.ns);
         // mongod 8.2.11: ` batchSize=3 limit=2 skip=1`, a given `batchSize`

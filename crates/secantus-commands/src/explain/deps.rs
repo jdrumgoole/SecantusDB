@@ -203,6 +203,66 @@ pub(crate) fn projection(rest: &[Document]) -> Option<Document> {
     None
 }
 
+/// Whether `rest`, the stages mongod did not take into the query, read each
+/// document's sort key, which the query must then compute
+/// (`DepsTracker`'s `sortKey` metadata; measured 8.2.11, RM-428): a
+/// `{$meta: "sortKey"}`, a `$rank`, `$denseRank` or `$documentNumber`
+/// window, or a `$rankFusion`, in a stage or in a `$facet`'s pipelines,
+/// before a stage that drops the metadata (a `$group`). A `$lookup`'s or
+/// `$unionWith`'s pipeline reads other documents; a `$sort` in front
+/// that produces the key does not stop the need.
+pub(crate) fn reads_sort_key(rest: &[Bson]) -> bool {
+    for stage in rest {
+        let Some((name, arg)) = stage.as_document().and_then(|d| d.iter().next()) else {
+            return false;
+        };
+        match name.as_str() {
+            "$lookup" | "$unionWith" | "$graphLookup" => continue,
+            "$facet" => {
+                return arg.as_document().is_some_and(|facets| {
+                    facets.values().any(|sub| match sub {
+                        Bson::Array(stages) => reads_sort_key(stages),
+                        _ => false,
+                    })
+                });
+            }
+            "$rankFusion" => return true,
+            _ => {}
+        }
+        if reads_key(arg) {
+            return true;
+        }
+        if matches!(
+            name.as_str(),
+            "$group" | "$bucket" | "$bucketAuto" | "$sortByCount" | "$count" | "$redact"
+        ) {
+            return false;
+        }
+    }
+    false
+}
+
+/// Whether an argument reads a sort key: `{$meta: "sortKey"}`, or a
+/// window function that ranks by it.
+fn reads_key(v: &Bson) -> bool {
+    match v {
+        Bson::Document(d) => {
+            if d.len() == 1 && d.get_str("$meta") == Ok("sortKey") {
+                return true;
+            }
+            d.iter().any(|(k, x)| {
+                matches!(k.as_str(), "$rank" | "$denseRank" | "$documentNumber")
+                    || (k == "$_secantusFusePrep"
+                        && x.as_document()
+                            .is_some_and(|p| p.get_str("kind") == Ok("rank")))
+                    || reads_key(x)
+            })
+        }
+        Bson::Array(items) => items.iter().any(reads_key),
+        _ => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -269,5 +329,18 @@ mod tests {
             ]),
             None
         );
+    }
+
+    #[test]
+    fn a_rank_in_a_facet_reads_the_sort_key_and_a_group_stops_the_need() {
+        let rank = bson::doc! { "$setWindowFields": {
+        "sortBy": { "x": 1 }, "output": { "r": { "$rank": {} } } } };
+        let facet = Bson::Document(bson::doc! { "$facet": { "f": [rank.clone()] } });
+        assert!(reads_sort_key(&[facet]));
+        let group = Bson::Document(bson::doc! { "$group": { "_id": "$x" } });
+        assert!(!reads_sort_key(&[group, Bson::Document(rank.clone())]));
+        let lookup = Bson::Document(bson::doc! { "$lookup": {
+        "from": "s", "pipeline": [rank], "as": "j" } });
+        assert!(!reads_sort_key(&[lookup]));
     }
 }

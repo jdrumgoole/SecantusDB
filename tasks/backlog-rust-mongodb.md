@@ -2718,25 +2718,6 @@ What is left, all on the RUST MongoDB server:
       `$unionWith` alike. Found 2026-11-15 working RM-426.
       Verify: tests/backlog/test_rm_found_2026_11_15_rm426.py::test_a_distinct_scan_group_hashes_as_mongod_does
       Backlog-ID: RM-697
-- [ ] **A `$facet` whose sub-pipeline keeps a sort key plans no
-      `SORT_KEY_GENERATOR`.** mongod 8.2.11's `$cursor` under a `$facet`
-      holding a `$sort` with `outputSortKeyMetadata` (a `$setWindowFields`
-      `$rank`, a `$rankFusion` input) is `SORT_KEY_GENERATOR` over the
-      `COLLSCAN`; this server's is the `COLLSCAN`. Found 2026-11-08 working
-      RM-200.
-      Backlog-ID: RM-428
-      Verify: tests/backlog/test_rm_found_2026_11_08_explain_listing.py::test_facet_that_reads_sort_keys_has_a_key_generator
-- [ ] **`explain` of a write misses a required field mongod's parser
-      finds first.** mongod parses the explained command in full before it
-      explains it, required fields before the namespace's type:
-      `{explain: {insert: "x"}}` is 40414 "BSON field 'insert.documents' is
-      missing but a required field", where this server answers 20 "Cannot
-      explain cmd: insert"; `{explain: {update: 1}}` and `{explain: {delete:
-      1}}` name the missing `updates` / `deletes` (40414) where this server
-      refuses the namespace (73). Measured 8.2.11; found 2026-11-08 working
-      RM-185.
-      Backlog-ID: RM-432
-      Verify: tests/backlog/test_rm_431_432.py::test_explain_parses_the_write_it_explains
 
 ### 7.074 Change streams, command by command -- 2026-10-11
 
@@ -2749,30 +2730,37 @@ differs on none (re-measured 2026-11-09 after RM-454; 1 earlier that day, 2 on 2
 mongod keeps the oplog of earlier runs and a stream started in the past
 would see them. What is left:
 
-- [ ] **RUST MongoDB server: a `$match` after a `$changeStream` is not
-      rewritten into the oplog filter.** mongod rewrites a `$match` on the
-      event's fields (`operationType`, `fullDocument`,
-      `fullDocumentBeforeChange`, `documentKey`, `ns`, ...) into predicates
-      on the oplog entry and adds them to the read's filter, so the
-      `explain`'s `parsedQuery` and its hashes change (`operationType:
-      "insert"` adds `op: {$eq: "i"}` beside the writes: `queryHash`
-      2CFDBDA8, not 90A52575; mongod 8.2.11, 2026-11-09). This server lists
-      the `$match` as mongod does after the read and leaves the filter as it
-      is without one. Needs mongod's per-field rewrites transcribed (found
-      working RM-076).
-      Verify: tests/backlog/test_rm_found_2026_11_09_rm076.py::test_a_match_on_an_event_field_joins_the_oplog_filter
-      Backlog-ID: RM-452
-- [ ] **RUST MongoDB server: `executionStats` of a change stream counts
-      nothing.** mongod 8.2.11 runs the oplog read under `executionStats`:
-      a stream started before three inserts counts the three entries at
-      every stage, and the `COLLSCAN` its `docsExamined` (2026-11-09). This
-      server reports what a new stream at the end of the oplog finds -- no
-      entry, at every stage -- which is mongod's answer only for that
-      stream. `docsExamined` also counts mongod's own oplog entries (its
-      periodic no-ops), which this server's oplog does not keep (found
-      working RM-076).
-      Verify: tests/backlog/test_rm_found_2026_11_09_rm076.py::test_execution_stats_count_what_the_read_found
-      Backlog-ID: RM-453
+- [ ] **RUST MongoDB server: a `$match` after a `$changeStream` on an
+      event field other than `operationType` is not rewritten into the
+      oplog filter.** mongod 8.2.11 rewrites predicates on `fullDocument`,
+      `documentKey`, `ns`, `to`, `updateDescription`,
+      `fullDocumentBeforeChange`, the renamed `clusterTime` / `lsid` /
+      `txnNumber` (also into the transaction filter), and an `$expr` over
+      them, and adds them to the read's filter (`fullDocument.a: 1`:
+      `queryHash` 193DCAB5, not 90A52575; 2026-11-15). RM-452 ported the
+      `operationType` rewrite only; the rest of
+      `change_stream_rewrite_helpers.cpp` is to transcribe (found working
+      RM-452).
+      Verify: tests/backlog/test_rm_found_2026_11_15_rm452.py::test_a_match_on_another_event_field_joins_the_oplog_filter
+      Backlog-ID: RM-698
+- [ ] **RUST MongoDB server: the unwind filter of a change stream is not
+      Boolean-simplified.** mongod 8.2.11 optimizes
+      `internalUnwindTransaction`'s filter with its Boolean expression
+      simplifier (the oplog filter it optimizes without): after
+      `operationType: "drop"` (`rename`, `dropDatabase`) the writes branch
+      and the event-type `$or` fall away, as only a command can match. This
+      server prints the unsimplified `$and`, which matches the same entries
+      (2026-11-15, found working RM-452).
+      Verify: tests/backlog/test_rm_found_2026_11_15_rm452.py::test_the_unwind_filter_is_simplified
+      Backlog-ID: RM-699
+- [ ] **RUST MongoDB server: a change stream's `docsExamined` leaves out
+      mongod's own oplog entries.** mongod 8.2.11's `executionStats` of a
+      change stream counts every oplog entry its scan reads from the start
+      time, its periodic no-ops among them; this server's oplog keeps no
+      no-op entries, so its `docsExamined` counts only the writes (the
+      counts of the entries the stream keeps match since RM-453, 2026-11-15).
+      Verify: none -- mongod writes its no-ops on a timer, so no test can pin how many a scan reads
+      Backlog-ID: RM-700
 
 ### 7.073 The cursor commands -- 2026-10-11
 
@@ -2781,15 +2769,6 @@ cursor options, `getMore`, `killCursors`, the cursors of `aggregate` and the
 listing commands, tailable cursors, `count`, `distinct`). The Rust server
 differs on 5 scenarios. What is left:
 
-- [ ] **RUST MongoDB server: a tailable `find` of a collection that is not
-      capped does not print its query.** mongod 8.2.11 refuses it (2) with
-      the query its planner could not plan, `error processing query:
-      ns=<db>.pTree: $and\nSort: {}\nProj: {}\n tailable cursor requested
-      on non capped collection`; this server's message is `ns=<db>.p
-      tailable cursor ...`, with no query. Found while working RM-363,
-      2026-11-10.
-      Verify: tests/backlog/test_rm_found_2026_11_10_rm363.py::test_a_tailable_find_of_a_collection_that_is_not_capped_prints_its_query
-      Backlog-ID: RM-498
 - [ ] **RUST MongoDB server: a time-series `aggregate` that needs only
       some fields reads the collection at the command.** Behind an inclusion
       `$project` (`{$project: {v: 1}}`) mongod 8.2.11 reads the buckets one

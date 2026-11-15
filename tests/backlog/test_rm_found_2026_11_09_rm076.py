@@ -19,12 +19,13 @@ def _planner(client: Any, then: list) -> dict:
     return e["stages"][0]["$cursor"]["queryPlanner"]
 
 
-@pytest.mark.backlog("RM-452")
+@pytest.mark.backlog_fixed("RM-452")
 def test_a_match_on_an_event_field_joins_the_oplog_filter(rust_mongo: Any, mongod_rs: Any) -> None:
     """mongod 8.2.11 rewrites a `$match` on `operationType` into the oplog
     filter (`operationType: "insert"` adds `op: {$eq: "i"}` beside the
     writes), which changes the read's shape: its `queryHash` is 2CFDBDA8
-    rather than 90A52575."""
+    rather than 90A52575. This server left the filter as it was until
+    `change_stream.rs` ported mongod's `operationType` rewrite (RM-452)."""
     then = [{"$match": {"operationType": "insert"}}]
     want = _planner(mongod_rs, then)["queryHash"]
     assert want == "2CFDBDA8"
@@ -47,11 +48,12 @@ def _counted(client: Any) -> tuple:
     return stats["nReturned"], [s["nReturned"] for s in e["stages"]]
 
 
-@pytest.mark.backlog("RM-453")
+@pytest.mark.backlog_fixed("RM-453")
 def test_execution_stats_count_what_the_read_found(rust_mongo: Any, mongod_rs: Any) -> None:
     """A stream that starts before three inserts: mongod 8.2.11's
     `executionStats` reads the oplog from the start time and counts the
-    three entries at every stage."""
+    three entries at every stage. This server counted none until the
+    explain ran the read (`explain/change_stream.rs::run_read`)."""
     want = _counted(mongod_rs)
     assert want == (3, [3, 3, 3, 3, 3, 3])
     assert _counted(rust_mongo) == want
