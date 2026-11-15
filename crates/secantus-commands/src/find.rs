@@ -749,18 +749,6 @@ fn find_body(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
             "ok": 1.0,
         });
     }
-    if tailable
-        && !storage
-            .collection_is_capped(&ctx.db_name, &coll)
-            .map_err(command_error)?
-    {
-        return Ok(CommandError::new(
-            2,
-            "BadValue",
-            format!("error processing query: ns={ns} tailable cursor requested on non capped collection"),
-        )
-        .into_reply());
-    }
 
     let read = crate::notablescan::Read {
         coll: &coll,
@@ -776,6 +764,21 @@ fn find_body(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
             batch_size: doc.get("batchSize").and_then(as_i64),
         },
     };
+    // mongod refuses it with the query it was asked, as its planner
+    // prints it (RM-498).
+    if tailable
+        && !storage
+            .collection_is_capped(&ctx.db_name, &coll)
+            .map_err(command_error)?
+    {
+        return Ok(CommandError::new(
+            2,
+            "BadValue",
+            read.canonical(&ctx.db_name)
+                .query_error("tailable cursor requested on non capped collection"),
+        )
+        .into_reply());
+    }
     read.check_hint(storage, &ctx.db_name)?;
     crate::notablescan::check(ctx, &read)?;
 

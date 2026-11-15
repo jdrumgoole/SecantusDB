@@ -2772,15 +2772,6 @@ cursor options, `getMore`, `killCursors`, the cursors of `aggregate` and the
 listing commands, tailable cursors, `count`, `distinct`). The Rust server
 differs on 5 scenarios. What is left:
 
-- [ ] **RUST MongoDB server: a tailable `find` of a collection that is not
-      capped does not print its query.** mongod 8.2.11 refuses it (2) with
-      the query its planner could not plan, `error processing query:
-      ns=<db>.pTree: $and\nSort: {}\nProj: {}\n tailable cursor requested
-      on non capped collection`; this server's message is `ns=<db>.p
-      tailable cursor ...`, with no query. Found while working RM-363,
-      2026-11-10.
-      Verify: tests/backlog/test_rm_found_2026_11_10_rm363.py::test_a_tailable_find_of_a_collection_that_is_not_capped_prints_its_query
-      Backlog-ID: RM-498
 - [ ] **RUST MongoDB server: a time-series `aggregate` that needs only
       some fields reads the collection at the command.** Behind an inclusion
       `$project` (`{$project: {v: 1}}`) mongod 8.2.11 reads the buckets one

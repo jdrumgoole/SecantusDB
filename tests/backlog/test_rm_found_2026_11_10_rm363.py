@@ -182,7 +182,7 @@ def test_a_time_series_read_bounded_on_its_time_field_scans_the_clustered_bucket
     assert summary(rust_mongo, False) == want
 
 
-@pytest.mark.backlog("RM-498")
+@pytest.mark.backlog_fixed("RM-498")
 def test_a_tailable_find_of_a_collection_that_is_not_capped_prints_its_query(
     rust_mongo: Any, mongod: Any
 ) -> None:
