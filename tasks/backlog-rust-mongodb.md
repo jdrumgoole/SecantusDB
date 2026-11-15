@@ -744,8 +744,7 @@ These are explicit non-goals. Don't add them without a reason.
         all for a cached plan, and this planner's candidates are not its
         enumeration;
       - the other aggregates: one with a `$match` or `$redact` left after
-        its read (mongod's optimizer moves some where this server's does
-        not: RM-580), a `$limit` there (it stops its source short
+        its read, a `$limit` there (it stops its source short
         of the documents this server runs in one go), a `$lookup`,
         `$unionWith`, `$facet`, `$geoNear` or `$out` / `$merge`, a stage
         read whole that SBE does not take whole (a `$sort` after a
@@ -1800,15 +1799,6 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       2026-11-14 working RM-538.
       Verify: tests/backlog/test_rm_found_2026_11_14_rm538.py::test_explain_refuses_a_sample_rate_the_run_refuses
       Backlog-ID: RM-663
-- [ ] **Explain leaves a `$match` after a `$redact` where it was
-      written.** mongod 8.2.11 copies a `$match` that follows a `$redact`
-      ahead of it and into the query (`[{$redact: "$$KEEP"}, {$match: {z:
-      0}}]` explains as a `$cursor` reading `{z: {$eq: 0}}`, then the
-      `$match`, the `$redact` and the `$match` again); this server lists
-      the two stages as written over a whole-collection `$cursor`, and reads
-      the collection so. Found 2026-11-12 (RM-360).
-      Verify: tests/backlog/test_rm_found_2026_11_12_rm360.py::test_a_match_after_a_redact_is_copied_ahead_of_it
-      Backlog-ID: RM-580
 - [ ] **A `$lookup` over a collection reports nothing it examined.** At
       `executionStats` mongod 8.2.11 gives a `$lookup` whose pipeline reads
       a collection its `totalDocsExamined`, `totalKeysExamined`,

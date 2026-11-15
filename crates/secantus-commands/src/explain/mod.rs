@@ -1732,7 +1732,9 @@ fn count_inline(
         .flat_map(|stage| {
             match (
                 stage.get(shape::WINDOW_SORT),
-                stage.get(hoist::PUSHED_MATCH),
+                stage
+                    .get(hoist::PUSHED_MATCH)
+                    .or_else(|| stage.get(hoist::REDACT_MATCH)),
                 stage.get_str("$count"),
             ) {
                 (Some(sort), _, _) => vec![Bson::Document(doc! { "$sort": sort.clone() })],
@@ -1799,6 +1801,7 @@ fn streams(stage: &Document) -> bool {
         Some(
             "$match"
                 | hoist::PUSHED_MATCH
+                | hoist::REDACT_MATCH
                 | "$unwind"
                 | "$project"
                 | "$addFields"
