@@ -323,7 +323,21 @@ impl PgHandler {
             "Nested Loop Left Join" => true,
             _ => return,
         };
-        let Some((outer_table, outer_alias)) = filtered_seq_scan(&tree.children[0]) else {
+        // The outer side: a filtered Seq Scan, or (RP-390) a chain of
+        // plain Nested Loops, whose joined rows drive the inner scan.
+        let chain = if filtered_seq_scan(&tree.children[0]).is_some() {
+            None
+        } else if tree.children[0].name.starts_with("Nested Loop")
+            && tree.children[0]
+                .children
+                .get(1)
+                .is_some_and(|n| crate::explain::param_scan(n).param_cond.is_none())
+        {
+            match self.count_plain_nest_loop(&tree.children[0], sel, None) {
+                Some(c) => Some(c),
+                None => return,
+            }
+        } else {
             return;
         };
         let memoized = tree.children[1].name == "Memoize";
@@ -346,6 +360,7 @@ impl PgHandler {
         // Index Cond of both.
         let mut quals: Vec<(&str, &str)> = Vec::new();
         let mut col = None;
+        let mut param_alias: Option<&str> = None;
         let conjuncts = crate::explain::split_conjuncts(cond);
         for c in &conjuncts {
             let Some(body) = c.strip_prefix('(').and_then(|c| c.strip_suffix(')')) else {
@@ -360,18 +375,33 @@ impl PgHandler {
             let Some((alias, outer_col)) = other.split_once('.') else {
                 return;
             };
-            if alias != outer_alias
+            if param_alias.is_some_and(|a| a != alias)
                 || !["=", "<", "<=", ">", ">="].contains(&op)
                 || col.is_some_and(|c| c != own)
             {
                 return;
             }
             col = Some(own);
+            param_alias = Some(alias);
             quals.push((op, outer_col));
         }
-        let Some(col) = col else {
+        let (Some(col), Some(param_alias)) = (col, param_alias) else {
             return;
         };
+        // The relation the parameters come from.
+        let (outer_table, outer_alias) = match &chain {
+            None => match filtered_seq_scan(&tree.children[0]) {
+                Some(r) => r,
+                None => return,
+            },
+            Some(c) => match c.rels.iter().find(|(_, a)| a == param_alias) {
+                Some(r) => r.clone(),
+                None => return,
+            },
+        };
+        if outer_alias != param_alias {
+            return;
+        }
         let holds = |op: &str, inner: f64, outer: f64| match op {
             "=" => inner == outer,
             "<" => inner < outer,
@@ -403,11 +433,29 @@ impl PgHandler {
         {
             return;
         }
-        // The outer scan's rows: those its Filter keeps.
-        let Some((outer_docs, outer_read)) =
-            self.scan_rows(sel, &tree.children[0], &outer_table, &outer_alias)
-        else {
-            return;
+        // The outer rows: those the scan's Filter keeps, or each row the
+        // chain joined, as the parameter relation's own fields.
+        let (outer_docs, outer_read) = match &chain {
+            None => match self.scan_rows(sel, &tree.children[0], &outer_table, &outer_alias) {
+                Some(r) => r,
+                None => return,
+            },
+            Some(c) => {
+                let prefix = rel_prefix(&outer_alias);
+                let docs: Vec<Document> = c
+                    .rows
+                    .iter()
+                    .map(|d| {
+                        d.iter()
+                            .filter_map(|(k, v)| {
+                                k.strip_prefix(&prefix).map(|k| (k.to_string(), v.clone()))
+                            })
+                            .collect()
+                    })
+                    .collect();
+                let n = docs.len();
+                (docs, n)
+            }
         };
         let Ok(inner_docs) = self.table_docs(&inner_table) else {
             return;
@@ -551,7 +599,9 @@ impl PgHandler {
         }
         let loops = outer_docs.len();
         let outer = &mut tree.children[0];
-        if !outer.details.is_empty() {
+        if let Some(c) = &chain {
+            apply_nest_counts(outer, c);
+        } else if !outer.details.is_empty() {
             outer.removed_by_filter = Some(outer_read - loops);
         }
         outer.actual_rows = Some(loops);

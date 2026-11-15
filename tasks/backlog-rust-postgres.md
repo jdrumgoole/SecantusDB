@@ -1960,19 +1960,21 @@ a regression test.
       Hash Join's and a parameterized Nested Loop's outer Seq Scans theirs
       too, and since 2026-11-15 a LEFT join filter over a char(n)
       column and a chain of plain Nested Loops over Seq Scans (`z join z
-      z2 on z.a < z2.a join z z3 on z2.a < z3.a`). Still unannotated: a
-      LEFT join with a WHERE (unpriced too, RP-379), a parameterized inner
-      index scan with its own Filter, a Merge Join (its Sorts' `Sort
-      Method`), a hash table past `hash_mem` (several batches), a join
-      with an inner-unique inner side, and a chain whose top join's inner
-      side is a Memoize over an index scan (`z join z z2 on z.a < z2.a
-      join kz on z2.a < kz.a`: PostgreSQL's lower Nested Loop is `(actual
-      rows=190 loops=1)`, the Memoize its `Hits: 171  Misses: 19` line;
-      here the lower join prints bare).
+      z2 on z.a < z2.a join z z3 on z2.a < z3.a`), and since 2026-11-15
+      a chain whose top join's inner side is a Memoize over an index scan
+      (`z join z z2 on z.a < z2.a join kz on z2.a < kz.a`). Still
+      unannotated: a LEFT join with a WHERE (unpriced too, RP-379), a
+      parameterized inner index scan with its own Filter, a Merge Join (its
+      Sorts' `Sort Method`), a hash table past `hash_mem` (several
+      batches), a join with an inner-unique inner side, and a chain whose
+      lower join is not a plain Nested Loop (`z join kz on z.a = kz.a join
+      z z2 on z2.a < kz.a`: PostgreSQL 15.19 annotates the lower Hash Join
+      and the top join's `Rows Removed by Join Filter: 210`; here the whole
+      plan below the top prints bare).
       Measured on a private 15.19 cluster (found while working RP-386,
       the chain while working RP-354).
       Backlog-ID: RP-390
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[analyze of a nested loop of three relations into a memoized index]
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[analyze of a nested loop over a hash join]
 - [ ] **An inner join nested in an outer join keeps its one-table ON
       conjuncts in its Join Filter.** Since RP-391 / RP-392 an inner
       join's ON conjunct over one table is that table's scan Filter, but

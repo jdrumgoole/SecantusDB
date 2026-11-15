@@ -4548,8 +4548,12 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "        ->  Seq Scan on z z3 (actual rows=20 loops=1)",
         ],
     ),
+    # Split from RP-390 and fixed: a chain's top join whose inner side is a
+    # Memoize over a parameterized index scan counts the lower join's rows,
+    # and the Memoize its cache, as the scan's outer rows (they printed
+    # bare).
     "analyze of a nested loop of three relations into a memoized index": (
-        "RP-390",
+        "RP-389",
         _ANALYSED_INDEXED_SMALL,
         "explain (analyze, costs off, timing off, summary off)"
         " select * from z join z z2 on z.a < z2.a join kz on z2.a < kz.a",
@@ -4567,6 +4571,27 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "        Hits: 171  Misses: 19  Evictions: 0  Overflows: 0  Memory Usage: 15kB",
             "        ->  Index Scan using kz_pkey on kz (actual rows=19 loops=19)",
             "              Index Cond: (a > z2.a)",
+        ],
+    ),
+    # A chain whose lower join is a Hash Join: the top Nested Loop's outer
+    # side prints bare here (RP-390's remainder).
+    "analyze of a nested loop over a hash join": (
+        "RP-390",
+        _ANALYSED_INDEXED_SMALL,
+        "explain (analyze, costs off, timing off, summary off)"
+        " select * from z join kz on z.a = kz.a join z z2 on z2.a < kz.a",
+        [
+            "Nested Loop (actual rows=190 loops=1)",
+            "  Join Filter: (z2.a < kz.a)",
+            "  Rows Removed by Join Filter: 210",
+            "  ->  Hash Join (actual rows=20 loops=1)",
+            "        Hash Cond: (z.a = kz.a)",
+            "        ->  Seq Scan on z (actual rows=20 loops=1)",
+            "        ->  Hash (actual rows=30 loops=1)",
+            "              Buckets: 1024  Batches: 1  Memory Usage: 10kB",
+            "              ->  Seq Scan on kz (actual rows=30 loops=1)",
+            "  ->  Materialize (actual rows=20 loops=20)",
+            "        ->  Seq Scan on z z2 (actual rows=20 loops=1)",
         ],
     ),
     # An index over a weakly correlated column (RP-926): a nested loop's
