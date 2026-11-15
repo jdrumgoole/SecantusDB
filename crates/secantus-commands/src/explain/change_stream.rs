@@ -18,8 +18,15 @@
 //! scopes and every option that changes the filter
 //! (`tests/mongod_live/test_change_stream_explain.py`).
 //!
-//! Not reproduced: the rewrite of a user `$match` into the oplog filter
-//! (RM-452), the counts of a read that starts before the end of the oplog
+//! A `$match` on `operationType` that follows the stream -- with the
+//! `$match` on the event types a stream without `showExpandedEvents`
+//! starts with -- is rewritten into predicates on the oplog entry and
+//! joins the read's filter and the unwind's (RM-452), as mongod's
+//! `change_stream_rewrite_helpers.cpp` rewrites it.
+//!
+//! Not reproduced: the rewrites of the other event fields and of `$expr`
+//! (RM-698), the Boolean simplifier mongod runs over the unwind's filter
+//! (RM-699), the counts of a read that starts before the end of the oplog
 //! (RM-453), and the change stream's `queryShapeHash` (RM-454).
 
 use bson::{doc, Bson, Document, Timestamp};
@@ -109,7 +116,10 @@ impl Leaf {
 }
 
 /// One node of the oplog filter.
+#[derive(Clone)]
 enum M {
+    True,
+    False,
     And(Vec<M>),
     Or(Vec<M>),
     Nor(Vec<M>),
@@ -127,6 +137,8 @@ impl M {
             M::Leaf(_, leaf, _) => leaf.rank(),
             M::Not(_) => 18,
             M::Nor(_) => 19,
+            M::False => 24,
+            M::True => 25,
         }
     }
 
@@ -141,7 +153,7 @@ impl M {
         match self {
             M::And(c) | M::Or(c) | M::Nor(c) => c,
             M::Not(c) | M::ElemObject(_, c) => std::slice::from_ref(&**c),
-            M::Leaf(..) => &[],
+            M::Leaf(..) | M::True | M::False => &[],
         }
     }
 
@@ -162,7 +174,9 @@ impl M {
 
     /// The optimizer's flattening -- an `$and` in an `$and` (an `$or` in an
     /// `$or`) gives up its children to it, and a one-child `$and` / `$or` is
-    /// its child -- then `sortTree`: children first, each list stably.
+    /// its child -- its folding of `$alwaysTrue` / `$alwaysFalse`, its
+    /// merging of an `$or`'s equalities on one path into an `$in`, then
+    /// `sortTree`: children first, each list stably.
     fn normalized(self) -> M {
         let flat = |children: Vec<M>, and: bool| {
             let mut out = Vec::new();
@@ -173,32 +187,53 @@ impl M {
                     other => out.push(other),
                 }
             }
-            out.sort_by(M::compare);
             out
+        };
+        let single = |mut c: Vec<M>, empty: M, wrap: fn(Vec<M>) -> M| match c.len() {
+            0 => empty,
+            1 => c.pop().expect("one"),
+            _ => {
+                c.sort_by(M::compare);
+                wrap(c)
+            }
         };
         match self {
             M::And(c) => {
-                let mut c = flat(c, true);
-                if c.len() == 1 {
-                    c.pop().expect("one")
-                } else {
-                    M::And(c)
+                let c = flat(c, true);
+                if c.iter().any(|m| matches!(m, M::False)) {
+                    return M::False;
                 }
+                let c = c.into_iter().filter(|m| !matches!(m, M::True)).collect();
+                single(c, M::True, M::And)
             }
             M::Or(c) => {
-                let mut c = flat(c, false);
-                if c.len() == 1 {
-                    c.pop().expect("one")
-                } else {
-                    M::Or(c)
+                let c = flat(c, false);
+                if c.iter().any(|m| matches!(m, M::True)) {
+                    return M::True;
                 }
+                let c = c.into_iter().filter(|m| !matches!(m, M::False)).collect();
+                single(merge_equalities(c), M::False, M::Or)
             }
             M::Nor(c) => {
-                let mut c: Vec<M> = c.into_iter().map(M::normalized).collect();
-                c.sort_by(M::compare);
-                M::Nor(c)
+                let c: Vec<M> = c.into_iter().map(M::normalized).collect();
+                if c.iter().any(|m| matches!(m, M::True)) {
+                    return M::False;
+                }
+                let mut c: Vec<M> = c.into_iter().filter(|m| !matches!(m, M::False)).collect();
+                match c.len() {
+                    0 => M::True,
+                    1 => M::Not(Box::new(c.pop().expect("one"))).normalized(),
+                    _ => {
+                        c.sort_by(M::compare);
+                        M::Nor(c)
+                    }
+                }
             }
-            M::Not(c) => M::Not(Box::new(c.normalized())),
+            M::Not(c) => match c.normalized() {
+                M::True => M::False,
+                M::False => M::True,
+                c => M::Not(Box::new(c)),
+            },
             M::ElemObject(p, c) => M::ElemObject(p, Box::new(c.normalized())),
             leaf => leaf,
         }
@@ -212,6 +247,10 @@ impl M {
             M::Or(c) => doc! { "$or": list(c) },
             M::Nor(c) => doc! { "$nor": list(c) },
             M::Leaf(path, leaf, value) => doc! { path.clone(): { leaf.op(): value.clone() } },
+            M::True => doc! { "$alwaysTrue": 1 },
+            M::False => doc! { "$alwaysFalse": 1 },
+            // A `$not` of a tree prints as the `$nor` of it.
+            M::Not(child) if !matches!(**child, M::Leaf(..)) => doc! { "$nor": [child.to_doc()] },
             M::Not(child) => {
                 let inner = child.to_doc();
                 let (path, pred) = inner.into_iter().next().expect("a leaf");
@@ -220,6 +259,52 @@ impl M {
             M::ElemObject(path, child) => doc! { path.clone(): { "$elemMatch": child.to_doc() } },
         }
     }
+}
+
+/// The optimizer's `$in` of an `$or`'s equalities (and `$in`s) on one
+/// path, where there are two or more of them; the values sorted, once each.
+fn merge_equalities(children: Vec<M>) -> Vec<M> {
+    let mergeable = |m: &M| match m {
+        M::Leaf(_, Leaf::Eq, v) => !matches!(v, Bson::RegularExpression(_)),
+        M::Leaf(_, Leaf::In, _) => true,
+        _ => false,
+    };
+    let mut paths: Vec<String> = Vec::new();
+    for c in children.iter().filter(|m| mergeable(m)) {
+        let p = c.path().to_string();
+        let many = children
+            .iter()
+            .filter(|m| mergeable(m) && m.path() == p)
+            .count()
+            > 1;
+        if many && !paths.contains(&p) {
+            paths.push(p);
+        }
+    }
+    if paths.is_empty() {
+        return children;
+    }
+    let mut out = Vec::new();
+    let mut values: Vec<(String, Vec<Bson>)> =
+        paths.iter().map(|p| (p.clone(), Vec::new())).collect();
+    for c in children {
+        match c {
+            M::Leaf(p, kind, v) if paths.contains(&p) && matches!(kind, Leaf::Eq | Leaf::In) => {
+                let slot = &mut values.iter_mut().find(|(q, _)| *q == p).expect("a path").1;
+                match (kind, v) {
+                    (Leaf::In, Bson::Array(a)) => slot.extend(a),
+                    (_, v) => slot.push(v),
+                }
+            }
+            other => out.push(other),
+        }
+    }
+    for (p, mut vs) in values {
+        vs.sort_by(secantus_core::order::cmp);
+        vs.dedup();
+        out.push(M::Leaf(p, Leaf::In, Bson::Array(vs)));
+    }
+    out
 }
 
 fn leaf(path: &str, kind: Leaf, value: impl Into<Bson>) -> M {
@@ -303,6 +388,251 @@ impl Names {
     }
 }
 
+// --------------------------------------------------------- user match --
+
+/// A predicate of the `$match` that follows the stream, as mongod's parser
+/// makes it: `$ne` / `$nin` are the `$not` of `$eq` / `$in`, an empty
+/// `$in` is `$alwaysFalse`.
+enum U {
+    And(Vec<U>),
+    Or(Vec<U>),
+    Nor(Vec<U>),
+    Not(Box<U>),
+    Eq(String, Bson),
+    /// The equalities, and whether the list held a regex.
+    In(String, Vec<Bson>, bool),
+    /// `{$exists: true}`; `false` parses as its `$not`.
+    Exists(String),
+    /// Any other predicate on a path: its operator and operand.
+    Other(String, String, Bson),
+    /// `$expr`, `$where`, `$text`, ... -- nothing on a path.
+    Opaque,
+    False,
+}
+
+impl U {
+    fn parse(m: &Document) -> U {
+        let mut all = Vec::new();
+        for (k, v) in m {
+            let list = || -> Vec<U> {
+                match v {
+                    Bson::Array(a) => a
+                        .iter()
+                        .filter_map(|c| c.as_document().map(U::parse))
+                        .collect(),
+                    _ => Vec::new(),
+                }
+            };
+            match k.as_str() {
+                "$and" => all.push(U::And(list())),
+                "$or" => all.push(U::Or(list())),
+                "$nor" => all.push(U::Nor(list())),
+                "$alwaysFalse" => all.push(U::False),
+                k if k.starts_with('$') => all.push(U::Opaque),
+                path => all.push(U::path(path, v)),
+            }
+        }
+        if all.len() == 1 {
+            all.pop().expect("one")
+        } else {
+            U::And(all)
+        }
+    }
+
+    fn path(path: &str, v: &Bson) -> U {
+        let ops = match v {
+            Bson::Document(d) if d.keys().next().is_some_and(|k| k.starts_with('$')) => d,
+            other => return U::Eq(path.to_string(), other.clone()),
+        };
+        let mut all = Vec::new();
+        for (op, arg) in ops {
+            let one = |op: &str, arg: &Bson| -> U {
+                match op {
+                    "$eq" => U::Eq(path.to_string(), arg.clone()),
+                    "$in" => match arg {
+                        Bson::Array(a) if a.is_empty() => U::False,
+                        Bson::Array(a) => U::In(
+                            path.to_string(),
+                            a.iter()
+                                .filter(|b| !matches!(b, Bson::RegularExpression(_)))
+                                .cloned()
+                                .collect(),
+                            a.iter().any(|b| matches!(b, Bson::RegularExpression(_))),
+                        ),
+                        _ => U::Opaque,
+                    },
+                    "$exists" => U::Exists(path.to_string()),
+                    _ => U::Other(path.to_string(), op.to_string(), arg.clone()),
+                }
+            };
+            all.push(match op.as_str() {
+                "$ne" => U::Not(Box::new(one("$eq", arg))),
+                "$nin" => U::Not(Box::new(one("$in", arg))),
+                "$not" => match arg {
+                    Bson::Document(d) => {
+                        U::Not(Box::new(U::path(path, &Bson::Document(d.clone()))))
+                    }
+                    other => U::Not(Box::new(U::Other(
+                        path.to_string(),
+                        "$regex".into(),
+                        other.clone(),
+                    ))),
+                },
+                // `{$exists: false}` is the `$not` of `{$exists: true}`.
+                "$exists" if !truthy(arg) => U::Not(Box::new(U::Exists(path.to_string()))),
+                "$options" => continue,
+                op => one(op, arg),
+            });
+        }
+        if all.len() == 1 {
+            all.pop().expect("one")
+        } else {
+            U::And(all)
+        }
+    }
+
+    /// Whether the `$match`'s own optimizer folds it to `$alwaysFalse`: an
+    /// empty `$in`, or an `$and` holding one.
+    fn always_false(&self) -> bool {
+        match self {
+            U::False => true,
+            U::And(c) => c.iter().any(U::always_false),
+            U::Or(c) => !c.is_empty() && c.iter().all(U::always_false),
+            _ => false,
+        }
+    }
+}
+
+fn truthy(b: &Bson) -> bool {
+    !matches!(
+        b,
+        Bson::Boolean(false) | Bson::Null | Bson::Int32(0) | Bson::Int64(0) | Bson::Undefined
+    ) && !matches!(b, Bson::Double(d) if *d == 0.0)
+}
+
+/// mongod's `kOpTypeRewriteMap`: each event type as the oplog entries that
+/// make it.
+fn op_type_rewrite(name: &str) -> Option<M> {
+    let c = |field: &str| M::And(vec![op_is("c"), exists(field)]);
+    Some(match name {
+        "insert" => op_is("i"),
+        "delete" => op_is("d"),
+        "update" => M::And(vec![op_is("u"), M::Not(Box::new(exists("o._id")))]),
+        "replace" => M::And(vec![op_is("u"), exists("o._id")]),
+        "drop" => c("o.drop"),
+        "create" => c("o.create"),
+        "createIndexes" => M::And(vec![
+            op_is("c"),
+            M::Or(vec![
+                exists("o.createIndexes"),
+                exists("o.commitIndexBuild"),
+            ]),
+        ]),
+        "startIndexBuild" => c("o.startIndexBuild"),
+        "abortIndexBuild" => c("o.abortIndexBuild"),
+        "dropIndexes" => c("o.dropIndexes"),
+        "modify" => c("o.collMod"),
+        "rename" => c("o.renameCollection"),
+        "dropDatabase" => c("o.dropDatabase"),
+        _ => return None,
+    })
+}
+
+fn is_crud(name: &str) -> bool {
+    matches!(name, "insert" | "update" | "replace" | "delete")
+}
+
+/// mongod's `matchRewriteOperationType`.
+fn rewrite_operation_type(u: &U, path: &str) -> Option<M> {
+    // A subfield of `operationType` is always missing: the predicate is
+    // what it says of a missing field.
+    if path != "operationType" {
+        let on_missing = match u {
+            U::Eq(_, v) => matches!(v, Bson::Null),
+            U::In(_, vs, _) => vs.iter().any(|v| matches!(v, Bson::Null)),
+            U::Other(_, op, v) => matches!(op.as_str(), "$gte" | "$lte") && matches!(v, Bson::Null),
+            _ => false,
+        };
+        return Some(if on_missing { M::True } else { M::False });
+    }
+    let named = |v: &Bson| match v {
+        Bson::String(s) => op_type_rewrite(s).map(|m| (s.clone(), m)),
+        _ => None,
+    };
+    match u {
+        U::Eq(_, v) => Some(named(v).map_or(M::False, |(_, m)| m)),
+        U::In(_, _, true) => None,
+        U::In(_, vs, false) if vs.is_empty() => Some(M::False),
+        U::In(_, vs, false) => {
+            let mut names: Vec<String> = vs.iter().filter_map(named).map(|(s, _)| s).collect();
+            names.sort();
+            names.dedup();
+            names.sort_by(|a, b| is_crud(b).cmp(&is_crud(a)).then_with(|| a.cmp(b)));
+            let fused = names.iter().any(|n| n == "update") && names.iter().any(|n| n == "replace");
+            let mut any = Vec::new();
+            for n in names {
+                match n.as_str() {
+                    "replace" if fused => {}
+                    "update" if fused => any.push(op_is("u")),
+                    n => any.extend(op_type_rewrite(n)),
+                }
+            }
+            Some(M::Or(any))
+        }
+        _ => None,
+    }
+}
+
+/// mongod's `rewriteMatchExpressionTree`, for the fields this server
+/// rewrites: `operationType`. `None` is no rewrite.
+fn rewrite(u: &U, inexact: bool) -> Option<M> {
+    match u {
+        U::And(c) => {
+            let mut out = Vec::new();
+            for child in c {
+                match rewrite(child, inexact) {
+                    Some(m) => out.push(m),
+                    None if inexact => {}
+                    None => return None,
+                }
+            }
+            Some(M::And(out))
+        }
+        U::Or(c) => c
+            .iter()
+            .map(|x| rewrite(x, inexact))
+            .collect::<Option<Vec<_>>>()
+            .map(M::Or),
+        U::Nor(c) => {
+            let mut out = Vec::new();
+            for child in c {
+                match rewrite(child, false) {
+                    Some(m) => out.push(m),
+                    None if inexact => {}
+                    None => return None,
+                }
+            }
+            Some(M::Nor(out))
+        }
+        U::Not(c) => rewrite(c, false).map(|m| M::Not(Box::new(m))),
+        U::Eq(p, _) | U::In(p, ..) | U::Exists(p) | U::Other(p, ..) => match p.split('.').next() {
+            Some("operationType") => rewrite_operation_type(u, p),
+            _ => None,
+        },
+        U::Opaque | U::False => None,
+    }
+}
+
+/// The rewrite of the `$match` after the stream into the oplog's terms, if
+/// it has one; mongod skips a `$match` its optimizer folded to a constant.
+fn rewritten(user: Option<&Document>) -> Option<M> {
+    let u = U::parse(user?);
+    if u.always_false() {
+        return None;
+    }
+    rewrite(&u, true)
+}
+
 /// An oplog entry that writes a document: not a no-op, not a command.
 fn writes(ns_pattern: &str) -> M {
     M::And(vec![
@@ -336,27 +666,16 @@ fn commands(scope: &Scope, n: &Names, spec: &Spec) -> M {
     M::And(vec![M::Or(any), op_is("c"), regex("ns", &n.cmd_ns)])
 }
 
-/// The entries that are an event of the stream: its writes and commands,
-/// and -- unless `showExpandedEvents` -- only of the original event types.
-fn events(scope: &Scope, n: &Names, spec: &Spec) -> M {
+/// mongod's `buildOperationFilter`: the entries that are an event of the
+/// stream, its writes and commands, and of those the ones the `$match`
+/// after the stream -- the event types, without `showExpandedEvents` --
+/// rewritten can accept.
+fn events(scope: &Scope, n: &Names, spec: &Spec, user: Option<&M>) -> M {
     let entries = M::Or(vec![commands(scope, n, spec), writes(&n.ns)]);
-    if spec.expanded {
-        return entries;
+    match user {
+        Some(m) => M::And(vec![entries, m.clone()]),
+        None => entries,
     }
-    let command = |field: &str| M::And(vec![op_is("c"), exists(field)]);
-    M::And(vec![
-        entries,
-        M::Or(vec![
-            command("o.drop"),
-            command("o.dropDatabase"),
-            command("o.renameCollection"),
-            leaf(
-                "op",
-                Leaf::In,
-                Bson::Array(vec!["d".into(), "i".into(), "u".into()]),
-            ),
-        ]),
-    ])
 }
 
 /// The commands that end the stream: a drop or rename of the collection,
@@ -456,15 +775,22 @@ fn not_from_migration(n: &Names, spec: &Spec) -> Option<M> {
 
 /// The oplog filter, and the filter `internalUnwindTransaction` applies to
 /// the entries a transaction holds.
-fn filters(scope: &Scope, spec: &Spec, start: Timestamp) -> (Document, Document) {
+fn filters(
+    scope: &Scope,
+    spec: &Spec,
+    start: Timestamp,
+    user: Option<&Document>,
+) -> (Document, Document) {
     let n = Names::of(scope, spec.system);
+    let user = rewritten(user);
+    let user = user.as_ref();
     let mut any = Vec::new();
     if spec.expanded {
         if let Some(views) = &n.views {
             any.push(writes(views));
         }
     }
-    any.push(events(scope, &n, spec));
+    any.push(events(scope, &n, spec, user));
     any.extend(invalidations(scope));
     any.push(transactions(&n));
     any.push(sharding(&n, spec));
@@ -478,7 +804,7 @@ fn filters(scope: &Scope, spec: &Spec, start: Timestamp) -> (Document, Document)
     ]));
     let mut oplog = vec![M::Or(any), leaf("ts", Leaf::Gte, start)];
     oplog.extend(not_from_migration(&n, spec));
-    let mut unwind = vec![events(scope, &n, spec)];
+    let mut unwind = vec![events(scope, &n, spec, user)];
     unwind.extend(not_from_migration(&n, spec));
     (
         M::And(oplog).normalized().to_doc(),
@@ -635,7 +961,16 @@ fn stages_after_read(spec: &Spec, db: &str, user: &[Document], token: &Document)
                 Ok(children) if m.len() == 1 => all.extend(children.iter().cloned()),
                 _ => all.push(Bson::Document(m)),
             }
-            out.push(doc! { "$match": { "$and": all } });
+            // An `$and` holding `$alwaysFalse` is `$alwaysFalse`.
+            let never = doc! { "$alwaysFalse": 1 };
+            if all
+                .iter()
+                .any(|b| b.as_document().is_some_and(|d| *d == never))
+            {
+                out.push(doc! { "$match": never });
+            } else {
+                out.push(doc! { "$match": { "$and": all } });
+            }
         }
     }
     for stage in rest {
@@ -737,7 +1072,11 @@ pub(super) fn reply(
             )
         }
     };
-    let (filter, unwind) = filters(&scope, &spec, start);
+    let after = stages_after_read(&spec, &db, &pipeline[1..], &token);
+    // The `$match` that leads the stages after the read is the one mongod
+    // rewrites into the oplog filter.
+    let user = after.first().and_then(|s| s.get_document("$match").ok());
+    let (filter, unwind) = filters(&scope, &spec, start, user);
     let transform_by = projection(&spec);
     let no_indexes = |_: &Document| false;
     let key = cache_key::key_for(
@@ -834,7 +1173,7 @@ pub(super) fn reply(
         "stage": "$_internalChangeStreamCheckResumability",
         "resumeToken": token.clone(),
     } });
-    stages.extend(stages_after_read(&spec, &db, &pipeline[1..], &token));
+    stages.extend(after);
     if wanted {
         for stage in &mut stages {
             stage.insert("nReturned", 0_i64);
@@ -857,7 +1196,20 @@ mod tests {
     use super::*;
 
     fn hashes(scope: &Scope, raw: Document) -> (String, String) {
+        hashes_after(scope, raw, None)
+    }
+
+    /// The hashes of a stream whose `$match` after it is `user`, listed as
+    /// mongod lists it: joined to the event types unless
+    /// `showExpandedEvents`.
+    fn hashes_after(scope: &Scope, raw: Document, user: Option<Document>) -> (String, String) {
         let spec = Spec::of(&raw);
+        let types = doc! { "operationType": { "$in": EVENT_TYPES.to_vec() } };
+        let user = match (spec.expanded, user) {
+            (true, u) => u,
+            (false, None) => Some(types),
+            (false, Some(u)) => Some(doc! { "$and": [types, u] }),
+        };
         let (filter, _) = filters(
             scope,
             &spec,
@@ -865,6 +1217,7 @@ mod tests {
                 time: 1,
                 increment: 1,
             },
+            user.as_ref(),
         );
         let no = |_: &Document| false;
         let key = cache_key::key_for(
@@ -980,6 +1333,99 @@ mod tests {
             if !key_hash.is_empty() {
                 assert_eq!(k, key_hash, "planCacheKey of {raw}");
             }
+        }
+    }
+
+    /// mongod 8.2.11's `queryHash` of a collection stream followed by a
+    /// `$match` on `operationType` (2026-11-15): the rewrite that joins the
+    /// oplog filter (RM-452).
+    #[test]
+    fn a_match_on_the_operation_type_joins_the_read() {
+        let coll = Scope::Coll { db: "d", coll: "c" };
+        let cases: Vec<(Document, &str)> = vec![
+            (doc! { "operationType": "insert" }, "2CFDBDA8"),
+            (doc! { "operationType": "delete" }, "2CFDBDA8"),
+            (doc! { "operationType": "update" }, "C2547ADC"),
+            (doc! { "operationType": "replace" }, "D472C25A"),
+            (doc! { "operationType": "drop" }, "C1F2BAA7"),
+            (doc! { "operationType": "rename" }, "0F49F6B5"),
+            (doc! { "operationType": "dropDatabase" }, "8669925F"),
+            (doc! { "operationType": "create" }, "D47AF345"),
+            (doc! { "operationType": "modify" }, "0A8E56F6"),
+            (doc! { "operationType": "invalidate" }, "33ABFEAA"),
+            (doc! { "operationType": "bogus" }, "33ABFEAA"),
+            (doc! { "operationType": 1 }, "33ABFEAA"),
+            (doc! { "operationType": Bson::Null }, "33ABFEAA"),
+            (doc! { "operationType.a": 1 }, "33ABFEAA"),
+            (doc! { "operationType.a": { "$exists": false } }, "90A52575"),
+            (
+                doc! { "operationType": { "$in": ["insert", "update"] } },
+                "96297809",
+            ),
+            (
+                doc! { "operationType": { "$in": ["insert", "delete"] } },
+                "1D036745",
+            ),
+            (
+                doc! { "operationType": { "$in": ["update", "replace"] } },
+                "2CFDBDA8",
+            ),
+            (
+                doc! { "operationType": { "$in": ["insert", 3] } },
+                "2CFDBDA8",
+            ),
+            (
+                doc! { "operationType": { "$in": ["drop", "createIndexes", "insert"] } },
+                "DE50B65C",
+            ),
+            (
+                doc! { "operationType": { "$in": ["createIndexes"] } },
+                "6E0AA942",
+            ),
+            (doc! { "operationType": { "$in": [] } }, "95183B55"),
+            (doc! { "operationType": { "$ne": "insert" } }, "FFF0FC73"),
+            (
+                doc! { "operationType": { "$nin": ["bogus", "insert"] } },
+                "FFF0FC73",
+            ),
+            (
+                doc! { "operationType": { "$not": { "$eq": "insert" } } },
+                "FFF0FC73",
+            ),
+            (doc! { "operationType": { "$ne": "bogus" } }, "90A52575"),
+            (doc! { "operationType": { "$ne": "update" } }, "D6530318"),
+            (
+                doc! { "operationType": { "$nin": ["update", "drop"] } },
+                "E1359AA6",
+            ),
+            (
+                doc! { "$nor": [{ "operationType": "update" }, { "operationType": "drop" }] },
+                "7203AC7F",
+            ),
+            (
+                doc! { "$nor": [{ "operationType": "insert" }, { "x": 1 }] },
+                "FFF0FC73",
+            ),
+            (
+                doc! { "$or": [{ "operationType": "insert" }, { "operationType": "delete" }] },
+                "1D036745",
+            ),
+            (
+                doc! { "$or": [{ "operationType": "insert" }, { "x": 1 }] },
+                "90A52575",
+            ),
+            (
+                doc! { "$and": [{ "operationType": "insert" }, { "operationType": "delete" }] },
+                "E37C3474",
+            ),
+            (doc! { "operationType": "insert", "x": 1 }, "2CFDBDA8"),
+            (doc! { "operationType": { "$exists": true } }, "90A52575"),
+            (doc! { "operationType": { "$gt": "a" } }, "90A52575"),
+            (doc! { "x": 1 }, "90A52575"),
+        ];
+        for (user, want) in cases {
+            let (q, _) = hashes_after(&coll, doc! {}, Some(user.clone()));
+            assert_eq!(q, want, "queryHash after {user}");
         }
     }
 

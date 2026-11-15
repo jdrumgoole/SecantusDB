@@ -2730,19 +2730,29 @@ differs on none (re-measured 2026-11-09 after RM-454; 1 earlier that day, 2 on 2
 mongod keeps the oplog of earlier runs and a stream started in the past
 would see them. What is left:
 
-- [ ] **RUST MongoDB server: a `$match` after a `$changeStream` is not
-      rewritten into the oplog filter.** mongod rewrites a `$match` on the
-      event's fields (`operationType`, `fullDocument`,
-      `fullDocumentBeforeChange`, `documentKey`, `ns`, ...) into predicates
-      on the oplog entry and adds them to the read's filter, so the
-      `explain`'s `parsedQuery` and its hashes change (`operationType:
-      "insert"` adds `op: {$eq: "i"}` beside the writes: `queryHash`
-      2CFDBDA8, not 90A52575; mongod 8.2.11, 2026-11-09). This server lists
-      the `$match` as mongod does after the read and leaves the filter as it
-      is without one. Needs mongod's per-field rewrites transcribed (found
-      working RM-076).
-      Verify: tests/backlog/test_rm_found_2026_11_09_rm076.py::test_a_match_on_an_event_field_joins_the_oplog_filter
-      Backlog-ID: RM-452
+- [ ] **RUST MongoDB server: a `$match` after a `$changeStream` on an
+      event field other than `operationType` is not rewritten into the
+      oplog filter.** mongod 8.2.11 rewrites predicates on `fullDocument`,
+      `documentKey`, `ns`, `to`, `updateDescription`,
+      `fullDocumentBeforeChange`, the renamed `clusterTime` / `lsid` /
+      `txnNumber` (also into the transaction filter), and an `$expr` over
+      them, and adds them to the read's filter (`fullDocument.a: 1`:
+      `queryHash` 193DCAB5, not 90A52575; 2026-11-15). RM-452 ported the
+      `operationType` rewrite only; the rest of
+      `change_stream_rewrite_helpers.cpp` is to transcribe (found working
+      RM-452).
+      Verify: tests/backlog/test_rm_found_2026_11_15_rm452.py::test_a_match_on_another_event_field_joins_the_oplog_filter
+      Backlog-ID: RM-698
+- [ ] **RUST MongoDB server: the unwind filter of a change stream is not
+      Boolean-simplified.** mongod 8.2.11 optimizes
+      `internalUnwindTransaction`'s filter with its Boolean expression
+      simplifier (the oplog filter it optimizes without): after
+      `operationType: "drop"` (`rename`, `dropDatabase`) the writes branch
+      and the event-type `$or` fall away, as only a command can match. This
+      server prints the unsimplified `$and`, which matches the same entries
+      (2026-11-15, found working RM-452).
+      Verify: tests/backlog/test_rm_found_2026_11_15_rm452.py::test_the_unwind_filter_is_simplified
+      Backlog-ID: RM-699
 - [ ] **RUST MongoDB server: `executionStats` of a change stream counts
       nothing.** mongod 8.2.11 runs the oplog read under `executionStats`:
       a stream started before three inserts counts the three entries at

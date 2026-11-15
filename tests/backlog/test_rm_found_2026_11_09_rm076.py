@@ -19,12 +19,13 @@ def _planner(client: Any, then: list) -> dict:
     return e["stages"][0]["$cursor"]["queryPlanner"]
 
 
-@pytest.mark.backlog("RM-452")
+@pytest.mark.backlog_fixed("RM-452")
 def test_a_match_on_an_event_field_joins_the_oplog_filter(rust_mongo: Any, mongod_rs: Any) -> None:
     """mongod 8.2.11 rewrites a `$match` on `operationType` into the oplog
     filter (`operationType: "insert"` adds `op: {$eq: "i"}` beside the
     writes), which changes the read's shape: its `queryHash` is 2CFDBDA8
-    rather than 90A52575."""
+    rather than 90A52575. This server left the filter as it was until
+    `change_stream.rs` ported mongod's `operationType` rewrite (RM-452)."""
     then = [{"$match": {"operationType": "insert"}}]
     want = _planner(mongod_rs, then)["queryHash"]
     assert want == "2CFDBDA8"
