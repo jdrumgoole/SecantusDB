@@ -1032,6 +1032,14 @@ impl<'a> Printer<'a> {
             // stays a name.
             let keep = |t: &str| t == "text" || t == "name";
             let text_side = |t: &str| matches!(t, "text" | "varchar");
+            // `varchar` meets `char(n)` through `bpchareq`, the varchar
+            // side relabelled to `bpchar` (PostgreSQL 15.19, RP-738).
+            if l == "varchar" && r == "bpchar" {
+                return Some(("bpchar".into(), String::new()));
+            }
+            if l == "bpchar" && r == "varchar" {
+                return Some((String::new(), "bpchar".into()));
+            }
             let (lt, rt) = if (l == "name" && text_side(r)) || (r == "name" && text_side(l)) {
                 (
                     if keep(l) { "" } else { "text" },

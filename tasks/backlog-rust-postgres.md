@@ -2872,15 +2872,6 @@ Measured on a private PostgreSQL 15.19 cluster with the `_SETUP` in
 varchar(4), t text)` holding `(1, 'y', 'y', 'y')` and `(2, 'ab', 'ab ',
 'ab ')`.
 
-- [ ] **EXPLAIN of a JOIN ... ON a `varchar` column equal to a `char(n)`
-      one prints the Hash Cond through `text` casts.** `explain (costs
-      off) select x.k, y.k from ch726 x join ch726 y on x.v = y.c` prints
-      `Hash Cond: ((x.v)::bpchar = y.c)` on PostgreSQL 15.19, the operator
-      it resolved (`bpchareq`, the `varchar` side relabelled); here
-      `((x.v)::text = (y.c)::text)`. The rows are right since RP-736.
-      Found while working RP-736 (2026-11-09).
-      Verify: tests/backlog/test_rp_found_rp726.py::test_explain_join_on_varchar_against_char_n
-      Backlog-ID: RP-738
 
 ## Found while working RP-732 (2026-11-09)
 
