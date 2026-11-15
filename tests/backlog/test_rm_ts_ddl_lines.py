@@ -106,10 +106,10 @@ def test_a_coll_mod_of_a_missing_collection_names_cmd(rust_mongo: Any, mongod_rs
     assert got["rust"] == got["mongod"]
 
 
-@pytest.mark.backlog("RM-585")
+@pytest.mark.backlog_fixed("RM-585")
 def test_an_insert_into_buckets_is_profiled(rust_mongo: Any, mongod_rs: Any) -> None:
     """mongod 8.2.11 profiles an `insert` into `system.buckets.ts`; this
-    server writes its line and no profile entry."""
+    server wrote its line and no profile entry."""
     got = _named(
         rust_mongo,
         mongod_rs,

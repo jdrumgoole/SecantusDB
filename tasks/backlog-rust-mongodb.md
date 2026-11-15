@@ -791,12 +791,6 @@ These are explicit non-goals. Don't add them without a reason.
       working RM-485, 2026-11-13.
       Verify: tests/backlog/test_rm_view_ddl_refusals.py::test_a_drop_indexes_of_system_views_answers
       Backlog-ID: RM-588
-- [ ] **An `insert` into a time-series collection's buckets is not
-      profiled.** mongod 8.2.11 writes a profile entry for an `insert` into
-      `<db>.system.buckets.ts`; this server writes the line and no entry.
-      Found while working RM-484, 2026-11-13.
-      Verify: tests/backlog/test_rm_ts_ddl_lines.py::test_an_insert_into_buckets_is_profiled
-      Backlog-ID: RM-585
 - [ ] **A `find` of a time-series collection's buckets does not say what
       it examined.** mongod 8.2.11's line for a `find` of
       `<db>.system.buckets.ts` has `keysExamined`, `docsExamined` and

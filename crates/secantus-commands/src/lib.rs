@@ -2067,6 +2067,11 @@ fn dispatch_inner(
             if doc.get("autocommit") != Some(&Bson::Boolean(false)) {
                 // `system.buckets.<name>` of a time-series collection.
                 if let Some(reply) = ts_bucket_ns::intercept(name, doc, ctx) {
+                    // An `insert` into the buckets ran, and mongod 8.2.11
+                    // profiles it as one into any collection (RM-585).
+                    if name == "insert" {
+                        profiler::mark_reached(ctx);
+                    }
                     return reply;
                 }
                 if let Some(reply) = views::refusal(name, doc, ctx) {
