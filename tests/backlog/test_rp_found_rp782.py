@@ -130,8 +130,8 @@ def test_pg_get_viewdef_of_a_system_view(dsn: str) -> None:
 
 
 # The system views the printer does not reproduce are still NULL: an
-# `information_schema` view (its domain casts), and a function in FROM,
-# which ruleutils prints with its column definition list.
+# `information_schema` view (its domain casts), and `pg_catalog` views
+# such as `pg_sequences` and the `pg_stat_*` family.
 @pytest.mark.backlog("RP-798")
 def test_pg_get_viewdef_of_the_remaining_system_views(dsn: str) -> None:
     with _connect(dsn) as c:
@@ -139,35 +139,43 @@ def test_pg_get_viewdef_of_the_remaining_system_views(dsn: str) -> None:
             _answer(c, sql)
             for sql in [
                 "select pg_get_viewdef('information_schema.domains'::regclass) is not null",
-                "select pg_get_viewdef('pg_settings'::regclass)",
+                "select pg_get_viewdef('pg_sequences'::regclass) is not null",
             ]
         ]
+    assert got == [[(True,)], [(True,)]]
+
+
+# A function in FROM returning a record of OUT parameters prints with its
+# column list, as ruleutils expands it. It was NULL: the printer refused
+# `SELECT * FROM f() a` over a record; fixed by naming the RTE's columns
+# from the built-in's OUT parameters (RP-798).
+@pytest.mark.backlog_fixed("RP-798")
+def test_pg_get_viewdef_of_a_view_over_a_function_in_from(dsn: str) -> None:
+    with _connect(dsn) as c:
+        got = _answer(c, "select pg_get_viewdef('pg_settings'::regclass)")
     assert got == [
-        [(True,)],
-        [
-            (
-                " SELECT a.name,\n"
-                "    a.setting,\n"
-                "    a.unit,\n"
-                "    a.category,\n"
-                "    a.short_desc,\n"
-                "    a.extra_desc,\n"
-                "    a.context,\n"
-                "    a.vartype,\n"
-                "    a.source,\n"
-                "    a.min_val,\n"
-                "    a.max_val,\n"
-                "    a.enumvals,\n"
-                "    a.boot_val,\n"
-                "    a.reset_val,\n"
-                "    a.sourcefile,\n"
-                "    a.sourceline,\n"
-                "    a.pending_restart\n"
-                "   FROM pg_show_all_settings() a(name, setting, unit, category, short_desc,"
-                " extra_desc, context, vartype, source, min_val, max_val, enumvals, boot_val,"
-                " reset_val, sourcefile, sourceline, pending_restart);",
-            )
-        ],
+        (
+            " SELECT a.name,\n"
+            "    a.setting,\n"
+            "    a.unit,\n"
+            "    a.category,\n"
+            "    a.short_desc,\n"
+            "    a.extra_desc,\n"
+            "    a.context,\n"
+            "    a.vartype,\n"
+            "    a.source,\n"
+            "    a.min_val,\n"
+            "    a.max_val,\n"
+            "    a.enumvals,\n"
+            "    a.boot_val,\n"
+            "    a.reset_val,\n"
+            "    a.sourcefile,\n"
+            "    a.sourceline,\n"
+            "    a.pending_restart\n"
+            "   FROM pg_show_all_settings() a(name, setting, unit, category, short_desc,"
+            " extra_desc, context, vartype, source, min_val, max_val, enumvals, boot_val,"
+            " reset_val, sourcefile, sourceline, pending_restart);",
+        )
     ]
 
 

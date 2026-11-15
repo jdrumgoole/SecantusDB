@@ -111,6 +111,10 @@ struct JoinRte {
 /// whose first field is this marker.
 const VAR_MARK: &str = "\u{1f}var";
 
+/// A FROM function: (the call, the name the query uses for it, its
+/// columns' names and types).
+type FunctionItem = (Node, String, Vec<(String, String)>);
+
 fn var_ref(scope: usize, rte: usize, col: usize) -> Node {
     column_ref(&[
         VAR_MARK,
@@ -2785,10 +2789,8 @@ impl Printer<'_> {
             }
             N::JoinExpr(j) => return self.collect_join(j, out),
             N::RangeFunction(rf) => {
-                let (call, name, column, ty) = self.function_item(rf)?;
-                let _ = call;
+                let (_, name, columns) = self.function_item(rf)?;
                 let refname = self.unique_refname(&name, out);
-                let columns = vec![(column, ty)];
                 out.push(Rte {
                     refname,
                     name,
@@ -2994,12 +2996,10 @@ impl Printer<'_> {
         Some(idx)
     }
     /// A FROM item that is one plain call of a function returning a scalar
-    /// (`generate_series(1, 10) g`): (the call, the name the query uses
-    /// for it, its one column's name and type).
-    fn function_item(
-        &mut self,
-        rf: &pg_query::protobuf::RangeFunction,
-    ) -> Option<(Node, String, String, String)> {
+    /// (`generate_series(1, 10) g`), or of a built-in returning a record of
+    /// OUT parameters (`pg_show_all_settings() a`): (the call, the name the
+    /// query uses for it, its columns' names and types).
+    fn function_item(&mut self, rf: &pg_query::protobuf::RangeFunction) -> Option<FunctionItem> {
         if rf.lateral || rf.ordinality || rf.is_rowsfrom || !rf.coldeflist.is_empty() {
             return None;
         }
@@ -3021,6 +3021,29 @@ impl Printer<'_> {
         let fname = crate::func_name(f)?;
         if f.agg_star || f.over.is_some() || !f.agg_order.is_empty() {
             return None;
+        }
+        if let Some(mut columns) = f
+            .args
+            .is_empty()
+            .then(|| crate::builtin_out_columns(&fname))
+            .flatten()
+        {
+            // The OUT parameters name the columns; an alias may rename
+            // the leading ones (`addRangeTableEntryForFunction`).
+            let name = match rf.alias.as_ref() {
+                Some(a) => {
+                    let cols = names(&a.colnames);
+                    if cols.len() > columns.len() {
+                        return None;
+                    }
+                    for (c, n) in columns.iter_mut().zip(cols) {
+                        c.0 = n;
+                    }
+                    a.aliasname.clone()
+                }
+                None => fname,
+            };
+            return Some((call, name, columns));
         }
         let args = f
             .args
@@ -3065,7 +3088,7 @@ impl Printer<'_> {
             }
             None => (fname.clone(), fname),
         };
-        Some((call, name, column, ty))
+        Some((call, name, vec![(column, ty)]))
     }
 
     /// `set_rtable_names`: `name`, or `name_N` for the least N free, when an
@@ -3838,7 +3861,7 @@ impl Printer<'_> {
             N::RangeFunction(rf) => {
                 let rte = entry(self, *at)?;
                 *at += 1;
-                let (call, _, _, _) = self.function_item(rf)?;
+                let (call, _, _) = self.function_item(rf)?;
                 self.expr(&call)?;
                 self.buf.push(' ');
                 self.buf.push_str(&q(&rte.refname));
@@ -6318,4 +6341,40 @@ pub fn explain_verbose_scan(
         output,
         quals,
     })
+}
+
+#[cfg(test)]
+mod out_parameter_function_tests {
+    use super::*;
+
+    #[test]
+    fn a_record_of_out_parameters_in_from_prints_its_column_list() {
+        // PostgreSQL 15.19 (RP-798): `pg_settings` is `SELECT * FROM
+        // pg_show_all_settings() AS A`; ruleutils expands the star to the
+        // OUT parameters and prints them as the alias's column list.
+        let none_t = |_: &str| None;
+        let none_v = |_: &str| None;
+        let cat = Catalog {
+            lookup: &none_t,
+            view_sql: &none_v,
+        };
+        let got = viewdef(
+            "SELECT * FROM pg_show_all_settings() AS A(n, s)",
+            None,
+            &cat,
+        )
+        .unwrap();
+        assert!(
+            got.starts_with(" SELECT a.n,\n    a.s,\n    a.unit,"),
+            "{got}"
+        );
+        assert!(
+            got.ends_with(
+                "FROM pg_show_all_settings() a(n, s, unit, category, short_desc, extra_desc, \
+                 context, vartype, source, min_val, max_val, enumvals, boot_val, reset_val, \
+                 sourcefile, sourceline, pending_restart);"
+            ),
+            "{got}"
+        );
+    }
 }

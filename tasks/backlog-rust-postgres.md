@@ -3060,17 +3060,19 @@ with ICU) with the `_SETUP` in `tests/backlog/test_rp_found_rp782.py`:
 - [ ] **`pg_get_viewdef` of most system views is NULL.** PostgreSQL
       15.19 deparses every `pg_catalog` and `information_schema` view's
       rule. Here `system_view_defs` prints `system_views.sql`'s queries
-      through `ruleutils`, which reproduces 16 of the 140 exactly
-      (`pg_tables`, `pg_roles`, `pg_stats`, ...; measured 2026-11-15) and
-      leaves the rest NULL rather than print them as written. Two shapes
-      remain: a function in FROM, printed with its column definition list
-      (`pg_settings`: `FROM pg_show_all_settings() a(name, setting, ...)`,
-      `pg_locks`; the printer refuses `SELECT * FROM f() a`), and every
-      `information_schema` view, left out because the printer casts to the
-      bare domain where ruleutils qualifies it and casts a literal to the
-      base type first (`('c'::character varying)::information_schema.character_data`,
-      `(x)::information_schema.sql_identifier`); 22 of them it would print
-      wrong that way, the rest it refuses.
+      through `ruleutils`, which reproduces 38 of the 75 `pg_catalog`
+      views exactly (`pg_tables`, `pg_roles`, `pg_stats`, `pg_settings`,
+      `pg_locks`, ...; none printed wrong, measured 2026-11-15) and
+      leaves the rest NULL rather than print them as written. Remaining:
+      the 37 other `pg_catalog` views (`pg_sequences`, `pg_policies`,
+      `pg_seclabels`, `pg_publication_tables`, `pg_stats_ext*`, and every
+      `pg_stat_*` / `pg_statio_*` view), which the printer refuses; and
+      every `information_schema` view, left out because the printer casts
+      to the bare domain where ruleutils qualifies it and casts a literal
+      to the base type first
+      (`('c'::character varying)::information_schema.character_data`,
+      `(x)::information_schema.sql_identifier`). A function in FROM
+      returning a record of OUT parameters prints since 2026-11-15.
       Verify: tests/backlog/test_rp_found_rp782.py::test_pg_get_viewdef_of_the_remaining_system_views
       Backlog-ID: RP-798
 
