@@ -615,12 +615,6 @@ _FORWARD = (
 _TOO_MANY = ("42P10", 'WITH query "w" has 1 columns available but 2 columns specified', None, "6")
 _TWICE = ("42712", 'WITH query name "w" specified more than once', None, "25")
 WITH_CHECKS = {
-    "with w as (select 'x'::int) select 1": (
-        "22P02",
-        'invalid input syntax for type integer: "x"',
-        None,
-        "19",
-    ),
     "select (with w as (select nosuch) select 1)": _missing("27"),
     "with v as (select a from w), w as (select 1 as a) select 1": _FORWARD,
     "with v as (select a from w), w as (select 1 as a) select * from v": _FORWARD,
@@ -628,15 +622,34 @@ WITH_CHECKS = {
     "with w(x, y) as (select 1) select * from w": _TOO_MANY,
     "with w as (select 1 a), w as (select 2 a) select 1": _TWICE,
     "with w as (select 1 a), w as (select 2 a) select * from w": _TWICE,
+    # An unread item reading an enclosing level's column or CTE, and one
+    # only running would fail, are no error.
+    "select (with w as (select v.a + 1) select 7) from (values (1)) v(a)": None,
+    "select * from (values (1)) v(a) where exists (with w as (select v.a) select 1)": None,
+    "with o as (select 5 c) select (with w as (select c from o) select 1)": None,
+    "select (with w as (select 1/0) select 1)": None,
 }
 
 
-@pytest.mark.backlog("RP-504")
+@pytest.mark.backlog_fixed("RP-504")
 @pytest.mark.parametrize("query", list(WITH_CHECKS))
 def test_with_clause_checks(query: str, rust_pg: Any) -> None:
-    """Each runs here, or is 42601 `table "w" has 1 columns available but
-    2 columns specified` with no position, or misses the HINT."""
+    """Each ran here, or was 42601 `table "w" has 1 columns available but
+    2 columns specified` with no position, or missed the HINT: a WITH in a
+    subquery expression was not analysed, nor was an item's alias list
+    counted, a name given twice refused, or a forward reference hinted."""
     assert answer(rust_pg, query) == WITH_CHECKS[query]
+
+
+@pytest.mark.backlog("RP-504")
+def test_with_unread_literal_input(rust_pg: Any) -> None:
+    """An unread item's literal is not read as its type, so it runs here."""
+    assert answer(rust_pg, "with w as (select 'x'::int) select 1") == (
+        "22P02",
+        'invalid input syntax for type integer: "x"',
+        None,
+        "19",
+    )
 
 
 # Found while working RP-501, measured on PostgreSQL 15.19: a subquery's

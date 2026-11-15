@@ -2403,19 +2403,15 @@ Measured on a private PostgreSQL 15.19 cluster.
 Measured on PostgreSQL 15.19 (the data-modifying WITH on a private cluster).
 
 - [ ] **What `transformWithClause` checks of a WITH is not all checked.**
-      Since RP-501 an unread item is planned without being run, so its
-      names and types are checked, but not: an unread item's literal input
-      (`with w as (select 'x'::int) select 1` is 22P02 at 19 there, `1`
-      here); an item of a WITH inside a subquery expression (`select (with
-      w as (select nosuch) select 1)`, 42703 at 27 there, `1` here); the
-      forward reference's HINT `Use WITH RECURSIVE, or re-order the WITH
-      items to remove forward references.`; an alias list longer than the
-      item's columns (`with w(x, y) as (select 1)`, 42P10 `WITH query "w"
-      has 1 columns available but 2 columns specified` at 6 there; here
-      42601 `table "w" ...` with no position when read, and nothing when
-      not); and a name given twice (42712 `WITH query name "w" specified
-      more than once` at the second, 25; here the first wins).
-      Verify: tests/backlog/test_rp_fromless_analysis.py::test_with_clause_checks
+      An unread item's literal input is not read as its type: `with w as
+      (select 'x'::int) select 1` is 22P02 at 19 on PostgreSQL 15.19, `1`
+      here (the item is planned without running, and the cast only fails
+      when evaluated). And a WITH of a subquery expression under a level
+      with FROM items has its unread items planned on their own, where that
+      level's columns are not in scope, so a name such an item does not find
+      (42703, 42P01) is let go rather than raised: `select (with w as
+      (select nosuch) select 1) from (values (1)) v(a)` answers 1 here.
+      Verify: tests/backlog/test_rp_fromless_analysis.py::test_with_unread_literal_input
       Backlog-ID: RP-504
 
 ## Found while working RP-486 (2026-11-07)

@@ -25875,7 +25875,22 @@ fn resolve_one_sublink(
         e.extend(outer.iter().cloned());
         d
     });
-    let resolved = resolve_sublinks_in_select(&mut inner, lookup, params, run);
+    let resolved = resolve_sublinks_in_select(&mut inner, lookup, params, run).and_then(|()| {
+        // Its own WITH is analysed as the statement's is, read or not
+        // (RP-504), with the enclosing levels' CTEs in scope. An item is
+        // planned on its own, where an enclosing level's column is not in
+        // scope, so under a level with columns a name it does not find is
+        // left alone (the backlog's RP-504 remainder).
+        if inner.with_clause.is_some() {
+            match unread_ctes::analyse(&with_visible_ctes(&inner)?, lookup, params) {
+                Err(e) if !outer.is_empty() && matches!(e.sqlstate(), "42703" | "42P01") => {
+                    take_error_location();
+                }
+                r => r?,
+            }
+        }
+        Ok(())
+    });
     ENCLOSING_COLUMNS.with(|e| e.borrow_mut().truncate(enclosing));
     resolved?;
     // The enclosing statements' CTEs are in scope, as an outer scope its own
@@ -27503,15 +27518,21 @@ pub(crate) fn visible_cte_def(
 pub(crate) fn under_visible_ctes(
     s: &pg_query::protobuf::SelectStmt,
 ) -> Result<pg_query::protobuf::SelectStmt> {
+    inline_ctes(&with_visible_ctes(s)?)
+}
+
+/// `s` with the enclosing statements' CTEs substituted where it reads them,
+/// its own WITH kept.
+fn with_visible_ctes(s: &pg_query::protobuf::SelectStmt) -> Result<pg_query::protobuf::SelectStmt> {
     let visible = VISIBLE_CTES.with(|v| v.borrow().clone());
     if visible.is_empty() {
-        return inline_ctes(s);
+        return Ok(s.clone());
     }
     let defs = cte_defs(&pg_query::protobuf::WithClause {
         ctes: visible,
         ..Default::default()
     })?;
-    inline_ctes(&substitute_ctes(s, &defs))
+    Ok(substitute_ctes(s, &defs))
 }
 
 /// Push a WITH's items onto `VISIBLE_CTES` for the subqueries resolved

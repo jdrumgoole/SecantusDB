@@ -53,6 +53,28 @@ pub(crate) fn analyse_with(
     if with.recursive {
         return Ok(());
     }
+    // `transformWithClause` refuses a name given twice before it analyses
+    // any item, at the second (RP-504).
+    let items: Vec<&pg_query::protobuf::CommonTableExpr> = with
+        .ctes
+        .iter()
+        .filter_map(|c| match c.node.as_ref() {
+            Some(N::CommonTableExpr(c)) => Some(&**c),
+            _ => None,
+        })
+        .collect();
+    for (i, c) in items.iter().enumerate() {
+        if let Some(dup) = items[i + 1..].iter().find(|d| d.ctename == c.ctename) {
+            set_error_location(dup.location);
+            return Err(Error::Sqlstate(
+                "42712",
+                format!(
+                    "WITH query name \"{}\" specified more than once",
+                    dup.ctename
+                ),
+            ));
+        }
+    }
     let names: Vec<&str> = with
         .ctes
         .iter()
@@ -82,16 +104,50 @@ pub(crate) fn analyse_with(
                 .iter()
                 .any(|later| reads(later, names[i]))
     };
-    let Some(last_unread) = (0..names.len()).rev().find(|&i| !read(i)) else {
+    // An item with a column alias list, or one naming an item written after
+    // it, is analysed too: `analyzeCTETargetList` counts the aliases against
+    // the item's columns (42P10), and `parserOpenTable` hints at a forward
+    // reference (RP-504), neither of which the inlined statement reports.
+    let forward = |i: usize| {
+        names[i + 1..]
+            .iter()
+            .any(|later| reads(&with.ctes[i], later))
+    };
+    let Some(last) = (0..names.len())
+        .rev()
+        .find(|&i| !read(i) || !items[i].aliascolnames.is_empty() || forward(i))
+    else {
         return Ok(());
     };
     let Ok(defs) = cte_defs(with) else {
         return Ok(());
     };
-    for (_, body, _) in defs.iter().take(last_unread + 1) {
+    for (i, (name, body, aliases)) in defs.iter().enumerate().take(last + 1) {
         let planned = planning_without_running(|| plan_select(body, lookup, params));
         match planned {
-            Ok(_) => {}
+            Ok(_) => {
+                if let Some(columns) = domain_scope::output_columns(body, lookup, &Vec::new()) {
+                    if columns.len() < aliases.len() {
+                        set_error_location(items[i].location);
+                        return Err(Error::Sqlstate(
+                            "42P10",
+                            format!(
+                                "WITH query \"{name}\" has {} columns available but {} columns specified",
+                                columns.len(),
+                                aliases.len()
+                            ),
+                        ));
+                    }
+                }
+            }
+            Err(Error::UndefinedTable(t)) if names[i + 1..].contains(&t.as_str()) => {
+                return Err(Error::Sqlstate(
+                    "42P01",
+                    format!(
+                        "relation \"{t}\" does not exist\nHint: Use WITH RECURSIVE, or re-order the WITH items to remove forward references."
+                    ),
+                ));
+            }
             Err(e) if raised_by_analysis(&e) => return Err(e),
             // An error only running the item raises (a division by zero, a
             // value's input), or a shape this server refuses, which a
