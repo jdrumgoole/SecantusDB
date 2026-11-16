@@ -22,8 +22,10 @@ mod domain_scope;
 mod join_alias;
 mod record_image;
 mod relabel;
+mod sublink_join;
 mod subquery_pullup;
 pub use domain_scope::{select_output_domains, select_target_domain};
+pub use sublink_join::SemiJoin;
 mod targetlist_size;
 pub use targetlist_size::MAX_HEAP_ATTRIBUTE_NUMBER;
 mod cmpfn;
@@ -3764,6 +3766,9 @@ pub struct ExplainOptions {
     /// That scan's WHERE, for the server to print and price as its
     /// Filter once it knows the function's result columns (RP-475).
     pub function_scan_where: Option<Box<FunctionScanWhere>>,
+    /// A SELECT whose WHERE is one IN or EXISTS sublink pulled up into a
+    /// semi join (RP-411).
+    pub semi_join: Option<Box<SemiJoin>>,
 }
 
 /// A user function scan's WHERE, kept until the function's result
@@ -12375,6 +12380,7 @@ fn plan_explain(
         function_scan: None,
         function_scan_call: None,
         function_scan_where: None,
+        semi_join: None,
     };
     let (mut timing, mut summary) = (None, None);
     // `transformExplainStmt` resolves the statement's names and literals
@@ -12463,6 +12469,10 @@ fn plan_explain(
     join_alias::flatten_join_aliases(&mut query, lookup)?;
     // A simple FROM-subquery is merged into its parent (RP-422).
     subquery_pullup::pull_up_simple_subquery(&mut query, lookup)?;
+    // An IN / EXISTS sublink is pulled up into a semi join (RP-411).
+    if !options.analyze {
+        options.semi_join = sublink_join::semi_join_of(&query, lookup);
+    }
     // The WHERE's constants are simplified before anything is planned
     // (`eval_const_expressions`, `canonicalize_qual`; RP-409).
     options.dummy_relation = const_quals::simplify_statement(&mut query, lookup)?;

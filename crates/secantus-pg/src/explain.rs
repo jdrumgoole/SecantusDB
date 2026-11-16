@@ -709,6 +709,29 @@ fn join_tree(node: &JoinNode, scan: &ScanChooser<'_>) -> PlanNode {
     }
 }
 
+/// The `Hash Semi Join` an IN or EXISTS sublink is pulled up into
+/// (RP-411): the outer relation's scan, and the inner one's under a Hash.
+/// Unpriced: a semi join has no planner path here yet.
+pub(crate) fn semi_join_tree(sj: &secantus_pgplan::SemiJoin) -> PlanNode {
+    let scan = |(table, shown): &(String, String)| {
+        let mut n = PlanNode::new(if table == shown {
+            format!("Seq Scan on {table}")
+        } else {
+            format!("Seq Scan on {table} {shown}")
+        });
+        n.props.push(("Relation Name".into(), table.clone()));
+        if table != shown {
+            n.props.push(("Alias".into(), shown.clone()));
+        }
+        n
+    };
+    let mut n = PlanNode::new("Hash Semi Join");
+    n.details.push(("Hash Cond".into(), sj.hash_cond.clone()));
+    n.children.push(scan(&sj.outer));
+    n.children.push(PlanNode::over("Hash", scan(&sj.inner)));
+    n
+}
+
 /// The plan tree of a two-table join planned on the narrow path
 /// (`Select::join`, RP-361), as `join_tree` draws a `JoinRows` join: each
 /// side its table's scan named by its alias, or its subquery's; an ON
@@ -3268,6 +3291,7 @@ mod heap_fetches_tests {
             one_time_false: 0,
             nullable_gate: None,
             dummy_relation: false,
+            semi_join: None,
             modify_table: None,
             sort_keys: None,
             series_scan: None,

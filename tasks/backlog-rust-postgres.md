@@ -1983,31 +1983,29 @@ a regression test.
       a private 15.19 cluster (found while working RP-399).
       Backlog-ID: RP-410
       Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a table's only index composite]
-- [ ] **EXPLAIN of an IN or EXISTS subquery prints `Filter: (...)`, not
-      PostgreSQL's semi join.** PostgreSQL 15.19 pulls `select * from e
-      where a in (select a from s)` and `... where exists (select 1 from s
-      where s.a = e.a)` up into a join (`convert_ANY_sublink_to_join`,
-      `convert_EXISTS_sublink_to_join`) and prints a `Hash Semi Join` on
-      `(e.a = s.a)` over `Seq Scan on e` and a Hash of `Seq Scan on s`;
-      here `Seq Scan on e` with `Filter: (...)`, and the subquery's own
-      scan, Filter included, is not printed. Related to the semi join
-      RP-131 names for `element_types`. Measured on a private 15.19
-      cluster (found while working RP-399).
-      (2026-11-16: the FROM-subquery pull-up RP-422 added,
-      `secantus-pgplan/src/subquery_pullup.rs`, rewrites the parse tree
-      before EXPLAIN plans it; the sublink-to-join conversion belongs
-      beside it, as `convert_ANY_sublink_to_join` runs in the same
-      `pull_up_sublinks` pass.)
-      (2026-11-16: the anti join RP-908 renders is a renamed `Hash Left
-      Join` (`left_anti_key` in `secantus-pg/src/lib.rs`), priced by
-      `scan_estimate`'s anti-join path; a semi join has no planner path or
-      price yet. PostgreSQL prices it with `eqjoinsel_semi` and
-      `final_cost_hashjoin`'s semi-join match fraction, and may instead
+- [ ] **EXPLAIN of an IN subquery over a unique column, and every semi
+      join's costs, are not PostgreSQL's.** Since RP-411's first slice
+      (2026-11-16) a WHERE that is one uncorrelated `col IN (select col
+      from t)` / `= any`, or one `EXISTS` correlated by a single column
+      equality, prints PostgreSQL 15.19's `Hash Semi Join` shape
+      (`secantus-pgplan/src/sublink_join.rs`, drawn by
+      `explain::semi_join_tree`). Still open: (1) over an inner column a
+      unique index fixes, `reduce_unique_semijoins` makes it an inner join
+      -- `select * from e where a in (select a from k)` is `Hash Join`,
+      `Hash Cond: (e.a = k.a)`, k hashed -- where this server keeps the
+      `Seq Scan on e` with `Filter: (...)`; which side is hashed is the
+      inner join's cost decision, so the faithful fix plans it as that
+      join. (2) The semi join is unpriced (zeros): PostgreSQL prices it
+      with `eqjoinsel_semi` and `final_cost_hashjoin`'s semi-join match
+      fraction (`select * from e where a in (select a from s)` is `Hash
+      Semi Join (cost=1.68..19.63 rows=30 width=7)`), and may instead
       unique-ify the inner side into an inner join, so the costed test
-      needs both paths compared as `add_path` does; the two scenarios are
-      COSTS OFF and pin only the node shape.)
+      needs both paths compared as `add_path` does. The anti join RP-908
+      renders (`left_anti_key`, `hash_anti_join_of`) is the nearest priced
+      path. (3) Wider shapes still print the scan: a sublink ANDed with
+      other quals, a subquery with its own WHERE, a cross-type comparison.
       Backlog-ID: RP-411
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[an in subquery is a hash semi join], tests/backlog/test_rp_explain_costs.py::test_plan[an exists subquery is a hash semi join]
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[an in subquery over a unique column is an inner join]
 - [ ] **A hash join of two tables never analysed is unpriced, and its
       sides stay in written order.** `hash_side` prices a side only from
       `analysed_key`, which needs `pg_statistic` rows. PostgreSQL 15.19

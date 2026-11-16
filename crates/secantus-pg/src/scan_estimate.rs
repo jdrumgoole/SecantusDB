@@ -410,6 +410,35 @@ impl PgHandler {
         Some((children.into_iter().map(|(e, _)| e).collect(), estimate))
     }
 
+    /// Whether `table` has a unique index that is immediate, has no WHERE
+    /// and keys only plain columns, every one in `fixed`
+    /// (`relation_has_unique_index_for`; RP-353).
+    pub(crate) fn unique_index_fixed(&self, table: &str, fixed: &[String]) -> bool {
+        let relations = self.index_relations();
+        let defs = self.index_defs();
+        relations.iter().any(|ix| {
+            let t = &ix.table;
+            ix.unique
+                && t.name == table
+                && !ix.keys.is_empty()
+                && !t
+                    .unique_constraints
+                    .iter()
+                    .any(|u| u.name == ix.name && u.deferrable)
+                && !defs
+                    .iter()
+                    .any(|(o, d)| *o == ix.oid && d.contains(" WHERE "))
+                && ix.keys.iter().all(|&k| {
+                    k > 0
+                        && t.columns
+                            .iter()
+                            .enumerate()
+                            .find(|(i, _)| i32::from(t.attnum(*i)) == k)
+                            .is_some_and(|(_, c)| fixed.contains(&c.name))
+                })
+        })
+    }
+
     /// A Nested Loop joining two tables' sequential scans with nothing to
     /// hash or merge on (RP-329): `FROM a, b`, its WHERE's conjuncts over
     /// both tables only `<`, `<=`, `>`, `>=` (`DEFAULT_INEQ_SEL` each, as

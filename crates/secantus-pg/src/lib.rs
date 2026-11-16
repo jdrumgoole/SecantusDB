@@ -45660,31 +45660,8 @@ impl PgHandler {
                 // only plain columns, every one fixed by the join's clauses
                 // or a constant (`relation_has_unique_index_for`).
                 if explain::has_unique_probe(&tree) {
-                    let relations = self.index_relations();
-                    let defs = self.index_defs();
-                    let unique = |table: &str, fixed: &[String]| -> bool {
-                        relations.iter().any(|ix| {
-                            let t = &ix.table;
-                            ix.unique
-                                && t.name == table
-                                && !ix.keys.is_empty()
-                                && !t
-                                    .unique_constraints
-                                    .iter()
-                                    .any(|u| u.name == ix.name && u.deferrable)
-                                && !defs
-                                    .iter()
-                                    .any(|(o, d)| *o == ix.oid && d.contains(" WHERE "))
-                                && ix.keys.iter().all(|&k| {
-                                    k > 0
-                                        && t.columns
-                                            .iter()
-                                            .enumerate()
-                                            .find(|(i, _)| i32::from(t.attnum(*i)) == k)
-                                            .is_some_and(|(_, c)| fixed.contains(&c.name))
-                                })
-                        })
-                    };
+                    let unique =
+                        |table: &str, fixed: &[String]| self.unique_index_fixed(table, fixed);
                     explain::resolve_inner_unique(&mut tree, &unique);
                 }
                 // A select with no FROM is a one-row Result (RP-325).
@@ -46729,6 +46706,15 @@ impl PgHandler {
                         })
                         .unwrap_or_else(|| scan_estimate::catalog_index_columns(name))
                 };
+                // An IN / EXISTS pulled up into a semi join (RP-411). Over
+                // an inner side unique on its column `reduce_unique_semijoins`
+                // makes it an inner join, whose sides cost decides: left as
+                // planned.
+                if let Some(sj) = &options.semi_join {
+                    if !self.unique_index_fixed(&sj.inner.0, std::slice::from_ref(&sj.inner_col)) {
+                        tree = explain::semi_join_tree(sj);
+                    }
+                }
                 explain::attach_scan_quals(
                     &mut tree,
                     &options.scan_quals,

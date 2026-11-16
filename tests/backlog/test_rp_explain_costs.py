@@ -4518,11 +4518,49 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "  Index Cond: ((a = 15) AND (b = 3))",
         ],
     ),
-    # An IN or EXISTS subquery pulled up into a semi join
+    # An IN or EXISTS subquery was pulled up into a semi join
     # (`convert_ANY_sublink_to_join`, `convert_EXISTS_sublink_to_join`;
-    # found while working RP-399).
-    "an in subquery is a hash semi join": (
+    # found while working RP-399). Aliases print on the Hash Cond and
+    # scans, `= any` is IN, and an inner side unique on its column is an
+    # inner join (`reduce_unique_semijoins`, still open), measured on 15.19.
+    "an = any subquery over an alias is a hash semi join": (
+        "RP-411:fixed",
+        _ANALYSED_THIRTY,
+        "explain (costs off) select * from e x where a = any (select a from s)",
+        [
+            "Hash Semi Join",
+            "  Hash Cond: (x.a = s.a)",
+            "  ->  Seq Scan on e x",
+            "  ->  Hash",
+            "        ->  Seq Scan on s",
+        ],
+    ),
+    "an exists subquery over an alias is a hash semi join": (
+        "RP-411:fixed",
+        _ANALYSED_THIRTY,
+        "explain (costs off) select * from e where exists (select 1 from s t where e.a = t.a)",
+        [
+            "Hash Semi Join",
+            "  Hash Cond: (e.a = t.a)",
+            "  ->  Seq Scan on e",
+            "  ->  Hash",
+            "        ->  Seq Scan on s t",
+        ],
+    ),
+    "an in subquery over a unique column is an inner join": (
         "RP-411",
+        _ANALYSED_THIRTY,
+        "explain (costs off) select * from e where a in (select a from k)",
+        [
+            "Hash Join",
+            "  Hash Cond: (e.a = k.a)",
+            "  ->  Seq Scan on e",
+            "  ->  Hash",
+            "        ->  Seq Scan on k",
+        ],
+    ),
+    "an in subquery is a hash semi join": (
+        "RP-411:fixed",
         _ANALYSED_THIRTY,
         "explain (costs off) select * from e where a in (select a from s)",
         [
@@ -4534,7 +4572,7 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
         ],
     ),
     "an exists subquery is a hash semi join": (
-        "RP-411",
+        "RP-411:fixed",
         _ANALYSED_THIRTY,
         "explain (costs off) select * from e where exists (select 1 from s where s.a = e.a)",
         [
