@@ -975,7 +975,17 @@ pub fn aggregate(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
                             collation: collation.as_ref(),
                             vars: &vars,
                             limit,
-                            asked: Default::default(),
+                            asked: crate::near::Asked {
+                                skip: front.skip,
+                                limit: front.limit,
+                                sort,
+                                projection: front.projection.as_ref(),
+                                // A front SBE runs keeps its plan cache's
+                                // own replanning: read as before.
+                                cached: !sbe_read,
+                                distinct: None,
+                                sbe: sbe_read,
+                            },
                         },
                         front.projection.as_ref(),
                         keep_input && sort.is_some(),
