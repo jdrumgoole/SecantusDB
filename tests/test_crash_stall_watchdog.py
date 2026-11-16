@@ -149,6 +149,11 @@ def test_stall_fails_fast_with_stacks(tmp_path: Path) -> None:
     # would be no better than the job-level timeout it replaces.
     assert "Thread stacks follow" in combined, combined
     assert "no worker reported going down" in combined, combined
+    # RM-254: the controller's own threads are idle execnet loops; the hung
+    # test is in a WORKER, so the dump must carry the workers' stacks (and
+    # name the test function the sleeping worker is stuck in).
+    assert "worker thread stacks:" in combined, combined
+    assert "in test_long_gap_with_no_reports" in combined, combined
 
 
 @pytest.mark.timeout(300)

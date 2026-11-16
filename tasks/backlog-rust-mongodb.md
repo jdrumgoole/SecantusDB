@@ -3207,20 +3207,6 @@ touched:
 
 ## The backlog verifier's pytest stalled once in CI (2026-10-21)
 
-- [ ] **One CI run of the storage-engine (ubuntu) backlog step stalled for
-  300 s and was killed.** PR #2082's run 39691311797, first attempt: the
-  `tools/backlog.py verify --regressions` pytest reported no test for 301 s
-  ("=== pytest session stalled ==="), three tests of
-  `tests/backlog/test_rm_found_2026_10_20b.py` never ran
-  (`test_snapshot_read_at_cluster_time`,
-  `test_snapshot_session_keeps_its_snapshot`, `test_diagnostic_stages`), and
-  the step failed. The re-run passed, `main` had passed six runs in a row,
-  and the module ran in 23 s locally. Not known: which test hung. The
-  stall dump prints the CONTROLLER's threads only, so the next stall should
-  dump the workers' stacks too (and the servers they started) -- that is
-  the change that makes this diagnosable.
-  Backlog-ID: RM-254
-  Verify: none -- an intermittent CI stall whose hung test is unknown
 - [ ] **RM-008's limiter test reads mongod's answer under load as a
   different answer.** `test_ingress_rate_limiter_admits_queues_and_closes`
   opens six connections against each server with the limiter at one a
