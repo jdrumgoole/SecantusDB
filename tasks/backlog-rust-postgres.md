@@ -1785,27 +1785,25 @@ a regression test.
       Verify: tests/backlog/test_rp_explain_costs.py::test_plan[nested loop into a weakly correlated index], tests/backlog/test_rp_explain_costs.py::test_plan[nested loop of few rows into a weakly correlated index], tests/backlog/test_rp_explain_costs.py::test_a_wide_range_over_a_weakly_correlated_index
       Backlog-ID: RP-926
 - [ ] **A join of three tables by inequalities runs in its written
-      order, and a WHERE's join clauses all run at the top join.**
-      PostgreSQL's `standard_join_search` picks the order of an inner join
-      of three tables linked only by `<`, `<=`, `>`, `>=` or `<>` as it
-      does for equalities (`join_search.rs` searches only those): PostgreSQL
-      15.19 runs `select * from e join e e3 on e.a < e3.a join zs on e3.a >
-      zs.a` (`e` 1,000 analysed rows, `zs` ten) as `(e3 x zs) x e`, so its
-      rows come out in that loop's order (`limit 5` of `e.a` gives 1, 1, 2,
-      1, 2, here 1, 1, 1, 1, 1) and EXPLAIN prints that plan; here the tables
-      join as written and the plan is unpriced. A comma join's WHERE clause
-      over two tables is the Join Filter of the first join holding both
-      (`from e, e e2, e e3 where e.a < e2.a and e2.a < e3.a`: `(e.a < e2.a)`
-      on the lower Nested Loop); here both are the top join's, the lower
-      one a cross join. Measured on a private 15.19 cluster (found while
-      working RP-354). Where to start (read 2026-11-15): the order search
-      is `join_search.rs`, which takes only column equalities; the
-      EXPLAIN side is `scan_estimate::nest_loop_chain_estimate`, which
-      prices only the left spine as written and declines any WHERE filter
-      (`!j.where_filters.is_empty()`) and any join without an ON, so a
-      comma join's lower cross joins print zeros. Both halves change the
-      executed order or the printed tree, not just a cost: two slices.
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[nested loop of three relations joined in another order], tests/backlog/test_rp_explain_costs.py::test_plan[nested loop of three relations by a where]
+      order.** PostgreSQL's `standard_join_search` picks the order of an
+      inner join of three tables linked only by `<`, `<=`, `>`, `>=` or
+      `<>` as it does for equalities (`join_search.rs` searches only
+      those): PostgreSQL 15.19 runs `select * from e join e e3 on e.a <
+      e3.a join zs on e3.a > zs.a` (`e` 1,000 analysed rows, `zs` ten) as
+      `(e3 x zs) x e`, so its rows come out in that loop's order (`limit
+      5` of `e.a` gives 1, 1, 2, 1, 2, here 1, 1, 1, 1, 1) and EXPLAIN
+      prints that plan; here the tables join as written and the plan is
+      unpriced. A comma join's WHERE does the same: `from e, e e2, e e3
+      where e.a < e2.a and e2.a < e3.a and e.a + e3.a > 5` (30 rows) is
+      `(e x e3) x e2` there. Measured on a private 15.19 cluster (found
+      while working RP-354). Where to start (read 2026-11-16): the order
+      search is `join_search.rs`, which takes only column equalities;
+      `scan_estimate::nest_loop_chain_estimate` already runs
+      `join_search_one_level` over the inequalities and finds the cheaper
+      order, then declines it (`pair != (lower, leaf)`) because the
+      executed tree is the written one. The executor's order and the
+      printed tree must move together.
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[nested loop of three relations joined in another order]
       Backlog-ID: RP-919
 - [ ] **EXPLAIN VERBOSE prints no `Output` lists above a scan.** A plan
       that is one relation's scan prints as VERBOSE does (RP-925); any

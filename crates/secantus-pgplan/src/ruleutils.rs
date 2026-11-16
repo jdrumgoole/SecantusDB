@@ -5296,7 +5296,7 @@ pub fn join_where(s: &pg_query::protobuf::SelectStmt, cat: &Catalog<'_>) -> Opti
             text
         };
         let column = home.as_ref().and_then(|_| qual_column(part));
-        out.push((text, home, column));
+        out.push((text, home, column, rels));
     }
     let types = |home: &str, col: &str| {
         p.scopes
@@ -5507,8 +5507,9 @@ fn qual_operators(n: &Node) -> crate::Result<usize> {
 
 /// A joined SELECT's WHERE conjunct for EXPLAIN: its text, the relation
 /// whose scan it filters (`None`: the top join's), and the column an index
-/// scan there could take it on (RP-369).
-pub type JoinQual = (String, Option<String>, Option<String>);
+/// scan there could take it on (RP-369), and the relations it reads
+/// (RP-919: a conjunct over several is the lowest join holding them all).
+pub type JoinQual = (String, Option<String>, Option<String>, Vec<String>);
 
 /// An expression node over one table, printed as `pg_get_expr` does.
 pub fn expr_node_def(n: &Node, def: &TableDef) -> Option<String> {
@@ -6153,7 +6154,7 @@ mod comma_join_conds_tests {
     }
 
     fn q(text: &str, home: Option<&str>) -> JoinQual {
-        (text.to_string(), home.map(str::to_string), None)
+        (text.to_string(), home.map(str::to_string), None, Vec::new())
     }
 
     #[test]
@@ -6248,7 +6249,7 @@ mod join_where_tests {
         join_where(s, &cat)
             .unwrap()
             .into_iter()
-            .map(|(text, home, _)| (text, home))
+            .map(|(text, home, ..)| (text, home))
             .collect()
     }
 

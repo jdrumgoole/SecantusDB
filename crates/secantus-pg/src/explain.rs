@@ -2570,28 +2570,98 @@ pub(crate) fn attach_join_where(
             ),
         }
     };
+    fn is_inner_join(n: &PlanNode) -> bool {
+        matches!(n.name.as_str(), "Nested Loop" | "Hash Join" | "Merge Join")
+    }
+    fn holds(n: &PlanNode, rel: &str) -> bool {
+        if is_scan(n) {
+            let name = n
+                .props
+                .iter()
+                .find(|(k, _)| k == "Alias")
+                .or_else(|| n.props.iter().find(|(k, _)| k == "Relation Name"));
+            return name.is_some_and(|(_, v)| v == rel);
+        }
+        n.children.iter().any(|c| holds(c, rel))
+    }
+    // The child path from `n` to the lowest join holding every one of
+    // `rels` through inner joins only (`distribute_qual_to_rels`: a clause
+    // is evaluated at the lowest join whose relations cover it, RP-919).
+    // A join under a single-input node (a Materialize, a Hash) counts.
+    fn lowest_join(n: &PlanNode, rels: &[String], path: &mut Vec<usize>) {
+        if !is_inner_join(n) {
+            return;
+        }
+        for (i, c) in n.children.iter().enumerate() {
+            let mut below = c;
+            let mut steps = vec![i];
+            while !is_inner_join(below) && below.children.len() == 1 {
+                below = &below.children[0];
+                steps.push(0);
+            }
+            if is_inner_join(below) && rels.iter().all(|r| holds(below, r)) {
+                path.extend(steps);
+                lowest_join(below, rels, path);
+                return;
+            }
+        }
+    }
+    fn at_path<'a>(mut n: &'a mut PlanNode, path: &[usize]) -> &'a mut PlanNode {
+        for i in path {
+            n = &mut n.children[*i];
+        }
+        n
+    }
+    fn top_join_path(n: &PlanNode, path: &mut Vec<usize>) -> bool {
+        if n.name.contains("Join") || n.name.starts_with("Nested Loop") {
+            return true;
+        }
+        for (i, c) in n.children.iter().enumerate() {
+            path.push(i);
+            if top_join_path(c, path) {
+                return true;
+            }
+            path.pop();
+        }
+        false
+    }
+    // Where a conjunct goes: a relation's scan, or the join at a path.
+    #[derive(PartialEq)]
+    enum Place {
+        Scan(String),
+        Join(Vec<usize>),
+    }
     // Per home: its conjuncts' texts, and each with its column.
-    type Home<'q> = (
-        Option<String>,
-        Vec<&'q String>,
-        Vec<(String, Option<String>)>,
-    );
+    type Home<'q> = (Place, Vec<&'q String>, Vec<(String, Option<String>)>);
     let mut homes: Vec<Home<'_>> = Vec::new();
-    for (text, home, column) in quals {
-        let i = match homes.iter().position(|(h, _, _)| h == home) {
+    for (text, home, column, rels) in quals {
+        let place = match home {
+            Some(rel) => Place::Scan(rel.clone()),
+            None => {
+                let mut path = Vec::new();
+                if top_join_path(root, &mut path) && rels.len() > 1 {
+                    let mut below = Vec::new();
+                    lowest_join(at_path(root, &path), rels, &mut below);
+                    path.extend(below);
+                }
+                Place::Join(path)
+            }
+        };
+        let i = match homes.iter().position(|(h, _, _)| *h == place) {
             Some(i) => i,
             None => {
-                homes.push((home.clone(), Vec::new(), Vec::new()));
+                homes.push((place, Vec::new(), Vec::new()));
                 homes.len() - 1
             }
         };
         homes[i].1.push(text);
         homes[i].2.push((text.clone(), column.clone()));
     }
-    for (home, parts, with_columns) in homes {
-        let target = match &home {
-            Some(rel) => scan_for(root, rel),
-            None => top_join(root),
+    for (place, parts, with_columns) in homes {
+        let (target, home) = match &place {
+            Place::Scan(rel) => (scan_for(root, rel), Some(rel)),
+            Place::Join(path) if top_join(root).is_some() => (Some(at_path(root, path)), None),
+            Place::Join(_) => (None, None),
         };
         if let Some(n) = target {
             // An index scan takes the conjuncts on its key columns as its
@@ -3210,7 +3280,12 @@ mod join_where_tests {
         // PostgreSQL 15.19 (RP-405): `... where e.a + 1 > 996` is the one
         // `Filter: ((a + 1) > 996)` on e's scan.
         let mut root = joined();
-        let quals = vec![("((a + 1) > 996)".to_string(), Some("e".to_string()), None)];
+        let quals = vec![(
+            "((a + 1) > 996)".to_string(),
+            Some("e".to_string()),
+            None,
+            vec!["e".to_string()],
+        )];
         attach_join_where(&mut root, &quals, &|_| Vec::new());
         assert_eq!(
             root.children[0].details,
@@ -3219,11 +3294,54 @@ mod join_where_tests {
     }
 
     #[test]
+    fn a_where_over_two_tables_filters_the_lowest_join_holding_them() {
+        // PostgreSQL 15.19 (RP-919): `from e, e e2, e e3 where e.a < e2.a
+        // and e2.a < e3.a` puts each conjunct on the first join of its
+        // two tables: the lower join's, and the top's.
+        let scan = |alias: &str| {
+            let mut n = PlanNode::new(format!("Seq Scan on e {alias}"));
+            n.props.push(("Relation Name".into(), "e".into()));
+            n.props.push(("Alias".into(), alias.into()));
+            n
+        };
+        let mut lower = PlanNode::new("Nested Loop");
+        lower.children = vec![scan("e"), scan("e2")];
+        let mut root = PlanNode::new("Nested Loop");
+        root.children = vec![lower, PlanNode::over("Materialize", scan("e3"))];
+        let q = |text: &str, rels: &[&str]| {
+            (
+                text.to_string(),
+                None,
+                None,
+                rels.iter().map(|r| r.to_string()).collect(),
+            )
+        };
+        let quals = vec![
+            q("(e.a < e2.a)", &["e", "e2"]),
+            q("(e2.a < e3.a)", &["e2", "e3"]),
+        ];
+        attach_join_where(&mut root, &quals, &|_| Vec::new());
+        assert_eq!(
+            root.details,
+            vec![("Join Filter".to_string(), "(e2.a < e3.a)".to_string())]
+        );
+        assert_eq!(
+            root.children[0].details,
+            vec![("Join Filter".to_string(), "(e.a < e2.a)".to_string())]
+        );
+    }
+
+    #[test]
     fn a_conjunct_left_on_the_join_keeps_the_placeholder() {
         // A conjunct over both sides is the join's; the scan's placeholder
         // stands until something prints the scan's own.
         let mut root = joined();
-        let quals = vec![("((e.a + s.a) > 3)".to_string(), None, None)];
+        let quals = vec![(
+            "((e.a + s.a) > 3)".to_string(),
+            None,
+            None,
+            vec!["e".to_string(), "s".to_string()],
+        )];
         attach_join_where(&mut root, &quals, &|_| Vec::new());
         assert_eq!(
             root.details.last(),

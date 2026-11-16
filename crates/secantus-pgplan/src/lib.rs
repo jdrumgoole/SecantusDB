@@ -12239,11 +12239,14 @@ fn nullable_side_scan_quals(
             ruleutils::explain_conjuncts(&and(bare), &def)
         });
         if let Some(ordered) = ordered {
-            out.extend(
-                ordered
-                    .into_iter()
-                    .map(|(text, column)| (text, Some(alias.to_string()), column)),
-            );
+            out.extend(ordered.into_iter().map(|(text, column)| {
+                (
+                    text,
+                    Some(alias.to_string()),
+                    column,
+                    vec![alias.to_string()],
+                )
+            }));
             continue;
         }
         let alone = pg_query::protobuf::SelectStmt {

@@ -2300,11 +2300,11 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "        ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
         ],
     ),
-    # Still open: a comma join's WHERE clause over two tables is the Join
-    # Filter of the join that first holds both; here every one is the top
-    # join's.
+    # Fixed: a comma join's WHERE clause over two tables is the Join
+    # Filter of the join that first holds both, and the chain is priced;
+    # before, every one was the top join's and the plan printed zeros.
     "nested loop of three relations by a where": (
-        "RP-919",
+        "RP-919:fixed",
         _ANALYSED,
         "explain select * from e, e e2, e e3 where e.a < e2.a and e2.a < e3.a",
         [

@@ -922,11 +922,11 @@ impl PgHandler {
             || sel.casts.iter().any(Option::is_some)
             || ((!sel.filter.is_empty() || sel.residual.is_some()) && !j.where_modelled)
             || j.where_spans_equality
-            || !j.where_filters.is_empty()
         {
             return None;
         }
-        // An inner join with an ON of its own clauses only, no column it
+        // An inner join with an ON of its own clauses only, or a comma
+        // join's with none (its clauses the WHERE's, RP-919), no column it
         // could hash or merge on.
         fn inner_join(
             node: &JoinNode,
@@ -935,7 +935,7 @@ impl PgHandler {
                 kind: JoinKind::Inner,
                 left,
                 right,
-                on: Some(_),
+                on,
                 on_filters,
                 equi,
                 merged,
@@ -945,7 +945,11 @@ impl PgHandler {
             else {
                 return None;
             };
-            if !equi.is_empty() || !merged.is_empty() || !expr_keys.is_empty() {
+            if !equi.is_empty()
+                || !merged.is_empty()
+                || !expr_keys.is_empty()
+                || (on.is_none() && !on_filters.is_empty())
+            {
                 return None;
             }
             Some((left.as_ref(), right.as_ref(), on_filters.as_slice()))
@@ -1057,7 +1061,15 @@ impl PgHandler {
             })
             .collect();
         let mut clauses: Vec<Clause> = Vec::new();
-        for f in filter_lists.iter().copied().flatten() {
+        // A WHERE conjunct over two tables joins them as an ON's would:
+        // `deconstruct_jointree` makes an inner join's WHERE and ON quals
+        // one list, each evaluated at the lowest join holding its tables.
+        for f in filter_lists
+            .iter()
+            .copied()
+            .flatten()
+            .chain(j.where_filters.iter())
+        {
             let secantus_pgplan::ColumnExpr::Row { fields, .. } = &f.expr else {
                 return None;
             };
