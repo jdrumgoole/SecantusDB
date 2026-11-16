@@ -312,14 +312,15 @@ def _transaction_lines(client: Any, is_mongod: bool) -> dict:
     return lines
 
 
-@pytest.mark.backlog("RM-355")
+@pytest.mark.backlog_fixed("RM-355")
 def test_ending_a_transaction_takes_mongods_execution_tickets(
     rust_mongo: Any, mongod_rs: Any
 ) -> None:
-    """mongod 8.2.11 unstashes a transaction's resources to end it, and its
-    `abortTransaction` line counts three execution admissions, as its
-    `commitTransaction` line does; this server's abort counts two (measured
-    2026-11-12)."""
+    """mongod 8.2.11's `abortTransaction` line counts three execution
+    admissions, as its `commitTransaction` line does: the abort waits for
+    its write concern under the journal wait's global IS, as the commit
+    does. This server's abort waited for none and counted two (measured
+    2026-11-12; fixed 2026-11-16)."""
     got = {
         "rust": _transaction_lines(rust_mongo, False),
         "mongod": _transaction_lines(mongod_rs, True),
@@ -1843,3 +1844,41 @@ def test_a_contested_aggregate_sees_what_is_deleted_after_its_first_batch(
             client.drop_database(db.name)
     assert answers["mongod"] == 101
     assert answers["rust"] == answers["mongod"]
+
+
+def _await_data_admissions(client: Any, is_mongod: bool) -> Any:
+    """The `queues.execution` of the `Slow query` line of an `awaitData`
+    getMore that waits its whole 500 ms for a document."""
+    db = client[fresh("await")]
+    db.create_collection("c", capped=True, size=4096)
+    db.c.insert_one({"v": 1})
+    cursor = db.command("find", "c", tailable=True, awaitData=True, batchSize=10)["cursor"]
+    last = client.admin.command("getLog", "global")["log"][-1]
+    client.admin.command("profile", 0, slowms=-1 if is_mongod else 0)
+    try:
+        db.command("getMore", cursor["id"], collection="c", maxTimeMS=500)
+    finally:
+        client.admin.command("profile", 0, slowms=100)
+    log = client.admin.command("getLog", "global")["log"]
+    log = log[log.index(last) + 1 :]
+    client.drop_database(db.name)
+    for raw in log:
+        entry = json.loads(raw)
+        command = entry.get("attr", {}).get("command", {})
+        if entry.get("msg") == "Slow query" and "getMore" in command:
+            return entry["attr"].get("queues", {}).get("execution")
+    return None
+
+
+@pytest.mark.backlog("RM-355")
+def test_an_await_data_get_more_takes_mongods_execution_tickets(
+    rust_mongo: Any, mongod_rs: Any
+) -> None:
+    """mongod 8.2.11's `awaitData` getMore yields once for its wait, so its
+    line counts 4 execution admissions for a 500 ms wait; this server's
+    wait took 24,845 (measured 2026-11-16)."""
+    got = {
+        "rust": _await_data_admissions(rust_mongo, False),
+        "mongod": _await_data_admissions(mongod_rs, True),
+    }
+    assert got["rust"] == got["mongod"]
