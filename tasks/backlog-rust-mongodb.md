@@ -778,12 +778,6 @@ These are explicit non-goals. Don't add them without a reason.
       e01df2d2 (2026-11-08), each command checked against a probe of its own.
       Backlog-ID: RM-360
       Verify: tests/backlog/test_rm_355_364.py::test_every_line_counts_its_interrupt_checks
-- [ ] **A `dataSize` of a view answers.** mongod 8.2.11 refuses
-      `{dataSize: "<db>.v"}` of a view (166, CommandNotSupportedOnView);
-      this server answers `ok: 1`, sizing nothing. Found while working
-      RM-485, 2026-11-13.
-      Verify: tests/backlog/test_rm_view_ddl_refusals.py::test_a_data_size_of_a_view_is_refused
-      Backlog-ID: RM-587
 - [ ] **A `dropIndexes` of `system.views` is refused.** mongod 8.2.11 drops
       `<db>.system.views`' indexes (`ok: 1`, its line and profile entry
       naming `<db>.system.views`, `system`); this server refuses it with
