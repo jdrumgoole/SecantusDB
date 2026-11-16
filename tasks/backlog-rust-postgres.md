@@ -2069,6 +2069,12 @@ a regression test.
       unknown value; `ExprQual` is the nearest shape but models a
       statistics-less expression, not `var_eq_non_const` over a column's
       own statistics.)
+      (2026-11-16, RP-411's first slice: EXPLAIN now recognises a WHERE
+      sublink from the parse tree in `secantus-pgplan/src/sublink_join.rs`,
+      carried on `ExplainOptions::semi_join`, and redraws the tree in
+      `secantus-pg/src/lib.rs` just before `attach_scan_quals`; an
+      EXPR_SUBLINK's InitPlan can be recognised the same way. Note the raw
+      parse tree leaves an IN's `oper_name` empty.)
       Verify: tests/backlog/test_rp_explain_costs.py::test_plan[an uncorrelated subquery is an initplan], tests/backlog/test_rp_explain_costs.py::test_plan[a join's on subquery is an initplan on its scan]
       Backlog-ID: RP-440
 
