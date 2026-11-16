@@ -1784,26 +1784,22 @@ a regression test.
       working RP-354).
       Verify: tests/backlog/test_rp_explain_costs.py::test_plan[nested loop into a weakly correlated index], tests/backlog/test_rp_explain_costs.py::test_plan[nested loop of few rows into a weakly correlated index], tests/backlog/test_rp_explain_costs.py::test_a_wide_range_over_a_weakly_correlated_index
       Backlog-ID: RP-926
-- [ ] **A join of three tables by inequalities runs in its written
+- [ ] **A chain of inequality joins under a LIMIT runs in its written
       order.** PostgreSQL's `standard_join_search` picks the order of an
-      inner join of three tables linked only by `<`, `<=`, `>`, `>=` or
-      `<>` as it does for equalities (`join_search.rs` searches only
-      those): PostgreSQL 15.19 runs `select * from e join e e3 on e.a <
-      e3.a join zs on e3.a > zs.a` (`e` 1,000 analysed rows, `zs` ten) as
-      `(e3 x zs) x e`, so its rows come out in that loop's order (`limit
-      5` of `e.a` gives 1, 1, 2, 1, 2, here 1, 1, 1, 1, 1) and EXPLAIN
-      prints that plan; here the tables join as written and the plan is
-      unpriced. A comma join's WHERE does the same: `from e, e e2, e e3
-      where e.a < e2.a and e2.a < e3.a and e.a + e3.a > 5` (30 rows) is
-      `(e x e3) x e2` there. Measured on a private 15.19 cluster (found
-      while working RP-354). Where to start (read 2026-11-16): the order
-      search is `join_search.rs`, which takes only column equalities;
-      `scan_estimate::nest_loop_chain_estimate` already runs
-      `join_search_one_level` over the inequalities and finds the cheaper
-      order, then declines it (`pair != (lower, leaf)`) because the
-      executed tree is the written one. The executor's order and the
-      printed tree must move together.
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[nested loop of three relations joined in another order]
+      inner join of tables linked only by `<`, `<=`, `>`, `>=` or `<>`;
+      without a LIMIT the chain now runs, and EXPLAIN prints, the order
+      the search keeps (`scan_estimate::reorder_nest_loop_chain`, applied
+      in `execute_inner_keys` and before `plan_tree`). Under a LIMIT the
+      estimate declines (`nest_loop_chain` refuses `sel.limit`, since a
+      LIMIT's search weighs startup costs, `join_order`'s
+      `limit_choice`), so the tables join as written: PostgreSQL 15.19
+      gives `e.a` 1, 1, 2, 1, 2 for `select * from e join e e3 on e.a <
+      e3.a join zs on e3.a > zs.a limit 5` (`e` 1,000 analysed rows,
+      `zs` ten), here 1, 1, 1, 1, 1. Also still written order: an ORDER
+      BY over the chain (the same refusal), a join two ONs land on in the
+      new tree, and a bushy tree (four or more tables). Measured on a
+      private 15.19 cluster (found while working RP-354).
+      Verify: tests/backlog/test_rp_explain_costs.py::test_a_chain_of_inequality_joins_under_a_limit
       Backlog-ID: RP-919
 - [ ] **EXPLAIN VERBOSE prints no `Output` lists above a scan.** A plan
       that is one relation's scan prints as VERBOSE does (RP-925); any
