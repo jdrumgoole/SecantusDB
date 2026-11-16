@@ -542,6 +542,105 @@ DISTINCTS: list[tuple[str, Any]] = [
 ]
 
 
+# `$jsonSchema`, shaped as the tree mongod's JSON Schema parser builds:
+# every keyword, a restriction with and without a stated type, the top
+# level's own rules, and the placeholder an `items` entry prints.
+JSON_SCHEMAS: list[dict] = [
+    {},
+    {"minimum": 1},
+    {"type": "object"},
+    {"bsonType": "int"},
+    {"bsonType": ["int", "string"]},
+    {"required": ["x"], "properties": {"x": {"bsonType": "int"}}},
+    {"properties": {"a": {}}},
+    {"properties": {"a.b": {"bsonType": "int"}}},
+    {
+        "properties": {
+            "a": {
+                "type": "number",
+                "minimum": 1,
+                "exclusiveMinimum": True,
+                "maximum": 5,
+                "exclusiveMaximum": False,
+                "multipleOf": 2,
+            }
+        }
+    },
+    {"properties": {"a": {"bsonType": ["number"], "minimum": 0, "multipleOf": 1.5}}},
+    {"properties": {"a": {"type": ["string", "null"], "pattern": "^x", "minLength": 2}}},
+    {"properties": {"a": {"type": "string", "minimum": 3, "maxLength": 4}}},
+    {"properties": {"a": {"bsonType": "double", "pattern": "x"}}},
+    {
+        "properties": {
+            "a": {
+                "bsonType": "array",
+                "minItems": 1,
+                "maxItems": 3,
+                "uniqueItems": True,
+                "items": {"bsonType": "int"},
+            }
+        }
+    },
+    {
+        "properties": {
+            "a": {"bsonType": "array", "items": [{"bsonType": "int"}, {}], "additionalItems": False}
+        }
+    },
+    {"properties": {"a": {"items": [{}], "additionalItems": {"bsonType": "string"}}}},
+    {"properties": {"a": {"items": {"not": {}}, "additionalItems": True}}},
+    {"properties": {"a": {"items": [{"properties": {"q": {}}}, {"allOf": [{}]}, {"minimum": 1}]}}},
+    {"properties": {"a": {"enum": [{"b": 1}, "s", None, [1, 2]]}}},
+    {
+        "properties": {
+            "a": {"uniqueItems": False, "enum": [{"b": {"c": [1, {"d": "x"}]}, "e": []}, {}]}
+        }
+    },
+    {"enum": [{"b": 1}, 2]},
+    {"enum": [1, 2]},
+    {
+        "allOf": [{"required": ["a"]}, {"minProperties": 2}],
+        "anyOf": [{"required": ["b"]}],
+        "oneOf": [{"required": ["c"]}, {"required": ["d"]}],
+        "not": {"required": ["e"]},
+    },
+    {"dependencies": {"a": ["b", "c"], "d": {"required": ["e"]}}},
+    {
+        "properties": {
+            "o": {
+                "dependencies": {"a": ["b"]},
+                "required": ["z", "y"],
+                "maxProperties": 4,
+                "patternProperties": {"^p": {"bsonType": "int"}},
+                "additionalProperties": {"bsonType": "string"},
+            }
+        }
+    },
+    {"patternProperties": {"^p": {}}, "additionalProperties": True},
+    {
+        "properties": {
+            "x": {"minimum": 3, "enum": [1, 2]},
+            "y": {"type": "object", "properties": {"z": {"type": "string"}}},
+        },
+        "minProperties": 1,
+        "additionalProperties": False,
+    },
+    {"title": "t", "description": "d", "properties": {"a": {"title": "x", "bsonType": "object"}}},
+    {"properties": {"a": {"type": "boolean", "maxProperties": 2, "required": ["x"]}}},
+    {
+        "properties": {
+            "a": {
+                "bsonType": "number",
+                "required": ["x"],
+                "properties": {"x": {}},
+                "additionalProperties": False,
+            }
+        }
+    },
+    {"properties": {"a": {"bsonType": ["object", "array"], "minProperties": 0}}},
+    {"items": {}, "additionalItems": False, "minItems": 2, "uniqueItems": True, "maxLength": 3},
+]
+
+
 @pytest.fixture(scope="module")
 def servers(rust_mongo: Any, mongod_rs: Any) -> Any:
     for client in (rust_mongo, mongod_rs):
@@ -620,6 +719,12 @@ def test_a_stage(servers: Any, pipeline: list) -> None:
 @pytest.mark.parametrize("coll,pipeline", HYBRID, ids=[str(h) for h in HYBRID])
 def test_a_hybrid_search(servers: Any, coll: str, pipeline: list) -> None:
     _check(servers, SON([("aggregate", coll), ("pipeline", pipeline), ("cursor", {})]))
+
+
+@pytest.mark.parametrize("schema", JSON_SCHEMAS, ids=[str(j) for j in JSON_SCHEMAS])
+def test_a_json_schema(servers: Any, schema: dict) -> None:
+    _check(servers, SON([("find", "c"), ("filter", {"$jsonSchema": schema})]))
+    _check(servers, SON([("find", "c"), ("filter", {"x": {"$gt": 1}, "$jsonSchema": schema})]))
 
 
 @pytest.mark.parametrize("filt", GEO_FILTERS, ids=[str(f) for f in GEO_FILTERS])
