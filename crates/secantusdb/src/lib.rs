@@ -43,7 +43,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use secantus_commands::{CursorRegistry, Storage as CmdStorage};
 pub use secantus_server::TlsOptions;
 use secantus_server::{bind, RunningServer, ServerConfig};
-use secantus_storage::{wt_config, Storage, StorageOptions};
+use secantus_storage::{mongod_message_config, wt_config, Storage, StorageOptions};
 use secantus_storage_adapter::StorageAdapter;
 
 /// The replica-set name [`Server::start`] advertises, as the Python server does.
@@ -348,7 +348,11 @@ impl Builder {
             &StorageOptions {
                 // The embedded handle's 128MB log: many short-lived stores must
                 // not each carry a large sparse log file.
-                wt_config: Some(wt_config(&self.cache_size, 1000, false, "128MB")),
+                wt_config: Some(format!(
+                    "{},{}",
+                    wt_config(&self.cache_size, 1000, false, "128MB"),
+                    mongod_message_config()
+                )),
                 // mongod's split, as `secantusd-mdb` creates stores (RM-210).
                 data_nonlogged: Some(true),
                 transactions_logged_at_commit: true,

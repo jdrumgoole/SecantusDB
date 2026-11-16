@@ -771,17 +771,39 @@ def test_startup_reads_an_unclean_shutdown_from_the_lock_file(tmp_path: Any) -> 
     assert _summary(lines)["Startup from clean shutdown?"] is False
 
 
-@pytest.mark.backlog("RM-305")
+@pytest.mark.backlog_fixed("RM-305")
 def test_startup_writes_wiredtigers_own_messages(rust_mongo: Any) -> None:
     """Between `Opening WiredTiger` (22315) and `WiredTiger opened`
     (4795906) mongod 8.2.11 writes WiredTiger's own messages, each a
     `WiredTiger message` (22430) under `WTRECOV` / `WTEVICT` on
     `initandlisten`: fourteen on a new dbpath (measured 2026-11-13), from its
     `verbose=[recovery_progress:1,...]` and `json_output=(error,message)`
-    configuration. This server writes none."""
+    configuration. This server wrote none until 2026-11-16; it opens its
+    WiredTiger 7.0 with mongod's message configuration and logs what that
+    engine writes (four `WT_VERB_RECOVERY_PROGRESS` lines on a new store)."""
+    lines = [
+        e
+        for e in map(json.loads, rust_mongo.admin.command("getLog", "global")["log"])
+        if e["ctx"] == "initandlisten"
+    ]
+    ids = [e["id"] for e in lines]
+    between = lines[ids.index(22315) + 1 : ids.index(4795906)]
+    assert between and all(e["id"] == 22430 for e in between), ids
+    for e in between:
+        assert e["c"] == "WTRECOV" and e["msg"] == "WiredTiger message", e
+        message = e["attr"]["message"]
+        assert message["category"] == "WT_VERB_RECOVERY_PROGRESS", message
+        assert {"ts_sec", "ts_usec", "thread", "session_name", "msg"} <= message.keys()
+
+
+@pytest.mark.backlog("RM-305")
+def test_startup_writes_the_recovery_timestamp_after_opening(rust_mongo: Any) -> None:
+    """Right after `WiredTiger opened` (4795906) mongod 8.2.11 writes
+    `WiredTiger recoveryTimestamp` (23987, `RECOVERY`) on `initandlisten`,
+    then the session-cache, spill WiredTiger and durable-catalog lines
+    (measured 2026-11-16 on a new dbpath). This server goes straight on."""
     ids = _startup_ids(rust_mongo)
-    between = ids[ids.index(22315) + 1 : ids.index(4795906)]
-    assert 22430 in between, between
+    assert ids[ids.index(4795906) + 1] == 23987, ids
 
 
 def _op_msg(sock: socket.socket, command: dict, request_id: int) -> dict:

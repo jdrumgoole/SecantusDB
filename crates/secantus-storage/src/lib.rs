@@ -232,6 +232,11 @@ pub struct OpenRecord {
     pub wt_config: String,
     /// How long `wiredtiger_open` took.
     pub wt_open: Duration,
+    /// The messages WiredTiger wrote while it opened, in order, as it
+    /// formatted them (JSON under `json_output=(message)`): mongod logs each
+    /// as `WiredTiger message` (22430) between `Opening WiredTiger` and
+    /// `WiredTiger opened`.
+    pub wt_messages: Vec<String>,
     /// How long the whole open took after the lock file: WiredTiger, the
     /// tables, the recovery and the upgrades (mongod's
     /// `createStorageEngineMillis`).
@@ -2623,6 +2628,17 @@ const DEFAULT_CONFIG: &str = "create,session_max=1000,cache_size=4G,\
 /// `--sync-on-commit`). Mirrors `storage.py`'s config assembly and matches
 /// [`DEFAULT_CONFIG`] byte-for-byte for the engine defaults (`"4G"`, `1000`,
 /// `false`) — see the `wt_config_matches_default` test.
+/// The message configuration mongod 8.2.11 opens WiredTiger with (measured
+/// 2026-11-16 from its `Opening WiredTiger` line): JSON messages, and the
+/// recovery, checkpoint and compaction progress at verbosity 1 with each
+/// other category at 0 (`INFO`). Appended by the MongoDB server, whose log
+/// carries each message as mongod's does (`WiredTiger message`, 22430).
+/// The vendored WiredTiger 7.0 has no `live_restore` categories and names
+/// eviction `evict`; those differ from mongod's string.
+pub fn mongod_message_config() -> &'static str {
+    "json_output=(error,message),verbose=[recovery_progress:1,checkpoint_progress:1,compact_progress:1,backup:0,checkpoint:0,compact:0,evict:0,fileops:0,history_store:0,recovery:0,rts:0,salvage:0,tiered:0,timestamp:0,transaction:0,verify:0,log:0]"
+}
+
 pub fn wt_config(
     cache_size: &str,
     session_max: u32,
@@ -8342,6 +8358,7 @@ impl Storage {
         let wt_started = Instant::now();
         let conn = Arc::new(Connection::open(home, config)?);
         let wt_open = wt_started.elapsed();
+        let wt_messages = conn.take_messages();
         // An existing store's mode is the one its tables were created with,
         // read from WiredTiger's own metadata before anything is created: a
         // logged store records no mode of its own, and neither does a
@@ -8545,6 +8562,7 @@ impl Storage {
                 new_store,
                 wt_config: config.to_string(),
                 wt_open,
+                wt_messages,
                 open: Duration::ZERO,
             },
             lock_file,
