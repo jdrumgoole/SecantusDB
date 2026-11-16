@@ -45857,8 +45857,16 @@ impl PgHandler {
                 let bare_scan = |c: &explain::PlanNode| {
                     c.children.is_empty() && c.name.starts_with("Seq Scan on ")
                 };
+                // Under a bare Limit (RP-919) the chain is its child, and
+                // the Limit is `adjust_limit_rows_costs` over its top.
+                let under_limit =
+                    tree.name == "Limit" && tree.details.is_empty() && tree.children.len() == 1;
                 let mut depth = 0;
-                let mut node = &tree;
+                let mut node = if under_limit {
+                    &tree.children[0]
+                } else {
+                    &tree
+                };
                 let chain = loop {
                     if node.name != "Nested Loop"
                         || !node.details.is_empty()
@@ -45877,10 +45885,23 @@ impl PgHandler {
                     if let Statement::Select(sel) = inner.as_ref() {
                         if let Some(levels) = self.nest_loop_chain_estimate(sel) {
                             if levels.len() == depth {
+                                if under_limit {
+                                    if let Some((_, _, _, top, _)) = levels.last() {
+                                        let count = sel.limit.map_or(0, |n| n.max(1));
+                                        tree.estimate = Some(scan_estimate::limit_estimate(
+                                            *top, sel.offset, count,
+                                        ));
+                                    }
+                                }
+                                let root = if under_limit {
+                                    &mut tree.children[0]
+                                } else {
+                                    &mut tree
+                                };
                                 // Lowest first, so each join above is
                                 // still the tree's when it is reached.
                                 for (i, (plan, a, b, join, param)) in levels.iter().enumerate() {
-                                    let mut node = &mut tree;
+                                    let mut node = &mut *root;
                                     for _ in 0..depth - 1 - i {
                                         node = &mut node.children[0];
                                     }

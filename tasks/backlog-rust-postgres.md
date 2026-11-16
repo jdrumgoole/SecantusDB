@@ -1784,22 +1784,20 @@ a regression test.
       working RP-354).
       Verify: tests/backlog/test_rp_explain_costs.py::test_plan[nested loop into a weakly correlated index], tests/backlog/test_rp_explain_costs.py::test_plan[nested loop of few rows into a weakly correlated index], tests/backlog/test_rp_explain_costs.py::test_a_wide_range_over_a_weakly_correlated_index
       Backlog-ID: RP-926
-- [ ] **A chain of inequality joins under a LIMIT prints unpriced, and
-      some chains still run in their written order.** Under a LIMIT the
-      chain now runs in the order PostgreSQL's search keeps
-      (`scan_estimate::nest_loop_chain` keeps each relation's paths with
-      `consider_startup`, and the top's is `get_cheapest_fractional_path`'s),
-      but EXPLAIN prices only a chain whose top node is the Nested Loop:
-      PostgreSQL 15.19 prints `explain select e.a, e3.a, zs.a from e join e
-      e3 on e.a < e3.a join zs on e3.a > zs.a limit 5` (`e` 1,000 analysed
-      rows, `zs` ten) as `Limit (cost=0.00..0.23 rows=5 width=12)` over
-      priced Nested Loops, each inner under a Materialize; here the same
-      tree with zero costs and no Materialize nodes. Still written order:
-      an ORDER BY over the chain (`nest_loop_chain` refuses `sel.order`), an
-      OFFSET, a join two ONs land on in the new tree, and a bushy tree (four
-      or more tables). Measured on a private 15.19 cluster (found while
-      working RP-354).
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a chain of inequality joins under a limit]
+- [ ] **Some chains of inequality joins still run in their written
+      order.** A chain under a LIMIT runs in the order PostgreSQL's search
+      keeps (`scan_estimate::nest_loop_chain` keeps each relation's paths
+      with `consider_startup`, the top's `get_cheapest_fractional_path`'s)
+      and EXPLAIN prices it under its Limit. Still written order, and
+      unpriced: an ORDER BY over the chain (`nest_loop_chain` refuses
+      `sel.order`), an OFFSET (it refuses `sel.offset`; PostgreSQL 15.19
+      prints `... limit 5 offset 2` over `e`, `e e3` and `zs` as `Limit
+      (cost=0.09..0.32 rows=5 width=12)` over the same priced tree as
+      without the OFFSET, so `limit_choice_of` needs the offset's rows and
+      `limit_estimate` its share), a join two ONs land on in the new tree,
+      and a bushy tree (four or more tables). Measured on a private 15.19
+      cluster (found while working RP-354).
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a chain of inequality joins under a limit and offset]
       Backlog-ID: RP-919
 - [ ] **EXPLAIN VERBOSE prints no `Output` lists above a scan.** A plan
       that is one relation's scan prints as VERBOSE does (RP-925); any
