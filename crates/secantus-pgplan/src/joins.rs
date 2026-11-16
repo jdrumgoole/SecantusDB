@@ -3974,7 +3974,7 @@ pub struct KeyBound {
 /// and that may be an index qual's operand: not VOLATILE
 /// (`match_clause_to_indexcol`), not a user's function, and a plain call
 /// -- no aggregate or window decoration, no VARIADIC, no named argument.
-fn plain_call_procost(f: &pg_query::protobuf::FuncCall) -> Option<f64> {
+pub(crate) fn plain_call_procost(f: &pg_query::protobuf::FuncCall) -> Option<f64> {
     if f.agg_star
         || f.agg_distinct
         || f.func_variadic

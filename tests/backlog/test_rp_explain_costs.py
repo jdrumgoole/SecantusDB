@@ -5459,12 +5459,33 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
     # over such a scan, each printed with no estimate (found while working
     # RP-404).
     "estimate of a function call compared with a constant": (
-        "RP-423",
+        "RP-423:fixed",
         _ANALYSED,
         "explain select * from e where abs(a) > 5",
         [
             "Seq Scan on e  (cost=0.00..20.00 rows=333 width=7)",
             "  Filter: (abs(a) > 5)",
+        ],
+    ),
+    # A call whose result type differs from its argument's: the overload
+    # its argument selects (measured on 15.19).
+    "estimate of a call of another result type compared with a constant": (
+        "RP-423:fixed",
+        _ANALYSED,
+        "explain select * from e where length(b) > 2",
+        [
+            "Seq Scan on e  (cost=0.00..20.00 rows=333 width=7)",
+            "  Filter: (length(b) > 2)",
+        ],
+    ),
+    # `eval_const_expressions` folds an immutable call over constants.
+    "a call over constants in a where is folded": (
+        "RP-1021",
+        _ANALYSED,
+        "explain select * from e where abs(-3) < a",
+        [
+            "Seq Scan on e  (cost=0.00..17.50 rows=997 width=7)",
+            "  Filter: (3 < a)",
         ],
     ),
     "estimate of a LIKE over an expression": (

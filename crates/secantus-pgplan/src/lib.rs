@@ -54042,8 +54042,9 @@ pub struct ExprQual {
 /// literals, or `||` over `text` / `varchar` columns and string literals:
 /// operators that are each one function of `procost` 1, with no implicit
 /// cast between them; or an explicit cast of a column to an integer or
-/// string type (`a::text`, its function's cost, [`pg_casts::explicit_cast_cost`]).
-/// A function call, any other cast or any other node is declined.
+/// string type (`a::text`, its function's cost, [`pg_casts::explicit_cast_cost`]);
+/// or a call of a built-in of one `procost` over columns and literals
+/// (RP-423). Any other call, cast or node is declined.
 fn explain_scan_expr_quals(
     query: &N,
     lookup: &dyn Fn(&str) -> Option<TableDef>,
@@ -54152,6 +54153,51 @@ fn expr_side(n: &pg_query::protobuf::Node, def: &TableDef) -> Option<ExprSide> {
                 },
                 // A subtree reading no column is folded to a constant.
                 operators: if fields.is_empty() { 0 } else { below + 1 },
+                integer,
+                fields,
+            }
+        }
+        // A call of a built-in over columns and literals whose every
+        // overload is of one `procost` (RP-423): that cost a row
+        // (`cost_qual_eval` of a FuncExpr), its result type the overload
+        // its arguments' types select. A call reading no column is folded.
+        N::FuncCall(f) => {
+            let procost = joins::plain_call_procost(f)?;
+            let name = func_name(f)?;
+            let mut types = Vec::with_capacity(f.args.len());
+            let mut texts = Vec::with_capacity(f.args.len());
+            let mut fields: Vec<String> = Vec::new();
+            for a in &f.args {
+                let side = expr_side(a, def)?;
+                let ty = match a.node.as_ref()? {
+                    N::ColumnRef(_) => def
+                        .column(&side.text)?
+                        .pg_type
+                        .trim_start_matches("pg_catalog.")
+                        .to_string(),
+                    N::AConst(_) if side.integer => "int4".to_string(),
+                    N::AConst(_) => "unknown".to_string(),
+                    _ => return None,
+                };
+                types.push(ty);
+                texts.push(side.text);
+                for g in side.fields {
+                    if !fields.contains(&g) {
+                        fields.push(g);
+                    }
+                }
+            }
+            let integer = match funcsig::selected_result_type(&name, &types)?.as_str() {
+                "int2" | "int4" | "int8" => true,
+                "text" | "varchar" => false,
+                _ => return None,
+            };
+            if procost.fract() != 0.0 {
+                return None;
+            }
+            ExprSide {
+                text: format!("{name}({})", texts.join(", ")),
+                operators: if fields.is_empty() { 0 } else { procost as u32 },
                 integer,
                 fields,
             }

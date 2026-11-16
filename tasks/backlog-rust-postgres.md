@@ -1935,30 +1935,41 @@ a regression test.
       private 15.19 cluster (found while working RP-402).
       Verify: tests/backlog/test_rp_explain_costs.py::test_plan[an equivalence class's generated constant is the inner index's cond]
       Backlog-ID: RP-977
-- [ ] **EXPLAIN prints no estimate for a scan filtered by a function
-      call, a pattern over an expression, or a pattern over a table never
-      analysed.** Since RP-404 a comparison of integer or text
-      arithmetic with a constant, and a LIKE / ILIKE of an analysed string
-      column, are estimated as PostgreSQL 15.19 estimates them. Still
-      zeros: `select * from e where abs(a) > 5` (PostgreSQL `rows=333`,
-      `cost=0.00..20.00`: `abs` is one function of `procost` 1, which is
-      not modelled for any function), `lower(b) like 'v%'` (`rows=5`,
-      `patternsel` with no statistics), and over a table never analysed
-      `select * from zu where c like 'x%'` (`rows=6`, `cost=0.00..25.88`)
-      or `c ~ 'ab'` (`rows=254`). Since 2026-11-13 a regex match over an
-      analysed column is estimated (RP-354), from the fixed prefix
-      `regex_fixed_prefix` reads; one whose prefix walk is not modelled
-      (a group repeated other than at most once, an anchor inside a group,
-      a back reference, embedded options) still prints zeros. Only a
-      single relation's scan is estimated so: a join over such a scan
+- [ ] **EXPLAIN prints no estimate for a scan filtered by a pattern over
+      an expression, or a pattern over a table never analysed.** Since
+      RP-404 a comparison of integer or text arithmetic with a constant,
+      and a LIKE / ILIKE of an analysed string column, are estimated as
+      PostgreSQL 15.19 estimates them; since 2026-11-16 so is a comparison
+      of a built-in call over columns and literals whose every overload is
+      of one `procost` (`select * from e where abs(a) > 5`, `rows=333`,
+      `cost=0.00..20.00`; `expr_side` in `secantus-pgplan`). Still zeros:
+      `lower(b) like 'v%'` (`rows=5`, `patternsel` with no statistics), a
+      call of a function whose overloads differ in `procost`, and over a
+      table never analysed `select * from zu where c like 'x%'` (`rows=6`,
+      `cost=0.00..25.88`) or `c ~ 'ab'` (`rows=254`). Since 2026-11-13 a
+      regex match over an analysed column is estimated (RP-354), from the
+      fixed prefix `regex_fixed_prefix` reads; one whose prefix walk is not
+      modelled (a group repeated other than at most once, an anchor inside
+      a group, a back reference, embedded options) still prints zeros. Only
+      a single relation's scan is estimated so: a join over such a scan
       prints zeros throughout (`e join s on s.a = e.a where s.c like
       'xxx%'` is PostgreSQL's `Hash Join (cost=1.74..20.78 rows=29
       width=27)`; `where e.a + 1 > 996` instead, `cost=1.68..23.02
       rows=10`; `e join w on e.a = w.a where w.c ~ '^w00'`,
       `cost=19.64..39.30 rows=91`). Measured on a private 15.19 cluster
       (found while working RP-404 and RP-354).
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[estimate of a function call compared with a constant], tests/backlog/test_rp_explain_costs.py::test_plan[estimate of a join over a scan filtered by a LIKE], tests/backlog/test_rp_explain_costs.py::test_plan[estimate of a LIKE over an expression], tests/backlog/test_rp_explain_costs.py::test_plan[estimate of a LIKE over a table never analysed], tests/backlog/test_rp_explain_costs.py::test_plan[estimate of a regex match over a table never analysed], tests/backlog/test_rp_explain_costs.py::test_plan[estimate of a join over a scan filtered by a regex match]
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[estimate of a join over a scan filtered by a LIKE], tests/backlog/test_rp_explain_costs.py::test_plan[estimate of a LIKE over an expression], tests/backlog/test_rp_explain_costs.py::test_plan[estimate of a LIKE over a table never analysed], tests/backlog/test_rp_explain_costs.py::test_plan[estimate of a regex match over a table never analysed], tests/backlog/test_rp_explain_costs.py::test_plan[estimate of a join over a scan filtered by a regex match]
       Backlog-ID: RP-423
+- [ ] **A call over constants in a WHERE is not folded in EXPLAIN.**
+      `eval_const_expressions` folds an immutable call whose arguments are
+      all constants: PostgreSQL 15.19 prints `explain select * from e where
+      abs(-3) < a` (`e` analysed, 1,000 rows) as `Seq Scan on e
+      (cost=0.00..17.50 rows=997 width=7)` with `Filter: (3 < a)`; here
+      `cost=0.00..0.00 rows=0 width=0` and `Filter: (abs('-3'::integer) <
+      a)`. The rows are right. Measured on the 15.19 reference on port 5415
+      (found while working RP-423).
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a call over constants in a where is folded]
+      Backlog-ID: RP-1021
 - [ ] **A semi join cheaper unique-ified keeps the semi join's shape.**
       Since RP-411's first slice (2026-11-16) a WHERE that is one
       uncorrelated `col IN (select col from t)` / `= any`, or one `EXISTS`
