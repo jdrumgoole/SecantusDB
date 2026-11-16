@@ -2046,16 +2046,16 @@ a regression test.
       (`var_eq_non_const`, `DEFAULT_INEQ_SEL`), and a Sort above that scan
       (keys qualified, as the InitPlan lengthens the range table); a join's
       ON conjunct of that shape is placed in its side's scan as `Filter: (b =
-      $0)`, inner and LEFT join alike (`initplan::on_init_plans`). Still
-      open: (1) `select count(*) from e where b = (select 'v3'::text)` prints
-      a `Subquery Scan on e` between the Aggregate and the scan, unpriced,
-      which PostgreSQL does not have (`Aggregate (cost=17.76..17.77 rows=1
-      width=8)` over the scan). (2) A subquery with a FROM, a correlated
-      one, or a sublink beside any other non-constant qual is still printed
-      inline; a join's ON InitPlan is unpriced; other nodes above the scan
-      (Limit, Unique, a computed sort key) are unpriced. Measured on a
-      private 15.19 cluster.
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[an aggregate over an initplan's scan is not a subquery scan]
+      $0)`, inner and LEFT join alike (`initplan::on_init_plans`). Counts
+      over the scan are an Aggregate straight over it, priced
+      (`PgHandler::init_plan_count_agg`). Still open: a subquery with a
+      FROM, a correlated one, or a sublink beside any other non-constant
+      qual is still printed inline (`select * from e where b = (select b
+      from k limit 1)`); a join's ON InitPlan is unpriced; other nodes above
+      the scan (Limit, Unique, a computed sort key, an aggregate other than
+      a count, a GROUP BY) are unpriced. Measured on a private 15.19
+      cluster.
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a limit above an initplan's scan is priced]
       Backlog-ID: RP-440
 
 ## Found by batch 54 (2026-10-24)

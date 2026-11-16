@@ -4259,6 +4259,91 @@ impl PgHandler {
         self.user_seq_scan_with(table, filter, fields, &[], exprs, &[])
     }
 
+    /// Counts over one user table whose WHERE compares columns with
+    /// InitPlans' outputs (RP-440). The executor runs that WHERE as a FROM
+    /// subquery under the Aggregate; PostgreSQL's `pull_up_simple_subquery`
+    /// merges it, so its Subquery Scan is dropped and the Aggregate is
+    /// priced by `cost_agg` (AGG_PLAIN) over the scan, the InitPlans' cost
+    /// on the top node only.
+    pub(crate) fn init_plan_count_agg(
+        &self,
+        agg: &secantus_pgplan::Aggregate,
+        tree: &mut explain::PlanNode,
+        param_quals: &[(String, secantus_pgplan::colstats::Op)],
+        init_cost: f64,
+    ) {
+        let Some(sub) = agg.sub.as_ref() else { return };
+        let Statement::Select(sel) = sub.plan.as_ref() else {
+            return;
+        };
+        let plain_counts = !agg.items.is_empty()
+            && agg.items.iter().all(|it| {
+                matches!(
+                    it.func,
+                    secantus_pgplan::AggFunc::CountStar | secantus_pgplan::AggFunc::Count
+                ) && it.expr.is_none()
+                    && it.expr2.is_none()
+                    && it.field2.is_none()
+                    && !it.distinct
+                    && it.filter.is_none()
+                    && it.order.is_empty()
+            })
+            && agg.group_by.is_empty()
+            && agg.grouping_sets.is_none()
+            && agg.groupings.is_empty()
+            && agg.having.is_none()
+            && agg.exprs.is_empty()
+            && agg.order.is_empty()
+            && agg.limit.is_none()
+            && agg.offset == 0
+            && !agg.distinct
+            && agg.filter.is_empty()
+            && agg.items.len() == agg.select.len()
+            && agg
+                .select
+                .iter()
+                .enumerate()
+                .all(|(i, (_, c))| *c == secantus_pgplan::OutputCol::Agg(i));
+        let simple_sub = sub.alias == sel.table
+            && sel.sub.is_none()
+            && sel.series.is_none()
+            && sel.join.is_none()
+            && sel.windows.is_empty()
+            && sel.order.is_empty()
+            && sel.limit.is_none()
+            && sel.offset == 0
+            && matches!(sel.distinct, secantus_pgplan::Distinct::None);
+        let shaped = tree.name == "Aggregate"
+            && tree.children.len() == 1
+            && tree.children[0].name.starts_with("Subquery Scan on ")
+            && tree.children[0].children.len() == 1
+            && tree.children[0].children[0].children.is_empty()
+            && tree.children[0].children[0].name == format!("Seq Scan on {}", sel.table);
+        if !(plain_counts && simple_sub && shaped) {
+            return;
+        }
+        let fields: Vec<String> =
+            agg.items
+                .iter()
+                .filter_map(|it| it.field.clone())
+                .fold(Vec::new(), |mut v, f| {
+                    if !v.contains(&f) {
+                        v.push(f);
+                    }
+                    v
+                });
+        let Some(scan) =
+            self.init_plan_scan_estimate(&sel.table, &sel.filter, param_quals, &fields)
+        else {
+            return;
+        };
+        let mut scan_node = tree.children[0].children.remove(0);
+        scan_node.estimate = Some(scan);
+        tree.children[0] = scan_node;
+        let (startup, total, rows, w) = count_agg_estimate(scan, agg.items.len());
+        tree.estimate = Some((startup + init_cost, total + init_cost, rows, w));
+    }
+
     /// A user table's sequential scan whose WHERE compares columns with
     /// InitPlans' outputs (`param_quals`), and with constants (`filter`):
     /// the scan's estimate, before the InitPlans' own cost (RP-440).

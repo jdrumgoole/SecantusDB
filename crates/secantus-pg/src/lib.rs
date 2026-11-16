@@ -45904,6 +45904,21 @@ impl PgHandler {
                             });
                         }
                     }
+                    // Counts over the one relation whose WHERE reads an
+                    // InitPlan: the executor runs that WHERE as a FROM
+                    // subquery, which `pull_up_simple_subquery` merges, so
+                    // the Aggregate is straight over the scan (RP-440), and
+                    // `cost_agg` (AGG_PLAIN) prices it over that scan.
+                    if let (Statement::Aggregate(agg), Some(init_cost)) =
+                        (inner.as_ref(), init_cost)
+                    {
+                        let quals: Vec<(String, secantus_pgplan::colstats::Op)> = options
+                            .init_plans
+                            .iter()
+                            .map(|ip| (ip.field.clone(), ip.op))
+                            .collect();
+                        self.init_plan_count_agg(agg, &mut tree, &quals, init_cost);
+                    }
                     // On the top plan node (`SS_attach_initplans`).
                     tree.init_plans = inits;
                 }
