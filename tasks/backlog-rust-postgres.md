@@ -2852,24 +2852,6 @@ test is in `tests/backlog/test_rp_found_rp900.py`.
       Verify: tests/backlog/test_rp_found_rp900.py::test_the_unnamed_portal_is_not_in_pg_cursors
       Backlog-ID: RP-936
 
-## Found while working RP-756 (2026-11-10)
-
-Measured on PostgreSQL 15.19 (the shared reference on port 5415): every
-statement is VALUES-only and runs there as written.
-
-- [ ] **A FROM subquery's set operation is not typed by the operator
-      check.** `select x = 1 from (select 'a'::text union select 'b')
-      s(x)` is 42883 `operator does not exist: text = integer` at 10 on
-      PostgreSQL 15.19 (the set operation's column is its arms' common
-      type, `text` when both are untyped literals); here it is 0A000
-      `comparing string with int32 using = is not supported yet`, raised
-      at run time with no position. `optype.rs`'s `add_derived` marks a
-      set-operation FROM item incomplete, so none of its columns is
-      typed. A scalar subquery over a set operation is typed since RP-756
-      (`first_output_type`).
-      Verify: tests/backlog/test_rp_found_rp756.py::test_a_set_operation_from_subquerys_column_is_typed
-      Backlog-ID: RP-765
-
 ## Found while working RP-782 (2026-11-10)
 
 Measured on a private PostgreSQL 15.19 cluster (locale C.UTF-8, built

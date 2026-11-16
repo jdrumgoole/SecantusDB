@@ -36,7 +36,7 @@ def _answer(dsn: str, query: str) -> object:
             return ("error", e.sqlstate, str(e).splitlines()[0], e.diag.statement_position)
 
 
-@pytest.mark.backlog("RP-765")
+@pytest.mark.backlog_fixed("RP-765")
 @pytest.mark.parametrize(
     "query",
     [
@@ -48,10 +48,10 @@ def test_a_set_operation_from_subquerys_column_is_typed(query: str, dsn: str) ->
     """A FROM subquery's set operation has the arms' common column type
     (`transformSetOperationTree`; `text` when every arm is an untyped
     literal), so `x = 1` over its text column is 42883 `operator does not
-    exist: text = integer` at 10 on PostgreSQL 15.19. Here the operator
-    check does not type a set operation's columns (`add_derived` gives
-    up), and the comparison is 0A000 `comparing string with int32 using =
-    is not supported yet`, with no position."""
+    exist: text = integer` at 10 on PostgreSQL 15.19. The operator check
+    did not type a set operation's columns (`add_derived` gave up), and
+    the comparison was 0A000 `comparing string with int32 using = is not
+    supported yet`, with no position."""
     assert _answer(dsn, query) == (
         "error",
         "42883",
