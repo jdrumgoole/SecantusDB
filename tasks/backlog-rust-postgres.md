@@ -1763,26 +1763,22 @@ a regression test.
       frequencies match (found while working RP-313).
       Verify: tests/backlog/test_rp_catalog_reads.py::test_a_catalog_columns_correlation_follows_the_heap
       Backlog-ID: RP-358
-- [ ] **An index over a weakly correlated column is mispriced as a nested
-      loop's inner, and read for a range PostgreSQL scans the heap for.**
-      `k2 (x int, y int)` holds `g % 100` in `y` for 1,000 rows, indexed
-      and analysed (both servers report the same `pg_stats` correlation,
-      `relpages` and `reltuples`). PostgreSQL 15.19 prices `explain select
-      * from e join k2 on e.a < k2.y` (`e` 1,000 rows) `cost=0.28..9483.50`;
-      here `0.28..9487.50`, the inner Index Scan the same to two places.
-      Over twenty outer rows (`z join k2 on z.a < k2.y`) the scan itself
-      differs: `cost=0.28..7.90` there, `0.28..8.10` here (the join
-      `225.85` against `229.85`), so `cost_index`'s cost across
-      `loop_count` scans (`index_pages_fetched`, the correlation's share
-      between its best and worst I/O) is the suspect. A range of the
+- [ ] **A committed table's wide range over a weakly correlated index is
+      read through the index, unpriced.** `k2 (x int, y int)` holds `g %
+      100` in `y` for 1,000 rows, indexed and analysed. A range of the
       column wide enough (`select * from k2 where y > 70`, 290 rows) is
-      PostgreSQL's `Seq Scan on k2 (cost=0.00..17.50 rows=290 width=8)`,
-      `Filter: (y > 70)`; here, once the table is committed, `Index Scan
-      using k2_y_idx`, priced zeros (inside the transaction that made it,
-      PostgreSQL's plan). A narrower one (`y > 90`) matches. One cause
-      for both is not established. Measured on a private 15.19 cluster (found while
-      working RP-354).
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[nested loop into a weakly correlated index], tests/backlog/test_rp_explain_costs.py::test_plan[nested loop of few rows into a weakly correlated index], tests/backlog/test_rp_explain_costs.py::test_a_wide_range_over_a_weakly_correlated_index
+      PostgreSQL 15.19's `Seq Scan on k2 (cost=0.00..17.50 rows=290
+      width=8)`, `Filter: (y > 70)`; here, once the table is committed,
+      `Index Scan using k2_y_idx`, priced zeros. Inside the transaction
+      that made it the plan is PostgreSQL's, and a narrower one (`y > 90`)
+      matches, so the cost model's path choice gives up only on the
+      committed table (`user_paths` returns `None` somewhere it does not
+      inside the transaction); find which `?` before fixing. (Since
+      2026-11-16 the nested loops into this index are priced as PostgreSQL
+      prices them: `dedup_index_size` takes the B-tree model's pages, 4,
+      where the dedup estimate gave up and `btree_size`'s 5 stood.)
+      Measured on a private 15.19 cluster (found while working RP-354).
+      Verify: tests/backlog/test_rp_explain_costs.py::test_a_wide_range_over_a_weakly_correlated_index
       Backlog-ID: RP-926
 - [ ] **A chain of inequality joins under a LIMIT runs far past the rows
       it returns.** `select e.a, e3.a, zs.a, e4.a from e join e e3 on e.a <

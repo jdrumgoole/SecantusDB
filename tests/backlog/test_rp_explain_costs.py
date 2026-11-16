@@ -5103,7 +5103,7 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
     # inner scan of it is priced a little high, more so the fewer the
     # loops. (Its wide range is `test_a_wide_range_over_a_weakly_correlated_index`.)
     "nested loop into a weakly correlated index": (
-        "RP-926",
+        "RP-926:fixed",
         _ANALYSED_INDEXED_SMALL,
         "explain select * from e join k2 on e.a < k2.y",
         [
@@ -5114,7 +5114,7 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
         ],
     ),
     "nested loop of few rows into a weakly correlated index": (
-        "RP-926",
+        "RP-926:fixed",
         _ANALYSED_INDEXED_SMALL,
         "explain select * from z join k2 on z.a < k2.y",
         [

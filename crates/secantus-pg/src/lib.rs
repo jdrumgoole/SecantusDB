@@ -9874,6 +9874,20 @@ impl PgHandler {
         table: &str,
         ix: &secantus_pgplan::costsize::Index,
     ) -> Option<Option<(f64, u32)>> {
+        // The B-tree model's pages and root level where it holds the index
+        // (what CREATE INDEX built, deduplicated and split since:
+        // `RelationGetNumberOfBlocks`, as `pg_class` reports it, RP-926).
+        if let Some(shape) = self
+            .btree_shapes(table)
+            .iter()
+            .find(|s| s.key_fields() == ix.columns.as_slice())
+        {
+            if let Ok(Some((pages, height))) =
+                self.with_btree(table, shape, |t| Some((t.pages(), t.height())))
+            {
+                return Some(Some((f64::from(pages), height)));
+            }
+        }
         const LEAF: usize = 8192 - 24 - 16;
         const MAX_POSTING: usize = 1352;
         let maxalign = |n: usize| n.div_ceil(8) * 8;
