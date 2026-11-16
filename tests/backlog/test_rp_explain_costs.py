@@ -4435,7 +4435,7 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
     # Nodes above a dummy relation are still priced, and its Result keeps
     # a join's width (found while working RP-409).
     "an aggregate over a dummy relation is priced": (
-        "RP-420",
+        "RP-420:fixed",
         _ANALYSED,
         "explain select count(*) from e where a = null",
         [
@@ -4445,10 +4445,45 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
         ],
     ),
     "a dummy join keeps its width": (
-        "RP-420",
+        "RP-420:fixed",
         _ANALYSED,
         "explain select * from e, k where e.a = null",
         ["Result  (cost=0.00..0.00 rows=0 width=14)", "  One-Time Filter: false"],
+    ),
+    # Only the columns the join carries count; one table made dummy is
+    # width 0, excluded before `set_rel_width` (measured on 15.19).
+    "a dummy join keeps the width of what it carries": (
+        "RP-420:fixed",
+        _ANALYSED,
+        "explain select e.b from e, k where e.a = null",
+        ["Result  (cost=0.00..0.00 rows=0 width=3)", "  One-Time Filter: false"],
+    ),
+    "a dummy relation alone is width zero": (
+        "RP-420:fixed",
+        _ANALYSED,
+        "explain select * from e where a = null",
+        ["Result  (cost=0.00..0.00 rows=0 width=0)", "  One-Time Filter: false"],
+    ),
+    "a sort over a dummy relation is priced": (
+        "RP-420",
+        _ANALYSED,
+        "explain select * from e where a = null order by b",
+        [
+            "Sort  (cost=0.01..0.02 rows=0 width=36)",
+            "  Sort Key: b",
+            "  ->  Result  (cost=0.00..0.00 rows=0 width=0)",
+            "        One-Time Filter: false",
+        ],
+    ),
+    "an update of a dummy relation keeps its result's width": (
+        "RP-420",
+        _ANALYSED,
+        "explain update e set b = 'x' where a = null",
+        [
+            "Update on e  (cost=0.00..0.00 rows=0 width=0)",
+            "  ->  Result  (cost=0.00..0.00 rows=0 width=38)",
+            "        One-Time Filter: false",
+        ],
     ),
     # `eval_const_expressions` folds a COALESCE's constant arguments
     # (found while working RP-409).

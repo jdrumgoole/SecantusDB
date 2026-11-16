@@ -2264,6 +2264,19 @@ pub(crate) fn dummy_relation(root: &mut PlanNode) {
     }
 }
 
+/// The `Result` [`dummy_relation`] put where the relation was.
+pub(crate) fn dummy_result_mut(root: &mut PlanNode) -> Option<&mut PlanNode> {
+    if root.name == "Result"
+        && root
+            .details
+            .iter()
+            .any(|(k, v)| k == "One-Time Filter" && v == "false")
+    {
+        return Some(root);
+    }
+    root.children.iter_mut().find_map(dummy_result_mut)
+}
+
 /// Put a set operation's per-arm WHERE conjuncts on its scans, left to
 /// right, as PostgreSQL prints each arm's own `Filter` / `Index Cond`
 /// (RP-346). A plan whose scans do not pair one-to-one with the arms is

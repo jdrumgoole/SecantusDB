@@ -4202,6 +4202,67 @@ impl PgHandler {
         })
     }
 
+    /// The width of a dummy relation's `Result` (RP-420). A join made
+    /// dummy keeps its target as `set_rel_width` sized it: each joined
+    /// table's columns the join carries. One table is excluded before its
+    /// width is set, so 0. `None` where the target is not modelled (a
+    /// LATERAL item, a computed select list, a leaf that is not a plain
+    /// table's select).
+    pub(crate) fn dummy_width(&self, stmt: &Statement) -> Option<i64> {
+        use secantus_pgplan::joins::JoinNode;
+        let width = |table: &str, fields: &[String]| -> Option<i64> {
+            Some(self.scan_estimate(table, &Document::new(), fields)?.0 .3)
+        };
+        match stmt {
+            Statement::Select(sel) => match sel.sub.as_ref().map(|s| s.plan.as_ref()) {
+                Some(Statement::JoinRows(j)) => {
+                    fn leaves<'a>(n: &'a JoinNode, out: &mut Vec<&'a JoinNode>) -> Option<()> {
+                        match n {
+                            JoinNode::Leaf { .. } => out.push(n),
+                            JoinNode::Join { left, right, .. } => {
+                                leaves(left, out)?;
+                                leaves(right, out)?;
+                            }
+                            _ => return None,
+                        }
+                        Some(())
+                    }
+                    let mut found = Vec::new();
+                    leaves(&j.tree, &mut found)?;
+                    let mut total = 0;
+                    for leaf in found {
+                        let JoinNode::Leaf { plan, def, columns } = leaf else {
+                            return None;
+                        };
+                        let Statement::Select(scan) = plan.as_ref() else {
+                            return None;
+                        };
+                        let table = self.lookup(&scan.table)?;
+                        let above: Vec<String> = columns
+                            .iter()
+                            .filter(|(key, _)| j.project.is_none() || j.needed.contains(key))
+                            .map(|(_, f)| {
+                                let c = def.columns.iter().find(|c| c.field() == *f)?;
+                                table.field_of(&c.name)
+                            })
+                            .collect::<Option<_>>()?;
+                        total += width(&scan.table, &above)?;
+                    }
+                    Some(total)
+                }
+                Some(_) => None,
+                // One table excluded before its width is set
+                // (`relation_excluded_by_constraints` ahead of
+                // `set_rel_width`): nothing, unless a computed select list
+                // projects it, which is not modelled.
+                None if sel.casts.iter().all(Option::is_none) => Some(0),
+                None => None,
+            },
+            Statement::Aggregate(agg) if agg.sub.is_none() && agg.join.is_none() => Some(0),
+            _ => None,
+        }
+    }
+
     pub(crate) fn user_seq_scan(
         &self,
         table: &str,

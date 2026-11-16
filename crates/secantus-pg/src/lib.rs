@@ -46878,6 +46878,50 @@ impl PgHandler {
                 explain::gate_named_scan(&mut tree, &options.nullable_gate);
                 if options.dummy_relation {
                     explain::dummy_relation(&mut tree);
+                    // The Result keeps the relation's width, and a count
+                    // over it is priced as over any input: `cost_agg`'s
+                    // AGG_PLAIN over no rows (RP-420).
+                    let width = self.dummy_width(inner.as_ref());
+                    let result = (0.0, 0.0, 0.0, width.unwrap_or(0));
+                    if let Some(node) = explain::dummy_result_mut(&mut tree) {
+                        if width.is_some() {
+                            node.estimate = Some(result);
+                        }
+                    }
+                    if let (Some(_), Statement::Aggregate(agg)) = (width, inner.as_ref()) {
+                        let counts = !agg.items.is_empty()
+                            && agg.items.iter().all(|it| {
+                                matches!(
+                                    it.func,
+                                    secantus_pgplan::AggFunc::CountStar
+                                        | secantus_pgplan::AggFunc::Count
+                                ) && it.expr.is_none()
+                                    && it.expr2.is_none()
+                                    && it.field2.is_none()
+                                    && !it.distinct
+                                    && it.filter.is_none()
+                                    && it.order.is_empty()
+                            });
+                        if tree.name == "Aggregate"
+                            && tree.children.len() == 1
+                            && tree.children[0].name == "Result"
+                            && counts
+                            && agg.group_by.is_empty()
+                            && agg.grouping_sets.is_none()
+                            && agg.groupings.is_empty()
+                            && agg.having.is_none()
+                            && agg.exprs.is_empty()
+                            && agg.items.len() == agg.select.len()
+                            && agg
+                                .select
+                                .iter()
+                                .enumerate()
+                                .all(|(i, (_, c))| *c == secantus_pgplan::OutputCol::Agg(i))
+                        {
+                            tree.estimate =
+                                Some(scan_estimate::count_agg_estimate(result, agg.items.len()));
+                        }
+                    }
                 }
                 explain::attach_setop_quals(&mut tree, &options.setop_quals, &index_columns);
                 // Each ON's text on the join it moved to (RP-919).
