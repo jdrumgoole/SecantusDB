@@ -740,6 +740,26 @@ pub(crate) fn semi_join_tree(sj: &secantus_pgplan::SemiJoin) -> PlanNode {
     n
 }
 
+/// A [`semi_join_tree`] planned as the inner join of its inner side made
+/// unique on the compared column (`create_unique_path`, RP-411): a `Hash
+/// Join` hashing a `HashAggregate` of the inner scan, grouped by the key.
+pub(crate) fn unique_ify_semi_join(
+    tree: &mut PlanNode,
+    sj: &secantus_pgplan::SemiJoin,
+    agg: crate::scan_estimate::Estimate,
+) {
+    tree.name = "Hash Join".into();
+    let hash = &mut tree.children[1];
+    let scan = hash.children.remove(0);
+    let mut grouped = PlanNode::over("HashAggregate", scan);
+    grouped.estimate = Some(agg);
+    grouped.details.push((
+        "Group Key".into(),
+        format!("{}.{}", sj.inner.1, sj.inner_col),
+    ));
+    hash.children.push(grouped);
+}
+
 /// The plan tree of a two-table join planned on the narrow path
 /// (`Select::join`, RP-361), as `join_tree` draws a `JoinRows` join: each
 /// side its table's scan named by its alias, or its subquery's; an ON

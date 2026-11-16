@@ -4545,7 +4545,7 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
         ],
     ),
     # An aggregate over an InitPlan's scan has no Subquery Scan between
-    # them; the Aggregate line measured on 15.19 (RP-440).
+    # them, measured on 15.19 (RP-440).
     "an aggregate over an initplan's scan is not a subquery scan": (
         "RP-440",
         _ANALYSED,
@@ -4642,15 +4642,32 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
         ],
     ),
     # Cheaper as the inner join of the inner side made unique
-    # (`create_unique_path`), which `add_path` keeps, measured on 15.19.
+    # (`create_unique_path`), which `add_path` kept, measured on 15.19.
     "a semi join cheaper unique-ified is a hash join over a hashaggregate": (
-        "RP-411",
+        "RP-411:fixed",
         _ANALYSED_THIRTY,
         "explain select * from e where b in (select b from k)",
         [
             "Hash Join  (cost=17.73..46.48 rows=1000 width=7)",
             "  Hash Cond: (e.b = k.b)",
             "  ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
+            "  ->  Hash  (cost=17.60..17.60 rows=10 width=3)",
+            "        ->  HashAggregate  (cost=17.50..17.60 rows=10 width=3)",
+            "              Group Key: k.b",
+            "              ->  Seq Scan on k  (cost=0.00..15.00 rows=1000 width=3)",
+        ],
+    ),
+    # The sublink ANDed with a qual over the outer relation, which filters
+    # its scan, measured on 15.19.
+    "a sublink anded with an outer qual is planned as a join": (
+        "RP-411",
+        _ANALYSED_THIRTY,
+        "explain select * from e where b in (select b from k) and a > 5",
+        [
+            "Hash Join  (cost=17.73..48.91 rows=995 width=7)",
+            "  Hash Cond: (e.b = k.b)",
+            "  ->  Seq Scan on e  (cost=0.00..17.50 rows=995 width=7)",
+            "        Filter: (a > 5)",
             "  ->  Hash  (cost=17.60..17.60 rows=10 width=3)",
             "        ->  HashAggregate  (cost=17.50..17.60 rows=10 width=3)",
             "              Group Key: k.b",

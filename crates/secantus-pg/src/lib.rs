@@ -46802,13 +46802,23 @@ impl PgHandler {
                             Statement::Select(sel) => self.semi_join_estimate(sj, sel),
                             _ => None,
                         };
-                        if let Some((outer, hashed, join)) = priced {
+                        if let Some((outer, scanned, join, unique)) = priced {
                             tree.estimate = Some(join);
                             tree.children[0].estimate = Some(outer);
+                            tree.children[1].children[0].estimate = Some(scanned);
+                            // Cheaper as the inner join of the inner side
+                            // made unique (`create_unique_path`): hashed
+                            // over its HashAggregate.
+                            let hashed = match unique {
+                                Some(agg) => {
+                                    explain::unique_ify_semi_join(&mut tree, sj, agg);
+                                    agg
+                                }
+                                None => scanned,
+                            };
                             // A Hash returns nothing until it is built.
                             tree.children[1].estimate =
                                 Some((hashed.1, hashed.1, hashed.2, hashed.3));
-                            tree.children[1].children[0].estimate = Some(hashed);
                         }
                     }
                 }

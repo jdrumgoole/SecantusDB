@@ -1996,18 +1996,20 @@ a regression test.
       `eqjoinsel_semi` with its MCV branch, `final_cost_hashjoin`'s
       JOIN_SEMI) where it beats the inner join of the unique-ified inner
       side, hashed either way, and lower bounds of the merge and
-      nested-loop paths. Still open: (1) Where the unique-ified path is
-      cheaper, PostgreSQL plans it and the semi join here prints zeros:
-      `select * from e where b in (select b from k)` is `Hash Join
-      (cost=17.73..46.48 rows=1000 width=7)` over `Hash` over
-      `HashAggregate (cost=17.50..17.60 rows=10 width=3)`, `Group Key:
-      k.b` (`create_unique_path`; the costs `hash_semi_join_of` already
-      computes for the comparison). Merge and nested-loop semi joins, and
-      a side read through an index, are not priced. (2) Wider shapes still
-      print the scan: a sublink ANDed with other quals, a subquery with its
-      own WHERE, a cross-type comparison.
+      nested-loop paths, and where the inner join of the unique-ified inner
+      side hashed over its `HashAggregate` is cheaper (`create_unique_path`,
+      its semi factors those of the base relation as
+      `compute_semi_anti_join_factors` takes them) it is planned and printed
+      as that `Hash Join`. Still open: (1) Merge and nested-loop semi
+      joins, the unique-ified side as the outer one, and a side read through
+      an index, are not priced. (2) Wider shapes still print the scan: a
+      sublink ANDed with other quals (`select * from e where b in (select b
+      from k) and a > 5` is the unique-ified `Hash Join (cost=17.73..48.91
+      rows=995 width=7)` with `Filter: (a > 5)` on `e`'s scan, measured on a
+      private 15.19 cluster), a subquery with its own WHERE, a cross-type
+      comparison.
       Backlog-ID: RP-411
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a semi join cheaper unique-ified is a hash join over a hashaggregate]
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a sublink anded with an outer qual is planned as a join]
 - [ ] **A hash join of two tables never analysed is unpriced, and its
       sides stay in written order.** `hash_side` prices a side only from
       `analysed_key`, which needs `pg_statistic` rows. PostgreSQL 15.19
