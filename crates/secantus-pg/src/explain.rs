@@ -95,6 +95,12 @@ pub(crate) struct PlanNode {
     /// A Memoize node's cache (RP-916): what its rows hold, and under
     /// ANALYZE what `show_memoize_info` prints.
     pub memo: Option<MemoInfo>,
+    /// The InitPlans this node runs first (RP-440), each labelled by
+    /// its `subplan_name`, printed after the node's details and before
+    /// its children.
+    pub init_plans: Vec<PlanNode>,
+    /// A sub-plan's label: `InitPlan 1 (returns $0)`.
+    pub subplan_name: Option<String>,
 }
 
 /// A Memoize node: the stored fields of each row its subplan returns, and
@@ -195,6 +201,8 @@ impl PlanNode {
             skip_cond: false,
             implied_filter: None,
             param_cond: None,
+            init_plans: Vec::new(),
+            subplan_name: None,
         }
     }
 
@@ -1444,9 +1452,12 @@ pub(crate) fn render_text(
     actual_rows: Option<usize>,
 ) -> Vec<String> {
     let mut out = Vec::new();
+    // `pad`: the extra indent of a sub-plan, whose label line sits where
+    // its parent's details do (`ExplainSubPlans`).
     fn walk(
         n: &PlanNode,
         depth: usize,
+        pad: usize,
         options: &ExplainOptions,
         actual: Option<usize>,
         out: &mut Vec<String>,
@@ -1454,7 +1465,7 @@ pub(crate) fn render_text(
         let mut header = if depth == 0 {
             n.name.clone()
         } else {
-            format!("{}->  {}", " ".repeat(2 + 6 * (depth - 1)), n.name)
+            format!("{}->  {}", " ".repeat(2 + 6 * (depth - 1) + pad), n.name)
         };
         if options.costs {
             header.push_str(&costs_text(n));
@@ -1471,14 +1482,17 @@ pub(crate) fn render_text(
         }
         out.push(header);
         for (label, value) in &n.details {
-            out.push(format!("{}{label}: {value}", " ".repeat(2 + 6 * depth)));
+            out.push(format!(
+                "{}{label}: {value}",
+                " ".repeat(2 + 6 * depth + pad)
+            ));
             // `show_instrumentation_count`: the text format prints a
             // non-zero count only.
             if let (Some(r), Some(_), "Filter") = (n.removed_by_filter, actual, label.as_str()) {
                 if r > 0 {
                     out.push(format!(
                         "{}Rows Removed by Filter: {r}",
-                        " ".repeat(2 + 6 * depth)
+                        " ".repeat(2 + 6 * depth + pad)
                     ));
                 }
             }
@@ -1488,35 +1502,50 @@ pub(crate) fn render_text(
                 if r > 0 {
                     out.push(format!(
                         "{}Rows Removed by Join Filter: {r}",
-                        " ".repeat(2 + 6 * depth)
+                        " ".repeat(2 + 6 * depth + pad)
                     ));
                 }
             }
         }
         if let (Some(n), Some(_)) = (n.heap_fetches, actual) {
-            out.push(format!("{}Heap Fetches: {n}", " ".repeat(2 + 6 * depth)));
+            out.push(format!(
+                "{}Heap Fetches: {n}",
+                " ".repeat(2 + 6 * depth + pad)
+            ));
         }
         if let (Some(n), Some(_)) = (n.heap_blocks, actual) {
             out.push(format!(
                 "{}Heap Blocks: exact={n}",
-                " ".repeat(2 + 6 * depth)
+                " ".repeat(2 + 6 * depth + pad)
             ));
         }
         if let (Some(h), Some(_)) = (n.hash_info, actual) {
-            out.push(format!("{}{}", " ".repeat(2 + 6 * depth), h.text()));
+            out.push(format!("{}{}", " ".repeat(2 + 6 * depth + pad), h.text()));
         }
         // `show_memoize_info`: only once the cache has missed.
         if let (Some(m), Some(_)) = (n.memo.as_ref().and_then(|m| m.stats), actual) {
             if m.misses > 0 {
-                out.push(format!("{}{}", " ".repeat(2 + 6 * depth), m.text()));
+                out.push(format!("{}{}", " ".repeat(2 + 6 * depth + pad), m.text()));
             }
+        }
+        for c in &n.init_plans {
+            let label = c.subplan_name.as_deref().unwrap_or("InitPlan");
+            out.push(format!("{}{label}", " ".repeat(2 + 6 * depth + pad)));
+            walk(
+                c,
+                depth + 1,
+                pad + 2,
+                options,
+                actual.and(c.actual_rows),
+                out,
+            );
         }
         for c in &n.children {
             let a = actual.and(c.actual_rows);
-            walk(c, depth + 1, options, a, out);
+            walk(c, depth + 1, pad, options, a, out);
         }
     }
-    walk(root, 0, options, actual_rows, &mut out);
+    walk(root, 0, 0, options, actual_rows, &mut out);
     if options.summary {
         out.push("Planning Time: 0.000 ms".into());
         if actual_rows.is_some() {
@@ -1560,6 +1589,9 @@ fn structured(
         fields.push(("Node Type".into(), Value::Str(node_type.clone())));
         if let Some(r) = relationship {
             fields.push(("Parent Relationship".into(), Value::Str(r.into())));
+        }
+        if let Some(name) = &n.subplan_name {
+            fields.push(("Subplan Name".into(), Value::Str(name.clone())));
         }
         fields.push(("Parallel Aware".into(), Value::Num("false".into())));
         fields.push(("Async Capable".into(), Value::Num("false".into())));
@@ -1687,26 +1719,26 @@ fn structured(
                 fields.push((k.into(), Value::Num(v.to_string())));
             }
         }
-        if !n.children.is_empty() {
-            let kids = n
-                .children
+        if !n.children.is_empty() || !n.init_plans.is_empty() {
+            let inits = n
+                .init_plans
                 .iter()
-                .enumerate()
-                .map(|(i, c)| {
-                    // ExplainNode's `Member` plans: an Append's, and a
-                    // BitmapOr's / BitmapAnd's (RP-378).
-                    let rel = if matches!(node_type.as_str(), "Append" | "BitmapOr" | "BitmapAnd") {
-                        "Member"
-                    } else if node_type == "Subquery Scan" {
-                        "Subquery"
-                    } else if i == 0 {
-                        "Outer"
-                    } else {
-                        "Inner"
-                    };
-                    node(c, options, actual.and(c.actual_rows), Some(rel))
-                })
-                .collect();
+                .map(|c| node(c, options, actual.and(c.actual_rows), Some("InitPlan")));
+            let kids = n.children.iter().enumerate().map(|(i, c)| {
+                // ExplainNode's `Member` plans: an Append's, and a
+                // BitmapOr's / BitmapAnd's (RP-378).
+                let rel = if matches!(node_type.as_str(), "Append" | "BitmapOr" | "BitmapAnd") {
+                    "Member"
+                } else if node_type == "Subquery Scan" {
+                    "Subquery"
+                } else if i == 0 {
+                    "Outer"
+                } else {
+                    "Inner"
+                };
+                node(c, options, actual.and(c.actual_rows), Some(rel))
+            });
+            let kids = inits.chain(kids).collect();
             fields.push(("Plans".into(), Value::Arr(kids)));
         }
         Value::Obj(fields)
@@ -3292,6 +3324,7 @@ mod heap_fetches_tests {
             nullable_gate: None,
             dummy_relation: false,
             semi_join: None,
+            init_plans: Vec::new(),
             modify_table: None,
             sort_keys: None,
             series_scan: None,

@@ -45830,6 +45830,60 @@ impl PgHandler {
                         }
                     }
                 }
+                // Each uncorrelated scalar subquery a qual compares with is
+                // an InitPlan the scan runs first (RP-440): its cost is in
+                // the scan's startup and total, and its comparison is with
+                // a value unknown at plan time.
+                if !options.init_plans.is_empty() {
+                    let inits: Vec<explain::PlanNode> = options
+                        .init_plans
+                        .iter()
+                        .enumerate()
+                        .map(|(i, ip)| {
+                            let mut n = explain::plan_tree(&ip.plan, &chooser);
+                            if let Statement::SelectConstant(sc) = ip.plan.as_ref() {
+                                n.estimate = scan_estimate::result_estimate(sc);
+                            }
+                            n.subplan_name = Some(format!("InitPlan {} (returns ${i})", i + 1));
+                            n
+                        })
+                        .collect();
+                    let init_cost: Option<f64> =
+                        inits.iter().map(|n| n.estimate.map(|e| e.1)).sum();
+                    if let (Statement::Select(sel), Some(init_cost)) = (inner.as_ref(), init_cost) {
+                        if tree.children.is_empty()
+                            && tree.name.starts_with("Seq Scan on ")
+                            && sel.sub.is_none()
+                            && sel.series.is_none()
+                            && sel.join.is_none()
+                            && sel.windows.is_empty()
+                        {
+                            let quals: Vec<(String, secantus_pgplan::colstats::Op)> = options
+                                .init_plans
+                                .iter()
+                                .map(|ip| (ip.field.clone(), ip.op))
+                                .collect();
+                            tree.estimate = scan_estimate::target_cost(sel).and_then(
+                                |(cost, width, fields)| {
+                                    let (startup, total, rows, w) = self.init_plan_scan_estimate(
+                                        &sel.table,
+                                        &sel.filter,
+                                        &quals,
+                                        &fields,
+                                    )?;
+                                    Some((
+                                        startup + init_cost,
+                                        total + cost * rows + init_cost,
+                                        rows,
+                                        w + width,
+                                    ))
+                                },
+                            );
+                        }
+                    }
+                    // On the top plan node (`SS_attach_initplans`).
+                    tree.init_plans = inits;
+                }
                 // A narrow-path inner join whose WHERE fixes a join key
                 // (RP-363) is a Nested Loop of the two filtered scans: the
                 // equivalence class with the constant replaced its clause.

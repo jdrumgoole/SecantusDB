@@ -4476,12 +4476,39 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
     # as `$0`; in a join's ON it is pushed to the scan it constrains (found
     # while working RP-438).
     "an uncorrelated subquery is an initplan": (
-        "RP-440",
+        "RP-440:fixed",
         _ANALYSED,
         "explain select * from e where b = (select 'v3'::text)",
         [
             "Seq Scan on e  (cost=0.01..17.51 rows=100 width=7)",
             "  Filter: (b = $0)",
+            "  InitPlan 1 (returns $0)",
+            "    ->  Result  (cost=0.00..0.01 rows=1 width=32)",
+        ],
+    ),
+    # Each sublink is its own InitPlan, numbered in order; an inequality
+    # to an unknown value is DEFAULT_INEQ_SEL, `<>` the complement of
+    # `var_eq_non_const` (measured on 15.19).
+    "two uncorrelated subqueries are two initplans": (
+        "RP-440:fixed",
+        _ANALYSED,
+        "explain select * from e where a > (select 5) and b = (select 'v3'::text)",
+        [
+            "Seq Scan on e  (cost=0.02..20.02 rows=33 width=7)",
+            "  Filter: ((a > $0) AND (b = $1))",
+            "  InitPlan 1 (returns $0)",
+            "    ->  Result  (cost=0.00..0.01 rows=1 width=4)",
+            "  InitPlan 2 (returns $1)",
+            "    ->  Result  (cost=0.00..0.01 rows=1 width=32)",
+        ],
+    ),
+    "an initplan beside a constant qual": (
+        "RP-440:fixed",
+        _ANALYSED,
+        "explain select a, b from e where a > 5 and b <> (select 'v3'::text)",
+        [
+            "Seq Scan on e  (cost=0.01..20.01 rows=896 width=7)",
+            "  Filter: ((a > 5) AND (b <> $0))",
             "  InitPlan 1 (returns $0)",
             "    ->  Result  (cost=0.00..0.01 rows=1 width=32)",
         ],

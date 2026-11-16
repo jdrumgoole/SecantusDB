@@ -20,6 +20,21 @@ use pg_query::protobuf::{
 
 use crate::TableDef;
 
+thread_local! {
+    /// The sublinks planned as InitPlans while EXPLAIN prints quals, in
+    /// their InitPlan order: each prints as `$n` (RP-440).
+    static INIT_PLANS: std::cell::RefCell<Vec<pg_query::protobuf::SubLink>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Run `f` with `plans` printing as their InitPlans' parameters.
+pub fn with_init_plans<T>(plans: &[pg_query::protobuf::SubLink], f: impl FnOnce() -> T) -> T {
+    let saved = INIT_PLANS.with(|i| std::mem::replace(&mut *i.borrow_mut(), plans.to_vec()));
+    let out = f();
+    INIT_PLANS.with(|i| *i.borrow_mut() = saved);
+    out
+}
+
 type Node = pg_query::protobuf::Node;
 
 const PRETTYINDENT_STD: i32 = 8;
@@ -2520,6 +2535,12 @@ impl<'a> Printer<'a> {
                 self.buf.push_str("(EXISTS (");
                 self.subquery(sub)?;
                 self.buf.push_str("))");
+            }
+            // A sublink the planner made an InitPlan prints as its
+            // output parameter (RP-440).
+            SubLinkType::ExprSublink if INIT_PLANS.with(|i| i.borrow().contains(s)) => {
+                let n = INIT_PLANS.with(|i| i.borrow().iter().position(|x| x == s))?;
+                self.buf.push_str(&format!("${n}"));
             }
             SubLinkType::ExprSublink => {
                 self.buf.push('(');

@@ -2030,62 +2030,30 @@ a regression test.
       working RP-409).
       Verify: tests/backlog/test_rp_explain_costs.py::test_plan[an aggregate over a dummy relation is priced], tests/backlog/test_rp_explain_costs.py::test_plan[a dummy join keeps its width]
       Backlog-ID: RP-420
-- [ ] **EXPLAIN prints an uncorrelated subquery inline, with no InitPlan
-      and no estimate.** PostgreSQL 15.19 plans `(select 'v3'::text)` as
-      an `InitPlan 1 (returns $0)` over a `Result`, run once, and the qual
-      reads `$0`: `explain select * from e where b = (select 'v3'::text)` is
-      `Seq Scan on e  (cost=0.01..17.51 rows=100 width=7)`, `Filter: (b =
-      $0)`, then the InitPlan. Here `Filter: (b = ( SELECT 'v3'::text AS
-      text))`, every cost zero, no InitPlan, in a WHERE as in a join. In a
-      join's ON (runnable since RP-438) the conjunct also stays in the
-      join's `Join Filter`, where PostgreSQL pushes it to `Seq Scan on k`'s
-      `Filter: (b = $0)`, inner and LEFT join alike. Its rows are right.
-      Measured on a private 15.19 cluster (found while working RP-438).
-      (2026-11-16, bundled with RP-422: no InitPlan or SubPlan exists in
-      `secantus-pg/src/explain.rs` yet -- `PlanNode` has no labelled
-      sub-plan child, the renderers no `InitPlan n (returns $n)` line or
-      JSON `Parent Relationship: InitPlan` / `Subplan Name`, and no `$n`
-      param text. The fix needs that node kind, the initplan's cost added
-      to the scan's startup and total, and `b = $0` estimated as an
-      equality to an unknown value: 1/ndistinct, so 100 of e's rows.)
-      (2026-11-16, measured while working RP-475 on PostgreSQL 15.19:
-      each sublink is its own InitPlan, numbered in order, `select * from
-      e where a > (select 5) and b = (select 'v3'::text)` printing
-      `(cost=0.02..20.02 rows=33 width=7)`, `Filter: ((a > $0) AND (b =
-      $1))`, then `InitPlan 1 (returns $0)` over `Result (cost=0.00..0.01
-      rows=1 width=4)` and `InitPlan 2 (returns $1)` over one of width 32:
-      the inequality to an unknown value is `DEFAULT_INEQ_SEL`, so the
-      `a > 5` this server substitutes at plan time would price wrongly. A
-      select-list sublink is an InitPlan too (`select a, (select 1) from
-      e` is `Seq Scan on e (cost=0.01..15.01 rows=1000 width=8)` over
-      `InitPlan 1`). JSON puts the Result in the scan's `Plans` with
-      `Parent Relationship: InitPlan`, `Subplan Name: InitPlan 1 (returns
-      $0)`. Text prints the InitPlan lines after the node's details and
-      before its child plans. The seq-scan pricer
-      (`user_seq_scan_with`) has no qual kind for a comparison to an
-      unknown value; `ExprQual` is the nearest shape but models a
-      statistics-less expression, not `var_eq_non_const` over a column's
-      own statistics.)
-      (2026-11-16, RP-411's first slice: EXPLAIN now recognises a WHERE
-      sublink from the parse tree in `secantus-pgplan/src/sublink_join.rs`,
-      carried on `ExplainOptions::semi_join`, and redraws the tree in
-      `secantus-pg/src/lib.rs` just before `attach_scan_quals`; an
-      EXPR_SUBLINK's InitPlan can be recognised the same way. Note the raw
-      parse tree leaves an IN's `oper_name` empty.)
-      (2026-11-16, sized while bundled with RP-411: four pieces. (a) The
-      scan's MQL filter already holds the constant the planner substituted
-      for the sublink, so `where_selectivity` prices `b = 'v3'` from the
-      MCV list; the estimator needs the conjunct as a comparison to an
-      unknown value instead (`var_eq_non_const`: (1 - nullfrac) /
-      ndistinct; `DEFAULT_INEQ_SEL` for `<` / `>`). (b) The Filter text
-      comes from `ruleutils::explain_conjuncts`, whose `sublink` printer
-      writes `( SELECT ...)`: it needs a numbering context printing `$n`
-      per InitPlan in order. (c) `PlanNode` needs labelled InitPlan
-      children, rendered by `render_text` after the details and before
-      the children, and by `structured` in `Plans` first. (d) The scan's
-      startup and total each gain the InitPlan's total (0.01 for a
-      FROM-less one, `scan_estimate::result_estimate`).)
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[an uncorrelated subquery is an initplan], tests/backlog/test_rp_explain_costs.py::test_plan[a join's on subquery is an initplan on its scan]
+- [ ] **An InitPlan in a join's ON stays in the Join Filter, and a node
+      above an InitPlan's scan is unpriced.** Since RP-440's first slice
+      (2026-11-16) a SELECT over one relation whose WHERE compares columns
+      with uncorrelated FROM-less scalar subqueries plans each as an
+      InitPlan on the top node, as PostgreSQL 15.19 does
+      (`secantus-pgplan/src/initplan.rs`, `$n` printed through
+      `ruleutils::with_init_plans`), and prices a plain Seq Scan over them
+      (`var_eq_non_const`, `DEFAULT_INEQ_SEL`). Still open: (1) In a join's
+      ON (runnable since RP-438) the conjunct stays in the join's `Join
+      Filter` as `(k.b = ( SELECT 'v3'::text AS text))`, where PostgreSQL
+      pushes it to `Seq Scan on k`'s `Filter: (b = $0)`, inner and LEFT join
+      alike, with `InitPlan 1 (returns $0)` on the join. (2) A node above
+      the scan is unpriced: `explain select a from e where b = (select
+      'v3'::text) order by a` is `Sort (cost=20.83..21.08 rows=100
+      width=4)`, `Sort Key: e.a`, over `Seq Scan on e (cost=0.00..17.50
+      rows=100 width=4)` (the initplan's cost is on the top node only);
+      here zeros and `Sort Key: a`. (3) `select count(*) from e where b =
+      (select 'v3'::text)` prints a `Subquery Scan on e` between the
+      Aggregate and the scan, which PostgreSQL does not have (`Aggregate
+      (cost=17.76..17.77 rows=1 width=8)` over the scan). (4) A subquery
+      with a FROM, a correlated one, or a sublink beside any other
+      non-constant qual is still printed inline. Measured on a private
+      15.19 cluster.
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a join's on subquery is an initplan on its scan]
       Backlog-ID: RP-440
 
 ## Found by batch 54 (2026-10-24)

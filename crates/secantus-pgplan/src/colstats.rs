@@ -424,6 +424,42 @@ impl Column<'_> {
         Some(selec.clamp(0.0, 1.0))
     }
 
+    /// A comparison with a value unknown at plan time, an InitPlan's
+    /// output (RP-440): `var_eq_non_const` for `=` (negated for `<>`),
+    /// `DEFAULT_INEQ_SEL` for an inequality (`scalarineqsel` given no
+    /// constant).
+    pub fn non_const_sel(&self, op: Op) -> f64 {
+        if !matches!(op, Op::Eq | Op::Ne) {
+            return DEFAULT_INEQ_SEL;
+        }
+        let nullfrac = self.null_frac();
+        let mut selec = if self.unique && self.tuples >= 1.0 {
+            1.0 / self.tuples
+        } else if let Some((_, slots)) = self.stats {
+            let mut selec = 1.0 - nullfrac;
+            let ndistinct = self.numdistinct();
+            if ndistinct > 1.0 {
+                selec /= ndistinct;
+            }
+            // No more common than the most common value.
+            if let Some(top) = slots
+                .mcv
+                .iter()
+                .map(|(_, f)| f64::from(*f))
+                .reduce(f64::max)
+            {
+                selec = selec.min(top);
+            }
+            selec
+        } else {
+            1.0 / self.numdistinct()
+        };
+        if op == Op::Ne {
+            selec = 1.0 - selec - nullfrac;
+        }
+        selec.clamp(0.0, 1.0)
+    }
+
     /// `scalarineqsel`: the MCVs that satisfy the comparison, plus the
     /// histogram's share (`ineq_histogram_selectivity`) of the rest; a third
     /// with no statistics. `None` for a column whose values are not

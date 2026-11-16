@@ -4164,7 +4164,7 @@ impl PgHandler {
         filter: &Document,
         fields: &[String],
     ) -> Option<Estimate> {
-        self.user_seq_scan_with(table, filter, fields, &[], &[])
+        self.user_seq_scan_with(table, filter, fields, &[], &[], &[])
     }
 
     /// A user table's sequential scan whose WHERE runs per row, in part or
@@ -4217,7 +4217,57 @@ impl PgHandler {
                 return None;
             }
         }
-        self.user_seq_scan_with(table, filter, fields, &[], exprs)
+        self.user_seq_scan_with(table, filter, fields, &[], exprs, &[])
+    }
+
+    /// A user table's sequential scan whose WHERE compares columns with
+    /// InitPlans' outputs (`param_quals`), and with constants (`filter`):
+    /// the scan's estimate, before the InitPlans' own cost (RP-440).
+    pub(crate) fn init_plan_scan_estimate(
+        &self,
+        table: &str,
+        filter: &Document,
+        param_quals: &[(String, secantus_pgplan::colstats::Op)],
+        fields: &[String],
+    ) -> Option<Estimate> {
+        if !self
+            .shared_table_defs()
+            .ok()?
+            .iter()
+            .any(|d| d.name == table)
+        {
+            return None;
+        }
+        self.user_seq_scan_with(table, filter, fields, &[], &[], param_quals)
+    }
+
+    /// `field`'s comparison with a value unknown at plan time
+    /// (`colstats::Column::non_const_sel`).
+    fn param_qual_selectivity(
+        &self,
+        pt: &PlannerTable,
+        field: &str,
+        op: secantus_pgplan::colstats::Op,
+    ) -> Option<f64> {
+        let c = pt.def.columns.iter().find(|c| c.field() == field)?;
+        let measured = match pt.analyzed.as_ref().map(|a| a.get(field)) {
+            Some(Some(Some(a))) => Some((a.stats, a.slots.as_ref()?)),
+            Some(Some(None)) => return None,
+            _ => None,
+        };
+        let base = c.pg_type.trim_start_matches("pg_catalog.");
+        let column = secantus_pgplan::colstats::Column {
+            stats: measured,
+            unique: pt.unique.iter().any(|u| u == field),
+            boolean: base == "bool",
+            numeric: false,
+            ordered: false,
+            string: false,
+            c_collation: false,
+            actual: None,
+            tuples: pt.tuples,
+        };
+        Some(column.non_const_sel(op))
     }
 
     /// A user table's sequential scan whose WHERE is only array operators
@@ -4240,7 +4290,7 @@ impl PgHandler {
         {
             return None;
         }
-        self.user_seq_scan_with(table, &Document::new(), fields, quals, &[])
+        self.user_seq_scan_with(table, &Document::new(), fields, quals, &[], &[])
     }
 
     /// One array conjunct's selectivity (`arraycontsel`, or
@@ -4315,6 +4365,7 @@ impl PgHandler {
         fields: &[String],
         array_quals: &[secantus_pgplan::ArrayQual],
         expr_quals: &[secantus_pgplan::ExprQual],
+        param_quals: &[(String, secantus_pgplan::colstats::Op)],
     ) -> Option<Estimate> {
         let counted: std::cell::OnceCell<Option<usize>> = std::cell::OnceCell::new();
         let count = || {
@@ -4343,6 +4394,11 @@ impl PgHandler {
                     costsize::Qual::Filter(f64::from(q.operators)),
                 ));
             }
+        }
+        for (field, op) in param_quals {
+            sel *= self.param_qual_selectivity(&pt, field, *op)?;
+            // The comparison; the parameter it reads costs nothing.
+            quals.push((field.clone(), costsize::Qual::Filter(1.0)));
         }
         let width = output_width(&pt.def, pt.analyzed.as_ref(), fields)?;
         let rel = costsize::Rel {

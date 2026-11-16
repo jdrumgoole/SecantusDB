@@ -19,12 +19,14 @@ mod agg_support;
 pub mod deferred;
 mod dml_pullup;
 mod domain_scope;
+mod initplan;
 mod join_alias;
 mod record_image;
 mod relabel;
 mod sublink_join;
 mod subquery_pullup;
 pub use domain_scope::{select_output_domains, select_target_domain};
+pub use initplan::InitPlan;
 pub use sublink_join::SemiJoin;
 mod targetlist_size;
 pub use targetlist_size::MAX_HEAP_ATTRIBUTE_NUMBER;
@@ -3769,6 +3771,9 @@ pub struct ExplainOptions {
     /// A SELECT whose WHERE is one IN or EXISTS sublink pulled up into a
     /// semi join (RP-411).
     pub semi_join: Option<Box<SemiJoin>>,
+    /// The uncorrelated scalar subqueries the scan's quals compare with,
+    /// each an InitPlan run once (RP-440).
+    pub init_plans: Vec<InitPlan>,
 }
 
 /// A user function scan's WHERE, kept until the function's result
@@ -12381,6 +12386,7 @@ fn plan_explain(
         function_scan_call: None,
         function_scan_where: None,
         semi_join: None,
+        init_plans: Vec::new(),
     };
     let (mut timing, mut summary) = (None, None);
     // `transformExplainStmt` resolves the statement's names and literals
@@ -12497,7 +12503,18 @@ fn plan_explain(
         }
         options.nullable_gate = reduce_left_join_on_classes(&mut query, lookup);
     }
-    let scan_quals = explain_scan_quals(&query, lookup).unwrap_or_default();
+    // An uncorrelated scalar subquery a qual compares with is an
+    // InitPlan, printed as its parameter (RP-440).
+    let init_sublinks = if options.analyze {
+        Vec::new()
+    } else {
+        let (sublinks, plans) = initplan::init_plans_of(&query, lookup, params)?;
+        options.init_plans = plans;
+        sublinks
+    };
+    let scan_quals = ruleutils::with_init_plans(&init_sublinks, || {
+        explain_scan_quals(&query, lookup).unwrap_or_default()
+    });
     (options.series_scan, options.series_qual) = match &query {
         N::SelectStmt(s) => match explain_series_scan(s) {
             Some((scan, qual)) => (Some(scan), qual),
