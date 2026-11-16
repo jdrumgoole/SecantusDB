@@ -648,16 +648,14 @@ _UNSHAPED = {
 }
 
 
-@pytest.mark.backlog("RM-358")
+@pytest.mark.backlog_fixed("RM-358")
 def test_a_query_of_every_kind_names_its_query_shape(rust_mongo: Any, mongod_rs: Any) -> None:
     """mongod 8.2's `explain` (as its line and profile entry) carries a
     `queryShapeHash` for every `find`, `distinct` and `aggregate` it parses
-    (measured 2026-11-07, and on 8.2.11 2026-11-09). This server shapes the
-    predicates, operators, accumulators and stages in
-    `tests/mongod_live/test_query_shape_hash.py`, `$rankFusion` and
-    `$scoreFusion` among them since 2026-11-12, and prints none for
-    `$jsonSchema`, which mongod shapes as the internal schema predicates it
-    translates the schema into."""
+    (measured 2026-11-07, and on 8.2.11 2026-11-09). This server printed
+    none for `$jsonSchema`, which mongod shapes as the internal schema
+    predicates its parser translates the schema into; since 2026-11-16 it
+    builds the same tree (`query_shape/json_schema.rs`)."""
     name = fresh("qshape")
     answers = {}
     for server, client in (("rust", rust_mongo), ("mongod", mongod_rs)):

@@ -612,19 +612,9 @@ These are explicit non-goals. Don't add them without a reason.
 - [ ] **Some queries have no `queryShapeHash`.** Since 2026-11-07 a
       `find`'s, `distinct`'s and `aggregate`'s line, profile entry and
       `explain` carry mongod's `queryShapeHash` (`secantus-commands`
-      `query_shape.rs`); since 2026-11-09 it covers geo, `$text`, `$where`
-      and `$sampleRate` predicates, the aggregation operators and
-      accumulators with arguments of their own, the stages mongod desugars,
-      change streams, `aggregate: 1` and DBPointer literals
-      (`tests/mongod_live/test_query_shape_hash.py`, against mongod
-      8.2.11); since 2026-11-12 `$rankFusion` and `$scoreFusion`, as the
-      pipelines mongod desugars them into, and a `$geoNear` with no
-      `distanceField`. A query using one of these prints none, where mongod
-      prints one:
-      - `$jsonSchema`, which mongod shapes as the `$_internalSchema*`
-        predicates its JSON Schema parser translates the schema into
-        (`json_schema_parser.cpp`, about 1,950 lines in 8.2.11, and the
-        serializer of each of the ~18 internal predicates it builds);
+      `query_shape.rs`, `tests/mongod_live/test_query_shape_hash.py`,
+      against mongod 8.2.11), `$jsonSchema` among them since 2026-11-16. A
+      query using one of these prints none, where mongod prints one:
       - a `$rankFusion` or `$scoreFusion` input of `$search` or
         `$vectorSearch`, which need mongot;
       - options measured nowhere yet: a `$lookup` `from` naming another
@@ -634,7 +624,8 @@ These are explicit non-goals. Don't add them without a reason.
       Each is mongod's serializer for that node, transcribed and checked as
       the shaped ones were.
       Backlog-ID: RM-358
-      Verify: tests/backlog/test_rm_355_364.py::test_a_query_of_every_kind_names_its_query_shape
+      Verify: none -- the mongot inputs need a mongot, and the unmeasured
+      options have no measured answer yet to assert
 - [ ] **`$scoreFusion` combines by `"average"`, not `"avg"`.** mongod
       8.2.11's `combination.method` is `"avg"` or `"expression"` (its IDL
       enum, `kAvg: "avg"`) and refuses `"average"` with 2 (`Enumeration
@@ -1864,12 +1855,12 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       mongod's settings, a read of their shape is refused (411) or planned
       over its `indexHints` (RM-219), since 2026-11-10 its
       `queryFramework` chooses the engine, and since 2026-11-14
-      `showDebugQueryShape` gives each `debugQueryShape` (RM-418). Open:
-      a query whose shape `query_shape.rs` does not compute (a
-      `$jsonSchema` filter) is refused 115 where mongod keeps the setting;
-      and a write made to `config.clusterParameters` directly is read only
-      at the next start (mongod's op observer reloads it).
-      Verify: tests/backlog/test_rm_219_diag_query_settings.py::test_setting_for_a_query_the_server_does_not_shape
+      `showDebugQueryShape` gives each `debugQueryShape` (RM-418), and
+      since 2026-11-16 a `$jsonSchema` query's setting is kept (RM-358).
+      Open: a write made to `config.clusterParameters` directly is read
+      only at the next start (mongod's op observer reloads it).
+      Verify: none -- no gap test yet for the direct write to
+      `config.clusterParameters`
       Backlog-ID: RM-418
 - [ ] **A `find` under `queryFramework: "sbe"` that is sorted or
       index-served is explained in the classic shape.** mongod 8.2.11 runs

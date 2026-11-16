@@ -34,13 +34,17 @@
 //! into (`document_source_rank_fusion.cpp`,
 //! `document_source_score_fusion.cpp`).
 //!
-//! Where a query uses something this module does not shape (`$jsonSchema`,
-//! a hybrid search over `$search`, an option no one has measured), [`hash`]
-//! answers `None` and no hash is printed: a wrong hash would be worse than
+//! `$jsonSchema` is the tree mongod's JSON Schema parser builds from the
+//! schema ([`json_schema`]).
+//!
+//! Where a query uses something this module does not shape (a hybrid
+//! search over `$search`, an option no one has measured), [`hash`] answers `None` and no hash is printed: a wrong hash would be worse than
 //! none (`tasks/backlog-rust-mongodb.md` names what is left).
 
 use bson::{doc, oid::ObjectId, spec::BinarySubtype, Binary, Bson, DateTime, Document, Timestamp};
 use sha2::{Digest, Sha256};
+
+mod json_schema;
 
 /// `queryShapeHash` of `request`, run against database `db`: uppercase hex
 /// of the SHA-256, or `None` for a command mongod gives no query shape or a
@@ -734,6 +738,7 @@ fn pathless(op: &str, v: &Bson) -> Option<Option<Node>> {
         "$or" => Node::Or(list(v)?),
         "$nor" => Node::Nor(list(v)?),
         "$comment" => return Some(None),
+        "$jsonSchema" => json_schema::parse(v.as_document()?)?,
         "$alwaysTrue" | "$alwaysFalse" => Node::Raw(doc! { op: lit(Bson::Int32(1)) }),
         "$expr" => Node::Raw(doc! { "$expr": expr(v, true)? }),
         "$where" => {
@@ -3767,7 +3772,10 @@ mod tests {
     #[test]
     fn what_it_cannot_shape_has_no_hash() {
         assert_eq!(
-            hash("d", &doc! { "find": "c", "filter": { "$jsonSchema": {} } }),
+            hash(
+                "d",
+                &doc! { "find": "c", "filter": { "$jsonSchema": { "$ref": "#" } } }
+            ),
             None
         );
         // mongod refuses a hybrid search with no input pipeline, and one

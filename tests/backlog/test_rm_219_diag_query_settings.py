@@ -669,13 +669,14 @@ def _unshaped_setting(client: Any) -> tuple:
     return ("ok", n)
 
 
-@pytest.mark.backlog("RM-418")
+@pytest.mark.backlog_fixed("RM-418")
 def test_setting_for_a_query_the_server_does_not_shape(
     rust_mongo: Any,
     mongod_rs: Any,  # noqa: F811
 ) -> None:
-    """A setting for a query whose shape `query_shape.rs` does not compute
-    (a `$jsonSchema` filter) is kept, as on mongod."""
+    """A setting for a `$jsonSchema` query was refused 115, as a query
+    `query_shape.rs` did not shape; since 2026-11-16 (RM-358) it is shaped
+    and the setting is kept, as on mongod."""
     assert _unshaped_setting(rust_mongo) == _unshaped_setting(mongod_rs)
 
 
