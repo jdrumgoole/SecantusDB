@@ -2302,6 +2302,51 @@ pub(crate) fn bitmap_index_scan(index: &str, estimate: crate::scan_estimate::Est
     n
 }
 
+/// A join's `Join Filter` text from the written ONs' clauses placed on it
+/// (RP-919): each `(written join, place in its ON, its ON's clause
+/// count)`. A whole ON prints as written; clauses from several are ANDed
+/// in the order given, which [`joininfo_order`] then sorts. A clause whose
+/// ON's text does not split into as many conjuncts prints nothing.
+pub(crate) fn placed_join_cond(conds: &[String], clauses: &[(usize, usize, usize)]) -> String {
+    if let [(w, _, of)] = clauses {
+        if *of == 1 {
+            return conds.get(*w).cloned().unwrap_or_default();
+        }
+    }
+    if let Some((w, _, of)) = clauses.first() {
+        if clauses.len() == *of && clauses.iter().all(|c| c.0 == *w) {
+            return conds.get(*w).cloned().unwrap_or_default();
+        }
+    }
+    let mut parts: Vec<String> = Vec::new();
+    for &(w, at, of) in clauses {
+        let Some(text) = conds.get(w) else {
+            return String::new();
+        };
+        if of == 1 {
+            parts.push(text.clone());
+            continue;
+        }
+        let Some(inner) = text.strip_prefix('(').and_then(|t| t.strip_suffix(')')) else {
+            return String::new();
+        };
+        let split: Vec<&str> = inner.split(" AND ").collect();
+        if split.len() != of
+            || split
+                .iter()
+                .any(|p| !(p.starts_with('(') && p.ends_with(')')))
+        {
+            return String::new();
+        }
+        parts.push(split[at].to_string());
+    }
+    match parts.len() {
+        0 => String::new(),
+        1 => parts.remove(0),
+        _ => format!("({})", parts.join(" AND ")),
+    }
+}
+
 /// Put each join's ON condition on its join node (post-order, as
 /// `join_conditions` lists them): `Hash Cond` on a hash join, `Join Filter`
 /// on a nested loop. A hash or merge join whose ON also holds conjuncts
@@ -3348,5 +3393,37 @@ mod join_where_tests {
             Some(&("Join Filter".to_string(), "((e.a + s.a) > 3)".to_string()))
         );
         assert_eq!(root.children[0].details.len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod placed_join_cond_tests {
+    use super::placed_join_cond;
+
+    fn conds() -> Vec<String> {
+        vec![
+            "(e.a < e3.a)".into(),
+            "(e3.a > zs.a)".into(),
+            "((e4.a < zs.a) AND (e4.a > e.a))".into(),
+        ]
+    }
+
+    #[test]
+    fn a_whole_on_prints_as_written() {
+        assert_eq!(placed_join_cond(&conds(), &[(0, 0, 1)]), "(e.a < e3.a)");
+        assert_eq!(
+            placed_join_cond(&conds(), &[(2, 0, 2), (2, 1, 2)]),
+            "((e4.a < zs.a) AND (e4.a > e.a))"
+        );
+    }
+
+    #[test]
+    fn a_split_on_prints_each_clause_where_it_lands() {
+        assert_eq!(placed_join_cond(&conds(), &[(2, 0, 2)]), "(e4.a < zs.a)");
+        assert_eq!(
+            placed_join_cond(&conds(), &[(1, 0, 1), (2, 1, 2)]),
+            "((e3.a > zs.a) AND (e4.a > e.a))"
+        );
+        assert_eq!(placed_join_cond(&conds(), &[]), "");
     }
 }

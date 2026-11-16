@@ -46623,7 +46623,7 @@ impl PgHandler {
                 let join_conds: Vec<String> = match &cond_from {
                     Some(from) if from.len() == options.join_conds.len() => from
                         .iter()
-                        .map(|w| w.map(|w| options.join_conds[w].clone()).unwrap_or_default())
+                        .map(|clauses| explain::placed_join_cond(&options.join_conds, clauses))
                         .collect(),
                     _ => options.join_conds.clone(),
                 };

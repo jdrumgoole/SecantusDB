@@ -4943,11 +4943,11 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
     # The bushy chain with a second clause in the last ON, `e4.a > e.a`:
     # PostgreSQL places each clause, not each ON, on the lowest join
     # holding its tables, so `e4.a < zs.a` stays on `e4 join zs` and
-    # `e4.a > e.a` joins `e3.a > zs.a` on the top (RP-919). Here the ON
-    # moves whole, the tree is refused, and the chain runs in its written
-    # order, unpriced. Measured on PostgreSQL 15.19.
+    # `e4.a > e.a` joins `e3.a > zs.a` on the top (RP-919, fixed: the ON
+    # moved whole, the tree was refused, and the chain ran in its written
+    # order, unpriced). Measured on PostgreSQL 15.19.
     "a bushy chain whose last ON splits across two joins": (
-        "RP-919",
+        "RP-919:fixed",
         _ANALYSED_SMALL,
         "explain select e.a, e3.a, zs.a, e4.a from e join e e3 on e.a < e3.a"
         " join zs on e3.a > zs.a join e e4 on e4.a < zs.a and e4.a > e.a limit 5",
@@ -6200,4 +6200,29 @@ def test_a_bushy_chain_runs_each_loop_outer_first(rust_pg: Any) -> None:
         (1, 5, 3, 2),
         (1, 5, 4, 2),
         (1, 5, 4, 3),
+    ]
+
+
+@pytest.mark.backlog_fixed("RP-919")
+def test_a_bushy_chain_whose_on_splits_runs_each_clause_where_it_lands(
+    rust_pg: Any,
+) -> None:
+    """PostgreSQL 15.19 runs `e4.a < zs.a` on the lower `e4 join zs` and
+    `e4.a > e.a` with `e3.a > zs.a` on the top join, so `limit 7 offset 3`
+    returns these rows; the chain ran in its written order, an ON whole
+    on one join, and did not finish."""
+    query = (
+        "select e.a, e3.a, zs.a, e4.a from e join e e3 on e.a < e3.a"
+        " join zs on e3.a > zs.a join e e4 on e4.a < zs.a and e4.a > e.a"
+        " limit 7 offset 3"
+    )
+    rows = _first_rows(fresh_db(_dsn(rust_pg)), query, 7)
+    assert rows == [
+        (1, 5, 4, 3),
+        (1, 6, 3, 2),
+        (1, 6, 4, 2),
+        (1, 6, 5, 2),
+        (1, 6, 4, 3),
+        (1, 6, 5, 3),
+        (1, 6, 5, 4),
     ]

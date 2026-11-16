@@ -1784,25 +1784,19 @@ a regression test.
       working RP-354).
       Verify: tests/backlog/test_rp_explain_costs.py::test_plan[nested loop into a weakly correlated index], tests/backlog/test_rp_explain_costs.py::test_plan[nested loop of few rows into a weakly correlated index], tests/backlog/test_rp_explain_costs.py::test_a_wide_range_over_a_weakly_correlated_index
       Backlog-ID: RP-926
-- [ ] **A chain of inequality joins whose ON splits across the searched
-      tree still runs in its written order.** A chain under a LIMIT (and
-      OFFSET), or sorted by an ORDER BY under one, runs in the tree
-      PostgreSQL's search keeps, bushy ones included
-      (`scan_estimate::nest_loop_chain`), and EXPLAIN prices it. But
-      `reorder_nest_loop_chain` moves each ON whole to the lowest join
-      holding all its tables, and refuses a tree where two ONs land on one
-      join; PostgreSQL places each clause (`distribute_qual_to_rels`). For
-      `... join zs on e3.a > zs.a join e e4 on e4.a < zs.a and e4.a > e.a
-      limit 5` PostgreSQL 15.19 keeps the bushy `(e join e3) x Materialize
-      (e4 join zs)`, `e4.a < zs.a` on the lower join and `Join Filter:
-      ((e4.a > e.a) AND (e3.a > zs.a))` on the top (the ON's later clause
-      first); here the written order, unpriced, and executing it without
-      EXPLAIN did not finish in the probe's timeout. Needs the ONs split
-      into their clauses (each `JoinFilter` placed alone), the top's
-      filters combined, and `join_conds`' text per join rebuilt from the
-      clauses (found while working RP-354).
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a bushy chain whose last ON splits across two joins]
-      Backlog-ID: RP-919
+- [ ] **A chain of inequality joins under a LIMIT runs far past the rows
+      it returns.** `select e.a, e3.a, zs.a, e4.a from e join e e3 on e.a <
+      e3.a join zs on e3.a > zs.a join e e4 on e4.a < zs.a limit 7 offset
+      3` (`e` 1,000 rows, `zs` 10) answers at once on PostgreSQL 15.19,
+      whose bushy `(e join e3) x Materialize (e4 join zs)` stops after ten
+      rows; here it runs in the same tree and takes 100-140 s on a debug
+      build (the two `test_a_bushy_chain_*` tests in
+      `tests/backlog/test_rp_explain_costs.py`), as though a loop's rows
+      were produced whole before the Limit reads them. The cause is not
+      established: count the rows each loop produces before naming one
+      (found while working RP-919).
+      Verify: none -- a performance budget; the two tests named above time it
+      Backlog-ID: RP-1020
 - [ ] **EXPLAIN VERBOSE prints no `Output` lists above a scan.** A plan
       that is one relation's scan prints as VERBOSE does (RP-925); any
       other node prints as without it: PostgreSQL 15.19 prints `explain

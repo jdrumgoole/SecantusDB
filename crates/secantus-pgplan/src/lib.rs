@@ -20207,6 +20207,77 @@ fn mark_stored_column_sizes(
     })
 }
 
+/// Two row expressions over one statement's parameters ANDed into one, as
+/// a join's quals are when clauses written in different ONs land on one
+/// join (`distribute_qual_to_rels`, RP-919). `b`'s field references are
+/// renumbered past `a`'s fields. `None` when either is not a row
+/// expression, or they do not share the statement's parameter count.
+pub fn and_row_exprs(a: &ColumnExpr, b: &ColumnExpr) -> Option<ColumnExpr> {
+    let (
+        ColumnExpr::Row {
+            expr: ea,
+            fields: fa,
+            params: pa,
+            param_types,
+            widths: wa,
+            ..
+        },
+        ColumnExpr::Row {
+            expr: eb,
+            fields: fb,
+            params: pb,
+            widths: wb,
+            ..
+        },
+    ) = (a, b)
+    else {
+        return None;
+    };
+    if pa.len() != pb.len() {
+        return None;
+    }
+    let n = pa.len();
+    let mut eb = eb.as_ref().clone();
+    let shift = fa.len();
+    walk_expr(&mut eb, &mut |node| {
+        if let Some(N::ParamRef(p)) = node.node.as_mut() {
+            if p.number as usize > n {
+                p.number += i32::try_from(shift).unwrap_or(0);
+            }
+        }
+        Ok(())
+    })
+    .ok()?;
+    let params = pa
+        .iter()
+        .zip(pb)
+        .map(|(x, y)| {
+            if matches!(x, Bson::Null) {
+                y.clone()
+            } else {
+                x.clone()
+            }
+        })
+        .collect();
+    let expr = pg_query::protobuf::Node {
+        node: Some(N::BoolExpr(Box::new(pg_query::protobuf::BoolExpr {
+            xpr: None,
+            boolop: pg_query::protobuf::BoolExprType::AndExpr as i32,
+            args: vec![ea.as_ref().clone(), eb],
+            location: -1,
+        }))),
+    };
+    Some(ColumnExpr::Row {
+        expr: Box::new(expr),
+        fields: fa.iter().chain(fb).cloned().collect(),
+        params,
+        param_types: param_types.clone(),
+        result_type: "bool".to_string(),
+        widths: wa.iter().chain(wb).cloned().collect(),
+        scratch: RowScratch::default(),
+    })
+}
+
 /// The row fields an expression reads, its `$n` renumbered to match, when
 /// every reference to the row is a parameter: each evaluation copies its
 /// fields, and over a wide join that copy of columns the expression never

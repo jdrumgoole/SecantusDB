@@ -328,6 +328,10 @@ fn output_width(
     Some(width)
 }
 
+/// A clause placed on a reordered chain's join: `(written join, place in
+/// its ON, its ON's clause count)` (RP-919).
+pub(crate) type PlacedClause = (usize, usize, usize);
+
 impl PgHandler {
     /// The children's and the node's estimates of a `UNION ALL` of two
     /// plain selects, each one user table's sequential scan of stored
@@ -924,15 +928,16 @@ impl PgHandler {
     /// `sel` with its chain of inner joins in the order PostgreSQL's
     /// search keeps ([`Self::nest_loop_chain_order`]), so its rows come
     /// out of that plan's loops and EXPLAIN prints its tree (RP-919). Each
-    /// ON moves, whole, to the lowest join holding the tables it reads; a
-    /// WHERE stays the query's. `None` where the order is the written one,
-    /// or an ON does not land alone on one join of the new tree. With it,
-    /// each new join's ON as the written join it came from, bottom first,
-    /// both counted from the bottom (`join_conds`' post-order).
+    /// ON's clauses move, each alone, to the lowest join holding the tables
+    /// it reads (`distribute_qual_to_rels`), those landing on one join
+    /// ANDed; a WHERE stays the query's. `None` where the order is the
+    /// written one. With it, each new join's clauses, bottom first, as
+    /// `(written join, place in its ON, its ON's clause count)`, both joins
+    /// counted from the bottom (`join_conds`' post-order).
     pub(crate) fn reorder_nest_loop_chain(
         &self,
         sel: &secantus_pgplan::Select,
-    ) -> Option<(secantus_pgplan::Select, Vec<Option<usize>>)> {
+    ) -> Option<(secantus_pgplan::Select, Vec<Vec<PlacedClause>>)> {
         use secantus_pgplan::joins::{JoinKind, JoinNode};
         use secantus_pgplan::Statement;
         let order = self.nest_loop_chain_order(sel)?;
@@ -940,38 +945,55 @@ impl PgHandler {
         let Statement::JoinRows(j) = sub.plan.as_ref() else {
             return None;
         };
-        // The written spine: its tables bottom first, and each join's ON
-        // with the tables it reads.
-        type On = (
-            usize,
-            Option<secantus_pgplan::ColumnExpr>,
-            Vec<String>,
-            Vec<secantus_pgplan::joins::JoinFilter>,
-        );
+        // The written spine: its tables bottom first, and each ON's
+        // clauses, each with the tables it reads (`distribute_qual_to_rels`
+        // places each alone).
+        struct On {
+            /// The written join, counted from the bottom.
+            written: usize,
+            /// Its place among that ON's clauses.
+            at: usize,
+            /// That ON's clause count, and the ON itself.
+            of: usize,
+            whole: Option<secantus_pgplan::ColumnExpr>,
+            filter: secantus_pgplan::joins::JoinFilter,
+        }
         let mut leaves: Vec<JoinNode> = Vec::new();
         let mut ons: Vec<On> = Vec::new();
         let mut node = &j.tree;
-        let mut at = 0;
+        let mut depth = 0;
         while let JoinNode::Join {
             kind: JoinKind::Inner,
             left,
             right,
             on,
-            on_aliases,
             on_filters,
             ..
         } = node
         {
             leaves.push(right.as_ref().clone());
             if on.is_some() {
-                ons.push((at, on.clone(), on_aliases.clone(), on_filters.clone()));
+                if on_filters.is_empty() {
+                    return None;
+                }
+                for (at, f) in on_filters.iter().enumerate() {
+                    ons.push(On {
+                        written: depth,
+                        at,
+                        of: on_filters.len(),
+                        whole: on.clone(),
+                        filter: f.clone(),
+                    });
+                }
             }
-            at += 1;
+            depth += 1;
             node = left;
         }
         for o in &mut ons {
-            o.0 = at - 1 - o.0;
+            o.written = depth - 1 - o.written;
         }
+        // Bottom first, each ON's clauses in their written order.
+        ons.sort_by_key(|o| (o.written, o.at));
         leaves.push(node.clone());
         leaves.reverse();
         let alias = |n: &JoinNode| -> Option<String> {
@@ -991,7 +1013,7 @@ impl PgHandler {
                 JoinNode::Lateral { .. } => Vec::new(),
             }
         };
-        // The tree bottom up, each ON on the lowest join holding the
+        // The tree bottom up, each clause on the lowest join holding the
         // tables it reads; `from` in post-order, as `join_conds` counts.
         #[allow(clippy::too_many_arguments)]
         fn build(
@@ -999,7 +1021,7 @@ impl PgHandler {
             leaves: &[JoinNode],
             ons: &[On],
             placed: &mut [bool],
-            from: &mut Vec<Option<usize>>,
+            from: &mut Vec<Vec<PlacedClause>>,
             alias: &dyn Fn(&JoinNode) -> Option<String>,
             keys: &dyn Fn(&JoinNode) -> Vec<String>,
         ) -> Option<(JoinNode, Vec<String>)> {
@@ -1015,20 +1037,41 @@ impl PgHandler {
             let (right, more) = build(r, leaves, ons, placed, from, alias, keys)?;
             held.extend(more);
             let here: Vec<usize> = (0..ons.len())
-                .filter(|&i| !placed[i] && ons[i].2.iter().all(|a| held.contains(a)))
+                .filter(|&i| !placed[i] && ons[i].filter.aliases.iter().all(|a| held.contains(a)))
                 .collect();
-            if here.len() > 1 {
-                return None;
+            for &i in &here {
+                placed[i] = true;
             }
-            let (written, on, on_aliases, on_filters) = match here.first() {
-                Some(&i) => {
-                    placed[i] = true;
-                    let (w, on, a, f) = ons[i].clone();
-                    (Some(w), on, a, f)
+            let mut on = None;
+            let mut on_aliases: Vec<String> = Vec::new();
+            let mut on_filters = Vec::new();
+            // One written ON whole keeps its own expression.
+            let whole = here.first().is_some_and(|&f| {
+                let o = &ons[f];
+                here.len() == o.of && here.iter().all(|&i| ons[i].written == o.written)
+            });
+            for &i in &here {
+                let o = &ons[i];
+                on = if whole {
+                    o.whole.clone()
+                } else {
+                    match on {
+                        None => Some(o.filter.expr.clone()),
+                        Some(e) => Some(secantus_pgplan::and_row_exprs(&e, &o.filter.expr)?),
+                    }
+                };
+                for a in &o.filter.aliases {
+                    if !on_aliases.contains(a) {
+                        on_aliases.push(a.clone());
+                    }
                 }
-                None => (None, None, Vec::new(), Vec::new()),
-            };
-            from.push(written);
+                on_filters.push(o.filter.clone());
+            }
+            from.push(
+                here.iter()
+                    .map(|&i| (ons[i].written, ons[i].at, ons[i].of))
+                    .collect(),
+            );
             let (left_keys, right_keys) = (keys(&left), keys(&right));
             let node = JoinNode::Join {
                 kind: JoinKind::Inner,
@@ -1049,7 +1092,7 @@ impl PgHandler {
             Some((node, held))
         }
         let mut placed = vec![false; ons.len()];
-        let mut from: Vec<Option<usize>> = Vec::new();
+        let mut from = Vec::new();
         let (tree, held) = build(&order, &leaves, &ons, &mut placed, &mut from, &alias, &keys)?;
         if held.len() != leaves.len() {
             return None;
