@@ -1089,6 +1089,9 @@ fn find_body(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         for (k, v) in spec {
             match secantus_core::projection::meta_spec(v) {
                 Some(m @ ("recordId" | "indexKey")) => metas.push((k.clone(), m)),
+                // The sort key as an array (mongod 8.2.11, RM-703); a read
+                // with no sort is refused before here.
+                Some("sortKey") if sort.is_some() => metas.push((k.clone(), "sortKey")),
                 Some(_) => {}
                 None => {
                     let mut v = v.clone();
@@ -1150,6 +1153,15 @@ fn find_body(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         } else {
             None
         };
+        let sort_keys: Option<Vec<Bson>> = match sort {
+            Some(s) if metas.iter().any(|(_, m)| *m == "sortKey") => Some(
+                originals
+                    .iter()
+                    .map(|d| sort_key_array(d, s, &ns))
+                    .collect::<Result<_, _>>()?,
+            ),
+            _ => None,
+        };
         let mut projected = match &nested_spec {
             Some(rewritten) => {
                 crate::agg_meta::attach(
@@ -1176,6 +1188,7 @@ fn find_body(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
             for (field, meta) in &metas {
                 let value = match *meta {
                     "recordId" => record_ids.as_ref().and_then(|r| r[i]).map(Bson::Int64),
+                    "sortKey" => sort_keys.as_ref().map(|k| k[i].clone()),
                     _ => index_keys.as_ref().map(|k| Bson::Document(k[i].clone())),
                 };
                 if let Some(v) = value {
@@ -1510,12 +1523,14 @@ fn shape_streamed(
             // A top-level `$meta` goes after the projected fields, where
             // mongod puts it; one inside an expression reads a field the
             // documents are given for the projection (`agg_meta`).
+            let cursor_sort = cursor.command.get_document("sort").ok();
             let mut metas: Vec<(String, &str)> = Vec::new();
             let mut rewritten = Document::new();
             let mut nested = false;
             for (k, v) in spec {
                 match secantus_core::projection::meta_spec(v) {
                     Some(m @ ("recordId" | "indexKey")) => metas.push((k.clone(), m)),
+                    Some("sortKey") if cursor_sort.is_some() => metas.push((k.clone(), "sortKey")),
                     Some(_) => {}
                     None => {
                         let mut v = v.clone();
@@ -1535,6 +1550,20 @@ fn shape_streamed(
                 }
                 rewritten.insert(k.clone(), v.clone());
             }
+            let sort_keys: Option<Vec<Bson>> = match cursor_sort {
+                Some(s) if metas.iter().any(|(_, m)| *m == "sortKey") => Some(
+                    docs.iter()
+                        .map(|b| {
+                            let d =
+                                secantus_core::bsondoc::from_bytes(b.as_slice()).map_err(|e| {
+                                    CommandError::new(1, "InternalError", e.to_string())
+                                })?;
+                            sort_key_array(&d, s, &cursor.ns)
+                        })
+                        .collect::<Result<_, _>>()?,
+                ),
+                _ => None,
+            };
             let mut projected = if nested {
                 let mut originals: Vec<Document> = docs
                     .iter()
@@ -1567,6 +1596,7 @@ fn shape_streamed(
                 for (field, meta) in &metas {
                     let value = match *meta {
                         "recordId" => Some(Bson::Int64(rids[i])),
+                        "sortKey" => sort_keys.as_ref().map(|k| k[i].clone()),
                         _ => keys[i].clone().map(Bson::Document),
                     };
                     if let Some(v) = value {
