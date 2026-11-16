@@ -2772,15 +2772,6 @@ Measured on PostgreSQL 15.19 (the shared reference on port 5415): every
 statement is VALUES-only and runs there as written. The gap tests are in
 `tests/backlog/test_rp_found_rp732.py`.
 
-- [ ] **A cast over a CASE of untyped literals reports a branch's input
-      error at the literal.** `select (case when k = 1 then 'x' else '5'
-      end)::int from (values (1)) s(k)` is 22P02 `invalid input syntax for
-      type integer: "x"` with no position on PostgreSQL 15.19, which
-      resolves the CASE to `text` and casts its result as the row runs;
-      here the error carries the position of `'x'`, the cast having been
-      applied to each branch's literal.
-      Verify: tests/backlog/test_rp_found_rp732.py::test_a_cast_over_a_case_of_literals_reports_no_position
-      Backlog-ID: RP-746
 
 ## Found while working RP-744 (2026-11-12)
 
