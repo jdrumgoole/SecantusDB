@@ -278,12 +278,11 @@ def test_cursor_tuple_fraction_decides_the_postponement(dsn: str) -> None:
     ]
 
 
-@pytest.mark.backlog("RP-746")
+@pytest.mark.backlog_fixed("RP-746")
 def test_a_cast_over_a_case_of_literals_reports_no_position(dsn: str) -> None:
     """PostgreSQL 15.19 resolves a CASE of untyped literals to `text` and
     casts its result as the row runs, so the input error has no position.
-    Here the cast is applied to each branch's literal and the error points
-    at it."""
+    The error used to point at the branch's literal."""
     with psycopg.connect(dsn, autocommit=True) as c, pytest.raises(psycopg.Error) as info:
         c.execute("select (case when k = 1 then 'x' else '5' end)::int from (values (1)) s(k)")
     e = info.value

@@ -171,7 +171,7 @@ fn element_literal(toks: &[Tok], value: &str) -> Option<usize> {
 
 /// The token of the literal an input function read `value` from, or `None`
 /// when no literal holds it or it reached the function as a text value.
-fn input_literal(toks: &[Tok], value: &str) -> Option<usize> {
+fn input_literal(sql: &str, toks: &[Tok], value: &str) -> Option<usize> {
     let lit = format!("'{}'", value.replace('\'', "''"));
     let i = toks
         .iter()
@@ -191,7 +191,49 @@ fn input_literal(toks: &[Tok], value: &str) -> Option<usize> {
     {
         return None;
     }
+    if resolved_to_text(sql, toks[i].start) {
+        return None;
+    }
     Some(toks[i].start)
+}
+
+/// Whether the literal at byte `start` is an arm of a CASE, COALESCE,
+/// GREATEST or LEAST whose every arm is an untyped literal or NULL.
+/// `select_common_type` resolves such arms to `text`, and the cast over the
+/// expression reads that text at execution, where there is no position
+/// (`(case when k = 1 then 'x' else '5' end)::int` on 15.19, RP-746). One
+/// typed arm makes the literal coerced to it while parsing, at the literal.
+fn resolved_to_text(sql: &str, start: usize) -> bool {
+    use pg_query::protobuf::a_const::Val;
+    use pg_query::NodeRef;
+    let Ok(tree) = pg_query::parse(sql) else {
+        return false;
+    };
+    let untyped = |n: &pg_query::protobuf::Node| {
+        matches!(n.node.as_ref(), Some(N::AConst(c))
+            if c.isnull || matches!(c.val, Some(Val::Sval(_))))
+    };
+    let at = |n: &pg_query::protobuf::Node| {
+        matches!(n.node.as_ref(), Some(N::AConst(c))
+            if usize::try_from(c.location).is_ok_and(|l| l == start))
+    };
+    tree.protobuf.nodes().iter().any(|(n, _, _, _)| {
+        let arms: Vec<&pg_query::protobuf::Node> = match n {
+            NodeRef::CaseExpr(c) => c
+                .args
+                .iter()
+                .filter_map(|w| match w.node.as_ref() {
+                    Some(N::CaseWhen(w)) => w.result.as_deref(),
+                    _ => None,
+                })
+                .chain(c.defresult.as_deref())
+                .collect(),
+            NodeRef::CoalesceExpr(c) => c.args.iter().collect(),
+            NodeRef::MinMaxExpr(m) => m.args.iter().collect(),
+            _ => return false,
+        };
+        arms.iter().any(|a| at(a)) && arms.iter().all(|a| untyped(a))
+    })
 }
 
 /// `ALTER TABLE | INDEX | VIEW | SEQUENCE | MATERIALIZED VIEW | FOREIGN
@@ -817,14 +859,14 @@ pub fn error_position(sql: &str, sqlstate: &str, message: &str) -> Option<usize>
             // `invalid input syntax for type integer: "abc"`: the literal.
             let (_, value) = m.rsplit_once(": \"")?;
             let value = value.strip_suffix('"')?;
-            input_literal(&toks, value).and_then(pos)
+            input_literal(sql, &toks, value).and_then(pos)
         }
         // An input function's `value "70000" is out of range for type
         // smallint`: at the literal, as its 22P02 is.
         "22003" => {
             let rest = m.strip_prefix("value \"")?;
             let (value, _) = rest.rsplit_once("\" is out of range for type ")?;
-            input_literal(&toks, value).and_then(pos)
+            input_literal(sql, &toks, value).and_then(pos)
         }
         // `regoperator`'s own refusals of its input: at the literal.
         "42P02" | "54023" if matches!(m, "missing argument" | "too many arguments") => {
@@ -889,6 +931,30 @@ fn regtype_literal_names(tok: &str, full: &str) -> bool {
 #[cfg(test)]
 mod escape_literal_tests {
     use super::*;
+
+    /// RP-746: arms that are all untyped literals resolve to text, read by
+    /// the cast at execution with no position; a typed arm coerces the
+    /// literal while parsing, at the literal (15.19).
+    #[test]
+    fn a_literal_arm_resolved_to_text_has_no_position() {
+        let msg = "invalid input syntax for type integer: \"x\"";
+        for sql in [
+            "select (case when k = 1 then 'x' else '5' end)::int from (values (1)) s(k)",
+            "select case when random() < 2 then 'x' end::int",
+            "select coalesce(null, 'x')::int",
+            "select greatest('x', '5')::int",
+        ] {
+            assert_eq!(error_position(sql, "22P02", msg), None, "{sql}");
+        }
+        assert_eq!(
+            error_position(
+                "select case when random() > 2 then 1 else 'x' end",
+                "22P02",
+                msg
+            ),
+            Some(43)
+        );
+    }
 
     #[test]
     fn an_escaped_literal_input_error_is_placed_at_its_e() {
