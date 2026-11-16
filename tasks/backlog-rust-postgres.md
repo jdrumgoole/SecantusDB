@@ -2072,6 +2072,19 @@ a regression test.
       `secantus-pg/src/lib.rs` just before `attach_scan_quals`; an
       EXPR_SUBLINK's InitPlan can be recognised the same way. Note the raw
       parse tree leaves an IN's `oper_name` empty.)
+      (2026-11-16, sized while bundled with RP-411: four pieces. (a) The
+      scan's MQL filter already holds the constant the planner substituted
+      for the sublink, so `where_selectivity` prices `b = 'v3'` from the
+      MCV list; the estimator needs the conjunct as a comparison to an
+      unknown value instead (`var_eq_non_const`: (1 - nullfrac) /
+      ndistinct; `DEFAULT_INEQ_SEL` for `<` / `>`). (b) The Filter text
+      comes from `ruleutils::explain_conjuncts`, whose `sublink` printer
+      writes `( SELECT ...)`: it needs a numbering context printing `$n`
+      per InitPlan in order. (c) `PlanNode` needs labelled InitPlan
+      children, rendered by `render_text` after the details and before
+      the children, and by `structured` in `Plans` first. (d) The scan's
+      startup and total each gain the InitPlan's total (0.01 for a
+      FROM-less one, `scan_estimate::result_estimate`).)
       Verify: tests/backlog/test_rp_explain_costs.py::test_plan[an uncorrelated subquery is an initplan], tests/backlog/test_rp_explain_costs.py::test_plan[a join's on subquery is an initplan on its scan]
       Backlog-ID: RP-440
 
