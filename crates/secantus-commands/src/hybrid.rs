@@ -481,8 +481,10 @@ fn fusion(name: &str, spec: &Bson, coll: &str) -> Result<Vec<Bson>, CommandError
         }
     }
     let method = match combination.get("method") {
-        None => "average".to_string(),
-        Some(Bson::String(m)) if m == "average" || m == "expression" => m.clone(),
+        // mongod 8.2.11's IDL enum is `avg` / `expression`; "average" is only
+        // the method's name in `scoreDetails` (RM-553).
+        None => "avg".to_string(),
+        Some(Bson::String(m)) if m == "avg" || m == "expression" => m.clone(),
         Some(other) => return Err(enumeration(other, &format!("{name}.combination.method"))),
     };
     let expression = combination.get("expression");
