@@ -1784,22 +1784,22 @@ a regression test.
       working RP-354).
       Verify: tests/backlog/test_rp_explain_costs.py::test_plan[nested loop into a weakly correlated index], tests/backlog/test_rp_explain_costs.py::test_plan[nested loop of few rows into a weakly correlated index], tests/backlog/test_rp_explain_costs.py::test_a_wide_range_over_a_weakly_correlated_index
       Backlog-ID: RP-926
-- [ ] **A chain of inequality joins under a LIMIT runs in its written
-      order.** PostgreSQL's `standard_join_search` picks the order of an
-      inner join of tables linked only by `<`, `<=`, `>`, `>=` or `<>`;
-      without a LIMIT the chain now runs, and EXPLAIN prints, the order
-      the search keeps (`scan_estimate::reorder_nest_loop_chain`, applied
-      in `execute_inner_keys` and before `plan_tree`). Under a LIMIT the
-      estimate declines (`nest_loop_chain` refuses `sel.limit`, since a
-      LIMIT's search weighs startup costs, `join_order`'s
-      `limit_choice`), so the tables join as written: PostgreSQL 15.19
-      gives `e.a` 1, 1, 2, 1, 2 for `select * from e join e e3 on e.a <
-      e3.a join zs on e3.a > zs.a limit 5` (`e` 1,000 analysed rows,
-      `zs` ten), here 1, 1, 1, 1, 1. Also still written order: an ORDER
-      BY over the chain (the same refusal), a join two ONs land on in the
-      new tree, and a bushy tree (four or more tables). Measured on a
-      private 15.19 cluster (found while working RP-354).
-      Verify: tests/backlog/test_rp_explain_costs.py::test_a_chain_of_inequality_joins_under_a_limit
+- [ ] **A chain of inequality joins under a LIMIT prints unpriced, and
+      some chains still run in their written order.** Under a LIMIT the
+      chain now runs in the order PostgreSQL's search keeps
+      (`scan_estimate::nest_loop_chain` keeps each relation's paths with
+      `consider_startup`, and the top's is `get_cheapest_fractional_path`'s),
+      but EXPLAIN prices only a chain whose top node is the Nested Loop:
+      PostgreSQL 15.19 prints `explain select e.a, e3.a, zs.a from e join e
+      e3 on e.a < e3.a join zs on e3.a > zs.a limit 5` (`e` 1,000 analysed
+      rows, `zs` ten) as `Limit (cost=0.00..0.23 rows=5 width=12)` over
+      priced Nested Loops, each inner under a Materialize; here the same
+      tree with zero costs and no Materialize nodes. Still written order:
+      an ORDER BY over the chain (`nest_loop_chain` refuses `sel.order`), an
+      OFFSET, a join two ONs land on in the new tree, and a bushy tree (four
+      or more tables). Measured on a private 15.19 cluster (found while
+      working RP-354).
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a chain of inequality joins under a limit]
       Backlog-ID: RP-919
 - [ ] **EXPLAIN VERBOSE prints no `Output` lists above a scan.** A plan
       that is one relation's scan prints as VERBOSE does (RP-925); any

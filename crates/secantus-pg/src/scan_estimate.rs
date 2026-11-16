@@ -1063,7 +1063,7 @@ impl PgHandler {
             || sel.join.is_some()
             || !sel.windows.is_empty()
             || !sel.order.is_empty()
-            || sel.limit.is_some()
+            || sel.limit.is_some_and(|l| l < 0)
             || sel.offset != 0
             || !matches!(sel.distinct, secantus_pgplan::Distinct::None)
             || sel.with_ties
@@ -1386,11 +1386,39 @@ impl PgHandler {
             (qual, sel_factor)
         };
         let linked = |a: u32, b: u32| clauses.iter().any(|c| c.set & a != 0 && c.set & b != 0);
-        // Each relation's estimate and, for a join, its kept path and the
-        // pair it was built from.
-        type Kept = (secantus_pgplan::joincost::NestLoopPlan, (u32, u32));
-        let mut rels: std::collections::HashMap<u32, (Estimate, Option<Kept>)> =
-            (0..n).map(|i| (1u32 << i, (scans[i], None))).collect();
+        // Each relation: its estimate (its cheapest-total path's costs),
+        // its paths `(startup, total)` in `add_path`'s order, and for a
+        // join each path's nested loop and the pair it was built from.
+        // Under a LIMIT a relation keeps a path cheaper to start beside a
+        // cheaper one in total (`consider_startup`, RP-919).
+        use secantus_pgplan::joincost::{NestLoopInput, NestLoopKept};
+        struct Rel {
+            est: Estimate,
+            paths: Vec<(f64, f64)>,
+            cheapest: usize,
+            kept: Vec<(NestLoopKept, (u32, u32))>,
+        }
+        let startup_counts = sel.limit.is_some();
+        let input = |r: &Rel| NestLoopInput {
+            paths: r.paths.clone(),
+            cheapest: r.cheapest,
+            rows: r.est.2,
+            width: r.est.3,
+        };
+        let mut rels: std::collections::HashMap<u32, Rel> = (0..n)
+            .map(|i| {
+                let e = scans[i];
+                (
+                    1u32 << i,
+                    Rel {
+                        est: e,
+                        paths: vec![(e.0, e.1)],
+                        cheapest: 0,
+                        kept: Vec::new(),
+                    },
+                )
+            })
+            .collect();
         let mut levels: Vec<Vec<u32>> = vec![Vec::new(), (0..n).map(|i| 1u32 << i).collect()];
         for level in 2..=n {
             // `make_join_rel`'s calls, in `join_search_one_level`'s order.
@@ -1430,9 +1458,9 @@ impl PgHandler {
                     .copied()
                     .filter(|&(a, b)| a | b == set)
                     .collect();
-                let pairs: Vec<secantus_pgplan::joincost::NestLoopPair> = built
+                let pairs: Vec<(NestLoopInput, NestLoopInput, f64)> = built
                     .iter()
-                    .map(|&(a, b)| (rels[&a].0, rels[&b].0, restrict(a, b).0))
+                    .map(|&(a, b)| (input(&rels[&a]), input(&rels[&b]), restrict(a, b).0))
                     .collect();
                 let pair_params: Vec<[Option<secantus_pgplan::joincost::ParamInner>; 2]> = built
                     .iter()
@@ -1440,25 +1468,57 @@ impl PgHandler {
                     .collect();
                 let (a, b) = built[0];
                 let rows =
-                    costsize::clamp_row_est(rels[&a].0 .2 * rels[&b].0 .2 * restrict(a, b).1);
-                let (pick, plan) =
-                    secantus_pgplan::joincost::cheapest_nest_loop_of_param(&pairs, &pair_params)?;
-                let est = (plan.startup, plan.total, rows, width(set)?);
-                rels.insert(set, (est, Some((plan, built[pick]))));
+                    costsize::clamp_row_est(rels[&a].est.2 * rels[&b].est.2 * restrict(a, b).1);
+                let kept = secantus_pgplan::joincost::nest_loop_pathlist(
+                    &pairs,
+                    &pair_params,
+                    startup_counts,
+                )?;
+                let paths: Vec<(f64, f64)> = kept
+                    .iter()
+                    .map(|k| (k.plan.startup, k.plan.total))
+                    .collect();
+                let cheapest = secantus_pgplan::joincost::cheapest_total_of(&paths)?;
+                let (s0, t0) = paths[cheapest];
+                rels.insert(
+                    set,
+                    Rel {
+                        est: (s0, t0, rows, width(set)?),
+                        paths,
+                        cheapest,
+                        kept: kept.into_iter().map(|k| (k, built[k.pair])).collect(),
+                    },
+                );
             }
             levels.push(made);
         }
+        // The top's path: its cheapest in total or, under a LIMIT, the one
+        // the LIMIT reads least of (`get_cheapest_fractional_path`).
+        let top = &rels[&full];
+        let mut at = match sel.limit {
+            Some(count) => secantus_pgplan::joincost::limit_choice_of(
+                &top.paths,
+                top.est.2,
+                count.max(0) as f64,
+                0.0,
+            )?,
+            None => top.cheapest,
+        };
         // Down the kept paths from the top: each must join a relation
         // below and one table, which the tree puts above it.
         let mut out = Vec::new();
         let mut order = Vec::new();
         let mut set = full;
         while set.count_ones() > 1 {
-            let (est, kept) = rels.get(&set)?;
-            let (mut plan, (p, q)) = (*kept)?;
+            let rel = rels.get(&set)?;
+            let (kept, (p, q)) = *rel.kept.get(at)?;
+            let mut plan = kept.plan;
+            let lower_is_outer;
             let (lower, leaf) = if q.count_ones() == 1 {
+                lower_is_outer = !plan.b_outer;
                 (p, q)
             } else if p.count_ones() == 1 {
+                lower_is_outer = plan.b_outer;
                 plan.b_outer = !plan.b_outer;
                 (q, p)
             } else {
@@ -1466,7 +1526,16 @@ impl PgHandler {
             };
             let i = leaf.trailing_zeros() as usize;
             order.push(i);
-            let (mut a, mut b) = (rels[&lower].0, scans[i]);
+            // The lower relation's path: the one the loop reads as its
+            // outer, or its cheapest as the inner.
+            let low = &rels[&lower];
+            let next = if lower_is_outer {
+                kept.outer_path
+            } else {
+                low.cheapest
+            };
+            let (ls, lt) = *low.paths.get(next)?;
+            let (mut a, mut b) = ((ls, lt, low.est.2, low.est.3), scans[i]);
             // The parameterized inner: its scan's estimate, read through
             // its index, under its Memoize where that is kept.
             let mut scan = None;
@@ -1483,8 +1552,15 @@ impl PgHandler {
                 s.memoize = plan.memoize;
                 scan = Some(s);
             }
-            out.push((plan, a, b, *est, scan));
+            out.push((
+                plan,
+                a,
+                b,
+                (plan.startup, plan.total, rel.est.2, rel.est.3),
+                scan,
+            ));
             set = lower;
+            at = next;
         }
         order.push(set.trailing_zeros() as usize);
         out.reverse();

@@ -1052,18 +1052,131 @@ fn nest_loop_paths_over(
     params: &[[Option<ParamInner>; 2]],
     qual_startup: f64,
 ) -> (usize, NestLoopPlan) {
+    let inputs: Vec<(NestLoopInput, NestLoopInput, f64)> = pairs
+        .iter()
+        .map(|&(a, b, qual)| (NestLoopInput::scan(a), NestLoopInput::scan(b), qual))
+        .collect();
+    let paths = nest_loop_pathlist_with(&inputs, unique, orders, params, qual_startup, false);
+    let best = paths[0];
+    (best.pair, best.plan)
+}
+
+/// One input relation of a [`nest_loop_pathlist`] pair: its paths'
+/// `(startup, total)` in `add_path`'s order, the cheapest-total one's
+/// index (`set_cheapest`), its rows and its width.
+#[derive(Debug, Clone)]
+pub struct NestLoopInput {
+    pub paths: Vec<(f64, f64)>,
+    pub cheapest: usize,
+    pub rows: f64,
+    pub width: i64,
+}
+
+impl NestLoopInput {
+    /// A relation of one path, `(startup, total, rows, width)`.
+    pub fn scan(e: (f64, f64, f64, i64)) -> NestLoopInput {
+        NestLoopInput {
+            paths: vec![(e.0, e.1)],
+            cheapest: 0,
+            rows: e.2,
+            width: e.3,
+        }
+    }
+}
+
+/// A nested loop a join relation keeps (RP-919): the pair it was built
+/// from, the outer relation's path it reads (an index into that input's
+/// `paths`), and the plan.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct NestLoopKept {
+    pub pair: usize,
+    pub outer_path: usize,
+    pub plan: NestLoopPlan,
+}
+
+/// The paths one join relation keeps from nested loops over `pairs`, in
+/// `add_path`'s order: `match_unsorted_outer` weighs every path of the
+/// outer relation (`outerrel->pathlist`) over the inner's cheapest-total
+/// path, its parameterized scan, a Memoize of that and a Material of the
+/// cheapest. With `startup_counts` (`consider_startup`, a query whose
+/// LIMIT makes `tuple_fraction` positive) a path cheaper to start stays
+/// beside a cheaper one in total, so a relation keeps several (RP-919).
+pub fn nest_loop_pathlist(
+    pairs: &[(NestLoopInput, NestLoopInput, f64)],
+    params: &[[Option<ParamInner>; 2]],
+    startup_counts: bool,
+) -> Option<Vec<NestLoopKept>> {
+    if pairs.is_empty() || params.len() != pairs.len() {
+        return None;
+    }
+    Some(nest_loop_pathlist_with(
+        pairs,
+        [None, None],
+        &[false, true],
+        params,
+        0.0,
+        startup_counts,
+    ))
+}
+
+/// `set_cheapest` over `paths` (each `(startup, total)`): the index of
+/// the cheapest in total; of two that cost the same, the earlier.
+pub fn cheapest_total_of(paths: &[(f64, f64)]) -> Option<usize> {
+    let cost = |p: &(f64, f64)| InPath::scan(p.0, p.1, 0.0, None);
+    let mut best: Option<usize> = None;
+    for (i, p) in paths.iter().enumerate() {
+        match best {
+            Some(b)
+                if compare_path_costs(&cost(&paths[b]), &cost(p), false)
+                    != std::cmp::Ordering::Greater => {}
+            _ => best = Some(i),
+        }
+    }
+    best
+}
+
+/// The path a LIMIT of `count` rows (after `offset`) reads least of
+/// (`get_cheapest_fractional_path` over the Limit's paths,
+/// `create_limit_path`'s costs): an index into `paths`, each `(startup,
+/// total)` of a relation of `rows` rows.
+pub fn limit_choice_of(paths: &[(f64, f64)], rows: f64, count: f64, offset: f64) -> Option<usize> {
+    let choices: Vec<JoinChoice> = paths
+        .iter()
+        .enumerate()
+        .map(|(i, &(startup, total))| JoinChoice {
+            combo: i,
+            method: JoinMethod::Other,
+            startup,
+            total,
+            class: None,
+            a_path: DEFAULT_INPUT,
+            b_path: DEFAULT_INPUT,
+            rows,
+            rescan: (startup, total),
+            req_outer: 0,
+        })
+        .collect();
+    limit_choice(&choices, rows, count, offset)
+}
+
+fn nest_loop_pathlist_with(
+    pairs: &[(NestLoopInput, NestLoopInput, f64)],
+    unique: [Option<(f64, f64)>; 2],
+    orders: &[bool],
+    params: &[[Option<ParamInner>; 2]],
+    qual_startup: f64,
+    startup_counts: bool,
+) -> Vec<NestLoopKept> {
     let mut paths: Vec<JoinPath> = Vec::new();
-    // Each pair's Material of its inner, and Memoize of its parameterized
-    // inner, by outer side.
-    let mut materials = vec![[(0.0, 0.0); 2]; pairs.len()];
-    let mut memos = vec![[(0.0, 0.0); 2]; pairs.len()];
-    for (pair, &(a, b, qual)) in pairs.iter().enumerate() {
+    // Every path weighed, by its `combo`.
+    let mut weighed: Vec<NestLoopKept> = Vec::new();
+    for (pair, (a, b, qual)) in pairs.iter().enumerate() {
+        let qual = *qual;
         for &b_outer in orders {
             let (o, i) = if b_outer { (b, a) } else { (a, b) };
-            let outer = InPath::scan(o.0, o.1, o.2, None);
-            let inner = InPath::scan(i.0, i.1, i.2, None);
-            let mat = material(&inner, i.3);
-            materials[pair][usize::from(b_outer)] = (mat.startup, mat.total);
+            let (is, it) = i.paths[i.cheapest];
+            let inner = InPath::scan(is, it, i.rows, None);
+            let mat = material(&inner, i.width);
             let param_inner = params[pair][usize::from(b_outer)].map(|p| {
                 let mut path = InPath::scan(p.startup, p.total, p.rows, None);
                 path.indexed = true;
@@ -1073,65 +1186,63 @@ fn nest_loop_paths_over(
             // per outer row; none for an outer relation of fewer than two
             // rows.
             let memoized = param_inner.as_ref().and_then(|(path, q, memo)| {
-                let key = memo.as_ref().filter(|_| o.2 >= 2.0)?;
-                Some((memoize(path, key, o.2, i.3), *q))
+                let key = memo.as_ref().filter(|_| o.rows >= 2.0)?;
+                Some((memoize(path, key, o.rows, i.width), *q))
             });
-            if let Some((m, _)) = &memoized {
-                memos[pair][usize::from(b_outer)] = (m.startup, m.total);
-            }
-            let mut inners: Vec<(usize, &InPath, f64)> = vec![(0, &inner, qual)];
-            if let Some((path, q, _)) = &param_inner {
-                inners.push((2, path, *q));
-            }
-            if let Some((m, q)) = &memoized {
-                inners.push((3, m, *q));
-            }
-            inners.push((1, &mat, qual));
-            for (kind, inner, qual) in inners {
-                let semi = unique[usize::from(!b_outer)];
-                let (startup, total) = nestloop_cost(&outer, inner, semi, false, qual);
-                let (startup, total) = (startup + qual_startup, total + qual_startup);
-                add_path(
-                    &mut paths,
-                    JoinPath {
-                        startup,
-                        total,
-                        keyed: false,
-                        class: 0,
-                        method: JoinMethod::Other,
-                        // The pair it was built from, which side is outer,
-                        // and its inner: plain (0), materialised (1), the
-                        // parameterized index scan (2) or a Memoize of it
-                        // (3).
-                        combo: pair * 8 + usize::from(b_outer) * 4 + kind,
-                        a_path: DEFAULT_INPUT,
-                        b_path: DEFAULT_INPUT,
-                        rows: 0.0,
-                        req_outer: 0,
-                        rescan: (startup, total),
-                    },
-                    false,
-                );
+            for (outer_path, &(os, ot)) in o.paths.iter().enumerate() {
+                let outer = InPath::scan(os, ot, o.rows, None);
+                // Its inner: plain (0), materialised (1), the
+                // parameterized index scan (2) or a Memoize of it (3).
+                let mut inners: Vec<(usize, &InPath, f64)> = vec![(0, &inner, qual)];
+                if let Some((path, q, _)) = &param_inner {
+                    inners.push((2, path, *q));
+                }
+                if let Some((m, q)) = &memoized {
+                    inners.push((3, m, *q));
+                }
+                inners.push((1, &mat, qual));
+                for (kind, inner, qual) in inners {
+                    let semi = unique[usize::from(!b_outer)];
+                    let (startup, total) = nestloop_cost(&outer, inner, semi, false, qual);
+                    let (startup, total) = (startup + qual_startup, total + qual_startup);
+                    let materialized = kind == 1;
+                    weighed.push(NestLoopKept {
+                        pair,
+                        outer_path,
+                        plan: NestLoopPlan {
+                            b_outer,
+                            materialized,
+                            startup,
+                            total,
+                            material: materialized.then_some((mat.startup, mat.total)),
+                            param: kind >= 2,
+                            memoize: (kind == 3)
+                                .then(|| memoized.as_ref().map(|(m, _)| (m.startup, m.total)))
+                                .flatten(),
+                        },
+                    });
+                    add_path(
+                        &mut paths,
+                        JoinPath {
+                            startup,
+                            total,
+                            keyed: false,
+                            class: 0,
+                            method: JoinMethod::Other,
+                            combo: weighed.len() - 1,
+                            a_path: DEFAULT_INPUT,
+                            b_path: DEFAULT_INPUT,
+                            rows: 0.0,
+                            req_outer: 0,
+                            rescan: (startup, total),
+                        },
+                        startup_counts,
+                    );
+                }
             }
         }
     }
-    let best = paths[0];
-    let pair = best.combo / 8;
-    let b_outer = best.combo % 8 >= 4;
-    let kind = best.combo % 4;
-    let materialized = kind == 1;
-    (
-        pair,
-        NestLoopPlan {
-            b_outer,
-            materialized,
-            startup: best.startup,
-            total: best.total,
-            material: materialized.then_some(materials[pair][usize::from(b_outer)]),
-            param: kind >= 2,
-            memoize: (kind == 3).then_some(memos[pair][usize::from(b_outer)]),
-        },
-    )
+    paths.iter().map(|p| weighed[p.combo]).collect()
 }
 
 /// A merge join, each side read in key order -- by its `ordered` index scan
