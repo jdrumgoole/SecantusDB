@@ -92,7 +92,7 @@ Python wheel. `cargo install` builds it (WiredTiger included) and puts the
 `secantusd-mdb` daemon on `PATH`:
 
 ```bash
-cargo install secantus-mdb --version 0.5.3-beta.196
+cargo install secantus-mdb --version 0.5.3-beta.197
 secantusd-mdb --host 127.0.0.1 --port 27017
 ```
 

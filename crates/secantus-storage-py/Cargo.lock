@@ -918,7 +918,7 @@ dependencies = [
 
 [[package]]
 name = "secantus-core"
-version = "0.5.3-beta.196"
+version = "0.5.3-beta.197"
 dependencies = [
  "bson",
  "chrono",
@@ -934,14 +934,14 @@ dependencies = [
 
 [[package]]
 name = "secantus-icu"
-version = "0.5.3-beta.196"
+version = "0.5.3-beta.197"
 dependencies = [
  "cc",
 ]
 
 [[package]]
 name = "secantus-storage"
-version = "0.5.3-beta.196"
+version = "0.5.3-beta.197"
 dependencies = [
  "bson",
  "flate2",
@@ -955,7 +955,7 @@ dependencies = [
 
 [[package]]
 name = "secantus-storage-py"
-version = "0.5.3-beta.196"
+version = "0.5.3-beta.197"
 dependencies = [
  "bson",
  "pyo3",
@@ -964,7 +964,7 @@ dependencies = [
 
 [[package]]
 name = "secantus-wiredtiger-sys"
-version = "0.5.3-beta.196"
+version = "0.5.3-beta.197"
 dependencies = [
  "cc",
  "cmake",
@@ -973,7 +973,7 @@ dependencies = [
 
 [[package]]
 name = "secantus-wt"
-version = "0.5.3-beta.196"
+version = "0.5.3-beta.197"
 dependencies = [
  "secantus-wiredtiger-sys",
 ]

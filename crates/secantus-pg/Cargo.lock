@@ -2252,7 +2252,7 @@ dependencies = [
 
 [[package]]
 name = "secantus-auth"
-version = "0.5.3-beta.196"
+version = "0.5.3-beta.197"
 dependencies = [
  "base64 0.22.1",
  "hmac 0.12.1",
@@ -2267,7 +2267,7 @@ dependencies = [
 
 [[package]]
 name = "secantus-core"
-version = "0.5.3-beta.196"
+version = "0.5.3-beta.197"
 dependencies = [
  "bson",
  "chrono",
@@ -2283,7 +2283,7 @@ dependencies = [
 
 [[package]]
 name = "secantus-icu"
-version = "0.5.3-beta.196"
+version = "0.5.3-beta.197"
 dependencies = [
  "cc",
 ]
@@ -2418,7 +2418,7 @@ dependencies = [
 
 [[package]]
 name = "secantus-storage"
-version = "0.5.3-beta.196"
+version = "0.5.3-beta.197"
 dependencies = [
  "bson",
  "flate2",
@@ -2432,7 +2432,7 @@ dependencies = [
 
 [[package]]
 name = "secantus-wiredtiger-sys"
-version = "0.5.3-beta.196"
+version = "0.5.3-beta.197"
 dependencies = [
  "cc",
  "cmake",
@@ -2441,7 +2441,7 @@ dependencies = [
 
 [[package]]
 name = "secantus-wt"
-version = "0.5.3-beta.196"
+version = "0.5.3-beta.197"
 dependencies = [
  "secantus-wiredtiger-sys",
 ]
