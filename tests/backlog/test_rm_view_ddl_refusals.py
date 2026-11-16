@@ -24,10 +24,10 @@ def _answer(client: Any, op: Any) -> tuple:
         client.drop_database(db.name)
 
 
-@pytest.mark.backlog("RM-587")
+@pytest.mark.backlog_fixed("RM-587")
 def test_a_data_size_of_a_view_is_refused(rust_mongo: Any, mongod_rs: Any) -> None:
     """mongod 8.2.11 refuses a `dataSize` of a view with
-    CommandNotSupportedOnView; this server answers `ok: 1`."""
+    CommandNotSupportedOnView; this server answered `ok: 1`."""
 
     def op(db: Any) -> Any:
         return db.command("dataSize", f"{db.name}.v")

@@ -778,12 +778,6 @@ These are explicit non-goals. Don't add them without a reason.
       e01df2d2 (2026-11-08), each command checked against a probe of its own.
       Backlog-ID: RM-360
       Verify: tests/backlog/test_rm_355_364.py::test_every_line_counts_its_interrupt_checks
-- [ ] **A `dataSize` of a view answers.** mongod 8.2.11 refuses
-      `{dataSize: "<db>.v"}` of a view (166, CommandNotSupportedOnView);
-      this server answers `ok: 1`, sizing nothing. Found while working
-      RM-485, 2026-11-13.
-      Verify: tests/backlog/test_rm_view_ddl_refusals.py::test_a_data_size_of_a_view_is_refused
-      Backlog-ID: RM-587
 - [ ] **A `dropIndexes` of `system.views` is refused.** mongod 8.2.11 drops
       `<db>.system.views`' indexes (`ok: 1`, its line and profile entry
       naming `<db>.system.views`, `system`); this server refuses it with
@@ -791,14 +785,17 @@ These are explicit non-goals. Don't add them without a reason.
       working RM-485, 2026-11-13.
       Verify: tests/backlog/test_rm_view_ddl_refusals.py::test_a_drop_indexes_of_system_views_answers
       Backlog-ID: RM-588
-- [ ] **A `find` of a time-series collection's buckets does not say what
-      it examined.** mongod 8.2.11's line for a `find` of
-      `<db>.system.buckets.ts` has `keysExamined`, `docsExamined` and
-      `nBatches`, as one of a collection's does; this server's has its
-      `planSummary` and `nreturned` and none of those. Found while working
-      RM-484, 2026-11-13.
-      Verify: tests/backlog/test_rm_ts_ddl_lines.py::test_a_find_of_buckets_says_what_it_examined
-      Backlog-ID: RM-586
+- [ ] **A `find` of a clustered collection that leaves its cursor open
+      does not say what it examined.** mongod 8.2.11's lines for a `find`
+      of `<db>.system.buckets.ts` read four at a time, and its `getMore`s,
+      each say what that batch examined (`keysExamined: 0`, `docsExamined`
+      4, 4, 2, `nBatches: 1`); this server's say `nreturned` alone. A
+      clustered collection's read is not streamed (`can_stream`), so a read
+      the first batch ends counts its plan's run as `explain` does (RM-586),
+      and one that leaves a cursor open counts nothing. Found while working
+      RM-586, 2026-11-16.
+      Verify: tests/backlog/test_rm_ts_ddl_lines.py::test_a_batched_find_of_buckets_says_what_each_batch_examined
+      Backlog-ID: RM-708
 - [ ] **A refused write of a view counts fewer locks than mongod's.**
       mongod 8.2.11 refuses a write of a view once it holds the namespace
       for the write; this server refuses it earlier, in `views::refusal`,
@@ -2070,6 +2067,13 @@ Still different:
       oplog spans several tables), lists by database and then name rather
       than creation order, gives an index `spec` in `listIndexes`' key
       order, and reads a geo index's `multikey` from the documents now.
+      Not workable as one fix (a fix-one session declined it, 2026-11-14): it
+      bundles about ten gaps (buildInfo's per-OS block, latencyStats,
+      connectionStatus privileges, hostInfo.extra on Linux, $indexStats
+      following the trial, $listCatalog fields, sessions in
+      config.system.sessions) besides the per-table sizes RM-499 decides.
+      Split it into one item per gap, each with its own gap test, before
+      batching.
       Backlog-ID: RM-040
       Verify: tests/backlog/test_rm_029_056.py::test_coll_stats_wiredtiger_and_index_details
 
@@ -2240,6 +2244,10 @@ Still different, all 77:
       either side of 15 characters. **Decided (Joe, 2026-11-08, on RM-341):
       a layout table per mongod build, chosen by the target the server is
       built for, each fitted by probing that platform's mongod 8.2.11.**
+      Blocked (2026-11-14): fitting the LIBSTDCXX_X86_64 table needs a Linux
+      x86_64 mongod 8.2.11, and this Mac has only macOS builds and no
+      container runtime. Either install colima or Docker and run the Linux
+      image here, or probe CI's Linux mongod from a dedicated session.
       Backlog-ID: RM-442
       Verify: tests/backlog/test_rm_340_342_plan_cache_gaps.py::test_an_entry_reports_its_estimated_size_on_linux
 - [ ] **A `$cursor` the pipeline stops reading reports a plan run to its
@@ -2369,6 +2377,9 @@ A `readConcern` with an `atClusterTime` older than the oldest timestamp is
       and the two delinquency totals).
       **Decided 2026-10-16 (Joe):** leave it open; no stand-in values. Build
       it when those mechanisms exist.
+      Blocked (checked 2026-11-14): waits on RM-355 (execution admission
+      control) and RM-360 (interrupt checks), per the decision above; both are
+      still open in part.
       Backlog-ID: RM-170
       Verify: tests/backlog/test_rm_found_2026_10_16.py::test_include_query_stats_metrics_adds_a_metrics_document
 
@@ -2639,6 +2650,13 @@ compressed column, placed by mongod's bucket catalog
       allocators, so `memoryUsage` and idle-bucket expiry follow mongod's.
       The size limit's memory accounting (`getCacheDerivedBucketMaxSize`,
       decided 2026-10-16) does not depend on it and is built.
+      Too large for one fix (declined 2026-11-15). Proposed split: (1)
+      serverStatus.bucketCatalog's counts, counters and stateManagement from
+      state the catalog keeps; (2) mongod's memory accounting, so memoryUsage
+      matches; (3) idle-bucket expiry past
+      timeseriesIdleBucketExpiryMemoryUsageThreshold, which needs (2). The gap
+      test stays red until (2) lands. Awaiting Joe's go-ahead to file the
+      split.
       Verify: tests/backlog/test_rm_found_2026_11_11_rm088.py::test_server_status_reports_the_bucket_catalog
       Backlog-ID: RM-549
 - **Scope decision — a `hashed` index on a time-series collection** is
