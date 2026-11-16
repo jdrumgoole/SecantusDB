@@ -526,7 +526,37 @@ pub fn hash_anti_join(
     factors: (f64, f64),
     inner_keys: &[KeyStats<'_>],
 ) -> (f64, f64) {
-    hash_join_core(outer, inner, 0.0, sel, 1.0, inner_keys, Some(factors))
+    hash_join_core(
+        outer,
+        inner,
+        0.0,
+        sel,
+        1.0,
+        inner_keys,
+        Some((factors, true)),
+    )
+}
+
+/// A semi join hashing `inner` (RP-411): `final_cost_hashjoin`'s
+/// JOIN_SEMI, each outer row's probe stopping at its first match as an
+/// anti join's does, the join's tuples the outer rows that match.
+/// `factors` and `sel` as [`hash_anti_join`]'s.
+pub fn hash_semi_join(
+    outer: &JoinSide,
+    inner: &JoinSide,
+    sel: f64,
+    factors: (f64, f64),
+    inner_keys: &[KeyStats<'_>],
+) -> (f64, f64) {
+    hash_join_core(
+        outer,
+        inner,
+        0.0,
+        sel,
+        1.0,
+        inner_keys,
+        Some((factors, false)),
+    )
 }
 
 /// `eqjoinsel_semi` (also JOIN_ANTI's) of `k1 = k2` where neither key has
@@ -548,6 +578,51 @@ pub fn eqjoinsel_semi_no_mcv(k1: &KeyStats<'_>, k2: &KeyStats<'_>, inner_rows: f
     })
 }
 
+/// `eqjoinsel_semi` (PostgreSQL 15 `selfuncs.c`) of `k1 = k2`, the share
+/// of the outer rows with a match, `nd2` clamped to the inner relation's
+/// `inner_rows`. With both sides' MCV lists the matched outer MCVs are
+/// certain, and of the rest a fraction `nd2 / nd1` of the distinct values
+/// left (half where either count is the default) is taken to match, the
+/// inner list cut to `nd2` entries; otherwise [`eqjoinsel_semi_no_mcv`]'s
+/// formula, which PostgreSQL also uses where only one side has a list.
+pub fn eqjoinsel_semi(k1: &KeyStats<'_>, k2: &KeyStats<'_>, inner_rows: f64) -> f64 {
+    if k1.mcv.is_empty() || k2.mcv.is_empty() {
+        let bare = |k: &KeyStats<'_>| KeyStats { mcv: &[], ..*k };
+        return eqjoinsel_semi_no_mcv(&bare(k1), &bare(k2), inner_rows).expect("no MCV lists");
+    }
+    let mut nd1 = k1.ndistinct;
+    let mut nd2 = k2.ndistinct.min(inner_rows);
+    let clamped2 = (k2.mcv.len() as f64).min(nd2).max(0.0) as usize;
+    let mut has2 = vec![false; clamped2];
+    let mut matchfreq1 = 0.0f64;
+    let mut nmatches = 0.0f64;
+    for (v1, f1) in k1.mcv {
+        for (j, (v2, _)) in k2.mcv.iter().take(clamped2).enumerate() {
+            if has2[j] || v1 != v2 {
+                continue;
+            }
+            has2[j] = true;
+            matchfreq1 += f64::from(*f1);
+            nmatches += 1.0;
+            break;
+        }
+    }
+    let matchfreq1 = matchfreq1.clamp(0.0, 1.0);
+    let uncertainfrac = if !k1.default_ndistinct && !k2.default_ndistinct {
+        nd1 -= nmatches;
+        nd2 -= nmatches;
+        if nd1 <= nd2 || nd2 < 0.0 {
+            1.0
+        } else {
+            nd2 / nd1
+        }
+    } else {
+        0.5
+    };
+    let uncertain = (1.0 - matchfreq1 - k1.null_frac).clamp(0.0, 1.0);
+    matchfreq1 + uncertainfrac * uncertain
+}
+
 fn hash_join_core(
     outer: &JoinSide,
     inner: &JoinSide,
@@ -555,7 +630,7 @@ fn hash_join_core(
     sel: f64,
     filter_sel: f64,
     inner_keys: &[KeyStats<'_>],
-    anti: Option<(f64, f64)>,
+    semi_anti: Option<((f64, f64), bool)>,
 ) -> (f64, f64) {
     let mut startup = outer.scan.0 + inner.scan.1;
     let mut run = outer.scan.1 - outer.scan.0;
@@ -645,8 +720,8 @@ fn hash_join_core(
         }
         bucket
     };
-    let tuples = if inner.unique || anti.is_some() {
-        let (match_frac, match_count) = anti.unwrap_or_else(|| {
+    let tuples = if inner.unique || semi_anti.is_some() {
+        let (match_frac, match_count) = semi_anti.map(|(f, _)| f).unwrap_or_else(|| {
             let match_frac = sel * filter_sel;
             (match_frac, (match_frac * inner.rows / match_frac).max(1.0))
         });
@@ -660,7 +735,7 @@ fn hash_join_core(
             * (outer.rows - matched)
             * clamp_row_est(inner.rows / buckets)
             * 0.05;
-        if anti.is_some() {
+        if semi_anti.is_some_and(|(_, anti)| anti) {
             outer.rows - matched
         } else {
             matched
@@ -3096,6 +3171,27 @@ pub fn limit_choice(paths: &[JoinChoice], rows: f64, count: f64, offset: f64) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `eqjoinsel_semi` with both MCV lists: the matched outer MCVs, and of
+    /// the rest `nd2 / nd1` of the distinct values left (RP-411).
+    #[test]
+    fn eqjoinsel_semi_with_mcv_lists() {
+        let (a, b) = (b"a".to_vec(), b"b".to_vec());
+        let m1 = [(a.clone(), 0.5f32), (b, 0.25f32)];
+        let m2 = [(a, 0.5f32)];
+        let k = |ndistinct: f64, mcv| KeyStats {
+            ndistinct,
+            default_ndistinct: false,
+            null_frac: 0.0,
+            mcv,
+        };
+        let (k1, k2) = (k(4.0, &m1[..]), k(3.0, &m2[..]));
+        // nd1 3 and nd2 2 after the one match: 0.5 + 2/3 of 0.5.
+        assert!((eqjoinsel_semi(&k1, &k2, 30.0) - (0.5 + 0.5 * 2.0 / 3.0)).abs() < 1e-12);
+        // One side without a list: the formula without MCVs.
+        let k3 = k(3.0, &[][..]);
+        assert_eq!(eqjoinsel_semi(&k1, &k3, 30.0), 0.75);
+    }
 
     #[test]
     fn an_anti_join_matches_every_outer_row_of_a_unique_key() {

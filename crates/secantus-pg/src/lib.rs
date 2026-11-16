@@ -46775,6 +46775,18 @@ impl PgHandler {
                 if let Some(sj) = &options.semi_join {
                     if !self.unique_index_fixed(&sj.inner.0, std::slice::from_ref(&sj.inner_col)) {
                         tree = explain::semi_join_tree(sj);
+                        let priced = match inner.as_ref() {
+                            Statement::Select(sel) => self.semi_join_estimate(sj, sel),
+                            _ => None,
+                        };
+                        if let Some((outer, hashed, join)) = priced {
+                            tree.estimate = Some(join);
+                            tree.children[0].estimate = Some(outer);
+                            // A Hash returns nothing until it is built.
+                            tree.children[1].estimate =
+                                Some((hashed.1, hashed.1, hashed.2, hashed.3));
+                            tree.children[1].children[0].estimate = Some(hashed);
+                        }
                     }
                 }
                 explain::attach_scan_quals(

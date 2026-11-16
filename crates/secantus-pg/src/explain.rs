@@ -719,7 +719,7 @@ fn join_tree(node: &JoinNode, scan: &ScanChooser<'_>) -> PlanNode {
 
 /// The `Hash Semi Join` an IN or EXISTS sublink is pulled up into
 /// (RP-411): the outer relation's scan, and the inner one's under a Hash.
-/// Unpriced: a semi join has no planner path here yet.
+/// Priced by the server where `semi_join_estimate` models the path.
 pub(crate) fn semi_join_tree(sj: &secantus_pgplan::SemiJoin) -> PlanNode {
     let scan = |(table, shown): &(String, String)| {
         let mut n = PlanNode::new(if table == shown {

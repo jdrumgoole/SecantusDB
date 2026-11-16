@@ -4590,7 +4590,7 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
         ],
     ),
     "a hash semi join is priced": (
-        "RP-411",
+        "RP-411:fixed",
         _ANALYSED_THIRTY,
         "explain select * from e where a in (select a from s)",
         [
@@ -4599,6 +4599,48 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "  ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
             "  ->  Hash  (cost=1.30..1.30 rows=30 width=4)",
             "        ->  Seq Scan on s  (cost=0.00..1.30 rows=30 width=4)",
+        ],
+    ),
+    # The inner side the larger, and text keys with MCV lists
+    # (`eqjoinsel_semi`'s MCV branch), measured on 15.19 (RP-411).
+    "a hash semi join over the larger inner side is priced": (
+        "RP-411:fixed",
+        _ANALYSED_THIRTY,
+        "explain select * from s where a in (select a from e)",
+        [
+            "Hash Semi Join  (cost=27.50..29.21 rows=30 width=20)",
+            "  Hash Cond: (s.a = e.a)",
+            "  ->  Seq Scan on s  (cost=0.00..1.30 rows=30 width=20)",
+            "  ->  Hash  (cost=15.00..15.00 rows=1000 width=4)",
+            "        ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=4)",
+        ],
+    ),
+    "a hash semi join on text keys with mcv lists is priced": (
+        "RP-411:fixed",
+        _ANALYSED_THIRTY,
+        "explain select * from e where b in (select c from s)",
+        [
+            "Hash Semi Join  (cost=1.68..30.43 rows=1000 width=7)",
+            "  Hash Cond: (e.b = s.c)",
+            "  ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
+            "  ->  Hash  (cost=1.30..1.30 rows=30 width=16)",
+            "        ->  Seq Scan on s  (cost=0.00..1.30 rows=30 width=16)",
+        ],
+    ),
+    # Cheaper as the inner join of the inner side made unique
+    # (`create_unique_path`), which `add_path` keeps, measured on 15.19.
+    "a semi join cheaper unique-ified is a hash join over a hashaggregate": (
+        "RP-411",
+        _ANALYSED_THIRTY,
+        "explain select * from e where b in (select b from k)",
+        [
+            "Hash Join  (cost=17.73..46.48 rows=1000 width=7)",
+            "  Hash Cond: (e.b = k.b)",
+            "  ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
+            "  ->  Hash  (cost=17.60..17.60 rows=10 width=3)",
+            "        ->  HashAggregate  (cost=17.50..17.60 rows=10 width=3)",
+            "              Group Key: k.b",
+            "              ->  Seq Scan on k  (cost=0.00..15.00 rows=1000 width=3)",
         ],
     ),
     # Planned as the inner join `reduce_unique_semijoins` makes of it.

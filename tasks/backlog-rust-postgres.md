@@ -1983,26 +1983,31 @@ a regression test.
       a private 15.19 cluster (found while working RP-399).
       Backlog-ID: RP-410
       Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a table's only index composite]
-- [ ] **A semi join's costs are not PostgreSQL's.** Since RP-411's first
-      slice (2026-11-16) a WHERE that is one uncorrelated `col IN (select
-      col from t)` / `= any`, or one `EXISTS` correlated by a single column
-      equality, prints PostgreSQL 15.19's `Hash Semi Join` shape
-      (`secantus-pgplan/src/sublink_join.rs`, drawn by
-      `explain::semi_join_tree`); over an inner column a unique index fixes
-      it is planned as the inner join `reduce_unique_semijoins` makes of it
-      (`sublink_join::as_inner_join`, chosen in the server's EXPLAIN arm by
-      `unique_index_fixed`), costs included. Still open: (1) The semi join
-      is unpriced (zeros): PostgreSQL prices it with `eqjoinsel_semi` and
-      `final_cost_hashjoin`'s semi-join match fraction (`select * from e
-      where a in (select a from s)` is `Hash Semi Join (cost=1.68..19.63
-      rows=30 width=7)`), and may instead unique-ify the inner side into an
-      inner join, so the costed test needs both paths compared as
-      `add_path` does. The anti join RP-908 renders (`left_anti_key`,
-      `hash_anti_join_of`) is the nearest priced path. (2) Wider shapes
-      still print the scan: a sublink ANDed with other quals, a subquery
-      with its own WHERE, a cross-type comparison.
+- [ ] **A semi join cheaper unique-ified keeps the semi join's shape.**
+      Since RP-411's first slice (2026-11-16) a WHERE that is one
+      uncorrelated `col IN (select col from t)` / `= any`, or one `EXISTS`
+      correlated by a single column equality, prints PostgreSQL 15.19's
+      `Hash Semi Join` shape (`secantus-pgplan/src/sublink_join.rs`, drawn
+      by `explain::semi_join_tree`); over an inner column a unique index
+      fixes it is planned as the inner join `reduce_unique_semijoins` makes
+      of it (`sublink_join::as_inner_join`, chosen in the server's EXPLAIN
+      arm by `unique_index_fixed`), costs included. The semi join is priced
+      (`PgHandler::semi_join_estimate`, `hash_semi_join_of`:
+      `eqjoinsel_semi` with its MCV branch, `final_cost_hashjoin`'s
+      JOIN_SEMI) where it beats the inner join of the unique-ified inner
+      side, hashed either way, and lower bounds of the merge and
+      nested-loop paths. Still open: (1) Where the unique-ified path is
+      cheaper, PostgreSQL plans it and the semi join here prints zeros:
+      `select * from e where b in (select b from k)` is `Hash Join
+      (cost=17.73..46.48 rows=1000 width=7)` over `Hash` over
+      `HashAggregate (cost=17.50..17.60 rows=10 width=3)`, `Group Key:
+      k.b` (`create_unique_path`; the costs `hash_semi_join_of` already
+      computes for the comparison). Merge and nested-loop semi joins, and
+      a side read through an index, are not priced. (2) Wider shapes still
+      print the scan: a sublink ANDed with other quals, a subquery with its
+      own WHERE, a cross-type comparison.
       Backlog-ID: RP-411
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a hash semi join is priced]
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a semi join cheaper unique-ified is a hash join over a hashaggregate]
 - [ ] **A hash join of two tables never analysed is unpriced, and its
       sides stay in written order.** `hash_side` prices a side only from
       `analysed_key`, which needs `pg_statistic` rows. PostgreSQL 15.19
