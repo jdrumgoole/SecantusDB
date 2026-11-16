@@ -4672,9 +4672,9 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
         ],
     ),
     # The sublink ANDed with a qual over the outer relation, which filters
-    # its scan, measured on 15.19.
+    # its scan, was printed as the scan, measured on 15.19 (RP-411, fixed).
     "a sublink anded with an outer qual is planned as a join": (
-        "RP-411",
+        "RP-411:fixed",
         _ANALYSED_THIRTY,
         "explain select * from e where b in (select b from k) and a > 5",
         [
@@ -4682,6 +4682,55 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "  Hash Cond: (e.b = k.b)",
             "  ->  Seq Scan on e  (cost=0.00..17.50 rows=995 width=7)",
             "        Filter: (a > 5)",
+            "  ->  Hash  (cost=17.60..17.60 rows=10 width=3)",
+            "        ->  HashAggregate  (cost=17.50..17.60 rows=10 width=3)",
+            "              Group Key: k.b",
+            "              ->  Seq Scan on k  (cost=0.00..15.00 rows=1000 width=3)",
+        ],
+    ),
+    # The sublink ANDed with an outer qual over a unique inner column: the
+    # inner join `reduce_unique_semijoins` makes of it, its outer side
+    # filtered, measured on 15.19.
+    "a unique in subquery anded with an outer qual is an inner join": (
+        "RP-411:fixed",
+        _ANALYSED_THIRTY,
+        "explain select * from e where a in (select a from k) and b = 'v3'",
+        [
+            "Hash Join  (cost=18.75..38.50 rows=100 width=7)",
+            "  Hash Cond: (k.a = e.a)",
+            "  ->  Seq Scan on k  (cost=0.00..15.00 rows=1000 width=4)",
+            "  ->  Hash  (cost=17.50..17.50 rows=100 width=7)",
+            "        ->  Seq Scan on e  (cost=0.00..17.50 rows=100 width=7)",
+            "              Filter: (b = 'v3'::text)",
+        ],
+    ),
+    # An EXISTS ANDed with an outer qual, measured on 15.19.
+    "an exists anded with an outer qual is planned as a join": (
+        "RP-411:fixed",
+        _ANALYSED_THIRTY,
+        "explain select * from e where exists (select 1 from k where k.b = e.b) and a < 100",
+        [
+            "Hash Join  (cost=17.73..36.59 rows=99 width=7)",
+            "  Hash Cond: (e.b = k.b)",
+            "  ->  Seq Scan on e  (cost=0.00..17.50 rows=99 width=7)",
+            "        Filter: (a < 100)",
+            "  ->  Hash  (cost=17.60..17.60 rows=10 width=3)",
+            "        ->  HashAggregate  (cost=17.50..17.60 rows=10 width=3)",
+            "              Group Key: k.b",
+            "              ->  Seq Scan on k  (cost=0.00..15.00 rows=1000 width=3)",
+        ],
+    ),
+    # An outer qual over an expression beside the sublink: its scan's
+    # filter is priced with the expression's cost, measured on 15.19.
+    "a sublink anded with an outer expression qual is planned as a join": (
+        "RP-411",
+        _ANALYSED_THIRTY,
+        "explain select * from e where b in (select b from k) and length(b) > 1 and a > 5",
+        [
+            "Hash Join  (cost=17.73..44.79 rows=332 width=7)",
+            "  Hash Cond: (e.b = k.b)",
+            "  ->  Seq Scan on e  (cost=0.00..22.50 rows=332 width=7)",
+            "        Filter: ((a > 5) AND (length(b) > 1))",
             "  ->  Hash  (cost=17.60..17.60 rows=10 width=3)",
             "        ->  HashAggregate  (cost=17.50..17.60 rows=10 width=3)",
             "              Group Key: k.b",

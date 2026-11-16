@@ -2120,8 +2120,13 @@ impl PgHandler {
         if !read.contains(&outer_key) {
             read.push(outer_key.clone());
         }
+        // The WHERE's conjuncts over the outer relation filter its scan;
+        // the sublink is the plan's residual, never in its filter.
+        if !sj.outer_quals.is_empty() && sel.filter.is_empty() {
+            return None;
+        }
         let empty = Document::new();
-        let a = self.hash_side(&sj.outer.0, &empty, &outer_key, &read, &fields)?;
+        let a = self.hash_side(&sj.outer.0, &sel.filter, &outer_key, &read, &fields)?;
         let inner_read = [inner_key.clone()];
         let b = self.hash_side(&sj.inner.0, &empty, &inner_key, &inner_read, &[])?;
         let ((outer, inner, mut join, _, _), unique) = hash_semi_join_of(a, b)?;

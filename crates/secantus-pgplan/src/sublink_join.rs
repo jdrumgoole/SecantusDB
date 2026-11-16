@@ -4,8 +4,9 @@
 //! `convert_EXISTS_sublink_to_join` make of it, planned as a `Hash Semi
 //! Join` of the outer relation's scan to the inner one's, hashed.
 //!
-//! Recognised here: a plain parent over one plain relation whose whole
-//! WHERE is that sublink, over a subquery reading one plain relation, with
+//! Recognised here: a plain parent over one plain relation whose WHERE is
+//! that sublink, alone or ANDed with conjuncts over the outer relation
+//! alone (which filter its scan), over a subquery reading one plain relation, with
 //! no WHERE (IN) or a WHERE that is the one correlating column equality
 //! (EXISTS). Anything else is left to the plan as written.
 //!
@@ -18,7 +19,7 @@
 //! join `add_path` weighs against it), so its costs print as zeros.
 
 use super::*;
-use pg_query::protobuf::{ColumnRef, RangeVar, SelectStmt, SubLinkType};
+use pg_query::protobuf::{ColumnRef, RangeVar, SelectStmt, SubLink, SubLinkType};
 
 /// A semi join's sides and its one hash clause, as EXPLAIN prints them.
 #[derive(Debug, Clone, PartialEq)]
@@ -33,6 +34,9 @@ pub struct SemiJoin {
     pub outer_col: String,
     /// `(outer.col = inner.col)`.
     pub hash_cond: String,
+    /// The WHERE's other conjuncts, over the outer relation alone, as its
+    /// scan's `Filter` prints them (empty: the WHERE is the sublink).
+    pub outer_quals: Vec<(String, Option<String>)>,
     /// The EXPLAIN of the inner join `reduce_unique_semijoins` makes of
     /// it when the inner relation is unique on `inner_col` (RP-411):
     /// `outer JOIN inner ON outer.col = inner.col`, the select list read
@@ -119,6 +123,58 @@ fn user_column<'a>(def: &'a TableDef, col: &str) -> Option<&'a Column> {
     def.columns.iter().find(|c| c.name == col)
 }
 
+/// The WHERE's one sublink and its other AND conjuncts, which must not
+/// hold a sublink themselves.
+fn split_where(w: &pg_query::protobuf::Node) -> Option<(&SubLink, Vec<pg_query::protobuf::Node>)> {
+    let args: Vec<&pg_query::protobuf::Node> = match w.node.as_ref() {
+        Some(N::BoolExpr(b)) if b.boolop == pg_query::protobuf::BoolExprType::AndExpr as i32 => {
+            b.args.iter().collect()
+        }
+        _ => vec![w],
+    };
+    let mut link = None;
+    let mut rest = Vec::new();
+    for a in args {
+        match a.node.as_ref() {
+            Some(N::SubLink(l)) if link.is_none() => link = Some(l.as_ref()),
+            _ if crate::filter_sublink::has_sublink(a) => return None,
+            _ => rest.push(a.clone()),
+        }
+    }
+    Some((link?, rest))
+}
+
+/// `rest` ANDed back into one WHERE.
+fn and_of(mut rest: Vec<pg_query::protobuf::Node>) -> Option<pg_query::protobuf::Node> {
+    match rest.len() {
+        0 => None,
+        1 => rest.pop(),
+        _ => Some(pg_query::protobuf::Node {
+            node: Some(N::BoolExpr(Box::new(pg_query::protobuf::BoolExpr {
+                boolop: pg_query::protobuf::BoolExprType::AndExpr as i32,
+                args: rest,
+                ..Default::default()
+            }))),
+        }),
+    }
+}
+
+/// Whether every column `n` names is the outer relation's.
+fn outer_only(n: &pg_query::protobuf::Node, name: &str, def: &TableDef) -> bool {
+    let Some(e) = n.node.as_ref() else {
+        return false;
+    };
+    e.nodes().into_iter().all(|(r, _, _, _)| match r {
+        pg_query::NodeRef::ColumnRef(c) => {
+            let node = pg_query::protobuf::Node {
+                node: Some(N::ColumnRef(c.clone())),
+            };
+            resolve(&node, &[(name, def)]).is_some()
+        }
+        _ => true,
+    })
+}
+
 fn is_equals(names: &[pg_query::protobuf::Node]) -> bool {
     matches!(
         names,
@@ -140,8 +196,21 @@ pub(crate) fn semi_join_of(
     let outer_rv = one_relation(s)?;
     let outer_def = lookup(&outer_rv.relname)?;
     let outer_name = shown_name(outer_rv);
-    let Some(N::SubLink(link)) = s.where_clause.as_deref()?.node.as_ref() else {
+    let (link, rest) = split_where(s.where_clause.as_deref()?)?;
+    if !rest.iter().all(|n| outer_only(n, &outer_name, &outer_def)) {
         return None;
+    }
+    // Only conjuncts the scan's filter holds whole: one the executor keeps
+    // as a residual expression is not priced by that filter, and its cost
+    // per row is not modelled here.
+    let outer_quals = match and_of(rest) {
+        Some(w) => {
+            let Ok((_, None)) = lower_where_or_residual(&w, &outer_def, &[]) else {
+                return None;
+            };
+            ruleutils::explain_conjuncts(&w, &outer_def)?
+        }
+        None => Vec::new(),
     };
     let Some(N::SelectStmt(sub)) = link.subselect.as_deref()?.node.as_ref() else {
         return None;
@@ -207,8 +276,50 @@ pub(crate) fn semi_join_of(
         inner: (inner_rv.relname.clone(), inner_name),
         inner_col,
         outer_col,
+        outer_quals,
         inner_join: None,
     }))
+}
+
+/// Every one-part column reference in `n` qualified by `rel`.
+fn qualify(n: &mut pg_query::protobuf::Node, rel: &str) {
+    let Some(e) = n.node.as_mut() else { return };
+    match e {
+        N::ColumnRef(c) => {
+            if let [f] = c.fields.as_slice() {
+                if matches!(f.node, Some(N::String(_))) {
+                    c.fields.insert(
+                        0,
+                        pg_query::protobuf::Node {
+                            node: Some(string(rel)),
+                        },
+                    );
+                }
+            }
+        }
+        N::AExpr(x) => {
+            for side in [x.lexpr.as_deref_mut(), x.rexpr.as_deref_mut()]
+                .into_iter()
+                .flatten()
+            {
+                qualify(side, rel);
+            }
+        }
+        N::BoolExpr(b) => b.args.iter_mut().for_each(|a| qualify(a, rel)),
+        N::TypeCast(t) => {
+            if let Some(a) = t.arg.as_deref_mut() {
+                qualify(a, rel);
+            }
+        }
+        N::NullTest(t) => {
+            if let Some(a) = t.arg.as_deref_mut() {
+                qualify(a, rel);
+            }
+        }
+        N::FuncCall(f) => f.args.iter_mut().for_each(|a| qualify(a, rel)),
+        N::List(l) => l.items.iter_mut().for_each(|a| qualify(a, rel)),
+        _ => {}
+    }
 }
 
 fn column_ref(fields: Vec<N>) -> pg_query::protobuf::Node {
@@ -236,9 +347,7 @@ pub(crate) fn as_inner_join(query: &N, sj: &SemiJoin) -> Option<N> {
     let N::SelectStmt(s) = query else {
         return None;
     };
-    let Some(N::SubLink(link)) = s.where_clause.as_deref()?.node.as_ref() else {
-        return None;
-    };
+    let (link, rest) = split_where(s.where_clause.as_deref()?)?;
     let Some(N::SelectStmt(sub)) = link.subselect.as_deref()?.node.as_ref() else {
         return None;
     };
@@ -272,7 +381,16 @@ pub(crate) fn as_inner_join(query: &N, sj: &SemiJoin) -> Option<N> {
         node: Some(N::RangeVar(inner_rv)),
     });
     let side = |r: &str, c: &str| Box::new(column_ref(vec![string(r), string(c)]));
-    out.where_clause = Some(Box::new(pg_query::protobuf::Node {
+    // The outer relation's conjuncts name its columns bare; beside the
+    // inner relation a bare name may be ambiguous.
+    let mut conjuncts: Vec<pg_query::protobuf::Node> = rest
+        .into_iter()
+        .map(|mut n| {
+            qualify(&mut n, outer);
+            n
+        })
+        .collect();
+    conjuncts.push(pg_query::protobuf::Node {
         node: Some(N::AExpr(Box::new(pg_query::protobuf::AExpr {
             kind: pg_query::protobuf::AExprKind::AexprOp as i32,
             name: vec![pg_query::protobuf::Node {
@@ -282,6 +400,7 @@ pub(crate) fn as_inner_join(query: &N, sj: &SemiJoin) -> Option<N> {
             rexpr: Some(side(&sj.inner.1, &sj.inner_col)),
             location: -1,
         }))),
-    }));
+    });
+    out.where_clause = and_of(conjuncts).map(Box::new);
     Some(N::SelectStmt(out))
 }

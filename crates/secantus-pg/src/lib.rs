@@ -46813,6 +46813,11 @@ impl PgHandler {
                 if let Some(sj) = &options.semi_join {
                     if !self.unique_index_fixed(&sj.inner.0, std::slice::from_ref(&sj.inner_col)) {
                         tree = explain::semi_join_tree(sj);
+                        explain::outer_quals_on_semi_join(
+                            &mut tree,
+                            &sj.outer_quals,
+                            &index_columns,
+                        );
                         let priced = match inner.as_ref() {
                             Statement::Select(sel) => self.semi_join_estimate(sj, sel),
                             _ => None,

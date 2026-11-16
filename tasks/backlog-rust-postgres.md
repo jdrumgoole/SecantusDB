@@ -2003,13 +2003,16 @@ a regression test.
       as that `Hash Join`. Still open: (1) Merge and nested-loop semi
       joins, the unique-ified side as the outer one, and a side read through
       an index, are not priced. (2) Wider shapes still print the scan: a
-      sublink ANDed with other quals (`select * from e where b in (select b
-      from k) and a > 5` is the unique-ified `Hash Join (cost=17.73..48.91
-      rows=995 width=7)` with `Filter: (a > 5)` on `e`'s scan, measured on a
+      sublink ANDed with an outer conjunct the scan's filter does not hold
+      whole (`select * from e where b in (select b from k) and length(b) >
+      1 and a > 5` is the unique-ified `Hash Join (cost=17.73..44.79 rows=332 width=7)`, its
+      scan `cost=0.00..22.50` with the expression's cost per row, on a
       private 15.19 cluster), a subquery with its own WHERE, a cross-type
-      comparison.
+      comparison. Conjuncts that lower wholly to the outer scan's filter
+      are pulled up with the sublink and filter that scan
+      (`sublink_join::split_where`).
       Backlog-ID: RP-411
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a sublink anded with an outer qual is planned as a join]
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a sublink anded with an outer expression qual is planned as a join]
 - [ ] **A hash join of two tables never analysed is unpriced, and its
       sides stay in written order.** `hash_side` prices a side only from
       `analysed_key`, which needs `pg_statistic` rows. PostgreSQL 15.19
