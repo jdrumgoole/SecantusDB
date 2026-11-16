@@ -1993,6 +1993,11 @@ a regression test.
       scan, Filter included, is not printed. Related to the semi join
       RP-131 names for `element_types`. Measured on a private 15.19
       cluster (found while working RP-399).
+      (2026-11-16: the FROM-subquery pull-up RP-422 added,
+      `secantus-pgplan/src/subquery_pullup.rs`, rewrites the parse tree
+      before EXPLAIN plans it; the sublink-to-join conversion belongs
+      beside it, as `convert_ANY_sublink_to_join` runs in the same
+      `pull_up_sublinks` pass.)
       Backlog-ID: RP-411
       Verify: tests/backlog/test_rp_explain_costs.py::test_plan[an in subquery is a hash semi join], tests/backlog/test_rp_explain_costs.py::test_plan[an exists subquery is a hash semi join]
 - [ ] **A hash join of two tables never analysed is unpriced, and its
@@ -2033,6 +2038,13 @@ a regression test.
       join's `Join Filter`, where PostgreSQL pushes it to `Seq Scan on k`'s
       `Filter: (b = $0)`, inner and LEFT join alike. Its rows are right.
       Measured on a private 15.19 cluster (found while working RP-438).
+      (2026-11-16, bundled with RP-422: no InitPlan or SubPlan exists in
+      `secantus-pg/src/explain.rs` yet -- `PlanNode` has no labelled
+      sub-plan child, the renderers no `InitPlan n (returns $n)` line or
+      JSON `Parent Relationship: InitPlan` / `Subplan Name`, and no `$n`
+      param text. The fix needs that node kind, the initplan's cost added
+      to the scan's startup and total, and `b = $0` estimated as an
+      equality to an unknown value: 1/ndistinct, so 100 of e's rows.)
       Verify: tests/backlog/test_rp_explain_costs.py::test_plan[an uncorrelated subquery is an initplan], tests/backlog/test_rp_explain_costs.py::test_plan[a join's on subquery is an initplan on its scan]
       Backlog-ID: RP-440
 
