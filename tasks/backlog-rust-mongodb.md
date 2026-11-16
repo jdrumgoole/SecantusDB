@@ -308,6 +308,7 @@ These are explicit non-goals. Don't add them without a reason.
       push/PR would catch this class at the cost of runner time on an already
       congested queue. Cheaper middle grounds: one extra Linux Python on PRs,
       or make the cron's failure loud (it currently notifies nobody).
+      **Decided (Joe, 2026-11-16): make the weekly cron's failure loud (it notifies) AND add one extra Linux Python to PR runs; not the full 3.13 matrix.**
       Backlog-ID: RM-014
       Verify: none -- CI matrix policy decision
 
@@ -346,6 +347,7 @@ These are explicit non-goals. Don't add them without a reason.
       Why it matters: the concurrency chart's CLAIM is its shape ("monotonic,
       no cliff"), and a noisy neighbour is exactly what could fake a cliff or
       hide one.
+      **Decided (Joe, 2026-11-16): run the concurrency benchmark on dedicated-CPU droplets, created for the run and destroyed after.**
       Backlog-ID: RM-015
       Verify: none -- cloud account tier for a benchmark
 
@@ -1051,6 +1053,7 @@ These are explicit non-goals. Don't add them without a reason.
       the Rust PG server links it, and the PG session is told before the
       format changes.
       Verify: tests/backlog/test_rm_355_364.py::test_an_insert_in_a_transaction_counts_mongods_dirty_bytes
+      **Decided (Joe, 2026-11-16): go ahead, staged as above -- storage first, then KeyString; a format bump that refuses an old store; the PG session told before the format changes.**
       Backlog-ID: RM-499
 
 - [ ] **mongod's startup lines this server does not write.** Since RM-302
@@ -2052,6 +2055,7 @@ Still different:
       config.system.sessions) besides the per-table sizes RM-499 decides.
       Split it into one item per gap, each with its own gap test, before
       batching.
+      **Decided (Joe, 2026-11-16): RM-499 goes ahead; once its storage stage lands, split this item's per-table parts and its other parts into separate items with their own gap tests.**
       Backlog-ID: RM-040
       Verify: tests/backlog/test_rm_029_056.py::test_coll_stats_wiredtiger_and_index_details
 
@@ -2226,6 +2230,7 @@ Still different, all 77:
       x86_64 mongod 8.2.11, and this Mac has only macOS builds and no
       container runtime. Either install colima or Docker and run the Linux
       image here, or probe CI's Linux mongod from a dedicated session.
+      **Decided (Joe, 2026-11-16): install colima on this Mac and run the Linux x86_64 mongod 8.2.11 image locally to fit LIBSTDCXX_X86_64.**
       Backlog-ID: RM-442
       Verify: tests/backlog/test_rm_340_342_plan_cache_gaps.py::test_an_entry_reports_its_estimated_size_on_linux
 - [ ] **A `$cursor` the pipeline stops reading reports a plan run to its
@@ -2610,33 +2615,61 @@ bucket documents in `system.buckets.<name>`, each data field mongod's
 compressed column, placed by mongod's bucket catalog
 (`crates/secantus-commands/src/bucket_catalog.rs`). What is left:
 
+- [ ] **RUST MongoDB server: `serverStatus` has no `bucketCatalog`
+      section.** mongod 8.2.11 reports one once a time-series collection is
+      written to: `numBuckets`, `numOpenBuckets`, `numIdleBuckets`,
+      `numArchivedBuckets`, `memoryUsage`, the execution counters
+      (`numBucketInserts`, `numBucketUpdates`, `numCommits`,
+      `numMeasurementsCommitted`, the `numBucketsClosedDueTo...` and
+      `numBucketReopeningsFailedDueTo...` families and the rest, 45 fields in
+      all, in one order) and `stateManagement` (`bucketsManaged`,
+      `currentEra`, `erasWithRemainingBuckets`, `trackedClearOperations`).
+      None before the first write. This server reports no section. Every
+      field but `memoryUsage` is the catalog's own state
+      (`crates/secantus-commands/src/bucket_catalog.rs`): report it from what
+      the catalog keeps, counting as mongod does (a commit per bucket per
+      batch, an update when a measurement joins an open bucket, and so on).
+      `memoryUsage` is reported with the key but its value is RM-710's.
+      Measured 2026-11-11 and 2026-11-16 (a time-series collection gives a
+      section after four inserts over two metadata values: `numBuckets` 2,
+      `numCommits` 2, `numMeasurementsCommitted` 4). (This was part of
+      RM-549, split 2026-11-16, Joe's go-ahead.)
+      Verify: tests/backlog/test_rm_found_2026_11_11_rm088.py::test_server_status_reports_the_bucket_catalog, tests/backlog/test_rm_bucket_catalog.py::test_bucket_catalog_counts_and_counters_follow_the_writes
+      Backlog-ID: RM-709
 - [ ] **RUST MongoDB server: the bucket catalog keeps no account of its
-      memory.** mongod 8.2.11 reports a `bucketCatalog` section in
-      `serverStatus` once a time-series collection is written to
-      (`numBuckets`, `numOpenBuckets`, `numIdleBuckets`,
-      `numArchivedBuckets`, `memoryUsage`, the execution counters,
-      `stateManagement`), and closes or archives idle buckets when the
-      catalog's memory passes `timeseriesIdleBucketExpiryMemoryUsageThreshold`
-      (a share of the machine's memory). This server reports no section and
-      never expires an idle bucket. Everything but the memory is the
-      catalog's to report; `memoryUsage`, and so the expiry, is the bytes
-      mongod's own C++ structures allocate through its tracking allocators,
-      which this server does not make. Measured 2026-11-11.
+      memory.** mongod 8.2.11's `bucketCatalog.memoryUsage` is the bytes its
+      own C++ structures allocate through tracking allocators: 12552 with one
+      bucket holding one measurement (and a one-character metadata value),
+      12828 after four more measurements, a new field among them, join that
+      bucket; each repeats run for run, while a larger catalog varies by about
+      a hundred bytes between runs (so only the small cases are pinned). This
+      server reports no section, and keeps no such account.
       **Decided (Joe, 2026-11-11):** model mongod's accounting: charge each
       bucket, its column builders, summaries, schema and the catalog's maps
       the bytes mongod's structures allocate through its tracking
-      allocators, so `memoryUsage` and idle-bucket expiry follow mongod's.
-      The size limit's memory accounting (`getCacheDerivedBucketMaxSize`,
-      decided 2026-10-16) does not depend on it and is built.
-      Too large for one fix (declined 2026-11-15). Proposed split: (1)
-      serverStatus.bucketCatalog's counts, counters and stateManagement from
-      state the catalog keeps; (2) mongod's memory accounting, so memoryUsage
-      matches; (3) idle-bucket expiry past
-      timeseriesIdleBucketExpiryMemoryUsageThreshold, which needs (2). The gap
-      test stays red until (2) lands. Awaiting Joe's go-ahead to file the
-      split.
-      Verify: tests/backlog/test_rm_found_2026_11_11_rm088.py::test_server_status_reports_the_bucket_catalog
-      Backlog-ID: RM-549
+      allocators, so `memoryUsage` follows mongod's. The size limit's memory
+      accounting (`getCacheDerivedBucketMaxSize`, decided 2026-10-16) does
+      not depend on it and is built. Needs RM-709's section to report it
+      through, and RM-711's expiry needs this. (This was part of RM-549, split
+      2026-11-16, Joe's go-ahead.)
+      Verify: tests/backlog/test_rm_bucket_catalog.py::test_bucket_catalog_memory_usage_is_the_bytes_mongod_accounts
+      Backlog-ID: RM-710
+- [ ] **RUST MongoDB server: idle buckets never expire past
+      `timeseriesIdleBucketExpiryMemoryUsageThreshold`.** mongod 8.2.11
+      closes idle buckets (and counts `numBucketsClosedDueToMemoryThreshold`
+      and `numBucketsArchivedDueToMemoryThreshold`, equal) when the catalog's
+      memory passes the threshold (`getParameter` reports 5 by default, a share of the
+      machine's memory; a byte count set at runtime, here after the first
+      write, takes effect) as a bucket is opened for a new metadata
+      value; with it at 30000 bytes, 21 buckets opened for 21 metadata values
+      leave 14 to 17 in the catalog, and every bucket document stays stored.
+      Which expire depends on the stripe each lands in, so only the facts
+      are pinned. This server never expires an idle bucket, and refuses the
+      `setParameter` (code 72). **Waits on RM-710** (the memory accounting
+      decides when the threshold is passed) and needs RM-709's counters. (This was part of RM-549, split 2026-11-16, Joe's
+      go-ahead.)
+      Verify: tests/backlog/test_rm_bucket_catalog.py::test_idle_buckets_expire_past_the_memory_threshold
+      Backlog-ID: RM-711
 - **Scope decision — a `hashed` index on a time-series collection** is
   refused as on any collection: hashed indexes are out of scope.
 - **Scope decision — `listCollections` order around time-series buckets.**
@@ -2910,23 +2943,6 @@ race on demand, which is worth having if this area changes again.
   Diagnose before trusting week-over-week go comparisons.
   Backlog-ID: RM-118
   Verify: none -- Go gauge CI test-count discrepancy
-- [ ] **One-time: configure a PyPI Trusted Publisher for `secantus-core`.**
-  On PyPI, add a Trusted Publisher for the (new) `secantus-core` project pointing
-  at `.github/workflows/rust-wheels.yml` (environment `pypi`), mirroring the
-  `secantus` setup. Until this exists the tag-gated `publish` job fails auth; the
-  `build`/`sdist` jobs run on every push/PR and are already CI-validated, so this
-  is the only thing blocking the first published `secantus-core` wheel.
-  Backlog-ID: RM-121
-  Verify: none -- PyPI account configuration
-- [ ] **Release-process: bump & publish `secantus-core` in lockstep.** The
-  `secantus[rust]` extra pins `secantus-core` to the exact SecantusDB version, so
-  every release must (a) bump BOTH versions — root `pyproject.toml` and
-  `crates/secantus-core/pyproject.toml` — and the `rust` extra pin in the root
-  pyproject, and (b) publish both wheels. Wire this into the `/secantusdb-release`
-  skill so the two can never drift (the `secantus[rust]` install breaks if the
-  matching `secantus-core` version isn't on PyPI).
-  Backlog-ID: RM-122
-  Verify: none -- release-process wiring
 
 ### 7.4 Verified rust-only gauge tail (2026-06-25)
 
@@ -3058,6 +3074,7 @@ the zlib block compressor; re-measure under the current lz4 default.
   vendored WiredTiger (`HAVE_BUILTIN_EXTENSION_ZLIB`) and is what the data
   tables use, so this is a connection-string change, not a build change.
   mongod uses snappy; zlib measured well here.
+  **Decided (Joe, 2026-11-16): benchmark first -- write latency and throughput with the log uncompressed, zlib, and snappy (mongod's choice; add it to the WiredTiger build if needed) -- then choose on the numbers.**
   Backlog-ID: RM-131
   Verify: none -- WAL compressor config/perf decision
 
@@ -3128,11 +3145,13 @@ above was of a fixed limit; the tail under probing is not yet measured.
 - [ ] **`--oplog-async` as a default** — worth 24% of the tail and 42% of the
   stalls on its own, independently of the cache story. Every write currently
   passes through one process-wide `Arc<Mutex<OplogState>>`.
+  **Decided (Joe, 2026-11-16): match mongod's model -- probe how mongod 8.2 orders the oplog and data writes and what a crash keeps, and make the default whatever reproduces that; no speed-only default.**
   Backlog-ID: RM-135
   Verify: none -- --oplog-async default decision
 - [ ] **Cache defaulting** — the daemon caps at 4G; the sweep shows the tail is
   governed by cache headroom versus write rate, so the default deserves
   revisiting (and documenting) rather than being a fixed number.
+  **Decided (Joe, 2026-11-16): adopt mongod's rule -- the larger of 50% of (RAM - 1 GB) and 256 MB -- and document it.**
   Backlog-ID: RM-136
   Verify: none -- cache-size default decision
 

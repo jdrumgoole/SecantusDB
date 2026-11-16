@@ -74,7 +74,7 @@ def test_bucket_indexes_list_each_index_as_mongod_keeps_it(
     assert got == ref
 
 
-@pytest.mark.backlog("RM-549")
+@pytest.mark.backlog("RM-709")
 def test_server_status_reports_the_bucket_catalog(rust_mongo: Any, mongod: Any) -> None:
     """mongod 8.2.11's `serverStatus` has a `bucketCatalog` section once a
     time-series collection has been written to: the buckets it holds open,
