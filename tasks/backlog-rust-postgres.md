@@ -2536,25 +2536,6 @@ Measured on a private PostgreSQL 15.19 cluster with `fe(a int, b text)`.
       Verify: tests/backlog/test_rp_found_rp500.py::test_create_view_analyses_without_evaluating
       Backlog-ID: RP-968
 
-## Found while working RP-510 (2026-11-11)
-
-Measured on PostgreSQL 15.19.
-
-- [ ] **A malformed multirange literal's 22P02 has no DETAIL, and a bad
-      member is reported as a range literal.** PostgreSQL 15.19's
-      `multirange_in` walks the literal itself and explains each failure:
-      `select '{[1,2}'::int4multirange` and `'{[1,2)'` have DETAIL
-      `Unexpected end of input.`, `'[1,2)'` `Missing left brace.`, `'{[1,2)}
-      x'` `Junk after closing right brace.`, and `'{[1,2),x}'` is
-      `malformed multirange literal: "{[1,2),x}"` with `Expected range
-      start.`. Here the first four have no DETAIL, and the last is
-      `malformed range literal: "x"` with the range parser's DETAIL: the
-      literal is split into members first (`split_members`) and each member
-      parsed as a range, where PostgreSQL's state machine reads the members
-      in place.
-      Verify: tests/backlog/test_rp_found_rp510.py::test_multirange_literal_detail
-      Backlog-ID: RP-878
-
 ## Found while working RP-316 (2026-11-02)
 
 - [ ] **Every CREATE VIEW takes over a second.** Each one rebuilds
