@@ -8,8 +8,9 @@ SecantusDB is a **surrogate single-node database**. It speaks real wire protocol
 
 **Four servers, two wire protocols, one storage format.** The Rust pair is the
 product. **The Python pair is FULLY DEPRECATED** (Joe, 2026-10-14: "We are
-focussed on rust servers only"; 2026-10-20: stop publishing to PyPI, and take
-the Python servers out of CI and the release process).
+focussed on rust servers only"; 2026-10-20: stop publishing them to PyPI, and
+take the Python servers out of CI and the release process; 2026-11-16: PyPI
+carries the Rust servers instead).
 
 **What fully deprecated means here:**
 - **All new work goes to the Rust servers.** Do not add features, operators,
@@ -18,7 +19,8 @@ the Python servers out of CI and the release process).
 - **The Python servers are not the reference for anything.** The exemplar
   was always the real product (`mongod`, PostgreSQL; see "Design
   constraints"); the Python code remains readable prior art, nothing more.
-- **Nothing publishes them, and CI does not test them** (2026-10-20). A
+- **Nothing publishes them, and CI does not test them** (2026-10-20); the
+  PyPI wheel carries only the Rust servers. A
   Python-server test a change breaks is not your problem to fix. pytest stays
   the test runner, including for the Rust servers' Python test files.
 - **Do not delete the `secantus` package.** Every Rust job builds WiredTiger
@@ -56,12 +58,19 @@ proven in ONE direction and never concurrently (measured 2026-09-18, pinned in
 
 The import package is `secantus`; the public Python class is `SecantusDBServer`.
 
-**Distribution: crates and tagged binaries only; nothing goes to PyPI**
-(2026-10-20): the `secantus-mdb` crate (`secantusd-rs`, `secantus_mdb::Server`)
+**Distribution: crates, tagged binaries, and one PyPI wheel of both Rust
+servers.** The `secantus-mdb` crate (`secantusd-rs`, `secantus_mdb::Server`)
 plus `secantusdb-v*` binaries, and the `secantus-pg` crate plus `secantusd-pg-v*`
-binaries. The embedded Python `RustServer` / `PgServer` handles are a
-SOURCE-BUILD tool for this repo's tests -- never document them to users as
-something `pip install` provides.
+binaries. Since 2026-11-16 (Joe) the `SecantusDB` project on PyPI is back,
+with different contents: `publish-pypi.yml` repackages the released
+`secantusd-rs` and the newest released `secantusd-pg` into one
+`py3-none` wheel per platform (Linux x86_64, macOS arm64), versioned as the
+MongoDB server (`0.5.3-beta.196` -> `0.5.3b196`), with the `secantusdb`
+launcher (`MongoServer` / `PostgresServer`; `packaging/pypi/`). It runs
+after every `secantusdb-v*` release; nothing is compiled in it. The wheel
+carries **no Python server**, and no other PyPI project exists. The
+embedded `RustServer` / `PgServer` handles remain a SOURCE-BUILD tool for
+this repo's tests -- never document them as something `pip install` provides.
 
 Internal references to `fongo` or `fongodb` (earlier names, dropped to avoid brand clashes) are stale -- flag and rename to `secantus` (or `SecantusDB` for the brand form).
 
@@ -266,8 +275,8 @@ engines.
   extra uncollects ~1,700 parity tests while still exiting 0 (`batch-worktree`).
 - To run a single test serially: `uv run python -m pytest -n0 tests/path::test_name`. The `-p no:xdist` form fails because `addopts` still injects `-n auto`.
 - Sphinx docs in `docs/` (Markdown via `myst-parser`, furo theme). Built with `-W` (warnings-as-errors). `invoke docs` to build, `invoke docs-serve` to preview.
-- Never run `uv publish` / `twine upload` or push a `vX.Y.Z` tag (see
-  Distribution, above).
+- Never run `uv publish` / `twine upload` or push a `vX.Y.Z` tag: the PyPI
+  wheel publishes only from `publish-pypi.yml` (see Distribution, above).
 - The on-disk repo path is `/Users/jdrumgoole/GIT/SecantusDB`. The **import package** is `secantus` (`src/secantus/`, `import secantus`); the distribution name in `pyproject.toml` is `SecantusDB`.
 
 ## Releases and website

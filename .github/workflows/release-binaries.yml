@@ -14,11 +14,11 @@
 #     links it via `SECANTUS_WT_INCLUDE` / `SECANTUS_WT_LIB`. Reusing that path
 #     (rather than a bespoke WT build) keeps the cmake/*.py patches in force.
 #
-# TAG SCHEME — deliberately distinct from the PyPI publish trigger:
-#   publish.yml fires on `vX.Y.Z` / `vX.Y.ZbN` (the Python package). The Rust
-#   server versions independently (`crates/*/Cargo.toml`, e.g. `0.5.3-beta.21`),
-#   so its binary releases tag as `secantusdb-v<crate-version>` — which does NOT
-#   match publish.yml's `v[0-9]+...` patterns, so the two never collide.
+# TAG SCHEME: the Rust server versions from `crates/*/Cargo.toml` (e.g.
+#   `0.5.3-beta.21`), so its binary releases tag as `secantusdb-v<crate-version>`.
+#   (The retired Python package's `vX.Y.Z` tags are a separate namespace.) When
+#   this workflow succeeds on a tag, publish-pypi.yml repackages its archives
+#   into the PyPI wheel.
 #     git tag secantusdb-v0.5.3-beta.21 && git push origin secantusdb-v0.5.3-beta.21
 #
 # SCOPE: the three targets CI already builds + smokes (x86_64 glibc Linux, arm64

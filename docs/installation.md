@@ -1,54 +1,48 @@
 # Installation
 
-SecantusDB requires **Python 3.10** or newer.
-
 ```bash
 pip install SecantusDB
 ```
 
-Pre-built wheels are published for CPython **3.10**, **3.11**, **3.12**, and **3.13** on:
+The wheel carries the two Rust servers as prebuilt binaries and a small
+Python launcher. It needs Python 3.10 or newer and is published for:
 
+- Linux x86_64 (glibc; the wheel tag names the minimum glibc version)
 - macOS arm64 (Apple Silicon)
-- Linux x86_64 and aarch64 (manylinux2014 / glibc, and musllinux_1_2 / Alpine)
-- Windows AMD64
 
-WiredTiger is vendored inside the wheel — no separate package, no compile
-step, no system build tools required.
+| command | server |
+| --- | --- |
+| `secantusd-rs` | MongoDB wire |
+| `secantusd-pg` | PostgreSQL wire (beta) |
 
-macOS Intel (x86_64) is not in the wheel matrix; macOS Intel users fall
-back to the [from-source path below](#building-from-source).
-
-## PyPI name vs import name
-
-The PyPI distribution is `SecantusDB`. The Python import is `secantus`:
+Both commands go on your `PATH`. From Python, the `secantusdb` package
+starts either server on a free port with a temporary data directory:
 
 ```python
-from secantus import SecantusDBServer       # import name: secantus
+from secantusdb import MongoServer, PostgresServer
+
+with MongoServer() as mongo:        # mongo.uri  -> pymongo.MongoClient(...)
+    ...
+with PostgresServer() as pg:        # pg.dsn     -> psycopg.connect(...)
+    ...
 ```
 
-This split is normal Python convention — `pip install Pillow` /
-`import PIL`, `pip install scikit-learn` / `import sklearn`. PyPI is
-case-insensitive on lookup so `pip install secantusdb` works too.
+Pass `storage_path=` to keep the data after the server stops, and `port=` to
+choose the port. The wheel's version is the MongoDB server's; the PostgreSQL
+server in it is the newest `secantusd-pg` release when the wheel was built
+(`secantusd-pg --version` prints it).
 
-(building-from-source)=
-## Building from source (unsupported platforms only)
+The wheel does not carry the deprecated Python servers.
 
-If your platform isn't in the wheel matrix, `pip install SecantusDB`
-falls back to the sdist and compiles WiredTiger from source. That needs
-three native build tools on `PATH`:
+## Other platforms
 
-- **`cmake`** (>= 3.21)
-- **`ninja`**
-- **`swig`** (>= 4.0)
-
-| Platform | Install prerequisites |
-|---|---|
-| macOS (Homebrew) | `brew install cmake ninja swig` |
-| Debian / Ubuntu | `sudo apt-get install -y cmake ninja-build swig` |
-| Fedora / RHEL | `sudo dnf install -y cmake ninja-build swig` |
-| Alpine | `apk add --no-cache cmake ninja swig build-base` |
-
-Then `pip install SecantusDB` triggers the build.
+There is no sdist: on a platform the wheel does not cover, install the
+servers from crates.io (`cargo install secantus-mdb --version <v>`,
+`cargo install secantus-pg --version <v>`; each needs a Rust toolchain and
+builds WiredTiger as part of the crate), or unpack a standalone archive from
+the `secantusdb-v*` / `secantusd-pg-v*` tags on
+[GitHub Releases](https://github.com/jdrumgoole/SecantusDB/releases)
+(`secantusd-rs` is also built for Windows x86_64).
 
 ## Development install
 

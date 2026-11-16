@@ -1,0 +1,166 @@
+name: Publish to PyPI
+
+# The SecantusDB PyPI wheel: both Rust servers, prebuilt, for Linux x86_64 and
+# macOS arm64. Nothing is compiled here. The wheel repackages the archives the
+# two binary-release workflows already built, smoke-tested and attached to
+# their GitHub Releases (packaging/pypi/build_wheels.py):
+#
+#   secantusd-rs  from the secantusdb-v* release that triggered this run
+#   secantusd-pg  from the newest secantusd-pg-v* release
+#
+# The wheel's version is the MongoDB server's (0.5.3-beta.196 -> 0.5.3b196).
+#
+# Triggered when "Release secantusdb binary" finishes on a secantusdb-v* tag.
+# A release made with GITHUB_TOKEN fires no `release` event, which is why this
+# listens for the workflow run instead. workflow_dispatch rebuilds a given tag,
+# and publishes only when asked.
+
+on:
+  workflow_run:
+    workflows: ["Release secantusdb binary"]
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "secantusdb-v* tag whose release to package"
+        required: true
+      publish:
+        description: "Upload to PyPI (otherwise build and smoke-test only)"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: publish-pypi-${{ github.event.inputs.tag || github.event.workflow_run.head_branch }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    # A workflow_run fires for every finished run, failed and dispatched ones
+    # included: package only a successful run on a pushed secantusdb-v* tag.
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.workflow_run.conclusion == 'success' &&
+       github.event.workflow_run.event == 'push' &&
+       startsWith(github.event.workflow_run.head_branch, 'secantusdb-v'))
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.resolve.outputs.version }}
+    steps:
+      - name: Resolve the two releases
+        id: resolve
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event.inputs.tag || github.event.workflow_run.head_branch }}
+        run: |
+          set -euo pipefail
+          case "$TAG" in
+            secantusdb-v*) ;;
+            *) echo "::error::$TAG is not a secantusdb-v* tag"; exit 1 ;;
+          esac
+          pg_tag=$(gh release list -R "$GITHUB_REPOSITORY" --exclude-drafts --limit 100 \
+            --json tagName,createdAt \
+            --jq '[.[] | select(.tagName | startswith("secantusd-pg-v"))] | sort_by(.createdAt) | last | .tagName')
+          if [ -z "$pg_tag" ] || [ "$pg_tag" = "null" ]; then
+            echo "::error::no secantusd-pg-v* release to bundle"; exit 1
+          fi
+          {
+            echo "tag=$TAG"
+            echo "mongodb_version=${TAG#secantusdb-v}"
+            echo "pg_tag=$pg_tag"
+            echo "postgres_version=${pg_tag#secantusd-pg-v}"
+          } >> "$GITHUB_OUTPUT"
+          echo "MongoDB server $TAG, PostgreSQL server $pg_tag"
+
+      # The checkout supplies the wheel builder, the launcher and the licence
+      # files, all at the MongoDB release's own tag.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          ref: ${{ steps.resolve.outputs.tag }}
+          persist-credentials: false
+
+      - name: Download the release archives
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir -p assets
+          for target in x86_64-unknown-linux-gnu aarch64-apple-darwin; do
+            gh release download "${{ steps.resolve.outputs.tag }}" -R "$GITHUB_REPOSITORY" -D assets \
+              -p "secantusdb-*-$target.tar.gz" -p "secantusdb-*-$target.tar.gz.sha256"
+            gh release download "${{ steps.resolve.outputs.pg_tag }}" -R "$GITHUB_REPOSITORY" -D assets \
+              -p "secantusd-pg-*-$target.tar.gz" -p "secantusd-pg-*-$target.tar.gz.sha256"
+          done
+          ls -l assets
+
+      - name: Build the wheels
+        id: wheel
+        run: |
+          set -euo pipefail
+          python3 packaging/pypi/build_wheels.py --assets assets --out dist \
+            --mongodb-version "${{ steps.resolve.outputs.mongodb_version }}" \
+            --postgres-version "${{ steps.resolve.outputs.postgres_version }}"
+          echo "version=$(python3 -c 'import sys; sys.path.insert(0, "packaging/pypi"); import build_wheels; print(build_wheels.pep440(sys.argv[1]))' "${{ steps.resolve.outputs.mongodb_version }}")" >> "$GITHUB_OUTPUT"
+          ls -l dist
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: pypi-wheels
+          path: dist/*.whl
+          if-no-files-found: error
+
+  smoke:
+    needs: build
+    name: smoke ${{ matrix.platform }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            platform: manylinux
+          - os: macos-15
+            platform: macosx
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          sparse-checkout: packaging/pypi
+          persist-credentials: false
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
+        with:
+          name: pypi-wheels
+          path: dist
+      - name: Install uv
+        uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78  # v7.6.0
+      - name: Install the wheel into a clean venv and start both servers
+        run: |
+          set -euo pipefail
+          uv venv --python 3.12 venv
+          uv pip install --python venv/bin/python dist/*-${{ matrix.platform }}*.whl pymongo "psycopg[binary]"
+          # From outside the checkout, so the installed package is what imports.
+          cd "$RUNNER_TEMP" && "$GITHUB_WORKSPACE/venv/bin/python" -I "$GITHUB_WORKSPACE/packaging/pypi/smoke_test.py"
+
+  # PyPI trusted publisher: bound on the PyPI side to this repository, this
+  # workflow file (publish-pypi.yml) and the `pypi` environment. Renaming any
+  # of the three needs the binding redone on pypi.org.
+  publish:
+    needs: [build, smoke]
+    if: github.event_name == 'workflow_run' || github.event.inputs.publish == 'true'
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/project/SecantusDB/${{ needs.build.outputs.version }}/
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
+        with:
+          name: pypi-wheels
+          path: dist
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33  # release/v1
+        with:
+          packages-dir: dist/
+          attestations: true
