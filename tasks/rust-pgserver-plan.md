@@ -1831,7 +1831,7 @@ because §5 called it the one constraint that is silent data loss if wrong:
 1. **Acknowledged writes did not survive SIGTERM.** The first cut had no signal
    handler, so the process died with no WiredTiger checkpoint: after
    CREATE TABLE + INSERT the client had been told both succeeded, and reopening
-   the store found the catalog document *and* the rows gone. `secantusd-rs`
+   the store found the catalog document *and* the rows gone. `secantusd-mdb`
    already installs a SIGINT/SIGTERM handler for exactly this reason; `-pg` now
    does too, with a named regression test.
 2. **A duplicate key leaked the MongoDB persona.** Storage answers

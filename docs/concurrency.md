@@ -140,7 +140,7 @@ body[data-theme="dark"] .dviz-wrap {
 
 (The async-stack column is the opt-in async-oplog + non-logged-oplog
 configuration, mitigations 5–6 below — first-class options since Phase C:
-`RustServer(oplog_async=True, oplog_nonlogged=True)`, or `secantusd-rs
+`RustServer(oplog_async=True, oplog_nonlogged=True)`, or `secantusd-mdb
 --oplog-async --oplog-nonlogged`, or the `SECANTUS_OPLOG_ASYNC=1` +
 `SECANTUS_OPLOG_NONLOGGED=1` env vars. Scaling in the chart is relative
 to each series' own single-writer rate.)
@@ -277,7 +277,7 @@ SecantusDB, the levers are:
    doesn't wait for the server's ack. Throughput climbs on the
    client side; server-side cost is unchanged.
 5. **Async oplog (Rust server, opt-in).** `RustServer(oplog_async=True)`,
-   `secantusd-rs --oplog-async` (or `[storage] oplog_async = true` in
+   `secantusd-mdb --oplog-async` (or `[storage] oplog_async = true` in
    `secantusd.toml`), or `SECANTUS_OPLOG_ASYNC=1` — the option wins over
    the env var for that store. Moves oplog writes off the writer's
    critical path onto a background drainer — ~1.6× multi-writer write
@@ -298,7 +298,7 @@ SecantusDB, the levers are:
    eight writers, so read the async column as slightly optimistic
    until the next release re-baseline.)
 6. **Non-logged oplog tables (Rust server, opt-in).**
-   `RustServer(oplog_nonlogged=True)`, `secantusd-rs --oplog-nonlogged`
+   `RustServer(oplog_nonlogged=True)`, `secantusd-mdb --oplog-nonlogged`
    (or the TOML key), or `SECANTUS_OPLOG_NONLOGGED=1` — applied at first
    open of a fresh store (the table config is create-time-sticky) — to
    create the oplog + pre-image tables with WAL logging disabled: the

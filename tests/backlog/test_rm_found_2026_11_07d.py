@@ -3,7 +3,7 @@
 tests its filter against each document twice.
 
 The reference is mongod, asked live (`mongod_rs`, a one-member replica set);
-the Rust server is `secantusd-rs` (`rust_mongo`).
+the Rust server is `secantusd-mdb` (`rust_mongo`).
 """
 
 from __future__ import annotations

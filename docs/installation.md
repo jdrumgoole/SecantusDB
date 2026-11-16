@@ -12,7 +12,7 @@ Python launcher. It needs Python 3.10 or newer and is published for:
 
 | command | server |
 | --- | --- |
-| `secantusd-rs` | MongoDB wire |
+| `secantusd-mdb` | MongoDB wire |
 | `secantusd-pg` | PostgreSQL wire (beta) |
 
 Both commands go on your `PATH`. From Python, the `secantusdb` package
@@ -42,7 +42,7 @@ servers from crates.io (`cargo install secantus-mdb --version <v>`,
 builds WiredTiger as part of the crate), or unpack a standalone archive from
 the `secantusdb-v*` / `secantusd-pg-v*` tags on
 [GitHub Releases](https://github.com/jdrumgoole/SecantusDB/releases)
-(`secantusd-rs` is also built for Windows x86_64).
+(`secantusd-mdb` is also built for Windows x86_64).
 
 ## Development install
 

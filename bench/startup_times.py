@@ -6,7 +6,7 @@ on-disk WiredTiger data directory:
 
 - **mongod**            — real MongoDB, run as a standalone ``mongod``.
 - **SecantusDB (py)**   — the pure-Python server (``python -m secantus``).
-- **SecantusDB (rust)** — the pure-Rust server: the compiled ``secantusd-rs``
+- **SecantusDB (rust)** — the pure-Rust server: the compiled ``secantusd-mdb``
   binary from ``crates/secantusdb`` (no libpython, no Python interpreter in
   the process). The ``.venv/bin/secantusd-py`` console-script is NOT used — it
   is a Python wrapper that launches the Python server.
@@ -86,7 +86,7 @@ def _is_native_binary(path: Path) -> bool:
 
 
 def _rust_binary() -> str | None:
-    """Locate the pure-Rust standalone ``secantusd-rs`` binary (no libpython).
+    """Locate the pure-Rust standalone ``secantusd-mdb`` binary (no libpython).
 
     Prefers a release build, falls back to the debug build. Override with
     the ``SECANTUSDB_BIN`` environment variable. The ``.venv/bin/secantusd-py``
@@ -98,9 +98,9 @@ def _rust_binary() -> str | None:
         return override if _is_native_binary(Path(override)) else None
 
     candidates = [
-        REPO_ROOT / "crates" / "secantusdb" / "target" / "release" / "secantusd-rs",
-        *sorted(REPO_ROOT.glob("build/*/secantusdb-target/release/secantusd-rs")),
-        REPO_ROOT / "crates" / "secantusdb" / "target" / "debug" / "secantusd-rs",
+        REPO_ROOT / "crates" / "secantusdb" / "target" / "release" / "secantusd-mdb",
+        *sorted(REPO_ROOT.glob("build/*/secantusdb-target/release/secantusd-mdb")),
+        REPO_ROOT / "crates" / "secantusdb" / "target" / "debug" / "secantusd-mdb",
     ]
     for candidate in candidates:
         if candidate.exists() and _is_native_binary(candidate):

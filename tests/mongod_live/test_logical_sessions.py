@@ -45,7 +45,7 @@ _PARAMETERS = (
 
 @contextlib.contextmanager
 def _rust(parameters: tuple[str, ...], extra: tuple[str, ...] = ()) -> Iterator[Any]:
-    """A `secantusd-rs` with test commands on, started with `parameters`
+    """A `secantusd-mdb` with test commands on, started with `parameters`
     (and the further arguments `extra`)."""
     assert RS_BINARY.exists(), f"{RS_BINARY} is not built (./inv rust-binary-build)"
     store = tempfile.mkdtemp(prefix="live-sessions-")
@@ -62,7 +62,7 @@ def _rust(parameters: tuple[str, ...], extra: tuple[str, ...] = ()) -> Iterator[
             m = _RS_BANNER.search(line)
             if m or not line:
                 break
-        assert m, f"secantusd-rs did not start: {line!r}"
+        assert m, f"secantusd-mdb did not start: {line!r}"
         drain_output(proc)
         client = pymongo.MongoClient(
             host=m.group(1), port=int(m.group(2)), serverSelectionTimeoutMS=20_000

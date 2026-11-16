@@ -4,7 +4,7 @@
 data whatever T said, and a `start_session(snapshot=True)` session saw other
 clients' writes between its reads: a silent wrong answer. The server now
 reads at T from WiredTiger's history, as mongod does. That history needs
-mongod's storage split, so `secantusd-rs` now creates its stores that way:
+mongod's storage split, so `secantusd-mdb` now creates its stores that way:
 the oplog written to the WiredTiger log, the data tables not, every write
 stamped with its oplog timestamp, and the data recovered after a crash by
 replaying the oplog from the last stable checkpoint.
@@ -32,7 +32,7 @@ replaying the oplog from the last stable checkpoint.
 
 #### Changed
 
-- `secantusd-rs`, the embedded `secantus_mdb::Server` and the `RustServer`
+- `secantusd-mdb`, the embedded `secantus_mdb::Server` and the `RustServer`
   test handle create new stores with data tables that are not logged (the
   `--data-nonlogged` mode, now the default); `--data-logged` creates them
   logged. An existing store keeps the mode it was created with. A store

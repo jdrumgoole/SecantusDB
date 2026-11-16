@@ -28,7 +28,7 @@ fixed first and the Rust side still had all four.
     PROBE_MONGOD="mongodb://127.0.0.1:27041" uv run python tools/probes/index_result_sets.py
 
     # Rust server
-    crates/secantusdb/target/debug/secantusd-rs --port 27055 --storage-path /tmp/rs &
+    crates/secantusdb/target/debug/secantusd-mdb --port 27055 --storage-path /tmp/rs &
     PROBE_SERVER="mongodb://127.0.0.1:27055" \
       PROBE_MONGOD="mongodb://127.0.0.1:27041" \
       uv run python tools/probes/index_result_sets.py

@@ -2711,7 +2711,7 @@ def test_replset_step_down_against_rust_server(tmp_path) -> None:
     """The whole observable of a single-node replica set's step-down.
 
     The embedded handle defaults to a STANDALONE (`replica_set_name=None`),
-    unlike the `secantusd-rs` binary which advertises `secantus`. A standalone
+    unlike the `secantusd-mdb` binary which advertises `secantus`. A standalone
     correctly answers 76 `NoReplicationEnabled` here, so every step-down test
     has to ask for the replica-set persona explicitly.
 

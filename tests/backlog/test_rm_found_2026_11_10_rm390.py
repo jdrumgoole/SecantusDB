@@ -10,7 +10,7 @@ RecordIds of an index, read for a clustered collection, still come whole
 before the first write.
 
 The reference is mongod 8.2.11, asked live (`mongod_rs`, a one-member
-replica set); the Rust server is `secantusd-rs` (`rust_mongo`).
+replica set); the Rust server is `secantusd-mdb` (`rust_mongo`).
 """
 
 from __future__ import annotations

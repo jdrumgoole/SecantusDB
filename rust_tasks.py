@@ -303,7 +303,7 @@ def _storage_engine_build_env() -> dict[str, str]:
 
     Extends ``_rust_env`` (WiredTiger + libclang, plus the MSVC env on Windows)
     with the CMake flag that bundles the Rust storage engine, embedded server and
-    ``secantusd-rs`` binary. On Windows it also puts ``swig`` + ``ninja`` on
+    ``secantusd-mdb`` binary. On Windows it also puts ``swig`` + ``ninja`` on
     ``PATH``: the inner WiredTiger ExternalProject uses the Ninja generator with
     ``ENABLE_PYTHON=ON`` (→ SWIG), and both are resolved from the ambient PATH —
     without ninja there, scikit-build-core falls back to the MSBuild generator and
@@ -380,7 +380,7 @@ def _build_wiredtiger(*, force: bool = False) -> pathlib.Path:
 
     A lean, no-SWIG build (``ENABLE_PYTHON=OFF``) straight from
     ``vendor/wiredtiger`` into ``_RUST_WT_BUILD_DIR`` — enough for the standalone
-    ``secantusd-rs`` binary, unlike the wheel's ``CMakeLists.txt`` path which also
+    ``secantusd-mdb`` binary, unlike the wheel's ``CMakeLists.txt`` path which also
     builds WT's Python bindings (and so needs SWIG). CMake writes only to the
     binary dir, so the submodule stays clean. Idempotent: returns immediately if
     the lib + generated header already exist (pass ``force=True`` to rebuild).
@@ -815,7 +815,7 @@ def rust_binary_build(c: Context, release: bool = False) -> None:
     c.run(f"cd {_RUST_BINARY_DIR} && cargo build{flag}", pty=os.name != "nt", env=_rust_env(wt))
     sub = "release" if release else "debug"
     ext = ".exe" if os.name == "nt" else ""
-    print(f"binary: {_RUST_BINARY_DIR}/target/{sub}/secantusd-rs{ext}")
+    print(f"binary: {_RUST_BINARY_DIR}/target/{sub}/secantusd-mdb{ext}")
 
 
 @task(name="rust-mdb-coverage")
@@ -875,7 +875,7 @@ def rust_wheel_build(c: Context, out: str = "dist-storage") -> None:
 
     The ``SECANTUS_BUILD_STORAGE_ENGINE=ON`` wheel build (cross-platform): the
     produced wheel ships ``_secantus_storage``, the embedded ``_secantus_server``
-    and the ``secantusd-rs`` binary alongside WiredTiger's Python bindings — the
+    and the ``secantusd-mdb`` binary alongside WiredTiger's Python bindings — the
     same artifact the ``storage-engine`` CI job builds. Unlike ``rust-server-build``
     (which installs editable into the project venv), this emits a distributable
     ``.whl`` into ``--out`` (default ``dist-storage/``).
@@ -1153,7 +1153,7 @@ def rust_repro(c: Context, script: str, release: bool = True) -> None:
     flag = " --release" if release else ""
     wt = _build_wiredtiger()
     c.run(f"cd {_RUST_BINARY_DIR} && cargo build{flag}", pty=PTY, env=_rust_env(wt))
-    binpath = f"{_RUST_BINARY_DIR}/target/{sub}/secantusd-rs"
+    binpath = f"{_RUST_BINARY_DIR}/target/{sub}/secantusd-mdb"
     c.run(f"uv run python {shlex.quote(script)} --binary {binpath}", pty=PTY, env=_rust_env(wt))
 
 

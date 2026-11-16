@@ -1,6 +1,6 @@
 ### Rust MongoDB server: `getCmdLineOpts` reports the command line
 
-`secantusd-rs` now answers `getCmdLineOpts` as mongod 8.2 does: `argv` is the
+`secantusd-mdb` now answers `getCmdLineOpts` as mongod 8.2 does: `argv` is the
 command line the process was started with, and `parsed` holds each option it
 was given under its mongod configuration-file path (`--port 27031
 --storage-path D` is `{net: {port: 27031}, storage: {dbPath: D}}`). The same

@@ -31,7 +31,7 @@
 # libwiredtiger.a". That was true of the *filename*, not the capability: MSVC
 # emits `wiredtiger.lib`, and `secantus-wt/build.rs` searches for that name too,
 # so `storage-engine (windows-latest)` has been linking the static lib and
-# building `secantusd-rs.exe` on every push. The note outlived its cause. Two
+# building `secantusd-mdb.exe` on every push. The note outlived its cause. Two
 # things this target does differently: no PGO yet, and `+crt-static` to match
 # WT's static CRT (see the matrix entry).
 
@@ -297,7 +297,7 @@ jobs:
           manifest=crates/secantusdb/Cargo.toml
           exe=""
           [ "${{ matrix.os }}" = "windows" ] && exe=".exe"
-          bin="crates/secantusdb/target/$target/release/secantusd-rs$exe"
+          bin="crates/secantusdb/target/$target/release/secantusd-mdb$exe"
           profraw="$PWD/pgo-raw"; rm -rf "$profraw"; mkdir -p "$profraw"
 
           if [ "${{ matrix.no_pgo }}" = "true" ]; then
@@ -457,11 +457,11 @@ jobs:
           set -euo pipefail
           stem="secantusdb-${VERSION}-${{ matrix.target }}"
           mkdir -p "$stem"
-          # Ship the binary as `secantusd-rs`, matching the command name the
+          # Ship the binary as `secantusd-mdb`, matching the command name the
           # wheel installs (the pure-Python `secantusd-py` is a different program).
           exe=""
           [ "${{ matrix.os }}" = "windows" ] && exe=".exe"
-          cp "$BIN" "$stem/secantusd-rs$exe"
+          cp "$BIN" "$stem/secantusd-mdb$exe"
           cp LICENSE README.md "$stem/"
           # ICU 57.1 is linked in (crates/secantus-icu); its licence asks
           # for its notice to travel with the binary.

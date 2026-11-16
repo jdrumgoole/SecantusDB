@@ -6,7 +6,7 @@ the things compared (the Rust server refused every `createUser` on a fresh
 `--auth` store until 2026-09-30, so it could never be given a user):
 
     mongod --auth --port 27042 --dbpath <empty> &
-    secantusd-rs --auth --port 27059 --storage-path <empty> &
+    secantusd-mdb --auth --port 27059 --storage-path <empty> &
     PROBE_MONGOD_AUTH="mongodb://127.0.0.1:27042/?directConnection=true" \\
     PROBE_SERVER_AUTH="mongodb://127.0.0.1:27059/?directConnection=true" \\
         python tools/probes/scram_auth.py

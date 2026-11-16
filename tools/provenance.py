@@ -2,7 +2,7 @@
 
 **Why this is not in `tests/conftest.py`.** It used to be. PR #1586 put a
 collection-time check there covering all four built artifacts — `_secantus_core`,
-`_secantus_server`, `secantusd-pg`, `secantusd-rs` — after nine false-regression
+`_secantus_server`, `secantusd-pg`, `secantusd-mdb` — after nine false-regression
 diagnoses in one day. That check works, and it only ever runs under pytest.
 
 The trouble is that this repo's primary bug-finding method is NOT pytest. CLAUDE.md
@@ -52,7 +52,7 @@ REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
 
 #: Rebuild commands per artifact — the official invoke tasks, verified against
 #: `rust_tasks.py` rather than guessed. An earlier draft of this table told
-#: anyone with a stale `secantusd-rs` to run `rust-server-build`, which rebuilds
+#: anyone with a stale `secantusd-mdb` to run `rust-server-build`, which rebuilds
 #: the embedded EXTENSION instead; a check that prints the wrong remedy sends
 #: people down a ten-minute detour and teaches them to distrust it.
 REBUILD_CORE_CMD = "uv run python -m invoke sync"
@@ -62,7 +62,7 @@ REBUILD_RS_CMD = "./inv rust-binary-build"
 
 #: Where each binary lands, relative to the repo root.
 PGSERVER_REL = "crates/secantus-pg/target/debug/secantusd-pg"
-RS_REL = "crates/secantusdb/target/debug/secantusd-rs"
+RS_REL = "crates/secantusdb/target/debug/secantusd-mdb"
 
 #: What a stale one has actually cost, per artifact. Carried in the failure text
 #: because an abstract warning gets waved past and a specific one does not.
@@ -248,12 +248,12 @@ def require_fresh_pgserver(binary: pathlib.Path, *, repo_root: pathlib.Path | No
 
 
 def require_fresh_rs(binary: pathlib.Path, *, repo_root: pathlib.Path | None = None) -> None:
-    """Abort when the standalone `secantusd-rs` binary is stale.
+    """Abort when the standalone `secantusd-mdb` binary is stale.
 
-    This is the one the gauges run. A stale `secantusd-rs` is how a conformance
+    This is the one the gauges run. A stale `secantusd-mdb` is how a conformance
     rate measured against a 116-commit-old tree reached the public website.
     """
-    require_fresh_binary(binary, "secantusd-rs", REBUILD_RS_CMD, repo_root=repo_root)
+    require_fresh_binary(binary, "secantusd-mdb", REBUILD_RS_CMD, repo_root=repo_root)
 
 
 def require_fresh_server_extension(module: object) -> None:

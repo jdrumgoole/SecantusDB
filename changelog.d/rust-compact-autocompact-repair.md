@@ -3,7 +3,7 @@
 `compact` used to answer `bytesFreed: 0` without doing anything, so a store
 never got back the space of deleted documents or dropped collections, and
 `autoCompact` was 59 CommandNotFound. Both now run WiredTiger's compaction, as
-mongod 8.2.11 does, and `secantusd-rs --repair` does what `mongod --repair`
+mongod 8.2.11 does, and `secantusd-mdb --repair` does what `mongod --repair`
 does: verify every table, salvage one that fails, rebuild the indexes of the
 collections it held, and exit. The Rust PostgreSQL server links the same
 storage crate and gains nothing it uses yet.
@@ -35,7 +35,7 @@ storage crate and gains nothing it uses yet.
   before the server has taken up the last one is 314 ObjectIsBusy; it answers only on
   `admin`; its twelve `background-compact` counters are in
   `serverStatus.wiredTiger` where mongod lists them.
-- `secantusd-rs --repair`: verify and salvage on a bare connection before the
+- `secantusd-mdb --repair`: verify and salvage on a bare connection before the
   store opens (with `salvage=true` when WiredTiger's metadata is damaged),
   then each collection checked against its indexes and rebuilt where a
   salvage touched it or they disagree. Exits 0, or 100 (mongod's code) when it

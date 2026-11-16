@@ -672,7 +672,7 @@ pub fn parse_startup_parameter(
     let Some((_, boolean)) = STARTUP.iter().find(|(n, _)| *n == name) else {
         if crate::serverinfo::known_params(false).contains_key(name) {
             return Err(format!(
-                "secantusd-rs does not take --setParameter '{name}' at startup"
+                "secantusd-mdb does not take --setParameter '{name}' at startup"
             ));
         }
         return Err(format!("Unknown --setParameter '{name}'"));

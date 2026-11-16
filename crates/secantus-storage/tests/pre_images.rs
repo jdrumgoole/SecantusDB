@@ -267,7 +267,7 @@ fn a_pre_image_expires_after_the_seconds_set() {
     });
 }
 
-/// A store whose data tables are not logged (how `secantusd-rs` creates
+/// A store whose data tables are not logged (how `secantusd-mdb` creates
 /// one) loses the pre-images written after its last stable checkpoint in a
 /// crash, with the rest of that data; crash recovery's replay of the oplog
 /// records them again, from each document as it was before the write, as
@@ -275,7 +275,7 @@ fn a_pre_image_expires_after_the_seconds_set() {
 #[test]
 fn crash_recovery_records_the_pre_images_it_replays() {
     const CHILD: &str = "SECANTUS_PREIMAGES_CRASH_CHILD";
-    // `secantusd-rs`'s store: unlogged data tables over a logged oplog,
+    // `secantusd-mdb`'s store: unlogged data tables over a logged oplog,
     // whatever the environment selects (`SECANTUS_OPLOG_NONLOGGED` would
     // make the oplog as forgetful as the data, leaving nothing to replay).
     let options = StorageOptions {

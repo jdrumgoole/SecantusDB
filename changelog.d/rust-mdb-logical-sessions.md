@@ -32,7 +32,7 @@ write commands already did: each op under its statement id with the
   `config.transactions` (with its `parent_lsid` index) and
   `config.image_collection` are created when a replica-set member starts, as
   mongod creates them on step-up.
-- `secantusd-rs --setParameter NAME=VALUE` for the four startup-only session
+- `secantusd-mdb --setParameter NAME=VALUE` for the four startup-only session
   parameters (`localLogicalSessionTimeoutMinutes`,
   `logicalSessionRefreshMillis`, `disableLogicalSessionCacheRefresh`,
   `TransactionRecordMinimumLifetimeMinutes`), refused as mongod refuses a bad

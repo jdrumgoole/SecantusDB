@@ -11,7 +11,7 @@ followed a clean shutdown and how long each step of the start took.
 
 #### Added
 
-- `mongod.lock` in the data directory (`secantusd-rs`, the embedded
+- `mongod.lock` in the data directory (`secantusd-mdb`, the embedded
   `secantus_mdb::Server` and the test launcher). It is taken with an
   exclusive lock before WiredTiger opens and holds the process id. It is
   emptied only after the store closes cleanly. A second server on the same

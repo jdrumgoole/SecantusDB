@@ -8,7 +8,7 @@ switching, and a client never sees a mix of the two.
   wire / dispatch / cursors / accept loop over the pure-Rust engines and a
   WiredTiger-backed store) that runs its accept loop off the GIL. It ships in
   the `SecantusDB` wheel as an embedded lifecycle handle (`RustServer`) and
-  as the standalone `secantusd-rs` binary; Python is only the launcher, never
+  as the standalone `secantusd-mdb` binary; Python is only the launcher, never
   in the request path.
 - **The Python server** — the original pure-Python `SecantusDBServer`. It is
   the readable reference: every operator, stage and error message lands here
@@ -34,7 +34,7 @@ live only in the Rust server.
 | | Rust server | Python server |
 | --- | --- | --- |
 | Package | the `secantus-mdb` crate (crates.io), or a release archive | `pip install SecantusDB` |
-| Run it as | `secantusd-rs` / `secantus_mdb::Server` | `SecantusDBServer` / `secantusd-py` |
+| Run it as | `secantusd-mdb` / `secantus_mdb::Server` | `SecantusDBServer` / `secantusd-py` |
 | Conformance | **99.5%** of pymongo's own suite | see the [validation report](validation-report.md) |
 | Speed | within 1.0×–3.2× of `mongod` per operation | 2×–27× |
 | Request path | pure Rust (off the GIL) | pure Python |
@@ -59,7 +59,7 @@ they diverged at `0.5.2` and advance independently:
   in `pyproject.toml` / `secantus.__version__`.
 - **Rust server** — `0.5.3-beta.N` (SemVer pre-release), carried in lockstep
   across the `crates/*` workspace and surfaced over the wire as
-  `buildInfo.secantusVersion`, by the `secantusd-rs --version` flag, and by
+  `buildInfo.secantusVersion`, by the `secantusd-mdb --version` flag, and by
   the embedded handle's `RustServer.version`.
 
 A change that touches only one server bumps only that server's version.
@@ -89,19 +89,19 @@ See [Quickstart](quickstart.md) and [Installation](installation.md).
 
 The Rust server ships as the `secantus-mdb` crate on crates.io, not in the
 Python wheel. `cargo install` builds it (WiredTiger included) and puts the
-`secantusd-rs` daemon on `PATH`:
+`secantusd-mdb` daemon on `PATH`:
 
 ```bash
 cargo install secantus-mdb --version 0.5.3-beta.196
-secantusd-rs --host 127.0.0.1 --port 27017
+secantusd-mdb --host 127.0.0.1 --port 27017
 ```
 
 From a Rust test, the same crate starts the server in-process as
-`secantus_mdb::Server`. From a Python test, run `secantusd-rs` as a
+`secantus_mdb::Server`. From a Python test, run `secantusd-mdb` as a
 subprocess and point `pymongo` at it, or use the Python server, which has
 the same `pymongo` surface.
 
-Standalone `secantusd-rs` archives (no Python needed) are attached to the
+Standalone `secantusd-mdb` archives (no Python needed) are attached to the
 `secantusdb-v*` tags on
 [GitHub Releases](https://github.com/jdrumgoole/SecantusDB/releases). Both
 Mongo daemons read the same `secantusd.toml` config (see
@@ -325,7 +325,7 @@ The Rust server passes 99.5% of pymongo's suite. The remaining *feature* differe
 
 - **Point-in-time restore over the wire** — `secantusAdmin.restoreToTimestamp`
   is Python-server-only; the Rust server does the same restore via the
-  `secantusd-rs restore` CLI subcommand.
+  `secantusd-mdb restore` CLI subcommand.
 - **Session lifecycle** — `endSessions` / `refreshSessions` / `killSessions`
   are acknowledged no-ops on the Rust server; the Python server tracks
   sessions with a 30-minute idle TTL.

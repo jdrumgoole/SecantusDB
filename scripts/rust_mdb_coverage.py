@@ -5,7 +5,7 @@ Builds every crate of the server with LLVM source-based coverage
 
 - **suites**: the cargo tests of the clean workspace and of the four
   WiredTiger-linked crates, then the Python suites CI runs against the
-  ``secantusd-rs`` binary (the backlog's gap and regression tests,
+  ``secantusd-mdb`` binary (the backlog's gap and regression tests,
   ``tests/mongod_live``, the binary smoke and crash-durability tests);
 - **gauges**: the eleven driver gauges that run the binary as a daemon.
 
@@ -50,7 +50,7 @@ import time
 
 REPO = pathlib.Path(__file__).resolve().parent.parent
 
-# The crates that make up secantusd-rs. The PG server's crates, the PyO3
+# The crates that make up secantusd-mdb. The PG server's crates, the PyO3
 # bindings, the benches and the bindgen crate are not part of it.
 CRATES = (
     "secantus-auth",
@@ -365,7 +365,7 @@ def main() -> int:
     )  # the Ruby gauge needs a newer Ruby than macOS ships
     if ruby.is_dir():
         env["PATH"] = f"{ruby}{os.pathsep}{env['PATH']}"
-    binary = out / "target" / "debug" / "secantusd-rs"
+    binary = out / "target" / "debug" / "secantusd-mdb"
     runs: list[tuple[str, int, str]] = []
     log(out, f"start at {commit}, work directory {out}")
 

@@ -198,7 +198,7 @@ def test_storage_says_what_the_engine_read(tmp_path: Any) -> None:
             m = _RS_BANNER.search(line)
             if m or not line:
                 break
-        assert m, f"secantusd-rs did not start: {line!r}"
+        assert m, f"secantusd-mdb did not start: {line!r}"
         drain_output(proc)
         return proc, pymongo.MongoClient(host=m.group(1), port=int(m.group(2)))
 
@@ -1187,7 +1187,7 @@ def test_a_write_says_how_long_it_held_its_oplog_slot(rust_mongo: Any, mongod_rs
 
 @pytest.fixture(scope="module")
 def rust_mongo_async(tmp_path_factory: pytest.TempPathFactory) -> Iterator[Any]:
-    """A `secantusd-rs` of this module's own, on the asynchronous oplog.
+    """A `secantusd-mdb` of this module's own, on the asynchronous oplog.
 
     `--data-logged` as well: a store whose data tables are not logged (the
     default) stamps each write with its oplog timestamp, so it keeps the
@@ -1221,7 +1221,7 @@ def rust_mongo_async(tmp_path_factory: pytest.TempPathFactory) -> Iterator[Any]:
             m = _RS_BANNER.search(line)
             if m or not line:
                 break
-        assert m, f"secantusd-rs --oplog-async did not start: {line!r}"
+        assert m, f"secantusd-mdb --oplog-async did not start: {line!r}"
         drain_output(proc)
         client = pymongo.MongoClient(
             host=m.group(1), port=int(m.group(2)), serverSelectionTimeoutMS=10_000

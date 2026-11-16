@@ -41,7 +41,7 @@ pub const REMOTE_DIR: &str = "/opt/secantus-bench";
 /// Kept separate from [`REMOTE_DIR`]'s own `src/` checkout so a perf run and a
 /// throughput run can share a droplet without clobbering each other's build.
 pub const PERF_DIR: &str = "/opt/secantus-perf";
-pub const SERVER_BIN: &str = "/usr/local/bin/secantusd-rs";
+pub const SERVER_BIN: &str = "/usr/local/bin/secantusd-mdb";
 pub const SERVER_DATA: &str = "/var/lib/secantus-bench";
 pub const SERVICE: &str = "secantus-bench";
 pub const GITHUB_REPO: &str = "jdrumgoole/SecantusDB";

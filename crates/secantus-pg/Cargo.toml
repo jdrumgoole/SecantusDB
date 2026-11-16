@@ -2,7 +2,7 @@
 name = "secantus-pg"
 version = "0.1.0-beta.17"
 edition = "2021"
-description = "A surrogate PostgreSQL server for tests: the real PostgreSQL wire protocol and grammar (libpg_query) over WiredTiger, single-node. Embed it (secantus_pg::PgServer) or run the secantusd-pg binary."
+description = "A single-node PostgreSQL server: the real PostgreSQL wire protocol and grammar (libpg_query) over WiredTiger. Embed it (secantus_pg::PgServer) or run the secantusd-pg binary."
 # GPL in effect: it links secantus-core / -storage / -wt / -auth (GPL-2.0-only)
 # and WiredTiger (GPL v2 or v3). tasks/rust-packages-plan.md section 2.2.
 license = "GPL-2.0-only"
@@ -40,7 +40,7 @@ name = "secantus_pg"
 path = "src/lib.rs"
 
 [features]
-# mimalloc is default-on and optional, as it is for `secantusd-rs`: a build
+# mimalloc is default-on and optional, as it is for `secantusd-mdb`: a build
 # can leave it out (`--no-default-features --features bin`) to compare
 # allocators or to instrument for PGO.
 default = ["bin", "mimalloc"]

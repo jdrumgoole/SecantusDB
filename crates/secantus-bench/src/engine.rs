@@ -17,7 +17,7 @@ use crate::BenchResult;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Engine {
-    /// The SecantusDB Rust server, `secantusd-rs`.
+    /// The SecantusDB Rust server, `secantusd-mdb`.
     Secantus,
     /// A real MongoDB Community server, `mongod`.
     Mongod,
@@ -51,14 +51,14 @@ impl Engine {
     /// The process name the resource sampler tracks.
     pub fn process(self) -> &'static str {
         match self {
-            Engine::Secantus => "secantusd-rs",
+            Engine::Secantus => "secantusd-mdb",
             Engine::Mongod => "mongod",
         }
     }
 
     pub fn parse(name: &str) -> BenchResult<Engine> {
         match name {
-            "secantus" | "secantusdb" | "secantusd-rs" => Ok(Engine::Secantus),
+            "secantus" | "secantusdb" | "secantusd-mdb" => Ok(Engine::Secantus),
             "mongod" | "mongodb" => Ok(Engine::Mongod),
             other => Err(format!(
                 "unknown engine {other:?} (expected: secantus | mongod | both)"
@@ -168,7 +168,7 @@ mod tests {
 
     #[test]
     fn engine_names_and_aliases_parse() {
-        for name in ["secantus", "secantusdb", "secantusd-rs"] {
+        for name in ["secantus", "secantusdb", "secantusd-mdb"] {
             assert_eq!(Engine::parse(name).unwrap(), Engine::Secantus);
         }
         for name in ["mongod", "mongodb"] {

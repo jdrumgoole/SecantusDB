@@ -54,7 +54,7 @@ and is on its way back to ~99.6%.
 Rust server is **0 divergent of 63** against mongod 8.2.11 on `codeName` and
 `errorLabels` across 21 codes on `insert` / `commitTransaction` /
 `abortTransaction`, and `test_transactions_unified` against the standalone
-`secantusd-rs` went **10 failures -> 3** -- the three survivors being the
+`secantusd-mdb` went **10 failures -> 3** -- the three survivors being the
 secondary-read cases in §7 that cannot pass on a single node.
 
 Three things the work found that this section did not predict, all worth
@@ -119,7 +119,7 @@ Three concrete defects, all in `crates/secantus-commands`:
   the mechanism, not changing a default.
 - Proposal: on by default in the embedded test handles (`SecantusDBServer`,
   `RustServer` via Python), opt-in (default off) for the standalone daemons
-  `secantusd-rs` / `secantusd-py`.
+  `secantusd-mdb` / `secantusd-py`.
 - Cost: the non-Python driver gauges launch daemons, so every gauge task must
   pass the flag. Miss one and that gauge silently loses its failpoint coverage.
 - Counter-argument: SecantusDB is a test tool with a loopback default bind;
@@ -157,7 +157,7 @@ none, and this section had it pointing the wrong way.**
 
 ### 5. Re-run the gauges -- DONE for the RUST server, 2026-09-28
 
-Eleven gauges, all against `secantusd-rs` built from `d971ef9e`. Every row was
+Eleven gauges, all against `secantusd-mdb` built from `d971ef9e`. Every row was
 checked for truncation before being believed -- tests started versus tests that
 reported a result, and the raw artifact's mtime before and after the run.
 
@@ -225,7 +225,7 @@ artifacts, so the published panels have not moved.
   `maxTimeMS: 1`:
 
       mongod 8.2.11      -> ok: 0, code 50, MaxTimeMSExpired
-      rust secantusd-rs  -> ok: 1.0        (index fully built)
+      rust secantusd-mdb  -> ok: 1.0        (index fully built)
 
   Two lines to reproduce, so this no longer needs to be taken on trust. The
   budget is parsed and recognised — the failpoint path answers 50 correctly — and

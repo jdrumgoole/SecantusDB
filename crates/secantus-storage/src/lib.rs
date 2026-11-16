@@ -5501,7 +5501,7 @@ pub struct Storage {
     /// clean shutdown leaves the log un-truncated and reopen replays the full
     /// retained log; the checkpoint bounds recovery time and truncates the log.
     /// Resolved from the environment on open (see `resolve_durable`): production
-    /// (the `secantusd-rs` daemon) is durable; the Python test suite sets
+    /// (the `secantusd-mdb` daemon) is durable; the Python test suite sets
     /// `SECANTUS_TEST_FAST_STORAGE=1`, which turns it off so parallel workers
     /// don't serialise on the close fsync (the `SECANTUS_FORCE_DURABLE=1` CI lane
     /// forces it back on). `durable=false` is safe only for ephemeral instances
@@ -8311,7 +8311,7 @@ impl Storage {
     /// `None` falls back to the corresponding env var (or the default), so
     /// existing callers and the env-driven workflows keep working; an
     /// explicit `Some` wins over the environment. This is what the Python
-    /// `RustServer(...)` kwargs and the `secantusd-rs` flags thread through.
+    /// `RustServer(...)` kwargs and the `secantusd-mdb` flags thread through.
     pub fn open_with_options(home: &str, opts: &StorageOptions) -> Result<Storage> {
         let started = Instant::now();
         let (lock_file, lock_record) = match &opts.lock_file {

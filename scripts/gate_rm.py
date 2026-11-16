@@ -17,7 +17,7 @@ CI the same day):
 
 - the cargo lanes (``rust`` / ``rust-storage``): the clean workspace and
   each WiredTiger-linked crate, fmt + clippy + test;
-- the two server builds from HEAD: ``secantusd-rs`` and the embedded
+- the two server builds from HEAD: ``secantusd-mdb`` and the embedded
   ``_secantus_server``;
 - the ``test`` job's selection (``tools/ci_test_selection.py``), slow tests too;
 - the ``storage-engine`` job's named files, read from
@@ -55,7 +55,7 @@ WORKERS = "4"
 #: ``storage-engine`` job, the R7 one in ``mdb-binary``).
 STORAGE_ENGINE_STEPS = (
     "Storage + Rust-server smoke tests",
-    "Build + smoke the standalone secantusd-rs binary (R7)",
+    "Build + smoke the standalone secantusd-mdb binary (R7)",
 )
 
 

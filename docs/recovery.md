@@ -16,11 +16,11 @@ WiredTiger connection isn't supported — real `mongod` restores work the same w
 ## One interface, two servers
 
 SecantusDB ships as [two separate servers](servers.md) — the pure-Python
-`secantusd-py` and the standalone Rust `secantusd-rs` binary — and **both
+`secantusd-py` and the standalone Rust `secantusd-mdb` binary — and **both
 implement the full PITR surface** with the same subcommand:
 
 - the `restore` subcommand — `secantusd-py restore` (the Python console script)
-  and `secantusd-rs restore` (the Rust binary) take identical flags;
+  and `secantusd-mdb restore` (the Rust binary) take identical flags;
 - the `secantusAdmin.backupArchive`, `secantusAdmin.restoreToTimestamp`, and
   `secantusAdmin.archiveBaseSnapshot` wire commands;
 - the `--oplog-archive-dir` server flag.
@@ -113,7 +113,7 @@ wall-clock time. With neither, the whole oplog is replayed ("latest").
 ### CLI
 
 ```bash
-# Recover to a wall-clock time (use `secantusd-rs restore` for the Rust binary):
+# Recover to a wall-clock time (use `secantusd-mdb restore` for the Rust binary):
 secantusd-py restore --source /backups/db.tar.gz \
                      --target-dir /restore/at-1430 \
                      --to-time 2026-06-17T14:30:00Z
@@ -134,7 +134,7 @@ below — auto-detected). `--target-dir` must be a fresh path.
 
 ```{note}
 The `restore` subcommand is provided by **both** servers with identical flags —
-`secantusd-py restore` (Python console script) and `secantusd-rs restore` (Rust
+`secantusd-py restore` (Python console script) and `secantusd-mdb restore` (Rust
 binary). The Rust binary additionally exposes `--to-timestamp` and
 `--preserve-oplog`; the Python CLI adds `--to-time`.
 ```

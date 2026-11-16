@@ -1,7 +1,7 @@
 # Release the standalone `secantusd-pg` Rust PostgreSQL-wire server binary as
 # prebuilt, static-WiredTiger archives attached to a GitHub Release.
 #
-# The PostgreSQL-side twin of `release-binaries.yml`, which ships `secantusd-rs`.
+# The PostgreSQL-side twin of `release-binaries.yml`, which ships `secantusd-mdb`.
 # Same shape deliberately: build the vendored WiredTiger static lib through the
 # wheel path CI already proves green, link the binary against it, smoke the exact
 # artifact, then attach `tar.gz` + `.sha256` to a GitHub Release. Read that file

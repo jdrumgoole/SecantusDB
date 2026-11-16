@@ -4,7 +4,7 @@ DISTINCT_SCAN and in what order, how a `$unionWith` reads its collection,
 and what a first batch of none leaves undone.
 
 The reference is mongod 8.2.11, asked live (`mongod`); the Rust server is
-`secantusd-rs` (`rust_mongo`).
+`secantusd-mdb` (`rust_mongo`).
 """
 
 from __future__ import annotations

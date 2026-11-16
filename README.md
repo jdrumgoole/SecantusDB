@@ -25,7 +25,7 @@
 > production data here yet — production deployments that need durable
 > data across upgrades should still run a real `mongod` or `postgres`.
 
-**A surrogate single-node database for your tests.** SecantusDB speaks
+**A single-node MongoDB and PostgreSQL database.** SecantusDB speaks
 the real **MongoDB** and **PostgreSQL** wire protocols on a real TCP
 socket, over the same **WiredTiger** storage engine MongoDB ships. Point
 your existing driver at it — `pymongo`, `mongo-go-driver`, `mongosh`,
@@ -65,14 +65,14 @@ with PostgresServer() as server:
         assert conn.execute("SELECT name FROM users WHERE id = 1").fetchone() == ("Joe",)
 ```
 
-The wheel also puts `secantusd-rs` and `secantusd-pg` on your `PATH`.
+The wheel also puts `secantusd-mdb` and `secantusd-pg` on your `PATH`.
 
 **From crates.io**, built from source with a Rust toolchain:
 
 ```bash
-cargo install secantus-mdb --version 0.5.3-beta.196   # MongoDB: the `secantusd-rs` daemon
+cargo install secantus-mdb --version 0.5.3-beta.196   # MongoDB: the `secantusd-mdb` daemon
 cargo install secantus-pg --version 0.1.0-beta.17      # PostgreSQL: the `secantusd-pg` daemon
-secantusd-rs --port 27017 --storage-path ./secantus-data
+secantusd-mdb --port 27017 --storage-path ./secantus-data
 ```
 
 Both crates are pre-releases, so `cargo install` needs the `--version`:
@@ -98,7 +98,7 @@ Two wire protocols, two implementations of each, one storage format.
 
 | Server | Wire | Run it as | Role |
 | --- | --- | --- | --- |
-| **Rust MongoDB server** | MongoDB | `secantusd-rs` / `secantus_mdb::Server` | **The flagship.** The [`secantus-mdb`](https://crates.io/crates/secantus-mdb) crate; prebuilt binaries per platform |
+| **Rust MongoDB server** | MongoDB | `secantusd-mdb` / `secantus_mdb::Server` | **The flagship.** The [`secantus-mdb`](https://crates.io/crates/secantus-mdb) crate; prebuilt binaries per platform |
 | **Rust PostgreSQL server** | PostgreSQL | `secantusd-pg` | **The newest.** Prebuilt `secantusd-pg` binaries on [GitHub Releases](https://github.com/jdrumgoole/SecantusDB/releases), and the [`secantus-pg`](https://crates.io/crates/secantus-pg) crate |
 | Python MongoDB server | MongoDB | `SecantusDBServer` / `secantusd-py` | The readable reference — every operator, stage and error message lands here first |
 | Python PostgreSQL server | PostgreSQL | `SecantusPGServer` / `secantusd-py-pg` | The reference for the SQL surface, and still the most complete one |
@@ -121,7 +121,7 @@ but how they can share it depends on the pair:
   takes an exclusive file lock, so a second server pointed at a directory
   that is already open exits rather than opening it. Between the Rust
   pair the hand-over works in one direction only: a table written by
-  `secantusd-pg` reads back through `secantusd-rs` as a collection, but a
+  `secantusd-pg` reads back through `secantusd-mdb` as a collection, but a
   `pymongo`-written collection is not visible to the Rust PostgreSQL
   server until something runs `CREATE TABLE` for it.
 
@@ -210,7 +210,7 @@ for the supported-SQL matrix and examples.
 pip install SecantusDB
 ```
 
-The wheel carries the two Rust servers as prebuilt binaries, `secantusd-rs`
+The wheel carries the two Rust servers as prebuilt binaries, `secantusd-mdb`
 (MongoDB) and `secantusd-pg` (PostgreSQL, beta), plus the `secantusdb`
 Python launcher. It needs Python 3.10 or newer and is published for:
 
@@ -221,7 +221,7 @@ It does not carry the deprecated Python servers. On any other platform,
 install from crates.io: `cargo install secantus-mdb --version 0.5.3-beta.196`
 and `cargo install secantus-pg --version 0.1.0-beta.17`. Each needs a Rust
 toolchain and builds WiredTiger as part of the crate. Standalone archives of
-`secantusd-rs` (Linux x86_64, macOS arm64, Windows x86_64) and `secantusd-pg`
+`secantusd-mdb` (Linux x86_64, macOS arm64, Windows x86_64) and `secantusd-pg`
 (Linux x86_64, macOS arm64) are attached to the `secantusdb-v*` and
 `secantusd-pg-v*` tags on
 [GitHub Releases](https://github.com/jdrumgoole/SecantusDB/releases).
@@ -231,10 +231,10 @@ See [Installation](https://secantusdb.com/docs/installation.html) for dev-instal
 ## Standalone daemons (drop-in `mongod` / `postgres` replacements)
 
 Installing the wheel (`pip install SecantusDB`) or the `secantus-mdb` crate
-puts `secantusd-rs` on your `PATH` (or unpack a release archive). Run it like you'd run `mongod`:
+puts `secantusd-mdb` on your `PATH` (or unpack a release archive). Run it like you'd run `mongod`:
 
 ```bash
-secantusd-rs --host 127.0.0.1 --port 27017 --storage-path ./secantus-data
+secantusd-mdb --host 127.0.0.1 --port 27017 --storage-path ./secantus-data
 ```
 
 The Rust PostgreSQL server comes from the same wheel, the `secantus-pg` crate

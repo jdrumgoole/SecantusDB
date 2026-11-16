@@ -27,7 +27,7 @@ it is a test's server.
 
 The published `SecantusDB` wheel no longer contains the Rust server: it
 carries only the Python servers. From a Python test, either run
-`secantusd-rs` (from the `secantus-mdb` crate or a release archive) as a
+`secantusd-mdb` (from the `secantus-mdb` crate or a release archive) as a
 subprocess and point `pymongo` at it, or use the Python server's
 `SecantusDBServer`, which has the same `pymongo` surface.
 
@@ -89,7 +89,7 @@ The storage-mode kwargs default to `None` = defer to the matching
 `SECANTUS_CHECKPOINT_SECONDS`), so env-driven workflows are unchanged; an
 explicit value wins over the environment for this server only. The
 exception is `data_nonlogged`, which is on unless set to `False`, as
-`secantusd-rs` creates its stores: data tables that are not logged keep the
+`secantusd-mdb` creates its stores: data tables that are not logged keep the
 history a snapshot read at a past time (`readConcern: {level: "snapshot",
 atClusterTime: ...}`) reads, which WiredTiger keeps for no logged table. A
 store created with `data_nonlogged=False` refuses such a read (246). It

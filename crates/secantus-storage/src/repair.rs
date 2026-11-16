@@ -1,4 +1,4 @@
-//! `secantusd-rs --repair`: mongod's `--repair`, over this store's layout.
+//! `secantusd-mdb --repair`: mongod's `--repair`, over this store's layout.
 //!
 //! mongod 8.2.11 `--repair` (measured 2026-10-26) opens the store, and for
 //! each table runs WiredTiger's `verify`; a table that fails it is salvaged

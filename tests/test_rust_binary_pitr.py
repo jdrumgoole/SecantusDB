@@ -69,7 +69,7 @@ def _binary_path() -> pathlib.Path | None:
     # restore is pathologically slow under the full parallel suite (~4x slower),
     # which can blow even a generous subprocess timeout. Fall back to debug.
     for profile in ("release", "debug"):
-        p = _REPO_ROOT / "crates" / "secantusdb" / "target" / profile / "secantusd-rs"
+        p = _REPO_ROOT / "crates" / "secantusdb" / "target" / profile / "secantusd-mdb"
         if sys.platform == "win32":
             p = p.with_suffix(".exe")
         if p.exists():
@@ -89,7 +89,7 @@ pytestmark = [
     pytest.mark.xdist_group("rust_binary_serial"),
 ]
 
-# Each test here spawns a full secantusd-rs server plus a restore subprocess. Run
+# Each test here spawns a full secantusd-mdb server plus a restore subprocess. Run
 # concurrently across xdist workers, several heavy restores contend hard enough
 # that one can blow its subprocess timeout — a contention artifact, not a real
 # restore failure (each passes in isolation). Serialize them machine-wide with an
@@ -209,7 +209,7 @@ def test_rust_binary_restore_missing_source_errors(tmp_path: pathlib.Path) -> No
     assert res.returncode != 0
 
 
-_BANNER = re.compile(r"secantusd-rs listening on (\S+):(\d+)")
+_BANNER = re.compile(r"secantusd-mdb listening on (\S+):(\d+)")
 
 
 def _read_banner_line(proc: subprocess.Popen, timeout: float = 120.0) -> str:
@@ -234,7 +234,7 @@ def _read_banner_line(proc: subprocess.Popen, timeout: float = 120.0) -> str:
     t.join(timeout)
     if "line" not in result:
         raise AssertionError(
-            f"secantusd-rs printed no banner within {timeout}s "
+            f"secantusd-mdb printed no banner within {timeout}s "
             f"(pid={proc.pid}, alive={proc.poll() is None})"
         )
     return result["line"]
@@ -258,7 +258,7 @@ def test_rust_binary_v2_archive_base_snapshot_and_restore(tmp_path: pathlib.Path
             str(archive),
             # The restore and the reads below are the Python server's, which
             # writes without timestamps: a store whose data tables are not
-            # logged (secantusd-rs's default since RM-210) refuses that.
+            # logged (secantusd-mdb's default since RM-210) refuses that.
             "--data-logged",
         ],
         stdout=subprocess.PIPE,

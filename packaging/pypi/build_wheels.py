@@ -2,7 +2,7 @@
 
 The wheel compiles nothing. It repackages the binaries the two release
 workflows already built, smoke-tested and attached to their GitHub Releases:
-``secantusd-rs`` from a ``secantusdb-v*`` release and ``secantusd-pg`` from a
+``secantusd-mdb`` from a ``secantusdb-v*`` release and ``secantusd-pg`` from a
 ``secantusd-pg-v*`` release. One wheel per platform, tagged ``py3-none``
 (the launcher is pure Python), with the platform tag read from the binaries
 themselves: the newest glibc symbol version they need (Linux), or the
@@ -97,7 +97,7 @@ def platform_tag(target: str, binaries: list[bytes]) -> str:
     return f"macosx_{major}_{minor if major < 11 else 0}_{arch}"
 
 
-def read_archive(path: Path, binary_name: str) -> bytes:
+def read_archive(path: Path, binary_name: str, legacy_name: str | None = None) -> bytes:
     """The named binary from one release archive, after checking its sha256."""
     expected_sha = path.with_name(path.name + ".sha256")
     data = path.read_bytes()
@@ -113,7 +113,7 @@ def read_archive(path: Path, binary_name: str) -> bytes:
         for member in tar.getmembers():
             if not member.isfile():
                 continue
-            if member.name.rsplit("/", 1)[-1] == binary_name:
+            if member.name.rsplit("/", 1)[-1] in (binary_name, legacy_name):
                 extracted = tar.extractfile(member)
                 assert extracted is not None
                 binary = extracted.read()
@@ -133,8 +133,7 @@ def _metadata(version: str, mongodb_version: str, postgres_version: str) -> byte
         "Metadata-Version: 2.4",
         "Name: SecantusDB",
         f"Version: {version}",
-        "Summary: Single-node MongoDB- and PostgreSQL-wire servers over WiredTiger, "
-        "for tests and CI",
+        "Summary: Single-node MongoDB- and PostgreSQL-wire database servers over WiredTiger",
         "Author-email: Joe Drumgoole <joe@joedrumgoole.com>",
         "License-Expression: GPL-2.0-only",
         "License-File: LICENSE",
@@ -168,7 +167,13 @@ def build_wheel(
     mongodb_version: str,
     postgres_version: str,
 ) -> Path:
-    mdb = read_archive(assets / f"secantusdb-{mongodb_version}-{target}.tar.gz", "secantusd-rs")
+    # Archives before 0.5.3-beta.197 named the MongoDB binary `secantusd-rs`;
+    # the wheel installs it as `secantusd-mdb` either way.
+    mdb = read_archive(
+        assets / f"secantusdb-{mongodb_version}-{target}.tar.gz",
+        "secantusd-mdb",
+        legacy_name="secantusd-rs",
+    )
     pg = read_archive(assets / f"secantusd-pg-{postgres_version}-{target}.tar.gz", "secantusd-pg")
     version = pep440(mongodb_version)
     tag = f"py3-none-{platform_tag(target, [mdb, pg])}"
@@ -178,7 +183,7 @@ def build_wheel(
     for src in sorted(PACKAGE.iterdir()):
         if src.is_file() and src.suffix in (".py", ".typed"):
             files.append((f"secantusdb/{src.name}", src.read_bytes(), False))
-    files.append(("secantusdb/bin/secantusd-rs", mdb, True))
+    files.append(("secantusdb/bin/secantusd-mdb", mdb, True))
     files.append(("secantusdb/bin/secantusd-pg", pg, True))
     # The licences come from the checkout the workflow runs from: archives
     # before 2026-10 carry no LICENSE-ICU.
@@ -197,7 +202,7 @@ def build_wheel(
     files.append((f"{dist_info}/WHEEL", wheel_file.encode(), False))
     entry_points = (
         "[console_scripts]\n"
-        "secantusd-rs = secantusdb._cli:mongodb\n"
+        "secantusd-mdb = secantusdb._cli:mongodb\n"
         "secantusd-pg = secantusdb._cli:postgres\n"
     )
     files.append((f"{dist_info}/entry_points.txt", entry_points.encode(), False))

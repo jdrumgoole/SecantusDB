@@ -2,7 +2,7 @@
 insert into a time-series bucket the TTL monitor is removing fails.
 
 The reference is mongod 8.2.11 (`mongod`); the Rust server is
-`secantusd-rs` (`rust_mongo`).
+`secantusd-mdb` (`rust_mongo`).
 """
 
 from __future__ import annotations

@@ -1,9 +1,9 @@
 # secantus-pg
 
-A **surrogate PostgreSQL server** for tests: it speaks the real PostgreSQL wire
+A **single-node PostgreSQL server**: it speaks the real PostgreSQL wire
 protocol on a real TCP socket, parses SQL with PostgreSQL's own grammar
-(libpg_query), and stores rows in WiredTiger, scoped to a single node. Point an
-application's test suite at it instead of standing up a real `postgres`.
+(libpg_query), and stores rows in WiredTiger. Any PostgreSQL driver connects
+to it as it would to `postgres`.
 
 Building it compiles WiredTiger and libpg_query from source, which needs
 **CMake, a C compiler and libclang**. The first build takes a few minutes as a

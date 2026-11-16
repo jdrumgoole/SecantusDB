@@ -1,4 +1,4 @@
-//! CLI argument parsing for the standalone `secantusd-rs` binary (R7).
+//! CLI argument parsing for the standalone `secantusd-mdb` binary (R7).
 //!
 //! Lives here — not in the bin crate — so it is WT-free and unit-testable in
 //! the clean workspace (`cargo test -p secantus-server`). The WT-linked
@@ -324,7 +324,7 @@ pub fn parse_args(args: &[String]) -> Result<Parsed, String> {
 
         match flag {
             "--help" | "-h" => return Ok(Parsed::Help(usage())),
-            "--version" => return Ok(Parsed::Version(version_text("secantusd-rs"))),
+            "--version" => return Ok(Parsed::Version(version_text("secantusd-mdb"))),
             "--config" => {
                 let v = take_value("--config")?;
                 set_option(&mut cmd_line, &["config"], v.clone().into());
@@ -354,7 +354,7 @@ pub fn parse_args(args: &[String]) -> Result<Parsed, String> {
             }
             "--log-level" => {
                 let lvl = take_value("--log-level")?;
-                validate_log_level(&lvl, "secantusd-rs").map_err(|_| {
+                validate_log_level(&lvl, "secantusd-mdb").map_err(|_| {
                     format!("--log-level must be one of DEBUG/INFO/WARNING/ERROR, got {lvl:?}")
                 })?;
                 o.log_level = Some(lvl);
@@ -487,13 +487,13 @@ pub fn parse_args(args: &[String]) -> Result<Parsed, String> {
 pub fn usage() -> String {
     format!(
         "\
-secantusd-rs {} — standalone single-node MongoDB-compatible server (Rust)
+secantusd-mdb {} — standalone single-node MongoDB-compatible server (Rust)
 
 Flags override values in secantusd.toml; secantusd.toml overrides built-in
 defaults.
 
 USAGE:
-    secantusd-rs [OPTIONS]
+    secantusd-mdb [OPTIONS]
 
 OPTIONS:
     --config PATH                Path to a secantusd.toml config file. When
@@ -856,7 +856,7 @@ mod tests {
         assert!(matches!(parse(&["--help"]).unwrap(), Parsed::Help(_)));
         assert!(matches!(parse(&["-h"]).unwrap(), Parsed::Help(_)));
         match parse(&["--version"]).unwrap() {
-            Parsed::Version(v) => assert!(v.starts_with("secantusd-rs ")),
+            Parsed::Version(v) => assert!(v.starts_with("secantusd-mdb ")),
             other => panic!("expected Version, got {other:?}"),
         }
     }

@@ -1053,7 +1053,7 @@ These are explicit non-goals. Don't add them without a reason.
       one WiredTiger table per collection (`key_format=q`) and one per
       index (KeyString keys), so no key names its namespace. Measured with
       the gap test's insert of fifty documents into `c`, with the `_id` and
-      `x` indexes (`secantusd-rs` from `rm-batch` at 6bcd8f41, mongod
+      `x` indexes (`secantusd-mdb` from `rm-batch` at 6bcd8f41, mongod
       8.2.11): a 9-character database name gives 362.8 bytes per document
       here against 311.6 on mongod. A 49-character name gives 481.4 here
       against 313.8: 40 more characters cost 118.6 bytes here (three keys
@@ -1264,7 +1264,7 @@ about forty such points; these are the ones measured.
 
 An audit of the command, expression and wire layers, each finding reproduced
 against mongod 8.2.11 (standalone, or a one-member replica set where it
-needs sessions) with a `secantusd-rs` built from tree `af2629ec`. The gap
+needs sessions) with a `secantusd-mdb` built from tree `af2629ec`. The gap
 tests are in `tests/backlog/test_rm_found_2026_10_20b.py` and ask mongod
 live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
 `j: true` durability (RM-186), `storageSize` (RM-040).
@@ -1274,7 +1274,7 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
   history for a logged table, so a store created with `--data-logged`, or by
   the PostgreSQL server, refuses `atClusterTime` before the newest time with
   246 SnapshotUnavailable, by name, rather than answer as of now; without
-  `atClusterTime` it reads the latest data, which is correct. `secantusd-rs`
+  `atClusterTime` it reads the latest data, which is correct. `secantusd-mdb`
   creates its stores the other way, mongod's (RM-210).
 - [ ] **A spill the spill engine writes out takes this server's size on
       disk, not mongod's.** A `$setWindowFields` spills to a table of a
@@ -1296,7 +1296,7 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       on its command line (not at runtime), and at 50000 spills a slot-based
       `$group` `$push` of 300 1000-byte strings 7 times, 312300 bytes, into
       a table of its spill engine (`groupSpilledDataStorageSize` 4096).
-      `secantusd-rs` refuses the parameter ("Unknown --setParameter"), so
+      `secantusd-mdb` refuses the parameter ("Unknown --setParameter"), so
       the SBE `$group`'s budget is always 100 MiB and what it spills is
       unmeasured. Found 2026-11-13 working RM-325 (its remainder).
       Verify: tests/backlog/test_rm_found_2026_11_13_rm325.py::test_an_sbe_group_spills_as_mongods
@@ -1902,7 +1902,7 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
 
 A read-only audit of `secantus-storage` / `secantus-wt`, the layer both
 Rust servers use. The two items with gap tests were reproduced against
-mongod 8.2.11 with a `secantusd-rs` built from tree `af2629ec`; the rest
+mongod 8.2.11 with a `secantusd-mdb` built from tree `af2629ec`; the rest
 were confirmed by reading the code path and need a fault no quick test can
 inject (a panic, a power loss, a failing checkpoint).
 
@@ -2809,7 +2809,7 @@ dropped (four), and `listIndexes` lists by name.
 - **The multikey `$sort` plan artifact**: accepted -- mongod contradicting its
   own `_id` tie-break.
 - **Decimal128 transcendental last digit**: authorised (correctly rounded).
-- **Make Rust the recommended default**: decided 2026-10-16 (Joe): Rust first everywhere — README (the PyPI page) and docs lead with the Rust servers, the Python servers move to a marked-deprecated section, and the `secantusdb` alias names `secantusd-rs`. Removing the Python servers stays a separate decision.
+- **Make Rust the recommended default**: decided 2026-10-16 (Joe): Rust first everywhere — README (the PyPI page) and docs lead with the Rust servers, the Python servers move to a marked-deprecated section, and the `secantusdb` alias names `secantusd-mdb`. Removing the Python servers stays a separate decision.
 - **PyPI trusted publisher for `secantus-core` / lockstep publishing**: needs
   Joe's PyPI account.
 - **CI Python matrix (3.10 only on push)** and **vendored WiredTiger rebuilt per
@@ -3091,7 +3091,7 @@ the zlib block compressor; re-measure under the current lz4 default.
 re-measurement on Linux (`bench/results/mdb-droplet/2026-10-13-log-file-max/`)
 found no throughput difference between 2GB / 512MB / 128MB / 32MB.
 
-- [ ] **64 writers got less than 16 from `secantusd-rs`** in that run
+- [ ] **64 writers got less than 16 from `secantusd-mdb`** in that run
   (about 16,100 operations a second against 22,400, half inserts and half
   updates of 1 KiB documents), with the clients' CPUs under 5% busy. Not
   looked into.

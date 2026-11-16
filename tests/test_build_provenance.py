@@ -170,7 +170,7 @@ def test_a_dormant_check_says_so(capsys: pytest.CaptureFixture[str]) -> None:
 # The generic check, covering the three artifacts beyond `_secantus_core`.
 #
 # `_secantus_core` had this protection from #1489; `_secantus_server`,
-# `secantusd-pg` and `secantusd-rs` did not. On 2026-09-27 that cost nine
+# `secantusd-pg` and `secantusd-mdb` did not. On 2026-09-27 that cost nine
 # false-regression diagnoses in one session -- including one reported as "main
 # is broken" from an extension six days behind the checkout, and six separate
 # occasions where a stale `secantusd-pg` read as somebody else's bug.
@@ -216,7 +216,7 @@ def test_each_rebuild_command_is_a_real_invoke_task() -> None:
     than no remedy: it sends the reader on a detour and teaches them to distrust
     the check.
 
-    The first draft of this table pointed `secantusd-rs` at `rust-server-build`,
+    The first draft of this table pointed `secantusd-mdb` at `rust-server-build`,
     which rebuilds the embedded extension instead of the binary. This asserts
     each command against the task definitions rather than trusting the name.
     """
@@ -346,7 +346,7 @@ def test_resolve_binary_falls_back_to_the_exe_suffix(tmp_path: Path) -> None:
     exe.write_text("")
     assert resolve_binary(tmp_path / "secantusd-pg") == exe
 
-    plain = tmp_path / "secantusd-rs"
+    plain = tmp_path / "secantusd-mdb"
     plain.write_text("")
     assert resolve_binary(plain) == plain
 

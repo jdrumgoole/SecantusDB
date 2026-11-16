@@ -217,7 +217,7 @@ claims and it is easy to cite one as evidence for the other:
   concurrently** (measured 2026-09-18, pinned by three tests in
   `tests/test_rust_pgserver_slice.py`):
   - SQL → MongoDB **works**: a table written by `secantusd-pg` reads back
-    through `secantusd-rs` as a collection in the database the SQL session used,
+    through `secantusd-mdb` as a collection in the database the SQL session used,
     with the `PRIMARY KEY` as `_id`.
   - MongoDB → SQL **does not**: the Rust PG server resolves names through
     `__sql_catalog__`, which only `CREATE TABLE` writes, so a `pymongo`-written
@@ -236,7 +236,7 @@ claims and it is easy to cite one as evidence for the other:
 user runs **one of them** — never a per-operator/per-`Storage` selection inside
 one request path:
 
-- **The Rust MongoDB server** (`secantusd-rs`, `crates/secantusdb`) — a whole,
+- **The Rust MongoDB server** (`secantusd-mdb`, `crates/secantusdb`) — a whole,
   self-contained Rust server (its own wire / dispatch / cursors / accept loop over
   the pure-Rust `secantus-core` + `secantus-storage` + `secantus-wt` crates). No
   Python in the request path. Its Python ergonomic is a **thin embedded lifecycle

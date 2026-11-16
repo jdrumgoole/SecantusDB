@@ -2,18 +2,18 @@
 
 SecantusDB is a pair of single-node database servers, one speaking the
 MongoDB wire protocol and one speaking the PostgreSQL wire protocol (beta),
-both over the WiredTiger storage engine MongoDB ships. Point your tests at it
-instead of standing up a real `mongod` or `postgres`.
+both over the WiredTiger storage engine MongoDB ships. Any MongoDB or
+PostgreSQL driver connects to it as it would to `mongod` or `postgres`.
 
 This wheel bundles both servers as prebuilt binaries for Linux x86_64 and
 macOS arm64:
 
 | command | server | version |
 | --- | --- | --- |
-| `secantusd-rs` | MongoDB wire | {mongodb_version} |
+| `secantusd-mdb` | MongoDB wire | {mongodb_version} |
 | `secantusd-pg` | PostgreSQL wire (beta) | {postgres_version} |
 
-## Start a server in a test
+## Start a server from Python
 
 ```python
 import pymongo
@@ -40,7 +40,7 @@ pick the port.
 ## Run a server from the shell
 
 ```
-secantusd-rs --port 27018 --storage-path ./data
+secantusd-mdb --port 27018 --storage-path ./data
 secantusd-pg ./pgdata 127.0.0.1:5433
 ```
 

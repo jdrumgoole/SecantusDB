@@ -16,7 +16,7 @@ from types import TracebackType
 _BIN_DIR = Path(__file__).resolve().parent / "bin"
 
 # Both binaries print one line naming the address they bound, e.g.
-# "secantusd-rs listening on 127.0.0.1:53211". Port 0 asks for an ephemeral
+# "secantusd-mdb listening on 127.0.0.1:53211". Port 0 asks for an ephemeral
 # port, so this line is the only way to learn which one was picked.
 _LISTENING = re.compile(r"listening on (\S+):(\d+)")
 
@@ -26,8 +26,8 @@ class ServerStartError(RuntimeError):
 
 
 def binary_path(name: str) -> Path:
-    """The path of a bundled binary: ``"secantusd-rs"`` or ``"secantusd-pg"``."""
-    if name not in ("secantusd-rs", "secantusd-pg"):
+    """The path of a bundled binary: ``"secantusd-mdb"`` or ``"secantusd-pg"``."""
+    if name not in ("secantusd-mdb", "secantusd-pg"):
         raise ValueError(f"unknown SecantusDB binary {name!r}")
     path = _BIN_DIR / name
     if not path.is_file():
@@ -137,13 +137,13 @@ class _Server:
 
 
 class MongoServer(_Server):
-    """The MongoDB-wire server, ``secantusd-rs``.
+    """The MongoDB-wire server, ``secantusd-mdb``.
 
     With no ``storage_path`` the data lives in a temporary directory that
     is removed on ``stop()``. ``port=0`` (the default) picks a free port.
     """
 
-    _binary = "secantusd-rs"
+    _binary = "secantusd-mdb"
 
     def _args(self, storage: Path) -> list[str]:
         return ["--port", str(self._requested_port), "--storage-path", str(storage)]

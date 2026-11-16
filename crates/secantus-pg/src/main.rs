@@ -366,7 +366,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let addr = addr.unwrap_or_else(|| "127.0.0.1:25434".into());
     let databases = Arc::new(DatabaseRegistry::new("postgres", databases));
 
-    // Create the home if it is missing, which is what `secantusd-rs` does
+    // Create the home if it is missing, which is what `secantusd-mdb` does
     // (`--storage-path … created if missing`). Without it a first run against a
     // fresh path failed inside WiredTiger with
     // `WiredTiger.lock: handle-open: open: No such file or directory` and a

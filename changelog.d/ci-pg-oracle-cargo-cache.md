@@ -4,7 +4,7 @@
 
 - The `pg-oracle` job had no cargo cache. Each of its three shards compiled
   every third-party crate on every run: "Build secantusd-pg" took
-  108-153 s, "Build secantusd-rs" 65 s, and the build accounted for most of
+  108-153 s, "Build secantusd-mdb" 65 s, and the build accounted for most of
   the cargo tests' 99 s. This is the job that sets a PR's CI time.
   - A `Swatinem/rust-cache` step now covers `crates/secantus-pg` and
     `crates/secantusdb`, with one key shared by the three shards.

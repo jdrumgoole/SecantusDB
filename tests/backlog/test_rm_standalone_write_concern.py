@@ -1,6 +1,6 @@
 """RM-551 (fixed): a standalone's write concern was a replica set's.
 
-`secantusd-rs --standalone` keeps the replica-set member's write-concern
+`secantusd-mdb --standalone` keeps the replica-set member's write-concern
 machinery: its implicit default is `w: "majority"`, so a write sent without
 a write concern waits for the journal under the transition lock and the
 global lock in IS, and it accepts `setDefaultRWConcern`. mongod 8.2.11 as a

@@ -1,6 +1,6 @@
 ### SecantusDB is back on PyPI, carrying both Rust servers
 
-`pip install SecantusDB` installs the Rust MongoDB server (`secantusd-rs`)
+`pip install SecantusDB` installs the Rust MongoDB server (`secantusd-mdb`)
 and the Rust PostgreSQL server (`secantusd-pg`, beta) as prebuilt binaries
 for Linux x86_64 and macOS arm64, with a small `secantusdb` launcher that
 starts either one from a test in two lines. The wheel no longer contains the
@@ -9,7 +9,7 @@ deprecated Python servers.
 #### Added
 
 - `publish-pypi.yml`: after each `secantusdb-v*` binary release, repackage
-  that release's `secantusd-rs` and the newest `secantusd-pg` release into
+  that release's `secantusd-mdb` and the newest `secantusd-pg` release into
   one `py3-none` wheel per platform, smoke-test each wheel in a clean venv
   on Linux and macOS (pymongo and psycopg round trips, both console scripts),
   and publish it through PyPI trusted publishing with attestations.

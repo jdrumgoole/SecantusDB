@@ -120,7 +120,7 @@ WORKLOAD (run, all)
   --cache-size SIZE    WiredTiger cache            [half the droplet's RAM]
   --sync-on-commit     Start the server with --sync-on-commit
   --standalone         Start the server with --standalone
-  --server-flags STR   Extra flags appended to secantusd-rs
+  --server-flags STR   Extra flags appended to secantusd-mdb
   --keep-data          Do not wipe the server data directory first
   --start-delay SECS   Lead time before the shared start barrier   [20]
   --keep-server-running  Leave the server up after the run

@@ -907,7 +907,7 @@ mod comparison_tests {
     fn long_version_strings_are_shortened_for_the_table() {
         assert_eq!(short_version("db version v8.0.4"), "v8.0.4");
         assert_eq!(
-            short_version("secantusd-rs 0.5.3-beta.160"),
+            short_version("secantusd-mdb 0.5.3-beta.160"),
             "0.5.3-beta.160"
         );
         assert_eq!(short_version("  "), "unknown");

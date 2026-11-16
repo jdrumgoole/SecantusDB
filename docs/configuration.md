@@ -1,6 +1,6 @@
 # Configuration
 
-Both Mongo daemons (`secantusd-py` and `secantusd-rs`) read the same
+Both Mongo daemons (`secantusd-py` and `secantusd-mdb`) read the same
 `secantusd.toml` configuration file for deployment-shaped knobs that
 would otherwise have to be passed on every invocation. CLI flags still work and **override** any value
 set in the file, so the file is a per-deployment baseline rather

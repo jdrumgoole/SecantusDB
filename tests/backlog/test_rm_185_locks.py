@@ -59,7 +59,7 @@ _BASE_ROUNDS = {"retryWrites": False, "w": 1}
 
 @pytest.fixture(scope="module")
 def rust_mongo(tmp_path_factory: pytest.TempPathFactory) -> Iterator[Any]:
-    """A standalone `secantusd-rs` of the module's own, through a client
+    """A standalone `secantusd-mdb` of the module's own, through a client
     like the reference's."""
     from tests.backlog.conftest import rust_mongo_server
 

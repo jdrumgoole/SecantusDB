@@ -316,7 +316,7 @@ def main() -> int:
             '  git worktree add --detach ../SecantusDB-measure "$(git rev-parse origin/main)"'
         )
 
-    binary = REPO / "crates" / "secantusdb" / "target" / "release" / "secantusd-rs"
+    binary = REPO / "crates" / "secantusdb" / "target" / "release" / "secantusd-mdb"
     if not binary.exists():
         raise SystemExit(f"Rust binary not built at {binary}")
     if not shutil.which("mongod"):

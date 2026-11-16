@@ -3,7 +3,7 @@ interrupt the operation it names (RM-313): what a multi-document write that
 stops part-way leaves written.
 
 The reference is mongod 8.2.11, asked live (`mongod_rs`, a one-member
-replica set); the Rust server is `secantusd-rs` (`rust_mongo`).
+replica set); the Rust server is `secantusd-mdb` (`rust_mongo`).
 """
 
 from __future__ import annotations

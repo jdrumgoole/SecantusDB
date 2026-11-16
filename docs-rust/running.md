@@ -1,10 +1,10 @@
 # Running the daemon
 
 ```bash
-secantusd-rs --host 127.0.0.1 --port 27017 --storage-path ./secantus-data
+secantusd-mdb --host 127.0.0.1 --port 27017 --storage-path ./secantus-data
 ```
 
-The daemon prints `secantusd-rs listening on <host>:<port>` once the accept
+The daemon prints `secantusd-mdb listening on <host>:<port>` once the accept
 loop is up (launchers can parse that line), runs until SIGINT/SIGTERM, and
 shuts WiredTiger down cleanly on exit. `--port 0` binds an OS-assigned
 port. Bad arguments exit 2; `--help` / `--version` exit 0.
@@ -68,7 +68,7 @@ in the storage engine the time went, which `mongod`'s line does.
 
 ## Configuration file
 
-Both MongoDB-wire daemons (`secantusd-py` and `secantusd-rs`) read the same
+Both MongoDB-wire daemons (`secantusd-py` and `secantusd-mdb`) read the same
 `secantusd.toml`, discovered in order:
 
 1. `./secantusd.toml` (per-checkout / per-cwd)

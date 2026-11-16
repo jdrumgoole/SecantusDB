@@ -5,7 +5,7 @@
 build directory sorted first, and the wheel's (`build/cp312-*/wt-build`,
 re-patched only by `rust-server-build`) sorts ahead of it. A checkout that had
 built the wheel once could therefore put an unpatched WiredTiger into
-`secantusd-rs` after a patcher landed. The binary tasks now link the directory
+`secantusd-mdb` after a patcher landed. The binary tasks now link the directory
 they refreshed.
 
 #### Fixed

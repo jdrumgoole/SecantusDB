@@ -35,7 +35,7 @@ carries the Rust servers instead).
 
 | server | binary / entry point | wire | role |
 | --- | --- | --- | --- |
-| **Rust MongoDB server** | `secantusd-rs` (`crates/secantusdb`) | MongoDB | **the flagship.** Ships as the `secantus-mdb` crate (crates.io) and prebuilt binaries per platform |
+| **Rust MongoDB server** | `secantusd-mdb` (`crates/secantusdb`) | MongoDB | **the flagship.** Ships as the `secantus-mdb` crate (crates.io) and prebuilt binaries per platform |
 | **Rust PostgreSQL server** | `secantusd-pg` (`crates/secantus-pg`) | PostgreSQL | **the newest.** Ships as the `secantus-pg` crate (on crates.io since `0.1.0-beta.3`, 2026-10-07) and standalone binaries on the `secantusd-pg-v*` releases (Linux x86_64, macOS arm64); builds from its own directory |
 | Python MongoDB server | `SecantusDBServer` / `secantusd-py` | MongoDB | **fully deprecated** (2026-10-20): not tested in CI, not published |
 | Python PostgreSQL server | `secantusd-py-pg` (`secantus.sql.pgserver`) | PostgreSQL | **fully deprecated** (2026-10-20): not tested in CI, not published |
@@ -48,7 +48,7 @@ promise -- breaking it is silent data loss. Cross-protocol between them is
 proven in ONE direction and never concurrently (measured 2026-09-18, pinned in
 `tests/test_rust_pgserver_slice.py`):
   - SQL -> MongoDB **works**: a `secantusd-pg` table reads back through
-    `secantusd-rs` as a collection, with the `PRIMARY KEY` as `_id`.
+    `secantusd-mdb` as a collection, with the `PRIMARY KEY` as `_id`.
   - MongoDB -> SQL **does not**: the Rust PG server resolves names through
     `__sql_catalog__`, which only `CREATE TABLE` writes. The Python SQL layer's
     sampling of uncatalogued collections does NOT carry across.
@@ -59,11 +59,11 @@ proven in ONE direction and never concurrently (measured 2026-09-18, pinned in
 The import package is `secantus`; the public Python class is `SecantusDBServer`.
 
 **Distribution: crates, tagged binaries, and one PyPI wheel of both Rust
-servers.** The `secantus-mdb` crate (`secantusd-rs`, `secantus_mdb::Server`)
+servers.** The `secantus-mdb` crate (`secantusd-mdb`, `secantus_mdb::Server`)
 plus `secantusdb-v*` binaries, and the `secantus-pg` crate plus `secantusd-pg-v*`
 binaries. Since 2026-11-16 (Joe) the `SecantusDB` project on PyPI is back,
 with different contents: `publish-pypi.yml` repackages the released
-`secantusd-rs` and the newest released `secantusd-pg` into one
+`secantusd-mdb` and the newest released `secantusd-pg` into one
 `py3-none` wheel per platform (Linux x86_64, macOS arm64), versioned as the
 MongoDB server (`0.5.3-beta.196` -> `0.5.3b196`), with the `secantusdb`
 launcher (`MongoServer` / `PostgresServer`; `packaging/pypi/`). It runs
@@ -218,7 +218,7 @@ The Rust side is a Cargo workspace under `crates/`: `secantus-core` (pure-Rust
 engines + geo + aggregation, **no PyO3**), `secantus-storage` (the full WT-backed
 `Storage`, pure-Rust), `secantus-wt` (the WT FFI), plus thin PyO3 binding crates
 (`secantus-core-py` → the `_secantus_core` abi3 extension). The PyO3-free split is
-exactly what lets the Rust server / standalone `secantusd-rs` binary reuse the
+exactly what lets the Rust server / standalone `secantusd-mdb` binary reuse the
 engines.
 
 - **The parity suites (`tests/test_rust_*_parity.py`) no longer run in CI**
@@ -251,7 +251,7 @@ engines.
   ones run **unmodified** upstream test suites against SecantusDB (invocation,
   toolchains and quirks: `/conformance-gauges`). The weekly `validate.yml`
   runs every gauge against a Rust server, as a `*-rust-server` lane: the
-  MongoDB drivers against `secantusd-rs`, the SQL gauges (`--server rust`)
+  MongoDB drivers against `secantusd-mdb`, the SQL gauges (`--server rust`)
   against `secantusd-pg`. **Keep `invoke validate-all
   --jobs` at 4 or fewer** (1 for a committable number): beyond that CPU
   contention flakes timing-sensitive tests. The C++ gauge binds port 27017.

@@ -94,7 +94,7 @@ otherwise refuses with `transport 'file' not allowed`).
 installed `_secantus_core`'s stamped source tree against the checkout and
 ABORTS the whole run when they differ — a stale extension can no longer
 silently produce phantom failures, it now produces no run at all. The same
-abort fires for the `secantusd-pg`/`secantusd-rs` binaries
+abort fires for the `secantusd-pg`/`secantusd-mdb` binaries
 ("built from different sources than this checkout"); rebuild with
 `./inv rust-pgserver-build` / `./inv rust-binary-build` rather than bypassing
 it. `SECANTUS_ALLOW_STALE_ARTIFACT=1` exists for deliberately measuring an

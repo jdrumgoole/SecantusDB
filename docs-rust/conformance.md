@@ -24,7 +24,7 @@ streams, transactions, auth, and backup/PITR. The short version of what the
 Rust server does **not** have relative to the Python server:
 
 - `secantusAdmin.restoreToTimestamp` over the wire (use
-  [`secantusd-rs restore`](recovery.md) instead),
+  [`secantusd-mdb restore`](recovery.md) instead),
 - session-lifecycle commands beyond `startSession` are acknowledged no-ops,
 - a handful of operator edge cases the Rust engine deliberately rejects
   rather than risk diverging from `mongod` (some
