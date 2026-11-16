@@ -898,13 +898,161 @@ impl PgHandler {
     /// A relation's width is the columns read above it
     /// (`build_joinrel_tlist`): the query's, and a clause's to a table
     /// outside it. `None` -- zeros -- unless every join PostgreSQL keeps
-    /// is this tree's: the first `i + 2` tables, the next joined above
-    /// them. The joins come back lowest first. (`join_collapse_limit`
-    /// keeps more than eight from being searched as one.)
+    /// joins one table above the relation below it (a left-deep tree).
+    /// The joins come back lowest first, in the order PostgreSQL keeps
+    /// (RP-919), which [`Self::nest_loop_chain_order`] gives the tree.
+    /// (`join_collapse_limit` keeps more than eight from being searched
+    /// as one.)
     pub(crate) fn nest_loop_chain_estimate(
         &self,
         sel: &secantus_pgplan::Select,
     ) -> Option<Vec<NestLoopLevel>> {
+        self.nest_loop_chain(sel).map(|(levels, _)| levels)
+    }
+
+    /// The order of the chain's tables PostgreSQL's search keeps, bottom
+    /// first, by their index in the written chain, when it is not the
+    /// written one (RP-919).
+    pub(crate) fn nest_loop_chain_order(
+        &self,
+        sel: &secantus_pgplan::Select,
+    ) -> Option<Vec<usize>> {
+        let (_, order) = self.nest_loop_chain(sel)?;
+        (!order.iter().enumerate().all(|(i, &t)| i == t)).then_some(order)
+    }
+
+    /// `sel` with its chain of inner joins in the order PostgreSQL's
+    /// search keeps ([`Self::nest_loop_chain_order`]), so its rows come
+    /// out of that plan's loops and EXPLAIN prints its tree (RP-919). Each
+    /// ON moves, whole, to the lowest join holding the tables it reads; a
+    /// WHERE stays the query's. `None` where the order is the written one,
+    /// or an ON does not land alone on one join of the new tree. With it,
+    /// each new join's ON as the written join it came from, bottom first,
+    /// both counted from the bottom (`join_conds`' post-order).
+    pub(crate) fn reorder_nest_loop_chain(
+        &self,
+        sel: &secantus_pgplan::Select,
+    ) -> Option<(secantus_pgplan::Select, Vec<Option<usize>>)> {
+        use secantus_pgplan::joins::{JoinKind, JoinNode};
+        use secantus_pgplan::Statement;
+        let order = self.nest_loop_chain_order(sel)?;
+        let sub = sel.sub.as_ref()?;
+        let Statement::JoinRows(j) = sub.plan.as_ref() else {
+            return None;
+        };
+        // The written spine: its tables bottom first, and each join's ON
+        // with the tables it reads.
+        type On = (
+            usize,
+            Option<secantus_pgplan::ColumnExpr>,
+            Vec<String>,
+            Vec<secantus_pgplan::joins::JoinFilter>,
+        );
+        let mut leaves: Vec<JoinNode> = Vec::new();
+        let mut ons: Vec<On> = Vec::new();
+        let mut node = &j.tree;
+        let mut at = 0;
+        while let JoinNode::Join {
+            kind: JoinKind::Inner,
+            left,
+            right,
+            on,
+            on_aliases,
+            on_filters,
+            ..
+        } = node
+        {
+            leaves.push(right.as_ref().clone());
+            if on.is_some() {
+                ons.push((at, on.clone(), on_aliases.clone(), on_filters.clone()));
+            }
+            at += 1;
+            node = left;
+        }
+        for o in &mut ons {
+            o.0 = at - 1 - o.0;
+        }
+        leaves.push(node.clone());
+        leaves.reverse();
+        if leaves.len() != order.len() {
+            return None;
+        }
+        let alias = |n: &JoinNode| -> Option<String> {
+            let JoinNode::Leaf { def, .. } = n else {
+                return None;
+            };
+            Some(def.name.clone())
+        };
+        let keys = |n: &JoinNode| -> Vec<String> {
+            match n {
+                JoinNode::Leaf { columns, .. } => columns.iter().map(|(k, _)| k.clone()).collect(),
+                JoinNode::Join {
+                    left_keys,
+                    right_keys,
+                    ..
+                } => left_keys.iter().chain(right_keys).cloned().collect(),
+                JoinNode::Lateral { .. } => Vec::new(),
+            }
+        };
+        let mut placed = vec![false; ons.len()];
+        let mut held: Vec<String> = vec![alias(&leaves[order[0]])?];
+        let mut tree = leaves[order[0]].clone();
+        let mut from: Vec<Option<usize>> = Vec::new();
+        for &t in &order[1..] {
+            let leaf = leaves[t].clone();
+            held.push(alias(&leaf)?);
+            let mut here: Vec<usize> = Vec::new();
+            for (i, (_, _, aliases, _)) in ons.iter().enumerate() {
+                if !placed[i] && aliases.iter().all(|a| held.contains(a)) {
+                    here.push(i);
+                }
+            }
+            if here.len() > 1 {
+                return None;
+            }
+            let (written, on, on_aliases, on_filters) = match here.first() {
+                Some(&i) => {
+                    placed[i] = true;
+                    let (w, on, a, f) = ons[i].clone();
+                    (Some(w), on, a, f)
+                }
+                None => (None, None, Vec::new(), Vec::new()),
+            };
+            from.push(written);
+            let (left_keys, right_keys) = (keys(&tree), keys(&leaf));
+            tree = JoinNode::Join {
+                kind: JoinKind::Inner,
+                left: Box::new(tree),
+                right: Box::new(leaf),
+                on_other: on.is_some(),
+                on,
+                on_aliases,
+                on_filters,
+                equi: Vec::new(),
+                equi_reversed: Vec::new(),
+                merged: Vec::new(),
+                expr_keys: Vec::new(),
+                ec: None,
+                left_keys,
+                right_keys,
+            };
+        }
+        if placed.iter().any(|p| !p) {
+            return None;
+        }
+        let mut j = j.clone();
+        j.tree = tree;
+        let mut out = sel.clone();
+        let mut s = sub.clone();
+        s.plan = Box::new(Statement::JoinRows(j));
+        out.sub = Some(s);
+        Some((out, from))
+    }
+
+    fn nest_loop_chain(
+        &self,
+        sel: &secantus_pgplan::Select,
+    ) -> Option<(Vec<NestLoopLevel>, Vec<usize>)> {
         use secantus_pgplan::joins::{FilterKind, JoinFilter, JoinKind, JoinNode, JoinRows};
         use secantus_pgplan::Statement;
         let sub = sel.sub.as_ref()?;
@@ -922,11 +1070,11 @@ impl PgHandler {
             || sel.casts.iter().any(Option::is_some)
             || ((!sel.filter.is_empty() || sel.residual.is_some()) && !j.where_modelled)
             || j.where_spans_equality
-            || !j.where_filters.is_empty()
         {
             return None;
         }
-        // An inner join with an ON of its own clauses only, no column it
+        // An inner join with an ON of its own clauses only, or a comma
+        // join's with none (its clauses the WHERE's, RP-919), no column it
         // could hash or merge on.
         fn inner_join(
             node: &JoinNode,
@@ -935,7 +1083,7 @@ impl PgHandler {
                 kind: JoinKind::Inner,
                 left,
                 right,
-                on: Some(_),
+                on,
                 on_filters,
                 equi,
                 merged,
@@ -945,7 +1093,11 @@ impl PgHandler {
             else {
                 return None;
             };
-            if !equi.is_empty() || !merged.is_empty() || !expr_keys.is_empty() {
+            if !equi.is_empty()
+                || !merged.is_empty()
+                || !expr_keys.is_empty()
+                || (on.is_none() && !on_filters.is_empty())
+            {
                 return None;
             }
             Some((left.as_ref(), right.as_ref(), on_filters.as_slice()))
@@ -1057,7 +1209,15 @@ impl PgHandler {
             })
             .collect();
         let mut clauses: Vec<Clause> = Vec::new();
-        for f in filter_lists.iter().copied().flatten() {
+        // A WHERE conjunct over two tables joins them as an ON's would:
+        // `deconstruct_jointree` makes an inner join's WHERE and ON quals
+        // one list, each evaluated at the lowest join holding its tables.
+        for f in filter_lists
+            .iter()
+            .copied()
+            .flatten()
+            .chain(j.where_filters.iter())
+        {
             let secantus_pgplan::ColumnExpr::Row { fields, .. } = &f.expr else {
                 return None;
             };
@@ -1288,19 +1448,24 @@ impl PgHandler {
             }
             levels.push(made);
         }
-        // Down the kept paths from the top: each must join this tree's
-        // lower relation and its next table.
+        // Down the kept paths from the top: each must join a relation
+        // below and one table, which the tree puts above it.
         let mut out = Vec::new();
+        let mut order = Vec::new();
         let mut set = full;
-        for i in (1..n).rev() {
-            let (lower, leaf) = (set & !(1 << i), 1u32 << i);
+        while set.count_ones() > 1 {
             let (est, kept) = rels.get(&set)?;
-            let (mut plan, pair) = (*kept)?;
-            if pair == (leaf, lower) {
+            let (mut plan, (p, q)) = (*kept)?;
+            let (lower, leaf) = if q.count_ones() == 1 {
+                (p, q)
+            } else if p.count_ones() == 1 {
                 plan.b_outer = !plan.b_outer;
-            } else if pair != (lower, leaf) {
+                (q, p)
+            } else {
                 return None;
-            }
+            };
+            let i = leaf.trailing_zeros() as usize;
+            order.push(i);
             let (mut a, mut b) = (rels[&lower].0, scans[i]);
             // The parameterized inner: its scan's estimate, read through
             // its index, under its Memoize where that is kept.
@@ -1321,8 +1486,10 @@ impl PgHandler {
             out.push((plan, a, b, *est, scan));
             set = lower;
         }
+        order.push(set.trailing_zeros() as usize);
         out.reverse();
-        Some(out)
+        order.reverse();
+        Some((out, order))
     }
 
     /// `get_memoize_path` over a scan of `inner` parameterized by the row

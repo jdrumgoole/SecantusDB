@@ -43404,6 +43404,12 @@ impl PgHandler {
             }
 
             Statement::Select(sel) => {
+                // A chain of inner joins runs in the order PostgreSQL's
+                // search keeps (RP-919).
+                let sel = match self.reorder_nest_loop_chain(&sel) {
+                    Some((reordered, _)) => reordered,
+                    None => sel,
+                };
                 let env = RowEnv {
                     tz: row_tz.clone(),
                     ds: row_ds,
@@ -45501,7 +45507,16 @@ impl PgHandler {
                         | secantus_storage::ExplainPlan::Or { .. } => None,
                     }
                 };
-                let mut tree = explain::plan_tree(&inner, &chooser);
+                // The tree of the order the search keeps (RP-919); its
+                // estimates come from the written one below.
+                let (reordered, cond_from) = match inner.as_ref() {
+                    Statement::Select(sel) => match self.reorder_nest_loop_chain(sel) {
+                        Some((s, from)) => (Some(Statement::Select(s)), Some(from)),
+                        None => (None, None),
+                    },
+                    _ => (None, None),
+                };
+                let mut tree = explain::plan_tree(reordered.as_ref().unwrap_or(&inner), &chooser);
                 // Each join's `Inner Unique` (RP-353): a unique index of
                 // the inner table that is immediate, has no WHERE and keys
                 // only plain columns, every one fixed by the join's clauses
@@ -46536,11 +46551,15 @@ impl PgHandler {
                     explain::dummy_relation(&mut tree);
                 }
                 explain::attach_setop_quals(&mut tree, &options.setop_quals, &index_columns);
-                explain::attach_join_conds(
-                    &mut tree,
-                    &options.join_conds,
-                    &options.join_cond_splits,
-                );
+                // Each ON's text on the join it moved to (RP-919).
+                let join_conds: Vec<String> = match &cond_from {
+                    Some(from) if from.len() == options.join_conds.len() => from
+                        .iter()
+                        .map(|w| w.map(|w| options.join_conds[w].clone()).unwrap_or_default())
+                        .collect(),
+                    _ => options.join_conds.clone(),
+                };
+                explain::attach_join_conds(&mut tree, &join_conds, &options.join_cond_splits);
                 explain::attach_join_where(&mut tree, &options.join_where, &index_columns);
                 explain::move_param_conds(&mut tree);
                 explain::apply_implied_filters(&mut tree);

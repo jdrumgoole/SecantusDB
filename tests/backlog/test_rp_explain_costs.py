@@ -2282,10 +2282,11 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "        ->  Seq Scan on e e3  (cost=0.00..15.00 rows=1000 width=7)",
         ],
     ),
-    # Still open: PostgreSQL joins the two tables the cheaper clause links
-    # first and puts the third on top; here the tables join as written.
+    # Fixed: PostgreSQL joins the two tables the cheaper clause links
+    # first and puts the third on top; the tables joined as written, and
+    # the plan printed zeros.
     "nested loop of three relations joined in another order": (
-        "RP-919",
+        "RP-919:fixed",
         _ANALYSED_SMALL,
         "explain select * from e join e e3 on e.a < e3.a join zs on e3.a > zs.a",
         [
@@ -2300,11 +2301,11 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "        ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
         ],
     ),
-    # Still open: a comma join's WHERE clause over two tables is the Join
-    # Filter of the join that first holds both; here every one is the top
-    # join's.
+    # Fixed: a comma join's WHERE clause over two tables is the Join
+    # Filter of the join that first holds both, and the chain is priced;
+    # before, every one was the top join's and the plan printed zeros.
     "nested loop of three relations by a where": (
-        "RP-919",
+        "RP-919:fixed",
         _ANALYSED,
         "explain select * from e, e e2, e e3 where e.a < e2.a and e2.a < e3.a",
         [
@@ -6026,3 +6027,35 @@ def test_a_chains_lower_hash_join_is_counted(rust_pg: Any) -> None:
     _, setup, query, expected = SCENARIOS["analyze of a nested loop over a hash join"]
     got = run(fresh_db(_dsn(rust_pg)), setup, query)
     assert got[:9] == expected[:9]
+
+
+_INEQUALITY_CHAIN = "select e.a, e3.a, zs.a from e join e e3 on e.a < e3.a join zs on e3.a > zs.a"
+
+
+def _first_rows(dsn: str, query: str, n: int) -> list[tuple[Any, ...]]:
+    with psycopg.connect(dsn) as c:
+        try:
+            for s in _ANALYSED_SMALL:
+                c.execute(s)
+            return c.execute(query).fetchmany(n)
+        finally:
+            c.rollback()
+
+
+@pytest.mark.backlog_fixed("RP-919")
+def test_a_chain_of_inequality_joins_runs_in_the_searched_order(rust_pg: Any) -> None:
+    """PostgreSQL 15.19 runs the chain as `(e3 x zs) x e`, so its first rows
+    are those of e3's 2 and 3 against every e below them; the tables joined
+    as written, e outermost."""
+    rows = _first_rows(fresh_db(_dsn(rust_pg)), _INEQUALITY_CHAIN, 5)
+    assert rows == [(1, 2, 1), (1, 3, 1), (2, 3, 1), (1, 3, 2), (2, 3, 2)]
+
+
+@pytest.mark.backlog("RP-919")
+def test_a_chain_of_inequality_joins_under_a_limit(rust_pg: Any) -> None:
+    """PostgreSQL 15.19 keeps the same order under a LIMIT (`e.a` of the
+    first five rows 1, 1, 2, 1, 2); here a LIMIT's search, which weighs
+    startup costs, is not run for a chain without equalities, and the
+    tables join as written."""
+    rows = _first_rows(fresh_db(_dsn(rust_pg)), _INEQUALITY_CHAIN + " limit 5", 5)
+    assert [r[0] for r in rows] == [1, 1, 2, 1, 2]
