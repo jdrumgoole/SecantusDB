@@ -33,7 +33,7 @@ use secantus_commands::{CursorRegistry, Storage as CmdStorage};
 use secantus_server::args::{parse_args, CliArgs, Parsed};
 use secantus_server::bind;
 use secantus_server::config::resolve;
-use secantus_storage::{wt_config, Storage, StorageOptions};
+use secantus_storage::{mongod_message_config, wt_config, Storage, StorageOptions};
 use secantus_storage_adapter::StorageAdapter;
 
 const RESTORE_HELP: &str = "\
@@ -349,11 +349,15 @@ fn storage_options(cli: &CliArgs) -> StorageOptions {
     // Open with the resolved WiredTiger knobs (--cache-size / --session-max /
     // --sync-on-commit). The daemon default is `1G` (matching the Python
     // server); the engine/library default via `Storage::open` stays `256M`.
-    let wt = wt_config(
-        &cli.cache_size,
-        cli.session_max,
-        cli.sync_on_commit,
-        &cli.log_file_max,
+    let wt = format!(
+        "{},{}",
+        wt_config(
+            &cli.cache_size,
+            cli.session_max,
+            cli.sync_on_commit,
+            &cli.log_file_max,
+        ),
+        mongod_message_config()
     );
     // Storage write-path modes (--oplog-async / --oplog-nonlogged /
     // --data-nonlogged / --checkpoint-seconds): `None` defers to the matching

@@ -330,6 +330,9 @@ pub struct StoreOpening {
     pub wt_config: String,
     /// How long `wiredtiger_open` took.
     pub wt_open: std::time::Duration,
+    /// The messages WiredTiger wrote while it opened, in order, as it
+    /// formatted them: JSON objects under `json_output=(message)`.
+    pub wt_messages: Vec<String>,
     /// How long the whole open took after the lock file.
     pub open: std::time::Duration,
 }

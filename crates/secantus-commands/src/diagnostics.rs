@@ -192,6 +192,7 @@ pub fn storage_opening_lines(
         LogEntry::new("I", "STORAGE", 22315, "initandlisten", "Opening WiredTiger")
             .attr(doc! {"config": opening.wt_config.as_str()}),
     );
+    lines.extend(opening.wt_messages.iter().map(|m| wiredtiger_message(m)));
     lines.push(
         LogEntry::new(
             "I",
@@ -203,6 +204,186 @@ pub fn storage_opening_lines(
         .attr(doc! {"durationMillis": millis(opening.wt_open)}),
     );
     lines
+}
+
+/// `WiredTiger message` (22430): one message WiredTiger wrote, as mongod's
+/// event handler logs it (`wiredtiger_util.cpp`, 8.2.11). WiredTiger
+/// formats it as JSON under `json_output=(message)`; mongod parses it into
+/// `attr.message`, names the component by its `category` and takes the
+/// severity from its `verbose_level` (measured 2026-11-16: `DEBUG_1` lines
+/// are `I`). A message that is not JSON is logged as its text.
+pub fn wiredtiger_message(text: &str) -> crate::logbuf::LogEntry {
+    use crate::logbuf::LogEntry;
+    let parsed = wt_json::parse_object(text);
+    let (component, severity) = match &parsed {
+        Some(m) => (
+            wt_component(m.get_str("category").unwrap_or("")),
+            match m.get_str("verbose_level").unwrap_or("") {
+                "ERROR" => "E",
+                "WARNING" => "W",
+                _ => "I",
+            },
+        ),
+        None => ("WT", "I"),
+    };
+    let message = match parsed {
+        Some(m) => Bson::Document(m),
+        None => Bson::String(text.to_string()),
+    };
+    LogEntry::new(
+        severity,
+        component,
+        22430,
+        "initandlisten",
+        "WiredTiger message",
+    )
+    .attr(doc! {"message": message})
+}
+
+/// The log component mongod gives a WiredTiger message by its verbose
+/// category (`getMongoComponent`, mongod 8.2). WiredTiger 7.0 names
+/// eviction `WT_VERB_EVICT` where mongod's newer build says
+/// `WT_VERB_EVICTION`; both are `WTEVICT`.
+fn wt_component(category: &str) -> &'static str {
+    match category {
+        "WT_VERB_BACKUP" => "WTBACKUP",
+        "WT_VERB_CHECKPOINT" | "WT_VERB_CHECKPOINT_PROGRESS" => "WTCHKPT",
+        "WT_VERB_COMPACT" | "WT_VERB_COMPACT_PROGRESS" => "WTCMPCT",
+        "WT_VERB_EVICT" | "WT_VERB_EVICTION" => "WTEVICT",
+        "WT_VERB_HS" | "WT_VERB_HS_ACTIVITY" => "WTHS",
+        "WT_VERB_RECOVERY" | "WT_VERB_RECOVERY_PROGRESS" => "WTRECOV",
+        "WT_VERB_RTS" => "WTRTS",
+        "WT_VERB_SALVAGE" => "WTSLVG",
+        "WT_VERB_TIERED" => "WTTIER",
+        "WT_VERB_TIMESTAMP" => "WTTS",
+        "WT_VERB_TRANSACTION" => "WTTXN",
+        "WT_VERB_VERIFY" => "WTVRFY",
+        "WT_VERB_LOG" => "WTWRTLOG",
+        _ => "WT",
+    }
+}
+
+/// The JSON WiredTiger writes under `json_output`: an object of strings,
+/// numbers and booleans, its keys in the order written. Integers that fit
+/// in 32 bits are `Int32`, larger ones `Int64`, as mongod's `fromjson`.
+mod wt_json {
+    use bson::{Bson, Document};
+
+    pub fn parse_object(text: &str) -> Option<Document> {
+        let mut p = Parser {
+            s: text.as_bytes(),
+            i: 0,
+        };
+        let doc = p.object()?;
+        p.ws();
+        (p.i == p.s.len()).then_some(doc)
+    }
+
+    struct Parser<'a> {
+        s: &'a [u8],
+        i: usize,
+    }
+
+    impl Parser<'_> {
+        fn ws(&mut self) {
+            while self.s.get(self.i).is_some_and(u8::is_ascii_whitespace) {
+                self.i += 1;
+            }
+        }
+        fn eat(&mut self, c: u8) -> Option<()> {
+            self.ws();
+            (self.s.get(self.i) == Some(&c)).then(|| self.i += 1)
+        }
+        fn object(&mut self) -> Option<Document> {
+            self.eat(b'{')?;
+            let mut doc = Document::new();
+            if self.eat(b'}').is_some() {
+                return Some(doc);
+            }
+            loop {
+                self.ws();
+                let key = self.string()?;
+                self.eat(b':')?;
+                let value = self.value()?;
+                doc.insert(key, value);
+                if self.eat(b',').is_none() {
+                    self.eat(b'}')?;
+                    return Some(doc);
+                }
+            }
+        }
+        fn value(&mut self) -> Option<Bson> {
+            self.ws();
+            match *self.s.get(self.i)? {
+                b'"' => self.string().map(Bson::String),
+                b'{' => self.object().map(Bson::Document),
+                b't' => self.word("true", Bson::Boolean(true)),
+                b'f' => self.word("false", Bson::Boolean(false)),
+                b'n' => self.word("null", Bson::Null),
+                _ => self.number(),
+            }
+        }
+        fn word(&mut self, w: &str, v: Bson) -> Option<Bson> {
+            self.s[self.i..].starts_with(w.as_bytes()).then(|| {
+                self.i += w.len();
+                v
+            })
+        }
+        fn number(&mut self) -> Option<Bson> {
+            let start = self.i;
+            while self
+                .s
+                .get(self.i)
+                .is_some_and(|c| c.is_ascii_digit() || b"+-.eE".contains(c))
+            {
+                self.i += 1;
+            }
+            let t = std::str::from_utf8(&self.s[start..self.i]).ok()?;
+            if let Ok(n) = t.parse::<i64>() {
+                return Some(match i32::try_from(n) {
+                    Ok(n) => Bson::Int32(n),
+                    Err(_) => Bson::Int64(n),
+                });
+            }
+            t.parse::<f64>().ok().map(Bson::Double)
+        }
+        fn string(&mut self) -> Option<String> {
+            if self.s.get(self.i) != Some(&b'"') {
+                return None;
+            }
+            self.i += 1;
+            let mut out = Vec::new();
+            loop {
+                let c = *self.s.get(self.i)?;
+                self.i += 1;
+                match c {
+                    b'"' => return String::from_utf8(out).ok(),
+                    b'\\' => {
+                        let e = *self.s.get(self.i)?;
+                        self.i += 1;
+                        match e {
+                            b'n' => out.push(b'\n'),
+                            b't' => out.push(b'\t'),
+                            b'r' => out.push(b'\r'),
+                            b'b' => out.push(0x08),
+                            b'f' => out.push(0x0c),
+                            b'u' => {
+                                let hex =
+                                    std::str::from_utf8(self.s.get(self.i..self.i + 4)?).ok()?;
+                                self.i += 4;
+                                let ch = char::from_u32(u32::from_str_radix(hex, 16).ok()?)
+                                    .unwrap_or('\u{fffd}');
+                                let mut buf = [0u8; 4];
+                                out.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
+                            }
+                            other => out.push(other),
+                        }
+                    }
+                    _ => out.push(c),
+                }
+            }
+        }
+    }
 }
 
 /// Whole milliseconds, truncated, as mongod's `durationCount<Milliseconds>`.
@@ -901,6 +1082,34 @@ mod tests {
     }
 
     #[test]
+    fn a_wiredtiger_message_is_logged_as_mongod_logs_it() {
+        // mongod 8.2.11's line for this message (measured 2026-11-16).
+        let text = r#"{"ts_sec":1794848415,"ts_usec":443110,"thread":"7352:0x1f60aa180","session_name":"txn-recover","category":"WT_VERB_RECOVERY_PROGRESS","log_id":1000000,"category_id":33,"verbose_level":"DEBUG_1","verbose_level_id":1,"msg":"Set global recovery timestamp: (0, 0)"}"#;
+        let e = wiredtiger_message(text);
+        assert_eq!((e.severity, e.component, e.id), ("I", "WTRECOV", 22430));
+        assert_eq!(e.msg, "WiredTiger message");
+        assert_eq!(
+            e.render().split(",\"attr\":").nth(1).unwrap(),
+            format!("{{\"message\":{text}}}}}")
+        );
+        let e = wiredtiger_message(
+            r#"{"category":"WT_VERB_EVICTION","verbose_level":"WARNING","msg":"a \"q\"\n"}"#,
+        );
+        assert_eq!((e.severity, e.component), ("W", "WTEVICT"));
+        assert_eq!(
+            e.attr
+                .unwrap()
+                .get_document("message")
+                .unwrap()
+                .get_str("msg"),
+            Ok("a \"q\"\n")
+        );
+        let e = wiredtiger_message("not json");
+        assert_eq!(e.component, "WT");
+        assert_eq!(e.attr.unwrap(), doc! {"message": "not json"});
+    }
+
+    #[test]
     fn storage_opening_lines_warn_of_an_unclean_shutdown() {
         let mut opening = crate::storage::StoreOpening {
             started: std::time::Instant::now(),
@@ -908,6 +1117,7 @@ mod tests {
             new_store: false,
             wt_config: "create,cache_size=1G".into(),
             wt_open: std::time::Duration::from_millis(12),
+            wt_messages: Vec::new(),
             open: Default::default(),
         };
         let ids = |o: &crate::storage::StoreOpening| -> Vec<i32> {
