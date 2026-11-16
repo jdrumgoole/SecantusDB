@@ -98,9 +98,10 @@ Linux binaries now link it statically.) The larger changes:
 
 Both servers are single-node and in beta.
 
-`cargo install secantus-mdb --version 0.5.3-beta.197` and
-`cargo install secantus-pg --version 0.1.0-beta.19` build them from
-crates.io.
+The crates for these versions are not on crates.io yet: this release adds
+a new crate, `secantus-icu`, which crates.io needs published by hand once
+before our release workflow can publish it. Until then, use `pip` or the
+binaries below.
 
 [Rust MongoDB server](https://secantusdb.com/rust-db.html) ·
 [Rust PostgreSQL server](https://secantusdb.com/rust-pg.html) ·
