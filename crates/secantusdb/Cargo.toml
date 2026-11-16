@@ -2,7 +2,7 @@
 name = "secantus-mdb"
 version = "0.5.3-beta.196"
 edition = "2021"
-description = "A surrogate MongoDB server for tests: the real wire protocol over WiredTiger, single-node. Embed it (secantus_mdb::Server) or run the secantusd-mdb binary."
+description = "A single-node MongoDB server: the real wire protocol over WiredTiger. Embed it (secantus_mdb::Server) or run the secantusd-mdb binary."
 license = "GPL-2.0-only"
 repository = "https://github.com/jdrumgoole/SecantusDB"
 

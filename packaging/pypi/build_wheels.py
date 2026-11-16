@@ -133,8 +133,7 @@ def _metadata(version: str, mongodb_version: str, postgres_version: str) -> byte
         "Metadata-Version: 2.4",
         "Name: SecantusDB",
         f"Version: {version}",
-        "Summary: Single-node MongoDB- and PostgreSQL-wire servers over WiredTiger, "
-        "for tests and CI",
+        "Summary: Single-node MongoDB- and PostgreSQL-wire database servers over WiredTiger",
         "Author-email: Joe Drumgoole <joe@joedrumgoole.com>",
         "License-Expression: GPL-2.0-only",
         "License-File: LICENSE",

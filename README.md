@@ -25,7 +25,7 @@
 > production data here yet — production deployments that need durable
 > data across upgrades should still run a real `mongod` or `postgres`.
 
-**A surrogate single-node database for your tests.** SecantusDB speaks
+**A single-node MongoDB and PostgreSQL database.** SecantusDB speaks
 the real **MongoDB** and **PostgreSQL** wire protocols on a real TCP
 socket, over the same **WiredTiger** storage engine MongoDB ships. Point
 your existing driver at it — `pymongo`, `mongo-go-driver`, `mongosh`,
