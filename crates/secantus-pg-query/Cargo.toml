@@ -6,7 +6,7 @@
 # its position in the body (`internalpos`), which upstream drops (RP-621).
 name = "secantus-pg-query"
 description = "SecantusDB's fork of pg_query 6.2.0: PostgreSQL's own parser via libpg_query, keeping a PL/pgSQL compile error's SQLSTATE and position."
-version = "0.1.0-beta.17"
+version = "0.1.0-beta.18"
 edition = "2021"
 documentation = "https://docs.rs/pg_query"
 license = "MIT"

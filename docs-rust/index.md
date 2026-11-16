@@ -12,7 +12,7 @@ with the Python server), and ships as a single static-WiredTiger binary:
 It ships as the `secantus-mdb` crate on crates.io:
 
 ```bash
-cargo install secantus-mdb --version 0.5.3-beta.196   # builds WiredTiger, installs `secantusd-mdb`
+cargo install secantus-mdb --version 0.5.3-beta.197   # builds WiredTiger, installs `secantusd-mdb`
 secantusd-mdb --port 27017 --storage-path ./secantus-data
 ```
 

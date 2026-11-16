@@ -70,8 +70,8 @@ The wheel also puts `secantusd-mdb` and `secantusd-pg` on your `PATH`.
 **From crates.io**, built from source with a Rust toolchain:
 
 ```bash
-cargo install secantus-mdb --version 0.5.3-beta.196   # MongoDB: the `secantusd-mdb` daemon
-cargo install secantus-pg --version 0.1.0-beta.17      # PostgreSQL: the `secantusd-pg` daemon
+cargo install secantus-mdb --version 0.5.3-beta.197   # MongoDB: the `secantusd-mdb` daemon
+cargo install secantus-pg --version 0.1.0-beta.18      # PostgreSQL: the `secantusd-pg` daemon
 secantusd-mdb --port 27017 --storage-path ./secantus-data
 ```
 
@@ -218,8 +218,8 @@ Python launcher. It needs Python 3.10 or newer and is published for:
 - macOS arm64 (Apple Silicon)
 
 It does not carry the deprecated Python servers. On any other platform,
-install from crates.io: `cargo install secantus-mdb --version 0.5.3-beta.196`
-and `cargo install secantus-pg --version 0.1.0-beta.17`. Each needs a Rust
+install from crates.io: `cargo install secantus-mdb --version 0.5.3-beta.197`
+and `cargo install secantus-pg --version 0.1.0-beta.18`. Each needs a Rust
 toolchain and builds WiredTiger as part of the crate. Standalone archives of
 `secantusd-mdb` (Linux x86_64, macOS arm64, Windows x86_64) and `secantusd-pg`
 (Linux x86_64, macOS arm64) are attached to the `secantusdb-v*` and

@@ -1810,7 +1810,7 @@ checksum = "b39cdef0fa800fc44525c84ccb54a029961a8215f9619753635a9c0d2538d46d"
 
 [[package]]
 name = "secantus-auth"
-version = "0.5.3-beta.196"
+version = "0.5.3-beta.197"
 dependencies = [
  "base64 0.22.1",
  "hmac 0.12.1",
@@ -1825,7 +1825,7 @@ dependencies = [
 
 [[package]]
 name = "secantus-bench"
-version = "0.5.3-beta.196"
+version = "0.5.3-beta.197"
 dependencies = [
  "bson",
  "rand 0.9.4",
@@ -1836,7 +1836,7 @@ dependencies = [
 
 [[package]]
 name = "secantus-commands"
-version = "0.5.3-beta.196"
+version = "0.5.3-beta.197"
 dependencies = [
  "base64 0.22.1",
  "bson",
@@ -1856,7 +1856,7 @@ dependencies = [
 
 [[package]]
 name = "secantus-core"
-version = "0.5.3-beta.196"
+version = "0.5.3-beta.197"
 dependencies = [
  "bson",
  "chrono",
@@ -1872,7 +1872,7 @@ dependencies = [
 
 [[package]]
 name = "secantus-core-py"
-version = "0.5.3-beta.196"
+version = "0.5.3-beta.197"
 dependencies = [
  "bson",
  "pyo3",
@@ -1881,14 +1881,14 @@ dependencies = [
 
 [[package]]
 name = "secantus-icu"
-version = "0.5.3-beta.196"
+version = "0.5.3-beta.197"
 dependencies = [
  "cc",
 ]
 
 [[package]]
 name = "secantus-pg-query"
-version = "0.1.0-beta.17"
+version = "0.1.0-beta.18"
 dependencies = [
  "bindgen",
  "cc",
@@ -1905,14 +1905,14 @@ dependencies = [
 
 [[package]]
 name = "secantus-pgcatalog"
-version = "0.1.0-beta.17"
+version = "0.1.0-beta.18"
 dependencies = [
  "bson",
 ]
 
 [[package]]
 name = "secantus-pgplan"
-version = "0.1.0-beta.17"
+version = "0.1.0-beta.18"
 dependencies = [
  "aes",
  "blowfish 0.9.1",
@@ -1951,7 +1951,7 @@ dependencies = [
 
 [[package]]
 name = "secantus-server"
-version = "0.5.3-beta.196"
+version = "0.5.3-beta.197"
 dependencies = [
  "bson",
  "log",
@@ -1967,7 +1967,7 @@ dependencies = [
 
 [[package]]
 name = "secantus-wire"
-version = "0.5.3-beta.196"
+version = "0.5.3-beta.197"
 dependencies = [
  "bson",
  "flate2",

@@ -1653,24 +1653,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "pg_query"
-version = "6.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "42a66643c4aa9c929b68b2c9e30d6c4d955bfd1e87e255ce6c5d0c026082436c"
-dependencies = [
- "bindgen",
- "cc",
- "fs_extra",
- "glob",
- "itertools 0.10.5",
- "prost",
- "prost-build",
- "serde",
- "serde_json",
- "thiserror 1.0.69",
-]
-
-[[package]]
 name = "phf"
 version = "0.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2260,7 +2242,7 @@ dependencies = [
 
 [[package]]
 name = "secantus-auth"
-version = "0.5.3-beta.196"
+version = "0.5.3-beta.197"
 dependencies = [
  "base64 0.22.1",
  "hmac 0.12.1",
@@ -2275,7 +2257,7 @@ dependencies = [
 
 [[package]]
 name = "secantus-commands"
-version = "0.5.3-beta.196"
+version = "0.5.3-beta.197"
 dependencies = [
  "base64 0.22.1",
  "bson",
@@ -2293,7 +2275,7 @@ dependencies = [
 
 [[package]]
 name = "secantus-core"
-version = "0.5.3-beta.196"
+version = "0.5.3-beta.197"
 dependencies = [
  "bson",
  "chrono",
@@ -2309,14 +2291,14 @@ dependencies = [
 
 [[package]]
 name = "secantus-icu"
-version = "0.5.3-beta.196"
+version = "0.5.3-beta.197"
 dependencies = [
  "cc",
 ]
 
 [[package]]
 name = "secantus-pg"
-version = "0.1.0-beta.17"
+version = "0.1.0-beta.18"
 dependencies = [
  "aes",
  "async-trait",
@@ -2328,7 +2310,6 @@ dependencies = [
  "futures",
  "libc",
  "md-5 0.10.6",
- "pg_query",
  "pkcs8",
  "postgres-types",
  "rand 0.9.5",
@@ -2336,6 +2317,7 @@ dependencies = [
  "rustls-pki-types",
  "secantus-auth",
  "secantus-core",
+ "secantus-pg-query",
  "secantus-pgcatalog",
  "secantus-pgplan",
  "secantus-pgwire",
@@ -2349,15 +2331,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "secantus-pg-query"
+version = "0.1.0-beta.18"
+dependencies = [
+ "bindgen",
+ "cc",
+ "fs_extra",
+ "glob",
+ "itertools 0.10.5",
+ "prost",
+ "prost-build",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+]
+
+[[package]]
 name = "secantus-pgcatalog"
-version = "0.1.0-beta.17"
+version = "0.1.0-beta.18"
 dependencies = [
  "bson",
 ]
 
 [[package]]
 name = "secantus-pgplan"
-version = "0.1.0-beta.17"
+version = "0.1.0-beta.18"
 dependencies = [
  "aes",
  "blowfish 0.9.1",
@@ -2378,11 +2376,11 @@ dependencies = [
  "md-5 0.10.6",
  "num-bigint",
  "num-traits",
- "pg_query",
  "prost",
  "pwhash",
  "regex",
  "rust-stemmers",
+ "secantus-pg-query",
  "secantus-pgcatalog",
  "serde_json",
  "sha1",
@@ -2396,7 +2394,7 @@ dependencies = [
 
 [[package]]
 name = "secantus-pgwire"
-version = "0.1.0-beta.17"
+version = "0.1.0-beta.18"
 dependencies = [
  "async-trait",
  "base64 0.23.1",
@@ -2424,7 +2422,7 @@ dependencies = [
 
 [[package]]
 name = "secantus-server"
-version = "0.5.3-beta.196"
+version = "0.5.3-beta.197"
 dependencies = [
  "bson",
  "log",
@@ -2439,7 +2437,7 @@ dependencies = [
 
 [[package]]
 name = "secantus-server-py"
-version = "0.5.3-beta.196"
+version = "0.5.3-beta.197"
 dependencies = [
  "mimalloc",
  "pyo3",
@@ -2452,7 +2450,7 @@ dependencies = [
 
 [[package]]
 name = "secantus-storage"
-version = "0.5.3-beta.196"
+version = "0.5.3-beta.197"
 dependencies = [
  "bson",
  "flate2",
@@ -2466,7 +2464,7 @@ dependencies = [
 
 [[package]]
 name = "secantus-storage-adapter"
-version = "0.5.3-beta.196"
+version = "0.5.3-beta.197"
 dependencies = [
  "bson",
  "secantus-commands",
@@ -2475,7 +2473,7 @@ dependencies = [
 
 [[package]]
 name = "secantus-wire"
-version = "0.5.3-beta.196"
+version = "0.5.3-beta.197"
 dependencies = [
  "bson",
  "flate2",
@@ -2485,7 +2483,7 @@ dependencies = [
 
 [[package]]
 name = "secantus-wiredtiger-sys"
-version = "0.5.3-beta.196"
+version = "0.5.3-beta.197"
 dependencies = [
  "cc",
  "cmake",
@@ -2494,7 +2492,7 @@ dependencies = [
 
 [[package]]
 name = "secantus-wt"
-version = "0.5.3-beta.196"
+version = "0.5.3-beta.197"
 dependencies = [
  "secantus-wiredtiger-sys",
 ]
