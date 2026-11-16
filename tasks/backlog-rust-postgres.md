@@ -1998,6 +1998,14 @@ a regression test.
       before EXPLAIN plans it; the sublink-to-join conversion belongs
       beside it, as `convert_ANY_sublink_to_join` runs in the same
       `pull_up_sublinks` pass.)
+      (2026-11-16: the anti join RP-908 renders is a renamed `Hash Left
+      Join` (`left_anti_key` in `secantus-pg/src/lib.rs`), priced by
+      `scan_estimate`'s anti-join path; a semi join has no planner path or
+      price yet. PostgreSQL prices it with `eqjoinsel_semi` and
+      `final_cost_hashjoin`'s semi-join match fraction, and may instead
+      unique-ify the inner side into an inner join, so the costed test
+      needs both paths compared as `add_path` does; the two scenarios are
+      COSTS OFF and pin only the node shape.)
       Backlog-ID: RP-411
       Verify: tests/backlog/test_rp_explain_costs.py::test_plan[an in subquery is a hash semi join], tests/backlog/test_rp_explain_costs.py::test_plan[an exists subquery is a hash semi join]
 - [ ] **A hash join of two tables never analysed is unpriced, and its
@@ -2045,6 +2053,24 @@ a regression test.
       param text. The fix needs that node kind, the initplan's cost added
       to the scan's startup and total, and `b = $0` estimated as an
       equality to an unknown value: 1/ndistinct, so 100 of e's rows.)
+      (2026-11-16, measured while working RP-475 on PostgreSQL 15.19:
+      each sublink is its own InitPlan, numbered in order, `select * from
+      e where a > (select 5) and b = (select 'v3'::text)` printing
+      `(cost=0.02..20.02 rows=33 width=7)`, `Filter: ((a > $0) AND (b =
+      $1))`, then `InitPlan 1 (returns $0)` over `Result (cost=0.00..0.01
+      rows=1 width=4)` and `InitPlan 2 (returns $1)` over one of width 32:
+      the inequality to an unknown value is `DEFAULT_INEQ_SEL`, so the
+      `a > 5` this server substitutes at plan time would price wrongly. A
+      select-list sublink is an InitPlan too (`select a, (select 1) from
+      e` is `Seq Scan on e (cost=0.01..15.01 rows=1000 width=8)` over
+      `InitPlan 1`). JSON puts the Result in the scan's `Plans` with
+      `Parent Relationship: InitPlan`, `Subplan Name: InitPlan 1 (returns
+      $0)`. Text prints the InitPlan lines after the node's details and
+      before its child plans. The seq-scan pricer
+      (`user_seq_scan_with`) has no qual kind for a comparison to an
+      unknown value; `ExprQual` is the nearest shape but models a
+      statistics-less expression, not `var_eq_non_const` over a column's
+      own statistics.)
       Verify: tests/backlog/test_rp_explain_costs.py::test_plan[an uncorrelated subquery is an initplan], tests/backlog/test_rp_explain_costs.py::test_plan[a join's on subquery is an initplan on its scan]
       Backlog-ID: RP-440
 
