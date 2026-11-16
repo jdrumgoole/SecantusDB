@@ -2973,7 +2973,14 @@ its first input gave.
       and a nested set operation, and leaves any other input -- a join, an
       aggregate or GROUP BY, a DISTINCT, a computed column, a FROM
       subquery other than VALUES, a catalog -- in the written order,
-      hashed.
+      hashed. Sized 2026-11-16: the gap test's join is of a table never
+      analysed, which PostgreSQL 15.19 plans as `Merge Join (cost=176.34..
+      303.67 rows=8064 width=32)` over two default-sized scans (`rows=1270`
+      each, `estimate_rel_size`'s ten pages), `estimate_num_groups` over
+      `a.x` then clamping 200 default distinct values to those rows. This
+      server prices no join of never-analysed tables (RP-1019, the same
+      missing mechanism), so the join's estimate comes first; the order
+      then follows from `setop_plan` as for any estimated input.
       Verify: tests/backlog/test_rp_found_rp692.py::test_an_intersect_over_a_join_puts_the_smaller_input_first
       Backlog-ID: RP-841
 
