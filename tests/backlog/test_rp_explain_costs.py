@@ -4464,8 +4464,8 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
         "explain (costs off) select * from e where coalesce(1, a) = 1",
         ["Seq Scan on e"],
     ),
-    # `pull_up_subqueries` merges a simple FROM-subquery into its parent
-    # (found while working RP-409).
+    # `pull_up_subqueries` merged a simple FROM-subquery into its parent
+    # (found while working RP-409, fixed by RP-422).
     "a plain from-subquery is pulled up": (
         "RP-422",
         _ANALYSED,
@@ -6006,6 +6006,7 @@ def _marked(name: str, item: str) -> Any:
         "RP-412",
         "RP-421",
         "RP-915",
+        "RP-422",
     )
     mark = pytest.mark.backlog_fixed if fixed else pytest.mark.backlog
     return pytest.param(name, marks=mark(item), id=name)

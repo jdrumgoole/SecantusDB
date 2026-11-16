@@ -2022,15 +2022,6 @@ a regression test.
       working RP-409).
       Verify: tests/backlog/test_rp_explain_costs.py::test_plan[an aggregate over a dummy relation is priced], tests/backlog/test_rp_explain_costs.py::test_plan[a dummy join keeps its width]
       Backlog-ID: RP-420
-- [ ] **EXPLAIN of a plain FROM-subquery prints a Subquery Scan
-      PostgreSQL pulls up.** `pull_up_subqueries` merges a simple subquery
-      into its parent: `select * from (select * from e where a > 5) s` is
-      `Seq Scan on e` with `Filter: (a > 5)` on PostgreSQL 15.19; here
-      `Subquery Scan on s` over a `Seq Scan on e` that prints no Filter.
-      Its rows are right. Measured on a private 15.19 cluster (found while
-      working RP-409).
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a plain from-subquery is pulled up]
-      Backlog-ID: RP-422
 - [ ] **EXPLAIN prints an uncorrelated subquery inline, with no InitPlan
       and no estimate.** PostgreSQL 15.19 plans `(select 'v3'::text)` as
       an `InitPlan 1 (returns $0)` over a `Result`, run once, and the qual
