@@ -4547,8 +4547,21 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "        ->  Seq Scan on s t",
         ],
     ),
-    "an in subquery over a unique column is an inner join": (
+    "a hash semi join is priced": (
         "RP-411",
+        _ANALYSED_THIRTY,
+        "explain select * from e where a in (select a from s)",
+        [
+            "Hash Semi Join  (cost=1.68..19.63 rows=30 width=7)",
+            "  Hash Cond: (e.a = s.a)",
+            "  ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
+            "  ->  Hash  (cost=1.30..1.30 rows=30 width=4)",
+            "        ->  Seq Scan on s  (cost=0.00..1.30 rows=30 width=4)",
+        ],
+    ),
+    # Planned as the inner join `reduce_unique_semijoins` makes of it.
+    "an in subquery over a unique column is an inner join": (
+        "RP-411:fixed",
         _ANALYSED_THIRTY,
         "explain (costs off) select * from e where a in (select a from k)",
         [
@@ -4557,6 +4570,18 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "  ->  Seq Scan on e",
             "  ->  Hash",
             "        ->  Seq Scan on k",
+        ],
+    ),
+    "an exists subquery over a unique column is priced as an inner join": (
+        "RP-411:fixed",
+        _ANALYSED_THIRTY,
+        "explain select * from e where exists (select 1 from k where k.a = e.a)",
+        [
+            "Hash Join  (cost=27.50..45.14 rows=1000 width=7)",
+            "  Hash Cond: (e.a = k.a)",
+            "  ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
+            "  ->  Hash  (cost=15.00..15.00 rows=1000 width=4)",
+            "        ->  Seq Scan on k  (cost=0.00..15.00 rows=1000 width=4)",
         ],
     ),
     "an in subquery is a hash semi join": (

@@ -45619,6 +45619,15 @@ impl PgHandler {
                 "a join source reached execution on its own".into(),
             ))),
             Statement::Explain { inner, options } => {
+                // An IN / EXISTS whose inner side is unique on its column:
+                // `reduce_unique_semijoins` plans the inner join (RP-411).
+                if let Some(joined) = options.semi_join.as_ref().and_then(|sj| {
+                    sj.inner_join.as_ref().filter(|_| {
+                        self.unique_index_fixed(&sj.inner.0, std::slice::from_ref(&sj.inner_col))
+                    })
+                }) {
+                    return self.execute_statement((**joined).clone(), max_rows);
+                }
                 let _in_lengths = scan_estimate::explain_in_lengths(&options.scan_in_lengths);
                 let _patterns = scan_estimate::explain_patterns(&options.scan_patterns);
                 let db = self.db().to_string();
@@ -46706,10 +46715,9 @@ impl PgHandler {
                         })
                         .unwrap_or_else(|| scan_estimate::catalog_index_columns(name))
                 };
-                // An IN / EXISTS pulled up into a semi join (RP-411). Over
-                // an inner side unique on its column `reduce_unique_semijoins`
-                // makes it an inner join, whose sides cost decides: left as
-                // planned.
+                // An IN / EXISTS pulled up into a semi join (RP-411); over
+                // an inner side unique on its column it was planned above
+                // as the inner join `reduce_unique_semijoins` makes of it.
                 if let Some(sj) = &options.semi_join {
                     if !self.unique_index_fixed(&sj.inner.0, std::slice::from_ref(&sj.inner_col)) {
                         tree = explain::semi_join_tree(sj);

@@ -9,9 +9,13 @@
 //! no WHERE (IN) or a WHERE that is the one correlating column equality
 //! (EXISTS). Anything else is left to the plan as written.
 //!
-//! Only the node shape is modelled: a semi join has no planner path or
-//! price here yet (`eqjoinsel_semi`, and the unique-ified inner join
-//! `add_path` weighs against it), so its costs print as zeros.
+//! Over an inner relation unique on its column, `reduce_unique_semijoins`
+//! makes the semi join an inner join: `as_inner_join` writes that join, and
+//! the server plans it when a unique index fixes the column.
+//!
+//! Otherwise only the node shape is modelled: a semi join has no planner
+//! path or price here yet (`eqjoinsel_semi`, and the unique-ified inner
+//! join `add_path` weighs against it), so its costs print as zeros.
 
 use super::*;
 use pg_query::protobuf::{ColumnRef, RangeVar, SelectStmt, SubLinkType};
@@ -25,8 +29,16 @@ pub struct SemiJoin {
     pub inner: (String, String),
     /// The inner relation's column the clause compares.
     pub inner_col: String,
+    /// The outer relation's column the clause compares.
+    pub outer_col: String,
     /// `(outer.col = inner.col)`.
     pub hash_cond: String,
+    /// The EXPLAIN of the inner join `reduce_unique_semijoins` makes of
+    /// it when the inner relation is unique on `inner_col` (RP-411):
+    /// `outer JOIN inner ON outer.col = inner.col`, the select list read
+    /// from the outer side. Planned in `plan_explain`; the server, which
+    /// knows the unique indexes, chooses it.
+    pub inner_join: Option<Box<Statement>>,
 }
 
 fn plain(s: &SelectStmt) -> bool {
@@ -194,5 +206,82 @@ pub(crate) fn semi_join_of(
         outer: (outer_rv.relname.clone(), outer_name),
         inner: (inner_rv.relname.clone(), inner_name),
         inner_col,
+        outer_col,
+        inner_join: None,
     }))
+}
+
+fn column_ref(fields: Vec<N>) -> pg_query::protobuf::Node {
+    pg_query::protobuf::Node {
+        node: Some(N::ColumnRef(ColumnRef {
+            fields: fields
+                .into_iter()
+                .map(|f| pg_query::protobuf::Node { node: Some(f) })
+                .collect(),
+            location: -1,
+        })),
+    }
+}
+
+fn string(s: &str) -> N {
+    N::String(pg_query::protobuf::String { sval: s.into() })
+}
+
+/// `query` with its WHERE sublink `sj` made the inner join
+/// `reduce_unique_semijoins` leaves of a semi join whose inner side is
+/// unique (RP-411): FROM both relations, the hash clause as its WHERE, and
+/// each select-list column read from the outer side. `None` when the select
+/// list has anything but `*` and the outer side's own columns.
+pub(crate) fn as_inner_join(query: &N, sj: &SemiJoin) -> Option<N> {
+    let N::SelectStmt(s) = query else {
+        return None;
+    };
+    let Some(N::SubLink(link)) = s.where_clause.as_deref()?.node.as_ref() else {
+        return None;
+    };
+    let Some(N::SelectStmt(sub)) = link.subselect.as_deref()?.node.as_ref() else {
+        return None;
+    };
+    let inner_rv = one_relation(sub)?.clone();
+    let outer = sj.outer.1.as_str();
+    let mut out = s.clone();
+    for t in &mut out.target_list {
+        let Some(N::ResTarget(rt)) = t.node.as_mut() else {
+            return None;
+        };
+        let parts = rt.val.as_deref().and_then(|v| match v.node.as_ref() {
+            Some(N::ColumnRef(c)) => Some(c.fields.clone()),
+            _ => None,
+        })?;
+        let qualified = match parts.as_slice() {
+            [f] if matches!(f.node, Some(N::AStar(_))) => {
+                vec![string(outer), N::AStar(pg_query::protobuf::AStar {})]
+            }
+            [f] => match f.node.as_ref() {
+                Some(N::String(c)) => vec![string(outer), string(&c.sval)],
+                _ => return None,
+            },
+            [rel, _] if matches!(rel.node.as_ref(), Some(N::String(r)) if r.sval == outer) => {
+                parts.iter().filter_map(|p| p.node.clone()).collect()
+            }
+            _ => return None,
+        };
+        rt.val = Some(Box::new(column_ref(qualified)));
+    }
+    out.from_clause.push(pg_query::protobuf::Node {
+        node: Some(N::RangeVar(inner_rv)),
+    });
+    let side = |r: &str, c: &str| Box::new(column_ref(vec![string(r), string(c)]));
+    out.where_clause = Some(Box::new(pg_query::protobuf::Node {
+        node: Some(N::AExpr(Box::new(pg_query::protobuf::AExpr {
+            kind: pg_query::protobuf::AExprKind::AexprOp as i32,
+            name: vec![pg_query::protobuf::Node {
+                node: Some(string("=")),
+            }],
+            lexpr: Some(side(outer, &sj.outer_col)),
+            rexpr: Some(side(&sj.inner.1, &sj.inner_col)),
+            location: -1,
+        }))),
+    }));
+    Some(N::SelectStmt(out))
 }

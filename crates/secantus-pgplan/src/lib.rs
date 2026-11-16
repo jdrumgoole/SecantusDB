@@ -12472,6 +12472,13 @@ fn plan_explain(
     // An IN / EXISTS sublink is pulled up into a semi join (RP-411).
     if !options.analyze {
         options.semi_join = sublink_join::semi_join_of(&query, lookup);
+        if let Some(sj) = options.semi_join.as_mut() {
+            if let Some(joined) = sublink_join::as_inner_join(&query, sj) {
+                let mut alt = e.clone();
+                alt.query = Some(Box::new(pg_query::protobuf::Node { node: Some(joined) }));
+                sj.inner_join = Some(Box::new(plan_explain(&alt, lookup, params)?));
+            }
+        }
     }
     // The WHERE's constants are simplified before anything is planned
     // (`eval_const_expressions`, `canonicalize_qual`; RP-409).
