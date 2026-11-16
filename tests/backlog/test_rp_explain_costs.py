@@ -1390,7 +1390,7 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
     # Still open: a function call in a join filter costs its `procost` a
     # pair; here it is priced as nothing.
     "nested loop left join with a function call in its join filter": (
-        "RP-910",
+        "RP-910:fixed",
         _ANALYSED,
         "explain select * from e left join e e2 on e.a < abs(e2.a)",
         [

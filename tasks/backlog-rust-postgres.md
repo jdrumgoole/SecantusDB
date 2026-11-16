@@ -1826,17 +1826,6 @@ a regression test.
       15.19 cluster (found while working RP-925).
       Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a scan of an aliased relation]
       Backlog-ID: RP-967
-- [ ] **A function call in a nested loop's join filter is priced as
-      nothing.** `cost_qual_eval` charges a call its `procost` for every
-      pair the Join Filter checks: PostgreSQL 15.19 prints `select * from e
-      left join e e2 on e.a < abs(e2.a)` (`e`, `k` analysed, 1000 rows) as
-      `Nested Loop Left Join (cost=0.00..17532.50 rows=333333 width=14)`;
-      here `cost=0.00..15032.50`, the comparison alone. A cast in the same
-      place is priced (RP-354); a call needs its overload resolved by its
-      arguments' types to read its `procost`. Its rows are right. Measured
-      on a private 15.19 cluster (found while working RP-354).
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[nested loop left join with a function call in its join filter]
-      Backlog-ID: RP-910
 
 
 - [ ] **EXPLAIN ANALYZE's scan counters PostgreSQL prints that are still
