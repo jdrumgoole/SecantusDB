@@ -548,10 +548,10 @@ These are explicit non-goals. Don't add them without a reason.
       - where this server's ticket points differ from mongod's: a yield here
         keeps its locks, so it keeps its ticket and takes no second
         admission (mongod returns both and takes them again, RM-360); an
-        `awaitData` getMore returns its ticket for each 100 ms of its wait,
-        where mongod's yields once per wait; `abortTransaction`'s line
-        counts two execution admissions, where mongod's unstash makes it
-        three (`commitTransaction`'s three match, measured 2026-11-12);
+        `awaitData` getMore that waits 500 ms for a document counts 24,845
+        execution admissions on its line, where mongod 8.2.11's, which
+        yields once per wait, counts 4 (measured 2026-11-16: the wait takes
+        a ticket far more often than the once per 100 ms this item said);
         and an `update` or `delete` statement's line counts one admission
         fewer, its command's line one fewer per statement, because the
         statement's line is written with the command's locks still held
@@ -565,7 +565,7 @@ These are explicit non-goals. Don't add them without a reason.
         measured).
       **Decided (Joe, 2026-11-08): build mongod's execution admission control in full, the faithful option: the ingress controller, then the read and write ticket pools with `throughputProbing` (replacing `admission.rs`'s opt-in write tickets), then the per-command admission counts, so the concurrency cap is on by default as on mongod. Several PRs, in that order.** The ingress controller landed 2026-11-08, the ticket pools 2026-11-09, and the per-command admission counts on the line 2026-11-09; what is left is above.
       Backlog-ID: RM-355
-      Verify: tests/backlog/test_rm_355_364.py::test_ending_a_transaction_takes_mongods_execution_tickets
+      Verify: tests/backlog/test_rm_355_364.py::test_an_await_data_get_more_takes_mongods_execution_tickets
 - [ ] **Some writes' `locks` are not mongod's.** Since 2026-11-07 a write
       counts mongod's flow control tickets (one per global IX taken apart)
       and a retryable write's session checkout and session row, and a

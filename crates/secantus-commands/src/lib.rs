@@ -1323,7 +1323,8 @@ fn attach_write_concern_error(wc: &Document, provenance: &str, reply: &mut Docum
 /// because `writeConcernMajorityJournalDefault` is true on this one-member
 /// set -- and that is the implicit default, so a write with no write concern
 /// at all is journaled, as on mongod 8.2.11. `w: 0` never waits. A statement
-/// inside a transaction takes no write concern; its commit does.
+/// inside a transaction takes no write concern; its commit and its abort
+/// do (mongod 8.2.11: the abort's line counts the wait's ticket, RM-355).
 fn wants_journal(
     name: &str,
     doc: &Document,
@@ -1332,8 +1333,8 @@ fn wants_journal(
     standalone: bool,
 ) -> bool {
     let in_transaction = doc.contains_key("autocommit");
-    let takes =
-        name == "commitTransaction" || (!in_transaction && takes_default_write_concern(name, doc));
+    let takes = matches!(name, "commitTransaction" | "abortTransaction")
+        || (!in_transaction && takes_default_write_concern(name, doc));
     if !takes {
         return false;
     }
