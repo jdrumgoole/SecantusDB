@@ -1,6 +1,6 @@
 """Gap tests of what was found while working RP-527: RP-545 (a FROM item
-naming no relation is reported after the statement's qualified column
-references) and RP-546 (a function over a table's row type does not
+naming no relation was reported after the statement's qualified column
+references, fixed) and RP-546 (a function over a table's row type does not
 depend on the table, fixed: its tests are regression tests).
 
 An answer is the rows, `"ok"` for a statement with none, or `(sqlstate,
@@ -39,9 +39,9 @@ def _run(c: psycopg.Connection, query: str) -> Any:
 
 # `transformFromClause` runs before the select list and WHERE are read, so
 # a FROM relation that does not exist is 42P01 `relation "nosuch" does not
-# exist` at its name, whatever the qualified references say. Here the
-# qualifier is checked first: `fs.c` is `missing FROM-clause entry`, and
-# `nosuch.c` has the right message at the reference.
+# exist` at its name, whatever the qualified references say. The qualifier
+# used to be checked first: `fs.c` was `missing FROM-clause entry`, and
+# `nosuch.c` had the right message at the reference.
 MISSING_FROM_RELATION = {
     "select fs.c from nosuch": ("42P01", 'relation "nosuch" does not exist', None, "18"),
     "select nosuch.c from nosuch": ("42P01", 'relation "nosuch" does not exist', None, "22"),
@@ -54,7 +54,7 @@ MISSING_FROM_RELATION = {
 }
 
 
-@pytest.mark.backlog("RP-545")
+@pytest.mark.backlog_fixed("RP-545")
 @pytest.mark.parametrize("query", list(MISSING_FROM_RELATION))
 def test_missing_from_relation_reported_first(query: str, dsn: str) -> None:
     with psycopg.connect(dsn, autocommit=True) as c:

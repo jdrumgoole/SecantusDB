@@ -4848,6 +4848,27 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "        Index Cond: (y > z.a)",
         ],
     ),
+    # A chain of inequality joins under a LIMIT: the order the search
+    # keeps, each join and Material priced (RP-919). Measured on a private
+    # PostgreSQL 15.19 cluster.
+    "a chain of inequality joins under a limit": (
+        "RP-919",
+        _ANALYSED_SMALL,
+        "explain select e.a, e3.a, zs.a from e join e e3 on e.a < e3.a"
+        " join zs on e3.a > zs.a limit 5",
+        [
+            "Limit  (cost=0.00..0.23 rows=5 width=12)",
+            "  ->  Nested Loop  (cost=0.00..50178.62 rows=1111110 width=12)",
+            "        Join Filter: (e.a < e3.a)",
+            "        ->  Nested Loop  (cost=0.00..166.12 rows=3333 width=8)",
+            "              Join Filter: (e3.a > zs.a)",
+            "              ->  Seq Scan on e e3  (cost=0.00..15.00 rows=1000 width=4)",
+            "              ->  Materialize  (cost=0.00..1.15 rows=10 width=4)",
+            "                    ->  Seq Scan on zs  (cost=0.00..1.10 rows=10 width=4)",
+            "        ->  Materialize  (cost=0.00..20.00 rows=1000 width=4)",
+            "              ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=4)",
+        ],
+    ),
     # Split from RP-390 and fixed: a LEFT join filter over a char(n) column
     # reads the column blank-padded, so its pairs are counted and the
     # children annotated (they printed bare).
@@ -6051,11 +6072,11 @@ def test_a_chain_of_inequality_joins_runs_in_the_searched_order(rust_pg: Any) ->
     assert rows == [(1, 2, 1), (1, 3, 1), (2, 3, 1), (1, 3, 2), (2, 3, 2)]
 
 
-@pytest.mark.backlog("RP-919")
+@pytest.mark.backlog_fixed("RP-919")
 def test_a_chain_of_inequality_joins_under_a_limit(rust_pg: Any) -> None:
     """PostgreSQL 15.19 keeps the same order under a LIMIT (`e.a` of the
-    first five rows 1, 1, 2, 1, 2); here a LIMIT's search, which weighs
-    startup costs, is not run for a chain without equalities, and the
-    tables join as written."""
+    first five rows 1, 1, 2, 1, 2); a LIMIT's search, which weighs startup
+    costs, was not run for a chain without equalities, and the tables
+    joined as written."""
     rows = _first_rows(fresh_db(_dsn(rust_pg)), _INEQUALITY_CHAIN + " limit 5", 5)
     assert [r[0] for r in rows] == [1, 1, 2, 1, 2]

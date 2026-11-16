@@ -605,51 +605,119 @@ pub fn multirange_oid_name(oid: u32) -> Option<&'static str> {
     })
 }
 
-/// Split `{r1,r2}` into its members. A range contains commas of its own, so the
-/// split has to track brackets and quoting rather than cutting on every comma.
+/// Split `{r1,r2}` into its members, each a range literal's text (an
+/// `empty` member as `empty`).
+///
+/// A port of PostgreSQL's `multirange_in` scanner (`multirangetypes.c`):
+/// the members are read in place by its state machine, whitespace between
+/// tokens is skipped, and each failure is 22P02 `malformed multirange
+/// literal` naming the input as given, with the DETAIL of the state it
+/// stopped in. A member's own errors come from the range parser.
 pub fn split_members(text: &str) -> Result<Vec<String>> {
-    let t = text.trim();
-    if !t.starts_with('{') || !t.ends_with('}') {
-        return Err(bad_multirange(text));
+    #[derive(PartialEq)]
+    enum State {
+        BeforeRange,
+        InRange,
+        InRangeEscaped,
+        InRangeQuoted,
+        InRangeQuotedEscaped,
+        AfterRange,
+        Finished,
     }
-    let body = &t[1..t.len() - 1];
-    if body.trim().is_empty() {
-        return Ok(Vec::new());
+    let b = text.as_bytes();
+    let mut i = 0;
+    while i < b.len() && is_c_space(b[i]) {
+        i += 1;
     }
+    if b.get(i) != Some(&b'{') {
+        return Err(malformed_multirange(text, "Missing left brace."));
+    }
+    i += 1;
     let mut out = Vec::new();
-    let mut cur = String::new();
-    let mut depth = 0i32;
-    let mut quoted = false;
-    let mut chars = body.chars().peekable();
-    while let Some(c) = chars.next() {
-        match c {
-            '"' => {
-                quoted = !quoted;
-                cur.push(c);
-            }
-            '\\' if quoted => {
-                cur.push(c);
-                if let Some(n) = chars.next() {
-                    cur.push(n);
+    let mut ranges_seen = 0usize;
+    let mut start = 0usize;
+    let mut state = State::BeforeRange;
+    while state != State::Finished {
+        let Some(&ch) = b.get(i) else {
+            return Err(malformed_multirange(text, "Unexpected end of input."));
+        };
+        if is_c_space(ch) {
+            i += 1;
+            continue;
+        }
+        match state {
+            State::BeforeRange => {
+                if ch == b'[' || ch == b'(' {
+                    start = i;
+                    state = State::InRange;
+                } else if ch == b'}' && ranges_seen == 0 {
+                    state = State::Finished;
+                } else if b.len() - i >= 5 && b[i..i + 5].eq_ignore_ascii_case(b"empty") {
+                    ranges_seen += 1;
+                    out.push("empty".to_string());
+                    i += 4;
+                    state = State::AfterRange;
+                } else {
+                    return Err(malformed_multirange(text, "Expected range start."));
                 }
             }
-            '[' | '(' if !quoted => {
-                depth += 1;
-                cur.push(c);
+            State::InRange => {
+                if ch == b']' || ch == b')' {
+                    out.push(text[start..=i].to_string());
+                    ranges_seen += 1;
+                    state = State::AfterRange;
+                } else if ch == b'"' {
+                    state = State::InRangeQuoted;
+                } else if ch == b'\\' {
+                    state = State::InRangeEscaped;
+                }
             }
-            ']' | ')' if !quoted => {
-                depth -= 1;
-                cur.push(c);
+            State::InRangeEscaped => state = State::InRange,
+            State::InRangeQuoted => {
+                if ch == b'"' {
+                    if b.get(i + 1) == Some(&b'"') {
+                        i += 1;
+                    } else {
+                        state = State::InRange;
+                    }
+                } else if ch == b'\\' {
+                    state = State::InRangeQuotedEscaped;
+                }
             }
-            ',' if !quoted && depth == 0 => out.push(std::mem::take(&mut cur)),
-            _ => cur.push(c),
+            State::InRangeQuotedEscaped => state = State::InRangeQuoted,
+            State::AfterRange => {
+                if ch == b',' {
+                    state = State::BeforeRange;
+                } else if ch == b'}' {
+                    state = State::Finished;
+                } else {
+                    return Err(malformed_multirange(
+                        text,
+                        "Expected comma or end of multirange.",
+                    ));
+                }
+            }
+            State::Finished => unreachable!(),
         }
+        i += 1;
     }
-    if depth != 0 || quoted {
-        return Err(bad_multirange(text));
+    while i < b.len() && is_c_space(b[i]) {
+        i += 1;
     }
-    out.push(cur);
+    if i < b.len() {
+        return Err(malformed_multirange(
+            text,
+            "Junk after closing right brace.",
+        ));
+    }
     Ok(out)
+}
+
+/// `multirange_in`'s 22P02: the literal as given, and the check that failed.
+fn malformed_multirange(text: &str, detail: &str) -> Error {
+    Error::InvalidText(format!(
+        "malformed multirange literal: \"{text}\"\nDetail: {detail}"
+    ))
 }
 
 fn bad_multirange(text: &str) -> Error {
@@ -793,6 +861,27 @@ pub fn multirange_from_typed_args(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn multirange_scanner_reports_multirange_in_details() {
+        let detail = |t: &str| match split_members(t) {
+            Err(Error::InvalidText(m)) => m,
+            other => panic!("{t}: {other:?}"),
+        };
+        assert!(detail("[1,2)").ends_with("Detail: Missing left brace."));
+        assert!(detail("{[1,2)").ends_with("Detail: Unexpected end of input."));
+        assert!(detail("{[1,2)} x").ends_with("Detail: Junk after closing right brace."));
+        assert_eq!(
+            detail("{[1,2),x}"),
+            "malformed multirange literal: \"{[1,2),x}\"\nDetail: Expected range start."
+        );
+        assert!(detail("{[1,2) [3,4)}").ends_with("Detail: Expected comma or end of multirange."));
+        assert_eq!(
+            split_members(" { [1,2) , EMPTY, (\"a,]\",3] } ").unwrap(),
+            vec!["[1,2)", "empty", "(\"a,]\",3]"]
+        );
+        assert!(split_members("{}").unwrap().is_empty());
+    }
 
     fn detail_of(text: &str) -> String {
         match parse_literal(text) {

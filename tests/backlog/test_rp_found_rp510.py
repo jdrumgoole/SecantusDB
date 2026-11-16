@@ -1,5 +1,5 @@
 """Gap tests of the divergences found while working RP-510 (a malformed
-range literal's DETAIL): RP-878 (a malformed multirange literal's DETAIL,
+range literal's DETAIL): RP-878, fixed (a malformed multirange literal's DETAIL,
 and a bad member reported as a multirange literal).
 
 An answer is `("ok", rows)`, or `(sqlstate, message, detail, hint,
@@ -51,7 +51,7 @@ MULTIRANGE_LITERAL_DETAIL = {
 }
 
 
-@pytest.mark.backlog("RP-878")
+@pytest.mark.backlog_fixed("RP-878")
 @pytest.mark.parametrize("query", list(MULTIRANGE_LITERAL_DETAIL))
 def test_multirange_literal_detail(query: str, dsn: str) -> None:
     value, detail = MULTIRANGE_LITERAL_DETAIL[query]

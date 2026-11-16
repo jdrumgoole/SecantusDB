@@ -1784,22 +1784,22 @@ a regression test.
       working RP-354).
       Verify: tests/backlog/test_rp_explain_costs.py::test_plan[nested loop into a weakly correlated index], tests/backlog/test_rp_explain_costs.py::test_plan[nested loop of few rows into a weakly correlated index], tests/backlog/test_rp_explain_costs.py::test_a_wide_range_over_a_weakly_correlated_index
       Backlog-ID: RP-926
-- [ ] **A chain of inequality joins under a LIMIT runs in its written
-      order.** PostgreSQL's `standard_join_search` picks the order of an
-      inner join of tables linked only by `<`, `<=`, `>`, `>=` or `<>`;
-      without a LIMIT the chain now runs, and EXPLAIN prints, the order
-      the search keeps (`scan_estimate::reorder_nest_loop_chain`, applied
-      in `execute_inner_keys` and before `plan_tree`). Under a LIMIT the
-      estimate declines (`nest_loop_chain` refuses `sel.limit`, since a
-      LIMIT's search weighs startup costs, `join_order`'s
-      `limit_choice`), so the tables join as written: PostgreSQL 15.19
-      gives `e.a` 1, 1, 2, 1, 2 for `select * from e join e e3 on e.a <
-      e3.a join zs on e3.a > zs.a limit 5` (`e` 1,000 analysed rows,
-      `zs` ten), here 1, 1, 1, 1, 1. Also still written order: an ORDER
-      BY over the chain (the same refusal), a join two ONs land on in the
-      new tree, and a bushy tree (four or more tables). Measured on a
-      private 15.19 cluster (found while working RP-354).
-      Verify: tests/backlog/test_rp_explain_costs.py::test_a_chain_of_inequality_joins_under_a_limit
+- [ ] **A chain of inequality joins under a LIMIT prints unpriced, and
+      some chains still run in their written order.** Under a LIMIT the
+      chain now runs in the order PostgreSQL's search keeps
+      (`scan_estimate::nest_loop_chain` keeps each relation's paths with
+      `consider_startup`, and the top's is `get_cheapest_fractional_path`'s),
+      but EXPLAIN prices only a chain whose top node is the Nested Loop:
+      PostgreSQL 15.19 prints `explain select e.a, e3.a, zs.a from e join e
+      e3 on e.a < e3.a join zs on e3.a > zs.a limit 5` (`e` 1,000 analysed
+      rows, `zs` ten) as `Limit (cost=0.00..0.23 rows=5 width=12)` over
+      priced Nested Loops, each inner under a Materialize; here the same
+      tree with zero costs and no Materialize nodes. Still written order:
+      an ORDER BY over the chain (`nest_loop_chain` refuses `sel.order`), an
+      OFFSET, a join two ONs land on in the new tree, and a bushy tree (four
+      or more tables). Measured on a private 15.19 cluster (found while
+      working RP-354).
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a chain of inequality joins under a limit]
       Backlog-ID: RP-919
 - [ ] **EXPLAIN VERBOSE prints no `Output` lists above a scan.** A plan
       that is one relation's scan prints as VERBOSE does (RP-925); any
@@ -2242,17 +2242,6 @@ Measured on a private PostgreSQL 15.19 cluster.
 Measured on a private PostgreSQL 15.19 cluster. The gap tests are in
 `tests/backlog/test_rp_found_rp527.py`.
 
-- [ ] **A FROM relation that does not exist is reported after the
-      statement's qualified column references.** PostgreSQL 15.19's
-      `transformFromClause` runs before the select list and WHERE are read,
-      so `select fs.c from nosuch` is 42P01 `relation "nosuch" does not
-      exist` at 18, `select nosuch.c from nosuch` the same at 22 and
-      `select a from nosuch where zz.a = 1` at 15. Here the qualifier check
-      runs first: the first and third are `missing FROM-clause entry for
-      table "fs"` / `"zz"` (at 8, 28), and the second has PostgreSQL's
-      message at the reference (8).
-      Backlog-ID: RP-545
-      Verify: tests/backlog/test_rp_found_rp527.py::test_missing_from_relation_reported_first
 
 ## Found while working RP-532 (2026-11-08)
 
@@ -2546,25 +2535,6 @@ Measured on a private PostgreSQL 15.19 cluster with `fe(a int, b text)`.
       that scope.
       Verify: tests/backlog/test_rp_found_rp500.py::test_create_view_analyses_without_evaluating
       Backlog-ID: RP-968
-
-## Found while working RP-510 (2026-11-11)
-
-Measured on PostgreSQL 15.19.
-
-- [ ] **A malformed multirange literal's 22P02 has no DETAIL, and a bad
-      member is reported as a range literal.** PostgreSQL 15.19's
-      `multirange_in` walks the literal itself and explains each failure:
-      `select '{[1,2}'::int4multirange` and `'{[1,2)'` have DETAIL
-      `Unexpected end of input.`, `'[1,2)'` `Missing left brace.`, `'{[1,2)}
-      x'` `Junk after closing right brace.`, and `'{[1,2),x}'` is
-      `malformed multirange literal: "{[1,2),x}"` with `Expected range
-      start.`. Here the first four have no DETAIL, and the last is
-      `malformed range literal: "x"` with the range parser's DETAIL: the
-      literal is split into members first (`split_members`) and each member
-      parsed as a range, where PostgreSQL's state machine reads the members
-      in place.
-      Verify: tests/backlog/test_rp_found_rp510.py::test_multirange_literal_detail
-      Backlog-ID: RP-878
 
 ## Found while working RP-316 (2026-11-02)
 
