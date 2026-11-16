@@ -949,14 +949,17 @@ These are explicit non-goals. Don't add them without a reason.
       RM-359 its profile entry carries its stages (`execStats`); these do
       neither:
       - a read two or more plans could serve, which mongod chooses by
-        trial, other than a `find`'s or an `aggregate`'s that streams: an
-        `aggregate` that sorts or groups what its `$match` reads (mongod:
-        133 keys and documents over 400, this server none), a `count`'s,
-        a `distinct`'s, a write's. Its documents come from the store's
+        trial, other than a `find`'s or an `aggregate`'s that streams or
+        sorts: an `aggregate` that groups what its `$match` reads (mongod:
+        133 keys and documents over 400, this server none; the group runs
+        in SBE, and a trial outside the store's router misses SBE's
+        replanning at ten times the cached reads, RM-340), a `count`'s, a
+        `distinct`'s, a write's. Its documents come from the store's
         router. mongod counts what the winner examined in its trial, and
         since RM-349 a `find` (since 2026-11-13 an unsorted `aggregate` of
-        stages that stream) streams the winner after its trial's buffer
-        and counts as mongod's does; the other readers still decline a
+        stages that stream, since 2026-11-16 a classic one that sorts what
+        its `$match` reads) runs the winner after its trial's buffer and
+        counts as mongod's does; the other readers still decline a
         contested plan (`order::stream_plan`);
       - a read of a time-series collection made whole: under a `$sort`, a
         `$group` (`count_documents`), an inclusion `$project` (RM-456), a

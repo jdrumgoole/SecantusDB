@@ -1559,17 +1559,25 @@ def test_a_contested_aggregate_runs_its_cached_plan(rust_mongo: Any, mongod_rs: 
     assert answers["rust"] == answers["mongod"]
 
 
-@pytest.mark.backlog("RM-363")
 @pytest.mark.parametrize(
-    "stage", [{"$sort": {"z": 1}}, {"$group": {"_id": "$z", "n": {"$sum": 1}}}]
+    "stage",
+    [
+        pytest.param({"$sort": {"z": 1}}, marks=pytest.mark.backlog_fixed("RM-363")),
+        # The group runs in SBE, whose plan cache replans as RM-340 measured:
+        # still open.
+        pytest.param(
+            {"$group": {"_id": "$z", "n": {"$sum": 1}}}, marks=pytest.mark.backlog("RM-363")
+        ),
+    ],
 )
 def test_a_contested_aggregate_that_does_not_stream_counts_what_it_examined(
     rust_mongo: Any, mongod_rs: Any, stage: dict
 ) -> None:
     """mongod 8.2.11's line for a contested `aggregate` that sorts or groups
     what its `$match` reads counts what the winner examined (133 keys and
-    documents for both, measured 2026-11-13). This server reads such a
-    pipeline whole through its store's router, and counts nothing."""
+    documents for both, measured 2026-11-13). This server read such a
+    pipeline whole through its store's router, and counted nothing; since
+    2026-11-16 a sorting one runs the trial's winner and counts it."""
     answers = _contested_lines(
         rust_mongo,
         mongod_rs,

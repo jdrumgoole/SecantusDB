@@ -2958,7 +2958,16 @@ pub(crate) fn find_counted(
         sorts_documents: true,
         ..Default::default()
     };
-    let Some(plan) = stream_plan(storage, ask, 0, ask.limit, projection, false, flags)? else {
+    // A plan two or more indexes contest is chosen by mongod's trial, run
+    // through the plan cache, when the caller asks for the cache (RM-363):
+    // the winner's trial results are read first, and the read goes on from
+    // where it stopped, counting what the winner examined.
+    let planned = if ask.asked.cached {
+        stream_tried(storage, ask, 0, ask.limit, projection, false, flags)?
+    } else {
+        stream_plan(storage, ask, 0, ask.limit, projection, false, flags)?.map(|plan| (plan, None))
+    };
+    let Some((plan, trial)) = planned else {
         return Ok(None);
     };
     // No budget here: the pipeline's leading `$sort` holds the sort to its
@@ -2973,6 +2982,15 @@ pub(crate) fn find_counted(
     else {
         return Ok(None);
     };
+    if let Some(trial) = trial {
+        let _active = secantus_core::collation::activate(ask.collation);
+        stream.buffer_trial(
+            storage,
+            trial.results,
+            trial.ended,
+            trial.cached.then_some(&plan),
+        )?;
+    }
     let all = stream.read_all(storage)?;
     Ok(Some(Counted {
         docs: all.docs,
