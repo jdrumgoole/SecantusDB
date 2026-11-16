@@ -4870,11 +4870,11 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
         ],
     ),
     # The same chain under an OFFSET as well: PostgreSQL keeps the same
-    # tree, the Limit's startup the OFFSET's share (RP-919). Here the
-    # chain runs in its written order, unpriced. Measured on PostgreSQL
+    # tree, the Limit's startup the OFFSET's share (RP-919, fixed: the
+    # chain ran in its written order, unpriced). Measured on PostgreSQL
     # 15.19.
     "a chain of inequality joins under a limit and offset": (
-        "RP-919",
+        "RP-919:fixed",
         _ANALYSED_SMALL,
         "explain select e.a, e3.a, zs.a from e join e e3 on e.a < e3.a"
         " join zs on e3.a > zs.a limit 5 offset 2",
@@ -4889,6 +4889,29 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "                    ->  Seq Scan on zs  (cost=0.00..1.10 rows=10 width=4)",
             "        ->  Materialize  (cost=0.00..20.00 rows=1000 width=4)",
             "              ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=4)",
+        ],
+    ),
+    # The same chain sorted: PostgreSQL keeps the same tree under a Sort
+    # (RP-919). Here the chain runs in its written order, unpriced.
+    # Measured on PostgreSQL 15.19.
+    "a chain of inequality joins under an order by": (
+        "RP-919",
+        _ANALYSED_SMALL,
+        "explain select e.a, e3.a, zs.a from e join e e3 on e.a < e3.a"
+        " join zs on e3.a > zs.a order by zs.a limit 5",
+        [
+            "Limit  (cost=68633.76..68633.78 rows=5 width=12)",
+            "  ->  Sort  (cost=68633.76..71411.54 rows=1111110 width=12)",
+            "        Sort Key: zs.a",
+            "        ->  Nested Loop  (cost=0.00..50178.62 rows=1111110 width=12)",
+            "              Join Filter: (e.a < e3.a)",
+            "              ->  Nested Loop  (cost=0.00..166.12 rows=3333 width=8)",
+            "                    Join Filter: (e3.a > zs.a)",
+            "                    ->  Seq Scan on e e3  (cost=0.00..15.00 rows=1000 width=4)",
+            "                    ->  Materialize  (cost=0.00..1.15 rows=10 width=4)",
+            "                          ->  Seq Scan on zs  (cost=0.00..1.10 rows=10 width=4)",
+            "              ->  Materialize  (cost=0.00..20.00 rows=1000 width=4)",
+            "                    ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=4)",
         ],
     ),
     # Split from RP-390 and fixed: a LEFT join filter over a char(n) column

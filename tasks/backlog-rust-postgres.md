@@ -1785,19 +1785,18 @@ a regression test.
       Verify: tests/backlog/test_rp_explain_costs.py::test_plan[nested loop into a weakly correlated index], tests/backlog/test_rp_explain_costs.py::test_plan[nested loop of few rows into a weakly correlated index], tests/backlog/test_rp_explain_costs.py::test_a_wide_range_over_a_weakly_correlated_index
       Backlog-ID: RP-926
 - [ ] **Some chains of inequality joins still run in their written
-      order.** A chain under a LIMIT runs in the order PostgreSQL's search
-      keeps (`scan_estimate::nest_loop_chain` keeps each relation's paths
-      with `consider_startup`, the top's `get_cheapest_fractional_path`'s)
-      and EXPLAIN prices it under its Limit. Still written order, and
-      unpriced: an ORDER BY over the chain (`nest_loop_chain` refuses
-      `sel.order`), an OFFSET (it refuses `sel.offset`; PostgreSQL 15.19
-      prints `... limit 5 offset 2` over `e`, `e e3` and `zs` as `Limit
-      (cost=0.09..0.32 rows=5 width=12)` over the same priced tree as
-      without the OFFSET, so `limit_choice_of` needs the offset's rows and
-      `limit_estimate` its share), a join two ONs land on in the new tree,
-      and a bushy tree (four or more tables). Measured on a private 15.19
-      cluster (found while working RP-354).
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a chain of inequality joins under a limit and offset]
+      order.** A chain under a LIMIT (and OFFSET) runs in the order
+      PostgreSQL's search keeps (`scan_estimate::nest_loop_chain` keeps each
+      relation's paths with `consider_startup`, the top's
+      `get_cheapest_fractional_path`'s) and EXPLAIN prices it under its
+      Limit. Still written order, and unpriced: an ORDER BY over the chain
+      (`nest_loop_chain` refuses `sel.order`; PostgreSQL 15.19 keeps the
+      same tree under a `Sort (cost=68633.76..71411.54 rows=1111110
+      width=12)` with `order by zs.a limit 5` over `e`, `e e3` and `zs`),
+      a join two ONs land on in the new tree, and a bushy tree (four or
+      more tables). Measured on a private 15.19 cluster (found while
+      working RP-354).
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a chain of inequality joins under an order by]
       Backlog-ID: RP-919
 - [ ] **EXPLAIN VERBOSE prints no `Output` lists above a scan.** A plan
       that is one relation's scan prints as VERBOSE does (RP-925); any

@@ -1064,7 +1064,7 @@ impl PgHandler {
             || !sel.windows.is_empty()
             || !sel.order.is_empty()
             || sel.limit.is_some_and(|l| l < 0)
-            || sel.offset != 0
+            || sel.offset < 0
             || !matches!(sel.distinct, secantus_pgplan::Distinct::None)
             || sel.with_ties
             || sel.casts.iter().any(Option::is_some)
@@ -1493,14 +1493,15 @@ impl PgHandler {
             levels.push(made);
         }
         // The top's path: its cheapest in total or, under a LIMIT, the one
-        // the LIMIT reads least of (`get_cheapest_fractional_path`).
+        // the LIMIT -- past its OFFSET -- reads least of
+        // (`get_cheapest_fractional_path`).
         let top = &rels[&full];
         let mut at = match sel.limit {
             Some(count) => secantus_pgplan::joincost::limit_choice_of(
                 &top.paths,
                 top.est.2,
                 count.max(0) as f64,
-                0.0,
+                sel.offset as f64,
             )?,
             None => top.cheapest,
         };
