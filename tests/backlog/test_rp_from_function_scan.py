@@ -286,8 +286,38 @@ FUNCTION_SCAN_PLAN = {
 }
 
 
-@pytest.mark.backlog("RP-475")
+@pytest.mark.backlog_fixed("RP-475")
 @pytest.mark.parametrize("call", list(FUNCTION_SCAN_PLAN))
 def test_function_scan_plan(call: str, dsn: str) -> None:
+    """A user function in FROM printed a Subquery Scan over a Values Scan;
+    it now prints the Function Scan PostgreSQL runs, without the call."""
     rows, after = answer(dsn, call)
     assert (rows, after) == (FUNCTION_SCAN_PLAN[call], [([1, 2, 3],)])
+
+
+# PostgreSQL 15.19: `cost_functionscan` prices a Function Scan from the
+# function's `procost` and `prorows`, and a scalar SQL function whose body
+# is one SELECT is inlined into a Result.
+FUNCTION_SCAN_COST = {
+    "explain select * from fz473()": [
+        ("Function Scan on fz473  (cost=0.25..10.25 rows=1000 width=4)",)
+    ],
+    "explain select * from fq473()": [
+        ("Function Scan on fq473  (cost=0.25..0.26 rows=1 width=4)",)
+    ],
+    "explain (costs off) select * from fi475()": [("Result",)],
+}
+
+
+@pytest.mark.backlog("RP-475")
+@pytest.mark.parametrize("call", list(FUNCTION_SCAN_COST))
+def test_function_scan_cost(call: str, dsn: str) -> None:
+    with psycopg.connect(dsn, autocommit=True) as c:
+        for q in _SETUP:
+            c.execute(q)
+        c.execute("create or replace function fi475() returns int language sql as $$ select 1 $$")
+        try:
+            rows = c.execute(call).fetchall()
+        finally:
+            c.execute("drop function fi475()")
+    assert rows == FUNCTION_SCAN_COST[call]

@@ -1922,6 +1922,31 @@ pub(crate) fn attach_series_scan(
     }
 }
 
+/// A FROM function answered at plan time is planned as its rows' VALUES
+/// list under a Subquery Scan; PostgreSQL prints the `Function Scan` it
+/// runs (RP-475).
+pub(crate) fn attach_function_scan(root: &mut PlanNode, scan: &Option<String>) {
+    let Some(name) = scan else {
+        return;
+    };
+    fn find(n: &mut PlanNode) -> Option<&mut PlanNode> {
+        if n.name.starts_with("Subquery Scan on ")
+            && n.children.len() == 1
+            && n.children[0].name.starts_with("Values Scan")
+        {
+            return Some(n);
+        }
+        n.children.iter_mut().find_map(find)
+    }
+    if let Some(n) = find(root) {
+        let details = std::mem::take(&mut n.details);
+        let estimate = n.estimate.take();
+        *n = PlanNode::new(name.clone());
+        n.details = details;
+        n.estimate = estimate;
+    }
+}
+
 /// A single-relation SELECT's ORDER BY Sort prints its keys as the
 /// planned expressions (RP-840): the Sort below any Limit / Unique.
 pub(crate) fn attach_sort_keys(root: &mut PlanNode, keys: &Option<Vec<String>>) {
@@ -3239,6 +3264,7 @@ mod heap_fetches_tests {
             sort_keys: None,
             series_scan: None,
             series_qual: None,
+            function_scan: None,
         }
     }
 

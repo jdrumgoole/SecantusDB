@@ -2156,16 +2156,18 @@ Measured on PostgreSQL 15.19 (the data-modifying WITH on a private cluster).
 
 ## Found while working RP-472 (2026-11-07)
 
-- [ ] **EXPLAIN of a user function in FROM prints no Function Scan.**
-      PostgreSQL 15.19 prints `Function Scan on fq` for `explain (costs
-      off) select * from fq()`, a scalar or a SETOF SQL function alike.
-      Here each prints `Subquery Scan on fq` over `Values Scan on
-      "*VALUES*"` (a scalar one printed `Result` until RP-474 made it a
-      row source): the call is answered at plan time and its rows planned
-      as a VALUES list. A built-in
-      (`generate_series`) already prints its Function Scan.
+- [ ] **EXPLAIN of a user function in FROM prints an unpriced Function
+      Scan, and never inlines a scalar SQL function.** The node is named as
+      PostgreSQL names it (`Function Scan on fq`, the alias after it), but
+      `cost_functionscan`'s price is missing: PostgreSQL 15.19 prints
+      `(cost=0.25..10.25 rows=1000 width=4)` for a SETOF SQL function and
+      `(cost=0.25..0.26 rows=1 width=4)` for a scalar one, from `procost`
+      and `prorows`; here every cost is zero. A scalar SQL function whose
+      body is one SELECT (`select 1`) is inlined there and prints `Result`;
+      here it prints its Function Scan. A WHERE over the call prints no
+      `Filter` on the scan either. Rows are right.
       Backlog-ID: RP-475
-      Verify: tests/backlog/test_rp_from_function_scan.py::test_function_scan_plan
+      Verify: tests/backlog/test_rp_from_function_scan.py::test_function_scan_cost
 
 ## Found while working RP-454 (2026-11-07)
 

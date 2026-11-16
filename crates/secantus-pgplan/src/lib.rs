@@ -3755,6 +3755,9 @@ pub struct ExplainOptions {
     /// (RP-847): its operators per row, and its selectivity given the
     /// series' row count.
     pub series_qual: Option<SeriesQual>,
+    /// A SELECT over one other function in FROM: the `Function Scan on`
+    /// node's name, with its alias when it differs (RP-475).
+    pub function_scan: Option<String>,
 }
 
 /// A `generate_series` scan's WHERE as the planner prices it (RP-847).
@@ -12309,6 +12312,7 @@ fn plan_explain(
         sort_keys: None,
         series_scan: None,
         series_qual: None,
+        function_scan: None,
     };
     let (mut timing, mut summary) = (None, None);
     // `transformExplainStmt` resolves the statement's names and literals
@@ -12421,6 +12425,10 @@ fn plan_explain(
             None => (None, None),
         },
         _ => (None, None),
+    };
+    options.function_scan = match &query {
+        N::SelectStmt(s) if options.series_scan.is_none() => explain_function_scan(s),
+        _ => None,
     };
     options.sort_keys = match &query {
         N::SelectStmt(s) => match s.from_clause.as_slice() {
@@ -54665,9 +54673,46 @@ fn scan_where(query: &N) -> Option<(String, &pg_query::protobuf::Node)> {
 /// the function's name, and `show_scan_qual` prints the WHERE the scan
 /// applies to each row, its conjuncts ANDed.
 #[allow(clippy::type_complexity)]
+/// A `generate_series` Function Scan's alias and Filter text.
+type SeriesScan = (Option<String>, Option<String>);
+
+/// The Function Scan a single FROM function prints (RP-475):
+/// `Function Scan on f`, or `Function Scan on f a` under an alias.
+fn explain_function_scan(s: &pg_query::protobuf::SelectStmt) -> Option<String> {
+    let [item] = s.from_clause.as_slice() else {
+        return None;
+    };
+    let Some(N::RangeFunction(rf)) = item.node.as_ref() else {
+        return None;
+    };
+    if rf.lateral || rf.ordinality || rf.is_rowsfrom || rf.functions.len() != 1 {
+        return None;
+    }
+    let Some(N::List(l)) = rf.functions[0].node.as_ref() else {
+        return None;
+    };
+    let Some(N::FuncCall(f)) = l.items.first().and_then(|n| n.node.as_ref()) else {
+        return None;
+    };
+    let name = f
+        .funcname
+        .iter()
+        .rev()
+        .find_map(|n| match n.node.as_ref() {
+            Some(N::String(s)) => Some(s.sval.clone()),
+            _ => None,
+        })?;
+    let mut shown = format!("Function Scan on {}", scalar::quote_identifier(&name));
+    if let Some(a) = rf.alias.as_ref().filter(|a| a.aliasname != name) {
+        shown.push(' ');
+        shown.push_str(&scalar::quote_identifier(&a.aliasname));
+    }
+    Some(shown)
+}
+
 fn explain_series_scan(
     s: &pg_query::protobuf::SelectStmt,
-) -> Option<((Option<String>, Option<String>), Option<SeriesQual>)> {
+) -> Option<(SeriesScan, Option<SeriesQual>)> {
     let [item] = s.from_clause.as_slice() else {
         return None;
     };
