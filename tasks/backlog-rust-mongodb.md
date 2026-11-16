@@ -785,14 +785,17 @@ These are explicit non-goals. Don't add them without a reason.
       working RM-485, 2026-11-13.
       Verify: tests/backlog/test_rm_view_ddl_refusals.py::test_a_drop_indexes_of_system_views_answers
       Backlog-ID: RM-588
-- [ ] **A `find` of a time-series collection's buckets does not say what
-      it examined.** mongod 8.2.11's line for a `find` of
-      `<db>.system.buckets.ts` has `keysExamined`, `docsExamined` and
-      `nBatches`, as one of a collection's does; this server's has its
-      `planSummary` and `nreturned` and none of those. Found while working
-      RM-484, 2026-11-13.
-      Verify: tests/backlog/test_rm_ts_ddl_lines.py::test_a_find_of_buckets_says_what_it_examined
-      Backlog-ID: RM-586
+- [ ] **A `find` of a clustered collection that leaves its cursor open
+      does not say what it examined.** mongod 8.2.11's lines for a `find`
+      of `<db>.system.buckets.ts` read four at a time, and its `getMore`s,
+      each say what that batch examined (`keysExamined: 0`, `docsExamined`
+      4, 4, 2, `nBatches: 1`); this server's say `nreturned` alone. A
+      clustered collection's read is not streamed (`can_stream`), so a read
+      the first batch ends counts its plan's run as `explain` does (RM-586),
+      and one that leaves a cursor open counts nothing. Found while working
+      RM-586, 2026-11-16.
+      Verify: tests/backlog/test_rm_ts_ddl_lines.py::test_a_batched_find_of_buckets_says_what_each_batch_examined
+      Backlog-ID: RM-708
 - [ ] **A refused write of a view counts fewer locks than mongod's.**
       mongod 8.2.11 refuses a write of a view once it holds the namespace
       for the write; this server refuses it earlier, in `views::refusal`,

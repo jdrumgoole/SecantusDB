@@ -270,51 +270,12 @@ fn plan_info_with(
         out.summary = Some("EOF".to_string());
         return out;
     }
-    let Ok(collation) = crate::util::effective_collation(storage, db, &s.coll, &s.options) else {
+    let Some(node) = planned(storage, db, &s) else {
         return out;
     };
-    let Ok(full) = catalog(storage, db, &s.coll, None) else {
-        return out;
-    };
-    let (catalog, _) = crate::index_filters::apply(
-        storage,
-        db,
-        &s.coll,
-        &s.filter,
-        s.sort.as_ref(),
-        s.projection.as_ref(),
-        collation.as_ref(),
-        full,
-    );
-    let Ok(hint) = resolve_hint(s.hint.as_ref(), &catalog) else {
-        return out;
-    };
-    let canonical = parsed::parsed_query(&s.filter);
-    let implies = |partial: &Document| storage.query_implies_partial(&s.filter, partial);
-    let q = Query {
-        canonical: &canonical,
-        sort: s.sort.as_ref(),
-        projection: s.projection.as_ref(),
-        skip: s.skip,
-        limit: s.limit,
-        hint,
-        collation: collation.as_ref(),
-        min_max: s.min_max.is_some(),
-        return_key: s.return_key,
-        show_record_id: s.show_record_id,
-        batch_size: s.batch_size,
-        keys_only: false,
-        wanted: None,
-        sbe: false,
-        implies: &implies,
-        trial: None,
-    };
-    let node = match &s.kind {
-        Kind::Find => plan::plan(&q, &catalog),
-        Kind::Count => plan::count(&q, &catalog),
-        Kind::Distinct(key) => plan::distinct(&q, &catalog, key, !s.filter.is_empty()),
-        _ => return out,
-    };
+    let collation = crate::util::effective_collation(storage, db, &s.coll, &s.options)
+        .ok()
+        .flatten();
     let buckets = storage
         .get_collection_options(db, &s.coll)
         .ok()
@@ -349,6 +310,98 @@ fn plan_info_with(
     }
     out
 }
+/// The plan [`plan_info`] names for the read shaped `s` on `db`, planned
+/// apart from the plan cache. `None`: no such plan.
+fn planned(storage: &dyn crate::storage::Storage, db: &str, s: &Shape) -> Option<Node> {
+    let Ok(collation) = crate::util::effective_collation(storage, db, &s.coll, &s.options) else {
+        return None;
+    };
+    let Ok(full) = catalog(storage, db, &s.coll, None) else {
+        return None;
+    };
+    let (catalog, _) = crate::index_filters::apply(
+        storage,
+        db,
+        &s.coll,
+        &s.filter,
+        s.sort.as_ref(),
+        s.projection.as_ref(),
+        collation.as_ref(),
+        full,
+    );
+    let Ok(hint) = resolve_hint(s.hint.as_ref(), &catalog) else {
+        return None;
+    };
+    let canonical = parsed::parsed_query(&s.filter);
+    let implies = |partial: &Document| storage.query_implies_partial(&s.filter, partial);
+    let q = Query {
+        canonical: &canonical,
+        sort: s.sort.as_ref(),
+        projection: s.projection.as_ref(),
+        skip: s.skip,
+        limit: s.limit,
+        hint,
+        collation: collation.as_ref(),
+        min_max: s.min_max.is_some(),
+        return_key: s.return_key,
+        show_record_id: s.show_record_id,
+        batch_size: s.batch_size,
+        keys_only: false,
+        wanted: None,
+        sbe: false,
+        implies: &implies,
+        trial: None,
+    };
+    Some(match &s.kind {
+        Kind::Find => plan::plan(&q, &catalog),
+        Kind::Count => plan::count(&q, &catalog),
+        Kind::Distinct(key) => plan::distinct(&q, &catalog, key, !s.filter.is_empty()),
+        _ => return None,
+    })
+}
+
+/// What a `find` of `request` examined, `(keys, docs)`, for a read that
+/// did not count it as it read (a clustered collection's, which no stream
+/// reads, RM-586): its plan run over the collection's documents, as
+/// `explain`'s `executionStats` runs it. `None`: not a `find` of a
+/// collection there is.
+pub(crate) fn find_examined(
+    storage: &dyn crate::storage::Storage,
+    db: &str,
+    request: &Document,
+) -> Option<(i64, i64)> {
+    let s = shape_of(request)?;
+    if !matches!(s.kind, Kind::Find) || !storage.collection_exists(db, &s.coll).unwrap_or(false) {
+        return None;
+    }
+    let node = planned(storage, db, &s)?;
+    let collation = crate::util::effective_collation(storage, db, &s.coll, &s.options).ok()?;
+    let raw = storage
+        .find_collated(
+            db,
+            &s.coll,
+            &Document::new(),
+            None,
+            None,
+            None,
+            &Document::new(),
+        )
+        .ok()?;
+    let docs = crate::util::decode_docs(raw).ok()?;
+    let env = super::exec::Env {
+        docs: &docs,
+        collation: collation.as_ref(),
+        skip: s.skip,
+        limit: s.limit,
+        multi: true,
+        upsert: false,
+        returns: false,
+        known: None,
+        query: Some(&s.filter),
+    };
+    Some(super::exec::run(&node, &env).totals())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

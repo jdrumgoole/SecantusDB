@@ -123,12 +123,13 @@ def test_an_insert_into_buckets_is_profiled(rust_mongo: Any, mongod_rs: Any) -> 
 _EXAMINED = ("planSummary", "keysExamined", "docsExamined", "nBatches", "nreturned")
 
 
-@pytest.mark.backlog("RM-586")
+@pytest.mark.backlog_fixed("RM-586")
 def test_a_find_of_buckets_says_what_it_examined(rust_mongo: Any, mongod_rs: Any) -> None:
     """mongod 8.2.11's line for a `find` of `<db>.system.buckets.ts` says
     what it examined, as one of a collection's does (`keysExamined: 0`,
-    `docsExamined: 10`, `nBatches: 1` for ten buckets); this server's says
-    `COLLSCAN` and `nreturned` and leaves the rest out."""
+    `docsExamined: 10`, `nBatches: 1` for ten buckets); this server's said
+    `COLLSCAN` and `nreturned` and left the rest out, as a clustered
+    collection's read is not streamed and so counted nothing."""
     got = {
         server: [{k: a.get(k) for k in _EXAMINED} for _, a in lines]
         for server, (lines, _) in _both(
@@ -143,5 +144,32 @@ def test_a_find_of_buckets_says_what_it_examined(rust_mongo: Any, mongod_rs: Any
             "nBatches": 1,
             "nreturned": 10,
         }
+    ]
+    assert got["rust"] == got["mongod"]
+
+
+@pytest.mark.backlog("RM-708")
+def test_a_batched_find_of_buckets_says_what_each_batch_examined(
+    rust_mongo: Any, mongod_rs: Any
+) -> None:
+    """mongod 8.2.11's lines for a `find` of ten buckets read four at a
+    time, and its two `getMore`s, each say what that batch examined
+    (`docsExamined` 4, 4, 2, `nBatches: 1`, `cursorid`); this server's say
+    `nreturned` alone, as a clustered collection's read that leaves a
+    cursor open counts nothing."""
+    fields = (*_EXAMINED, "cursorExhausted")
+    got = {
+        server: [{k: a.get(k) for k in fields} for _, a in lines]
+        for server, (lines, _) in _both(
+            rust_mongo,
+            mongod_rs,
+            lambda d: list(d["system.buckets.ts"].find(batch_size=4)),
+        ).items()
+    }
+    batch = {"planSummary": "COLLSCAN", "keysExamined": 0, "nBatches": 1}
+    assert got["mongod"] == [
+        {**batch, "docsExamined": 4, "nreturned": 4, "cursorExhausted": None},
+        {**batch, "docsExamined": 4, "nreturned": 4, "cursorExhausted": None},
+        {**batch, "docsExamined": 2, "nreturned": 2, "cursorExhausted": True},
     ]
     assert got["rust"] == got["mongod"]
