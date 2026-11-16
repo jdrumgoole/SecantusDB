@@ -426,15 +426,66 @@ impl<'p> Scope<'p> {
         lookup: &dyn Fn(&str) -> Option<TableDef>,
         parent: Option<&Scope>,
     ) {
-        if q.op != pg_query::protobuf::SetOperation::SetopNone as i32 {
-            self.complete = false;
-            return;
-        }
-        let inner = Scope::new(&q.from_clause, ctes, lookup, parent);
         let named = |n: &pg_query::protobuf::Node| match n.node.as_ref() {
             Some(N::String(s)) => Some(s.sval.clone()),
             _ => None,
         };
+        // A set operation: its columns are named by the leftmost arm and
+        // typed as the arms' common type (`transformSetOperationTree`).
+        if q.op != pg_query::protobuf::SetOperation::SetopNone as i32 {
+            let mut left = q;
+            while left.op != pg_query::protobuf::SetOperation::SetopNone as i32 {
+                let Some(l) = left.larg.as_deref() else {
+                    self.complete = false;
+                    return;
+                };
+                left = l;
+            }
+            let outer = Scope::new(&[], ctes, lookup, parent);
+            let mut columns = Vec::new();
+            for (k, t) in left.target_list.iter().enumerate() {
+                let Some(N::ResTarget(rt)) = t.node.as_ref() else {
+                    self.complete = false;
+                    return;
+                };
+                let Some(val) = rt.val.as_deref() else {
+                    self.complete = false;
+                    return;
+                };
+                if let Some(N::ColumnRef(c)) = val.node.as_ref() {
+                    if c.fields.iter().any(|f| matches!(f.node, Some(N::AStar(_)))) {
+                        self.complete = false;
+                        return;
+                    }
+                }
+                let name = colnames
+                    .get(k)
+                    .and_then(named)
+                    .or_else(|| (!rt.name.is_empty()).then(|| rt.name.clone()))
+                    .or_else(|| match val.node.as_ref() {
+                        Some(N::ColumnRef(c)) => c.fields.last().and_then(named),
+                        Some(N::FuncCall(f)) => func_name(f),
+                        _ => None,
+                    })
+                    .unwrap_or_else(|| "?column?".to_string());
+                let ty = match nth_output_type(q, k, &outer) {
+                    Some(None) => "text".to_string(),
+                    Some(Some(t)) => t,
+                    None => String::new(),
+                };
+                columns.push(Column::new(&name, &ty, true));
+            }
+            let names: Vec<String> = columns.iter().map(|c| c.name.clone()).collect();
+            for c in &mut columns {
+                if names.iter().filter(|n| **n == c.name).count() > 1 {
+                    c.pg_type.clear();
+                }
+            }
+            self.tables
+                .push((alias.clone(), TableDef::new(&alias, columns)));
+            return;
+        }
+        let inner = Scope::new(&q.from_clause, ctes, lookup, parent);
         // `(VALUES ...) v(a, b)`: column k is the rows' common type at k
         // (`select_common_type`), named by the alias list or `columnK`.
         if !q.values_lists.is_empty() {

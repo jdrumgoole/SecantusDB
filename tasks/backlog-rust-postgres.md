@@ -1785,18 +1785,16 @@ a regression test.
       Verify: tests/backlog/test_rp_explain_costs.py::test_plan[nested loop into a weakly correlated index], tests/backlog/test_rp_explain_costs.py::test_plan[nested loop of few rows into a weakly correlated index], tests/backlog/test_rp_explain_costs.py::test_a_wide_range_over_a_weakly_correlated_index
       Backlog-ID: RP-926
 - [ ] **Some chains of inequality joins still run in their written
-      order.** A chain under a LIMIT (and OFFSET) runs in the order
-      PostgreSQL's search keeps (`scan_estimate::nest_loop_chain` keeps each
-      relation's paths with `consider_startup`, the top's
-      `get_cheapest_fractional_path`'s) and EXPLAIN prices it under its
-      Limit. Still written order, and unpriced: an ORDER BY over the chain
-      (`nest_loop_chain` refuses `sel.order`; PostgreSQL 15.19 keeps the
-      same tree under a `Sort (cost=68633.76..71411.54 rows=1111110
-      width=12)` with `order by zs.a limit 5` over `e`, `e e3` and `zs`),
-      a join two ONs land on in the new tree, and a bushy tree (four or
-      more tables). Measured on a private 15.19 cluster (found while
-      working RP-354).
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a chain of inequality joins under an order by]
+      order.** A chain under a LIMIT (and OFFSET), or sorted by an ORDER BY
+      under one, runs in the order PostgreSQL's search keeps
+      (`scan_estimate::nest_loop_chain`) and EXPLAIN prices it. Still
+      written order, and unpriced: a bushy tree (four or more tables;
+      PostgreSQL 15.19 keeps `e join e3` as the outer of a Nested Loop whose
+      inner is a Materialize of `e4 join zs`, for `... join zs on e3.a >
+      zs.a join e e4 on e4.a < zs.a limit 5`), and a join two ONs land on
+      in the new tree (`reorder_nest_loop_chain` refuses it). Measured on a
+      private 15.19 cluster (found while working RP-354).
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a bushy chain of inequality joins under a limit]
       Backlog-ID: RP-919
 - [ ] **EXPLAIN VERBOSE prints no `Output` lists above a scan.** A plan
       that is one relation's scan prints as VERBOSE does (RP-925); any
@@ -1996,25 +1994,6 @@ a regression test.
       cluster (found while working RP-399).
       Backlog-ID: RP-411
       Verify: tests/backlog/test_rp_explain_costs.py::test_plan[an in subquery is a hash semi join], tests/backlog/test_rp_explain_costs.py::test_plan[an exists subquery is a hash semi join]
-- [ ] **A missing column's 42703 names the wrong reference, or drops its
-      qualifier.** PostgreSQL 15.19 reports the first missing column in
-      the order it analyses the statement, by the name as written and at
-      its first token. Here: `select * from e, k where k.bcc = 1 and e.bb =
-      2` reports `column e.bb does not exist` at 40 (PostgreSQL `column
-      k.bcc does not exist` at 26); a third table's `join k on k.bcc = 1`
-      reports `column "bcc"` at the name's own token; an UPDATE's or
-      DELETE's alias is dropped (`update e x set a = 1 where x.bb = 1` is
-      `column "bb"` at 30, PostgreSQL `column x.bb` at 28);
-      `public.e.bb` is positioned at 15, not 8; and `on conflict (a) do
-      update set b = excluded.bb` reports this server's internal name,
-      `column "__excluded__.bb" does not exist`, with no position
-      (PostgreSQL `column excluded.bb does not exist` at 65). Each loses
-      its HINT too, as the hint is found from the reference at the
-      error's position. Measured on a private 15.19 cluster with `e(a
-      int, b text)`, `s(a int, c text)`, `k(a int, b text, bc int)`
-      (found while working RP-408).
-      Backlog-ID: RP-414
-      Verify: tests/backlog/test_rp_column_errors.py::test_missing_column_reported_as_written
 - [ ] **A hash join of two tables never analysed is unpriced, and its
       sides stay in written order.** `hash_side` prices a side only from
       `analysed_key`, which needs `pg_statistic` rows. PostgreSQL 15.19
@@ -2851,24 +2830,6 @@ test is in `tests/backlog/test_rp_found_rp900.py`.
       Bind hands it `DEFAULT_NAME`.
       Verify: tests/backlog/test_rp_found_rp900.py::test_the_unnamed_portal_is_not_in_pg_cursors
       Backlog-ID: RP-936
-
-## Found while working RP-756 (2026-11-10)
-
-Measured on PostgreSQL 15.19 (the shared reference on port 5415): every
-statement is VALUES-only and runs there as written.
-
-- [ ] **A FROM subquery's set operation is not typed by the operator
-      check.** `select x = 1 from (select 'a'::text union select 'b')
-      s(x)` is 42883 `operator does not exist: text = integer` at 10 on
-      PostgreSQL 15.19 (the set operation's column is its arms' common
-      type, `text` when both are untyped literals); here it is 0A000
-      `comparing string with int32 using = is not supported yet`, raised
-      at run time with no position. `optype.rs`'s `add_derived` marks a
-      set-operation FROM item incomplete, so none of its columns is
-      typed. A scalar subquery over a set operation is typed since RP-756
-      (`first_output_type`).
-      Verify: tests/backlog/test_rp_found_rp756.py::test_a_set_operation_from_subquerys_column_is_typed
-      Backlog-ID: RP-765
 
 ## Found while working RP-782 (2026-11-10)
 

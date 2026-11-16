@@ -30,7 +30,7 @@ mod colhint;
 mod default_expr;
 mod schema_refs;
 mod values_refs;
-pub use colhint::missing_column_hint;
+pub use colhint::{first_missing_column, missing_column_hint};
 pub mod colstats;
 pub mod costsize;
 mod expr_memo;
@@ -12487,6 +12487,10 @@ fn plan_explain(
                             .all(|n| matches!(n.node.as_ref(), Some(N::RangeVar(_))))
                 }
             };
+            // A join's ORDER BY keys, qualified (RP-919).
+            if joined {
+                options.sort_keys = ruleutils::explain_join_sort_keys(s, &cat);
+            }
             options.join_where = if joined {
                 ruleutils::join_where(s, &cat).unwrap_or_default()
             } else {

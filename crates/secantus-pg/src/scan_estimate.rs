@@ -1062,7 +1062,6 @@ impl PgHandler {
         if sel.series.is_some()
             || sel.join.is_some()
             || !sel.windows.is_empty()
-            || !sel.order.is_empty()
             || sel.limit.is_some_and(|l| l < 0)
             || sel.offset < 0
             || !matches!(sel.distinct, secantus_pgplan::Distinct::None)
@@ -1496,7 +1495,9 @@ impl PgHandler {
         // the LIMIT -- past its OFFSET -- reads least of
         // (`get_cheapest_fractional_path`).
         let top = &rels[&full];
-        let mut at = match sel.limit {
+        // An ORDER BY sorts the cheapest in total: no path of the chain
+        // is ordered, so none is presorted (RP-919).
+        let mut at = match sel.limit.filter(|_| sel.order.is_empty()) {
             Some(count) => secantus_pgplan::joincost::limit_choice_of(
                 &top.paths,
                 top.est.2,

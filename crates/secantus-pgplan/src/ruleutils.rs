@@ -5728,19 +5728,82 @@ pub fn explain_sort_keys(
                 format!("({})", p.buf)
             }
         };
-        let desc = sb.sortby_dir == pg_query::protobuf::SortByDir::SortbyDesc as i32;
-        let nulls = sb.sortby_nulls;
-        let first = pg_query::protobuf::SortByNulls::SortbyNullsFirst as i32;
-        let last = pg_query::protobuf::SortByNulls::SortbyNullsLast as i32;
-        let suffix = match (desc, nulls) {
-            (false, n) if n == first => " NULLS FIRST",
-            (false, _) => "",
-            (true, n) if n == last => " DESC NULLS LAST",
-            (true, _) => " DESC",
-        };
-        out.push(format!("{text}{suffix}"));
+        out.push(format!("{text}{}", sort_key_suffix(sb)));
     }
     computed.then_some(out)
+}
+
+/// A Sort key's direction and NULLS placement as EXPLAIN prints them.
+fn sort_key_suffix(sb: &pg_query::protobuf::SortBy) -> &'static str {
+    let desc = sb.sortby_dir == pg_query::protobuf::SortByDir::SortbyDesc as i32;
+    let nulls = sb.sortby_nulls;
+    let first = pg_query::protobuf::SortByNulls::SortbyNullsFirst as i32;
+    let last = pg_query::protobuf::SortByNulls::SortbyNullsLast as i32;
+    match (desc, nulls) {
+        (false, n) if n == first => " NULLS FIRST",
+        (false, _) => "",
+        (true, n) if n == last => " DESC NULLS LAST",
+        (true, _) => " DESC",
+    }
+}
+
+/// A join's ORDER BY Sort keys as EXPLAIN prints them (RP-919): over more
+/// than one relation each Var is qualified by its relation's name. A key
+/// naming an output column, or by its position, is that column's
+/// expression (`findTargetlistEntrySQL92`). `None` for a shape the printer
+/// does not know.
+pub fn explain_join_sort_keys(
+    s: &pg_query::protobuf::SelectStmt,
+    cat: &Catalog<'_>,
+) -> Option<Vec<String>> {
+    if s.sort_clause.is_empty() {
+        return None;
+    }
+    let mut p = Printer::new(cat, 0);
+    p.fold_consts = true;
+    let mut rtes = Vec::new();
+    p.collect_rtes(&s.from_clause, &mut rtes)?;
+    p.scopes.push(rtes);
+    let targets: Vec<(&str, &Node)> = s
+        .target_list
+        .iter()
+        .filter_map(|t| match t.node.as_ref() {
+            Some(N::ResTarget(rt)) => Some((rt.name.as_str(), rt.val.as_deref()?)),
+            _ => None,
+        })
+        .collect();
+    let mut out = Vec::new();
+    for item in &s.sort_clause {
+        let Some(N::SortBy(sb)) = item.node.as_ref() else {
+            return None;
+        };
+        let mut key = sb.node.as_deref()?;
+        match key.node.as_ref() {
+            Some(N::AConst(c)) => {
+                let Some(Val::Ival(v)) = c.val.as_ref() else {
+                    return None;
+                };
+                key = targets
+                    .get(usize::try_from(v.ival).ok()?.checked_sub(1)?)?
+                    .1;
+            }
+            Some(N::ColumnRef(c)) if c.fields.len() == 1 => {
+                let name = c.fields.first().and_then(sval)?;
+                if let Some((_, t)) = targets.iter().find(|(n, _)| *n == name) {
+                    key = t;
+                }
+            }
+            _ => {}
+        }
+        p.buf.clear();
+        p.expr(key)?;
+        let text = match key.node.as_ref() {
+            Some(N::ColumnRef(_)) => p.buf.clone(),
+            _ => format!("({})", p.buf),
+        };
+        out.push(format!("{text}{}", sort_key_suffix(sb)));
+    }
+    Some(out)
 }
 
 /// A FROM-less statement's unfolded WHERE as EXPLAIN prints it as the

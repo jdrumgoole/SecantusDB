@@ -27130,29 +27130,43 @@ impl PgHandler {
     fn column_hinted(&self, mut e: PgWireError, sql: &str) -> PgWireError {
         if let PgWireError::UserError(info) = &mut e {
             if info.code == "42703" && info.hint.is_none() {
+                // A table's columns, or a view's as its catalog row
+                // records them.
+                let columns = |n: &str| {
+                    self.lookup(n)
+                        .map(|def| def.columns.into_iter().map(|c| c.name).collect())
+                        .or_else(|| {
+                            let doc = self.view_doc(n)?;
+                            let row = doc.get_array("row_fields").ok()?;
+                            row.iter()
+                                .map(|f| match f {
+                                    Bson::Array(f) => f.first()?.as_str().map(str::to_string),
+                                    _ => None,
+                                })
+                                .collect()
+                        })
+                };
+                let lookup = |n: &str| self.lookup(n);
+                // PostgreSQL reports the first missing reference in its
+                // analysis order, by the name as written (RP-414).
+                let plain = info.message.starts_with("column ")
+                    && info.message.ends_with(" does not exist")
+                    && !info.message.contains(" of relation ");
+                if plain {
+                    if let Some((message, position)) =
+                        secantus_pgplan::first_missing_column(sql, &columns, &lookup)
+                    {
+                        info.message = message;
+                        info.position = Some(position.to_string());
+                    }
+                }
                 if let Some(position) = info.position.as_deref().and_then(|p| p.parse().ok()) {
-                    // A table's columns, or a view's as its catalog row
-                    // records them.
-                    let columns = |n: &str| {
-                        self.lookup(n)
-                            .map(|def| def.columns.into_iter().map(|c| c.name).collect())
-                            .or_else(|| {
-                                let doc = self.view_doc(n)?;
-                                let row = doc.get_array("row_fields").ok()?;
-                                row.iter()
-                                    .map(|f| match f {
-                                        Bson::Array(f) => f.first()?.as_str().map(str::to_string),
-                                        _ => None,
-                                    })
-                                    .collect()
-                            })
-                    };
                     info.hint = secantus_pgplan::missing_column_hint(
                         sql,
                         position,
                         &info.message,
                         &columns,
-                        &|n: &str| self.lookup(n),
+                        &lookup,
                     );
                 }
             }
@@ -45861,12 +45875,25 @@ impl PgHandler {
                 // the Limit is `adjust_limit_rows_costs` over its top.
                 let under_limit =
                     tree.name == "Limit" && tree.details.is_empty() && tree.children.len() == 1;
-                let mut depth = 0;
-                let mut node = if under_limit {
-                    &tree.children[0]
-                } else {
-                    &tree
+                // Under a Sort of an ORDER BY (RP-919), itself under the
+                // Limit or not: `cost_sort` over the chain's top, bounded
+                // by the Limit's count past its offset.
+                let is_sort = |t: &explain::PlanNode| {
+                    t.name == "Sort"
+                        && t.children.len() == 1
+                        && t.details.iter().all(|(k, _)| k == "Sort Key")
                 };
+                let under_sort = if under_limit {
+                    is_sort(&tree.children[0])
+                } else {
+                    is_sort(&tree)
+                };
+                let above = usize::from(under_limit) + usize::from(under_sort);
+                let mut depth = 0;
+                let mut node = &tree;
+                for _ in 0..above {
+                    node = &node.children[0];
+                }
                 let chain = loop {
                     if node.name != "Nested Loop"
                         || !node.details.is_empty()
@@ -45885,19 +45912,33 @@ impl PgHandler {
                     if let Statement::Select(sel) = inner.as_ref() {
                         if let Some(levels) = self.nest_loop_chain_estimate(sel) {
                             if levels.len() == depth {
-                                if under_limit {
-                                    if let Some((_, _, _, top, _)) = levels.last() {
-                                        let count = sel.limit.map_or(0, |n| n.max(1));
+                                if let Some((_, _, _, top, _)) = levels.last() {
+                                    let count = sel.limit.map_or(0, |n| n.max(1));
+                                    let mut input = *top;
+                                    if under_sort {
+                                        let bound = (under_limit && count > 0)
+                                            .then(|| (count + sel.offset.max(0)) as f64);
+                                        let (startup, total) = secantus_pgplan::joincost::cost_sort(
+                                            top.1, top.2, top.3, bound,
+                                        );
+                                        input = (startup, total, top.2, top.3);
+                                        let sort = if under_limit {
+                                            &mut tree.children[0]
+                                        } else {
+                                            &mut tree
+                                        };
+                                        sort.estimate = Some(input);
+                                    }
+                                    if under_limit {
                                         tree.estimate = Some(scan_estimate::limit_estimate(
-                                            *top, sel.offset, count,
+                                            input, sel.offset, count,
                                         ));
                                     }
                                 }
-                                let root = if under_limit {
-                                    &mut tree.children[0]
-                                } else {
-                                    &mut tree
-                                };
+                                let mut root = &mut tree;
+                                for _ in 0..above {
+                                    root = &mut root.children[0];
+                                }
                                 // Lowest first, so each join above is
                                 // still the tree's when it is reached.
                                 for (i, (plan, a, b, join, param)) in levels.iter().enumerate() {
