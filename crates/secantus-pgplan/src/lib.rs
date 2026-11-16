@@ -12536,6 +12536,17 @@ fn plan_explain(
     options.sort_keys = match &query {
         N::SelectStmt(s) => match s.from_clause.as_slice() {
             [item] => match item.node.as_ref() {
+                // An InitPlan's range table entry makes the range table
+                // longer than one, so the keys are qualified
+                // (`show_sort_group_keys`'s `useprefix`, RP-440).
+                Some(N::RangeVar(_)) if !options.init_plans.is_empty() => {
+                    let none = |_: &str| None;
+                    let cat = ruleutils::Catalog {
+                        lookup,
+                        view_sql: &none,
+                    };
+                    ruleutils::explain_join_sort_keys(s, &cat)
+                }
                 Some(N::RangeVar(rv)) => {
                     lookup(&rv.relname).and_then(|def| ruleutils::explain_sort_keys(s, &def))
                 }

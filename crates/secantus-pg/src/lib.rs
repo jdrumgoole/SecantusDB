@@ -45851,8 +45851,22 @@ impl PgHandler {
                     let init_cost: Option<f64> =
                         inits.iter().map(|n| n.estimate.map(|e| e.1)).sum();
                     if let (Statement::Select(sel), Some(init_cost)) = (inner.as_ref(), init_cost) {
-                        if tree.children.is_empty()
-                            && tree.name.starts_with("Seq Scan on ")
+                        // A Sort of the scan's rows for an ORDER BY over
+                        // returned columns (`cost_sort`); the InitPlans'
+                        // cost is on the top node only.
+                        let sorted = tree.name == "Sort"
+                            && tree.children.len() == 1
+                            && tree.children[0].children.is_empty()
+                            && tree.children[0].name.starts_with("Seq Scan on ")
+                            && sel.limit.is_none()
+                            && sel.offset == 0
+                            && matches!(sel.distinct, secantus_pgplan::Distinct::None)
+                            && !sel.with_ties
+                            && sel.order.iter().all(|k| {
+                                k.expr.is_none() && sel.columns.iter().any(|(_, f)| *f == k.field)
+                            });
+                        if (sorted
+                            || tree.children.is_empty() && tree.name.starts_with("Seq Scan on "))
                             && sel.sub.is_none()
                             && sel.series.is_none()
                             && sel.join.is_none()
@@ -45863,7 +45877,7 @@ impl PgHandler {
                                 .iter()
                                 .map(|ip| (ip.field.clone(), ip.op))
                                 .collect();
-                            tree.estimate = scan_estimate::target_cost(sel).and_then(
+                            let scan = scan_estimate::target_cost(sel).and_then(
                                 |(cost, width, fields)| {
                                     let (startup, total, rows, w) = self.init_plan_scan_estimate(
                                         &sel.table,
@@ -45871,14 +45885,23 @@ impl PgHandler {
                                         &quals,
                                         &fields,
                                     )?;
-                                    Some((
-                                        startup + init_cost,
-                                        total + cost * rows + init_cost,
-                                        rows,
-                                        w + width,
-                                    ))
+                                    Some((startup, total + cost * rows, rows, w + width))
                                 },
                             );
+                            let top = if sorted {
+                                tree.children[0].estimate = scan;
+                                scan.map(|e| {
+                                    scan_estimate::sort_estimate(
+                                        e,
+                                        self.kb_setting("work_mem", 4096),
+                                    )
+                                })
+                            } else {
+                                scan
+                            };
+                            tree.estimate = top.map(|(startup, total, rows, w)| {
+                                (startup + init_cost, total + init_cost, rows, w)
+                            });
                         }
                     }
                     // On the top plan node (`SS_attach_initplans`).

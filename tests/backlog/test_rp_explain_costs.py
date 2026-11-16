@@ -4529,10 +4529,10 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "              Filter: (b = $0)",
         ],
     ),
-    # A node above an InitPlan's scan is priced, the InitPlan's cost on
-    # the top node only, measured on 15.19 (RP-440).
+    # A node above an InitPlan's scan was priced, the InitPlan's cost on
+    # the top node only, measured on 15.19 (RP-440, fixed).
     "a sort above an initplan's scan is priced": (
-        "RP-440",
+        "RP-440:fixed",
         _ANALYSED,
         "explain select a from e where b = (select 'v3'::text) order by a",
         [
@@ -4541,6 +4541,20 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "  InitPlan 1 (returns $0)",
             "    ->  Result  (cost=0.00..0.01 rows=1 width=32)",
             "  ->  Seq Scan on e  (cost=0.00..17.50 rows=100 width=4)",
+            "        Filter: (b = $0)",
+        ],
+    ),
+    # An aggregate over an InitPlan's scan has no Subquery Scan between
+    # them; the Aggregate line measured on 15.19 (RP-440).
+    "an aggregate over an initplan's scan is not a subquery scan": (
+        "RP-440",
+        _ANALYSED,
+        "explain select count(*) from e where b = (select 'v3'::text)",
+        [
+            "Aggregate  (cost=17.76..17.77 rows=1 width=8)",
+            "  InitPlan 1 (returns $0)",
+            "    ->  Result  (cost=0.00..0.01 rows=1 width=32)",
+            "  ->  Seq Scan on e  (cost=0.00..17.50 rows=100 width=0)",
             "        Filter: (b = $0)",
         ],
     ),

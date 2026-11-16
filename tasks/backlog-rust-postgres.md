@@ -2035,28 +2035,25 @@ a regression test.
       working RP-409).
       Verify: tests/backlog/test_rp_explain_costs.py::test_plan[an aggregate over a dummy relation is priced], tests/backlog/test_rp_explain_costs.py::test_plan[a dummy join keeps its width]
       Backlog-ID: RP-420
-- [ ] **A node above an InitPlan's scan is unpriced.** Since RP-440's
-      first slices (2026-11-16) a SELECT over one relation whose WHERE
+- [ ] **An aggregate above an InitPlan's scan is a Subquery Scan.** Since
+      RP-440's first slices (2026-11-16) a SELECT over one relation whose WHERE
       compares columns with uncorrelated FROM-less scalar subqueries plans
       each as an InitPlan on the top node, as PostgreSQL 15.19 does
       (`secantus-pgplan/src/initplan.rs`, `$n` printed through
       `ruleutils::with_init_plans`), and prices a plain Seq Scan over them
-      (`var_eq_non_const`, `DEFAULT_INEQ_SEL`); a join's ON conjunct of that
-      shape is placed in its side's scan as `Filter: (b = $0)`, inner and
-      LEFT join alike (`initplan::on_init_plans`; `joins::alias_of` takes
-      the sublink as a parameter while EXPLAIN places quals). Still open:
-      (1) A node above the scan is unpriced: `explain select a from e where
-      b = (select 'v3'::text) order by a` is `Sort (cost=20.83..21.08
-      rows=100 width=4)`, `Sort Key: e.a`, over `Seq Scan on e
-      (cost=0.00..17.50 rows=100 width=4)` (the initplan's cost is on the
-      top node only); here zeros and `Sort Key: a`. (2) `select count(*)
-      from e where b = (select 'v3'::text)` prints a `Subquery Scan on e`
-      between the Aggregate and the scan, which PostgreSQL does not have
-      (`Aggregate (cost=17.76..17.77 rows=1 width=8)` over the scan). (3) A
-      subquery with a FROM, a correlated one, or a sublink beside any other
-      non-constant qual is still printed inline; a join's ON InitPlan is
-      unpriced. Measured on a private 15.19 cluster.
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a sort above an initplan's scan is priced]
+      (`var_eq_non_const`, `DEFAULT_INEQ_SEL`), and a Sort above that scan
+      (keys qualified, as the InitPlan lengthens the range table); a join's
+      ON conjunct of that shape is placed in its side's scan as `Filter: (b =
+      $0)`, inner and LEFT join alike (`initplan::on_init_plans`). Still
+      open: (1) `select count(*) from e where b = (select 'v3'::text)` prints
+      a `Subquery Scan on e` between the Aggregate and the scan, unpriced,
+      which PostgreSQL does not have (`Aggregate (cost=17.76..17.77 rows=1
+      width=8)` over the scan). (2) A subquery with a FROM, a correlated
+      one, or a sublink beside any other non-constant qual is still printed
+      inline; a join's ON InitPlan is unpriced; other nodes above the scan
+      (Limit, Unique, a computed sort key) are unpriced. Measured on a
+      private 15.19 cluster.
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[an aggregate over an initplan's scan is not a subquery scan]
       Backlog-ID: RP-440
 
 ## Found by batch 54 (2026-10-24)
