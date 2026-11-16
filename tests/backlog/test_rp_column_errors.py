@@ -1,6 +1,6 @@
 """Gap tests of the missing-column and ON-clause errors found while working
 RP-408: RP-413 (a function in FROM leaves a 42703 with no HINT), RP-414 (a
-42703 names the wrong reference or drops its qualifier), RP-415 (a column
+42703 named the wrong reference or dropped its qualifier; fixed), RP-415 (a column
 in an INSERT's VALUES was refused as a gap; fixed) and RP-416 (a join's ON
 after a comma item was not type-checked; fixed); RP-430, found while fixing
 RP-416 (a subquery's join ON could not name the outer query; fixed); and
@@ -130,9 +130,13 @@ AS_WRITTEN = {
 }
 
 
-@pytest.mark.backlog("RP-414")
+@pytest.mark.backlog_fixed("RP-414")
 @pytest.mark.parametrize("query", list(AS_WRITTEN))
 def test_missing_column_reported_as_written(query: str, dsn: str) -> None:
+    """A 42703 named the last missing column this server's lowering met,
+    by its internal name or without its alias's qualifier; PostgreSQL
+    reports the first one in parse analysis's order, as written, at its
+    first token."""
     assert answer(dsn, query) == AS_WRITTEN[query]
 
 

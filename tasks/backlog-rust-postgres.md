@@ -1996,25 +1996,6 @@ a regression test.
       cluster (found while working RP-399).
       Backlog-ID: RP-411
       Verify: tests/backlog/test_rp_explain_costs.py::test_plan[an in subquery is a hash semi join], tests/backlog/test_rp_explain_costs.py::test_plan[an exists subquery is a hash semi join]
-- [ ] **A missing column's 42703 names the wrong reference, or drops its
-      qualifier.** PostgreSQL 15.19 reports the first missing column in
-      the order it analyses the statement, by the name as written and at
-      its first token. Here: `select * from e, k where k.bcc = 1 and e.bb =
-      2` reports `column e.bb does not exist` at 40 (PostgreSQL `column
-      k.bcc does not exist` at 26); a third table's `join k on k.bcc = 1`
-      reports `column "bcc"` at the name's own token; an UPDATE's or
-      DELETE's alias is dropped (`update e x set a = 1 where x.bb = 1` is
-      `column "bb"` at 30, PostgreSQL `column x.bb` at 28);
-      `public.e.bb` is positioned at 15, not 8; and `on conflict (a) do
-      update set b = excluded.bb` reports this server's internal name,
-      `column "__excluded__.bb" does not exist`, with no position
-      (PostgreSQL `column excluded.bb does not exist` at 65). Each loses
-      its HINT too, as the hint is found from the reference at the
-      error's position. Measured on a private 15.19 cluster with `e(a
-      int, b text)`, `s(a int, c text)`, `k(a int, b text, bc int)`
-      (found while working RP-408).
-      Backlog-ID: RP-414
-      Verify: tests/backlog/test_rp_column_errors.py::test_missing_column_reported_as_written
 - [ ] **A hash join of two tables never analysed is unpriced, and its
       sides stay in written order.** `hash_side` prices a side only from
       `analysed_key`, which needs `pg_statistic` rows. PostgreSQL 15.19

@@ -42,6 +42,7 @@ type Levels = Vec<Vec<Rte>>;
 struct Found {
     levels: Levels,
     parts: Vec<String>,
+    location: i32,
 }
 
 /// Why a walk stopped early.
@@ -63,6 +64,14 @@ struct Finder<'a> {
     functions: Option<FunctionColumns<'a>>,
     /// The CTEs in scope, innermost WITH last: `(name, columns)`.
     ctes: Vec<Vec<(String, Option<Vec<String>>)>>,
+    /// Stop at the first reference no range table resolves, in place of
+    /// the one at `location` (RP-414).
+    first_missing: bool,
+    /// The search met something it does not model: its answer is not
+    /// PostgreSQL's.
+    uncertain: bool,
+    /// The output names an ORDER BY, GROUP BY or DISTINCT ON may name.
+    outputs: Option<Vec<String>>,
 }
 
 /// The HINT PostgreSQL sends with the 42703 `message` this server raised
@@ -88,6 +97,9 @@ pub fn missing_column_hint(
         columns,
         functions: Some(&functions),
         ctes: Vec::new(),
+        first_missing: false,
+        uncertain: false,
+        outputs: None,
     };
     let found = match finder.statement(&mut node) {
         Err(Stop::Found(f)) => f,
@@ -107,6 +119,78 @@ pub fn missing_column_hint(
         return None;
     }
     hint_for(&found.levels, alias, name)
+}
+
+/// The missing column PostgreSQL reports for `sql`: the first column
+/// reference, in parse analysis's order, that no range table in force
+/// there resolves, as `(message, position)` (1-based, in characters), by
+/// the name as written (`column x.bb`, `column "bb"`) and at its first
+/// token (RP-414). This server finds a missing column late, in the
+/// lowering, in its own order and under its own names. `None` when the
+/// search meets what it does not model, or finds every reference.
+pub fn first_missing_column(
+    sql: &str,
+    columns: &dyn Fn(&str) -> Option<Vec<String>>,
+    lookup: &dyn Fn(&str) -> Option<TableDef>,
+) -> Option<(String, usize)> {
+    let functions = |rf: &pb::RangeFunction| joins::function_columns(rf, lookup, &[]);
+    let mut node = pb::Node {
+        node: Some(parse_one_as_sent(sql).ok()?),
+    };
+    let mut finder = Finder {
+        location: i32::MIN,
+        columns,
+        functions: Some(&functions),
+        ctes: Vec::new(),
+        first_missing: true,
+        uncertain: false,
+        outputs: None,
+    };
+    let found = match finder.statement(&mut node) {
+        Err(Stop::Found(f)) => f,
+        Ok(()) => return None,
+    };
+    if finder.uncertain {
+        return None;
+    }
+    let message = match found.parts.as_slice() {
+        [name] => format!("column \"{name}\" does not exist"),
+        [.., alias, name] => format!("column {alias}.{name} does not exist"),
+        [] => return None,
+    };
+    let byte = usize::try_from(found.location).ok()?;
+    let position = sql.get(..byte)?.chars().count() + 1;
+    Some((message, position))
+}
+
+/// Whether `parts` (a column reference's names, no star) resolves in
+/// `levels`: `None` when that cannot be told here.
+fn resolves(levels: &Levels, parts: &[String], outputs: Option<&[String]>) -> Option<bool> {
+    let rtes = || levels.iter().rev().flat_map(|l| l.iter());
+    match parts {
+        [name] => {
+            if outputs.is_some_and(|o| o.contains(name)) {
+                return Some(true);
+            }
+            let mut any = false;
+            for rte in rtes() {
+                // A whole-row reference names the entry.
+                if rte.alias == *name || rte.cols.as_ref()?.contains(name) {
+                    any = true;
+                }
+            }
+            Some(any)
+        }
+        [.., alias, name] => {
+            match rtes().find(|r| r.alias == *alias) {
+                Some(rte) => Some(rte.cols.as_ref()?.contains(name)),
+                // A composite column's field, or a missing FROM entry:
+                // neither is this error.
+                None => None,
+            }
+        }
+        [] => None,
+    }
 }
 
 /// `errorMissingColumn`'s hint, from `searchRangeTableForCol`'s answer.
@@ -269,6 +353,9 @@ pub(crate) fn from_item_columns(
         columns,
         functions: Some(functions),
         ctes: Vec::new(),
+        first_missing: false,
+        uncertain: false,
+        outputs: None,
     };
     let mut with = pb::WithClause {
         ctes: ctes.to_vec(),
@@ -342,13 +429,37 @@ impl Finder<'_> {
     fn expr(&mut self, node: &mut pb::Node, levels: &Levels) -> Walk<()> {
         let mut stop: Option<Stop> = None;
         let location = self.location;
+        let first_missing = self.first_missing;
+        let outputs = self.outputs.clone();
+        let mut uncertain = false;
         let _ = walk_expr(node, &mut |n| {
             match n.node.as_mut() {
                 Some(N::ColumnRef(c)) if c.location == location => {
                     stop = Some(Stop::Found(Found {
                         levels: levels.clone(),
                         parts: strings(&c.fields),
+                        location: c.location,
                     }));
+                }
+                Some(N::ColumnRef(c)) if first_missing => {
+                    let star = matches!(
+                        c.fields.last().and_then(|f| f.node.as_ref()),
+                        Some(N::AStar(_))
+                    );
+                    let parts = strings(&c.fields);
+                    if !star && parts.len() == c.fields.len() {
+                        match resolves(levels, &parts, outputs.as_deref()) {
+                            Some(true) => {}
+                            Some(false) => {
+                                stop = Some(Stop::Found(Found {
+                                    levels: levels.clone(),
+                                    parts,
+                                    location: c.location,
+                                }))
+                            }
+                            None => uncertain = true,
+                        }
+                    }
                 }
                 Some(N::SubLink(sl)) => {
                     if let Some(N::SelectStmt(body)) =
@@ -364,9 +475,18 @@ impl Finder<'_> {
             match stop {
                 // Any error ends the walk; the stop says why.
                 Some(_) => Err(Error::Internal(String::new())),
+                None if uncertain => Err(Error::Internal(String::new())),
                 None => Ok(()),
             }
         });
+        if uncertain && stop.is_none() {
+            self.uncertain = true;
+            return Err(Stop::Found(Found {
+                levels: Levels::new(),
+                parts: Vec::new(),
+                location: 0,
+            }));
+        }
         match stop {
             Some(s) => Err(s),
             None => Ok(()),
@@ -464,6 +584,11 @@ impl Finder<'_> {
                     Some(r) => self.range_item(r, levels, rtable)?,
                     None => None,
                 };
+                // A join's alias hides its sides' names, which this
+                // search does not model.
+                if self.first_missing && j.alias.is_some() {
+                    self.uncertain = true;
+                }
                 if let Some(q) = j.quals.as_deref_mut() {
                     self.expr(q, &with_level(levels, rtable))?;
                 }
@@ -615,16 +740,43 @@ impl Finder<'_> {
             items.push(self.range_item(item, levels, &mut rtable)?);
         }
         let here = with_level(levels, &rtable);
-        self.exprs(s.target_list.iter_mut(), &here)?;
-        self.exprs(s.where_clause.as_deref_mut(), &here)?;
-        self.exprs(s.group_clause.iter_mut(), &here)?;
-        self.exprs(s.having_clause.as_deref_mut(), &here)?;
-        self.exprs(s.window_clause.iter_mut(), &here)?;
-        self.exprs(s.sort_clause.iter_mut(), &here)?;
-        self.exprs(s.distinct_clause.iter_mut(), &here)?;
-        self.exprs(s.limit_offset.as_deref_mut(), &here)?;
-        self.exprs(s.limit_count.as_deref_mut(), &here)?;
+        // `transformSelectStmt`'s order. Only its ORDER BY, GROUP BY and
+        // DISTINCT ON may name an output column.
+        let outer = self.outputs.take();
+        let out = self.select_clauses(s, &here, &rtable, &items);
+        self.outputs = outer;
+        out?;
         Ok(output_columns(s, &rtable, &items))
+    }
+
+    fn select_clauses(
+        &mut self,
+        s: &mut pb::SelectStmt,
+        here: &Levels,
+        rtable: &[Rte],
+        items: &[Option<Vec<String>>],
+    ) -> Walk<()> {
+        self.exprs(s.target_list.iter_mut(), here)?;
+        self.exprs(s.where_clause.as_deref_mut(), here)?;
+        self.exprs(s.having_clause.as_deref_mut(), here)?;
+        let named = !(s.sort_clause.is_empty()
+            && s.group_clause.is_empty()
+            && s.distinct_clause.is_empty());
+        let outputs = output_columns(s, rtable, items);
+        if self.first_missing && named && outputs.is_none() {
+            self.uncertain = true;
+        }
+        let saved = std::mem::replace(&mut self.outputs, outputs);
+        let out = (|| {
+            self.exprs(s.sort_clause.iter_mut(), here)?;
+            self.exprs(s.group_clause.iter_mut(), here)?;
+            self.exprs(s.distinct_clause.iter_mut(), here)
+        })();
+        self.outputs = saved;
+        out?;
+        self.exprs(s.limit_offset.as_deref_mut(), here)?;
+        self.exprs(s.limit_count.as_deref_mut(), here)?;
+        self.exprs(s.window_clause.iter_mut(), here)
     }
 
     fn insert(&mut self, i: &mut pb::InsertStmt) -> Walk<()> {
@@ -679,9 +831,10 @@ impl Finder<'_> {
             self.range_item(item, &Vec::new(), &mut rtable)?;
         }
         let here: Levels = vec![rtable];
-        self.exprs(u.target_list.iter_mut(), &here)?;
+        // `transformUpdateStmt`'s order: the SET list last.
         self.exprs(u.where_clause.as_deref_mut(), &here)?;
         self.exprs(u.returning_list.iter_mut(), &here)?;
+        self.exprs(u.target_list.iter_mut(), &here)?;
         if scoped {
             self.ctes.pop();
         }
@@ -783,6 +936,40 @@ mod tests {
             alias: alias.into(),
             cols: Some(cols.iter().map(|c| c.to_string()).collect()),
         }
+    }
+
+    fn first_missing(sql: &str) -> Option<(String, usize)> {
+        let columns = |n: &str| match n {
+            "e" => Some(vec!["a".to_string(), "b".to_string()]),
+            "k" => Some(vec!["a".to_string(), "b".to_string(), "bc".to_string()]),
+            _ => None,
+        };
+        first_missing_column(sql, &columns, &|_| None)
+    }
+
+    // PostgreSQL 15.19's answers (RP-414).
+    #[test]
+    fn first_missing_column_is_in_analysis_order_as_written() {
+        let m = |s: &str, p: usize| Some((s.to_string(), p));
+        assert_eq!(
+            first_missing("select * from e, k where k.bcc = 1 and e.bb = 2"),
+            m("column k.bcc does not exist", 26)
+        );
+        assert_eq!(
+            first_missing("update e x set a = x.b where x.bb = 1"),
+            m("column x.bb does not exist", 30)
+        );
+        assert_eq!(
+            first_missing("select public.e.bb from e"),
+            m("column e.bb does not exist", 8)
+        );
+        assert_eq!(
+            first_missing("select a as z from e order by z, zz"),
+            m("column \"zz\" does not exist", 34)
+        );
+        // A FROM entry whose columns are unknown here gives no answer.
+        assert_eq!(first_missing("select bb from nosuch"), None);
+        assert_eq!(first_missing("select a from e"), None);
     }
 
     #[test]

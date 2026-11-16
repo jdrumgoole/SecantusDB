@@ -27130,29 +27130,43 @@ impl PgHandler {
     fn column_hinted(&self, mut e: PgWireError, sql: &str) -> PgWireError {
         if let PgWireError::UserError(info) = &mut e {
             if info.code == "42703" && info.hint.is_none() {
+                // A table's columns, or a view's as its catalog row
+                // records them.
+                let columns = |n: &str| {
+                    self.lookup(n)
+                        .map(|def| def.columns.into_iter().map(|c| c.name).collect())
+                        .or_else(|| {
+                            let doc = self.view_doc(n)?;
+                            let row = doc.get_array("row_fields").ok()?;
+                            row.iter()
+                                .map(|f| match f {
+                                    Bson::Array(f) => f.first()?.as_str().map(str::to_string),
+                                    _ => None,
+                                })
+                                .collect()
+                        })
+                };
+                let lookup = |n: &str| self.lookup(n);
+                // PostgreSQL reports the first missing reference in its
+                // analysis order, by the name as written (RP-414).
+                let plain = info.message.starts_with("column ")
+                    && info.message.ends_with(" does not exist")
+                    && !info.message.contains(" of relation ");
+                if plain {
+                    if let Some((message, position)) =
+                        secantus_pgplan::first_missing_column(sql, &columns, &lookup)
+                    {
+                        info.message = message;
+                        info.position = Some(position.to_string());
+                    }
+                }
                 if let Some(position) = info.position.as_deref().and_then(|p| p.parse().ok()) {
-                    // A table's columns, or a view's as its catalog row
-                    // records them.
-                    let columns = |n: &str| {
-                        self.lookup(n)
-                            .map(|def| def.columns.into_iter().map(|c| c.name).collect())
-                            .or_else(|| {
-                                let doc = self.view_doc(n)?;
-                                let row = doc.get_array("row_fields").ok()?;
-                                row.iter()
-                                    .map(|f| match f {
-                                        Bson::Array(f) => f.first()?.as_str().map(str::to_string),
-                                        _ => None,
-                                    })
-                                    .collect()
-                            })
-                    };
                     info.hint = secantus_pgplan::missing_column_hint(
                         sql,
                         position,
                         &info.message,
                         &columns,
-                        &|n: &str| self.lookup(n),
+                        &lookup,
                     );
                 }
             }

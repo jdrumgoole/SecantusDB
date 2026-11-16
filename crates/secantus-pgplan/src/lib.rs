@@ -30,7 +30,7 @@ mod colhint;
 mod default_expr;
 mod schema_refs;
 mod values_refs;
-pub use colhint::missing_column_hint;
+pub use colhint::{first_missing_column, missing_column_hint};
 pub mod colstats;
 pub mod costsize;
 mod expr_memo;
