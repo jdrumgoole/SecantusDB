@@ -574,7 +574,9 @@ These are explicit non-goals. Don't add them without a reason.
       2026-11-12 a command that took the global lock in IX and logged
       nothing (`create` of a collection there, `drop` or `dropIndexes` of
       one not there) reads the latest optime for its last op as mongod's
-      entry point does (`lastop::entry_point_fixes`). Still different,
+      entry point does (`lastop::entry_point_fixes`); since 2026-11-16 a
+      `collMod` of a collection there takes mongod's global IS and its
+      collection X twice. Still different,
       measured against a one-member replica set:
       - an `insert` of several documents one of which fails: mongod inserts
         them again a document at a time, each under a transition, global,
@@ -592,13 +594,13 @@ These are explicit non-goals. Don't add them without a reason.
       - a retryable `findAndModify` writes its image under its locks (one
         more transition, global and collection IX), and one that removes
         takes a single round;
-      - `collMod` and `$out` take more transition locks than this server's
-        rounds (`$out`'s were measured on a standalone, RM-185), and an
-        `$out`'s line here has one global IS more than mongod's (7 to 6,
-        measured 8.2.11 2026-11-12);
+      - `$out` takes more transition locks than this server's rounds
+        (measured on a standalone, RM-185), and an `$out`'s line here has
+        one global IS more than mongod's (7 to 6, measured 8.2.11
+        2026-11-12); a `collMod` of a collection not there is not measured;
       - each global lock taken apart takes an execution ticket, so where
         these locks differ the line's `queues.execution` admissions differ
-        too (RM-355; `collMod`'s line has 3 here, 4 on mongod);
+        too (RM-355);
       - a statement of a transaction shows `{}` on mongod's line and the
         transaction's initial locks in its entry;
       - a collectionless `aggregate` takes no lock of its own since

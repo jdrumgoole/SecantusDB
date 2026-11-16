@@ -1091,6 +1091,18 @@ pub fn statement_rounds(
             exclusive.push((Resource::Collection(format!("{db}.{c}")), X));
             Some(vec![write_round(Some(c)), exclusive])
         }
+        // A global IS alone, then one write round that takes the
+        // collection in X twice, the second nested in the first, so one
+        // flow control ticket (measured 8.2.11, 2026-11-16: transition w 1,
+        // global r 1 w 1, database w 1, collection W 2). A collection that
+        // is not there is not measured: it keeps the plain chain.
+        "collMod" => {
+            let c = coll.filter(|c| exists(c))?;
+            let mut x = write_round(None);
+            x.push((Resource::Collection(format!("{db}.{c}")), X));
+            x.push((Resource::Collection(format!("{db}.{c}")), X));
+            Some(vec![vec![(Resource::Global, Is)], x])
+        }
         "dropDatabase" => Some(vec![vec![
             (Resource::ReplicationStateTransition, Ix),
             (Resource::Global, Ix),
@@ -2331,6 +2343,28 @@ mod tests {
             {"$facet": {"x": [{"$lookup": {"from": "x", "pipeline": [], "as": "j"}}]}},
         ]);
         assert_eq!(rounds(lookup, bson::Bson::Int32(1)).len(), 1);
+    }
+
+    /// `collMod` takes a global IS alone, then one write round holding the
+    /// collection in X twice (measured 8.2.11, RM-357).
+    #[test]
+    fn coll_mod_takes_mongods_rounds() {
+        use super::{statement_rounds, Mode::*, Resource};
+        let rounds = statement_rounds(&bson::doc! {"collMod": "c"}, "a", &Catalog).unwrap();
+        let coll = (Resource::Collection("a.c".into()), X);
+        assert_eq!(
+            rounds,
+            vec![
+                vec![(Resource::Global, Is)],
+                vec![
+                    (Resource::ReplicationStateTransition, Ix),
+                    (Resource::Global, Ix),
+                    (Resource::Database("a".into()), Ix),
+                    coll.clone(),
+                    coll,
+                ],
+            ]
+        );
     }
 
     // ------------------------------------------- execution tickets (RM-355)
