@@ -490,6 +490,9 @@ _MATCHING_WRITES = {
     "dropIndexes of one not there": lambda d: d.command(
         "dropIndexes", "c", index="nope_1", writeConcern={"w": 1}
     ),
+    # A global IS alone, then the collection in X twice in one write round
+    # (measured 2026-11-16).
+    "collMod": lambda d: d.command("collMod", "c", writeConcern={"w": 1}),
 }
 
 
@@ -510,7 +513,9 @@ def test_a_write_reports_mongods_locks_and_flow_control(
     collection there, a `drop` or `dropIndexes` of one not there) reads the
     latest optime for the client's last op under the global IS, with the
     transition lock (`setLastOpToSystemLastOpTime`, measured 2026-11-12);
-    this server did not."""
+    this server did not. A `collMod` takes the global IS alone, then the
+    collection in X twice under one write round (measured 2026-11-16); this
+    server took the plain chain once."""
     answers = _write_locks(rust_mongo, mongod_rs, _MATCHING_WRITES[name])
     assert answers["mongod"]
     assert answers["rust"] == answers["mongod"]
@@ -537,7 +542,6 @@ _DIVERGING_WRITES = {
     # one that removes takes one round.
     "findAndModify": lambda d: _w1(d).find_one_and_update({"_id": 1}, {"$set": {"q": 1}}),
     "findAndModify that removes": lambda d: _w1(_plain(d)).find_one_and_delete({"_id": 1}),
-    "collMod": lambda d: d.command("collMod", "c", writeConcern={"w": 1}),
     "$out": lambda d: list(_w1(_plain(d)).aggregate([{"$match": {}}, {"$out": "o"}])),
     # A statement of a transaction prints `{}`; its entry has the
     # transaction's locks.
