@@ -4738,7 +4738,7 @@ fn rename_fields(filter: &Document, rename: &dyn Fn(&str) -> Option<String>) -> 
     Some(out)
 }
 
-fn clamp_rows(rows: f64) -> f64 {
+pub(crate) fn clamp_rows(rows: f64) -> f64 {
     if rows <= 1.0 {
         1.0
     } else {

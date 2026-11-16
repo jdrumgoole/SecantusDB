@@ -5,8 +5,8 @@ while working RP-472 (2026-11-07).
   wrote.
 - RP-474 (fixed): a scalar user function in FROM was refused under an
   aggregate, an alias column list with a WHERE, and ROWS FROM.
-- RP-475: EXPLAIN of a user function in FROM printed no Function Scan,
-  then an unpriced one (fixed); a WHERE over it still prints no Filter.
+- RP-475 (fixed): EXPLAIN of a user function in FROM printed no Function
+  Scan, then an unpriced one, then one with no Filter for a WHERE.
 - RP-476 (fixed): a function in FROM under an aggregate and a WHERE ran
   twice.
 - RP-496 (fixed): a volatile function in a FROM subquery or a CTE joined
@@ -340,7 +340,7 @@ FUNCTION_SCAN_FILTER = {
 }
 
 
-@pytest.mark.backlog("RP-475")
+@pytest.mark.backlog_fixed("RP-475")
 @pytest.mark.parametrize("call", list(FUNCTION_SCAN_FILTER))
 def test_function_scan_filter(call: str, dsn: str) -> None:
     with psycopg.connect(dsn, autocommit=True) as c:

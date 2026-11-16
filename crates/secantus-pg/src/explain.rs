@@ -3274,6 +3274,7 @@ mod heap_fetches_tests {
             series_qual: None,
             function_scan: None,
             function_scan_call: None,
+            function_scan_where: None,
         }
     }
 

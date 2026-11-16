@@ -14758,12 +14758,15 @@ impl PgHandler {
     /// result type. A scalar SQL function whose body is one SELECT of a
     /// constant is inlined (`inline_function`) and its now-constant FROM
     /// item replaced by an `RTE_RESULT` (`pull_up_constant_function`), so
-    /// it prints a `Result`.
+    /// it prints a `Result`. A WHERE over it is the scan's Filter, its
+    /// operators `cpu_operator_cost` a row and its selectivity scaling the
+    /// rows, as `cost_functionscan` and `set_baserel_size_estimates` have it.
     fn price_function_scan(
         &self,
         tree: &mut explain::PlanNode,
         shown: &str,
         (name, nargs): &(String, usize),
+        filter: Option<&secantus_pgplan::FunctionScanWhere>,
     ) -> PgWireResult<()> {
         const CPU_OPERATOR_COST: f64 = 0.0025;
         let Some(node) = explain::find_node(tree, shown) else {
@@ -14807,12 +14810,17 @@ impl PgHandler {
             1.0
         };
         let startup = f.cost * CPU_OPERATOR_COST;
-        node.estimate = Some((
-            startup,
-            startup + secantus_pgplan::costsize::CPU_TUPLE_COST * rows,
-            rows,
-            width,
-        ));
+        let (mut per_row, mut out_rows) = (secantus_pgplan::costsize::CPU_TUPLE_COST, rows);
+        if let Some((text, qual)) = filter.and_then(|w| w.filter(&f.columns, &f.return_type)) {
+            if !node.details.iter().any(|(k, _)| k == "Filter") {
+                node.details.push(("Filter".into(), text));
+            }
+            if let Some(q) = qual {
+                per_row += CPU_OPERATOR_COST * f64::from(q.ops);
+                out_rows = scan_estimate::clamp_rows(rows * q.selectivity(rows));
+            }
+        }
+        node.estimate = Some((startup, startup + per_row * rows, out_rows, width));
         Ok(())
     }
 
@@ -46733,7 +46741,12 @@ impl PgHandler {
                 if let (Some(shown), Some(call)) =
                     (&options.function_scan, &options.function_scan_call)
                 {
-                    self.price_function_scan(&mut tree, shown, call)?;
+                    self.price_function_scan(
+                        &mut tree,
+                        shown,
+                        call,
+                        options.function_scan_where.as_deref(),
+                    )?;
                 }
                 explain::gate_scan(&mut tree, options.one_time_false);
                 explain::gate_named_scan(&mut tree, &options.nullable_gate);

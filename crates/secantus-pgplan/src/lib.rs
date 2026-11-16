@@ -3761,6 +3761,63 @@ pub struct ExplainOptions {
     /// That function's name and argument count, for the server to price
     /// the scan from its `pg_proc` row (RP-475).
     pub function_scan_call: Option<(String, usize)>,
+    /// That scan's WHERE, for the server to print and price as its
+    /// Filter once it knows the function's result columns (RP-475).
+    pub function_scan_where: Option<Box<FunctionScanWhere>>,
+}
+
+/// A user function scan's WHERE, kept until the function's result
+/// columns are known (RP-475).
+#[derive(Debug, Clone, PartialEq)]
+pub struct FunctionScanWhere {
+    where_clause: pg_query::protobuf::Node,
+    /// The range table entry's name: the alias, else the function's.
+    relation: String,
+    /// The alias's column names, which rename the result columns in order.
+    colnames: Vec<String>,
+}
+
+impl FunctionScanWhere {
+    /// The Filter's text and, over a one-column result, its pricing:
+    /// `out_columns` are the function's OUT columns (empty for a scalar
+    /// or SETOF scalar result, whose one column is named for the alias
+    /// column, else the relation), `return_type` its result type.
+    pub fn filter(
+        &self,
+        out_columns: &[(String, String)],
+        return_type: &str,
+    ) -> Option<(String, Option<SeriesQual>)> {
+        let base: Vec<(String, String)> = if out_columns.is_empty() {
+            vec![(self.relation.clone(), return_type.to_string())]
+        } else {
+            out_columns.to_vec()
+        };
+        let columns: Vec<(String, String)> = base
+            .into_iter()
+            .enumerate()
+            .map(|(i, (n, t))| (self.colnames.get(i).cloned().unwrap_or(n), t))
+            .collect();
+        let def = TableDef::new(
+            &self.relation,
+            columns
+                .iter()
+                .map(|(n, t)| secantus_pgcatalog::Column::new(n, t, false))
+                .collect(),
+        );
+        let texts: Vec<String> = ruleutils::explain_conjuncts(&self.where_clause, &def)?
+            .into_iter()
+            .map(|(t, _)| t)
+            .collect();
+        let text = match texts.as_slice() {
+            [one] => one.clone(),
+            many => format!("({})", many.join(" AND ")),
+        };
+        let qual = match columns.as_slice() {
+            [(c, _)] => series_qual(&self.where_clause, c),
+            _ => None,
+        };
+        Some((text, qual))
+    }
 }
 
 /// A `generate_series` scan's WHERE as the planner prices it (RP-847).
@@ -12317,6 +12374,7 @@ fn plan_explain(
         series_qual: None,
         function_scan: None,
         function_scan_call: None,
+        function_scan_where: None,
     };
     let (mut timing, mut summary) = (None, None);
     // `transformExplainStmt` resolves the statement's names and literals
@@ -12430,12 +12488,16 @@ fn plan_explain(
         },
         _ => (None, None),
     };
-    (options.function_scan, options.function_scan_call) = match &query {
+    (
+        options.function_scan,
+        options.function_scan_call,
+        options.function_scan_where,
+    ) = match &query {
         N::SelectStmt(s) if options.series_scan.is_none() => match explain_function_scan(s) {
-            Some((shown, call)) => (Some(shown), Some(call)),
-            None => (None, None),
+            Some((shown, call, filter)) => (Some(shown), Some(call), filter),
+            None => (None, None, None),
         },
-        _ => (None, None),
+        _ => (None, None, None),
     };
     options.sort_keys = match &query {
         N::SelectStmt(s) => match s.from_clause.as_slice() {
@@ -54685,7 +54747,11 @@ type SeriesScan = (Option<String>, Option<String>);
 
 /// The Function Scan a single FROM function prints (RP-475):
 /// `Function Scan on f`, or `Function Scan on f a` under an alias.
-fn explain_function_scan(s: &pg_query::protobuf::SelectStmt) -> Option<(String, (String, usize))> {
+/// A user function scan's node name, its call (name, argument count) and
+/// its WHERE.
+type FunctionScanParts = (String, (String, usize), Option<Box<FunctionScanWhere>>);
+
+fn explain_function_scan(s: &pg_query::protobuf::SelectStmt) -> Option<FunctionScanParts> {
     let [item] = s.from_clause.as_slice() else {
         return None;
     };
@@ -54714,7 +54780,29 @@ fn explain_function_scan(s: &pg_query::protobuf::SelectStmt) -> Option<(String, 
         shown.push(' ');
         shown.push_str(&scalar::quote_identifier(&a.aliasname));
     }
-    Some((shown, (name, f.args.len())))
+    let filter = s.where_clause.as_deref().map(|w| {
+        Box::new(FunctionScanWhere {
+            where_clause: w.clone(),
+            relation: rf
+                .alias
+                .as_ref()
+                .map_or_else(|| name.clone(), |a| a.aliasname.clone()),
+            colnames: rf
+                .alias
+                .as_ref()
+                .map(|a| {
+                    a.colnames
+                        .iter()
+                        .filter_map(|n| match n.node.as_ref() {
+                            Some(N::String(s)) => Some(s.sval.clone()),
+                            _ => None,
+                        })
+                        .collect()
+                })
+                .unwrap_or_default(),
+        })
+    });
+    Some((shown, (name, f.args.len()), filter))
 }
 
 fn explain_series_scan(
@@ -54976,5 +55064,35 @@ mod rp573_declared_types {
                 "relation \"nosuch573\" does not exist".into()
             ))
         );
+    }
+}
+
+#[cfg(test)]
+mod rp475_function_scan_filter {
+    use super::*;
+
+    fn where_of(sql: &str) -> FunctionScanWhere {
+        let tree = pg_query::parse(sql).unwrap();
+        let Some(N::SelectStmt(s)) = tree.protobuf.stmts[0]
+            .stmt
+            .as_ref()
+            .and_then(|n| n.node.clone())
+        else {
+            panic!("not a select");
+        };
+        *explain_function_scan(&s).unwrap().2.unwrap()
+    }
+
+    /// A WHERE over a user function in FROM is its Filter, the column
+    /// named for the alias, priced over one column (RP-475).
+    #[test]
+    fn the_where_is_the_scans_filter() {
+        let (text, qual) = where_of("select * from f() x where x > 1")
+            .filter(&[], "int4")
+            .unwrap();
+        assert_eq!(text, "(x > 1)");
+        let q = qual.unwrap();
+        assert_eq!(q.ops, 1);
+        assert!((q.selectivity(1000.0) - 1.0 / 3.0).abs() < 1e-9);
     }
 }

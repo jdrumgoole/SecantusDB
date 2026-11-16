@@ -2194,20 +2194,6 @@ Measured on PostgreSQL 15.19 (the data-modifying WITH on a private cluster).
 
 ## Found while working RP-472 (2026-11-07)
 
-- [ ] **EXPLAIN of a user function in FROM prints no Filter for a WHERE
-      over the call.** PostgreSQL 15.19 prints `explain select * from
-      fz473() where fz473 > 1` (a SETOF int SQL function) as `Function Scan
-      on fz473  (cost=0.25..12.75 rows=333 width=4)`, `Filter: (fz473 >
-      1)`: the qual costs `cpu_operator_cost` per row and its selectivity
-      scales the rows. Here the scan is priced (since RP-475's first part,
-      2026-11-16) but carries no Filter and keeps all 1000 rows. The
-      `generate_series` scan already does this (`explain_series_scan`,
-      `SeriesQual`), but assumes an int4 column; a user function's column
-      types come from its `pg_proc` row, which only `secantus-pg` reads, so
-      the filter text and selectivity need the function's result columns
-      passed to the planner (or built in `price_function_scan`).
-      Backlog-ID: RP-475
-      Verify: tests/backlog/test_rp_from_function_scan.py::test_function_scan_filter
 
 ## Found while working RP-454 (2026-11-07)
 
