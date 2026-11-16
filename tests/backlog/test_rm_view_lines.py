@@ -192,13 +192,14 @@ def test_an_aggregate_of_a_view_names_the_plan_beneath(rust_mongo: Any, mongod_r
     assert got["rust"] == got["mongod"]
 
 
-@pytest.mark.backlog("RM-494")
+@pytest.mark.backlog_fixed("RM-494")
 def test_a_count_documents_runs_a_count_scan(rust_mongo: Any, mongod_rs: Any) -> None:
     """mongod 8.2.11 runs a `count_documents` -- a `$match` and a `$group`
     that reads no field -- whose filter bounds the index on `x` as a
     `COUNT_SCAN { x: 1 }` that examines no document, of a view as of the
-    collection beneath it; this server's line names an `IXSCAN { x: 1 }`
-    and counts the 11 documents it fetched (measured 2026-11-13)."""
+    collection beneath it; this server's line named an `IXSCAN { x: 1 }`
+    and counted the 11 documents it fetched (measured 2026-11-13; fixed
+    2026-11-16)."""
     ops = (
         lambda d: d.v.count_documents({}),
         lambda d: d.c.count_documents({"x": {"$gte": 1}}),

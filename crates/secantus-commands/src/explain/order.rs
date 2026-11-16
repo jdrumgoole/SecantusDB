@@ -2887,6 +2887,60 @@ pub(crate) struct Counted {
     pub sort_input: Option<Vec<Vec<u8>>>,
 }
 
+/// A read mongod answers with a COUNT_SCAN (RM-494): a pipeline's query
+/// whose group reads no field ([`super::pipeline_counts_keys`]), over a
+/// plan of one index scan its documents need not be fetched for. The scan
+/// counts the index's keys and reads no document; each key is an empty
+/// document for the group to count. `None`: mongod keeps the plan.
+pub(crate) fn count_scanned(
+    storage: &dyn Storage,
+    ask: &Ask,
+    projection: Option<&Document>,
+) -> Result<Option<(Counted, String)>, StorageError> {
+    if ask.sort.is_some() || ask.limit != 0 {
+        return Ok(None);
+    }
+    let Some(plan) = stream_plan(
+        storage,
+        ask,
+        0,
+        0,
+        projection,
+        false,
+        StreamFlags::default(),
+    )?
+    else {
+        return Ok(None);
+    };
+    let Some(scan) = super::count_scan_of(&plan) else {
+        return Ok(None);
+    };
+    let opts = super::stream::Options {
+        collation: ask.collation,
+        ..Default::default()
+    };
+    let Some(mut stream) =
+        super::stream::Stream::of_count(&scan, ask.db, ask.coll, ask.filter, ask.vars, &opts)?
+    else {
+        return Ok(None);
+    };
+    stream.count_as_sbe();
+    let all = stream.read_all(storage)?;
+    // An empty BSON document: its length, 5, and its terminator.
+    let empty = vec![5_u8, 0, 0, 0, 0];
+    let mut summary = Vec::new();
+    super::summary::leaves_of(&scan, &mut summary);
+    Ok(Some((
+        Counted {
+            docs: vec![empty; all.docs.len()],
+            keys_examined: all.keys_examined,
+            docs_examined: all.docs_examined,
+            sort_input: None,
+        },
+        summary.join(", "),
+    )))
+}
+
 /// [`find`], run as mongod's plan for the read runs when a stream can run
 /// it (RM-023): every document, in the plan's order (a sort of whole
 /// documents included), with the keys and documents it examined. `limit`
