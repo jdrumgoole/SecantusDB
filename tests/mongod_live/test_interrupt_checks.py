@@ -74,6 +74,11 @@ def _documents(n: int) -> Callable[[Any], Any]:
     return setup
 
 
+def _arrays(n: int) -> Callable[[Any], Any]:
+    """Twelve documents, each with an array `a` of `n` elements."""
+    return lambda db: db.c.insert_many([{"_id": i, "a": list(range(n))} for i in range(12)])
+
+
 def _pipeline(pipeline: list, **kwargs: Any) -> Callable[[Any], Any]:
     return lambda d: list(d.c.aggregate(pipeline, **kwargs))
 
@@ -233,6 +238,66 @@ PIPELINES: dict[str, tuple[Callable[[Any], Any], Callable[[Any], Any], tuple[str
     "aggregate with a $skip between two $unwinds": (
         _documents(400),
         _pipeline([{"$unwind": "$a"}, {"$skip": 5}, {"$unwind": "$a"}], batchSize=60),
+        _PIPELINE,
+    ),
+    # mongod 8.2.11 checks after every tenth element of each evaluation of a
+    # `$map`, `$filter` or `$reduce`, its count starting again with the
+    # next (RM-360): 9 elements check none, 10 once, 50 five times.
+    "aggregate with a $map of 2": (
+        seed,
+        _pipeline([{"$addFields": {"m": {"$map": {"input": [1, 2], "in": "$$this"}}}}]),
+        _PIPELINE,
+    ),
+    "aggregate with a $map of 9": (
+        _arrays(9),
+        _pipeline([{"$addFields": {"m": {"$map": {"input": "$a", "in": "$$this"}}}}]),
+        _PIPELINE,
+    ),
+    "aggregate with a $map of 10": (
+        _arrays(10),
+        _pipeline([{"$addFields": {"m": {"$map": {"input": "$a", "in": "$$this"}}}}]),
+        _PIPELINE,
+    ),
+    "aggregate with a $map of 127": (
+        _arrays(127),
+        _pipeline([{"$addFields": {"m": {"$map": {"input": "$a", "in": "$$this"}}}}]),
+        _PIPELINE,
+    ),
+    "aggregate with two $maps of 5 and a nested one": (
+        _arrays(5),
+        _pipeline(
+            [
+                {
+                    "$addFields": {
+                        "m": {"$map": {"input": "$a", "in": "$$this"}},
+                        "n": {"$map": {"input": "$a", "in": {"$map": {"input": "$a", "in": 1}}}},
+                    }
+                }
+            ]
+        ),
+        _PIPELINE,
+    ),
+    "aggregate with a $filter of 50": (
+        _arrays(50),
+        _pipeline([{"$addFields": {"m": {"$filter": {"input": "$a", "cond": True}}}}]),
+        _PIPELINE,
+    ),
+    "aggregate with a $filter stopped by its limit at 10": (
+        _arrays(50),
+        _pipeline([{"$addFields": {"m": {"$filter": {"input": "$a", "cond": True, "limit": 10}}}}]),
+        _PIPELINE,
+    ),
+    "aggregate with a $reduce of 50": (
+        _arrays(50),
+        _pipeline(
+            [
+                {
+                    "$addFields": {
+                        "m": {"$reduce": {"input": "$a", "initialValue": 0, "in": "$$value"}}
+                    }
+                }
+            ]
+        ),
         _PIPELINE,
     ),
 }

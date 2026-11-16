@@ -1029,16 +1029,14 @@ pub fn aggregate(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
                 drop(engine);
                 // A pipeline mongod's query layer runs whole checks as its
                 // `find` does, which this read has counted (RM-360).
-                if !secantus_core::deadline::take_expression_ticked()
-                    && crate::explain::query_layer_takes_whole(
-                        storage,
-                        &ctx.db_name,
-                        c,
-                        &read_pipeline,
-                        hint,
-                        collation.as_ref(),
-                    )
-                {
+                if crate::explain::query_layer_takes_whole(
+                    storage,
+                    &ctx.db_name,
+                    c,
+                    &read_pipeline,
+                    hint,
+                    collation.as_ref(),
+                ) {
                     secantus_core::deadline::pipeline_counted();
                 }
                 // The plan the pipeline's first read runs uses its indexes
