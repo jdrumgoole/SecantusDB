@@ -2070,6 +2070,13 @@ Still different:
       oplog spans several tables), lists by database and then name rather
       than creation order, gives an index `spec` in `listIndexes`' key
       order, and reads a geo index's `multikey` from the documents now.
+      Not workable as one fix (a fix-one session declined it, 2026-11-14): it
+      bundles about ten gaps (buildInfo's per-OS block, latencyStats,
+      connectionStatus privileges, hostInfo.extra on Linux, $indexStats
+      following the trial, $listCatalog fields, sessions in
+      config.system.sessions) besides the per-table sizes RM-499 decides.
+      Split it into one item per gap, each with its own gap test, before
+      batching.
       Backlog-ID: RM-040
       Verify: tests/backlog/test_rm_029_056.py::test_coll_stats_wiredtiger_and_index_details
 
@@ -2240,6 +2247,10 @@ Still different, all 77:
       either side of 15 characters. **Decided (Joe, 2026-11-08, on RM-341):
       a layout table per mongod build, chosen by the target the server is
       built for, each fitted by probing that platform's mongod 8.2.11.**
+      Blocked (2026-11-14): fitting the LIBSTDCXX_X86_64 table needs a Linux
+      x86_64 mongod 8.2.11, and this Mac has only macOS builds and no
+      container runtime. Either install colima or Docker and run the Linux
+      image here, or probe CI's Linux mongod from a dedicated session.
       Backlog-ID: RM-442
       Verify: tests/backlog/test_rm_340_342_plan_cache_gaps.py::test_an_entry_reports_its_estimated_size_on_linux
 - [ ] **A `$cursor` the pipeline stops reading reports a plan run to its
@@ -2369,6 +2380,9 @@ A `readConcern` with an `atClusterTime` older than the oldest timestamp is
       and the two delinquency totals).
       **Decided 2026-10-16 (Joe):** leave it open; no stand-in values. Build
       it when those mechanisms exist.
+      Blocked (checked 2026-11-14): waits on RM-355 (execution admission
+      control) and RM-360 (interrupt checks), per the decision above; both are
+      still open in part.
       Backlog-ID: RM-170
       Verify: tests/backlog/test_rm_found_2026_10_16.py::test_include_query_stats_metrics_adds_a_metrics_document
 
@@ -2639,6 +2653,13 @@ compressed column, placed by mongod's bucket catalog
       allocators, so `memoryUsage` and idle-bucket expiry follow mongod's.
       The size limit's memory accounting (`getCacheDerivedBucketMaxSize`,
       decided 2026-10-16) does not depend on it and is built.
+      Too large for one fix (declined 2026-11-15). Proposed split: (1)
+      serverStatus.bucketCatalog's counts, counters and stateManagement from
+      state the catalog keeps; (2) mongod's memory accounting, so memoryUsage
+      matches; (3) idle-bucket expiry past
+      timeseriesIdleBucketExpiryMemoryUsageThreshold, which needs (2). The gap
+      test stays red until (2) lands. Awaiting Joe's go-ahead to file the
+      split.
       Verify: tests/backlog/test_rm_found_2026_11_11_rm088.py::test_server_status_reports_the_bucket_catalog
       Backlog-ID: RM-549
 - **Scope decision — a `hashed` index on a time-series collection** is
