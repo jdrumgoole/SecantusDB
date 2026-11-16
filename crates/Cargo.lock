@@ -1888,7 +1888,7 @@ dependencies = [
 
 [[package]]
 name = "secantus-pg-query"
-version = "0.1.0-beta.17"
+version = "0.1.0-beta.18"
 dependencies = [
  "bindgen",
  "cc",
@@ -1905,14 +1905,14 @@ dependencies = [
 
 [[package]]
 name = "secantus-pgcatalog"
-version = "0.1.0-beta.17"
+version = "0.1.0-beta.18"
 dependencies = [
  "bson",
 ]
 
 [[package]]
 name = "secantus-pgplan"
-version = "0.1.0-beta.17"
+version = "0.1.0-beta.18"
 dependencies = [
  "aes",
  "blowfish 0.9.1",
