@@ -75,10 +75,10 @@ jobs:
           echo "MongoDB server $TAG, PostgreSQL server $pg_tag"
 
       # The checkout supplies the wheel builder, the launcher and the licence
-      # files, all at the MongoDB release's own tag.
+      # files. It is the workflow's own commit (main), not the release tag: a
+      # tag cut before packaging/pypi/ existed would have no builder to run.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
-          ref: ${{ steps.resolve.outputs.tag }}
           persist-credentials: false
 
       - name: Download the release archives

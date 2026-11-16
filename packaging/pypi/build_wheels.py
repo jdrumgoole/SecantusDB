@@ -180,8 +180,8 @@ def build_wheel(
             files.append((f"secantusdb/{src.name}", src.read_bytes(), False))
     files.append(("secantusdb/bin/secantusd-rs", mdb, True))
     files.append(("secantusdb/bin/secantusd-pg", pg, True))
-    # The licences come from the checkout the workflow builds at, which is the
-    # MongoDB release's tag: archives before 2026-10 carry no LICENSE-ICU.
+    # The licences come from the checkout the workflow runs from: archives
+    # before 2026-10 carry no LICENSE-ICU.
     repo = HERE.parent.parent
     for name, src in (("LICENSE", "LICENSE"), ("LICENSE-ICU", "vendor/icu4c-57.1/LICENSE")):
         files.append((f"{dist_info}/licenses/{name}", (repo / src).read_bytes(), False))
