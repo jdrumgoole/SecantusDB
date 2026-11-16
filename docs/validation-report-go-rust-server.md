@@ -1,6 +1,6 @@
 # mongo-go-driver Validation Report
 
-Measured 2026-10-15 (raw artifact), generated 2026-10-15 — SecantusDB 0.7.0b3 vs mongo-go-driver fd85a834c40e (`vendor/mongo-go-driver/`).
+Measured 2026-11-16 (raw artifact), generated 2026-11-16 — SecantusDB 0.7.0b3 vs mongo-go-driver fd85a834c40e (`vendor/mongo-go-driver/`).
 
 Run `uv run python -m invoke validate-go` to refresh. The pass rate is the analogue of the pymongo conformance gauge for the official Go driver — same shape, different wire-protocol pickiness. Type-strict bugs (int32 vs int64) that pymongo accepts silently fail loudly here.
 
@@ -8,11 +8,11 @@ Run `uv run python -m invoke validate-go` to refresh. The pass rate is the analo
 
 | Package | Passed | Failed | Skipped | Total | Pass rate |
 |---|---:|---:|---:|---:|---:|
-| `internal/integration` | 556 | 12 | 49 | 617 | 97.8% |
+| `internal/integration` | 555 | 13 | 49 | 617 | 97.7% |
 | `internal/integration/unified` | 42 | 0 | 0 | 42 | 100.0% |
-| **Overall** | **598** | **12** | **49** | **659** | **98.0%** |
+| **Overall** | **597** | **13** | **49** | **659** | **97.8%** |
 
-## Failures (12)
+## Failures (13)
 
 First 30 failed tests for triage:
 
@@ -20,12 +20,13 @@ First 30 failed tests for triage:
 internal/integration :: TestRetryableReadsProse/retrying_reads_in_a_replica_set/overload_errors_retried_on_a_different_replicaset_server
 internal/integration :: TestRetryableReadsProse/retrying_reads_in_a_replica_set
 internal/integration :: TestRetryableReadsProse
+internal/integration :: TestErrorPropagationAfterEncounteringMultipleErrors/Case_4:_Test_that_drivers_set_the_maximum_number_of_retries_for_all_retryable_write_errors_when_an_overload_error_is_encountered
+internal/integration :: TestErrorPropagationAfterEncounteringMultipleErrors
 internal/integration :: TestSDAMErrorHandling/after_handshake_completes/network_errors/pool_not_cleared_on_timeout_network_error
 internal/integration :: TestSDAMErrorHandling/after_handshake_completes/network_errors/pool_not_cleared_on_context_cancellation
 internal/integration :: TestSDAMErrorHandling/after_handshake_completes/network_errors
 internal/integration :: TestSDAMErrorHandling/after_handshake_completes
 internal/integration :: TestSDAMErrorHandling
-internal/integration :: TestConnectionPoolBackpressure
 internal/integration :: TestSessionsMongocryptdProse/18._implicit_session_is_ignored_if_connection_does_not_support_sessions
 internal/integration :: TestSessionsMongocryptdProse/19._explicit_session_raises_an_error_if_connection_does_not_support_sessions
 internal/integration :: TestSessionsMongocryptdProse
