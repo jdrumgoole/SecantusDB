@@ -1103,13 +1103,6 @@ def _two_indexes(db: Any) -> None:
 
 _UNCOUNTED = {
     "find": ("find", _two_indexes, lambda d: list(d.c.find({"x": {"$gt": 1}, "y": 1}))),
-    "aggregate with a $map": (
-        "aggregate",
-        seed,
-        lambda d: list(
-            d.c.aggregate([{"$addFields": {"m": {"$map": {"input": [1, 2], "in": "$$this"}}}}])
-        ),
-    ),
     "aggregate sorting its groups": (
         "aggregate",
         seed,
@@ -1139,16 +1132,14 @@ _UNCOUNTED = {
 def test_every_line_counts_its_interrupt_checks(rust_mongo: Any, mongod_rs: Any) -> None:
     """mongod 8.2.11's line for every command carries `numInterruptChecks`
     (measured 2026-11-09 and 2026-11-12, time-based yields off: a `find`
-    with two candidate plans 8, an `aggregate` with a `$map` 5 and one
-    sorting its groups 5, an unordered `insert` of two documents, one a
-    duplicate key, 27, a retryable `findAndModify` 26, a `createIndexes`
-    of twelve documents 73). This server counts its reads with one candidate plan, its
+    with two candidate plans 8, an `aggregate` sorting its groups 5, an
+    unordered `insert` of two documents, one a duplicate key, 27, a
+    retryable `findAndModify` 26, a `createIndexes` of twelve documents
+    73). This server counts its reads with one candidate plan, its
     `insert`, `update` and `delete`, and the aggregates it models, and
     prints none here: mongod's planner checks once per index scan of every
-    plan it enumerates, its `$map` makes no tick of the pipeline's
-    interrupt checker where this server's makes one per element, its
-    slot-based engine leaves a `$sort` after a `$group` to the pipeline, a
-    failed batch of inserts is inserted again a document at a time under
+    plan it enumerates, its slot-based engine leaves a `$sort` after a
+    `$group` to the pipeline, a failed batch of inserts is inserted again a document at a time under
     locks of its own, a `findAndModify` takes rounds this server does not
     (RM-357), and DDL checks at points this server does not check yet."""
     for label, (name, setup, op) in _UNCOUNTED.items():

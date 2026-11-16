@@ -87,10 +87,8 @@ thread_local! {
     /// (see [`yield_with`]).
     static YIELD_HOOK: std::cell::RefCell<Option<Relock>> =
         const { std::cell::RefCell::new(None) };
-    /// Calls to [`check_expression`] until it next checks.
+    /// Stage calls ([`tick_stages`]) until the pipeline's checker next checks.
     static EXPRESSION_TICK: Cell<u32> = const { Cell::new(EXPRESSION_CHECK_PERIOD) };
-    /// Whether [`check_expression`] ticked since [`take_expression_ticked`].
-    static EXPRESSION_TICKED: Cell<bool> = const { Cell::new(false) };
     /// Whether a check of the running operation was made somewhere mongod
     /// makes none, or one mongod makes is not made here (see [`unmatched`]).
     static UNMATCHED: Cell<bool> = const { Cell::new(false) };
@@ -199,9 +197,7 @@ pub fn is_pipeline_counted() -> bool {
 
 /// mongod's `exec::agg::Stage::getNext`, `n` times over: each call ticks
 /// the pipeline's `ExpressionContext` interrupt checker, which checks the
-/// operation every 128th tick (`InterruptChecker`, 8.2). It is the checker
-/// [`check_expression`] ticks too, as a pipeline's `$map` ticks its
-/// stages' (RM-360).
+/// operation every 128th tick (`InterruptChecker`, 8.2) (RM-360).
 pub fn tick_stages(n: u64) -> Result<(), MaxTimeMsExpired> {
     let mut left = n;
     while left > 0 {
@@ -228,14 +224,6 @@ pub fn ticks_to_check() -> u32 {
 /// it ([`ticks_to_check`]).
 pub fn resume_ticks(ticks: u32) {
     EXPRESSION_TICK.with(|t| t.set(ticks.clamp(1, EXPRESSION_CHECK_PERIOD)));
-}
-
-/// Whether an expression ticked the interrupt checker ([`check_expression`])
-/// since the last call, which resets it: mongod 8.2.11 evaluates `$map`,
-/// `$filter` and `$reduce` without a tick, so a pipeline count that took one
-/// is not mongod's (RM-360).
-pub fn take_expression_ticked() -> bool {
-    EXPRESSION_TICKED.with(|t| t.replace(false))
 }
 
 /// A fresh pipeline's interrupt checker: its first check is 128 ticks away.
@@ -305,32 +293,22 @@ pub fn opaque() -> OpaqueGuard {
     OpaqueGuard(())
 }
 
-/// The check from inside an expression: one element of a `$map`, `$filter`
-/// or `$reduce`, where a single evaluation can run for seconds. It is
-/// mongod's `ExpressionContext::checkForInterrupt`, which checks the
-/// operation every 128th call (`InterruptChecker`, 8.2), except under
-/// [`opaque`].
-pub fn check_expression() -> Result<(), MaxTimeMsExpired> {
-    if OPAQUE.with(Cell::get) > 0 {
+/// The check from inside an expression, after its `done`th element of a
+/// `$map`, `$filter` or `$reduce`, where a single evaluation can run for
+/// seconds: mongod 8.2.11 checks the operation, counted, after every tenth
+/// element of each evaluation, its count starting again with the next
+/// evaluation (measured 2026-11-16: a `$map` of 9 elements checks none, of
+/// 10 to 19 once, of 50 five times per document; a `$filter` stopped by
+/// its `limit` at 10 once; RM-360). Not under [`opaque`].
+pub fn check_expression(done: usize) -> Result<(), MaxTimeMsExpired> {
+    if !done.is_multiple_of(EXPRESSION_ELEMENT_PERIOD) || OPAQUE.with(Cell::get) > 0 {
         return Ok(());
     }
-    EXPRESSION_TICKED.with(|t| t.set(true));
-    let due = EXPRESSION_TICK.with(|t| {
-        let n = t.get() - 1;
-        if n == 0 {
-            t.set(EXPRESSION_CHECK_PERIOD);
-            true
-        } else {
-            t.set(n);
-            false
-        }
-    });
-    if due {
-        check_for_interrupt()
-    } else {
-        Ok(())
-    }
+    check_for_interrupt()
 }
+
+/// The elements of a `$map`, `$filter` or `$reduce` between its checks.
+const EXPRESSION_ELEMENT_PERIOD: usize = 10;
 
 /// Restores the previous kill flag when dropped.
 #[must_use = "the kill flag is uninstalled when this guard drops"]
@@ -706,12 +684,16 @@ mod tests {
         flag.store(true, std::sync::atomic::Ordering::Release);
         {
             let _o = opaque();
-            for _ in 0..POLL_EVERY * 2 {
-                assert_eq!(check_expression(), Ok(()), "a validator is not interrupted");
+            for done in 1..POLL_EVERY * 2 {
+                assert_eq!(
+                    check_expression(done as usize),
+                    Ok(()),
+                    "a validator is not interrupted"
+                );
             }
         }
-        let failed = (0..EXPRESSION_CHECK_PERIOD).any(|_| check_expression().is_err());
-        assert!(failed, "the kill is read within mongod's 128 calls");
+        let failed = (1..=10).any(|done| check_expression(done).is_err());
+        assert!(failed, "the kill is read by the tenth element");
     }
 
     /// A failed poll is remembered for the command, even when its caller
@@ -764,14 +746,27 @@ mod tests {
         resume_ticks(kept);
         tick_stages(u64::from(kept) - 1).unwrap();
         assert_eq!(interrupt_checks(), 0);
-        check_expression().unwrap();
-        assert_eq!(
-            interrupt_checks(),
-            1,
-            "an expression ticks the same checker"
-        );
-        assert!(take_expression_ticked());
-        assert!(!take_expression_ticked(), "taking it resets it");
+        tick_stages(1).unwrap();
+        assert_eq!(interrupt_checks(), 1);
+    }
+
+    /// An expression checks after every tenth element of its evaluation,
+    /// counted, and leaves the pipeline's checker alone (RM-360).
+    #[test]
+    fn an_expression_checks_every_tenth_element() {
+        begin_operation();
+        let ticks = ticks_to_check();
+        for done in 1..=9 {
+            check_expression(done).unwrap();
+        }
+        assert_eq!(interrupt_checks(), 0);
+        check_expression(10).unwrap();
+        assert_eq!(interrupt_checks(), 1);
+        for done in 11..=50 {
+            check_expression(done).unwrap();
+        }
+        assert_eq!(interrupt_checks(), 5);
+        assert_eq!(ticks_to_check(), ticks, "the stages' checker is not ticked");
     }
 
     /// The flag a counted pipeline sets lasts for its operation only.

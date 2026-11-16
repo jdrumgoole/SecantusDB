@@ -682,12 +682,9 @@ pub fn attributes(
 /// replica set, outside a transaction. Others print none until theirs are:
 /// a pipeline's stages, `findAndModify` and DDL check where mongod's do
 /// not yet.
-/// The operation's pipeline counted its checks as mongod's does, and no
-/// expression ticked its interrupt checker where mongod's does not
-/// (`deadline::take_expression_ticked`).
+/// The operation's pipeline counted its checks as mongod's does.
 fn pipeline_counted() -> bool {
     secantus_core::deadline::is_pipeline_counted()
-        && !secantus_core::deadline::take_expression_ticked()
 }
 
 pub fn with_interrupt_checks(

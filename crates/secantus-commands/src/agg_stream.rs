@@ -1154,7 +1154,6 @@ impl StreamCursor for AggStream {
         if self.counted {
             secantus_core::deadline::resume_ticks(self.ticks);
         }
-        secantus_core::deadline::take_expression_ticked();
         let (mut keys, mut examined) = (0, 0);
         let mut out: Vec<Vec<u8>> = Vec::new();
         let mut bytes = 0usize;
@@ -1245,12 +1244,6 @@ impl StreamCursor for AggStream {
         }
         if eof {
             self.tick(self.calls_at_eof() as usize)?;
-        }
-        // An expression that ticked the pipeline's interrupt checker
-        // (`$map`, `$filter`, `$reduce`: one tick an element here, none on
-        // mongod 8.2.11) leaves the count this cursor's from here on.
-        if secantus_core::deadline::take_expression_ticked() {
-            self.counted = false;
         }
         if self.counted {
             secantus_core::deadline::pipeline_counted();
