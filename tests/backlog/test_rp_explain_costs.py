@@ -4514,7 +4514,7 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
         ],
     ),
     "a join's on subquery is an initplan on its scan": (
-        "RP-440",
+        "RP-440:fixed",
         _ANALYSED,
         "explain (costs off) select * from e left join k"
         " on e.a = k.a and k.b = (select 'v3'::text)",
@@ -4527,6 +4527,21 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "  ->  Hash",
             "        ->  Seq Scan on k",
             "              Filter: (b = $0)",
+        ],
+    ),
+    # A node above an InitPlan's scan is priced, the InitPlan's cost on
+    # the top node only, measured on 15.19 (RP-440).
+    "a sort above an initplan's scan is priced": (
+        "RP-440",
+        _ANALYSED,
+        "explain select a from e where b = (select 'v3'::text) order by a",
+        [
+            "Sort  (cost=20.83..21.08 rows=100 width=4)",
+            "  Sort Key: e.a",
+            "  InitPlan 1 (returns $0)",
+            "    ->  Result  (cost=0.00..0.01 rows=1 width=32)",
+            "  ->  Seq Scan on e  (cost=0.00..17.50 rows=100 width=4)",
+            "        Filter: (b = $0)",
         ],
     ),
     # A table whose only index is a composite one, its WHERE constraining

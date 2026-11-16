@@ -35,6 +35,12 @@ pub fn with_init_plans<T>(plans: &[pg_query::protobuf::SubLink], f: impl FnOnce(
     out
 }
 
+/// Whether `s` is one of the sublinks EXPLAIN is printing as an
+/// InitPlan's parameter: a value fixed before any scan runs (RP-440).
+pub(crate) fn is_init_plan(s: &pg_query::protobuf::SubLink) -> bool {
+    INIT_PLANS.with(|i| i.borrow().contains(s))
+}
+
 type Node = pg_query::protobuf::Node;
 
 const PRETTYINDENT_STD: i32 = 8;

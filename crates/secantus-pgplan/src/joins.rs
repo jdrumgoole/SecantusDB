@@ -5704,6 +5704,9 @@ fn alias_of(
                 }
             }
             Some(N::AConst(_)) | Some(N::ParamRef(_)) => true,
+            // An InitPlan's output is a parameter, fixed before the scan
+            // (RP-440); set only while EXPLAIN places its quals.
+            Some(N::SubLink(s)) if crate::ruleutils::is_init_plan(s) => true,
             Some(N::TypeCast(t)) => t.arg.as_deref().is_some_and(&mut rec),
             Some(N::AExpr(e)) => {
                 e.lexpr.as_deref().is_none_or(&mut rec) && e.rexpr.as_deref().is_none_or(&mut rec)

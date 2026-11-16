@@ -134,6 +134,9 @@ pub(crate) fn init_plans_of(
     let [item] = s.from_clause.as_slice() else {
         return none;
     };
+    if let Some(N::JoinExpr(_)) = item.node.as_ref() {
+        return on_init_plans(item, lookup, params);
+    }
     let Some(N::RangeVar(rv)) = item.node.as_ref() else {
         return none;
     };
@@ -168,6 +171,91 @@ pub(crate) fn init_plans_of(
             return none;
         }
     }
+    planned(found, lookup, params)
+}
+
+/// The InitPlans of a join tree's ON clauses: each conjunct comparing one
+/// side's qualified column with a FROM-less scalar subquery, which
+/// `distribute_qual_to_rels` then runs in that side's scan as `Filter: (b
+/// = $0)`, inner and outer join alike (RP-440).
+fn on_init_plans(
+    item: &pg_query::protobuf::Node,
+    lookup: &dyn Fn(&str) -> Option<TableDef>,
+    params: &[Bson],
+) -> Result<(Vec<SubLink>, Vec<InitPlan>)> {
+    fn leaves(n: &pg_query::protobuf::Node, out: &mut Vec<(String, String)>) {
+        match n.node.as_ref() {
+            Some(N::RangeVar(rv)) => out.push((
+                rv.alias
+                    .as_ref()
+                    .map_or(rv.relname.clone(), |a| a.aliasname.clone()),
+                rv.relname.clone(),
+            )),
+            Some(N::JoinExpr(j)) => {
+                for side in [j.larg.as_deref(), j.rarg.as_deref()].into_iter().flatten() {
+                    leaves(side, out);
+                }
+            }
+            _ => {}
+        }
+    }
+    fn ons<'a>(n: &'a pg_query::protobuf::Node, out: &mut Vec<&'a pg_query::protobuf::Node>) {
+        if let Some(N::JoinExpr(j)) = n.node.as_ref() {
+            for side in [j.larg.as_deref(), j.rarg.as_deref()].into_iter().flatten() {
+                ons(side, out);
+            }
+            if let Some(q) = j.quals.as_deref() {
+                conjuncts(q, out);
+            }
+        }
+    }
+    let mut rels = Vec::new();
+    leaves(item, &mut rels);
+    let mut parts = Vec::new();
+    ons(item, &mut parts);
+    let qualified = |n: &pg_query::protobuf::Node| -> Option<String> {
+        let Some(N::ColumnRef(c)) = n.node.as_ref() else {
+            return None;
+        };
+        let [Some(N::String(r)), Some(N::String(_))] =
+            [c.fields.first(), c.fields.get(1)].map(|f| f.and_then(|f| f.node.as_ref()))
+        else {
+            return None;
+        };
+        if c.fields.len() != 2 {
+            return None;
+        }
+        let (alias, table) = rels.iter().find(|(a, _)| *a == r.sval)?;
+        let def = lookup(table)?;
+        column(n, &def, alias).map(|c| c.field())
+    };
+    let mut found: Vec<(&SubLink, String, colstats::Op)> = Vec::new();
+    for p in parts {
+        let Some(N::AExpr(e)) = p.node.as_ref() else {
+            continue;
+        };
+        if e.kind != AExprKind::AexprOp as i32 {
+            continue;
+        }
+        let (Some(op), Some(l), Some(r)) = (op_of(&e.name), e.lexpr.as_deref(), e.rexpr.as_deref())
+        else {
+            continue;
+        };
+        if let (Some(f), Some(sl)) = (qualified(l), sub(r)) {
+            found.push((sl, f, op));
+        } else if let (Some(sl), Some(f)) = (sub(l), qualified(r)) {
+            found.push((sl, f, commuted(op)));
+        }
+    }
+    planned(found, lookup, params)
+}
+
+fn planned(
+    found: Vec<(&SubLink, String, colstats::Op)>,
+    lookup: &dyn Fn(&str) -> Option<TableDef>,
+    params: &[Bson],
+) -> Result<(Vec<SubLink>, Vec<InitPlan>)> {
+    let none = Ok((Vec::new(), Vec::new()));
     let mut sublinks = Vec::new();
     let mut plans = Vec::new();
     for (sl, field, op) in found {
@@ -242,5 +330,22 @@ mod tests {
     fn another_qual_declines() {
         let q = where_of("select * from e where b = (select 'v3'::text) and a + 1 > 2");
         assert!(init_plans_of(&q, &e, &[]).unwrap().1.is_empty());
+    }
+
+    /// A join's ON conjunct comparing one side's column with a scalar
+    /// subquery is an InitPlan, whichever way round it is written
+    /// (RP-440).
+    #[test]
+    fn an_on_sublink_is_an_initplan() {
+        let both = |n: &str| e(n).or_else(|| e("e").filter(|_| n == "k"));
+        let q = where_of(
+            "select * from e left join k on e.a = k.a and (select 'v3'::text) = k.b and e.b = 'x'",
+        );
+        let (sublinks, plans) = init_plans_of(&q, &both, &[]).unwrap();
+        assert_eq!(sublinks.len(), 1);
+        assert_eq!(
+            (plans[0].field.as_str(), plans[0].op),
+            ("b", colstats::Op::Eq)
+        );
     }
 }

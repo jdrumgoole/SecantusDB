@@ -12571,64 +12571,68 @@ fn plan_explain(
     let setop_quals = explain_setop_quals(&query, lookup).unwrap_or_default();
     options.subquery_quals = explain_subquery_quals(&query, lookup).unwrap_or_default();
     let mut join_cond_splits = Vec::new();
-    let join_conds = match &query {
-        N::SelectStmt(s) => {
-            // A constant TRUE ON conjunct is folded away (RP-394), and an
-            // inner join's one-table ON conjunct is printed on its table's
-            // scan, as the planner runs it (RP-391).
-            let hoisted = joins::prepare_on_quals(s);
-            let s = hoisted.as_ref().unwrap_or(s);
-            // An outer join's ON conjunct over its nullable side alone is
-            // printed on that side's scan, as it runs there (RP-395).
-            let nullable_side = joins::nullable_side_on_conjuncts(s);
-            let (s, nullable_pushed) = match &nullable_side {
-                Some((rewritten, pushed)) => (rewritten, pushed.as_slice()),
-                None => (s, &[][..]),
-            };
-            let none = |_: &str| None;
-            let cat = ruleutils::Catalog {
-                lookup,
-                view_sql: &none,
-            };
-            // A JOIN, or a comma list of plain relations (`FROM a, b`,
-            // RP-329), whose WHERE's conjuncts over both are join quals.
-            let joined = match s.from_clause.as_slice() {
-                [one] => matches!(one.node.as_ref(), Some(N::JoinExpr(_))),
-                many => {
-                    many.len() > 1
-                        && many
-                            .iter()
-                            .all(|n| matches!(n.node.as_ref(), Some(N::RangeVar(_))))
+    // An InitPlan's parameter in an ON conjunct is placed and printed as
+    // the WHERE's is (RP-440).
+    let join_conds = ruleutils::with_init_plans(&init_sublinks, || -> Result<Vec<String>> {
+        Ok(match &query {
+            N::SelectStmt(s) => {
+                // A constant TRUE ON conjunct is folded away (RP-394), and an
+                // inner join's one-table ON conjunct is printed on its table's
+                // scan, as the planner runs it (RP-391).
+                let hoisted = joins::prepare_on_quals(s);
+                let s = hoisted.as_ref().unwrap_or(s);
+                // An outer join's ON conjunct over its nullable side alone is
+                // printed on that side's scan, as it runs there (RP-395).
+                let nullable_side = joins::nullable_side_on_conjuncts(s);
+                let (s, nullable_pushed) = match &nullable_side {
+                    Some((rewritten, pushed)) => (rewritten, pushed.as_slice()),
+                    None => (s, &[][..]),
+                };
+                let none = |_: &str| None;
+                let cat = ruleutils::Catalog {
+                    lookup,
+                    view_sql: &none,
+                };
+                // A JOIN, or a comma list of plain relations (`FROM a, b`,
+                // RP-329), whose WHERE's conjuncts over both are join quals.
+                let joined = match s.from_clause.as_slice() {
+                    [one] => matches!(one.node.as_ref(), Some(N::JoinExpr(_))),
+                    many => {
+                        many.len() > 1
+                            && many
+                                .iter()
+                                .all(|n| matches!(n.node.as_ref(), Some(N::RangeVar(_))))
+                    }
+                };
+                // A join's ORDER BY keys, qualified (RP-919).
+                if joined {
+                    options.sort_keys = ruleutils::explain_join_sort_keys(s, &cat);
                 }
-            };
-            // A join's ORDER BY keys, qualified (RP-919).
-            if joined {
-                options.sort_keys = ruleutils::explain_join_sort_keys(s, &cat);
+                options.join_where = if joined {
+                    ruleutils::join_where(s, &cat).unwrap_or_default()
+                } else {
+                    Vec::new()
+                };
+                // Those go first: `deconstruct_jointree` distributes a join's
+                // own quals before the WHERE's.
+                if joined && !nullable_pushed.is_empty() {
+                    let mut first = nullable_side_scan_quals(nullable_pushed, &cat);
+                    first.append(&mut options.join_where);
+                    options.join_where = first;
+                    ruleutils::order_merged_scan_quals(&mut options.join_where);
+                }
+                let split = ruleutils::join_conditions_split(s, &cat).unwrap_or_default();
+                let conds: Vec<String> = split.iter().map(|(c, _)| c.clone()).collect();
+                join_cond_splits = split.into_iter().map(|(_, s)| s).collect();
+                if conds.is_empty() && joined {
+                    ruleutils::comma_join_conds(s, &mut options.join_where)?
+                } else {
+                    conds
+                }
             }
-            options.join_where = if joined {
-                ruleutils::join_where(s, &cat).unwrap_or_default()
-            } else {
-                Vec::new()
-            };
-            // Those go first: `deconstruct_jointree` distributes a join's
-            // own quals before the WHERE's.
-            if joined && !nullable_pushed.is_empty() {
-                let mut first = nullable_side_scan_quals(nullable_pushed, &cat);
-                first.append(&mut options.join_where);
-                options.join_where = first;
-                ruleutils::order_merged_scan_quals(&mut options.join_where);
-            }
-            let split = ruleutils::join_conditions_split(s, &cat).unwrap_or_default();
-            let conds: Vec<String> = split.iter().map(|(c, _)| c.clone()).collect();
-            join_cond_splits = split.into_iter().map(|(_, s)| s).collect();
-            if conds.is_empty() && joined {
-                ruleutils::comma_join_conds(s, &mut options.join_where)?
-            } else {
-                conds
-            }
-        }
-        _ => Vec::new(),
-    };
+            _ => Vec::new(),
+        })
+    })?;
     // Without ANALYZE the statement is planned and not run.
     let inner = if options.analyze {
         plan_node(query, lookup, params)?
