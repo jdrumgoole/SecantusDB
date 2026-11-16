@@ -1947,6 +1947,14 @@ pub(crate) fn attach_function_scan(root: &mut PlanNode, scan: &Option<String>) {
     }
 }
 
+/// The first node named `name`, depth first.
+pub(crate) fn find_node<'a>(n: &'a mut PlanNode, name: &str) -> Option<&'a mut PlanNode> {
+    if n.name == name {
+        return Some(n);
+    }
+    n.children.iter_mut().find_map(|c| find_node(c, name))
+}
+
 /// A single-relation SELECT's ORDER BY Sort prints its keys as the
 /// planned expressions (RP-840): the Sort below any Limit / Unique.
 pub(crate) fn attach_sort_keys(root: &mut PlanNode, keys: &Option<Vec<String>>) {
@@ -3265,6 +3273,7 @@ mod heap_fetches_tests {
             series_scan: None,
             series_qual: None,
             function_scan: None,
+            function_scan_call: None,
         }
     }
 

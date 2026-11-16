@@ -5,7 +5,8 @@ while working RP-472 (2026-11-07).
   wrote.
 - RP-474 (fixed): a scalar user function in FROM was refused under an
   aggregate, an alias column list with a WHERE, and ROWS FROM.
-- RP-475: EXPLAIN of a user function in FROM prints no Function Scan.
+- RP-475: EXPLAIN of a user function in FROM printed no Function Scan,
+  then an unpriced one (fixed); a WHERE over it still prints no Filter.
 - RP-476 (fixed): a function in FROM under an aggregate and a WHERE ran
   twice.
 - RP-496 (fixed): a volatile function in a FROM subquery or a CTE joined
@@ -309,9 +310,11 @@ FUNCTION_SCAN_COST = {
 }
 
 
-@pytest.mark.backlog("RP-475")
+@pytest.mark.backlog_fixed("RP-475")
 @pytest.mark.parametrize("call", list(FUNCTION_SCAN_COST))
 def test_function_scan_cost(call: str, dsn: str) -> None:
+    """Every Function Scan cost was zero, and a scalar SQL function of one
+    constant SELECT printed its scan instead of the Result it inlines to."""
     with psycopg.connect(dsn, autocommit=True) as c:
         for q in _SETUP:
             c.execute(q)
@@ -321,3 +324,27 @@ def test_function_scan_cost(call: str, dsn: str) -> None:
         finally:
             c.execute("drop function fi475()")
     assert rows == FUNCTION_SCAN_COST[call]
+
+
+# PostgreSQL 15.19: a WHERE over the call is the scan's Filter, and its
+# selectivity scales the rows (`DEFAULT_INEQ_SEL` for `>`).
+FUNCTION_SCAN_FILTER = {
+    "explain select * from fz473() where fz473 > 1": [
+        ("Function Scan on fz473  (cost=0.25..12.75 rows=333 width=4)",),
+        ("  Filter: (fz473 > 1)",),
+    ],
+    "explain select * from fq473() x where x > 1": [
+        ("Function Scan on fq473 x  (cost=0.25..0.26 rows=1 width=4)",),
+        ("  Filter: (x > 1)",),
+    ],
+}
+
+
+@pytest.mark.backlog("RP-475")
+@pytest.mark.parametrize("call", list(FUNCTION_SCAN_FILTER))
+def test_function_scan_filter(call: str, dsn: str) -> None:
+    with psycopg.connect(dsn, autocommit=True) as c:
+        for q in _SETUP:
+            c.execute(q)
+        rows = c.execute(call).fetchall()
+    assert rows == FUNCTION_SCAN_FILTER[call]

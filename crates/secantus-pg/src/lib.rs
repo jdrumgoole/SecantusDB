@@ -1626,6 +1626,57 @@ fn column_at(schema: &[FieldInfo], i: usize) -> PgWireResult<&FieldInfo> {
     })
 }
 
+/// Whether a stored function is one `inline_function` inlines into a
+/// constant (RP-475): a `LANGUAGE sql` function, neither `SECURITY
+/// DEFINER` nor carrying `SET` clauses, whose body is a single SELECT of
+/// one constant -- no FROM, WHERE, grouping, ordering or limit.
+fn inlines_to_constant(d: &Document) -> bool {
+    use pg_query::NodeEnum as N;
+    if d.get_str("language") != Ok("sql")
+        || d.get_bool("security_definer").unwrap_or(false)
+        || d.get_array("config").is_ok_and(|c| !c.is_empty())
+    {
+        return false;
+    }
+    let Ok(parsed) = pg_query::parse(d.get_str("body").unwrap_or_default()) else {
+        return false;
+    };
+    let [stmt] = parsed.protobuf.stmts.as_slice() else {
+        return false;
+    };
+    let Some(N::SelectStmt(s)) = stmt.stmt.as_ref().and_then(|n| n.node.as_ref()) else {
+        return false;
+    };
+    if !s.from_clause.is_empty()
+        || s.where_clause.is_some()
+        || !s.group_clause.is_empty()
+        || s.having_clause.is_some()
+        || !s.sort_clause.is_empty()
+        || s.limit_count.is_some()
+        || s.limit_offset.is_some()
+        || !s.distinct_clause.is_empty()
+        || s.with_clause.is_some()
+        || !s.values_lists.is_empty()
+        || s.op != pg_query::protobuf::SetOperation::SetopNone as i32
+    {
+        return false;
+    }
+    let [target] = s.target_list.as_slice() else {
+        return false;
+    };
+    fn constant(n: Option<&N>) -> bool {
+        match n {
+            Some(N::AConst(_)) => true,
+            Some(N::TypeCast(c)) => constant(c.arg.as_ref().and_then(|a| a.node.as_ref())),
+            _ => false,
+        }
+    }
+    match target.node.as_ref() {
+        Some(N::ResTarget(r)) => constant(r.val.as_ref().and_then(|v| v.node.as_ref())),
+        _ => false,
+    }
+}
+
 fn user_fn_of(d: &Document) -> secantus_pgplan::UserFn {
     let strings = |key: &str| -> Vec<String> {
         d.get_array(key)
@@ -14698,6 +14749,71 @@ impl PgHandler {
             Some(a) if !a.is_empty() => Bson::Array(a.clone()),
             _ => Bson::Null,
         }
+    }
+
+    /// A user function's Function Scan, priced as PostgreSQL 15's
+    /// `cost_functionscan` prices it (RP-475): the call's `procost` times
+    /// `cpu_operator_cost` at startup, then `cpu_tuple_cost` for each of
+    /// its `prorows` rows (one for a scalar function), as wide as its
+    /// result type. A scalar SQL function whose body is one SELECT of a
+    /// constant is inlined (`inline_function`) and its now-constant FROM
+    /// item replaced by an `RTE_RESULT` (`pull_up_constant_function`), so
+    /// it prints a `Result`.
+    fn price_function_scan(
+        &self,
+        tree: &mut explain::PlanNode,
+        shown: &str,
+        (name, nargs): &(String, usize),
+    ) -> PgWireResult<()> {
+        const CPU_OPERATOR_COST: f64 = 0.0025;
+        let Some(node) = explain::find_node(tree, shown) else {
+            return Ok(());
+        };
+        let docs = self.user_function_docs()?;
+        let named: Vec<&Document> = docs
+            .iter()
+            .filter(|d| d.get_str("name") == Ok(name.as_str()))
+            .collect();
+        let doc = match named.as_slice() {
+            [d] => *d,
+            _ => match named
+                .iter()
+                .find(|d| user_fn_of(d).arg_types.len() == *nargs)
+            {
+                Some(d) => *d,
+                None => return Ok(()),
+            },
+        };
+        let f = user_fn_of(doc);
+        let width = if f.columns.is_empty() {
+            scan_estimate::type_width(&f.return_type, -1)
+        } else {
+            f.columns
+                .iter()
+                .map(|(_, t)| scan_estimate::type_width(t, -1))
+                .sum()
+        };
+        if *nargs == 0 && !f.returns_set && inlines_to_constant(doc) {
+            *node = explain::PlanNode::new("Result".to_string());
+            node.estimate = Some((0.0, secantus_pgplan::costsize::CPU_TUPLE_COST, 1.0, width));
+            return Ok(());
+        }
+        let rows = if f.returns_set {
+            doc.get_f64("rows")
+                .ok()
+                .filter(|r| *r > 0.0)
+                .unwrap_or(1000.0)
+        } else {
+            1.0
+        };
+        let startup = f.cost * CPU_OPERATOR_COST;
+        node.estimate = Some((
+            startup,
+            startup + secantus_pgplan::costsize::CPU_TUPLE_COST * rows,
+            rows,
+            width,
+        ));
+        Ok(())
     }
 
     /// The stored `LANGUAGE sql` / `plpgsql` function documents.
@@ -46614,6 +46730,11 @@ impl PgHandler {
                 explain::attach_sort_keys(&mut tree, &options.sort_keys);
                 explain::attach_series_scan(&mut tree, &options.series_scan);
                 explain::attach_function_scan(&mut tree, &options.function_scan);
+                if let (Some(shown), Some(call)) =
+                    (&options.function_scan, &options.function_scan_call)
+                {
+                    self.price_function_scan(&mut tree, shown, call)?;
+                }
                 explain::gate_scan(&mut tree, options.one_time_false);
                 explain::gate_named_scan(&mut tree, &options.nullable_gate);
                 if options.dummy_relation {

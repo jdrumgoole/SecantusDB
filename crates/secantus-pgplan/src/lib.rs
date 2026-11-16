@@ -3758,6 +3758,9 @@ pub struct ExplainOptions {
     /// A SELECT over one other function in FROM: the `Function Scan on`
     /// node's name, with its alias when it differs (RP-475).
     pub function_scan: Option<String>,
+    /// That function's name and argument count, for the server to price
+    /// the scan from its `pg_proc` row (RP-475).
+    pub function_scan_call: Option<(String, usize)>,
 }
 
 /// A `generate_series` scan's WHERE as the planner prices it (RP-847).
@@ -12313,6 +12316,7 @@ fn plan_explain(
         series_scan: None,
         series_qual: None,
         function_scan: None,
+        function_scan_call: None,
     };
     let (mut timing, mut summary) = (None, None);
     // `transformExplainStmt` resolves the statement's names and literals
@@ -12426,9 +12430,12 @@ fn plan_explain(
         },
         _ => (None, None),
     };
-    options.function_scan = match &query {
-        N::SelectStmt(s) if options.series_scan.is_none() => explain_function_scan(s),
-        _ => None,
+    (options.function_scan, options.function_scan_call) = match &query {
+        N::SelectStmt(s) if options.series_scan.is_none() => match explain_function_scan(s) {
+            Some((shown, call)) => (Some(shown), Some(call)),
+            None => (None, None),
+        },
+        _ => (None, None),
     };
     options.sort_keys = match &query {
         N::SelectStmt(s) => match s.from_clause.as_slice() {
@@ -54678,7 +54685,7 @@ type SeriesScan = (Option<String>, Option<String>);
 
 /// The Function Scan a single FROM function prints (RP-475):
 /// `Function Scan on f`, or `Function Scan on f a` under an alias.
-fn explain_function_scan(s: &pg_query::protobuf::SelectStmt) -> Option<String> {
+fn explain_function_scan(s: &pg_query::protobuf::SelectStmt) -> Option<(String, (String, usize))> {
     let [item] = s.from_clause.as_slice() else {
         return None;
     };
@@ -54707,7 +54714,7 @@ fn explain_function_scan(s: &pg_query::protobuf::SelectStmt) -> Option<String> {
         shown.push(' ');
         shown.push_str(&scalar::quote_identifier(&a.aliasname));
     }
-    Some(shown)
+    Some((shown, (name, f.args.len())))
 }
 
 fn explain_series_scan(
