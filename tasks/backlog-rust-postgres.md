@@ -2242,17 +2242,6 @@ Measured on a private PostgreSQL 15.19 cluster.
 Measured on a private PostgreSQL 15.19 cluster. The gap tests are in
 `tests/backlog/test_rp_found_rp527.py`.
 
-- [ ] **A FROM relation that does not exist is reported after the
-      statement's qualified column references.** PostgreSQL 15.19's
-      `transformFromClause` runs before the select list and WHERE are read,
-      so `select fs.c from nosuch` is 42P01 `relation "nosuch" does not
-      exist` at 18, `select nosuch.c from nosuch` the same at 22 and
-      `select a from nosuch where zz.a = 1` at 15. Here the qualifier check
-      runs first: the first and third are `missing FROM-clause entry for
-      table "fs"` / `"zz"` (at 8, 28), and the second has PostgreSQL's
-      message at the reference (8).
-      Backlog-ID: RP-545
-      Verify: tests/backlog/test_rp_found_rp527.py::test_missing_from_relation_reported_first
 
 ## Found while working RP-532 (2026-11-08)
 

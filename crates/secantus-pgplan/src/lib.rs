@@ -4898,10 +4898,14 @@ pub fn identifier_position(sql: &str, name: &str) -> Option<usize> {
             }
         }
     }
-    tokens
-        .iter()
-        .find(|tok| spelled(tok).as_deref() == Some(name))
-        .map(position)
+    // A bare name continued by `.` is a column reference's qualifier
+    // (`select nosuch.c from nosuch`), not the relation (RP-545).
+    let named = |i: &usize| spelled(&tokens[*i]).as_deref() == Some(name);
+    (0..tokens.len())
+        .filter(named)
+        .find(|i| !is_dot(i + 1))
+        .or_else(|| (0..tokens.len()).find(named))
+        .map(|i| position(&tokens[i]))
 }
 
 /// libpg_query's own message, without the `Error splitting: ` / `Invalid
@@ -30546,6 +30550,17 @@ fn plan_select_rest(
     lookup: &dyn Fn(&str) -> Option<TableDef>,
     params: &[Bson],
 ) -> Result<Statement> {
+    // `transformFromClause` opens the FROM relations before the select list
+    // or WHERE is read, so a FROM table that does not exist is reported
+    // ahead of any qualified column reference (RP-545).
+    if let [item] = s.from_clause.as_slice() {
+        if let Some(N::RangeVar(r)) = item.node.as_ref() {
+            let table = relation_name(r);
+            if joins::planned_join(&r.relname).is_none() && lookup(&table).is_none() {
+                return Err(Error::UndefinedTable(table));
+            }
+        }
+    }
     check_single_source_qualifiers(s)?;
     if !s.group_clause.is_empty() || has_aggregate(s) {
         // A window function OVER an aggregate (`sum(sum(v)) over (order by
