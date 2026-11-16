@@ -1784,17 +1784,24 @@ a regression test.
       working RP-354).
       Verify: tests/backlog/test_rp_explain_costs.py::test_plan[nested loop into a weakly correlated index], tests/backlog/test_rp_explain_costs.py::test_plan[nested loop of few rows into a weakly correlated index], tests/backlog/test_rp_explain_costs.py::test_a_wide_range_over_a_weakly_correlated_index
       Backlog-ID: RP-926
-- [ ] **Some chains of inequality joins still run in their written
-      order.** A chain under a LIMIT (and OFFSET), or sorted by an ORDER BY
-      under one, runs in the order PostgreSQL's search keeps
-      (`scan_estimate::nest_loop_chain`) and EXPLAIN prices it. Still
-      written order, and unpriced: a bushy tree (four or more tables;
-      PostgreSQL 15.19 keeps `e join e3` as the outer of a Nested Loop whose
-      inner is a Materialize of `e4 join zs`, for `... join zs on e3.a >
-      zs.a join e e4 on e4.a < zs.a limit 5`), and a join two ONs land on
-      in the new tree (`reorder_nest_loop_chain` refuses it). Measured on a
-      private 15.19 cluster (found while working RP-354).
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a bushy chain of inequality joins under a limit]
+- [ ] **A chain of inequality joins whose ON splits across the searched
+      tree still runs in its written order.** A chain under a LIMIT (and
+      OFFSET), or sorted by an ORDER BY under one, runs in the tree
+      PostgreSQL's search keeps, bushy ones included
+      (`scan_estimate::nest_loop_chain`), and EXPLAIN prices it. But
+      `reorder_nest_loop_chain` moves each ON whole to the lowest join
+      holding all its tables, and refuses a tree where two ONs land on one
+      join; PostgreSQL places each clause (`distribute_qual_to_rels`). For
+      `... join zs on e3.a > zs.a join e e4 on e4.a < zs.a and e4.a > e.a
+      limit 5` PostgreSQL 15.19 keeps the bushy `(e join e3) x Materialize
+      (e4 join zs)`, `e4.a < zs.a` on the lower join and `Join Filter:
+      ((e4.a > e.a) AND (e3.a > zs.a))` on the top (the ON's later clause
+      first); here the written order, unpriced, and executing it without
+      EXPLAIN did not finish in the probe's timeout. Needs the ONs split
+      into their clauses (each `JoinFilter` placed alone), the top's
+      filters combined, and `join_conds`' text per join rebuilt from the
+      clauses (found while working RP-354).
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a bushy chain whose last ON splits across two joins]
       Backlog-ID: RP-919
 - [ ] **EXPLAIN VERBOSE prints no `Output` lists above a scan.** A plan
       that is one relation's scan prints as VERBOSE does (RP-925); any

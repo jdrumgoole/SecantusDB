@@ -4915,10 +4915,11 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
         ],
     ),
     # Four tables under a LIMIT: PostgreSQL keeps a bushy tree, the
-    # Materialize of one join the inner of another (RP-919). Here the chain
-    # runs in its written order, unpriced. Measured on PostgreSQL 15.19.
+    # Materialize of one join the inner of another (RP-919, fixed: the
+    # chain ran in its written order, unpriced). Measured on PostgreSQL
+    # 15.19.
     "a bushy chain of inequality joins under a limit": (
-        "RP-919",
+        "RP-919:fixed",
         _ANALYSED_SMALL,
         "explain select e.a, e3.a, zs.a, e4.a from e join e e3 on e.a < e3.a"
         " join zs on e3.a > zs.a join e e4 on e4.a < zs.a limit 5",
@@ -4926,6 +4927,34 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "Limit  (cost=0.00..0.23 rows=5 width=16)",
             "  ->  Nested Loop  (cost=0.00..16680190.29 rows=370370000 width=16)",
             "        Join Filter: (e3.a > zs.a)",
+            "        ->  Nested Loop  (cost=0.00..15032.50 rows=333333 width=8)",
+            "              Join Filter: (e.a < e3.a)",
+            "              ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=4)",
+            "              ->  Materialize  (cost=0.00..20.00 rows=1000 width=4)",
+            "                    ->  Seq Scan on e e3  (cost=0.00..15.00 rows=1000 width=4)",
+            "        ->  Materialize  (cost=0.00..182.79 rows=3333 width=8)",
+            "              ->  Nested Loop  (cost=0.00..166.12 rows=3333 width=8)",
+            "                    Join Filter: (e4.a < zs.a)",
+            "                    ->  Seq Scan on e e4  (cost=0.00..15.00 rows=1000 width=4)",
+            "                    ->  Materialize  (cost=0.00..1.15 rows=10 width=4)",
+            "                          ->  Seq Scan on zs  (cost=0.00..1.10 rows=10 width=4)",
+        ],
+    ),
+    # The bushy chain with a second clause in the last ON, `e4.a > e.a`:
+    # PostgreSQL places each clause, not each ON, on the lowest join
+    # holding its tables, so `e4.a < zs.a` stays on `e4 join zs` and
+    # `e4.a > e.a` joins `e3.a > zs.a` on the top (RP-919). Here the ON
+    # moves whole, the tree is refused, and the chain runs in its written
+    # order, unpriced. Measured on PostgreSQL 15.19.
+    "a bushy chain whose last ON splits across two joins": (
+        "RP-919",
+        _ANALYSED_SMALL,
+        "explain select e.a, e3.a, zs.a, e4.a from e join e e3 on e.a < e3.a"
+        " join zs on e3.a > zs.a join e e4 on e4.a < zs.a and e4.a > e.a limit 5",
+        [
+            "Limit  (cost=0.00..0.79 rows=5 width=16)",
+            "  ->  Nested Loop  (cost=0.00..19457687.52 rows=123456667 width=16)",
+            "        Join Filter: ((e4.a > e.a) AND (e3.a > zs.a))",
             "        ->  Nested Loop  (cost=0.00..15032.50 rows=333333 width=8)",
             "              Join Filter: (e.a < e3.a)",
             "              ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=4)",
@@ -6150,3 +6179,25 @@ def test_a_chain_of_inequality_joins_under_a_limit(rust_pg: Any) -> None:
     joined as written."""
     rows = _first_rows(fresh_db(_dsn(rust_pg)), _INEQUALITY_CHAIN + " limit 5", 5)
     assert [r[0] for r in rows] == [1, 1, 2, 1, 2]
+
+
+@pytest.mark.backlog_fixed("RP-919")
+def test_a_bushy_chain_runs_each_loop_outer_first(rust_pg: Any) -> None:
+    """PostgreSQL 15.19 runs the bushy chain's `e4 join zs` with `e4` as
+    the loop's outer, so past the first rows (`limit 7 offset 3`) the
+    pairs come `e4` by `e4`; the two-table join ran its written left,
+    `zs`, as the outer while EXPLAIN printed `e4` first."""
+    query = (
+        "select e.a, e3.a, zs.a, e4.a from e join e e3 on e.a < e3.a"
+        " join zs on e3.a > zs.a join e e4 on e4.a < zs.a limit 7 offset 3"
+    )
+    rows = _first_rows(fresh_db(_dsn(rust_pg)), query, 7)
+    assert rows == [
+        (1, 4, 3, 2),
+        (1, 5, 2, 1),
+        (1, 5, 3, 1),
+        (1, 5, 4, 1),
+        (1, 5, 3, 2),
+        (1, 5, 4, 2),
+        (1, 5, 4, 3),
+    ]

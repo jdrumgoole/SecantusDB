@@ -45889,70 +45889,76 @@ impl PgHandler {
                     is_sort(&tree)
                 };
                 let above = usize::from(under_limit) + usize::from(under_sort);
-                let mut depth = 0;
+                // The plan's shape the search's tree, a Nested Loop per
+                // join and a bare scan per table (a bushy tree, RP-919).
+                fn fits(
+                    node: &explain::PlanNode,
+                    t: &scan_estimate::NestLoopTree,
+                    bare_scan: &dyn Fn(&explain::PlanNode) -> bool,
+                ) -> bool {
+                    match t {
+                        scan_estimate::NestLoopTree::Leaf(_) => bare_scan(node),
+                        scan_estimate::NestLoopTree::Join(_, l, r) => {
+                            node.name == "Nested Loop"
+                                && node.details.is_empty()
+                                && node.children.len() == 2
+                                && fits(&node.children[0], l, bare_scan)
+                                && fits(&node.children[1], r, bare_scan)
+                        }
+                    }
+                }
+                // Lowest first, so each join's children are still the
+                // tree's when it is priced.
+                fn price(node: &mut explain::PlanNode, t: &scan_estimate::NestLoopTree) {
+                    if let scan_estimate::NestLoopTree::Join(level, l, r) = t {
+                        price(&mut node.children[0], l);
+                        price(&mut node.children[1], r);
+                        let (plan, a, b, join, param) = level.as_ref();
+                        explain::price_nest_loop(node, plan, *a, *b, *join);
+                        // The inner read through its index (RP-354).
+                        if let Some(p) = param {
+                            explain::param_index_inner(node, p);
+                        }
+                    }
+                }
                 let mut node = &tree;
                 for _ in 0..above {
                     node = &node.children[0];
                 }
-                let chain = loop {
-                    if node.name != "Nested Loop"
-                        || !node.details.is_empty()
-                        || node.children.len() != 2
-                        || !bare_scan(&node.children[1])
-                    {
-                        break false;
-                    }
-                    depth += 1;
-                    if bare_scan(&node.children[0]) {
-                        break true;
-                    }
-                    node = &node.children[0];
-                };
-                if chain && depth >= 2 {
+                let chain = node.name == "Nested Loop";
+                if chain {
                     if let Statement::Select(sel) = inner.as_ref() {
                         if let Some(levels) = self.nest_loop_chain_estimate(sel) {
-                            if levels.len() == depth {
-                                if let Some((_, _, _, top, _)) = levels.last() {
-                                    let count = sel.limit.map_or(0, |n| n.max(1));
-                                    let mut input = *top;
-                                    if under_sort {
-                                        let bound = (under_limit && count > 0)
-                                            .then(|| (count + sel.offset.max(0)) as f64);
-                                        let (startup, total) = secantus_pgplan::joincost::cost_sort(
-                                            top.1, top.2, top.3, bound,
-                                        );
-                                        input = (startup, total, top.2, top.3);
-                                        let sort = if under_limit {
-                                            &mut tree.children[0]
-                                        } else {
-                                            &mut tree
-                                        };
-                                        sort.estimate = Some(input);
-                                    }
-                                    if under_limit {
-                                        tree.estimate = Some(scan_estimate::limit_estimate(
-                                            input, sel.offset, count,
-                                        ));
-                                    }
+                            if let (true, scan_estimate::NestLoopTree::Join(top, ..)) =
+                                (fits(node, &levels, &bare_scan), &levels)
+                            {
+                                let top = top.3;
+                                let count = sel.limit.map_or(0, |n| n.max(1));
+                                let mut input = top;
+                                if under_sort {
+                                    let bound = (under_limit && count > 0)
+                                        .then(|| (count + sel.offset.max(0)) as f64);
+                                    let (startup, total) = secantus_pgplan::joincost::cost_sort(
+                                        top.1, top.2, top.3, bound,
+                                    );
+                                    input = (startup, total, top.2, top.3);
+                                    let sort = if under_limit {
+                                        &mut tree.children[0]
+                                    } else {
+                                        &mut tree
+                                    };
+                                    sort.estimate = Some(input);
+                                }
+                                if under_limit {
+                                    tree.estimate = Some(scan_estimate::limit_estimate(
+                                        input, sel.offset, count,
+                                    ));
                                 }
                                 let mut root = &mut tree;
                                 for _ in 0..above {
                                     root = &mut root.children[0];
                                 }
-                                // Lowest first, so each join above is
-                                // still the tree's when it is reached.
-                                for (i, (plan, a, b, join, param)) in levels.iter().enumerate() {
-                                    let mut node = &mut *root;
-                                    for _ in 0..depth - 1 - i {
-                                        node = &mut node.children[0];
-                                    }
-                                    explain::price_nest_loop(node, plan, *a, *b, *join);
-                                    // The inner read through its index
-                                    // (RP-354).
-                                    if let Some(p) = param {
-                                        explain::param_index_inner(node, p);
-                                    }
-                                }
+                                price(root, &levels);
                             }
                         }
                     }

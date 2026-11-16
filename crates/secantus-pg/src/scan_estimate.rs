@@ -906,19 +906,19 @@ impl PgHandler {
     pub(crate) fn nest_loop_chain_estimate(
         &self,
         sel: &secantus_pgplan::Select,
-    ) -> Option<Vec<NestLoopLevel>> {
-        self.nest_loop_chain(sel).map(|(levels, _)| levels)
+    ) -> Option<NestLoopTree> {
+        self.nest_loop_chain(sel)
     }
 
-    /// The order of the chain's tables PostgreSQL's search keeps, bottom
-    /// first, by their index in the written chain, when it is not the
-    /// written one (RP-919).
+    /// The tree of the chain's joins PostgreSQL's search keeps, each table
+    /// by its index in the written chain, when it is not the written
+    /// left-deep one (RP-919).
     pub(crate) fn nest_loop_chain_order(
         &self,
         sel: &secantus_pgplan::Select,
-    ) -> Option<Vec<usize>> {
-        let (_, order) = self.nest_loop_chain(sel)?;
-        (!order.iter().enumerate().all(|(i, &t)| i == t)).then_some(order)
+    ) -> Option<NestLoopTree> {
+        let tree = self.nest_loop_chain(sel)?;
+        (!tree.is_written()).then_some(tree)
     }
 
     /// `sel` with its chain of inner joins in the order PostgreSQL's
@@ -974,9 +974,6 @@ impl PgHandler {
         }
         leaves.push(node.clone());
         leaves.reverse();
-        if leaves.len() != order.len() {
-            return None;
-        }
         let alias = |n: &JoinNode| -> Option<String> {
             let JoinNode::Leaf { def, .. } = n else {
                 return None;
@@ -994,19 +991,32 @@ impl PgHandler {
                 JoinNode::Lateral { .. } => Vec::new(),
             }
         };
-        let mut placed = vec![false; ons.len()];
-        let mut held: Vec<String> = vec![alias(&leaves[order[0]])?];
-        let mut tree = leaves[order[0]].clone();
-        let mut from: Vec<Option<usize>> = Vec::new();
-        for &t in &order[1..] {
-            let leaf = leaves[t].clone();
-            held.push(alias(&leaf)?);
-            let mut here: Vec<usize> = Vec::new();
-            for (i, (_, _, aliases, _)) in ons.iter().enumerate() {
-                if !placed[i] && aliases.iter().all(|a| held.contains(a)) {
-                    here.push(i);
+        // The tree bottom up, each ON on the lowest join holding the
+        // tables it reads; `from` in post-order, as `join_conds` counts.
+        #[allow(clippy::too_many_arguments)]
+        fn build(
+            t: &NestLoopTree,
+            leaves: &[JoinNode],
+            ons: &[On],
+            placed: &mut [bool],
+            from: &mut Vec<Option<usize>>,
+            alias: &dyn Fn(&JoinNode) -> Option<String>,
+            keys: &dyn Fn(&JoinNode) -> Vec<String>,
+        ) -> Option<(JoinNode, Vec<String>)> {
+            let (l, r) = match t {
+                NestLoopTree::Leaf(i) => {
+                    let leaf = leaves.get(*i)?.clone();
+                    let a = alias(&leaf)?;
+                    return Some((leaf, vec![a]));
                 }
-            }
+                NestLoopTree::Join(_, l, r) => (l, r),
+            };
+            let (left, mut held) = build(l, leaves, ons, placed, from, alias, keys)?;
+            let (right, more) = build(r, leaves, ons, placed, from, alias, keys)?;
+            held.extend(more);
+            let here: Vec<usize> = (0..ons.len())
+                .filter(|&i| !placed[i] && ons[i].2.iter().all(|a| held.contains(a)))
+                .collect();
             if here.len() > 1 {
                 return None;
             }
@@ -1019,11 +1029,11 @@ impl PgHandler {
                 None => (None, None, Vec::new(), Vec::new()),
             };
             from.push(written);
-            let (left_keys, right_keys) = (keys(&tree), keys(&leaf));
-            tree = JoinNode::Join {
+            let (left_keys, right_keys) = (keys(&left), keys(&right));
+            let node = JoinNode::Join {
                 kind: JoinKind::Inner,
-                left: Box::new(tree),
-                right: Box::new(leaf),
+                left: Box::new(left),
+                right: Box::new(right),
                 on_other: on.is_some(),
                 on,
                 on_aliases,
@@ -1036,6 +1046,13 @@ impl PgHandler {
                 left_keys,
                 right_keys,
             };
+            Some((node, held))
+        }
+        let mut placed = vec![false; ons.len()];
+        let mut from: Vec<Option<usize>> = Vec::new();
+        let (tree, held) = build(&order, &leaves, &ons, &mut placed, &mut from, &alias, &keys)?;
+        if held.len() != leaves.len() {
+            return None;
         }
         if placed.iter().any(|p| !p) {
             return None;
@@ -1049,10 +1066,7 @@ impl PgHandler {
         Some((out, from))
     }
 
-    fn nest_loop_chain(
-        &self,
-        sel: &secantus_pgplan::Select,
-    ) -> Option<(Vec<NestLoopLevel>, Vec<usize>)> {
+    fn nest_loop_chain(&self, sel: &secantus_pgplan::Select) -> Option<NestLoopTree> {
         use secantus_pgplan::joins::{FilterKind, JoinFilter, JoinKind, JoinNode, JoinRows};
         use secantus_pgplan::Statement;
         let sub = sel.sub.as_ref()?;
@@ -1497,7 +1511,7 @@ impl PgHandler {
         let top = &rels[&full];
         // An ORDER BY sorts the cheapest in total: no path of the chain
         // is ordered, so none is presorted (RP-919).
-        let mut at = match sel.limit.filter(|_| sel.order.is_empty()) {
+        let at = match sel.limit.filter(|_| sel.order.is_empty()) {
             Some(count) => secantus_pgplan::joincost::limit_choice_of(
                 &top.paths,
                 top.est.2,
@@ -1506,68 +1520,67 @@ impl PgHandler {
             )?,
             None => top.cheapest,
         };
-        // Down the kept paths from the top: each must join a relation
-        // below and one table, which the tree puts above it.
-        let mut out = Vec::new();
-        let mut order = Vec::new();
-        let mut set = full;
-        while set.count_ones() > 1 {
+        // Down the kept paths from the top: each join's two relations,
+        // the relation the loop reads as its outer at the path it kept,
+        // the inner at its cheapest; the outer is the tree's left, and
+        // either may be a join (a bushy tree, RP-919).
+        fn descend(
+            set: u32,
+            at: usize,
+            rels: &std::collections::HashMap<u32, Rel>,
+            scans: &[Estimate],
+            params: &[Option<(u32, secantus_pgplan::joincost::ParamInner, ParamScan)>],
+        ) -> Option<NestLoopTree> {
+            if set.count_ones() == 1 {
+                return Some(NestLoopTree::Leaf(set.trailing_zeros() as usize));
+            }
             let rel = rels.get(&set)?;
             let (kept, (p, q)) = *rel.kept.get(at)?;
             let mut plan = kept.plan;
-            let lower_is_outer;
-            let (lower, leaf) = if q.count_ones() == 1 {
-                lower_is_outer = !plan.b_outer;
-                (p, q)
-            } else if p.count_ones() == 1 {
-                lower_is_outer = plan.b_outer;
-                plan.b_outer = !plan.b_outer;
-                (q, p)
-            } else {
-                return None;
+            // The loop's outer is the tree's left, so its rows come out
+            // in the plan's order.
+            let (left, right) = if plan.b_outer { (q, p) } else { (p, q) };
+            plan.b_outer = false;
+            let path_of = |r: u32, at: usize| -> Option<(usize, Estimate)> {
+                let rel = rels.get(&r)?;
+                let (s, t) = *rel.paths.get(at)?;
+                Some((at, (s, t, rel.est.2, rel.est.3)))
             };
-            let i = leaf.trailing_zeros() as usize;
-            order.push(i);
-            // The lower relation's path: the one the loop reads as its
-            // outer, or its cheapest as the inner.
-            let low = &rels[&lower];
-            let next = if lower_is_outer {
-                kept.outer_path
-            } else {
-                low.cheapest
-            };
-            let (ls, lt) = *low.paths.get(next)?;
-            let (mut a, mut b) = ((ls, lt, low.est.2, low.est.3), scans[i]);
+            let (lat, mut a) = path_of(left, kept.outer_path)?;
+            let (rat, mut b) = path_of(right, rels.get(&right)?.cheapest)?;
+            // A table's estimate is its scan's.
+            if left.count_ones() == 1 {
+                a = scans[left.trailing_zeros() as usize];
+            }
+            if right.count_ones() == 1 {
+                b = scans[right.trailing_zeros() as usize];
+            }
             // The parameterized inner: its scan's estimate, read through
             // its index, under its Memoize where that is kept.
             let mut scan = None;
             if plan.param {
-                let inner = if plan.b_outer { lower } else { leaf };
-                let (_, p, s) = params[inner.trailing_zeros() as usize].as_ref()?;
-                let est = |e: Estimate| (p.startup, p.total, p.rows, e.3);
-                if plan.b_outer {
-                    a = est(a);
-                } else {
-                    b = est(b);
+                if right.count_ones() != 1 {
+                    return None;
                 }
+                let (_, p, s) = params[right.trailing_zeros() as usize].as_ref()?;
+                b = (p.startup, p.total, p.rows, b.3);
                 let mut s = s.clone();
                 s.memoize = plan.memoize;
                 scan = Some(s);
             }
-            out.push((
-                plan,
-                a,
-                b,
-                (plan.startup, plan.total, rel.est.2, rel.est.3),
-                scan,
-            ));
-            set = lower;
-            at = next;
+            Some(NestLoopTree::Join(
+                Box::new((
+                    plan,
+                    a,
+                    b,
+                    (plan.startup, plan.total, rel.est.2, rel.est.3),
+                    scan,
+                )),
+                Box::new(descend(left, lat, rels, scans, params)?),
+                Box::new(descend(right, rat, rels, scans, params)?),
+            ))
         }
-        order.push(set.trailing_zeros() as usize);
-        out.reverse();
-        order.reverse();
-        Some((out, order))
+        descend(full, at, &rels, &scans, &params)
     }
 
     /// `get_memoize_path` over a scan of `inner` parameterized by the row
@@ -5869,6 +5882,34 @@ fn neqjoinsel_cast(
     }
     let eq = secantus_pgplan::joincost::eqjoinsel_inner(&x.stats(), &y.stats());
     Some(1.0 - eq.clamp(0.0, 1.0))
+}
+
+/// [`PgHandler::nest_loop_chain_estimate`]'s answer: a table by its
+/// index in the written chain, or a Nested Loop over two subtrees, left
+/// and right as the join tree lists them (RP-919).
+#[derive(Debug, Clone)]
+pub(crate) enum NestLoopTree {
+    Leaf(usize),
+    Join(Box<NestLoopLevel>, Box<NestLoopTree>, Box<NestLoopTree>),
+}
+
+impl NestLoopTree {
+    /// The written chain: left-deep, its tables in FROM order.
+    fn is_written(&self) -> bool {
+        fn walk(t: &NestLoopTree, next: &mut usize) -> bool {
+            match t {
+                NestLoopTree::Leaf(i) => {
+                    let ok = *i == *next;
+                    *next += 1;
+                    ok
+                }
+                NestLoopTree::Join(_, l, r) => {
+                    matches!(**r, NestLoopTree::Leaf(_)) && walk(l, next) && walk(r, next)
+                }
+            }
+        }
+        walk(self, &mut 0)
+    }
 }
 
 /// One Nested Loop of [`PgHandler::nest_loop_chain_estimate`]'s answer:
