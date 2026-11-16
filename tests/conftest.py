@@ -317,7 +317,7 @@ def _check_artifact_build_provenance() -> None:
 
     for name, rel, rebuild in (
         ("secantusd-pg", provenance.PGSERVER_REL, provenance.REBUILD_PGSERVER_CMD),
-        ("secantusd-rs", provenance.RS_REL, provenance.REBUILD_RS_CMD),
+        ("secantusd-mdb", provenance.RS_REL, provenance.REBUILD_RS_CMD),
     ):
         # `binary_staleness` resolves the Windows `.exe` suffix and abstains on a
         # binary that does not exist -- its tests skip, so there is nothing to be
@@ -526,7 +526,7 @@ def _cap_file_size() -> None:
     failed with "No space left on device". Nothing a test writes needs to be
     anywhere near that size, so the soft `RLIMIT_FSIZE` is lowered here, in
     every pytest process, and every process it starts -- mongod,
-    `secantusd-rs`, `secantusd-pg`, `pg_dump` -- inherits it. A child that
+    `secantusd-mdb`, `secantusd-pg`, `pg_dump` -- inherits it. A child that
     writes past it is killed by SIGXFSZ (`subprocess` restores that signal's
     default in the child), which surfaces as a dead server and a failing
     test: the runaway is reported, not silently absorbed. Inside pytest

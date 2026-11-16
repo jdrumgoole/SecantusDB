@@ -556,7 +556,7 @@ handle, `port=0`, `tmp_path`) in CI / on a WT-capable machine.
   servers.** `pymongo_validation/plugin.py` selects the server via
   `SECANTUS_GAUGE_SERVER` (`python` default / `rust` → the
   `_secantus_server.RustServer` embedded handle) and `gauge_common.py` does the
-  same for the other-language gauges (via the standalone `secantusd-rs` binary),
+  same for the other-language gauges (via the standalone `secantusd-mdb` binary),
   so `invoke validate-all-servers` runs the whole fleet twice and each Rust pass
   writes a `-rust-server` report. The weekly `.github/workflows/validate.yml`
   matrix has a `pymongo-rust-server` entry.

@@ -1,7 +1,7 @@
 """Drive representative workloads against a running server URI to collect a PGO
 profile.
 
-Used by the standalone ``secantusd-rs`` binary's two-stage PGO release build
+Used by the standalone ``secantusd-mdb`` binary's two-stage PGO release build
 (``.github/workflows/release-binaries.yml``): the instrumented binary runs with
 ``LLVM_PROFILE_FILE`` set, this script exercises its hot paths (CRUD +
 aggregation + indexing), then the binary is stopped so the profiling runtime

@@ -30,7 +30,7 @@ The Rust server's point-in-time restore is a subcommand of the binary
 `secantusAdmin.restoreToTimestamp`):
 
 ```
-secantusd-rs restore --source PATH --target-dir PATH [--to-timestamp SECS[,ORD]]
+secantusd-mdb restore --source PATH --target-dir PATH [--to-timestamp SECS[,ORD]]
 ```
 
 It rebuilds a fresh data directory as the database was at the target time
@@ -52,12 +52,12 @@ Typical flow:
 ```bash
 # 1. Stop the server (or extract a backup archive).
 # 2. Replay to the moment before the bad deploy:
-secantusd-rs restore \
+secantusd-mdb restore \
     --source ./secantus-data \
     --target-dir ./secantus-data-restored \
     --to-timestamp 1752694800
 # 3. Start fresh on the restored directory:
-secantusd-rs --port 27017 --storage-path ./secantus-data-restored
+secantusd-mdb --port 27017 --storage-path ./secantus-data-restored
 ```
 
 ## Durability knobs

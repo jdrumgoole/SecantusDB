@@ -91,14 +91,14 @@ impl RustServer {
     /// * `cache_size` / `session_max` / `sync_on_commit` — the WiredTiger
     ///   knobs the daemons expose (`--cache-size` / `--session-max` /
     ///   `--sync-on-commit`), threaded into `wt_config`. Defaults match
-    ///   `python -m secantus` and the standalone `secantusd-rs` binary
+    ///   `python -m secantus` and the standalone `secantusd-mdb` binary
     ///   (4G cache cap — WiredTiger fills it lazily, so idle test servers stay small — 1000 sessions, no per-commit fsync).
     /// * `oplog_async` / `oplog_nonlogged` / `data_nonlogged` /
     ///   `checkpoint_seconds` — the storage write-path modes, per store:
     ///   background oplog drainer, non-logged oplog tables, and the
     ///   log-only-the-oplog data mode with its stable-checkpoint cadence.
     ///   `None` (the default) defers to the matching `SECANTUS_*` env var,
-    ///   except `data_nonlogged`, which defaults to on as `secantusd-rs` does
+    ///   except `data_nonlogged`, which defaults to on as `secantusd-mdb` does
     ///   (RM-210); an explicit value wins over the environment for THIS
     ///   server only. An existing store's recorded data-logging mode always
     ///   wins over `data_nonlogged` (the table config is create-time-sticky).
@@ -190,7 +190,7 @@ impl RustServer {
                 wt_config: Some(wt_config(&cache_size, session_max, sync_on_commit, "128MB")),
                 oplog_async,
                 oplog_nonlogged,
-                // mongod's split by default, as `secantusd-rs` (RM-210).
+                // mongod's split by default, as `secantusd-mdb` (RM-210).
                 data_nonlogged: Some(data_nonlogged.unwrap_or(true)),
                 checkpoint_seconds,
                 transactions_logged_at_commit: true,
@@ -241,7 +241,7 @@ impl RustServer {
             // ON for the EMBEDDED handle, mirroring `SecantusDBServer`'s own
             // default: constructing a server in-process is a test doing it, and
             // every driver failpoint suite needs `configureFailPoint`. The
-            // standalone `secantusd-rs` daemon keeps mongod's default of OFF —
+            // standalone `secantusd-mdb` daemon keeps mongod's default of OFF —
             // that is the one an operator exposes on a port.
             enable_test_commands: true,
             ..ServerConfig::default()

@@ -90,7 +90,7 @@ def test_rotate_certificates_reloads_the_files(tmp_path: Any) -> None:
     try:
         assert proc.stdout is not None
         m = _RS_BANNER.search(proc.stdout.readline())
-        assert m, "secantusd-rs did not start"
+        assert m, "secantusd-mdb did not start"
         drain_output(proc)
         port = int(m.group(2))
         client = pymongo.MongoClient(

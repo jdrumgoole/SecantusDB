@@ -2,7 +2,7 @@
 
 The reference is mongod 8.2.11, asked live: a standalone (`mongod`) or a
 one-member replica set of this module's own (`mongod_rs`) where the item
-needs transactions or change streams. The Rust server is `secantusd-rs`
+needs transactions or change streams. The Rust server is `secantusd-mdb`
 (`rust_mongo`), which always advertises itself as a replica-set primary.
 """
 
@@ -61,7 +61,7 @@ def mongod_rs() -> Iterator[Any]:
 
 @contextlib.contextmanager
 def fresh_rust(tmp_path: Any) -> Iterator[Any]:
-    """A `secantusd-rs` nobody has written to yet."""
+    """A `secantusd-mdb` nobody has written to yet."""
     assert RS_BINARY.exists(), f"{RS_BINARY} is not built"
     proc = subprocess.Popen(
         [str(RS_BINARY), "--port", "0", "--storage-path", str(tmp_path / "store")],
@@ -72,7 +72,7 @@ def fresh_rust(tmp_path: Any) -> Iterator[Any]:
     try:
         assert proc.stdout is not None
         m = _RS_BANNER.search(proc.stdout.readline())
-        assert m, "secantusd-rs did not start"
+        assert m, "secantusd-mdb did not start"
         drain_output(proc)
         client = pymongo.MongoClient(
             host=m.group(1), port=int(m.group(2)), serverSelectionTimeoutMS=10_000
@@ -847,7 +847,7 @@ def test_resume_token_not_found_message_names_the_event_found(
 
 @contextlib.contextmanager
 def auth_rust(tmp_path: Any) -> Iterator[tuple]:
-    """A fresh `secantusd-rs --auth` with `root`, `alice@admin` and
+    """A fresh `secantusd-mdb --auth` with `root`, `alice@admin` and
     `bob@p5b` (password `pw`); yields `(host, port)`."""
     proc = subprocess.Popen(
         [str(RS_BINARY), "--auth", "--port", "0", "--storage-path", str(tmp_path / "auth")],
@@ -858,7 +858,7 @@ def auth_rust(tmp_path: Any) -> Iterator[tuple]:
     try:
         assert proc.stdout is not None
         m = _RS_BANNER.search(proc.stdout.readline())
-        assert m, "secantusd-rs did not start"
+        assert m, "secantusd-mdb did not start"
         drain_output(proc)
         host, port = m.group(1), int(m.group(2))
         local = pymongo.MongoClient(host=host, port=port, directConnection=True)

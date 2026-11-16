@@ -355,7 +355,7 @@ def concurrency_refresh(
     """Re-measure N-writer scaling and refresh the concurrency graphs.
 
     Runs ``bench.concurrency --server all`` (python, rust, rust-async,
-    mongod — needs ``mongod`` on PATH and a built ``secantusd-rs``) with
+    mongod — needs ``mongod`` on PATH and a built ``secantusd-mdb``) with
     interleaved runs, writes the medians to
     ``bench/results/concurrency.json``, then regenerates the
     marker-delimited chart + table blocks in

@@ -1,4 +1,4 @@
-//! TOML-based configuration loader for the `secantusd-rs` daemon.
+//! TOML-based configuration loader for the `secantusd-mdb` daemon.
 //!
 //! A faithful Rust port of `src/secantus/config.py` (the oracle). The config
 //! file is a thin convenience over the CLI flag surface plus a handful of
@@ -31,7 +31,7 @@ pub const LOG_LEVELS: [&str; 4] = ["DEBUG", "INFO", "WARNING", "ERROR"];
 
 /// A fully-resolved daemon configuration. Field defaults match
 /// `SecantusConfig` in `config.py` exactly, so a `ResolvedConfig::default()`
-/// (no file, no flags) behaves identically to what `secantusd-rs` with zero
+/// (no file, no flags) behaves identically to what `secantusd-mdb` with zero
 /// arguments used to do.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ResolvedConfig {

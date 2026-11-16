@@ -2,7 +2,7 @@
 2026-11-13 while working RM-495.
 
 The reference is mongod 8.2.11 (`mongod_rs`); the Rust server is
-`secantusd-rs` (`rust_mongo`).
+`secantusd-mdb` (`rust_mongo`).
 """
 
 from __future__ import annotations

@@ -252,7 +252,7 @@ plan = coll.find({"n": 5}).explain()["queryPlanner"]["winningPlan"]
 `Storage.explain_plan(...)` mirrors `find_matching`'s routing decisions
 without executing them and is exposed on the public storage API.
 
-The Rust MongoDB server (`secantusd-rs`) goes further: its `explain` reports
+The Rust MongoDB server (`secantusd-mdb`) goes further: its `explain` reports
 the plan `mongod` 8.2.11 reports, with `indexBounds`, the residual filter,
 `EXPRESS_IXSCAN` for a point lookup through a unique index,
 `PROJECTION_COVERED`, and the stages `count`, `distinct`, `update`, `delete`

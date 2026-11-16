@@ -24,7 +24,7 @@ WHEN = datetime.datetime(2026, 1, 2, 3, 4, 5)
 MONGOD = os.environ.get("PROBE_MONGOD", "mongodb://127.0.0.1:27041")
 
 #: Point the probe at a RUNNING server instead of an embedded Python one --
-#: this is how the Rust server gets swept (start `secantusd-rs --port N
+#: this is how the Rust server gets swept (start `secantusd-mdb --port N
 #: --storage-path DIR`, then `PROBE_SERVER=mongodb://127.0.0.1:N`). The probe
 #: drives the wire, so the server under test is just a URI; there is nothing
 #: Python-specific about it.

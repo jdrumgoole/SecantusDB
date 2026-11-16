@@ -277,7 +277,7 @@ contains this conversation's uuid; a different uuid is a different session,
 whose processes you report and do not touch. Before calling any of them
 orphaned, check whether that session is still alive — `pgrep -fl 'claude
 --resume <uuid>'`. On 2026-09-29 three servers that looked abandoned (a
-`mongod`, a `secantusd-rs` and a Python server, on ports 27100–27102) turned out
+`mongod`, a `secantusd-mdb` and a Python server, on ports 27100–27102) turned out
 to belong to a session that was still running and still using them. Age alone
 does not settle it; a live owner does.
 

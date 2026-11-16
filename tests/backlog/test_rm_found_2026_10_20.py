@@ -1,7 +1,7 @@
 """Gap tests for the shared Rust storage items found on 2026-10-20 by the
 storage audit (§7.085, measured against mongod 8.2.11).
 
-Both start a `secantusd-rs` of their own: one is killed mid-life, the other
+Both start a `secantusd-mdb` of their own: one is killed mid-life, the other
 needs a small WiredTiger cache."""
 
 from __future__ import annotations
@@ -22,7 +22,7 @@ from tests.backlog.conftest import _RS_BANNER, RS_BINARY, drain_output
 
 @contextlib.contextmanager
 def rust_server(store: Any, *extra: str, socket_timeout_ms: int | None = None) -> Iterator[Any]:
-    """`(proc, client)` for a `secantusd-rs` over `store`."""
+    """`(proc, client)` for a `secantusd-mdb` over `store`."""
     assert RS_BINARY.exists(), f"{RS_BINARY} is not built"
     proc = subprocess.Popen(
         [str(RS_BINARY), "--port", "0", "--storage-path", str(store), *extra],
@@ -39,7 +39,7 @@ def rust_server(store: Any, *extra: str, socket_timeout_ms: int | None = None) -
             m = _RS_BANNER.search(line)
             if m or not line:
                 break
-        assert m, "secantusd-rs did not start"
+        assert m, "secantusd-mdb did not start"
         drain_output(proc)
         client = pymongo.MongoClient(
             host=m.group(1),

@@ -15,7 +15,7 @@ The PostgreSQL server is beta::
     with PostgresServer() as server:
         conn = psycopg.connect(server.dsn)
 
-The same binaries are on PATH as ``secantusd-rs`` and ``secantusd-pg``.
+The same binaries are on PATH as ``secantusd-mdb`` and ``secantusd-pg``.
 """
 
 from secantusdb._server import (

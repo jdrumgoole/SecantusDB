@@ -13,7 +13,7 @@ oplog entry names.
 They expire as mongod expires them: with the oplog entry of their write,
 and, once `changeStreamOptions.preAndPostImages.expireAfterSeconds` is set
 through `setClusterParameter`, after that many seconds. On a store whose
-data tables are not logged (how `secantusd-rs` creates one), crash recovery
+data tables are not logged (how `secantusd-mdb` creates one), crash recovery
 records the pre-images of the writes it replays from the documents as they
 stood before each write, as mongod's oplog application does. A store
 written by an earlier build has its pre-images moved into the collection

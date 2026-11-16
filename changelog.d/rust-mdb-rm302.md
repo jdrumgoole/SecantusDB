@@ -31,7 +31,7 @@ log as mongod writes it found nothing in them.
   - A profile entry that cannot be written is mongod's warning 20703.
   - A profile filter that throws writes no line, as on mongod.
 - The server's standard error carries the same JSON lines.
-- `ServerConfig` gains `db_path`, set by `secantusd-rs`, `secantus_mdb::Server`
+- `ServerConfig` gains `db_path`, set by `secantusd-mdb`, `secantus_mdb::Server`
   and the embedded handle, for `MongoDB starting`.
 - Fixes RM-302 (`tests/backlog/test_rm_001_028.py::test_get_log_lines_are_structured_json`).
 

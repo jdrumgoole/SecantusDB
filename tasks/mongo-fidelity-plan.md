@@ -238,7 +238,7 @@ not show. Re-probed across three zones (8.2.11, 2026-09-10), mongod is
 DST-correct: `America/New_York` is 5h behind in November and 4h in July. It
 resolves a real timezone database at the instant.
 
-Verified end-to-end, not just in the engine: the standalone `secantusd-rs`
+Verified end-to-end, not just in the engine: the standalone `secantusd-mdb`
 answers all eight measured values over the wire under both `TZ=UTC` and
 `TZ=America/New_York`, matching mongod and the Python server exactly.
 

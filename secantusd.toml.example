@@ -1,6 +1,6 @@
 # Example secantusd.toml.
 #
-# Read by both Mongo-wire daemons (secantusd-py and secantusd-rs); the
+# Read by both Mongo-wire daemons (secantusd-py and secantusd-mdb); the
 # legacy secantusdb.toml name is still discovered at each location.
 #
 # Copy to one of the auto-discovery paths and edit:

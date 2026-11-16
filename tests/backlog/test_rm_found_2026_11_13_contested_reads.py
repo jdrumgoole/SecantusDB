@@ -3,7 +3,7 @@ two indexes contest reads every match on this server, where mongod 8.2.11
 stops once the read has what it needs.
 
 The reference is mongod, asked live (`mongod_rs`, a one-member replica set);
-the Rust server is `secantusd-rs` (`rust_mongo`). The test compares how each
+the Rust server is `secantusd-mdb` (`rust_mongo`). The test compares how each
 server's time grows with the collection, not the times themselves, so a
 debug build or a slow runner does not move it: a read that stops at its
 limit costs the same over 10,000 documents and 100,000, one that reads

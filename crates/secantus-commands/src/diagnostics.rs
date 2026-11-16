@@ -90,7 +90,7 @@ pub fn get_cmd_line_opts(_doc: &Document, ctx: &mut CommandContext) -> HandlerRe
     Ok(doc! { "argv": argv, "parsed": parsed_options(ctx.require_auth), "ok": 1.0 })
 }
 
-/// The process's command line, recorded once by the `secantusd-rs` binary
+/// The process's command line, recorded once by the `secantusd-mdb` binary
 /// before it serves: `argv` as the process was started, and the options it
 /// gave under their mongod configuration-file paths (RM-425). An embedded
 /// server has no command line and leaves it unset.

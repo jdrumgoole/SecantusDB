@@ -5,13 +5,13 @@ protocol on a real TCP socket, over the same WiredTiger storage engine MongoDB
 ships, scoped to a single node. Point an application's test suite at it instead
 of standing up a real `mongod`.
 
-This package provides the `secantusd-rs` binary. Building it compiles
+This package provides the `secantusd-mdb` binary. Building it compiles
 WiredTiger from bundled source, which needs **CMake and a C compiler**; nothing
 else (no Python, no libclang). The first build takes a minute or so.
 
 ```sh
 cargo install secantus-mdb --version 0.5.3-beta.196   # a pre-release: cargo needs the version
-secantusd-rs --port 27018
+secantusd-mdb --port 27018
 ```
 
 Prebuilt binaries for each platform are on the

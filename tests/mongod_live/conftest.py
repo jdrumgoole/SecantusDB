@@ -6,7 +6,7 @@ the ones written because nothing in CI compared the surface with mongod at
 all (the coverage review of 2026-10-21: window functions, `$fill`, change
 stream pre-images, retryable writes, and a tail of operators). Every test
 here is marked `mongod_live`, which the default suite's addopts leave out:
-it needs the `secantusd-rs` binary and a `mongod`, and the storage-engine
+it needs the `secantusd-mdb` binary and a `mongod`, and the storage-engine
 job in test.yml runs it with both. A missing reference is an error, never a
 skip (the fixtures come from `tests/backlog/conftest.py`).
 
@@ -51,4 +51,4 @@ def canonical(value: Any) -> str:
 def same(ours: Any, theirs: Any) -> None:
     """Exact, type-aware equality, with both renderings in the message."""
     a, b = canonical(ours), canonical(theirs)
-    assert a == b, f"\n  secantusd-rs: {a}\n  mongod:       {b}"
+    assert a == b, f"\n  secantusd-mdb: {a}\n  mongod:       {b}"

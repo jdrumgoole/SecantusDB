@@ -17,7 +17,7 @@ skipping them has cost a wrong figure on the live website more than once.
   live site before anyone ran `git log`.
 - **Before quoting:** `git rev-parse HEAD`, then
   `git log HEAD..origin/main -- <the crate you measured>`. A binary prints
-  the `crates/` tree it was built from: `secantusd-rs --version`,
+  the `crates/` tree it was built from: `secantusd-mdb --version`,
   `secantusd-pg --version`; compare it with `git rev-parse HEAD:crates`.
 - **`tools/provenance.py` checks this for you on most paths**: the pytest
   collection hook, both probe launchers, `gauge_common.rust_binary()`, the

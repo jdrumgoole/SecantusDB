@@ -6,13 +6,13 @@ which carries only the Python servers.
 ## From crates.io (recommended)
 
 The server is the `secantus-mdb` crate. `cargo install` builds it, WiredTiger
-included, and puts `secantusd-rs` on `PATH`. It needs a Rust toolchain, CMake
+included, and puts `secantusd-mdb` on `PATH`. It needs a Rust toolchain, CMake
 and a C compiler:
 
 ```bash
 cargo install secantus-mdb --version 0.5.3-beta.196
-secantusd-rs --version
-secantusd-rs --port 27017 --storage-path ./secantus-data
+secantusd-mdb --version
+secantusd-mdb --port 27017 --storage-path ./secantus-data
 ```
 
 The crate is a pre-release, so `cargo install` needs the `--version`; without
@@ -48,14 +48,14 @@ curl -LO "$base/secantusdb-0.5.3-beta.147-x86_64-unknown-linux-gnu.tar.gz"
 curl -LO "$base/secantusdb-0.5.3-beta.147-x86_64-unknown-linux-gnu.tar.gz.sha256"
 shasum -a 256 -c secantusdb-0.5.3-beta.147-x86_64-unknown-linux-gnu.tar.gz.sha256
 tar xzf secantusdb-0.5.3-beta.147-x86_64-unknown-linux-gnu.tar.gz
-./secantusd-rs --version
+./secantusd-mdb --version
 ```
 
 Every archive is smoke-tested in CI before release: the workflow boots the
 binary and runs a full `pymongo` CRUD round-trip against it.
 
 On **Windows**, unpack the `.zip` in Explorer (or `tar xzf` the `.tar.gz` from
-any modern shell) and run `secantusd-rs.exe`:
+any modern shell) and run `secantusd-mdb.exe`:
 
 ```powershell
 $tag = "secantusdb-v0.5.3-beta.147"
@@ -66,7 +66,7 @@ Invoke-WebRequest "$base/$zip" -OutFile $zip
 (Get-FileHash $zip -Algorithm SHA256).Hash -eq `
   ((Get-Content "$zip.sha256") -split '\s+')[0].ToUpper()
 Expand-Archive $zip -DestinationPath .
-.\secantusd-rs.exe --version
+.\secantusd-mdb.exe --version
 ```
 
 The Windows build links the C runtime statically, so it needs no Visual C++
@@ -84,7 +84,7 @@ libclang (for the WiredTiger FFI bindgen):
 git clone --recurse-submodules https://github.com/jdrumgoole/SecantusDB
 cd SecantusDB
 cargo build --release --manifest-path crates/secantusdb/Cargo.toml
-# → crates/secantusdb/target/release/secantusd-rs
+# → crates/secantusdb/target/release/secantusd-mdb
 ```
 
 The build compiles the vendored WiredTiger (`vendor/wiredtiger`,

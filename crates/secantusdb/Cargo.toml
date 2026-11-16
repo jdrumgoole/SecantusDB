@@ -2,7 +2,7 @@
 name = "secantus-mdb"
 version = "0.5.3-beta.196"
 edition = "2021"
-description = "A surrogate MongoDB server for tests: the real wire protocol over WiredTiger, single-node. Embed it (secantus_mdb::Server) or run the secantusd-rs binary."
+description = "A surrogate MongoDB server for tests: the real wire protocol over WiredTiger, single-node. Embed it (secantus_mdb::Server) or run the secantusd-mdb binary."
 license = "GPL-2.0-only"
 repository = "https://github.com/jdrumgoole/SecantusDB"
 
@@ -31,13 +31,13 @@ pkg-fmt = "tgz"
 
 # Binary name follows the `secantusd-<engine>` daemon scheme so the compiled
 # Rust server is distinguishable from the Python one (`secantusd-py`). The Cargo
-# package stays `secantusdb`; only the emitted binary is `secantusd-rs`.
+# package stays `secantusdb`; only the emitted binary is `secantusd-mdb`.
 [lib]
 name = "secantus_mdb"
 path = "src/lib.rs"
 
 [[bin]]
-name = "secantusd-rs"
+name = "secantusd-mdb"
 path = "src/main.rs"
 # The binary's own dependencies (signal handling, logging, the allocator) are
 # not the library's: a test that uses `secantus_mdb::Server` as a
@@ -69,7 +69,7 @@ libc = { version = "0.2", optional = true }
 # drop it (`--no-default-features`) — instrumenting mimalloc's internals crashed
 # the arm64-macOS build; the habit is kept for Linux too, harmlessly.
 default = ["bin", "mimalloc"]
-# Builds the `secantusd-rs` binary. Off, the crate is the library alone.
+# Builds the `secantusd-mdb` binary. Off, the crate is the library alone.
 bin = ["dep:ctrlc", "dep:log", "dep:env_logger", "dep:libc"]
 # Enabled only for the PGO instrumented stage-1 build: writes the profile to
 # SECANTUS_PGO_OUT on shutdown via __llvm_profile_set_filename/write_file, because

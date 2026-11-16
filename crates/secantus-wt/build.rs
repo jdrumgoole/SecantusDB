@@ -172,7 +172,7 @@ fn main() {
         // liblz4.dylib side by side the linker always took the dylib — by its
         // ABSOLUTE Homebrew path. That is invisible on a build machine (which
         // has Homebrew by definition) and fatal on a user's: both published
-        // macOS binaries, secantusd-rs 0.5.3-beta.164 and secantusd-pg
+        // macOS binaries, secantusd-mdb 0.5.3-beta.164 and secantusd-pg
         // 0.1.0-beta.1, carry
         //     /opt/homebrew/opt/lz4/lib/liblz4.1.dylib
         // and fail to launch on a Mac without Homebrew lz4 installed at exactly

@@ -231,7 +231,7 @@ agreement.
 ## Cross-protocol facts
 
 - SQL to MongoDB works: a table written by `secantusd-pg` reads back through
-  `secantusd-rs` as a collection, `PRIMARY KEY` as `_id`.
+  `secantusd-mdb` as a collection, `PRIMARY KEY` as `_id`.
 - MongoDB to SQL does NOT: names resolve through `__sql_catalog__`, which
   only `CREATE TABLE` writes, so a `pymongo`-written collection is
   `relation "..." does not exist`. (The Python SQL layer samples

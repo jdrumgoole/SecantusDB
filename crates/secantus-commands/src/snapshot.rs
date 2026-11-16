@@ -234,7 +234,7 @@ pub(crate) fn check_at(rc: &Document, ctx: &CommandContext) -> Result<(), Comman
                     format!(
                         "Cannot read at Timestamp({}, {}): this store's data tables are \
                          logged, and keep no history to read a past time from. A store \
-                         secantusd-rs creates keeps it.",
+                         secantusd-mdb creates keeps it.",
                         at.time, at.increment
                     ),
                 ));

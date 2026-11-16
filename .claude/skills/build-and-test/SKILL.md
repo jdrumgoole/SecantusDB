@@ -27,7 +27,7 @@ use the invoke tasks, which do.
 | one test | `./inv rust-test-one --crate <dir> --test <file stem> --name <test>` |
 | fmt everything, WiredTiger crates included | `./inv rust-fmt` |
 | the vendored WiredTiger static lib | `./inv rust-wt-build` |
-| `secantusd-rs` (debug, what gap tests and probes use) | `./inv rust-binary-build` |
+| `secantusd-mdb` (debug, what gap tests and probes use) | `./inv rust-binary-build` |
 | the embedded `_secantus_server` extension, into the venv | `./inv rust-server-build` |
 | `secantusd-pg` | `./inv rust-pgserver-build` |
 | a pymongo repro script against a fresh binary | `./inv rust-repro` |
@@ -63,7 +63,7 @@ binary built from neither tree; the provenance check will refuse it.
 
 ## Profile-guided optimisation
 
-- **The Rust server is built with PGO** (profile-guided optimization) on top of thin-LTO + mimalloc (~12–19% on write/aggregate paths; `tasks/rust-perf-findings.md` Finding 8). Two halves: the **standalone `secantusd-rs` binary** builds two-stage per-arch in `.github/workflows/release-binaries.yml` (on-target profile via `bench/pgo_workload.py`); the **wheel-embedded `_secantus_server` extension** consumes a committed profile at `crates/pgo/_secantus_server.profdata.tar.gz` (CMake extracts it and passes `-Cprofile-use`). Regenerate the committed profile with `invoke rust-pgo-refresh` when the Rust hot paths change materially — it's only a hint (unmatched functions ignored, so a stale/cross-arch profile is safe, never build-breaking). `SECANTUS_PGO_DISABLE=1` turns it off; `SECANTUS_PGO_GENERATE=<dir>` switches the extension build to instrumentation (used by the refresh task). Don't delete the committed `.tar.gz` — it's the wheel's profile, not a stray artifact. **The Rust PostgreSQL server's released binary has fat LTO and a profile too (2026-10-13)**: the LTO is the crate's `[profile.release]`, so every release build and `cargo install` has it, and the profile is collected at release time by `scripts/build_pg_release.sh` from `bench/pgo_workload_pg.py`. Nothing is committed for it. A release build of that crate takes about nine minutes here.
+- **The Rust server is built with PGO** (profile-guided optimization) on top of thin-LTO + mimalloc (~12–19% on write/aggregate paths; `tasks/rust-perf-findings.md` Finding 8). Two halves: the **standalone `secantusd-mdb` binary** builds two-stage per-arch in `.github/workflows/release-binaries.yml` (on-target profile via `bench/pgo_workload.py`); the **wheel-embedded `_secantus_server` extension** consumes a committed profile at `crates/pgo/_secantus_server.profdata.tar.gz` (CMake extracts it and passes `-Cprofile-use`). Regenerate the committed profile with `invoke rust-pgo-refresh` when the Rust hot paths change materially — it's only a hint (unmatched functions ignored, so a stale/cross-arch profile is safe, never build-breaking). `SECANTUS_PGO_DISABLE=1` turns it off; `SECANTUS_PGO_GENERATE=<dir>` switches the extension build to instrumentation (used by the refresh task). Don't delete the committed `.tar.gz` — it's the wheel's profile, not a stray artifact. **The Rust PostgreSQL server's released binary has fat LTO and a profile too (2026-10-13)**: the LTO is the crate's `[profile.release]`, so every release build and `cargo install` has it, and the profile is collected at release time by `scripts/build_pg_release.sh` from `bench/pgo_workload_pg.py`. Nothing is committed for it. A release build of that crate takes about nine minutes here.
 
 ## The Python test suite
 

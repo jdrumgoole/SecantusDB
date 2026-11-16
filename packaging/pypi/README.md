@@ -10,7 +10,7 @@ macOS arm64:
 
 | command | server | version |
 | --- | --- | --- |
-| `secantusd-rs` | MongoDB wire | {mongodb_version} |
+| `secantusd-mdb` | MongoDB wire | {mongodb_version} |
 | `secantusd-pg` | PostgreSQL wire (beta) | {postgres_version} |
 
 ## Start a server in a test
@@ -40,7 +40,7 @@ pick the port.
 ## Run a server from the shell
 
 ```
-secantusd-rs --port 27018 --storage-path ./data
+secantusd-mdb --port 27018 --storage-path ./data
 secantusd-pg ./pgdata 127.0.0.1:5433
 ```
 

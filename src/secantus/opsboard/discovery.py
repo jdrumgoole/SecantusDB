@@ -30,7 +30,7 @@ _SIGNATURES = (
     "cmake",
     "ninja",
     "invoke",
-    "secantusd-rs",
+    "secantusd-mdb",
     "secantusd-py",
     "gradlew",
     "test-libmongoc",

@@ -5,7 +5,7 @@ name: Publish to PyPI
 # two binary-release workflows already built, smoke-tested and attached to
 # their GitHub Releases (packaging/pypi/build_wheels.py):
 #
-#   secantusd-rs  from the secantusdb-v* release that triggered this run
+#   secantusd-mdb  from the secantusdb-v* release that triggered this run
 #   secantusd-pg  from the newest secantusd-pg-v* release
 #
 # The wheel's version is the MongoDB server's (0.5.3-beta.196 -> 0.5.3b196).

@@ -9,7 +9,7 @@ takes three minutes on its own.
 #### Changed
 
 - `test.yml` `pg-oracle` is a matrix of two shards. `server` runs the slice
-  suite, builds `secantusd-rs`, and keeps the cargo tests, the login
+  suite, builds `secantusd-mdb`, and keeps the cargo tests, the login
   comparisons and the backlog tests. `differential` runs everything compared
   with PostgreSQL's answers: the differential suite against the PostgreSQL 14
   service, and the binary-only files (the corpora, the built-in coverage, the

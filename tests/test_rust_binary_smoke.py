@@ -26,7 +26,7 @@ import pytest
 pymongo = pytest.importorskip("pymongo")
 
 _REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
-_BANNER = re.compile(r"secantusd-rs listening on (\S+):(\d+)")
+_BANNER = re.compile(r"secantusd-mdb listening on (\S+):(\d+)")
 
 
 def _source_tree_of(binary: pathlib.Path) -> str | None:
@@ -54,7 +54,7 @@ def _binary_path() -> pathlib.Path | None:
     if env:
         p = pathlib.Path(env)
         # Windows: the caller may hand us a path without the `.exe` suffix —
-        # `command -v secantusd-rs` under Git Bash does exactly that.
+        # `command -v secantusd-mdb` under Git Bash does exactly that.
         if not p.exists() and sys.platform == "win32" and not p.suffix:
             p = p.with_suffix(".exe")
         if not p.exists():
@@ -68,7 +68,7 @@ def _binary_path() -> pathlib.Path | None:
             raise RuntimeError(
                 f"SECANTUSDB_BIN={env!r} does not exist"
                 + (f" (nor {p})" if str(p) != env else "")
-                + ". Point it at a built secantusd-rs binary, or unset it to let "
+                + ". Point it at a built secantusd-mdb binary, or unset it to let "
                 "the suite discover one under crates/secantusdb/target/."
             )
         return p
@@ -80,7 +80,7 @@ def _binary_path() -> pathlib.Path | None:
     # signal tests deterministically and read as a regression (RM-112).
     found = []
     for profile in ("release", "debug"):
-        p = _REPO_ROOT / "crates" / "secantusdb" / "target" / profile / "secantusd-rs"
+        p = _REPO_ROOT / "crates" / "secantusdb" / "target" / profile / "secantusd-mdb"
         if sys.platform == "win32":
             p = p.with_suffix(".exe")
         if p.exists():

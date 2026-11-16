@@ -60,7 +60,7 @@ project's own `secantus-wire` crate) instead of going through a driver. For a
 *server* benchmark that is the right instrument: driver overhead is the usual
 reason a client machine saturates first, and removing it moves the bottleneck
 back onto the server where it belongs. Measured locally against the same
-`secantusd-rs`, the Rust agent drives about **1.6× the operations per second**
+`secantusd-mdb`, the Rust agent drives about **1.6× the operations per second**
 of an equivalent pymongo agent at the same worker count.
 
 ---
@@ -160,8 +160,8 @@ Two halves:
 1. **The server binary.** By default downloads the newest
    `secantusdb-v*` GitHub release's Linux x86_64 tarball onto the server
    droplet, verifies its SHA-256 against the published checksum, and installs
-   it at `/usr/local/bin/secantusd-rs`. With `--server-build source` it
-   instead clones the repo on the droplet and builds `secantusd-rs` from a
+   it at `/usr/local/bin/secantusd-mdb`. With `--server-build source` it
+   instead clones the repo on the droplet and builds `secantusd-mdb` from a
    pushed git ref, vendored WiredTiger and all.
 2. **The load agent.** Builds `do-client` on the *first* client droplet, then
    pulls the binary back and pushes it to the other client and to the server.
@@ -321,7 +321,7 @@ for this server (`bench/results/pg-droplet/2026-10-12-low-client-noise/`).
 | `--cache-size SIZE` | half the droplet's RAM | WiredTiger cache, e.g. `4G` |
 | `--sync-on-commit` | off | Start the server with `--sync-on-commit` (fsync per commit) |
 | `--standalone` | off | Start the server with `--standalone` |
-| `--server-flags STR` | none | Extra flags appended to the `secantusd-rs` command line |
+| `--server-flags STR` | none | Extra flags appended to the `secantusd-mdb` command line |
 | `--keep-data` | off | Do not wipe the server's data directory before the run |
 | `--start-delay SECS` | `20` | Lead time before the shared start barrier |
 | `--keep-server-running` | off | Leave the server up after the run, for manual poking |
@@ -730,7 +730,7 @@ cargo run --release --manifest-path crates/Cargo.toml -p secantus-bench \
 ```
 
 That clones the repo on the server droplet at your current `HEAD`, builds
-vendored WiredTiger through the same path CI uses, and builds `secantusd-rs`
+vendored WiredTiger through the same path CI uses, and builds `secantusd-mdb`
 from it. It takes 15-25 minutes and requires the ref to be **pushed** — the
 droplet clones from GitHub, so uncommitted work is invisible to it (and
 unreproducible as a benchmark anyway). The load agent is built from the same

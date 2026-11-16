@@ -7,7 +7,7 @@ first hour, 50 of 8 after it), takes one, deletes every measurement, and
 counts what the cursor still returns: what mongod's read had buffered.
 
 The reference is mongod 8.2.11 (`mongod`); the Rust server is
-`secantusd-rs` (`rust_mongo`).
+`secantusd-mdb` (`rust_mongo`).
 """
 
 from __future__ import annotations

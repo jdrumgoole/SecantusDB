@@ -868,7 +868,7 @@ def _start_rust(store: pathlib.Path) -> tuple[subprocess.Popen, Any]:
     )
     assert proc.stdout is not None
     m = _RS_BANNER.search(proc.stdout.readline())
-    assert m, "secantusd-rs did not start"
+    assert m, "secantusd-mdb did not start"
     drain_output(proc)
     client = pymongo.MongoClient(
         host=m.group(1), port=int(m.group(2)), serverSelectionTimeoutMS=10_000
@@ -887,7 +887,7 @@ def _stop_rust(proc: subprocess.Popen, client: Any) -> None:
 
 @pytest.fixture
 def restarted(tmp_path: pathlib.Path) -> Iterator[Any]:
-    """A `secantusd-rs` whose `rm055.c` once held an array under `a_1` and
+    """A `secantusd-mdb` whose `rm055.c` once held an array under `a_1` and
     no longer does, restarted after that."""
     proc, client = _start_rust(tmp_path)
     try:

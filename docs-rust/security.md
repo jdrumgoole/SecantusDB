@@ -67,7 +67,7 @@ The server's own commands have no mongod rule, so the server sets one:
 Transport security is [rustls](https://github.com/rustls/rustls)-based:
 
 ```bash
-secantusd-rs \
+secantusd-mdb \
   --tls-cert-file /etc/letsencrypt/live/db.example.com/fullchain.pem \
   --tls-key-file  /etc/letsencrypt/live/db.example.com/privkey.pem \
   --tls-ca-file   /etc/ssl/client-ca.crt \

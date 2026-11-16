@@ -190,7 +190,7 @@ PYTHON = Target(
 RUST = Target(
     key="rust",
     name="Rust server",
-    subtitle="secantusd-rs binary + _secantus_server · secantusdb-v tags",
+    subtitle="secantusd-mdb binary + _secantus_server · secantusdb-v tags",
     tasks=[
         Task(
             "rs-test",
@@ -272,7 +272,7 @@ RUST = Target(
             "build",
             "Standalone secantusd binary.",
             detail=(
-                "Builds the standalone secantusd-rs binary (the Rust MongoDB-"
+                "Builds the standalone secantusd-mdb binary (the Rust MongoDB-"
                 "wire server) and prints its path. Statically links the "
                 "vendored WiredTiger, so a cold build is slow; incremental "
                 "rebuilds are much faster."

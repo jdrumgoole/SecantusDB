@@ -30,7 +30,7 @@ with PostgresServer() as server, psycopg.connect(server.dsn, autocommit=True) as
     print("PostgreSQL server OK:", server.dsn)
 
 scripts = Path(sys.executable).parent
-for command in ("secantusd-rs", "secantusd-pg"):
+for command in ("secantusd-mdb", "secantusd-pg"):
     out = subprocess.run(
         [os.fspath(scripts / command), "--version"],
         capture_output=True,

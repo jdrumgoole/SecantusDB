@@ -1185,16 +1185,16 @@ jobs:
           python -c "import _secantus_storage, _secantus_server;
           print('bundled OK:', _secantus_storage.__file__, _secantus_server.__file__)"
 
-      - name: Assert the wheel bundles secantusd-rs on PATH + it runs
+      - name: Assert the wheel bundles secantusd-mdb on PATH + it runs
         # CMake installs the standalone binary into the wheel's scripts dir
-        # (SKBUILD_SCRIPTS_DIR), so installing the wheel puts `secantusd-rs` on
+        # (SKBUILD_SCRIPTS_DIR), so installing the wheel puts `secantusd-mdb` on
         # PATH — distinct from the pure-Python `secantus.cli:main` `secantusd-py`
         # console script. Drive the bundled binary through the same smoke test
         # via SECANTUSDB_BIN.
         #
         # This ran everywhere-but-Windows on the grounds that "the bin isn't
         # built there". It is: this job's own log shows `Linking C static library
-        # wiredtiger.lib` followed by `Building standalone secantusd-rs binary`,
+        # wiredtiger.lib` followed by `Building standalone secantusd-mdb binary`,
         # because MSVC's static lib is simply named differently from the Unix one
         # and build.rs already looks for both. Running it here keeps the Windows
         # release binary honest on every push instead of only at tag time —
@@ -1205,12 +1205,12 @@ jobs:
           uv run --no-project --with pymongo --with pytest --with "$whl" bash -c '
             set -e
             # Resolve through Python, not `command -v`: under Git Bash the latter
-            # returns an MSYS path with no .exe (/d/a/.../Scripts/secantusd-rs),
+            # returns an MSYS path with no .exe (/d/a/.../Scripts/secantusd-mdb),
             # which the Windows Python running pytest cannot open. shutil.which
             # gives a native path with the right suffix on every platform.
-            bin=$(python -c "import shutil,sys; p=shutil.which(\"secantusd-rs\"); print(p) if p else sys.exit(1)") \
-              || { echo "secantusd-rs not on PATH after install" >&2; exit 1; }
-            echo "secantusd-rs -> $bin"
+            bin=$(python -c "import shutil,sys; p=shutil.which(\"secantusd-mdb\"); print(p) if p else sys.exit(1)") \
+              || { echo "secantusd-mdb not on PATH after install" >&2; exit 1; }
+            echo "secantusd-mdb -> $bin"
             "$bin" --version
             SECANTUSDB_BIN="$bin" python -m pytest tests/test_rust_binary_smoke.py \
               -o addopts= -p no:cacheprovider -q
@@ -1305,7 +1305,7 @@ jobs:
           df -h "$t" || df -h . || true
           if [ "$RUNNER_OS" = "Windows" ]; then echo "C: (toolchains)"; df -h /c || true; fi
 
-      - name: Build + smoke the standalone secantusd-rs binary (R7, macOS)
+      - name: Build + smoke the standalone secantusd-mdb binary (R7, macOS)
         # macOS (the weekly cron) only. On Linux this moved to the
         # `mdb-binary` job, which builds the binary without waiting for this
         # job's wheel. Keep the test list in step with that job's "(R7)" step.
@@ -1344,7 +1344,7 @@ jobs:
           echo "disk watchdog: free space never fell under the threshold"
 
   mdb-binary:
-    # The standalone `secantusd-rs` (debug) against a live mongod 8.2: the
+    # The standalone `secantusd-mdb` (debug) against a live mongod 8.2: the
     # backlog's RM gap and regression tests, tests/mongod_live/, and the R7
     # binary tests. Until 2026-11-11 these were the tail of `storage-engine`,
     # where they waited ~9 min for a wheel they do not use -- they drive the
@@ -1472,12 +1472,12 @@ jobs:
           shared-key: mdb-binary
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
-      - name: Build the standalone secantusd-rs binary (debug)
-        # tests/backlog/conftest.py runs crates/secantusdb/target/debug/secantusd-rs.
+      - name: Build the standalone secantusd-mdb binary (debug)
+        # tests/backlog/conftest.py runs crates/secantusdb/target/debug/secantusd-mdb.
         if: matrix.shard == 'backlog'
         run: cargo build --manifest-path crates/secantusdb/Cargo.toml
 
-      - name: Build + smoke the standalone secantusd-rs binary (R7)
+      - name: Build + smoke the standalone secantusd-mdb binary (R7)
         # The bin crate links the vendored WiredTiger resolved above.
         # test_rust_binary_pitr.py (PITR restore and --preserve-oplog
         # against this binary) ran in no job until 2026-10-21: it imports
@@ -1608,7 +1608,7 @@ jobs:
     # Two shards since 2026-10-22, when this job became the whole PR run's
     # critical path (19-27 min, the suite step alone 11-18). Each shard
     # builds `secantusd-pg` and runs its share. `server`: the slice suite,
-    # secantusd-rs, the cargo tests, the login and backlog comparisons.
+    # secantusd-mdb, the cargo tests, the login and backlog comparisons.
     # `differential`: everything compared with PostgreSQL's answers, live
     # (the differential suite, against the service below) or recorded (the
     # corpora and the other binary-only files). `backlog`, split from
@@ -1731,7 +1731,7 @@ jobs:
 
       # Until 2026-11-08 this job had no cargo cache, so each of the three
       # shards compiled every third-party crate on every run: "Build
-      # secantusd-pg" took 108-153s, "Build secantusd-rs" 65s and the cargo
+      # secantusd-pg" took 108-153s, "Build secantusd-mdb" 65s and the cargo
       # tests' build most of their 99s, in the job that sets the PR's CI
       # time. One cache serves all three shards (`shared-key`). Only the
       # `server` shard builds all of it (both binaries and the test
@@ -1764,19 +1764,19 @@ jobs:
 
       # The cross-protocol tests in test_rust_pgserver_slice.py need the
       # MongoDB binary as well: they have the PG server write a table, stop it,
-      # and then read it back as a collection through `secantusd-rs`. Without
+      # and then read it back as a collection through `secantusd-mdb`. Without
       # this step they skip -- and since this is the only lane that runs that
       # suite, skipping here means they run in NO lane at all, which is worse
       # than not having them (a green summary that proves nothing). Same
       # reasoning as the secantusd-pg build above.
-      - name: Build secantusd-rs (for the cross-protocol tests)
+      - name: Build secantusd-mdb (for the cross-protocol tests)
         if: matrix.shard != 'differential'
         shell: bash
         run: |
           WT="$PWD/$(ls -d build/*/wt-build | head -1)"
           export SECANTUS_WT_INCLUDE="$WT/include" SECANTUS_WT_LIB="$WT"
-          cargo build --manifest-path crates/secantusdb/Cargo.toml --bin secantusd-rs
-          test -x crates/secantusdb/target/debug/secantusd-rs
+          cargo build --manifest-path crates/secantusdb/Cargo.toml --bin secantusd-mdb
+          test -x crates/secantusdb/target/debug/secantusd-mdb
 
       # The embedded serve path (`bind` / `RunningPgServer::stop`) and, most of
       # all, its DURABILITY property: start, write over the wire, stop, reopen

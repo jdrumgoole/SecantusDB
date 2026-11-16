@@ -5,7 +5,7 @@
 - `Storage::close()` now returns the first failure: the stable checkpoint,
   persisting the oplog meta row, or the final checkpoint. Each failure is
   still logged. `close()` runs once, and the `Drop` after it does nothing.
-- `secantusd-rs` closes its store on shutdown and exits non-zero if the
+- `secantusd-mdb` closes its store on shutdown and exits non-zero if the
   close failed. Before, a daemon whose last checkpoint failed printed a line
   and exited 0.
 - The WiredTiger wrapper's `Connection`, `Session` and `Cursor` drops log a

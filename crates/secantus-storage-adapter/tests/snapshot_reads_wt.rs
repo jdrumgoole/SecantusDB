@@ -1,5 +1,5 @@
 //! Snapshot reads at a point in time over real WiredTiger (RM-210): a store
-//! whose data tables are not logged -- the one `secantusd-rs` creates --
+//! whose data tables are not logged -- the one `secantusd-mdb` creates --
 //! reads at `atClusterTime`, cursors and all; a logged one keeps no history
 //! and refuses a time in the past by name rather than answer as of now.
 //! The mongod comparisons are `tests/backlog/test_rm_found_2026_10_20b.py`.

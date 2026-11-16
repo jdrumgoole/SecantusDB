@@ -17,7 +17,7 @@ Two user-facing packages, one per server:
 
 | package (crates.io) | library entry point | binary |
 | --- | --- | --- |
-| `secantus-mdb` | `secantus_mdb::Server::start()` | `secantusd-rs` |
+| `secantus-mdb` | `secantus_mdb::Server::start()` | `secantusd-mdb` |
 | `secantus-pg` | `secantus_pg::PgServer::start()` | `secantusd-pg` |
 
 The target experience, for each:
@@ -47,7 +47,7 @@ And `cargo install secantus-mdb` / `cargo binstall secantus-mdb` for the binary.
 1. **Names: `secantus-mdb` (MongoDB server) and `secantus-pg` (PostgreSQL
    server).** Both were unclaimed on crates.io on 2026-09-30; register them
    first, before any other work, because a squatter is the one risk here with
-   no engineering fix. The binaries keep their names (`secantusd-rs`,
+   no engineering fix. The binaries keep their names (`secantusd-mdb`,
    `secantusd-pg`), and so do the existing `secantusdb-v*` release tags.
 2. **Licence: the PG SERVER crate is GPL-2.0-only; `secantus-pgcatalog` and
    `secantus-pgplan` stay Apache-2.0.** `secantus-pgserver` links
@@ -112,7 +112,7 @@ compress to **3.2 MB** (measured), well under crates.io's 10 MB limit. `test/`
 ## 4. Package layout
 
 ```
-secantus-mdb          (user-facing: Server + bin secantusd-rs)
+secantus-mdb          (user-facing: Server + bin secantusd-mdb)
  ├─ secantus-server   ├─ secantus-commands ─┬─ secantus-core
  │                    │                     ├─ secantus-auth
  │                    │                     └─ secantus-wire

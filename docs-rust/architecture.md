@@ -10,7 +10,7 @@ engines never depend on Python **or** WiredTiger:
 | `secantus-wt` | The WiredTiger FFI bindings (bindgen over the vendored C library). |
 | `secantus-server` | The server proper: wire protocol (`OP_MSG` / legacy handshake), command dispatch, cursors, auth (`secantus-auth`), TLS accept loop (rustls), CLI argument/config parsing. |
 | `secantus-auth` | SCRAM-SHA-1/256 mechanics, X509 DN matching, RBAC role resolution. |
-| `secantusdb` | The standalone binary crate — `secantusd-rs`. Its own workspace (it links WiredTiger); builds the vendored WT and statically links it. |
+| `secantusdb` | The standalone binary crate — `secantusd-mdb`. Its own workspace (it links WiredTiger); builds the vendored WT and statically links it. |
 | `secantus-core-py`, `secantus-server-py`, `secantus-storage-py` | Thin PyO3 binding crates: `_secantus_core` (the parity-test vehicle), `_secantus_server` (the embedded `RustServer` handle), `_secantus_storage`. Python is only ever a launcher — never in the request path. |
 
 The WiredTiger-linked crates are excluded from the clean workspace so
@@ -46,6 +46,6 @@ A data directory written by one server opens in the other.
 All crates carry one lockstep version (`0.MAJOR.PATCH-beta.N`, SemVer
 pre-release) that advances independently of the PyPI package's version.
 The canonical embedded value is `secantus_server::VERSION`, surfaced as
-`buildInfo.secantusVersion` over the wire, `secantusd-rs --version` on the
+`buildInfo.secantusVersion` over the wire, `secantusd-mdb --version` on the
 CLI, and `RustServer.version` on the embedded handle. See
 [Releases](releases.md).

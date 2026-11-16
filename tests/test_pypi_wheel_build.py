@@ -120,7 +120,7 @@ TARGET = "x86_64-unknown-linux-gnu"
 def assets(tmp_path: Path) -> Path:
     d = tmp_path / "assets"
     d.mkdir()
-    _archive(d, f"secantusdb-0.5.3-beta.7-{TARGET}", "secantusd-rs", _elf("2.17", "2.31"))
+    _archive(d, f"secantusdb-0.5.3-beta.7-{TARGET}", "secantusd-mdb", _elf("2.17", "2.31"))
     _archive(d, f"secantusd-pg-0.1.0-beta.2-{TARGET}", "secantusd-pg", _elf("2.35"))
     return d
 
@@ -140,7 +140,7 @@ def test_wheel_contents_tag_and_record(assets: Path, tmp_path: Path) -> None:
             "secantusdb/__init__.py",
             "secantusdb/_server.py",
             "secantusdb/_cli.py",
-            "secantusdb/bin/secantusd-rs",
+            "secantusdb/bin/secantusd-mdb",
             "secantusdb/bin/secantusd-pg",
             f"{dist_info}/METADATA",
             f"{dist_info}/WHEEL",
@@ -151,7 +151,7 @@ def test_wheel_contents_tag_and_record(assets: Path, tmp_path: Path) -> None:
         } <= names
         # No deprecated Python server goes in the wheel.
         assert not any(n.startswith("secantus/") for n in names)
-        for binary in ("secantusd-rs", "secantusd-pg"):
+        for binary in ("secantusd-mdb", "secantusd-pg"):
             mode = zf.getinfo(f"secantusdb/bin/{binary}").external_attr >> 16
             assert mode & 0o111, f"{binary} is not executable"
         metadata = zf.read(f"{dist_info}/METADATA").decode()
@@ -159,7 +159,7 @@ def test_wheel_contents_tag_and_record(assets: Path, tmp_path: Path) -> None:
         assert "| 0.5.3-beta.7 |" in metadata and "| 0.1.0-beta.2 |" in metadata
         assert "Tag: py3-none-manylinux_2_35_x86_64" in zf.read(f"{dist_info}/WHEEL").decode()
         entry_points = zf.read(f"{dist_info}/entry_points.txt").decode()
-        assert "secantusd-rs = secantusdb._cli:mongodb" in entry_points
+        assert "secantusd-mdb = secantusdb._cli:mongodb" in entry_points
         assert "secantusd-pg = secantusdb._cli:postgres" in entry_points
         record = zf.read(f"{dist_info}/RECORD").decode().splitlines()
         listed = {}
@@ -174,6 +174,13 @@ def test_wheel_contents_tag_and_record(assets: Path, tmp_path: Path) -> None:
             data = zf.read(path)
             want = base64.urlsafe_b64encode(hashlib.sha256(data).digest()).rstrip(b"=").decode()
             assert digest == f"sha256={want}" and int(size) == len(data), path
+
+
+def test_an_archive_with_the_old_binary_name_still_builds(assets: Path, tmp_path: Path) -> None:
+    # Releases up to 0.5.3-beta.196 shipped the MongoDB binary as secantusd-rs.
+    _archive(assets, f"secantusdb-0.5.3-beta.7-{TARGET}", "secantusd-rs", _elf("2.17"))
+    with zipfile.ZipFile(_build(assets, tmp_path / "dist")) as zf:
+        assert "secantusdb/bin/secantusd-mdb" in zf.namelist()
 
 
 def test_a_checksum_mismatch_is_refused(assets: Path, tmp_path: Path) -> None:
@@ -206,9 +213,9 @@ def test_launcher_reads_the_bound_port_and_cleans_up(
     # keep draining the pipe after the banner or the child blocks.
     _fake_binary(
         bin_dir,
-        "secantusd-rs",
+        "secantusd-mdb",
         'print("starting", flush=True)\n'
-        'print("secantusd-rs listening on 127.0.0.1:41234", flush=True)\n'
+        'print("secantusd-mdb listening on 127.0.0.1:41234", flush=True)\n'
         'print("x" * 200000, flush=True)\n'
         "time.sleep(60)",
     )

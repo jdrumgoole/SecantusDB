@@ -84,7 +84,7 @@ def _start_rust(store: str) -> tuple[subprocess.Popen, pymongo.MongoClient]:
         m = _RS_BANNER.search(line)
         if m or not line:
             break
-    assert m, f"secantusd-rs did not start: {line!r}"
+    assert m, f"secantusd-mdb did not start: {line!r}"
     drain_output(proc)
     client = pymongo.MongoClient(
         host=m.group(1), port=int(m.group(2)), serverSelectionTimeoutMS=20_000
@@ -94,7 +94,7 @@ def _start_rust(store: str) -> tuple[subprocess.Popen, pymongo.MongoClient]:
 
 @pytest.fixture(scope="module")
 def rust_fp() -> Iterator[Any]:
-    """A `secantusd-rs` with test commands on (`configureFailPoint`)."""
+    """A `secantusd-mdb` with test commands on (`configureFailPoint`)."""
     assert RS_BINARY.exists(), f"{RS_BINARY} is not built (./inv rust-binary-build)"
     store = tempfile.mkdtemp(prefix="live-index-builds-")
     proc, client = _start_rust(store)

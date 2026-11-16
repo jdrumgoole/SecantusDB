@@ -168,7 +168,7 @@ output of a run you didn't start and that wasn't instrumented. So:
 
 - **Tier 3 — Process discovery (best-effort, zero instrumentation).**
   `discovery.py` scans the process table for signature commands (`pytest`,
-  `cargo build|test`, `cmake`, `inv <task>`, `uv run`, `secantusd-rs`). Shows
+  `cargo build|test`, `cmake`, `inv <task>`, `uv run`, `secantusd-mdb`). Shows
   them as **untracked external jobs**: cmdline, start time, cwd (via
   `lsof`/proc), elapsed. Cannot stream their stdout (fd owned by the other
   tty), but detects completion when the pid exits and can tail a known report

@@ -11543,11 +11543,11 @@ def test_the_python_server_sees_the_unique_constraint(home: Path) -> None:
 # the asymmetry is the whole reason these two tests exist.
 # ---------------------------------------------------------------------------
 
-_MONGO_BANNER = re.compile(r"secantusd-rs listening on (\S+):(\d+)")
+_MONGO_BANNER = re.compile(r"secantusd-mdb listening on (\S+):(\d+)")
 
 
 def _mongo_binary() -> Path | None:
-    """The standalone `secantusd-rs`, the way test_rust_binary_smoke finds it."""
+    """The standalone `secantusd-mdb`, the way test_rust_binary_smoke finds it."""
     import os
 
     env = os.environ.get("SECANTUSDB_BIN")
@@ -11555,7 +11555,7 @@ def _mongo_binary() -> Path | None:
         p = Path(env)
         return p if p.exists() else None
     for profile in ("release", "debug"):
-        p = REPO / "crates" / "secantusdb" / "target" / profile / "secantusd-rs"
+        p = REPO / "crates" / "secantusdb" / "target" / profile / "secantusd-mdb"
         if p.exists():
             return p
     return None
@@ -11565,7 +11565,7 @@ _MONGO_BIN = _mongo_binary()
 _needs_mongo_binary = pytest.mark.skipif(
     _MONGO_BIN is None,
     reason=(
-        "secantusd-rs not built (cargo build --manifest-path "
+        "secantusd-mdb not built (cargo build --manifest-path "
         "crates/secantusdb/Cargo.toml, or set SECANTUSDB_BIN)"
     ),
 )

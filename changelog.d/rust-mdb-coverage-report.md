@@ -10,7 +10,7 @@ the files with the most lines never executed.
 #### Added
 
 - `scripts/rust_mdb_coverage.py` and `./inv rust-mdb-coverage`: build every
-  crate of `secantusd-rs` with `-C instrument-coverage`, run the cargo
+  crate of `secantusd-mdb` with `-C instrument-coverage`, run the cargo
   tests, the Python suites CI runs against the binary and the daemon driver
   gauges, and write `docs-rust/coverage.md`.
 - `docs-rust/coverage.md`: the first measurement.

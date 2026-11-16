@@ -29,7 +29,7 @@ fn open(home: &std::path::Path) -> Storage {
     Storage::open_with_config(home.to_str().unwrap(), &cfg).unwrap()
 }
 
-/// Opened as `secantusd-rs` opens its store: data tables unlogged and
+/// Opened as `secantusd-mdb` opens its store: data tables unlogged and
 /// timestamped, durable through checkpoints and oplog replay.
 fn open_like_the_server(home: &std::path::Path) -> Storage {
     let opts = secantus_storage::StorageOptions {

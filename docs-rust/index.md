@@ -7,13 +7,13 @@ Python in the request path. It speaks the same MongoDB wire protocol as
 [the Python server](https://secantusdb.com/docs/), passes the same
 unmodified driver-conformance suites (99.5% of pymongo's own tests — level
 with the Python server), and ships as a single static-WiredTiger binary:
-`secantusd-rs`.
+`secantusd-mdb`.
 
 It ships as the `secantus-mdb` crate on crates.io:
 
 ```bash
-cargo install secantus-mdb --version 0.5.3-beta.196   # builds WiredTiger, installs `secantusd-rs`
-secantusd-rs --port 27017 --storage-path ./secantus-data
+cargo install secantus-mdb --version 0.5.3-beta.196   # builds WiredTiger, installs `secantusd-mdb`
+secantusd-mdb --port 27017 --storage-path ./secantus-data
 ```
 
 ```rust

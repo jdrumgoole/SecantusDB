@@ -2,7 +2,7 @@
 time-series `find` the aggregation mongod converts it to (RM-363, RM-455).
 
 The reference is mongod 8.2.11 (`mongod`, `mongod_rs`); the Rust server is
-`secantusd-rs` (`rust_mongo`).
+`secantusd-mdb` (`rust_mongo`).
 """
 
 from __future__ import annotations

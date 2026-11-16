@@ -1,6 +1,6 @@
 # Rust MongoDB server: the backlog -- plan (2026-10-14)
 
-Scope: what is still open for `secantusd-rs` against mongod 8.2.11, taken from
+Scope: what is still open for `secantusd-mdb` against mongod 8.2.11, taken from
 `tasks/backlog.md` §7 (7.064 to 7.084, measured by the probes this month,
 plus the open lines of 7.05 and 7.06). Every entry of 7.00 to 7.04 and 7.5 to
 7.8 is closed. The exemplar is mongod only; the Python server is never the
@@ -42,7 +42,7 @@ Four rows do not match the figures their backlog entries give:
 `transactions` (backlog 7.072: 11, counted in scenarios), `cursor_commands`
 (7.073: 5 scenarios), `change_stream_commands` (7.074: 5 results) and
 `insert_delete_count_distinct` (7.078: 32). The binary tree this table was
-measured on is not recorded. Re-run a probe, and record `secantusd-rs
+measured on is not recorded. Re-run a probe, and record `secantusd-mdb
 --version`, before quoting its row anywhere.
 
 ## How each batch lands

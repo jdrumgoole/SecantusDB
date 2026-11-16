@@ -1,4 +1,4 @@
-//! `secantusd-rs --repair` (RM-192): every table verified and a damaged one
+//! `secantusd-mdb --repair` (RM-192): every table verified and a damaged one
 //! salvaged, then the indexes of the collections it touched rebuilt from
 //! their documents, as mongod's `--repair` does.
 

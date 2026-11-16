@@ -14,7 +14,7 @@ def _exec(name: str) -> None:
 
 
 def mongodb() -> None:
-    _exec("secantusd-rs")
+    _exec("secantusd-mdb")
 
 
 def postgres() -> None:

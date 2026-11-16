@@ -103,7 +103,7 @@ def main() -> int:
 
     if not is_detached():
         raise SystemExit("refusing to measure on an attached branch — use a pinned worktree")
-    binary = REPO / "crates" / "secantusdb" / "target" / "release" / "secantusd-rs"
+    binary = REPO / "crates" / "secantusdb" / "target" / "release" / "secantusd-mdb"
     if not binary.exists():
         raise SystemExit(f"Rust binary not built at {binary}")
     if not shutil.which("mongod"):
