@@ -270,12 +270,20 @@ fn plan_info_with(
         out.summary = Some("EOF".to_string());
         return out;
     }
-    let Some(node) = planned(storage, db, &s) else {
+    let Some(mut node) = planned(storage, db, &s) else {
         return out;
     };
     let collation = crate::util::effective_collation(storage, db, &s.coll, &s.options)
         .ok()
         .flatten();
+    // A group that reads no field counts the keys of a plan of one index
+    // scan: mongod names the COUNT_SCAN it runs (RM-494).
+    if name == "aggregate" && super::shape_counts_keys(storage, db, &s, collation.as_ref(), &stages)
+    {
+        if let Some(scan) = super::count_scan_of(&node) {
+            node = scan;
+        }
+    }
     let buckets = storage
         .get_collection_options(db, &s.coll)
         .ok()

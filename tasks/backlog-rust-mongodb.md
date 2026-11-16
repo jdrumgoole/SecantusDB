@@ -833,22 +833,6 @@ These are explicit non-goals. Don't add them without a reason.
       2026-11-13.
       Verify: tests/backlog/test_rm_view_namespaces.py::test_a_change_stream_of_a_view_writes_no_line
       Backlog-ID: RM-593
-- [ ] **A `count_documents` names an `IXSCAN` where mongod runs a
-      `COUNT_SCAN`.** A `count_documents` is a `$match` and a `$group` that
-      reads no field. Where its filter bounds the index on `x` -- of a
-      collection, or of a view `{$match: {x: {$gte: 1}}}` over it -- mongod
-      8.2.11 runs a `COUNT_SCAN { x: 1 }` that examines 11 keys and no
-      document; this server fetches the 11 documents through an
-      `IXSCAN { x: 1 }`, and its line says so. A line's `planSummary` is
-      planned from the catalog (`explain/summary.rs`), and naming a
-      `COUNT_SCAN` there would name a plan that did not run: the executor
-      has to run the count scan first, which is the SBE `GROUP` over a
-      `COUNT_SCAN` of RM-071 (which `explain` builds and runs since
-      2026-11-14, RM-072).
-      An `aggregate` of a view otherwise names the plan beneath it since
-      2026-11-13. Found while working RM-381, 2026-11-10.
-      Verify: tests/backlog/test_rm_view_lines.py::test_a_count_documents_runs_a_count_scan
-      Backlog-ID: RM-494
 - [ ] **A bare `"$"` is read as a missing field, not refused.** mongod
       8.2.11 refuses `"$"` wherever an expression parses an operand (16872
       "'$' by itself is not a valid FieldPath"): `{$project: {f: "$"}}`,

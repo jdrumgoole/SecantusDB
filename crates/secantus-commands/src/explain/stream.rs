@@ -2544,6 +2544,16 @@ impl Stream {
         }
     }
 
+    /// A count scan run as SBE's `ixseek` runs it, for a pipeline's group
+    /// (RM-494): it counts the keys within its bounds and not the call that
+    /// finds its end, which classic `CountScan::doWork` counts (measured
+    /// 8.2.11: `{x: {$lte: 5}}` over keys 0 to 11 examines 6, `{x: 99}` 0).
+    pub(crate) fn count_as_sbe(&mut self) {
+        if let Stage::Ix(scan) = &mut self.root {
+            scan.count_scan = false;
+        }
+    }
+
     pub(crate) fn read_all(&mut self, storage: &dyn Storage) -> Result<ReadAll, StorageError> {
         let mut out = ReadAll::default();
         loop {

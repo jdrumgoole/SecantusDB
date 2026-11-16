@@ -926,8 +926,42 @@ pub fn aggregate(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
                 // read keeps that for it.
                 let keep_input = lead.sort.is_some();
                 let mut sort_input: Option<Vec<Vec<u8>>> = None;
+                // A group that reads no field counts index keys (RM-494).
+                let counts_keys = crate::explain::pipeline_counts_keys(
+                    storage,
+                    &ctx.db_name,
+                    c,
+                    &read_pipeline,
+                    hint,
+                    collation.as_ref(),
+                );
                 let mut read = |sort: Option<&Document>, limit: i64| {
                     let moved = lead.filter.as_ref().filter(|_| sort.is_some());
+                    let ask = crate::explain::order::Ask {
+                        db: &ctx.db_name,
+                        coll: c,
+                        filter: moved.unwrap_or(&filter),
+                        sort,
+                        hint,
+                        collation: collation.as_ref(),
+                        vars: &vars,
+                        limit,
+                        asked: Default::default(),
+                    };
+                    if counts_keys {
+                        if let Some((counted, summary)) = crate::explain::order::count_scanned(
+                            storage,
+                            &ask,
+                            front.projection.as_ref(),
+                        )? {
+                            crate::opdebug::note_examined(
+                                counted.keys_examined,
+                                counted.docs_examined,
+                                Some(summary),
+                            );
+                            return Ok(counted.docs);
+                        }
+                    }
                     // Read as mongod's plan reads, counting what it examines
                     // (RM-023), when a stream can run the plan.
                     let counted = crate::explain::order::find_counted(

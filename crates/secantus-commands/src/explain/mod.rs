@@ -2242,6 +2242,70 @@ fn reply_for(r: &Request, verbosity: Verbosity, ctx: &mut CommandContext) -> Han
     Ok(reply)
 }
 
+/// Whether mongod runs `pipeline`'s query on `db.coll` as a count of index
+/// keys where its plan allows (`turnIxscanIntoCount`): its query has no
+/// skip, limit, sort, projection, hint or collation, and the one stage SBE
+/// takes after it is a `$group` (or `$count`) that reads no field -- a
+/// `count_documents` (RM-494).
+pub(crate) fn pipeline_counts_keys(
+    storage: &dyn crate::storage::Storage,
+    db: &str,
+    coll: &str,
+    pipeline: &[Bson],
+    hint: Option<&Bson>,
+    collation: Option<&Collation>,
+) -> bool {
+    // The leading `$match`es -- a view's and the read's own -- are one
+    // query to mongod.
+    let stages: Vec<Document> = hoist::hoist_runnable(pipeline)
+        .iter()
+        .map_while(|s| s.as_document().cloned())
+        .collect();
+    let Ok(mut s) = shape::find(coll, &doc! { "find": coll }) else {
+        return false;
+    };
+    shape::absorb(&mut s, &stages);
+    s.hint = hint.cloned();
+    shape_counts_keys(storage, db, &s, collation, &stages)
+}
+
+/// [`pipeline_counts_keys`] for the shape `s` of `pipeline`.
+pub(crate) fn shape_counts_keys(
+    storage: &dyn crate::storage::Storage,
+    db: &str,
+    s: &Shape,
+    collation: Option<&Collation>,
+    pipeline: &[Document],
+) -> bool {
+    fn reads(v: &Bson) -> bool {
+        match v {
+            Bson::String(p) => p.starts_with('$'),
+            Bson::Document(d) => d.values().any(reads),
+            Bson::Array(a) => a.iter().any(reads),
+            _ => false,
+        }
+    }
+    s.skip == 0
+        && s.limit == 0
+        && sbe_front(storage, db, s, collation, pipeline, true)
+            .and_then(|f| f.group)
+            .is_some_and(|g| !g.values().any(reads))
+}
+
+/// The `COUNT_SCAN` that counts the keys of `plan` for a read that needs
+/// no field of its documents ([`count_seek`]); `None` where mongod keeps
+/// the plan.
+pub(crate) fn count_scan_of(plan: &Node) -> Option<Node> {
+    count_seek(plan)?;
+    match plan {
+        Node::Fetch { input, .. } => match &**input {
+            Node::IxScan(ix) => Some(Node::CountScan(ix.clone())),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
 /// The `COUNT_SCAN` mongod plans in place of `plan` for a group that reads
 /// no field (`QueryPlannerAnalysis::turnIxscanIntoCount`): a `FETCH` with
 /// no filter over an `IXSCAN` with none, of one interval. Built here for
