@@ -4575,7 +4575,7 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
     # A table whose only index is a composite one, its WHERE constraining
     # both columns (found while working RP-399).
     "a table's only index composite": (
-        "RP-410",
+        "RP-410:fixed",
         [
             "create table t2 (a int, b int, c text)",
             "insert into t2 select g, g % 50, 'x' || (g % 7) from generate_series(1, 5000) g",

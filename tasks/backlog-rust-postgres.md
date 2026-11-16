@@ -1970,19 +1970,6 @@ a regression test.
       (found while working RP-404 and RP-354).
       Verify: tests/backlog/test_rp_explain_costs.py::test_plan[estimate of a function call compared with a constant], tests/backlog/test_rp_explain_costs.py::test_plan[estimate of a join over a scan filtered by a LIKE], tests/backlog/test_rp_explain_costs.py::test_plan[estimate of a LIKE over an expression], tests/backlog/test_rp_explain_costs.py::test_plan[estimate of a LIKE over a table never analysed], tests/backlog/test_rp_explain_costs.py::test_plan[estimate of a regex match over a table never analysed], tests/backlog/test_rp_explain_costs.py::test_plan[estimate of a join over a scan filtered by a regex match]
       Backlog-ID: RP-423
-- [ ] **A table whose only index is a composite one prices no scan of
-      both its columns.** `create table t2 (a int, b int, c text)`, 5,000
-      rows, `create index t2_ab on t2 (a, b)`, analysed: PostgreSQL 15.19
-      plans `select * from t2 where a = 15 and b = 3` as `Index Scan using
-      t2_ab on t2  (cost=0.28..8.30 rows=1 width=11)` with `Index Cond:
-      ((a = 15) AND (b = 3))`; here a `Seq Scan on t2  (cost=0.00..0.00
-      rows=0 width=0)`, no estimate at all. The same table with a second,
-      one-column index (`n` in the scenarios, `n_b` beside `n_ab`) is
-      planned as PostgreSQL plans it, and so is `where a = 15` alone. Its
-      rows are right; the order they come out in may not be. Measured on
-      a private 15.19 cluster (found while working RP-399).
-      Backlog-ID: RP-410
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a table's only index composite]
 - [ ] **A semi join cheaper unique-ified keeps the semi join's shape.**
       Since RP-411's first slice (2026-11-16) a WHERE that is one
       uncorrelated `col IN (select col from t)` / `= any`, or one `EXISTS`

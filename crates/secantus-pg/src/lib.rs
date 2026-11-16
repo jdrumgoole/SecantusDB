@@ -9603,8 +9603,21 @@ impl PgHandler {
                 let Some((f, q)) = index_qual(c) else {
                     continue;
                 };
+                // A column held only past an index's lead is that index's
+                // qual when the conjunction also bounds its leading column
+                // (`match_clause_to_indexcol` on a later key column); with
+                // no such bound the full-index path is not modelled.
                 if trailing_only(f) {
-                    return None;
+                    let bounded = indexes.iter().any(|ix| {
+                        ix.columns[1..].iter().any(|c| c == f)
+                            && items
+                                .iter()
+                                .any(|o| index_qual(o).is_some_and(|(g, _)| g == ix.field))
+                    });
+                    if !bounded {
+                        return None;
+                    }
+                    continue;
                 }
                 if !leads(f) {
                     continue;
