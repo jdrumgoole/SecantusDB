@@ -13,7 +13,7 @@ computed every row's select list at the DECLARE):
   still runs one with a UNION, INTERSECT or EXCEPT under it whole;
 - a cursor's WHERE and Sort ran at the DECLARE, where PostgreSQL runs
   them at the first FETCH (fixed, RP-897), and its WHERE is still
-  evaluated for every row at that FETCH (RP-961);
+  evaluated for every row at that FETCH (fixed, RP-961);
 - `FETCH FORWARD 0` / `FETCH 0` / `FETCH BACKWARD 0` answered no row, and
   `MOVE FORWARD 0` moved over none (fixed, RP-898);
 - `pg_cursors.statement` is a deparse of the query, not the DECLARE text;
@@ -561,13 +561,13 @@ def test_a_deferred_cursor_raises_at_its_fetch(dsn: str) -> None:
     ]
 
 
-@pytest.mark.backlog("RP-961")
+@pytest.mark.backlog_fixed("RP-961")
 def test_a_cursors_where_filters_as_it_is_fetched(dsn: str) -> None:
     """PostgreSQL 15.19 filters a cursor's rows as it is fetched: with no
     Sort, `fetch 1` evaluates the WHERE only up to the first row that
     passes, so a later row's error is raised by the FETCH that reaches it.
-    Here the first FETCH evaluates the WHERE for every row of a VALUES
-    list and raises, and the DECLARE of one over a table raises. Measured
+    Here the first FETCH evaluated the WHERE for every row of a VALUES
+    list and raised, and the DECLARE of one over a table raised. Measured
     on PostgreSQL 15.19 (the table one on the shared reference, in a temp
     table)."""
     n = uuid.uuid4().hex[:8]
@@ -597,6 +597,63 @@ def test_a_cursors_where_filters_as_it_is_fetched(dsn: str) -> None:
             )
             == expected
         ), source
+
+
+@pytest.mark.backlog_fixed("RP-961")
+def test_a_table_cursors_where_is_tested_as_it_is_read_again(dsn: str) -> None:
+    """A SCROLL cursor over a table tests its WHERE for the rows each FETCH
+    reaches: across another statement of the block (which reads the rest
+    of the DECLARE's snapshot here), and when it moves back to the start
+    and reads on. Measured on PostgreSQL 15.19 (the shared reference)."""
+    n = uuid.uuid4().hex[:8]
+    with psycopg.connect(dsn, autocommit=True) as c:
+        c.execute(f"create table rp961b_{n} (k int)")
+        c.execute(f"insert into rp961b_{n} values (1), (5), (2), (0)")
+    declare = f"declare c scroll cursor for select k from rp961b_{n} where 10/k > 1"
+    assert _steps(
+        dsn,
+        [
+            "begin",
+            declare,
+            "fetch 1 from c",
+            f"insert into rp961b_{n} values (3)",
+            "fetch 1 from c",
+            "fetch first from c",
+            "fetch 2 from c",
+            "fetch 1 from c",
+            "rollback",
+        ],
+    ) == [
+        "BEGIN",
+        "DECLARE CURSOR",
+        [(1,)],
+        "INSERT 0 1",
+        [(5,)],
+        [(1,)],
+        [(5,), (2,)],
+        ("22012", "division by zero"),
+        "ROLLBACK",
+    ]
+    assert _steps(
+        dsn,
+        [
+            "begin",
+            declare,
+            "fetch 2 from c",
+            "fetch backward 1 from c",
+            "fetch first from c",
+            "fetch 3 from c",
+            "rollback",
+        ],
+    ) == [
+        "BEGIN",
+        "DECLARE CURSOR",
+        [(1,), (5,)],
+        [(1,)],
+        [(1,)],
+        ("22012", "division by zero"),
+        "ROLLBACK",
+    ]
 
 
 @pytest.mark.backlog_fixed("RP-898")

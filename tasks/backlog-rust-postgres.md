@@ -2669,24 +2669,6 @@ still computed whole, and the cursor answers that differ either way.
       (2026-11-14).
       Verify: tests/backlog/test_rp_found_rp744.py::test_a_cursor_recomputes_a_volatile_column_when_it_reads_a_row_again
       Backlog-ID: RP-962
-- [ ] **A cursor's WHERE is evaluated for every row at its first FETCH.**
-      Since RP-897 a cursor's query runs at the first FETCH that needs a
-      row (`portal_stream::PendingRows::Unstarted`), but the executor
-      evaluates the whole WHERE when it runs: `declare c cursor for select
-      k from (values (1), (2), (0)) s(k) where 10/k > 1` raises 22012 at
-      `fetch 1`, where PostgreSQL 15.19 filters as it is fetched and
-      answers `1`, then `2`, and the third FETCH raises. The same cursor
-      over a table raises 22012 at the DECLARE. Two paths, measured
-      2026-11-17 (RP-963's session): a VALUES list or SRF runs through
-      `portal_stream::start_pending` -> `execute`, which filters every row
-      before `project_rows` streams the select list; a table goes to
-      `declare_streamed`, whose `BlockScan::read_batch` asks
-      `Storage::scan_batch_after` for `BATCH` (256) matching rows, and the
-      DECLARE reads that first batch. Needs the filter run in the row
-      stream on both, and a table scan that reads only the matches a
-      FETCH wants. Found while working RP-897 (2026-11-14).
-      Verify: tests/backlog/test_rp_found_rp744.py::test_a_cursors_where_filters_as_it_is_fetched
-      Backlog-ID: RP-961
 
 ## Found while working RP-782 (2026-11-10)
 

@@ -41962,6 +41962,22 @@ impl PgHandler {
         casts: &[Option<secantus_pgplan::ColumnExpr>],
         env: &RowEnv,
     ) -> PgWireResult<QueryResponse> {
+        self.project_rows_where(docs, None, def, columns, casts, env)
+    }
+
+    /// `project_rows`, keeping only the rows `residual` (a WHERE that did
+    /// not lower to a filter) holds for, tested as each row is streamed:
+    /// a cursor's rows are filtered as they are fetched, as PostgreSQL's
+    /// scan evaluates its qual for the row a FETCH reaches (RP-961).
+    fn project_rows_where(
+        &self,
+        docs: Vec<Document>,
+        residual: Option<secantus_pgplan::ColumnExpr>,
+        def: &TableDef,
+        columns: &[(String, String)],
+        casts: &[Option<secantus_pgplan::ColumnExpr>],
+        env: &RowEnv,
+    ) -> PgWireResult<QueryResponse> {
         let schema = Arc::new(self.row_schema(def, columns, casts));
         let mut fields: Vec<String> = columns.iter().map(|(_, f)| f.clone()).collect();
         let mut casts = casts.to_vec();
@@ -42003,7 +42019,20 @@ impl PgHandler {
             })?;
         }
         let source = stream::iter(docs.into_iter().map(Ok::<Document, PgWireError>));
-        Ok(self.project_stream(source.boxed(), schema, fields, casts, env))
+        let source = match residual {
+            None => source.boxed(),
+            Some(residual) => source
+                .filter_map(move |d| {
+                    let kept = d.and_then(|d| {
+                        let v = secantus_pgplan::apply_row_expr(&residual, &d)
+                            .map_err(|e| Self::err(&e))?;
+                        Ok((v == Bson::Boolean(true)).then_some(d))
+                    });
+                    futures::future::ready(kept.transpose())
+                })
+                .boxed(),
+        };
+        Ok(self.project_stream(source, schema, fields, casts, env))
     }
 
     /// `project_rows` over a source of documents that arrive as the rows are
@@ -43735,9 +43764,29 @@ impl PgHandler {
                 if let Some(streamed) = self.try_stream_select(&sel, &env)? {
                     return Ok(vec![streamed]);
                 }
+                // A cursor's rows are filtered as a FETCH reaches them
+                // (RP-961): with nothing over the scan that reads every row
+                // first, its per-row WHERE is left to the row stream.
+                let mut sel = sel;
+                let residual = if self.cursor_run.load(std::sync::atomic::Ordering::Relaxed)
+                    && max_rows == 0
+                    && sel.order.is_empty()
+                    && sel.limit.is_none()
+                    && sel.offset == 0
+                    && sel.distinct == secantus_pgplan::Distinct::None
+                    && sel.windows.is_empty()
+                    && !sel.with_ties
+                    && sel.lock.is_none()
+                    && sel.lock_clauses.is_empty()
+                {
+                    sel.residual.take()
+                } else {
+                    None
+                };
                 let (docs, def) = self.select_docs(&sel, max_rows)?;
-                Ok(vec![Response::Query(self.project_rows(
+                Ok(vec![Response::Query(self.project_rows_where(
                     docs,
+                    residual,
                     &def,
                     &sel.columns,
                     &sel.casts,

@@ -300,6 +300,17 @@ impl PgHandler {
     /// The table definition of `sel` when it is a plain read of one stored
     /// table that can be streamed (see the module doc), else `None`.
     fn streamable(&self, sel: &secantus_pgplan::Select, sorted: bool) -> Option<TableDef> {
+        self.streamable_with(sel, sorted, false)
+    }
+
+    /// `streamable`, `residual_ok` when the reader tests a per-row WHERE
+    /// itself (a cursor's, `CursorTail::residual`).
+    fn streamable_with(
+        &self,
+        sel: &secantus_pgplan::Select,
+        sorted: bool,
+        residual_ok: bool,
+    ) -> Option<TableDef> {
         // A `FOR UPDATE` locks the rows it returns, which the reader
         // thread's own session could not do for this transaction.
         let plain = sel.lock.is_none()
@@ -310,7 +321,7 @@ impl PgHandler {
             && sel.windows.is_empty()
             && (sel.order.is_empty() || sorted)
             && (sel.distinct == secantus_pgplan::Distinct::None || sorted)
-            && sel.residual.is_none()
+            && (sel.residual.is_none() || residual_ok)
             && sel.casts.iter().all(Option::is_none)
             && sel.offset >= 0
             // WITH TIES reads past the LIMIT, which the streamed sort's
@@ -1110,6 +1121,28 @@ pub(crate) struct CursorTail {
     fields: Vec<String>,
     casts: Vec<Option<secantus_pgplan::ColumnExpr>>,
     env: RowEnv,
+    /// A WHERE that did not lower to a filter, tested row by row as a
+    /// FETCH reaches each row (RP-961).
+    residual: Option<secantus_pgplan::ColumnExpr>,
+    /// Rows the scan read that the residual has not tested yet.
+    unfiltered: std::collections::VecDeque<Document>,
+    /// Every row of the DECLARE's snapshot, once another statement made
+    /// the cursor read them (`drain_block_scans`): a rewind reads them
+    /// again, not the table.
+    drained: Option<Arc<Vec<Document>>>,
+}
+
+impl CursorTail {
+    /// Back to the cursor's first row.
+    fn rewind(&mut self) {
+        self.scan = self.start.clone();
+        self.exhausted = false;
+        self.unfiltered.clear();
+        if let Some(drained) = &self.drained {
+            self.unfiltered.extend(drained.iter().cloned());
+            self.scan.done = true;
+        }
+    }
 }
 
 /// Drop the rows of a streamed cursor more than `KEEP_BEHIND` behind its
@@ -1303,6 +1336,7 @@ fn reads_portal_snapshot(stmt: &Statement) -> bool {
             .casts
             .iter()
             .flatten()
+            .chain(sel.residual.as_ref())
             .any(secantus_pgplan::correlated::reads_portal_snapshot),
         Statement::SetOp(set) => {
             reads_portal_snapshot(&set.left) || reads_portal_snapshot(&set.right)
@@ -1853,7 +1887,18 @@ impl PgHandler {
         scrollable: bool,
         holdable: bool,
     ) -> PgWireResult<Option<CursorState>> {
-        let Some(def) = self.streamable(sel, true) else {
+        // A per-row WHERE is tested as a FETCH reaches each row (RP-961),
+        // unless it reads the database, which must be in the DECLARE's
+        // snapshot.
+        let residual_ok = sel.order.is_empty()
+            && sel.distinct == secantus_pgplan::Distinct::None
+            && sel.limit.is_none()
+            && sel.offset == 0
+            && !sel
+                .residual
+                .as_ref()
+                .is_some_and(secantus_pgplan::correlated::reads_portal_snapshot);
+        let Some(def) = self.streamable_with(sel, true, residual_ok) else {
             return Ok(None);
         };
         let tz = self.session_timezone();
@@ -1905,6 +1950,9 @@ impl PgHandler {
                 fields: sel.columns.iter().map(|(_, f)| f.clone()).collect(),
                 casts: sel.casts.clone(),
                 env,
+                residual: sel.residual.clone(),
+                unfiltered: std::collections::VecDeque::new(),
+                drained: None,
             }),
             base: 0,
             pending: None,
@@ -1950,10 +1998,37 @@ impl PgHandler {
         if tail.exhausted {
             return Ok(false);
         }
-        let docs = tail
-            .scan
-            .read_batch(&self.storage, &|| self.check_cancel())?;
-        tail.exhausted = tail.scan.done && tail.scan.pending.is_empty();
+        let docs = match tail.residual.clone() {
+            None => tail
+                .scan
+                .read_batch(&self.storage, &|| self.check_cancel())?,
+            // Tested a row at a time, up to the next it keeps: a row no
+            // FETCH reaches is never tested (RP-961).
+            Some(residual) => {
+                let mut kept = Vec::new();
+                loop {
+                    if let Some(d) = tail.unfiltered.pop_front() {
+                        let v = secantus_pgplan::apply_row_expr(&residual, &d)
+                            .map_err(|e| Self::err(&e))?;
+                        if v == Bson::Boolean(true) {
+                            kept.push(d);
+                            break;
+                        }
+                        continue;
+                    }
+                    if tail.scan.done && tail.scan.pending.is_empty() {
+                        break;
+                    }
+                    let batch = tail
+                        .scan
+                        .read_batch(&self.storage, &|| self.check_cancel())?;
+                    tail.unfiltered.extend(batch);
+                }
+                kept
+            }
+        };
+        tail.exhausted =
+            tail.scan.done && tail.scan.pending.is_empty() && tail.unfiltered.is_empty();
         let exhausted = tail.exhausted;
         if !docs.is_empty() {
             if let Some(c) = cursor.current_of.as_mut() {
@@ -1988,8 +2063,7 @@ impl PgHandler {
         // Back past the window: read again from the start.
         if lo >= 1 && usize::try_from(lo - 1).unwrap_or(0) < cursor.base {
             if let Some(tail) = cursor.tail.as_mut() {
-                tail.scan = tail.start.clone();
-                tail.exhausted = false;
+                tail.rewind();
                 cursor.clear_window();
             }
         }
@@ -2135,8 +2209,26 @@ impl PgHandler {
                 let Some(tail) = cursor.tail.as_mut() else {
                     continue;
                 };
-                tail.scan = tail.start.clone();
-                tail.exhausted = false;
+                // Already read whole by an earlier statement.
+                if tail.drained.is_some() {
+                    continue;
+                }
+                tail.rewind();
+                // A per-row WHERE is still tested as a FETCH reaches each
+                // row: the snapshot's rows are kept for it (RP-961).
+                if tail.residual.is_some() {
+                    let mut all = Vec::new();
+                    while !(tail.scan.done && tail.scan.pending.is_empty()) {
+                        all.extend(
+                            tail.scan
+                                .read_batch(&self.storage, &|| self.check_cancel())?,
+                        );
+                    }
+                    tail.drained = Some(Arc::new(all));
+                    tail.rewind();
+                    cursor.clear_window();
+                    continue;
+                }
                 cursor.clear_window();
                 while self.pull_cursor(cursor)? {}
             }
