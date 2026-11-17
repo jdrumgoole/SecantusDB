@@ -1205,17 +1205,6 @@ one beside it.
 
 ## Found while working RP-908 (2026-11-15)
 
-- [ ] **EXPLAIN of a NOT EXISTS prints a filtered Seq Scan, not PostgreSQL's
-      Hash Anti Join.** `select * from e where not exists (select 1 from e
-      e2 where e2.a = e.a)` is, in PostgreSQL 15.19, `Hash Anti Join
-      (cost=27.50..46.25 rows=1 width=7)` on `(e.a = e2.a)`, the Hash over
-      a Seq Scan of `e2` of width 4 (`convert_EXISTS_sublink_to_join`);
-      here a Seq Scan on e with a `Filter`. Its rows are right. The anti
-      cost (`hash_anti_join_of` in `scan_estimate.rs`, RP-908) is there to
-      reuse once the sublink is pulled up into a join. Measured on a
-      private 15.19 cluster.
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a not exists over an equality is a hash anti join]
-      Backlog-ID: RP-980
 - [ ] **A LEFT join on an expression key whose WHERE keeps only the
       unmatched rows prints a Nested Loop Left Join, not a Hash Anti
       Join.** `select * from e left join e e2 on e.a = e2.a + 1 where e2.a
@@ -2971,3 +2960,22 @@ statement is VALUES-only and runs there as written. The gap test is in
       Measured on the 15.19 reference on port 5415.
       Verify: tests/backlog/test_rp_explain_costs.py::test_plan[explain verbose of a limit over a descending sort]
       Backlog-ID: RP-1025
+
+## Found while working RP-980 (2026-11-17)
+
+- [ ] **An anti join with an outer conjunct beside it is not planned as
+      one.** `select b from e where a > 500 and not exists (select 1 from e
+      e2 where e2.a = e.a)`, and its LEFT join spelling `select e.b from e
+      left join e e2 on e.a = e2.a where e.a > 500 and e2.a is null`, are
+      in PostgreSQL 15.19 both `Hash Anti Join (cost=27.50..46.88 rows=1
+      width=3)` with `Filter: (a > 500)` on the outer Seq Scan (`rows=500`).
+      Here the LEFT join form prints an unpriced `Hash Left Join` with
+      `Filter: (e2.a IS NULL)` (RP-908's `left_anti_key` recognises the
+      anti join only where the WHERE is the IS NULL alone), and the NOT
+      EXISTS form a Seq Scan with `Filter: (...)`:
+      `sublink_join::anti_join_of` (RP-980) rewrites NOT EXISTS into that
+      LEFT join form only when it is the whole WHERE, and should take the
+      outer conjuncts once the LEFT join form prices them. Measured on the
+      15.19 reference on port 5415.
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a not exists beside an outer conjunct is a hash anti join], tests/backlog/test_rp_explain_costs.py::test_plan[a left join anti join beside an outer conjunct is a hash anti join]
+      Backlog-ID: RP-1027

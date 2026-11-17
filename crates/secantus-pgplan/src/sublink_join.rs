@@ -404,3 +404,130 @@ pub(crate) fn as_inner_join(query: &N, sj: &SemiJoin) -> Option<N> {
     out.where_clause = and_of(conjuncts).map(Box::new);
     Some(N::SelectStmt(out))
 }
+
+/// `NOT EXISTS (SELECT .. FROM inner WHERE inner.col = outer.col)` as the
+/// anti join `convert_EXISTS_sublink_to_join` pulls it up into (RP-980),
+/// written as the LEFT join PostgreSQL reduces to the same JOIN_ANTI:
+/// `outer LEFT JOIN inner ON outer.col = inner.col WHERE inner.col IS
+/// NULL`, the select list read from the outer side. `None` for any other
+/// shape.
+pub(crate) fn anti_join_of(query: &N, lookup: &dyn Fn(&str) -> Option<TableDef>) -> Option<N> {
+    let N::SelectStmt(s) = query else {
+        return None;
+    };
+    // The WHERE with its `NOT EXISTS` read as `EXISTS`, for the semi join's
+    // resolution of the clause and its sides.
+    let mut exists = s.clone();
+    let args: Vec<pg_query::protobuf::Node> = match s.where_clause.as_deref()?.node.as_ref() {
+        Some(N::BoolExpr(b)) if b.boolop == pg_query::protobuf::BoolExprType::AndExpr as i32 => {
+            b.args.clone()
+        }
+        _ => vec![s.where_clause.as_deref()?.clone()],
+    };
+    let mut found = false;
+    let mut conjuncts = Vec::new();
+    for a in args {
+        match a.node.as_ref() {
+            Some(N::BoolExpr(b))
+                if !found && b.boolop == pg_query::protobuf::BoolExprType::NotExpr as i32 =>
+            {
+                let [inner] = b.args.as_slice() else {
+                    return None;
+                };
+                let Some(N::SubLink(l)) = inner.node.as_ref() else {
+                    return None;
+                };
+                if l.sub_link_type != SubLinkType::ExistsSublink as i32 {
+                    return None;
+                }
+                found = true;
+                conjuncts.push(inner.clone());
+            }
+            _ => conjuncts.push(a),
+        }
+    }
+    // An outer conjunct beside it is not yet planned as an anti join in
+    // the LEFT join form either (RP-1027).
+    if !found || conjuncts.len() != 1 {
+        return None;
+    }
+    exists.where_clause = and_of(conjuncts).map(Box::new);
+    let exists = N::SelectStmt(exists);
+    let sj = semi_join_of(&exists, lookup)?;
+    let N::SelectStmt(mut joined) = as_inner_join(&exists, &sj)? else {
+        return None;
+    };
+    // `as_inner_join` ends the WHERE with the equality; it is the ON.
+    let mut rest = match joined.where_clause.take().map(|w| *w) {
+        Some(pg_query::protobuf::Node {
+            node: Some(N::BoolExpr(b)),
+        }) if b.boolop == pg_query::protobuf::BoolExprType::AndExpr as i32 => b.args,
+        Some(w) => vec![w],
+        None => return None,
+    };
+    let on = rest.pop()?;
+    let [outer_rv, inner_rv] = std::mem::take(&mut joined.from_clause).try_into().ok()?;
+    joined.from_clause = vec![pg_query::protobuf::Node {
+        node: Some(N::JoinExpr(Box::new(pg_query::protobuf::JoinExpr {
+            jointype: pg_query::protobuf::JoinType::JoinLeft as i32,
+            larg: Some(Box::new(outer_rv)),
+            rarg: Some(Box::new(inner_rv)),
+            quals: Some(Box::new(on)),
+            ..Default::default()
+        }))),
+    }];
+    rest.push(pg_query::protobuf::Node {
+        node: Some(N::NullTest(Box::new(pg_query::protobuf::NullTest {
+            arg: Some(Box::new(column_ref(vec![
+                string(&sj.inner.1),
+                string(&sj.inner_col),
+            ]))),
+            nulltesttype: pg_query::protobuf::NullTestType::IsNull as i32,
+            location: -1,
+            ..Default::default()
+        }))),
+    });
+    joined.where_clause = and_of(rest).map(Box::new);
+    Some(N::SelectStmt(joined))
+}
+
+#[cfg(test)]
+mod rp980_anti_join {
+    use super::*;
+
+    fn rewritten(sql: &str) -> Option<String> {
+        let def = TableDef::new(
+            "e",
+            vec![
+                secantus_pgcatalog::Column::new("a", "int4", false),
+                secantus_pgcatalog::Column::new("b", "text", false),
+            ],
+        );
+        let tree = pg_query::parse(sql).unwrap();
+        let q = tree.protobuf.stmts[0].stmt.as_ref()?.node.clone()?;
+        let out = anti_join_of(&q, &|_| Some(def.clone()))?;
+        pg_query::protobuf::Node { node: Some(out) }.deparse().ok()
+    }
+
+    /// A NOT EXISTS over a column equality is the LEFT join PostgreSQL
+    /// reduces to the same anti join (RP-980); an outer conjunct beside
+    /// it is left alone (RP-1027).
+    #[test]
+    fn a_not_exists_is_the_left_join_anti_form() {
+        assert_eq!(
+            rewritten("select * from e where not exists (select 1 from e e2 where e2.a = e.a)")
+                .as_deref(),
+            Some("SELECT e.* FROM e LEFT JOIN e e2 ON e.a = e2.a WHERE e2.a IS NULL")
+        );
+        assert_eq!(
+            rewritten(
+                "select * from e where a > 5 and not exists (select 1 from e e2 where e2.a = e.a)"
+            ),
+            None
+        );
+        assert_eq!(
+            rewritten("select * from e where exists (select 1 from e e2 where e2.a = e.a)"),
+            None
+        );
+    }
+}

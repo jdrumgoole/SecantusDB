@@ -12487,6 +12487,12 @@ fn plan_explain(
     join_alias::flatten_join_aliases(&mut query, lookup)?;
     // A simple FROM-subquery is merged into its parent (RP-422).
     subquery_pullup::pull_up_simple_subquery(&mut query, lookup)?;
+    // A NOT EXISTS sublink is pulled up into an anti join (RP-980).
+    if !options.analyze {
+        if let Some(anti) = sublink_join::anti_join_of(&query, lookup) {
+            query = anti;
+        }
+    }
     // An IN / EXISTS sublink is pulled up into a semi join (RP-411).
     if !options.analyze {
         options.semi_join = sublink_join::semi_join_of(&query, lookup);
