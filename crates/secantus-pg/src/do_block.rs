@@ -88,6 +88,20 @@ impl PgHandler {
                     &crate::plpgsql_fn::with_row_types(&sql, &crate::PlHost { h: self }),
                     body,
                 )?;
+                // `make_return_stmt`: a DO block returns void (RP-960).
+                if let Some(e) =
+                    crate::plpgsql_fn::return_with_value(&sql, crate::plpgsql_fn::ReturnShape::Void)
+                {
+                    let at = e.position;
+                    let PgWireError::UserError(mut info) = crate::wire_pl_error(e) else {
+                        unreachable!("wire_pl_error makes a user error")
+                    };
+                    if let (Some(at), Some(start)) = (at, query.find(body)) {
+                        let before = query[..start].chars().count();
+                        info.position = Some((before + at.get() as usize).to_string());
+                    }
+                    return Err(PgWireError::UserError(info));
+                }
                 // A grammar error points at its token in the statement, as
                 // `function_parse_error_transpose` places it (RP-492).
                 if let Err(e) = crate::plpgsql_fn::validate(&compiled(body)) {

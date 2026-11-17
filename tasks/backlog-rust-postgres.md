@@ -2569,15 +2569,6 @@ Measured on a private PostgreSQL 15.19 cluster.
       (RP-492 a DO's grammar errors).
       Verify: tests/backlog/test_rp_found_rp619.py::test_expression_syntax_error_is_placed_in_the_body
       Backlog-ID: RP-958
-- [ ] **A RETURN with a value in a routine returning void is accepted.**
-      `make_return_stmt` refuses it as it reads the RETURN, before the
-      expression is parsed: on PostgreSQL 15.19 `do $$ begin return 1; end
-      $$` is 42804 `RETURN cannot have a parameter in function returning
-      void` at 20, `return 1 +;` the same, and a `returns void` function's
-      `return 1 +;` the same at 73. Here the first runs, and the other two
-      are 42601 `syntax error at end of input` (31, 76).
-      Verify: tests/backlog/test_rp_found_rp619.py::test_return_with_a_value_in_a_void_routine
-      Backlog-ID: RP-960
 
 ## Found while working RP-573 (2026-11-08)
 

@@ -15169,11 +15169,34 @@ impl PgHandler {
                 if checks {
                     self.check_plpgsql_declarations(&def.name, &create_sql, &def.body)?;
                 }
+                // `make_return_stmt` refuses a RETURN's expression as it
+                // reads the RETURN, before a later error (RP-960).
+                let shape = if def.returns_set {
+                    plpgsql_fn::ReturnShape::Set
+                } else if def
+                    .all_params
+                    .iter()
+                    .any(|(_, _, mode)| mode == "o" || mode == "b" || mode == "t")
+                {
+                    plpgsql_fn::ReturnShape::OutParams
+                } else if def.is_procedure {
+                    plpgsql_fn::ReturnShape::Procedure
+                } else if def.return_type.eq_ignore_ascii_case("void")
+                    || def.return_type.eq_ignore_ascii_case("pg_catalog.void")
+                {
+                    plpgsql_fn::ReturnShape::Void
+                } else {
+                    plpgsql_fn::ReturnShape::Value
+                };
+                let (parsed, as_written) = match plpgsql_fn::return_with_value(&plain_sql, shape) {
+                    Some(e) => (Err(e), true),
+                    None => (parsed, false),
+                };
                 parsed.map_err(|e| {
                     // The scanner's position is in the body the compiler
                     // read; one the row-type rewrite moved is taken from the
                     // body as written, when it raises the same error.
-                    let at = if create_sql == plain_sql {
+                    let at = if as_written || create_sql == plain_sql {
                         e.position
                     } else {
                         plpgsql_fn::validate(&plain_sql)
@@ -15182,6 +15205,7 @@ impl PgHandler {
                             .and_then(|o| o.position)
                     };
                     let mut info = ErrorInfo::new("ERROR".into(), e.sqlstate, e.message);
+                    info.hint = e.hint;
                     // `function_parse_error_transpose`.
                     info.position = at.and_then(|at| {
                         let (source, index) = self
