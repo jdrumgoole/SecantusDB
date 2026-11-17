@@ -2558,20 +2558,17 @@ tests are scenarios in `tests/backlog/test_rp_batch26.py`.
 
 Measured on a private PostgreSQL 15.19 cluster.
 
-- [ ] **A syntax error in a PL/pgSQL expression is placed at the end of
-      the statement, not in the body.** `check_sql_expr` parses each
-      expression as the compiler reads it, and the error is placed at the
-      expression's token, transposed into the statement: on PostgreSQL
-      15.19 `do $$ declare x int := 1 +; begin null; end $$` is `syntax
-      error at end of input` at 27; here it is at 47. And `do $$ begin
-      perform 1 +; end $$` is the same error at 24 there, found at compile;
-      here it has no position, found when the PERFORM runs (CONTEXT
-      `PL/pgSQL function inline_code_block line 1 at PERFORM`). A CREATE
-      FUNCTION's (75 and 79) are placed since RP-621, which transposes the
-      scanner's `internalpos`; a DO block's error is not transposed yet
-      (RP-492 a DO's grammar errors).
-      Verify: tests/backlog/test_rp_found_rp619.py::test_expression_syntax_error_is_placed_in_the_body
-      Backlog-ID: RP-958
+- [ ] **A CREATE FUNCTION's compile error without a position has no
+      compile context.** An error PL/pgSQL's grammar raises without a
+      scanner position is framed `compilation of PL/pgSQL function "<name>"
+      near line N` (`plpgsql_compile_error_callback`): on PostgreSQL 15.19
+      `create function u958() returns void language plpgsql as $$ begin
+      raise unknown_thing; end $$` is 42704 `unrecognized exception
+      condition "unknown_thing"` with CONTEXT `compilation of PL/pgSQL
+      function "u958" near line 1`. Here the CONTEXT is missing. A DO block
+      has it since RP-958 (`do_compile_error`).
+      Verify: tests/backlog/test_rp_found_rp619.py::test_create_function_compile_error_has_context
+      Backlog-ID: RP-1040
 
 ## Found while working RP-573 (2026-11-08)
 

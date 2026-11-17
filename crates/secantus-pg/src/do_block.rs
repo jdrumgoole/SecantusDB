@@ -64,7 +64,12 @@ impl PgHandler {
             }
         }
         let stmts = match pl::parse(body) {
-            Ok(stmts) => stmts,
+            // `plpgsql_compile_inline` compiles the whole block before any
+            // of it runs, `check_sql_expr` parsing each expression (RP-958).
+            Ok(stmts) => match self.do_compile_error(body, query) {
+                Some(e) => return Err(e),
+                None => stmts,
+            },
             // Beyond the statements this path renders with PostgreSQL's
             // exact error context, the block runs on the function
             // interpreter: declarations, control flow, handlers, INTO.
@@ -74,10 +79,6 @@ impl PgHandler {
                         "CREATE FUNCTION inline_code_block() RETURNS void AS \
                          $secantus_do${body}\n$secantus_do$ LANGUAGE plpgsql"
                     )
-                };
-                // Parsed as `run` parses it, row-typed variables as records.
-                let compiled = |body: &str| {
-                    crate::plpgsql_fn::with_row_types(&wrap(body), &crate::PlHost { h: self })
                 };
                 let sql = wrap(body);
                 // `plpgsql_compile_inline` compiles the whole block, its
@@ -102,22 +103,8 @@ impl PgHandler {
                     }
                     return Err(PgWireError::UserError(info));
                 }
-                // A grammar error points at its token in the statement, as
-                // `function_parse_error_transpose` places it (RP-492).
-                if let Err(e) = crate::plpgsql_fn::validate(&compiled(body)) {
-                    let message = e.message.clone();
-                    let PgWireError::UserError(mut info) = crate::wire_pl_error(e) else {
-                        unreachable!("wire_pl_error makes a user error")
-                    };
-                    let offset =
-                        crate::plpgsql_fn::compile_error_offset(body, &message, &|prefix| {
-                            crate::plpgsql_fn::validate(&compiled(prefix)).map_err(|e| e.message)
-                        });
-                    if let (Some(offset), Some(start)) = (offset, query.find(body)) {
-                        let before = query[..start].chars().count();
-                        info.position = Some((before + offset + 1).to_string());
-                    }
-                    return Err(PgWireError::UserError(info));
+                if let Some(e) = self.do_compile_error(body, query) {
+                    return Err(e);
                 }
                 // Alone in its query string outside a block, the body may
                 // COMMIT; anywhere else it is atomic.
@@ -157,6 +144,58 @@ impl PgHandler {
             }
         }
         Ok(vec![Response::Execution(Tag::new("DO"))])
+    }
+
+    /// The block's grammar error, placed in the statement as
+    /// `function_parse_error_transpose` places it: at the scanner's
+    /// internal position in the body (RP-958, as RP-621 for CREATE
+    /// FUNCTION), else at the token a prefix of the body fails on
+    /// (RP-492).
+    fn do_compile_error(&self, body: &str, query: &str) -> Option<PgWireError> {
+        let wrap = |body: &str| {
+            format!(
+                "CREATE FUNCTION inline_code_block() RETURNS void AS \
+                 $secantus_do${body}\n$secantus_do$ LANGUAGE plpgsql"
+            )
+        };
+        let compiled =
+            |body: &str| crate::plpgsql_fn::with_row_types(&wrap(body), &crate::PlHost { h: self });
+        let e = crate::plpgsql_fn::validate(&compiled(body)).err()?;
+        let message = e.message.clone();
+        // A position the row-type rewrite moved is taken from the body as
+        // written, when it raises the same error.
+        let internal = if compiled(body) == wrap(body) {
+            e.position
+        } else {
+            crate::plpgsql_fn::validate(&wrap(body))
+                .err()
+                .filter(|o| o.message == message)
+                .and_then(|o| o.position)
+        };
+        let PgWireError::UserError(mut info) = crate::wire_pl_error(e) else {
+            unreachable!("wire_pl_error makes a user error")
+        };
+        let offset = internal.map(|p| p.get() as usize - 1).or_else(|| {
+            crate::plpgsql_fn::compile_error_offset(body, &message, &|prefix| {
+                crate::plpgsql_fn::validate(&compiled(prefix)).map_err(|e| e.message)
+            })
+        });
+        // An error the grammar raises without a scanner position (an
+        // unknown condition name) is framed by the compile, not placed.
+        if internal.is_none() && info.code != "42601" {
+            let line = offset.map_or(1, |o| {
+                1 + body.chars().take(o).filter(|c| *c == '\n').count()
+            });
+            info.where_context = Some(format!(
+                "compilation of PL/pgSQL function \"inline_code_block\" near line {line}"
+            ));
+            return Some(PgWireError::UserError(info));
+        }
+        if let (Some(offset), Some(start)) = (offset, query.find(body)) {
+            let before = query[..start].chars().count();
+            info.position = Some((before + offset + 1).to_string());
+        }
+        Some(PgWireError::UserError(info))
     }
 
     fn do_parse_error(e: ParseError, body: &str, query: &str) -> PgWireError {

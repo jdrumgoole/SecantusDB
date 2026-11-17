@@ -104,8 +104,10 @@ RETURN_SHAPES = [
 ]
 
 
-@pytest.mark.backlog("RP-958")
+@pytest.mark.backlog_fixed("RP-958")
 def test_expression_syntax_error_is_placed_in_the_body(dsn: str) -> None:
+    """A DO block's was at the statement's end, or found when it ran; now
+    in the body, at compile."""
     assert _answers(dsn, EXPRESSION_SYNTAX) == [
         ("42601", "syntax error at end of input", "75", None),
         ("42601", "syntax error at end of input", "79", None),
@@ -142,3 +144,42 @@ def test_return_expression_by_routine_shape(dsn: str, query: str, expected: Any)
             d = e.diag
             got = (e.sqlstate, d.message_primary, d.statement_position, d.message_hint)
     assert got == expected
+
+
+# A grammar error without a scanner position is framed by the compile,
+# `near` the line the compiler had reached, and not placed.
+UNKNOWN_CONDITION = 'unrecognized exception condition "unknown_thing"'
+
+
+@pytest.mark.backlog_fixed("RP-958")
+def test_do_block_compile_error_has_context(dsn: str) -> None:
+    """A DO block's compile error, checked before the block runs, keeps
+    the compile context (it had none on the function interpreter path)."""
+    assert _answers(
+        dsn,
+        [
+            "do $$ declare x int; begin raise unknown_thing; end $$",
+            "do $$ begin\n null;\n raise unknown_thing; end $$",
+        ],
+    ) == [
+        (
+            "42704",
+            UNKNOWN_CONDITION,
+            None,
+            f'compilation of PL/pgSQL function "inline_code_block" near line {n}',
+        )
+        for n in (1, 3)
+    ]
+
+
+@pytest.mark.backlog("RP-1040")
+def test_create_function_compile_error_has_context(dsn: str) -> None:
+    assert _answers(
+        dsn,
+        [
+            "create function e619() returns void language plpgsql as $$ begin "
+            "raise unknown_thing; end $$"
+        ],
+    ) == [
+        ("42704", UNKNOWN_CONDITION, None, 'compilation of PL/pgSQL function "e619" near line 1'),
+    ]
