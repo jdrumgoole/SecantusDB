@@ -3517,6 +3517,22 @@ fn attach_verbose_nested_loop(root: &mut PlanNode, v: &secantus_pgplan::ruleutil
     if !(filter_ok(inner, inner_rel) || inner_filters == 1 && !inner_rel.join_quals.is_empty()) {
         return;
     }
+    // A Filter evaluating such a conjunct prints bare columns no
+    // `join_quals` entry prefixes: only an `Index Cond` carries it.
+    if v.unprinted_filter
+        && inner.details.iter().any(|(k, t)| {
+            k == "Filter"
+                && !t.split(" AND ").all(|part| {
+                    inner_rel
+                        .quals
+                        .iter()
+                        .chain(&inner_rel.join_quals)
+                        .any(|(b, _)| b == part)
+                })
+        })
+    {
+        return;
+    }
     let mut cond = None;
     for (at, (k, text)) in inner.details.iter().enumerate() {
         if k == "Filter" {

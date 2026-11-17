@@ -1881,7 +1881,7 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
     # relation with the other's column is the inner index scan's
     # `Index Cond`, the ON its `Filter`, every node's Output printed.
     "explain verbose of a nested loop whose where compares an expression": (
-        "RP-966",
+        "RP-966:fixed",
         _ANALYSED,
         "explain verbose select k.b, e.a from e join k on e.a <> k.a where length(e.b) < k.a",
         [
@@ -1893,6 +1893,39 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "        Output: k.a, k.b",
             "        Index Cond: (k.a > length(e.b))",
             "        Filter: (e.a <> k.a)",
+        ],
+    ),
+    # Measured on PostgreSQL 15.19: a WHERE expression over both relations
+    # is the parameterised inner index scan's `Filter`, prefixed.
+    "explain verbose of an inner index scan filtering an expression of both": (
+        "RP-966",
+        _ANALYSED,
+        "explain verbose select k.b, e.a from e join k on e.a < k.a where e.a + k.a < 7",
+        [
+            "Nested Loop  (cost=0.28..8932.50 rows=111111 width=7)",
+            "  Output: k.b, e.a",
+            "  ->  Seq Scan on public.e  (cost=0.00..15.00 rows=1000 width=4)",
+            "        Output: e.a, e.b",
+            "  ->  Index Scan using k_pkey on public.k  (cost=0.28..7.81 rows=111 width=7)",
+            "        Output: k.a, k.b",
+            "        Index Cond: (k.a > e.a)",
+            "        Filter: ((e.a + k.a) < 7)",
+        ],
+    ),
+    # Measured on PostgreSQL 15.19 (found while working RP-966): a hash
+    # join whose WHERE compares an expression of the inner relation with
+    # the outer's column is priced like any other.
+    "a hash join with an expression join filter is priced": (
+        "RP-1039",
+        _ANALYSED,
+        "explain select e.b from e join k on e.a = k.a where length(k.b) <> e.a",
+        [
+            "Hash Join  (cost=27.50..45.14 rows=999 width=3)",
+            "  Hash Cond: (e.a = k.a)",
+            "  Join Filter: (length(k.b) <> e.a)",
+            "  ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
+            "  ->  Hash  (cost=15.00..15.00 rows=1000 width=7)",
+            "        ->  Seq Scan on k  (cost=0.00..15.00 rows=1000 width=7)",
         ],
     ),
     # Measured on PostgreSQL 15.19 (found while working RP-966).

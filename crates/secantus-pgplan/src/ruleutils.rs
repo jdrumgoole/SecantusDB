@@ -6570,6 +6570,9 @@ pub struct VerboseJoin {
     /// The WHERE holds a comparison of a column of each relation, which
     /// the join evaluates as its `Join Filter`.
     pub join_filter: bool,
+    /// A cross-relation WHERE conjunct is not a comparison of two columns,
+    /// so no `join_quals` entry can prefix it as an inner scan's `Filter`.
+    pub unprinted_filter: bool,
 }
 
 /// [`VerboseJoin`] for `SELECT <columns or *> FROM a [LEFT] JOIN b ON
@@ -6741,6 +6744,7 @@ pub fn explain_verbose_join(
     // scan evaluates as its `Filter`; its columns are not needed above.
     let mut quals: [Vec<(String, String)>; 2] = [Vec::new(), Vec::new()];
     let mut join_filter = false;
+    let mut unprinted_filter = false;
     if let Some(w) = s.where_clause.as_deref() {
         let none_lookup = |_: &str| None;
         let none_views = |_: &str| None;
@@ -6787,7 +6791,38 @@ pub fn explain_verbose_join(
                         Some(N::ColumnRef(c)) => resolve(c),
                         _ => None,
                     };
-                    let ((li, lc), (ri, rc)) = (col(&a.lexpr)?, col(&a.rexpr)?);
+                    let (Some((li, lc)), Some((ri, rc))) = (col(&a.lexpr), col(&a.rexpr)) else {
+                        // An expression of one relation compared with the
+                        // other's (`length(e.b) < k.a`): its columns are
+                        // needed above, and its text is printed already
+                        // prefixed or as an `Index Cond` (RP-966).
+                        let mut refs = Vec::new();
+                        let mut subquery = false;
+                        let mut copy = part.clone();
+                        crate::walk_expr(&mut copy, &mut |n| {
+                            match n.node.as_ref() {
+                                Some(N::ColumnRef(c)) => refs.push(c.clone()),
+                                Some(N::SubLink(_)) => subquery = true,
+                                _ => {}
+                            }
+                            Ok(())
+                        })
+                        .ok()?;
+                        if subquery {
+                            return None;
+                        }
+                        let refs: Vec<(usize, String)> =
+                            refs.iter().map(&resolve).collect::<Option<_>>()?;
+                        if !refs.iter().any(|r| r.0 == 0) || !refs.iter().any(|r| r.0 == 1) {
+                            return None;
+                        }
+                        for (i, c) in &refs {
+                            need(*i, c);
+                        }
+                        join_filter = true;
+                        unprinted_filter = true;
+                        continue;
+                    };
                     if li == ri {
                         return None;
                     }
@@ -6860,6 +6895,7 @@ pub fn explain_verbose_join(
         output,
         all_equal,
         join_filter,
+        unprinted_filter,
     })
 }
 

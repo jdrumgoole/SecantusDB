@@ -1764,12 +1764,30 @@ a regression test.
       in the Hash's `Output`: `VerboseJoin::join_filter`.) (Since 2026-11-17 a nested loop does too:
       into a parameterised index scan the comparison is that scan's
       `Filter`, prefixed, and over a Materialize it joins the ON's
-      conjuncts in the one `Join Filter`.) A WHERE comparison of an
-      expression with the other relation's column (`length(e.b) < k.a`,
-      the inner index scan's `Index Cond: (k.a > length(e.b))`) still
-      prints the plain plan: `explain_verbose_join` returns `None` for it.
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[explain verbose of a nested loop whose where compares an expression]
+      conjuncts in the one `Join Filter`.) (Since 2026-11-17 a WHERE
+      comparison of an expression with the other relation's column does
+      too, as an inner `Index Cond` or a `Join Filter`, both already
+      prefixed: `VerboseJoin::unprinted_filter`.) Still the plain plan:
+      such an expression evaluated as the parameterised inner index
+      scan's `Filter` (`on e.a < k.a where e.a + k.a < 7`, PostgreSQL's
+      `Filter: ((e.a + k.a) < 7)`): `join_quals` holds only
+      column-to-column texts, so `attach_verbose_nested_loop` declines.
+      The fix is to print each cross-relation conjunct with a Printer
+      over both relations' scopes, bare for the scan's own columns, in
+      place of the hand-built `join_quals` strings.
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[explain verbose of an inner index scan filtering an expression of both]
       Backlog-ID: RP-966
+
+- [ ] **A hash join whose WHERE compares an expression of one relation
+      with the other's column is priced at zero.** `explain select e.b
+      from e join k on e.a = k.a where length(k.b) <> e.a` (both tables
+      analysed, 1000 rows) prints `Hash Join  (cost=0.00..0.00 rows=0
+      width=0)` and zero costs on every node below it; PostgreSQL 15.19
+      prints `Hash Join  (cost=27.50..45.14 rows=999 width=3)` over scans
+      costed `0.00..15.00 rows=1000`. Found while working RP-966; the
+      same query with a column-to-column WHERE is priced.
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a hash join with an expression join filter is priced]
+      Backlog-ID: RP-1039
 
 
 - [ ] **EXPLAIN ANALYZE's scan counters PostgreSQL prints that are still
