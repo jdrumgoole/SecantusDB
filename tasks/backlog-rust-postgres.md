@@ -2950,35 +2950,6 @@ RP-692 an INTERSECT or EXCEPT runs the plan PostgreSQL makes for it
 sorted as `choose_hashed_setop` prices them, each group's row the first
 its first input gave.
 
-- [ ] **An INTERSECT over an input this server does not estimate keeps its
-      left input first.** `select distinct x from t692j intersect select
-      1.000` is `1.000` on PostgreSQL 15.19: the input's estimated groups
-      outnumber the constant's one, so the constant is the HashSetOp's
-      first input. Here it is `1.0`, the left input's, and the same for a
-      HAVING and for a join with a WHERE. `setop_input_estimate` estimates
-      a constant, a VALUES list, one user table's stored columns through a
-      WHERE the selectivity model covers, a nested set operation, an inner
-      join of user tables whose every clause is a column equality (ON or
-      WHERE) with no WHERE besides but (since 2026-11-17, over tables never
-      analysed) comparisons of one side's column with a constant, each
-      side's rows its scan's (`join_input_estimate`; three or more
-      tables, `join_chain_input_estimate`, only over tables never
-      analysed, each equivalence class's members joined in table order),
-      an aggregate over one user table, grouped by plain columns or not,
-      and (since 2026-11-17) a DISTINCT over any of those leaves, its rows
-      its groups, and an aggregate's HAVING over aggregates, its groups
-      scaled by the qual's default selectivity as `cost_agg` scales them
-      (`having_selectivity`; two inequalities over one aggregate, a range
-      pair, are not modelled). It leaves any other input -- a join with a
-      WHERE over an analysed table, a chain over an analysed table, a
-      HAVING over a grouping column (which PostgreSQL
-      moves to the WHERE), a GROUP BY expression, a computed column, a FROM
-      subquery other than VALUES or a plain select over one user table
-      (pulled up since 2026-11-17, `pull_up_simple_subquery`), a catalog -- in the written order,
-      hashed. Measured on
-      the 15.19 reference on port 5415.
-      Verify: tests/backlog/test_rp_found_rp692.py::test_an_intersect_over_another_unestimated_input_puts_the_smaller_input_first
-      Backlog-ID: RP-841
 
 ## Found while working RP-727 (2026-11-10)
 

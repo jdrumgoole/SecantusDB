@@ -195,19 +195,54 @@ impl PgHandler {
                     || agg.limit.is_some()
                     || agg.offset != 0
                     || agg.distinct
-                    || agg.group_by.iter().any(|k| k.expr.is_some())
                 {
                     return None;
                 }
+                // `subquery_planner` moves a HAVING term over grouping
+                // columns alone to the WHERE; the rest stays a HAVING.
+                let (filter, having) = match &agg.having {
+                    Some(h) => having_to_where(h, agg)?,
+                    None => (Document::new(), None),
+                };
+                let where_ = match (agg.filter.is_empty(), filter.is_empty()) {
+                    (_, true) => agg.filter.clone(),
+                    (true, false) => filter,
+                    (false, false) => bson::doc! { "$and": [agg.filter.clone(), filter] },
+                };
                 let rows = if agg.group_by.is_empty() {
                     1.0
                 } else {
-                    let fields: Vec<String> =
-                        agg.group_by.iter().map(|k| k.field.clone()).collect();
-                    self.distinct_groups(&agg.table, &agg.filter, &fields)?
+                    // `estimate_num_groups` takes an expression key's Vars
+                    // (`pull_var_clause`), each counted once; a key with no
+                    // Var adds no groups.
+                    let mut fields: Vec<String> = Vec::new();
+                    for k in &agg.group_by {
+                        let read = match &k.expr {
+                            None => vec![k.field.clone()],
+                            Some(e) => {
+                                let mut keys = std::collections::HashSet::new();
+                                if !secantus_pgplan::joins::expr_reads(e, &mut keys) {
+                                    return None;
+                                }
+                                let mut keys: Vec<String> = keys.into_iter().collect();
+                                keys.sort();
+                                keys
+                            }
+                        };
+                        for f in read {
+                            if !fields.contains(&f) {
+                                fields.push(f);
+                            }
+                        }
+                    }
+                    if fields.is_empty() {
+                        1.0
+                    } else {
+                        self.distinct_groups(&agg.table, &where_, &fields)?
+                    }
                 };
                 // `cost_agg` scales the groups by the HAVING's selectivity.
-                let rows = match &agg.having {
+                let rows = match &having {
                     Some(h) => costsize::clamp_row_est(rows * having_selectivity(h, false)?),
                     None => rows,
                 };
@@ -394,6 +429,64 @@ impl PgHandler {
 /// complement for `<>`, a null test `DEFAULT_UNK_SEL` or its complement.
 /// `None` for a grouping column's test, which `subquery_planner` moves to
 /// the WHERE, a comparison with NULL, or an operator not listed.
+/// Split a HAVING into the terms `subquery_planner` moves to the WHERE --
+/// a comparison of a bare grouping column with a constant, ANDed at the
+/// top -- as an MQL filter, and the HAVING left. `None` when a moved term
+/// has no filter form.
+fn having_to_where(
+    h: &secantus_pgplan::Having,
+    agg: &secantus_pgplan::Aggregate,
+) -> Option<(Document, Option<secantus_pgplan::Having>)> {
+    use secantus_pgplan::{Having, OutputCol};
+    let terms: Vec<&Having> = match h {
+        Having::And(t) => t.iter().collect(),
+        _ => vec![h],
+    };
+    let mut filter: Vec<Bson> = Vec::new();
+    let mut kept: Vec<Having> = Vec::new();
+    for t in terms {
+        match t {
+            Having::Compare {
+                subject: OutputCol::Group(i),
+                op,
+                value,
+            } => {
+                let key = agg.group_by.get(*i)?;
+                if key.expr.is_some() || matches!(value, Bson::Null) {
+                    return None;
+                }
+                let mop = match op.as_str() {
+                    "=" => "$eq",
+                    "<>" => "$ne",
+                    "<" => "$lt",
+                    "<=" => "$lte",
+                    ">" => "$gt",
+                    ">=" => "$gte",
+                    _ => return None,
+                };
+                filter.push(Bson::Document(
+                    bson::doc! { key.field.clone(): { mop: value.clone() } },
+                ));
+            }
+            _ => kept.push(t.clone()),
+        }
+    }
+    let filter = match filter.len() {
+        0 => Document::new(),
+        1 => match filter.pop() {
+            Some(Bson::Document(d)) => d,
+            _ => return None,
+        },
+        _ => bson::doc! { "$and": filter },
+    };
+    let having = match kept.len() {
+        0 => None,
+        1 => kept.pop(),
+        _ => Some(Having::And(kept)),
+    };
+    Some((filter, having))
+}
+
 fn having_selectivity(h: &secantus_pgplan::Having, negated: bool) -> Option<f64> {
     use secantus_pgplan::{Having, OutputCol};
     const DEFAULT_INEQ_SEL: f64 = 1.0 / 3.0;
