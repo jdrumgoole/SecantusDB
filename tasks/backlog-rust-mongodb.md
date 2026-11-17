@@ -763,23 +763,18 @@ These are explicit non-goals. Don't add them without a reason.
       e01df2d2 (2026-11-08), each command checked against a probe of its own.
       Backlog-ID: RM-360
       Verify: tests/backlog/test_rm_355_364.py::test_every_line_counts_its_interrupt_checks
-- [ ] **A refused write of a view counts fewer locks than mongod's.**
-      mongod 8.2.11 refuses a write of a view once it holds the namespace
-      for the write; this server refuses it earlier, in `views::refusal`,
-      before `session::run`, and its lines count fewer locks: a retryable
-      `update` / `delete` is refused before its session is checked out, so
-      its statement and command lines are one `ReplicationStateTransition`
-      w short (the transition lock `retryable_write_transition_lock`
-      takes); an `insert`'s line has none of its two write rounds (no
-      `Database` / `Collection`, no `flowControl`); a statement of a
-      transaction has `locks: {}` where mongod's has the transaction's
-      (`MultiDocumentTransactionsBarrier`, the rounds). The faithful fix
-      refuses the write where mongod does, after the session checkout and
-      the write's acquisition; whether a refused retryable write then uses
-      up its `txnNumber`, as on mongod, wants probing first. Found while
-      working RM-487, 2026-11-13.
-      Verify: tests/backlog/test_rm_view_namespaces.py::test_a_refused_write_of_a_view_takes_mongods_locks
-      Backlog-ID: RM-589
+- [ ] **A statement of a transaction does not count the transaction's
+      locks.** mongod 8.2.11's line for it counts
+      `MultiDocumentTransactionsBarrier` w 1, `ReplicationStateTransition`
+      w 3 and a flow control ticket beside the statement's Global /
+      Database / Collection, and the command's line has `locks: {}`; this
+      server's statement line has the statement's three only, no
+      `flowControl`, and its command line counts them again. Nothing takes
+      `Resource::MdtBarrier`. Of a collection and of a view alike (a write
+      of a view is refused under the transaction's locks since RM-589).
+      Found while working RM-589, 2026-11-17.
+      Verify: tests/backlog/test_rm_view_namespaces.py::test_a_transaction_statement_counts_the_transactions_locks
+      Backlog-ID: RM-715
 - [ ] **A `$collStats` of a view is refused.** mongod 8.2.11 answers a
       `$collStats: {}` or `{latencyStats: {}}` stage of a view (one
       document, `ns`, `host`, `localTime`, and `latencyStats` when asked),

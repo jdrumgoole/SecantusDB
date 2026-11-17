@@ -407,25 +407,18 @@ def test_a_query_settings_refusal_counts_rejected_not_failed(
     assert got["rust"] == got["mongod"]
 
 
-@pytest.mark.backlog("RM-589")
+@pytest.mark.backlog_fixed("RM-589")
 def test_a_refused_write_of_a_view_takes_mongods_locks(rust_mongo: Any, mongod_rs: Any) -> None:
     """mongod 8.2.11 refuses a write of a view once it holds the namespace
     for the write: a retryable `update` after checking its session out (one
-    more transition lock), an `insert` after its write rounds, and a
-    statement of a transaction under the transaction's locks. This server
-    refuses each before those, and its lines count fewer locks: the
-    retryable statement and command one transition lock short, the insert
-    no write round, the transaction's statement none at all."""
+    more transition lock), an `insert` after its two write rounds. This
+    server refused each before those, and its lines counted the retryable
+    statement and command one transition lock short and the insert no
+    write round."""
 
     def op(db: Any) -> None:
         _refused(lambda d: d.v.update_one({}, {"$set": {"a": 1}}))(db)
         _refused(lambda d: d.v.insert_one({"a": 1}))(db)
-
-        def txn(d: Any) -> None:
-            with d.client.start_session() as s, s.start_transaction():
-                d.v.update_one({}, {"$set": {"a": 1}}, session=s)
-
-        _refused(txn)(db)
 
     got = {
         server: [(_first(a), _ns(a), a.get("locks"), a.get("flowControl")) for _, a in lines]
@@ -434,6 +427,37 @@ def test_a_refused_write_of_a_view_takes_mongods_locks(rust_mongo: Any, mongod_r
     statement = got["mongod"][0]
     assert statement[:2] == ("q", "v")
     assert statement[2]["ReplicationStateTransition"] == {"acquireCount": {"w": 2}}
+    assert got["rust"] == got["mongod"]
+
+
+@pytest.mark.backlog("RM-715")
+def test_a_transaction_statement_counts_the_transactions_locks(
+    rust_mongo: Any, mongod_rs: Any
+) -> None:
+    """mongod 8.2.11's line for a statement of a transaction counts the
+    transaction's locks (`MultiDocumentTransactionsBarrier`, three
+    `ReplicationStateTransition` w, a flow control ticket), and the
+    command's line has `locks: {}`; this server's statement line has the
+    statement's Global / Database / Collection only, no `flowControl`, and
+    its command line counts them again. Of a collection and of a view
+    alike."""
+
+    def op(db: Any) -> None:
+        for coll in ("c", "v"):
+
+            def txn(d: Any, coll: str = coll) -> None:
+                with d.client.start_session() as s, s.start_transaction():
+                    d[coll].update_one({}, {"$set": {"a": 1}}, session=s)
+
+            _refused(txn)(db)
+
+    got = {
+        server: [(_first(a), _ns(a), a.get("locks"), a.get("flowControl")) for _, a in lines]
+        for server, (lines, _) in _both(rust_mongo, mongod_rs, op).items()
+    }
+    statement = got["mongod"][0]
+    assert statement[:2] == ("q", "c")
+    assert "MultiDocumentTransactionsBarrier" in statement[2]
     assert got["rust"] == got["mongod"]
 
 

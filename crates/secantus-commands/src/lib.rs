@@ -2099,7 +2099,14 @@ fn dispatch_inner(
                     return reply;
                 }
             }
-            profiler::mark_reached(ctx);
+            // A write of a view outside a transaction is refused in the run
+            // (`views::write_refusal`), and mongod 8.2.11 profiles none
+            // (RM-589).
+            let view_write = doc.get("autocommit") != Some(&Bson::Boolean(false))
+                && views::is_view_write(name, doc, ctx);
+            if !view_write {
+                profiler::mark_reached(ctx);
+            }
             let mut reply = session::run(name, handler, doc, ctx);
             // A failpoint-configured writeConcernError attaches to a successful reply,
             // AND so do the failpoint's errorLabels. The labels are what make the
@@ -2529,6 +2536,12 @@ fn run_handler(handler: Handler, doc: &Document, ctx: &mut CommandContext) -> Do
         if let Some(reply) = index_builds::before_locks(doc, ctx) {
             return reply;
         }
+    }
+    // A write of a view is refused here, after its session is checked out
+    // (or under its transaction's locks), taking the rounds mongod takes
+    // before it finds the view (RM-589).
+    if let Some(reply) = views::write_refusal(command_name(doc), doc, ctx) {
+        return reply;
     }
     // A `getMore` of a pipeline whose cursor stage takes its own locks as
     // it fills its buffer takes none of its own (RM-360).
