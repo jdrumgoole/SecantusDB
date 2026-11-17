@@ -1879,15 +1879,106 @@ def _await_data_admissions(client: Any, is_mongod: bool) -> Any:
     return None
 
 
-@pytest.mark.backlog("RM-355")
+@pytest.mark.backlog_fixed("RM-355")
 def test_an_await_data_get_more_takes_mongods_execution_tickets(
     rust_mongo: Any, mongod_rs: Any
 ) -> None:
-    """mongod 8.2.11's `awaitData` getMore yields once for its wait, so its
+    """mongod 8.2.11's `awaitData` getMore yields twice for its wait, so its
     line counts 4 execution admissions for a 500 ms wait; this server's
-    wait took 24,845 (measured 2026-11-16)."""
+    wait took 24,845 (measured 2026-11-16) until 2026-11-17: a capped
+    tail's oplog position read 0, so the wait never blocked."""
     got = {
         "rust": _await_data_admissions(rust_mongo, False),
         "mongod": _await_data_admissions(mongod_rs, True),
+    }
+    assert got["rust"] == got["mongod"]
+
+
+def _filtered_await_data_admissions(client: Any, is_mongod: bool) -> Any:
+    """The `queues.execution` of a filtered `awaitData` getMore that a
+    write its filter rejects wakes, so it waits twice."""
+    import threading
+    import time
+
+    db = client[fresh("await")]
+    db.create_collection("c", capped=True, size=4096)
+    db.c.insert_one({"v": 1})
+    cursor = db.command(
+        "find", "c", filter={"v": {"$lt": 2}}, tailable=True, awaitData=True, batchSize=10
+    )["cursor"]
+    writer = threading.Thread(target=lambda: (time.sleep(0.2), db.c.insert_one({"v": 3})))
+    last = client.admin.command("getLog", "global")["log"][-1]
+    client.admin.command("profile", 0, slowms=-1 if is_mongod else 0)
+    try:
+        writer.start()
+        db.command("getMore", cursor["id"], collection="c", maxTimeMS=1000)
+    finally:
+        writer.join()
+        client.admin.command("profile", 0, slowms=100)
+    log = client.admin.command("getLog", "global")["log"]
+    log = log[log.index(last) + 1 :]
+    client.drop_database(db.name)
+    for raw in log:
+        entry = json.loads(raw)
+        command = entry.get("attr", {}).get("command", {})
+        if entry.get("msg") == "Slow query" and "getMore" in command:
+            return entry["attr"].get("queues", {}).get("execution")
+    return None
+
+
+@pytest.mark.backlog_fixed("RM-355")
+def test_an_await_data_get_more_woken_twice_takes_mongods_tickets(
+    rust_mongo: Any, mongod_rs: Any
+) -> None:
+    """mongod 8.2.11 yields twice for each wait, so a filtered tail a
+    rejected write wakes (two waits) counts 6 admissions; this server's
+    counted 24,000-odd until 2026-11-17, its wait rescanning in a loop."""
+    got = {
+        "rust": _filtered_await_data_admissions(rust_mongo, False),
+        "mongod": _filtered_await_data_admissions(mongod_rs, True),
+    }
+    assert got["rust"] == got["mongod"]
+
+
+def _update_admissions(client: Any, is_mongod: bool) -> Any:
+    """`queues.execution` of an `update` statement's line and its command's."""
+    db = client[fresh("upd")]
+    db.c.insert_many([{"_id": i, "v": 0} for i in range(3)])
+    last = client.admin.command("getLog", "global")["log"][-1]
+    client.admin.command("profile", 0, slowms=-1 if is_mongod else 0)
+    try:
+        db.command(
+            "update",
+            "c",
+            updates=[
+                {"q": {"_id": 0}, "u": {"$set": {"v": 1}}},
+                {"q": {"_id": 1}, "u": {"$set": {"v": 1}}},
+            ],
+        )
+    finally:
+        client.admin.command("profile", 0, slowms=100)
+    log = client.admin.command("getLog", "global")["log"]
+    log = log[log.index(last) + 1 :]
+    client.drop_database(db.name)
+    out = []
+    for raw in log:
+        entry = json.loads(raw)
+        attr = entry.get("attr", {})
+        if entry.get("msg") == "Slow query" and attr.get("type") in ("update", "command"):
+            out.append((attr.get("type"), attr.get("queues", {}).get("execution")))
+    return out
+
+
+@pytest.mark.backlog("RM-355")
+def test_an_update_statement_takes_mongods_execution_tickets(
+    rust_mongo: Any, mongod_rs: Any
+) -> None:
+    """mongod 8.2.11's `update` statement lets its locks go before its line
+    is written and takes a fresh ticket to read its statistics; this
+    server writes the line with the command's locks still held, so the
+    statement's line and its command's each count fewer admissions."""
+    got = {
+        "rust": _update_admissions(rust_mongo, False),
+        "mongod": _update_admissions(mongod_rs, True),
     }
     assert got["rust"] == got["mongod"]

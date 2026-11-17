@@ -1392,9 +1392,24 @@ pub fn get_more(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
             // newly-appended entries). killCursors wakes this via notify.
             // The wait holds no execution ticket, as mongod's lets its
             // locks and ticket go while it waits for data (RM-355).
-            let slice = (deadline - now).min(Duration::from_millis(100));
-            crate::lock_manager::without_ticket(|| {
-                storage.wait_for_oplog(position, slice.as_millis() as u64)
+            // mongod 8.2.11 yields twice for each wait for data -- the
+            // executor's yield on reaching the end, then the yield it waits
+            // for inserts in -- and each takes its ticket again (measured
+            // 2026-11-17: 4 execution admissions for a getMore that waits
+            // once, 6 for one woken by a write its filter rejects, which
+            // waits twice). So: one empty yield, then ONE ticketless wait
+            // for the whole of it; the 100 ms slices only let `killOp` and
+            // the deadline be seen, and take no ticket of their own (RM-355).
+            crate::lock_manager::without_ticket(|| ());
+            crate::lock_manager::without_ticket(|| loop {
+                let left = deadline.saturating_duration_since(Instant::now());
+                if left.is_zero() || crate::ops::current_killed() {
+                    break;
+                }
+                let slice = left.min(Duration::from_millis(100));
+                if storage.wait_for_oplog(position, slice.as_millis().max(1) as u64) > position {
+                    break;
+                }
             });
             awaited += now.elapsed();
         }
