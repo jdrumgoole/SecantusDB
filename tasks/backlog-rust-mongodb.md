@@ -590,8 +590,10 @@ These are explicit non-goals. Don't add them without a reason.
         without interrupt checks (the command's `numInterruptChecks` is
         mongod's without them);
       - a retryable `findAndModify` writes its image under its locks (one
-        more transition, global and collection IX), and one that removes
-        takes a single round;
+        more transition, global and collection IX; a retryable remove reads
+        transition w 4, global w 3, database w 2, collection w 3 on mongod,
+        4/3/3/2 here, measured 2026-11-17); one without a `txnNumber` that
+        removes takes mongod's single round since 2026-11-17;
       - `$out` takes more transition locks than this server's rounds
         (measured on a standalone, RM-185), and an `$out`'s line here has
         one global IS more than mongod's (7 to 6, measured 8.2.11

@@ -1063,8 +1063,15 @@ pub fn statement_rounds(
         // The full round is taken inside the first, which it holds: the
         // write takes one flow control ticket where `drop`'s two rounds
         // take two (measured 8.2.11).
+        // One that removes takes a single write round, whether or not it
+        // finds a document (measured 8.2.11, 2026-11-17, without a
+        // `txnNumber`).
         "findAndModify" | "findandmodify" => {
             let c = coll?;
+            if doc.get("remove").is_some_and(crate::util::truthy) && !doc.contains_key("txnNumber")
+            {
+                return Some(vec![write_round(Some(c))]);
+            }
             let mut nested = write_round(None);
             nested.extend(write_round(Some(c)));
             Some(vec![nested])
@@ -2197,6 +2204,24 @@ mod tests {
             .filter(|(r, _)| *r == Resource::Global)
             .count();
         assert_eq!(globals, 2);
+        assert_eq!(
+            rounds[0].last().unwrap().0,
+            Resource::Collection("db.c".into())
+        );
+    }
+
+    /// RM-357: a `findAndModify` that removes takes one flat write round.
+    #[test]
+    fn find_and_modify_that_removes_takes_one_round() {
+        use super::{statement_rounds, Resource, StorageFacts};
+        let facts = StorageFacts {
+            storage: None,
+            db: "db",
+        };
+        let doc = bson::doc! {"findAndModify": "c", "remove": true};
+        let rounds = statement_rounds(&doc, "db", &facts).unwrap();
+        assert_eq!(rounds.len(), 1);
+        assert_eq!(rounds[0].len(), 4);
         assert_eq!(
             rounds[0].last().unwrap().0,
             Resource::Collection("db.c".into())

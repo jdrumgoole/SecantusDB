@@ -538,12 +538,32 @@ _DIVERGING_WRITES = {
         ],
         writeConcern={"w": 1},
     ),
-    # The image of a retryable findAndModify is written under its locks;
-    # one that removes takes one round.
+    # The image of a retryable findAndModify is written under its locks.
     "findAndModify": lambda d: _w1(d).find_one_and_update({"_id": 1}, {"$set": {"q": 1}}),
-    "findAndModify that removes": lambda d: _w1(_plain(d)).find_one_and_delete({"_id": 1}),
     "$out": lambda d: list(_w1(_plain(d)).aggregate([{"$match": {}}, {"$out": "o"}])),
 }
+
+
+#: findAndModify removes without a `txnNumber`, found and not.
+_PLAIN_REMOVES = {
+    "a document": lambda d: _w1(_plain(d)).find_one_and_delete({"_id": 1}),
+    "nothing": lambda d: _w1(_plain(d)).find_one_and_delete({"_id": 999}),
+}
+
+
+@pytest.mark.backlog_fixed("RM-357")
+@pytest.mark.parametrize("name", list(_PLAIN_REMOVES))
+def test_a_find_and_modify_that_removes_takes_one_round(
+    rust_mongo: Any, mongod_rs: Any, name: str
+) -> None:
+    """mongod 8.2.11 takes a single write round for a `findAndModify` that
+    removes (measured 2026-11-17), one IX each on the transition, global,
+    database and collection locks, plus the latest-optime read when it
+    removed nothing. This server nested a second round inside a first, as
+    for one that updates."""
+    answers = _write_locks(rust_mongo, mongod_rs, _PLAIN_REMOVES[name])
+    assert answers["mongod"]
+    assert answers["rust"] == answers["mongod"]
 
 
 def _in_transaction(d: Any) -> None:
