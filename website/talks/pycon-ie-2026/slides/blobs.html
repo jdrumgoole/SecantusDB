@@ -1,0 +1,13 @@
+<section id="blobs">
+<p class="eyebrow">The critical decision</p>
+<h2>Store documents as opaque BSON blobs</h2>
+<div class="cards two">
+<div style="display:flex;flex-direction:column;gap:24px;">
+<p>WiredTiger holds the bytes. Filtering, projection, sorting and updates happen in the engine, after decoding.</p>
+<p>No JSON, no native column types: any lossy middle step breaks <b>ObjectId, Decimal128, int32 vs int64, dates, Binary, Regex</b>.</p>
+<p>Indexes are WiredTiger indexes over typed sort-key columns — never coerced numbers.</p>
+</div>
+<div class="code"><span class="c"># a JSON round trip</span><br>{"n": Int64(1)}<br>  → {"n": 1}<br>  → int32<br><br><span class="k">pymongo can tell.</span><br><span class="c"># so we never do it</span></div>
+</div>
+<aside>The single most important early decision. Using WiredTiger — the engine mongod itself ships — gives us real durability, checkpoints and transactions instead of a dict. ~2 min.</aside>
+</section>
