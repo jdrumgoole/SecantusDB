@@ -292,7 +292,7 @@ pub(crate) fn finish(
     let Some(mut pending) = ctx.profiling.take() else {
         return;
     };
-    if !pending.reached || pending.existed || refused_unprofiled(name, reply) {
+    if !pending.reached || pending.existed || ctx.unacquired || refused_unprofiled(name, reply) {
         return;
     }
     if let Some(ns) = noted_ns {

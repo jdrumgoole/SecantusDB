@@ -17,14 +17,14 @@ from tests.backlog.opdebug import fresh, seed
 from tests.backlog.test_rm_drop_reports import _line_namespaces
 
 
-@pytest.mark.backlog("RM-595")
+@pytest.mark.backlog_fixed("RM-595")
 def test_a_command_refused_before_it_acquires_its_collection_names_cmd(
     rust_mongo: Any, mongod_rs: Any
 ) -> None:
     """mongod 8.2.11's line for a `create` of a collection that exists
     (which succeeds) and for a `findAndModify` with neither `update` nor
     `remove` (FailedToParse) names `<db>.$cmd`: neither acquired the
-    collection. This server's name `<db>.c`."""
+    collection. This server's named `<db>.c` until RM-595 was fixed."""
     commands = [{"create": "c"}, {"findAndModify": "c"}]
     answers = {
         "rust": _line_namespaces(rust_mongo, False, commands),

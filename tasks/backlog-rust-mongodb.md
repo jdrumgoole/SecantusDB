@@ -773,13 +773,6 @@ These are explicit non-goals. Don't add them without a reason.
       Found while working RM-589, 2026-11-17.
       Verify: tests/backlog/test_rm_view_namespaces.py::test_a_transaction_statement_counts_the_transactions_locks
       Backlog-ID: RM-715
-- [ ] **A `Slow query` line names a collection a command refused before
-      it acquired one.** mongod 8.2.11's line for a `create` of a
-      collection that exists (which succeeds) and for a `findAndModify`
-      with neither `update` nor `remove` (FailedToParse) names `<db>.$cmd`;
-      this server's names `<db>.c`. Found while working RM-495, 2026-11-13.
-      Verify: tests/backlog/test_rm_found_2026_11_13_rm495.py::test_a_command_refused_before_it_acquires_its_collection_names_cmd
-      Backlog-ID: RM-595
 - [ ] **A `Slow query` line names a command's value, not the collection it
       works through.** mongod 8.2.11's line for a `filemd5` names its
       root's chunks (`<db>.fs.chunks`), for a `convertToCapped` the

@@ -390,6 +390,12 @@ pub fn read_attributes(request: &Document, reply: &Document, ctx: &CommandContex
     let mut out = Document::new();
     out.insert("isFromUserConnection", true);
     let (db, coll) = line_target(name, request, reply, &ctx.db_name);
+    // An operation that ended before it acquired its collection names
+    // `<db>.$cmd` (RM-595).
+    let coll = coll.filter(|_| !ctx.unacquired);
+    if ctx.unacquired {
+        out.insert("ns", format!("{db}.$cmd"));
+    }
     let ok = reply.ok_number().unwrap_or(1.0) == 1.0;
     // The namespace [`attributes`] names, moved beneath a view the read
     // failed under.

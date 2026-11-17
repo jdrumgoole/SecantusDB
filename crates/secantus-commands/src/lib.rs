@@ -316,6 +316,10 @@ pub struct CommandContext {
     /// The view an `$out` was refused for writing to: mongod 8.2.11 names it
     /// on the aggregate's line and profile entry (RM-591).
     pub refused_out_view: Option<String>,
+    /// The operation ended before it acquired the collection it names, so
+    /// its line names `<db>.$cmd`: a `create` of a collection that exists
+    /// with the same options (measured 8.2.11, RM-595).
+    pub unacquired: bool,
     /// How many documents a `findAndModify` changed, for its line.
     pub modified: Option<i64>,
     /// How long the operation waited for its write concern, in ms.
@@ -441,6 +445,7 @@ impl CommandContext {
             planning_micros: None,
             resolved_views: None,
             refused_out_view: None,
+            unacquired: false,
             modified: None,
             write_concern_wait: None,
             last_op_seq: 0,
@@ -979,6 +984,7 @@ fn dispatch_named(doc: &Document, ctx: &mut CommandContext) -> Document {
     ctx.planning_micros = None;
     ctx.resolved_views = None;
     ctx.refused_out_view = None;
+    ctx.unacquired = false;
     ctx.modified = None;
     ctx.write_concern_wait = None;
     ctx.cpu_nanos = None;

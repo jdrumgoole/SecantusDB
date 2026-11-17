@@ -515,6 +515,9 @@ pub fn create(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         // separately, and is never a requested option.
         existing.remove("uuid");
         if existing == opts {
+            // mongod answers this before it acquires the collection: its
+            // line names `<db>.$cmd` (measured 8.2.11, RM-595).
+            ctx.unacquired = true;
             return Ok(doc! { "ok": 1.0 });
         }
         // A time-series collection on either side has its own wording.
