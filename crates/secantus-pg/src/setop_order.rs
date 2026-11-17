@@ -29,8 +29,8 @@
 //! over its select list on its own row estimate, and a nested set
 //! operation's are its rows, as are a DISTINCT leaf's. An input this
 //! server does not estimate -- a join with a WHERE, a WHERE the
-//! selectivity model does not cover, a FROM subquery other than VALUES,
-//! a catalog -- leaves the left input first, as before (RP-841).
+//! selectivity model does not cover, a FROM subquery other than VALUES
+//! or a plain select over one user table, a catalog -- leaves the left input first, as before (RP-841).
 
 use super::*;
 use pgwire::api::results::FieldInfo;
@@ -260,8 +260,34 @@ impl PgHandler {
             // RTE_VALUES, whose Vars `get_variable_numdistinct` takes as
             // unique; a set-returning function's rows are not a VALUES
             // list (`typmods` is `None`).
-            let secantus_pgplan::Statement::ValuesConstant(vc) = sub.plan.as_ref() else {
-                return None;
+            //
+            // A plain subquery over a user table is pulled up
+            // (`pull_up_simple_subquery`): the leaf is the inner select,
+            // reading the stored columns the outer one names.
+            let vc = match sub.plan.as_ref() {
+                secantus_pgplan::Statement::ValuesConstant(vc) => vc,
+                secantus_pgplan::Statement::Select(inner) => {
+                    if !sel.filter.is_empty() || inner.sub.is_some() || inner.lock.is_some() {
+                        return None;
+                    }
+                    let columns = fields
+                        .iter()
+                        .map(|f| {
+                            let i = sub.def.columns.iter().position(|c| &c.field() == f)?;
+                            if inner.casts.get(i).is_some_and(Option::is_some) {
+                                return None;
+                            }
+                            inner.columns.get(i).cloned()
+                        })
+                        .collect::<Option<Vec<_>>>()?;
+                    let mut pulled = inner.clone();
+                    pulled.casts = vec![None; columns.len()];
+                    pulled.sort_input = vec![false; columns.len()];
+                    pulled.columns = columns;
+                    pulled.order.clear();
+                    return self.select_input_estimate(&pulled);
+                }
+                _ => return None,
             };
             vc.typmods.as_ref()?;
             if !sel.filter.is_empty() {

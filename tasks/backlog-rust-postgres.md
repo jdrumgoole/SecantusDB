@@ -2973,8 +2973,8 @@ its first input gave.
       WHERE over an analysed table, a chain over an analysed table, a
       HAVING over a grouping column (which PostgreSQL
       moves to the WHERE), a GROUP BY expression, a computed column, a FROM
-      subquery other than VALUES (`select x from (select x from t692j) s`),
-      a catalog -- in the written order,
+      subquery other than VALUES or a plain select over one user table
+      (pulled up since 2026-11-17, `pull_up_simple_subquery`), a catalog -- in the written order,
       hashed. Measured on
       the 15.19 reference on port 5415.
       Verify: tests/backlog/test_rp_found_rp692.py::test_an_intersect_over_another_unestimated_input_puts_the_smaller_input_first
