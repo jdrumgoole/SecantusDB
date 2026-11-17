@@ -1665,6 +1665,7 @@ pub fn write_rounds(db: &str, coll: &str, n: usize) -> Option<Guard> {
         owner,
         // Not the statement's own chain: whose the statement is stays as it was.
         previous_owner: STATEMENT_OWNER.with(std::cell::Cell::get),
+        previous_round: None,
         chain: round,
     })
 }
@@ -1766,7 +1767,59 @@ pub struct Guard {
     lm: std::sync::Arc<LockManager>,
     owner: Owner,
     previous_owner: Option<Owner>,
+    /// The enclosing statement's round, restored on drop; `None` for a
+    /// guard that did not replace it ([`write_rounds`]).
+    previous_round: Option<Option<StatementRound>>,
     chain: Vec<(Resource, Mode)>,
+}
+
+/// The round an `update` or `delete` statement holds while it runs, taken
+/// again for each statement (mongod's `performUpdates` / `performDeletes`
+/// acquire the collection per statement).
+struct StatementRound {
+    lm: std::sync::Arc<LockManager>,
+    owner: Owner,
+    chain: Vec<(Resource, Mode)>,
+    held: bool,
+}
+
+thread_local! {
+    static PER_STATEMENT: std::cell::RefCell<Option<StatementRound>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// The running `update` or `delete` statement is done: its round, and with
+/// it its execution ticket, is let go before its `Slow query` line reads
+/// its statistics under a global IS (and a ticket) of their own, as
+/// mongod's statement does (measured 8.2.11, RM-355).
+pub fn statement_done() {
+    PER_STATEMENT.with(|p| {
+        if let Some(round) = p.borrow_mut().as_mut().filter(|r| r.held) {
+            round.lm.release(round.owner);
+            round.held = false;
+        }
+    });
+}
+
+/// The next statement of an `update` or `delete` starts: it takes its own
+/// round (letting go of the last statement's, if that one never finished).
+pub fn next_statement() -> Result<(), crate::CommandError> {
+    let taken = PER_STATEMENT.with(|p| {
+        let mut p = p.borrow_mut();
+        let Some(round) = p.as_mut() else {
+            return Ok(());
+        };
+        if round.held {
+            round.lm.release(round.owner);
+            round.held = false;
+        }
+        acquire_chain(&round.lm, round.owner, &round.chain)?;
+        round.held = true;
+        Ok(())
+    });
+    taken.map_err(|_: MaxTimeMsExpired| {
+        take_ticket_error().unwrap_or_else(crate::CommandError::max_time_expired)
+    })
 }
 
 impl Guard {
@@ -1783,6 +1836,19 @@ impl Guard {
         let mut rounds =
             statement_rounds(doc, db, facts).unwrap_or_else(|| vec![statement_chain(doc, db)]);
         let chain = rounds.pop().unwrap_or_default();
+        // mongod's `update` and `delete` take each statement's round as the
+        // statement runs and let it go before its line is written
+        // ([`next_statement`], [`statement_done`]): only the first is taken
+        // here. A retryable write keeps its locks to write its session's row
+        // after the last statement, which this server does once (RM-357).
+        let per_statement = matches!(
+            doc.keys().next().map(String::as_str),
+            Some("update" | "delete")
+        ) && !chain.is_empty()
+            && HELD_TO_END.with(|h| h.borrow().is_none());
+        if per_statement {
+            rounds.clear();
+        }
         // The rounds before the last are taken and let go, as mongod does.
         let refused = || take_ticket_error().unwrap_or_else(crate::CommandError::max_time_expired);
         for round in &rounds {
@@ -1794,12 +1860,23 @@ impl Guard {
         }
         let owner = lm.statement_owner();
         match acquire_chain(lm, owner, &chain) {
-            Ok(()) => Some(Ok(Self {
-                lm: lm.clone(),
-                owner,
-                previous_owner: STATEMENT_OWNER.with(|o| o.replace(Some(owner))),
-                chain,
-            })),
+            Ok(()) => {
+                let previous_round = PER_STATEMENT.with(|p| {
+                    p.replace(per_statement.then(|| StatementRound {
+                        lm: lm.clone(),
+                        owner,
+                        chain: chain.clone(),
+                        held: true,
+                    }))
+                });
+                Some(Ok(Self {
+                    lm: lm.clone(),
+                    owner,
+                    previous_owner: STATEMENT_OWNER.with(|o| o.replace(Some(owner))),
+                    previous_round: Some(previous_round),
+                    chain,
+                }))
+            }
             Err(_) => Some(Err(refused())),
         }
     }
@@ -1852,6 +1929,9 @@ impl LockManager {
 impl Drop for Guard {
     fn drop(&mut self) {
         STATEMENT_OWNER.with(|o| o.set(self.previous_owner));
+        if let Some(previous) = self.previous_round.take() {
+            PER_STATEMENT.with(|p| *p.borrow_mut() = previous);
+        }
         let kept = HELD_TO_END.with(|h| match h.borrow_mut().as_mut() {
             Some(held) => {
                 held.push((self.lm.clone(), self.owner));
