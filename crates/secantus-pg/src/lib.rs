@@ -43472,7 +43472,7 @@ impl PgHandler {
                         Some(changed) => DomainChecks::Only(&changed[n]),
                         None => DomainChecks::Except(&of_domain),
                     };
-                    self.check_row_constraints_with(&def, row, domains)?;
+                    self.check_routed_row_constraints(&def, row, domains)?;
                     self.check_view_conditions(&def, row, &ins.view_checks)?;
                     self.check_partition_route(&def, row)?;
                 }
@@ -49733,7 +49733,7 @@ impl PgHandler {
                                         }
                                     }
                                 }
-                                self.check_row_constraints_with(
+                                self.check_routed_row_constraints(
                                     def,
                                     &after,
                                     DomainChecks::Only(&checked),
@@ -50770,13 +50770,6 @@ impl PgHandler {
         PgWireError::UserError(Box::new(info))
     }
 
-    /// NOT NULL and CHECK over one row about to be written, in PostgreSQL's
-    /// order: every NOT NULL column first, then the CHECK constraints by
-    /// name. A CHECK that evaluates to NULL passes (SQL's rule).
-    fn check_row_constraints(&self, def: &TableDef, row: &Document) -> PgWireResult<()> {
-        self.check_row_constraints_with(def, row, DomainChecks::All)
-    }
-
     /// The domain columns of `row` that `domains` names, each against its
     /// domain's NOT NULL and CHECKs.
     fn check_domains(
@@ -50810,6 +50803,25 @@ impl PgHandler {
 
     /// `check_row_constraints`, checking only the domain columns `domains`
     /// says the write coerced into their domain.
+    /// `check_row_constraints_with` for a write that `check_partition_route`
+    /// follows: a partitioned table's NOT NULLs and CHECKs are checked there,
+    /// on the leaf the row lands in, which the error names (RP-975).
+    pub(crate) fn check_routed_row_constraints(
+        &self,
+        def: &TableDef,
+        row: &Document,
+        domains: DomainChecks<'_>,
+    ) -> PgWireResult<()> {
+        if crate::partition::is_partitioned(def) {
+            return self.check_domains(def, row, domains);
+        }
+        self.check_row_constraints_with(def, row, domains)
+    }
+
+    /// NOT NULL and CHECK over one row about to be written, in PostgreSQL's
+    /// order: every NOT NULL column first, then the CHECK constraints. A
+    /// CHECK that evaluates to NULL passes (SQL's rule). Only the domain
+    /// columns `domains` names are checked against their domain.
     pub(crate) fn check_row_constraints_with(
         &self,
         def: &TableDef,
@@ -58910,7 +58922,7 @@ impl PgHandler {
                     kept_lines = lines.clone();
                 }
                 for (row, line) in rows.iter().zip(&kept_lines) {
-                    self.check_row_constraints(&def, row)
+                    self.check_routed_row_constraints(&def, row, DomainChecks::All)
                         .and_then(|()| self.check_partition_route(&def, row))
                         .map_err(|e| with_where_context(e, row_context(line)))?;
                 }

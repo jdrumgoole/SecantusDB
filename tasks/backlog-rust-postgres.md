@@ -2802,14 +2802,6 @@ Measured on a private PostgreSQL 15.19 cluster.
       over an existing table is taken.
       Verify: tests/backlog/test_rp_found_rp816.py::test_a_checks_regclass_of_its_own_table_resolves_at_create
       Backlog-ID: RP-974
-- [ ] **A CHECK violated by a row routed into a partition names the
-      partitioned table, not the leaf.** `insert into p974 values (2)`,
-      routed into `p974b` and failing `check (x < 2)`, is 23514 `new row
-      for relation "p974b" violates check constraint "p974_x_check"` on
-      PostgreSQL 15.19 (`ExecConstraints` reports the leaf's result
-      relation); here the relation is `p974`.
-      Verify: tests/backlog/test_rp_found_rp816.py::test_a_partitions_check_violation_names_the_leaf
-      Backlog-ID: RP-975
 
 ## Found while working RP-860 (2026-11-14)
 
