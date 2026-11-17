@@ -86,8 +86,14 @@
 <section class="section alt">
   <div class="wrap">
     <h2>Get it</h2>
-    <p class="section-lead">Two ways to run the Rust server &mdash; built from crates.io, or as a prebuilt standalone binary.</p>
+    <p class="section-lead">Three ways to run the Rust server &mdash; from PyPI, built from crates.io, or as a prebuilt standalone binary.</p>
     <div class="install-cols">
+      <div class="install-col">
+        <h3>From PyPI</h3>
+        <p><code>pip install SecantusDB</code> installs both servers prebuilt &mdash; <code>secantusd-mdb</code> and <code>secantusd-pg</code> land on your <code>PATH</code>, with nothing to compile (Linux x86_64, macOS arm64). The wheel also carries the <code>secantusdb</code> launcher for starting either server from Python.</p>
+        <pre class="install-code"><code>pip install SecantusDB
+secantusd-mdb --port 27017 --storage-path ./data</code></pre>
+      </div>
       <div class="install-col">
         <h3>From crates.io</h3>
         <p>The Rust server is the <code>secantus-mdb</code> crate. <code>cargo install</code> builds it, WiredTiger included, and puts <code>secantusd-mdb</code> on your <code>PATH</code>. The same crate starts the server in-process from a Rust test as <code>secantus_mdb::Server</code>.</p>
@@ -108,8 +114,7 @@ secantusd-mdb --port 27017 --storage-path ./data</code></pre>
 
 <section class="section">
   <div class="wrap">
-    <h2>Get it</h2>
-    <p class="section-lead"><code>pip install SecantusDB</code> puts <code>secantusd-mdb</code> and <code>secantusd-pg</code> on your <code>PATH</code>; or <code>cargo install secantus-mdb --version 0.5.3-beta.197</code>, or download a prebuilt binary.</p>
+    <h2>Documentation</h2>
     <div class="ctas" style="margin-top: 24px;">
       <a class="btn btn-primary" href="{{ SECANTUS_RUST_BINARY_URL }}" rel="noopener">Download the binary</a>
       <a class="btn btn-secondary" href="{{ SECANTUS_RUST_DOCS_URL }}index.html" rel="noopener">Read the Rust docs</a>

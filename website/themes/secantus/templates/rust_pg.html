@@ -112,8 +112,14 @@
 <section class="section alt" id="get-it">
   <div class="wrap">
     <h2>Get it</h2>
-    <p class="section-lead">A prebuilt archive for <strong>Linux x86_64</strong> and <strong>macOS arm64</strong>, or from source on any other platform &mdash; there is no Windows build yet. Each archive ships with a <code>.sha256</code>. Binary releases are GitHub <em>pre-releases</em>, so they never show as &ldquo;Latest&rdquo; &mdash; the link below goes straight to the tag.</p>
+    <p class="section-lead"><code>pip install SecantusDB</code>, a prebuilt archive for <strong>Linux x86_64</strong> and <strong>macOS arm64</strong>, or from source on any other platform &mdash; there is no Windows build yet. Each archive ships with a <code>.sha256</code>. Binary releases are GitHub <em>pre-releases</em>, so they never show as &ldquo;Latest&rdquo; &mdash; the link below goes straight to the tag.</p>
     <div class="install-cols">
+      <div class="install-col">
+        <h3>From PyPI</h3>
+        <p><code>pip install SecantusDB</code> installs a prebuilt <code>secantusd-pg</code> (and <code>secantusd-mdb</code>) on your <code>PATH</code> &mdash; nothing to compile, Linux x86_64 and macOS arm64.</p>
+        <pre class="install-code"><code>pip install SecantusDB
+secantusd-pg ./data 127.0.0.1:5432</code></pre>
+      </div>
       <div class="install-col">
         <h3>Prebuilt binary</h3>
         <p>Download, extract, run. No Rust toolchain, no Python, and since 0.1.0-beta.2 nothing but the platform's own C runtime &mdash; zlib and lz4 are linked in.</p>
