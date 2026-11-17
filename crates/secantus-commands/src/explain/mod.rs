@@ -629,6 +629,7 @@ fn catalog(
                         .flatten()
                 }),
             plain,
+            geo: secantus_core::geoorder::GeoIndex::from_spec(spec),
             key: key.clone(),
             name,
         }));

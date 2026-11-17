@@ -141,7 +141,7 @@ fn clauses(filter: &Document) -> Vec<(&str, &Bson)> {
 /// The bounds of the index's non-geo fields from the filter: one value
 /// under an equality, all of them with no predicate. `None` when a field
 /// has another predicate, whose bounds this does not build.
-fn trailing_bounds(index: &GeoIndex, filter: &Document) -> Option<Vec<FieldBounds>> {
+pub(crate) fn trailing_bounds(index: &GeoIndex, filter: &Document) -> Option<Vec<FieldBounds>> {
     let cl = clauses(filter);
     let mut out = Vec::with_capacity(index.fields.len());
     for (at, field) in index.fields.iter().enumerate() {
