@@ -108,7 +108,7 @@ dependency, are attached to the releases on
 
 | Server | Release tag | Archive | Platforms |
 | --- | --- | --- | --- |
-| MongoDB | `secantusdb-v<version>` | `secantusdb-<version>-<target>.tar.gz` | Linux x86_64, macOS arm64, Windows x86_64 (also a `.zip`) |
+| MongoDB | `secantusdb-v<version>` | `secantusdb-<version>-<target>.tar.gz` | Linux x86_64, macOS arm64, Windows x86_64 (a `.zip` too from the release after 0.5.3-beta.197) |
 | PostgreSQL | `secantusd-pg-v<version>` | `secantusd-pg-<version>-<target>.tar.gz` | Linux x86_64, macOS arm64 |
 
 `<target>` is the Rust target triple: `x86_64-unknown-linux-gnu`,

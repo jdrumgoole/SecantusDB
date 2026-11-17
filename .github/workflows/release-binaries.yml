@@ -521,6 +521,21 @@ jobs:
             secantusdb-*.tar.gz
             secantusdb-*.tar.gz.sha256
 
+      # The Windows .zip built above was never attached: the step before can't
+      # list it (fail_on_unmatched_files would fail every non-Windows target),
+      # so until 2026-11-17 no release carried one although the docs promised
+      # it. Attach it in a Windows-only step instead.
+      - name: Attach the Windows .zip to the GitHub Release
+        if: matrix.os == 'windows'
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64  # v3.0.3
+        with:
+          tag_name: ${{ env.TAG }}
+          prerelease: ${{ contains(env.VERSION, '-') }}
+          fail_on_unmatched_files: true
+          files: |
+            secantusdb-*.zip
+            secantusdb-*.zip.sha256
+
 # ---------------------------------------------------------------------------
 # Follow-on matrix entries (NOT yet enabled — each needs verification first):
 #

@@ -33,5 +33,5 @@ one server bumps only that server's version.
 | --- | --- |
 | `x86_64-unknown-linux-gnu` | ✅ prebuilt archive |
 | `aarch64-apple-darwin` | ✅ prebuilt archive |
-| `x86_64-pc-windows-msvc` | ✅ prebuilt archive (`.zip` + `.tar.gz`; static CRT, no PGO yet) |
+| `x86_64-pc-windows-msvc` | ✅ prebuilt archive (`.tar.gz`, plus a `.zip` from the release after 0.5.3-beta.197; static CRT, no PGO yet) |
 | musl-static Linux, `aarch64` Linux | documented follow-ons |
