@@ -2808,18 +2808,6 @@ Measured on a private PostgreSQL 15.19 cluster.
 Measured on a private, freshly initdb'd PostgreSQL 15.19 cluster with the
 `_SETUP` in `tests/backlog/test_rp_found_rp860.py` (`t860 (x int)`).
 
-- [ ] **A column renamed under a CHECK leaves the CHECK naming the old
-      column, and the table takes no more rows.** After `alter table t860
-      add constraint k check (x > 0)` and `alter table t860 rename column x
-      to y`, PostgreSQL 15.19 still enforces the constraint on the column
-      (`insert ... values (0)` is 23514) and prints it `CHECK ((y > 0))`:
-      the stored tree holds the column's attnum, not its name. Here the
-      stored text still says `x`, so every INSERT is 42703 `column "x" does
-      not exist` and `pg_get_constraintdef` prints the old text. The fix renames the column in every stored CHECK
-      expression (and any other stored expression text keyed by column
-      name) where the rename is applied.
-      Verify: tests/backlog/test_rp_found_rp860.py::test_a_renamed_column_is_renamed_in_its_check
-      Backlog-ID: RP-939
 - [ ] **A `regtype` comparison in a CHECK prints without its `oid`
       casts.** `check (pg_typeof(x) = 'int4'::regtype)` prints `CHECK
       (((pg_typeof(x))::oid = ('integer'::regtype)::oid))` on PostgreSQL
@@ -2830,6 +2818,24 @@ Measured on a private, freshly initdb'd PostgreSQL 15.19 cluster with the
       records.
       Verify: tests/backlog/test_rp_found_rp860.py::test_a_regtype_comparison_in_a_check_prints_its_oid_casts
       Backlog-ID: RP-941
+
+## Found while working RP-939 (2026-11-17)
+
+Measured on PostgreSQL 15.19 (the shared reference on port 5415).
+
+- [ ] **A renamed partition key column leaves the key naming the old
+      column, and the table takes no more rows.** After `alter table p939k
+      rename column x to y` on `p939k (x int) partition by list (x)`,
+      PostgreSQL 15.19 still routes `insert into p939k values (1)` and
+      prints the key `LIST (y)`: the key holds the column's attnum. Here
+      the stored key text still names `x`, so the INSERT is 42703 `column
+      "x" does not exist`. The RENAME COLUMN arm renames the column in
+      stored CHECKs (`rename_column_in_expression`, RP-939); the partition
+      key, the partitions' bounds, and any other stored expression text
+      (defaults, generated columns, index expressions and predicates) were
+      not checked.
+      Verify: tests/backlog/test_rp_found_rp860.py::test_a_renamed_partition_key_column_still_routes
+      Backlog-ID: RP-1024
 
 ## Found while working RP-751 (2026-11-10)
 

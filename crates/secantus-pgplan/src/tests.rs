@@ -8654,3 +8654,28 @@ fn a_writes_unknown_column_is_at_the_reference_transformed_first() {
         assert_eq!(take_error_location(), Some(at), "{sql}");
     }
 }
+
+/// A RENAME COLUMN renames the column in a stored CHECK, qualified or not,
+/// and leaves a string literal and the other columns alone (RP-939).
+#[test]
+fn rename_column_in_a_check_expression() {
+    let Statement::CreateTable(def, _) =
+        plan_ok("create table w (x int, z int, check (x > z and w.x::text <> 'x'))")
+    else {
+        panic!("not a CREATE TABLE");
+    };
+    let [check] = def.check_constraints.as_slice() else {
+        panic!("{:?}", def.check_constraints);
+    };
+    let renamed =
+        crate::rename_column_in_expression(&check.expression, &def, "x", "Big Y").expect("renames");
+    assert_eq!(
+        renamed, "\"Big Y\" > z AND w.\"Big Y\"::text <> 'x'",
+        "from {}",
+        check.expression
+    );
+    assert_eq!(
+        crate::rename_column_in_expression(&check.expression, &def, "q", "r").expect("unchanged"),
+        check.expression
+    );
+}

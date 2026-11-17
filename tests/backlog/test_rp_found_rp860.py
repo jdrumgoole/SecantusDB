@@ -49,11 +49,11 @@ def _script(dsn: str, statements: list[str]) -> list[object]:
     return out
 
 
-@pytest.mark.backlog("RP-939")
+@pytest.mark.backlog_fixed("RP-939")
 def test_a_renamed_column_is_renamed_in_its_check(dsn: str) -> None:
     """A CHECK holds the column itself, not its name: after `rename column
     x to y` it still tests the column, now printed `y`, on PostgreSQL
-    15.19. Here the stored text still names `x`, so every INSERT is 42703
+    15.19. The stored text still named `x`, so every INSERT was 42703
     `column "x" does not exist`."""
     assert _script(
         dsn,
@@ -94,3 +94,32 @@ def test_a_regtype_comparison_in_a_check_prints_its_oid_casts(dsn: str) -> None:
         dsn,
         ["alter table t860 add constraint k check (pg_typeof(x) = 'int4'::regtype)", _DEF],
     ) == ["ALTER TABLE", [("CHECK (((pg_typeof(x))::oid = ('integer'::regtype)::oid))",)]]
+
+
+@pytest.mark.backlog("RP-1024")
+def test_a_renamed_partition_key_column_still_routes(dsn: str) -> None:
+    """The partition key holds the column's attnum: after `rename column x
+    to y` on a partitioned table, a row still routes and the key prints
+    `LIST (y)` on PostgreSQL 15.19 (shared reference, port 5415). Here the
+    stored key text still names `x`, so the INSERT is 42703 `column "x"
+    does not exist`. Found while working RP-939."""
+    assert _script(
+        dsn,
+        [
+            "drop table if exists p939k",
+            "create table p939k (x int) partition by list (x)",
+            "create table p939k1 partition of p939k for values in (1)",
+            "alter table p939k rename column x to y",
+            "insert into p939k values (1)",
+            "select pg_get_partkeydef('p939k'::regclass)",
+            "drop table p939k",
+        ],
+    ) == [
+        "DROP TABLE",
+        "CREATE TABLE",
+        "CREATE TABLE",
+        "ALTER TABLE",
+        "INSERT 0 1",
+        [("LIST (y)",)],
+        "DROP TABLE",
+    ]

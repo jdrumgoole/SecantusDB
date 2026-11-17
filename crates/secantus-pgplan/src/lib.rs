@@ -12096,6 +12096,43 @@ pub fn defer_constraint_defs(build: impl FnOnce() -> Vec<(i64, String)> + 'stati
     CONSTRAINT_DEFS.with(|d| d.defer(build));
 }
 
+/// A table's stored expression (a CHECK's) with its column `old` renamed
+/// to `new`. PostgreSQL stores the analysed tree, which holds the column's
+/// attnum, so a rename carries over; the text stored here is renamed
+/// instead (RP-939). The expression unchanged when it does not name `old`.
+pub fn rename_column_in_expression(
+    expression: &str,
+    def: &TableDef,
+    old: &str,
+    new: &str,
+) -> Result<String> {
+    let relation = def.name.clone();
+    let columns: Vec<String> = def.columns.iter().map(|c| c.name.clone()).collect();
+    let columns_of = |name: &str| (name == relation).then(|| columns.clone());
+    let sql = format!(
+        "SELECT ({expression}) FROM {}",
+        scalar::quote_identifier(&relation)
+    );
+    let renamed = view_deps::rename_column(&sql, &relation, old, new, &columns_of)?;
+    if renamed == sql {
+        return Ok(expression.to_string());
+    }
+    let tree = pg_query::parse(&renamed).map_err(|e| Error::Parse(e.to_string()))?;
+    let node = tree
+        .protobuf
+        .stmts
+        .first()
+        .and_then(|s| match s.stmt.as_ref()?.node.as_ref()? {
+            N::SelectStmt(sel) => match sel.target_list.first()?.node.as_ref()? {
+                N::ResTarget(rt) => rt.val.as_deref().cloned(),
+                _ => None,
+            },
+            _ => None,
+        })
+        .ok_or_else(|| Error::Parse("CHECK expression is not an expression".into()))?;
+    deparse_expr(&node)
+}
+
 /// A CHECK constraint's expression as `pg_get_constraintdef` prints it:
 /// `CHECK ((n > 0))`.
 pub fn check_constraint_text(expression: &str, def: &TableDef) -> String {

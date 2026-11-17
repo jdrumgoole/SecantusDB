@@ -45543,6 +45543,17 @@ impl PgHandler {
                 if !old.pk {
                     self.rename_row_field(&table, &old.field(), &to)?;
                 }
+                // A CHECK keeps naming the column under its new name (RP-939).
+                let before = def.clone();
+                for ck in &mut def.check_constraints {
+                    ck.expression = secantus_pgplan::rename_column_in_expression(
+                        &ck.expression,
+                        &before,
+                        &column,
+                        &to,
+                    )
+                    .map_err(|e| Self::err(&e))?;
+                }
                 if let Some(c) = def.columns.iter_mut().find(|c| c.name == column) {
                     c.name = to.clone();
                 }
