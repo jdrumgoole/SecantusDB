@@ -42,7 +42,7 @@ answered once the parse had finished. And a cancel that lands while the server
 is still reading a very large statement off the socket is still dropped; we
 saw that in the first 5 ms after a 1.4 MB statement, in a debug build.
 
-This is a server for tests. It is single-node, it is a beta, and a role with
+This is a real single-node database, it is a beta, and a role with
 no password connects without one, so keep it on loopback.
 
 `cargo install secantus-pg --version 0.1.0-beta.5` builds it from crates.io.

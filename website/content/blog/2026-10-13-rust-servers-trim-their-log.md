@@ -80,7 +80,7 @@ there.
 - The Python servers have the same gap and are not changed by this
   release. We have not measured them.
 
-This is a server for tests. It is single-node, and it is a beta.
+This is a real single-node database, and it is a beta.
 
 `cargo install secantus-mdb --version 0.5.3-beta.191` and
 `cargo install secantus-pg --version 0.1.0-beta.15` build them from

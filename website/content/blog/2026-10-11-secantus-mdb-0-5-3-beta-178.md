@@ -7,7 +7,7 @@ Tags: release
 
 Summary: secantus-mdb 0.5.3-beta.178 replaces its hand-written collation with ICU4X, makes a collation reach aggregation, defaults and unique indexes, and fixes renameCollection dropping a collection's validator.
 
-If your tests use a collation on `secantusd-rs`, this release changes their
+If you use a collation on `secantusd-rs`, this release changes its
 answers, and the new ones are `mongod`'s.
 
 ```python
@@ -85,7 +85,7 @@ The binary is 1.5 MB larger, which is the language data. We ran the pymongo,
 Go and Node driver suites against this code and each gave the same result as
 the release before.
 
-This is a server for tests. It is single-node and it is a beta.
+This is a real single-node database, and it is a beta.
 
 `cargo install secantus-mdb --version 0.5.3-beta.178` builds it from crates.io.
 Binaries for Linux x86_64, macOS arm64 and Windows x86_64 are on the release.

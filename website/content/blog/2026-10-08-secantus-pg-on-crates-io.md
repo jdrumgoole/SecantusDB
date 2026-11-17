@@ -56,7 +56,7 @@ durable `UPDATE` by primary key is level, 90 to 92 microseconds against 95 to
 100. At eight clients durable writes scale about three times over one client
 where PostgreSQL scales about four. We have not measured any of this on Linux.
 
-This is a server for tests. It is single-node, it is a beta, and a role with
+This is a real single-node database, it is a beta, and a role with
 no password connects without one, so keep it on loopback.
 
 [Rust PostgreSQL server](https://secantusdb.com/rust-pg.html) ·

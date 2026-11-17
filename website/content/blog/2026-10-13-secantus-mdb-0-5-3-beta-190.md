@@ -7,7 +7,7 @@ Tags: release
 
 Summary: secantus-mdb 0.5.3-beta.190 tests GeoJSON shapes on the sphere, returns $near results nearest first, and refuses what a geo index cannot hold, as mongod does.
 
-Upgrade if you run `secantusd-rs` and your tests use geo queries. Several
+Upgrade if you run `secantusd-rs` and use geo queries. Several
 of them returned different documents from `mongod`.
 
 - **GeoJSON shapes were tested as if the map were flat.** `mongod` tests
@@ -59,7 +59,7 @@ Two things to know when you upgrade:
 We ran the pymongo, Go and Node driver suites against this code. Each gave
 the same result as the release before.
 
-This is a server for tests. It is single-node and it is a beta.
+This is a real single-node database, and it is a beta.
 
 `cargo install secantus-mdb --version 0.5.3-beta.190` builds it from crates.io.
 Binaries for Linux x86_64, macOS arm64 and Windows x86_64 are on the release.

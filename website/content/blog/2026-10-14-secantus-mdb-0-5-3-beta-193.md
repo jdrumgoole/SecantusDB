@@ -7,7 +7,7 @@ Tags: release
 
 Summary: secantus-mdb 0.5.3-beta.193 makes validate read the collection and its indexes, removes a dropped role from the users that held it, and answers the user and role management commands as mongod does.
 
-Upgrade if you run `secantusd-rs` and your tests create users or roles, or
+Upgrade if you run `secantusd-rs` and create users or roles, or
 call `validate`.
 
 `validate` checks the collection now. The last release's post said it
@@ -73,7 +73,7 @@ with this one under `--auth`, and each user logged in.
 We ran the pymongo, Go and Node driver suites against this code. Each gave
 the same result as the release before.
 
-This is a server for tests. It is single-node and it is a beta.
+This is a real single-node database, and it is a beta.
 
 `cargo install secantus-mdb --version 0.5.3-beta.193` builds it from crates.io.
 Binaries for Linux x86_64, macOS arm64 and Windows x86_64 are on the release.

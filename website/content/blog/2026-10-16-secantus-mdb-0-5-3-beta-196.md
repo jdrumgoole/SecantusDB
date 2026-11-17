@@ -7,7 +7,7 @@ Tags: release
 
 Summary: secantus-mdb 0.5.3-beta.196 runs mongod's trial of candidate plans, so explain and the order documents come back in follow mongod's choice of index; numbers compare by their exact value; and the server gains a profiler, wire compression and real serverStatus counters.
 
-Upgrade if your tests depend on which index a query reads, on the order a
+Upgrade if you depend on which index a query reads, on the order a
 query returns documents in, or on how a double compares with a long or a
 decimal.
 
@@ -125,7 +125,7 @@ We ran the thirteen driver test suites against this release's code. No
 suite lost a test: pymongo passes 99.5%, and the Java, Kotlin, Rust, C++,
 C# and PHP extension drivers pass every test they run.
 
-This is a server for tests. It is single-node and it is a beta.
+This is a real single-node database, and it is a beta.
 
 `cargo install secantus-mdb --version 0.5.3-beta.196` builds it from crates.io.
 Binaries for Linux x86_64, macOS arm64 and Windows x86_64 are on the release.

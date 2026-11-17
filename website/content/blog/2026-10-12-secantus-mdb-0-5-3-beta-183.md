@@ -7,8 +7,8 @@ Tags: release
 
 Summary: secantus-mdb 0.5.3-beta.183 checks what $changeStream is given, refuses a resume token it cannot find, names the transaction on a transaction's events, and reports an implicit create, after a comparison of the change-stream commands with mongod.
 
-If your tests resume change streams on `secantusd-rs`, upgrade. Two things
-in this release could leave a test passing on wrong data.
+If you resume change streams on `secantusd-rs`, upgrade. Two things
+in this release could leave an application reading wrong data.
 
 - **A resume token the server could not find resumed anyway.** `mongod`
   re-reads the token's event and refuses to resume (280,
@@ -68,7 +68,7 @@ servers' tokens are their own); explain a change stream as the oplog scan
 We ran the pymongo, Go and Node driver suites against this code. Each gave
 the same result as the release before.
 
-This is a server for tests. It is single-node and it is a beta.
+This is a real single-node database, and it is a beta.
 
 `cargo install secantus-mdb --version 0.5.3-beta.183` builds it from crates.io.
 Binaries for Linux x86_64, macOS arm64 and Windows x86_64 are on the release.
