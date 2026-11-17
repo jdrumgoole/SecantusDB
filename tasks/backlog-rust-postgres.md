@@ -2010,21 +2010,19 @@ a regression test.
       RP-435).
       Verify: tests/backlog/test_rp_dml_from.py::test_explain_prints_the_join
       Backlog-ID: RP-1019
-- [ ] **A Sort above a dummy relation prints no estimate, and an
-      UPDATE's dummy Result no width.** Since RP-409 a WHERE that folds to
-      constant false plans a `Result` with `One-Time Filter: false`, costing
-      nothing, as PostgreSQL 15.19 does; since 2026-11-16 a dummy join's
-      Result keeps the width of the columns the join carries, one table's
-      is width 0, and a count Aggregate above it is priced
-      (`dummy_width`, `scan_estimate.rs`). Still open: a Sort over it,
-      which PostgreSQL prices at its type-default widths (`explain select *
-      from e where a = null order by b` is `Sort (cost=0.01..0.02 rows=0
-      width=36)`; here `cost=0.00..0.00 rows=0 width=0`); an UPDATE's
-      Result, `width=38` there (the new row's columns and the row's
-      identity), `width=0` here; any aggregate other than a count, and a
-      count over a dummy join. Measured on the 15.19 reference on port
-      5415 (found while working RP-409).
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a sort over a dummy relation is priced], tests/backlog/test_rp_explain_costs.py::test_plan[an update of a dummy relation keeps its result's width]
+- [ ] **An aggregate other than a count over a dummy relation prints no
+      estimate.** Since RP-409 a WHERE that folds to constant false plans a
+      `Result` with `One-Time Filter: false`, costing nothing, as
+      PostgreSQL 15.19 does; a dummy join's Result keeps the width of the
+      columns the join carries, one table's is width 0, a count Aggregate
+      above it is priced (`dummy_width`, `scan_estimate.rs`), and since
+      2026-11-17 so are a Sort over one table's (its select list at its
+      types' widths) and an UPDATE's Result (the assigned columns and
+      `ctid`; `dummy_target_width`). Still open: any aggregate other than a
+      count, and a count over a dummy join, both priced zeros here.
+      Measured on the 15.19 reference on port 5415 (found while working
+      RP-409).
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a sum over a dummy relation is priced]
       Backlog-ID: RP-420
 - [ ] **An aggregate above an InitPlan's scan is a Subquery Scan.** Since
       RP-440's first slices (2026-11-16) a SELECT over one relation whose WHERE

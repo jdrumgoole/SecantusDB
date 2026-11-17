@@ -4465,7 +4465,7 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
         ["Result  (cost=0.00..0.00 rows=0 width=0)", "  One-Time Filter: false"],
     ),
     "a sort over a dummy relation is priced": (
-        "RP-420",
+        "RP-420:fixed",
         _ANALYSED,
         "explain select * from e where a = null order by b",
         [
@@ -4475,8 +4475,21 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "        One-Time Filter: false",
         ],
     ),
-    "an update of a dummy relation keeps its result's width": (
+    # PostgreSQL 15.19 prices any plain aggregate over a dummy relation
+    # (`cost_agg` AGG_PLAIN over no rows): a sum's transition and final
+    # functions, not only a count's (found while working RP-420).
+    "a sum over a dummy relation is priced": (
         "RP-420",
+        _ANALYSED,
+        "explain select sum(a) from e where a = null",
+        [
+            "Aggregate  (cost=0.00..0.01 rows=1 width=8)",
+            "  ->  Result  (cost=0.00..0.00 rows=0 width=0)",
+            "        One-Time Filter: false",
+        ],
+    ),
+    "an update of a dummy relation keeps its result's width": (
+        "RP-420:fixed",
         _ANALYSED,
         "explain update e set b = 'x' where a = null",
         [

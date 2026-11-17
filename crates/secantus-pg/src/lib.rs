@@ -46895,8 +46895,24 @@ impl PgHandler {
                     // The Result keeps the relation's width, and a count
                     // over it is priced as over any input: `cost_agg`'s
                     // AGG_PLAIN over no rows (RP-420).
-                    let width = self.dummy_width(inner.as_ref());
+                    let width = match inner.as_ref() {
+                        Statement::Update(_) => self.dummy_target_width(inner.as_ref()),
+                        _ => self.dummy_width(inner.as_ref()),
+                    };
                     let result = (0.0, 0.0, 0.0, width.unwrap_or(0));
+                    // A Sort over it sorts the select list at its types'
+                    // widths (`cost_sort` over no rows, clamped to two).
+                    if tree.name == "Sort"
+                        && tree.children.len() == 1
+                        && tree.children[0].name == "Result"
+                    {
+                        if let Some(w) = self.dummy_target_width(inner.as_ref()) {
+                            tree.estimate = Some(scan_estimate::sort_estimate(
+                                (0.0, 0.0, 0.0, w),
+                                self.kb_setting("work_mem", 4096),
+                            ));
+                        }
+                    }
                     if let Some(node) = explain::dummy_result_mut(&mut tree) {
                         if width.is_some() {
                             node.estimate = Some(result);

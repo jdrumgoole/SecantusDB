@@ -104,7 +104,7 @@ impl JoinSide {
 /// `(startup, total)`.
 fn sort_cost(input_total: f64, rows: f64) -> (f64, f64) {
     let n = rows.max(2.0);
-    let startup = input_total + 2.0 * CPU_OPERATOR_COST * n * n.log2();
+    let startup = input_total + 2.0 * CPU_OPERATOR_COST * n * crate::costsize::pg_log2(n);
     (startup, startup + CPU_OPERATOR_COST * rows)
 }
 
@@ -140,11 +140,11 @@ pub fn cost_sort(input_total: f64, tuples: f64, width: i64, limit: Option<f64>) 
             1.0
         };
         let accesses = 2.0 * npages * log_runs;
-        comparison * n * n.log2() + accesses * (0.75 + RANDOM_PAGE_COST * 0.25)
+        comparison * n * crate::costsize::pg_log2(n) + accesses * (0.75 + RANDOM_PAGE_COST * 0.25)
     } else if n > 2.0 * output_tuples || input_bytes > WORK_MEM_BYTES {
-        comparison * n * (2.0 * output_tuples).log2()
+        comparison * n * crate::costsize::pg_log2(2.0 * output_tuples)
     } else {
-        comparison * n * n.log2()
+        comparison * n * crate::costsize::pg_log2(n)
     };
     let startup = input_total + startup;
     (startup, startup + CPU_OPERATOR_COST * n)

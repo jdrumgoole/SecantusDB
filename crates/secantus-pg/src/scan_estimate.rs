@@ -4263,6 +4263,46 @@ impl PgHandler {
         }
     }
 
+    /// The width of a target computed over one dummy table (RP-420):
+    /// `set_pathtarget_cost_width` finds no `attr_widths` on a relation
+    /// excluded before `set_rel_width`, so each column is its type's
+    /// `get_typavgwidth`. A Sort over `select` of stored columns prices that
+    /// target; an UPDATE's Result carries each assigned column, at its
+    /// type, and the row's identity (`ctid`, 6). `None` where the target is
+    /// not modelled.
+    pub(crate) fn dummy_target_width(&self, stmt: &Statement) -> Option<i64> {
+        let def_of = |table: &str| {
+            self.shared_table_defs()
+                .ok()?
+                .iter()
+                .find(|d| d.name == table)
+                .cloned()
+        };
+        match stmt {
+            Statement::Select(sel)
+                if sel.sub.is_none()
+                    && sel.join.is_none()
+                    && sel.series.is_none()
+                    && sel.windows.is_empty()
+                    && sel.casts.iter().all(Option::is_none) =>
+            {
+                let def = def_of(&sel.table)?;
+                let fields: Vec<String> = sel.columns.iter().map(|(_, f)| f.clone()).collect();
+                output_width(&def, None, &fields)
+            }
+            Statement::Update(up) if up.set_subscripts.is_empty() => {
+                let def = def_of(&up.table)?;
+                let mut fields: Vec<String> = up.set.keys().cloned().collect();
+                fields.extend(up.set_exprs.iter().map(|(f, ..)| f.clone()));
+                if fields.is_empty() {
+                    return None;
+                }
+                Some(output_width(&def, None, &fields)? + 6)
+            }
+            _ => None,
+        }
+    }
+
     pub(crate) fn user_seq_scan(
         &self,
         table: &str,
@@ -5096,10 +5136,10 @@ pub(crate) fn sort_estimate(input: Estimate, work_mem_kb: usize) -> Estimate {
             1.0
         };
         let page_accesses = 2.0 * npages * log_runs;
-        comparison_cost * tuples * tuples.log2()
+        comparison_cost * tuples * secantus_pgplan::costsize::pg_log2(tuples)
             + page_accesses * (SEQ_PAGE_COST * 0.75 + RANDOM_PAGE_COST * 0.25)
     } else {
-        comparison_cost * tuples * tuples.log2()
+        comparison_cost * tuples * secantus_pgplan::costsize::pg_log2(tuples)
     };
     let run = CPU_OPERATOR_COST * tuples;
     startup += in_total;
