@@ -549,12 +549,11 @@ These are explicit non-goals. Don't add them without a reason.
       (`tests/mongod_live/test_ingress_admission.py`). Open:
       - where this server's ticket points differ from mongod's: a yield here
         keeps its locks, so it keeps its ticket and takes no second
-        admission (mongod returns both and takes them again, RM-360); and
-        an `update` or `delete` statement's line counts one admission
-        fewer, its command's line one fewer per statement, because the
-        statement's line is written with the command's locks still held
-        (RM-357's statement rounds), where mongod's statement has let its
-        own go and takes a fresh ticket to read its statistics;
+        admission (mongod returns both and takes them again, RM-360).
+        Since 2026-11-17 an `update` or `delete` statement takes its round
+        as it runs and lets it go before its line reads its statistics, as
+        mongod's does; a retryable one still holds every round to the end
+        (RM-357's session row);
       - the line of a command that never got its ingress ticket names
         `<db>.$cmd` on mongod, its collection here; and mongod's first
         retryable write after startup takes a second, exempt, ingress
@@ -563,7 +562,7 @@ These are explicit non-goals. Don't add them without a reason.
         measured).
       **Decided (Joe, 2026-11-08): build mongod's execution admission control in full, the faithful option: the ingress controller, then the read and write ticket pools with `throughputProbing` (replacing `admission.rs`'s opt-in write tickets), then the per-command admission counts, so the concurrency cap is on by default as on mongod. Several PRs, in that order.** The ingress controller landed 2026-11-08, the ticket pools 2026-11-09, and the per-command admission counts on the line 2026-11-09; what is left is above.
       Backlog-ID: RM-355
-      Verify: tests/backlog/test_rm_355_364.py::test_an_update_statement_takes_mongods_execution_tickets
+      Verify: none -- the yield's second admission is RM-360's; the `$cmd` line name, the second exempt ingress admission and an index build's `queues` have no gap test yet
 - [ ] **Some writes' `locks` are not mongod's.** Since 2026-11-07 a write
       counts mongod's flow control tickets (one per global IX taken apart)
       and a retryable write's session checkout and session row, and a

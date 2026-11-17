@@ -1976,23 +1976,28 @@ def _update_admissions(client: Any, is_mongod: bool) -> Any:
     for raw in log:
         entry = json.loads(raw)
         attr = entry.get("attr", {})
-        if entry.get("msg") == "Slow query" and attr.get("type") in ("update", "command"):
+        # The `update` command's line and its statements' only: the
+        # `profile` command's own line shows up when it runs slow.
+        kind = attr.get("type")
+        is_update = kind == "update" or (kind == "command" and "update" in attr.get("command", {}))
+        if entry.get("msg") == "Slow query" and is_update:
             out.append((attr.get("type"), attr.get("queues", {}).get("execution")))
     return out
 
 
-@pytest.mark.backlog("RM-355")
+@pytest.mark.backlog_fixed("RM-355")
 def test_an_update_statement_takes_mongods_execution_tickets(
     rust_mongo: Any, mongod_rs: Any
 ) -> None:
     """mongod 8.2.11's `update` statement lets its locks go before its line
     is written and takes a fresh ticket to read its statistics; this
-    server writes the line with the command's locks still held, so the
-    statement's line and its command's each count fewer admissions."""
+    server wrote the line with the command's locks still held, so the
+    statement's line and its command's each counted fewer admissions."""
     got = {
         "rust": _update_admissions(rust_mongo, False),
         "mongod": _update_admissions(mongod_rs, True),
     }
+    assert len(got["mongod"]) == 3
     assert got["rust"] == got["mongod"]
 
 

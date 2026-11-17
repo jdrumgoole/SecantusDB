@@ -1420,6 +1420,8 @@ impl<'a> Statements<'a> {
             self.planning_mark = crate::explain::planning_spent();
             return;
         };
+        // mongod's statement lets its locks go before it writes its line.
+        crate::lock_manager::statement_done();
         let outcome = if errors.len() > open.errors {
             StatementOutcome::Failed(
                 errors
