@@ -309,12 +309,12 @@ def test_a_system_column_in_a_generated_column_is_42p10(dsn: str) -> None:
     )
 
 
-@pytest.mark.backlog("RP-974")
+@pytest.mark.backlog_fixed("RP-974")
 def test_a_checks_regclass_of_its_own_table_resolves_at_create(dsn: str) -> None:
     """`cookConstraint` runs after `heap_create_with_catalog`, so a CHECK
     may name its own table by `regclass`: `create table t816 (x int, check
     (tableoid = 't816'::regclass))` is CREATE TABLE on PostgreSQL 15.19.
-    Here it is 42P01 `relation "t816" does not exist` at 14."""
+    It was 42P01 `relation "t816" does not exist` at 14."""
     assert _answer(dsn, "create table t816 (x int, check (tableoid = 't816'::regclass))") == (
         "CREATE TABLE"
     )

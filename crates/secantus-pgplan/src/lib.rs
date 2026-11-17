@@ -38248,6 +38248,14 @@ fn resolve_regclass(text: &str) -> Result<i64> {
 /// there is no such relation, or no such schema.
 pub(crate) fn relation_oid(schema: Option<&str>, name: &str) -> Option<i64> {
     let user = |stored: &str, temp: Option<bool>| -> Option<i64> {
+        let cooking = COOKING_RELATION.with(|c| {
+            c.borrow()
+                .as_ref()
+                .is_some_and(|(n, is_temp)| n == stored && temp.is_none_or(|want| want == *is_temp))
+        });
+        if cooking {
+            return Some(0);
+        }
         crate::deferred::read(&PLAN_USER_RELATIONS, |t| {
             t.iter()
                 .find(|(n, _, is_temp)| n == stored && temp.is_none_or(|want| want == *is_temp))
@@ -39492,6 +39500,12 @@ thread_local! {
     /// cast to it (RP-860). Not yet published, so held here meanwhile.
     static COOKING_ROWTYPE: std::cell::RefCell<Option<CompositeType>> =
         const { std::cell::RefCell::new(None) };
+    /// The relation itself, `(key, temp)`, which `heap_create_with_catalog`
+    /// has also made by then: a CHECK may name it by `regclass` (RP-974).
+    /// Its oid is not assigned yet; cooking only judges the expression, and
+    /// the stored text resolves the name again when a row is checked.
+    static COOKING_RELATION: std::cell::RefCell<Option<(String, bool)>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 /// Run `f` with the row type of `def`, a table being created, resolvable.
@@ -39509,6 +39523,14 @@ fn with_cooking_rowtype<T>(def: &TableDef, f: impl FnOnce() -> T) -> T {
         }
     }
     let _restore = Restore(COOKING_ROWTYPE.with(|c| c.replace(Some((name, 0, fields)))));
+    struct RestoreRelation(Option<(String, bool)>);
+    impl Drop for RestoreRelation {
+        fn drop(&mut self) {
+            COOKING_RELATION.with(|c| *c.borrow_mut() = self.0.take());
+        }
+    }
+    let _relation =
+        RestoreRelation(COOKING_RELATION.with(|c| c.replace(Some((def.name.clone(), def.temp)))));
     f()
 }
 

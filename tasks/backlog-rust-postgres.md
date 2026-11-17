@@ -2794,14 +2794,6 @@ with ICU) with the `_SETUP` in `tests/backlog/test_rp_found_rp782.py`:
 
 Measured on a private PostgreSQL 15.19 cluster.
 
-- [ ] **A CHECK naming its own table by `regclass` is refused at CREATE
-      TABLE.** `create table t816 (x int, check (tableoid =
-      't816'::regclass))` is CREATE TABLE on PostgreSQL 15.19
-      (`cookConstraint` runs after the relation exists); here it is 42P01
-      `relation "t816" does not exist` at 14. `alter table ... add check`
-      over an existing table is taken.
-      Verify: tests/backlog/test_rp_found_rp816.py::test_a_checks_regclass_of_its_own_table_resolves_at_create
-      Backlog-ID: RP-974
 
 ## Found while working RP-860 (2026-11-14)
 
