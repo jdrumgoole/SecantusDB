@@ -2158,6 +2158,19 @@ impl PgHandler {
         Some((outer, inner, join, unique))
     }
 
+    /// A side that reads no column but its key is read index-only through
+    /// the key's index (`check_index_only`), its heap fetches cut by the
+    /// visibility map's all-visible fraction (`cost_index`); with
+    /// `enable_indexonlyscan` off it is a plain index scan (RP-978).
+    fn mark_key_only(&self, h: &mut HashSide, key_only: bool) {
+        h.key_only_read = key_only && !self.setting_is("enable_indexonlyscan", "off");
+        if h.key_only_read {
+            if let Some(k) = h.key_index.as_mut() {
+                k.index.visible = k.allvisfrac;
+            }
+        }
+    }
+
     pub(crate) fn hash_join_estimate(&self, sel: &secantus_pgplan::Select) -> Option<JoinEstimate> {
         let (a, b, more, filter, left_join, target_width) = self.joined_sides(sel)?;
         // A WHERE conjunct pushed into a side's scan (RP-365) is priced as
@@ -2174,7 +2187,7 @@ impl PgHandler {
             }
             let mut h =
                 self.hash_side_with(&p.table, &p.filter, &p.exprs, &p.field, &p.read, &p.above)?;
-            h.key_only_read = p.read.iter().all(|f| *f == p.field);
+            self.mark_key_only(&mut h, p.read.iter().all(|f| *f == p.field));
             // A side whose key is an expression: no statistics for it, so
             // `get_variable_numdistinct`'s 200 default, no MCVs and no
             // NULLs (`eqjoinsel`, `estimate_hash_bucket_stats`); not unique
@@ -2847,14 +2860,6 @@ impl PgHandler {
             crate::NarrowImplied::InnerKey => (implied.filter.clone(), true),
             crate::NarrowImplied::NoJoinClause => return None,
         };
-        if !redundant {
-            for pred in &filters {
-                if (pred.alias == a.0 && pred.col == a.1) || (pred.alias == b.0 && pred.col == b.1)
-                {
-                    return None;
-                }
-            }
-        }
         // A WHERE on a LEFT join's nullable side never reaches this path:
         // the narrow planner refuses it, and the general one plans it.
         let left_join = j.left_join;
@@ -2886,7 +2891,19 @@ impl PgHandler {
                 read.push(field.clone());
             }
             let filter = side_filter(table, alias)?;
-            self.hash_side(table, &filter, &field, &read, &above)
+            // A key's bounds filter its own scan, as on the joined-rows
+            // path ([`Self::hash_join_estimate`]); any other predicate on
+            // it puts a constant in its equivalence class (RP-363).
+            if !redundant
+                && !filter.is_empty()
+                && filter_names(&filter, &field)
+                && !bounds_only(&filter, &field)
+            {
+                return None;
+            }
+            let mut h = self.hash_side(table, &filter, &field, &read, &above)?;
+            self.mark_key_only(&mut h, read.iter().all(|f| *f == field));
+            Some(h)
         };
         // A self-join's two sides share a table; their aliases differ.
         if j.left.1 == j.right.1 {
@@ -7081,9 +7098,8 @@ struct HashSide {
     /// Its table was never analysed (RP-1019): no statistics for the key,
     /// so `mergejoinscansel` keeps its defaults and reads it whole.
     no_stats: bool,
-    /// Its scan reads no column but its key: an index on the key could
-    /// serve it index-only (`check_index_only`), which a parameterized
-    /// inner here does not model.
+    /// Its scan reads no column but its key: an index on the key serves
+    /// it index-only (`check_index_only`).
     key_only_read: bool,
 }
 
@@ -7939,7 +7955,7 @@ fn hash_join_of(
             unique_key_other_paths(&a, &b, &outer, &inner, rows, left_join, filter)?;
         // The parameterized nested loop, cheaper beyond the fuzz factor and
         // with no join filter left to check on each pair, is the plan.
-        if let Some((b_outer, param, startup)) = nest_param
+        if let Some((b_outer, index_only, param, startup)) = nest_param
             .filter(|_| other * 1.01 < t0 && more.is_empty() && filter.count == 0 && !expr_key)
         {
             let (first, second) = if b_outer { (&b, &a) } else { (&a, &b) };
@@ -7947,7 +7963,10 @@ fn hash_join_of(
                 first.scan,
                 param,
                 (startup, other, rows, width),
-                JoinPick::NestParam { b_outer },
+                JoinPick::NestParam {
+                    b_outer,
+                    index_only,
+                },
                 [first.index.clone(), second.key_index_name.clone()],
             ));
         }
@@ -8010,12 +8029,12 @@ fn merge_column(s: &HashSide) -> Option<secantus_pgplan::colstats::Column<'_>> {
 
 /// What [`unique_key_other_paths`] finds: the cheapest path's total, a
 /// merge over a presorted side where that is it, and a parameterized nested
-/// loop where that is it (`b_outer`, the inner scan's estimate, the join's
-/// startup).
+/// loop where that is it (`b_outer`, whether the inner reads index-only,
+/// the inner scan's estimate, the join's startup).
 type UniqueKeyPaths = (
     f64,
     Option<(secantus_pgplan::joincost::MergePlan, bool)>,
-    Option<(bool, Estimate, f64)>,
+    Option<(bool, bool, Estimate, f64)>,
 );
 
 /// The cheapest total of the merge joins and nested loops PostgreSQL's
@@ -8165,8 +8184,9 @@ fn unique_key_other_paths(
         _ => None,
     };
     // A nested loop whose inner is the parameterized index scan, with no
-    // Memoize over it: the plan `explain::price_param_nest_loop` draws.
-    // An inner that could be read index-only is not modelled.
+    // Memoize over it: the plan `explain::price_param_nest_loop` draws,
+    // index-only where the inner reads no column but its key
+    // (`check_index_only`).
     let nest_param = match best.method {
         JoinMethod::Other | JoinMethod::NestOuterB if !best.memoized && !left_join => {
             let b_outer = matches!(best.method, JoinMethod::NestOuterB);
@@ -8177,7 +8197,7 @@ fn unique_key_other_paths(
             };
             paths
                 .get(side)
-                .filter(|p| p.req_outer != 0 && p.indexed && !inner.key_only_read)
+                .filter(|p| p.req_outer != 0 && p.indexed)
                 .filter(|_| {
                     inner
                         .key_index
@@ -8187,6 +8207,7 @@ fn unique_key_other_paths(
                 .map(|p| {
                     (
                         b_outer,
+                        inner.key_only_read,
                         (p.startup, p.total, p.rows, inner.scan.3),
                         best.startup,
                     )
@@ -8242,6 +8263,7 @@ pub(crate) enum JoinPick {
     /// estimate is one scan's, as PostgreSQL prints it.
     NestParam {
         b_outer: bool,
+        index_only: bool,
     },
 }
 

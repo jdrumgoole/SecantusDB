@@ -6651,10 +6651,9 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "        Filter: (b = 'v9'::text)",
         ],
     ),
-    # Still open (RP-978): the parameterized inner read index-only, and a
-    # hashed side read through its index on a range of the key.
+    # The parameterized inner read index-only (RP-978, fixed).
     "a parameterized nested loop's inner read index-only": (
-        "RP-978",
+        "RP-978:fixed",
         _ANALYSED,
         "explain select e.b from e join k on k.a = e.a where e.a > 998",
         [
@@ -6665,6 +6664,8 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "        Index Cond: (a = e.a)",
         ],
     ),
+    # Still open (RP-978): a hashed side read through its index on a range
+    # of the key.
     "a range on the hashed side's key reads it through its index": (
         "RP-978",
         _ANALYSED,
@@ -7381,4 +7382,23 @@ def test_a_bushy_chain_whose_on_splits_runs_each_clause_where_it_lands(
         (1, 6, 4, 3),
         (1, 6, 5, 3),
         (1, 6, 5, 4),
+    ]
+
+
+@pytest.mark.backlog_fixed("RP-978")
+def test_vacuumed_parameterized_inner_reads_index_only(rust_pg: Any) -> None:
+    """A parameterized nested loop's inner, reading no column but its key,
+    was read index-only, its heap fetches cut by the visibility map
+    VACUUM set -- PostgreSQL 15.19's plan on a fresh cluster."""
+    steps = _ANALYSED + [
+        "vacuum k",
+        "vacuum e",
+        "explain select e.b from e join k on k.a = e.a where e.a > 998",
+    ]
+    assert run_autocommit(fresh_db(_dsn(rust_pg)), steps)[-1] == [
+        "Nested Loop  (cost=0.28..26.09 rows=2 width=3)",
+        "  ->  Seq Scan on e  (cost=0.00..17.50 rows=2 width=7)",
+        "        Filter: (a > 998)",
+        "  ->  Index Only Scan using k_pkey on k  (cost=0.28..4.29 rows=1 width=4)",
+        "        Index Cond: (a = e.a)",
     ]

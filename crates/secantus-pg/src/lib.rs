@@ -46430,7 +46430,10 @@ impl PgHandler {
                                 // A nested loop into the inner side's unique
                                 // key index, parameterized by the outer row
                                 // (RP-978).
-                                scan_estimate::JoinPick::NestParam { b_outer } => {
+                                scan_estimate::JoinPick::NestParam {
+                                    b_outer,
+                                    index_only,
+                                } => {
                                     let inner_key =
                                         explain::join_key_texts(sel).and_then(|(l, r)| {
                                             let k = if b_outer { l } else { r };
@@ -46450,7 +46453,7 @@ impl PgHandler {
                                                 index,
                                                 alias,
                                                 column,
-                                                index_only: false,
+                                                index_only,
                                                 read: Vec::new(),
                                                 memoize: None,
                                             },
