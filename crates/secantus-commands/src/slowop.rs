@@ -7,7 +7,7 @@
 //! are not persisted across a restart.
 
 use crate::util::ReplyOk;
-use bson::Document;
+use bson::{Bson, Document};
 
 use crate::CommandContext;
 use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
@@ -390,6 +390,12 @@ pub fn read_attributes(request: &Document, reply: &Document, ctx: &CommandContex
     let mut out = Document::new();
     out.insert("isFromUserConnection", true);
     let (db, coll) = line_target(name, request, reply, &ctx.db_name);
+    // An operation that ended before it acquired its collection names
+    // `<db>.$cmd` (RM-595).
+    let coll = coll.filter(|_| !ctx.unacquired);
+    if ctx.unacquired {
+        out.insert("ns", format!("{db}.$cmd"));
+    }
     let ok = reply.ok_number().unwrap_or(1.0) == 1.0;
     // The namespace [`attributes`] names, moved beneath a view the read
     // failed under.
@@ -397,6 +403,14 @@ pub fn read_attributes(request: &Document, reply: &Document, ctx: &CommandContex
         if let Some(ns) = crate::opdebug::beneath_view(ctx, &format!("{db}.{coll}")) {
             out.insert("ns", ns);
         }
+    }
+    // Or to the collection the command worked through (RM-596).
+    if let Some(ns) = &ctx.worked_through {
+        out.insert("ns", ns.clone());
+    }
+    // Or to the view an `$out` was refused for (RM-591).
+    if let Some(ns) = &ctx.refused_out_view {
+        out.insert("ns", ns.clone());
     }
     // Or to the buckets a time-series collection's DDL runs on (RM-484).
     let buckets = coll.and_then(|coll| crate::opdebug::buckets_of(ctx, name, db, coll));
@@ -443,6 +457,16 @@ pub fn read_attributes(request: &Document, reply: &Document, ctx: &CommandContex
             out.insert("queryFramework", framework);
         }
         spills(exec.is_some_and(|e| e.has_sort_stage), &mut out);
+        // How the read chose its plan (RM-599): mongod prints each flag
+        // only when it is true.
+        if let Some(planned) = ctx.planned {
+            if planned.from_multi_planner {
+                out.insert("fromMultiPlanner", true);
+            }
+            if planned.from_plan_cache {
+                out.insert("fromPlanCache", true);
+            }
+        }
         if let (true, Some(micros)) = (plans(name), ctx.planning_micros) {
             out.insert("planningTimeMicros", micros);
         }
@@ -521,7 +545,17 @@ pub fn read_attributes(request: &Document, reply: &Document, ctx: &CommandContex
     }
     out.insert("numYields", secantus_core::deadline::yields());
     out.insert("reslen", response_length(reply, ctx));
-    out.insert("locks", ctx.op_locks.clone().unwrap_or_default());
+    // A statement of a multi-document transaction runs on the transaction's
+    // stashed locker, so mongod's line prints `locks: {}` (its profile entry
+    // keeps the transaction's locks; measured 8.2.11 2026-11-07, RM-357).
+    let locks = if request.get("autocommit") == Some(&Bson::Boolean(false))
+        && !matches!(name, "commitTransaction" | "abortTransaction")
+    {
+        Document::new()
+    } else {
+        ctx.op_locks.clone().unwrap_or_default()
+    };
+    out.insert("locks", locks);
     if let Some(fc) = crate::opdebug::flow_control(ctx.flow_control_tickets) {
         out.insert("flowControl", fc);
     }
@@ -655,6 +689,17 @@ pub fn attributes(
         // namespace as the database alone (measured 8.2.11, RM-383).
         _ if matches!(name, "dropDatabase" | "dbStats" | "dbstats") => db.to_string(),
         Some(_) if matches!(name, "update" | "delete") => format!("{db}.$cmd"),
+        // These work through a collection their value does not name: a
+        // `filemd5` its root's chunks, a `rolesInfo` of any role the
+        // roles collection (`rolesInfo: 1` names `<db>.$cmd`; measured
+        // 8.2.11, RM-596).
+        None if name == "filemd5" => {
+            let root = request.get_str("root").unwrap_or("fs");
+            format!("{db}.{root}.chunks")
+        }
+        None if name == "rolesInfo" && !request.get(name).is_some_and(is_number) => {
+            "admin.system.roles".to_string()
+        }
         Some(coll) => format!("{db}.{coll}"),
         // A collectionless aggregate runs on its own namespace (measured
         // 8.2.11, 2026-11-09).
@@ -670,6 +715,13 @@ pub fn attributes(
     attr.insert("workingMillis", worked.as_millis() as i64);
     attr.insert("durationMillis", total.as_millis() as i64);
     crate::opdebug::reorder(attr, crate::opdebug::LINE_ORDER)
+}
+
+fn is_number(value: &Bson) -> bool {
+    matches!(
+        value,
+        Bson::Int32(_) | Bson::Int64(_) | Bson::Double(_) | Bson::Decimal128(_)
+    )
 }
 
 /// The line's `numInterruptChecks`, read once the operation's checks are

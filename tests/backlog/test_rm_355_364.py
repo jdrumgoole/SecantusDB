@@ -543,9 +543,6 @@ _DIVERGING_WRITES = {
     "findAndModify": lambda d: _w1(d).find_one_and_update({"_id": 1}, {"$set": {"q": 1}}),
     "findAndModify that removes": lambda d: _w1(_plain(d)).find_one_and_delete({"_id": 1}),
     "$out": lambda d: list(_w1(_plain(d)).aggregate([{"$match": {}}, {"$out": "o"}])),
-    # A statement of a transaction prints `{}`; its entry has the
-    # transaction's locks.
-    "insert in a transaction": lambda d: _in_transaction(d),
 }
 
 
@@ -562,6 +559,17 @@ def test_more_writes_report_mongods_locks(rust_mongo: Any, mongod_rs: Any, name:
     take yet."""
     answers = _write_locks(rust_mongo, mongod_rs, _DIVERGING_WRITES[name])
     assert answers["mongod"]
+    assert answers["rust"] == answers["mongod"]
+
+
+@pytest.mark.backlog_fixed("RM-357")
+def test_a_transaction_statement_line_prints_no_locks(rust_mongo: Any, mongod_rs: Any) -> None:
+    """mongod 8.2.11 prints `locks: {}` on the line of a statement of a
+    multi-document transaction, which runs on the transaction's stashed
+    locker (measured 2026-11-07). This server printed the statement's
+    global, database and collection IX."""
+    answers = _write_locks(rust_mongo, mongod_rs, _in_transaction)
+    assert answers["mongod"] == [("insert", {}, None)]
     assert answers["rust"] == answers["mongod"]
 
 
@@ -1103,11 +1111,6 @@ def _two_indexes(db: Any) -> None:
 
 _UNCOUNTED = {
     "find": ("find", _two_indexes, lambda d: list(d.c.find({"x": {"$gt": 1}, "y": 1}))),
-    "aggregate sorting its groups": (
-        "aggregate",
-        seed,
-        lambda d: list(d.c.aggregate([{"$group": {"_id": "$y"}}, {"$sort": {"_id": 1}}])),
-    ),
     "insert": (
         "insert",
         seed,
@@ -1132,14 +1135,13 @@ _UNCOUNTED = {
 def test_every_line_counts_its_interrupt_checks(rust_mongo: Any, mongod_rs: Any) -> None:
     """mongod 8.2.11's line for every command carries `numInterruptChecks`
     (measured 2026-11-09 and 2026-11-12, time-based yields off: a `find`
-    with two candidate plans 8, an `aggregate` sorting its groups 5, an
+    with two candidate plans 8, an
     unordered `insert` of two documents, one a duplicate key, 27, a
     retryable `findAndModify` 26, a `createIndexes` of twelve documents
     73). This server counts its reads with one candidate plan, its
     `insert`, `update` and `delete`, and the aggregates it models, and
     prints none here: mongod's planner checks once per index scan of every
-    plan it enumerates, its slot-based engine leaves a `$sort` after a
-    `$group` to the pipeline, a failed batch of inserts is inserted again a document at a time under
+    plan it enumerates, a failed batch of inserts is inserted again a document at a time under
     locks of its own, a `findAndModify` takes rounds this server does not
     (RM-357), and DDL checks at points this server does not check yet."""
     for label, (name, setup, op) in _UNCOUNTED.items():
@@ -1563,10 +1565,8 @@ def test_a_contested_aggregate_runs_its_cached_plan(rust_mongo: Any, mongod_rs: 
     "stage",
     [
         pytest.param({"$sort": {"z": 1}}, marks=pytest.mark.backlog_fixed("RM-363")),
-        # The group runs in SBE, whose plan cache replans as RM-340 measured:
-        # still open.
         pytest.param(
-            {"$group": {"_id": "$z", "n": {"$sum": 1}}}, marks=pytest.mark.backlog("RM-363")
+            {"$group": {"_id": "$z", "n": {"$sum": 1}}}, marks=pytest.mark.backlog_fixed("RM-363")
         ),
     ],
 )
@@ -1576,8 +1576,8 @@ def test_a_contested_aggregate_that_does_not_stream_counts_what_it_examined(
     """mongod 8.2.11's line for a contested `aggregate` that sorts or groups
     what its `$match` reads counts what the winner examined (133 keys and
     documents for both, measured 2026-11-13). This server read such a
-    pipeline whole through its store's router, and counted nothing; since
-    2026-11-16 a sorting one runs the trial's winner and counts it."""
+    pipeline whole through its store's router, and counted nothing, until
+    both ran the trial's winner after its trial and counted it (RM-363)."""
     answers = _contested_lines(
         rust_mongo,
         mongod_rs,
@@ -1871,15 +1871,126 @@ def _await_data_admissions(client: Any, is_mongod: bool) -> Any:
     return None
 
 
-@pytest.mark.backlog("RM-355")
+@pytest.mark.backlog_fixed("RM-355")
 def test_an_await_data_get_more_takes_mongods_execution_tickets(
     rust_mongo: Any, mongod_rs: Any
 ) -> None:
-    """mongod 8.2.11's `awaitData` getMore yields once for its wait, so its
+    """mongod 8.2.11's `awaitData` getMore yields twice for its wait, so its
     line counts 4 execution admissions for a 500 ms wait; this server's
-    wait took 24,845 (measured 2026-11-16)."""
+    wait took 24,845 (measured 2026-11-16) until 2026-11-17: a capped
+    tail's oplog position read 0, so the wait never blocked."""
     got = {
         "rust": _await_data_admissions(rust_mongo, False),
         "mongod": _await_data_admissions(mongod_rs, True),
     }
     assert got["rust"] == got["mongod"]
+
+
+def _filtered_await_data_admissions(client: Any, is_mongod: bool) -> Any:
+    """The `queues.execution` of a filtered `awaitData` getMore that a
+    write its filter rejects wakes, so it waits twice."""
+    import threading
+    import time
+
+    db = client[fresh("await")]
+    db.create_collection("c", capped=True, size=4096)
+    db.c.insert_one({"v": 1})
+    cursor = db.command(
+        "find", "c", filter={"v": {"$lt": 2}}, tailable=True, awaitData=True, batchSize=10
+    )["cursor"]
+    writer = threading.Thread(target=lambda: (time.sleep(0.2), db.c.insert_one({"v": 3})))
+    last = client.admin.command("getLog", "global")["log"][-1]
+    client.admin.command("profile", 0, slowms=-1 if is_mongod else 0)
+    try:
+        writer.start()
+        db.command("getMore", cursor["id"], collection="c", maxTimeMS=1000)
+    finally:
+        writer.join()
+        client.admin.command("profile", 0, slowms=100)
+    log = client.admin.command("getLog", "global")["log"]
+    log = log[log.index(last) + 1 :]
+    client.drop_database(db.name)
+    for raw in log:
+        entry = json.loads(raw)
+        command = entry.get("attr", {}).get("command", {})
+        if entry.get("msg") == "Slow query" and "getMore" in command:
+            return entry["attr"].get("queues", {}).get("execution")
+    return None
+
+
+@pytest.mark.backlog_fixed("RM-355")
+def test_an_await_data_get_more_woken_twice_takes_mongods_tickets(
+    rust_mongo: Any, mongod_rs: Any
+) -> None:
+    """mongod 8.2.11 yields twice for each wait, so a filtered tail a
+    rejected write wakes (two waits) counts 6 admissions; this server's
+    counted 24,000-odd until 2026-11-17, its wait rescanning in a loop."""
+    got = {
+        "rust": _filtered_await_data_admissions(rust_mongo, False),
+        "mongod": _filtered_await_data_admissions(mongod_rs, True),
+    }
+    assert got["rust"] == got["mongod"]
+
+
+def _update_admissions(client: Any, is_mongod: bool) -> Any:
+    """`queues.execution` of an `update` statement's line and its command's."""
+    db = client[fresh("upd")]
+    db.c.insert_many([{"_id": i, "v": 0} for i in range(3)])
+    last = client.admin.command("getLog", "global")["log"][-1]
+    client.admin.command("profile", 0, slowms=-1 if is_mongod else 0)
+    try:
+        db.command(
+            "update",
+            "c",
+            updates=[
+                {"q": {"_id": 0}, "u": {"$set": {"v": 1}}},
+                {"q": {"_id": 1}, "u": {"$set": {"v": 1}}},
+            ],
+        )
+    finally:
+        client.admin.command("profile", 0, slowms=100)
+    log = client.admin.command("getLog", "global")["log"]
+    log = log[log.index(last) + 1 :]
+    client.drop_database(db.name)
+    out = []
+    for raw in log:
+        entry = json.loads(raw)
+        attr = entry.get("attr", {})
+        if entry.get("msg") == "Slow query" and attr.get("type") in ("update", "command"):
+            out.append((attr.get("type"), attr.get("queues", {}).get("execution")))
+    return out
+
+
+@pytest.mark.backlog("RM-355")
+def test_an_update_statement_takes_mongods_execution_tickets(
+    rust_mongo: Any, mongod_rs: Any
+) -> None:
+    """mongod 8.2.11's `update` statement lets its locks go before its line
+    is written and takes a fresh ticket to read its statistics; this
+    server writes the line with the command's locks still held, so the
+    statement's line and its command's each count fewer admissions."""
+    got = {
+        "rust": _update_admissions(rust_mongo, False),
+        "mongod": _update_admissions(mongod_rs, True),
+    }
+    assert got["rust"] == got["mongod"]
+
+
+@pytest.mark.backlog_fixed("RM-363")
+def test_a_contested_group_run_again_counts_what_its_cached_plan_examined(
+    rust_mongo: Any, mongod_rs: Any
+) -> None:
+    """mongod 8.2.11 runs a contested `aggregate` that groups what its
+    `$match` reads in SBE; run twice, each line counts what its plan
+    examined and the plan cache holds the same entry. This server counted
+    nothing for either until the grouping front ran the trial's winner
+    (RM-363)."""
+    pipeline = [{"$match": _TWO_INDEXES}, {"$group": {"_id": "$z", "n": {"$sum": 1}}}]
+
+    def twice(db: Any) -> None:
+        for _ in range(2):
+            list(db.c.aggregate(pipeline, batchSize=50))
+
+    answers = _contested_lines(rust_mongo, mongod_rs, twice)
+    assert answers["mongod"][0][0][1].get("keysExamined") == 133
+    assert answers["rust"] == answers["mongod"]

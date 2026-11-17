@@ -110,7 +110,12 @@ pub(crate) fn open(ctx: &CommandContext, ask: &Ask) -> Result<Option<Opened>, Co
     let Some((mut cursor, indexes)) = build(storage, ask, false)? else {
         return Ok(None);
     };
-    cursor.summary = crate::explain::summary::plan_summary(ask.command, ctx);
+    // The plan the read ran: the trial's winner where there was one, which
+    // the catalog alone cannot say (RM-598); otherwise the catalog's plan.
+    if cursor.summary.is_none() {
+        cursor.summary = crate::explain::summary::plan_summary(ask.command, ctx);
+    }
+    let summary = cursor.summary.clone();
     cursor.budgets = crate::aggregate::budgets_of(ctx);
     // Under `notablescan` the read itself was checked when the command
     // planned it; the stages that read other collections are checked as
@@ -166,6 +171,7 @@ pub(crate) fn open(ctx: &CommandContext, ask: &Ask) -> Result<Option<Opened>, Co
             docs_examined: batch.docs_examined,
             cursor_id,
             exhausted: batch.exhausted,
+            plan_summary: summary,
             ..Default::default()
         },
     }))
@@ -342,6 +348,7 @@ fn build(
     // What the trial's winner returned in it is buffered when the command
     // runs, and the read goes on from there; the first buffer counts what
     // the trial examined.
+    let tried = trial.is_some();
     if let Some(trial) = trial {
         let _active = secantus_core::collation::activate(ask.collation);
         source
@@ -376,6 +383,11 @@ fn build(
     cursor.modelled = modelled && (per_batch || !sbe);
     cursor.counted = cursor.modelled;
     cursor.in_plan = in_plan;
+    // A plan chosen by trial is named as it ran (RM-598: mongod 8.2.11's
+    // line and plan cache entry both name the trial's winner).
+    if tried {
+        cursor.summary = crate::explain::summary::summary_of_plan(&plan, storage, ask.db, ask.coll);
+    }
     Ok(Some((cursor, indexes)))
 }
 
@@ -664,7 +676,7 @@ fn streams(stage: &Bson) -> bool {
     STREAMING_STAGES.contains(&name.as_str()) && only_kept_meta(spec)
 }
 
-fn mentions_meta(v: &Bson) -> bool {
+pub(crate) fn mentions_meta(v: &Bson) -> bool {
     match v {
         Bson::Document(d) => d.iter().any(|(k, v)| k == "$meta" || mentions_meta(v)),
         Bson::Array(items) => items.iter().any(mentions_meta),

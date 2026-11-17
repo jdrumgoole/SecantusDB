@@ -58,6 +58,12 @@ struct TailableFindProducer {
     projection: Option<Document>,
     let_vars: Document,
     collation: Option<secantus_core::collation::Collation>,
+    /// The oplog tail when the last scan began. Every insert into the
+    /// collection logs an entry, so a document the scan missed has a later
+    /// seq: an `awaitData` getMore waits for the oplog to pass this, and
+    /// sleeps until a write instead of rescanning (and re-taking an
+    /// execution ticket) in a loop (RM-355).
+    seen_seq: i64,
 }
 
 impl CursorProducer for TailableFindProducer {
@@ -65,6 +71,9 @@ impl CursorProducer for TailableFindProducer {
         if self.fatal.is_some() {
             return Vec::new();
         }
+        // Read before the scan, so a write that races it moves the tail past
+        // this and wakes the wait.
+        self.seen_seq = self.storage.oplog_tail_seq();
         // Capped rollover: if the doc we last returned has been evicted, the
         // cursor is lapped — mongod kills it with CappedPositionLost.
         if let Some(after) = self.after {
@@ -133,7 +142,7 @@ impl CursorProducer for TailableFindProducer {
     }
 
     fn position(&self) -> i64 {
-        0
+        self.seen_seq
     }
 
     fn invalidated(&self) -> bool {
@@ -1039,6 +1048,7 @@ fn find_body(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
             filter: filter.clone(),
             projection: projection.cloned(),
             let_vars: let_vars.clone(),
+            seen_seq: 0,
             collation: collation.clone(),
         });
         let cursor_id = cursors

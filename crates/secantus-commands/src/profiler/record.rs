@@ -268,6 +268,26 @@ fn refused_unprofiled(name: &str, reply: &Document) -> bool {
     }
     let code = reply.get_i32("code").unwrap_or(0);
     let msg = reply.get_str("errmsg").unwrap_or("");
+    // `distinct` takes its collection before it parses its request, so a
+    // field it refuses is profiled (measured 8.2.11, RM-607).
+    if name == "distinct" {
+        return false;
+    }
+    // Refusals mongod gives before it locks the database (so before it
+    // profiles): a `findAndModify` query naming an undefined `$$variable`,
+    // a `createIndexes` spec it cannot read, a capped `create` without its
+    // size, a write to a `system.` namespace it does not take, an `explain`
+    // of a command it cannot explain (measured 8.2.11, RM-607).
+    if matches!(
+        (name, code),
+        ("findAndModify" | "findandmodify", 17276)
+            | ("createIndexes", 9)
+            | ("create", 72)
+            | ("insert", 73)
+            | ("explain", 20)
+    ) {
+        return true;
+    }
     msg.starts_with("BSON field '")
         || msg.starts_with("Expected field ")
         || matches!(code, 40323 | 40324)
@@ -292,7 +312,7 @@ pub(crate) fn finish(
     let Some(mut pending) = ctx.profiling.take() else {
         return;
     };
-    if !pending.reached || pending.existed || refused_unprofiled(name, reply) {
+    if !pending.reached || pending.existed || ctx.unacquired || refused_unprofiled(name, reply) {
         return;
     }
     if let Some(ns) = noted_ns {
@@ -1653,6 +1673,14 @@ mod tests {
     #[test]
     fn a_failed_rename_is_not_profiled() {
         assert!(!refused_unprofiled("renameCollection", &doc! {"ok": 1.0}));
+        // RM-607: a distinct's field refusal is profiled; an unreadable
+        // createIndexes spec is not.
+        let field = doc! {"ok": 0.0, "code": 40415, "errmsg": "BSON field 'distinctCommandRequest.bogus' is an unknown field."};
+        assert!(!refused_unprofiled("distinct", &field));
+        assert!(refused_unprofiled(
+            "createIndexes",
+            &doc! {"ok": 0.0, "code": 9, "errmsg": "Error in specification"}
+        ));
         for (code, msg) in [
             (26_i32, "Source collection b.nope does not exist"),
             (48, "target namespace exists"),

@@ -673,6 +673,9 @@ pub fn aggregate(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     let mut read_pipeline: Vec<Bson> = Vec::new();
     // Whether the leading `$sort` blocks, for the pipeline run below.
     let mut leading_guard: Option<secantus_core::aggregate::LeadingSort> = None;
+    // The pipeline is a `$group` mongod's slot-based engine runs, read
+    // through its cursor stage by a `$sort` (RM-360).
+    let mut sorted_after_sbe = false;
     // Fetch the input documents + decide the remaining pipeline.
     let (ns, input, working_pipeline): (String, Vec<Document>, Vec<Bson>) = match &coll {
         Some(c) => {
@@ -685,9 +688,12 @@ pub fn aggregate(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
             // namespace this server derives (`system.views`, a time-series
             // collection's buckets) is listed as the collection mongod
             // keeps, not read as the view it is here.
-            let derived = first_stage_has(&pipeline, crate::list_catalog::STAGE)
-                && (c == "system.views"
-                    || crate::ts_buckets::bucketed(storage, &ctx.db_name, c).is_some());
+            // A `$collStats` of a view reports the view's own namespace, never
+            // resolved to the collection beneath it (RM-590, measured 8.2.11).
+            let derived = first_stage_has(&pipeline, "$collStats")
+                || first_stage_has(&pipeline, crate::list_catalog::STAGE)
+                    && (c == "system.views"
+                        || crate::ts_buckets::bucketed(storage, &ctx.db_name, c).is_some());
             let asked: &str = c;
             let (base_coll, mut pipeline) = if derived {
                 (c.clone(), pipeline)
@@ -980,9 +986,13 @@ pub fn aggregate(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
                                 limit: front.limit,
                                 sort,
                                 projection: front.projection.as_ref(),
-                                // A front SBE runs keeps its plan cache's
-                                // own replanning: read as before.
-                                cached: !sbe_read,
+                                // A front SBE runs is tried through the
+                                // plan cache too (RM-363), but one that
+                                // takes a skip or a limit keeps its read:
+                                // its entry's reads are the trial's to
+                                // that limit, which this read does not
+                                // bound (RM-340).
+                                cached: !sbe_read || (front.skip == 0 && front.limit == 0),
                                 distinct: None,
                                 sbe: sbe_read,
                             },
@@ -1048,6 +1058,17 @@ pub fn aggregate(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
                     collation.as_ref(),
                 ) {
                     secantus_core::deadline::pipeline_counted();
+                } else {
+                    sorted_after_sbe = c == asked
+                        && crate::ts_buckets::bucketed(storage, &ctx.db_name, c).is_none()
+                        && sort_after_sbe_group(
+                            storage,
+                            &ctx.db_name,
+                            c,
+                            &read_pipeline,
+                            hint,
+                            collation.as_ref(),
+                        );
                 }
                 // The plan the pipeline's first read runs uses its indexes
                 // once (a `$lookup`'s reads count none: measured 8.2.11).
@@ -1259,6 +1280,40 @@ pub fn aggregate(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
             loads = Some(stage);
         }
     }
+    // A `$sort` after a `$group` mongod's slot-based engine runs reads the
+    // group's output through the cursor stage, which takes the global lock
+    // for each buffer it loads (32 documents, then twice as many each time,
+    // until one comes back short); the `$sort` pulls every document through
+    // the cursor stage and one more that finds the end, then passes each on
+    // with a `getNext`, and one more finds its end when the batch is not
+    // filled -- each `getNext` a tick of the pipeline's interrupt checker
+    // (RM-360, measured 8.2.11 2026-11-17).
+    let mut ticks_left = None;
+    if sorted_after_sbe && !crate::explain::order::is_uncounted() && !doc.contains_key("autocommit")
+    {
+        let (mut loaded, mut asked) = (0usize, CURSOR_STAGE_FIRST_BUFFER);
+        loop {
+            crate::lock_manager::let_statement_ticket_go();
+            crate::lock_manager::global_read()?;
+            loaded += asked;
+            if loaded > total {
+                break;
+            }
+            asked *= 2;
+        }
+        let wanted = if batch_size < 0 {
+            DEFAULT_BATCH_SIZE as usize
+        } else {
+            batch_size as usize
+        };
+        let found_end = first_batch.len() < wanted;
+        secantus_core::deadline::resume_ticks(secantus_core::deadline::FRESH_TICKS);
+        secantus_core::deadline::tick_stages(
+            (total + 1 + first_batch.len() + usize::from(found_end)) as u64,
+        )?;
+        secantus_core::deadline::pipeline_counted();
+        ticks_left = Some(secantus_core::deadline::ticks_to_check());
+    }
     // Every document was read for the first batch: the cursor's `getMore`s
     // name the command that opened it and repeat its plan (RM-400).
     if cursor_id != 0 {
@@ -1269,7 +1324,13 @@ pub fn aggregate(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
             c.plan_summary = plan_summary;
             c.has_sort_stage = has_sort_stage;
             c.loads = loads;
+            c.ticks = ticks_left;
         });
+        // Its `getMore`s read the documents the cursor stage loaded, and
+        // take no lock of their own (RM-360).
+        if ticks_left.is_some() {
+            ctx.cursors()?.set_locks_internally(cursor_id);
+        }
     }
     // `batchSize: 0` asks for the cursor and no documents, and mongod opens
     // one even over nothing -- a missing collection included.
@@ -1734,9 +1795,10 @@ fn apply_source_stage(
     vec![row]
 }
 
-/// Atlas-only aggregation stages SecantusDB can't provide — rejected with the
-/// Atlas message (`CommandNotSupported`, 115) rather than the generic
-/// unrecognized-stage error. Mirrors `aggregate._ATLAS_ONLY_STAGES`.
+/// Atlas-only aggregation stages SecantusDB can't provide. mongod 8.2.11 with
+/// no `mongot` parses the whole pipeline (a later unknown stage is still
+/// 40324) and then refuses these as they run with 31082 (SearchNotEnabled),
+/// in the message `atlas_stage_error` picks (RM-605).
 const ATLAS_STAGES: &[&str] = &[
     "$listSearchIndexes",
     "$search",
@@ -1755,9 +1817,33 @@ pub const PIPELINE_ELEMENT_MSG: &str = "Each element of the 'pipeline' array mus
 pub const STAGE_ARITY_MSG: &str =
     "A pipeline stage specification object must contain exactly one field.";
 
+/// mongod 8.2.11's refusal of the search-index commands and the
+/// `$listSearchIndexes` stage without `mongot` (code 31082).
 pub const SEARCH_INDEX_ATLAS_MSG: &str = "Using Atlas Search Database Commands and the \
 $listSearchIndexes aggregation stage requires additional configuration. Please connect to Atlas \
-or an Atlas-compatible deployment to use this feature.";
+or an AtlasCLI local deployment to enable. For more information on how to connect, see \
+https://dochub.mongodb.org/core/atlas-cli-deploy-local-reqs.";
+
+/// mongod 8.2.11's refusal of `$search`, `$searchMeta` and `$vectorSearch`
+/// without `mongot` (code 31082). The missing space after "enable." is
+/// mongod's own.
+pub const SEARCH_STAGE_ATLAS_MSG: &str = "Using $search and $vectorSearch aggregation stages \
+requires additional configuration. Please connect to Atlas or an AtlasCLI local deployment to \
+enable.For more information on how to connect, see \
+https://dochub.mongodb.org/core/atlas-cli-deploy-local-reqs.";
+
+/// The SearchNotEnabled (31082) refusal of a search-index command or stage.
+pub fn search_not_enabled(msg: &str) -> CommandError {
+    CommandError::new(31082, "SearchNotEnabled", msg)
+}
+
+fn atlas_stage_error(name: &str) -> CommandError {
+    search_not_enabled(if name == "$listSearchIndexes" {
+        SEARCH_INDEX_ATLAS_MSG
+    } else {
+        SEARCH_STAGE_ATLAS_MSG
+    })
+}
 
 /// Whether `name` is a recognised aggregation stage (the set the Python
 /// `aggregate._STAGES` registry recognises). Keep in sync with that set.
@@ -1814,7 +1900,7 @@ pub(crate) fn recognized_stage(name: &str) -> bool {
 }
 
 /// Up-front pipeline stage-name validation (mongod validates at parse time,
-/// before any document flows). An Atlas-only stage → `CommandNotSupported` (115);
+/// before any document flows). An Atlas-only stage → SearchNotEnabled (31082) once the rest parses;
 /// an unrecognised single-key stage → `Location40324`. Malformed stage shapes
 /// (non-document / empty / multi-key) are left to the engine path. Mirrors
 /// `aggregate.validate_stage_names`.
@@ -2166,12 +2252,48 @@ fn lite_parse_pipeline(pipeline: &[Bson], db: &str) -> Result<(), CommandError> 
         if name == "$queryStats" {
             validate_query_stats(d.get(name))?;
         }
-        lookups_lite_parse(std::slice::from_ref(stage), db)?;
+        if name == "$lookup" {
+            lookup_lite_parse(d.get(name), db)?;
+        }
+        if name == "$unionWith" {
+            union_with_lite_parse(d.get(name))?;
+        }
+        // A `$facet`'s, a `$lookup`'s and a `$unionWith`'s pipeline is a
+        // `LiteParsedPipeline` of its own, built as its stage is read: an
+        // unknown stage there is 40324 as the command parses (RM-603).
+        for (_, sub, _) in sub_pipelines(stage) {
+            lite_parse_pipeline(sub, db)?;
+        }
     }
     Ok(())
 }
 
+/// What mongod's `$unionWith` refuses as it first reads its spec: a
+/// `pipeline` that is not an array of documents (14). It used to be read
+/// only where it was an array, and `pipeline: 1` ran the union with no
+/// sub-pipeline (RM-603, measured 8.2.11).
+fn union_with_lite_parse(spec: Option<&Bson>) -> Result<(), CommandError> {
+    let Some(Bson::Document(spec)) = spec else {
+        return Ok(());
+    };
+    match spec.get("pipeline") {
+        None => Ok(()),
+        Some(Bson::Array(stages)) if stages.iter().all(|s| matches!(s, Bson::Document(_))) => {
+            Ok(())
+        }
+        Some(Bson::Array(_)) => Err(CommandError::new(14, "TypeMismatch", PIPELINE_ELEMENT_MSG)),
+        Some(_) => Err(CommandError::new(
+            14,
+            "TypeMismatch",
+            "A pipeline must be an array of objects",
+        )),
+    }
+}
+
 pub(crate) fn validate_stage_names(pipeline: &[Bson], db: &str) -> Result<(), CommandError> {
+    // An Atlas stage parses and is refused as it runs, after the rest of the
+    // pipeline has parsed (RM-605).
+    let mut atlas: Option<&str> = None;
     for stage in pipeline {
         // Both of these used to `continue`, so a malformed element sailed past
         // validation: `pipeline: [42]` reached execution and surfaced as a bare
@@ -2184,11 +2306,15 @@ pub(crate) fn validate_stage_names(pipeline: &[Bson], db: &str) -> Result<(), Co
         }
         let name = stage_name(stage);
         if ATLAS_STAGES.contains(&name) {
-            return Err(CommandError::new(
-                115,
-                "CommandNotSupported",
-                SEARCH_INDEX_ATLAS_MSG,
-            ));
+            if name == "$search" && !matches!(d.get(name), Some(Bson::Document(_))) {
+                return Err(CommandError::new(
+                    10065,
+                    "Location10065",
+                    "invalid parameter: expected an object ($search)",
+                ));
+            }
+            atlas.get_or_insert(name);
+            continue;
         }
         if !recognized_stage(name) && !crate::hybrid::is_prepared_stage(name) {
             return Err(CommandError::new(
@@ -2223,7 +2349,10 @@ pub(crate) fn validate_stage_names(pipeline: &[Bson], db: &str) -> Result<(), Co
         lookups_lite_parse(std::slice::from_ref(stage), db)?;
         nested_query_stats_specs(stage)?;
     }
-    Ok(())
+    match atlas {
+        Some(name) => Err(atlas_stage_error(name)),
+        None => Ok(()),
+    }
 }
 
 /// What mongod's `$lookup` refuses as it first reads the stage, before any
@@ -2713,17 +2842,25 @@ fn validate_set_window_fields(stage: &str, spec: Option<&Bson>) -> Result<(), Co
     let Some(spec) = spec.and_then(Bson::as_document) else {
         return Ok(()); // shape errors are the engine's to report
     };
-    if let Some(unknown) = spec
-        .keys()
-        .find(|k| !k.starts_with('$') && !SET_WINDOW_FIELDS_KNOWN.contains(&k.as_str()))
-    {
-        return Err(CommandError::new(
-            40415,
-            "IDLUnknownField",
-            format!("BSON field '{stage}.{unknown}' is an unknown field."),
-        ));
+    // The IDL types each field as it reads it, so a wrong type and an
+    // unknown field are reported in document order (RM-604).
+    for (field, value) in spec {
+        if let Some((code, msg)) =
+            crate::argtypes::window_stage_field_type_problem("$setWindowFields", field, value)
+        {
+            let msg = msg.replacen("$setWindowFields", stage, 1);
+            return Err(CommandError::new(code, "TypeMismatch", msg));
+        }
+        if !field.starts_with('$') && !SET_WINDOW_FIELDS_KNOWN.contains(&field.as_str()) {
+            return Err(CommandError::new(
+                40415,
+                "IDLUnknownField",
+                format!("BSON field '{stage}.{field}' is an unknown field."),
+            ));
+        }
     }
-    if !spec.contains_key("output") {
+    // A null `output` is an absent one.
+    if matches!(spec.get("output"), None | Some(Bson::Null)) {
         return Err(CommandError::new(
             40414,
             "IDLFailedToParse",
@@ -6511,6 +6648,35 @@ mod malformed_pipeline_tests {
     use super::*;
     use bson::doc;
 
+    /// A nested pipeline is lite-parsed with the command's own (RM-603,
+    /// measured mongod 8.2.11).
+    #[test]
+    fn nested_pipelines_are_lite_parsed() {
+        let check = |stage: Document| {
+            lite_parse_pipeline(&[Bson::Document(stage)], "db")
+                .err()
+                .map(|e| (e.code, e.errmsg))
+        };
+        let unknown = Some((40324, "Unrecognized pipeline stage name: '$bogus'".into()));
+        assert_eq!(check(doc! {"$facet": {"a": [{"$bogus": 1}]}}), unknown);
+        assert_eq!(
+            check(doc! {"$lookup": {"from": "c", "as": "x", "pipeline": [{"$bogus": 1}]}}),
+            unknown
+        );
+        assert_eq!(
+            check(doc! {"$unionWith": {"coll": "c", "pipeline": [{"$bogus": 1}]}}),
+            unknown
+        );
+        assert_eq!(
+            check(doc! {"$unionWith": {"coll": "c", "pipeline": 1}}),
+            Some((14, "A pipeline must be an array of objects".into()))
+        );
+        assert_eq!(
+            check(doc! {"$unionWith": {"coll": "c", "pipeline": [{"$match": {}}]}}),
+            None
+        );
+    }
+
     /// Values probed against real mongod (6.0.16 and 8.3.4 agree): every
     /// non-document element of `pipeline` is 14 TypeMismatch with one wording.
     #[test]
@@ -7076,4 +7242,35 @@ mod documents_argument_tests {
             );
         }
     }
+}
+
+/// The documents mongod's cursor stage loads into its first buffer.
+const CURSOR_STAGE_FIRST_BUFFER: usize = 32;
+
+/// Whether `pipeline` is a `$group` (and the stages before it) that mongod's
+/// slot-based engine runs, followed by nothing but a `$sort` (RM-360).
+fn sort_after_sbe_group(
+    storage: &dyn crate::storage::Storage,
+    db: &str,
+    coll: &str,
+    pipeline: &[Bson],
+    hint: Option<&Bson>,
+    collation: Option<&secantus_core::collation::Collation>,
+) -> bool {
+    let hoisted = crate::explain::hoist::hoist_runnable(pipeline);
+    let Some(pushed) = crate::explain::sbe_pushdown(storage, db, coll, &hoisted, hint, collation)
+    else {
+        return false;
+    };
+    let name = |s: &Bson| {
+        s.as_document()
+            .and_then(|d| d.keys().next())
+            .map_or(String::new(), String::clone)
+    };
+    pushed > 0
+        && hoisted.len() == pushed + 1
+        && name(&hoisted[pushed - 1]) == "$group"
+        && name(&hoisted[pushed]) == "$sort"
+        && !crate::agg_meta::reads_sort_key(&hoisted[pushed])
+        && !crate::agg_stream::mentions_meta(&hoisted[pushed])
 }

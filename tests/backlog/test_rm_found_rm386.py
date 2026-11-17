@@ -83,7 +83,7 @@ _CREATE_AND_DB_STATS = {
 }
 
 
-@pytest.mark.backlog("RM-602")
+@pytest.mark.backlog_fixed("RM-602")
 def test_create_and_db_stats_refused_as_they_parse_never_run(
     rust_mongo: Any, mongod_rs: Any
 ) -> None:
@@ -92,8 +92,8 @@ def test_create_and_db_stats_refused_as_they_parse_never_run(
     not a connection's first command (6788700), writes no `Slow query` line
     and no profile entry. A `listDatabases` on another database than
     `admin` is refused once it has parsed: logged, not counted. This server
-    parses these inside the run, so it counts each, and logs the first
-    seven."""
+    parsed these inside the run, so it counted each, and logged the first
+    seven, until RM-602 parsed them ahead of the run."""
     answers = {
         name: (_ran(rust_mongo, False, on, cmd), _ran(mongod_rs, True, on, cmd))
         for name, (on, cmd) in _CREATE_AND_DB_STATS.items()
@@ -125,13 +125,14 @@ def _nested_pipelines(client: Any) -> dict:
     }
 
 
-@pytest.mark.backlog("RM-603")
+@pytest.mark.backlog_fixed("RM-603")
 def test_a_nested_pipeline_is_parsed_with_the_command(rust_mongo: Any, mongod_rs: Any) -> None:
     """mongod 8.2.11 parses the pipeline of a `$facet`, a `$lookup` and a
     `$unionWith` as it parses the command's own: an unknown stage there is
     40324, and a `$unionWith` `pipeline` that is not an array is 14. This
-    server answers the first three with BadValue (2, "not supported by the
-    Rust server") and runs the fourth, answering ok."""
+    server answered the first three with BadValue (2, "not supported by the
+    Rust server") and ran the fourth, answering ok, until RM-603 lite-parsed
+    the nested pipelines with the command's own."""
     unknown = ("err", 40324, "Unrecognized pipeline stage name: '$bogus'")
     expected = {
         "facet-unknown-stage": unknown,
@@ -161,14 +162,14 @@ def _wrong_typed_stage_fields(client: Any) -> dict:
     }
 
 
-@pytest.mark.backlog("RM-604")
+@pytest.mark.backlog_fixed("RM-604")
 def test_a_stage_field_of_the_wrong_type_is_a_type_mismatch(
     rust_mongo: Any, mongod_rs: Any
 ) -> None:
     """mongod 8.2.11 refuses a `$setWindowFields` `output`, a `$densify`
     `field` and a `$fill` `output` of the wrong type with 14, naming the
-    field; this server answers BadValue (2), "aggregation pipeline uses a
-    stage or operator not supported by the Rust server"."""
+    field; this server answered BadValue (2), "aggregation pipeline uses a
+    stage or operator not supported by the Rust server", until RM-604."""
     expected = {
         "set-window-fields-output": (
             "err",
@@ -203,11 +204,11 @@ def _atlas_stages(client: Any) -> dict:
     }
 
 
-@pytest.mark.backlog("RM-605")
+@pytest.mark.backlog_fixed("RM-605")
 def test_an_atlas_stage_is_refused_as_mongod_refuses_it(rust_mongo: Any, mongod_rs: Any) -> None:
     """mongod 8.2.11 with no `mongot` refuses `$search`, `$vectorSearch` and
     `$listSearchIndexes` as they run with 31082 (SearchNotEnabled), in two
-    messages of its own; this server answers 115 (CommandNotSupported) with
+    messages of its own; this server answered 115 (CommandNotSupported) with
     one message, the wording of `$listSearchIndexes`'s from an older
     mongod."""
     search = (
@@ -238,18 +239,24 @@ def _get_more_int_id(client: Any) -> tuple:
     db = client.rm386g
     client.drop_database(db.name)
     db.c.insert_one({"_id": 1})
-    return mongo_answer(lambda: db.command({"getMore": 5, "collection": "c"}))
+    return (
+        mongo_answer(lambda: db.command({"getMore": 5, "collection": "c"})),
+        mongo_answer(lambda: db.command({"getMore": 1})),
+    )
 
 
-@pytest.mark.backlog("RM-606")
+@pytest.mark.backlog_fixed("RM-606")
 def test_a_get_more_takes_an_int_cursor_id(rust_mongo: Any, mongod_rs: Any) -> None:
-    """mongod 8.2.11 reads a `getMore` cursor id given as an int as the
-    cursor id (`{getMore: 1}` with no `collection` is refused for the
-    missing field, not the id's type); this server refuses the int with 14,
-    "BSON field 'getMore.getMore' is the wrong type 'int', expected type
-    'long'"."""
-    assert _get_more_int_id(rust_mongo) == _get_more_int_id(mongod_rs)
-    assert _get_more_int_id(mongod_rs)[:2] == ("err", 43)
+    """mongod 8.2.11 refuses a `getMore` cursor id given as an int for its
+    type (14, "... expected type 'long'"), as this server did; but its IDL
+    checks the cursor id LAST, so `{getMore: 1}` with no `collection` is
+    refused for the missing field (40414). This server refused the int's
+    type first. (The item as filed said mongod takes the int; it does
+    not -- re-measured 2026-11-17.)"""
+    rust, mongod = _get_more_int_id(rust_mongo), _get_more_int_id(mongod_rs)
+    assert rust == mongod
+    assert mongod[0][:2] == ("err", 14)
+    assert mongod[1][:2] == ("err", 40414)
 
 
 # ------------------------------------- refused commands' profile entries --
@@ -275,7 +282,7 @@ _PROFILED = {
 }
 
 
-@pytest.mark.backlog("RM-607")
+@pytest.mark.backlog_fixed("RM-607")
 def test_a_command_refused_as_it_runs_is_profiled_as_mongod_profiles_it(
     rust_mongo: Any, mongod_rs: Any
 ) -> None:
@@ -284,8 +291,9 @@ def test_a_command_refused_as_it_runs_is_profiled_as_mongod_profiles_it(
     or with an undefined `$$variable`, no `createIndexes` refused for a
     spec, no `create` refused for its capped options, no write to a
     `system.` namespace it does not take, no `explain` of an `insert`, no
-    `dbStats` of `scale: 0`. This server does each the other way. (Each is
-    run, and logged, on both.)"""
+    `dbStats` of `scale: 0`. This server did the distinct, findAndModify
+    `$$variable`, createIndexes, create, system-namespace and explain cases
+    the other way until RM-607. (Each is run, and logged, on both.)"""
     answers = {
         name: (_ran(rust_mongo, False, on, cmd)[3], _ran(mongod_rs, True, on, cmd)[3])
         for name, (on, cmd) in _PROFILED.items()
@@ -298,14 +306,14 @@ def test_a_command_refused_as_it_runs_is_profiled_as_mongod_profiles_it(
 # ------------------------------------ a failed update statement's lines --
 
 
-@pytest.mark.backlog("RM-608")
+@pytest.mark.backlog_fixed("RM-608")
 def test_an_update_with_a_failed_statement_writes_two_lines(
     rust_mongo: Any, mongod_rs: Any
 ) -> None:
     """mongod 8.2.11 writes two `Slow query` lines for an `update` whose one
     statement fails as it parses its update (`{$bogus: {a: 1}}`, a write
     error in an `ok: 1` reply): the statement's and the command's. This
-    server writes one."""
+    server wrote the command's alone until RM-608."""
 
     def run(client: Any, db: Any) -> None:
         _command(

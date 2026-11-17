@@ -32,6 +32,11 @@ tick; the checker lives with the cursor, so a `getMore` goes on counting
 where the batch before stopped. Such a `getMore` takes no lock of its own,
 and so reads no storage statistics unless it filled a buffer.
 
+A `$sort` after a `$group` the slot-based engine runs reads the groups
+through the cursor stage in the same way: a global IS per buffer, and a
+tick for each document the `$sort` pulls from it, each it passes on, and
+each end found.
+
 What this server does not count yet prints no field, and is RM-360's
 remainder: plans with several candidates, the pipelines it does not model,
 `findAndModify`, DDL, and the write concerns whose waits are not modelled
@@ -84,6 +89,18 @@ def _pipeline(pipeline: list, **kwargs: Any) -> Callable[[Any], Any]:
 
 
 _ADD = {"$addFields": {"q": 1}}
+
+_GROUP_SORT = [{"$group": {"_id": "$y"}}, {"$sort": {"_id": 1}}]
+
+
+def _groups(n: int) -> Callable[[Any], Any]:
+    """`n` documents over an index on `x`, each its own group of `y`."""
+
+    def setup(db: Any) -> None:
+        db.c.insert_many([{"_id": i, "x": i, "y": i} for i in range(n)])
+        db.c.create_index("x")
+
+    return setup
 
 
 #: label -> (setup, operation, the commands whose lines are compared).
@@ -285,6 +302,38 @@ PIPELINES: dict[str, tuple[Callable[[Any], Any], Callable[[Any], Any], tuple[str
     "aggregate with a $filter stopped by its limit at 10": (
         _arrays(50),
         _pipeline([{"$addFields": {"m": {"$filter": {"input": "$a", "cond": True, "limit": 10}}}}]),
+        _PIPELINE,
+    ),
+    # A `$sort` after a `$group` mongod's slot-based engine runs reads the
+    # groups through the cursor stage: a global IS per buffer it loads, and
+    # a tick per `getNext` of the `$sort` and of the cursor stage beneath it
+    # (RM-360, measured 8.2.11 2026-11-17: 32 groups 6, 96 groups 8, 300
+    # groups 12 and a `getMore` of 3).
+    "aggregate sorting three groups": (seed, _pipeline(_GROUP_SORT), _PIPELINE),
+    "aggregate sorting 32 groups, one buffer full": (
+        _groups(32),
+        _pipeline(_GROUP_SORT),
+        _PIPELINE,
+    ),
+    "aggregate sorting 96 groups": (_groups(96), _pipeline(_GROUP_SORT), _PIPELINE),
+    "aggregate sorting 101 groups, a first batch full": (
+        _groups(101),
+        _pipeline(_GROUP_SORT),
+        _PIPELINE,
+    ),
+    "aggregate sorting 400 groups, and its getMore": (
+        _groups(400),
+        _pipeline(_GROUP_SORT),
+        _PIPELINE,
+    ),
+    "aggregate sorting 300 groups in small batches": (
+        _groups(300),
+        _pipeline(_GROUP_SORT, batchSize=50),
+        _PIPELINE,
+    ),
+    "aggregate sorting the groups of a $match": (
+        seed,
+        _pipeline([{"$match": {"x": {"$gt": 2}}}, *_GROUP_SORT]),
         _PIPELINE,
     ),
     "aggregate with a $reduce of 50": (

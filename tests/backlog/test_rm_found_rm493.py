@@ -27,12 +27,12 @@ def _answer(client: Any, expr: Any) -> Any:
         return ("error", e.code, (e.details or {}).get("errmsg"))
 
 
-@pytest.mark.backlog("RM-594")
+@pytest.mark.backlog_fixed("RM-594")
 def test_a_bare_dollar_is_no_field_path(rust_mongo: Any, mongod_rs: Any) -> None:
     """mongod 8.2.11 refuses `"$"` as an operand when it parses it (16872
-    "'$' by itself is not a valid FieldPath"); this server reads it as a
-    missing field: `{$toUpper: "$"}` is `""`, `{$concat: ["$", "x"]}` is
-    `null`, and the bare `"$"` drops the field."""
+    "'$' by itself is not a valid FieldPath"); this server read it as a
+    missing field: `{$toUpper: "$"}` was `""`, `{$concat: ["$", "x"]}` was
+    `null`, and the bare `"$"` dropped the field."""
     for expr in _SHAPES:
         theirs = _answer(mongod_rs, expr)
         assert theirs[:2] == ("error", 16872)
