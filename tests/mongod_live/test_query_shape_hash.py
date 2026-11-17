@@ -711,7 +711,38 @@ def test_an_expression(servers: Any, expression: Any) -> None:
     _check(servers, SON([("aggregate", "c"), ("pipeline", pipeline), ("cursor", {})]))
 
 
-@pytest.mark.parametrize("pipeline", STAGES, ids=[str(p) for p in STAGES])
+#: Shaped (RM-358) but not run by `test_query_stats.py`: this server does
+#: not run them as mongod does yet (RM-717, RM-718).
+UNRUN_STAGES: list[list] = [
+    # `$out` to a time-series collection (RM-358).
+    [
+        {
+            "$out": {
+                "db": "t",
+                "coll": "ts",
+                "timeseries": {"timeField": "t", "metaField": "m", "granularity": "hours"},
+            }
+        }
+    ],
+    [{"$out": {"db": "t", "coll": "ts2", "timeseries": {"timeField": "t"}}}],
+    # `from: {db, coll}` in `local` / `config` (RM-358).
+    [{"$lookup": {"from": {"db": "local", "coll": "oplog.rs"}, "as": "j", "pipeline": []}}],
+    [
+        {
+            "$lookup": {
+                "from": {"db": "config", "coll": "cache.chunks.t.c"},
+                "localField": "x",
+                "foreignField": "k",
+                "as": "j",
+            }
+        }
+    ],
+]
+
+
+@pytest.mark.parametrize(
+    "pipeline", STAGES + UNRUN_STAGES, ids=[str(p) for p in STAGES + UNRUN_STAGES]
+)
 def test_a_stage(servers: Any, pipeline: list) -> None:
     _check(servers, SON([("aggregate", "c"), ("pipeline", pipeline), ("cursor", {})]))
 
@@ -753,6 +784,17 @@ def test_a_collectionless_aggregate(servers: Any) -> None:
         {},
         {"fullDocument": "updateLookup", "fullDocumentBeforeChange": "whenAvailable"},
         {"startAtOperationTime": Timestamp(5, 1), "showExpandedEvents": True},
+        # The other flags, in mongod's order whatever the request's (RM-358).
+        {"showSystemEvents": True},
+        {"showRawUpdateDescription": True, "fullDocument": "required"},
+        {
+            "showRawUpdateDescription": True,
+            "allowToRunOnSystemNS": False,
+            "allowToRunOnConfigDB": False,
+            "showExpandedEvents": True,
+            "showSystemEvents": False,
+            "showMigrationEvents": False,
+        },
     ],
     ids=str,
 )

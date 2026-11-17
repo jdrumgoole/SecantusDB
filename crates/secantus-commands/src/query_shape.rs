@@ -2515,16 +2515,28 @@ fn coll_stats(spec: &Document) -> Option<Document> {
 /// resume token, otherwise the operation time mongod picks) and the two
 /// `fullDocument` modes.
 fn change_stream(spec: &Document) -> Option<Document> {
-    const KEYS: [&str; 7] = [
+    // The flags in `DocumentSourceChangeStreamSpec`'s order, which its
+    // shape keeps (mongod 8.2.11, measured 2026-11-17, RM-358).
+    const FLAGS: [&str; 7] = [
+        "allChangesForCluster",
+        "showMigrationEvents",
+        "showSystemEvents",
+        "allowToRunOnConfigDB",
+        "allowToRunOnSystemNS",
+        "showExpandedEvents",
+        "showRawUpdateDescription",
+    ];
+    const KEYS: [&str; 5] = [
         "resumeAfter",
         "startAfter",
         "startAtOperationTime",
         "fullDocument",
         "fullDocumentBeforeChange",
-        "allChangesForCluster",
-        "showExpandedEvents",
     ];
-    if spec.keys().any(|k| !KEYS.contains(&k.as_str())) {
+    if spec
+        .keys()
+        .any(|k| !KEYS.contains(&k.as_str()) && !FLAGS.contains(&k.as_str()))
+    {
         return None;
     }
     let mut out = Document::new();
@@ -2558,7 +2570,7 @@ fn change_stream(spec: &Document) -> Option<Document> {
         spec.get("fullDocumentBeforeChange")
             .map_or(Some("off"), Bson::as_str)?,
     );
-    for key in ["allChangesForCluster", "showExpandedEvents"] {
+    for key in FLAGS {
         if let Some(v) = spec.get(key) {
             out.insert(key, v.as_bool()?);
         }
@@ -3223,8 +3235,27 @@ fn stage_shape(db: &str, coll: &str, stage: &Document) -> Option<Vec<Document>> 
             if d.keys().any(|k| !KEYS.contains(&k.as_str())) {
                 return None;
             }
+            // `from: {db, coll}` names a collection in `local` or `config`
+            // (all mongod 8.2.11 accepts); its shape keeps the namespace
+            // form, `db` first (measured 2026-11-17, RM-358).
+            let (from_db, from) = match d.get("from")? {
+                Bson::String(c) => (db, c.as_str()),
+                Bson::Document(f) if f.len() == 2 => {
+                    let fdb = f.get_str("db").ok()?;
+                    if !matches!(fdb, "local" | "config") {
+                        return None;
+                    }
+                    (fdb, f.get_str("coll").ok()?)
+                }
+                _ => return None,
+            };
+            let from_shape = if d.get("from")?.as_str().is_some() {
+                Bson::String(ident(from))
+            } else {
+                Bson::Document(doc! { "db": ident(from_db), "coll": ident(from) })
+            };
             let mut out = doc! {
-                "from": ident(d.get_str("from").ok()?),
+                "from": from_shape,
                 "as": field_path(d.get_str("as").ok()?),
             };
             match (d.get("localField"), d.get("foreignField")) {
@@ -3244,9 +3275,8 @@ fn stage_shape(db: &str, coll: &str, stage: &Document) -> Option<Vec<Document>> 
                         None => Document::new(),
                     };
                     out.insert("let", vars);
-                    let from = d.get_str("from").ok()?;
                     let p = p.as_array()?;
-                    out.insert("pipeline", pipeline_shape(db, from, p)?);
+                    out.insert("pipeline", pipeline_shape(from_db, from, p)?);
                     // `DocumentSourceLookUp::serializeToArray` flags a
                     // hybrid search's join (`isHybridSearchPipeline`): the
                     // hash covers it, and mongod 8.2.11's `$queryStats`
@@ -3346,14 +3376,27 @@ fn stage_shape(db: &str, coll: &str, stage: &Document) -> Option<Vec<Document>> 
         "$fill" => fill(spec.as_document()?)?,
         "$densify" => densify(spec.as_document()?)?,
         "$out" => {
-            let (out_db, coll) = match spec {
-                Bson::String(c) => (db, c.as_str()),
-                Bson::Document(d) if d.len() == 2 => {
-                    (d.get_str("db").ok()?, d.get_str("coll").ok()?)
+            let (out_db, coll, ts) = match spec {
+                Bson::String(c) => (db, c.as_str(), None),
+                Bson::Document(d) => {
+                    // `timeseries` options are printed as given, granularity
+                    // defaults unfilled (mongod 8.2.11, measured 2026-11-17).
+                    let ts = match d.get("timeseries") {
+                        Some(t) => Some(t.as_document()?.clone()),
+                        None => None,
+                    };
+                    if d.len() != 2 + usize::from(ts.is_some()) {
+                        return None;
+                    }
+                    (d.get_str("db").ok()?, d.get_str("coll").ok()?, ts)
                 }
                 _ => return None,
             };
-            vec![doc! { "$out": { "coll": ident(coll), "db": ident(out_db) } }]
+            let mut out = doc! { "coll": ident(coll), "db": ident(out_db) };
+            if let Some(ts) = ts {
+                out.insert("timeseries", ts);
+            }
+            vec![doc! { "$out": out }]
         }
         "$merge" => vec![doc! { "$merge": merge(db, coll, spec)? }],
         "$geoNear" => vec![doc! { "$geoNear": geo_near(spec.as_document()?)? }],

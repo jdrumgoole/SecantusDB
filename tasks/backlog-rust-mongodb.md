@@ -606,23 +606,31 @@ These are explicit non-goals. Don't add them without a reason.
         (four in its entry, four execution admissions) and once here.
       Backlog-ID: RM-357
       Verify: tests/backlog/test_rm_355_364.py::test_more_writes_report_mongods_locks
+- [ ] **A `$lookup` from `{db: "local", coll: "oplog.rs"}` is refused.**
+      mongod 8.2.11 runs a `$lookup` whose `from` is `{db, coll}` naming a
+      collection in `local` or `config`; this server answers FailedToParse
+      (9), as mongod does only for any other database. Found 2026-11-17
+      (RM-358).
+      Verify: tests/backlog/test_rm_found_2026_11_17_rm358.py::test_a_lookup_from_the_oplog_runs
+      Backlog-ID: RM-717
+- [ ] **`$out` to a new time-series collection does not check the time
+      field.** mongod 8.2.11 fails the `aggregate` (BadValue, 2) when a
+      document it writes has no `timeField` date; this server writes it.
+      Found 2026-11-17 (RM-358).
+      Verify: tests/backlog/test_rm_found_2026_11_17_rm358.py::test_out_to_time_series_needs_the_time_field
+      Backlog-ID: RM-718
 - [ ] **Some queries have no `queryShapeHash`.** Since 2026-11-07 a
       `find`'s, `distinct`'s and `aggregate`'s line, profile entry and
       `explain` carry mongod's `queryShapeHash` (`secantus-commands`
       `query_shape.rs`, `tests/mongod_live/test_query_shape_hash.py`,
-      against mongod 8.2.11), `$jsonSchema` among them since 2026-11-16. A
-      query using one of these prints none, where mongod prints one:
-      - a `$rankFusion` or `$scoreFusion` input of `$search` or
-        `$vectorSearch`, which need mongot;
-      - options measured nowhere yet: a `$lookup` `from` naming another
-        database, `$out` to a time-series collection, change stream
-        options beyond `fullDocument`, `fullDocumentBeforeChange`,
-        `allChangesForCluster` and `showExpandedEvents`.
-      Each is mongod's serializer for that node, transcribed and checked as
-      the shaped ones were.
+      against mongod 8.2.11), `$jsonSchema` among them since 2026-11-16,
+      and a `$lookup` from `local` / `config`, `$out` to a time-series
+      collection and every change stream flag since 2026-11-17. A query
+      with a `$rankFusion` or `$scoreFusion` input of `$search` or
+      `$vectorSearch` prints none, where mongod prints one; those stages
+      need mongot, so mongod's serializer for them is unmeasured here.
       Backlog-ID: RM-358
-      Verify: none -- the mongot inputs need a mongot, and the unmeasured
-      options have no measured answer yet to assert
+      Verify: none -- the mongot inputs need a mongot
 - [ ] **`test_a_write_while_an_index_builds` reads mongod's answer off a
       5 ms lock wait.** `tests/mongod_live/test_txn_catalog_changes.py`
       asserts mongod 8.2.11 refuses a transaction's insert while an index
