@@ -23,12 +23,12 @@ def dsn(rust_pg: object) -> Iterator[str]:
     yield _dsn(rust_pg) + " dbname=postgres"
 
 
-@pytest.mark.backlog("RP-936")
+@pytest.mark.backlog_fixed("RP-936")
 def test_the_unnamed_portal_is_not_in_pg_cursors(dsn: str) -> None:
     """PostgreSQL 15.19 creates the unnamed portal of a Bind invisible
     (`exec_bind_message`), so `pg_cursors` does not list it. Here a
-    parameterised statement in a block leaves a row named
-    `POSTGRESQL_DEFAULT_NAME` there until the block ends."""
+    parameterised statement in a block left a row named
+    `POSTGRESQL_DEFAULT_NAME` there until the block ended."""
     with psycopg.connect(dsn, autocommit=True) as c, c.transaction():
         c.execute("select %s::int", (1,))
         assert c.execute("select name from pg_cursors").fetchall() == []

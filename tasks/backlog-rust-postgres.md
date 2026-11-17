@@ -2678,22 +2678,6 @@ still computed whole, and the cursor answers that differ either way.
       Verify: tests/backlog/test_rp_found_rp744.py::test_a_cursors_where_filters_as_it_is_fetched
       Backlog-ID: RP-961
 
-## Found while working RP-900 (2026-11-13)
-
-Measured on PostgreSQL 15.19 (the shared reference on port 5415). The gap
-test is in `tests/backlog/test_rp_found_rp900.py`.
-
-- [ ] **The extended protocol's unnamed portal is listed in `pg_cursors`.**
-      In a block, a parameterised statement (`select $1::int`, as psycopg
-      sends `select %s::int`) leaves a `pg_cursors` row named
-      `POSTGRESQL_DEFAULT_NAME`, pgwire's placeholder for the unnamed
-      portal, until the block ends; PostgreSQL 15.19 creates that portal
-      invisible (`exec_bind_message`) and lists none.
-      `wire_portals::note_wire_portal` skips only an empty name, and the
-      Bind hands it `DEFAULT_NAME`.
-      Verify: tests/backlog/test_rp_found_rp900.py::test_the_unnamed_portal_is_not_in_pg_cursors
-      Backlog-ID: RP-936
-
 ## Found while working RP-782 (2026-11-10)
 
 Measured on a private PostgreSQL 15.19 cluster (locale C.UTF-8, built
