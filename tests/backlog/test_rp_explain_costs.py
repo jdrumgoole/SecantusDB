@@ -6517,10 +6517,10 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "                    Index Cond: (a = e.a)",
         ],
     ),
-    # Still open: a constant the class generates for the inner side's
-    # indexed column is that index scan's Index Cond, not a Filter.
+    # A constant the class generates for the inner side's indexed column
+    # is that index scan's Index Cond, not a Filter (RP-977, fixed).
     "an equivalence class's generated constant is the inner index's cond": (
-        "RP-977",
+        "RP-977:fixed",
         _ANALYSED,
         "explain select * from e, k where e.a = k.a and e.a = 5",
         [

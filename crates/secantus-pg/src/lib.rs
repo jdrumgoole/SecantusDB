@@ -47297,7 +47297,7 @@ impl PgHandler {
                 explain::attach_join_conds(&mut tree, &join_conds, &options.join_cond_splits);
                 explain::attach_join_where(&mut tree, &options.join_where, &index_columns);
                 explain::move_param_conds(&mut tree);
-                explain::apply_implied_filters(&mut tree);
+                explain::apply_implied_filters(&mut tree, &index_columns);
                 explain::attach_scan_alias(&mut tree, &options.scan_alias);
                 explain::attach_verbose(&mut tree, &options.verbose_scan);
                 explain::attach_verbose_join(&mut tree, &options.verbose_join);

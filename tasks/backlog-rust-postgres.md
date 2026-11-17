@@ -1887,16 +1887,6 @@ a regression test.
       15.19 cluster (found while working RP-918).
       Verify: tests/backlog/test_rp_explain_costs.py::test_plan[nested loop into an index with a range of the inner side]
       Backlog-ID: RP-979
-- [ ] **A constant an equivalence class generates for a join's inner
-      index scan is a Filter, not its Index Cond.** `select * from e, k
-      where e.a = k.a and e.a = 5` (`k.a` the primary key) is, on
-      PostgreSQL 15.19, a Nested Loop whose `Index Scan using k_pkey on k`
-      has `Index Cond: (a = 5)` (`generate_base_implied_equalities` gives
-      k its own `k.a = 5`, which the index takes); here the same scan
-      prints `Filter: (a = 5)`. The costs and rows match. Measured on a
-      private 15.19 cluster (found while working RP-402).
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[an equivalence class's generated constant is the inner index's cond]
-      Backlog-ID: RP-977
 - [ ] **EXPLAIN prints no estimate for a join over a scan filtered by an
       expression.** Since RP-404 a comparison of integer or text arithmetic
       with a constant, and a LIKE / ILIKE of an analysed string column, are

@@ -2587,7 +2587,10 @@ pub(crate) type ImpliedFilter = (String, (String, String));
 /// A leaf's alias, its implied filter, and its printed `Filter`.
 type LeafFilters = (Option<String>, Option<ImpliedFilter>, Option<String>);
 
-pub(crate) fn apply_implied_filters(root: &mut PlanNode) {
+pub(crate) fn apply_implied_filters(
+    root: &mut PlanNode,
+    index_columns: &dyn Fn(&str) -> Vec<String>,
+) {
     fn alias_of(n: &PlanNode) -> Option<String> {
         n.props
             .iter()
@@ -2629,6 +2632,7 @@ pub(crate) fn apply_implied_filters(root: &mut PlanNode) {
     collect(root, &mut found);
     // The new Filter text for each alias.
     let mut texts: Vec<(String, String)> = Vec::new();
+    let mut conds: Vec<(String, String)> = Vec::new();
     for (alias, implied, filter) in &found {
         let (Some(alias), Some((own_col, (from_alias, from_col)))) = (alias, implied) else {
             continue;
@@ -2657,12 +2661,53 @@ pub(crate) fn apply_implied_filters(root: &mut PlanNode) {
             },
             None => Vec::new(),
         };
-        own.push(format!("({own_col} = {rhs}"));
+        let generated = format!("({own_col} = {rhs}");
+        // An index scan over the class's own column takes the generated
+        // constant as an index qual (`match_clause_to_indexcol`): its
+        // Index Cond, not a Filter (RP-977).
+        if index_scan_reads(root, alias, own_col, index_columns) {
+            conds.push((alias.clone(), generated));
+            if !own.is_empty() {
+                texts.push((alias.clone(), render(&own)));
+            }
+            continue;
+        }
+        own.push(generated);
         texts.push((alias.clone(), render(&own)));
     }
-    fn apply(n: &mut PlanNode, texts: &[(String, String)]) {
+    fn index_scan_reads(
+        n: &PlanNode,
+        alias: &str,
+        col: &str,
+        index_columns: &dyn Fn(&str) -> Vec<String>,
+    ) -> bool {
+        if n.children.is_empty() {
+            return alias_of(n).as_deref() == Some(alias)
+                && n.name
+                    .strip_prefix("Index Scan using ")
+                    .and_then(|r| r.split_once(" on "))
+                    .is_some_and(|(ix, _)| index_columns(ix).iter().any(|c| c == col));
+        }
+        n.children
+            .iter()
+            .any(|c| index_scan_reads(c, alias, col, index_columns))
+    }
+    fn apply(n: &mut PlanNode, texts: &[(String, String)], conds: &[(String, String)]) {
         if n.children.is_empty() {
             if let Some(alias) = alias_of(n) {
+                if let Some((_, cond)) = conds.iter().find(|(a, _)| *a == alias) {
+                    match n.details.iter_mut().find(|(k, _)| k == "Index Cond") {
+                        Some((_, c)) => {
+                            let mut parts = conjuncts(c).unwrap_or_else(|| vec![c.clone()]);
+                            parts.push(cond.clone());
+                            *c = render(&parts);
+                        }
+                        None => n.details.insert(0, ("Index Cond".into(), cond.clone())),
+                    }
+                    if !texts.iter().any(|(a, _)| *a == alias) {
+                        drop_filter_placeholder(n);
+                    }
+                }
                 if let Some((_, text)) = texts.iter().find(|(a, _)| *a == alias) {
                     drop_filter_placeholder(n);
                     match n.details.iter_mut().find(|(k, _)| k == "Filter") {
@@ -2674,10 +2719,10 @@ pub(crate) fn apply_implied_filters(root: &mut PlanNode) {
             n.implied_filter = None;
         }
         for c in &mut n.children {
-            apply(c, texts);
+            apply(c, texts, conds);
         }
     }
-    apply(root, &texts);
+    apply(root, &texts, &conds);
 }
 
 /// Make a narrow-path `Hash Join` whose clause an equivalence class
@@ -2994,7 +3039,7 @@ mod join_type_tests {
             .push(scan("e", Some("(b = 'v2'::text)"), None));
         root.children
             .push(scan("k", Some("(a < 500)"), Some(("c", "e"))));
-        apply_implied_filters(&mut root);
+        apply_implied_filters(&mut root, &|_| Vec::new());
         assert_eq!(
             root.children[1].details,
             vec![(
@@ -3006,8 +3051,38 @@ mod join_type_tests {
         root.children
             .push(scan("e", Some("(b = 'v2'::text)"), None));
         root.children.push(scan("k", None, Some(("b", "e"))));
-        apply_implied_filters(&mut root);
+        apply_implied_filters(&mut root, &|_| Vec::new());
         assert_eq!(root.children[1].details[0].1, "(b = 'v2'::text)");
+    }
+
+    /// The class's constant on an index scan's own key column is that
+    /// scan's Index Cond (RP-977), its other quals staying the Filter.
+    #[test]
+    fn implied_constant_is_an_index_scans_cond() {
+        let mut e = PlanNode::new("Seq Scan on e");
+        e.props.push(("Relation Name".into(), "e".into()));
+        e.details.push(("Filter".into(), "(a = 5)".into()));
+        let mut k = PlanNode::new("Index Scan using k_pkey on k");
+        k.props.push(("Relation Name".into(), "k".into()));
+        k.details.push(("Filter".into(), "(b <> 'x'::text)".into()));
+        k.implied_filter = Some(("a".into(), ("e".into(), "a".into())));
+        let mut root = PlanNode::new("Nested Loop");
+        root.children.push(e);
+        root.children.push(k);
+        apply_implied_filters(&mut root, &|ix| {
+            if ix == "k_pkey" {
+                vec!["a".into()]
+            } else {
+                Vec::new()
+            }
+        });
+        assert_eq!(
+            root.children[1].details,
+            vec![
+                ("Index Cond".to_string(), "(a = 5)".to_string()),
+                ("Filter".to_string(), "(b <> 'x'::text)".to_string()),
+            ]
+        );
     }
 
     /// A swapped hash join's `Hash Cond` is written outer side first
