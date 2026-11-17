@@ -204,11 +204,11 @@ def _atlas_stages(client: Any) -> dict:
     }
 
 
-@pytest.mark.backlog("RM-605")
+@pytest.mark.backlog_fixed("RM-605")
 def test_an_atlas_stage_is_refused_as_mongod_refuses_it(rust_mongo: Any, mongod_rs: Any) -> None:
     """mongod 8.2.11 with no `mongot` refuses `$search`, `$vectorSearch` and
     `$listSearchIndexes` as they run with 31082 (SearchNotEnabled), in two
-    messages of its own; this server answers 115 (CommandNotSupported) with
+    messages of its own; this server answered 115 (CommandNotSupported) with
     one message, the wording of `$listSearchIndexes`'s from an older
     mongod."""
     search = (

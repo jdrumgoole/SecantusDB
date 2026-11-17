@@ -5584,13 +5584,10 @@ fn split_ns(ns: &str) -> (String, String) {
 /// mongo-c-driver's `/index-management/{update,drop}SearchIndex` caught. The
 /// message is shared with the `$listSearchIndexes` stage so the two stay in
 /// lockstep. Mirrors `commands._search_index_not_supported`.
+/// mongod 8.2.11 refuses each, `listSearchIndexes` too, with 31082
+/// (SearchNotEnabled) when it has no `mongot` (RM-605).
 pub fn search_index_not_supported(_doc: &Document, _ctx: &mut CommandContext) -> HandlerResult {
-    Ok(CommandError::new(
-        115,
-        "CommandNotSupported",
-        crate::aggregate::SEARCH_INDEX_ATLAS_MSG,
-    )
-    .into_reply())
+    Ok(crate::aggregate::search_not_enabled(crate::aggregate::SEARCH_INDEX_ATLAS_MSG).into_reply())
 }
 
 #[cfg(test)]
@@ -5621,6 +5618,7 @@ mod parity_tests {
             "createSearchIndexes",
             "updateSearchIndex",
             "dropSearchIndex",
+            "listSearchIndexes",
         ] {
             assert!(
                 crate::lookup_for_test(name).is_some(),
@@ -5629,7 +5627,7 @@ mod parity_tests {
         }
         let reply = search_index_not_supported(&doc! {"dropSearchIndex": "c"}, &mut ctx()).unwrap();
         let (code, name, msg) = err_of(&reply);
-        assert_eq!((code, name.as_str()), (115, "CommandNotSupported"));
+        assert_eq!((code, name.as_str()), (31082, "SearchNotEnabled"));
         assert!(
             msg.contains("Atlas"),
             "the driver specs assert on 'Atlas': {msg}"

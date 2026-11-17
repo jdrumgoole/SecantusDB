@@ -784,17 +784,6 @@ These are explicit non-goals. Don't add them without a reason.
       Found while working RM-604, 2026-11-17.
       Verify: tests/backlog/test_rm_found_rm604.py::test_an_empty_densify_range_or_fill_output_is_refused_as_mongod_refuses_it
       Backlog-ID: RM-716
-- [ ] **`$search`, `$vectorSearch` and `$listSearchIndexes` are refused
-      with an older mongod's code and message.** mongod 8.2.11 without
-      `mongot` refuses each as it runs with 31082 (SearchNotEnabled):
-      "Using $search and $vectorSearch aggregation stages requires
-      additional configuration. ..." for the first two, its own wording for
-      `$listSearchIndexes`. This server answers all three with 115
-      (CommandNotSupported) and `SEARCH_INDEX_ATLAS_MSG` ("... an
-      Atlas-compatible deployment to use this feature."). Found while
-      working RM-386, 2026-11-13.
-      Verify: tests/backlog/test_rm_found_rm386.py::test_an_atlas_stage_is_refused_as_mongod_refuses_it
-      Backlog-ID: RM-605
 - [ ] **A `getMore` with an int cursor id is refused for its type.**
       mongod 8.2.11 reads `{getMore: 5, collection: "c"}` as cursor 5
       (CursorNotFound, 43), and `{getMore: 1}` is refused for the missing

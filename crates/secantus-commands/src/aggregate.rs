@@ -1737,9 +1737,10 @@ fn apply_source_stage(
     vec![row]
 }
 
-/// Atlas-only aggregation stages SecantusDB can't provide — rejected with the
-/// Atlas message (`CommandNotSupported`, 115) rather than the generic
-/// unrecognized-stage error. Mirrors `aggregate._ATLAS_ONLY_STAGES`.
+/// Atlas-only aggregation stages SecantusDB can't provide. mongod 8.2.11 with
+/// no `mongot` parses the whole pipeline (a later unknown stage is still
+/// 40324) and then refuses these as they run with 31082 (SearchNotEnabled),
+/// in the message `atlas_stage_error` picks (RM-605).
 const ATLAS_STAGES: &[&str] = &[
     "$listSearchIndexes",
     "$search",
@@ -1758,9 +1759,33 @@ pub const PIPELINE_ELEMENT_MSG: &str = "Each element of the 'pipeline' array mus
 pub const STAGE_ARITY_MSG: &str =
     "A pipeline stage specification object must contain exactly one field.";
 
+/// mongod 8.2.11's refusal of the search-index commands and the
+/// `$listSearchIndexes` stage without `mongot` (code 31082).
 pub const SEARCH_INDEX_ATLAS_MSG: &str = "Using Atlas Search Database Commands and the \
 $listSearchIndexes aggregation stage requires additional configuration. Please connect to Atlas \
-or an Atlas-compatible deployment to use this feature.";
+or an AtlasCLI local deployment to enable. For more information on how to connect, see \
+https://dochub.mongodb.org/core/atlas-cli-deploy-local-reqs.";
+
+/// mongod 8.2.11's refusal of `$search`, `$searchMeta` and `$vectorSearch`
+/// without `mongot` (code 31082). The missing space after "enable." is
+/// mongod's own.
+pub const SEARCH_STAGE_ATLAS_MSG: &str = "Using $search and $vectorSearch aggregation stages \
+requires additional configuration. Please connect to Atlas or an AtlasCLI local deployment to \
+enable.For more information on how to connect, see \
+https://dochub.mongodb.org/core/atlas-cli-deploy-local-reqs.";
+
+/// The SearchNotEnabled (31082) refusal of a search-index command or stage.
+pub fn search_not_enabled(msg: &str) -> CommandError {
+    CommandError::new(31082, "SearchNotEnabled", msg)
+}
+
+fn atlas_stage_error(name: &str) -> CommandError {
+    search_not_enabled(if name == "$listSearchIndexes" {
+        SEARCH_INDEX_ATLAS_MSG
+    } else {
+        SEARCH_STAGE_ATLAS_MSG
+    })
+}
 
 /// Whether `name` is a recognised aggregation stage (the set the Python
 /// `aggregate._STAGES` registry recognises). Keep in sync with that set.
@@ -1817,7 +1842,7 @@ pub(crate) fn recognized_stage(name: &str) -> bool {
 }
 
 /// Up-front pipeline stage-name validation (mongod validates at parse time,
-/// before any document flows). An Atlas-only stage → `CommandNotSupported` (115);
+/// before any document flows). An Atlas-only stage → SearchNotEnabled (31082) once the rest parses;
 /// an unrecognised single-key stage → `Location40324`. Malformed stage shapes
 /// (non-document / empty / multi-key) are left to the engine path. Mirrors
 /// `aggregate.validate_stage_names`.
@@ -2208,6 +2233,9 @@ fn union_with_lite_parse(spec: Option<&Bson>) -> Result<(), CommandError> {
 }
 
 pub(crate) fn validate_stage_names(pipeline: &[Bson], db: &str) -> Result<(), CommandError> {
+    // An Atlas stage parses and is refused as it runs, after the rest of the
+    // pipeline has parsed (RM-605).
+    let mut atlas: Option<&str> = None;
     for stage in pipeline {
         // Both of these used to `continue`, so a malformed element sailed past
         // validation: `pipeline: [42]` reached execution and surfaced as a bare
@@ -2220,11 +2248,15 @@ pub(crate) fn validate_stage_names(pipeline: &[Bson], db: &str) -> Result<(), Co
         }
         let name = stage_name(stage);
         if ATLAS_STAGES.contains(&name) {
-            return Err(CommandError::new(
-                115,
-                "CommandNotSupported",
-                SEARCH_INDEX_ATLAS_MSG,
-            ));
+            if name == "$search" && !matches!(d.get(name), Some(Bson::Document(_))) {
+                return Err(CommandError::new(
+                    10065,
+                    "Location10065",
+                    "invalid parameter: expected an object ($search)",
+                ));
+            }
+            atlas.get_or_insert(name);
+            continue;
         }
         if !recognized_stage(name) && !crate::hybrid::is_prepared_stage(name) {
             return Err(CommandError::new(
@@ -2259,7 +2291,10 @@ pub(crate) fn validate_stage_names(pipeline: &[Bson], db: &str) -> Result<(), Co
         lookups_lite_parse(std::slice::from_ref(stage), db)?;
         nested_query_stats_specs(stage)?;
     }
-    Ok(())
+    match atlas {
+        Some(name) => Err(atlas_stage_error(name)),
+        None => Ok(()),
+    }
 }
 
 /// What mongod's `$lookup` refuses as it first reads the stage, before any

@@ -782,7 +782,7 @@ fn lookup(name: &str) -> Option<Handler> {
         "listDatabases" => stats_admin::list_databases,
         "listIndexes" => admin::list_indexes,
         "createIndexes" => admin::create_indexes,
-        "createSearchIndexes" | "updateSearchIndex" | "dropSearchIndex" => {
+        "createSearchIndexes" | "updateSearchIndex" | "dropSearchIndex" | "listSearchIndexes" => {
             admin::search_index_not_supported
         }
         "dropIndexes" | "deleteIndexes" => admin::drop_indexes,
