@@ -213,6 +213,13 @@ struct Search {
     /// on the class sorts both sides in it (`select_outer_pathkeys_for_merge`
     /// takes the query's pathkey, its `nulls_first` included).
     order_nulls_first: bool,
+    /// A descending ORDER BY with a key after its first that is a pathkey of
+    /// its own: `select_outer_pathkeys_for_merge` adopts the query's
+    /// pathkeys only when every key is a merge clause's class, so merges on
+    /// the first key's class sort ascending (`asc_keys`, of use for merging
+    /// only), and only a backward index scan, or a nested loop over one,
+    /// is in the query's order.
+    merge_asc: bool,
     /// Each edge's outer join (`Search::edges` order): the preserved table
     /// of a LEFT join, `usize::MAX` for a FULL join, `None` for an inner
     /// join's clause. An outer join's clause moves only into a scan of its
@@ -995,6 +1002,7 @@ impl PgHandler {
                 order: None,
                 order_desc: false,
                 order_nulls_first: false,
+                merge_asc: false,
                 edge_outer,
                 general: false,
                 param_keys: Vec::new(),
@@ -1246,6 +1254,20 @@ impl PgHandler {
                 None if order_key == Some(clause.b_key.as_str()) => Some(ORDER_CLASS),
                 None => search.key_ec(clause.b_table, &clause.b_key).or(own),
             };
+            // Under `Search::merge_asc` a merge on the ORDER BY's class sorts
+            // ascending: its order is the class's ascending one.
+            let (a_class, b_class) = if search.merge_asc {
+                let order_class = search.order.as_ref().map(|(_, c)| *c);
+                let asc = |c: Option<usize>| match c {
+                    Some(c) if Some(c) == order_class => {
+                        Some(secantus_pgplan::joincost::asc_keys(c))
+                    }
+                    c => c,
+                };
+                (asc(a_class), asc(b_class))
+            } else {
+                (a_class, b_class)
+            };
             // A merge on several clauses that a side already in the
             // class's order would serve on its first is not modelled.
             if !clause.extra.is_empty() && pa.0.iter().chain(&pb.0).any(|p| p.class.is_some()) {
@@ -1314,7 +1336,9 @@ impl PgHandler {
             // merge with that key's side outer sorts both sides descending
             // (`Search::order_desc`, `select_outer_pathkeys_for_merge`).
             let desc_outer = match &search.order {
-                Some((key, ORDER_CLASS)) if search.order_desc || search.order_nulls_first => {
+                Some((key, ORDER_CLASS))
+                    if (search.order_desc || search.order_nulls_first) && !search.merge_asc =>
+                {
                     (clause.a_key == *key, clause.b_key == *key)
                 }
                 _ => (false, false),
@@ -1590,6 +1614,7 @@ impl PgHandler {
         };
         let back = back_input(built.a, a_pick, a_sorted) || back_input(built.b, b_pick, b_sorted);
         let merge_in_order = (search.order_desc || search.order_nulls_first)
+            && !search.merge_asc
             && !back
             && !asc_input(built.a, a_pick, a_sorted)
             && !asc_input(built.b, b_pick, b_sorted)
@@ -1833,15 +1858,17 @@ impl PgHandler {
 
     /// Whether the search plans `node` for an ORDER BY under a LIMIT
     /// (`four_table_join` with both): its first column's joined-row key
-    /// (`ascending`: with its NULLs last), and `later` its later columns',
-    /// which it plans for when [`PgHandler::later_order_keys_modelled`]
-    /// does, and with any that is a pathkey of its own only after an
-    /// ascending first key.
+    /// (`desc`, and `nulls_first` with its NULLs against the direction's
+    /// default), and `later` its later columns', which it plans for when
+    /// [`PgHandler::later_order_keys_modelled`] does, and with any that is a
+    /// pathkey of its own only after a first key with its default NULLs,
+    /// a descending one in an inner join's class (`Search::merge_asc`).
     pub(crate) fn ordered_limit_searched(
         &self,
         node: &JoinNode,
         first: &str,
-        ascending: bool,
+        desc: bool,
+        nulls_first: bool,
         later: &[String],
     ) -> bool {
         let Some((chain, search)) = self.four_table_chain(node, true, true) else {
@@ -1850,7 +1877,7 @@ impl PgHandler {
         later.is_empty()
             || Self::order_class(&search, &chain, first).is_some_and(|class| {
                 self.later_order_keys_modelled(&search, first, class, later)
-                    .is_some_and(|n| n == 0 || ascending)
+                    .is_some_and(|n| n == 0 || !(desc && (nulls_first || class == ORDER_CLASS)))
             })
     }
 
@@ -1953,9 +1980,14 @@ impl PgHandler {
                     // (`select_outer_pathkeys_for_merge`); with another key
                     // it sorts ascending, NULLs last, which this search's
                     // descending or NULLS FIRST class order does not model.
-                    if n > 0 && (desc || nulls_first) {
+                    // A descending first key merges ascending
+                    // (`Search::merge_asc`); NULLS FIRST against the default,
+                    // and a key no inner join's clause makes a class of
+                    // (`ORDER_CLASS`), are not modelled.
+                    if n > 0 && desc && (nulls_first || class == ORDER_CLASS) {
                         return Ok(None);
                     }
+                    search.merge_asc = n > 0 && (desc || nulls_first);
                     order_keys = n;
                 }
             }

@@ -77,12 +77,13 @@ fn hint_for(table: &str) -> Option<ScanHint> {
 /// by bytes, as the model orders text: `C`, `POSIX` and `C.UTF-8` compare
 /// bytewise (`lc_collate_is_c`, and UTF-8 byte order is code point order).
 fn own_collation_not_bytewise(c: &&secantus_pgcatalog::Column) -> bool {
-    c.extra.get_str("collation").is_ok_and(|coll| {
-        !matches!(
-            coll.trim_matches('"'),
-            "C" | "POSIX" | "C.UTF-8" | "default"
-        )
-    })
+    own_collation(c).is_some()
+}
+
+/// A column's own collation, when it does not order by bytes.
+fn own_collation(c: &secantus_pgcatalog::Column) -> Option<String> {
+    let coll = c.extra.get_str("collation").ok()?.trim_matches('"');
+    (!matches!(coll, "C" | "POSIX" | "C.UTF-8" | "default")).then(|| coll.to_string())
 }
 
 /// A GIN index this models: array columns under `array_ops`, scalar
@@ -100,6 +101,9 @@ pub(crate) struct GinShape {
     /// Every key column, `field` and `elem` the first: a multi-column
     /// index's pages are modelled, its scans are not.
     pub(crate) cols: Vec<(String, String)>,
+    /// Each key column's collation when it does not order by bytes
+    /// (`en_US`): its text keys compare as `varstr_cmp` does under it.
+    pub(crate) collations: Vec<Option<String>>,
     /// `fastupdate` (on unless `WITH` turned it off).
     pub(crate) fastupdate: bool,
     /// `gin_pending_list_limit`, kB, when `WITH` set it.
@@ -150,6 +154,8 @@ impl AmShape {
 /// its keys' comparison, and the sizes they take in an index tuple.
 pub(crate) struct ElemOps {
     elem: String,
+    /// The column's collation, when it does not order by bytes.
+    collation: Option<String>,
 }
 
 impl ElemOps {
@@ -205,6 +211,20 @@ impl ElemOps {
         self.elem == "jsonb"
     }
 
+    /// `varstr_cmp`: bytewise, or under the column's collation with a
+    /// bytewise tie-break (a deterministic collation's sort key carries it).
+    fn text_cmp(&self, x: &str, y: &str) -> std::cmp::Ordering {
+        if let Some(coll) = &self.collation {
+            if let (Ok(a), Ok(b)) = (
+                secantus_pgplan::collation::sort_key(coll, x),
+                secantus_pgplan::collation::sort_key(coll, y),
+            ) {
+                return a.cmp(&b);
+            }
+        }
+        x.as_bytes().cmp(y.as_bytes())
+    }
+
     /// `jsonb_path_ops` (`elem` is `jsonb_path`): its keys are `int4`
     /// path hashes, compared as `btint4cmp` compares them.
     fn jsonb_path(&self) -> bool {
@@ -253,7 +273,11 @@ impl GinOps {
             cols: s
                 .cols
                 .iter()
-                .map(|(_, elem)| ElemOps { elem: elem.clone() })
+                .zip(&s.collations)
+                .map(|((_, elem), collation)| ElemOps {
+                    elem: elem.clone(),
+                    collation: collation.clone(),
+                })
                 .collect(),
         }
     }
@@ -314,7 +338,7 @@ impl KeyOps for ElemOps {
             (Bson::Int32(x), Bson::Int32(y)) => x.cmp(y),
             (Bson::Int64(x), Bson::Int64(y)) => x.cmp(y),
             (Bson::Boolean(x), Bson::Boolean(y)) => x.cmp(y),
-            (Bson::String(x), Bson::String(y)) => x.as_bytes().cmp(y.as_bytes()),
+            (Bson::String(x), Bson::String(y)) => self.text_cmp(x, y),
             _ => match (Self::numeric(a), Self::numeric(b)) {
                 // `btfloat8cmp`: NaN above everything.
                 (Some(x), Some(y)) => match (x.is_nan(), y.is_nan()) {
@@ -928,7 +952,7 @@ impl crate::PgHandler {
             };
             // Each key's field (none for an expression), type, and whether
             // it carries a collation of its own.
-            let keys: Vec<(String, String, bool)> = match &exprs {
+            let keys: Vec<(String, String, bool, Option<String>)> = match &exprs {
                 Some(exprs) => {
                     // An expression's collation comes from its inputs.
                     let collated = def.columns.iter().any(|c| own_collation_not_bytewise(&c));
@@ -939,6 +963,7 @@ impl crate::PgHandler {
                                 String::new(),
                                 secantus_pgplan::column_expr_type(e).to_string(),
                                 collated,
+                                None,
                             )
                         })
                         .collect()
@@ -959,7 +984,7 @@ impl crate::PgHandler {
                         continue;
                     };
                     cols.iter()
-                        .map(|c| (c.field(), c.pg_type.clone(), own_collation_not_bytewise(c)))
+                        .map(|c| (c.field(), c.pg_type.clone(), false, own_collation(c)))
                         .collect()
                 }
             };
@@ -979,7 +1004,9 @@ impl crate::PgHandler {
             };
             let shape = if method == "gin" {
                 let mut gin_cols = Vec::with_capacity(keys.len());
-                for ((field, pg_type, collated), path_ops) in keys.iter().zip(&path_ops) {
+                let mut collations = Vec::with_capacity(keys.len());
+                for ((field, pg_type, collated, collation), path_ops) in keys.iter().zip(&path_ops)
+                {
                     let elem = if *path_ops {
                         if pg_type != "jsonb" {
                             break;
@@ -995,11 +1022,24 @@ impl crate::PgHandler {
                     };
                     let textual = ElemOps {
                         elem: elem.to_string(),
+                        collation: None,
                     }
                     .textual();
                     if !ElemOps::supported(elem) || (*collated && textual) {
                         break;
                     }
+                    // `jsonb` and `tsvector` keys are uncollated `text`; a
+                    // text key's collation must resolve to one the model
+                    // can order by.
+                    let collation = collation
+                        .clone()
+                        .filter(|_| textual && !matches!(elem, "jsonb" | "tsvector"));
+                    if collation.as_deref().is_some_and(|c| {
+                        !secantus_pgplan::collation::resolve(c).is_ok_and(|r| r.is_locale())
+                    }) {
+                        break;
+                    }
+                    collations.push(collation);
                     gin_cols.push((field.clone(), elem.to_string()));
                 }
                 if gin_cols.len() != keys.len() {
@@ -1011,6 +1051,7 @@ impl crate::PgHandler {
                     field: gin_cols[0].0.clone(),
                     elem: gin_cols[0].1.clone(),
                     cols: gin_cols,
+                    collations,
                     fastupdate: !matches!(
                         reloption("fastupdate").as_deref(),
                         Some("off" | "false" | "no" | "0")
@@ -1459,6 +1500,7 @@ impl crate::PgHandler {
             AmShape::Gin(s) => {
                 let ops = ElemOps {
                     elem: s.elem.clone(),
+                    collation: s.collations[0].clone(),
                 };
                 self.with_am_model(table, &path.shape, |m| {
                     let Model::Gin(g) = m else {
@@ -1696,7 +1738,10 @@ mod tests {
     }
 
     fn keys_of(elem: &str, text: &str) -> Vec<String> {
-        let ops = ElemOps { elem: elem.into() };
+        let ops = ElemOps {
+            elem: elem.into(),
+            collation: None,
+        };
         gin_keys(&ops, Some(&Bson::String(text.into())))
             .into_iter()
             .map(|k| match (k.cat, k.val) {
@@ -1720,6 +1765,7 @@ mod tests {
         assert_eq!(keys("{}"), ["EmptyItem"]);
         let ops = ElemOps {
             elem: "jsonb".into(),
+            collation: None,
         };
         assert_eq!(gin_keys(&ops, None)[0].cat, gin_index::Cat::NullItem);
     }
@@ -1727,6 +1773,7 @@ mod tests {
     fn path_keys(text: &str) -> Vec<i32> {
         let ops = ElemOps {
             elem: "jsonb_path".into(),
+            collation: None,
         };
         gin_keys(&ops, Some(&Bson::String(text.into())))
             .into_iter()

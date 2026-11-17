@@ -792,19 +792,28 @@ one beside it.
     810 of 810 shapes each (692, 676 and 778 before); with two more
     (`--then "m0.c, m1.b desc"`), 809 of 810 (711); the one left, not
     diagnosed, is two rows tying on all three keys in another order
-    (`multi5/20/idx1/two_hubs2/lastleft/ordlastlim5`). Declined still (the
-    join planned for every row and sorted, as before): an ORDER BY of
-    several columns whose first is descending or NULLS FIRST, which with a
-    key after it no merge join takes (`select_outer_pathkeys_for_merge`
-    adopts the query's pathkeys only when every key is a merge clause's
-    class) and an index's backward scan gives (`--desc --then m0.c`: 789
-    of 810, 771 before; `--nulls-first --then m1.c` 800, 785 before;
-    `--desc-nulls-last --then "m0.c desc"` 776, 758 before); a later key a
+    (`multi5/20/idx1/two_hubs2/lastleft/ordlastlim5`). Since 2026-11-17 a
+    descending first key (its NULLs first) in an inner join's class is
+    searched with keys after it too: the merges on its class sort
+    ascending (`select_outer_pathkeys_for_merge` adopts the query's
+    pathkeys only when every key is a merge clause's class), so only an
+    index's backward scan, or a nested loop over one, is in its order
+    (`Search::merge_asc`); `--desc --then m0.c` 1,665 of 1,665 (789 of 810
+    before), `--desc --then "m1.c desc, m0.b"` 18 differences (33), the
+    18 not diagnosed. Since 2026-11-17 an ASC NULLS FIRST first key with
+    keys after it is searched too, under `Search::merge_asc`: no merge and
+    no index scan is in its order, so the plan is the cheapest under a
+    bounded Sort (`--nulls-first --then m1.c`, `--then m0.c`, `--then
+    "m1.c desc, m0.b"`: 810 of 810 each, 10 differences before). Declined
+    still (the join planned for every row and sorted, as before): a DESC
+    NULLS LAST first key with a key after it (`--desc-nulls-last --then
+    "m0.c desc"` 776 of 810, 758 before); a descending first key a LEFT join NULL-extends
+    or no clause reads (`ORDER_CLASS`), with a key after it; a later key a
     WHERE may fix to a constant; a table with an index of several columns;
     and a two-table join with a subquery side.
   - Sorts that spill to disk runs are not PostgreSQL's merge.
   Backlog-ID: RP-028
-  Verify: tests/backlog/test_rust_postgres_gaps.py::test_a_descending_first_key_with_another_reads_an_index_backward
+  Verify: tests/backlog/test_rust_postgres_gaps.py::test_a_desc_nulls_last_key_with_another_sorts_the_merge
 
 - [ ] **OPEN — RUST pgserver on LINUX: psycopg's timing tests fail in CI
       and pass on macOS (first measured 2026-10-12).** No Linux lane ran
@@ -1463,7 +1472,7 @@ batch, their tests regression tests:
       - GIN `=` on arrays, and opclasses other than `array_ops`,
         `jsonb_ops`, `jsonb_path_ops` and `tsvector_ops` (btree_gin), whose
         indexes `pg_relation_size` reads as 0; array elements other than ints,
-        floats, bool and C-ordered text; an ANALYZEd array column (MCELEM
+        floats, bool and text (in byte order or under an ICU collation); an ANALYZEd array column (MCELEM
         statistics);
       - `jsonb_ops` scans (`@>`, `?`, `?|`, `?&`): its pages and keys are
         modelled, its `extractQuery` and consistent functions are not;
@@ -1491,16 +1500,15 @@ batch, their tests regression tests:
         the same layout on three runs).
       The size functions read the modelled indexes' pages (since RP-287's
       first slice); an unmodelled one still reads 0 from
-      `pg_relation_size`: a GIN index over a column with a collation of its
-      own that does not order by bytes (`en_US` and the like; array or
-      `btree_gin` text; the model orders text by bytes only). `C`, `POSIX`
-      and `C.UTF-8` have been modelled since 2026-11-17.
+      `pg_relation_size`. Text keys under a column's ICU collation have
+      been ordered as `varstr_cmp` orders them since 2026-11-17 (libc
+      collations such as `en_US` do not exist here, a scope decision).
       A `btree_gin` index over a scalar `int2`/`int4`/`int8`/`float4`/
       `float8`/`bool`/`text` column has been modelled since 2026-11-17 (one
       key per row, the value itself); its scans are not, nor its other
       types (`date`, `timestamp`, `numeric`, ...).
       Backlog-ID: RP-287
-      Verify: tests/backlog/test_rp_top10_found.py::test_a_linguistically_collated_btree_gin_index_has_its_pages
+      Verify: tests/backlog/test_rp_top10_found.py::test_a_btree_gin_date_index_has_its_pages
 
 
 ## Found by batch 71 (2026-10-25)

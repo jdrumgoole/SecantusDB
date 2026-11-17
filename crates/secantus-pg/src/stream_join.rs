@@ -1144,8 +1144,8 @@ impl PgHandler {
                         self.ordered_limit_searched(
                             &j.tree,
                             &first.field,
-                            first.ascending
-                                && !matches!(first.nulls, secantus_pgplan::Nulls::First),
+                            !first.ascending,
+                            first.ascending == matches!(first.nulls, secantus_pgplan::Nulls::First),
                             &later,
                         )
                     })

@@ -962,22 +962,49 @@ def test_a_collated_btree_gin_index_has_its_pages(pg: Any) -> None:
     assert got == ("ok", [(14,)])
 
 
-@pytest.mark.backlog("RP-287")
-def test_a_linguistically_collated_btree_gin_index_has_its_pages(pg: Any) -> None:
-    """A btree_gin index over a column collated "en_US" is not modelled
-    (the model orders text by bytes only): PostgreSQL 15.19 sizes this one
-    at 14 pages; here `pg_relation_size` reads 0."""
-    got = _in_block(
-        pg,
+_RP287_ICU = {
+    "btree_gin_built": (
         [
             "create extension if not exists btree_gin",
-            'create table rp287_bu (a text collate "en_US")',
+            'create table rp287_bu (a text collate "en-US-x-icu")',
             "insert into rp287_bu select 'v' || (g % 500) from generate_series(1, 20000) g",
             "create index rp287_bui on rp287_bu using gin (a)",
         ],
-        "select pg_relation_size('rp287_bui') / 8192",
-    )
-    assert got == ("ok", [(14,)])
+        14,
+    ),
+    "btree_gin_inserted": (
+        [
+            "create extension if not exists btree_gin",
+            'create table rp287_bu (a text collate "en-US-x-icu")',
+            "create index rp287_bui on rp287_bu using gin (a) with (fastupdate=off)",
+            "insert into rp287_bu select (array['v','V','\u00e9','e'])[g % 4 + 1] || (g % 500)"
+            " from generate_series(1, 20000) g",
+        ],
+        10,
+    ),
+    "array_inserted": (
+        [
+            'create table rp287_bu (a text[] collate "de-x-icu")',
+            "create index rp287_bui on rp287_bu using gin (a)",
+            "insert into rp287_bu select array['k' || (g % 300), 'Z' || (g % 77),"
+            " '\u00e4' || (g % 41)] from generate_series(1, 20000) g",
+        ],
+        150,
+    ),
+}
+
+
+@pytest.mark.backlog_fixed("RP-287")
+@pytest.mark.parametrize("case", list(_RP287_ICU), ids=list(_RP287_ICU))
+def test_a_linguistically_collated_btree_gin_index_has_its_pages(pg: Any, case: str) -> None:
+    """A GIN index over text with an ICU collation orders its keys as
+    `varstr_cmp` does under it, and sizes as PostgreSQL 15.19's does (it
+    read 0 pages while the model ordered text by bytes only). libc
+    collations such as `en_US` are a scope decision: only `C` / `POSIX`
+    exist here."""
+    statements, pages = _RP287_ICU[case]
+    got = _in_block(pg, statements, "select pg_relation_size('rp287_bui') / 8192")
+    assert got == ("ok", [(pages,)])
 
 
 @pytest.mark.backlog_fixed("RP-287")
@@ -1194,3 +1221,22 @@ def test_a_select_list_nextval_in_an_autocommit_join_runs_once_a_row(rust_pg: An
         conn.execute("drop table rp19_a, rp19_b")
         conn.execute("drop sequence rp19_s")
     assert got == [([(1, 1), (2, 2), (3, 3)], (3,))] * 2
+
+
+@pytest.mark.backlog("RP-287")
+def test_a_btree_gin_date_index_has_its_pages(pg: Any) -> None:
+    """A btree_gin index over a `date` column is not modelled (only int,
+    float, bool and text keys are): PostgreSQL 15.19 sizes this one at 14
+    pages; here `pg_relation_size` reads 0."""
+    got = _in_block(
+        pg,
+        [
+            "create extension if not exists btree_gin",
+            "create table rp287_bd (a date)",
+            "insert into rp287_bd select date '2020-01-01' + (g % 500)"
+            " from generate_series(1, 20000) g",
+            "create index rp287_bdi on rp287_bd using gin (a)",
+        ],
+        "select pg_relation_size('rp287_bdi') / 8192",
+    )
+    assert got == ("ok", [(14,)])
