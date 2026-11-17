@@ -792,19 +792,26 @@ one beside it.
     810 of 810 shapes each (692, 676 and 778 before); with two more
     (`--then "m0.c, m1.b desc"`), 809 of 810 (711); the one left, not
     diagnosed, is two rows tying on all three keys in another order
-    (`multi5/20/idx1/two_hubs2/lastleft/ordlastlim5`). Declined still (the
-    join planned for every row and sorted, as before): an ORDER BY of
-    several columns whose first is descending or NULLS FIRST, which with a
-    key after it no merge join takes (`select_outer_pathkeys_for_merge`
-    adopts the query's pathkeys only when every key is a merge clause's
-    class) and an index's backward scan gives (`--desc --then m0.c`: 789
-    of 810, 771 before; `--nulls-first --then m1.c` 800, 785 before;
-    `--desc-nulls-last --then "m0.c desc"` 776, 758 before); a later key a
+    (`multi5/20/idx1/two_hubs2/lastleft/ordlastlim5`). Since 2026-11-17 a
+    descending first key (its NULLs first) in an inner join's class is
+    searched with keys after it too: the merges on its class sort
+    ascending (`select_outer_pathkeys_for_merge` adopts the query's
+    pathkeys only when every key is a merge clause's class), so only an
+    index's backward scan, or a nested loop over one, is in its order
+    (`Search::merge_asc`); `--desc --then m0.c` 1,665 of 1,665 (789 of 810
+    before), `--desc --then "m1.c desc, m0.b"` 18 differences (33), the
+    18 not diagnosed. Declined still (the join planned for every row and
+    sorted, as before): a first key NULLS FIRST against its direction's
+    default with a key after it, whose order no merge and no index scan
+    gives (`--nulls-first --then m1.c`: 10 differences, all LEFT joins of
+    3,000 rows with the index; `--desc-nulls-last --then "m0.c desc"` 776
+    of 810, 758 before); a descending first key a LEFT join NULL-extends
+    or no clause reads (`ORDER_CLASS`), with a key after it; a later key a
     WHERE may fix to a constant; a table with an index of several columns;
     and a two-table join with a subquery side.
   - Sorts that spill to disk runs are not PostgreSQL's merge.
   Backlog-ID: RP-028
-  Verify: tests/backlog/test_rust_postgres_gaps.py::test_a_descending_first_key_with_another_reads_an_index_backward
+  Verify: tests/backlog/test_rust_postgres_gaps.py::test_a_nulls_first_key_with_another_sorts_the_whole_join
 
 - [ ] **OPEN — RUST pgserver on LINUX: psycopg's timing tests fail in CI
       and pass on macOS (first measured 2026-10-12).** No Linux lane ran
