@@ -1700,7 +1700,7 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
     # every node's targetlist too, the filtered scan's qual prefixed, and
     # the scan under the Hash returns the select list's column first.
     "a join with a where prints its output under verbose": (
-        "RP-966",
+        "RP-966:fixed",
         _ANALYSED,
         "explain verbose select e.b, k.b from e join k on e.a = k.a where e.b = 'v1'",
         [
@@ -1714,6 +1714,60 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "        ->  Seq Scan on public.e  (cost=0.00..17.50 rows=100 width=7)",
             "              Output: e.b, e.a",
             "              Filter: (e.b = 'v1'::text)",
+        ],
+    ),
+    # Measured on PostgreSQL 15.19: the hashed side's restriction is its
+    # scan's Filter, prefixed; a column only the WHERE reads is not needed
+    # above the scan, so the Hash returns the join key alone.
+    "a join with a where on the hashed side prints its output under verbose": (
+        "RP-966:fixed",
+        _ANALYSED,
+        "explain verbose select e.b, k.b from e join k on e.a = k.a where k.b = 'v1'",
+        [
+            "Hash Join  (cost=18.75..36.39 rows=100 width=6)",
+            "  Output: e.b, k.b",
+            "  Inner Unique: true",
+            "  Hash Cond: (e.a = k.a)",
+            "  ->  Seq Scan on public.e  (cost=0.00..15.00 rows=1000 width=7)",
+            "        Output: e.a, e.b",
+            "  ->  Hash  (cost=17.50..17.50 rows=100 width=7)",
+            "        Output: k.b, k.a",
+            "        ->  Seq Scan on public.k  (cost=0.00..17.50 rows=100 width=7)",
+            "              Output: k.b, k.a",
+            "              Filter: (k.b = 'v1'::text)",
+        ],
+    ),
+    "a join with a where on both sides prints its output under verbose": (
+        "RP-966:fixed",
+        _ANALYSED,
+        "explain verbose select e.b from e join k on e.a = k.a where e.b = 'v1' and k.b = 'v2'",
+        [
+            "Hash Join  (cost=18.75..36.51 rows=10 width=3)",
+            "  Output: e.b",
+            "  Inner Unique: true",
+            "  Hash Cond: (e.a = k.a)",
+            "  ->  Seq Scan on public.e  (cost=0.00..17.50 rows=100 width=7)",
+            "        Output: e.a, e.b",
+            "        Filter: (e.b = 'v1'::text)",
+            "  ->  Hash  (cost=17.50..17.50 rows=100 width=4)",
+            "        Output: k.a",
+            "        ->  Seq Scan on public.k  (cost=0.00..17.50 rows=100 width=4)",
+            "              Output: k.a",
+            "              Filter: (k.b = 'v2'::text)",
+        ],
+    ),
+    # Measured on PostgreSQL 15.19: the computed key is a resjunk entry the
+    # scan computes, and the Sort prints it parenthesised.
+    "explain verbose of a sort on a computed key": (
+        "RP-966",
+        _ANALYSED,
+        "explain verbose select a from k order by a+1",
+        [
+            "Sort  (cost=67.33..69.83 rows=1000 width=8)",
+            "  Output: a, ((a + 1))",
+            "  Sort Key: ((k.a + 1))",
+            "  ->  Seq Scan on public.k  (cost=0.00..17.50 rows=1000 width=8)",
+            "        Output: a, (a + 1)",
         ],
     ),
     # Measured on PostgreSQL 15.19: the inner side is unique whichever

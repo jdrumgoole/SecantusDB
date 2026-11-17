@@ -1760,15 +1760,16 @@ a regression test.
       equalities with no WHERE prints every node's `Output` and its `Inner
       Unique`, and a nested loop of two relations whose inner side is a
       parameterised index scan prints both scans' physical `Output` and the
-      `Index Cond` prefixed (RP-966, in part:
+      `Index Cond` prefixed, and since 2026-11-17 such a hash join with a
+      WHERE whose conjuncts each read one relation prints them as its
+      scans' `Filter`, prefixed (RP-966, in part:
       `ruleutils::explain_verbose_join`, `explain::attach_verbose_join`,
       `explain::attach_verbose_nested_loop`). Every other join does not:
       PostgreSQL 15.19 prints a Merge Join's, its Materialize's and
       Memoize's `Output` likewise, and a nested loop's `Join Filter`
-      prefixed; here the plain plan. Nor does a join with a WHERE (its
-      scans' quals prefixed, and the scan under the Hash returns its
-      `needed` columns in `reltarget` order, select list first: `Output:
-      e.b, e.a`), an ON that is not column comparisons, or three or more
+      prefixed; here the plain plan. Nor does a nested loop with a WHERE,
+      a WHERE conjunct reading both relations, an ON that is not column
+      comparisons, or three or more
       relations; nor a Sort on a computed key (`order by a+1`
       prints `Output: a, ((a + 1))` and `Sort Key: ((k.a + 1))` over a scan
       whose `Output: a, (a + 1)`): `attach_verbose` declines a key that is
@@ -1777,7 +1778,7 @@ a regression test.
       than one relation; a node under a Hash, Sort or Material returns only
       the columns needed above, `CP_SMALL_TLIST`), its quals and keys
       printed with `unqualified = false`.
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a join with a where prints its output under verbose]
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[explain verbose of a sort on a computed key]
       Backlog-ID: RP-966
 
 

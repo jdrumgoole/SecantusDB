@@ -3280,9 +3280,16 @@ pub(crate) fn attach_verbose(
         return;
     };
     root.name = format!("{head} on {}", v.relation);
-    for (label, value) in &mut root.details {
+    prefix_quals(root, &v.quals);
+    root.details.insert(0, ("Output".into(), output.join(", ")));
+}
+
+/// A scan's quals as VERBOSE prints them: each conjunct the plain plan
+/// printed replaced by its prefixed form.
+fn prefix_quals(scan: &mut PlanNode, quals: &[(String, String)]) {
+    for (label, value) in &mut scan.details {
         if matches!(label.as_str(), "Filter" | "Index Cond" | "Recheck Cond") {
-            for (bare, qualified) in &v.quals {
+            for (bare, qualified) in quals {
                 if *value == *bare {
                     value.clone_from(qualified);
                 } else {
@@ -3292,7 +3299,6 @@ pub(crate) fn attach_verbose(
             }
         }
     }
-    root.details.insert(0, ("Output".into(), output.join(", ")));
 }
 
 /// `EXPLAIN VERBOSE` of a two-relation hash join (RP-966): every node
@@ -3326,7 +3332,11 @@ pub(crate) fn attach_verbose_join(
         return;
     }
     let rel_of = |n: &PlanNode| -> Option<usize> {
-        if !is_scan_name(&n.name) || n.details.iter().any(|(k, _)| k != "Index Cond") {
+        if !is_scan_name(&n.name)
+            || n.details
+                .iter()
+                .any(|(k, _)| k != "Index Cond" && k != "Filter")
+        {
             return None;
         }
         v.rels
@@ -3336,7 +3346,12 @@ pub(crate) fn attach_verbose_join(
     let (Some(o), Some(i)) = (rel_of(outer), rel_of(inner)) else {
         return;
     };
-    if o == i {
+    // A scan with a Filter must print each of its relation's WHERE
+    // conjuncts, and one without none of them.
+    let filtered = |n: &PlanNode, r: &secantus_pgplan::ruleutils::VerboseRel| {
+        n.details.iter().any(|(k, _)| k == "Filter") == !r.quals.is_empty()
+    };
+    if o == i || !filtered(outer, &v.rels[o]) || !filtered(inner, &v.rels[i]) {
         return;
     }
     let requalify = |n: &mut PlanNode, r: &secantus_pgplan::ruleutils::VerboseRel| {
@@ -3344,6 +3359,7 @@ pub(crate) fn attach_verbose_join(
         n.name = format!("{}{}", &n.name[..at], r.relation);
     };
     requalify(outer, &v.rels[o]);
+    prefix_quals(outer, &v.rels[o].quals);
     outer
         .details
         .insert(0, ("Output".into(), v.rels[o].columns.join(", ")));
@@ -3351,6 +3367,7 @@ pub(crate) fn attach_verbose_join(
     hash.details.insert(0, ("Output".into(), needed.clone()));
     let inner = &mut hash.children[0];
     requalify(inner, &v.rels[i]);
+    prefix_quals(inner, &v.rels[i].quals);
     inner.details.insert(0, ("Output".into(), needed));
     root.details
         .insert(0, ("Output".into(), v.output.join(", ")));
@@ -3363,7 +3380,10 @@ pub(crate) fn attach_verbose_join(
 /// PostgreSQL 15.19 prints `Index Cond: (k.a > e.a)`. Any other nested
 /// loop prints as without VERBOSE.
 fn attach_verbose_nested_loop(root: &mut PlanNode, v: &secantus_pgplan::ruleutils::VerboseJoin) {
-    if !root.details.is_empty() || root.children.len() != 2 {
+    if !root.details.is_empty()
+        || root.children.len() != 2
+        || v.rels.iter().any(|r| !r.quals.is_empty())
+    {
         return;
     }
     let rel_of = |n: &PlanNode| -> Option<usize> {
