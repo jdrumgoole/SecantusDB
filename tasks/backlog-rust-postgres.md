@@ -2664,8 +2664,16 @@ still computed whole, and the cursor answers that differ either way.
       re-read to re-run the plan for a volatile select list, as
       `ExecutorRewind` and a backward scan do: the computed rows kept in
       `CursorState` (`trim_cursor`, `persist_holdable_cursors`) would have
-      to be re-run from the plan instead. Builds on RP-961's row-stream
-      filter, so work that first. Found while working RP-895
+      to be re-run from the plan instead. In PostgreSQL the scan node
+      projects every tuple it returns (`ExecScan`), backward included, so
+      a re-read runs the select list again over the same source row: the
+      cursor needs its source rows kept (not only the encoded `DataRow`s
+      of `project_stream_into`) and the select list projected per read
+      when it is volatile, in the FETCH / MOVE window code
+      (`fetch_cursor` and `fill_cursor` / `pull_pending`). RP-961
+      (2026-11-17) left a per-row WHERE to the row stream and to
+      `CursorTail::residual`, which keeps the untested source rows a
+      re-read would project again. Found while working RP-895
       (2026-11-14).
       Verify: tests/backlog/test_rp_found_rp744.py::test_a_cursor_recomputes_a_volatile_column_when_it_reads_a_row_again
       Backlog-ID: RP-962
