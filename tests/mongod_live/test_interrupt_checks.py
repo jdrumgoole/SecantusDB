@@ -336,6 +336,39 @@ PIPELINES: dict[str, tuple[Callable[[Any], Any], Callable[[Any], Any], tuple[str
         _pipeline([{"$match": {"x": {"$gt": 2}}}, *_GROUP_SORT]),
         _PIPELINE,
     ),
+    # A `$count`, `$sortByCount` or `$bucket` is a `$group` SBE takes and a
+    # `$project` or `$sort` the pipeline runs over the cursor stage, counted
+    # as a `$sort` after a `$group` is (RM-360, measured 8.2.11 2026-11-17:
+    # a `$count` 5 at any size; a `$sortByCount` of 300 groups 12 and a
+    # `getMore` of 3).
+    "aggregate counting": (_groups(300), _pipeline([{"$count": "n"}]), _PIPELINE),
+    "aggregate counting groups": (
+        seed,
+        _pipeline([{"$group": {"_id": "$y"}}, {"$count": "n"}]),
+        _PIPELINE,
+    ),
+    "aggregate with a $sortByCount of 300": (
+        _groups(300),
+        _pipeline([{"$sortByCount": "$y"}]),
+        _PIPELINE,
+    ),
+    "aggregate with a $sortByCount of groups": (
+        _groups(300),
+        _pipeline([{"$group": {"_id": "$y"}}, {"$sortByCount": "$_id"}]),
+        _PIPELINE,
+    ),
+    "aggregate with a $bucket": (
+        _groups(300),
+        _pipeline([{"$bucket": {"groupBy": "$y", "boundaries": [0, 1000]}}]),
+        _PIPELINE,
+    ),
+    # 49 buckets, the most SBE takes: a `$bucket` of 50 is a `$switch` of 50
+    # branches, which keeps its `$group` classic.
+    "aggregate with a $bucket of 49 buckets": (
+        _groups(300),
+        _pipeline([{"$bucket": {"groupBy": "$y", "boundaries": [*range(0, 294, 6), 1000]}}]),
+        _PIPELINE,
+    ),
     "aggregate with a $reduce of 50": (
         _arrays(50),
         _pipeline(

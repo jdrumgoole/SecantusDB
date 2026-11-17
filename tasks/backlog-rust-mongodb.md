@@ -715,7 +715,11 @@ These are explicit non-goals. Don't add them without a reason.
       alone. Since 2026-11-17 a `$sort` alone after a `$group` SBE runs
       counts the cursor stage's buffers (each a global IS) and its own and
       the cursor stage's `getNext`s, and its `getMore`s go on counting
-      with no lock of their own. The line of a `find`, `count`
+      with no lock of their own; so, since the same day, do a `$count`,
+      `$sortByCount` and `$bucket` SBE runs (the `$group` mongod expands
+      each into, with the `$project` or `$sort` after it left to the
+      pipeline), and a `$switch` of 50 branches or more (a `$bucket` of 50
+      buckets or more) keeps its `$group` classic, as on mongod. The line of a `find`, `count`
       or `distinct` of a collection with one candidate plan, a `getMore` of
       a `find`, an `aggregate` of a collection mongod's query layer runs
       whole, or whose stages after its cursor stage are `$project`,
@@ -736,10 +740,9 @@ These are explicit non-goals. Don't add them without a reason.
       - the other aggregates: one with a `$match` or `$redact` left after
         its read, a `$limit` there (it stops its source short
         of the documents this server runs in one go), a `$lookup`,
-        `$unionWith`, `$facet`, `$geoNear` or `$out` / `$merge`, a stage
-        read whole that SBE does not take whole (a `$count` or `$bucket`
-        after a `$group`: 5 on mongod; a `$sort` alone after one is
-        counted), one over a
+        `$unionWith`, `$facet`, `$geoNear` or `$out` / `$merge`, a `$group`
+        run classic over the cursor stage (a `$bucket` of 400 buckets: 16
+        and a `getMore` of 4 on mongod), one over a
         view or a time-series collection, and one asked for a first batch
         of none;
       - `findAndModify`: counted as the other writes are, it matches mongod

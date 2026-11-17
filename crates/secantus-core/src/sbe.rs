@@ -182,12 +182,28 @@ pub fn expression_compatible(expr: &Bson) -> bool {
                 if matches!(op.as_str(), "$literal" | "$const") {
                     return true;
                 }
+                if op == "$switch" && switch_branches(d) >= MAX_SBE_SWITCH_BRANCHES {
+                    return false;
+                }
                 d.values().all(expression_compatible)
             }
             _ => d.values().all(expression_compatible),
         },
         _ => true,
     }
+}
+
+/// The fewest `$switch` branches that keep an expression out of SBE: mongod
+/// 8.2.11 runs a `$group` whose `_id` is a `$switch` of 49 branches in SBE
+/// and one of 50 classic, a `default` not counted, and so a `$bucket` of 50
+/// boundaries in SBE and one of 51 classic (measured 2026-11-17, RM-360).
+const MAX_SBE_SWITCH_BRANCHES: usize = 50;
+
+fn switch_branches(d: &Document) -> usize {
+    d.get_document("$switch")
+        .ok()
+        .and_then(|s| s.get_array("branches").ok())
+        .map_or(0, Vec::len)
 }
 
 /// Whether a `$match` filter compiles: its `$expr`s, and no `$jsonSchema`.
@@ -319,7 +335,12 @@ fn pushed(
                 Some(Bson::Document(o)) => o.values().all(accumulator_compatible),
                 _ => true,
             };
-            (group_by && output).then_some(true)
+            // mongod expands it into a `$group` on a `$switch` of a branch
+            // per pair of boundaries.
+            let branches = b
+                .get_array("boundaries")
+                .map_or(0, |a| a.len().saturating_sub(1));
+            (group_by && output && branches < MAX_SBE_SWITCH_BRANCHES).then_some(true)
         }
         ("$lookup", Bson::Document(l)) => {
             if l.contains_key("pipeline")
@@ -668,6 +689,26 @@ impl Build<'_> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_switch_of_fifty_branches_stays_classic() {
+        let switch = |k: i32| {
+            let branches: Vec<bson::Bson> = (0..k)
+                .map(|i| bson::Bson::Document(bson::doc! {"case": {"$eq": ["$y", i]}, "then": i}))
+                .collect();
+            bson::doc! {"$group": {"_id": {"$switch": {"branches": branches, "default": -1}}}}
+        };
+        let bucket = |n: i32| {
+            let bounds: Vec<i32> = (0..n).collect();
+            bson::doc! {"$bucket": {"groupBy": "$y", "boundaries": bounds}}
+        };
+        let none = |_: &str| false;
+        let pd = |d: bson::Document| pushdown(&[bson::Bson::Document(d)], &none);
+        assert_eq!(pd(switch(49)), Some(1));
+        assert_eq!(pd(switch(50)), None);
+        assert_eq!(pd(bucket(50)), Some(1));
+        assert_eq!(pd(bucket(51)), None);
+    }
+
     use super::*;
     use bson::doc;
 

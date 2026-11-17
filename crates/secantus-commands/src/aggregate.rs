@@ -673,8 +673,10 @@ pub fn aggregate(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     let mut read_pipeline: Vec<Bson> = Vec::new();
     // Whether the leading `$sort` blocks, for the pipeline run below.
     let mut leading_guard: Option<secantus_core::aggregate::LeadingSort> = None;
-    // The pipeline is a `$group` mongod's slot-based engine runs, read
-    // through its cursor stage by a `$sort` (RM-360).
+    // The pipeline's last stage reads what mongod's slot-based engine
+    // ran through its cursor stage: a `$sort` after a `$group`, or the
+    // `$sort` or `$project` of a `$bucket`, `$sortByCount` or `$count`
+    // (RM-360).
     let mut sorted_after_sbe = false;
     // Fetch the input documents + decide the remaining pipeline.
     let (ns, input, working_pipeline): (String, Vec<Document>, Vec<Bson>) = match &coll {
@@ -7247,8 +7249,13 @@ mod documents_argument_tests {
 /// The documents mongod's cursor stage loads into its first buffer.
 const CURSOR_STAGE_FIRST_BUFFER: usize = 32;
 
-/// Whether `pipeline` is a `$group` (and the stages before it) that mongod's
-/// slot-based engine runs, followed by nothing but a `$sort` (RM-360).
+/// Whether `pipeline` ends in a stage the classic engine runs over
+/// mongod's cursor stage after the stages its slot-based engine took
+/// (RM-360): a `$group` followed by nothing but a `$sort`, or a `$count`,
+/// `$bucket` or `$sortByCount`, which mongod expands into a `$group` SBE
+/// takes and a `$project` (`$count`) or `$sort` it leaves to the pipeline
+/// (measured 8.2.11 2026-11-17: `[{$count}]` 5, `[{$sortByCount}]` of 300
+/// groups 12 and a `getMore` of 3, as a `$sort` of 300 groups).
 fn sort_after_sbe_group(
     storage: &dyn crate::storage::Storage,
     db: &str,
@@ -7267,6 +7274,15 @@ fn sort_after_sbe_group(
             .and_then(|d| d.keys().next())
             .map_or(String::new(), String::clone)
     };
+    if pushed > 0
+        && hoisted.len() == pushed
+        && matches!(
+            name(&hoisted[pushed - 1]).as_str(),
+            "$count" | "$bucket" | "$sortByCount"
+        )
+    {
+        return true;
+    }
     pushed > 0
         && hoisted.len() == pushed + 1
         && name(&hoisted[pushed - 1]) == "$group"
