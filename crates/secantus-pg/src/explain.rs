@@ -3362,10 +3362,7 @@ pub(crate) fn attach_verbose_join(
 /// and the inner scan's `Index Cond` prefixes its own column, as
 /// PostgreSQL 15.19 prints `Index Cond: (k.a > e.a)`. Any other nested
 /// loop prints as without VERBOSE.
-fn attach_verbose_nested_loop(
-    root: &mut PlanNode,
-    v: &secantus_pgplan::ruleutils::VerboseJoin,
-) {
+fn attach_verbose_nested_loop(root: &mut PlanNode, v: &secantus_pgplan::ruleutils::VerboseJoin) {
     if !root.details.is_empty() || root.children.len() != 2 {
         return;
     }
@@ -3410,10 +3407,12 @@ fn attach_verbose_nested_loop(
         let node = &mut root.children[n];
         let at = node.name.len() - r.plain.len();
         node.name = format!("{}{}", &node.name[..at], r.relation);
-        node.details.insert(0, ("Output".into(), r.columns.join(", ")));
+        node.details
+            .insert(0, ("Output".into(), r.columns.join(", ")));
     }
     root.children[1].details[1].1 = cond;
-    root.details.insert(0, ("Output".into(), v.output.join(", ")));
+    root.details
+        .insert(0, ("Output".into(), v.output.join(", ")));
 }
 
 /// A single-relation plan's scan names the relation's alias after it, as
