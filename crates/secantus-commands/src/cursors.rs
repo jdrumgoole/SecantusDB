@@ -1210,7 +1210,32 @@ fn mint_id(cursors: &HashMap<i64, Entry>, tailable: bool) -> Result<i64, CursorE
 /// connection's first command (RM-386, measured 8.2.11). The cursor's id.
 pub(crate) fn get_more_parse(doc: &Document) -> Result<i64, CommandError> {
     // mongod PARSES before it looks the cursor up, so a wrong-typed argument is
-    // its own error rather than CursorNotFound about a cursor that exists.
+    // its own error rather than CursorNotFound about a cursor that exists. Its
+    // IDL checks the other fields' types and unknown fields first, then the
+    // required `collection`, and the command-name field (the cursor id) last:
+    // `{getMore: 1}` is refused for the missing `collection` (RM-606,
+    // measured 8.2.11).
+    if doc.contains_key("collection") {
+        argtypes::require_required_string(doc, "collection", "getMore.collection")?;
+    }
+    argtypes::require_number(doc, "batchSize", "getMore.batchSize")?;
+    argtypes::require_number(doc, "maxTimeMS", "getMore.maxTimeMS")?;
+    const FIELDS: &[&str] = &[
+        "getMore",
+        "collection",
+        "batchSize",
+        "term",
+        "lastKnownCommittedOpTime",
+        "includeQueryStatsMetrics",
+    ];
+    if let Some(key) = argtypes::unknown_field(doc, FIELDS) {
+        return Err(CommandError::new(
+            40415,
+            "IDLUnknownField",
+            format!("BSON field 'getMore.{key}' is an unknown field."),
+        ));
+    }
+    argtypes::require_required_string(doc, "collection", "getMore.collection")?;
     let cursor_id = match doc.get("getMore") {
         Some(Bson::Int64(id)) => *id,
         None | Some(Bson::Null) => {
@@ -1231,24 +1256,6 @@ pub(crate) fn get_more_parse(doc: &Document) -> Result<i64, CommandError> {
             ))
         }
     };
-    argtypes::require_required_string(doc, "collection", "getMore.collection")?;
-    argtypes::require_number(doc, "batchSize", "getMore.batchSize")?;
-    argtypes::require_number(doc, "maxTimeMS", "getMore.maxTimeMS")?;
-    const FIELDS: &[&str] = &[
-        "getMore",
-        "collection",
-        "batchSize",
-        "term",
-        "lastKnownCommittedOpTime",
-        "includeQueryStatsMetrics",
-    ];
-    if let Some(key) = argtypes::unknown_field(doc, FIELDS) {
-        return Err(CommandError::new(
-            40415,
-            "IDLUnknownField",
-            format!("BSON field 'getMore.{key}' is an unknown field."),
-        ));
-    }
     if let Some(n) = doc.get("batchSize").and_then(as_i64).filter(|n| *n < 0) {
         return Err(CommandError::new(
             2,

@@ -784,14 +784,6 @@ These are explicit non-goals. Don't add them without a reason.
       Found while working RM-604, 2026-11-17.
       Verify: tests/backlog/test_rm_found_rm604.py::test_an_empty_densify_range_or_fill_output_is_refused_as_mongod_refuses_it
       Backlog-ID: RM-716
-- [ ] **A `getMore` with an int cursor id is refused for its type.**
-      mongod 8.2.11 reads `{getMore: 5, collection: "c"}` as cursor 5
-      (CursorNotFound, 43), and `{getMore: 1}` is refused for the missing
-      `collection`; this server refuses the int with 14, "BSON field
-      'getMore.getMore' is the wrong type 'int', expected type 'long'".
-      Found while working RM-386, 2026-11-13.
-      Verify: tests/backlog/test_rm_found_rm386.py::test_a_get_more_takes_an_int_cursor_id
-      Backlog-ID: RM-606
 - [ ] **A command refused as it runs is profiled where mongod's is not,
       and the other way.** mongod 8.2.11 profiles a `distinct` refused for
       its fields; it profiles no `findAndModify` with neither `update` nor

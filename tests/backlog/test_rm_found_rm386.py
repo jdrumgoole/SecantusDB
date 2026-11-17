@@ -239,18 +239,24 @@ def _get_more_int_id(client: Any) -> tuple:
     db = client.rm386g
     client.drop_database(db.name)
     db.c.insert_one({"_id": 1})
-    return mongo_answer(lambda: db.command({"getMore": 5, "collection": "c"}))
+    return (
+        mongo_answer(lambda: db.command({"getMore": 5, "collection": "c"})),
+        mongo_answer(lambda: db.command({"getMore": 1})),
+    )
 
 
-@pytest.mark.backlog("RM-606")
+@pytest.mark.backlog_fixed("RM-606")
 def test_a_get_more_takes_an_int_cursor_id(rust_mongo: Any, mongod_rs: Any) -> None:
-    """mongod 8.2.11 reads a `getMore` cursor id given as an int as the
-    cursor id (`{getMore: 1}` with no `collection` is refused for the
-    missing field, not the id's type); this server refuses the int with 14,
-    "BSON field 'getMore.getMore' is the wrong type 'int', expected type
-    'long'"."""
-    assert _get_more_int_id(rust_mongo) == _get_more_int_id(mongod_rs)
-    assert _get_more_int_id(mongod_rs)[:2] == ("err", 43)
+    """mongod 8.2.11 refuses a `getMore` cursor id given as an int for its
+    type (14, "... expected type 'long'"), as this server did; but its IDL
+    checks the cursor id LAST, so `{getMore: 1}` with no `collection` is
+    refused for the missing field (40414). This server refused the int's
+    type first. (The item as filed said mongod takes the int; it does
+    not -- re-measured 2026-11-17.)"""
+    rust, mongod = _get_more_int_id(rust_mongo), _get_more_int_id(mongod_rs)
+    assert rust == mongod
+    assert mongod[0][:2] == ("err", 14)
+    assert mongod[1][:2] == ("err", 40414)
 
 
 # ------------------------------------- refused commands' profile entries --
