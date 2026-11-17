@@ -2067,17 +2067,6 @@ Measured on PostgreSQL 15.19 (the data-modifying WITH on a private cluster).
 
 ## Found while working RP-485 (2026-11-11)
 
-- [ ] **A function found nowhere inside another call's arguments is
-      reported as the outer call's missing overload.** On PostgreSQL 15.19
-      `select abs(nosuch1())` is 42883 `function nosuch1() does not exist`
-      at 12: `transformFuncCall` analyses the arguments before it looks
-      the outer function up. Here it is `function abs(text) does not
-      exist` at 8 -- the inner call is typed and the outer lookup fails
-      first. (A refused qualified name inside the arguments,
-      `abs(a.b.c())`, is already answered right, RP-880.) Measured on
-      PostgreSQL 15.19.
-      Verify: tests/backlog/test_rp_qualified_calls.py::test_enclosing_call_waits_for_its_arguments
-      Backlog-ID: RP-950
 
 
 ## Found while working RP-472 (2026-11-07)

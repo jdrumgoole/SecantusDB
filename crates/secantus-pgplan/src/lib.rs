@@ -5374,7 +5374,8 @@ fn statement_type_names(node: &N) -> (Vec<pg_query::protobuf::TypeName>, Option<
                 pg_query::NodeRef::TypeCast(tc) => out.extend(tc.type_name.clone()),
                 pg_query::NodeRef::ColumnDef(cd) => out.extend(cd.type_name.clone()),
                 pg_query::NodeRef::FuncCall(f) => {
-                    if let Some(missing) = refused_call_name(f) {
+                    if let Some(missing) = refused_call_name(f).or_else(|| missing_argument_call(f))
+                    {
                         if call.as_ref().is_none_or(|c| f.location < c.location) {
                             call = Some(missing);
                         }
@@ -5469,6 +5470,52 @@ enum CallNameRefusal {
     TooManyDots(String),
     /// A schema that does not exist.
     MissingSchema(String),
+    /// A call in another call's arguments to a name no function has: its
+    /// own 42883, met before the enclosing call is looked up.
+    MissingFunction(Error),
+}
+
+/// The first call in `f`'s arguments, by position, to an unqualified name
+/// no function, aggregate or window function has. PostgreSQL's
+/// `transformFuncCall` analyses the arguments before it looks `f` up, so
+/// that call's 42883 comes first: `abs(nosuch1())` is `function nosuch1()
+/// does not exist`, not `abs(text)`.
+fn missing_argument_call(f: &pg_query::protobuf::FuncCall) -> Option<RefusedCallName> {
+    let unknown = |name: &str| {
+        !name.starts_with("__")
+            && !funcsig::is_builtin_function_name(name)
+            && !is_builtin_aggregate_or_window(name)
+            && !user_agg::is_user_aggregate(name)
+            && !correlated::user_function_named(name)
+            && !correlated::user_function_bare_named(name)
+            && extension_of_function(name).is_none()
+    };
+    f.args
+        .iter()
+        .filter_map(|a| a.node.as_ref())
+        .flat_map(|n| n.nodes())
+        .filter_map(|(n, _, _, _)| match n {
+            pg_query::NodeRef::FuncCall(g) => Some(g),
+            _ => None,
+        })
+        .filter(|g| g.funcname.len() == 1)
+        .filter_map(|g| match g.funcname[0].node.as_ref() {
+            Some(N::String(s)) if unknown(&s.sval) => Some((g, s.sval.clone())),
+            _ => None,
+        })
+        .min_by_key(|(g, _)| g.location)
+        .map(|(g, name)| {
+            // `no_such_call` points the error at the call; the statement
+            // has not failed yet, so the recorded location is put back.
+            let previous = peek_error_location();
+            let error = no_such_call(g, &name);
+            ERROR_LOCATION.with(|l| l.set(previous));
+            RefusedCallName {
+                location: g.location,
+                refusal: CallNameRefusal::MissingFunction(error),
+                function: name,
+            }
+        })
 }
 
 thread_local! {
@@ -5541,6 +5588,23 @@ fn answer_refused_call_name(
     let Some(missing) = missing else {
         return plan();
     };
+    // An argument's missing function replaces only the enclosing call's
+    // own 42883: anything else the plan meets, or its success, stands.
+    if matches!(missing.refusal, CallNameRefusal::MissingFunction(_)) {
+        return match planning_without_running(plan) {
+            Err(e)
+                if missing_function_name(&e).is_some_and(|other| {
+                    other != missing.function
+                        && peek_error_location()
+                            .or_else(|| first_call_location(sql, other))
+                            .is_some_and(|at| call_encloses(sql, at, missing.location))
+                }) =>
+            {
+                Err(missing.error())
+            }
+            other => other,
+        };
+    }
     match planning_without_running(plan) {
         Err(e) => match missing_function_name(&e) {
             None if !["0A", "21", "22"].contains(&&e.sqlstate()[..2]) => Err(e),
@@ -5596,6 +5660,7 @@ impl RefusedCallName {
             CallNameRefusal::MissingSchema(schema) => {
                 Error::Sqlstate("3F000", format!("schema \"{schema}\" does not exist"))
             }
+            CallNameRefusal::MissingFunction(e) => e.clone(),
         }
     }
 }
