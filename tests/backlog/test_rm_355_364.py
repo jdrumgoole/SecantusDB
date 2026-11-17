@@ -1565,10 +1565,8 @@ def test_a_contested_aggregate_runs_its_cached_plan(rust_mongo: Any, mongod_rs: 
     "stage",
     [
         pytest.param({"$sort": {"z": 1}}, marks=pytest.mark.backlog_fixed("RM-363")),
-        # The group runs in SBE, whose plan cache replans as RM-340 measured:
-        # still open.
         pytest.param(
-            {"$group": {"_id": "$z", "n": {"$sum": 1}}}, marks=pytest.mark.backlog("RM-363")
+            {"$group": {"_id": "$z", "n": {"$sum": 1}}}, marks=pytest.mark.backlog_fixed("RM-363")
         ),
     ],
 )
@@ -1578,8 +1576,8 @@ def test_a_contested_aggregate_that_does_not_stream_counts_what_it_examined(
     """mongod 8.2.11's line for a contested `aggregate` that sorts or groups
     what its `$match` reads counts what the winner examined (133 keys and
     documents for both, measured 2026-11-13). This server read such a
-    pipeline whole through its store's router, and counted nothing; since
-    2026-11-16 a sorting one runs the trial's winner and counts it."""
+    pipeline whole through its store's router, and counted nothing, until
+    both ran the trial's winner after its trial and counted it (RM-363)."""
     answers = _contested_lines(
         rust_mongo,
         mongod_rs,
@@ -1976,3 +1974,23 @@ def test_an_update_statement_takes_mongods_execution_tickets(
         "mongod": _update_admissions(mongod_rs, True),
     }
     assert got["rust"] == got["mongod"]
+
+
+@pytest.mark.backlog_fixed("RM-363")
+def test_a_contested_group_run_again_counts_what_its_cached_plan_examined(
+    rust_mongo: Any, mongod_rs: Any
+) -> None:
+    """mongod 8.2.11 runs a contested `aggregate` that groups what its
+    `$match` reads in SBE; run twice, each line counts what its plan
+    examined and the plan cache holds the same entry. This server counted
+    nothing for either until the grouping front ran the trial's winner
+    (RM-363)."""
+    pipeline = [{"$match": _TWO_INDEXES}, {"$group": {"_id": "$z", "n": {"$sum": 1}}}]
+
+    def twice(db: Any) -> None:
+        for _ in range(2):
+            list(db.c.aggregate(pipeline, batchSize=50))
+
+    answers = _contested_lines(rust_mongo, mongod_rs, twice)
+    assert answers["mongod"][0][0][1].get("keysExamined") == 133
+    assert answers["rust"] == answers["mongod"]

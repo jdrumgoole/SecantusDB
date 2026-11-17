@@ -986,9 +986,13 @@ pub fn aggregate(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
                                 limit: front.limit,
                                 sort,
                                 projection: front.projection.as_ref(),
-                                // A front SBE runs keeps its plan cache's
-                                // own replanning: read as before.
-                                cached: !sbe_read,
+                                // A front SBE runs is tried through the
+                                // plan cache too (RM-363), but one that
+                                // takes a skip or a limit keeps its read:
+                                // its entry's reads are the trial's to
+                                // that limit, which this read does not
+                                // bound (RM-340).
+                                cached: !sbe_read || (front.skip == 0 && front.limit == 0),
                                 distinct: None,
                                 sbe: sbe_read,
                             },

@@ -799,18 +799,18 @@ These are explicit non-goals. Don't add them without a reason.
       RM-359 its profile entry carries its stages (`execStats`); these do
       neither:
       - a read two or more plans could serve, which mongod chooses by
-        trial, other than a `find`'s or an `aggregate`'s that streams or
-        sorts: an `aggregate` that groups what its `$match` reads (mongod:
-        133 keys and documents over 400, this server none; the group runs
-        in SBE, and a trial outside the store's router misses SBE's
-        replanning at ten times the cached reads, RM-340), a `count`'s, a
+        trial, other than a `find`'s or an `aggregate`'s: an `aggregate`
+        that groups what a `$match` and a `$skip` or `$limit` read (in SBE
+        the entry's reads are the trial's to that limit, and the counted
+        read does not yet bound its trial by it; RM-340's test pins the
+        plan), a `count`'s, a
         `distinct`'s, a write's. Its documents come from the store's
         router. mongod counts what the winner examined in its trial, and
-        since RM-349 a `find` (since 2026-11-13 an unsorted `aggregate` of
-        stages that stream, since 2026-11-16 a classic one that sorts what
-        its `$match` reads) runs the winner after its trial's buffer and
-        counts as mongod's does; the other readers still decline a
-        contested plan (`order::stream_plan`);
+        since RM-349 a `find` and an `aggregate` (one that streams, sorts
+        or, since 2026-11-17, groups what its `$match` reads) run the
+        winner after its trial's buffer and count as mongod's do; the
+        other readers still decline a contested plan
+        (`order::stream_plan`);
       - a read of a time-series collection made whole: under a `$sort`, a
         `$group` (`count_documents`), an inclusion `$project` (RM-456), a
         filter on the meta field (RM-457), a hint or a collation. mongod
@@ -821,7 +821,7 @@ These are explicit non-goals. Don't add them without a reason.
         mongod 5 keys and 4 documents, this server none).
       Measured 2026-10-27, 2026-11-07, 2026-11-10 and 2026-11-13.
       Backlog-ID: RM-363
-      Verify: tests/backlog/test_rm_355_364.py::test_a_contested_aggregate_that_does_not_stream_counts_what_it_examined, tests/backlog/test_rm_355_364.py::test_a_time_series_read_made_whole_counts_what_it_examined
+      Verify: tests/backlog/test_rm_355_364.py::test_a_time_series_read_made_whole_counts_what_it_examined
 - [ ] **WiredTiger 11's interruptible cache wait is not on the line.**
       mongod 8.2.11's WiredTiger splits a cache wait into the share spent
       in interruptible eviction (`timeWaitingMicros.cacheInterruptibleMicros`)
