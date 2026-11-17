@@ -1463,7 +1463,7 @@ batch, their tests regression tests:
       - GIN `=` on arrays, and opclasses other than `array_ops`,
         `jsonb_ops`, `jsonb_path_ops` and `tsvector_ops` (btree_gin), whose
         indexes `pg_relation_size` reads as 0; array elements other than ints,
-        floats, bool and C-ordered text; an ANALYZEd array column (MCELEM
+        floats, bool and text (in byte order or under an ICU collation); an ANALYZEd array column (MCELEM
         statistics);
       - `jsonb_ops` scans (`@>`, `?`, `?|`, `?&`): its pages and keys are
         modelled, its `extractQuery` and consistent functions are not;
@@ -1491,16 +1491,15 @@ batch, their tests regression tests:
         the same layout on three runs).
       The size functions read the modelled indexes' pages (since RP-287's
       first slice); an unmodelled one still reads 0 from
-      `pg_relation_size`: a GIN index over a column with a collation of its
-      own that does not order by bytes (`en_US` and the like; array or
-      `btree_gin` text; the model orders text by bytes only). `C`, `POSIX`
-      and `C.UTF-8` have been modelled since 2026-11-17.
+      `pg_relation_size`. Text keys under a column's ICU collation have
+      been ordered as `varstr_cmp` orders them since 2026-11-17 (libc
+      collations such as `en_US` do not exist here, a scope decision).
       A `btree_gin` index over a scalar `int2`/`int4`/`int8`/`float4`/
       `float8`/`bool`/`text` column has been modelled since 2026-11-17 (one
       key per row, the value itself); its scans are not, nor its other
       types (`date`, `timestamp`, `numeric`, ...).
       Backlog-ID: RP-287
-      Verify: tests/backlog/test_rp_top10_found.py::test_a_linguistically_collated_btree_gin_index_has_its_pages
+      Verify: tests/backlog/test_rp_top10_found.py::test_a_btree_gin_date_index_has_its_pages
 
 
 ## Found by batch 71 (2026-10-25)
