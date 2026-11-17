@@ -782,12 +782,6 @@ These are explicit non-goals. Don't add them without a reason.
       2026-11-13.
       Verify: tests/backlog/test_rm_found_2026_11_13_rm495.py::test_a_line_names_the_collection_a_command_works_through
       Backlog-ID: RM-596
-- [ ] **`deleteIndexes` is refused as a command this server does not
-      know.** mongod 8.2.11 runs it as `dropIndexes`'s alias; this server
-      answers CommandNotFound (59), though its lock, view and time-series
-      tables already list it. Found while working RM-495, 2026-11-13.
-      Verify: tests/backlog/test_rm_found_2026_11_13_rm495.py::test_delete_indexes_is_drop_indexes
-      Backlog-ID: RM-597
 - [ ] **A `create` or `dbStats` refused for a field runs before it is
       refused.** mongod 8.2.11 refuses a `create` with an unknown or
       mistyped field (`bogus`, `storageEngine: 1`, `viewOn: 1`,

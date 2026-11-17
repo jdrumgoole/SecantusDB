@@ -91,6 +91,7 @@ const STRICT: &[&str] = &[
     "drop",
     "dropDatabase",
     "dropIndexes",
+    "deleteIndexes",
     "endSessions",
     "explain",
     "features",
@@ -151,7 +152,7 @@ fn own_fields(command: &str) -> Option<&'static [&'static str]> {
             "isTimeseriesNamespace",
             "collectionUUID",
         ],
-        "dropIndexes" => &["index", "isTimeseriesNamespace", "collectionUUID"],
+        "dropIndexes" | "deleteIndexes" => &["index", "isTimeseriesNamespace", "collectionUUID"],
         "mapReduce" | "mapreduce" => &[
             "map",
             "reduce",
@@ -219,6 +220,7 @@ pub(crate) fn struct_name(command: &str) -> &str {
         "datasize" => "dataSize",
         "dbstats" => "dbStats",
         "findandmodify" => "findAndModify",
+        "deleteIndexes" => "dropIndexes",
         "mapreduce" => "mapReduce",
         other => other,
     }

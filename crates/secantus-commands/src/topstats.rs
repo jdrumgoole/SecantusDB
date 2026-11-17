@@ -31,9 +31,10 @@ pub const TOP_SECTIONS: [&str; 9] = [
 /// to `commands` is a read. Probed: `createIndexes` / `dropIndexes` /
 /// `findAndModify` are writeLock; `aggregate` / `count` / `distinct` /
 /// `listIndexes` / `explain` are readLock.
-const WRITE_COMMANDS: [&str; 10] = [
+const WRITE_COMMANDS: [&str; 11] = [
     "createIndexes",
     "dropIndexes",
+    "deleteIndexes",
     "findAndModify",
     "findandmodify",
     "create",

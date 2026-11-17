@@ -4145,7 +4145,7 @@ pub fn drop_indexes_parse(doc: &Document) -> Result<Option<Vec<String>>, Command
 
 pub fn drop_indexes(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     let names = drop_indexes_parse(doc)?;
-    let coll = coll_arg(doc, "dropIndexes")?;
+    let coll = coll_arg(doc, doc.keys().next().map_or("dropIndexes", |k| k.as_str()))?;
     let storage = ctx.storage()?;
     let exists = storage
         .list_collections(&ctx.db_name)

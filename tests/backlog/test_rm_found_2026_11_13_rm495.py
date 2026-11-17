@@ -76,14 +76,26 @@ def _delete_indexes(client: Any) -> Any:
         answer: Any = ("ok", reply.get("nIndexesWas"))
     except OperationFailure as e:
         answer = ("error", e.code)
+    refusals = []
+    for cmd in (
+        {"deleteIndexes": "c", "index": "q_1", "bogus": 1},
+        {"deleteIndexes": "c"},
+        {"deleteIndexes": 1, "index": "q_1"},
+    ):
+        try:
+            db.command(cmd)
+            refusals.append(("ok",))
+        except OperationFailure as e:
+            refusals.append((e.code, (e.details or {}).get("errmsg")))
     client.drop_database(db.name)
-    return answer
+    return answer, refusals
 
 
-@pytest.mark.backlog("RM-597")
+@pytest.mark.backlog_fixed("RM-597")
 def test_delete_indexes_is_drop_indexes(rust_mongo: Any, mongod_rs: Any) -> None:
-    """mongod 8.2.11 runs `deleteIndexes`, `dropIndexes`'s alias; this
-    server refuses it as a command it does not know (59)."""
+    """mongod 8.2.11 runs `deleteIndexes`, `dropIndexes`'s alias, and
+    refuses its fields under the name `dropIndexes`; this server refused
+    it as a command it did not know (59)."""
     answers = {"rust": _delete_indexes(rust_mongo), "mongod": _delete_indexes(mongod_rs)}
-    assert answers["mongod"][0] == "ok"
+    assert answers["mongod"][0][0] == "ok"
     assert answers["rust"] == answers["mongod"]

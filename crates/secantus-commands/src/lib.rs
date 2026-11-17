@@ -780,7 +780,7 @@ fn lookup(name: &str) -> Option<Handler> {
         "createSearchIndexes" | "updateSearchIndex" | "dropSearchIndex" => {
             admin::search_index_not_supported
         }
-        "dropIndexes" => admin::drop_indexes,
+        "dropIndexes" | "deleteIndexes" => admin::drop_indexes,
         "dropDatabase" => admin::drop_database,
         "renameCollection" => admin::rename_collection,
         "collStats" | "collstats" => stats_admin::coll_stats,
@@ -1381,6 +1381,7 @@ pub(crate) fn takes_default_write_concern(name: &str, doc: &Document) -> bool {
         | "create"
         | "createIndexes"
         | "dropIndexes"
+        | "deleteIndexes"
         | "drop"
         | "dropDatabase"
         | "renameCollection"
@@ -1546,6 +1547,7 @@ fn is_write_concern_command(name: &str) -> bool {
             | "createIndexes"
             | "drop"
             | "dropIndexes"
+            | "deleteIndexes"
             | "dropDatabase"
             | "renameCollection"
     )
@@ -1746,6 +1748,7 @@ fn collection_name_problem(name: &str, doc: &Document, db: &str) -> Option<Comma
             | "create"
             | "collMod"
             | "dropIndexes"
+            | "deleteIndexes"
             | "collStats"
             | "collstats"
             | "validate"
@@ -1806,7 +1809,7 @@ fn parse_before_locks(
         "count" => crud::count_parse(doc),
         "findAndModify" | "findandmodify" => findandmodify::parse(doc),
         "createIndexes" => argtypes::require_index_specs(doc),
-        "dropIndexes" => admin::drop_indexes_parse(doc).map(drop),
+        "dropIndexes" | "deleteIndexes" => admin::drop_indexes_parse(doc).map(drop),
         "dbStats" | "dbstats" => stats_admin::parse_db_stats(doc).map(drop),
         "listDatabases" => stats_admin::parse_list_databases(doc).map(drop),
         "drop" => admin::drop_parse(doc),
