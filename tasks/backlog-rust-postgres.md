@@ -1259,22 +1259,6 @@ one beside it.
       Verify: tests/backlog/test_rp_catalog_latency.py::test_the_first_catalog_query_after_ddl_over_two_user_types_costs_the_same_at_400_tables
       Backlog-ID: RP-970
 
-## Found while working RP-929 (2026-11-14)
-
-Since RP-929 a hash index's build (CREATE INDEX, REINDEX, a rewrite)
-records its pages and index tuples, from the metapage model
-`hash_index.rs` keeps; TRUNCATE records 0 pages, -1 tuples. Measured on a
-private 15.19 cluster:
-
-- [ ] **OPEN — a hash index has no overflow pages.** 1,000 rows of one
-      key, all in one bucket: PostgreSQL 15.19 chains overflow pages to
-      the full bucket (`_hash_addovflpage`) and records 12 pages;
-      `secantusd-pg` records 6, the 4 buckets with the metapage and the
-      bitmap page. The metapage model counts buckets, not the tuples in
-      each; overflow needs each bucket's tuple count, moved by each split.
-      Verify: tests/backlog/test_rp_found_rp929.py::test_duplicate_hash_keys_fill_overflow_pages
-      Backlog-ID: RP-956
-
 ## Found by a CI run (2026-11-07)
 
 - [ ] **OPEN — CI: `obj_description` of a commented index answered NULL

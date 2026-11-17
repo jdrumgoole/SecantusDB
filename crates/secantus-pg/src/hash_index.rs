@@ -87,7 +87,30 @@ fn total_buckets(phase: u32) -> u32 {
     (1 << (group - 1)) + (((1 << (group - 1)) >> SPLITPOINT_PHASE_BITS) * within)
 }
 
-/// The metapage's bucket fields.
+/// The index tuples a hash page holds: each is its key's 4-byte hash code
+/// after an 8-byte header, 16 bytes aligned, with a 4-byte line pointer;
+/// `_hash_doinsert` moves on while `PageGetFreeSpace` is under 16, which
+/// leaves 407 in the 8,152 bytes between the page header and the special
+/// space.
+const TUPLES_PER_PAGE: usize = 407;
+
+/// One bucket: its primary page and its overflow chain, each page's
+/// tuples as their hash codes.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct Bucket {
+    pages: Vec<Vec<u32>>,
+}
+
+impl Bucket {
+    fn empty() -> Bucket {
+        Bucket {
+            pages: vec![Vec::new()],
+        }
+    }
+}
+
+/// The metapage's bucket fields, and, for an index whose keys' hashes are
+/// reproduced, every bucket's pages.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct Meta {
     pub(crate) maxbucket: u32,
@@ -95,6 +118,14 @@ pub(crate) struct Meta {
     pub(crate) lowmask: u32,
     pub(crate) ntuples: f64,
     pub(crate) ffactor: u32,
+    /// Each bucket's pages; empty when the hashes are not reproduced, which
+    /// leaves the overflow pages out.
+    buckets: Vec<Bucket>,
+    /// The overflow pages allocated (`hashm_spares`, the bitmap page aside),
+    /// and those freed for reuse (`_hash_freeovflpage`): the file keeps
+    /// both.
+    ovfl: u32,
+    free_ovfl: u32,
 }
 
 impl Meta {
@@ -118,7 +149,146 @@ impl Meta {
             lowmask: highmask >> 1,
             ntuples: 0.0,
             ffactor,
+            buckets: Vec::new(),
+            ovfl: 0,
+            free_ovfl: 0,
         }
+    }
+
+    /// [`Self::init`], keeping each bucket's pages.
+    pub(crate) fn init_keyed(num_tuples: f64, fillfactor: u32) -> Meta {
+        let mut m = Meta::init(num_tuples, fillfactor);
+        m.buckets = (0..=m.maxbucket).map(|_| Bucket::empty()).collect();
+        m
+    }
+
+    /// `_hash_getovflpage`: a freed overflow page if the bitmap has one,
+    /// else a new one at the end of the file.
+    fn alloc_ovfl(&mut self) {
+        if self.free_ovfl > 0 {
+            self.free_ovfl -= 1;
+        } else {
+            self.ovfl += 1;
+        }
+    }
+
+    /// A tuple into the first page of bucket `b`'s chain with room for it,
+    /// or a new overflow page at its end (`_hash_addovflpage`).
+    fn add(&mut self, b: usize, hashkey: u32) {
+        if let Some(page) = self.buckets[b]
+            .pages
+            .iter_mut()
+            .find(|p| p.len() < TUPLES_PER_PAGE)
+        {
+            page.push(hashkey);
+            return;
+        }
+        self.alloc_ovfl();
+        self.buckets[b].pages.push(vec![hashkey]);
+    }
+
+    /// `_hash_squeezebucket`: the chain's tuples packed toward its start,
+    /// each overflow page left empty freed.
+    fn squeeze(&mut self, b: usize) {
+        let items: Vec<u32> = self.buckets[b].pages.concat();
+        let keep = items.len().div_ceil(TUPLES_PER_PAGE).max(1);
+        let freed = self.buckets[b].pages.len().saturating_sub(keep);
+        self.free_ovfl += freed as u32;
+        let mut pages: Vec<Vec<u32>> = items.chunks(TUPLES_PER_PAGE).map(<[u32]>::to_vec).collect();
+        if pages.is_empty() {
+            pages.push(Vec::new());
+        }
+        self.buckets[b].pages = pages;
+    }
+
+    /// `_hash_splitbucket`: each tuple of `old` that now hashes to `new` is
+    /// copied there, overflow pages added as `new` fills; then, as nothing
+    /// else holds a pin on `old`, `hashbucketcleanup` removes the copied
+    /// tuples from it and squeezes it, freeing its emptied overflow pages.
+    fn split(&mut self, old: u32, new: u32) {
+        let (old, new) = (old as usize, new as usize);
+        while self.buckets.len() <= new {
+            self.buckets.push(Bucket::empty());
+        }
+        let moving: Vec<u32> = self.buckets[old]
+            .pages
+            .iter()
+            .flatten()
+            .copied()
+            .filter(|h| self.bucket(*h) as usize == new)
+            .collect();
+        if moving.is_empty() {
+            return;
+        }
+        for h in moving {
+            self.add(new, h);
+        }
+        let unmoved = |h: &u32| {
+            let b = h & self.highmask;
+            let b = if b > self.maxbucket {
+                b & self.lowmask
+            } else {
+                b
+            };
+            b as usize != new
+        };
+        let pages: Vec<Vec<u32>> = self.buckets[old]
+            .pages
+            .iter()
+            .map(|p| p.iter().copied().filter(unmoved).collect())
+            .collect();
+        self.buckets[old].pages = pages;
+        self.squeeze(old);
+    }
+
+    /// One insert of hash code `hashkey` (`_hash_doinsert`): the tuple
+    /// placed in its bucket, then [`Self::insert`]'s count and split, whose
+    /// tuples move. The split's old and new bucket.
+    pub(crate) fn insert_key(&mut self, hashkey: u32) -> Option<(u32, u32)> {
+        if self.buckets.is_empty() {
+            return self.insert();
+        }
+        let b = self.bucket(hashkey) as usize;
+        self.add(b, hashkey);
+        let split = self.insert();
+        if let Some((old, new)) = split {
+            self.split(old, new);
+        }
+        split
+    }
+
+    /// `hashbulkdelete`: each bucket keeps the tuples of `live` (hash codes,
+    /// one per live tuple) and loses the rest; a bucket that lost one is
+    /// squeezed. The count becomes what is left.
+    pub(crate) fn bulk_delete(&mut self, live: &[u32]) {
+        if self.buckets.is_empty() {
+            self.ntuples = live.len() as f64;
+            return;
+        }
+        let mut left: HashMap<u32, usize> = HashMap::new();
+        for h in live {
+            *left.entry(*h).or_default() += 1;
+        }
+        for b in 0..self.buckets.len() {
+            let mut removed = false;
+            for page in &mut self.buckets[b].pages {
+                page.retain(|h| {
+                    let keep = match left.get_mut(h) {
+                        Some(n) if *n > 0 => {
+                            *n -= 1;
+                            true
+                        }
+                        _ => false,
+                    };
+                    removed |= !keep;
+                    keep
+                });
+            }
+            if removed {
+                self.squeeze(b);
+            }
+        }
+        self.ntuples = live.len() as f64;
     }
 
     /// `_hash_hashkey2bucket`.
@@ -154,9 +324,9 @@ impl Meta {
     /// The pages it occupies (`RelationGetNumberOfBlocks`): the metapage,
     /// the first bitmap page and the buckets of every splitpoint phase
     /// begun, which `_hash_alloc_buckets` allocates whole when its first
-    /// bucket splits off. Overflow pages are not modelled.
+    /// bucket splits off, and every overflow page allocated.
     pub(crate) fn pages(&self) -> f64 {
-        f64::from(total_buckets(spare_index(self.maxbucket + 1))) + 2.0
+        f64::from(total_buckets(spare_index(self.maxbucket + 1))) + 2.0 + f64::from(self.ovfl)
     }
 }
 
@@ -193,6 +363,16 @@ pub(crate) fn built(estimate: f64, rows: usize, fillfactor: u32) -> Meta {
     let mut m = Meta::init(estimate, fillfactor);
     for _ in 0..rows {
         m.insert();
+    }
+    m
+}
+
+/// [`built`] over the rows' hash codes, in heap order, each placed in its
+/// bucket's pages.
+pub(crate) fn built_keyed(estimate: f64, keys: &[u32], fillfactor: u32) -> Meta {
+    let mut m = Meta::init_keyed(estimate, fillfactor);
+    for h in keys {
+        m.insert_key(*h);
     }
     m
 }
@@ -371,8 +551,23 @@ impl crate::PgHandler {
         let estimate = self
             .planner_table(table, count)
             .map_or(count as f64, |pt| pt.tuples);
+        if shape.modelled {
+            let keys = self.hash_keys(table, shape);
+            let n = keys.len();
+            return (built_keyed(estimate, &keys, shape.fillfactor), n);
+        }
         let indexed = self.hash_indexed(table, shape);
         (built(estimate, indexed, shape.fillfactor), indexed)
+    }
+
+    /// The hash codes of the rows of `table` a modelled `shape` indexes, in
+    /// heap order.
+    fn hash_keys(&self, table: &str, shape: &HashShape) -> Vec<u32> {
+        self.table_docs(table)
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|d| shape.hashkey(d))
+            .collect()
     }
 
     /// `index`'s metapage, built over the rows now if it has none.
@@ -395,7 +590,7 @@ impl crate::PgHandler {
             store,
             &db,
             oid,
-            || fresh.unwrap_or_else(|| Meta::init(0.0, shape.fillfactor)),
+            || fresh.unwrap_or_else(|| Self::hash_empty(shape)),
             f,
         )
     }
@@ -430,9 +625,18 @@ impl crate::PgHandler {
                 self.hash_store(),
                 self.db(),
                 shape.oid,
-                || Meta::init(0.0, shape.fillfactor),
-                |m| *m = Meta::init(0.0, shape.fillfactor),
+                || Self::hash_empty(&shape),
+                |m| *m = Self::hash_empty(&shape),
             );
+        }
+    }
+
+    /// `hashbuildempty`'s metapage.
+    fn hash_empty(shape: &HashShape) -> Meta {
+        if shape.modelled {
+            Meta::init_keyed(0.0, shape.fillfactor)
+        } else {
+            Meta::init(0.0, shape.fillfactor)
         }
     }
 
@@ -440,8 +644,13 @@ impl crate::PgHandler {
     /// becomes the tuples left, its rows with a key.
     pub(crate) fn hash_bulk_delete(&self, table: &str) {
         for shape in self.hash_index_shapes(table) {
-            let left = self.hash_indexed(table, &shape);
-            self.with_hash_meta(table, &shape, |m| m.ntuples = left as f64);
+            if shape.modelled {
+                let live = self.hash_keys(table, &shape);
+                self.with_hash_meta(table, &shape, |m| m.bulk_delete(&live));
+            } else {
+                let left = self.hash_indexed(table, &shape);
+                self.with_hash_meta(table, &shape, |m| m.ntuples = left as f64);
+            }
         }
     }
 
@@ -503,7 +712,9 @@ impl crate::PgHandler {
                 };
                 let bucket = self.with_hash_meta(table, &shape, |m| m.bucket(hashkey));
                 self.ssi_index_insert(shape.oid, bucket_page(bucket))?;
-                if let Some((old, new)) = self.with_hash_meta(table, &shape, Meta::insert) {
+                if let Some((old, new)) =
+                    self.with_hash_meta(table, &shape, |m| m.insert_key(hashkey))
+                {
                     self.ssi_page_split(shape.oid, bucket_page(old), bucket_page(new));
                 }
             }
@@ -563,5 +774,45 @@ mod tests {
             m.insert();
         }
         assert_eq!((m.maxbucket, m.pages()), (9, 18.0));
+    }
+
+    #[test]
+    fn a_full_bucket_chains_overflow_pages() {
+        // 1,000 tuples of one key into 8 buckets: 407 a page, so the
+        // bucket's primary page and 2 overflow pages; 12 pages, as
+        // PostgreSQL 15.19 measured (RP-956).
+        let m = built_keyed(2550.0, &[7; 1000], 75);
+        assert_eq!((m.maxbucket, m.ovfl, m.pages()), (7, 2, 12.0));
+    }
+
+    #[test]
+    fn a_split_frees_the_old_buckets_overflow_pages_for_reuse() {
+        // Every key in bucket 1 of 2, until a split moves the ones whose
+        // next bit is set to bucket 3: the copies take new overflow pages,
+        // then the old bucket's emptied ones are freed, and reused.
+        let mut m = Meta::init_keyed(0.0, 75);
+        let keys: Vec<u32> = (0..614).map(|i| if i % 2 == 0 { 1 } else { 3 }).collect();
+        for h in &keys {
+            assert_eq!(m.insert_key(*h), None);
+        }
+        assert_eq!(m.ovfl, 1);
+        assert_eq!(m.insert_key(1), Some((0, 2)));
+        // The split of bucket 0 moved nothing; bucket 1's turn is next.
+        while m.insert_key(1) != Some((1, 3)) {}
+        assert_eq!(m.buckets[3].pages.concat().len(), 307);
+        assert_eq!(m.free_ovfl, 1);
+        let before = m.ovfl;
+        for _ in 0..200 {
+            m.insert_key(3);
+        }
+        assert_eq!((m.ovfl, m.free_ovfl), (before, 0));
+    }
+
+    #[test]
+    fn bulk_delete_squeezes_and_frees() {
+        let mut m = built_keyed(2550.0, &[7; 1000], 75);
+        m.bulk_delete(&[7; 10]);
+        assert_eq!((m.ovfl, m.free_ovfl, m.ntuples), (2, 2, 10.0));
+        assert_eq!(m.pages(), 12.0);
     }
 }

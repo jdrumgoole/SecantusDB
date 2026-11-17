@@ -47149,8 +47149,10 @@ impl PgHandler {
                 slot.set(9, 2);
                 let before = self.index_model_names(&table);
                 let out = self.create_index(ci)?;
-                self.record_relstats(&table, false)?;
+                // The build estimates the heap as it stood, then
+                // `index_update_stats` records its size (RP-956).
                 self.btree_built(&table, &before)?;
+                self.record_relstats(&table, false)?;
                 // The build read the heap: a sequential scan (RP-070).
                 let rows = self
                     .storage
