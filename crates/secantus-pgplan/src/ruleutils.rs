@@ -6525,6 +6525,8 @@ pub struct VerboseRel {
     /// `reltarget` collects them (`build_base_rel_tlists`, then the join
     /// clauses): what a scan under a Hash returns (`CP_SMALL_TLIST`).
     pub needed: Vec<String>,
+    /// The name its columns are prefixed with: the alias, else the table.
+    pub refname: String,
 }
 
 /// `EXPLAIN VERBOSE` of a SELECT joining two relations on an ON of
@@ -6535,6 +6537,9 @@ pub struct VerboseRel {
 pub struct VerboseJoin {
     pub rels: [VerboseRel; 2],
     pub output: Vec<String>,
+    /// Every ON clause is an equality (a hash join's keys); otherwise
+    /// some are other comparisons, which only a nested loop serves.
+    pub all_equal: bool,
 }
 
 /// [`VerboseJoin`] for `SELECT <columns or *> FROM a [LEFT] JOIN b ON
@@ -6651,6 +6656,7 @@ pub fn explain_verbose_join(
     }
     // The ON: equalities between a column of each side.
     let mut parts = Vec::new();
+    let mut all_equal = true;
     and_clauses(j.quals.as_deref()?, &mut parts);
     for part in &parts {
         let part: &Node = part;
@@ -6661,9 +6667,12 @@ pub fn explain_verbose_join(
             Some(N::String(s)) => Some(s.sval.as_str()),
             _ => None,
         });
-        if a.kind() != pg_query::protobuf::AExprKind::AexprOp || op != Some("=") {
+        if a.kind() != pg_query::protobuf::AExprKind::AexprOp
+            || !matches!(op, Some("=" | "<" | ">" | "<=" | ">=" | "<>"))
+        {
             return None;
         }
+        all_equal &= op == Some("=");
         let col = |n: &Option<Box<Node>>| match n.as_deref()?.node.as_ref() {
             Some(N::ColumnRef(c)) => resolve(c),
             _ => None,
@@ -6694,11 +6703,13 @@ pub fn explain_verbose_join(
                 .iter()
                 .map(|c| format!("{}.{}", q(refname), q(c)))
                 .collect(),
+            refname: q(refname),
         }
     };
     Some(VerboseJoin {
         rels: [rel(0), rel(1)],
         output,
+        all_equal,
     })
 }
 

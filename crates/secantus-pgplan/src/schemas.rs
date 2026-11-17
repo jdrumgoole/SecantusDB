@@ -872,6 +872,17 @@ fn qualify_reference(r: &mut RangeVar, ctes: &[String], trivial: bool) -> Option
         r.relname = key;
         return None;
     }
+    // Another session's `pg_temp_N` is a namespace of its own: its
+    // relation is keyed `pg_temp_N.name`, as that session stored it, so a
+    // missing one is named as written (`relation "pg_temp_1.x"`).
+    if r.schemaname.starts_with("pg_temp_") {
+        let key = relation_key(&r.schemaname, &r.relname);
+        r.schemaname.clear();
+        r.catalogname.clear();
+        add_alias(r);
+        r.relname = key;
+        return None;
+    }
     if is_builtin(&r.schemaname) {
         return None;
     }
@@ -1143,6 +1154,19 @@ pub fn qualify(node: &mut N) -> Result<()> {
                     continue;
                 }
                 let r = &mut *r;
+                // `RangeVarGetRelidExtended`: a relation qualified by a
+                // database other than the session's is refused before any
+                // lookup.
+                if !r.catalogname.is_empty() {
+                    let db = crate::session_database();
+                    if !db.is_empty() && r.catalogname != db {
+                        crate::set_error_location(r.location);
+                        return Err(Error::FeatureNotSupported(format!(
+                            "cross-database references are not implemented: \"{}.{}.{}\"",
+                            r.catalogname, r.schemaname, r.relname
+                        )));
+                    }
+                }
                 if r.schemaname.is_empty()
                     && !ctes.contains(&r.relname)
                     && hidden_in_public(&r.relname, &path)
@@ -1438,8 +1462,11 @@ pub fn qualify(node: &mut N) -> Result<()> {
 fn node_mentions_schema(node: &N) -> bool {
     node.nodes().iter().any(|(n, _, _, _)| match n {
         pg_query::NodeRef::RangeVar(r) => {
-            !r.schemaname.is_empty()
-                && (!is_builtin(&r.schemaname) || names_temp_schema(&r.schemaname).is_some())
+            !r.catalogname.is_empty()
+                || (!r.schemaname.is_empty()
+                    && (!is_builtin(&r.schemaname)
+                        || r.schemaname.starts_with("pg_temp_")
+                        || names_temp_schema(&r.schemaname).is_some()))
         }
         _ => false,
     }) || match node {

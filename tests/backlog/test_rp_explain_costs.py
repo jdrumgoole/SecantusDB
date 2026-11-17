@@ -1680,10 +1680,10 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "              Output: k.a, k.b",
         ],
     ),
-    # Measured on PostgreSQL 15.19 (RP-966): a nested loop's nodes print
+    # Measured on PostgreSQL 15.19 (RP-966): a nested loop's nodes printed
     # their targetlists too, and the inner index scan's qual prefixed.
     "a nested loop's nodes print their output under verbose": (
-        "RP-966",
+        "RP-966:fixed",
         _ANALYSED,
         "explain verbose select e.b, k.b from e join k on e.a < k.a",
         [
@@ -1694,6 +1694,26 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "  ->  Index Scan using k_pkey on public.k  (cost=0.28..6.14 rows=333 width=7)",
             "        Output: k.a, k.b",
             "        Index Cond: (k.a > e.a)",
+        ],
+    ),
+    # Measured on PostgreSQL 15.19 (RP-966): a join with a WHERE prints
+    # every node's targetlist too, the filtered scan's qual prefixed, and
+    # the scan under the Hash returns the select list's column first.
+    "a join with a where prints its output under verbose": (
+        "RP-966",
+        _ANALYSED,
+        "explain verbose select e.b, k.b from e join k on e.a = k.a where e.b = 'v1'",
+        [
+            "Hash Join  (cost=18.75..38.50 rows=100 width=6)",
+            "  Output: e.b, k.b",
+            "  Hash Cond: (k.a = e.a)",
+            "  ->  Seq Scan on public.k  (cost=0.00..15.00 rows=1000 width=7)",
+            "        Output: k.a, k.b",
+            "  ->  Hash  (cost=17.50..17.50 rows=100 width=7)",
+            "        Output: e.b, e.a",
+            "        ->  Seq Scan on public.e  (cost=0.00..17.50 rows=100 width=7)",
+            "              Output: e.b, e.a",
+            "              Filter: (e.b = 'v1'::text)",
         ],
     ),
     # Measured on PostgreSQL 15.19: the inner side is unique whichever

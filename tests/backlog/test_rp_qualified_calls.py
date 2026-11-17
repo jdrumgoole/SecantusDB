@@ -500,9 +500,10 @@ def test_qualified_missing_relation_points_at_its_qualifier(case: str, dsn: str)
         answer(dsn, "drop schema if exists s882")
 
 
-@pytest.mark.backlog("RP-964")
+@pytest.mark.backlog_fixed("RP-964")
 def test_other_database_pg_temp_is_a_cross_database_reference(dsn: str) -> None:
-    """`x.pg_temp.nosuch` names another database: 0A000 on 15.19."""
+    """`x.pg_temp.nosuch` named another database and was looked up; it is
+    0A000 on 15.19, and now here."""
     assert answer(dsn, "select * from x.pg_temp.nosuch") == (
         "0A000",
         'cross-database references are not implemented: "x.pg_temp.nosuch"',
@@ -511,10 +512,10 @@ def test_other_database_pg_temp_is_a_cross_database_reference(dsn: str) -> None:
     )
 
 
-@pytest.mark.backlog("RP-965")
+@pytest.mark.backlog_fixed("RP-965")
 def test_other_sessions_temp_schema_relation_is_named_as_written(dsn: str) -> None:
-    """A missing relation in a `pg_temp_N` that is not the session's keeps
-    its schema in the message, at the qualifier."""
+    """A missing relation in a `pg_temp_N` that is not the session's lost
+    its schema from the message; it now keeps it, at the qualifier."""
     assert answer(dsn, "select * from pg_temp_1.nosuch") == (
         "42P01",
         'relation "pg_temp_1.nosuch" does not exist',
