@@ -1649,7 +1649,7 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
         ],
     ),
     "explain verbose of a sort over a scan": (
-        "RP-966",
+        "RP-966:fixed",
         _ANALYSED,
         "explain verbose select * from k where a > 5 order by b",
         [
@@ -1659,6 +1659,105 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "  ->  Seq Scan on public.k  (cost=0.00..17.50 rows=995 width=7)",
             "        Output: a, b",
             "        Filter: (k.a > 5)",
+        ],
+    ),
+    # Measured on PostgreSQL 15.19 (RP-966): every node of a join prints
+    # its targetlist, qualified, and the join its `Inner Unique`.
+    "a join's nodes print their output under verbose": (
+        "RP-966:fixed",
+        _ANALYSED,
+        "explain verbose select * from e join k on e.a = k.a",
+        [
+            "Hash Join  (cost=27.50..45.14 rows=1000 width=14)",
+            "  Output: e.a, e.b, k.a, k.b",
+            "  Inner Unique: true",
+            "  Hash Cond: (e.a = k.a)",
+            "  ->  Seq Scan on public.e  (cost=0.00..15.00 rows=1000 width=7)",
+            "        Output: e.a, e.b",
+            "  ->  Hash  (cost=15.00..15.00 rows=1000 width=7)",
+            "        Output: k.a, k.b",
+            "        ->  Seq Scan on public.k  (cost=0.00..15.00 rows=1000 width=7)",
+            "              Output: k.a, k.b",
+        ],
+    ),
+    # Measured on PostgreSQL 15.19 (RP-966): a nested loop's nodes print
+    # their targetlists too, and the inner index scan's qual prefixed.
+    "a nested loop's nodes print their output under verbose": (
+        "RP-966",
+        _ANALYSED,
+        "explain verbose select e.b, k.b from e join k on e.a < k.a",
+        [
+            "Nested Loop  (cost=0.28..9487.50 rows=333333 width=6)",
+            "  Output: e.b, k.b",
+            "  ->  Seq Scan on public.e  (cost=0.00..15.00 rows=1000 width=7)",
+            "        Output: e.a, e.b",
+            "  ->  Index Scan using k_pkey on public.k  (cost=0.28..6.14 rows=333 width=7)",
+            "        Output: k.a, k.b",
+            "        Index Cond: (k.a > e.a)",
+        ],
+    ),
+    # Measured on PostgreSQL 15.19: the inner side is unique whichever
+    # order the FROM writes the tables in.
+    "a hash join written inner side first is inner unique": (
+        "RP-1030",
+        _ANALYSED,
+        "explain verbose select * from k join e on e.a = k.a",
+        [
+            "Hash Join  (cost=27.50..45.14 rows=1000 width=14)",
+            "  Output: k.a, k.b, e.a, e.b",
+            "  Inner Unique: true",
+            "  Hash Cond: (e.a = k.a)",
+            "  ->  Seq Scan on public.e  (cost=0.00..15.00 rows=1000 width=7)",
+            "        Output: e.a, e.b",
+            "  ->  Hash  (cost=15.00..15.00 rows=1000 width=7)",
+            "        Output: k.a, k.b",
+            "        ->  Seq Scan on public.k  (cost=0.00..15.00 rows=1000 width=7)",
+            "              Output: k.a, k.b",
+        ],
+    ),
+    # Measured on PostgreSQL 15.19: under VERBOSE a structured format names
+    # a scan's schema (`ExplainScanTarget`).
+    "a structured verbose scan names its schema": (
+        "RP-1031",
+        _ANALYSED,
+        "explain (verbose, costs off, format json) select * from e",
+        [
+            '[\n  {\n    "Plan": {\n      "Node Type": "Seq Scan",\n'
+            '      "Parallel Aware": false,\n      "Async Capable": false,\n'
+            '      "Relation Name": "e",\n      "Schema": "public",\n'
+            '      "Alias": "e",\n      "Output": ["a", "b"]\n'
+            "    }\n  }\n]"
+        ],
+    ),
+    # Measured on PostgreSQL 15.19 (RP-966): a Limit over the Sort prints
+    # the targetlist too, the ORDER BY column the select list lacks
+    # included, and the key keeps its direction.
+    "explain verbose of a limit over a descending sort": (
+        "RP-1025",
+        _ANALYSED,
+        "explain verbose select a from k where a > 5 order by b desc limit 3",
+        [
+            "Limit  (cost=30.36..30.37 rows=3 width=7)",
+            "  Output: a, b",
+            "  ->  Sort  (cost=30.36..32.85 rows=995 width=7)",
+            "        Output: a, b",
+            "        Sort Key: k.b DESC",
+            "        ->  Seq Scan on public.k  (cost=0.00..17.50 rows=995 width=7)",
+            "              Output: a, b",
+            "              Filter: (k.a > 5)",
+        ],
+    ),
+    "explain verbose of a sort over an aliased scan": (
+        "RP-966:fixed",
+        _ANALYSED,
+        "explain verbose select * from k x where a > 5 order by x.b",
+        [
+            "Sort  (cost=67.04..69.53 rows=995 width=7)",
+            "  Output: a, b",
+            "  Sort Key: x.b",
+            "  ->  Seq Scan on public.k x  (cost=0.00..17.50 rows=995 width=7)",
+            "        Output: a, b",
+            "        Filter: (x.a > 5)",
         ],
     ),
     # Split from RP-354 and fixed: a `<>` whose operands differ in type
@@ -3075,8 +3174,65 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "        ->  Seq Scan on e e2  (cost=0.00..15.00 rows=1000 width=4)",
         ],
     ),
+    # Measured on PostgreSQL 15.19: an outer conjunct beside the anti
+    # join is its outer scan's Filter, in either spelling.
+    "a not exists beside an outer conjunct is a hash anti join": (
+        "RP-1027",
+        _ANALYSED,
+        "explain select b from e where a > 500"
+        " and not exists (select 1 from e e2 where e2.a = e.a)",
+        [
+            "Hash Anti Join  (cost=27.50..46.88 rows=1 width=3)",
+            "  Hash Cond: (e.a = e2.a)",
+            "  ->  Seq Scan on e  (cost=0.00..17.50 rows=500 width=7)",
+            "        Filter: (a > 500)",
+            "  ->  Hash  (cost=15.00..15.00 rows=1000 width=4)",
+            "        ->  Seq Scan on e e2  (cost=0.00..15.00 rows=1000 width=4)",
+        ],
+    ),
+    "a left join anti join beside an outer conjunct is a hash anti join": (
+        "RP-1027",
+        _ANALYSED,
+        "explain select e.b from e left join e e2 on e.a = e2.a where e.a > 500 and e2.a is null",
+        [
+            "Hash Anti Join  (cost=27.50..46.88 rows=1 width=3)",
+            "  Hash Cond: (e.a = e2.a)",
+            "  ->  Seq Scan on e  (cost=0.00..17.50 rows=500 width=7)",
+            "        Filter: (a > 500)",
+            "  ->  Hash  (cost=15.00..15.00 rows=1000 width=4)",
+            "        ->  Seq Scan on e e2  (cost=0.00..15.00 rows=1000 width=4)",
+        ],
+    ),
+    # Measured on PostgreSQL 15.19: a temporary table's scan names the
+    # relation bare, as any other (found while working RP-981).
+    "a scan of a temporary table names it bare": (
+        "RP-1029",
+        ["create temp table t (a int)"],
+        "explain select * from t",
+        ["Seq Scan on t  (cost=0.00..35.50 rows=2550 width=4)"],
+    ),
+    "a scan of an aliased temporary table names it and its alias": (
+        "RP-1029",
+        ["create temp table t (a int)"],
+        "explain select * from t x",
+        ["Seq Scan on t x  (cost=0.00..35.50 rows=2550 width=4)"],
+    ),
+    # Measured on PostgreSQL 15.19: an inner join on an expression key was
+    # hashed on the expression (the mechanism RP-981 built on).
+    "an inner join on an expression key is a hash join": (
+        "RP-981",
+        _ANALYSED,
+        "explain select * from e join e e2 on e.a = e2.a + 1",
+        [
+            "Hash Join  (cost=27.50..57.50 rows=1000 width=14)",
+            "  Hash Cond: ((e2.a + 1) = e.a)",
+            "  ->  Seq Scan on e e2  (cost=0.00..15.00 rows=1000 width=7)",
+            "  ->  Hash  (cost=15.00..15.00 rows=1000 width=7)",
+            "        ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
+        ],
+    ),
     # ------------- RP-981 an anti join on an expression key
-    # The ON strict in the nullable side's key through an expression is an
+    # The ON strict in the nullable side's key through an expression was an
     # anti join too, hashed on the expression (found while working RP-908).
     "a left join on an expression key where the nullable side is null is a hash anti join": (
         "RP-981",
@@ -3088,6 +3244,53 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "  ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
             "  ->  Hash  (cost=15.00..15.00 rows=1000 width=7)",
             "        ->  Seq Scan on e e2  (cost=0.00..15.00 rows=1000 width=7)",
+        ],
+    ),
+    # Measured on PostgreSQL 15.19: an expression key against a unique
+    # column hashes the unique side, inner unique.
+    "an expression key against a unique column is a hash join": (
+        "RP-1032",
+        _ANALYSED,
+        "explain select * from e join k on k.a = e.a - 1",
+        [
+            "Hash Join  (cost=27.50..45.26 rows=1000 width=14)",
+            "  Hash Cond: ((e.a - 1) = k.a)",
+            "  ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
+            "  ->  Hash  (cost=15.00..15.00 rows=1000 width=7)",
+            "        ->  Seq Scan on k  (cost=0.00..15.00 rows=1000 width=7)",
+        ],
+    ),
+    # Measured on PostgreSQL 15.19: a text expression key over a column of
+    # ten values merges, the expression's Sort Key its projected value.
+    "an expression key over a column of few values is a merge join": (
+        "RP-1032",
+        _ANALYSED,
+        "explain select * from e join e e2 on e.b = e2.b || 'x'",
+        [
+            "Merge Join  (cost=129.66..224.66 rows=5000 width=14)",
+            "  Merge Cond: (e.b = ((e2.b || 'x'::text)))",
+            "  ->  Sort  (cost=64.83..67.33 rows=1000 width=7)",
+            "        Sort Key: e.b",
+            "        ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
+            "  ->  Sort  (cost=64.83..67.33 rows=1000 width=7)",
+            "        Sort Key: ((e2.b || 'x'::text))",
+            "        ->  Seq Scan on e e2  (cost=0.00..15.00 rows=1000 width=7)",
+        ],
+    ),
+    # Measured on PostgreSQL 15.19: ANALYZE of an anti join hashed on an
+    # expression counts its children and its hash table.
+    "analyze of an anti join on an expression key": (
+        "RP-1033",
+        _ANALYSED,
+        "explain (analyze, costs off, timing off, summary off)"
+        " select * from e left join e e2 on e.a = e2.a + 1 where e2.a is null",
+        [
+            "Hash Anti Join (actual rows=1 loops=1)",
+            "  Hash Cond: (e.a = (e2.a + 1))",
+            "  ->  Seq Scan on e (actual rows=1000 loops=1)",
+            "  ->  Hash (actual rows=1000 loops=1)",
+            "        Buckets: 1024  Batches: 1  Memory Usage: 47kB",
+            "        ->  Seq Scan on e e2 (actual rows=1000 loops=1)",
         ],
     ),
     # ------------- RP-902 a reduced LEFT join's one-sided ON conjunct
@@ -6435,7 +6638,10 @@ def _marked(name: str, item: str) -> Any:
             name, marks=pytest.mark.backlog_fixed(item.removesuffix(":fixed")), id=name
         )
     fixed = item in (
+        "RP-981",
         "RP-967",
+        "RP-1021",
+        "RP-980",
         "RP-314",
         "RP-914",
         "RP-912",

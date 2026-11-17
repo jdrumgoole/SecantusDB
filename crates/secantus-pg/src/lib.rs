@@ -16881,7 +16881,13 @@ impl PgHandler {
                 }
             }
             for ck in &t.check_constraints {
-                push(secantus_pgplan::check_constraint_text(&ck.expression, t));
+                // `pg_get_constraintdef_worker` marks an unvalidated one (RP-940).
+                let text = secantus_pgplan::check_constraint_text(&ck.expression, t);
+                push(if ck.not_valid {
+                    format!("{text} NOT VALID")
+                } else {
+                    text
+                });
             }
             for fk in &t.foreign_keys {
                 // `REFERENCES t` with no list names t's primary key.
@@ -22054,6 +22060,10 @@ impl PgHandler {
             .into_iter()
             .find(|ix| Self::index_relstats_key(&ix.table.name, &ix.name) == rel);
         if let Some(ix) = index {
+            // A partitioned index has no storage (RP-949).
+            if crate::partition::is_partitioned(&ix.table) {
+                return Ok(Bson::Int64(0));
+            }
             let pages = match self.btree_size(&ix.table.name, &ix.name)? {
                 Some((p, _, _)) => Some(p),
                 None => self
@@ -22065,6 +22075,14 @@ impl PgHandler {
                 "pg_indexes_size" => 0,
                 _ => bytes,
             }));
+        }
+        // A partitioned table has no storage, nor do its indexes or a TOAST
+        // table (RP-949).
+        if self
+            .lookup(&rel)
+            .is_some_and(|def| crate::partition::is_partitioned(&def))
+        {
+            return Ok(Bson::Int64(0));
         }
         let stored = self.lookup(&rel).is_some() && Self::virtual_table(&rel).is_none();
         // A system catalog: its rows as `initdb` would lay them out (RP-214;
@@ -43460,7 +43478,7 @@ impl PgHandler {
                         Some(changed) => DomainChecks::Only(&changed[n]),
                         None => DomainChecks::Except(&of_domain),
                     };
-                    self.check_row_constraints_with(&def, row, domains)?;
+                    self.check_routed_row_constraints(&def, row, domains)?;
                     self.check_view_conditions(&def, row, &ins.view_checks)?;
                     self.check_partition_route(&def, row)?;
                 }
@@ -45525,6 +45543,17 @@ impl PgHandler {
                 if !old.pk {
                     self.rename_row_field(&table, &old.field(), &to)?;
                 }
+                // A CHECK keeps naming the column under its new name (RP-939).
+                let before = def.clone();
+                for ck in &mut def.check_constraints {
+                    ck.expression = secantus_pgplan::rename_column_in_expression(
+                        &ck.expression,
+                        &before,
+                        &column,
+                        &to,
+                    )
+                    .map_err(|e| Self::err(&e))?;
+                }
                 if let Some(c) = def.columns.iter_mut().find(|c| c.name == column) {
                     c.name = to.clone();
                 }
@@ -46024,6 +46053,26 @@ impl PgHandler {
                             "Nested Loop Left Join" => tree.name = "Nested Loop Anti Join".into(),
                             _ => {}
                         }
+                    }
+                }
+                // A join on an expression key is hashed on the expression
+                // where that path prices (RP-981): the right side under a
+                // Hash, and its ON (attached below) the Hash Cond.
+                if let Statement::Select(sel) = inner.as_ref() {
+                    if matches!(
+                        tree.name.as_str(),
+                        "Nested Loop" | "Nested Loop Left Join" | "Nested Loop Anti Join"
+                    ) && tree.children.len() == 2
+                        && tree.children.iter().all(|c| c.children.is_empty())
+                        && scan_estimate::has_expr_join_key(sel)
+                        && self.hash_join_estimate(sel).is_some()
+                    {
+                        tree.name = tree.name.replace("Nested Loop", "Hash");
+                        if tree.name == "Hash" {
+                            tree.name = "Hash Join".into();
+                        }
+                        let right = tree.children.pop().expect("two children");
+                        tree.children.push(explain::PlanNode::over("Hash", right));
                     }
                 }
                 let plain_scan =
@@ -46974,6 +47023,7 @@ impl PgHandler {
                 explain::apply_implied_filters(&mut tree);
                 explain::attach_scan_alias(&mut tree, &options.scan_alias);
                 explain::attach_verbose(&mut tree, &options.verbose_scan);
+                explain::attach_verbose_join(&mut tree, &options.verbose_join);
                 // ANALYZE runs the statement, as PostgreSQL's does -- a write
                 // is written -- and reports the rows it produced.
                 let actual = if options.analyze {
@@ -47137,8 +47187,10 @@ impl PgHandler {
                 slot.set(9, 2);
                 let before = self.index_model_names(&table);
                 let out = self.create_index(ci)?;
-                self.record_relstats(&table, false)?;
+                // The build estimates the heap as it stood, then
+                // `index_update_stats` records its size (RP-956).
                 self.btree_built(&table, &before)?;
+                self.record_relstats(&table, false)?;
                 // The build read the heap: a sequential scan (RP-070).
                 let rows = self
                     .storage
@@ -49719,7 +49771,7 @@ impl PgHandler {
                                         }
                                     }
                                 }
-                                self.check_row_constraints_with(
+                                self.check_routed_row_constraints(
                                     def,
                                     &after,
                                     DomainChecks::Only(&checked),
@@ -50756,13 +50808,6 @@ impl PgHandler {
         PgWireError::UserError(Box::new(info))
     }
 
-    /// NOT NULL and CHECK over one row about to be written, in PostgreSQL's
-    /// order: every NOT NULL column first, then the CHECK constraints by
-    /// name. A CHECK that evaluates to NULL passes (SQL's rule).
-    fn check_row_constraints(&self, def: &TableDef, row: &Document) -> PgWireResult<()> {
-        self.check_row_constraints_with(def, row, DomainChecks::All)
-    }
-
     /// The domain columns of `row` that `domains` names, each against its
     /// domain's NOT NULL and CHECKs.
     fn check_domains(
@@ -50796,6 +50841,25 @@ impl PgHandler {
 
     /// `check_row_constraints`, checking only the domain columns `domains`
     /// says the write coerced into their domain.
+    /// `check_row_constraints_with` for a write that `check_partition_route`
+    /// follows: a partitioned table's NOT NULLs and CHECKs are checked there,
+    /// on the leaf the row lands in, which the error names (RP-975).
+    pub(crate) fn check_routed_row_constraints(
+        &self,
+        def: &TableDef,
+        row: &Document,
+        domains: DomainChecks<'_>,
+    ) -> PgWireResult<()> {
+        if crate::partition::is_partitioned(def) {
+            return self.check_domains(def, row, domains);
+        }
+        self.check_row_constraints_with(def, row, domains)
+    }
+
+    /// NOT NULL and CHECK over one row about to be written, in PostgreSQL's
+    /// order: every NOT NULL column first, then the CHECK constraints. A
+    /// CHECK that evaluates to NULL passes (SQL's rule). Only the domain
+    /// columns `domains` names are checked against their domain.
     pub(crate) fn check_row_constraints_with(
         &self,
         def: &TableDef,
@@ -58896,7 +58960,7 @@ impl PgHandler {
                     kept_lines = lines.clone();
                 }
                 for (row, line) in rows.iter().zip(&kept_lines) {
-                    self.check_row_constraints(&def, row)
+                    self.check_routed_row_constraints(&def, row, DomainChecks::All)
                         .and_then(|()| self.check_partition_route(&def, row))
                         .map_err(|e| with_where_context(e, row_context(line)))?;
                 }

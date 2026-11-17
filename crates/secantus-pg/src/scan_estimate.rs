@@ -472,6 +472,7 @@ impl PgHandler {
             on,
             on_filters,
             equi,
+            expr_keys,
             ..
         } = &j.tree
         else {
@@ -488,7 +489,13 @@ impl PgHandler {
         if !k.starts_with(&prefix) || *v != bson::Bson::Null {
             return None;
         }
+        // An expression key is built of operators and casts over the one
+        // column (`expr_equalities`), each strict: the ON is strict in
+        // that column too (RP-981).
         let strict = equi.iter().any(|(l, r)| l == k || r == k)
+            || (equi.is_empty()
+                && matches!(expr_keys.as_slice(), [e]
+                    if expr_key_pair(e).is_some_and(|(l, r, _)| r == *k && l != *k)))
             || (on.is_some()
                 && on_filters
                     .iter()
@@ -2149,7 +2156,25 @@ impl PgHandler {
             {
                 return None;
             }
-            self.hash_side_with(&p.table, &p.filter, &p.exprs, &p.field, &p.read, &p.above)
+            let mut h =
+                self.hash_side_with(&p.table, &p.filter, &p.exprs, &p.field, &p.read, &p.above)?;
+            // A side whose key is an expression: no statistics for it, so
+            // `get_variable_numdistinct`'s 200 default, no MCVs and no
+            // NULLs (`eqjoinsel`, `estimate_hash_bucket_stats`); not unique
+            // and in no index's order (RP-981).
+            if let Some((ops, ty)) = &p.key_expr {
+                h.stats = (200.0, 0.0, Vec::new());
+                h.unique = false;
+                h.column = None;
+                h.ordered = false;
+                h.key_indexed = false;
+                h.key_index = None;
+                h.key_index_name = None;
+                h.pg_type = ty.clone();
+                h.key_ops = f64::from(*ops);
+                h.default_nd = true;
+            }
+            Some(h)
         };
         // `hash_join_of` prices at most `MORE_HASH_CLAUSES` further
         // clauses: past them, pricing each side's scan for nothing would
@@ -2280,6 +2305,22 @@ impl PgHandler {
             return None;
         }
         let on_filters: Vec<&secantus_pgplan::joins::JoinFilter> = on_filters.iter().collect();
+        // A join on one equality between a column of one side and an
+        // expression over one column of the other is hashed on the
+        // expression (RP-981): keyed here by the column it reads, priced
+        // by the caller with no statistics for it.
+        let expr_key = match (equi.as_slice(), merged.as_slice(), expr_keys.as_slice()) {
+            ([], [], [e]) => Some(expr_key_pair(e)?),
+            _ => None,
+        };
+        let synth: Vec<(String, String)>;
+        let equi: &Vec<(String, String)> = match &expr_key {
+            Some((l, r, _)) => {
+                synth = vec![(l.clone(), r.clone())];
+                &synth
+            }
+            None => equi,
+        };
         let ((left_key, right_key), rest) = equi.split_first()?;
         // The join clauses are an ON's, or -- a comma join, `FROM e, k
         // WHERE e.b = k.b` -- the WHERE's conjuncts over both tables, those
@@ -2364,7 +2405,7 @@ impl PgHandler {
                 return None;
             }
         }
-        if !merged.is_empty() || !expr_keys.is_empty() {
+        if !merged.is_empty() || (!expr_keys.is_empty() && expr_key.is_none()) {
             return None;
         }
         let project = j.project.as_deref();
@@ -2523,11 +2564,16 @@ impl PgHandler {
                 read,
                 above: s.above.clone(),
                 exprs: std::rc::Rc::clone(&s.exprs),
+                key_expr: None,
             })
         };
         let (left, right) = (scan(left)?, scan(right)?);
-        let a = side(&left, left_key)?;
-        let b = side(&right, right_key)?;
+        let mut a = side(&left, left_key)?;
+        let mut b = side(&right, right_key)?;
+        if let Some((_, _, (left_expr, ops, ty))) = &expr_key {
+            let s = if *left_expr { &mut a } else { &mut b };
+            s.key_expr = Some((*ops, ty.clone()));
+        }
         let more: Vec<(JoinedSide, JoinedSide)> = rest
             .iter()
             .map(|(l, r)| Some((side(&left, l)?, side(&right, r)?)))
@@ -3254,6 +3300,8 @@ impl PgHandler {
             key_indexed,
             key_index,
             key_index_name,
+            key_ops: 0.0,
+            default_nd: false,
         })
     }
 
@@ -6726,6 +6774,50 @@ fn with_in_lengths(mut quals: Vec<(String, costsize::Qual)>) -> Vec<(String, cos
 /// the table's tuples.
 /// One side of a two-table join planned as joined rows
 /// ([`PgHandler::joined_sides`]).
+/// One expression equality of a join (RP-981) as a pair of joined-row
+/// keys: the bare column's on one side, and on the other the one column
+/// the expression reads, with whether that is the left side, its
+/// operators and its result type. `None` where neither or both sides are
+/// bare columns, or the expression reads other than one column.
+fn expr_key_pair(
+    e: &secantus_pgplan::joins::ExprEquality,
+) -> Option<(String, String, (bool, u32, String))> {
+    let read = |x: &secantus_pgplan::ColumnExpr| {
+        let mut keys = std::collections::HashSet::new();
+        if !secantus_pgplan::joins::expr_reads(x, &mut keys) || keys.len() != 1 {
+            return None;
+        }
+        keys.into_iter().next()
+    };
+    let ty = |x: &secantus_pgplan::ColumnExpr| secantus_pgplan::column_expr_type(x).to_string();
+    match (&e.left_column, &e.right_column) {
+        (Some(l), None) => Some((
+            l.clone(),
+            read(&e.right)?,
+            (false, e.right_ops, ty(&e.right)),
+        )),
+        (None, Some(r)) => Some((read(&e.left)?, r.clone(), (true, e.left_ops, ty(&e.left)))),
+        _ => None,
+    }
+}
+
+/// Whether `sel` joins two relations on one expression equality and
+/// nothing else (RP-981).
+pub(crate) fn has_expr_join_key(sel: &secantus_pgplan::Select) -> bool {
+    use secantus_pgplan::joins::JoinNode;
+    let Some(sub) = sel.sub.as_ref() else {
+        return false;
+    };
+    let secantus_pgplan::Statement::JoinRows(j) = sub.plan.as_ref() else {
+        return false;
+    };
+    matches!(
+        &j.tree,
+        JoinNode::Join { equi, merged, expr_keys, on_other: false, .. }
+            if equi.is_empty() && merged.is_empty() && expr_keys.len() == 1
+    )
+}
+
 struct JoinedSide {
     /// Its join key, as the joined rows name it (`alias` SEP `column`).
     key: String,
@@ -6741,6 +6833,9 @@ struct JoinedSide {
     above: Vec<String>,
     /// The expression comparisons its scan runs per row (RP-423).
     exprs: std::rc::Rc<Vec<secantus_pgplan::ExprQual>>,
+    /// Its side of the join clause is an expression over `field` (RP-981):
+    /// the operators it evaluates and its result type.
+    key_expr: Option<(u32, String)>,
 }
 
 /// The constant `filter` sets stored field `field` equal to, at its top
@@ -6891,6 +6986,11 @@ struct HashSide {
     key_index: Option<KeyIndex>,
     /// That index's name, where one index leads with the key (RP-401).
     key_index_name: Option<String>,
+    /// The operators its side of the join clause evaluates, and whether
+    /// its distinct count is the 200 default: an expression's, which has
+    /// no statistics (RP-981).
+    key_ops: f64,
+    default_nd: bool,
 }
 
 /// A join key's B-tree index over an analysed table (RP-377): the table
@@ -7371,7 +7471,7 @@ fn hash_anti_join_of(a: HashSide, b: HashSide) -> Option<JoinEstimate> {
     fn key(s: &HashSide) -> KeyStats<'_> {
         KeyStats {
             ndistinct: s.stats.0,
-            default_ndistinct: false,
+            default_ndistinct: s.default_nd,
             null_frac: s.stats.1,
             mcv: &s.stats.2,
         }
@@ -7386,15 +7486,21 @@ fn hash_anti_join_of(a: HashSide, b: HashSide) -> Option<JoinEstimate> {
         scan_ordered: false,
         unique: false,
         ndistinct: s.stats.0,
-        default_ndistinct: false,
-        key_ops: 0.0,
+        default_ndistinct: s.default_nd,
+        key_ops: s.key_ops,
         rel_rows: s.scan.2,
         width: Some(s.scan.3),
         extra: joincost::ExtraKeys::default(),
     };
     let (outer, inner) = (side(&a), side(&b));
     let nselec = joincost::eqjoinsel_inner(&ka, &kb);
-    let jselec = joincost::eqjoinsel_semi_no_mcv(&ka, &kb, inner.rows)?;
+    // An expression key has no MCV list, so `eqjoinsel_semi` takes its
+    // formula without lists whatever the other side has (RP-981).
+    let jselec = if a.key_ops > 0.0 || b.key_ops > 0.0 {
+        joincost::eqjoinsel_semi(&ka, &kb, inner.rows)
+    } else {
+        joincost::eqjoinsel_semi_no_mcv(&ka, &kb, inner.rows)?
+    };
     let match_count = if jselec > 0.0 {
         (nselec * inner.rows / jselec).max(1.0)
     } else {
@@ -7402,8 +7508,17 @@ fn hash_anti_join_of(a: HashSide, b: HashSide) -> Option<JoinEstimate> {
     };
     let (startup, total) =
         joincost::hash_anti_join(&outer, &inner, nselec, (jselec, match_count), &[kb]);
-    let sorts = joincost::cost_sort(a.scan.1, a.scan.2, a.scan.3, None).0
-        + joincost::cost_sort(b.scan.1, b.scan.2, b.scan.3, None).0;
+    // Over an expression key `mergejoinscansel` keeps its defaults, so a
+    // merge reads both sorted inputs whole: their totals bound it (RP-981).
+    let sort = |s: &HashSide| {
+        let (startup, total) = joincost::cost_sort(s.scan.1, s.scan.2, s.scan.3, None);
+        if a.key_ops > 0.0 || b.key_ops > 0.0 {
+            total
+        } else {
+            startup
+        }
+    };
+    let sorts = sort(&a) + sort(&b);
     if total >= sorts {
         return None;
     }
@@ -7454,11 +7569,12 @@ fn hash_join_of(
     fn key(s: &HashSide) -> KeyStats<'_> {
         KeyStats {
             ndistinct: s.stats.0,
-            default_ndistinct: false,
+            default_ndistinct: s.default_nd,
             null_frac: s.stats.1,
             mcv: &s.stats.2,
         }
     }
+    let expr_key = a.key_ops > 0.0 || b.key_ops > 0.0;
     let (ka, kb) = (key(&a), key(&b));
     let mut selectivity = if redundant {
         1.0
@@ -7491,8 +7607,8 @@ fn hash_join_of(
         scan_ordered: false,
         unique: s.unique,
         ndistinct: s.stats.0,
-        default_ndistinct: false,
-        key_ops: 0.0,
+        default_ndistinct: s.default_nd,
+        key_ops: s.key_ops,
         rel_rows: s.scan.2,
         width: Some(s.scan.3),
         extra,
@@ -7502,7 +7618,9 @@ fn hash_join_of(
     // nested loop probing it (RP-377): priced below over each side's
     // pathlist. An outer join or a join filter there is not modelled.
     let unique_key = !multi && (a.unique || b.unique);
-    if unique_key && redundant {
+    // The other paths a unique key weighs are not modelled over an
+    // expression key.
+    if unique_key && (redundant || expr_key) {
         return None;
     }
     // A side its own WHERE cuts to one row is `inner_unique` as the inner
@@ -7567,8 +7685,14 @@ fn hash_join_of(
     let merges = if redundant || multi || a.key_indexed || b.key_indexed {
         None
     } else {
-        let (ca, cb) = (merge_column(&a)?, merge_column(&b)?);
-        let (mut ls, mut le, rs, re) = joincost::mergejoinscansel(&ca, &cb)?;
+        // Over an expression key `mergejoinscansel` finds no range and
+        // keeps its defaults: each side read whole (RP-981).
+        let (mut ls, mut le, rs, re) = if expr_key {
+            (0.0, 1.0, 0.0, 1.0)
+        } else {
+            let (ca, cb) = (merge_column(&a)?, merge_column(&b)?);
+            joincost::mergejoinscansel(&ca, &cb)?
+        };
         // `initial_cost_mergejoin`: an outer join reads its preserved
         // input whole -- the LEFT join's left table, outer in the `JOIN_LEFT`
         // path and inner in the `JOIN_RIGHT` one.
@@ -7666,6 +7790,11 @@ fn hash_join_of(
             best
         }
     })?;
+    // A merge on an expression key sorts on the expression, whose plan is
+    // not drawn here (RP-981).
+    if expr_key && matches!(pick, JoinPick::Merge { .. }) {
+        return None;
+    }
     // `match_unsorted_outer`'s nested loops are paths too, each pair
     // paying the join clause (`cpu_operator_cost` for its `=`). Over two
     // whole sequential scans they never come near; a side an index scan
@@ -7679,7 +7808,8 @@ fn hash_join_of(
     let nest = joincost::cheapest_nest_loop_semi(
         a.scan,
         b.scan,
-        costsize::CPU_OPERATOR_COST * (1.0 + more.len() as f64 + filter.ops),
+        costsize::CPU_OPERATOR_COST
+            * (1.0 + more.len() as f64 + filter.ops + a.key_ops + b.key_ops),
         [semi(&a, unique_a), semi(&b, unique_b)],
     );
     if nest.total <= t0 * 1.01 {

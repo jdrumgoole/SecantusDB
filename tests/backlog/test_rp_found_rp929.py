@@ -60,13 +60,14 @@ def test_a_hash_index_has_its_pages(pg: Any) -> None:
     assert tuple(row) == (49152, 98304, 147456)
 
 
-@pytest.mark.backlog("RP-956")
+@pytest.mark.backlog_fixed("RP-956")
 def test_duplicate_hash_keys_fill_overflow_pages(pg: Any) -> None:
     """A bucket whose primary page is full chains overflow pages
     (`_hash_addovflpage`): 1,000 rows of one key, all in one bucket, leave
     a hash index of 12 pages where 4 buckets alone make 6. `secantusd-pg`
-    answered 6: its metapage model counts the buckets, not the tuples in
-    each, so it has no overflow pages (2026-11-14)."""
+    answered 6: its metapage model counted the buckets, not the tuples in
+    each, so it had no overflow pages (2026-11-14). The model now keeps each
+    bucket's pages (RP-956)."""
     pg.execute("DROP TABLE IF EXISTS rp929o")
     pg.execute("CREATE TABLE rp929o (a int)")
     pg.execute("INSERT INTO rp929o SELECT 1 FROM generate_series(1, 1000)")

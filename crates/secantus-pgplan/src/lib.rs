@@ -3758,6 +3758,9 @@ pub struct ExplainOptions {
     /// Under VERBOSE, a single-relation SELECT's scan as it prints then
     /// (RP-925).
     pub verbose_scan: Option<ruleutils::VerboseScan>,
+    /// Under VERBOSE, a two-relation join's lists as its nodes print them
+    /// (RP-966).
+    pub verbose_join: Option<ruleutils::VerboseJoin>,
     /// A SELECT over one aliased relation: the alias its scan prints
     /// after the relation's name (RP-967).
     pub scan_alias: Option<String>,
@@ -12096,6 +12099,43 @@ pub fn defer_constraint_defs(build: impl FnOnce() -> Vec<(i64, String)> + 'stati
     CONSTRAINT_DEFS.with(|d| d.defer(build));
 }
 
+/// A table's stored expression (a CHECK's) with its column `old` renamed
+/// to `new`. PostgreSQL stores the analysed tree, which holds the column's
+/// attnum, so a rename carries over; the text stored here is renamed
+/// instead (RP-939). The expression unchanged when it does not name `old`.
+pub fn rename_column_in_expression(
+    expression: &str,
+    def: &TableDef,
+    old: &str,
+    new: &str,
+) -> Result<String> {
+    let relation = def.name.clone();
+    let columns: Vec<String> = def.columns.iter().map(|c| c.name.clone()).collect();
+    let columns_of = |name: &str| (name == relation).then(|| columns.clone());
+    let sql = format!(
+        "SELECT ({expression}) FROM {}",
+        scalar::quote_identifier(&relation)
+    );
+    let renamed = view_deps::rename_column(&sql, &relation, old, new, &columns_of)?;
+    if renamed == sql {
+        return Ok(expression.to_string());
+    }
+    let tree = pg_query::parse(&renamed).map_err(|e| Error::Parse(e.to_string()))?;
+    let node = tree
+        .protobuf
+        .stmts
+        .first()
+        .and_then(|s| match s.stmt.as_ref()?.node.as_ref()? {
+            N::SelectStmt(sel) => match sel.target_list.first()?.node.as_ref()? {
+                N::ResTarget(rt) => rt.val.as_deref().cloned(),
+                _ => None,
+            },
+            _ => None,
+        })
+        .ok_or_else(|| Error::Parse("CHECK expression is not an expression".into()))?;
+    deparse_expr(&node)
+}
+
 /// A CHECK constraint's expression as `pg_get_constraintdef` prints it:
 /// `CHECK ((n > 0))`.
 pub fn check_constraint_text(expression: &str, def: &TableDef) -> String {
@@ -12369,6 +12409,7 @@ fn plan_explain(
         analyze: false,
         verbose: false,
         verbose_scan: None,
+        verbose_join: None,
         scan_alias: None,
         costs: true,
         timing: false,
@@ -12487,6 +12528,12 @@ fn plan_explain(
     join_alias::flatten_join_aliases(&mut query, lookup)?;
     // A simple FROM-subquery is merged into its parent (RP-422).
     subquery_pullup::pull_up_simple_subquery(&mut query, lookup)?;
+    // A NOT EXISTS sublink is pulled up into an anti join (RP-980).
+    if !options.analyze {
+        if let Some(anti) = sublink_join::anti_join_of(&query, lookup) {
+            query = anti;
+        }
+    }
     // An IN / EXISTS sublink is pulled up into a semi join (RP-411).
     if !options.analyze {
         options.semi_join = sublink_join::semi_join_of(&query, lookup);
@@ -12579,6 +12626,10 @@ fn plan_explain(
             },
             _ => None,
         },
+        _ => None,
+    };
+    options.verbose_join = match &query {
+        N::SelectStmt(s) if options.verbose => ruleutils::explain_verbose_join(s, lookup),
         _ => None,
     };
     let scan_or_arms = explain_scan_or_arms(&query, lookup).unwrap_or_default();
@@ -38205,6 +38256,14 @@ fn resolve_regclass(text: &str) -> Result<i64> {
 /// there is no such relation, or no such schema.
 pub(crate) fn relation_oid(schema: Option<&str>, name: &str) -> Option<i64> {
     let user = |stored: &str, temp: Option<bool>| -> Option<i64> {
+        let cooking = COOKING_RELATION.with(|c| {
+            c.borrow()
+                .as_ref()
+                .is_some_and(|(n, is_temp)| n == stored && temp.is_none_or(|want| want == *is_temp))
+        });
+        if cooking {
+            return Some(0);
+        }
         crate::deferred::read(&PLAN_USER_RELATIONS, |t| {
             t.iter()
                 .find(|(n, _, is_temp)| n == stored && temp.is_none_or(|want| want == *is_temp))
@@ -39449,6 +39508,12 @@ thread_local! {
     /// cast to it (RP-860). Not yet published, so held here meanwhile.
     static COOKING_ROWTYPE: std::cell::RefCell<Option<CompositeType>> =
         const { std::cell::RefCell::new(None) };
+    /// The relation itself, `(key, temp)`, which `heap_create_with_catalog`
+    /// has also made by then: a CHECK may name it by `regclass` (RP-974).
+    /// Its oid is not assigned yet; cooking only judges the expression, and
+    /// the stored text resolves the name again when a row is checked.
+    static COOKING_RELATION: std::cell::RefCell<Option<(String, bool)>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 /// Run `f` with the row type of `def`, a table being created, resolvable.
@@ -39466,6 +39531,14 @@ fn with_cooking_rowtype<T>(def: &TableDef, f: impl FnOnce() -> T) -> T {
         }
     }
     let _restore = Restore(COOKING_ROWTYPE.with(|c| c.replace(Some((name, 0, fields)))));
+    struct RestoreRelation(Option<(String, bool)>);
+    impl Drop for RestoreRelation {
+        fn drop(&mut self) {
+            COOKING_RELATION.with(|c| *c.borrow_mut() = self.0.take());
+        }
+    }
+    let _relation =
+        RestoreRelation(COOKING_RELATION.with(|c| c.replace(Some((def.name.clone(), def.temp)))));
     f()
 }
 
@@ -52701,6 +52774,11 @@ fn lower_aexpr(e: &AExpr, def: &TableDef, params: &[Bson]) -> Result<Document> {
         return lower_pattern_match(e, def, params);
     }
 
+    // `const op column` is the column's clause through the operator's
+    // commutator, as `scalarineqsel` and `eqsel` read it (RP-1021).
+    if let Some(commuted) = commuted_comparison(e, op) {
+        return lower_aexpr(&commuted, def, params);
+    }
     let col = match e.lexpr.as_ref().and_then(|l| l.node.as_ref()) {
         Some(N::ColumnRef(c)) => {
             column_ref_name(c).ok_or_else(|| Error::Unsupported("this column reference".into()))?
@@ -52985,6 +53063,39 @@ fn coerce_any_array(rhs: Bson, element_type: &str) -> Result<Bson> {
         }
     }
     Ok(rhs)
+}
+
+/// `const op column` as `column commutator(op) const`, for a built-in
+/// comparison whose left side folds to a constant; `None` otherwise.
+fn commuted_comparison(e: &AExpr, op: &str) -> Option<AExpr> {
+    let commutator = match op {
+        "=" => "=",
+        "<>" => "<>",
+        "!=" => "!=",
+        "<" => ">",
+        "<=" => ">=",
+        ">" => "<",
+        ">=" => "<=",
+        _ => return None,
+    };
+    if user_ops::defines(op)
+        || !e.lexpr.as_deref().is_some_and(folds_to_constant)
+        || !matches!(
+            e.rexpr.as_deref().and_then(|r| r.node.as_ref()),
+            Some(N::ColumnRef(_))
+        )
+    {
+        return None;
+    }
+    let mut out = e.clone();
+    std::mem::swap(&mut out.lexpr, &mut out.rexpr);
+    let last = out.name.last_mut()?;
+    *last = pg_query::protobuf::Node {
+        node: Some(N::String(pg_query::protobuf::String {
+            sval: commutator.into(),
+        })),
+    };
+    Some(out)
 }
 
 /// The MQL comparison operator for a SQL scalar comparison operator.
@@ -55451,5 +55562,48 @@ mod rp475_function_scan_filter {
         let q = qual.unwrap();
         assert_eq!(q.ops, 1);
         assert!((q.selectivity(1000.0) - 1.0 / 3.0).abs() < 1e-9);
+    }
+}
+
+#[cfg(test)]
+mod rp1021_commuted_comparison {
+    use super::*;
+
+    fn lowered(sql: &str) -> Document {
+        let def = TableDef::new(
+            "e",
+            vec![secantus_pgcatalog::Column::new("a", "int4", false)],
+        );
+        let tree = pg_query::parse(sql).unwrap();
+        let Some(N::SelectStmt(s)) = tree.protobuf.stmts[0]
+            .stmt
+            .as_ref()
+            .and_then(|n| n.node.clone())
+        else {
+            panic!("not a select");
+        };
+        lower_where_nonvolatile(s.where_clause.as_deref().unwrap(), &def, &[]).unwrap()
+    }
+
+    /// A constant on the left of a built-in comparison is the column's
+    /// clause through the commutator (RP-1021).
+    #[test]
+    fn a_constant_on_the_left_is_commuted() {
+        assert_eq!(
+            lowered("select * from e where 3 < a"),
+            lowered("select * from e where a > 3")
+        );
+        assert_eq!(
+            lowered("select * from e where 3 >= a"),
+            lowered("select * from e where a <= 3")
+        );
+        assert_eq!(
+            lowered("select * from e where 3 = a"),
+            lowered("select * from e where a = 3")
+        );
+        assert_eq!(
+            lowered("select * from e where 3 <> a"),
+            lowered("select * from e where a <> 3")
+        );
     }
 }

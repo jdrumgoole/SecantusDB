@@ -72,8 +72,8 @@ def test_tableoid_in_a_check_is_a_column(dsn: str, query: str, expected: object)
 def test_a_checks_tableoid_is_the_rows_relation(dsn: str) -> None:
     """A CHECK's `tableoid` is the oid of the relation the row is stored
     in: its own table, or the leaf partition a row of a partitioned table
-    lands in (PostgreSQL 15.19 answers below, but for the relation the
-    violation names), and the generated name is `<table>_tableoid_check`."""
+    lands in (PostgreSQL 15.19 answers below), and the generated name is
+    `<table>_tableoid_check`."""
     got = _script(
         dsn,
         [
@@ -100,8 +100,7 @@ def test_a_checks_tableoid_is_the_rows_relation(dsn: str) -> None:
         (
             "error",
             "23514",
-            # PostgreSQL names the leaf, `p859b`: RP-975.
-            'new row for relation "p859" violates check constraint "p859_tableoid_check"',
+            'new row for relation "p859b" violates check constraint "p859_tableoid_check"',
             None,
         ),
         "DROP TABLE",
@@ -310,23 +309,23 @@ def test_a_system_column_in_a_generated_column_is_42p10(dsn: str) -> None:
     )
 
 
-@pytest.mark.backlog("RP-974")
+@pytest.mark.backlog_fixed("RP-974")
 def test_a_checks_regclass_of_its_own_table_resolves_at_create(dsn: str) -> None:
     """`cookConstraint` runs after `heap_create_with_catalog`, so a CHECK
     may name its own table by `regclass`: `create table t816 (x int, check
     (tableoid = 't816'::regclass))` is CREATE TABLE on PostgreSQL 15.19.
-    Here it is 42P01 `relation "t816" does not exist` at 14."""
+    It was 42P01 `relation "t816" does not exist` at 14."""
     assert _answer(dsn, "create table t816 (x int, check (tableoid = 't816'::regclass))") == (
         "CREATE TABLE"
     )
 
 
-@pytest.mark.backlog("RP-975")
+@pytest.mark.backlog_fixed("RP-975")
 def test_a_partitions_check_violation_names_the_leaf(dsn: str) -> None:
     """`ExecConstraints` reports the leaf partition's result relation: a
     row routed through `p974` into `p974b` that fails a CHECK is 23514
-    `new row for relation "p974b" ...` on PostgreSQL 15.19. Here it names
-    the partitioned table, `p974`."""
+    `new row for relation "p974b" ...` on PostgreSQL 15.19. It named the
+    partitioned table, `p974`."""
     got = _script(
         dsn,
         [

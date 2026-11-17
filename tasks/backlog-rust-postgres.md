@@ -1200,36 +1200,17 @@ one beside it.
       ratio of 1.23 to 1.29 in ten of ten runs of fifteen rounds. The test
       now takes fifteen paired rounds and bounds their median, and failed
       ten of ten serially and three of three under `-n 9`.)
+      (2026-11-17, platform: CI's pg-oracle (backlog) step builds the same
+      `dev` profile binary, `crates/secantus-pg/target/debug/secantusd-pg`,
+      and passed the paired-median test on x86_64 Linux (job 134018142698,
+      PR #2821); this arm64 Mac failed six of six more runs of that build at
+      a median ratio of 1.26-1.27 (14 ms against 18 ms; the test now prints
+      each round's ratio). The gap shows only on macOS here, so its test
+      runs `only_on("darwin")`, and verify reports it ELSEWHERE on CI. Not
+      separated: macOS from arm64 (no arm64 Linux or x86_64 macOS runner
+      measured). Close it when it passes every run on darwin.)
       Backlog-ID: RP-911
       Verify: tests/backlog/test_rp_catalog_latency.py::test_the_first_catalog_query_after_ddl_costs_the_same_at_800_tables_within_a_tenth
-
-## Found while working RP-908 (2026-11-15)
-
-- [ ] **EXPLAIN of a NOT EXISTS prints a filtered Seq Scan, not PostgreSQL's
-      Hash Anti Join.** `select * from e where not exists (select 1 from e
-      e2 where e2.a = e.a)` is, in PostgreSQL 15.19, `Hash Anti Join
-      (cost=27.50..46.25 rows=1 width=7)` on `(e.a = e2.a)`, the Hash over
-      a Seq Scan of `e2` of width 4 (`convert_EXISTS_sublink_to_join`);
-      here a Seq Scan on e with a `Filter`. Its rows are right. The anti
-      cost (`hash_anti_join_of` in `scan_estimate.rs`, RP-908) is there to
-      reuse once the sublink is pulled up into a join. Measured on a
-      private 15.19 cluster.
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a not exists over an equality is a hash anti join]
-      Backlog-ID: RP-980
-- [ ] **A LEFT join on an expression key whose WHERE keeps only the
-      unmatched rows prints a Nested Loop Left Join, not a Hash Anti
-      Join.** `select * from e left join e e2 on e.a = e2.a + 1 where e2.a
-      is null` is, in PostgreSQL 15.19, `Hash Anti Join
-      (cost=27.50..133.88 rows=500 width=14)` on `(e.a = (e2.a + 1))`;
-      here a `Nested Loop Left Join` with `Filter: (e2.a IS NULL)` and
-      zero costs (and under ANALYZE its scans print no actuals). RP-908
-      recognises the anti join only where the ON is strict through a bare
-      key (`left_anti_key`); an expression key is neither hashed here nor
-      priced as one (`eqjoinsel_semi` over an expression has no
-      statistics: `rows=500` is its 0.5 default). Measured on a private
-      15.19 cluster.
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a left join on an expression key where the nullable side is null is a hash anti join]
-      Backlog-ID: RP-981
 
 ## Found while working RP-911 (2026-11-15)
 
@@ -1258,35 +1239,6 @@ one beside it.
       that type's catalog entry alone.
       Verify: tests/backlog/test_rp_catalog_latency.py::test_the_first_catalog_query_after_ddl_over_two_user_types_costs_the_same_at_400_tables
       Backlog-ID: RP-970
-
-## Found while working RP-929 (2026-11-14)
-
-Since RP-929 a hash index's build (CREATE INDEX, REINDEX, a rewrite)
-records its pages and index tuples, from the metapage model
-`hash_index.rs` keeps; TRUNCATE records 0 pages, -1 tuples. Measured on a
-private 15.19 cluster:
-
-- [ ] **OPEN — a hash index has no overflow pages.** 1,000 rows of one
-      key, all in one bucket: PostgreSQL 15.19 chains overflow pages to
-      the full bucket (`_hash_addovflpage`) and records 12 pages;
-      `secantusd-pg` records 6, the 4 buckets with the metapage and the
-      bitmap page. The metapage model counts buckets, not the tuples in
-      each; overflow needs each bucket's tuple count, moved by each split.
-      Verify: tests/backlog/test_rp_found_rp929.py::test_duplicate_hash_keys_fill_overflow_pages
-      Backlog-ID: RP-956
-
-## Found while working RP-931 (2026-11-14)
-
-- [ ] **OPEN — the size functions give a partitioned table's indexes a
-      page each.** A partitioned index has no storage, so PostgreSQL 15.19
-      answers 0 for `pg_relation_size` of one, and 0 for `pg_indexes_size`
-      and `pg_total_relation_size` of a partitioned table, rows or none
-      (2026-11-14). `secantusd-pg` answers 8192 per index and 8192 times
-      the index count for the other two: `size_call_here` sizes the
-      index from the root's B-tree model, which holds the whole tree's rows
-      (`partition.rs`), where `pg_class` now shows 0 pages (RP-931).
-      Verify: tests/backlog/test_rp_found_rp931.py::test_a_partitioned_tables_indexes_have_no_size
-      Backlog-ID: RP-949
 
 ## Found by a CI run (2026-11-07)
 
@@ -1786,24 +1738,29 @@ a regression test.
       (found while working RP-919).
       Verify: none -- a performance budget; the two tests named above time it
       Backlog-ID: RP-1020
-- [ ] **EXPLAIN VERBOSE prints no `Output` lists above a scan.** A plan
-      that is one relation's scan prints as VERBOSE does (RP-925); any
-      other node prints as without it: PostgreSQL 15.19 prints `explain
-      verbose select * from k where a > 5 order by b` (`k` 1,000 analysed
-      rows) with `Output: a, b` and `Sort Key: k.b` on the Sort, and the
-      Seq Scan under it as `Seq Scan on public.k` with `Output: a, b` and
-      `Filter: (k.a > 5)`; here the plain plan. A join's nodes each print
-      their `Output` too (`Output: e.a, e.b, e2.a, e2.b` on a Nested Loop,
-      its Materialize's and Memoize's likewise), and an inner index scan's
-      `Index Cond` is qualified (`(k.a > r.a)`). Measured on a private
-      15.19 cluster (found while working RP-916). Where to build it: the
-      lone-scan case is `explain::attach_verbose`, fed by
-      `ruleutils::explain_verbose_scan` through
-      `ExplainOptions.verbose_scan`; every other node needs its targetlist
+- [ ] **EXPLAIN VERBOSE prints no `Output` lists on most joins' nodes.**
+      A plan over one relation prints as VERBOSE does: its scan (RP-925)
+      and the Sorts and Limits above it, each with the scan's `Output` and
+      its `Sort Key` qualified; and a hash join of two relations on column
+      equalities with no WHERE prints every node's `Output` and its `Inner
+      Unique` (RP-966, in part: `ruleutils::explain_verbose_join`,
+      `explain::attach_verbose_join`). Every other join does not: PostgreSQL
+      15.19 prints a Nested Loop's, a Merge Join's, its Materialize's and
+      Memoize's `Output` likewise (`select e.b, k.b from e join k on e.a <
+      k.a`: `Output: e.b, k.b` on the Nested Loop, `Output: e.a, e.b` on the
+      outer Seq Scan, which returns its physical target list, `Output: k.a,
+      k.b` on the inner index scan and its `Index Cond: (k.a > e.a)`
+      prefixed); here the plain plan. Nor does a join with a WHERE (its
+      scans' quals prefixed), an ON that is not column equalities, or
+      three or more relations; nor a Sort on a computed key (`order by a+1`
+      prints `Output: a, ((a + 1))` and `Sort Key: ((k.a + 1))` over a scan
+      whose `Output: a, (a + 1)`): `attach_verbose` declines a key that is
+      not a bare column. Where to build it: every node's targetlist
       deparsed (`show_plan_tlist`, prefixed when the range table holds more
-      than one relation) and its quals and keys printed with `unqualified
-      = false`.
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[explain verbose of a sort over a scan]
+      than one relation; a node under a Hash, Sort or Material returns only
+      the columns needed above, `CP_SMALL_TLIST`), its quals and keys
+      printed with `unqualified = false`.
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a nested loop's nodes print their output under verbose]
       Backlog-ID: RP-966
 
 
@@ -1954,16 +1911,6 @@ a regression test.
       it (2026-11-17, sized while working RP-841).
       Verify: tests/backlog/test_rp_explain_costs.py::test_plan[estimate of a regex match with a repeated group]
       Backlog-ID: RP-423
-- [ ] **A call over constants in a WHERE is not folded in EXPLAIN.**
-      `eval_const_expressions` folds an immutable call whose arguments are
-      all constants: PostgreSQL 15.19 prints `explain select * from e where
-      abs(-3) < a` (`e` analysed, 1,000 rows) as `Seq Scan on e
-      (cost=0.00..17.50 rows=997 width=7)` with `Filter: (3 < a)`; here
-      `cost=0.00..0.00 rows=0 width=0` and `Filter: (abs('-3'::integer) <
-      a)`. The rows are right. Measured on the 15.19 reference on port 5415
-      (found while working RP-423).
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a call over constants in a where is folded]
-      Backlog-ID: RP-1021
 - [ ] **A semi join cheaper unique-ified keeps the semi join's shape.**
       Since RP-411's first slice (2026-11-16) a WHERE that is one
       uncorrelated `col IN (select col from t)` / `= any`, or one `EXISTS`
@@ -2836,56 +2783,30 @@ with ICU) with the `_SETUP` in `tests/backlog/test_rp_found_rp782.py`:
 
 Measured on a private PostgreSQL 15.19 cluster.
 
-- [ ] **A CHECK naming its own table by `regclass` is refused at CREATE
-      TABLE.** `create table t816 (x int, check (tableoid =
-      't816'::regclass))` is CREATE TABLE on PostgreSQL 15.19
-      (`cookConstraint` runs after the relation exists); here it is 42P01
-      `relation "t816" does not exist` at 14. `alter table ... add check`
-      over an existing table is taken.
-      Verify: tests/backlog/test_rp_found_rp816.py::test_a_checks_regclass_of_its_own_table_resolves_at_create
-      Backlog-ID: RP-974
-- [ ] **A CHECK violated by a row routed into a partition names the
-      partitioned table, not the leaf.** `insert into p974 values (2)`,
-      routed into `p974b` and failing `check (x < 2)`, is 23514 `new row
-      for relation "p974b" violates check constraint "p974_x_check"` on
-      PostgreSQL 15.19 (`ExecConstraints` reports the leaf's result
-      relation); here the relation is `p974`.
-      Verify: tests/backlog/test_rp_found_rp816.py::test_a_partitions_check_violation_names_the_leaf
-      Backlog-ID: RP-975
 
 ## Found while working RP-860 (2026-11-14)
 
 Measured on a private, freshly initdb'd PostgreSQL 15.19 cluster with the
 `_SETUP` in `tests/backlog/test_rp_found_rp860.py` (`t860 (x int)`).
 
-- [ ] **A column renamed under a CHECK leaves the CHECK naming the old
-      column, and the table takes no more rows.** After `alter table t860
-      add constraint k check (x > 0)` and `alter table t860 rename column x
-      to y`, PostgreSQL 15.19 still enforces the constraint on the column
-      (`insert ... values (0)` is 23514) and prints it `CHECK ((y > 0))`:
-      the stored tree holds the column's attnum, not its name. Here the
-      stored text still says `x`, so every INSERT is 42703 `column "x" does
-      not exist` and `pg_get_constraintdef` prints the old text. The fix renames the column in every stored CHECK
-      expression (and any other stored expression text keyed by column
-      name) where the rename is applied.
-      Verify: tests/backlog/test_rp_found_rp860.py::test_a_renamed_column_is_renamed_in_its_check
-      Backlog-ID: RP-939
-- [ ] **`pg_get_constraintdef` drops `NOT VALID` from a CHECK.** `alter
-      table t860 add constraint k check (x > 0) not valid` prints `CHECK
-      ((x > 0)) NOT VALID` on PostgreSQL 15.19 (`pg_get_constraintdef_worker`
-      appends it while `convalidated` is false); here `CHECK ((x > 0))`.
-      Verify: tests/backlog/test_rp_found_rp860.py::test_a_not_valid_check_prints_not_valid
-      Backlog-ID: RP-940
-- [ ] **A `regtype` comparison in a CHECK prints without its `oid`
-      casts.** `check (pg_typeof(x) = 'int4'::regtype)` prints `CHECK
-      (((pg_typeof(x))::oid = ('integer'::regtype)::oid))` on PostgreSQL
-      15.19: `regtype` has no `=`, so the parser resolves `oideq` over
-      binary-coercible casts, and ruleutils prints them. Here it is the
-      text as written, `CHECK ((pg_typeof(x) = 'int4'::regtype))`.
-      `ruleutils.rs` would need the operator resolution the analysed tree
-      records.
-      Verify: tests/backlog/test_rp_found_rp860.py::test_a_regtype_comparison_in_a_check_prints_its_oid_casts
-      Backlog-ID: RP-941
+
+## Found while working RP-939 (2026-11-17)
+
+Measured on PostgreSQL 15.19 (the shared reference on port 5415).
+
+- [ ] **A renamed partition key column leaves the key naming the old
+      column, and the table takes no more rows.** After `alter table p939k
+      rename column x to y` on `p939k (x int) partition by list (x)`,
+      PostgreSQL 15.19 still routes `insert into p939k values (1)` and
+      prints the key `LIST (y)`: the key holds the column's attnum. Here
+      the stored key text still names `x`, so the INSERT is 42703 `column
+      "x" does not exist`. The RENAME COLUMN arm renames the column in
+      stored CHECKs (`rename_column_in_expression`, RP-939); the partition
+      key, the partitions' bounds, and any other stored expression text
+      (defaults, generated columns, index expressions and predicates) were
+      not checked.
+      Verify: tests/backlog/test_rp_found_rp860.py::test_a_renamed_partition_key_column_still_routes
+      Backlog-ID: RP-1024
 
 ## Found while working RP-751 (2026-11-10)
 
@@ -2998,3 +2919,98 @@ statement is VALUES-only and runs there as written. The gap test is in
       the 15.19 reference on port 5415.
       Verify: none -- no EXPLAIN this server prints reaches an exact half yet (its HashAggregate over a HAVING prints zeros); `setop_order::tests::having_selectivity_is_postgres` notes the case
       Backlog-ID: RP-1023
+
+## Found while working RP-966 (2026-11-17)
+
+- [ ] **A join on an expression key PostgreSQL prices is unpriced in
+      three shapes.** Since RP-981 a join of two analysed tables on one
+      equality between a column and an operator expression over one column
+      of the other is a priced Hash Join (inner, LEFT, anti), hashing the
+      side whose key has statistics. Still a `Nested Loop` with `Join
+      Filter` and zero costs: against a unique column, `select * from e join
+      k on k.a = e.a - 1` (PostgreSQL 15.19 `Hash Join (cost=27.50..45.26
+      rows=1000 width=14)` hashing `k`, inner unique; `hash_join_of`'s
+      unique-key paths are not modelled over an expression); where the
+      merge wins, `e.b = e2.b || 'x'` over a ten-value column (`Merge Join
+      (cost=129.66..224.66 rows=5000 width=14)`, the expression's Sort Key
+      `((e2.b || 'x'::text))`; priced with `mergejoinscansel`'s defaults
+      and declined, the plan is not drawn); and across types, `e.a::bigint =
+      e2.a` (`Hash Join (cost=27.50..57.50 rows=1000 width=14)`; declined on
+      `pg_type`). An aggregate over such a join (`select count(*)`) and a
+      LEFT join filtered on a column not its key (`where e2.b is null`, a
+      `Hash Right Join` with `Filter`) stay unpriced as they do over a
+      column key. Measured on the 15.19 reference on port 5415.
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[an expression key against a unique column is a hash join], tests/backlog/test_rp_explain_costs.py::test_plan[an expression key over a column of few values is a merge join]
+      Backlog-ID: RP-1032
+- [ ] **ANALYZE of a hash join on an expression key counts nothing below
+      it.** `explain (analyze, costs off, timing off, summary off) select *
+      from e left join e e2 on e.a = e2.a + 1 where e2.a is null` prints,
+      in PostgreSQL 15.19, `actual rows` on both scans and the Hash and the
+      Hash's `Buckets: 1024  Batches: 1  Memory Usage: 47kB`; here only the
+      join's own `actual rows=1`. `join_analyze` reads the `Hash Cond` as
+      two columns. Measured on the 15.19 reference on port 5415 (found
+      while working RP-981).
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[analyze of an anti join on an expression key]
+      Backlog-ID: RP-1033
+- [ ] **A hash join written inner side first is not `Inner Unique`.**
+      `explain verbose select * from k join e on e.a = k.a` (`k.a` the
+      primary key, `k` hashed) prints `Inner Unique: true` in PostgreSQL
+      15.19, as the same join written `e join k` does; here `false`, in
+      the structured formats without VERBOSE too (`"Inner Unique":
+      false`). The `unique_probe` of the join's inner table is taken from
+      the side the FROM writes second, not the side the plan hashes.
+      Measured on the 15.19 reference on port 5415.
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a hash join written inner side first is inner unique]
+      Backlog-ID: RP-1030
+- [ ] **A structured EXPLAIN VERBOSE names no `Schema` on a scan.**
+      `explain (verbose, costs off, format json) select * from e` prints
+      `"Relation Name": "e", "Schema": "public", "Alias": "e"` in
+      PostgreSQL 15.19 (`ExplainScanTarget` adds the schema under
+      VERBOSE); here no `Schema` key, on every scan of every structured
+      format. Measured on the 15.19 reference on port 5415.
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a structured verbose scan names its schema]
+      Backlog-ID: RP-1031
+- [ ] **A Limit over a Sort of a filtered scan is not priced.**
+      PostgreSQL 15.19 prints `explain select a from k where a > 5 order by
+      b desc limit 3` (`k` analysed, 1,000 rows) as `Limit
+      (cost=30.36..30.37 rows=3 width=7)` over `Sort (cost=30.36..32.85
+      rows=995 width=7)` (a top-N heapsort, `cost_sort` with its bound)
+      over `Seq Scan on k (cost=0.00..17.50 rows=995 width=7)`; here every
+      node is `cost=0.00..0.00 rows=0 width=0`, with or without VERBOSE,
+      and with `select *` too. The same Sort without the LIMIT is priced.
+      Measured on the 15.19 reference on port 5415.
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[explain verbose of a limit over a descending sort]
+      Backlog-ID: RP-1025
+
+## Found while working RP-980 (2026-11-17)
+
+- [ ] **An anti join with an outer conjunct beside it is not planned as
+      one.** `select b from e where a > 500 and not exists (select 1 from e
+      e2 where e2.a = e.a)`, and its LEFT join spelling `select e.b from e
+      left join e e2 on e.a = e2.a where e.a > 500 and e2.a is null`, are
+      in PostgreSQL 15.19 both `Hash Anti Join (cost=27.50..46.88 rows=1
+      width=3)` with `Filter: (a > 500)` on the outer Seq Scan (`rows=500`).
+      Here the LEFT join form prints an unpriced `Hash Left Join` with
+      `Filter: (e2.a IS NULL)` (RP-908's `left_anti_key` recognises the
+      anti join only where the WHERE is the IS NULL alone), and the NOT
+      EXISTS form a Seq Scan with `Filter: (...)`:
+      `sublink_join::anti_join_of` (RP-980) rewrites NOT EXISTS into that
+      LEFT join form only when it is the whole WHERE, and should take the
+      outer conjuncts once the LEFT join form prices them. Measured on the
+      15.19 reference on port 5415.
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a not exists beside an outer conjunct is a hash anti join], tests/backlog/test_rp_explain_costs.py::test_plan[a left join anti join beside an outer conjunct is a hash anti join]
+      Backlog-ID: RP-1027
+
+## Found while working RP-981 (2026-11-17)
+
+- [ ] **EXPLAIN names a temporary table's scan by its schema and repeats
+      it as an alias.** PostgreSQL 15.19 prints `explain select * from t`
+      (`t` a temporary table) as `Seq Scan on t (cost=0.00..35.50
+      rows=2550 width=4)`, and `... from t x` as `Seq Scan on t x`; here
+      `Seq Scan on pg_temp_22.t t` and `Seq Scan on pg_temp_22.t x`: the
+      scan's relation name is the temp schema's storage key, which the
+      join-leaf alias logic then sees as differing from the alias. Only
+      VERBOSE prints a schema (`pg_temp_3.t`). Measured on the 15.19
+      reference on port 5415.
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a scan of a temporary table names it bare], tests/backlog/test_rp_explain_costs.py::test_plan[a scan of an aliased temporary table names it and its alias]
+      Backlog-ID: RP-1029

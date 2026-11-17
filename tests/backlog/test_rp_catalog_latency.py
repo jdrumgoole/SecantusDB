@@ -16,6 +16,8 @@ from typing import Any
 
 import pytest
 
+from tests.backlog.conftest import only_on
+
 #: psql 15's column query for `\d`, cut to the correlated subquery that holds
 #: all the time: a comma join of pg_collation and pg_type, filtered by
 #: equalities on the OUTER row's columns.
@@ -149,6 +151,16 @@ def _describe(pairs: list[tuple[float, float]], what: str, tables: int) -> str:
     )
 
 
+def _ratios(pairs: list[tuple[float, float]], what: str, tables: int) -> str:
+    """Each round's large-over-small ratio and the median, for the log of a
+    run that passes as well as one that fails."""
+    ratios = sorted(large / small for small, large in pairs)
+    return (
+        f"{_describe(pairs, what, tables)}; ratio median "
+        f"{statistics.median(ratios):.2f}, rounds {' '.join(f'{r:.2f}' for r in ratios)}"
+    )
+
+
 def _first_collation(conn: Any, table: str) -> float:
     """The collation query's first run straight after a `CREATE TABLE`."""
     conn.execute(f'CREATE TABLE {table} (v text COLLATE "C")')
@@ -264,9 +276,16 @@ def test_the_first_catalog_query_after_ddl_costs_the_same_at_800_tables_within_a
     The fastest of five passed CI on 2026-11-17 (PR #2794) while a debug
     build here measured a ratio of 1.23 to 1.29 in ten of ten runs of
     fifteen rounds, by minimum and by median alike."""
+    only_on(
+        "darwin",
+        why="the same debug build passes on x86_64 Linux CI (PRs #2794 and "
+        "#2821, min-of-five and paired-median methods) and fails every run "
+        "on arm64 macOS at a median ratio of 1.26-1.27 (2026-11-17)",
+    )
     small, large = pg_pair
     _grow(large, "rp911", 2 * GROWTH_TABLES)
     pairs = _paired(small, large, _first_collation, "rp911c")
+    print(_ratios(pairs, "first query after DDL", 2 * GROWTH_TABLES))
     assert _median_excess(pairs, 1.1) < 0.001, _describe(
         pairs, "first query after DDL", 2 * GROWTH_TABLES
     )

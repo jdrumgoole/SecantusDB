@@ -658,6 +658,16 @@ impl PgHandler {
             return Ok(());
         }
         let mut level = def.clone();
+        // The partitioned levels' NOT NULLs and CHECKs, which a partition
+        // inherits: `ExecConstraints` checks them on the leaf the row is
+        // routed to, and names the leaf (RP-975).
+        let mut inherited_checks = def.check_constraints.clone();
+        let mut not_null: Vec<String> = def
+            .columns
+            .iter()
+            .filter(|c| !c.nullable || c.pk)
+            .map(|c| c.name.clone())
+            .collect();
         for _ in 0..64 {
             if !is_partitioned(&level) {
                 return Ok(());
@@ -675,11 +685,44 @@ impl PgHandler {
                 // The partition's OWN NOT NULLs and CHECKs hold for the rows
                 // it takes, whichever table they were written through.
                 Some(p) => {
-                    let shaped = Self::reshape_rows(def, &p, std::slice::from_ref(row))?;
-                    if let Some(r) = shaped.first() {
-                        // A partition's columns are of the parent's types,
-                        // whose domains the write has checked already.
-                        self.check_row_constraints_with(&p, r, crate::DomainChecks::Only(&[]))?;
+                    if is_partitioned(&p) {
+                        for c in &p.check_constraints {
+                            if !inherited_checks.iter().any(|k| k.name == c.name) {
+                                inherited_checks.push(c.clone());
+                            }
+                        }
+                        not_null.extend(
+                            p.columns
+                                .iter()
+                                .filter(|c| !c.nullable || c.pk)
+                                .map(|c| c.name.clone()),
+                        );
+                    } else {
+                        let shaped = Self::reshape_rows(def, &p, std::slice::from_ref(row))?;
+                        if let Some(r) = shaped.first() {
+                            let mut leaf = p.clone();
+                            for c in &mut leaf.columns {
+                                if not_null.contains(&c.name) {
+                                    c.nullable = false;
+                                }
+                            }
+                            let own = std::mem::take(&mut leaf.check_constraints);
+                            leaf.check_constraints = inherited_checks.clone();
+                            for c in own {
+                                if !leaf.check_constraints.iter().any(|k| k.name == c.name) {
+                                    leaf.check_constraints.push(c);
+                                }
+                            }
+                            // `ExecRelCheck` runs them in name order.
+                            leaf.check_constraints.sort_by(|a, b| a.name.cmp(&b.name));
+                            // A partition's columns are of the parent's types,
+                            // whose domains the write has checked already.
+                            self.check_row_constraints_with(
+                                &leaf,
+                                r,
+                                crate::DomainChecks::Only(&[]),
+                            )?;
+                        }
                     }
                     level = p;
                 }
