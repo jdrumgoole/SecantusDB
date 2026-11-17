@@ -277,14 +277,16 @@ def test_a_scroll_cursor_projects_each_row_its_executor_steps_onto(
     assert got == expected
 
 
-@pytest.mark.backlog("RP-962")
+@pytest.mark.backlog_fixed("RP-962")
 def test_a_cursor_over_a_table_recomputes_a_volatile_column_when_it_reads_a_row_again(
     dsn: str,
 ) -> None:
     """PostgreSQL 15.19's scan node projects each row it reads, a re-read
     included: on a SCROLL cursor over a table or VALUES, `fetch prior` and
     `fetch first` draw `nextval` again. Here those cursors read back the
-    rows as first computed. Measured on PostgreSQL 15.19 (2026-11-17)."""
+    rows as first computed: the one over a table, simply updatable, had
+    computed every row at the DECLARE. Measured on PostgreSQL 15.19
+    (2026-11-17)."""
     n = uuid.uuid4().hex[:8]
     with psycopg.connect(dsn, autocommit=True) as c:
         c.execute(f"create table rp_reread_t_{n} (g int primary key)")
@@ -306,6 +308,45 @@ def test_a_cursor_over_a_table_recomputes_a_volatile_column_when_it_reads_a_row_
     assert got == [
         [[(1, 1), (2, 2)], [(3, 1)], [(4, 1)]],
         [[(1, 1), (2, 2)], [(3, 1)], [(4, 1)]],
+    ]
+
+
+@pytest.mark.backlog_fixed("RP-962")
+def test_a_simply_updatable_cursor_computes_its_rows_as_they_are_fetched(dsn: str) -> None:
+    """A simply updatable cursor over a table computed its whole select
+    list at the DECLARE, to capture each row's id for `WHERE CURRENT OF`:
+    the DECLARE drew every `nextval`. PostgreSQL 15.19 draws none there,
+    and `WHERE CURRENT OF` names the row a backward FETCH lands on.
+    Measured on the shared reference (2026-11-17)."""
+    n = uuid.uuid4().hex[:8]
+    t, s = f"rp_cur_t_{n}", f"rp_cur_s_{n}"
+    with psycopg.connect(dsn, autocommit=True) as c:
+        c.execute(f"create table {t} (g int primary key, v int)")
+        c.execute(f"insert into {t} select x, 0 from generate_series(1, 4) x")
+        c.execute(f"create sequence {s}")
+    assert _steps(
+        dsn,
+        [
+            "begin",
+            f"declare c scroll cursor for select nextval('{s}'), g from {t}",
+            f"select nextval('{s}')",
+            "fetch 2 from c",
+            f"update {t} set v = 9 where current of c",
+            "fetch prior from c",
+            f"update {t} set v = 7 where current of c",
+            f"select g, v from {t} order by g",
+            "rollback",
+        ],
+    ) == [
+        "BEGIN",
+        "DECLARE CURSOR",
+        [(1,)],
+        [(2, 1), (3, 2)],
+        "UPDATE 1",
+        [(4, 1)],
+        "UPDATE 1",
+        [(1, 7), (2, 9), (3, 0), (4, 0)],
+        "ROLLBACK",
     ]
 
 

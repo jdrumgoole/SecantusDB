@@ -1361,8 +1361,15 @@ fn reprojects(stmt: &Statement) -> bool {
     let Statement::Select(sel) = stmt else {
         return false;
     };
+    // A VALUES list in FROM is a Values Scan, which projects each row it
+    // returns as a table scan does; another subquery's rows come from a
+    // subplan of their own.
+    let values_scan = sel
+        .sub
+        .as_ref()
+        .is_none_or(|s| matches!(*s.plan, Statement::ValuesConstant(_)));
     sel.join.is_none()
-        && sel.sub.is_none()
+        && values_scan
         && sel.windows.is_empty()
         && sel.distinct == secantus_pgplan::Distinct::None
         && sel.lock.is_none()
@@ -1633,13 +1640,33 @@ impl PgHandler {
         self.pull_pending(name, hi)
     }
 
+    /// Run `f` with the ids of the rows it computes captured, when `armed`:
+    /// a simply updatable cursor's rows carry their stored `_id` for
+    /// `WHERE CURRENT OF`, captured as each row is computed (RP-962).
+    fn with_cursor_ids<T>(&self, armed: bool, f: impl FnOnce() -> T) -> (T, Option<Vec<Bson>>) {
+        if !armed {
+            return (f(), None);
+        }
+        let previous = self
+            .cursor_ids
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .replace(Vec::new());
+        let out = f();
+        let ids = std::mem::replace(
+            &mut *self.cursor_ids.lock().unwrap_or_else(|e| e.into_inner()),
+            previous,
+        );
+        (out, ids)
+    }
+
     /// Compute cursor `name`'s pending rows up to row `upto` (1-based), or
     /// all of them. The cursor lock is not held while they are computed: a
     /// row's select list may call a function that reads a cursor. An error
     /// ends the stream; the caller marks the cursor failed, as PostgreSQL's
     /// `PortalRunFetch` does.
     pub(crate) fn pull_pending(&self, name: &str, upto: Option<i64>) -> PgWireResult<()> {
-        let (pending, wanted) = {
+        let (pending, wanted, ids) = {
             let mut cursors = self.cursors.lock().unwrap_or_else(|e| e.into_inner());
             let Some(cursor) = cursors.get_mut(name).filter(|c| !c.failed) else {
                 return Ok(());
@@ -1655,9 +1682,9 @@ impl PgHandler {
             let Some(pending) = cursor.pending.take() else {
                 return Ok(());
             };
-            (pending, wanted)
+            (pending, wanted, cursor.current_of.is_some())
         };
-        let pulled = self.pull_rows(pending, wanted);
+        let (pulled, ids) = self.with_cursor_ids(ids, || self.pull_rows(pending, wanted));
         let mut cursors = self.cursors.lock().unwrap_or_else(|e| e.into_inner());
         let Some(cursor) = cursors.get_mut(name) else {
             return pulled.failure.map_or(Ok(()), Err);
@@ -1673,6 +1700,7 @@ impl PgHandler {
             _ => cursor.typed_rows = None,
         }
         cursor.absorb_sources(pulled.reproject, pulled.sources, pulled.rows.len());
+        cursor.absorb_ids(ids, pulled.rows.len());
         cursor.rows.extend(pulled.rows);
         cursor.pending = pulled.rest;
         pulled.failure.map_or(Ok(()), Err)
@@ -2106,7 +2134,14 @@ impl PgHandler {
                     return;
                 }
             };
-            let started = self.start_pending(*query, capture_typed);
+            let armed = self
+                .cursors
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(name)
+                .is_some_and(|c| c.current_of.is_some());
+            let (started, ids) =
+                self.with_cursor_ids(armed, || self.start_pending(*query, capture_typed));
             let mut cursors = self.cursors.lock().unwrap_or_else(|e| e.into_inner());
             let Some(cursor) = cursors.get_mut(name) else {
                 return;
@@ -2128,6 +2163,7 @@ impl PgHandler {
                         _ => cursor.typed_rows = None,
                     }
                     cursor.absorb_sources(started.reproject, started.sources, started.rows.len());
+                    cursor.absorb_ids(ids, started.rows.len());
                     cursor.rows.extend(started.rows);
                     rest
                 }

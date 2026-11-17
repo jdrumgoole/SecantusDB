@@ -5089,6 +5089,19 @@ impl CursorState {
         }
     }
 
+    /// Keep the ids of `n` rows a pull computed, for `WHERE CURRENT OF`;
+    /// rows without one each make the cursor not simply updatable, as rows
+    /// that did not come from one scan do.
+    pub(crate) fn absorb_ids(&mut self, ids: Option<Vec<Bson>>, n: usize) {
+        let Some(c) = self.current_of.as_mut() else {
+            return;
+        };
+        match ids {
+            Some(ids) if ids.len() == n => c.ids.extend(ids),
+            _ => self.current_of = None,
+        }
+    }
+
     /// Empty the window, to be read again from the start.
     fn clear_window(&mut self) {
         self.rows.clear();
@@ -36190,9 +36203,10 @@ impl PgHandler {
             // (`start_deferred_cursors`). Its row description is the
             // planner's until the run gives its own. Kept to run here: a
             // WITH HOLD cursor declared outside a block, whose transaction
-            // ends now (PostgreSQL materialises it at that commit), and a
-            // simply updatable one, whose rows' ids are captured with them.
-            if in_block && updatable.is_none() {
+            // ends now (PostgreSQL materialises it at that commit). A simply
+            // updatable one captures each row's id as the row is computed
+            // (RP-962).
+            if in_block {
                 let planned = match &*query {
                     Statement::Select(_)
                     | Statement::SetOp(_)
@@ -36256,7 +36270,10 @@ impl PgHandler {
                                 base: 0,
                                 pending: Some(pending),
                                 failed: false,
-                                current_of: None,
+                                current_of: updatable.clone().map(|table| CurrentOf {
+                                    table,
+                                    ids: Vec::new(),
+                                }),
                                 held: false,
                                 pinned: false,
                                 auto_held: false,

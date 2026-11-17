@@ -2637,37 +2637,6 @@ statement is VALUES-only and runs there as written. The gap tests are in
 `tests/backlog/test_rp_found_rp732.py`.
 
 
-## Found while working RP-744 (2026-11-12)
-
-Measured on PostgreSQL 15.19: the VALUES-only statements on the shared
-reference on port 5415, the ones that create a function, a sequence or a
-table on a private cluster. The gap tests are in
-`tests/backlog/test_rp_found_rp744.py`. Since RP-744, RP-895, RP-896 and
-RP-897 a cursor runs its query at the first FETCH and computes its select
-list as it is fetched (`portal_stream::PendingRows`); these are the shapes
-still computed whole, and the cursor answers that differ either way.
-
-- [ ] **A cursor over a table or VALUES reads a row again without
-      computing it again.** PostgreSQL 15.19's scan node projects every
-      tuple it returns (`ExecScan`), backward and after a rewind included,
-      so a VOLATILE select list runs again on a re-read. Since 2026-11-17 a
-      cursor whose query runs as `PendingRows` (a plain scan of a function
-      such as `generate_series`) keeps each row's source row
-      (`CursorState::sources`) and, on a SCROLL cursor, moves as
-      `DoPortalRunFetch` moves the executor (`replay_fetch`), and a WITH
-      HOLD cursor projects its rows again when COMMIT persists it. Still
-      read back as first computed: a cursor over a table, which streams
-      through `CursorTail` (`encode_cursor_docs` projects its batches and
-      `trim_cursor` drains its window), and one over VALUES. On a SCROLL
-      cursor over `select nextval('s'), g from t` (4 rows), `fetch 2`,
-      `fetch prior`, `fetch first` answer (1,1) (2,2), (3,1), (4,1); here
-      (1,1), (1,1). Needs the same source rows and walk on the tail path:
-      the window's sources drained with it, and `fill_cursor` in place of
-      `pull_pending` for the rows not read yet. Found while working RP-895
-      (2026-11-14).
-      Verify: tests/backlog/test_rp_found_rp744.py::test_a_cursor_over_a_table_recomputes_a_volatile_column_when_it_reads_a_row_again
-      Backlog-ID: RP-962
-
 ## Found while working RP-782 (2026-11-10)
 
 Measured on a private PostgreSQL 15.19 cluster (locale C.UTF-8, built
