@@ -73,7 +73,8 @@ fn hint_for(table: &str) -> Option<ScanHint> {
     HINTS.with(|h| h.borrow().iter().rev().find(|x| x.table == table).cloned())
 }
 
-/// A GIN index this models: array columns under `array_ops`, `jsonb`
+/// A GIN index this models: array columns under `array_ops`, scalar
+/// columns under `btree_gin`'s opclasses, `jsonb`
 /// columns under `jsonb_ops` or `jsonb_path_ops`, `tsvector` columns
 /// under `tsvector_ops` -- one, or several (a multi-column index).
 #[derive(Debug, Clone)]
@@ -984,10 +985,10 @@ impl crate::PgHandler {
                     } else if matches!(pg_type.as_str(), "jsonb" | "tsvector") {
                         pg_type.as_str()
                     } else {
-                        let Some(elem) = pg_type.strip_suffix("[]") else {
-                            break;
-                        };
-                        elem
+                        // An array under `array_ops`, or a scalar under
+                        // `btree_gin`'s opclass for its type, whose one key
+                        // is the value itself (`gin_extract_value_*`).
+                        pg_type.strip_suffix("[]").unwrap_or(pg_type.as_str())
                     };
                     let textual = ElemOps {
                         elem: elem.to_string(),

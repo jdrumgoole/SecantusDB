@@ -1490,10 +1490,15 @@ batch, their tests regression tests:
         tuple can land on another page than in a given backend (15.19 gave
         the same layout on three runs).
       The size functions read the modelled indexes' pages (since RP-287's
-      first slice); an unmodelled one (a btree_gin one) still reads 0 from
-      `pg_relation_size`.
+      first slice); an unmodelled one still reads 0 from
+      `pg_relation_size`: a GIN index over a column with a collation of its
+      own (array or `btree_gin` text; the model orders text by bytes only).
+      A `btree_gin` index over a scalar `int2`/`int4`/`int8`/`float4`/
+      `float8`/`bool`/`text` column has been modelled since 2026-11-17 (one
+      key per row, the value itself); its scans are not, nor its other
+      types (`date`, `timestamp`, `numeric`, ...).
       Backlog-ID: RP-287
-      Verify: tests/backlog/test_rp_top10_found.py::test_a_btree_gin_index_has_its_pages
+      Verify: tests/backlog/test_rp_top10_found.py::test_a_collated_btree_gin_index_has_its_pages
 
 
 ## Found by batch 71 (2026-10-25)

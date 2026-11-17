@@ -859,11 +859,11 @@ def test_expression_gin_index_shapes_have_their_pages(pg: Any, case: str) -> Non
     assert got == ("ok", [(pages,)])
 
 
-@pytest.mark.backlog("RP-287")
+@pytest.mark.backlog_fixed("RP-287")
 def test_a_btree_gin_index_has_its_pages(pg: Any) -> None:
-    """A btree_gin index (a scalar column under `int4_ops`) is not modelled
-    page by page: PostgreSQL 15.19 sizes this one at 9 pages; here
-    `pg_relation_size` reads 0."""
+    """A btree_gin index (a scalar column under `int4_ops`) was not
+    modelled page by page: PostgreSQL 15.19 sizes this one at 9 pages;
+    `pg_relation_size` read 0."""
     got = _in_block(
         pg,
         [
@@ -875,6 +875,91 @@ def test_a_btree_gin_index_has_its_pages(pg: Any) -> None:
         "select pg_relation_size('rp287_bgi') / 8192",
     )
     assert got == ("ok", [(9,)])
+
+
+_RP287_BTREE_GIN = {
+    "int8": (
+        [
+            "create table rp287_bt (a int8)",
+            "insert into rp287_bt select g % 300 from generate_series(1, 20000) g",
+            "create index rp287_bti on rp287_bt using gin (a)",
+        ],
+        13,
+    ),
+    "text": (
+        [
+            "create table rp287_bt (a text)",
+            "insert into rp287_bt select 'v' || (g % 500) from generate_series(1, 20000) g",
+            "create index rp287_bti on rp287_bt using gin (a)",
+        ],
+        14,
+    ),
+    "float8": (
+        [
+            "create table rp287_bt (a float8)",
+            "insert into rp287_bt select (g % 200) / 3.0 from generate_series(1, 20000) g",
+            "create index rp287_bti on rp287_bt using gin (a)",
+        ],
+        12,
+    ),
+    "bool_nulls": (
+        [
+            "create table rp287_bt (a bool)",
+            "insert into rp287_bt select case when g % 5 = 0 then null else g % 2 = 0 end"
+            " from generate_series(1, 20000) g",
+            "create index rp287_bti on rp287_bt using gin (a)",
+        ],
+        9,
+    ),
+    "pending_list": (
+        [
+            "create table rp287_bt (a int4)",
+            "create index rp287_bti on rp287_bt using gin (a)",
+            "insert into rp287_bt select g % 100 from generate_series(1, 20000) g",
+        ],
+        52,
+    ),
+    "no_fastupdate": (
+        [
+            "create table rp287_bt (a int2)",
+            "create index rp287_bti on rp287_bt using gin (a) with (fastupdate = off)",
+            "insert into rp287_bt select g % 100 from generate_series(1, 20000) g",
+        ],
+        7,
+    ),
+}
+
+
+@pytest.mark.backlog_fixed("RP-287")
+@pytest.mark.parametrize("case", list(_RP287_BTREE_GIN), ids=list(_RP287_BTREE_GIN))
+def test_btree_gin_index_shapes_have_their_pages(pg: Any, case: str) -> None:
+    """btree_gin indexes over other scalar types, NULLs, and rows filled
+    through the pending list or the entry tree size as PostgreSQL 15.19's."""
+    statements, pages = _RP287_BTREE_GIN[case]
+    got = _in_block(
+        pg,
+        ["create extension if not exists btree_gin", *statements],
+        "select pg_relation_size('rp287_bti') / 8192",
+    )
+    assert got == ("ok", [(pages,)])
+
+
+@pytest.mark.backlog("RP-287")
+def test_a_collated_btree_gin_index_has_its_pages(pg: Any) -> None:
+    """A btree_gin index over a column with its own collation is not
+    modelled (the model orders text by bytes only): PostgreSQL 15.19 sizes
+    this one at 14 pages; here `pg_relation_size` reads 0."""
+    got = _in_block(
+        pg,
+        [
+            "create extension if not exists btree_gin",
+            'create table rp287_bc (a text collate "C")',
+            "insert into rp287_bc select 'v' || (g % 500) from generate_series(1, 20000) g",
+            "create index rp287_bci on rp287_bc using gin (a)",
+        ],
+        "select pg_relation_size('rp287_bci') / 8192",
+    )
+    assert got == ("ok", [(14,)])
 
 
 @pytest.mark.backlog_fixed("RP-287")
