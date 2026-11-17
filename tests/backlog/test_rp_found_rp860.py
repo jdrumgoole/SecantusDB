@@ -73,10 +73,10 @@ def test_a_renamed_column_is_renamed_in_its_check(dsn: str) -> None:
     ]
 
 
-@pytest.mark.backlog("RP-940")
+@pytest.mark.backlog_fixed("RP-940")
 def test_a_not_valid_check_prints_not_valid(dsn: str) -> None:
     """`pg_get_constraintdef` ends a CHECK that is not validated with ` NOT
-    VALID` on PostgreSQL 15.19. Here it is left off."""
+    VALID` on PostgreSQL 15.19. It was left off."""
     assert _script(
         dsn,
         ["alter table t860 add constraint k check (x > 0) not valid", _DEF],

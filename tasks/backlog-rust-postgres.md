@@ -2820,12 +2820,6 @@ Measured on a private, freshly initdb'd PostgreSQL 15.19 cluster with the
       name) where the rename is applied.
       Verify: tests/backlog/test_rp_found_rp860.py::test_a_renamed_column_is_renamed_in_its_check
       Backlog-ID: RP-939
-- [ ] **`pg_get_constraintdef` drops `NOT VALID` from a CHECK.** `alter
-      table t860 add constraint k check (x > 0) not valid` prints `CHECK
-      ((x > 0)) NOT VALID` on PostgreSQL 15.19 (`pg_get_constraintdef_worker`
-      appends it while `convalidated` is false); here `CHECK ((x > 0))`.
-      Verify: tests/backlog/test_rp_found_rp860.py::test_a_not_valid_check_prints_not_valid
-      Backlog-ID: RP-940
 - [ ] **A `regtype` comparison in a CHECK prints without its `oid`
       casts.** `check (pg_typeof(x) = 'int4'::regtype)` prints `CHECK
       (((pg_typeof(x))::oid = ('integer'::regtype)::oid))` on PostgreSQL

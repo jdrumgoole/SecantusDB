@@ -16881,7 +16881,13 @@ impl PgHandler {
                 }
             }
             for ck in &t.check_constraints {
-                push(secantus_pgplan::check_constraint_text(&ck.expression, t));
+                // `pg_get_constraintdef_worker` marks an unvalidated one (RP-940).
+                let text = secantus_pgplan::check_constraint_text(&ck.expression, t);
+                push(if ck.not_valid {
+                    format!("{text} NOT VALID")
+                } else {
+                    text
+                });
             }
             for fk in &t.foreign_keys {
                 // `REFERENCES t` with no list names t's primary key.
