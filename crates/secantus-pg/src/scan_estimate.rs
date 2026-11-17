@@ -2064,7 +2064,7 @@ impl PgHandler {
             return Some((outer_key, inner_key, read));
         }
         let (a, b, more, _, _, _) = self.joined_sides(sel)?;
-        if !more.is_empty() {
+        if !more.is_empty() || !a.exprs.is_empty() || !b.exprs.is_empty() {
             return None;
         }
         let (outer, inner) = if a.alias == outer_alias && b.alias == inner_alias {
@@ -2149,7 +2149,7 @@ impl PgHandler {
             {
                 return None;
             }
-            self.hash_side(&p.table, &p.filter, &p.field, &p.read, &p.above)
+            self.hash_side_with(&p.table, &p.filter, &p.exprs, &p.field, &p.read, &p.above)
         };
         // `hash_join_of` prices at most `MORE_HASH_CLAUSES` further
         // clauses: past them, pricing each side's scan for nothing would
@@ -2312,7 +2312,11 @@ impl PgHandler {
         // The executor re-checks a comma join's equalities above the join
         // as the select's residual; those are the join clauses, not a
         // filter.
-        if let Some(residual) = &sel.residual {
+        // A WHERE whose every conjunct was pushed to a scan is re-checked
+        // above the join too; where those are the expression comparisons
+        // the scans are priced with, that residual is theirs (RP-423).
+        let pushed_exprs = !comma_clause && j.where_modelled && join_exprs_modelled();
+        if let Some(residual) = sel.residual.as_ref().filter(|_| !pushed_exprs) {
             if !comma_clause || !is_key_equality(residual, equi, filters.len()) {
                 return None;
             }
@@ -2339,6 +2343,7 @@ impl PgHandler {
         struct SideScan<'s> {
             leaf: &'s secantus_pgplan::Select,
             columns: &'s [(String, String)],
+            exprs: std::rc::Rc<Vec<secantus_pgplan::ExprQual>>,
             filter: std::rc::Rc<Document>,
             above: Vec<String>,
             /// The scan's target list where no WHERE conjunct is above
@@ -2360,8 +2365,18 @@ impl PgHandler {
             let Statement::Select(leaf) = plan.as_ref() else {
                 return None;
             };
-            if leaf.residual.is_some()
-                || leaf.sub.is_some()
+            // A residual is priced where it is the expression comparisons
+            // the join's WHERE pushed to this scan (RP-423).
+            let alias = columns
+                .first()?
+                .0
+                .split(secantus_pgplan::joins::SEP)
+                .next()?;
+            let exprs = match &leaf.residual {
+                Some(_) => join_exprs_of(alias)?,
+                None => Vec::new(),
+            };
+            if leaf.sub.is_some()
                 || leaf.series.is_some()
                 || leaf.join.is_some()
                 || !leaf.windows.is_empty()
@@ -2422,6 +2437,7 @@ impl PgHandler {
             Some(SideScan {
                 leaf,
                 columns,
+                exprs: std::rc::Rc::new(exprs),
                 filter: std::rc::Rc::new(filter),
                 above,
                 carried,
@@ -2449,6 +2465,7 @@ impl PgHandler {
                 field,
                 read,
                 above: s.above.clone(),
+                exprs: std::rc::Rc::clone(&s.exprs),
             })
         };
         let (left, right) = (scan(left)?, scan(right)?);
@@ -2527,7 +2544,13 @@ impl PgHandler {
         [Option<String>; 2],
     )> {
         let (mut a, mut b, more, filter, left_join, target_width) = self.joined_sides(sel)?;
-        if !more.is_empty() || a.table == b.table || filter.count != 0 || left_join {
+        if !more.is_empty()
+            || a.table == b.table
+            || filter.count != 0
+            || left_join
+            || !a.exprs.is_empty()
+            || !b.exprs.is_empty()
+        {
             return None;
         }
         let column = |p: &JoinedSide| {
@@ -3037,6 +3060,21 @@ impl PgHandler {
         read: &[String],
         above: &[String],
     ) -> Option<HashSide> {
+        self.hash_side_with(table, filter, &[], field, read, above)
+    }
+
+    /// [`Self::hash_side`] of a scan that also runs `exprs`, comparisons
+    /// of expressions with constants, per row (RP-423): its sequential
+    /// scan priced as a lone scan's residual is.
+    fn hash_side_with(
+        &self,
+        table: &str,
+        filter: &Document,
+        exprs: &[secantus_pgplan::ExprQual],
+        field: &str,
+        read: &[String],
+        above: &[String],
+    ) -> Option<HashSide> {
         let indexes = self.index_relations();
         let indexed = indexes.iter().any(|ix| ix.table.name == table);
         // A filtered side over a table with an index is read through the
@@ -3066,7 +3104,12 @@ impl PgHandler {
                     })
             })
         };
-        let (scan, index) = if !filter.is_empty() && indexed && index_reads_filter() {
+        let (scan, index) = if !exprs.is_empty() {
+            (
+                self.residual_scan_estimate(table, filter, exprs, read, &[])?,
+                None,
+            )
+        } else if !filter.is_empty() && indexed && index_reads_filter() {
             let mut found = None;
             for ix in indexes.iter().filter(|ix| ix.table.name == table) {
                 let key: Option<Vec<String>> = ix
@@ -5997,6 +6040,52 @@ thread_local! {
         const { std::cell::RefCell::new(Vec::new()) };
 }
 
+thread_local! {
+    /// The expression comparisons each table of an EXPLAIN's join is
+    /// filtered by ([`secantus_pgplan::ExplainOptions::join_expr_quals`],
+    /// RP-423): the join's leaves keep them only as a residual.
+    static EXPLAIN_JOIN_EXPRS: std::cell::RefCell<Vec<(String, Option<Vec<secantus_pgplan::ExprQual>>)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Holds an EXPLAIN's join expression quals until it is dropped.
+pub(crate) struct JoinExprsGuard(());
+
+impl Drop for JoinExprsGuard {
+    fn drop(&mut self) {
+        EXPLAIN_JOIN_EXPRS.with(|c| c.borrow_mut().clear());
+    }
+}
+
+/// Make `quals` what this EXPLAIN's joined scans of each alias are
+/// filtered by beside their lowered filter, until the guard is dropped.
+pub(crate) fn explain_join_exprs(
+    quals: &[(String, Option<Vec<secantus_pgplan::ExprQual>>)],
+) -> JoinExprsGuard {
+    EXPLAIN_JOIN_EXPRS.with(|c| *c.borrow_mut() = quals.to_vec());
+    JoinExprsGuard(())
+}
+
+/// Whether this EXPLAIN's join WHERE has expression comparisons, each
+/// alias's all modelled.
+fn join_exprs_modelled() -> bool {
+    EXPLAIN_JOIN_EXPRS.with(|c| {
+        let c = c.borrow();
+        !c.is_empty() && c.iter().all(|(_, q)| q.is_some())
+    })
+}
+
+/// The expression comparisons a joined scan of `alias` runs as its
+/// residual: `None` where this EXPLAIN models none, or not all, of them.
+fn join_exprs_of(alias: &str) -> Option<Vec<secantus_pgplan::ExprQual>> {
+    EXPLAIN_JOIN_EXPRS.with(|c| {
+        c.borrow()
+            .iter()
+            .find(|(a, _)| a == alias)
+            .and_then(|(_, q)| q.clone())
+    })
+}
+
 /// Holds an EXPLAIN's LIKE patterns until it is dropped.
 pub(crate) struct PatternsGuard(());
 
@@ -6143,6 +6232,8 @@ struct JoinedSide {
     /// The fields its scan reads, and those it carries above the join.
     read: Vec<String>,
     above: Vec<String>,
+    /// The expression comparisons its scan runs per row (RP-423).
+    exprs: std::rc::Rc<Vec<secantus_pgplan::ExprQual>>,
 }
 
 /// The constant `filter` sets stored field `field` equal to, at its top

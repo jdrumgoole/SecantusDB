@@ -45666,6 +45666,7 @@ impl PgHandler {
                 }
                 let _in_lengths = scan_estimate::explain_in_lengths(&options.scan_in_lengths);
                 let _patterns = scan_estimate::explain_patterns(&options.scan_patterns);
+                let _join_exprs = scan_estimate::explain_join_exprs(&options.join_expr_quals);
                 let db = self.db().to_string();
                 let chooser = |table: &str, filter: &Document| -> Option<String> {
                     match self.storage.explain_plan(&db, table, filter).ok()? {

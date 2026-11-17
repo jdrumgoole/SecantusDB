@@ -5614,10 +5614,10 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "              Filter: (c ~~* 'W01%'::text)",
         ],
     ),
-    # Still open: a comparison of an expression with a constant pushed to a
-    # join's side (found while working RP-423).
+    # A comparison of an expression with a constant pushed to a join's side
+    # is that scan's residual, priced as a lone scan's (RP-423).
     "estimate of a join over a scan filtered by an arithmetic comparison": (
-        "RP-423",
+        "RP-423:fixed",
         _ANALYSED_STRINGS,
         "explain select * from e join w on e.a = w.a where e.a + 1 > 996",
         [
@@ -5627,6 +5627,48 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "  ->  Hash  (cost=20.00..20.00 rows=333 width=7)",
             "        ->  Seq Scan on e  (cost=0.00..20.00 rows=333 width=7)",
             "              Filter: ((a + 1) > 996)",
+        ],
+    ),
+    "estimate of a join over two scans each filtered by an arithmetic comparison": (
+        "RP-423:fixed",
+        _ANALYSED_STRINGS,
+        "explain select * from e join w on e.a = w.a where e.a + 1 > 996 and w.a * 2 < 1500",
+        [
+            "Hash Join  (cost=24.16..47.52 rows=111 width=17)",
+            "  Hash Cond: (w.a = e.a)",
+            "  ->  Seq Scan on w  (cost=0.00..21.00 rows=333 width=10)",
+            "        Filter: ((a * 2) < 1500)",
+            "  ->  Hash  (cost=20.00..20.00 rows=333 width=7)",
+            "        ->  Seq Scan on e  (cost=0.00..20.00 rows=333 width=7)",
+            "              Filter: ((a + 1) > 996)",
+        ],
+    ),
+    "estimate of a join over a scan filtered by a range and an arithmetic comparison": (
+        "RP-423:fixed",
+        _ANALYSED_STRINGS,
+        "explain select * from e join w on e.a = w.a where e.a + 1 > 996 and e.a < 999",
+        [
+            "Hash Join  (cost=26.66..49.74 rows=333 width=17)",
+            "  Hash Cond: (w.a = e.a)",
+            "  ->  Seq Scan on w  (cost=0.00..16.00 rows=1000 width=10)",
+            "  ->  Hash  (cost=22.50..22.50 rows=333 width=7)",
+            "        ->  Seq Scan on e  (cost=0.00..22.50 rows=333 width=7)",
+            "              Filter: ((a < 999) AND ((a + 1) > 996))",
+        ],
+    ),
+    # Still open: a comma join's WHERE holds the join clause beside the
+    # expression comparison, re-checked above the join as one residual.
+    "estimate of a comma join over a scan filtered by a call": (
+        "RP-423",
+        _ANALYSED_STRINGS,
+        "explain select e.a from e, w where e.a = w.a and length(e.b) > 2",
+        [
+            "Hash Join  (cost=24.16..47.24 rows=333 width=4)",
+            "  Hash Cond: (w.a = e.a)",
+            "  ->  Seq Scan on w  (cost=0.00..16.00 rows=1000 width=4)",
+            "  ->  Hash  (cost=20.00..20.00 rows=333 width=4)",
+            "        ->  Seq Scan on e  (cost=0.00..20.00 rows=333 width=4)",
+            "              Filter: (length(b) > 2)",
         ],
     ),
     # Still open: a LIKE's ESCAPE is a `like_escape` call PostgreSQL folds

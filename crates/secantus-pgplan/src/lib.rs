@@ -609,7 +609,7 @@ pub enum Statement {
     /// `EXPLAIN [ANALYZE] [(options)] <statement>`.
     Explain {
         inner: Box<Statement>,
-        options: ExplainOptions,
+        options: Box<ExplainOptions>,
     },
     /// `CREATE [UNIQUE] INDEX`.
     CreateIndex(CreateIndex),
@@ -3704,6 +3704,13 @@ pub struct ExplainOptions {
     /// those conjuncts, as `clauselist_selectivity` reads it (RP-404).
     /// `None` for any other WHERE.
     pub scan_expr_quals: Option<Vec<ExprQual>>,
+    /// A join of plain tables: for each table (by its alias) whose WHERE
+    /// conjuncts include comparisons of an expression over its columns
+    /// with a constant, those conjuncts as `clauselist_selectivity` reads
+    /// them once `distribute_qual_to_rels` has pushed them to its scan
+    /// (RP-423). `None` for an alias with a conjunct of its own that is
+    /// neither lowered nor such a comparison.
+    pub join_expr_quals: Vec<(String, Option<Vec<ExprQual>>)>,
     /// A single-relation statement whose WHERE compares an array column
     /// with a constant: the WHERE's conjuncts lowered as though those
     /// comparisons were filters, and whether every conjunct lowered
@@ -12369,6 +12376,7 @@ fn plan_explain(
         scan_array_quals: None,
         scan_patterns: Vec::new(),
         scan_expr_quals: None,
+        join_expr_quals: Vec::new(),
         scan_array_cmp_filter: None,
         setop_quals: Vec::new(),
         join_conds: Vec::new(),
@@ -12579,6 +12587,7 @@ fn plan_explain(
         let _filters = ArrayCompareAsFilter::set();
         explain_scan_expr_quals(&query, lookup)
     };
+    options.join_expr_quals = explain_join_expr_quals(&query, lookup).unwrap_or_default();
     let setop_quals = explain_setop_quals(&query, lookup).unwrap_or_default();
     options.subquery_quals = explain_subquery_quals(&query, lookup).unwrap_or_default();
     let mut join_cond_splits = Vec::new();
@@ -12670,7 +12679,7 @@ fn plan_explain(
     }
     Ok(Statement::Explain {
         inner: Box::new(inner),
-        options,
+        options: Box::new(options),
     })
 }
 
@@ -54158,6 +54167,113 @@ fn explain_scan_expr_quals(
         }
     }
     (!out.is_empty()).then_some(out)
+}
+
+/// A join's WHERE conjuncts that each read one plain table's columns
+/// and do not lower to its filter, as [`ExprQual`]s of that table's alias
+/// ([`ExplainOptions::join_expr_quals`], RP-423). `None` where the FROM is
+/// not two or more plain tables joined.
+fn explain_join_expr_quals(
+    query: &N,
+    lookup: &dyn Fn(&str) -> Option<TableDef>,
+) -> Option<Vec<(String, Option<Vec<ExprQual>>)>> {
+    fn tables(n: &pg_query::protobuf::Node, out: &mut Vec<(String, String)>) -> Option<()> {
+        match n.node.as_ref()? {
+            N::RangeVar(rv) => {
+                let alias = rv
+                    .alias
+                    .as_ref()
+                    .map_or_else(|| rv.relname.clone(), |a| a.aliasname.clone());
+                out.push((alias, rv.relname.clone()));
+            }
+            N::JoinExpr(j) => {
+                tables(j.larg.as_deref()?, out)?;
+                tables(j.rarg.as_deref()?, out)?;
+            }
+            _ => return None,
+        }
+        Some(())
+    }
+    let N::SelectStmt(s) = query else {
+        return None;
+    };
+    let where_clause = s.where_clause.as_deref()?;
+    let mut from = Vec::new();
+    for item in &s.from_clause {
+        tables(item, &mut from)?;
+    }
+    if from.len() < 2 {
+        return None;
+    }
+    let defs: Vec<(String, TableDef)> = from
+        .into_iter()
+        .map(|(alias, table)| Some((alias, lookup(&table)?)))
+        .collect::<Option<_>>()?;
+    let mut parts = Vec::new();
+    let mut stack = vec![where_clause];
+    while let Some(n) = stack.pop() {
+        match n.node.as_ref() {
+            Some(N::BoolExpr(b))
+                if BoolExprType::try_from(b.boolop) == Ok(BoolExprType::AndExpr) =>
+            {
+                stack.extend(b.args.iter().rev());
+            }
+            _ => parts.push(n),
+        }
+    }
+    let mut out: Vec<(String, Option<Vec<ExprQual>>)> = Vec::new();
+    for p in parts {
+        // The one table the conjunct reads, by each column's qualifier or,
+        // unqualified, the one FROM table that has the column.
+        let mut alias: Option<&str> = None;
+        let mut one_table = true;
+        for (n, _, _, _) in p.node.as_ref()?.nodes() {
+            let pg_query::NodeRef::ColumnRef(c) = n else {
+                continue;
+            };
+            let names: Vec<&str> = c
+                .fields
+                .iter()
+                .filter_map(|f| match f.node.as_ref() {
+                    Some(N::String(s)) => Some(s.sval.as_str()),
+                    _ => None,
+                })
+                .collect();
+            let found = match names.as_slice() {
+                [a, _] => defs.iter().find(|(x, _)| x == a).map(|(x, _)| x.as_str()),
+                [col] => {
+                    let mut has = defs.iter().filter(|(_, d)| d.field_of(col).is_some());
+                    match (has.next(), has.next()) {
+                        (Some((x, _)), None) => Some(x.as_str()),
+                        _ => None,
+                    }
+                }
+                _ => None,
+            };
+            match (found, alias) {
+                (None, _) => one_table = false,
+                (Some(f), Some(a)) if f != a => one_table = false,
+                (Some(f), _) => alias = Some(f),
+            }
+        }
+        let (true, Some(alias)) = (one_table, alias) else {
+            continue;
+        };
+        let def = &defs.iter().find(|(a, _)| a == alias)?.1;
+        let qual = match lower_where_nonvolatile(p, def, &[]) {
+            Ok(_) => continue,
+            Err(Error::Unsupported(_)) => expr_qual(p, def),
+            Err(_) => None,
+        };
+        match out.iter_mut().find(|(a, _)| a == alias) {
+            Some((_, quals)) => match (quals.as_mut(), qual) {
+                (Some(q), Some(x)) => q.push(x),
+                _ => *quals = None,
+            },
+            None => out.push((alias.to_string(), qual.map(|q| vec![q]))),
+        }
+    }
+    Some(out)
 }
 
 /// An expression side of an [`ExprQual`]: its text, its operators, its

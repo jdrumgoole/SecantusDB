@@ -1928,14 +1928,19 @@ a regression test.
       `explain_join_patterns`). Still zeros: a call of a function whose
       overloads differ in `procost`; a regex whose prefix walk is not
       modelled (a group repeated other than at most once, an anchor inside
-      a group, a back reference, embedded options); and a join over a scan
-      an expression comparison filters, which prints zeros throughout
-      (`e join w on e.a = w.a where e.a + 1 > 996` is PostgreSQL's `Hash
-      Join (cost=24.16..47.24 rows=333 width=17)`, `e` hashed): the side's
-      conjunct is an `ExprQual`, which `joined_sides` does not price.
-      Measured on a private 15.19 cluster (found while working RP-404 and
-      RP-354).
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[estimate of a join over a scan filtered by an arithmetic comparison]
+      a group, a back reference, embedded options). Since 2026-11-17 an
+      inner ON join whose WHERE pushes expression comparisons to its sides
+      prices each side as that scan's residual
+      (`ExplainOptions::join_expr_quals`, `hash_side_with`). Still zeros
+      there: a comma join (`select e.a from e, w where e.a = w.a and
+      length(e.b) > 2` is PostgreSQL's `Hash Join (cost=24.16..47.24
+      rows=333 width=4)`), whose residual holds the join clause beside the
+      comparison; a LEFT join with such a WHERE (PostgreSQL's `Hash Right
+      Join`); and an expression over both tables, a Join Filter
+      (`where e.a + w.a > 996`, `Hash Join (cost=27.50..62.25 rows=333
+      width=17)`). Measured on the 15.19 reference on port 5415 (found
+      while working RP-404 and RP-354).
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[estimate of a comma join over a scan filtered by a call]
       Backlog-ID: RP-423
 - [ ] **A call over constants in a WHERE is not folded in EXPLAIN.**
       `eval_const_expressions` folds an immutable call whose arguments are
