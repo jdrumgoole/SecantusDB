@@ -166,10 +166,13 @@ pub fn convert_to_capped(doc: &Document, ctx: &mut CommandContext) -> HandlerRes
     let size = cap(doc)?;
     let storage = ctx.storage()?;
     source_problem(storage, &db, &coll)?;
-    let tmp = format!(
-        "tmp{}.convertToCapped.{coll}",
-        &bson::oid::ObjectId::new().to_hex()[18..]
-    );
+    // mongod's `makeUniqueCollectionName("tmp%%%%%.convertToCapped.")`:
+    // five random letters or digits (RM-596).
+    const ALNUM: &[u8] = b"0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
+    let suffix: String = (0..5)
+        .map(|_| ALNUM[rand::random_range(0..ALNUM.len())] as char)
+        .collect();
+    let tmp = format!("tmp{suffix}.convertToCapped.{coll}");
     // mongod profiles the conversion under the collection it copies into,
     // and cannot name one for `system.profile` (measured 8.2.11).
     crate::profiler::note_namespace(format!("{db}.{tmp}"));
@@ -206,6 +209,8 @@ pub fn convert_to_capped(doc: &Document, ctx: &mut CommandContext) -> HandlerRes
             ),
         ));
     }
+    // mongod's line names the copy it built (measured 8.2.11, RM-596).
+    ctx.worked_through = Some(format!("{db}.{tmp}"));
     Ok(doc! { "ok": 1.0 })
 }
 

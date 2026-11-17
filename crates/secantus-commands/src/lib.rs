@@ -320,6 +320,10 @@ pub struct CommandContext {
     /// its line names `<db>.$cmd`: a `create` of a collection that exists
     /// with the same options (measured 8.2.11, RM-595).
     pub unacquired: bool,
+    /// The collection a command worked through rather than the one it
+    /// named: a `convertToCapped`'s temporary copy, which mongod 8.2.11's
+    /// line names (RM-596).
+    pub worked_through: Option<String>,
     /// How many documents a `findAndModify` changed, for its line.
     pub modified: Option<i64>,
     /// How long the operation waited for its write concern, in ms.
@@ -446,6 +450,7 @@ impl CommandContext {
             resolved_views: None,
             refused_out_view: None,
             unacquired: false,
+            worked_through: None,
             modified: None,
             write_concern_wait: None,
             last_op_seq: 0,
@@ -985,6 +990,7 @@ fn dispatch_named(doc: &Document, ctx: &mut CommandContext) -> Document {
     ctx.resolved_views = None;
     ctx.refused_out_view = None;
     ctx.unacquired = false;
+    ctx.worked_through = None;
     ctx.modified = None;
     ctx.write_concern_wait = None;
     ctx.cpu_nanos = None;

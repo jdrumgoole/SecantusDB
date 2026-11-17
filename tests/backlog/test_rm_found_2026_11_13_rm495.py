@@ -40,7 +40,7 @@ def _shown(found: dict) -> dict:
     return {k: re.sub(r"\.tmp[A-Za-z0-9]{5}\.", ".<tmp>.", v) for k, v in found.items()}
 
 
-@pytest.mark.backlog("RM-596")
+@pytest.mark.backlog_fixed("RM-596")
 def test_a_line_names_the_collection_a_command_works_through(
     rust_mongo: Any, mongod_rs: Any
 ) -> None:
@@ -49,7 +49,7 @@ def test_a_line_names_the_collection_a_command_works_through(
     `convertToCapped` the temporary collection it builds
     (`<db>.tmpXXXXX.convertToCapped.c`), a `rolesInfo` of a role
     `admin.system.roles` (`rolesInfo: 1` names `<db>.$cmd`).
-    This server's name `<db>.$cmd`, `<db>.c` and `<db>.$cmd`."""
+    This server's named `<db>.$cmd`, `<db>.c` and `<db>.$cmd` until RM-596."""
     commands = [
         {"filemd5": 1, "root": "fs"},
         {"rolesInfo": "c"},
