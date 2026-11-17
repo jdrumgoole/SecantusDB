@@ -44,11 +44,12 @@ def _best_ms(call: Callable[[], Any]) -> float:
     return best * 1000
 
 
-def _growth(client: Any) -> dict[str, bool]:
-    """For each operation over the contested query: whether its time over
-    100,000 documents is within `_RATIO` of its time over 10,000."""
+def _growth(client: Any, names: tuple[str, ...]) -> dict[str, bool]:
+    """For each operation `names` picks over the contested query: whether
+    its time over 100,000 documents is within `_RATIO` of its time over
+    10,000."""
     db = client["rm_found_contested_reads"]
-    reads: dict[str, Callable[[], Any]] = {
+    every: dict[str, Callable[[], Any]] = {
         "find with a limit": lambda: list(db.c.find(_QUERY).limit(101)),
         "updateOne": lambda: db.command(
             "update", "c", updates=[{"q": _QUERY, "u": {"$inc": {"z": 1}}}]
@@ -57,6 +58,7 @@ def _growth(client: Any) -> dict[str, bool]:
             "explain", {"find": "c", "filter": _QUERY, "limit": 101}, verbosity="queryPlanner"
         ),
     }
+    reads = {name: every[name] for name in names}
     times: dict[int, dict[str, float]] = {}
     try:
         for n in (10_000, 100_000):
@@ -72,10 +74,25 @@ def _growth(client: Any) -> dict[str, bool]:
     }
 
 
+@pytest.mark.backlog_fixed("RM-610")
+def test_a_contested_find_and_write_of_one_cost_what_they_return(
+    rust_mongo: Any, mongod_rs: Any
+) -> None:
+    """A contested find with a limit and a contested updateOne read every
+    match before their trial; since RM-610 the trial reads only what its
+    plans reach, and their cost is flat in the collection's size, as
+    mongod's is."""
+    names = ("find with a limit", "updateOne")
+    theirs = _growth(mongod_rs, names)
+    assert all(theirs.values()), theirs
+    assert _growth(rust_mongo, names) == theirs
+
+
 @pytest.mark.backlog("RM-610")
 def test_a_contested_read_costs_what_it_returns(rust_mongo: Any, mongod_rs: Any) -> None:
-    """mongod's cost of each read is flat in the collection's size; this
-    server's grows with it."""
-    theirs = _growth(mongod_rs)
+    """mongod's cost of an explain at queryPlanner is flat in the
+    collection's size; this server's grows with it."""
+    names = ("explain at queryPlanner",)
+    theirs = _growth(mongod_rs, names)
     assert all(theirs.values()), theirs
-    assert _growth(rust_mongo) == theirs
+    assert _growth(rust_mongo, names) == theirs

@@ -1026,20 +1026,20 @@ about forty such points; these are the ones measured.
       `bounded_span_pages` does; a geo plan is not yet probed.
       Backlog-ID: RM-390
       Verify: tests/backlog/test_rm_found_2026_11_10_rm390.py::test_a_write_of_many_through_a_compound_index_out_of_time_keeps_what_it_wrote
-- [ ] **A read whose plan two indexes contest reads every match.**
-      Over `{a: {$gte: 0}, b: {$gte: 0}}` with indexes `a_1` and `b_1`,
-      mongod 8.2.11 tries both plans for about 101 results and then runs
-      the winner only as far as the read needs, so a `find(...).limit(101)`
-      takes 0.3 ms, an `updateOne` 4-5 ms and an `explain` at
-      `queryPlanner` 0.3 ms whether the collection holds 10,000 documents
-      or 100,000. This server's time for each grows with the collection,
-      ten times over for ten times the documents (debug build, 2026-11-13:
-      80, 135 and 127 ms at 10,000; 710, 1,221 and 1,282 ms at 100,000), so
-      it reads every match before the limit, the single write or the plan
-      choice stops it. The answers are the same; the cost is the whole
-      read. A write of many has streamed a contested plan since
-      2026-11-13 (RM-390); a read, a write of one and `explain` do not.
-      Found while fixing RM-390's CI test, 2026-11-13.
+- [ ] **An explain of a read whose plan two indexes contest reads the
+      whole collection.** Over `{a: {$gte: 0}, b: {$gte: 0}}` with
+      indexes `a_1` and `b_1`, mongod 8.2.11's `explain` of a
+      `find(...).limit(101)` at `queryPlanner` takes 0.3 ms whether the
+      collection holds 10,000 documents or 100,000: its trial reads only
+      what the candidate plans reach. This server's grows ten times over
+      (debug build, 2026-11-13: 127 ms at 10,000, 1,282 ms at 100,000),
+      because `explain` plans over every document of the collection,
+      loaded into memory first (`explain/mod.rs`, `Target.docs`, read by
+      `target()`). The answers are the same; the cost is the whole
+      collection. A find and a write of one try their plans over what the
+      plans reach since 2026-11-17 (RM-610, part); the work is to give
+      explain's trial the store, as `order.rs`'s `Lazy` does, in place of
+      `Held`. Found while fixing RM-390's CI test, 2026-11-13.
       Verify: tests/backlog/test_rm_found_2026_11_13_contested_reads.py::test_a_contested_read_costs_what_it_returns
       Backlog-ID: RM-610
 - [ ] **A profile entry counts what it examined as int64, where mongod
