@@ -6430,6 +6430,9 @@ pub struct VerboseScan {
     pub refname: String,
     /// The relation's columns, as printed.
     pub columns: Vec<String>,
+    /// Each ORDER BY key that is not a bare column (RP-966): its text
+    /// unqualified, as the scan's resjunk `Output` entry, and qualified.
+    pub sort_exprs: Vec<(String, String)>,
 }
 
 /// [`VerboseScan`] for a SELECT over one relation; `None` for any other
@@ -6500,6 +6503,21 @@ pub fn explain_verbose_scan(
             quals.push((plain, p.buf));
         }
     }
+    let mut sort_exprs = Vec::new();
+    for sort in &s.sort_clause {
+        let Some(N::SortBy(sb)) = sort.node.as_ref() else {
+            return None;
+        };
+        let key = sb.node.as_deref()?;
+        if matches!(key.node.as_ref(), Some(N::ColumnRef(_) | N::AConst(_))) {
+            continue;
+        }
+        let mut u = printer(true);
+        u.expr(key)?;
+        let mut qd = printer(false);
+        qd.expr(key)?;
+        sort_exprs.push((u.buf, qd.buf));
+    }
     let suffix = alias.map(|a| format!(" {}", q(&a))).unwrap_or_default();
     Some(VerboseScan {
         relation: format!("{}.{}{suffix}", q(&schema), q(&bare)),
@@ -6508,6 +6526,7 @@ pub fn explain_verbose_scan(
         quals,
         refname: q(&refname),
         columns: def.columns.iter().map(|c| q(&c.name)).collect(),
+        sort_exprs,
     })
 }
 

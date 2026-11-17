@@ -46559,18 +46559,29 @@ impl PgHandler {
                             && !sel.with_ties
                             && sel.casts.iter().all(Option::is_none)
                             && sel.order.iter().all(|k| {
-                                k.expr.is_none() && sel.columns.iter().any(|(_, f)| *f == k.field)
+                                k.expr.is_some() || sel.columns.iter().any(|(_, f)| *f == k.field)
                             })
                         {
                             let fields: Vec<String> =
                                 sel.columns.iter().map(|(_, f)| f.clone()).collect();
+                            // A computed key no index returns in order: the
+                            // scan computes it (RP-966).
+                            let computed = sel.order.iter().any(|k| k.expr.is_some());
                             let want = scan_estimate::PathWant {
                                 limit: None,
-                                order: sel.order.iter().map(|k| k.field.clone()).collect(),
+                                order: if computed {
+                                    Vec::new()
+                                } else {
+                                    sel.order.iter().map(|k| k.field.clone()).collect()
+                                },
                             };
-                            if let Some((estimate, index, ordered)) =
-                                self.upper_scan(&sel.table, &sel.filter, &fields, &want)
-                            {
+                            if let (Some((key_cost, key_width)), Some((estimate, index, ordered))) = (
+                                scan_estimate::sort_key_cost(sel),
+                                self.upper_scan(&sel.table, &sel.filter, &fields, &want),
+                            ) {
+                                let (startup, total, rows, width) = estimate;
+                                let estimate =
+                                    (startup, total + key_cost * rows, rows, width + key_width);
                                 let sort = scan_estimate::sort_estimate(
                                     estimate,
                                     self.kb_setting("work_mem", 4096),
