@@ -23,11 +23,11 @@ def dsn(rust_pg: object) -> Iterator[str]:
     yield _dsn(rust_pg) + " dbname=postgres"
 
 
-@pytest.mark.backlog("RP-1018")
+@pytest.mark.backlog_fixed("RP-1018")
 def test_a_pg_temp_function_is_labelled_with_its_schema(dsn: str) -> None:
     """A `pg_temp` function's frame is `pg_temp_N.f833()` on PostgreSQL
-    15.19 (`format_procedure` qualifies a schema off the search path); here
-    it is the bare `f833()`."""
+    15.19 (`format_procedure` qualifies a schema off the search path); it
+    was the bare `f833()`, and is now qualified."""
     contexts: list[str | None] = []
     with psycopg.connect(dsn, autocommit=True) as c:
         c.execute(
@@ -40,3 +40,26 @@ def test_a_pg_temp_function_is_labelled_with_its_schema(dsn: str) -> None:
     assert re.fullmatch(
         r"PL/pgSQL function pg_temp_\d+\.f833\(\) line 1 at RAISE", contexts[0] or ""
     ), contexts
+
+
+@pytest.mark.backlog("RP-1034")
+def test_a_function_label_is_fixed_at_its_first_compile(dsn: str) -> None:
+    """`plpgsql_compile` labels a function once per session: `s1034.f()`
+    called first off the path keeps that label after the path reaches it."""
+    contexts: list[str | None] = []
+    with psycopg.connect(dsn, autocommit=True) as c:
+        c.execute("drop schema if exists s1034 cascade")
+        c.execute("create schema s1034")
+        c.execute(
+            "create function s1034.f() returns int language plpgsql "
+            "as $$ begin raise notice 'in'; return 1; end $$"
+        )
+        c.add_notice_handler(lambda d: contexts.append(d.context))
+        try:
+            c.execute("select s1034.f()")
+            c.execute("set search_path = s1034, public")
+            c.execute("select f()")
+        finally:
+            c.execute("reset search_path")
+            c.execute("drop schema s1034 cascade")
+    assert [x for x in contexts if x] == ["PL/pgSQL function s1034.f() line 1 at RAISE"] * 2

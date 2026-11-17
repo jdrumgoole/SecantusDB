@@ -1220,6 +1220,21 @@ one beside it.
       `typnamespace` is `pg_my_temp_schema()`, and that is no longer 0.
       `secantusd-pg` answers 42704 `type "pg_temp.t" does not exist` to
       the cast.
+      Measured 2026-11-17 against 15.19 (while working RP-950's bundle):
+      the composite IS made, but outside the temp namespace -- its
+      `pg_type` row's `typnamespace` is no `pg_temp_N`, the bare
+      `'ct911'::regtype` is 42704 too (15.19 finds it: the temp namespace
+      is searched first for types), and `create temp table t (x ct911)`
+      is 42704. `row(1)::pg_temp.ct911` already works. An enum has the
+      other half of the gap: `create type pg_temp.e as enum ('a')` then
+      `'pg_temp.e'::regtype` prints `pg_temp.e` where 15.19 prints `e`
+      -- it is kept under a schema literally named `pg_temp`, not the
+      session's. Faithful: a type made in `pg_temp` (any kind) lives in
+      the session's `pg_temp_N` (made by it, as a temp relation makes it),
+      is found by `LookupTypeName` through the implicit temp namespace at
+      the head of the path, and is dropped with the session's other temp
+      objects. This is the type side of the namespace RP-882 built for
+      relations, not a one-line fix.
       Verify: tests/backlog/test_rp_qualified_calls.py::test_standalone_temp_composite_is_in_the_temp_schema
       Backlog-ID: RP-971
 
@@ -2067,17 +2082,6 @@ Measured on PostgreSQL 15.19 (the data-modifying WITH on a private cluster).
 
 ## Found while working RP-485 (2026-11-11)
 
-- [ ] **A function found nowhere inside another call's arguments is
-      reported as the outer call's missing overload.** On PostgreSQL 15.19
-      `select abs(nosuch1())` is 42883 `function nosuch1() does not exist`
-      at 12: `transformFuncCall` analyses the arguments before it looks
-      the outer function up. Here it is `function abs(text) does not
-      exist` at 8 -- the inner call is typed and the outer lookup fails
-      first. (A refused qualified name inside the arguments,
-      `abs(a.b.c())`, is already answered right, RP-880.) Measured on
-      PostgreSQL 15.19.
-      Verify: tests/backlog/test_rp_qualified_calls.py::test_enclosing_call_waits_for_its_arguments
-      Backlog-ID: RP-950
 
 
 ## Found while working RP-472 (2026-11-07)
@@ -2805,16 +2809,22 @@ Measured on PostgreSQL 15.19; none of it needs DDL. The gap tests are in
 Measured on PostgreSQL 15.19 (the shared reference on port 5415). The gap
 test is in `tests/backlog/test_rp_found_rp833.py`.
 
-- [ ] **A function in `pg_temp` is labelled without its schema.** A RAISE
-      in `pg_temp.f833()` carries CONTEXT `PL/pgSQL function
-      pg_temp_3.f833() line 1 at RAISE` on PostgreSQL 15.19:
-      `plpgsql_compile` labels a function by `format_procedure`, which
-      qualifies one whose schema is not on the search path, and `pg_temp`
-      is searched for no function. Here it is `f833()`
-      (`function_label` in `plpgsql_fn.rs` reads the CREATE text's bare
-      name); the same label frames an error.
-      Verify: tests/backlog/test_rp_found_rp833.py::test_a_pg_temp_function_is_labelled_with_its_schema
-      Backlog-ID: RP-1018
+
+## Found while working RP-1018 (2026-11-17)
+
+Measured on PostgreSQL 15.19 (the shared reference on port 5415). The gap
+test is in `tests/backlog/test_rp_found_rp833.py`.
+
+- [ ] **A function's CONTEXT label follows the search path of each call,
+      not of its first.** `plpgsql_compile` labels a function once, when the
+      session first compiles it, and keeps that label while the compiled
+      function is cached: on PostgreSQL 15.19, `s.f()` called first with
+      `s` off the path is `PL/pgSQL function s.f()`, and still is after
+      `set search_path = s`. Here `function_label` runs on every call, so
+      the second is `f()`. Faithful: label at the session's first compile,
+      kept until the function is replaced or dropped.
+      Verify: tests/backlog/test_rp_found_rp833.py::test_a_function_label_is_fixed_at_its_first_compile
+      Backlog-ID: RP-1034
 
 ## Found while working RP-689 (2026-11-10)
 

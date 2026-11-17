@@ -157,10 +157,10 @@ def test_three_part_function_name(query: str, dsn: str) -> None:
     assert answer(dsn, query) == THREE_PART_FUNCTION_NAME[query]
 
 
-@pytest.mark.backlog("RP-950")
+@pytest.mark.backlog_fixed("RP-950")
 def test_enclosing_call_waits_for_its_arguments(dsn: str) -> None:
-    """A function found nowhere inside another call's arguments is the
-    error, not the outer call's overload."""
+    """A function found nowhere inside another call's arguments was
+    reported as the outer call's missing overload; it is now the error."""
     assert answer(dsn, "select abs(nosuch1())") == (
         "42883",
         "function nosuch1() does not exist",

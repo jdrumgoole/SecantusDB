@@ -1504,6 +1504,30 @@ fn function_label(create_sql: &str) -> String {
             N::String(s) => s.sval.clone(),
             _ => return None,
         };
+        // `format_procedure` qualifies a function its schema does not make
+        // visible: a `pg_temp` one (never searched for functions) by the
+        // session's `pg_temp_N`, another schema when it is off the path.
+        let schema = match c
+            .funcname
+            .len()
+            .checked_sub(2)
+            .map(|i| c.funcname[i].node.as_ref())
+        {
+            Some(Some(N::String(s))) => Some(s.sval.clone()),
+            _ => None,
+        };
+        let name = match schema {
+            Some(s) if secantus_pgplan::is_pg_temp_schema(&s) => {
+                let t = secantus_pgplan::schemas::temp_schema().unwrap_or(s);
+                format!("{t}.{name}")
+            }
+            Some(s)
+                if s != "pg_catalog" && !secantus_pgplan::schemas::search_path().contains(&s) =>
+            {
+                format!("{s}.{name}")
+            }
+            _ => name,
+        };
         let mut args = Vec::new();
         for p in &c.parameters {
             let Some(N::FunctionParameter(fp)) = p.node.as_ref() else {
