@@ -2885,6 +2885,19 @@ pub(crate) fn attach_join_where(
             if home.is_some() {
                 drop_filter_placeholder(n);
             }
+            // An inner join's ON and WHERE clauses are one list of join
+            // quals, the ON's first (`deconstruct_jointree`), so a
+            // parameterised inner scan takes a WHERE comparison as its
+            // `Filter` as it does an ON's (RP-966).
+            if inner {
+                if let Some(at) = n.details.iter().position(|(k, _)| k == "Join Filter") {
+                    let mut all = split_conjuncts(&n.details[at].1);
+                    all.extend(parts.iter().map(|p| (*p).clone()));
+                    let all: Vec<&String> = all.iter().collect();
+                    n.details[at].1 = combine(&all);
+                    continue;
+                }
+            }
             n.details.push((label.into(), combine(&parts)));
         }
     }
@@ -3383,7 +3396,16 @@ pub(crate) fn attach_verbose_join(
         .iter()
         .filter(|(k, _)| k == "Join Filter")
         .count();
-    if v.join_filter && (join_filters != 1 || !root.name.starts_with("Hash ")) {
+    // A nested loop into a parameterised index scan has moved it into
+    // that scan's `Filter` (RP-966).
+    // A Materialize loop evaluates it in its one `Join Filter`, the ON's
+    // conjuncts first.
+    let moved = root.name.starts_with("Nested Loop")
+        && (join_filters == 0
+            || join_filters == 1
+                && root.children.len() == 2
+                && root.children[1].name == "Materialize");
+    if v.join_filter && !moved && (join_filters != 1 || !root.name.starts_with("Hash ")) {
         return;
     }
     if root.name.starts_with("Nested Loop") {

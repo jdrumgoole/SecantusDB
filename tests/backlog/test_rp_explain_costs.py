@@ -1845,7 +1845,7 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
     # Measured on PostgreSQL 15.19 (RP-966): a WHERE conjunct reading both
     # relations is the parameterised inner index scan's `Filter`.
     "explain verbose of a nested loop whose where reads both relations": (
-        "RP-966",
+        "RP-966:fixed",
         _ANALYSED,
         "explain verbose select k.b, e.a from e join k on e.a < k.a where e.b <> k.b",
         [
@@ -1857,6 +1857,42 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "        Output: k.a, k.b",
             "        Index Cond: (k.a > e.a)",
             "        Filter: (e.b <> k.b)",
+        ],
+    ),
+    # Measured on PostgreSQL 15.19: the ON and the WHERE comparison are
+    # one `Join Filter`, the columns both read in the Materialize's Output.
+    "explain verbose of a materialized loop whose where reads both relations": (
+        "RP-966:fixed",
+        _ANALYSED,
+        "explain verbose select k.b, e.a from e join k on e.a <> k.a where e.b <> k.b",
+        [
+            "Nested Loop  (cost=0.00..17532.50 rows=899100 width=7)",
+            "  Output: k.b, e.a",
+            "  Join Filter: ((e.a <> k.a) AND (e.b <> k.b))",
+            "  ->  Seq Scan on public.e  (cost=0.00..15.00 rows=1000 width=7)",
+            "        Output: e.a, e.b",
+            "  ->  Materialize  (cost=0.00..20.00 rows=1000 width=7)",
+            "        Output: k.b, k.a",
+            "        ->  Seq Scan on public.k  (cost=0.00..15.00 rows=1000 width=7)",
+            "              Output: k.b, k.a",
+        ],
+    ),
+    # Measured on PostgreSQL 15.19: a WHERE comparing an expression of one
+    # relation with the other's column is the inner index scan's
+    # `Index Cond`, the ON its `Filter`, every node's Output printed.
+    "explain verbose of a nested loop whose where compares an expression": (
+        "RP-966",
+        _ANALYSED,
+        "explain verbose select k.b, e.a from e join k on e.a <> k.a where length(e.b) < k.a",
+        [
+            "Nested Loop  (cost=0.28..10322.50 rows=333000 width=7)",
+            "  Output: k.b, e.a",
+            "  ->  Seq Scan on public.e  (cost=0.00..15.00 rows=1000 width=7)",
+            "        Output: e.a, e.b",
+            "  ->  Index Scan using k_pkey on public.k  (cost=0.28..6.98 rows=333 width=7)",
+            "        Output: k.a, k.b",
+            "        Index Cond: (k.a > length(e.b))",
+            "        Filter: (e.a <> k.a)",
         ],
     ),
     # Measured on PostgreSQL 15.19 (found while working RP-966).

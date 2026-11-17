@@ -6791,6 +6791,36 @@ pub fn explain_verbose_join(
                     if li == ri {
                         return None;
                     }
+                    // A parameterised inner scan evaluates it as its
+                    // `Filter`, as it does an ON comparison (RP-966).
+                    let op = a.name.iter().find_map(|n| match n.node.as_ref() {
+                        Some(N::String(s)) => Some(s.sval.as_str()),
+                        _ => None,
+                    });
+                    if let Some(op @ ("=" | "<" | ">" | "<=" | ">=" | "<>")) = op {
+                        let side_text = |i: usize, c: &str, own: usize| {
+                            if i == own {
+                                q(c)
+                            } else {
+                                format!("{}.{}", q(&sides[i].0), q(c))
+                            }
+                        };
+                        let full = format!(
+                            "({}.{} {op} {}.{})",
+                            q(&sides[li].0),
+                            q(&lc),
+                            q(&sides[ri].0),
+                            q(&rc)
+                        );
+                        for own in [0usize, 1] {
+                            let plain = format!(
+                                "({} {op} {})",
+                                side_text(li, &lc, own),
+                                side_text(ri, &rc, own)
+                            );
+                            join_quals[own].push((plain, full.clone()));
+                        }
+                    }
                     need(li, &lc);
                     need(ri, &rc);
                     join_filter = true;
