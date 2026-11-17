@@ -813,17 +813,6 @@ These are explicit non-goals. Don't add them without a reason.
       Measured 2026-10-27, 2026-11-07, 2026-11-10 and 2026-11-13.
       Backlog-ID: RM-363
       Verify: tests/backlog/test_rm_355_364.py::test_a_contested_aggregate_that_does_not_stream_counts_what_it_examined, tests/backlog/test_rm_355_364.py::test_a_time_series_read_made_whole_counts_what_it_examined
-- [ ] **A contested read's line names the plan its trial lost.** For a
-      `find` or `aggregate` of `{x: {$lt: 30}, y: 1}` over indexes on `x`
-      and `y`, mongod 8.2.11's trial runs the index on `x`, its plan cache
-      entry and its line both say `IXSCAN { x: 1 }`; this server runs and
-      caches the same plan, but its line names `IXSCAN { y: 1 }`, the plan
-      its fixed preference puts first: `explain/summary.rs` plans the line's
-      summary from the catalog with no trial. The summary should be the
-      plan the read ran (the cached plan, or the trial's winner). Found
-      while working RM-363, 2026-11-13.
-      Verify: tests/backlog/test_rm_found_rm363.py::test_a_contested_read_names_the_plan_its_trial_chose
-      Backlog-ID: RM-598
 - [ ] **A line says nothing of how its plan was chosen.** mongod 8.2.11's
       `Slow query` line for a read whose plan its trial chose says
       `fromMultiPlanner: true` (and `fromPlanCache: true` for one that ran

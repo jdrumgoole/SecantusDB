@@ -40,15 +40,15 @@ def _lines(rust_mongo: Any, mongod_rs: Any, op: Any) -> dict:
     return out
 
 
-@pytest.mark.backlog("RM-598")
+@pytest.mark.backlog_fixed("RM-598")
 @pytest.mark.parametrize("command", list(_READS))
 def test_a_contested_read_names_the_plan_its_trial_chose(
     rust_mongo: Any, mongod_rs: Any, command: str
 ) -> None:
     """mongod 8.2.11's line for a read its trial runs on the index on `x`
     names `IXSCAN { x: 1 }`, as the plan cache's entry does (measured
-    2026-11-13). This server's line names the index its fixed preference
-    puts first, `IXSCAN { y: 1 }`, though it ran the other."""
+    2026-11-13). This server's `aggregate` line named the index its fixed
+    preference puts first, `IXSCAN { y: 1 }`, though it ran the other."""
     got = _lines(rust_mongo, mongod_rs, _READS[command])
     answers = {side: attr.get("planSummary") for side, attr in got.items()}
     assert answers["mongod"] == "IXSCAN { x: 1 }"
