@@ -93,12 +93,12 @@ def test_an_intersect_over_a_grouped_input_puts_the_smaller_input_first(dsn: str
     assert got == [("1.000",)]
 
 
-@pytest.mark.backlog("RP-841")
+@pytest.mark.backlog_fixed("RP-841")
 def test_an_intersect_over_a_three_table_join_puts_the_smaller_input_first(dsn: str) -> None:
     """`select a.x from t692j a, t692j b, t692j c where a.k = b.k and b.k =
     c.k intersect select 1.000` is `1.000` on PostgreSQL 15.19: the join's
-    estimated groups outnumber the constant's one. Here a join of more than
-    two tables is not estimated, so the left input stays first."""
+    estimated groups outnumber the constant's one. A join of more than two
+    tables was not estimated, so the left input stayed first."""
     with _connect(dsn) as c:
         got = _text(
             c,
@@ -173,3 +173,39 @@ def test_a_numeric_constant_selected_from_a_from_item_is_inserted(dsn: str) -> N
         got = _text(c, "select x, k from t692e order by k, x")
     assert errors == []
     assert got == [("1.0", "1"), ("1.0", "2"), ("1.0", "3"), ("1.5", None)]
+
+
+@pytest.mark.backlog_fixed("RP-841")
+def test_an_intersect_over_a_three_table_on_join_puts_the_smaller_input_first(dsn: str) -> None:
+    """The ON form of the three-table join, `select a.x from t692j a join
+    t692j b on a.k = b.k join t692j c on b.k = c.k intersect select 1.000`,
+    is `1.000` on PostgreSQL 15.19, as the comma form is."""
+    with _connect(dsn) as c:
+        got = _text(
+            c,
+            "select a.x from t692j a join t692j b on a.k = b.k join t692j c on b.k = c.k"
+            " intersect select 1.000",
+        )
+    assert got == [("1.000",)]
+
+
+@pytest.mark.backlog("RP-841")
+@pytest.mark.parametrize(
+    "query",
+    [
+        "select max(x) from t692j group by k having max(x) > 0 intersect select 1.000",
+        "select distinct x from t692j intersect select 1.000",
+        "select a.x from t692j a join t692j b on a.k = b.k where a.x > 0 intersect select 1.000",
+    ],
+    ids=["having", "distinct", "join with a where"],
+)
+def test_an_intersect_over_another_unestimated_input_puts_the_smaller_input_first(
+    dsn: str, query: str
+) -> None:
+    """Each is `1.000` on PostgreSQL 15.19: the input's estimated groups
+    outnumber the constant's one, so the constant is the HashSetOp's first
+    input. Here a HAVING, a DISTINCT and a join with a WHERE are not
+    estimated, so the left input stays first."""
+    with _connect(dsn) as c:
+        got = _text(c, query)
+    assert got == [("1.000",)]

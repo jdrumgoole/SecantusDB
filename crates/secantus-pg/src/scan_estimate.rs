@@ -5399,7 +5399,10 @@ impl PgHandler {
             }
             [side(&js.left)?, side(&js.right)?]
         } else {
-            self.joined_rows_input_sides(sel)?
+            match self.joined_rows_input_sides(sel) {
+                Some(sides) => sides,
+                None => return self.join_chain_input_estimate(sel),
+            }
         };
         let counted = |table: &str| {
             let counted: std::cell::OnceCell<Option<usize>> = std::cell::OnceCell::new();
@@ -5460,6 +5463,197 @@ impl PgHandler {
         };
         let mut groups = 1.0f64;
         for (i, (_, _, read)) in sides.iter().enumerate() {
+            let keys: Vec<hashagg::KeyStat> = read
+                .iter()
+                .map(|f| key_stat(&tables[i], f))
+                .collect::<Option<_>>()?;
+            if !keys.is_empty() {
+                groups *=
+                    hashagg::estimate_groups(&keys, tables[i].tuples, tables[i].tuples) as f64;
+            }
+        }
+        Some((rows, groups.min(rows).max(1.0)))
+    }
+
+    /// An inner join of three or more stored tables as a set operation's
+    /// input (RP-841), every join clause a column equality (an ON's or the
+    /// WHERE's) and no table analysed: `calc_joinrel_size_estimate`'s
+    /// product of the scans' rows and, for each equivalence class the
+    /// equalities make, one `eqjoinsel` per member past its first (the
+    /// clause `generate_join_implied_equalities` adds as each member's
+    /// table joins), from `get_variable_numdistinct`'s defaults. The groups
+    /// are `estimate_num_groups`', as for two tables.
+    fn join_chain_input_estimate(&self, sel: &secantus_pgplan::Select) -> Option<(f64, f64)> {
+        use secantus_pgplan::joins::{JoinKind, JoinNode};
+        use secantus_pgplan::Statement;
+        let sub = sel.sub.as_ref()?;
+        let Statement::JoinRows(j) = sub.plan.as_ref() else {
+            return None;
+        };
+        if !j.where_modelled
+            || j.where_filters.len() != j.where_equalities.len()
+            || sel.residual.is_some() && j.where_equalities.is_empty()
+        {
+            return None;
+        }
+        // Leaves in join order: (table, leaf columns, leaf select columns).
+        let mut leaves: Vec<(&JoinNode, &secantus_pgplan::Select)> = Vec::new();
+        let mut equalities: Vec<(String, String)> = j.where_equalities.clone();
+        fn walk<'a>(
+            n: &'a JoinNode,
+            leaves: &mut Vec<(&'a JoinNode, &'a secantus_pgplan::Select)>,
+            eqs: &mut Vec<(String, String)>,
+        ) -> Option<()> {
+            match n {
+                JoinNode::Leaf { plan, .. } => {
+                    let Statement::Select(leaf) = plan.as_ref() else {
+                        return None;
+                    };
+                    if !leaf.filter.is_empty()
+                        || leaf.residual.is_some()
+                        || leaf.sub.is_some()
+                        || leaf.series.is_some()
+                        || leaf.join.is_some()
+                        || leaf.casts.iter().any(Option::is_some)
+                    {
+                        return None;
+                    }
+                    leaves.push((n, leaf));
+                }
+                JoinNode::Join {
+                    kind: JoinKind::Inner,
+                    left,
+                    right,
+                    on,
+                    on_other: false,
+                    on_filters,
+                    equi,
+                    merged,
+                    expr_keys,
+                    ..
+                } => {
+                    if !merged.is_empty()
+                        || !expr_keys.is_empty()
+                        || !on_filters.is_empty()
+                        || (on.is_some() && equi.is_empty())
+                    {
+                        return None;
+                    }
+                    if on.is_some() {
+                        eqs.extend(equi.iter().cloned());
+                    }
+                    walk(left, leaves, eqs)?;
+                    walk(right, leaves, eqs)?;
+                }
+                _ => return None,
+            }
+            Some(())
+        }
+        walk(&j.tree, &mut leaves, &mut equalities)?;
+        if leaves.len() < 3 || equalities.is_empty() {
+            return None;
+        }
+        // A joined-row key's leaf and the stored field it reads.
+        let stored = |key: &str| -> Option<(usize, String)> {
+            leaves.iter().enumerate().find_map(|(i, (n, leaf))| {
+                let JoinNode::Leaf { columns, .. } = n else {
+                    return None;
+                };
+                let (_, f) = columns.iter().find(|(ck, _)| ck == key)?;
+                Some((i, leaf.columns.iter().find(|(out, _)| out == f)?.1.clone()))
+            })
+        };
+        let mut reads: Vec<Vec<String>> = vec![Vec::new(); leaves.len()];
+        for (_, f) in &sel.columns {
+            let (i, field) = stored(f)?;
+            reads[i].push(field);
+        }
+        // Equivalence classes over (leaf, field), members in leaf order.
+        let mut classes: Vec<Vec<(usize, String)>> = Vec::new();
+        for (l, r) in &equalities {
+            let (l, r) = (stored(l)?, stored(r)?);
+            let find = |classes: &Vec<Vec<(usize, String)>>, m: &(usize, String)| {
+                classes.iter().position(|c| c.contains(m))
+            };
+            match (find(&classes, &l), find(&classes, &r)) {
+                (Some(a), Some(b)) if a == b => {}
+                (Some(a), Some(b)) => {
+                    let moved = classes.remove(a.max(b));
+                    classes[a.min(b)].extend(moved);
+                }
+                (Some(a), None) => classes[a].push(r),
+                (None, Some(b)) => classes[b].push(l),
+                (None, None) => classes.push(vec![l, r]),
+            }
+        }
+        let mut joined = vec![false; leaves.len()];
+        for c in &mut classes {
+            c.sort();
+            // Two members of one table would restrict its scan.
+            if c.windows(2).any(|w| w[0].0 == w[1].0) {
+                return None;
+            }
+            for (i, _) in c.iter() {
+                joined[*i] = true;
+            }
+        }
+        if joined.iter().any(|j| !j) {
+            return None;
+        }
+        let counted = |table: &str| {
+            let counted: std::cell::OnceCell<Option<usize>> = std::cell::OnceCell::new();
+            let count = || {
+                *counted.get_or_init(|| {
+                    self.storage
+                        .count_matching(self.db(), table, &Document::new(), None)
+                        .ok()
+                })
+            };
+            self.planner_table_lazy(table, &count)
+        };
+        let tables: Vec<PlannerTable> = leaves
+            .iter()
+            .map(|(_, leaf)| counted(&leaf.table))
+            .collect::<Option<_>>()?;
+        if tables.iter().any(|pt| pt.analyzed.is_some()) {
+            return None;
+        }
+        let key_stat = |pt: &PlannerTable, field: &str| -> Option<hashagg::KeyStat> {
+            let c = pt.def.columns.iter().find(|c| c.field() == field)?;
+            Some(if c.pg_type == "bool" {
+                hashagg::KeyStat::Bool
+            } else if pt.unique.iter().any(|u| u == field) {
+                hashagg::KeyStat::Unique
+            } else {
+                hashagg::KeyStat::Unknown
+            })
+        };
+        let nd = |(i, field): &(usize, String)| -> Option<(f64, bool)> {
+            let pt = &tables[*i];
+            Some(match key_stat(pt, field)? {
+                hashagg::KeyStat::Unique => (costsize::clamp_row_est(pt.tuples), false),
+                hashagg::KeyStat::Bool => (2.0, false),
+                hashagg::KeyStat::Unknown if pt.tuples < 200.0 => {
+                    (costsize::clamp_row_est(pt.tuples), true)
+                }
+                _ => (200.0, true),
+            })
+        };
+        let k = |(ndistinct, default_ndistinct)| secantus_pgplan::joincost::KeyStats {
+            ndistinct,
+            default_ndistinct,
+            null_frac: 0.0,
+            mcv: &[],
+        };
+        let mut rows: f64 = tables.iter().map(|pt| pt.tuples).product();
+        for c in &classes {
+            for w in c.windows(2) {
+                rows *= secantus_pgplan::joincost::eqjoinsel_inner(&k(nd(&w[0])?), &k(nd(&w[1])?));
+            }
+        }
+        let rows = costsize::clamp_row_est(rows);
+        let mut groups = 1.0f64;
+        for (i, read) in reads.iter().enumerate() {
             let keys: Vec<hashagg::KeyStat> = read
                 .iter()
                 .map(|f| key_stat(&tables[i], f))
