@@ -40,15 +40,45 @@ def _text(c: psycopg.Connection, query: str) -> list[tuple[str | None, ...]]:
     return [tuple(None if v is None else str(v) for v in r) for r in c.execute(query).fetchall()]
 
 
-@pytest.mark.backlog("RP-841")
+@pytest.mark.backlog_fixed("RP-841")
 def test_an_intersect_over_a_join_puts_the_smaller_input_first(dsn: str) -> None:
     """`select a.x from t692j a join t692j b on a.k = b.k intersect select
     1.000` is `1.000` on PostgreSQL 15.19: the join's estimated groups
     outnumber the constant's one, so the constant is the HashSetOp's first
-    input and its row is the group's. Here a join input is not estimated,
-    so the left input stays first and its `1.0` is returned."""
+    input and its row is the group's. A join input was not estimated, so
+    the left input stayed first and its `1.0` was returned."""
     with _connect(dsn) as c:
         got = _text(c, "select a.x from t692j a join t692j b on a.k = b.k intersect select 1.000")
+    assert got == [("1.000",)]
+
+
+@pytest.mark.backlog_fixed("RP-841")
+def test_an_intersect_over_a_join_with_a_unique_key_puts_the_smaller_input_first(
+    dsn: str,
+) -> None:
+    """A join on a primary key of a table never analysed is estimated from
+    the key's row count as its distinct count: `select b.x from t692j a
+    join t692p b on a.k = b.k intersect select 1.0` is `1.0`, the
+    constant's, on PostgreSQL 15.19."""
+    with _connect(dsn) as c:
+        c.execute("drop table if exists t692p")
+        c.execute("create table t692p (k int primary key, x numeric)")
+        c.execute("insert into t692p values (1, 1.00), (2, 2.0)")
+        try:
+            got = _text(c, "select b.x from t692j a join t692p b on a.k = b.k intersect select 1.0")
+        finally:
+            c.execute("drop table t692p")
+    assert got == [("1.0",)]
+
+
+@pytest.mark.backlog("RP-841")
+def test_an_intersect_over_a_comma_join_puts_the_smaller_input_first(dsn: str) -> None:
+    """The comma form of the join, `select a.x from t692j a, t692j b where
+    a.k = b.k intersect select 1.000`, is `1.000` on PostgreSQL 15.19, as
+    the ON form is. Here its join clause is a WHERE the set operation's
+    input estimate does not read, so the left input stays first."""
+    with _connect(dsn) as c:
+        got = _text(c, "select a.x from t692j a, t692j b where a.k = b.k intersect select 1.000")
     assert got == [("1.000",)]
 
 

@@ -5310,6 +5310,196 @@ impl PgHandler {
         let (_, _, rows, _) = self.user_seq_scan(table, filter, &[])?;
         Some(hashagg::estimate_groups(&keys, pt.tuples, rows) as f64)
     }
+
+    /// An inner join of two stored tables on one column equality, with no
+    /// WHERE, as a set operation's input (RP-841): its rows, and the groups
+    /// of the select list's columns. The rows are the priced hash join's
+    /// where both sides are analysed; over two tables never analysed they
+    /// are `calc_joinrel_size_estimate`'s product of the scans' rows and
+    /// `eqjoinsel` from `get_variable_numdistinct`'s defaults. The groups
+    /// are `estimate_num_groups`': each table's columns' distinct counts
+    /// clamped to that table's rows, multiplied, and clamped to the join's.
+    pub(crate) fn join_input_estimate(&self, sel: &secantus_pgplan::Select) -> Option<(f64, f64)> {
+        if !sel.filter.is_empty() || sel.residual.is_some() || sel.casts.iter().any(Option::is_some)
+        {
+            return None;
+        }
+        // Each side's table, its join key's stored field, and the stored
+        // fields the select list reads from it.
+        let sides: [(String, String, Vec<String>); 2] = if let Some(js) = &sel.join {
+            if js.left_join
+                || !js.filter.is_empty()
+                || js.order.is_some()
+                || js.left_sub.is_some()
+                || js.right_sub.is_some()
+                || js.exprs.iter().any(Option::is_some)
+            {
+                return None;
+            }
+            let ((la, lc), (ra, rc)) = js.on.as_ref()?;
+            let side =
+                |(table, alias): &(String, String)| -> Option<(String, String, Vec<String>)> {
+                    let def = self.lookup(table)?;
+                    let key = if la == alias {
+                        lc
+                    } else if ra == alias {
+                        rc
+                    } else {
+                        return None;
+                    };
+                    let read = js
+                        .columns
+                        .iter()
+                        .filter(|(_, a, _)| a == alias)
+                        .map(|(_, _, c)| def.field_of(c))
+                        .collect::<Option<_>>()?;
+                    Some((table.clone(), def.field_of(key)?, read))
+                };
+            if js.left.1 == js.right.1 {
+                return None;
+            }
+            [side(&js.left)?, side(&js.right)?]
+        } else {
+            self.joined_rows_input_sides(sel)?
+        };
+        let counted = |table: &str| {
+            let counted: std::cell::OnceCell<Option<usize>> = std::cell::OnceCell::new();
+            let count = || {
+                *counted.get_or_init(|| {
+                    self.storage
+                        .count_matching(self.db(), table, &Document::new(), None)
+                        .ok()
+                })
+            };
+            self.planner_table_lazy(table, &count)
+        };
+        let tables = [counted(&sides[0].0)?, counted(&sides[1].0)?];
+        let key_stat = |pt: &PlannerTable, field: &str| -> Option<hashagg::KeyStat> {
+            let c = pt.def.columns.iter().find(|c| c.field() == field)?;
+            let unique = pt.unique.iter().any(|u| u == field);
+            let measured = pt.analyzed.as_ref().and_then(|a| a.get(field));
+            Some(if c.pg_type == "bool" {
+                hashagg::KeyStat::Bool
+            } else if let Some(stats) = measured {
+                hashagg::KeyStat::Analyzed {
+                    stats: stats.as_ref()?.stats,
+                    unique,
+                }
+            } else if unique {
+                hashagg::KeyStat::Unique
+            } else {
+                hashagg::KeyStat::Unknown
+            })
+        };
+        let rows = if tables.iter().all(|pt| pt.analyzed.is_none()) {
+            let nd = |i: usize| -> Option<(f64, bool)> {
+                let pt = &tables[i];
+                Some(match key_stat(pt, &sides[i].1)? {
+                    hashagg::KeyStat::Unique => (costsize::clamp_row_est(pt.tuples), false),
+                    hashagg::KeyStat::Bool => (2.0, false),
+                    hashagg::KeyStat::Unknown if pt.tuples < 200.0 => {
+                        (costsize::clamp_row_est(pt.tuples), true)
+                    }
+                    hashagg::KeyStat::Unknown => (200.0, true),
+                    hashagg::KeyStat::Analyzed { .. } => return None,
+                })
+            };
+            let ((n1, d1), (n2, d2)) = (nd(0)?, nd(1)?);
+            let k = |ndistinct, default_ndistinct| secantus_pgplan::joincost::KeyStats {
+                ndistinct,
+                default_ndistinct,
+                null_frac: 0.0,
+                mcv: &[],
+            };
+            let selec = secantus_pgplan::joincost::eqjoinsel_inner(&k(n1, d1), &k(n2, d2));
+            costsize::clamp_row_est(tables[0].tuples * tables[1].tuples * selec)
+        } else {
+            self.hash_join_estimate(sel)
+                .or_else(|| self.join_select_hash_estimate(sel))?
+                .2
+                 .2
+        };
+        let mut groups = 1.0f64;
+        for (i, (_, _, read)) in sides.iter().enumerate() {
+            let keys: Vec<hashagg::KeyStat> = read
+                .iter()
+                .map(|f| key_stat(&tables[i], f))
+                .collect::<Option<_>>()?;
+            if !keys.is_empty() {
+                groups *=
+                    hashagg::estimate_groups(&keys, tables[i].tuples, tables[i].tuples) as f64;
+            }
+        }
+        Some((rows, groups.min(rows).max(1.0)))
+    }
+
+    /// [`Self::join_input_estimate`]'s sides of an inner join planned as
+    /// joined rows: each plain scan's table, its key's stored field and
+    /// the stored fields the select list reads from it.
+    fn joined_rows_input_sides(
+        &self,
+        sel: &secantus_pgplan::Select,
+    ) -> Option<[(String, String, Vec<String>); 2]> {
+        use secantus_pgplan::joins::{JoinKind, JoinNode};
+        use secantus_pgplan::Statement;
+        let sub = sel.sub.as_ref()?;
+        let Statement::JoinRows(j) = sub.plan.as_ref() else {
+            return None;
+        };
+        if !j.where_filters.is_empty() || j.where_spans_equality || !j.where_modelled {
+            return None;
+        }
+        let JoinNode::Join {
+            kind: JoinKind::Inner,
+            left,
+            right,
+            on: Some(_),
+            on_other: false,
+            equi,
+            merged,
+            expr_keys,
+            ..
+        } = &j.tree
+        else {
+            return None;
+        };
+        let [(left_key, right_key)] = equi.as_slice() else {
+            return None;
+        };
+        if !merged.is_empty() || !expr_keys.is_empty() {
+            return None;
+        }
+        let side = |n: &JoinNode, key: &str| -> Option<(String, String, Vec<String>)> {
+            let JoinNode::Leaf { plan, columns, .. } = n else {
+                return None;
+            };
+            let Statement::Select(leaf) = plan.as_ref() else {
+                return None;
+            };
+            if !leaf.filter.is_empty()
+                || leaf.residual.is_some()
+                || leaf.sub.is_some()
+                || leaf.series.is_some()
+                || leaf.join.is_some()
+                || leaf.casts.iter().any(Option::is_some)
+            {
+                return None;
+            }
+            let stored = |k: &str| -> Option<String> {
+                let (_, f) = columns.iter().find(|(ck, _)| ck == k)?;
+                Some(leaf.columns.iter().find(|(out, _)| out == f)?.1.clone())
+            };
+            let read = sel
+                .columns
+                .iter()
+                .filter(|(_, f)| columns.iter().any(|(ck, _)| ck == f))
+                .map(|(_, f)| stored(f))
+                .collect::<Option<_>>()?;
+            Some((leaf.table.clone(), stored(key)?, read))
+        };
+        let sides = [side(left, left_key)?, side(right, right_key)?];
+        (sides[0].2.len() + sides[1].2.len() == sel.columns.len()).then_some(sides)
+    }
 }
 
 #[cfg(test)]

@@ -2934,24 +2934,23 @@ sorted as `choose_hashed_setop` prices them, each group's row the first
 its first input gave.
 
 - [ ] **An INTERSECT over an input this server does not estimate keeps its
-      left input first.** `select a.x from t692j a join t692j b on a.k =
+      left input first.** `select a.x from t692j a, t692j b where a.k =
       b.k intersect select 1.000` is `1.000` on PostgreSQL 15.19: the
       join's estimated groups outnumber the constant's one, so the constant
       is the HashSetOp's first input. Here it is `1.0`, the left input's:
       `setop_input_estimate` estimates a constant, a VALUES list, one user
       table's stored columns through a WHERE the selectivity model covers,
-      and a nested set operation, and leaves any other input -- a join, an
-      aggregate or GROUP BY, a DISTINCT, a computed column, a FROM
-      subquery other than VALUES, a catalog -- in the written order,
-      hashed. Sized 2026-11-16: the gap test's join is of a table never
-      analysed, which PostgreSQL 15.19 plans as `Merge Join (cost=176.34..
-      303.67 rows=8064 width=32)` over two default-sized scans (`rows=1270`
-      each, `estimate_rel_size`'s ten pages), `estimate_num_groups` over
-      `a.x` then clamping 200 default distinct values to those rows. This
-      server prices no join of never-analysed tables (RP-1019, the same
-      missing mechanism), so the join's estimate comes first; the order
-      then follows from `setop_plan` as for any estimated input.
-      Verify: tests/backlog/test_rp_found_rp692.py::test_an_intersect_over_a_join_puts_the_smaller_input_first
+      a nested set operation, and since 2026-11-17 an inner join of two
+      user tables on one ON equality with no WHERE, its stored columns
+      read (`join_input_estimate`: `eqjoinsel` from the default distinct
+      counts over tables never analysed, the priced hash join's rows over
+      analysed ones, `estimate_num_groups` clamped to the join's rows). It
+      leaves any other input -- a comma join (its join clause is a WHERE),
+      a join with a WHERE or of more tables, an aggregate or GROUP BY, a
+      DISTINCT, a computed column, a FROM subquery other than VALUES, a
+      catalog -- in the written order, hashed. Measured on the 15.19
+      reference on port 5415.
+      Verify: tests/backlog/test_rp_found_rp692.py::test_an_intersect_over_a_comma_join_puts_the_smaller_input_first
       Backlog-ID: RP-841
 
 ## Found while working RP-727 (2026-11-10)
