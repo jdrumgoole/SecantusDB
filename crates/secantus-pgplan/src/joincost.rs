@@ -2773,7 +2773,9 @@ impl JoinRel {
                 // presorted the same way (`find_mergeclauses_for_outer_pathkeys`,
                 // `make_inner_pathkeys_for_merge`).
                 let req = op.req_outer | inner.paths[ict].req_outer;
-                let flagged = if o_class.is_some_and(|c| op.class == Some(back_keys(c))) {
+                let flagged = if o_class.is_some_and(|c| {
+                    c != USELESS_KEYS && op.class == Some(back_keys(c & !ASC_KEYS))
+                }) {
                     Some(back_keys as fn(usize) -> usize)
                 } else if o_class.is_some_and(|c| op.class == Some(asc_keys(c))) {
                     Some(asc_keys as fn(usize) -> usize)
@@ -2785,7 +2787,10 @@ impl JoinRel {
                     continue;
                 }
                 let (o_order, i_order) = match flagged {
-                    Some(flag) if asc => (o_class.map(flag), i_class.map(flag)),
+                    Some(flag) if asc => (
+                        o_class.map(|c| flag(c & !ASC_KEYS)), // under `Search::merge_asc`
+                        i_class.map(|c| flag(c & !ASC_KEYS)),
+                    ),
                     _ => (o_class, i_class),
                 };
                 let merge_order = if right { None } else { o_order };

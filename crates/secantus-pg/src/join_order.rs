@@ -1858,17 +1858,15 @@ impl PgHandler {
 
     /// Whether the search plans `node` for an ORDER BY under a LIMIT
     /// (`four_table_join` with both): its first column's joined-row key
-    /// (`desc`, and `nulls_first` with its NULLs against the direction's
-    /// default), and `later` its later columns', which it plans for when
-    /// [`PgHandler::later_order_keys_modelled`] does, and with any that is a
-    /// pathkey of its own only after a first key with its default NULLs,
-    /// a descending one in an inner join's class (`Search::merge_asc`).
+    /// (`desc` when descending), and `later` its later columns', which it
+    /// plans for when [`PgHandler::later_order_keys_modelled`] does, and with
+    /// any that is a pathkey of its own only after a first key in an inner
+    /// join's class when descending (`Search::merge_asc`).
     pub(crate) fn ordered_limit_searched(
         &self,
         node: &JoinNode,
         first: &str,
         desc: bool,
-        nulls_first: bool,
         later: &[String],
     ) -> bool {
         let Some((chain, search)) = self.four_table_chain(node, true, true) else {
@@ -1877,7 +1875,7 @@ impl PgHandler {
         later.is_empty()
             || Self::order_class(&search, &chain, first).is_some_and(|class| {
                 self.later_order_keys_modelled(&search, first, class, later)
-                    .is_some_and(|n| n == 0 || !(desc && (nulls_first || class == ORDER_CLASS)))
+                    .is_some_and(|n| n == 0 || !(desc && class == ORDER_CLASS))
             })
     }
 
@@ -1984,7 +1982,7 @@ impl PgHandler {
                     // (`Search::merge_asc`); NULLS FIRST against the default,
                     // and a key no inner join's clause makes a class of
                     // (`ORDER_CLASS`), are not modelled.
-                    if n > 0 && desc && (nulls_first || class == ORDER_CLASS) {
+                    if n > 0 && desc && class == ORDER_CLASS {
                         return Ok(None);
                     }
                     search.merge_asc = n > 0 && (desc || nulls_first);
@@ -2038,7 +2036,10 @@ impl PgHandler {
                         // wrong direction for merging, and the backward
                         // scan's DESC NULLS FIRST the right one, though
                         // not the ORDER BY's own pathkey.
-                        if search.order_nulls_first && search.order_desc && unread {
+                        if search.order_nulls_first
+                            && search.order_desc
+                            && (unread || search.merge_asc)
+                        {
                             let c = list[i].0.class.unwrap_or(ORDER_CLASS);
                             list[i].0.class = Some(secantus_pgplan::joincost::back_keys(c));
                             base_backward[t][i] = true;
