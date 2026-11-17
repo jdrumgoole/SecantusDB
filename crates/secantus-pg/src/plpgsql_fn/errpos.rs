@@ -21,16 +21,34 @@ pub fn compile_error_offset(
         return None;
     }
     let tokens = pg_query::scan(body).ok()?.tokens;
+    // A check `pl_gram.y` makes once a statement is read points at the
+    // statement's first token (`@1`), not the token it stopped on.
+    let opener = statement_opener(message);
+    let mut statement_start = None;
     for t in tokens {
         let (start, end) = (t.start as usize, t.end as usize);
         let Some(prefix) = body.get(..end) else {
             continue;
         };
+        if opener.is_some_and(|kw| body[start..end].eq_ignore_ascii_case(kw)) {
+            statement_start = Some(start);
+        }
         if parse(prefix).err().as_deref() == Some(message) {
-            return Some(body[..start].chars().count());
+            let at = opener.and(statement_start).unwrap_or(start);
+            return Some(body[..at].chars().count());
         }
     }
     None
+}
+
+/// The keyword opening the statement whose `@1` a `pl_gram.y` error is
+/// reported at, for the errors raised after the statement is read.
+fn statement_opener(message: &str) -> Option<&'static str> {
+    match message {
+        // `stmt_fetch`: `parser_errposition(@1)`.
+        "FETCH statement cannot return multiple rows" => Some("fetch"),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -52,5 +70,17 @@ mod tests {
         let body = "<<blk>> begin raise notice 'z'; end nope";
         let msg = parse(body).unwrap_err();
         assert_eq!(compile_error_offset(body, &msg, &parse), Some(36));
+    }
+
+    #[test]
+    fn a_multi_row_fetch_points_at_the_fetch() {
+        let body = "declare c scroll cursor for select 1; r int; begin \
+                    if false then fetch forward 2 from c into r; end if; end";
+        let msg = parse(body).unwrap_err();
+        assert_eq!(msg, "FETCH statement cannot return multiple rows");
+        assert_eq!(
+            compile_error_offset(body, &msg, &parse),
+            Some(body.find("fetch forward").unwrap())
+        );
     }
 }

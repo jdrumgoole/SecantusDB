@@ -5826,6 +5826,41 @@ impl PgHandler {
         secantus_pgplan::schemas::set_temp_namespace_made(ns.is_some());
     }
 
+    /// The schema a `CREATE TYPE` writes to: `pg_temp` (or the session's own
+    /// `pg_temp_N`) is the session's temp namespace, which the type makes as
+    /// a temp relation does (`RangeVarGetAndCheckCreationNamespace`; RP-971).
+    fn temp_type_schema(&self, schema: Option<String>) -> Option<String> {
+        match schema {
+            Some(s) if s == "pg_temp" || s == self.temp_schema_name() => {
+                self.make_temp_namespace();
+                Some(self.temp_schema_name())
+            }
+            other => other,
+        }
+    }
+
+    /// Make the session's temp namespace now, at the current savepoint
+    /// level (`InitTempTableNamespace`).
+    fn make_temp_namespace(&self) {
+        let mut ns = self
+            .temp_namespace
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if ns.is_none() {
+            *ns = Some(
+                self.in_transaction
+                    .load(std::sync::atomic::Ordering::Relaxed)
+                    .then(|| {
+                        self.savepoints
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .len()
+                    }),
+            );
+        }
+        secantus_pgplan::schemas::set_temp_namespace_made(true);
+    }
+
     /// Whether the session's temp namespace has been made.
     fn temp_namespace_made(&self) -> bool {
         self.temp_namespace
@@ -12433,6 +12468,71 @@ impl PgHandler {
             .any(|d| d.get_str("schema").is_ok_and(|s| s.starts_with("pg_temp_")));
         MEMO.with(|m| *m.borrow_mut() = Some((docs, has)));
         has
+    }
+
+    /// The catalog key of a type in the session's temp namespace that
+    /// `name` (`pg_temp.t`, `pg_temp_N.t` or a bare `t`) reaches, if one
+    /// does: `LookupTypeName` searches the temp namespace first (RP-971).
+    fn temp_type_key(&self, name: &str) -> Option<String> {
+        let own = self.temp_schema_name();
+        let bare = match name.split_once('.') {
+            Some((s, b)) if s == "pg_temp" || s == own => b,
+            Some(_) => return None,
+            None => name,
+        };
+        let key = format!("{own}.{bare}");
+        let held = [
+            Self::COMPOSITE_COLLECTION,
+            Self::ENUM_COLLECTION,
+            Self::RANGE_COLLECTION,
+        ]
+        .into_iter()
+        .any(|c| {
+            self.type_catalog_docs(c)
+                .is_ok_and(|docs| docs.iter().any(|d| d.get_str("_id") == Ok(key.as_str())))
+        });
+        held.then_some(key)
+    }
+
+    /// Drop this session's temp types (enums, standalone composites,
+    /// ranges), as the session's end clears its temp namespace
+    /// (`RemoveTempRelations`; RP-971). Run after its temp tables, whose
+    /// row types are theirs.
+    fn drop_own_temp_types(&self) -> PgWireResult<()> {
+        let own = self.temp_schema_name();
+        self.drop_temp_types_where(|s| s == own)
+    }
+
+    /// Drop EVERY session's temp types, when the server opens a store: a
+    /// crashed process's would otherwise reappear in the next session
+    /// given the same serial.
+    pub(crate) fn drop_orphan_temp_types(&self) -> PgWireResult<()> {
+        self.drop_temp_types_where(|s| s.starts_with("pg_temp_"))
+    }
+
+    fn drop_temp_types_where(&self, pick: impl Fn(&str) -> bool) -> PgWireResult<()> {
+        let mut any = false;
+        for collection in [
+            Self::COMPOSITE_COLLECTION,
+            Self::ENUM_COLLECTION,
+            Self::RANGE_COLLECTION,
+        ] {
+            let keys: Vec<String> = self
+                .type_catalog_docs_raw(collection)?
+                .iter()
+                .filter(|d| !d.get_bool("relation").unwrap_or(false))
+                .filter(|d| d.get_str("schema").is_ok_and(&pick))
+                .filter_map(|d| d.get_str("_id").ok().map(str::to_string))
+                .collect();
+            for key in keys {
+                self.delete_type_doc(collection, &key)?;
+                any = true;
+            }
+        }
+        if any {
+            bump_catalog_version();
+        }
+        Ok(())
     }
 
     /// Drop this session's `pg_temp` functions, as PostgreSQL does when the
@@ -25233,6 +25333,7 @@ impl PgHandler {
                     Self::COMPOSITE_COLLECTION,
                     Self::ENUM_COLLECTION,
                     Self::BASE_TYPE_COLLECTION,
+                    Self::RANGE_COLLECTION,
                 ] {
                     if !user_types {
                         break;
@@ -25246,6 +25347,13 @@ impl PgHandler {
                         if let Some((_, ns)) = namespaces.iter().find(|(n, _)| n == schema) {
                             type_namespace.insert(oid, *ns);
                             type_namespace.insert(oid + Self::USER_TYPE_ARRAY_OID_OFFSET, *ns);
+                            // A range's multirange (and its array) is made
+                            // in the range's namespace (`DefineRange`).
+                            if collection == Self::RANGE_COLLECTION {
+                                let mr = oid + Self::MULTIRANGE_TYPE_OID_OFFSET;
+                                type_namespace.insert(mr, *ns);
+                                type_namespace.insert(mr + Self::USER_TYPE_ARRAY_OID_OFFSET, *ns);
+                            }
                         }
                     }
                 }
@@ -30518,6 +30626,9 @@ impl Drop for PgHandler {
         }
         if let Err(e) = self.drop_own_temp_functions() {
             eprintln!("secantusd-pg: dropping session temp functions failed: {e:?}");
+        }
+        if let Err(e) = self.drop_own_temp_types() {
+            eprintln!("secantusd-pg: dropping session temp types failed: {e:?}");
         }
         // A session's advisory locks die with it, and its table locks.
         advisory::release_session(pid);
@@ -44023,6 +44134,7 @@ impl PgHandler {
                 typmods,
                 ndims,
             } => {
+                let schema = self.temp_type_schema(schema);
                 // A schema-qualified name (`CREATE TYPE s.t`) is a distinct type
                 // from a bare `t`; unqualified lands in `public`. A duplicate is
                 // 42710, checked per (schema, name): a composite collides only
@@ -44110,6 +44222,7 @@ impl PgHandler {
                 schema,
                 subtype,
             } => {
+                let schema = self.temp_type_schema(schema);
                 // A schema-qualified name (`CREATE TYPE s.t AS RANGE`) is a
                 // distinct type from a bare `t`; unqualified lands in `public`.
                 // A duplicate is 42710, checked per (schema, name): a range
@@ -45030,6 +45143,7 @@ impl PgHandler {
                 schema,
                 labels,
             } => {
+                let schema = self.temp_type_schema(schema);
                 // A schema-qualified name (`CREATE TYPE s.t AS ENUM`) is a
                 // distinct type from a bare `t`; unqualified lands in `public`.
                 // A duplicate is 42710, distinct from a table's 42P07, checked
@@ -45084,6 +45198,12 @@ impl PgHandler {
                 if_exists,
                 cascade,
             } => {
+                // A temp type is named `pg_temp.t`, or bare `t` while the
+                // session's temp namespace (first in the path) holds it.
+                let names: Vec<String> = names
+                    .into_iter()
+                    .map(|n| self.temp_type_key(&n).unwrap_or(n))
+                    .collect();
                 self.ensure_collection(Self::ENUM_COLLECTION)?;
                 self.ensure_collection(Self::COMPOSITE_COLLECTION)?;
                 self.ensure_collection(Self::RANGE_COLLECTION)?;

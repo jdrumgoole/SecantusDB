@@ -1214,30 +1214,6 @@ one beside it.
 
 ## Found while working RP-911 (2026-11-15)
 
-- [ ] **OPEN — `CREATE TYPE pg_temp.t AS (...)` makes no type in the temp
-      schema.** PostgreSQL 15.19 creates the composite in the session's
-      temp namespace (making it): `'pg_temp.t'::regtype` resolves, its
-      `typnamespace` is `pg_my_temp_schema()`, and that is no longer 0.
-      `secantusd-pg` answers 42704 `type "pg_temp.t" does not exist` to
-      the cast.
-      Measured 2026-11-17 against 15.19 (while working RP-950's bundle):
-      the composite IS made, but outside the temp namespace -- its
-      `pg_type` row's `typnamespace` is no `pg_temp_N`, the bare
-      `'ct911'::regtype` is 42704 too (15.19 finds it: the temp namespace
-      is searched first for types), and `create temp table t (x ct911)`
-      is 42704. `row(1)::pg_temp.ct911` already works. An enum has the
-      other half of the gap: `create type pg_temp.e as enum ('a')` then
-      `'pg_temp.e'::regtype` prints `pg_temp.e` where 15.19 prints `e`
-      -- it is kept under a schema literally named `pg_temp`, not the
-      session's. Faithful: a type made in `pg_temp` (any kind) lives in
-      the session's `pg_temp_N` (made by it, as a temp relation makes it),
-      is found by `LookupTypeName` through the implicit temp namespace at
-      the head of the path, and is dropped with the session's other temp
-      objects. This is the type side of the namespace RP-882 built for
-      relations, not a one-line fix.
-      Verify: tests/backlog/test_rp_qualified_calls.py::test_standalone_temp_composite_is_in_the_temp_schema
-      Backlog-ID: RP-971
-
 ## Found while working RP-927 (2026-11-14)
 
 - [ ] **OPEN — psql's `\d` column query straight after DDL builds every
@@ -1766,20 +1742,25 @@ a regression test.
       `ruleutils::explain_verbose_join`, `explain::attach_verbose_join`,
       `explain::attach_verbose_nested_loop`). Every other join does not:
       PostgreSQL 15.19 prints a Merge Join's, its Materialize's and
-      Memoize's `Output` likewise, and a nested loop's `Join Filter`
-      prefixed; here the plain plan. Nor does a nested loop with a WHERE,
-      a WHERE conjunct reading both relations, an ON that is not column
+      Memoize's `Output` likewise; here the plain plan. (Since 2026-11-17
+      a nested loop over a scan and a Materialize of a scan, the ON its
+      `Join Filter`, prints every node's `Output`:
+      `explain::attach_verbose_materialized_loop`.) Nor does a WHERE conjunct reading both relations, an ON that is not column
       comparisons, or three or more
       relations (since 2026-11-17 a Sort on a computed key over one
       relation prints its resjunk entry, `Output: a, ((a + 1))` and `Sort
-      Key: ((k.a + 1))` over a scan whose `Output: a, (a + 1)`). A nested
-      loop with a WHERE prints the plain plan where PostgreSQL 15.19 prints
-      both scans' `Output` and the `Filter` prefixed. Where to build it: every node's targetlist
+      Key: ((k.a + 1))` over a scan whose `Output: a, (a + 1)`, and a
+      nested loop into a parameterised index scan with a WHERE whose
+      conjuncts each read one relation prints them as its scans'
+      `Filter`, prefixed). Where to build it: every node's targetlist
       deparsed (`show_plan_tlist`, prefixed when the range table holds more
       than one relation; a node under a Hash, Sort or Material returns only
       the columns needed above, `CP_SMALL_TLIST`), its quals and keys
       printed with `unqualified = false`.
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[explain verbose of a nested loop with a where]
+      An inner index scan's `Filter` reading both relations (`e left join
+      k on e.a < k.a and e.b <> k.b`, `Filter: (e.b <> k.b)`) is still
+      printed plain.
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[explain verbose of a nested loop whose inner filter reads both relations]
       Backlog-ID: RP-966
 
 
@@ -2702,38 +2683,6 @@ still computed whole, and the cursor answers that differ either way.
       Verify: tests/backlog/test_rp_found_rp744.py::test_a_cursors_where_filters_as_it_is_fetched
       Backlog-ID: RP-961
 
-## Found while working RP-898 (2026-11-14)
-
-Measured on PostgreSQL 15.19 (the shared reference on port 5415; a DO
-block creates no object). The gap test is in
-`tests/backlog/test_rp_found_rp898.py`.
-
-- [ ] **A PL/pgSQL FETCH of more than one row is refused with the wrong
-      SQLSTATE.** `do $$ declare c scroll cursor for select 1; r int;
-      begin if false then fetch forward 2 from c into r; end if; end $$`
-      is 0A000 `FETCH statement cannot return multiple rows` on PostgreSQL
-      15.19 (`pl_gram.y`'s `stmt_fetch`, at compile time), with the
-      statement position at the FETCH; here it is 42601 with no position
-      (`open_cursor::fetch_cursor`).
-      Verify: tests/backlog/test_rp_found_rp898.py::test_a_multi_row_plpgsql_fetch_is_feature_not_supported
-      Backlog-ID: RP-942
-
-## Found while working RP-900 (2026-11-13)
-
-Measured on PostgreSQL 15.19 (the shared reference on port 5415). The gap
-test is in `tests/backlog/test_rp_found_rp900.py`.
-
-- [ ] **The extended protocol's unnamed portal is listed in `pg_cursors`.**
-      In a block, a parameterised statement (`select $1::int`, as psycopg
-      sends `select %s::int`) leaves a `pg_cursors` row named
-      `POSTGRESQL_DEFAULT_NAME`, pgwire's placeholder for the unnamed
-      portal, until the block ends; PostgreSQL 15.19 creates that portal
-      invisible (`exec_bind_message`) and lists none.
-      `wire_portals::note_wire_portal` skips only an empty name, and the
-      Bind hands it `DEFAULT_NAME`.
-      Verify: tests/backlog/test_rp_found_rp900.py::test_the_unnamed_portal_is_not_in_pg_cursors
-      Backlog-ID: RP-936
-
 ## Found while working RP-782 (2026-11-10)
 
 Measured on a private PostgreSQL 15.19 cluster (locale C.UTF-8, built
@@ -2909,6 +2858,18 @@ statement is VALUES-only and runs there as written. The gap test is in
 
 ## Found while working RP-966 (2026-11-17)
 
+- [ ] **A nested loop whose inner relation has its own WHERE conjunct is
+      not priced.** `explain select e.b from e join k on e.a <> k.a where
+      k.b = 'v1'` (`e`, `k` 1,000 analysed rows) is, on PostgreSQL 15.19,
+      `Nested Loop (cost=0.00..1532.75 rows=99900 width=3)` over `Seq Scan
+      on e` and a `Materialize (cost=0.00..18.00 rows=100 width=4)` of
+      `Seq Scan on k (cost=0.00..17.50 rows=100 width=4)`; here zeros and
+      no Materialize. With the conjunct on the OUTER table PostgreSQL
+      swaps the sides and this server matches it (found while working
+      RP-966).
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a nested loop over a filtered inner relation is priced]
+      Backlog-ID: RP-1038
+
 - [ ] **A computed ORDER BY key written through an alias prints its
       synthetic name.** `explain select a from k x order by x.a*2` prints
       `Sort Key: __order0`; PostgreSQL 15.19 prints `Sort Key: ((a * 2))`
@@ -3024,3 +2985,16 @@ statement is VALUES-only and runs there as written. The gap test is in
       reference on port 5415.
       Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a scan of a temporary table names it bare], tests/backlog/test_rp_explain_costs.py::test_plan[a scan of an aliased temporary table names it and its alias]
       Backlog-ID: RP-1029
+
+## Found while working RP-971 (2026-11-17)
+
+- [ ] **A `pg_temp` name before the session has a temp namespace answers
+      "does not exist" for the object, not the schema.** In a fresh
+      session PostgreSQL 15.19 answers `select 'pg_temp.zz'::regclass` and
+      `select 'pg_temp.zz'::regtype` with 3F000 `schema "pg_temp" does not
+      exist` (`LookupExplicitNamespace` finds no `myTempNamespace`);
+      `secantusd-pg` answers 42P01 `relation "pg_temp.zz" does not exist`
+      and 42704 `type "pg_temp.zz" does not exist`. A function call
+      already answers 3F000 (`test_a_pg_temp_function_left_by_a_killed_server_is_gone_at_restart`).
+      Verify: tests/backlog/test_rp_qualified_calls.py::test_pg_temp_name_without_a_temp_namespace_is_an_undefined_schema
+      Backlog-ID: RP-1037

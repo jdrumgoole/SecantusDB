@@ -14,7 +14,9 @@ pub(crate) struct WirePortal {
 
 impl PgHandler {
     pub(crate) fn note_wire_portal(&self, name: &str, statement: &str, format: &Format) {
-        if name.is_empty() {
+        // The unnamed portal (pgwire names it `DEFAULT_NAME`) is created
+        // invisible, as `exec_bind_message` does, so `pg_cursors` omits it.
+        if name.is_empty() || name == DEFAULT_NAME {
             return;
         }
         let binary = match format {

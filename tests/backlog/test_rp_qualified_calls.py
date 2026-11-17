@@ -524,10 +524,10 @@ def test_other_sessions_temp_schema_relation_is_named_as_written(dsn: str) -> No
     )
 
 
-@pytest.mark.backlog("RP-971")
+@pytest.mark.backlog_fixed("RP-971")
 def test_standalone_temp_composite_is_in_the_temp_schema(dsn: str) -> None:
-    """`CREATE TYPE pg_temp.t AS (...)` makes a composite in the session's
-    temp schema, which it makes: on 15.19 the type resolves as
+    """`CREATE TYPE pg_temp.t AS (...)` made a composite outside the
+    session's temp schema; it now makes it there, making the schema: on 15.19 the type resolves as
     `pg_temp.t` and `pg_my_temp_schema()` is no longer 0."""
     assert answer(
         dsn,
@@ -536,3 +536,11 @@ def test_standalone_temp_composite_is_in_the_temp_schema(dsn: str) -> None:
         " where oid = 'pg_temp.ct911'::regtype) = pg_my_temp_schema(),"
         " pg_my_temp_schema() = 0",
     ) == [(True, False)]
+
+
+@pytest.mark.backlog("RP-1037")
+def test_pg_temp_name_without_a_temp_namespace_is_an_undefined_schema(dsn: str) -> None:
+    """Before the session has a temp namespace, `pg_temp.x` names a schema
+    that does not exist: 3F000 on 15.19 for a relation and a type alike."""
+    for q in ("select 'pg_temp.zz'::regclass", "select 'pg_temp.zz'::regtype"):
+        assert answer(dsn, q)[:2] == ("3F000", 'schema "pg_temp" does not exist'), q
