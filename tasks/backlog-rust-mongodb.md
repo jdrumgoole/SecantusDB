@@ -797,14 +797,6 @@ These are explicit non-goals. Don't add them without a reason.
       working RM-386, 2026-11-13.
       Verify: tests/backlog/test_rm_found_rm386.py::test_a_command_refused_as_it_runs_is_profiled_as_mongod_profiles_it
       Backlog-ID: RM-607
-- [ ] **An `update` whose statement fails writes one `Slow query` line,
-      not two.** mongod 8.2.11 writes the statement's line (`<db>.c`) and
-      the command's (`<db>.$cmd`) for an `update` whose one statement is
-      refused as it parses its update (`u: {$bogus: {a: 1}}`, a write
-      error in an `ok: 1` reply); this server writes the command's alone.
-      Found while working RM-386, 2026-11-13.
-      Verify: tests/backlog/test_rm_found_rm386.py::test_an_update_with_a_failed_statement_writes_two_lines
-      Backlog-ID: RM-608
 - [ ] **Operations this server runs another way than mongod's plan say
       less.** Since RM-023 a read or a write's read that a stream runs as
       mongod's plan counts its keys and documents examined, and since

@@ -305,14 +305,14 @@ def test_a_command_refused_as_it_runs_is_profiled_as_mongod_profiles_it(
 # ------------------------------------ a failed update statement's lines --
 
 
-@pytest.mark.backlog("RM-608")
+@pytest.mark.backlog_fixed("RM-608")
 def test_an_update_with_a_failed_statement_writes_two_lines(
     rust_mongo: Any, mongod_rs: Any
 ) -> None:
     """mongod 8.2.11 writes two `Slow query` lines for an `update` whose one
     statement fails as it parses its update (`{$bogus: {a: 1}}`, a write
     error in an `ok: 1` reply): the statement's and the command's. This
-    server writes one."""
+    server wrote the command's alone until RM-608."""
 
     def run(client: Any, db: Any) -> None:
         _command(

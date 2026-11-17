@@ -2530,9 +2530,18 @@ pub(crate) fn update_in(
         // apply-time engine would never run. Pipeline-form `u` is validated below.
         if !matches!(spec.get("u"), Some(Bson::Array(_))) {
             if let Some((code, errmsg)) = update_spec_error(&doc_field(spec, "u")) {
-                write_errors.push(Bson::Document(doc! {
+                let error = doc! {
                     "index": index as i32, "code": code, "errmsg": errmsg,
-                }));
+                };
+                // mongod parses the update once it holds the collection, and
+                // writes the refused statement's `Slow query` line (no plan,
+                // no counts, `ok: 0`) before the command's (measured 8.2.11,
+                // RM-608). Its acquisition is already counted on this
+                // command's locks.
+                crate::profiler::refused_statement(
+                    db_name, &coll, "update", spec, &error, doc, false,
+                );
+                write_errors.push(Bson::Document(error));
                 if ordered {
                     break;
                 }
