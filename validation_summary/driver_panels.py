@@ -498,18 +498,13 @@ def render(
     return '<div class="drivers">\n' + "\n".join(panels) + "</div>\n"
 
 
-#: Heading shown above each grid in `render_both`. The Rust servers are what
-#: the site leads with, so they come first; the Python row is labelled as the
-#: reference implementation rather than left to be inferred from its position.
+#: Heading shown above each grid in `render_both`. Only the Rust server's grid
+#: is published: the Python servers are deprecated and no longer on the site
+#: (Joe, 2026-11-17).
 _GRID_LABELS = {
     "rust": (
         "Rust MongoDB server",
         "The flagship — the server these numbers are measured against by default.",
-    ),
-    "python": (
-        "Python reference server",
-        "The reference implementation the Rust server is held to, run through the "
-        "same unmodified suites.",
     ),
 }
 
@@ -520,17 +515,14 @@ def render_both(
     allow_stale: bool = False,
     max_spread_days: float = 7.0,
 ) -> str:
-    """Both servers' grids, one above the other, each labelled.
+    """The published grid: the Rust server's, labelled.
 
-    Published together rather than choosing one, because the interesting fact
-    is that they AGREE: the Rust server reaching pymongo parity with the Python
-    reference is the claim the project actually makes, and a single grid cannot
-    show it. Each half is guarded independently, so a stale or empty artifact on
-    either side refuses the whole page rather than publishing one fresh grid
-    beside one that is not.
+    Kept under its old name so ``--server both`` still works; it once stacked a
+    Python-server grid under this one, dropped when the Python servers left the
+    site (2026-11-17).
     """
     parts: list[str] = []
-    for server in ("rust", "python"):
+    for server in _GRID_LABELS:
         title, blurb = _GRID_LABELS[server]
         parts.append(
             f'<h3 class="drivers-grid-label">{escape(title)}</h3>\n'
@@ -571,10 +563,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--server",
         choices=("python", "rust", "both"),
-        default="python",
+        default="rust",
         help=(
-            "Which server's gauge artifacts to read: 'python' uses e.g. "
-            "raw.json, 'rust' uses raw-rust-server.json (default: python)."
+            "Which server's gauge artifacts to read: 'rust' uses e.g. "
+            "raw-rust-server.json, 'python' uses raw.json (default: rust)."
         ),
     )
     parser.add_argument(

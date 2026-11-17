@@ -56,6 +56,9 @@ LABEL_MIN_GAP = 14.0
 STYLES = {
     "website": {
         "prefix": "viz",
+        # The site shows the Rust server against mongod only (the Python
+        # servers are deprecated, Joe 2026-11-17); docs/concurrency.md keeps all.
+        "series": ["mongod", "rust", "rust-async"],
         "wrap_class": "viz-wrap",
         "legend_class": "viz-legend",
         "svg_class": "viz",
@@ -90,6 +93,7 @@ STYLES = {
     },
     "docs": {
         "prefix": "dv",
+        "series": DRAW_ORDER,
         "wrap_class": "dviz-wrap",
         "legend_class": "dv-legend",
         "svg_class": "dviz",
@@ -161,8 +165,9 @@ def render_viz(results: dict, style_name: str) -> str:
     st = STYLES[style_name]
     p = st["prefix"]
     writers: list[int] = results["meta"]["writers"]
-    rates = {s: results["servers"][s]["docs_per_sec"] for s in DRAW_ORDER}
-    ratios = {s: scaling_ratios(rates[s]) for s in DRAW_ORDER}
+    series = [s for s in DRAW_ORDER if s in st["series"]]
+    rates = {s: results["servers"][s]["docs_per_sec"] for s in series}
+    ratios = {s: scaling_ratios(rates[s]) for s in series}
 
     span = max(writers) - min(writers)
     if span <= 0:
@@ -182,6 +187,7 @@ def render_viz(results: dict, style_name: str) -> str:
         f'border:2px dashed var({st["var"][s]});box-sizing:border-box"></span>'
         f"{st['legend_names'][s]}</span>"
         for s in ["mongod", "rust", "python", "rust-async"]
+        if s in series
     )
     parts.append(
         f'<div class="{st["wrap_class"]}"><div class="{st["legend_class"]}">{legend}</div>'
@@ -213,7 +219,7 @@ def render_viz(results: dict, style_name: str) -> str:
         f'<text x="{(X0 + X1) / 2:.0f}" y="310" text-anchor="middle" class="{p}-lab">concurrent writers</text>'  # noqa: E501
     )
 
-    for s in DRAW_ORDER:
+    for s in series:
         var = f"var({st['var'][s]})"
         pts = [(x, y(r)) for x, r in zip(xs, ratios[s], strict=True)]
         d = "M" + " L".join(f"{x:.1f},{py:.1f}" for x, py in pts)
@@ -235,8 +241,8 @@ def render_viz(results: dict, style_name: str) -> str:
                     f"{st['dot_class']}><title>{tip}</title></circle>"
                 )
 
-    label_pos = _nudge_labels([(s, y(ratios[s][-1]) + 4) for s in DRAW_ORDER])
-    for s in DRAW_ORDER:
+    label_pos = _nudge_labels([(s, y(ratios[s][-1]) + 4) for s in series])
+    for s in series:
         parts.append(
             f'<text x="{LABEL_X}" y="{label_pos[s]:.0f}" class="{p}-val" fill="var({st["var"][s]})">'  # noqa: E501
             f'{st["label_names"][s]} {ratios[s][-1]:.1f}<tspan class="{p}-x">x</tspan></text>'
@@ -252,7 +258,7 @@ def _fmt_rate(rate: float) -> str:
 
 def render_website_table(results: dict) -> str:
     writers: list[int] = results["meta"]["writers"]
-    order = ["mongod", "rust", "rust-async", "python"]
+    order = ["mongod", "rust", "rust-async"]
     rows = []
     for i, n in enumerate(writers):
         cells = "".join(
@@ -267,7 +273,7 @@ def render_website_table(results: dict) -> str:
         '      <table class="compare-table">\n'
         "        <thead>\n"
         "          <tr><th>Writers</th><th>mongod</th><th>Rust DB</th>"
-        "<th>Rust DB &mdash; async stack</th><th>Python DB</th></tr>\n"
+        "<th>Rust DB &mdash; async stack</th></tr>\n"
         "        </thead>\n"
         "        <tbody>\n"
         f"{body}\n"
