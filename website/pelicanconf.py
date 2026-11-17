@@ -102,7 +102,7 @@ MARKDOWN = {
     "output_format": "html5",
 }
 
-STATIC_PATHS: list[str] = []
+STATIC_PATHS: list[str] = ["talks"]
 ARTICLE_EXCLUDES: list[str] = ["pages"]
 
 PLUGIN_PATHS = [str(HERE / "plugins")]

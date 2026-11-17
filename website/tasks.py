@@ -180,6 +180,18 @@ def _copy_screenshots() -> None:
     print(f"  copied {len(SITE_SCREENSHOTS)} screenshot(s) → {dest.relative_to(REPO_ROOT)}")
 
 
+def _build_talk_decks() -> None:
+    """Render every deck under website/talks/ into content/talks/ (git-ignored)."""
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("build_deck", HERE / "talks" / "build_deck.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    for deck in sorted((HERE / "talks").iterdir()):
+        if (deck / "deck.json").is_file():
+            mod.build(deck.name)
+
+
 def _load_state() -> dict[str, str]:
     if not STATE_FILE.exists():
         raise SystemExit(f"AWS state file not found at {STATE_FILE}. Run `invoke infra-up` first.")
@@ -192,6 +204,7 @@ def assets(c: Context) -> None:
     _ensure_venv()
     _copy_brandkit_assets()
     _copy_screenshots()
+    _build_talk_decks()
 
 
 @task(pre=[assets])

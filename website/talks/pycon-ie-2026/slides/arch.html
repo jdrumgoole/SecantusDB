@@ -1,0 +1,24 @@
+<section id="arch">
+<p class="eyebrow">Architecture</p>
+<h2>Two servers, two protocols, one storage format</h2>
+<div class="flow">
+<div class="box"><p class="t">pymongo</p><p>OP_MSG</p></div>
+<p class="arrow">→</p>
+<div class="box"><p class="t">secantus-wire</p><p>commands</p></div>
+<p class="arrow">→</p>
+<div class="box"><p class="t">secantus-core</p><p>query, update, aggregate</p></div>
+<p class="arrow">→</p>
+<div class="box wt" style="flex:1.2;"><p class="t">secantus-storage</p><p>WiredTiger</p></div>
+</div>
+<div class="flow">
+<div class="box"><p class="t">psycopg</p><p>PG wire</p></div>
+<p class="arrow">→</p>
+<div class="box"><p class="t">libpg_query</p><p>real PG parser</p></div>
+<p class="arrow">→</p>
+<div class="box"><p class="t">secantus-pgplan</p><p>SQL → MQL filters</p></div>
+<p class="arrow">→</p>
+<div class="box wt" style="flex:1.2;"><p class="t">same tables</p><p>same files</p></div>
+</div>
+<p style="font-size:28px;color:var(--soft);">A Cargo workspace of about 20 crates. The engines have no PyO3, so the standalone binaries and the Python bindings share them.</p>
+<aside>Walk the two rows. Point: a CREATE TABLE in the Postgres server reads back as a collection in the MongoDB server — a hand-off, not concurrent serving; WiredTiger’s file lock lets only one serve at a time. ~2 min.</aside>
+</section>
