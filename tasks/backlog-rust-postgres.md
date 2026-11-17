@@ -1200,6 +1200,15 @@ one beside it.
       ratio of 1.23 to 1.29 in ten of ten runs of fifteen rounds. The test
       now takes fifteen paired rounds and bounds their median, and failed
       ten of ten serially and three of three under `-n 9`.)
+      (2026-11-17, platform: CI's pg-oracle (backlog) step builds the same
+      `dev` profile binary, `crates/secantus-pg/target/debug/secantusd-pg`,
+      and passed the paired-median test on x86_64 Linux (job 134018142698,
+      PR #2821); this arm64 Mac failed six of six more runs of that build at
+      a median ratio of 1.26-1.27 (14 ms against 18 ms; the test now prints
+      each round's ratio). The gap shows only on macOS here, so its test
+      runs `only_on("darwin")`, and verify reports it ELSEWHERE on CI. Not
+      separated: macOS from arm64 (no arm64 Linux or x86_64 macOS runner
+      measured). Close it when it passes every run on darwin.)
       Backlog-ID: RP-911
       Verify: tests/backlog/test_rp_catalog_latency.py::test_the_first_catalog_query_after_ddl_costs_the_same_at_800_tables_within_a_tenth
 
