@@ -109,12 +109,25 @@ pub(crate) fn refusal_is_profiled(name: &str) -> bool {
     matches!(name, "listIndexes" | "collStats" | "collstats")
 }
 
-/// The reply to a command mongod refuses on a view, or `None` to run it.
-pub(crate) fn refusal(name: &str, doc: &Document, ctx: &CommandContext) -> Option<Document> {
+/// Whether `doc` is an `insert`, `update` or `delete` of a view.
+pub(crate) fn is_view_write(name: &str, doc: &Document, ctx: &CommandContext) -> bool {
+    matches!(name, "insert" | "update" | "delete")
+        && ctx.storage.as_ref().is_some_and(|storage| {
+            doc.get_str(name).is_ok_and(|coll| {
+                coll != "system.views" && is_view(storage.as_ref(), &ctx.db_name, coll)
+            })
+        })
+}
+
+/// The reply to an `insert`, `update` or `delete` of a view, or `None` to
+/// run it. mongod 8.2.11 refuses the write once it holds the namespace: a
+/// retryable one after checking its session out, an insert after its write
+/// rounds, a statement of a transaction under the transaction's locks, so
+/// `run_handler` asks here once it holds the statement's locks, under its
+/// slow-operation and current-operation scopes (RM-589).
+pub(crate) fn write_refusal(name: &str, doc: &Document, ctx: &CommandContext) -> Option<Document> {
     let storage = ctx.storage.as_ref()?;
     let db = ctx.db_name.as_str();
-    // `system.views` holds the definitions and is not one of them: a write
-    // to it has a refusal of its own, which the handler gives.
     let view = |coll: &str| coll != "system.views" && is_view(storage.as_ref(), db, coll);
     match name {
         // A write reports one error per statement, or only the first when the
@@ -145,12 +158,17 @@ pub(crate) fn refusal(name: &str, doc: &Document, ctx: &CommandContext) -> Optio
                 .collect();
             // Each statement it tried has a line of its own before the
             // command's, an insert's none (measured 8.2.11, RM-487).
+            let in_txn = doc.get("autocommit") == Some(&Bson::Boolean(false));
+            let _slow = crate::slowop::enter(ctx);
+            let _current = crate::lock_manager::enter(ctx.locks.as_ref());
+            // An insert's two write rounds come before the view is found
+            // (measured 8.2.11, RM-589).
+            if name == "insert" && !in_txn {
+                drop(crate::lock_manager::write_rounds(db, coll, 2));
+            }
             if name != "insert" {
                 let op = if name == "update" { "update" } else { "remove" };
                 let specs = doc.get_array(statements).map(Vec::as_slice).unwrap_or(&[]);
-                let in_txn = doc.get("autocommit") == Some(&Bson::Boolean(false));
-                let _slow = crate::slowop::enter(ctx);
-                let _current = crate::lock_manager::enter(ctx.locks.as_ref());
                 for (spec, error) in specs.iter().zip(&errors) {
                     let spec = spec.as_document().cloned().unwrap_or_default();
                     crate::profiler::refused_statement(db, coll, op, &spec, error, doc, !in_txn);
@@ -164,6 +182,21 @@ pub(crate) fn refusal(name: &str, doc: &Document, ctx: &CommandContext) -> Optio
             reply.insert("ok", 1.0);
             Some(reply)
         }
+        _ => None,
+    }
+}
+
+/// The reply to a command mongod refuses on a view, or `None` to run it.
+pub(crate) fn refusal(name: &str, doc: &Document, ctx: &CommandContext) -> Option<Document> {
+    let storage = ctx.storage.as_ref()?;
+    let db = ctx.db_name.as_str();
+    // `system.views` holds the definitions and is not one of them: a write
+    // to it has a refusal of its own, which the handler gives.
+    let view = |coll: &str| coll != "system.views" && is_view(storage.as_ref(), db, coll);
+    match name {
+        // A write is refused where mongod refuses it, holding its session
+        // and its locks: `write_refusal`, from `run_handler` (RM-589).
+        "insert" | "update" | "delete" => None,
         "findAndModify" | "findandmodify" | "createIndexes" | "listIndexes" | "dropIndexes"
         | "deleteIndexes" | "collStats" | "collstats" => {
             let coll = doc.get_str(name).ok()?;
