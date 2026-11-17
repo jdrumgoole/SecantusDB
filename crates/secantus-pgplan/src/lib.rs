@@ -3758,6 +3758,9 @@ pub struct ExplainOptions {
     /// Under VERBOSE, a single-relation SELECT's scan as it prints then
     /// (RP-925).
     pub verbose_scan: Option<ruleutils::VerboseScan>,
+    /// A SELECT over one aliased relation: the alias its scan prints
+    /// after the relation's name (RP-967).
+    pub scan_alias: Option<String>,
     /// A SELECT over one `generate_series` in FROM: the alias its Function
     /// Scan names (when it differs from the function's), and its WHERE as
     /// the scan's `Filter` (RP-847).
@@ -12366,6 +12369,7 @@ fn plan_explain(
         analyze: false,
         verbose: false,
         verbose_scan: None,
+        scan_alias: None,
         costs: true,
         timing: false,
         summary: false,
@@ -12523,6 +12527,7 @@ fn plan_explain(
     let scan_quals = ruleutils::with_init_plans(&init_sublinks, || {
         explain_scan_quals(&query, lookup).unwrap_or_default()
     });
+    options.scan_alias = scan_alias(&query);
     (options.series_scan, options.series_qual) = match &query {
         N::SelectStmt(s) => match explain_series_scan(s) {
             Some((scan, qual)) => (Some(scan), qual),
@@ -55207,8 +55212,27 @@ fn explain_scan_quals(
     lookup: &dyn Fn(&str) -> Option<TableDef>,
 ) -> Option<Vec<(String, Option<String>)>> {
     let (table, where_clause) = scan_where(query)?;
-    let def = lookup(&table)?;
+    let mut def = lookup(&table)?;
+    // An aliased relation is in scope under its alias alone (RP-967).
+    if let Some(alias) = scan_alias(query) {
+        def.name = alias;
+    }
     ruleutils::explain_conjuncts(where_clause, &def)
+}
+
+/// A SELECT over one aliased relation: the alias its scan names after
+/// the relation (`ExplainTargetRel`, RP-967).
+fn scan_alias(query: &N) -> Option<String> {
+    let N::SelectStmt(s) = query else {
+        return None;
+    };
+    let [item] = s.from_clause.as_slice() else {
+        return None;
+    };
+    let Some(N::RangeVar(rv)) = item.node.as_ref() else {
+        return None;
+    };
+    rv.alias.as_ref().map(|a| a.aliasname.clone())
 }
 
 #[cfg(test)]
