@@ -34,8 +34,10 @@ html,body{{margin:0;height:100%;background:#0B1915;overflow:hidden;}}
 #stage>section.on{{display:flex;}}
 #stage>section>aside{{display:none;}}
 #stage h1,#stage h2,#stage h3,#stage p,#stage ul,#stage ol{{margin:0;}}
-#bar{{position:fixed;right:16px;bottom:12px;font:14px/1 system-ui,sans-serif;color:#BFD3CB;opacity:.7;}}
-#bar button{{background:none;border:1px solid #BFD3CB;color:inherit;border-radius:4px;padding:4px 10px;margin-left:6px;cursor:pointer;}}
+#bar{{position:fixed;right:16px;bottom:12px;color:#BFD3CB;opacity:.7;
+  font:14px/1 system-ui,sans-serif;}}
+#bar button{{background:none;border:1px solid #BFD3CB;color:inherit;
+  border-radius:4px;padding:4px 10px;margin-left:6px;cursor:pointer;}}
 {css}
 </style>
 </head>
@@ -43,7 +45,9 @@ html,body{{margin:0;height:100%;background:#0B1915;overflow:hidden;}}
 <div id="stage">
 {slides}
 </div>
-<div id="bar"><span id="num"></span><button id="prev" aria-label="Previous slide">&#8592;</button><button id="next" aria-label="Next slide">&#8594;</button></div>
+<div id="bar"><span id="num"></span>
+<button id="prev" aria-label="Previous slide">&#8592;</button>
+<button id="next" aria-label="Next slide">&#8594;</button></div>
 <script>
 (function(){{
   var s=[].slice.call(document.querySelectorAll('#stage>section'));
