@@ -9944,6 +9944,8 @@ fn find_all_values_path(arg: &Bson) -> Result<Option<&str>, Fallback> {
         other => other,
     };
     let constant = match arg {
+        // The operand parses before the const check (RM-594).
+        Bson::String(s) if s == "$" => return crate::expr_parse::operand(arg).map(|_| None),
         Bson::String(s) if s.starts_with('$') => None,
         Bson::Document(d) if d.len() == 1 => d.get("$literal").or_else(|| d.get("$const")),
         Bson::Document(_) | Bson::Array(_) => None,
@@ -12770,6 +12772,7 @@ mod find_all_values_at_path_tests {
         assert_eq!(code(values(&doc! {}, bson!(1))), 9567004);
         assert_eq!(code(values(&doc! {}, Bson::Null)), 9567004);
         assert_eq!(code(values(&doc! {}, bson!("$a.b"))), 5511201);
+        assert_eq!(code(values(&doc! {}, bson!("$"))), 16872);
         assert_eq!(
             code(values(&doc! {}, bson!({"$concat": ["a", ".b"]}))),
             5511201
