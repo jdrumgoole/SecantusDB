@@ -628,15 +628,6 @@ These are explicit non-goals. Don't add them without a reason.
       Backlog-ID: RM-358
       Verify: none -- the mongot inputs need a mongot, and the unmeasured
       options have no measured answer yet to assert
-- [ ] **`$scoreFusion` combines by `"average"`, not `"avg"`.** mongod
-      8.2.11's `combination.method` is `"avg"` or `"expression"` (its IDL
-      enum, `kAvg: "avg"`) and refuses `"average"` with 2 (`Enumeration
-      value 'average' for field '$scoreFusion.combination.method' is not a
-      valid value.`); `"average"` is only the method's name in
-      `scoreDetails`. This server takes `"average"` and refuses `"avg"`
-      (`hybrid.rs`). Found 2026-11-12 (RM-358).
-      Verify: tests/backlog/test_rm_found_rm358.py::test_score_fusion_combines_by_avg
-      Backlog-ID: RM-553
 - [ ] **`test_a_write_while_an_index_builds` reads mongod's answer off a
       5 ms lock wait.** `tests/mongod_live/test_txn_catalog_changes.py`
       asserts mongod 8.2.11 refuses a transaction's insert while an index

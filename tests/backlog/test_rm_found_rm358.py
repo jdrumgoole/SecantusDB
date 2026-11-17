@@ -68,13 +68,13 @@ def test_an_explain_of_geo_near_runs(rust_mongo: Any, mongod: Any) -> None:
     assert answers["rust"] == answers["mongod"]
 
 
-@pytest.mark.backlog("RM-553")
+@pytest.mark.backlog_fixed("RM-553")
 def test_score_fusion_combines_by_avg(rust_mongo: Any, mongod: Any) -> None:
     """mongod 8.2.11's `$scoreFusion` takes `combination.method: "avg"`
     (its IDL enum, `kAvg: "avg"`) and refuses `"average"` with 2
     (`Enumeration value 'average' for field '$scoreFusion.combination.method'
-    is not a valid value.`). This server takes `"average"` and refuses
-    `"avg"` (found 2026-11-12, RM-358)."""
+    is not a valid value.`). This server took `"average"` and refused
+    `"avg"` (found 2026-11-12, RM-358; fixed 2026-11-16)."""
 
     def run(client: Any, method: str) -> Any:
         db = client["rm_found_rm358_avg"]
