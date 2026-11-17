@@ -796,11 +796,12 @@ fn shared_names(s: &pg_query::protobuf::SelectStmt) -> Vec<String> {
 /// The names of `s`'s FROM that an aliased JOIN hides and another FROM
 /// item reuses (`(fs join fe) as j, fs`), which PostgreSQL allows: the
 /// alias hides the sides' names, so the two never meet in one namespace.
-/// Only names every item of which is a table: their leaves are keyed apart
-/// (a joined row is keyed by its leaf's base, which would otherwise be the
-/// name for both); another kind of leaf is still refused by name.
+/// Only names every item of which is a leaf (a table, a subquery, a
+/// function): their leaves are keyed apart (a joined row is keyed by its
+/// leaf's base, which would otherwise be the name for both); a JOIN's own
+/// alias is still refused by name.
 fn hidden_reused_names(s: &pg_query::protobuf::SelectStmt) -> Vec<String> {
-    // (name, is a table, inside an aliased JOIN)
+    // (name, is a leaf, inside an aliased JOIN)
     fn walk(n: &pg_query::protobuf::Node, inside: bool, out: &mut Vec<(String, bool, bool)>) {
         match n.node.as_ref() {
             Some(N::RangeVar(r)) => {
@@ -826,7 +827,7 @@ fn hidden_reused_names(s: &pg_query::protobuf::SelectStmt) -> Vec<String> {
             }
             Some(N::RangeSubselect(rs)) => {
                 if let Some(a) = rs.alias.as_ref() {
-                    out.push((a.aliasname.clone(), false, inside));
+                    out.push((a.aliasname.clone(), true, inside));
                 }
             }
             Some(N::RangeFunction(rf)) => {
@@ -836,7 +837,7 @@ fn hidden_reused_names(s: &pg_query::protobuf::SelectStmt) -> Vec<String> {
                     .map(|a| a.aliasname.clone())
                     .or_else(|| range_function_name(rf))
                 {
-                    out.push((name, false, inside));
+                    out.push((name, true, inside));
                 }
             }
             _ => {}
@@ -851,7 +852,7 @@ fn hidden_reused_names(s: &pg_query::protobuf::SelectStmt) -> Vec<String> {
         let same: Vec<_> = items.iter().filter(|(n, _, _)| n == name).collect();
         if !out.contains(name)
             && same.len() > 1
-            && same.iter().all(|(_, table, _)| *table)
+            && same.iter().all(|(_, leaf, _)| *leaf)
             && same.iter().any(|(_, _, inside)| *inside)
         {
             out.push(name.clone());
@@ -2834,7 +2835,20 @@ fn leaf_with_names(
             format!("table name \"{alias}\" specified more than once"),
         ));
     }
-    hidden_reuse(aliases, alias)?;
+    // A subquery or function of a name an aliased JOIN hides and another
+    // item reuses is keyed apart, still named by the name, as a table leaf
+    // of such a name is (`build`'s RangeVar arm).
+    let base = if hidden_reused(alias) {
+        let n = REKEYED.with(|c| {
+            let n = c.get();
+            c.set(n + 1);
+            n
+        });
+        format!("{alias}\u{1d}{n}")
+    } else {
+        hidden_reuse(aliases, alias)?;
+        alias.to_string()
+    };
     aliases.push(alias.to_string());
     let mut scope = Scope {
         cols: Vec::new(),
@@ -2843,10 +2857,10 @@ fn leaf_with_names(
     };
     let mut columns = Vec::new();
     for (i, name) in names.iter().enumerate() {
-        let key = join_key(alias, name);
+        let key = join_key(&base, name);
         columns.push((key.clone(), fields[i].clone()));
         scope.cols.push(ScopeCol {
-            alias: alias.to_string(),
+            alias: base.clone(),
             name: name.clone(),
             key,
             pg_type: typed.columns[i].pg_type.clone(),

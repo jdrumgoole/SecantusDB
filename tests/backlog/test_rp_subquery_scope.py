@@ -434,14 +434,20 @@ def test_hidden_join_name_reused(query: str, dsn: str) -> None:
     assert answer(dsn, query) == HIDDEN_NAME_REUSED[query]
 
 
-# Found while working RP-469: only a table leaf is keyed apart, so a
-# subquery or function reusing the hidden name is still refused (0A000). RP-972.
+# Found while working RP-469: only a table leaf was keyed apart, so a
+# subquery or function reusing the hidden name was refused (0A000). RP-972
+# keys every leaf of such a name apart.
 HIDDEN_NAME_REUSED_BY_SUBQUERY = {
     "select * from (fs join fe using (a)) as j, (select 2 as z) fs": [(1, "y", "x", 2)],
+    "select * from (fs join fe using (a)) as j, generate_series(1,2) fs": [
+        (1, "y", "x", 1),
+        (1, "y", "x", 2),
+    ],
+    "select * from (fs join (select 1 as a) fe using (a)) as j, fe": [(1, "y", 1, "x")],
 }
 
 
-@pytest.mark.backlog("RP-972")
+@pytest.mark.backlog_fixed("RP-972")
 @pytest.mark.parametrize("query", list(HIDDEN_NAME_REUSED_BY_SUBQUERY))
 def test_hidden_join_name_reused_by_subquery(query: str, dsn: str) -> None:
     assert answer(dsn, query) == HIDDEN_NAME_REUSED_BY_SUBQUERY[query]

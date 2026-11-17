@@ -2090,17 +2090,6 @@ Measured on PostgreSQL 15.19 (the data-modifying WITH on a private cluster).
 
 ## Found while working RP-454 (2026-11-07)
 
-- [ ] **A subquery or function named as a table an aliased JOIN hides is
-      refused.** PostgreSQL 15.19 answers `select * from (fs join fe using
-      (a)) as j, (select 2 as z) fs` with `(1, 'y', 'x', 2)`. Here it is
-      0A000 `a FROM item named "fs" beside an aliased JOIN that hides that
-      name is not supported yet`. RP-469 keyed each TABLE leaf of such a
-      name apart (`hidden_reused_names`, a `\u{1d}<n>` key base); a
-      subquery or function leaf still keys by the name it is written as
-      (`leaf_with_names`, the RangeSubselect / RangeFunction arms), so the
-      refusal stays for any name one of those carries.
-      Verify: tests/backlog/test_rp_subquery_scope.py::test_hidden_join_name_reused_by_subquery
-      Backlog-ID: RP-972
 
 
 ## Found while working RP-479 (2026-11-08)
