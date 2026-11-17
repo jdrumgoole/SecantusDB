@@ -282,7 +282,7 @@ _PROFILED = {
 }
 
 
-@pytest.mark.backlog("RM-607")
+@pytest.mark.backlog_fixed("RM-607")
 def test_a_command_refused_as_it_runs_is_profiled_as_mongod_profiles_it(
     rust_mongo: Any, mongod_rs: Any
 ) -> None:
@@ -291,8 +291,9 @@ def test_a_command_refused_as_it_runs_is_profiled_as_mongod_profiles_it(
     or with an undefined `$$variable`, no `createIndexes` refused for a
     spec, no `create` refused for its capped options, no write to a
     `system.` namespace it does not take, no `explain` of an `insert`, no
-    `dbStats` of `scale: 0`. This server does each the other way. (Each is
-    run, and logged, on both.)"""
+    `dbStats` of `scale: 0`. This server did the distinct, findAndModify
+    `$$variable`, createIndexes, create, system-namespace and explain cases
+    the other way until RM-607. (Each is run, and logged, on both.)"""
     answers = {
         name: (_ran(rust_mongo, False, on, cmd)[3], _ran(mongod_rs, True, on, cmd)[3])
         for name, (on, cmd) in _PROFILED.items()

@@ -784,19 +784,6 @@ These are explicit non-goals. Don't add them without a reason.
       Found while working RM-604, 2026-11-17.
       Verify: tests/backlog/test_rm_found_rm604.py::test_an_empty_densify_range_or_fill_output_is_refused_as_mongod_refuses_it
       Backlog-ID: RM-716
-- [ ] **A command refused as it runs is profiled where mongod's is not,
-      and the other way.** mongod 8.2.11 profiles a `distinct` refused for
-      its fields; it profiles no `findAndModify` with neither `update` nor
-      `remove` or with an undefined `$$variable`, no `createIndexes`
-      refused for a spec, no `create` refused for its capped options, no
-      write to a `system.` namespace it does not take, no `explain` of an
-      `insert`, no `dbStats` of `scale: 0`; and it profiles a
-      `$querySettings` stage refused for a field. This server does each the
-      other way (`profiler::refused_unprofiled` reads the reply's message
-      for some of these). Each is run, and logged, on both. Found while
-      working RM-386, 2026-11-13.
-      Verify: tests/backlog/test_rm_found_rm386.py::test_a_command_refused_as_it_runs_is_profiled_as_mongod_profiles_it
-      Backlog-ID: RM-607
 - [ ] **Operations this server runs another way than mongod's plan say
       less.** Since RM-023 a read or a write's read that a stream runs as
       mongod's plan counts its keys and documents examined, and since
