@@ -6666,8 +6666,10 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
     ),
     # Still open (RP-978): a hashed side read through its index on a range
     # of the key.
+    # The hashed side read through its key's index is a path the unique
+    # key's merge and nested loops weigh too (RP-978, fixed).
     "a range on the hashed side's key reads it through its index": (
-        "RP-978",
+        "RP-978:fixed",
         _ANALYSED,
         "explain select * from e join k on k.a = e.a where k.a < 10",
         [

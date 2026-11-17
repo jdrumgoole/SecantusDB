@@ -3335,8 +3335,14 @@ impl PgHandler {
             })
             .collect();
         let key_indexed = !leading.is_empty();
-        let key_index = if key_indexed && index.is_none() {
-            self.key_index_by(table, filter, nd, scan.2, |ix| {
+        // The side read through the one index leading with its key: that
+        // scan is the side's ordered path, and the index probed by the
+        // other side's key carries the WHERE's quals beside the join's
+        // (`Index Cond: ((a = e.a) AND (a < 10))`, RP-978).
+        let reads_key_index =
+            matches!(leading.as_slice(), [ix] if index.as_deref() == Some(ix.name.as_str()));
+        let key_index = if key_indexed && (index.is_none() || reads_key_index) {
+            self.key_index_by(table, filter, nd, scan.2, reads_key_index, |ix| {
                 (
                     ix.field == field,
                     ix.columns[1..].iter().any(|c| c == field),
@@ -3415,7 +3421,7 @@ impl PgHandler {
         key: &AnalysedKey,
         rows: f64,
     ) -> Option<KeyIndex> {
-        self.key_index_by(table, &Document::new(), key.ndistinct, rows, |ix| {
+        self.key_index_by(table, &Document::new(), key.ndistinct, rows, false, |ix| {
             (ix.columns == columns, false)
         })
     }
@@ -3428,6 +3434,7 @@ impl PgHandler {
         filter: &Document,
         ndistinct: f64,
         rows: f64,
+        key_quals: bool,
         pick: impl Fn(&costsize::Index) -> (bool, bool),
     ) -> Option<KeyIndex> {
         let count = self
@@ -3448,7 +3455,15 @@ impl PgHandler {
             // An index holding it at the other position is a path not
             // priced here.
             let (here, there) = pick(ix);
-            if quals.iter().any(|(f, _)| ix.columns.contains(f)) || there {
+            // With `key_quals`, the WHERE's quals on a one-column index's
+            // key are its index quals, beside the join's equality.
+            let key_qual =
+                |f: &String| key_quals && here && ix.columns.len() == 1 && *f == ix.field;
+            if quals
+                .iter()
+                .any(|(f, _)| ix.columns.contains(f) && !key_qual(f))
+                || there
+            {
                 return None;
             }
             if !here {
@@ -8066,6 +8081,9 @@ fn unique_key_other_paths(
             return Some(out);
         }
         let k = s.key_index.as_ref()?;
+        // A side read through its key's index already scans it in the
+        // key's order: no whole-index scan beside it (RP-978).
+        let by_key = s.index.is_some() && s.index == s.key_index_name;
         // The Memoize over it is keyed on the other side's column: its
         // statistics, or a table never analysed's defaults (RP-1019).
         if !other.no_stats {
@@ -8077,7 +8095,11 @@ fn unique_key_other_paths(
             &k.quals,
             costsize::ColSel::Ndistinct(k.ndistinct),
         );
-        out.push(InPath::scan(st, tt, s.scan.2, Some(CLASS)));
+        if by_key {
+            out[0] = InPath::scan(s.scan.0, s.scan.1, s.scan.2, Some(CLASS));
+        } else {
+            out.push(InPath::scan(st, tt, s.scan.2, Some(CLASS)));
+        }
         // `get_parameterized_baserel_size`: the WHERE's selectivity and the
         // clause's (`var_eq_non_const`), at most the rows.
         let ppi_rows = costsize::clamp_row_est(k.rel.tuples * k.where_sel / k.ndistinct.max(1.0))
