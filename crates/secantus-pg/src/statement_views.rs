@@ -83,3 +83,23 @@ impl Drop for ViewedCall {
         }
     }
 }
+
+/// A write whose RETURNING runs subqueries, for the span of its writes:
+/// PostgreSQL computes RETURNING under the statement's snapshot, so a
+/// subquery there reads the table as it was before the statement wrote it
+/// (RP-943). The writes are recorded as a call's are, and RETURNING,
+/// projected after the guard is dropped, lays the rows as they were over
+/// its reads.
+pub(crate) fn hide_own_writes(
+    h: &PgHandler,
+    returning: Option<&secantus_pgplan::Returning>,
+) -> Option<ViewedCall> {
+    returning
+        .is_some_and(|r| {
+            r.casts
+                .iter()
+                .flatten()
+                .any(secantus_pgplan::correlated::has_correlated)
+        })
+        .then(|| ViewedCall::enter(h))
+}

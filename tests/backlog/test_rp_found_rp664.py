@@ -506,8 +506,8 @@ def test_a_delete_returning_subquery_reads_a_using_item_as_it_was_before_the_del
 
 # Found while working RP-686. A subquery in RETURNING correlated to the
 # target row runs under the statement's snapshot on PostgreSQL, so a table
-# it reads is as it was before the statement's own writes; here it runs
-# after them.
+# it reads is as it was before the statement's own writes; here it ran
+# after them until RP-943.
 RETURNING_SNAPSHOT = {
     "delete from t668 returning (select count(*) from t668 z where z.a = t668.a)": (
         [(1,), (1,), (1,)],
@@ -524,7 +524,7 @@ RETURNING_SNAPSHOT = {
 }
 
 
-@pytest.mark.backlog("RP-943")
+@pytest.mark.backlog_fixed("RP-943")
 @pytest.mark.parametrize("query", list(RETURNING_SNAPSHOT))
 def test_a_returning_subquery_reads_the_statement_snapshot(query: str, dsn: str) -> None:
     assert _scoped_answer(dsn, query) == RETURNING_SNAPSHOT[query]

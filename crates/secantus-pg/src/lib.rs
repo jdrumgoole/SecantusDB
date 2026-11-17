@@ -43653,6 +43653,7 @@ impl PgHandler {
 
             Statement::Insert(mut ins) => {
                 self.refuse_matview_write(&ins.table)?;
+                let own_writes = statement_views::hide_own_writes(self, ins.returning.as_ref());
                 if self.is_system_catalog(&ins.table)? {
                     return Err(Self::catalog_write_refused(&ins.table));
                 }
@@ -43846,6 +43847,7 @@ impl PgHandler {
                     // defaults included -- and tags the response `INSERT 0 n`
                     // with the row count pgwire appends.
                     Some(returning) => {
+                        drop(own_writes);
                         let mut response = self.project_rows(
                             ins.rows,
                             &def,
@@ -49922,6 +49924,7 @@ impl PgHandler {
 
             Statement::Update(mut upd) => {
                 self.refuse_matview_write(&upd.table)?;
+                let own_writes = statement_views::hide_own_writes(self, upd.returning.as_ref());
                 upd.filter =
                     self.resolve_current_of(&upd.table, std::mem::take(&mut upd.filter))?;
                 if let Some(matched) = self.system_catalog_update(&upd)? {
@@ -50249,6 +50252,7 @@ impl PgHandler {
                 if let Some(returning) = upd.returning.as_ref() {
                     let def = def
                         .ok_or_else(|| Self::err(&PlanError::UndefinedTable(upd.table.clone())))?;
+                    drop(own_writes);
                     let mut response = self.project_rows(
                         returned,
                         &def,
@@ -50275,6 +50279,7 @@ impl PgHandler {
 
             Statement::Delete(mut del) => {
                 self.refuse_matview_write(&del.table)?;
+                let own_writes = statement_views::hide_own_writes(self, del.returning.as_ref());
                 del.filter =
                     self.resolve_current_of(&del.table, std::mem::take(&mut del.filter))?;
                 if self.is_system_catalog(&del.table)? {
@@ -50342,6 +50347,7 @@ impl PgHandler {
                     self.after_delete_rows(def, &kept)?;
                     self.fire_statement_triggers(&def.name, "AFTER", "DELETE")?;
                     if let Some(returning) = del.returning.as_ref() {
+                        drop(own_writes);
                         let mut response = self.project_rows(
                             kept,
                             def,
@@ -50393,6 +50399,7 @@ impl PgHandler {
                     let def = self
                         .lookup(&del.table)
                         .ok_or_else(|| Self::err(&PlanError::UndefinedTable(del.table.clone())))?;
+                    drop(own_writes);
                     let mut response = self.project_rows(
                         doomed,
                         &def,

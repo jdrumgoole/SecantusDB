@@ -2270,26 +2270,6 @@ nothing. The gap tests are in `tests/backlog/test_rp_found_rp750.py`.
       Verify: tests/backlog/test_rp_found_rp750.py::test_type_input_function_is_callable_by_name
       Backlog-ID: RP-953
 
-## Found while working RP-686 (2026-11-14)
-
-Measured on a private PostgreSQL 15.19 cluster with the `_SCOPE_SETUP` in
-`tests/backlog/test_rp_found_rp664.py`.
-
-- [ ] **A correlated subquery in RETURNING reads the table after the
-      write.** `delete from t668 returning (select count(*) from t668 z
-      where z.a = t668.a)` is 1 per row on PostgreSQL 15.19, `update t668
-      set b = 100 returning (select z.b from t668 z where z.a = t668.a)`
-      returns each row's OLD `b`, and `insert into t668 values (9, 9)
-      returning (select count(*) from t668 z where z.a <= t668.a)` is 3:
-      RETURNING's subqueries run under the statement's snapshot, which
-      does not see the statement's own writes. Here they are 0, the new
-      `b` (100) and 4: a subquery correlated to the target row runs once
-      per returned row after the rows are written. (A subquery that reads
-      only an UPDATE's FROM or a DELETE's USING items is evaluated before
-      the write since RP-686, and reads the snapshot.)
-      Verify: tests/backlog/test_rp_found_rp664.py::test_a_returning_subquery_reads_the_statement_snapshot
-      Backlog-ID: RP-943
-
 ## Found while working RP-570 (2026-11-08)
 
 Measured on a private PostgreSQL 15.19 cluster with `create domain d570c as
