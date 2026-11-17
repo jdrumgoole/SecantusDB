@@ -5742,15 +5742,27 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "        ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=4)",
         ],
     ),
-    # Still open: a regex with a back reference, whose prefix walk is not
-    # modelled, prints zeros.
+    # Part of RP-423, fixed: a regex with a back reference, whose prefix
+    # walk was not modelled, printed zeros. The walk reads `\1` as a copy
+    # of the group, as the regex compiler does (prefix `ww`).
     "estimate of a regex match with a back reference": (
-        "RP-423",
+        "RP-423:fixed",
         _ANALYSED_STRINGS,
         "explain select * from w where c ~ '^(w)\\1'",
         [
             "Seq Scan on w  (cost=0.00..18.50 rows=1 width=10)",
             "  Filter: (c ~ '^(w)\\1'::text)",
+        ],
+    ),
+    # Still open: a regex with a group repeated at least once, whose prefix
+    # walk is not modelled, prints zeros.
+    "estimate of a regex match with a repeated group": (
+        "RP-423",
+        _ANALYSED_STRINGS,
+        "explain select * from w where c ~ '^(w0)+1'",
+        [
+            "Seq Scan on w  (cost=0.00..18.50 rows=101 width=10)",
+            "  Filter: (c ~ '^(w0)+1'::text)",
         ],
     ),
     # Still open: a LIKE's ESCAPE is a `like_escape` call PostgreSQL folds

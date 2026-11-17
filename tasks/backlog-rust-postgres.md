@@ -1928,7 +1928,8 @@ a regression test.
       `explain_join_patterns`). Still zeros: a call of a function whose
       overloads differ in `procost`; a regex whose prefix walk is not
       modelled (a group repeated other than at most once, an anchor inside
-      a group, a back reference, embedded options). Since 2026-11-17 an
+      a group, embedded options). A back reference is walked as a copy of
+      the group it names since 2026-11-17, as the regex compiler copies it. Since 2026-11-17 an
       inner ON join whose WHERE pushes expression comparisons to its sides
       prices each side as that scan's residual
       (`ExplainOptions::join_expr_quals`, `hash_side_with`), and since
@@ -1937,12 +1938,12 @@ a regression test.
       reads; since 2026-11-17 a LEFT join whose WHERE compares only
       preserved-side expressions (`preserved_exprs`), and an inner ON
       join whose WHERE holds inequalities over both tables, its Join
-      Filter (`where_join_filters`). A regex with a back reference
-      (`select * from w where c ~ '^(w)\1'`) is `Seq Scan on w
-      (cost=0.00..18.50 rows=1 width=10)` there and zeros here. Measured
+      Filter (`where_join_filters`). A regex with a repeated group
+      (`select * from w where c ~ '^(w0)+1'`) is `Seq Scan on w
+      (cost=0.00..18.50 rows=101 width=10)` there and zeros here. Measured
       on the 15.19 reference on port 5415 (found while working RP-404 and
       RP-354).
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[estimate of a regex match with a back reference]
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[estimate of a regex match with a repeated group]
       Backlog-ID: RP-423
 - [ ] **A call over constants in a WHERE is not folded in EXPLAIN.**
       `eval_const_expressions` folds an immutable call whose arguments are
@@ -2980,3 +2981,21 @@ statement is VALUES-only and runs there as written. The gap test is in
 `tests/backlog/test_rp_found_rp849.py`.
 
 
+
+## Found while working RP-423 (2026-11-17)
+
+Measured on PostgreSQL 15.19 (the shared reference on port 5415): every
+statement is VALUES-only and runs there as written. The gap test is in
+`tests/backlog/test_rp_found_rp423.py`.
+
+- [ ] **A back reference is an invalid regex outside a WHERE.** `select
+      'abab' ~ '(ab)\1'` is `t` on PostgreSQL 15.19, `regexp_replace('abab',
+      '(ab)\1', 'X')` is `X` and `regexp_match('xabab', '(ab)\1')` is
+      `{ab}`. Here each is 2201B `invalid regular expression`: the scalar
+      evaluator and the regex builtins compile with the linear `regex`
+      crate, which refuses a back reference (the "backreferences are not
+      supported" parse error). A WHERE over a table column matches, through
+      `secantus-core`'s backtracking fallback, and since RP-423 the
+      planner's selectivity estimate falls back the same way.
+      Verify: tests/backlog/test_rp_found_rp423.py::test_a_back_reference_outside_a_where
+      Backlog-ID: RP-1022

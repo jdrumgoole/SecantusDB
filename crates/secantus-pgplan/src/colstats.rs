@@ -684,13 +684,28 @@ impl Column<'_> {
         } else {
             like_fixed_prefix(pattern.as_bytes(), insensitive, self.c_collation)
         };
-        // The regex a regex match runs as (`eval_pattern_match_const`).
+        // The regex a regex match runs as (`eval_pattern_match_const`): the
+        // linear engine, or for a back reference, which it refuses, the
+        // backtracking one.
+        enum Compiled {
+            Linear(regex::Regex),
+            Backtracking(fancy_regex::Regex),
+        }
         let compiled = if regex {
+            let source = crate::scalar::pg_regex_source(pattern);
             Some(
-                regex::RegexBuilder::new(&crate::scalar::pg_regex_source(pattern))
+                match regex::RegexBuilder::new(&source)
                     .case_insensitive(insensitive)
                     .build()
-                    .ok()?,
+                {
+                    Ok(re) => Compiled::Linear(re),
+                    Err(_) => Compiled::Backtracking(
+                        fancy_regex::RegexBuilder::new(&source)
+                            .case_insensitive(insensitive)
+                            .build()
+                            .ok()?,
+                    ),
+                },
             )
         } else {
             None
@@ -698,7 +713,9 @@ impl Column<'_> {
         let matches = |v: &[u8]| -> Option<bool> {
             let v = std::str::from_utf8(v).ok()?;
             match &compiled {
-                Some(re) => Some(re.is_match(v)),
+                Some(Compiled::Linear(re)) => Some(re.is_match(v)),
+                // A backtracking limit reached is not modelled.
+                Some(Compiled::Backtracking(re)) => re.is_match(v).ok(),
                 None => crate::like_match::like_match(v, pattern, Some('\\'), insensitive).ok(),
             }
         };
@@ -904,7 +921,7 @@ fn regex_fixed_prefix(
 }
 
 /// One atom of a regex, as [`regex_prefix`] reads it, with its bounds.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 enum ReAtom {
     /// One character: a state with one out-arc whose color, outside a
     /// case-insensitive match of a cased letter, is that character alone.
@@ -931,8 +948,9 @@ type QuantifiedAtom = (ReAtom, u32, Option<u32>);
 /// regex is not anchored, alternates at its top, or fixes no first
 /// character. `None` for a regex whose NFA this does not model: a group
 /// repeated other than at most once, a constraint or anchor anywhere but
-/// a leading `^` and a trailing `$`, a back reference, a numeric
-/// character escape, embedded options or a director.
+/// a leading `^` and a trailing `$`, a back reference to a group not
+/// yet closed or quantified, a numeric character escape, embedded
+/// options or a director.
 fn regex_prefix(patt: &str, insensitive: bool, c_ctype: bool) -> Option<(String, PrefixStatus)> {
     let chars: Vec<char> = patt.chars().collect();
     if patt.starts_with("***") || patt.starts_with("(?") {
@@ -962,7 +980,7 @@ fn regex_prefix(patt: &str, insensitive: bool, c_ctype: bool) -> Option<(String,
     };
     let body = &chars[1..chars.len() - usize::from(exact_end)];
     let mut pos = 0;
-    let alternatives = regex_atoms(body, &mut pos)?;
+    let alternatives = regex_atoms(body, &mut pos, &mut Vec::new())?;
     if pos != body.len() {
         return None;
     }
@@ -1100,9 +1118,15 @@ fn regex_has_bare(chars: &[char], c: char, top: bool) -> bool {
 /// The alternatives of a regex's text from `*pos` to its end or the `)`
 /// closing the group it is inside, each its atoms with their quantifiers'
 /// bounds. `None` for what [`regex_prefix`] does not model.
-fn regex_atoms(chars: &[char], pos: &mut usize) -> Option<Vec<Vec<QuantifiedAtom>>> {
+fn regex_atoms(
+    chars: &[char],
+    pos: &mut usize,
+    captures: &mut Vec<Option<Vec<Vec<QuantifiedAtom>>>>,
+) -> Option<Vec<Vec<QuantifiedAtom>>> {
     let mut alternatives = Vec::new();
     let mut atoms: Vec<QuantifiedAtom> = Vec::new();
+    // The capturing group the last atom pushed is, if it is one.
+    let mut last_capture: Option<usize> = None;
     while *pos < chars.len() {
         let c = chars[*pos];
         let atom = match c {
@@ -1120,6 +1144,12 @@ fn regex_atoms(chars: &[char], pos: &mut usize) -> Option<Vec<Vec<QuantifiedAtom
                     return None;
                 }
                 (last.1, last.2) = (min, max);
+                // A back reference to a quantified group is not modelled.
+                if let Some(i) = last_capture.take() {
+                    if (min, max) != (1, Some(1)) {
+                        captures[i] = None;
+                    }
+                }
                 // A non-greedy quantifier's NFA is the greedy one's.
                 if chars.get(*pos) == Some(&'?') {
                     *pos += 1;
@@ -1131,18 +1161,27 @@ fn regex_atoms(chars: &[char], pos: &mut usize) -> Option<Vec<Vec<QuantifiedAtom
             }
             '(' => {
                 *pos += 1;
-                if chars.get(*pos) == Some(&'?') {
+                // Groups are numbered by their opening parenthesis.
+                let capture = if chars.get(*pos) == Some(&'?') {
                     if chars.get(*pos + 1) != Some(&':') {
                         return None;
                     }
                     *pos += 2;
-                }
-                let inner = regex_atoms(chars, pos)?;
+                    None
+                } else {
+                    captures.push(None);
+                    Some(captures.len() - 1)
+                };
+                let inner = regex_atoms(chars, pos, captures)?;
                 if chars.get(*pos) != Some(&')') {
                     return None;
                 }
                 *pos += 1;
+                if let Some(i) = capture {
+                    captures[i] = Some(inner.clone());
+                }
                 atoms.push((ReAtom::Group(inner), 1, Some(1)));
+                last_capture = capture;
                 continue;
             }
             '.' => {
@@ -1153,6 +1192,20 @@ fn regex_atoms(chars: &[char], pos: &mut usize) -> Option<Vec<Vec<QuantifiedAtom
             '\\' => {
                 let e = *chars.get(*pos + 1)?;
                 *pos += 2;
+                // A back reference: the regex compiler copies the NFA of
+                // the group it names in its place (`parseqatom`'s
+                // BACKREF, then `pg_regprefix` walks the copy). One
+                // digit only, naming a group already closed and not
+                // quantified.
+                if let Some(n) = e.to_digit(10).filter(|n| *n > 0) {
+                    if chars.get(*pos).is_some_and(|c| c.is_ascii_digit()) {
+                        return None;
+                    }
+                    let copy = captures.get(n as usize - 1)?.clone()?;
+                    atoms.push((ReAtom::Group(copy), 1, Some(1)));
+                    last_capture = None;
+                    continue;
+                }
                 match e {
                     'd' | 'D' | 's' | 'S' | 'w' | 'W' => ReAtom::Set,
                     'a' => ReAtom::Char('\u{7}'),
@@ -1174,6 +1227,7 @@ fn regex_atoms(chars: &[char], pos: &mut usize) -> Option<Vec<Vec<QuantifiedAtom
             }
         };
         atoms.push((atom, 1, Some(1)));
+        last_capture = None;
     }
     alternatives.push(atoms);
     Some(alternatives)
@@ -1707,10 +1761,23 @@ mod tests {
             ("a|^b", false, Some(("", NoMatch))),
             ("^a$|^b$", false, Some(("", NoMatch))),
             // Not modelled: a group repeated at least once (`^(ab)+c` is
-            // `a`, `^a(b)+` is `ab`), an anchor inside, a back reference.
+            // `a`, `^a(b)+` is `ab`), an anchor inside, a back reference to an
+            // unclosed group.
             ("^(ab)+c", false, None),
             ("(^a)", false, None),
             ("^a\\1", false, None),
+            // A back reference is a copy of the group it names, as
+            // PostgreSQL 15.19's index conditions show.
+            (r"^(w)\1", false, Some(("ww", Partial))),
+            (r"^a(b)\1c", false, Some(("abbc", Partial))),
+            (r"^a(b)c\1d", false, Some(("abcbd", Partial))),
+            (r"^(ab)\1x", false, Some(("ababx", Partial))),
+            (r"^(a)\1$", false, Some(("aa", Exact))),
+            (r"^a(b*)\1c", false, Some(("a", Partial))),
+            (r"^a(b|c)\1d", false, Some(("a", Partial))),
+            (r"^a(b)x(c)\2\1", false, Some(("abxccb", Partial))),
+            (r"^a(?:b)(c)\1", false, Some(("abcc", Partial))),
+            (r"^a(b)?\1", false, None),
         ] {
             let got = regex_prefix(pattern, insensitive, true);
             let got = got.as_ref().map(|(p, s)| (p.as_str(), *s));
