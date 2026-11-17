@@ -457,6 +457,16 @@ pub fn read_attributes(request: &Document, reply: &Document, ctx: &CommandContex
             out.insert("queryFramework", framework);
         }
         spills(exec.is_some_and(|e| e.has_sort_stage), &mut out);
+        // How the read chose its plan (RM-599): mongod prints each flag
+        // only when it is true.
+        if let Some(planned) = ctx.planned {
+            if planned.from_multi_planner {
+                out.insert("fromMultiPlanner", true);
+            }
+            if planned.from_plan_cache {
+                out.insert("fromPlanCache", true);
+            }
+        }
         if let (true, Some(micros)) = (plans(name), ctx.planning_micros) {
             out.insert("planningTimeMicros", micros);
         }

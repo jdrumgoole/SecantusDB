@@ -813,14 +813,6 @@ These are explicit non-goals. Don't add them without a reason.
       Measured 2026-10-27, 2026-11-07, 2026-11-10 and 2026-11-13.
       Backlog-ID: RM-363
       Verify: tests/backlog/test_rm_355_364.py::test_a_contested_aggregate_that_does_not_stream_counts_what_it_examined, tests/backlog/test_rm_355_364.py::test_a_time_series_read_made_whole_counts_what_it_examined
-- [ ] **A line says nothing of how its plan was chosen.** mongod 8.2.11's
-      `Slow query` line for a read whose plan its trial chose says
-      `fromMultiPlanner: true` (and `fromPlanCache: true` for one that ran
-      the cache's active plan); this server's line carries neither, though
-      `explain/order.rs` notes both for `$queryStats`
-      (`opdebug::note_planned`). Found while working RM-363, 2026-11-13.
-      Verify: tests/backlog/test_rm_found_rm363.py::test_a_contested_read_says_it_was_multi_planned
-      Backlog-ID: RM-599
 - [ ] **A time-series read bounded on its time field is not a clustered
       scan of its buckets.** mongod 8.2.11's line for a `find({t: {$gt:
       <date>}})` of a time-series collection, with no index serving the
