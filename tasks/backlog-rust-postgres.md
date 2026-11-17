@@ -1947,7 +1947,16 @@ a regression test.
       (`select * from w where c ~ '^(w0)+1'`) is `Seq Scan on w
       (cost=0.00..18.50 rows=101 width=10)` there and zeros here. Measured
       on the 15.19 reference on port 5415 (found while working RP-404 and
-      RP-354).
+      RP-354). The repeated group's prefix is not a walk of the regex's
+      text: `pg_regprefix` reads the NFA after `regc_nfa.c`'s `optimize`
+      (`fixempties`, state merging), and a capturing group's `x{m,n}` is
+      first rewritten `x{m-1,n-1}x` (`parseqatom`). The prefixes 15.19
+      gives (an index's `Index Cond` over a `"C"` column): `^(w0)+1` `w`,
+      `^(ab)+a` `a`, `^a+a` `a`, `^(ab){2,}c` `ab`, `^a{3,}` `a`,
+      `^(ab){1,3}` none -- `^(ab){2,}c` stops short of what a hand walk of
+      `repeat`'s arcs gives (`aba`). The faithful fix ports `regcomp.c` /
+      `regc_nfa.c`'s NFA build and optimisation and runs `findprefix` on
+      it (2026-11-17, sized while working RP-841).
       Verify: tests/backlog/test_rp_explain_costs.py::test_plan[estimate of a regex match with a repeated group]
       Backlog-ID: RP-423
 - [ ] **A call over constants in a WHERE is not folded in EXPLAIN.**
@@ -2950,16 +2959,22 @@ its first input gave.
       a constant, a VALUES list, one user table's stored columns through a
       WHERE the selectivity model covers, a nested set operation, an inner
       join of user tables whose every clause is a column equality (ON or
-      WHERE) with no WHERE besides (`join_input_estimate`; three or more
+      WHERE) with no WHERE besides but (since 2026-11-17, over tables never
+      analysed) comparisons of one side's column with a constant, each
+      side's rows its scan's (`join_input_estimate`; three or more
       tables, `join_chain_input_estimate`, only over tables never
       analysed, each equivalence class's members joined in table order),
-      an aggregate over one user table with no HAVING, grouped by
-      plain columns or not, and (since 2026-11-17) a DISTINCT over any of
-      those leaves, its rows its groups. It leaves any other input -- a
-      join with a WHERE, a chain over an analysed table, a HAVING (whose
-      rows PostgreSQL scales by the qual's selectivity in `cost_agg`, 1/3
-      for `max(x) > 0`), a GROUP BY expression, a computed column, a FROM
-      subquery other than VALUES, a catalog -- in the written order,
+      an aggregate over one user table, grouped by plain columns or not,
+      and (since 2026-11-17) a DISTINCT over any of those leaves, its rows
+      its groups, and an aggregate's HAVING over aggregates, its groups
+      scaled by the qual's default selectivity as `cost_agg` scales them
+      (`having_selectivity`; two inequalities over one aggregate, a range
+      pair, are not modelled). It leaves any other input -- a join with a
+      WHERE over an analysed table, a chain over an analysed table, a
+      HAVING over a grouping column (which PostgreSQL
+      moves to the WHERE), a GROUP BY expression, a computed column, a FROM
+      subquery other than VALUES or a plain select over one user table
+      (pulled up since 2026-11-17, `pull_up_simple_subquery`), a catalog -- in the written order,
       hashed. Measured on
       the 15.19 reference on port 5415.
       Verify: tests/backlog/test_rp_found_rp692.py::test_an_intersect_over_another_unestimated_input_puts_the_smaller_input_first
@@ -3007,3 +3022,13 @@ statement is VALUES-only and runs there as written. The gap test is in
       planner's selectivity estimate falls back the same way.
       Verify: tests/backlog/test_rp_found_rp423.py::test_a_back_reference_outside_a_where
       Backlog-ID: RP-1022
+- [ ] **`clamp_row_est` rounds a half away from zero.** PostgreSQL 15.19's
+      `clamp_row_est` is `rint`, ties to even: `select max(x) from hv group
+      by k having max(x) <> 5` over 300 groups (`hv(x numeric, k int)`,
+      3,000 rows, `k = g % 300`, analysed) is `HashAggregate (... rows=298
+      ...)`, 300 x 0.995 = 298.5. `costsize::clamp_row_est` uses
+      `f64::round`, which makes it 299; every estimate that lands on an
+      exact half with an even integer part is one row high. Measured on
+      the 15.19 reference on port 5415.
+      Verify: none -- no EXPLAIN this server prints reaches an exact half yet (its HashAggregate over a HAVING prints zeros); `setop_order::tests::having_selectivity_is_postgres` notes the case
+      Backlog-ID: RP-1023

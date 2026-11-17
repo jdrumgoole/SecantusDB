@@ -200,22 +200,72 @@ def test_an_intersect_over_a_distinct_input_puts_the_smaller_input_first(dsn: st
     assert got == [("1.000",)]
 
 
+@pytest.mark.backlog_fixed("RP-841")
+def test_an_intersect_over_a_having_input_puts_the_smaller_input_first(dsn: str) -> None:
+    """`select max(x) from t692j group by k having max(x) > 0 intersect
+    select 1.000` is `1.000` on PostgreSQL 15.19: `cost_agg` scales the
+    groups by the HAVING's selectivity (1/3 for an inequality over an
+    aggregate), still more than the constant's one. Here it was `1.0`: an
+    aggregate with a HAVING was not estimated."""
+    with _connect(dsn) as c:
+        got = _text(
+            c, "select max(x) from t692j group by k having max(x) > 0 intersect select 1.000"
+        )
+    assert got == [("1.000",)]
+
+
+@pytest.mark.backlog_fixed("RP-841")
+def test_an_intersect_over_a_join_with_a_where_puts_the_smaller_input_first(dsn: str) -> None:
+    """`select a.x from t692j a join t692j b on a.k = b.k where a.x > 0
+    intersect select 1.000` is `1.000` on PostgreSQL 15.19: the join's
+    rows are its sides' scans' rows (the WHERE's default selectivity on
+    one) times `eqjoinsel`, its groups more than the constant's one. Here
+    it was `1.0`: a join with a WHERE was not estimated."""
+    with _connect(dsn) as c:
+        got = _text(
+            c,
+            "select a.x from t692j a join t692j b on a.k = b.k where a.x > 0"
+            " intersect select 1.000",
+        )
+    assert got == [("1.000",)]
+
+
+@pytest.mark.backlog_fixed("RP-841")
+@pytest.mark.parametrize(
+    "query",
+    [
+        "select x from (select x from t692j) s intersect select 1.000",
+        "select x from (select x, k from t692j where k > 0 order by k) s intersect select 1.000",
+    ],
+    ids=["from subquery", "from subquery with a where and an order by"],
+)
+def test_an_intersect_over_a_from_subquery_puts_the_smaller_input_first(
+    dsn: str, query: str
+) -> None:
+    """Each is `1.000` on PostgreSQL 15.19: the plain subquery is pulled up
+    (`pull_up_simple_subquery`) and estimated as the scan it reads. Here it
+    was `1.0`: a FROM subquery other than VALUES was not estimated."""
+    with _connect(dsn) as c:
+        got = _text(c, query)
+    assert got == [("1.000",)]
+
+
 @pytest.mark.backlog("RP-841")
 @pytest.mark.parametrize(
     "query",
     [
-        "select max(x) from t692j group by k having max(x) > 0 intersect select 1.000",
-        "select a.x from t692j a join t692j b on a.k = b.k where a.x > 0 intersect select 1.000",
+        "select x * 1 from t692j group by x * 1 intersect select 1.000",
+        "select x from t692j group by x having x > 0 intersect select 1.000",
     ],
-    ids=["having", "join with a where"],
+    ids=["group by expression", "having over a grouping column"],
 )
 def test_an_intersect_over_another_unestimated_input_puts_the_smaller_input_first(
     dsn: str, query: str
 ) -> None:
     """Each is `1.000` on PostgreSQL 15.19: the input's estimated groups
     outnumber the constant's one, so the constant is the HashSetOp's first
-    input. Here a HAVING, a DISTINCT and a join with a WHERE are not
-    estimated, so the left input stays first."""
+    input. Here a GROUP BY expression and a HAVING over a
+    grouping column are not estimated, so the left input stays first."""
     with _connect(dsn) as c:
         got = _text(c, query)
     assert got == [("1.000",)]

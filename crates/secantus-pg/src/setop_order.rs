@@ -29,8 +29,8 @@
 //! over its select list on its own row estimate, and a nested set
 //! operation's are its rows, as are a DISTINCT leaf's. An input this
 //! server does not estimate -- a join with a WHERE, a WHERE the
-//! selectivity model does not cover, a HAVING, a FROM subquery other than
-//! VALUES, a catalog -- leaves the left input first, as before (RP-841).
+//! selectivity model does not cover, a FROM subquery other than VALUES
+//! or a plain select over one user table, a catalog -- leaves the left input first, as before (RP-841).
 
 use super::*;
 use pgwire::api::results::FieldInfo;
@@ -192,7 +192,6 @@ impl PgHandler {
                     || agg.join.is_some()
                     || agg.series.is_some()
                     || agg.grouping_sets.is_some()
-                    || agg.having.is_some()
                     || agg.limit.is_some()
                     || agg.offset != 0
                     || agg.distinct
@@ -206,6 +205,11 @@ impl PgHandler {
                     let fields: Vec<String> =
                         agg.group_by.iter().map(|k| k.field.clone()).collect();
                     self.distinct_groups(&agg.table, &agg.filter, &fields)?
+                };
+                // `cost_agg` scales the groups by the HAVING's selectivity.
+                let rows = match &agg.having {
+                    Some(h) => costsize::clamp_row_est(rows * having_selectivity(h, false)?),
+                    None => rows,
                 };
                 Some(InputEstimate { rows, groups: rows })
             }
@@ -256,8 +260,34 @@ impl PgHandler {
             // RTE_VALUES, whose Vars `get_variable_numdistinct` takes as
             // unique; a set-returning function's rows are not a VALUES
             // list (`typmods` is `None`).
-            let secantus_pgplan::Statement::ValuesConstant(vc) = sub.plan.as_ref() else {
-                return None;
+            //
+            // A plain subquery over a user table is pulled up
+            // (`pull_up_simple_subquery`): the leaf is the inner select,
+            // reading the stored columns the outer one names.
+            let vc = match sub.plan.as_ref() {
+                secantus_pgplan::Statement::ValuesConstant(vc) => vc,
+                secantus_pgplan::Statement::Select(inner) => {
+                    if !sel.filter.is_empty() || inner.sub.is_some() || inner.lock.is_some() {
+                        return None;
+                    }
+                    let columns = fields
+                        .iter()
+                        .map(|f| {
+                            let i = sub.def.columns.iter().position(|c| &c.field() == f)?;
+                            if inner.casts.get(i).is_some_and(Option::is_some) {
+                                return None;
+                            }
+                            inner.columns.get(i).cloned()
+                        })
+                        .collect::<Option<Vec<_>>>()?;
+                    let mut pulled = inner.clone();
+                    pulled.casts = vec![None; columns.len()];
+                    pulled.sort_input = vec![false; columns.len()];
+                    pulled.columns = columns;
+                    pulled.order.clear();
+                    return self.select_input_estimate(&pulled);
+                }
+                _ => return None,
             };
             vc.typmods.as_ref()?;
             if !sel.filter.is_empty() {
@@ -354,6 +384,75 @@ impl PgHandler {
             .unwrap_or(2.0);
         (work_mem_kb as f64 * multiplier * 1024.0).floor()
     }
+}
+
+/// `clauselist_selectivity` of a HAVING over aggregates, `negated` under
+/// a NOT, which `negate_clause` pushes down (`NOT max(x) > 0` is `max(x)
+/// <= 0`). An aggregate or an expression over the groups has no
+/// statistics: a comparison with a constant is `DEFAULT_INEQ_SEL` for an
+/// inequality, `1 / DEFAULT_NUM_DISTINCT` for `=` (`var_eq_const`) and its
+/// complement for `<>`, a null test `DEFAULT_UNK_SEL` or its complement.
+/// `None` for a grouping column's test, which `subquery_planner` moves to
+/// the WHERE, a comparison with NULL, or an operator not listed.
+fn having_selectivity(h: &secantus_pgplan::Having, negated: bool) -> Option<f64> {
+    use secantus_pgplan::{Having, OutputCol};
+    const DEFAULT_INEQ_SEL: f64 = 1.0 / 3.0;
+    const DEFAULT_EQ_SEL: f64 = 1.0 / 200.0;
+    const DEFAULT_UNK_SEL: f64 = 0.005;
+    let over_groups = |c: &OutputCol| matches!(c, OutputCol::Agg(_) | OutputCol::Expr(_));
+    Some(match h {
+        Having::Compare { subject, op, value } => {
+            if !over_groups(subject) || matches!(value, Bson::Null) {
+                return None;
+            }
+            match (op.as_str(), negated) {
+                ("<" | "<=" | ">" | ">=", _) => DEFAULT_INEQ_SEL,
+                ("=", false) | ("<>", true) => DEFAULT_EQ_SEL,
+                ("<>", false) | ("=", true) => 1.0 - DEFAULT_EQ_SEL,
+                _ => return None,
+            }
+        }
+        Having::IsNull {
+            subject,
+            negated: n,
+        } => {
+            if !over_groups(subject) {
+                return None;
+            }
+            if *n != negated {
+                1.0 - DEFAULT_UNK_SEL
+            } else {
+                DEFAULT_UNK_SEL
+            }
+        }
+        Having::Not(inner) => having_selectivity(inner, !negated)?,
+        // `clauselist_selectivity`'s product; an OR is
+        // `clause_selectivity`'s `s1 + s2 - s1 * s2`, term by term.
+        Having::And(terms) | Having::Or(terms) => {
+            let and = matches!(h, Having::And(_)) != negated;
+            // Two inequalities over one subject are a range pair
+            // (`addRangeClause`), not modelled.
+            if and {
+                let mut seen = Vec::new();
+                for t in terms {
+                    if let Having::Compare { subject, op, .. } = t {
+                        if matches!(op.as_str(), "<" | "<=" | ">" | ">=") {
+                            if seen.contains(&subject) {
+                                return None;
+                            }
+                            seen.push(subject);
+                        }
+                    }
+                }
+            }
+            let mut sel = if and { 1.0 } else { 0.0 };
+            for t in terms {
+                let s2 = having_selectivity(t, negated)?;
+                sel = if and { sel * s2 } else { sel + s2 - sel * s2 };
+            }
+            sel
+        }
+    })
 }
 
 /// The groups of a VALUES list's columns of `types` over `rows` rows:
@@ -502,6 +601,52 @@ fn compare_fractional_path_costs(a: (f64, f64), b: (f64, f64), fraction: f64) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A HAVING over 300 groups scaled as PostgreSQL 15.19's HashAggregate
+    /// estimate shows it (`group by k having ...` over 3,000 analysed rows).
+    #[test]
+    fn having_selectivity_is_postgres() {
+        use secantus_pgplan::{Having, OutputCol};
+        let cmp = |op: &str, slot: usize| Having::Compare {
+            subject: OutputCol::Agg(slot),
+            op: op.into(),
+            value: Bson::Int32(5),
+        };
+        let null = |negated| Having::IsNull {
+            subject: OutputCol::Agg(0),
+            negated,
+        };
+        let rows =
+            |h: &Having| having_selectivity(h, false).map(|s| costsize::clamp_row_est(300.0 * s));
+        let sel = |h: &Having| having_selectivity(h, false).unwrap();
+        let close = |a: f64, b: f64| (a - b).abs() < 1e-12;
+        assert_eq!(rows(&cmp(">", 0)), Some(100.0));
+        // 300 x 0.005 = 1.5 is 2 and 300 x 0.995 = 298.5 is 298 there, by
+        // `rint` (RP-1023), so these compare the selectivities.
+        assert!(close(sel(&cmp("=", 0)), 0.005));
+        assert!(close(sel(&cmp("<>", 0)), 0.995));
+        assert!(close(sel(&null(false)), 0.005));
+        assert!(close(sel(&null(true)), 0.995));
+        assert_eq!(
+            rows(&Having::And(vec![cmp(">", 0), cmp("<", 1)])),
+            Some(33.0)
+        );
+        assert_eq!(
+            rows(&Having::Or(vec![cmp(">", 0), cmp("<", 1)])),
+            Some(167.0)
+        );
+        // `NOT max(x) > 0` is `max(x) <= 0`.
+        assert_eq!(rows(&Having::Not(Box::new(cmp(">", 0)))), Some(100.0));
+        // A range pair over one aggregate is not modelled.
+        assert_eq!(rows(&Having::And(vec![cmp(">", 0), cmp("<", 0)])), None);
+        // A grouping column's test moves to the WHERE.
+        let group = Having::Compare {
+            subject: OutputCol::Group(0),
+            op: ">".into(),
+            value: Bson::Int32(5),
+        };
+        assert_eq!(rows(&group), None);
+    }
 
     #[test]
     fn a_few_groups_hash_without_spilling() {
