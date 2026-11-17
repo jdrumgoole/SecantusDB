@@ -773,14 +773,6 @@ These are explicit non-goals. Don't add them without a reason.
       Found while working RM-589, 2026-11-17.
       Verify: tests/backlog/test_rm_view_namespaces.py::test_a_transaction_statement_counts_the_transactions_locks
       Backlog-ID: RM-715
-- [ ] **A `$collStats` of a view is refused.** mongod 8.2.11 answers a
-      `$collStats: {}` or `{latencyStats: {}}` stage of a view (one
-      document, `ns`, `host`, `localTime`, and `latencyStats` when asked),
-      and refuses `count`, `storageStats` and `queryExecStats` (166); this
-      server refuses every `$collStats` of a view. Found while working
-      RM-488, 2026-11-13.
-      Verify: tests/backlog/test_rm_view_namespaces.py::test_a_coll_stats_stage_of_a_view_answers
-      Backlog-ID: RM-590
 - [ ] **A `$merge` into a view is not profiled.** mongod 8.2.11 refuses it
       (166) and profiles the `aggregate` under the collection it reads
       (`<db>.c`, `ok: 0`); this server writes no entry. Found while

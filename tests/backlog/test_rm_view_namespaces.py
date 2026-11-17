@@ -476,10 +476,10 @@ def _coll_stats_of_view(client: Any) -> list:
     return got
 
 
-@pytest.mark.backlog("RM-590")
+@pytest.mark.backlog_fixed("RM-590")
 def test_a_coll_stats_stage_of_a_view_answers(rust_mongo: Any, mongod_rs: Any) -> None:
     """mongod 8.2.11 answers a `$collStats: {}` or `{latencyStats: {}}` of a
-    view, and refuses `count` and `storageStats` (166); this server refuses
+    view, and refuses `count` and `storageStats` (166); this server refused
     every `$collStats` of a view."""
     got = {s: _coll_stats_of_view(c) for s, c in (("rust", rust_mongo), ("mongod", mongod_rs))}
     assert got["mongod"] == [

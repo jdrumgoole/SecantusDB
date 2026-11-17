@@ -246,7 +246,22 @@ pub(crate) fn refusal(name: &str, doc: &Document, ctx: &CommandContext) -> Optio
                     Some("$changeStream") if ctx.replica_set_name.is_some() => {
                         return Some(unsupported(not_a_collection(&ns)));
                     }
-                    Some("$collStats") => return Some(executor(not_a_collection(&ns))),
+                    // mongod answers a view's `$collStats: {}` and its
+                    // `latencyStats`, and refuses the statistics only a
+                    // collection keeps (RM-590, measured 8.2.11).
+                    Some("$collStats")
+                        if pipeline
+                            .first()
+                            .and_then(Bson::as_document)
+                            .and_then(|s| s.get_document("$collStats").ok())
+                            .is_some_and(|spec| {
+                                ["count", "storageStats", "queryExecStats"]
+                                    .iter()
+                                    .any(|k| spec.contains_key(*k))
+                            }) =>
+                    {
+                        return Some(executor(not_a_collection(&ns)));
+                    }
                     _ => {}
                 }
             }

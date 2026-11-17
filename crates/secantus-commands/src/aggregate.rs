@@ -685,9 +685,12 @@ pub fn aggregate(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
             // namespace this server derives (`system.views`, a time-series
             // collection's buckets) is listed as the collection mongod
             // keeps, not read as the view it is here.
-            let derived = first_stage_has(&pipeline, crate::list_catalog::STAGE)
-                && (c == "system.views"
-                    || crate::ts_buckets::bucketed(storage, &ctx.db_name, c).is_some());
+            // A `$collStats` of a view reports the view's own namespace, never
+            // resolved to the collection beneath it (RM-590, measured 8.2.11).
+            let derived = first_stage_has(&pipeline, "$collStats")
+                || first_stage_has(&pipeline, crate::list_catalog::STAGE)
+                    && (c == "system.views"
+                        || crate::ts_buckets::bucketed(storage, &ctx.db_name, c).is_some());
             let asked: &str = c;
             let (base_coll, mut pipeline) = if derived {
                 (c.clone(), pipeline)
