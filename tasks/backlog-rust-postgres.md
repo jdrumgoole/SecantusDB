@@ -1277,16 +1277,6 @@ private 15.19 cluster:
       Verify: tests/backlog/test_rp_found_rp929.py::test_analyze_and_vacuum_record_a_hash_indexs_size
       Backlog-ID: RP-954
 
-- [ ] **OPEN — `pg_relation_size` of a hash index is 0.** Built on an
-      empty `(a int, b text)` table one is 6 pages, 49152 on PostgreSQL
-      15.19, and one split by 3,000 rows 18 pages, 147456;
-      `pg_indexes_size` of a table with two of the first is 98304.
-      `secantusd-pg` answers 0, 0 and 16384: `size_call_here` reads the
-      B-tree, GIN and GiST models and estimates any other index, where
-      the hash metapage model has the pages (`Meta::pages`).
-      Verify: tests/backlog/test_rp_found_rp929.py::test_a_hash_index_has_its_pages
-      Backlog-ID: RP-955
-
 - [ ] **OPEN — a hash index has no overflow pages.** 1,000 rows of one
       key, all in one bucket: PostgreSQL 15.19 chains overflow pages to
       the full bucket (`_hash_addovflpage`) and records 12 pages;

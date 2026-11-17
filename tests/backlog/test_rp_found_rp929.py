@@ -36,14 +36,15 @@ def test_analyze_and_vacuum_record_a_hash_indexs_size(pg: Any) -> None:
     assert pg.execute(SIZE.format("rp929m_h")).fetchall() == [(18, 2000.0)]
 
 
-@pytest.mark.backlog("RP-955")
+@pytest.mark.backlog_fixed("RP-955")
 def test_a_hash_index_has_its_pages(pg: Any) -> None:
     """`pg_relation_size` of a hash index is its blocks: 6 pages (49152)
     built on an empty `(a int, b text)` table, and 18 (147456) once 3,000
     rows have split a 10-page one; `pg_indexes_size` of the first table,
     with two of them, 98304. `secantusd-pg` answered 0 for each index and
     16384 for the table (2026-11-14): the size functions read the B-tree,
-    GIN and GiST models, and estimate any other index."""
+    GIN and GiST models, and estimated any other index. They now read the
+    hash metapage model too (RP-955)."""
     pg.execute("DROP TABLE IF EXISTS rp929s")
     pg.execute("DROP TABLE IF EXISTS rp929g")
     pg.execute("CREATE TABLE rp929s (a int, b text)")

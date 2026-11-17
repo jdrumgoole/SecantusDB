@@ -27,7 +27,8 @@ pub(crate) struct HashShape {
     /// Its `fillfactor` (75 unless `WITH` gave one), which its builds read.
     pub(crate) fillfactor: u32,
     /// Whether its key's hash is reproduced, so SERIALIZABLE can name its
-    /// buckets. One that is not still has its size recorded at a build.
+    /// buckets. One that is not still keeps its metapage, whose tuple
+    /// count splits it and so sizes it.
     pub(crate) modelled: bool,
     /// A partial index's WHERE, planned: only a row it holds true for is
     /// indexed. An expression index's is already in its stored field, which
@@ -414,19 +415,17 @@ impl crate::PgHandler {
             }
             let (meta, indexed) = self.hash_build(table, &shape);
             sizes.push((shape.name.clone(), meta.pages() as u32, indexed as f64));
-            if shape.modelled {
-                metas()
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .insert((self.hash_store(), self.db().to_string(), shape.oid), meta);
-            }
+            metas()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert((self.hash_store(), self.db().to_string(), shape.oid), meta);
         }
         sizes
     }
 
     /// TRUNCATE: each hash index starts empty, as `hashbuildempty` leaves it.
     pub(crate) fn hash_truncated(&self, table: &str) {
-        for shape in self.hash_shapes(table) {
+        for shape in self.hash_index_shapes(table) {
             with_meta(
                 self.hash_store(),
                 self.db(),
@@ -440,18 +439,20 @@ impl crate::PgHandler {
     /// VACUUM's index pass (`hashbulkdelete`): each hash index's tuple count
     /// becomes the tuples left, its rows with a key.
     pub(crate) fn hash_bulk_delete(&self, table: &str) {
-        for shape in self.hash_shapes(table) {
-            let left = self
-                .storage
-                .count_matching(
-                    self.db(),
-                    table,
-                    &bson::doc! { shape.field.clone(): { "$ne": Bson::Null } },
-                    None,
-                )
-                .unwrap_or(0);
+        for shape in self.hash_index_shapes(table) {
+            let left = self.hash_indexed(table, &shape);
             self.with_hash_meta(table, &shape, |m| m.ntuples = left as f64);
         }
+    }
+
+    /// The pages of `table`'s hash index `index` (`RelationGetNumberOfBlocks`),
+    /// `None` when it is not a hash index.
+    pub(crate) fn hash_pages(&self, table: &str, index: &str) -> Option<u32> {
+        let shape = self
+            .hash_index_shapes(table)
+            .into_iter()
+            .find(|s| s.name == index)?;
+        Some(self.with_hash_meta(table, &shape, |m| m.pages() as u32))
     }
 
     /// New tuple versions of `table` that are not heap-only, into each hash
@@ -466,8 +467,21 @@ impl crate::PgHandler {
         if versions.is_empty() {
             return Ok(());
         }
-        for shape in self.hash_shapes(table) {
+        for shape in self.hash_index_shapes(table) {
             for (doc, _, _) in versions {
+                if !shape.modelled {
+                    // Its key's hash is not reproduced, so no bucket: only
+                    // the count, which is what splits it.
+                    let keyed = !matches!(doc.get(&shape.field), None | Some(Bson::Null))
+                        && shape.predicate.as_ref().is_none_or(|p| {
+                            secantus_pgplan::apply_row_expr(p, doc).ok()
+                                == Some(Bson::Boolean(true))
+                        });
+                    if keyed {
+                        self.with_hash_meta(table, &shape, Meta::insert);
+                    }
+                    continue;
+                }
                 let Some(hashkey) = shape.hashkey(doc) else {
                     continue;
                 };

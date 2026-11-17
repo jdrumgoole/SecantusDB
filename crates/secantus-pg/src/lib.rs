@@ -22056,7 +22056,9 @@ impl PgHandler {
         if let Some(ix) = index {
             let pages = match self.btree_size(&ix.table.name, &ix.name)? {
                 Some((p, _, _)) => Some(p),
-                None => self.am_pages(&ix.table.name, &ix.name),
+                None => self
+                    .am_pages(&ix.table.name, &ix.name)
+                    .or_else(|| self.hash_pages(&ix.table.name, &ix.name)),
             };
             let bytes = pages.map_or(0, |p| i64::from(p) * PAGE);
             return Ok(Bson::Int64(match name {
@@ -22110,6 +22112,11 @@ impl PgHandler {
             }
             for shape in self.am_shapes(&rel) {
                 if let Some(p) = self.am_pages(&rel, shape.name()) {
+                    out.push(i64::from(p) * PAGE);
+                }
+            }
+            for shape in self.hash_index_shapes(&rel) {
+                if let Some(p) = self.hash_pages(&rel, &shape.name) {
                     out.push(i64::from(p) * PAGE);
                 }
             }
