@@ -543,9 +543,6 @@ _DIVERGING_WRITES = {
     "findAndModify": lambda d: _w1(d).find_one_and_update({"_id": 1}, {"$set": {"q": 1}}),
     "findAndModify that removes": lambda d: _w1(_plain(d)).find_one_and_delete({"_id": 1}),
     "$out": lambda d: list(_w1(_plain(d)).aggregate([{"$match": {}}, {"$out": "o"}])),
-    # A statement of a transaction prints `{}`; its entry has the
-    # transaction's locks.
-    "insert in a transaction": lambda d: _in_transaction(d),
 }
 
 
@@ -562,6 +559,17 @@ def test_more_writes_report_mongods_locks(rust_mongo: Any, mongod_rs: Any, name:
     take yet."""
     answers = _write_locks(rust_mongo, mongod_rs, _DIVERGING_WRITES[name])
     assert answers["mongod"]
+    assert answers["rust"] == answers["mongod"]
+
+
+@pytest.mark.backlog_fixed("RM-357")
+def test_a_transaction_statement_line_prints_no_locks(rust_mongo: Any, mongod_rs: Any) -> None:
+    """mongod 8.2.11 prints `locks: {}` on the line of a statement of a
+    multi-document transaction, which runs on the transaction's stashed
+    locker (measured 2026-11-07). This server printed the statement's
+    global, database and collection IX."""
+    answers = _write_locks(rust_mongo, mongod_rs, _in_transaction)
+    assert answers["mongod"] == [("insert", {}, None)]
     assert answers["rust"] == answers["mongod"]
 
 

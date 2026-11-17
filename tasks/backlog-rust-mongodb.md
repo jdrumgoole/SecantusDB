@@ -601,8 +601,9 @@ These are explicit non-goals. Don't add them without a reason.
       - each global lock taken apart takes an execution ticket, so where
         these locks differ the line's `queues.execution` admissions differ
         too (RM-355);
-      - a statement of a transaction shows `{}` on mongod's line and the
-        transaction's initial locks in its entry;
+      - a statement of a transaction shows the transaction's initial locks
+        in its profile entry on mongod (its line prints `{}` here too since
+        2026-11-17); the entry is not compared yet;
       - a collectionless `aggregate` takes no lock of its own since
         2026-11-09, as on mongod, but one whose `$lookup` or `$unionWith`
         reads a collection takes the global IS three times on mongod's line

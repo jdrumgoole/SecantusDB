@@ -545,7 +545,17 @@ pub fn read_attributes(request: &Document, reply: &Document, ctx: &CommandContex
     }
     out.insert("numYields", secantus_core::deadline::yields());
     out.insert("reslen", response_length(reply, ctx));
-    out.insert("locks", ctx.op_locks.clone().unwrap_or_default());
+    // A statement of a multi-document transaction runs on the transaction's
+    // stashed locker, so mongod's line prints `locks: {}` (its profile entry
+    // keeps the transaction's locks; measured 8.2.11 2026-11-07, RM-357).
+    let locks = if request.get("autocommit") == Some(&Bson::Boolean(false))
+        && !matches!(name, "commitTransaction" | "abortTransaction")
+    {
+        Document::new()
+    } else {
+        ctx.op_locks.clone().unwrap_or_default()
+    };
+    out.insert("locks", locks);
     if let Some(fc) = crate::opdebug::flow_control(ctx.flow_control_tickets) {
         out.insert("flowControl", fc);
     }
