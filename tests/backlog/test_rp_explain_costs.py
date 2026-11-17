@@ -1700,7 +1700,7 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
     # every node's targetlist too, the filtered scan's qual prefixed, and
     # the scan under the Hash returns the select list's column first.
     "a join with a where prints its output under verbose": (
-        "RP-966",
+        "RP-966:fixed",
         _ANALYSED,
         "explain verbose select e.b, k.b from e join k on e.a = k.a where e.b = 'v1'",
         [
@@ -1714,6 +1714,99 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "        ->  Seq Scan on public.e  (cost=0.00..17.50 rows=100 width=7)",
             "              Output: e.b, e.a",
             "              Filter: (e.b = 'v1'::text)",
+        ],
+    ),
+    # Measured on PostgreSQL 15.19: the hashed side's restriction is its
+    # scan's Filter, prefixed; a column only the WHERE reads is not needed
+    # above the scan, so the Hash returns the join key alone.
+    "a join with a where on the hashed side prints its output under verbose": (
+        "RP-966:fixed",
+        _ANALYSED,
+        "explain verbose select e.b, k.b from e join k on e.a = k.a where k.b = 'v1'",
+        [
+            "Hash Join  (cost=18.75..36.39 rows=100 width=6)",
+            "  Output: e.b, k.b",
+            "  Inner Unique: true",
+            "  Hash Cond: (e.a = k.a)",
+            "  ->  Seq Scan on public.e  (cost=0.00..15.00 rows=1000 width=7)",
+            "        Output: e.a, e.b",
+            "  ->  Hash  (cost=17.50..17.50 rows=100 width=7)",
+            "        Output: k.b, k.a",
+            "        ->  Seq Scan on public.k  (cost=0.00..17.50 rows=100 width=7)",
+            "              Output: k.b, k.a",
+            "              Filter: (k.b = 'v1'::text)",
+        ],
+    ),
+    "a join with a where on both sides prints its output under verbose": (
+        "RP-966:fixed",
+        _ANALYSED,
+        "explain verbose select e.b from e join k on e.a = k.a where e.b = 'v1' and k.b = 'v2'",
+        [
+            "Hash Join  (cost=18.75..36.51 rows=10 width=3)",
+            "  Output: e.b",
+            "  Inner Unique: true",
+            "  Hash Cond: (e.a = k.a)",
+            "  ->  Seq Scan on public.e  (cost=0.00..17.50 rows=100 width=7)",
+            "        Output: e.a, e.b",
+            "        Filter: (e.b = 'v1'::text)",
+            "  ->  Hash  (cost=17.50..17.50 rows=100 width=4)",
+            "        Output: k.a",
+            "        ->  Seq Scan on public.k  (cost=0.00..17.50 rows=100 width=4)",
+            "              Output: k.a",
+            "              Filter: (k.b = 'v2'::text)",
+        ],
+    ),
+    # Measured on PostgreSQL 15.19: the computed key is a resjunk entry the
+    # scan computes, and the Sort printed it parenthesised.
+    "explain verbose of a sort on a computed key": (
+        "RP-966:fixed",
+        _ANALYSED,
+        "explain verbose select a from k order by a+1",
+        [
+            "Sort  (cost=67.33..69.83 rows=1000 width=8)",
+            "  Output: a, ((a + 1))",
+            "  Sort Key: ((k.a + 1))",
+            "  ->  Seq Scan on public.k  (cost=0.00..17.50 rows=1000 width=8)",
+            "        Output: a, (a + 1)",
+        ],
+    ),
+    # Measured on PostgreSQL 15.19: a nested loop with a WHERE prints both
+    # scans' and its own Output, the Filter and Index Cond prefixed.
+    "explain verbose of a nested loop with a where": (
+        "RP-966",
+        _ANALYSED,
+        "explain verbose select * from e join k on k.a > e.a where e.b = 'v1'",
+        [
+            "Nested Loop  (cost=0.28..1000.75 rows=33333 width=14)",
+            "  Output: e.a, e.b, k.a, k.b",
+            "  ->  Seq Scan on public.e  (cost=0.00..17.50 rows=100 width=7)",
+            "        Output: e.a, e.b",
+            "        Filter: (e.b = 'v1'::text)",
+            "  ->  Index Scan using k_pkey on public.k  (cost=0.28..6.50 rows=333 width=7)",
+            "        Output: k.a, k.b",
+            "        Index Cond: (k.a > e.a)",
+        ],
+    ),
+    # Measured on PostgreSQL 15.19: the key deparsed, not its slot's name.
+    "a computed sort key through an alias prints its expression": (
+        "RP-1035",
+        _ANALYSED,
+        "explain select a from k x order by x.a*2",
+        [
+            "Sort  (cost=67.33..69.83 rows=1000 width=8)",
+            "  Sort Key: ((a * 2))",
+            "  ->  Seq Scan on k x  (cost=0.00..17.50 rows=1000 width=8)",
+        ],
+    ),
+    # Measured on PostgreSQL 15.19: the shared entry is computed once.
+    "a sort on a computed key under a computed select list is priced": (
+        "RP-1036",
+        _ANALYSED,
+        "explain select a+1 from k order by a+1",
+        [
+            "Sort  (cost=67.33..69.83 rows=1000 width=4)",
+            "  Sort Key: ((a + 1))",
+            "  ->  Seq Scan on k  (cost=0.00..17.50 rows=1000 width=4)",
         ],
     ),
     # Measured on PostgreSQL 15.19: the inner side is unique whichever

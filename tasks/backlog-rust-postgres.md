@@ -1760,24 +1760,26 @@ a regression test.
       equalities with no WHERE prints every node's `Output` and its `Inner
       Unique`, and a nested loop of two relations whose inner side is a
       parameterised index scan prints both scans' physical `Output` and the
-      `Index Cond` prefixed (RP-966, in part:
+      `Index Cond` prefixed, and since 2026-11-17 such a hash join with a
+      WHERE whose conjuncts each read one relation prints them as its
+      scans' `Filter`, prefixed (RP-966, in part:
       `ruleutils::explain_verbose_join`, `explain::attach_verbose_join`,
       `explain::attach_verbose_nested_loop`). Every other join does not:
       PostgreSQL 15.19 prints a Merge Join's, its Materialize's and
       Memoize's `Output` likewise, and a nested loop's `Join Filter`
-      prefixed; here the plain plan. Nor does a join with a WHERE (its
-      scans' quals prefixed, and the scan under the Hash returns its
-      `needed` columns in `reltarget` order, select list first: `Output:
-      e.b, e.a`), an ON that is not column comparisons, or three or more
-      relations; nor a Sort on a computed key (`order by a+1`
-      prints `Output: a, ((a + 1))` and `Sort Key: ((k.a + 1))` over a scan
-      whose `Output: a, (a + 1)`): `attach_verbose` declines a key that is
-      not a bare column. Where to build it: every node's targetlist
+      prefixed; here the plain plan. Nor does a nested loop with a WHERE,
+      a WHERE conjunct reading both relations, an ON that is not column
+      comparisons, or three or more
+      relations (since 2026-11-17 a Sort on a computed key over one
+      relation prints its resjunk entry, `Output: a, ((a + 1))` and `Sort
+      Key: ((k.a + 1))` over a scan whose `Output: a, (a + 1)`). A nested
+      loop with a WHERE prints the plain plan where PostgreSQL 15.19 prints
+      both scans' `Output` and the `Filter` prefixed. Where to build it: every node's targetlist
       deparsed (`show_plan_tlist`, prefixed when the range table holds more
       than one relation; a node under a Hash, Sort or Material returns only
       the columns needed above, `CP_SMALL_TLIST`), its quals and keys
       printed with `unqualified = false`.
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a join with a where prints its output under verbose]
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[explain verbose of a nested loop with a where]
       Backlog-ID: RP-966
 
 
@@ -2089,17 +2091,6 @@ Measured on PostgreSQL 15.19 (the data-modifying WITH on a private cluster).
 
 ## Found while working RP-454 (2026-11-07)
 
-- [ ] **A subquery or function named as a table an aliased JOIN hides is
-      refused.** PostgreSQL 15.19 answers `select * from (fs join fe using
-      (a)) as j, (select 2 as z) fs` with `(1, 'y', 'x', 2)`. Here it is
-      0A000 `a FROM item named "fs" beside an aliased JOIN that hides that
-      name is not supported yet`. RP-469 keyed each TABLE leaf of such a
-      name apart (`hidden_reused_names`, a `\u{1d}<n>` key base); a
-      subquery or function leaf still keys by the name it is written as
-      (`leaf_with_names`, the RangeSubselect / RangeFunction arms), so the
-      refusal stays for any name one of those carries.
-      Verify: tests/backlog/test_rp_subquery_scope.py::test_hidden_join_name_reused_by_subquery
-      Backlog-ID: RP-972
 
 
 ## Found while working RP-479 (2026-11-08)
@@ -2917,6 +2908,29 @@ statement is VALUES-only and runs there as written. The gap test is in
       Backlog-ID: RP-1023
 
 ## Found while working RP-966 (2026-11-17)
+
+- [ ] **A computed ORDER BY key written through an alias prints its
+      synthetic name.** `explain select a from k x order by x.a*2` prints
+      `Sort Key: __order0`; PostgreSQL 15.19 prints `Sort Key: ((a * 2))`
+      (the unaliased `order by a*2` already does). The plain plan's key
+      text is not deparsed against the alias's range-table entry.
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a computed sort key through an alias prints its expression]
+      Backlog-ID: RP-1035
+
+- [ ] **A Sort on a computed key is priced in one shape only.** Since
+      2026-11-17 (RP-966) a Sort straight over one relation's scan whose
+      computed keys are operator expressions over the select list's
+      columns is priced, each key a resjunk entry of the scan's target
+      list (its operators' `cpu_operator_cost` per row, its type's width).
+      Still `cost=0.00..0.00`: a select list with a computed entry (`select
+      a+1 from k order by a+1`, PostgreSQL 15.19 `Sort (cost=67.33..69.83
+      rows=1000 width=4)` over `Seq Scan (cost=0.00..17.50 ...)`), a LIMIT
+      above the Sort, a key that calls a function (`order by lower(b)`,
+      `width=36`), and a key reading a column the select list does not
+      return. `sort_key_cost` and the Sort pricing in `lib.rs` (RP-318)
+      decline them.
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a sort on a computed key under a computed select list is priced]
+      Backlog-ID: RP-1036
 
 - [ ] **A join on an expression key PostgreSQL prices is unpriced in
       three shapes.** Since RP-981 a join of two analysed tables on one

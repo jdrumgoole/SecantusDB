@@ -6442,7 +6442,6 @@ pub(crate) fn computed_reads(sel: &secantus_pgplan::Select) -> Vec<String> {
 
 pub(crate) fn target_cost(sel: &secantus_pgplan::Select) -> Option<(f64, i64, Vec<String>)> {
     use secantus_pgplan::ColumnExpr;
-    const CPU_OPERATOR_COST: f64 = 0.0025;
     let (mut cost, mut width, mut fields) = (0.0, 0, Vec::new());
     for (i, (_, field)) in sel.columns.iter().enumerate() {
         match sel.casts.get(i).and_then(Option::as_ref) {
@@ -6450,28 +6449,68 @@ pub(crate) fn target_cost(sel: &secantus_pgplan::Select) -> Option<(f64, i64, Ve
             Some(ColumnExpr::Const { result_type, .. }) => {
                 width += type_width(result_type, -1);
             }
-            Some(ColumnExpr::Row {
-                expr,
-                fields: read,
-                params,
-                result_type,
-                ..
-            }) => {
-                if read.iter().any(|(_, _, t)| {
-                    secantus_pgplan::pgtypes::oid_of_name(t).is_none_or(|oid| oid >= 10000)
-                }) || secantus_pgplan::pgtypes::oid_of_name(result_type)
-                    .is_none_or(|oid| oid >= 10000)
-                {
-                    return None;
-                }
-                let (ops, _) = row_expr_ops(expr, params.len())?;
-                cost += f64::from(ops) * CPU_OPERATOR_COST;
-                width += type_width(result_type, -1);
+            Some(e @ ColumnExpr::Row { .. }) => {
+                let (c, w) = row_entry_cost(e)?;
+                cost += c;
+                width += w;
             }
             Some(_) => return None,
         }
     }
     Some((cost, width, fields))
+}
+
+/// `(per-row cost, width)` of one computed target entry over built-in
+/// types (RP-333): each operator one `cpu_operator_cost`, the width its
+/// type's `get_typavgwidth`. `None` for any entry not priced.
+fn row_entry_cost(e: &secantus_pgplan::ColumnExpr) -> Option<(f64, i64)> {
+    let secantus_pgplan::ColumnExpr::Row {
+        expr,
+        fields: read,
+        params,
+        result_type,
+        ..
+    } = e
+    else {
+        return None;
+    };
+    if read
+        .iter()
+        .any(|(_, _, t)| secantus_pgplan::pgtypes::oid_of_name(t).is_none_or(|oid| oid >= 10000))
+        || secantus_pgplan::pgtypes::oid_of_name(result_type).is_none_or(|oid| oid >= 10000)
+    {
+        return None;
+    }
+    let (ops, _) = row_expr_ops(expr, params.len())?;
+    Some((
+        f64::from(ops) * costsize::CPU_OPERATOR_COST,
+        type_width(result_type, -1),
+    ))
+}
+
+/// `(per-row cost, width)` the ORDER BY's computed keys add to the scan
+/// under its Sort (RP-966): each is a resjunk entry of the scan's target
+/// list (`make_sort_input_target` leaves it to the scan), priced as a
+/// select-list expression. `None` where a key is not priced, or reads a
+/// column the select list does not return (whose width the scan would add).
+pub(crate) fn sort_key_cost(sel: &secantus_pgplan::Select) -> Option<(f64, i64)> {
+    let (mut cost, mut width) = (0.0, 0);
+    for k in &sel.order {
+        let Some(e) = &k.expr else { continue };
+        let secantus_pgplan::ColumnExpr::Row { fields, .. } = e else {
+            return None;
+        };
+        if !fields
+            .iter()
+            .all(|(_, f, _)| sel.columns.iter().any(|(_, c)| c == f))
+        {
+            return None;
+        }
+        let (c, w) = row_entry_cost(e)?;
+        cost += c;
+        width += w;
+    }
+    Some((cost, width))
 }
 
 #[cfg(test)]

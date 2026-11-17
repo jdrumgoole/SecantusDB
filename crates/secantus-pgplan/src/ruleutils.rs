@@ -6430,6 +6430,9 @@ pub struct VerboseScan {
     pub refname: String,
     /// The relation's columns, as printed.
     pub columns: Vec<String>,
+    /// Each ORDER BY key that is not a bare column (RP-966): its text
+    /// unqualified, as the scan's resjunk `Output` entry, and qualified.
+    pub sort_exprs: Vec<(String, String)>,
 }
 
 /// [`VerboseScan`] for a SELECT over one relation; `None` for any other
@@ -6500,6 +6503,21 @@ pub fn explain_verbose_scan(
             quals.push((plain, p.buf));
         }
     }
+    let mut sort_exprs = Vec::new();
+    for sort in &s.sort_clause {
+        let Some(N::SortBy(sb)) = sort.node.as_ref() else {
+            return None;
+        };
+        let key = sb.node.as_deref()?;
+        if matches!(key.node.as_ref(), Some(N::ColumnRef(_) | N::AConst(_))) {
+            continue;
+        }
+        let mut u = printer(true);
+        u.expr(key)?;
+        let mut qd = printer(false);
+        qd.expr(key)?;
+        sort_exprs.push((u.buf, qd.buf));
+    }
     let suffix = alias.map(|a| format!(" {}", q(&a))).unwrap_or_default();
     Some(VerboseScan {
         relation: format!("{}.{}{suffix}", q(&schema), q(&bare)),
@@ -6508,6 +6526,7 @@ pub fn explain_verbose_scan(
         quals,
         refname: q(&refname),
         columns: def.columns.iter().map(|c| q(&c.name)).collect(),
+        sort_exprs,
     })
 }
 
@@ -6527,10 +6546,14 @@ pub struct VerboseRel {
     pub needed: Vec<String>,
     /// The name its columns are prefixed with: the alias, else the table.
     pub refname: String,
+    /// Each WHERE conjunct over this relation alone, as the plain plan
+    /// prints its scan's `Filter` and as VERBOSE prints it, prefixed.
+    pub quals: Vec<(String, String)>,
 }
 
 /// `EXPLAIN VERBOSE` of a SELECT joining two relations on an ON of
-/// column equalities, with no WHERE (RP-966): each relation's lists, and
+/// column comparisons, with a WHERE whose every conjunct reads one
+/// relation (RP-966): each relation's lists, and
 /// the join's target list, prefixed (`show_plan_tlist`'s `useprefix`
 /// holds with two relations in the range table).
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -6548,8 +6571,7 @@ pub fn explain_verbose_join(
     s: &pg_query::protobuf::SelectStmt,
     lookup: &dyn Fn(&str) -> Option<TableDef>,
 ) -> Option<VerboseJoin> {
-    if s.where_clause.is_some()
-        || !s.group_clause.is_empty()
+    if !s.group_clause.is_empty()
         || s.having_clause.is_some()
         || !s.distinct_clause.is_empty()
         || !s.sort_clause.is_empty()
@@ -6684,6 +6706,47 @@ pub fn explain_verbose_join(
         need(li, &lc);
         need(ri, &rc);
     }
+    // The WHERE: each conjunct a restriction of one relation, which its
+    // scan evaluates as its `Filter`; its columns are not needed above.
+    let mut quals: [Vec<(String, String)>; 2] = [Vec::new(), Vec::new()];
+    if let Some(w) = s.where_clause.as_deref() {
+        let none_lookup = |_: &str| None;
+        let none_views = |_: &str| None;
+        let cat = Catalog {
+            lookup: &none_lookup,
+            view_sql: &none_views,
+        };
+        let print = |part: &Node, i: usize, unqualified: bool| -> Option<String> {
+            let (refname, def, _) = &sides[i];
+            let mut p = Printer::new(&cat, 0);
+            p.unqualified = unqualified;
+            p.fold_consts = true;
+            p.scopes.push(vec![Rte {
+                refname: refname.clone(),
+                name: refname.clone(),
+                columns: def
+                    .columns
+                    .iter()
+                    .map(|c| (c.name.clone(), base_type(&c.pg_type)))
+                    .collect(),
+                qualified_only: false,
+                ..Default::default()
+            }]);
+            p.expr(part)?;
+            Some(p.buf)
+        };
+        let mut parts = Vec::new();
+        and_clauses(w, &mut parts);
+        for part in &parts {
+            let part: &Node = part;
+            let i = match (print(part, 0, true), print(part, 1, true)) {
+                (Some(_), None) => 0,
+                (None, Some(_)) => 1,
+                _ => return None,
+            };
+            quals[i].push((print(part, i, true)?, print(part, i, false)?));
+        }
+    }
     let rel = |i: usize| {
         let (refname, def, alias) = &sides[i];
         let (schema, bare) = crate::schemas::split_key(&def.name);
@@ -6704,6 +6767,7 @@ pub fn explain_verbose_join(
                 .map(|c| format!("{}.{}", q(refname), q(c)))
                 .collect(),
             refname: q(refname),
+            quals: quals[i].clone(),
         }
     };
     Some(VerboseJoin {

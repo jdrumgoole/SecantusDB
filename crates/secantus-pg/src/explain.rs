@@ -3210,6 +3210,37 @@ mod join_type_tests {
     }
 
     #[test]
+    fn a_computed_sort_key_is_a_resjunk_entry_under_verbose() {
+        // PostgreSQL 15.19, `explain verbose select a from k order by
+        // a+1 desc` (RP-966).
+        let v = secantus_pgplan::ruleutils::VerboseScan {
+            relation: "public.k".into(),
+            plain: "k".into(),
+            output: vec!["a".into()],
+            refname: "k".into(),
+            columns: vec!["a".into(), "b".into()],
+            sort_exprs: vec![("(a + 1)".into(), "(k.a + 1)".into())],
+            ..Default::default()
+        };
+        let mut sort = PlanNode::over("Sort", PlanNode::new("Seq Scan on k"));
+        sort.details
+            .push(("Sort Key".into(), "((a + 1)) DESC".into()));
+        attach_verbose(&mut sort, &Some(v));
+        assert_eq!(
+            sort.details,
+            [
+                ("Output".to_string(), "a, ((a + 1))".to_string()),
+                ("Sort Key".to_string(), "((k.a + 1)) DESC".to_string()),
+            ]
+        );
+        assert_eq!(sort.children[0].name, "Seq Scan on public.k");
+        assert_eq!(
+            sort.children[0].details,
+            [("Output".to_string(), "a, (a + 1)".to_string())]
+        );
+    }
+
+    #[test]
     fn a_constant_equality_fixes_its_field() {
         let mut out = Vec::new();
         let f = bson::doc! {
@@ -3241,11 +3272,27 @@ pub(crate) fn attach_verbose(
     fn upper(n: &PlanNode) -> bool {
         matches!(n.name.as_str(), "Sort" | "Limit") && n.children.len() == 1
     }
+    // A computed key is a resjunk entry the scan computes, which the nodes
+    // above it reference: they print it parenthesised, and the Sort Key
+    // its qualified text so (RP-966).
+    let computed = |key: &str| {
+        v.sort_exprs.iter().find(|(u, _)| {
+            let wrapped = format!("({u})");
+            key == wrapped
+                || key
+                    .strip_prefix(&wrapped)
+                    .is_some_and(|r| r.starts_with(' '))
+        })
+    };
     let mut keys: Vec<String> = Vec::new();
     let mut n: &PlanNode = root;
     while upper(n) {
         if let Some((_, text)) = n.details.iter().find(|(k, _)| k == "Sort Key") {
             for key in text.split(", ") {
+                if let Some((u, _)) = computed(key) {
+                    keys.push(u.clone());
+                    continue;
+                }
                 let col = key.split_once(' ').map_or(key, |(c, _)| c);
                 if !v.columns.iter().any(|c| c == col) {
                     return;
@@ -3264,25 +3311,47 @@ pub(crate) fn attach_verbose(
             output.push(col);
         }
     }
+    // A node above the scan references each entry the scan computed, and
+    // prints it parenthesised.
+    let above: Vec<String> = output
+        .iter()
+        .map(|e| {
+            if v.columns.contains(e) {
+                e.clone()
+            } else {
+                format!("({e})")
+            }
+        })
+        .collect();
     let mut root = root;
     while upper(root) {
         if let Some(d) = root.details.iter_mut().find(|(k, _)| k == "Sort Key") {
             d.1 =
                 d.1.split(", ")
-                    .map(|key| format!("{}.{key}", v.refname))
+                    .map(|key| match computed(key) {
+                        Some((u, q)) => format!("({q}){}", &key[u.len() + 2..]),
+                        None => format!("{}.{key}", v.refname),
+                    })
                     .collect::<Vec<_>>()
                     .join(", ");
         }
-        root.details.insert(0, ("Output".into(), output.join(", ")));
+        root.details.insert(0, ("Output".into(), above.join(", ")));
         root = &mut root.children[0];
     }
     let Some(head) = root.name.strip_suffix(&plain) else {
         return;
     };
     root.name = format!("{head} on {}", v.relation);
-    for (label, value) in &mut root.details {
+    prefix_quals(root, &v.quals);
+    root.details.insert(0, ("Output".into(), output.join(", ")));
+}
+
+/// A scan's quals as VERBOSE prints them: each conjunct the plain plan
+/// printed replaced by its prefixed form.
+fn prefix_quals(scan: &mut PlanNode, quals: &[(String, String)]) {
+    for (label, value) in &mut scan.details {
         if matches!(label.as_str(), "Filter" | "Index Cond" | "Recheck Cond") {
-            for (bare, qualified) in &v.quals {
+            for (bare, qualified) in quals {
                 if *value == *bare {
                     value.clone_from(qualified);
                 } else {
@@ -3292,7 +3361,6 @@ pub(crate) fn attach_verbose(
             }
         }
     }
-    root.details.insert(0, ("Output".into(), output.join(", ")));
 }
 
 /// `EXPLAIN VERBOSE` of a two-relation hash join (RP-966): every node
@@ -3326,7 +3394,11 @@ pub(crate) fn attach_verbose_join(
         return;
     }
     let rel_of = |n: &PlanNode| -> Option<usize> {
-        if !is_scan_name(&n.name) || n.details.iter().any(|(k, _)| k != "Index Cond") {
+        if !is_scan_name(&n.name)
+            || n.details
+                .iter()
+                .any(|(k, _)| k != "Index Cond" && k != "Filter")
+        {
             return None;
         }
         v.rels
@@ -3336,7 +3408,12 @@ pub(crate) fn attach_verbose_join(
     let (Some(o), Some(i)) = (rel_of(outer), rel_of(inner)) else {
         return;
     };
-    if o == i {
+    // A scan with a Filter must print each of its relation's WHERE
+    // conjuncts, and one without none of them.
+    let filtered = |n: &PlanNode, r: &secantus_pgplan::ruleutils::VerboseRel| {
+        n.details.iter().any(|(k, _)| k == "Filter") == !r.quals.is_empty()
+    };
+    if o == i || !filtered(outer, &v.rels[o]) || !filtered(inner, &v.rels[i]) {
         return;
     }
     let requalify = |n: &mut PlanNode, r: &secantus_pgplan::ruleutils::VerboseRel| {
@@ -3344,6 +3421,7 @@ pub(crate) fn attach_verbose_join(
         n.name = format!("{}{}", &n.name[..at], r.relation);
     };
     requalify(outer, &v.rels[o]);
+    prefix_quals(outer, &v.rels[o].quals);
     outer
         .details
         .insert(0, ("Output".into(), v.rels[o].columns.join(", ")));
@@ -3351,6 +3429,7 @@ pub(crate) fn attach_verbose_join(
     hash.details.insert(0, ("Output".into(), needed.clone()));
     let inner = &mut hash.children[0];
     requalify(inner, &v.rels[i]);
+    prefix_quals(inner, &v.rels[i].quals);
     inner.details.insert(0, ("Output".into(), needed));
     root.details
         .insert(0, ("Output".into(), v.output.join(", ")));
@@ -3363,7 +3442,10 @@ pub(crate) fn attach_verbose_join(
 /// PostgreSQL 15.19 prints `Index Cond: (k.a > e.a)`. Any other nested
 /// loop prints as without VERBOSE.
 fn attach_verbose_nested_loop(root: &mut PlanNode, v: &secantus_pgplan::ruleutils::VerboseJoin) {
-    if !root.details.is_empty() || root.children.len() != 2 {
+    if !root.details.is_empty()
+        || root.children.len() != 2
+        || v.rels.iter().any(|r| !r.quals.is_empty())
+    {
         return;
     }
     let rel_of = |n: &PlanNode| -> Option<usize> {
