@@ -22,7 +22,7 @@
 <section class="section">
   <div class="wrap">
     <h2>What you get</h2>
-    <p class="section-lead">This is the server to run. The pure-Python implementation it grew out of is still the project's reference &mdash; the readable one, the one every operator lands in first &mdash; and this is that same database with the interpreter taken out from under it.</p>
+    <p class="section-lead">This is the server to run: a single-node MongoDB database in one self-contained binary, held to what a real <code>mongod</code> 8.x answers.</p>
     <div class="benefits">
       <div class="benefit">
         <h3><span class="pip"></span>One standalone binary</h3>
@@ -34,7 +34,7 @@
       </div>
       <div class="benefit">
         <h3><span class="pip"></span>Same wire protocol</h3>
-        <p>It answers the same <code>OP_MSG</code> handshake, CRUD, aggregation, and change-stream commands. Every driver that talks to the Python server talks to the Rust server unchanged.</p>
+        <p>It answers the same <code>OP_MSG</code> handshake, CRUD, aggregation, and change-stream commands. Every driver that talks to <code>mongod</code> talks to it unchanged.</p>
       </div>
       <div class="benefit">
         <h3><span class="pip"></span>Same conformance bar</h3>
@@ -42,7 +42,7 @@
       </div>
       <div class="benefit">
         <h3><span class="pip"></span>Real WiredTiger storage</h3>
-        <p>The same C storage engine MongoDB ships with, linked into the binary. B-trees, durability, write-ahead logging &mdash; identical on-disk semantics to the Python server.</p>
+        <p>The same C storage engine MongoDB ships with, linked into the binary. B-trees, durability, write-ahead logging &mdash; the same on-disk format the Rust PostgreSQL server reads.</p>
       </div>
       <div class="benefit">
         <h3><span class="pip"></span>Embeddable from Python too</h3>
@@ -60,7 +60,7 @@
 <section class="section">
   <div class="wrap">
     <h2>Measured, not promised</h2>
-    <p class="section-lead">Nine workloads, median of fifteen interleaved runs, end to end through <code>pymongo</code> on on-disk WiredTiger, with a real <code>mongod</code> 8.0.32 as the reference &mdash; all three on a dedicated 8-vCPU cloud instance, because a laptop cannot be trusted for this. Across three such measurements the Rust server runs at <strong>1.0&times;&ndash;3.2&times; of mongod</strong> per operation, and <strong>~1.9&times;&ndash;13.5&times; faster than the Python reference</strong> workload for workload.</p>
+    <p class="section-lead">Nine workloads, median of fifteen interleaved runs, end to end through <code>pymongo</code> on on-disk WiredTiger, with a real <code>mongod</code> 8.0.32 as the reference &mdash; both on a dedicated 8-vCPU cloud instance, because a laptop cannot be trusted for this. Across three such measurements the Rust server runs at <strong>1.0&times;&ndash;3.2&times; of mongod</strong> per operation.</p>
     <div class="compare-wrap">
       <table class="compare-table">
         <thead>
