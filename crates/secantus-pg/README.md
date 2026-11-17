@@ -11,7 +11,8 @@ test dependency. `cargo install` builds with link-time optimisation and takes
 about ten. If you only want the binary, `cargo binstall secantus-pg` fetches a
 prebuilt one (Linux x86_64, macOS arm64) with no toolchain. The prebuilt one
 is also the fastest: it is built with a profile that `cargo install` cannot
-have.
+have. `pip install SecantusDB` also installs a prebuilt `secantusd-pg` (and
+`secantusd-mdb`) on your `PATH`, with no Rust toolchain.
 
 ## Embedded in a Rust program
 

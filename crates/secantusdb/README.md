@@ -13,7 +13,9 @@ cargo install secantus-mdb --version 0.5.3-beta.197   # a pre-release: cargo nee
 secantusd-mdb --port 27018
 ```
 
-Prebuilt binaries for each platform are on the
+Or skip the build: `pip install SecantusDB` installs the prebuilt
+`secantusd-mdb` (and `secantusd-pg`) on your `PATH` (Linux x86_64, macOS
+arm64), and prebuilt binaries for each platform are on the
 [GitHub releases](https://github.com/jdrumgoole/SecantusDB/releases).
 
 Project home and documentation: <https://secantusdb.com>.

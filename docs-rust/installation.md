@@ -10,7 +10,7 @@ covers all three channels for both servers, including `secantusd-pg`.
 binaries on `PATH` (Linux x86_64, macOS arm64) and the `secantusdb` Python
 launcher (`from secantusdb import MongoServer, PostgresServer`).
 
-## From crates.io (recommended)
+## From crates.io
 
 The server is the `secantus-mdb` crate. `cargo install` builds it, WiredTiger
 included, and puts `secantusd-mdb` on `PATH`. It needs a Rust toolchain, CMake

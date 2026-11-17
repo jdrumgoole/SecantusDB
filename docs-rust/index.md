@@ -11,9 +11,9 @@ on GitHub Releases, and inside the `SecantusDB` wheel on PyPI (which also
 carries the PostgreSQL server, `secantusd-pg`):
 
 ```bash
-cargo install secantus-mdb --version 0.5.3-beta.197   # builds WiredTiger, installs `secantusd-mdb`
+pip install SecantusDB     # prebuilt secantusd-mdb + secantusd-pg on PATH, nothing to compile
+# or: cargo install secantus-mdb --version 0.5.3-beta.197   (builds WiredTiger)
 secantusd-mdb --port 27017 --storage-path ./secantus-data
-# or: pip install SecantusDB     (prebuilt secantusd-mdb + secantusd-pg on PATH)
 ```
 
 ```rust
