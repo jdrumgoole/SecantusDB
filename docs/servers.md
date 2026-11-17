@@ -39,7 +39,7 @@ live only in the Rust server.
 | Speed | within 1.0×–3.2× of `mongod` per operation | 2×–27× |
 | Request path | pure Rust (off the GIL) | pure Python |
 
-Use the **Rust server** to run SecantusDB — in tests, in CI, in a container.
+Use the **Rust server** to run SecantusDB — on a host, in a container, or embedded in your application.
 Reach for the **Python server** when you want to read how something works, or
 need one of the few features only it has (listed below and in the
 [Feature comparison](feature-comparison.md)). Speed figures are from

@@ -17,7 +17,7 @@ secantusd-mdb --port 27017 --storage-path ./secantus-data
 ```
 
 ```rust
-// Or in-process, from a Rust test (add `secantus-mdb` as a dev-dependency):
+// Or in-process, from Rust (add `secantus-mdb` as a dependency):
 let server = secantus_mdb::Server::start()?;   // temporary store, OS-assigned port
 let client = mongodb::sync::Client::with_uri_str(server.uri())?;
 ```

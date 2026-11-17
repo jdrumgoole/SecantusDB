@@ -13,7 +13,7 @@ SecantusDB runs in two modes from the same `SecantusDBServer` class:
 
 Both modes default to **on-disk storage** at `./secantus-data` so data
 survives restarts. Pass `storage_path=":memory:"` (or `--storage-path
-:memory:` on the CLI) for an ephemeral, test-friendly mode.
+:memory:` on the CLI) for a temporary, throwaway-data mode.
 
 ## Embedded (in-process)
 
@@ -120,9 +120,9 @@ server.start()       # returns once the listener is bound
 server.wait()        # blocks until server.stop() from another thread / signal
 ```
 
-## Ephemeral / test mode
+## Temporary (in-memory) mode
 
-For tests or scratch experiments, set `storage_path=":memory:"`. The
+For scratch experiments or tests, set `storage_path=":memory:"`. The
 server uses a tempdir WiredTiger home that's wiped on `stop()` — no
 files left behind, no port conflicts, fully parallel-safe. Combine with
 `port=0` so the OS picks a free port:

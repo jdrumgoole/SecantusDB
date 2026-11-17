@@ -108,7 +108,7 @@ power-loss-window durability.
 | Value | Sized for |
 |---|---|
 | `"256M"` | Small dev box; working set is a few MB |
-| `"1G"` (default) | Single-app local dev / test surrogate |
+| `"1G"` (default) | Single-app local dev |
 | `"4G"` | Modest production single-node |
 | `"8G"` or more | Larger working sets; tune to fit the hot doc subset |
 

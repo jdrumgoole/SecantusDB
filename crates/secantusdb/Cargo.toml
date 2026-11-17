@@ -16,7 +16,7 @@ repository = "https://github.com/jdrumgoole/SecantusDB"
 # into the parent `crates` workspace, matching secantus-storage-adapter.
 rust-version = "1.98"
 readme = "README.md"
-keywords = ["mongodb", "database", "testing", "server", "wiredtiger"]
+keywords = ["mongodb", "database", "embedded", "server", "wiredtiger"]
 categories = ["database-implementations", "development-tools::testing"]
 
 # `cargo binstall secantus-mdb` fetches the prebuilt, PGO-optimised binary that

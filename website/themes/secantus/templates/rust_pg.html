@@ -24,7 +24,7 @@
   <div class="wrap">
     <div class="callout">
       <span class="badge">Early access</span>
-      <span>The Rust PostgreSQL server is the youngest thing in the project, and it is a server for tests. A role that has a password must prove it with SCRAM-SHA-256, and a wrong password is refused. A role with <strong>no password, and a user name the server has never seen, both connect without one</strong>, unless the server is started with a <code>pg_hba.conf</code> (<code>--hba-file</code>) that says otherwise. TLS is off unless the server is started with a certificate, and a client that does not ask for it is served in the clear unless a <code>pg_hba.conf</code> line or <code>--tls-require</code> refuses it. Keep it on loopback, and keep production data out of it.</span>
+      <span>The Rust PostgreSQL server is the youngest thing in the project, and it is a beta. A role that has a password must prove it with SCRAM-SHA-256, and a wrong password is refused. A role with <strong>no password, and a user name the server has never seen, both connect without one</strong>, unless the server is started with a <code>pg_hba.conf</code> (<code>--hba-file</code>) that says otherwise. TLS is off unless the server is started with a certificate, and a client that does not ask for it is served in the clear unless a <code>pg_hba.conf</code> line or <code>--tls-require</code> refuses it. Keep it on loopback, and keep production data out of it.</span>
     </div>
   </div>
 </div>

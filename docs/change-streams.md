@@ -198,7 +198,7 @@ See [`tasks/backlog.md`](https://github.com/jdrumgoole/SecantusDB/blob/main/task
 - `$changeStreamSplitLargeEvent` is honoured at the envelope level on
   the Python server — every event carries `{splitEvent: {fragment:1,
   of:1}}` when the stage is given — but events never actually split
-  (oplog entries cap well below 16 MB in our test surrogate workloads).
+  (oplog entries cap well below 16 MB in practice).
   The Rust server adds `splitEvent` only to an event it split, as
   `mongod` 8.2.11 does.
 - No `noop` heartbeats — resume tokens advance only on real ops.

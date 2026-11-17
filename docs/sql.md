@@ -1904,7 +1904,7 @@ only the survivors are grouped). When a query has **both** a JOIN and a GROUP BY
 the WHERE filters the joined rows after the join and before the `$group` — again,
 only the survivors are grouped. The inner query is a simple `SELECT … FROM
 one_table [WHERE …]` (no inner join / GROUP BY). The per-row evaluation is a full
-scan, so it's `O(outer × inner)` — fine for the ephemeral test data SecantusDB
+scan, so it's `O(outer × inner)` — fine for the small data sets this path
 targets, not a query planner. A correlated WHERE also composes with a GROUP BY
 **and** a window function in one SELECT — single-table or over a JOIN (the WHERE
 filters the joined rows before the `$group`, then the window runs over the grouped
@@ -3313,7 +3313,7 @@ Two limitations: prepared transactions are held **in memory only**, so — unlik
 real Postgres, which persists them to `pg_twophase` — they do **not** survive a
 server restart; and the statements must be sent over the **simple query
 protocol** (the wire server can't route them through the extended Parse/Bind
-path). Both are fine for the single-node test-surrogate use case.
+path). Both are fine for a single-node server.
 
 ## LISTEN / NOTIFY
 

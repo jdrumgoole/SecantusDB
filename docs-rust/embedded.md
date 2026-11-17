@@ -1,10 +1,10 @@
-# Embedded in a test
+# Embedded in your application
 
-## From a Rust test
+## From Rust
 
 The `secantus-mdb` crate starts the server **in-process**: a real server on a
-real TCP port, with a temporary store removed on drop, so any number of tests
-can run in parallel. Add it as a dev-dependency and connect the official
+real TCP port, with a temporary store removed on drop, so any number of servers
+can run in parallel. Add it as a dependency and connect the official
 `mongodb` driver:
 
 ```rust
@@ -16,17 +16,15 @@ client.database("mydb").collection("users")
 
 `Server::builder()` sets a persistent store, a port, auth, TLS, the WiredTiger
 cache and the background sweepers. Like the daemon, it expires TTL-indexed
-documents every 60 seconds. A test that needs an expiry sooner sets
-`ttlMonitorSleepSecs` with `setParameter`, as it would on `mongod`, and can
-wait for `serverStatus().metrics.ttl.passes` to move instead of sleeping. A
+documents every 60 seconds. To get an expiry sooner, set
+`ttlMonitorSleepSecs` with `setParameter`, as on `mongod`, and wait for `serverStatus().metrics.ttl.passes` to move instead of sleeping. A
 server started this way advertises a
-single-node replica set named `secantus` and enables test commands, because
-it is a test's server.
+single-node replica set named `secantus` and enables test commands.
 
-## From a Python test
+## From Python
 
 The published `SecantusDB` wheel no longer contains the Rust server: it
-carries only the Python servers. From a Python test, either run
+carries only the Python servers. From Python, either run
 `secantusd-mdb` (from the `secantus-mdb` crate or a release archive) as a
 subprocess and point `pymongo` at it, or use the Python server's
 `SecantusDBServer`, which has the same `pymongo` surface.

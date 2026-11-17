@@ -10,7 +10,7 @@ from pymongo import MongoClient
 from secantus import SecantusDBServer
 
 # On-disk by default at ./secantus-data;
-# pass storage_path=":memory:" for ephemeral.
+# pass storage_path=":memory:" for a temporary store.
 with SecantusDBServer(port=27017) as server:
     client = MongoClient(server.uri)
     db = client["mydb"]

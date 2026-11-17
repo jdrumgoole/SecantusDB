@@ -2,14 +2,13 @@
 
 ## Should you?
 
-SecantusDB started life as a **single-node test surrogate** for the
-MongoDB wire protocol — fast, embeddable, ephemeral, "don't stand up
-a real `mongod` just to run pytest." That's still the primary
-audience. The storage engine underneath (WiredTiger, the same engine
-real `mongod` uses) is genuinely production-grade, and the supported
-wire-protocol surface is conformant enough that production drivers
-talk to it cleanly. So the comparison most people reach for —
-"SecantusDB vs `mongod` in prod" — isn't the useful one. The useful
+SecantusDB is a **real single-node database** speaking the MongoDB
+(and PostgreSQL) wire protocol — fast, embeddable, and backed by the
+same WiredTiger storage engine real `mongod` uses. The storage engine
+is production-grade, and the supported wire-protocol surface is
+conformant enough that production drivers talk to it cleanly. So the
+comparison most people reach for — "SecantusDB vs `mongod` in prod" —
+isn't the useful one. The useful
 comparison is **SecantusDB vs single-node Postgres** for a small or
 medium application that wants document-shaped storage on one box.
 
@@ -347,8 +346,7 @@ proxy, and a quarterly restore drill.
 
 The features that make SecantusDB worth choosing — embeddability,
 WiredTiger-class storage, the same wire protocol your apps already
-speak to mongod — are the same ones it shares with the project's
-test-surrogate origin. The features that make production *scary* —
+speak to mongod. The features that make production *scary* —
 replication, PITR, mature TLS / auth integrations, decades of
 incident-tested edge-case handling — are the ones it doesn't have
 yet. Treat the comparison table above as the truth-in-advertising

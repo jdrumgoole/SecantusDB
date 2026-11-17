@@ -31,13 +31,13 @@ socket, over the same **WiredTiger** storage engine MongoDB ships. Point
 your existing driver at it — `pymongo`, `mongo-go-driver`, `mongosh`,
 `psycopg`, `psql`, SQLAlchemy — and your application code doesn't know
 the difference, as long as it only needs single-node behaviour. No
-`mongod` or `postgres` to install, no port conflicts, parallel-test
-friendly, embedded in-process or as a standalone daemon.
+`mongod` or `postgres` to install, one self-contained binary, run as a
+standalone daemon or started from your own code.
 
 Three ways to get it.
 
 **From PyPI**, with both Rust servers prebuilt (Linux x86_64 and macOS
-arm64), started from a test in two lines:
+arm64), started from your own code in two lines:
 
 ```bash
 pip install SecantusDB
@@ -80,7 +80,7 @@ without it cargo stops at "nothing to install". The current versions are on
 the [`secantus-mdb`](https://crates.io/crates/secantus-mdb) and
 [`secantus-pg`](https://crates.io/crates/secantus-pg) pages. Each crate is
 also a library: `secantus_mdb::Server` and `secantus_pg::PgServer` start a
-server inside a Rust test.
+server inside a Rust program.
 
 **As standalone archives** of both servers, attached to their tags on
 [GitHub Releases](https://github.com/jdrumgoole/SecantusDB/releases).
@@ -139,9 +139,9 @@ benchmark the **Rust MongoDB server runs within 1.0×–3.2× of `mongod`**
 per operation across three runs (reads at the low end, multi-stage
 aggregation at the high end); the Python server runs 2×–27×. See
 [`docs/benchmark.md`](https://secantusdb.com/docs/benchmark.html) for
-the numbers and methodology. The right use is tests, dev, CI,
-containers, and single-node prototypes where conformance and
-WiredTiger durability matter more than per-operation latency.
+the numbers and methodology. The right use is single-node
+applications, development, containers, and services where conformance
+and WiredTiger durability matter more than per-operation latency.
 
 ## What's in scope: MongoDB
 
@@ -339,7 +339,7 @@ tour of all 22 pages.
 Full docs are at [secantusdb.com/docs](https://secantusdb.com/docs/index.html) — with the Rust server's own tree at [secantusdb.com/docs/rust](https://secantusdb.com/docs/rust/index.html).
 Highlights:
 
-- [Quickstart](https://secantusdb.com/docs/quickstart.html) — embedding in tests, running standalone.
+- [Quickstart](https://secantusdb.com/docs/quickstart.html) — embedding in your application, running standalone.
 - [The two servers](https://secantusdb.com/docs/servers.html) — Rust vs Python server, and what each doesn't support yet.
 - [SQL / PostgreSQL interface](https://secantusdb.com/docs/sql.html) — the supported SQL surface.
 - [Architecture](https://secantusdb.com/docs/architecture.html) — the layered design.

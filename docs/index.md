@@ -28,12 +28,11 @@ There are two ways to use it:
 
 - **Embedded** — `with SecantusDBServer(...) as server:` inside your
   application or test process. No subprocess, no port collision (use
-  `port=0`), no separate daemon to manage. Also ideal for tests under
-  `pytest-xdist`.
+  `port=0`), no separate daemon to manage.
 - **Standalone daemon** — `pip install` puts a `secantusd-py` script on
   `PATH` that runs the server like a `mongod`. Drop-in replacement for a
-  single-node `mongod` in dev / CI / small production-shaped workloads
-  where the beta caveats are acceptable.
+  single-node `mongod` for single-node workloads where the beta caveats
+  are acceptable.
 
 Single-node only by design. Replica sets, sharding, and anything that
 depends on real cluster topology are out of scope — but within the
@@ -60,9 +59,9 @@ with SecantusDBServer(port=27017) as server:
 ```
 
 That's it. No `mongod` to install. The on-disk store keeps your data
-across restarts; for tests, swap in `port=0, storage_path=":memory:"`
-so each `SecantusDBServer` instance gets an OS-assigned port and an
-ephemeral WiredTiger home — suites then run cleanly under `pytest-xdist`.
+across restarts; for a scratch instance, swap in `port=0,
+storage_path=":memory:"` so each `SecantusDBServer` gets an OS-assigned
+port and a temporary WiredTiger home (handy under `pytest-xdist`).
 
 ## Standalone daemon
 

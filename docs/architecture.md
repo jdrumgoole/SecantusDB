@@ -182,9 +182,10 @@ the methodology to reproduce.
 
 What this means for use:
 
-- **Tests and dev**: SecantusDB is the right choice. Per-op latency
-  is in the hundreds of milliseconds for thousands of docs, which is
-  fine when the alternative is a `mongod` install in your CI image.
+- **Development and small data sets**: SecantusDB is a good choice.
+  Per-op latency is in the hundreds of milliseconds for thousands of
+  docs, which is fine when the alternative is installing and running a
+  `mongod`.
 - **Embedded single-node apps with modest throughput**: also a good
   fit. WT durability + on-disk format mean your data survives restart
   exactly the way it would under mongod.

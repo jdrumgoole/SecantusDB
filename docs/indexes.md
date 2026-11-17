@@ -413,8 +413,8 @@ list(coll.find().sort("name", 1))   # COLLSCAN
 ## What's still missing
 
 - **TTL background sweeper** — `prune_ttl` is opt-in; no 60-second
-  cadence sweeper. Real mongod runs one; for an in-process test
-  surrogate the explicit-call ergonomics suit the audience better.
+  cadence sweeper. Real mongod runs one; for an in-process
+  server the explicit-call ergonomics suit the audience better.
 - **Text / hashed indexes** — out of scope (no full-text engine; no
   practical workload pulling hashed shard-key behaviour into an
-  in-process surrogate).
+  in-process server).
