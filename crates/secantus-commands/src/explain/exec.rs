@@ -1695,6 +1695,19 @@ pub(crate) fn run(plan: &Node, env: &Env) -> Stats {
     stats
 }
 
+/// [`run`], with what the plan had examined, `(keys, docs)`, as it
+/// returned each of its documents: where a batch that ends at that
+/// document stops counting, as mongod's executor stops working when the
+/// batch is full (RM-708).
+pub(crate) fn run_marks(plan: &Node, env: &Env) -> (Vec<(i64, i64)>, Stats) {
+    let mut root = Run::new(plan, env);
+    let mut marks = Vec::new();
+    while root.pull(env).is_some() {
+        marks.push(root.stats().totals());
+    }
+    (marks, root.stats())
+}
+
 /// Each stage's work accounting from `worked`, a tree of the same plan.
 fn graft_work(stats: &mut Stats, worked: &Stats) {
     if worked.work.is_some() || stats.work.is_none() {

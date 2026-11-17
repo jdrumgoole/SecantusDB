@@ -761,17 +761,6 @@ These are explicit non-goals. Don't add them without a reason.
       e01df2d2 (2026-11-08), each command checked against a probe of its own.
       Backlog-ID: RM-360
       Verify: tests/backlog/test_rm_355_364.py::test_every_line_counts_its_interrupt_checks
-- [ ] **A `find` of a clustered collection that leaves its cursor open
-      does not say what it examined.** mongod 8.2.11's lines for a `find`
-      of `<db>.system.buckets.ts` read four at a time, and its `getMore`s,
-      each say what that batch examined (`keysExamined: 0`, `docsExamined`
-      4, 4, 2, `nBatches: 1`); this server's say `nreturned` alone. A
-      clustered collection's read is not streamed (`can_stream`), so a read
-      the first batch ends counts its plan's run as `explain` does (RM-586),
-      and one that leaves a cursor open counts nothing. Found while working
-      RM-586, 2026-11-16.
-      Verify: tests/backlog/test_rm_ts_ddl_lines.py::test_a_batched_find_of_buckets_says_what_each_batch_examined
-      Backlog-ID: RM-708
 - [ ] **A refused write of a view counts fewer locks than mongod's.**
       mongod 8.2.11 refuses a write of a view once it holds the namespace
       for the write; this server refuses it earlier, in `views::refusal`,
