@@ -2749,17 +2749,25 @@ fn validate_set_window_fields(stage: &str, spec: Option<&Bson>) -> Result<(), Co
     let Some(spec) = spec.and_then(Bson::as_document) else {
         return Ok(()); // shape errors are the engine's to report
     };
-    if let Some(unknown) = spec
-        .keys()
-        .find(|k| !k.starts_with('$') && !SET_WINDOW_FIELDS_KNOWN.contains(&k.as_str()))
-    {
-        return Err(CommandError::new(
-            40415,
-            "IDLUnknownField",
-            format!("BSON field '{stage}.{unknown}' is an unknown field."),
-        ));
+    // The IDL types each field as it reads it, so a wrong type and an
+    // unknown field are reported in document order (RM-604).
+    for (field, value) in spec {
+        if let Some((code, msg)) =
+            crate::argtypes::window_stage_field_type_problem("$setWindowFields", field, value)
+        {
+            let msg = msg.replacen("$setWindowFields", stage, 1);
+            return Err(CommandError::new(code, "TypeMismatch", msg));
+        }
+        if !field.starts_with('$') && !SET_WINDOW_FIELDS_KNOWN.contains(&field.as_str()) {
+            return Err(CommandError::new(
+                40415,
+                "IDLUnknownField",
+                format!("BSON field '{stage}.{field}' is an unknown field."),
+            ));
+        }
     }
-    if !spec.contains_key("output") {
+    // A null `output` is an absent one.
+    if matches!(spec.get("output"), None | Some(Bson::Null)) {
         return Err(CommandError::new(
             40414,
             "IDLFailedToParse",

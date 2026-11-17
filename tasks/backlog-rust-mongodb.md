@@ -773,14 +773,17 @@ These are explicit non-goals. Don't add them without a reason.
       Found while working RM-589, 2026-11-17.
       Verify: tests/backlog/test_rm_view_namespaces.py::test_a_transaction_statement_counts_the_transactions_locks
       Backlog-ID: RM-715
-- [ ] **A `$setWindowFields`, `$densify` or `$fill` field of the wrong
-      type is "not supported".** mongod 8.2.11 refuses `output: 1`,
-      `field: 1` with 14, "BSON field '$densify.field' is the wrong type
-      'int', expected type 'string'"; this server answers BadValue (2),
-      "aggregation pipeline uses a stage or operator not supported by the
-      Rust server". Found while working RM-386, 2026-11-13.
-      Verify: tests/backlog/test_rm_found_rm386.py::test_a_stage_field_of_the_wrong_type_is_a_type_mismatch
-      Backlog-ID: RM-604
+- [ ] **An empty `$densify.range` or `$fill.output` is refused with the
+      wrong answer.** mongod 8.2.11 parses `range` as it reads it, so
+      `{$densify: {range: {}}}` is 40414 "BSON field
+      '$densify.range.bounds' is missing but a required field" (before the
+      missing `field`), and `{$fill: {output: {}}}` is 6050203 "The output
+      field in '$fill' must contain an object with at least one element".
+      This server names the missing `field` for the first and answers
+      BadValue (2), "not supported by the Rust server", for the second.
+      Found while working RM-604, 2026-11-17.
+      Verify: tests/backlog/test_rm_found_rm604.py::test_an_empty_densify_range_or_fill_output_is_refused_as_mongod_refuses_it
+      Backlog-ID: RM-716
 - [ ] **`$search`, `$vectorSearch` and `$listSearchIndexes` are refused
       with an older mongod's code and message.** mongod 8.2.11 without
       `mongot` refuses each as it runs with 31082 (SearchNotEnabled):

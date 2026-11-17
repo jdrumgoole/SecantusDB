@@ -3714,6 +3714,9 @@ fn stage_field_problem(name: &str, spec: &Bson) -> Option<(i32, String)> {
                 return Some(problem);
             }
         }
+        if let Some(problem) = window_stage_field_type_problem(name, field, value) {
+            return Some(problem);
+        }
         // `$merge` reads its fields in order and names an unknown one when
         // it reaches it (`aggregate::merge_spec`).
         if known.contains(&field.as_str()) || name == "$merge" {
@@ -3785,11 +3788,20 @@ fn stage_field_problem(name: &str, spec: &Bson) -> Option<(i32, String)> {
                 .to_string(),
         ));
     }
+    // `$densify` requires a `range` as well as a `field` (measured 8.2.11).
+    let required = match (name, required) {
+        ("$densify", Some(_)) if !matches!(d.get("field"), None | Some(Bson::Null)) => {
+            Some("range")
+        }
+        _ => required,
+    };
     if let Some(field) = required {
-        // `$lookup`'s IDL reads a null `as` as an absent one.
+        // These IDL parses read a null field as an absent one.
         let missing = match d.get(field) {
             None => true,
-            Some(Bson::Null) => name == "$lookup",
+            Some(Bson::Null) => {
+                matches!(name, "$lookup" | "$densify" | "$fill")
+            }
             Some(_) => false,
         };
         if missing {
@@ -3803,6 +3815,47 @@ fn stage_field_problem(name: &str, spec: &Bson) -> Option<(i32, String)> {
         return lookup_join_fields_problem(d);
     }
     None
+}
+
+/// A `$setWindowFields`, `$densify` or `$fill` field of the wrong type, as
+/// mongod's IDL names it as it reads the field, so in document order with
+/// the unknown-field check; a null stands for an absent field (measured
+/// 8.2.11, RM-604).
+pub(crate) fn window_stage_field_type_problem(
+    name: &str,
+    field: &str,
+    value: &Bson,
+) -> Option<(i32, String)> {
+    let expected: &[&str] = match (name, field) {
+        ("$setWindowFields", "sortBy" | "output")
+        | ("$densify", "range")
+        | ("$fill", "sortBy" | "output") => &["object"],
+        ("$densify", "field") => &["string"],
+        ("$densify" | "$fill", "partitionByFields") => &["array"],
+        ("$fill", "partitionBy") => &["object", "string"],
+        _ => return None,
+    };
+    let actual = match value {
+        Bson::Null => return None,
+        Bson::Document(_) => "object",
+        Bson::String(_) => "string",
+        Bson::Array(_) => "array",
+        _ => "",
+    };
+    if expected.contains(&actual) {
+        return None;
+    }
+    let expected = match expected {
+        [one] => format!("type '{one}'"),
+        many => format!("types '[{}]'", many.join(", ")),
+    };
+    Some((
+        14,
+        format!(
+            "BSON field '{name}.{field}' is the wrong type '{}', expected {expected}",
+            bson_type_name(value)
+        ),
+    ))
 }
 
 /// A `$lookup` field of the wrong type, as mongod's IDL names it: `let` must
@@ -3891,6 +3944,41 @@ mod stage_validation_order_tests {
             d.insert(*k, v.clone());
         }
         Bson::Document(d)
+    }
+
+    #[test]
+    fn a_window_stage_field_of_the_wrong_type_is_14_in_document_order() {
+        // Measured 8.2.11 (RM-604).
+        let i = Bson::Int32(1);
+        assert_eq!(
+            err("$densify", doc_of(&[("field", i.clone())])),
+            (
+                14,
+                "BSON field '$densify.field' is the wrong type 'int', expected type 'string'"
+                    .to_string()
+            )
+        );
+        assert_eq!(
+            err("$fill", doc_of(&[("partitionBy", Bson::Array(vec![]))])),
+            (
+                14,
+                "BSON field '$fill.partitionBy' is the wrong type 'array', \
+                 expected types '[object, string]'"
+                    .to_string()
+            )
+        );
+        assert_eq!(
+            window_stage_field_type_problem("$setWindowFields", "sortBy", &Bson::Array(vec![]))
+                .map(|p| p.0),
+            Some(14)
+        );
+        assert_eq!(
+            err("$densify", doc_of(&[("field", Bson::String("a".into()))])),
+            (
+                40414,
+                "BSON field '$densify.range' is missing but a required field".to_string()
+            )
+        );
     }
 
     #[test]

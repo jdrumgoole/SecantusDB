@@ -162,14 +162,14 @@ def _wrong_typed_stage_fields(client: Any) -> dict:
     }
 
 
-@pytest.mark.backlog("RM-604")
+@pytest.mark.backlog_fixed("RM-604")
 def test_a_stage_field_of_the_wrong_type_is_a_type_mismatch(
     rust_mongo: Any, mongod_rs: Any
 ) -> None:
     """mongod 8.2.11 refuses a `$setWindowFields` `output`, a `$densify`
     `field` and a `$fill` `output` of the wrong type with 14, naming the
-    field; this server answers BadValue (2), "aggregation pipeline uses a
-    stage or operator not supported by the Rust server"."""
+    field; this server answered BadValue (2), "aggregation pipeline uses a
+    stage or operator not supported by the Rust server", until RM-604."""
     expected = {
         "set-window-fields-output": (
             "err",
