@@ -1770,10 +1770,11 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "        Output: a, (a + 1)",
         ],
     ),
-    # Measured on PostgreSQL 15.19: a nested loop with a WHERE prints both
-    # scans' and its own Output, the Filter and Index Cond prefixed.
+    # Fixed (RP-966, in part): a nested loop with a WHERE printed both
+    # scans' and its own Output, the Filter and Index Cond prefixed, as
+    # PostgreSQL 15.19 does.
     "explain verbose of a nested loop with a where": (
-        "RP-966",
+        "RP-966:fixed",
         _ANALYSED,
         "explain verbose select * from e join k on k.a > e.a where e.b = 'v1'",
         [
@@ -1785,6 +1786,24 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "  ->  Index Scan using k_pkey on public.k  (cost=0.28..6.50 rows=333 width=7)",
             "        Output: k.a, k.b",
             "        Index Cond: (k.a > e.a)",
+        ],
+    ),
+    # Measured on PostgreSQL 15.19: a nested loop's Join Filter prefixed,
+    # and its Materialize's and the scans' Output.
+    "explain verbose of a nested loop with a join filter": (
+        "RP-966",
+        _ANALYSED,
+        "explain verbose select * from e join k on e.a <> k.a",
+        [
+            "Nested Loop  (cost=0.00..15032.50 rows=999000 width=14)",
+            "  Output: e.a, e.b, k.a, k.b",
+            "  Join Filter: (e.a <> k.a)",
+            "  ->  Seq Scan on public.e  (cost=0.00..15.00 rows=1000 width=7)",
+            "        Output: e.a, e.b",
+            "  ->  Materialize  (cost=0.00..20.00 rows=1000 width=7)",
+            "        Output: k.a, k.b",
+            "        ->  Seq Scan on public.k  (cost=0.00..15.00 rows=1000 width=7)",
+            "              Output: k.a, k.b",
         ],
     ),
     # Measured on PostgreSQL 15.19: the key deparsed, not its slot's name.

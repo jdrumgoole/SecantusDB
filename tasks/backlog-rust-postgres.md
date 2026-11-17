@@ -1743,19 +1743,19 @@ a regression test.
       `explain::attach_verbose_nested_loop`). Every other join does not:
       PostgreSQL 15.19 prints a Merge Join's, its Materialize's and
       Memoize's `Output` likewise, and a nested loop's `Join Filter`
-      prefixed; here the plain plan. Nor does a nested loop with a WHERE,
-      a WHERE conjunct reading both relations, an ON that is not column
+      prefixed; here the plain plan. Nor does a WHERE conjunct reading both relations, an ON that is not column
       comparisons, or three or more
       relations (since 2026-11-17 a Sort on a computed key over one
       relation prints its resjunk entry, `Output: a, ((a + 1))` and `Sort
-      Key: ((k.a + 1))` over a scan whose `Output: a, (a + 1)`). A nested
-      loop with a WHERE prints the plain plan where PostgreSQL 15.19 prints
-      both scans' `Output` and the `Filter` prefixed. Where to build it: every node's targetlist
+      Key: ((k.a + 1))` over a scan whose `Output: a, (a + 1)`, and a
+      nested loop into a parameterised index scan with a WHERE whose
+      conjuncts each read one relation prints them as its scans'
+      `Filter`, prefixed). Where to build it: every node's targetlist
       deparsed (`show_plan_tlist`, prefixed when the range table holds more
       than one relation; a node under a Hash, Sort or Material returns only
       the columns needed above, `CP_SMALL_TLIST`), its quals and keys
       printed with `unqualified = false`.
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[explain verbose of a nested loop with a where]
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[explain verbose of a nested loop with a join filter]
       Backlog-ID: RP-966
 
 

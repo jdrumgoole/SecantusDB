@@ -3438,14 +3438,12 @@ pub(crate) fn attach_verbose_join(
 /// `EXPLAIN VERBOSE` of a two-relation nested loop whose inner side is a
 /// parameterised index scan (RP-966): both scans return their physical
 /// target list (no Hash or Material above them asks for `CP_SMALL_TLIST`),
-/// and the inner scan's `Index Cond` prefixes its own column, as
-/// PostgreSQL 15.19 prints `Index Cond: (k.a > e.a)`. Any other nested
-/// loop prints as without VERBOSE.
+/// the inner scan's `Index Cond` prefixes its own column, as
+/// PostgreSQL 15.19 prints `Index Cond: (k.a > e.a)`, and a WHERE
+/// conjunct over one relation prints as its scan's `Filter`, prefixed.
+/// Any other nested loop prints as without VERBOSE.
 fn attach_verbose_nested_loop(root: &mut PlanNode, v: &secantus_pgplan::ruleutils::VerboseJoin) {
-    if !root.details.is_empty()
-        || root.children.len() != 2
-        || v.rels.iter().any(|r| !r.quals.is_empty())
-    {
+    if !root.details.is_empty() || root.children.len() != 2 {
         return;
     }
     let rel_of = |n: &PlanNode| -> Option<usize> {
@@ -3459,13 +3457,29 @@ fn attach_verbose_nested_loop(root: &mut PlanNode, v: &secantus_pgplan::ruleutil
     let (Some(o), Some(i)) = (rel_of(&root.children[0]), rel_of(&root.children[1])) else {
         return;
     };
-    if o == i || !root.children[0].details.is_empty() {
+    if o == i {
         return;
     }
-    // The inner scan's only detail is `Index Cond: (<its column> <op> <outer ref>)`.
+    // A scan prints a `Filter` exactly when its relation has WHERE
+    // conjuncts, and nothing else but the inner scan's `Index Cond`.
+    let filter_ok = |n: &PlanNode, r: &secantus_pgplan::ruleutils::VerboseRel| {
+        n.details.iter().filter(|(k, _)| k == "Filter").count() == usize::from(!r.quals.is_empty())
+    };
+    let outer = &root.children[0];
+    if !filter_ok(outer, &v.rels[o]) || outer.details.iter().any(|(k, _)| k != "Filter") {
+        return;
+    }
+    // The inner scan's `Index Cond: (<its column> <op> <outer ref>)`.
     let inner_rel = &v.rels[i];
+    let inner = &root.children[1];
+    if !filter_ok(inner, inner_rel) {
+        return;
+    }
     let mut cond = None;
-    for (k, text) in &root.children[1].details {
+    for (at, (k, text)) in inner.details.iter().enumerate() {
+        if k == "Filter" {
+            continue;
+        }
         if k != "Index Cond" || cond.is_some() {
             return;
         }
@@ -3479,20 +3493,34 @@ fn attach_verbose_nested_loop(root: &mut PlanNode, v: &secantus_pgplan::ruleutil
         if !inner_rel.columns.contains(&qualified) || !rest.contains('.') {
             return;
         }
-        cond = Some(format!("({qualified} {rest})"));
+        cond = Some((at, format!("({qualified} {rest})")));
     }
-    let Some(cond) = cond else {
+    let Some((at, cond)) = cond else {
         return;
     };
+    root.children[1].details[at].1 = cond;
     for (n, idx) in [(0usize, o), (1, i)] {
         let r = &v.rels[idx];
         let node = &mut root.children[n];
-        let at = node.name.len() - r.plain.len();
-        node.name = format!("{}{}", &node.name[..at], r.relation);
+        let cut = node.name.len() - r.plain.len();
+        node.name = format!("{}{}", &node.name[..cut], r.relation);
+        for (k, value) in &mut node.details {
+            if k == "Filter" {
+                for (bare, qualified) in &r.quals {
+                    if value == bare {
+                        value.clone_from(qualified);
+                    } else {
+                        *value =
+                            value.replace(&format!("{bare} AND "), &format!("{qualified} AND "));
+                        *value =
+                            value.replace(&format!(" AND {bare}"), &format!(" AND {qualified}"));
+                    }
+                }
+            }
+        }
         node.details
             .insert(0, ("Output".into(), r.columns.join(", ")));
     }
-    root.children[1].details[1].1 = cond;
     root.details
         .insert(0, ("Output".into(), v.output.join(", ")));
 }
