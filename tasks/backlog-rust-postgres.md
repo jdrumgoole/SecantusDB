@@ -804,22 +804,27 @@ one beside it.
     keys after it is searched too, under `Search::merge_asc`: no merge and
     no index scan is in its order, so the plan is the cheapest under a
     bounded Sort (`--nulls-first --then m1.c`, `--then m0.c`, `--then
-    "m1.c desc, m0.b"`: 810 of 810 each, 10 differences before). Declined
-    still (the join planned for every row and sorted, as before): a DESC
-    NULLS LAST first key with a key after it (`--desc-nulls-last --then
-    "m0.c desc"` 776 of 810, 758 before; tried 2026-11-17: searching it
-    under `merge_asc`, the index's backward scan marked `back_keys` for
-    merging, left 28 differences, 6 fewer two-table ones, but not the
-    gap test's inner two-table join, which PostgreSQL plans as a bounded
-    Sort over a Merge Join on the backward index scan and a Sort `b DESC`
-    -- the merge takes the backward scan's DESC direction, not ascending;
-    not diagnosed, so not landed); a descending first key a LEFT join NULL-extends
-    or no clause reads (`ORDER_CLASS`), with a key after it; a later key a
+    "m1.c desc, m0.b"`: 810 of 810 each, 10 differences before). Since
+    2026-11-17 a DESC NULLS LAST first key in an inner join's class with a
+    key after it is searched too, under `Search::merge_asc`: the index's
+    forward scan is the wrong direction for merging and its backward scan
+    (`back_keys`) of use for merging only, and a merge on it takes the
+    scan's DESC NULLS FIRST (`generate_mergejoin_paths` follows the
+    outer's pathkeys) -- `joincost` matched it against the class's
+    `asc_keys` id and never weighed it (`--desc-nulls-last --then "m0.c
+    desc"` 781 of 810, 776 before, none worse; `--then m1.c` 791 of 810).
+    `--desc --then m0.c` measured 797 of 810 on 2026-11-17 with and
+    without that change (13 differences, 10 two-table LEFT joins), not
+    the 0 recorded above: not diagnosed. Declined still (the join planned
+    for every row and sorted, as before): a descending first key a LEFT
+    join NULL-extends or no clause reads (`ORDER_CLASS`), with a key after
+    it (the 12 two-table LEFT join shapes left under `--desc-nulls-last
+    --then "m0.c desc"`); a later key a
     WHERE may fix to a constant; a table with an index of several columns;
     and a two-table join with a subquery side.
   - Sorts that spill to disk runs are not PostgreSQL's merge.
   Backlog-ID: RP-028
-  Verify: tests/backlog/test_rust_postgres_gaps.py::test_a_desc_nulls_last_key_with_another_sorts_the_merge
+  Verify: tests/backlog/test_rust_postgres_gaps.py::test_a_left_join_desc_nulls_last_key_with_another_sorts_the_merge
 
 - [ ] **OPEN — RUST pgserver on LINUX: psycopg's timing tests fail in CI
       and pass on macOS (first measured 2026-10-12).** No Linux lane ran

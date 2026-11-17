@@ -1141,13 +1141,7 @@ impl PgHandler {
                     && ((sel.filter.is_empty() && sel.residual.is_none()) || j.where_modelled)
                     && crate::sort_bound(sel).is_some()
                     && crate::join_search::with_join_where(j, || {
-                        self.ordered_limit_searched(
-                            &j.tree,
-                            &first.field,
-                            !first.ascending,
-                            first.ascending == matches!(first.nulls, secantus_pgplan::Nulls::First),
-                            &later,
-                        )
+                        self.ordered_limit_searched(&j.tree, &first.field, !first.ascending, &later)
                     })
                 {
                     return Ok(None);
