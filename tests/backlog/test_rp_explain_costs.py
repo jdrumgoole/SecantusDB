@@ -1664,7 +1664,7 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
     # Measured on PostgreSQL 15.19 (RP-966): every node of a join prints
     # its targetlist, qualified, and the join its `Inner Unique`.
     "a join's nodes print their output under verbose": (
-        "RP-966",
+        "RP-966:fixed",
         _ANALYSED,
         "explain verbose select * from e join k on e.a = k.a",
         [
@@ -1678,6 +1678,55 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "        Output: k.a, k.b",
             "        ->  Seq Scan on public.k  (cost=0.00..15.00 rows=1000 width=7)",
             "              Output: k.a, k.b",
+        ],
+    ),
+    # Measured on PostgreSQL 15.19 (RP-966): a nested loop's nodes print
+    # their targetlists too, and the inner index scan's qual prefixed.
+    "a nested loop's nodes print their output under verbose": (
+        "RP-966",
+        _ANALYSED,
+        "explain verbose select e.b, k.b from e join k on e.a < k.a",
+        [
+            "Nested Loop  (cost=0.28..9487.50 rows=333333 width=6)",
+            "  Output: e.b, k.b",
+            "  ->  Seq Scan on public.e  (cost=0.00..15.00 rows=1000 width=7)",
+            "        Output: e.a, e.b",
+            "  ->  Index Scan using k_pkey on public.k  (cost=0.28..6.14 rows=333 width=7)",
+            "        Output: k.a, k.b",
+            "        Index Cond: (k.a > e.a)",
+        ],
+    ),
+    # Measured on PostgreSQL 15.19: the inner side is unique whichever
+    # order the FROM writes the tables in.
+    "a hash join written inner side first is inner unique": (
+        "RP-1030",
+        _ANALYSED,
+        "explain verbose select * from k join e on e.a = k.a",
+        [
+            "Hash Join  (cost=27.50..45.14 rows=1000 width=14)",
+            "  Output: k.a, k.b, e.a, e.b",
+            "  Inner Unique: true",
+            "  Hash Cond: (e.a = k.a)",
+            "  ->  Seq Scan on public.e  (cost=0.00..15.00 rows=1000 width=7)",
+            "        Output: e.a, e.b",
+            "  ->  Hash  (cost=15.00..15.00 rows=1000 width=7)",
+            "        Output: k.a, k.b",
+            "        ->  Seq Scan on public.k  (cost=0.00..15.00 rows=1000 width=7)",
+            "              Output: k.a, k.b",
+        ],
+    ),
+    # Measured on PostgreSQL 15.19: under VERBOSE a structured format names
+    # a scan's schema (`ExplainScanTarget`).
+    "a structured verbose scan names its schema": (
+        "RP-1031",
+        _ANALYSED,
+        "explain (verbose, costs off, format json) select * from e",
+        [
+            '[\n  {\n    "Plan": {\n      "Node Type": "Seq Scan",\n'
+            '      "Parallel Aware": false,\n      "Async Capable": false,\n'
+            '      "Relation Name": "e",\n      "Schema": "public",\n'
+            '      "Alias": "e",\n      "Output": ["a", "b"]\n'
+            "    }\n  }\n]"
         ],
     ),
     # Measured on PostgreSQL 15.19 (RP-966): a Limit over the Sort prints

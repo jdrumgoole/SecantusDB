@@ -1756,22 +1756,29 @@ a regression test.
       (found while working RP-919).
       Verify: none -- a performance budget; the two tests named above time it
       Backlog-ID: RP-1020
-- [ ] **EXPLAIN VERBOSE prints no `Output` lists on a join's nodes.** A
-      plan over one relation prints as VERBOSE does: its scan (RP-925) and
-      the Sorts and Limits above it, each with the scan's `Output` and its
-      `Sort Key` qualified (RP-966, in part). A join's nodes do not:
-      PostgreSQL 15.19 prints each with its `Output` (`Output: e.a, e.b,
-      e2.a, e2.b` on a Nested Loop, its Materialize's and Memoize's
-      likewise), and an inner index scan's `Index Cond` qualified (`(k.a >
-      r.a)`); here the plain plan. Nor does a Sort on a computed key
-      (`order by a+1` prints `Output: a, ((a + 1))` and `Sort Key: ((k.a +
-      1))` over a scan whose `Output: a, (a + 1)`): `attach_verbose`
-      declines a key that is not a bare column. Measured on a private 15.19
-      cluster (found while working RP-916). Where to build it: every other
-      node needs its targetlist deparsed (`show_plan_tlist`, prefixed when
-      the range table holds more than one relation) and its quals and keys
+- [ ] **EXPLAIN VERBOSE prints no `Output` lists on most joins' nodes.**
+      A plan over one relation prints as VERBOSE does: its scan (RP-925)
+      and the Sorts and Limits above it, each with the scan's `Output` and
+      its `Sort Key` qualified; and a hash join of two relations on column
+      equalities with no WHERE prints every node's `Output` and its `Inner
+      Unique` (RP-966, in part: `ruleutils::explain_verbose_join`,
+      `explain::attach_verbose_join`). Every other join does not: PostgreSQL
+      15.19 prints a Nested Loop's, a Merge Join's, its Materialize's and
+      Memoize's `Output` likewise (`select e.b, k.b from e join k on e.a <
+      k.a`: `Output: e.b, k.b` on the Nested Loop, `Output: e.a, e.b` on the
+      outer Seq Scan, which returns its physical target list, `Output: k.a,
+      k.b` on the inner index scan and its `Index Cond: (k.a > e.a)`
+      prefixed); here the plain plan. Nor does a join with a WHERE (its
+      scans' quals prefixed), an ON that is not column equalities, or
+      three or more relations; nor a Sort on a computed key (`order by a+1`
+      prints `Output: a, ((a + 1))` and `Sort Key: ((k.a + 1))` over a scan
+      whose `Output: a, (a + 1)`): `attach_verbose` declines a key that is
+      not a bare column. Where to build it: every node's targetlist
+      deparsed (`show_plan_tlist`, prefixed when the range table holds more
+      than one relation; a node under a Hash, Sort or Material returns only
+      the columns needed above, `CP_SMALL_TLIST`), its quals and keys
       printed with `unqualified = false`.
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a join's nodes print their output under verbose]
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a nested loop's nodes print their output under verbose]
       Backlog-ID: RP-966
 
 
@@ -2943,6 +2950,24 @@ statement is VALUES-only and runs there as written. The gap test is in
 
 ## Found while working RP-966 (2026-11-17)
 
+- [ ] **A hash join written inner side first is not `Inner Unique`.**
+      `explain verbose select * from k join e on e.a = k.a` (`k.a` the
+      primary key, `k` hashed) prints `Inner Unique: true` in PostgreSQL
+      15.19, as the same join written `e join k` does; here `false`, in
+      the structured formats without VERBOSE too (`"Inner Unique":
+      false`). The `unique_probe` of the join's inner table is taken from
+      the side the FROM writes second, not the side the plan hashes.
+      Measured on the 15.19 reference on port 5415.
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a hash join written inner side first is inner unique]
+      Backlog-ID: RP-1030
+- [ ] **A structured EXPLAIN VERBOSE names no `Schema` on a scan.**
+      `explain (verbose, costs off, format json) select * from e` prints
+      `"Relation Name": "e", "Schema": "public", "Alias": "e"` in
+      PostgreSQL 15.19 (`ExplainScanTarget` adds the schema under
+      VERBOSE); here no `Schema` key, on every scan of every structured
+      format. Measured on the 15.19 reference on port 5415.
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a structured verbose scan names its schema]
+      Backlog-ID: RP-1031
 - [ ] **A Limit over a Sort of a filtered scan is not priced.**
       PostgreSQL 15.19 prints `explain select a from k where a > 5 order by
       b desc limit 3` (`k` analysed, 1,000 rows) as `Limit

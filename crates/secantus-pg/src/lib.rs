@@ -47003,6 +47003,7 @@ impl PgHandler {
                 explain::apply_implied_filters(&mut tree);
                 explain::attach_scan_alias(&mut tree, &options.scan_alias);
                 explain::attach_verbose(&mut tree, &options.verbose_scan);
+                explain::attach_verbose_join(&mut tree, &options.verbose_join);
                 // ANALYZE runs the statement, as PostgreSQL's does -- a write
                 // is written -- and reports the rows it produced.
                 let actual = if options.analyze {

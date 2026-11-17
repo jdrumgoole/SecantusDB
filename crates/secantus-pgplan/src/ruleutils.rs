@@ -6476,6 +6476,197 @@ pub fn explain_verbose_scan(
     })
 }
 
+/// One relation of a two-relation join under `EXPLAIN VERBOSE` (RP-966).
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct VerboseRel {
+    /// The relation as the node names it: `public.e`, `public.e e2`.
+    pub relation: String,
+    /// The relation as the plain plan names it: `e`, `e e2`.
+    pub plain: String,
+    /// Every column, prefixed: a scan's physical target list
+    /// (`use_physical_tlist`).
+    pub columns: Vec<String>,
+    /// The columns the join needs from it, prefixed, in the order its
+    /// `reltarget` collects them (`build_base_rel_tlists`, then the join
+    /// clauses): what a scan under a Hash returns (`CP_SMALL_TLIST`).
+    pub needed: Vec<String>,
+}
+
+/// `EXPLAIN VERBOSE` of a SELECT joining two relations on an ON of
+/// column equalities, with no WHERE (RP-966): each relation's lists, and
+/// the join's target list, prefixed (`show_plan_tlist`'s `useprefix`
+/// holds with two relations in the range table).
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct VerboseJoin {
+    pub rels: [VerboseRel; 2],
+    pub output: Vec<String>,
+}
+
+/// [`VerboseJoin`] for `SELECT <columns or *> FROM a [LEFT] JOIN b ON
+/// a.x = b.y [AND ...]`; `None` for any other shape.
+pub fn explain_verbose_join(
+    s: &pg_query::protobuf::SelectStmt,
+    lookup: &dyn Fn(&str) -> Option<TableDef>,
+) -> Option<VerboseJoin> {
+    if s.where_clause.is_some()
+        || !s.group_clause.is_empty()
+        || s.having_clause.is_some()
+        || !s.distinct_clause.is_empty()
+        || !s.sort_clause.is_empty()
+        || s.limit_count.is_some()
+        || s.limit_offset.is_some()
+        || !s.window_clause.is_empty()
+    {
+        return None;
+    }
+    let [item] = s.from_clause.as_slice() else {
+        return None;
+    };
+    let Some(N::JoinExpr(j)) = item.node.as_ref() else {
+        return None;
+    };
+    if j.is_natural || !j.using_clause.is_empty() || j.alias.is_some() {
+        return None;
+    }
+    let jt = pg_query::protobuf::JoinType::try_from(j.jointype).ok()?;
+    if !matches!(
+        jt,
+        pg_query::protobuf::JoinType::JoinInner | pg_query::protobuf::JoinType::JoinLeft
+    ) {
+        return None;
+    }
+    let side = |n: &Option<Box<Node>>| -> Option<(String, TableDef, Option<String>)> {
+        let Some(N::RangeVar(rv)) = n.as_deref()?.node.as_ref() else {
+            return None;
+        };
+        let def = lookup(&rv.relname)?;
+        let alias = rv.alias.as_ref().map(|a| a.aliasname.clone());
+        let refname = alias
+            .clone()
+            .unwrap_or_else(|| crate::schemas::split_key(&def.name).1);
+        Some((refname, def, alias))
+    };
+    let sides = [side(&j.larg)?, side(&j.rarg)?];
+    if sides[0].0 == sides[1].0 {
+        return None;
+    }
+    // A column reference's relation and column, by name.
+    let resolve = |c: &pg_query::protobuf::ColumnRef| -> Option<(usize, String)> {
+        let names: Vec<&str> = c
+            .fields
+            .iter()
+            .map(|f| match f.node.as_ref() {
+                Some(N::String(s)) => Some(s.sval.as_str()),
+                _ => None,
+            })
+            .collect::<Option<_>>()?;
+        let has = |i: usize, col: &str| sides[i].1.columns.iter().any(|c| c.name == col);
+        match names.as_slice() {
+            [rel, col] => {
+                let i = sides.iter().position(|s| s.0 == *rel)?;
+                has(i, col).then(|| (i, col.to_string()))
+            }
+            [col] => match (has(0, col), has(1, col)) {
+                (true, false) => Some((0, col.to_string())),
+                (false, true) => Some((1, col.to_string())),
+                _ => None,
+            },
+            _ => None,
+        }
+    };
+    let mut needed: [Vec<String>; 2] = [Vec::new(), Vec::new()];
+    let mut need = |i: usize, col: &str| {
+        if !needed[i].iter().any(|c| c == col) {
+            needed[i].push(col.to_string());
+        }
+    };
+    let mut output = Vec::new();
+    let pre = |i: usize, col: &str| format!("{}.{}", q(&sides[i].0), q(col));
+    for t in &s.target_list {
+        let Some(N::ResTarget(rt)) = t.node.as_ref() else {
+            return None;
+        };
+        let Some(N::ColumnRef(c)) = rt.val.as_deref()?.node.as_ref() else {
+            return None;
+        };
+        let last_star = c
+            .fields
+            .last()
+            .is_some_and(|f| matches!(f.node.as_ref(), Some(N::AStar(_))));
+        if last_star {
+            let which: Vec<usize> = match c.fields.as_slice() {
+                [_] => vec![0, 1],
+                [rel, _] => match rel.node.as_ref() {
+                    Some(N::String(s)) => vec![sides.iter().position(|x| x.0 == s.sval)?],
+                    _ => return None,
+                },
+                _ => return None,
+            };
+            for i in which {
+                for col in &sides[i].1.columns {
+                    output.push(pre(i, &col.name));
+                    need(i, &col.name);
+                }
+            }
+            continue;
+        }
+        let (i, col) = resolve(c)?;
+        output.push(pre(i, &col));
+        need(i, &col);
+    }
+    // The ON: equalities between a column of each side.
+    let mut parts = Vec::new();
+    and_clauses(j.quals.as_deref()?, &mut parts);
+    for part in &parts {
+        let part: &Node = part;
+        let Some(N::AExpr(a)) = part.node.as_ref() else {
+            return None;
+        };
+        let op = a.name.iter().find_map(|n| match n.node.as_ref() {
+            Some(N::String(s)) => Some(s.sval.as_str()),
+            _ => None,
+        });
+        if a.kind() != pg_query::protobuf::AExprKind::AexprOp || op != Some("=") {
+            return None;
+        }
+        let col = |n: &Option<Box<Node>>| match n.as_deref()?.node.as_ref() {
+            Some(N::ColumnRef(c)) => resolve(c),
+            _ => None,
+        };
+        let ((li, lc), (ri, rc)) = (col(&a.lexpr)?, col(&a.rexpr)?);
+        if li == ri {
+            return None;
+        }
+        need(li, &lc);
+        need(ri, &rc);
+    }
+    let rel = |i: usize| {
+        let (refname, def, alias) = &sides[i];
+        let (schema, bare) = crate::schemas::split_key(&def.name);
+        let suffix = alias
+            .as_ref()
+            .map(|a| format!(" {}", q(a)))
+            .unwrap_or_default();
+        VerboseRel {
+            relation: format!("{}.{}{suffix}", q(&schema), q(&bare)),
+            plain: format!("{}{suffix}", q(&bare)),
+            columns: def
+                .columns
+                .iter()
+                .map(|c| format!("{}.{}", q(refname), q(&c.name)))
+                .collect(),
+            needed: needed[i]
+                .iter()
+                .map(|c| format!("{}.{}", q(refname), q(c)))
+                .collect(),
+        }
+    };
+    Some(VerboseJoin {
+        rels: [rel(0), rel(1)],
+        output,
+    })
+}
+
 #[cfg(test)]
 mod out_parameter_function_tests {
     use super::*;

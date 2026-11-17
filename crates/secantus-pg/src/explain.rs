@@ -1513,7 +1513,18 @@ pub(crate) fn render_text(
             }
         }
         out.push(header);
-        for (label, value) in &n.details {
+        // A join whose inner side is unique says so under VERBOSE, after
+        // its `Output` (`ExplainNode` prints the text format's only when
+        // true; RP-966).
+        let unique_at = (options.verbose && n.inner_unique && join_type_of(&n.name).is_some())
+            .then(|| usize::from(n.details.first().is_some_and(|(k, _)| k == "Output")));
+        for (i, (label, value)) in n.details.iter().enumerate() {
+            if unique_at == Some(i) {
+                out.push(format!(
+                    "{}Inner Unique: true",
+                    " ".repeat(2 + 6 * depth + pad)
+                ));
+            }
             out.push(format!(
                 "{}{label}: {value}",
                 " ".repeat(2 + 6 * depth + pad)
@@ -1672,11 +1683,17 @@ fn structured(
         }
         // Every join says whether its inner side is unique, before its
         // quals; the text format only under VERBOSE (`ExplainNode`).
+        // Under VERBOSE the target list comes first (`show_plan_tlist`).
+        let tlist = n.details.first().filter(|(k, _)| k == "Output");
+        if let Some((k, v)) = tlist {
+            let items = v.split(", ").map(|s| Value::Str(s.to_string())).collect();
+            fields.push((k.clone(), Value::Arr(items)));
+        }
         if join_type.is_some() {
             let b = if n.inner_unique { "true" } else { "false" };
             fields.push(("Inner Unique".into(), Value::Num(b.into())));
         }
-        for (k, v) in &n.details {
+        for (k, v) in &n.details[usize::from(tlist.is_some())..] {
             // A Memoize's key is one text (`show_memoize_info`).
             let value = if k.ends_with("Key") && k != "Cache Key" {
                 Value::Arr(v.split(", ").map(|s| Value::Str(s.to_string())).collect())
@@ -3272,6 +3289,63 @@ pub(crate) fn attach_verbose(
     root.details.insert(0, ("Output".into(), output.join(", ")));
 }
 
+/// `EXPLAIN VERBOSE` of a two-relation hash join (RP-966): every node
+/// prints its target list, prefixed, and each scan names its relation
+/// schema-qualified. The outer scan returns its physical target list
+/// (`use_physical_tlist`); the Hash and the scan under it only the
+/// columns the join needs (`CP_SMALL_TLIST`). Any other plan prints as
+/// without VERBOSE.
+pub(crate) fn attach_verbose_join(
+    root: &mut PlanNode,
+    join: &Option<secantus_pgplan::ruleutils::VerboseJoin>,
+) {
+    let Some(v) = join else {
+        return;
+    };
+    if !root.name.starts_with("Hash ") || join_type_of(&root.name).is_none() {
+        return;
+    }
+    let [outer, hash] = root.children.as_mut_slice() else {
+        return;
+    };
+    if hash.name != "Hash" || hash.children.len() != 1 || !outer.children.is_empty() {
+        return;
+    }
+    let inner = &hash.children[0];
+    if !inner.children.is_empty() {
+        return;
+    }
+    let rel_of = |n: &PlanNode| -> Option<usize> {
+        if !is_scan_name(&n.name) || n.details.iter().any(|(k, _)| k != "Index Cond") {
+            return None;
+        }
+        v.rels
+            .iter()
+            .position(|r| n.name.ends_with(&format!(" on {}", r.plain)))
+    };
+    let (Some(o), Some(i)) = (rel_of(outer), rel_of(inner)) else {
+        return;
+    };
+    if o == i {
+        return;
+    }
+    let requalify = |n: &mut PlanNode, r: &secantus_pgplan::ruleutils::VerboseRel| {
+        let at = n.name.len() - r.plain.len();
+        n.name = format!("{}{}", &n.name[..at], r.relation);
+    };
+    requalify(outer, &v.rels[o]);
+    outer
+        .details
+        .insert(0, ("Output".into(), v.rels[o].columns.join(", ")));
+    let needed = v.rels[i].needed.join(", ");
+    hash.details.insert(0, ("Output".into(), needed.clone()));
+    let inner = &mut hash.children[0];
+    requalify(inner, &v.rels[i]);
+    inner.details.insert(0, ("Output".into(), needed));
+    root.details
+        .insert(0, ("Output".into(), v.output.join(", ")));
+}
+
 /// A single-relation plan's scan names the relation's alias after it, as
 /// `ExplainTargetRel` prints `Seq Scan on k x` (RP-967).
 pub(crate) fn attach_scan_alias(root: &mut PlanNode, alias: &Option<String>) {
@@ -3425,6 +3499,7 @@ mod heap_fetches_tests {
             analyze: true,
             verbose: false,
             verbose_scan: None,
+            verbose_join: None,
             scan_alias: None,
             costs: false,
             timing: false,
