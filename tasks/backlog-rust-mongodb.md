@@ -660,14 +660,6 @@ These are explicit non-goals. Don't add them without a reason.
       falls within mongod's own run-to-run spread of its answer.
       Verify: none -- mongod's own answer varies between runs; no test can pin it
       Backlog-ID: RM-556
-- [ ] **A `returnKey` read with a `sortKey` field over an index's order
-      has no SORT_KEY_GENERATOR.** mongod 8.2.11 plans `find({y: {$gte:
-      0}}, {k: {$meta: "sortKey"}}).sort({y: 1}).returnKey()` over `{y: 1,
-      x: 1}` as `RETURN_KEY <- SORT_KEY_GENERATOR <- IXSCAN`; this
-      server's explain names `RETURN_KEY <- IXSCAN`. The keys returned
-      match. Found 2026-11-15 (RM-568).
-      Verify: tests/backlog/test_rm_found_rm568b.py::test_return_key_with_a_sort_key_over_an_index_sort_explains_a_key_generator
-      Backlog-ID: RM-706
 - [ ] **A GEO_NEAR stage's `executionStats` are not mongod's.** mongod
       8.2.11's GEO_NEAR_2D for `find({loc: {$near: [0, 0]}})` over twelve
       points and a `{loc: "2d"}` index reports `searchIntervals`, an

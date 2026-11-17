@@ -782,7 +782,7 @@ fn plan_for(
 /// `analyzeDataAccess` places one (measured 8.2.11: `SORT_KEY_GENERATOR <-
 /// COLLSCAN`), and `stats` given the stage's level, which passes its
 /// input's documents on.
-fn sort_key_generator(plan: Node, stats: Option<&mut Stats>) -> Node {
+pub(super) fn sort_key_generator(plan: Node, stats: Option<&mut Stats>) -> Node {
     match plan {
         Node::Limit(n, input) => Node::Limit(
             n,
