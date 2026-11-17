@@ -333,6 +333,8 @@ pub struct StoreOpening {
     /// The messages WiredTiger wrote while it opened, in order, as it
     /// formatted them: JSON objects under `json_output=(message)`.
     pub wt_messages: Vec<String>,
+    /// WiredTiger's recovery timestamp right after the open, 0 when none.
+    pub recovery_timestamp: u64,
     /// How long the whole open took after the lock file.
     pub open: std::time::Duration,
 }

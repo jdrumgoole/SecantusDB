@@ -237,6 +237,10 @@ pub struct OpenRecord {
     /// as `WiredTiger message` (22430) between `Opening WiredTiger` and
     /// `WiredTiger opened`.
     pub wt_messages: Vec<String>,
+    /// WiredTiger's recovery timestamp (`get=recovery`) right after the
+    /// open: the stable timestamp of the checkpoint it opened from, 0 when
+    /// none (mongod's `WiredTiger recoveryTimestamp`, 23987).
+    pub recovery_timestamp: u64,
     /// How long the whole open took after the lock file: WiredTiger, the
     /// tables, the recovery and the upgrades (mongod's
     /// `createStorageEngineMillis`).
@@ -8379,6 +8383,11 @@ impl Storage {
         let conn = Arc::new(Connection::open(home, config)?);
         let wt_open = wt_started.elapsed();
         let wt_messages = conn.take_messages();
+        // mongod reads the checkpoint's stable timestamp back right after
+        // the open and logs it as `WiredTiger recoveryTimestamp` (23987);
+        // WiredTiger answers in hex, `0` when there is none.
+        let recovery_timestamp = u64::from_str_radix(&conn.query_timestamp("get=recovery")?, 16)
+            .map_err(|e| StorageError::Internal(format!("recovery timestamp: {e}")))?;
         // An existing store's mode is the one its tables were created with,
         // read from WiredTiger's own metadata before anything is created: a
         // logged store records no mode of its own, and neither does a
@@ -8583,6 +8592,7 @@ impl Storage {
                 wt_config: config.to_string(),
                 wt_open,
                 wt_messages,
+                recovery_timestamp,
                 open: Duration::ZERO,
             },
             lock_file,

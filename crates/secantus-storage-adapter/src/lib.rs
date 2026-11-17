@@ -245,6 +245,7 @@ impl CmdStorage for StorageAdapter {
             wt_config: r.wt_config.clone(),
             wt_open: r.wt_open,
             wt_messages: r.wt_messages.clone(),
+            recovery_timestamp: r.recovery_timestamp,
             open: r.open,
         })
     }
