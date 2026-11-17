@@ -1175,6 +1175,11 @@ one beside it.
       in two of four runs, so the remainder sits at its tenth's edge; a
       FIXED? from one run is not a fix, and a close needs it to pass
       every run.)
+      (2026-11-17: still open. Its gap test passed CI once more, PR #2794,
+      a min of five per server taken apart; a debug build here measured a
+      ratio of 1.23 to 1.29 in ten of ten runs of fifteen rounds. The test
+      now takes fifteen paired rounds and bounds their median, and failed
+      ten of ten serially and three of three under `-n 9`.)
       Backlog-ID: RP-911
       Verify: tests/backlog/test_rp_catalog_latency.py::test_the_first_catalog_query_after_ddl_costs_the_same_at_800_tables_within_a_tenth
 
