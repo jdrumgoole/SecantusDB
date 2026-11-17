@@ -811,17 +811,18 @@ These are explicit non-goals. Don't add them without a reason.
         winner after its trial's buffer and count as mongod's do; the
         other readers still decline a contested plan
         (`order::stream_plan`);
-      - a read of a time-series collection made whole: under a `$sort`, a
+      - a read of a time-series collection made whole: under a
         `$group` (`count_documents`), an inclusion `$project` (RM-456), a
         filter on the meta field (RM-457), a hint or a collation. mongod
         counts the buckets its cursor stage buffered (five of five for a
         sorted `find`). Since RM-455 a `find` is the aggregation mongod
-        converts it to, and counts where a time-series `aggregate` streams;
+        converts it to, and counts where a time-series `aggregate` streams,
+        and since 2026-11-17 under a `$sort`;
       - a geo, `$near` or `$text` read (`$geoWithin` over a `2d` index:
         mongod 5 keys and 4 documents, this server none).
       Measured 2026-10-27, 2026-11-07, 2026-11-10 and 2026-11-13.
       Backlog-ID: RM-363
-      Verify: tests/backlog/test_rm_355_364.py::test_a_time_series_read_made_whole_counts_what_it_examined
+      Verify: tests/backlog/test_rm_355_364.py::test_a_grouped_time_series_read_counts_what_it_examined
 - [ ] **WiredTiger 11's interruptible cache wait is not on the line.**
       mongod 8.2.11's WiredTiger splits a cache wait into the share spent
       in interruptible eviction (`timeWaitingMicros.cacheInterruptibleMicros`)

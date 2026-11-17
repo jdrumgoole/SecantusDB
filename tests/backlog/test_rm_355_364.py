@@ -1482,16 +1482,51 @@ def test_a_time_series_find_counts_the_buckets_its_first_batch_examined(
     assert answers["rust"] == answers["mongod"]
 
 
-@pytest.mark.backlog("RM-363")
+@pytest.mark.backlog_fixed("RM-363")
 def test_a_time_series_read_made_whole_counts_what_it_examined(
     rust_mongo: Any, mongod_rs: Any
 ) -> None:
     """mongod 8.2.11's line for a sorted `find` of five buckets counts the
-    five it examined (measured 2026-11-10). This server reads a time-series
-    collection whole under a sort, and counts nothing."""
+    five it examined (measured 2026-11-10). This server read a time-series
+    collection whole under a sort, and counted nothing, until its `$sort`
+    ran once over the buckets the cursor stage unpacked (RM-363)."""
     got = _both(rust_mongo, mongod_rs, lambda d: list(d.ts.find().sort("v", -1).limit(3)), _series)
     answers = {s: _counts(_line(lines, "find")) for s, (lines, _) in got.items()}
     assert answers["mongod"].get("docsExamined") == 5
+    assert answers["rust"] == answers["mongod"]
+
+
+@pytest.mark.backlog_fixed("RM-363")
+@pytest.mark.parametrize(
+    "pipeline",
+    [
+        [{"$match": {"v": {"$gt": 100}}}, {"$sort": {"v": -1}}, {"$limit": 2}],
+        [{"$sort": {"t": 1}}, {"$skip": 290}],
+        [{"$set": {"w": 1}}, {"$sort": {"v": 1}}, {"$limit": 1}],
+    ],
+)
+def test_a_sorted_time_series_aggregate_counts_what_it_examined(
+    rust_mongo: Any, mongod_rs: Any, pipeline: list
+) -> None:
+    """A time-series `aggregate` with a `$sort` counts the buckets its
+    cursor stage unpacked on each line, as mongod 8.2.11's do (measured
+    2026-11-17)."""
+    got = _both(rust_mongo, mongod_rs, lambda d: list(d.ts.aggregate(pipeline)), _series)
+    answers = {s: [_counts(a) for _, a in lines] for s, (lines, _) in got.items()}
+    assert answers["rust"] == answers["mongod"]
+
+
+@pytest.mark.backlog("RM-363")
+def test_a_grouped_time_series_read_counts_what_it_examined(
+    rust_mongo: Any, mongod_rs: Any
+) -> None:
+    """mongod 8.2.11's line for an `aggregate` that groups five buckets
+    counts what its cursor stage examined. This server reads a time-series
+    collection whole under a `$group`, and counts nothing."""
+    pipeline = [{"$group": {"_id": "$m", "n": {"$sum": 1}}}]
+    got = _both(rust_mongo, mongod_rs, lambda d: list(d.ts.aggregate(pipeline)), _series)
+    answers = {s: _counts(_line(lines, "aggregate")) for s, (lines, _) in got.items()}
+    assert "docsExamined" in answers["mongod"]
     assert answers["rust"] == answers["mongod"]
 
 
