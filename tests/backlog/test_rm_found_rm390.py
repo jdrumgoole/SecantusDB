@@ -39,13 +39,12 @@ def _profiled_counts(client: Any) -> list:
     ]
 
 
-@pytest.mark.backlog("RM-601")
+@pytest.mark.backlog_fixed("RM-601")
 def test_a_profile_entry_counts_what_it_examined_as_int32(rust_mongo: Any, mongod_rs: Any) -> None:
     """mongod 8.2.11 writes a profile entry's `keysExamined` and
     `docsExamined` as int32 (measured 2026-11-13, an updateMany and a find:
-    `{"$numberInt": "50"}`); this server writes them as int64, so a reader
-    of `system.profile` that checks the type, or compares the documents
-    byte for byte, sees a different entry."""
+    `{"$numberInt": "50"}`); this server wrote them as int64 until RM-601
+    was fixed."""
     theirs = _profiled_counts(mongod_rs)
     assert len(theirs) == 2, theirs
     assert _profiled_counts(rust_mongo) == theirs

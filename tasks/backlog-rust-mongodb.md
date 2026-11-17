@@ -1042,15 +1042,6 @@ about forty such points; these are the ones measured.
       `Held`. Found while fixing RM-390's CI test, 2026-11-13.
       Verify: tests/backlog/test_rm_found_2026_11_13_contested_reads.py::test_a_contested_read_costs_what_it_returns
       Backlog-ID: RM-610
-- [ ] **A profile entry counts what it examined as int64, where mongod
-      writes int32.** mongod 8.2.11's `system.profile` entry for an
-      updateMany or a find holds `keysExamined` and `docsExamined` as
-      int32 (`{"$numberInt": "50"}`, measured 2026-11-13); this server's
-      holds them as int64, so a reader that checks the BSON type, or
-      compares entries exactly, sees a different document. Found while
-      working RM-390, 2026-11-13.
-      Verify: tests/backlog/test_rm_found_rm390.py::test_a_profile_entry_counts_what_it_examined_as_int32
-      Backlog-ID: RM-601
 - [ ] **A write's profile entry counts no yields, where mongod counts
       each.** mongod 8.2.11's executor yields once its yield period (10 ms)
       has passed, before a `work()` call, and its `system.profile` entry

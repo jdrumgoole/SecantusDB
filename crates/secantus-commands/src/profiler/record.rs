@@ -572,8 +572,14 @@ fn outcome(
                 }
                 // What a streamed read examined for this batch.
                 if let Some(e) = &ctx.exec_stats {
-                    entry.insert("keysExamined", e.keys_examined);
-                    entry.insert("docsExamined", e.docs_examined);
+                    entry.insert(
+                        "keysExamined",
+                        crate::opdebug::append_number(e.keys_examined),
+                    );
+                    entry.insert(
+                        "docsExamined",
+                        crate::opdebug::append_number(e.docs_examined),
+                    );
                 }
                 // A stage that spilled (RM-211): mongod 8.2.11 puts
                 // `usedDisk` here and its `$group`'s spill counts after
@@ -680,8 +686,14 @@ fn execution(name: &str, doc: &Document, ok: bool, ctx: &CommandContext, entry: 
         entry.insert("queryShapeHash", shape);
     }
     if let (true, Some(e)) = (ok, &ctx.exec_stats) {
-        entry.insert("keysExamined", e.keys_examined);
-        entry.insert("docsExamined", e.docs_examined);
+        entry.insert(
+            "keysExamined",
+            crate::opdebug::append_number(e.keys_examined),
+        );
+        entry.insert(
+            "docsExamined",
+            crate::opdebug::append_number(e.docs_examined),
+        );
         // A `distinct` of a view ran an aggregation whose cursor it read to
         // the end (RM-493; measured 8.2.11).
         if e.exhausted {
@@ -1112,8 +1124,8 @@ impl Statement {
             out.insert("planCacheKey", key.clone());
         }
         if let (Some((keys, docs)), false) = (self.ran.examined, failed) {
-            out.insert("keysExamined", keys);
-            out.insert("docsExamined", docs);
+            out.insert("keysExamined", crate::opdebug::append_number(keys));
+            out.insert("docsExamined", crate::opdebug::append_number(docs));
         }
         if self.ran.oplog_slot_micros > 0 {
             out.insert(
