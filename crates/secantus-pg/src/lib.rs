@@ -11050,10 +11050,10 @@ impl PgHandler {
     }
 
     /// A general join's rows (`join_rows`), the left side fed a batch at a
-    /// time by `left` and each batch's joined rows handed to `emit` (`false`
-    /// stops), in the materialised path's order: each left row in turn with
-    /// its matching right rows in their order, then (RIGHT / FULL) the right
-    /// rows nothing matched.
+    /// time by `left` and its joined rows handed to `emit` at most
+    /// `JOIN_EMIT_ROWS` at a time (`false` stops), in the materialised
+    /// path's order: each left row in turn with its matching right rows in
+    /// their order, then (RIGHT / FULL) the right rows nothing matched.
     #[allow(clippy::too_many_arguments, clippy::type_complexity)]
     pub(crate) fn join_rows_core(
         &self,
@@ -11188,6 +11188,15 @@ impl PgHandler {
                         matched = true;
                         right_matched[i] = true;
                         out.push(d);
+                        // Handed on as they are made, so a consumer that
+                        // stops (a LIMIT) is never past a bounded number
+                        // of rows: one left batch against a large right
+                        // side was built whole first, gigabytes before
+                        // the LIMIT saw its first row.
+                        if out.len() >= JOIN_EMIT_ROWS && !emit(std::mem::take(&mut out))? {
+                            stopped = true;
+                            return Ok(false);
+                        }
                     }
                 }
                 if !matched && matches!(kind, JoinKind::Left | JoinKind::Full) {
@@ -61186,3 +61195,6 @@ mod type_catalog_reuse_tests {
         assert!(!Arc::ptr_eq(&first[1], &second[2]), "c was decoded anew");
     }
 }
+
+/// The most joined rows `join_rows_core` builds before handing them on.
+const JOIN_EMIT_ROWS: usize = 4096;
