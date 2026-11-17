@@ -39,3 +39,8 @@ ul.pts{font-size:36px;line-height:1.45;padding-left:40px;display:flex;flex-direc
 .arrow{font-size:44px;color:var(--green);font-weight:700;}
 .rise{animation:rise 600ms ease-out both;animation-delay:calc(var(--i) * 140ms);}
 @keyframes rise{from{opacity:0;transform:translateY(24px);}to{opacity:1;transform:translateY(0);}}
+.links{display:flex;flex-direction:column;gap:28px;}
+.links p{font-size:40px;overflow-wrap:anywhere;}
+.links .lk{display:inline-block;width:260px;font-size:24px;font-weight:600;letter-spacing:3px;text-transform:uppercase;color:var(--amber);}
+.links a{color:var(--paper);text-decoration:none;border-bottom:2px solid var(--amber);}
+@media (max-width: 820px), (max-height: 500px){.links{gap:14px;}.links .lk{display:block;width:auto;font-size:12px;letter-spacing:2px;}}
