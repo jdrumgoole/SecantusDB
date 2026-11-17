@@ -71,14 +71,25 @@ def test_an_intersect_over_a_join_with_a_unique_key_puts_the_smaller_input_first
     assert got == [("1.0",)]
 
 
-@pytest.mark.backlog("RP-841")
+@pytest.mark.backlog_fixed("RP-841")
 def test_an_intersect_over_a_comma_join_puts_the_smaller_input_first(dsn: str) -> None:
     """The comma form of the join, `select a.x from t692j a, t692j b where
     a.k = b.k intersect select 1.000`, is `1.000` on PostgreSQL 15.19, as
-    the ON form is. Here its join clause is a WHERE the set operation's
-    input estimate does not read, so the left input stays first."""
+    the ON form is. Its join clause was a WHERE the set operation's input
+    estimate did not read, so the left input stayed first."""
     with _connect(dsn) as c:
         got = _text(c, "select a.x from t692j a, t692j b where a.k = b.k intersect select 1.000")
+    assert got == [("1.000",)]
+
+
+@pytest.mark.backlog("RP-841")
+def test_an_intersect_over_a_grouped_input_puts_the_smaller_input_first(dsn: str) -> None:
+    """`select max(x) from t692j group by k intersect select 1.000` is
+    `1.000` on PostgreSQL 15.19: the GROUP BY's estimated groups outnumber
+    the constant's one. Here the aggregate input is not estimated, so the
+    left input stays first."""
+    with _connect(dsn) as c:
+        got = _text(c, "select max(x) from t692j group by k intersect select 1.000")
     assert got == [("1.000",)]
 
 

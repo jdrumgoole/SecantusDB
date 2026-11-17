@@ -191,7 +191,10 @@ impl PgHandler {
     /// over a FROM VALUES list, with nothing above the scan that changes
     /// its rows or groups.
     fn select_input_estimate(&self, sel: &secantus_pgplan::Select) -> Option<InputEstimate> {
-        if sel.residual.is_some()
+        // A comma join's residual is its re-checked key equality, which
+        // `join_input_estimate` reads itself.
+        let comma_join = sel.join.is_none() && sel.sub.is_some();
+        if (sel.residual.is_some() && !comma_join)
             || sel.series.is_some()
             || !sel.windows.is_empty()
             || sel.limit.is_some()
@@ -205,6 +208,9 @@ impl PgHandler {
         let fields: Vec<String> = sel.columns.iter().map(|(_, f)| f.clone()).collect();
         if let Some((rows, groups)) = self.join_input_estimate(sel) {
             return Some(InputEstimate { rows, groups });
+        }
+        if sel.residual.is_some() {
+            return None;
         }
         if let Some(sub) = &sel.sub {
             // `(VALUES ...) v(x)` is pulled up into the leaf as its

@@ -5320,7 +5320,11 @@ impl PgHandler {
     /// are `estimate_num_groups`': each table's columns' distinct counts
     /// clamped to that table's rows, multiplied, and clamped to the join's.
     pub(crate) fn join_input_estimate(&self, sel: &secantus_pgplan::Select) -> Option<(f64, f64)> {
-        if !sel.filter.is_empty() || sel.residual.is_some() || sel.casts.iter().any(Option::is_some)
+        // A comma join's key equality is re-checked above the join as the
+        // select's residual (`joined_rows_input_sides` admits only that).
+        if !sel.filter.is_empty()
+            || (sel.residual.is_some() && sel.join.is_some())
+            || sel.casts.iter().any(Option::is_some)
         {
             return None;
         }
@@ -5446,14 +5450,11 @@ impl PgHandler {
         let Statement::JoinRows(j) = sub.plan.as_ref() else {
             return None;
         };
-        if !j.where_filters.is_empty() || j.where_spans_equality || !j.where_modelled {
-            return None;
-        }
         let JoinNode::Join {
             kind: JoinKind::Inner,
             left,
             right,
-            on: Some(_),
+            on,
             on_other: false,
             equi,
             merged,
@@ -5466,7 +5467,31 @@ impl PgHandler {
         let [(left_key, right_key)] = equi.as_slice() else {
             return None;
         };
-        if !merged.is_empty() || !expr_keys.is_empty() {
+        if !merged.is_empty() || !expr_keys.is_empty() || !j.where_modelled {
+            return None;
+        }
+        // The join clause is an ON's or -- a comma join, `FROM a, b WHERE
+        // a.k = b.k` -- the WHERE's one conjunct, that same equality,
+        // which the executor re-checks above the join as the residual:
+        // PostgreSQL makes an inner join's WHERE and ON quals one list
+        // (`deconstruct_jointree`), so both estimate alike.
+        let comma_clause = on.is_none()
+            && j.where_spans_equality
+            && j.where_filters.len() == 1
+            && j.where_equalities.len() == 1
+            && j.where_equalities.iter().all(|(l, r)| {
+                (l == left_key && r == right_key) || (l == right_key && r == left_key)
+            })
+            && sel
+                .residual
+                .as_ref()
+                .is_none_or(|r| is_key_equality(r, equi, 0));
+        if !comma_clause
+            && (on.is_none()
+                || sel.residual.is_some()
+                || !j.where_filters.is_empty()
+                || j.where_spans_equality)
+        {
             return None;
         }
         let side = |n: &JoinNode, key: &str| -> Option<(String, String, Vec<String>)> {
