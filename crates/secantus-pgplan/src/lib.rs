@@ -52701,6 +52701,11 @@ fn lower_aexpr(e: &AExpr, def: &TableDef, params: &[Bson]) -> Result<Document> {
         return lower_pattern_match(e, def, params);
     }
 
+    // `const op column` is the column's clause through the operator's
+    // commutator, as `scalarineqsel` and `eqsel` read it (RP-1021).
+    if let Some(commuted) = commuted_comparison(e, op) {
+        return lower_aexpr(&commuted, def, params);
+    }
     let col = match e.lexpr.as_ref().and_then(|l| l.node.as_ref()) {
         Some(N::ColumnRef(c)) => {
             column_ref_name(c).ok_or_else(|| Error::Unsupported("this column reference".into()))?
@@ -52985,6 +52990,39 @@ fn coerce_any_array(rhs: Bson, element_type: &str) -> Result<Bson> {
         }
     }
     Ok(rhs)
+}
+
+/// `const op column` as `column commutator(op) const`, for a built-in
+/// comparison whose left side folds to a constant; `None` otherwise.
+fn commuted_comparison(e: &AExpr, op: &str) -> Option<AExpr> {
+    let commutator = match op {
+        "=" => "=",
+        "<>" => "<>",
+        "!=" => "!=",
+        "<" => ">",
+        "<=" => ">=",
+        ">" => "<",
+        ">=" => "<=",
+        _ => return None,
+    };
+    if user_ops::defines(op)
+        || !e.lexpr.as_deref().is_some_and(folds_to_constant)
+        || !matches!(
+            e.rexpr.as_deref().and_then(|r| r.node.as_ref()),
+            Some(N::ColumnRef(_))
+        )
+    {
+        return None;
+    }
+    let mut out = e.clone();
+    std::mem::swap(&mut out.lexpr, &mut out.rexpr);
+    let last = out.name.last_mut()?;
+    *last = pg_query::protobuf::Node {
+        node: Some(N::String(pg_query::protobuf::String {
+            sval: commutator.into(),
+        })),
+    };
+    Some(out)
 }
 
 /// The MQL comparison operator for a SQL scalar comparison operator.
@@ -55451,5 +55489,48 @@ mod rp475_function_scan_filter {
         let q = qual.unwrap();
         assert_eq!(q.ops, 1);
         assert!((q.selectivity(1000.0) - 1.0 / 3.0).abs() < 1e-9);
+    }
+}
+
+#[cfg(test)]
+mod rp1021_commuted_comparison {
+    use super::*;
+
+    fn lowered(sql: &str) -> Document {
+        let def = TableDef::new(
+            "e",
+            vec![secantus_pgcatalog::Column::new("a", "int4", false)],
+        );
+        let tree = pg_query::parse(sql).unwrap();
+        let Some(N::SelectStmt(s)) = tree.protobuf.stmts[0]
+            .stmt
+            .as_ref()
+            .and_then(|n| n.node.clone())
+        else {
+            panic!("not a select");
+        };
+        lower_where_nonvolatile(s.where_clause.as_deref().unwrap(), &def, &[]).unwrap()
+    }
+
+    /// A constant on the left of a built-in comparison is the column's
+    /// clause through the commutator (RP-1021).
+    #[test]
+    fn a_constant_on_the_left_is_commuted() {
+        assert_eq!(
+            lowered("select * from e where 3 < a"),
+            lowered("select * from e where a > 3")
+        );
+        assert_eq!(
+            lowered("select * from e where 3 >= a"),
+            lowered("select * from e where a <= 3")
+        );
+        assert_eq!(
+            lowered("select * from e where 3 = a"),
+            lowered("select * from e where a = 3")
+        );
+        assert_eq!(
+            lowered("select * from e where 3 <> a"),
+            lowered("select * from e where a <> 3")
+        );
     }
 }

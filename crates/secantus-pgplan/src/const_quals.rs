@@ -417,6 +417,36 @@ fn text_const(s: String) -> pg_query::protobuf::Node {
     }
 }
 
+/// A plain call of an immutable built-in whose every argument is a
+/// non-NULL constant: what `simplify_function` evaluates (RP-1021). A
+/// NULL argument is the strict-function rule's, left to it.
+fn immutable_call_of_constants(f: &pg_query::protobuf::FuncCall) -> bool {
+    !f.args.is_empty()
+        && f.agg_order.is_empty()
+        && f.agg_filter.is_none()
+        && f.over.is_none()
+        && !f.agg_star
+        && !f.agg_distinct
+        && !f.func_variadic
+        && f.args.iter().all(non_null_literal)
+        && crate::func_name(f).is_some_and(|name| {
+            crate::correlated::immutable_builtin(&name, f.args.len())
+                && crate::correlated::user_function_for(&name, &f.args).is_none()
+        })
+}
+
+fn int_const(v: i32) -> pg_query::protobuf::Node {
+    pg_query::protobuf::Node {
+        node: Some(N::AConst(pg_query::protobuf::AConst {
+            val: Some(pg_query::protobuf::a_const::Val::Ival(
+                pg_query::protobuf::Integer { ival: v },
+            )),
+            location: -1,
+            ..Default::default()
+        })),
+    }
+}
+
 /// A non-NULL literal: `eval_const_expressions`' `Const`.
 fn non_null_literal(n: &pg_query::protobuf::Node) -> bool {
     match n.node.as_ref() {
@@ -484,6 +514,26 @@ pub(crate) fn fold_calls(n: &mut pg_query::protobuf::Node) -> Result<bool> {
                     };
                     *x = text_const(folded);
                     changed = true;
+                }
+            }
+            Some(N::FuncCall(f)) if immutable_call_of_constants(f) => {
+                // `simplify_function`: an immutable call over constants is
+                // run, and its result is the constant. Folding runs the
+                // call, so a data exception it raises is the plan's.
+                match crate::const_value(x, &[]) {
+                    Ok(Bson::Int32(v)) => {
+                        *x = int_const(v);
+                        changed = true;
+                    }
+                    Ok(Bson::Boolean(b)) => {
+                        *x = const_node(if b { ConstQual::True } else { ConstQual::False });
+                        changed = true;
+                    }
+                    // A result of another type is not yet printed as its
+                    // constant; it is left as the call.
+                    Ok(_) => {}
+                    Err(e) if e.sqlstate().starts_with("22") => return Err(e),
+                    Err(_) => {}
                 }
             }
             _ => {}

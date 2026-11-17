@@ -1925,16 +1925,6 @@ a regression test.
       it (2026-11-17, sized while working RP-841).
       Verify: tests/backlog/test_rp_explain_costs.py::test_plan[estimate of a regex match with a repeated group]
       Backlog-ID: RP-423
-- [ ] **A call over constants in a WHERE is not folded in EXPLAIN.**
-      `eval_const_expressions` folds an immutable call whose arguments are
-      all constants: PostgreSQL 15.19 prints `explain select * from e where
-      abs(-3) < a` (`e` analysed, 1,000 rows) as `Seq Scan on e
-      (cost=0.00..17.50 rows=997 width=7)` with `Filter: (3 < a)`; here
-      `cost=0.00..0.00 rows=0 width=0` and `Filter: (abs('-3'::integer) <
-      a)`. The rows are right. Measured on the 15.19 reference on port 5415
-      (found while working RP-423).
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a call over constants in a where is folded]
-      Backlog-ID: RP-1021
 - [ ] **A semi join cheaper unique-ified keeps the semi join's shape.**
       Since RP-411's first slice (2026-11-16) a WHERE that is one
       uncorrelated `col IN (select col from t)` / `= any`, or one `EXISTS`
