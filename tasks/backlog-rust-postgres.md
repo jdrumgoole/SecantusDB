@@ -2569,14 +2569,6 @@ Measured on a private PostgreSQL 15.19 cluster.
       (RP-492 a DO's grammar errors).
       Verify: tests/backlog/test_rp_found_rp619.py::test_expression_syntax_error_is_placed_in_the_body
       Backlog-ID: RP-958
-- [ ] **A DO block refuses PL/pgSQL's `#` compile options.**
-      `plpgsql_compile_inline` reads a DO body with the function grammar,
-      so `do $$ #variable_conflict use_column\n begin null; end $$` and
-      `#print_strict_params on` before a DECLARE run on PostgreSQL 15.19.
-      Here both are 42601 `syntax error at or near "#"` at 7 (`pl::parse`
-      refuses the `#` before the body reaches the interpreter).
-      Verify: tests/backlog/test_rp_found_rp619.py::test_do_block_takes_compile_options
-      Backlog-ID: RP-959
 - [ ] **A RETURN with a value in a routine returning void is accepted.**
       `make_return_stmt` refuses it as it reads the RETURN, before the
       expression is parsed: on PostgreSQL 15.19 `do $$ begin return 1; end

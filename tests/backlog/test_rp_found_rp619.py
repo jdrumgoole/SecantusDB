@@ -73,8 +73,9 @@ def test_expression_syntax_error_is_placed_in_the_body(dsn: str) -> None:
     ]
 
 
-@pytest.mark.backlog("RP-959")
+@pytest.mark.backlog_fixed("RP-959")
 def test_do_block_takes_compile_options(dsn: str) -> None:
+    """Was 42601 at the `#`; the block now runs on the function grammar."""
     assert _answers(dsn, DO_COMPILE_OPTIONS) == ["ok", "ok"]
 
 

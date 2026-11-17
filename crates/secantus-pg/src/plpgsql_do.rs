@@ -132,6 +132,13 @@ const RAISE_OPTIONS: &[&str] = &[
 pub fn parse(body: &str) -> Result<Vec<Stmt>, ParseError> {
     let chars: Vec<char> = body.chars().collect();
     let mut pos = skip_space(&chars, 0);
+    // A `#option` line before the block is the function grammar's
+    // (`plpgsql_compile_inline` reads the same grammar, RP-959).
+    if chars.get(pos) == Some(&'#') {
+        return Err(ParseError::Unsupported(
+            "a compile option in an inline code block".into(),
+        ));
+    }
     if is_label_at(&chars, pos) {
         return Err(ParseError::Unsupported(
             "a block label in an inline code block".into(),
