@@ -538,8 +538,6 @@ _DIVERGING_WRITES = {
         ],
         writeConcern={"w": 1},
     ),
-    # The image of a retryable findAndModify is written under its locks.
-    "findAndModify": lambda d: _w1(d).find_one_and_update({"_id": 1}, {"$set": {"q": 1}}),
     "$out": lambda d: list(_w1(_plain(d)).aggregate([{"$match": {}}, {"$out": "o"}])),
 }
 
@@ -549,6 +547,28 @@ _PLAIN_REMOVES = {
     "a document": lambda d: _w1(_plain(d)).find_one_and_delete({"_id": 1}),
     "nothing": lambda d: _w1(_plain(d)).find_one_and_delete({"_id": 999}),
 }
+
+
+#: Retryable findAndModifys that write an image.
+_IMAGE_WRITES = {
+    "update": lambda d: _w1(d).find_one_and_update({"_id": 1}, {"$set": {"q": 1}}),
+    "remove": lambda d: _w1(d).find_one_and_delete({"_id": 1}),
+}
+
+
+@pytest.mark.backlog_fixed("RM-357")
+@pytest.mark.parametrize("name", list(_IMAGE_WRITES))
+def test_a_retryable_find_and_modify_writes_its_image_under_its_locks(
+    rust_mongo: Any, mongod_rs: Any, name: str
+) -> None:
+    """mongod 8.2.11 writes a retryable `findAndModify`'s image in
+    `config.image_collection` under the command's locks, one more transition,
+    global and collection IX and no database IX, and a retryable remove takes
+    a single write round (measured 2026-11-17). This server took no lock for
+    the image, and nested a second round in a remove's."""
+    answers = _write_locks(rust_mongo, mongod_rs, _IMAGE_WRITES[name])
+    assert answers["mongod"]
+    assert answers["rust"] == answers["mongod"]
 
 
 @pytest.mark.backlog_fixed("RM-357")

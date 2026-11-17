@@ -1064,12 +1064,10 @@ pub fn statement_rounds(
         // write takes one flow control ticket where `drop`'s two rounds
         // take two (measured 8.2.11).
         // One that removes takes a single write round, whether or not it
-        // finds a document (measured 8.2.11, 2026-11-17, without a
-        // `txnNumber`).
+        // finds a document, retryable or not (measured 8.2.11, 2026-11-17).
         "findAndModify" | "findandmodify" => {
             let c = coll?;
-            if doc.get("remove").is_some_and(crate::util::truthy) && !doc.contains_key("txnNumber")
-            {
+            if doc.get("remove").is_some_and(crate::util::truthy) {
                 return Some(vec![write_round(Some(c))]);
             }
             let mut nested = write_round(None);
@@ -1985,6 +1983,32 @@ impl HeldToEnd {
             (Resource::Global, Mode::Ix),
             (Resource::Database(db.to_string()), Mode::Ix),
             (Resource::Collection(format!("{db}.{coll}")), Mode::Ix),
+        ];
+        for (res, mode) in &round {
+            lm.acquire(owner, res, *mode)?;
+        }
+        Ok(())
+    }
+}
+
+impl HeldToEnd {
+    /// The round a retryable `findAndModify`'s image is written in, inside
+    /// the held statement's locks: the transition, global and
+    /// `config.image_collection` locks in IX, with no database lock of its
+    /// own (measured 8.2.11, 2026-11-17: the image adds one transition, one
+    /// global and one collection IX to the line, and no database IX).
+    /// Nothing when no statement lock is held.
+    pub fn image_round(&self) -> Result<(), MaxTimeMsExpired> {
+        let Some((lm, owner)) = HELD_TO_END.with(|h| h.borrow().as_ref()?.last().cloned()) else {
+            return Ok(());
+        };
+        let round = [
+            (Resource::ReplicationStateTransition, Mode::Ix),
+            (Resource::Global, Mode::Ix),
+            (
+                Resource::Collection("config.image_collection".to_string()),
+                Mode::Ix,
+            ),
         ];
         for (res, mode) in &round {
             lm.acquire(owner, res, *mode)?;

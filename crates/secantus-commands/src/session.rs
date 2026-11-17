@@ -1339,7 +1339,14 @@ fn retryable_write(
         if let Some(ts) = s.take_last_retryable_ts() {
             pin_operation_time(&mut reply, ctx.replica_set_name.is_some(), s.as_ref());
             let kept = if fam {
-                keep_retry_image(s.as_ref(), doc, &reply, session.clone(), txn_number, ts)
+                keep_retry_image(
+                    s.as_ref(),
+                    doc,
+                    &reply,
+                    (&held, session.clone()),
+                    txn_number,
+                    ts,
+                )
             } else {
                 Ok(())
             };
@@ -1533,7 +1540,7 @@ fn keep_retry_image(
     storage: &dyn crate::Storage,
     doc: &Document,
     reply: &Document,
-    lsid: Document,
+    (held, lsid): (&crate::lock_manager::HeldToEnd, Document),
     txn_number: i64,
     ts: bson::Timestamp,
 ) -> Result<(), CommandError> {
@@ -1560,7 +1567,10 @@ fn keep_retry_image(
         "invalidated": false,
     };
     // mongod writes the image in the command's own unit of work, so a
-    // failure to keep it fails the command; it logs no entry for it.
+    // failure to keep it fails the command; it logs no entry for it. It
+    // takes the image collection under the command's locks (RM-357).
+    held.image_round()
+        .map_err(|_| CommandError::max_time_expired())?;
     let _unreplicated = storage.unreplicated();
     storage
         .update_matching(

@@ -570,7 +570,9 @@ These are explicit non-goals. Don't add them without a reason.
       one not there) reads the latest optime for its last op as mongod's
       entry point does (`lastop::entry_point_fixes`); since 2026-11-16 a
       `collMod` of a collection there takes mongod's global IS and its
-      collection X twice. Still different,
+      collection X twice; since 2026-11-17 a `findAndModify` that removes
+      takes one round, and a retryable one writes its image under the
+      transition, global and image collection IX. Still different,
       measured against a one-member replica set:
       - an `insert` of several documents one of which fails: mongod inserts
         them again a document at a time, each under a transition, global,
@@ -585,11 +587,6 @@ These are explicit non-goals. Don't add them without a reason.
         command's locks (`Metadata: {W: 1}`, one more global IX), taken
         without interrupt checks (the command's `numInterruptChecks` is
         mongod's without them);
-      - a retryable `findAndModify` writes its image under its locks (one
-        more transition, global and collection IX; a retryable remove reads
-        transition w 4, global w 3, database w 2, collection w 3 on mongod,
-        4/3/3/2 here, measured 2026-11-17); one without a `txnNumber` that
-        removes takes mongod's single round since 2026-11-17;
       - `$out` takes more transition locks than this server's rounds
         (measured on a standalone, RM-185), and an `$out`'s line here has
         one global IS more than mongod's (7 to 6, measured 8.2.11
