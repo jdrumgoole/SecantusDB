@@ -2247,7 +2247,20 @@ impl PgHandler {
         // join, priced by the caller (RP-908); that WHERE is not pushed to
         // a scan.
         let anti = left_join && Self::left_anti_key(sel).is_some();
-        if left_join && !anti && (!sel.filter.is_empty() || sel.residual.is_some()) {
+        // A WHERE whose every conjunct is an expression comparison over
+        // the preserved side is pushed to that side's scan and cannot
+        // reduce the join (RP-423).
+        let preserved_exprs = left_join
+            && !anti
+            && sel.filter.is_empty()
+            && j.where_modelled
+            && join_exprs_modelled()
+            && leaf_alias(left).is_some_and(join_exprs_only_of);
+        if left_join
+            && !anti
+            && !preserved_exprs
+            && (!sel.filter.is_empty() || sel.residual.is_some())
+        {
             return None;
         }
         // An ON's conjuncts beside its equalities are the join's filter,
@@ -6321,6 +6334,20 @@ fn join_exprs_count() -> usize {
             .map(|(_, q)| q.as_ref().map_or(0, Vec::len))
             .sum()
     })
+}
+
+/// Whether every expression comparison this EXPLAIN's join WHERE pushes
+/// is over `alias`.
+fn join_exprs_only_of(alias: &str) -> bool {
+    EXPLAIN_JOIN_EXPRS.with(|c| c.borrow().iter().all(|(a, _)| a == alias))
+}
+
+/// The alias of a join side that is one table's scan.
+fn leaf_alias(node: &secantus_pgplan::joins::JoinNode) -> Option<&str> {
+    let secantus_pgplan::joins::JoinNode::Leaf { columns, .. } = node else {
+        return None;
+    };
+    columns.first()?.0.split(secantus_pgplan::joins::SEP).next()
 }
 
 /// The expression comparisons a joined scan of `alias` runs as its

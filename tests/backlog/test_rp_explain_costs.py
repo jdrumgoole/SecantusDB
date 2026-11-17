@@ -5698,10 +5698,11 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "              Filter: (length(b) > 2)",
         ],
     ),
-    # Still open: a LEFT join whose WHERE filters its preserved side by an
-    # expression is PostgreSQL's Hash Right Join over that filtered scan.
+    # Fixed in part of RP-423: a LEFT join whose WHERE filters its
+    # preserved side by an expression was printed with zeros; it is
+    # PostgreSQL's Hash Right Join over that filtered scan.
     "estimate of a left join over a preserved scan filtered by a call": (
-        "RP-423",
+        "RP-423:fixed",
         _ANALYSED_STRINGS,
         "explain select e.a from e left join w on e.a = w.a where length(e.b) > 2",
         [
@@ -5711,6 +5712,21 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "  ->  Hash  (cost=20.00..20.00 rows=333 width=4)",
             "        ->  Seq Scan on e  (cost=0.00..20.00 rows=333 width=4)",
             "              Filter: (length(b) > 2)",
+        ],
+    ),
+    # Still open: a WHERE expression over both tables of a join is its
+    # Join Filter, which this server prints with zeros.
+    "estimate of a join filtered by an expression over both tables": (
+        "RP-423",
+        _ANALYSED_STRINGS,
+        "explain select e.a from e join w on e.a = w.a where e.a + w.a > 996",
+        [
+            "Hash Join  (cost=27.50..62.25 rows=333 width=4)",
+            "  Hash Cond: (w.a = e.a)",
+            "  Join Filter: ((e.a + w.a) > 996)",
+            "  ->  Seq Scan on w  (cost=0.00..16.00 rows=1000 width=4)",
+            "  ->  Hash  (cost=15.00..15.00 rows=1000 width=4)",
+            "        ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=4)",
         ],
     ),
     # Still open: a LIKE's ESCAPE is a `like_escape` call PostgreSQL folds
