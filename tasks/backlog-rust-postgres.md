@@ -2805,16 +2805,22 @@ Measured on PostgreSQL 15.19; none of it needs DDL. The gap tests are in
 Measured on PostgreSQL 15.19 (the shared reference on port 5415). The gap
 test is in `tests/backlog/test_rp_found_rp833.py`.
 
-- [ ] **A function in `pg_temp` is labelled without its schema.** A RAISE
-      in `pg_temp.f833()` carries CONTEXT `PL/pgSQL function
-      pg_temp_3.f833() line 1 at RAISE` on PostgreSQL 15.19:
-      `plpgsql_compile` labels a function by `format_procedure`, which
-      qualifies one whose schema is not on the search path, and `pg_temp`
-      is searched for no function. Here it is `f833()`
-      (`function_label` in `plpgsql_fn.rs` reads the CREATE text's bare
-      name); the same label frames an error.
-      Verify: tests/backlog/test_rp_found_rp833.py::test_a_pg_temp_function_is_labelled_with_its_schema
-      Backlog-ID: RP-1018
+
+## Found while working RP-1018 (2026-11-17)
+
+Measured on PostgreSQL 15.19 (the shared reference on port 5415). The gap
+test is in `tests/backlog/test_rp_found_rp833.py`.
+
+- [ ] **A function's CONTEXT label follows the search path of each call,
+      not of its first.** `plpgsql_compile` labels a function once, when the
+      session first compiles it, and keeps that label while the compiled
+      function is cached: on PostgreSQL 15.19, `s.f()` called first with
+      `s` off the path is `PL/pgSQL function s.f()`, and still is after
+      `set search_path = s`. Here `function_label` runs on every call, so
+      the second is `f()`. Faithful: label at the session's first compile,
+      kept until the function is replaced or dropped.
+      Verify: tests/backlog/test_rp_found_rp833.py::test_a_function_label_is_fixed_at_its_first_compile
+      Backlog-ID: RP-1034
 
 ## Found while working RP-689 (2026-11-10)
 

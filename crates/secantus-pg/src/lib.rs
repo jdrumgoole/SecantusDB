@@ -1425,9 +1425,16 @@ fn plpgsql_create_sql(doc: &Document) -> String {
     let ret = doc.get_str("return_tag").unwrap_or("void");
     // The function's own name: CONTEXT lines and the outer block's label
     // carry it.
+    let quote = |n: &str| format!("\"{}\"", n.replace('"', "\"\""));
     let fname = match doc.get_str("name") {
-        Ok(n) if !n.is_empty() => format!("\"{}\"", n.replace('"', "\"\"")),
+        Ok(n) if !n.is_empty() => quote(n),
         _ => "f".to_string(),
+    };
+    // Qualified by its schema, so the CONTEXT label can name one that is
+    // not visible (`format_procedure`).
+    let fname = match doc.get_str("schema") {
+        Ok(s) if !s.is_empty() && s != "public" && fname != "f" => format!("{}.{fname}", quote(s)),
+        _ => fname,
     };
     // A document with every parameter's MODE renders them as declared, in
     // order -- which is also the order the interpreter binds arguments in.
