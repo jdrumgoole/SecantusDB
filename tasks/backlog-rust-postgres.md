@@ -1947,7 +1947,16 @@ a regression test.
       (`select * from w where c ~ '^(w0)+1'`) is `Seq Scan on w
       (cost=0.00..18.50 rows=101 width=10)` there and zeros here. Measured
       on the 15.19 reference on port 5415 (found while working RP-404 and
-      RP-354).
+      RP-354). The repeated group's prefix is not a walk of the regex's
+      text: `pg_regprefix` reads the NFA after `regc_nfa.c`'s `optimize`
+      (`fixempties`, state merging), and a capturing group's `x{m,n}` is
+      first rewritten `x{m-1,n-1}x` (`parseqatom`). The prefixes 15.19
+      gives (an index's `Index Cond` over a `"C"` column): `^(w0)+1` `w`,
+      `^(ab)+a` `a`, `^a+a` `a`, `^(ab){2,}c` `ab`, `^a{3,}` `a`,
+      `^(ab){1,3}` none -- `^(ab){2,}c` stops short of what a hand walk of
+      `repeat`'s arcs gives (`aba`). The faithful fix ports `regcomp.c` /
+      `regc_nfa.c`'s NFA build and optimisation and runs `findprefix` on
+      it (2026-11-17, sized while working RP-841).
       Verify: tests/backlog/test_rp_explain_costs.py::test_plan[estimate of a regex match with a repeated group]
       Backlog-ID: RP-423
 - [ ] **A call over constants in a WHERE is not folded in EXPLAIN.**
