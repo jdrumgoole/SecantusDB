@@ -24,12 +24,13 @@ def dsn(rust_pg: object) -> Iterator[str]:
     yield _dsn(rust_pg) + " dbname=postgres"
 
 
-@pytest.mark.backlog("RP-942")
+@pytest.mark.backlog_fixed("RP-942")
 def test_a_multi_row_plpgsql_fetch_is_feature_not_supported(dsn: str) -> None:
     """PostgreSQL 15.19 refuses `FETCH FORWARD 2 FROM c INTO r` when the
     function is compiled -- a branch that never runs included -- with 0A000
     `FETCH statement cannot return multiple rows` at the FETCH (position
-    72 here). This server answers 42601 with no position."""
+    72 here). This server answered 42601 with no position, then 0A000 at
+    the token after INTO."""
     block = (
         "do $$ declare c scroll cursor for select 1; r int; begin"
         " if false then fetch forward 2 from c into r; end if; end $$"

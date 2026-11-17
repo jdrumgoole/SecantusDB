@@ -2678,22 +2678,6 @@ still computed whole, and the cursor answers that differ either way.
       Verify: tests/backlog/test_rp_found_rp744.py::test_a_cursors_where_filters_as_it_is_fetched
       Backlog-ID: RP-961
 
-## Found while working RP-898 (2026-11-14)
-
-Measured on PostgreSQL 15.19 (the shared reference on port 5415; a DO
-block creates no object). The gap test is in
-`tests/backlog/test_rp_found_rp898.py`.
-
-- [ ] **A PL/pgSQL FETCH of more than one row is refused with the wrong
-      SQLSTATE.** `do $$ declare c scroll cursor for select 1; r int;
-      begin if false then fetch forward 2 from c into r; end if; end $$`
-      is 0A000 `FETCH statement cannot return multiple rows` on PostgreSQL
-      15.19 (`pl_gram.y`'s `stmt_fetch`, at compile time), with the
-      statement position at the FETCH; here it is 42601 with no position
-      (`open_cursor::fetch_cursor`).
-      Verify: tests/backlog/test_rp_found_rp898.py::test_a_multi_row_plpgsql_fetch_is_feature_not_supported
-      Backlog-ID: RP-942
-
 ## Found while working RP-900 (2026-11-13)
 
 Measured on PostgreSQL 15.19 (the shared reference on port 5415). The gap

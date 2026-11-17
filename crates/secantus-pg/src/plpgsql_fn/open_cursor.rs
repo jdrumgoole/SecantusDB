@@ -377,7 +377,7 @@ impl Interp<'_> {
                 .unwrap_or(false)
         {
             return Err(PlError::new(
-                "42601",
+                "0A000",
                 "FETCH statement cannot return multiple rows",
             ));
         }
