@@ -2948,11 +2948,14 @@ its first input gave.
       WHERE) with no WHERE besides (`join_input_estimate`; three or more
       tables, `join_chain_input_estimate`, only over tables never
       analysed, each equivalence class's members joined in table order),
-      and an aggregate over one user table with no HAVING, grouped by
-      plain columns or not. It leaves any other input -- a join with a
-      WHERE, a chain over an analysed table, a HAVING, a GROUP BY
-      expression, a DISTINCT, a computed column, a FROM subquery other
-      than VALUES, a catalog -- in the written order, hashed. Measured on
+      an aggregate over one user table with no HAVING, grouped by
+      plain columns or not, and (since 2026-11-17) a DISTINCT over any of
+      those leaves, its rows its groups. It leaves any other input -- a
+      join with a WHERE, a chain over an analysed table, a HAVING (whose
+      rows PostgreSQL scales by the qual's selectivity in `cost_agg`, 1/3
+      for `max(x) > 0`), a GROUP BY expression, a computed column, a FROM
+      subquery other than VALUES, a catalog -- in the written order,
+      hashed. Measured on
       the 15.19 reference on port 5415.
       Verify: tests/backlog/test_rp_found_rp692.py::test_an_intersect_over_another_unestimated_input_puts_the_smaller_input_first
       Backlog-ID: RP-841
