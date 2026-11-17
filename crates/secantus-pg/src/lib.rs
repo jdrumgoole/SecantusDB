@@ -4631,6 +4631,10 @@ pub struct PgHandler {
     /// Armed with `cursor_capture` by a DECLARE over a simply updatable
     /// scan: each output row's stored `_id`, for `WHERE CURRENT OF`.
     cursor_ids: std::sync::Arc<Mutex<Option<Vec<Bson>>>>,
+    /// Armed while a cursor's rows are computed from a select list that
+    /// calls a VOLATILE function: each row's source, kept so a re-read
+    /// projects it again (RP-962).
+    cursor_sources: std::sync::Arc<Mutex<Option<SourceCapture>>>,
     /// A serial unique to this connection for the life of the process,
     /// naming the owner of an uncommitted-type view in
     /// [`INSTALLED_USER_TYPES`]. Distinct from `backend_pid`, which is
@@ -5008,6 +5012,31 @@ struct CursorState {
     /// (`PORTAL_ONE_RETURNING`, RP-905): not read-only, so a COMMIT or
     /// ROLLBACK while it is pinned is 55000 (`HoldPinnedPortals`).
     returning: bool,
+    /// How a row is projected again from its source row, when the select
+    /// list calls a VOLATILE function and the scan reads a row again by
+    /// projecting it again (`ExecScan`), as a backward FETCH and the
+    /// rewind of a WITH HOLD cursor's persisting do (RP-962). `None` once
+    /// the rows are persisted (a hold store is read back as stored).
+    reproject: Option<Arc<Reproject>>,
+    /// The source row behind each row of `rows`, from `base`, while
+    /// `reproject` is set.
+    sources: Vec<Document>,
+}
+
+/// What `project_stream_into` projects a cursor's source rows with: a row
+/// read again is projected again from its source (RP-962).
+pub(crate) struct Reproject {
+    schema: Arc<Vec<FieldInfo>>,
+    fields: Vec<String>,
+    casts: Vec<Option<secantus_pgplan::ColumnExpr>>,
+    env: RowEnv,
+}
+
+/// The source rows a cursor's run projected, and how it projected them.
+#[derive(Default)]
+pub(crate) struct SourceCapture {
+    pub(crate) docs: Vec<Document>,
+    pub(crate) spec: Option<Arc<Reproject>>,
 }
 
 /// What `WHERE CURRENT OF` needs of a cursor (RP-072): the one table it
@@ -5024,6 +5053,7 @@ impl CursorState {
     /// Drop the first `n` rows of the window, with their ids.
     fn drain_front(&mut self, n: usize) {
         self.rows.drain(..n);
+        self.sources.drain(..n.min(self.sources.len()));
         if let Some(t) = self.typed_rows.as_mut() {
             t.drain(..n.min(t.len()));
         }
@@ -5033,9 +5063,36 @@ impl CursorState {
         self.base += n;
     }
 
+    /// Keep the source rows behind `n` rows a pull computed, while they
+    /// are projected again on a re-read (RP-962); rows without their
+    /// sources end the re-projection.
+    pub(crate) fn absorb_sources(
+        &mut self,
+        reproject: Option<Arc<Reproject>>,
+        sources: Option<Vec<Document>>,
+        n: usize,
+    ) {
+        if let Some(spec) = reproject {
+            if self.base == 0 && self.rows.is_empty() && self.tail.is_none() {
+                self.reproject = Some(spec);
+            }
+        }
+        if self.reproject.is_none() {
+            return;
+        }
+        match sources {
+            Some(docs) if docs.len() == n => self.sources.extend(docs),
+            _ => {
+                self.reproject = None;
+                self.sources.clear();
+            }
+        }
+    }
+
     /// Empty the window, to be read again from the start.
     fn clear_window(&mut self) {
         self.rows.clear();
+        self.sources.clear();
         self.typed_rows = Some(Vec::new());
         if let Some(c) = self.current_of.as_mut() {
             c.ids.clear();
@@ -5282,6 +5339,7 @@ impl PgHandler {
             cursor_capture: std::sync::Arc::new(Mutex::new(None)),
             cursor_run: AtomicBool::new(false),
             cursor_ids: std::sync::Arc::new(Mutex::new(None)),
+            cursor_sources: std::sync::Arc::new(Mutex::new(None)),
             session_serial: {
                 static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
                 NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
@@ -31050,7 +31108,7 @@ impl PgHandler {
         // A cursor computes the rows this FETCH reaches, running its query
         // first if no FETCH has yet (RP-744, RP-897). A zero count reaches
         // only the row the cursor sits on, computed already.
-        self.fill_pending(name, direction, count)?;
+        self.fill_pending(name, direction, count, is_move)?;
         let mut cursors = self.cursors.lock().unwrap_or_else(|e| e.into_inner());
         let Some(cursor) = cursors.get_mut(name) else {
             return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
@@ -36203,6 +36261,8 @@ impl PgHandler {
                                 pinned: false,
                                 auto_held: false,
                                 returning: false,
+                                reproject: None,
+                                sources: Vec::new(),
                             },
                         );
                     if holdable {
@@ -36309,6 +36369,8 @@ impl PgHandler {
                             pinned: false,
                             auto_held: false,
                             returning: false,
+                            reproject: None,
+                            sources: Vec::new(),
                         },
                     );
                 if holdable {
@@ -36367,6 +36429,8 @@ impl PgHandler {
                         pinned: false,
                         auto_held: false,
                         returning: false,
+                        reproject: None,
+                        sources: Vec::new(),
                     },
                 );
             if holdable {
@@ -42072,6 +42136,7 @@ impl PgHandler {
         // A `DECLARE CURSOR` over this SELECT arms row capture (see
         // `cursor_capture`); a plain SELECT leaves it disarmed and pays
         // only the `Option` check below -- no lock, no extra clone.
+        let own_run = capture_into.is_none();
         let ids = capture_into
             .is_none()
             .then(|| {
@@ -42091,6 +42156,26 @@ impl PgHandler {
                 .is_some();
             armed.then(|| self.cursor_capture.clone())
         });
+        // A cursor whose re-reads project again keeps each source row.
+        let sources = if own_run {
+            let mut slot = self
+                .cursor_sources
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            slot.as_mut().map(|c| {
+                c.spec.get_or_insert_with(|| {
+                    Arc::new(Reproject {
+                        schema: schema.clone(),
+                        fields: fields.clone(),
+                        casts: casts.clone(),
+                        env: env.clone(),
+                    })
+                });
+                self.cursor_sources.clone()
+            })
+        } else {
+            None
+        };
         let computed: Vec<String> = (0..fields.len()).map(sort_input_key).collect();
         let rows = source.map(move |d| {
             let d = d?;
@@ -42203,6 +42288,11 @@ impl PgHandler {
             if let (Some(cap), Some(row)) = (&capture, captured) {
                 if let Some(buf) = cap.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
                     buf.push(row);
+                }
+            }
+            if let Some(sources) = &sources {
+                if let Some(c) = sources.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+                    c.docs.push(d);
                 }
             }
             Ok(enc.take_row())
@@ -42602,7 +42692,7 @@ impl PgHandler {
         // The rows it reaches are computed outside the cursor lock.
         if cursor.pending.is_some() {
             drop(cursors);
-            self.fill_pending(name, direction, wanted)
+            self.fill_pending(name, direction, wanted, false)
                 .map_err(Self::plan_error_of)?;
             cursors = self.cursors.lock().unwrap_or_else(|e| e.into_inner());
             let Some(again) = cursors.get_mut(name) else {

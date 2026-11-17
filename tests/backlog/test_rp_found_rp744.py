@@ -156,12 +156,12 @@ def test_a_cursors_function_reads_the_snapshot_its_volatility_gives(dsn: str) ->
     ]
 
 
-@pytest.mark.backlog("RP-962")
+@pytest.mark.backlog_fixed("RP-962")
 def test_a_cursor_recomputes_a_volatile_column_when_it_reads_a_row_again(dsn: str) -> None:
     """PostgreSQL 15.19 reads a row again by running the plan again: a
     backward FETCH, or a WITH HOLD cursor persisted at COMMIT
     (`PersistHoldablePortal` rewinds and runs the query whole), computes
-    a `nextval` in the select list again. Here the rows computed once are
+    a `nextval` in the select list again. Here the rows computed once were
     kept and read back. Measured on a private PostgreSQL 15.19 cluster."""
     n = uuid.uuid4().hex[:8]
     with psycopg.connect(dsn, autocommit=True) as c:
@@ -197,6 +197,115 @@ def test_a_cursor_recomputes_a_volatile_column_when_it_reads_a_row_again(dsn: st
     ] == [
         ["BEGIN", "DECLARE CURSOR", [(1,), (2,)], [(3,)], [(4,)], [(5,), (6,)], "ROLLBACK"],
         ["BEGIN", "DECLARE CURSOR", [(1,)], "COMMIT", [(4,)], [(3,), (4,)], "CLOSE CURSOR"],
+    ]
+
+
+@pytest.mark.backlog_fixed("RP-962")
+@pytest.mark.parametrize(
+    ("steps", "expected"),
+    [
+        (
+            [
+                "fetch 2",
+                "fetch absolute -1",
+                "fetch relative 0",
+                "fetch prior",
+                "move backward all",
+                "fetch 2",
+            ],
+            [[(1, 1), (2, 2)], [(5, 4)], [(7, 4)], [(8, 3)], "MOVE 2", [(9, 1), (10, 2)], [(10,)]],
+        ),
+        (
+            [
+                "fetch all",
+                "fetch backward 2",
+                "fetch absolute 2",
+                "fetch 0",
+                "move 0",
+                "fetch absolute 4",
+                "fetch absolute 1",
+            ],
+            [
+                [(1, 1), (2, 2), (3, 3), (4, 4)],
+                [(5, 4), (6, 3)],
+                [(8, 2)],
+                [(10, 2)],
+                "MOVE 1",
+                [(12, 4)],
+                [(13, 1)],
+                [(13,)],
+            ],
+        ),
+        (
+            ["move 3", "fetch backward all", "fetch forward all"],
+            ["MOVE 3", [(4, 2), (5, 1)], [(6, 1), (7, 2), (8, 3), (9, 4)], [(9,)]],
+        ),
+        (
+            [
+                "fetch absolute 3",
+                "fetch absolute 2",
+                "fetch absolute 0",
+                "fetch next",
+                "fetch last",
+                "fetch first",
+            ],
+            [[(3, 3)], [(5, 2)], [], [(6, 1)], [(10, 4)], [(11, 1)], [(11,)]],
+        ),
+    ],
+)
+def test_a_scroll_cursor_projects_each_row_its_executor_steps_onto(
+    dsn: str, steps: list[str], expected: list[object]
+) -> None:
+    """Each FETCH / MOVE moves the executor as `DoPortalRunFetch` does --
+    ABSOLUTE rewinds or scans from where it is, a negative ABSOLUTE runs to
+    the end and back, FETCH 0 backs up one and reads again, MOVE BACKWARD
+    ALL rewinds -- and every row it steps onto runs the select list's
+    `nextval` again. Answers measured on PostgreSQL 15.19 (2026-11-17)."""
+    s = f"rp_walk_{uuid.uuid4().hex[:8]}"
+    with psycopg.connect(dsn, autocommit=True) as c:
+        c.execute(f"create sequence {s}")
+        c.execute("begin")
+        c.execute(
+            f"declare c scroll cursor for select nextval('{s}'), g from generate_series(1, 4) g"
+        )
+        got: list[object] = []
+        for q in steps:
+            cur = c.execute(f"{q} from c")
+            got.append(cur.fetchall() if cur.description else cur.statusmessage)
+        got.append(c.execute(f"select currval('{s}')").fetchall())
+        c.execute("rollback")
+    assert got == expected
+
+
+@pytest.mark.backlog("RP-962")
+def test_a_cursor_over_a_table_recomputes_a_volatile_column_when_it_reads_a_row_again(
+    dsn: str,
+) -> None:
+    """PostgreSQL 15.19's scan node projects each row it reads, a re-read
+    included: on a SCROLL cursor over a table or VALUES, `fetch prior` and
+    `fetch first` draw `nextval` again. Here those cursors read back the
+    rows as first computed. Measured on PostgreSQL 15.19 (2026-11-17)."""
+    n = uuid.uuid4().hex[:8]
+    with psycopg.connect(dsn, autocommit=True) as c:
+        c.execute(f"create table rp_reread_t_{n} (g int primary key)")
+        c.execute(f"insert into rp_reread_t_{n} select generate_series(1, 4)")
+        got = []
+        for i, source in enumerate((f"rp_reread_t_{n}", "(values (1), (2), (3)) v(g)")):
+            c.execute(f"create sequence rp_reread_s{i}_{n}")
+            c.execute("begin")
+            c.execute(
+                f"declare c scroll cursor for select nextval('rp_reread_s{i}_{n}'), g from {source}"
+            )
+            got.append(
+                [
+                    c.execute(f"{q} from c").fetchall()
+                    for q in ("fetch 2", "fetch prior", "fetch first")
+                ]
+            )
+            c.execute("rollback")
+    assert got == [
+        [[(1, 1), (2, 2)], [(3, 1)], [(4, 1)]],
+        [[(1, 1), (2, 2)], [(3, 1)], [(4, 1)]],
     ]
 
 

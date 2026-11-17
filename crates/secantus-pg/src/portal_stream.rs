@@ -1183,6 +1183,9 @@ pub(crate) enum PendingRows {
         /// DECLARE's snapshot (`correlated::reads_portal_snapshot`): the
         /// rest is computed before another statement moves it.
         reads: bool,
+        /// Each row's source row is kept with it, for a re-read to project
+        /// it again (`reprojects`, RP-962).
+        sources: bool,
     },
     /// The run failed when another statement of the block made it run
     /// before it moved the snapshot (`drain_block_scans`): the first FETCH
@@ -1280,6 +1283,7 @@ impl PendingRows {
             rows,
             capture_typed,
             reads: false,
+            sources: false,
         }
     }
 
@@ -1345,6 +1349,30 @@ fn reads_portal_snapshot(stmt: &Statement) -> bool {
     }
 }
 
+/// Does a cursor over `stmt` project a row again when it reads it again
+/// (RP-962)? PostgreSQL's scan node projects every tuple it returns
+/// (`ExecScan`), a backward one and one after a rewind included, so a
+/// VOLATILE function in the select list runs again. Only a plain scan of
+/// one source qualifies: a join, a subquery, a window, a DISTINCT or a
+/// locking clause puts a node between the scan and the cursor (a Material
+/// under a SCROLL cursor) that reads its rows back as computed. A column
+/// computed below a Sort is read from the source row, as computed.
+fn reprojects(stmt: &Statement) -> bool {
+    let Statement::Select(sel) = stmt else {
+        return false;
+    };
+    sel.join.is_none()
+        && sel.sub.is_none()
+        && sel.windows.is_empty()
+        && sel.distinct == secantus_pgplan::Distinct::None
+        && sel.lock.is_none()
+        && sel
+            .casts
+            .iter()
+            .flatten()
+            .any(secantus_pgplan::correlated::is_volatile)
+}
+
 /// What a pull from a cursor's pending rows produced, outside the cursor
 /// lock.
 struct Pulled {
@@ -1356,6 +1384,10 @@ struct Pulled {
     /// What is left to compute; `None` when the stream ended or failed.
     rest: Option<PendingRows>,
     failure: Option<PgWireError>,
+    /// How the run projects its rows, when it keeps their sources (RP-962).
+    reproject: Option<Arc<crate::Reproject>>,
+    /// The source row behind each of `rows`, when the run keeps them.
+    sources: Option<Vec<Document>>,
 }
 
 /// The (lowest, highest) 1-based row a FETCH / MOVE of `direction` `count`
@@ -1387,6 +1419,188 @@ fn fetch_reach(
 }
 
 impl PgHandler {
+    /// Project every row cursor `name` has computed again, in order, as
+    /// a rewound executor reads them (RP-962).
+    fn reproject_all(&self, name: &str) -> PgWireResult<()> {
+        let n = {
+            let cursors = self.cursors.lock().unwrap_or_else(|e| e.into_inner());
+            match cursors.get(name) {
+                Some(c) if c.reproject.is_some() && !c.failed => c.sources.len(),
+                _ => return Ok(()),
+            }
+        };
+        for i in 0..n {
+            self.reproject_row(name, i)?;
+        }
+        Ok(())
+    }
+
+    /// Project row `i` (0-based) of cursor `name` again from its source
+    /// row, as PostgreSQL's scan projects a row it reads again (`ExecScan`):
+    /// a VOLATILE function in the select list runs again (RP-962). The
+    /// cursor lock is not held while it is computed. An error fails the
+    /// cursor, as `PortalRunFetch` does.
+    fn reproject_row(&self, name: &str, i: usize) -> PgWireResult<()> {
+        let (spec, doc) = {
+            let cursors = self.cursors.lock().unwrap_or_else(|e| e.into_inner());
+            let Some(c) = cursors.get(name).filter(|c| !c.failed) else {
+                return Ok(());
+            };
+            let (Some(spec), Some(doc)) = (c.reproject.clone(), c.sources.get(i).cloned()) else {
+                return Ok(());
+            };
+            (spec, doc)
+        };
+        let mut projected = None;
+        let ran = self.in_open_transaction(|| {
+            self.with_executor_hooks(|| {
+                projected = Some(self.check_cancel().and_then(|()| {
+                    let cap: Arc<Mutex<Option<CapturedRows>>> =
+                        Arc::new(Mutex::new(Some(Vec::new())));
+                    let resp = self.project_stream_into(
+                        stream::iter(std::iter::once(Ok(doc))).boxed(),
+                        spec.schema.clone(),
+                        spec.fields.clone(),
+                        spec.casts.clone(),
+                        &spec.env,
+                        Some(cap.clone()),
+                    );
+                    let rows = futures::executor::block_on(resp.data_rows.try_collect::<Vec<_>>())?;
+                    let typed = cap
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .take()
+                        .unwrap_or_default();
+                    Ok((rows, typed))
+                }));
+            });
+            Ok(())
+        });
+        let projected = match (ran, projected) {
+            (Err(e), _) | (Ok(()), Some(Err(e))) => Err(e),
+            (Ok(()), Some(Ok(p))) => Ok(p),
+            (Ok(()), None) => return Ok(()),
+        };
+        let mut cursors = self.cursors.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(c) = cursors.get_mut(name) else {
+            return projected.map(|_| ());
+        };
+        match projected {
+            Ok((rows, typed)) => {
+                if let (Some(row), Some(slot)) = (rows.into_iter().next(), c.rows.get_mut(i)) {
+                    *slot = row;
+                }
+                if let Some(all) = c.typed_rows.as_mut() {
+                    match (typed.into_iter().next(), all.get_mut(i)) {
+                        (Some(v), Some(slot)) => *slot = v,
+                        _ => c.typed_rows = None,
+                    }
+                }
+                Ok(())
+            }
+            Err(e) => {
+                c.failed = true;
+                Err(e)
+            }
+        }
+    }
+
+    /// Run a FETCH / MOVE on a cursor whose re-reads project again
+    /// (RP-962) the way `DoPortalRunFetch` moves PostgreSQL's executor: each
+    /// row the executor steps onto is projected -- a row not computed yet
+    /// is computed from the pending rows, one computed already is projected
+    /// again from its source -- in the order the executor reaches them.
+    /// The FETCH then answers from the rows as last projected.
+    fn replay_fetch(
+        &self,
+        name: &str,
+        direction: secantus_pgplan::FetchDirection,
+        count: i64,
+        is_move: bool,
+    ) -> PgWireResult<()> {
+        use secantus_pgplan::FetchDirection as Fd;
+        let mut e = {
+            let cursors = self.cursors.lock().unwrap_or_else(|e| e.into_inner());
+            match cursors.get(name) {
+                Some(c) => c.pos,
+                None => return Ok(()),
+            }
+        };
+        let mut walk = ExecutorWalk {
+            handler: self,
+            name,
+            e: &mut e,
+        };
+        const ALL: i64 = i64::MAX;
+        // FORWARD / BACKWARD with a negative count turn round.
+        let (direction, count) = match direction {
+            Fd::Forward if count < 0 => (Fd::Backward, count.saturating_neg()),
+            Fd::Backward if count < 0 => (Fd::Forward, count.saturating_neg()),
+            Fd::Relative if count == 0 => (Fd::Forward, 0),
+            d => (d, count),
+        };
+        match direction {
+            Fd::Absolute if count > 0 => {
+                // `portalPos` stays on the last row past the end, where
+                // `pos` counts one more.
+                let pos = walk.pos();
+                let portal_pos = if walk.at_end() { pos - 1 } else { pos };
+                if count - 1 <= portal_pos / 2 {
+                    walk.rewind();
+                    if count > 1 {
+                        walk.run(true, count - 1)?;
+                    }
+                } else if count <= pos {
+                    walk.run(false, pos - count + 1)?;
+                } else if count > pos + 1 {
+                    walk.run(true, count - pos - 1)?;
+                }
+                walk.run(true, 1)
+            }
+            Fd::Absolute if count < 0 => {
+                walk.run(true, ALL)?;
+                if count < -1 {
+                    walk.run(false, count.saturating_neg() - 1)?;
+                }
+                walk.run(false, 1)
+            }
+            Fd::Absolute => {
+                walk.rewind();
+                Ok(())
+            }
+            Fd::Relative if count > 0 => {
+                if count > 1 {
+                    walk.run(true, count - 1)?;
+                }
+                walk.run(true, 1)
+            }
+            Fd::Relative => {
+                if count < -1 {
+                    walk.run(false, count.saturating_neg() - 1)?;
+                }
+                walk.run(false, 1)
+            }
+            Fd::Forward | Fd::Backward => {
+                let forward = matches!(direction, Fd::Forward);
+                if count == 0 {
+                    // A FETCH 0 on a row backs up one and fetches it again;
+                    // a MOVE 0 only counts it.
+                    if !is_move && walk.on_row() {
+                        walk.run(false, 1)?;
+                        return walk.run(true, 1);
+                    }
+                    return Ok(());
+                }
+                // MOVE BACKWARD ALL is a rewind.
+                if !forward && count == ALL && is_move {
+                    walk.rewind();
+                    return Ok(());
+                }
+                walk.run(forward, count)
+            }
+        }
+    }
+
     /// Compute cursor `name`'s pending rows (`PendingRows`) through what a
     /// FETCH / MOVE of `direction` `count` reaches: up to the furthest row
     /// it moves to, and to the end when it counts from the end. A missing
@@ -1396,9 +1610,20 @@ impl PgHandler {
         name: &str,
         direction: secantus_pgplan::FetchDirection,
         count: i64,
+        is_move: bool,
     ) -> PgWireResult<()> {
         let pos = {
             let cursors = self.cursors.lock().unwrap_or_else(|e| e.into_inner());
+            // A SCROLL cursor that projects a row again when it reads it
+            // again moves as the executor does (RP-962). A NO SCROLL one
+            // never reads a row again.
+            if cursors
+                .get(name)
+                .is_some_and(|c| c.reproject.is_some() && c.is_scrollable && !c.failed)
+            {
+                drop(cursors);
+                return self.replay_fetch(name, direction, count, is_move);
+            }
             match cursors.get(name) {
                 Some(c) if c.pending.is_some() && !c.failed => c.pos,
                 _ => return Ok(()),
@@ -1447,6 +1672,7 @@ impl PgHandler {
             (Some(all), Some(typed)) if typed.len() == pulled.rows.len() => all.extend(typed),
             _ => cursor.typed_rows = None,
         }
+        cursor.absorb_sources(pulled.reproject, pulled.sources, pulled.rows.len());
         cursor.rows.extend(pulled.rows);
         cursor.pending = pulled.rest;
         pulled.failure.map_or(Ok(()), Err)
@@ -1475,7 +1701,26 @@ impl PgHandler {
         let ran = self
             .cursor_run
             .swap(true, std::sync::atomic::Ordering::Relaxed);
+        let keeps_sources = reprojects(&query);
+        let previous_sources = keeps_sources.then(|| {
+            self.cursor_sources
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .replace(crate::SourceCapture::default())
+        });
         let out = self.in_open_transaction(|| self.execute(query, 0));
+        // How the run projects its rows, when its select list is left to
+        // the row stream.
+        let reproject = previous_sources.and_then(|previous| {
+            std::mem::replace(
+                &mut *self
+                    .cursor_sources
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner()),
+                previous,
+            )
+            .and_then(|c| c.spec)
+        });
         self.cursor_run
             .store(ran, std::sync::atomic::Ordering::Relaxed);
         // What the run captured already: rows its executor computed whole.
@@ -1498,6 +1743,8 @@ impl PgHandler {
             schema: None,
             rest: None,
             failure: Some(e),
+            reproject: None,
+            sources: None,
         };
         let q = match out.map(|r| r.into_iter().next()) {
             Ok(Some(Response::Query(q))) => q,
@@ -1523,10 +1770,13 @@ impl PgHandler {
                 rows: Vec::new(),
                 captured: capture_typed.then(Vec::new),
                 schema: Some(schema),
+                reproject: reproject.clone(),
+                sources: reproject.is_some().then(Vec::new),
                 rest: Some(PendingRows::Running {
                     rows: q.data_rows,
                     capture_typed,
                     reads,
+                    sources: reproject.is_some(),
                 }),
                 failure: None,
             },
@@ -1536,7 +1786,7 @@ impl PgHandler {
     /// Pull up to `wanted` rows from `pending`, starting its run first when
     /// it has not started.
     fn pull_rows(&self, pending: PendingRows, wanted: usize) -> Pulled {
-        let (mut rows, capture_typed, reads, schema) = match pending {
+        let (mut rows, capture_typed, reads, keep_sources, schema, reproject) = match pending {
             PendingRows::Append(leaves) => return self.pull_append(leaves, wanted),
             PendingRows::Converted { inner, conversion } => {
                 return self.pull_converted(*inner, conversion, wanted)
@@ -1548,6 +1798,8 @@ impl PgHandler {
                     schema: None,
                     rest: None,
                     failure: Some(e),
+                    reproject: None,
+                    sources: None,
                 }
             }
             PendingRows::Unstarted {
@@ -1559,17 +1811,26 @@ impl PgHandler {
                     rows,
                     capture_typed,
                     reads,
+                    sources,
                 }) = started.rest
                 else {
                     return started;
                 };
-                (rows, capture_typed, reads, started.schema)
+                (
+                    rows,
+                    capture_typed,
+                    reads,
+                    sources,
+                    started.schema,
+                    started.reproject,
+                )
             }
             PendingRows::Running {
                 rows,
                 capture_typed,
                 reads,
-            } => (rows, capture_typed, reads, None),
+                sources,
+            } => (rows, capture_typed, reads, sources, None, None),
         };
         // The rows' values are captured as the stream computes them, into
         // the buffer the DECLARE armed; put back whatever it held.
@@ -1578,6 +1839,12 @@ impl PgHandler {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .replace(Vec::new())
+        });
+        let previous_sources = keep_sources.then(|| {
+            self.cursor_sources
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .replace(crate::SourceCapture::default())
         });
         let mut out = Vec::new();
         let mut ended = false;
@@ -1619,10 +1886,21 @@ impl PgHandler {
                 previous,
             )
         });
+        let sources = previous_sources.and_then(|previous| {
+            std::mem::replace(
+                &mut *self
+                    .cursor_sources
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner()),
+                previous,
+            )
+            .map(|c| c.docs)
+        });
         let rest = (!ended && failure.is_none()).then_some(PendingRows::Running {
             rows,
             capture_typed,
             reads,
+            sources: keep_sources,
         });
         Pulled {
             rows: out,
@@ -1630,6 +1908,8 @@ impl PgHandler {
             schema,
             rest,
             failure,
+            reproject,
+            sources,
         }
     }
 
@@ -1648,6 +1928,8 @@ impl PgHandler {
             schema: None,
             rest: None,
             failure: None,
+            reproject: None,
+            sources: None,
         };
         for row in &pulled.rows {
             match conversion.convert(row) {
@@ -1681,6 +1963,8 @@ impl PgHandler {
             schema: None,
             rest: None,
             failure: None,
+            reproject: None,
+            sources: None,
         };
         while out.rows.len() < wanted {
             let Some(leaf) = leaves.pop_front() else {
@@ -1843,6 +2127,7 @@ impl PgHandler {
                         }
                         _ => cursor.typed_rows = None,
                     }
+                    cursor.absorb_sources(started.reproject, started.sources, started.rows.len());
                     cursor.rows.extend(started.rows);
                     rest
                 }
@@ -1859,11 +2144,26 @@ impl PgHandler {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .iter()
-            .filter(|(_, c)| c.is_holdable && c.pending.is_some())
+            .filter(|(_, c)| c.is_holdable && (c.pending.is_some() || c.reproject.is_some()))
             .map(|(name, _)| name.clone())
             .collect();
         for name in names {
-            if let Err(e) = self.pull_pending(&name, None) {
+            // `PersistHoldablePortal` rewinds the executor and runs the
+            // query whole into the hold store: a row computed already is
+            // projected again (RP-962), and the store is read back as kept.
+            let persisted = self
+                .reproject_all(&name)
+                .and_then(|()| self.pull_pending(&name, None));
+            if let Some(c) = self
+                .cursors
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get_mut(&name)
+            {
+                c.reproject = None;
+                c.sources.clear();
+            }
+            if let Err(e) = persisted {
                 if let Some(c) = self
                     .cursors
                     .lock()
@@ -1960,6 +2260,8 @@ impl PgHandler {
             pinned: false,
             auto_held: false,
             returning: false,
+            reproject: None,
+            sources: Vec::new(),
         }))
     }
 
@@ -2234,5 +2536,98 @@ impl PgHandler {
             }
             Ok(())
         })
+    }
+}
+
+/// PostgreSQL's executor position over a cursor whose re-reads project
+/// again (`replay_fetch`): `e` is the cursor's own position, 0 before the
+/// first row and one past the last after it.
+struct ExecutorWalk<'a> {
+    handler: &'a PgHandler,
+    name: &'a str,
+    e: &'a mut i64,
+}
+
+impl ExecutorWalk<'_> {
+    /// The rows computed so far, and whether that is all of them.
+    fn computed(&self) -> (i64, bool) {
+        let cursors = self
+            .handler
+            .cursors
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        cursors.get(self.name).map_or((0, true), |c| {
+            ((c.base + c.rows.len()) as i64, c.pending.is_none())
+        })
+    }
+
+    /// `portalPos`, with one more when the portal is past its end, as
+    /// `DoPortalRunFetch` counts for FETCH ABSOLUTE.
+    fn pos(&self) -> i64 {
+        *self.e
+    }
+
+    fn at_end(&self) -> bool {
+        let (len, done) = self.computed();
+        done && *self.e > len
+    }
+
+    fn on_row(&self) -> bool {
+        let (len, done) = self.computed();
+        *self.e >= 1 && (*self.e <= len || !done)
+    }
+
+    fn rewind(&mut self) {
+        *self.e = 0;
+    }
+
+    /// `PortalRunSelect`: step `count` rows (`i64::MAX`: all) forward or
+    /// back, each row stepped onto projected.
+    fn run(&mut self, forward: bool, count: i64) -> PgWireResult<()> {
+        let mut left = count;
+        while left > 0 {
+            if forward {
+                let next = *self.e + 1;
+                let (len, done) = self.computed();
+                if next > len {
+                    if done {
+                        *self.e = len + 1;
+                        return Ok(());
+                    }
+                    // Not computed yet: the pull is its projection.
+                    let upto = if left == i64::MAX {
+                        None
+                    } else {
+                        Some(self.e.saturating_add(left))
+                    };
+                    self.handler.pull_pending(self.name, upto)?;
+                    let (now, _) = self.computed();
+                    if now < next {
+                        *self.e = now + 1;
+                        return Ok(());
+                    }
+                    let stepped = now.min(self.e.saturating_add(left)) - *self.e;
+                    *self.e += stepped;
+                    if left != i64::MAX {
+                        left -= stepped;
+                    }
+                    continue;
+                }
+                self.handler.reproject_row(self.name, (next - 1) as usize)?;
+                *self.e = next;
+            } else {
+                if *self.e <= 1 {
+                    *self.e = 0;
+                    return Ok(());
+                }
+                *self.e -= 1;
+                self.handler
+                    .reproject_row(self.name, (*self.e - 1) as usize)?;
+            }
+            if left != i64::MAX {
+                left -= 1;
+            }
+        }
+        Ok(())
     }
 }

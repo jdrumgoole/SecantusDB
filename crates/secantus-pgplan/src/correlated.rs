@@ -2342,6 +2342,17 @@ pub fn reads_portal_snapshot(expr: &ColumnExpr) -> bool {
     found
 }
 
+/// Does this computed column call a VOLATILE function (`has_volatile_call`)?
+/// PostgreSQL projects it again each time the executor reads its row, so a
+/// cursor that reads a row again computes it again (RP-962).
+pub fn is_volatile(expr: &ColumnExpr) -> bool {
+    match expr {
+        ColumnExpr::Row { expr, .. } => has_volatile_call(expr),
+        ColumnExpr::Call { name, args, .. } => volatile_builtin(name, args.len()),
+        _ => false,
+    }
+}
+
 /// Does this computed column contain a correlated subquery? Such a column
 /// has to be evaluated where the executor's runner is installed, not lazily
 /// inside a row stream that outlives it.

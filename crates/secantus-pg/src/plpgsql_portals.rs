@@ -237,6 +237,8 @@ impl PgHandler {
                 pinned: false,
                 auto_held: false,
                 returning: false,
+                reproject: None,
+                sources: Vec::new(),
             },
         );
         Ok(name)

@@ -2653,31 +2653,25 @@ RP-897 a cursor runs its query at the first FETCH and computes its select
 list as it is fetched (`portal_stream::PendingRows`); these are the shapes
 still computed whole, and the cursor answers that differ either way.
 
-- [ ] **A cursor reads a row again without computing it again.** Since
-      RP-744 the rows a cursor has computed are kept and read back, so a
-      `nextval` in its select list is drawn once per row. PostgreSQL 15.19
-      reads a row again by running the plan again: on a SCROLL cursor
-      over `select nextval('s') from generate_series(1, 4)`, `fetch 2`,
-      `fetch backward 1`, `fetch first` and `fetch 2` answer 1 2, 3, 4,
-      5 6, where this server answers 1 2, 1, 1, 2 3. A WITH HOLD cursor
-      is persisted at COMMIT by rewinding and running the query whole
-      (`PersistHoldablePortal`): after `fetch 1` and COMMIT, `currval` is
-      4 and `fetch all` answers 3 4 (here 3, and 2 3). Needs the
-      re-read to re-run the plan for a volatile select list, as
-      `ExecutorRewind` and a backward scan do: the computed rows kept in
-      `CursorState` (`trim_cursor`, `persist_holdable_cursors`) would have
-      to be re-run from the plan instead. In PostgreSQL the scan node
-      projects every tuple it returns (`ExecScan`), backward included, so
-      a re-read runs the select list again over the same source row: the
-      cursor needs its source rows kept (not only the encoded `DataRow`s
-      of `project_stream_into`) and the select list projected per read
-      when it is volatile, in the FETCH / MOVE window code
-      (`fetch_cursor` and `fill_cursor` / `pull_pending`). RP-961
-      (2026-11-17) left a per-row WHERE to the row stream and to
-      `CursorTail::residual`, which keeps the untested source rows a
-      re-read would project again. Found while working RP-895
+- [ ] **A cursor over a table or VALUES reads a row again without
+      computing it again.** PostgreSQL 15.19's scan node projects every
+      tuple it returns (`ExecScan`), backward and after a rewind included,
+      so a VOLATILE select list runs again on a re-read. Since 2026-11-17 a
+      cursor whose query runs as `PendingRows` (a plain scan of a function
+      such as `generate_series`) keeps each row's source row
+      (`CursorState::sources`) and, on a SCROLL cursor, moves as
+      `DoPortalRunFetch` moves the executor (`replay_fetch`), and a WITH
+      HOLD cursor projects its rows again when COMMIT persists it. Still
+      read back as first computed: a cursor over a table, which streams
+      through `CursorTail` (`encode_cursor_docs` projects its batches and
+      `trim_cursor` drains its window), and one over VALUES. On a SCROLL
+      cursor over `select nextval('s'), g from t` (4 rows), `fetch 2`,
+      `fetch prior`, `fetch first` answer (1,1) (2,2), (3,1), (4,1); here
+      (1,1), (1,1). Needs the same source rows and walk on the tail path:
+      the window's sources drained with it, and `fill_cursor` in place of
+      `pull_pending` for the rows not read yet. Found while working RP-895
       (2026-11-14).
-      Verify: tests/backlog/test_rp_found_rp744.py::test_a_cursor_recomputes_a_volatile_column_when_it_reads_a_row_again
+      Verify: tests/backlog/test_rp_found_rp744.py::test_a_cursor_over_a_table_recomputes_a_volatile_column_when_it_reads_a_row_again
       Backlog-ID: RP-962
 
 ## Found while working RP-782 (2026-11-10)
