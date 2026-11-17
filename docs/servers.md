@@ -53,7 +53,7 @@ A change that touches only one server bumps only that server's version.
 ### MongoDB server
 
 ```bash
-cargo install secantus-mdb --version <version>   # or: pip install SecantusDB
+cargo install secantus-mdb --version 0.5.3-beta.197   # or: pip install SecantusDB
 secantusd-mdb --host 127.0.0.1 --port 27017 --storage-path ./secantus-data
 ```
 
@@ -68,7 +68,7 @@ and its own docs are in the
 ### PostgreSQL server
 
 The PostgreSQL server is the `secantus-pg` crate on crates.io (`cargo
-install secantus-pg --version <version>`), is in the PyPI wheel, and also ships as a standalone
+install secantus-pg --version 0.1.0-beta.19`), is in the PyPI wheel, and also ships as a standalone
 `secantusd-pg` archive on
 the `secantusd-pg-v*` tags on
 [GitHub Releases](https://github.com/jdrumgoole/SecantusDB/releases):

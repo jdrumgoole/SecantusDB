@@ -38,8 +38,8 @@ Three ways to get them (see [Installation](installation.md)):
 - **PyPI** — `pip install SecantusDB` puts both prebuilt binaries on
   `PATH` and adds the `secantusdb` Python launcher (Linux x86_64, macOS
   arm64).
-- **crates.io** — `cargo install secantus-mdb` and `cargo install
-  secantus-pg` build each server from source; each crate is also a Rust
+- **crates.io** — `cargo install secantus-mdb --version 0.5.3-beta.197` and
+  `cargo install secantus-pg --version 0.1.0-beta.19` build each server from source; each crate is also a Rust
   library (`secantus_mdb::Server`, `secantus_pg::PgServer`).
 - **GitHub Releases** — prebuilt archives of each server.
 
