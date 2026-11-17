@@ -53933,9 +53933,91 @@ fn explain_scan_patterns(
     query: &N,
     lookup: &dyn Fn(&str) -> Option<TableDef>,
 ) -> Option<Vec<ScanPattern>> {
+    if let Some(found) = explain_join_patterns(query, lookup) {
+        return Some(found);
+    }
     let (table, where_clause) = explain_scan_where(query)?;
     let def = lookup(&table)?;
     Some(where_patterns(where_clause, &def))
+}
+
+/// A join's WHERE patterns (RP-423): each LIKE / ILIKE or regex match of
+/// one joined table's column, the column's table found by its qualifier
+/// (or, unqualified, the one FROM table that has it), as that table's
+/// scan reads it once `distribute_qual_to_rels` has pushed it down. `None`
+/// where the FROM is not two or more plain tables joined.
+fn explain_join_patterns(
+    query: &N,
+    lookup: &dyn Fn(&str) -> Option<TableDef>,
+) -> Option<Vec<ScanPattern>> {
+    fn tables(n: &pg_query::protobuf::Node, out: &mut Vec<(String, String)>) -> Option<()> {
+        match n.node.as_ref()? {
+            N::RangeVar(rv) => {
+                let alias = rv
+                    .alias
+                    .as_ref()
+                    .map_or_else(|| rv.relname.clone(), |a| a.aliasname.clone());
+                out.push((alias, rv.relname.clone()));
+            }
+            N::JoinExpr(j) => {
+                tables(j.larg.as_deref()?, out)?;
+                tables(j.rarg.as_deref()?, out)?;
+            }
+            _ => return None,
+        }
+        Some(())
+    }
+    let N::SelectStmt(s) = query else {
+        return None;
+    };
+    let where_clause = s.where_clause.as_deref()?;
+    let mut from = Vec::new();
+    for item in &s.from_clause {
+        tables(item, &mut from)?;
+    }
+    if from.len() < 2 {
+        return None;
+    }
+    let defs: Vec<(String, TableDef)> = from
+        .into_iter()
+        .map(|(alias, table)| Some((alias, lookup(&table)?)))
+        .collect::<Option<_>>()?;
+    fn walk(n: &pg_query::protobuf::Node, defs: &[(String, TableDef)], out: &mut Vec<ScanPattern>) {
+        match n.node.as_ref() {
+            Some(N::BoolExpr(b)) => b.args.iter().for_each(|a| walk(a, defs, out)),
+            Some(N::AExpr(e)) => {
+                let Some(N::ColumnRef(c)) = e.lexpr.as_deref().and_then(|l| l.node.as_ref()) else {
+                    return;
+                };
+                let names: Vec<&str> = c
+                    .fields
+                    .iter()
+                    .filter_map(|f| match f.node.as_ref() {
+                        Some(N::String(s)) => Some(s.sval.as_str()),
+                        _ => None,
+                    })
+                    .collect();
+                let def = match names.as_slice() {
+                    [alias, _] => defs.iter().find(|(a, _)| a == alias).map(|(_, d)| d),
+                    [col] => {
+                        let mut has = defs.iter().filter(|(_, d)| d.field_of(col).is_some());
+                        match (has.next(), has.next()) {
+                            (Some((_, d)), None) => Some(d),
+                            _ => None,
+                        }
+                    }
+                    _ => None,
+                };
+                if let Some(p) = def.and_then(|d| scan_pattern(e, d)) {
+                    out.push(p);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut out = Vec::new();
+    walk(where_clause, &defs, &mut out);
+    Some(out)
 }
 
 /// The [`ScanPattern`]s of `where_clause`, a WHERE over table `def`'s

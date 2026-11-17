@@ -5562,7 +5562,7 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
         ],
     ),
     "estimate of a join over a scan filtered by a LIKE": (
-        "RP-423",
+        "RP-423:fixed",
         _ANALYSED_THIRTY,
         "explain select * from e join s on s.a = e.a where s.c like 'xxx%'",
         [
@@ -5586,7 +5586,7 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
         ],
     ),
     "estimate of a join over a scan filtered by a regex match": (
-        "RP-423",
+        "RP-423:fixed",
         _ANALYSED_STRINGS,
         "explain select * from e join w on e.a = w.a where w.c ~ '^w00'",
         [
@@ -5596,6 +5596,37 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "  ->  Hash  (cost=18.50..18.50 rows=91 width=10)",
             "        ->  Seq Scan on w  (cost=0.00..18.50 rows=91 width=10)",
             "              Filter: (c ~ '^w00'::text)",
+        ],
+    ),
+    # A join's WHERE patterns reach its sides' scans (`explain_join_patterns`)
+    # with the table's alias, an unqualified column, an ILIKE and a NOT LIKE
+    # (RP-423).
+    "estimate of an aliased join over a scan filtered by an ilike": (
+        "RP-423:fixed",
+        _ANALYSED_STRINGS,
+        "explain select * from e x join w y on x.a = y.a where c ilike 'W01%'",
+        [
+            "Hash Join  (cost=19.76..39.52 rows=101 width=17)",
+            "  Hash Cond: (x.a = y.a)",
+            "  ->  Seq Scan on e x  (cost=0.00..15.00 rows=1000 width=7)",
+            "  ->  Hash  (cost=18.50..18.50 rows=101 width=10)",
+            "        ->  Seq Scan on w y  (cost=0.00..18.50 rows=101 width=10)",
+            "              Filter: (c ~~* 'W01%'::text)",
+        ],
+    ),
+    # Still open: a comparison of an expression with a constant pushed to a
+    # join's side (found while working RP-423).
+    "estimate of a join over a scan filtered by an arithmetic comparison": (
+        "RP-423",
+        _ANALYSED_STRINGS,
+        "explain select * from e join w on e.a = w.a where e.a + 1 > 996",
+        [
+            "Hash Join  (cost=24.16..47.24 rows=333 width=17)",
+            "  Hash Cond: (w.a = e.a)",
+            "  ->  Seq Scan on w  (cost=0.00..16.00 rows=1000 width=10)",
+            "  ->  Hash  (cost=20.00..20.00 rows=333 width=7)",
+            "        ->  Seq Scan on e  (cost=0.00..20.00 rows=333 width=7)",
+            "              Filter: ((a + 1) > 996)",
         ],
     ),
     # Still open: a LIKE's ESCAPE is a `like_escape` call PostgreSQL folds

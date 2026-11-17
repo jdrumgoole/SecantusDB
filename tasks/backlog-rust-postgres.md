@@ -1914,28 +1914,28 @@ a regression test.
       private 15.19 cluster (found while working RP-402).
       Verify: tests/backlog/test_rp_explain_costs.py::test_plan[an equivalence class's generated constant is the inner index's cond]
       Backlog-ID: RP-977
-- [ ] **EXPLAIN prints no estimate for a join over a scan filtered by a
-      pattern.** Since RP-404 a comparison of integer or text arithmetic
+- [ ] **EXPLAIN prints no estimate for a join over a scan filtered by an
+      expression.** Since RP-404 a comparison of integer or text arithmetic
       with a constant, and a LIKE / ILIKE of an analysed string column, are
       estimated as PostgreSQL 15.19 estimates them; a comparison of a
       built-in call over columns and literals whose every overload is of
-      one `procost` (`expr_side` in `secantus-pgplan`); since 2026-11-17 a
-      pattern match of such an expression (`lower(b) like 'v%'`, `rows=5`,
-      `patternsel` with no statistics; `ExprQual::pattern`) and a pattern
-      over a table never analysed (`zu where c like 'x%'`, `rows=6`;
-      `where_selectivity`). Since 2026-11-13 a regex match over an analysed
-      column is estimated (RP-354), from the fixed prefix
-      `regex_fixed_prefix` reads. Still zeros: a call of a function whose
+      one `procost` (`expr_side` in `secantus-pgplan`); a pattern match of
+      such an expression (`lower(b) like 'v%'`, `rows=5`; `ExprQual::pattern`)
+      and a pattern over a table never analysed (`where_selectivity`).
+      Since 2026-11-13 a regex match over an analysed column is estimated
+      (RP-354), and since 2026-11-17 a join over a scan a LIKE / ILIKE or
+      regex match filters (the join's WHERE patterns collected by
+      `explain_join_patterns`). Still zeros: a call of a function whose
       overloads differ in `procost`; a regex whose prefix walk is not
       modelled (a group repeated other than at most once, an anchor inside
-      a group, a back reference, embedded options); and a join over any
-      such scan, which prints zeros throughout (`e join s on s.a = e.a
-      where s.c like 'xxx%'` is PostgreSQL's `Hash Join (cost=1.74..20.78
-      rows=29 width=27)`; `where e.a + 1 > 996` instead, `cost=1.68..23.02
-      rows=10`; `e join w on e.a = w.a where w.c ~ '^w00'`,
-      `cost=19.64..39.30 rows=91`). Measured on a private 15.19 cluster
-      (found while working RP-404 and RP-354).
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[estimate of a join over a scan filtered by a LIKE], tests/backlog/test_rp_explain_costs.py::test_plan[estimate of a join over a scan filtered by a regex match]
+      a group, a back reference, embedded options); and a join over a scan
+      an expression comparison filters, which prints zeros throughout
+      (`e join w on e.a = w.a where e.a + 1 > 996` is PostgreSQL's `Hash
+      Join (cost=24.16..47.24 rows=333 width=17)`, `e` hashed): the side's
+      conjunct is an `ExprQual`, which `joined_sides` does not price.
+      Measured on a private 15.19 cluster (found while working RP-404 and
+      RP-354).
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[estimate of a join over a scan filtered by an arithmetic comparison]
       Backlog-ID: RP-423
 - [ ] **A call over constants in a WHERE is not folded in EXPLAIN.**
       `eval_const_expressions` folds an immutable call whose arguments are
