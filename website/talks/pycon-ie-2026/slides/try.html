@@ -1,10 +1,10 @@
-<section id="try" class="alt">
+<section id="try" class="alt" style="gap:28px;padding-top:88px;padding-bottom:72px;">
 <p class="eyebrow">Try it</p>
 <h2>Three ways to install</h2>
-<div class="cards" style="grid-template-columns:1fr 1.5fr 1fr;">
-<div class="card" style="padding:32px;"><h3>PyPI</h3><p class="code" style="font-size:24px;padding:20px 24px;white-space:nowrap;">pip install SecantusDB</p><p class="body">Both Rust servers plus the secantusdb launcher. Linux x86_64, macOS arm64.</p></div>
-<div class="card" style="padding:32px;"><h3>crates.io</h3><p class="code" style="font-size:24px;padding:20px 24px;white-space:nowrap;">cargo install secantus-mdb \<br>&#160;&#160;--version 0.5.3-beta.197<br>cargo install secantus-pg \<br>&#160;&#160;--version 0.1.0-beta.19</p><p class="body">Builds from source, WiredTiger included. Or embed as a Rust library.</p></div>
-<div class="card" style="padding:32px;"><h3>Binaries</h3><p class="code" style="font-size:24px;padding:20px 24px;white-space:nowrap;">secantusd-mdb<br>secantusd-pg</p><p class="body">Prebuilt on GitHub Releases. Run standalone, like mongod or postgres.</p></div>
+<div class="cards two">
+<div class="card" style="padding:28px 32px;"><h3>PyPI</h3><p class="code" style="font-size:24px;padding:20px 24px;white-space:nowrap;">pip install SecantusDB</p><p class="body">Both Rust servers plus the secantusdb launcher. Linux x86_64, macOS arm64.</p></div>
+<div class="card" style="padding:28px 32px;"><h3>crates.io</h3><p class="code" style="font-size:24px;padding:20px 24px;white-space:nowrap;">cargo install secantus-mdb --version 0.5.3-beta.197<br>cargo install secantus-pg&#160;&#160;--version 0.1.0-beta.19</p><p class="body">Builds from source, WiredTiger included. Or embed as a Rust library.</p></div>
 </div>
-<aside>Recap the usage slide. Nothing compiles on pip install. cargo install needs a C toolchain and CMake because it builds WiredTiger. Both crates are pre-releases, so cargo needs the exact --version; check for newer versions before the talk. Demo here if time allows. ~2 min.</aside>
+<div class="card" style="padding:28px 32px;"><h3>GitHub Releases: prebuilt binaries</h3><p class="code" style="font-size:22px;padding:20px 24px;white-space:nowrap;"><span class="c"># macOS arm64 shown; on Linux use x86_64-unknown-linux-gnu</span><br>R=https://github.com/jdrumgoole/SecantusDB/releases/download<br>curl -LO $R/secantusdb-v0.5.3-beta.197/secantusdb-0.5.3-beta.197-aarch64-apple-darwin.tar.gz<br>tar xzf secantusdb-0.5.3-beta.197-aarch64-apple-darwin.tar.gz<br>./secantusdb-0.5.3-beta.197-aarch64-apple-darwin/secantusd-mdb --port 27017</p><p class="body">secantusd-pg: the same steps from the secantusd-pg-v0.1.0-beta.19 release. Each archive has a .sha256 beside it. No Python, no toolchain.</p></div>
+<aside>Nothing compiles on pip install. cargo install needs a C toolchain and CMake because it builds WiredTiger. Both crates are pre-releases, so cargo needs the exact --version. The binary commands were run verbatim on macOS arm64 on 17 November 2026; check for newer releases before the talk. Windows (mdb only) is a .tar.gz on the same release. ~2 min.</aside>
 </section>
