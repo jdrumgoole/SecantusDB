@@ -3217,8 +3217,8 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
         "explain select * from t x",
         ["Seq Scan on t x  (cost=0.00..35.50 rows=2550 width=4)"],
     ),
-    # Measured on PostgreSQL 15.19: an inner join on an expression key is
-    # hashed on the expression (the mechanism RP-981 builds on).
+    # Measured on PostgreSQL 15.19: an inner join on an expression key was
+    # hashed on the expression (the mechanism RP-981 built on).
     "an inner join on an expression key is a hash join": (
         "RP-981",
         _ANALYSED,
@@ -3232,7 +3232,7 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
         ],
     ),
     # ------------- RP-981 an anti join on an expression key
-    # The ON strict in the nullable side's key through an expression is an
+    # The ON strict in the nullable side's key through an expression was an
     # anti join too, hashed on the expression (found while working RP-908).
     "a left join on an expression key where the nullable side is null is a hash anti join": (
         "RP-981",
@@ -3244,6 +3244,53 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "  ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
             "  ->  Hash  (cost=15.00..15.00 rows=1000 width=7)",
             "        ->  Seq Scan on e e2  (cost=0.00..15.00 rows=1000 width=7)",
+        ],
+    ),
+    # Measured on PostgreSQL 15.19: an expression key against a unique
+    # column hashes the unique side, inner unique.
+    "an expression key against a unique column is a hash join": (
+        "RP-1032",
+        _ANALYSED,
+        "explain select * from e join k on k.a = e.a - 1",
+        [
+            "Hash Join  (cost=27.50..45.26 rows=1000 width=14)",
+            "  Hash Cond: ((e.a - 1) = k.a)",
+            "  ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
+            "  ->  Hash  (cost=15.00..15.00 rows=1000 width=7)",
+            "        ->  Seq Scan on k  (cost=0.00..15.00 rows=1000 width=7)",
+        ],
+    ),
+    # Measured on PostgreSQL 15.19: a text expression key over a column of
+    # ten values merges, the expression's Sort Key its projected value.
+    "an expression key over a column of few values is a merge join": (
+        "RP-1032",
+        _ANALYSED,
+        "explain select * from e join e e2 on e.b = e2.b || 'x'",
+        [
+            "Merge Join  (cost=129.66..224.66 rows=5000 width=14)",
+            "  Merge Cond: (e.b = ((e2.b || 'x'::text)))",
+            "  ->  Sort  (cost=64.83..67.33 rows=1000 width=7)",
+            "        Sort Key: e.b",
+            "        ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
+            "  ->  Sort  (cost=64.83..67.33 rows=1000 width=7)",
+            "        Sort Key: ((e2.b || 'x'::text))",
+            "        ->  Seq Scan on e e2  (cost=0.00..15.00 rows=1000 width=7)",
+        ],
+    ),
+    # Measured on PostgreSQL 15.19: ANALYZE of an anti join hashed on an
+    # expression counts its children and its hash table.
+    "analyze of an anti join on an expression key": (
+        "RP-1033",
+        _ANALYSED,
+        "explain (analyze, costs off, timing off, summary off)"
+        " select * from e left join e e2 on e.a = e2.a + 1 where e2.a is null",
+        [
+            "Hash Anti Join (actual rows=1 loops=1)",
+            "  Hash Cond: (e.a = (e2.a + 1))",
+            "  ->  Seq Scan on e (actual rows=1000 loops=1)",
+            "  ->  Hash (actual rows=1000 loops=1)",
+            "        Buckets: 1024  Batches: 1  Memory Usage: 47kB",
+            "        ->  Seq Scan on e e2 (actual rows=1000 loops=1)",
         ],
     ),
     # ------------- RP-902 a reduced LEFT join's one-sided ON conjunct
@@ -6591,6 +6638,7 @@ def _marked(name: str, item: str) -> Any:
             name, marks=pytest.mark.backlog_fixed(item.removesuffix(":fixed")), id=name
         )
     fixed = item in (
+        "RP-981",
         "RP-967",
         "RP-1021",
         "RP-980",

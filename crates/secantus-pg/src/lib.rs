@@ -46055,6 +46055,26 @@ impl PgHandler {
                         }
                     }
                 }
+                // A join on an expression key is hashed on the expression
+                // where that path prices (RP-981): the right side under a
+                // Hash, and its ON (attached below) the Hash Cond.
+                if let Statement::Select(sel) = inner.as_ref() {
+                    if matches!(
+                        tree.name.as_str(),
+                        "Nested Loop" | "Nested Loop Left Join" | "Nested Loop Anti Join"
+                    ) && tree.children.len() == 2
+                        && tree.children.iter().all(|c| c.children.is_empty())
+                        && scan_estimate::has_expr_join_key(sel)
+                        && self.hash_join_estimate(sel).is_some()
+                    {
+                        tree.name = tree.name.replace("Nested Loop", "Hash");
+                        if tree.name == "Hash" {
+                            tree.name = "Hash Join".into();
+                        }
+                        let right = tree.children.pop().expect("two children");
+                        tree.children.push(explain::PlanNode::over("Hash", right));
+                    }
+                }
                 let plain_scan =
                     |n: &str| n.starts_with("Seq Scan on ") || n.starts_with("Index Scan using ");
                 if matches!(

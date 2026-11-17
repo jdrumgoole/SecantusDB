@@ -1268,7 +1268,13 @@ fn outer_first(n: &PlanNode, c: &str) -> Option<bool> {
     if b.contains(" = ") {
         return None;
     }
-    let qual = |o: &str| o.split_once('.').map(|(q, _)| q.to_string());
+    // An operand may be an expression over one column, `(e2.a + 1)`
+    // (RP-981).
+    let qual = |o: &str| {
+        o.trim_start_matches('(')
+            .split_once('.')
+            .map(|(q, _)| q.to_string())
+    };
     let (qa, qb) = (qual(a)?, qual(b)?);
     let mut outer = Vec::new();
     relation_names(&n.children[0], &mut outer);

@@ -1203,33 +1203,6 @@ one beside it.
       Backlog-ID: RP-911
       Verify: tests/backlog/test_rp_catalog_latency.py::test_the_first_catalog_query_after_ddl_costs_the_same_at_800_tables_within_a_tenth
 
-## Found while working RP-908 (2026-11-15)
-
-- [ ] **A LEFT join on an expression key whose WHERE keeps only the
-      unmatched rows prints a Nested Loop Left Join, not a Hash Anti
-      Join.** `select * from e left join e e2 on e.a = e2.a + 1 where e2.a
-      is null` is, in PostgreSQL 15.19, `Hash Anti Join
-      (cost=27.50..133.88 rows=500 width=14)` on `(e.a = (e2.a + 1))`;
-      here a `Nested Loop Left Join` with `Filter: (e2.a IS NULL)` and
-      zero costs (and under ANALYZE its scans print no actuals). RP-908
-      recognises the anti join only where the ON is strict through a bare
-      key (`left_anti_key`); an expression key is neither hashed here nor
-      priced as one (`eqjoinsel_semi` over an expression has no
-      statistics: `rows=500` is its 0.5 default). Measured on a private
-      15.19 cluster.
-      (2026-11-17, working RP-981 in a bundle: no join on an expression
-      key is hashed yet, inner included. `select * from e join e e2 on e.a
-      = e2.a + 1` is, in PostgreSQL 15.19, `Hash Join (cost=27.50..57.50
-      rows=1000 width=14)` on `((e2.a + 1) = e.a)`, `e2` outer; the LEFT
-      join without the WHERE a `Hash Right Join` of the same cost. Here
-      each is an unpriced `Nested Loop` with `Join Filter: (e.a = (e2.a +
-      1))`, and the planner's `expr_keys` make `nest_loop_estimate`
-      decline. Build the inner hash join on an expression key first (its
-      path, `Hash Cond` and `eqjoinsel` with no statistics on the
-      expression), then let `left_anti_key` accept the expression key.)
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a left join on an expression key where the nullable side is null is a hash anti join], tests/backlog/test_rp_explain_costs.py::test_plan[an inner join on an expression key is a hash join]
-      Backlog-ID: RP-981
-
 ## Found while working RP-911 (2026-11-15)
 
 - [ ] **OPEN — `CREATE TYPE pg_temp.t AS (...)` makes no type in the temp
@@ -2940,6 +2913,36 @@ statement is VALUES-only and runs there as written. The gap test is in
 
 ## Found while working RP-966 (2026-11-17)
 
+- [ ] **A join on an expression key PostgreSQL prices is unpriced in
+      three shapes.** Since RP-981 a join of two analysed tables on one
+      equality between a column and an operator expression over one column
+      of the other is a priced Hash Join (inner, LEFT, anti), hashing the
+      side whose key has statistics. Still a `Nested Loop` with `Join
+      Filter` and zero costs: against a unique column, `select * from e join
+      k on k.a = e.a - 1` (PostgreSQL 15.19 `Hash Join (cost=27.50..45.26
+      rows=1000 width=14)` hashing `k`, inner unique; `hash_join_of`'s
+      unique-key paths are not modelled over an expression); where the
+      merge wins, `e.b = e2.b || 'x'` over a ten-value column (`Merge Join
+      (cost=129.66..224.66 rows=5000 width=14)`, the expression's Sort Key
+      `((e2.b || 'x'::text))`; priced with `mergejoinscansel`'s defaults
+      and declined, the plan is not drawn); and across types, `e.a::bigint =
+      e2.a` (`Hash Join (cost=27.50..57.50 rows=1000 width=14)`; declined on
+      `pg_type`). An aggregate over such a join (`select count(*)`) and a
+      LEFT join filtered on a column not its key (`where e2.b is null`, a
+      `Hash Right Join` with `Filter`) stay unpriced as they do over a
+      column key. Measured on the 15.19 reference on port 5415.
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[an expression key against a unique column is a hash join], tests/backlog/test_rp_explain_costs.py::test_plan[an expression key over a column of few values is a merge join]
+      Backlog-ID: RP-1032
+- [ ] **ANALYZE of a hash join on an expression key counts nothing below
+      it.** `explain (analyze, costs off, timing off, summary off) select *
+      from e left join e e2 on e.a = e2.a + 1 where e2.a is null` prints,
+      in PostgreSQL 15.19, `actual rows` on both scans and the Hash and the
+      Hash's `Buckets: 1024  Batches: 1  Memory Usage: 47kB`; here only the
+      join's own `actual rows=1`. `join_analyze` reads the `Hash Cond` as
+      two columns. Measured on the 15.19 reference on port 5415 (found
+      while working RP-981).
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[analyze of an anti join on an expression key]
+      Backlog-ID: RP-1033
 - [ ] **A hash join written inner side first is not `Inner Unique`.**
       `explain verbose select * from k join e on e.a = k.a` (`k.a` the
       primary key, `k` hashed) prints `Inner Unique: true` in PostgreSQL
