@@ -19,10 +19,15 @@ mod agg_support;
 pub mod deferred;
 mod dml_pullup;
 mod domain_scope;
+mod initplan;
 mod join_alias;
 mod record_image;
 mod relabel;
+mod sublink_join;
+mod subquery_pullup;
 pub use domain_scope::{select_output_domains, select_target_domain};
+pub use initplan::InitPlan;
+pub use sublink_join::SemiJoin;
 mod targetlist_size;
 pub use targetlist_size::MAX_HEAP_ATTRIBUTE_NUMBER;
 mod cmpfn;
@@ -604,7 +609,7 @@ pub enum Statement {
     /// `EXPLAIN [ANALYZE] [(options)] <statement>`.
     Explain {
         inner: Box<Statement>,
-        options: ExplainOptions,
+        options: Box<ExplainOptions>,
     },
     /// `CREATE [UNIQUE] INDEX`.
     CreateIndex(CreateIndex),
@@ -3699,6 +3704,13 @@ pub struct ExplainOptions {
     /// those conjuncts, as `clauselist_selectivity` reads it (RP-404).
     /// `None` for any other WHERE.
     pub scan_expr_quals: Option<Vec<ExprQual>>,
+    /// A join of plain tables: for each table (by its alias) whose WHERE
+    /// conjuncts include comparisons of an expression over its columns
+    /// with a constant, those conjuncts as `clauselist_selectivity` reads
+    /// them once `distribute_qual_to_rels` has pushed them to its scan
+    /// (RP-423). `None` for an alias with a conjunct of its own that is
+    /// neither lowered nor such a comparison.
+    pub join_expr_quals: Vec<(String, Option<Vec<ExprQual>>)>,
     /// A single-relation statement whose WHERE compares an array column
     /// with a constant: the WHERE's conjuncts lowered as though those
     /// comparisons were filters, and whether every conjunct lowered
@@ -3754,6 +3766,75 @@ pub struct ExplainOptions {
     /// (RP-847): its operators per row, and its selectivity given the
     /// series' row count.
     pub series_qual: Option<SeriesQual>,
+    /// A SELECT over one other function in FROM: the `Function Scan on`
+    /// node's name, with its alias when it differs (RP-475).
+    pub function_scan: Option<String>,
+    /// That function's name and argument count, for the server to price
+    /// the scan from its `pg_proc` row (RP-475).
+    pub function_scan_call: Option<(String, usize)>,
+    /// That scan's WHERE, for the server to print and price as its
+    /// Filter once it knows the function's result columns (RP-475).
+    pub function_scan_where: Option<Box<FunctionScanWhere>>,
+    /// A SELECT whose WHERE is one IN or EXISTS sublink pulled up into a
+    /// semi join (RP-411).
+    pub semi_join: Option<Box<SemiJoin>>,
+    /// The uncorrelated scalar subqueries the scan's quals compare with,
+    /// each an InitPlan run once (RP-440).
+    pub init_plans: Vec<InitPlan>,
+}
+
+/// A user function scan's WHERE, kept until the function's result
+/// columns are known (RP-475).
+#[derive(Debug, Clone, PartialEq)]
+pub struct FunctionScanWhere {
+    where_clause: pg_query::protobuf::Node,
+    /// The range table entry's name: the alias, else the function's.
+    relation: String,
+    /// The alias's column names, which rename the result columns in order.
+    colnames: Vec<String>,
+}
+
+impl FunctionScanWhere {
+    /// The Filter's text and, over a one-column result, its pricing:
+    /// `out_columns` are the function's OUT columns (empty for a scalar
+    /// or SETOF scalar result, whose one column is named for the alias
+    /// column, else the relation), `return_type` its result type.
+    pub fn filter(
+        &self,
+        out_columns: &[(String, String)],
+        return_type: &str,
+    ) -> Option<(String, Option<SeriesQual>)> {
+        let base: Vec<(String, String)> = if out_columns.is_empty() {
+            vec![(self.relation.clone(), return_type.to_string())]
+        } else {
+            out_columns.to_vec()
+        };
+        let columns: Vec<(String, String)> = base
+            .into_iter()
+            .enumerate()
+            .map(|(i, (n, t))| (self.colnames.get(i).cloned().unwrap_or(n), t))
+            .collect();
+        let def = TableDef::new(
+            &self.relation,
+            columns
+                .iter()
+                .map(|(n, t)| secantus_pgcatalog::Column::new(n, t, false))
+                .collect(),
+        );
+        let texts: Vec<String> = ruleutils::explain_conjuncts(&self.where_clause, &def)?
+            .into_iter()
+            .map(|(t, _)| t)
+            .collect();
+        let text = match texts.as_slice() {
+            [one] => one.clone(),
+            many => format!("({})", many.join(" AND ")),
+        };
+        let qual = match columns.as_slice() {
+            [(c, _)] => series_qual(&self.where_clause, c),
+            _ => None,
+        };
+        Some((text, qual))
+    }
 }
 
 /// A `generate_series` scan's WHERE as the planner prices it (RP-847).
@@ -12295,6 +12376,7 @@ fn plan_explain(
         scan_array_quals: None,
         scan_patterns: Vec::new(),
         scan_expr_quals: None,
+        join_expr_quals: Vec::new(),
         scan_array_cmp_filter: None,
         setop_quals: Vec::new(),
         join_conds: Vec::new(),
@@ -12308,6 +12390,11 @@ fn plan_explain(
         sort_keys: None,
         series_scan: None,
         series_qual: None,
+        function_scan: None,
+        function_scan_call: None,
+        function_scan_where: None,
+        semi_join: None,
+        init_plans: Vec::new(),
     };
     let (mut timing, mut summary) = (None, None);
     // `transformExplainStmt` resolves the statement's names and literals
@@ -12394,6 +12481,19 @@ fn plan_explain(
     }
     // A join alias's columns are its sides' own (RP-471).
     join_alias::flatten_join_aliases(&mut query, lookup)?;
+    // A simple FROM-subquery is merged into its parent (RP-422).
+    subquery_pullup::pull_up_simple_subquery(&mut query, lookup)?;
+    // An IN / EXISTS sublink is pulled up into a semi join (RP-411).
+    if !options.analyze {
+        options.semi_join = sublink_join::semi_join_of(&query, lookup);
+        if let Some(sj) = options.semi_join.as_mut() {
+            if let Some(joined) = sublink_join::as_inner_join(&query, sj) {
+                let mut alt = e.clone();
+                alt.query = Some(Box::new(pg_query::protobuf::Node { node: Some(joined) }));
+                sj.inner_join = Some(Box::new(plan_explain(&alt, lookup, params)?));
+            }
+        }
+    }
     // The WHERE's constants are simplified before anything is planned
     // (`eval_const_expressions`, `canonicalize_qual`; RP-409).
     options.dummy_relation = const_quals::simplify_statement(&mut query, lookup)?;
@@ -12411,7 +12511,18 @@ fn plan_explain(
         }
         options.nullable_gate = reduce_left_join_on_classes(&mut query, lookup);
     }
-    let scan_quals = explain_scan_quals(&query, lookup).unwrap_or_default();
+    // An uncorrelated scalar subquery a qual compares with is an
+    // InitPlan, printed as its parameter (RP-440).
+    let init_sublinks = if options.analyze {
+        Vec::new()
+    } else {
+        let (sublinks, plans) = initplan::init_plans_of(&query, lookup, params)?;
+        options.init_plans = plans;
+        sublinks
+    };
+    let scan_quals = ruleutils::with_init_plans(&init_sublinks, || {
+        explain_scan_quals(&query, lookup).unwrap_or_default()
+    });
     (options.series_scan, options.series_qual) = match &query {
         N::SelectStmt(s) => match explain_series_scan(s) {
             Some((scan, qual)) => (Some(scan), qual),
@@ -12419,9 +12530,31 @@ fn plan_explain(
         },
         _ => (None, None),
     };
+    (
+        options.function_scan,
+        options.function_scan_call,
+        options.function_scan_where,
+    ) = match &query {
+        N::SelectStmt(s) if options.series_scan.is_none() => match explain_function_scan(s) {
+            Some((shown, call, filter)) => (Some(shown), Some(call), filter),
+            None => (None, None, None),
+        },
+        _ => (None, None, None),
+    };
     options.sort_keys = match &query {
         N::SelectStmt(s) => match s.from_clause.as_slice() {
             [item] => match item.node.as_ref() {
+                // An InitPlan's range table entry makes the range table
+                // longer than one, so the keys are qualified
+                // (`show_sort_group_keys`'s `useprefix`, RP-440).
+                Some(N::RangeVar(_)) if !options.init_plans.is_empty() => {
+                    let none = |_: &str| None;
+                    let cat = ruleutils::Catalog {
+                        lookup,
+                        view_sql: &none,
+                    };
+                    ruleutils::explain_join_sort_keys(s, &cat)
+                }
                 Some(N::RangeVar(rv)) => {
                     lookup(&rv.relname).and_then(|def| ruleutils::explain_sort_keys(s, &def))
                 }
@@ -12454,67 +12587,72 @@ fn plan_explain(
         let _filters = ArrayCompareAsFilter::set();
         explain_scan_expr_quals(&query, lookup)
     };
+    options.join_expr_quals = explain_join_expr_quals(&query, lookup).unwrap_or_default();
     let setop_quals = explain_setop_quals(&query, lookup).unwrap_or_default();
     options.subquery_quals = explain_subquery_quals(&query, lookup).unwrap_or_default();
     let mut join_cond_splits = Vec::new();
-    let join_conds = match &query {
-        N::SelectStmt(s) => {
-            // A constant TRUE ON conjunct is folded away (RP-394), and an
-            // inner join's one-table ON conjunct is printed on its table's
-            // scan, as the planner runs it (RP-391).
-            let hoisted = joins::prepare_on_quals(s);
-            let s = hoisted.as_ref().unwrap_or(s);
-            // An outer join's ON conjunct over its nullable side alone is
-            // printed on that side's scan, as it runs there (RP-395).
-            let nullable_side = joins::nullable_side_on_conjuncts(s);
-            let (s, nullable_pushed) = match &nullable_side {
-                Some((rewritten, pushed)) => (rewritten, pushed.as_slice()),
-                None => (s, &[][..]),
-            };
-            let none = |_: &str| None;
-            let cat = ruleutils::Catalog {
-                lookup,
-                view_sql: &none,
-            };
-            // A JOIN, or a comma list of plain relations (`FROM a, b`,
-            // RP-329), whose WHERE's conjuncts over both are join quals.
-            let joined = match s.from_clause.as_slice() {
-                [one] => matches!(one.node.as_ref(), Some(N::JoinExpr(_))),
-                many => {
-                    many.len() > 1
-                        && many
-                            .iter()
-                            .all(|n| matches!(n.node.as_ref(), Some(N::RangeVar(_))))
+    // An InitPlan's parameter in an ON conjunct is placed and printed as
+    // the WHERE's is (RP-440).
+    let join_conds = ruleutils::with_init_plans(&init_sublinks, || -> Result<Vec<String>> {
+        Ok(match &query {
+            N::SelectStmt(s) => {
+                // A constant TRUE ON conjunct is folded away (RP-394), and an
+                // inner join's one-table ON conjunct is printed on its table's
+                // scan, as the planner runs it (RP-391).
+                let hoisted = joins::prepare_on_quals(s);
+                let s = hoisted.as_ref().unwrap_or(s);
+                // An outer join's ON conjunct over its nullable side alone is
+                // printed on that side's scan, as it runs there (RP-395).
+                let nullable_side = joins::nullable_side_on_conjuncts(s);
+                let (s, nullable_pushed) = match &nullable_side {
+                    Some((rewritten, pushed)) => (rewritten, pushed.as_slice()),
+                    None => (s, &[][..]),
+                };
+                let none = |_: &str| None;
+                let cat = ruleutils::Catalog {
+                    lookup,
+                    view_sql: &none,
+                };
+                // A JOIN, or a comma list of plain relations (`FROM a, b`,
+                // RP-329), whose WHERE's conjuncts over both are join quals.
+                let joined = match s.from_clause.as_slice() {
+                    [one] => matches!(one.node.as_ref(), Some(N::JoinExpr(_))),
+                    many => {
+                        many.len() > 1
+                            && many
+                                .iter()
+                                .all(|n| matches!(n.node.as_ref(), Some(N::RangeVar(_))))
+                    }
+                };
+                // A join's ORDER BY keys, qualified (RP-919).
+                if joined {
+                    options.sort_keys = ruleutils::explain_join_sort_keys(s, &cat);
                 }
-            };
-            // A join's ORDER BY keys, qualified (RP-919).
-            if joined {
-                options.sort_keys = ruleutils::explain_join_sort_keys(s, &cat);
+                options.join_where = if joined {
+                    ruleutils::join_where(s, &cat).unwrap_or_default()
+                } else {
+                    Vec::new()
+                };
+                // Those go first: `deconstruct_jointree` distributes a join's
+                // own quals before the WHERE's.
+                if joined && !nullable_pushed.is_empty() {
+                    let mut first = nullable_side_scan_quals(nullable_pushed, &cat);
+                    first.append(&mut options.join_where);
+                    options.join_where = first;
+                    ruleutils::order_merged_scan_quals(&mut options.join_where);
+                }
+                let split = ruleutils::join_conditions_split(s, &cat).unwrap_or_default();
+                let conds: Vec<String> = split.iter().map(|(c, _)| c.clone()).collect();
+                join_cond_splits = split.into_iter().map(|(_, s)| s).collect();
+                if conds.is_empty() && joined {
+                    ruleutils::comma_join_conds(s, &mut options.join_where)?
+                } else {
+                    conds
+                }
             }
-            options.join_where = if joined {
-                ruleutils::join_where(s, &cat).unwrap_or_default()
-            } else {
-                Vec::new()
-            };
-            // Those go first: `deconstruct_jointree` distributes a join's
-            // own quals before the WHERE's.
-            if joined && !nullable_pushed.is_empty() {
-                let mut first = nullable_side_scan_quals(nullable_pushed, &cat);
-                first.append(&mut options.join_where);
-                options.join_where = first;
-                ruleutils::order_merged_scan_quals(&mut options.join_where);
-            }
-            let split = ruleutils::join_conditions_split(s, &cat).unwrap_or_default();
-            let conds: Vec<String> = split.iter().map(|(c, _)| c.clone()).collect();
-            join_cond_splits = split.into_iter().map(|(_, s)| s).collect();
-            if conds.is_empty() && joined {
-                ruleutils::comma_join_conds(s, &mut options.join_where)?
-            } else {
-                conds
-            }
-        }
-        _ => Vec::new(),
-    };
+            _ => Vec::new(),
+        })
+    })?;
     // Without ANALYZE the statement is planned and not run.
     let inner = if options.analyze {
         plan_node(query, lookup, params)?
@@ -12541,7 +12679,7 @@ fn plan_explain(
     }
     Ok(Statement::Explain {
         inner: Box::new(inner),
-        options,
+        options: Box::new(options),
     })
 }
 
@@ -20204,6 +20342,77 @@ fn mark_stored_column_sizes(
             })),
         });
         Ok(())
+    })
+}
+
+/// Two row expressions over one statement's parameters ANDed into one, as
+/// a join's quals are when clauses written in different ONs land on one
+/// join (`distribute_qual_to_rels`, RP-919). `b`'s field references are
+/// renumbered past `a`'s fields. `None` when either is not a row
+/// expression, or they do not share the statement's parameter count.
+pub fn and_row_exprs(a: &ColumnExpr, b: &ColumnExpr) -> Option<ColumnExpr> {
+    let (
+        ColumnExpr::Row {
+            expr: ea,
+            fields: fa,
+            params: pa,
+            param_types,
+            widths: wa,
+            ..
+        },
+        ColumnExpr::Row {
+            expr: eb,
+            fields: fb,
+            params: pb,
+            widths: wb,
+            ..
+        },
+    ) = (a, b)
+    else {
+        return None;
+    };
+    if pa.len() != pb.len() {
+        return None;
+    }
+    let n = pa.len();
+    let mut eb = eb.as_ref().clone();
+    let shift = fa.len();
+    walk_expr(&mut eb, &mut |node| {
+        if let Some(N::ParamRef(p)) = node.node.as_mut() {
+            if p.number as usize > n {
+                p.number += i32::try_from(shift).unwrap_or(0);
+            }
+        }
+        Ok(())
+    })
+    .ok()?;
+    let params = pa
+        .iter()
+        .zip(pb)
+        .map(|(x, y)| {
+            if matches!(x, Bson::Null) {
+                y.clone()
+            } else {
+                x.clone()
+            }
+        })
+        .collect();
+    let expr = pg_query::protobuf::Node {
+        node: Some(N::BoolExpr(Box::new(pg_query::protobuf::BoolExpr {
+            xpr: None,
+            boolop: pg_query::protobuf::BoolExprType::AndExpr as i32,
+            args: vec![ea.as_ref().clone(), eb],
+            location: -1,
+        }))),
+    };
+    Some(ColumnExpr::Row {
+        expr: Box::new(expr),
+        fields: fa.iter().chain(fb).cloned().collect(),
+        params,
+        param_types: param_types.clone(),
+        result_type: "bool".to_string(),
+        widths: wa.iter().chain(wb).cloned().collect(),
+        scratch: RowScratch::default(),
     })
 }
 
@@ -53733,9 +53942,91 @@ fn explain_scan_patterns(
     query: &N,
     lookup: &dyn Fn(&str) -> Option<TableDef>,
 ) -> Option<Vec<ScanPattern>> {
+    if let Some(found) = explain_join_patterns(query, lookup) {
+        return Some(found);
+    }
     let (table, where_clause) = explain_scan_where(query)?;
     let def = lookup(&table)?;
     Some(where_patterns(where_clause, &def))
+}
+
+/// A join's WHERE patterns (RP-423): each LIKE / ILIKE or regex match of
+/// one joined table's column, the column's table found by its qualifier
+/// (or, unqualified, the one FROM table that has it), as that table's
+/// scan reads it once `distribute_qual_to_rels` has pushed it down. `None`
+/// where the FROM is not two or more plain tables joined.
+fn explain_join_patterns(
+    query: &N,
+    lookup: &dyn Fn(&str) -> Option<TableDef>,
+) -> Option<Vec<ScanPattern>> {
+    fn tables(n: &pg_query::protobuf::Node, out: &mut Vec<(String, String)>) -> Option<()> {
+        match n.node.as_ref()? {
+            N::RangeVar(rv) => {
+                let alias = rv
+                    .alias
+                    .as_ref()
+                    .map_or_else(|| rv.relname.clone(), |a| a.aliasname.clone());
+                out.push((alias, rv.relname.clone()));
+            }
+            N::JoinExpr(j) => {
+                tables(j.larg.as_deref()?, out)?;
+                tables(j.rarg.as_deref()?, out)?;
+            }
+            _ => return None,
+        }
+        Some(())
+    }
+    let N::SelectStmt(s) = query else {
+        return None;
+    };
+    let where_clause = s.where_clause.as_deref()?;
+    let mut from = Vec::new();
+    for item in &s.from_clause {
+        tables(item, &mut from)?;
+    }
+    if from.len() < 2 {
+        return None;
+    }
+    let defs: Vec<(String, TableDef)> = from
+        .into_iter()
+        .map(|(alias, table)| Some((alias, lookup(&table)?)))
+        .collect::<Option<_>>()?;
+    fn walk(n: &pg_query::protobuf::Node, defs: &[(String, TableDef)], out: &mut Vec<ScanPattern>) {
+        match n.node.as_ref() {
+            Some(N::BoolExpr(b)) => b.args.iter().for_each(|a| walk(a, defs, out)),
+            Some(N::AExpr(e)) => {
+                let Some(N::ColumnRef(c)) = e.lexpr.as_deref().and_then(|l| l.node.as_ref()) else {
+                    return;
+                };
+                let names: Vec<&str> = c
+                    .fields
+                    .iter()
+                    .filter_map(|f| match f.node.as_ref() {
+                        Some(N::String(s)) => Some(s.sval.as_str()),
+                        _ => None,
+                    })
+                    .collect();
+                let def = match names.as_slice() {
+                    [alias, _] => defs.iter().find(|(a, _)| a == alias).map(|(_, d)| d),
+                    [col] => {
+                        let mut has = defs.iter().filter(|(_, d)| d.field_of(col).is_some());
+                        match (has.next(), has.next()) {
+                            (Some((_, d)), None) => Some(d),
+                            _ => None,
+                        }
+                    }
+                    _ => None,
+                };
+                if let Some(p) = def.and_then(|d| scan_pattern(e, d)) {
+                    out.push(p);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut out = Vec::new();
+    walk(where_clause, &defs, &mut out);
+    Some(out)
 }
 
 /// The [`ScanPattern`]s of `where_clause`, a WHERE over table `def`'s
@@ -53832,6 +54123,10 @@ pub struct ExprQual {
     pub operators: u32,
     /// The stored fields the expression reads.
     pub fields: Vec<String>,
+    /// A pattern match of the expression instead of the comparison
+    /// (RP-423): `(pattern, insensitive, negated, regex)`, `patternsel`
+    /// over an expression with no statistics.
+    pub pattern: Option<(String, bool, bool, bool)>,
 }
 
 /// A single-relation statement's WHERE as [`ExprQual`]s: `Some` only when
@@ -53842,8 +54137,9 @@ pub struct ExprQual {
 /// literals, or `||` over `text` / `varchar` columns and string literals:
 /// operators that are each one function of `procost` 1, with no implicit
 /// cast between them; or an explicit cast of a column to an integer or
-/// string type (`a::text`, its function's cost, [`pg_casts::explicit_cast_cost`]).
-/// A function call, any other cast or any other node is declined.
+/// string type (`a::text`, its function's cost, [`pg_casts::explicit_cast_cost`]);
+/// or a call of a built-in of one `procost` over columns and literals
+/// (RP-423). Any other call, cast or node is declined.
 fn explain_scan_expr_quals(
     query: &N,
     lookup: &dyn Fn(&str) -> Option<TableDef>,
@@ -53871,6 +54167,113 @@ fn explain_scan_expr_quals(
         }
     }
     (!out.is_empty()).then_some(out)
+}
+
+/// A join's WHERE conjuncts that each read one plain table's columns
+/// and do not lower to its filter, as [`ExprQual`]s of that table's alias
+/// ([`ExplainOptions::join_expr_quals`], RP-423). `None` where the FROM is
+/// not two or more plain tables joined.
+fn explain_join_expr_quals(
+    query: &N,
+    lookup: &dyn Fn(&str) -> Option<TableDef>,
+) -> Option<Vec<(String, Option<Vec<ExprQual>>)>> {
+    fn tables(n: &pg_query::protobuf::Node, out: &mut Vec<(String, String)>) -> Option<()> {
+        match n.node.as_ref()? {
+            N::RangeVar(rv) => {
+                let alias = rv
+                    .alias
+                    .as_ref()
+                    .map_or_else(|| rv.relname.clone(), |a| a.aliasname.clone());
+                out.push((alias, rv.relname.clone()));
+            }
+            N::JoinExpr(j) => {
+                tables(j.larg.as_deref()?, out)?;
+                tables(j.rarg.as_deref()?, out)?;
+            }
+            _ => return None,
+        }
+        Some(())
+    }
+    let N::SelectStmt(s) = query else {
+        return None;
+    };
+    let where_clause = s.where_clause.as_deref()?;
+    let mut from = Vec::new();
+    for item in &s.from_clause {
+        tables(item, &mut from)?;
+    }
+    if from.len() < 2 {
+        return None;
+    }
+    let defs: Vec<(String, TableDef)> = from
+        .into_iter()
+        .map(|(alias, table)| Some((alias, lookup(&table)?)))
+        .collect::<Option<_>>()?;
+    let mut parts = Vec::new();
+    let mut stack = vec![where_clause];
+    while let Some(n) = stack.pop() {
+        match n.node.as_ref() {
+            Some(N::BoolExpr(b))
+                if BoolExprType::try_from(b.boolop) == Ok(BoolExprType::AndExpr) =>
+            {
+                stack.extend(b.args.iter().rev());
+            }
+            _ => parts.push(n),
+        }
+    }
+    let mut out: Vec<(String, Option<Vec<ExprQual>>)> = Vec::new();
+    for p in parts {
+        // The one table the conjunct reads, by each column's qualifier or,
+        // unqualified, the one FROM table that has the column.
+        let mut alias: Option<&str> = None;
+        let mut one_table = true;
+        for (n, _, _, _) in p.node.as_ref()?.nodes() {
+            let pg_query::NodeRef::ColumnRef(c) = n else {
+                continue;
+            };
+            let names: Vec<&str> = c
+                .fields
+                .iter()
+                .filter_map(|f| match f.node.as_ref() {
+                    Some(N::String(s)) => Some(s.sval.as_str()),
+                    _ => None,
+                })
+                .collect();
+            let found = match names.as_slice() {
+                [a, _] => defs.iter().find(|(x, _)| x == a).map(|(x, _)| x.as_str()),
+                [col] => {
+                    let mut has = defs.iter().filter(|(_, d)| d.field_of(col).is_some());
+                    match (has.next(), has.next()) {
+                        (Some((x, _)), None) => Some(x.as_str()),
+                        _ => None,
+                    }
+                }
+                _ => None,
+            };
+            match (found, alias) {
+                (None, _) => one_table = false,
+                (Some(f), Some(a)) if f != a => one_table = false,
+                (Some(f), _) => alias = Some(f),
+            }
+        }
+        let (true, Some(alias)) = (one_table, alias) else {
+            continue;
+        };
+        let def = &defs.iter().find(|(a, _)| a == alias)?.1;
+        let qual = match lower_where_nonvolatile(p, def, &[]) {
+            Ok(_) => continue,
+            Err(Error::Unsupported(_)) => expr_qual(p, def),
+            Err(_) => None,
+        };
+        match out.iter_mut().find(|(a, _)| a == alias) {
+            Some((_, quals)) => match (quals.as_mut(), qual) {
+                (Some(q), Some(x)) => q.push(x),
+                _ => *quals = None,
+            },
+            None => out.push((alias.to_string(), qual.map(|q| vec![q]))),
+        }
+    }
+    Some(out)
 }
 
 /// An expression side of an [`ExprQual`]: its text, its operators, its
@@ -53956,6 +54359,51 @@ fn expr_side(n: &pg_query::protobuf::Node, def: &TableDef) -> Option<ExprSide> {
                 fields,
             }
         }
+        // A call of a built-in over columns and literals whose every
+        // overload is of one `procost` (RP-423): that cost a row
+        // (`cost_qual_eval` of a FuncExpr), its result type the overload
+        // its arguments' types select. A call reading no column is folded.
+        N::FuncCall(f) => {
+            let procost = joins::plain_call_procost(f)?;
+            let name = func_name(f)?;
+            let mut types = Vec::with_capacity(f.args.len());
+            let mut texts = Vec::with_capacity(f.args.len());
+            let mut fields: Vec<String> = Vec::new();
+            for a in &f.args {
+                let side = expr_side(a, def)?;
+                let ty = match a.node.as_ref()? {
+                    N::ColumnRef(_) => def
+                        .column(&side.text)?
+                        .pg_type
+                        .trim_start_matches("pg_catalog.")
+                        .to_string(),
+                    N::AConst(_) if side.integer => "int4".to_string(),
+                    N::AConst(_) => "unknown".to_string(),
+                    _ => return None,
+                };
+                types.push(ty);
+                texts.push(side.text);
+                for g in side.fields {
+                    if !fields.contains(&g) {
+                        fields.push(g);
+                    }
+                }
+            }
+            let integer = match funcsig::selected_result_type(&name, &types)?.as_str() {
+                "int2" | "int4" | "int8" => true,
+                "text" | "varchar" => false,
+                _ => return None,
+            };
+            if procost.fract() != 0.0 {
+                return None;
+            }
+            ExprSide {
+                text: format!("{name}({})", texts.join(", ")),
+                operators: if fields.is_empty() { 0 } else { procost as u32 },
+                integer,
+                fields,
+            }
+        }
         // A cast of a column to an integer or string type (RP-354): the
         // cast's function, or its output and input functions where it is
         // an I/O conversion, each of `procost` 1 (`cost_qual_eval` of a
@@ -54011,6 +54459,41 @@ fn expr_qual(n: &pg_query::protobuf::Node, def: &TableDef) -> Option<ExprQual> {
     let Some(N::AExpr(e)) = n.node.as_ref() else {
         return None;
     };
+    // A LIKE / ILIKE or regex match of a string expression with a constant
+    // pattern (RP-423).
+    let kind = AExprKind::try_from(e.kind);
+    let pattern = match (kind, operator_name(e).ok()?) {
+        (Ok(AExprKind::AexprLike), "~~") => Some((false, false, false)),
+        (Ok(AExprKind::AexprLike), "!~~") => Some((false, true, false)),
+        (Ok(AExprKind::AexprIlike), "~~*") => Some((true, false, false)),
+        (Ok(AExprKind::AexprIlike), "!~~*") => Some((true, true, false)),
+        (Ok(AExprKind::AexprOp), "~") => Some((false, false, true)),
+        (Ok(AExprKind::AexprOp), "!~") => Some((false, true, true)),
+        (Ok(AExprKind::AexprOp), "~*") => Some((true, false, true)),
+        (Ok(AExprKind::AexprOp), "!~*") => Some((true, true, true)),
+        _ => None,
+    };
+    if let Some((insensitive, negated, regex)) = pattern {
+        use pg_query::protobuf::a_const::Val;
+        let expr = expr_side(e.lexpr.as_deref()?, def)?;
+        let Some(N::AConst(c)) = e.rexpr.as_deref()?.node.as_ref() else {
+            return None;
+        };
+        let Some(Val::Sval(pat)) = c.val.as_ref() else {
+            return None;
+        };
+        // A bare column is a statistics-backed clause, not this one.
+        if expr.integer || expr.operators == 0 || expr.fields.is_empty() {
+            return None;
+        }
+        return Some(ExprQual {
+            expr: expr.text,
+            op: Op::Eq,
+            operators: expr.operators + 1,
+            fields: expr.fields,
+            pattern: Some((pat.sval.clone(), insensitive, negated, regex)),
+        });
+    }
     if AExprKind::try_from(e.kind) != Ok(AExprKind::AexprOp) {
         return None;
     }
@@ -54052,6 +54535,7 @@ fn expr_qual(n: &pg_query::protobuf::Node, def: &TableDef) -> Option<ExprQual> {
         op,
         operators: expr.operators + 1,
         fields: expr.fields,
+        pattern: None,
     })
 }
 
@@ -54591,9 +55075,72 @@ fn scan_where(query: &N) -> Option<(String, &pg_query::protobuf::Node)> {
 /// the function's name, and `show_scan_qual` prints the WHERE the scan
 /// applies to each row, its conjuncts ANDed.
 #[allow(clippy::type_complexity)]
+/// A `generate_series` Function Scan's alias and Filter text.
+type SeriesScan = (Option<String>, Option<String>);
+
+/// The Function Scan a single FROM function prints (RP-475):
+/// `Function Scan on f`, or `Function Scan on f a` under an alias.
+/// A user function scan's node name, its call (name, argument count) and
+/// its WHERE.
+type FunctionScanParts = (String, (String, usize), Option<Box<FunctionScanWhere>>);
+
+fn explain_function_scan(s: &pg_query::protobuf::SelectStmt) -> Option<FunctionScanParts> {
+    let [item] = s.from_clause.as_slice() else {
+        return None;
+    };
+    let Some(N::RangeFunction(rf)) = item.node.as_ref() else {
+        return None;
+    };
+    if rf.lateral || rf.ordinality || rf.is_rowsfrom || rf.functions.len() != 1 {
+        return None;
+    }
+    let Some(N::List(l)) = rf.functions[0].node.as_ref() else {
+        return None;
+    };
+    let Some(N::FuncCall(f)) = l.items.first().and_then(|n| n.node.as_ref()) else {
+        return None;
+    };
+    let name = f
+        .funcname
+        .iter()
+        .rev()
+        .find_map(|n| match n.node.as_ref() {
+            Some(N::String(s)) => Some(s.sval.clone()),
+            _ => None,
+        })?;
+    let mut shown = format!("Function Scan on {}", scalar::quote_identifier(&name));
+    if let Some(a) = rf.alias.as_ref().filter(|a| a.aliasname != name) {
+        shown.push(' ');
+        shown.push_str(&scalar::quote_identifier(&a.aliasname));
+    }
+    let filter = s.where_clause.as_deref().map(|w| {
+        Box::new(FunctionScanWhere {
+            where_clause: w.clone(),
+            relation: rf
+                .alias
+                .as_ref()
+                .map_or_else(|| name.clone(), |a| a.aliasname.clone()),
+            colnames: rf
+                .alias
+                .as_ref()
+                .map(|a| {
+                    a.colnames
+                        .iter()
+                        .filter_map(|n| match n.node.as_ref() {
+                            Some(N::String(s)) => Some(s.sval.clone()),
+                            _ => None,
+                        })
+                        .collect()
+                })
+                .unwrap_or_default(),
+        })
+    });
+    Some((shown, (name, f.args.len()), filter))
+}
+
 fn explain_series_scan(
     s: &pg_query::protobuf::SelectStmt,
-) -> Option<((Option<String>, Option<String>), Option<SeriesQual>)> {
+) -> Option<(SeriesScan, Option<SeriesQual>)> {
     let [item] = s.from_clause.as_slice() else {
         return None;
     };
@@ -54850,5 +55397,35 @@ mod rp573_declared_types {
                 "relation \"nosuch573\" does not exist".into()
             ))
         );
+    }
+}
+
+#[cfg(test)]
+mod rp475_function_scan_filter {
+    use super::*;
+
+    fn where_of(sql: &str) -> FunctionScanWhere {
+        let tree = pg_query::parse(sql).unwrap();
+        let Some(N::SelectStmt(s)) = tree.protobuf.stmts[0]
+            .stmt
+            .as_ref()
+            .and_then(|n| n.node.clone())
+        else {
+            panic!("not a select");
+        };
+        *explain_function_scan(&s).unwrap().2.unwrap()
+    }
+
+    /// A WHERE over a user function in FROM is its Filter, the column
+    /// named for the alias, priced over one column (RP-475).
+    #[test]
+    fn the_where_is_the_scans_filter() {
+        let (text, qual) = where_of("select * from f() x where x > 1")
+            .filter(&[], "int4")
+            .unwrap();
+        assert_eq!(text, "(x > 1)");
+        let q = qual.unwrap();
+        assert_eq!(q.ops, 1);
+        assert!((q.selectivity(1000.0) - 1.0 / 3.0).abs() < 1e-9);
     }
 }

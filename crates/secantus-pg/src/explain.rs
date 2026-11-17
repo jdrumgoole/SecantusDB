@@ -95,6 +95,12 @@ pub(crate) struct PlanNode {
     /// A Memoize node's cache (RP-916): what its rows hold, and under
     /// ANALYZE what `show_memoize_info` prints.
     pub memo: Option<MemoInfo>,
+    /// The InitPlans this node runs first (RP-440), each labelled by
+    /// its `subplan_name`, printed after the node's details and before
+    /// its children.
+    pub init_plans: Vec<PlanNode>,
+    /// A sub-plan's label: `InitPlan 1 (returns $0)`.
+    pub subplan_name: Option<String>,
 }
 
 /// A Memoize node: the stored fields of each row its subplan returns, and
@@ -195,6 +201,8 @@ impl PlanNode {
             skip_cond: false,
             implied_filter: None,
             param_cond: None,
+            init_plans: Vec::new(),
+            subplan_name: None,
         }
     }
 
@@ -707,6 +715,61 @@ fn join_tree(node: &JoinNode, scan: &ScanChooser<'_>) -> PlanNode {
             n
         }
     }
+}
+
+/// The `Hash Semi Join` an IN or EXISTS sublink is pulled up into
+/// (RP-411): the outer relation's scan, and the inner one's under a Hash.
+/// Priced by the server where `semi_join_estimate` models the path.
+pub(crate) fn semi_join_tree(sj: &secantus_pgplan::SemiJoin) -> PlanNode {
+    let scan = |(table, shown): &(String, String)| {
+        let mut n = PlanNode::new(if table == shown {
+            format!("Seq Scan on {table}")
+        } else {
+            format!("Seq Scan on {table} {shown}")
+        });
+        n.props.push(("Relation Name".into(), table.clone()));
+        if table != shown {
+            n.props.push(("Alias".into(), shown.clone()));
+        }
+        n
+    };
+    let mut n = PlanNode::new("Hash Semi Join");
+    n.details.push(("Hash Cond".into(), sj.hash_cond.clone()));
+    n.children.push(scan(&sj.outer));
+    n.children.push(PlanNode::over("Hash", scan(&sj.inner)));
+    n
+}
+
+/// A [`semi_join_tree`]'s outer scan filtered by the WHERE's conjuncts
+/// over the outer relation alone (RP-411).
+pub(crate) fn outer_quals_on_semi_join(
+    tree: &mut PlanNode,
+    quals: &[(String, Option<String>)],
+    index_columns: &dyn Fn(&str) -> Vec<String>,
+) {
+    if !quals.is_empty() {
+        quals_on_scan(&mut tree.children[0], quals, index_columns);
+    }
+}
+
+/// A [`semi_join_tree`] planned as the inner join of its inner side made
+/// unique on the compared column (`create_unique_path`, RP-411): a `Hash
+/// Join` hashing a `HashAggregate` of the inner scan, grouped by the key.
+pub(crate) fn unique_ify_semi_join(
+    tree: &mut PlanNode,
+    sj: &secantus_pgplan::SemiJoin,
+    agg: crate::scan_estimate::Estimate,
+) {
+    tree.name = "Hash Join".into();
+    let hash = &mut tree.children[1];
+    let scan = hash.children.remove(0);
+    let mut grouped = PlanNode::over("HashAggregate", scan);
+    grouped.estimate = Some(agg);
+    grouped.details.push((
+        "Group Key".into(),
+        format!("{}.{}", sj.inner.1, sj.inner_col),
+    ));
+    hash.children.push(grouped);
 }
 
 /// The plan tree of a two-table join planned on the narrow path
@@ -1421,9 +1484,12 @@ pub(crate) fn render_text(
     actual_rows: Option<usize>,
 ) -> Vec<String> {
     let mut out = Vec::new();
+    // `pad`: the extra indent of a sub-plan, whose label line sits where
+    // its parent's details do (`ExplainSubPlans`).
     fn walk(
         n: &PlanNode,
         depth: usize,
+        pad: usize,
         options: &ExplainOptions,
         actual: Option<usize>,
         out: &mut Vec<String>,
@@ -1431,7 +1497,7 @@ pub(crate) fn render_text(
         let mut header = if depth == 0 {
             n.name.clone()
         } else {
-            format!("{}->  {}", " ".repeat(2 + 6 * (depth - 1)), n.name)
+            format!("{}->  {}", " ".repeat(2 + 6 * (depth - 1) + pad), n.name)
         };
         if options.costs {
             header.push_str(&costs_text(n));
@@ -1448,14 +1514,17 @@ pub(crate) fn render_text(
         }
         out.push(header);
         for (label, value) in &n.details {
-            out.push(format!("{}{label}: {value}", " ".repeat(2 + 6 * depth)));
+            out.push(format!(
+                "{}{label}: {value}",
+                " ".repeat(2 + 6 * depth + pad)
+            ));
             // `show_instrumentation_count`: the text format prints a
             // non-zero count only.
             if let (Some(r), Some(_), "Filter") = (n.removed_by_filter, actual, label.as_str()) {
                 if r > 0 {
                     out.push(format!(
                         "{}Rows Removed by Filter: {r}",
-                        " ".repeat(2 + 6 * depth)
+                        " ".repeat(2 + 6 * depth + pad)
                     ));
                 }
             }
@@ -1465,35 +1534,50 @@ pub(crate) fn render_text(
                 if r > 0 {
                     out.push(format!(
                         "{}Rows Removed by Join Filter: {r}",
-                        " ".repeat(2 + 6 * depth)
+                        " ".repeat(2 + 6 * depth + pad)
                     ));
                 }
             }
         }
         if let (Some(n), Some(_)) = (n.heap_fetches, actual) {
-            out.push(format!("{}Heap Fetches: {n}", " ".repeat(2 + 6 * depth)));
+            out.push(format!(
+                "{}Heap Fetches: {n}",
+                " ".repeat(2 + 6 * depth + pad)
+            ));
         }
         if let (Some(n), Some(_)) = (n.heap_blocks, actual) {
             out.push(format!(
                 "{}Heap Blocks: exact={n}",
-                " ".repeat(2 + 6 * depth)
+                " ".repeat(2 + 6 * depth + pad)
             ));
         }
         if let (Some(h), Some(_)) = (n.hash_info, actual) {
-            out.push(format!("{}{}", " ".repeat(2 + 6 * depth), h.text()));
+            out.push(format!("{}{}", " ".repeat(2 + 6 * depth + pad), h.text()));
         }
         // `show_memoize_info`: only once the cache has missed.
         if let (Some(m), Some(_)) = (n.memo.as_ref().and_then(|m| m.stats), actual) {
             if m.misses > 0 {
-                out.push(format!("{}{}", " ".repeat(2 + 6 * depth), m.text()));
+                out.push(format!("{}{}", " ".repeat(2 + 6 * depth + pad), m.text()));
             }
+        }
+        for c in &n.init_plans {
+            let label = c.subplan_name.as_deref().unwrap_or("InitPlan");
+            out.push(format!("{}{label}", " ".repeat(2 + 6 * depth + pad)));
+            walk(
+                c,
+                depth + 1,
+                pad + 2,
+                options,
+                actual.and(c.actual_rows),
+                out,
+            );
         }
         for c in &n.children {
             let a = actual.and(c.actual_rows);
-            walk(c, depth + 1, options, a, out);
+            walk(c, depth + 1, pad, options, a, out);
         }
     }
-    walk(root, 0, options, actual_rows, &mut out);
+    walk(root, 0, 0, options, actual_rows, &mut out);
     if options.summary {
         out.push("Planning Time: 0.000 ms".into());
         if actual_rows.is_some() {
@@ -1537,6 +1621,9 @@ fn structured(
         fields.push(("Node Type".into(), Value::Str(node_type.clone())));
         if let Some(r) = relationship {
             fields.push(("Parent Relationship".into(), Value::Str(r.into())));
+        }
+        if let Some(name) = &n.subplan_name {
+            fields.push(("Subplan Name".into(), Value::Str(name.clone())));
         }
         fields.push(("Parallel Aware".into(), Value::Num("false".into())));
         fields.push(("Async Capable".into(), Value::Num("false".into())));
@@ -1664,26 +1751,26 @@ fn structured(
                 fields.push((k.into(), Value::Num(v.to_string())));
             }
         }
-        if !n.children.is_empty() {
-            let kids = n
-                .children
+        if !n.children.is_empty() || !n.init_plans.is_empty() {
+            let inits = n
+                .init_plans
                 .iter()
-                .enumerate()
-                .map(|(i, c)| {
-                    // ExplainNode's `Member` plans: an Append's, and a
-                    // BitmapOr's / BitmapAnd's (RP-378).
-                    let rel = if matches!(node_type.as_str(), "Append" | "BitmapOr" | "BitmapAnd") {
-                        "Member"
-                    } else if node_type == "Subquery Scan" {
-                        "Subquery"
-                    } else if i == 0 {
-                        "Outer"
-                    } else {
-                        "Inner"
-                    };
-                    node(c, options, actual.and(c.actual_rows), Some(rel))
-                })
-                .collect();
+                .map(|c| node(c, options, actual.and(c.actual_rows), Some("InitPlan")));
+            let kids = n.children.iter().enumerate().map(|(i, c)| {
+                // ExplainNode's `Member` plans: an Append's, and a
+                // BitmapOr's / BitmapAnd's (RP-378).
+                let rel = if matches!(node_type.as_str(), "Append" | "BitmapOr" | "BitmapAnd") {
+                    "Member"
+                } else if node_type == "Subquery Scan" {
+                    "Subquery"
+                } else if i == 0 {
+                    "Outer"
+                } else {
+                    "Inner"
+                };
+                node(c, options, actual.and(c.actual_rows), Some(rel))
+            });
+            let kids = inits.chain(kids).collect();
             fields.push(("Plans".into(), Value::Arr(kids)));
         }
         Value::Obj(fields)
@@ -1922,6 +2009,39 @@ pub(crate) fn attach_series_scan(
     }
 }
 
+/// A FROM function answered at plan time is planned as its rows' VALUES
+/// list under a Subquery Scan; PostgreSQL prints the `Function Scan` it
+/// runs (RP-475).
+pub(crate) fn attach_function_scan(root: &mut PlanNode, scan: &Option<String>) {
+    let Some(name) = scan else {
+        return;
+    };
+    fn find(n: &mut PlanNode) -> Option<&mut PlanNode> {
+        if n.name.starts_with("Subquery Scan on ")
+            && n.children.len() == 1
+            && n.children[0].name.starts_with("Values Scan")
+        {
+            return Some(n);
+        }
+        n.children.iter_mut().find_map(find)
+    }
+    if let Some(n) = find(root) {
+        let details = std::mem::take(&mut n.details);
+        let estimate = n.estimate.take();
+        *n = PlanNode::new(name.clone());
+        n.details = details;
+        n.estimate = estimate;
+    }
+}
+
+/// The first node named `name`, depth first.
+pub(crate) fn find_node<'a>(n: &'a mut PlanNode, name: &str) -> Option<&'a mut PlanNode> {
+    if n.name == name {
+        return Some(n);
+    }
+    n.children.iter_mut().find_map(|c| find_node(c, name))
+}
+
 /// A single-relation SELECT's ORDER BY Sort prints its keys as the
 /// planned expressions (RP-840): the Sort below any Limit / Unique.
 pub(crate) fn attach_sort_keys(root: &mut PlanNode, keys: &Option<Vec<String>>) {
@@ -2144,6 +2264,19 @@ pub(crate) fn dummy_relation(root: &mut PlanNode) {
     }
 }
 
+/// The `Result` [`dummy_relation`] put where the relation was.
+pub(crate) fn dummy_result_mut(root: &mut PlanNode) -> Option<&mut PlanNode> {
+    if root.name == "Result"
+        && root
+            .details
+            .iter()
+            .any(|(k, v)| k == "One-Time Filter" && v == "false")
+    {
+        return Some(root);
+    }
+    root.children.iter_mut().find_map(dummy_result_mut)
+}
+
 /// Put a set operation's per-arm WHERE conjuncts on its scans, left to
 /// right, as PostgreSQL prints each arm's own `Filter` / `Index Cond`
 /// (RP-346). A plan whose scans do not pair one-to-one with the arms is
@@ -2300,6 +2433,51 @@ pub(crate) fn bitmap_index_scan(index: &str, estimate: crate::scan_estimate::Est
     n.props.push(("Index Name".into(), index.to_string()));
     n.estimate = Some(estimate);
     n
+}
+
+/// A join's `Join Filter` text from the written ONs' clauses placed on it
+/// (RP-919): each `(written join, place in its ON, its ON's clause
+/// count)`. A whole ON prints as written; clauses from several are ANDed
+/// in the order given, which [`joininfo_order`] then sorts. A clause whose
+/// ON's text does not split into as many conjuncts prints nothing.
+pub(crate) fn placed_join_cond(conds: &[String], clauses: &[(usize, usize, usize)]) -> String {
+    if let [(w, _, of)] = clauses {
+        if *of == 1 {
+            return conds.get(*w).cloned().unwrap_or_default();
+        }
+    }
+    if let Some((w, _, of)) = clauses.first() {
+        if clauses.len() == *of && clauses.iter().all(|c| c.0 == *w) {
+            return conds.get(*w).cloned().unwrap_or_default();
+        }
+    }
+    let mut parts: Vec<String> = Vec::new();
+    for &(w, at, of) in clauses {
+        let Some(text) = conds.get(w) else {
+            return String::new();
+        };
+        if of == 1 {
+            parts.push(text.clone());
+            continue;
+        }
+        let Some(inner) = text.strip_prefix('(').and_then(|t| t.strip_suffix(')')) else {
+            return String::new();
+        };
+        let split: Vec<&str> = inner.split(" AND ").collect();
+        if split.len() != of
+            || split
+                .iter()
+                .any(|p| !(p.starts_with('(') && p.ends_with(')')))
+        {
+            return String::new();
+        }
+        parts.push(split[at].to_string());
+    }
+    match parts.len() {
+        0 => String::new(),
+        1 => parts.remove(0),
+        _ => format!("({})", parts.join(" AND ")),
+    }
 }
 
 /// Put each join's ON condition on its join node (post-order, as
@@ -3181,6 +3359,7 @@ mod heap_fetches_tests {
             scan_array_quals: None,
             scan_patterns: Vec::new(),
             scan_expr_quals: None,
+            join_expr_quals: Vec::new(),
             scan_array_cmp_filter: None,
             setop_quals: Vec::new(),
             join_conds: Vec::new(),
@@ -3190,10 +3369,15 @@ mod heap_fetches_tests {
             one_time_false: 0,
             nullable_gate: None,
             dummy_relation: false,
+            semi_join: None,
+            init_plans: Vec::new(),
             modify_table: None,
             sort_keys: None,
             series_scan: None,
             series_qual: None,
+            function_scan: None,
+            function_scan_call: None,
+            function_scan_where: None,
         }
     }
 
@@ -3348,5 +3532,37 @@ mod join_where_tests {
             Some(&("Join Filter".to_string(), "((e.a + s.a) > 3)".to_string()))
         );
         assert_eq!(root.children[0].details.len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod placed_join_cond_tests {
+    use super::placed_join_cond;
+
+    fn conds() -> Vec<String> {
+        vec![
+            "(e.a < e3.a)".into(),
+            "(e3.a > zs.a)".into(),
+            "((e4.a < zs.a) AND (e4.a > e.a))".into(),
+        ]
+    }
+
+    #[test]
+    fn a_whole_on_prints_as_written() {
+        assert_eq!(placed_join_cond(&conds(), &[(0, 0, 1)]), "(e.a < e3.a)");
+        assert_eq!(
+            placed_join_cond(&conds(), &[(2, 0, 2), (2, 1, 2)]),
+            "((e4.a < zs.a) AND (e4.a > e.a))"
+        );
+    }
+
+    #[test]
+    fn a_split_on_prints_each_clause_where_it_lands() {
+        assert_eq!(placed_join_cond(&conds(), &[(2, 0, 2)]), "(e4.a < zs.a)");
+        assert_eq!(
+            placed_join_cond(&conds(), &[(1, 0, 1), (2, 1, 2)]),
+            "((e3.a > zs.a) AND (e4.a > e.a))"
+        );
+        assert_eq!(placed_join_cond(&conds(), &[]), "");
     }
 }

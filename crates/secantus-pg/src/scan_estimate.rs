@@ -328,6 +328,10 @@ fn output_width(
     Some(width)
 }
 
+/// A clause placed on a reordered chain's join: `(written join, place in
+/// its ON, its ON's clause count)` (RP-919).
+pub(crate) type PlacedClause = (usize, usize, usize);
+
 impl PgHandler {
     /// The children's and the node's estimates of a `UNION ALL` of two
     /// plain selects, each one user table's sequential scan of stored
@@ -404,6 +408,35 @@ impl PgHandler {
         }
         let estimate = append_estimate(&children)?;
         Some((children.into_iter().map(|(e, _)| e).collect(), estimate))
+    }
+
+    /// Whether `table` has a unique index that is immediate, has no WHERE
+    /// and keys only plain columns, every one in `fixed`
+    /// (`relation_has_unique_index_for`; RP-353).
+    pub(crate) fn unique_index_fixed(&self, table: &str, fixed: &[String]) -> bool {
+        let relations = self.index_relations();
+        let defs = self.index_defs();
+        relations.iter().any(|ix| {
+            let t = &ix.table;
+            ix.unique
+                && t.name == table
+                && !ix.keys.is_empty()
+                && !t
+                    .unique_constraints
+                    .iter()
+                    .any(|u| u.name == ix.name && u.deferrable)
+                && !defs
+                    .iter()
+                    .any(|(o, d)| *o == ix.oid && d.contains(" WHERE "))
+                && ix.keys.iter().all(|&k| {
+                    k > 0
+                        && t.columns
+                            .iter()
+                            .enumerate()
+                            .find(|(i, _)| i32::from(t.attnum(*i)) == k)
+                            .is_some_and(|(_, c)| fixed.contains(&c.name))
+                })
+        })
     }
 
     /// A Nested Loop joining two tables' sequential scans with nothing to
@@ -906,33 +939,34 @@ impl PgHandler {
     pub(crate) fn nest_loop_chain_estimate(
         &self,
         sel: &secantus_pgplan::Select,
-    ) -> Option<Vec<NestLoopLevel>> {
-        self.nest_loop_chain(sel).map(|(levels, _)| levels)
+    ) -> Option<NestLoopTree> {
+        self.nest_loop_chain(sel)
     }
 
-    /// The order of the chain's tables PostgreSQL's search keeps, bottom
-    /// first, by their index in the written chain, when it is not the
-    /// written one (RP-919).
+    /// The tree of the chain's joins PostgreSQL's search keeps, each table
+    /// by its index in the written chain, when it is not the written
+    /// left-deep one (RP-919).
     pub(crate) fn nest_loop_chain_order(
         &self,
         sel: &secantus_pgplan::Select,
-    ) -> Option<Vec<usize>> {
-        let (_, order) = self.nest_loop_chain(sel)?;
-        (!order.iter().enumerate().all(|(i, &t)| i == t)).then_some(order)
+    ) -> Option<NestLoopTree> {
+        let tree = self.nest_loop_chain(sel)?;
+        (!tree.is_written()).then_some(tree)
     }
 
     /// `sel` with its chain of inner joins in the order PostgreSQL's
     /// search keeps ([`Self::nest_loop_chain_order`]), so its rows come
     /// out of that plan's loops and EXPLAIN prints its tree (RP-919). Each
-    /// ON moves, whole, to the lowest join holding the tables it reads; a
-    /// WHERE stays the query's. `None` where the order is the written one,
-    /// or an ON does not land alone on one join of the new tree. With it,
-    /// each new join's ON as the written join it came from, bottom first,
-    /// both counted from the bottom (`join_conds`' post-order).
+    /// ON's clauses move, each alone, to the lowest join holding the tables
+    /// it reads (`distribute_qual_to_rels`), those landing on one join
+    /// ANDed; a WHERE stays the query's. `None` where the order is the
+    /// written one. With it, each new join's clauses, bottom first, as
+    /// `(written join, place in its ON, its ON's clause count)`, both joins
+    /// counted from the bottom (`join_conds`' post-order).
     pub(crate) fn reorder_nest_loop_chain(
         &self,
         sel: &secantus_pgplan::Select,
-    ) -> Option<(secantus_pgplan::Select, Vec<Option<usize>>)> {
+    ) -> Option<(secantus_pgplan::Select, Vec<Vec<PlacedClause>>)> {
         use secantus_pgplan::joins::{JoinKind, JoinNode};
         use secantus_pgplan::Statement;
         let order = self.nest_loop_chain_order(sel)?;
@@ -940,43 +974,57 @@ impl PgHandler {
         let Statement::JoinRows(j) = sub.plan.as_ref() else {
             return None;
         };
-        // The written spine: its tables bottom first, and each join's ON
-        // with the tables it reads.
-        type On = (
-            usize,
-            Option<secantus_pgplan::ColumnExpr>,
-            Vec<String>,
-            Vec<secantus_pgplan::joins::JoinFilter>,
-        );
+        // The written spine: its tables bottom first, and each ON's
+        // clauses, each with the tables it reads (`distribute_qual_to_rels`
+        // places each alone).
+        struct On {
+            /// The written join, counted from the bottom.
+            written: usize,
+            /// Its place among that ON's clauses.
+            at: usize,
+            /// That ON's clause count, and the ON itself.
+            of: usize,
+            whole: Option<secantus_pgplan::ColumnExpr>,
+            filter: secantus_pgplan::joins::JoinFilter,
+        }
         let mut leaves: Vec<JoinNode> = Vec::new();
         let mut ons: Vec<On> = Vec::new();
         let mut node = &j.tree;
-        let mut at = 0;
+        let mut depth = 0;
         while let JoinNode::Join {
             kind: JoinKind::Inner,
             left,
             right,
             on,
-            on_aliases,
             on_filters,
             ..
         } = node
         {
             leaves.push(right.as_ref().clone());
             if on.is_some() {
-                ons.push((at, on.clone(), on_aliases.clone(), on_filters.clone()));
+                if on_filters.is_empty() {
+                    return None;
+                }
+                for (at, f) in on_filters.iter().enumerate() {
+                    ons.push(On {
+                        written: depth,
+                        at,
+                        of: on_filters.len(),
+                        whole: on.clone(),
+                        filter: f.clone(),
+                    });
+                }
             }
-            at += 1;
+            depth += 1;
             node = left;
         }
         for o in &mut ons {
-            o.0 = at - 1 - o.0;
+            o.written = depth - 1 - o.written;
         }
+        // Bottom first, each ON's clauses in their written order.
+        ons.sort_by_key(|o| (o.written, o.at));
         leaves.push(node.clone());
         leaves.reverse();
-        if leaves.len() != order.len() {
-            return None;
-        }
         let alias = |n: &JoinNode| -> Option<String> {
             let JoinNode::Leaf { def, .. } = n else {
                 return None;
@@ -994,36 +1042,70 @@ impl PgHandler {
                 JoinNode::Lateral { .. } => Vec::new(),
             }
         };
-        let mut placed = vec![false; ons.len()];
-        let mut held: Vec<String> = vec![alias(&leaves[order[0]])?];
-        let mut tree = leaves[order[0]].clone();
-        let mut from: Vec<Option<usize>> = Vec::new();
-        for &t in &order[1..] {
-            let leaf = leaves[t].clone();
-            held.push(alias(&leaf)?);
-            let mut here: Vec<usize> = Vec::new();
-            for (i, (_, _, aliases, _)) in ons.iter().enumerate() {
-                if !placed[i] && aliases.iter().all(|a| held.contains(a)) {
-                    here.push(i);
+        // The tree bottom up, each clause on the lowest join holding the
+        // tables it reads; `from` in post-order, as `join_conds` counts.
+        #[allow(clippy::too_many_arguments)]
+        fn build(
+            t: &NestLoopTree,
+            leaves: &[JoinNode],
+            ons: &[On],
+            placed: &mut [bool],
+            from: &mut Vec<Vec<PlacedClause>>,
+            alias: &dyn Fn(&JoinNode) -> Option<String>,
+            keys: &dyn Fn(&JoinNode) -> Vec<String>,
+        ) -> Option<(JoinNode, Vec<String>)> {
+            let (l, r) = match t {
+                NestLoopTree::Leaf(i) => {
+                    let leaf = leaves.get(*i)?.clone();
+                    let a = alias(&leaf)?;
+                    return Some((leaf, vec![a]));
                 }
-            }
-            if here.len() > 1 {
-                return None;
-            }
-            let (written, on, on_aliases, on_filters) = match here.first() {
-                Some(&i) => {
-                    placed[i] = true;
-                    let (w, on, a, f) = ons[i].clone();
-                    (Some(w), on, a, f)
-                }
-                None => (None, None, Vec::new(), Vec::new()),
+                NestLoopTree::Join(_, l, r) => (l, r),
             };
-            from.push(written);
-            let (left_keys, right_keys) = (keys(&tree), keys(&leaf));
-            tree = JoinNode::Join {
+            let (left, mut held) = build(l, leaves, ons, placed, from, alias, keys)?;
+            let (right, more) = build(r, leaves, ons, placed, from, alias, keys)?;
+            held.extend(more);
+            let here: Vec<usize> = (0..ons.len())
+                .filter(|&i| !placed[i] && ons[i].filter.aliases.iter().all(|a| held.contains(a)))
+                .collect();
+            for &i in &here {
+                placed[i] = true;
+            }
+            let mut on = None;
+            let mut on_aliases: Vec<String> = Vec::new();
+            let mut on_filters = Vec::new();
+            // One written ON whole keeps its own expression.
+            let whole = here.first().is_some_and(|&f| {
+                let o = &ons[f];
+                here.len() == o.of && here.iter().all(|&i| ons[i].written == o.written)
+            });
+            for &i in &here {
+                let o = &ons[i];
+                on = if whole {
+                    o.whole.clone()
+                } else {
+                    match on {
+                        None => Some(o.filter.expr.clone()),
+                        Some(e) => Some(secantus_pgplan::and_row_exprs(&e, &o.filter.expr)?),
+                    }
+                };
+                for a in &o.filter.aliases {
+                    if !on_aliases.contains(a) {
+                        on_aliases.push(a.clone());
+                    }
+                }
+                on_filters.push(o.filter.clone());
+            }
+            from.push(
+                here.iter()
+                    .map(|&i| (ons[i].written, ons[i].at, ons[i].of))
+                    .collect(),
+            );
+            let (left_keys, right_keys) = (keys(&left), keys(&right));
+            let node = JoinNode::Join {
                 kind: JoinKind::Inner,
-                left: Box::new(tree),
-                right: Box::new(leaf),
+                left: Box::new(left),
+                right: Box::new(right),
                 on_other: on.is_some(),
                 on,
                 on_aliases,
@@ -1036,6 +1118,13 @@ impl PgHandler {
                 left_keys,
                 right_keys,
             };
+            Some((node, held))
+        }
+        let mut placed = vec![false; ons.len()];
+        let mut from = Vec::new();
+        let (tree, held) = build(&order, &leaves, &ons, &mut placed, &mut from, &alias, &keys)?;
+        if held.len() != leaves.len() {
+            return None;
         }
         if placed.iter().any(|p| !p) {
             return None;
@@ -1049,10 +1138,7 @@ impl PgHandler {
         Some((out, from))
     }
 
-    fn nest_loop_chain(
-        &self,
-        sel: &secantus_pgplan::Select,
-    ) -> Option<(Vec<NestLoopLevel>, Vec<usize>)> {
+    fn nest_loop_chain(&self, sel: &secantus_pgplan::Select) -> Option<NestLoopTree> {
         use secantus_pgplan::joins::{FilterKind, JoinFilter, JoinKind, JoinNode, JoinRows};
         use secantus_pgplan::Statement;
         let sub = sel.sub.as_ref()?;
@@ -1497,7 +1583,7 @@ impl PgHandler {
         let top = &rels[&full];
         // An ORDER BY sorts the cheapest in total: no path of the chain
         // is ordered, so none is presorted (RP-919).
-        let mut at = match sel.limit.filter(|_| sel.order.is_empty()) {
+        let at = match sel.limit.filter(|_| sel.order.is_empty()) {
             Some(count) => secantus_pgplan::joincost::limit_choice_of(
                 &top.paths,
                 top.est.2,
@@ -1506,68 +1592,67 @@ impl PgHandler {
             )?,
             None => top.cheapest,
         };
-        // Down the kept paths from the top: each must join a relation
-        // below and one table, which the tree puts above it.
-        let mut out = Vec::new();
-        let mut order = Vec::new();
-        let mut set = full;
-        while set.count_ones() > 1 {
+        // Down the kept paths from the top: each join's two relations,
+        // the relation the loop reads as its outer at the path it kept,
+        // the inner at its cheapest; the outer is the tree's left, and
+        // either may be a join (a bushy tree, RP-919).
+        fn descend(
+            set: u32,
+            at: usize,
+            rels: &std::collections::HashMap<u32, Rel>,
+            scans: &[Estimate],
+            params: &[Option<(u32, secantus_pgplan::joincost::ParamInner, ParamScan)>],
+        ) -> Option<NestLoopTree> {
+            if set.count_ones() == 1 {
+                return Some(NestLoopTree::Leaf(set.trailing_zeros() as usize));
+            }
             let rel = rels.get(&set)?;
             let (kept, (p, q)) = *rel.kept.get(at)?;
             let mut plan = kept.plan;
-            let lower_is_outer;
-            let (lower, leaf) = if q.count_ones() == 1 {
-                lower_is_outer = !plan.b_outer;
-                (p, q)
-            } else if p.count_ones() == 1 {
-                lower_is_outer = plan.b_outer;
-                plan.b_outer = !plan.b_outer;
-                (q, p)
-            } else {
-                return None;
+            // The loop's outer is the tree's left, so its rows come out
+            // in the plan's order.
+            let (left, right) = if plan.b_outer { (q, p) } else { (p, q) };
+            plan.b_outer = false;
+            let path_of = |r: u32, at: usize| -> Option<(usize, Estimate)> {
+                let rel = rels.get(&r)?;
+                let (s, t) = *rel.paths.get(at)?;
+                Some((at, (s, t, rel.est.2, rel.est.3)))
             };
-            let i = leaf.trailing_zeros() as usize;
-            order.push(i);
-            // The lower relation's path: the one the loop reads as its
-            // outer, or its cheapest as the inner.
-            let low = &rels[&lower];
-            let next = if lower_is_outer {
-                kept.outer_path
-            } else {
-                low.cheapest
-            };
-            let (ls, lt) = *low.paths.get(next)?;
-            let (mut a, mut b) = ((ls, lt, low.est.2, low.est.3), scans[i]);
+            let (lat, mut a) = path_of(left, kept.outer_path)?;
+            let (rat, mut b) = path_of(right, rels.get(&right)?.cheapest)?;
+            // A table's estimate is its scan's.
+            if left.count_ones() == 1 {
+                a = scans[left.trailing_zeros() as usize];
+            }
+            if right.count_ones() == 1 {
+                b = scans[right.trailing_zeros() as usize];
+            }
             // The parameterized inner: its scan's estimate, read through
             // its index, under its Memoize where that is kept.
             let mut scan = None;
             if plan.param {
-                let inner = if plan.b_outer { lower } else { leaf };
-                let (_, p, s) = params[inner.trailing_zeros() as usize].as_ref()?;
-                let est = |e: Estimate| (p.startup, p.total, p.rows, e.3);
-                if plan.b_outer {
-                    a = est(a);
-                } else {
-                    b = est(b);
+                if right.count_ones() != 1 {
+                    return None;
                 }
+                let (_, p, s) = params[right.trailing_zeros() as usize].as_ref()?;
+                b = (p.startup, p.total, p.rows, b.3);
                 let mut s = s.clone();
                 s.memoize = plan.memoize;
                 scan = Some(s);
             }
-            out.push((
-                plan,
-                a,
-                b,
-                (plan.startup, plan.total, rel.est.2, rel.est.3),
-                scan,
-            ));
-            set = lower;
-            at = next;
+            Some(NestLoopTree::Join(
+                Box::new((
+                    plan,
+                    a,
+                    b,
+                    (plan.startup, plan.total, rel.est.2, rel.est.3),
+                    scan,
+                )),
+                Box::new(descend(left, lat, rels, scans, params)?),
+                Box::new(descend(right, rat, rels, scans, params)?),
+            ))
         }
-        order.push(set.trailing_zeros() as usize);
-        out.reverse();
-        order.reverse();
-        Some((out, order))
+        descend(full, at, &rels, &scans, &params)
     }
 
     /// `get_memoize_path` over a scan of `inner` parameterized by the row
@@ -1979,7 +2064,7 @@ impl PgHandler {
             return Some((outer_key, inner_key, read));
         }
         let (a, b, more, _, _, _) = self.joined_sides(sel)?;
-        if !more.is_empty() {
+        if !more.is_empty() || !a.exprs.is_empty() || !b.exprs.is_empty() {
             return None;
         }
         let (outer, inner) = if a.alias == outer_alias && b.alias == inner_alias {
@@ -2006,6 +2091,50 @@ impl PgHandler {
         side.index.is_none().then_some(side.scan)
     }
 
+    /// The estimates of the `Hash Semi Join` an IN or EXISTS sublink was
+    /// pulled up into (RP-411), its outer side reading `sel`'s targets:
+    /// the outer scan's, the hashed inner scan's and the join's, and the
+    /// inner side's `HashAggregate` where the inner join of the inner side
+    /// made unique is the cheaper path (`create_unique_path`).
+    pub(crate) fn semi_join_estimate(
+        &self,
+        sj: &secantus_pgplan::SemiJoin,
+        sel: &secantus_pgplan::Select,
+    ) -> Option<(Estimate, Estimate, Estimate, Option<Estimate>)> {
+        if sel.table != sj.outer.0 || sel.join.is_some() || sel.sub.is_some() {
+            return None;
+        }
+        let (target, width, fields) = target_cost(sel)?;
+        let field = |table: &str, col: &str| {
+            self.lookup(table)?
+                .columns
+                .iter()
+                .find(|c| c.name == col)
+                .map(|c| c.field())
+        };
+        let (outer_key, inner_key) = (
+            field(&sj.outer.0, &sj.outer_col)?,
+            field(&sj.inner.0, &sj.inner_col)?,
+        );
+        let mut read = fields.clone();
+        if !read.contains(&outer_key) {
+            read.push(outer_key.clone());
+        }
+        // The WHERE's conjuncts over the outer relation filter its scan;
+        // the sublink is the plan's residual, never in its filter.
+        if !sj.outer_quals.is_empty() && sel.filter.is_empty() {
+            return None;
+        }
+        let empty = Document::new();
+        let a = self.hash_side(&sj.outer.0, &sel.filter, &outer_key, &read, &fields)?;
+        let inner_read = [inner_key.clone()];
+        let b = self.hash_side(&sj.inner.0, &empty, &inner_key, &inner_read, &[])?;
+        let ((outer, inner, mut join, _, _), unique) = hash_semi_join_of(a, b)?;
+        join.1 += target * join.2;
+        join.3 += width;
+        Some((outer, inner, join, unique))
+    }
+
     pub(crate) fn hash_join_estimate(&self, sel: &secantus_pgplan::Select) -> Option<JoinEstimate> {
         let (a, b, more, filter, left_join, target_width) = self.joined_sides(sel)?;
         // A WHERE conjunct pushed into a side's scan (RP-365) is priced as
@@ -2020,7 +2149,7 @@ impl PgHandler {
             {
                 return None;
             }
-            self.hash_side(&p.table, &p.filter, &p.field, &p.read, &p.above)
+            self.hash_side_with(&p.table, &p.filter, &p.exprs, &p.field, &p.read, &p.above)
         };
         // `hash_join_of` prices at most `MORE_HASH_CLAUSES` further
         // clauses: past them, pricing each side's scan for nothing would
@@ -2118,7 +2247,20 @@ impl PgHandler {
         // join, priced by the caller (RP-908); that WHERE is not pushed to
         // a scan.
         let anti = left_join && Self::left_anti_key(sel).is_some();
-        if left_join && !anti && (!sel.filter.is_empty() || sel.residual.is_some()) {
+        // A WHERE whose every conjunct is an expression comparison over
+        // the preserved side is pushed to that side's scan and cannot
+        // reduce the join (RP-423).
+        let preserved_exprs = left_join
+            && !anti
+            && sel.filter.is_empty()
+            && j.where_modelled
+            && join_exprs_modelled()
+            && leaf_alias(left).is_some_and(join_exprs_only_of);
+        if left_join
+            && !anti
+            && !preserved_exprs
+            && (!sel.filter.is_empty() || sel.residual.is_some())
+        {
             return None;
         }
         // An ON's conjuncts beside its equalities are the join's filter,
@@ -2171,20 +2313,54 @@ impl PgHandler {
             && comma_filters.iter().all(|f| f.aliases.len() == 2)
             && j.where_equalities.len() == equi.len()
             && j.where_equalities.iter().all(same_pair);
+        // An ON join's WHERE conjuncts over both tables that are not
+        // equalities are its join filter beside the ON's: one qual list,
+        // as for a comma join (RP-423).
+        let where_join_filters = on.is_some()
+            && !left_join
+            && !j.where_spans_equality
+            && !j.where_filters.is_empty()
+            && j.where_span_aliases.len() == j.where_filters.len()
+            && j.where_filters.iter().all(priced_kind);
         let filters = if comma_clause && !comma_filters.is_empty() {
             comma_filters
+        } else if where_join_filters {
+            on_filters
+                .into_iter()
+                .chain(j.where_filters.iter())
+                .collect()
         } else {
             on_filters
         };
-        if !comma_clause && (on.is_none() || !j.where_filters.is_empty() || j.where_spans_equality)
+        if !comma_clause
+            && !where_join_filters
+            && (on.is_none() || !j.where_filters.is_empty() || j.where_spans_equality)
         {
             return None;
         }
         // The executor re-checks a comma join's equalities above the join
         // as the select's residual; those are the join clauses, not a
         // filter.
-        if let Some(residual) = &sel.residual {
-            if !comma_clause || !is_key_equality(residual, equi, filters.len()) {
+        // A WHERE whose every conjunct was pushed to a scan is re-checked
+        // above the join too; where those are the expression comparisons
+        // the scans are priced with, that residual is theirs (RP-423).
+        let pushed_exprs = !comma_clause && j.where_modelled && join_exprs_modelled();
+        // A comma join's residual holds its key equalities and, beside
+        // them, those same expression comparisons (`e.a = w.a and
+        // length(e.b) > 2`).
+        let comma_exprs = if comma_clause && j.where_modelled && join_exprs_modelled() {
+            join_exprs_count()
+        } else {
+            0
+        };
+        if let Some(residual) = sel.residual.as_ref().filter(|_| !pushed_exprs) {
+            // The WHERE's join filters are re-checked above the join.
+            if where_join_filters {
+                if !is_key_equality(residual, &[], j.where_filters.len()) {
+                    return None;
+                }
+            } else if !comma_clause || !is_key_equality(residual, equi, filters.len() + comma_exprs)
+            {
                 return None;
             }
         }
@@ -2210,6 +2386,7 @@ impl PgHandler {
         struct SideScan<'s> {
             leaf: &'s secantus_pgplan::Select,
             columns: &'s [(String, String)],
+            exprs: std::rc::Rc<Vec<secantus_pgplan::ExprQual>>,
             filter: std::rc::Rc<Document>,
             above: Vec<String>,
             /// The scan's target list where no WHERE conjunct is above
@@ -2231,8 +2408,18 @@ impl PgHandler {
             let Statement::Select(leaf) = plan.as_ref() else {
                 return None;
             };
-            if leaf.residual.is_some()
-                || leaf.sub.is_some()
+            // A residual is priced where it is the expression comparisons
+            // the join's WHERE pushed to this scan (RP-423).
+            let alias = columns
+                .first()?
+                .0
+                .split(secantus_pgplan::joins::SEP)
+                .next()?;
+            let exprs = match &leaf.residual {
+                Some(_) => join_exprs_of(alias)?,
+                None => Vec::new(),
+            };
+            if leaf.sub.is_some()
                 || leaf.series.is_some()
                 || leaf.join.is_some()
                 || !leaf.windows.is_empty()
@@ -2279,13 +2466,27 @@ impl PgHandler {
             // The scan's target list: what the join and the rows above it
             // read. A WHERE conjunct run in the scan adds nothing to it,
             // unlike one left above the join.
+            // A column only the scan's expression comparisons read is not
+            // carried either (`build_joinrel_tlist`): it is not in the
+            // select list or a join clause (RP-423). Not judged beside a
+            // join filter, whose reads are its own.
+            let expr_only = |key: &str, field: &str| {
+                exprs.iter().any(|q| q.fields.iter().any(|f| f == field))
+                    && !j.needed.iter().any(|n| n == key)
+                    && !equi.iter().any(|(l, r)| l == key || r == key)
+                    && filters.is_empty()
+            };
             let carried = if above_filter.is_empty() {
                 Some(
                     columns
                         .iter()
                         .filter(|(key, _)| JoinRows::carries(project, key))
-                        .map(|(_, f)| stored(leaf, f))
-                        .collect::<Option<_>>()?,
+                        .map(|(key, f)| Some((key, stored(leaf, f)?)))
+                        .collect::<Option<Vec<_>>>()?
+                        .into_iter()
+                        .filter(|(key, field)| !expr_only(key, field))
+                        .map(|(_, field)| field)
+                        .collect(),
                 )
             } else {
                 None
@@ -2293,6 +2494,7 @@ impl PgHandler {
             Some(SideScan {
                 leaf,
                 columns,
+                exprs: std::rc::Rc::new(exprs),
                 filter: std::rc::Rc::new(filter),
                 above,
                 carried,
@@ -2320,6 +2522,7 @@ impl PgHandler {
                 field,
                 read,
                 above: s.above.clone(),
+                exprs: std::rc::Rc::clone(&s.exprs),
             })
         };
         let (left, right) = (scan(left)?, scan(right)?);
@@ -2398,7 +2601,13 @@ impl PgHandler {
         [Option<String>; 2],
     )> {
         let (mut a, mut b, more, filter, left_join, target_width) = self.joined_sides(sel)?;
-        if !more.is_empty() || a.table == b.table || filter.count != 0 || left_join {
+        if !more.is_empty()
+            || a.table == b.table
+            || filter.count != 0
+            || left_join
+            || !a.exprs.is_empty()
+            || !b.exprs.is_empty()
+        {
             return None;
         }
         let column = |p: &JoinedSide| {
@@ -2908,6 +3117,21 @@ impl PgHandler {
         read: &[String],
         above: &[String],
     ) -> Option<HashSide> {
+        self.hash_side_with(table, filter, &[], field, read, above)
+    }
+
+    /// [`Self::hash_side`] of a scan that also runs `exprs`, comparisons
+    /// of expressions with constants, per row (RP-423): its sequential
+    /// scan priced as a lone scan's residual is.
+    fn hash_side_with(
+        &self,
+        table: &str,
+        filter: &Document,
+        exprs: &[secantus_pgplan::ExprQual],
+        field: &str,
+        read: &[String],
+        above: &[String],
+    ) -> Option<HashSide> {
         let indexes = self.index_relations();
         let indexed = indexes.iter().any(|ix| ix.table.name == table);
         // A filtered side over a table with an index is read through the
@@ -2937,7 +3161,12 @@ impl PgHandler {
                     })
             })
         };
-        let (scan, index) = if !filter.is_empty() && indexed && index_reads_filter() {
+        let (scan, index) = if !exprs.is_empty() {
+            (
+                self.residual_scan_estimate(table, filter, exprs, read, &[])?,
+                None,
+            )
+        } else if !filter.is_empty() && indexed && index_reads_filter() {
             let mut found = None;
             for ix in indexes.iter().filter(|ix| ix.table.name == table) {
                 let key: Option<Vec<String>> = ix
@@ -3625,8 +3854,10 @@ impl PgHandler {
     /// the whole arm, a partial index, or an index the clauses reach only
     /// past its leading column with no index that leads with them
     /// (PostgreSQL prices a full-index path for it, not modelled).
-    /// [`Self::user_index_path`] for a user table, `None` for a catalog.
-    pub(crate) fn user_index_path_reading(
+    /// [`Self::user_index_path`] for a user table, the sequential scan
+    /// priced where it wins (`Some((_, None))`), `None` for a catalog or a
+    /// choice not modelled (RP-926).
+    pub(crate) fn user_scan_path_reading(
         &self,
         table: &str,
         filter: &Document,
@@ -3641,7 +3872,13 @@ impl PgHandler {
         {
             return None;
         }
-        self.user_index_path(table, filter, fields, reads)
+        match self
+            .user_paths(table, filter, fields, reads, &PathWant::default())?
+            .chosen
+        {
+            Some(chosen) => Some(chosen),
+            None => Some((self.user_seq_scan(table, filter, fields)?, None)),
+        }
     }
 
     fn user_index_path(
@@ -4073,13 +4310,123 @@ impl PgHandler {
         })
     }
 
+    /// The width of a dummy relation's `Result` (RP-420). A join made
+    /// dummy keeps its target as `set_rel_width` sized it: each joined
+    /// table's columns the join carries. One table is excluded before its
+    /// width is set, so 0. `None` where the target is not modelled (a
+    /// LATERAL item, a computed select list, a leaf that is not a plain
+    /// table's select).
+    pub(crate) fn dummy_width(&self, stmt: &Statement) -> Option<i64> {
+        use secantus_pgplan::joins::JoinNode;
+        let width = |table: &str, fields: &[String]| -> Option<i64> {
+            Some(self.scan_estimate(table, &Document::new(), fields)?.0 .3)
+        };
+        let join_width = |j: &secantus_pgplan::joins::JoinRows| -> Option<i64> {
+            fn leaves<'a>(n: &'a JoinNode, out: &mut Vec<&'a JoinNode>) -> Option<()> {
+                match n {
+                    JoinNode::Leaf { .. } => out.push(n),
+                    JoinNode::Join { left, right, .. } => {
+                        leaves(left, out)?;
+                        leaves(right, out)?;
+                    }
+                    _ => return None,
+                }
+                Some(())
+            }
+            let mut found = Vec::new();
+            leaves(&j.tree, &mut found)?;
+            let mut total = 0;
+            for leaf in found {
+                let JoinNode::Leaf { plan, def, columns } = leaf else {
+                    return None;
+                };
+                let Statement::Select(scan) = plan.as_ref() else {
+                    return None;
+                };
+                let table = self.lookup(&scan.table)?;
+                let above: Vec<String> = columns
+                    .iter()
+                    .filter(|(key, _)| j.project.is_none() || j.needed.contains(key))
+                    .map(|(_, f)| {
+                        let c = def.columns.iter().find(|c| c.field() == *f)?;
+                        table.field_of(&c.name)
+                    })
+                    .collect::<Option<_>>()?;
+                total += width(&scan.table, &above)?;
+            }
+            Some(total)
+        };
+        match stmt {
+            Statement::Select(sel) => match sel.sub.as_ref().map(|s| s.plan.as_ref()) {
+                Some(Statement::JoinRows(j)) => join_width(j),
+                Some(_) => None,
+                // One table excluded before its width is set
+                // (`relation_excluded_by_constraints` ahead of
+                // `set_rel_width`): nothing, unless a computed select list
+                // projects it, which is not modelled.
+                None if sel.casts.iter().all(Option::is_none) => Some(0),
+                None => None,
+            },
+            Statement::Aggregate(agg) if agg.sub.is_none() && agg.join.is_none() => Some(0),
+            // A join made dummy under an aggregate keeps the columns the
+            // aggregate reads, as one under a select does.
+            Statement::Aggregate(agg) if agg.join.is_none() => {
+                match agg.sub.as_ref().map(|s| s.plan.as_ref()) {
+                    Some(Statement::JoinRows(j)) => join_width(j),
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// The width of a target computed over one dummy table (RP-420):
+    /// `set_pathtarget_cost_width` finds no `attr_widths` on a relation
+    /// excluded before `set_rel_width`, so each column is its type's
+    /// `get_typavgwidth`. A Sort over `select` of stored columns prices that
+    /// target; an UPDATE's Result carries each assigned column, at its
+    /// type, and the row's identity (`ctid`, 6). `None` where the target is
+    /// not modelled.
+    pub(crate) fn dummy_target_width(&self, stmt: &Statement) -> Option<i64> {
+        let def_of = |table: &str| {
+            self.shared_table_defs()
+                .ok()?
+                .iter()
+                .find(|d| d.name == table)
+                .cloned()
+        };
+        match stmt {
+            Statement::Select(sel)
+                if sel.sub.is_none()
+                    && sel.join.is_none()
+                    && sel.series.is_none()
+                    && sel.windows.is_empty()
+                    && sel.casts.iter().all(Option::is_none) =>
+            {
+                let def = def_of(&sel.table)?;
+                let fields: Vec<String> = sel.columns.iter().map(|(_, f)| f.clone()).collect();
+                output_width(&def, None, &fields)
+            }
+            Statement::Update(up) if up.set_subscripts.is_empty() => {
+                let def = def_of(&up.table)?;
+                let mut fields: Vec<String> = up.set.keys().cloned().collect();
+                fields.extend(up.set_exprs.iter().map(|(f, ..)| f.clone()));
+                if fields.is_empty() {
+                    return None;
+                }
+                Some(output_width(&def, None, &fields)? + 6)
+            }
+            _ => None,
+        }
+    }
+
     pub(crate) fn user_seq_scan(
         &self,
         table: &str,
         filter: &Document,
         fields: &[String],
     ) -> Option<Estimate> {
-        self.user_seq_scan_with(table, filter, fields, &[], &[])
+        self.user_seq_scan_with(table, filter, fields, &[], &[], &[])
     }
 
     /// A user table's sequential scan whose WHERE runs per row, in part or
@@ -4132,7 +4479,142 @@ impl PgHandler {
                 return None;
             }
         }
-        self.user_seq_scan_with(table, filter, fields, &[], exprs)
+        self.user_seq_scan_with(table, filter, fields, &[], exprs, &[])
+    }
+
+    /// Counts over one user table whose WHERE compares columns with
+    /// InitPlans' outputs (RP-440). The executor runs that WHERE as a FROM
+    /// subquery under the Aggregate; PostgreSQL's `pull_up_simple_subquery`
+    /// merges it, so its Subquery Scan is dropped and the Aggregate is
+    /// priced by `cost_agg` (AGG_PLAIN) over the scan, the InitPlans' cost
+    /// on the top node only.
+    pub(crate) fn init_plan_count_agg(
+        &self,
+        agg: &secantus_pgplan::Aggregate,
+        tree: &mut explain::PlanNode,
+        param_quals: &[(String, secantus_pgplan::colstats::Op)],
+        init_cost: f64,
+    ) {
+        let Some(sub) = agg.sub.as_ref() else { return };
+        let Statement::Select(sel) = sub.plan.as_ref() else {
+            return;
+        };
+        let plain_counts = !agg.items.is_empty()
+            && agg.items.iter().all(|it| {
+                matches!(
+                    it.func,
+                    secantus_pgplan::AggFunc::CountStar | secantus_pgplan::AggFunc::Count
+                ) && it.expr.is_none()
+                    && it.expr2.is_none()
+                    && it.field2.is_none()
+                    && !it.distinct
+                    && it.filter.is_none()
+                    && it.order.is_empty()
+            })
+            && agg.group_by.is_empty()
+            && agg.grouping_sets.is_none()
+            && agg.groupings.is_empty()
+            && agg.having.is_none()
+            && agg.exprs.is_empty()
+            && agg.order.is_empty()
+            && agg.limit.is_none()
+            && agg.offset == 0
+            && !agg.distinct
+            && agg.filter.is_empty()
+            && agg.items.len() == agg.select.len()
+            && agg
+                .select
+                .iter()
+                .enumerate()
+                .all(|(i, (_, c))| *c == secantus_pgplan::OutputCol::Agg(i));
+        let simple_sub = sub.alias == sel.table
+            && sel.sub.is_none()
+            && sel.series.is_none()
+            && sel.join.is_none()
+            && sel.windows.is_empty()
+            && sel.order.is_empty()
+            && sel.limit.is_none()
+            && sel.offset == 0
+            && matches!(sel.distinct, secantus_pgplan::Distinct::None);
+        let shaped = tree.name == "Aggregate"
+            && tree.children.len() == 1
+            && tree.children[0].name.starts_with("Subquery Scan on ")
+            && tree.children[0].children.len() == 1
+            && tree.children[0].children[0].children.is_empty()
+            && tree.children[0].children[0].name == format!("Seq Scan on {}", sel.table);
+        if !(plain_counts && simple_sub && shaped) {
+            return;
+        }
+        let fields: Vec<String> =
+            agg.items
+                .iter()
+                .filter_map(|it| it.field.clone())
+                .fold(Vec::new(), |mut v, f| {
+                    if !v.contains(&f) {
+                        v.push(f);
+                    }
+                    v
+                });
+        let Some(scan) =
+            self.init_plan_scan_estimate(&sel.table, &sel.filter, param_quals, &fields)
+        else {
+            return;
+        };
+        let mut scan_node = tree.children[0].children.remove(0);
+        scan_node.estimate = Some(scan);
+        tree.children[0] = scan_node;
+        let (startup, total, rows, w) = count_agg_estimate(scan, agg.items.len());
+        tree.estimate = Some((startup + init_cost, total + init_cost, rows, w));
+    }
+
+    /// A user table's sequential scan whose WHERE compares columns with
+    /// InitPlans' outputs (`param_quals`), and with constants (`filter`):
+    /// the scan's estimate, before the InitPlans' own cost (RP-440).
+    pub(crate) fn init_plan_scan_estimate(
+        &self,
+        table: &str,
+        filter: &Document,
+        param_quals: &[(String, secantus_pgplan::colstats::Op)],
+        fields: &[String],
+    ) -> Option<Estimate> {
+        if !self
+            .shared_table_defs()
+            .ok()?
+            .iter()
+            .any(|d| d.name == table)
+        {
+            return None;
+        }
+        self.user_seq_scan_with(table, filter, fields, &[], &[], param_quals)
+    }
+
+    /// `field`'s comparison with a value unknown at plan time
+    /// (`colstats::Column::non_const_sel`).
+    fn param_qual_selectivity(
+        &self,
+        pt: &PlannerTable,
+        field: &str,
+        op: secantus_pgplan::colstats::Op,
+    ) -> Option<f64> {
+        let c = pt.def.columns.iter().find(|c| c.field() == field)?;
+        let measured = match pt.analyzed.as_ref().map(|a| a.get(field)) {
+            Some(Some(Some(a))) => Some((a.stats, a.slots.as_ref()?)),
+            Some(Some(None)) => return None,
+            _ => None,
+        };
+        let base = c.pg_type.trim_start_matches("pg_catalog.");
+        let column = secantus_pgplan::colstats::Column {
+            stats: measured,
+            unique: pt.unique.iter().any(|u| u == field),
+            boolean: base == "bool",
+            numeric: false,
+            ordered: false,
+            string: false,
+            c_collation: false,
+            actual: None,
+            tuples: pt.tuples,
+        };
+        Some(column.non_const_sel(op))
     }
 
     /// A user table's sequential scan whose WHERE is only array operators
@@ -4155,7 +4637,7 @@ impl PgHandler {
         {
             return None;
         }
-        self.user_seq_scan_with(table, &Document::new(), fields, quals, &[])
+        self.user_seq_scan_with(table, &Document::new(), fields, quals, &[], &[])
     }
 
     /// One array conjunct's selectivity (`arraycontsel`, or
@@ -4230,6 +4712,7 @@ impl PgHandler {
         fields: &[String],
         array_quals: &[secantus_pgplan::ArrayQual],
         expr_quals: &[secantus_pgplan::ExprQual],
+        param_quals: &[(String, secantus_pgplan::colstats::Op)],
     ) -> Option<Estimate> {
         let counted: std::cell::OnceCell<Option<usize>> = std::cell::OnceCell::new();
         let count = || {
@@ -4258,6 +4741,11 @@ impl PgHandler {
                     costsize::Qual::Filter(f64::from(q.operators)),
                 ));
             }
+        }
+        for (field, op) in param_quals {
+            sel *= self.param_qual_selectivity(&pt, field, *op)?;
+            // The comparison; the parameter it reads costs nothing.
+            quals.push((field.clone(), costsize::Qual::Filter(1.0)));
         }
         let width = output_width(&pt.def, pt.analyzed.as_ref(), fields)?;
         let rel = costsize::Rel {
@@ -4311,6 +4799,32 @@ impl PgHandler {
             let indexes = self.cost_indexes(table, &pt.def, count()? as u64);
             let w = self.analyzed_where(
                 table, &pt.def, &pt.unique, stats, pt.tuples, filter, &indexes,
+            )?;
+            return Some((w.selectivity, w.quals));
+        }
+        // A pattern match over a table never analysed is `patternsel` with
+        // no statistics (`DEFAULT_MATCH_SEL` for a fixed prefix, the rest
+        // of the pattern's guess), the other clauses their defaults
+        // (RP-423).
+        if crate::where_clauses(filter).is_some_and(|cs| {
+            fn has_pattern(cs: &[crate::WhereClause]) -> bool {
+                cs.iter().any(|c| match c {
+                    crate::WhereClause::Pattern(..) => true,
+                    crate::WhereClause::Or(arms) => arms.iter().any(|a| has_pattern(a)),
+                    _ => false,
+                })
+            }
+            has_pattern(&cs)
+        }) {
+            let indexes = self.cost_indexes(table, &pt.def, count()? as u64);
+            let w = self.analyzed_where(
+                table,
+                &pt.def,
+                &pt.unique,
+                &HashMap::new(),
+                pt.tuples,
+                filter,
+                &indexes,
             )?;
             return Some((w.selectivity, w.quals));
         }
@@ -4682,7 +5196,7 @@ fn rename_fields(filter: &Document, rename: &dyn Fn(&str) -> Option<String>) -> 
     Some(out)
 }
 
-fn clamp_rows(rows: f64) -> f64 {
+pub(crate) fn clamp_rows(rows: f64) -> f64 {
     if rows <= 1.0 {
         1.0
     } else {
@@ -4765,10 +5279,10 @@ pub(crate) fn sort_estimate(input: Estimate, work_mem_kb: usize) -> Estimate {
             1.0
         };
         let page_accesses = 2.0 * npages * log_runs;
-        comparison_cost * tuples * tuples.log2()
+        comparison_cost * tuples * secantus_pgplan::costsize::pg_log2(tuples)
             + page_accesses * (SEQ_PAGE_COST * 0.75 + RANDOM_PAGE_COST * 0.25)
     } else {
-        comparison_cost * tuples * tuples.log2()
+        comparison_cost * tuples * secantus_pgplan::costsize::pg_log2(tuples)
     };
     let run = CPU_OPERATOR_COST * tuples;
     startup += in_total;
@@ -4852,6 +5366,415 @@ impl PgHandler {
             .collect::<Option<_>>()?;
         let (_, _, rows, _) = self.user_seq_scan(table, filter, &[])?;
         Some(hashagg::estimate_groups(&keys, pt.tuples, rows) as f64)
+    }
+
+    /// An inner join of two stored tables on one column equality, with no
+    /// WHERE, as a set operation's input (RP-841): its rows, and the groups
+    /// of the select list's columns. The rows are the priced hash join's
+    /// where both sides are analysed; over two tables never analysed they
+    /// are `calc_joinrel_size_estimate`'s product of the scans' rows and
+    /// `eqjoinsel` from `get_variable_numdistinct`'s defaults. The groups
+    /// are `estimate_num_groups`': each table's columns' distinct counts
+    /// clamped to that table's rows, multiplied, and clamped to the join's.
+    pub(crate) fn join_input_estimate(&self, sel: &secantus_pgplan::Select) -> Option<(f64, f64)> {
+        // A comma join's key equality is re-checked above the join as the
+        // select's residual (`joined_rows_input_sides` admits only that).
+        if !sel.filter.is_empty()
+            || (sel.residual.is_some() && sel.join.is_some())
+            || sel.casts.iter().any(Option::is_some)
+        {
+            return None;
+        }
+        // Each side's table, its join key's stored field, and the stored
+        // fields the select list reads from it.
+        let sides: [(String, String, Vec<String>); 2] = if let Some(js) = &sel.join {
+            if js.left_join
+                || !js.filter.is_empty()
+                || js.order.is_some()
+                || js.left_sub.is_some()
+                || js.right_sub.is_some()
+                || js.exprs.iter().any(Option::is_some)
+            {
+                return None;
+            }
+            let ((la, lc), (ra, rc)) = js.on.as_ref()?;
+            let side =
+                |(table, alias): &(String, String)| -> Option<(String, String, Vec<String>)> {
+                    let def = self.lookup(table)?;
+                    let key = if la == alias {
+                        lc
+                    } else if ra == alias {
+                        rc
+                    } else {
+                        return None;
+                    };
+                    let read = js
+                        .columns
+                        .iter()
+                        .filter(|(_, a, _)| a == alias)
+                        .map(|(_, _, c)| def.field_of(c))
+                        .collect::<Option<_>>()?;
+                    Some((table.clone(), def.field_of(key)?, read))
+                };
+            if js.left.1 == js.right.1 {
+                return None;
+            }
+            [side(&js.left)?, side(&js.right)?]
+        } else {
+            match self.joined_rows_input_sides(sel) {
+                Some(sides) => sides,
+                None => return self.join_chain_input_estimate(sel),
+            }
+        };
+        let counted = |table: &str| {
+            let counted: std::cell::OnceCell<Option<usize>> = std::cell::OnceCell::new();
+            let count = || {
+                *counted.get_or_init(|| {
+                    self.storage
+                        .count_matching(self.db(), table, &Document::new(), None)
+                        .ok()
+                })
+            };
+            self.planner_table_lazy(table, &count)
+        };
+        let tables = [counted(&sides[0].0)?, counted(&sides[1].0)?];
+        let key_stat = |pt: &PlannerTable, field: &str| -> Option<hashagg::KeyStat> {
+            let c = pt.def.columns.iter().find(|c| c.field() == field)?;
+            let unique = pt.unique.iter().any(|u| u == field);
+            let measured = pt.analyzed.as_ref().and_then(|a| a.get(field));
+            Some(if c.pg_type == "bool" {
+                hashagg::KeyStat::Bool
+            } else if let Some(stats) = measured {
+                hashagg::KeyStat::Analyzed {
+                    stats: stats.as_ref()?.stats,
+                    unique,
+                }
+            } else if unique {
+                hashagg::KeyStat::Unique
+            } else {
+                hashagg::KeyStat::Unknown
+            })
+        };
+        let rows = if tables.iter().all(|pt| pt.analyzed.is_none()) {
+            let nd = |i: usize| -> Option<(f64, bool)> {
+                let pt = &tables[i];
+                Some(match key_stat(pt, &sides[i].1)? {
+                    hashagg::KeyStat::Unique => (costsize::clamp_row_est(pt.tuples), false),
+                    hashagg::KeyStat::Bool => (2.0, false),
+                    hashagg::KeyStat::Unknown if pt.tuples < 200.0 => {
+                        (costsize::clamp_row_est(pt.tuples), true)
+                    }
+                    hashagg::KeyStat::Unknown => (200.0, true),
+                    hashagg::KeyStat::Analyzed { .. } => return None,
+                })
+            };
+            let ((n1, d1), (n2, d2)) = (nd(0)?, nd(1)?);
+            let k = |ndistinct, default_ndistinct| secantus_pgplan::joincost::KeyStats {
+                ndistinct,
+                default_ndistinct,
+                null_frac: 0.0,
+                mcv: &[],
+            };
+            let selec = secantus_pgplan::joincost::eqjoinsel_inner(&k(n1, d1), &k(n2, d2));
+            costsize::clamp_row_est(tables[0].tuples * tables[1].tuples * selec)
+        } else {
+            self.hash_join_estimate(sel)
+                .or_else(|| self.join_select_hash_estimate(sel))?
+                .2
+                 .2
+        };
+        let mut groups = 1.0f64;
+        for (i, (_, _, read)) in sides.iter().enumerate() {
+            let keys: Vec<hashagg::KeyStat> = read
+                .iter()
+                .map(|f| key_stat(&tables[i], f))
+                .collect::<Option<_>>()?;
+            if !keys.is_empty() {
+                groups *=
+                    hashagg::estimate_groups(&keys, tables[i].tuples, tables[i].tuples) as f64;
+            }
+        }
+        Some((rows, groups.min(rows).max(1.0)))
+    }
+
+    /// An inner join of three or more stored tables as a set operation's
+    /// input (RP-841), every join clause a column equality (an ON's or the
+    /// WHERE's) and no table analysed: `calc_joinrel_size_estimate`'s
+    /// product of the scans' rows and, for each equivalence class the
+    /// equalities make, one `eqjoinsel` per member past its first (the
+    /// clause `generate_join_implied_equalities` adds as each member's
+    /// table joins), from `get_variable_numdistinct`'s defaults. The groups
+    /// are `estimate_num_groups`', as for two tables.
+    fn join_chain_input_estimate(&self, sel: &secantus_pgplan::Select) -> Option<(f64, f64)> {
+        use secantus_pgplan::joins::{JoinKind, JoinNode};
+        use secantus_pgplan::Statement;
+        let sub = sel.sub.as_ref()?;
+        let Statement::JoinRows(j) = sub.plan.as_ref() else {
+            return None;
+        };
+        if !j.where_modelled
+            || j.where_filters.len() != j.where_equalities.len()
+            || sel.residual.is_some() && j.where_equalities.is_empty()
+        {
+            return None;
+        }
+        // Leaves in join order: (table, leaf columns, leaf select columns).
+        let mut leaves: Vec<(&JoinNode, &secantus_pgplan::Select)> = Vec::new();
+        let mut equalities: Vec<(String, String)> = j.where_equalities.clone();
+        fn walk<'a>(
+            n: &'a JoinNode,
+            leaves: &mut Vec<(&'a JoinNode, &'a secantus_pgplan::Select)>,
+            eqs: &mut Vec<(String, String)>,
+        ) -> Option<()> {
+            match n {
+                JoinNode::Leaf { plan, .. } => {
+                    let Statement::Select(leaf) = plan.as_ref() else {
+                        return None;
+                    };
+                    if !leaf.filter.is_empty()
+                        || leaf.residual.is_some()
+                        || leaf.sub.is_some()
+                        || leaf.series.is_some()
+                        || leaf.join.is_some()
+                        || leaf.casts.iter().any(Option::is_some)
+                    {
+                        return None;
+                    }
+                    leaves.push((n, leaf));
+                }
+                JoinNode::Join {
+                    kind: JoinKind::Inner,
+                    left,
+                    right,
+                    on,
+                    on_other: false,
+                    on_filters,
+                    equi,
+                    merged,
+                    expr_keys,
+                    ..
+                } => {
+                    if !merged.is_empty()
+                        || !expr_keys.is_empty()
+                        || !on_filters.is_empty()
+                        || (on.is_some() && equi.is_empty())
+                    {
+                        return None;
+                    }
+                    if on.is_some() {
+                        eqs.extend(equi.iter().cloned());
+                    }
+                    walk(left, leaves, eqs)?;
+                    walk(right, leaves, eqs)?;
+                }
+                _ => return None,
+            }
+            Some(())
+        }
+        walk(&j.tree, &mut leaves, &mut equalities)?;
+        if leaves.len() < 3 || equalities.is_empty() {
+            return None;
+        }
+        // A joined-row key's leaf and the stored field it reads.
+        let stored = |key: &str| -> Option<(usize, String)> {
+            leaves.iter().enumerate().find_map(|(i, (n, leaf))| {
+                let JoinNode::Leaf { columns, .. } = n else {
+                    return None;
+                };
+                let (_, f) = columns.iter().find(|(ck, _)| ck == key)?;
+                Some((i, leaf.columns.iter().find(|(out, _)| out == f)?.1.clone()))
+            })
+        };
+        let mut reads: Vec<Vec<String>> = vec![Vec::new(); leaves.len()];
+        for (_, f) in &sel.columns {
+            let (i, field) = stored(f)?;
+            reads[i].push(field);
+        }
+        // Equivalence classes over (leaf, field), members in leaf order.
+        let mut classes: Vec<Vec<(usize, String)>> = Vec::new();
+        for (l, r) in &equalities {
+            let (l, r) = (stored(l)?, stored(r)?);
+            let find = |classes: &Vec<Vec<(usize, String)>>, m: &(usize, String)| {
+                classes.iter().position(|c| c.contains(m))
+            };
+            match (find(&classes, &l), find(&classes, &r)) {
+                (Some(a), Some(b)) if a == b => {}
+                (Some(a), Some(b)) => {
+                    let moved = classes.remove(a.max(b));
+                    classes[a.min(b)].extend(moved);
+                }
+                (Some(a), None) => classes[a].push(r),
+                (None, Some(b)) => classes[b].push(l),
+                (None, None) => classes.push(vec![l, r]),
+            }
+        }
+        let mut joined = vec![false; leaves.len()];
+        for c in &mut classes {
+            c.sort();
+            // Two members of one table would restrict its scan.
+            if c.windows(2).any(|w| w[0].0 == w[1].0) {
+                return None;
+            }
+            for (i, _) in c.iter() {
+                joined[*i] = true;
+            }
+        }
+        if joined.iter().any(|j| !j) {
+            return None;
+        }
+        let counted = |table: &str| {
+            let counted: std::cell::OnceCell<Option<usize>> = std::cell::OnceCell::new();
+            let count = || {
+                *counted.get_or_init(|| {
+                    self.storage
+                        .count_matching(self.db(), table, &Document::new(), None)
+                        .ok()
+                })
+            };
+            self.planner_table_lazy(table, &count)
+        };
+        let tables: Vec<PlannerTable> = leaves
+            .iter()
+            .map(|(_, leaf)| counted(&leaf.table))
+            .collect::<Option<_>>()?;
+        if tables.iter().any(|pt| pt.analyzed.is_some()) {
+            return None;
+        }
+        let key_stat = |pt: &PlannerTable, field: &str| -> Option<hashagg::KeyStat> {
+            let c = pt.def.columns.iter().find(|c| c.field() == field)?;
+            Some(if c.pg_type == "bool" {
+                hashagg::KeyStat::Bool
+            } else if pt.unique.iter().any(|u| u == field) {
+                hashagg::KeyStat::Unique
+            } else {
+                hashagg::KeyStat::Unknown
+            })
+        };
+        let nd = |(i, field): &(usize, String)| -> Option<(f64, bool)> {
+            let pt = &tables[*i];
+            Some(match key_stat(pt, field)? {
+                hashagg::KeyStat::Unique => (costsize::clamp_row_est(pt.tuples), false),
+                hashagg::KeyStat::Bool => (2.0, false),
+                hashagg::KeyStat::Unknown if pt.tuples < 200.0 => {
+                    (costsize::clamp_row_est(pt.tuples), true)
+                }
+                _ => (200.0, true),
+            })
+        };
+        let k = |(ndistinct, default_ndistinct)| secantus_pgplan::joincost::KeyStats {
+            ndistinct,
+            default_ndistinct,
+            null_frac: 0.0,
+            mcv: &[],
+        };
+        let mut rows: f64 = tables.iter().map(|pt| pt.tuples).product();
+        for c in &classes {
+            for w in c.windows(2) {
+                rows *= secantus_pgplan::joincost::eqjoinsel_inner(&k(nd(&w[0])?), &k(nd(&w[1])?));
+            }
+        }
+        let rows = costsize::clamp_row_est(rows);
+        let mut groups = 1.0f64;
+        for (i, read) in reads.iter().enumerate() {
+            let keys: Vec<hashagg::KeyStat> = read
+                .iter()
+                .map(|f| key_stat(&tables[i], f))
+                .collect::<Option<_>>()?;
+            if !keys.is_empty() {
+                groups *=
+                    hashagg::estimate_groups(&keys, tables[i].tuples, tables[i].tuples) as f64;
+            }
+        }
+        Some((rows, groups.min(rows).max(1.0)))
+    }
+
+    /// [`Self::join_input_estimate`]'s sides of an inner join planned as
+    /// joined rows: each plain scan's table, its key's stored field and
+    /// the stored fields the select list reads from it.
+    fn joined_rows_input_sides(
+        &self,
+        sel: &secantus_pgplan::Select,
+    ) -> Option<[(String, String, Vec<String>); 2]> {
+        use secantus_pgplan::joins::{JoinKind, JoinNode};
+        use secantus_pgplan::Statement;
+        let sub = sel.sub.as_ref()?;
+        let Statement::JoinRows(j) = sub.plan.as_ref() else {
+            return None;
+        };
+        let JoinNode::Join {
+            kind: JoinKind::Inner,
+            left,
+            right,
+            on,
+            on_other: false,
+            equi,
+            merged,
+            expr_keys,
+            ..
+        } = &j.tree
+        else {
+            return None;
+        };
+        let [(left_key, right_key)] = equi.as_slice() else {
+            return None;
+        };
+        if !merged.is_empty() || !expr_keys.is_empty() || !j.where_modelled {
+            return None;
+        }
+        // The join clause is an ON's or -- a comma join, `FROM a, b WHERE
+        // a.k = b.k` -- the WHERE's one conjunct, that same equality,
+        // which the executor re-checks above the join as the residual:
+        // PostgreSQL makes an inner join's WHERE and ON quals one list
+        // (`deconstruct_jointree`), so both estimate alike.
+        let comma_clause = on.is_none()
+            && j.where_spans_equality
+            && j.where_filters.len() == 1
+            && j.where_equalities.len() == 1
+            && j.where_equalities.iter().all(|(l, r)| {
+                (l == left_key && r == right_key) || (l == right_key && r == left_key)
+            })
+            && sel
+                .residual
+                .as_ref()
+                .is_none_or(|r| is_key_equality(r, equi, 0));
+        if !comma_clause
+            && (on.is_none()
+                || sel.residual.is_some()
+                || !j.where_filters.is_empty()
+                || j.where_spans_equality)
+        {
+            return None;
+        }
+        let side = |n: &JoinNode, key: &str| -> Option<(String, String, Vec<String>)> {
+            let JoinNode::Leaf { plan, columns, .. } = n else {
+                return None;
+            };
+            let Statement::Select(leaf) = plan.as_ref() else {
+                return None;
+            };
+            if !leaf.filter.is_empty()
+                || leaf.residual.is_some()
+                || leaf.sub.is_some()
+                || leaf.series.is_some()
+                || leaf.join.is_some()
+                || leaf.casts.iter().any(Option::is_some)
+            {
+                return None;
+            }
+            let stored = |k: &str| -> Option<String> {
+                let (_, f) = columns.iter().find(|(ck, _)| ck == k)?;
+                Some(leaf.columns.iter().find(|(out, _)| out == f)?.1.clone())
+            };
+            let read = sel
+                .columns
+                .iter()
+                .filter(|(_, f)| columns.iter().any(|(ck, _)| ck == f))
+                .map(|(_, f)| stored(f))
+                .collect::<Option<_>>()?;
+            Some((leaf.table.clone(), stored(key)?, read))
+        };
+        let sides = [side(left, left_key)?, side(right, right_key)?];
+        (sides[0].2.len() + sides[1].2.len() == sel.columns.len()).then_some(sides)
     }
 }
 
@@ -4942,6 +5865,82 @@ pub(crate) fn count_agg_estimate(input: Estimate, n: usize) -> Estimate {
     let (_, in_total, rows, _) = input;
     let startup = in_total + CPU_OPERATOR_COST * n as f64 * rows;
     (startup, startup + CPU_TUPLE_COST, 1.0, 8 * n as i64)
+}
+
+/// A plain Aggregate's estimate over `input` (RP-420): `cost_agg`'s
+/// AGG_PLAIN with `get_agg_clause_costs`' sums. Each aggregate's
+/// transition function (`procost` 1) runs once a row and its final
+/// function, where `pg_aggregate` names one, once at the end, both at
+/// startup; the one row costs `cpu_tuple_cost`. The width is each
+/// result type's `get_typavgwidth`. `None` for an aggregate whose
+/// `pg_aggregate` row is not resolved here: one over an expression, a
+/// DISTINCT, a FILTER, an ORDER BY, or a function outside the list below.
+pub(crate) fn plain_agg_estimate(
+    input: Estimate,
+    items: &[secantus_pgplan::AggItem],
+) -> Option<Estimate> {
+    use secantus_pgplan::AggFunc;
+    const CPU_OPERATOR_COST: f64 = 0.0025;
+    const CPU_TUPLE_COST: f64 = 0.01;
+    if items.is_empty() {
+        return None;
+    }
+    let facts = crate::catalog_facts::builtin();
+    // `find_compatible_agg` shares one state, and one final call, between
+    // identical calls; each still has its own output column.
+    let (mut finals, mut width) = (0usize, 0i64);
+    let mut seen: Vec<(AggFunc, Option<&str>)> = Vec::new();
+    let mut distinct_calls = 0usize;
+    for it in items {
+        if it.expr.is_some()
+            || it.expr2.is_some()
+            || it.field2.is_some()
+            || it.distinct
+            || it.filter.is_some()
+            || !it.order.is_empty()
+        {
+            return None;
+        }
+        let (name, args): (&str, Vec<i64>) = match it.func {
+            AggFunc::CountStar => ("count", Vec::new()),
+            // `count("any")`.
+            AggFunc::Count => ("count", vec![2276]),
+            f => {
+                let name = match f {
+                    AggFunc::Sum => "sum",
+                    AggFunc::Avg => "avg",
+                    AggFunc::Min => "min",
+                    AggFunc::Max => "max",
+                    AggFunc::BoolAnd => "bool_and",
+                    AggFunc::BoolOr => "bool_or",
+                    _ => return None,
+                };
+                let ty = secantus_pgplan::pgtypes::oid_of_name(it.source_type.as_deref()?)?;
+                (name, vec![ty])
+            }
+        };
+        let oid = facts.procs_by_name.get(name)?.iter().copied().find(|o| {
+            facts
+                .procs
+                .get(o)
+                .is_some_and(|p| p.kind == 'a' && p.args == args)
+        })?;
+        let (_, fin, _) = facts.aggregates.get(&oid).copied()?;
+        let call = (it.func, it.field.as_deref());
+        if !seen.contains(&call) {
+            seen.push(call);
+            distinct_calls += 1;
+            if fin != 0 {
+                finals += 1;
+            }
+        }
+        width += type_width(&secantus_pgplan::aggregate_item_type(it), -1);
+    }
+    let (_, in_total, rows, _) = input;
+    let startup = in_total
+        + CPU_OPERATOR_COST * distinct_calls as f64 * rows
+        + CPU_OPERATOR_COST * finals as f64;
+    Some((startup, startup + CPU_TUPLE_COST, 1.0, width))
 }
 
 /// A HashAggregate's estimate for a GROUP BY of `ncols` keys with `n`
@@ -5507,6 +6506,77 @@ thread_local! {
         const { std::cell::RefCell::new(Vec::new()) };
 }
 
+thread_local! {
+    /// The expression comparisons each table of an EXPLAIN's join is
+    /// filtered by ([`secantus_pgplan::ExplainOptions::join_expr_quals`],
+    /// RP-423): the join's leaves keep them only as a residual.
+    static EXPLAIN_JOIN_EXPRS: std::cell::RefCell<Vec<(String, Option<Vec<secantus_pgplan::ExprQual>>)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Holds an EXPLAIN's join expression quals until it is dropped.
+pub(crate) struct JoinExprsGuard(());
+
+impl Drop for JoinExprsGuard {
+    fn drop(&mut self) {
+        EXPLAIN_JOIN_EXPRS.with(|c| c.borrow_mut().clear());
+    }
+}
+
+/// Make `quals` what this EXPLAIN's joined scans of each alias are
+/// filtered by beside their lowered filter, until the guard is dropped.
+pub(crate) fn explain_join_exprs(
+    quals: &[(String, Option<Vec<secantus_pgplan::ExprQual>>)],
+) -> JoinExprsGuard {
+    EXPLAIN_JOIN_EXPRS.with(|c| *c.borrow_mut() = quals.to_vec());
+    JoinExprsGuard(())
+}
+
+/// Whether this EXPLAIN's join WHERE has expression comparisons, each
+/// alias's all modelled.
+fn join_exprs_modelled() -> bool {
+    EXPLAIN_JOIN_EXPRS.with(|c| {
+        let c = c.borrow();
+        !c.is_empty() && c.iter().all(|(_, q)| q.is_some())
+    })
+}
+
+/// How many expression comparisons this EXPLAIN's join WHERE pushes to
+/// its scans, over every alias.
+fn join_exprs_count() -> usize {
+    EXPLAIN_JOIN_EXPRS.with(|c| {
+        c.borrow()
+            .iter()
+            .map(|(_, q)| q.as_ref().map_or(0, Vec::len))
+            .sum()
+    })
+}
+
+/// Whether every expression comparison this EXPLAIN's join WHERE pushes
+/// is over `alias`.
+fn join_exprs_only_of(alias: &str) -> bool {
+    EXPLAIN_JOIN_EXPRS.with(|c| c.borrow().iter().all(|(a, _)| a == alias))
+}
+
+/// The alias of a join side that is one table's scan.
+fn leaf_alias(node: &secantus_pgplan::joins::JoinNode) -> Option<&str> {
+    let secantus_pgplan::joins::JoinNode::Leaf { columns, .. } = node else {
+        return None;
+    };
+    columns.first()?.0.split(secantus_pgplan::joins::SEP).next()
+}
+
+/// The expression comparisons a joined scan of `alias` runs as its
+/// residual: `None` where this EXPLAIN models none, or not all, of them.
+fn join_exprs_of(alias: &str) -> Option<Vec<secantus_pgplan::ExprQual>> {
+    EXPLAIN_JOIN_EXPRS.with(|c| {
+        c.borrow()
+            .iter()
+            .find(|(a, _)| a == alias)
+            .and_then(|(_, q)| q.clone())
+    })
+}
+
 /// Holds an EXPLAIN's LIKE patterns until it is dropped.
 pub(crate) struct PatternsGuard(());
 
@@ -5593,14 +6663,27 @@ fn expr_selectivity(quals: &[secantus_pgplan::ExprQual], tuples: f64) -> Option<
             tuples,
         })
         .collect();
+    // A pattern match is `patternsel` over an expression with no
+    // statistics (RP-423).
+    let mut others = Vec::new();
+    for q in quals {
+        if let Some((pattern, insensitive, negated, regex)) = &q.pattern {
+            let column = Column {
+                string: true,
+                ..columns[0].clone()
+            };
+            others.push(column.pattern_sel(pattern, *insensitive, *negated, *regex)?);
+        }
+    }
     let clauses: Vec<(&Column, secantus_pgplan::colstats::Op, Vec<u8>)> = quals
         .iter()
+        .filter(|q| q.pattern.is_none())
         .map(|q| {
             let i = exprs.iter().position(|e| *e == q.expr)?;
             Some((&columns[i], q.op, Vec::new()))
         })
         .collect::<Option<_>>()?;
-    secantus_pgplan::colstats::clauselist(&clauses)
+    secantus_pgplan::colstats::clauselist_with(&clauses, &others)
 }
 
 /// An `IN` list's cost counts every element, NULLs included
@@ -5640,6 +6723,8 @@ struct JoinedSide {
     /// The fields its scan reads, and those it carries above the join.
     read: Vec<String>,
     above: Vec<String>,
+    /// The expression comparisons its scan runs per row (RP-423).
+    exprs: std::rc::Rc<Vec<secantus_pgplan::ExprQual>>,
 }
 
 /// The constant `filter` sets stored field `field` equal to, at its top
@@ -5871,6 +6956,34 @@ fn neqjoinsel_cast(
     Some(1.0 - eq.clamp(0.0, 1.0))
 }
 
+/// [`PgHandler::nest_loop_chain_estimate`]'s answer: a table by its
+/// index in the written chain, or a Nested Loop over two subtrees, left
+/// and right as the join tree lists them (RP-919).
+#[derive(Debug, Clone)]
+pub(crate) enum NestLoopTree {
+    Leaf(usize),
+    Join(Box<NestLoopLevel>, Box<NestLoopTree>, Box<NestLoopTree>),
+}
+
+impl NestLoopTree {
+    /// The written chain: left-deep, its tables in FROM order.
+    fn is_written(&self) -> bool {
+        fn walk(t: &NestLoopTree, next: &mut usize) -> bool {
+            match t {
+                NestLoopTree::Leaf(i) => {
+                    let ok = *i == *next;
+                    *next += 1;
+                    ok
+                }
+                NestLoopTree::Join(_, l, r) => {
+                    matches!(**r, NestLoopTree::Leaf(_)) && walk(l, next) && walk(r, next)
+                }
+            }
+        }
+        walk(self, &mut 0)
+    }
+}
+
 /// One Nested Loop of [`PgHandler::nest_loop_chain_estimate`]'s answer:
 /// its plan and its two inputs' and its own estimates, its inputs in the
 /// order the join tree lists them.
@@ -6094,6 +7207,131 @@ struct AnalysedKey {
 
 /// The most further equality clauses [`hash_join_of`] prices.
 const MORE_HASH_CLAUSES: usize = 3;
+
+/// The Hash Semi Join of `a`, the outer side, to `b` hashed (RP-411):
+/// `final_cost_hashjoin`'s JOIN_SEMI over `compute_semi_anti_join_factors`
+/// (`eqjoinsel_semi` the outer match fraction, `eqjoinsel_inner` over the
+/// inner rows the match count), its rows the outer rows with a match
+/// (`calc_joinrel_size_estimate`). PostgreSQL 15 hashes only the inner
+/// side of a semi join. `add_path` also weighs a merge or nested-loop semi
+/// join and the inner join of the inner side made unique
+/// (`create_unique_path`). The last is priced where it is hashed on the
+/// `HashAggregate` of the inner side (the second value, that aggregate's
+/// estimate, when it is the cheaper path); the rest are not, so a hash
+/// join is answered only where it is cheaper than a lower bound of each:
+/// the two Sorts a merge must start with, the outer scan and the inner
+/// rescans a nested loop pays for each unmatched outer row, and the outer
+/// scan and the inner side's `HashAggregate` any join of the unique-ified
+/// side reads. A side read through an index is not priced.
+fn hash_semi_join_of(a: HashSide, b: HashSide) -> Option<(JoinEstimate, Option<Estimate>)> {
+    use secantus_pgplan::joincost::{self, JoinSide, KeyStats};
+    const CPU_OPERATOR_COST: f64 = 0.0025;
+    const CPU_TUPLE_COST: f64 = 0.01;
+    if a.pg_type != b.pg_type
+        || a.index.is_some()
+        || b.index.is_some()
+        || a.key_indexed
+        || b.key_indexed
+    {
+        return None;
+    }
+    fn key(s: &HashSide) -> KeyStats<'_> {
+        KeyStats {
+            ndistinct: s.stats.0,
+            default_ndistinct: false,
+            null_frac: s.stats.1,
+            mcv: &s.stats.2,
+        }
+    }
+    let (ka, kb) = (key(&a), key(&b));
+    let side = |s: &HashSide| JoinSide {
+        rows: s.scan.2,
+        tuples: s.tuples,
+        scan: (s.scan.0, s.scan.1),
+        startup_scan: (s.scan.0, s.scan.1),
+        ordered: None,
+        scan_ordered: false,
+        unique: false,
+        ndistinct: s.stats.0,
+        default_ndistinct: false,
+        key_ops: 0.0,
+        rel_rows: s.scan.2,
+        width: Some(s.scan.3),
+        extra: joincost::ExtraKeys::default(),
+    };
+    let (outer, inner) = (side(&a), side(&b));
+    let nselec = joincost::eqjoinsel_inner(&ka, &kb);
+    let jselec = joincost::eqjoinsel_semi(&ka, &kb, inner.rows);
+    let match_count = if jselec > 0.0 {
+        (nselec * inner.rows / jselec).max(1.0)
+    } else {
+        1.0
+    };
+    let (startup, total) =
+        joincost::hash_semi_join(&outer, &inner, nselec, (jselec, match_count), &[kb]);
+    let sorts = joincost::cost_sort(a.scan.1, a.scan.2, a.scan.3, None).0
+        + joincost::cost_sort(b.scan.1, b.scan.2, b.scan.3, None).0;
+    // A nested loop's unmatched outer rows read the whole inner side, its
+    // matched ones `2 / (match_count + 1)` of it (`initial_cost_nestloop`).
+    let matched = (outer.rows * jselec).round();
+    let scanned = (outer.rows - matched) + matched * 2.0 / (match_count + 1.0);
+    let nest_loop = a.scan.1 + b.scan.1 + scanned * CPU_OPERATOR_COST * inner.rows;
+    // The inner join of the inner side made unique on its key
+    // (`create_unique_path`, a `HashAggregate`: `cost_agg`'s AGG_HASHED,
+    // one grouping column). Hashed, it is `inner_unique`, which
+    // `final_cost_hashjoin` prices as a semi join is priced, over the
+    // aggregate's rows; the outer side hashed, a plain hash join. A merge
+    // must still sort the outer side, and a nested loop evaluates the
+    // clause on every pair of rows: bounds of those.
+    let groups = costsize::clamp_row_est(b.stats.0.min(inner.rows));
+    let agg_startup = b.scan.1 + CPU_OPERATOR_COST * inner.rows;
+    let agg = (agg_startup, agg_startup + CPU_TUPLE_COST * groups);
+    let bounds = [
+        joincost::cost_sort(a.scan.1, a.scan.2, a.scan.3, None).0 + agg.1,
+        a.scan.1 + agg.1 + outer.rows * groups * CPU_OPERATOR_COST,
+    ];
+    let unique = JoinSide {
+        rows: groups,
+        scan: agg,
+        startup_scan: agg,
+        rel_rows: groups,
+        ..side(&b)
+    };
+    let (u_startup, via_unique) =
+        joincost::hash_semi_join(&outer, &unique, nselec, (jselec, match_count), &[kb]);
+    // The outer side hashed under the aggregate's rows: an inner join on
+    // a side not known unique (one that is is not modelled here).
+    if a.unique {
+        return None;
+    }
+    let (_, outer_hashed) = joincost::hash_join_stats(&unique, &outer, nselec, &[ka]);
+    // `add_path` keeps the cheapest; ties go to the path added first, the
+    // semi join.
+    let via = via_unique < total;
+    let (startup, total) = if via {
+        (u_startup, via_unique)
+    } else {
+        (startup, total)
+    };
+    if total >= sorts
+        || total >= nest_loop
+        || total >= outer_hashed
+        || bounds.iter().any(|b| total >= *b)
+    {
+        return None;
+    }
+    let rows = costsize::clamp_row_est(outer.rows * jselec);
+    Some((
+        (
+            a.scan,
+            b.scan,
+            (startup, total, rows, a.above),
+            JoinPick::Hash { swap: false },
+            [a.index, b.index],
+        ),
+        via.then_some((agg.0, agg.1, groups, b.scan.3)),
+    ))
+}
 
 /// The Hash Anti Join of `a`, the preserved side, to `b` hashed (RP-908):
 /// `final_cost_hashjoin`'s JOIN_ANTI over `compute_semi_anti_join_factors`

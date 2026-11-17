@@ -21861,3 +21861,40 @@ def test_create_table_records_its_constraint_indexes_as_built(home: Path) -> Non
             ("rp921_f_pkey", 1, 0.0),
             ("rp921_p1a_pkey", 1, 0.0),
         ]
+
+
+def test_a_limit_over_a_join_with_a_joined_right_side_stops_early(tmp_path: Path) -> None:
+    """A LIMIT over a nested loop whose inner side is itself a join stops
+    after the rows it wants, as PostgreSQL's executor does. The join built a
+    whole batch of outer rows against the inner side's 4,500 rows before the
+    LIMIT saw one, growing the server by 9 GB (a debug build) and ending the
+    CI runner (snapshot PR #2794's `backlog_fixed` step)."""
+    with _Server(tmp_path) as server, server.connect() as conn:
+        for statement in [
+            "create table e (a int, b text)",
+            "insert into e select g, 'v' || (g % 10) from generate_series(1, 1000) g",
+            "create table zs (a int, b text)",
+            "insert into zs select g, 'x' from generate_series(1, 10) g",
+            "analyze e",
+            "analyze zs",
+        ]:
+            conn.execute(statement)
+        assert server.proc is not None
+
+        def rss_kb() -> int:
+            out = subprocess.run(
+                ["ps", "-o", "rss=", "-p", str(server.proc.pid)],  # type: ignore[union-attr]
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            return int(out.stdout.strip())
+
+        before = rss_kb()
+        rows = conn.execute(
+            "select e.a, e3.a, zs.a, e4.a from e join e e3 on e.a < e3.a"
+            " join zs on e3.a > zs.a join e e4 on e4.a < zs.a limit 7 offset 3"
+        ).fetchall()
+        assert len(rows) == 7
+        # Bounded rows built: tens of megabytes at most, never gigabytes.
+        assert rss_kb() - before < 512 * 1024

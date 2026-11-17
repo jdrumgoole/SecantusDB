@@ -3697,10 +3697,47 @@ fn filter_kind_and_ops(c: &pg_query::protobuf::Node, scope: &Scope) -> (FilterKi
     let Some(casts) = cast_cost(c, scope) else {
         return (FilterKind::Other, ops);
     };
+    let Some(calls) = call_cost(c) else {
+        return (FilterKind::Other, ops);
+    };
+    let ops = ops + calls;
     match not_equal_cast(c, scope) {
         Some((kind, coercions)) => (kind, ops + (casts + coercions) as f64),
         None => (filter_kind(c), ops + casts as f64),
     }
+}
+
+/// What `cost_qual_eval` charges a row for the calls in `n`: each call
+/// reading a column its function's `procost` (`cost_qual_eval_walker`'s
+/// FuncExpr). A call reading none is folded to a constant by
+/// `eval_const_expressions` and costs nothing. `None` where a call's
+/// `procost` is not known whatever overload it resolves to, or it is not
+/// one [`plain_call_procost`] prices.
+fn call_cost(n: &pg_query::protobuf::Node) -> Option<f64> {
+    fn has_column(n: &pg_query::protobuf::Node) -> bool {
+        let mut found = false;
+        let mut node = n.clone();
+        let _ = walk_expr(&mut node, &mut |x| {
+            found |= matches!(x.node.as_ref(), Some(N::ColumnRef(_)));
+            Ok(())
+        });
+        found
+    }
+    let mut total = Some(0.0);
+    let mut node = n.clone();
+    let _ = walk_expr(&mut node, &mut |x| {
+        let Some(N::FuncCall(f)) = x.node.as_ref() else {
+            return Ok(());
+        };
+        let cost = plain_call_procost(f);
+        let reads = f.args.iter().any(has_column);
+        total = match (total, cost) {
+            (Some(t), Some(c)) => Some(if reads { t + c } else { t }),
+            _ => None,
+        };
+        Ok(())
+    });
+    total
 }
 
 /// `c` as a `<>` (or IS DISTINCT FROM) between two operands that are each
@@ -3937,7 +3974,7 @@ pub struct KeyBound {
 /// and that may be an index qual's operand: not VOLATILE
 /// (`match_clause_to_indexcol`), not a user's function, and a plain call
 /// -- no aggregate or window decoration, no VARIADIC, no named argument.
-fn plain_call_procost(f: &pg_query::protobuf::FuncCall) -> Option<f64> {
+pub(crate) fn plain_call_procost(f: &pg_query::protobuf::FuncCall) -> Option<f64> {
     if f.agg_star
         || f.agg_distinct
         || f.func_variadic
@@ -5704,6 +5741,9 @@ fn alias_of(
                 }
             }
             Some(N::AConst(_)) | Some(N::ParamRef(_)) => true,
+            // An InitPlan's output is a parameter, fixed before the scan
+            // (RP-440); set only while EXPLAIN places its quals.
+            Some(N::SubLink(s)) if crate::ruleutils::is_init_plan(s) => true,
             Some(N::TypeCast(t)) => t.arg.as_deref().is_some_and(&mut rec),
             Some(N::AExpr(e)) => {
                 e.lexpr.as_deref().is_none_or(&mut rec) && e.rexpr.as_deref().is_none_or(&mut rec)

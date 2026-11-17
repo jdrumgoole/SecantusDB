@@ -17,6 +17,15 @@ const RANDOM_PAGE_COST: f64 = 4.0;
 pub const CPU_TUPLE_COST: f64 = 0.01;
 const CPU_INDEX_TUPLE_COST: f64 = 0.005;
 pub const CPU_OPERATOR_COST: f64 = 0.0025;
+
+/// `costsize.c`'s `LOG2(x)`: `log(x) / 0.693147180559945`, whose truncated
+/// divisor leaves `LOG2(2)` a hair above 1 -- enough to move a cost's
+/// last printed digit (`Sort (cost=0.01..0.02)` over no rows, RP-420).
+pub fn pg_log2(x: f64) -> f64 {
+    #[allow(clippy::approx_constant)]
+    let ln2 = 0.693147180559945;
+    x.ln() / ln2
+}
 const STD_FUZZ_FACTOR: f64 = 1.01;
 /// `DEFAULT_PAGE_CPU_MULTIPLIER`: a B-tree page descended, in operators.
 const PAGE_CPU_MULTIPLIER: f64 = 50.0;
@@ -811,7 +820,7 @@ pub fn index_order_beats_sort(
 ) -> bool {
     let (_, input) = cheapest_scan_path(rel, indexes, quals, ndistinct, rows);
     let n = rows.max(2.0);
-    let sort_startup = input + 2.0 * CPU_OPERATOR_COST * n * n.log2();
+    let sort_startup = input + 2.0 * CPU_OPERATOR_COST * n * pg_log2(n);
     let sort_total = sort_startup + CPU_OPERATOR_COST * rows;
     let (startup, total) = ordered_index_scan(rel, index, quals, ndistinct(&index.field));
     if total * STD_FUZZ_FACTOR < sort_total {
@@ -1133,7 +1142,7 @@ pub fn sorted_grouping_wins_over(
         _ => {
             let resort = if ordered {
                 let g = groups.max(2.0);
-                2.0 * CPU_OPERATOR_COST * g * g.log2() + CPU_OPERATOR_COST * groups
+                2.0 * CPU_OPERATOR_COST * g * pg_log2(g) + CPU_OPERATOR_COST * groups
             } else {
                 0.0
             };
@@ -1219,7 +1228,7 @@ fn grouping_costs(
     let hash_startup = input_total + a.trans_per_tuple * rows + cols;
     let hash_total = hash_startup + a.final_per_group * groups + CPU_TUPLE_COST * groups;
     let n = rows.max(2.0);
-    let sort_startup = input_total + 2.0 * CPU_OPERATOR_COST * n * n.log2();
+    let sort_startup = input_total + 2.0 * CPU_OPERATOR_COST * n * pg_log2(n);
     let sort_total = sort_startup + CPU_OPERATOR_COST * rows;
     let group_total = sort_total
         + cols

@@ -27,10 +27,10 @@
 //!
 //! The estimates are PostgreSQL's: a leaf's groups are `estimate_num_groups`
 //! over its select list on its own row estimate, and a nested set
-//! operation's are its rows. An input this server does not estimate -- a
-//! join, a WHERE the selectivity model does not cover, an aggregate, a
-//! FROM subquery other than VALUES, a catalog -- leaves the left input
-//! first, as before (RP-841).
+//! operation's are its rows, as are a DISTINCT leaf's. An input this
+//! server does not estimate -- a join with a WHERE, a WHERE the
+//! selectivity model does not cover, a HAVING, a FROM subquery other than
+//! VALUES, a catalog -- leaves the left input first, as before (RP-841).
 
 use super::*;
 use pgwire::api::results::FieldInfo;
@@ -183,6 +183,32 @@ impl PgHandler {
                 Some(values_groups(&vc.types, vc.rows.len() as f64))
             }
             Statement::Select(sel) => self.select_input_estimate(sel),
+            // An aggregated input's groups are its rows (`*pNumGroups =
+            // subpath->rows` under `hasAggs` or a GROUP BY): a plain
+            // aggregate's one row, or `estimate_num_groups` of the
+            // GROUP BY's columns over one user table's scan.
+            Statement::Aggregate(agg) => {
+                if agg.sub.is_some()
+                    || agg.join.is_some()
+                    || agg.series.is_some()
+                    || agg.grouping_sets.is_some()
+                    || agg.having.is_some()
+                    || agg.limit.is_some()
+                    || agg.offset != 0
+                    || agg.distinct
+                    || agg.group_by.iter().any(|k| k.expr.is_some())
+                {
+                    return None;
+                }
+                let rows = if agg.group_by.is_empty() {
+                    1.0
+                } else {
+                    let fields: Vec<String> =
+                        agg.group_by.iter().map(|k| k.field.clone()).collect();
+                    self.distinct_groups(&agg.table, &agg.filter, &fields)?
+                };
+                Some(InputEstimate { rows, groups: rows })
+            }
             _ => None,
         }
     }
@@ -191,9 +217,24 @@ impl PgHandler {
     /// over a FROM VALUES list, with nothing above the scan that changes
     /// its rows or groups.
     fn select_input_estimate(&self, sel: &secantus_pgplan::Select) -> Option<InputEstimate> {
-        if sel.residual.is_some()
+        // A DISTINCT input's groups are its rows (`*pNumGroups =
+        // subpath->rows` under a `distinctClause`): the Unique's or
+        // HashAggregate's `estimate_num_groups` over the select list, which
+        // is the leaf's own group estimate.
+        if matches!(sel.distinct, secantus_pgplan::Distinct::All) {
+            let mut plain = sel.clone();
+            plain.distinct = secantus_pgplan::Distinct::None;
+            let e = self.select_input_estimate(&plain)?;
+            return Some(InputEstimate {
+                rows: e.groups,
+                groups: e.groups,
+            });
+        }
+        // A comma join's residual is its re-checked key equality, which
+        // `join_input_estimate` reads itself.
+        let comma_join = sel.join.is_none() && sel.sub.is_some();
+        if (sel.residual.is_some() && !comma_join)
             || sel.series.is_some()
-            || sel.join.is_some()
             || !sel.windows.is_empty()
             || sel.limit.is_some()
             || sel.offset != 0
@@ -204,6 +245,12 @@ impl PgHandler {
             return None;
         }
         let fields: Vec<String> = sel.columns.iter().map(|(_, f)| f.clone()).collect();
+        if let Some((rows, groups)) = self.join_input_estimate(sel) {
+            return Some(InputEstimate { rows, groups });
+        }
+        if sel.residual.is_some() {
+            return None;
+        }
         if let Some(sub) = &sel.sub {
             // `(VALUES ...) v(x)` is pulled up into the leaf as its
             // RTE_VALUES, whose Vars `get_variable_numdistinct` takes as

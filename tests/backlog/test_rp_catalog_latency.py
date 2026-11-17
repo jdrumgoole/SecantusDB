@@ -8,8 +8,9 @@ query psql sends for `\\d <table>`.
 
 from __future__ import annotations
 
+import statistics
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import Any
 
@@ -94,16 +95,6 @@ def test_the_first_catalog_query_after_ddl_costs_what_the_next_does(pg: Any) -> 
     )
 
 
-@pytest.fixture
-def pg_alone(tmp_path: Path) -> Iterator[Any]:
-    """A connection to a `secantusd-pg` of the test's own, whose schema no
-    other test's tables enlarge."""
-    from tests.test_rust_pgserver_slice import _Server
-
-    with _Server(tmp_path) as server, server.connect() as conn:
-        yield conn
-
-
 #: User tables added between the two measurements.
 GROWTH_TABLES = 400
 
@@ -125,29 +116,56 @@ def pg_pair(tmp_path: Path) -> Iterator[tuple[Any, Any]]:
         yield small, large
 
 
-def _alternating_firsts(
-    small: Any, large: Any, prefix: str, rounds: int = 5
-) -> tuple[float, float]:
-    """The fastest of `rounds` first runs of the collation query straight
-    after a `CREATE TABLE` on each connection, the two taking turns: runs
-    taken one server after the other met the machine's load at different
-    times, and a load that rose between them failed a server that had
-    not slowed (2026-11-13)."""
-    firsts: dict[str, list[float]] = {"small": [], "large": []}
-    for i in range(rounds):
-        for side, conn in (("small", small), ("large", large)):
-            table = f"{prefix}_{side}_{i}"
-            conn.execute(f'CREATE TABLE {table} (v text COLLATE "C")')
-            query = COLLATION_QUERY.replace("'rp_cx'", f"'{table}'")
-            start = time.monotonic()
-            assert conn.execute(query).fetchall() == [("v", "C")]
-            firsts[side].append(time.monotonic() - start)
-    return min(firsts["small"]), min(firsts["large"])
+#: Rounds each paired timing takes.
+ROUNDS = 15
+
+
+def _paired(
+    small: Any, large: Any, run: Callable[[Any, str], float], prefix: str
+) -> list[tuple[float, float]]:
+    """`ROUNDS` timings of `run` on each connection, taken in pairs back to
+    back so the machine's load meets both alike: a minimum taken over each
+    server's runs apart let a load that rose or fell between them flip the
+    verdict either way (2026-11-13; CI on 2026-11-14, -15 and -17)."""
+    pairs = []
+    for i in range(ROUNDS):
+        pairs.append((run(small, f"{prefix}_s_{i}"), run(large, f"{prefix}_l_{i}")))
+    return pairs
+
+
+def _median_excess(pairs: list[tuple[float, float]], factor: float) -> float:
+    """The median over the rounds of how far the large server's run went
+    past `factor` times its pair's: one noisy round, on either side, cannot
+    move it."""
+    return statistics.median(large - factor * small for small, large in pairs)
+
+
+def _describe(pairs: list[tuple[float, float]], what: str, tables: int) -> str:
+    small = statistics.median(s for s, _ in pairs)
+    large = statistics.median(big for _, big in pairs)
+    return (
+        f"{what}: median {small * 1000:.1f} ms with no other table, "
+        f"{large * 1000:.1f} ms with {tables}"
+    )
+
+
+def _first_collation(conn: Any, table: str) -> float:
+    """The collation query's first run straight after a `CREATE TABLE`."""
+    conn.execute(f'CREATE TABLE {table} (v text COLLATE "C")')
+    query = COLLATION_QUERY.replace("'rp_cx'", f"'{table}'")
+    start = time.monotonic()
+    assert conn.execute(query).fetchall() == [("v", "C")]
+    return time.monotonic() - start
+
+
+def _grow(conn: Any, prefix: str, tables: int) -> None:
+    for i in range(tables):
+        conn.execute(f"CREATE TABLE {prefix}_grow_{i} (a int, b text)")
 
 
 @pytest.mark.backlog_fixed("RP-715")
 def test_the_first_catalog_query_after_ddl_does_not_grow_with_the_schema(
-    pg_alone: Any,
+    pg_pair: tuple[Any, Any],
 ) -> None:
     """PostgreSQL 15.19 answers the first collation query after a `CREATE
     TABLE` in the same time however many other tables there are (0.33 ms
@@ -162,16 +180,17 @@ def test_the_first_catalog_query_after_ddl_does_not_grow_with_the_schema(
     copied the definitions several times over. Since then a debug build
     takes about 0.011 s with none and 0.023 s with 400.
 
-    The fastest first-after-DDL run with 400 more tables against the
-    fastest with none, in one server."""
-    small, _ = _first_and_warm(pg_alone, "rp715a")
-    for i in range(GROWTH_TABLES):
-        pg_alone.execute(f"CREATE TABLE rp715_grow_{i} (a int, b text)")
-    large, _ = _first_and_warm(pg_alone, "rp715b")
-    assert large < 2 * small + 0.01, (
-        f"first query after DDL {small * 1000:.0f} ms with no other table, "
-        f"{large * 1000:.0f} ms with {GROWTH_TABLES}"
-    )
+    A server with 400 more tables against one with none, within twice
+    plus 10 ms.
+
+    Measured as 15 paired rounds (`_paired`), the median of the large
+    server's run less twice times its pair's under 10 ms (2026-11-17: the
+    minima of each server's runs taken apart let CI's noise flip verdicts,
+    PRs #2732, #2744, #2769 and #2794)."""
+    small, large = pg_pair
+    _grow(large, "rp715", GROWTH_TABLES)
+    pairs = _paired(small, large, _first_collation, "rp715a")
+    assert _median_excess(pairs, 2) < 0.01, _describe(pairs, "first query after DDL", GROWTH_TABLES)
 
 
 @pytest.mark.backlog_fixed("RP-911")
@@ -190,8 +209,8 @@ def test_the_first_catalog_query_after_ddl_costs_the_same_at_800_tables(
     `pg_attribute` read decodes its own relation's composite alone, about
     0.010 s and 0.014 s (2026-11-13).
 
-    The fastest of five first-after-DDL runs on a server with 800 more
-    tables against the fastest on one with none, taking turns, within
+    The first-after-DDL run on a server with 800 more tables against one
+    with none, within
     twice plus 2 ms: the growth this guards against was more than three
     times (0.011 s against 0.036 s), and what is left of it is the next
     test's. Half again plus 2 ms failed CI on 2026-11-14 at 24 ms and
@@ -204,14 +223,17 @@ def test_the_first_catalog_query_after_ddl_costs_the_same_at_800_tables(
     whose runs are about three times slower (29 ms and 41 ms, PR #2716):
     the ratio is about 1.4 on both, so the absolute term is kept small.
     Until the same day the two were measured one after the other on one
-    server, and a machine loaded by another build failed it twice in six."""
-    small_conn, large_conn = pg_pair
-    for i in range(2 * GROWTH_TABLES):
-        large_conn.execute(f"CREATE TABLE rp911_grow_{i} (a int, b text)")
-    small, large = _alternating_firsts(small_conn, large_conn, "rp911a")
-    assert large < 2 * small + 0.002, (
-        f"first query after DDL {small * 1000:.0f} ms with no other table, "
-        f"{large * 1000:.0f} ms with {2 * GROWTH_TABLES}"
+    server, and a machine loaded by another build failed it twice in six.
+
+    Measured as 15 paired rounds (`_paired`), the median of the large
+    server's run less twice times its pair's under 2 ms (2026-11-17: the
+    minima of each server's runs taken apart let CI's noise flip verdicts,
+    PRs #2732, #2744, #2769 and #2794)."""
+    small, large = pg_pair
+    _grow(large, "rp911", 2 * GROWTH_TABLES)
+    pairs = _paired(small, large, _first_collation, "rp911a")
+    assert _median_excess(pairs, 2) < 0.002, _describe(
+        pairs, "first query after DDL", 2 * GROWTH_TABLES
     )
 
 
@@ -230,32 +252,35 @@ def test_the_first_catalog_query_after_ddl_costs_the_same_at_800_tables_within_a
     table's index list and the relations for `regclass`, for each catalog
     version, and its own catalog reads cost about 1 ms more.
 
-    The fastest of five first-after-DDL runs on a server with 800 more
-    tables against the fastest on one with none, taking turns, within a
+    The first-after-DDL run on a server with 800 more tables against one
+    with none, within a
     tenth again plus 1 ms: the growth the previous test's bound still
-    allows (about 3.5 ms) fails it by more than a millisecond."""
-    small_conn, large_conn = pg_pair
-    for i in range(2 * GROWTH_TABLES):
-        large_conn.execute(f"CREATE TABLE rp911_grow_{i} (a int, b text)")
-    small, large = _alternating_firsts(small_conn, large_conn, "rp911c")
-    assert large < 1.1 * small + 0.001, (
-        f"first query after DDL {small * 1000:.1f} ms with no other table, "
-        f"{large * 1000:.1f} ms with {2 * GROWTH_TABLES}"
+    allows (about 3.5 ms) fails it by more than a millisecond.
+
+    Measured as 15 paired rounds (`_paired`), the median of the large
+    server's run less 1.1 times its pair's under 1 ms (2026-11-17: the
+    minima of each server's runs taken apart let CI's noise flip verdicts,
+    PRs #2732, #2744, #2769 and #2794).
+    The fastest of five passed CI on 2026-11-17 (PR #2794) while a debug
+    build here measured a ratio of 1.23 to 1.29 in ten of ten runs of
+    fifteen rounds, by minimum and by median alike."""
+    small, large = pg_pair
+    _grow(large, "rp911", 2 * GROWTH_TABLES)
+    pairs = _paired(small, large, _first_collation, "rp911c")
+    assert _median_excess(pairs, 1.1) < 0.001, _describe(
+        pairs, "first query after DDL", 2 * GROWTH_TABLES
     )
 
 
-def _fastest_create(pg: Any, prefix: str) -> float:
-    """The fastest of five `CREATE TABLE`s."""
-    times = []
-    for i in range(5):
-        start = time.monotonic()
-        pg.execute(f'CREATE TABLE {prefix}_{i} (v text COLLATE "C")')
-        times.append(time.monotonic() - start)
-    return min(times)
+def _create(conn: Any, table: str) -> float:
+    """One `CREATE TABLE`."""
+    start = time.monotonic()
+    conn.execute(f'CREATE TABLE {table} (v text COLLATE "C")')
+    return time.monotonic() - start
 
 
 @pytest.mark.backlog_fixed("RP-921")
-def test_create_table_costs_the_same_at_400_tables(pg_alone: Any) -> None:
+def test_create_table_costs_the_same_at_400_tables(pg_pair: tuple[Any, Any]) -> None:
     """PostgreSQL 15.19 runs a `CREATE TABLE` in the same time however many
     other tables there are (0.41 ms with none, 0.37 ms with 800, private
     cluster, 2026-11-13). A debug `secantusd-pg` took about 1.4 ms with
@@ -267,40 +292,41 @@ def test_create_table_costs_the_same_at_400_tables(pg_alone: Any) -> None:
     decoded the whole catalog too. With both reading only what they need,
     1.2 ms and 5.9 ms (RP-928 holds the rest).
 
-    The fastest of five with 400 more tables against the fastest with none,
-    in one server, within four times plus 5 ms: the growth this guards
+    A server with 400 more tables against one with none, within
+    four times plus 5 ms: the growth this guards
     against was about thirty times. Half again plus 5 ms failed CI on
     2026-11-14 at 2.6 ms and 9.7 ms (PR #2744) and passed the same commits
     on a rerun: CI runs about three times slower than a laptop, so the
     residual growth RP-928 holds already fills most of a fixed 5 ms
-    there."""
-    small = _fastest_create(pg_alone, "rp_ct_a")
-    for i in range(GROWTH_TABLES):
-        pg_alone.execute(f"CREATE TABLE rp_ct_grow_{i} (a int, b text)")
-    large = _fastest_create(pg_alone, "rp_ct_b")
-    assert large < 4 * small + 0.005, (
-        f"CREATE TABLE {small * 1000:.1f} ms with no other table, "
-        f"{large * 1000:.1f} ms with {GROWTH_TABLES}"
-    )
+    there.
+
+    Measured as 15 paired rounds (`_paired`), the median of the large
+    server's run less four times its pair's under 5 ms (2026-11-17: the
+    minima of each server's runs taken apart let CI's noise flip verdicts,
+    PRs #2732, #2744, #2769 and #2794)."""
+    small, large = pg_pair
+    _grow(large, "rp_ct", GROWTH_TABLES)
+    pairs = _paired(small, large, _create, "rp_ct")
+    assert _median_excess(pairs, 4) < 0.005, _describe(pairs, "CREATE TABLE", GROWTH_TABLES)
 
 
-def _fastest_first_over_two_types(pg: Any, prefix: str) -> float:
-    """The fastest of five first runs of the collation query straight after
-    a `CREATE TABLE` of an `int` and a `text` column."""
-    times = []
-    for i in range(5):
-        table = f"{prefix}_{i}"
-        pg.execute(f"CREATE TABLE {table} (a int, b text)")
+def _first_over_columns(columns: str) -> Callable[[Any, str], float]:
+    """The collation query's first run straight after a `CREATE TABLE` of
+    two columns `a` and `b` of `columns`, neither with a collation."""
+
+    def run(conn: Any, table: str) -> float:
+        conn.execute(f"CREATE TABLE {table} ({columns})")
         query = COLLATION_QUERY.replace("'rp_cx'", f"'{table}'")
         start = time.monotonic()
-        assert pg.execute(query).fetchall() == [("a", None), ("b", None)]
-        times.append(time.monotonic() - start)
-    return min(times)
+        assert conn.execute(query).fetchall() == [("a", None), ("b", None)]
+        return time.monotonic() - start
+
+    return run
 
 
 @pytest.mark.backlog_fixed("RP-927")
 def test_the_first_catalog_query_after_ddl_over_two_column_types_costs_the_same_at_400_tables(
-    pg_alone: Any,
+    pg_pair: tuple[Any, Any],
 ) -> None:
     """PostgreSQL 15.19 answers the collation query for a table of an `int`
     and a `text` column, straight after its `CREATE TABLE`, in the same time
@@ -313,19 +339,24 @@ def test_the_first_catalog_query_after_ddl_over_two_column_types_costs_the_same_
     type with its owner from all of `pg_class`.
 
     The fastest of five with 400 more tables against the fastest with none,
-    in one server, within half again plus 5 ms."""
-    small = _fastest_first_over_two_types(pg_alone, "rp_tt_a")
-    for i in range(GROWTH_TABLES):
-        pg_alone.execute(f"CREATE TABLE rp_tt_grow_{i} (a int, b text)")
-    large = _fastest_first_over_two_types(pg_alone, "rp_tt_b")
-    assert large < 1.5 * small + 0.005, (
-        f"first query after DDL {small * 1000:.1f} ms with no other table, "
-        f"{large * 1000:.1f} ms with {GROWTH_TABLES}"
+    within half again plus 5 ms.
+
+    Measured as 15 paired rounds (`_paired`), the median of the large
+    server's run less 1.5 times its pair's under 5 ms (2026-11-17: the
+    minima of each server's runs taken apart let CI's noise flip verdicts,
+    PRs #2732, #2744, #2769 and #2794)."""
+    small, large = pg_pair
+    _grow(large, "rp_tt", GROWTH_TABLES)
+    pairs = _paired(small, large, _first_over_columns("a int, b text"), "rp_tt")
+    assert _median_excess(pairs, 1.5) < 0.005, _describe(
+        pairs, "first query after DDL", GROWTH_TABLES
     )
 
 
 @pytest.mark.backlog_fixed("RP-928")
-def test_create_table_costs_the_same_at_800_tables_within_a_tenth(pg_alone: Any) -> None:
+def test_create_table_costs_the_same_at_800_tables_within_a_tenth(
+    pg_pair: tuple[Any, Any],
+) -> None:
     """PostgreSQL 15.19 runs a `CREATE TABLE` in the same time however many
     other tables there are (0.41 ms with none, 0.37 ms with 800, private
     cluster, 2026-11-13): it finds a clashing relation by name through
@@ -339,40 +370,27 @@ def test_create_table_costs_the_same_at_800_tables_within_a_tenth(pg_alone: Any)
     relation's key (2026-11-15: 2.9 ms to 1.6 ms with 800, nineteen of
     twenty runs alone within the bound at a load average near 13).
 
-    The fastest of five with 800 more tables against the fastest with none,
-    in one server, within twice plus 2 ms. As the gap test it held a tenth
+    A server with 800 more tables against one with none, within
+    twice plus 2 ms. As the gap test it held a tenth
     again plus 1 ms, which measured the growth then left (about 5x); kept as
     the regression bound once RP-928 closed, it failed CI on 2026-11-15 at
     1.8 ms and 3.2 ms (rm snapshot PR #2769, a shared-storage change that
     does not scale with tables): a millisecond under CI load is noise.
-    Twice plus 2 ms still catches a return of that growth."""
-    small = _fastest_create(pg_alone, "rp_ct8_a")
-    for i in range(2 * GROWTH_TABLES):
-        pg_alone.execute(f"CREATE TABLE rp_ct8_grow_{i} (a int, b text)")
-    large = _fastest_create(pg_alone, "rp_ct8_b")
-    assert large < 2 * small + 0.002, (
-        f"CREATE TABLE {small * 1000:.1f} ms with no other table, "
-        f"{large * 1000:.1f} ms with {2 * GROWTH_TABLES}"
-    )
+    Twice plus 2 ms still catches a return of that growth.
 
-
-def _fastest_first_over_two_enums(pg: Any, prefix: str) -> float:
-    """The fastest of five first runs of the collation query straight after
-    a `CREATE TABLE` of two columns of two user enums."""
-    times = []
-    for i in range(5):
-        table = f"{prefix}_{i}"
-        pg.execute(f"CREATE TABLE {table} (a rp_e1, b rp_e2)")
-        query = COLLATION_QUERY.replace("'rp_cx'", f"'{table}'")
-        start = time.monotonic()
-        assert pg.execute(query).fetchall() == [("a", None), ("b", None)]
-        times.append(time.monotonic() - start)
-    return min(times)
+    Measured as 15 paired rounds (`_paired`), the median of the large
+    server's run less twice times its pair's under 2 ms (2026-11-17: the
+    minima of each server's runs taken apart let CI's noise flip verdicts,
+    PRs #2732, #2744, #2769 and #2794)."""
+    small, large = pg_pair
+    _grow(large, "rp_ct8", 2 * GROWTH_TABLES)
+    pairs = _paired(small, large, _create, "rp_ct8")
+    assert _median_excess(pairs, 2) < 0.002, _describe(pairs, "CREATE TABLE", 2 * GROWTH_TABLES)
 
 
 @pytest.mark.backlog("RP-970")
 def test_the_first_catalog_query_after_ddl_over_two_user_types_costs_the_same_at_400_tables(
-    pg_alone: Any,
+    pg_pair: tuple[Any, Any],
 ) -> None:
     """PostgreSQL 15.19 answers the collation query for a table of two
     columns of two user enums, straight after its `CREATE TABLE`, in the
@@ -382,15 +400,19 @@ def test_the_first_catalog_query_after_ddl_over_two_user_types_costs_the_same_at
     79 ms with 400 (2026-11-14): a key of a user type builds every user
     type, and the second one in a message cycle builds every row.
 
-    The bound is RP-927's: the fastest of five with 400 more tables against
-    the fastest with none, within half again plus 5 ms."""
-    pg_alone.execute("CREATE TYPE rp_e1 AS ENUM ('x')")
-    pg_alone.execute("CREATE TYPE rp_e2 AS ENUM ('y')")
-    small = _fastest_first_over_two_enums(pg_alone, "rp_te_a")
-    for i in range(GROWTH_TABLES):
-        pg_alone.execute(f"CREATE TABLE rp_te_grow_{i} (a int, b text)")
-    large = _fastest_first_over_two_enums(pg_alone, "rp_te_b")
-    assert large < 1.5 * small + 0.005, (
-        f"first query after DDL {small * 1000:.1f} ms with no other table, "
-        f"{large * 1000:.1f} ms with {GROWTH_TABLES}"
+    The bound is RP-927's: a server with 400 more tables against one with
+    none, within half again plus 5 ms.
+
+    Measured as 15 paired rounds (`_paired`), the median of the large
+    server's run less 1.5 times its pair's under 5 ms (2026-11-17: the
+    minima of each server's runs taken apart let CI's noise flip verdicts,
+    PRs #2732, #2744, #2769 and #2794)."""
+    small, large = pg_pair
+    for conn in pg_pair:
+        conn.execute("CREATE TYPE rp_e1 AS ENUM ('x')")
+        conn.execute("CREATE TYPE rp_e2 AS ENUM ('y')")
+    _grow(large, "rp_te", GROWTH_TABLES)
+    pairs = _paired(small, large, _first_over_columns("a rp_e1, b rp_e2"), "rp_te")
+    assert _median_excess(pairs, 1.5) < 0.005, _describe(
+        pairs, "first query after DDL", GROWTH_TABLES
     )

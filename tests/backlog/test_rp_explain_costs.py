@@ -1390,7 +1390,7 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
     # Still open: a function call in a join filter costs its `procost` a
     # pair; here it is priced as nothing.
     "nested loop left join with a function call in its join filter": (
-        "RP-910",
+        "RP-910:fixed",
         _ANALYSED,
         "explain select * from e left join e e2 on e.a < abs(e2.a)",
         [
@@ -4435,7 +4435,7 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
     # Nodes above a dummy relation are still priced, and its Result keeps
     # a join's width (found while working RP-409).
     "an aggregate over a dummy relation is priced": (
-        "RP-420",
+        "RP-420:fixed",
         _ANALYSED,
         "explain select count(*) from e where a = null",
         [
@@ -4445,10 +4445,100 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
         ],
     ),
     "a dummy join keeps its width": (
-        "RP-420",
+        "RP-420:fixed",
         _ANALYSED,
         "explain select * from e, k where e.a = null",
         ["Result  (cost=0.00..0.00 rows=0 width=14)", "  One-Time Filter: false"],
+    ),
+    # Only the columns the join carries count; one table made dummy is
+    # width 0, excluded before `set_rel_width` (measured on 15.19).
+    "a dummy join keeps the width of what it carries": (
+        "RP-420:fixed",
+        _ANALYSED,
+        "explain select e.b from e, k where e.a = null",
+        ["Result  (cost=0.00..0.00 rows=0 width=3)", "  One-Time Filter: false"],
+    ),
+    "a dummy relation alone is width zero": (
+        "RP-420:fixed",
+        _ANALYSED,
+        "explain select * from e where a = null",
+        ["Result  (cost=0.00..0.00 rows=0 width=0)", "  One-Time Filter: false"],
+    ),
+    "a sort over a dummy relation is priced": (
+        "RP-420:fixed",
+        _ANALYSED,
+        "explain select * from e where a = null order by b",
+        [
+            "Sort  (cost=0.01..0.02 rows=0 width=36)",
+            "  Sort Key: b",
+            "  ->  Result  (cost=0.00..0.00 rows=0 width=0)",
+            "        One-Time Filter: false",
+        ],
+    ),
+    # PostgreSQL 15.19 prices any plain aggregate over a dummy relation
+    # (`cost_agg` AGG_PLAIN over no rows): a sum's transition and final
+    # functions, not only a count's (found while working RP-420).
+    "a sum over a dummy relation is priced": (
+        "RP-420:fixed",
+        _ANALYSED,
+        "explain select sum(a) from e where a = null",
+        [
+            "Aggregate  (cost=0.00..0.01 rows=1 width=8)",
+            "  ->  Result  (cost=0.00..0.00 rows=0 width=0)",
+            "        One-Time Filter: false",
+        ],
+    ),
+    # Each result type's width, duplicate aggregates kept in the width
+    # (found while working RP-420).
+    "an avg, a min and a max over a dummy relation are priced": (
+        "RP-420:fixed",
+        _ANALYSED,
+        "explain select avg(a), min(b), max(a) from e where a = null",
+        [
+            "Aggregate  (cost=0.00..0.01 rows=1 width=68)",
+            "  ->  Result  (cost=0.00..0.00 rows=0 width=0)",
+            "        One-Time Filter: false",
+        ],
+    ),
+    "repeated aggregates over a dummy relation are priced": (
+        "RP-420:fixed",
+        _ANALYSED,
+        "explain select sum(a), avg(a), avg(a), avg(a), avg(a), avg(a) from e where a = null",
+        [
+            "Aggregate  (cost=0.00..0.01 rows=1 width=168)",
+            "  ->  Result  (cost=0.00..0.00 rows=0 width=0)",
+            "        One-Time Filter: false",
+        ],
+    ),
+    "a count over a dummy join is priced": (
+        "RP-420:fixed",
+        _ANALYSED,
+        "explain select count(*) from e x join e y on x.a = y.a where x.a = null",
+        [
+            "Aggregate  (cost=0.00..0.01 rows=1 width=8)",
+            "  ->  Result  (cost=0.00..0.00 rows=0 width=0)",
+            "        One-Time Filter: false",
+        ],
+    ),
+    "a sum over a dummy join keeps the join's width": (
+        "RP-420:fixed",
+        _ANALYSED,
+        "explain select sum(x.a), max(y.b) from e x join e y on x.a = y.a where x.a = null",
+        [
+            "Aggregate  (cost=0.00..0.01 rows=1 width=40)",
+            "  ->  Result  (cost=0.00..0.00 rows=0 width=7)",
+            "        One-Time Filter: false",
+        ],
+    ),
+    "an update of a dummy relation keeps its result's width": (
+        "RP-420:fixed",
+        _ANALYSED,
+        "explain update e set b = 'x' where a = null",
+        [
+            "Update on e  (cost=0.00..0.00 rows=0 width=0)",
+            "  ->  Result  (cost=0.00..0.00 rows=0 width=38)",
+            "        One-Time Filter: false",
+        ],
     ),
     # `eval_const_expressions` folds a COALESCE's constant arguments
     # (found while working RP-409).
@@ -4464,8 +4554,8 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
         "explain (costs off) select * from e where coalesce(1, a) = 1",
         ["Seq Scan on e"],
     ),
-    # `pull_up_subqueries` merges a simple FROM-subquery into its parent
-    # (found while working RP-409).
+    # `pull_up_subqueries` merged a simple FROM-subquery into its parent
+    # (found while working RP-409, fixed by RP-422).
     "a plain from-subquery is pulled up": (
         "RP-422",
         _ANALYSED,
@@ -4476,7 +4566,7 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
     # as `$0`; in a join's ON it is pushed to the scan it constrains (found
     # while working RP-438).
     "an uncorrelated subquery is an initplan": (
-        "RP-440",
+        "RP-440:fixed",
         _ANALYSED,
         "explain select * from e where b = (select 'v3'::text)",
         [
@@ -4486,8 +4576,35 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "    ->  Result  (cost=0.00..0.01 rows=1 width=32)",
         ],
     ),
+    # Each sublink is its own InitPlan, numbered in order; an inequality
+    # to an unknown value is DEFAULT_INEQ_SEL, `<>` the complement of
+    # `var_eq_non_const` (measured on 15.19).
+    "two uncorrelated subqueries are two initplans": (
+        "RP-440:fixed",
+        _ANALYSED,
+        "explain select * from e where a > (select 5) and b = (select 'v3'::text)",
+        [
+            "Seq Scan on e  (cost=0.02..20.02 rows=33 width=7)",
+            "  Filter: ((a > $0) AND (b = $1))",
+            "  InitPlan 1 (returns $0)",
+            "    ->  Result  (cost=0.00..0.01 rows=1 width=4)",
+            "  InitPlan 2 (returns $1)",
+            "    ->  Result  (cost=0.00..0.01 rows=1 width=32)",
+        ],
+    ),
+    "an initplan beside a constant qual": (
+        "RP-440:fixed",
+        _ANALYSED,
+        "explain select a, b from e where a > 5 and b <> (select 'v3'::text)",
+        [
+            "Seq Scan on e  (cost=0.01..20.01 rows=896 width=7)",
+            "  Filter: ((a > 5) AND (b <> $0))",
+            "  InitPlan 1 (returns $0)",
+            "    ->  Result  (cost=0.00..0.01 rows=1 width=32)",
+        ],
+    ),
     "a join's on subquery is an initplan on its scan": (
-        "RP-440",
+        "RP-440:fixed",
         _ANALYSED,
         "explain (costs off) select * from e left join k"
         " on e.a = k.a and k.b = (select 'v3'::text)",
@@ -4502,10 +4619,53 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "              Filter: (b = $0)",
         ],
     ),
+    # A node above an InitPlan's scan was priced, the InitPlan's cost on
+    # the top node only, measured on 15.19 (RP-440, fixed).
+    "a sort above an initplan's scan is priced": (
+        "RP-440:fixed",
+        _ANALYSED,
+        "explain select a from e where b = (select 'v3'::text) order by a",
+        [
+            "Sort  (cost=20.83..21.08 rows=100 width=4)",
+            "  Sort Key: e.a",
+            "  InitPlan 1 (returns $0)",
+            "    ->  Result  (cost=0.00..0.01 rows=1 width=32)",
+            "  ->  Seq Scan on e  (cost=0.00..17.50 rows=100 width=4)",
+            "        Filter: (b = $0)",
+        ],
+    ),
+    # An aggregate over an InitPlan's scan had a Subquery Scan between
+    # them, measured on 15.19 (RP-440, fixed).
+    "an aggregate over an initplan's scan is not a subquery scan": (
+        "RP-440:fixed",
+        _ANALYSED,
+        "explain select count(*) from e where b = (select 'v3'::text)",
+        [
+            "Aggregate  (cost=17.76..17.77 rows=1 width=8)",
+            "  InitPlan 1 (returns $0)",
+            "    ->  Result  (cost=0.00..0.01 rows=1 width=32)",
+            "  ->  Seq Scan on e  (cost=0.00..17.50 rows=100 width=0)",
+            "        Filter: (b = $0)",
+        ],
+    ),
+    # A Limit over an InitPlan's scan is priced, the InitPlan's cost on the
+    # top node only, measured on 15.19 (RP-440).
+    "a limit above an initplan's scan is priced": (
+        "RP-440",
+        _ANALYSED,
+        "explain select a from e where b = (select 'v3'::text) limit 5",
+        [
+            "Limit  (cost=0.01..0.89 rows=5 width=4)",
+            "  InitPlan 1 (returns $0)",
+            "    ->  Result  (cost=0.00..0.01 rows=1 width=32)",
+            "  ->  Seq Scan on e  (cost=0.00..17.50 rows=100 width=4)",
+            "        Filter: (b = $0)",
+        ],
+    ),
     # A table whose only index is a composite one, its WHERE constraining
     # both columns (found while working RP-399).
     "a table's only index composite": (
-        "RP-410",
+        "RP-410:fixed",
         [
             "create table t2 (a int, b int, c text)",
             "insert into t2 select g, g % 50, 'x' || (g % 7) from generate_series(1, 5000) g",
@@ -4518,11 +4678,182 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "  Index Cond: ((a = 15) AND (b = 3))",
         ],
     ),
-    # An IN or EXISTS subquery pulled up into a semi join
+    # An IN or EXISTS subquery was pulled up into a semi join
     # (`convert_ANY_sublink_to_join`, `convert_EXISTS_sublink_to_join`;
-    # found while working RP-399).
-    "an in subquery is a hash semi join": (
+    # found while working RP-399). Aliases print on the Hash Cond and
+    # scans, `= any` is IN, and an inner side unique on its column is an
+    # inner join (`reduce_unique_semijoins`, still open), measured on 15.19.
+    "an = any subquery over an alias is a hash semi join": (
+        "RP-411:fixed",
+        _ANALYSED_THIRTY,
+        "explain (costs off) select * from e x where a = any (select a from s)",
+        [
+            "Hash Semi Join",
+            "  Hash Cond: (x.a = s.a)",
+            "  ->  Seq Scan on e x",
+            "  ->  Hash",
+            "        ->  Seq Scan on s",
+        ],
+    ),
+    "an exists subquery over an alias is a hash semi join": (
+        "RP-411:fixed",
+        _ANALYSED_THIRTY,
+        "explain (costs off) select * from e where exists (select 1 from s t where e.a = t.a)",
+        [
+            "Hash Semi Join",
+            "  Hash Cond: (e.a = t.a)",
+            "  ->  Seq Scan on e",
+            "  ->  Hash",
+            "        ->  Seq Scan on s t",
+        ],
+    ),
+    "a hash semi join is priced": (
+        "RP-411:fixed",
+        _ANALYSED_THIRTY,
+        "explain select * from e where a in (select a from s)",
+        [
+            "Hash Semi Join  (cost=1.68..19.63 rows=30 width=7)",
+            "  Hash Cond: (e.a = s.a)",
+            "  ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
+            "  ->  Hash  (cost=1.30..1.30 rows=30 width=4)",
+            "        ->  Seq Scan on s  (cost=0.00..1.30 rows=30 width=4)",
+        ],
+    ),
+    # The inner side the larger, and text keys with MCV lists
+    # (`eqjoinsel_semi`'s MCV branch), measured on 15.19 (RP-411).
+    "a hash semi join over the larger inner side is priced": (
+        "RP-411:fixed",
+        _ANALYSED_THIRTY,
+        "explain select * from s where a in (select a from e)",
+        [
+            "Hash Semi Join  (cost=27.50..29.21 rows=30 width=20)",
+            "  Hash Cond: (s.a = e.a)",
+            "  ->  Seq Scan on s  (cost=0.00..1.30 rows=30 width=20)",
+            "  ->  Hash  (cost=15.00..15.00 rows=1000 width=4)",
+            "        ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=4)",
+        ],
+    ),
+    "a hash semi join on text keys with mcv lists is priced": (
+        "RP-411:fixed",
+        _ANALYSED_THIRTY,
+        "explain select * from e where b in (select c from s)",
+        [
+            "Hash Semi Join  (cost=1.68..30.43 rows=1000 width=7)",
+            "  Hash Cond: (e.b = s.c)",
+            "  ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
+            "  ->  Hash  (cost=1.30..1.30 rows=30 width=16)",
+            "        ->  Seq Scan on s  (cost=0.00..1.30 rows=30 width=16)",
+        ],
+    ),
+    # Cheaper as the inner join of the inner side made unique
+    # (`create_unique_path`), which `add_path` kept, measured on 15.19.
+    "a semi join cheaper unique-ified is a hash join over a hashaggregate": (
+        "RP-411:fixed",
+        _ANALYSED_THIRTY,
+        "explain select * from e where b in (select b from k)",
+        [
+            "Hash Join  (cost=17.73..46.48 rows=1000 width=7)",
+            "  Hash Cond: (e.b = k.b)",
+            "  ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
+            "  ->  Hash  (cost=17.60..17.60 rows=10 width=3)",
+            "        ->  HashAggregate  (cost=17.50..17.60 rows=10 width=3)",
+            "              Group Key: k.b",
+            "              ->  Seq Scan on k  (cost=0.00..15.00 rows=1000 width=3)",
+        ],
+    ),
+    # The sublink ANDed with a qual over the outer relation, which filters
+    # its scan, was printed as the scan, measured on 15.19 (RP-411, fixed).
+    "a sublink anded with an outer qual is planned as a join": (
+        "RP-411:fixed",
+        _ANALYSED_THIRTY,
+        "explain select * from e where b in (select b from k) and a > 5",
+        [
+            "Hash Join  (cost=17.73..48.91 rows=995 width=7)",
+            "  Hash Cond: (e.b = k.b)",
+            "  ->  Seq Scan on e  (cost=0.00..17.50 rows=995 width=7)",
+            "        Filter: (a > 5)",
+            "  ->  Hash  (cost=17.60..17.60 rows=10 width=3)",
+            "        ->  HashAggregate  (cost=17.50..17.60 rows=10 width=3)",
+            "              Group Key: k.b",
+            "              ->  Seq Scan on k  (cost=0.00..15.00 rows=1000 width=3)",
+        ],
+    ),
+    # The sublink ANDed with an outer qual over a unique inner column: the
+    # inner join `reduce_unique_semijoins` makes of it, its outer side
+    # filtered, measured on 15.19.
+    "a unique in subquery anded with an outer qual is an inner join": (
+        "RP-411:fixed",
+        _ANALYSED_THIRTY,
+        "explain select * from e where a in (select a from k) and b = 'v3'",
+        [
+            "Hash Join  (cost=18.75..38.50 rows=100 width=7)",
+            "  Hash Cond: (k.a = e.a)",
+            "  ->  Seq Scan on k  (cost=0.00..15.00 rows=1000 width=4)",
+            "  ->  Hash  (cost=17.50..17.50 rows=100 width=7)",
+            "        ->  Seq Scan on e  (cost=0.00..17.50 rows=100 width=7)",
+            "              Filter: (b = 'v3'::text)",
+        ],
+    ),
+    # An EXISTS ANDed with an outer qual, measured on 15.19.
+    "an exists anded with an outer qual is planned as a join": (
+        "RP-411:fixed",
+        _ANALYSED_THIRTY,
+        "explain select * from e where exists (select 1 from k where k.b = e.b) and a < 100",
+        [
+            "Hash Join  (cost=17.73..36.59 rows=99 width=7)",
+            "  Hash Cond: (e.b = k.b)",
+            "  ->  Seq Scan on e  (cost=0.00..17.50 rows=99 width=7)",
+            "        Filter: (a < 100)",
+            "  ->  Hash  (cost=17.60..17.60 rows=10 width=3)",
+            "        ->  HashAggregate  (cost=17.50..17.60 rows=10 width=3)",
+            "              Group Key: k.b",
+            "              ->  Seq Scan on k  (cost=0.00..15.00 rows=1000 width=3)",
+        ],
+    ),
+    # An outer qual over an expression beside the sublink: its scan's
+    # filter is priced with the expression's cost, measured on 15.19.
+    "a sublink anded with an outer expression qual is planned as a join": (
         "RP-411",
+        _ANALYSED_THIRTY,
+        "explain select * from e where b in (select b from k) and length(b) > 1 and a > 5",
+        [
+            "Hash Join  (cost=17.73..44.79 rows=332 width=7)",
+            "  Hash Cond: (e.b = k.b)",
+            "  ->  Seq Scan on e  (cost=0.00..22.50 rows=332 width=7)",
+            "        Filter: ((a > 5) AND (length(b) > 1))",
+            "  ->  Hash  (cost=17.60..17.60 rows=10 width=3)",
+            "        ->  HashAggregate  (cost=17.50..17.60 rows=10 width=3)",
+            "              Group Key: k.b",
+            "              ->  Seq Scan on k  (cost=0.00..15.00 rows=1000 width=3)",
+        ],
+    ),
+    # Planned as the inner join `reduce_unique_semijoins` makes of it.
+    "an in subquery over a unique column is an inner join": (
+        "RP-411:fixed",
+        _ANALYSED_THIRTY,
+        "explain (costs off) select * from e where a in (select a from k)",
+        [
+            "Hash Join",
+            "  Hash Cond: (e.a = k.a)",
+            "  ->  Seq Scan on e",
+            "  ->  Hash",
+            "        ->  Seq Scan on k",
+        ],
+    ),
+    "an exists subquery over a unique column is priced as an inner join": (
+        "RP-411:fixed",
+        _ANALYSED_THIRTY,
+        "explain select * from e where exists (select 1 from k where k.a = e.a)",
+        [
+            "Hash Join  (cost=27.50..45.14 rows=1000 width=7)",
+            "  Hash Cond: (e.a = k.a)",
+            "  ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
+            "  ->  Hash  (cost=15.00..15.00 rows=1000 width=4)",
+            "        ->  Seq Scan on k  (cost=0.00..15.00 rows=1000 width=4)",
+        ],
+    ),
+    "an in subquery is a hash semi join": (
+        "RP-411:fixed",
         _ANALYSED_THIRTY,
         "explain (costs off) select * from e where a in (select a from s)",
         [
@@ -4534,7 +4865,7 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
         ],
     ),
     "an exists subquery is a hash semi join": (
-        "RP-411",
+        "RP-411:fixed",
         _ANALYSED_THIRTY,
         "explain (costs off) select * from e where exists (select 1 from s where s.a = e.a)",
         [
@@ -4827,7 +5158,7 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
     # inner scan of it is priced a little high, more so the fewer the
     # loops. (Its wide range is `test_a_wide_range_over_a_weakly_correlated_index`.)
     "nested loop into a weakly correlated index": (
-        "RP-926",
+        "RP-926:fixed",
         _ANALYSED_INDEXED_SMALL,
         "explain select * from e join k2 on e.a < k2.y",
         [
@@ -4838,7 +5169,7 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
         ],
     ),
     "nested loop of few rows into a weakly correlated index": (
-        "RP-926",
+        "RP-926:fixed",
         _ANALYSED_INDEXED_SMALL,
         "explain select * from z join k2 on z.a < k2.y",
         [
@@ -4915,10 +5246,11 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
         ],
     ),
     # Four tables under a LIMIT: PostgreSQL keeps a bushy tree, the
-    # Materialize of one join the inner of another (RP-919). Here the chain
-    # runs in its written order, unpriced. Measured on PostgreSQL 15.19.
+    # Materialize of one join the inner of another (RP-919, fixed: the
+    # chain ran in its written order, unpriced). Measured on PostgreSQL
+    # 15.19.
     "a bushy chain of inequality joins under a limit": (
-        "RP-919",
+        "RP-919:fixed",
         _ANALYSED_SMALL,
         "explain select e.a, e3.a, zs.a, e4.a from e join e e3 on e.a < e3.a"
         " join zs on e3.a > zs.a join e e4 on e4.a < zs.a limit 5",
@@ -4926,6 +5258,34 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "Limit  (cost=0.00..0.23 rows=5 width=16)",
             "  ->  Nested Loop  (cost=0.00..16680190.29 rows=370370000 width=16)",
             "        Join Filter: (e3.a > zs.a)",
+            "        ->  Nested Loop  (cost=0.00..15032.50 rows=333333 width=8)",
+            "              Join Filter: (e.a < e3.a)",
+            "              ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=4)",
+            "              ->  Materialize  (cost=0.00..20.00 rows=1000 width=4)",
+            "                    ->  Seq Scan on e e3  (cost=0.00..15.00 rows=1000 width=4)",
+            "        ->  Materialize  (cost=0.00..182.79 rows=3333 width=8)",
+            "              ->  Nested Loop  (cost=0.00..166.12 rows=3333 width=8)",
+            "                    Join Filter: (e4.a < zs.a)",
+            "                    ->  Seq Scan on e e4  (cost=0.00..15.00 rows=1000 width=4)",
+            "                    ->  Materialize  (cost=0.00..1.15 rows=10 width=4)",
+            "                          ->  Seq Scan on zs  (cost=0.00..1.10 rows=10 width=4)",
+        ],
+    ),
+    # The bushy chain with a second clause in the last ON, `e4.a > e.a`:
+    # PostgreSQL places each clause, not each ON, on the lowest join
+    # holding its tables, so `e4.a < zs.a` stays on `e4 join zs` and
+    # `e4.a > e.a` joins `e3.a > zs.a` on the top (RP-919, fixed: the ON
+    # moved whole, the tree was refused, and the chain ran in its written
+    # order, unpriced). Measured on PostgreSQL 15.19.
+    "a bushy chain whose last ON splits across two joins": (
+        "RP-919:fixed",
+        _ANALYSED_SMALL,
+        "explain select e.a, e3.a, zs.a, e4.a from e join e e3 on e.a < e3.a"
+        " join zs on e3.a > zs.a join e e4 on e4.a < zs.a and e4.a > e.a limit 5",
+        [
+            "Limit  (cost=0.00..0.79 rows=5 width=16)",
+            "  ->  Nested Loop  (cost=0.00..19457687.52 rows=123456667 width=16)",
+            "        Join Filter: ((e4.a > e.a) AND (e3.a > zs.a))",
             "        ->  Nested Loop  (cost=0.00..15032.50 rows=333333 width=8)",
             "              Join Filter: (e.a < e3.a)",
             "              ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=4)",
@@ -5154,7 +5514,7 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
     # over such a scan, each printed with no estimate (found while working
     # RP-404).
     "estimate of a function call compared with a constant": (
-        "RP-423",
+        "RP-423:fixed",
         _ANALYSED,
         "explain select * from e where abs(a) > 5",
         [
@@ -5162,8 +5522,29 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "  Filter: (abs(a) > 5)",
         ],
     ),
+    # A call whose result type differs from its argument's: the overload
+    # its argument selects (measured on 15.19).
+    "estimate of a call of another result type compared with a constant": (
+        "RP-423:fixed",
+        _ANALYSED,
+        "explain select * from e where length(b) > 2",
+        [
+            "Seq Scan on e  (cost=0.00..20.00 rows=333 width=7)",
+            "  Filter: (length(b) > 2)",
+        ],
+    ),
+    # `eval_const_expressions` folds an immutable call over constants.
+    "a call over constants in a where is folded": (
+        "RP-1021",
+        _ANALYSED,
+        "explain select * from e where abs(-3) < a",
+        [
+            "Seq Scan on e  (cost=0.00..17.50 rows=997 width=7)",
+            "  Filter: (3 < a)",
+        ],
+    ),
     "estimate of a LIKE over an expression": (
-        "RP-423",
+        "RP-423:fixed",
         _ANALYSED,
         "explain select * from e where lower(b) like 'v%'",
         [
@@ -5172,7 +5553,7 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
         ],
     ),
     "estimate of a LIKE over a table never analysed": (
-        "RP-423",
+        "RP-423:fixed",
         _ANALYSED_STRINGS,
         "explain select * from zu where c like 'x%'",
         [
@@ -5181,7 +5562,7 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
         ],
     ),
     "estimate of a join over a scan filtered by a LIKE": (
-        "RP-423",
+        "RP-423:fixed",
         _ANALYSED_THIRTY,
         "explain select * from e join s on s.a = e.a where s.c like 'xxx%'",
         [
@@ -5196,7 +5577,7 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
     # The same two shapes with a regex match, whose estimate RP-354 built:
     # still zeros (found while working RP-354).
     "estimate of a regex match over a table never analysed": (
-        "RP-423",
+        "RP-423:fixed",
         _ANALYSED_STRINGS,
         "explain select * from zu where c ~ 'ab'",
         [
@@ -5205,7 +5586,7 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
         ],
     ),
     "estimate of a join over a scan filtered by a regex match": (
-        "RP-423",
+        "RP-423:fixed",
         _ANALYSED_STRINGS,
         "explain select * from e join w on e.a = w.a where w.c ~ '^w00'",
         [
@@ -5215,6 +5596,173 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "  ->  Hash  (cost=18.50..18.50 rows=91 width=10)",
             "        ->  Seq Scan on w  (cost=0.00..18.50 rows=91 width=10)",
             "              Filter: (c ~ '^w00'::text)",
+        ],
+    ),
+    # A join's WHERE patterns reach its sides' scans (`explain_join_patterns`)
+    # with the table's alias, an unqualified column, an ILIKE and a NOT LIKE
+    # (RP-423).
+    "estimate of an aliased join over a scan filtered by an ilike": (
+        "RP-423:fixed",
+        _ANALYSED_STRINGS,
+        "explain select * from e x join w y on x.a = y.a where c ilike 'W01%'",
+        [
+            "Hash Join  (cost=19.76..39.52 rows=101 width=17)",
+            "  Hash Cond: (x.a = y.a)",
+            "  ->  Seq Scan on e x  (cost=0.00..15.00 rows=1000 width=7)",
+            "  ->  Hash  (cost=18.50..18.50 rows=101 width=10)",
+            "        ->  Seq Scan on w y  (cost=0.00..18.50 rows=101 width=10)",
+            "              Filter: (c ~~* 'W01%'::text)",
+        ],
+    ),
+    # A comparison of an expression with a constant pushed to a join's side
+    # is that scan's residual, priced as a lone scan's (RP-423).
+    "estimate of a join over a scan filtered by an arithmetic comparison": (
+        "RP-423:fixed",
+        _ANALYSED_STRINGS,
+        "explain select * from e join w on e.a = w.a where e.a + 1 > 996",
+        [
+            "Hash Join  (cost=24.16..47.24 rows=333 width=17)",
+            "  Hash Cond: (w.a = e.a)",
+            "  ->  Seq Scan on w  (cost=0.00..16.00 rows=1000 width=10)",
+            "  ->  Hash  (cost=20.00..20.00 rows=333 width=7)",
+            "        ->  Seq Scan on e  (cost=0.00..20.00 rows=333 width=7)",
+            "              Filter: ((a + 1) > 996)",
+        ],
+    ),
+    "estimate of a join over two scans each filtered by an arithmetic comparison": (
+        "RP-423:fixed",
+        _ANALYSED_STRINGS,
+        "explain select * from e join w on e.a = w.a where e.a + 1 > 996 and w.a * 2 < 1500",
+        [
+            "Hash Join  (cost=24.16..47.52 rows=111 width=17)",
+            "  Hash Cond: (w.a = e.a)",
+            "  ->  Seq Scan on w  (cost=0.00..21.00 rows=333 width=10)",
+            "        Filter: ((a * 2) < 1500)",
+            "  ->  Hash  (cost=20.00..20.00 rows=333 width=7)",
+            "        ->  Seq Scan on e  (cost=0.00..20.00 rows=333 width=7)",
+            "              Filter: ((a + 1) > 996)",
+        ],
+    ),
+    "estimate of a join over a scan filtered by a range and an arithmetic comparison": (
+        "RP-423:fixed",
+        _ANALYSED_STRINGS,
+        "explain select * from e join w on e.a = w.a where e.a + 1 > 996 and e.a < 999",
+        [
+            "Hash Join  (cost=26.66..49.74 rows=333 width=17)",
+            "  Hash Cond: (w.a = e.a)",
+            "  ->  Seq Scan on w  (cost=0.00..16.00 rows=1000 width=10)",
+            "  ->  Hash  (cost=22.50..22.50 rows=333 width=7)",
+            "        ->  Seq Scan on e  (cost=0.00..22.50 rows=333 width=7)",
+            "              Filter: ((a < 999) AND ((a + 1) > 996))",
+        ],
+    ),
+    # Fixed: a comma join's WHERE holds the join clause beside the
+    # expression comparison, re-checked above the join as one residual,
+    # and the scan carried the column only the comparison reads.
+    "estimate of a comma join over a scan filtered by a call": (
+        "RP-423:fixed",
+        _ANALYSED_STRINGS,
+        "explain select e.a from e, w where e.a = w.a and length(e.b) > 2",
+        [
+            "Hash Join  (cost=24.16..47.24 rows=333 width=4)",
+            "  Hash Cond: (w.a = e.a)",
+            "  ->  Seq Scan on w  (cost=0.00..16.00 rows=1000 width=4)",
+            "  ->  Hash  (cost=20.00..20.00 rows=333 width=4)",
+            "        ->  Seq Scan on e  (cost=0.00..20.00 rows=333 width=4)",
+            "              Filter: (length(b) > 2)",
+        ],
+    ),
+    "estimate of a comma join over a scan filtered by an arithmetic comparison": (
+        "RP-423:fixed",
+        _ANALYSED_STRINGS,
+        "explain select e.a from e, w where e.a = w.a and e.a + 1 > 996",
+        [
+            "Hash Join  (cost=24.16..47.24 rows=333 width=4)",
+            "  Hash Cond: (w.a = e.a)",
+            "  ->  Seq Scan on w  (cost=0.00..16.00 rows=1000 width=4)",
+            "  ->  Hash  (cost=20.00..20.00 rows=333 width=4)",
+            "        ->  Seq Scan on e  (cost=0.00..20.00 rows=333 width=4)",
+            "              Filter: ((a + 1) > 996)",
+        ],
+    ),
+    "an inner join's scan carries no column only its expression filter reads": (
+        "RP-423:fixed",
+        _ANALYSED_STRINGS,
+        "explain select e.a from e join w on e.a = w.a where length(e.b) > 2",
+        [
+            "Hash Join  (cost=24.16..47.24 rows=333 width=4)",
+            "  Hash Cond: (w.a = e.a)",
+            "  ->  Seq Scan on w  (cost=0.00..16.00 rows=1000 width=4)",
+            "  ->  Hash  (cost=20.00..20.00 rows=333 width=4)",
+            "        ->  Seq Scan on e  (cost=0.00..20.00 rows=333 width=4)",
+            "              Filter: (length(b) > 2)",
+        ],
+    ),
+    # Fixed in part of RP-423: a LEFT join whose WHERE filters its
+    # preserved side by an expression was printed with zeros; it is
+    # PostgreSQL's Hash Right Join over that filtered scan.
+    "estimate of a left join over a preserved scan filtered by a call": (
+        "RP-423:fixed",
+        _ANALYSED_STRINGS,
+        "explain select e.a from e left join w on e.a = w.a where length(e.b) > 2",
+        [
+            "Hash Right Join  (cost=24.16..47.24 rows=333 width=4)",
+            "  Hash Cond: (w.a = e.a)",
+            "  ->  Seq Scan on w  (cost=0.00..16.00 rows=1000 width=4)",
+            "  ->  Hash  (cost=20.00..20.00 rows=333 width=4)",
+            "        ->  Seq Scan on e  (cost=0.00..20.00 rows=333 width=4)",
+            "              Filter: (length(b) > 2)",
+        ],
+    ),
+    # Fixed with RP-423: a WHERE expression over both tables of an ON join
+    # is its Join Filter, which this server printed with zeros.
+    "estimate of a join filtered by an expression over both tables": (
+        "RP-423:fixed",
+        _ANALYSED_STRINGS,
+        "explain select e.a from e join w on e.a = w.a where e.a + w.a > 996",
+        [
+            "Hash Join  (cost=27.50..62.25 rows=333 width=4)",
+            "  Hash Cond: (w.a = e.a)",
+            "  Join Filter: ((e.a + w.a) > 996)",
+            "  ->  Seq Scan on w  (cost=0.00..16.00 rows=1000 width=4)",
+            "  ->  Hash  (cost=15.00..15.00 rows=1000 width=4)",
+            "        ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=4)",
+        ],
+    ),
+    "estimate of a join filtered by an expression comparison over both tables": (
+        "RP-423:fixed",
+        _ANALYSED_STRINGS,
+        "explain select e.a from e join w on e.a = w.a where e.a < w.a + 5",
+        [
+            "Hash Join  (cost=27.50..62.25 rows=333 width=4)",
+            "  Hash Cond: (w.a = e.a)",
+            "  Join Filter: (e.a < (w.a + 5))",
+            "  ->  Seq Scan on w  (cost=0.00..16.00 rows=1000 width=4)",
+            "  ->  Hash  (cost=15.00..15.00 rows=1000 width=4)",
+            "        ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=4)",
+        ],
+    ),
+    # Part of RP-423, fixed: a regex with a back reference, whose prefix
+    # walk was not modelled, printed zeros. The walk reads `\1` as a copy
+    # of the group, as the regex compiler does (prefix `ww`).
+    "estimate of a regex match with a back reference": (
+        "RP-423:fixed",
+        _ANALYSED_STRINGS,
+        "explain select * from w where c ~ '^(w)\\1'",
+        [
+            "Seq Scan on w  (cost=0.00..18.50 rows=1 width=10)",
+            "  Filter: (c ~ '^(w)\\1'::text)",
+        ],
+    ),
+    # Still open: a regex with a group repeated at least once, whose prefix
+    # walk is not modelled, prints zeros.
+    "estimate of a regex match with a repeated group": (
+        "RP-423",
+        _ANALYSED_STRINGS,
+        "explain select * from w where c ~ '^(w0)+1'",
+        [
+            "Seq Scan on w  (cost=0.00..18.50 rows=101 width=10)",
+            "  Filter: (c ~ '^(w0)+1'::text)",
         ],
     ),
     # Still open: a LIKE's ESCAPE is a `like_escape` call PostgreSQL folds
@@ -5977,6 +6525,7 @@ def _marked(name: str, item: str) -> Any:
         "RP-412",
         "RP-421",
         "RP-915",
+        "RP-422",
     )
     mark = pytest.mark.backlog_fixed if fixed else pytest.mark.backlog
     return pytest.param(name, marks=mark(item), id=name)
@@ -6081,12 +6630,12 @@ def test_an_index_only_scan_after_a_delete_and_vacuum(rust_pg: Any) -> None:
     ]
 
 
-@pytest.mark.backlog("RP-926")
+@pytest.mark.backlog_fixed("RP-926")
 def test_a_wide_range_over_a_weakly_correlated_index(rust_pg: Any) -> None:
     """PostgreSQL 15.19 scans the heap for a range of 290 of 1,000 rows of
-    a column `g % 100` under a non-unique index; this server prints the
-    index scan it reads, unpriced, once the table is committed (inside the
-    transaction that made it, it prints PostgreSQL's plan)."""
+    a column `g % 100` under a non-unique index; this server printed the
+    index scan it read, unpriced, once the table was committed: where the
+    cost model chose the sequential scan, EXPLAIN kept the storage's node."""
     steps = [
         "create table k2 (x int, y int)",
         "insert into k2 select g, g % 100 from generate_series(1, 1000) g",
@@ -6150,3 +6699,50 @@ def test_a_chain_of_inequality_joins_under_a_limit(rust_pg: Any) -> None:
     joined as written."""
     rows = _first_rows(fresh_db(_dsn(rust_pg)), _INEQUALITY_CHAIN + " limit 5", 5)
     assert [r[0] for r in rows] == [1, 1, 2, 1, 2]
+
+
+@pytest.mark.backlog_fixed("RP-919")
+def test_a_bushy_chain_runs_each_loop_outer_first(rust_pg: Any) -> None:
+    """PostgreSQL 15.19 runs the bushy chain's `e4 join zs` with `e4` as
+    the loop's outer, so past the first rows (`limit 7 offset 3`) the
+    pairs come `e4` by `e4`; the two-table join ran its written left,
+    `zs`, as the outer while EXPLAIN printed `e4` first."""
+    query = (
+        "select e.a, e3.a, zs.a, e4.a from e join e e3 on e.a < e3.a"
+        " join zs on e3.a > zs.a join e e4 on e4.a < zs.a limit 7 offset 3"
+    )
+    rows = _first_rows(fresh_db(_dsn(rust_pg)), query, 7)
+    assert rows == [
+        (1, 4, 3, 2),
+        (1, 5, 2, 1),
+        (1, 5, 3, 1),
+        (1, 5, 4, 1),
+        (1, 5, 3, 2),
+        (1, 5, 4, 2),
+        (1, 5, 4, 3),
+    ]
+
+
+@pytest.mark.backlog_fixed("RP-919")
+def test_a_bushy_chain_whose_on_splits_runs_each_clause_where_it_lands(
+    rust_pg: Any,
+) -> None:
+    """PostgreSQL 15.19 runs `e4.a < zs.a` on the lower `e4 join zs` and
+    `e4.a > e.a` with `e3.a > zs.a` on the top join, so `limit 7 offset 3`
+    returns these rows; the chain ran in its written order, an ON whole
+    on one join, and did not finish."""
+    query = (
+        "select e.a, e3.a, zs.a, e4.a from e join e e3 on e.a < e3.a"
+        " join zs on e3.a > zs.a join e e4 on e4.a < zs.a and e4.a > e.a"
+        " limit 7 offset 3"
+    )
+    rows = _first_rows(fresh_db(_dsn(rust_pg)), query, 7)
+    assert rows == [
+        (1, 5, 4, 3),
+        (1, 6, 3, 2),
+        (1, 6, 4, 2),
+        (1, 6, 5, 2),
+        (1, 6, 4, 3),
+        (1, 6, 5, 3),
+        (1, 6, 5, 4),
+    ]

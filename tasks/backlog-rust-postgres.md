@@ -1175,6 +1175,11 @@ one beside it.
       in two of four runs, so the remainder sits at its tenth's edge; a
       FIXED? from one run is not a fix, and a close needs it to pass
       every run.)
+      (2026-11-17: still open. Its gap test passed CI once more, PR #2794,
+      a min of five per server taken apart; a debug build here measured a
+      ratio of 1.23 to 1.29 in ten of ten runs of fifteen rounds. The test
+      now takes fifteen paired rounds and bounds their median, and failed
+      ten of ten serially and three of three under `-n 9`.)
       Backlog-ID: RP-911
       Verify: tests/backlog/test_rp_catalog_latency.py::test_the_first_catalog_query_after_ddl_costs_the_same_at_800_tables_within_a_tenth
 
@@ -1763,39 +1768,19 @@ a regression test.
       frequencies match (found while working RP-313).
       Verify: tests/backlog/test_rp_catalog_reads.py::test_a_catalog_columns_correlation_follows_the_heap
       Backlog-ID: RP-358
-- [ ] **An index over a weakly correlated column is mispriced as a nested
-      loop's inner, and read for a range PostgreSQL scans the heap for.**
-      `k2 (x int, y int)` holds `g % 100` in `y` for 1,000 rows, indexed
-      and analysed (both servers report the same `pg_stats` correlation,
-      `relpages` and `reltuples`). PostgreSQL 15.19 prices `explain select
-      * from e join k2 on e.a < k2.y` (`e` 1,000 rows) `cost=0.28..9483.50`;
-      here `0.28..9487.50`, the inner Index Scan the same to two places.
-      Over twenty outer rows (`z join k2 on z.a < k2.y`) the scan itself
-      differs: `cost=0.28..7.90` there, `0.28..8.10` here (the join
-      `225.85` against `229.85`), so `cost_index`'s cost across
-      `loop_count` scans (`index_pages_fetched`, the correlation's share
-      between its best and worst I/O) is the suspect. A range of the
-      column wide enough (`select * from k2 where y > 70`, 290 rows) is
-      PostgreSQL's `Seq Scan on k2 (cost=0.00..17.50 rows=290 width=8)`,
-      `Filter: (y > 70)`; here, once the table is committed, `Index Scan
-      using k2_y_idx`, priced zeros (inside the transaction that made it,
-      PostgreSQL's plan). A narrower one (`y > 90`) matches. One cause
-      for both is not established. Measured on a private 15.19 cluster (found while
-      working RP-354).
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[nested loop into a weakly correlated index], tests/backlog/test_rp_explain_costs.py::test_plan[nested loop of few rows into a weakly correlated index], tests/backlog/test_rp_explain_costs.py::test_a_wide_range_over_a_weakly_correlated_index
-      Backlog-ID: RP-926
-- [ ] **Some chains of inequality joins still run in their written
-      order.** A chain under a LIMIT (and OFFSET), or sorted by an ORDER BY
-      under one, runs in the order PostgreSQL's search keeps
-      (`scan_estimate::nest_loop_chain`) and EXPLAIN prices it. Still
-      written order, and unpriced: a bushy tree (four or more tables;
-      PostgreSQL 15.19 keeps `e join e3` as the outer of a Nested Loop whose
-      inner is a Materialize of `e4 join zs`, for `... join zs on e3.a >
-      zs.a join e e4 on e4.a < zs.a limit 5`), and a join two ONs land on
-      in the new tree (`reorder_nest_loop_chain` refuses it). Measured on a
-      private 15.19 cluster (found while working RP-354).
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a bushy chain of inequality joins under a limit]
-      Backlog-ID: RP-919
+- [ ] **A chain of inequality joins under a LIMIT runs far past the rows
+      it returns.** `select e.a, e3.a, zs.a, e4.a from e join e e3 on e.a <
+      e3.a join zs on e3.a > zs.a join e e4 on e4.a < zs.a limit 7 offset
+      3` (`e` 1,000 rows, `zs` 10) answers at once on PostgreSQL 15.19,
+      whose bushy `(e join e3) x Materialize (e4 join zs)` stops after ten
+      rows; here it runs in the same tree and takes 100-140 s on a debug
+      build (the two `test_a_bushy_chain_*` tests in
+      `tests/backlog/test_rp_explain_costs.py`), as though a loop's rows
+      were produced whole before the Limit reads them. The cause is not
+      established: count the rows each loop produces before naming one
+      (found while working RP-919).
+      Verify: none -- a performance budget; the two tests named above time it
+      Backlog-ID: RP-1020
 - [ ] **EXPLAIN VERBOSE prints no `Output` lists above a scan.** A plan
       that is one relation's scan prints as VERBOSE does (RP-925); any
       other node prints as without it: PostgreSQL 15.19 prints `explain
@@ -1825,17 +1810,6 @@ a regression test.
       15.19 cluster (found while working RP-925).
       Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a scan of an aliased relation]
       Backlog-ID: RP-967
-- [ ] **A function call in a nested loop's join filter is priced as
-      nothing.** `cost_qual_eval` charges a call its `procost` for every
-      pair the Join Filter checks: PostgreSQL 15.19 prints `select * from e
-      left join e e2 on e.a < abs(e2.a)` (`e`, `k` analysed, 1000 rows) as
-      `Nested Loop Left Join (cost=0.00..17532.50 rows=333333 width=14)`;
-      here `cost=0.00..15032.50`, the comparison alone. A cast in the same
-      place is priced (RP-354); a call needs its overload resolved by its
-      arguments' types to read its `procost`. Its rows are right. Measured
-      on a private 15.19 cluster (found while working RP-354).
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[nested loop left join with a function call in its join filter]
-      Backlog-ID: RP-910
 
 
 - [ ] **EXPLAIN ANALYZE's scan counters PostgreSQL prints that are still
@@ -1945,55 +1919,77 @@ a regression test.
       private 15.19 cluster (found while working RP-402).
       Verify: tests/backlog/test_rp_explain_costs.py::test_plan[an equivalence class's generated constant is the inner index's cond]
       Backlog-ID: RP-977
-- [ ] **EXPLAIN prints no estimate for a scan filtered by a function
-      call, a pattern over an expression, or a pattern over a table never
-      analysed.** Since RP-404 a comparison of integer or text
-      arithmetic with a constant, and a LIKE / ILIKE of an analysed string
-      column, are estimated as PostgreSQL 15.19 estimates them. Still
-      zeros: `select * from e where abs(a) > 5` (PostgreSQL `rows=333`,
-      `cost=0.00..20.00`: `abs` is one function of `procost` 1, which is
-      not modelled for any function), `lower(b) like 'v%'` (`rows=5`,
-      `patternsel` with no statistics), and over a table never analysed
-      `select * from zu where c like 'x%'` (`rows=6`, `cost=0.00..25.88`)
-      or `c ~ 'ab'` (`rows=254`). Since 2026-11-13 a regex match over an
-      analysed column is estimated (RP-354), from the fixed prefix
-      `regex_fixed_prefix` reads; one whose prefix walk is not modelled
-      (a group repeated other than at most once, an anchor inside a group,
-      a back reference, embedded options) still prints zeros. Only a
-      single relation's scan is estimated so: a join over such a scan
-      prints zeros throughout (`e join s on s.a = e.a where s.c like
-      'xxx%'` is PostgreSQL's `Hash Join (cost=1.74..20.78 rows=29
-      width=27)`; `where e.a + 1 > 996` instead, `cost=1.68..23.02
-      rows=10`; `e join w on e.a = w.a where w.c ~ '^w00'`,
-      `cost=19.64..39.30 rows=91`). Measured on a private 15.19 cluster
-      (found while working RP-404 and RP-354).
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[estimate of a function call compared with a constant], tests/backlog/test_rp_explain_costs.py::test_plan[estimate of a join over a scan filtered by a LIKE], tests/backlog/test_rp_explain_costs.py::test_plan[estimate of a LIKE over an expression], tests/backlog/test_rp_explain_costs.py::test_plan[estimate of a LIKE over a table never analysed], tests/backlog/test_rp_explain_costs.py::test_plan[estimate of a regex match over a table never analysed], tests/backlog/test_rp_explain_costs.py::test_plan[estimate of a join over a scan filtered by a regex match]
+- [ ] **EXPLAIN prints no estimate for a join over a scan filtered by an
+      expression.** Since RP-404 a comparison of integer or text arithmetic
+      with a constant, and a LIKE / ILIKE of an analysed string column, are
+      estimated as PostgreSQL 15.19 estimates them; a comparison of a
+      built-in call over columns and literals whose every overload is of
+      one `procost` (`expr_side` in `secantus-pgplan`); a pattern match of
+      such an expression (`lower(b) like 'v%'`, `rows=5`; `ExprQual::pattern`)
+      and a pattern over a table never analysed (`where_selectivity`).
+      Since 2026-11-13 a regex match over an analysed column is estimated
+      (RP-354), and since 2026-11-17 a join over a scan a LIKE / ILIKE or
+      regex match filters (the join's WHERE patterns collected by
+      `explain_join_patterns`). Still zeros: a call of a function whose
+      overloads differ in `procost`; a regex whose prefix walk is not
+      modelled (a group repeated other than at most once, an anchor inside
+      a group, embedded options). A back reference is walked as a copy of
+      the group it names since 2026-11-17, as the regex compiler copies it. Since 2026-11-17 an
+      inner ON join whose WHERE pushes expression comparisons to its sides
+      prices each side as that scan's residual
+      (`ExplainOptions::join_expr_quals`, `hash_side_with`), and since
+      2026-11-17 a comma join, whose residual holds the join clause beside
+      the comparison; neither scan carries a column only its comparison
+      reads; since 2026-11-17 a LEFT join whose WHERE compares only
+      preserved-side expressions (`preserved_exprs`), and an inner ON
+      join whose WHERE holds inequalities over both tables, its Join
+      Filter (`where_join_filters`). A regex with a repeated group
+      (`select * from w where c ~ '^(w0)+1'`) is `Seq Scan on w
+      (cost=0.00..18.50 rows=101 width=10)` there and zeros here. Measured
+      on the 15.19 reference on port 5415 (found while working RP-404 and
+      RP-354).
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[estimate of a regex match with a repeated group]
       Backlog-ID: RP-423
-- [ ] **A table whose only index is a composite one prices no scan of
-      both its columns.** `create table t2 (a int, b int, c text)`, 5,000
-      rows, `create index t2_ab on t2 (a, b)`, analysed: PostgreSQL 15.19
-      plans `select * from t2 where a = 15 and b = 3` as `Index Scan using
-      t2_ab on t2  (cost=0.28..8.30 rows=1 width=11)` with `Index Cond:
-      ((a = 15) AND (b = 3))`; here a `Seq Scan on t2  (cost=0.00..0.00
-      rows=0 width=0)`, no estimate at all. The same table with a second,
-      one-column index (`n` in the scenarios, `n_b` beside `n_ab`) is
-      planned as PostgreSQL plans it, and so is `where a = 15` alone. Its
-      rows are right; the order they come out in may not be. Measured on
-      a private 15.19 cluster (found while working RP-399).
-      Backlog-ID: RP-410
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a table's only index composite]
-- [ ] **EXPLAIN of an IN or EXISTS subquery prints `Filter: (...)`, not
-      PostgreSQL's semi join.** PostgreSQL 15.19 pulls `select * from e
-      where a in (select a from s)` and `... where exists (select 1 from s
-      where s.a = e.a)` up into a join (`convert_ANY_sublink_to_join`,
-      `convert_EXISTS_sublink_to_join`) and prints a `Hash Semi Join` on
-      `(e.a = s.a)` over `Seq Scan on e` and a Hash of `Seq Scan on s`;
-      here `Seq Scan on e` with `Filter: (...)`, and the subquery's own
-      scan, Filter included, is not printed. Related to the semi join
-      RP-131 names for `element_types`. Measured on a private 15.19
-      cluster (found while working RP-399).
+- [ ] **A call over constants in a WHERE is not folded in EXPLAIN.**
+      `eval_const_expressions` folds an immutable call whose arguments are
+      all constants: PostgreSQL 15.19 prints `explain select * from e where
+      abs(-3) < a` (`e` analysed, 1,000 rows) as `Seq Scan on e
+      (cost=0.00..17.50 rows=997 width=7)` with `Filter: (3 < a)`; here
+      `cost=0.00..0.00 rows=0 width=0` and `Filter: (abs('-3'::integer) <
+      a)`. The rows are right. Measured on the 15.19 reference on port 5415
+      (found while working RP-423).
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a call over constants in a where is folded]
+      Backlog-ID: RP-1021
+- [ ] **A semi join cheaper unique-ified keeps the semi join's shape.**
+      Since RP-411's first slice (2026-11-16) a WHERE that is one
+      uncorrelated `col IN (select col from t)` / `= any`, or one `EXISTS`
+      correlated by a single column equality, prints PostgreSQL 15.19's
+      `Hash Semi Join` shape (`secantus-pgplan/src/sublink_join.rs`, drawn
+      by `explain::semi_join_tree`); over an inner column a unique index
+      fixes it is planned as the inner join `reduce_unique_semijoins` makes
+      of it (`sublink_join::as_inner_join`, chosen in the server's EXPLAIN
+      arm by `unique_index_fixed`), costs included. The semi join is priced
+      (`PgHandler::semi_join_estimate`, `hash_semi_join_of`:
+      `eqjoinsel_semi` with its MCV branch, `final_cost_hashjoin`'s
+      JOIN_SEMI) where it beats the inner join of the unique-ified inner
+      side, hashed either way, and lower bounds of the merge and
+      nested-loop paths, and where the inner join of the unique-ified inner
+      side hashed over its `HashAggregate` is cheaper (`create_unique_path`,
+      its semi factors those of the base relation as
+      `compute_semi_anti_join_factors` takes them) it is planned and printed
+      as that `Hash Join`. Still open: (1) Merge and nested-loop semi
+      joins, the unique-ified side as the outer one, and a side read through
+      an index, are not priced. (2) Wider shapes still print the scan: a
+      sublink ANDed with an outer conjunct the scan's filter does not hold
+      whole (`select * from e where b in (select b from k) and length(b) >
+      1 and a > 5` is the unique-ified `Hash Join (cost=17.73..44.79 rows=332 width=7)`, its
+      scan `cost=0.00..22.50` with the expression's cost per row, on a
+      private 15.19 cluster), a subquery with its own WHERE, a cross-type
+      comparison. Conjuncts that lower wholly to the outer scan's filter
+      are pulled up with the sublink and filter that scan
+      (`sublink_join::split_where`).
       Backlog-ID: RP-411
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[an in subquery is a hash semi join], tests/backlog/test_rp_explain_costs.py::test_plan[an exists subquery is a hash semi join]
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a sublink anded with an outer expression qual is planned as a join]
 - [ ] **A hash join of two tables never analysed is unpriced, and its
       sides stay in written order.** `hash_side` prices a side only from
       `analysed_key`, which needs `pg_statistic` rows. PostgreSQL 15.19
@@ -2008,40 +2004,25 @@ a regression test.
       RP-435).
       Verify: tests/backlog/test_rp_dml_from.py::test_explain_prints_the_join
       Backlog-ID: RP-1019
-- [ ] **A node above a dummy relation prints no estimate, and a dummy
-      join no width.** Since RP-409 a WHERE that folds to constant false
-      plans a `Result` with `One-Time Filter: false`, costing nothing, as
-      PostgreSQL 15.19 does. Above it PostgreSQL still prices each node:
-      `explain select count(*) from e where a = null` is `Aggregate
-      (cost=0.00..0.01 rows=1 width=8)`, here `cost=0.00..0.00 rows=0
-      width=0`; a Sort over it `cost=0.01..0.02 rows=0 width=36`. A dummy
-      join's Result keeps the join's width (`select * from e, k where e.a
-      = null` is `rows=0 width=14`) and so does an UPDATE's (`width=38`);
-      here `width=0`. Measured on a private 15.19 cluster (found while
-      working RP-409).
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[an aggregate over a dummy relation is priced], tests/backlog/test_rp_explain_costs.py::test_plan[a dummy join keeps its width]
-      Backlog-ID: RP-420
-- [ ] **EXPLAIN of a plain FROM-subquery prints a Subquery Scan
-      PostgreSQL pulls up.** `pull_up_subqueries` merges a simple subquery
-      into its parent: `select * from (select * from e where a > 5) s` is
-      `Seq Scan on e` with `Filter: (a > 5)` on PostgreSQL 15.19; here
-      `Subquery Scan on s` over a `Seq Scan on e` that prints no Filter.
-      Its rows are right. Measured on a private 15.19 cluster (found while
-      working RP-409).
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a plain from-subquery is pulled up]
-      Backlog-ID: RP-422
-- [ ] **EXPLAIN prints an uncorrelated subquery inline, with no InitPlan
-      and no estimate.** PostgreSQL 15.19 plans `(select 'v3'::text)` as
-      an `InitPlan 1 (returns $0)` over a `Result`, run once, and the qual
-      reads `$0`: `explain select * from e where b = (select 'v3'::text)` is
-      `Seq Scan on e  (cost=0.01..17.51 rows=100 width=7)`, `Filter: (b =
-      $0)`, then the InitPlan. Here `Filter: (b = ( SELECT 'v3'::text AS
-      text))`, every cost zero, no InitPlan, in a WHERE as in a join. In a
-      join's ON (runnable since RP-438) the conjunct also stays in the
-      join's `Join Filter`, where PostgreSQL pushes it to `Seq Scan on k`'s
-      `Filter: (b = $0)`, inner and LEFT join alike. Its rows are right.
-      Measured on a private 15.19 cluster (found while working RP-438).
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[an uncorrelated subquery is an initplan], tests/backlog/test_rp_explain_costs.py::test_plan[a join's on subquery is an initplan on its scan]
+- [ ] **An aggregate above an InitPlan's scan is a Subquery Scan.** Since
+      RP-440's first slices (2026-11-16) a SELECT over one relation whose WHERE
+      compares columns with uncorrelated FROM-less scalar subqueries plans
+      each as an InitPlan on the top node, as PostgreSQL 15.19 does
+      (`secantus-pgplan/src/initplan.rs`, `$n` printed through
+      `ruleutils::with_init_plans`), and prices a plain Seq Scan over them
+      (`var_eq_non_const`, `DEFAULT_INEQ_SEL`), and a Sort above that scan
+      (keys qualified, as the InitPlan lengthens the range table); a join's
+      ON conjunct of that shape is placed in its side's scan as `Filter: (b =
+      $0)`, inner and LEFT join alike (`initplan::on_init_plans`). Counts
+      over the scan are an Aggregate straight over it, priced
+      (`PgHandler::init_plan_count_agg`). Still open: a subquery with a
+      FROM, a correlated one, or a sublink beside any other non-constant
+      qual is still printed inline (`select * from e where b = (select b
+      from k limit 1)`); a join's ON InitPlan is unpriced; other nodes above
+      the scan (Limit, Unique, a computed sort key, an aggregate other than
+      a count, a GROUP BY) are unpriced. Measured on a private 15.19
+      cluster.
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a limit above an initplan's scan is priced]
       Backlog-ID: RP-440
 
 ## Found by batch 54 (2026-10-24)
@@ -2164,16 +2145,6 @@ Measured on PostgreSQL 15.19 (the data-modifying WITH on a private cluster).
 
 ## Found while working RP-472 (2026-11-07)
 
-- [ ] **EXPLAIN of a user function in FROM prints no Function Scan.**
-      PostgreSQL 15.19 prints `Function Scan on fq` for `explain (costs
-      off) select * from fq()`, a scalar or a SETOF SQL function alike.
-      Here each prints `Subquery Scan on fq` over `Values Scan on
-      "*VALUES*"` (a scalar one printed `Result` until RP-474 made it a
-      row source): the call is answered at plan time and its rows planned
-      as a VALUES list. A built-in
-      (`generate_series`) already prints its Function Scan.
-      Backlog-ID: RP-475
-      Verify: tests/backlog/test_rp_from_function_scan.py::test_function_scan_plan
 
 ## Found while working RP-454 (2026-11-07)
 
@@ -2971,17 +2942,27 @@ sorted as `choose_hashed_setop` prices them, each group's row the first
 its first input gave.
 
 - [ ] **An INTERSECT over an input this server does not estimate keeps its
-      left input first.** `select a.x from t692j a join t692j b on a.k =
-      b.k intersect select 1.000` is `1.000` on PostgreSQL 15.19: the
-      join's estimated groups outnumber the constant's one, so the constant
-      is the HashSetOp's first input. Here it is `1.0`, the left input's:
-      `setop_input_estimate` estimates a constant, a VALUES list, one user
-      table's stored columns through a WHERE the selectivity model covers,
-      and a nested set operation, and leaves any other input -- a join, an
-      aggregate or GROUP BY, a DISTINCT, a computed column, a FROM
+      left input first.** `select distinct x from t692j intersect select
+      1.000` is `1.000` on PostgreSQL 15.19: the input's estimated groups
+      outnumber the constant's one, so the constant is the HashSetOp's
+      first input. Here it is `1.0`, the left input's, and the same for a
+      HAVING and for a join with a WHERE. `setop_input_estimate` estimates
+      a constant, a VALUES list, one user table's stored columns through a
+      WHERE the selectivity model covers, a nested set operation, an inner
+      join of user tables whose every clause is a column equality (ON or
+      WHERE) with no WHERE besides (`join_input_estimate`; three or more
+      tables, `join_chain_input_estimate`, only over tables never
+      analysed, each equivalence class's members joined in table order),
+      an aggregate over one user table with no HAVING, grouped by
+      plain columns or not, and (since 2026-11-17) a DISTINCT over any of
+      those leaves, its rows its groups. It leaves any other input -- a
+      join with a WHERE, a chain over an analysed table, a HAVING (whose
+      rows PostgreSQL scales by the qual's selectivity in `cost_agg`, 1/3
+      for `max(x) > 0`), a GROUP BY expression, a computed column, a FROM
       subquery other than VALUES, a catalog -- in the written order,
-      hashed.
-      Verify: tests/backlog/test_rp_found_rp692.py::test_an_intersect_over_a_join_puts_the_smaller_input_first
+      hashed. Measured on
+      the 15.19 reference on port 5415.
+      Verify: tests/backlog/test_rp_found_rp692.py::test_an_intersect_over_another_unestimated_input_puts_the_smaller_input_first
       Backlog-ID: RP-841
 
 ## Found while working RP-727 (2026-11-10)
@@ -3008,3 +2989,21 @@ statement is VALUES-only and runs there as written. The gap test is in
 `tests/backlog/test_rp_found_rp849.py`.
 
 
+
+## Found while working RP-423 (2026-11-17)
+
+Measured on PostgreSQL 15.19 (the shared reference on port 5415): every
+statement is VALUES-only and runs there as written. The gap test is in
+`tests/backlog/test_rp_found_rp423.py`.
+
+- [ ] **A back reference is an invalid regex outside a WHERE.** `select
+      'abab' ~ '(ab)\1'` is `t` on PostgreSQL 15.19, `regexp_replace('abab',
+      '(ab)\1', 'X')` is `X` and `regexp_match('xabab', '(ab)\1')` is
+      `{ab}`. Here each is 2201B `invalid regular expression`: the scalar
+      evaluator and the regex builtins compile with the linear `regex`
+      crate, which refuses a back reference (the "backreferences are not
+      supported" parse error). A WHERE over a table column matches, through
+      `secantus-core`'s backtracking fallback, and since RP-423 the
+      planner's selectivity estimate falls back the same way.
+      Verify: tests/backlog/test_rp_found_rp423.py::test_a_back_reference_outside_a_where
+      Backlog-ID: RP-1022

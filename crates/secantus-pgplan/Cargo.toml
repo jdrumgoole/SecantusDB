@@ -14,6 +14,9 @@ categories = ["database-implementations", "parser-implementations"]
 # `regexp_replace` -- linear-time, which covers the POSIX-ARE subset any
 # measured client sends.
 regex = "1"
+# A regex with a back reference, which `regex` refuses, as the planner's
+# selectivity estimate runs it over the histogram (`patternsel`).
+fancy-regex = "0.14"
 
 # `normalize(text [, form])`. Unicode normalisation is TABLE-driven -- the
 # composition and decomposition mappings are data, not an algorithm -- so there

@@ -1626,6 +1626,57 @@ fn column_at(schema: &[FieldInfo], i: usize) -> PgWireResult<&FieldInfo> {
     })
 }
 
+/// Whether a stored function is one `inline_function` inlines into a
+/// constant (RP-475): a `LANGUAGE sql` function, neither `SECURITY
+/// DEFINER` nor carrying `SET` clauses, whose body is a single SELECT of
+/// one constant -- no FROM, WHERE, grouping, ordering or limit.
+fn inlines_to_constant(d: &Document) -> bool {
+    use pg_query::NodeEnum as N;
+    if d.get_str("language") != Ok("sql")
+        || d.get_bool("security_definer").unwrap_or(false)
+        || d.get_array("config").is_ok_and(|c| !c.is_empty())
+    {
+        return false;
+    }
+    let Ok(parsed) = pg_query::parse(d.get_str("body").unwrap_or_default()) else {
+        return false;
+    };
+    let [stmt] = parsed.protobuf.stmts.as_slice() else {
+        return false;
+    };
+    let Some(N::SelectStmt(s)) = stmt.stmt.as_ref().and_then(|n| n.node.as_ref()) else {
+        return false;
+    };
+    if !s.from_clause.is_empty()
+        || s.where_clause.is_some()
+        || !s.group_clause.is_empty()
+        || s.having_clause.is_some()
+        || !s.sort_clause.is_empty()
+        || s.limit_count.is_some()
+        || s.limit_offset.is_some()
+        || !s.distinct_clause.is_empty()
+        || s.with_clause.is_some()
+        || !s.values_lists.is_empty()
+        || s.op != pg_query::protobuf::SetOperation::SetopNone as i32
+    {
+        return false;
+    }
+    let [target] = s.target_list.as_slice() else {
+        return false;
+    };
+    fn constant(n: Option<&N>) -> bool {
+        match n {
+            Some(N::AConst(_)) => true,
+            Some(N::TypeCast(c)) => constant(c.arg.as_ref().and_then(|a| a.node.as_ref())),
+            _ => false,
+        }
+    }
+    match target.node.as_ref() {
+        Some(N::ResTarget(r)) => constant(r.val.as_ref().and_then(|v| v.node.as_ref())),
+        _ => false,
+    }
+}
+
 fn user_fn_of(d: &Document) -> secantus_pgplan::UserFn {
     let strings = |key: &str| -> Vec<String> {
         d.get_array(key)
@@ -9552,8 +9603,21 @@ impl PgHandler {
                 let Some((f, q)) = index_qual(c) else {
                     continue;
                 };
+                // A column held only past an index's lead is that index's
+                // qual when the conjunction also bounds its leading column
+                // (`match_clause_to_indexcol` on a later key column); with
+                // no such bound the full-index path is not modelled.
                 if trailing_only(f) {
-                    return None;
+                    let bounded = indexes.iter().any(|ix| {
+                        ix.columns[1..].iter().any(|c| c == f)
+                            && items
+                                .iter()
+                                .any(|o| index_qual(o).is_some_and(|(g, _)| g == ix.field))
+                    });
+                    if !bounded {
+                        return None;
+                    }
+                    continue;
                 }
                 if !leads(f) {
                     continue;
@@ -9810,6 +9874,20 @@ impl PgHandler {
         table: &str,
         ix: &secantus_pgplan::costsize::Index,
     ) -> Option<Option<(f64, u32)>> {
+        // The B-tree model's pages and root level where it holds the index
+        // (what CREATE INDEX built, deduplicated and split since:
+        // `RelationGetNumberOfBlocks`, as `pg_class` reports it, RP-926).
+        if let Some(shape) = self
+            .btree_shapes(table)
+            .iter()
+            .find(|s| s.key_fields() == ix.columns.as_slice())
+        {
+            if let Ok(Some((pages, height))) =
+                self.with_btree(table, shape, |t| Some((t.pages(), t.height())))
+            {
+                return Some(Some((f64::from(pages), height)));
+            }
+        }
         const LEAF: usize = 8192 - 24 - 16;
         const MAX_POSTING: usize = 1352;
         let maxalign = |n: usize| n.div_ceil(8) * 8;
@@ -10972,10 +11050,10 @@ impl PgHandler {
     }
 
     /// A general join's rows (`join_rows`), the left side fed a batch at a
-    /// time by `left` and each batch's joined rows handed to `emit` (`false`
-    /// stops), in the materialised path's order: each left row in turn with
-    /// its matching right rows in their order, then (RIGHT / FULL) the right
-    /// rows nothing matched.
+    /// time by `left` and its joined rows handed to `emit` at most
+    /// `JOIN_EMIT_ROWS` at a time (`false` stops), in the materialised
+    /// path's order: each left row in turn with its matching right rows in
+    /// their order, then (RIGHT / FULL) the right rows nothing matched.
     #[allow(clippy::too_many_arguments, clippy::type_complexity)]
     pub(crate) fn join_rows_core(
         &self,
@@ -11110,6 +11188,15 @@ impl PgHandler {
                         matched = true;
                         right_matched[i] = true;
                         out.push(d);
+                        // Handed on as they are made, so a consumer that
+                        // stops (a LIMIT) is never past a bounded number
+                        // of rows: one left batch against a large right
+                        // side was built whole first, gigabytes before
+                        // the LIMIT saw its first row.
+                        if out.len() >= JOIN_EMIT_ROWS && !emit(std::mem::take(&mut out))? {
+                            stopped = true;
+                            return Ok(false);
+                        }
                     }
                 }
                 if !matched && matches!(kind, JoinKind::Left | JoinKind::Full) {
@@ -14698,6 +14785,79 @@ impl PgHandler {
             Some(a) if !a.is_empty() => Bson::Array(a.clone()),
             _ => Bson::Null,
         }
+    }
+
+    /// A user function's Function Scan, priced as PostgreSQL 15's
+    /// `cost_functionscan` prices it (RP-475): the call's `procost` times
+    /// `cpu_operator_cost` at startup, then `cpu_tuple_cost` for each of
+    /// its `prorows` rows (one for a scalar function), as wide as its
+    /// result type. A scalar SQL function whose body is one SELECT of a
+    /// constant is inlined (`inline_function`) and its now-constant FROM
+    /// item replaced by an `RTE_RESULT` (`pull_up_constant_function`), so
+    /// it prints a `Result`. A WHERE over it is the scan's Filter, its
+    /// operators `cpu_operator_cost` a row and its selectivity scaling the
+    /// rows, as `cost_functionscan` and `set_baserel_size_estimates` have it.
+    fn price_function_scan(
+        &self,
+        tree: &mut explain::PlanNode,
+        shown: &str,
+        (name, nargs): &(String, usize),
+        filter: Option<&secantus_pgplan::FunctionScanWhere>,
+    ) -> PgWireResult<()> {
+        const CPU_OPERATOR_COST: f64 = 0.0025;
+        let Some(node) = explain::find_node(tree, shown) else {
+            return Ok(());
+        };
+        let docs = self.user_function_docs()?;
+        let named: Vec<&Document> = docs
+            .iter()
+            .filter(|d| d.get_str("name") == Ok(name.as_str()))
+            .collect();
+        let doc = match named.as_slice() {
+            [d] => *d,
+            _ => match named
+                .iter()
+                .find(|d| user_fn_of(d).arg_types.len() == *nargs)
+            {
+                Some(d) => *d,
+                None => return Ok(()),
+            },
+        };
+        let f = user_fn_of(doc);
+        let width = if f.columns.is_empty() {
+            scan_estimate::type_width(&f.return_type, -1)
+        } else {
+            f.columns
+                .iter()
+                .map(|(_, t)| scan_estimate::type_width(t, -1))
+                .sum()
+        };
+        if *nargs == 0 && !f.returns_set && inlines_to_constant(doc) {
+            *node = explain::PlanNode::new("Result".to_string());
+            node.estimate = Some((0.0, secantus_pgplan::costsize::CPU_TUPLE_COST, 1.0, width));
+            return Ok(());
+        }
+        let rows = if f.returns_set {
+            doc.get_f64("rows")
+                .ok()
+                .filter(|r| *r > 0.0)
+                .unwrap_or(1000.0)
+        } else {
+            1.0
+        };
+        let startup = f.cost * CPU_OPERATOR_COST;
+        let (mut per_row, mut out_rows) = (secantus_pgplan::costsize::CPU_TUPLE_COST, rows);
+        if let Some((text, qual)) = filter.and_then(|w| w.filter(&f.columns, &f.return_type)) {
+            if !node.details.iter().any(|(k, _)| k == "Filter") {
+                node.details.push(("Filter".into(), text));
+            }
+            if let Some(q) = qual {
+                per_row += CPU_OPERATOR_COST * f64::from(q.ops);
+                out_rows = scan_estimate::clamp_rows(rows * q.selectivity(rows));
+            }
+        }
+        node.estimate = Some((startup, startup + per_row * rows, out_rows, width));
+        Ok(())
     }
 
     /// The stored `LANGUAGE sql` / `plpgsql` function documents.
@@ -45495,8 +45655,18 @@ impl PgHandler {
                 "a join source reached execution on its own".into(),
             ))),
             Statement::Explain { inner, options } => {
+                // An IN / EXISTS whose inner side is unique on its column:
+                // `reduce_unique_semijoins` plans the inner join (RP-411).
+                if let Some(joined) = options.semi_join.as_ref().and_then(|sj| {
+                    sj.inner_join.as_ref().filter(|_| {
+                        self.unique_index_fixed(&sj.inner.0, std::slice::from_ref(&sj.inner_col))
+                    })
+                }) {
+                    return self.execute_statement((**joined).clone(), max_rows);
+                }
                 let _in_lengths = scan_estimate::explain_in_lengths(&options.scan_in_lengths);
                 let _patterns = scan_estimate::explain_patterns(&options.scan_patterns);
+                let _join_exprs = scan_estimate::explain_join_exprs(&options.join_expr_quals);
                 let db = self.db().to_string();
                 let chooser = |table: &str, filter: &Document| -> Option<String> {
                     match self.storage.explain_plan(&db, table, filter).ok()? {
@@ -45536,31 +45706,8 @@ impl PgHandler {
                 // only plain columns, every one fixed by the join's clauses
                 // or a constant (`relation_has_unique_index_for`).
                 if explain::has_unique_probe(&tree) {
-                    let relations = self.index_relations();
-                    let defs = self.index_defs();
-                    let unique = |table: &str, fixed: &[String]| -> bool {
-                        relations.iter().any(|ix| {
-                            let t = &ix.table;
-                            ix.unique
-                                && t.name == table
-                                && !ix.keys.is_empty()
-                                && !t
-                                    .unique_constraints
-                                    .iter()
-                                    .any(|u| u.name == ix.name && u.deferrable)
-                                && !defs
-                                    .iter()
-                                    .any(|(o, d)| *o == ix.oid && d.contains(" WHERE "))
-                                && ix.keys.iter().all(|&k| {
-                                    k > 0
-                                        && t.columns
-                                            .iter()
-                                            .enumerate()
-                                            .find(|(i, _)| i32::from(t.attnum(*i)) == k)
-                                            .is_some_and(|(_, c)| fixed.contains(&c.name))
-                                })
-                        })
-                    };
+                    let unique =
+                        |table: &str, fixed: &[String]| self.unique_index_fixed(table, fixed);
                     explain::resolve_inner_unique(&mut tree, &unique);
                 }
                 // A select with no FROM is a one-row Result (RP-325).
@@ -45719,6 +45866,98 @@ impl PgHandler {
                             }
                         }
                     }
+                }
+                // Each uncorrelated scalar subquery a qual compares with is
+                // an InitPlan the scan runs first (RP-440): its cost is in
+                // the scan's startup and total, and its comparison is with
+                // a value unknown at plan time.
+                if !options.init_plans.is_empty() {
+                    let inits: Vec<explain::PlanNode> = options
+                        .init_plans
+                        .iter()
+                        .enumerate()
+                        .map(|(i, ip)| {
+                            let mut n = explain::plan_tree(&ip.plan, &chooser);
+                            if let Statement::SelectConstant(sc) = ip.plan.as_ref() {
+                                n.estimate = scan_estimate::result_estimate(sc);
+                            }
+                            n.subplan_name = Some(format!("InitPlan {} (returns ${i})", i + 1));
+                            n
+                        })
+                        .collect();
+                    let init_cost: Option<f64> =
+                        inits.iter().map(|n| n.estimate.map(|e| e.1)).sum();
+                    if let (Statement::Select(sel), Some(init_cost)) = (inner.as_ref(), init_cost) {
+                        // A Sort of the scan's rows for an ORDER BY over
+                        // returned columns (`cost_sort`); the InitPlans'
+                        // cost is on the top node only.
+                        let sorted = tree.name == "Sort"
+                            && tree.children.len() == 1
+                            && tree.children[0].children.is_empty()
+                            && tree.children[0].name.starts_with("Seq Scan on ")
+                            && sel.limit.is_none()
+                            && sel.offset == 0
+                            && matches!(sel.distinct, secantus_pgplan::Distinct::None)
+                            && !sel.with_ties
+                            && sel.order.iter().all(|k| {
+                                k.expr.is_none() && sel.columns.iter().any(|(_, f)| *f == k.field)
+                            });
+                        if (sorted
+                            || tree.children.is_empty() && tree.name.starts_with("Seq Scan on "))
+                            && sel.sub.is_none()
+                            && sel.series.is_none()
+                            && sel.join.is_none()
+                            && sel.windows.is_empty()
+                        {
+                            let quals: Vec<(String, secantus_pgplan::colstats::Op)> = options
+                                .init_plans
+                                .iter()
+                                .map(|ip| (ip.field.clone(), ip.op))
+                                .collect();
+                            let scan = scan_estimate::target_cost(sel).and_then(
+                                |(cost, width, fields)| {
+                                    let (startup, total, rows, w) = self.init_plan_scan_estimate(
+                                        &sel.table,
+                                        &sel.filter,
+                                        &quals,
+                                        &fields,
+                                    )?;
+                                    Some((startup, total + cost * rows, rows, w + width))
+                                },
+                            );
+                            let top = if sorted {
+                                tree.children[0].estimate = scan;
+                                scan.map(|e| {
+                                    scan_estimate::sort_estimate(
+                                        e,
+                                        self.kb_setting("work_mem", 4096),
+                                    )
+                                })
+                            } else {
+                                scan
+                            };
+                            tree.estimate = top.map(|(startup, total, rows, w)| {
+                                (startup + init_cost, total + init_cost, rows, w)
+                            });
+                        }
+                    }
+                    // Counts over the one relation whose WHERE reads an
+                    // InitPlan: the executor runs that WHERE as a FROM
+                    // subquery, which `pull_up_simple_subquery` merges, so
+                    // the Aggregate is straight over the scan (RP-440), and
+                    // `cost_agg` (AGG_PLAIN) prices it over that scan.
+                    if let (Statement::Aggregate(agg), Some(init_cost)) =
+                        (inner.as_ref(), init_cost)
+                    {
+                        let quals: Vec<(String, secantus_pgplan::colstats::Op)> = options
+                            .init_plans
+                            .iter()
+                            .map(|ip| (ip.field.clone(), ip.op))
+                            .collect();
+                        self.init_plan_count_agg(agg, &mut tree, &quals, init_cost);
+                    }
+                    // On the top plan node (`SS_attach_initplans`).
+                    tree.init_plans = inits;
                 }
                 // A narrow-path inner join whose WHERE fixes a join key
                 // (RP-363) is a Nested Loop of the two filtered scans: the
@@ -45889,70 +46128,76 @@ impl PgHandler {
                     is_sort(&tree)
                 };
                 let above = usize::from(under_limit) + usize::from(under_sort);
-                let mut depth = 0;
+                // The plan's shape the search's tree, a Nested Loop per
+                // join and a bare scan per table (a bushy tree, RP-919).
+                fn fits(
+                    node: &explain::PlanNode,
+                    t: &scan_estimate::NestLoopTree,
+                    bare_scan: &dyn Fn(&explain::PlanNode) -> bool,
+                ) -> bool {
+                    match t {
+                        scan_estimate::NestLoopTree::Leaf(_) => bare_scan(node),
+                        scan_estimate::NestLoopTree::Join(_, l, r) => {
+                            node.name == "Nested Loop"
+                                && node.details.is_empty()
+                                && node.children.len() == 2
+                                && fits(&node.children[0], l, bare_scan)
+                                && fits(&node.children[1], r, bare_scan)
+                        }
+                    }
+                }
+                // Lowest first, so each join's children are still the
+                // tree's when it is priced.
+                fn price(node: &mut explain::PlanNode, t: &scan_estimate::NestLoopTree) {
+                    if let scan_estimate::NestLoopTree::Join(level, l, r) = t {
+                        price(&mut node.children[0], l);
+                        price(&mut node.children[1], r);
+                        let (plan, a, b, join, param) = level.as_ref();
+                        explain::price_nest_loop(node, plan, *a, *b, *join);
+                        // The inner read through its index (RP-354).
+                        if let Some(p) = param {
+                            explain::param_index_inner(node, p);
+                        }
+                    }
+                }
                 let mut node = &tree;
                 for _ in 0..above {
                     node = &node.children[0];
                 }
-                let chain = loop {
-                    if node.name != "Nested Loop"
-                        || !node.details.is_empty()
-                        || node.children.len() != 2
-                        || !bare_scan(&node.children[1])
-                    {
-                        break false;
-                    }
-                    depth += 1;
-                    if bare_scan(&node.children[0]) {
-                        break true;
-                    }
-                    node = &node.children[0];
-                };
-                if chain && depth >= 2 {
+                let chain = node.name == "Nested Loop";
+                if chain {
                     if let Statement::Select(sel) = inner.as_ref() {
                         if let Some(levels) = self.nest_loop_chain_estimate(sel) {
-                            if levels.len() == depth {
-                                if let Some((_, _, _, top, _)) = levels.last() {
-                                    let count = sel.limit.map_or(0, |n| n.max(1));
-                                    let mut input = *top;
-                                    if under_sort {
-                                        let bound = (under_limit && count > 0)
-                                            .then(|| (count + sel.offset.max(0)) as f64);
-                                        let (startup, total) = secantus_pgplan::joincost::cost_sort(
-                                            top.1, top.2, top.3, bound,
-                                        );
-                                        input = (startup, total, top.2, top.3);
-                                        let sort = if under_limit {
-                                            &mut tree.children[0]
-                                        } else {
-                                            &mut tree
-                                        };
-                                        sort.estimate = Some(input);
-                                    }
-                                    if under_limit {
-                                        tree.estimate = Some(scan_estimate::limit_estimate(
-                                            input, sel.offset, count,
-                                        ));
-                                    }
+                            if let (true, scan_estimate::NestLoopTree::Join(top, ..)) =
+                                (fits(node, &levels, &bare_scan), &levels)
+                            {
+                                let top = top.3;
+                                let count = sel.limit.map_or(0, |n| n.max(1));
+                                let mut input = top;
+                                if under_sort {
+                                    let bound = (under_limit && count > 0)
+                                        .then(|| (count + sel.offset.max(0)) as f64);
+                                    let (startup, total) = secantus_pgplan::joincost::cost_sort(
+                                        top.1, top.2, top.3, bound,
+                                    );
+                                    input = (startup, total, top.2, top.3);
+                                    let sort = if under_limit {
+                                        &mut tree.children[0]
+                                    } else {
+                                        &mut tree
+                                    };
+                                    sort.estimate = Some(input);
+                                }
+                                if under_limit {
+                                    tree.estimate = Some(scan_estimate::limit_estimate(
+                                        input, sel.offset, count,
+                                    ));
                                 }
                                 let mut root = &mut tree;
                                 for _ in 0..above {
                                     root = &mut root.children[0];
                                 }
-                                // Lowest first, so each join above is
-                                // still the tree's when it is reached.
-                                for (i, (plan, a, b, join, param)) in levels.iter().enumerate() {
-                                    let mut node = &mut *root;
-                                    for _ in 0..depth - 1 - i {
-                                        node = &mut node.children[0];
-                                    }
-                                    explain::price_nest_loop(node, plan, *a, *b, *join);
-                                    // The inner read through its index
-                                    // (RP-354).
-                                    if let Some(p) = param {
-                                        explain::param_index_inner(node, p);
-                                    }
-                                }
+                                price(root, &levels);
                             }
                         }
                     }
@@ -46569,8 +46814,10 @@ impl PgHandler {
                             && sel.windows.is_empty()
                         {
                             if let Some((cost, width, fields)) = scan_estimate::target_cost(sel) {
-                                if let Some(((startup, total, rows, w), Some(index))) = self
-                                    .user_index_path_reading(
+                                // The sequential scan where it is cheaper
+                                // than the index the storage reads (RP-926).
+                                if let Some(((startup, total, rows, w), index)) = self
+                                    .user_scan_path_reading(
                                         &sel.table,
                                         &sel.filter,
                                         &fields,
@@ -46579,7 +46826,7 @@ impl PgHandler {
                                 {
                                     tree.estimate =
                                         Some((startup, total + cost * rows, rows, w + width));
-                                    explain::index_path_node(&mut tree, index, &sel.table);
+                                    explain::scan_path_node(&mut tree, index, &sel.table);
                                 }
                             }
                         }
@@ -46599,6 +46846,41 @@ impl PgHandler {
                         })
                         .unwrap_or_else(|| scan_estimate::catalog_index_columns(name))
                 };
+                // An IN / EXISTS pulled up into a semi join (RP-411); over
+                // an inner side unique on its column it was planned above
+                // as the inner join `reduce_unique_semijoins` makes of it.
+                if let Some(sj) = &options.semi_join {
+                    if !self.unique_index_fixed(&sj.inner.0, std::slice::from_ref(&sj.inner_col)) {
+                        tree = explain::semi_join_tree(sj);
+                        explain::outer_quals_on_semi_join(
+                            &mut tree,
+                            &sj.outer_quals,
+                            &index_columns,
+                        );
+                        let priced = match inner.as_ref() {
+                            Statement::Select(sel) => self.semi_join_estimate(sj, sel),
+                            _ => None,
+                        };
+                        if let Some((outer, scanned, join, unique)) = priced {
+                            tree.estimate = Some(join);
+                            tree.children[0].estimate = Some(outer);
+                            tree.children[1].children[0].estimate = Some(scanned);
+                            // Cheaper as the inner join of the inner side
+                            // made unique (`create_unique_path`): hashed
+                            // over its HashAggregate.
+                            let hashed = match unique {
+                                Some(agg) => {
+                                    explain::unique_ify_semi_join(&mut tree, sj, agg);
+                                    agg
+                                }
+                                None => scanned,
+                            };
+                            // A Hash returns nothing until it is built.
+                            tree.children[1].estimate =
+                                Some((hashed.1, hashed.1, hashed.2, hashed.3));
+                        }
+                    }
+                }
                 explain::attach_scan_quals(
                     &mut tree,
                     &options.scan_quals,
@@ -46607,17 +46889,75 @@ impl PgHandler {
                 );
                 explain::attach_sort_keys(&mut tree, &options.sort_keys);
                 explain::attach_series_scan(&mut tree, &options.series_scan);
+                explain::attach_function_scan(&mut tree, &options.function_scan);
+                if let (Some(shown), Some(call)) =
+                    (&options.function_scan, &options.function_scan_call)
+                {
+                    self.price_function_scan(
+                        &mut tree,
+                        shown,
+                        call,
+                        options.function_scan_where.as_deref(),
+                    )?;
+                }
                 explain::gate_scan(&mut tree, options.one_time_false);
                 explain::gate_named_scan(&mut tree, &options.nullable_gate);
                 if options.dummy_relation {
                     explain::dummy_relation(&mut tree);
+                    // The Result keeps the relation's width, and a count
+                    // over it is priced as over any input: `cost_agg`'s
+                    // AGG_PLAIN over no rows (RP-420).
+                    let width = match inner.as_ref() {
+                        Statement::Update(_) => self.dummy_target_width(inner.as_ref()),
+                        _ => self.dummy_width(inner.as_ref()),
+                    };
+                    let result = (0.0, 0.0, 0.0, width.unwrap_or(0));
+                    // A Sort over it sorts the select list at its types'
+                    // widths (`cost_sort` over no rows, clamped to two).
+                    if tree.name == "Sort"
+                        && tree.children.len() == 1
+                        && tree.children[0].name == "Result"
+                    {
+                        if let Some(w) = self.dummy_target_width(inner.as_ref()) {
+                            tree.estimate = Some(scan_estimate::sort_estimate(
+                                (0.0, 0.0, 0.0, w),
+                                self.kb_setting("work_mem", 4096),
+                            ));
+                        }
+                    }
+                    if let Some(node) = explain::dummy_result_mut(&mut tree) {
+                        if width.is_some() {
+                            node.estimate = Some(result);
+                        }
+                    }
+                    if let (Some(_), Statement::Aggregate(agg)) = (width, inner.as_ref()) {
+                        if tree.name == "Aggregate"
+                            && tree.children.len() == 1
+                            && tree.children[0].name == "Result"
+                            && agg.group_by.is_empty()
+                            && agg.grouping_sets.is_none()
+                            && agg.groupings.is_empty()
+                            && agg.having.is_none()
+                            && agg.exprs.is_empty()
+                            && agg.items.len() == agg.select.len()
+                            && agg
+                                .select
+                                .iter()
+                                .enumerate()
+                                .all(|(i, (_, c))| *c == secantus_pgplan::OutputCol::Agg(i))
+                        {
+                            if let Some(e) = scan_estimate::plain_agg_estimate(result, &agg.items) {
+                                tree.estimate = Some(e);
+                            }
+                        }
+                    }
                 }
                 explain::attach_setop_quals(&mut tree, &options.setop_quals, &index_columns);
                 // Each ON's text on the join it moved to (RP-919).
                 let join_conds: Vec<String> = match &cond_from {
                     Some(from) if from.len() == options.join_conds.len() => from
                         .iter()
-                        .map(|w| w.map(|w| options.join_conds[w].clone()).unwrap_or_default())
+                        .map(|clauses| explain::placed_join_cond(&options.join_conds, clauses))
                         .collect(),
                     _ => options.join_conds.clone(),
                 };
@@ -60856,3 +61196,6 @@ mod type_catalog_reuse_tests {
         assert!(!Arc::ptr_eq(&first[1], &second[2]), "c was decoded anew");
     }
 }
+
+/// The most joined rows `join_rows_core` builds before handing them on.
+const JOIN_EMIT_ROWS: usize = 4096;
