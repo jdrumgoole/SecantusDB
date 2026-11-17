@@ -22054,6 +22054,10 @@ impl PgHandler {
             .into_iter()
             .find(|ix| Self::index_relstats_key(&ix.table.name, &ix.name) == rel);
         if let Some(ix) = index {
+            // A partitioned index has no storage (RP-949).
+            if crate::partition::is_partitioned(&ix.table) {
+                return Ok(Bson::Int64(0));
+            }
             let pages = match self.btree_size(&ix.table.name, &ix.name)? {
                 Some((p, _, _)) => Some(p),
                 None => self
@@ -22065,6 +22069,14 @@ impl PgHandler {
                 "pg_indexes_size" => 0,
                 _ => bytes,
             }));
+        }
+        // A partitioned table has no storage, nor do its indexes or a TOAST
+        // table (RP-949).
+        if self
+            .lookup(&rel)
+            .is_some_and(|def| crate::partition::is_partitioned(&def))
+        {
+            return Ok(Bson::Int64(0));
         }
         let stored = self.lookup(&rel).is_some() && Self::virtual_table(&rel).is_none();
         // A system catalog: its rows as `initdb` would lay them out (RP-214;

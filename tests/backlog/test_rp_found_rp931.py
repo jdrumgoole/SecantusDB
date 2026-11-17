@@ -11,12 +11,13 @@ from typing import Any
 import pytest
 
 
-@pytest.mark.backlog("RP-949")
+@pytest.mark.backlog_fixed("RP-949")
 def test_a_partitioned_tables_indexes_have_no_size(pg: Any) -> None:
     """A partitioned index has no storage, so PostgreSQL sizes it at 0, and
     a partitioned table's indexes at 0 together, even with rows in its
     partitions. `secantusd-pg` answered a page per index, sized from the
-    root's B-tree model (2026-11-14)."""
+    root's B-tree model (2026-11-14), until the size functions answered 0
+    for a partitioned table and its indexes (RP-949)."""
     pg.execute("DROP TABLE IF EXISTS rp931s CASCADE")
     pg.execute("CREATE TABLE rp931s (a int PRIMARY KEY, b int, c int) PARTITION BY RANGE (a)")
     pg.execute("CREATE INDEX rp931s_c ON rp931s (c)")
