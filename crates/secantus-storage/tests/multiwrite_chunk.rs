@@ -367,3 +367,53 @@ fn a_write_of_many_reads_every_page_of_its_candidates_once() {
     drop(st);
     let _ = std::fs::remove_dir_all(&home);
 }
+
+/// A write of many through an index read between bounds reads the index a
+/// page at a time (RM-390): an update that moves each document further on
+/// in the index it is read through still updates each exactly once, across
+/// pages, as mongod's update stage takes each RecordId once.
+#[test]
+fn paged_index_write_moves_each_document_once() {
+    let home = temp_home();
+    let st = Storage::open(home.to_str().unwrap()).unwrap();
+    let docs: Vec<Vec<u8>> = (0..2500i64)
+        .map(|i| enc(&doc! {"_id": i, "a": i, "n": 0}))
+        .collect();
+    st.insert("app", "c", docs, true).unwrap();
+    st.create_index("app", "c", "a_1", &doc! {"a": 1}, &doc! {})
+        .unwrap();
+    let out = st
+        .update_matching(
+            "app",
+            "c",
+            &doc! {"a": {"$gte": 0}},
+            &doc! {"$inc": {"a": 1000, "n": 1}},
+            true,
+            false,
+            &[],
+            &Document::new(),
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+    assert_eq!((out.matched, out.modified), (2500, 2500));
+    assert_eq!(
+        st.count_matching("app", "c", &doc! {"n": 1}, None).unwrap(),
+        2500,
+        "every document updated exactly once"
+    );
+    let deleted = st
+        .delete_matching(
+            "app",
+            "c",
+            &doc! {"a": {"$gte": 1000}},
+            0,
+            &Document::new(),
+            None,
+        )
+        .unwrap();
+    assert_eq!(deleted, 2500);
+    drop(st);
+    let _ = std::fs::remove_dir_all(&home);
+}

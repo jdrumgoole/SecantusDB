@@ -27,22 +27,27 @@ DOCS = 100_000
 def _write_out_of_time(client: Any, plan: str, op: str, budget: int = 30) -> tuple:
     """An updateMany (`$inc: {n: 1}`) or a deleteMany of 100,000 documents
     with `maxTimeMS: budget`, its read `plan`: `clustered-index` reads index
-    `a_1` of a collection clustered by `_id`, `contested` has indexes `a_1`
-    and `b_1` both able to answer it. Its error code, and whether it had
+    `a_1` of a collection clustered by `_id`, `clustered-compound` reads
+    compound index `a_1_b_1` of one, `contested` has indexes `a_1` and
+    `b_1` both able to answer it. Its error code, and whether it had
     written some documents but not all."""
     db = client["rm390"]
     db.drop_collection("c")
-    if plan == "clustered-index":
+    if plan.startswith("clustered"):
         db.create_collection("c", clusteredIndex={"key": {"_id": 1}, "unique": True})
     for start in range(0, DOCS, 10_000):
         db.c.insert_many(
             [{"_id": i, "a": i, "b": i % 7, "n": 0} for i in range(start, start + 10_000)]
         )
-    db.c.create_index("a")
+    if plan == "clustered-compound":
+        db.c.create_index([("a", 1), ("b", 1)])
+        query = {"a": {"$gte": 0}, "b": {"$gte": 0}}
+    else:
+        db.c.create_index("a")
     if plan == "contested":
         db.c.create_index("b")
         query = {"a": {"$gte": 0}, "b": {"$gte": 0}}
-    else:
+    elif plan == "clustered-index":
         query = {"a": {"$gte": 0}}
     if op == "update":
         command = {
@@ -58,7 +63,7 @@ def _write_out_of_time(client: Any, plan: str, op: str, budget: int = 30) -> tup
     return answer[:2], 0 < written < DOCS
 
 
-@pytest.mark.backlog("RM-390")
+@pytest.mark.backlog_fixed("RM-390")
 @pytest.mark.parametrize("op", ["update", "delete"])
 def test_a_write_of_many_out_of_time_keeps_what_it_wrote_whatever_its_plan(
     rust_mongo: Any, mongod_rs: Any, op: str
@@ -67,8 +72,9 @@ def test_a_write_of_many_out_of_time_keeps_what_it_wrote_whatever_its_plan(
     updateMany or deleteMany out of `maxTimeMS` part-way has written some,
     whatever the plan (measured 2026-11-10: through index `a_1` of a
     clustered collection 4,599 updated and 11,280 deleted of 100,000). This
-    server reads the index's every RecordId before it writes one, and a
-    budget spent there writes nothing."""
+    server read the index's every RecordId before it wrote one, and a
+    budget spent there wrote nothing; a bounded read of one field's index
+    now reads a page at a time into the write."""
     theirs = _write_out_of_time(mongod_rs, "clustered-index", op)
     assert theirs == (("err", 50), True), theirs
     assert _write_out_of_time(rust_mongo, "clustered-index", op) == theirs
@@ -100,3 +106,18 @@ def test_a_contested_write_of_many_out_of_time_keeps_what_it_wrote(
     # under a third of reading every match first, which costs 1.25 s here
     # and more on CI.
     assert _write_out_of_time(rust_mongo, "contested", op, budget=400) == theirs
+
+
+@pytest.mark.backlog("RM-390")
+@pytest.mark.parametrize("op", ["update", "delete"])
+def test_a_write_of_many_through_a_compound_index_out_of_time_keeps_what_it_wrote(
+    rust_mongo: Any, mongod_rs: Any, op: str
+) -> None:
+    """The same write through compound index `a_1_b_1` of a clustered
+    collection: mongod 8.2.11 writes as its plan returns and stops
+    part-way. This server's router reads a compound index's RecordIds
+    whole before the first write, and a budget spent there writes
+    nothing."""
+    theirs = _write_out_of_time(mongod_rs, "clustered-compound", op)
+    assert theirs == (("err", 50), True), theirs
+    assert _write_out_of_time(rust_mongo, "clustered-compound", op) == theirs
