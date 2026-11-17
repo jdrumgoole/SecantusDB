@@ -6280,15 +6280,36 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "  Filter: (c ~ '^(w)\\1'::text)",
         ],
     ),
-    # Still open: a regex with a group repeated at least once, whose prefix
-    # walk is not modelled, prints zeros.
+    # Part of RP-423, fixed: a capturing group repeated with `+` is `x*x`
+    # (`parseqatom`), whose prefix is the group's first character ...
     "estimate of a regex match with a repeated group": (
-        "RP-423",
+        "RP-423:fixed",
         _ANALYSED_STRINGS,
         "explain select * from w where c ~ '^(w0)+1'",
         [
             "Seq Scan on w  (cost=0.00..18.50 rows=101 width=10)",
             "  Filter: (c ~ '^(w0)+1'::text)",
+        ],
+    ),
+    # ... and a non-capturing one's, one whole copy of the group.
+    "estimate of a regex match with a repeated non-capturing group": (
+        "RP-423:fixed",
+        _ANALYSED_STRINGS,
+        "explain select * from w where c ~ '^(?:w0)+1'",
+        [
+            "Seq Scan on w  (cost=0.00..18.50 rows=101 width=10)",
+            "  Filter: (c ~ '^(?:w0)+1'::text)",
+        ],
+    ),
+    # Still open: a group repeated `{m,}` with m of 2 or more, whose prefix
+    # comes from the optimised NFA (`^(ab){2,}c` is `ab`), prints zeros.
+    "estimate of a regex match with a group repeated twice or more": (
+        "RP-423",
+        _ANALYSED_STRINGS,
+        "explain select * from w where c ~ '^(w0){2,}1'",
+        [
+            "Seq Scan on w  (cost=0.00..18.50 rows=1 width=10)",
+            "  Filter: (c ~ '^(w0){2,}1'::text)",
         ],
     ),
     # Still open: a LIKE's ESCAPE is a `like_escape` call PostgreSQL folds
