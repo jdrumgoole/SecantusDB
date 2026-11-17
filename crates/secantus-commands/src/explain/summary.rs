@@ -368,16 +368,21 @@ fn planned(storage: &dyn crate::storage::Storage, db: &str, s: &Shape) -> Option
     })
 }
 
-/// What a `find` of `request` examined, `(keys, docs)`, for a read that
-/// did not count it as it read (a clustered collection's, which no stream
-/// reads, RM-586): its plan run over the collection's documents, as
-/// `explain`'s `executionStats` runs it. `None`: not a `find` of a
+/// What a plan examined, `(keys, docs)`, as it returned each document,
+/// and in all.
+pub(crate) type Examined = (Vec<(i64, i64)>, (i64, i64));
+
+/// What a `find` of `request` examined, for a read that did not count it
+/// as it read (a clustered collection's, which no stream reads): its plan
+/// run over the collection's documents, as `explain`'s `executionStats`
+/// runs it, with where each returned document left the count, for a read
+/// whose cursor stays open (RM-586, RM-708). `None`: not a `find` of a
 /// collection there is.
-pub(crate) fn find_examined(
+pub(crate) fn find_examined_marks(
     storage: &dyn crate::storage::Storage,
     db: &str,
     request: &Document,
-) -> Option<(i64, i64)> {
+) -> Option<Examined> {
     let s = shape_of(request)?;
     if !matches!(s.kind, Kind::Find) || !storage.collection_exists(db, &s.coll).unwrap_or(false) {
         return None;
@@ -407,7 +412,8 @@ pub(crate) fn find_examined(
         known: None,
         query: Some(&s.filter),
     };
-    Some(super::exec::run(&node, &env).totals())
+    let (marks, stats) = super::exec::run_marks(&node, &env);
+    Some((marks, stats.totals()))
 }
 
 #[cfg(test)]

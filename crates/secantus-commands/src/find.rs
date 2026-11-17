@@ -1335,22 +1335,61 @@ fn find_body(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     // examined is counted by running it, as `explain` does, when the first
     // batch ends the read (RM-586; mongod 8.2.11's line for a `find` of
     // ten buckets has `keysExamined: 0`, `docsExamined: 10`, `nBatches: 1`).
-    let closed = reply
+    //
+    // One that leaves its cursor open counts each batch as far as the
+    // plan went to fill it, and the last batch on to the end of the read
+    // (RM-708; mongod 8.2.11's lines for that `find` read four at a time
+    // say `docsExamined` 4, 4, 2): the cursor keeps where each document
+    // left the count, for its `getMore`s.
+    let cursor_id = reply
         .get_document("cursor")
         .and_then(|c| c.get_i64("id"))
-        .is_ok_and(|id| id == 0);
+        .unwrap_or(0);
     let store = ctx.storage.clone();
-    if let (true, Some(store)) = (closed && ctx.exec_stats.is_none() && !tailable, store) {
+    if let (true, Some(store)) = (ctx.exec_stats.is_none() && !tailable, store) {
         let examined = is_clustered(store.as_ref(), &ctx.db_name, &coll)
-            .then(|| crate::explain::summary::find_examined(store.as_ref(), &ctx.db_name, doc))
+            .then(|| {
+                crate::explain::summary::find_examined_marks(store.as_ref(), &ctx.db_name, doc)
+            })
             .flatten();
-        if let Some((keys, docs)) = examined {
-            ctx.exec_stats = Some(crate::ExecStats {
-                keys_examined: keys,
-                docs_examined: docs,
-                exhausted: true,
-                ..Default::default()
-            });
+        if let Some((marks, all)) = examined {
+            if cursor_id == 0 {
+                ctx.exec_stats = Some(crate::ExecStats {
+                    keys_examined: all.0,
+                    docs_examined: all.1,
+                    exhausted: true,
+                    ..Default::default()
+                });
+            } else if let Some(cursors) = ctx.cursors.clone() {
+                let first = match &ctx.pending_batch {
+                    Some(p) => p.batch.len(),
+                    None => reply
+                        .get_document("cursor")
+                        .and_then(|c| c.get_array("firstBatch"))
+                        .map_or(0, Vec::len),
+                };
+                let (keys, docs) = first
+                    .checked_sub(1)
+                    .and_then(|i| marks.get(i).copied())
+                    .unwrap_or((0, 0));
+                ctx.exec_stats = Some(crate::ExecStats {
+                    keys_examined: keys,
+                    docs_examined: docs,
+                    cursor_id,
+                    ..Default::default()
+                });
+                let summary = crate::explain::summary::plan_summary(doc, ctx);
+                let command = doc.clone();
+                cursors.update_counts(cursor_id, |c| {
+                    c.examined = Some(crate::cursors::BatchExamined {
+                        marks,
+                        all,
+                        returned: first,
+                        plan_summary: summary,
+                        command,
+                    })
+                });
+            }
         }
     }
     Ok(reply)

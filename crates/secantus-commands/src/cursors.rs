@@ -263,6 +263,35 @@ pub struct CursorCounts {
     /// A query-layer sort read through the cursor stage, which counts it
     /// again at each buffer it loads (RM-326).
     pub loads: Option<CursorLoads>,
+    /// A read run whole whose plan's examining each batch reports as far
+    /// as that batch went (RM-708).
+    pub examined: Option<BatchExamined>,
+}
+
+/// What a plan read whole examined as it returned each document, `(keys,
+/// docs)`, and in all; and how many documents the cursor has returned.
+#[derive(Debug, Clone)]
+pub struct BatchExamined {
+    pub marks: Vec<(i64, i64)>,
+    pub all: (i64, i64),
+    pub returned: usize,
+    pub plan_summary: Option<String>,
+    pub command: Document,
+}
+
+impl BatchExamined {
+    /// What a batch of `n` more documents examined: up to its last
+    /// document, and to the end of the read when it ends the cursor.
+    fn batch(&self, n: usize, exhausted: bool) -> (i64, i64) {
+        let at = |i: usize| i.checked_sub(1).and_then(|i| self.marks.get(i).copied());
+        let before = at(self.returned).unwrap_or((0, 0));
+        let after = if exhausted {
+            self.all
+        } else {
+            at(self.returned + n).unwrap_or(self.all)
+        };
+        (after.0 - before.0, after.1 - before.1)
+    }
 }
 
 /// A query-layer sort read through mongod's cursor stage, and how far the
@@ -1454,10 +1483,30 @@ pub fn get_more(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
             exhausted,
             batch_size,
         );
-        // A cursor whose documents were all read for its first batch: its
-        // `getMore` names the command that opened it, and examines nothing
-        // (measured 8.2.11).
-        if let Some(origin) = counts.origin {
+        if let Some(examined) = counts.examined {
+            let (keys, docs) = examined.batch(batch.len(), exhausted);
+            let returned = examined.returned + batch.len();
+            cursors.update_counts(cursor_id, |c| {
+                if let Some(e) = c.examined.as_mut() {
+                    e.returned = returned;
+                }
+            });
+            ctx.exec_stats = Some(crate::ExecStats {
+                keys_examined: keys,
+                docs_examined: docs,
+                cursor_id,
+                exhausted,
+                plan_summary: examined.plan_summary,
+                originating_command: Some(examined.command),
+                write_concern: info.write_concern,
+                has_sort_stage: counts.has_sort_stage,
+                exec_stages: None,
+                write_run: None,
+            });
+        } else if let Some(origin) = counts.origin {
+            // A cursor whose documents were all read for its first batch: its
+            // `getMore` names the command that opened it, and examines nothing
+            // (measured 8.2.11).
             ctx.exec_stats = Some(crate::ExecStats {
                 keys_examined: 0,
                 docs_examined: 0,
@@ -1837,6 +1886,24 @@ mod tests {
     use super::*;
     use crate::dispatch;
     use std::sync::{Arc, Mutex as StdMutex};
+
+    /// Each batch counts as far as its last document, the last to the end
+    /// of the read (RM-708: ten documents, two of them filtered out after
+    /// the last match, read four at a time).
+    #[test]
+    fn a_batch_examines_as_far_as_it_went() {
+        let mut e = BatchExamined {
+            marks: (1..=8).map(|d| (0, d)).collect(),
+            all: (0, 10),
+            returned: 4,
+            plan_summary: None,
+            command: Document::new(),
+        };
+        assert_eq!(e.batch(0, false), (0, 0));
+        assert_eq!(e.batch(4, true), (0, 6));
+        e.returned = 0;
+        assert_eq!(e.batch(4, false), (0, 4));
+    }
 
     fn enc(d: &Document) -> Vec<u8> {
         let mut v = Vec::new();

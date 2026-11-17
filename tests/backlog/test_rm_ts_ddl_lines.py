@@ -148,7 +148,7 @@ def test_a_find_of_buckets_says_what_it_examined(rust_mongo: Any, mongod_rs: Any
     assert got["rust"] == got["mongod"]
 
 
-@pytest.mark.backlog("RM-708")
+@pytest.mark.backlog_fixed("RM-708")
 def test_a_batched_find_of_buckets_says_what_each_batch_examined(
     rust_mongo: Any, mongod_rs: Any
 ) -> None:
