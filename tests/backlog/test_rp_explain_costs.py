@@ -2242,10 +2242,11 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "        Filter: (a <> 2)",
         ],
     ),
-    # Still open: a bound of the inner side's own on its indexed key joins
-    # the parameterized scan's Index Cond (found while working RP-918).
+    # A bound of the inner side's own on its indexed key joins the
+    # parameterized scan's Index Cond (RP-979, fixed; found while working
+    # RP-918).
     "nested loop into an index with a range of the inner side": (
-        "RP-979",
+        "RP-979:fixed",
         _ANALYSED,
         "explain select * from e left join k on e.a < k.a and k.a > 2",
         [
@@ -2253,6 +2254,18 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "  ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
             "  ->  Index Scan using k_pkey on k  (cost=0.28..6.98 rows=333 width=7)",
             "        Index Cond: ((a > e.a) AND (a > 2))",
+        ],
+    ),
+    # ... and two of them, their range's selectivity the scan's (RP-979).
+    "nested loop into an index with two bounds of the inner side": (
+        "RP-979:fixed",
+        _ANALYSED,
+        "explain select * from e left join k on e.a < k.a and k.a > 2 and k.a < 900",
+        [
+            "Nested Loop Left Join  (cost=0.28..10047.50 rows=299000 width=14)",
+            "  ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
+            "  ->  Index Scan using k_pkey on k  (cost=0.28..7.04 rows=299 width=7)",
+            "        Index Cond: ((a > e.a) AND (a > 2) AND (a < 900))",
         ],
     ),
     # Fixed (RP-916): a parameterized index scan under an outer side with

@@ -671,6 +671,7 @@ impl PgHandler {
                         || (!leaf.filter.is_empty()
                             && !self.own_quals(&leaf.table, &leaf.filter).is_some_and(|q| {
                                 q.iter().all(|(_, q)| matches!(q, costsize::Qual::Ne))
+                                    || own_bounds_only(&q)
                             }))))
             {
                 return None;
@@ -713,11 +714,20 @@ impl PgHandler {
                 self.own_quals(&leaf.table, &leaf.filter)
                     .unwrap_or_default()
             };
+            // Bounds of one column of its own join that column's index
+            // quals (RP-979): their `clauselist_selectivity` scales the
+            // parameterized scan's.
+            let bounds_sel = if own_bounds_only(&quals) {
+                self.restriction_selectivity(&leaf.table, &leaf.filter)?
+            } else {
+                1.0
+            };
             leaves.push(SideLeaf {
                 table: leaf.table.clone(),
                 keys,
                 read,
                 quals,
+                bounds_sel,
             });
             Some((scan, width.3, index))
         };
@@ -1380,6 +1390,7 @@ impl PgHandler {
             read: l.read.clone(),
             // A chain's indexed table has no filter of its own.
             quals: Vec::new(),
+            bounds_sel: 1.0,
         };
         let mut params: Vec<Option<(u32, secantus_pgplan::joincost::ParamInner, ParamScan)>> =
             vec![None; n];
@@ -1865,8 +1876,13 @@ impl PgHandler {
             if index_only {
                 ki.index.visible = ki.allvisfrac;
             }
+            let own_sel = if leaf.quals.first().is_some_and(|(f, _)| *f == field) {
+                leaf.bounds_sel
+            } else {
+                1.0
+            };
             let Some((startup, total)) = costsize::param_range_index_scan(
-                &ki.rel, &ki.index, &field, &rest, &bounds, arg_ops, outer_rows,
+                &ki.rel, &ki.index, &field, &rest, &bounds, own_sel, arg_ops, outer_rows,
             ) else {
                 return ParamFound::Unmodelled;
             };
@@ -7160,6 +7176,20 @@ struct SideLeaf {
     /// The side's own restriction, none an index qual: a parameterized
     /// scan of it checks them on each row it fetches (RP-918).
     quals: Vec<(String, costsize::Qual)>,
+    /// The selectivity of `quals` where they are all bounds of one column
+    /// ([`own_bounds_only`]), which join a parameterized scan's Index Cond
+    /// on that column (RP-979); else 1.
+    bounds_sel: f64,
+}
+
+/// Whether a side's own quals are all constant bounds (`>`, `<`, ...) of
+/// one column: an index scan bounded on that column by the join takes them
+/// as index quals beside the join clause (RP-979).
+fn own_bounds_only(quals: &[(String, costsize::Qual)]) -> bool {
+    !quals.is_empty()
+        && quals
+            .iter()
+            .all(|(f, q)| *f == quals[0].0 && matches!(q, costsize::Qual::Range(_)))
 }
 
 /// An operand of a `<>` between joined keys, for `eqjoinsel` and

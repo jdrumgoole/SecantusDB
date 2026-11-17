@@ -1873,20 +1873,6 @@ a regression test.
       cluster (found while working RP-393 and RP-397).
       Verify: tests/backlog/test_rp_explain_costs.py::test_plan[analyze of an inner join under an outer join with a one-table ON conjunct], tests/backlog/test_rp_explain_costs.py::test_plan[a left join's ON conjunct over a table of an inner join it null-extends]
       Backlog-ID: RP-978
-- [ ] **A nested loop into an index prints no estimate where the inner
-      side's own range on the indexed key joins its Index Cond.**
-      PostgreSQL 15.19 plans `explain select * from e left join k on e.a <
-      k.a and k.a > 2` (`e`, `k` 1,000 analysed rows, `k.a` the primary
-      key) as `Nested Loop Left Join (cost=0.28..10320.00 rows=332667
-      width=14)` over `Index Scan using k_pkey on k (cost=0.28..6.98
-      rows=333 width=7)` with `Index Cond: ((a > e.a) AND (a > 2))`; here
-      zeros over two Seq Scans and a `Join Filter: (e.a < k.a)`. A `<>` of
-      the inner side's own is that scan's Filter since RP-918; a bound is
-      an index qual, which `costsize::param_range_index_scan` refuses
-      beside the join clause. Its rows are right. Measured on a private
-      15.19 cluster (found while working RP-918).
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[nested loop into an index with a range of the inner side]
-      Backlog-ID: RP-979
 - [ ] **EXPLAIN prints no estimate for a join over a scan filtered by an
       expression.** Since RP-404 a comparison of integer or text arithmetic
       with a constant, and a LIKE / ILIKE of an analysed string column, are

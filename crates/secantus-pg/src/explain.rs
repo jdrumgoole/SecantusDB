@@ -1013,7 +1013,19 @@ pub(crate) fn move_param_conds(root: &mut PlanNode) {
         "Memoize" => &mut root.children[1].children[0],
         _ => &mut root.children[1],
     };
-    inner.details.insert(0, ("Index Cond".into(), cond));
+    // The scan's own bound of the column is an index qual beside the
+    // join's, printed after it (RP-979).
+    match inner.details.iter().position(|(k, _)| k == "Index Cond") {
+        Some(i) => {
+            let own = inner.details.remove(i).1;
+            let mut all = conds.clone();
+            all.extend(split_conjuncts(&own));
+            inner
+                .details
+                .insert(0, ("Index Cond".into(), format!("({})", all.join(" AND "))));
+        }
+        None => inner.details.insert(0, ("Index Cond".into(), cond)),
+    }
     // A clause an index qual implies is not checked again
     // (`create_indexscan_plan`'s `predicate_implied_by`), though it was
     // costed: a strict `<` or `>` implies `<>` of the same two operands.
