@@ -17678,6 +17678,42 @@ def test_pg_temp_function_is_session_private_and_dropped_at_disconnect(home: Pat
             assert c.execute("select pg_temp.f()").fetchone() == (3,)
 
 
+def test_pg_temp_types_live_in_the_temp_namespace_and_go_with_the_session(
+    home: Path,
+) -> None:
+    """`create type pg_temp.t` (composite, enum or range) makes the type in
+    the session's `pg_temp_N`, made by it; it resolves bare, `DROP TYPE`
+    reaches it, another session cannot name it, and it is gone when the
+    session ends -- as on PostgreSQL 15.19 (RP-971). It used to be kept in
+    `public` (composite, range) or a schema literally named `pg_temp`
+    (enum), and outlived the session."""
+    with _Server(home) as server:
+        with server.connect() as a:
+            a.execute("create type pg_temp.c971 as (a int)")
+            a.execute("create type pg_temp.e971 as enum ('a')")
+            a.execute("create type pg_temp.r971 as range (subtype = float8)")
+            assert a.execute(
+                "select 'c971'::regtype::text, 'pg_temp.e971'::regtype::text,"
+                " 'r971'::regtype::text, pg_my_temp_schema() <> 0"
+            ).fetchone() == ("c971", "e971", "r971", True)
+            assert a.execute(
+                "select typname from pg_type where typnamespace = pg_my_temp_schema()"
+                " and typname in ('c971', 'e971', 'r971', 'r971_multirange')"
+                " order by 1"
+            ).fetchall() == [("c971",), ("e971",), ("r971",), ("r971_multirange",)]
+            a.execute("create temp table t971 (x c971, y e971)")
+            a.execute("insert into t971 values (row(1), 'a')")
+            assert a.execute("select x::text, y::text from t971").fetchone() == ("(1)", "a")
+            with server.connect() as b, pytest.raises(psycopg.errors.UndefinedObject):
+                b.execute("select 'e971'::regtype")
+            a.execute("drop type r971")
+            assert a.execute("select to_regtype('pg_temp.r971') is null").fetchone() == (True,)
+        with server.connect() as c:
+            assert c.execute(
+                "select count(*) from pg_type where typname in ('c971', 'e971', '_e971')"
+            ).fetchone() == (0,)
+
+
 def test_startup_parameter_status_matches_postgresql_15(home: Path) -> None:
     """PostgreSQL 15 reports no `search_path` (reported from 18) and no
     `scram_iterations` (from 16) at startup."""

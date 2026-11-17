@@ -669,6 +669,9 @@ pub fn bind_with(
             if let Err(e) = handler.drop_orphan_temp_functions() {
                 eprintln!("secantusd-pg: could not drop orphaned temp functions: {e}");
             }
+            if let Err(e) = handler.drop_orphan_temp_types() {
+                eprintln!("secantusd-pg: could not drop orphaned temp types: {e}");
+            }
             if let Err(e) = handler.ensure_catalog_collections() {
                 eprintln!("secantusd-pg: could not create the catalog collections: {e}");
             }

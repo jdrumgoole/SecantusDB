@@ -1214,30 +1214,6 @@ one beside it.
 
 ## Found while working RP-911 (2026-11-15)
 
-- [ ] **OPEN — `CREATE TYPE pg_temp.t AS (...)` makes no type in the temp
-      schema.** PostgreSQL 15.19 creates the composite in the session's
-      temp namespace (making it): `'pg_temp.t'::regtype` resolves, its
-      `typnamespace` is `pg_my_temp_schema()`, and that is no longer 0.
-      `secantusd-pg` answers 42704 `type "pg_temp.t" does not exist` to
-      the cast.
-      Measured 2026-11-17 against 15.19 (while working RP-950's bundle):
-      the composite IS made, but outside the temp namespace -- its
-      `pg_type` row's `typnamespace` is no `pg_temp_N`, the bare
-      `'ct911'::regtype` is 42704 too (15.19 finds it: the temp namespace
-      is searched first for types), and `create temp table t (x ct911)`
-      is 42704. `row(1)::pg_temp.ct911` already works. An enum has the
-      other half of the gap: `create type pg_temp.e as enum ('a')` then
-      `'pg_temp.e'::regtype` prints `pg_temp.e` where 15.19 prints `e`
-      -- it is kept under a schema literally named `pg_temp`, not the
-      session's. Faithful: a type made in `pg_temp` (any kind) lives in
-      the session's `pg_temp_N` (made by it, as a temp relation makes it),
-      is found by `LookupTypeName` through the implicit temp namespace at
-      the head of the path, and is dropped with the session's other temp
-      objects. This is the type side of the namespace RP-882 built for
-      relations, not a one-line fix.
-      Verify: tests/backlog/test_rp_qualified_calls.py::test_standalone_temp_composite_is_in_the_temp_schema
-      Backlog-ID: RP-971
-
 ## Found while working RP-927 (2026-11-14)
 
 - [ ] **OPEN — psql's `\d` column query straight after DDL builds every
@@ -3024,3 +3000,16 @@ statement is VALUES-only and runs there as written. The gap test is in
       reference on port 5415.
       Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a scan of a temporary table names it bare], tests/backlog/test_rp_explain_costs.py::test_plan[a scan of an aliased temporary table names it and its alias]
       Backlog-ID: RP-1029
+
+## Found while working RP-971 (2026-11-17)
+
+- [ ] **A `pg_temp` name before the session has a temp namespace answers
+      "does not exist" for the object, not the schema.** In a fresh
+      session PostgreSQL 15.19 answers `select 'pg_temp.zz'::regclass` and
+      `select 'pg_temp.zz'::regtype` with 3F000 `schema "pg_temp" does not
+      exist` (`LookupExplicitNamespace` finds no `myTempNamespace`);
+      `secantusd-pg` answers 42P01 `relation "pg_temp.zz" does not exist`
+      and 42704 `type "pg_temp.zz" does not exist`. A function call
+      already answers 3F000 (`test_a_pg_temp_function_left_by_a_killed_server_is_gone_at_restart`).
+      Verify: tests/backlog/test_rp_qualified_calls.py::test_pg_temp_name_without_a_temp_namespace_is_an_undefined_schema
+      Backlog-ID: RP-1037
