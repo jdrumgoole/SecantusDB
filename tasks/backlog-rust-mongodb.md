@@ -1008,26 +1008,24 @@ Python behind the Rust server, a deferral answers 2 "aggregation pipeline
 uses a stage or operator not supported by the Rust server". The file has
 about forty such points; these are the ones measured.
 
-- [ ] **A write of many through an index of a clustered collection reads
-      every candidate before it writes one.** mongod writes each document
-      as its plan returns it, whatever the plan, so an updateMany or
-      deleteMany out of `maxTimeMS` part-way has written some (mongod
-      8.2.11, 2026-11-10, 100,000 documents, `maxTimeMS: 30`: through index
-      `a_1` of a collection clustered by `_id` 4,599 updated and 11,280
-      deleted). A plan this server's write cannot stream -- a clustered or
-      time-series collection, a geo plan -- leaves the write to the store,
-      which since 2026-11-10 reads its candidates a page at a time and
-      writes each page first, so a collection scan out of time keeps what
-      it wrote. The router's RecordIds of an index (`try_index_id_keys`)
-      are still read whole before the first page, and a budget spent there
-      writes nothing. The work is to stream a clustered collection's plan
-      as an ordinary one's (its natural order is `_id`'s, which the stream
-      does not yet read), or to read the index a page at a time into the
-      write; a geo plan is the same shape, not yet probed. (A contested
-      plan is tried over what its candidates reach and streamed since
-      2026-11-13.)
+- [ ] **A write of many through a compound index of a clustered
+      collection reads every candidate before it writes one.** mongod
+      writes each document as its plan returns it, whatever the plan, so an
+      updateMany or deleteMany out of `maxTimeMS` part-way has written some
+      (mongod 8.2.11, 100,000 documents, `maxTimeMS: 30`). A plan this
+      server's write cannot stream -- a clustered or time-series
+      collection, a geo plan -- leaves the write to the store, which reads
+      a collection scan (since 2026-11-10) and a one-field bounded index
+      read (since 2026-11-17) a page at a time, writing each page first.
+      The router's other index reads (`try_index_id_keys`: a compound
+      index, `$in` / `$eq`, `$and`, `$or`, `$elemMatch`, geo) are still
+      read whole before the first page, and a budget spent there writes
+      nothing. The work is to stream a clustered collection's plan as an
+      ordinary one's (its natural order is `_id`'s, which the stream does
+      not yet read), or to page each of those reads into the write as
+      `bounded_span_pages` does; a geo plan is not yet probed.
       Backlog-ID: RM-390
-      Verify: tests/backlog/test_rm_found_2026_11_10_rm390.py::test_a_write_of_many_out_of_time_keeps_what_it_wrote_whatever_its_plan
+      Verify: tests/backlog/test_rm_found_2026_11_10_rm390.py::test_a_write_of_many_through_a_compound_index_out_of_time_keeps_what_it_wrote
 - [ ] **A read whose plan two indexes contest reads every match.**
       Over `{a: {$gte: 0}, b: {$gte: 0}}` with indexes `a_1` and `b_1`,
       mongod 8.2.11 tries both plans for about 101 results and then runs
