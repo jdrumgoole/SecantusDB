@@ -2361,15 +2361,6 @@ The gap tests are in `tests/backlog/test_rp_found_rp552.py`.
       `ctp` (23514 for this one, a comparison for a valid one).
       Verify: tests/backlog/test_rp_found_rp552.py::test_composite_column_equals_untyped_literal
       Backlog-ID: RP-947
-- [ ] **Under `PREPARE`, an error's recorded location is counted in the
-      inner statement.** `prepare p5 as select 1::inet` is 42846 at 23 on
-      PostgreSQL 15.19 (at the `::`); here it is 9, the `::`'s offset in
-      `select 1::inet`, which lands on `p5`. `prepare p as select
-      '(0,x)'::ctp` is 23514 at 21 there, none here. The token search
-      (`errpos.rs`) finds a literal in the whole text, so errors that rely
-      on it are right; every `set_error_location` site is shifted.
-      Verify: tests/backlog/test_rp_found_rp552.py::test_prepare_error_location
-      Backlog-ID: RP-948
 
 ## Found while working RP-534 (2026-11-08)
 

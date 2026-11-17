@@ -15444,8 +15444,16 @@ impl PgHandler {
                 )
                 .and_then(|p| self.subquery_rows(&p))
             });
+            // A field's domain check is the literal's input when a
+            // composite's or an array's input runs it (`record_in` /
+            // `array_in` call `domain_in`), which records the literal's
+            // location; a cast straight to a domain checks it only when
+            // the expression runs (RP-948).
+            let at_literal = secantus_pgplan::take_error_location().is_some();
             let mut err = Self::err(&got.err()?);
-            if !sql_fn_validator::is_input_error(&err) {
+            let field_domain = at_literal
+                && matches!(&err, PgWireError::UserError(i) if i.code == "23514" || i.code == "23502");
+            if !sql_fn_validator::is_input_error(&err) && !field_domain {
                 return None;
             }
             if let PgWireError::UserError(info) = &mut err {

@@ -98,10 +98,17 @@ def test_composite_column_equals_untyped_literal(dsn: str) -> None:
 PREPARED = {
     "prepare p5 as select 1::inet": ("42846", "cannot cast type integer to inet", "23"),
     "prepare p6 as select '(0,x)'::ctp": ("23514", _PINT, "22"),
+    # Analysis reads the literal whether or not a row reaches it.
+    "prepare p7 as select '(0,x)'::ctp from pg_class where false": ("23514", _PINT, "22"),
+    "prepare p8 as select '{0}'::pint[]": ("23514", _PINT, "22"),
+    # A cast straight to a domain checks it when the expression runs.
+    "prepare p9 as select '-5'::pint": "PREPARE",
 }
 
 
-@pytest.mark.backlog("RP-948")
+@pytest.mark.backlog_fixed("RP-948")
 @pytest.mark.parametrize("query", list(PREPARED))
 def test_prepare_error_location(query: str, dsn: str) -> None:
+    """A composite or array literal's field domain error was not raised at
+    PREPARE; analysis now raises it at the literal."""
     assert answer(dsn, query) == PREPARED[query]
