@@ -54032,6 +54032,10 @@ pub struct ExprQual {
     pub operators: u32,
     /// The stored fields the expression reads.
     pub fields: Vec<String>,
+    /// A pattern match of the expression instead of the comparison
+    /// (RP-423): `(pattern, insensitive, negated, regex)`, `patternsel`
+    /// over an expression with no statistics.
+    pub pattern: Option<(String, bool, bool, bool)>,
 }
 
 /// A single-relation statement's WHERE as [`ExprQual`]s: `Some` only when
@@ -54257,6 +54261,41 @@ fn expr_qual(n: &pg_query::protobuf::Node, def: &TableDef) -> Option<ExprQual> {
     let Some(N::AExpr(e)) = n.node.as_ref() else {
         return None;
     };
+    // A LIKE / ILIKE or regex match of a string expression with a constant
+    // pattern (RP-423).
+    let kind = AExprKind::try_from(e.kind);
+    let pattern = match (kind, operator_name(e).ok()?) {
+        (Ok(AExprKind::AexprLike), "~~") => Some((false, false, false)),
+        (Ok(AExprKind::AexprLike), "!~~") => Some((false, true, false)),
+        (Ok(AExprKind::AexprIlike), "~~*") => Some((true, false, false)),
+        (Ok(AExprKind::AexprIlike), "!~~*") => Some((true, true, false)),
+        (Ok(AExprKind::AexprOp), "~") => Some((false, false, true)),
+        (Ok(AExprKind::AexprOp), "!~") => Some((false, true, true)),
+        (Ok(AExprKind::AexprOp), "~*") => Some((true, false, true)),
+        (Ok(AExprKind::AexprOp), "!~*") => Some((true, true, true)),
+        _ => None,
+    };
+    if let Some((insensitive, negated, regex)) = pattern {
+        use pg_query::protobuf::a_const::Val;
+        let expr = expr_side(e.lexpr.as_deref()?, def)?;
+        let Some(N::AConst(c)) = e.rexpr.as_deref()?.node.as_ref() else {
+            return None;
+        };
+        let Some(Val::Sval(pat)) = c.val.as_ref() else {
+            return None;
+        };
+        // A bare column is a statistics-backed clause, not this one.
+        if expr.integer || expr.operators == 0 || expr.fields.is_empty() {
+            return None;
+        }
+        return Some(ExprQual {
+            expr: expr.text,
+            op: Op::Eq,
+            operators: expr.operators + 1,
+            fields: expr.fields,
+            pattern: Some((pat.sval.clone(), insensitive, negated, regex)),
+        });
+    }
     if AExprKind::try_from(e.kind) != Ok(AExprKind::AexprOp) {
         return None;
     }
@@ -54298,6 +54337,7 @@ fn expr_qual(n: &pg_query::protobuf::Node, def: &TableDef) -> Option<ExprQual> {
         op,
         operators: expr.operators + 1,
         fields: expr.fields,
+        pattern: None,
     })
 }
 

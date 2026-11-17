@@ -4693,6 +4693,32 @@ impl PgHandler {
             )?;
             return Some((w.selectivity, w.quals));
         }
+        // A pattern match over a table never analysed is `patternsel` with
+        // no statistics (`DEFAULT_MATCH_SEL` for a fixed prefix, the rest
+        // of the pattern's guess), the other clauses their defaults
+        // (RP-423).
+        if crate::where_clauses(filter).is_some_and(|cs| {
+            fn has_pattern(cs: &[crate::WhereClause]) -> bool {
+                cs.iter().any(|c| match c {
+                    crate::WhereClause::Pattern(..) => true,
+                    crate::WhereClause::Or(arms) => arms.iter().any(|a| has_pattern(a)),
+                    _ => false,
+                })
+            }
+            has_pattern(&cs)
+        }) {
+            let indexes = self.cost_indexes(table, &pt.def, count()? as u64);
+            let w = self.analyzed_where(
+                table,
+                &pt.def,
+                &pt.unique,
+                &HashMap::new(),
+                pt.tuples,
+                filter,
+                &indexes,
+            )?;
+            return Some((w.selectivity, w.quals));
+        }
         let nd = |f: &str| {
             if pt.unique.iter().any(|u| u == f) {
                 pt.tuples
@@ -5972,14 +5998,27 @@ fn expr_selectivity(quals: &[secantus_pgplan::ExprQual], tuples: f64) -> Option<
             tuples,
         })
         .collect();
+    // A pattern match is `patternsel` over an expression with no
+    // statistics (RP-423).
+    let mut others = Vec::new();
+    for q in quals {
+        if let Some((pattern, insensitive, negated, regex)) = &q.pattern {
+            let column = Column {
+                string: true,
+                ..columns[0].clone()
+            };
+            others.push(column.pattern_sel(pattern, *insensitive, *negated, *regex)?);
+        }
+    }
     let clauses: Vec<(&Column, secantus_pgplan::colstats::Op, Vec<u8>)> = quals
         .iter()
+        .filter(|q| q.pattern.is_none())
         .map(|q| {
             let i = exprs.iter().position(|e| *e == q.expr)?;
             Some((&columns[i], q.op, Vec::new()))
         })
         .collect::<Option<_>>()?;
-    secantus_pgplan::colstats::clauselist(&clauses)
+    secantus_pgplan::colstats::clauselist_with(&clauses, &others)
 }
 
 /// An `IN` list's cost counts every element, NULLs included

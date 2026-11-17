@@ -5502,7 +5502,7 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
         ],
     ),
     "estimate of a LIKE over an expression": (
-        "RP-423",
+        "RP-423:fixed",
         _ANALYSED,
         "explain select * from e where lower(b) like 'v%'",
         [
@@ -5511,7 +5511,7 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
         ],
     ),
     "estimate of a LIKE over a table never analysed": (
-        "RP-423",
+        "RP-423:fixed",
         _ANALYSED_STRINGS,
         "explain select * from zu where c like 'x%'",
         [
@@ -5535,7 +5535,7 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
     # The same two shapes with a regex match, whose estimate RP-354 built:
     # still zeros (found while working RP-354).
     "estimate of a regex match over a table never analysed": (
-        "RP-423",
+        "RP-423:fixed",
         _ANALYSED_STRINGS,
         "explain select * from zu where c ~ 'ab'",
         [
