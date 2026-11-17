@@ -313,6 +313,9 @@ pub struct CommandContext {
     /// The views the operation resolved, as its line's and profile entry's
     /// `resolvedViews` list them (RM-362).
     pub resolved_views: Option<Vec<Bson>>,
+    /// The view an `$out` was refused for writing to: mongod 8.2.11 names it
+    /// on the aggregate's line and profile entry (RM-591).
+    pub refused_out_view: Option<String>,
     /// How many documents a `findAndModify` changed, for its line.
     pub modified: Option<i64>,
     /// How long the operation waited for its write concern, in ms.
@@ -437,6 +440,7 @@ impl CommandContext {
             flow_control_tickets: 0,
             planning_micros: None,
             resolved_views: None,
+            refused_out_view: None,
             modified: None,
             write_concern_wait: None,
             last_op_seq: 0,
@@ -974,6 +978,7 @@ fn dispatch_named(doc: &Document, ctx: &mut CommandContext) -> Document {
     ctx.flow_control_tickets = 0;
     ctx.planning_micros = None;
     ctx.resolved_views = None;
+    ctx.refused_out_view = None;
     ctx.modified = None;
     ctx.write_concern_wait = None;
     ctx.cpu_nanos = None;
@@ -2094,6 +2099,13 @@ fn dispatch_inner(
                             return e.into_reply();
                         }
                         drop(locks);
+                        profiler::mark_reached(ctx);
+                    } else if let Some(ns) = views::refused_out_view(name, doc, &reply, ctx) {
+                        // mongod's `$out` takes its target's namespace and
+                        // finds the view there: its line and entry name the
+                        // view (measured 8.2.11, RM-591).
+                        profiler::note_namespace(ns.clone());
+                        ctx.refused_out_view = Some(ns);
                         profiler::mark_reached(ctx);
                     }
                     return reply;

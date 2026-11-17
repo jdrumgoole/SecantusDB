@@ -781,13 +781,6 @@ These are explicit non-goals. Don't add them without a reason.
       RM-488, 2026-11-13.
       Verify: tests/backlog/test_rm_view_namespaces.py::test_a_coll_stats_stage_of_a_view_answers
       Backlog-ID: RM-590
-- [ ] **An `$out` into a view is not profiled, and its line names the
-      source.** mongod 8.2.11 refuses it (166) with a line and a profile
-      entry naming the view (`<db>.v`, `ok: 0`); this server's line names
-      the collection the pipeline reads, and it writes no entry. Found
-      while working RM-488, 2026-11-13.
-      Verify: tests/backlog/test_rm_view_namespaces.py::test_an_out_into_a_view_names_the_view
-      Backlog-ID: RM-591
 - [ ] **A `$merge` into a view is not profiled.** mongod 8.2.11 refuses it
       (166) and profiles the `aggregate` under the collection it reads
       (`<db>.c`, `ok: 0`); this server writes no entry. Found while

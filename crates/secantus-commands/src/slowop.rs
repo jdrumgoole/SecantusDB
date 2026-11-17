@@ -398,6 +398,10 @@ pub fn read_attributes(request: &Document, reply: &Document, ctx: &CommandContex
             out.insert("ns", ns);
         }
     }
+    // Or to the view an `$out` was refused for (RM-591).
+    if let Some(ns) = &ctx.refused_out_view {
+        out.insert("ns", ns.clone());
+    }
     // Or to the buckets a time-series collection's DDL runs on (RM-484).
     let buckets = coll.and_then(|coll| crate::opdebug::buckets_of(ctx, name, db, coll));
     if let Some(buckets) = &buckets {

@@ -491,11 +491,11 @@ def test_a_coll_stats_stage_of_a_view_answers(rust_mongo: Any, mongod_rs: Any) -
     assert got["rust"] == got["mongod"]
 
 
-@pytest.mark.backlog("RM-591")
+@pytest.mark.backlog_fixed("RM-591")
 def test_an_out_into_a_view_names_the_view(rust_mongo: Any, mongod_rs: Any) -> None:
     """mongod 8.2.11's line and profile entry for an `$out` into a view, which
-    it refuses, name the view; this server's line names the collection the
-    pipeline reads, and it writes no entry."""
+    it refuses, name the view; this server's line named the collection the
+    pipeline reads, and it wrote no entry."""
     got = {}
     for server, (lines, entries) in _both(
         rust_mongo, mongod_rs, _refused(lambda d: list(d.c.aggregate([{"$out": "v"}])))

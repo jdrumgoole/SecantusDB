@@ -109,6 +109,25 @@ pub(crate) fn refusal_is_profiled(name: &str) -> bool {
     matches!(name, "listIndexes" | "collStats" | "collstats")
 }
 
+/// The view an `aggregate`'s `$out` writes to, when `reply` is mongod's
+/// refusal of it (166). A `$merge` into a view is profiled elsewhere (RM-592).
+pub(crate) fn refused_out_view(
+    name: &str,
+    doc: &Document,
+    reply: &Document,
+    ctx: &CommandContext,
+) -> Option<String> {
+    if name != "aggregate" || reply.get_i32("code") != Ok(166) {
+        return None;
+    }
+    let stage = doc.get_array("pipeline").ok()?.last()?.as_document()?;
+    if !stage.contains_key("$out") {
+        return None;
+    }
+    let (db, coll) = write_target(stage, &ctx.db_name)?;
+    is_view(ctx.storage.as_ref()?.as_ref(), &db, &coll).then(|| format!("{db}.{coll}"))
+}
+
 /// Whether `doc` is an `insert`, `update` or `delete` of a view.
 pub(crate) fn is_view_write(name: &str, doc: &Document, ctx: &CommandContext) -> bool {
     matches!(name, "insert" | "update" | "delete")
