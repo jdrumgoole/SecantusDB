@@ -239,7 +239,7 @@ impl JoinRows {
 
 /// The keys a row expression reads, or `false` when it may read the row some
 /// other way (a column reference or subquery left in it, another variant).
-fn expr_reads(e: &ColumnExpr, keys: &mut std::collections::HashSet<String>) -> bool {
+pub fn expr_reads(e: &ColumnExpr, keys: &mut std::collections::HashSet<String>) -> bool {
     let ColumnExpr::Row { expr, fields, .. } = e else {
         return false;
     };

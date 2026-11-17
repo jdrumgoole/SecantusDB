@@ -250,7 +250,7 @@ def test_an_intersect_over_a_from_subquery_puts_the_smaller_input_first(
     assert got == [("1.000",)]
 
 
-@pytest.mark.backlog("RP-841")
+@pytest.mark.backlog_fixed("RP-841")
 @pytest.mark.parametrize(
     "query",
     [
@@ -264,8 +264,8 @@ def test_an_intersect_over_another_unestimated_input_puts_the_smaller_input_firs
 ) -> None:
     """Each is `1.000` on PostgreSQL 15.19: the input's estimated groups
     outnumber the constant's one, so the constant is the HashSetOp's first
-    input. Here a GROUP BY expression and a HAVING over a
-    grouping column are not estimated, so the left input stays first."""
+    input. Here a GROUP BY expression and a HAVING over a grouping column
+    were not estimated, so the left input stayed first."""
     with _connect(dsn) as c:
         got = _text(c, query)
     assert got == [("1.000",)]
