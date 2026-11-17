@@ -290,6 +290,15 @@ fn plan_info_with(
         .and_then(|options| Layout::of(&options));
     let mut leaves_of = Vec::new();
     leaves(&node.to_doc(None), buckets.as_ref(), &mut leaves_of);
+    // mongod clusters a time-series collection's buckets by `_id`, whose
+    // timestamp is each bucket's start, so a Date bound on the time field
+    // bounds the `_id`s a scan reads: it names a CLUSTERED_IXSCAN where
+    // this plan scans the whole collection (RM-600).
+    if let Some(layout) = &buckets {
+        if leaves_of == ["COLLSCAN"] && bounds_time(&s.filter, &layout.time) {
+            leaves_of = vec!["CLUSTERED_IXSCAN".to_string()];
+        }
+    }
     out.summary = (!leaves_of.is_empty()).then(|| leaves_of.join(", "));
     let scan = match &node {
         Node::Projection { input, .. } => input.as_ref(),
@@ -318,6 +327,41 @@ fn plan_info_with(
     }
     out
 }
+/// Whether `filter` bounds the time field `time` by a Date, in a conjunct
+/// mongod turns into bounds on a time-series collection's clustered `_id`
+/// (measured 8.2.11, 2026-11-17): `$eq` (or an implicit one), `$gt`,
+/// `$gte`, `$lt`, `$lte`, an `$in` of one Date, under `$and` or in an
+/// `$expr` comparison of `$<time>` and a Date. A bound by any other type,
+/// `$ne`, `$not`, `$nor` or one arm of an `$or` bounds nothing.
+fn bounds_time(filter: &Document, time: &str) -> bool {
+    let date = |v: &Bson| matches!(v, Bson::DateTime(_));
+    filter
+        .iter()
+        .any(|(key, value)| match (key.as_str(), value) {
+            ("$and", Bson::Array(arms)) => arms
+                .iter()
+                .filter_map(Bson::as_document)
+                .any(|arm| bounds_time(arm, time)),
+            ("$expr", Bson::Document(expr)) => expr.iter().any(|(op, args)| {
+                matches!(op.as_str(), "$eq" | "$gt" | "$gte" | "$lt" | "$lte")
+                    && matches!(args, Bson::Array(a) if a.len() == 2
+                    && a[0].as_str() == Some(&format!("${time}"))
+                    && date(&a[1]))
+            }),
+            (field, Bson::Document(ops))
+                if field == time && ops.keys().all(|k| k.starts_with('$')) =>
+            {
+                ops.iter().any(|(op, v)| match op.as_str() {
+                    "$eq" | "$gt" | "$gte" | "$lt" | "$lte" => date(v),
+                    "$in" => matches!(v, Bson::Array(a) if a.len() == 1 && date(&a[0])),
+                    _ => false,
+                })
+            }
+            (field, v) if field == time => date(v),
+            _ => false,
+        })
+}
+
 /// The plan [`plan_info`] names for the read shaped `s` on `db`, planned
 /// apart from the plan cache. `None`: no such plan.
 fn planned(storage: &dyn crate::storage::Storage, db: &str, s: &Shape) -> Option<Node> {
@@ -451,6 +495,35 @@ mod tests {
             "EXPRESS_IXSCAN { _id: 1 }"
         );
         assert_eq!(summary(doc! {"stage": "EOF"}), "EOF");
+    }
+
+    /// The bounds on a time field mongod 8.2.11 read as a CLUSTERED_IXSCAN
+    /// of the buckets (RM-600), and the ones it read as a COLLSCAN.
+    #[test]
+    fn a_date_bound_on_the_time_field_bounds_the_clustered_buckets() {
+        let d = Bson::DateTime(bson::DateTime::from_millis(1_704_412_800_000));
+        for f in [
+            doc! {"t": {"$gt": d.clone()}},
+            doc! {"t": {"$lte": d.clone()}},
+            doc! {"t": d.clone()},
+            doc! {"t": {"$in": [d.clone()]}},
+            doc! {"t": {"$gt": d.clone(), "$lt": 5}},
+            doc! {"v": 1, "$and": [{"t": {"$gte": d.clone()}}]},
+            doc! {"$expr": {"$gt": ["$t", d.clone()]}},
+        ] {
+            assert!(bounds_time(&f, "t"), "{f}");
+        }
+        for f in [
+            doc! {"t": {"$gt": 5}},
+            doc! {"t": {"$ne": d.clone()}},
+            doc! {"t": {"$not": {"$lt": d.clone()}}},
+            doc! {"t": {"$in": [d.clone(), 5]}},
+            doc! {"$or": [{"t": {"$gt": d.clone()}}, {"v": 1}]},
+            doc! {"$nor": [{"t": {"$lt": d.clone()}}]},
+            doc! {"u": {"$gt": d.clone()}},
+        ] {
+            assert!(!bounds_time(&f, "t"), "{f}");
+        }
     }
 
     /// A time-series collection's indexes as mongod 8.2.11 named them in

@@ -813,15 +813,6 @@ These are explicit non-goals. Don't add them without a reason.
       Measured 2026-10-27, 2026-11-07, 2026-11-10 and 2026-11-13.
       Backlog-ID: RM-363
       Verify: tests/backlog/test_rm_355_364.py::test_a_contested_aggregate_that_does_not_stream_counts_what_it_examined, tests/backlog/test_rm_355_364.py::test_a_time_series_read_made_whole_counts_what_it_examined
-- [ ] **A time-series read bounded on its time field is not a clustered
-      scan of its buckets.** mongod 8.2.11's line for a `find({t: {$gt:
-      <date>}})` of a time-series collection, with no index serving the
-      bound, says `CLUSTERED_IXSCAN`: the buckets are clustered by `_id`,
-      whose timestamp is each bucket's start, so the bound on
-      `control.min.t` bounds the `_id`s read. This server's says
-      `COLLSCAN`. Found while working RM-496, 2026-11-13.
-      Backlog-ID: RM-600
-      Verify: tests/backlog/test_rm_found_2026_11_10_rm363.py::test_a_time_series_read_bounded_on_its_time_field_scans_the_clustered_buckets
 - [ ] **WiredTiger 11's interruptible cache wait is not on the line.**
       mongod 8.2.11's WiredTiger splits a cache wait into the share spent
       in interruptible eviction (`timeWaitingMicros.cacheInterruptibleMicros`)
