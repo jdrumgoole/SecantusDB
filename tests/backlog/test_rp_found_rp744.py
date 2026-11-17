@@ -205,7 +205,8 @@ def test_cursor_to_xml_in_from_reads_the_cursor_once(dsn: str) -> None:
     """`select * from cursor_to_xml('c', 1, ...)` reads one row of the
     cursor on PostgreSQL 15.19, as the call in a select list does. Here the
     call in FROM read the cursor twice (once while its column was typed):
-    it answered the second row, and the FETCH after it the third. Measured on the shared reference."""
+    it answered the second row, and the FETCH after it the third. Measured
+    on the shared reference."""
     assert _steps(
         dsn,
         [
@@ -565,19 +566,15 @@ def test_a_cursors_where_filters_as_it_is_fetched(dsn: str) -> None:
     """PostgreSQL 15.19 filters a cursor's rows as it is fetched: with no
     Sort, `fetch 1` evaluates the WHERE only up to the first row that
     passes, so a later row's error is raised by the FETCH that reaches it.
-    Here the first FETCH evaluates the WHERE for every row and raises.
-    Measured on a private PostgreSQL 15.19 cluster."""
-    assert _steps(
-        dsn,
-        [
-            "begin",
-            "declare c cursor for select k from (values (1), (2), (0)) s(k) where 10/k > 1",
-            "fetch 1 from c",
-            "fetch 1 from c",
-            "fetch 1 from c",
-            "rollback",
-        ],
-    ) == [
+    Here the first FETCH evaluates the WHERE for every row of a VALUES
+    list and raises, and the DECLARE of one over a table raises. Measured
+    on PostgreSQL 15.19 (the table one on the shared reference, in a temp
+    table)."""
+    n = uuid.uuid4().hex[:8]
+    with psycopg.connect(dsn, autocommit=True) as c:
+        c.execute(f"create table rp961_{n} (k int)")
+        c.execute(f"insert into rp961_{n} values (1), (2), (0)")
+    expected = [
         "BEGIN",
         "DECLARE CURSOR",
         [(1,)],
@@ -585,6 +582,21 @@ def test_a_cursors_where_filters_as_it_is_fetched(dsn: str) -> None:
         ("22012", "division by zero"),
         "ROLLBACK",
     ]
+    for source in ("(values (1), (2), (0)) s(k)", f"rp961_{n}"):
+        assert (
+            _steps(
+                dsn,
+                [
+                    "begin",
+                    f"declare c cursor for select k from {source} where 10/k > 1",
+                    "fetch 1 from c",
+                    "fetch 1 from c",
+                    "fetch 1 from c",
+                    "rollback",
+                ],
+            )
+            == expected
+        ), source
 
 
 @pytest.mark.backlog_fixed("RP-898")
