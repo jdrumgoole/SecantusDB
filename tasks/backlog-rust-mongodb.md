@@ -773,12 +773,6 @@ These are explicit non-goals. Don't add them without a reason.
       Found while working RM-589, 2026-11-17.
       Verify: tests/backlog/test_rm_view_namespaces.py::test_a_transaction_statement_counts_the_transactions_locks
       Backlog-ID: RM-715
-- [ ] **A `$merge` into a view is not profiled.** mongod 8.2.11 refuses it
-      (166) and profiles the `aggregate` under the collection it reads
-      (`<db>.c`, `ok: 0`); this server writes no entry. Found while
-      working RM-488, 2026-11-13.
-      Verify: tests/backlog/test_rm_view_namespaces.py::test_a_merge_into_a_view_is_profiled
-      Backlog-ID: RM-592
 - [ ] **A `$changeStream` of a view writes a line.** Both servers refuse
       it (166), and mongod 8.2.11 writes no `Slow query` line for it; this
       server writes one (`<db>.v`, `ok: 0`). Found while working RM-488,

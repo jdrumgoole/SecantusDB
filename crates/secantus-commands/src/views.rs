@@ -110,7 +110,7 @@ pub(crate) fn refusal_is_profiled(name: &str) -> bool {
 }
 
 /// The view an `aggregate`'s `$out` writes to, when `reply` is mongod's
-/// refusal of it (166). A `$merge` into a view is profiled elsewhere (RM-592).
+/// refusal of it (166). A `$merge` into a view: `refused_merge_into_view`.
 pub(crate) fn refused_out_view(
     name: &str,
     doc: &Document,
@@ -126,6 +126,37 @@ pub(crate) fn refused_out_view(
     }
     let (db, coll) = write_target(stage, &ctx.db_name)?;
     is_view(ctx.storage.as_ref()?.as_ref(), &db, &coll).then(|| format!("{db}.{coll}"))
+}
+
+/// Whether `reply` is mongod's refusal (166) of an `aggregate` whose
+/// `$merge` writes to a view. mongod 8.2.11 profiles it under the
+/// collection the pipeline reads (`<db>.c`, `ok: 0`), not the view (RM-592).
+pub(crate) fn refused_merge_into_view(
+    name: &str,
+    doc: &Document,
+    reply: &Document,
+    ctx: &CommandContext,
+) -> bool {
+    if name != "aggregate" || reply.get_i32("code") != Ok(166) {
+        return false;
+    }
+    let Some(stage) = doc
+        .get_array("pipeline")
+        .ok()
+        .and_then(|p| p.last())
+        .and_then(|s| s.as_document())
+    else {
+        return false;
+    };
+    if !stage.contains_key("$merge") {
+        return false;
+    }
+    let Some((db, coll)) = write_target(stage, &ctx.db_name) else {
+        return false;
+    };
+    ctx.storage
+        .as_ref()
+        .is_some_and(|s| is_view(s.as_ref(), &db, &coll))
 }
 
 /// Whether `doc` is an `insert`, `update` or `delete` of a view.

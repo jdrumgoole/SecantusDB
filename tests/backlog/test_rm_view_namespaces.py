@@ -507,10 +507,10 @@ def test_an_out_into_a_view_names_the_view(rust_mongo: Any, mongod_rs: Any) -> N
     assert got["rust"] == got["mongod"]
 
 
-@pytest.mark.backlog("RM-592")
+@pytest.mark.backlog_fixed("RM-592")
 def test_a_merge_into_a_view_is_profiled(rust_mongo: Any, mongod_rs: Any) -> None:
     """mongod 8.2.11 profiles a `$merge` into a view, which it refuses, under
-    the collection the pipeline reads; this server writes no entry."""
+    the collection the pipeline reads; this server wrote no entry."""
     got = _entries(
         rust_mongo,
         mongod_rs,

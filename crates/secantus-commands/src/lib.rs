@@ -2107,6 +2107,11 @@ fn dispatch_inner(
                         profiler::note_namespace(ns.clone());
                         ctx.refused_out_view = Some(ns);
                         profiler::mark_reached(ctx);
+                    } else if views::refused_merge_into_view(name, doc, &reply, ctx) {
+                        // mongod's `$merge` refuses the view after the
+                        // aggregate took its source's namespace: its entry
+                        // names the source (measured 8.2.11, RM-592).
+                        profiler::mark_reached(ctx);
                     }
                     return reply;
                 }
