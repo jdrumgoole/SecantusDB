@@ -23615,6 +23615,11 @@ impl Storage {
             }
             let mut idx = 0usize;
             while idx < batch.len() {
+                // A batch split by its time target resumes in a later
+                // `work()` call, before which the executor may yield.
+                if idx > 0 && batched {
+                    deadline::yield_point().map_err(|_| StorageError::MaxTimeExpired)?;
+                }
                 let (consumed, d, stopped) =
                     self.retry_write_conflicts("delete_matching_chunk", || {
                         let session = self.op_session()?;
@@ -23627,6 +23632,7 @@ impl Storage {
                                 filter,
                                 let_vars,
                                 coll_opt,
+                                batched,
                             )
                         })
                     })?;
@@ -23763,7 +23769,13 @@ impl Storage {
         filter: &Document,
         let_vars: &Document,
         coll_opt: Option<&Collation>,
+        batched: bool,
     ) -> Result<(usize, usize, Option<StorageError>)> {
+        // mongod's `BatchedDeleteStage::_deleteBatch` stops a batch once it
+        // has run `batchedDeletesTargetBatchTimeMS` (5 ms), commits what it
+        // deleted and finishes the rest in its next `work()` call (RM-609).
+        const TARGET_BATCH_TIME: std::time::Duration = std::time::Duration::from_millis(5);
+        let started = std::time::Instant::now();
         // Large scalar `$in` / `$nin` lists hashed once for the scan.
         let in_sets = secantus_core::query::InSets::prepare(filter);
         let _in_sets = secantus_core::query::InSetsGuard::install(&in_sets);
@@ -23790,6 +23802,9 @@ impl Storage {
         for (recordid, scanned, yielded) in rids {
             let recordid = *recordid;
             if deleted >= WRITE_CHUNK_MAX_DOCS || chunk_bytes >= WRITE_CHUNK_MAX_BYTES {
+                break;
+            }
+            if batched && consumed > 0 && started.elapsed() >= TARGET_BATCH_TIME {
                 break;
             }
             consumed += 1;
