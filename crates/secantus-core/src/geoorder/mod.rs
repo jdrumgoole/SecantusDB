@@ -22,6 +22,7 @@
 
 pub mod near;
 mod parse;
+pub mod scan;
 
 use crate::geohash2d::{Box2, Converter, GeoHash, R2Region};
 use crate::s2legacy::{CellId, LatLngRect, Region, RegionCoverer};
@@ -588,6 +589,63 @@ mod tests {
         live.docs.retain(|(rid, _)| *rid != 3);
         let rest: Vec<i64> = std::iter::from_fn(|| next(&mut live)).collect();
         assert_eq!(rest, [20, 1, 2, 4, 21, 5]);
+    }
+
+    #[test]
+    fn a_flat_near_search_counts_what_mongods_geo_near_2d_reports() {
+        // RM-707: mongod 8.2.11's executionStats of `{loc: {$near: [0, 0]}}`
+        // over twelve points `[n, n]` and `{loc: "2d"}`: 25 rings, 52 keys
+        // examined, 98 works, and per ring the IXSCAN's keys and seeks.
+        let near = crate::geoshape::near_condition(&doc! { "$near": [0, 0] })
+            .unwrap()
+            .unwrap();
+        let measure = near::Measure::new(&flat_index(), &near).unwrap();
+        let mut live = Live {
+            measure: measure.clone(),
+            docs: (0..12)
+                .map(|i| (i, doc! { "_id": i, "loc": [i as f64, i as f64] }))
+                .collect(),
+            held: Vec::new(),
+        };
+        let mut search = near::NearSearch::new(measure, vec![FieldBounds::Full]);
+        let mut n = 0;
+        while search.next(&mut live).unwrap().is_some() {
+            n += 1;
+        }
+        let c = &search.counts;
+        assert_eq!(n, 12);
+        assert_eq!(
+            (c.works, c.advanced, c.need_time, c.eof),
+            (98, 12, 85, true)
+        );
+        assert_eq!(c.intervals.len(), 25);
+        assert_eq!(search.keys_examined, 52);
+        assert_eq!(search.docs_examined, 12);
+        let keys: Vec<(i64, i64)> = c
+            .intervals
+            .iter()
+            .map(|i| (i.scan.keys_examined, i.scan.seeks))
+            .collect();
+        let mut want = vec![(2, 1)];
+        want.extend([(2, 2); 14]);
+        want.extend([
+            (3, 2),
+            (4, 2),
+            (5, 2),
+            (6, 2),
+            (1, 2),
+            (1, 2),
+            (1, 2),
+            (1, 2),
+        ]);
+        want.extend([(0, 1), (0, 1)]);
+        assert_eq!(keys, want);
+        let found: Vec<(i64, i64)> = c
+            .intervals
+            .iter()
+            .map(|i| (i.buffered, i.returned))
+            .collect();
+        assert_eq!(&found[15..19], &[(1, 1), (2, 1), (3, 3), (5, 6)]);
     }
 
     #[test]

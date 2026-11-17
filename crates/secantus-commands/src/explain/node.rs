@@ -27,6 +27,8 @@ pub(crate) struct IndexInfo {
     pub collation: Option<Collation>,
     /// Every key value is `1` or `-1` (no text, geo, hashed or wildcard key).
     pub plain: bool,
+    /// A `2d` or `2dsphere` index as mongod keys it, its ring search reads.
+    pub geo: Option<secantus_core::geoorder::GeoIndex>,
 }
 
 impl IndexInfo {

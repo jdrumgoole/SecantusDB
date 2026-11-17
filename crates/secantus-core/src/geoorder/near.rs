@@ -12,6 +12,7 @@
 //! what was still in the queue. This replays the search step for step, so
 //! the queue sees what mongod's sees.
 
+use super::scan::{IndexScan, ScanCounts, Step};
 use super::{sphere_intervals, stored_all, FieldBounds, GeoIndex, Key, Kind};
 use crate::geohash2d::{self, distance_compare, R2Region};
 use crate::geoshape::{Near, EARTH_RADIUS_METERS};
@@ -21,6 +22,7 @@ use crate::s2legacy::{
     AVG_EDGE, MIN_WIDTH,
 };
 use bson::{Bson, Document};
+
 use std::collections::HashSet;
 use std::f64::consts::PI;
 
@@ -146,6 +148,36 @@ impl Measure {
     }
 }
 
+/// One ring as mongod's GEO_NEAR stage reports it: its `searchIntervals`
+/// entry, and the IXSCAN and FETCH of its `inputStages` entry.
+#[derive(Clone, Debug)]
+pub struct IntervalCounts {
+    pub min: f64,
+    pub max: f64,
+    pub inclusive_max: bool,
+    /// `nBuffered` and `nReturned`.
+    pub buffered: i64,
+    pub returned: i64,
+    /// The geo field's bounds of the ring's index scan.
+    pub bounds: FieldBounds,
+    pub scan: ScanCounts,
+    /// The FETCH's documents examined and documents it let through.
+    pub docs: i64,
+    pub fetch_advanced: i64,
+}
+
+/// The near stage's own work accounting, and its rings in order.
+#[derive(Clone, Debug, Default)]
+pub struct NearCounts {
+    pub works: i64,
+    pub advanced: i64,
+    pub need_time: i64,
+    pub eof: bool,
+    /// Some document has more than one entry in the index.
+    pub multikey: bool,
+    pub intervals: Vec<IntervalCounts>,
+}
+
 /// One ring: the covering's key intervals and its distance bounds.
 struct Ring {
     geo: FieldBounds,
@@ -178,6 +210,8 @@ pub struct NearSearch<P> {
     /// Index entries the ring scans read, and documents they fetched.
     pub keys_examined: i64,
     pub docs_examined: i64,
+    /// What mongod's explain reports of the search so far.
+    pub counts: NearCounts,
 }
 
 impl<P: Clone> NearSearch<P> {
@@ -194,6 +228,7 @@ impl<P: Clone> NearSearch<P> {
             done: false,
             keys_examined: 0,
             docs_examined: 0,
+            counts: NearCounts::default(),
         }
     }
 
@@ -206,15 +241,21 @@ impl<P: Clone> NearSearch<P> {
         self.done
     }
 
-    fn bounded(&self, key: &Key, geo: &FieldBounds, others: bool) -> bool {
+    /// A scan's bounds, field by field: `geo` on the geo field, and on the
+    /// others the query's bounds when `others`, else all of it.
+    fn bounds(&self, geo: &FieldBounds, others: bool) -> Vec<FieldBounds> {
         let geo_at = self.measure.index.geo_at;
-        key.iter().enumerate().all(|(at, part)| {
-            if at == geo_at {
-                geo.admits(part)
-            } else {
-                !others || self.base.get(at).is_none_or(|b| b.admits(part))
-            }
-        })
+        (0..self.measure.index.fields.len())
+            .map(|at| {
+                if at == geo_at {
+                    geo.clone()
+                } else if others {
+                    self.base.get(at).cloned().unwrap_or(FieldBounds::Full)
+                } else {
+                    FieldBounds::Full
+                }
+            })
+            .collect()
     }
 
     /// The next document, with its RecordId: what the queue holds inside
@@ -228,36 +269,61 @@ impl<P: Clone> NearSearch<P> {
             if self.search.is_none() {
                 // The density estimator's index scan, which fetches nothing.
                 // A `2d` index's estimate bounds only the geo field.
+                // Each level's scan is worked until it finds an entry or
+                // ends, one near-stage work a scan work.
                 let docs = source.candidates()?;
+                let entries = sorted_entries(docs);
                 let sphere = self.measure.index.is_sphere();
+                let works = std::cell::Cell::new(0_i64);
                 let any_entry = |geo: &FieldBounds| {
-                    docs.iter()
-                        .any(|d| d.keys.iter().any(|k| self.bounded(k, geo, sphere)))
+                    let bounds = self.bounds(geo, sphere);
+                    let mut scan = IndexScan::new(&entries, &bounds);
+                    let found = loop {
+                        match scan.work() {
+                            Step::Advanced(_) => break true,
+                            Step::Eof => break false,
+                            Step::NeedTime => {}
+                        }
+                    };
+                    works.set(works.get() + scan.counts.works);
+                    found
                 };
                 let (centre, full) = (self.measure.near.centre, self.measure.full);
-                let search = match &self.measure.index.kind {
+                let (search, cut_short) = match &self.measure.index.kind {
                     Kind::Sphere { coarsest, .. } => {
-                        Search::Sphere(SphereSearch::new(centre, full, *coarsest, &any_entry))
+                        let (s, cut) = SphereSearch::new(centre, full, *coarsest, &any_entry);
+                        (Search::Sphere(s), cut)
                     }
-                    Kind::Flat(conv) => Search::Flat(
-                        FlatSearch::new(
+                    Kind::Flat(conv) => {
+                        let (s, cut) = FlatSearch::new(
                             *conv,
                             centre,
                             full,
                             self.measure.near.spherical,
                             &any_entry,
                         )
-                        .expect("a centre Measure::new hashed"),
-                    ),
+                        .expect("a centre Measure::new hashed");
+                        (Search::Flat(s), cut)
+                    }
                 };
+                // A search too small for the next level ends the estimate
+                // on a work of its own, which scans nothing.
+                let init = works.get() + i64::from(cut_short);
+                self.counts.works += init;
+                self.counts.need_time += init;
                 self.search = Some(search);
             }
             // Advancing: hand out what is inside the ring.
             if let Some(ring) = &self.ring {
                 while let Some(top) = self.heap.top() {
                     if top.distance < ring.min {
+                        // Nearer than the ring: a document an earlier ring
+                        // returned, buffered again from another of its keys.
+                        // Dropping it is a work of its own.
                         let gone = self.heap.pop().expect("a top to pop");
                         self.seen.remove(&gone.rid);
+                        self.counts.works += 1;
+                        self.counts.need_time += 1;
                         continue;
                     }
                     let inside = if ring.inclusive_max {
@@ -271,8 +337,16 @@ impl<P: Clone> NearSearch<P> {
                     let found = self.heap.pop().expect("a top to pop");
                     self.seen.remove(&found.rid);
                     self.returned += 1;
+                    self.counts.works += 1;
+                    self.counts.advanced += 1;
+                    if let Some(i) = self.counts.intervals.last_mut() {
+                        i.returned += 1;
+                    }
                     return Ok(Some((found.rid, found.payload)));
                 }
+                // The work that finds the ring done.
+                self.counts.works += 1;
+                self.counts.need_time += 1;
                 self.last_returned = Some(self.returned);
                 self.ring = None;
             }
@@ -282,31 +356,46 @@ impl<P: Clone> NearSearch<P> {
                 .expect("a search")
                 .next(self.last_returned);
             let Some(ring) = next else {
+                self.counts.works += 1;
+                self.counts.eof = true;
                 self.done = true;
                 return Ok(None);
             };
-            // Buffering: the ring's index scan, its fetch, and the queue.
+            // Buffering: the ring's index scan, its fetch, and the queue,
+            // one near-stage work a scan work.
             let docs = source.candidates()?;
-            let mut entries: Vec<(&Key, usize)> = Vec::new();
-            for (i, d) in docs.iter().enumerate() {
-                for k in &d.keys {
-                    if self.bounded(k, &ring.geo, true) {
-                        entries.push((k, i));
-                    }
-                }
+            let entries = sorted_entries(docs);
+            // A `2dsphere` ring bounds the index's other fields; a `2d`
+            // ring scans all of them and filters the keys.
+            let sphere = self.measure.index.is_sphere();
+            let bounds = self.bounds(&ring.geo, sphere);
+            self.counts.multikey = is_multikey(docs);
+            let mut scan = IndexScan::new(&entries, &bounds);
+            if !sphere && self.measure.index.fields.len() > 1 {
+                let filter = self.bounds(&FieldBounds::Full, true);
+                scan = scan.with_filter(filter);
             }
-            entries.sort_by(|a, b| a.0.cmp(b.0).then(docs[a.1].rid.cmp(&docs[b.1].rid)));
-            self.keys_examined += entries.len() as i64;
-            let mut scanned: HashSet<usize> = HashSet::new();
-            for (_, i) in entries {
-                if !scanned.insert(i) {
+            let (mut fetched, mut passed, mut buffered) = (0_i64, 0_i64, 0_i64);
+            loop {
+                let step = scan.work();
+                self.counts.works += 1;
+                self.counts.need_time += 1;
+                let Step::Advanced(at) = step else {
+                    if step == Step::Eof {
+                        break;
+                    }
+                    continue;
+                };
+                let d = &docs[entries[at].1];
+                fetched += 1;
+                if !d.fetched {
                     continue;
                 }
-                let d = &docs[i];
-                self.docs_examined += 1;
-                if !d.fetched || self.seen.contains(&d.rid) {
+                passed += 1;
+                if self.seen.contains(&d.rid) {
                     continue;
                 }
+                buffered += 1;
                 self.heap.push(Found {
                     distance: d.distance,
                     rid: d.rid,
@@ -314,10 +403,40 @@ impl<P: Clone> NearSearch<P> {
                 });
                 self.seen.insert(d.rid);
             }
+            self.keys_examined += scan.counts.keys_examined;
+            self.docs_examined += fetched;
+            self.counts.intervals.push(IntervalCounts {
+                min: ring.min,
+                max: ring.max,
+                inclusive_max: ring.inclusive_max,
+                buffered,
+                returned: 0,
+                bounds: ring.geo.clone(),
+                scan: scan.counts,
+                docs: fetched,
+                fetch_advanced: passed,
+            });
             self.ring = Some(ring);
             self.returned = 0;
         }
     }
+}
+
+/// Every index entry of `docs`, with the position of its document, in
+/// index order (key, then RecordId).
+fn sorted_entries<P>(docs: &[Candidate<P>]) -> Vec<(Key, usize)> {
+    let mut out: Vec<(Key, usize)> = docs
+        .iter()
+        .enumerate()
+        .flat_map(|(i, d)| d.keys.iter().map(move |k| (k.clone(), i)))
+        .collect();
+    out.sort_by(|a, b| a.0.cmp(&b.0).then(docs[a.1].rid.cmp(&docs[b.1].rid)));
+    out
+}
+
+/// Some document has more than one entry: the index is multikey.
+fn is_multikey<P>(docs: &[Candidate<P>]) -> bool {
+    docs.iter().any(|d| d.keys.len() > 1)
 }
 
 /// A collection that does not change while it is read.
@@ -441,12 +560,13 @@ impl SphereSearch {
         full: Annulus,
         coarsest: i32,
         any_entry: &dyn Fn(&FieldBounds) -> bool,
-    ) -> SphereSearch {
+    ) -> (SphereSearch, bool) {
         // The density estimator: the centre's cell and its vertex
         // neighbours, coarser and coarser, until an index entry is in them.
         let centre_id = CellId::from_point(latlng_point(centre.0, centre.1));
         // `min(kMaxCellLevel - 1, internalQueryS2GeoFinestLevel)`.
         let mut level = 23;
+        let mut cut = false;
         let estimate = loop {
             let ranges: Vec<(i64, i64)> = centre_id
                 .vertex_neighbors(level)
@@ -458,6 +578,7 @@ impl SphereSearch {
             }
             let width = MIN_WIDTH.value(level + 1) * EARTH_RADIUS_METERS;
             if full.outer < width {
+                cut = true;
                 break width;
             }
             if level > 0 {
@@ -466,14 +587,15 @@ impl SphereSearch {
             }
             break AVG_EDGE.value(level) * EARTH_RADIUS_METERS;
         };
-        SphereSearch {
+        let search = SphereSearch {
             centre,
             full,
             current: (-1.0, full.inner),
             increment: 3.0 * estimate,
             coarsest,
             scanned: Vec::new(),
-        }
+        };
+        (search, cut)
     }
 
     /// `buildS2Region`: the ring between two caps.
@@ -546,11 +668,12 @@ impl FlatSearch {
         full: Annulus,
         spherical: bool,
         any_entry: &dyn Fn(&FieldBounds) -> bool,
-    ) -> Option<FlatSearch> {
+    ) -> Option<(FlatSearch, bool)> {
         // A centre outside the index's range is mongod's 16433, which the
         // caller reports.
         let centre_cell = conv.hash(centre.0, centre.1)?;
         let mut level = conv.bits.saturating_sub(1);
+        let mut cut = false;
         let estimate = loop {
             let ranges = centre_cell
                 .vertex_neighbors(level)
@@ -561,6 +684,7 @@ impl FlatSearch {
                 break conv.size_edge(level);
             }
             if full.outer < 0.5 * conv.size_edge(level) {
+                cut = true;
                 break 0.5 * conv.size_edge(level);
             }
             if level > 0 {
@@ -574,14 +698,15 @@ impl FlatSearch {
         } else {
             3.0 * estimate
         };
-        Some(FlatSearch {
+        let search = FlatSearch {
             conv,
             full,
             spherical,
             current: (-1.0, full.inner),
             increment,
             scanned: Vec::new(),
-        })
+        };
+        Some((search, cut))
     }
 
     fn next(&mut self, last_returned: Option<usize>) -> Option<Ring> {
