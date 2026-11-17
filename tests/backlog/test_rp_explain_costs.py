@@ -5656,14 +5656,56 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "              Filter: ((a < 999) AND ((a + 1) > 996))",
         ],
     ),
-    # Still open: a comma join's WHERE holds the join clause beside the
-    # expression comparison, re-checked above the join as one residual.
+    # Fixed: a comma join's WHERE holds the join clause beside the
+    # expression comparison, re-checked above the join as one residual,
+    # and the scan carried the column only the comparison reads.
     "estimate of a comma join over a scan filtered by a call": (
-        "RP-423",
+        "RP-423:fixed",
         _ANALYSED_STRINGS,
         "explain select e.a from e, w where e.a = w.a and length(e.b) > 2",
         [
             "Hash Join  (cost=24.16..47.24 rows=333 width=4)",
+            "  Hash Cond: (w.a = e.a)",
+            "  ->  Seq Scan on w  (cost=0.00..16.00 rows=1000 width=4)",
+            "  ->  Hash  (cost=20.00..20.00 rows=333 width=4)",
+            "        ->  Seq Scan on e  (cost=0.00..20.00 rows=333 width=4)",
+            "              Filter: (length(b) > 2)",
+        ],
+    ),
+    "estimate of a comma join over a scan filtered by an arithmetic comparison": (
+        "RP-423:fixed",
+        _ANALYSED_STRINGS,
+        "explain select e.a from e, w where e.a = w.a and e.a + 1 > 996",
+        [
+            "Hash Join  (cost=24.16..47.24 rows=333 width=4)",
+            "  Hash Cond: (w.a = e.a)",
+            "  ->  Seq Scan on w  (cost=0.00..16.00 rows=1000 width=4)",
+            "  ->  Hash  (cost=20.00..20.00 rows=333 width=4)",
+            "        ->  Seq Scan on e  (cost=0.00..20.00 rows=333 width=4)",
+            "              Filter: ((a + 1) > 996)",
+        ],
+    ),
+    "an inner join's scan carries no column only its expression filter reads": (
+        "RP-423:fixed",
+        _ANALYSED_STRINGS,
+        "explain select e.a from e join w on e.a = w.a where length(e.b) > 2",
+        [
+            "Hash Join  (cost=24.16..47.24 rows=333 width=4)",
+            "  Hash Cond: (w.a = e.a)",
+            "  ->  Seq Scan on w  (cost=0.00..16.00 rows=1000 width=4)",
+            "  ->  Hash  (cost=20.00..20.00 rows=333 width=4)",
+            "        ->  Seq Scan on e  (cost=0.00..20.00 rows=333 width=4)",
+            "              Filter: (length(b) > 2)",
+        ],
+    ),
+    # Still open: a LEFT join whose WHERE filters its preserved side by an
+    # expression is PostgreSQL's Hash Right Join over that filtered scan.
+    "estimate of a left join over a preserved scan filtered by a call": (
+        "RP-423",
+        _ANALYSED_STRINGS,
+        "explain select e.a from e left join w on e.a = w.a where length(e.b) > 2",
+        [
+            "Hash Right Join  (cost=24.16..47.24 rows=333 width=4)",
             "  Hash Cond: (w.a = e.a)",
             "  ->  Seq Scan on w  (cost=0.00..16.00 rows=1000 width=4)",
             "  ->  Hash  (cost=20.00..20.00 rows=333 width=4)",

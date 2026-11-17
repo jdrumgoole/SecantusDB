@@ -2316,8 +2316,16 @@ impl PgHandler {
         // above the join too; where those are the expression comparisons
         // the scans are priced with, that residual is theirs (RP-423).
         let pushed_exprs = !comma_clause && j.where_modelled && join_exprs_modelled();
+        // A comma join's residual holds its key equalities and, beside
+        // them, those same expression comparisons (`e.a = w.a and
+        // length(e.b) > 2`).
+        let comma_exprs = if comma_clause && j.where_modelled && join_exprs_modelled() {
+            join_exprs_count()
+        } else {
+            0
+        };
         if let Some(residual) = sel.residual.as_ref().filter(|_| !pushed_exprs) {
-            if !comma_clause || !is_key_equality(residual, equi, filters.len()) {
+            if !comma_clause || !is_key_equality(residual, equi, filters.len() + comma_exprs) {
                 return None;
             }
         }
@@ -2423,13 +2431,27 @@ impl PgHandler {
             // The scan's target list: what the join and the rows above it
             // read. A WHERE conjunct run in the scan adds nothing to it,
             // unlike one left above the join.
+            // A column only the scan's expression comparisons read is not
+            // carried either (`build_joinrel_tlist`): it is not in the
+            // select list or a join clause (RP-423). Not judged beside a
+            // join filter, whose reads are its own.
+            let expr_only = |key: &str, field: &str| {
+                exprs.iter().any(|q| q.fields.iter().any(|f| f == field))
+                    && !j.needed.iter().any(|n| n == key)
+                    && !equi.iter().any(|(l, r)| l == key || r == key)
+                    && filters.is_empty()
+            };
             let carried = if above_filter.is_empty() {
                 Some(
                     columns
                         .iter()
                         .filter(|(key, _)| JoinRows::carries(project, key))
-                        .map(|(_, f)| stored(leaf, f))
-                        .collect::<Option<_>>()?,
+                        .map(|(key, f)| Some((key, stored(leaf, f)?)))
+                        .collect::<Option<Vec<_>>>()?
+                        .into_iter()
+                        .filter(|(key, field)| !expr_only(key, field))
+                        .map(|(_, field)| field)
+                        .collect(),
                 )
             } else {
                 None
@@ -6287,6 +6309,17 @@ fn join_exprs_modelled() -> bool {
     EXPLAIN_JOIN_EXPRS.with(|c| {
         let c = c.borrow();
         !c.is_empty() && c.iter().all(|(_, q)| q.is_some())
+    })
+}
+
+/// How many expression comparisons this EXPLAIN's join WHERE pushes to
+/// its scans, over every alias.
+fn join_exprs_count() -> usize {
+    EXPLAIN_JOIN_EXPRS.with(|c| {
+        c.borrow()
+            .iter()
+            .map(|(_, q)| q.as_ref().map_or(0, Vec::len))
+            .sum()
     })
 }
 

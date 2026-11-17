@@ -1931,16 +1931,17 @@ a regression test.
       a group, a back reference, embedded options). Since 2026-11-17 an
       inner ON join whose WHERE pushes expression comparisons to its sides
       prices each side as that scan's residual
-      (`ExplainOptions::join_expr_quals`, `hash_side_with`). Still zeros
-      there: a comma join (`select e.a from e, w where e.a = w.a and
-      length(e.b) > 2` is PostgreSQL's `Hash Join (cost=24.16..47.24
-      rows=333 width=4)`), whose residual holds the join clause beside the
-      comparison; a LEFT join with such a WHERE (PostgreSQL's `Hash Right
-      Join`); and an expression over both tables, a Join Filter
+      (`ExplainOptions::join_expr_quals`, `hash_side_with`), and since
+      2026-11-17 a comma join, whose residual holds the join clause beside
+      the comparison; neither scan carries a column only its comparison
+      reads. Still zeros there: a LEFT join with such a WHERE (`select e.a
+      from e left join w on e.a = w.a where length(e.b) > 2` is
+      PostgreSQL's `Hash Right Join (cost=24.16..47.24 rows=333 width=4)`
+      over the filtered scan of `e`); and an expression over both tables, a Join Filter
       (`where e.a + w.a > 996`, `Hash Join (cost=27.50..62.25 rows=333
       width=17)`). Measured on the 15.19 reference on port 5415 (found
       while working RP-404 and RP-354).
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[estimate of a comma join over a scan filtered by a call]
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[estimate of a left join over a preserved scan filtered by a call]
       Backlog-ID: RP-423
 - [ ] **A call over constants in a WHERE is not folded in EXPLAIN.**
       `eval_const_expressions` folds an immutable call whose arguments are
