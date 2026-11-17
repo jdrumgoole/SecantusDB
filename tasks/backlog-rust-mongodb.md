@@ -552,15 +552,14 @@ These are explicit non-goals. Don't add them without a reason.
         as it runs and lets it go before its line reads its statistics, as
         mongod's does; a retryable one still holds every round to the end
         (RM-357's session row);
-      - the line of a command that never got its ingress ticket names
-        `<db>.$cmd` on mongod, its collection here; and mongod's first
-        retryable write after startup takes a second, exempt, ingress
-        admission (not traced), both measured 8.2.11 2026-11-08; an index
+      - mongod's first retryable write after startup takes a second,
+        exempt, ingress admission (not traced), measured 8.2.11
+        2026-11-08; an index
         build's `$currentOp` row has no `queues` here (mongod's not yet
         measured).
       **Decided (Joe, 2026-11-08): build mongod's execution admission control in full, the faithful option: the ingress controller, then the read and write ticket pools with `throughputProbing` (replacing `admission.rs`'s opt-in write tickets), then the per-command admission counts, so the concurrency cap is on by default as on mongod. Several PRs, in that order.** The ingress controller landed 2026-11-08, the ticket pools 2026-11-09, and the per-command admission counts on the line 2026-11-09; what is left is above.
       Backlog-ID: RM-355
-      Verify: none -- the yield's second admission is RM-360's; the `$cmd` line name, the second exempt ingress admission and an index build's `queues` have no gap test yet
+      Verify: none -- the yield's second admission is RM-360's; the second exempt ingress admission and an index build's `queues` have no gap test yet
 - [ ] **Some writes' `locks` are not mongod's.** Since 2026-11-07 a write
       counts mongod's flow control tickets (one per global IX taken apart)
       and a retryable write's session checkout and session row, and a

@@ -266,10 +266,11 @@ def test_a_queued_commands_line_says_how_long_it_waited(servers: dict) -> None:
                     ingress.get("admissions"),
                     ingress.get("totalTimeQueuedMicros", 0) >= 40_000,
                     attr.get("errName"),
+                    attr.get("ns", "").replace(db.name, "<db>"),
                 )
         got[name] = lines
     same(got["rust"], got["mongod"])
-    assert got["mongod"]["waited"] == (1, True, None)
+    assert got["mongod"]["waited"] == (1, True, None, "<db>.c")
 
 
 def test_a_current_op_row_says_what_admission_control_admitted(servers: dict) -> None:
