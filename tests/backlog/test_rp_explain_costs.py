@@ -3154,6 +3154,34 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "        ->  Seq Scan on e e2  (cost=0.00..15.00 rows=1000 width=4)",
         ],
     ),
+    # Measured on PostgreSQL 15.19: a temporary table's scan names the
+    # relation bare, as any other (found while working RP-981).
+    "a scan of a temporary table names it bare": (
+        "RP-1029",
+        ["create temp table t (a int)"],
+        "explain select * from t",
+        ["Seq Scan on t  (cost=0.00..35.50 rows=2550 width=4)"],
+    ),
+    "a scan of an aliased temporary table names it and its alias": (
+        "RP-1029",
+        ["create temp table t (a int)"],
+        "explain select * from t x",
+        ["Seq Scan on t x  (cost=0.00..35.50 rows=2550 width=4)"],
+    ),
+    # Measured on PostgreSQL 15.19: an inner join on an expression key is
+    # hashed on the expression (the mechanism RP-981 builds on).
+    "an inner join on an expression key is a hash join": (
+        "RP-981",
+        _ANALYSED,
+        "explain select * from e join e e2 on e.a = e2.a + 1",
+        [
+            "Hash Join  (cost=27.50..57.50 rows=1000 width=14)",
+            "  Hash Cond: ((e2.a + 1) = e.a)",
+            "  ->  Seq Scan on e e2  (cost=0.00..15.00 rows=1000 width=7)",
+            "  ->  Hash  (cost=15.00..15.00 rows=1000 width=7)",
+            "        ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
+        ],
+    ),
     # ------------- RP-981 an anti join on an expression key
     # The ON strict in the nullable side's key through an expression is an
     # anti join too, hashed on the expression (found while working RP-908).

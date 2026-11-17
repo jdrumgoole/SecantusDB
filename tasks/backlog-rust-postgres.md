@@ -1217,7 +1217,17 @@ one beside it.
       priced as one (`eqjoinsel_semi` over an expression has no
       statistics: `rows=500` is its 0.5 default). Measured on a private
       15.19 cluster.
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a left join on an expression key where the nullable side is null is a hash anti join]
+      (2026-11-17, working RP-981 in a bundle: no join on an expression
+      key is hashed yet, inner included. `select * from e join e e2 on e.a
+      = e2.a + 1` is, in PostgreSQL 15.19, `Hash Join (cost=27.50..57.50
+      rows=1000 width=14)` on `((e2.a + 1) = e.a)`, `e2` outer; the LEFT
+      join without the WHERE a `Hash Right Join` of the same cost. Here
+      each is an unpriced `Nested Loop` with `Join Filter: (e.a = (e2.a +
+      1))`, and the planner's `expr_keys` make `nest_loop_estimate`
+      decline. Build the inner hash join on an expression key first (its
+      path, `Hash Cond` and `eqjoinsel` with no statistics on the
+      expression), then let `left_anti_key` accept the expression key.)
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a left join on an expression key where the nullable side is null is a hash anti join], tests/backlog/test_rp_explain_costs.py::test_plan[an inner join on an expression key is a hash join]
       Backlog-ID: RP-981
 
 ## Found while working RP-911 (2026-11-15)
@@ -2979,3 +2989,17 @@ statement is VALUES-only and runs there as written. The gap test is in
       15.19 reference on port 5415.
       Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a not exists beside an outer conjunct is a hash anti join], tests/backlog/test_rp_explain_costs.py::test_plan[a left join anti join beside an outer conjunct is a hash anti join]
       Backlog-ID: RP-1027
+
+## Found while working RP-981 (2026-11-17)
+
+- [ ] **EXPLAIN names a temporary table's scan by its schema and repeats
+      it as an alias.** PostgreSQL 15.19 prints `explain select * from t`
+      (`t` a temporary table) as `Seq Scan on t (cost=0.00..35.50
+      rows=2550 width=4)`, and `... from t x` as `Seq Scan on t x`; here
+      `Seq Scan on pg_temp_22.t t` and `Seq Scan on pg_temp_22.t x`: the
+      scan's relation name is the temp schema's storage key, which the
+      join-leaf alias logic then sees as differing from the alias. Only
+      VERBOSE prints a schema (`pg_temp_3.t`). Measured on the 15.19
+      reference on port 5415.
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a scan of a temporary table names it bare], tests/backlog/test_rp_explain_costs.py::test_plan[a scan of an aliased temporary table names it and its alias]
+      Backlog-ID: RP-1029
