@@ -530,9 +530,9 @@ def test_a_returning_subquery_reads_the_statement_snapshot(query: str, dsn: str)
     assert _scoped_answer(dsn, query) == RETURNING_SNAPSHOT[query]
 
 
-# Found while working RP-686. An aggregate whose arguments are all outer
-# references belongs to the outer query level (`check_agg_arguments`),
-# which in RETURNING is 42803.
+# Found while working RP-686, fixed by RP-944. An aggregate whose arguments
+# are all outer references belonged to the outer query level
+# (`check_agg_arguments`), which in RETURNING is 42803.
 _AGG_IN_RETURNING = ("error", "42803", "aggregate functions are not allowed in RETURNING")
 RETURNING_OUTER_AGGREGATE = [
     "update t668 set a = 1 returning (select array_agg(t668.b) from u668)",
@@ -543,7 +543,7 @@ RETURNING_OUTER_AGGREGATE = [
 ]
 
 
-@pytest.mark.backlog("RP-944")
+@pytest.mark.backlog_fixed("RP-944")
 @pytest.mark.parametrize("query", RETURNING_OUTER_AGGREGATE)
 def test_an_outer_aggregate_in_a_returning_subquery_is_refused(query: str, dsn: str) -> None:
     assert _scoped_answer(dsn, query) == _AGG_IN_RETURNING

@@ -567,6 +567,42 @@ fn outer_level_aggregates(
     })
 }
 
+/// An aggregate in a RETURNING subquery whose arguments are all the write's
+/// own columns (the target's, or a FROM / USING item's) belongs to the
+/// write's level, where `check_agglevels_and_constraints` refuses it: 42803.
+pub(crate) fn check_returning_outer_aggregates(
+    relation: Option<&pg_query::protobuf::RangeVar>,
+    from: &[pg_query::protobuf::Node],
+    returning: &[pg_query::protobuf::Node],
+    lookup: &dyn Fn(&str) -> Option<TableDef>,
+) -> Result<()> {
+    if !returning.iter().any(contains_sublink) {
+        return Ok(());
+    }
+    let mut from_clause: Vec<pg_query::protobuf::Node> = relation
+        .map(|r| pg_query::protobuf::Node {
+            node: Some(N::RangeVar(r.clone())),
+        })
+        .into_iter()
+        .collect();
+    from_clause.extend(from.iter().cloned());
+    let s = pg_query::protobuf::SelectStmt {
+        from_clause,
+        ..Default::default()
+    };
+    for n in returning {
+        if let Some(at) = outer_level_aggregates(&s, lookup, n) {
+            if at >= 0 {
+                set_error_location(at);
+            }
+            return Err(Error::Grouping(
+                "aggregate functions are not allowed in RETURNING".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// An outer-level aggregate inside a subquery in WHERE, a JOIN condition or
 /// GROUP BY is misplaced exactly as one written there directly (42803).
 fn check_misplaced_outer_aggregates(

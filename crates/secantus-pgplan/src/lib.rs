@@ -24954,6 +24954,27 @@ fn rewrite_dml_from_inner(
     // `SET (a, b) = (1, 2)` is `SET a = 1, b = 2`. The row-subquery form
     // `SET (a, b) = (SELECT ...)` becomes one record subquery here, before
     // the statement's subqueries are resolved (`multi_assign`).
+    match node.node.as_ref() {
+        Some(N::UpdateStmt(u)) => agg_hoist::check_returning_outer_aggregates(
+            u.relation.as_ref(),
+            &u.from_clause,
+            &u.returning_list,
+            lookup,
+        )?,
+        Some(N::DeleteStmt(d)) => agg_hoist::check_returning_outer_aggregates(
+            d.relation.as_ref(),
+            &d.using_clause,
+            &d.returning_list,
+            lookup,
+        )?,
+        Some(N::InsertStmt(i)) => agg_hoist::check_returning_outer_aggregates(
+            i.relation.as_ref(),
+            &[],
+            &i.returning_list,
+            lookup,
+        )?,
+        _ => {}
+    }
     // `RETURNING *` / `RETURNING t.*` as the columns they stand for.
     match node.node.as_mut() {
         Some(N::UpdateStmt(u)) => returning_star::expand(

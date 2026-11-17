@@ -2289,18 +2289,6 @@ Measured on a private PostgreSQL 15.19 cluster with the `_SCOPE_SETUP` in
       the write since RP-686, and reads the snapshot.)
       Verify: tests/backlog/test_rp_found_rp664.py::test_a_returning_subquery_reads_the_statement_snapshot
       Backlog-ID: RP-943
-- [ ] **An aggregate over outer references alone in a RETURNING subquery is
-      not refused.** `update t668 set a = 1 returning (select
-      array_agg(t668.b) from u668)` is 42803 `aggregate functions are not
-      allowed in RETURNING` on PostgreSQL 15.19 (an aggregate whose
-      arguments are all outer references belongs to the outer query level,
-      `check_agg_arguments`), as is the same over an UPDATE's FROM item
-      (`... from u668 where u668.k = t668.a returning (select max(u668.v)
-      from u668 z)`), a DELETE's and an INSERT's. Here the first returns
-      one array per row, the FROM-item one 21000, the DELETE and INSERT
-      ones a value per row.
-      Verify: tests/backlog/test_rp_found_rp664.py::test_an_outer_aggregate_in_a_returning_subquery_is_refused
-      Backlog-ID: RP-944
 
 ## Found while working RP-570 (2026-11-08)
 
