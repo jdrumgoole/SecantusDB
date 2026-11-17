@@ -33,12 +33,13 @@ PAGE = """<!doctype html>
 {fonts}
 <style>
 html,body{{margin:0;height:100%;background:#0B1915;overflow:hidden;}}
-#stage{{position:absolute;left:50%;top:50%;width:1920px;height:1080px;transform-origin:0 0;}}
+#stage{{position:absolute;left:50%;top:calc(50% - 24px);
+  width:1920px;height:1080px;transform-origin:0 0;}}
 #stage>section{{position:absolute;inset:0;box-sizing:border-box;display:none;}}
 #stage>section.on{{display:flex;}}
 #stage>section>aside{{display:none;}}
 #stage h1,#stage h2,#stage h3,#stage p,#stage ul,#stage ol{{margin:0;}}
-#bar{{position:fixed;right:16px;bottom:12px;color:#BFD3CB;opacity:.7;
+#bar{{position:fixed;right:16px;bottom:10px;color:#BFD3CB;opacity:.7;
   font:14px/1 system-ui,sans-serif;}}
 #bar button{{background:none;border:1px solid #BFD3CB;color:inherit;
   border-radius:4px;padding:4px 10px;margin-left:6px;cursor:pointer;}}
@@ -60,7 +61,7 @@ html,body{{margin:0;height:100%;background:#0B1915;overflow:hidden;}}
   var stage=document.getElementById('stage'), i=0;
   var reader=matchMedia(READER);
   function fit(){{if(reader.matches){{stage.style.transform='';return;}}
-    var k=Math.min(innerWidth/1920,innerHeight/1080);
+    var k=Math.min(innerWidth/1920,(innerHeight-48)/1080);
     stage.style.transform='scale('+k+') translate(-50%,-50%)';}}
   function show(n){{if(reader.matches)return;
     i=Math.max(0,Math.min(s.length-1,n));
